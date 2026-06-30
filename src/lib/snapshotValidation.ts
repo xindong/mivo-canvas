@@ -19,6 +19,11 @@ const aiWorkflowOperations = new Set<AiWorkflowOperation>([
   'beside-generation',
   'annotation-edit',
   'variation',
+  'prompt-edit',
+  'area-edit',
+  'remove-background',
+  'outpaint',
+  'upscale',
 ])
 const aiWorkflowPlacements = new Set<AiWorkflowPlacement>(['slot', 'right', 'left', 'below'])
 

@@ -66,7 +66,16 @@ export type ConnectorBinding = {
 }
 export type AiWorkflowKind = 'slot' | 'annotation' | 'result'
 export type AiWorkflowStatus = 'empty' | 'queued' | 'generating' | 'ready' | 'failed'
-export type AiWorkflowOperation = 'slot-generation' | 'beside-generation' | 'annotation-edit' | 'variation'
+export type AiWorkflowOperation =
+  | 'slot-generation'
+  | 'beside-generation'
+  | 'annotation-edit'
+  | 'variation'
+  | 'prompt-edit'
+  | 'area-edit'
+  | 'remove-background'
+  | 'outpaint'
+  | 'upscale'
 export type AiWorkflowPlacement = 'slot' | 'right' | 'left' | 'below'
 
 export type CanvasAiWorkflow = {

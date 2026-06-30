@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, type CSSProperties } from 'react'
 import { ChevronDown } from 'lucide-react'
 import type { CanvasBounds } from './canvasInteraction'
 import { quickToolbarGroupsFor, type CanvasActionItem } from './actions/canvasActionModel'
@@ -93,9 +93,85 @@ export function SelectionQuickToolbar({
     setOpenMenu({ selectionKey })
   }
 
-  const renderActionButton = ({ id, label, icon: Icon, text, danger, disabled, children, onClick }: CanvasActionItem) => {
+  const renderActionGlyph = (action: CanvasActionItem, size = 15) => {
+    if (action.swatch) {
+      return (
+        <span
+          className={`selection-quick-toolbar-current-swatch ${action.swatch.transparent ? 'transparent' : ''}`}
+          style={{ '--swatch-color': action.swatch.color } as CSSProperties}
+          aria-hidden="true"
+        />
+      )
+    }
+
+    if (action.linePreview) {
+      return (
+        <span
+          className={`selection-quick-toolbar-line-preview ${action.linePreview.dashed ? 'dashed' : ''}`}
+          style={
+            {
+              '--line-color': action.linePreview.color || '#fffaf0',
+              '--line-width': `${action.linePreview.width || 3}px`,
+            } as CSSProperties
+          }
+          aria-hidden="true"
+        >
+          <span />
+        </span>
+      )
+    }
+
+    const ChildIcon = action.icon
+    return ChildIcon ? <ChildIcon size={size} /> : <b>{action.text}</b>
+  }
+
+  const renderCompactMenuAction = (action: CanvasActionItem) => (
+    <button
+      key={action.id}
+      type="button"
+      role="menuitem"
+      className={`choice-button ${action.danger ? 'danger' : ''} ${action.selected ? 'selected' : ''}`}
+      aria-label={action.label}
+      title={action.label}
+      disabled={action.disabled}
+      onClick={() => runAction(action)}
+    >
+      {renderActionGlyph(action)}
+    </button>
+  )
+
+  const renderListMenuAction = (action: CanvasActionItem) => (
+    <button
+      key={action.id}
+      type="button"
+      role="menuitem"
+      className={`${action.danger ? 'danger' : ''} ${action.selected ? 'selected' : ''}`.trim()}
+      disabled={action.disabled}
+      onClick={() => runAction(action)}
+    >
+      {renderActionGlyph(action)}
+      <span>{action.label}</span>
+    </button>
+  )
+
+  const renderActionButton = ({
+    id,
+    label,
+    icon: Icon,
+    text,
+    swatch,
+    linePreview,
+    danger,
+    disabled,
+    children,
+    menuVariant,
+    onClick,
+  }: CanvasActionItem) => {
     const hasMenu = Boolean(children?.length)
     const menuOpen = openActionId === id
+    const swatchActions = children?.filter((child) => child.swatch) || []
+    const commandActions = children?.filter((child) => !child.swatch) || []
+    const resolvedMenuVariant = menuVariant || (swatchActions.length > 0 ? 'palette' : 'list')
 
     return (
       <span key={id} className="selection-quick-toolbar-item">
@@ -120,29 +196,80 @@ export function SelectionQuickToolbar({
             onClick()
           }}
         >
-          {Icon ? <Icon size={16} /> : <b>{text}</b>}
+          {renderActionGlyph({ id, label, icon: Icon, text, swatch, linePreview, onClick })}
           <span className="selection-quick-toolbar-label">{label}</span>
           {hasMenu ? <ChevronDown size={13} strokeWidth={2.4} /> : null}
         </button>
         {hasMenu && menuOpen ? (
-          <div className="selection-quick-toolbar-menu" role="menu" aria-label={`${label} actions`}>
-            {children?.map((child) => {
-              const ChildIcon = child.icon
-
-              return (
-                <button
-                  key={child.id}
-                  type="button"
-                  role="menuitem"
-                  className={child.danger ? 'danger' : ''}
-                  disabled={child.disabled}
-                  onClick={() => runAction(child)}
-                >
-                  {ChildIcon ? <ChildIcon size={15} /> : <b>{child.text}</b>}
-                  <span>{child.label}</span>
-                </button>
-              )
-            })}
+          <div
+            className={`selection-quick-toolbar-menu ${resolvedMenuVariant}-menu`}
+            role="menu"
+            aria-label={`${label} actions`}
+          >
+            {resolvedMenuVariant === 'palette' ? (
+              <>
+                <div className="selection-quick-toolbar-palette" role="none">
+                  {swatchActions.map((child) => (
+                    <button
+                      key={child.id}
+                      type="button"
+                      role="menuitem"
+                      className={`palette-swatch-button ${child.swatch?.transparent ? 'transparent' : ''} ${child.selected ? 'selected' : ''}`}
+                      style={{ '--swatch-color': child.swatch?.color } as CSSProperties}
+                      aria-label={child.label}
+                      title={child.label}
+                      disabled={child.disabled}
+                      onClick={() => runAction(child)}
+                    >
+                      <span aria-hidden="true" />
+                    </button>
+                  ))}
+                </div>
+                {commandActions.length ? (
+                  <>
+                    <div className="selection-quick-toolbar-menu-divider" />
+                    <div className="selection-quick-toolbar-choice-row" role="none">
+                      {commandActions.map(renderCompactMenuAction)}
+                    </div>
+                  </>
+                ) : null}
+              </>
+            ) : null}
+            {resolvedMenuVariant === 'segmented' ? (
+              <div className="selection-quick-toolbar-choice-row" role="none">
+                {(children || []).map(renderCompactMenuAction)}
+              </div>
+            ) : null}
+            {resolvedMenuVariant === 'icon-grid' ? (
+              <div className="selection-quick-toolbar-icon-grid" role="none">
+                {(children || []).map(renderCompactMenuAction)}
+              </div>
+            ) : null}
+            {resolvedMenuVariant === 'list' ? (
+              <>
+                {swatchActions.length ? (
+                  <div className="selection-quick-toolbar-palette" role="none">
+                    {swatchActions.map((child) => (
+                      <button
+                        key={child.id}
+                        type="button"
+                        role="menuitem"
+                        className={`palette-swatch-button ${child.swatch?.transparent ? 'transparent' : ''} ${child.selected ? 'selected' : ''}`}
+                        style={{ '--swatch-color': child.swatch?.color } as CSSProperties}
+                        aria-label={child.label}
+                        title={child.label}
+                        disabled={child.disabled}
+                        onClick={() => runAction(child)}
+                      >
+                        <span aria-hidden="true" />
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+                {swatchActions.length && commandActions.length ? <div className="selection-quick-toolbar-menu-divider" /> : null}
+                {commandActions.map(renderListMenuAction)}
+              </>
+            ) : null}
           </div>
         ) : null}
       </span>

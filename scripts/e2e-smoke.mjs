@@ -996,6 +996,22 @@ try {
     throw new Error(`Multi-format imports should render Markdown, PDF, and Video nodes: ${JSON.stringify(importedFileNodes)}`)
   }
 
+  await page.locator('.canvas-shell').click({ position: { x: 12, y: 820 } })
+  await page.locator('.dom-node.markdown-node').click({ position: { x: 20, y: 20 } })
+  if ((await page.locator('.selection-quick-toolbar').count()) !== 0) {
+    throw new Error('Markdown selection should not show a download-only quick toolbar')
+  }
+  await page.locator('.dom-node.video-node').click({ position: { x: 20, y: 20 } })
+  if ((await page.locator('.selection-quick-toolbar').count()) !== 0) {
+    throw new Error('Video selection should not show a download-only quick toolbar')
+  }
+  await page.locator('.dom-node.pdf-node').click({ position: { x: 20, y: 20 } })
+  await page.waitForSelector('.selection-quick-toolbar')
+  if ((await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Download original' }).count()) !== 1) {
+    throw new Error('PDF selection should keep the original-file download quick action')
+  }
+  await page.locator('.canvas-shell').click({ position: { x: 12, y: 820 } })
+
   await page.locator('.dom-node.markdown-node').dblclick({ position: { x: 20, y: 20 } })
   await page.getByRole('dialog', { name: 'Asset details' }).waitFor()
   if ((await page.locator('.node-preview-markdown .markdown-preview.details').count()) !== 1) {
@@ -1459,13 +1475,16 @@ try {
   }
 
   await page.waitForSelector('.selection-quick-toolbar')
-  for (const action of ['Details', 'Crop', 'AI Edit']) {
+  if ((await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Details' }).count()) !== 0) {
+    throw new Error('Image selection quick toolbar should rely on double-click for details')
+  }
+  for (const action of ['Crop', 'AI Edit']) {
     if ((await page.locator('.selection-quick-toolbar').getByRole('button', { name: action }).count()) !== 1) {
       throw new Error(`Image selection quick toolbar should expose ${action}`)
     }
   }
   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
-  for (const action of ['Generate beside', 'Add edit note', 'Make variations']) {
+  for (const action of ['Edit with prompt', 'Select area', 'Remove background', 'Expand', 'Boost resolution']) {
     if ((await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: action }).count()) !== 1) {
       throw new Error(`Image AI Edit quick menu should expose ${action}`)
     }
@@ -1730,10 +1749,13 @@ try {
       )}, after=${JSON.stringify(arrowLabelAfterMove)}`,
     )
   }
-  for (const action of ['Edit text', 'Stroke color', 'Fill color', 'Stroke width', 'Dashed line', 'Copy', 'Duplicate', 'Front', 'Delete']) {
+  for (const action of ['Edit text', 'Fill color', 'Line', 'Duplicate', 'Front', 'Delete']) {
     if ((await page.locator('.selection-quick-toolbar').getByRole('button', { name: action }).count()) !== 1) {
       throw new Error(`Markup quick toolbar should expose ${action}`)
     }
+  }
+  if ((await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Copy' }).count()) !== 0) {
+    throw new Error('Markup quick toolbar should keep Copy in the right-click menu instead of the floating bar')
   }
   await arrowMarkupNode.evaluate((node) => {
     const rect = node.getBoundingClientRect()
@@ -1748,7 +1770,7 @@ try {
     )
   })
   await page.waitForSelector('.node-action-menu')
-  await page.locator('.node-action-menu').getByRole('menuitem', { name: 'Stroke color' }).hover()
+  await page.locator('.node-action-menu').getByRole('menuitem', { name: 'Line' }).hover()
   await page.waitForSelector('.node-action-submenu')
   if (
     (await page.locator('.node-action-submenu').getByRole('menuitem', { name: 'Blue' }).count()) !== 1 ||
@@ -1757,7 +1779,13 @@ try {
     throw new Error('Node context menu should render nested markup style actions')
   }
   await page.mouse.click(12, 12)
-  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Stroke width' }).click()
+  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Line' }).click()
+  if (
+    !(await page.locator('.selection-quick-toolbar-menu').evaluate((menu) => menu.classList.contains('palette-menu'))) ||
+    (await page.locator('.selection-quick-toolbar-menu .choice-button.selected').count()) !== 2
+  ) {
+    throw new Error('Markup Line menu should combine color, style, and active stroke width controls')
+  }
   await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Bold' }).click()
   const boldMarkupStrokes = await arrowMarkupNode
     .locator('.markup-visible-line')
@@ -1765,7 +1793,14 @@ try {
   if (!boldMarkupStrokes.length || boldMarkupStrokes.some((stroke) => stroke !== '6')) {
     throw new Error(`Markup stroke-width action should update every rendered SVG line segment, got ${boldMarkupStrokes}`)
   }
-  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Dashed line' }).click()
+  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Line' }).click()
+  if (
+    !(await page.locator('.selection-quick-toolbar-menu').evaluate((menu) => menu.classList.contains('palette-menu'))) ||
+    (await page.locator('.selection-quick-toolbar-menu .choice-button.selected').count()) !== 2
+  ) {
+    throw new Error('Markup Line menu should keep active style and width visible')
+  }
+  await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Dashed line' }).click()
   const dashedMarkupStrokes = await arrowMarkupNode
     .locator('.markup-visible-line')
     .evaluateAll((lines) => lines.map((line) => line.getAttribute('stroke-dasharray')))
@@ -2344,9 +2379,21 @@ try {
   }
 
   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Section fill' }).click()
-  await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Warm fill' }).click()
-  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Section border' }).click()
-  await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Blue border' }).click()
+  const sectionFillPalette = await page.locator('.selection-quick-toolbar-menu').evaluate((menu) => ({
+    className: menu.className,
+    swatches: menu.querySelectorAll('.palette-swatch-button').length,
+    visibleText: menu.textContent?.trim() || '',
+  }))
+  if (
+    !sectionFillPalette.className.includes('palette-menu') ||
+    sectionFillPalette.swatches < 5 ||
+    sectionFillPalette.visibleText.length !== 0
+  ) {
+    throw new Error(`Section fill should render as an icon-only color palette: ${JSON.stringify(sectionFillPalette)}`)
+  }
+  await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Warm' }).click()
+  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Section line' }).click()
+  await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Blue' }).click()
   const styledSection = await sectionNode.locator('.dom-frame-node').evaluate((node) => {
     const style = getComputedStyle(node)
     return {
@@ -2356,8 +2403,42 @@ try {
     }
   })
   if (!styledSection.backgroundColor.includes('255, 247, 230') || !styledSection.borderColor.includes('21, 155, 255')) {
-    throw new Error(`Section style toolbar should update fill and border colors: ${JSON.stringify(styledSection)}`)
+    throw new Error(`Section style toolbar should update fill and line colors: ${JSON.stringify(styledSection)}`)
   }
+  await sectionNode.evaluate((node) => {
+    const rect = node.getBoundingClientRect()
+    node.dispatchEvent(
+      new MouseEvent('contextmenu', {
+        bubbles: true,
+        cancelable: true,
+        button: 2,
+        clientX: rect.left + rect.width / 2,
+        clientY: rect.top + 24,
+      }),
+    )
+  })
+  await page.waitForSelector('.node-action-menu')
+  if (
+    (await page.locator('.node-action-menu').getByRole('menuitem', { name: 'Section fill' }).count()) !== 1 ||
+    (await page.locator('.node-action-menu').getByRole('menuitem', { name: 'Section line' }).count()) !== 1 ||
+    (await page.locator('.node-action-menu').getByRole('menuitem', { name: 'Orange dashed border' }).count()) !== 0
+  ) {
+    throw new Error('Section right-click menu should use unified Section fill / Section line naming')
+  }
+  await page.locator('.node-action-menu').getByRole('menuitem', { name: 'Section line' }).hover()
+  await page.waitForSelector('.node-action-submenu')
+  if (
+    (await page.locator('.node-action-submenu').getByRole('menuitem', { name: 'Blue' }).count()) !== 1 ||
+    (await page.locator('.node-action-submenu').getByRole('menuitem', { name: 'Thin' }).count()) !== 1 ||
+    (await page.locator('.node-action-submenu').getByRole('menuitem', { name: 'Thin border' }).count()) !== 0
+  ) {
+    throw new Error('Section line submenu should use unified color and weight labels')
+  }
+  await page.evaluate(() => {
+    document.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, clientX: 1, clientY: 1 }))
+  })
+  await page.waitForSelector('.node-action-menu', { state: 'detached' })
+  await page.waitForSelector('.selection-quick-toolbar')
 
   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Hide title' }).click()
   await page.waitForFunction((id) => !document.querySelector(`[data-node-id="${id}"] .dom-frame-title`), sectionNodeId)
@@ -2854,6 +2935,9 @@ try {
   }
   await page.waitForSelector('.selection-quick-toolbar')
   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Align' }).click()
+  if (!(await page.locator('.selection-quick-toolbar-menu').evaluate((menu) => menu.classList.contains('icon-grid-menu')))) {
+    throw new Error('Multi-selection Align quick menu should render as an icon grid')
+  }
   const expectedMultiQuickActions = [
     'Align left',
     'Align center',

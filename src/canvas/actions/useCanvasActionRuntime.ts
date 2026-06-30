@@ -66,6 +66,7 @@ export const useCanvasActionRuntime = ({
   const removeSectionOnly = useCanvasStore((state) => state.removeSectionOnly)
   const selectNodes = useCanvasStore((state) => state.selectNodes)
   const generateBesideNode = useCanvasStore((state) => state.generateBesideNode)
+  const generateImageEdit = useCanvasStore((state) => state.generateImageEdit)
   const generateIntoAiSlot = useCanvasStore((state) => state.generateIntoAiSlot)
   const generateFromAnnotation = useCanvasStore((state) => state.generateFromAnnotation)
 
@@ -111,6 +112,7 @@ export const useCanvasActionRuntime = ({
     removeSectionOnly,
     selectNodes,
     generateVariations,
+    generateImageEdit,
     generateBesideNode,
     generateIntoAiSlot,
     generateFromAnnotation,
