@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useState } from 'react'
+import { Fragment, useCallback, useState, type CSSProperties } from 'react'
 import { createPortal } from 'react-dom'
 import { ChevronRight } from 'lucide-react'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
@@ -67,6 +67,37 @@ export function NodeActionMenu({
     onClose()
   }
 
+  const renderActionGlyph = ({ icon: Icon, text, swatch, linePreview }: CanvasActionItem) => {
+    if (swatch) {
+      return (
+        <i
+          className={`node-action-swatch ${swatch.transparent ? 'transparent' : ''}`}
+          style={{ '--swatch-color': swatch.color } as CSSProperties}
+          aria-hidden="true"
+        />
+      )
+    }
+
+    if (linePreview) {
+      return (
+        <i
+          className={`node-action-line-preview ${linePreview.dashed ? 'dashed' : ''}`}
+          style={
+            {
+              '--line-color': linePreview.color || '#554f48',
+              '--line-width': `${linePreview.width || 2}px`,
+            } as CSSProperties
+          }
+          aria-hidden="true"
+        >
+          <span />
+        </i>
+      )
+    }
+
+    return Icon ? <Icon size={16} /> : <b>{text}</b>
+  }
+
   const openChildMenu = useCallback((actionId: string, button: HTMLButtonElement) => {
     const rect = button.getBoundingClientRect()
     const viewport = window.visualViewport
@@ -97,9 +128,10 @@ export function NodeActionMenu({
   }, [])
 
   const renderAction = (
-    { id, label, icon: Icon, text, danger, disabled, children, onClick }: CanvasActionItem,
+    action: CanvasActionItem,
     nested = false,
   ) => {
+    const { id, label, swatch, linePreview, selected, danger, disabled, children, onClick } = action
     const hasChildren = Boolean(children?.length)
     const submenuOpen = openSubmenu.id === id
 
@@ -110,7 +142,7 @@ export function NodeActionMenu({
           role="menuitem"
           aria-haspopup={hasChildren ? 'menu' : undefined}
           aria-expanded={hasChildren ? submenuOpen : undefined}
-          className={`${danger ? 'danger' : ''} ${hasChildren ? 'has-children' : ''} ${submenuOpen ? 'active' : ''}`}
+          className={`${danger ? 'danger' : ''} ${hasChildren ? 'has-children' : ''} ${swatch ? 'has-swatch' : ''} ${linePreview ? 'has-line-preview' : ''} ${selected ? 'selected' : ''} ${submenuOpen ? 'active' : ''}`}
           disabled={disabled}
           onPointerEnter={(event) => {
             if (hasChildren) openChildMenu(id, event.currentTarget)
@@ -128,7 +160,7 @@ export function NodeActionMenu({
             runAction(onClick)
           }}
         >
-          {Icon ? <Icon size={16} /> : <b>{text}</b>}
+          {renderActionGlyph(action)}
           <span>{label}</span>
           {hasChildren ? <ChevronRight className="node-action-chevron" size={15} /> : null}
         </button>

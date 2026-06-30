@@ -1,6 +1,13 @@
 import type { LucideIcon } from 'lucide-react'
 import type { DistributionAxis, SelectionAlignment } from '../../store/canvasStore'
-import type { MarkupKind, MarkupPoint, MivoCanvasNode, SectionLockMode, ToolId } from '../../types/mivoCanvas'
+import type {
+  AiWorkflowOperation,
+  MarkupKind,
+  MarkupPoint,
+  MivoCanvasNode,
+  SectionLockMode,
+  ToolId,
+} from '../../types/mivoCanvas'
 import type { CanvasSelectionContext } from './canvasSelectionModel'
 
 export type LayerMove = 'forward' | 'backward' | 'front' | 'back'
@@ -10,6 +17,17 @@ export type CanvasActionItem = {
   label: string
   icon?: LucideIcon
   text?: string
+  menuVariant?: 'list' | 'palette' | 'segmented' | 'icon-grid'
+  swatch?: {
+    color: string
+    transparent?: boolean
+  }
+  linePreview?: {
+    color?: string
+    width?: number
+    dashed?: boolean
+  }
+  selected?: boolean
   danger?: boolean
   disabled?: boolean
   children?: CanvasActionItem[]
@@ -45,6 +63,7 @@ export type CanvasActionRuntime = {
     sourceNodeId?: string,
     position?: { x: number; y: number },
     instruction?: string,
+    options?: { operation?: AiWorkflowOperation; title?: string },
   ) => string | undefined
   addMarkupNode: (
     kind: MarkupKind,
@@ -89,6 +108,7 @@ export type CanvasActionRuntime = {
   removeSectionOnly: (nodeId: string) => void
   selectNodes: (nodeIds: string[], primaryNodeId?: string) => void
   generateVariations: (sourceNodeId?: string) => void
+  generateImageEdit: (sourceNodeId: string | undefined, operation: AiWorkflowOperation, prompt: string) => void
   generateBesideNode: (sourceNodeId?: string, prompt?: string) => void
   generateIntoAiSlot: (slotId?: string, prompt?: string) => void
   generateFromAnnotation: (annotationNodeId?: string) => void

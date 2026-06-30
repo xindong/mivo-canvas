@@ -1,23 +1,30 @@
 import {
   AlignCenter,
+  AlignHorizontalJustifyCenter,
+  AlignHorizontalJustifyEnd,
+  AlignHorizontalJustifyStart,
+  AlignVerticalJustifyCenter,
+  AlignVerticalJustifyEnd,
+  AlignVerticalJustifyStart,
   ArrowDown,
+  ArrowLeftRight,
+  ArrowRight,
   ArrowUp,
   ArrowUpRight,
-  Brush,
+  BetweenHorizontalStart,
+  BetweenVerticalStart,
   ChevronsDown,
   ChevronsUp,
   Clipboard,
   Copy,
   Crop,
   Download,
+  Eraser,
   Eye,
   EyeOff,
   ExternalLink,
-  FileText,
-  FileVideo,
   FilePlus2,
   Group,
-  Image,
   ImagePlus,
   LocateFixed,
   Lock,
@@ -25,7 +32,6 @@ import {
   MessageSquareText,
   Minus,
   PanelTop,
-  PaintBucket,
   Pencil,
   Square,
   SquareDashed,
@@ -35,6 +41,7 @@ import {
   Trash2,
   Ungroup,
   Unlock,
+  Wand2,
 } from 'lucide-react'
 import type { DistributionAxis, SelectionAlignment } from '../../store/canvasStore'
 import type { CanvasNodeType, MarkupKind, SectionLockMode, ToolId } from '../../types/mivoCanvas'
@@ -111,6 +118,93 @@ const addAnnotationForPrimary = (runtime: CanvasActionRuntime) => {
   runtime.addAnnotationNode(primaryNodeId(runtime))
 }
 
+const beginImageEditPrompt = (
+  runtime: CanvasActionRuntime,
+  operation: Parameters<CanvasActionRuntime['generateImageEdit']>[1],
+  instruction: string,
+  titlePrefix: string,
+) => {
+  const nodeId = primaryNodeId(runtime)
+  if (!nodeId) return
+
+  const noteId = runtime.addAnnotationNode(nodeId, undefined, instruction, {
+    operation,
+    title: `${titlePrefix} for ${runtime.context.primaryNode?.title || 'image'}`,
+  })
+  if (!noteId) return
+
+  runtime.setActiveTool('select')
+  runtime.onEditText?.(noteId)
+}
+
+const generateImageEditForPrimary = (
+  runtime: CanvasActionRuntime,
+  operation: Parameters<CanvasActionRuntime['generateImageEdit']>[1],
+  prompt: string,
+) => {
+  runtime.generateImageEdit(primaryNodeId(runtime), operation, prompt)
+}
+
+const imageAiEditActionsFor = (runtime: CanvasActionRuntime): CanvasActionItem[] => [
+  {
+    id: 'edit-with-prompt',
+    label: 'Edit with prompt',
+    icon: Wand2,
+    onClick: () =>
+      beginImageEditPrompt(
+        runtime,
+        'prompt-edit',
+        'Describe the image edit here',
+        'Prompt edit',
+      ),
+  },
+  {
+    id: 'select-area-edit',
+    label: 'Select area',
+    icon: SquareMousePointer,
+    onClick: () =>
+      beginImageEditPrompt(
+        runtime,
+        'area-edit',
+        'Select the area to edit, then describe the change here',
+        'Area edit',
+      ),
+  },
+  {
+    id: 'remove-background',
+    label: 'Remove background',
+    icon: Eraser,
+    onClick: () =>
+      generateImageEditForPrimary(
+        runtime,
+        'remove-background',
+        'Remove the background and keep the subject as a clean transparent cutout.',
+      ),
+  },
+  {
+    id: 'expand-image',
+    label: 'Expand',
+    icon: Maximize2,
+    onClick: () =>
+      generateImageEditForPrimary(
+        runtime,
+        'outpaint',
+        'Expand the image beyond its current edges while preserving the original composition.',
+      ),
+  },
+  {
+    id: 'boost-resolution',
+    label: 'Boost resolution',
+    text: 'HD',
+    onClick: () =>
+      generateImageEditForPrimary(
+        runtime,
+        'upscale',
+        'Increase image resolution and preserve the original visual content.',
+      ),
+  },
+]
+
 const generateFromPrimaryAnnotation = (runtime: CanvasActionRuntime) => {
   runtime.generateFromAnnotation(primaryNodeId(runtime))
 }
@@ -140,18 +234,18 @@ const lockLabelFor = (runtime: CanvasActionRuntime) =>
   runtime.context.nodes.some((node) => !node.locked) ? 'Lock' : 'Unlock'
 
 const sectionFillPresets = [
-  { label: 'White fill', value: '#ffffff' },
-  { label: 'Warm fill', value: '#fff7e6' },
-  { label: 'Blue fill', value: '#eef6ff' },
-  { label: 'Pink fill', value: '#fff0f0' },
-  { label: 'Green fill', value: '#effaf2' },
+  { label: 'White', value: '#ffffff' },
+  { label: 'Warm', value: '#fff7e6' },
+  { label: 'Blue', value: '#eef6ff' },
+  { label: 'Pink', value: '#fff0f0' },
+  { label: 'Green', value: '#effaf2' },
 ]
 
 const sectionBorderPresets = [
-  { label: 'Orange border', value: '#ff8a00' },
-  { label: 'Blue border', value: '#159bff' },
-  { label: 'Purple border', value: '#6957e8' },
-  { label: 'Gray border', value: '#8c8880' },
+  { label: 'Orange', value: '#ff8a00' },
+  { label: 'Blue', value: '#159bff' },
+  { label: 'Purple', value: '#6957e8' },
+  { label: 'Gray', value: '#8c8880' },
 ]
 
 const markupColorPresets = [
@@ -168,6 +262,11 @@ const markupFillPresets = [
   { label: 'Soft yellow', value: '#fff1a8' },
   { label: 'Soft blue', value: 'rgba(21, 155, 255, 0.1)' },
 ]
+
+const swatchForColor = (color: string) => ({
+  color,
+  transparent: color === 'transparent',
+})
 
 const setSectionStyle = (
   runtime: CanvasActionRuntime,
@@ -202,6 +301,76 @@ const removeSectionOnly = (runtime: CanvasActionRuntime) => {
 
   runtime.removeSectionOnly(nodeId)
 }
+
+const sectionStyleStateFor = (runtime: CanvasActionRuntime) => {
+  const section = runtime.context.primaryNode
+
+  return {
+    fillColor: section?.sectionFillColor || '#ffffff',
+    lineColor: section?.sectionBorderColor || section?.frameColor || '#ff8a00',
+    lineStyle: section?.sectionBorderStyle || 'dashed',
+    lineWidth: section?.sectionBorderWidth || 2,
+  }
+}
+
+const sectionFillActionsFor = (runtime: CanvasActionRuntime, fillColor: string): CanvasActionItem[] =>
+  sectionFillPresets.map((preset) => ({
+    id: `section-fill-${preset.value}`,
+    label: preset.label,
+    swatch: swatchForColor(preset.value),
+    selected: fillColor === preset.value,
+    onClick: () => setSectionStyle(runtime, { sectionFillColor: preset.value }),
+  }))
+
+const sectionLineActionsFor = (
+  runtime: CanvasActionRuntime,
+  lineColor: string,
+  lineStyle: 'solid' | 'dashed',
+  lineWidth: number,
+): CanvasActionItem[] => [
+  ...sectionBorderPresets.map((preset) => ({
+    id: `section-line-${preset.value}`,
+    label: preset.label,
+    swatch: swatchForColor(preset.value),
+    selected: lineColor === preset.value,
+    onClick: () => setSectionStyle(runtime, { sectionBorderColor: preset.value }),
+  })),
+  {
+    id: 'section-line-dashed',
+    label: 'Dashed line',
+    linePreview: { color: lineColor, width: 3, dashed: true },
+    selected: lineStyle === 'dashed',
+    onClick: () => setSectionStyle(runtime, { sectionBorderStyle: 'dashed' }),
+  },
+  {
+    id: 'section-line-solid',
+    label: 'Solid line',
+    linePreview: { color: lineColor, width: 3 },
+    selected: lineStyle === 'solid',
+    onClick: () => setSectionStyle(runtime, { sectionBorderStyle: 'solid' }),
+  },
+  {
+    id: 'section-line-thin',
+    label: 'Thin',
+    linePreview: { color: lineColor, width: 1, dashed: lineStyle === 'dashed' },
+    selected: lineWidth === 1,
+    onClick: () => setSectionStyle(runtime, { sectionBorderWidth: 1 }),
+  },
+  {
+    id: 'section-line-medium',
+    label: 'Medium',
+    linePreview: { color: lineColor, width: 2, dashed: lineStyle === 'dashed' },
+    selected: lineWidth === 2,
+    onClick: () => setSectionStyle(runtime, { sectionBorderWidth: 2 }),
+  },
+  {
+    id: 'section-line-bold',
+    label: 'Bold',
+    linePreview: { color: lineColor, width: 4, dashed: lineStyle === 'dashed' },
+    selected: lineWidth === 4,
+    onClick: () => setSectionStyle(runtime, { sectionBorderWidth: 4 }),
+  },
+]
 
 const sectionLockToolbarAction = (runtime: CanvasActionRuntime): CanvasActionItem => {
   const section = runtime.context.primaryNode
@@ -307,18 +476,26 @@ type NodeActionExtension = (runtime: CanvasActionRuntime) => CanvasActionGroup[]
 
 const sectionContextMenuGroupsFor: NodeActionExtension = (runtime) => {
   const { context } = runtime
+  const { fillColor, lineColor, lineStyle, lineWidth } = sectionStyleStateFor(runtime)
 
   return [
     {
       id: 'section',
       actions: [
-        { id: 'section-fill-white', label: 'White fill', icon: Brush, onClick: () => setSectionStyle(runtime, { sectionFillColor: '#ffffff' }) },
-        { id: 'section-fill-warm', label: 'Warm fill', icon: Brush, onClick: () => setSectionStyle(runtime, { sectionFillColor: '#fff7e6' }) },
-        { id: 'section-border-orange', label: 'Orange dashed border', icon: SquareDashed, onClick: () => setSectionStyle(runtime, { sectionBorderColor: '#ff8a00', sectionBorderStyle: 'dashed' }) },
-        { id: 'section-border-solid', label: 'Solid border', icon: SquareDashed, onClick: () => setSectionStyle(runtime, { sectionBorderStyle: 'solid' }) },
-        { id: 'section-border-thin', label: 'Thin border', text: '1', onClick: () => setSectionStyle(runtime, { sectionBorderWidth: 1 }) },
-        { id: 'section-border-medium', label: 'Medium border', text: '2', onClick: () => setSectionStyle(runtime, { sectionBorderWidth: 2 }) },
-        { id: 'section-border-bold', label: 'Bold border', text: '4', onClick: () => setSectionStyle(runtime, { sectionBorderWidth: 4 }) },
+        {
+          id: 'section-fill',
+          label: 'Section fill',
+          swatch: swatchForColor(fillColor),
+          children: sectionFillActionsFor(runtime, fillColor),
+          onClick: () => setSectionStyle(runtime, { sectionFillColor: '#ffffff' }),
+        },
+        {
+          id: 'section-line',
+          label: 'Section line',
+          linePreview: { color: lineColor, width: lineWidth, dashed: lineStyle === 'dashed' },
+          children: sectionLineActionsFor(runtime, lineColor, lineStyle, lineWidth),
+          onClick: () => setSectionStyle(runtime, { sectionBorderColor: '#ff8a00' }),
+        },
         {
           id: 'section-title-toggle',
           label: context.primaryNode?.sectionTitleVisible === false ? 'Show title' : 'Hide title',
@@ -431,101 +608,141 @@ const generationContextMenuGroupsFor: NodeActionExtension = (runtime) => {
   ]
 }
 
-const markupStyleActionsFor = (runtime: CanvasActionRuntime): CanvasActionItem[] => [
-  ...(runtime.context.primaryNode?.markupKind === 'arrow' || runtime.context.primaryNode?.markupKind === 'line'
-    ? [
+const markupStyleActionsFor = (runtime: CanvasActionRuntime): CanvasActionItem[] => {
+  const node = runtime.context.primaryNode
+  const kind = node?.markupKind
+  const isConnector = kind === 'arrow' || kind === 'line'
+  const strokeColor = node?.markupStrokeColor || '#6957e8'
+  const fillColor = node?.markupFillColor || 'transparent'
+  const strokeWidth = node?.markupStrokeWidth || 3
+  const isMediumStrokeWidth = strokeWidth !== 2 && strokeWidth !== 6
+  const strokeStyle = node?.markupStrokeStyle || 'solid'
+  const hasStartArrow = Boolean(node?.markupStartArrow)
+  const hasEndArrow = node?.markupEndArrow ?? kind === 'arrow'
+  const cornerRadius = node?.markupCornerRadius || 0
+
+  return [
+    ...(isConnector
+      ? [
+          {
+            id: 'markup-arrowheads',
+            label: 'Arrowheads',
+            icon: ArrowUpRight,
+            menuVariant: 'segmented',
+            children: [
+              {
+                id: 'markup-arrow-none',
+                label: 'No arrows',
+                icon: Minus,
+                selected: !hasStartArrow && !hasEndArrow,
+                onClick: () => setMarkupStyle(runtime, { markupStartArrow: false, markupEndArrow: false }),
+              },
+              {
+                id: 'markup-arrow-end',
+                label: 'End arrow',
+                icon: ArrowRight,
+                selected: !hasStartArrow && hasEndArrow,
+                onClick: () => setMarkupStyle(runtime, { markupStartArrow: false, markupEndArrow: true }),
+              },
+              {
+                id: 'markup-arrow-both',
+                label: 'Both arrows',
+                icon: ArrowLeftRight,
+                selected: hasStartArrow && hasEndArrow,
+                onClick: () => setMarkupStyle(runtime, { markupStartArrow: true, markupEndArrow: true }),
+              },
+            ],
+            onClick: () =>
+              setMarkupStyle(runtime, {
+                markupStartArrow: false,
+                markupEndArrow: !hasEndArrow,
+              }),
+          } satisfies CanvasActionItem,
+        ]
+      : []),
+    {
+      id: 'markup-fill-color',
+      label: 'Fill color',
+      swatch: swatchForColor(fillColor),
+      menuVariant: 'palette',
+      children: markupFillPresets.map((preset) => ({
+        id: `markup-fill-${preset.value}`,
+        label: preset.label,
+        swatch: swatchForColor(preset.value),
+        selected: fillColor === preset.value,
+        onClick: () => setMarkupStyle(runtime, { markupFillColor: preset.value }),
+      })),
+      onClick: () => setMarkupStyle(runtime, { markupFillColor: 'rgba(105, 87, 232, 0.08)' }),
+    },
+    {
+      id: 'markup-line-style',
+      label: 'Line',
+      linePreview: { color: strokeColor, width: strokeWidth, dashed: strokeStyle === 'dashed' },
+      menuVariant: 'palette',
+      children: [
+        ...markupColorPresets.map((preset) => ({
+          id: `markup-stroke-${preset.value}`,
+          label: preset.label,
+          swatch: swatchForColor(preset.value),
+          selected: strokeColor === preset.value,
+          onClick: () => setMarkupStyle(runtime, { markupStrokeColor: preset.value }),
+        })),
         {
-          id: 'markup-arrowheads',
-          label: 'Arrowheads',
-          icon: ArrowUpRight,
-          children: [
-            {
-              id: 'markup-arrow-none',
-              label: 'No arrows',
-              text: '–',
-              onClick: () => setMarkupStyle(runtime, { markupStartArrow: false, markupEndArrow: false }),
-            },
-            {
-              id: 'markup-arrow-end',
-              label: 'End arrow',
-              text: '→',
-              onClick: () => setMarkupStyle(runtime, { markupStartArrow: false, markupEndArrow: true }),
-            },
-            {
-              id: 'markup-arrow-both',
-              label: 'Both arrows',
-              text: '↔',
-              onClick: () => setMarkupStyle(runtime, { markupStartArrow: true, markupEndArrow: true }),
-            },
-          ],
-          onClick: () =>
-            setMarkupStyle(runtime, {
-              markupStartArrow: false,
-              markupEndArrow: !(runtime.context.primaryNode?.markupEndArrow ?? runtime.context.primaryNode?.markupKind === 'arrow'),
-            }),
-        } satisfies CanvasActionItem,
-      ]
-    : []),
-  {
-    id: 'markup-stroke-color',
-    label: 'Stroke color',
-    icon: PaintBucket,
-    children: markupColorPresets.map((preset) => ({
-      id: `markup-stroke-${preset.value}`,
-      label: preset.label,
-      text: '●',
-      onClick: () => setMarkupStyle(runtime, { markupStrokeColor: preset.value }),
-    })),
-    onClick: () => setMarkupStyle(runtime, { markupStrokeColor: '#6957e8' }),
-  },
-  {
-    id: 'markup-fill-color',
-    label: 'Fill color',
-    icon: Square,
-    children: markupFillPresets.map((preset) => ({
-      id: `markup-fill-${preset.value}`,
-      label: preset.label,
-      text: '●',
-      onClick: () => setMarkupStyle(runtime, { markupFillColor: preset.value }),
-    })),
-    onClick: () => setMarkupStyle(runtime, { markupFillColor: 'rgba(105, 87, 232, 0.08)' }),
-  },
-  {
-    id: 'markup-stroke-width',
-    label: 'Stroke width',
-    icon: Minus,
-    children: [
-      { id: 'markup-width-2', label: 'Thin', text: '2', onClick: () => setMarkupStyle(runtime, { markupStrokeWidth: 2 }) },
-      { id: 'markup-width-4', label: 'Medium', text: '4', onClick: () => setMarkupStyle(runtime, { markupStrokeWidth: 4 }) },
-      { id: 'markup-width-6', label: 'Bold', text: '6', onClick: () => setMarkupStyle(runtime, { markupStrokeWidth: 6 }) },
-    ],
-    onClick: () => setMarkupStyle(runtime, { markupStrokeWidth: 4 }),
-  },
-  {
-    id: 'markup-stroke-style',
-    label: runtime.context.primaryNode?.markupStrokeStyle === 'dashed' ? 'Solid line' : 'Dashed line',
-    icon: SquareDashed,
-    onClick: () =>
-      setMarkupStyle(runtime, {
-        markupStrokeStyle: runtime.context.primaryNode?.markupStrokeStyle === 'dashed' ? 'solid' : 'dashed',
-      }),
-  },
-  ...(runtime.context.primaryNode?.markupKind === 'rect'
-    ? [
+          id: 'markup-stroke-solid',
+          label: 'Solid line',
+          linePreview: { color: strokeColor, width: 3 },
+          selected: strokeStyle === 'solid',
+          onClick: () => setMarkupStyle(runtime, { markupStrokeStyle: 'solid' }),
+        },
         {
-          id: 'markup-corner-radius',
-          label: 'Corner radius',
-          icon: Square,
-          children: [
-            { id: 'markup-radius-0', label: 'Sharp', text: '0', onClick: () => setMarkupStyle(runtime, { markupCornerRadius: 0 }) },
-            { id: 'markup-radius-6', label: 'Soft', text: '6', onClick: () => setMarkupStyle(runtime, { markupCornerRadius: 6 }) },
-            { id: 'markup-radius-18', label: 'Round', text: '18', onClick: () => setMarkupStyle(runtime, { markupCornerRadius: 18 }) },
-          ],
-          onClick: () => setMarkupStyle(runtime, { markupCornerRadius: runtime.context.primaryNode?.markupCornerRadius ? 0 : 8 }),
-        } satisfies CanvasActionItem,
-      ]
-    : []),
-]
+          id: 'markup-stroke-dashed',
+          label: 'Dashed line',
+          linePreview: { color: strokeColor, width: 3, dashed: true },
+          selected: strokeStyle === 'dashed',
+          onClick: () => setMarkupStyle(runtime, { markupStrokeStyle: 'dashed' }),
+        },
+        {
+          id: 'markup-width-2',
+          label: 'Thin',
+          linePreview: { color: strokeColor, width: 2, dashed: strokeStyle === 'dashed' },
+          selected: strokeWidth === 2,
+          onClick: () => setMarkupStyle(runtime, { markupStrokeWidth: 2 }),
+        },
+        {
+          id: 'markup-width-3',
+          label: 'Medium',
+          linePreview: { color: strokeColor, width: 3, dashed: strokeStyle === 'dashed' },
+          selected: isMediumStrokeWidth,
+          onClick: () => setMarkupStyle(runtime, { markupStrokeWidth: 3 }),
+        },
+        {
+          id: 'markup-width-6',
+          label: 'Bold',
+          linePreview: { color: strokeColor, width: 6, dashed: strokeStyle === 'dashed' },
+          selected: strokeWidth === 6,
+          onClick: () => setMarkupStyle(runtime, { markupStrokeWidth: 6 }),
+        },
+      ],
+      onClick: () => setMarkupStyle(runtime, { markupStrokeColor: '#6957e8' }),
+    },
+    ...(kind === 'rect'
+      ? [
+          {
+            id: 'markup-corner-radius',
+            label: 'Corner radius',
+            icon: Square,
+            menuVariant: 'segmented',
+            children: [
+              { id: 'markup-radius-0', label: 'Sharp', text: '0', selected: cornerRadius === 0, onClick: () => setMarkupStyle(runtime, { markupCornerRadius: 0 }) },
+              { id: 'markup-radius-6', label: 'Soft', text: '6', selected: cornerRadius === 6, onClick: () => setMarkupStyle(runtime, { markupCornerRadius: 6 }) },
+              { id: 'markup-radius-18', label: 'Round', text: '18', selected: cornerRadius === 18, onClick: () => setMarkupStyle(runtime, { markupCornerRadius: 18 }) },
+            ],
+            onClick: () => setMarkupStyle(runtime, { markupCornerRadius: cornerRadius ? 0 : 8 }),
+          } satisfies CanvasActionItem,
+        ]
+      : []),
+  ]
+}
 
 const markupContextMenuGroupsFor: NodeActionExtension = (runtime) => [
   {
@@ -836,10 +1053,8 @@ const aiSlotQuickToolbarGroupsFor: NodeActionExtension = (runtime) => [
     id: 'ai-slot',
     actions: [
       { id: 'fill-slot', label: 'Generate', icon: ImagePlus, onClick: () => generateIntoPrimarySlot(runtime) },
-      { id: 'copy', label: 'Copy', icon: Copy, onClick: runtime.copySelectedNodes },
       { id: 'duplicate', label: 'Duplicate', icon: Copy, onClick: () => duplicateAction(runtime) },
       { id: 'bring-front', label: 'Front', icon: ChevronsUp, onClick: () => moveLayerAction(runtime, 'front') },
-      { id: 'delete', label: 'Delete', icon: Trash2, danger: true, onClick: () => deleteAction(runtime) },
     ],
   },
 ]
@@ -850,9 +1065,7 @@ const annotationQuickToolbarGroupsFor: NodeActionExtension = (runtime) => [
     actions: [
       { id: 'generate-from-note', label: 'Generate', icon: Sparkles, onClick: () => generateFromPrimaryAnnotation(runtime) },
       { id: 'edit-note', label: 'Edit', icon: Type, onClick: () => runtime.onEditText?.(runtime.context.primaryNode?.id || '') },
-      { id: 'copy', label: 'Copy', icon: Copy, onClick: runtime.copySelectedNodes },
       { id: 'duplicate', label: 'Duplicate', icon: Copy, onClick: () => duplicateAction(runtime) },
-      { id: 'delete', label: 'Delete', icon: Trash2, danger: true, onClick: () => deleteAction(runtime) },
     ],
   },
 ]
@@ -868,7 +1081,6 @@ const markupQuickToolbarGroupsFor: NodeActionExtension = (runtime) => [
         onClick: () => runtime.onEditText?.(runtime.context.primaryNode?.id || ''),
       },
       ...markupStyleActionsFor(runtime),
-      { id: 'copy', label: 'Copy', icon: Copy, onClick: runtime.copySelectedNodes },
       { id: 'duplicate', label: 'Duplicate', icon: Copy, onClick: () => duplicateAction(runtime) },
       { id: 'bring-front', label: 'Front', icon: ChevronsUp, onClick: () => moveLayerAction(runtime, 'front') },
       { id: 'delete', label: 'Delete', icon: Trash2, danger: true, onClick: () => deleteAction(runtime) },
@@ -879,24 +1091,23 @@ const markupQuickToolbarGroupsFor: NodeActionExtension = (runtime) => [
 const imageQuickToolbarGroupsFor: NodeActionExtension = (runtime) => {
   if (!hasAnyCapability(runtime.context, 'imageAsset')) return []
 
-  const aiEditActions: CanvasActionItem[] = [
-    { id: 'generate-beside', label: 'Generate beside', icon: Sparkles, onClick: () => generateBesidePrimary(runtime) },
-    { id: 'add-edit-note', label: 'Add edit note', icon: MessageSquareText, onClick: () => addAnnotationForPrimary(runtime) },
-    { id: 'variations', label: 'Make variations', icon: Sparkles, onClick: () => makeVariations(runtime) },
-  ]
-
   return [
     {
       id: 'image',
       actions: [
-        { id: 'details', label: 'Details', icon: Image, onClick: () => runtime.onOpenDetails?.() },
         { id: 'crop', label: 'Crop', icon: Crop, onClick: () => cropPrimaryNode(runtime) },
         {
           id: 'ai-edit-menu',
           label: 'AI Edit',
           icon: Sparkles,
-          children: aiEditActions,
-          onClick: () => makeVariations(runtime),
+          children: imageAiEditActionsFor(runtime),
+          onClick: () =>
+            beginImageEditPrompt(
+              runtime,
+              'prompt-edit',
+              'Describe the image edit here',
+              'Prompt edit',
+            ),
         },
       ],
     },
@@ -905,19 +1116,15 @@ const imageQuickToolbarGroupsFor: NodeActionExtension = (runtime) => {
 
 const fileQuickToolbarGroupsFor: NodeActionExtension = (runtime) => {
   const node = runtime.context.primaryNode
-  if (!node || (!hasAnyCapability(runtime.context, 'markdownDoc') && !hasAnyCapability(runtime.context, 'pdfAsset') && !hasAnyCapability(runtime.context, 'videoAsset'))) {
+  if (!node || !hasAnyCapability(runtime.context, 'pdfAsset')) {
     return []
   }
-  const FileIcon = node.type === 'video' ? FileVideo : FileText
 
   return [
     {
       id: 'file',
       actions: [
-        { id: 'details', label: 'Details', icon: FileIcon, onClick: () => runtime.onOpenDetails?.() },
         { id: 'download-original', label: 'Download original', icon: Download, onClick: () => downloadPrimaryOriginal(runtime) },
-        { id: 'copy', label: 'Copy', icon: Copy, onClick: runtime.copySelectedNodes },
-        { id: 'delete', label: 'Delete', icon: Trash2, danger: true, onClick: () => deleteAction(runtime) },
       ],
     },
   ]
@@ -929,15 +1136,14 @@ const textQuickToolbarGroupsFor: NodeActionExtension = (runtime) => [
     actions: [
       { id: 'generate-beside-text', label: 'Generate', icon: Sparkles, onClick: () => generateBesidePrimary(runtime) },
       { id: 'edit-text', label: 'Edit', icon: Type, onClick: () => runtime.onEditText?.(runtime.context.primaryNode?.id || '') },
-      { id: 'copy', label: 'Copy', icon: Copy, onClick: runtime.copySelectedNodes },
       { id: 'duplicate', label: 'Duplicate', icon: Copy, onClick: () => duplicateAction(runtime) },
-      { id: 'delete', label: 'Delete', icon: Trash2, danger: true, onClick: () => deleteAction(runtime) },
     ],
   },
 ]
 
 const sectionQuickToolbarGroupsFor: NodeActionExtension = (runtime) => {
   const { context } = runtime
+  const { fillColor, lineColor, lineStyle, lineWidth } = sectionStyleStateFor(runtime)
 
   return [
     {
@@ -946,29 +1152,17 @@ const sectionQuickToolbarGroupsFor: NodeActionExtension = (runtime) => {
         {
           id: 'section-fill',
           label: 'Section fill',
-          icon: PaintBucket,
-          children: sectionFillPresets.map((preset) => ({
-            id: `section-fill-${preset.value}`,
-            label: preset.label,
-            text: '●',
-            onClick: () => setSectionStyle(runtime, { sectionFillColor: preset.value }),
-          })),
+          swatch: swatchForColor(fillColor),
+          menuVariant: 'palette',
+          children: sectionFillActionsFor(runtime, fillColor),
           onClick: () => setSectionStyle(runtime, { sectionFillColor: '#ffffff' }),
         },
         {
-          id: 'section-border',
-          label: 'Section border',
-          icon: SquareDashed,
-          children: [
-            ...sectionBorderPresets.map((preset) => ({
-              id: `section-border-${preset.value}`,
-              label: preset.label,
-              text: '●',
-              onClick: () => setSectionStyle(runtime, { sectionBorderColor: preset.value }),
-            })),
-            { id: 'section-border-dashed', label: 'Dashed border', text: 'D', onClick: () => setSectionStyle(runtime, { sectionBorderStyle: 'dashed' }) },
-            { id: 'section-border-solid', label: 'Solid border', text: 'S', onClick: () => setSectionStyle(runtime, { sectionBorderStyle: 'solid' }) },
-          ],
+          id: 'section-line',
+          label: 'Section line',
+          linePreview: { color: lineColor, width: lineWidth, dashed: lineStyle === 'dashed' },
+          menuVariant: 'palette',
+          children: sectionLineActionsFor(runtime, lineColor, lineStyle, lineWidth),
           onClick: () => setSectionStyle(runtime, { sectionBorderColor: '#ff8a00' }),
         },
         {
@@ -1020,24 +1214,24 @@ export const quickToolbarGroupsFor = (runtime: CanvasActionRuntime): CanvasActio
 
   if (context.kind === 'multi') {
     const alignActions: CanvasActionItem[] = [
-      { id: 'align-left', label: 'Align left', text: 'L', onClick: () => align(runtime, 'left') },
-      { id: 'align-center', label: 'Align center', text: 'C', onClick: () => align(runtime, 'center') },
-      { id: 'align-right', label: 'Align right', text: 'R', onClick: () => align(runtime, 'right') },
-      { id: 'align-top', label: 'Align top', text: 'T', onClick: () => align(runtime, 'top') },
-      { id: 'align-middle', label: 'Align middle', text: 'M', onClick: () => align(runtime, 'middle') },
-      { id: 'align-bottom', label: 'Align bottom', text: 'B', onClick: () => align(runtime, 'bottom') },
+      { id: 'align-left', label: 'Align left', icon: AlignHorizontalJustifyStart, onClick: () => align(runtime, 'left') },
+      { id: 'align-center', label: 'Align center', icon: AlignHorizontalJustifyCenter, onClick: () => align(runtime, 'center') },
+      { id: 'align-right', label: 'Align right', icon: AlignHorizontalJustifyEnd, onClick: () => align(runtime, 'right') },
+      { id: 'align-top', label: 'Align top', icon: AlignVerticalJustifyStart, onClick: () => align(runtime, 'top') },
+      { id: 'align-middle', label: 'Align middle', icon: AlignVerticalJustifyCenter, onClick: () => align(runtime, 'middle') },
+      { id: 'align-bottom', label: 'Align bottom', icon: AlignVerticalJustifyEnd, onClick: () => align(runtime, 'bottom') },
       ...(context.selectedCount >= 3
         ? [
             {
               id: 'distribute-horizontal',
               label: 'Distribute horizontal',
-              text: 'H',
+              icon: BetweenHorizontalStart,
               onClick: () => distribute(runtime, 'horizontal'),
             },
             {
               id: 'distribute-vertical',
               label: 'Distribute vertical',
-              text: 'V',
+              icon: BetweenVerticalStart,
               onClick: () => distribute(runtime, 'vertical'),
             },
           ]
@@ -1048,7 +1242,6 @@ export const quickToolbarGroupsFor = (runtime: CanvasActionRuntime): CanvasActio
       {
         id: 'multi',
         actions: [
-          { id: 'copy', label: 'Copy', icon: Copy, onClick: runtime.copySelectedNodes },
           { id: 'duplicate', label: 'Duplicate', icon: Copy, onClick: () => duplicateAction(runtime) },
           ...(hasGroupedNodes(runtime)
             ? [{ id: 'ungroup', label: 'Ungroup', icon: Ungroup, onClick: runtime.ungroupSelectedNodes }]
@@ -1059,6 +1252,7 @@ export const quickToolbarGroupsFor = (runtime: CanvasActionRuntime): CanvasActio
             id: 'align-menu',
             label: 'Align',
             icon: AlignCenter,
+            menuVariant: 'icon-grid',
             children: alignActions,
             onClick: () => align(runtime, 'center'),
           },
@@ -1071,7 +1265,6 @@ export const quickToolbarGroupsFor = (runtime: CanvasActionRuntime): CanvasActio
           ...(hasCommonCapability(context, 'layerable')
             ? [{ id: 'bring-front', label: 'Front', icon: ChevronsUp, onClick: () => moveLayerAction(runtime, 'front') }]
             : []),
-          { id: 'delete', label: 'Delete', icon: Trash2, danger: true, onClick: () => deleteAction(runtime) },
         ],
       },
     ]

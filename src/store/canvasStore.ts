@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import type {
   AiCanvasContextSnapshot,
+  AiWorkflowOperation,
   CanvasAssetNodeType,
   CanvasId,
   CanvasDocument,
@@ -111,6 +112,7 @@ type CanvasState = {
     sourceNodeId?: string,
     position?: { x: number; y: number },
     instruction?: string,
+    options?: { operation?: AiWorkflowOperation; title?: string },
   ) => string | undefined
   addMarkupNode: (
     kind: MarkupKind,
@@ -176,6 +178,7 @@ type CanvasState = {
   ) => void
   resizeTextNode: (nodeId: string, x: number, width: number, height: number) => void
   generateVariations: (sourceNodeId?: string) => void
+  generateImageEdit: (sourceNodeId: string | undefined, operation: AiWorkflowOperation, prompt: string) => void
   generateBesideNode: (sourceNodeId?: string, prompt?: string) => void
   generateIntoAiSlot: (slotId?: string, prompt?: string) => void
   generateFromAnnotation: (annotationNodeId?: string) => void
@@ -1474,7 +1477,7 @@ export const useCanvasStore = create<CanvasState>()(
 
         return id
       },
-      addAnnotationNode: (sourceNodeId, position, instruction) => {
+      addAnnotationNode: (sourceNodeId, position, instruction, options) => {
         const id = createNodeId('annotation')
         const defaultSize = defaultSizeForNodeType('annotation')
         const createdAt = Date.now()
@@ -1492,7 +1495,7 @@ export const useCanvasStore = create<CanvasState>()(
           const annotation = makeNode({
             id,
             type: 'annotation',
-            title: `Edit note for ${source.title}`,
+            title: options?.title || `Edit note for ${source.title}`,
             text: note,
             fontSize: 18,
             textColor: '#4f4548',
@@ -1514,7 +1517,7 @@ export const useCanvasStore = create<CanvasState>()(
             aiWorkflow: {
               kind: 'annotation',
               status: 'ready',
-              operation: 'annotation-edit',
+              operation: options?.operation || 'annotation-edit',
               prompt: note,
               sourceNodeIds: [source.id],
               anchorNodeId: source.id,
@@ -1802,6 +1805,80 @@ export const useCanvasStore = create<CanvasState>()(
             tasks: [result.task, ...current.tasks].slice(0, 5),
           }),
         }))
+      },
+      generateImageEdit: (sourceNodeId, operation, prompt) => {
+        const id = createNodeId(`ai-${operation}`)
+        const createdAt = Date.now()
+        const operationLabels: Record<string, string> = {
+          'prompt-edit': 'Prompt edit',
+          'area-edit': 'Area edit',
+          'remove-background': 'Remove background',
+          outpaint: 'Expand image',
+          upscale: 'Boost resolution',
+        }
+
+        set((state) => {
+          const source =
+            state.nodes.find((node) => node.id === sourceNodeId && node.type === 'image' && !node.hidden) ||
+            state.nodes.find((node) => node.id === state.selectedNodeId && node.type === 'image' && !node.hidden)
+          if (!source) return {}
+
+          const operationLabel = operationLabels[operation] || 'Image edit'
+          const resultPrompt = prompt.trim() || operationLabel
+          const width = operation === 'outpaint' ? Math.round(source.width * 1.16) : source.width
+          const height = operation === 'outpaint' ? Math.round(source.height * 1.16) : source.height
+          const placement = chooseAdjacentPlacement({
+            nodes: state.nodes,
+            anchor: source,
+            width,
+            height,
+            placement: 'right',
+          })
+          const result = makeNode({
+            id,
+            type: 'image',
+            title: `${operationLabel} for ${source.title}`,
+            x: Math.round(placement.x),
+            y: Math.round(placement.y),
+            width: Math.round(width),
+            height: Math.round(height),
+            assetUrl: mockResultAssetUrl(state.nodes),
+            status: 'ready',
+            parentIds: [source.id],
+            generation: {
+              prompt: resultPrompt,
+              model: 'Mivo Mock Image Workflow',
+              size: `${Math.round(width)}x${Math.round(height)}`,
+              seed: createdAt % 99999,
+              strength: operation === 'upscale' ? 0.28 : 0.62,
+              taskId: `task-${id}`,
+            },
+            aiWorkflow: {
+              kind: 'result',
+              status: 'ready',
+              operation,
+              prompt: resultPrompt,
+              sourceNodeIds: [source.id],
+              anchorNodeId: source.id,
+              placement: 'right',
+              createdAt,
+            },
+          })
+          const task: CanvasTask = {
+            id: `task-${id}`,
+            label: `${operationLabel}: ${source.title}`,
+            status: 'done',
+            progress: 100,
+            nodeIds: [id],
+          }
+
+          return patchWithHistory(state, {
+            selectedNodeId: id,
+            selectedNodeIds: [id],
+            nodes: normalizeCanvasNodes([...state.nodes, result]),
+            tasks: [task, ...state.tasks].slice(0, 5),
+          })
+        })
       },
       generateBesideNode: (sourceNodeId, prompt) => {
         const id = createNodeId('ai-result')
