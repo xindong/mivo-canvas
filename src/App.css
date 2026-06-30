@@ -1954,6 +1954,11 @@ button:disabled {
   gap: 2px;
 }
 
+.node-action-item {
+  position: relative;
+  display: block;
+}
+
 .node-action-separator {
   height: 1px;
   margin: 5px 4px;
@@ -1976,7 +1981,19 @@ button:disabled {
   text-align: left;
 }
 
-.node-action-menu button:hover {
+.node-action-menu button span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.node-action-menu button.has-children {
+  padding-right: 7px;
+}
+
+.node-action-menu button:hover,
+.node-action-menu button.active {
   color: #fffaf0;
   background: var(--charcoal);
 }
@@ -1993,6 +2010,36 @@ button:disabled {
   font-size: 11px;
   letter-spacing: 0;
   text-align: center;
+}
+
+.node-action-chevron {
+  flex: 0 0 auto;
+  margin-left: auto;
+  opacity: 0.68;
+}
+
+.node-action-submenu {
+  position: absolute;
+  top: -6px;
+  z-index: 2;
+  display: grid;
+  width: 188px;
+  max-height: min(360px, calc(100vh - 24px));
+  padding: 6px;
+  overflow-y: auto;
+  background: rgba(255, 250, 240, 0.98);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(14px);
+}
+
+.node-action-submenu.side-right {
+  left: calc(100% + 8px);
+}
+
+.node-action-submenu.side-left {
+  right: calc(100% + 8px);
 }
 
 .node-action-menu button.danger {

@@ -152,7 +152,7 @@ export const canvasNodeRegistry = {
     type: 'markdown',
     label: 'Markdown',
     renderKind: 'markdown',
-    defaultSize: { width: 360, height: 280 },
+    defaultSize: { width: 560, height: 320 },
     importBehavior: 'asset-markdown',
     capabilities: (node) => fileCapabilitiesFor(node, 'markdownDoc'),
   },

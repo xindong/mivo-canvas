@@ -6,6 +6,7 @@ const STORE_NAME = 'assets'
 const IMPORTED_ASSET_PREFIX = 'mivo-asset:'
 const transparentAlphaThreshold = 2
 const transparentTrimPadding = 2
+const maxAlphaScanPixels = 12_000_000
 
 const extensionMimeMap: Record<string, string> = {
   gif: 'image/gif',
@@ -27,6 +28,17 @@ const mimeFromFilename = (filename: string) => {
   const extension = filename.split('.').pop()?.toLowerCase() || ''
   return extensionMimeMap[extension] || 'application/octet-stream'
 }
+
+const normalizedMimeType = (type: string) => type.toLowerCase().split(';')[0]
+
+const isKnownOpaqueImageType = (type: string) =>
+  type === 'image/jpeg' || type === 'image/jpg' || type === 'image/bmp'
+
+const isLikelyTransparentImageType = (type: string) =>
+  type === 'image/svg+xml' || type === 'image/gif'
+
+const shouldScanImageAlpha = (type: string) =>
+  type === 'image/png' || type === 'image/webp'
 
 type StoredAsset = {
   id: string
@@ -167,6 +179,7 @@ const alphaBoundsFor = (imageData: ImageData): AlphaBounds | undefined => {
 
 const prepareImportedImage = async (file: File): Promise<PreparedImportedImage> => {
   const detectedType = file.type || mimeFromFilename(file.name)
+  const normalizedType = normalizedMimeType(detectedType)
   const fallback = {
     blob: file,
     type: detectedType,
@@ -183,9 +196,24 @@ const prepareImportedImage = async (file: File): Promise<PreparedImportedImage> 
     height: bitmap.height,
   }
 
+  if (isKnownOpaqueImageType(normalizedType) || isLikelyTransparentImageType(normalizedType) || !shouldScanImageAlpha(normalizedType)) {
+    bitmap.close()
+    return {
+      ...fallback,
+      dimensions: sourceDimensions,
+      sourceDimensions,
+      hasTransparency: isLikelyTransparentImageType(normalizedType) ? true : isKnownOpaqueImageType(normalizedType) ? false : undefined,
+    }
+  }
+
+  const sourcePixels = bitmap.width * bitmap.height
+  const scanScale = sourcePixels > maxAlphaScanPixels ? Math.sqrt(maxAlphaScanPixels / sourcePixels) : 1
+  const scanWidth = Math.max(1, Math.round(bitmap.width * scanScale))
+  const scanHeight = Math.max(1, Math.round(bitmap.height * scanScale))
+
   const canvas = document.createElement('canvas')
-  canvas.width = bitmap.width
-  canvas.height = bitmap.height
+  canvas.width = scanWidth
+  canvas.height = scanHeight
   const context = canvas.getContext('2d', { willReadFrequently: true })
 
   if (!context) {
@@ -197,7 +225,7 @@ const prepareImportedImage = async (file: File): Promise<PreparedImportedImage> 
     }
   }
 
-  context.drawImage(bitmap, 0, 0)
+  context.drawImage(bitmap, 0, 0, scanWidth, scanHeight)
   const bounds = alphaBoundsFor(context.getImageData(0, 0, canvas.width, canvas.height))
   bitmap.close()
 

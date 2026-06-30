@@ -1735,6 +1735,28 @@ try {
       throw new Error(`Markup quick toolbar should expose ${action}`)
     }
   }
+  await arrowMarkupNode.evaluate((node) => {
+    const rect = node.getBoundingClientRect()
+    node.dispatchEvent(
+      new MouseEvent('contextmenu', {
+        bubbles: true,
+        cancelable: true,
+        button: 2,
+        clientX: rect.left + rect.width / 2,
+        clientY: rect.top + rect.height / 2,
+      }),
+    )
+  })
+  await page.waitForSelector('.node-action-menu')
+  await page.locator('.node-action-menu').getByRole('menuitem', { name: 'Stroke color' }).hover()
+  await page.waitForSelector('.node-action-submenu')
+  if (
+    (await page.locator('.node-action-submenu').getByRole('menuitem', { name: 'Blue' }).count()) !== 1 ||
+    (await page.locator('.node-action-submenu').getByRole('menuitem', { name: 'Red' }).count()) !== 1
+  ) {
+    throw new Error('Node context menu should render nested markup style actions')
+  }
+  await page.mouse.click(12, 12)
   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Stroke width' }).click()
   await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Bold' }).click()
   const boldMarkupStrokes = await arrowMarkupNode

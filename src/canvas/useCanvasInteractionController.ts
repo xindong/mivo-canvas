@@ -268,6 +268,7 @@ export function useCanvasInteractionController({
   const textResizeRef = useRef<TextResizeState | null>(null)
   const groupResizeRef = useRef<GroupResizeState | null>(null)
   const persistedSceneRef = useRef(sceneId)
+  const viewportPersistenceTimerRef = useRef<number | undefined>(undefined)
   const [viewport, setViewport] = useState(() => initialViewportFor(sceneId))
   const [snapGuides, setSnapGuides] = useState<SnapGuide[]>([])
   const [activeSectionDropTargetId, setActiveSectionDropTargetId] = useState<string | undefined>()
@@ -328,7 +329,14 @@ export function useCanvasInteractionController({
 
   useEffect(() => {
     if (persistedSceneRef.current !== sceneId) return
-    window.localStorage.setItem(viewportStorageKey(sceneId), JSON.stringify(viewport))
+
+    window.clearTimeout(viewportPersistenceTimerRef.current)
+    viewportPersistenceTimerRef.current = window.setTimeout(() => {
+      window.localStorage.setItem(viewportStorageKey(sceneId), JSON.stringify(viewport))
+      viewportPersistenceTimerRef.current = undefined
+    }, 180)
+
+    return () => window.clearTimeout(viewportPersistenceTimerRef.current)
   }, [sceneId, viewport])
 
   useEffect(() => {
