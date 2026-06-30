@@ -1,7 +1,7 @@
 import { useMemo } from 'react'
 import { useCanvasStore } from '../../store/canvasStore'
 import type { MivoCanvasNode } from '../../types/mivoCanvas'
-import type { CanvasActionRuntime } from './canvasActionModel'
+import type { CanvasActionRuntime } from './canvasActionTypes'
 import { createCanvasSelectionContext } from './canvasSelectionModel'
 
 type UseCanvasActionRuntimeOptions = {
@@ -15,7 +15,7 @@ type UseCanvasActionRuntimeOptions = {
   onCreateFrameAt?: (position: { x: number; y: number }) => void
   onEditText?: (nodeId: string) => void
   onRenameNode?: (nodeId: string) => void
-  onImportImageAt?: (position: { x: number; y: number }) => void
+  onImportAssetAt?: (position: { x: number; y: number }) => void
   onCropNode?: (nodeId: string) => void
   onDownloadOriginal?: (node?: MivoCanvasNode) => void
 }
@@ -31,7 +31,7 @@ export const useCanvasActionRuntime = ({
   onCreateFrameAt,
   onEditText,
   onRenameNode,
-  onImportImageAt,
+  onImportAssetAt,
   onCropNode,
   onDownloadOriginal,
 }: UseCanvasActionRuntimeOptions): CanvasActionRuntime => {
@@ -59,6 +59,8 @@ export const useCanvasActionRuntime = ({
   const addFrameNode = useCanvasStore((state) => state.addFrameNode)
   const addAiSlotNode = useCanvasStore((state) => state.addAiSlotNode)
   const addAnnotationNode = useCanvasStore((state) => state.addAnnotationNode)
+  const addMarkupNode = useCanvasStore((state) => state.addMarkupNode)
+  const updateMarkupStyle = useCanvasStore((state) => state.updateMarkupStyle)
   const updateSectionStyle = useCanvasStore((state) => state.updateSectionStyle)
   const setSectionLockMode = useCanvasStore((state) => state.setSectionLockMode)
   const removeSectionOnly = useCanvasStore((state) => state.removeSectionOnly)
@@ -94,7 +96,7 @@ export const useCanvasActionRuntime = ({
     onCreateFrameAt,
     onEditText,
     onRenameNode,
-    onImportImageAt,
+    onImportAssetAt,
     onCropNode,
     onDownloadOriginal,
     setActiveTool,
@@ -102,6 +104,8 @@ export const useCanvasActionRuntime = ({
     addFrameNode,
     addAiSlotNode,
     addAnnotationNode,
+    addMarkupNode,
+    updateMarkupStyle,
     updateSectionStyle,
     setSectionLockMode,
     removeSectionOnly,

@@ -13,6 +13,7 @@ export type CanvasToolHandlerContext = {
   beginNodeResize: (nodeId: string, corner: ResizeCorner, event: ResizeHandlePointerEvent) => void
   beginTextBox: (event: CanvasSurfacePointerEvent) => void
   beginFrameBox: (event: CanvasSurfacePointerEvent) => void
+  beginMarkupBox: (event: CanvasSurfacePointerEvent) => void
   beginTextEdit: (nodeId: string, event: CanvasNodePointerEvent) => boolean
 }
 
@@ -109,9 +110,28 @@ const frameToolHandler: CanvasToolHandler = {
   },
 }
 
+const markupToolHandler: CanvasToolHandler = {
+  id: 'markup',
+  onCanvasPointerDown: (event, context) => {
+    if (event.button !== 0) return
+
+    context.beginMarkupBox(event)
+  },
+  onNodePointerDown: (_nodeId, event, context) => {
+    if (event.button !== 0) return
+
+    event.stopPropagation()
+    context.beginMarkupBox(event)
+  },
+  onResizeHandlePointerDown: (_nodeId, _corner, event) => {
+    event.stopPropagation()
+  },
+}
+
 export const canvasToolHandlers: Record<RuntimeCanvasTool, CanvasToolHandler> = {
   select: selectToolHandler,
   hand: handToolHandler,
   text: textToolHandler,
   frame: frameToolHandler,
+  markup: markupToolHandler,
 }

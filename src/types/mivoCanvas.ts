@@ -10,6 +10,12 @@ export type ToolId =
   | 'asset'
   | 'text'
   | 'frame'
+  | 'markup-arrow'
+  | 'markup-line'
+  | 'markup-rect'
+  | 'markup-ellipse'
+  | 'markup-brush'
+  | 'markup-note'
   | 'brush'
   | 'sticker'
   | 'comment'
@@ -31,9 +37,33 @@ export type DemoSceneId =
 
 export type NodeStatus = 'ready' | 'generating' | 'failed' | 'queued'
 
-export type CanvasNodeType = 'image' | 'task-placeholder' | 'text' | 'frame' | 'ai-slot' | 'annotation'
+export type CanvasNodeType =
+  | 'image'
+  | 'task-placeholder'
+  | 'text'
+  | 'frame'
+  | 'ai-slot'
+  | 'annotation'
+  | 'markup'
+  | 'markdown'
+  | 'pdf'
+  | 'video'
+export type CanvasAssetNodeType = Extract<CanvasNodeType, 'image' | 'markdown' | 'pdf' | 'video'>
 export type SectionBorderStyle = 'solid' | 'dashed'
 export type SectionLockMode = 'all' | 'background'
+export type MarkupKind = 'arrow' | 'line' | 'rect' | 'ellipse' | 'brush' | 'note'
+export type MarkupStrokeStyle = 'solid' | 'dashed'
+export type MarkdownDisplayMode = 'full' | 'preview'
+export type ConnectorAnchor = 'center' | 'top' | 'right' | 'bottom' | 'left'
+export type MarkupPoint = {
+  x: number
+  y: number
+}
+export type ConnectorBinding = {
+  nodeId: string
+  anchor: ConnectorAnchor
+  offset?: number
+}
 export type AiWorkflowKind = 'slot' | 'annotation' | 'result'
 export type AiWorkflowStatus = 'empty' | 'queued' | 'generating' | 'ready' | 'failed'
 export type AiWorkflowOperation = 'slot-generation' | 'beside-generation' | 'annotation-edit' | 'variation'
@@ -73,6 +103,19 @@ export type MivoCanvasNode = {
   fontWeight?: number
   textAlign?: 'left' | 'center' | 'right'
   textAutoWidth?: boolean
+  markupKind?: MarkupKind
+  markupPoints?: MarkupPoint[]
+  markupStrokeColor?: string
+  markupFillColor?: string
+  markupStrokeWidth?: number
+  markupStrokeStyle?: MarkupStrokeStyle
+  markupOpacity?: number
+  markupStartArrow?: boolean
+  markupEndArrow?: boolean
+  markupCornerRadius?: number
+  connectorStart?: ConnectorBinding
+  connectorEnd?: ConnectorBinding
+  targetNodeId?: string
   frameColor?: string
   sectionId?: string
   sectionFillColor?: string
@@ -83,6 +126,10 @@ export type MivoCanvasNode = {
   sectionLockMode?: SectionLockMode
   sectionTemplateId?: string
   assetUrl?: string
+  assetMimeType?: string
+  assetOriginalName?: string
+  assetSizeBytes?: number
+  markdownDisplayMode?: MarkdownDisplayMode
   imageHasTransparency?: boolean
   imageCrop?: ImageCrop
   status: NodeStatus
@@ -115,7 +162,22 @@ export type AiCanvasContextNode = {
   status: NodeStatus
   text?: string
   assetUrl?: string
+  assetMimeType?: string
+  assetOriginalName?: string
+  assetSizeBytes?: number
   sectionId?: string
+  targetNodeId?: string
+  markupKind?: MarkupKind
+  markupPoints?: MarkupPoint[]
+  markupStrokeColor?: string
+  markupFillColor?: string
+  markupStrokeWidth?: number
+  markupStrokeStyle?: MarkupStrokeStyle
+  markupStartArrow?: boolean
+  markupEndArrow?: boolean
+  markupCornerRadius?: number
+  connectorStart?: ConnectorBinding
+  connectorEnd?: ConnectorBinding
   generation?: MivoCanvasNode['generation']
   aiWorkflow?: CanvasAiWorkflow
 }
@@ -133,7 +195,7 @@ export type AiCanvasContextSnapshot = {
   }
   nodes: AiCanvasContextNode[]
   links: Array<{
-    kind: AiWorkflowOperation | 'parent'
+    kind: AiWorkflowOperation | 'parent' | 'connector'
     fromNodeId: string
     toNodeId: string
   }>

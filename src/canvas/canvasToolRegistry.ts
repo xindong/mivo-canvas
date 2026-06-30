@@ -1,15 +1,20 @@
 import {
+  ArrowUpRight,
+  Circle,
   Hand,
   ImagePlus,
   MessageSquare,
+  Minus,
   MousePointer2,
   PanelTop,
   Pencil,
+  RectangleHorizontal,
   SmilePlus,
+  StickyNote,
   Type,
   Video,
 } from 'lucide-react'
-import type { ToolId } from '../types/mivoCanvas'
+import type { MarkupKind, ToolId } from '../types/mivoCanvas'
 import type { RuntimeCanvasTool } from './canvasInteraction'
 
 export type CanvasToolGroup = 'navigate' | 'create' | 'media'
@@ -25,6 +30,16 @@ export type CanvasToolDefinition = {
   enabled?: boolean
   icon: typeof MousePointer2
 }
+
+export const markupShapeToolIds = [
+  'markup-arrow',
+  'markup-line',
+  'markup-rect',
+  'markup-ellipse',
+  'markup-brush',
+] as const satisfies ToolId[]
+
+export type MarkupShapeToolId = (typeof markupShapeToolIds)[number]
 
 export const canvasToolRegistry: CanvasToolDefinition[] = [
   {
@@ -64,12 +79,59 @@ export const canvasToolRegistry: CanvasToolDefinition[] = [
     icon: PanelTop,
   },
   {
-    id: 'brush',
-    label: 'Brush',
+    id: 'markup-arrow',
+    label: 'Arrow',
+    shortcut: 'A',
+    keyboardShortcuts: ['a'],
     group: 'create',
-    runtimeTool: 'select',
-    enabled: false,
+    runtimeTool: 'markup',
+    dividerBefore: true,
+    icon: ArrowUpRight,
+  },
+  {
+    id: 'markup-line',
+    label: 'Line',
+    shortcut: 'L',
+    keyboardShortcuts: ['l'],
+    group: 'create',
+    runtimeTool: 'markup',
+    icon: Minus,
+  },
+  {
+    id: 'markup-rect',
+    label: 'Rectangle',
+    shortcut: 'R',
+    keyboardShortcuts: ['r'],
+    group: 'create',
+    runtimeTool: 'markup',
+    icon: RectangleHorizontal,
+  },
+  {
+    id: 'markup-ellipse',
+    label: 'Ellipse',
+    shortcut: 'O',
+    keyboardShortcuts: ['o'],
+    group: 'create',
+    runtimeTool: 'markup',
+    icon: Circle,
+  },
+  {
+    id: 'markup-brush',
+    label: 'Brush',
+    shortcut: 'P',
+    keyboardShortcuts: ['p'],
+    group: 'create',
+    runtimeTool: 'markup',
     icon: Pencil,
+  },
+  {
+    id: 'markup-note',
+    label: 'Markup note',
+    shortcut: 'N',
+    keyboardShortcuts: ['n'],
+    group: 'create',
+    runtimeTool: 'markup',
+    icon: StickyNote,
   },
   {
     id: 'sticker',
@@ -116,4 +178,14 @@ export const toolForKeyboardShortcut = (key: string) => {
   return canvasToolRegistry.find(
     (tool) => tool.enabled !== false && tool.keyboardShortcuts?.includes(normalizedKey),
   )?.id
+}
+
+export const markupKindForTool = (toolId: ToolId): MarkupKind | undefined => {
+  if (toolId === 'markup-arrow') return 'arrow'
+  if (toolId === 'markup-line') return 'line'
+  if (toolId === 'markup-rect') return 'rect'
+  if (toolId === 'markup-ellipse') return 'ellipse'
+  if (toolId === 'markup-brush') return 'brush'
+  if (toolId === 'markup-note') return 'note'
+  return undefined
 }

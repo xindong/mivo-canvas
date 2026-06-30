@@ -7,6 +7,27 @@ const IMPORTED_ASSET_PREFIX = 'mivo-asset:'
 const transparentAlphaThreshold = 2
 const transparentTrimPadding = 2
 
+const extensionMimeMap: Record<string, string> = {
+  gif: 'image/gif',
+  jpeg: 'image/jpeg',
+  jpg: 'image/jpeg',
+  markdown: 'text/markdown',
+  md: 'text/markdown',
+  m4v: 'video/mp4',
+  mov: 'video/quicktime',
+  mp4: 'video/mp4',
+  pdf: 'application/pdf',
+  png: 'image/png',
+  svg: 'image/svg+xml',
+  webm: 'video/webm',
+  webp: 'image/webp',
+}
+
+const mimeFromFilename = (filename: string) => {
+  const extension = filename.split('.').pop()?.toLowerCase() || ''
+  return extensionMimeMap[extension] || 'application/octet-stream'
+}
+
 type StoredAsset = {
   id: string
   name: string
@@ -145,15 +166,16 @@ const alphaBoundsFor = (imageData: ImageData): AlphaBounds | undefined => {
 }
 
 const prepareImportedImage = async (file: File): Promise<PreparedImportedImage> => {
+  const detectedType = file.type || mimeFromFilename(file.name)
   const fallback = {
     blob: file,
-    type: file.type || 'application/octet-stream',
+    type: detectedType,
     dimensions: undefined,
     sourceDimensions: undefined,
     hasTransparency: undefined,
   }
 
-  if (!file.type.startsWith('image/')) return fallback
+  if (!detectedType.startsWith('image/')) return fallback
 
   const bitmap = await createImageBitmap(file)
   const sourceDimensions = {
@@ -200,7 +222,7 @@ export const saveImportedAsset = async (file: File) => {
   const id = createAssetId()
   const prepared = await prepareImportedImage(file).catch(() => ({
     blob: file,
-    type: file.type || 'application/octet-stream',
+    type: file.type || mimeFromFilename(file.name),
     dimensions: undefined,
     sourceDimensions: undefined,
     hasTransparency: undefined,
@@ -217,6 +239,9 @@ export const saveImportedAsset = async (file: File) => {
 
   return {
     assetUrl: importedAssetUrl(id),
+    name: file.name,
+    type: prepared.type,
+    sizeBytes: file.size,
     title: file.name.replace(/\.[^.]+$/, ''),
     size: prepared.sourceDimensions
       ? `${prepared.sourceDimensions.width}x${prepared.sourceDimensions.height}`

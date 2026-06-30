@@ -119,6 +119,19 @@ export const buildAiContextSnapshot = (state: AiContextState): AiCanvasContextSn
         toNodeId: node.id,
       })
     }
+    if (node.connectorStart?.nodeId && node.connectorEnd?.nodeId) {
+      pushLink({
+        kind: 'connector',
+        fromNodeId: node.connectorStart.nodeId,
+        toNodeId: node.connectorEnd.nodeId,
+      })
+    } else if (node.connectorStart?.nodeId || node.connectorEnd?.nodeId) {
+      pushLink({
+        kind: 'connector',
+        fromNodeId: node.connectorStart?.nodeId || node.connectorEnd?.nodeId || node.id,
+        toNodeId: node.id,
+      })
+    }
   })
 
   return {
@@ -145,7 +158,22 @@ export const buildAiContextSnapshot = (state: AiContextState): AiCanvasContextSn
       status: node.status,
       text: node.text,
       assetUrl: node.assetUrl,
+      assetMimeType: node.assetMimeType,
+      assetOriginalName: node.assetOriginalName,
+      assetSizeBytes: node.assetSizeBytes,
       sectionId: node.sectionId,
+      targetNodeId: node.targetNodeId,
+      markupKind: node.markupKind,
+      markupPoints: node.markupPoints ? node.markupPoints.map((point) => ({ ...point })) : undefined,
+      markupStrokeColor: node.markupStrokeColor,
+      markupFillColor: node.markupFillColor,
+      markupStrokeWidth: node.markupStrokeWidth,
+      markupStrokeStyle: node.markupStrokeStyle,
+      markupStartArrow: node.markupStartArrow,
+      markupEndArrow: node.markupEndArrow,
+      markupCornerRadius: node.markupCornerRadius,
+      connectorStart: node.connectorStart ? { ...node.connectorStart } : undefined,
+      connectorEnd: node.connectorEnd ? { ...node.connectorEnd } : undefined,
       generation: node.generation ? { ...node.generation } : undefined,
       aiWorkflow: node.aiWorkflow
         ? {

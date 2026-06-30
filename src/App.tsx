@@ -160,7 +160,7 @@ function App() {
         </div>
       ) : (
         <div className="workspace library-mode">
-          <LibraryWorkspace type={workspaceView} />
+          <LibraryWorkspace type={workspaceView} onOpenCanvas={() => setWorkspaceView('canvas')} />
         </div>
       )}
       {detailsOpen ? (
@@ -173,7 +173,7 @@ function App() {
             }
           }}
         >
-          <div className="details-dialog" role="dialog" aria-modal="true" aria-label="Image details">
+          <div className="details-dialog" role="dialog" aria-modal="true" aria-label="Asset details">
             <InspectorPanel onClose={() => setDetailsSceneId(undefined)} />
           </div>
         </div>

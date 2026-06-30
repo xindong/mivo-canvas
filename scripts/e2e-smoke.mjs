@@ -1,6 +1,9 @@
 import { spawn } from 'node:child_process'
 import { Buffer } from 'node:buffer'
-import { mkdir } from 'node:fs/promises'
+import path from 'node:path'
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdir, readFile } from 'node:fs/promises'
+import { createServer } from 'node:http'
 import { chromium } from 'playwright'
 import {
   assertLibraryLayoutStable,
@@ -13,17 +16,146 @@ import {
 
 const port = Number(process.env.MIVO_E2E_PORT ?? 5174)
 const baseUrl = `http://127.0.0.1:${port}`
+const localAssetFixtureDir = path.resolve('test-artifacts/local-assets')
+const eagleMockDir = path.resolve('test-artifacts/eagle-mock')
+const eagleMockItemId = 'E2E-EAGLE-ASSET'
+const eagleMockItemDir = path.join(eagleMockDir, `${eagleMockItemId}.info`)
+const localAssetFixtureSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="96" height="72" viewBox="0 0 96 72">
+  <rect width="96" height="72" rx="10" fill="#fffaf0"/>
+  <circle cx="34" cy="36" r="18" fill="#6957e8"/>
+  <path d="M48 18l22 36H26z" fill="#ff8a00" fill-opacity=".82"/>
+</svg>`
+const eagleMockSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="120" height="90" viewBox="0 0 120 90">
+  <rect width="120" height="90" rx="12" fill="#f4efe6"/>
+  <rect x="18" y="18" width="84" height="54" rx="8" fill="#6957e8"/>
+  <circle cx="60" cy="45" r="18" fill="#ff8a00"/>
+</svg>`
+
+mkdirSync(localAssetFixtureDir, { recursive: true })
+mkdirSync(eagleMockItemDir, { recursive: true })
+writeFileSync(path.join(localAssetFixtureDir, 'mivo-local-fixture.svg'), localAssetFixtureSvg)
+writeFileSync(path.join(eagleMockItemDir, 'Mock Eagle Concept.svg'), eagleMockSvg)
+writeFileSync(path.join(eagleMockItemDir, 'Mock Eagle Concept_thumbnail.svg'), eagleMockSvg)
+
+const eagleMockItem = {
+  id: eagleMockItemId,
+  name: 'Mock Eagle Concept',
+  size: Buffer.byteLength(eagleMockSvg),
+  btime: Date.now(),
+  mtime: Date.now(),
+  ext: 'svg',
+  tags: ['mock', 'eagle'],
+  folders: ['MOCK-FOLDER'],
+  isDeleted: false,
+  url: 'https://example.com/mock-eagle-concept',
+  annotation: 'Mock Eagle metadata note',
+  modificationTime: Date.now(),
+  height: 90,
+  width: 120,
+}
+const eagleMockServer = createServer((request, response) => {
+  const requestUrl = new URL(request.url || '/', 'http://127.0.0.1')
+  response.setHeader('Content-Type', 'application/json; charset=utf-8')
+
+  if (requestUrl.pathname === '/api/application/info') {
+    response.end(JSON.stringify({ status: 'success', data: { version: 'E2E', platform: 'darwin' } }))
+    return
+  }
+
+  if (requestUrl.pathname === '/api/library/info') {
+    response.end(
+      JSON.stringify({
+        status: 'success',
+        data: {
+          folders: [{ id: 'MOCK-FOLDER', name: 'Mock Eagle Folder', children: [] }],
+          libPath: eagleMockDir,
+        },
+      }),
+    )
+    return
+  }
+
+  if (requestUrl.pathname === '/api/folder/list') {
+    response.end(
+      JSON.stringify({
+        status: 'success',
+        data: [{ id: 'MOCK-FOLDER', name: 'Mock Eagle Folder', children: [] }],
+      }),
+    )
+    return
+  }
+
+  if (requestUrl.pathname === '/api/item/list') {
+    const folderId = requestUrl.searchParams.get('folderId')
+    const keyword = requestUrl.searchParams.get('keyword')?.toLowerCase() || ''
+    const matchesFolder = !folderId || folderId === 'MOCK-FOLDER'
+    const matchesKeyword = !keyword || eagleMockItem.name.toLowerCase().includes(keyword)
+    response.end(JSON.stringify({ status: 'success', data: matchesFolder && matchesKeyword ? [eagleMockItem] : [] }))
+    return
+  }
+
+  if (requestUrl.pathname === '/api/item/info') {
+    response.end(JSON.stringify({ status: 'success', data: eagleMockItem }))
+    return
+  }
+
+  if (requestUrl.pathname === '/api/item/thumbnail') {
+    response.end(
+      JSON.stringify({
+        status: 'success',
+        data: path.join(eagleMockItemDir, 'Mock Eagle Concept_thumbnail.svg'),
+      }),
+    )
+    return
+  }
+
+  response.statusCode = 404
+  response.end(JSON.stringify({ status: 'error', message: 'not found' }))
+})
+await new Promise((resolve) => eagleMockServer.listen(0, '127.0.0.1', resolve))
+const eagleMockAddress = eagleMockServer.address()
+const eagleMockPort = typeof eagleMockAddress === 'object' && eagleMockAddress ? eagleMockAddress.port : 41895
 
 const server = spawn(
   'npm',
   ['run', 'dev', '--', '--host', '127.0.0.1', '--port', String(port), '--strictPort'],
   {
     stdio: ['ignore', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      MIVO_ASSET_DIR: localAssetFixtureDir,
+      MIVO_EAGLE_API_URL: `http://127.0.0.1:${eagleMockPort}`,
+    },
   },
 )
 
 try {
   await mkdir('test-artifacts', { recursive: true })
+  const [nodeRegistrySource, actionModelSource] = await Promise.all([
+    readFile('src/canvas/nodeTypes/canvasNodeRegistry.ts', 'utf8'),
+    readFile('src/canvas/actions/canvasActionModel.ts', 'utf8'),
+  ])
+  for (const nodeType of [
+    'image',
+    'task-placeholder',
+    'text',
+    'frame',
+    'ai-slot',
+    'annotation',
+    'markup',
+    'markdown',
+    'pdf',
+    'video',
+  ]) {
+    if (!nodeRegistrySource.includes(`${nodeType}:`) && !nodeRegistrySource.includes(`'${nodeType}':`)) {
+      throw new Error(`Node registry should declare ${nodeType}`)
+    }
+  }
+  for (const extensionMap of ['contextMenuExtensionsByNodeType', 'quickToolbarExtensionsByNodeType']) {
+    if (!actionModelSource.includes(extensionMap)) {
+      throw new Error(`Action model should compose node actions through ${extensionMap}`)
+    }
+  }
   await waitForServer(baseUrl)
 
   const browser = await chromium.launch({ headless: true })
@@ -406,7 +538,9 @@ try {
     throw new Error(`Collapsed top bar should show floating logo, a circular menu button, title, and meta: ${JSON.stringify(collapsedLayout)}`)
   }
 
+  await page.getByRole('button', { name: 'Open projects' }).hover()
   await page.mouse.move(1510, 890)
+  await wait(40)
   await page.getByRole('button', { name: 'Open projects' }).hover()
   await page.waitForFunction(() => {
     const sidebar = document.querySelector('.project-sidebar.drawer')
@@ -739,6 +873,298 @@ try {
     throw new Error(`Importing a Mivo archive should restore embedded local assets: ${JSON.stringify(importedArchiveAsset)}`)
   }
 
+  await page.evaluate(async () => {
+    const shell = document.querySelector('.canvas-shell')
+    if (!shell) throw new Error('Missing canvas shell for multi-format import test')
+    const rect = shell.getBoundingClientRect()
+    const videoFile = await new Promise((resolve) => {
+      const canvas = document.createElement('canvas')
+      canvas.width = 240
+      canvas.height = 320
+      const context = canvas.getContext('2d')
+      if (!context || !('captureStream' in canvas) || typeof MediaRecorder === 'undefined') {
+        resolve(new File([new Uint8Array([0, 0, 0, 24, 102, 116, 121, 112, 109, 112, 52, 50])], 'mivo-motion.mp4', { type: 'video/mp4' }))
+        return
+      }
+
+      context.fillStyle = '#26231f'
+      context.fillRect(0, 0, canvas.width, canvas.height)
+      context.fillStyle = '#fffaf0'
+      context.beginPath()
+      context.moveTo(132, 72)
+      context.lineTo(132, 108)
+      context.lineTo(176, 90)
+      context.closePath()
+      context.fill()
+
+      const stream = canvas.captureStream(5)
+      const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp8') ? 'video/webm;codecs=vp8' : 'video/webm'
+      const recorder = new MediaRecorder(stream, { mimeType })
+      const chunks = []
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) chunks.push(event.data)
+      }
+      recorder.onstop = () => {
+        stream.getTracks().forEach((track) => track.stop())
+        resolve(new File(chunks, 'mivo-motion.webm', { type: 'video/webm' }))
+      }
+      recorder.start()
+      window.setTimeout(() => recorder.stop(), 240)
+    })
+    const transfer = new DataTransfer()
+    transfer.items.add(
+      new File(
+        [
+          '# Mivo format brief\n\n',
+          'Markdown should render as a complete document node, not a clipped summary card.\n\n',
+          '- [x] Keep original files\n',
+          '- [ ] Add richer document tools\n',
+          '- Preview **formatted** documents on canvas\n\n',
+          '| Feature | State |\n',
+          '| --- | --- |\n',
+          '| Tables | Ready |\n',
+          '| Task lists | Ready |\n\n',
+          '> Markdown should keep blockquote styling.\n\n',
+          '```ts\n',
+          'const fullDocumentPreview = true\n',
+          '```\n\n',
+          '~~Old summary card~~\n',
+        ],
+        'mivo-format-brief.md',
+        { type: 'text/markdown' },
+      ),
+    )
+    transfer.items.add(new File(['%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF'], 'mivo-reference.pdf', { type: 'application/pdf' }))
+    transfer.items.add(videoFile)
+
+    shell.dispatchEvent(
+      new DragEvent('drop', {
+        bubbles: true,
+        cancelable: true,
+        dataTransfer: transfer,
+        clientX: rect.left + rect.width / 2,
+        clientY: rect.top + rect.height / 2,
+      }),
+    )
+  })
+  await page.waitForFunction(
+    () =>
+      document.querySelector('.dom-node.markdown-node[data-node-type="markdown"]') &&
+      document.querySelector('.dom-node.pdf-node[data-node-type="pdf"]') &&
+      document.querySelector('.dom-node.video-node[data-node-type="video"]') &&
+      document.querySelector('.dom-node.video-node video')?.getAttribute('src')?.startsWith('blob:'),
+  )
+  await page.waitForFunction(() => {
+    const node = document.querySelector('.dom-node.markdown-node')
+    const documentNode = node?.querySelector('.dom-markdown-document')
+    if (!(node instanceof HTMLElement) || !(documentNode instanceof HTMLElement)) return false
+    return node.getBoundingClientRect().height >= documentNode.scrollHeight - 2
+  })
+  const importedFileNodes = await page.evaluate(() => ({
+    markdownText: document.querySelector('.dom-node.markdown-node .markdown-preview')?.textContent,
+    markdownHasTable: Boolean(document.querySelector('.dom-node.markdown-node table')),
+    markdownHasTask: Boolean(document.querySelector('.dom-node.markdown-node input[type="checkbox"]')),
+    markdownHasCode: Boolean(document.querySelector('.dom-node.markdown-node pre code')),
+    markdownFitsContent: (() => {
+      const node = document.querySelector('.dom-node.markdown-node')
+      const documentNode = node?.querySelector('.dom-markdown-document')
+      return node instanceof HTMLElement && documentNode instanceof HTMLElement
+        ? node.getBoundingClientRect().height >= documentNode.scrollHeight - 2
+        : false
+    })(),
+    pdfTitle: document.querySelector('.dom-node.pdf-node')?.textContent,
+    videoSrc: document.querySelector('.dom-node.video-node video')?.getAttribute('src'),
+    videoHasPlay: Boolean(document.querySelector('.dom-node.video-node .dom-file-video-play')),
+    videoBox: (() => {
+      const rect = document.querySelector('.dom-node.video-node')?.getBoundingClientRect()
+      return rect ? { width: rect.width, height: rect.height } : undefined
+    })(),
+  }))
+  if (
+    !importedFileNodes.markdownText?.includes('Mivo format brief') ||
+    !importedFileNodes.markdownText.includes('fullDocumentPreview') ||
+    !importedFileNodes.markdownHasTable ||
+    !importedFileNodes.markdownHasTask ||
+    !importedFileNodes.markdownHasCode ||
+    !importedFileNodes.markdownFitsContent ||
+    !importedFileNodes.pdfTitle?.includes('mivo-reference') ||
+    !importedFileNodes.videoSrc?.startsWith('blob:') ||
+    !importedFileNodes.videoHasPlay ||
+    !importedFileNodes.videoBox ||
+    Math.abs(importedFileNodes.videoBox.width / importedFileNodes.videoBox.height - 240 / 320) > 0.04
+  ) {
+    throw new Error(`Multi-format imports should render Markdown, PDF, and Video nodes: ${JSON.stringify(importedFileNodes)}`)
+  }
+
+  await page.locator('.dom-node.markdown-node').dblclick({ position: { x: 20, y: 20 } })
+  await page.getByRole('dialog', { name: 'Asset details' }).waitFor()
+  if ((await page.locator('.node-preview-markdown .markdown-preview.details').count()) !== 1) {
+    throw new Error('Markdown details should render a document preview')
+  }
+  if ((await page.locator('.details-dialog .field textarea').count()) !== 0) {
+    throw new Error('Markdown details should not show an image-generation prompt field')
+  }
+  if ((await page.getByRole('button', { name: 'Raw', exact: true }).count()) !== 1) {
+    throw new Error('Markdown details should expose a Raw view toggle')
+  }
+  await page.getByRole('button', { name: 'Raw', exact: true }).click()
+  await page.waitForSelector('.node-preview-markdown-raw')
+  if (!((await page.locator('.node-preview-markdown-raw').textContent()) || '').includes('# Mivo format brief')) {
+    throw new Error('Markdown raw view should show original Markdown source')
+  }
+  await page.getByRole('button', { name: 'Rendered', exact: true }).click()
+  await page.waitForSelector('.node-preview-markdown .markdown-preview.details')
+  await page.getByRole('button', { name: 'Preview', exact: true }).click()
+  await page.waitForFunction(() => {
+    const node = document.querySelector('.dom-node.markdown-node')
+    return node instanceof HTMLElement && node.classList.contains('markdown-preview-mode')
+  })
+  await page.getByRole('button', { name: 'Close details' }).click()
+  await page.locator('.dom-node.pdf-node').dblclick({ position: { x: 20, y: 20 } })
+  await page.getByRole('dialog', { name: 'Asset details' }).waitFor()
+  if ((await page.locator('iframe.node-preview-pdf[src^="blob:"]').count()) !== 1) {
+    throw new Error('PDF details should render a blob-backed document viewer')
+  }
+  await page.getByRole('button', { name: 'Close details' }).click()
+  await page.locator('.canvas-shell').click({ position: { x: 12, y: 820 } })
+  await page.locator('.dom-node.video-node').dblclick({ position: { x: 20, y: 20 } })
+  await page.getByRole('dialog', { name: 'Asset details' }).waitFor()
+  if ((await page.locator('video.node-preview-video[src^="blob:"]').count()) !== 1) {
+    throw new Error('Video details should render a blob-backed video preview')
+  }
+  await page.getByRole('button', { name: 'Close details' }).click()
+
+  await page.evaluate(async () => {
+    const shell = document.querySelector('.canvas-shell')
+    if (!shell) throw new Error('Missing canvas shell for long Markdown import test')
+    const rect = shell.getBoundingClientRect()
+    const imageLine = '![Concept reference](https://example.com/mivo-reference.png)'
+    const sections = Array.from({ length: 72 }, (_, index) =>
+      [
+        `## Direction ${index + 1}`,
+        imageLine,
+        'This longer research note should land on the canvas as a preview card instead of a very tall document column.',
+      ].join('\n\n'),
+    )
+    const transfer = new DataTransfer()
+    transfer.items.add(
+      new File(
+        ['# Mivo long research brief\n\n', sections.join('\n\n')],
+        'mivo-long-research-brief.md',
+        { type: 'text/markdown' },
+      ),
+    )
+
+    shell.dispatchEvent(
+      new DragEvent('drop', {
+        bubbles: true,
+        cancelable: true,
+        dataTransfer: transfer,
+        clientX: rect.left + rect.width / 2 + 260,
+        clientY: rect.top + rect.height / 2,
+      }),
+    )
+  })
+  await page.waitForFunction(() => {
+    const node = [...document.querySelectorAll('.dom-node.markdown-node')].find((candidate) =>
+      candidate.textContent?.includes('Mivo long research brief'),
+    )
+    if (!(node instanceof HTMLElement)) return false
+
+    const rect = node.getBoundingClientRect()
+    return node.classList.contains('markdown-preview-mode') && rect.height <= 660 && Boolean(node.querySelector('.dom-markdown-preview-fade'))
+  })
+
+  await page.getByRole('button', { name: 'Assets' }).click()
+  await page.getByRole('heading', { name: 'Assets' }).waitFor()
+  const localAssetsResponse = await page.request.get(`${baseUrl}/api/mivo/local-assets`)
+  if (!localAssetsResponse.ok()) {
+    throw new Error(`Local asset API should be available in dev, got ${localAssetsResponse.status()}`)
+  }
+  const localAssetsPayload = await localAssetsResponse.json()
+  if (
+    !String(localAssetsPayload.root).includes('test-artifacts/local-assets') ||
+    !Array.isArray(localAssetsPayload.assets) ||
+    !localAssetsPayload.assets.some((asset) => asset.name === 'mivo-local-fixture.svg')
+  ) {
+    throw new Error(`Local asset API should index the configured fixture folder: ${JSON.stringify(localAssetsPayload)}`)
+  }
+  await page.getByRole('button', { name: /Pinterest boards/i }).click()
+  await page.getByRole('button', { name: 'Add source' }).click()
+  await page.getByRole('dialog', { name: 'Pinterest settings' }).waitFor()
+  if ((await page.locator('.source-settings-dialog input').count()) !== 0) {
+    throw new Error('Pinterest settings should default to an OAuth login view without credential fields')
+  }
+  if ((await page.getByRole('button', { name: 'Developer settings' }).count()) !== 0) {
+    throw new Error('Pinterest product dialog should not expose developer settings')
+  }
+  await page.getByRole('button', { name: 'Connect Pinterest' }).click()
+  await page.getByText(/layout prototype/).waitFor()
+  await page.getByRole('button', { name: 'Close Pinterest settings' }).click()
+  await page.getByRole('button', { name: /Eagle libraries/i }).click()
+  await page.getByRole('button', { name: 'Mock Eagle Folder' }).waitFor()
+  await page.getByRole('button', { name: 'Mock Eagle Folder' }).click()
+  await page.waitForSelector('.asset-tile img[src^="/api/mivo/eagle/assets/"]')
+  const eagleAssetTile = page.getByRole('button', { name: /Mock Eagle Concept/i })
+  if ((await eagleAssetTile.count()) !== 1) {
+    throw new Error('Assets workspace should render Eagle folder assets through the connector model')
+  }
+  await eagleAssetTile.click()
+  await page.waitForSelector('.asset-detail-panel')
+  const eagleAssetDetail = await page.locator('.asset-detail-panel').evaluate((panel) => ({
+    title: panel.querySelector('h2')?.textContent,
+    source: panel.querySelector('.library-kicker')?.textContent,
+    copy: panel.textContent,
+  }))
+  if (
+    eagleAssetDetail.title !== 'Mock Eagle Concept' ||
+    eagleAssetDetail.source !== 'Eagle libraries' ||
+    !eagleAssetDetail.copy?.includes('120 x 90') ||
+    !eagleAssetDetail.copy.includes('mock, eagle') ||
+    !eagleAssetDetail.copy.includes('https://example.com/mock-eagle-concept')
+  ) {
+    throw new Error(`Single-clicking an Eagle asset should open connector metadata details: ${JSON.stringify(eagleAssetDetail)}`)
+  }
+  await page.getByRole('button', { name: /Local folders/i }).click()
+  await page.waitForSelector('.asset-tile img[src^="/api/mivo/local-assets/"]')
+  const localAssetTile = page.getByRole('button', { name: /mivo-local-fixture/i })
+  if ((await localAssetTile.count()) !== 1) {
+    throw new Error('Assets workspace should render the local fixture as a real draggable tile')
+  }
+  await page.waitForFunction(() => {
+    const tile = [...document.querySelectorAll('.asset-tile')].find((item) =>
+      item.textContent?.includes('mivo-local-fixture'),
+    )
+    return tile?.textContent?.includes('SVG') && tile.textContent.includes('96 x 72')
+  })
+  await localAssetTile.click()
+  await page.waitForSelector('.asset-detail-panel')
+  if ((await page.locator('.canvas-shell').count()) !== 0) {
+    throw new Error('Single-clicking an asset should open details without entering the canvas')
+  }
+  const localAssetDetail = await page.locator('.asset-detail-panel').evaluate((panel) => ({
+    title: panel.querySelector('h2')?.textContent,
+    source: panel.querySelector('.library-kicker')?.textContent,
+    copy: panel.textContent,
+  }))
+  if (
+    !localAssetDetail.title?.includes('mivo-local-fixture') ||
+    localAssetDetail.source !== 'Local folders' ||
+    !localAssetDetail.copy?.includes('96 x 72')
+  ) {
+    throw new Error(`Single-clicking a local asset should open metadata details: ${JSON.stringify(localAssetDetail)}`)
+  }
+  await localAssetTile.dblclick()
+  await page.waitForSelector('.canvas-shell')
+  await page.waitForFunction(
+    () =>
+      [...document.querySelectorAll('.dom-node')].some(
+        (node) =>
+          node.getAttribute('data-node-id')?.startsWith('imported-') &&
+          node.querySelector('.dom-node-media img')?.getAttribute('src')?.startsWith('blob:'),
+      ),
+  )
+
   await page.getByRole('button', { name: '角色参考图流程' }).click()
   await page.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
 
@@ -785,7 +1211,9 @@ try {
   ) {
     throw new Error(`Library surfaces should share one background with no visible middle seam: ${JSON.stringify(assetsSurfaceColors)}`)
   }
+  await page.getByRole('button', { name: 'Open projects' }).hover()
   await page.mouse.move(1510, 890)
+  await wait(40)
   await page.getByRole('button', { name: 'Open projects' }).hover()
   await page.waitForFunction(() => {
     const sidebar = document.querySelector('.project-sidebar.drawer')
@@ -1075,6 +1503,28 @@ try {
     throw new Error('Canvas images should keep a shadow')
   }
 
+  const canvasRasterizationHints = await page.evaluate(() => ({
+    layerWillChange: window.getComputedStyle(document.querySelector('.dom-canvas-layer')).willChange,
+    nodeWillChange: window.getComputedStyle(document.querySelector('.dom-node')).willChange,
+    renderedNodeCount: Number(document.querySelector('.canvas-shell')?.getAttribute('data-rendered-node-count') || 0),
+    totalNodeCount: Number(document.querySelector('.canvas-shell')?.getAttribute('data-total-node-count') || 0),
+    imageLoading: document.querySelector('.dom-node-media img')?.getAttribute('loading'),
+    imageDecoding: document.querySelector('.dom-node-media img')?.getAttribute('decoding'),
+  }))
+  if (canvasRasterizationHints.layerWillChange !== 'auto' || canvasRasterizationHints.nodeWillChange !== 'auto') {
+    throw new Error(
+      `Canvas DOM should not keep persistent transform raster caches after zoom: ${JSON.stringify(canvasRasterizationHints)}`,
+    )
+  }
+  if (
+    canvasRasterizationHints.renderedNodeCount < 1 ||
+    canvasRasterizationHints.totalNodeCount < canvasRasterizationHints.renderedNodeCount ||
+    canvasRasterizationHints.imageLoading !== 'lazy' ||
+    canvasRasterizationHints.imageDecoding !== 'async'
+  ) {
+    throw new Error(`Canvas should expose culling metrics and lazy image decoding: ${JSON.stringify(canvasRasterizationHints)}`)
+  }
+
   const beforePan = await firstNodeMedia.boundingBox()
   const canvasBox = await page.locator('.canvas-shell').boundingBox()
   if (!beforePan || !canvasBox) throw new Error('Missing canvas geometry for pan check')
@@ -1123,9 +1573,12 @@ try {
     'New text here',
     'New section here',
     'New AI image slot here',
+    'New arrow markup',
+    'New rectangle markup',
+    'New markup note',
     'Fit all objects',
     'Select all objects',
-    'Import image',
+    'Import asset',
   ]) {
     if ((await page.getByRole('menuitem', { name: action }).count()) !== 1) {
       throw new Error(`Blank right-click menu should expose ${action}`)
@@ -1136,6 +1589,576 @@ try {
   }
   await page.keyboard.press('Escape')
   await page.waitForSelector('.node-context-menu', { state: 'detached' })
+
+  const markupCountBefore = await page.locator('.dom-node.markup-node').count()
+  const drawToolButton = page.locator('.canvas-tool-dock').getByRole('button', { name: 'Draw' })
+  if ((await drawToolButton.count()) !== 1) {
+    throw new Error('Markup shape tools should be collapsed behind one Draw toolbar button')
+  }
+  await drawToolButton.hover()
+  await page.waitForFunction(() => {
+    const flyout = document.querySelector('.canvas-tool-flyout')
+    return flyout && window.getComputedStyle(flyout).visibility === 'visible'
+  })
+  for (const tool of ['Arrow', 'Line', 'Rectangle', 'Ellipse', 'Brush']) {
+    if ((await page.locator('.canvas-tool-flyout').getByRole('menuitem', { name: tool }).count()) !== 1) {
+      throw new Error(`Draw flyout should expose ${tool}`)
+    }
+  }
+  await drawToolButton.click()
+  await page.mouse.move(farBlankPoint.x, farBlankPoint.y)
+  await page.mouse.down()
+  await page.mouse.move(farBlankPoint.x + 150, farBlankPoint.y - 70, { steps: 6 })
+  await page.waitForSelector('.markup-creation-box.kind-arrow')
+  await page.mouse.up()
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="arrow"]').length === count + 1,
+    markupCountBefore,
+  )
+  const arrowMarkupNode = page.locator('.dom-node.markup-node[data-markup-kind="arrow"]').last()
+  const arrowMarkupNodeId = await arrowMarkupNode.getAttribute('data-node-id')
+  const arrowMarkupBox = await arrowMarkupNode.boundingBox()
+  const arrowMissTarget =
+    arrowMarkupBox && arrowMarkupNodeId
+      ? await page.evaluate(({ x, y, id }) => {
+          return document.elementFromPoint(x, y)?.closest(`[data-node-id="${id}"]`)?.getAttribute('data-node-id') || null
+        }, {
+          x: arrowMarkupBox.x + arrowMarkupBox.width - 6,
+          y: arrowMarkupBox.y + arrowMarkupBox.height - 6,
+          id: arrowMarkupNodeId,
+        })
+      : null
+  if (arrowMissTarget) {
+    throw new Error('Arrow markup should not use its full bounding rectangle as the click target')
+  }
+  const selectButtonClassAfterMarkupCreate = await page.getByRole('button', { name: /^Select$/ }).getAttribute('class')
+  if (!selectButtonClassAfterMarkupCreate?.includes('active')) {
+    throw new Error('Creating markup should return the active tool to Select')
+  }
+  if ((await page.locator('.dom-node.markup-node.selected').count()) !== 0) {
+    throw new Error('Freshly drawn markup should not immediately show the purple edit frame')
+  }
+  if ((await page.locator('.selection-quick-toolbar').count()) !== 0) {
+    throw new Error('Freshly drawn markup should wait for a second click before showing edit controls')
+  }
+  await arrowMarkupNode.click()
+  await page.waitForSelector('.selection-quick-toolbar')
+  await page.waitForFunction(() => document.querySelectorAll('.dom-node.markup-node.selected .markup-point-handle').length === 2)
+  if ((await arrowMarkupNode.locator('.node-handle').count()) !== 0) {
+    throw new Error('Selected arrow markup should expose endpoint handles instead of the four resize corners')
+  }
+  const endPointHandle = await arrowMarkupNode.locator('.markup-point-handle').nth(1).boundingBox()
+  const lineEndBefore = await arrowMarkupNode.locator('.markup-visible-line').evaluate((line) => ({
+    x2: Number(line.getAttribute('x2')),
+    y2: Number(line.getAttribute('y2')),
+  }))
+  if (!endPointHandle) throw new Error('Arrow markup should expose a draggable endpoint handle')
+  await page.mouse.move(endPointHandle.x + endPointHandle.width / 2, endPointHandle.y + endPointHandle.height / 2)
+  await page.mouse.down()
+  await page.mouse.move(endPointHandle.x + endPointHandle.width / 2 + 44, endPointHandle.y + endPointHandle.height / 2 + 26, {
+    steps: 5,
+  })
+  await page.mouse.up()
+  const lineEndAfter = await arrowMarkupNode.locator('.markup-visible-line').evaluate((line) => ({
+    x2: Number(line.getAttribute('x2')),
+    y2: Number(line.getAttribute('y2')),
+  }))
+  const endPointHandleAfter = await arrowMarkupNode.locator('.markup-point-handle').nth(1).boundingBox()
+  const endpointHandleTravel =
+    endPointHandleAfter && endPointHandle
+      ? Math.abs(endPointHandleAfter.x - endPointHandle.x) + Math.abs(endPointHandleAfter.y - endPointHandle.y)
+      : 0
+  if (
+    (lineEndAfter.x2 === lineEndBefore.x2 && lineEndAfter.y2 === lineEndBefore.y2) ||
+    !endPointHandleAfter ||
+    endpointHandleTravel <= 20
+  ) {
+    throw new Error(
+      `Dragging an arrow endpoint should edit the arrow geometry: before=${JSON.stringify(lineEndBefore)}, after=${JSON.stringify(lineEndAfter)}, handleBefore=${JSON.stringify(endPointHandle)}, handleAfter=${JSON.stringify(endPointHandleAfter)}`,
+    )
+  }
+  await arrowMarkupNode.dblclick()
+  await page.waitForSelector('.dom-node.markup-node[data-markup-kind="arrow"].editing .dom-markup-text-editor')
+  if ((await page.locator('.details-dialog').count()) !== 0) {
+    throw new Error('Double-clicking arrow markup should edit its label instead of opening image details')
+  }
+  const arrowEditorChrome = await arrowMarkupNode.locator('.dom-markup-text-editor').evaluate((editor) => {
+    const style = getComputedStyle(editor)
+    return {
+      backgroundColor: style.backgroundColor,
+      borderTopWidth: style.borderTopWidth,
+      boxShadow: style.boxShadow,
+    }
+  })
+  if (
+    arrowEditorChrome.backgroundColor !== 'rgba(0, 0, 0, 0)' ||
+    arrowEditorChrome.borderTopWidth !== '0px' ||
+    arrowEditorChrome.boxShadow !== 'none'
+  ) {
+    throw new Error(`Arrow label editor should be transparent and chrome-free: ${JSON.stringify(arrowEditorChrome)}`)
+  }
+  await page.keyboard.type('Flow label')
+  await page.keyboard.press('Escape')
+  await page.waitForSelector('.dom-node.markup-node[data-markup-kind="arrow"]:not(.editing) .dom-markup-label.line-label')
+  const arrowVisibleSegmentsWithLabel = await arrowMarkupNode.locator('.markup-visible-line').count()
+  if (arrowVisibleSegmentsWithLabel !== 2) {
+    throw new Error(`Arrow label should split the visible arrow stroke around text, got ${arrowVisibleSegmentsWithLabel} segments`)
+  }
+  const arrowLabelBeforeMove = await arrowMarkupNode.locator('.dom-markup-label.line-label').boundingBox()
+  if (!arrowLabelBeforeMove) throw new Error('Arrow markup should render a label after text editing')
+  const endPointHandleWithLabel = await arrowMarkupNode.locator('.markup-point-handle').nth(1).boundingBox()
+  if (!endPointHandleWithLabel) throw new Error('Arrow markup should keep endpoint handles after label editing')
+  await page.mouse.move(
+    endPointHandleWithLabel.x + endPointHandleWithLabel.width / 2,
+    endPointHandleWithLabel.y + endPointHandleWithLabel.height / 2,
+  )
+  await page.mouse.down()
+  await page.mouse.move(
+    endPointHandleWithLabel.x + endPointHandleWithLabel.width / 2 + 34,
+    endPointHandleWithLabel.y + endPointHandleWithLabel.height / 2 - 28,
+    { steps: 5 },
+  )
+  await page.mouse.up()
+  const arrowLabelAfterMove = await arrowMarkupNode.locator('.dom-markup-label.line-label').boundingBox()
+  const arrowLabelTravel = arrowLabelAfterMove
+    ? Math.abs(arrowLabelAfterMove.x - arrowLabelBeforeMove.x) + Math.abs(arrowLabelAfterMove.y - arrowLabelBeforeMove.y)
+    : 0
+  if (!arrowLabelAfterMove || arrowLabelTravel <= 6) {
+    throw new Error(
+      `Arrow label should stay attached to the line midpoint when an endpoint moves: before=${JSON.stringify(
+        arrowLabelBeforeMove,
+      )}, after=${JSON.stringify(arrowLabelAfterMove)}`,
+    )
+  }
+  for (const action of ['Edit text', 'Stroke color', 'Fill color', 'Stroke width', 'Dashed line', 'Copy', 'Duplicate', 'Front', 'Delete']) {
+    if ((await page.locator('.selection-quick-toolbar').getByRole('button', { name: action }).count()) !== 1) {
+      throw new Error(`Markup quick toolbar should expose ${action}`)
+    }
+  }
+  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Stroke width' }).click()
+  await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Bold' }).click()
+  const boldMarkupStrokes = await arrowMarkupNode
+    .locator('.markup-visible-line')
+    .evaluateAll((lines) => lines.map((line) => line.getAttribute('stroke-width')))
+  if (!boldMarkupStrokes.length || boldMarkupStrokes.some((stroke) => stroke !== '6')) {
+    throw new Error(`Markup stroke-width action should update every rendered SVG line segment, got ${boldMarkupStrokes}`)
+  }
+  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Dashed line' }).click()
+  const dashedMarkupStrokes = await arrowMarkupNode
+    .locator('.markup-visible-line')
+    .evaluateAll((lines) => lines.map((line) => line.getAttribute('stroke-dasharray')))
+  if (!dashedMarkupStrokes.length || dashedMarkupStrokes.some((stroke) => !stroke)) {
+    throw new Error('Markup dashed action should update the rendered SVG dash array')
+  }
+  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Delete' }).click()
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node.markup-node').length === count,
+    markupCountBefore,
+  )
+
+  const chooseDrawTool = async (toolName) => {
+    await drawToolButton.hover()
+    await page.waitForFunction(() => {
+      const flyout = document.querySelector('.canvas-tool-flyout')
+      return flyout && window.getComputedStyle(flyout).visibility === 'visible'
+    })
+    await page.locator('.canvas-tool-flyout').getByRole('menuitem', { name: toolName }).click()
+    await page.waitForFunction(
+      (name) =>
+        [...document.querySelectorAll('.canvas-tool-dock button.active')].some(
+          (button) => button.getAttribute('aria-label') === name,
+        ),
+      toolName,
+    )
+    await page.evaluate(() => {
+      if (document.activeElement instanceof HTMLElement) document.activeElement.blur()
+    })
+  }
+
+  const connectorCountBefore = await page.locator('.dom-node.markup-node[data-markup-kind="arrow"]').count()
+  const firstImageBoxForConnector = await selectedNode.boundingBox()
+  const secondImageBoxForConnector = await secondImageNode.boundingBox()
+  if (!firstImageBoxForConnector || !secondImageBoxForConnector) {
+    throw new Error('Missing image bounds for connector binding check')
+  }
+  await chooseDrawTool('Arrow')
+  await page.mouse.move(
+    firstImageBoxForConnector.x + firstImageBoxForConnector.width / 2,
+    firstImageBoxForConnector.y + firstImageBoxForConnector.height / 2,
+  )
+  await page.mouse.down()
+  await page.mouse.move(
+    secondImageBoxForConnector.x + secondImageBoxForConnector.width / 2,
+    secondImageBoxForConnector.y + secondImageBoxForConnector.height / 2,
+    { steps: 8 },
+  )
+  await page.waitForFunction(
+    (nodeId) => document.querySelector(`[data-node-id="${nodeId}"]`)?.classList.contains('connector-drop-target'),
+    secondImageNodeId,
+  )
+  await page.mouse.up()
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="arrow"]').length === count + 1,
+    connectorCountBefore,
+  )
+  const boundConnector = page.locator('.dom-node.markup-node[data-markup-kind="arrow"]').last()
+  const boundConnectorStartId = await boundConnector.getAttribute('data-connector-start-node-id')
+  const boundConnectorEndId = await boundConnector.getAttribute('data-connector-end-node-id')
+  if (boundConnectorStartId !== firstNodeId || boundConnectorEndId !== secondImageNodeId) {
+    throw new Error(
+      `Arrow endpoints should bind to nearby image nodes: start=${boundConnectorStartId}, end=${boundConnectorEndId}`,
+    )
+  }
+  await boundConnector.click()
+  await page.waitForFunction(() => document.querySelectorAll('.dom-node.markup-node.selected .markup-point-handle.bound').length === 2)
+  const connectorEndAbsoluteBefore = await boundConnector.evaluate((node) => {
+    const rect = node.getBoundingClientRect()
+    const line = [...node.querySelectorAll('.markup-visible-line')].at(-1)
+    return {
+      x: rect.left + Number(line?.getAttribute('x2') || 0),
+      y: rect.top + Number(line?.getAttribute('y2') || 0),
+    }
+  })
+  const secondImageMoveStartBox = await secondImageNode.boundingBox()
+  if (!secondImageMoveStartBox) throw new Error('Missing second image bounds before connector follow check')
+  await page.mouse.move(
+    secondImageMoveStartBox.x + secondImageMoveStartBox.width / 2,
+    secondImageMoveStartBox.y + secondImageMoveStartBox.height / 2,
+  )
+  await page.mouse.down()
+  await page.mouse.move(
+    secondImageMoveStartBox.x + secondImageMoveStartBox.width / 2 + 72,
+    secondImageMoveStartBox.y + secondImageMoveStartBox.height / 2 + 26,
+    { steps: 8 },
+  )
+  await page.mouse.up()
+  const connectorEndAbsoluteAfter = await boundConnector.evaluate((node) => {
+    const rect = node.getBoundingClientRect()
+    const line = [...node.querySelectorAll('.markup-visible-line')].at(-1)
+    return {
+      x: rect.left + Number(line?.getAttribute('x2') || 0),
+      y: rect.top + Number(line?.getAttribute('y2') || 0),
+    }
+  })
+  if (
+    connectorEndAbsoluteAfter.x <= connectorEndAbsoluteBefore.x + 40 ||
+    connectorEndAbsoluteAfter.y <= connectorEndAbsoluteBefore.y + 12
+  ) {
+    throw new Error(
+      `Bound connector endpoint should follow the moved target: before=${JSON.stringify(
+        connectorEndAbsoluteBefore,
+      )}, after=${JSON.stringify(connectorEndAbsoluteAfter)}`,
+    )
+  }
+  await boundConnector.click()
+  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Arrowheads' }).click()
+  await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Both arrows' }).click()
+  const connectorArrowheads = await boundConnector.locator('.markup-visible-line').evaluate((line) => ({
+    markerStart: line.getAttribute('marker-start'),
+    markerEnd: line.getAttribute('marker-end'),
+  }))
+  if (!connectorArrowheads.markerStart || !connectorArrowheads.markerEnd) {
+    throw new Error(`Both arrows action should render start and end arrowheads: ${JSON.stringify(connectorArrowheads)}`)
+  }
+  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Delete' }).click()
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="arrow"]').length === count,
+    connectorCountBefore,
+  )
+
+  const noteCountBeforeConnector = await page.locator('.dom-node.markup-node[data-markup-kind="note"]').count()
+  const connectorNotePoint = { x: farBlankPoint.x, y: farBlankPoint.y }
+  await page.locator('.canvas-tool-dock').getByRole('button', { name: 'Markup note' }).click()
+  await page.waitForFunction(() =>
+    [...document.querySelectorAll('.canvas-tool-dock button.active')].some(
+      (button) => button.getAttribute('aria-label') === 'Markup note',
+    ),
+  )
+  await page.mouse.click(connectorNotePoint.x, connectorNotePoint.y)
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="note"]').length === count + 1,
+    noteCountBeforeConnector,
+  )
+  const connectorNote = page.locator('.dom-node.markup-node[data-markup-kind="note"]').last()
+  const connectorNoteId = await connectorNote.getAttribute('data-node-id')
+  const connectorNoteBox = await connectorNote.boundingBox()
+  if (!connectorNoteId || !connectorNoteBox) throw new Error('Markup note should be available for connector binding checks')
+  const connectorStartPoint = await page.evaluate((nodeId) => {
+    const node = document.querySelector(`[data-node-id="${nodeId}"]`)
+    const canvas = document.querySelector('.canvas-shell')
+    const nodeRect = node?.getBoundingClientRect()
+    const canvasRect = canvas?.getBoundingClientRect()
+    if (!nodeRect || !canvasRect) return null
+    const candidates = [
+      { x: nodeRect.right + 180, y: nodeRect.bottom + 72 },
+      { x: nodeRect.right + 180, y: nodeRect.top - 72 },
+      { x: nodeRect.left - 180, y: nodeRect.bottom + 72 },
+      { x: nodeRect.left - 180, y: nodeRect.top - 72 },
+      { x: nodeRect.left + nodeRect.width / 2, y: nodeRect.bottom + 160 },
+      { x: nodeRect.left + nodeRect.width / 2, y: nodeRect.top - 160 },
+    ].map((point) => ({
+      x: Math.max(canvasRect.left + 24, Math.min(canvasRect.right - 24, point.x)),
+      y: Math.max(canvasRect.top + 24, Math.min(canvasRect.bottom - 24, point.y)),
+    }))
+
+    return (
+      candidates.find((point) => {
+        const target = document.elementFromPoint(point.x, point.y)
+        return Boolean(
+          target &&
+            target.closest('.canvas-shell') &&
+            !target.closest('.dom-node') &&
+            !target.closest('.canvas-tool-dock') &&
+            !target.closest('.selection-quick-toolbar') &&
+            !target.closest('.node-context-menu'),
+        )
+      }) || null
+    )
+  }, connectorNoteId)
+  if (!connectorStartPoint) throw new Error('Could not find a blank connector start point near the markup note')
+
+  const freeNoteConnectorCountBefore = await page.locator('.dom-node.markup-node[data-markup-kind="arrow"]').count()
+  await chooseDrawTool('Arrow')
+  await page.mouse.move(connectorStartPoint.x, connectorStartPoint.y)
+  await page.mouse.down()
+  await page.mouse.move(connectorNoteBox.x + connectorNoteBox.width * 0.72, connectorNoteBox.y + connectorNoteBox.height * 0.52, {
+    steps: 8,
+  })
+  await page.mouse.up()
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="arrow"]').length === count + 1,
+    freeNoteConnectorCountBefore,
+  )
+  const freeNoteConnector = page.locator('.dom-node.markup-node[data-markup-kind="arrow"]').last()
+  const freeNoteConnectorEndId = await freeNoteConnector.getAttribute('data-connector-end-node-id')
+  if (freeNoteConnectorEndId) {
+    throw new Error(`Arrow endpoint dropped in the free interior of a note should not auto-bind, got ${freeNoteConnectorEndId}`)
+  }
+  await freeNoteConnector.click()
+  await page.waitForSelector('.selection-quick-toolbar')
+  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Delete' }).click()
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="arrow"]').length === count,
+    freeNoteConnectorCountBefore,
+  )
+
+  const noteConnectorCountBefore = await page.locator('.dom-node.markup-node[data-markup-kind="arrow"]').count()
+  await chooseDrawTool('Arrow')
+  await page.mouse.move(connectorStartPoint.x, connectorStartPoint.y)
+  await page.mouse.down()
+  await page.mouse.move(connectorNoteBox.x + connectorNoteBox.width * 0.72, connectorNoteBox.y + connectorNoteBox.height * 0.92, {
+    steps: 8,
+  })
+  await page.mouse.up()
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="arrow"]').length === count + 1,
+    noteConnectorCountBefore,
+  )
+  const boundNoteConnector = page.locator('.dom-node.markup-node[data-markup-kind="arrow"]').last()
+  const boundNoteConnectorEndId = await boundNoteConnector.getAttribute('data-connector-end-node-id')
+  const boundNoteConnectorEndAnchor = await boundNoteConnector.getAttribute('data-connector-end-anchor')
+  const boundNoteConnectorEndOffset = Number(await boundNoteConnector.getAttribute('data-connector-end-offset'))
+  if (boundNoteConnectorEndId !== connectorNoteId || !boundNoteConnectorEndAnchor || !Number.isFinite(boundNoteConnectorEndOffset)) {
+    throw new Error(
+      `Arrow should bind to a specific note edge point: end=${boundNoteConnectorEndId}, anchor=${boundNoteConnectorEndAnchor}, offset=${boundNoteConnectorEndOffset}`,
+    )
+  }
+  if (boundNoteConnectorEndAnchor === 'center') {
+    throw new Error('Connector dropped inside a note but away from the center should bind to the nearest note edge')
+  }
+  const pointForBoxAnchor = (box, anchor, offset = 0.5) => {
+    if (anchor === 'top') return { x: box.x + box.width * offset, y: box.y }
+    if (anchor === 'right') return { x: box.x + box.width, y: box.y + box.height * offset }
+    if (anchor === 'bottom') return { x: box.x + box.width * offset, y: box.y + box.height }
+    if (anchor === 'left') return { x: box.x, y: box.y + box.height * offset }
+    return { x: box.x + box.width / 2, y: box.y + box.height / 2 }
+  }
+  const readConnectorEndPoint = async (connector) =>
+    connector.evaluate((node) => {
+      const rect = node.getBoundingClientRect()
+      const line = [...node.querySelectorAll('.markup-visible-line')].at(-1)
+      return {
+        markerEnd: line?.getAttribute('marker-end'),
+        x: rect.left + Number(line?.getAttribute('x2') || 0),
+        y: rect.top + Number(line?.getAttribute('y2') || 0),
+      }
+    })
+  const noteExpectedBefore = pointForBoxAnchor(connectorNoteBox, boundNoteConnectorEndAnchor, boundNoteConnectorEndOffset)
+  const boundNoteConnectorEndBefore = await readConnectorEndPoint(boundNoteConnector)
+  if (
+    boundNoteConnectorEndBefore.markerEnd &&
+    (!nearlyEqual(boundNoteConnectorEndBefore.x, noteExpectedBefore.x, 1.5) ||
+      !nearlyEqual(boundNoteConnectorEndBefore.y, noteExpectedBefore.y, 1.5))
+  ) {
+    throw new Error(
+      `Bound note connector endpoint should sit on the saved note edge point before moving: expected=${JSON.stringify(
+        noteExpectedBefore,
+      )}, actual=${JSON.stringify(boundNoteConnectorEndBefore)}`,
+    )
+  }
+
+  await page.mouse.move(connectorNoteBox.x + connectorNoteBox.width / 2, connectorNoteBox.y + connectorNoteBox.height / 2)
+  await page.mouse.down()
+  await page.mouse.move(connectorNoteBox.x + connectorNoteBox.width / 2 + 68, connectorNoteBox.y + connectorNoteBox.height / 2 - 42, {
+    steps: 8,
+  })
+  await page.mouse.up()
+  const movedConnectorNoteBox = await connectorNote.boundingBox()
+  const boundNoteConnectorEndAfter = await readConnectorEndPoint(boundNoteConnector)
+  if (!movedConnectorNoteBox) throw new Error('Missing note bounds after connector follow move')
+  const noteExpectedAfter = pointForBoxAnchor(movedConnectorNoteBox, boundNoteConnectorEndAnchor, boundNoteConnectorEndOffset)
+  if (
+    !nearlyEqual(boundNoteConnectorEndAfter.x, noteExpectedAfter.x, 1.5) ||
+    !nearlyEqual(boundNoteConnectorEndAfter.y, noteExpectedAfter.y, 1.5)
+  ) {
+    throw new Error(
+      `Bound connector endpoint should keep its note edge offset when the note moves: expected=${JSON.stringify(
+        noteExpectedAfter,
+      )}, actual=${JSON.stringify(boundNoteConnectorEndAfter)}`,
+    )
+  }
+  const noteConnectorMarkerRef = await boundNoteConnector.locator('marker').first().getAttribute('refX')
+  if (noteConnectorMarkerRef !== '15') {
+    throw new Error(`Arrow marker refX should align the visual arrow tip with the connector endpoint, got ${noteConnectorMarkerRef}`)
+  }
+  const noteConnectorMarkerFill = await boundNoteConnector.locator('marker path').first().getAttribute('fill')
+  if (noteConnectorMarkerFill !== 'none') {
+    throw new Error(`Arrowheads should use FigJam-style open strokes, got fill=${noteConnectorMarkerFill}`)
+  }
+  const noteConnectorLineCap = await boundNoteConnector.locator('.markup-visible-line').last().getAttribute('stroke-linecap')
+  if (noteConnectorLineCap !== 'butt') {
+    throw new Error(`Arrow lines with marker heads should use butt caps to avoid a protruding tip, got ${noteConnectorLineCap}`)
+  }
+  await boundNoteConnector.click()
+  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Delete' }).click()
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="arrow"]').length === count,
+    noteConnectorCountBefore,
+  )
+  await connectorNote.click()
+  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Delete' }).click()
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="note"]').length === count,
+    noteCountBeforeConnector,
+  )
+
+  const markupShapeTestPoint = { x: canvasBox.x + 520, y: canvasBox.y + 240 }
+  const rectMarkupCountBefore = await page.locator('.dom-node.markup-node[data-markup-kind="rect"]').count()
+  await chooseDrawTool('Rectangle')
+  await page.keyboard.down('Shift')
+  await page.mouse.move(markupShapeTestPoint.x, markupShapeTestPoint.y)
+  await page.mouse.down()
+  await page.mouse.move(markupShapeTestPoint.x + 150, markupShapeTestPoint.y + 58, { steps: 5 })
+  await page.mouse.up()
+  await page.keyboard.up('Shift')
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="rect"]').length === count + 1,
+    rectMarkupCountBefore,
+  )
+  const shiftedRectMarkup = page.locator('.dom-node.markup-node[data-markup-kind="rect"]').last()
+  const shiftedRectBox = await shiftedRectMarkup.boundingBox()
+  if (!shiftedRectBox || Math.abs(shiftedRectBox.width - shiftedRectBox.height) > 2) {
+    throw new Error(`Shift-dragged rectangle should become a square, got ${JSON.stringify(shiftedRectBox)}`)
+  }
+  await shiftedRectMarkup.dblclick()
+  await page.waitForSelector('.dom-node.markup-node[data-markup-kind="rect"].editing .dom-markup-text-editor')
+  if ((await page.locator('.details-dialog').count()) !== 0) {
+    throw new Error('Double-clicking rectangle markup should edit shape text instead of opening image details')
+  }
+  const rectEditorChrome = await shiftedRectMarkup.locator('.dom-markup-text-editor').evaluate((editor) => {
+    const style = getComputedStyle(editor)
+    return {
+      backgroundColor: style.backgroundColor,
+      borderTopWidth: style.borderTopWidth,
+      boxShadow: style.boxShadow,
+    }
+  })
+  if (
+    rectEditorChrome.backgroundColor !== 'rgba(0, 0, 0, 0)' ||
+    rectEditorChrome.borderTopWidth !== '0px' ||
+    rectEditorChrome.boxShadow !== 'none'
+  ) {
+    throw new Error(`Shape text editor should be transparent and chrome-free: ${JSON.stringify(rectEditorChrome)}`)
+  }
+  await page.keyboard.type('Shape text')
+  const rectBoxWhileEditing = await shiftedRectMarkup.boundingBox()
+  const rectEditorBox = await shiftedRectMarkup.locator('.dom-markup-text-editor').boundingBox()
+  if (
+    !rectBoxWhileEditing ||
+    !rectEditorBox ||
+    Math.abs(rectEditorBox.y + rectEditorBox.height / 2 - (rectBoxWhileEditing.y + rectBoxWhileEditing.height / 2)) > 8
+  ) {
+    throw new Error(
+      `Shape text editor should stay visually centered while editing: node=${JSON.stringify(
+        rectBoxWhileEditing,
+      )}, editor=${JSON.stringify(rectEditorBox)}`,
+    )
+  }
+  await page.keyboard.press('Escape')
+  const rectMarkupText = await shiftedRectMarkup.locator('.dom-markup-label.shape-label').textContent()
+  if (!rectMarkupText?.includes('Shape text')) {
+    throw new Error(`Rectangle markup should keep text inside the shape, got ${rectMarkupText}`)
+  }
+  await shiftedRectMarkup.click()
+  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Corner radius' }).click()
+  await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Round' }).click()
+  const roundedRectRadius = await shiftedRectMarkup.locator('rect').getAttribute('rx')
+  if (roundedRectRadius !== '18') {
+    throw new Error(`Rectangle corner radius action should update the rendered SVG rect, got ${roundedRectRadius}`)
+  }
+  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Delete' }).click()
+
+  const ellipseMarkupCountBefore = await page.locator('.dom-node.markup-node[data-markup-kind="ellipse"]').count()
+  await chooseDrawTool('Ellipse')
+  await page.mouse.move(markupShapeTestPoint.x + 20, markupShapeTestPoint.y + 20)
+  await page.mouse.down()
+  await page.mouse.move(markupShapeTestPoint.x + 140, markupShapeTestPoint.y + 66, { steps: 4 })
+  await page.waitForSelector('.markup-creation-box.kind-ellipse')
+  const ellipsePreviewRadius = await page.locator('.markup-creation-box.kind-ellipse').evaluate((box) => getComputedStyle(box).borderTopLeftRadius)
+  if (ellipsePreviewRadius !== '50%') {
+    throw new Error(`Ellipse creation preview should use an oval radius instead of a pill radius, got ${ellipsePreviewRadius}`)
+  }
+  await page.mouse.up()
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="ellipse"]').length === count + 1,
+    ellipseMarkupCountBefore,
+  )
+  const ellipseMarkup = page.locator('.dom-node.markup-node[data-markup-kind="ellipse"]').last()
+  await ellipseMarkup.click()
+  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Delete' }).click()
+
+  const lineMarkupCountBefore = await page.locator('.dom-node.markup-node[data-markup-kind="line"]').count()
+  await chooseDrawTool('Line')
+  await page.keyboard.down('Shift')
+  await page.mouse.move(markupShapeTestPoint.x + 20, markupShapeTestPoint.y + 40)
+  await page.mouse.down()
+  await page.mouse.move(markupShapeTestPoint.x + 190, markupShapeTestPoint.y + 92, { steps: 6 })
+  await page.mouse.up()
+  await page.keyboard.up('Shift')
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="line"]').length === count + 1,
+    lineMarkupCountBefore,
+  )
+  const shiftedLineMarkup = page.locator('.dom-node.markup-node[data-markup-kind="line"]').last()
+  const shiftedLine = await shiftedLineMarkup.locator('.markup-visible-line').evaluate((line) => ({
+    x1: Number(line.getAttribute('x1')),
+    y1: Number(line.getAttribute('y1')),
+    x2: Number(line.getAttribute('x2')),
+    y2: Number(line.getAttribute('y2')),
+  }))
+  const shiftedLineAngle = Math.abs(Math.atan2(shiftedLine.y2 - shiftedLine.y1, shiftedLine.x2 - shiftedLine.x1))
+  const snappedAngles = [0, Math.PI / 4, Math.PI / 2]
+  if (!snappedAngles.some((angle) => Math.abs(shiftedLineAngle - angle) < 0.03)) {
+    throw new Error(`Shift-dragged line should snap to 0/45/90 degrees, got ${JSON.stringify(shiftedLine)}`)
+  }
+  const shiftedLineBox = await shiftedLineMarkup.boundingBox()
+  if (!shiftedLineBox) throw new Error('Missing shifted line geometry for deletion')
+  await page.mouse.click(
+    shiftedLineBox.x + (shiftedLine.x1 + shiftedLine.x2) / 2,
+    shiftedLineBox.y + (shiftedLine.y1 + shiftedLine.y2) / 2,
+  )
+  await page.waitForSelector('.selection-quick-toolbar')
+  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Delete' }).click()
 
   const secondNode = page.locator('.dom-node').nth(1)
   const visibleNodeCountBeforeOrganization = await page.locator('.dom-node').count()
@@ -1483,7 +2506,7 @@ try {
     throw new Error('The V shortcut should restore Select after testing the section tool')
   }
 
-  const postSectionBlankPoint = { x: canvasBox.x + canvasBox.width - 520, y: canvasBox.y + canvasBox.height - 180 }
+  const postSectionBlankPoint = { x: canvasBox.x + 130, y: canvasBox.y + canvasBox.height - 170 }
   await page.keyboard.press('t')
   await page.mouse.click(postSectionBlankPoint.x, postSectionBlankPoint.y)
   await page.waitForSelector('.dom-node.text-node.editing .dom-text-editor')
@@ -1546,15 +2569,15 @@ try {
   }
 
   const lowerBlankPoint = {
-    x: canvasBox.x + 130,
-    y: canvasBox.y + canvasBox.height - 90,
+    x: canvasBox.x + 40,
+    y: canvasBox.y + canvasBox.height - 40,
   }
   await page.mouse.click(lowerBlankPoint.x, lowerBlankPoint.y)
   await page.waitForFunction(() => document.querySelectorAll('.dom-node.text-node.selected').length === 0)
 
   let textBox = await page.locator('.dom-node.text-node').last().boundingBox()
   if (!textBox) throw new Error('Missing text node for FigJam-style text selection check')
-  await page.locator('.dom-node.text-node').last().click()
+  await page.mouse.click(textBox.x + Math.min(32, textBox.width / 2), textBox.y + Math.min(28, textBox.height / 2))
   await page.waitForSelector('.dom-node.text-node.selected:not(.editing)')
   if ((await page.locator('.dom-node.text-node.editing').count()) !== 0) {
     throw new Error('The first click on an unselected text node should select it without entering text editing')
@@ -1576,7 +2599,10 @@ try {
     throw new Error(`Dragging a selected text node should move it without entering edit mode: before=${JSON.stringify(textBox)}, after=${JSON.stringify(movedTextBox)}`)
   }
 
-  await page.locator('.dom-node.text-node').last().click()
+  await page.mouse.click(
+    movedTextBox.x + Math.min(32, movedTextBox.width / 2),
+    movedTextBox.y + Math.min(28, movedTextBox.height / 2),
+  )
   await page.waitForSelector('.dom-node.text-node.editing .dom-text-editor')
   await page.keyboard.type(' updated')
   await page.keyboard.press('Escape')
@@ -1693,6 +2719,82 @@ try {
   const zoomAfter = await page.locator('.zoom-readout').textContent()
   if (Number.parseInt(zoomAfter || '0', 10) <= Number.parseInt(zoomBefore || '0', 10)) {
     throw new Error(`Zoom in should increase the canvas scale: before=${zoomBefore}, after=${zoomAfter}`)
+  }
+
+  await page.getByRole('button', { name: 'Reset view' }).click()
+  await page.waitForFunction(() => {
+    const shell = document.querySelector('.canvas-shell')
+    return (
+      shell &&
+      Number(shell.getAttribute('data-viewport-scale')) === 1 &&
+      Math.abs(Number(shell.getAttribute('data-viewport-x')) - 420) <= 0.5 &&
+      Math.abs(Number(shell.getAttribute('data-viewport-y')) - 240) <= 0.5
+    )
+  })
+  await wait(60)
+  const pointerZoomMedia = selectedNode.locator('.dom-node-media')
+  const beforePointerZoom = await pointerZoomMedia.boundingBox()
+  if (!beforePointerZoom) throw new Error('Missing first node for pointer-centered zoom check')
+  const pointerZoomAnchor = {
+    x: beforePointerZoom.x + beforePointerZoom.width / 2,
+    y: beforePointerZoom.y + beforePointerZoom.height / 2,
+  }
+  const scaleBeforePointerZoom = Number(await page.locator('.canvas-shell').getAttribute('data-viewport-scale'))
+  await page.evaluate(({ x, y }) => {
+    const target = document.elementFromPoint(x, y)
+    target?.dispatchEvent(
+      new WheelEvent('wheel', {
+        bubbles: true,
+        cancelable: true,
+        clientX: x,
+        clientY: y,
+        ctrlKey: true,
+        deltaMode: WheelEvent.DOM_DELTA_PIXEL,
+        deltaX: 0,
+        deltaY: -180,
+      }),
+    )
+  }, pointerZoomAnchor)
+  await page.waitForFunction(
+    (previousScale) => Number(document.querySelector('.canvas-shell')?.getAttribute('data-viewport-scale')) > previousScale,
+    scaleBeforePointerZoom,
+  )
+  const afterPointerZoom = await pointerZoomMedia.boundingBox()
+  if (
+    !afterPointerZoom ||
+    afterPointerZoom.width <= beforePointerZoom.width ||
+    !nearlyEqual(afterPointerZoom.x + afterPointerZoom.width / 2, pointerZoomAnchor.x, 2) ||
+    !nearlyEqual(afterPointerZoom.y + afterPointerZoom.height / 2, pointerZoomAnchor.y, 2)
+  ) {
+    throw new Error(
+      `Ctrl-wheel zoom should keep the pointer anchor fixed: before=${JSON.stringify(beforePointerZoom)}, after=${JSON.stringify(afterPointerZoom)}, anchor=${JSON.stringify(pointerZoomAnchor)}`,
+    )
+  }
+
+  const scaleAfterPointerZoom = Number(await page.locator('.canvas-shell').getAttribute('data-viewport-scale'))
+  await page.keyboard.down('Shift')
+  await page.keyboard.press('Digit1')
+  await page.keyboard.up('Shift')
+  const scaleAfterFitAll = Number(await page.locator('.canvas-shell').getAttribute('data-viewport-scale'))
+  if (!(scaleAfterFitAll > 0) || scaleAfterFitAll >= scaleAfterPointerZoom) {
+    throw new Error(`Shift+1 should fit all objects after zooming in: before=${scaleAfterPointerZoom}, after=${scaleAfterFitAll}`)
+  }
+
+  await selectedNode.click()
+  await page.keyboard.down('Shift')
+  await page.keyboard.press('Digit2')
+  await page.keyboard.up('Shift')
+  const scaleAfterFitSelection = Number(await page.locator('.canvas-shell').getAttribute('data-viewport-scale'))
+  if (scaleAfterFitSelection <= scaleAfterFitAll) {
+    throw new Error(`Shift+2 should fit the selected object tighter than Fit all: all=${scaleAfterFitAll}, selection=${scaleAfterFitSelection}`)
+  }
+
+  await page.keyboard.down('Control')
+  await page.keyboard.press('Digit0')
+  await page.keyboard.up('Control')
+  const zoomAfterKeyboardReset = await page.locator('.zoom-readout').textContent()
+  if (zoomAfterKeyboardReset !== '100%') {
+    throw new Error(`Control+0 should reset the canvas view to 100%, got ${zoomAfterKeyboardReset}`)
   }
   await page.getByRole('button', { name: 'Reset view' }).click()
 
@@ -2041,6 +3143,8 @@ try {
   }
 
   await selectedNode.click()
+  await page.locator('.canvas-controls').getByRole('button', { name: 'Fit selection' }).click()
+  await wait(60)
   const beforeCrop = await selectedNode.locator('.dom-node-media').boundingBox()
   if (!beforeCrop) throw new Error('Missing selected node media before crop')
   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Crop' }).click()
@@ -2404,6 +3508,10 @@ try {
     countBeforeTransparentPaste,
   )
   await page.locator('.dom-node').last().locator('.dom-node-media img').waitFor({ state: 'visible' })
+  await page.waitForFunction(() => {
+    const image = [...document.querySelectorAll('.dom-node')].at(-1)?.querySelector('.dom-node-media img')
+    return image instanceof HTMLImageElement && image.complete && image.naturalWidth > 0
+  })
   const transparentPasteRender = await page.locator('.dom-node').last().evaluate((node) => {
     const media = node.querySelector('.dom-node-media')
     const image = node.querySelector('.dom-node-media img')
@@ -2454,4 +3562,5 @@ try {
   console.log('E2E smoke test passed')
 } finally {
   server.kill('SIGTERM')
+  eagleMockServer.close()
 }

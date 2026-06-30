@@ -31,6 +31,25 @@ const isStringArray = (value: unknown): value is string[] =>
 const isTextAlign = (value: unknown) => value === undefined || value === 'left' || value === 'center' || value === 'right'
 const isSectionBorderStyle = (value: unknown) => value === undefined || value === 'solid' || value === 'dashed'
 const isSectionLockMode = (value: unknown) => value === undefined || value === 'all' || value === 'background'
+const isMarkdownDisplayMode = (value: unknown) => value === undefined || value === 'full' || value === 'preview'
+const isMarkupKind = (value: unknown) =>
+  value === undefined ||
+  value === 'arrow' ||
+  value === 'line' ||
+  value === 'rect' ||
+  value === 'ellipse' ||
+  value === 'brush' ||
+  value === 'note'
+const isMarkupStrokeStyle = (value: unknown) => value === undefined || value === 'solid' || value === 'dashed'
+const isMarkupPointArray = (value: unknown) =>
+  value === undefined ||
+  (Array.isArray(value) &&
+    value.every(
+      (point) =>
+        isRecord(point) &&
+        typeof point.x === 'number' &&
+        typeof point.y === 'number',
+    ))
 
 const isImageCrop = (value: unknown) => {
   if (value === undefined) return true
@@ -76,15 +95,31 @@ const isCanvasNode = (value: unknown): value is MivoCanvasNode => {
     value.type === 'text' ||
     value.type === 'frame' ||
     value.type === 'ai-slot' ||
-    value.type === 'annotation'
+    value.type === 'annotation' ||
+    value.type === 'markup' ||
+    value.type === 'markdown' ||
+    value.type === 'pdf' ||
+    value.type === 'video'
   const textFieldsValid =
-    (value.type !== 'text' && value.type !== 'annotation') ||
+    (value.type !== 'text' && value.type !== 'annotation' && value.type !== 'markup' && value.type !== 'markdown') ||
     ((value.text === undefined || typeof value.text === 'string') &&
       (value.fontSize === undefined || typeof value.fontSize === 'number') &&
       (value.textColor === undefined || typeof value.textColor === 'string') &&
       (value.fontWeight === undefined || typeof value.fontWeight === 'number') &&
       isTextAlign(value.textAlign) &&
       (value.textAutoWidth === undefined || typeof value.textAutoWidth === 'boolean'))
+  const markupFieldsValid =
+    value.type !== 'markup' ||
+    (isMarkupKind(value.markupKind) &&
+      isMarkupPointArray(value.markupPoints) &&
+      (value.markupStrokeColor === undefined || typeof value.markupStrokeColor === 'string') &&
+      (value.markupFillColor === undefined || typeof value.markupFillColor === 'string') &&
+      (value.markupStrokeWidth === undefined || typeof value.markupStrokeWidth === 'number') &&
+      isMarkupStrokeStyle(value.markupStrokeStyle) &&
+      (value.markupOpacity === undefined || typeof value.markupOpacity === 'number') &&
+      (value.markupStartArrow === undefined || typeof value.markupStartArrow === 'boolean') &&
+      (value.markupEndArrow === undefined || typeof value.markupEndArrow === 'boolean') &&
+      (value.markupCornerRadius === undefined || typeof value.markupCornerRadius === 'number'))
 
   return (
     typeof value.id === 'string' &&
@@ -96,6 +131,7 @@ const isCanvasNode = (value: unknown): value is MivoCanvasNode => {
     typeof value.height === 'number' &&
     nodeStatuses.has(value.status as NodeStatus) &&
     textFieldsValid &&
+    markupFieldsValid &&
     (value.frameColor === undefined || typeof value.frameColor === 'string') &&
     (value.sectionId === undefined || typeof value.sectionId === 'string') &&
     (value.sectionFillColor === undefined || typeof value.sectionFillColor === 'string') &&
@@ -106,6 +142,10 @@ const isCanvasNode = (value: unknown): value is MivoCanvasNode => {
     isSectionLockMode(value.sectionLockMode) &&
     (value.sectionTemplateId === undefined || typeof value.sectionTemplateId === 'string') &&
     (value.assetUrl === undefined || typeof value.assetUrl === 'string') &&
+    (value.assetMimeType === undefined || typeof value.assetMimeType === 'string') &&
+    (value.assetOriginalName === undefined || typeof value.assetOriginalName === 'string') &&
+    (value.assetSizeBytes === undefined || typeof value.assetSizeBytes === 'number') &&
+    isMarkdownDisplayMode(value.markdownDisplayMode) &&
     (value.imageHasTransparency === undefined || typeof value.imageHasTransparency === 'boolean') &&
     isImageCrop(value.imageCrop) &&
     (value.parentIds === undefined || isStringArray(value.parentIds)) &&

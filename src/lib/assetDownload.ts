@@ -8,6 +8,11 @@ const extensionForType = (type?: string) => {
   if (type.includes('webp')) return '.webp'
   if (type.includes('gif')) return '.gif'
   if (type.includes('svg')) return '.svg'
+  if (type.includes('markdown')) return '.md'
+  if (type.includes('pdf')) return '.pdf'
+  if (type.includes('quicktime')) return '.mov'
+  if (type.includes('mp4')) return '.mp4'
+  if (type.includes('webm')) return '.webm'
   return ''
 }
 
@@ -30,7 +35,7 @@ const filenameFromUrl = (assetUrl: string) => {
 
 const filenameFor = (node: MivoCanvasNode, type?: string) => {
   const sourceName = node.assetUrl ? filenameFromUrl(node.assetUrl) : undefined
-  const name = cleanFilename(sourceName || node.title || 'mivo-image')
+  const name = cleanFilename(node.assetOriginalName || sourceName || node.title || 'mivo-asset')
   const hasExtension = /\.[a-z0-9]{2,8}$/i.test(name)
 
   return hasExtension ? name : `${name}${extensionForType(type)}`

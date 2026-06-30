@@ -1,30 +1,8 @@
 import type { MivoCanvasNode } from '../../types/mivoCanvas'
+import { capabilitiesForNode } from '../nodeTypes/canvasNodeRegistry'
+import type { CanvasObjectCapability } from '../nodeTypes/nodeCapabilities'
 
-export type CanvasObjectCapability =
-  | 'selectable'
-  | 'movable'
-  | 'resizable'
-  | 'layerable'
-  | 'groupable'
-  | 'lockable'
-  | 'hideable'
-  | 'exportable'
-  | 'downloadOriginal'
-  | 'asset'
-  | 'imageAsset'
-  | 'text'
-  | 'frame'
-  | 'promptSource'
-  | 'aiReference'
-  | 'aiEditable'
-  | 'videoAsset'
-  | 'pdfAsset'
-  | 'markdownDoc'
-  | 'annotatable'
-  | 'task'
-  | 'aiSlot'
-  | 'annotation'
-  | 'aiResult'
+export type { CanvasObjectCapability } from '../nodeTypes/nodeCapabilities'
 
 export type CanvasSelectionKind = 'blank' | 'single' | 'multi'
 
@@ -36,73 +14,6 @@ export type CanvasSelectionContext = {
   commonCapabilities: Set<CanvasObjectCapability>
   anyCapabilities: Set<CanvasObjectCapability>
   objectTypes: Set<MivoCanvasNode['type']>
-}
-
-const baseObjectCapabilities: CanvasObjectCapability[] = [
-  'selectable',
-  'movable',
-  'resizable',
-  'layerable',
-  'groupable',
-  'lockable',
-  'hideable',
-  'exportable',
-]
-
-export const capabilitiesForNode = (node: MivoCanvasNode): Set<CanvasObjectCapability> => {
-  const organizationCapabilities: CanvasObjectCapability[] = ['selectable', 'lockable', 'hideable']
-
-  if (node.type === 'text') {
-    if (node.locked) return new Set([...organizationCapabilities, 'text', 'promptSource', 'exportable'])
-    return new Set([...baseObjectCapabilities, 'text', 'promptSource'])
-  }
-
-  if (node.type === 'annotation') {
-    if (node.locked) {
-      return new Set([...organizationCapabilities, 'text', 'annotation', 'promptSource', 'annotatable', 'exportable'])
-    }
-    return new Set([...baseObjectCapabilities, 'text', 'annotation', 'promptSource', 'annotatable'])
-  }
-
-  if (node.type === 'frame') {
-    if (node.locked) return new Set([...organizationCapabilities, 'frame'])
-    return new Set([...baseObjectCapabilities, 'frame'])
-  }
-
-  if (node.type === 'ai-slot') {
-    if (node.locked) return new Set([...organizationCapabilities, 'aiSlot', 'promptSource', 'exportable'])
-    return new Set([...baseObjectCapabilities, 'aiSlot', 'promptSource'])
-  }
-
-  if (node.type === 'task-placeholder') {
-    if (node.locked) {
-      return new Set([...organizationCapabilities, 'asset', 'imageAsset', 'aiReference', 'task', 'exportable'])
-    }
-    return new Set([...baseObjectCapabilities, 'asset', 'imageAsset', 'aiReference', 'task'])
-  }
-
-  if (node.locked) {
-    return new Set([
-      ...organizationCapabilities,
-      'asset',
-      'imageAsset',
-      'downloadOriginal',
-      'aiReference',
-      'aiEditable',
-      'exportable',
-      ...(node.aiWorkflow?.kind === 'result' ? (['aiResult'] as CanvasObjectCapability[]) : []),
-    ])
-  }
-
-  return new Set([
-    ...baseObjectCapabilities,
-    'asset',
-    'imageAsset',
-    'downloadOriginal',
-    'aiReference',
-    'aiEditable',
-    ...(node.aiWorkflow?.kind === 'result' ? (['aiResult'] as CanvasObjectCapability[]) : []),
-  ])
 }
 
 const intersectionOf = (capabilitySets: Array<Set<CanvasObjectCapability>>) => {

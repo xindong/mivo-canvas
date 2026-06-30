@@ -1,7 +1,9 @@
-import { useEffect, useRef, type CSSProperties } from 'react'
+import { useCallback, useEffect, useRef, type CSSProperties } from 'react'
+import { MarkdownPreview } from '../lib/MarkdownPreview'
 import { useResolvedAssetUrl } from '../lib/useResolvedAssetUrl'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 import type { ResizeCorner } from './canvasGeometry'
+import { renderKindForNode } from './nodeTypes/canvasNodeRegistry'
 import { defaultTextAlign, defaultTextColor, defaultTextFontSize, defaultTextWeight } from './textGeometry'
 import type { TextResizeEdge } from './useCanvasInteractionController'
 
@@ -10,6 +12,7 @@ type CanvasNodeViewProps = {
   selected: boolean
   selectionPreview: boolean
   sectionDropTarget: boolean
+  connectorDropTarget: boolean
   primarySelected: boolean
   editing: boolean
   effectiveLocked: boolean
@@ -23,6 +26,11 @@ type CanvasNodeViewProps = {
     corner: ResizeCorner,
     event: React.PointerEvent<HTMLButtonElement>,
   ) => void
+  onMarkupPointPointerDown: (
+    nodeId: string,
+    pointIndex: number,
+    event: React.PointerEvent<HTMLButtonElement>,
+  ) => void
   onTextResizeHandlePointerDown: (
     nodeId: string,
     edge: TextResizeEdge,
@@ -34,23 +42,33 @@ type CanvasNodeViewProps = {
   onRenameNode: (nodeId: string) => void
   onUpdateText: (nodeId: string, text: string) => void
   onFinishTextEdit: (nodeId: string) => void
+  onResizeNodeToContent: (nodeId: string, width: number, height: number) => void
 }
-
-const isTaskNode = (node: MivoCanvasNode) => node.type === 'task-placeholder'
-const isTextNode = (node: MivoCanvasNode) => node.type === 'text' || node.type === 'annotation'
-const isFrameNode = (node: MivoCanvasNode) => node.type === 'frame'
-const isAiSlotNode = (node: MivoCanvasNode) => node.type === 'ai-slot'
 
 function CanvasTextEditor({
   node,
   onUpdateText,
   onFinishTextEdit,
+  className = 'dom-text-editor',
+  style,
+  autoSize = false,
 }: {
   node: MivoCanvasNode
   onUpdateText: (nodeId: string, text: string) => void
   onFinishTextEdit: (nodeId: string) => void
+  className?: string
+  style?: CSSProperties
+  autoSize?: boolean
 }) {
   const textAreaRef = useRef<HTMLTextAreaElement | null>(null)
+
+  const resizeTextArea = useCallback(() => {
+    const textArea = textAreaRef.current
+    if (!textArea || !autoSize) return
+
+    textArea.style.height = '0px'
+    textArea.style.height = `${textArea.scrollHeight}px`
+  }, [autoSize])
 
   useEffect(() => {
     const textArea = textAreaRef.current
@@ -59,25 +77,37 @@ function CanvasTextEditor({
     textArea.focus()
     const textLength = textArea.value.length
     textArea.setSelectionRange(textLength, textLength)
-  }, [node.id])
+    resizeTextArea()
+  }, [node.id, resizeTextArea])
+
+  useEffect(() => {
+    resizeTextArea()
+  }, [resizeTextArea, node.text, node.fontSize, node.fontWeight, node.width])
 
   return (
     <textarea
       ref={textAreaRef}
-      className="dom-text-editor"
+      className={className}
       value={node.text || ''}
       style={{
         fontSize: node.fontSize || defaultTextFontSize,
         color: node.textColor || defaultTextColor,
         fontWeight: node.fontWeight || defaultTextWeight,
         textAlign: node.textAlign || defaultTextAlign,
+        ...style,
       }}
-      onChange={(event) => onUpdateText(node.id, event.currentTarget.value)}
+      onChange={(event) => {
+        if (autoSize) {
+          event.currentTarget.style.height = '0px'
+          event.currentTarget.style.height = `${event.currentTarget.scrollHeight}px`
+        }
+        onUpdateText(node.id, event.currentTarget.value)
+      }}
       onBlur={() => onFinishTextEdit(node.id)}
       onPointerDown={(event) => event.stopPropagation()}
       onDoubleClick={(event) => event.stopPropagation()}
       onKeyDown={(event) => {
-        if (event.key === 'Escape') {
+        if (event.key === 'Escape' || (event.key === 'Enter' && (event.metaKey || event.ctrlKey))) {
           event.preventDefault()
           event.stopPropagation()
           event.currentTarget.blur()
@@ -87,11 +117,317 @@ function CanvasTextEditor({
   )
 }
 
+const defaultMarkupPointsFor = (node: MivoCanvasNode) => {
+  if (node.markupKind === 'arrow' || node.markupKind === 'line') {
+    return [
+      { x: Math.max(2, node.markupStrokeWidth || 3), y: Math.max(2, node.height - (node.markupStrokeWidth || 3)) },
+      { x: Math.max(2, node.width - (node.markupStrokeWidth || 3)), y: Math.max(2, node.markupStrokeWidth || 3) },
+    ]
+  }
+
+  if (node.markupKind === 'brush') {
+    return [
+      { x: 8, y: node.height * 0.6 },
+      { x: node.width * 0.32, y: node.height * 0.25 },
+      { x: node.width * 0.56, y: node.height * 0.68 },
+      { x: node.width - 8, y: node.height * 0.3 },
+    ]
+  }
+
+  return []
+}
+
+const isLineMarkup = (node: MivoCanvasNode) => node.markupKind === 'arrow' || node.markupKind === 'line'
+
+const markupTextAlignFor = (node: MivoCanvasNode) =>
+  node.textAlign || (node.markupKind === 'note' ? defaultTextAlign : 'center')
+
+const lineLabelPositionFor = (node: MivoCanvasNode, points: Array<{ x: number; y: number }>) => {
+  const start = points[0] || { x: 0, y: node.height }
+  const end = points[1] || { x: node.width, y: 0 }
+
+  return {
+    x: (start.x + end.x) / 2,
+    y: (start.y + end.y) / 2,
+  }
+}
+
+const estimatedMarkupLabelWidth = (text: string, fontSize: number) => {
+  const chars = Array.from(text || ' ')
+  const rawWidth = chars.reduce((width, char) => {
+    if (/[\u2e80-\u9fff\uf900-\ufaff]/.test(char)) return width + fontSize
+    if (char === ' ') return width + fontSize * 0.35
+    if (/[A-Z0-9]/.test(char)) return width + fontSize * 0.68
+    return width + fontSize * 0.56
+  }, 0)
+
+  return Math.max(54, Math.min(360, rawWidth + 18))
+}
+
+const lineSegmentsWithLabelGap = (
+  node: MivoCanvasNode,
+  points: Array<{ x: number; y: number }>,
+  labelActive: boolean,
+) => {
+  const start = points[0] || { x: 0, y: node.height }
+  const end = points[1] || { x: node.width, y: 0 }
+
+  if (!labelActive) return [{ start, end, markerEnd: true }]
+
+  const dx = end.x - start.x
+  const dy = end.y - start.y
+  const length = Math.hypot(dx, dy)
+  if (length < 1) return [{ start, end, markerEnd: true }]
+
+  const labelWidth = estimatedMarkupLabelWidth(node.text || 'Label', node.fontSize || defaultTextFontSize)
+  const gap = Math.min(length * 0.42, labelWidth / 2 + 10)
+  const gapRatio = gap / length
+  const beforeEnd = {
+    x: start.x + dx * Math.max(0, 0.5 - gapRatio),
+    y: start.y + dy * Math.max(0, 0.5 - gapRatio),
+  }
+  const afterStart = {
+    x: start.x + dx * Math.min(1, 0.5 + gapRatio),
+    y: start.y + dy * Math.min(1, 0.5 + gapRatio),
+  }
+
+  return [
+    { start, end: beforeEnd, markerEnd: false },
+    { start: afterStart, end, markerEnd: true },
+  ]
+}
+
+function MarkupTextLayer({
+  node,
+  points,
+  editing,
+  onUpdateText,
+  onFinishTextEdit,
+}: {
+  node: MivoCanvasNode
+  points: Array<{ x: number; y: number }>
+  editing: boolean
+  onUpdateText: (nodeId: string, text: string) => void
+  onFinishTextEdit: (nodeId: string) => void
+}) {
+  const hasText = Boolean(node.text?.trim())
+  if (!hasText && !editing) return null
+
+  const commonTextStyle: CSSProperties = {
+    color: node.textColor || defaultTextColor,
+    fontSize: node.fontSize || defaultTextFontSize,
+    fontWeight: node.fontWeight || defaultTextWeight,
+    textAlign: markupTextAlignFor(node),
+  }
+
+  if (isLineMarkup(node)) {
+    const position = lineLabelPositionFor(node, points)
+
+    return (
+      <div
+        className={`dom-markup-label line-label ${editing ? 'editing' : ''}`}
+        style={{
+          left: position.x,
+          top: position.y,
+          maxWidth: Math.max(120, Math.min(320, node.width + 96)),
+          ...commonTextStyle,
+        }}
+      >
+        {editing ? (
+          <CanvasTextEditor
+            node={node}
+            onUpdateText={onUpdateText}
+            onFinishTextEdit={onFinishTextEdit}
+            className="dom-markup-text-editor line-label-editor"
+            style={commonTextStyle}
+            autoSize
+          />
+        ) : (
+          node.text
+        )}
+      </div>
+    )
+  }
+
+  return (
+    <div
+      className={`dom-markup-label shape-label kind-${node.markupKind || 'rect'} ${editing ? 'editing' : ''}`}
+      style={commonTextStyle}
+    >
+      {editing ? (
+        <CanvasTextEditor
+          node={node}
+          onUpdateText={onUpdateText}
+          onFinishTextEdit={onFinishTextEdit}
+          className="dom-markup-text-editor shape-label-editor"
+          style={commonTextStyle}
+          autoSize
+        />
+      ) : (
+        node.text
+      )}
+    </div>
+  )
+}
+
+function MarkupNodeView({
+  node,
+  editing,
+  onUpdateText,
+  onFinishTextEdit,
+}: {
+  node: MivoCanvasNode
+  editing: boolean
+  onUpdateText: (nodeId: string, text: string) => void
+  onFinishTextEdit: (nodeId: string) => void
+}) {
+  const kind = node.markupKind || 'rect'
+  const strokeWidth = node.markupStrokeWidth || 3
+  const stroke = node.markupStrokeColor || '#6957e8'
+  const fill = node.markupFillColor || 'rgba(105, 87, 232, 0.08)'
+  const strokeDasharray = node.markupStrokeStyle === 'dashed' ? `${strokeWidth * 2.2} ${strokeWidth * 1.6}` : undefined
+  const points = node.markupPoints?.length ? node.markupPoints : defaultMarkupPointsFor(node)
+  const markerId = `markup-arrow-${node.id}`
+  const lineLabelActive = isLineMarkup(node) && (editing || Boolean(node.text?.trim()))
+  const lineSegments = lineSegmentsWithLabelGap(node, points, lineLabelActive)
+  const showStartArrow = Boolean(node.markupStartArrow)
+  const showEndArrow = node.markupEndArrow ?? kind === 'arrow'
+
+  if (kind === 'note') {
+    return (
+      <>
+        <div
+          className="dom-markup-note"
+          style={{
+            background: fill === 'transparent' ? '#fff1a8' : fill,
+            borderColor: stroke,
+          }}
+        />
+        <MarkupTextLayer
+          node={node}
+          points={points}
+          editing={editing}
+          onUpdateText={onUpdateText}
+          onFinishTextEdit={onFinishTextEdit}
+        />
+      </>
+    )
+  }
+
+  return (
+    <>
+      <svg
+        className="dom-markup-node"
+        viewBox={`0 0 ${Math.max(1, node.width)} ${Math.max(1, node.height)}`}
+        preserveAspectRatio="none"
+        aria-hidden="true"
+      >
+        <defs>
+          <marker
+            id={markerId}
+            markerWidth="18"
+            markerHeight="18"
+            refX="15"
+            refY="9"
+            orient="auto-start-reverse"
+            markerUnits="userSpaceOnUse"
+          >
+            <path
+              d="M 5 3 L 15 9 L 5 15"
+              fill="none"
+              stroke={stroke}
+              strokeWidth={Math.max(2.5, Math.min(5.5, strokeWidth))}
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </marker>
+        </defs>
+        {kind === 'rect' ? (
+          <rect
+            x={strokeWidth / 2}
+            y={strokeWidth / 2}
+            width={Math.max(1, node.width - strokeWidth)}
+            height={Math.max(1, node.height - strokeWidth)}
+            rx={node.markupCornerRadius ?? 4}
+            fill={fill}
+            stroke={stroke}
+            strokeWidth={strokeWidth}
+            strokeDasharray={strokeDasharray}
+          />
+        ) : kind === 'ellipse' ? (
+          <ellipse
+            cx={node.width / 2}
+            cy={node.height / 2}
+            rx={Math.max(1, node.width / 2 - strokeWidth / 2)}
+            ry={Math.max(1, node.height / 2 - strokeWidth / 2)}
+            fill={fill}
+            stroke={stroke}
+            strokeWidth={strokeWidth}
+            strokeDasharray={strokeDasharray}
+          />
+        ) : kind === 'brush' ? (
+          <polyline
+            points={points.map((point) => `${point.x},${point.y}`).join(' ')}
+            fill="none"
+            stroke={stroke}
+            strokeWidth={strokeWidth}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            strokeDasharray={strokeDasharray}
+          />
+        ) : (
+          <>
+            <line
+              className="markup-hit-line"
+              x1={points[0]?.x ?? 0}
+              y1={points[0]?.y ?? node.height}
+              x2={points[1]?.x ?? node.width}
+              y2={points[1]?.y ?? 0}
+              stroke="transparent"
+              strokeWidth={Math.max(14, strokeWidth + 10)}
+              strokeLinecap="round"
+            />
+            {lineSegments.map((segment, index) => {
+              const hasStartMarker = index === 0 && showStartArrow
+              const hasEndMarker = segment.markerEnd && showEndArrow
+
+              return (
+                <line
+                  key={index}
+                  className="markup-visible-line"
+                  x1={segment.start.x}
+                  y1={segment.start.y}
+                  x2={segment.end.x}
+                  y2={segment.end.y}
+                  stroke={stroke}
+                  strokeWidth={strokeWidth}
+                  strokeLinecap={hasStartMarker || hasEndMarker ? 'butt' : 'round'}
+                  strokeDasharray={strokeDasharray}
+                  markerStart={hasStartMarker ? `url(#${markerId})` : undefined}
+                  markerEnd={hasEndMarker ? `url(#${markerId})` : undefined}
+                />
+              )
+            })}
+          </>
+      )}
+      </svg>
+      <MarkupTextLayer
+        node={node}
+        points={points}
+        editing={editing}
+        onUpdateText={onUpdateText}
+        onFinishTextEdit={onFinishTextEdit}
+      />
+    </>
+  )
+}
+
 export function CanvasNodeView({
   node,
   selected,
   selectionPreview,
   sectionDropTarget,
+  connectorDropTarget,
   primarySelected,
   editing,
   effectiveLocked,
@@ -101,6 +437,7 @@ export function CanvasNodeView({
   onSelect,
   onPointerDown,
   onResizeHandlePointerDown,
+  onMarkupPointPointerDown,
   onTextResizeHandlePointerDown,
   onOpenDetails,
   onOpenContextMenu,
@@ -108,12 +445,33 @@ export function CanvasNodeView({
   onRenameNode,
   onUpdateText,
   onFinishTextEdit,
+  onResizeNodeToContent,
 }: CanvasNodeViewProps) {
+  const markdownDocumentRef = useRef<HTMLElement | null>(null)
   const resolvedAssetUrl = useResolvedAssetUrl(node.assetUrl)
-  const textNode = isTextNode(node)
-  const frameNode = isFrameNode(node)
-  const aiSlotNode = isAiSlotNode(node)
-  const annotationNode = node.type === 'annotation'
+  const renderKind = renderKindForNode(node)
+  const textNode = renderKind === 'text' || renderKind === 'annotation'
+  const frameNode = renderKind === 'section'
+  const aiSlotNode = renderKind === 'ai-slot'
+  const taskNode = renderKind === 'task'
+  const annotationNode = renderKind === 'annotation'
+  const markupNode = renderKind === 'markup'
+  const markdownNode = renderKind === 'markdown'
+  const markdownDisplayMode = markdownNode ? node.markdownDisplayMode || 'full' : undefined
+  const markdownPreviewMode = markdownDisplayMode === 'preview'
+  const markdownStatsLabel =
+    markdownNode && node.text
+      ? `${node.text.split(/\r?\n/).length} lines · ${node.text.length} chars`
+      : 'Markdown document'
+  const pdfNode = renderKind === 'pdf'
+  const videoNode = renderKind === 'video'
+  const fileNode = markdownNode || pdfNode || videoNode
+  const lineMarkupNode = markupNode && (node.markupKind === 'arrow' || node.markupKind === 'line')
+  const markupPointHandles = lineMarkupNode
+    ? node.markupPoints && node.markupPoints.length >= 2
+      ? node.markupPoints.slice(0, 2)
+      : defaultMarkupPointsFor(node).slice(0, 2)
+    : []
   const emptyText = textNode && !node.text?.trim()
   const imageNode = node.type === 'image'
   const transparentImage = imageNode && Boolean(node.imageHasTransparency)
@@ -140,6 +498,11 @@ export function CanvasNodeView({
     frameNode && 'frame-node',
     aiSlotNode && 'ai-slot-node',
     annotationNode && 'annotation-node',
+    markupNode && 'markup-node',
+    fileNode && 'file-node',
+    markdownNode && 'markdown-node',
+    pdfNode && 'pdf-node',
+    videoNode && 'video-node',
     emptyText && 'empty-text',
     editing && 'editing',
     effectiveLocked && 'locked-node',
@@ -147,18 +510,58 @@ export function CanvasNodeView({
     selected && 'selected',
     selectionPreview && 'selection-preview',
     sectionDropTarget && 'section-drop-target',
+    connectorDropTarget && 'connector-drop-target',
+    markdownPreviewMode && 'markdown-preview-mode',
     node.status,
   ]
     .filter(Boolean)
     .join(' ')
 
+  useEffect(() => {
+    if (!markdownNode || markdownPreviewMode) return undefined
+
+    const element = markdownDocumentRef.current
+    if (!element) return undefined
+
+    let animationFrame = 0
+    const measure = () => {
+      animationFrame = 0
+      const measuredHeight = Math.ceil(element.scrollHeight)
+      if (measuredHeight <= 0 || Math.abs(measuredHeight - node.height) <= 2) return
+
+      onResizeNodeToContent(node.id, node.width, measuredHeight)
+    }
+    const scheduleMeasure = () => {
+      if (animationFrame) return
+      animationFrame = window.requestAnimationFrame(measure)
+    }
+
+    scheduleMeasure()
+    const resizeObserver = new ResizeObserver(scheduleMeasure)
+    resizeObserver.observe(element)
+
+    return () => {
+      if (animationFrame) window.cancelAnimationFrame(animationFrame)
+      resizeObserver.disconnect()
+    }
+  }, [markdownNode, markdownPreviewMode, node.height, node.id, node.text, node.width, onResizeNodeToContent])
+
   return (
     <div
       data-node-id={node.id}
+      data-node-type={node.type}
       data-section-id={node.sectionId}
       data-ai-kind={node.aiWorkflow?.kind}
       data-ai-operation={node.aiWorkflow?.operation}
       data-ai-source-node-ids={node.aiWorkflow?.sourceNodeIds?.join(',')}
+      data-markup-kind={node.markupKind}
+      data-target-node-id={node.targetNodeId}
+      data-connector-start-node-id={node.connectorStart?.nodeId}
+      data-connector-start-anchor={node.connectorStart?.anchor}
+      data-connector-start-offset={node.connectorStart?.offset}
+      data-connector-end-node-id={node.connectorEnd?.nodeId}
+      data-connector-end-anchor={node.connectorEnd?.anchor}
+      data-connector-end-offset={node.connectorEnd?.offset}
       className={nodeClassName}
       style={nodeStyle}
       onPointerDown={(event) => onPointerDown(node.id, event)}
@@ -171,7 +574,7 @@ export function CanvasNodeView({
       onDoubleClick={(event) => {
         event.stopPropagation()
         onSelect(node.id)
-        if (textNode) {
+        if (textNode || markupNode) {
           onEditText(node.id)
         } else if (frameNode) {
           onRenameNode(node.id)
@@ -202,6 +605,13 @@ export function CanvasNodeView({
           </div>
           <em>{node.width} x {node.height}</em>
         </div>
+      ) : markupNode ? (
+        <MarkupNodeView
+          node={node}
+          editing={editing}
+          onUpdateText={onUpdateText}
+          onFinishTextEdit={onFinishTextEdit}
+        />
       ) : textNode ? (
         editing ? (
           <CanvasTextEditor node={node} onUpdateText={onUpdateText} onFinishTextEdit={onFinishTextEdit} />
@@ -218,12 +628,54 @@ export function CanvasNodeView({
             {node.text}
           </div>
         )
+      ) : fileNode ? (
+        <div className={`dom-file-node ${node.type}`}>
+          {markdownNode ? (
+            <article
+              className={markdownPreviewMode ? 'dom-markdown-document preview-mode' : 'dom-markdown-document'}
+              ref={markdownDocumentRef}
+            >
+              <div className="dom-file-node-header">
+                <span>MD</span>
+                <strong>{node.title}</strong>
+                <em>{markdownStatsLabel}</em>
+              </div>
+              <MarkdownPreview text={node.text} />
+              {markdownPreviewMode ? (
+                <div className="dom-markdown-preview-fade">
+                  <span>Open details for full document</span>
+                </div>
+              ) : null}
+            </article>
+          ) : pdfNode ? (
+            <>
+              <div className="dom-file-node-badge">PDF</div>
+              <strong>{node.title}</strong>
+              <span>{node.assetMimeType || 'application/pdf'}</span>
+            </>
+          ) : resolvedAssetUrl ? (
+            <>
+              <video src={resolvedAssetUrl} preload="metadata" muted playsInline />
+              <div className="dom-file-video-play" aria-hidden="true" />
+              <div className="dom-file-video-label">
+                <span>VIDEO</span>
+                <strong>{node.title}</strong>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="dom-file-node-badge">VID</div>
+              <strong>{node.title}</strong>
+              <span>{node.assetMimeType || 'video'}</span>
+            </>
+          )}
+        </div>
       ) : (
         <div
           className={imageCrop ? 'dom-node-media cropped' : 'dom-node-media'}
           style={{ width: node.width, height: node.height }}
         >
-          {isTaskNode(node) ? (
+          {taskNode ? (
           <div className="dom-task-node">
             <strong>{node.status === 'failed' ? 'Task failed' : 'Generating...'}</strong>
             <span>{node.generation?.prompt}</span>
@@ -235,6 +687,8 @@ export function CanvasNodeView({
               className={imageCrop ? 'cropped-image' : undefined}
               src={resolvedAssetUrl}
               alt=""
+              loading="lazy"
+              decoding="async"
               draggable={false}
               style={imageCropStyle}
             />
@@ -257,7 +711,29 @@ export function CanvasNodeView({
           ))}
         </>
       ) : null}
-      {primarySelected && !editing && !textNode && !effectiveLocked ? (
+      {primarySelected && !editing && lineMarkupNode && !effectiveLocked ? (
+        <>
+          {markupPointHandles.map((point, index) => (
+            <button
+              key={index}
+              type="button"
+              className={`markup-point-handle ${
+                (index === 0 ? node.connectorStart : node.connectorEnd) ? 'bound' : ''
+              }`}
+              aria-label={`Edit ${node.markupKind} point ${index + 1}`}
+              style={{
+                left: point.x,
+                top: point.y,
+                width: handleSize,
+                height: handleSize,
+                borderWidth: handleBorderWidth,
+              }}
+              onPointerDown={(event) => onMarkupPointPointerDown(node.id, index, event)}
+            />
+          ))}
+        </>
+      ) : null}
+      {primarySelected && !editing && !textNode && !lineMarkupNode && !effectiveLocked ? (
         <>
           {(['nw', 'ne', 'sw', 'se'] as const).map((corner) => (
             <button

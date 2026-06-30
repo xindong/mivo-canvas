@@ -1,10 +1,17 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type DragEvent as ReactDragEvent,
+  type MouseEvent as ReactMouseEvent,
+} from 'react'
 import { Leafer } from 'leafer-ui'
 import '@leafer-in/view'
 import { LocateFixed, Minus, Plus, RotateCcw } from 'lucide-react'
 import { downloadCanvasNodeOriginal } from '../lib/assetDownload'
-import { saveImportedAsset } from '../lib/assetStorage'
-import { importedImageDisplaySize } from '../lib/imageSizing'
+import { canImportCanvasFile, importFilesToCanvas, importImageUrlToCanvas } from '../lib/canvasAssetImport'
 import { useCanvasStore } from '../store/canvasStore'
 import { CanvasContextMenu } from './CanvasContextMenu'
 import { CanvasNodeView } from './CanvasNodeView'
@@ -52,6 +59,38 @@ const isCanvasChromeTarget = (target: EventTarget | null) =>
     ),
   )
 
+const localAssetDragType = 'application/x-mivo-local-asset'
+
+type LocalAssetDragPayload = {
+  name: string
+  url: string
+}
+
+const canvasRenderOverscanPx = 520
+
+const rectsIntersect = (
+  a: { x: number; y: number; width: number; height: number },
+  b: { x: number; y: number; width: number; height: number },
+) => a.x + a.width >= b.x && b.x + b.width >= a.x && a.y + a.height >= b.y && b.y + b.height >= a.y
+
+const parseLocalAssetDragPayload = (dataTransfer: DataTransfer) => {
+  const rawPayload = dataTransfer.getData(localAssetDragType)
+  if (!rawPayload) return undefined
+
+  try {
+    const payload = JSON.parse(rawPayload) as Partial<LocalAssetDragPayload>
+    if (!payload.name || !payload.url) return undefined
+    return { name: payload.name, url: payload.url }
+  } catch {
+    return undefined
+  }
+}
+
+const canImportDataTransfer = (dataTransfer: DataTransfer) =>
+  Array.from(dataTransfer.files).some(canImportCanvasFile) ||
+  dataTransfer.types.includes('Files') ||
+  dataTransfer.types.includes(localAssetDragType)
+
 const isNodeEffectivelyLocked = (nodeId: string, nodes: Array<{ id: string; type: string; sectionId?: string; locked?: boolean; sectionLockMode?: string }>) => {
   const node = nodes.find((item) => item.id === nodeId)
   if (!node) return false
@@ -66,6 +105,7 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
   const leaferRef = useRef<Leafer | null>(null)
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null)
   const [cropNodeId, setCropNodeId] = useState<string>()
+  const [shellSize, setShellSize] = useState({ width: 0, height: 0 })
   const nodes = useCanvasStore((state) => state.nodes)
   const sceneId = useCanvasStore((state) => state.sceneId)
   const selectedNodeId = useCanvasStore((state) => state.selectedNodeId)
@@ -74,11 +114,14 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
   const addTextNode = useCanvasStore((state) => state.addTextNode)
   const addFrameNode = useCanvasStore((state) => state.addFrameNode)
   const addImportedImage = useCanvasStore((state) => state.addImportedImage)
+  const addImportedFileNode = useCanvasStore((state) => state.addImportedFileNode)
+  const updateNodeMeasuredSize = useCanvasStore((state) => state.updateNodeMeasuredSize)
   const cropImageNode = useCanvasStore((state) => state.cropImageNode)
   const renameNode = useCanvasStore((state) => state.renameNode)
+  const contextMenuNodeId = contextMenu?.nodeId
   const visibleNodes = useMemo(() => nodes.filter((node) => !node.hidden), [nodes])
   const contextMenuNode =
-    contextMenu?.kind === 'node' ? visibleNodes.find((node) => node.id === contextMenu.nodeId) : undefined
+    contextMenu?.kind === 'node' ? visibleNodes.find((node) => node.id === contextMenuNodeId) : undefined
   const cropNode = cropNodeId ? visibleNodes.find((node) => node.id === cropNodeId && node.type === 'image') : undefined
   const closeContextMenu = useCallback(() => setContextMenu(null), [])
   const {
@@ -92,16 +135,20 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
     selectedNodes,
     selectedBounds,
     activeSectionDropTargetId,
+    activeConnectorDropTargetId,
     showGroupSelectionBounds,
     activeSelectionRect,
     activeTextCreationRect,
     activeFrameCreationRect,
+    activeMarkupCreationRect,
+    markupCreationBox,
     selectionPreviewSet,
     beginGroupResize,
     beginNodePointerDown,
     beginNodeResize,
     editTextNode,
     beginTextResize,
+    beginMarkupPointMove,
     updateEditingText,
     finishTextEditing,
     handleCanvasPointerDown,
@@ -131,6 +178,34 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
     },
     [viewport.scale, viewport.x, viewport.y],
   )
+
+  const renderedNodes = useMemo(() => {
+    if (!shellSize.width || !shellSize.height) return visibleNodes
+
+    const viewportRect = {
+      x: (-viewport.x - canvasRenderOverscanPx) / viewport.scale,
+      y: (-viewport.y - canvasRenderOverscanPx) / viewport.scale,
+      width: (shellSize.width + canvasRenderOverscanPx * 2) / viewport.scale,
+      height: (shellSize.height + canvasRenderOverscanPx * 2) / viewport.scale,
+    }
+    const pinnedNodeIds = new Set(selectedNodeIds)
+    if (selectedNodeId) pinnedNodeIds.add(selectedNodeId)
+    if (cropNodeId) pinnedNodeIds.add(cropNodeId)
+    if (contextMenuNodeId) pinnedNodeIds.add(contextMenuNodeId)
+
+    return visibleNodes.filter((node) => pinnedNodeIds.has(node.id) || rectsIntersect(node, viewportRect))
+  }, [
+    contextMenuNodeId,
+    cropNodeId,
+    selectedNodeId,
+    selectedNodeIds,
+    shellSize.height,
+    shellSize.width,
+    viewport.scale,
+    viewport.x,
+    viewport.y,
+    visibleNodes,
+  ])
 
   const openNodeContextMenu = useCallback(
     (nodeId: string, clientX: number, clientY: number) => {
@@ -224,37 +299,52 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
     [renameNode],
   )
 
-  const importImageAt = useCallback(
+  const importAssetAt = useCallback(
     (position: { x: number; y: number }) => {
       const input = document.createElement('input')
       input.type = 'file'
-      input.accept = 'image/*'
+      input.accept = 'image/*,.md,.markdown,application/pdf,video/*'
       input.multiple = true
 
       input.onchange = async () => {
         const files = Array.from(input.files || [])
-
-        for (const [index, file] of files.entries()) {
-          const asset = await saveImportedAsset(file)
-          const displaySize = importedImageDisplaySize(asset.dimensions)
-          const offset = index * 28
-
-          addImportedImage(
-            asset.assetUrl,
-            asset.title,
-            asset.size,
-            {
-              x: position.x - displaySize.width / 2 + offset,
-              y: position.y - displaySize.height / 2 + offset,
-            },
-            asset,
-          )
-        }
+        await importFilesToCanvas(files, position, addImportedFileNode)
       }
 
       input.click()
     },
-    [addImportedImage],
+    [addImportedFileNode],
+  )
+
+  const handleCanvasDragOver = useCallback((event: ReactDragEvent<HTMLElement>) => {
+    if (!canImportDataTransfer(event.dataTransfer)) return
+    if (isCanvasChromeTarget(event.target)) return
+
+    event.preventDefault()
+    event.dataTransfer.dropEffect = 'copy'
+  }, [])
+
+  const handleCanvasDrop = useCallback(
+    (event: ReactDragEvent<HTMLElement>) => {
+      if (!canImportDataTransfer(event.dataTransfer)) return
+      if (isCanvasChromeTarget(event.target)) return
+
+      event.preventDefault()
+      event.stopPropagation()
+
+      const position = screenToCanvasPoint(event.clientX, event.clientY)
+      const files = Array.from(event.dataTransfer.files)
+      if (files.length) {
+        void importFilesToCanvas(files, position, addImportedFileNode)
+        return
+      }
+
+      const payload = parseLocalAssetDragPayload(event.dataTransfer)
+      if (payload) {
+        void importImageUrlToCanvas(payload.url, payload.name, position, addImportedImage)
+      }
+    },
+    [addImportedFileNode, addImportedImage, screenToCanvasPoint],
   )
 
   useEffect(() => {
@@ -294,6 +384,23 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
   }, [])
 
   useEffect(() => {
+    const shell = shellRef.current
+    if (!shell) return undefined
+
+    const updateShellSize = () => {
+      const width = shell.clientWidth
+      const height = shell.clientHeight
+      setShellSize((current) => (current.width === width && current.height === height ? current : { width, height }))
+    }
+    updateShellSize()
+
+    const resizeObserver = new ResizeObserver(updateShellSize)
+    resizeObserver.observe(shell)
+
+    return () => resizeObserver.disconnect()
+  }, [])
+
+  useEffect(() => {
     if (!contextMenu) return
 
     const handleOutsidePointerDown = (event: PointerEvent) => {
@@ -318,12 +425,19 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
         selectionBox ? 'is-selecting' : ''
       } ${selectedNodes.length > 1 ? 'has-multi-selection' : ''}`}
       aria-label="Mivo Canvas"
+      data-viewport-scale={viewport.scale}
+      data-viewport-x={viewport.x}
+      data-viewport-y={viewport.y}
+      data-rendered-node-count={renderedNodes.length}
+      data-total-node-count={visibleNodes.length}
       ref={shellRef}
       onWheel={handleWheel}
       onPointerDown={handleCanvasPointerDown}
       onPointerMove={handleCanvasPointerMove}
       onPointerUp={handleCanvasPointerEnd}
       onPointerCancel={handleCanvasPointerEnd}
+      onDragOver={handleCanvasDragOver}
+      onDrop={handleCanvasDrop}
       onContextMenu={openBlankContextMenu}
       style={{
         backgroundPosition: `${viewport.x}px ${viewport.y}px`,
@@ -331,7 +445,7 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
       }}
     >
       <div className="canvas-host" ref={hostRef} />
-      <CanvasToolDock previewTool={temporaryTool} />
+      <CanvasToolDock previewTool={temporaryTool === 'hand' ? 'hand' : undefined} />
       <div
         className="dom-canvas-layer"
         style={{ transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})` }}
@@ -391,6 +505,64 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
             }}
           />
         ) : null}
+        {activeMarkupCreationRect && markupCreationBox ? (
+          <div
+            className={`markup-creation-box kind-${markupCreationBox.kind}`}
+            style={{
+              left: activeMarkupCreationRect.x,
+              top: activeMarkupCreationRect.y,
+              width: Math.max(1, activeMarkupCreationRect.width),
+              height: Math.max(1, activeMarkupCreationRect.height),
+              borderWidth: selectionStrokeWidth,
+            }}
+          >
+            {markupCreationBox.kind === 'arrow' ||
+            markupCreationBox.kind === 'line' ||
+            markupCreationBox.kind === 'brush' ? (
+              <svg
+                viewBox={`0 0 ${Math.max(1, activeMarkupCreationRect.width)} ${Math.max(1, activeMarkupCreationRect.height)}`}
+                preserveAspectRatio="none"
+              >
+                <defs>
+                  <marker
+                    id="markup-preview-arrow"
+                    markerWidth="18"
+                    markerHeight="18"
+                    refX="15"
+                    refY="9"
+                    orient="auto"
+                    markerUnits="userSpaceOnUse"
+                  >
+                    <path
+                      d="M 5 3 L 15 9 L 5 15"
+                      fill="none"
+                      stroke="var(--violet)"
+                      strokeWidth="3"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </marker>
+                </defs>
+                {markupCreationBox.kind === 'brush' ? (
+                  <polyline
+                    points={markupCreationBox.points
+                      .map((point) => `${point.x - activeMarkupCreationRect.x},${point.y - activeMarkupCreationRect.y}`)
+                      .join(' ')}
+                  />
+                ) : (
+                  <line
+                    className={markupCreationBox.kind === 'arrow' ? 'markup-preview-arrow-line' : undefined}
+                    x1={markupCreationBox.startX - activeMarkupCreationRect.x}
+                    y1={markupCreationBox.startY - activeMarkupCreationRect.y}
+                    x2={markupCreationBox.currentX - activeMarkupCreationRect.x}
+                    y2={markupCreationBox.currentY - activeMarkupCreationRect.y}
+                    markerEnd={markupCreationBox.kind === 'arrow' ? 'url(#markup-preview-arrow)' : undefined}
+                  />
+                )}
+              </svg>
+            ) : null}
+          </div>
+        ) : null}
         {showGroupSelectionBounds && selectedBounds ? (
           <>
             <div
@@ -425,7 +597,7 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
             ))}
           </>
         ) : null}
-        {visibleNodes.map((node) => {
+        {renderedNodes.map((node) => {
           const selected = selectedNodeIds.includes(node.id)
 
           return (
@@ -435,6 +607,7 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
               selected={selected}
               selectionPreview={selectionPreviewSet.has(node.id)}
               sectionDropTarget={node.id === activeSectionDropTargetId}
+              connectorDropTarget={node.id === activeConnectorDropTargetId}
               editing={editingTextNodeId === node.id}
               primarySelected={
                 interactionMode === 'select' &&
@@ -449,11 +622,13 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
               onSelect={selectNode}
               onPointerDown={beginNodePointerDown}
               onResizeHandlePointerDown={beginNodeResize}
+              onMarkupPointPointerDown={beginMarkupPointMove}
               onTextResizeHandlePointerDown={beginTextResize}
               onEditText={editTextNode}
               onRenameNode={promptRenameNode}
               onUpdateText={updateEditingText}
               onFinishTextEdit={finishTextEditing}
+              onResizeNodeToContent={updateNodeMeasuredSize}
               onOpenDetails={(nodeId) => {
                 setContextMenu(null)
                 selectNode(nodeId)
@@ -514,7 +689,7 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
             onFitAll={fitAll}
             onCreateTextAt={createTextAt}
             onCreateFrameAt={createFrameAt}
-            onImportImageAt={importImageAt}
+            onImportAssetAt={importAssetAt}
           />
         </CanvasContextMenu>
       ) : null}
@@ -524,21 +699,21 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
         </div>
       ) : null}
       <div className="canvas-controls" aria-label="Canvas zoom controls">
-        <button type="button" onClick={() => zoomBy(1 / 1.12)} aria-label="Zoom out" title="Zoom out">
+        <button type="button" onClick={() => zoomBy(1 / 1.12)} aria-label="Zoom out" title="Zoom out (⌘-)">
           <Minus size={16} />
         </button>
         <button
           type="button"
           onClick={selectedNodes.length ? fitSelection : fitAll}
           aria-label={selectedNodes.length ? 'Fit selection' : 'Fit all'}
-          title={selectedNodes.length ? 'Fit selection' : 'Fit all'}
+          title={selectedNodes.length ? 'Fit selection (Shift+2)' : 'Fit all (Shift+1)'}
         >
           <LocateFixed size={16} />
         </button>
-        <button type="button" onClick={resetView} aria-label="Reset view" title="Reset view">
+        <button type="button" onClick={resetView} aria-label="Reset view" title="Reset view (⌘0)">
           <RotateCcw size={15} />
         </button>
-        <button type="button" onClick={() => zoomBy(1.12)} aria-label="Zoom in" title="Zoom in">
+        <button type="button" onClick={() => zoomBy(1.12)} aria-label="Zoom in" title="Zoom in (⌘+)">
           <Plus size={16} />
         </button>
         <span className="zoom-readout">{Math.round(viewport.scale * 100)}%</span>

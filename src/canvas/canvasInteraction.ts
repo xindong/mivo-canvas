@@ -7,7 +7,7 @@ import {
   type SnapGuide,
 } from './canvasGeometry'
 
-export type RuntimeCanvasTool = 'select' | 'hand' | 'text' | 'frame'
+export type RuntimeCanvasTool = 'select' | 'hand' | 'text' | 'frame' | 'markup'
 
 export type Viewport = {
   x: number
@@ -26,6 +26,8 @@ export type CanvasPoint = {
   x: number
   y: number
 }
+
+export type ViewportFitRect = Pick<ClientRectLike, 'left' | 'top' | 'width' | 'height'>
 
 export type PanState = {
   pointerId: number
@@ -89,17 +91,22 @@ export type NodeTransformState = NodeMoveState | NodeResizeState
 
 type ClientRectLike = Pick<DOMRect, 'left' | 'top' | 'width' | 'height'>
 
+const minViewportScale = 0.08
+const maxViewportScale = 4
 const minSelectionDrag = 4
 const minNodeTransformDrag = 4
 const minNodeWidth = 96
 const maxNodeWidth = 6000
 const minSectionWidth = 160
 const minSectionHeight = 120
+const minMarkupWidth = 18
+const minMarkupHeight = 18
 
 export const runtimeToolFor = (activeTool: ToolId, temporaryTool?: RuntimeCanvasTool): RuntimeCanvasTool => {
   if (temporaryTool) return temporaryTool
   if (activeTool === 'text') return 'text'
   if (activeTool === 'frame') return 'frame'
+  if (activeTool.startsWith('markup-')) return 'markup'
   return activeTool === 'hand' ? 'hand' : 'select'
 }
 
@@ -146,6 +153,61 @@ export const clientPointToCanvas = (
 export const viewportCenterPoint = (rect: ClientRectLike | undefined, viewport: Viewport) => {
   if (!rect) return { x: 0, y: 0 }
   return clientPointToCanvas(rect, viewport, rect.left + rect.width / 2, rect.top + rect.height / 2)
+}
+
+export const clampViewportScale = (scale: number) =>
+  Math.min(maxViewportScale, Math.max(minViewportScale, Number(scale.toFixed(3))))
+
+export const viewportFromZoom = (
+  viewport: Viewport,
+  rect: ViewportFitRect | undefined,
+  nextScale: number,
+  center?: { clientX: number; clientY: number },
+): Viewport => {
+  if (!rect) return viewport
+
+  const scale = clampViewportScale(nextScale)
+  const clientX = center?.clientX ?? rect.left + rect.width / 2
+  const clientY = center?.clientY ?? rect.top + rect.height / 2
+  const canvasX = (clientX - rect.left - viewport.x) / viewport.scale
+  const canvasY = (clientY - rect.top - viewport.y) / viewport.scale
+
+  return {
+    x: clientX - rect.left - canvasX * scale,
+    y: clientY - rect.top - canvasY * scale,
+    scale,
+  }
+}
+
+export const viewportForBounds = (
+  bounds: CanvasBounds,
+  rect: ViewportFitRect | undefined,
+  options?: { padding?: number; minPadding?: number },
+): Viewport | undefined => {
+  if (!rect) return undefined
+
+  const minViewportSide = Math.max(1, Math.min(rect.width, rect.height))
+  const padding = Math.min(options?.padding ?? 180, Math.max(options?.minPadding ?? 80, minViewportSide * 0.2))
+  const availableWidth = Math.max(120, rect.width - padding)
+  const availableHeight = Math.max(120, rect.height - padding)
+  const scale = clampViewportScale(
+    Math.min(availableWidth / Math.max(bounds.width, 1), availableHeight / Math.max(bounds.height, 1)),
+  )
+
+  return {
+    scale,
+    x: rect.width / 2 - (bounds.x + bounds.width / 2) * scale,
+    y: rect.height / 2 - (bounds.y + bounds.height / 2) * scale,
+  }
+}
+
+export const normalizedWheelDelta = (event: Pick<WheelEvent, 'deltaX' | 'deltaY' | 'deltaMode'>) => {
+  const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 800 : 1
+
+  return {
+    x: event.deltaX * unit,
+    y: event.deltaY * unit,
+  }
 }
 
 export const boundsForNodes = (nodes: MivoCanvasNode[]): CanvasBounds | undefined => {
@@ -344,11 +406,13 @@ export const resizeNodeTransform = (
   const east = state.corner.endsWith('e')
   const south = state.corner.startsWith('s')
 
-  if (node.type === 'frame') {
+  if (node.type === 'frame' || node.type === 'markup') {
     const nextWidthRaw = state.startWidth + (east ? dx : -dx)
     const nextHeightRaw = state.startHeight + (south ? dy : -dy)
-    const nextWidth = Math.max(minSectionWidth, nextWidthRaw)
-    const nextHeight = Math.max(minSectionHeight, nextHeightRaw)
+    const minWidth = node.type === 'markup' ? minMarkupWidth : minSectionWidth
+    const minHeight = node.type === 'markup' ? minMarkupHeight : minSectionHeight
+    const nextWidth = Math.max(minWidth, nextWidthRaw)
+    const nextHeight = Math.max(minHeight, nextHeightRaw)
     const nextX = east ? state.startX : state.startX + state.startWidth - nextWidth
     const nextY = south ? state.startY : state.startY + state.startHeight - nextHeight
 
@@ -360,8 +424,8 @@ export const resizeNodeTransform = (
       east ? state.startX : state.startX + state.startWidth,
       south ? state.startY : state.startY + state.startHeight,
       {
-        minWidth: minSectionWidth,
-        minHeight: minSectionHeight,
+        minWidth,
+        minHeight,
         maxWidth: Number.POSITIVE_INFINITY,
         maxHeight: Number.POSITIVE_INFINITY,
       },

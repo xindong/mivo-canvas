@@ -8,14 +8,15 @@ import {
   type RefObject,
   type WheelEvent as ReactWheelEvent,
 } from 'react'
-import { saveImportedAsset } from '../lib/assetStorage'
-import { importedImageDisplaySize } from '../lib/imageSizing'
+import { importImageFileToCanvas } from '../lib/canvasAssetImport'
 import { useCanvasStore } from '../store/canvasStore'
-import type { CanvasId, MivoCanvasNode } from '../types/mivoCanvas'
+import type { CanvasId, MarkupKind, MarkupPoint, MivoCanvasNode } from '../types/mivoCanvas'
 import type { ResizeCorner, SnapGuide } from './canvasGeometry'
+import { nearestConnectorBindingForPoint } from './connectorGeometry'
 import {
   boundsForNodes,
   clientPointToCanvas,
+  clampViewportScale,
   createGroupResizeState,
   createNodeMoveState,
   createNodeResizeState,
@@ -24,6 +25,7 @@ import {
   isActiveSelectionRect,
   isEditingTarget,
   moveNodeTransform,
+  normalizedWheelDelta,
   previewIdsFromSelectionBox,
   resizeGroupSelection,
   resizeNodeTransform,
@@ -33,7 +35,9 @@ import {
   shouldCommitNodeTransform,
   shouldStartCanvasSurfaceInteraction,
   viewportCenterPoint,
+  viewportForBounds,
   viewportFromPan,
+  viewportFromZoom,
   type GroupResizeState,
   type CanvasBounds,
   type NodeTransformState,
@@ -43,7 +47,7 @@ import {
   type Viewport,
 } from './canvasInteraction'
 import { canvasToolHandlers, type CanvasToolHandlerContext } from './canvasToolHandlers'
-import { isCanvasToolEnabled, toolForKeyboardShortcut } from './canvasToolRegistry'
+import { isCanvasToolEnabled, markupKindForTool, toolForKeyboardShortcut } from './canvasToolRegistry'
 import { defaultTextFontSize, defaultTextWeight, textGeometryFor } from './textGeometry'
 
 type UseCanvasInteractionControllerOptions = {
@@ -76,16 +80,27 @@ type TextCreationState = {
 
 type FrameCreationState = TextCreationState
 
-const minScale = 0.18
-const maxScale = 2.4
+type MarkupCreationState = TextCreationState & {
+  kind: MarkupKind
+  points: MarkupPoint[]
+}
+
+type MarkupPointTransformState = {
+  pointerId: number
+  nodeId: string
+  pointIndex: number
+  startClientX: number
+  startClientY: number
+  startNode: MivoCanvasNode
+  startPoints: MarkupPoint[]
+  historyCaptured: boolean
+}
 
 export const defaultViewportFor = (sceneId: string): Viewport => ({
   x: 420,
   y: 240,
   scale: sceneId === 'stress-test' ? 0.62 : 1,
 })
-
-const clampScale = (scale: number) => Math.min(maxScale, Math.max(minScale, Number(scale.toFixed(3))))
 
 const viewportStorageKey = (sceneId: CanvasId) => `mivo-canvas-viewport:${sceneId}`
 
@@ -106,7 +121,7 @@ const persistedViewportFor = (sceneId: CanvasId): Viewport | undefined => {
     return {
       x: viewport.x,
       y: viewport.y,
-      scale: clampScale(viewport.scale),
+      scale: clampViewportScale(viewport.scale),
     }
   } catch {
     return undefined
@@ -129,12 +144,110 @@ const rectFromFrameCreation = (box: FrameCreationState): CanvasBounds => ({
   height: Math.abs(box.currentY - box.startY),
 })
 
+const rectFromMarkupCreation = (box: MarkupCreationState): CanvasBounds => ({
+  x: Math.min(box.startX, box.currentX),
+  y: Math.min(box.startY, box.currentY),
+  width: Math.abs(box.currentX - box.startX),
+  height: Math.abs(box.currentY - box.startY),
+})
+
+const constrainBoxPoint = (start: MarkupPoint, current: MarkupPoint): MarkupPoint => {
+  const dx = current.x - start.x
+  const dy = current.y - start.y
+  const side = Math.max(Math.abs(dx), Math.abs(dy))
+  if (side <= 0) return current
+
+  return {
+    x: start.x + (dx < 0 ? -side : side),
+    y: start.y + (dy < 0 ? -side : side),
+  }
+}
+
+const constrainAnglePoint = (start: MarkupPoint, current: MarkupPoint): MarkupPoint => {
+  const dx = current.x - start.x
+  const dy = current.y - start.y
+  const length = Math.hypot(dx, dy)
+  if (length <= 0) return current
+
+  const snappedAngle = Math.round(Math.atan2(dy, dx) / (Math.PI / 4)) * (Math.PI / 4)
+  return {
+    x: start.x + Math.cos(snappedAngle) * length,
+    y: start.y + Math.sin(snappedAngle) * length,
+  }
+}
+
+const constrainedMarkupPoint = (
+  kind: MarkupKind,
+  start: MarkupPoint,
+  current: MarkupPoint,
+  constrain: boolean,
+): MarkupPoint => {
+  if (!constrain) return current
+  if (kind === 'rect' || kind === 'ellipse') return constrainBoxPoint(start, current)
+  if (kind === 'arrow' || kind === 'line' || kind === 'brush') return constrainAnglePoint(start, current)
+  return current
+}
+
+const normalizeMarkupPoints = (box: MarkupCreationState, bounds: CanvasBounds): MarkupPoint[] | undefined => {
+  if (box.kind !== 'arrow' && box.kind !== 'line' && box.kind !== 'brush') return undefined
+
+  const sourcePoints =
+    box.kind === 'brush' && box.points.length > 1
+      ? box.points
+      : [
+          { x: box.startX, y: box.startY },
+          { x: box.currentX, y: box.currentY },
+        ]
+
+  return sourcePoints.map((point) => ({
+    x: point.x - bounds.x,
+    y: point.y - bounds.y,
+  }))
+}
+
+const defaultLineMarkupPointsFor = (node: MivoCanvasNode): MarkupPoint[] => [
+  { x: Math.max(2, node.markupStrokeWidth || 3), y: Math.max(2, node.height - (node.markupStrokeWidth || 3)) },
+  { x: Math.max(2, node.width - (node.markupStrokeWidth || 3)), y: Math.max(2, node.markupStrokeWidth || 3) },
+]
+
+const lineMarkupPointsFor = (node: MivoCanvasNode): MarkupPoint[] =>
+  node.markupPoints && node.markupPoints.length >= 2
+    ? node.markupPoints.slice(0, 2).map((point) => ({ ...point }))
+    : defaultLineMarkupPointsFor(node)
+
+const markupGeometryFromAbsolutePoints = (points: MarkupPoint[]) => {
+  const minWidth = 18
+  const minHeight = 18
+  const minX = Math.min(...points.map((point) => point.x))
+  const maxX = Math.max(...points.map((point) => point.x))
+  const minY = Math.min(...points.map((point) => point.y))
+  const maxY = Math.max(...points.map((point) => point.y))
+  const rawWidth = maxX - minX
+  const rawHeight = maxY - minY
+  const width = Math.max(minWidth, rawWidth)
+  const height = Math.max(minHeight, rawHeight)
+  const x = rawWidth < minWidth ? minX - (minWidth - rawWidth) / 2 : minX
+  const y = rawHeight < minHeight ? minY - (minHeight - rawHeight) / 2 : minY
+
+  return {
+    geometry: { x, y, width, height },
+    points: points.map((point) => ({ x: point.x - x, y: point.y - y })),
+  }
+}
+
 const isNodeEffectivelyLocked = (node: MivoCanvasNode, nodes: MivoCanvasNode[]) => {
   const section = node.sectionId ? nodes.find((item) => item.id === node.sectionId && item.type === 'frame') : undefined
   return Boolean(node.locked || section?.sectionLockMode === 'all')
 }
 
-const isEditableTextNode = (node: MivoCanvasNode | undefined): node is MivoCanvasNode & { type: 'text' | 'annotation' } =>
+const isEditableTextNode = (
+  node: MivoCanvasNode | undefined,
+): node is MivoCanvasNode & { type: 'text' | 'annotation' | 'markup' } =>
+  node?.type === 'text' || node?.type === 'annotation' || node?.type === 'markup'
+
+const isAutoDeletedEmptyTextNode = (
+  node: MivoCanvasNode | undefined,
+): node is MivoCanvasNode & { type: 'text' | 'annotation' } =>
   node?.type === 'text' || node?.type === 'annotation'
 
 export function useCanvasInteractionController({
@@ -149,16 +262,20 @@ export function useCanvasInteractionController({
   const selectionRef = useRef<SelectionBox | null>(null)
   const textCreationRef = useRef<TextCreationState | null>(null)
   const frameCreationRef = useRef<FrameCreationState | null>(null)
+  const markupCreationRef = useRef<MarkupCreationState | null>(null)
   const nodeTransformRef = useRef<NodeTransformState | null>(null)
+  const markupPointTransformRef = useRef<MarkupPointTransformState | null>(null)
   const textResizeRef = useRef<TextResizeState | null>(null)
   const groupResizeRef = useRef<GroupResizeState | null>(null)
   const persistedSceneRef = useRef(sceneId)
   const [viewport, setViewport] = useState(() => initialViewportFor(sceneId))
   const [snapGuides, setSnapGuides] = useState<SnapGuide[]>([])
   const [activeSectionDropTargetId, setActiveSectionDropTargetId] = useState<string | undefined>()
+  const [activeConnectorDropTargetId, setActiveConnectorDropTargetId] = useState<string | undefined>()
   const [selectionBox, setSelectionBox] = useState<SelectionBox | null>(null)
   const [textCreationBox, setTextCreationBox] = useState<TextCreationState | null>(null)
   const [frameCreationBox, setFrameCreationBox] = useState<FrameCreationState | null>(null)
+  const [markupCreationBox, setMarkupCreationBox] = useState<MarkupCreationState | null>(null)
   const [isPanning, setIsPanning] = useState(false)
   const [temporaryTool, setTemporaryTool] = useState<RuntimeCanvasTool | undefined>()
   const storedActiveTool = useCanvasStore((state) => state.activeTool)
@@ -170,6 +287,7 @@ export function useCanvasInteractionController({
   const redo = useCanvasStore((state) => state.redo)
   const updateSelectedNodesPosition = useCanvasStore((state) => state.updateSelectedNodesPosition)
   const updateNodeGeometry = useCanvasStore((state) => state.updateNodeGeometry)
+  const updateMarkupGeometry = useCanvasStore((state) => state.updateMarkupGeometry)
   const updateNodesGeometry = useCanvasStore((state) => state.updateNodesGeometry)
   const moveSelectedNodesBy = useCanvasStore((state) => state.moveSelectedNodesBy)
   const moveSelectedLayer = useCanvasStore((state) => state.moveSelectedLayer)
@@ -180,6 +298,7 @@ export function useCanvasInteractionController({
   const addImportedImage = useCanvasStore((state) => state.addImportedImage)
   const addTextNode = useCanvasStore((state) => state.addTextNode)
   const addFrameNode = useCanvasStore((state) => state.addFrameNode)
+  const addMarkupNode = useCanvasStore((state) => state.addMarkupNode)
   const updateTextNode = useCanvasStore((state) => state.updateTextNode)
   const resizeTextNode = useCanvasStore((state) => state.resizeTextNode)
   const deleteNode = useCanvasStore((state) => state.deleteNode)
@@ -200,7 +319,12 @@ export function useCanvasInteractionController({
 
   useEffect(() => {
     viewportRef.current = viewport
-  }, [viewport])
+    const shell = shellRef.current
+    if (shell && (shell.scrollLeft !== 0 || shell.scrollTop !== 0)) {
+      shell.scrollLeft = 0
+      shell.scrollTop = 0
+    }
+  }, [shellRef, viewport])
 
   useEffect(() => {
     if (persistedSceneRef.current !== sceneId) return
@@ -208,14 +332,31 @@ export function useCanvasInteractionController({
   }, [sceneId, viewport])
 
   useEffect(() => {
+    const shell = shellRef.current
+    if (!shell) return undefined
+
+    const preventNativeWheelDefault = (event: WheelEvent) => {
+      event.preventDefault()
+    }
+
+    shell.addEventListener('wheel', preventNativeWheelDefault, { passive: false })
+
+    return () => {
+      shell.removeEventListener('wheel', preventNativeWheelDefault)
+    }
+  }, [shellRef])
+
+  useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
       persistedSceneRef.current = sceneId
       setViewport(initialViewportFor(sceneId))
       setSnapGuides([])
       setActiveSectionDropTargetId(undefined)
+      setActiveConnectorDropTargetId(undefined)
       setSelectionBox(null)
       setTextCreationBox(null)
       setFrameCreationBox(null)
+      setMarkupCreationBox(null)
       setIsPanning(false)
       setTemporaryTool(undefined)
       setEditingTextNodeId(undefined)
@@ -223,6 +364,8 @@ export function useCanvasInteractionController({
       selectionRef.current = null
       textCreationRef.current = null
       frameCreationRef.current = null
+      markupCreationRef.current = null
+      markupPointTransformRef.current = null
       nodeTransformRef.current = null
       textResizeRef.current = null
       groupResizeRef.current = null
@@ -248,19 +391,7 @@ export function useCanvasInteractionController({
     (nextScale: number, center?: { clientX: number; clientY: number }) => {
       setViewport((current) => {
         const rect = shellRef.current?.getBoundingClientRect()
-        if (!rect) return current
-
-        const scale = clampScale(nextScale)
-        const clientX = center?.clientX ?? rect.left + rect.width / 2
-        const clientY = center?.clientY ?? rect.top + rect.height / 2
-        const canvasX = (clientX - rect.left - current.x) / current.scale
-        const canvasY = (clientY - rect.top - current.y) / current.scale
-
-        return {
-          x: clientX - rect.left - canvasX * scale,
-          y: clientY - rect.top - canvasY * scale,
-          scale,
-        }
+        return viewportFromZoom(current, rect, nextScale, center)
       })
     },
     [shellRef],
@@ -273,24 +404,15 @@ export function useCanvasInteractionController({
     [zoomTo],
   )
 
-  const fitToBounds = useCallback((bounds: CanvasBounds | undefined) => {
-    const rect = shellRef.current?.getBoundingClientRect()
-    if (!rect || !bounds) {
-      setViewport(defaultViewportFor(sceneId))
-      return
-    }
+  const fitToBounds = useCallback(
+    (bounds: CanvasBounds | undefined) => {
+      const rect = shellRef.current?.getBoundingClientRect()
+      const nextViewport = bounds ? viewportForBounds(bounds, rect) : undefined
 
-    const padding = 180
-    const scale = clampScale(
-      Math.min((rect.width - padding) / Math.max(bounds.width, 1), (rect.height - padding) / Math.max(bounds.height, 1)),
-    )
-
-    setViewport({
-      scale,
-      x: rect.width / 2 - (bounds.x + bounds.width / 2) * scale,
-      y: rect.height / 2 - (bounds.y + bounds.height / 2) * scale,
-    })
-  }, [sceneId, shellRef])
+      setViewport(nextViewport || defaultViewportFor(sceneId))
+    },
+    [sceneId, shellRef],
+  )
 
   const fitAll = useCallback(() => {
     fitToBounds(boundsForNodes(nodes.filter((node) => !node.hidden)))
@@ -356,7 +478,7 @@ export function useCanvasInteractionController({
       if (!nodeId) return
 
       const node = useCanvasStore.getState().nodes.find((item) => item.id === nodeId)
-      if (isEditableTextNode(node) && !node.text?.trim()) {
+      if (isAutoDeletedEmptyTextNode(node) && !node.text?.trim()) {
         deleteNode(nodeId)
       }
 
@@ -376,6 +498,7 @@ export function useCanvasInteractionController({
       setEditingTextNodeId(undefined)
       setSnapGuides([])
       setActiveSectionDropTargetId(undefined)
+      setActiveConnectorDropTargetId(undefined)
       selectionRef.current = null
       setSelectionBox(null)
       setIsPanning(true)
@@ -397,6 +520,7 @@ export function useCanvasInteractionController({
       setEditingTextNodeId(undefined)
       setSnapGuides([])
       setActiveSectionDropTargetId(undefined)
+      setActiveConnectorDropTargetId(undefined)
 
       const point = screenToCanvas(event.clientX, event.clientY)
       const additive = event.shiftKey || event.metaKey || event.ctrlKey
@@ -422,6 +546,7 @@ export function useCanvasInteractionController({
       setEditingTextNodeId(undefined)
       setSnapGuides([])
       setActiveSectionDropTargetId(undefined)
+      setActiveConnectorDropTargetId(undefined)
       captureHistory()
 
       groupResizeRef.current = createGroupResizeState(
@@ -450,13 +575,15 @@ export function useCanvasInteractionController({
       setEditingTextNodeId(undefined)
       setSnapGuides([])
       setActiveSectionDropTargetId(undefined)
+      setActiveConnectorDropTargetId(undefined)
       selectionRef.current = null
       setSelectionBox(null)
 
       const additive = event.shiftKey || event.metaKey || event.ctrlKey
       const alreadySelected = selectedNodeIds.includes(nodeId)
       const shouldPreserveMultiSelection = !additive && alreadySelected && selectedNodeIds.length > 1
-      const shouldEditTextOnClick = !additive && alreadySelected && selectedNodeIds.length === 1 && isEditableTextNode(node)
+      const shouldEditTextOnClick =
+        !additive && alreadySelected && selectedNodeIds.length === 1 && isAutoDeletedEmptyTextNode(node)
 
       if (additive) {
         selectNode(nodeId, { additive: true })
@@ -491,6 +618,7 @@ export function useCanvasInteractionController({
       setEditingTextNodeId(undefined)
       setSnapGuides([])
       setActiveSectionDropTargetId(undefined)
+      setActiveConnectorDropTargetId(undefined)
       selectionRef.current = null
       setSelectionBox(null)
       selectNode(nodeId)
@@ -509,6 +637,7 @@ export function useCanvasInteractionController({
       onCloseContextMenu()
       setSnapGuides([])
       setActiveSectionDropTargetId(undefined)
+      setActiveConnectorDropTargetId(undefined)
       selectNode(nodeId)
       captureHistory()
       setEditingTextNodeId(nodeId)
@@ -538,6 +667,7 @@ export function useCanvasInteractionController({
       setSnapGuides([])
       setSelectionBox(null)
       selectionRef.current = null
+      selectNode(undefined)
 
       const point = screenToCanvas(event.clientX, event.clientY)
       const nextBox = {
@@ -550,7 +680,37 @@ export function useCanvasInteractionController({
       textCreationRef.current = nextBox
       setTextCreationBox(nextBox)
     },
-    [discardEmptyEditingText, onCloseContextMenu, screenToCanvas],
+    [discardEmptyEditingText, onCloseContextMenu, screenToCanvas, selectNode],
+  )
+
+  const beginMarkupPointMove = useCallback(
+    (nodeId: string, pointIndex: number, event: ReactPointerEvent<HTMLButtonElement>) => {
+      if (event.button !== 0) return
+
+      const node = nodes.find((item) => item.id === nodeId)
+      if (!node || node.type !== 'markup' || (node.markupKind !== 'arrow' && node.markupKind !== 'line')) return
+      if (isNodeEffectivelyLocked(node, nodes)) return
+
+      event.preventDefault()
+      event.stopPropagation()
+      event.currentTarget.setPointerCapture(event.pointerId)
+      onCloseContextMenu()
+      discardEmptyEditingText()
+      setSnapGuides([])
+      selectNode(nodeId)
+
+      markupPointTransformRef.current = {
+        pointerId: event.pointerId,
+        nodeId,
+        pointIndex,
+        startClientX: event.clientX,
+        startClientY: event.clientY,
+        startNode: node,
+        startPoints: lineMarkupPointsFor(node),
+        historyCaptured: false,
+      }
+    },
+    [discardEmptyEditingText, nodes, onCloseContextMenu, selectNode],
   )
 
   const beginFrameBox = useCallback(
@@ -574,6 +734,36 @@ export function useCanvasInteractionController({
       }
       frameCreationRef.current = nextBox
       setFrameCreationBox(nextBox)
+    },
+    [discardEmptyEditingText, onCloseContextMenu, screenToCanvas],
+  )
+
+  const beginMarkupBox = useCallback(
+    (event: ReactPointerEvent<HTMLElement>) => {
+      const kind = markupKindForTool(useCanvasStore.getState().activeTool)
+      if (!kind) return
+
+      event.preventDefault()
+      event.currentTarget.setPointerCapture(event.pointerId)
+      onCloseContextMenu()
+      discardEmptyEditingText()
+      setEditingTextNodeId(undefined)
+      setSnapGuides([])
+      setSelectionBox(null)
+      selectionRef.current = null
+
+      const point = screenToCanvas(event.clientX, event.clientY)
+      const nextBox: MarkupCreationState = {
+        pointerId: event.pointerId,
+        kind,
+        startX: point.x,
+        startY: point.y,
+        currentX: point.x,
+        currentY: point.y,
+        points: [point],
+      }
+      markupCreationRef.current = nextBox
+      setMarkupCreationBox(nextBox)
     },
     [discardEmptyEditingText, onCloseContextMenu, screenToCanvas],
   )
@@ -623,7 +813,7 @@ export function useCanvasInteractionController({
       setEditingTextNodeId((current) => (current === nodeId ? undefined : current))
 
       const node = useCanvasStore.getState().nodes.find((item) => item.id === nodeId)
-      if (isEditableTextNode(node) && !node.text?.trim()) {
+      if (isAutoDeletedEmptyTextNode(node) && !node.text?.trim()) {
         discardEmptyEditingText(nodeId)
       }
     },
@@ -638,9 +828,10 @@ export function useCanvasInteractionController({
       beginNodeResize: startNodeResize,
       beginTextBox,
       beginFrameBox,
+      beginMarkupBox,
       beginTextEdit,
     }),
-    [beginFrameBox, beginNodeMove, beginPan, beginSelection, beginTextBox, beginTextEdit, startNodeResize],
+    [beginFrameBox, beginMarkupBox, beginNodeMove, beginPan, beginSelection, beginTextBox, beginTextEdit, startNodeResize],
   )
 
   const beginNodePointerDown = useCallback(
@@ -692,6 +883,34 @@ export function useCanvasInteractionController({
         return
       }
 
+      const markupCreation = markupCreationRef.current
+      if (markupCreation?.pointerId === event.pointerId) {
+        const rawPoint = screenToCanvas(event.clientX, event.clientY)
+        const startPoint = { x: markupCreation.startX, y: markupCreation.startY }
+        const point = constrainedMarkupPoint(markupCreation.kind, startPoint, rawPoint, event.shiftKey)
+        markupCreation.currentX = point.x
+        markupCreation.currentY = point.y
+        if (markupCreation.kind === 'arrow' || markupCreation.kind === 'line') {
+          const snap = nearestConnectorBindingForPoint(nodes, point)
+          setActiveConnectorDropTargetId(snap?.binding.nodeId)
+        }
+        if (markupCreation.kind === 'brush') {
+          if (event.shiftKey) {
+            markupCreation.points = [startPoint, point]
+            setMarkupCreationBox({ ...markupCreation, points: [...markupCreation.points] })
+            return
+          }
+
+          const previousPoint = markupCreation.points.at(-1)
+          const distance = previousPoint
+            ? Math.abs(previousPoint.x - point.x) + Math.abs(previousPoint.y - point.y)
+            : Number.POSITIVE_INFINITY
+          if (distance > 2) markupCreation.points.push(point)
+        }
+        setMarkupCreationBox({ ...markupCreation, points: [...markupCreation.points] })
+        return
+      }
+
       const nodeTransform = nodeTransformRef.current
       if (nodeTransform?.pointerId === event.pointerId) {
         const node = nodes.find((item) => item.id === nodeTransform.nodeId)
@@ -727,9 +946,49 @@ export function useCanvasInteractionController({
           )
           setSnapGuides(snapped.guides)
           setActiveSectionDropTargetId(undefined)
+      setActiveConnectorDropTargetId(undefined)
           updateNodeGeometry(nodeTransform.nodeId, snapped.x, snapped.y, snapped.width, snapped.height)
         }
 
+        return
+      }
+
+      const markupPointTransform = markupPointTransformRef.current
+      if (markupPointTransform?.pointerId === event.pointerId) {
+        if (!markupPointTransform.historyCaptured) {
+          captureHistory()
+          markupPointTransform.historyCaptured = true
+        }
+
+        const dx = (event.clientX - markupPointTransform.startClientX) / viewportRef.current.scale
+        const dy = (event.clientY - markupPointTransform.startClientY) / viewportRef.current.scale
+        const startAbsolutePoints = markupPointTransform.startPoints.map((point) => ({
+          x: markupPointTransform.startNode.x + point.x,
+          y: markupPointTransform.startNode.y + point.y,
+        }))
+        const stationaryPoint = startAbsolutePoints[markupPointTransform.pointIndex === 0 ? 1 : 0]
+        const rawMovingPoint = {
+          x: startAbsolutePoints[markupPointTransform.pointIndex].x + dx,
+          y: startAbsolutePoints[markupPointTransform.pointIndex].y + dy,
+        }
+        const movingPoint = event.shiftKey ? constrainAnglePoint(stationaryPoint, rawMovingPoint) : rawMovingPoint
+        const snap = nearestConnectorBindingForPoint(nodes, movingPoint, {
+          connectorNodeId: markupPointTransform.nodeId,
+        })
+        const snappedMovingPoint = snap?.point || movingPoint
+        setActiveConnectorDropTargetId(snap?.binding.nodeId)
+        const absolutePoints = startAbsolutePoints.map((point, index) =>
+          index === markupPointTransform.pointIndex ? snappedMovingPoint : point,
+        )
+        const next = markupGeometryFromAbsolutePoints(absolutePoints)
+        updateMarkupGeometry(
+          markupPointTransform.nodeId,
+          next.geometry,
+          next.points,
+          markupPointTransform.pointIndex === 0
+            ? { connectorStart: snap?.binding || null }
+            : { connectorEnd: snap?.binding || null },
+        )
         return
       }
 
@@ -778,6 +1037,7 @@ export function useCanvasInteractionController({
       resizeTextNode,
       screenToCanvas,
       updateNodeGeometry,
+      updateMarkupGeometry,
       updateNodesGeometry,
       updateSelectedNodesPosition,
       sectionDropTargetFor,
@@ -826,11 +1086,69 @@ export function useCanvasInteractionController({
         setActiveTool('select')
       }
 
+      if (markupCreationRef.current?.pointerId === event.pointerId) {
+        const markupCreation = markupCreationRef.current
+        const rect = rectFromMarkupCreation(markupCreation)
+        const dragged = rect.width > 8 || rect.height > 8
+        const width = dragged ? Math.max(18, rect.width) : markupCreation.kind === 'note' ? 180 : 160
+        const height = dragged ? Math.max(18, rect.height) : markupCreation.kind === 'note' ? 108 : 96
+        const x = dragged ? rect.x : markupCreation.startX - width / 2
+        const y = dragged ? rect.y : markupCreation.startY - height / 2
+        const fallbackBounds = { x, y, width, height }
+        let points = dragged
+          ? normalizeMarkupPoints(markupCreation, rect)
+          : markupCreation.kind === 'arrow' || markupCreation.kind === 'line'
+            ? [
+                { x: 8, y: height - 8 },
+                { x: width - 8, y: 8 },
+              ]
+            : markupCreation.kind === 'brush'
+              ? [
+                  { x: 12, y: height * 0.62 },
+                  { x: width * 0.32, y: height * 0.25 },
+                  { x: width * 0.56, y: height * 0.68 },
+                  { x: width - 12, y: height * 0.3 },
+                ]
+              : normalizeMarkupPoints(markupCreation, fallbackBounds)
+
+        let finalPosition = { x, y }
+        let finalSize = { width, height }
+        const connectorOptions: {
+          connectorStart?: MivoCanvasNode['connectorStart']
+          connectorEnd?: MivoCanvasNode['connectorEnd']
+        } = {}
+
+        if ((markupCreation.kind === 'arrow' || markupCreation.kind === 'line') && points && points.length >= 2) {
+          const absolutePoints = points.slice(0, 2).map((point) => ({ x: x + point.x, y: y + point.y }))
+          const startSnap = nearestConnectorBindingForPoint(nodes, absolutePoints[0])
+          const endSnap = nearestConnectorBindingForPoint(nodes, absolutePoints[1])
+          if (startSnap) {
+            absolutePoints[0] = startSnap.point
+            connectorOptions.connectorStart = startSnap.binding
+          }
+          if (endSnap) {
+            absolutePoints[1] = endSnap.point
+            connectorOptions.connectorEnd = endSnap.binding
+          }
+          const next = markupGeometryFromAbsolutePoints(absolutePoints)
+          finalPosition = { x: next.geometry.x, y: next.geometry.y }
+          finalSize = { width: next.geometry.width, height: next.geometry.height }
+          points = next.points
+        }
+
+        addMarkupNode(markupCreation.kind, finalPosition, finalSize, { points, select: false, ...connectorOptions })
+        markupCreationRef.current = null
+        setMarkupCreationBox(null)
+        setActiveConnectorDropTargetId(undefined)
+        setActiveTool('select')
+      }
+
       if (nodeTransformRef.current?.pointerId === event.pointerId) {
         const nodeTransform = nodeTransformRef.current
         nodeTransformRef.current = null
         setSnapGuides([])
         setActiveSectionDropTargetId(undefined)
+        setActiveConnectorDropTargetId(undefined)
 
         if (nodeTransform.mode === 'move' && nodeTransform.collapseSelectionOnClick && !nodeTransform.moved) {
           selectNode(nodeTransform.nodeId)
@@ -845,6 +1163,11 @@ export function useCanvasInteractionController({
         textResizeRef.current = null
       }
 
+      if (markupPointTransformRef.current?.pointerId === event.pointerId) {
+        markupPointTransformRef.current = null
+        setActiveConnectorDropTargetId(undefined)
+      }
+
       if (panRef.current?.pointerId === event.pointerId) {
         panRef.current = null
         setIsPanning(false)
@@ -854,23 +1177,35 @@ export function useCanvasInteractionController({
         finishSelection()
       }
     },
-    [addFrameNode, addTextNode, editTextNode, finishSelection, resizeTextNode, selectNode, setActiveTool],
+    [
+      addFrameNode,
+      addMarkupNode,
+      addTextNode,
+      editTextNode,
+      finishSelection,
+      nodes,
+      resizeTextNode,
+      selectNode,
+      setActiveTool,
+    ],
   )
 
   const handleWheel = useCallback(
     (event: ReactWheelEvent<HTMLElement>) => {
-      event.preventDefault()
       onCloseContextMenu()
 
+      const delta = normalizedWheelDelta(event.nativeEvent)
       if (event.ctrlKey || event.metaKey) {
-        zoomBy(Math.exp(-event.deltaY * 0.002), { clientX: event.clientX, clientY: event.clientY })
+        zoomBy(Math.exp(-delta.y * 0.002), { clientX: event.clientX, clientY: event.clientY })
         return
       }
 
+      const deltaX = event.shiftKey && delta.x === 0 ? delta.y : delta.x
+      const deltaY = event.shiftKey && delta.x === 0 ? 0 : delta.y
       setViewport((current) => ({
         ...current,
-        x: current.x - event.deltaX,
-        y: current.y - event.deltaY,
+        x: current.x - deltaX,
+        y: current.y - deltaY,
       }))
     },
     [onCloseContextMenu, zoomBy],
@@ -895,6 +1230,8 @@ export function useCanvasInteractionController({
         selectionRef.current = null
         textCreationRef.current = null
         frameCreationRef.current = null
+        markupCreationRef.current = null
+        markupPointTransformRef.current = null
         groupResizeRef.current = null
         nodeTransformRef.current = null
         textResizeRef.current = null
@@ -902,8 +1239,40 @@ export function useCanvasInteractionController({
         setSelectionBox(null)
         setTextCreationBox(null)
         setFrameCreationBox(null)
+        setMarkupCreationBox(null)
         setSnapGuides([])
+        setActiveConnectorDropTargetId(undefined)
         selectNode(undefined)
+        return
+      }
+
+      if (modifier && (event.key === '=' || event.key === '+' || event.code === 'Equal')) {
+        event.preventDefault()
+        zoomBy(1.12)
+        return
+      }
+
+      if (modifier && (event.key === '-' || event.code === 'Minus')) {
+        event.preventDefault()
+        zoomBy(1 / 1.12)
+        return
+      }
+
+      if (modifier && event.code === 'Digit0') {
+        event.preventDefault()
+        resetView()
+        return
+      }
+
+      if (!modifier && event.shiftKey && event.code === 'Digit1') {
+        event.preventDefault()
+        fitAll()
+        return
+      }
+
+      if (!modifier && event.shiftKey && event.code === 'Digit2') {
+        event.preventDefault()
+        fitSelection()
         return
       }
 
@@ -983,8 +1352,12 @@ export function useCanvasInteractionController({
       setTextCreationBox(null)
       frameCreationRef.current = null
       setFrameCreationBox(null)
+      markupCreationRef.current = null
+      setMarkupCreationBox(null)
+      markupPointTransformRef.current = null
       nodeTransformRef.current = null
       textResizeRef.current = null
+      setActiveConnectorDropTargetId(undefined)
     }
 
     const handlePaste = async (event: ClipboardEvent) => {
@@ -1001,19 +1374,12 @@ export function useCanvasInteractionController({
         const namedFile = file.name
           ? file
           : new File([file], `clipboard-${Date.now()}.png`, { type: file.type || 'image/png' })
-        const asset = await saveImportedAsset(namedFile)
         const center = viewportCenter()
-        const displaySize = importedImageDisplaySize(asset.dimensions)
-        addImportedImage(
-          asset.assetUrl,
-          asset.title,
-          asset.size,
-          {
-            x: center.x - displaySize.width / 2,
-            y: center.y - displaySize.height / 2,
-          },
-          asset,
-        )
+        await importImageFileToCanvas({
+          file: namedFile,
+          position: center,
+          addImportedImage,
+        })
         return
       }
 
@@ -1041,23 +1407,29 @@ export function useCanvasInteractionController({
     deleteSelectedNodes,
     deleteNode,
     duplicateSelectedNodes,
+    fitAll,
+    fitSelection,
     moveSelectedLayer,
     moveSelectedNodesBy,
     onCloseContextMenu,
     pasteClipboardNodes,
     redo,
+    resetView,
     selectNode,
     setActiveTool,
     undo,
     resizeTextNode,
+    updateMarkupGeometry,
     updateTextNode,
     viewportCenter,
+    zoomBy,
   ])
 
   const selectionRect = selectionBox ? selectionRectFromBox(selectionBox) : undefined
   const activeSelectionRect = selectionRect && isActiveSelectionRect(selectionRect) ? selectionRect : undefined
   const activeTextCreationRect = textCreationBox ? rectFromTextCreation(textCreationBox) : undefined
   const activeFrameCreationRect = frameCreationBox ? rectFromFrameCreation(frameCreationBox) : undefined
+  const activeMarkupCreationRect = markupCreationBox ? rectFromMarkupCreation(markupCreationBox) : undefined
   const selectionPreviewSet = previewIdsFromSelectionBox(selectionBox, nodes)
 
   return {
@@ -1071,16 +1443,20 @@ export function useCanvasInteractionController({
     selectedNodes,
     selectedBounds,
     activeSectionDropTargetId,
+    activeConnectorDropTargetId,
     showGroupSelectionBounds,
     activeSelectionRect,
     activeTextCreationRect,
     activeFrameCreationRect,
+    activeMarkupCreationRect,
+    markupCreationBox,
     selectionPreviewSet,
     beginGroupResize,
     beginNodePointerDown,
     beginNodeResize,
     editTextNode,
     beginTextResize,
+    beginMarkupPointMove,
     updateEditingText,
     finishTextEditing,
     handleCanvasPointerDown,

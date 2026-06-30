@@ -15,7 +15,7 @@ type NodeActionMenuProps = {
   onCreateFrameAt?: (position: { x: number; y: number }) => void
   onEditText?: (nodeId: string) => void
   onRenameNode?: (nodeId: string) => void
-  onImportImageAt?: (position: { x: number; y: number }) => void
+  onImportAssetAt?: (position: { x: number; y: number }) => void
   onCropNode?: (nodeId: string) => void
   onDownloadOriginal?: (node?: MivoCanvasNode) => void
 }
@@ -32,7 +32,7 @@ export function NodeActionMenu({
   onCreateFrameAt,
   onEditText,
   onRenameNode,
-  onImportImageAt,
+  onImportAssetAt,
   onCropNode,
   onDownloadOriginal,
 }: NodeActionMenuProps) {
@@ -47,7 +47,7 @@ export function NodeActionMenu({
     onCreateFrameAt,
     onEditText,
     onRenameNode,
-    onImportImageAt,
+    onImportAssetAt,
     onCropNode,
     onDownloadOriginal,
   })
