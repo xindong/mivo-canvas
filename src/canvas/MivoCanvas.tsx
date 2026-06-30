@@ -404,7 +404,7 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
     if (!contextMenu) return
 
     const handleOutsidePointerDown = (event: PointerEvent) => {
-      if (event.target instanceof HTMLElement && event.target.closest('.node-context-menu')) return
+      if (event.target instanceof HTMLElement && event.target.closest('.node-context-menu, .node-action-submenu')) return
       setContextMenu(null)
     }
 

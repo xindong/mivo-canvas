@@ -1,4 +1,5 @@
 import { Fragment, useCallback, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { ChevronRight } from 'lucide-react'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 import { contextMenuGroupsFor, type CanvasActionItem } from './actions/canvasActionModel'
@@ -53,7 +54,13 @@ export function NodeActionMenu({
     onDownloadOriginal,
   })
   const actionGroups = contextMenuGroupsFor(runtime)
-  const [openSubmenu, setOpenSubmenu] = useState<{ id?: string; side: 'left' | 'right' }>({ side: 'right' })
+  const [openSubmenu, setOpenSubmenu] = useState<{
+    id?: string
+    side: 'left' | 'right'
+    left?: number
+    top?: number
+    maxHeight?: number
+  }>({ side: 'right' })
 
   const runAction = (action: () => void) => {
     action()
@@ -62,14 +69,37 @@ export function NodeActionMenu({
 
   const openChildMenu = useCallback((actionId: string, button: HTMLButtonElement) => {
     const rect = button.getBoundingClientRect()
-    const submenuWidth = 190
+    const viewport = window.visualViewport
+    const viewportLeft = viewport?.offsetLeft || 0
+    const viewportTop = viewport?.offsetTop || 0
+    const viewportWidth = viewport?.width || window.innerWidth
+    const viewportHeight = viewport?.height || window.innerHeight
+    const submenuWidth = 188
+    const gap = 8
     const margin = 12
-    const side = rect.right + submenuWidth + margin <= window.innerWidth ? 'right' : 'left'
+    const maxHeight = Math.min(360, viewportHeight - margin * 2)
+    const hasRoomRight = rect.right + gap + submenuWidth + margin <= viewportLeft + viewportWidth
+    const side = hasRoomRight ? 'right' : 'left'
+    const rawLeft = side === 'right' ? rect.right + gap : rect.left - submenuWidth - gap
+    const rawTop = rect.top - 6
+    const minLeft = viewportLeft + margin
+    const maxLeft = viewportLeft + viewportWidth - submenuWidth - margin
+    const minTop = viewportTop + margin
+    const maxTop = viewportTop + viewportHeight - maxHeight - margin
 
-    setOpenSubmenu({ id: actionId, side })
+    setOpenSubmenu({
+      id: actionId,
+      side,
+      left: Math.round(Math.min(Math.max(rawLeft, minLeft), Math.max(minLeft, maxLeft))),
+      top: Math.round(Math.min(Math.max(rawTop, minTop), Math.max(minTop, maxTop))),
+      maxHeight: Math.floor(maxHeight),
+    })
   }, [])
 
-  const renderAction = ({ id, label, icon: Icon, text, danger, disabled, children, onClick }: CanvasActionItem) => {
+  const renderAction = (
+    { id, label, icon: Icon, text, danger, disabled, children, onClick }: CanvasActionItem,
+    nested = false,
+  ) => {
     const hasChildren = Boolean(children?.length)
     const submenuOpen = openSubmenu.id === id
 
@@ -84,7 +114,7 @@ export function NodeActionMenu({
           disabled={disabled}
           onPointerEnter={(event) => {
             if (hasChildren) openChildMenu(id, event.currentTarget)
-            else setOpenSubmenu({ side: 'right' })
+            else if (!nested) setOpenSubmenu({ side: 'right' })
           }}
           onFocus={(event) => {
             if (hasChildren) openChildMenu(id, event.currentTarget)
@@ -102,16 +132,20 @@ export function NodeActionMenu({
           <span>{label}</span>
           {hasChildren ? <ChevronRight className="node-action-chevron" size={15} /> : null}
         </button>
-        {hasChildren && submenuOpen ? (
+        {hasChildren && submenuOpen
+          ? createPortal(
           <div
             className={`node-action-submenu side-${openSubmenu.side}`}
             role="menu"
             aria-label={`${label} options`}
+            style={{ left: openSubmenu.left, top: openSubmenu.top, maxHeight: openSubmenu.maxHeight }}
             onPointerDown={(event) => event.stopPropagation()}
           >
-            {children?.map((child) => renderAction(child))}
-          </div>
-        ) : null}
+            {children?.map((child) => renderAction(child, true))}
+          </div>,
+              document.body,
+            )
+          : null}
       </span>
     )
   }
@@ -122,7 +156,7 @@ export function NodeActionMenu({
         <Fragment key={group.id}>
           {groupIndex > 0 ? <div className="node-action-separator" role="separator" /> : null}
           <div className="node-action-group" role="group">
-            {group.actions.map(renderAction)}
+            {group.actions.map((action) => renderAction(action))}
           </div>
         </Fragment>
       ))}

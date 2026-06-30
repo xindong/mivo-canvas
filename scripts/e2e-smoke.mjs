@@ -2518,6 +2518,13 @@ try {
   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Unlock' }).click()
   await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Unlock section' }).click()
   await sectionNode.click({ button: 'right', position: { x: 24, y: 24 } })
+  const sectionContextMenuOverflow = await page.locator('.node-action-menu').evaluate((menu) => ({
+    clientWidth: menu.clientWidth,
+    scrollWidth: menu.scrollWidth,
+  }))
+  if (sectionContextMenuOverflow.scrollWidth > sectionContextMenuOverflow.clientWidth + 1) {
+    throw new Error(`Section context menu should not show horizontal overflow: ${JSON.stringify(sectionContextMenuOverflow)}`)
+  }
   await page.getByRole('menuitem', { name: 'Remove section only' }).click()
   await page.waitForFunction((count) => document.querySelectorAll('.dom-node.frame-node').length === count, sectionCountBefore)
   await page.waitForFunction((imageId) => !document.querySelector(`[data-node-id="${imageId}"]`)?.getAttribute('data-section-id'), firstNodeId)
