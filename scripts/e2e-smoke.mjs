@@ -182,6 +182,7 @@ try {
 
   const browser = await chromium.launch({ headless: true })
   const page = await browser.newPage({ viewport: { width: 1512, height: 900 }, deviceScaleFactor: 1 })
+  await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin: baseUrl })
   const errors = []
   const { readFloatingChrome, readLibraryLayout, readLibrarySurfaceColors } = createPageReaders(page)
 
@@ -535,6 +536,42 @@ try {
   await debugLogPanel.getByRole('button', { name: /^Error \d+/ }).click()
   if ((await debugLogPanel.getByText('__MIVO_E2E_EXPECTED_ERROR__ unity-style error', { exact: false }).count()) !== 1) {
     throw new Error('Error filter should keep error entries visible')
+  }
+  if ((await debugLogPanel.locator('.debug-log-entry:not(.error) [aria-label^="Copy error log"]').count()) !== 0) {
+    throw new Error('Only error entries should expose copy controls')
+  }
+  const expectedErrorEntry = debugLogPanel
+    .locator('.debug-log-entry.error')
+    .filter({ hasText: '__MIVO_E2E_EXPECTED_ERROR__ unity-style error' })
+  if ((await expectedErrorEntry.getByRole('button', { name: 'Copy error log content' }).count()) !== 1) {
+    throw new Error('Each error entry should expose one copy-log icon button')
+  }
+  await expectedErrorEntry.getByRole('button', { name: 'Copy error log content' }).click()
+  const copiedErrorLog = await page.evaluate(() => navigator.clipboard.readText())
+  if (
+    !copiedErrorLog.includes('[ERROR]') ||
+    !copiedErrorLog.includes('Console') ||
+    !copiedErrorLog.includes('__MIVO_E2E_EXPECTED_ERROR__ unity-style error')
+  ) {
+    throw new Error(`Copying an error log should place the formatted error content on the clipboard: ${copiedErrorLog}`)
+  }
+  const copyToast = page.getByRole('status').filter({ hasText: 'Error log copied' })
+  await copyToast.waitFor()
+  const toastPlacement = await page.locator('.toast-viewport').evaluate((element) => {
+    const rect = element.getBoundingClientRect()
+    const style = window.getComputedStyle(element)
+    return {
+      horizontalCenterDelta: Math.abs(rect.left + rect.width / 2 - window.innerWidth / 2),
+      bottom: style.bottom,
+      pointerEvents: style.pointerEvents,
+    }
+  })
+  if (toastPlacement.horizontalCenterDelta > 2 || toastPlacement.pointerEvents !== 'none') {
+    throw new Error(`Toast viewport should be bottom-centered and non-blocking: ${JSON.stringify(toastPlacement)}`)
+  }
+  await debugLogPanel.getByRole('button', { name: /^All \d+/ }).click()
+  if ((await debugLogPanel.getByText('Copied error log content', { exact: false }).count()) !== 0) {
+    throw new Error('Copying an error log successfully should not add a normal Debug Log entry')
   }
   await debugLogPanel.getByRole('button', { name: 'Clear debug log' }).click()
   if ((await debugLogPanel.getByText('__MIVO_E2E_EXPECTED_ERROR__', { exact: false }).count()) !== 0) {

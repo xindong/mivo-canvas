@@ -26,10 +26,16 @@ checks.push(async () => {
 checks.push(async () => {
   const docs = await read('docs/development-logging.md')
   for (const phrase of [
-    'Every user-facing feature must emit Debug Log entries',
+    'User-facing feature flows that change app state',
+    'Actions that need immediate user acknowledgement must use the global toast feedback API',
+    'can be toast-only',
     'debugLogger.log',
     'debugLogger.warn',
     'debugLogger.error',
+    'toastFeedback.success',
+    'toastFeedback.info',
+    'toastFeedback.warn',
+    'toastFeedback.error',
     'npm run verify:logging',
   ]) {
     requireIncludes(docs, phrase, 'Development logging documentation')
@@ -38,8 +44,9 @@ checks.push(async () => {
 
 checks.push(async () => {
   const readme = await read('README.md')
-  requireIncludes(readme, 'Development Logging Rule', 'README')
+  requireIncludes(readme, 'Development Feedback Rule', 'README')
   requireIncludes(readme, 'docs/development-logging.md', 'README')
+  requireIncludes(readme, 'toastFeedback', 'README')
 })
 
 checks.push(async () => {
@@ -48,6 +55,16 @@ checks.push(async () => {
     requireIncludes(store, level, 'Debug Log store')
   }
   requireLoggerLevels(store, 'Debug Log store')
+})
+
+checks.push(async () => {
+  const store = await read('src/store/toastStore.ts')
+  for (const level of ["'success'", "'info'", "'warning'", "'error'"]) {
+    requireIncludes(store, level, 'Toast feedback store')
+  }
+  for (const call of ['success:', 'info:', 'warn:', 'error:']) {
+    requireIncludes(store, call, 'Toast feedback store')
+  }
 })
 
 checks.push(async () => {

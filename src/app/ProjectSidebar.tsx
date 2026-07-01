@@ -5,6 +5,7 @@ import {
   ChevronDown,
   ChevronRight,
   ChevronUp,
+  Copy,
   CircleHelp,
   Folder,
   FolderOpen,
@@ -24,7 +25,8 @@ import {
   X,
 } from 'lucide-react'
 import { scenes, useCanvasStore } from '../store/canvasStore'
-import { debugLogger, useDebugLogStore, type DebugLogLevel } from '../store/debugLogStore'
+import { debugLogger, useDebugLogStore, type DebugLogEntry, type DebugLogLevel } from '../store/debugLogStore'
+import { toastFeedback } from '../store/toastStore'
 import type { CanvasId } from '../types/mivoCanvas'
 
 export type WorkspaceView = 'canvas' | 'assets' | 'plugins' | 'skills'
@@ -182,6 +184,24 @@ export function ProjectSidebar({
       minute: '2-digit',
       second: '2-digit',
     }).format(new Date(timestamp))
+  const formatDebugEntryForClipboard = (entry: DebugLogEntry) =>
+    `[${entry.level.toUpperCase()}] ${formatDebugTime(entry.timestamp)} ${entry.source}\n${entry.message}`
+  const copyErrorLogEntry = async (entry: DebugLogEntry) => {
+    if (!navigator.clipboard?.writeText) {
+      debugLogger.error('Debug Log', 'Clipboard API unavailable while copying error log')
+      toastFeedback.error('Clipboard is unavailable')
+      return
+    }
+
+    try {
+      await navigator.clipboard.writeText(formatDebugEntryForClipboard(entry))
+      toastFeedback.success('Error log copied')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      debugLogger.error('Debug Log', `Failed to copy error log: ${message}`)
+      toastFeedback.error('Failed to copy error log')
+    }
+  }
 
   if (!open && !peeking && !closing) {
     return null
@@ -405,6 +425,17 @@ export function ProjectSidebar({
                             <time>{formatDebugTime(entry.timestamp)}</time>
                             <span className="debug-log-source">{entry.source}</span>
                             <span className="debug-log-message">{entry.message}</span>
+                            {entry.level === 'error' ? (
+                              <button
+                                type="button"
+                                className="debug-log-copy"
+                                aria-label="Copy error log content"
+                                title="Copy error log content"
+                                onClick={() => void copyErrorLogEntry(entry)}
+                              >
+                                <Copy size={14} />
+                              </button>
+                            ) : null}
                           </li>
                         ))
                       ) : (

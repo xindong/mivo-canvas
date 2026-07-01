@@ -11,6 +11,7 @@ import { ProjectSidebar } from './app/ProjectSidebar'
 import { ProjectSidebarControls } from './app/ProjectSidebarControls'
 import { TaskQueue } from './app/TaskQueue'
 import { TopBar } from './app/TopBar'
+import { ToastViewport } from './app/ToastViewport'
 import { useCanvasStore } from './store/canvasStore'
 import { debugLogger, installConsoleCapture } from './store/debugLogStore'
 import type { WorkspaceView } from './app/ProjectSidebar'
@@ -206,6 +207,7 @@ function App() {
           </div>
         </div>
       ) : null}
+      <ToastViewport />
     </main>
   )
 }
