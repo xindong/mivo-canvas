@@ -433,6 +433,31 @@ const eagleThumbnailPathFor = async (itemId: string) => {
   return decodeURI(thumbnailPath)
 }
 
+const eagleThumbnailFallbackSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="240" viewBox="0 0 320 240">
+  <rect width="320" height="240" rx="16" fill="#f3f0e8"/>
+  <path d="M76 154l52-62 42 48 28-30 46 44H76z" fill="#c9c1b0"/>
+  <circle cx="220" cy="82" r="22" fill="#d9d1c2"/>
+</svg>`
+
+const sendImageBuffer = (response: ServerResponse, file: Buffer, filePath: string) => {
+  response.setHeader('Content-Type', mimeForFile(file, filePath))
+  response.setHeader('Cache-Control', 'no-store')
+  response.end(file)
+}
+
+const sendEagleThumbnailFallback = async (response: ServerResponse, itemId: string) => {
+  try {
+    const item = await readEagleItem(itemId)
+    const filePath = await eagleOriginalPathFor(item)
+    sendImageBuffer(response, await fs.readFile(filePath), filePath)
+  } catch {
+    response.statusCode = 200
+    response.setHeader('Content-Type', 'image/svg+xml')
+    response.setHeader('Cache-Control', 'no-store')
+    response.end(eagleThumbnailFallbackSvg)
+  }
+}
+
 const eagleOriginalPathFor = async (item: EagleItem) => {
   const thumbnailPath = await eagleThumbnailPathFor(item.id)
   const itemDirectory = path.dirname(thumbnailPath)
@@ -642,13 +667,12 @@ const localAssetLibraryPlugin = ({ imageApiKey }: { imageApiKey: string }): Plug
             pathname.slice('/api/mivo/eagle/assets/'.length, -'/thumbnail'.length) || '',
           )
           const thumbnailPath = await eagleThumbnailPathFor(itemId)
-          const file = await fs.readFile(thumbnailPath)
-          response.setHeader('Content-Type', mimeForFile(file, thumbnailPath))
-          response.setHeader('Cache-Control', 'no-store')
-          response.end(file)
+          sendImageBuffer(response, await fs.readFile(thumbnailPath), thumbnailPath)
         } catch {
-          response.statusCode = 404
-          response.end('Eagle thumbnail not found')
+          const itemId = decodeURIComponent(
+            pathname.slice('/api/mivo/eagle/assets/'.length, -'/thumbnail'.length) || '',
+          )
+          await sendEagleThumbnailFallback(response, itemId)
         }
         return
       }
@@ -660,10 +684,7 @@ const localAssetLibraryPlugin = ({ imageApiKey }: { imageApiKey: string }): Plug
           )
           const item = await readEagleItem(itemId)
           const filePath = await eagleOriginalPathFor(item)
-          const file = await fs.readFile(filePath)
-          response.setHeader('Content-Type', mimeForFile(file, filePath))
-          response.setHeader('Cache-Control', 'no-store')
-          response.end(file)
+          sendImageBuffer(response, await fs.readFile(filePath), filePath)
         } catch {
           response.statusCode = 404
           response.end('Eagle original not found')

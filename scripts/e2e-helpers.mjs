@@ -54,7 +54,7 @@ export const createPageReaders = (page) => {
 
   const readLibraryLayout = async () =>
     page.evaluate(() => {
-      const workspace = document.querySelector('.workspace.library-mode')?.getBoundingClientRect()
+      const workspace = document.querySelector('.workspace.library-mode, .workspace')?.getBoundingClientRect()
       const library = document.querySelector('.library-workspace')?.getBoundingClientRect()
       const title = document.querySelector('.library-workspace h1')?.getBoundingClientRect()
 

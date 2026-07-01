@@ -54,8 +54,8 @@ const toolItems: Array<{ id: ImageMaskTool; label: string; icon: typeof MousePoi
 const minimumBoxSizePx = 8
 const floatingControlsMargin = 12
 const floatingControlsGap = 10
-const floatingToolbarHeight = 106
-const floatingPromptHeight = 138
+const floatingToolbarHeight = 114
+const floatingPromptHeight = 146
 const floatingControlsMinWidth = 320
 const floatingControlsMaxWidth = 420
 
@@ -181,16 +181,19 @@ export function ImageMaskEditOverlay({
       floatingControlsMargin,
       Math.max(floatingControlsMargin, shellRect.width - width - floatingControlsMargin),
     )
-    const toolbarAboveTop = stageTop - floatingToolbarHeight - floatingControlsGap
-    const toolbarTop =
-      toolbarAboveTop >= floatingControlsMargin
-        ? toolbarAboveTop
-        : clamp(stageBottom + floatingControlsGap, floatingControlsMargin, shellRect.height - floatingToolbarHeight - floatingControlsMargin)
-    const promptBelowTop = stageBottom + floatingControlsGap
-    const promptTop =
-      promptBelowTop <= shellRect.height - floatingPromptHeight - floatingControlsMargin
-        ? promptBelowTop
-        : clamp(stageTop - floatingPromptHeight - floatingControlsGap, floatingControlsMargin, shellRect.height - floatingPromptHeight - floatingControlsMargin)
+    const stackHeight = floatingToolbarHeight + floatingControlsGap + floatingPromptHeight
+    const minStackTop = floatingControlsMargin
+    const maxStackTop = Math.max(floatingControlsMargin, shellRect.height - stackHeight - floatingControlsMargin)
+    const belowStackTop = stageBottom + floatingControlsGap
+    const aboveStackTop = stageTop - stackHeight - floatingControlsGap
+    const stackTop =
+      belowStackTop <= maxStackTop
+        ? belowStackTop
+        : aboveStackTop >= minStackTop
+          ? aboveStackTop
+          : clamp(belowStackTop, minStackTop, maxStackTop)
+    const toolbarTop = stackTop
+    const promptTop = stackTop + floatingToolbarHeight + floatingControlsGap
 
     setFloatingHost(shell)
     setFloatingLayout((current) => {

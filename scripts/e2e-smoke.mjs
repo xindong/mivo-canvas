@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process'
 import { Buffer } from 'node:buffer'
 import path from 'node:path'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { mkdir, readFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { chromium } from 'playwright'
@@ -30,6 +30,13 @@ const eagleMockSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="120" height
   <rect x="18" y="18" width="84" height="54" rx="8" fill="#6957e8"/>
   <circle cx="60" cy="45" r="18" fill="#ff8a00"/>
 </svg>`
+const horizontalMaskSourceSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+  <rect width="1600" height="900" fill="#2767c8"/>
+  <rect x="520" y="260" width="560" height="320" rx="48" fill="#ffd35a"/>
+  <circle cx="800" cy="420" r="120" fill="#26a269"/>
+</svg>`
+const generatedImageB64 = `data:image/jpeg;base64,${readFileSync(path.resolve('public/demo-assets/courage-1.jpg')).toString('base64')}`
+const horizontalMaskSourceB64 = `data:image/svg+xml;base64,${Buffer.from(horizontalMaskSourceSvg).toString('base64')}`
 
 mkdirSync(localAssetFixtureDir, { recursive: true })
 mkdirSync(eagleMockItemDir, { recursive: true })
@@ -85,12 +92,27 @@ const eagleMockServer = createServer((request, response) => {
     return
   }
 
+  if (requestUrl.pathname === '/api/tag/list') {
+    response.end(
+      JSON.stringify({
+        status: 'success',
+        data: [
+          { id: 'mock', name: 'mock', count: 1 },
+          { id: 'eagle', name: 'eagle', count: 1 },
+        ],
+      }),
+    )
+    return
+  }
+
   if (requestUrl.pathname === '/api/item/list') {
     const folderId = requestUrl.searchParams.get('folderId')
     const keyword = requestUrl.searchParams.get('keyword')?.toLowerCase() || ''
+    const tag = requestUrl.searchParams.get('tags')?.toLowerCase() || ''
     const matchesFolder = !folderId || folderId === 'MOCK-FOLDER'
     const matchesKeyword = !keyword || eagleMockItem.name.toLowerCase().includes(keyword)
-    response.end(JSON.stringify({ status: 'success', data: matchesFolder && matchesKeyword ? [eagleMockItem] : [] }))
+    const matchesTag = !tag || eagleMockItem.tags.some((itemTag) => itemTag.toLowerCase() === tag)
+    response.end(JSON.stringify({ status: 'success', data: matchesFolder && matchesKeyword && matchesTag ? [eagleMockItem] : [] }))
     return
   }
 
@@ -161,7 +183,44 @@ try {
   const browser = await chromium.launch({ headless: true })
   const page = await browser.newPage({ viewport: { width: 1512, height: 900 }, deviceScaleFactor: 1 })
   const errors = []
+  const mivoEditRequests = []
   const { readFloatingChrome, readLibraryLayout, readLibrarySurfaceColors } = createPageReaders(page)
+
+  await page.route('**/api/mivo/generate', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }),
+    })
+  })
+  await page.route('**/api/mivo/edit', async (route) => {
+    const request = route.request()
+    try {
+      const formRequest = new Request('http://127.0.0.1/api/mivo/edit', {
+        method: 'POST',
+        headers: request.headers(),
+        body: request.postDataBuffer(),
+      })
+      const formData = await formRequest.formData()
+      mivoEditRequests.push({
+        prompt: String(formData.get('prompt') || ''),
+        fileKeys: ['image', 'mask', 'reference[]', 'reference']
+          .map((key) => `${key}:${formData.getAll(key).length}`)
+          .filter((entry) => !entry.endsWith(':0')),
+      })
+    } catch (error) {
+      mivoEditRequests.push({
+        prompt: '',
+        fileKeys: [],
+        parseError: error instanceof Error ? error.message : 'Unable to inspect edit request',
+      })
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }),
+    })
+  })
 
   page.on('console', (message) => {
     if (message.type() === 'error') errors.push(message.text())
@@ -170,6 +229,48 @@ try {
   await page.addInitScript(() => window.localStorage.clear())
   await page.goto(baseUrl, { waitUntil: 'networkidle' })
   await page.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
+
+  const canvasStoreSpec = async () =>
+    page.evaluate(() => {
+      const resource = performance.getEntriesByType('resource')
+        .map((entry) => entry.name)
+        .find((name) => name.includes('/src/store/canvasStore.ts'))
+      return resource ? new URL(resource).pathname + new URL(resource).search : '/src/store/canvasStore.ts'
+    })
+
+  const readCanvasState = async () => {
+    const spec = await canvasStoreSpec()
+    return page.evaluate(async (moduleSpec) => {
+      const { useCanvasStore } = await import(moduleSpec)
+      const state = useCanvasStore.getState()
+      return {
+        selectedNodeId: state.selectedNodeId,
+        selectedNodeIds: state.selectedNodeIds,
+        nodes: state.nodes.map((node) => ({
+          id: node.id,
+          type: node.type,
+          title: node.title,
+          sourceNodeId: node.sourceNodeId,
+          aiWorkflow: node.aiWorkflow,
+        })),
+        edges: state.edges.map((edge) => ({ ...edge })),
+      }
+    }, spec)
+  }
+
+  const waitForCanvasState = async (predicate, payload) => {
+    const spec = await canvasStoreSpec()
+    const startedAt = Date.now()
+    while (Date.now() - startedAt < 8000) {
+      const matches = await page.evaluate(async ({ moduleSpec, predicateSource, payload }) => {
+        const { useCanvasStore } = await import(moduleSpec)
+        return new Function('state', 'payload', `return (${predicateSource})(state, payload)`)(useCanvasStore.getState(), payload)
+      }, { moduleSpec: spec, predicateSource: predicate.toString(), payload })
+      if (matches) return
+      await wait(50)
+    }
+    throw new Error(`Timed out waiting for canvas state: ${predicate.toString()}`)
+  }
 
   const logoResponse = await page.request.get(`${baseUrl}/mivo-logo.svg`)
   if (!logoResponse.ok()) throw new Error(`Mivo logo asset should be reachable, got ${logoResponse.status()}`)
@@ -1120,27 +1221,56 @@ try {
   await page.getByRole('button', { name: /Eagle libraries/i }).click()
   await page.getByRole('button', { name: 'Mock Eagle Folder' }).waitFor()
   await page.getByRole('button', { name: 'Mock Eagle Folder' }).click()
-  await page.waitForSelector('.asset-tile img[src^="/api/mivo/eagle/assets/"]')
-  const eagleAssetTile = page.getByRole('button', { name: /Mock Eagle Concept/i })
-  if ((await eagleAssetTile.count()) !== 1) {
-    throw new Error('Assets workspace should render Eagle folder assets through the connector model')
+  await page.waitForSelector('.asset-masonry-card img[src^="/api/mivo/eagle/assets/"]')
+  const eagleAssetCard = page.locator('.asset-masonry-card').filter({ hasText: 'Mock Eagle Concept' })
+  if ((await eagleAssetCard.count()) !== 1) {
+    throw new Error('Assets workspace should render Eagle folder assets as masonry cards through the connector model')
   }
-  await eagleAssetTile.click()
-  await page.waitForSelector('.asset-detail-panel')
-  const eagleAssetDetail = await page.locator('.asset-detail-panel').evaluate((panel) => ({
+
+  if ((await page.locator('.eagle-tag-directory').getByRole('button', { name: /mock/i }).count()) !== 1) {
+    throw new Error('Eagle workspace should render connector tags in the tag directory')
+  }
+  await page.locator('.eagle-tag-directory').getByRole('button', { name: /mock/i }).click()
+  await page.waitForFunction(() => {
+    const heading = document.querySelector('.asset-browser .library-section-heading strong')?.textContent || ''
+    return heading.includes('Tag: mock') && document.querySelectorAll('.asset-masonry-card').length === 1
+  })
+  await page.locator('.eagle-tag-directory').getByRole('button', { name: /^All/i }).click()
+  await page.waitForFunction(() => document.querySelectorAll('.asset-masonry-card').length === 1)
+
+  const eagleCardCopy = await eagleAssetCard.evaluate((card) => ({
+    title: card.querySelector('strong')?.textContent,
+    summary: card.querySelector('small')?.textContent,
+  }))
+  if (
+    eagleCardCopy.title !== 'Mock Eagle Concept' ||
+    !eagleCardCopy.summary?.includes('SVG') ||
+    !eagleCardCopy.summary.includes('120 x 90')
+  ) {
+    throw new Error(`Eagle masonry card should show compact image metadata: ${JSON.stringify(eagleCardCopy)}`)
+  }
+  await eagleAssetCard.click()
+  await page.waitForSelector('.asset-lightbox-panel')
+  await page.waitForFunction(() => {
+    const preview = document.querySelector('.asset-lightbox-image')
+    return preview && !preview.classList.contains('loading')
+  })
+  const eagleAssetPreview = await page.locator('.asset-lightbox-panel').evaluate((panel) => ({
     title: panel.querySelector('h2')?.textContent,
     source: panel.querySelector('.library-kicker')?.textContent,
     copy: panel.textContent,
+    imageState: panel.querySelector('.asset-lightbox-image')?.getAttribute('class'),
   }))
   if (
-    eagleAssetDetail.title !== 'Mock Eagle Concept' ||
-    eagleAssetDetail.source !== 'Eagle libraries' ||
-    !eagleAssetDetail.copy?.includes('120 x 90') ||
-    !eagleAssetDetail.copy.includes('mock, eagle') ||
-    !eagleAssetDetail.copy.includes('https://example.com/mock-eagle-concept')
+    eagleAssetPreview.title !== 'Mock Eagle Concept' ||
+    eagleAssetPreview.source !== 'Eagle libraries' ||
+    !eagleAssetPreview.copy?.includes('120 x 90') ||
+    !eagleAssetPreview.imageState?.includes('ready')
   ) {
-    throw new Error(`Single-clicking an Eagle asset should open connector metadata details: ${JSON.stringify(eagleAssetDetail)}`)
+    throw new Error(`Single-clicking an Eagle asset should open the current lightbox preview: ${JSON.stringify(eagleAssetPreview)}`)
   }
+  await page.getByRole('button', { name: 'Close asset preview' }).click()
+  await page.waitForSelector('.asset-lightbox-panel', { state: 'detached' })
   await page.getByRole('button', { name: /Local folders/i }).click()
   await page.waitForSelector('.asset-tile img[src^="/api/mivo/local-assets/"]')
   const localAssetTile = page.getByRole('button', { name: /mivo-local-fixture/i })
@@ -1155,8 +1285,8 @@ try {
   })
   await localAssetTile.click()
   await page.waitForSelector('.asset-detail-panel')
-  if ((await page.locator('.canvas-shell').count()) !== 0) {
-    throw new Error('Single-clicking an asset should open details without entering the canvas')
+  if ((await page.locator('.asset-library-drawer').count()) !== 1 || (await page.locator('.canvas-shell').count()) !== 1) {
+    throw new Error('Single-clicking a drawer asset should open details while keeping the canvas behind the drawer')
   }
   const localAssetDetail = await page.locator('.asset-detail-panel').evaluate((panel) => ({
     title: panel.querySelector('h2')?.textContent,
@@ -1170,7 +1300,7 @@ try {
   ) {
     throw new Error(`Single-clicking a local asset should open metadata details: ${JSON.stringify(localAssetDetail)}`)
   }
-  await localAssetTile.dblclick()
+  await page.locator('.asset-detail-panel').getByRole('button', { name: 'Add to canvas' }).click()
   await page.waitForSelector('.canvas-shell')
   await page.waitForFunction(
     () =>
@@ -1191,11 +1321,11 @@ try {
     fontSize: window.getComputedStyle(heading).fontSize,
     lineHeight: window.getComputedStyle(heading).lineHeight,
   }))
-  if (libraryTypeScale.fontSize !== '28px') {
-    throw new Error(`Library heading should use the quieter workspace heading scale: ${JSON.stringify(libraryTypeScale)}`)
+  if (libraryTypeScale.fontSize !== '22px') {
+    throw new Error(`Assets drawer heading should use the compact drawer heading scale: ${JSON.stringify(libraryTypeScale)}`)
   }
-  if ((await page.locator('.canvas-shell').count()) !== 0) {
-    throw new Error('Assets should switch the main workspace away from the canvas')
+  if ((await page.locator('.canvas-shell').count()) !== 1 || (await page.locator('.asset-library-drawer').count()) !== 1) {
+    throw new Error('Assets drawer should keep a single canvas shell behind the asset browser')
   }
   for (const source of ['Local folders', 'Eagle libraries', 'Pinterest boards']) {
     if ((await page.getByRole('button', { name: source }).count()) !== 1) {
@@ -1218,14 +1348,17 @@ try {
   })
   assertLibraryLayoutStable('Assets', assetsOpenLayout, await readLibraryLayout())
   const assetsSurfaceColors = await readLibrarySurfaceColors()
-  if (
-    !assetsSurfaceColors.hasLibraryActiveClass ||
-    assetsSurfaceColors.appBackground !== assetsSurfaceColors.workspaceBackground ||
-    assetsSurfaceColors.appBackground !== assetsSurfaceColors.libraryBackground ||
-    assetsSurfaceColors.leftProbeBackground !== assetsSurfaceColors.appBackground ||
-    assetsSurfaceColors.rightProbeBackground !== assetsSurfaceColors.workspaceBackground
-  ) {
-    throw new Error(`Library surfaces should share one background with no visible middle seam: ${JSON.stringify(assetsSurfaceColors)}`)
+  const assetsDrawerState = await page.evaluate(() => ({
+    hasDrawer: Boolean(document.querySelector('.asset-library-drawer')),
+    hasCanvas: Boolean(document.querySelector('.canvas-shell')),
+    hasLibraryActiveClass: document.querySelector('.mivo-app')?.classList.contains('library-active'),
+  }))
+  if (!assetsDrawerState.hasDrawer || !assetsDrawerState.hasCanvas || assetsDrawerState.hasLibraryActiveClass) {
+    throw new Error(
+      `Assets should render as a drawer over the canvas, not as a full library workspace: state=${JSON.stringify(
+        assetsDrawerState,
+      )}, colors=${JSON.stringify(assetsSurfaceColors)}`,
+    )
   }
   await page.getByRole('button', { name: 'Open projects' }).hover()
   await page.mouse.move(1510, 890)
@@ -3429,14 +3562,16 @@ try {
   await page.waitForSelector('.details-dialog', { state: 'detached' })
 
   const countBeforeGenerate = await page.locator('.dom-node').count()
+  await page.locator('.canvas-ai-action-bar').getByRole('button', { name: '生成' }).click()
+  await page.locator('.ai-prompt-box textarea').fill('e2e derived concept image')
   await page.getByRole('button', { name: '立即生成' }).click()
-  await page.waitForFunction((count) => document.querySelectorAll('.dom-node').length === count + 1, countBeforeGenerate)
+  await page.waitForFunction((count) => document.querySelectorAll('.dom-node').length >= count + 2, countBeforeGenerate)
 
   const generatedCount = await page.locator('.dom-node').count()
-  if (generatedCount !== countBeforeGenerate + 1) {
-    throw new Error(`Expected ${countBeforeGenerate + 1} nodes after generation, got ${generatedCount}`)
+  if (generatedCount < countBeforeGenerate + 2) {
+    throw new Error(`Expected at least ${countBeforeGenerate + 2} nodes after generation result + edge, got ${generatedCount}`)
   }
-  const besideResult = await page.locator('.dom-node').last().evaluate((node) => ({
+  const besideResult = await page.locator('.dom-node[data-ai-kind="result"][data-ai-operation="beside-generation"]').last().evaluate((node) => ({
     kind: node.getAttribute('data-ai-kind'),
     operation: node.getAttribute('data-ai-operation'),
     sourceNodeIds: node.getAttribute('data-ai-source-node-ids'),
@@ -3456,8 +3591,8 @@ try {
   const slotNodeId = await page.locator('.dom-node.ai-slot-node').last().getAttribute('data-node-id')
   if (!slotNodeId) throw new Error('AI slot creation should produce a selectable slot node')
   await page.getByRole('button', { name: '生成到槽位' }).click()
-  await page.waitForFunction((count) => document.querySelectorAll('.dom-node').length === count + 2, countBeforeSlot)
-  const slotResult = await page.locator('.dom-node').last().evaluate((node) => ({
+  await page.waitForFunction((count) => document.querySelectorAll('.dom-node').length >= count + 3, countBeforeSlot)
+  const slotResult = await page.locator('.dom-node[data-ai-kind="result"][data-ai-operation="slot-generation"]').last().evaluate((node) => ({
     kind: node.getAttribute('data-ai-kind'),
     operation: node.getAttribute('data-ai-operation'),
     sourceNodeIds: node.getAttribute('data-ai-source-node-ids'),
@@ -3478,8 +3613,8 @@ try {
   const annotationNodeId = await page.locator('.dom-node.annotation-node').last().getAttribute('data-node-id')
   if (!annotationNodeId) throw new Error('Annotation creation should produce a selectable note node')
   await page.getByRole('button', { name: '从批注生成' }).click()
-  await page.waitForFunction((count) => document.querySelectorAll('.dom-node').length === count + 2, countBeforeAnnotation)
-  const annotationResult = await page.locator('.dom-node').last().evaluate((node) => ({
+  await page.waitForFunction((count) => document.querySelectorAll('.dom-node').length >= count + 3, countBeforeAnnotation)
+  const annotationResult = await page.locator('.dom-node[data-ai-kind="result"][data-ai-operation="annotation-edit"]').last().evaluate((node) => ({
     kind: node.getAttribute('data-ai-kind'),
     operation: node.getAttribute('data-ai-operation'),
     sourceNodeIds: node.getAttribute('data-ai-source-node-ids'),
@@ -3592,7 +3727,7 @@ try {
   )
 
   await page.getByRole('button', { name: 'Reset view' }).click()
-  const countBeforeTransparentPaste = await page.locator('.dom-node').count()
+  const countBeforeTransparentPaste = await page.locator('.dom-node[data-node-type="image"]').count()
   await page.evaluate(async () => {
     const canvas = document.createElement('canvas')
     canvas.width = 128
@@ -3617,15 +3752,16 @@ try {
     window.dispatchEvent(event)
   })
   await page.waitForFunction(
-    (count) => document.querySelectorAll('.dom-node').length === count + 1,
+    (count) => document.querySelectorAll('.dom-node[data-node-type="image"]').length === count + 1,
     countBeforeTransparentPaste,
   )
-  await page.locator('.dom-node').last().locator('.dom-node-media img').waitFor({ state: 'visible' })
+  const transparentImageNode = page.locator('.dom-node[data-node-type="image"]').last()
+  await transparentImageNode.locator('.dom-node-media img').waitFor({ state: 'visible' })
   await page.waitForFunction(() => {
-    const image = [...document.querySelectorAll('.dom-node')].at(-1)?.querySelector('.dom-node-media img')
+    const image = [...document.querySelectorAll('.dom-node[data-node-type="image"]')].at(-1)?.querySelector('.dom-node-media img')
     return image instanceof HTMLImageElement && image.complete && image.naturalWidth > 0
   })
-  const transparentPasteRender = await page.locator('.dom-node').last().evaluate((node) => {
+  const transparentPasteRender = await transparentImageNode.evaluate((node) => {
     const media = node.querySelector('.dom-node-media')
     const image = node.querySelector('.dom-node-media img')
     const nodeStyle = window.getComputedStyle(node)
@@ -3663,6 +3799,163 @@ try {
     transparentPasteRender.naturalHeight !== 128
   ) {
     throw new Error(`Transparent PNG paste should keep the original image frame while rendering alpha transparently: ${JSON.stringify(transparentPasteRender)}`)
+  }
+
+  const assertMaskFloatingControlsSeparated = async () => {
+    const layout = await page.evaluate(() => {
+      const boundsFor = (selector) => {
+        const element = document.querySelector(selector)
+        if (!element) return undefined
+        const rect = element.getBoundingClientRect()
+        return {
+          left: rect.left,
+          top: rect.top,
+          right: rect.right,
+          bottom: rect.bottom,
+          width: rect.width,
+          height: rect.height,
+        }
+      }
+      const toolbar = boundsFor('.image-mask-edit-toolbar')
+      const prompt = boundsFor('.image-mask-edit-prompt')
+      const overlaps =
+        toolbar &&
+        prompt &&
+        !(toolbar.right <= prompt.left || prompt.right <= toolbar.left || toolbar.bottom <= prompt.top || prompt.bottom <= toolbar.top)
+
+      return { toolbar, prompt, overlaps: Boolean(overlaps) }
+    })
+
+    if (!layout.toolbar || !layout.prompt || layout.overlaps) {
+      throw new Error(`Mask floating toolbar and prompt should not overlap: ${JSON.stringify(layout)}`)
+    }
+  }
+
+  const addHorizontalMaskSource = async () => {
+    const spec = await canvasStoreSpec()
+    return page.evaluate(async ({ moduleSpec, assetUrl }) => {
+      const { useCanvasStore } = await import(moduleSpec)
+      useCanvasStore.getState().addImportedImage(assetUrl, 'E2E horizontal mask source', 'source', { x: -280, y: 260 }, {
+        dimensions: { width: 1600, height: 900 },
+        mimeType: 'image/svg+xml',
+        originalName: 'e2e-horizontal-mask-source.svg',
+      })
+      return useCanvasStore.getState().selectedNodeId
+    }, { moduleSpec: spec, assetUrl: horizontalMaskSourceB64 })
+  }
+
+  const drawMaskRegion = async (toolId) => {
+    const stage = await page.locator('.image-mask-edit-stage').boundingBox()
+    if (!stage) throw new Error('Mask edit stage should be visible')
+
+    if (toolId === 'point') {
+      await page.mouse.click(stage.x + stage.width * 0.52, stage.y + stage.height * 0.5)
+      return
+    }
+
+    if (toolId === 'box') {
+      await page.mouse.move(stage.x + stage.width * 0.38, stage.y + stage.height * 0.42)
+      await page.mouse.down()
+      await page.mouse.move(stage.x + stage.width * 0.65, stage.y + stage.height * 0.6, { steps: 8 })
+      await page.mouse.up()
+      return
+    }
+
+    await page.mouse.move(stage.x + stage.width * 0.34, stage.y + stage.height * 0.42)
+    await page.mouse.down()
+    await page.mouse.move(stage.x + stage.width * 0.45, stage.y + stage.height * 0.48, { steps: 4 })
+    await page.mouse.move(stage.x + stage.width * 0.58, stage.y + stage.height * 0.54, { steps: 4 })
+    await page.mouse.move(stage.x + stage.width * 0.7, stage.y + stage.height * 0.58, { steps: 4 })
+    await page.mouse.up()
+  }
+
+  const imageCountFor = (state) => state.nodes.filter((node) => node.type === 'image').length
+  const verifyMaskEditFlow = async ({ sourceNodeId, sourceLabel, toolId, toolLabel }) => {
+    await page.locator(`[data-node-id="${sourceNodeId}"]`).click()
+    await page.locator('.canvas-ai-action-bar').getByRole('button', { name: '局部重绘' }).click()
+    await page.waitForSelector('.image-mask-edit-stage')
+    await assertMaskFloatingControlsSeparated()
+    await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: toolLabel, exact: true }).click()
+    await drawMaskRegion(toolId)
+    await page.waitForFunction(() => Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0') > 0)
+    const regionCount = Number(await page.locator('.image-mask-edit-overlay').getAttribute('data-region-count'))
+    const before = await readCanvasState()
+    const beforeSourceEditEdges = before.edges.filter((edge) => edge.from === sourceNodeId && edge.type === 'edit').length
+    const editRequestCountBefore = mivoEditRequests.length
+    await page.locator('.image-mask-edit-prompt textarea').fill(`E2E ${sourceLabel} ${toolId} repaint`)
+    const editResponse = page.waitForResponse((response) => response.url().includes('/api/mivo/edit') && response.status() === 200)
+    await page.locator('.image-mask-edit-prompt').getByRole('button', { name: '局部重绘' }).click()
+    await editResponse
+    await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
+    await waitForCanvasState(
+      (state, payload) =>
+        state.nodes.filter((node) => node.type === 'image').length >= payload.minImageCount &&
+        state.edges.length >= payload.minEdgeCount,
+      {
+        minImageCount: imageCountFor(before) + 1,
+        minEdgeCount: before.edges.length + 1,
+      },
+    )
+    const after = await readCanvasState()
+    const editEdges = after.edges.filter((edge) => edge.from === sourceNodeId && edge.type === 'edit')
+    const resultNode = after.nodes.find((node) => editEdges.some((edge) => edge.to === node.id))
+    const latestRequest = mivoEditRequests.at(-1)
+
+    if (mivoEditRequests.length !== editRequestCountBefore + 1) {
+      throw new Error(`${sourceLabel}/${toolId} should issue exactly one edit request`)
+    }
+    if (!latestRequest?.fileKeys.includes('image:1') || !latestRequest.fileKeys.includes('mask:1')) {
+      throw new Error(`${sourceLabel}/${toolId} edit request should include image and mask: ${JSON.stringify(latestRequest)}`)
+    }
+    if (!after.nodes.some((node) => node.id === sourceNodeId && node.type === 'image')) {
+      throw new Error(`${sourceLabel}/${toolId} should keep the source image`)
+    }
+    if (imageCountFor(after) < imageCountFor(before) + 1) {
+      throw new Error(`${sourceLabel}/${toolId} should create a new image node`)
+    }
+    if (editEdges.length < beforeSourceEditEdges + 1 || !resultNode) {
+      throw new Error(`${sourceLabel}/${toolId} should create a derived edit edge`)
+    }
+
+    return {
+      source: sourceLabel,
+      tool: toolId,
+      regionCount,
+      imagesBefore: imageCountFor(before),
+      imagesAfter: imageCountFor(after),
+      editEdgesFromSource: editEdges.length,
+      requestFiles: latestRequest.fileKeys,
+    }
+  }
+
+  await page.evaluate(async () => {
+    const resource = performance.getEntriesByType('resource')
+      .map((entry) => entry.name)
+      .find((name) => name.includes('/src/store/canvasStore.ts'))
+    const moduleSpec = resource ? new URL(resource).pathname + new URL(resource).search : '/src/store/canvasStore.ts'
+    const { useCanvasStore } = await import(moduleSpec)
+    useCanvasStore.getState().loadScene('character-flow')
+    useCanvasStore.getState().resetCurrentScene()
+  })
+  await page.waitForSelector('[data-node-id="ref-hero"]')
+  const horizontalMaskSourceId = await addHorizontalMaskSource()
+  if (!horizontalMaskSourceId) throw new Error('Horizontal mask source should be created')
+
+  const maskEditSmokeResults = []
+  for (const source of [
+    { sourceNodeId: 'ref-hero', sourceLabel: 'vertical' },
+    { sourceNodeId: horizontalMaskSourceId, sourceLabel: 'horizontal' },
+  ]) {
+    for (const tool of [
+      { toolId: 'point', toolLabel: '点选' },
+      { toolId: 'box', toolLabel: '框选' },
+      { toolId: 'brush', toolLabel: '涂抹' },
+    ]) {
+      maskEditSmokeResults.push(await verifyMaskEditFlow({ ...source, ...tool }))
+    }
+  }
+  if (maskEditSmokeResults.some((result) => result.regionCount < 1)) {
+    throw new Error(`Mask edit smoke should mark at least one region per tool: ${JSON.stringify(maskEditSmokeResults)}`)
   }
 
   await page.screenshot({ path: 'test-artifacts/e2e-smoke.png', fullPage: true })
