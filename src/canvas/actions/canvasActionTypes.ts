@@ -1,5 +1,5 @@
 import type { LucideIcon } from 'lucide-react'
-import type { DistributionAxis, SelectionAlignment } from '../../store/canvasStore'
+import type { CanvasGenerationOptions, DistributionAxis, SelectionAlignment } from '../../store/canvasStore'
 import type {
   AiWorkflowOperation,
   MarkupKind,
@@ -108,9 +108,22 @@ export type CanvasActionRuntime = {
   removeSectionOnly: (nodeId: string) => void
   selectNodes: (nodeIds: string[], primaryNodeId?: string) => void
   generateVariations: (sourceNodeId?: string) => void
-  generateImageEdit: (sourceNodeId: string | undefined, operation: AiWorkflowOperation, prompt: string) => void
-  generateBesideNode: (sourceNodeId?: string, prompt?: string) => void
-  generateIntoAiSlot: (slotId?: string, prompt?: string) => void
+  generateImageEdit: (
+    sourceNodeId: string | undefined,
+    operation: AiWorkflowOperation,
+    prompt: string,
+    options?: CanvasGenerationOptions,
+  ) => Promise<void>
+  generateBesideNode: (
+    sourceNodeId?: string,
+    prompt?: string,
+    options?: CanvasGenerationOptions,
+  ) => Promise<void>
+  generateIntoAiSlot: (
+    slotId?: string,
+    prompt?: string,
+    options?: CanvasGenerationOptions,
+  ) => Promise<void>
   generateFromAnnotation: (annotationNodeId?: string) => void
   duplicateNode: (nodeId: string) => void
   duplicateSelectedNodes: () => void

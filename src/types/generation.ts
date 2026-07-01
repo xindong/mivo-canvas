@@ -1,5 +1,26 @@
 import type { CanvasMaskBounds, CanvasTask, MivoCanvasNode } from './mivoCanvas'
 
+export type MivoImageRatio = '1:1' | '3:2' | '2:3' | '16:9' | '9:16'
+export type MivoImageQuality = 'low' | 'medium' | 'high'
+
+export type MivoGenerateRequest = {
+  prompt: string
+  imgRatio?: MivoImageRatio
+  quality?: MivoImageQuality
+  n?: number
+  model?: string
+}
+
+export type MivoEditRequest = MivoGenerateRequest & {
+  image: Blob
+  mask?: Blob
+  reference?: Blob[]
+}
+
+export type MivoImageResponse = {
+  images: Array<{ b64: string }>
+}
+
 export type GenerationRequest = {
   sourceNode: MivoCanvasNode
   count: number

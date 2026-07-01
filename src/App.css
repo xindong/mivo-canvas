@@ -3766,11 +3766,12 @@ button:disabled {
 
 .ai-panel {
   position: absolute;
-  top: 12px;
   right: var(--ai-panel-offset);
   bottom: 12px;
+  top: auto;
   z-index: 8;
   width: min(var(--ai-panel-w), calc(100% - 28px));
+  max-height: min(680px, calc(100% - 28px));
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
   overflow: hidden;
@@ -3785,6 +3786,7 @@ button:disabled {
   grid-template-rows: auto auto auto auto minmax(0, 1fr);
   justify-items: center;
   width: var(--ai-panel-collapsed-w);
+  max-height: none;
   gap: 9px;
   padding: 12px 8px;
   border-radius: var(--radius-lg);
@@ -3991,6 +3993,56 @@ button:disabled {
   font-style: normal;
 }
 
+.ai-reference-list {
+  display: grid;
+  gap: 7px;
+}
+
+.ai-reference-chip {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) 28px;
+  align-items: center;
+  min-height: 42px;
+  gap: 9px;
+  padding: 5px 7px;
+  background: rgba(255, 250, 240, 0.86);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.ai-reference-thumb {
+  width: 34px;
+  height: 30px;
+  object-fit: cover;
+  background: #e8dfd1;
+  border-radius: 6px;
+}
+
+.ai-reference-chip span {
+  min-width: 0;
+  overflow: hidden;
+  color: #4f4840;
+  font-size: 12px;
+  font-weight: 760;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ai-reference-remove {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  color: var(--muted);
+  background: transparent;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.ai-reference-remove:hover {
+  color: #fffaf0;
+  background: var(--charcoal);
+}
+
 .context-pills {
   display: flex;
   flex-wrap: wrap;
@@ -4065,13 +4117,35 @@ button:disabled {
 }
 
 .ai-run-options {
-  display: grid;
-  grid-template-columns: 74px 84px minmax(110px, 1fr);
+  display: flex;
+  flex-wrap: wrap;
   gap: 7px;
 }
 
 .ai-run-options button {
+  height: 34px;
   padding: 0 9px;
+}
+
+.ai-run-options button.active {
+  color: #fffaf0;
+  background: var(--charcoal);
+  border-color: var(--charcoal);
+}
+
+.ai-run-options button:disabled {
+  opacity: 0.56;
+}
+
+.ai-generation-error {
+  padding: 8px 10px;
+  color: #9d362f;
+  background: rgba(185, 71, 58, 0.1);
+  border: 1px solid rgba(185, 71, 58, 0.22);
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 760;
+  line-height: 1.35;
 }
 
 .ai-generate {
@@ -4090,6 +4164,12 @@ button:disabled {
 
 .ai-generate:hover {
   background: #37423d;
+}
+
+.ai-generate:disabled {
+  background: #5e6762;
+  cursor: progress;
+  opacity: 0.74;
 }
 
 .details-dialog-backdrop {

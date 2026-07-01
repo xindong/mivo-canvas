@@ -107,11 +107,11 @@ const makeVariations = (runtime: CanvasActionRuntime) => {
 }
 
 const generateBesidePrimary = (runtime: CanvasActionRuntime) => {
-  runtime.generateBesideNode(primaryNodeId(runtime))
+  void runtime.generateBesideNode(primaryNodeId(runtime))
 }
 
 const generateIntoPrimarySlot = (runtime: CanvasActionRuntime) => {
-  runtime.generateIntoAiSlot(primaryNodeId(runtime))
+  void runtime.generateIntoAiSlot(primaryNodeId(runtime))
 }
 
 const addAnnotationForPrimary = (runtime: CanvasActionRuntime) => {
@@ -142,7 +142,7 @@ const generateImageEditForPrimary = (
   operation: Parameters<CanvasActionRuntime['generateImageEdit']>[1],
   prompt: string,
 ) => {
-  runtime.generateImageEdit(primaryNodeId(runtime), operation, prompt)
+  void runtime.generateImageEdit(primaryNodeId(runtime), operation, prompt)
 }
 
 const imageAiEditActionsFor = (runtime: CanvasActionRuntime): CanvasActionItem[] => [
@@ -887,7 +887,7 @@ export const contextMenuGroupsFor = (runtime: CanvasActionRuntime): CanvasAction
                     return
                   }
                   if (context.primaryNode?.type === 'ai-slot' && context.primaryNode.id) {
-                    runtime.generateIntoAiSlot(context.primaryNode.id)
+                    void runtime.generateIntoAiSlot(context.primaryNode.id)
                     return
                   }
                   runtime.onOpenDetails?.()

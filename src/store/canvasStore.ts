@@ -32,14 +32,26 @@ import {
 } from '../lib/canvasAssetImport'
 import { importedImageDisplaySize, type ImportedImageMetadata } from '../lib/imageSizing'
 import { saveGeneratedAsset } from '../lib/assetStorage'
+import { assetBlobForNode, editMivoImage, generateMivoImage } from '../lib/mivoImageClient'
 import { buildAiContextSnapshot, chooseAdjacentPlacement } from './aiCanvasWorkflow'
 import { makeNode, realCaseImages, scenes, snapshotFromScene } from './demoScenes'
 import { mockGenerationAdapter } from './mockGeneration'
-import type { CommitGenerationResultPayload, CommittedGenerationImage } from '../types/generation'
+import type {
+  CommitGenerationResultPayload,
+  CommittedGenerationImage,
+  MivoImageQuality,
+  MivoImageRatio,
+} from '../types/generation'
 
 type LayerMove = 'forward' | 'backward' | 'front' | 'back'
 export type SelectionAlignment = 'left' | 'center' | 'right' | 'top' | 'middle' | 'bottom'
 export type DistributionAxis = 'horizontal' | 'vertical'
+export type CanvasGenerationOptions = {
+  imgRatio?: MivoImageRatio
+  quality?: MivoImageQuality
+  model?: string
+  referenceFiles?: File[]
+}
 
 type CanvasState = {
   canvases: Record<CanvasId, CanvasDocument>
@@ -184,9 +196,22 @@ type CanvasState = {
   ) => void
   resizeTextNode: (nodeId: string, x: number, width: number, height: number) => void
   generateVariations: (sourceNodeId?: string) => void
-  generateImageEdit: (sourceNodeId: string | undefined, operation: AiWorkflowOperation, prompt: string) => void
-  generateBesideNode: (sourceNodeId?: string, prompt?: string) => void
-  generateIntoAiSlot: (slotId?: string, prompt?: string) => void
+  generateImageEdit: (
+    sourceNodeId: string | undefined,
+    operation: AiWorkflowOperation,
+    prompt: string,
+    options?: CanvasGenerationOptions,
+  ) => Promise<void>
+  generateBesideNode: (
+    sourceNodeId?: string,
+    prompt?: string,
+    options?: CanvasGenerationOptions,
+  ) => Promise<void>
+  generateIntoAiSlot: (
+    slotId?: string,
+    prompt?: string,
+    options?: CanvasGenerationOptions,
+  ) => Promise<void>
   generateFromAnnotation: (annotationNodeId?: string) => void
   commitGenerationResult: (payload: CommitGenerationResultPayload) => Promise<string[]>
   toggleFavorite: (nodeId: string) => void
@@ -633,6 +658,7 @@ const nodePrompt = (node: MivoCanvasNode | undefined, fallback = '基于当前�
   node?.text?.trim() || node?.generation?.prompt || node?.aiWorkflow?.prompt || fallback
 
 const mockResultAssetUrl = (nodes: MivoCanvasNode[]) => realCaseImages[nodes.length % realCaseImages.length]
+const defaultMivoImageModel = 'gpt-image-2'
 
 const importedAssetDisplaySize = (type: CanvasAssetNodeType, metadata?: ImportedFileMetadata) => {
   if (type === 'image' || type === 'video') {
@@ -698,6 +724,26 @@ const displaySizeForGeneratedAsset = (
   asset: GeneratedAssetRecord,
   fallbackSize: { width: number; height: number },
 ) => asset.sourceDimensions ? importedImageDisplaySize(asset.sourceDimensions) : fallbackSize
+
+const upsertTask = (tasks: CanvasTask[], task: CanvasTask) => [
+  task,
+  ...tasks.filter((item) => item.id !== task.id),
+].slice(0, 5)
+
+const failedTask = (task: CanvasTask, label: string): CanvasTask => ({
+  ...task,
+  label,
+  status: 'failed',
+  progress: 100,
+})
+
+const doneTask = (task: CanvasTask, label: string, nodeIds: string[]): CanvasTask => ({
+  ...task,
+  label,
+  status: 'done',
+  progress: 100,
+  nodeIds,
+})
 
 const selectedNodesFromState = (state: CanvasState) => {
   const selected = state.selectedNodeIds.length ? state.selectedNodeIds : state.selectedNodeId ? [state.selectedNodeId] : []
@@ -2078,9 +2124,8 @@ export const useCanvasStore = create<CanvasState>()(
           }),
         }))
       },
-      generateImageEdit: (sourceNodeId, operation, prompt) => {
-        const id = createNodeId(`ai-${operation}`)
-        const createdAt = Date.now()
+      generateImageEdit: async (sourceNodeId, operation, prompt, options = {}) => {
+        const taskId = createNodeId(`task-${operation}`)
         const operationLabels: Record<string, string> = {
           'prompt-edit': 'Prompt edit',
           'area-edit': 'Area edit',
@@ -2088,249 +2133,231 @@ export const useCanvasStore = create<CanvasState>()(
           outpaint: 'Expand image',
           upscale: 'Boost resolution',
         }
+        const operationLabel = operationLabels[operation] || 'Image edit'
+        const state = get()
+        const source =
+          state.nodes.find((node) => node.id === sourceNodeId && node.type === 'image' && !node.hidden) ||
+          state.nodes.find((node) => node.id === state.selectedNodeId && node.type === 'image' && !node.hidden)
+        if (!source) return
 
-        set((state) => {
-          const source =
-            state.nodes.find((node) => node.id === sourceNodeId && node.type === 'image' && !node.hidden) ||
-            state.nodes.find((node) => node.id === state.selectedNodeId && node.type === 'image' && !node.hidden)
-          if (!source) return {}
+        const resultPrompt = prompt.trim() || operationLabel
+        const model = options.model || defaultMivoImageModel
+        const runningTask: CanvasTask = {
+          id: taskId,
+          label: `${operationLabel}: ${source.title}`,
+          status: 'running',
+          progress: 20,
+          nodeIds: [],
+        }
 
-          const operationLabel = operationLabels[operation] || 'Image edit'
-          const resultPrompt = prompt.trim() || operationLabel
-          const width = operation === 'outpaint' ? Math.round(source.width * 1.16) : source.width
-          const height = operation === 'outpaint' ? Math.round(source.height * 1.16) : source.height
-          const placement = chooseAdjacentPlacement({
-            nodes: state.nodes,
-            anchor: source,
-            width,
-            height,
-            placement: 'right',
-          })
-          const result = makeNode({
-            id,
-            type: 'image',
-            title: `${operationLabel} for ${source.title}`,
-            x: Math.round(placement.x),
-            y: Math.round(placement.y),
-            width: Math.round(width),
-            height: Math.round(height),
-            assetUrl: mockResultAssetUrl(state.nodes),
-            status: 'ready',
-            parentIds: [source.id],
-            sourceNodeId: source.id,
-            generation: {
-              prompt: resultPrompt,
-              model: 'Mivo Mock Image Workflow',
-              size: `${Math.round(width)}x${Math.round(height)}`,
-              seed: createdAt % 99999,
-              strength: operation === 'upscale' ? 0.28 : 0.62,
-              taskId: `task-${id}`,
-              createdAt,
-            },
-            aiWorkflow: {
-              kind: 'result',
-              status: 'ready',
-              operation,
-              prompt: resultPrompt,
-              sourceNodeIds: [source.id],
-              anchorNodeId: source.id,
-              placement: 'right',
-              createdAt,
-            },
-          })
-          const task: CanvasTask = {
-            id: `task-${id}`,
-            label: `${operationLabel}: ${source.title}`,
-            status: 'done',
-            progress: 100,
-            nodeIds: [id],
-          }
-          const edge: CanvasEdge = {
-            id: createEdgeId(),
-            from: source.id,
-            to: id,
-            type: edgeTypeForOperation(operation),
+        set((current) => patchActiveCanvas(current, { tasks: upsertTask(current.tasks, runningTask) }))
+
+        try {
+          const image = await assetBlobForNode(source)
+          const response = await editMivoImage({
+            image,
+            reference: options.referenceFiles,
             prompt: resultPrompt,
-            createdAt,
-          }
-
-          return patchWithHistory(state, {
-            selectedNodeId: id,
-            selectedNodeIds: [id],
-            nodes: normalizeCanvasNodes([...state.nodes, result]),
-            edges: [...state.edges, edge],
-            tasks: [task, ...state.tasks].slice(0, 5),
+            imgRatio: options.imgRatio || '1:1',
+            quality: options.quality || 'medium',
+            model,
           })
-        })
-      },
-      generateBesideNode: (sourceNodeId, prompt) => {
-        const id = createNodeId('ai-result')
-        const createdAt = Date.now()
-
-        set((state) => {
-          const source =
-            state.nodes.find((node) => node.id === sourceNodeId && !node.hidden) ||
-            state.nodes.find((node) => node.id === state.selectedNodeId && !node.hidden) ||
-            state.nodes.find((node) => !node.hidden)
-          if (!source) return {}
-
-          const width = source.type === 'text' || source.type === 'annotation' ? 320 : source.width
-          const height = source.type === 'text' || source.type === 'annotation' ? 240 : source.height
-          const placement = chooseAdjacentPlacement({
-            nodes: state.nodes,
-            anchor: source,
-            width,
-            height,
-            placement: 'right',
-          })
-          const resultPrompt = prompt?.trim() || nodePrompt(source)
-          const result = makeNode({
-            id,
-            type: 'image',
-            title: `AI result from ${source.title}`,
-            x: Math.round(placement.x),
-            y: Math.round(placement.y),
-            width: Math.round(width),
-            height: Math.round(height),
-            assetUrl: mockResultAssetUrl(state.nodes),
-            status: 'ready',
-            parentIds: [source.id],
+          const nodeIds = await get().commitGenerationResult({
             sourceNodeId: source.id,
-            generation: {
-              prompt: resultPrompt,
-              model: 'Mivo Mock Image Workflow',
-              size: `${Math.round(width)}x${Math.round(height)}`,
-              seed: createdAt % 99999,
-              strength: 0.58,
-              taskId: `task-${id}`,
-              createdAt,
-            },
-            aiWorkflow: {
-              kind: 'result',
-              status: 'ready',
-              operation: 'beside-generation',
-              prompt: resultPrompt,
-              sourceNodeIds: [source.id],
-              anchorNodeId: source.id,
-              placement: 'right',
-              createdAt,
-            },
-          })
-          const task: CanvasTask = {
-            id: `task-${id}`,
-            label: `旁边生成：${source.title}`,
-            status: 'done',
-            progress: 100,
-            nodeIds: [id],
-          }
-          const edge: CanvasEdge = {
-            id: createEdgeId(),
-            from: source.id,
-            to: id,
-            type: 'generate',
+            resultImages: response.images,
             prompt: resultPrompt,
-            createdAt,
-          }
-
-          return patchWithHistory(state, {
-            selectedNodeId: id,
-            selectedNodeIds: [id],
-            nodes: normalizeCanvasNodes([...state.nodes, result]),
-            edges: [...state.edges, edge],
-            tasks: [task, ...state.tasks].slice(0, 5),
+            model,
+            kind: edgeTypeForOperation(operation),
+            taskId,
           })
-        })
+          set((current) =>
+            patchActiveCanvas(current, {
+              tasks: upsertTask(current.tasks, doneTask(runningTask, `${operationLabel}: ${source.title}`, nodeIds)),
+            }),
+          )
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Image edit failed'
+          set((current) =>
+            patchActiveCanvas(current, {
+              tasks: upsertTask(current.tasks, failedTask(runningTask, `${operationLabel} failed: ${message}`)),
+            }),
+          )
+          throw error
+        }
       },
-      generateIntoAiSlot: (slotId, prompt) => {
-        const id = createNodeId('slot-result')
-        const createdAt = Date.now()
+      generateBesideNode: async (sourceNodeId, prompt, options = {}) => {
+        const state = get()
+        const source =
+          state.nodes.find((node) => node.id === sourceNodeId && !node.hidden) ||
+          state.nodes.find((node) => node.id === state.selectedNodeId && !node.hidden) ||
+          state.nodes.find((node) => !node.hidden)
+        if (!source) return
 
-        set((state) => {
-          const slot =
-            state.nodes.find((node) => node.id === slotId && node.type === 'ai-slot' && !node.hidden) ||
-            state.nodes.find((node) => node.id === state.selectedNodeId && node.type === 'ai-slot' && !node.hidden)
-          if (!slot) return {}
+        const resultPrompt = prompt?.trim() || nodePrompt(source)
+        const model = options.model || defaultMivoImageModel
+        const taskId = createNodeId('task-beside-generation')
+        const runningTask: CanvasTask = {
+          id: taskId,
+          label: `旁边生成：${source.title}`,
+          status: 'running',
+          progress: 20,
+          nodeIds: [],
+        }
 
-          const resultPrompt = prompt?.trim() || nodePrompt(slot, '根据 AI 槽位生成图片')
-          const result = makeNode({
-            id,
-            type: 'image',
-            title: `Generated for ${slot.title}`,
-            x: slot.x,
-            y: slot.y,
-            width: slot.width,
-            height: slot.height,
-            assetUrl: mockResultAssetUrl(state.nodes),
-            status: 'ready',
-            parentIds: [slot.id],
-            sourceNodeId: slot.id,
-            generation: {
-              prompt: resultPrompt,
-              model: 'Mivo Mock Image Workflow',
-              size: `${Math.round(slot.width)}x${Math.round(slot.height)}`,
-              seed: createdAt % 99999,
-              strength: 0.62,
-              taskId: `task-${id}`,
-              createdAt,
-            },
-            aiWorkflow: {
-              kind: 'result',
-              status: 'ready',
-              operation: 'slot-generation',
-              prompt: resultPrompt,
-              sourceNodeIds: [slot.id],
-              slotId: slot.id,
-              anchorNodeId: slot.id,
-              placement: 'slot',
-              createdAt,
-            },
+        set((current) => patchActiveCanvas(current, { tasks: upsertTask(current.tasks, runningTask) }))
+
+        try {
+          const referenceFiles = options.referenceFiles || []
+          const sourceImage = source.type === 'image' && source.assetUrl ? await assetBlobForNode(source) : undefined
+          const editImage = sourceImage || referenceFiles[0]
+          const response = editImage
+            ? await editMivoImage({
+                image: editImage,
+                reference: sourceImage ? referenceFiles : referenceFiles.slice(1),
+                prompt: resultPrompt,
+                imgRatio: options.imgRatio || '1:1',
+                quality: options.quality || 'medium',
+                model,
+              })
+            : await generateMivoImage({
+                prompt: resultPrompt,
+                imgRatio: options.imgRatio || '1:1',
+                quality: options.quality || 'medium',
+                n: 1,
+                model,
+              })
+          const nodeIds = await get().commitGenerationResult({
+            sourceNodeId: source.id,
+            resultImages: response.images,
+            prompt: resultPrompt,
+            model,
+            kind: 'generate',
+            taskId,
           })
-          const nodes = state.nodes.map((node) =>
+          set((current) =>
+            patchActiveCanvas(current, {
+              tasks: upsertTask(current.tasks, doneTask(runningTask, `旁边生成：${source.title}`, nodeIds)),
+            }),
+          )
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Generation failed'
+          set((current) =>
+            patchActiveCanvas(current, {
+              tasks: upsertTask(current.tasks, failedTask(runningTask, `旁边生成失败：${message}`)),
+            }),
+          )
+          throw error
+        }
+      },
+      generateIntoAiSlot: async (slotId, prompt, options = {}) => {
+        const state = get()
+        const slot =
+          state.nodes.find((node) => node.id === slotId && node.type === 'ai-slot' && !node.hidden) ||
+          state.nodes.find((node) => node.id === state.selectedNodeId && node.type === 'ai-slot' && !node.hidden)
+        if (!slot) return
+
+        const resultPrompt = prompt?.trim() || nodePrompt(slot, '根据 AI 槽位生成图片')
+        const model = options.model || defaultMivoImageModel
+        const taskId = createNodeId('task-slot-generation')
+        const runningTask: CanvasTask = {
+          id: taskId,
+          label: `生成到槽位：${slot.title}`,
+          status: 'running',
+          progress: 20,
+          nodeIds: [],
+        }
+
+        set((current) => {
+          const nodes = current.nodes.map((node) =>
             node.id === slot.id
               ? {
                   ...node,
                   generation: {
                     prompt: resultPrompt,
-                    model: node.generation?.model || 'Mivo Mock Image Workflow',
-                    size: `${Math.round(slot.width)}x${Math.round(slot.height)}`,
-                    seed: node.generation?.seed || createdAt % 99999,
+                    model,
+                    size: node.generation?.size || `${Math.round(slot.width)}x${Math.round(slot.height)}`,
+                    seed: node.generation?.seed,
                     strength: node.generation?.strength,
-                    taskId: `task-${id}`,
-                    createdAt,
+                    taskId,
+                    createdAt: Date.now(),
                   },
                   aiWorkflow: {
                     ...(node.aiWorkflow || { kind: 'slot' as const }),
-                    status: 'ready' as const,
+                    status: 'generating' as const,
                     operation: 'slot-generation' as const,
                     prompt: resultPrompt,
                   },
                 }
               : node,
           )
-          const task: CanvasTask = {
-            id: `task-${id}`,
-            label: `生成到槽位：${slot.title}`,
-            status: 'done',
-            progress: 100,
-            nodeIds: [id],
-          }
-          const edge: CanvasEdge = {
-            id: createEdgeId(),
-            from: slot.id,
-            to: id,
-            type: 'generate',
-            prompt: resultPrompt,
-            createdAt,
-          }
-
-          return patchWithHistory(state, {
-            selectedNodeId: id,
-            selectedNodeIds: [id],
-            nodes: normalizeCanvasNodes([...nodes, result]),
-            edges: [...state.edges, edge],
-            tasks: [task, ...state.tasks].slice(0, 5),
-          })
+          return patchActiveCanvas(current, { nodes, tasks: upsertTask(current.tasks, runningTask) })
         })
+
+        try {
+          const referenceFiles = options.referenceFiles || []
+          const response = referenceFiles[0]
+            ? await editMivoImage({
+                image: referenceFiles[0],
+                reference: referenceFiles.slice(1),
+                prompt: resultPrompt,
+                imgRatio: options.imgRatio || '1:1',
+                quality: options.quality || 'medium',
+                model,
+              })
+            : await generateMivoImage({
+                prompt: resultPrompt,
+                imgRatio: options.imgRatio || '1:1',
+                quality: options.quality || 'medium',
+                n: 1,
+                model,
+              })
+          const nodeIds = await get().commitGenerationResult({
+            sourceNodeId: slot.id,
+            resultImages: response.images,
+            prompt: resultPrompt,
+            model,
+            kind: 'generate',
+            taskId,
+            placement: 'right',
+          })
+          set((current) => {
+            const nodes = current.nodes.map((node) =>
+              node.id === slot.id && node.aiWorkflow
+                ? {
+                    ...node,
+                    aiWorkflow: {
+                      ...node.aiWorkflow,
+                      status: 'ready' as const,
+                    },
+                  }
+                : node,
+            )
+            return patchActiveCanvas(current, {
+              nodes,
+              tasks: upsertTask(current.tasks, doneTask(runningTask, `生成到槽位：${slot.title}`, nodeIds)),
+            })
+          })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Generation failed'
+          set((current) => {
+            const nodes = current.nodes.map((node) =>
+              node.id === slot.id && node.aiWorkflow
+                ? {
+                    ...node,
+                    aiWorkflow: {
+                      ...node.aiWorkflow,
+                      status: 'failed' as const,
+                    },
+                  }
+                : node,
+            )
+            return patchActiveCanvas(current, {
+              nodes,
+              tasks: upsertTask(current.tasks, failedTask(runningTask, `生成到槽位失败：${message}`)),
+            })
+          })
+          throw error
+        }
       },
       generateFromAnnotation: (annotationNodeId) => {
         const id = createNodeId('annotation-result')
