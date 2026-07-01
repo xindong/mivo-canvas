@@ -1,11 +1,57 @@
-import { defineConfig, type Plugin, type ViteDevServer } from 'vite'
+import { defineConfig, loadEnv, type Plugin, type ViteDevServer } from 'vite'
 import react from '@vitejs/plugin-react'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
+import type { IncomingMessage, ServerResponse } from 'node:http'
 
 const imageExtensions = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg'])
 const eagleApiBase = process.env.MIVO_EAGLE_API_URL?.trim() || 'http://127.0.0.1:41595'
+const mivoImageApiBase = 'https://llm-proxy.tapsvc.com/v1/images'
+const defaultMivoImageModel = 'gpt-image-2'
+const mivoQualitySet = new Set(['low', 'medium', 'high'])
+const mivoImageRequestMaxBytes = 40 * 1024 * 1024
+const mivoJsonRequestMaxBytes = 1024 * 1024
+const mivoImageSizeMap = {
+  '1:1': {
+    low: '1024x1024',
+    medium: '2048x2048',
+    high: '2880x2880',
+  },
+  '3:2': {
+    low: '1536x1024',
+    medium: '3072x2048',
+    high: '3504x2336',
+  },
+  '2:3': {
+    low: '1024x1536',
+    medium: '2048x3072',
+    high: '2336x3504',
+  },
+  '16:9': {
+    low: '1824x1024',
+    medium: '2048x1152',
+    high: '3840x2160',
+  },
+  '9:16': {
+    low: '1024x1824',
+    medium: '1152x2048',
+    high: '2160x3840',
+  },
+} as const
+
+type MivoImageRatio = keyof typeof mivoImageSizeMap
+type MivoImageQuality = keyof (typeof mivoImageSizeMap)['1:1']
+type MivoImageResponse = {
+  images: Array<{ b64: string }>
+}
+
+type ParsedMivoMultipart = {
+  fields: Map<string, string[]>
+  files: Map<string, File[]>
+}
+
+class RequestBodyTooLargeError extends Error {}
 
 const mimeFor = (filePath: string) => {
   const extension = path.extname(filePath).toLowerCase()
@@ -87,6 +133,253 @@ const requestJson = async <T>(url: string, init?: RequestInit) => {
   const response = await fetch(url, init)
   if (!response.ok) throw new Error(`${response.status} ${response.statusText}`)
   return (await response.json()) as T
+}
+
+const readImageApiKey = (imageApiKey: string) => {
+  const key = imageApiKey.trim()
+  if (!key) throw new Error('MIVO_IMAGE_API_KEY is not set')
+  return key
+}
+
+const sendMivoJson = (response: ServerResponse, status: number, payload: unknown) => {
+  response.statusCode = status
+  response.setHeader('Content-Type', 'application/json; charset=utf-8')
+  response.end(JSON.stringify(payload))
+}
+
+const readRequestBuffer = async (request: IncomingMessage, maxBytes: number) =>
+  new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = []
+    let totalBytes = 0
+
+    request.on('data', (chunk: Buffer) => {
+      totalBytes += chunk.length
+      if (totalBytes > maxBytes) {
+        reject(new RequestBodyTooLargeError('Request body is too large'))
+        request.destroy()
+        return
+      }
+      chunks.push(chunk)
+    })
+    request.on('end', () => resolve(Buffer.concat(chunks)))
+    request.on('error', reject)
+  })
+
+const readJsonRequest = async <T>(request: IncomingMessage) => {
+  const buffer = await readRequestBuffer(request, mivoJsonRequestMaxBytes)
+  if (!buffer.length) return {} as T
+  return JSON.parse(buffer.toString('utf8')) as T
+}
+
+const headersFromIncomingRequest = (request: IncomingMessage) => {
+  const headers = new Headers()
+  Object.entries(request.headers).forEach(([key, value]) => {
+    if (Array.isArray(value)) headers.set(key, value.join(', '))
+    else if (value !== undefined) headers.set(key, value)
+  })
+  return headers
+}
+
+const parseMultipartRequest = async (request: IncomingMessage): Promise<ParsedMivoMultipart> => {
+  const buffer = await readRequestBuffer(request, mivoImageRequestMaxBytes)
+  const webRequest = new Request('http://127.0.0.1/api/mivo/edit', {
+    method: request.method || 'POST',
+    headers: headersFromIncomingRequest(request),
+    body: buffer,
+  })
+  const formData = await webRequest.formData()
+  const fields = new Map<string, string[]>()
+  const files = new Map<string, File[]>()
+
+  formData.forEach((value, key) => {
+    if (value instanceof File) {
+      const nextFiles = files.get(key) || []
+      nextFiles.push(value)
+      files.set(key, nextFiles)
+      return
+    }
+
+    const nextValues = fields.get(key) || []
+    nextValues.push(value)
+    fields.set(key, nextValues)
+  })
+
+  return { fields, files }
+}
+
+const firstMultipartField = (fields: Map<string, string[]>, key: string) => fields.get(key)?.[0] || ''
+
+const multipartFiles = (files: Map<string, File[]>, key: string) => files.get(key) || []
+
+const appendFile = (formData: FormData, key: string, file: File) => {
+  formData.append(key, file, file.name || `${key}.png`)
+}
+
+const normalizeMivoQuality = (quality: unknown): MivoImageQuality => {
+  const value = typeof quality === 'string' && mivoQualitySet.has(quality) ? quality : 'medium'
+  return value as MivoImageQuality
+}
+
+const normalizeMivoRatio = (imgRatio: unknown): MivoImageRatio => {
+  const value = typeof imgRatio === 'string' && imgRatio in mivoImageSizeMap ? imgRatio : '1:1'
+  return value as MivoImageRatio
+}
+
+const imageSizeFor = (imgRatio: unknown, quality: unknown) => {
+  const ratio = normalizeMivoRatio(imgRatio)
+  const normalizedQuality = normalizeMivoQuality(quality)
+  return mivoImageSizeMap[ratio][normalizedQuality]
+}
+
+const normalizeMivoImages = (payload: unknown): MivoImageResponse => {
+  const maybePayload = payload as {
+    data?: Array<{ b64_json?: unknown }>
+    images?: Array<{ b64?: unknown }>
+  }
+  const images = (maybePayload.data || [])
+    .map((item) => (typeof item.b64_json === 'string' ? { b64: item.b64_json } : undefined))
+    .filter((item): item is { b64: string } => Boolean(item))
+
+  if (!images.length && maybePayload.images) {
+    images.push(
+      ...maybePayload.images
+        .map((item) => (typeof item.b64 === 'string' ? { b64: item.b64 } : undefined))
+        .filter((item): item is { b64: string } => Boolean(item)),
+    )
+  }
+
+  if (!images.length) throw new Error('Image API returned no images')
+  return { images }
+}
+
+const readUpstreamError = async (response: Response) => {
+  try {
+    const payload = (await response.json()) as { error?: { message?: string } | string; message?: string }
+    if (typeof payload.error === 'string') return payload.error
+    return payload.error?.message || payload.message || `${response.status} ${response.statusText}`
+  } catch {
+    try {
+      return await response.text()
+    } catch {
+      return `${response.status} ${response.statusText}`
+    }
+  }
+}
+
+const proxyMivoGenerate = async (
+  request: IncomingMessage,
+  response: ServerResponse,
+  imageApiKey: string,
+) => {
+  try {
+    if (request.method !== 'POST') {
+      sendMivoJson(response, 405, { error: 'Method not allowed' })
+      return
+    }
+
+    const body = await readJsonRequest<{
+      prompt?: unknown
+      imgRatio?: unknown
+      quality?: unknown
+      n?: unknown
+      model?: unknown
+    }>(request)
+    const prompt = String(body.prompt || '').trim()
+    if (!prompt) {
+      sendMivoJson(response, 400, { error: 'prompt is required' })
+      return
+    }
+
+    const quality = normalizeMivoQuality(body.quality)
+    const upstreamResponse = await fetch(`${mivoImageApiBase}/generations`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${readImageApiKey(imageApiKey)}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: typeof body.model === 'string' && body.model.trim() ? body.model.trim() : defaultMivoImageModel,
+        prompt,
+        n: Number.isFinite(Number(body.n)) ? Math.max(1, Math.min(4, Math.floor(Number(body.n)))) : 1,
+        size: imageSizeFor(body.imgRatio, quality),
+        quality,
+      }),
+    })
+
+    if (!upstreamResponse.ok) {
+      sendMivoJson(response, upstreamResponse.status, { error: await readUpstreamError(upstreamResponse) })
+      return
+    }
+
+    sendMivoJson(response, 200, normalizeMivoImages(await upstreamResponse.json()))
+  } catch (error) {
+    sendMivoJson(
+      response,
+      error instanceof RequestBodyTooLargeError ? 413 : 500,
+      { error: error instanceof Error ? error.message : 'Unable to generate image' },
+    )
+  }
+}
+
+const proxyMivoEdit = async (
+  request: IncomingMessage,
+  response: ServerResponse,
+  imageApiKey: string,
+) => {
+  try {
+    if (request.method !== 'POST') {
+      sendMivoJson(response, 405, { error: 'Method not allowed' })
+      return
+    }
+
+    const { fields, files } = await parseMultipartRequest(request)
+    const image = multipartFiles(files, 'image')[0]
+    if (!image) {
+      sendMivoJson(response, 400, { error: 'image is required' })
+      return
+    }
+
+    const prompt = firstMultipartField(fields, 'prompt').trim()
+    if (!prompt) {
+      sendMivoJson(response, 400, { error: 'prompt is required' })
+      return
+    }
+
+    const quality = normalizeMivoQuality(firstMultipartField(fields, 'quality'))
+    const model = firstMultipartField(fields, 'model').trim() || defaultMivoImageModel
+    const formData = new FormData()
+    appendFile(formData, 'image', image)
+    const mask = multipartFiles(files, 'mask')[0]
+    if (mask) appendFile(formData, 'mask', mask)
+    for (const reference of [...multipartFiles(files, 'reference[]'), ...multipartFiles(files, 'reference')]) {
+      appendFile(formData, 'reference[]', reference)
+    }
+    formData.set('model', model)
+    formData.set('prompt', prompt)
+    formData.set('size', imageSizeFor(firstMultipartField(fields, 'imgRatio'), quality))
+    formData.set('quality', quality)
+
+    const upstreamResponse = await fetch(`${mivoImageApiBase}/edits`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${readImageApiKey(imageApiKey)}`,
+      },
+      body: formData,
+    })
+
+    if (!upstreamResponse.ok) {
+      sendMivoJson(response, upstreamResponse.status, { error: await readUpstreamError(upstreamResponse) })
+      return
+    }
+
+    sendMivoJson(response, 200, normalizeMivoImages(await upstreamResponse.json()))
+  } catch (error) {
+    sendMivoJson(
+      response,
+      error instanceof RequestBodyTooLargeError ? 413 : 500,
+      { error: error instanceof Error ? error.message : 'Unable to edit image' },
+    )
+  }
 }
 
 const eagleApi = async <T>(route: string, params?: URLSearchParams) => {
@@ -218,13 +511,25 @@ const readLocalAssets = async () => {
   }
 }
 
-const localAssetLibraryPlugin = (): Plugin => ({
+const localAssetLibraryPlugin = ({ imageApiKey }: { imageApiKey: string }): Plugin => ({
   name: 'mivo-local-asset-library',
   configureServer(server: ViteDevServer) {
     server.middlewares.use(async (request, response, next) => {
       const url = request.url || ''
+      const requestUrl = new URL(url || '/', 'http://127.0.0.1')
+      const pathname = requestUrl.pathname
 
-      if (url === '/api/mivo/local-assets') {
+      if (pathname === '/api/mivo/generate') {
+        await proxyMivoGenerate(request, response, imageApiKey)
+        return
+      }
+
+      if (pathname === '/api/mivo/edit') {
+        await proxyMivoEdit(request, response, imageApiKey)
+        return
+      }
+
+      if (pathname === '/api/mivo/local-assets') {
         try {
           const payload = await readLocalAssets()
           response.setHeader('Content-Type', 'application/json; charset=utf-8')
@@ -236,7 +541,7 @@ const localAssetLibraryPlugin = (): Plugin => ({
         return
       }
 
-      if (url === '/api/mivo/eagle/status') {
+      if (pathname === '/api/mivo/eagle/status') {
         try {
           const [applicationInfo, libraryInfo] = await Promise.all([
             eagleApi<{ version?: string; platform?: string }>('/api/application/info'),
@@ -264,7 +569,7 @@ const localAssetLibraryPlugin = (): Plugin => ({
         return
       }
 
-      if (url === '/api/mivo/eagle/folders') {
+      if (pathname === '/api/mivo/eagle/folders') {
         try {
           const folders = await eagleApi<unknown[]>('/api/folder/list')
           response.setHeader('Content-Type', 'application/json; charset=utf-8')
@@ -276,10 +581,10 @@ const localAssetLibraryPlugin = (): Plugin => ({
         return
       }
 
-      if (url.startsWith('/api/mivo/eagle/assets/') && url.endsWith('/thumbnail')) {
+      if (pathname.startsWith('/api/mivo/eagle/assets/') && pathname.endsWith('/thumbnail')) {
         try {
           const itemId = decodeURIComponent(
-            url.slice('/api/mivo/eagle/assets/'.length, -'/thumbnail'.length).split('?')[0] || '',
+            pathname.slice('/api/mivo/eagle/assets/'.length, -'/thumbnail'.length) || '',
           )
           const thumbnailPath = await eagleThumbnailPathFor(itemId)
           const file = await fs.readFile(thumbnailPath)
@@ -293,10 +598,10 @@ const localAssetLibraryPlugin = (): Plugin => ({
         return
       }
 
-      if (url.startsWith('/api/mivo/eagle/assets/') && url.endsWith('/file')) {
+      if (pathname.startsWith('/api/mivo/eagle/assets/') && pathname.endsWith('/file')) {
         try {
           const itemId = decodeURIComponent(
-            url.slice('/api/mivo/eagle/assets/'.length, -'/file'.length).split('?')[0] || '',
+            pathname.slice('/api/mivo/eagle/assets/'.length, -'/file'.length) || '',
           )
           const item = await readEagleItem(itemId)
           const filePath = await eagleOriginalPathFor(item)
@@ -311,9 +616,8 @@ const localAssetLibraryPlugin = (): Plugin => ({
         return
       }
 
-      if (url.startsWith('/api/mivo/eagle/assets')) {
+      if (pathname === '/api/mivo/eagle/assets') {
         try {
-          const requestUrl = new URL(url, 'http://127.0.0.1')
           const limit = requestUrl.searchParams.get('limit') || '80'
           const offset = requestUrl.searchParams.get('offset') || '0'
           const folderId = requestUrl.searchParams.get('folderId') || ''
@@ -352,7 +656,7 @@ const localAssetLibraryPlugin = (): Plugin => ({
         return
       }
 
-      if (url === '/api/mivo/pinterest/status') {
+      if (pathname === '/api/mivo/pinterest/status') {
         response.setHeader('Content-Type', 'application/json; charset=utf-8')
         response.end(
           JSON.stringify({
@@ -363,9 +667,9 @@ const localAssetLibraryPlugin = (): Plugin => ({
         return
       }
 
-      if (url.startsWith('/api/mivo/local-assets/')) {
+      if (pathname.startsWith('/api/mivo/local-assets/')) {
         try {
-          const id = decodeURIComponent(url.slice('/api/mivo/local-assets/'.length).split('?')[0] || '')
+          const id = decodeURIComponent(pathname.slice('/api/mivo/local-assets/'.length) || '')
           const filePath = decodeAssetPath(id)
           const roots = localAssetRoots()
 
@@ -392,6 +696,11 @@ const localAssetLibraryPlugin = (): Plugin => ({
 })
 
 // https://vite.dev/config/
-export default defineConfig({
-  plugins: [react(), localAssetLibraryPlugin()],
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, process.cwd(), '')
+  const imageApiKey = env.MIVO_IMAGE_API_KEY || process.env.MIVO_IMAGE_API_KEY || ''
+
+  return {
+    plugins: [react(), localAssetLibraryPlugin({ imageApiKey })],
+  }
 })
