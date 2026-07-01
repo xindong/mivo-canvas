@@ -3215,8 +3215,32 @@ try {
       throw new Error(`Multi-selection Arrange quick menu should expose ${action}`)
     }
   }
+  const arrangeTargetsBefore = await page.locator('.dom-node.selected:not([data-node-type="markup"])').evaluateAll((nodes) =>
+    nodes.map((node) => {
+      const rect = node.getBoundingClientRect()
+      return {
+        id: node.getAttribute('data-node-id'),
+        left: rect.left,
+        top: rect.top,
+      }
+    }),
+  )
   await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Arrange row' }).click()
   await page.waitForSelector('.selection-quick-toolbar-menu', { state: 'detached' })
+  const arrangeTargetsAfter = await page.locator('.dom-node.selected:not([data-node-type="markup"])').evaluateAll((nodes) =>
+    nodes.map((node) => {
+      const rect = node.getBoundingClientRect()
+      return {
+        id: node.getAttribute('data-node-id'),
+        left: rect.left,
+        top: rect.top,
+      }
+    }),
+  )
+  const movedArrangeTargets = arrangeTargetsAfter.filter((after) => {
+    const before = arrangeTargetsBefore.find((item) => item.id === after.id)
+    return before && (Math.abs(before.left - after.left) > 2 || Math.abs(before.top - after.top) > 2)
+  })
   const arrangedRowCenters = await page.locator('.dom-node.selected:not([data-node-type="markup"])').evaluateAll((nodes) =>
     nodes.map((node) => {
       const rect = node.getBoundingClientRect()
@@ -3225,10 +3249,15 @@ try {
   )
   if (
     arrangedRowCenters.length < 2 ||
+    movedArrangeTargets.length < 1 ||
     Math.max(...arrangedRowCenters) - Math.min(...arrangedRowCenters) > 2 ||
     (await page.locator('.selection-quick-toolbar').count()) !== 1
   ) {
-    throw new Error(`Arrange row should keep a multi-selection and align object centers: ${JSON.stringify(arrangedRowCenters)}`)
+    throw new Error(
+      `Arrange row should move selected objects, keep a multi-selection, and align object centers: centers=${JSON.stringify(
+        arrangedRowCenters,
+      )}, before=${JSON.stringify(arrangeTargetsBefore)}, after=${JSON.stringify(arrangeTargetsAfter)}`,
+    )
   }
   await page.keyboard.press(process.platform === 'darwin' ? 'Meta+Z' : 'Control+Z')
   await page.waitForSelector('.selection-quick-toolbar')

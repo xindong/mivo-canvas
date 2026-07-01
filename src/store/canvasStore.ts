@@ -1498,11 +1498,10 @@ export const useCanvasStore = create<CanvasState>()(
               const position = positions.get(node.id)
               if (position) {
                 if (node.x !== position.x || node.y !== position.y) changed = true
-                return {
-                  ...node,
+                return setNodeTransform(node, {
                   x: position.x,
                   y: position.y,
-                }
+                })
               }
 
               const sectionDelta = node.sectionId ? sectionDeltas.get(node.sectionId) : undefined
@@ -1510,11 +1509,10 @@ export const useCanvasStore = create<CanvasState>()(
               if (!sectionDelta.dx && !sectionDelta.dy) return node
 
               changed = true
-              return {
-                ...node,
+              return setNodeTransform(node, {
                 x: Math.round(node.x + sectionDelta.dx),
                 y: Math.round(node.y + sectionDelta.dy),
-              }
+              })
             }),
           )
 
