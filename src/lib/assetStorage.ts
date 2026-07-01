@@ -280,6 +280,12 @@ export const saveImportedAsset = async (file: File) => {
   }
 }
 
+export const saveGeneratedAsset = async (blob: Blob, name: string, type = blob.type || 'image/png') => {
+  const normalizedName = name.trim() || `generated-${Date.now()}.png`
+  const file = new File([blob], normalizedName, { type })
+  return saveImportedAsset(file)
+}
+
 export const resolveAssetUrl = async (assetUrl?: string) => {
   if (!assetUrl) return ''
   if (!isImportedAssetUrl(assetUrl)) return assetUrl

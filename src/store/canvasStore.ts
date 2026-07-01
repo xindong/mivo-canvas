@@ -4,8 +4,11 @@ import type {
   AiCanvasContextSnapshot,
   AiWorkflowOperation,
   CanvasAssetNodeType,
+  CanvasEdge,
+  CanvasEdgeType,
   CanvasId,
   CanvasDocument,
+  CanvasMaskBounds,
   CanvasTask,
   ConnectorBinding,
   DemoSceneId,
@@ -28,9 +31,11 @@ import {
   type ImportedFileMetadata,
 } from '../lib/canvasAssetImport'
 import { importedImageDisplaySize, type ImportedImageMetadata } from '../lib/imageSizing'
+import { saveGeneratedAsset } from '../lib/assetStorage'
 import { buildAiContextSnapshot, chooseAdjacentPlacement } from './aiCanvasWorkflow'
 import { makeNode, realCaseImages, scenes, snapshotFromScene } from './demoScenes'
 import { mockGenerationAdapter } from './mockGeneration'
+import type { CommitGenerationResultPayload, CommittedGenerationImage } from '../types/generation'
 
 type LayerMove = 'forward' | 'backward' | 'front' | 'back'
 export type SelectionAlignment = 'left' | 'center' | 'right' | 'top' | 'middle' | 'bottom'
@@ -39,6 +44,7 @@ export type DistributionAxis = 'horizontal' | 'vertical'
 type CanvasState = {
   canvases: Record<CanvasId, CanvasDocument>
   nodes: MivoCanvasNode[]
+  edges: CanvasEdge[]
   tasks: CanvasTask[]
   activeTool: ToolId
   selectedNodeId?: string
@@ -182,6 +188,7 @@ type CanvasState = {
   generateBesideNode: (sourceNodeId?: string, prompt?: string) => void
   generateIntoAiSlot: (slotId?: string, prompt?: string) => void
   generateFromAnnotation: (annotationNodeId?: string) => void
+  commitGenerationResult: (payload: CommitGenerationResultPayload) => Promise<string[]>
   toggleFavorite: (nodeId: string) => void
   updatePrompt: (nodeId: string, prompt: string) => void
   resetCurrentScene: () => void
@@ -191,7 +198,7 @@ type CanvasState = {
 }
 
 type PersistedCanvasState = Partial<
-  Pick<CanvasState, 'canvases' | 'nodes' | 'tasks' | 'sceneId' | 'selectedNodeId' | 'selectedNodeIds' | 'activeTool'>
+  Pick<CanvasState, 'canvases' | 'nodes' | 'edges' | 'tasks' | 'sceneId' | 'selectedNodeId' | 'selectedNodeIds' | 'activeTool'>
 >
 
 export { scenes }
@@ -209,7 +216,12 @@ const cloneNode = (node: MivoCanvasNode): MivoCanvasNode => ({
   connectorStart: node.connectorStart ? { ...node.connectorStart } : undefined,
   connectorEnd: node.connectorEnd ? { ...node.connectorEnd } : undefined,
   parentIds: node.parentIds ? [...node.parentIds] : undefined,
-  generation: node.generation ? { ...node.generation } : undefined,
+  generation: node.generation
+    ? {
+        ...node.generation,
+        maskBounds: node.generation.maskBounds ? { ...node.generation.maskBounds } : undefined,
+      }
+    : undefined,
   aiWorkflow: node.aiWorkflow
     ? {
         ...node.aiWorkflow,
@@ -223,8 +235,11 @@ const cloneTask = (task: CanvasTask): CanvasTask => ({
   nodeIds: [...task.nodeIds],
 })
 
+const cloneEdge = (edge: CanvasEdge): CanvasEdge => ({ ...edge })
+
 const cloneNodes = (nodes: MivoCanvasNode[]) => nodes.map(cloneNode)
 const cloneTasks = (tasks: CanvasTask[]) => tasks.map(cloneTask)
+const cloneEdges = (edges: CanvasEdge[] = []) => edges.map(cloneEdge)
 
 const normalizeSelection = (nodeIds: string[] | undefined, nodes: MivoCanvasNode[]) => {
   const validIds = new Set(nodes.filter((node) => !node.hidden).map((node) => node.id))
@@ -238,10 +253,11 @@ const selectionFrom = (nodeIds: string[] | undefined, selectedNodeId: string | u
   return { selectedNodeId: primary, selectedNodeIds: selection }
 }
 
-const snapshotFromState = (state: Pick<CanvasState, 'sceneId' | 'nodes' | 'tasks' | 'selectedNodeId' | 'selectedNodeIds'>) => ({
+const snapshotFromState = (state: Pick<CanvasState, 'sceneId' | 'nodes' | 'edges' | 'tasks' | 'selectedNodeId' | 'selectedNodeIds'>) => ({
   version: 1 as const,
   sceneId: state.sceneId,
   nodes: cloneNodes(state.nodes),
+  edges: cloneEdges(state.edges),
   tasks: cloneTasks(state.tasks),
   selectedNodeId: state.selectedNodeId,
   selectedNodeIds: [...state.selectedNodeIds],
@@ -262,6 +278,7 @@ const createCanvasId = () => {
 
 const createGroupId = () => `group-${Date.now()}-${Math.random().toString(16).slice(2)}`
 const createNodeId = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`
+const createEdgeId = () => createNodeId('edge')
 
 const defaultSectionFillColor = '#ffffff'
 const defaultSectionBorderColor = '#ff8a00'
@@ -382,8 +399,63 @@ const normalizeConnectorMarkupNodes = (nodes: MivoCanvasNode[]) =>
     }
   })
 
+const derivationEdgeModel = 'Mivo Derivation Edge'
+const derivationEdgeNodeId = (edgeId: string) => `derivation-${edgeId}`
+const isDerivationEdgeNode = (node: MivoCanvasNode) =>
+  node.type === 'markup' && node.generation?.model === derivationEdgeModel
+
+const createDerivationEdgeNode = (edge: CanvasEdge, nodes: MivoCanvasNode[]): MivoCanvasNode | undefined => {
+  const source = nodes.find((node) => node.id === edge.from && !node.hidden)
+  const target = nodes.find((node) => node.id === edge.to && !node.hidden)
+  if (!source || !target) return undefined
+
+  return makeNode({
+    id: derivationEdgeNodeId(edge.id),
+    type: 'markup',
+    title: edge.type === 'edit' ? 'Edit derivation' : 'Generation derivation',
+    x: source.x + source.width,
+    y: source.y + source.height / 2,
+    width: Math.max(24, target.x - (source.x + source.width)),
+    height: Math.max(24, Math.abs(target.y - source.y)),
+    markupKind: 'arrow',
+    markupStrokeColor: '#3f6f64',
+    markupStrokeWidth: 3,
+    markupStrokeStyle: 'solid',
+    markupOpacity: 0.82,
+    markupStartArrow: false,
+    markupEndArrow: true,
+    markupPoints: [
+      { x: 0, y: 0 },
+      { x: Math.max(24, target.x - (source.x + source.width)), y: Math.round(target.y - source.y) },
+    ],
+    connectorStart: { nodeId: edge.from, anchor: 'right' },
+    connectorEnd: { nodeId: edge.to, anchor: 'left' },
+    status: 'ready',
+    locked: true,
+    generation: {
+      prompt: edge.prompt,
+      model: derivationEdgeModel,
+      createdAt: edge.createdAt,
+    },
+  })
+}
+
+const syncDerivationEdgeNodes = (nodes: MivoCanvasNode[], edges: CanvasEdge[]) => {
+  const contentNodes = nodes.filter((node) => !isDerivationEdgeNode(node))
+  const contentIds = new Set(contentNodes.filter((node) => !node.hidden).map((node) => node.id))
+  const edgeNodes = edges
+    .filter((edge) => contentIds.has(edge.from) && contentIds.has(edge.to))
+    .map((edge) => createDerivationEdgeNode(edge, contentNodes))
+    .filter((node): node is MivoCanvasNode => Boolean(node))
+
+  return [...contentNodes, ...edgeNodes]
+}
+
 const normalizeCanvasNodes = (nodes: MivoCanvasNode[]) =>
   normalizeConnectorMarkupNodes(normalizeSectionMembership(nodes))
+
+const normalizeCanvasGraph = (nodes: MivoCanvasNode[], edges: CanvasEdge[] = []) =>
+  normalizeCanvasNodes(syncDerivationEdgeNodes(nodes, edges))
 
 const normalizeLongMarkdownPreviewNodes = (nodes: MivoCanvasNode[]) =>
   nodes.map((node) => {
@@ -401,6 +473,7 @@ const createBlankDocument = (title = 'Untitled Canvas', projectId?: string): Can
   title,
   projectId,
   nodes: [],
+  edges: [],
   tasks: [],
   selectedNodeId: undefined,
   selectedNodeIds: [],
@@ -413,7 +486,8 @@ const canvasDocumentFromScene = (sceneId: DemoSceneId): CanvasDocument => {
   return {
     title: fallbackTitle(sceneId),
     sourceTemplateId: sceneId,
-    nodes: cloneNodes(snapshot.nodes),
+    nodes: normalizeCanvasGraph(cloneNodes(snapshot.nodes), snapshot.edges || []),
+    edges: cloneEdges(snapshot.edges || []),
     tasks: cloneTasks(snapshot.tasks),
     selectedNodeId: selection.selectedNodeId,
     selectedNodeIds: selection.selectedNodeIds,
@@ -430,13 +504,16 @@ const documentFor = (canvases: Record<CanvasId, CanvasDocument>, sceneId: Canvas
   canvases[sceneId] || (sceneIds.has(sceneId as DemoSceneId) ? canvasDocumentFromScene(sceneId as DemoSceneId) : createBlankDocument(fallbackTitle(sceneId)))
 
 const normalizeDocument = (document: CanvasDocument): CanvasDocument => {
-  const selection = selectionFrom(document.selectedNodeIds, document.selectedNodeId, document.nodes)
+  const edges = cloneEdges(document.edges || [])
+  const nodes = normalizeCanvasGraph(cloneNodes(document.nodes), edges)
+  const selection = selectionFrom(document.selectedNodeIds, document.selectedNodeId, nodes)
 
   return {
     ...document,
     projectId: document.projectId,
     sourceTemplateId: document.sourceTemplateId,
-    nodes: cloneNodes(document.nodes),
+    nodes,
+    edges,
     tasks: cloneTasks(document.tasks),
     selectedNodeId: selection.selectedNodeId,
     selectedNodeIds: selection.selectedNodeIds,
@@ -445,10 +522,14 @@ const normalizeDocument = (document: CanvasDocument): CanvasDocument => {
 
 const patchActiveCanvas = (
   state: CanvasState,
-  patch: Partial<Pick<CanvasDocument, 'nodes' | 'tasks' | 'selectedNodeId' | 'selectedNodeIds' | 'title'>>,
+  patch: Partial<Pick<CanvasDocument, 'nodes' | 'edges' | 'tasks' | 'selectedNodeId' | 'selectedNodeIds' | 'title'>>,
 ) => {
   const currentDocument = documentFor(state.canvases, state.sceneId)
-  const nextNodes = patch.nodes || state.nodes
+  const nextEdges = 'edges' in patch ? cloneEdges(patch.edges || []) : state.edges
+  const nextNodes =
+    'nodes' in patch || 'edges' in patch
+      ? normalizeCanvasGraph(patch.nodes || state.nodes, nextEdges)
+      : state.nodes
   const selection = selectionFrom(
     'selectedNodeIds' in patch ? patch.selectedNodeIds : state.selectedNodeIds,
     'selectedNodeId' in patch ? patch.selectedNodeId : state.selectedNodeId,
@@ -457,14 +538,16 @@ const patchActiveCanvas = (
   const nextDocument = {
     ...currentDocument,
     ...patch,
-    nodes: patch.nodes || currentDocument.nodes,
+    nodes: nextNodes,
+    edges: nextEdges,
     tasks: patch.tasks || currentDocument.tasks,
     selectedNodeId: selection.selectedNodeId,
     selectedNodeIds: selection.selectedNodeIds,
   }
 
   return {
-    ...(patch.nodes ? { nodes: patch.nodes } : {}),
+    ...('nodes' in patch || 'edges' in patch ? { nodes: nextNodes } : {}),
+    ...('edges' in patch ? { edges: nextEdges } : {}),
     ...(patch.tasks ? { tasks: patch.tasks } : {}),
     selectedNodeId: selection.selectedNodeId,
     selectedNodeIds: selection.selectedNodeIds,
@@ -477,7 +560,7 @@ const patchActiveCanvas = (
 
 const patchWithHistory = (
   state: CanvasState,
-  patch: Partial<Pick<CanvasDocument, 'nodes' | 'tasks' | 'selectedNodeId' | 'selectedNodeIds' | 'title'>>,
+  patch: Partial<Pick<CanvasDocument, 'nodes' | 'edges' | 'tasks' | 'selectedNodeId' | 'selectedNodeIds' | 'title'>>,
 ) => ({
   ...remember(state),
   ...patchActiveCanvas(state, patch),
@@ -485,10 +568,13 @@ const patchWithHistory = (
 
 const applySnapshot = (state: CanvasState, snapshot: MivoCanvasSnapshot) => {
   const currentDocument = documentFor(state.canvases, snapshot.sceneId)
-  const selection = selectionFrom(snapshot.selectedNodeIds, snapshot.selectedNodeId, snapshot.nodes)
+  const edges = cloneEdges(snapshot.edges || [])
+  const nodes = normalizeCanvasGraph(cloneNodes(snapshot.nodes), edges)
+  const selection = selectionFrom(snapshot.selectedNodeIds, snapshot.selectedNodeId, nodes)
   const document: CanvasDocument = {
     ...currentDocument,
-    nodes: cloneNodes(snapshot.nodes),
+    nodes,
+    edges,
     tasks: cloneTasks(snapshot.tasks),
     selectedNodeId: selection.selectedNodeId,
     selectedNodeIds: selection.selectedNodeIds,
@@ -497,6 +583,7 @@ const applySnapshot = (state: CanvasState, snapshot: MivoCanvasSnapshot) => {
   return {
     sceneId: snapshot.sceneId,
     nodes: document.nodes,
+    edges: document.edges,
     tasks: document.tasks,
     selectedNodeId: document.selectedNodeId,
     selectedNodeIds: document.selectedNodeIds || [],
@@ -581,6 +668,37 @@ const importedAssetModelFor = (type: Exclude<CanvasAssetNodeType, 'markdown'>) =
   return 'Imported'
 }
 
+const cloneMaskBounds = (maskBounds?: CanvasMaskBounds) =>
+  maskBounds ? { ...maskBounds } : undefined
+
+const edgeTypeForOperation = (operation: AiWorkflowOperation): CanvasEdgeType =>
+  operation === 'slot-generation' || operation === 'beside-generation' || operation === 'variation'
+    ? 'generate'
+    : 'edit'
+
+const blobFromCommittedGenerationImage = (image: CommittedGenerationImage) => {
+  if (image.blob) return image.blob
+
+  const raw = image.b64 || ''
+  const dataUrlMatch = raw.match(/^data:([^;]+);base64,(.*)$/)
+  const mimeType = image.mimeType || dataUrlMatch?.[1] || 'image/png'
+  const base64 = dataUrlMatch?.[2] || raw
+  const binary = atob(base64)
+  const bytes = new Uint8Array(binary.length)
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index)
+  }
+
+  return new Blob([bytes], { type: mimeType })
+}
+
+type GeneratedAssetRecord = Awaited<ReturnType<typeof saveGeneratedAsset>>
+
+const displaySizeForGeneratedAsset = (
+  asset: GeneratedAssetRecord,
+  fallbackSize: { width: number; height: number },
+) => asset.sourceDimensions ? importedImageDisplaySize(asset.sourceDimensions) : fallbackSize
+
 const selectedNodesFromState = (state: CanvasState) => {
   const selected = state.selectedNodeIds.length ? state.selectedNodeIds : state.selectedNodeId ? [state.selectedNodeId] : []
   const selectedSet = new Set(selected)
@@ -616,6 +734,7 @@ const migratePersistedState = (persistedState: unknown, persistedVersion = 0) =>
     const normalizedDocument = normalizeDocument({
       ...currentDocument,
       nodes: persisted.nodes,
+      edges: persisted.edges || currentDocument.edges || [],
       tasks: persisted.tasks,
       selectedNodeId: persisted.selectedNodeId,
       selectedNodeIds: persisted.selectedNodeIds,
@@ -636,6 +755,7 @@ const migratePersistedState = (persistedState: unknown, persistedVersion = 0) =>
     canvases,
     sceneId,
     nodes: activeDocument.nodes,
+    edges: activeDocument.edges || [],
     tasks: activeDocument.tasks,
     selectedNodeId: selection.selectedNodeId,
     selectedNodeIds: selection.selectedNodeIds,
@@ -656,6 +776,7 @@ export const useCanvasStore = create<CanvasState>()(
       canvases: defaultCanvases,
       sceneId: defaultSceneId,
       nodes: defaultDocument.nodes,
+      edges: defaultDocument.edges || [],
       tasks: defaultDocument.tasks,
       selectedNodeId: defaultDocument.selectedNodeId,
       selectedNodeIds: defaultDocument.selectedNodeIds || [],
@@ -679,6 +800,7 @@ export const useCanvasStore = create<CanvasState>()(
           return {
             sceneId: id,
             nodes: normalizedDocument.nodes,
+            edges: normalizedDocument.edges || [],
             tasks: normalizedDocument.tasks,
             selectedNodeId: normalizedDocument.selectedNodeId,
             selectedNodeIds: normalizedDocument.selectedNodeIds || [],
@@ -711,6 +833,7 @@ export const useCanvasStore = create<CanvasState>()(
         set((current) => ({
           sceneId: id,
           nodes: duplicatedDocument.nodes,
+          edges: duplicatedDocument.edges || [],
           tasks: duplicatedDocument.tasks,
           selectedNodeId: duplicatedDocument.selectedNodeId,
           selectedNodeIds: duplicatedDocument.selectedNodeIds || [],
@@ -745,6 +868,7 @@ export const useCanvasStore = create<CanvasState>()(
             canvases: remainingCanvases,
             sceneId: nextSceneId,
             nodes: nextDocument.nodes,
+            edges: nextDocument.edges || [],
             tasks: nextDocument.tasks,
             selectedNodeId: nextDocument.selectedNodeId,
             selectedNodeIds: nextDocument.selectedNodeIds || [],
@@ -760,6 +884,7 @@ export const useCanvasStore = create<CanvasState>()(
           return {
             sceneId,
             nodes: document.nodes,
+            edges: document.edges || [],
             tasks: document.tasks,
             selectedNodeId: document.selectedNodeId,
             selectedNodeIds: document.selectedNodeIds || [],
@@ -1142,6 +1267,7 @@ export const useCanvasStore = create<CanvasState>()(
             selectedNodeId: deletedIds.has(state.selectedNodeId || '') ? selectedNodeIds[0] : state.selectedNodeId,
             selectedNodeIds,
             nodes: normalizeCanvasNodes(state.nodes.filter((node) => !deletedIds.has(node.id))),
+            edges: state.edges.filter((edge) => !deletedIds.has(edge.from) && !deletedIds.has(edge.to)),
           })
         }),
       deleteSelectedNodes: () =>
@@ -1168,6 +1294,7 @@ export const useCanvasStore = create<CanvasState>()(
             selectedNodeId: undefined,
             selectedNodeIds: [],
             nodes: normalizeCanvasNodes(state.nodes.filter((node) => !selectedSet.has(node.id))),
+            edges: state.edges.filter((edge) => !selectedSet.has(edge.from) && !selectedSet.has(edge.to)),
           })
         }),
       toggleSelectedNodesLocked: () =>
@@ -1780,6 +1907,131 @@ export const useCanvasStore = create<CanvasState>()(
 
           return patchActiveCanvas(state, { nodes, selectedNodeId: nodeId, selectedNodeIds: [nodeId] })
         }),
+      commitGenerationResult: async (payload) => {
+        const prompt = payload.prompt.trim()
+        if (!prompt) throw new Error('Prompt is required')
+        if (!payload.resultImages.length) throw new Error('No generated images returned')
+
+        const initialState = get()
+        const source = payload.sourceNodeId
+          ? initialState.nodes.find((node) => node.id === payload.sourceNodeId && !node.hidden)
+          : undefined
+        if (payload.sourceNodeId && !source) throw new Error('Source node not found')
+
+        const createdAt = Date.now()
+        const savedImages = await Promise.all(
+          payload.resultImages.map(async (image, index) => {
+            const blob = blobFromCommittedGenerationImage(image)
+            const extension = blob.type === 'image/jpeg' || blob.type === 'image/jpg' ? 'jpg' : 'png'
+            const name = image.title?.trim() || `mivo-${payload.kind}-${createdAt}-${index + 1}.${extension}`
+            const asset = await saveGeneratedAsset(blob, name, image.mimeType || blob.type || 'image/png')
+            return { image, asset }
+          }),
+        )
+
+        const createdNodeIds: string[] = []
+
+        set((state) => {
+          const currentSource = payload.sourceNodeId
+            ? state.nodes.find((node) => node.id === payload.sourceNodeId && !node.hidden)
+            : undefined
+          if (payload.sourceNodeId && !currentSource) return {}
+
+          let nextNodes = state.nodes.filter((node) => !isDerivationEdgeNode(node))
+          const nextEdges = cloneEdges(state.edges)
+          const newNodes: MivoCanvasNode[] = []
+          const newEdges: CanvasEdge[] = []
+
+          savedImages.forEach(({ image, asset }, index) => {
+            const fallbackSize = currentSource
+              ? { width: currentSource.width, height: currentSource.height }
+              : {
+                  width: image.width || defaultSizeForNodeType('image').width,
+                  height: image.height || defaultSizeForNodeType('image').height,
+                }
+            const displaySize = displaySizeForGeneratedAsset(asset, fallbackSize)
+            const placement = currentSource
+              ? chooseAdjacentPlacement({
+                  nodes: nextNodes,
+                  anchor: currentSource,
+                  width: displaySize.width,
+                  height: displaySize.height,
+                  placement: payload.placement || 'right',
+                })
+              : { x: index * 36, y: index * 36 }
+            const nodeId = createNodeId(`${payload.kind}-result`)
+            const taskId = payload.taskId || `task-${nodeId}`
+            const operation: AiWorkflowOperation =
+              payload.kind === 'edit'
+                ? 'area-edit'
+                : currentSource?.type === 'ai-slot'
+                  ? 'slot-generation'
+                  : 'beside-generation'
+            const resultNode = makeNode({
+              id: nodeId,
+              type: 'image',
+              title: image.title?.trim() || `Generated image ${index + 1}`,
+              x: Math.round(placement.x),
+              y: Math.round(placement.y),
+              width: Math.round(displaySize.width),
+              height: Math.round(displaySize.height),
+              assetUrl: asset.assetUrl,
+              assetMimeType: asset.type,
+              assetOriginalName: asset.name,
+              assetSizeBytes: asset.sizeBytes,
+              imageHasTransparency: asset.hasTransparency,
+              status: 'ready',
+              parentIds: currentSource ? [currentSource.id] : undefined,
+              sourceNodeId: currentSource?.id,
+              generation: {
+                prompt,
+                model: payload.model,
+                size: asset.size,
+                taskId,
+                createdAt,
+                maskBounds: cloneMaskBounds(payload.maskBounds),
+              },
+              aiWorkflow: {
+                kind: 'result',
+                status: 'ready',
+                operation,
+                prompt,
+                sourceNodeIds: currentSource ? [currentSource.id] : undefined,
+                anchorNodeId: currentSource?.id,
+                slotId: currentSource?.type === 'ai-slot' ? currentSource.id : undefined,
+                placement: payload.placement || 'right',
+                createdAt,
+              },
+            })
+
+            createdNodeIds.push(nodeId)
+            newNodes.push(resultNode)
+            nextNodes = [...nextNodes, resultNode]
+
+            if (currentSource) {
+              newEdges.push({
+                id: createEdgeId(),
+                from: currentSource.id,
+                to: nodeId,
+                type: payload.kind,
+                prompt,
+                createdAt,
+              })
+            }
+          })
+
+          nextEdges.push(...newEdges)
+
+          return patchWithHistory(state, {
+            selectedNodeId: createdNodeIds[0],
+            selectedNodeIds: createdNodeIds,
+            nodes: [...state.nodes, ...newNodes],
+            edges: nextEdges,
+          })
+        })
+
+        return createdNodeIds
+      },
       generateVariations: (sourceNodeId) => {
         const state = get()
         const source =
@@ -1795,13 +2047,33 @@ export const useCanvasStore = create<CanvasState>()(
           count: 4,
           batchId,
         })
+        const createdAt = Date.now()
+        const resultNodes = result.nodes.map((node) => ({
+          ...node,
+          sourceNodeId: source.id,
+          generation: node.generation
+            ? {
+                ...node.generation,
+                createdAt,
+              }
+            : node.generation,
+        }))
+        const edges = resultNodes.map((node) => ({
+          id: createEdgeId(),
+          from: source.id,
+          to: node.id,
+          type: 'generate' as const,
+          prompt: node.generation?.prompt || nodePrompt(source),
+          createdAt,
+        }))
 
         set((current) => ({
           activeTool: 'variations',
           ...patchWithHistory(current, {
-            selectedNodeId: result.nodes[0]?.id,
-            selectedNodeIds: result.nodes[0] ? [result.nodes[0].id] : [],
-            nodes: [...current.nodes, ...result.nodes],
+            selectedNodeId: resultNodes[0]?.id,
+            selectedNodeIds: resultNodes[0] ? [resultNodes[0].id] : [],
+            nodes: [...current.nodes, ...resultNodes],
+            edges: [...current.edges, ...edges],
             tasks: [result.task, ...current.tasks].slice(0, 5),
           }),
         }))
@@ -1845,6 +2117,7 @@ export const useCanvasStore = create<CanvasState>()(
             assetUrl: mockResultAssetUrl(state.nodes),
             status: 'ready',
             parentIds: [source.id],
+            sourceNodeId: source.id,
             generation: {
               prompt: resultPrompt,
               model: 'Mivo Mock Image Workflow',
@@ -1852,6 +2125,7 @@ export const useCanvasStore = create<CanvasState>()(
               seed: createdAt % 99999,
               strength: operation === 'upscale' ? 0.28 : 0.62,
               taskId: `task-${id}`,
+              createdAt,
             },
             aiWorkflow: {
               kind: 'result',
@@ -1871,11 +2145,20 @@ export const useCanvasStore = create<CanvasState>()(
             progress: 100,
             nodeIds: [id],
           }
+          const edge: CanvasEdge = {
+            id: createEdgeId(),
+            from: source.id,
+            to: id,
+            type: edgeTypeForOperation(operation),
+            prompt: resultPrompt,
+            createdAt,
+          }
 
           return patchWithHistory(state, {
             selectedNodeId: id,
             selectedNodeIds: [id],
             nodes: normalizeCanvasNodes([...state.nodes, result]),
+            edges: [...state.edges, edge],
             tasks: [task, ...state.tasks].slice(0, 5),
           })
         })
@@ -1912,6 +2195,7 @@ export const useCanvasStore = create<CanvasState>()(
             assetUrl: mockResultAssetUrl(state.nodes),
             status: 'ready',
             parentIds: [source.id],
+            sourceNodeId: source.id,
             generation: {
               prompt: resultPrompt,
               model: 'Mivo Mock Image Workflow',
@@ -1919,6 +2203,7 @@ export const useCanvasStore = create<CanvasState>()(
               seed: createdAt % 99999,
               strength: 0.58,
               taskId: `task-${id}`,
+              createdAt,
             },
             aiWorkflow: {
               kind: 'result',
@@ -1938,11 +2223,20 @@ export const useCanvasStore = create<CanvasState>()(
             progress: 100,
             nodeIds: [id],
           }
+          const edge: CanvasEdge = {
+            id: createEdgeId(),
+            from: source.id,
+            to: id,
+            type: 'generate',
+            prompt: resultPrompt,
+            createdAt,
+          }
 
           return patchWithHistory(state, {
             selectedNodeId: id,
             selectedNodeIds: [id],
             nodes: normalizeCanvasNodes([...state.nodes, result]),
+            edges: [...state.edges, edge],
             tasks: [task, ...state.tasks].slice(0, 5),
           })
         })
@@ -1969,6 +2263,7 @@ export const useCanvasStore = create<CanvasState>()(
             assetUrl: mockResultAssetUrl(state.nodes),
             status: 'ready',
             parentIds: [slot.id],
+            sourceNodeId: slot.id,
             generation: {
               prompt: resultPrompt,
               model: 'Mivo Mock Image Workflow',
@@ -1976,6 +2271,7 @@ export const useCanvasStore = create<CanvasState>()(
               seed: createdAt % 99999,
               strength: 0.62,
               taskId: `task-${id}`,
+              createdAt,
             },
             aiWorkflow: {
               kind: 'result',
@@ -2000,6 +2296,7 @@ export const useCanvasStore = create<CanvasState>()(
                     seed: node.generation?.seed || createdAt % 99999,
                     strength: node.generation?.strength,
                     taskId: `task-${id}`,
+                    createdAt,
                   },
                   aiWorkflow: {
                     ...(node.aiWorkflow || { kind: 'slot' as const }),
@@ -2017,11 +2314,20 @@ export const useCanvasStore = create<CanvasState>()(
             progress: 100,
             nodeIds: [id],
           }
+          const edge: CanvasEdge = {
+            id: createEdgeId(),
+            from: slot.id,
+            to: id,
+            type: 'generate',
+            prompt: resultPrompt,
+            createdAt,
+          }
 
           return patchWithHistory(state, {
             selectedNodeId: id,
             selectedNodeIds: [id],
             nodes: normalizeCanvasNodes([...nodes, result]),
+            edges: [...state.edges, edge],
             tasks: [task, ...state.tasks].slice(0, 5),
           })
         })
@@ -2060,6 +2366,7 @@ export const useCanvasStore = create<CanvasState>()(
             assetUrl: mockResultAssetUrl(state.nodes),
             status: 'ready',
             parentIds: source ? [source.id, annotation.id] : [annotation.id],
+            sourceNodeId: anchor.id,
             generation: {
               prompt: resultPrompt,
               model: 'Mivo Mock Image Workflow',
@@ -2067,6 +2374,7 @@ export const useCanvasStore = create<CanvasState>()(
               seed: createdAt % 99999,
               strength: 0.66,
               taskId: `task-${id}`,
+              createdAt,
             },
             aiWorkflow: {
               kind: 'result',
@@ -2087,11 +2395,20 @@ export const useCanvasStore = create<CanvasState>()(
             progress: 100,
             nodeIds: [id],
           }
+          const edge: CanvasEdge = {
+            id: createEdgeId(),
+            from: anchor.id,
+            to: id,
+            type: 'edit',
+            prompt: resultPrompt,
+            createdAt,
+          }
 
           return patchWithHistory(state, {
             selectedNodeId: id,
             selectedNodeIds: [id],
             nodes: normalizeCanvasNodes([...state.nodes, result]),
+            edges: [...state.edges, edge],
             tasks: [task, ...state.tasks].slice(0, 5),
           })
         })
@@ -2133,6 +2450,7 @@ export const useCanvasStore = create<CanvasState>()(
           return {
             ...remember(state),
             nodes: document.nodes,
+            edges: document.edges || [],
             tasks: document.tasks,
             selectedNodeId: document.selectedNodeId,
             selectedNodeIds: document.selectedNodeIds || [],
@@ -2150,15 +2468,25 @@ export const useCanvasStore = create<CanvasState>()(
           historyFuture: [],
         })),
       getSnapshot: () => snapshotFromState(get()),
-      getAiContextSnapshot: () => buildAiContextSnapshot(get()),
+      getAiContextSnapshot: () => {
+        const state = get()
+        return buildAiContextSnapshot({
+          sceneId: state.sceneId,
+          nodes: state.nodes,
+          edges: state.edges,
+          selectedNodeId: state.selectedNodeId,
+          selectedNodeIds: state.selectedNodeIds,
+        })
+      },
     }),
     {
       name: 'mivo-canvas-demo',
-      version: 6,
+      version: 7,
       migrate: migratePersistedState,
       partialize: (state) => ({
         canvases: state.canvases,
         nodes: state.nodes,
+        edges: state.edges,
         tasks: state.tasks,
         sceneId: state.sceneId,
         selectedNodeId: state.selectedNodeId,

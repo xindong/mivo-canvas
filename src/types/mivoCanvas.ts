@@ -64,6 +64,21 @@ export type ConnectorBinding = {
   anchor: ConnectorAnchor
   offset?: number
 }
+export type CanvasEdgeType = 'generate' | 'edit'
+export type CanvasMaskBounds = {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+export type CanvasEdge = {
+  id: string
+  from: string
+  to: string
+  type: CanvasEdgeType
+  prompt: string
+  createdAt: number
+}
 export type AiWorkflowKind = 'slot' | 'annotation' | 'result'
 export type AiWorkflowStatus = 'empty' | 'queued' | 'generating' | 'ready' | 'failed'
 export type AiWorkflowOperation =
@@ -147,13 +162,16 @@ export type MivoCanvasNode = {
   locked?: boolean
   hidden?: boolean
   favorited?: boolean
+  sourceNodeId?: string
   generation?: {
     prompt: string
     model: string
-    size: string
-    seed: number
+    size?: string
+    seed?: number
     strength?: number
     taskId?: string
+    createdAt?: number
+    maskBounds?: CanvasMaskBounds
   }
   aiWorkflow?: CanvasAiWorkflow
 }
@@ -203,8 +221,9 @@ export type AiCanvasContextSnapshot = {
     results: number
   }
   nodes: AiCanvasContextNode[]
+  edges: CanvasEdge[]
   links: Array<{
-    kind: AiWorkflowOperation | 'parent' | 'connector'
+    kind: AiWorkflowOperation | CanvasEdgeType | 'parent' | 'connector'
     fromNodeId: string
     toNodeId: string
   }>
@@ -222,6 +241,7 @@ export type MivoCanvasSnapshot = {
   version: 1
   sceneId: CanvasId
   nodes: MivoCanvasNode[]
+  edges: CanvasEdge[]
   tasks: CanvasTask[]
   selectedNodeId?: string
   selectedNodeIds?: string[]
@@ -232,6 +252,7 @@ export type CanvasDocument = {
   sourceTemplateId?: DemoSceneId
   projectId?: string
   nodes: MivoCanvasNode[]
+  edges: CanvasEdge[]
   tasks: CanvasTask[]
   selectedNodeId?: string
   selectedNodeIds?: string[]
@@ -241,6 +262,7 @@ export type SceneDefinition = {
   id: DemoSceneId
   label: string
   nodes: MivoCanvasNode[]
+  edges?: CanvasEdge[]
   tasks: CanvasTask[]
   selectedNodeId?: string
   selectedNodeIds?: string[]

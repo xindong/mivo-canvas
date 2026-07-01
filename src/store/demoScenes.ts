@@ -293,6 +293,7 @@ export const snapshotFromScene = (sceneId: DemoSceneId): MivoCanvasSnapshot => {
     version: 1,
     sceneId,
     nodes: scene.nodes,
+    edges: scene.edges || [],
     tasks: scene.tasks,
     selectedNodeId: scene.selectedNodeId,
     selectedNodeIds: scene.selectedNodeIds || (scene.selectedNodeId ? [scene.selectedNodeId] : []),

@@ -3,6 +3,8 @@ import type {
   AiWorkflowOperation,
   AiWorkflowPlacement,
   AiWorkflowStatus,
+  CanvasEdge,
+  CanvasEdgeType,
   CanvasTask,
   MivoCanvasNode,
   MivoCanvasSnapshot,
@@ -12,6 +14,7 @@ import type { SerializedCanvasAsset } from './assetStorage'
 
 const nodeStatuses = new Set<NodeStatus>(['ready', 'generating', 'failed', 'queued'])
 const taskStatuses = new Set<CanvasTask['status']>(['running', 'queued', 'failed', 'done'])
+const canvasEdgeTypes = new Set<CanvasEdgeType>(['generate', 'edit'])
 const aiWorkflowKinds = new Set<AiWorkflowKind>(['slot', 'annotation', 'result'])
 const aiWorkflowStatuses = new Set<AiWorkflowStatus>(['empty', 'queued', 'generating', 'ready', 'failed'])
 const aiWorkflowOperations = new Set<AiWorkflowOperation>([
@@ -74,6 +77,20 @@ const isImageCrop = (value: unknown) => {
   )
 }
 
+const isCanvasMaskBounds = (value: unknown) => {
+  if (value === undefined) return true
+  if (!isRecord(value)) return false
+
+  return (
+    typeof value.x === 'number' &&
+    typeof value.y === 'number' &&
+    typeof value.width === 'number' &&
+    typeof value.height === 'number' &&
+    value.width > 0 &&
+    value.height > 0
+  )
+}
+
 const isAiWorkflow = (value: unknown) => {
   if (value === undefined) return true
   if (!isRecord(value)) return false
@@ -89,6 +106,22 @@ const isAiWorkflow = (value: unknown) => {
     (value.slotId === undefined || typeof value.slotId === 'string') &&
     (value.placement === undefined || aiWorkflowPlacements.has(value.placement as AiWorkflowPlacement)) &&
     (value.createdAt === undefined || typeof value.createdAt === 'number')
+  )
+}
+
+const isGeneration = (value: unknown) => {
+  if (value === undefined) return true
+  if (!isRecord(value)) return false
+
+  return (
+    typeof value.prompt === 'string' &&
+    typeof value.model === 'string' &&
+    (value.size === undefined || typeof value.size === 'string') &&
+    (value.seed === undefined || typeof value.seed === 'number') &&
+    (value.strength === undefined || typeof value.strength === 'number') &&
+    (value.taskId === undefined || typeof value.taskId === 'string') &&
+    (value.createdAt === undefined || typeof value.createdAt === 'number') &&
+    isCanvasMaskBounds(value.maskBounds)
   )
 }
 
@@ -154,9 +187,12 @@ const isCanvasNode = (value: unknown): value is MivoCanvasNode => {
     (value.imageHasTransparency === undefined || typeof value.imageHasTransparency === 'boolean') &&
     isImageCrop(value.imageCrop) &&
     (value.parentIds === undefined || isStringArray(value.parentIds)) &&
+    (value.sourceNodeId === undefined || typeof value.sourceNodeId === 'string') &&
     (value.groupId === undefined || typeof value.groupId === 'string') &&
     (value.locked === undefined || typeof value.locked === 'boolean') &&
     (value.hidden === undefined || typeof value.hidden === 'boolean') &&
+    (value.favorited === undefined || typeof value.favorited === 'boolean') &&
+    isGeneration(value.generation) &&
     isAiWorkflow(value.aiWorkflow)
   )
 }
@@ -172,6 +208,19 @@ const isCanvasTask = (value: unknown): value is CanvasTask => {
     value.progress >= 0 &&
     value.progress <= 100 &&
     isStringArray(value.nodeIds)
+  )
+}
+
+const isCanvasEdge = (value: unknown): value is CanvasEdge => {
+  if (!isRecord(value)) return false
+
+  return (
+    typeof value.id === 'string' &&
+    typeof value.from === 'string' &&
+    typeof value.to === 'string' &&
+    canvasEdgeTypes.has(value.type as CanvasEdgeType) &&
+    typeof value.prompt === 'string' &&
+    typeof value.createdAt === 'number'
   )
 }
 
@@ -209,6 +258,10 @@ const validateSnapshot = (parsed: unknown) => {
     return { ok: false as const, message: '快照里的任务列表无效。' }
   }
 
+  if (parsed.edges !== undefined && (!Array.isArray(parsed.edges) || !parsed.edges.every(isCanvasEdge))) {
+    return { ok: false as const, message: '快照里的派生关系无效。' }
+  }
+
   if (parsed.selectedNodeId !== undefined && typeof parsed.selectedNodeId !== 'string') {
     return { ok: false as const, message: '快照里的选中节点无效。' }
   }
@@ -219,7 +272,10 @@ const validateSnapshot = (parsed: unknown) => {
 
   return {
     ok: true as const,
-    snapshot: parsed as MivoCanvasSnapshot,
+    snapshot: {
+      ...(parsed as MivoCanvasSnapshot),
+      edges: (parsed.edges as CanvasEdge[] | undefined) || [],
+    },
   }
 }
 

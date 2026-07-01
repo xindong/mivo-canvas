@@ -1,6 +1,7 @@
 import type {
   AiCanvasContextSnapshot,
   AiWorkflowPlacement,
+  CanvasEdge,
   CanvasId,
   MivoCanvasNode,
 } from '../types/mivoCanvas'
@@ -8,9 +9,12 @@ import type {
 type AiContextState = {
   sceneId: CanvasId
   nodes: MivoCanvasNode[]
+  edges: CanvasEdge[]
   selectedNodeId?: string
   selectedNodeIds: string[]
 }
+
+const derivationEdgeModel = 'Mivo Derivation Edge'
 
 const rectsOverlap = (
   a: Pick<MivoCanvasNode, 'x' | 'y' | 'width' | 'height'>,
@@ -83,7 +87,12 @@ export const chooseAdjacentPlacement = ({
 
 export const buildAiContextSnapshot = (state: AiContextState): AiCanvasContextSnapshot => {
   const visibleNodes = state.nodes.filter((node) => !node.hidden)
-  const selectedNodeIds = selectedIdsForSnapshot(state.selectedNodeIds, state.selectedNodeId, visibleNodes)
+  const visibleContentNodes = visibleNodes.filter((node) => node.generation?.model !== derivationEdgeModel)
+  const visibleContentIds = new Set(visibleContentNodes.map((node) => node.id))
+  const visibleEdges = state.edges.filter(
+    (edge) => visibleContentIds.has(edge.from) && visibleContentIds.has(edge.to),
+  )
+  const selectedNodeIds = selectedIdsForSnapshot(state.selectedNodeIds, state.selectedNodeId, visibleContentNodes)
   const links: AiCanvasContextSnapshot['links'] = []
   const linkKeys = new Set<string>()
   const pushLink = (link: AiCanvasContextSnapshot['links'][number]) => {
@@ -94,7 +103,11 @@ export const buildAiContextSnapshot = (state: AiContextState): AiCanvasContextSn
     links.push(link)
   }
 
-  visibleNodes.forEach((node) => {
+  visibleEdges.forEach((edge) => {
+    pushLink({ kind: edge.type, fromNodeId: edge.from, toNodeId: edge.to })
+  })
+
+  visibleContentNodes.forEach((node) => {
     node.parentIds?.forEach((parentId) => {
       pushLink({ kind: 'parent', fromNodeId: parentId, toNodeId: node.id })
     })
@@ -139,13 +152,13 @@ export const buildAiContextSnapshot = (state: AiContextState): AiCanvasContextSn
     sceneId: state.sceneId,
     selectedNodeIds,
     summary: {
-      nodes: visibleNodes.length,
-      images: visibleNodes.filter((node) => node.type === 'image').length,
-      slots: visibleNodes.filter((node) => node.type === 'ai-slot').length,
-      annotations: visibleNodes.filter((node) => node.type === 'annotation').length,
-      results: visibleNodes.filter((node) => node.aiWorkflow?.kind === 'result').length,
+      nodes: visibleContentNodes.length,
+      images: visibleContentNodes.filter((node) => node.type === 'image').length,
+      slots: visibleContentNodes.filter((node) => node.type === 'ai-slot').length,
+      annotations: visibleContentNodes.filter((node) => node.type === 'annotation').length,
+      results: visibleContentNodes.filter((node) => node.aiWorkflow?.kind === 'result').length,
     },
-    nodes: visibleNodes.map((node) => ({
+    nodes: visibleContentNodes.map((node) => ({
       id: node.id,
       type: node.type,
       title: node.title,
@@ -182,6 +195,7 @@ export const buildAiContextSnapshot = (state: AiContextState): AiCanvasContextSn
           }
         : undefined,
     })),
+    edges: visibleEdges.map((edge) => ({ ...edge })),
     links,
   }
 }
