@@ -1,5 +1,5 @@
 import { Brush, MousePointer2, Redo2, Sparkles, Square, Trash2, Undo2, X } from 'lucide-react'
-import { useMemo, useRef, useState, type PointerEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 import {
   boundsForRegions,
@@ -111,6 +111,9 @@ export function ImageMaskEditOverlay({
   const [brushSizePx, setBrushSizePx] = useState(48)
   const [draft, setDraft] = useState<DraftRegion>()
   const [statusError, setStatusError] = useState('')
+  const regionsRef = useRef<ImageMaskRegion[]>([])
+  const draftRef = useRef<DraftRegion | undefined>(undefined)
+  const removeWindowDragListenersRef = useRef<() => void>(() => undefined)
   const promptReady = Boolean(prompt.trim())
   const maskEditHint = !regions.length
     ? '先在图片上点选、框选或涂抹要修改的区域。'
@@ -130,92 +133,135 @@ export function ImageMaskEditOverlay({
     [naturalSize.height, naturalSize.width, node.height, node.imageCrop, node.width],
   )
 
+  const updateDraft = (nextDraft?: DraftRegion) => {
+    draftRef.current = nextDraft
+    setDraft(nextDraft)
+  }
+
   const commitRegions = (nextRegions: ImageMaskRegion[]) => {
-    setPast((current) => [...current, regions])
+    const previousRegions = regionsRef.current
+    regionsRef.current = nextRegions
+    setPast((current) => [...current, previousRegions])
     setRegions(nextRegions)
     setFuture([])
     setStatusError('')
   }
 
-  const localPointForEvent = (event: PointerEvent<HTMLElement>): ImageMaskPoint | undefined => {
+  useEffect(() => () => removeWindowDragListenersRef.current(), [])
+
+  const localPointForClient = (clientX: number, clientY: number): ImageMaskPoint | undefined => {
     const rect = stageRef.current?.getBoundingClientRect()
     if (!rect) return undefined
 
     return {
-      x: ((event.clientX - rect.left) / Math.max(1, rect.width)) * node.width,
-      y: ((event.clientY - rect.top) / Math.max(1, rect.height)) * node.height,
+      x: ((clientX - rect.left) / Math.max(1, rect.width)) * node.width,
+      y: ((clientY - rect.top) / Math.max(1, rect.height)) * node.height,
     }
   }
 
-  const pixelForEvent = (event: PointerEvent<HTMLElement>) => {
-    const point = localPointForEvent(event)
+  const pixelForClient = (clientX: number, clientY: number) => {
+    const point = localPointForClient(clientX, clientY)
     return point ? nodePointToImagePixel(point, displayRect, naturalSize, node.imageCrop) : undefined
   }
 
-  const beginPointer = (event: PointerEvent<HTMLElement>) => {
+  const updateDraftAtPixel = (pixel: ImageMaskPoint) => {
+    const currentDraft = draftRef.current
+    if (!currentDraft) return
+
+    if (currentDraft.type === 'box') {
+      updateDraft({ ...currentDraft, current: pixel })
+      return
+    }
+
+    const lastPoint = currentDraft.points.at(-1)
+    if (lastPoint && Math.hypot(lastPoint.x - pixel.x, lastPoint.y - pixel.y) < Math.max(2, brushSizePx / 6)) {
+      return
+    }
+    updateDraft({ ...currentDraft, points: [...currentDraft.points, pixel] })
+  }
+
+  const commitDraftAtPixel = (pixel?: ImageMaskPoint) => {
+    const currentDraft = draftRef.current
+    if (!currentDraft) return
+
+    const nextRegions = regionsRef.current
+    if (currentDraft.type === 'box') {
+      const finalCurrent = pixel || currentDraft.current
+      const x = Math.min(currentDraft.start.x, finalCurrent.x)
+      const y = Math.min(currentDraft.start.y, finalCurrent.y)
+      const width = Math.abs(finalCurrent.x - currentDraft.start.x)
+      const height = Math.abs(finalCurrent.y - currentDraft.start.y)
+      if (width >= minimumBoxSizePx && height >= minimumBoxSizePx) {
+        commitRegions([...nextRegions, { type: 'box', x, y, width, height }])
+      } else {
+        setStatusError('选区太小，请拖出更大的区域。')
+      }
+    } else {
+      const lastPoint = currentDraft.points.at(-1)
+      const shouldAppendEndPoint = pixel && lastPoint && Math.hypot(lastPoint.x - pixel.x, lastPoint.y - pixel.y) >= Math.max(2, brushSizePx / 6)
+      const points = shouldAppendEndPoint ? [...currentDraft.points, pixel] : currentDraft.points
+      if (points.length) {
+        commitRegions([...nextRegions, { type: 'brush', points, radius: brushSizePx }])
+      }
+    }
+    updateDraft(undefined)
+  }
+
+  const attachWindowDragListeners = () => {
+    removeWindowDragListenersRef.current()
+
+    const handleWindowPointerMove = (event: globalThis.PointerEvent) => {
+      if (!draftRef.current || submitting) return
+      event.preventDefault()
+      const pixel = pixelForClient(event.clientX, event.clientY)
+      if (pixel) updateDraftAtPixel(pixel)
+    }
+
+    const handleWindowPointerEnd = (event: globalThis.PointerEvent) => {
+      if (!draftRef.current || submitting) return
+      event.preventDefault()
+      commitDraftAtPixel(pixelForClient(event.clientX, event.clientY))
+      removeWindowDragListenersRef.current()
+    }
+
+    window.addEventListener('pointermove', handleWindowPointerMove)
+    window.addEventListener('pointerup', handleWindowPointerEnd)
+    window.addEventListener('pointercancel', handleWindowPointerEnd)
+    removeWindowDragListenersRef.current = () => {
+      window.removeEventListener('pointermove', handleWindowPointerMove)
+      window.removeEventListener('pointerup', handleWindowPointerEnd)
+      window.removeEventListener('pointercancel', handleWindowPointerEnd)
+      removeWindowDragListenersRef.current = () => undefined
+    }
+  }
+
+  const beginPointer = (event: ReactPointerEvent<HTMLElement>) => {
     event.preventDefault()
     event.stopPropagation()
     if (submitting) return
 
-    const pixel = pixelForEvent(event)
+    const pixel = pixelForClient(event.clientX, event.clientY)
     if (!pixel) return
 
     event.currentTarget.setPointerCapture(event.pointerId)
     if (tool === 'point') {
-      commitRegions([...regions, { type: 'point', center: pixel, radius: brushSizePx }])
+      commitRegions([...regionsRef.current, { type: 'point', center: pixel, radius: brushSizePx }])
       return
     }
     if (tool === 'box') {
-      setDraft({ type: 'box', start: pixel, current: pixel })
+      updateDraft({ type: 'box', start: pixel, current: pixel })
+      attachWindowDragListeners()
       return
     }
-    setDraft({ type: 'brush', points: [pixel] })
-  }
-
-  const updatePointer = (event: PointerEvent<HTMLElement>) => {
-    if (!draft || submitting) return
-    event.preventDefault()
-    event.stopPropagation()
-
-    const pixel = pixelForEvent(event)
-    if (!pixel) return
-
-    setDraft((current) => {
-      if (!current) return current
-      if (current.type === 'box') return { ...current, current: pixel }
-      const lastPoint = current.points.at(-1)
-      if (lastPoint && Math.hypot(lastPoint.x - pixel.x, lastPoint.y - pixel.y) < Math.max(2, brushSizePx / 6)) {
-        return current
-      }
-      return { ...current, points: [...current.points, pixel] }
-    })
-  }
-
-  const endPointer = (event: PointerEvent<HTMLElement>) => {
-    if (!draft || submitting) return
-    event.preventDefault()
-    event.stopPropagation()
-
-    if (draft.type === 'box') {
-      const x = Math.min(draft.start.x, draft.current.x)
-      const y = Math.min(draft.start.y, draft.current.y)
-      const width = Math.abs(draft.current.x - draft.start.x)
-      const height = Math.abs(draft.current.y - draft.start.y)
-      if (width >= minimumBoxSizePx && height >= minimumBoxSizePx) {
-        commitRegions([...regions, { type: 'box', x, y, width, height }])
-      } else {
-        setStatusError('选区太小，请拖出更大的区域。')
-      }
-    } else if (draft.points.length) {
-      commitRegions([...regions, { type: 'brush', points: draft.points, radius: brushSizePx }])
-    }
-    setDraft(undefined)
+    updateDraft({ type: 'brush', points: [pixel] })
+    attachWindowDragListeners()
   }
 
   const undo = () => {
     const previous = past.at(-1)
     if (!previous) return
     setFuture((current) => [regions, ...current])
+    regionsRef.current = previous
     setRegions(previous)
     setPast((current) => current.slice(0, -1))
   }
@@ -224,12 +270,13 @@ export function ImageMaskEditOverlay({
     const next = future[0]
     if (!next) return
     setPast((current) => [...current, regions])
+    regionsRef.current = next
     setRegions(next)
     setFuture((current) => current.slice(1))
   }
 
   const clear = () => {
-    if (!regions.length) return
+    if (!regionsRef.current.length) return
     commitRegions([])
   }
 
@@ -268,15 +315,17 @@ export function ImageMaskEditOverlay({
     : regions
 
   return (
-    <div className="image-mask-edit-overlay" data-canvas-ui="true" onPointerDown={(event) => event.stopPropagation()}>
+    <div
+      className="image-mask-edit-overlay"
+      data-canvas-ui="true"
+      data-region-count={regions.length}
+      onPointerDown={(event) => event.stopPropagation()}
+    >
       <div
         ref={stageRef}
         className="image-mask-edit-stage"
         data-canvas-ui="true"
         onPointerDown={beginPointer}
-        onPointerMove={updatePointer}
-        onPointerUp={endPointer}
-        onPointerCancel={endPointer}
       >
         <svg width={node.width} height={node.height} viewBox={`0 0 ${node.width} ${node.height}`}>
           <rect
