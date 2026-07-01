@@ -24,6 +24,7 @@ Mivo Canvas is an early interaction demo for the desktop-style AI art canvas dis
 ## Product direction notes
 
 - New canvas features should start by checking mature GitHub references before implementation.
+- New user-facing features must follow the [Development Feedback Rule](docs/development-logging.md): emit Debug Log entries through `debugLogger` for diagnosable state changes, workflow results, skipped paths, and failures, and use `toastFeedback` for short user-visible success, info, warning, and error outcomes.
 - Current image handling follows the same broad model used by mature infinite-canvas tools: keep the original asset separate from the canvas node that displays it.
 - Local imports are stored as original blobs in IndexedDB. Canvas resizing, transparent PNG display, and crop windows only affect the node display frame.
 - The Assets workspace uses the shared `AssetSource` / `AssetItem` model in `src/app/assetLibraryModel.ts` so Local, Eagle, Pinterest, and future sources can render through the same browser, details panel, drag payload, and canvas import path.

@@ -29,6 +29,7 @@ import {
 } from '../lib/canvasAssetImport'
 import { importedImageDisplaySize, type ImportedImageMetadata } from '../lib/imageSizing'
 import { buildAiContextSnapshot, chooseAdjacentPlacement } from './aiCanvasWorkflow'
+import { debugLogger } from './debugLogStore'
 import { makeNode, realCaseImages, scenes, snapshotFromScene } from './demoScenes'
 import { mockGenerationAdapter } from './mockGeneration'
 
@@ -785,6 +786,10 @@ const defaultSceneId: CanvasId = 'character-flow'
 const defaultCanvases = initialCanvases()
 const defaultDocument = documentFor(defaultCanvases, defaultSceneId)
 
+const logCanvas = (message: string) => debugLogger.log('Canvas Store', message)
+const warnCanvas = (message: string) => debugLogger.warn('Canvas Store', message)
+const errorCanvas = (message: string) => debugLogger.error('Canvas Store', message)
+
 export const useCanvasStore = create<CanvasState>()(
   persist(
     (set, get) => ({
@@ -827,13 +832,17 @@ export const useCanvasStore = create<CanvasState>()(
           }
         })
 
+        logCanvas(`Created canvas "${title}" (${id})`)
         return id
       },
       duplicateCanvas: (canvasId) => {
         const state = get()
         const sourceId = canvasId || state.sceneId
         const sourceDocument = state.canvases[sourceId]
-        if (!sourceDocument) return undefined
+        if (!sourceDocument) {
+          warnCanvas(`Duplicate canvas skipped: missing source ${sourceId}`)
+          return undefined
+        }
 
         const id = createCanvasId()
         const duplicatedDocument = normalizeDocument({
@@ -858,23 +867,34 @@ export const useCanvasStore = create<CanvasState>()(
           },
         }))
 
+        logCanvas(`Duplicated canvas "${sourceDocument.title}" to ${id}`)
         return id
       },
       deleteCanvas: (canvasId) =>
         set((state) => {
           const targetId = canvasId || state.sceneId
           const canvasIds = Object.keys(state.canvases)
-          if (!state.canvases[targetId] || canvasIds.length <= 1) return {}
+          if (!state.canvases[targetId]) {
+            warnCanvas(`Delete canvas skipped: missing canvas ${targetId}`)
+            return {}
+          }
+          if (canvasIds.length <= 1) {
+            errorCanvas('Delete canvas blocked: at least one canvas must remain')
+            return {}
+          }
 
           const remainingCanvases = { ...state.canvases }
+          const deletedTitle = state.canvases[targetId].title
           delete remainingCanvases[targetId]
 
           if (targetId !== state.sceneId) {
+            logCanvas(`Deleted inactive canvas "${deletedTitle}"`)
             return { canvases: remainingCanvases }
           }
 
           const nextSceneId = canvasIds.find((id) => id !== targetId) || defaultSceneId
           const nextDocument = normalizeDocument(documentFor(remainingCanvases, nextSceneId))
+          logCanvas(`Deleted active canvas "${deletedTitle}" and loaded "${nextDocument.title}"`)
 
           return {
             canvases: remainingCanvases,
@@ -891,6 +911,7 @@ export const useCanvasStore = create<CanvasState>()(
       loadScene: (sceneId) =>
         set((state) => {
           const document = normalizeDocument(documentFor(state.canvases, sceneId))
+          logCanvas(`Loaded canvas "${document.title}" (${sceneId})`)
 
           return {
             sceneId,
@@ -910,6 +931,7 @@ export const useCanvasStore = create<CanvasState>()(
       renameCanvas: (sceneId, title) =>
         set((state) => {
           const document = documentFor(state.canvases, sceneId)
+          logCanvas(`Renamed canvas "${document.title}" to "${title}"`)
 
           return {
             canvases: {
@@ -923,10 +945,16 @@ export const useCanvasStore = create<CanvasState>()(
         }),
       selectNode: (nodeId, options) =>
         set((state) => {
-          if (!nodeId) return patchActiveCanvas(state, { selectedNodeId: undefined, selectedNodeIds: [] })
+          if (!nodeId) {
+            logCanvas('Selection cleared')
+            return patchActiveCanvas(state, { selectedNodeId: undefined, selectedNodeIds: [] })
+          }
 
           const target = state.nodes.find((node) => node.id === nodeId && !node.hidden)
-          if (!target) return {}
+          if (!target) {
+            warnCanvas(`Selection skipped: node ${nodeId} is missing or hidden`)
+            return {}
+          }
 
           const targetNodeIds = target.groupId
             ? state.nodes
@@ -945,9 +973,11 @@ export const useCanvasStore = create<CanvasState>()(
               ? state.selectedNodeId
               : normalizedSelection.at(-1)
 
+            logCanvas(`Selection toggled: ${normalizedSelection.length} selected`)
             return patchActiveCanvas(state, { selectedNodeId, selectedNodeIds: normalizedSelection })
           }
 
+          logCanvas(`Selected ${targetNodeIds.length === 1 ? target.title : `${targetNodeIds.length} grouped nodes`}`)
           return patchActiveCanvas(state, { selectedNodeId: nodeId, selectedNodeIds: targetNodeIds })
         }),
       selectNodes: (nodeIds, primaryNodeId) =>
@@ -955,10 +985,14 @@ export const useCanvasStore = create<CanvasState>()(
           const selectedNodeIds = normalizeSelection(nodeIds, state.nodes)
           const selectedNodeId =
             primaryNodeId && selectedNodeIds.includes(primaryNodeId) ? primaryNodeId : selectedNodeIds[0]
+          logCanvas(`Selected ${selectedNodeIds.length} node${selectedNodeIds.length === 1 ? '' : 's'}`)
 
           return patchActiveCanvas(state, { selectedNodeId, selectedNodeIds })
         }),
-      setActiveTool: (toolId) => set({ activeTool: toolId }),
+      setActiveTool: (toolId) => {
+        logCanvas(`Tool changed to ${toolId}`)
+        set({ activeTool: toolId })
+      },
       captureHistory: () => set((state) => remember(state)),
       undo: () =>
         set((state) => {
@@ -1501,6 +1535,7 @@ export const useCanvasStore = create<CanvasState>()(
           }
         }),
       addImportedImage: (assetUrl, title = 'Imported Image', size = 'source', position, metadata) => {
+        logCanvas(`Import image requested: ${title}`)
         get().addImportedFileNode('image', assetUrl, title, size, position, metadata)
       },
       addImportedFileNode: (type, assetUrl, title, size = 'source', position, metadata) => {
@@ -1546,11 +1581,15 @@ export const useCanvasStore = create<CanvasState>()(
             ],
           }),
         )
+        logCanvas(`Imported ${type} node "${nodeTitle}" from ${metadata?.originalName || assetUrl}`)
       },
       cropImageNode: (nodeId, box) =>
         set((state) => {
           const source = state.nodes.find((node) => node.id === nodeId && node.type === 'image')
-          if (!source) return {}
+          if (!source) {
+            warnCanvas(`Crop skipped: image node ${nodeId} not found`)
+            return {}
+          }
 
           const sourceWidth = Math.max(1, source.width)
           const sourceHeight = Math.max(1, source.height)
@@ -1586,6 +1625,7 @@ export const useCanvasStore = create<CanvasState>()(
               : node,
           )
 
+          logCanvas(`Cropped image "${source.title}"`)
           return patchWithHistory(state, { nodes, selectedNodeId: nodeId, selectedNodeIds: [nodeId] })
         }),
       addFrameNode: (position, size, title) => {
@@ -1617,6 +1657,7 @@ export const useCanvasStore = create<CanvasState>()(
           })
         })
 
+        logCanvas(`Created section ${id}`)
         return id
       },
       addAiSlotNode: (position, size, prompt) => {
@@ -1661,6 +1702,7 @@ export const useCanvasStore = create<CanvasState>()(
           })
         })
 
+        logCanvas(`Created AI slot ${id}`)
         return id
       },
       addAnnotationNode: (sourceNodeId, position, instruction, options) => {
@@ -1673,7 +1715,10 @@ export const useCanvasStore = create<CanvasState>()(
           const source =
             state.nodes.find((node) => node.id === sourceNodeId && !node.hidden) ||
             state.nodes.find((node) => node.id === state.selectedNodeId && !node.hidden)
-          if (!source) return {}
+          if (!source) {
+            warnCanvas('Annotation creation skipped: no source node selected')
+            return {}
+          }
 
           const note = instruction?.trim() || 'Describe the image edit here'
           const x = Math.round(position?.x ?? source.x + 28)
@@ -1719,6 +1764,7 @@ export const useCanvasStore = create<CanvasState>()(
           })
         })
 
+        if (created) logCanvas(`Created annotation ${id}`)
         return created ? id : undefined
       },
       addMarkupNode: (kind, position, geometry, options) => {
@@ -1784,6 +1830,7 @@ export const useCanvasStore = create<CanvasState>()(
           })
         })
 
+        logCanvas(`Created ${kind} markup ${id}`)
         return id
       },
       updateMarkupGeometry: (nodeId, geometry, points, bindings) =>
@@ -1910,6 +1957,7 @@ export const useCanvasStore = create<CanvasState>()(
           }),
         )
 
+        logCanvas(`Created text node ${id}`)
         return id
       },
       updateTextNode: (nodeId, text, geometry) =>
@@ -1973,7 +2021,10 @@ export const useCanvasStore = create<CanvasState>()(
           state.nodes.find((node) => node.id === state.selectedNodeId) ||
           state.nodes[0]
 
-        if (!source) return
+        if (!source) {
+          warnCanvas('Variation generation skipped: no source node available')
+          return
+        }
 
         const batchId = Date.now() % 100000
         const result = mockGenerationAdapter.generateVariations({
@@ -1991,6 +2042,7 @@ export const useCanvasStore = create<CanvasState>()(
             tasks: [result.task, ...current.tasks].slice(0, 5),
           }),
         }))
+        logCanvas(`Generated ${result.nodes.length} variations from "${source.title}"`)
       },
       generateImageEdit: (sourceNodeId, operation, prompt) => {
         const id = createNodeId(`ai-${operation}`)
@@ -2007,7 +2059,10 @@ export const useCanvasStore = create<CanvasState>()(
           const source =
             state.nodes.find((node) => node.id === sourceNodeId && node.type === 'image' && !node.hidden) ||
             state.nodes.find((node) => node.id === state.selectedNodeId && node.type === 'image' && !node.hidden)
-          if (!source) return {}
+          if (!source) {
+            warnCanvas(`Image edit skipped: no image source for ${operation}`)
+            return {}
+          }
 
           const operationLabel = operationLabels[operation] || 'Image edit'
           const resultPrompt = prompt.trim() || operationLabel
@@ -2058,6 +2113,7 @@ export const useCanvasStore = create<CanvasState>()(
             nodeIds: [id],
           }
 
+          logCanvas(`Generated ${operationLabel} result for "${source.title}"`)
           return patchWithHistory(state, {
             selectedNodeId: id,
             selectedNodeIds: [id],
@@ -2075,7 +2131,10 @@ export const useCanvasStore = create<CanvasState>()(
             state.nodes.find((node) => node.id === sourceNodeId && !node.hidden) ||
             state.nodes.find((node) => node.id === state.selectedNodeId && !node.hidden) ||
             state.nodes.find((node) => !node.hidden)
-          if (!source) return {}
+          if (!source) {
+            warnCanvas('Beside generation skipped: no source node available')
+            return {}
+          }
 
           const width = source.type === 'text' || source.type === 'annotation' ? 320 : source.width
           const height = source.type === 'text' || source.type === 'annotation' ? 240 : source.height
@@ -2125,6 +2184,7 @@ export const useCanvasStore = create<CanvasState>()(
             nodeIds: [id],
           }
 
+          logCanvas(`Generated beside result from "${source.title}"`)
           return patchWithHistory(state, {
             selectedNodeId: id,
             selectedNodeIds: [id],
@@ -2141,7 +2201,10 @@ export const useCanvasStore = create<CanvasState>()(
           const slot =
             state.nodes.find((node) => node.id === slotId && node.type === 'ai-slot' && !node.hidden) ||
             state.nodes.find((node) => node.id === state.selectedNodeId && node.type === 'ai-slot' && !node.hidden)
-          if (!slot) return {}
+          if (!slot) {
+            warnCanvas('Slot generation skipped: no AI slot selected')
+            return {}
+          }
 
           const resultPrompt = prompt?.trim() || nodePrompt(slot, '根据 AI 槽位生成图片')
           const result = makeNode({
@@ -2204,6 +2267,7 @@ export const useCanvasStore = create<CanvasState>()(
             nodeIds: [id],
           }
 
+          logCanvas(`Generated into AI slot "${slot.title}"`)
           return patchWithHistory(state, {
             selectedNodeId: id,
             selectedNodeIds: [id],
@@ -2220,7 +2284,10 @@ export const useCanvasStore = create<CanvasState>()(
           const annotation =
             state.nodes.find((node) => node.id === annotationNodeId && node.type === 'annotation' && !node.hidden) ||
             state.nodes.find((node) => node.id === state.selectedNodeId && node.type === 'annotation' && !node.hidden)
-          if (!annotation) return {}
+          if (!annotation) {
+            warnCanvas('Annotation generation skipped: no annotation selected')
+            return {}
+          }
 
           const sourceId = annotation.aiWorkflow?.sourceNodeIds?.[0] || annotation.parentIds?.[0]
           const source = sourceId ? state.nodes.find((node) => node.id === sourceId && !node.hidden) : undefined
@@ -2274,6 +2341,7 @@ export const useCanvasStore = create<CanvasState>()(
             nodeIds: [id],
           }
 
+          logCanvas(`Generated from annotation "${annotation.title}"`)
           return patchWithHistory(state, {
             selectedNodeId: id,
             selectedNodeIds: [id],

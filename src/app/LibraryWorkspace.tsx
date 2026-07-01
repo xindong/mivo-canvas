@@ -17,6 +17,7 @@ import {
 } from 'lucide-react'
 import { importImageUrlToCanvas } from '../lib/canvasAssetImport'
 import { useCanvasStore } from '../store/canvasStore'
+import { debugLogger } from '../store/debugLogStore'
 import {
   assetMatchesQuery,
   dimensionsLabel,
@@ -241,9 +242,11 @@ export function LibraryWorkspace({ type, onOpenCanvas }: LibraryWorkspaceProps) 
       setLocalAssetRoot(payload.root)
       setLocalAssets(payload.assets.map(localAssetFromApi))
       setAssetLoadState('ready')
-    } catch {
+      debugLogger.log('Asset Library', `Loaded ${payload.assets.length} local assets from ${payload.root}`)
+    } catch (error) {
       setLocalAssets([])
       setAssetLoadState('error')
+      debugLogger.error('Asset Library', `Local asset load failed: ${error instanceof Error ? error.message : String(error)}`)
     }
   }, [isAssets])
 
@@ -271,11 +274,17 @@ export function LibraryWorkspace({ type, onOpenCanvas }: LibraryWorkspaceProps) 
       const assetsPayload = (await assetsResponse.json()) as EagleAssetsResponse
       setEagleAssets(assetsPayload.assets.map(eagleAssetFromApi))
       setEagleLoadState(statusPayload.connected ? 'ready' : 'error')
-    } catch {
+      if (statusPayload.connected) {
+        debugLogger.log('Asset Library', `Loaded ${assetsPayload.assets.length} Eagle assets`)
+      } else {
+        debugLogger.warn('Asset Library', 'Eagle is offline or not reachable')
+      }
+    } catch (error) {
       setEagleStatus({ connected: false })
       setEagleAssets([])
       setEagleFolders([])
       setEagleLoadState('error')
+      debugLogger.error('Asset Library', `Eagle asset load failed: ${error instanceof Error ? error.message : String(error)}`)
     }
   }, [isAssets, query, selectedEagleFolderId])
 
@@ -285,9 +294,12 @@ export function LibraryWorkspace({ type, onOpenCanvas }: LibraryWorkspaceProps) 
     try {
       const response = await fetch('/api/mivo/pinterest/status')
       if (!response.ok) throw new Error(`Pinterest status failed with ${response.status}`)
-      setPinterestStatus((await response.json()) as PinterestStatus)
-    } catch {
+      const status = (await response.json()) as PinterestStatus
+      setPinterestStatus(status)
+      debugLogger.log('Asset Library', `Pinterest status loaded: ${status.connected ? 'connected' : status.mode || 'preview'}`)
+    } catch (error) {
       setPinterestStatus(undefined)
+      debugLogger.warn('Asset Library', `Pinterest status unavailable: ${error instanceof Error ? error.message : String(error)}`)
     }
   }, [isAssets])
 
@@ -295,9 +307,12 @@ export function LibraryWorkspace({ type, onOpenCanvas }: LibraryWorkspaceProps) 
     try {
       const response = await fetch('/api/mivo/pinterest/status')
       if (!response.ok) throw new Error(await response.text())
-      setPinterestStatus((await response.json()) as PinterestStatus)
-    } catch {
+      const status = (await response.json()) as PinterestStatus
+      setPinterestStatus(status)
+      debugLogger.log('Asset Library', 'Pinterest settings status loaded')
+    } catch (error) {
       setPinterestStatus({ connected: false, mode: 'prototype' })
+      debugLogger.warn('Asset Library', `Pinterest settings fell back to prototype mode: ${error instanceof Error ? error.message : String(error)}`)
     }
   }, [])
 
@@ -309,11 +324,13 @@ export function LibraryWorkspace({ type, onOpenCanvas }: LibraryWorkspaceProps) 
   const startPinterestOAuth = useCallback(() => {
     setPinterestPrototypeConnected(true)
     setPinterestSettingsMessage('Pinterest authorization is a layout prototype for now. Once Mivo has account services, this button will open Pinterest and return here after approval.')
+    debugLogger.log('Asset Library', 'Pinterest prototype OAuth started')
   }, [])
 
   const disconnectPinterest = useCallback(() => {
     setPinterestPrototypeConnected(false)
     setPinterestSettingsMessage('Pinterest prototype connection cleared.')
+    debugLogger.warn('Asset Library', 'Pinterest prototype connection cleared')
   }, [])
 
   useEffect(() => {
@@ -329,6 +346,7 @@ export function LibraryWorkspace({ type, onOpenCanvas }: LibraryWorkspaceProps) 
   const addAssetToCanvas = useCallback(
     async (asset: AssetItem) => {
       await importImageUrlToCanvas(asset.url, asset.name, { x: 0, y: 0 }, addImportedImage)
+      debugLogger.log('Asset Library', `Added asset to canvas: ${asset.name}`)
       setSelectedAsset(undefined)
       onOpenCanvas?.()
     },
