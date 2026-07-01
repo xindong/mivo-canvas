@@ -2577,7 +2577,7 @@ button:disabled {
 
 .selection-handle {
   position: absolute;
-  z-index: 30;
+  z-index: 32;
   padding: 0;
   pointer-events: auto;
   background: #fffaf0;
@@ -2603,6 +2603,46 @@ button:disabled {
 .selection-handle.se {
   transform: translate(-50%, -50%);
   cursor: nwse-resize;
+}
+
+.selection-spacing-handle {
+  position: absolute;
+  z-index: 31;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  color: #fffaf0;
+  pointer-events: auto;
+  background: rgba(105, 87, 232, 0.94);
+  border: 0;
+  border-radius: 999px;
+  box-shadow:
+    0 0 0 2px rgba(255, 250, 240, 0.95),
+    0 8px 22px rgba(35, 35, 35, 0.18);
+}
+
+.selection-spacing-handle.horizontal {
+  cursor: ew-resize;
+}
+
+.selection-spacing-handle.vertical {
+  cursor: ns-resize;
+}
+
+.selection-spacing-handle span {
+  display: block;
+  font-weight: 850;
+  line-height: 1;
+  letter-spacing: 0;
+  pointer-events: none;
+}
+
+.selection-spacing-handle:hover,
+.selection-spacing-handle:focus-visible {
+  background: #4f3ee6;
 }
 
 .dom-node {

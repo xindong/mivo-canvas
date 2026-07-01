@@ -134,6 +134,7 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
     interactionMode,
     selectedNodes,
     selectedBounds,
+    selectionSpacingHandles,
     activeSectionDropTargetId,
     activeConnectorDropTargetId,
     showGroupSelectionBounds,
@@ -144,6 +145,7 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
     markupCreationBox,
     selectionPreviewSet,
     beginGroupResize,
+    beginSelectionSpacingDrag,
     beginNodePointerDown,
     beginNodeResize,
     editTextNode,
@@ -418,6 +420,19 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
   const handleSize = 14 / viewport.scale
   const handleBorderWidth = 2.5 / viewport.scale
   const selectionStrokeWidth = 2 / viewport.scale
+  const overlayHandleSize = 14
+  const overlayHandleBorderWidth = 2.5
+  const overlaySelectionStrokeWidth = 2
+  const selectionOverlayBounds = selectedBounds
+    ? {
+        x: viewport.x + selectedBounds.x * viewport.scale,
+        y: viewport.y + selectedBounds.y * viewport.scale,
+        width: selectedBounds.width * viewport.scale,
+        height: selectedBounds.height * viewport.scale,
+      }
+    : undefined
+  const canvasToOverlayX = (x: number) => viewport.x + x * viewport.scale
+  const canvasToOverlayY = (y: number) => viewport.y + y * viewport.scale
 
   return (
     <section
@@ -563,40 +578,6 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
             ) : null}
           </div>
         ) : null}
-        {showGroupSelectionBounds && selectedBounds ? (
-          <>
-            <div
-              className="selection-bounds"
-              data-selection-bounds="true"
-              style={{
-                left: selectedBounds.x,
-                top: selectedBounds.y,
-                width: selectedBounds.width,
-                height: selectedBounds.height,
-                borderWidth: selectionStrokeWidth,
-              }}
-            />
-            {(['nw', 'ne', 'sw', 'se'] as const).map((corner) => (
-              <button
-                key={corner}
-                type="button"
-                className={`selection-handle ${corner}`}
-                aria-label={`Resize selection ${corner}`}
-                style={{
-                  left: corner.endsWith('e') ? selectedBounds.x + selectedBounds.width : selectedBounds.x,
-                  top: corner.startsWith('s') ? selectedBounds.y + selectedBounds.height : selectedBounds.y,
-                  width: handleSize,
-                  height: handleSize,
-                  borderWidth: handleBorderWidth,
-                }}
-                onPointerDown={(event) => beginGroupResize(corner, event)}
-                onPointerMove={handleCanvasPointerMove}
-                onPointerUp={handleCanvasPointerEnd}
-                onPointerCancel={handleCanvasPointerEnd}
-              />
-            ))}
-          </>
-        ) : null}
         {renderedNodes.map((node) => {
           const selected = selectedNodeIds.includes(node.id)
 
@@ -662,6 +643,66 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
           />
         ) : null}
       </div>
+      {showGroupSelectionBounds && selectionOverlayBounds ? (
+        <>
+          <div
+            className="selection-bounds"
+            data-selection-bounds="true"
+            style={{
+              left: selectionOverlayBounds.x,
+              top: selectionOverlayBounds.y,
+              width: selectionOverlayBounds.width,
+              height: selectionOverlayBounds.height,
+              borderWidth: overlaySelectionStrokeWidth,
+            }}
+          />
+          {(['nw', 'ne', 'sw', 'se'] as const).map((corner) => (
+            <button
+              key={corner}
+              type="button"
+              className={`selection-handle ${corner}`}
+              aria-label={`Resize selection ${corner}`}
+              style={{
+                left: corner.endsWith('e')
+                  ? selectionOverlayBounds.x + selectionOverlayBounds.width
+                  : selectionOverlayBounds.x,
+                top: corner.startsWith('s')
+                  ? selectionOverlayBounds.y + selectionOverlayBounds.height
+                  : selectionOverlayBounds.y,
+                width: overlayHandleSize,
+                height: overlayHandleSize,
+                borderWidth: overlayHandleBorderWidth,
+              }}
+              onPointerDown={(event) => beginGroupResize(corner, event)}
+              onPointerMove={handleCanvasPointerMove}
+              onPointerUp={handleCanvasPointerEnd}
+              onPointerCancel={handleCanvasPointerEnd}
+            />
+          ))}
+          {selectionSpacingHandles.map((handle) => (
+            <button
+              key={handle.id}
+              type="button"
+              className={`selection-spacing-handle ${handle.axis}`}
+              aria-label={`Adjust ${handle.axis} spacing ${handle.label}px`}
+              title={`${handle.label}px`}
+              style={{
+                left: canvasToOverlayX(handle.x),
+                top: canvasToOverlayY(handle.y),
+                width: handle.width * viewport.scale,
+                height: handle.height * viewport.scale,
+                fontSize: 10,
+              }}
+              onPointerDown={(event) => beginSelectionSpacingDrag(handle, event)}
+              onPointerMove={handleCanvasPointerMove}
+              onPointerUp={handleCanvasPointerEnd}
+              onPointerCancel={handleCanvasPointerEnd}
+            >
+              <span>{handle.label}</span>
+            </button>
+          ))}
+        </>
+      ) : null}
       {contextMenu && contextMenuNode ? (
         <CanvasContextMenu x={contextMenu.x} y={contextMenu.y}>
           <NodeActionMenu

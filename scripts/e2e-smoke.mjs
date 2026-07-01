@@ -3259,6 +3259,45 @@ try {
       )}, before=${JSON.stringify(arrangeTargetsBefore)}, after=${JSON.stringify(arrangeTargetsAfter)}`,
     )
   }
+  const selectedRowGapsBefore = await page.locator('.dom-node.selected:not([data-node-type="markup"])').evaluateAll((nodes) => {
+    const sorted = nodes
+      .map((node) => {
+        const rect = node.getBoundingClientRect()
+        return { id: node.getAttribute('data-node-id'), left: rect.left, right: rect.right }
+      })
+      .sort((a, b) => a.left - b.left)
+
+    return sorted.slice(0, -1).map((node, index) => sorted[index + 1].left - node.right)
+  })
+  const spacingHandle = page.locator('.selection-spacing-handle.horizontal').first()
+  if ((await spacingHandle.count()) !== 1 || selectedRowGapsBefore.length < 1) {
+    throw new Error(`Arrange row should expose a draggable horizontal spacing handle: gaps=${JSON.stringify(selectedRowGapsBefore)}`)
+  }
+  const spacingHandleBox = await spacingHandle.boundingBox()
+  if (!spacingHandleBox) throw new Error('Missing spacing handle bounds')
+  await page.mouse.move(spacingHandleBox.x + spacingHandleBox.width / 2, spacingHandleBox.y + spacingHandleBox.height / 2)
+  await page.mouse.down()
+  await page.mouse.move(spacingHandleBox.x + spacingHandleBox.width / 2 + 48, spacingHandleBox.y + spacingHandleBox.height / 2, {
+    steps: 6,
+  })
+  await page.mouse.up()
+  const selectedRowGapsAfter = await page.locator('.dom-node.selected:not([data-node-type="markup"])').evaluateAll((nodes) => {
+    const sorted = nodes
+      .map((node) => {
+        const rect = node.getBoundingClientRect()
+        return { id: node.getAttribute('data-node-id'), left: rect.left, right: rect.right }
+      })
+      .sort((a, b) => a.left - b.left)
+
+    return sorted.slice(0, -1).map((node, index) => sorted[index + 1].left - node.right)
+  })
+  if (selectedRowGapsAfter[0] < selectedRowGapsBefore[0] + 24) {
+    throw new Error(
+      `Dragging the horizontal spacing handle should increase the first selected gap: before=${JSON.stringify(
+        selectedRowGapsBefore,
+      )}, after=${JSON.stringify(selectedRowGapsAfter)}`,
+    )
+  }
   await page.keyboard.press(process.platform === 'darwin' ? 'Meta+Z' : 'Control+Z')
   await page.waitForSelector('.selection-quick-toolbar')
 
