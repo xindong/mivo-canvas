@@ -1,4 +1,5 @@
 import { createDemoImage } from '../lib/demoImages'
+import { normalizeCanvasSnapshotV2 } from '../model/canvasSnapshotModel'
 import { normalizeCanvasNodeV2 } from '../model/documentModelV2'
 import type { DemoSceneId, MivoCanvasNode, MivoCanvasSnapshot, SceneDefinition } from '../types/mivoCanvas'
 
@@ -291,12 +292,12 @@ export const scenes = () => Object.values(sceneDefinitions())
 
 export const snapshotFromScene = (sceneId: DemoSceneId): MivoCanvasSnapshot => {
   const scene = sceneDefinitions()[sceneId]
-  return {
-    version: 1,
+  return normalizeCanvasSnapshotV2({
+    version: 2,
     sceneId,
     nodes: scene.nodes,
     tasks: scene.tasks,
     selectedNodeId: scene.selectedNodeId,
     selectedNodeIds: scene.selectedNodeIds || (scene.selectedNodeId ? [scene.selectedNodeId] : []),
-  }
+  })
 }

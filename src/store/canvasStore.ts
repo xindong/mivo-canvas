@@ -28,6 +28,8 @@ import {
   type ImportedFileMetadata,
 } from '../lib/canvasAssetImport'
 import { importedImageDisplaySize, type ImportedImageMetadata } from '../lib/imageSizing'
+import { createAiResultNode } from '../model/aiCanvasCommands'
+import { normalizeCanvasSnapshotV2 } from '../model/canvasSnapshotModel'
 import {
   normalizeCanvasNodeV2,
   normalizeCanvasNodesV2,
@@ -244,14 +246,15 @@ const selectionFrom = (nodeIds: string[] | undefined, selectedNodeId: string | u
   return { selectedNodeId: primary, selectedNodeIds: selection }
 }
 
-const snapshotFromState = (state: Pick<CanvasState, 'sceneId' | 'nodes' | 'tasks' | 'selectedNodeId' | 'selectedNodeIds'>) => ({
-  version: 1 as const,
-  sceneId: state.sceneId,
-  nodes: cloneNodes(state.nodes),
-  tasks: cloneTasks(state.tasks),
-  selectedNodeId: state.selectedNodeId,
-  selectedNodeIds: [...state.selectedNodeIds],
-})
+const snapshotFromState = (state: Pick<CanvasState, 'sceneId' | 'nodes' | 'tasks' | 'selectedNodeId' | 'selectedNodeIds'>) =>
+  normalizeCanvasSnapshotV2({
+    version: 2,
+    sceneId: state.sceneId,
+    nodes: cloneNodes(state.nodes),
+    tasks: cloneTasks(state.tasks),
+    selectedNodeId: state.selectedNodeId,
+    selectedNodeIds: [...state.selectedNodeIds],
+  })
 
 const remember = (state: CanvasState) => ({
   historyPast: [...state.historyPast.slice(-(historyLimit - 1)), snapshotFromState(state)],
@@ -490,18 +493,19 @@ const patchWithHistory = (
 })
 
 const applySnapshot = (state: CanvasState, snapshot: MivoCanvasSnapshot) => {
-  const currentDocument = documentFor(state.canvases, snapshot.sceneId)
-  const selection = selectionFrom(snapshot.selectedNodeIds, snapshot.selectedNodeId, snapshot.nodes)
+  const normalizedSnapshot = normalizeCanvasSnapshotV2(snapshot)
+  const currentDocument = documentFor(state.canvases, normalizedSnapshot.sceneId)
+  const selection = selectionFrom(normalizedSnapshot.selectedNodeIds, normalizedSnapshot.selectedNodeId, normalizedSnapshot.nodes)
   const document: CanvasDocument = {
     ...currentDocument,
-    nodes: cloneNodes(snapshot.nodes),
-    tasks: cloneTasks(snapshot.tasks),
+    nodes: cloneNodes(normalizedSnapshot.nodes),
+    tasks: cloneTasks(normalizedSnapshot.tasks),
     selectedNodeId: selection.selectedNodeId,
     selectedNodeIds: selection.selectedNodeIds,
   }
 
   return {
-    sceneId: snapshot.sceneId,
+    sceneId: normalizedSnapshot.sceneId,
     nodes: document.nodes,
     tasks: document.tasks,
     selectedNodeId: document.selectedNodeId,
@@ -509,7 +513,7 @@ const applySnapshot = (state: CanvasState, snapshot: MivoCanvasSnapshot) => {
     activeTool: 'select' as ToolId,
     canvases: {
       ...state.canvases,
-      [snapshot.sceneId]: document,
+      [normalizedSnapshot.sceneId]: document,
     },
   }
 }
@@ -1893,35 +1897,20 @@ export const useCanvasStore = create<CanvasState>()(
             height,
             placement: 'right',
           })
-          const result = makeNode({
+          const result = createAiResultNode({
             id,
-            type: 'image',
             title: `${operationLabel} for ${source.title}`,
-            x: Math.round(placement.x),
-            y: Math.round(placement.y),
-            width: Math.round(width),
-            height: Math.round(height),
+            sourceNodes: [source],
+            anchorNode: source,
+            operation,
+            prompt: resultPrompt,
+            placement: 'right',
+            position: { x: placement.x, y: placement.y },
+            size: { width, height },
             assetUrl: mockResultAssetUrl(state.nodes),
-            status: 'ready',
-            parentIds: [source.id],
-            generation: {
-              prompt: resultPrompt,
-              model: 'Mivo Mock Image Workflow',
-              size: `${Math.round(width)}x${Math.round(height)}`,
-              seed: createdAt % 99999,
-              strength: operation === 'upscale' ? 0.28 : 0.62,
-              taskId: `task-${id}`,
-            },
-            aiWorkflow: {
-              kind: 'result',
-              status: 'ready',
-              operation,
-              prompt: resultPrompt,
-              sourceNodeIds: [source.id],
-              anchorNodeId: source.id,
-              placement: 'right',
-              createdAt,
-            },
+            createdAt,
+            taskId: `task-${id}`,
+            strength: operation === 'upscale' ? 0.28 : 0.62,
           })
           const task: CanvasTask = {
             id: `task-${id}`,
@@ -1964,35 +1953,20 @@ export const useCanvasStore = create<CanvasState>()(
             placement: 'right',
           })
           const resultPrompt = prompt?.trim() || nodePrompt(source)
-          const result = makeNode({
+          const result = createAiResultNode({
             id,
-            type: 'image',
             title: `AI result from ${source.title}`,
-            x: Math.round(placement.x),
-            y: Math.round(placement.y),
-            width: Math.round(width),
-            height: Math.round(height),
+            sourceNodes: [source],
+            anchorNode: source,
+            operation: 'beside-generation',
+            prompt: resultPrompt,
+            placement: 'right',
+            position: { x: placement.x, y: placement.y },
+            size: { width, height },
             assetUrl: mockResultAssetUrl(state.nodes),
-            status: 'ready',
-            parentIds: [source.id],
-            generation: {
-              prompt: resultPrompt,
-              model: 'Mivo Mock Image Workflow',
-              size: `${Math.round(width)}x${Math.round(height)}`,
-              seed: createdAt % 99999,
-              strength: 0.58,
-              taskId: `task-${id}`,
-            },
-            aiWorkflow: {
-              kind: 'result',
-              status: 'ready',
-              operation: 'beside-generation',
-              prompt: resultPrompt,
-              sourceNodeIds: [source.id],
-              anchorNodeId: source.id,
-              placement: 'right',
-              createdAt,
-            },
+            createdAt,
+            taskId: `task-${id}`,
+            strength: 0.58,
           })
           const task: CanvasTask = {
             id: `task-${id}`,
@@ -2025,36 +1999,21 @@ export const useCanvasStore = create<CanvasState>()(
           }
 
           const resultPrompt = prompt?.trim() || nodePrompt(slot, '根据 AI 槽位生成图片')
-          const result = makeNode({
+          const result = createAiResultNode({
             id,
-            type: 'image',
             title: `Generated for ${slot.title}`,
-            x: slot.x,
-            y: slot.y,
-            width: slot.width,
-            height: slot.height,
+            sourceNodes: [slot],
+            anchorNode: slot,
+            slotNode: slot,
+            operation: 'slot-generation',
+            prompt: resultPrompt,
+            placement: 'slot',
+            position: { x: slot.x, y: slot.y },
+            size: { width: slot.width, height: slot.height },
             assetUrl: mockResultAssetUrl(state.nodes),
-            status: 'ready',
-            parentIds: [slot.id],
-            generation: {
-              prompt: resultPrompt,
-              model: 'Mivo Mock Image Workflow',
-              size: `${Math.round(slot.width)}x${Math.round(slot.height)}`,
-              seed: createdAt % 99999,
-              strength: 0.62,
-              taskId: `task-${id}`,
-            },
-            aiWorkflow: {
-              kind: 'result',
-              status: 'ready',
-              operation: 'slot-generation',
-              prompt: resultPrompt,
-              sourceNodeIds: [slot.id],
-              slotId: slot.id,
-              anchorNodeId: slot.id,
-              placement: 'slot',
-              createdAt,
-            },
+            createdAt,
+            taskId: `task-${id}`,
+            strength: 0.62,
           })
           const nodes = state.nodes.map((node) =>
             node.id === slot.id
@@ -2120,36 +2079,21 @@ export const useCanvasStore = create<CanvasState>()(
             placement: 'right',
           })
           const resultPrompt = nodePrompt(annotation, '根据批注生成修订版图片')
-          const result = makeNode({
+          const result = createAiResultNode({
             id,
-            type: 'image',
             title: `Edited from ${source?.title || annotation.title}`,
-            x: Math.round(placement.x),
-            y: Math.round(placement.y),
-            width: Math.round(width),
-            height: Math.round(height),
+            sourceNodes: source ? [source] : [annotation],
+            anchorNode: anchor,
+            annotationNode: annotation,
+            operation: 'annotation-edit',
+            prompt: resultPrompt,
+            placement: 'right',
+            position: { x: placement.x, y: placement.y },
+            size: { width, height },
             assetUrl: mockResultAssetUrl(state.nodes),
-            status: 'ready',
-            parentIds: source ? [source.id, annotation.id] : [annotation.id],
-            generation: {
-              prompt: resultPrompt,
-              model: 'Mivo Mock Image Workflow',
-              size: `${Math.round(width)}x${Math.round(height)}`,
-              seed: createdAt % 99999,
-              strength: 0.66,
-              taskId: `task-${id}`,
-            },
-            aiWorkflow: {
-              kind: 'result',
-              status: 'ready',
-              operation: 'annotation-edit',
-              prompt: resultPrompt,
-              sourceNodeIds: source ? [source.id] : [annotation.id],
-              annotationNodeId: annotation.id,
-              anchorNodeId: anchor.id,
-              placement: 'right',
-              createdAt,
-            },
+            createdAt,
+            taskId: `task-${id}`,
+            strength: 0.66,
           })
           const task: CanvasTask = {
             id: `task-${id}`,

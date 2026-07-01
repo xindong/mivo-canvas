@@ -315,7 +315,7 @@ export type CanvasTask = {
 }
 
 export type MivoCanvasSnapshot = {
-  version: 1
+  version: 2
   sceneId: CanvasId
   nodes: MivoCanvasNode[]
   tasks: CanvasTask[]
