@@ -52,6 +52,7 @@ export type CanvasGenerationOptions = {
   quality?: MivoImageQuality
   model?: string
   referenceFiles?: File[]
+  signal?: AbortSignal
 }
 
 type CanvasState = {
@@ -447,7 +448,7 @@ const createDerivationEdgeNode = (edge: CanvasEdge, nodes: MivoCanvasNode[]): Mi
     width: Math.max(24, target.x - (source.x + source.width)),
     height: Math.max(24, Math.abs(target.y - source.y)),
     markupKind: 'arrow',
-    markupStrokeColor: '#3f6f64',
+    markupStrokeColor: '#497466',
     markupStrokeWidth: 3,
     markupStrokeStyle: 'solid',
     markupOpacity: 0.82,
@@ -722,11 +723,22 @@ const edgeTypeForOperation = (operation: AiWorkflowOperation): CanvasEdgeType =>
 const blobFromCommittedGenerationImage = (image: CommittedGenerationImage) => {
   if (image.blob) return image.blob
 
-  const raw = image.b64 || ''
+  const raw = image.b64?.trim() || ''
+  if (!raw) throw new Error('Image service returned empty image data')
+
   const dataUrlMatch = raw.match(/^data:([^;]+);base64,(.*)$/)
   const mimeType = image.mimeType || dataUrlMatch?.[1] || 'image/png'
-  const base64 = dataUrlMatch?.[2] || raw
-  const binary = atob(base64)
+  const base64 = (dataUrlMatch?.[2] || raw).trim()
+  if (!base64) throw new Error('Image service returned empty image data')
+
+  let binary = ''
+  try {
+    binary = atob(base64)
+  } catch {
+    throw new Error('Image service returned invalid image data')
+  }
+  if (!binary.length) throw new Error('Image service returned empty image data')
+
   const bytes = new Uint8Array(binary.length)
   for (let index = 0; index < binary.length; index += 1) {
     bytes[index] = binary.charCodeAt(index)
@@ -2228,6 +2240,7 @@ export const useCanvasStore = create<CanvasState>()(
             imgRatio: options.imgRatio || '1:1',
             quality: options.quality || 'medium',
             model,
+            signal: options.signal,
           })
           const nodeIds = await get().commitGenerationResult({
             sourceNodeId: source.id,
@@ -2285,6 +2298,7 @@ export const useCanvasStore = create<CanvasState>()(
                 imgRatio: options.imgRatio || '1:1',
                 quality: options.quality || 'medium',
                 model,
+                signal: options.signal,
               })
             : await generateMivoImage({
                 prompt: resultPrompt,
@@ -2292,6 +2306,7 @@ export const useCanvasStore = create<CanvasState>()(
                 quality: options.quality || 'medium',
                 n: 1,
                 model,
+                signal: options.signal,
               })
           const nodeIds = await get().commitGenerationResult({
             sourceNodeId: source.id,
@@ -2370,6 +2385,7 @@ export const useCanvasStore = create<CanvasState>()(
                 imgRatio: options.imgRatio || '1:1',
                 quality: options.quality || 'medium',
                 model,
+                signal: options.signal,
               })
             : await generateMivoImage({
                 prompt: resultPrompt,
@@ -2377,6 +2393,7 @@ export const useCanvasStore = create<CanvasState>()(
                 quality: options.quality || 'medium',
                 n: 1,
                 model,
+                signal: options.signal,
               })
           const nodeIds = await get().commitGenerationResult({
             sourceNodeId: slot.id,

@@ -66,11 +66,12 @@ export function CanvasAiActionBar({
         }}
         disabled={!canStartMaskEdit}
         aria-label="局部重绘"
-        title={canStartMaskEdit ? '局部重绘' : 'Select an image first'}
+        title={canStartMaskEdit ? '局部重绘' : '先选择一张图片'}
       >
         <Brush size={18} />
         <span>局部重绘</span>
       </button>
+      {!canStartMaskEdit ? <span className="canvas-ai-action-hint">先选择图片</span> : null}
     </div>
   )
 }

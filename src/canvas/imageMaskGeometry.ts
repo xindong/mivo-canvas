@@ -21,6 +21,18 @@ export type ImageMaskSubmitPayload = {
   prompt: string
   mask: Blob
   maskBounds?: ImageMaskBounds
+  sourceSize: { width: number; height: number }
+}
+
+export const maxMaskCanvasPixels = 24_000_000
+export const maxMaskCanvasEdge = 6000
+
+export const validateMaskCanvasSize = (naturalSize: { width: number; height: number }) => {
+  const width = Math.max(1, Math.round(naturalSize.width))
+  const height = Math.max(1, Math.round(naturalSize.height))
+  if (width > maxMaskCanvasEdge || height > maxMaskCanvasEdge || width * height > maxMaskCanvasPixels) {
+    throw new Error(`图片尺寸 ${width} x ${height} 过大，局部重绘请先导入较低分辨率版本。`)
+  }
 }
 
 type DisplayRectInput = {
@@ -176,6 +188,7 @@ export const buildEditMaskBlob = async ({
   imageCrop?: ImageCrop
   regions: ImageMaskRegion[]
 }) => {
+  validateMaskCanvasSize(naturalSize)
   const canvas = document.createElement('canvas')
   canvas.width = Math.max(1, Math.round(naturalSize.width))
   canvas.height = Math.max(1, Math.round(naturalSize.height))

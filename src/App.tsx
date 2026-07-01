@@ -28,6 +28,7 @@ function App() {
   const [aiPanelFocusRequestId, setAiPanelFocusRequestId] = useState(0)
   const [workspaceView, setWorkspaceView] = useState<WorkspaceView>('canvas')
   const [detailsSceneId, setDetailsSceneId] = useState<string>()
+  const [maskCancelRequestId, setMaskCancelRequestId] = useState(0)
   const projectSidebarTimerRef = useRef<number | undefined>(undefined)
   const isCanvasWorkspace = workspaceView === 'canvas' || workspaceView === 'assets'
   const detailsOpen = isCanvasWorkspace && detailsSceneId === sceneId
@@ -44,8 +45,15 @@ function App() {
   }, [])
 
   const openGeneratePanel = useCallback(() => {
+    setWorkspaceView('canvas')
     setAiPanelOpen(true)
     setAiPanelFocusRequestId((id) => id + 1)
+  }, [])
+
+  const openAssetsWorkspace = useCallback(() => {
+    setMaskCancelRequestId((id) => id + 1)
+    setAiPanelOpen(false)
+    setWorkspaceView('assets')
   }, [])
 
   const openProjectSidebar = useCallback(() => {
@@ -137,7 +145,7 @@ function App() {
         open={projectSidebarOpen}
         peeking={projectSidebarPeek}
         closing={projectSidebarClosing}
-        onOpenAssets={() => setWorkspaceView('assets')}
+        onOpenAssets={openAssetsWorkspace}
         onOpenCanvas={() => setWorkspaceView('canvas')}
         onOpenPlugins={() => setWorkspaceView('plugins')}
         onOpenSkills={() => setWorkspaceView('skills')}
@@ -164,6 +172,7 @@ function App() {
               key={sceneId}
               onOpenDetails={() => setDetailsSceneId(sceneId)}
               onOpenGeneratePanel={openGeneratePanel}
+              maskCancelRequestId={maskCancelRequestId}
             />
             <AIToolPanel
               open={aiPanelOpen}
@@ -171,11 +180,20 @@ function App() {
               focusRequestId={aiPanelFocusRequestId}
             />
             {workspaceView === 'assets' ? (
-              <LibraryWorkspace
-                type="assets"
-                variant="canvas-drawer"
-                onOpenCanvas={() => setWorkspaceView('canvas')}
-              />
+              <div
+                className="asset-library-drawer-backdrop"
+                data-canvas-ui="true"
+                role="presentation"
+                onPointerDown={(event) => {
+                  if (event.target === event.currentTarget) setWorkspaceView('canvas')
+                }}
+              >
+                <LibraryWorkspace
+                  type="assets"
+                  variant="canvas-drawer"
+                  onOpenCanvas={() => setWorkspaceView('canvas')}
+                />
+              </div>
             ) : null}
           </div>
           <TaskQueue />

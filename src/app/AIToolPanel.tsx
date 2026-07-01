@@ -4,6 +4,7 @@ import {
   MessageSquareText,
   PanelRightClose,
   PanelRightOpen,
+  RefreshCw,
   Sparkles,
   SquareDashed,
   Upload,
@@ -33,6 +34,7 @@ export function AIToolPanel({ open, onToggle, focusRequestId = 0 }: AIToolPanelP
   const inputRef = useRef<HTMLInputElement | null>(null)
   const promptRef = useRef<HTMLTextAreaElement | null>(null)
   const referenceFilesRef = useRef<ReferenceFile[]>([])
+  const generationAbortRef = useRef<AbortController | null>(null)
   const nodes = useCanvasStore((state) => state.nodes)
   const selectedNodeId = useCanvasStore((state) => state.selectedNodeId)
   const selectedNodeIds = useCanvasStore((state) => state.selectedNodeIds)
@@ -52,6 +54,7 @@ export function AIToolPanel({ open, onToggle, focusRequestId = 0 }: AIToolPanelP
   const [quality, setQuality] = useState<MivoImageQuality>('medium')
   const [isGenerating, setIsGenerating] = useState(false)
   const [generationError, setGenerationError] = useState('')
+  const [referenceError, setReferenceError] = useState('')
   const promptValue = selectedNode
     ? selectedNode.type === 'annotation'
       ? selectedNode.text ?? selectedNode.generation?.prompt ?? ''
@@ -69,13 +72,17 @@ export function AIToolPanel({ open, onToggle, focusRequestId = 0 }: AIToolPanelP
 
   useEffect(
     () => () => {
+      generationAbortRef.current?.abort()
       referenceFilesRef.current.forEach((reference) => URL.revokeObjectURL(reference.previewUrl))
     },
     [],
   )
 
   const addReferenceFiles = (files: FileList | File[] | undefined | null) => {
-    const nextFiles = Array.from(files || []).filter((file) => file.type.startsWith('image/'))
+    const incomingFiles = Array.from(files || [])
+    const nextFiles = incomingFiles.filter((file) => file.type.startsWith('image/'))
+    const rejectedCount = incomingFiles.length - nextFiles.length
+    setReferenceError(rejectedCount ? `已跳过 ${rejectedCount} 个非图片文件。` : '')
     if (!nextFiles.length) return
 
     setGenerationError('')
@@ -104,6 +111,7 @@ export function AIToolPanel({ open, onToggle, focusRequestId = 0 }: AIToolPanelP
 
   const handlePromptChange = (prompt: string) => {
     setGenerationError('')
+    setReferenceError('')
     if (selectedNode) {
       if (selectedNode.type === 'annotation') {
         updateTextNode(selectedNode.id, prompt)
@@ -121,6 +129,8 @@ export function AIToolPanel({ open, onToggle, focusRequestId = 0 }: AIToolPanelP
   }
 
   const runPrimaryGeneration = async () => {
+    if (isGenerating) return
+
     const prompt = promptValue.trim()
     if (!prompt) {
       setGenerationError('请输入提示词。')
@@ -128,11 +138,16 @@ export function AIToolPanel({ open, onToggle, focusRequestId = 0 }: AIToolPanelP
     }
 
     setGenerationError('')
+    setReferenceError('')
     setIsGenerating(true)
+    const abortController = new AbortController()
+    generationAbortRef.current?.abort()
+    generationAbortRef.current = abortController
     const options = {
       imgRatio,
       quality,
       referenceFiles: referenceFiles.map((reference) => reference.file),
+      signal: abortController.signal,
     }
 
     try {
@@ -150,8 +165,16 @@ export function AIToolPanel({ open, onToggle, focusRequestId = 0 }: AIToolPanelP
     } catch (error) {
       setGenerationError(error instanceof Error ? error.message : '生成失败。')
     } finally {
+      if (generationAbortRef.current === abortController) {
+        generationAbortRef.current = null
+      }
       setIsGenerating(false)
     }
+  }
+
+  const cancelGeneration = () => {
+    if (!isGenerating) return
+    generationAbortRef.current?.abort()
   }
 
   const handleDrop = (event: DragEvent<HTMLElement>) => {
@@ -281,7 +304,12 @@ export function AIToolPanel({ open, onToggle, focusRequestId = 0 }: AIToolPanelP
             <div className="ai-reference-list" aria-label="Staged reference images">
               {referenceFiles.map((reference) => (
                 <div className="ai-reference-chip" key={reference.id}>
-                  <img className="ai-reference-thumb" src={reference.previewUrl} alt="" />
+                  <img
+                    className="ai-reference-thumb"
+                    src={reference.previewUrl}
+                    alt=""
+                    onError={() => setReferenceError('参考图预览加载失败，请移除后换一张图片。')}
+                  />
                   <span title={reference.file.name}>{reference.file.name}</span>
                   <button
                     type="button"
@@ -295,6 +323,7 @@ export function AIToolPanel({ open, onToggle, focusRequestId = 0 }: AIToolPanelP
               ))}
             </div>
           ) : null}
+          {referenceError ? <div className="ai-generation-error subtle">{referenceError}</div> : null}
         </div>
 
         <div className="ai-field compact-metrics">
@@ -391,16 +420,32 @@ export function AIToolPanel({ open, onToggle, focusRequestId = 0 }: AIToolPanelP
             </button>
           ))}
         </div>
-        {generationError ? <div className="ai-generation-error">{generationError}</div> : null}
-        <button
-          type="button"
-          className="ai-generate"
-          onClick={() => void runPrimaryGeneration()}
-          disabled={isGenerating}
-        >
-          <Upload size={17} />
-          {isGenerating ? '生成中...' : '立即生成'}
-        </button>
+        {generationError ? (
+          <div className="ai-generation-error">
+            <span>{generationError}</span>
+            <button type="button" onClick={() => void runPrimaryGeneration()} disabled={isGenerating}>
+              <RefreshCw size={13} />
+              重试
+            </button>
+          </div>
+        ) : null}
+        <div className="ai-generate-actions">
+          {isGenerating ? (
+            <button type="button" className="ai-generate secondary" onClick={cancelGeneration}>
+              <X size={17} />
+              取消
+            </button>
+          ) : null}
+          <button
+            type="button"
+            className="ai-generate"
+            onClick={() => void runPrimaryGeneration()}
+            disabled={isGenerating}
+          >
+            <Upload size={17} />
+            {isGenerating ? '生成中...' : '立即生成'}
+          </button>
+        </div>
       </div>
 
       <input

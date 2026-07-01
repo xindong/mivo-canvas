@@ -7,6 +7,7 @@ import {
   displayRectForImage,
   imagePixelToNodePoint,
   nodePointToImagePixel,
+  validateMaskCanvasSize,
   type ImageMaskPoint,
   type ImageMaskRegion,
   type ImageMaskSubmitPayload,
@@ -29,9 +30,9 @@ type DraftRegion =
   | { type: 'brush'; points: ImageMaskPoint[] }
 
 const toolItems: Array<{ id: ImageMaskTool; label: string; icon: typeof MousePointer2 }> = [
-  { id: 'point', label: 'Point', icon: MousePointer2 },
-  { id: 'box', label: 'Box', icon: Square },
-  { id: 'brush', label: 'Brush', icon: Brush },
+  { id: 'point', label: '点选', icon: MousePointer2 },
+  { id: 'box', label: '框选', icon: Square },
+  { id: 'brush', label: '涂抹', icon: Brush },
 ]
 
 const minimumBoxSizePx = 8
@@ -110,6 +111,12 @@ export function ImageMaskEditOverlay({
   const [brushSizePx, setBrushSizePx] = useState(48)
   const [draft, setDraft] = useState<DraftRegion>()
   const [statusError, setStatusError] = useState('')
+  const promptReady = Boolean(prompt.trim())
+  const maskEditHint = !regions.length
+    ? '先在图片上点选、框选或涂抹要修改的区域。'
+    : !promptReady
+      ? '输入修改描述后再提交。'
+      : ''
 
   const displayRect = useMemo(
     () =>
@@ -196,6 +203,8 @@ export function ImageMaskEditOverlay({
       const height = Math.abs(draft.current.y - draft.start.y)
       if (width >= minimumBoxSizePx && height >= minimumBoxSizePx) {
         commitRegions([...regions, { type: 'box', x, y, width, height }])
+      } else {
+        setStatusError('选区太小，请拖出更大的区域。')
       }
     } else if (draft.points.length) {
       commitRegions([...regions, { type: 'brush', points: draft.points, radius: brushSizePx }])
@@ -230,11 +239,13 @@ export function ImageMaskEditOverlay({
 
     try {
       setStatusError('')
+      validateMaskCanvasSize(naturalSize)
       const mask = await buildEditMaskBlob({ naturalSize, imageCrop: node.imageCrop, regions })
       await onSubmit({
         prompt: trimmedPrompt,
         mask,
         maskBounds: boundsForRegions(regions, naturalSize),
+        sourceSize: naturalSize,
       })
     } catch (error) {
       setStatusError(error instanceof Error ? error.message : '局部重绘失败。')
@@ -313,6 +324,8 @@ export function ImageMaskEditOverlay({
               className={tool === id ? 'active' : undefined}
               onClick={() => setTool(id)}
               disabled={submitting}
+              title={label}
+              aria-label={label}
             >
               <Icon size={14} />
               {label}
@@ -320,7 +333,7 @@ export function ImageMaskEditOverlay({
           ))}
         </div>
         <label className="image-mask-edit-size">
-          <span>Brush</span>
+          <span>画笔</span>
           <input
             type="range"
             min="12"
@@ -341,7 +354,7 @@ export function ImageMaskEditOverlay({
           <button type="button" onClick={clear} disabled={!regions.length || submitting} aria-label="Clear mask regions">
             <Trash2 size={14} />
           </button>
-          <button type="button" onClick={onCancel} disabled={submitting} aria-label="Cancel mask edit">
+          <button type="button" onClick={onCancel} aria-label={submitting ? 'Cancel mask request' : 'Cancel mask edit'}>
             <X size={14} />
           </button>
         </div>
@@ -354,8 +367,9 @@ export function ImageMaskEditOverlay({
           onChange={(event) => setPrompt(event.target.value)}
           placeholder="描述这个区域要怎么改..."
         />
+        {maskEditHint ? <div className="image-mask-edit-hint">{maskEditHint}</div> : null}
         {statusError ? <div className="image-mask-edit-error">{statusError}</div> : null}
-        <button type="button" onClick={() => void submit()} disabled={submitting || !prompt.trim() || !regions.length}>
+        <button type="button" onClick={() => void submit()} disabled={submitting || !promptReady || !regions.length}>
           <Sparkles size={15} />
           {submitting ? '重绘中...' : '局部重绘'}
         </button>

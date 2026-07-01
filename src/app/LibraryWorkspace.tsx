@@ -90,10 +90,13 @@ const assetClipboardItemFrom = (asset: AssetItem): CanvasAssetClipboardItem => (
 const tagMatches = (assetTag: string, selectedTag: string) =>
   assetTag.trim().toLowerCase() === selectedTag.trim().toLowerCase()
 
+type ImageLoadState = 'loading' | 'ready' | 'error'
+
 const fallbackToOriginalAssetImage = (asset: AssetItem, image: HTMLImageElement) => {
-  if (image.dataset.fallbackSource === 'original') return
+  if (image.dataset.fallbackSource === 'original') return false
   image.dataset.fallbackSource = 'original'
   image.src = asset.url
+  return true
 }
 
 const pluginRows = [
@@ -184,6 +187,9 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
   const [eagleLoadState, setEagleLoadState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
   const [eagleTagLoadState, setEagleTagLoadState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
   const [assetDimensions, setAssetDimensions] = useState<Record<string, { width: number; height: number }>>({})
+  const [imageLoadStateByAssetId, setImageLoadStateByAssetId] = useState<Record<string, ImageLoadState>>({})
+  const [previewImageState, setPreviewImageState] = useState<ImageLoadState>('loading')
+  const [copyStatus, setCopyStatus] = useState('')
   const title = isAssets ? 'Assets' : isSkills ? 'Skills' : 'Plugins'
   const kicker = isAssets ? 'Library' : isSkills ? 'Agent capabilities' : 'Extensions'
   const description = isAssets
@@ -220,7 +226,27 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
       .sort((left, right) => left.localeCompare(right))
     return tagNames.map((name) => ({ id: name, name }))
   }, [eagleAssets])
-  const activeEagleTags = eagleTags.length ? eagleTags : fallbackEagleTags
+  const eagleTagCounts = useMemo(() => {
+    const counts = new Map<string, number>()
+    eagleAssets.forEach((asset) => {
+      for (const tag of asset.tags || []) {
+        const key = tag.trim().toLowerCase()
+        if (!key) continue
+        counts.set(key, (counts.get(key) || 0) + 1)
+      }
+    })
+    return counts
+  }, [eagleAssets])
+  const activeEagleTags = useMemo(() => {
+    const sourceTags = eagleTags.length ? eagleTags : fallbackEagleTags
+    return sourceTags
+      .map((tag) => {
+        const count = eagleTagCounts.get(tag.name.trim().toLowerCase()) || 0
+        return { ...tag, count }
+      })
+      .filter((tag) => tag.count > 0)
+      .sort((left, right) => right.count - left.count || left.name.localeCompare(right.name))
+  }, [eagleTagCounts, eagleTags, fallbackEagleTags])
   const selectedEagleFolder = useMemo(
     () => flatEagleFolders.find((folder) => folder.id === selectedEagleFolderId),
     [flatEagleFolders, selectedEagleFolderId],
@@ -334,7 +360,6 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
     try {
       const searchParams = new URLSearchParams({ limit: '120', offset: '0' })
       if (selectedEagleFolderId) searchParams.set('folderId', selectedEagleFolderId)
-      if (selectedEagleTag) searchParams.set('tag', selectedEagleTag)
       const [statusResponse, foldersResponse, assetsResponse] = await Promise.all([
         fetch('/api/mivo/eagle/status'),
         fetch('/api/mivo/eagle/folders'),
@@ -357,7 +382,7 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
       setEagleFolders([])
       setEagleLoadState('error')
     }
-  }, [isAssets, selectedEagleFolderId, selectedEagleTag])
+  }, [isAssets, selectedEagleFolderId])
 
   const loadPinterestStatus = useCallback(async () => {
     if (!isAssets) return
@@ -416,6 +441,18 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
   }, [filteredAssets])
 
   useEffect(() => {
+    if (!selectedEagleTag || eagleLoadState !== 'ready') return
+    if (!activeEagleTags.some((tag) => tagMatches(tag.name, selectedEagleTag))) {
+      setSelectedEagleTag(undefined)
+    }
+  }, [activeEagleTags, eagleLoadState, selectedEagleTag])
+
+  useEffect(() => {
+    if (!previewAsset) return
+    setPreviewImageState('loading')
+  }, [previewAsset])
+
+  useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return
       if (previewAsset) {
@@ -458,6 +495,7 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
     (assets: AssetItem[]) => {
       if (!assets.length) return
       copyAssetsToClipboard(assets.map(assetClipboardItemFrom))
+      setCopyStatus(`已复制 ${assets.length} 张，可在画布粘贴。`)
       setAssetCardMenu(undefined)
     },
     [copyAssetsToClipboard],
@@ -491,7 +529,11 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
     (asset: AssetItem) => {
       copyAssetsToInternalClipboard([asset])
       void writeSingleAssetToOsClipboard(asset).catch((error) => {
-        console.warn('OS clipboard image write failed', error)
+        setCopyStatus(
+          error instanceof Error
+            ? `已写入 MivoCanvas 内部剪贴板；系统剪贴板写入失败：${error.message}`
+            : '已写入 MivoCanvas 内部剪贴板；系统剪贴板写入失败。',
+        )
       })
     },
     [copyAssetsToInternalClipboard, writeSingleAssetToOsClipboard],
@@ -503,6 +545,7 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
 
   const copyAssetSource = useCallback((asset: AssetItem) => {
     void navigator.clipboard?.writeText(asset.sourceUrl || asset.sourcePath || asset.name)
+    setCopyStatus('素材来源已复制。')
   }, [])
 
   const beginAssetDrag = useCallback((asset: AssetItem, event: ReactDragEvent<HTMLElement>) => {
@@ -627,6 +670,26 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
     )
   }, [])
 
+  const markImageLoadState = useCallback((assetId: string, state: ImageLoadState) => {
+    setImageLoadStateByAssetId((current) => (current[assetId] === state ? current : { ...current, [assetId]: state }))
+  }, [])
+
+  const handleAssetImageLoad = useCallback(
+    (assetId: string, image: HTMLImageElement) => {
+      rememberDimensions(assetId, image)
+      markImageLoadState(assetId, 'ready')
+    },
+    [markImageLoadState, rememberDimensions],
+  )
+
+  const handleAssetImageError = useCallback(
+    (asset: AssetItem, image: HTMLImageElement) => {
+      if (fallbackToOriginalAssetImage(asset, image)) return
+      markImageLoadState(asset.id, 'error')
+    },
+    [markImageLoadState],
+  )
+
   return (
     <section className={rootClassName} aria-label={`${title} workspace`}>
       <header className="library-header">
@@ -636,11 +699,11 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
           <p>{description}</p>
         </div>
         <div className="library-actions">
-          <button type="button" onClick={syncActiveSource}>
+          <button type="button" onClick={syncActiveSource} disabled={activeLoadState === 'loading'}>
             <RefreshCw size={16} />
             Sync
           </button>
-          <button type="button" className="primary" onClick={connectActiveSource}>
+          <button type="button" className="primary" onClick={connectActiveSource} disabled={activeLoadState === 'loading'}>
             {isAssets ? <FolderOpen size={16} /> : isSkills ? <Sparkles size={16} /> : <Plug size={16} />}
             {actionLabel}
           </button>
@@ -669,6 +732,7 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
                 key={label}
                 type="button"
                 className={activeAssetSource === id ? 'source-row active' : 'source-row'}
+                disabled={id === activeAssetSource && activeLoadState === 'loading'}
                 onClick={() => {
                   setActiveAssetSource(id)
                   setSelectedAsset(undefined)
@@ -805,6 +869,9 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
                     </button>
                   </>
                 ) : null}
+                {activeAssetSource === 'eagle' && copyStatus ? (
+                  <span className="asset-copy-status">{copyStatus}</span>
+                ) : null}
                 {activeAssetSource === 'eagle' && selectedEagleTag ? (
                   <button type="button" onClick={() => toggleEagleTag(undefined)}>
                     <X size={15} />
@@ -814,6 +881,7 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
                 <button
                   type="button"
                   onClick={activeAssetSource === 'pinterest' ? openPinterestSettings : undefined}
+                  disabled={activeLoadState === 'loading'}
                 >
                   <Image size={15} />
                   {activeAssetSource === 'eagle' && eagleLoadState === 'loading'
@@ -828,9 +896,24 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
             </div>
             <div className={selectedAsset && activeAssetSource !== 'eagle' ? 'asset-browser-content has-detail' : 'asset-browser-content'}>
               <div className={activeAssetSource === 'eagle' ? 'asset-masonry' : 'asset-grid'}>
-                {filteredAssets.map((asset) => {
+                {activeLoadState === 'loading'
+                  ? Array.from({ length: activeAssetSource === 'eagle' ? 8 : 6 }).map((_, index) => (
+                      <div
+                        key={`asset-skeleton-${index}`}
+                        className={activeAssetSource === 'eagle' ? 'asset-masonry-card skeleton' : 'asset-tile skeleton'}
+                        aria-hidden="true"
+                      >
+                        <span className="asset-image-placeholder loading">加载中...</span>
+                        <span>
+                          <strong />
+                          <small />
+                        </span>
+                      </div>
+                    ))
+                  : filteredAssets.map((asset) => {
                   const dimensions = assetDimensions[asset.id] || (asset.width && asset.height ? { width: asset.width, height: asset.height } : undefined)
                   const isSelected = selectedAssetIds.includes(asset.id)
+                  const imageState = imageLoadStateByAssetId[asset.id] || 'loading'
 
                   if (activeAssetSource === 'eagle') {
                     return (
@@ -858,12 +941,21 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
                             aria-label={`Select ${asset.title}`}
                           />
                         </label>
-                        <img
-                          src={thumbnailUrlFor(asset)}
-                          alt=""
-                          onLoad={(event) => rememberDimensions(asset.id, event.currentTarget)}
-                          onError={(event) => fallbackToOriginalAssetImage(asset, event.currentTarget)}
-                        />
+                        <div className="asset-card-image-frame">
+                          {imageState === 'error' ? (
+                            <span className="asset-image-placeholder error">图片不可用</span>
+                          ) : (
+                            <>
+                              {imageState === 'loading' ? <span className="asset-image-placeholder loading">加载中...</span> : null}
+                              <img
+                                src={thumbnailUrlFor(asset)}
+                                alt=""
+                                onLoad={(event) => handleAssetImageLoad(asset.id, event.currentTarget)}
+                                onError={(event) => handleAssetImageError(asset, event.currentTarget)}
+                              />
+                            </>
+                          )}
+                        </div>
                         <span>
                           <strong>{asset.title}</strong>
                           <small>
@@ -884,12 +976,21 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
                       onDoubleClick={() => void addAssetToCanvas(asset)}
                       onDragStart={(event) => beginAssetDrag(asset, event)}
                     >
-                      <img
-                        src={thumbnailUrlFor(asset)}
-                        alt=""
-                        onLoad={(event) => rememberDimensions(asset.id, event.currentTarget)}
-                        onError={(event) => fallbackToOriginalAssetImage(asset, event.currentTarget)}
-                      />
+                      <div className="asset-card-image-frame">
+                        {imageState === 'error' ? (
+                          <span className="asset-image-placeholder error">图片不可用</span>
+                        ) : (
+                          <>
+                            {imageState === 'loading' ? <span className="asset-image-placeholder loading">加载中...</span> : null}
+                            <img
+                              src={thumbnailUrlFor(asset)}
+                              alt=""
+                              onLoad={(event) => handleAssetImageLoad(asset.id, event.currentTarget)}
+                              onError={(event) => handleAssetImageError(asset, event.currentTarget)}
+                            />
+                          </>
+                        )}
+                      </div>
                       <span>
                         <strong>{asset.title}</strong>
                         <small>
@@ -1070,8 +1171,23 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
             >
               <X size={18} />
             </button>
-            <div className="asset-lightbox-image">
-              <img src={previewAsset.url || thumbnailUrlFor(previewAsset)} alt="" />
+            <div className={`asset-lightbox-image ${previewImageState}`}>
+              {previewImageState === 'error' ? (
+                <span className="asset-image-placeholder error">图片不可用</span>
+              ) : (
+                <>
+                  {previewImageState === 'loading' ? <span className="asset-image-placeholder loading">加载中...</span> : null}
+                  <img
+                    src={previewAsset.url || thumbnailUrlFor(previewAsset)}
+                    alt=""
+                    onLoad={(event) => {
+                      rememberDimensions(previewAsset.id, event.currentTarget)
+                      setPreviewImageState('ready')
+                    }}
+                    onError={() => setPreviewImageState('error')}
+                  />
+                </>
+              )}
             </div>
             <div className="asset-lightbox-copy">
               <span className="library-kicker">{previewAsset.sourceLabel}</span>
@@ -1085,11 +1201,16 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
                 )} · {formatBytes(previewAsset.sizeBytes)}
               </p>
               <div className="asset-lightbox-actions">
-                <button type="button" className="primary" onClick={() => void addAssetToCanvas(previewAsset)}>
+                <button
+                  type="button"
+                  className="primary"
+                  onClick={() => void addAssetToCanvas(previewAsset)}
+                  disabled={previewImageState === 'error'}
+                >
                   <Image size={15} />
                   Add to canvas
                 </button>
-                <button type="button" onClick={() => copyOneAsset(previewAsset)}>
+                <button type="button" onClick={() => copyOneAsset(previewAsset)} disabled={previewImageState === 'error'}>
                   <Copy size={15} />
                   Copy
                 </button>

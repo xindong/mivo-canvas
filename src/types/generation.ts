@@ -9,6 +9,7 @@ export type MivoGenerateRequest = {
   quality?: MivoImageQuality
   n?: number
   model?: string
+  signal?: AbortSignal
 }
 
 export type MivoEditRequest = MivoGenerateRequest & {

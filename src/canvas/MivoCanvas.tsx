@@ -23,6 +23,7 @@ import { ImageCropOverlay, type ImageCropBox } from './ImageCropOverlay'
 import { NodeActionMenu } from './NodeActionMenu'
 import { SelectionQuickToolbar } from './SelectionQuickToolbar'
 import type { ImageMaskSubmitPayload } from './imageMaskGeometry'
+import type { MivoImageRatio } from '../types/generation'
 import { useCanvasInteractionController } from './useCanvasInteractionController'
 
 type ContextMenuState = {
@@ -39,6 +40,7 @@ type ContextMenuState = {
 type MivoCanvasProps = {
   onOpenDetails?: () => void
   onOpenGeneratePanel?: () => void
+  maskCancelRequestId?: number
 }
 
 const contextMenuWidth = 252
@@ -73,6 +75,21 @@ type LocalAssetDragPayload = {
 
 const canvasRenderOverscanPx = 520
 
+const supportedMivoRatios: Array<{ id: MivoImageRatio; value: number }> = [
+  { id: '1:1', value: 1 },
+  { id: '3:2', value: 3 / 2 },
+  { id: '2:3', value: 2 / 3 },
+  { id: '16:9', value: 16 / 9 },
+  { id: '9:16', value: 9 / 16 },
+]
+
+const closestMivoRatioForSize = (size: { width: number; height: number }): MivoImageRatio => {
+  const ratio = Math.max(1, size.width) / Math.max(1, size.height)
+  return supportedMivoRatios.reduce((best, candidate) => (
+    Math.abs(Math.log(ratio / candidate.value)) < Math.abs(Math.log(ratio / best.value)) ? candidate : best
+  )).id
+}
+
 const rectsIntersect = (
   a: { x: number; y: number; width: number; height: number },
   b: { x: number; y: number; width: number; height: number },
@@ -104,10 +121,12 @@ const isNodeEffectivelyLocked = (nodeId: string, nodes: Array<{ id: string; type
   return Boolean(node.locked || section?.sectionLockMode === 'all')
 }
 
-export function MivoCanvas({ onOpenDetails, onOpenGeneratePanel }: MivoCanvasProps) {
+export function MivoCanvas({ onOpenDetails, onOpenGeneratePanel, maskCancelRequestId = 0 }: MivoCanvasProps) {
   const shellRef = useRef<HTMLElement | null>(null)
   const hostRef = useRef<HTMLDivElement | null>(null)
   const leaferRef = useRef<Leafer | null>(null)
+  const maskEditAbortRef = useRef<AbortController | null>(null)
+  const lastMaskCancelRequestIdRef = useRef(maskCancelRequestId)
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null)
   const [cropNodeId, setCropNodeId] = useState<string>()
   const [maskEditNodeId, setMaskEditNodeId] = useState<string>()
@@ -134,6 +153,8 @@ export function MivoCanvas({ onOpenDetails, onOpenGeneratePanel }: MivoCanvasPro
   const cropNode = cropNodeId ? visibleNodes.find((node) => node.id === cropNodeId && node.type === 'image') : undefined
   const closeContextMenu = useCallback(() => setContextMenu(null), [])
   const cancelMaskEdit = useCallback(() => {
+    maskEditAbortRef.current?.abort()
+    maskEditAbortRef.current = null
     setMaskEditNodeId(undefined)
     setMaskEditSubmittingNodeId(undefined)
   }, [])
@@ -295,15 +316,19 @@ export function MivoCanvas({ onOpenDetails, onOpenGeneratePanel }: MivoCanvasPro
       if (!source) throw new Error('Source image not found')
 
       setMaskEditSubmittingNodeId(nodeId)
+      const abortController = new AbortController()
+      maskEditAbortRef.current?.abort()
+      maskEditAbortRef.current = abortController
       try {
         const image = await readCanvasImageBlob(source, resolvedAssetUrl)
         const response = await editMivoImage({
           image,
           mask: payload.mask,
           prompt: payload.prompt,
-          imgRatio: '1:1',
+          imgRatio: closestMivoRatioForSize(payload.sourceSize),
           quality: 'medium',
           model: 'gpt-image-2',
+          signal: abortController.signal,
         })
         await commitGenerationResult({
           sourceNodeId: source.id,
@@ -316,6 +341,9 @@ export function MivoCanvas({ onOpenDetails, onOpenGeneratePanel }: MivoCanvasPro
         })
         setMaskEditNodeId(undefined)
       } finally {
+        if (maskEditAbortRef.current === abortController) {
+          maskEditAbortRef.current = null
+        }
         setMaskEditSubmittingNodeId(undefined)
       }
     },
@@ -409,6 +437,16 @@ export function MivoCanvas({ onOpenDetails, onOpenGeneratePanel }: MivoCanvasPro
     },
     [addImportedFileNode, addImportedImage, screenToCanvasPoint],
   )
+
+  useEffect(() => {
+    if (lastMaskCancelRequestIdRef.current === maskCancelRequestId) return
+    lastMaskCancelRequestIdRef.current = maskCancelRequestId
+    cancelMaskEdit()
+  }, [cancelMaskEdit, maskCancelRequestId])
+
+  useEffect(() => () => {
+    maskEditAbortRef.current?.abort()
+  }, [])
 
   useEffect(() => {
     if (!hostRef.current || leaferRef.current) return

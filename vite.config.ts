@@ -12,6 +12,7 @@ const defaultMivoImageModel = 'gpt-image-2'
 const mivoQualitySet = new Set(['low', 'medium', 'high'])
 const mivoImageRequestMaxBytes = 40 * 1024 * 1024
 const mivoJsonRequestMaxBytes = 1024 * 1024
+const mivoUpstreamTimeoutMs = 110_000
 const mivoImageSizeMap = {
   '1:1': {
     low: '1024x1024',
@@ -52,6 +53,32 @@ type ParsedMivoMultipart = {
 }
 
 class RequestBodyTooLargeError extends Error {}
+class UpstreamRequestTimeoutError extends Error {}
+
+const isAbortError = (error: unknown) => error instanceof Error && error.name === 'AbortError'
+
+const fetchUpstreamWithTimeout = async (url: string, init: RequestInit) => {
+  const controller = new AbortController()
+  let timedOut = false
+  const timeoutId = setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, mivoUpstreamTimeoutMs)
+
+  try {
+    return await fetch(url, {
+      ...init,
+      signal: controller.signal,
+    })
+  } catch (error) {
+    if (isAbortError(error) && timedOut) {
+      throw new UpstreamRequestTimeoutError('Image API request timed out')
+    }
+    throw error
+  } finally {
+    clearTimeout(timeoutId)
+  }
+}
 
 const mimeFor = (filePath: string) => {
   const extension = path.extname(filePath).toLowerCase()
@@ -244,13 +271,13 @@ const normalizeMivoImages = (payload: unknown): MivoImageResponse => {
     images?: Array<{ b64?: unknown }>
   }
   const images = (maybePayload.data || [])
-    .map((item) => (typeof item.b64_json === 'string' ? { b64: item.b64_json } : undefined))
+    .map((item) => (typeof item.b64_json === 'string' && item.b64_json.trim() ? { b64: item.b64_json } : undefined))
     .filter((item): item is { b64: string } => Boolean(item))
 
   if (!images.length && maybePayload.images) {
     images.push(
       ...maybePayload.images
-        .map((item) => (typeof item.b64 === 'string' ? { b64: item.b64 } : undefined))
+        .map((item) => (typeof item.b64 === 'string' && item.b64.trim() ? { b64: item.b64 } : undefined))
         .filter((item): item is { b64: string } => Boolean(item)),
     )
   }
@@ -298,7 +325,7 @@ const proxyMivoGenerate = async (
     }
 
     const quality = normalizeMivoQuality(body.quality)
-    const upstreamResponse = await fetch(`${mivoImageApiBase}/generations`, {
+    const upstreamResponse = await fetchUpstreamWithTimeout(`${mivoImageApiBase}/generations`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${readImageApiKey(imageApiKey)}`,
@@ -322,7 +349,7 @@ const proxyMivoGenerate = async (
   } catch (error) {
     sendMivoJson(
       response,
-      error instanceof RequestBodyTooLargeError ? 413 : 500,
+      error instanceof RequestBodyTooLargeError ? 413 : error instanceof UpstreamRequestTimeoutError ? 504 : 500,
       { error: error instanceof Error ? error.message : 'Unable to generate image' },
     )
   }
@@ -366,7 +393,7 @@ const proxyMivoEdit = async (
     formData.set('size', imageSizeFor(firstMultipartField(fields, 'imgRatio'), quality))
     formData.set('quality', quality)
 
-    const upstreamResponse = await fetch(`${mivoImageApiBase}/edits`, {
+    const upstreamResponse = await fetchUpstreamWithTimeout(`${mivoImageApiBase}/edits`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${readImageApiKey(imageApiKey)}`,
@@ -383,7 +410,7 @@ const proxyMivoEdit = async (
   } catch (error) {
     sendMivoJson(
       response,
-      error instanceof RequestBodyTooLargeError ? 413 : 500,
+      error instanceof RequestBodyTooLargeError ? 413 : error instanceof UpstreamRequestTimeoutError ? 504 : 500,
       { error: error instanceof Error ? error.message : 'Unable to edit image' },
     )
   }
