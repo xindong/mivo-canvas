@@ -28,6 +28,11 @@ import {
   type ImportedFileMetadata,
 } from '../lib/canvasAssetImport'
 import { importedImageDisplaySize, type ImportedImageMetadata } from '../lib/imageSizing'
+import {
+  normalizeCanvasNodeV2,
+  normalizeCanvasNodesV2,
+  setNodeTransform,
+} from '../model/documentModelV2'
 import { buildAiContextSnapshot, chooseAdjacentPlacement } from './aiCanvasWorkflow'
 import { debugLogger } from './debugLogStore'
 import { makeNode, realCaseImages, scenes, snapshotFromScene } from './demoScenes'
@@ -205,7 +210,7 @@ const sceneLabels = new Map(sceneOptions.map((scene) => [scene.id, scene.label])
 const fallbackTitle = (sceneId: CanvasId) => sceneLabels.get(sceneId as DemoSceneId) || sceneId
 
 const cloneNode = (node: MivoCanvasNode): MivoCanvasNode => ({
-  ...node,
+  ...normalizeCanvasNodeV2(node),
   markupPoints: node.markupPoints ? node.markupPoints.map((point) => ({ ...point })) : undefined,
   connectorStart: node.connectorStart ? { ...node.connectorStart } : undefined,
   connectorEnd: node.connectorEnd ? { ...node.connectorEnd } : undefined,
@@ -384,7 +389,7 @@ const normalizeConnectorMarkupNodes = (nodes: MivoCanvasNode[]) =>
   })
 
 const normalizeCanvasNodes = (nodes: MivoCanvasNode[]) =>
-  normalizeConnectorMarkupNodes(normalizeSectionMembership(nodes))
+  normalizeCanvasNodesV2(normalizeConnectorMarkupNodes(normalizeSectionMembership(nodes)))
 
 const normalizeLongMarkdownPreviewNodes = (nodes: MivoCanvasNode[]) =>
   nodes.map((node) => {
@@ -888,7 +893,7 @@ export const useCanvasStore = create<CanvasState>()(
 
           const nodes = normalizeCanvasNodes(
             state.nodes.map((node) =>
-              node.id === nodeId ? { ...node, x: Math.round(x), y: Math.round(y) } : node,
+              node.id === nodeId ? setNodeTransform(node, { x: Math.round(x), y: Math.round(y) }) : node,
             ),
           )
 
@@ -914,7 +919,7 @@ export const useCanvasStore = create<CanvasState>()(
           const nodes = normalizeCanvasNodes(
             state.nodes.map((node) =>
               moveSet.has(node.id) && !isEffectivelyLocked(state.nodes, node)
-                ? { ...node, x: node.x + dx, y: node.y + dy }
+                ? setNodeTransform(node, { x: node.x + dx, y: node.y + dy })
                 : node,
             ),
           )
@@ -929,13 +934,12 @@ export const useCanvasStore = create<CanvasState>()(
           const nodes = normalizeCanvasNodes(
             state.nodes.map((node) =>
               node.id === nodeId
-                ? {
-                    ...node,
+                ? setNodeTransform(node, {
                     x: Math.round(x),
                     y: Math.round(y),
                     width: Math.round(width),
                     height: Math.round(height),
-                  }
+                  })
                 : node,
             ),
           )
@@ -951,13 +955,12 @@ export const useCanvasStore = create<CanvasState>()(
             const update = updatesById.get(node.id)
             if (!update || isEffectivelyLocked(state.nodes, node)) return node
 
-            return {
-              ...node,
+            return setNodeTransform(node, {
               x: Math.round(update.x),
               y: Math.round(update.y),
               width: Math.round(update.width),
               height: Math.round(update.height),
-            }
+            })
           }))
 
           return patchActiveCanvas(state, {
@@ -1685,10 +1688,7 @@ export const useCanvasStore = create<CanvasState>()(
 
           const nodes = state.nodes.map((node) =>
             node.id === nodeId
-              ? {
-                  ...node,
-                  ...style,
-                }
+              ? normalizeCanvasNodeV2({ ...node, ...style, fills: undefined, strokes: undefined })
               : node,
           )
           return patchWithHistory(state, { nodes, selectedNodeId: nodeId, selectedNodeIds: [nodeId] })
@@ -1698,7 +1698,11 @@ export const useCanvasStore = create<CanvasState>()(
           const section = state.nodes.find((node) => node.id === nodeId && isSectionNode(node))
           if (!section || section.locked) return {}
 
-          const nodes = state.nodes.map((node) => (node.id === nodeId ? { ...node, ...style } : node))
+          const nodes = state.nodes.map((node) =>
+            node.id === nodeId
+              ? normalizeCanvasNodeV2({ ...node, ...style, fills: undefined, strokes: undefined })
+              : node,
+          )
           return patchWithHistory(state, { nodes, selectedNodeId: nodeId, selectedNodeIds: [nodeId] })
         }),
       setSectionLockMode: (nodeId, mode) =>

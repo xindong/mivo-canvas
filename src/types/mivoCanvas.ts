@@ -98,6 +98,94 @@ export type ImageCrop = {
   height: number
 }
 
+export type CanvasNodeTransform = {
+  x: number
+  y: number
+  width: number
+  height: number
+  rotation: number
+}
+
+export type CanvasNodeSolidFill = {
+  id: string
+  kind: 'solid'
+  color: string
+  opacity: number
+  visible: boolean
+}
+
+export type CanvasNodeImageFill = {
+  id: string
+  kind: 'image'
+  assetUrl: string
+  opacity: number
+  visible: boolean
+  scaleMode: 'fill' | 'fit' | 'crop' | 'tile'
+}
+
+export type CanvasNodeFill = CanvasNodeSolidFill | CanvasNodeImageFill
+
+export type CanvasNodeStroke = {
+  id: string
+  color: string
+  width: number
+  style: MarkupStrokeStyle
+  opacity: number
+  visible: boolean
+}
+
+export type CanvasNodeEffect =
+  | {
+      id: string
+      kind: 'shadow'
+      color: string
+      x: number
+      y: number
+      blur: number
+      spread: number
+      opacity: number
+      visible: boolean
+    }
+  | {
+      id: string
+      kind: 'blur'
+      radius: number
+      visible: boolean
+    }
+
+export type CanvasNodeLayout = {
+  mode: 'none' | 'auto'
+  direction?: 'horizontal' | 'vertical'
+  gap?: number
+  padding?: {
+    top: number
+    right: number
+    bottom: number
+    left: number
+  }
+}
+
+export type CanvasNodeConstraints = {
+  horizontal?: 'left' | 'right' | 'left-right' | 'center' | 'scale'
+  vertical?: 'top' | 'bottom' | 'top-bottom' | 'center' | 'scale'
+}
+
+export type CanvasNodeAssetRef = {
+  url: string
+  mimeType?: string
+  originalName?: string
+  sizeBytes?: number
+}
+
+export type CanvasNodeRelations = {
+  parentIds?: string[]
+  sectionId?: string
+  targetNodeId?: string
+  connectorStart?: ConnectorBinding
+  connectorEnd?: ConnectorBinding
+  aiWorkflow?: CanvasAiWorkflow
+}
+
 export type MivoCanvasNode = {
   id: string
   type: CanvasNodeType
@@ -106,6 +194,14 @@ export type MivoCanvasNode = {
   y: number
   width: number
   height: number
+  transform?: CanvasNodeTransform
+  fills?: CanvasNodeFill[]
+  strokes?: CanvasNodeStroke[]
+  effects?: CanvasNodeEffect[]
+  layout?: CanvasNodeLayout
+  constraints?: CanvasNodeConstraints
+  asset?: CanvasNodeAssetRef
+  relations?: CanvasNodeRelations
   text?: string
   fontSize?: number
   textColor?: string

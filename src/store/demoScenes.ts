@@ -1,4 +1,5 @@
 import { createDemoImage } from '../lib/demoImages'
+import { normalizeCanvasNodeV2 } from '../model/documentModelV2'
 import type { DemoSceneId, MivoCanvasNode, MivoCanvasSnapshot, SceneDefinition } from '../types/mivoCanvas'
 
 export const modelNames = ['Mivo Art SDXL', 'Mivo Character v3', 'Mivo Concept Fast']
@@ -26,11 +27,12 @@ const image = (
 
 export const makeNode = (
   node: Omit<MivoCanvasNode, 'status' | 'type'> & Partial<Pick<MivoCanvasNode, 'status' | 'type'>>,
-): MivoCanvasNode => ({
-  type: 'image',
-  status: 'ready',
-  ...node,
-})
+): MivoCanvasNode =>
+  normalizeCanvasNodeV2({
+    type: 'image',
+    status: 'ready',
+    ...node,
+  })
 
 const buildVariants = (sourceId: string, startX: number, startY: number) =>
   Array.from({ length: 4 }, (_, index) =>
