@@ -683,9 +683,11 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
             <button
               key={handle.id}
               type="button"
-              className={`selection-spacing-handle ${handle.axis}`}
+              className={`selection-spacing-handle ${handle.axis} layout-${handle.layoutKind}`}
               aria-label={`Adjust ${handle.axis} spacing ${handle.label}px`}
               title={`${handle.label}px`}
+              data-smart-layout={handle.layoutKind}
+              data-smart-spacing={handle.label}
               style={{
                 left: canvasToOverlayX(handle.x),
                 top: canvasToOverlayY(handle.y),

@@ -12,7 +12,7 @@ import { importImageFileToCanvas } from '../lib/canvasAssetImport'
 import { useCanvasStore } from '../store/canvasStore'
 import type { CanvasId, MarkupKind, MarkupPoint, MivoCanvasNode } from '../types/mivoCanvas'
 import type { ResizeCorner, SnapGuide } from './canvasGeometry'
-import { isConnectorNode, nearestConnectorBindingForPoint } from './connectorGeometry'
+import { nearestConnectorBindingForPoint } from './connectorGeometry'
 import {
   boundsForNodes,
   clientPointToCanvas,
@@ -48,6 +48,14 @@ import {
 } from './canvasInteraction'
 import { canvasToolHandlers, type CanvasToolHandlerContext } from './canvasToolHandlers'
 import { isCanvasToolEnabled, markupKindForTool, toolForKeyboardShortcut } from './canvasToolRegistry'
+import {
+  smartSelectionGapFor,
+  smartSelectionHandlesFor,
+  smartSelectionLayoutFor,
+  smartSelectionSpacingUpdates,
+  type SmartSelectionHandle,
+  type SmartSelectionSpacingDragState,
+} from './smartSelection'
 import { defaultTextFontSize, defaultTextWeight, textGeometryFor } from './textGeometry'
 
 type UseCanvasInteractionControllerOptions = {
@@ -94,30 +102,6 @@ type MarkupPointTransformState = {
   startNode: MivoCanvasNode
   startPoints: MarkupPoint[]
   historyCaptured: boolean
-}
-
-export type SelectionSpacingAxis = 'horizontal' | 'vertical'
-
-export type SelectionSpacingHandle = {
-  id: string
-  axis: SelectionSpacingAxis
-  index: number
-  gap: number
-  x: number
-  y: number
-  width: number
-  height: number
-  label: string
-}
-
-type SelectionSpacingDragState = {
-  pointerId: number
-  axis: SelectionSpacingAxis
-  index: number
-  startClientX: number
-  startClientY: number
-  startGap: number
-  startNodes: MivoCanvasNode[]
 }
 
 export const defaultViewportFor = (sceneId: string): Viewport => ({
@@ -264,95 +248,6 @@ const isNodeEffectivelyLocked = (node: MivoCanvasNode, nodes: MivoCanvasNode[]) 
   return Boolean(node.locked || section?.sectionLockMode === 'all')
 }
 
-const spacingSubjectNodesFrom = (selectedNodes: MivoCanvasNode[], nodes: MivoCanvasNode[]) =>
-  selectedNodes.filter((node) => node.type !== 'frame' && !isConnectorNode(node) && !isNodeEffectivelyLocked(node, nodes))
-
-const spacingAxisFor = (nodes: MivoCanvasNode[]): SelectionSpacingAxis | undefined => {
-  const bounds = boundsForNodes(nodes)
-  if (!bounds || nodes.length < 2) return undefined
-
-  return bounds.width >= bounds.height ? 'horizontal' : 'vertical'
-}
-
-const sortedSpacingNodes = (nodes: MivoCanvasNode[], axis: SelectionSpacingAxis) =>
-  [...nodes].sort((a, b) => (axis === 'horizontal' ? a.x - b.x || a.y - b.y : a.y - b.y || a.x - b.x))
-
-const spacingGapFor = (nodes: MivoCanvasNode[], axis: SelectionSpacingAxis, index: number) => {
-  const current = nodes[index]
-  const next = nodes[index + 1]
-  if (!current || !next) return 0
-
-  return axis === 'horizontal' ? next.x - (current.x + current.width) : next.y - (current.y + current.height)
-}
-
-const selectionSpacingHandlesFor = (
-  selectedNodes: MivoCanvasNode[],
-  nodes: MivoCanvasNode[],
-  viewportScale: number,
-): SelectionSpacingHandle[] => {
-  const subjects = spacingSubjectNodesFrom(selectedNodes, nodes)
-  const axis = spacingAxisFor(subjects)
-  const bounds = boundsForNodes(subjects)
-  if (!axis || !bounds) return []
-
-  const sorted = sortedSpacingNodes(subjects, axis)
-  const minInlineSize = 40 / viewportScale
-  const maxInlineSize = 96 / viewportScale
-  const crossSize = 22 / viewportScale
-
-  return sorted.flatMap((node, index): SelectionSpacingHandle[] => {
-    const next = sorted[index + 1]
-    if (!next) return []
-
-    const gap = spacingGapFor(sorted, axis, index)
-    if (gap < 0) return []
-
-    if (axis === 'horizontal') {
-      const gapStart = node.x + node.width
-      const gapEnd = next.x
-      const width = Math.max(minInlineSize, Math.min(maxInlineSize, Math.max(gap, crossSize)))
-      const height = crossSize
-      const centerX = (gapStart + gapEnd) / 2
-      const centerY = bounds.y + bounds.height / 2
-
-      return [
-        {
-          id: `spacing-${axis}-${index}-${node.id}-${next.id}`,
-          axis,
-          index,
-          gap: Math.round(gap),
-          x: centerX - width / 2,
-          y: centerY - height / 2,
-          width,
-          height,
-          label: `${Math.max(0, Math.round(gap))}`,
-        },
-      ]
-    }
-
-    const gapStart = node.y + node.height
-    const gapEnd = next.y
-    const width = minInlineSize
-    const height = Math.max(crossSize, Math.min(maxInlineSize, Math.max(gap, crossSize)))
-    const centerX = bounds.x + bounds.width / 2
-    const centerY = (gapStart + gapEnd) / 2
-
-    return [
-      {
-        id: `spacing-${axis}-${index}-${node.id}-${next.id}`,
-        axis,
-        index,
-        gap: Math.round(gap),
-        x: centerX - width / 2,
-        y: centerY - height / 2,
-        width,
-        height,
-        label: `${Math.max(0, Math.round(gap))}`,
-      },
-    ]
-  })
-}
-
 const isEditableTextNode = (
   node: MivoCanvasNode | undefined,
 ): node is MivoCanvasNode & { type: 'text' | 'annotation' | 'markup' } =>
@@ -380,7 +275,7 @@ export function useCanvasInteractionController({
   const markupPointTransformRef = useRef<MarkupPointTransformState | null>(null)
   const textResizeRef = useRef<TextResizeState | null>(null)
   const groupResizeRef = useRef<GroupResizeState | null>(null)
-  const selectionSpacingDragRef = useRef<SelectionSpacingDragState | null>(null)
+  const selectionSpacingDragRef = useRef<SmartSelectionSpacingDragState | null>(null)
   const persistedSceneRef = useRef(sceneId)
   const viewportPersistenceTimerRef = useRef<number | undefined>(undefined)
   const [viewport, setViewport] = useState(() => initialViewportFor(sceneId))
@@ -434,7 +329,10 @@ export function useCanvasInteractionController({
   const selectionSpacingHandles = useMemo(
     () =>
       showGroupSelectionBounds
-        ? selectionSpacingHandlesFor(selectedNodes, nodes, viewport.scale)
+        ? smartSelectionHandlesFor(selectedNodes, {
+            isEffectivelyLocked: (node) => isNodeEffectivelyLocked(node, nodes),
+            viewportScale: viewport.scale,
+          })
         : [],
     [nodes, selectedNodes, showGroupSelectionBounds, viewport.scale],
   )
@@ -693,15 +591,15 @@ export function useCanvasInteractionController({
   )
 
   const beginSelectionSpacingDrag = useCallback(
-    (handle: SelectionSpacingHandle, event: ReactPointerEvent<HTMLButtonElement>) => {
+    (handle: SmartSelectionHandle, event: ReactPointerEvent<HTMLButtonElement>) => {
       if (event.button !== 0) return
 
-      const subjects = spacingSubjectNodesFrom(selectedNodes, nodes)
-      const axis = spacingAxisFor(subjects)
-      if (axis !== handle.axis) return
-
-      const startNodes = sortedSpacingNodes(subjects, axis)
-      if (!startNodes[handle.index] || !startNodes[handle.index + 1]) return
+      const startLayout = smartSelectionLayoutFor(selectedNodes, {
+        isEffectivelyLocked: (node) => isNodeEffectivelyLocked(node, nodes),
+      })
+      if (!startLayout) return
+      const startGap = smartSelectionGapFor(startLayout, handle.axis, handle.index)
+      if (startGap < 0) return
 
       event.preventDefault()
       event.stopPropagation()
@@ -717,12 +615,13 @@ export function useCanvasInteractionController({
 
       selectionSpacingDragRef.current = {
         pointerId: event.pointerId,
-        axis,
+        axis: handle.axis,
         index: handle.index,
+        layoutKind: startLayout.kind,
         startClientX: event.clientX,
         startClientY: event.clientY,
-        startGap: spacingGapFor(startNodes, axis, handle.index),
-        startNodes,
+        startGap,
+        startLayout,
       }
     },
     [captureHistory, discardEmptyEditingText, nodes, onCloseContextMenu, selectedNodes],
@@ -1034,19 +933,12 @@ export function useCanvasInteractionController({
 
       const selectionSpacingDrag = selectionSpacingDragRef.current
       if (selectionSpacingDrag?.pointerId === event.pointerId) {
-        const delta =
-          selectionSpacingDrag.axis === 'horizontal'
-            ? (event.clientX - selectionSpacingDrag.startClientX) / viewportRef.current.scale
-            : (event.clientY - selectionSpacingDrag.startClientY) / viewportRef.current.scale
-        const nextGap = Math.max(0, selectionSpacingDrag.startGap + delta)
-        const gapDelta = nextGap - selectionSpacingDrag.startGap
-        const updates = selectionSpacingDrag.startNodes.map((node, index) => ({
-          id: node.id,
-          x: selectionSpacingDrag.axis === 'horizontal' && index > selectionSpacingDrag.index ? node.x + gapDelta : node.x,
-          y: selectionSpacingDrag.axis === 'vertical' && index > selectionSpacingDrag.index ? node.y + gapDelta : node.y,
-          width: node.width,
-          height: node.height,
-        }))
+        const { updates } = smartSelectionSpacingUpdates(
+          selectionSpacingDrag,
+          event.clientX,
+          event.clientY,
+          viewportRef.current.scale,
+        )
 
         updateNodesGeometry(updates)
         return

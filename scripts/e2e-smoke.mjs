@@ -3273,9 +3273,19 @@ try {
   if ((await spacingHandle.count()) !== 1 || selectedRowGapsBefore.length < 1) {
     throw new Error(`Arrange row should expose a draggable horizontal spacing handle: gaps=${JSON.stringify(selectedRowGapsBefore)}`)
   }
+  const spacingHandleLabelHidden = await spacingHandle.locator('span').evaluate((label) => getComputedStyle(label).opacity === '0')
+  if (!spacingHandleLabelHidden) {
+    throw new Error('Smart spacing labels should stay hidden until hover or drag')
+  }
   const spacingHandleBox = await spacingHandle.boundingBox()
   if (!spacingHandleBox) throw new Error('Missing spacing handle bounds')
+  const spacingHandleElement = await spacingHandle.elementHandle()
+  if (!spacingHandleElement) throw new Error('Missing spacing handle element')
   await page.mouse.move(spacingHandleBox.x + spacingHandleBox.width / 2, spacingHandleBox.y + spacingHandleBox.height / 2)
+  await page.waitForFunction((element) => {
+    const label = element.querySelector('span')
+    return label ? Number(getComputedStyle(label).opacity) > 0.5 : false
+  }, spacingHandleElement)
   await page.mouse.down()
   await page.mouse.move(spacingHandleBox.x + spacingHandleBox.width / 2 + 48, spacingHandleBox.y + spacingHandleBox.height / 2, {
     steps: 6,
@@ -3291,9 +3301,10 @@ try {
 
     return sorted.slice(0, -1).map((node, index) => sorted[index + 1].left - node.right)
   })
-  if (selectedRowGapsAfter[0] < selectedRowGapsBefore[0] + 24) {
+  const gapSpreadAfterDrag = Math.max(...selectedRowGapsAfter) - Math.min(...selectedRowGapsAfter)
+  if (selectedRowGapsAfter.some((gap) => gap < selectedRowGapsBefore[0] + 24) || gapSpreadAfterDrag > 2) {
     throw new Error(
-      `Dragging the horizontal spacing handle should increase the first selected gap: before=${JSON.stringify(
+      `Dragging the horizontal spacing handle should create a larger uniform smart-selection gap: before=${JSON.stringify(
         selectedRowGapsBefore,
       )}, after=${JSON.stringify(selectedRowGapsAfter)}`,
     )
