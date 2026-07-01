@@ -3201,6 +3201,32 @@ try {
   }
   await page.keyboard.press('Escape')
   await page.waitForSelector('.selection-quick-toolbar-menu', { state: 'detached' })
+  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Arrange' }).click()
+  if (!(await page.locator('.selection-quick-toolbar-menu').evaluate((menu) => menu.classList.contains('icon-grid-menu')))) {
+    throw new Error('Multi-selection Arrange quick menu should render as an icon grid')
+  }
+  for (const action of ['Arrange row', 'Arrange column', 'Arrange grid', 'Tidy selection']) {
+    if ((await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: action }).count()) !== 1) {
+      throw new Error(`Multi-selection Arrange quick menu should expose ${action}`)
+    }
+  }
+  await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Arrange row' }).click()
+  await page.waitForSelector('.selection-quick-toolbar-menu', { state: 'detached' })
+  const arrangedRowCenters = await page.locator('.dom-node.selected:not([data-node-type="markup"])').evaluateAll((nodes) =>
+    nodes.map((node) => {
+      const rect = node.getBoundingClientRect()
+      return rect.top + rect.height / 2
+    }),
+  )
+  if (
+    arrangedRowCenters.length < 2 ||
+    Math.max(...arrangedRowCenters) - Math.min(...arrangedRowCenters) > 2 ||
+    (await page.locator('.selection-quick-toolbar').count()) !== 1
+  ) {
+    throw new Error(`Arrange row should keep a multi-selection and align object centers: ${JSON.stringify(arrangedRowCenters)}`)
+  }
+  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+Z' : 'Control+Z')
+  await page.waitForSelector('.selection-quick-toolbar')
 
   if ((await page.locator('.node-handle').count()) !== 0) {
     throw new Error('Multi-selection should hide individual node resize handles')

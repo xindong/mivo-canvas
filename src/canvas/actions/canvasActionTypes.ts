@@ -1,5 +1,5 @@
 import type { LucideIcon } from 'lucide-react'
-import type { DistributionAxis, SelectionAlignment } from '../../store/canvasStore'
+import type { DistributionAxis, SelectionAlignment, SelectionArrangeMode } from '../../store/canvasStore'
 import type {
   AiWorkflowOperation,
   MarkupKind,
@@ -122,6 +122,7 @@ export type CanvasActionRuntime = {
   moveSelectedLayer: (move: LayerMove) => void
   alignSelectedNodes: (alignment: SelectionAlignment) => void
   distributeSelectedNodes: (axis: DistributionAxis) => void
+  arrangeSelectedNodes: (mode: SelectionArrangeMode) => void
   toggleSelectedNodesLocked: () => void
   hideSelectedNodes: () => void
   showAllHiddenNodes: () => void

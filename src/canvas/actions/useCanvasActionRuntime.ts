@@ -50,6 +50,7 @@ export const useCanvasActionRuntime = ({
   const moveSelectedLayer = useCanvasStore((state) => state.moveSelectedLayer)
   const alignSelectedNodes = useCanvasStore((state) => state.alignSelectedNodes)
   const distributeSelectedNodes = useCanvasStore((state) => state.distributeSelectedNodes)
+  const arrangeSelectedNodes = useCanvasStore((state) => state.arrangeSelectedNodes)
   const toggleSelectedNodesLocked = useCanvasStore((state) => state.toggleSelectedNodesLocked)
   const hideSelectedNodes = useCanvasStore((state) => state.hideSelectedNodes)
   const showAllHiddenNodes = useCanvasStore((state) => state.showAllHiddenNodes)
@@ -126,6 +127,7 @@ export const useCanvasActionRuntime = ({
     moveSelectedLayer,
     alignSelectedNodes,
     distributeSelectedNodes,
+    arrangeSelectedNodes,
     toggleSelectedNodesLocked,
     hideSelectedNodes,
     showAllHiddenNodes,

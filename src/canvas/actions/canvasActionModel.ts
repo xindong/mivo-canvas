@@ -16,6 +16,7 @@ import {
   ChevronsDown,
   ChevronsUp,
   Clipboard,
+  Columns3,
   Copy,
   Crop,
   Download,
@@ -24,15 +25,18 @@ import {
   EyeOff,
   ExternalLink,
   FilePlus2,
+  Grid3X3,
   Group,
   ImagePlus,
   LocateFixed,
   Lock,
+  LayoutGrid,
   Maximize2,
   MessageSquareText,
   Minus,
   PanelTop,
   Pencil,
+  Rows3,
   Square,
   SquareDashed,
   SquareMousePointer,
@@ -42,8 +46,9 @@ import {
   Ungroup,
   Unlock,
   Wand2,
+  WandSparkles,
 } from 'lucide-react'
-import type { DistributionAxis, SelectionAlignment } from '../../store/canvasStore'
+import type { DistributionAxis, SelectionAlignment, SelectionArrangeMode } from '../../store/canvasStore'
 import type { CanvasNodeType, MarkupKind, SectionLockMode, ToolId } from '../../types/mivoCanvas'
 import {
   hasAnyCapability,
@@ -470,6 +475,10 @@ const align = (runtime: CanvasActionRuntime, alignment: SelectionAlignment) => {
 
 const distribute = (runtime: CanvasActionRuntime, axis: DistributionAxis) => {
   runtime.distributeSelectedNodes(axis)
+}
+
+const arrange = (runtime: CanvasActionRuntime, mode: SelectionArrangeMode) => {
+  runtime.arrangeSelectedNodes(mode)
 }
 
 type NodeActionExtension = (runtime: CanvasActionRuntime) => CanvasActionGroup[]
@@ -1237,6 +1246,24 @@ export const quickToolbarGroupsFor = (runtime: CanvasActionRuntime): CanvasActio
           ]
         : []),
     ]
+    const arrangeActions: CanvasActionItem[] = [
+      { id: 'arrange-row', label: 'Arrange row', icon: Rows3, onClick: () => arrange(runtime, 'row') },
+      { id: 'arrange-column', label: 'Arrange column', icon: Columns3, onClick: () => arrange(runtime, 'column') },
+      {
+        id: 'arrange-grid',
+        label: 'Arrange grid',
+        icon: LayoutGrid,
+        disabled: context.selectedCount < 3,
+        onClick: () => arrange(runtime, 'grid'),
+      },
+      {
+        id: 'arrange-tidy',
+        label: 'Tidy selection',
+        icon: WandSparkles,
+        disabled: context.selectedCount < 3,
+        onClick: () => arrange(runtime, 'tidy'),
+      },
+    ]
 
     return [
       {
@@ -1255,6 +1282,14 @@ export const quickToolbarGroupsFor = (runtime: CanvasActionRuntime): CanvasActio
             menuVariant: 'icon-grid',
             children: alignActions,
             onClick: () => align(runtime, 'center'),
+          },
+          {
+            id: 'arrange-menu',
+            label: 'Arrange',
+            icon: Grid3X3,
+            menuVariant: 'icon-grid',
+            children: arrangeActions,
+            onClick: () => arrange(runtime, 'tidy'),
           },
           {
             id: 'toggle-lock',
