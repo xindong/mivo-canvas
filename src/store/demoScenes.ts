@@ -1,4 +1,6 @@
 import { createDemoImage } from '../lib/demoImages'
+import { normalizeCanvasSnapshotV2 } from '../model/canvasSnapshotModel'
+import { normalizeCanvasNodeV2 } from '../model/documentModelV2'
 import type { DemoSceneId, MivoCanvasNode, MivoCanvasSnapshot, SceneDefinition } from '../types/mivoCanvas'
 
 export const modelNames = ['Mivo Art SDXL', 'Mivo Character v3', 'Mivo Concept Fast']
@@ -26,11 +28,12 @@ const image = (
 
 export const makeNode = (
   node: Omit<MivoCanvasNode, 'status' | 'type'> & Partial<Pick<MivoCanvasNode, 'status' | 'type'>>,
-): MivoCanvasNode => ({
-  type: 'image',
-  status: 'ready',
-  ...node,
-})
+): MivoCanvasNode =>
+  normalizeCanvasNodeV2({
+    type: 'image',
+    status: 'ready',
+    ...node,
+  })
 
 const buildVariants = (sourceId: string, startX: number, startY: number) =>
   Array.from({ length: 4 }, (_, index) =>
@@ -289,12 +292,12 @@ export const scenes = () => Object.values(sceneDefinitions())
 
 export const snapshotFromScene = (sceneId: DemoSceneId): MivoCanvasSnapshot => {
   const scene = sceneDefinitions()[sceneId]
-  return {
-    version: 1,
+  return normalizeCanvasSnapshotV2({
+    version: 2,
     sceneId,
     nodes: scene.nodes,
     tasks: scene.tasks,
     selectedNodeId: scene.selectedNodeId,
     selectedNodeIds: scene.selectedNodeIds || (scene.selectedNodeId ? [scene.selectedNodeId] : []),
-  }
+  })
 }

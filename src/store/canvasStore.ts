@@ -23,11 +23,19 @@ import { defaultSizeForNodeType } from '../canvas/nodeTypes/canvasNodeRegistry'
 import { defaultTextAlign, defaultTextColor, defaultTextFontSize, defaultTextWeight } from '../canvas/textGeometry'
 import {
   markdownDocumentWidth,
+  markdownDocumentSizeFor,
   markdownPreviewHeight,
   markdownShouldUsePreviewMode,
   type ImportedFileMetadata,
 } from '../lib/canvasAssetImport'
 import { importedImageDisplaySize, type ImportedImageMetadata } from '../lib/imageSizing'
+import { createAiResultNode } from '../model/aiCanvasCommands'
+import { normalizeCanvasSnapshotV2 } from '../model/canvasSnapshotModel'
+import {
+  normalizeCanvasNodeV2,
+  normalizeCanvasNodesV2,
+  setNodeTransform,
+} from '../model/documentModelV2'
 import { buildAiContextSnapshot, chooseAdjacentPlacement } from './aiCanvasWorkflow'
 import { debugLogger } from './debugLogStore'
 import { makeNode, realCaseImages, scenes, snapshotFromScene } from './demoScenes'
@@ -207,7 +215,7 @@ const sceneLabels = new Map(sceneOptions.map((scene) => [scene.id, scene.label])
 const fallbackTitle = (sceneId: CanvasId) => sceneLabels.get(sceneId as DemoSceneId) || sceneId
 
 const cloneNode = (node: MivoCanvasNode): MivoCanvasNode => ({
-  ...node,
+  ...normalizeCanvasNodeV2(node),
   markupPoints: node.markupPoints ? node.markupPoints.map((point) => ({ ...point })) : undefined,
   connectorStart: node.connectorStart ? { ...node.connectorStart } : undefined,
   connectorEnd: node.connectorEnd ? { ...node.connectorEnd } : undefined,
@@ -229,6 +237,35 @@ const cloneTask = (task: CanvasTask): CanvasTask => ({
 const cloneNodes = (nodes: MivoCanvasNode[]) => nodes.map(cloneNode)
 const cloneTasks = (tasks: CanvasTask[]) => tasks.map(cloneTask)
 
+const compactNodeForPersist = (node: MivoCanvasNode): MivoCanvasNode => {
+  const compactNode = cloneNode(node)
+  const transform = compactNode.transform
+  const rotation = transform?.rotation ?? 0
+
+  delete compactNode.asset
+  delete compactNode.fills
+  delete compactNode.relations
+  delete compactNode.strokes
+  delete compactNode.transform
+
+  return {
+    ...compactNode,
+    ...(Math.abs(rotation) > 0.0001 ? { transform } : {}),
+  }
+}
+
+const compactDocumentForPersist = (document: CanvasDocument): CanvasDocument => ({
+  ...document,
+  nodes: document.nodes.map(compactNodeForPersist),
+  tasks: cloneTasks(document.tasks),
+  selectedNodeIds: document.selectedNodeIds ? [...document.selectedNodeIds] : undefined,
+})
+
+const compactCanvasesForPersist = (canvases: Record<CanvasId, CanvasDocument>) =>
+  Object.fromEntries(
+    Object.entries(canvases).map(([canvasId, document]) => [canvasId, compactDocumentForPersist(document)]),
+  ) as Record<CanvasId, CanvasDocument>
+
 const normalizeSelection = (nodeIds: string[] | undefined, nodes: MivoCanvasNode[]) => {
   const validIds = new Set(nodes.filter((node) => !node.hidden).map((node) => node.id))
   return Array.from(new Set(nodeIds || [])).filter((nodeId) => validIds.has(nodeId))
@@ -241,14 +278,15 @@ const selectionFrom = (nodeIds: string[] | undefined, selectedNodeId: string | u
   return { selectedNodeId: primary, selectedNodeIds: selection }
 }
 
-const snapshotFromState = (state: Pick<CanvasState, 'sceneId' | 'nodes' | 'tasks' | 'selectedNodeId' | 'selectedNodeIds'>) => ({
-  version: 1 as const,
-  sceneId: state.sceneId,
-  nodes: cloneNodes(state.nodes),
-  tasks: cloneTasks(state.tasks),
-  selectedNodeId: state.selectedNodeId,
-  selectedNodeIds: [...state.selectedNodeIds],
-})
+const snapshotFromState = (state: Pick<CanvasState, 'sceneId' | 'nodes' | 'tasks' | 'selectedNodeId' | 'selectedNodeIds'>) =>
+  normalizeCanvasSnapshotV2({
+    version: 2,
+    sceneId: state.sceneId,
+    nodes: cloneNodes(state.nodes),
+    tasks: cloneTasks(state.tasks),
+    selectedNodeId: state.selectedNodeId,
+    selectedNodeIds: [...state.selectedNodeIds],
+  })
 
 const remember = (state: CanvasState) => ({
   historyPast: [...state.historyPast.slice(-(historyLimit - 1)), snapshotFromState(state)],
@@ -373,20 +411,21 @@ const normalizeConnectorMarkupNodes = (nodes: MivoCanvasNode[]) =>
     if (endBindingPoint) absolutePoints[1] = endBindingPoint
 
     const next = markupGeometryFromAbsolutePoints(absolutePoints)
-    return {
+    return setNodeTransform({
       ...node,
+      markupPoints: next.points.map((point) => ({ x: Math.round(point.x), y: Math.round(point.y) })),
+      connectorStart: startBindingPoint ? node.connectorStart : undefined,
+      connectorEnd: endBindingPoint ? node.connectorEnd : undefined,
+    }, {
       x: Math.round(next.geometry.x),
       y: Math.round(next.geometry.y),
       width: Math.round(next.geometry.width),
       height: Math.round(next.geometry.height),
-      markupPoints: next.points.map((point) => ({ x: Math.round(point.x), y: Math.round(point.y) })),
-      connectorStart: startBindingPoint ? node.connectorStart : undefined,
-      connectorEnd: endBindingPoint ? node.connectorEnd : undefined,
-    }
+    })
   })
 
 const normalizeCanvasNodes = (nodes: MivoCanvasNode[]) =>
-  normalizeConnectorMarkupNodes(normalizeSectionMembership(nodes))
+  normalizeCanvasNodesV2(normalizeConnectorMarkupNodes(normalizeSectionMembership(nodes)))
 
 const normalizeLongMarkdownPreviewNodes = (nodes: MivoCanvasNode[]) =>
   nodes.map((node) => {
@@ -487,18 +526,19 @@ const patchWithHistory = (
 })
 
 const applySnapshot = (state: CanvasState, snapshot: MivoCanvasSnapshot) => {
-  const currentDocument = documentFor(state.canvases, snapshot.sceneId)
-  const selection = selectionFrom(snapshot.selectedNodeIds, snapshot.selectedNodeId, snapshot.nodes)
+  const normalizedSnapshot = normalizeCanvasSnapshotV2(snapshot)
+  const currentDocument = documentFor(state.canvases, normalizedSnapshot.sceneId)
+  const selection = selectionFrom(normalizedSnapshot.selectedNodeIds, normalizedSnapshot.selectedNodeId, normalizedSnapshot.nodes)
   const document: CanvasDocument = {
     ...currentDocument,
-    nodes: cloneNodes(snapshot.nodes),
-    tasks: cloneTasks(snapshot.tasks),
+    nodes: cloneNodes(normalizedSnapshot.nodes),
+    tasks: cloneTasks(normalizedSnapshot.tasks),
     selectedNodeId: selection.selectedNodeId,
     selectedNodeIds: selection.selectedNodeIds,
   }
 
   return {
-    sceneId: snapshot.sceneId,
+    sceneId: normalizedSnapshot.sceneId,
     nodes: document.nodes,
     tasks: document.tasks,
     selectedNodeId: document.selectedNodeId,
@@ -506,7 +546,7 @@ const applySnapshot = (state: CanvasState, snapshot: MivoCanvasSnapshot) => {
     activeTool: 'select' as ToolId,
     canvases: {
       ...state.canvases,
-      [snapshot.sceneId]: document,
+      [normalizedSnapshot.sceneId]: document,
     },
   }
 }
@@ -563,10 +603,7 @@ const importedAssetDisplaySize = (type: CanvasAssetNodeType, metadata?: Imported
           width: markdownDocumentWidth,
           height: markdownPreviewHeight,
         }
-      : {
-          ...defaultSize,
-          width: markdownDocumentWidth,
-        }
+      : markdownDocumentSizeFor(metadata?.text)
   }
 
   return defaultSizeForNodeType(type)
@@ -1023,7 +1060,7 @@ export const useCanvasStore = create<CanvasState>()(
 
           const nodes = normalizeCanvasNodes(
             state.nodes.map((node) =>
-              node.id === nodeId ? { ...node, x: Math.round(x), y: Math.round(y) } : node,
+              node.id === nodeId ? setNodeTransform(node, { x: Math.round(x), y: Math.round(y) }) : node,
             ),
           )
 
@@ -1049,7 +1086,7 @@ export const useCanvasStore = create<CanvasState>()(
           const nodes = normalizeCanvasNodes(
             state.nodes.map((node) =>
               moveSet.has(node.id) && !isEffectivelyLocked(state.nodes, node)
-                ? { ...node, x: node.x + dx, y: node.y + dy }
+                ? setNodeTransform(node, { x: node.x + dx, y: node.y + dy })
                 : node,
             ),
           )
@@ -1064,13 +1101,12 @@ export const useCanvasStore = create<CanvasState>()(
           const nodes = normalizeCanvasNodes(
             state.nodes.map((node) =>
               node.id === nodeId
-                ? {
-                    ...node,
+                ? setNodeTransform(node, {
                     x: Math.round(x),
                     y: Math.round(y),
                     width: Math.round(width),
                     height: Math.round(height),
-                  }
+                  })
                 : node,
             ),
           )
@@ -1086,13 +1122,12 @@ export const useCanvasStore = create<CanvasState>()(
             const update = updatesById.get(node.id)
             if (!update || isEffectivelyLocked(state.nodes, node)) return node
 
-            return {
-              ...node,
+            return setNodeTransform(node, {
               x: Math.round(update.x),
               y: Math.round(update.y),
               width: Math.round(update.width),
               height: Math.round(update.height),
-            }
+            })
           }))
 
           return patchActiveCanvas(state, {
@@ -1113,11 +1148,10 @@ export const useCanvasStore = create<CanvasState>()(
           const nodes = normalizeCanvasNodes(
             state.nodes.map((node) =>
               node.id === nodeId
-                ? {
-                    ...node,
+                ? setNodeTransform(node, {
                     width: nextWidth,
                     height: nextHeight,
-                  }
+                  })
                 : node,
             ),
           )
@@ -1133,11 +1167,10 @@ export const useCanvasStore = create<CanvasState>()(
           const nodes = normalizeCanvasNodes(
             state.nodes.map((node) =>
               node.id === nodeId
-                ? {
+                ? setNodeTransform({
                     ...node,
                     markdownDisplayMode: mode,
-                    height: Math.max(320, Math.round(nextHeight)),
-                  }
+                  }, { height: Math.max(320, Math.round(nextHeight)) })
                 : node,
             ),
           )
@@ -1159,7 +1192,7 @@ export const useCanvasStore = create<CanvasState>()(
           const nodes = normalizeCanvasNodes(
             state.nodes.map((node) =>
               moveSet.has(node.id) && !isEffectivelyLocked(state.nodes, node)
-                ? { ...node, x: node.x + dx, y: node.y + dy }
+                ? setNodeTransform(node, { x: node.x + dx, y: node.y + dy })
                 : node,
             ),
           )
@@ -1399,12 +1432,12 @@ export const useCanvasStore = create<CanvasState>()(
           const nodes = state.nodes.map((node) => {
             if (!selectedSet.has(node.id) || node.locked) return node
 
-            if (alignment === 'left') return { ...node, x: Math.round(minX) }
-            if (alignment === 'center') return { ...node, x: Math.round(centerX - node.width / 2) }
-            if (alignment === 'right') return { ...node, x: Math.round(maxX - node.width) }
-            if (alignment === 'top') return { ...node, y: Math.round(minY) }
-            if (alignment === 'middle') return { ...node, y: Math.round(centerY - node.height / 2) }
-            return { ...node, y: Math.round(maxY - node.height) }
+            if (alignment === 'left') return setNodeTransform(node, { x: Math.round(minX) })
+            if (alignment === 'center') return setNodeTransform(node, { x: Math.round(centerX - node.width / 2) })
+            if (alignment === 'right') return setNodeTransform(node, { x: Math.round(maxX - node.width) })
+            if (alignment === 'top') return setNodeTransform(node, { y: Math.round(minY) })
+            if (alignment === 'middle') return setNodeTransform(node, { y: Math.round(centerY - node.height / 2) })
+            return setNodeTransform(node, { y: Math.round(maxY - node.height) })
           })
 
           return patchWithHistory(state, { nodes, selectedNodeId: state.selectedNodeId, selectedNodeIds: state.selectedNodeIds })
@@ -1433,7 +1466,7 @@ export const useCanvasStore = create<CanvasState>()(
           const nodes = state.nodes.map((node) => {
             const position = positions.get(node.id)
             if (position === undefined || node.locked) return node
-            return axis === 'horizontal' ? { ...node, x: position } : { ...node, y: position }
+            return axis === 'horizontal' ? setNodeTransform(node, { x: position }) : setNodeTransform(node, { y: position })
           })
 
           return patchWithHistory(state, { nodes, selectedNodeId: state.selectedNodeId, selectedNodeIds: state.selectedNodeIds })
@@ -1521,7 +1554,7 @@ export const useCanvasStore = create<CanvasState>()(
                 const dx = Math.round(position.x - (minX + (maxX - minX) / 2))
                 const dy = Math.round(position.y - (minY + (maxY - minY) / 2))
 
-                return clones.map((node) => ({ ...node, x: node.x + dx, y: node.y + dy }))
+                return clones.map((node) => setNodeTransform(node, { x: node.x + dx, y: node.y + dy }))
               })()
             : clones
 
@@ -1614,14 +1647,15 @@ export const useCanvasStore = create<CanvasState>()(
 
           const nodes = state.nodes.map((node) =>
             node.id === nodeId
-              ? {
+              ? setNodeTransform({
                   ...node,
+                  imageCrop: cropEqualsFullImage(nextCrop) ? undefined : nextCrop,
+                }, {
                   x: Math.round(node.x + cropBox.x),
                   y: Math.round(node.y + cropBox.y),
                   width: Math.round(cropBox.width),
                   height: Math.round(cropBox.height),
-                  imageCrop: cropEqualsFullImage(nextCrop) ? undefined : nextCrop,
-                }
+                })
               : node,
           )
 
@@ -1841,12 +1875,8 @@ export const useCanvasStore = create<CanvasState>()(
           const nodes = normalizeCanvasNodes(
             state.nodes.map((node) =>
               node.id === nodeId
-                ? {
+                ? setNodeTransform({
                     ...node,
-                    x: Math.round(geometry.x),
-                    y: Math.round(geometry.y),
-                    width: Math.round(geometry.width),
-                    height: Math.round(geometry.height),
                     markupPoints: points?.map((point) => ({
                       x: Math.round(point.x),
                       y: Math.round(point.y),
@@ -1857,7 +1887,12 @@ export const useCanvasStore = create<CanvasState>()(
                     ...(bindings && 'connectorEnd' in bindings
                       ? { connectorEnd: bindings.connectorEnd || undefined }
                       : {}),
-                  }
+                  }, {
+                    x: Math.round(geometry.x),
+                    y: Math.round(geometry.y),
+                    width: Math.round(geometry.width),
+                    height: Math.round(geometry.height),
+                  })
                 : node,
             ),
           )
@@ -1871,10 +1906,7 @@ export const useCanvasStore = create<CanvasState>()(
 
           const nodes = state.nodes.map((node) =>
             node.id === nodeId
-              ? {
-                  ...node,
-                  ...style,
-                }
+              ? normalizeCanvasNodeV2({ ...node, ...style, fills: undefined, strokes: undefined })
               : node,
           )
           return patchWithHistory(state, { nodes, selectedNodeId: nodeId, selectedNodeIds: [nodeId] })
@@ -1884,7 +1916,11 @@ export const useCanvasStore = create<CanvasState>()(
           const section = state.nodes.find((node) => node.id === nodeId && isSectionNode(node))
           if (!section || section.locked) return {}
 
-          const nodes = state.nodes.map((node) => (node.id === nodeId ? { ...node, ...style } : node))
+          const nodes = state.nodes.map((node) =>
+            node.id === nodeId
+              ? normalizeCanvasNodeV2({ ...node, ...style, fills: undefined, strokes: undefined })
+              : node,
+          )
           return patchWithHistory(state, { nodes, selectedNodeId: nodeId, selectedNodeIds: [nodeId] })
         }),
       setSectionLockMode: (nodeId, mode) =>
@@ -1964,20 +2000,27 @@ export const useCanvasStore = create<CanvasState>()(
         set((state) => {
           const nodes = state.nodes.map((node) =>
             node.id === nodeId && isEditableTextNode(node)
-              ? {
-                  ...node,
-                  title: node.type === 'markup' ? node.title : text.trim() || 'Text',
-                  text,
-                  width: geometry && node.type !== 'markup' ? Math.round(geometry.width) : node.width,
-                  height: geometry && node.type !== 'markup' ? Math.round(geometry.height) : node.height,
-                  generation:
-                    node.type === 'markup' && node.generation
-                      ? {
-                          ...node.generation,
-                          prompt: text.trim() || node.title,
-                        }
-                      : node.generation,
-                }
+              ? (() => {
+                  const nextNode = {
+                    ...node,
+                    title: node.type === 'markup' ? node.title : text.trim() || 'Text',
+                    text,
+                    generation:
+                      node.type === 'markup' && node.generation
+                        ? {
+                            ...node.generation,
+                            prompt: text.trim() || node.title,
+                          }
+                        : node.generation,
+                  }
+
+                  return geometry && node.type !== 'markup'
+                    ? setNodeTransform(nextNode, {
+                        width: Math.round(geometry.width),
+                        height: Math.round(geometry.height),
+                      })
+                    : nextNode
+                })()
               : node,
           )
 
@@ -1987,12 +2030,12 @@ export const useCanvasStore = create<CanvasState>()(
         set((state) => {
           const nodes = state.nodes.map((node) =>
             node.id === nodeId && isEditableTextNode(node)
-              ? {
-                  ...node,
-                  ...style,
-                  width: geometry && node.type !== 'markup' ? Math.round(geometry.width) : node.width,
-                  height: geometry && node.type !== 'markup' ? Math.round(geometry.height) : node.height,
-                }
+              ? geometry && node.type !== 'markup'
+                ? setNodeTransform({ ...node, ...style }, {
+                    width: Math.round(geometry.width),
+                    height: Math.round(geometry.height),
+                  })
+                : { ...node, ...style }
               : node,
           )
 
@@ -2002,13 +2045,14 @@ export const useCanvasStore = create<CanvasState>()(
         set((state) => {
           const nodes = state.nodes.map((node) =>
             node.id === nodeId && isEditableTextNode(node)
-              ? {
+              ? setNodeTransform({
                   ...node,
+                  textAutoWidth: false,
+                }, {
                   x: Math.round(x),
                   width: Math.round(width),
                   height: Math.round(height),
-                  textAutoWidth: false,
-                }
+                })
               : node,
           )
 
@@ -2075,35 +2119,20 @@ export const useCanvasStore = create<CanvasState>()(
             height,
             placement: 'right',
           })
-          const result = makeNode({
+          const result = createAiResultNode({
             id,
-            type: 'image',
             title: `${operationLabel} for ${source.title}`,
-            x: Math.round(placement.x),
-            y: Math.round(placement.y),
-            width: Math.round(width),
-            height: Math.round(height),
+            sourceNodes: [source],
+            anchorNode: source,
+            operation,
+            prompt: resultPrompt,
+            placement: 'right',
+            position: { x: placement.x, y: placement.y },
+            size: { width, height },
             assetUrl: mockResultAssetUrl(state.nodes),
-            status: 'ready',
-            parentIds: [source.id],
-            generation: {
-              prompt: resultPrompt,
-              model: 'Mivo Mock Image Workflow',
-              size: `${Math.round(width)}x${Math.round(height)}`,
-              seed: createdAt % 99999,
-              strength: operation === 'upscale' ? 0.28 : 0.62,
-              taskId: `task-${id}`,
-            },
-            aiWorkflow: {
-              kind: 'result',
-              status: 'ready',
-              operation,
-              prompt: resultPrompt,
-              sourceNodeIds: [source.id],
-              anchorNodeId: source.id,
-              placement: 'right',
-              createdAt,
-            },
+            createdAt,
+            taskId: `task-${id}`,
+            strength: operation === 'upscale' ? 0.28 : 0.62,
           })
           const task: CanvasTask = {
             id: `task-${id}`,
@@ -2146,35 +2175,20 @@ export const useCanvasStore = create<CanvasState>()(
             placement: 'right',
           })
           const resultPrompt = prompt?.trim() || nodePrompt(source)
-          const result = makeNode({
+          const result = createAiResultNode({
             id,
-            type: 'image',
             title: `AI result from ${source.title}`,
-            x: Math.round(placement.x),
-            y: Math.round(placement.y),
-            width: Math.round(width),
-            height: Math.round(height),
+            sourceNodes: [source],
+            anchorNode: source,
+            operation: 'beside-generation',
+            prompt: resultPrompt,
+            placement: 'right',
+            position: { x: placement.x, y: placement.y },
+            size: { width, height },
             assetUrl: mockResultAssetUrl(state.nodes),
-            status: 'ready',
-            parentIds: [source.id],
-            generation: {
-              prompt: resultPrompt,
-              model: 'Mivo Mock Image Workflow',
-              size: `${Math.round(width)}x${Math.round(height)}`,
-              seed: createdAt % 99999,
-              strength: 0.58,
-              taskId: `task-${id}`,
-            },
-            aiWorkflow: {
-              kind: 'result',
-              status: 'ready',
-              operation: 'beside-generation',
-              prompt: resultPrompt,
-              sourceNodeIds: [source.id],
-              anchorNodeId: source.id,
-              placement: 'right',
-              createdAt,
-            },
+            createdAt,
+            taskId: `task-${id}`,
+            strength: 0.58,
           })
           const task: CanvasTask = {
             id: `task-${id}`,
@@ -2207,36 +2221,21 @@ export const useCanvasStore = create<CanvasState>()(
           }
 
           const resultPrompt = prompt?.trim() || nodePrompt(slot, '根据 AI 槽位生成图片')
-          const result = makeNode({
+          const result = createAiResultNode({
             id,
-            type: 'image',
             title: `Generated for ${slot.title}`,
-            x: slot.x,
-            y: slot.y,
-            width: slot.width,
-            height: slot.height,
+            sourceNodes: [slot],
+            anchorNode: slot,
+            slotNode: slot,
+            operation: 'slot-generation',
+            prompt: resultPrompt,
+            placement: 'slot',
+            position: { x: slot.x, y: slot.y },
+            size: { width: slot.width, height: slot.height },
             assetUrl: mockResultAssetUrl(state.nodes),
-            status: 'ready',
-            parentIds: [slot.id],
-            generation: {
-              prompt: resultPrompt,
-              model: 'Mivo Mock Image Workflow',
-              size: `${Math.round(slot.width)}x${Math.round(slot.height)}`,
-              seed: createdAt % 99999,
-              strength: 0.62,
-              taskId: `task-${id}`,
-            },
-            aiWorkflow: {
-              kind: 'result',
-              status: 'ready',
-              operation: 'slot-generation',
-              prompt: resultPrompt,
-              sourceNodeIds: [slot.id],
-              slotId: slot.id,
-              anchorNodeId: slot.id,
-              placement: 'slot',
-              createdAt,
-            },
+            createdAt,
+            taskId: `task-${id}`,
+            strength: 0.62,
           })
           const nodes = state.nodes.map((node) =>
             node.id === slot.id
@@ -2302,36 +2301,21 @@ export const useCanvasStore = create<CanvasState>()(
             placement: 'right',
           })
           const resultPrompt = nodePrompt(annotation, '根据批注生成修订版图片')
-          const result = makeNode({
+          const result = createAiResultNode({
             id,
-            type: 'image',
             title: `Edited from ${source?.title || annotation.title}`,
-            x: Math.round(placement.x),
-            y: Math.round(placement.y),
-            width: Math.round(width),
-            height: Math.round(height),
+            sourceNodes: source ? [source] : [annotation],
+            anchorNode: anchor,
+            annotationNode: annotation,
+            operation: 'annotation-edit',
+            prompt: resultPrompt,
+            placement: 'right',
+            position: { x: placement.x, y: placement.y },
+            size: { width, height },
             assetUrl: mockResultAssetUrl(state.nodes),
-            status: 'ready',
-            parentIds: source ? [source.id, annotation.id] : [annotation.id],
-            generation: {
-              prompt: resultPrompt,
-              model: 'Mivo Mock Image Workflow',
-              size: `${Math.round(width)}x${Math.round(height)}`,
-              seed: createdAt % 99999,
-              strength: 0.66,
-              taskId: `task-${id}`,
-            },
-            aiWorkflow: {
-              kind: 'result',
-              status: 'ready',
-              operation: 'annotation-edit',
-              prompt: resultPrompt,
-              sourceNodeIds: source ? [source.id] : [annotation.id],
-              annotationNodeId: annotation.id,
-              anchorNodeId: anchor.id,
-              placement: 'right',
-              createdAt,
-            },
+            createdAt,
+            taskId: `task-${id}`,
+            strength: 0.66,
           })
           const task: CanvasTask = {
             id: `task-${id}`,
@@ -2408,12 +2392,10 @@ export const useCanvasStore = create<CanvasState>()(
     }),
     {
       name: 'mivo-canvas-demo',
-      version: 6,
+      version: 7,
       migrate: migratePersistedState,
       partialize: (state) => ({
-        canvases: state.canvases,
-        nodes: state.nodes,
-        tasks: state.tasks,
+        canvases: compactCanvasesForPersist(state.canvases),
         sceneId: state.sceneId,
         selectedNodeId: state.selectedNodeId,
         selectedNodeIds: state.selectedNodeIds,

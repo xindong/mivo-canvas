@@ -2,6 +2,12 @@ import { useCallback, useEffect, useRef, type CSSProperties } from 'react'
 import { MarkdownPreview } from '../lib/MarkdownPreview'
 import { useResolvedAssetUrl } from '../lib/useResolvedAssetUrl'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
+import {
+  frameRenderStyleFor,
+  markupRenderStyleFor,
+  nodeRenderBoxFor,
+  textRenderStyleFor,
+} from './canvasRenderAdapter'
 import type { ResizeCorner } from './canvasGeometry'
 import { renderKindForNode } from './nodeTypes/canvasNodeRegistry'
 import { defaultTextAlign, defaultTextColor, defaultTextFontSize, defaultTextWeight } from './textGeometry'
@@ -282,10 +288,11 @@ function MarkupNodeView({
   onFinishTextEdit: (nodeId: string) => void
 }) {
   const kind = node.markupKind || 'rect'
-  const strokeWidth = node.markupStrokeWidth || 3
-  const stroke = node.markupStrokeColor || '#6957e8'
-  const fill = node.markupFillColor || 'rgba(105, 87, 232, 0.08)'
-  const strokeDasharray = node.markupStrokeStyle === 'dashed' ? `${strokeWidth * 2.2} ${strokeWidth * 1.6}` : undefined
+  const renderStyle = markupRenderStyleFor(node)
+  const strokeWidth = renderStyle.strokeWidth
+  const stroke = renderStyle.stroke
+  const fill = renderStyle.fill
+  const strokeDasharray = renderStyle.strokeStyle === 'dashed' ? `${strokeWidth * 2.2} ${strokeWidth * 1.6}` : undefined
   const points = node.markupPoints?.length ? node.markupPoints : defaultMarkupPointsFor(node)
   const markerId = `markup-arrow-${node.id}`
   const lineLabelActive = isLineMarkup(node) && (editing || Boolean(node.text?.trim()))
@@ -352,6 +359,7 @@ function MarkupNodeView({
             fill={fill}
             stroke={stroke}
             strokeWidth={strokeWidth}
+            strokeOpacity={renderStyle.strokeOpacity}
             strokeDasharray={strokeDasharray}
           />
         ) : kind === 'ellipse' ? (
@@ -363,6 +371,7 @@ function MarkupNodeView({
             fill={fill}
             stroke={stroke}
             strokeWidth={strokeWidth}
+            strokeOpacity={renderStyle.strokeOpacity}
             strokeDasharray={strokeDasharray}
           />
         ) : kind === 'brush' ? (
@@ -371,6 +380,7 @@ function MarkupNodeView({
             fill="none"
             stroke={stroke}
             strokeWidth={strokeWidth}
+            strokeOpacity={renderStyle.strokeOpacity}
             strokeLinecap="round"
             strokeLinejoin="round"
             strokeDasharray={strokeDasharray}
@@ -401,6 +411,7 @@ function MarkupNodeView({
                   y2={segment.end.y}
                   stroke={stroke}
                   strokeWidth={strokeWidth}
+                  strokeOpacity={renderStyle.strokeOpacity}
                   strokeLinecap={hasStartMarker || hasEndMarker ? 'butt' : 'round'}
                   strokeDasharray={strokeDasharray}
                   markerStart={hasStartMarker ? `url(#${markerId})` : undefined}
@@ -487,9 +498,7 @@ export function CanvasNodeView({
       }
     : undefined
   const nodeStyle: CSSProperties & { '--node-selection-stroke': string } = {
-    width: node.width,
-    height: node.height,
-    transform: `translate(${node.x}px, ${node.y}px)`,
+    ...nodeRenderBoxFor(node),
     '--node-selection-stroke': `${selectionStrokeWidth}px`,
   }
   const nodeClassName = [
@@ -586,14 +595,7 @@ export function CanvasNodeView({
       {frameNode ? (
         <div
           className="dom-frame-node"
-          style={
-            {
-              '--section-fill-color': node.sectionFillColor || '#ffffff',
-              '--section-border-color': node.sectionBorderColor || node.frameColor || '#ff8a00',
-              '--section-border-width': `${node.sectionBorderWidth ?? 2}px`,
-              '--section-border-style': node.sectionBorderStyle || 'dashed',
-            } as CSSProperties
-          }
+          style={frameRenderStyleFor(node)}
         >
           {node.sectionTitleVisible !== false ? <div className="dom-frame-title">{node.title}</div> : null}
         </div>
@@ -618,12 +620,7 @@ export function CanvasNodeView({
         ) : (
           <div
             className={annotationNode ? 'dom-text-node dom-annotation-node' : 'dom-text-node'}
-            style={{
-              fontSize: node.fontSize || defaultTextFontSize,
-              color: node.textColor || defaultTextColor,
-              fontWeight: node.fontWeight || defaultTextWeight,
-              textAlign: node.textAlign || defaultTextAlign,
-            }}
+            style={textRenderStyleFor(node)}
           >
             {node.text}
           </div>

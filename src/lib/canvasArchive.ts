@@ -1,4 +1,5 @@
 import type { MivoCanvasSnapshot } from '../types/mivoCanvas'
+import { normalizeCanvasSnapshotV2 } from '../model/canvasSnapshotModel'
 import {
   isImportedAssetUrl,
   restoreSerializedAsset,
@@ -19,9 +20,10 @@ const isSerializedCanvasAsset = (
 ): asset is SerializedCanvasAsset => Boolean(asset)
 
 export const createCanvasArchive = async (snapshot: MivoCanvasSnapshot): Promise<MivoCanvasArchive> => {
+  const normalizedSnapshot = normalizeCanvasSnapshotV2(snapshot)
   const importedAssetUrls = Array.from(
     new Set(
-      snapshot.nodes
+      normalizedSnapshot.nodes
         .map((node) => node.assetUrl)
         .filter((assetUrl): assetUrl is string => isImportedAssetUrl(assetUrl)),
     ),
@@ -33,7 +35,7 @@ export const createCanvasArchive = async (snapshot: MivoCanvasSnapshot): Promise
   return {
     kind: 'mivo-canvas-archive',
     version: 2,
-    snapshot,
+    snapshot: normalizedSnapshot,
     assets,
   }
 }

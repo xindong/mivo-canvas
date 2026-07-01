@@ -109,7 +109,7 @@ export const markdownShouldUsePreviewMode = (text?: string) => {
   return source.length > 3500 || lines.length > 60 || imageCount > 4
 }
 
-const markdownDocumentSizeFor = (text?: string) => {
+export const markdownDocumentSizeFor = (text?: string) => {
   const width = markdownDocumentWidth
   if (markdownShouldUsePreviewMode(text)) {
     return { width, height: markdownPreviewHeight }

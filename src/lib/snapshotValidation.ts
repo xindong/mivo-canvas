@@ -8,6 +8,7 @@ import type {
   MivoCanvasSnapshot,
   NodeStatus,
 } from '../types/mivoCanvas'
+import { normalizeCanvasSnapshotV2 } from '../model/canvasSnapshotModel'
 import type { SerializedCanvasAsset } from './assetStorage'
 
 const nodeStatuses = new Set<NodeStatus>(['ready', 'generating', 'failed', 'queued'])
@@ -193,7 +194,7 @@ const validateSnapshot = (parsed: unknown) => {
     return { ok: false as const, message: '快照内容必须是对象。' }
   }
 
-  if (parsed.version !== 1) {
+  if (parsed.version !== 2) {
     return { ok: false as const, message: '暂不支持这个快照版本。' }
   }
 
@@ -219,7 +220,7 @@ const validateSnapshot = (parsed: unknown) => {
 
   return {
     ok: true as const,
-    snapshot: parsed as MivoCanvasSnapshot,
+    snapshot: normalizeCanvasSnapshotV2(parsed as MivoCanvasSnapshot),
   }
 }
 
