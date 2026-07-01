@@ -233,7 +233,8 @@ button:disabled {
 .panel-close,
 .favorite,
 .canvas-controls button,
-.canvas-tool-dock button {
+.canvas-tool-dock button,
+.canvas-ai-action-bar button {
   display: grid;
   place-items: center;
   cursor: pointer;
@@ -2294,6 +2295,54 @@ button:disabled {
   background: var(--line);
 }
 
+.canvas-ai-action-bar {
+  position: absolute;
+  left: 50%;
+  bottom: 18px;
+  z-index: 7;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: min(420px, calc(100% - 32px));
+  padding: 7px;
+  background: rgba(255, 250, 240, 0.92);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  box-shadow: var(--shadow);
+  transform: translateX(-50%);
+  backdrop-filter: blur(14px);
+}
+
+.canvas-ai-action-bar button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: auto;
+  min-width: 42px;
+  height: 42px;
+  gap: 7px;
+  padding: 0 13px;
+  color: #554f48;
+  background: transparent;
+  border-radius: 999px;
+  font-size: var(--text-sm);
+  font-weight: 850;
+  white-space: nowrap;
+}
+
+.canvas-ai-action-bar button:hover,
+.canvas-ai-action-bar button.active {
+  color: #fffaf0;
+  background: var(--charcoal);
+}
+
+.canvas-ai-action-bar button:disabled,
+.canvas-ai-action-bar button:disabled:hover {
+  color: rgba(85, 79, 72, 0.34);
+  cursor: not-allowed;
+  background: transparent;
+}
+
 .node-action-menu {
   display: grid;
   gap: 2px;
@@ -4241,6 +4290,10 @@ button:disabled {
   right: calc(var(--ai-panel-offset) + var(--ai-panel-collapsed-w) + var(--floating-gap));
 }
 
+.canvas-ai-action-bar ~ .canvas-controls {
+  bottom: calc(18px + 56px + var(--floating-gap));
+}
+
 .canvas-controls button {
   width: 32px;
   height: 32px;
@@ -5312,6 +5365,19 @@ button:disabled {
     width: min(320px, calc(100% - 24px));
   }
 
+  .canvas-ai-action-bar {
+    max-width: min(360px, calc(100% - 28px));
+  }
+
+  .canvas-ai-action-bar button {
+    width: 42px;
+    padding: 0;
+  }
+
+  .canvas-ai-action-bar button span {
+    display: none;
+  }
+
   .library-workspace {
     padding: 20px;
   }
@@ -5392,6 +5458,14 @@ button:disabled {
   .canvas-tool-dock {
     left: 10px;
     top: 64px;
+  }
+
+  .canvas-ai-action-bar {
+    bottom: 12px;
+  }
+
+  .canvas-ai-action-bar ~ .canvas-controls {
+    bottom: calc(12px + 56px + var(--floating-gap));
   }
 
   .details-dialog-backdrop {

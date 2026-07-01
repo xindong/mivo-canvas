@@ -16,6 +16,7 @@ import { readCanvasImageBlob } from '../lib/canvasImageSource'
 import { editMivoImage } from '../lib/mivoImageClient'
 import { useCanvasStore } from '../store/canvasStore'
 import { CanvasContextMenu } from './CanvasContextMenu'
+import { CanvasAiActionBar } from './CanvasAiActionBar'
 import { CanvasNodeView } from './CanvasNodeView'
 import { CanvasToolDock } from './CanvasToolDock'
 import { ImageCropOverlay, type ImageCropBox } from './ImageCropOverlay'
@@ -37,6 +38,7 @@ type ContextMenuState = {
 
 type MivoCanvasProps = {
   onOpenDetails?: () => void
+  onOpenGeneratePanel?: () => void
 }
 
 const contextMenuWidth = 252
@@ -58,7 +60,7 @@ const isCanvasChromeTarget = (target: EventTarget | null) =>
   target instanceof HTMLElement &&
   Boolean(
     target.closest(
-      '[data-canvas-ui="true"], .canvas-controls, .canvas-tool-dock, .node-context-menu, .empty-canvas-note',
+      '[data-canvas-ui="true"], .canvas-controls, .canvas-tool-dock, .canvas-ai-action-bar, .node-context-menu, .empty-canvas-note',
     ),
   )
 
@@ -102,7 +104,7 @@ const isNodeEffectivelyLocked = (nodeId: string, nodes: Array<{ id: string; type
   return Boolean(node.locked || section?.sectionLockMode === 'all')
 }
 
-export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
+export function MivoCanvas({ onOpenDetails, onOpenGeneratePanel }: MivoCanvasProps) {
   const shellRef = useRef<HTMLElement | null>(null)
   const hostRef = useRef<HTMLDivElement | null>(null)
   const leaferRef = useRef<Leafer | null>(null)
@@ -128,6 +130,7 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
   const visibleNodes = useMemo(() => nodes.filter((node) => !node.hidden), [nodes])
   const contextMenuNode =
     contextMenu?.kind === 'node' ? visibleNodes.find((node) => node.id === contextMenuNodeId) : undefined
+  const selectedNode = selectedNodeId ? visibleNodes.find((node) => node.id === selectedNodeId) : undefined
   const cropNode = cropNodeId ? visibleNodes.find((node) => node.id === cropNodeId && node.type === 'image') : undefined
   const closeContextMenu = useCallback(() => setContextMenu(null), [])
   const cancelMaskEdit = useCallback(() => {
@@ -506,6 +509,13 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
     >
       <div className="canvas-host" ref={hostRef} />
       <CanvasToolDock previewTool={temporaryTool === 'hand' ? 'hand' : undefined} />
+      <CanvasAiActionBar
+        selectedNode={selectedNode}
+        maskEditActive={Boolean(maskEditNodeId)}
+        onOpenGeneratePanel={onOpenGeneratePanel || (() => undefined)}
+        onStartMaskEdit={beginMaskEdit}
+        onCancelMaskEdit={cancelMaskEdit}
+      />
       <div
         className="dom-canvas-layer"
         style={{ transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})` }}

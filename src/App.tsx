@@ -25,6 +25,7 @@ function App() {
   const [projectSidebarState, setProjectSidebarState] = useState<ProjectSidebarState>('open')
   const [projectSidebarHoverLocked, setProjectSidebarHoverLocked] = useState(false)
   const [aiPanelOpen, setAiPanelOpen] = useState(true)
+  const [aiPanelFocusRequestId, setAiPanelFocusRequestId] = useState(0)
   const [workspaceView, setWorkspaceView] = useState<WorkspaceView>('canvas')
   const [detailsSceneId, setDetailsSceneId] = useState<string>()
   const projectSidebarTimerRef = useRef<number | undefined>(undefined)
@@ -40,6 +41,11 @@ function App() {
       window.clearTimeout(projectSidebarTimerRef.current)
       projectSidebarTimerRef.current = undefined
     }
+  }, [])
+
+  const openGeneratePanel = useCallback(() => {
+    setAiPanelOpen(true)
+    setAiPanelFocusRequestId((id) => id + 1)
   }, [])
 
   const openProjectSidebar = useCallback(() => {
@@ -154,8 +160,16 @@ function App() {
         <div className="workspace">
           <TopBar projectSidebarOpen={projectSidebarOpen} />
           <div className="work-surface">
-            <MivoCanvas key={sceneId} onOpenDetails={() => setDetailsSceneId(sceneId)} />
-            <AIToolPanel open={aiPanelOpen} onToggle={() => setAiPanelOpen((current) => !current)} />
+            <MivoCanvas
+              key={sceneId}
+              onOpenDetails={() => setDetailsSceneId(sceneId)}
+              onOpenGeneratePanel={openGeneratePanel}
+            />
+            <AIToolPanel
+              open={aiPanelOpen}
+              onToggle={() => setAiPanelOpen((current) => !current)}
+              focusRequestId={aiPanelFocusRequestId}
+            />
             {workspaceView === 'assets' ? (
               <LibraryWorkspace
                 type="assets"

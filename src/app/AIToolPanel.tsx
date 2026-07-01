@@ -17,6 +17,7 @@ import type { MivoImageQuality, MivoImageRatio } from '../types/generation'
 type AIToolPanelProps = {
   open: boolean
   onToggle: () => void
+  focusRequestId?: number
 }
 
 type ReferenceFile = {
@@ -28,8 +29,9 @@ type ReferenceFile = {
 const ratioOptions: MivoImageRatio[] = ['1:1', '3:2', '2:3', '16:9', '9:16']
 const qualityOptions: MivoImageQuality[] = ['low', 'medium', 'high']
 
-export function AIToolPanel({ open, onToggle }: AIToolPanelProps) {
+export function AIToolPanel({ open, onToggle, focusRequestId = 0 }: AIToolPanelProps) {
   const inputRef = useRef<HTMLInputElement | null>(null)
+  const promptRef = useRef<HTMLTextAreaElement | null>(null)
   const referenceFilesRef = useRef<ReferenceFile[]>([])
   const nodes = useCanvasStore((state) => state.nodes)
   const selectedNodeId = useCanvasStore((state) => state.selectedNodeId)
@@ -59,6 +61,11 @@ export function AIToolPanel({ open, onToggle }: AIToolPanelProps) {
   useEffect(() => {
     referenceFilesRef.current = referenceFiles
   }, [referenceFiles])
+
+  useEffect(() => {
+    if (!open || !focusRequestId) return
+    promptRef.current?.focus()
+  }, [focusRequestId, open])
 
   useEffect(
     () => () => {
@@ -243,6 +250,7 @@ export function AIToolPanel({ open, onToggle }: AIToolPanelProps) {
           <span className="ai-label">提示词</span>
           <div className="ai-prompt-box">
             <textarea
+              ref={promptRef}
               value={promptValue}
               onChange={(event) => handlePromptChange(event.target.value)}
               placeholder="描述画面、角色、风格、构图..."
