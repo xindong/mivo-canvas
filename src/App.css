@@ -3549,6 +3549,158 @@ button:disabled {
   filter: drop-shadow(0 14px 18px rgba(35, 35, 35, 0.2));
 }
 
+.image-mask-edit-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 35;
+  overflow: visible;
+  pointer-events: auto;
+}
+
+.image-mask-edit-stage {
+  position: absolute;
+  inset: 0;
+  cursor: crosshair;
+  pointer-events: auto;
+}
+
+.image-mask-edit-stage svg {
+  display: block;
+  overflow: visible;
+}
+
+.image-mask-edit-display-rect {
+  fill: rgba(63, 111, 100, 0.08);
+  stroke: rgba(63, 111, 100, 0.7);
+  stroke-width: 2px;
+  stroke-dasharray: 8 6;
+  vector-effect: non-scaling-stroke;
+}
+
+.image-mask-edit-region {
+  fill: rgba(86, 109, 137, 0.26);
+  stroke: #2f5c54;
+  stroke-width: 2px;
+  vector-effect: non-scaling-stroke;
+}
+
+.image-mask-edit-region.brush {
+  fill: none;
+  stroke: rgba(47, 92, 84, 0.72);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vector-effect: none;
+}
+
+.image-mask-edit-toolbar,
+.image-mask-edit-prompt {
+  position: absolute;
+  z-index: 2;
+  pointer-events: auto;
+  background: rgba(255, 253, 248, 0.96);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 10px 28px rgba(35, 35, 35, 0.16);
+  backdrop-filter: blur(12px);
+}
+
+.image-mask-edit-toolbar {
+  top: 10px;
+  left: 10px;
+  right: 10px;
+  display: grid;
+  gap: 8px;
+  padding: 8px;
+}
+
+.image-mask-edit-tools,
+.image-mask-edit-history {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.image-mask-edit-tools button,
+.image-mask-edit-history button,
+.image-mask-edit-prompt button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 30px;
+  gap: 5px;
+  padding: 0 9px;
+  color: var(--ink);
+  background: #fffaf0;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.image-mask-edit-tools button.active,
+.image-mask-edit-prompt button {
+  color: #fffaf0;
+  background: var(--charcoal);
+  border-color: var(--charcoal);
+}
+
+.image-mask-edit-tools button:disabled,
+.image-mask-edit-history button:disabled,
+.image-mask-edit-prompt button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+.image-mask-edit-size {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.image-mask-edit-size input {
+  width: 100%;
+}
+
+.image-mask-edit-size em {
+  color: var(--quiet);
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
+}
+
+.image-mask-edit-prompt {
+  right: 10px;
+  bottom: 10px;
+  left: 10px;
+  display: grid;
+  gap: 8px;
+  padding: 9px;
+}
+
+.image-mask-edit-prompt textarea {
+  width: 100%;
+  min-height: 58px;
+  resize: vertical;
+  padding: 9px;
+  color: var(--ink);
+  background: #fffaf0;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  outline: 0;
+  line-height: 1.35;
+}
+
+.image-mask-edit-error {
+  color: #9d362f;
+  font-size: 12px;
+  font-weight: 760;
+  line-height: 1.35;
+}
+
 .image-crop-overlay {
   position: absolute;
   z-index: 36;

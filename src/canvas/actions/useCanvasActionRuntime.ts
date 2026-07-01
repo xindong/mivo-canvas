@@ -17,6 +17,7 @@ type UseCanvasActionRuntimeOptions = {
   onRenameNode?: (nodeId: string) => void
   onImportAssetAt?: (position: { x: number; y: number }) => void
   onCropNode?: (nodeId: string) => void
+  onStartImageMaskEdit?: (nodeId: string) => void
   onDownloadOriginal?: (node?: MivoCanvasNode) => void
 }
 
@@ -33,6 +34,7 @@ export const useCanvasActionRuntime = ({
   onRenameNode,
   onImportAssetAt,
   onCropNode,
+  onStartImageMaskEdit,
   onDownloadOriginal,
 }: UseCanvasActionRuntimeOptions): CanvasActionRuntime => {
   const nodes = useCanvasStore((state) => state.nodes)
@@ -99,6 +101,7 @@ export const useCanvasActionRuntime = ({
     onRenameNode,
     onImportAssetAt,
     onCropNode,
+    onStartImageMaskEdit,
     onDownloadOriginal,
     setActiveTool,
     addTextNode,

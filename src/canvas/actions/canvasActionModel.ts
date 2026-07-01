@@ -162,13 +162,10 @@ const imageAiEditActionsFor = (runtime: CanvasActionRuntime): CanvasActionItem[]
     id: 'select-area-edit',
     label: 'Select area',
     icon: SquareMousePointer,
-    onClick: () =>
-      beginImageEditPrompt(
-        runtime,
-        'area-edit',
-        'Select the area to edit, then describe the change here',
-        'Area edit',
-      ),
+    onClick: () => {
+      const nodeId = primaryNodeId(runtime)
+      if (nodeId) runtime.onStartImageMaskEdit?.(nodeId)
+    },
   },
   {
     id: 'remove-background',

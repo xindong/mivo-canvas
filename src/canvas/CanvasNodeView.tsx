@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useRef, type CSSProperties } from 'react'
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react'
 import { MarkdownPreview } from '../lib/MarkdownPreview'
 import { useResolvedAssetUrl } from '../lib/useResolvedAssetUrl'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 import type { ResizeCorner } from './canvasGeometry'
+import { ImageMaskEditOverlay } from './ImageMaskEditOverlay'
+import type { ImageMaskSubmitPayload } from './imageMaskGeometry'
 import { renderKindForNode } from './nodeTypes/canvasNodeRegistry'
 import { defaultTextAlign, defaultTextColor, defaultTextFontSize, defaultTextWeight } from './textGeometry'
 import type { TextResizeEdge } from './useCanvasInteractionController'
@@ -19,6 +21,9 @@ type CanvasNodeViewProps = {
   handleSize: number
   handleBorderWidth: number
   selectionStrokeWidth: number
+  maskEditActive: boolean
+  maskEditSubmitting: boolean
+  viewportScale: number
   onSelect: (nodeId: string, options?: { additive?: boolean }) => void
   onPointerDown: (nodeId: string, event: React.PointerEvent<HTMLDivElement>) => void
   onResizeHandlePointerDown: (
@@ -43,6 +48,8 @@ type CanvasNodeViewProps = {
   onUpdateText: (nodeId: string, text: string) => void
   onFinishTextEdit: (nodeId: string) => void
   onResizeNodeToContent: (nodeId: string, width: number, height: number) => void
+  onSubmitMaskEdit: (nodeId: string, resolvedAssetUrl: string, payload: ImageMaskSubmitPayload) => Promise<void>
+  onCancelMaskEdit: () => void
 }
 
 function CanvasTextEditor({
@@ -434,6 +441,9 @@ export function CanvasNodeView({
   handleSize,
   handleBorderWidth,
   selectionStrokeWidth,
+  maskEditActive,
+  maskEditSubmitting,
+  viewportScale,
   onSelect,
   onPointerDown,
   onResizeHandlePointerDown,
@@ -446,8 +456,11 @@ export function CanvasNodeView({
   onUpdateText,
   onFinishTextEdit,
   onResizeNodeToContent,
+  onSubmitMaskEdit,
+  onCancelMaskEdit,
 }: CanvasNodeViewProps) {
   const markdownDocumentRef = useRef<HTMLElement | null>(null)
+  const [naturalSize, setNaturalSize] = useState<{ width: number; height: number }>()
   const resolvedAssetUrl = useResolvedAssetUrl(node.assetUrl)
   const renderKind = renderKindForNode(node)
   const textNode = renderKind === 'text' || renderKind === 'annotation'
@@ -516,6 +529,10 @@ export function CanvasNodeView({
   ]
     .filter(Boolean)
     .join(' ')
+
+  useEffect(() => {
+    setNaturalSize(undefined)
+  }, [resolvedAssetUrl])
 
   useEffect(() => {
     if (!markdownNode || markdownPreviewMode) return undefined
@@ -691,11 +708,28 @@ export function CanvasNodeView({
               decoding="async"
               draggable={false}
               style={imageCropStyle}
+              onLoad={(event) =>
+                setNaturalSize({
+                  width: event.currentTarget.naturalWidth,
+                  height: event.currentTarget.naturalHeight,
+                })
+              }
             />
           ) : (
             <div className="dom-node-placeholder" />
           )
           )}
+          {imageNode && maskEditActive && resolvedAssetUrl && naturalSize ? (
+            <ImageMaskEditOverlay
+              node={node}
+              resolvedAssetUrl={resolvedAssetUrl}
+              naturalSize={naturalSize}
+              viewportScale={viewportScale}
+              submitting={maskEditSubmitting}
+              onCancel={onCancelMaskEdit}
+              onSubmit={(payload) => onSubmitMaskEdit(node.id, resolvedAssetUrl, payload)}
+            />
+          ) : null}
         </div>
       )}
       {primarySelected && !editing && textNode && !effectiveLocked ? (

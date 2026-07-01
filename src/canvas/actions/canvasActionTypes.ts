@@ -54,6 +54,7 @@ export type CanvasActionRuntime = {
   onRenameNode?: (nodeId: string) => void
   onImportAssetAt?: (position: { x: number; y: number }) => void
   onCropNode?: (nodeId: string) => void
+  onStartImageMaskEdit?: (nodeId: string) => void
   onDownloadOriginal?: (node?: MivoCanvasNode) => void
   setActiveTool: (toolId: ToolId) => void
   addTextNode: (position: { x: number; y: number }, text?: string) => string

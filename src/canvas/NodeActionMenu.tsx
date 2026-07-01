@@ -19,6 +19,7 @@ type NodeActionMenuProps = {
   onRenameNode?: (nodeId: string) => void
   onImportAssetAt?: (position: { x: number; y: number }) => void
   onCropNode?: (nodeId: string) => void
+  onStartImageMaskEdit?: (nodeId: string) => void
   onDownloadOriginal?: (node?: MivoCanvasNode) => void
 }
 
@@ -36,6 +37,7 @@ export function NodeActionMenu({
   onRenameNode,
   onImportAssetAt,
   onCropNode,
+  onStartImageMaskEdit,
   onDownloadOriginal,
 }: NodeActionMenuProps) {
   const runtime = useCanvasActionRuntime({
@@ -51,6 +53,7 @@ export function NodeActionMenu({
     onRenameNode,
     onImportAssetAt,
     onCropNode,
+    onStartImageMaskEdit,
     onDownloadOriginal,
   })
   const actionGroups = contextMenuGroupsFor(runtime)

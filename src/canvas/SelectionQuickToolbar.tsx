@@ -17,6 +17,7 @@ type SelectionQuickToolbarProps = {
   onEditText?: (nodeId: string) => void
   onRenameNode?: (nodeId: string) => void
   onCropNode?: (nodeId: string) => void
+  onStartImageMaskEdit?: (nodeId: string) => void
   onDownloadOriginal?: (node?: MivoCanvasNode) => void
 }
 
@@ -38,6 +39,7 @@ export function SelectionQuickToolbar({
   onEditText,
   onRenameNode,
   onCropNode,
+  onStartImageMaskEdit,
   onDownloadOriginal,
 }: SelectionQuickToolbarProps) {
   const selectionKey = selectedNodes.map((node) => node.id).join('|')
@@ -54,6 +56,7 @@ export function SelectionQuickToolbar({
     onEditText,
     onRenameNode,
     onCropNode,
+    onStartImageMaskEdit,
     onDownloadOriginal,
   })
   const actionGroups = quickToolbarGroupsFor(runtime)

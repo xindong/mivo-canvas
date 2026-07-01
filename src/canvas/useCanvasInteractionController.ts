@@ -55,6 +55,8 @@ type UseCanvasInteractionControllerOptions = {
   sceneId: CanvasId
   nodes: MivoCanvasNode[]
   selectedNodeIds: string[]
+  maskEditNodeId?: string
+  onCancelMaskEdit?: () => void
   onCloseContextMenu: () => void
 }
 
@@ -255,6 +257,8 @@ export function useCanvasInteractionController({
   sceneId,
   nodes,
   selectedNodeIds,
+  maskEditNodeId,
+  onCancelMaskEdit,
   onCloseContextMenu,
 }: UseCanvasInteractionControllerOptions) {
   const viewportRef = useRef<Viewport>(initialViewportFor(sceneId))
@@ -1234,6 +1238,10 @@ export function useCanvasInteractionController({
 
       if (event.key === 'Escape') {
         event.preventDefault()
+        if (maskEditNodeId) {
+          onCancelMaskEdit?.()
+          return
+        }
         onCloseContextMenu()
         selectionRef.current = null
         textCreationRef.current = null
@@ -1417,8 +1425,10 @@ export function useCanvasInteractionController({
     duplicateSelectedNodes,
     fitAll,
     fitSelection,
+    maskEditNodeId,
     moveSelectedLayer,
     moveSelectedNodesBy,
+    onCancelMaskEdit,
     onCloseContextMenu,
     pasteClipboardNodes,
     redo,

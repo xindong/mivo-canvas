@@ -12,6 +12,8 @@ import '@leafer-in/view'
 import { LocateFixed, Minus, Plus, RotateCcw } from 'lucide-react'
 import { downloadCanvasNodeOriginal } from '../lib/assetDownload'
 import { canImportCanvasFile, importFilesToCanvas, importImageUrlToCanvas } from '../lib/canvasAssetImport'
+import { readCanvasImageBlob } from '../lib/canvasImageSource'
+import { editMivoImage } from '../lib/mivoImageClient'
 import { useCanvasStore } from '../store/canvasStore'
 import { CanvasContextMenu } from './CanvasContextMenu'
 import { CanvasNodeView } from './CanvasNodeView'
@@ -19,6 +21,7 @@ import { CanvasToolDock } from './CanvasToolDock'
 import { ImageCropOverlay, type ImageCropBox } from './ImageCropOverlay'
 import { NodeActionMenu } from './NodeActionMenu'
 import { SelectionQuickToolbar } from './SelectionQuickToolbar'
+import type { ImageMaskSubmitPayload } from './imageMaskGeometry'
 import { useCanvasInteractionController } from './useCanvasInteractionController'
 
 type ContextMenuState = {
@@ -105,6 +108,8 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
   const leaferRef = useRef<Leafer | null>(null)
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null)
   const [cropNodeId, setCropNodeId] = useState<string>()
+  const [maskEditNodeId, setMaskEditNodeId] = useState<string>()
+  const [maskEditSubmittingNodeId, setMaskEditSubmittingNodeId] = useState<string>()
   const [shellSize, setShellSize] = useState({ width: 0, height: 0 })
   const nodes = useCanvasStore((state) => state.nodes)
   const sceneId = useCanvasStore((state) => state.sceneId)
@@ -118,12 +123,17 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
   const updateNodeMeasuredSize = useCanvasStore((state) => state.updateNodeMeasuredSize)
   const cropImageNode = useCanvasStore((state) => state.cropImageNode)
   const renameNode = useCanvasStore((state) => state.renameNode)
+  const commitGenerationResult = useCanvasStore((state) => state.commitGenerationResult)
   const contextMenuNodeId = contextMenu?.nodeId
   const visibleNodes = useMemo(() => nodes.filter((node) => !node.hidden), [nodes])
   const contextMenuNode =
     contextMenu?.kind === 'node' ? visibleNodes.find((node) => node.id === contextMenuNodeId) : undefined
   const cropNode = cropNodeId ? visibleNodes.find((node) => node.id === cropNodeId && node.type === 'image') : undefined
   const closeContextMenu = useCallback(() => setContextMenu(null), [])
+  const cancelMaskEdit = useCallback(() => {
+    setMaskEditNodeId(undefined)
+    setMaskEditSubmittingNodeId(undefined)
+  }, [])
   const {
     viewport,
     snapGuides,
@@ -164,6 +174,8 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
     sceneId,
     nodes: visibleNodes,
     selectedNodeIds,
+    maskEditNodeId,
+    onCancelMaskEdit: cancelMaskEdit,
     onCloseContextMenu: closeContextMenu,
   })
 
@@ -191,12 +203,14 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
     const pinnedNodeIds = new Set(selectedNodeIds)
     if (selectedNodeId) pinnedNodeIds.add(selectedNodeId)
     if (cropNodeId) pinnedNodeIds.add(cropNodeId)
+    if (maskEditNodeId) pinnedNodeIds.add(maskEditNodeId)
     if (contextMenuNodeId) pinnedNodeIds.add(contextMenuNodeId)
 
     return visibleNodes.filter((node) => pinnedNodeIds.has(node.id) || rectsIntersect(node, viewportRect))
   }, [
     contextMenuNodeId,
     cropNodeId,
+    maskEditNodeId,
     selectedNodeId,
     selectedNodeIds,
     shellSize.height,
@@ -257,6 +271,52 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
       setCropNodeId(undefined)
     },
     [cropImageNode],
+  )
+
+  const beginMaskEdit = useCallback(
+    (nodeId: string) => {
+      const node = useCanvasStore.getState().nodes.find((item) => item.id === nodeId && item.type === 'image' && !item.hidden)
+      if (!node) return
+
+      selectNode(nodeId)
+      setContextMenu(null)
+      setCropNodeId(undefined)
+      setMaskEditNodeId(nodeId)
+    },
+    [selectNode],
+  )
+
+  const submitMaskEdit = useCallback(
+    async (nodeId: string, resolvedAssetUrl: string, payload: ImageMaskSubmitPayload) => {
+      const source = useCanvasStore.getState().nodes.find((node) => node.id === nodeId && node.type === 'image' && !node.hidden)
+      if (!source) throw new Error('Source image not found')
+
+      setMaskEditSubmittingNodeId(nodeId)
+      try {
+        const image = await readCanvasImageBlob(source, resolvedAssetUrl)
+        const response = await editMivoImage({
+          image,
+          mask: payload.mask,
+          prompt: payload.prompt,
+          imgRatio: '1:1',
+          quality: 'medium',
+          model: 'gpt-image-2',
+        })
+        await commitGenerationResult({
+          sourceNodeId: source.id,
+          resultImages: response.images,
+          prompt: payload.prompt,
+          model: 'gpt-image-2',
+          kind: 'edit',
+          maskBounds: payload.maskBounds,
+          placement: 'right',
+        })
+        setMaskEditNodeId(undefined)
+      } finally {
+        setMaskEditSubmittingNodeId(undefined)
+      }
+    },
+    [commitGenerationResult],
   )
 
   const downloadOriginal = useCallback((node?: typeof contextMenuNode) => {
@@ -619,6 +679,9 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
               handleSize={handleSize}
               handleBorderWidth={handleBorderWidth}
               selectionStrokeWidth={selectionStrokeWidth}
+              maskEditActive={node.id === maskEditNodeId}
+              maskEditSubmitting={node.id === maskEditSubmittingNodeId}
+              viewportScale={viewport.scale}
               onSelect={selectNode}
               onPointerDown={beginNodePointerDown}
               onResizeHandlePointerDown={beginNodeResize}
@@ -629,6 +692,8 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
               onUpdateText={updateEditingText}
               onFinishTextEdit={finishTextEditing}
               onResizeNodeToContent={updateNodeMeasuredSize}
+              onSubmitMaskEdit={submitMaskEdit}
+              onCancelMaskEdit={cancelMaskEdit}
               onOpenDetails={(nodeId) => {
                 setContextMenu(null)
                 selectNode(nodeId)
@@ -646,7 +711,7 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
             onCancel={() => setCropNodeId(undefined)}
           />
         ) : null}
-        {!cropNode ? (
+        {!cropNode && !maskEditNodeId ? (
           <SelectionQuickToolbar
             selectedNodes={selectedNodes}
             selectedBounds={selectedBounds}
@@ -658,6 +723,7 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
             onEditText={editTextNode}
             onRenameNode={promptRenameNode}
             onCropNode={beginCropNode}
+            onStartImageMaskEdit={beginMaskEdit}
             onDownloadOriginal={downloadOriginal}
           />
         ) : null}
@@ -676,6 +742,7 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
             onEditText={editTextNode}
             onRenameNode={promptRenameNode}
             onCropNode={beginCropNode}
+            onStartImageMaskEdit={beginMaskEdit}
             onDownloadOriginal={downloadOriginal}
           />
         </CanvasContextMenu>

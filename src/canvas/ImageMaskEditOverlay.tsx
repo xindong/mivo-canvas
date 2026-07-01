@@ -1,0 +1,365 @@
+import { Brush, MousePointer2, Redo2, Sparkles, Square, Trash2, Undo2, X } from 'lucide-react'
+import { useMemo, useRef, useState, type PointerEvent } from 'react'
+import type { MivoCanvasNode } from '../types/mivoCanvas'
+import {
+  boundsForRegions,
+  buildEditMaskBlob,
+  displayRectForImage,
+  imagePixelToNodePoint,
+  nodePointToImagePixel,
+  type ImageMaskPoint,
+  type ImageMaskRegion,
+  type ImageMaskSubmitPayload,
+} from './imageMaskGeometry'
+
+type ImageMaskTool = 'point' | 'box' | 'brush'
+
+type ImageMaskEditOverlayProps = {
+  node: MivoCanvasNode
+  resolvedAssetUrl: string
+  naturalSize: { width: number; height: number }
+  viewportScale: number
+  submitting: boolean
+  onCancel: () => void
+  onSubmit: (payload: ImageMaskSubmitPayload) => Promise<void>
+}
+
+type DraftRegion =
+  | { type: 'box'; start: ImageMaskPoint; current: ImageMaskPoint }
+  | { type: 'brush'; points: ImageMaskPoint[] }
+
+const toolItems: Array<{ id: ImageMaskTool; label: string; icon: typeof MousePointer2 }> = [
+  { id: 'point', label: 'Point', icon: MousePointer2 },
+  { id: 'box', label: 'Box', icon: Square },
+  { id: 'brush', label: 'Brush', icon: Brush },
+]
+
+const minimumBoxSizePx = 8
+
+const radiusToNode = (
+  center: ImageMaskPoint,
+  radius: number,
+  displayRect: { x: number; y: number; width: number; height: number },
+  naturalSize: { width: number; height: number },
+  imageCrop: MivoCanvasNode['imageCrop'],
+) => {
+  const centerNode = imagePixelToNodePoint(center, displayRect, naturalSize, imageCrop)
+  const edgeNode = imagePixelToNodePoint(
+    { x: center.x + radius, y: center.y },
+    displayRect,
+    naturalSize,
+    imageCrop,
+  )
+  return Math.max(4, Math.abs(edgeNode.x - centerNode.x))
+}
+
+const regionPath = (
+  region: ImageMaskRegion,
+  displayRect: { x: number; y: number; width: number; height: number },
+  naturalSize: { width: number; height: number },
+  imageCrop: MivoCanvasNode['imageCrop'],
+) => {
+  if (region.type === 'point') {
+    const center = imagePixelToNodePoint(region.center, displayRect, naturalSize, imageCrop)
+    return {
+      kind: 'circle' as const,
+      cx: center.x,
+      cy: center.y,
+      r: radiusToNode(region.center, region.radius, displayRect, naturalSize, imageCrop),
+    }
+  }
+
+  if (region.type === 'box') {
+    const start = imagePixelToNodePoint({ x: region.x, y: region.y }, displayRect, naturalSize, imageCrop)
+    const end = imagePixelToNodePoint(
+      { x: region.x + region.width, y: region.y + region.height },
+      displayRect,
+      naturalSize,
+      imageCrop,
+    )
+    return {
+      kind: 'rect' as const,
+      x: Math.min(start.x, end.x),
+      y: Math.min(start.y, end.y),
+      width: Math.abs(end.x - start.x),
+      height: Math.abs(end.y - start.y),
+    }
+  }
+
+  return {
+    kind: 'polyline' as const,
+    points: region.points.map((point) => imagePixelToNodePoint(point, displayRect, naturalSize, imageCrop)),
+    strokeWidth: radiusToNode(region.points[0], region.radius, displayRect, naturalSize, imageCrop) * 2,
+  }
+}
+
+export function ImageMaskEditOverlay({
+  node,
+  naturalSize,
+  viewportScale,
+  submitting,
+  onCancel,
+  onSubmit,
+}: ImageMaskEditOverlayProps) {
+  const stageRef = useRef<HTMLDivElement | null>(null)
+  const [tool, setTool] = useState<ImageMaskTool>('box')
+  const [prompt, setPrompt] = useState('')
+  const [regions, setRegions] = useState<ImageMaskRegion[]>([])
+  const [past, setPast] = useState<ImageMaskRegion[][]>([])
+  const [future, setFuture] = useState<ImageMaskRegion[][]>([])
+  const [brushSizePx, setBrushSizePx] = useState(48)
+  const [draft, setDraft] = useState<DraftRegion>()
+  const [statusError, setStatusError] = useState('')
+
+  const displayRect = useMemo(
+    () =>
+      displayRectForImage({
+        nodeWidth: node.width,
+        nodeHeight: node.height,
+        naturalWidth: naturalSize.width,
+        naturalHeight: naturalSize.height,
+        imageCrop: node.imageCrop,
+      }),
+    [naturalSize.height, naturalSize.width, node.height, node.imageCrop, node.width],
+  )
+
+  const commitRegions = (nextRegions: ImageMaskRegion[]) => {
+    setPast((current) => [...current, regions])
+    setRegions(nextRegions)
+    setFuture([])
+    setStatusError('')
+  }
+
+  const localPointForEvent = (event: PointerEvent<HTMLElement>): ImageMaskPoint | undefined => {
+    const rect = stageRef.current?.getBoundingClientRect()
+    if (!rect) return undefined
+
+    return {
+      x: ((event.clientX - rect.left) / Math.max(1, rect.width)) * node.width,
+      y: ((event.clientY - rect.top) / Math.max(1, rect.height)) * node.height,
+    }
+  }
+
+  const pixelForEvent = (event: PointerEvent<HTMLElement>) => {
+    const point = localPointForEvent(event)
+    return point ? nodePointToImagePixel(point, displayRect, naturalSize, node.imageCrop) : undefined
+  }
+
+  const beginPointer = (event: PointerEvent<HTMLElement>) => {
+    event.preventDefault()
+    event.stopPropagation()
+    if (submitting) return
+
+    const pixel = pixelForEvent(event)
+    if (!pixel) return
+
+    event.currentTarget.setPointerCapture(event.pointerId)
+    if (tool === 'point') {
+      commitRegions([...regions, { type: 'point', center: pixel, radius: brushSizePx }])
+      return
+    }
+    if (tool === 'box') {
+      setDraft({ type: 'box', start: pixel, current: pixel })
+      return
+    }
+    setDraft({ type: 'brush', points: [pixel] })
+  }
+
+  const updatePointer = (event: PointerEvent<HTMLElement>) => {
+    if (!draft || submitting) return
+    event.preventDefault()
+    event.stopPropagation()
+
+    const pixel = pixelForEvent(event)
+    if (!pixel) return
+
+    setDraft((current) => {
+      if (!current) return current
+      if (current.type === 'box') return { ...current, current: pixel }
+      const lastPoint = current.points.at(-1)
+      if (lastPoint && Math.hypot(lastPoint.x - pixel.x, lastPoint.y - pixel.y) < Math.max(2, brushSizePx / 6)) {
+        return current
+      }
+      return { ...current, points: [...current.points, pixel] }
+    })
+  }
+
+  const endPointer = (event: PointerEvent<HTMLElement>) => {
+    if (!draft || submitting) return
+    event.preventDefault()
+    event.stopPropagation()
+
+    if (draft.type === 'box') {
+      const x = Math.min(draft.start.x, draft.current.x)
+      const y = Math.min(draft.start.y, draft.current.y)
+      const width = Math.abs(draft.current.x - draft.start.x)
+      const height = Math.abs(draft.current.y - draft.start.y)
+      if (width >= minimumBoxSizePx && height >= minimumBoxSizePx) {
+        commitRegions([...regions, { type: 'box', x, y, width, height }])
+      }
+    } else if (draft.points.length) {
+      commitRegions([...regions, { type: 'brush', points: draft.points, radius: brushSizePx }])
+    }
+    setDraft(undefined)
+  }
+
+  const undo = () => {
+    const previous = past.at(-1)
+    if (!previous) return
+    setFuture((current) => [regions, ...current])
+    setRegions(previous)
+    setPast((current) => current.slice(0, -1))
+  }
+
+  const redo = () => {
+    const next = future[0]
+    if (!next) return
+    setPast((current) => [...current, regions])
+    setRegions(next)
+    setFuture((current) => current.slice(1))
+  }
+
+  const clear = () => {
+    if (!regions.length) return
+    commitRegions([])
+  }
+
+  const submit = async () => {
+    const trimmedPrompt = prompt.trim()
+    if (!trimmedPrompt || !regions.length || submitting) return
+
+    try {
+      setStatusError('')
+      const mask = await buildEditMaskBlob({ naturalSize, imageCrop: node.imageCrop, regions })
+      await onSubmit({
+        prompt: trimmedPrompt,
+        mask,
+        maskBounds: boundsForRegions(regions, naturalSize),
+      })
+    } catch (error) {
+      setStatusError(error instanceof Error ? error.message : '局部重绘失败。')
+    }
+  }
+
+  const renderedRegions = draft
+    ? [
+        ...regions,
+        draft.type === 'box'
+          ? {
+              type: 'box' as const,
+              x: Math.min(draft.start.x, draft.current.x),
+              y: Math.min(draft.start.y, draft.current.y),
+              width: Math.abs(draft.current.x - draft.start.x),
+              height: Math.abs(draft.current.y - draft.start.y),
+            }
+          : { type: 'brush' as const, points: draft.points, radius: brushSizePx },
+      ]
+    : regions
+
+  return (
+    <div className="image-mask-edit-overlay" data-canvas-ui="true" onPointerDown={(event) => event.stopPropagation()}>
+      <div
+        ref={stageRef}
+        className="image-mask-edit-stage"
+        data-canvas-ui="true"
+        onPointerDown={beginPointer}
+        onPointerMove={updatePointer}
+        onPointerUp={endPointer}
+        onPointerCancel={endPointer}
+      >
+        <svg width={node.width} height={node.height} viewBox={`0 0 ${node.width} ${node.height}`}>
+          <rect
+            x={displayRect.x}
+            y={displayRect.y}
+            width={displayRect.width}
+            height={displayRect.height}
+            className="image-mask-edit-display-rect"
+          />
+          {renderedRegions.map((region, index) => {
+            const shape = regionPath(region, displayRect, naturalSize, node.imageCrop)
+            if (shape.kind === 'circle') {
+              return <circle key={index} className="image-mask-edit-region" cx={shape.cx} cy={shape.cy} r={shape.r} />
+            }
+            if (shape.kind === 'rect') {
+              return (
+                <rect
+                  key={index}
+                  className="image-mask-edit-region"
+                  x={shape.x}
+                  y={shape.y}
+                  width={shape.width}
+                  height={shape.height}
+                />
+              )
+            }
+            return (
+              <polyline
+                key={index}
+                className="image-mask-edit-region brush"
+                points={shape.points.map((point) => `${point.x},${point.y}`).join(' ')}
+                strokeWidth={shape.strokeWidth / Math.max(0.1, viewportScale)}
+              />
+            )
+          })}
+        </svg>
+      </div>
+
+      <div className="image-mask-edit-toolbar" data-canvas-ui="true">
+        <div className="image-mask-edit-tools">
+          {toolItems.map(({ id, label, icon: Icon }) => (
+            <button
+              type="button"
+              key={id}
+              className={tool === id ? 'active' : undefined}
+              onClick={() => setTool(id)}
+              disabled={submitting}
+            >
+              <Icon size={14} />
+              {label}
+            </button>
+          ))}
+        </div>
+        <label className="image-mask-edit-size">
+          <span>Brush</span>
+          <input
+            type="range"
+            min="12"
+            max="180"
+            value={brushSizePx}
+            disabled={submitting}
+            onChange={(event) => setBrushSizePx(Number(event.target.value))}
+          />
+          <em>{brushSizePx}px</em>
+        </label>
+        <div className="image-mask-edit-history">
+          <button type="button" onClick={undo} disabled={!past.length || submitting} aria-label="Undo mask region">
+            <Undo2 size={14} />
+          </button>
+          <button type="button" onClick={redo} disabled={!future.length || submitting} aria-label="Redo mask region">
+            <Redo2 size={14} />
+          </button>
+          <button type="button" onClick={clear} disabled={!regions.length || submitting} aria-label="Clear mask regions">
+            <Trash2 size={14} />
+          </button>
+          <button type="button" onClick={onCancel} disabled={submitting} aria-label="Cancel mask edit">
+            <X size={14} />
+          </button>
+        </div>
+      </div>
+
+      <div className="image-mask-edit-prompt" data-canvas-ui="true">
+        <textarea
+          value={prompt}
+          disabled={submitting}
+          onChange={(event) => setPrompt(event.target.value)}
+          placeholder="描述这个区域要怎么改..."
+        />
+        {statusError ? <div className="image-mask-edit-error">{statusError}</div> : null}
+        <button type="button" onClick={() => void submit()} disabled={submitting || !prompt.trim() || !regions.length}>
+          <Sparkles size={15} />
+          {submitting ? '重绘中...' : '局部重绘'}
+        </button>
+      </div>
+    </div>
+  )
+}
