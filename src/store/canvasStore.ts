@@ -36,6 +36,7 @@ import { assetBlobForNode, editMivoImage, generateMivoImage } from '../lib/mivoI
 import { buildAiContextSnapshot, chooseAdjacentPlacement } from './aiCanvasWorkflow'
 import { makeNode, realCaseImages, scenes, snapshotFromScene } from './demoScenes'
 import { mockGenerationAdapter } from './mockGeneration'
+import type { CanvasAssetClipboardItem } from '../app/assetLibraryModel'
 import type {
   CommitGenerationResultPayload,
   CommittedGenerationImage,
@@ -63,6 +64,7 @@ type CanvasState = {
   selectedNodeIds: string[]
   sceneId: CanvasId
   clipboardNodes: MivoCanvasNode[]
+  clipboardAssets: CanvasAssetClipboardItem[]
   historyPast: MivoCanvasSnapshot[]
   historyFuture: MivoCanvasSnapshot[]
   createCanvas: (title?: string, options?: { projectId?: string; templateId?: DemoSceneId }) => CanvasId
@@ -100,6 +102,8 @@ type CanvasState = {
   distributeSelectedNodes: (axis: DistributionAxis) => void
   copySelectedNodes: () => void
   pasteClipboardNodes: (position?: { x: number; y: number }) => void
+  copyAssetsToClipboard: (assets: CanvasAssetClipboardItem[]) => void
+  pasteClipboardAssets: (position?: { x: number; y: number }) => void
   addImportedImage: (
     assetUrl: string,
     title?: string,
@@ -688,6 +692,19 @@ const importedAssetPromptFor = (type: Exclude<CanvasAssetNodeType, 'markdown'>) 
   return '本地导入图片，可作为后续 AI 上下文'
 }
 
+const clipboardAssetTitle = (asset: CanvasAssetClipboardItem) =>
+  asset.title?.trim() || asset.name?.replace(/\.[^.]+$/, '') || 'Eagle asset'
+
+const clipboardAssetDisplaySize = (asset: CanvasAssetClipboardItem) =>
+  importedImageDisplaySize(
+    asset.width && asset.height
+      ? {
+          width: asset.width,
+          height: asset.height,
+        }
+      : undefined,
+  )
+
 const importedAssetModelFor = (type: Exclude<CanvasAssetNodeType, 'markdown'>) => {
   if (type === 'pdf') return 'Imported PDF'
   if (type === 'video') return 'Imported Video'
@@ -807,6 +824,7 @@ const migratePersistedState = (persistedState: unknown, persistedVersion = 0) =>
     selectedNodeIds: selection.selectedNodeIds,
     activeTool: persisted.activeTool || 'select',
     clipboardNodes: [],
+    clipboardAssets: [],
     historyPast: [],
     historyFuture: [],
   }
@@ -828,6 +846,7 @@ export const useCanvasStore = create<CanvasState>()(
       selectedNodeIds: defaultDocument.selectedNodeIds || [],
       activeTool: 'select',
       clipboardNodes: [],
+      clipboardAssets: [],
       historyPast: [],
       historyFuture: [],
       createCanvas: (title = 'Untitled Canvas', options) => {
@@ -1447,7 +1466,7 @@ export const useCanvasStore = create<CanvasState>()(
           const selectedNodes = selectedNodesFromState(state)
           if (!selectedNodes.length) return {}
 
-          return { clipboardNodes: cloneNodes(selectedNodes) }
+          return { clipboardNodes: cloneNodes(selectedNodes), clipboardAssets: [] }
         }),
       pasteClipboardNodes: (position) =>
         set((state) => {
@@ -1486,6 +1505,54 @@ export const useCanvasStore = create<CanvasState>()(
               nodes: [...state.nodes, ...nextClones],
             }),
           }
+        }),
+      copyAssetsToClipboard: (assets) =>
+        set(() => ({
+          clipboardAssets: assets.map((asset) => ({ ...asset, tags: asset.tags ? [...asset.tags] : undefined })),
+          clipboardNodes: [],
+        })),
+      pasteClipboardAssets: (position) =>
+        set((state) => {
+          if (!state.clipboardAssets.length) return {}
+
+          const start = position || { x: -64 + state.nodes.length * 16, y: -64 + state.nodes.length * 16 }
+          const columns = Math.max(1, Math.min(3, Math.ceil(Math.sqrt(state.clipboardAssets.length))))
+          const createdAt = Date.now()
+          const nodes = state.clipboardAssets.map((asset, index) => {
+            const displaySize = clipboardAssetDisplaySize(asset)
+            const column = index % columns
+            const row = Math.floor(index / columns)
+            const id = createNodeId('asset')
+
+            return makeNode({
+              id,
+              type: 'image',
+              title: clipboardAssetTitle(asset),
+              x: Math.round(start.x + column * 36),
+              y: Math.round(start.y + row * 36),
+              width: displaySize.width,
+              height: displaySize.height,
+              assetUrl: asset.url,
+              assetOriginalName: asset.name,
+              status: 'ready',
+              generation: {
+                prompt: 'Eagle 素材库复制粘贴导入，可作为后续 AI 上下文',
+                model: 'Imported Eagle Asset',
+                size:
+                  asset.width && asset.height
+                    ? `${Math.round(asset.width)}x${Math.round(asset.height)}`
+                    : `${displaySize.width}x${displaySize.height}`,
+                seed: createdAt % 99999,
+                createdAt,
+              },
+            })
+          })
+
+          return patchWithHistory(state, {
+            selectedNodeId: nodes[0]?.id,
+            selectedNodeIds: nodes.map((node) => node.id),
+            nodes: [...state.nodes, ...nodes],
+          })
         }),
       addImportedImage: (assetUrl, title = 'Imported Image', size = 'source', position, metadata) => {
         get().addImportedFileNode('image', assetUrl, title, size, position, metadata)

@@ -20,6 +20,26 @@ export type AssetItem = {
   annotation?: string
 }
 
+export type CanvasAssetClipboardItem = Pick<
+  AssetItem,
+  | 'id'
+  | 'sourceId'
+  | 'name'
+  | 'title'
+  | 'url'
+  | 'thumbnailUrl'
+  | 'width'
+  | 'height'
+  | 'sourcePath'
+  | 'tags'
+>
+
+export type EagleTagItem = {
+  id: string
+  name: string
+  count?: number
+}
+
 export type AssetSource = {
   id: AssetSourceId
   label: string
@@ -49,6 +69,10 @@ export type EagleStatus = {
 
 export type EagleAssetsResponse = {
   assets: Omit<AssetItem, 'sourceId' | 'sourceLabel'>[]
+}
+
+export type EagleTagsResponse = {
+  tags: EagleTagItem[]
 }
 
 export type EagleFoldersResponse = {

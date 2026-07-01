@@ -28,7 +28,8 @@ function App() {
   const [workspaceView, setWorkspaceView] = useState<WorkspaceView>('canvas')
   const [detailsSceneId, setDetailsSceneId] = useState<string>()
   const projectSidebarTimerRef = useRef<number | undefined>(undefined)
-  const detailsOpen = workspaceView === 'canvas' && detailsSceneId === sceneId
+  const isCanvasWorkspace = workspaceView === 'canvas' || workspaceView === 'assets'
+  const detailsOpen = isCanvasWorkspace && detailsSceneId === sceneId
   const projectSidebarOpen = projectSidebarState === 'open' || projectSidebarState === 'pinning'
   const projectSidebarPeek = projectSidebarState === 'peeking' || projectSidebarState === 'peekClosing'
   const projectSidebarClosing = projectSidebarState === 'closing' || projectSidebarState === 'peekClosing'
@@ -120,7 +121,7 @@ function App() {
       } ${
         projectSidebarPinning ? 'project-pinning' : ''
       } ${
-        workspaceView === 'canvas' ? '' : 'library-active'
+        isCanvasWorkspace ? '' : 'library-active'
       } ${
         aiPanelOpen ? '' : 'ai-collapsed'
       }`}
@@ -149,12 +150,19 @@ function App() {
           />
         </div>
       ) : null}
-      {workspaceView === 'canvas' ? (
+      {isCanvasWorkspace ? (
         <div className="workspace">
           <TopBar projectSidebarOpen={projectSidebarOpen} />
           <div className="work-surface">
             <MivoCanvas key={sceneId} onOpenDetails={() => setDetailsSceneId(sceneId)} />
             <AIToolPanel open={aiPanelOpen} onToggle={() => setAiPanelOpen((current) => !current)} />
+            {workspaceView === 'assets' ? (
+              <LibraryWorkspace
+                type="assets"
+                variant="canvas-drawer"
+                onOpenCanvas={() => setWorkspaceView('canvas')}
+              />
+            ) : null}
           </div>
           <TaskQueue />
         </div>

@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useState, type DragEvent as ReactDragEvent } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type DragEvent as ReactDragEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
+} from 'react'
 import {
   CheckCircle2,
   Copy,
@@ -25,16 +33,20 @@ import {
   thumbnailUrlFor,
   type AssetItem,
   type AssetSourceId,
+  type CanvasAssetClipboardItem,
   type EagleAssetsResponse,
   type EagleFolder,
   type EagleFoldersResponse,
   type EagleStatus,
+  type EagleTagItem,
+  type EagleTagsResponse,
   type LocalAssetResponse,
   type PinterestStatus,
 } from './assetLibraryModel'
 
 type LibraryWorkspaceProps = {
   type: 'assets' | 'plugins' | 'skills'
+  variant?: 'workspace' | 'canvas-drawer'
   onOpenCanvas?: () => void
 }
 
@@ -60,6 +72,28 @@ const formatAssetDate = (timestamp: number) => {
     hour: '2-digit',
     minute: '2-digit',
   }).format(new Date(timestamp))
+}
+
+const assetClipboardItemFrom = (asset: AssetItem): CanvasAssetClipboardItem => ({
+  id: asset.id,
+  sourceId: asset.sourceId,
+  name: asset.name,
+  title: asset.title,
+  url: asset.url,
+  thumbnailUrl: asset.thumbnailUrl,
+  width: asset.width,
+  height: asset.height,
+  sourcePath: asset.sourcePath,
+  tags: asset.tags,
+})
+
+const tagMatches = (assetTag: string, selectedTag: string) =>
+  assetTag.trim().toLowerCase() === selectedTag.trim().toLowerCase()
+
+const fallbackToOriginalAssetImage = (asset: AssetItem, image: HTMLImageElement) => {
+  if (image.dataset.fallbackSource === 'original') return
+  image.dataset.fallbackSource = 'original'
+  image.src = asset.url
 }
 
 const pluginRows = [
@@ -122,15 +156,17 @@ const skillRows = [
   },
 ]
 
-export function LibraryWorkspace({ type, onOpenCanvas }: LibraryWorkspaceProps) {
+export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: LibraryWorkspaceProps) {
   const isAssets = type === 'assets'
   const isSkills = type === 'skills'
   const addImportedImage = useCanvasStore((state) => state.addImportedImage)
+  const copyAssetsToClipboard = useCanvasStore((state) => state.copyAssetsToClipboard)
   const [query, setQuery] = useState('')
   const [localAssetRoot, setLocalAssetRoot] = useState('~/Desktop/images')
   const [localAssets, setLocalAssets] = useState<AssetItem[]>([])
   const [eagleAssets, setEagleAssets] = useState<AssetItem[]>([])
   const [eagleFolders, setEagleFolders] = useState<EagleFolder[]>([])
+  const [eagleTags, setEagleTags] = useState<EagleTagItem[]>([])
   const [eagleStatus, setEagleStatus] = useState<EagleStatus>({ connected: false })
   const [pinterestStatus, setPinterestStatus] = useState<PinterestStatus>()
   const [pinterestSettingsOpen, setPinterestSettingsOpen] = useState(false)
@@ -138,9 +174,15 @@ export function LibraryWorkspace({ type, onOpenCanvas }: LibraryWorkspaceProps) 
   const [pinterestSettingsMessage, setPinterestSettingsMessage] = useState('')
   const [activeAssetSource, setActiveAssetSource] = useState<AssetSourceId>('local')
   const [selectedEagleFolderId, setSelectedEagleFolderId] = useState<string>()
+  const [selectedEagleTag, setSelectedEagleTag] = useState<string>()
   const [selectedAsset, setSelectedAsset] = useState<AssetItem>()
+  const [previewAsset, setPreviewAsset] = useState<AssetItem>()
+  const [selectedAssetIds, setSelectedAssetIds] = useState<string[]>([])
+  const [lastSelectedAssetId, setLastSelectedAssetId] = useState<string>()
+  const [assetCardMenu, setAssetCardMenu] = useState<{ assetId: string; x: number; y: number }>()
   const [assetLoadState, setAssetLoadState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
   const [eagleLoadState, setEagleLoadState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
+  const [eagleTagLoadState, setEagleTagLoadState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
   const [assetDimensions, setAssetDimensions] = useState<Record<string, { width: number; height: number }>>({})
   const title = isAssets ? 'Assets' : isSkills ? 'Skills' : 'Plugins'
   const kicker = isAssets ? 'Library' : isSkills ? 'Agent capabilities' : 'Extensions'
@@ -156,18 +198,40 @@ export function LibraryWorkspace({ type, onOpenCanvas }: LibraryWorkspaceProps) 
       : 'Search tools, connectors, presets'
   const actionLabel = isAssets ? 'Add source' : isSkills ? 'Add skill' : 'Add plugin'
   const activeRows = isSkills ? skillRows : pluginRows
+  const rootClassName = [
+    'library-workspace',
+    variant === 'canvas-drawer' ? 'asset-library-drawer' : '',
+  ].filter(Boolean).join(' ')
   const activeAssets = useMemo(
     () => (activeAssetSource === 'eagle' ? eagleAssets : activeAssetSource === 'local' ? localAssets : []),
     [activeAssetSource, eagleAssets, localAssets],
   )
   const filteredAssets = useMemo(() => {
-    if (activeAssetSource === 'eagle') return activeAssets
+    if (activeAssetSource === 'eagle') {
+      if (!selectedEagleTag) return activeAssets
+      return activeAssets.filter((asset) => asset.tags?.some((tag) => tagMatches(tag, selectedEagleTag)))
+    }
     return activeAssets.filter((asset) => assetMatchesQuery(asset, query))
-  }, [activeAssetSource, activeAssets, query])
+  }, [activeAssetSource, activeAssets, query, selectedEagleTag])
   const flatEagleFolders = useMemo(() => flattenEagleFolders(eagleFolders), [eagleFolders])
+  const fallbackEagleTags = useMemo<EagleTagItem[]>(() => {
+    const tagNames = Array.from(new Set(eagleAssets.flatMap((asset) => asset.tags || [])))
+      .filter(Boolean)
+      .sort((left, right) => left.localeCompare(right))
+    return tagNames.map((name) => ({ id: name, name }))
+  }, [eagleAssets])
+  const activeEagleTags = eagleTags.length ? eagleTags : fallbackEagleTags
   const selectedEagleFolder = useMemo(
     () => flatEagleFolders.find((folder) => folder.id === selectedEagleFolderId),
     [flatEagleFolders, selectedEagleFolderId],
+  )
+  const selectedAssets = useMemo(() => {
+    const selected = new Set(selectedAssetIds)
+    return filteredAssets.filter((asset) => selected.has(asset.id))
+  }, [filteredAssets, selectedAssetIds])
+  const contextMenuAsset = useMemo(
+    () => filteredAssets.find((asset) => asset.id === assetCardMenu?.assetId),
+    [assetCardMenu?.assetId, filteredAssets],
   )
   const activeLoadState = activeAssetSource === 'eagle' ? eagleLoadState : assetLoadState
   const selectedAssetDimensions = selectedAsset
@@ -247,14 +311,30 @@ export function LibraryWorkspace({ type, onOpenCanvas }: LibraryWorkspaceProps) 
     }
   }, [isAssets])
 
+  const loadEagleTags = useCallback(async () => {
+    if (!isAssets) return
+
+    setEagleTagLoadState('loading')
+    try {
+      const response = await fetch('/api/mivo/eagle/tags')
+      if (!response.ok) throw new Error(`Eagle tags failed with ${response.status}`)
+      const payload = (await response.json()) as EagleTagsResponse
+      setEagleTags(payload.tags)
+      setEagleTagLoadState('ready')
+    } catch {
+      setEagleTags([])
+      setEagleTagLoadState('error')
+    }
+  }, [isAssets])
+
   const loadEagleAssets = useCallback(async () => {
     if (!isAssets) return
 
     setEagleLoadState('loading')
     try {
-      const searchParams = new URLSearchParams({ limit: '80' })
+      const searchParams = new URLSearchParams({ limit: '120', offset: '0' })
       if (selectedEagleFolderId) searchParams.set('folderId', selectedEagleFolderId)
-      if (query.trim()) searchParams.set('q', query.trim())
+      if (selectedEagleTag) searchParams.set('tag', selectedEagleTag)
       const [statusResponse, foldersResponse, assetsResponse] = await Promise.all([
         fetch('/api/mivo/eagle/status'),
         fetch('/api/mivo/eagle/folders'),
@@ -277,7 +357,7 @@ export function LibraryWorkspace({ type, onOpenCanvas }: LibraryWorkspaceProps) 
       setEagleFolders([])
       setEagleLoadState('error')
     }
-  }, [isAssets, query, selectedEagleFolderId])
+  }, [isAssets, selectedEagleFolderId, selectedEagleTag])
 
   const loadPinterestStatus = useCallback(async () => {
     if (!isAssets) return
@@ -319,21 +399,107 @@ export function LibraryWorkspace({ type, onOpenCanvas }: LibraryWorkspaceProps) 
   useEffect(() => {
     const timer = window.setTimeout(() => {
       void loadLocalAssets()
+      void loadEagleTags()
       void loadEagleAssets()
       void loadPinterestStatus()
     }, 0)
 
     return () => window.clearTimeout(timer)
-  }, [loadEagleAssets, loadLocalAssets, loadPinterestStatus])
+  }, [loadEagleAssets, loadEagleTags, loadLocalAssets, loadPinterestStatus])
+
+  useEffect(() => {
+    setSelectedAssetIds((current) => {
+      const visibleIds = new Set(filteredAssets.map((asset) => asset.id))
+      const nextIds = current.filter((assetId) => visibleIds.has(assetId))
+      return nextIds.length === current.length ? current : nextIds
+    })
+  }, [filteredAssets])
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return
+      if (previewAsset) {
+        event.preventDefault()
+        setPreviewAsset(undefined)
+      }
+      if (assetCardMenu) {
+        event.preventDefault()
+        setAssetCardMenu(undefined)
+      }
+    }
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target instanceof Element ? event.target : null
+      if (!target?.closest('.asset-card-context-menu')) {
+        setAssetCardMenu(undefined)
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    window.addEventListener('pointerdown', handlePointerDown)
+
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown)
+      window.removeEventListener('pointerdown', handlePointerDown)
+    }
+  }, [assetCardMenu, previewAsset])
 
   const addAssetToCanvas = useCallback(
     async (asset: AssetItem) => {
       await importImageUrlToCanvas(asset.url, asset.name, { x: 0, y: 0 }, addImportedImage)
       setSelectedAsset(undefined)
+      setPreviewAsset(undefined)
       onOpenCanvas?.()
     },
     [addImportedImage, onOpenCanvas],
   )
+
+  const copyAssetsToInternalClipboard = useCallback(
+    (assets: AssetItem[]) => {
+      if (!assets.length) return
+      copyAssetsToClipboard(assets.map(assetClipboardItemFrom))
+      setAssetCardMenu(undefined)
+    },
+    [copyAssetsToClipboard],
+  )
+
+  const writeSingleAssetToOsClipboard = useCallback(async (asset: AssetItem) => {
+    if (!navigator.clipboard?.write || typeof ClipboardItem === 'undefined') return
+
+    const response = await fetch(asset.url)
+    if (!response.ok) throw new Error(`Asset fetch failed with ${response.status}`)
+    const sourceBlob = await response.blob()
+    const bitmap = await createImageBitmap(sourceBlob)
+    const canvas = document.createElement('canvas')
+    canvas.width = bitmap.width
+    canvas.height = bitmap.height
+    const context = canvas.getContext('2d')
+    if (!context) throw new Error('Canvas 2D context unavailable')
+    context.drawImage(bitmap, 0, 0)
+    bitmap.close()
+    const pngBlob = await new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob((blob) => {
+        if (blob) resolve(blob)
+        else reject(new Error('Unable to encode clipboard PNG'))
+      }, 'image/png')
+    })
+
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': pngBlob })])
+  }, [])
+
+  const copyOneAsset = useCallback(
+    (asset: AssetItem) => {
+      copyAssetsToInternalClipboard([asset])
+      void writeSingleAssetToOsClipboard(asset).catch((error) => {
+        console.warn('OS clipboard image write failed', error)
+      })
+    },
+    [copyAssetsToInternalClipboard, writeSingleAssetToOsClipboard],
+  )
+
+  const copySelectedAssets = useCallback(() => {
+    copyAssetsToInternalClipboard(selectedAssets)
+  }, [copyAssetsToInternalClipboard, selectedAssets])
 
   const copyAssetSource = useCallback((asset: AssetItem) => {
     void navigator.clipboard?.writeText(asset.sourceUrl || asset.sourcePath || asset.name)
@@ -346,6 +512,9 @@ export function LibraryWorkspace({ type, onOpenCanvas }: LibraryWorkspaceProps) 
       title: asset.title,
       url: asset.url,
       sourcePath: asset.sourcePath,
+      tags: asset.tags,
+      width: asset.width,
+      height: asset.height,
     })
 
     event.dataTransfer.effectAllowed = 'copy'
@@ -353,8 +522,74 @@ export function LibraryWorkspace({ type, onOpenCanvas }: LibraryWorkspaceProps) 
     event.dataTransfer.setData('text/plain', asset.name)
   }, [])
 
+  const toggleEagleTag = useCallback(
+    (tagName?: string) => {
+      setSelectedEagleTag((current) => (current && tagName && tagMatches(current, tagName) ? undefined : tagName))
+      setSelectedAsset(undefined)
+      setPreviewAsset(undefined)
+      setSelectedAssetIds([])
+      setLastSelectedAssetId(undefined)
+    },
+    [],
+  )
+
+  const toggleAssetSelection = useCallback((assetId: string) => {
+    setSelectedAssetIds((current) =>
+      current.includes(assetId) ? current.filter((id) => id !== assetId) : [...current, assetId],
+    )
+    setLastSelectedAssetId(assetId)
+  }, [])
+
+  const selectAssetRange = useCallback(
+    (assetId: string) => {
+      const startIndex = lastSelectedAssetId
+        ? filteredAssets.findIndex((asset) => asset.id === lastSelectedAssetId)
+        : -1
+      const endIndex = filteredAssets.findIndex((asset) => asset.id === assetId)
+      if (startIndex < 0 || endIndex < 0) {
+        toggleAssetSelection(assetId)
+        return
+      }
+
+      const [from, to] = startIndex < endIndex ? [startIndex, endIndex] : [endIndex, startIndex]
+      const rangeIds = filteredAssets.slice(from, to + 1).map((asset) => asset.id)
+      setSelectedAssetIds((current) => Array.from(new Set([...current, ...rangeIds])))
+      setLastSelectedAssetId(assetId)
+    },
+    [filteredAssets, lastSelectedAssetId, toggleAssetSelection],
+  )
+
+  const handleAssetCardClick = useCallback(
+    (asset: AssetItem, event: ReactMouseEvent<HTMLElement>) => {
+      if (event.metaKey || event.ctrlKey) {
+        event.preventDefault()
+        toggleAssetSelection(asset.id)
+        return
+      }
+
+      if (event.shiftKey) {
+        event.preventDefault()
+        selectAssetRange(asset.id)
+        return
+      }
+
+      setPreviewAsset(asset)
+    },
+    [selectAssetRange, toggleAssetSelection],
+  )
+
+  const handleAssetCardKeyDown = useCallback(
+    (asset: AssetItem, event: ReactKeyboardEvent<HTMLElement>) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return
+      event.preventDefault()
+      setPreviewAsset(asset)
+    },
+    [],
+  )
+
   const syncActiveSource = useCallback(() => {
     if (activeAssetSource === 'eagle') {
+      void loadEagleTags()
       void loadEagleAssets()
       return
     }
@@ -365,7 +600,7 @@ export function LibraryWorkspace({ type, onOpenCanvas }: LibraryWorkspaceProps) 
     }
 
     void loadLocalAssets()
-  }, [activeAssetSource, loadEagleAssets, loadLocalAssets, loadPinterestStatus])
+  }, [activeAssetSource, loadEagleAssets, loadEagleTags, loadLocalAssets, loadPinterestStatus])
 
   const connectActiveSource = useCallback(() => {
     if (activeAssetSource === 'pinterest') {
@@ -393,7 +628,7 @@ export function LibraryWorkspace({ type, onOpenCanvas }: LibraryWorkspaceProps) 
   }, [])
 
   return (
-    <section className="library-workspace" aria-label={`${title} workspace`}>
+    <section className={rootClassName} aria-label={`${title} workspace`}>
       <header className="library-header">
         <div>
           <span className="library-kicker">{kicker}</span>
@@ -412,17 +647,19 @@ export function LibraryWorkspace({ type, onOpenCanvas }: LibraryWorkspaceProps) 
         </div>
       </header>
 
-      <div className="library-searchbar">
-        <Search size={16} />
-        <input
-          value={query}
-          placeholder={searchPlaceholder}
-          onChange={(event) => {
-            setQuery(event.currentTarget.value)
-            setSelectedAsset(undefined)
-          }}
-        />
-      </div>
+      {!isAssets ? (
+        <div className="library-searchbar">
+          <Search size={16} />
+          <input
+            value={query}
+            placeholder={searchPlaceholder}
+            onChange={(event) => {
+              setQuery(event.currentTarget.value)
+              setSelectedAsset(undefined)
+            }}
+          />
+        </div>
+      ) : null}
 
       {isAssets ? (
         <div className="library-layout assets-layout">
@@ -435,6 +672,11 @@ export function LibraryWorkspace({ type, onOpenCanvas }: LibraryWorkspaceProps) 
                 onClick={() => {
                   setActiveAssetSource(id)
                   setSelectedAsset(undefined)
+                  setPreviewAsset(undefined)
+                  setAssetCardMenu(undefined)
+                  setSelectedAssetIds([])
+                  setLastSelectedAssetId(undefined)
+                  if (id !== 'eagle') setSelectedEagleTag(undefined)
                 }}
               >
                 <Icon size={18} />
@@ -454,6 +696,8 @@ export function LibraryWorkspace({ type, onOpenCanvas }: LibraryWorkspaceProps) 
                   onClick={() => {
                     setSelectedEagleFolderId(undefined)
                     setSelectedAsset(undefined)
+                    setSelectedAssetIds([])
+                    setLastSelectedAssetId(undefined)
                   }}
                 >
                   All Eagle assets
@@ -467,11 +711,55 @@ export function LibraryWorkspace({ type, onOpenCanvas }: LibraryWorkspaceProps) 
                     onClick={() => {
                       setSelectedEagleFolderId(folder.id)
                       setSelectedAsset(undefined)
+                      setSelectedAssetIds([])
+                      setLastSelectedAssetId(undefined)
                     }}
                   >
                     {folder.name}
                   </button>
                 ))}
+              </div>
+            ) : null}
+            {activeAssetSource === 'eagle' ? (
+              <div className="eagle-tag-directory" aria-label="Eagle tag directory">
+                <div className="eagle-tag-directory-header">
+                  <strong>Tags</strong>
+                  <span>
+                    {eagleTagLoadState === 'loading'
+                      ? 'Loading'
+                      : eagleTagLoadState === 'error'
+                        ? 'Fallback'
+                        : `${activeEagleTags.length} tags`}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className={!selectedEagleTag ? 'eagle-tag-row active' : 'eagle-tag-row'}
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    toggleEagleTag(undefined)
+                  }}
+                >
+                  <span>All</span>
+                  <em>{eagleAssets.length}</em>
+                </button>
+                {activeEagleTags.map((tag) => (
+                  <button
+                    key={tag.id}
+                    type="button"
+                    className={selectedEagleTag && tagMatches(tag.name, selectedEagleTag) ? 'eagle-tag-row active' : 'eagle-tag-row'}
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      toggleEagleTag(tag.name)
+                    }}
+                  >
+                    <span>{tag.name}</span>
+                    {tag.count !== undefined ? <em>{tag.count}</em> : null}
+                  </button>
+                ))}
+                {activeEagleTags.length === 0 ? (
+                  <span className="eagle-tag-empty">No Eagle tags found</span>
+                ) : null}
               </div>
             ) : null}
           </aside>
@@ -481,9 +769,11 @@ export function LibraryWorkspace({ type, onOpenCanvas }: LibraryWorkspaceProps) 
               <div>
                 <strong>
                   {activeAssetSource === 'eagle'
-                    ? selectedEagleFolder
-                      ? selectedEagleFolder.name
-                      : 'Eagle assets'
+                    ? selectedEagleTag
+                      ? `Tag: ${selectedEagleTag}`
+                      : selectedEagleFolder
+                        ? selectedEagleFolder.name
+                        : 'All Eagle assets'
                     : activeAssetSource === 'pinterest'
                       ? 'Pinterest boards'
                       : 'Recent assets'}
@@ -491,55 +781,133 @@ export function LibraryWorkspace({ type, onOpenCanvas }: LibraryWorkspaceProps) 
                 <span>
                   {activeAssetSource === 'pinterest'
                     ? 'Connect Pinterest OAuth before boards and pins can appear here.'
-                    : 'Drag any asset into a canvas as a reference or image node.'}
+                    : activeAssetSource === 'eagle'
+                      ? `${filteredAssets.length} image${filteredAssets.length === 1 ? '' : 's'}${selectedEagleTag ? ' in this tag' : ''}`
+                      : 'Drag any asset into a canvas as a reference or image node.'}
                 </span>
               </div>
-              <button
-                type="button"
-                onClick={activeAssetSource === 'pinterest' ? openPinterestSettings : undefined}
-              >
-                <Image size={15} />
-                {activeAssetSource === 'eagle' && eagleLoadState === 'loading'
-                  ? 'Syncing'
-                  : activeAssetSource === 'pinterest'
-                    ? 'Preview'
-                    : assetLoadState === 'loading'
-                      ? 'Syncing'
-                      : 'View all'}
-              </button>
-            </div>
-            <div className={selectedAsset ? 'asset-browser-content has-detail' : 'asset-browser-content'}>
-              <div className="asset-grid">
-                {filteredAssets.map((asset) => (
-                  <button
-                    key={asset.id}
-                    type="button"
-                    className={selectedAsset?.id === asset.id ? 'asset-tile selected' : 'asset-tile'}
-                    draggable
-                    onClick={() => setSelectedAsset(asset)}
-                    onDoubleClick={() => void addAssetToCanvas(asset)}
-                    onDragStart={(event) => beginAssetDrag(asset, event)}
-                  >
-                    <img
-                      src={thumbnailUrlFor(asset)}
-                      alt=""
-                      onLoad={(event) => rememberDimensions(asset.id, event.currentTarget)}
-                    />
-                    <span>
-                      <strong>{asset.title}</strong>
-                      <small>
-                        {asset.format} · {dimensionsLabel(assetDimensions[asset.id] || (asset.width && asset.height ? { width: asset.width, height: asset.height } : undefined))} · {formatBytes(asset.sizeBytes)}
-                      </small>
-                    </span>
+              <div className="library-section-actions">
+                {activeAssetSource === 'eagle' && selectedAssetIds.length ? (
+                  <>
+                    <span>{selectedAssetIds.length} selected</span>
+                    <button type="button" className="primary" onClick={copySelectedAssets}>
+                      <Copy size={15} />
+                      Copy selected
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSelectedAssetIds([])
+                        setLastSelectedAssetId(undefined)
+                      }}
+                    >
+                      Clear
+                    </button>
+                  </>
+                ) : null}
+                {activeAssetSource === 'eagle' && selectedEagleTag ? (
+                  <button type="button" onClick={() => toggleEagleTag(undefined)}>
+                    <X size={15} />
+                    Clear tag
                   </button>
-                ))}
+                ) : null}
+                <button
+                  type="button"
+                  onClick={activeAssetSource === 'pinterest' ? openPinterestSettings : undefined}
+                >
+                  <Image size={15} />
+                  {activeAssetSource === 'eagle' && eagleLoadState === 'loading'
+                    ? 'Syncing'
+                    : activeAssetSource === 'pinterest'
+                      ? 'Preview'
+                      : assetLoadState === 'loading'
+                        ? 'Syncing'
+                        : 'View all'}
+                </button>
+              </div>
+            </div>
+            <div className={selectedAsset && activeAssetSource !== 'eagle' ? 'asset-browser-content has-detail' : 'asset-browser-content'}>
+              <div className={activeAssetSource === 'eagle' ? 'asset-masonry' : 'asset-grid'}>
+                {filteredAssets.map((asset) => {
+                  const dimensions = assetDimensions[asset.id] || (asset.width && asset.height ? { width: asset.width, height: asset.height } : undefined)
+                  const isSelected = selectedAssetIds.includes(asset.id)
+
+                  if (activeAssetSource === 'eagle') {
+                    return (
+                      <article
+                        key={asset.id}
+                        role="button"
+                        tabIndex={0}
+                        className={isSelected ? 'asset-masonry-card selected' : 'asset-masonry-card'}
+                        draggable
+                        onClick={(event) => handleAssetCardClick(asset, event)}
+                        onKeyDown={(event) => handleAssetCardKeyDown(asset, event)}
+                        onDoubleClick={() => void addAssetToCanvas(asset)}
+                        onContextMenu={(event) => {
+                          event.preventDefault()
+                          event.stopPropagation()
+                          setAssetCardMenu({ assetId: asset.id, x: event.clientX, y: event.clientY })
+                        }}
+                        onDragStart={(event) => beginAssetDrag(asset, event)}
+                      >
+                        <label className="asset-select-check" onClick={(event) => event.stopPropagation()}>
+                          <input
+                            type="checkbox"
+                            checked={isSelected}
+                            onChange={() => toggleAssetSelection(asset.id)}
+                            aria-label={`Select ${asset.title}`}
+                          />
+                        </label>
+                        <img
+                          src={thumbnailUrlFor(asset)}
+                          alt=""
+                          onLoad={(event) => rememberDimensions(asset.id, event.currentTarget)}
+                          onError={(event) => fallbackToOriginalAssetImage(asset, event.currentTarget)}
+                        />
+                        <span>
+                          <strong>{asset.title}</strong>
+                          <small>
+                            {asset.format || 'Image'} · {dimensionsLabel(dimensions)} · {formatBytes(asset.sizeBytes)}
+                          </small>
+                        </span>
+                      </article>
+                    )
+                  }
+
+                  return (
+                    <button
+                      key={asset.id}
+                      type="button"
+                      className={selectedAsset?.id === asset.id ? 'asset-tile selected' : 'asset-tile'}
+                      draggable
+                      onClick={() => setSelectedAsset(asset)}
+                      onDoubleClick={() => void addAssetToCanvas(asset)}
+                      onDragStart={(event) => beginAssetDrag(asset, event)}
+                    >
+                      <img
+                        src={thumbnailUrlFor(asset)}
+                        alt=""
+                        onLoad={(event) => rememberDimensions(asset.id, event.currentTarget)}
+                        onError={(event) => fallbackToOriginalAssetImage(asset, event.currentTarget)}
+                      />
+                      <span>
+                        <strong>{asset.title}</strong>
+                        <small>
+                          {asset.format} · {dimensionsLabel(dimensions)} · {formatBytes(asset.sizeBytes)}
+                        </small>
+                      </span>
+                    </button>
+                  )
+                })}
                 {activeLoadState === 'ready' && filteredAssets.length === 0 ? (
                   <div className="asset-empty-state">
                     <Image size={18} />
                     <strong>
                       {activeAssetSource === 'eagle'
                         ? eagleStatus.connected
-                          ? 'No Eagle images found'
+                          ? selectedEagleTag
+                            ? `No assets indexed with ${selectedEagleTag}`
+                            : 'No Eagle images found'
                           : 'Eagle is offline'
                         : activeAssetSource === 'pinterest'
                           ? 'Pinterest preview'
@@ -547,7 +915,9 @@ export function LibraryWorkspace({ type, onOpenCanvas }: LibraryWorkspaceProps) 
                     </strong>
                     <span>
                       {activeAssetSource === 'eagle'
-                        ? eagleStatus.message || 'Open Eagle and keep its local API available.'
+                        ? selectedEagleTag
+                          ? 'Clear the tag or choose another category.'
+                          : eagleStatus.message || 'Open Eagle and keep its local API available.'
                         : activeAssetSource === 'pinterest'
                           ? 'Pinterest boards will appear here after the real connector is wired to Mivo account services.'
                           : localAssetRoot}
@@ -562,7 +932,7 @@ export function LibraryWorkspace({ type, onOpenCanvas }: LibraryWorkspaceProps) 
                   </div>
                 ) : null}
               </div>
-              {selectedAsset ? (
+              {selectedAsset && activeAssetSource !== 'eagle' ? (
                 <aside className="asset-detail-panel" aria-label="Asset details">
                   <div className="asset-detail-header">
                     <span className="library-kicker">{selectedAsset.sourceLabel}</span>
@@ -571,7 +941,11 @@ export function LibraryWorkspace({ type, onOpenCanvas }: LibraryWorkspaceProps) 
                     </button>
                   </div>
                   <div className="asset-detail-preview">
-                    <img src={thumbnailUrlFor(selectedAsset)} alt="" />
+                    <img
+                      src={thumbnailUrlFor(selectedAsset)}
+                      alt=""
+                      onError={(event) => fallbackToOriginalAssetImage(selectedAsset, event.currentTarget)}
+                    />
                   </div>
                   <div className="asset-detail-copy">
                     <h2>{selectedAsset.title}</h2>
@@ -605,14 +979,6 @@ export function LibraryWorkspace({ type, onOpenCanvas }: LibraryWorkspaceProps) 
                         </div>
                       ) : null}
                     </dl>
-                    {selectedAsset.tags?.length ? (
-                      <div className="asset-detail-tags" aria-label="Asset tags">
-                        <small>Tags: {selectedAsset.tags.slice(0, 10).join(', ')}</small>
-                        {selectedAsset.tags.slice(0, 10).map((tag) => (
-                          <span key={tag}>{tag}</span>
-                        ))}
-                      </div>
-                    ) : null}
                     <div className="asset-detail-actions">
                       <button type="button" className="primary" onClick={() => void addAssetToCanvas(selectedAsset)}>
                         <Image size={15} />
@@ -674,6 +1040,64 @@ export function LibraryWorkspace({ type, onOpenCanvas }: LibraryWorkspaceProps) 
           </section>
         </div>
       )}
+      {assetCardMenu && contextMenuAsset ? (
+        <div
+          className="asset-card-context-menu"
+          role="menu"
+          style={{ left: assetCardMenu.x, top: assetCardMenu.y }}
+          onPointerDown={(event) => event.stopPropagation()}
+        >
+          <button type="button" role="menuitem" onClick={() => copyOneAsset(contextMenuAsset)}>
+            <Copy size={14} />
+            Copy
+          </button>
+        </div>
+      ) : null}
+      {previewAsset ? (
+        <div
+          className="asset-lightbox-backdrop"
+          role="presentation"
+          onPointerDown={(event) => {
+            if (event.target === event.currentTarget) setPreviewAsset(undefined)
+          }}
+        >
+          <section className="asset-lightbox-panel" role="dialog" aria-modal="true" aria-label="Asset preview">
+            <button
+              type="button"
+              className="asset-lightbox-close"
+              aria-label="Close asset preview"
+              onClick={() => setPreviewAsset(undefined)}
+            >
+              <X size={18} />
+            </button>
+            <div className="asset-lightbox-image">
+              <img src={previewAsset.url || thumbnailUrlFor(previewAsset)} alt="" />
+            </div>
+            <div className="asset-lightbox-copy">
+              <span className="library-kicker">{previewAsset.sourceLabel}</span>
+              <h2>{previewAsset.title}</h2>
+              <p>
+                {previewAsset.format || 'Image'} · {dimensionsLabel(
+                  assetDimensions[previewAsset.id] ||
+                    (previewAsset.width && previewAsset.height
+                      ? { width: previewAsset.width, height: previewAsset.height }
+                      : undefined),
+                )} · {formatBytes(previewAsset.sizeBytes)}
+              </p>
+              <div className="asset-lightbox-actions">
+                <button type="button" className="primary" onClick={() => void addAssetToCanvas(previewAsset)}>
+                  <Image size={15} />
+                  Add to canvas
+                </button>
+                <button type="button" onClick={() => copyOneAsset(previewAsset)}>
+                  <Copy size={15} />
+                  Copy
+                </button>
+              </div>
+            </div>
+          </section>
+        </div>
+      ) : null}
       {pinterestSettingsOpen ? (
         <div className="source-settings-backdrop" role="presentation">
           <div className="source-settings-dialog" role="dialog" aria-modal="true" aria-label="Pinterest settings">

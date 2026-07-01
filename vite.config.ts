@@ -129,6 +129,13 @@ type EagleItem = {
   height?: number
 }
 
+type EagleTag = string | {
+  id?: string
+  name?: string
+  tag?: string
+  count?: number
+}
+
 const requestJson = async <T>(url: string, init?: RequestInit) => {
   const response = await fetch(url, init)
   if (!response.ok) throw new Error(`${response.status} ${response.statusText}`)
@@ -581,6 +588,27 @@ const localAssetLibraryPlugin = ({ imageApiKey }: { imageApiKey: string }): Plug
         return
       }
 
+      if (pathname === '/api/mivo/eagle/tags') {
+        try {
+          const tags = await eagleApi<EagleTag[]>('/api/tag/list')
+          const normalizedTags = tags.flatMap((tag) => {
+            const name = typeof tag === 'string' ? tag : tag.name || tag.tag || tag.id || ''
+            if (!name.trim()) return []
+            return {
+              id: typeof tag === 'string' ? name : tag.id || name,
+              name,
+              ...(typeof tag === 'string' || tag.count === undefined ? {} : { count: tag.count }),
+            }
+          })
+          response.setHeader('Content-Type', 'application/json; charset=utf-8')
+          response.end(JSON.stringify({ tags: normalizedTags }))
+        } catch (error) {
+          response.statusCode = 502
+          response.end(error instanceof Error ? error.message : 'Unable to read Eagle tags')
+        }
+        return
+      }
+
       if (pathname.startsWith('/api/mivo/eagle/assets/') && pathname.endsWith('/thumbnail')) {
         try {
           const itemId = decodeURIComponent(
@@ -621,11 +649,11 @@ const localAssetLibraryPlugin = ({ imageApiKey }: { imageApiKey: string }): Plug
           const limit = requestUrl.searchParams.get('limit') || '80'
           const offset = requestUrl.searchParams.get('offset') || '0'
           const folderId = requestUrl.searchParams.get('folderId') || ''
-          const keyword = requestUrl.searchParams.get('q') || ''
+          const tag = requestUrl.searchParams.get('tag') || requestUrl.searchParams.get('tags') || ''
           const params = new URLSearchParams({ limit, offset })
 
           if (folderId) params.set('folderId', folderId)
-          if (keyword) params.set('keyword', keyword)
+          if (tag) params.set('tags', tag)
 
           const items = await eagleApi<EagleItem[]>('/api/item/list', params)
           const assets = items

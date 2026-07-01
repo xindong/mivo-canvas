@@ -298,6 +298,7 @@ export function useCanvasInteractionController({
   const moveSelectedLayer = useCanvasStore((state) => state.moveSelectedLayer)
   const copySelectedNodes = useCanvasStore((state) => state.copySelectedNodes)
   const pasteClipboardNodes = useCanvasStore((state) => state.pasteClipboardNodes)
+  const pasteClipboardAssets = useCanvasStore((state) => state.pasteClipboardAssets)
   const deleteSelectedNodes = useCanvasStore((state) => state.deleteSelectedNodes)
   const duplicateSelectedNodes = useCanvasStore((state) => state.duplicateSelectedNodes)
   const addImportedImage = useCanvasStore((state) => state.addImportedImage)
@@ -1379,6 +1380,12 @@ export function useCanvasInteractionController({
     const handlePaste = async (event: ClipboardEvent) => {
       if (isEditingTarget(event.target)) return
 
+      if (useCanvasStore.getState().clipboardAssets.length) {
+        event.preventDefault()
+        pasteClipboardAssets(viewportCenter())
+        return
+      }
+
       const items = Array.from(event.clipboardData?.items || [])
       const imageItem = items.find((item) => item.type.startsWith('image/'))
 
@@ -1431,6 +1438,7 @@ export function useCanvasInteractionController({
     onCancelMaskEdit,
     onCloseContextMenu,
     pasteClipboardNodes,
+    pasteClipboardAssets,
     redo,
     resetView,
     selectNode,
