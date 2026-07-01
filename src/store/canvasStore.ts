@@ -35,6 +35,7 @@ import { mockGenerationAdapter } from './mockGeneration'
 type LayerMove = 'forward' | 'backward' | 'front' | 'back'
 export type SelectionAlignment = 'left' | 'center' | 'right' | 'top' | 'middle' | 'bottom'
 export type DistributionAxis = 'horizontal' | 'vertical'
+export type SelectionArrangeMode = 'row' | 'column' | 'grid' | 'tidy'
 
 type CanvasState = {
   canvases: Record<CanvasId, CanvasDocument>
@@ -80,6 +81,7 @@ type CanvasState = {
   showAllHiddenNodes: () => void
   alignSelectedNodes: (alignment: SelectionAlignment) => void
   distributeSelectedNodes: (axis: DistributionAxis) => void
+  arrangeSelectedNodes: (mode: SelectionArrangeMode) => void
   copySelectedNodes: () => void
   pasteClipboardNodes: (position?: { x: number; y: number }) => void
   addImportedImage: (
@@ -588,6 +590,139 @@ const selectedNodesFromState = (state: CanvasState) => {
 }
 
 const selectedIdsFromState = (state: CanvasState) => selectedNodesFromState(state).map((node) => node.id)
+
+const arrangeSelectionSpacing = 32
+
+const visualRowOrder = (nodes: MivoCanvasNode[]) =>
+  [...nodes].sort((a, b) => a.y - b.y || a.x - b.x)
+
+const arrangedSubjectNodesFrom = (nodes: MivoCanvasNode[], selectedNodes: MivoCanvasNode[]) => {
+  const selectedSectionIds = new Set(selectedNodes.filter(isSectionNode).map((node) => node.id))
+
+  return selectedNodes.filter(
+    (node) =>
+      !isConnectorNode(node) &&
+      !isEffectivelyLocked(nodes, node) &&
+      !(node.sectionId && selectedSectionIds.has(node.sectionId)),
+  )
+}
+
+const boundsForNodes = (nodes: MivoCanvasNode[]) => {
+  const minX = Math.min(...nodes.map((node) => node.x))
+  const maxX = Math.max(...nodes.map((node) => node.x + node.width))
+  const minY = Math.min(...nodes.map((node) => node.y))
+  const maxY = Math.max(...nodes.map((node) => node.y + node.height))
+
+  return {
+    minX,
+    maxX,
+    minY,
+    maxY,
+    width: maxX - minX,
+    height: maxY - minY,
+  }
+}
+
+const resolvedArrangeModeFor = (mode: SelectionArrangeMode, nodes: MivoCanvasNode[]) => {
+  if (mode !== 'tidy') return mode
+  if (nodes.length <= 2) {
+    const bounds = boundsForNodes(nodes)
+    return bounds.width >= bounds.height ? 'row' : 'column'
+  }
+
+  const bounds = boundsForNodes(nodes)
+  if (bounds.width > bounds.height * 1.8) return 'row'
+  if (bounds.height > bounds.width * 1.8) return 'column'
+  return 'grid'
+}
+
+const gridColumnCountFor = (count: number, bounds: ReturnType<typeof boundsForNodes>) => {
+  const aspect = Math.max(0.45, Math.min(2.8, bounds.width / Math.max(bounds.height, 1)))
+  return Math.max(2, Math.min(count, Math.round(Math.sqrt(count * aspect))))
+}
+
+const arrangedPositionsFor = (
+  nodes: MivoCanvasNode[],
+  requestedMode: SelectionArrangeMode,
+): Map<string, { x: number; y: number }> => {
+  const positions = new Map<string, { x: number; y: number }>()
+  if (nodes.length < 2) return positions
+
+  const bounds = boundsForNodes(nodes)
+  const mode = resolvedArrangeModeFor(requestedMode, nodes)
+
+  if (mode === 'row') {
+    let cursorX = bounds.minX
+    const centerY = bounds.minY + bounds.height / 2
+
+    ;[...nodes]
+      .sort((a, b) => a.x - b.x || a.y - b.y)
+      .forEach((node) => {
+        positions.set(node.id, {
+          x: Math.round(cursorX),
+          y: Math.round(centerY - node.height / 2),
+        })
+        cursorX += node.width + arrangeSelectionSpacing
+      })
+
+    return positions
+  }
+
+  if (mode === 'column') {
+    let cursorY = bounds.minY
+    const centerX = bounds.minX + bounds.width / 2
+
+    ;[...nodes]
+      .sort((a, b) => a.y - b.y || a.x - b.x)
+      .forEach((node) => {
+        positions.set(node.id, {
+          x: Math.round(centerX - node.width / 2),
+          y: Math.round(cursorY),
+        })
+        cursorY += node.height + arrangeSelectionSpacing
+      })
+
+    return positions
+  }
+
+  const sorted = visualRowOrder(nodes)
+  const columnCount = gridColumnCountFor(sorted.length, bounds)
+  const rows: MivoCanvasNode[][] = []
+  sorted.forEach((node, index) => {
+    const rowIndex = Math.floor(index / columnCount)
+    rows[rowIndex] = rows[rowIndex] || []
+    rows[rowIndex].push(node)
+  })
+
+  const columnWidths = Array.from({ length: columnCount }, (_, columnIndex) =>
+    Math.max(...rows.map((row) => row[columnIndex]?.width || 0)),
+  )
+  const rowHeights = rows.map((row) => Math.max(...row.map((node) => node.height)))
+  const columnXs: number[] = []
+  const rowYs: number[] = []
+  let cursorX = bounds.minX
+  let cursorY = bounds.minY
+
+  columnWidths.forEach((width, index) => {
+    columnXs[index] = cursorX
+    cursorX += width + arrangeSelectionSpacing
+  })
+  rowHeights.forEach((height, index) => {
+    rowYs[index] = cursorY
+    cursorY += height + arrangeSelectionSpacing
+  })
+
+  rows.forEach((row, rowIndex) => {
+    row.forEach((node, columnIndex) => {
+      positions.set(node.id, {
+        x: Math.round(columnXs[columnIndex] + (columnWidths[columnIndex] - node.width) / 2),
+        y: Math.round(rowYs[rowIndex] + (rowHeights[rowIndex] - node.height) / 2),
+      })
+    })
+  })
+
+  return positions
+}
 
 const migratePersistedState = (persistedState: unknown, persistedVersion = 0) => {
   const persisted = (persistedState || {}) as PersistedCanvasState
@@ -1266,6 +1401,57 @@ export const useCanvasStore = create<CanvasState>()(
             if (position === undefined || node.locked) return node
             return axis === 'horizontal' ? { ...node, x: position } : { ...node, y: position }
           })
+
+          return patchWithHistory(state, { nodes, selectedNodeId: state.selectedNodeId, selectedNodeIds: state.selectedNodeIds })
+        }),
+      arrangeSelectedNodes: (mode) =>
+        set((state) => {
+          const selectedNodes = selectedNodesFromState(state)
+          const subjectNodes = arrangedSubjectNodesFrom(state.nodes, selectedNodes)
+          if (subjectNodes.length < 2) return {}
+
+          const positions = arrangedPositionsFor(subjectNodes, mode)
+          if (!positions.size) return {}
+
+          const sectionDeltas = new Map<string, { dx: number; dy: number }>()
+
+          subjectNodes.forEach((node) => {
+            const position = positions.get(node.id)
+            if (!position || !isSectionNode(node)) return
+
+            sectionDeltas.set(node.id, {
+              dx: Math.round(position.x - node.x),
+              dy: Math.round(position.y - node.y),
+            })
+          })
+
+          let changed = false
+          const nodes = normalizeCanvasNodes(
+            state.nodes.map((node) => {
+              const position = positions.get(node.id)
+              if (position) {
+                if (node.x !== position.x || node.y !== position.y) changed = true
+                return {
+                  ...node,
+                  x: position.x,
+                  y: position.y,
+                }
+              }
+
+              const sectionDelta = node.sectionId ? sectionDeltas.get(node.sectionId) : undefined
+              if (!sectionDelta || isEffectivelyLocked(state.nodes, node)) return node
+              if (!sectionDelta.dx && !sectionDelta.dy) return node
+
+              changed = true
+              return {
+                ...node,
+                x: Math.round(node.x + sectionDelta.dx),
+                y: Math.round(node.y + sectionDelta.dy),
+              }
+            }),
+          )
+
+          if (!changed) return {}
 
           return patchWithHistory(state, { nodes, selectedNodeId: state.selectedNodeId, selectedNodeIds: state.selectedNodeIds })
         }),
