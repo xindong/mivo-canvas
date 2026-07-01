@@ -23,3 +23,30 @@ test-artifacts
 *.njsproj
 *.sln
 *.sw?
+
+# === ECC additions (new-project skill, 2026-07-01) ===
+# Sensitive — never commit
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.token.json
+.auth.json
+credentials/
+secrets/
+
+# ECC session data — not tracked
+history/checkpoints/
+history/daily/
+.claude/
+
+# macOS / iCloud placeholders
+*.icloud
+._*
+
+# Additional build artifacts
+build/
+coverage/
+.cache/
+.turbo/

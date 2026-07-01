@@ -1,0 +1,91 @@
+# MivoCanvas
+
+> 创建日期：2026-07-01
+> 技术栈：node（TypeScript + Vite + React + LeaferJS + Zustand）
+> 来源：完整克隆自 github.com/kirozeng/MivoCanvas（保留全部 commit 历史，origin 指向 upstream）
+
+## 项目目标
+
+桌面式 AI 艺术画布交互 Demo（Vite+React+TS+LeaferJS+Zustand），无限画布+FigJam 风格标注+AI 图像生成工作流。
+
+## 技术栈
+
+- **主语言**：TypeScript（node）
+- **框架/库**：
+  - React 19 + react-dom
+  - LeaferJS 2.1（leafer-ui + @leafer-in/editor + @leafer-in/view）— 画布渲染引擎
+  - Zustand 5 — 本地状态持久化
+  - react-markdown + remark-gfm — Markdown 节点渲染
+  - lucide-react — 图标
+- **运行环境**：Vite 8（dev/build）、Node.js、浏览器
+- **测试**：Playwright（e2e smoke）
+
+## 目录约定
+
+```
+Project MivoCanvas/
+├── CLAUDE.md           # 本文件 — 项目指引
+├── VERSIONING.md       # 版本管理规范
+├── README.md           # 源仓产品说明（产品方向笔记，勿覆盖）
+├── .gitignore          # Git 忽略规则（Vite 默认 + ECC 规则合并）
+├── src/                # 源代码
+├── docs/               # 文档（含 figjam-quickbar-study 等）
+├── public/             # 静态资源
+├── scripts/            # 脚本（e2e-smoke.mjs 等）
+├── config/             # 配置（不含 .env）— 按需新建
+├── data/               # 数据文件（大数据用 Git LFS 或外置存储）— 按需新建
+└── history/            # ECC 会话数据（不入 git）
+    ├── checkpoints/
+    └── daily/
+```
+
+> 注：src/docs/public/scripts 为源仓既有结构，按源仓约定维护。新增文件遵循 `~/.claude/rules-lib/project-structure.md` 分类。
+
+## 协作约定
+
+- **AI 助手**：Claude Code（主），其他 provider 通过 `/ask` 调用
+- **代码评审**：通过 `/review` 触发
+- **测试覆盖**：参见 VERSIONING.md
+
+## 代码规范
+
+- 遵循 `~/.claude/rules/node/` 下的语言规范（项目为 node/TS）
+- 全局规范：`~/.claude/rules/common/`
+- 项目特定 invariants：本节后续追加
+
+## 敏感数据保护
+
+**绝不入 git 的内容**：
+- `.env`、`*.key`、`*.pem`、`credentials/`、`*.token.json`、`.auth.json`
+- 任何含 API key / OAuth token / 密码的文件
+- 用户个人信息（PII）
+
+`.gitignore` 已配置基础排除（含 ECC 规则）。新增敏感文件类型时同步更新。
+
+## 测试与守卫
+
+- **开发**：`npm run dev`（Vite dev server）
+- **构建**：`npm run build`（`tsc -b && vite build`，含类型检查）
+- **Lint**：`npm run lint`（eslint .）
+- **预览**：`npm run preview`
+- **E2E**：`npm run test:e2e`（`node scripts/e2e-smoke.mjs`，Playwright）
+- **本地资源目录**：默认读 `~/Desktop/Images`，可用 `MIVO_ASSET_DIR=/path npm run dev` 覆盖
+- **Eagle 接入**：默认 `http://127.0.0.1:41595`，可用 `MIVO_EAGLE_API_URL` 覆盖
+
+## 版本管理
+
+详见 `VERSIONING.md`。
+
+**核心约定**：
+- 提交触发：手动喊"提交代码"/"commit" → `commit-projects` skill
+- 分支策略：`main` 为主分支
+- Push 策略：日常本地优先；本项目 origin 指向 upstream（kirozeng/MivoCanvas），**不可直接 push**。如需推送个人改动，请先 fork 到 PraiseZhu 或新建 remote。
+
+---
+
+## 项目特定记录
+
+- **来源**：2026-07-01 完整克隆自 github.com/kirozeng/MivoCanvas（5 commits，main 分支）。源仓无 license，仅供本地学习/二次开发，勿公开再发布。
+- **脚手架**：CLAUDE.md / VERSIONING.md / .gitignore（ECC 合并）/ history/ / pre-commit hook 由 `new-project` skill 于克隆后叠加，作为独立 commit 入库。
+
+（在此追加项目的具体决策、踩坑、TODO）
