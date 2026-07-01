@@ -11,6 +11,7 @@ import { Leafer } from 'leafer-ui'
 import '@leafer-in/view'
 import { LocateFixed, Minus, Plus, RotateCcw } from 'lucide-react'
 import { downloadCanvasNodeOriginal } from '../lib/assetDownload'
+import { canReadLocalAssetDrag, parseLocalAssetDragPayload } from '../lib/canvasAssetDrag'
 import { canImportCanvasFile, importFilesToCanvas, importImageUrlToCanvas } from '../lib/canvasAssetImport'
 import { readCanvasImageBlob } from '../lib/canvasImageSource'
 import { editMivoImage } from '../lib/mivoImageClient'
@@ -40,8 +41,11 @@ type ContextMenuState = {
 type MivoCanvasProps = {
   onOpenDetails?: () => void
   onOpenGeneratePanel?: () => void
+  onRegisterExternalAssetDrop?: (handler?: ExternalAssetDropHandler) => void
   maskCancelRequestId?: number
 }
+
+export type ExternalAssetDropHandler = (dataTransfer: DataTransfer, clientX: number, clientY: number) => boolean
 
 const contextMenuWidth = 252
 const contextMenuMaxHeight = 620
@@ -66,13 +70,6 @@ const isCanvasChromeTarget = (target: EventTarget | null) =>
     ),
   )
 
-const localAssetDragType = 'application/x-mivo-local-asset'
-
-type LocalAssetDragPayload = {
-  name: string
-  url: string
-}
-
 const canvasRenderOverscanPx = 520
 
 const supportedMivoRatios: Array<{ id: MivoImageRatio; value: number }> = [
@@ -95,23 +92,10 @@ const rectsIntersect = (
   b: { x: number; y: number; width: number; height: number },
 ) => a.x + a.width >= b.x && b.x + b.width >= a.x && a.y + a.height >= b.y && b.y + b.height >= a.y
 
-const parseLocalAssetDragPayload = (dataTransfer: DataTransfer) => {
-  const rawPayload = dataTransfer.getData(localAssetDragType)
-  if (!rawPayload) return undefined
-
-  try {
-    const payload = JSON.parse(rawPayload) as Partial<LocalAssetDragPayload>
-    if (!payload.name || !payload.url) return undefined
-    return { name: payload.name, url: payload.url }
-  } catch {
-    return undefined
-  }
-}
-
 const canImportDataTransfer = (dataTransfer: DataTransfer) =>
   Array.from(dataTransfer.files).some(canImportCanvasFile) ||
   dataTransfer.types.includes('Files') ||
-  dataTransfer.types.includes(localAssetDragType)
+  canReadLocalAssetDrag(dataTransfer)
 
 const isNodeEffectivelyLocked = (nodeId: string, nodes: Array<{ id: string; type: string; sectionId?: string; locked?: boolean; sectionLockMode?: string }>) => {
   const node = nodes.find((item) => item.id === nodeId)
@@ -121,7 +105,12 @@ const isNodeEffectivelyLocked = (nodeId: string, nodes: Array<{ id: string; type
   return Boolean(node.locked || section?.sectionLockMode === 'all')
 }
 
-export function MivoCanvas({ onOpenDetails, onOpenGeneratePanel, maskCancelRequestId = 0 }: MivoCanvasProps) {
+export function MivoCanvas({
+  onOpenDetails,
+  onOpenGeneratePanel,
+  onRegisterExternalAssetDrop,
+  maskCancelRequestId = 0,
+}: MivoCanvasProps) {
   const shellRef = useRef<HTMLElement | null>(null)
   const hostRef = useRef<HTMLDivElement | null>(null)
   const leaferRef = useRef<Leafer | null>(null)
@@ -407,6 +396,17 @@ export function MivoCanvas({ onOpenDetails, onOpenGeneratePanel, maskCancelReque
     [addImportedFileNode],
   )
 
+  const importLocalAssetAtClientPoint = useCallback(
+    (dataTransfer: DataTransfer, clientX: number, clientY: number) => {
+      const payload = parseLocalAssetDragPayload(dataTransfer)
+      if (!payload) return false
+
+      void importImageUrlToCanvas(payload.url, payload.name, screenToCanvasPoint(clientX, clientY), addImportedImage)
+      return true
+    },
+    [addImportedImage, screenToCanvasPoint],
+  )
+
   const handleCanvasDragOver = useCallback((event: ReactDragEvent<HTMLElement>) => {
     if (!canImportDataTransfer(event.dataTransfer)) return
     if (isCanvasChromeTarget(event.target)) return
@@ -431,12 +431,15 @@ export function MivoCanvas({ onOpenDetails, onOpenGeneratePanel, maskCancelReque
       }
 
       const payload = parseLocalAssetDragPayload(event.dataTransfer)
-      if (payload) {
-        void importImageUrlToCanvas(payload.url, payload.name, position, addImportedImage)
-      }
+      if (payload) void importImageUrlToCanvas(payload.url, payload.name, position, addImportedImage)
     },
     [addImportedFileNode, addImportedImage, screenToCanvasPoint],
   )
+
+  useEffect(() => {
+    onRegisterExternalAssetDrop?.(importLocalAssetAtClientPoint)
+    return () => onRegisterExternalAssetDrop?.(undefined)
+  }, [importLocalAssetAtClientPoint, onRegisterExternalAssetDrop])
 
   useEffect(() => {
     if (lastMaskCancelRequestIdRef.current === maskCancelRequestId) return

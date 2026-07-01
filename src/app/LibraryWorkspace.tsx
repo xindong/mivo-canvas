@@ -24,6 +24,7 @@ import {
   X,
 } from 'lucide-react'
 import { importImageUrlToCanvas } from '../lib/canvasAssetImport'
+import { writeLocalAssetDragPayload } from '../lib/canvasAssetDrag'
 import { useCanvasStore } from '../store/canvasStore'
 import {
   assetMatchesQuery,
@@ -49,8 +50,6 @@ type LibraryWorkspaceProps = {
   variant?: 'workspace' | 'canvas-drawer'
   onOpenCanvas?: () => void
 }
-
-const localAssetDragType = 'application/x-mivo-local-asset'
 
 const localAssetFromApi = (asset: LocalAssetResponse['assets'][number]): AssetItem => ({
   ...asset,
@@ -549,7 +548,7 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
   }, [])
 
   const beginAssetDrag = useCallback((asset: AssetItem, event: ReactDragEvent<HTMLElement>) => {
-    const payload = JSON.stringify({
+    writeLocalAssetDragPayload(event.dataTransfer, {
       id: asset.id,
       name: asset.name,
       title: asset.title,
@@ -559,10 +558,6 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
       width: asset.width,
       height: asset.height,
     })
-
-    event.dataTransfer.effectAllowed = 'copy'
-    event.dataTransfer.setData(localAssetDragType, payload)
-    event.dataTransfer.setData('text/plain', asset.name)
   }, [])
 
   const toggleEagleTag = useCallback(

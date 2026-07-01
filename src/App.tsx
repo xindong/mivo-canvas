@@ -1,12 +1,13 @@
 import './App.css'
-import { useCallback } from 'react'
+import { useCallback, type DragEvent as ReactDragEvent } from 'react'
 import { useEffect } from 'react'
 import { useRef } from 'react'
 import { useState } from 'react'
 import { AIToolPanel } from './app/AIToolPanel'
 import { LibraryWorkspace } from './app/LibraryWorkspace'
-import { MivoCanvas } from './canvas/MivoCanvas'
+import { MivoCanvas, type ExternalAssetDropHandler } from './canvas/MivoCanvas'
 import { InspectorPanel } from './app/InspectorPanel'
+import { canReadLocalAssetDrag } from './lib/canvasAssetDrag'
 import { ProjectSidebar } from './app/ProjectSidebar'
 import { ProjectSidebarControls } from './app/ProjectSidebarControls'
 import { TaskQueue } from './app/TaskQueue'
@@ -30,6 +31,7 @@ function App() {
   const [detailsSceneId, setDetailsSceneId] = useState<string>()
   const [maskCancelRequestId, setMaskCancelRequestId] = useState(0)
   const projectSidebarTimerRef = useRef<number | undefined>(undefined)
+  const externalAssetDropRef = useRef<ExternalAssetDropHandler | undefined>(undefined)
   const isCanvasWorkspace = workspaceView === 'canvas' || workspaceView === 'assets'
   const detailsOpen = isCanvasWorkspace && detailsSceneId === sceneId
   const projectSidebarOpen = projectSidebarState === 'open' || projectSidebarState === 'pinning'
@@ -54,6 +56,31 @@ function App() {
     setMaskCancelRequestId((id) => id + 1)
     setAiPanelOpen(false)
     setWorkspaceView('assets')
+  }, [])
+
+  const registerExternalAssetDrop = useCallback((handler?: ExternalAssetDropHandler) => {
+    externalAssetDropRef.current = handler
+  }, [])
+
+  const handleAssetDrawerDragOver = useCallback((event: ReactDragEvent<HTMLDivElement>) => {
+    if (!canReadLocalAssetDrag(event.dataTransfer)) return
+
+    event.preventDefault()
+    event.dataTransfer.dropEffect = 'copy'
+  }, [])
+
+  const handleAssetDrawerDrop = useCallback((event: ReactDragEvent<HTMLDivElement>) => {
+    if (!canReadLocalAssetDrag(event.dataTransfer)) return
+
+    event.preventDefault()
+    event.stopPropagation()
+
+    const target = event.target instanceof Element ? event.target : null
+    if (target?.closest('.asset-library-drawer')) return
+
+    if (externalAssetDropRef.current?.(event.dataTransfer, event.clientX, event.clientY)) {
+      setWorkspaceView('canvas')
+    }
   }, [])
 
   const openProjectSidebar = useCallback(() => {
@@ -172,6 +199,7 @@ function App() {
               key={sceneId}
               onOpenDetails={() => setDetailsSceneId(sceneId)}
               onOpenGeneratePanel={openGeneratePanel}
+              onRegisterExternalAssetDrop={registerExternalAssetDrop}
               maskCancelRequestId={maskCancelRequestId}
             />
             <AIToolPanel
@@ -184,6 +212,8 @@ function App() {
                 className="asset-library-drawer-backdrop"
                 data-canvas-ui="true"
                 role="presentation"
+                onDragOver={handleAssetDrawerDragOver}
+                onDrop={handleAssetDrawerDrop}
                 onPointerDown={(event) => {
                   if (event.target === event.currentTarget) setWorkspaceView('canvas')
                 }}

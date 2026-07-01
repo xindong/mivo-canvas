@@ -4082,6 +4082,13 @@ button:disabled {
   pointer-events: auto;
 }
 
+.image-mask-edit-floating-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 74;
+  pointer-events: none;
+}
+
 .image-mask-edit-stage svg {
   display: block;
   overflow: visible;
@@ -4113,7 +4120,7 @@ button:disabled {
 .image-mask-edit-toolbar,
 .image-mask-edit-prompt {
   position: absolute;
-  z-index: 2;
+  z-index: 1;
   pointer-events: auto;
   background: rgba(255, 253, 248, 0.96);
   border: 1px solid var(--line);
@@ -4123,9 +4130,6 @@ button:disabled {
 }
 
 .image-mask-edit-toolbar {
-  top: 10px;
-  left: 10px;
-  right: 10px;
   display: grid;
   gap: 8px;
   padding: 8px;
@@ -4191,9 +4195,6 @@ button:disabled {
 }
 
 .image-mask-edit-prompt {
-  right: 10px;
-  bottom: 10px;
-  left: 10px;
   display: grid;
   gap: 8px;
   padding: 9px;
