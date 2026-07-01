@@ -1,4 +1,4 @@
-.mivo-app {
+:root {
   --ink: #232323;
   --muted: #756f67;
   --quiet: #a1998d;
@@ -21,12 +21,15 @@
   --radius-md: 8px;
   --radius-lg: 16px;
   --radius-pill: 999px;
+  --shadow: 0 18px 48px rgba(35, 35, 35, 0.12);
+}
+
+.mivo-app {
   --project-w: 240px;
   --ai-panel-w: 340px;
   --ai-panel-collapsed-w: 58px;
   --ai-panel-offset: 12px;
   --floating-gap: 14px;
-  --shadow: 0 18px 48px rgba(35, 35, 35, 0.12);
   display: grid;
   grid-template-columns: var(--project-w) minmax(0, 1fr);
   width: 100vw;
@@ -167,6 +170,7 @@ button:disabled {
 .sidebar-header,
 .sidebar-brand,
 .section-heading,
+.debug-log-row,
 .settings-row,
 .nav-row,
 .project-row,
@@ -216,6 +220,7 @@ button:disabled {
 .library-row small,
 .library-row em,
 .review-row span,
+.debug-log-row span,
 .settings-row span {
   display: block;
   overflow: hidden;
@@ -394,6 +399,7 @@ button:disabled {
 .nav-row,
 .project-row,
 .review-row,
+.debug-log-row,
 .settings-row {
   width: 100%;
   min-width: 0;
@@ -473,6 +479,7 @@ button:disabled {
 .nav-row:hover,
 .project-row:hover,
 .review-row:hover,
+.debug-log-row:hover,
 .settings-row:hover {
   color: var(--ink);
   background: rgba(35, 35, 35, 0.06);
@@ -650,6 +657,7 @@ button:disabled {
   padding-top: 2px;
 }
 
+.debug-log-row,
 .settings-row {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
@@ -662,6 +670,245 @@ button:disabled {
   position: relative;
   display: grid;
   gap: 8px;
+}
+
+.debug-log-area {
+  display: grid;
+  gap: 8px;
+}
+
+.debug-log-badges {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  justify-self: end;
+  min-width: 0;
+  gap: 5px;
+  overflow: visible;
+  white-space: nowrap;
+}
+
+.debug-log-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  color: #fff;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 850;
+  line-height: 18px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  overflow: visible;
+}
+
+.debug-log-badge.warning {
+  color: #fff;
+  background: #c78217;
+}
+
+.debug-log-badge.error {
+  background: #bf3b2f;
+}
+
+.debug-log-row .debug-log-badges {
+  display: inline-flex;
+  overflow: visible;
+}
+
+.debug-log-row .debug-log-badge {
+  display: inline-flex;
+  overflow: visible;
+}
+
+.debug-log-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 85;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(35, 35, 35, 0.28);
+}
+
+.debug-log-panel {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 12px;
+  width: min(760px, calc(100vw - 48px));
+  height: min(560px, calc(100vh - 48px));
+  padding: 14px;
+  color: var(--muted);
+  background: rgba(255, 250, 240, 0.94);
+  border: 1px solid rgba(35, 35, 35, 0.1);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 24px 64px rgba(35, 35, 35, 0.22);
+  backdrop-filter: blur(18px) saturate(1.08);
+  animation: debug-log-dialog-in 160ms cubic-bezier(0.22, 1, 0.36, 1);
+  transform-origin: center;
+}
+
+.debug-log-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.debug-log-header div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.debug-log-header strong,
+.debug-log-header span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.debug-log-header strong {
+  color: var(--ink);
+  font-size: var(--text-lg);
+  line-height: 1.1;
+}
+
+.debug-log-header span {
+  color: var(--quiet);
+  font-size: var(--text-xs);
+}
+
+.debug-log-header button {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  color: var(--muted);
+  background: rgba(35, 35, 35, 0.05);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+}
+
+.debug-log-header button:hover {
+  color: var(--ink);
+  background: rgba(35, 35, 35, 0.09);
+}
+
+.debug-log-toolbar {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, auto)) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.debug-log-toolbar button {
+  min-width: 0;
+  height: 25px;
+  padding: 0 6px;
+  color: var(--muted);
+  background: rgba(35, 35, 35, 0.04);
+  border: 1px solid rgba(35, 35, 35, 0.07);
+  border-radius: var(--radius-md);
+  font-size: 10px;
+  font-weight: 760;
+  letter-spacing: 0;
+  cursor: pointer;
+}
+
+.debug-log-toolbar button:hover,
+.debug-log-toolbar button.active {
+  color: var(--ink);
+  background: rgba(255, 250, 240, 0.94);
+  border-color: rgba(35, 35, 35, 0.16);
+}
+
+.debug-log-toolbar .debug-log-clear {
+  grid-column: 6;
+}
+
+.debug-log-list {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  overflow: auto;
+  list-style: none;
+  user-select: text;
+}
+
+.debug-log-entry {
+  display: grid;
+  grid-template-columns: 54px 72px minmax(92px, 0.28fr) minmax(0, 1fr);
+  align-items: baseline;
+  gap: 9px;
+  min-width: 0;
+  padding: 8px 9px;
+  background: rgba(255, 250, 240, 0.7);
+  border-left: 3px solid rgba(35, 35, 35, 0.18);
+  border-radius: var(--radius-md);
+  font-size: 11px;
+  user-select: text;
+}
+
+.debug-log-entry.warning {
+  border-left-color: #c78217;
+}
+
+.debug-log-entry.error {
+  border-left-color: #bf3b2f;
+}
+
+.debug-log-level,
+.debug-log-source,
+.debug-log-message,
+.debug-log-entry time,
+.debug-log-empty {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.debug-log-level {
+  color: var(--quiet);
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.debug-log-entry.warning .debug-log-level {
+  color: #9f620d;
+}
+
+.debug-log-entry.error .debug-log-level {
+  color: #a7352c;
+}
+
+.debug-log-entry time,
+.debug-log-source {
+  color: var(--quiet);
+}
+
+.debug-log-message {
+  color: var(--ink);
+  font-size: var(--text-sm);
+  white-space: normal;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.debug-log-empty {
+  margin: 0;
+  padding: 22px 6px;
+  color: var(--quiet);
+  font-size: 11px;
+  text-align: center;
 }
 
 .settings-menu {
@@ -724,6 +971,18 @@ button:disabled {
   to {
     opacity: 1;
     transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes debug-log-dialog-in {
+  from {
+    opacity: 0;
+    transform: scale(0.98);
+  }
+
+  to {
+    opacity: 1;
+    transform: scale(1);
   }
 }
 

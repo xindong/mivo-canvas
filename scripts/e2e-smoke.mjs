@@ -116,6 +116,27 @@ await new Promise((resolve) => eagleMockServer.listen(0, '127.0.0.1', resolve))
 const eagleMockAddress = eagleMockServer.address()
 const eagleMockPort = typeof eagleMockAddress === 'object' && eagleMockAddress ? eagleMockAddress.port : 41895
 
+const runCommand = (command, args) =>
+  new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    let output = ''
+
+    child.stdout.on('data', (chunk) => {
+      output += chunk
+    })
+    child.stderr.on('data', (chunk) => {
+      output += chunk
+    })
+    child.on('close', (code) => {
+      if (code === 0) {
+        resolve(output)
+        return
+      }
+
+      reject(new Error(`${command} ${args.join(' ')} failed with ${code}\n${output}`))
+    })
+  })
+
 const server = spawn(
   'npm',
   ['run', 'dev', '--', '--host', '127.0.0.1', '--port', String(port), '--strictPort'],
@@ -131,6 +152,7 @@ const server = spawn(
 
 try {
   await mkdir('test-artifacts', { recursive: true })
+  await runCommand('npm', ['run', 'verify:logging'])
   const [nodeRegistrySource, actionModelSource] = await Promise.all([
     readFile('src/canvas/nodeTypes/canvasNodeRegistry.ts', 'utf8'),
     readFile('src/canvas/actions/canvasActionModel.ts', 'utf8'),
@@ -164,7 +186,7 @@ try {
   const { readFloatingChrome, readLibraryLayout, readLibrarySurfaceColors } = createPageReaders(page)
 
   page.on('console', (message) => {
-    if (message.type() === 'error') errors.push(message.text())
+    if (message.type() === 'error' && !message.text().includes('__MIVO_E2E_EXPECTED_ERROR__')) errors.push(message.text())
   })
 
   await page.addInitScript(() => window.localStorage.clear())
@@ -338,6 +360,191 @@ try {
     throw new Error('Back/forward controls should be removed from the workspace chrome')
   }
 
+  const debugLogButton = page.getByRole('button', { name: 'Debug Log', exact: true })
+  if ((await debugLogButton.count()) !== 1) {
+    throw new Error('Project sidebar should expose one Debug Log button above Settings')
+  }
+  const debugLogPlacement = await page.evaluate(() => {
+    const debugLog = document.querySelector('[aria-label="Debug Log"]')?.getBoundingClientRect()
+    const settings = document.querySelector('[aria-label="Settings"]')?.getBoundingClientRect()
+
+    return {
+      debugBottom: debugLog?.bottom,
+      settingsTop: settings?.top,
+    }
+  })
+  if (
+    typeof debugLogPlacement.debugBottom !== 'number' ||
+    typeof debugLogPlacement.settingsTop !== 'number' ||
+    debugLogPlacement.debugBottom > debugLogPlacement.settingsTop
+  ) {
+    throw new Error(`Debug Log should sit directly above Settings: ${JSON.stringify(debugLogPlacement)}`)
+  }
+  const initialDebugBadges = await debugLogButton.evaluate((button) => ({
+    warnings: button.querySelectorAll('.debug-log-badge.warning').length,
+    errors: button.querySelectorAll('.debug-log-badge.error').length,
+  }))
+  if (initialDebugBadges.warnings !== 0 || initialDebugBadges.errors !== 0) {
+    throw new Error(`Debug Log button should hide empty warning/error badges: ${JSON.stringify(initialDebugBadges)}`)
+  }
+  await page.evaluate(() => {
+    console.log('__MIVO_E2E_EXPECTED_LOG__ unity-style log')
+    console.warn('__MIVO_E2E_EXPECTED_WARNING__ unity-style warning')
+    console.error('__MIVO_E2E_EXPECTED_ERROR__ unity-style error')
+  })
+  await page.waitForFunction(() => {
+    const button = document.querySelector('[aria-label="Debug Log"]')
+    return (
+      button?.querySelector('.debug-log-badge.warning')?.textContent?.trim() === '1' &&
+      button?.querySelector('.debug-log-badge.error')?.textContent?.trim() === '1'
+    )
+  })
+  const debugBadgeColors = await debugLogButton.evaluate((button) => {
+    const warning = button.querySelector('.debug-log-badge.warning')
+    const error = button.querySelector('.debug-log-badge.error')
+
+    return {
+      warningText: warning?.textContent?.trim(),
+      warningColor: warning ? window.getComputedStyle(warning).backgroundColor : undefined,
+      warningTextColor: warning ? window.getComputedStyle(warning).color : undefined,
+      errorText: error?.textContent?.trim(),
+      errorColor: error ? window.getComputedStyle(error).backgroundColor : undefined,
+      errorTextColor: error ? window.getComputedStyle(error).color : undefined,
+    }
+  })
+  if (
+    debugBadgeColors.warningText !== '1' ||
+    debugBadgeColors.errorText !== '1' ||
+    !debugBadgeColors.warningColor?.includes('199') ||
+    !debugBadgeColors.errorColor?.includes('191') ||
+    !debugBadgeColors.warningTextColor?.includes('255, 255, 255') ||
+    !debugBadgeColors.errorTextColor?.includes('255, 255, 255')
+  ) {
+    throw new Error(`Debug Log button should show yellow/red counts with white text: ${JSON.stringify(debugBadgeColors)}`)
+  }
+  await page.evaluate(() => {
+    for (let index = 0; index < 11; index += 1) {
+      console.error(`__MIVO_E2E_EXPECTED_ERROR__ badge-center-${index}`)
+    }
+  })
+  await page.waitForFunction(() => document.querySelector('[aria-label="Debug Log"] .debug-log-badge.error')?.textContent?.trim() === '12')
+  const debugBadgeAlignment = await debugLogButton.evaluate((button) => {
+    const warning = button.querySelector('.debug-log-badge.warning')
+    const error = button.querySelector('.debug-log-badge.error')
+    const warningRect = warning?.getBoundingClientRect()
+    const style = error ? window.getComputedStyle(error) : undefined
+    const rect = error?.getBoundingClientRect()
+
+    return {
+      text: error?.textContent?.trim(),
+      display: style?.display,
+      alignItems: style?.alignItems,
+      justifyContent: style?.justifyContent,
+      height: rect?.height,
+      lineHeight: style?.lineHeight,
+      warningRight: warningRect?.right,
+      warningCenterY: warningRect ? warningRect.top + warningRect.height / 2 : undefined,
+      errorLeft: rect?.left,
+      errorCenterY: rect ? rect.top + rect.height / 2 : undefined,
+    }
+  })
+  if (
+    debugBadgeAlignment.text !== '12' ||
+    !['flex', 'inline-flex'].includes(debugBadgeAlignment.display || '') ||
+    debugBadgeAlignment.alignItems !== 'center' ||
+    debugBadgeAlignment.justifyContent !== 'center' ||
+    debugBadgeAlignment.lineHeight !== `${debugBadgeAlignment.height}px` ||
+    typeof debugBadgeAlignment.warningRight !== 'number' ||
+    typeof debugBadgeAlignment.errorLeft !== 'number' ||
+    debugBadgeAlignment.warningRight > debugBadgeAlignment.errorLeft ||
+    Math.abs((debugBadgeAlignment.warningCenterY || 0) - (debugBadgeAlignment.errorCenterY || 0)) > 1
+  ) {
+    throw new Error(`Debug Log count badges should align horizontally and center text: ${JSON.stringify(debugBadgeAlignment)}`)
+  }
+  await debugLogButton.click()
+  const debugLogPanel = page.getByRole('dialog', { name: 'Debug log console' })
+  if ((await debugLogPanel.count()) !== 1) {
+    throw new Error('Debug Log should open a modal console dialog')
+  }
+  const debugLogDialogGeometry = await debugLogPanel.evaluate((dialog) => {
+    const rect = dialog.getBoundingClientRect()
+
+    return {
+      centerX: rect.left + rect.width / 2,
+      centerY: rect.top + rect.height / 2,
+      viewportCenterX: window.innerWidth / 2,
+      viewportCenterY: window.innerHeight / 2,
+    }
+  })
+  if (
+    Math.abs(debugLogDialogGeometry.centerX - debugLogDialogGeometry.viewportCenterX) > 3 ||
+    Math.abs(debugLogDialogGeometry.centerY - debugLogDialogGeometry.viewportCenterY) > 3
+  ) {
+    throw new Error(`Debug Log dialog should be centered in the browser viewport: ${JSON.stringify(debugLogDialogGeometry)}`)
+  }
+  const debugLogDialogStyle = await debugLogPanel.evaluate((dialog) => {
+    const closeButton = dialog.querySelector('[aria-label="Close debug log"]')
+    const logEntry = dialog.querySelector('.debug-log-entry')
+
+    return {
+      panelRadius: Number.parseFloat(window.getComputedStyle(dialog).borderRadius),
+      closeRadius: closeButton ? Number.parseFloat(window.getComputedStyle(closeButton).borderRadius) : 0,
+      entryRadius: logEntry ? Number.parseFloat(window.getComputedStyle(logEntry).borderRadius) : 0,
+      panelBackground: window.getComputedStyle(dialog).backgroundColor,
+    }
+  })
+  if (
+    debugLogDialogStyle.panelRadius < 12 ||
+    debugLogDialogStyle.closeRadius < 8 ||
+    debugLogDialogStyle.entryRadius < 8 ||
+    !debugLogDialogStyle.panelBackground.includes('250')
+  ) {
+    throw new Error(`Debug Log dialog should match the rounded Mivo panel style: ${JSON.stringify(debugLogDialogStyle)}`)
+  }
+  for (const filter of ['All', 'Log', 'Warning', 'Error']) {
+    if ((await debugLogPanel.getByRole('button', { name: new RegExp(`^${filter} \\d+`) }).count()) !== 1) {
+      throw new Error(`Debug Log panel should expose a ${filter} level filter with a count`)
+    }
+  }
+  if ((await debugLogPanel.getByRole('button', { name: 'Clear debug log' }).count()) !== 1) {
+    throw new Error('Debug Log panel should expose a Clear action')
+  }
+  for (const message of ['App ready', 'Canvas loaded', 'Tool changed', 'Selection changed']) {
+    if ((await debugLogPanel.getByText(message, { exact: false }).count()) < 1) {
+      throw new Error(`Debug Log panel should include runtime log: ${message}`)
+    }
+  }
+  for (const message of [
+    '__MIVO_E2E_EXPECTED_LOG__ unity-style log',
+    '__MIVO_E2E_EXPECTED_WARNING__ unity-style warning',
+    '__MIVO_E2E_EXPECTED_ERROR__ unity-style error',
+  ]) {
+    await debugLogPanel.getByText(message, { exact: false }).waitFor()
+  }
+  const logListSelection = await debugLogPanel.locator('.debug-log-list').evaluate((list) => window.getComputedStyle(list).userSelect)
+  if (logListSelection !== 'text') {
+    throw new Error(`Debug Log modal should allow selecting log text for copy, user-select=${logListSelection}`)
+  }
+  await debugLogPanel.getByRole('button', { name: /^Warning \d+/ }).click()
+  if ((await debugLogPanel.getByText('__MIVO_E2E_EXPECTED_WARNING__', { exact: false }).count()) !== 1) {
+    throw new Error('Warning filter should keep warning entries visible')
+  }
+  if ((await debugLogPanel.getByText('__MIVO_E2E_EXPECTED_LOG__', { exact: false }).count()) !== 0) {
+    throw new Error('Warning filter should hide log entries')
+  }
+  await debugLogPanel.getByRole('button', { name: /^Error \d+/ }).click()
+  if ((await debugLogPanel.getByText('__MIVO_E2E_EXPECTED_ERROR__ unity-style error', { exact: false }).count()) !== 1) {
+    throw new Error('Error filter should keep error entries visible')
+  }
+  await debugLogPanel.getByRole('button', { name: 'Clear debug log' }).click()
+  if ((await debugLogPanel.getByText('__MIVO_E2E_EXPECTED_ERROR__', { exact: false }).count()) !== 0) {
+    throw new Error('Clear should remove captured debug entries')
+  }
+  await debugLogPanel.getByRole('button', { name: 'Close debug log' }).click()
+  if ((await debugLogPanel.count()) !== 0) {
+    throw new Error('Debug Log modal should close from its close button')
+  }
+
   await page.getByRole('button', { name: 'Settings' }).click()
   if ((await page.getByRole('menu', { name: 'Settings menu' }).count()) !== 1) {
     throw new Error('Settings should expand into an inline menu')
@@ -347,6 +554,8 @@ try {
       throw new Error(`Settings menu should include: ${item}`)
     }
   }
+  await page.getByRole('menuitem', { name: 'Preferences' }).click()
+  await page.waitForFunction(() => document.querySelector('[aria-label="Debug Log"] .debug-log-badge.warning')?.textContent?.trim() === '1')
   const settingsRowDisplay = await page.getByRole('button', { name: 'Settings' }).evaluate((row) => ({
     display: window.getComputedStyle(row).display,
     columns: window.getComputedStyle(row).gridTemplateColumns,

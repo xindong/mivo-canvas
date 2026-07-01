@@ -1,6 +1,7 @@
 import type { ImageDimensions, ImportedImageMetadata } from './imageSizing'
 import { importedImageDisplaySize } from './imageSizing'
 import { saveImportedAsset } from './assetStorage'
+import { debugLogger } from '../store/debugLogStore'
 import type { CanvasAssetNodeType } from '../types/mivoCanvas'
 
 export type AddImportedImage = (
@@ -227,7 +228,10 @@ const sizeLabelFor = (
 
 const prepareCanvasFileImport = async (file: File): Promise<PreparedCanvasFileImport | undefined> => {
   const type = canvasAssetNodeTypeForFile(file)
-  if (!type) return undefined
+  if (!type) {
+    debugLogger.warn('Canvas Import', `Unsupported file skipped: ${file.name}`)
+    return undefined
+  }
 
   const asset = await saveImportedAsset(file)
   const text = await markdownTextFor(file, type)
@@ -287,6 +291,7 @@ export const importFileToCanvas = async ({
     addImportedFileNode,
   )
 
+  debugLogger.log('Canvas Import', `Imported file: ${file.name}`)
   return prepared.asset
 }
 
@@ -310,6 +315,7 @@ export const importImageFileToCanvas = async ({
     asset,
   )
 
+  debugLogger.log('Canvas Import', `Imported image file: ${file.name}`)
   return asset
 }
 
@@ -319,6 +325,8 @@ export const importImageFilesToCanvas = async (
   addImportedImage: AddImportedImage,
 ) => {
   const imageFiles = files.filter((file) => file.type.startsWith('image/') || /\.(png|jpe?g|webp|gif|svg)$/i.test(file.name))
+  const skippedCount = files.length - imageFiles.length
+  if (skippedCount) debugLogger.warn('Canvas Import', `Skipped ${skippedCount} non-image file${skippedCount === 1 ? '' : 's'}`)
 
   for (const [index, file] of imageFiles.entries()) {
     await importImageFileToCanvas({
@@ -329,6 +337,7 @@ export const importImageFilesToCanvas = async (
     })
   }
 
+  debugLogger.log('Canvas Import', `Imported ${imageFiles.length} image file${imageFiles.length === 1 ? '' : 's'}`)
   return imageFiles.length
 }
 
@@ -338,6 +347,8 @@ export const importFilesToCanvas = async (
   addImportedFileNode: AddImportedFileNode,
 ) => {
   const supportedFiles = files.filter(canImportCanvasFile)
+  const skippedCount = files.length - supportedFiles.length
+  if (skippedCount) debugLogger.warn('Canvas Import', `Skipped ${skippedCount} unsupported file${skippedCount === 1 ? '' : 's'}`)
   const preparedFiles = (await Promise.all(supportedFiles.map(prepareCanvasFileImport))).filter(
     (prepared): prepared is PreparedCanvasFileImport => Boolean(prepared),
   )
@@ -390,14 +401,19 @@ export const importFilesToCanvas = async (
     rowTop += row.height + rowGap
   })
 
+  debugLogger.log('Canvas Import', `Imported ${preparedFiles.length} canvas file${preparedFiles.length === 1 ? '' : 's'}`)
   return preparedFiles.length
 }
 
 export const fileFromImageUrl = async (url: string, filename: string) => {
   const response = await fetch(url)
-  if (!response.ok) throw new Error(`Unable to import image source: ${response.status}`)
+  if (!response.ok) {
+    debugLogger.error('Canvas Import', `Unable to import image source ${filename}: ${response.status}`)
+    throw new Error(`Unable to import image source: ${response.status}`)
+  }
 
   const blob = await response.blob()
+  debugLogger.log('Canvas Import', `Fetched image source: ${filename}`)
   return new File([blob], filename, {
     type: blob.type || mimeFromFilename(filename),
   })
