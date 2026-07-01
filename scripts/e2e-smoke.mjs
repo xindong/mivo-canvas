@@ -1051,7 +1051,7 @@ try {
     kind: 'mivo-canvas-archive',
     version: 2,
     snapshot: {
-      version: 1,
+      version: 2,
       sceneId: 'canvas-e2e-archive',
       nodes: [
         {
@@ -1942,7 +1942,12 @@ try {
       `Dragging an arrow endpoint should edit the arrow geometry: before=${JSON.stringify(lineEndBefore)}, after=${JSON.stringify(lineEndAfter)}, handleBefore=${JSON.stringify(endPointHandle)}, handleAfter=${JSON.stringify(endPointHandleAfter)}`,
     )
   }
-  await arrowMarkupNode.dblclick()
+  const arrowHitLineBox = await arrowMarkupNode.locator('.markup-hit-line').boundingBox()
+  if (!arrowHitLineBox) throw new Error('Arrow markup should expose a line hit target for label editing')
+  await page.mouse.dblclick(
+    arrowHitLineBox.x + arrowHitLineBox.width / 2,
+    arrowHitLineBox.y + arrowHitLineBox.height / 2,
+  )
   await page.waitForSelector('.dom-node.markup-node[data-markup-kind="arrow"].editing .dom-markup-text-editor')
   if ((await page.locator('.details-dialog').count()) !== 0) {
     throw new Error('Double-clicking arrow markup should edit its label instead of opening image details')

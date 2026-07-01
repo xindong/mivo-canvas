@@ -23,6 +23,7 @@ import { defaultSizeForNodeType } from '../canvas/nodeTypes/canvasNodeRegistry'
 import { defaultTextAlign, defaultTextColor, defaultTextFontSize, defaultTextWeight } from '../canvas/textGeometry'
 import {
   markdownDocumentWidth,
+  markdownDocumentSizeFor,
   markdownPreviewHeight,
   markdownShouldUsePreviewMode,
   type ImportedFileMetadata,
@@ -234,6 +235,35 @@ const cloneTask = (task: CanvasTask): CanvasTask => ({
 const cloneNodes = (nodes: MivoCanvasNode[]) => nodes.map(cloneNode)
 const cloneTasks = (tasks: CanvasTask[]) => tasks.map(cloneTask)
 
+const compactNodeForPersist = (node: MivoCanvasNode): MivoCanvasNode => {
+  const compactNode = cloneNode(node)
+  const transform = compactNode.transform
+  const rotation = transform?.rotation ?? 0
+
+  delete compactNode.asset
+  delete compactNode.fills
+  delete compactNode.relations
+  delete compactNode.strokes
+  delete compactNode.transform
+
+  return {
+    ...compactNode,
+    ...(Math.abs(rotation) > 0.0001 ? { transform } : {}),
+  }
+}
+
+const compactDocumentForPersist = (document: CanvasDocument): CanvasDocument => ({
+  ...document,
+  nodes: document.nodes.map(compactNodeForPersist),
+  tasks: cloneTasks(document.tasks),
+  selectedNodeIds: document.selectedNodeIds ? [...document.selectedNodeIds] : undefined,
+})
+
+const compactCanvasesForPersist = (canvases: Record<CanvasId, CanvasDocument>) =>
+  Object.fromEntries(
+    Object.entries(canvases).map(([canvasId, document]) => [canvasId, compactDocumentForPersist(document)]),
+  ) as Record<CanvasId, CanvasDocument>
+
 const normalizeSelection = (nodeIds: string[] | undefined, nodes: MivoCanvasNode[]) => {
   const validIds = new Set(nodes.filter((node) => !node.hidden).map((node) => node.id))
   return Array.from(new Set(nodeIds || [])).filter((nodeId) => validIds.has(nodeId))
@@ -379,16 +409,17 @@ const normalizeConnectorMarkupNodes = (nodes: MivoCanvasNode[]) =>
     if (endBindingPoint) absolutePoints[1] = endBindingPoint
 
     const next = markupGeometryFromAbsolutePoints(absolutePoints)
-    return {
+    return setNodeTransform({
       ...node,
+      markupPoints: next.points.map((point) => ({ x: Math.round(point.x), y: Math.round(point.y) })),
+      connectorStart: startBindingPoint ? node.connectorStart : undefined,
+      connectorEnd: endBindingPoint ? node.connectorEnd : undefined,
+    }, {
       x: Math.round(next.geometry.x),
       y: Math.round(next.geometry.y),
       width: Math.round(next.geometry.width),
       height: Math.round(next.geometry.height),
-      markupPoints: next.points.map((point) => ({ x: Math.round(point.x), y: Math.round(point.y) })),
-      connectorStart: startBindingPoint ? node.connectorStart : undefined,
-      connectorEnd: endBindingPoint ? node.connectorEnd : undefined,
-    }
+    })
   })
 
 const normalizeCanvasNodes = (nodes: MivoCanvasNode[]) =>
@@ -570,10 +601,7 @@ const importedAssetDisplaySize = (type: CanvasAssetNodeType, metadata?: Imported
           width: markdownDocumentWidth,
           height: markdownPreviewHeight,
         }
-      : {
-          ...defaultSize,
-          width: markdownDocumentWidth,
-        }
+      : markdownDocumentSizeFor(metadata?.text)
   }
 
   return defaultSizeForNodeType(type)
@@ -985,11 +1013,10 @@ export const useCanvasStore = create<CanvasState>()(
           const nodes = normalizeCanvasNodes(
             state.nodes.map((node) =>
               node.id === nodeId
-                ? {
-                    ...node,
+                ? setNodeTransform(node, {
                     width: nextWidth,
                     height: nextHeight,
-                  }
+                  })
                 : node,
             ),
           )
@@ -1005,11 +1032,10 @@ export const useCanvasStore = create<CanvasState>()(
           const nodes = normalizeCanvasNodes(
             state.nodes.map((node) =>
               node.id === nodeId
-                ? {
+                ? setNodeTransform({
                     ...node,
                     markdownDisplayMode: mode,
-                    height: Math.max(320, Math.round(nextHeight)),
-                  }
+                  }, { height: Math.max(320, Math.round(nextHeight)) })
                 : node,
             ),
           )
@@ -1031,7 +1057,7 @@ export const useCanvasStore = create<CanvasState>()(
           const nodes = normalizeCanvasNodes(
             state.nodes.map((node) =>
               moveSet.has(node.id) && !isEffectivelyLocked(state.nodes, node)
-                ? { ...node, x: node.x + dx, y: node.y + dy }
+                ? setNodeTransform(node, { x: node.x + dx, y: node.y + dy })
                 : node,
             ),
           )
@@ -1271,12 +1297,12 @@ export const useCanvasStore = create<CanvasState>()(
           const nodes = state.nodes.map((node) => {
             if (!selectedSet.has(node.id) || node.locked) return node
 
-            if (alignment === 'left') return { ...node, x: Math.round(minX) }
-            if (alignment === 'center') return { ...node, x: Math.round(centerX - node.width / 2) }
-            if (alignment === 'right') return { ...node, x: Math.round(maxX - node.width) }
-            if (alignment === 'top') return { ...node, y: Math.round(minY) }
-            if (alignment === 'middle') return { ...node, y: Math.round(centerY - node.height / 2) }
-            return { ...node, y: Math.round(maxY - node.height) }
+            if (alignment === 'left') return setNodeTransform(node, { x: Math.round(minX) })
+            if (alignment === 'center') return setNodeTransform(node, { x: Math.round(centerX - node.width / 2) })
+            if (alignment === 'right') return setNodeTransform(node, { x: Math.round(maxX - node.width) })
+            if (alignment === 'top') return setNodeTransform(node, { y: Math.round(minY) })
+            if (alignment === 'middle') return setNodeTransform(node, { y: Math.round(centerY - node.height / 2) })
+            return setNodeTransform(node, { y: Math.round(maxY - node.height) })
           })
 
           return patchWithHistory(state, { nodes, selectedNodeId: state.selectedNodeId, selectedNodeIds: state.selectedNodeIds })
@@ -1305,7 +1331,7 @@ export const useCanvasStore = create<CanvasState>()(
           const nodes = state.nodes.map((node) => {
             const position = positions.get(node.id)
             if (position === undefined || node.locked) return node
-            return axis === 'horizontal' ? { ...node, x: position } : { ...node, y: position }
+            return axis === 'horizontal' ? setNodeTransform(node, { x: position }) : setNodeTransform(node, { y: position })
           })
 
           return patchWithHistory(state, { nodes, selectedNodeId: state.selectedNodeId, selectedNodeIds: state.selectedNodeIds })
@@ -1342,7 +1368,7 @@ export const useCanvasStore = create<CanvasState>()(
                 const dx = Math.round(position.x - (minX + (maxX - minX) / 2))
                 const dy = Math.round(position.y - (minY + (maxY - minY) / 2))
 
-                return clones.map((node) => ({ ...node, x: node.x + dx, y: node.y + dy }))
+                return clones.map((node) => setNodeTransform(node, { x: node.x + dx, y: node.y + dy }))
               })()
             : clones
 
@@ -1435,14 +1461,15 @@ export const useCanvasStore = create<CanvasState>()(
 
           const nodes = state.nodes.map((node) =>
             node.id === nodeId
-              ? {
+              ? setNodeTransform({
                   ...node,
+                  imageCrop: cropEqualsFullImage(nextCrop) ? undefined : nextCrop,
+                }, {
                   x: Math.round(node.x + cropBox.x),
                   y: Math.round(node.y + cropBox.y),
                   width: Math.round(cropBox.width),
                   height: Math.round(cropBox.height),
-                  imageCrop: cropEqualsFullImage(nextCrop) ? undefined : nextCrop,
-                }
+                })
               : node,
           )
 
@@ -1662,12 +1689,8 @@ export const useCanvasStore = create<CanvasState>()(
           const nodes = normalizeCanvasNodes(
             state.nodes.map((node) =>
               node.id === nodeId
-                ? {
+                ? setNodeTransform({
                     ...node,
-                    x: Math.round(geometry.x),
-                    y: Math.round(geometry.y),
-                    width: Math.round(geometry.width),
-                    height: Math.round(geometry.height),
                     markupPoints: points?.map((point) => ({
                       x: Math.round(point.x),
                       y: Math.round(point.y),
@@ -1678,7 +1701,12 @@ export const useCanvasStore = create<CanvasState>()(
                     ...(bindings && 'connectorEnd' in bindings
                       ? { connectorEnd: bindings.connectorEnd || undefined }
                       : {}),
-                  }
+                  }, {
+                    x: Math.round(geometry.x),
+                    y: Math.round(geometry.y),
+                    width: Math.round(geometry.width),
+                    height: Math.round(geometry.height),
+                  })
                 : node,
             ),
           )
@@ -1786,20 +1814,27 @@ export const useCanvasStore = create<CanvasState>()(
         set((state) => {
           const nodes = state.nodes.map((node) =>
             node.id === nodeId && isEditableTextNode(node)
-              ? {
-                  ...node,
-                  title: node.type === 'markup' ? node.title : text.trim() || 'Text',
-                  text,
-                  width: geometry && node.type !== 'markup' ? Math.round(geometry.width) : node.width,
-                  height: geometry && node.type !== 'markup' ? Math.round(geometry.height) : node.height,
-                  generation:
-                    node.type === 'markup' && node.generation
-                      ? {
-                          ...node.generation,
-                          prompt: text.trim() || node.title,
-                        }
-                      : node.generation,
-                }
+              ? (() => {
+                  const nextNode = {
+                    ...node,
+                    title: node.type === 'markup' ? node.title : text.trim() || 'Text',
+                    text,
+                    generation:
+                      node.type === 'markup' && node.generation
+                        ? {
+                            ...node.generation,
+                            prompt: text.trim() || node.title,
+                          }
+                        : node.generation,
+                  }
+
+                  return geometry && node.type !== 'markup'
+                    ? setNodeTransform(nextNode, {
+                        width: Math.round(geometry.width),
+                        height: Math.round(geometry.height),
+                      })
+                    : nextNode
+                })()
               : node,
           )
 
@@ -1809,12 +1844,12 @@ export const useCanvasStore = create<CanvasState>()(
         set((state) => {
           const nodes = state.nodes.map((node) =>
             node.id === nodeId && isEditableTextNode(node)
-              ? {
-                  ...node,
-                  ...style,
-                  width: geometry && node.type !== 'markup' ? Math.round(geometry.width) : node.width,
-                  height: geometry && node.type !== 'markup' ? Math.round(geometry.height) : node.height,
-                }
+              ? geometry && node.type !== 'markup'
+                ? setNodeTransform({ ...node, ...style }, {
+                    width: Math.round(geometry.width),
+                    height: Math.round(geometry.height),
+                  })
+                : { ...node, ...style }
               : node,
           )
 
@@ -1824,13 +1859,14 @@ export const useCanvasStore = create<CanvasState>()(
         set((state) => {
           const nodes = state.nodes.map((node) =>
             node.id === nodeId && isEditableTextNode(node)
-              ? {
+              ? setNodeTransform({
                   ...node,
+                  textAutoWidth: false,
+                }, {
                   x: Math.round(x),
                   width: Math.round(width),
                   height: Math.round(height),
-                  textAutoWidth: false,
-                }
+                })
               : node,
           )
 
@@ -2170,12 +2206,10 @@ export const useCanvasStore = create<CanvasState>()(
     }),
     {
       name: 'mivo-canvas-demo',
-      version: 6,
+      version: 7,
       migrate: migratePersistedState,
       partialize: (state) => ({
-        canvases: state.canvases,
-        nodes: state.nodes,
-        tasks: state.tasks,
+        canvases: compactCanvasesForPersist(state.canvases),
         sceneId: state.sceneId,
         selectedNodeId: state.selectedNodeId,
         selectedNodeIds: state.selectedNodeIds,
