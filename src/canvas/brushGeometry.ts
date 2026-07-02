@@ -1,5 +1,5 @@
 import { getStroke, type StrokeOptions } from 'perfect-freehand'
-import type { MarkupBrushKind, MarkupPoint } from '../types/mivoCanvas'
+import type { MarkupBrushKind, MarkupPoint, MivoCanvasNode } from '../types/mivoCanvas'
 
 export type BrushWidthPresetId = 'thin' | 'medium' | 'bold'
 
@@ -80,3 +80,75 @@ export const brushOutlinePathFor = (
     getStroke(strokeInput, brushStrokeOptionsFor(points, strokeWidth, brushKind, options)),
   )
 }
+
+/** FigJam-style eraser hit circle, in screen pixels (divide by viewport scale for canvas space). */
+export const eraserScreenRadius = 14
+
+const distancePointToSegment = (
+  px: number,
+  py: number,
+  ax: number,
+  ay: number,
+  bx: number,
+  by: number,
+) => {
+  const abx = bx - ax
+  const aby = by - ay
+  const lengthSquared = abx * abx + aby * aby
+  const t = lengthSquared === 0 ? 0 : Math.max(0, Math.min(1, ((px - ax) * abx + (py - ay) * aby) / lengthSquared))
+  return Math.hypot(px - (ax + abx * t), py - (ay + aby * t))
+}
+
+export const brushStrokeHitByCircle = (
+  node: MivoCanvasNode,
+  point: { x: number; y: number },
+  radius: number,
+) => {
+  const hitRadius =
+    radius + brushRenderWidthFor(node.markupStrokeWidth ?? 3, node.markupBrushKind || 'marker') / 2
+
+  if (
+    point.x < node.x - hitRadius ||
+    point.x > node.x + node.width + hitRadius ||
+    point.y < node.y - hitRadius ||
+    point.y > node.y + node.height + hitRadius
+  ) {
+    return false
+  }
+
+  const points = node.markupPoints || []
+  if (!points.length) return false
+  if (points.length === 1) {
+    return Math.hypot(node.x + points[0].x - point.x, node.y + points[0].y - point.y) <= hitRadius
+  }
+
+  for (let index = 0; index < points.length - 1; index += 1) {
+    const distance = distancePointToSegment(
+      point.x,
+      point.y,
+      node.x + points[index].x,
+      node.y + points[index].y,
+      node.x + points[index + 1].x,
+      node.y + points[index + 1].y,
+    )
+    if (distance <= hitRadius) return true
+  }
+
+  return false
+}
+
+/** Whole-stroke erasing like FigJam: any brush stroke touched by the eraser circle is removed. */
+export const eraserHitStrokeIds = (
+  nodes: MivoCanvasNode[],
+  point: { x: number; y: number },
+  radius: number,
+) =>
+  nodes
+    .filter(
+      (node) =>
+        node.type === 'markup' &&
+        node.markupKind === 'brush' &&
+        !node.hidden &&
+        brushStrokeHitByCircle(node, point, radius),
+    )
+    .map((node) => node.id)

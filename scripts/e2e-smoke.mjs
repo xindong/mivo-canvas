@@ -2486,6 +2486,19 @@ try {
 
   await page.getByRole('button', { name: 'Brush' }).click()
   await page.waitForSelector('.brush-options-bar')
+  const defaultBrushColorChecked = await page
+    .locator('.brush-options-bar')
+    .getByRole('radio', { name: 'Brush color Black' })
+    .getAttribute('aria-checked')
+  if (defaultBrushColorChecked !== 'true') {
+    throw new Error('Brush should default to the black color preset')
+  }
+  const markerCursor = await page.evaluate(
+    () => window.getComputedStyle(document.querySelector('.canvas-shell')).cursor,
+  )
+  if (!markerCursor.includes('data:image/svg+xml')) {
+    throw new Error(`Brush tool should show a pen cursor instead of the default one, got ${markerCursor}`)
+  }
   await page.locator('.brush-options-bar').getByRole('radio', { name: 'Brush width Bold' }).click()
   await page.locator('.brush-options-bar').getByRole('radio', { name: 'Brush color Orange' }).click()
   await drawBrushStroke(0)
@@ -2524,6 +2537,30 @@ try {
     throw new Error(`Highlighter strokes should render semi-transparent, got fill-opacity=${highlighterFillOpacity}`)
   }
 
+  await page.locator('.brush-options-bar').getByRole('radio', { name: 'Eraser' }).click()
+  const eraserCursor = await page.evaluate(
+    () => window.getComputedStyle(document.querySelector('.canvas-shell')).cursor,
+  )
+  if (!eraserCursor.includes('data:image/svg+xml') || eraserCursor === markerCursor) {
+    throw new Error('Eraser mode should switch to its own cursor')
+  }
+  if (
+    !(await page
+      .locator('.brush-options-bar')
+      .getByRole('radio', { name: 'Brush color Orange' })
+      .isDisabled())
+  ) {
+    throw new Error('Eraser mode should disable stroke color options')
+  }
+  await page.mouse.move(brushStrokeStart.x + 65, brushStrokeStart.y - 40)
+  await page.mouse.down()
+  await page.mouse.move(brushStrokeStart.x + 65, brushStrokeStart.y + 120, { steps: 24 })
+  await page.mouse.up()
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="brush"]').length === count,
+    brushCountBefore,
+  )
+
   await page.keyboard.press('Escape')
   await page.waitForFunction(() => {
     const selectButton = [...document.querySelectorAll('.canvas-tool-dock button')].find(
@@ -2531,14 +2568,22 @@ try {
     )
     return selectButton?.classList.contains('active') && !document.querySelector('.brush-options-bar')
   })
-  for (let strokeIndex = 0; strokeIndex < 3; strokeIndex += 1) {
-    await page.locator('.dom-node.markup-node[data-markup-kind="brush"]').last().click()
-    await page.keyboard.press('Backspace')
-    await page.waitForFunction(
-      (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="brush"]').length === count,
-      brushCountBefore + 2 - strokeIndex,
-    )
+
+  await page.keyboard.press('e')
+  await page.waitForSelector('.brush-options-bar')
+  if (
+    (await page.locator('.brush-options-bar').getByRole('radio', { name: 'Eraser' }).getAttribute('aria-checked')) !==
+    'true'
+  ) {
+    throw new Error('The E shortcut should activate eraser mode')
   }
+  await page.keyboard.press('p')
+  await page.waitForFunction(() => {
+    const marker = document.querySelector('.brush-options-bar [aria-label="Marker"]')
+    return marker?.getAttribute('aria-checked') === 'true'
+  })
+  await page.keyboard.press('Escape')
+  await page.waitForFunction(() => !document.querySelector('.brush-options-bar'))
 
   const secondNode = page.locator('.dom-node').nth(1)
   const visibleNodeCountBeforeOrganization = await page.locator('.dom-node').count()

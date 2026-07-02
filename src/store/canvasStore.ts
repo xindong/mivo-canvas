@@ -7,6 +7,7 @@ import type {
   CanvasId,
   CanvasDocument,
   CanvasTask,
+  BrushToolMode,
   ConnectorBinding,
   DemoSceneId,
   MarkupBrushKind,
@@ -50,7 +51,7 @@ export type SelectionArrangeMode = 'row' | 'column' | 'grid' | 'tidy'
 export type BrushStyle = {
   color: string
   width: number
-  kind: MarkupBrushKind
+  kind: BrushToolMode
 }
 
 type CanvasState = {
@@ -74,6 +75,7 @@ type CanvasState = {
   selectNodes: (nodeIds: string[], primaryNodeId?: string) => void
   setActiveTool: (toolId: ToolId) => void
   setBrushStyle: (style: Partial<BrushStyle>) => void
+  eraseMarkupStrokes: (nodeIds: string[]) => void
   captureHistory: () => void
   undo: () => void
   redo: () => void
@@ -325,8 +327,9 @@ const defaultSectionBorderStyle: SectionBorderStyle = 'dashed'
 const defaultMarkupStrokeColor = '#6957e8'
 const defaultMarkupFillColor = 'rgba(105, 87, 232, 0.08)'
 const defaultMarkupStrokeWidth = 3
+const defaultBrushColor = '#232323'
 const defaultBrushStyle: BrushStyle = {
-  color: defaultMarkupStrokeColor,
+  color: defaultBrushColor,
   width: defaultBrushWidth,
   kind: 'marker',
 }
@@ -833,7 +836,8 @@ const migratePersistedState = (persistedState: unknown, persistedVersion = 0) =>
     selectedNodeIds: selection.selectedNodeIds,
     activeTool: persisted.activeTool || 'select',
     clipboardNodes: [],
-    brushStyle: persisted.brushStyle || defaultBrushStyle,
+    // Version 8 introduced the black default and eraser mode; older persisted styles reset to the new default.
+    brushStyle: persistedVersion < 8 ? defaultBrushStyle : persisted.brushStyle || defaultBrushStyle,
     historyPast: [],
     historyFuture: [],
   }
@@ -1056,6 +1060,31 @@ export const useCanvasStore = create<CanvasState>()(
           const brushStyle = { ...state.brushStyle, ...style }
           logCanvas(`Brush style set: ${brushStyle.kind}, ${brushStyle.color}, ${brushStyle.width}px`)
           return { brushStyle }
+        }),
+      eraseMarkupStrokes: (nodeIds) =>
+        set((state) => {
+          // History is captured once per eraser drag by the interaction controller,
+          // so repeated calls during one drag stay a single undo step.
+          const erasableSet = new Set(
+            nodeIds.filter((nodeId) => {
+              const node = state.nodes.find((item) => item.id === nodeId)
+              return (
+                node &&
+                node.type === 'markup' &&
+                node.markupKind === 'brush' &&
+                !isEffectivelyLocked(state.nodes, node)
+              )
+            }),
+          )
+          if (!erasableSet.size) return {}
+
+          logCanvas(`Erased ${erasableSet.size} brush stroke${erasableSet.size === 1 ? '' : 's'}`)
+
+          return patchActiveCanvas(state, {
+            selectedNodeId: erasableSet.has(state.selectedNodeId || '') ? undefined : state.selectedNodeId,
+            selectedNodeIds: state.selectedNodeIds.filter((nodeId) => !erasableSet.has(nodeId)),
+            nodes: normalizeCanvasNodes(state.nodes.filter((node) => !erasableSet.has(node.id))),
+          })
         }),
       captureHistory: () => set((state) => remember(state)),
       undo: () =>
@@ -2465,7 +2494,7 @@ export const useCanvasStore = create<CanvasState>()(
     }),
     {
       name: 'mivo-canvas-demo',
-      version: 7,
+      version: 8,
       migrate: migratePersistedState,
       partialize: (state) => ({
         canvases: compactCanvasesForPersist(state.canvases),

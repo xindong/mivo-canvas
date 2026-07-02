@@ -4,6 +4,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
   type DragEvent as ReactDragEvent,
   type MouseEvent as ReactMouseEvent,
 } from 'react'
@@ -13,6 +14,7 @@ import { LocateFixed, Minus, Plus, RotateCcw } from 'lucide-react'
 import { downloadCanvasNodeOriginal } from '../lib/assetDownload'
 import { canImportCanvasFile, importFilesToCanvas, importImageUrlToCanvas } from '../lib/canvasAssetImport'
 import { useCanvasStore } from '../store/canvasStore'
+import { brushCursorCssFor } from './brushCursors'
 import { brushOutlinePathFor, highlighterOpacity } from './brushGeometry'
 import { BrushOptionsBar } from './BrushOptionsBar'
 import { CanvasContextMenu } from './CanvasContextMenu'
@@ -438,11 +440,13 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
   const canvasToOverlayX = (x: number) => viewport.x + x * viewport.scale
   const canvasToOverlayY = (y: number) => viewport.y + y * viewport.scale
 
+  const brushToolActive = storeActiveTool === 'markup-brush' && !temporaryTool && !isPanning
+
   return (
     <section
       className={`canvas-shell tool-${interactionMode} ${isPanning ? 'is-panning' : ''} ${
         selectionBox ? 'is-selecting' : ''
-      } ${selectedNodes.length > 1 ? 'has-multi-selection' : ''}`}
+      } ${selectedNodes.length > 1 ? 'has-multi-selection' : ''} ${brushToolActive ? 'brush-tool' : ''}`}
       aria-label="Mivo Canvas"
       data-viewport-scale={viewport.scale}
       data-viewport-x={viewport.x}
@@ -461,6 +465,9 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
       style={{
         backgroundPosition: `${viewport.x}px ${viewport.y}px`,
         backgroundSize: `${36 * viewport.scale}px ${36 * viewport.scale}px`,
+        ...(brushToolActive
+          ? ({ '--brush-cursor': brushCursorCssFor(brushStyle.kind, brushStyle.color) } as CSSProperties)
+          : {}),
       }}
     >
       <div className="canvas-host" ref={hostRef} />
@@ -572,7 +579,7 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
                         y: point.y - activeMarkupCreationRect.y,
                       })),
                       brushStyle.width,
-                      brushStyle.kind,
+                      brushStyle.kind === 'highlighter' ? 'highlighter' : 'marker',
                       { last: false },
                     )}
                     fill={brushStyle.color}

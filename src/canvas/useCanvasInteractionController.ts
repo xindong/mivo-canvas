@@ -46,6 +46,7 @@ import {
   type SelectionBox,
   type Viewport,
 } from './canvasInteraction'
+import { eraserHitStrokeIds, eraserScreenRadius } from './brushGeometry'
 import { canvasToolHandlers, type CanvasToolHandlerContext } from './canvasToolHandlers'
 import { isCanvasToolEnabled, markupKindForTool, toolForKeyboardShortcut } from './canvasToolRegistry'
 import {
@@ -277,6 +278,7 @@ export function useCanvasInteractionController({
   const textResizeRef = useRef<TextResizeState | null>(null)
   const groupResizeRef = useRef<GroupResizeState | null>(null)
   const selectionSpacingDragRef = useRef<SmartSelectionSpacingDragState | null>(null)
+  const eraserDragRef = useRef<{ pointerId: number; historyCaptured: boolean } | null>(null)
   const persistedSceneRef = useRef(sceneId)
   const viewportPersistenceTimerRef = useRef<number | undefined>(undefined)
   const [viewport, setViewport] = useState(() => initialViewportFor(sceneId))
@@ -304,6 +306,7 @@ export function useCanvasInteractionController({
   const moveSelectedLayer = useCanvasStore((state) => state.moveSelectedLayer)
   const copySelectedNodes = useCanvasStore((state) => state.copySelectedNodes)
   const cutSelectedNodes = useCanvasStore((state) => state.cutSelectedNodes)
+  const eraseMarkupStrokes = useCanvasStore((state) => state.eraseMarkupStrokes)
   const pasteClipboardNodes = useCanvasStore((state) => state.pasteClipboardNodes)
   const groupSelectedNodes = useCanvasStore((state) => state.groupSelectedNodes)
   const ungroupSelectedNodes = useCanvasStore((state) => state.ungroupSelectedNodes)
@@ -808,6 +811,27 @@ export function useCanvasInteractionController({
     [discardEmptyEditingText, onCloseContextMenu, screenToCanvas],
   )
 
+  const eraseAtClientPoint = useCallback(
+    (clientX: number, clientY: number) => {
+      const drag = eraserDragRef.current
+      if (!drag) return
+
+      const point = screenToCanvas(clientX, clientY)
+      const state = useCanvasStore.getState()
+      const radius = eraserScreenRadius / viewportRef.current.scale
+      const candidates = state.nodes.filter((node) => !isNodeEffectivelyLocked(node, state.nodes))
+      const hits = eraserHitStrokeIds(candidates, point, radius)
+      if (!hits.length) return
+
+      if (!drag.historyCaptured) {
+        captureHistory()
+        drag.historyCaptured = true
+      }
+      eraseMarkupStrokes(hits)
+    },
+    [captureHistory, eraseMarkupStrokes, screenToCanvas],
+  )
+
   const beginMarkupBox = useCallback(
     (event: ReactPointerEvent<HTMLElement>) => {
       const kind = markupKindForTool(useCanvasStore.getState().activeTool)
@@ -822,6 +846,12 @@ export function useCanvasInteractionController({
       setSelectionBox(null)
       selectionRef.current = null
 
+      if (kind === 'brush' && useCanvasStore.getState().brushStyle.kind === 'eraser') {
+        eraserDragRef.current = { pointerId: event.pointerId, historyCaptured: false }
+        eraseAtClientPoint(event.clientX, event.clientY)
+        return
+      }
+
       const point = screenToCanvas(event.clientX, event.clientY)
       const nextBox: MarkupCreationState = {
         pointerId: event.pointerId,
@@ -835,7 +865,7 @@ export function useCanvasInteractionController({
       markupCreationRef.current = nextBox
       setMarkupCreationBox(nextBox)
     },
-    [discardEmptyEditingText, onCloseContextMenu, screenToCanvas],
+    [discardEmptyEditingText, eraseAtClientPoint, onCloseContextMenu, screenToCanvas],
   )
 
   const updateEditingText = useCallback(
@@ -936,6 +966,11 @@ export function useCanvasInteractionController({
             centered: event.altKey,
           }).updates,
         )
+        return
+      }
+
+      if (eraserDragRef.current?.pointerId === event.pointerId) {
+        eraseAtClientPoint(event.clientX, event.clientY)
         return
       }
 
@@ -1125,6 +1160,7 @@ export function useCanvasInteractionController({
     },
     [
       captureHistory,
+      eraseAtClientPoint,
       nodes,
       resizeTextNode,
       screenToCanvas,
@@ -1241,7 +1277,7 @@ export function useCanvasInteractionController({
             ? {
                 strokeColor: brushStyle.color,
                 strokeWidth: brushStyle.width,
-                brushKind: brushStyle.kind,
+                brushKind: brushStyle.kind === 'highlighter' ? ('highlighter' as const) : ('marker' as const),
               }
             : {}),
           ...connectorOptions,
@@ -1276,6 +1312,10 @@ export function useCanvasInteractionController({
       if (markupPointTransformRef.current?.pointerId === event.pointerId) {
         markupPointTransformRef.current = null
         setActiveConnectorDropTargetId(undefined)
+      }
+
+      if (eraserDragRef.current?.pointerId === event.pointerId) {
+        eraserDragRef.current = null
       }
 
       if (panRef.current?.pointerId === event.pointerId) {
@@ -1344,6 +1384,7 @@ export function useCanvasInteractionController({
         markupPointTransformRef.current = null
         groupResizeRef.current = null
         selectionSpacingDragRef.current = null
+        eraserDragRef.current = null
         nodeTransformRef.current = null
         textResizeRef.current = null
         setEditingTextNodeId(undefined)
@@ -1446,10 +1487,23 @@ export function useCanvasInteractionController({
         return
       }
 
+      if (!modifier && key === 'e') {
+        event.preventDefault()
+        const store = useCanvasStore.getState()
+        store.setActiveTool('markup-brush')
+        if (store.brushStyle.kind !== 'eraser') store.setBrushStyle({ kind: 'eraser' })
+        return
+      }
+
       const shortcutTool = modifier ? undefined : toolForKeyboardShortcut(key)
       if (shortcutTool) {
         event.preventDefault()
         setActiveTool(shortcutTool)
+        if (shortcutTool === 'markup-brush') {
+          // P always means "draw": leaving eraser mode goes back to the marker.
+          const store = useCanvasStore.getState()
+          if (store.brushStyle.kind === 'eraser') store.setBrushStyle({ kind: 'marker' })
+        }
         return
       }
 
@@ -1488,6 +1542,7 @@ export function useCanvasInteractionController({
       markupCreationRef.current = null
       setMarkupCreationBox(null)
       markupPointTransformRef.current = null
+      eraserDragRef.current = null
       nodeTransformRef.current = null
       textResizeRef.current = null
       setActiveConnectorDropTargetId(undefined)

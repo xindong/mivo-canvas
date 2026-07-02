@@ -2337,6 +2337,12 @@ button:disabled {
   background: rgba(85, 79, 72, 0.1);
 }
 
+.brush-options-bar button:disabled {
+  cursor: not-allowed;
+  opacity: 0.35;
+  background: transparent;
+}
+
 .brush-options-bar button.active {
   color: #fffaf0;
   background: var(--charcoal);
@@ -2854,6 +2860,12 @@ button:disabled {
 
 .canvas-shell.tool-markup .dom-node {
   cursor: move;
+}
+
+.canvas-shell.brush-tool,
+.canvas-shell.brush-tool .dom-canvas-layer,
+.canvas-shell.brush-tool .dom-node {
+  cursor: var(--brush-cursor, crosshair);
 }
 
 .dom-node.selected {

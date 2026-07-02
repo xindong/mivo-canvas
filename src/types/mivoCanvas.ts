@@ -62,6 +62,8 @@ export type MarkupPoint = {
   pressure?: number
 }
 export type MarkupBrushKind = 'marker' | 'highlighter'
+/** Brush tool modes: the two stroke kinds plus the FigJam-style whole-stroke eraser. */
+export type BrushToolMode = MarkupBrushKind | 'eraser'
 export type ConnectorBinding = {
   nodeId: string
   anchor: ConnectorAnchor

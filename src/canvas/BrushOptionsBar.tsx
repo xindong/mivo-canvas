@@ -1,17 +1,19 @@
-import { Highlighter, Pencil } from 'lucide-react'
+import { Eraser, Highlighter, Pencil } from 'lucide-react'
 import { useCanvasStore } from '../store/canvasStore'
-import type { MarkupBrushKind } from '../types/mivoCanvas'
+import type { BrushToolMode } from '../types/mivoCanvas'
 import { markupColorPresets } from './actions/canvasActionModel'
 import { brushWidthPresets } from './brushGeometry'
 
-const brushKinds: Array<{ kind: MarkupBrushKind; label: string; icon: typeof Pencil }> = [
+const brushKinds: Array<{ kind: BrushToolMode; label: string; icon: typeof Pencil }> = [
   { kind: 'marker', label: 'Marker', icon: Pencil },
   { kind: 'highlighter', label: 'Highlighter', icon: Highlighter },
+  { kind: 'eraser', label: 'Eraser', icon: Eraser },
 ]
 
 export function BrushOptionsBar() {
   const brushStyle = useCanvasStore((state) => state.brushStyle)
   const setBrushStyle = useCanvasStore((state) => state.setBrushStyle)
+  const strokeOptionsDisabled = brushStyle.kind === 'eraser'
 
   return (
     <div className="brush-options-bar" aria-label="Brush options" data-canvas-ui="true">
@@ -43,6 +45,7 @@ export function BrushOptionsBar() {
             onClick={() => setBrushStyle({ width: preset.width })}
             aria-label={`Brush width ${preset.label}`}
             title={`${preset.label} (${preset.width}px)`}
+            disabled={strokeOptionsDisabled}
           >
             <span
               className="brush-width-preview"
@@ -63,6 +66,7 @@ export function BrushOptionsBar() {
             onClick={() => setBrushStyle({ color: preset.value })}
             aria-label={`Brush color ${preset.label}`}
             title={preset.label}
+            disabled={strokeOptionsDisabled}
           >
             <span className="brush-color-swatch" style={{ background: preset.value }} />
           </button>
