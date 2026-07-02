@@ -3215,8 +3215,32 @@ try {
       throw new Error(`Multi-selection Arrange quick menu should expose ${action}`)
     }
   }
+  const arrangeTargetsBefore = await page.locator('.dom-node.selected:not([data-node-type="markup"])').evaluateAll((nodes) =>
+    nodes.map((node) => {
+      const rect = node.getBoundingClientRect()
+      return {
+        id: node.getAttribute('data-node-id'),
+        left: rect.left,
+        top: rect.top,
+      }
+    }),
+  )
   await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Arrange row' }).click()
   await page.waitForSelector('.selection-quick-toolbar-menu', { state: 'detached' })
+  const arrangeTargetsAfter = await page.locator('.dom-node.selected:not([data-node-type="markup"])').evaluateAll((nodes) =>
+    nodes.map((node) => {
+      const rect = node.getBoundingClientRect()
+      return {
+        id: node.getAttribute('data-node-id'),
+        left: rect.left,
+        top: rect.top,
+      }
+    }),
+  )
+  const movedArrangeTargets = arrangeTargetsAfter.filter((after) => {
+    const before = arrangeTargetsBefore.find((item) => item.id === after.id)
+    return before && (Math.abs(before.left - after.left) > 2 || Math.abs(before.top - after.top) > 2)
+  })
   const arrangedRowCenters = await page.locator('.dom-node.selected:not([data-node-type="markup"])').evaluateAll((nodes) =>
     nodes.map((node) => {
       const rect = node.getBoundingClientRect()
@@ -3225,10 +3249,65 @@ try {
   )
   if (
     arrangedRowCenters.length < 2 ||
+    movedArrangeTargets.length < 1 ||
     Math.max(...arrangedRowCenters) - Math.min(...arrangedRowCenters) > 2 ||
     (await page.locator('.selection-quick-toolbar').count()) !== 1
   ) {
-    throw new Error(`Arrange row should keep a multi-selection and align object centers: ${JSON.stringify(arrangedRowCenters)}`)
+    throw new Error(
+      `Arrange row should move selected objects, keep a multi-selection, and align object centers: centers=${JSON.stringify(
+        arrangedRowCenters,
+      )}, before=${JSON.stringify(arrangeTargetsBefore)}, after=${JSON.stringify(arrangeTargetsAfter)}`,
+    )
+  }
+  const selectedRowGapsBefore = await page.locator('.dom-node.selected:not([data-node-type="markup"])').evaluateAll((nodes) => {
+    const sorted = nodes
+      .map((node) => {
+        const rect = node.getBoundingClientRect()
+        return { id: node.getAttribute('data-node-id'), left: rect.left, right: rect.right }
+      })
+      .sort((a, b) => a.left - b.left)
+
+    return sorted.slice(0, -1).map((node, index) => sorted[index + 1].left - node.right)
+  })
+  const spacingHandle = page.locator('.selection-spacing-handle.horizontal').first()
+  if ((await spacingHandle.count()) !== 1 || selectedRowGapsBefore.length < 1) {
+    throw new Error(`Arrange row should expose a draggable horizontal spacing handle: gaps=${JSON.stringify(selectedRowGapsBefore)}`)
+  }
+  const spacingHandleLabelHidden = await spacingHandle.locator('span').evaluate((label) => getComputedStyle(label).opacity === '0')
+  if (!spacingHandleLabelHidden) {
+    throw new Error('Smart spacing labels should stay hidden until hover or drag')
+  }
+  const spacingHandleBox = await spacingHandle.boundingBox()
+  if (!spacingHandleBox) throw new Error('Missing spacing handle bounds')
+  const spacingHandleElement = await spacingHandle.elementHandle()
+  if (!spacingHandleElement) throw new Error('Missing spacing handle element')
+  await page.mouse.move(spacingHandleBox.x + spacingHandleBox.width / 2, spacingHandleBox.y + spacingHandleBox.height / 2)
+  await page.waitForFunction((element) => {
+    const label = element.querySelector('span')
+    return label ? Number(getComputedStyle(label).opacity) > 0.5 : false
+  }, spacingHandleElement)
+  await page.mouse.down()
+  await page.mouse.move(spacingHandleBox.x + spacingHandleBox.width / 2 + 48, spacingHandleBox.y + spacingHandleBox.height / 2, {
+    steps: 6,
+  })
+  await page.mouse.up()
+  const selectedRowGapsAfter = await page.locator('.dom-node.selected:not([data-node-type="markup"])').evaluateAll((nodes) => {
+    const sorted = nodes
+      .map((node) => {
+        const rect = node.getBoundingClientRect()
+        return { id: node.getAttribute('data-node-id'), left: rect.left, right: rect.right }
+      })
+      .sort((a, b) => a.left - b.left)
+
+    return sorted.slice(0, -1).map((node, index) => sorted[index + 1].left - node.right)
+  })
+  const gapSpreadAfterDrag = Math.max(...selectedRowGapsAfter) - Math.min(...selectedRowGapsAfter)
+  if (selectedRowGapsAfter.some((gap) => gap < selectedRowGapsBefore[0] + 24) || gapSpreadAfterDrag > 2) {
+    throw new Error(
+      `Dragging the horizontal spacing handle should create a larger uniform smart-selection gap: before=${JSON.stringify(
+        selectedRowGapsBefore,
+      )}, after=${JSON.stringify(selectedRowGapsAfter)}`,
+    )
   }
   await page.keyboard.press(process.platform === 'darwin' ? 'Meta+Z' : 'Control+Z')
   await page.waitForSelector('.selection-quick-toolbar')

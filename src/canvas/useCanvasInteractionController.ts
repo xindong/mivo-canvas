@@ -48,6 +48,14 @@ import {
 } from './canvasInteraction'
 import { canvasToolHandlers, type CanvasToolHandlerContext } from './canvasToolHandlers'
 import { isCanvasToolEnabled, markupKindForTool, toolForKeyboardShortcut } from './canvasToolRegistry'
+import {
+  smartSelectionGapFor,
+  smartSelectionHandlesFor,
+  smartSelectionLayoutFor,
+  smartSelectionSpacingUpdates,
+  type SmartSelectionHandle,
+  type SmartSelectionSpacingDragState,
+} from './smartSelection'
 import { defaultTextFontSize, defaultTextWeight, textGeometryFor } from './textGeometry'
 
 type UseCanvasInteractionControllerOptions = {
@@ -267,6 +275,7 @@ export function useCanvasInteractionController({
   const markupPointTransformRef = useRef<MarkupPointTransformState | null>(null)
   const textResizeRef = useRef<TextResizeState | null>(null)
   const groupResizeRef = useRef<GroupResizeState | null>(null)
+  const selectionSpacingDragRef = useRef<SmartSelectionSpacingDragState | null>(null)
   const persistedSceneRef = useRef(sceneId)
   const viewportPersistenceTimerRef = useRef<number | undefined>(undefined)
   const [viewport, setViewport] = useState(() => initialViewportFor(sceneId))
@@ -317,6 +326,16 @@ export function useCanvasInteractionController({
     !selectionBox &&
     Boolean(selectedBounds) &&
     selectedNodes.some((node) => !isNodeEffectivelyLocked(node, nodes))
+  const selectionSpacingHandles = useMemo(
+    () =>
+      showGroupSelectionBounds
+        ? smartSelectionHandlesFor(selectedNodes, {
+            isEffectivelyLocked: (node) => isNodeEffectivelyLocked(node, nodes),
+            viewportScale: viewport.scale,
+          })
+        : [],
+    [nodes, selectedNodes, showGroupSelectionBounds, viewport.scale],
+  )
 
   useEffect(() => {
     viewportRef.current = viewport
@@ -377,6 +396,7 @@ export function useCanvasInteractionController({
       nodeTransformRef.current = null
       textResizeRef.current = null
       groupResizeRef.current = null
+      selectionSpacingDragRef.current = null
     })
 
     return () => window.cancelAnimationFrame(frame)
@@ -555,6 +575,7 @@ export function useCanvasInteractionController({
       setSnapGuides([])
       setActiveSectionDropTargetId(undefined)
       setActiveConnectorDropTargetId(undefined)
+      selectionSpacingDragRef.current = null
       captureHistory()
 
       groupResizeRef.current = createGroupResizeState(
@@ -567,6 +588,43 @@ export function useCanvasInteractionController({
       )
     },
     [captureHistory, discardEmptyEditingText, onCloseContextMenu, selectedBounds, selectedNodes],
+  )
+
+  const beginSelectionSpacingDrag = useCallback(
+    (handle: SmartSelectionHandle, event: ReactPointerEvent<HTMLButtonElement>) => {
+      if (event.button !== 0) return
+
+      const startLayout = smartSelectionLayoutFor(selectedNodes, {
+        isEffectivelyLocked: (node) => isNodeEffectivelyLocked(node, nodes),
+      })
+      if (!startLayout) return
+      const startGap = smartSelectionGapFor(startLayout, handle.axis, handle.index)
+      if (startGap < 0) return
+
+      event.preventDefault()
+      event.stopPropagation()
+      event.currentTarget.setPointerCapture(event.pointerId)
+      onCloseContextMenu()
+      discardEmptyEditingText()
+      setEditingTextNodeId(undefined)
+      setSnapGuides([])
+      setActiveSectionDropTargetId(undefined)
+      setActiveConnectorDropTargetId(undefined)
+      groupResizeRef.current = null
+      captureHistory()
+
+      selectionSpacingDragRef.current = {
+        pointerId: event.pointerId,
+        axis: handle.axis,
+        index: handle.index,
+        layoutKind: startLayout.kind,
+        startClientX: event.clientX,
+        startClientY: event.clientY,
+        startGap,
+        startLayout,
+      }
+    },
+    [captureHistory, discardEmptyEditingText, nodes, onCloseContextMenu, selectedNodes],
   )
 
   const beginNodeMove = useCallback(
@@ -873,6 +931,19 @@ export function useCanvasInteractionController({
         return
       }
 
+      const selectionSpacingDrag = selectionSpacingDragRef.current
+      if (selectionSpacingDrag?.pointerId === event.pointerId) {
+        const { updates } = smartSelectionSpacingUpdates(
+          selectionSpacingDrag,
+          event.clientX,
+          event.clientY,
+          viewportRef.current.scale,
+        )
+
+        updateNodesGeometry(updates)
+        return
+      }
+
       const textCreation = textCreationRef.current
       if (textCreation?.pointerId === event.pointerId) {
         const point = screenToCanvas(event.clientX, event.clientY)
@@ -1059,6 +1130,10 @@ export function useCanvasInteractionController({
         setSnapGuides([])
       }
 
+      if (selectionSpacingDragRef.current?.pointerId === event.pointerId) {
+        selectionSpacingDragRef.current = null
+      }
+
       if (textCreationRef.current?.pointerId === event.pointerId) {
         const textCreation = textCreationRef.current
         const rect = rectFromTextCreation(textCreation)
@@ -1241,6 +1316,7 @@ export function useCanvasInteractionController({
         markupCreationRef.current = null
         markupPointTransformRef.current = null
         groupResizeRef.current = null
+        selectionSpacingDragRef.current = null
         nodeTransformRef.current = null
         textResizeRef.current = null
         setEditingTextNodeId(undefined)
@@ -1450,6 +1526,7 @@ export function useCanvasInteractionController({
     interactionMode,
     selectedNodes,
     selectedBounds,
+    selectionSpacingHandles,
     activeSectionDropTargetId,
     activeConnectorDropTargetId,
     showGroupSelectionBounds,
@@ -1460,6 +1537,7 @@ export function useCanvasInteractionController({
     markupCreationBox,
     selectionPreviewSet,
     beginGroupResize,
+    beginSelectionSpacingDrag,
     beginNodePointerDown,
     beginNodeResize,
     editTextNode,

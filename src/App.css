@@ -2577,7 +2577,7 @@ button:disabled {
 
 .selection-handle {
   position: absolute;
-  z-index: 30;
+  z-index: 32;
   padding: 0;
   pointer-events: auto;
   background: #fffaf0;
@@ -2603,6 +2603,135 @@ button:disabled {
 .selection-handle.se {
   transform: translate(-50%, -50%);
   cursor: nwse-resize;
+}
+
+.selection-spacing-handle {
+  position: absolute;
+  z-index: 31;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  color: #fffaf0;
+  pointer-events: auto;
+  background: transparent;
+  border: 0;
+  border-radius: 999px;
+  box-shadow: none;
+}
+
+.selection-spacing-handle.horizontal {
+  cursor: ew-resize;
+}
+
+.selection-spacing-handle.vertical {
+  cursor: ns-resize;
+}
+
+.selection-spacing-handle::before {
+  position: absolute;
+  content: "";
+  background: rgba(105, 87, 232, 0.6);
+  border-radius: 999px;
+  box-shadow: 0 0 0 2px rgba(255, 250, 240, 0.94);
+  opacity: 0.72;
+  transition:
+    opacity 120ms ease,
+    background 120ms ease,
+    transform 120ms ease;
+}
+
+.selection-spacing-handle.horizontal::before {
+  right: 6px;
+  left: 6px;
+  top: 50%;
+  height: 3px;
+  transform: translateY(-50%);
+}
+
+.selection-spacing-handle.vertical::before {
+  top: 6px;
+  bottom: 6px;
+  left: 50%;
+  width: 3px;
+  transform: translateX(-50%);
+}
+
+.selection-spacing-handle span {
+  position: absolute;
+  z-index: 1;
+  display: block;
+  min-width: 34px;
+  padding: 5px 8px;
+  color: #fffaf0;
+  font-weight: 850;
+  line-height: 1;
+  letter-spacing: 0;
+  pointer-events: none;
+  background: rgba(28, 28, 27, 0.96);
+  border-radius: 7px;
+  box-shadow: 0 10px 24px rgba(35, 35, 35, 0.22);
+  opacity: 0;
+  transition:
+    opacity 120ms ease,
+    transform 120ms ease;
+}
+
+.selection-spacing-handle.horizontal span {
+  left: 50%;
+  bottom: calc(100% + 6px);
+  transform: translateX(-50%) translateY(4px);
+}
+
+.selection-spacing-handle.vertical span {
+  left: calc(100% + 6px);
+  top: 50%;
+  transform: translateY(-50%) translateX(-4px);
+}
+
+.selection-spacing-handle:hover,
+.selection-spacing-handle:focus-visible,
+.selection-spacing-handle:active {
+  background: rgba(105, 87, 232, 0.1);
+}
+
+.selection-spacing-handle:hover::before,
+.selection-spacing-handle:focus-visible::before,
+.selection-spacing-handle:active::before {
+  background: #6957e8;
+  opacity: 1;
+}
+
+.selection-spacing-handle.horizontal:hover::before,
+.selection-spacing-handle.horizontal:focus-visible::before,
+.selection-spacing-handle.horizontal:active::before {
+  transform: translateY(-50%) scaleY(1.65);
+}
+
+.selection-spacing-handle.vertical:hover::before,
+.selection-spacing-handle.vertical:focus-visible::before,
+.selection-spacing-handle.vertical:active::before {
+  transform: translateX(-50%) scaleX(1.65);
+}
+
+.selection-spacing-handle:hover span,
+.selection-spacing-handle:focus-visible span,
+.selection-spacing-handle:active span {
+  opacity: 1;
+}
+
+.selection-spacing-handle.horizontal:hover span,
+.selection-spacing-handle.horizontal:focus-visible span,
+.selection-spacing-handle.horizontal:active span {
+  transform: translateX(-50%) translateY(0);
+}
+
+.selection-spacing-handle.vertical:hover span,
+.selection-spacing-handle.vertical:focus-visible span,
+.selection-spacing-handle.vertical:active span {
+  transform: translateY(-50%) translateX(0);
 }
 
 .dom-node {
