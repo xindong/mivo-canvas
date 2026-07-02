@@ -3692,6 +3692,13 @@ try {
   await page.locator('.chat-composer-textarea').fill('gemini aspect ratio test')
   await page.locator('.chat-composer-textarea').press('Enter')
   await page.waitForFunction((before) => document.querySelectorAll('.dom-node').length > before, countBeforeGemini, { timeout: 30000 })
+  // 节点增长（slot 创建）先于 generate 请求发出 —— 轮询直到请求被捕获，消除竞态
+  {
+    const geminiDeadline = Date.now() + 30000
+    while (!capturedGeminiPayload && Date.now() < geminiDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 200))
+    }
+  }
   // Client sends {model, imgRatio} — Vite proxy transforms to aspect_ratio for gemini
   if (capturedGeminiPayload?.model !== 'gemini-3-pro-image' || capturedGeminiPayload?.imgRatio !== '21:9') {
     throw new Error(`gemini 21:9 request should carry model and imgRatio, got: ${JSON.stringify(capturedGeminiPayload)}`)
