@@ -43,10 +43,14 @@ checks.push(async () => {
 })
 
 checks.push(async () => {
+  // The detailed rule text lives in docs/product-notes.md; the README keeps a link to the rule doc.
   const readme = await read('README.md')
-  requireIncludes(readme, 'Development Feedback Rule', 'README')
   requireIncludes(readme, 'docs/development-logging.md', 'README')
-  requireIncludes(readme, 'toastFeedback', 'README')
+
+  const productNotes = await read('docs/product-notes.md')
+  requireIncludes(productNotes, 'Development Feedback Rule', 'Product notes')
+  requireIncludes(productNotes, 'development-logging.md', 'Product notes')
+  requireIncludes(productNotes, 'toastFeedback', 'Product notes')
 })
 
 checks.push(async () => {
