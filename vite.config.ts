@@ -274,15 +274,17 @@ const normalizeMivoQuality = (quality: unknown): MivoImageQuality => {
   return value as MivoImageQuality
 }
 
-const normalizeMivoRatio = (imgRatio: unknown): MivoImageRatio => {
-  const value = typeof imgRatio === 'string' && imgRatio in mivoImageSizeMap ? imgRatio : '1:1'
-  return value as MivoImageRatio
-}
-
-const imageSizeFor = (imgRatio: unknown, quality: unknown) => {
-  const ratio = normalizeMivoRatio(imgRatio)
-  const normalizedQuality = normalizeMivoQuality(quality)
-  return mivoImageSizeMap[ratio][normalizedQuality]
+// B1: model-specific ratio payload — gemini uses aspect_ratio, gpt uses size
+const resolveRatioPayload = (modelId: string, imgRatio: unknown, quality: string): Record<string, string> => {
+  const allowedRatios = mivoModelRatioMap[modelId] ?? mivoModelRatioMap['gpt-image-2']
+  const defaultRatio = mivoModelDefaultRatio[modelId] ?? '1:1'
+  const rawRatio = typeof imgRatio === 'string' ? imgRatio : defaultRatio
+  const clampedRatio = (allowedRatios as string[]).includes(rawRatio) ? rawRatio : defaultRatio
+  if (modelId === 'gemini-3-pro-image') {
+    return { aspect_ratio: clampedRatio }
+  }
+  const gptRatio: MivoImageRatio = (clampedRatio in mivoImageSizeMap) ? clampedRatio as MivoImageRatio : '1:1'
+  return { size: mivoImageSizeMap[gptRatio][normalizeMivoQuality(quality)] }
 }
 
 const normalizeMivoImages = (payload: unknown): MivoImageResponse => {
@@ -345,6 +347,7 @@ const proxyMivoGenerate = async (
     }
 
     const quality = normalizeMivoQuality(body.quality)
+    const modelId = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : defaultMivoImageModel
     const upstreamResponse = await fetchUpstreamWithTimeout(`${mivoImageApiBase}/generations`, {
       method: 'POST',
       headers: {
@@ -352,10 +355,10 @@ const proxyMivoGenerate = async (
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: typeof body.model === 'string' && body.model.trim() ? body.model.trim() : defaultMivoImageModel,
+        model: modelId,
         prompt,
         n: Number.isFinite(Number(body.n)) ? Math.max(1, Math.min(4, Math.floor(Number(body.n)))) : 1,
-        size: imageSizeFor(body.imgRatio, quality),
+        ...resolveRatioPayload(modelId, body.imgRatio, quality),
         quality,
       }),
     })
@@ -410,8 +413,9 @@ const proxyMivoEdit = async (
     }
     formData.set('model', model)
     formData.set('prompt', prompt)
-    formData.set('size', imageSizeFor(firstMultipartField(fields, 'imgRatio'), quality))
     formData.set('quality', quality)
+    const ratioPayload = resolveRatioPayload(model, firstMultipartField(fields, 'imgRatio'), quality)
+    Object.entries(ratioPayload).forEach(([k, v]) => formData.set(k, v))
 
     const upstreamResponse = await fetchUpstreamWithTimeout(
       `${mivoImageApiBase}/edits`,

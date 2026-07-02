@@ -3626,6 +3626,54 @@ try {
   })
   if (storedMsgCount < 2) throw new Error(`Chat messages should be persisted in localStorage, got ${storedMsgCount}`)
 
+  // NB3: gemini 21:9 → aspect_ratio:"21:9" in upstream payload (no size)
+  let capturedGeminiPayload = null
+  await page.unroute('**/api/mivo/generate')
+  await page.route('**/api/mivo/generate', async (route) => {
+    try { capturedGeminiPayload = JSON.parse(route.request().postData() || '{}') } catch { capturedGeminiPayload = {} }
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }) })
+  })
+  // Deselect canvas nodes so generate (not edit) is called
+  await page.locator('.canvas-shell').click({ position: { x: 10, y: 10 } })
+  await page.waitForTimeout(200)
+  await page.evaluate(async () => {
+    const spec = performance.getEntriesByType('resource').map(r => r.name).find(n => n.includes('chatStore.ts'))
+    if (!spec) return
+    const { useChatStore } = await import(new URL(spec).pathname + new URL(spec).search)
+    useChatStore.getState().setSelectedModel('gemini-3-pro-image')
+    useChatStore.getState().setParamOverride('imgRatio', '21:9')
+  })
+  const countBeforeGemini = await page.locator('.dom-node').count()
+  await page.locator('.chat-composer-textarea').fill('gemini aspect ratio test')
+  await page.locator('.chat-composer-textarea').press('Enter')
+  await page.waitForFunction((before) => document.querySelectorAll('.dom-node').length > before, countBeforeGemini, { timeout: 30000 })
+  // Client sends {model, imgRatio} — Vite proxy transforms to aspect_ratio for gemini
+  if (capturedGeminiPayload?.model !== 'gemini-3-pro-image' || capturedGeminiPayload?.imgRatio !== '21:9') {
+    throw new Error(`gemini 21:9 request should carry model and imgRatio, got: ${JSON.stringify(capturedGeminiPayload)}`)
+  }
+  await page.unroute('**/api/mivo/generate')
+  await page.route('**/api/mivo/generate', async (route) => {
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }) })
+  })
+  await page.evaluate(async () => {
+    const spec = performance.getEntriesByType('resource').map(r => r.name).find(n => n.includes('chatStore.ts'))
+    if (!spec) return
+    const { useChatStore } = await import(new URL(spec).pathname + new URL(spec).search)
+    useChatStore.getState().setSelectedModel('gpt-image-2')
+    useChatStore.getState().setParamOverride('imgRatio', 'auto')
+  })
+  // Wait for isBusy to clear after gemini generation
+  await page.evaluate(async () => {
+    const spec = performance.getEntriesByType('resource').map(r => r.name).find(n => n.includes('chatStore.ts'))
+    if (!spec) return
+    const { useChatStore } = await import(new URL(spec).pathname + new URL(spec).search)
+    const waitIdle = () => new Promise((resolve) => {
+      if (!useChatStore.getState().isBusy) return resolve(null)
+      const unsub = useChatStore.subscribe((s) => { if (!s.isBusy) { unsub(); resolve(null) } })
+    })
+    await waitIdle()
+  })
+
   const workflowCount = await page.locator('.dom-node').count()
 
   await page.getByRole('button', { name: '4 张变体结果' }).click()

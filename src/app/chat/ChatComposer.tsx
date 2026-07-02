@@ -97,6 +97,7 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
       const trimmed = text.trim()
       if (!trimmed || isBusy) return
       const filesToSend = referenceFiles.map((f) => f.file)
+      referenceFiles.forEach((f) => URL.revokeObjectURL(f.previewUrl))
       setText('')
       setReferenceFiles([])
       setReferenceError('')

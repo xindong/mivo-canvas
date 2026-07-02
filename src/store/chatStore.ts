@@ -30,6 +30,8 @@ export type ChatMessage = {
   resultNodeIds?: string[]
   origin?: ChatMessageOrigin
   error?: string
+  selectedNodeId?: string
+  selectedNodeType?: string
 }
 
 export type ChatParamOverrides = {
@@ -96,6 +98,8 @@ export const useChatStore = create<ChatState>()(
           text,
           createdAt: Date.now(),
           status: 'done',
+          selectedNodeId,
+          selectedNodeType,
         }
         const assistantMessage: ChatMessage = {
           id: assistantMessageId,
@@ -175,13 +179,21 @@ export const useChatStore = create<ChatState>()(
             nodeIds = await canvasStore.generateIntoAiSlot(slotId, finalPrompt, genOptions)
           }
 
+          // B2: guard against cross-canvas scene switch during generation
+          const resultNodeIds = useCanvasStore.getState().sceneId === sceneId ? nodeIds : undefined
+
           set((s) => ({
             isBusy: false,
             messagesByScene: {
               ...s.messagesByScene,
               [sceneId]: (s.messagesByScene[sceneId] || []).map((m) =>
                 m.id === assistantMessageId
-                  ? { ...m, status: 'done' as const, resultNodeIds: nodeIds }
+                  ? {
+                      ...m,
+                      status: 'done' as const,
+                      resultNodeIds,
+                      ...(resultNodeIds === undefined ? { text: '结果已生成到其他画布' } : {}),
+                    }
                   : m,
               ),
             },
@@ -208,13 +220,14 @@ export const useChatStore = create<ChatState>()(
 
         const messages = state.messagesByScene[sceneId] || []
         const targetMsg = messages.find((m) => m.id === messageId)
-        if (!targetMsg || !targetMsg.enhance?.richPrompt) return
+        // NB2: fall back to message.text when no richPrompt (degraded enhance case)
+        if (!targetMsg) return
 
         const { selectedModel, paramOverrides } = state
-        const finalRatio = paramOverrides.imgRatio !== 'auto' ? paramOverrides.imgRatio : targetMsg.enhance.imgRatio
+        const finalRatio = paramOverrides.imgRatio !== 'auto' ? paramOverrides.imgRatio : targetMsg.enhance?.imgRatio
         const finalQuality: MivoImageQuality =
-          paramOverrides.quality !== 'auto' ? (paramOverrides.quality as MivoImageQuality) : (targetMsg.enhance.quality || 'medium')
-        const finalPrompt = targetMsg.enhance.richPrompt
+          paramOverrides.quality !== 'auto' ? (paramOverrides.quality as MivoImageQuality) : (targetMsg.enhance?.quality || 'medium')
+        const finalPrompt = targetMsg.enhance?.richPrompt || targetMsg.text
 
         set((s) => ({
           isBusy: true,
@@ -228,19 +241,24 @@ export const useChatStore = create<ChatState>()(
 
         try {
           const canvasStore = useCanvasStore.getState()
-          const slotId = canvasStore.addAiSlotNode({ x: 0, y: 0 }, undefined, finalPrompt)
+          const { nodes } = canvasStore
+          const slotX = -160 + nodes.length * 18
+          const slotId = canvasStore.addAiSlotNode({ x: slotX, y: slotX }, { width: 320, height: 320 }, finalPrompt)
           const nodeIds = await canvasStore.generateIntoAiSlot(slotId, finalPrompt, {
             imgRatio: finalRatio,
             quality: finalQuality,
             model: selectedModel,
           })
 
+          // B2: guard against cross-canvas scene switch during regeneration
+          const resultNodeIds = useCanvasStore.getState().sceneId === sceneId ? nodeIds : undefined
+
           set((s) => ({
             isBusy: false,
             messagesByScene: {
               ...s.messagesByScene,
               [sceneId]: (s.messagesByScene[sceneId] || []).map((m) =>
-                m.id === messageId ? { ...m, status: 'done' as const, resultNodeIds: nodeIds } : m,
+                m.id === messageId ? { ...m, status: 'done' as const, resultNodeIds } : m,
               ),
             },
           }))
@@ -295,7 +313,12 @@ export const useChatStore = create<ChatState>()(
           },
         }))
 
-        await get().sendMessage({ sceneId, text: userMsg.text })
+        await get().sendMessage({
+          sceneId,
+          text: userMsg.text,
+          selectedNodeId: userMsg.selectedNodeId,
+          selectedNodeType: userMsg.selectedNodeType,
+        })
       },
 
       clearScene: (sceneId) =>
