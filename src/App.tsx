@@ -3,7 +3,7 @@ import { useCallback, type DragEvent as ReactDragEvent } from 'react'
 import { useEffect } from 'react'
 import { useRef } from 'react'
 import { useState } from 'react'
-import { AIToolPanel } from './app/AIToolPanel'
+import { ChatPanel } from './app/chat/ChatPanel'
 import { LibraryWorkspace } from './app/LibraryWorkspace'
 import { MivoCanvas, type ExternalAssetDropHandler } from './canvas/MivoCanvas'
 import { InspectorPanel } from './app/InspectorPanel'
@@ -223,7 +223,7 @@ function App() {
               onMaskEditActiveChange={handleMaskEditActiveChange}
               maskCancelRequestId={maskCancelRequestId}
             />
-            <AIToolPanel
+            <ChatPanel
               open={aiPanelOpen}
               onToggle={() => setAiPanelOpen((current) => !current)}
               focusRequestId={aiPanelFocusRequestId}
