@@ -16,8 +16,8 @@ import { canImportCanvasFile, importFilesToCanvas, importImageUrlToCanvas } from
 import { readCanvasImageBlob } from '../lib/canvasImageSource'
 import { editMivoImage } from '../lib/mivoImageClient'
 import { useCanvasStore } from '../store/canvasStore'
+import { useChatStore } from '../store/chatStore'
 import { CanvasContextMenu } from './CanvasContextMenu'
-import { CanvasAiActionBar } from './CanvasAiActionBar'
 import { CanvasNodeView } from './CanvasNodeView'
 import { CanvasToolDock } from './CanvasToolDock'
 import { ImageCropOverlay, type ImageCropBox } from './ImageCropOverlay'
@@ -108,7 +108,6 @@ const isNodeEffectivelyLocked = (nodeId: string, nodes: Array<{ id: string; type
 
 export function MivoCanvas({
   onOpenDetails,
-  onOpenGeneratePanel,
   onRegisterExternalAssetDrop,
   onMaskEditActiveChange,
   maskCancelRequestId = 0,
@@ -140,7 +139,6 @@ export function MivoCanvas({
   const visibleNodes = useMemo(() => nodes.filter((node) => !node.hidden), [nodes])
   const contextMenuNode =
     contextMenu?.kind === 'node' ? visibleNodes.find((node) => node.id === contextMenuNodeId) : undefined
-  const selectedNode = selectedNodeId ? visibleNodes.find((node) => node.id === selectedNodeId) : undefined
   const cropNode = cropNodeId ? visibleNodes.find((node) => node.id === cropNodeId && node.type === 'image') : undefined
   const closeContextMenu = useCallback(() => setContextMenu(null), [])
   const cancelMaskEdit = useCallback(() => {
@@ -321,7 +319,7 @@ export function MivoCanvas({
           model: 'gpt-image-2',
           signal: abortController.signal,
         })
-        await commitGenerationResult({
+        const nodeIds = await commitGenerationResult({
           sourceNodeId: source.id,
           resultImages: response.images,
           prompt: payload.prompt,
@@ -330,6 +328,8 @@ export function MivoCanvas({
           maskBounds: payload.maskBounds,
           placement: 'right',
         })
+        const sceneId = useCanvasStore.getState().sceneId
+        useChatStore.getState().appendNotice({ sceneId, origin: 'mask-edit', nodeIds, prompt: payload.prompt })
         setMaskEditNodeId(undefined)
       } finally {
         if (maskEditAbortRef.current === abortController) {
@@ -561,13 +561,6 @@ export function MivoCanvas({
     >
       <div className="canvas-host" ref={hostRef} />
       <CanvasToolDock previewTool={temporaryTool === 'hand' ? 'hand' : undefined} />
-      <CanvasAiActionBar
-        selectedNode={selectedNode}
-        maskEditActive={Boolean(maskEditNodeId)}
-        onOpenGeneratePanel={onOpenGeneratePanel || (() => undefined)}
-        onStartMaskEdit={beginMaskEdit}
-        onCancelMaskEdit={cancelMaskEdit}
-      />
       <div
         className="dom-canvas-layer"
         style={{ transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})` }}
