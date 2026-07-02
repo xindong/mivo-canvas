@@ -8,8 +8,10 @@ type ChatMessageListProps = {
   sceneId: string
 }
 
+const EMPTY_MESSAGES: import('../../store/chatStore').ChatMessage[] = []
+
 export function ChatMessageList({ sceneId }: ChatMessageListProps) {
-  const messages = useChatStore((s) => s.messagesByScene[sceneId] ?? [])
+  const messages = useChatStore((s) => s.messagesByScene[sceneId] ?? EMPTY_MESSAGES)
   const retryMessage = useChatStore((s) => s.retryMessage)
   const isBusy = useChatStore((s) => s.isBusy)
   const nodes = useCanvasStore((s) => s.nodes)

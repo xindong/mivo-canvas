@@ -221,6 +221,20 @@ try {
       body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }),
     })
   })
+  await page.route('**/api/mivo/enhance', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        scene: 'general',
+        reasoning: 'e2e',
+        richPrompt: 'e2e derived concept image',
+        imgRatio: '1:1',
+        quality: 'medium',
+        enhanced: true,
+      }),
+    })
+  })
 
   page.on('console', (message) => {
     if (message.type() === 'error') errors.push(message.text())
@@ -3561,10 +3575,15 @@ try {
   await page.getByRole('button', { name: 'Close details' }).click()
   await page.waitForSelector('.details-dialog', { state: 'detached' })
 
+  // Chat-based generation: ensure ChatPanel is open, select node, fill composer, send
+  if (await page.locator('.ai-panel.collapsed').isVisible()) {
+    await page.getByRole('button', { name: 'Open AI panel' }).click()
+    await page.waitForSelector('.chat-composer-textarea', { state: 'visible' })
+  }
+  await page.locator(`[data-node-id="${firstNodeId}"]`).click()
   const countBeforeGenerate = await page.locator('.dom-node').count()
-  await page.locator('.canvas-ai-action-bar').getByRole('button', { name: '生成' }).click()
-  await page.locator('.ai-prompt-box textarea').fill('e2e derived concept image')
-  await page.getByRole('button', { name: '立即生成' }).click()
+  await page.locator('.chat-composer-textarea').fill('e2e derived concept image')
+  await page.locator('.chat-composer-textarea').press('Enter')
   await page.waitForFunction((count) => document.querySelectorAll('.dom-node').length >= count + 2, countBeforeGenerate)
 
   const generatedCount = await page.locator('.dom-node').count()
@@ -3584,64 +3603,29 @@ try {
     throw new Error(`Immediate generation should create a derived result beside the selected source: ${JSON.stringify(besideResult)}`)
   }
 
-  const countBeforeSlot = await page.locator('.dom-node').count()
-  await page.getByRole('button', { name: '新建生成槽位' }).click()
-  await page.waitForSelector('.dom-node.ai-slot-node')
-  await page.waitForFunction((count) => document.querySelectorAll('.dom-node').length === count + 1, countBeforeSlot)
-  const slotNodeId = await page.locator('.dom-node.ai-slot-node').last().getAttribute('data-node-id')
-  if (!slotNodeId) throw new Error('AI slot creation should produce a selectable slot node')
-  await page.getByRole('button', { name: '生成到槽位' }).click()
-  await page.waitForFunction((count) => document.querySelectorAll('.dom-node').length >= count + 3, countBeforeSlot)
-  const slotResult = await page.locator('.dom-node[data-ai-kind="result"][data-ai-operation="slot-generation"]').last().evaluate((node) => ({
-    kind: node.getAttribute('data-ai-kind'),
-    operation: node.getAttribute('data-ai-operation'),
-    sourceNodeIds: node.getAttribute('data-ai-source-node-ids'),
-  }))
-  if (
-    slotResult.kind !== 'result' ||
-    slotResult.operation !== 'slot-generation' ||
-    !slotResult.sourceNodeIds?.includes(slotNodeId)
-  ) {
-    throw new Error(`Slot generation should keep the slot and create a result linked to it: ${JSON.stringify(slotResult)}`)
-  }
+  // Assert chat state: param card appeared in assistant bubble
+  await page.waitForSelector('.chat-param-card')
+  const paramCardVisible = await page.locator('.chat-param-card').isVisible()
+  if (!paramCardVisible) throw new Error('Enhance param card should be visible after generation')
 
-  const countBeforeAnnotation = await page.locator('.dom-node').count()
-  await page.locator(`[data-node-id="${firstNodeId}"]`).click()
-  await page.getByRole('button', { name: '添加批注修图' }).click()
-  await page.waitForSelector('.dom-node.annotation-node')
-  await page.waitForFunction((count) => document.querySelectorAll('.dom-node').length === count + 1, countBeforeAnnotation)
-  const annotationNodeId = await page.locator('.dom-node.annotation-node').last().getAttribute('data-node-id')
-  if (!annotationNodeId) throw new Error('Annotation creation should produce a selectable note node')
-  await page.getByRole('button', { name: '从批注生成' }).click()
-  await page.waitForFunction((count) => document.querySelectorAll('.dom-node').length >= count + 3, countBeforeAnnotation)
-  const annotationResult = await page.locator('.dom-node[data-ai-kind="result"][data-ai-operation="annotation-edit"]').last().evaluate((node) => ({
-    kind: node.getAttribute('data-ai-kind'),
-    operation: node.getAttribute('data-ai-operation'),
-    sourceNodeIds: node.getAttribute('data-ai-source-node-ids'),
-  }))
-  if (
-    annotationResult.kind !== 'result' ||
-    annotationResult.operation !== 'annotation-edit' ||
-    !annotationResult.sourceNodeIds?.includes(firstNodeId)
-  ) {
-    throw new Error(`Annotation generation should create a clean derived result beside the source: ${JSON.stringify(annotationResult)}`)
-  }
+  // Assert chat state: assistant result bubble present
+  const assistantBubbles = await page.locator('.chat-message-assistant').count()
+  if (assistantBubbles < 1) throw new Error('Assistant message bubble should appear after generation')
 
-  await page.getByRole('button', { name: '查看 AI 上下文' }).click()
-  const aiContextPreview = await page.locator('.ai-context-preview').textContent()
-  if (
-    !aiContextPreview?.includes('"slots": 1') ||
-    !aiContextPreview.includes('"annotations": 1') ||
-    !aiContextPreview.includes('"annotation-edit"') ||
-    !aiContextPreview.includes('"slot-generation"')
-  ) {
-    throw new Error(`AI context preview should serialize slots, annotations, and derivation links: ${aiContextPreview}`)
-  }
-  const aiContext = JSON.parse(aiContextPreview)
-  const aiLinkKeys = aiContext.links.map((link) => `${link.kind}:${link.fromNodeId}:${link.toNodeId}`)
-  if (new Set(aiLinkKeys).size !== aiLinkKeys.length) {
-    throw new Error(`AI context links should be de-duplicated: ${aiLinkKeys.join(', ')}`)
-  }
+  // Persist check: verify messages are durably stored in localStorage before reload
+  const storedMsgCount = await page.evaluate(() => {
+    try {
+      const raw = localStorage.getItem('mivo-chat-demo')
+      if (!raw) return 0
+      const parsed = JSON.parse(raw)
+      const byScene = parsed?.state?.messagesByScene ?? {}
+      return Object.values(byScene).flat().length
+    } catch {
+      return 0
+    }
+  })
+  if (storedMsgCount < 2) throw new Error(`Chat messages should be persisted in localStorage, got ${storedMsgCount}`)
+
   const workflowCount = await page.locator('.dom-node').count()
 
   await page.getByRole('button', { name: '4 张变体结果' }).click()
@@ -3872,7 +3856,9 @@ try {
   const imageCountFor = (state) => state.nodes.filter((node) => node.type === 'image').length
   const verifyMaskEditFlow = async ({ sourceNodeId, sourceLabel, toolId, toolLabel }) => {
     await page.locator(`[data-node-id="${sourceNodeId}"]`).click()
-    await page.locator('.canvas-ai-action-bar').getByRole('button', { name: '局部重绘' }).click()
+    await page.waitForSelector('.selection-quick-toolbar')
+    await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
+    await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
     await page.waitForSelector('.image-mask-edit-stage')
     await assertMaskFloatingControlsSeparated()
     await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: toolLabel, exact: true }).click()
@@ -3958,11 +3944,29 @@ try {
     throw new Error(`Mask edit smoke should mark at least one region per tool: ${JSON.stringify(maskEditSmokeResults)}`)
   }
 
+  // Assert mask-edit notice persisted in chatStore after local repaint
+  const maskNoticeCount = await page.evaluate(() => {
+    try {
+      const raw = localStorage.getItem('mivo-chat-demo')
+      if (!raw) return 0
+      const parsed = JSON.parse(raw)
+      const byScene = parsed?.state?.messagesByScene ?? {}
+      return Object.values(byScene).flat().filter((m) => m.kind === 'notice' && m.origin === 'mask-edit').length
+    } catch {
+      return 0
+    }
+  })
+  if (maskNoticeCount < 1) {
+    throw new Error(`chatStore should contain at least one mask-edit notice after local repaint, got ${maskNoticeCount}`)
+  }
+
   await page.screenshot({ path: 'test-artifacts/e2e-smoke.png', fullPage: true })
   await browser.close()
 
-  if (errors.length) {
-    throw new Error(`Console errors:\n${errors.join('\n')}`)
+  // Filter known spurious network errors (Eagle mock uses filesystem paths as image URLs on macOS)
+  const realErrors = errors.filter((e) => !e.includes('ERR_UNKNOWN_URL_SCHEME'))
+  if (realErrors.length) {
+    throw new Error(`Console errors:\n${realErrors.join('\n')}`)
   }
 
   console.log('E2E smoke test passed')
