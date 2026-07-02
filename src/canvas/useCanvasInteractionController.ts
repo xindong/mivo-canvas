@@ -210,6 +210,7 @@ const normalizeMarkupPoints = (box: MarkupCreationState, bounds: CanvasBounds): 
   return sourcePoints.map((point) => ({
     x: point.x - bounds.x,
     y: point.y - bounds.y,
+    ...('pressure' in point && point.pressure !== undefined ? { pressure: point.pressure } : {}),
   }))
 }
 
@@ -991,7 +992,11 @@ export function useCanvasInteractionController({
           const distance = previousPoint
             ? Math.abs(previousPoint.x - point.x) + Math.abs(previousPoint.y - point.y)
             : Number.POSITIVE_INFINITY
-          if (distance > 2) markupCreation.points.push(point)
+          if (distance > 2) {
+            markupCreation.points.push(
+              event.pointerType === 'pen' ? { ...point, pressure: event.pressure } : point,
+            )
+          }
         }
         setMarkupCreationBox({ ...markupCreation, points: [...markupCreation.points] })
         return
@@ -1227,11 +1232,25 @@ export function useCanvasInteractionController({
           points = next.points
         }
 
-        addMarkupNode(markupCreation.kind, finalPosition, finalSize, { points, select: false, ...connectorOptions })
+        const isBrush = markupCreation.kind === 'brush'
+        const brushStyle = useCanvasStore.getState().brushStyle
+        addMarkupNode(markupCreation.kind, finalPosition, finalSize, {
+          points,
+          select: false,
+          ...(isBrush
+            ? {
+                strokeColor: brushStyle.color,
+                strokeWidth: brushStyle.width,
+                brushKind: brushStyle.kind,
+              }
+            : {}),
+          ...connectorOptions,
+        })
         markupCreationRef.current = null
         setMarkupCreationBox(null)
         setActiveConnectorDropTargetId(undefined)
-        setActiveTool('select')
+        // Brush stays active for continuous strokes (FigJam/Excalidraw convention); Esc or V exits.
+        if (!isBrush) setActiveTool('select')
       }
 
       if (nodeTransformRef.current?.pointerId === event.pointerId) {
@@ -1335,6 +1354,7 @@ export function useCanvasInteractionController({
         setSnapGuides([])
         setActiveConnectorDropTargetId(undefined)
         selectNode(undefined)
+        if (useCanvasStore.getState().activeTool !== 'select') setActiveTool('select')
         return
       }
 

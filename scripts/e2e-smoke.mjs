@@ -1865,10 +1865,16 @@ try {
     const flyout = document.querySelector('.canvas-tool-flyout')
     return flyout && window.getComputedStyle(flyout).visibility === 'visible'
   })
-  for (const tool of ['Arrow', 'Line', 'Rectangle', 'Ellipse', 'Brush']) {
+  for (const tool of ['Arrow', 'Line', 'Rectangle', 'Ellipse']) {
     if ((await page.locator('.canvas-tool-flyout').getByRole('menuitem', { name: tool }).count()) !== 1) {
       throw new Error(`Draw flyout should expose ${tool}`)
     }
+  }
+  if ((await page.locator('.canvas-tool-flyout').getByRole('menuitem', { name: 'Brush' }).count()) !== 0) {
+    throw new Error('Brush should be a first-class dock tool instead of a Draw flyout item')
+  }
+  if ((await page.locator('.canvas-tool-dock > button[aria-label="Brush"]').count()) !== 1) {
+    throw new Error('Brush should render as a top-level dock button')
   }
   await drawToolButton.click()
   await page.mouse.move(farBlankPoint.x, farBlankPoint.y)
@@ -2467,6 +2473,72 @@ try {
   )
   await page.waitForSelector('.selection-quick-toolbar')
   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Delete' }).click()
+
+  const brushCountBefore = await page.locator('.dom-node.markup-node[data-markup-kind="brush"]').count()
+  const brushStrokeStart = { x: markupShapeTestPoint.x, y: markupShapeTestPoint.y + 150 }
+  const drawBrushStroke = async (offsetY) => {
+    await page.mouse.move(brushStrokeStart.x, brushStrokeStart.y + offsetY)
+    await page.mouse.down()
+    await page.mouse.move(brushStrokeStart.x + 60, brushStrokeStart.y + offsetY - 24, { steps: 5 })
+    await page.mouse.move(brushStrokeStart.x + 130, brushStrokeStart.y + offsetY + 12, { steps: 5 })
+    await page.mouse.up()
+  }
+
+  await page.getByRole('button', { name: 'Brush' }).click()
+  await page.waitForSelector('.brush-options-bar')
+  await page.locator('.brush-options-bar').getByRole('radio', { name: 'Brush width Bold' }).click()
+  await page.locator('.brush-options-bar').getByRole('radio', { name: 'Brush color Orange' }).click()
+  await drawBrushStroke(0)
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="brush"]').length === count + 1,
+    brushCountBefore,
+  )
+  const brushButtonClassAfterStroke = await page
+    .locator('.canvas-tool-dock > button[aria-label="Brush"]')
+    .getAttribute('class')
+  if (!brushButtonClassAfterStroke?.includes('active')) {
+    throw new Error('Brush should stay active after a stroke for continuous drawing')
+  }
+  await drawBrushStroke(40)
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="brush"]').length === count + 2,
+    brushCountBefore,
+  )
+  const markerBrushNode = page.locator('.dom-node.markup-node[data-markup-kind="brush"]').last()
+  const markerBrushFill = await markerBrushNode.locator('svg.dom-markup-node > path').getAttribute('fill')
+  if (markerBrushFill !== '#ff8a00') {
+    throw new Error(`Brush strokes should render a filled freehand path in the picked color, got ${markerBrushFill}`)
+  }
+
+  await page.locator('.brush-options-bar').getByRole('radio', { name: 'Highlighter' }).click()
+  await drawBrushStroke(80)
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="brush"]').length === count + 3,
+    brushCountBefore,
+  )
+  const highlighterNode = page.locator('.dom-node.markup-node[data-markup-kind="brush"]').last()
+  const highlighterFillOpacity = await highlighterNode
+    .locator('svg.dom-markup-node > path')
+    .getAttribute('fill-opacity')
+  if (Math.abs(Number(highlighterFillOpacity) - 0.42) > 0.01) {
+    throw new Error(`Highlighter strokes should render semi-transparent, got fill-opacity=${highlighterFillOpacity}`)
+  }
+
+  await page.keyboard.press('Escape')
+  await page.waitForFunction(() => {
+    const selectButton = [...document.querySelectorAll('.canvas-tool-dock button')].find(
+      (button) => button.getAttribute('aria-label') === 'Select',
+    )
+    return selectButton?.classList.contains('active') && !document.querySelector('.brush-options-bar')
+  })
+  for (let strokeIndex = 0; strokeIndex < 3; strokeIndex += 1) {
+    await page.locator('.dom-node.markup-node[data-markup-kind="brush"]').last().click()
+    await page.keyboard.press('Backspace')
+    await page.waitForFunction(
+      (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="brush"]').length === count,
+      brushCountBefore + 2 - strokeIndex,
+    )
+  }
 
   const secondNode = page.locator('.dom-node').nth(1)
   const visibleNodeCountBeforeOrganization = await page.locator('.dom-node').count()

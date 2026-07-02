@@ -58,7 +58,10 @@ export type ConnectorAnchor = 'center' | 'top' | 'right' | 'bottom' | 'left'
 export type MarkupPoint = {
   x: number
   y: number
+  /** Stylus pressure in [0, 1]; only recorded for pen input so mouse strokes keep simulated pressure. */
+  pressure?: number
 }
+export type MarkupBrushKind = 'marker' | 'highlighter'
 export type ConnectorBinding = {
   nodeId: string
   anchor: ConnectorAnchor
@@ -209,6 +212,7 @@ export type MivoCanvasNode = {
   textAlign?: 'left' | 'center' | 'right'
   textAutoWidth?: boolean
   markupKind?: MarkupKind
+  markupBrushKind?: MarkupBrushKind
   markupPoints?: MarkupPoint[]
   markupStrokeColor?: string
   markupFillColor?: string
@@ -273,6 +277,7 @@ export type AiCanvasContextNode = {
   sectionId?: string
   targetNodeId?: string
   markupKind?: MarkupKind
+  markupBrushKind?: MarkupBrushKind
   markupPoints?: MarkupPoint[]
   markupStrokeColor?: string
   markupFillColor?: string

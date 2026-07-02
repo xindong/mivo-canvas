@@ -54,7 +54,8 @@ const isMarkupPointArray = (value: unknown) =>
       (point) =>
         isRecord(point) &&
         typeof point.x === 'number' &&
-        typeof point.y === 'number',
+        typeof point.y === 'number' &&
+        (point.pressure === undefined || typeof point.pressure === 'number'),
     ))
 
 const isImageCrop = (value: unknown) => {
@@ -117,6 +118,9 @@ const isCanvasNode = (value: unknown): value is MivoCanvasNode => {
   const markupFieldsValid =
     value.type !== 'markup' ||
     (isMarkupKind(value.markupKind) &&
+      (value.markupBrushKind === undefined ||
+        value.markupBrushKind === 'marker' ||
+        value.markupBrushKind === 'highlighter') &&
       isMarkupPointArray(value.markupPoints) &&
       (value.markupStrokeColor === undefined || typeof value.markupStrokeColor === 'string') &&
       (value.markupFillColor === undefined || typeof value.markupFillColor === 'string') &&

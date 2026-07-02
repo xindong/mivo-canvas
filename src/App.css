@@ -2294,6 +2294,74 @@ button:disabled {
   background: transparent;
 }
 
+.brush-options-bar {
+  position: absolute;
+  left: 84px;
+  top: 70px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 9px;
+  background: rgba(255, 250, 240, 0.94);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(14px);
+}
+
+.brush-options-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.brush-options-divider {
+  align-self: stretch;
+  width: 1px;
+  margin: 2px 3px;
+  background: var(--line);
+}
+
+.brush-options-bar button {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  color: #554f48;
+  background: transparent;
+  border-radius: 7px;
+}
+
+.brush-options-bar button:hover {
+  background: rgba(85, 79, 72, 0.1);
+}
+
+.brush-options-bar button.active {
+  color: #fffaf0;
+  background: var(--charcoal);
+}
+
+.brush-width-preview {
+  display: block;
+  width: 16px;
+  background: currentColor;
+  border-radius: 99px;
+}
+
+.brush-options-bar button.brush-color-button.active {
+  background: rgba(85, 79, 72, 0.14);
+  box-shadow: inset 0 0 0 2px var(--charcoal);
+}
+
+.brush-color-swatch {
+  display: block;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12);
+}
+
 .dock-divider {
   position: absolute;
   top: -5px;

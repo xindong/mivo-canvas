@@ -253,7 +253,7 @@ const sectionBorderPresets = [
   { label: 'Gray', value: '#8c8880' },
 ]
 
-const markupColorPresets = [
+export const markupColorPresets = [
   { label: 'Purple', value: '#6957e8' },
   { label: 'Blue', value: '#159bff' },
   { label: 'Red', value: '#b9473a' },

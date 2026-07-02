@@ -9,6 +9,7 @@ import type {
   CanvasTask,
   ConnectorBinding,
   DemoSceneId,
+  MarkupBrushKind,
   MarkupKind,
   MarkupPoint,
   MarkdownDisplayMode,
@@ -18,6 +19,7 @@ import type {
   SectionLockMode,
   ToolId,
 } from '../types/mivoCanvas'
+import { defaultBrushWidth, highlighterOpacity } from '../canvas/brushGeometry'
 import { connectorBindingPointFor, isConnectorNode } from '../canvas/connectorGeometry'
 import { defaultSizeForNodeType } from '../canvas/nodeTypes/canvasNodeRegistry'
 import { defaultTextAlign, defaultTextColor, defaultTextFontSize, defaultTextWeight } from '../canvas/textGeometry'
@@ -45,6 +47,11 @@ type LayerMove = 'forward' | 'backward' | 'front' | 'back'
 export type SelectionAlignment = 'left' | 'center' | 'right' | 'top' | 'middle' | 'bottom'
 export type DistributionAxis = 'horizontal' | 'vertical'
 export type SelectionArrangeMode = 'row' | 'column' | 'grid' | 'tidy'
+export type BrushStyle = {
+  color: string
+  width: number
+  kind: MarkupBrushKind
+}
 
 type CanvasState = {
   canvases: Record<CanvasId, CanvasDocument>
@@ -55,6 +62,7 @@ type CanvasState = {
   selectedNodeIds: string[]
   sceneId: CanvasId
   clipboardNodes: MivoCanvasNode[]
+  brushStyle: BrushStyle
   historyPast: MivoCanvasSnapshot[]
   historyFuture: MivoCanvasSnapshot[]
   createCanvas: (title?: string, options?: { projectId?: string; templateId?: DemoSceneId }) => CanvasId
@@ -65,6 +73,7 @@ type CanvasState = {
   selectNode: (nodeId?: string, options?: { additive?: boolean }) => void
   selectNodes: (nodeIds: string[], primaryNodeId?: string) => void
   setActiveTool: (toolId: ToolId) => void
+  setBrushStyle: (style: Partial<BrushStyle>) => void
   captureHistory: () => void
   undo: () => void
   redo: () => void
@@ -137,6 +146,7 @@ type CanvasState = {
       fillColor?: string
       strokeWidth?: number
       strokeStyle?: MivoCanvasNode['markupStrokeStyle']
+      brushKind?: MarkupBrushKind
       startArrow?: boolean
       endArrow?: boolean
       connectorStart?: ConnectorBinding
@@ -203,7 +213,10 @@ type CanvasState = {
 }
 
 type PersistedCanvasState = Partial<
-  Pick<CanvasState, 'canvases' | 'nodes' | 'tasks' | 'sceneId' | 'selectedNodeId' | 'selectedNodeIds' | 'activeTool'>
+  Pick<
+    CanvasState,
+    'canvases' | 'nodes' | 'tasks' | 'sceneId' | 'selectedNodeId' | 'selectedNodeIds' | 'activeTool' | 'brushStyle'
+  >
 >
 
 export { scenes }
@@ -312,6 +325,11 @@ const defaultSectionBorderStyle: SectionBorderStyle = 'dashed'
 const defaultMarkupStrokeColor = '#6957e8'
 const defaultMarkupFillColor = 'rgba(105, 87, 232, 0.08)'
 const defaultMarkupStrokeWidth = 3
+const defaultBrushStyle: BrushStyle = {
+  color: defaultMarkupStrokeColor,
+  width: defaultBrushWidth,
+  kind: 'marker',
+}
 
 const isSectionNode = (node: MivoCanvasNode) => node.type === 'frame'
 const isEditableTextNode = (node: MivoCanvasNode | undefined) =>
@@ -815,6 +833,7 @@ const migratePersistedState = (persistedState: unknown, persistedVersion = 0) =>
     selectedNodeIds: selection.selectedNodeIds,
     activeTool: persisted.activeTool || 'select',
     clipboardNodes: [],
+    brushStyle: persisted.brushStyle || defaultBrushStyle,
     historyPast: [],
     historyFuture: [],
   }
@@ -839,6 +858,7 @@ export const useCanvasStore = create<CanvasState>()(
       selectedNodeIds: defaultDocument.selectedNodeIds || [],
       activeTool: 'select',
       clipboardNodes: [],
+      brushStyle: defaultBrushStyle,
       historyPast: [],
       historyFuture: [],
       createCanvas: (title = 'Untitled Canvas', options) => {
@@ -1031,6 +1051,12 @@ export const useCanvasStore = create<CanvasState>()(
         logCanvas(`Tool changed to ${toolId}`)
         set({ activeTool: toolId })
       },
+      setBrushStyle: (style) =>
+        set((state) => {
+          const brushStyle = { ...state.brushStyle, ...style }
+          logCanvas(`Brush style set: ${brushStyle.kind}, ${brushStyle.color}, ${brushStyle.width}px`)
+          return { brushStyle }
+        }),
       captureHistory: () => set((state) => remember(state)),
       undo: () =>
         set((state) => {
@@ -1878,12 +1904,17 @@ export const useCanvasStore = create<CanvasState>()(
             height,
             status: 'ready',
             markupKind: kind,
-            markupPoints: options?.points?.map((point) => ({ x: Math.round(point.x), y: Math.round(point.y) })),
+            markupBrushKind: kind === 'brush' ? options?.brushKind || 'marker' : undefined,
+            markupPoints: options?.points?.map((point) => ({
+              x: Math.round(point.x),
+              y: Math.round(point.y),
+              ...(point.pressure !== undefined ? { pressure: point.pressure } : {}),
+            })),
             markupStrokeColor: options?.strokeColor || defaultMarkupStrokeColor,
             markupFillColor: options?.fillColor || (kind === 'note' ? '#fff1a8' : defaultMarkupFillColor),
             markupStrokeWidth: options?.strokeWidth || defaultMarkupStrokeWidth,
             markupStrokeStyle: options?.strokeStyle || 'solid',
-            markupOpacity: 1,
+            markupOpacity: kind === 'brush' && options?.brushKind === 'highlighter' ? highlighterOpacity : 1,
             markupStartArrow: options?.startArrow ?? false,
             markupEndArrow: options?.endArrow ?? kind === 'arrow',
             markupCornerRadius: 4,
@@ -2442,6 +2473,7 @@ export const useCanvasStore = create<CanvasState>()(
         selectedNodeId: state.selectedNodeId,
         selectedNodeIds: state.selectedNodeIds,
         activeTool: state.activeTool,
+        brushStyle: state.brushStyle,
       }),
     },
   ),

@@ -13,6 +13,8 @@ import { LocateFixed, Minus, Plus, RotateCcw } from 'lucide-react'
 import { downloadCanvasNodeOriginal } from '../lib/assetDownload'
 import { canImportCanvasFile, importFilesToCanvas, importImageUrlToCanvas } from '../lib/canvasAssetImport'
 import { useCanvasStore } from '../store/canvasStore'
+import { brushOutlinePathFor, highlighterOpacity } from './brushGeometry'
+import { BrushOptionsBar } from './BrushOptionsBar'
 import { CanvasContextMenu } from './CanvasContextMenu'
 import { CanvasNodeView } from './CanvasNodeView'
 import { CanvasToolDock } from './CanvasToolDock'
@@ -108,6 +110,8 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
   const [shellSize, setShellSize] = useState({ width: 0, height: 0 })
   const nodes = useCanvasStore((state) => state.nodes)
   const sceneId = useCanvasStore((state) => state.sceneId)
+  const storeActiveTool = useCanvasStore((state) => state.activeTool)
+  const brushStyle = useCanvasStore((state) => state.brushStyle)
   const selectedNodeId = useCanvasStore((state) => state.selectedNodeId)
   const selectedNodeIds = useCanvasStore((state) => state.selectedNodeIds)
   const selectNode = useCanvasStore((state) => state.selectNode)
@@ -461,6 +465,7 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
     >
       <div className="canvas-host" ref={hostRef} />
       <CanvasToolDock previewTool={temporaryTool === 'hand' ? 'hand' : undefined} />
+      {storeActiveTool === 'markup-brush' && !temporaryTool ? <BrushOptionsBar /> : null}
       <div
         className="dom-canvas-layer"
         style={{ transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})` }}
@@ -559,10 +564,20 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
                   </marker>
                 </defs>
                 {markupCreationBox.kind === 'brush' ? (
-                  <polyline
-                    points={markupCreationBox.points
-                      .map((point) => `${point.x - activeMarkupCreationRect.x},${point.y - activeMarkupCreationRect.y}`)
-                      .join(' ')}
+                  <path
+                    d={brushOutlinePathFor(
+                      markupCreationBox.points.map((point) => ({
+                        ...point,
+                        x: point.x - activeMarkupCreationRect.x,
+                        y: point.y - activeMarkupCreationRect.y,
+                      })),
+                      brushStyle.width,
+                      brushStyle.kind,
+                      { last: false },
+                    )}
+                    fill={brushStyle.color}
+                    fillOpacity={brushStyle.kind === 'highlighter' ? highlighterOpacity : 1}
+                    stroke="none"
                   />
                 ) : (
                   <line

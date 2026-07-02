@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, type CSSProperties } from 'react'
 import { MarkdownPreview } from '../lib/MarkdownPreview'
 import { useResolvedAssetUrl } from '../lib/useResolvedAssetUrl'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
+import { brushOutlinePathFor } from './brushGeometry'
 import {
   frameRenderStyleFor,
   markupRenderStyleFor,
@@ -375,16 +376,26 @@ function MarkupNodeView({
             strokeDasharray={strokeDasharray}
           />
         ) : kind === 'brush' ? (
-          <polyline
-            points={points.map((point) => `${point.x},${point.y}`).join(' ')}
-            fill="none"
-            stroke={stroke}
-            strokeWidth={strokeWidth}
-            strokeOpacity={renderStyle.strokeOpacity}
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            strokeDasharray={strokeDasharray}
-          />
+          renderStyle.strokeStyle === 'dashed' ? (
+            // Filled freehand outlines cannot express dashes; dashed brush keeps the legacy polyline.
+            <polyline
+              points={points.map((point) => `${point.x},${point.y}`).join(' ')}
+              fill="none"
+              stroke={stroke}
+              strokeWidth={strokeWidth}
+              strokeOpacity={renderStyle.strokeOpacity}
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeDasharray={strokeDasharray}
+            />
+          ) : (
+            <path
+              d={brushOutlinePathFor(points, strokeWidth, node.markupBrushKind || 'marker')}
+              fill={stroke}
+              fillOpacity={renderStyle.strokeOpacity}
+              stroke="none"
+            />
+          )
         ) : (
           <>
             <line
