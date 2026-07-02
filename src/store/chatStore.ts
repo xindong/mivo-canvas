@@ -47,6 +47,7 @@ type ChatState = {
     text: string
     selectedNodeId?: string
     selectedNodeType?: string
+    referenceFiles?: File[]
   }) => Promise<void>
   regenerateWithParams: (options: { sceneId: string; messageId: string }) => Promise<void>
   appendNotice: (options: {
@@ -80,7 +81,7 @@ export const useChatStore = create<ChatState>()(
       paramOverrides: { imgRatio: 'auto', quality: 'auto' },
       isBusy: false,
 
-      sendMessage: async ({ sceneId, text, selectedNodeId, selectedNodeType }) => {
+      sendMessage: async ({ sceneId, text, selectedNodeId, selectedNodeType, referenceFiles = [] }) => {
         const state = get()
         if (state.isBusy) return
 
@@ -159,13 +160,18 @@ export const useChatStore = create<ChatState>()(
             imgRatio: finalRatio,
             quality: finalQuality,
             model: selectedModel,
+            referenceFiles: referenceFiles.length ? referenceFiles : undefined,
           }
 
           let nodeIds: string[]
           if (hasSelectedImage && selectedNodeId) {
             nodeIds = await canvasStore.generateBesideNode(selectedNodeId, finalPrompt, genOptions)
           } else {
-            const slotId = canvasStore.addAiSlotNode({ x: 0, y: 0 }, undefined, finalPrompt)
+            const { nodes } = canvasStore
+            const selectedNode = selectedNodeId ? nodes.find((n) => n.id === selectedNodeId) : undefined
+            const slotX = selectedNode ? selectedNode.x + selectedNode.width + 56 : -160 + nodes.length * 18
+            const slotY = selectedNode ? selectedNode.y : -160 + nodes.length * 18
+            const slotId = canvasStore.addAiSlotNode({ x: slotX, y: slotY }, { width: 320, height: 320 }, finalPrompt)
             nodeIds = await canvasStore.generateIntoAiSlot(slotId, finalPrompt, genOptions)
           }
 

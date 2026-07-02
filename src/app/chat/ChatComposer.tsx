@@ -96,6 +96,7 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
     const handleSend = useCallback(async () => {
       const trimmed = text.trim()
       if (!trimmed || isBusy) return
+      const filesToSend = referenceFiles.map((f) => f.file)
       setText('')
       setReferenceFiles([])
       setReferenceError('')
@@ -104,8 +105,9 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
         text: trimmed,
         selectedNodeId: selectedNode?.id,
         selectedNodeType: selectedNode?.type,
+        referenceFiles: filesToSend,
       })
-    }, [text, isBusy, sendMessage, sceneId, selectedNode])
+    }, [text, isBusy, sendMessage, sceneId, selectedNode, referenceFiles])
 
     const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
       if (e.key === 'Escape') {
