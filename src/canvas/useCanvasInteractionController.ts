@@ -1377,7 +1377,9 @@ export function useCanvasInteractionController({
 
       if (modifier && key === 'a') {
         event.preventDefault()
-        selectNodes(nodes.filter((node) => !node.hidden).map((node) => node.id))
+        // Read nodes via getState so this effect does not re-subscribe on every node change.
+        const allNodes = useCanvasStore.getState().nodes
+        selectNodes(allNodes.filter((node) => !node.hidden).map((node) => node.id))
         return
       }
 
@@ -1524,7 +1526,6 @@ export function useCanvasInteractionController({
     groupSelectedNodes,
     moveSelectedLayer,
     moveSelectedNodesBy,
-    nodes,
     onCloseContextMenu,
     pasteClipboardNodes,
     redo,
