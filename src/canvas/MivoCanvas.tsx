@@ -560,7 +560,10 @@ export function MivoCanvas({
       }}
     >
       <div className="canvas-host" ref={hostRef} />
-      <CanvasToolDock previewTool={temporaryTool === 'hand' ? 'hand' : undefined} />
+      <CanvasToolDock
+        previewTool={temporaryTool === 'hand' ? 'hand' : undefined}
+        onStartMaskEdit={beginMaskEdit}
+      />
       <div
         className="dom-canvas-layer"
         style={{ transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})` }}

@@ -2283,18 +2283,22 @@ button:disabled {
 
 .canvas-tool-dock {
   position: absolute;
-  left: 18px;
-  top: 70px;
+  left: 50%;
+  bottom: 18px;
+  top: auto;
   z-index: 5;
-  display: grid;
-  gap: 8px;
-  width: 54px;
-  padding: 9px;
-  background: rgba(255, 250, 240, 0.88);
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 4px;
+  max-width: min(780px, calc(100% - 32px));
+  padding: 7px;
+  background: rgba(255, 250, 240, 0.92);
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: 999px;
   box-shadow: var(--shadow);
   backdrop-filter: blur(14px);
+  transform: translateX(-50%);
 }
 
 .canvas-tool-dock button {
@@ -2303,18 +2307,19 @@ button:disabled {
   height: 36px;
   color: #554f48;
   background: transparent;
-  border-radius: 7px;
+  border-radius: 999px;
 }
 
 .canvas-tool-group {
   position: relative;
-  display: grid;
+  display: flex;
 }
 
 .canvas-tool-flyout {
   position: absolute;
-  top: -9px;
-  left: calc(100% + 12px);
+  bottom: calc(100% + 12px);
+  left: 50%;
+  top: auto;
   display: flex;
   gap: 6px;
   width: max-content;
@@ -2326,8 +2331,8 @@ button:disabled {
   box-shadow: var(--shadow);
   opacity: 0;
   pointer-events: none;
-  transform: translateX(-4px) scale(0.98);
-  transform-origin: left center;
+  transform: translateX(-50%) translateY(4px) scale(0.98);
+  transform-origin: bottom center;
   transition:
     opacity 140ms ease,
     transform 140ms ease,
@@ -2340,7 +2345,7 @@ button:disabled {
   visibility: visible;
   opacity: 1;
   pointer-events: auto;
-  transform: translateX(0) scale(1);
+  transform: translateX(-50%) translateY(0) scale(1);
   transition:
     opacity 140ms ease,
     transform 140ms ease,
@@ -2349,10 +2354,12 @@ button:disabled {
 
 .canvas-tool-flyout::before {
   position: absolute;
-  top: 0;
-  right: 100%;
-  width: 14px;
-  height: 100%;
+  bottom: -14px;
+  left: 0;
+  top: auto;
+  right: auto;
+  width: 100%;
+  height: 14px;
   content: '';
 }
 
@@ -2380,10 +2387,11 @@ button:disabled {
 
 .dock-divider {
   position: absolute;
-  top: -5px;
-  left: 6px;
-  right: 6px;
-  height: 1px;
+  left: -3px;
+  top: 6px;
+  bottom: 6px;
+  width: 1px;
+  height: auto;
   background: var(--line);
 }
 
@@ -5531,8 +5539,8 @@ button:disabled {
   }
 
   .canvas-tool-dock {
-    left: 10px;
-    top: 64px;
+    bottom: 12px;
+    max-width: min(680px, calc(100% - 24px));
   }
 
   .details-dialog-backdrop {
