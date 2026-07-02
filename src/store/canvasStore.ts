@@ -21,7 +21,7 @@ import type {
   SectionLockMode,
   ToolId,
 } from '../types/mivoCanvas'
-import { connectorBindingPointFor, isConnectorNode } from '../canvas/connectorGeometry'
+import { connectorAnchorPointFor, connectorBindingPointFor, derivationConnectorBindingsFor, isConnectorNode } from '../canvas/connectorGeometry'
 import { defaultSizeForNodeType } from '../canvas/nodeTypes/canvasNodeRegistry'
 import { defaultTextAlign, defaultTextColor, defaultTextFontSize, defaultTextWeight } from '../canvas/textGeometry'
 import {
@@ -439,14 +439,20 @@ const createDerivationEdgeNode = (edge: CanvasEdge, nodes: MivoCanvasNode[]): Mi
   const target = nodes.find((node) => node.id === edge.to && !node.hidden)
   if (!source || !target) return undefined
 
+  // M10: dynamic anchor selection — pick shortest-distance anchor pair
+  const { start, end } = derivationConnectorBindingsFor(source, target)
+  const startPt = connectorAnchorPointFor(source, start.anchor, 0.5)
+  const endPt = connectorAnchorPointFor(target, end.anchor, 0.5)
+
   return makeNode({
     id: derivationEdgeNodeId(edge.id),
     type: 'markup',
     title: edge.type === 'edit' ? 'Edit derivation' : 'Generation derivation',
-    x: source.x + source.width,
-    y: source.y + source.height / 2,
-    width: Math.max(24, target.x - (source.x + source.width)),
-    height: Math.max(24, Math.abs(target.y - source.y)),
+    // Initial geometry; overridden by normalizeConnectorMarkupNodes from binding anchor points
+    x: Math.min(startPt.x, endPt.x),
+    y: Math.min(startPt.y, endPt.y),
+    width: Math.max(24, Math.abs(endPt.x - startPt.x)),
+    height: Math.max(24, Math.abs(endPt.y - startPt.y)),
     markupKind: 'arrow',
     markupStrokeColor: '#497466',
     markupStrokeWidth: 3,
@@ -456,10 +462,10 @@ const createDerivationEdgeNode = (edge: CanvasEdge, nodes: MivoCanvasNode[]): Mi
     markupEndArrow: true,
     markupPoints: [
       { x: 0, y: 0 },
-      { x: Math.max(24, target.x - (source.x + source.width)), y: Math.round(target.y - source.y) },
+      { x: Math.max(24, Math.abs(endPt.x - startPt.x)), y: Math.round(endPt.y - startPt.y) },
     ],
-    connectorStart: { nodeId: edge.from, anchor: 'right' },
-    connectorEnd: { nodeId: edge.to, anchor: 'left' },
+    connectorStart: start,
+    connectorEnd: end,
     status: 'ready',
     locked: true,
     generation: {
@@ -2599,7 +2605,7 @@ export const useCanvasStore = create<CanvasState>()(
     }),
     {
       name: 'mivo-canvas-demo',
-      version: 7,
+      version: 8,
       migrate: migratePersistedState,
       partialize: (state) => ({
         canvases: state.canvases,

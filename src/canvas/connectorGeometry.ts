@@ -67,6 +67,32 @@ export const connectorBindingPointFor = (
   return node ? connectorAnchorPointFor(node, binding.anchor, binding.offset) : undefined
 }
 
+// Select best start/end anchor pair by minimizing euclidean distance between center points
+export const derivationConnectorBindingsFor = (
+  source: MivoCanvasNode,
+  target: MivoCanvasNode,
+): { start: ConnectorBinding; end: ConnectorBinding } => {
+  const sides: Exclude<ConnectorAnchor, 'center'>[] = ['top', 'right', 'bottom', 'left']
+  let bestStart: ConnectorBinding = { nodeId: source.id, anchor: 'right', offset: 0.5 }
+  let bestEnd: ConnectorBinding = { nodeId: target.id, anchor: 'left', offset: 0.5 }
+  let bestDist = Infinity
+
+  for (const sa of sides) {
+    const sp = connectorAnchorPointFor(source, sa, 0.5)
+    for (const ea of sides) {
+      const ep = connectorAnchorPointFor(target, ea, 0.5)
+      const dist = Math.hypot(ep.x - sp.x, ep.y - sp.y)
+      if (dist < bestDist) {
+        bestDist = dist
+        bestStart = { nodeId: source.id, anchor: sa, offset: 0.5 }
+        bestEnd = { nodeId: target.id, anchor: ea, offset: 0.5 }
+      }
+    }
+  }
+
+  return { start: bestStart, end: bestEnd }
+}
+
 export const nearestConnectorBindingForPoint = (
   nodes: MivoCanvasNode[],
   point: MarkupPoint,
