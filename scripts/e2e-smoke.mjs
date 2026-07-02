@@ -2511,6 +2511,101 @@ try {
     throw new Error('Canvas zoom controls should switch to Fit selection when an object is selected')
   }
 
+  await page.mouse.click(farBlankPoint.x, farBlankPoint.y)
+  await page.waitForFunction(() => document.querySelectorAll('.dom-node.selected').length === 0)
+  await page.keyboard.press('ControlOrMeta+a')
+  await page.waitForFunction(() => {
+    const rendered = document.querySelectorAll('.dom-node').length
+    return rendered > 0 && document.querySelectorAll('.dom-node.selected').length === rendered
+  })
+  await page.keyboard.press('Escape')
+  await page.waitForFunction(() => document.querySelectorAll('.dom-node.selected').length === 0)
+
+  const nodeCountBeforeCut = await page.locator('.dom-node').count()
+  await firstNode.click()
+  await page.waitForFunction(() => document.querySelectorAll('.dom-node.selected').length === 1)
+  await page.keyboard.press('ControlOrMeta+x')
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node').length === count - 1,
+    nodeCountBeforeCut,
+  )
+  await page.mouse.click(farBlankPoint.x, farBlankPoint.y, { button: 'right' })
+  await page.getByRole('menuitem', { name: /^Paste 1 item$/ }).click()
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node').length === count,
+    nodeCountBeforeCut,
+  )
+  await page.keyboard.press('ControlOrMeta+z')
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node').length === count - 1,
+    nodeCountBeforeCut,
+  )
+  await page.keyboard.press('ControlOrMeta+z')
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node').length === count,
+    nodeCountBeforeCut,
+  )
+
+  await firstNode.click()
+  await page.keyboard.down('Shift')
+  await secondNode.click()
+  await page.keyboard.up('Shift')
+  await page.waitForFunction(() => document.querySelectorAll('.dom-node.selected').length === 2)
+  await page.keyboard.press('ControlOrMeta+g')
+  await page.mouse.click(farBlankPoint.x, farBlankPoint.y)
+  await page.waitForFunction(() => document.querySelectorAll('.dom-node.selected').length === 0)
+  await firstNode.click()
+  await page.waitForFunction(() => document.querySelectorAll('.dom-node.selected').length === 2)
+  await page.keyboard.press('ControlOrMeta+Shift+g')
+  await page.mouse.click(farBlankPoint.x, farBlankPoint.y)
+  await firstNode.click()
+  await page.waitForFunction(() => document.querySelectorAll('.dom-node.selected').length === 1)
+
+  const altResizeBoxBefore = await firstNode.boundingBox()
+  if (!altResizeBoxBefore) throw new Error('Missing node geometry before Alt centered resize')
+  const altResizeHandleBox = await firstNode.locator('.node-handle.se').boundingBox()
+  if (!altResizeHandleBox) throw new Error('Missing se resize handle for Alt centered resize')
+  await page.keyboard.down('Alt')
+  await page.mouse.move(
+    altResizeHandleBox.x + altResizeHandleBox.width / 2,
+    altResizeHandleBox.y + altResizeHandleBox.height / 2,
+  )
+  await page.mouse.down()
+  await page.mouse.move(
+    altResizeHandleBox.x + altResizeHandleBox.width / 2 + 30,
+    altResizeHandleBox.y + altResizeHandleBox.height / 2 + 30,
+    { steps: 4 },
+  )
+  await page.mouse.up()
+  await page.keyboard.up('Alt')
+  const altResizeBoxAfter = await firstNode.boundingBox()
+  if (
+    !altResizeBoxAfter ||
+    altResizeBoxAfter.width <= altResizeBoxBefore.width + 20 ||
+    !nearlyEqual(
+      altResizeBoxBefore.x + altResizeBoxBefore.width / 2,
+      altResizeBoxAfter.x + altResizeBoxAfter.width / 2,
+      3,
+    ) ||
+    !nearlyEqual(
+      altResizeBoxBefore.y + altResizeBoxBefore.height / 2,
+      altResizeBoxAfter.y + altResizeBoxAfter.height / 2,
+      3,
+    )
+  ) {
+    throw new Error(
+      `Alt corner resize should grow the node around its center: before=${JSON.stringify(altResizeBoxBefore)}, after=${JSON.stringify(altResizeBoxAfter)}`,
+    )
+  }
+  await page.keyboard.press('ControlOrMeta+z')
+  await wait(200)
+  const altResizeBoxRestored = await firstNode.boundingBox()
+  if (!altResizeBoxRestored || !nearlyEqual(altResizeBoxRestored.width, altResizeBoxBefore.width, 2)) {
+    throw new Error(
+      `Undo should restore geometry after Alt centered resize: before=${JSON.stringify(altResizeBoxBefore)}, restored=${JSON.stringify(altResizeBoxRestored)}`,
+    )
+  }
+
   const firstNodeBoxForMenu = await firstNode.boundingBox()
   if (!firstNodeBoxForMenu) throw new Error('Missing first node geometry for hide menu')
   await page.mouse.click(firstNodeBoxForMenu.x + 12, firstNodeBoxForMenu.y + 12, { button: 'right' })
