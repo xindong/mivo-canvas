@@ -8,6 +8,25 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 const imageExtensions = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg'])
 const eagleApiBase = process.env.MIVO_EAGLE_API_URL?.trim() || 'http://127.0.0.1:41595'
 const mivoImageApiBase = 'https://llm-proxy.tapsvc.com/v1/images'
+// Enhance endpoint (chat completions)
+const mivoLlmApiBase = 'https://llm-proxy.tapsvc.com/v1'
+const mivoEnhancePrimaryModel = 'moonshotai/kimi-k2.6'
+const mivoEnhanceFallbackModel = 'qwen/qwen3.6-plus'
+const mivoEnhancePrimaryTimeoutMs = 10_000
+const mivoEnhanceFallbackTimeoutMs = 15_000
+// SYNC NOTE: keep in sync with src/lib/modelCapabilities.ts
+const mivoModelRatioMap: Record<string, string[]> = {
+  'gpt-image-2': ['1:1', '3:2', '2:3', '16:9', '9:16'],
+  'gemini-3-pro-image': ['1:1', '3:2', '2:3', '3:4', '4:3', '16:9', '9:16', '21:9', '5:4', '4:5'],
+  'doubao-seedance-2-0-260128': ['1:1', '3:4', '4:3', '16:9', '9:16', '21:9'],
+  'doubao-seedance-2-0-fast-260128': ['1:1', '3:4', '4:3', '16:9', '9:16', '21:9'],
+}
+const mivoModelDefaultRatio: Record<string, string> = {
+  'gpt-image-2': '1:1',
+  'gemini-3-pro-image': '1:1',
+  'doubao-seedance-2-0-260128': '16:9',
+  'doubao-seedance-2-0-fast-260128': '16:9',
+}
 const defaultMivoImageModel = 'gpt-image-2'
 const mivoQualitySet = new Set(['low', 'medium', 'high'])
 const mivoImageRequestMaxBytes = 40 * 1024 * 1024
@@ -575,7 +594,188 @@ const readLocalAssets = async () => {
   }
 }
 
-const localAssetLibraryPlugin = ({ imageApiKey }: { imageApiKey: string }): Plugin => ({
+// ─── enhance helpers ──────────────────────────────────────────────────────────
+
+const buildEnhanceSystemPrompt = (allowedRatios: string[]) =>
+  `You are an AI image generation prompt enhancer. Analyze the user input and return a single JSON object (no markdown fences) with these fields:
+- scene: brief scene category (e.g. "portrait", "landscape", "product", "abstract", "illustration")
+- reasoning: one sentence in Chinese explaining key enhancement decisions
+- richPrompt: enhanced English image prompt — specific and vivid; faithfully preserve user intent; do NOT add entities the user did not mention; do NOT pile style words like masterpiece/8k/cinematic/high quality unless the user asked
+- imgRatio: choose from allowed list: ${allowedRatios.join(', ')}; pick what best fits the scene composition
+- quality: "low" (fast sketch), "medium" (standard), or "high" (fine detail/print)
+
+Additional rules:
+- Chinese or very short input → expand into a specific English visual description
+- When history is provided → this is a refinement; evolve the previous richPrompt rather than starting fresh
+- Output ONLY the JSON object, no surrounding text`
+
+type EnhanceLlmResponse = {
+  choices?: Array<{ message?: { content?: string } }>
+}
+
+type EnhanceParsed = {
+  scene: string
+  reasoning: string
+  richPrompt: string
+  imgRatio: string
+  quality: string
+}
+
+const parseEnhanceJson = (raw: string): EnhanceParsed | null => {
+  try {
+    const stripped = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/i, '').trim()
+    const parsed = JSON.parse(stripped) as Record<string, unknown>
+    if (
+      typeof parsed.scene === 'string' &&
+      typeof parsed.reasoning === 'string' &&
+      typeof parsed.richPrompt === 'string' &&
+      typeof parsed.imgRatio === 'string' &&
+      typeof parsed.quality === 'string'
+    ) {
+      return {
+        scene: parsed.scene,
+        reasoning: parsed.reasoning,
+        richPrompt: parsed.richPrompt,
+        imgRatio: parsed.imgRatio,
+        quality: parsed.quality,
+      }
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
+const callEnhanceLlm = async (
+  model: string,
+  messages: Array<{ role: string; content: string }>,
+  llmApiKey: string,
+  timeoutMs: number,
+): Promise<{ result: EnhanceParsed | null; reason: string }> => {
+  try {
+    const response = await fetchUpstreamWithTimeout(
+      `${mivoLlmApiBase}/chat/completions`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${llmApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        // No response_format: kimi faster without it; qwen hangs with json_object (probe-results.md)
+        body: JSON.stringify({ model, messages }),
+      },
+      timeoutMs,
+    )
+    if (!response.ok) return { result: null, reason: 'upstream-error' }
+    const payload = (await response.json()) as EnhanceLlmResponse
+    const content = payload.choices?.[0]?.message?.content || ''
+    const parsed = parseEnhanceJson(content)
+    return { result: parsed, reason: parsed ? '' : 'bad-json' }
+  } catch (error) {
+    return {
+      result: null,
+      reason: error instanceof UpstreamRequestTimeoutError ? 'timeout' : 'upstream-error',
+    }
+  }
+}
+
+type EnhanceRequestBody = {
+  prompt?: unknown
+  modelId?: unknown
+  history?: unknown
+  hasSelectedImage?: unknown
+  sceneId?: unknown
+}
+
+const proxyMivoEnhance = async (
+  request: IncomingMessage,
+  response: ServerResponse,
+  llmApiKey: string,
+) => {
+  try {
+    if (request.method !== 'POST') {
+      sendMivoJson(response, 405, { error: 'Method not allowed' })
+      return
+    }
+
+    if (!llmApiKey.trim()) {
+      sendMivoJson(response, 200, { enhanced: false, degradedReason: 'no-key' })
+      return
+    }
+
+    const body = await readJsonRequest<EnhanceRequestBody>(request)
+    const prompt = String(body.prompt || '').trim()
+    if (!prompt) {
+      sendMivoJson(response, 400, { error: 'prompt is required' })
+      return
+    }
+
+    const modelId = typeof body.modelId === 'string' && body.modelId.trim() ? body.modelId.trim() : 'gpt-image-2'
+    const allowedRatios = mivoModelRatioMap[modelId] ?? mivoModelRatioMap['gpt-image-2']
+    const defaultRatio = mivoModelDefaultRatio[modelId] ?? '1:1'
+
+    type HistoryEntry = { role: string; content: string }
+    const historyEntries: HistoryEntry[] = Array.isArray(body.history)
+      ? (body.history as unknown[])
+          .filter(
+            (entry): entry is HistoryEntry =>
+              typeof entry === 'object' &&
+              entry !== null &&
+              typeof (entry as HistoryEntry).role === 'string' &&
+              typeof (entry as HistoryEntry).content === 'string',
+          )
+          .slice(-6)
+      : []
+
+    const systemPrompt = buildEnhanceSystemPrompt(allowedRatios)
+    const userContent =
+      historyEntries.length > 0
+        ? `Previous conversation:\n${historyEntries.map((e) => `${e.role}: ${e.content}`).join('\n')}\n\nNew request: ${prompt}`
+        : prompt
+
+    const llmMessages = [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userContent },
+    ]
+
+    // Primary: kimi-k2.6 (10s)
+    let { result, reason: degradedReason } = await callEnhanceLlm(mivoEnhancePrimaryModel, llmMessages, llmApiKey.trim(), mivoEnhancePrimaryTimeoutMs)
+
+    // Fallback: qwen3.6-plus (15s) — no response_format per probe-results
+    if (!result) {
+      const fallback = await callEnhanceLlm(mivoEnhanceFallbackModel, llmMessages, llmApiKey.trim(), mivoEnhanceFallbackTimeoutMs)
+      result = fallback.result
+      if (!result) degradedReason = fallback.reason || degradedReason
+    }
+
+    if (!result) {
+      sendMivoJson(response, 200, { enhanced: false, degradedReason })
+      return
+    }
+
+    const clampedRatio = (allowedRatios as string[]).includes(result.imgRatio) ? result.imgRatio : defaultRatio
+    const quality = ['low', 'medium', 'high'].includes(result.quality) ? result.quality : 'medium'
+
+    sendMivoJson(response, 200, {
+      scene: result.scene,
+      reasoning: result.reasoning,
+      richPrompt: result.richPrompt,
+      imgRatio: clampedRatio,
+      quality,
+      enhanced: true,
+    })
+  } catch (error) {
+    sendMivoJson(
+      response,
+      error instanceof RequestBodyTooLargeError ? 413 : 500,
+      { error: error instanceof Error ? error.message : 'Unable to enhance prompt' },
+    )
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+const localAssetLibraryPlugin = ({ imageApiKey, llmApiKey }: { imageApiKey: string; llmApiKey: string }): Plugin => ({
   name: 'mivo-local-asset-library',
   configureServer(server: ViteDevServer) {
     server.middlewares.use(async (request, response, next) => {
@@ -590,6 +790,11 @@ const localAssetLibraryPlugin = ({ imageApiKey }: { imageApiKey: string }): Plug
 
       if (pathname === '/api/mivo/edit') {
         await proxyMivoEdit(request, response, imageApiKey)
+        return
+      }
+
+      if (pathname === '/api/mivo/enhance') {
+        await proxyMivoEnhance(request, response, llmApiKey)
         return
       }
 
@@ -780,8 +985,10 @@ const localAssetLibraryPlugin = ({ imageApiKey }: { imageApiKey: string }): Plug
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
   const imageApiKey = env.MIVO_IMAGE_API_KEY || process.env.MIVO_IMAGE_API_KEY || ''
+  // LLM key for enhance endpoint: prefer dedicated key, fall back to image key
+  const llmApiKey = env.MIVO_LLM_API_KEY || env.MIVO_IMAGE_API_KEY || ''
 
   return {
-    plugins: [react(), localAssetLibraryPlugin({ imageApiKey })],
+    plugins: [react(), localAssetLibraryPlugin({ imageApiKey, llmApiKey })],
   }
 })
