@@ -42,18 +42,13 @@ export function ChatMessageList({ sceneId }: ChatMessageListProps) {
     )
   }
 
-  const lastAssistantIdx = messages.reduce<number>(
-    (last, m, i) => (m.role === 'assistant' && m.kind === 'text' ? i : last),
-    -1,
-  )
-
   return (
     <div
       className="chat-message-list"
       ref={listRef}
       onScroll={handleScroll}
     >
-      {messages.map((message, index) => {
+      {messages.map((message) => {
         if (message.kind === 'notice') {
           return (
             <div key={message.id} className="chat-notice">
@@ -80,7 +75,6 @@ export function ChatMessageList({ sceneId }: ChatMessageListProps) {
         }
 
         // assistant text message
-        const isLast = index === lastAssistantIdx
         const resultNodeId = message.resultNodeIds?.[0]
 
         return (
@@ -88,8 +82,6 @@ export function ChatMessageList({ sceneId }: ChatMessageListProps) {
             <div className="chat-bubble chat-bubble-assistant">
               <EnhanceParamCard
                 message={message}
-                sceneId={sceneId}
-                isLast={isLast}
               />
 
               {message.status === 'generating' && (

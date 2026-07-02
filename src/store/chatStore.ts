@@ -51,7 +51,6 @@ type ChatState = {
     selectedNodeType?: string
     referenceFiles?: File[]
   }) => Promise<void>
-  regenerateWithParams: (options: { sceneId: string; messageId: string }) => Promise<void>
   appendNotice: (options: {
     sceneId: string
     origin: ChatMessageOrigin
@@ -222,75 +221,6 @@ export const useChatStore = create<ChatState>()(
                 m.id === assistantMessageId
                   ? { ...m, status: 'error' as const, error: errorMsg }
                   : m,
-              ),
-            },
-          }))
-        } finally {
-          if (activeChatAbortController === abortController) {
-            activeChatAbortController = null
-          }
-        }
-      },
-
-      regenerateWithParams: async ({ sceneId, messageId }) => {
-        const state = get()
-        if (state.isBusy) return
-
-        const messages = state.messagesByScene[sceneId] || []
-        const targetMsg = messages.find((m) => m.id === messageId)
-        // NB2: fall back to message.text when no richPrompt (degraded enhance case)
-        if (!targetMsg) return
-        const abortController = new AbortController()
-        activeChatAbortController = abortController
-
-        const { selectedModel, paramOverrides } = state
-        const finalRatio = paramOverrides.imgRatio !== 'auto' ? paramOverrides.imgRatio : targetMsg.enhance?.imgRatio
-        const finalQuality: MivoImageQuality =
-          paramOverrides.quality !== 'auto' ? (paramOverrides.quality as MivoImageQuality) : (targetMsg.enhance?.quality || 'medium')
-        const finalPrompt = targetMsg.enhance?.richPrompt || targetMsg.text
-
-        set((s) => ({
-          isBusy: true,
-          messagesByScene: {
-            ...s.messagesByScene,
-            [sceneId]: (s.messagesByScene[sceneId] || []).map((m) =>
-              m.id === messageId ? { ...m, status: 'generating' as const, error: undefined } : m,
-            ),
-          },
-        }))
-
-        try {
-          const canvasStore = useCanvasStore.getState()
-          const { nodes } = canvasStore
-          const slotX = -160 + nodes.length * 18
-          const slotId = canvasStore.addAiSlotNode({ x: slotX, y: slotX }, { width: 320, height: 320 }, finalPrompt)
-          const nodeIds = await canvasStore.generateIntoAiSlot(slotId, finalPrompt, {
-            imgRatio: finalRatio,
-            quality: finalQuality,
-            model: selectedModel,
-            signal: abortController.signal,
-          })
-
-          // B2: guard against cross-canvas scene switch during regeneration
-          const resultNodeIds = useCanvasStore.getState().sceneId === sceneId ? nodeIds : undefined
-
-          set((s) => ({
-            isBusy: false,
-            messagesByScene: {
-              ...s.messagesByScene,
-              [sceneId]: (s.messagesByScene[sceneId] || []).map((m) =>
-                m.id === messageId ? { ...m, status: 'done' as const, resultNodeIds } : m,
-              ),
-            },
-          }))
-        } catch (err) {
-          const errorMsg = errorMessageForChat(err, abortController.signal)
-          set((s) => ({
-            isBusy: false,
-            messagesByScene: {
-              ...s.messagesByScene,
-              [sceneId]: (s.messagesByScene[sceneId] || []).map((m) =>
-                m.id === messageId ? { ...m, status: 'error' as const, error: errorMsg } : m,
               ),
             },
           }))

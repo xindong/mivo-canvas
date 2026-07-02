@@ -9,10 +9,13 @@ import {
   type DragEvent,
   type KeyboardEvent,
 } from 'react'
-import { ImagePlus, Send, Settings2, X } from 'lucide-react'
+import { ImagePlus, Send, Sparkles, X } from 'lucide-react'
+import { getModelCapabilities } from '../../lib/modelCapabilities'
 import { useChatStore } from '../../store/chatStore'
 import { useCanvasStore } from '../../store/canvasStore'
-import { ComposerParamsPopover } from './ComposerParamsPopover'
+import { ModelSelectorPopover } from './ModelSelectorPopover'
+import { RatioIcon, RatioPopover } from './RatioPopover'
+import { modelShortLabel } from './chatDisplayLabels'
 
 type ReferenceFile = {
   id: string
@@ -35,10 +38,12 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
     const [text, setText] = useState('')
     const [referenceFiles, setReferenceFiles] = useState<ReferenceFile[]>([])
     const [referenceError, setReferenceError] = useState('')
-    const [paramsOpen, setParamsOpen] = useState(false)
+    const [openPopover, setOpenPopover] = useState<'model' | 'ratio' | null>(null)
 
     const textareaRef = useRef<HTMLTextAreaElement>(null)
     const fileInputRef = useRef<HTMLInputElement>(null)
+    const modelButtonRef = useRef<HTMLButtonElement>(null)
+    const ratioButtonRef = useRef<HTMLButtonElement>(null)
     const referenceFilesRef = useRef<ReferenceFile[]>([])
 
     const sendMessage = useChatStore((s) => s.sendMessage)
@@ -134,7 +139,11 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
       addFiles(Array.from(e.clipboardData.files))
     }
 
-    const modelLabel = selectedModel.replace('gpt-image-2', 'GPT').replace('gemini-3-pro-image', 'Gemini')
+    const modelLabel = modelShortLabel(selectedModel)
+    const ratioLabel = paramOverrides.imgRatio === 'auto' ? '自动' : paramOverrides.imgRatio
+    const ratioIconValue = paramOverrides.imgRatio === 'auto'
+      ? getModelCapabilities(selectedModel).defaultRatio
+      : paramOverrides.imgRatio
     const hasOverride = paramOverrides.imgRatio !== 'auto' || paramOverrides.quality !== 'auto'
     const canSend = Boolean(text.trim()) && !isBusy
     const busyReason = '正在生成，完成或取消后可继续编辑'
@@ -169,57 +178,91 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
         )}
         {referenceError && <p className="chat-ref-error">{referenceError}</p>}
 
-        <textarea
-          ref={textareaRef}
-          className="chat-composer-textarea"
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder="描述画面、风格、内容… (Enter 发送)"
-          rows={3}
-          disabled={isBusy}
-          aria-label="Chat input"
-          title={isBusy ? busyReason : undefined}
-        />
-
-        <div className="chat-composer-actions">
-          <span className="chat-model-chip">{modelLabel}</span>
-
-          <button
-            type="button"
-            className={`chat-action-btn ${hasOverride ? 'active' : ''}`}
-            onClick={() => setParamsOpen((v) => !v)}
-            aria-label="生成参数"
-            title={isBusy ? '生成参数（影响下一次生成）' : '生成参数'}
-          >
-            <Settings2 size={16} />
-          </button>
-
-          <button
-            type="button"
-            className="chat-action-btn"
-            onClick={() => fileInputRef.current?.click()}
+        <div className="chat-composer-input-shell">
+          <textarea
+            ref={textareaRef}
+            className="chat-composer-textarea"
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder="描述画面、风格、内容… (Enter 发送)"
+            rows={7}
             disabled={isBusy}
-            aria-label="上传参考图"
-            title={referenceTitle}
-          >
-            <ImagePlus size={16} />
-          </button>
+            aria-label="Chat input"
+            title={isBusy ? busyReason : undefined}
+          />
 
-          <button
-            type="button"
-            className="chat-send-btn"
-            onClick={() => void handleSend()}
-            disabled={!canSend}
-            aria-label={isBusy ? '正在生成' : '发送'}
-            title={sendTitle}
-          >
-            <Send size={15} />
-          </button>
+          <div className="chat-composer-actions">
+            <div className="chat-composer-actions-left">
+              <button
+                ref={modelButtonRef}
+                type="button"
+                className="chat-tool-btn chat-model-trigger"
+                onClick={() => setOpenPopover((current) => (current === 'model' ? null : 'model'))}
+                aria-label="选择模型"
+                aria-expanded={openPopover === 'model'}
+                aria-controls="chat-model-selector-popover"
+                title="选择模型"
+              >
+                <Sparkles size={14} />
+                <span>{modelLabel}</span>
+              </button>
+
+              <button
+                ref={ratioButtonRef}
+                type="button"
+                className={`chat-tool-btn chat-ratio-trigger ${hasOverride ? 'active' : ''}`}
+                onClick={() => setOpenPopover((current) => (current === 'ratio' ? null : 'ratio'))}
+                aria-label="选择比例和质量"
+                aria-expanded={openPopover === 'ratio'}
+                aria-controls="chat-ratio-popover"
+                title="选择比例和质量"
+              >
+                <RatioIcon ratio={ratioIconValue} />
+                <span>{ratioLabel}</span>
+              </button>
+            </div>
+
+            <div className="chat-composer-actions-right">
+              <button
+                type="button"
+                className="chat-action-btn"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={isBusy}
+                aria-label="上传参考图"
+                title={referenceTitle}
+              >
+                <ImagePlus size={16} />
+              </button>
+
+              <button
+                type="button"
+                className="chat-send-btn"
+                onClick={() => void handleSend()}
+                disabled={!canSend}
+                aria-label={isBusy ? '正在生成' : '发送'}
+                title={sendTitle}
+              >
+                <Send size={15} />
+              </button>
+            </div>
+          </div>
         </div>
 
-        {paramsOpen && (
-          <ComposerParamsPopover onClose={() => setParamsOpen(false)} />
+        {openPopover === 'model' && (
+          <ModelSelectorPopover
+            id="chat-model-selector-popover"
+            anchorRef={modelButtonRef}
+            onClose={() => setOpenPopover(null)}
+          />
+        )}
+
+        {openPopover === 'ratio' && (
+          <RatioPopover
+            id="chat-ratio-popover"
+            anchorRef={ratioButtonRef}
+            onClose={() => setOpenPopover(null)}
+          />
         )}
 
         <input

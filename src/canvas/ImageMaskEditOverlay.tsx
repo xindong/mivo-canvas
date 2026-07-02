@@ -233,7 +233,7 @@ export function ImageMaskEditOverlay({
     const shell = stage?.closest('.canvas-shell')
     if (!stage || !shell) return undefined
 
-    let frame = window.requestAnimationFrame(updateFloatingControls)
+    const frame = window.requestAnimationFrame(updateFloatingControls)
     const resizeObserver = new ResizeObserver(updateFloatingControls)
     resizeObserver.observe(stage)
     resizeObserver.observe(shell)

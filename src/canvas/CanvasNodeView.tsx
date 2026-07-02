@@ -531,7 +531,8 @@ export function CanvasNodeView({
     .join(' ')
 
   useEffect(() => {
-    setNaturalSize(undefined)
+    const frame = window.requestAnimationFrame(() => setNaturalSize(undefined))
+    return () => window.cancelAnimationFrame(frame)
   }, [resolvedAssetUrl])
 
   useEffect(() => {

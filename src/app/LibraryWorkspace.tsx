@@ -432,23 +432,29 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
   }, [loadEagleAssets, loadEagleTags, loadLocalAssets, loadPinterestStatus])
 
   useEffect(() => {
-    setSelectedAssetIds((current) => {
-      const visibleIds = new Set(filteredAssets.map((asset) => asset.id))
-      const nextIds = current.filter((assetId) => visibleIds.has(assetId))
-      return nextIds.length === current.length ? current : nextIds
-    })
+    const timer = window.setTimeout(() => {
+      setSelectedAssetIds((current) => {
+        const visibleIds = new Set(filteredAssets.map((asset) => asset.id))
+        const nextIds = current.filter((assetId) => visibleIds.has(assetId))
+        return nextIds.length === current.length ? current : nextIds
+      })
+    }, 0)
+
+    return () => window.clearTimeout(timer)
   }, [filteredAssets])
 
   useEffect(() => {
     if (!selectedEagleTag || eagleLoadState !== 'ready') return
     if (!activeEagleTags.some((tag) => tagMatches(tag.name, selectedEagleTag))) {
-      setSelectedEagleTag(undefined)
+      const timer = window.setTimeout(() => setSelectedEagleTag(undefined), 0)
+      return () => window.clearTimeout(timer)
     }
   }, [activeEagleTags, eagleLoadState, selectedEagleTag])
 
   useEffect(() => {
     if (!previewAsset) return
-    setPreviewImageState('loading')
+    const timer = window.setTimeout(() => setPreviewImageState('loading'), 0)
+    return () => window.clearTimeout(timer)
   }, [previewAsset])
 
   useEffect(() => {
