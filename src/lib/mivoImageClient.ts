@@ -111,13 +111,15 @@ export const editMivoImage = async (request: MivoEditRequest) => {
 }
 
 export const enhanceMivoPrompt = async (request: EnhanceRequest): Promise<EnhanceResponse> => {
+  const { signal, ...body } = request
   try {
     const response = await fetchMivoWithTimeout(
       '/api/mivo/enhance',
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(request),
+        signal,
+        body: JSON.stringify(body),
       },
       mivoEnhanceTimeoutMs,
     )

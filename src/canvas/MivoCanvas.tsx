@@ -820,7 +820,10 @@ export function MivoCanvas({
       ) : null}
       {visibleNodes.length === 0 ? (
         <div className="empty-canvas-note">
-          <span>空画布</span>
+          <span>
+            <strong>空画布</strong>
+            <em>从右侧 AI 对话生成，或把素材拖到这里</em>
+          </span>
         </div>
       ) : null}
       <div className="canvas-controls" aria-label="Canvas zoom controls">

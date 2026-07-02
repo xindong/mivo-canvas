@@ -59,12 +59,21 @@ type ChatState = {
     prompt?: string
   }) => void
   retryMessage: (options: { sceneId: string; messageId: string }) => Promise<void>
+  cancelGeneration: () => void
   clearScene: (sceneId: string) => void
   setSelectedModel: (modelId: string) => void
   setParamOverride: (key: keyof ChatParamOverrides, value: string) => void
 }
 
 const createMessageId = () => `msg-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`
+const canceledGenerationMessage = '已取消生成，可修改提示后重试。'
+let activeChatAbortController: AbortController | null = null
+
+const errorMessageForChat = (err: unknown, signal?: AbortSignal) => {
+  if (signal?.aborted) return canceledGenerationMessage
+  if (err instanceof Error && err.message.includes('已取消')) return canceledGenerationMessage
+  return err instanceof Error ? err.message : 'Generation failed'
+}
 
 const trimSceneMessages = (messages: ChatMessage[]): ChatMessage[] =>
   messages.length > maxMessagesPerScene ? messages.slice(-maxMessagesPerScene) : messages
@@ -86,6 +95,8 @@ export const useChatStore = create<ChatState>()(
       sendMessage: async ({ sceneId, text, selectedNodeId, selectedNodeType, referenceFiles = [] }) => {
         const state = get()
         if (state.isBusy) return
+        const abortController = new AbortController()
+        activeChatAbortController = abortController
 
         const existingMessages = state.messagesByScene[sceneId] || []
         const userMessageId = createMessageId()
@@ -129,7 +140,9 @@ export const useChatStore = create<ChatState>()(
             history,
             hasSelectedImage,
             sceneId,
+            signal: abortController.signal,
           })
+          if (abortController.signal.aborted) throw new Error(canceledGenerationMessage)
 
           const enhance: ChatEnhanceResult = enhanceResult.enhanced
             ? {
@@ -165,6 +178,7 @@ export const useChatStore = create<ChatState>()(
             quality: finalQuality,
             model: selectedModel,
             referenceFiles: referenceFiles.length ? referenceFiles : undefined,
+            signal: abortController.signal,
           }
 
           let nodeIds: string[]
@@ -199,7 +213,7 @@ export const useChatStore = create<ChatState>()(
             },
           }))
         } catch (err) {
-          const errorMsg = err instanceof Error ? err.message : 'Generation failed'
+          const errorMsg = errorMessageForChat(err, abortController.signal)
           set((s) => ({
             isBusy: false,
             messagesByScene: {
@@ -211,6 +225,10 @@ export const useChatStore = create<ChatState>()(
               ),
             },
           }))
+        } finally {
+          if (activeChatAbortController === abortController) {
+            activeChatAbortController = null
+          }
         }
       },
 
@@ -222,6 +240,8 @@ export const useChatStore = create<ChatState>()(
         const targetMsg = messages.find((m) => m.id === messageId)
         // NB2: fall back to message.text when no richPrompt (degraded enhance case)
         if (!targetMsg) return
+        const abortController = new AbortController()
+        activeChatAbortController = abortController
 
         const { selectedModel, paramOverrides } = state
         const finalRatio = paramOverrides.imgRatio !== 'auto' ? paramOverrides.imgRatio : targetMsg.enhance?.imgRatio
@@ -248,6 +268,7 @@ export const useChatStore = create<ChatState>()(
             imgRatio: finalRatio,
             quality: finalQuality,
             model: selectedModel,
+            signal: abortController.signal,
           })
 
           // B2: guard against cross-canvas scene switch during regeneration
@@ -263,7 +284,7 @@ export const useChatStore = create<ChatState>()(
             },
           }))
         } catch (err) {
-          const errorMsg = err instanceof Error ? err.message : 'Generation failed'
+          const errorMsg = errorMessageForChat(err, abortController.signal)
           set((s) => ({
             isBusy: false,
             messagesByScene: {
@@ -273,6 +294,10 @@ export const useChatStore = create<ChatState>()(
               ),
             },
           }))
+        } finally {
+          if (activeChatAbortController === abortController) {
+            activeChatAbortController = null
+          }
         }
       },
 
@@ -319,6 +344,11 @@ export const useChatStore = create<ChatState>()(
           selectedNodeId: userMsg.selectedNodeId,
           selectedNodeType: userMsg.selectedNodeType,
         })
+      },
+
+      cancelGeneration: () => {
+        if (!activeChatAbortController || activeChatAbortController.signal.aborted) return
+        activeChatAbortController.abort()
       },
 
       clearScene: (sceneId) =>

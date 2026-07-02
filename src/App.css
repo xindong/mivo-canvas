@@ -84,6 +84,14 @@ button:disabled {
   opacity: 0.48;
 }
 
+.mivo-app button:focus-visible,
+.mivo-app [role='button']:focus-visible,
+.mivo-app textarea:focus-visible,
+.mivo-app input:focus-visible {
+  outline: 2px solid rgba(73, 116, 102, 0.72);
+  outline-offset: 2px;
+}
+
 .project-sidebar {
   box-sizing: border-box;
   grid-column: 1;
@@ -4389,12 +4397,32 @@ button:disabled {
 }
 
 .empty-canvas-note span {
+  display: grid;
+  gap: 4px;
   padding: 10px 14px;
   color: var(--muted);
   background: rgba(248, 244, 235, 0.84);
   border: 1px dashed #b9afa1;
   border-radius: 8px;
   font-size: 13px;
+  text-align: center;
+}
+
+.empty-canvas-note strong,
+.empty-canvas-note em {
+  display: block;
+  font-style: normal;
+}
+
+.empty-canvas-note strong {
+  color: var(--ink);
+  font-size: var(--text-lg);
+}
+
+.empty-canvas-note em {
+  max-width: 220px;
+  font-size: var(--text-sm);
+  line-height: 1.35;
 }
 
 .ai-panel {
@@ -5788,6 +5816,25 @@ button.chat-chip:disabled {
   color: var(--muted);
 }
 
+.chat-cancel-btn {
+  height: 24px;
+  margin-left: 2px;
+  padding: 0 8px;
+  color: var(--ink);
+  background: #fffaf0;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 760;
+}
+
+.chat-cancel-btn:hover {
+  background: var(--charcoal);
+  color: #fffaf0;
+  border-color: var(--charcoal);
+}
+
 .chat-result-image-btn {
   display: block;
   background: transparent;
@@ -5806,6 +5853,31 @@ button.chat-chip:disabled {
 
 .chat-result-image-btn:hover .chat-result-image {
   opacity: 0.88;
+}
+
+.chat-result-image-missing {
+  display: grid;
+  width: 100%;
+  gap: 3px;
+  padding: 12px;
+  color: #9d362f;
+  background: rgba(185, 71, 58, 0.08);
+  border: 1px dashed rgba(185, 71, 58, 0.28);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  text-align: left;
+}
+
+.chat-result-image-missing span {
+  color: #9d362f;
+  font-size: var(--text-sm);
+  font-weight: 800;
+}
+
+.chat-result-image-missing small {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
 }
 
 .chat-assistant-text {
@@ -5853,6 +5925,10 @@ button.chat-chip:disabled {
   display: grid;
   gap: 8px;
   position: relative;
+}
+
+.chat-composer.is-busy {
+  background: rgba(248, 244, 235, 0.34);
 }
 
 .chat-ref-chips {
@@ -5970,6 +6046,12 @@ button.chat-chip:disabled {
   color: var(--ink);
   background: #fffaf0;
   border-color: #b9afa1;
+}
+
+.chat-action-btn:disabled {
+  color: var(--quiet);
+  background: rgba(248, 244, 235, 0.5);
+  cursor: not-allowed;
 }
 
 .chat-send-btn {

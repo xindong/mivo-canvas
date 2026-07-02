@@ -35,6 +35,7 @@ export function EnhanceParamCard({ message, sceneId, isLast }: EnhanceParamCardP
   const [reasoningOpen, setReasoningOpen] = useState(false)
   const [promptOpen, setPromptOpen] = useState(false)
   const regenerateWithParams = useChatStore((s) => s.regenerateWithParams)
+  const cancelGeneration = useChatStore((s) => s.cancelGeneration)
   const isBusy = useChatStore((s) => s.isBusy)
   const { enhance } = message
 
@@ -51,6 +52,14 @@ export function EnhanceParamCard({ message, sceneId, isLast }: EnhanceParamCardP
         <div className="chat-thinking-placeholder">
           <span className="chat-spin-icon" />
           <span>深度思考中…</span>
+          <button
+            type="button"
+            className="chat-cancel-btn"
+            onClick={cancelGeneration}
+            title="取消本次生成"
+          >
+            取消
+          </button>
         </div>
       )}
 

@@ -11,6 +11,7 @@ export type EnhanceRequest = {
   history?: Array<{ role: 'user' | 'assistant'; content: string }>
   hasSelectedImage?: boolean
   sceneId?: string
+  signal?: AbortSignal
 }
 
 export type EnhanceResponse = {

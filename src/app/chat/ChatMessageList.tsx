@@ -14,6 +14,7 @@ const EMPTY_MESSAGES: import('../../store/chatStore').ChatMessage[] = []
 export function ChatMessageList({ sceneId }: ChatMessageListProps) {
   const messages = useChatStore((s) => s.messagesByScene[sceneId] ?? EMPTY_MESSAGES)
   const retryMessage = useChatStore((s) => s.retryMessage)
+  const cancelGeneration = useChatStore((s) => s.cancelGeneration)
   const isBusy = useChatStore((s) => s.isBusy)
   const selectNode = useCanvasStore((s) => s.selectNode)
 
@@ -95,6 +96,14 @@ export function ChatMessageList({ sceneId }: ChatMessageListProps) {
                 <div className="chat-generating-indicator">
                   <span className="chat-spin-icon" />
                   <span>生成中…</span>
+                  <button
+                    type="button"
+                    className="chat-cancel-btn"
+                    onClick={cancelGeneration}
+                    title="取消本次生成"
+                  >
+                    取消
+                  </button>
                 </div>
               )}
 
@@ -117,6 +126,7 @@ export function ChatMessageList({ sceneId }: ChatMessageListProps) {
                     className="chat-retry-btn"
                     onClick={() => void retryMessage({ sceneId, messageId: message.id })}
                     disabled={isBusy}
+                    title={isBusy ? '当前仍有生成任务，完成或取消后可重试' : '重新生成'}
                   >
                     <RefreshCw size={13} />
                     重试

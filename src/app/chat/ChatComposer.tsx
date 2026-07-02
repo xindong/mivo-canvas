@@ -71,6 +71,10 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
     )
 
     const addFiles = (files: FileList | File[] | null | undefined) => {
+      if (isBusy) {
+        setReferenceError('生成中，完成或取消后再添加参考图')
+        return
+      }
       const incoming = Array.from(files ?? []).filter((f) => f.type.startsWith('image/'))
       const rejected = Array.from(files ?? []).length - incoming.length
       setReferenceError(rejected ? `已跳过 ${rejected} 个非图片文件` : '')
@@ -132,13 +136,18 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
 
     const modelLabel = selectedModel.replace('gpt-image-2', 'GPT').replace('gemini-3-pro-image', 'Gemini')
     const hasOverride = paramOverrides.imgRatio !== 'auto' || paramOverrides.quality !== 'auto'
+    const canSend = Boolean(text.trim()) && !isBusy
+    const busyReason = '正在生成，完成或取消后可继续编辑'
+    const sendTitle = isBusy ? busyReason : text.trim() ? '发送' : '先输入描述'
+    const referenceTitle = isBusy ? '生成中，完成或取消后再上传参考图' : '上传参考图'
 
     return (
       <div
-        className="chat-composer"
+        className={`chat-composer ${isBusy ? 'is-busy' : ''}`}
         onDrop={handleDrop}
         onDragOver={(e) => e.preventDefault()}
         onPaste={handlePaste}
+        aria-busy={isBusy}
       >
         {referenceFiles.length > 0 && (
           <div className="chat-ref-chips">
@@ -170,6 +179,7 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
           rows={3}
           disabled={isBusy}
           aria-label="Chat input"
+          title={isBusy ? busyReason : undefined}
         />
 
         <div className="chat-composer-actions">
@@ -180,7 +190,7 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
             className={`chat-action-btn ${hasOverride ? 'active' : ''}`}
             onClick={() => setParamsOpen((v) => !v)}
             aria-label="生成参数"
-            title="生成参数"
+            title={isBusy ? '生成参数（影响下一次生成）' : '生成参数'}
           >
             <Settings2 size={16} />
           </button>
@@ -189,8 +199,9 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
             type="button"
             className="chat-action-btn"
             onClick={() => fileInputRef.current?.click()}
+            disabled={isBusy}
             aria-label="上传参考图"
-            title="上传参考图"
+            title={referenceTitle}
           >
             <ImagePlus size={16} />
           </button>
@@ -199,8 +210,9 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
             type="button"
             className="chat-send-btn"
             onClick={() => void handleSend()}
-            disabled={!text.trim() || isBusy}
-            aria-label="发送"
+            disabled={!canSend}
+            aria-label={isBusy ? '正在生成' : '发送'}
+            title={sendTitle}
           >
             <Send size={15} />
           </button>
@@ -215,6 +227,7 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
           type="file"
           accept="image/png,image/jpeg,image/webp"
           multiple
+          disabled={isBusy}
           onChange={(e) => {
             addFiles(e.target.files)
             e.target.value = ''
