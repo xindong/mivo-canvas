@@ -3,6 +3,7 @@ import { RefreshCw } from 'lucide-react'
 import { useChatStore } from '../../store/chatStore'
 import { useCanvasStore } from '../../store/canvasStore'
 import { EnhanceParamCard } from './EnhanceParamCard'
+import { ChatResultImage } from './ChatResultImage'
 
 type ChatMessageListProps = {
   sceneId: string
@@ -14,7 +15,6 @@ export function ChatMessageList({ sceneId }: ChatMessageListProps) {
   const messages = useChatStore((s) => s.messagesByScene[sceneId] ?? EMPTY_MESSAGES)
   const retryMessage = useChatStore((s) => s.retryMessage)
   const isBusy = useChatStore((s) => s.isBusy)
-  const nodes = useCanvasStore((s) => s.nodes)
   const selectNode = useCanvasStore((s) => s.selectNode)
 
   const listRef = useRef<HTMLDivElement>(null)
@@ -81,8 +81,6 @@ export function ChatMessageList({ sceneId }: ChatMessageListProps) {
         // assistant text message
         const isLast = index === lastAssistantIdx
         const resultNodeId = message.resultNodeIds?.[0]
-        const resultNode = resultNodeId ? nodes.find((n) => n.id === resultNodeId) : undefined
-        const resultImageUrl = resultNode?.type === 'image' ? (resultNode as { assetUrl?: string }).assetUrl : undefined
 
         return (
           <div key={message.id} className="chat-message chat-message-assistant">
@@ -100,22 +98,14 @@ export function ChatMessageList({ sceneId }: ChatMessageListProps) {
                 </div>
               )}
 
-              {message.status === 'done' && resultImageUrl && (
-                <button
-                  type="button"
-                  className="chat-result-image-btn"
-                  onClick={() => resultNodeId && selectNode(resultNodeId)}
-                  title="点击定位到画布节点"
-                >
-                  <img
-                    src={resultImageUrl}
-                    alt="生成结果"
-                    className="chat-result-image"
-                  />
-                </button>
+              {message.status === 'done' && resultNodeId && (
+                <ChatResultImage
+                  nodeId={resultNodeId}
+                  onLocate={() => selectNode(resultNodeId)}
+                />
               )}
 
-              {message.status === 'done' && !resultImageUrl && message.text && message.enhance?.richPrompt === undefined && (
+              {message.status === 'done' && !resultNodeId && message.text && message.enhance?.richPrompt === undefined && (
                 <p className="chat-assistant-text">{message.text}</p>
               )}
 
