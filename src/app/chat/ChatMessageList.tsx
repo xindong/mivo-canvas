@@ -76,6 +76,7 @@ export function ChatMessageList({ sceneId }: ChatMessageListProps) {
 
         // assistant text message
         const resultNodeId = message.resultNodeIds?.[0]
+        const retryDisabledReason = message.retryDisabledReason || (isBusy ? '当前仍有生成任务，完成或取消后可重试' : '')
 
         return (
           <div key={message.id} className="chat-message chat-message-assistant">
@@ -117,8 +118,8 @@ export function ChatMessageList({ sceneId }: ChatMessageListProps) {
                     type="button"
                     className="chat-retry-btn"
                     onClick={() => void retryMessage({ sceneId, messageId: message.id })}
-                    disabled={isBusy}
-                    title={isBusy ? '当前仍有生成任务，完成或取消后可重试' : '重新生成'}
+                    disabled={isBusy || Boolean(message.retryDisabledReason)}
+                    title={retryDisabledReason || '重新生成'}
                   >
                     <RefreshCw size={13} />
                     重试

@@ -48,6 +48,7 @@ type LayerMove = 'forward' | 'backward' | 'front' | 'back'
 export type SelectionAlignment = 'left' | 'center' | 'right' | 'top' | 'middle' | 'bottom'
 export type DistributionAxis = 'horizontal' | 'vertical'
 export type CanvasGenerationOptions = {
+  sceneId?: CanvasId
   imgRatio?: GenerationRatio
   quality?: MivoImageQuality
   model?: string
@@ -130,6 +131,7 @@ type CanvasState = {
     position: { x: number; y: number },
     size?: { width: number; height: number },
     prompt?: string,
+    options?: { sceneId?: CanvasId },
   ) => string
   addAnnotationNode: (
     sourceNodeId?: string,
@@ -601,6 +603,51 @@ const patchWithHistory = (
   ...remember(state),
   ...patchActiveCanvas(state, patch),
 })
+
+type CanvasDocumentPatch = Partial<
+  Pick<CanvasDocument, 'nodes' | 'edges' | 'tasks' | 'selectedNodeId' | 'selectedNodeIds' | 'title'>
+>
+
+const patchCanvasDocument = (
+  state: CanvasState,
+  sceneId: CanvasId,
+  patch: CanvasDocumentPatch,
+  options: { history?: boolean } = {},
+) => {
+  if (sceneId === state.sceneId) {
+    return options.history ? patchWithHistory(state, patch) : patchActiveCanvas(state, patch)
+  }
+
+  const currentDocument = state.canvases[sceneId]
+  if (!currentDocument) return {}
+
+  const nextEdges = 'edges' in patch ? cloneEdges(patch.edges || []) : cloneEdges(currentDocument.edges || [])
+  const nextNodes =
+    'nodes' in patch || 'edges' in patch
+      ? normalizeCanvasGraph(cloneNodes(patch.nodes || currentDocument.nodes), nextEdges)
+      : cloneNodes(currentDocument.nodes)
+  const selection = selectionFrom(
+    'selectedNodeIds' in patch ? patch.selectedNodeIds : currentDocument.selectedNodeIds,
+    'selectedNodeId' in patch ? patch.selectedNodeId : currentDocument.selectedNodeId,
+    nextNodes,
+  )
+  const nextDocument: CanvasDocument = {
+    ...currentDocument,
+    ...patch,
+    nodes: nextNodes,
+    edges: nextEdges,
+    tasks: patch.tasks ? cloneTasks(patch.tasks) : cloneTasks(currentDocument.tasks),
+    selectedNodeId: selection.selectedNodeId,
+    selectedNodeIds: selection.selectedNodeIds,
+  }
+
+  return {
+    canvases: {
+      ...state.canvases,
+      [sceneId]: nextDocument,
+    },
+  }
+}
 
 const applySnapshot = (state: CanvasState, snapshot: MivoCanvasSnapshot) => {
   const currentDocument = documentFor(state.canvases, snapshot.sceneId)
@@ -1695,7 +1742,11 @@ export const useCanvasStore = create<CanvasState>()(
 
         return id
       },
-      addAiSlotNode: (position, size, prompt) => {
+      addAiSlotNode: (position, size, prompt, options) => {
+        const targetSceneId = options?.sceneId || get().sceneId
+        const targetDocument = get().canvases[targetSceneId]
+        if (!targetDocument) throw new Error('目标画布已删除，无法继续生成。')
+
         const id = createNodeId('ai-slot')
         const defaultSize = defaultSizeForNodeType('ai-slot')
         const width = Math.round(size?.width ?? defaultSize.width)
@@ -1704,7 +1755,10 @@ export const useCanvasStore = create<CanvasState>()(
         const slotPrompt = prompt?.trim() || '等待 AI 生成的画布槽位'
 
         set((state) => {
-          const slotCount = state.nodes.filter((node) => node.type === 'ai-slot').length
+          const document = state.canvases[targetSceneId]
+          if (!document) return {}
+
+          const slotCount = document.nodes.filter((node) => node.type === 'ai-slot').length
           const slot = makeNode({
             id,
             type: 'ai-slot',
@@ -1730,11 +1784,11 @@ export const useCanvasStore = create<CanvasState>()(
             },
           })
 
-          return patchWithHistory(state, {
+          return patchCanvasDocument(state, targetSceneId, {
             selectedNodeId: id,
             selectedNodeIds: [id],
-            nodes: normalizeCanvasNodes([...state.nodes, slot]),
-          })
+            nodes: normalizeCanvasNodes([...document.nodes, slot]),
+          }, { history: true })
         })
 
         return id
@@ -2046,12 +2100,15 @@ export const useCanvasStore = create<CanvasState>()(
         const prompt = payload.prompt.trim()
         if (!prompt) throw new Error('Prompt is required')
         if (!payload.resultImages.length) throw new Error('No generated images returned')
+        const targetSceneId = payload.sceneId || get().sceneId
 
         const initialState = get()
+        const initialDocument = initialState.canvases[targetSceneId]
+        if (!initialDocument) throw new Error('目标画布已删除，无法继续生成。')
         const source = payload.sourceNodeId
-          ? initialState.nodes.find((node) => node.id === payload.sourceNodeId && !node.hidden)
+          ? initialDocument.nodes.find((node) => node.id === payload.sourceNodeId && !node.hidden)
           : undefined
-        if (payload.sourceNodeId && !source) throw new Error('Source node not found')
+        if (payload.sourceNodeId && !source) throw new Error('源节点已删除，无法继续生成。')
 
         const createdAt = Date.now()
         const savedImages = await Promise.all(
@@ -2066,14 +2123,27 @@ export const useCanvasStore = create<CanvasState>()(
 
         const createdNodeIds: string[] = []
 
+        const currentState = get()
+        const currentDocument = currentState.canvases[targetSceneId]
+        if (!currentDocument) throw new Error('目标画布已删除，无法继续生成。')
+        if (
+          payload.sourceNodeId &&
+          !currentDocument.nodes.find((node) => node.id === payload.sourceNodeId && !node.hidden)
+        ) {
+          throw new Error('源节点已删除，无法继续生成。')
+        }
+
         set((state) => {
+          const targetDocument = state.canvases[targetSceneId]
+          if (!targetDocument) return {}
+
           const currentSource = payload.sourceNodeId
-            ? state.nodes.find((node) => node.id === payload.sourceNodeId && !node.hidden)
+            ? targetDocument.nodes.find((node) => node.id === payload.sourceNodeId && !node.hidden)
             : undefined
           if (payload.sourceNodeId && !currentSource) return {}
 
-          let nextNodes = state.nodes.filter((node) => !isDerivationEdgeNode(node))
-          const nextEdges = cloneEdges(state.edges)
+          let nextNodes = targetDocument.nodes.filter((node) => !isDerivationEdgeNode(node))
+          const nextEdges = cloneEdges(targetDocument.edges || [])
           const newNodes: MivoCanvasNode[] = []
           const newEdges: CanvasEdge[] = []
 
@@ -2157,12 +2227,12 @@ export const useCanvasStore = create<CanvasState>()(
 
           nextEdges.push(...newEdges)
 
-          return patchWithHistory(state, {
+          return patchCanvasDocument(state, targetSceneId, {
             selectedNodeId: createdNodeIds[0],
             selectedNodeIds: createdNodeIds,
-            nodes: [...state.nodes, ...newNodes],
+            nodes: nextNodes,
             edges: nextEdges,
-          })
+          }, { history: true })
         })
 
         return createdNodeIds
@@ -2214,6 +2284,7 @@ export const useCanvasStore = create<CanvasState>()(
         }))
       },
       generateImageEdit: async (sourceNodeId, operation, prompt, options = {}) => {
+        const targetSceneId = options.sceneId || get().sceneId
         const taskId = createNodeId(`task-${operation}`)
         const operationLabels: Record<string, string> = {
           'prompt-edit': 'Prompt edit',
@@ -2224,9 +2295,16 @@ export const useCanvasStore = create<CanvasState>()(
         }
         const operationLabel = operationLabels[operation] || 'Image edit'
         const state = get()
+        const document = state.canvases[targetSceneId]
+        if (!document) throw new Error('目标画布已删除，无法继续生成。')
         const source =
-          state.nodes.find((node) => node.id === sourceNodeId && node.type === 'image' && !node.hidden) ||
-          state.nodes.find((node) => node.id === state.selectedNodeId && node.type === 'image' && !node.hidden)
+          (sourceNodeId
+            ? document.nodes.find((node) => node.id === sourceNodeId && node.type === 'image' && !node.hidden)
+            : undefined) ||
+          (!sourceNodeId
+            ? document.nodes.find((node) => node.id === document.selectedNodeId && node.type === 'image' && !node.hidden)
+            : undefined)
+        if (sourceNodeId && !source) throw new Error('源节点已删除，无法继续生成。')
         if (!source) return []
 
         const resultPrompt = prompt.trim() || operationLabel
@@ -2239,7 +2317,11 @@ export const useCanvasStore = create<CanvasState>()(
           nodeIds: [],
         }
 
-        set((current) => patchActiveCanvas(current, { tasks: upsertTask(current.tasks, runningTask) }))
+        set((current) => {
+          const targetDocument = current.canvases[targetSceneId]
+          if (!targetDocument) return {}
+          return patchCanvasDocument(current, targetSceneId, { tasks: upsertTask(targetDocument.tasks, runningTask) })
+        })
 
         try {
           const image = await assetBlobForNode(source)
@@ -2253,6 +2335,7 @@ export const useCanvasStore = create<CanvasState>()(
             signal: options.signal,
           })
           const nodeIds = await get().commitGenerationResult({
+            sceneId: targetSceneId,
             sourceNodeId: source.id,
             resultImages: response.images,
             prompt: resultPrompt,
@@ -2260,28 +2343,38 @@ export const useCanvasStore = create<CanvasState>()(
             kind: edgeTypeForOperation(operation),
             taskId,
           })
-          set((current) =>
-            patchActiveCanvas(current, {
-              tasks: upsertTask(current.tasks, doneTask(runningTask, `${operationLabel}: ${source.title}`, nodeIds)),
-            }),
-          )
+          set((current) => {
+            const targetDocument = current.canvases[targetSceneId]
+            if (!targetDocument) return {}
+            return patchCanvasDocument(current, targetSceneId, {
+              tasks: upsertTask(targetDocument.tasks, doneTask(runningTask, `${operationLabel}: ${source.title}`, nodeIds)),
+            })
+          })
           return nodeIds
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Image edit failed'
-          set((current) =>
-            patchActiveCanvas(current, {
-              tasks: upsertTask(current.tasks, failedTask(runningTask, `${operationLabel} failed: ${message}`)),
-            }),
-          )
+          set((current) => {
+            const targetDocument = current.canvases[targetSceneId]
+            if (!targetDocument) return {}
+            return patchCanvasDocument(current, targetSceneId, {
+              tasks: upsertTask(targetDocument.tasks, failedTask(runningTask, `${operationLabel} failed: ${message}`)),
+            })
+          })
           throw error
         }
       },
       generateBesideNode: async (sourceNodeId, prompt, options = {}) => {
+        const targetSceneId = options.sceneId || get().sceneId
         const state = get()
+        const document = state.canvases[targetSceneId]
+        if (!document) throw new Error('目标画布已删除，无法继续生成。')
         const source =
-          state.nodes.find((node) => node.id === sourceNodeId && !node.hidden) ||
-          state.nodes.find((node) => node.id === state.selectedNodeId && !node.hidden) ||
-          state.nodes.find((node) => !node.hidden)
+          (sourceNodeId ? document.nodes.find((node) => node.id === sourceNodeId && !node.hidden) : undefined) ||
+          (!sourceNodeId
+            ? document.nodes.find((node) => node.id === document.selectedNodeId && !node.hidden) ||
+              document.nodes.find((node) => !node.hidden)
+            : undefined)
+        if (sourceNodeId && !source) throw new Error('源节点已删除，无法继续生成。')
         if (!source) return []
 
         const resultPrompt = prompt?.trim() || nodePrompt(source)
@@ -2295,7 +2388,11 @@ export const useCanvasStore = create<CanvasState>()(
           nodeIds: [],
         }
 
-        set((current) => patchActiveCanvas(current, { tasks: upsertTask(current.tasks, runningTask) }))
+        set((current) => {
+          const targetDocument = current.canvases[targetSceneId]
+          if (!targetDocument) return {}
+          return patchCanvasDocument(current, targetSceneId, { tasks: upsertTask(targetDocument.tasks, runningTask) })
+        })
 
         try {
           const referenceFiles = options.referenceFiles || []
@@ -2320,6 +2417,7 @@ export const useCanvasStore = create<CanvasState>()(
                 signal: options.signal,
               })
           const nodeIds = await get().commitGenerationResult({
+            sceneId: targetSceneId,
             sourceNodeId: source.id,
             resultImages: response.images,
             prompt: resultPrompt,
@@ -2327,27 +2425,37 @@ export const useCanvasStore = create<CanvasState>()(
             kind: 'generate',
             taskId,
           })
-          set((current) =>
-            patchActiveCanvas(current, {
-              tasks: upsertTask(current.tasks, doneTask(runningTask, `旁边生成：${source.title}`, nodeIds)),
-            }),
-          )
+          set((current) => {
+            const targetDocument = current.canvases[targetSceneId]
+            if (!targetDocument) return {}
+            return patchCanvasDocument(current, targetSceneId, {
+              tasks: upsertTask(targetDocument.tasks, doneTask(runningTask, `旁边生成：${source.title}`, nodeIds)),
+            })
+          })
           return nodeIds
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Generation failed'
-          set((current) =>
-            patchActiveCanvas(current, {
-              tasks: upsertTask(current.tasks, failedTask(runningTask, `旁边生成失败：${message}`)),
-            }),
-          )
+          set((current) => {
+            const targetDocument = current.canvases[targetSceneId]
+            if (!targetDocument) return {}
+            return patchCanvasDocument(current, targetSceneId, {
+              tasks: upsertTask(targetDocument.tasks, failedTask(runningTask, `旁边生成失败：${message}`)),
+            })
+          })
           throw error
         }
       },
       generateIntoAiSlot: async (slotId, prompt, options = {}) => {
+        const targetSceneId = options.sceneId || get().sceneId
         const state = get()
+        const document = state.canvases[targetSceneId]
+        if (!document) throw new Error('目标画布已删除，无法继续生成。')
         const slot =
-          state.nodes.find((node) => node.id === slotId && node.type === 'ai-slot' && !node.hidden) ||
-          state.nodes.find((node) => node.id === state.selectedNodeId && node.type === 'ai-slot' && !node.hidden)
+          (slotId ? document.nodes.find((node) => node.id === slotId && node.type === 'ai-slot' && !node.hidden) : undefined) ||
+          (!slotId
+            ? document.nodes.find((node) => node.id === document.selectedNodeId && node.type === 'ai-slot' && !node.hidden)
+            : undefined)
+        if (slotId && !slot) throw new Error('AI 生成槽位已删除，无法继续生成。')
         if (!slot) return []
 
         const resultPrompt = prompt?.trim() || nodePrompt(slot, '根据 AI 槽位生成图片')
@@ -2362,7 +2470,9 @@ export const useCanvasStore = create<CanvasState>()(
         }
 
         set((current) => {
-          const nodes = current.nodes.map((node) =>
+          const targetDocument = current.canvases[targetSceneId]
+          if (!targetDocument) return {}
+          const nodes = targetDocument.nodes.map((node) =>
             node.id === slot.id
               ? {
                   ...node,
@@ -2384,7 +2494,7 @@ export const useCanvasStore = create<CanvasState>()(
                 }
               : node,
           )
-          return patchActiveCanvas(current, { nodes, tasks: upsertTask(current.tasks, runningTask) })
+          return patchCanvasDocument(current, targetSceneId, { nodes, tasks: upsertTask(targetDocument.tasks, runningTask) })
         })
 
         try {
@@ -2408,6 +2518,7 @@ export const useCanvasStore = create<CanvasState>()(
                 signal: options.signal,
               })
           const nodeIds = await get().commitGenerationResult({
+            sceneId: targetSceneId,
             sourceNodeId: slot.id,
             resultImages: response.images,
             prompt: resultPrompt,
@@ -2417,7 +2528,9 @@ export const useCanvasStore = create<CanvasState>()(
             placement: 'right',
           })
           set((current) => {
-            const nodes = current.nodes.map((node) =>
+            const targetDocument = current.canvases[targetSceneId]
+            if (!targetDocument) return {}
+            const nodes = targetDocument.nodes.map((node) =>
               node.id === slot.id && node.aiWorkflow
                 ? {
                     ...node,
@@ -2428,16 +2541,18 @@ export const useCanvasStore = create<CanvasState>()(
                   }
                 : node,
             )
-            return patchActiveCanvas(current, {
+            return patchCanvasDocument(current, targetSceneId, {
               nodes,
-              tasks: upsertTask(current.tasks, doneTask(runningTask, `生成到槽位：${slot.title}`, nodeIds)),
+              tasks: upsertTask(targetDocument.tasks, doneTask(runningTask, `生成到槽位：${slot.title}`, nodeIds)),
             })
           })
           return nodeIds
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Generation failed'
           set((current) => {
-            const nodes = current.nodes.map((node) =>
+            const targetDocument = current.canvases[targetSceneId]
+            if (!targetDocument) return {}
+            const nodes = targetDocument.nodes.map((node) =>
               node.id === slot.id && node.aiWorkflow
                 ? {
                     ...node,
@@ -2448,9 +2563,9 @@ export const useCanvasStore = create<CanvasState>()(
                   }
                 : node,
             )
-            return patchActiveCanvas(current, {
+            return patchCanvasDocument(current, targetSceneId, {
               nodes,
-              tasks: upsertTask(current.tasks, failedTask(runningTask, `生成到槽位失败：${message}`)),
+              tasks: upsertTask(targetDocument.tasks, failedTask(runningTask, `生成到槽位失败：${message}`)),
             })
           })
           throw error

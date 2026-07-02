@@ -1,4 +1,5 @@
 import type { CanvasMaskBounds, CanvasTask, MivoCanvasNode } from './mivoCanvas'
+import type { CanvasId } from './mivoCanvas'
 
 export type MivoImageRatio = '1:1' | '3:2' | '2:3' | '16:9' | '9:16'
 export type MivoImageQuality = 'low' | 'medium' | 'high'
@@ -70,6 +71,7 @@ export type CommittedGenerationImage = {
 }
 
 export type CommitGenerationResultPayload = {
+  sceneId?: CanvasId
   sourceNodeId?: string
   resultImages: CommittedGenerationImage[]
   prompt: string

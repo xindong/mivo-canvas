@@ -301,7 +301,10 @@ export function MivoCanvas({
 
   const submitMaskEdit = useCallback(
     async (nodeId: string, resolvedAssetUrl: string, payload: ImageMaskSubmitPayload) => {
-      const source = useCanvasStore.getState().nodes.find((node) => node.id === nodeId && node.type === 'image' && !node.hidden)
+      const targetSceneId = sceneId
+      const source = useCanvasStore
+        .getState()
+        .canvases[targetSceneId]?.nodes.find((node) => node.id === nodeId && node.type === 'image' && !node.hidden)
       if (!source) throw new Error('Source image not found')
 
       setMaskEditSubmittingNodeId(nodeId)
@@ -320,6 +323,7 @@ export function MivoCanvas({
           signal: abortController.signal,
         })
         const nodeIds = await commitGenerationResult({
+          sceneId: targetSceneId,
           sourceNodeId: source.id,
           resultImages: response.images,
           prompt: payload.prompt,
@@ -328,9 +332,28 @@ export function MivoCanvas({
           maskBounds: payload.maskBounds,
           placement: 'right',
         })
-        const sceneId = useCanvasStore.getState().sceneId
-        useChatStore.getState().appendNotice({ sceneId, origin: 'mask-edit', nodeIds, prompt: payload.prompt })
+        const latestCanvasState = useCanvasStore.getState()
+        useChatStore.getState().appendNotice({ sceneId: targetSceneId, origin: 'mask-edit', nodeIds, prompt: payload.prompt })
+        if (latestCanvasState.sceneId !== targetSceneId) {
+          const title = latestCanvasState.canvases[targetSceneId]?.title || targetSceneId
+          useChatStore.getState().appendNotice({
+            sceneId: latestCanvasState.sceneId,
+            origin: 'mask-edit',
+            prompt: `结果已生成到画布 ${title}`,
+          })
+        }
         setMaskEditNodeId(undefined)
+      } catch (error) {
+        const latestCanvasState = useCanvasStore.getState()
+        if (latestCanvasState.sceneId !== targetSceneId) {
+          const message = error instanceof Error ? error.message : '局部重绘失败'
+          useChatStore.getState().appendNotice({
+            sceneId: latestCanvasState.sceneId,
+            origin: 'mask-edit',
+            prompt: `局部重绘失败：${message}`,
+          })
+        }
+        throw error
       } finally {
         if (maskEditAbortRef.current === abortController) {
           maskEditAbortRef.current = null
@@ -338,7 +361,7 @@ export function MivoCanvas({
         setMaskEditSubmittingNodeId(undefined)
       }
     },
-    [commitGenerationResult],
+    [commitGenerationResult, sceneId],
   )
 
   const downloadOriginal = useCallback((node?: typeof contextMenuNode) => {

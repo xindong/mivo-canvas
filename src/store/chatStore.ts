@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import type { GenerationRatio, MivoImageQuality } from '../types/generation'
+import { readImportedAssetFile, saveImportedAsset } from '../lib/assetStorage'
 import { enhanceMivoPrompt } from '../lib/mivoImageClient'
 import { getModelCapabilities } from '../lib/modelCapabilities'
 import { useCanvasStore } from './canvasStore'
@@ -19,6 +20,24 @@ export type ChatEnhanceResult = {
   degradedReason?: string
 }
 
+export type ChatParamOverrides = {
+  imgRatio: 'auto' | GenerationRatio
+  quality: 'auto' | MivoImageQuality
+}
+
+export type ChatGenerationContext = {
+  sourceNodeId?: string
+  sourceNodeType?: string
+  referenceAssetUrls?: string[]
+  model: string
+  requestedImgRatio: ChatParamOverrides['imgRatio']
+  requestedQuality: ChatParamOverrides['quality']
+  imgRatio?: GenerationRatio
+  quality?: MivoImageQuality
+  finalPrompt?: string
+  pendingSlotId?: string
+}
+
 export type ChatMessage = {
   id: string
   role: 'user' | 'assistant'
@@ -32,11 +51,8 @@ export type ChatMessage = {
   error?: string
   selectedNodeId?: string
   selectedNodeType?: string
-}
-
-export type ChatParamOverrides = {
-  imgRatio: 'auto' | GenerationRatio
-  quality: 'auto' | MivoImageQuality
+  generationContext?: ChatGenerationContext
+  retryDisabledReason?: string
 }
 
 type ChatState = {
@@ -66,7 +82,18 @@ type ChatState = {
 
 const createMessageId = () => `msg-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`
 const canceledGenerationMessage = '已取消生成，可修改提示后重试。'
+const referenceAssetMissingMessage = '参考图已失效，无法重试'
 let activeChatAbortController: AbortController | null = null
+
+const saveReferenceAssets = async (files: File[]) =>
+  Promise.all(files.map(async (file) => (await saveImportedAsset(file)).assetUrl))
+
+const referenceFilesFromAssets = async (assetUrls: string[] = []) => {
+  const assets = await Promise.all(assetUrls.map((assetUrl) => readImportedAssetFile(assetUrl)))
+  if (assets.some((asset) => !asset)) throw new Error(referenceAssetMissingMessage)
+
+  return assets.map((asset) => new File([asset!.blob], asset!.name, { type: asset!.type || asset!.blob.type }))
+}
 
 const errorMessageForChat = (err: unknown, signal?: AbortSignal) => {
   if (signal?.aborted) return canceledGenerationMessage
@@ -94,12 +121,25 @@ export const useChatStore = create<ChatState>()(
       sendMessage: async ({ sceneId, text, selectedNodeId, selectedNodeType, referenceFiles = [] }) => {
         const state = get()
         if (state.isBusy) return
+
+        const { selectedModel, paramOverrides } = state
+        const referenceAssetUrls = await saveReferenceAssets(referenceFiles)
+        if (get().isBusy) return
+
         const abortController = new AbortController()
         activeChatAbortController = abortController
 
-        const existingMessages = state.messagesByScene[sceneId] || []
+        const existingMessages = get().messagesByScene[sceneId] || []
         const userMessageId = createMessageId()
         const assistantMessageId = createMessageId()
+        const initialContext: ChatGenerationContext = {
+          sourceNodeId: selectedNodeId,
+          sourceNodeType: selectedNodeType,
+          referenceAssetUrls,
+          model: selectedModel,
+          requestedImgRatio: paramOverrides.imgRatio,
+          requestedQuality: paramOverrides.quality,
+        }
 
         const userMessage: ChatMessage = {
           id: userMessageId,
@@ -110,6 +150,7 @@ export const useChatStore = create<ChatState>()(
           status: 'done',
           selectedNodeId,
           selectedNodeType,
+          generationContext: initialContext,
         }
         const assistantMessage: ChatMessage = {
           id: assistantMessageId,
@@ -118,6 +159,7 @@ export const useChatStore = create<ChatState>()(
           text: '',
           createdAt: Date.now(),
           status: 'enhancing',
+          generationContext: initialContext,
         }
 
         set((s) => ({
@@ -130,7 +172,6 @@ export const useChatStore = create<ChatState>()(
 
         try {
           const history = historyForEnhance(existingMessages)
-          const { selectedModel, paramOverrides } = get()
           const hasSelectedImage = selectedNodeType === 'image'
 
           const enhanceResult = await enhanceMivoPrompt({
@@ -159,13 +200,25 @@ export const useChatStore = create<ChatState>()(
           const finalRatio = paramOverrides.imgRatio !== 'auto' ? paramOverrides.imgRatio : enhance.imgRatio
           const finalQuality: MivoImageQuality =
             paramOverrides.quality !== 'auto' ? (paramOverrides.quality as MivoImageQuality) : (enhance.quality || 'medium')
+          let context: ChatGenerationContext = {
+            ...initialContext,
+            imgRatio: finalRatio,
+            quality: finalQuality,
+            finalPrompt,
+          }
 
           set((s) => ({
             messagesByScene: {
               ...s.messagesByScene,
               [sceneId]: (s.messagesByScene[sceneId] || []).map((m) =>
-                m.id === assistantMessageId
-                  ? { ...m, status: 'generating' as const, enhance, text: finalPrompt }
+                m.id === userMessageId || m.id === assistantMessageId
+                  ? {
+                      ...m,
+                      ...(m.id === assistantMessageId
+                        ? { status: 'generating' as const, enhance, text: finalPrompt }
+                        : {}),
+                      generationContext: context,
+                    }
                   : m,
               ),
             },
@@ -173,6 +226,7 @@ export const useChatStore = create<ChatState>()(
 
           const canvasStore = useCanvasStore.getState()
           const genOptions = {
+            sceneId,
             imgRatio: finalRatio,
             quality: finalQuality,
             model: selectedModel,
@@ -184,16 +238,38 @@ export const useChatStore = create<ChatState>()(
           if (hasSelectedImage && selectedNodeId) {
             nodeIds = await canvasStore.generateBesideNode(selectedNodeId, finalPrompt, genOptions)
           } else {
-            const { nodes } = canvasStore
-            const selectedNode = selectedNodeId ? nodes.find((n) => n.id === selectedNodeId) : undefined
-            const slotX = selectedNode ? selectedNode.x + selectedNode.width + 56 : -160 + nodes.length * 18
-            const slotY = selectedNode ? selectedNode.y : -160 + nodes.length * 18
-            const slotId = canvasStore.addAiSlotNode({ x: slotX, y: slotY }, { width: 320, height: 320 }, finalPrompt)
+            const targetDocument = canvasStore.canvases[sceneId]
+            if (!targetDocument) throw new Error('目标画布已删除，无法继续生成。')
+            const selectedNode = selectedNodeId ? targetDocument.nodes.find((n) => n.id === selectedNodeId) : undefined
+            const slotX = selectedNode ? selectedNode.x + selectedNode.width + 56 : -160 + targetDocument.nodes.length * 18
+            const slotY = selectedNode ? selectedNode.y : -160 + targetDocument.nodes.length * 18
+            const slotId = canvasStore.addAiSlotNode(
+              { x: slotX, y: slotY },
+              { width: 320, height: 320 },
+              finalPrompt,
+              { sceneId },
+            )
+            context = { ...context, pendingSlotId: slotId }
+            set((s) => ({
+              messagesByScene: {
+                ...s.messagesByScene,
+                [sceneId]: (s.messagesByScene[sceneId] || []).map((m) =>
+                  m.id === userMessageId || m.id === assistantMessageId ? { ...m, generationContext: context } : m,
+                ),
+              },
+            }))
             nodeIds = await canvasStore.generateIntoAiSlot(slotId, finalPrompt, genOptions)
           }
 
-          // B2: guard against cross-canvas scene switch during generation
-          const resultNodeIds = useCanvasStore.getState().sceneId === sceneId ? nodeIds : undefined
+          const latestCanvasState = useCanvasStore.getState()
+          if (latestCanvasState.sceneId !== sceneId) {
+            const title = latestCanvasState.canvases[sceneId]?.title || sceneId
+            get().appendNotice({
+              sceneId: latestCanvasState.sceneId,
+              origin: 'chat',
+              prompt: `结果已生成到画布 ${title}`,
+            })
+          }
 
           set((s) => ({
             isBusy: false,
@@ -204,8 +280,8 @@ export const useChatStore = create<ChatState>()(
                   ? {
                       ...m,
                       status: 'done' as const,
-                      resultNodeIds,
-                      ...(resultNodeIds === undefined ? { text: '结果已生成到其他画布' } : {}),
+                      resultNodeIds: nodeIds,
+                      generationContext: context,
                     }
                   : m,
               ),
@@ -213,6 +289,14 @@ export const useChatStore = create<ChatState>()(
           }))
         } catch (err) {
           const errorMsg = errorMessageForChat(err, abortController.signal)
+          const latestCanvasState = useCanvasStore.getState()
+          if (latestCanvasState.sceneId !== sceneId) {
+            get().appendNotice({
+              sceneId: latestCanvasState.sceneId,
+              origin: 'chat',
+              prompt: `生成失败：${errorMsg}`,
+            })
+          }
           set((s) => ({
             isBusy: false,
             messagesByScene: {
@@ -253,6 +337,7 @@ export const useChatStore = create<ChatState>()(
 
       retryMessage: async ({ sceneId, messageId }) => {
         const state = get()
+        if (state.isBusy) return
         const messages = state.messagesByScene[sceneId] || []
         const targetMsg = messages.find((m) => m.id === messageId && m.role === 'assistant')
         if (!targetMsg || targetMsg.status !== 'error') return
@@ -260,20 +345,168 @@ export const useChatStore = create<ChatState>()(
         const targetIndex = messages.findIndex((m) => m.id === messageId)
         const userMsg = messages.slice(0, targetIndex).reverse().find((m) => m.role === 'user')
         if (!userMsg) return
+        const baseContext = targetMsg.generationContext || userMsg.generationContext
+        if (!baseContext) return
+
+        let referenceFiles: File[]
+        try {
+          referenceFiles = await referenceFilesFromAssets(baseContext.referenceAssetUrls)
+        } catch (err) {
+          const errorMsg = err instanceof Error ? err.message : referenceAssetMissingMessage
+          set((s) => ({
+            messagesByScene: {
+              ...s.messagesByScene,
+              [sceneId]: (s.messagesByScene[sceneId] || []).map((m) =>
+                m.id === messageId
+                  ? {
+                      ...m,
+                      status: 'error' as const,
+                      error: errorMsg,
+                      retryDisabledReason: referenceAssetMissingMessage,
+                    }
+                  : m,
+              ),
+            },
+          }))
+          return
+        }
+
+        if (get().isBusy) return
+        const abortController = new AbortController()
+        activeChatAbortController = abortController
+        let context = baseContext
+        const finalPrompt = context.finalPrompt || targetMsg.enhance?.richPrompt || targetMsg.text || userMsg.text
+        const finalQuality = context.quality || 'medium'
 
         set((s) => ({
+          isBusy: true,
           messagesByScene: {
             ...s.messagesByScene,
-            [sceneId]: (s.messagesByScene[sceneId] || []).filter((m) => m.id !== messageId),
+            [sceneId]: (s.messagesByScene[sceneId] || []).map((m) =>
+              m.id === messageId
+                ? {
+                    ...m,
+                    status: 'generating' as const,
+                    text: finalPrompt,
+                    error: undefined,
+                    retryDisabledReason: undefined,
+                    resultNodeIds: undefined,
+                    generationContext: context,
+                  }
+                : m,
+            ),
           },
         }))
 
-        await get().sendMessage({
-          sceneId,
-          text: userMsg.text,
-          selectedNodeId: userMsg.selectedNodeId,
-          selectedNodeType: userMsg.selectedNodeType,
-        })
+        try {
+          const canvasStore = useCanvasStore.getState()
+          const genOptions = {
+            sceneId,
+            imgRatio: context.imgRatio,
+            quality: finalQuality,
+            model: context.model,
+            referenceFiles: referenceFiles.length ? referenceFiles : undefined,
+            signal: abortController.signal,
+          }
+
+          let nodeIds: string[]
+          if (context.sourceNodeType === 'image' && context.sourceNodeId) {
+            nodeIds = await canvasStore.generateBesideNode(context.sourceNodeId, finalPrompt, genOptions)
+          } else {
+            const targetDocument = canvasStore.canvases[sceneId]
+            if (!targetDocument) throw new Error('目标画布已删除，无法继续生成。')
+            let slotId = context.pendingSlotId
+            const reusableSlot = slotId
+              ? targetDocument.nodes.find((node) => node.id === slotId && node.type === 'ai-slot' && !node.hidden)
+              : undefined
+
+            if (!reusableSlot) {
+              const selectedNode = context.sourceNodeId
+                ? targetDocument.nodes.find((node) => node.id === context.sourceNodeId && !node.hidden)
+                : undefined
+              const slotX = selectedNode ? selectedNode.x + selectedNode.width + 56 : -160 + targetDocument.nodes.length * 18
+              const slotY = selectedNode ? selectedNode.y : -160 + targetDocument.nodes.length * 18
+              slotId = canvasStore.addAiSlotNode(
+                { x: slotX, y: slotY },
+                { width: 320, height: 320 },
+                finalPrompt,
+                { sceneId },
+              )
+              context = { ...context, pendingSlotId: slotId }
+              set((s) => ({
+                messagesByScene: {
+                  ...s.messagesByScene,
+                  [sceneId]: (s.messagesByScene[sceneId] || []).map((m) =>
+                    m.id === messageId ? { ...m, generationContext: context } : m,
+                  ),
+                },
+              }))
+            }
+
+            nodeIds = await canvasStore.generateIntoAiSlot(slotId, finalPrompt, genOptions)
+          }
+
+          const latestCanvasState = useCanvasStore.getState()
+          if (latestCanvasState.sceneId !== sceneId) {
+            const title = latestCanvasState.canvases[sceneId]?.title || sceneId
+            get().appendNotice({
+              sceneId: latestCanvasState.sceneId,
+              origin: 'chat',
+              prompt: `结果已生成到画布 ${title}`,
+            })
+          }
+
+          set((s) => ({
+            isBusy: false,
+            messagesByScene: {
+              ...s.messagesByScene,
+              [sceneId]: (s.messagesByScene[sceneId] || []).map((m) =>
+                m.id === messageId
+                  ? {
+                      ...m,
+                      status: 'done' as const,
+                      resultNodeIds: nodeIds,
+                      generationContext: {
+                        ...context,
+                        finalPrompt,
+                        quality: finalQuality,
+                      },
+                    }
+                  : m,
+              ),
+            },
+          }))
+        } catch (err) {
+          const errorMsg = errorMessageForChat(err, abortController.signal)
+          const latestCanvasState = useCanvasStore.getState()
+          if (latestCanvasState.sceneId !== sceneId) {
+            get().appendNotice({
+              sceneId: latestCanvasState.sceneId,
+              origin: 'chat',
+              prompt: `生成失败：${errorMsg}`,
+            })
+          }
+          set((s) => ({
+            isBusy: false,
+            messagesByScene: {
+              ...s.messagesByScene,
+              [sceneId]: (s.messagesByScene[sceneId] || []).map((m) =>
+                m.id === messageId
+                  ? {
+                      ...m,
+                      status: 'error' as const,
+                      error: errorMsg,
+                      retryDisabledReason: errorMsg === referenceAssetMissingMessage ? referenceAssetMissingMessage : undefined,
+                    }
+                  : m,
+              ),
+            },
+          }))
+        } finally {
+          if (activeChatAbortController === abortController) {
+            activeChatAbortController = null
+          }
+        }
       },
 
       cancelGeneration: () => {

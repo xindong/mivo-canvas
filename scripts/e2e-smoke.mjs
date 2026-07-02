@@ -251,6 +251,13 @@ try {
         .find((name) => name.includes('/src/store/canvasStore.ts'))
       return resource ? new URL(resource).pathname + new URL(resource).search : '/src/store/canvasStore.ts'
     })
+  const chatStoreSpec = async () =>
+    page.evaluate(() => {
+      const resource = performance.getEntriesByType('resource')
+        .map((entry) => entry.name)
+        .find((name) => name.includes('/src/store/chatStore.ts'))
+      return resource ? new URL(resource).pathname + new URL(resource).search : '/src/store/chatStore.ts'
+    })
 
   const readCanvasState = async () => {
     const spec = await canvasStoreSpec()
@@ -270,6 +277,34 @@ try {
         edges: state.edges.map((edge) => ({ ...edge })),
       }
     }, spec)
+  }
+
+  const readChatState = async () => {
+    const spec = await chatStoreSpec()
+    return page.evaluate(async (moduleSpec) => {
+      const { useChatStore } = await import(moduleSpec)
+      const state = useChatStore.getState()
+      return {
+        isBusy: state.isBusy,
+        messagesByScene: state.messagesByScene,
+        selectedModel: state.selectedModel,
+        paramOverrides: state.paramOverrides,
+      }
+    }, spec)
+  }
+
+  const waitForChatIdle = async () => {
+    const spec = await chatStoreSpec()
+    const startedAt = Date.now()
+    while (Date.now() - startedAt < 10000) {
+      const idle = await page.evaluate(async (moduleSpec) => {
+        const { useChatStore } = await import(moduleSpec)
+        return !useChatStore.getState().isBusy
+      }, spec)
+      if (idle) return
+      await wait(50)
+    }
+    throw new Error('Timed out waiting for chat generation to finish')
   }
 
   const waitForCanvasState = async (predicate, payload) => {
@@ -3674,12 +3709,168 @@ try {
     await waitIdle()
   })
 
-  const workflowCount = await page.locator('.dom-node').count()
+  // Regression: chat generation must commit to the scene where it started, even after switching canvases.
+  const sceneScopedBefore = await page.evaluate(async (moduleSpec) => {
+    const { useCanvasStore } = await import(moduleSpec)
+    const state = useCanvasStore.getState()
+    return {
+      nodes: state.canvases['character-flow']?.nodes.length || 0,
+      variantsNodes: state.canvases.variants?.nodes.length || 0,
+    }
+  }, await canvasStoreSpec())
+  let releaseSceneScopedGenerate
+  let sceneScopedGenerateSeen = false
+  const sceneScopedGenerateHandler = async (route) => {
+    sceneScopedGenerateSeen = true
+    await new Promise((resolve) => {
+      releaseSceneScopedGenerate = resolve
+    })
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }),
+    })
+  }
+  await page.route('**/api/mivo/generate', sceneScopedGenerateHandler)
+  try {
+    await page.evaluate(async (moduleSpec) => {
+      const { useCanvasStore } = await import(moduleSpec)
+      useCanvasStore.getState().loadScene('character-flow')
+      useCanvasStore.getState().selectNode(undefined)
+    }, await canvasStoreSpec())
+    await page.locator('.chat-composer-textarea').fill('scene scoped generation regression')
+    await page.locator('.chat-composer-textarea').press('Enter')
+    const startedAt = Date.now()
+    while (!sceneScopedGenerateSeen && Date.now() - startedAt < 5000) await wait(25)
+    if (!sceneScopedGenerateSeen) throw new Error('Scene-scoped regression should reach /api/mivo/generate')
+    await page.evaluate(async (moduleSpec) => {
+      const { useCanvasStore } = await import(moduleSpec)
+      useCanvasStore.getState().loadScene('variants')
+    }, await canvasStoreSpec())
+    releaseSceneScopedGenerate()
+    await waitForChatIdle()
+  } finally {
+    await page.unroute('**/api/mivo/generate', sceneScopedGenerateHandler)
+  }
+  const sceneScopedAfter = await page.evaluate(async ({ canvasModuleSpec, chatModuleSpec }) => {
+    const { useCanvasStore } = await import(canvasModuleSpec)
+    const { useChatStore } = await import(chatModuleSpec)
+    const canvasState = useCanvasStore.getState()
+    const chatState = useChatStore.getState()
+    return {
+      activeSceneId: canvasState.sceneId,
+      characterNodes: canvasState.canvases['character-flow']?.nodes.length || 0,
+      variantsNodes: canvasState.canvases.variants?.nodes.length || 0,
+      characterAssistantErrors: (chatState.messagesByScene['character-flow'] || [])
+        .filter((message) => message.role === 'assistant' && message.status === 'error')
+        .map((message) => message.error || ''),
+      currentNotices: (chatState.messagesByScene[canvasState.sceneId] || [])
+        .filter((message) => message.kind === 'notice')
+        .map((message) => message.text),
+    }
+  }, { canvasModuleSpec: await canvasStoreSpec(), chatModuleSpec: await chatStoreSpec() })
+  if (sceneScopedAfter.activeSceneId !== 'variants') {
+    throw new Error(`Scene-scoped regression should leave user on variants, got ${sceneScopedAfter.activeSceneId}`)
+  }
+  if (sceneScopedAfter.characterNodes <= sceneScopedBefore.nodes) {
+    throw new Error(`Scene-scoped generation should add nodes to character-flow: ${JSON.stringify({ sceneScopedBefore, sceneScopedAfter })}`)
+  }
+  if (sceneScopedAfter.variantsNodes !== sceneScopedBefore.variantsNodes) {
+    throw new Error(`Scene-scoped generation should not patch active variants nodes: ${JSON.stringify({ sceneScopedBefore, sceneScopedAfter })}`)
+  }
+  if (sceneScopedAfter.characterAssistantErrors.some((error) => error.includes('Source node not found'))) {
+    throw new Error(`Scene-scoped generation should not surface Source node not found: ${JSON.stringify(sceneScopedAfter.characterAssistantErrors)}`)
+  }
+  if (!sceneScopedAfter.currentNotices.some((text) => text.includes('结果已生成到画布'))) {
+    throw new Error(`Scene switch completion should append a current-scene notice: ${JSON.stringify(sceneScopedAfter.currentNotices)}`)
+  }
+  await page.evaluate(async (moduleSpec) => {
+    const { useCanvasStore } = await import(moduleSpec)
+    useCanvasStore.getState().loadScene('character-flow')
+  }, await canvasStoreSpec())
+
+  // Regression: retry reuses the original user message and preserves uploaded reference assets.
+  const retryEditRequests = []
+  let retryEditCount = 0
+  const retryEditHandler = async (route) => {
+    const request = route.request()
+    try {
+      const formRequest = new Request('http://127.0.0.1/api/mivo/edit', {
+        method: 'POST',
+        headers: request.headers(),
+        body: request.postDataBuffer(),
+      })
+      const formData = await formRequest.formData()
+      retryEditRequests.push({
+        prompt: String(formData.get('prompt') || ''),
+        fileKeys: ['image', 'mask', 'reference[]', 'reference']
+          .map((key) => `${key}:${formData.getAll(key).length}`)
+          .filter((entry) => !entry.endsWith(':0')),
+      })
+    } catch (error) {
+      retryEditRequests.push({
+        prompt: '',
+        fileKeys: [],
+        parseError: error instanceof Error ? error.message : 'Unable to inspect edit request',
+      })
+    }
+    retryEditCount += 1
+    if (retryEditCount === 1) {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [] }) })
+      return
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }),
+    })
+  }
+  await page.route('**/api/mivo/edit', retryEditHandler)
+  try {
+    await page.evaluate(async (moduleSpec) => {
+      const { useCanvasStore } = await import(moduleSpec)
+      useCanvasStore.getState().selectNode(undefined)
+    }, await canvasStoreSpec())
+    await page.locator('.ai-panel input[type="file"][accept*="image/png"]').setInputFiles({
+      name: 'retry-reference.png',
+      mimeType: 'image/png',
+      buffer: Buffer.from(localAssetFixtureSvg),
+    })
+    await page.waitForSelector('.chat-ref-chip')
+    const retryUserCountBefore = (await readChatState()).messagesByScene['character-flow'].filter((message) => message.role === 'user').length
+    await page.locator('.chat-composer-textarea').fill('retry should preserve uploaded reference')
+    await page.locator('.chat-composer-textarea').press('Enter')
+    await page.waitForSelector('.chat-error-text', { timeout: 10000 })
+    await page.locator('.chat-retry-btn').last().click()
+    await waitForChatIdle()
+    await page.waitForSelector('.chat-result-image, .chat-result-image-placeholder', { timeout: 10000 })
+    const retryUserCountAfter = (await readChatState()).messagesByScene['character-flow'].filter((message) => message.role === 'user').length
+    if (retryUserCountAfter !== retryUserCountBefore + 1) {
+      throw new Error(`Retry should not duplicate the original user message: before=${retryUserCountBefore}, after=${retryUserCountAfter}`)
+    }
+    if (retryEditRequests.length !== 2 || !retryEditRequests.every((request) => request.fileKeys.includes('image:1'))) {
+      throw new Error(`Retry should replay edit with the original reference image: ${JSON.stringify(retryEditRequests)}`)
+    }
+  } finally {
+    await page.unroute('**/api/mivo/edit', retryEditHandler)
+  }
+
+  const workflowCount = await page.evaluate(async (moduleSpec) => {
+    const { useCanvasStore } = await import(moduleSpec)
+    return useCanvasStore.getState().nodes.length
+  }, await canvasStoreSpec())
 
   await page.getByRole('button', { name: '4 张变体结果' }).click()
   await page.waitForFunction(() => document.querySelector('.top-title-lockup strong')?.textContent === '4 张变体结果')
   await page.getByRole('button', { name: '角色参考图流程' }).click()
-  await page.waitForFunction((count) => document.querySelectorAll('.dom-node').length === count, workflowCount)
+  await page.waitForFunction(
+    async ({ moduleSpec, count }) => {
+      const { useCanvasStore } = await import(moduleSpec)
+      const state = useCanvasStore.getState()
+      return state.sceneId === 'character-flow' && state.nodes.length === count
+    },
+    { moduleSpec: await canvasStoreSpec(), count: workflowCount },
+  )
 
   page.once('dialog', (dialog) => {
     void dialog.accept('Mivo Persistent Canvas')
@@ -3709,7 +3900,14 @@ try {
   await page.getByRole('heading', { name: 'Assets' }).waitFor()
   await page.getByRole('button', { name: 'Mivo Persistent Canvas' }).click()
   await page.waitForFunction(() => document.querySelector('.top-title-lockup strong')?.textContent === 'Mivo Persistent Canvas')
-  await page.waitForFunction((count) => document.querySelectorAll('.dom-node').length === count, workflowCount)
+  await page.waitForFunction(
+    async ({ moduleSpec, count }) => {
+      const { useCanvasStore } = await import(moduleSpec)
+      const state = useCanvasStore.getState()
+      return state.sceneId && state.nodes.length === count
+    },
+    { moduleSpec: await canvasStoreSpec(), count: workflowCount },
+  )
 
   const geometry = await page.evaluate(() => {
     const controls = document.querySelector('.canvas-controls')?.getBoundingClientRect()
@@ -3742,7 +3940,11 @@ try {
     throw new Error('Canvas is being squeezed by floating overlays')
   }
 
-  const countBeforeClipboardPaste = await page.locator('.dom-node').count()
+  await page.locator('.canvas-shell').click({ position: { x: 160, y: 160 }, force: true })
+  const countBeforeClipboardPaste = await page.evaluate(async (moduleSpec) => {
+    const { useCanvasStore } = await import(moduleSpec)
+    return useCanvasStore.getState().nodes.length
+  }, await canvasStoreSpec())
   await page.evaluate(async () => {
     const response = await fetch('/demo-assets/courage-1.jpg')
     const blob = await response.blob()
@@ -3754,12 +3956,19 @@ try {
     window.dispatchEvent(event)
   })
   await page.waitForFunction(
-    (count) => document.querySelectorAll('.dom-node').length === count + 1,
-    countBeforeClipboardPaste,
+    async ({ moduleSpec, count }) => {
+      const { useCanvasStore } = await import(moduleSpec)
+      return useCanvasStore.getState().nodes.length === count + 1
+    },
+    { moduleSpec: await canvasStoreSpec(), count: countBeforeClipboardPaste },
   )
 
   await page.getByRole('button', { name: 'Reset view' }).click()
-  const countBeforeTransparentPaste = await page.locator('.dom-node[data-node-type="image"]').count()
+  await page.locator('.canvas-shell').click({ position: { x: 160, y: 160 }, force: true })
+  const countBeforeTransparentPaste = await page.evaluate(async (moduleSpec) => {
+    const { useCanvasStore } = await import(moduleSpec)
+    return useCanvasStore.getState().nodes.filter((node) => node.type === 'image').length
+  }, await canvasStoreSpec())
   await page.evaluate(async () => {
     const canvas = document.createElement('canvas')
     canvas.width = 128
@@ -3784,8 +3993,11 @@ try {
     window.dispatchEvent(event)
   })
   await page.waitForFunction(
-    (count) => document.querySelectorAll('.dom-node[data-node-type="image"]').length === count + 1,
-    countBeforeTransparentPaste,
+    async ({ moduleSpec, count }) => {
+      const { useCanvasStore } = await import(moduleSpec)
+      return useCanvasStore.getState().nodes.filter((node) => node.type === 'image').length === count + 1
+    },
+    { moduleSpec: await canvasStoreSpec(), count: countBeforeTransparentPaste },
   )
   const transparentImageNode = page.locator('.dom-node[data-node-type="image"]').last()
   await transparentImageNode.locator('.dom-node-media img').waitFor({ state: 'visible' })
