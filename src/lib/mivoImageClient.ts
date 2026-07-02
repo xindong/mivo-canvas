@@ -1,10 +1,11 @@
 import type { MivoCanvasNode } from '../types/mivoCanvas'
-import type { MivoEditRequest, MivoGenerateRequest, MivoImageResponse } from '../types/generation'
+import type { EnhanceRequest, EnhanceResponse, MivoEditRequest, MivoGenerateRequest, MivoImageResponse } from '../types/generation'
 import { readImportedAssetFile } from './assetStorage'
 
 const defaultModel = 'gpt-image-2'
 const mivoRequestTimeoutMs = 110_000
 const mivoEditRequestTimeoutMs = 185_000
+const mivoEnhanceTimeoutMs = 30_000
 
 const isAbortError = (error: unknown) => error instanceof Error && error.name === 'AbortError'
 
@@ -31,7 +32,7 @@ const fetchMivoWithTimeout = async (input: RequestInfo | URL, init: RequestInit 
     })
   } catch (error) {
     if (isAbortError(error)) {
-      throw new Error(timedOut ? '图片请求超时，请重试。' : '图片请求已取消。')
+      throw new Error(timedOut ? '图片请求超时，请重试。' : '图片请求已取消。', { cause: error })
     }
     throw error
   } finally {
@@ -107,6 +108,24 @@ export const editMivoImage = async (request: MivoEditRequest) => {
 
   if (!response.ok) throw new Error(await readMivoError(response))
   return validateMivoImageResponse(await response.json())
+}
+
+export const enhanceMivoPrompt = async (request: EnhanceRequest): Promise<EnhanceResponse> => {
+  try {
+    const response = await fetchMivoWithTimeout(
+      '/api/mivo/enhance',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(request),
+      },
+      mivoEnhanceTimeoutMs,
+    )
+    if (!response.ok) return { enhanced: false, degradedReason: 'upstream-error' }
+    return (await response.json()) as EnhanceResponse
+  } catch {
+    return { enhanced: false, degradedReason: 'upstream-error' }
+  }
 }
 
 export const assetBlobForNode = async (node: MivoCanvasNode) => {

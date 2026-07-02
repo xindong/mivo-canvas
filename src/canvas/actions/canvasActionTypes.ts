@@ -114,17 +114,17 @@ export type CanvasActionRuntime = {
     operation: AiWorkflowOperation,
     prompt: string,
     options?: CanvasGenerationOptions,
-  ) => Promise<void>
+  ) => Promise<string[]>
   generateBesideNode: (
     sourceNodeId?: string,
     prompt?: string,
     options?: CanvasGenerationOptions,
-  ) => Promise<void>
+  ) => Promise<string[]>
   generateIntoAiSlot: (
     slotId?: string,
     prompt?: string,
     options?: CanvasGenerationOptions,
-  ) => Promise<void>
+  ) => Promise<string[]>
   generateFromAnnotation: (annotationNodeId?: string) => void
   duplicateNode: (nodeId: string) => void
   duplicateSelectedNodes: () => void

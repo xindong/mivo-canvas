@@ -40,15 +40,15 @@ import type { CanvasAssetClipboardItem } from '../app/assetLibraryModel'
 import type {
   CommitGenerationResultPayload,
   CommittedGenerationImage,
+  GenerationRatio,
   MivoImageQuality,
-  MivoImageRatio,
 } from '../types/generation'
 
 type LayerMove = 'forward' | 'backward' | 'front' | 'back'
 export type SelectionAlignment = 'left' | 'center' | 'right' | 'top' | 'middle' | 'bottom'
 export type DistributionAxis = 'horizontal' | 'vertical'
 export type CanvasGenerationOptions = {
-  imgRatio?: MivoImageRatio
+  imgRatio?: GenerationRatio
   quality?: MivoImageQuality
   model?: string
   referenceFiles?: File[]
@@ -206,17 +206,17 @@ type CanvasState = {
     operation: AiWorkflowOperation,
     prompt: string,
     options?: CanvasGenerationOptions,
-  ) => Promise<void>
+  ) => Promise<string[]>
   generateBesideNode: (
     sourceNodeId?: string,
     prompt?: string,
     options?: CanvasGenerationOptions,
-  ) => Promise<void>
+  ) => Promise<string[]>
   generateIntoAiSlot: (
     slotId?: string,
     prompt?: string,
     options?: CanvasGenerationOptions,
-  ) => Promise<void>
+  ) => Promise<string[]>
   generateFromAnnotation: (annotationNodeId?: string) => void
   commitGenerationResult: (payload: CommitGenerationResultPayload) => Promise<string[]>
   toggleFavorite: (nodeId: string) => void
@@ -731,7 +731,7 @@ const blobFromCommittedGenerationImage = (image: CommittedGenerationImage) => {
   const base64 = (dataUrlMatch?.[2] || raw).trim()
   if (!base64) throw new Error('Image service returned empty image data')
 
-  let binary = ''
+  let binary: string
   try {
     binary = atob(base64)
   } catch {
@@ -2221,7 +2221,7 @@ export const useCanvasStore = create<CanvasState>()(
         const source =
           state.nodes.find((node) => node.id === sourceNodeId && node.type === 'image' && !node.hidden) ||
           state.nodes.find((node) => node.id === state.selectedNodeId && node.type === 'image' && !node.hidden)
-        if (!source) return
+        if (!source) return []
 
         const resultPrompt = prompt.trim() || operationLabel
         const model = options.model || defaultMivoImageModel
@@ -2259,6 +2259,7 @@ export const useCanvasStore = create<CanvasState>()(
               tasks: upsertTask(current.tasks, doneTask(runningTask, `${operationLabel}: ${source.title}`, nodeIds)),
             }),
           )
+          return nodeIds
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Image edit failed'
           set((current) =>
@@ -2275,7 +2276,7 @@ export const useCanvasStore = create<CanvasState>()(
           state.nodes.find((node) => node.id === sourceNodeId && !node.hidden) ||
           state.nodes.find((node) => node.id === state.selectedNodeId && !node.hidden) ||
           state.nodes.find((node) => !node.hidden)
-        if (!source) return
+        if (!source) return []
 
         const resultPrompt = prompt?.trim() || nodePrompt(source)
         const model = options.model || defaultMivoImageModel
@@ -2325,6 +2326,7 @@ export const useCanvasStore = create<CanvasState>()(
               tasks: upsertTask(current.tasks, doneTask(runningTask, `旁边生成：${source.title}`, nodeIds)),
             }),
           )
+          return nodeIds
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Generation failed'
           set((current) =>
@@ -2340,7 +2342,7 @@ export const useCanvasStore = create<CanvasState>()(
         const slot =
           state.nodes.find((node) => node.id === slotId && node.type === 'ai-slot' && !node.hidden) ||
           state.nodes.find((node) => node.id === state.selectedNodeId && node.type === 'ai-slot' && !node.hidden)
-        if (!slot) return
+        if (!slot) return []
 
         const resultPrompt = prompt?.trim() || nodePrompt(slot, '根据 AI 槽位生成图片')
         const model = options.model || defaultMivoImageModel
@@ -2425,6 +2427,7 @@ export const useCanvasStore = create<CanvasState>()(
               tasks: upsertTask(current.tasks, doneTask(runningTask, `生成到槽位：${slot.title}`, nodeIds)),
             })
           })
+          return nodeIds
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Generation failed'
           set((current) => {
