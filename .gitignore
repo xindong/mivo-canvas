@@ -50,3 +50,4 @@ build/
 coverage/
 .cache/
 .turbo/
+_tmp/
