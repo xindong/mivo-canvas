@@ -164,6 +164,7 @@ export const buildAiContextSnapshot = (state: AiContextState): AiCanvasContextSn
       sectionId: node.sectionId,
       targetNodeId: node.targetNodeId,
       markupKind: node.markupKind,
+      markupStampKind: node.markupStampKind,
       markupPoints: node.markupPoints ? node.markupPoints.map((point) => ({ ...point })) : undefined,
       markupStrokeColor: node.markupStrokeColor,
       markupFillColor: node.markupFillColor,

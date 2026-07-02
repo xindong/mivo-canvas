@@ -2368,6 +2368,45 @@ button:disabled {
   box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12);
 }
 
+.stamp-options-bar {
+  position: absolute;
+  left: 84px;
+  top: 70px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 9px;
+  background: rgba(255, 250, 240, 0.94);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(14px);
+}
+
+.stamp-options-bar button {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  background: transparent;
+  border-radius: 7px;
+}
+
+.stamp-options-bar button:hover {
+  background: rgba(85, 79, 72, 0.1);
+}
+
+.stamp-options-bar button.active {
+  background: rgba(85, 79, 72, 0.14);
+  box-shadow: inset 0 0 0 2px var(--charcoal);
+}
+
+.stamp-option-emoji {
+  font-size: 17px;
+  line-height: 1;
+}
+
 .dock-divider {
   position: absolute;
   top: -5px;
@@ -2866,6 +2905,41 @@ button:disabled {
 .canvas-shell.brush-tool .dom-canvas-layer,
 .canvas-shell.brush-tool .dom-node {
   cursor: var(--brush-cursor, crosshair);
+}
+
+.canvas-shell.stamp-tool,
+.canvas-shell.stamp-tool .dom-canvas-layer,
+.canvas-shell.stamp-tool .dom-node {
+  cursor: var(--stamp-cursor, copy);
+}
+
+.dom-markup-stamp {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  line-height: 1;
+  user-select: none;
+}
+
+.stamp-placement-preview {
+  position: absolute;
+  z-index: 24;
+  display: grid;
+  place-items: center;
+  line-height: 1;
+  pointer-events: none;
+  animation: stamp-wiggle 360ms ease-in-out infinite;
+}
+
+@keyframes stamp-wiggle {
+  0%,
+  100% {
+    transform: rotate(-7deg) scale(1);
+  }
+  50% {
+    transform: rotate(7deg) scale(1.06);
+  }
 }
 
 .dom-node.selected {

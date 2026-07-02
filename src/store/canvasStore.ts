@@ -8,6 +8,7 @@ import type {
   CanvasDocument,
   CanvasTask,
   BrushToolMode,
+  CanvasStampKind,
   ConnectorBinding,
   DemoSceneId,
   MarkupBrushKind,
@@ -21,6 +22,7 @@ import type {
   ToolId,
 } from '../types/mivoCanvas'
 import { defaultBrushWidth, highlighterOpacity } from '../canvas/brushGeometry'
+import { defaultStampKind, stampLabelFor } from '../canvas/stampDefs'
 import { connectorBindingPointFor, isConnectorNode } from '../canvas/connectorGeometry'
 import { defaultSizeForNodeType } from '../canvas/nodeTypes/canvasNodeRegistry'
 import { defaultTextAlign, defaultTextColor, defaultTextFontSize, defaultTextWeight } from '../canvas/textGeometry'
@@ -64,6 +66,7 @@ type CanvasState = {
   sceneId: CanvasId
   clipboardNodes: MivoCanvasNode[]
   brushStyle: BrushStyle
+  activeStampKind: CanvasStampKind
   historyPast: MivoCanvasSnapshot[]
   historyFuture: MivoCanvasSnapshot[]
   createCanvas: (title?: string, options?: { projectId?: string; templateId?: DemoSceneId }) => CanvasId
@@ -75,6 +78,7 @@ type CanvasState = {
   selectNodes: (nodeIds: string[], primaryNodeId?: string) => void
   setActiveTool: (toolId: ToolId) => void
   setBrushStyle: (style: Partial<BrushStyle>) => void
+  setActiveStampKind: (kind: CanvasStampKind) => void
   eraseMarkupStrokes: (nodeIds: string[]) => void
   captureHistory: () => void
   undo: () => void
@@ -149,6 +153,7 @@ type CanvasState = {
       strokeWidth?: number
       strokeStyle?: MivoCanvasNode['markupStrokeStyle']
       brushKind?: MarkupBrushKind
+      stampKind?: CanvasStampKind
       startArrow?: boolean
       endArrow?: boolean
       connectorStart?: ConnectorBinding
@@ -217,7 +222,15 @@ type CanvasState = {
 type PersistedCanvasState = Partial<
   Pick<
     CanvasState,
-    'canvases' | 'nodes' | 'tasks' | 'sceneId' | 'selectedNodeId' | 'selectedNodeIds' | 'activeTool' | 'brushStyle'
+    | 'canvases'
+    | 'nodes'
+    | 'tasks'
+    | 'sceneId'
+    | 'selectedNodeId'
+    | 'selectedNodeIds'
+    | 'activeTool'
+    | 'brushStyle'
+    | 'activeStampKind'
   >
 >
 
@@ -336,7 +349,9 @@ const defaultBrushStyle: BrushStyle = {
 
 const isSectionNode = (node: MivoCanvasNode) => node.type === 'frame'
 const isEditableTextNode = (node: MivoCanvasNode | undefined) =>
-  node?.type === 'text' || node?.type === 'annotation' || node?.type === 'markup'
+  node?.type === 'text' ||
+  node?.type === 'annotation' ||
+  (node?.type === 'markup' && node.markupKind !== 'stamp')
 
 const nodeCenter = (node: Pick<MivoCanvasNode, 'x' | 'y' | 'width' | 'height'>) => ({
   x: node.x + node.width / 2,
@@ -838,6 +853,7 @@ const migratePersistedState = (persistedState: unknown, persistedVersion = 0) =>
     clipboardNodes: [],
     // Version 8 introduced the black default and eraser mode; older persisted styles reset to the new default.
     brushStyle: persistedVersion < 8 ? defaultBrushStyle : persisted.brushStyle || defaultBrushStyle,
+    activeStampKind: persisted.activeStampKind || defaultStampKind,
     historyPast: [],
     historyFuture: [],
   }
@@ -863,6 +879,7 @@ export const useCanvasStore = create<CanvasState>()(
       activeTool: 'select',
       clipboardNodes: [],
       brushStyle: defaultBrushStyle,
+      activeStampKind: defaultStampKind,
       historyPast: [],
       historyFuture: [],
       createCanvas: (title = 'Untitled Canvas', options) => {
@@ -1061,6 +1078,10 @@ export const useCanvasStore = create<CanvasState>()(
           logCanvas(`Brush style set: ${brushStyle.kind}, ${brushStyle.color}, ${brushStyle.width}px`)
           return { brushStyle }
         }),
+      setActiveStampKind: (kind) => {
+        logCanvas(`Stamp kind set to ${kind}`)
+        set({ activeStampKind: kind })
+      },
       eraseMarkupStrokes: (nodeIds) =>
         set((state) => {
           // History is captured once per eraser drag by the interaction controller,
@@ -1914,7 +1935,9 @@ export const useCanvasStore = create<CanvasState>()(
                   ? 'Ellipse annotation'
                   : kind === 'brush'
                     ? 'Brush annotation'
-                    : 'Markup note'
+                    : kind === 'stamp'
+                      ? `Stamp ${stampLabelFor(options?.stampKind)}`
+                      : 'Markup note'
 
         set((state) => {
           const draft = makeNode({
@@ -1934,6 +1957,7 @@ export const useCanvasStore = create<CanvasState>()(
             status: 'ready',
             markupKind: kind,
             markupBrushKind: kind === 'brush' ? options?.brushKind || 'marker' : undefined,
+            markupStampKind: kind === 'stamp' ? options?.stampKind || defaultStampKind : undefined,
             markupPoints: options?.points?.map((point) => ({
               x: Math.round(point.x),
               y: Math.round(point.y),
@@ -2503,6 +2527,7 @@ export const useCanvasStore = create<CanvasState>()(
         selectedNodeIds: state.selectedNodeIds,
         activeTool: state.activeTool,
         brushStyle: state.brushStyle,
+        activeStampKind: state.activeStampKind,
       }),
     },
   ),

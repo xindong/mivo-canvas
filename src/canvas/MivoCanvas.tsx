@@ -23,6 +23,8 @@ import { CanvasToolDock } from './CanvasToolDock'
 import { ImageCropOverlay, type ImageCropBox } from './ImageCropOverlay'
 import { NodeActionMenu } from './NodeActionMenu'
 import { SelectionQuickToolbar } from './SelectionQuickToolbar'
+import { StampOptionsBar } from './StampOptionsBar'
+import { stampCursorCssFor, stampEmojiFor, stampGrowthSizes } from './stampDefs'
 import { useCanvasInteractionController } from './useCanvasInteractionController'
 
 type ContextMenuState = {
@@ -114,6 +116,7 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
   const sceneId = useCanvasStore((state) => state.sceneId)
   const storeActiveTool = useCanvasStore((state) => state.activeTool)
   const brushStyle = useCanvasStore((state) => state.brushStyle)
+  const activeStampKind = useCanvasStore((state) => state.activeStampKind)
   const selectedNodeId = useCanvasStore((state) => state.selectedNodeId)
   const selectedNodeIds = useCanvasStore((state) => state.selectedNodeIds)
   const selectNode = useCanvasStore((state) => state.selectNode)
@@ -149,6 +152,7 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
     activeFrameCreationRect,
     activeMarkupCreationRect,
     markupCreationBox,
+    stampPlacementPreview,
     selectionPreviewSet,
     beginGroupResize,
     beginSelectionSpacingDrag,
@@ -441,12 +445,15 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
   const canvasToOverlayY = (y: number) => viewport.y + y * viewport.scale
 
   const brushToolActive = storeActiveTool === 'markup-brush' && !temporaryTool && !isPanning
+  const stampToolActive = storeActiveTool === 'stamp' && !temporaryTool && !isPanning
 
   return (
     <section
       className={`canvas-shell tool-${interactionMode} ${isPanning ? 'is-panning' : ''} ${
         selectionBox ? 'is-selecting' : ''
-      } ${selectedNodes.length > 1 ? 'has-multi-selection' : ''} ${brushToolActive ? 'brush-tool' : ''}`}
+      } ${selectedNodes.length > 1 ? 'has-multi-selection' : ''} ${brushToolActive ? 'brush-tool' : ''} ${
+        stampToolActive ? 'stamp-tool' : ''
+      }`}
       aria-label="Mivo Canvas"
       data-viewport-scale={viewport.scale}
       data-viewport-x={viewport.x}
@@ -468,11 +475,15 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
         ...(brushToolActive
           ? ({ '--brush-cursor': brushCursorCssFor(brushStyle.kind, brushStyle.color) } as CSSProperties)
           : {}),
+        ...(stampToolActive
+          ? ({ '--stamp-cursor': stampCursorCssFor(activeStampKind) } as CSSProperties)
+          : {}),
       }}
     >
       <div className="canvas-host" ref={hostRef} />
       <CanvasToolDock previewTool={temporaryTool === 'hand' ? 'hand' : undefined} />
       {storeActiveTool === 'markup-brush' && !temporaryTool ? <BrushOptionsBar /> : null}
+      {storeActiveTool === 'stamp' && !temporaryTool ? <StampOptionsBar /> : null}
       <div
         className="dom-canvas-layer"
         style={{ transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})` }}
@@ -641,6 +652,20 @@ export function MivoCanvas({ onOpenDetails }: MivoCanvasProps) {
             />
           )
         })}
+        {stampPlacementPreview ? (
+          <div
+            className="stamp-placement-preview"
+            style={{
+              left: stampPlacementPreview.x - stampGrowthSizes[stampPlacementPreview.stage] / 2,
+              top: stampPlacementPreview.y - stampGrowthSizes[stampPlacementPreview.stage] / 2,
+              width: stampGrowthSizes[stampPlacementPreview.stage],
+              height: stampGrowthSizes[stampPlacementPreview.stage],
+              fontSize: stampGrowthSizes[stampPlacementPreview.stage] * 0.78,
+            }}
+          >
+            {stampEmojiFor(activeStampKind)}
+          </div>
+        ) : null}
         {cropNode ? (
           <ImageCropOverlay
             node={cropNode}

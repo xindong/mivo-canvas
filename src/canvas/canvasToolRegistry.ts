@@ -133,11 +133,12 @@ export const canvasToolRegistry: CanvasToolDefinition[] = [
     icon: StickyNote,
   },
   {
-    id: 'sticker',
-    label: 'Sticker',
+    id: 'stamp',
+    label: 'Stamp',
+    shortcut: 'S',
+    keyboardShortcuts: ['s'],
     group: 'create',
-    runtimeTool: 'select',
-    enabled: false,
+    runtimeTool: 'stamp',
     icon: SmilePlus,
   },
   {

@@ -47,6 +47,7 @@ import {
   type Viewport,
 } from './canvasInteraction'
 import { eraserHitStrokeIds, eraserScreenRadius } from './brushGeometry'
+import { stampGrowthIntervalMs, stampGrowthSizes } from './stampDefs'
 import { canvasToolHandlers, type CanvasToolHandlerContext } from './canvasToolHandlers'
 import { isCanvasToolEnabled, markupKindForTool, toolForKeyboardShortcut } from './canvasToolRegistry'
 import {
@@ -253,7 +254,9 @@ const isNodeEffectivelyLocked = (node: MivoCanvasNode, nodes: MivoCanvasNode[]) 
 const isEditableTextNode = (
   node: MivoCanvasNode | undefined,
 ): node is MivoCanvasNode & { type: 'text' | 'annotation' | 'markup' } =>
-  node?.type === 'text' || node?.type === 'annotation' || node?.type === 'markup'
+  node?.type === 'text' ||
+  node?.type === 'annotation' ||
+  (node?.type === 'markup' && node.markupKind !== 'stamp')
 
 const isAutoDeletedEmptyTextNode = (
   node: MivoCanvasNode | undefined,
@@ -279,6 +282,7 @@ export function useCanvasInteractionController({
   const groupResizeRef = useRef<GroupResizeState | null>(null)
   const selectionSpacingDragRef = useRef<SmartSelectionSpacingDragState | null>(null)
   const eraserDragRef = useRef<{ pointerId: number; historyCaptured: boolean } | null>(null)
+  const stampPlacementRef = useRef<{ pointerId: number; stage: number; growTimer: number } | null>(null)
   const persistedSceneRef = useRef(sceneId)
   const viewportPersistenceTimerRef = useRef<number | undefined>(undefined)
   const [viewport, setViewport] = useState(() => initialViewportFor(sceneId))
@@ -289,6 +293,11 @@ export function useCanvasInteractionController({
   const [textCreationBox, setTextCreationBox] = useState<TextCreationState | null>(null)
   const [frameCreationBox, setFrameCreationBox] = useState<FrameCreationState | null>(null)
   const [markupCreationBox, setMarkupCreationBox] = useState<MarkupCreationState | null>(null)
+  const [stampPlacementPreview, setStampPlacementPreview] = useState<{
+    x: number
+    y: number
+    stage: number
+  } | null>(null)
   const [isPanning, setIsPanning] = useState(false)
   const [temporaryTool, setTemporaryTool] = useState<RuntimeCanvasTool | undefined>()
   const storedActiveTool = useCanvasStore((state) => state.activeTool)
@@ -832,6 +841,41 @@ export function useCanvasInteractionController({
     [captureHistory, eraseMarkupStrokes, screenToCanvas],
   )
 
+  const clearStampPlacement = useCallback(() => {
+    const placement = stampPlacementRef.current
+    if (!placement) return
+
+    window.clearInterval(placement.growTimer)
+    stampPlacementRef.current = null
+    setStampPlacementPreview(null)
+  }, [])
+
+  const beginStampPlacement = useCallback(
+    (event: ReactPointerEvent<HTMLElement>) => {
+      event.preventDefault()
+      event.currentTarget.setPointerCapture(event.pointerId)
+      onCloseContextMenu()
+      discardEmptyEditingText()
+      setEditingTextNodeId(undefined)
+      setSnapGuides([])
+      setSelectionBox(null)
+      selectionRef.current = null
+
+      const point = screenToCanvas(event.clientX, event.clientY)
+      // FigJam-style press-and-hold: the held stamp wiggles and grows through four stages.
+      const growTimer = window.setInterval(() => {
+        const placement = stampPlacementRef.current
+        if (!placement || placement.stage >= stampGrowthSizes.length - 1) return
+
+        placement.stage += 1
+        setStampPlacementPreview((current) => (current ? { ...current, stage: placement.stage } : current))
+      }, stampGrowthIntervalMs)
+      stampPlacementRef.current = { pointerId: event.pointerId, stage: 0, growTimer }
+      setStampPlacementPreview({ x: point.x, y: point.y, stage: 0 })
+    },
+    [discardEmptyEditingText, onCloseContextMenu, screenToCanvas],
+  )
+
   const beginMarkupBox = useCallback(
     (event: ReactPointerEvent<HTMLElement>) => {
       const kind = markupKindForTool(useCanvasStore.getState().activeTool)
@@ -929,9 +973,20 @@ export function useCanvasInteractionController({
       beginTextBox,
       beginFrameBox,
       beginMarkupBox,
+      beginStampPlacement,
       beginTextEdit,
     }),
-    [beginFrameBox, beginMarkupBox, beginNodeMove, beginPan, beginSelection, beginTextBox, beginTextEdit, startNodeResize],
+    [
+      beginFrameBox,
+      beginMarkupBox,
+      beginNodeMove,
+      beginPan,
+      beginSelection,
+      beginStampPlacement,
+      beginTextBox,
+      beginTextEdit,
+      startNodeResize,
+    ],
   )
 
   const beginNodePointerDown = useCallback(
@@ -971,6 +1026,13 @@ export function useCanvasInteractionController({
 
       if (eraserDragRef.current?.pointerId === event.pointerId) {
         eraseAtClientPoint(event.clientX, event.clientY)
+        return
+      }
+
+      const stampPlacement = stampPlacementRef.current
+      if (stampPlacement?.pointerId === event.pointerId) {
+        const point = screenToCanvas(event.clientX, event.clientY)
+        setStampPlacementPreview({ x: point.x, y: point.y, stage: stampPlacement.stage })
         return
       }
 
@@ -1318,6 +1380,22 @@ export function useCanvasInteractionController({
         eraserDragRef.current = null
       }
 
+      if (stampPlacementRef.current?.pointerId === event.pointerId) {
+        if (event.type === 'pointerup') {
+          const placement = stampPlacementRef.current
+          const point = screenToCanvas(event.clientX, event.clientY)
+          const size = stampGrowthSizes[placement.stage]
+          addMarkupNode(
+            'stamp',
+            { x: point.x - size / 2, y: point.y - size / 2 },
+            { width: size, height: size },
+            { stampKind: useCanvasStore.getState().activeStampKind, select: false },
+          )
+        }
+        // Stamp stays active for continuous stamping (FigJam convention); Esc or V exits.
+        clearStampPlacement()
+      }
+
       if (panRef.current?.pointerId === event.pointerId) {
         panRef.current = null
         setIsPanning(false)
@@ -1331,10 +1409,12 @@ export function useCanvasInteractionController({
       addFrameNode,
       addMarkupNode,
       addTextNode,
+      clearStampPlacement,
       editTextNode,
       finishSelection,
       nodes,
       resizeTextNode,
+      screenToCanvas,
       selectNode,
       setActiveTool,
     ],
@@ -1385,6 +1465,11 @@ export function useCanvasInteractionController({
         groupResizeRef.current = null
         selectionSpacingDragRef.current = null
         eraserDragRef.current = null
+        if (stampPlacementRef.current) {
+          window.clearInterval(stampPlacementRef.current.growTimer)
+          stampPlacementRef.current = null
+        }
+        setStampPlacementPreview(null)
         nodeTransformRef.current = null
         textResizeRef.current = null
         setEditingTextNodeId(undefined)
@@ -1543,6 +1628,11 @@ export function useCanvasInteractionController({
       setMarkupCreationBox(null)
       markupPointTransformRef.current = null
       eraserDragRef.current = null
+      if (stampPlacementRef.current) {
+        window.clearInterval(stampPlacementRef.current.growTimer)
+        stampPlacementRef.current = null
+      }
+      setStampPlacementPreview(null)
       nodeTransformRef.current = null
       textResizeRef.current = null
       setActiveConnectorDropTargetId(undefined)
@@ -1643,6 +1733,7 @@ export function useCanvasInteractionController({
     activeFrameCreationRect,
     activeMarkupCreationRect,
     markupCreationBox,
+    stampPlacementPreview,
     selectionPreviewSet,
     beginGroupResize,
     beginSelectionSpacingDrag,

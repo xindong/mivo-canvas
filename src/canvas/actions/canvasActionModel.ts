@@ -754,23 +754,27 @@ const markupStyleActionsFor = (runtime: CanvasActionRuntime): CanvasActionItem[]
   ]
 }
 
-const markupContextMenuGroupsFor: NodeActionExtension = (runtime) => [
-  {
-    id: 'markup-text',
-    actions: [
-      {
-        id: 'edit-markup-text',
-        label: 'Edit text',
-        icon: Type,
-        onClick: () => runtime.onEditText?.(runtime.context.primaryNode?.id || ''),
-      },
-    ],
-  },
-  {
-    id: 'markup-style',
-    actions: markupStyleActionsFor(runtime),
-  },
-]
+const markupContextMenuGroupsFor: NodeActionExtension = (runtime) => {
+  if (runtime.context.primaryNode?.markupKind === 'stamp') return []
+
+  return [
+    {
+      id: 'markup-text',
+      actions: [
+        {
+          id: 'edit-markup-text',
+          label: 'Edit text',
+          icon: Type,
+          onClick: () => runtime.onEditText?.(runtime.context.primaryNode?.id || ''),
+        },
+      ],
+    },
+    {
+      id: 'markup-style',
+      actions: markupStyleActionsFor(runtime),
+    },
+  ]
+}
 
 const contextMenuExtensionsByNodeType: Partial<Record<CanvasNodeType, NodeActionExtension>> = {
   image: generationContextMenuGroupsFor,
@@ -1080,23 +1084,32 @@ const annotationQuickToolbarGroupsFor: NodeActionExtension = (runtime) => [
   },
 ]
 
-const markupQuickToolbarGroupsFor: NodeActionExtension = (runtime) => [
-  {
-    id: 'markup',
-    actions: [
-      {
-        id: 'edit-markup-text',
-        label: 'Edit text',
-        icon: Type,
-        onClick: () => runtime.onEditText?.(runtime.context.primaryNode?.id || ''),
-      },
-      ...markupStyleActionsFor(runtime),
-      { id: 'duplicate', label: 'Duplicate', icon: Copy, onClick: () => duplicateAction(runtime) },
-      { id: 'bring-front', label: 'Front', icon: ChevronsUp, onClick: () => moveLayerAction(runtime, 'front') },
-      { id: 'delete', label: 'Delete', icon: Trash2, danger: true, onClick: () => deleteAction(runtime) },
-    ],
-  },
-]
+const markupQuickToolbarGroupsFor: NodeActionExtension = (runtime) => {
+  // Stamps are icon objects: no text or stroke/fill styling, just organization actions.
+  const isStamp = runtime.context.primaryNode?.markupKind === 'stamp'
+
+  return [
+    {
+      id: 'markup',
+      actions: [
+        ...(isStamp
+          ? []
+          : [
+              {
+                id: 'edit-markup-text',
+                label: 'Edit text',
+                icon: Type,
+                onClick: () => runtime.onEditText?.(runtime.context.primaryNode?.id || ''),
+              } satisfies CanvasActionItem,
+              ...markupStyleActionsFor(runtime),
+            ]),
+        { id: 'duplicate', label: 'Duplicate', icon: Copy, onClick: () => duplicateAction(runtime) },
+        { id: 'bring-front', label: 'Front', icon: ChevronsUp, onClick: () => moveLayerAction(runtime, 'front') },
+        { id: 'delete', label: 'Delete', icon: Trash2, danger: true, onClick: () => deleteAction(runtime) },
+      ],
+    },
+  ]
+}
 
 const imageQuickToolbarGroupsFor: NodeActionExtension = (runtime) => {
   if (!hasAnyCapability(runtime.context, 'imageAsset')) return []

@@ -45,7 +45,8 @@ const isMarkupKind = (value: unknown) =>
   value === 'rect' ||
   value === 'ellipse' ||
   value === 'brush' ||
-  value === 'note'
+  value === 'note' ||
+  value === 'stamp'
 const isMarkupStrokeStyle = (value: unknown) => value === undefined || value === 'solid' || value === 'dashed'
 const isMarkupPointArray = (value: unknown) =>
   value === undefined ||
@@ -121,6 +122,7 @@ const isCanvasNode = (value: unknown): value is MivoCanvasNode => {
       (value.markupBrushKind === undefined ||
         value.markupBrushKind === 'marker' ||
         value.markupBrushKind === 'highlighter') &&
+      (value.markupStampKind === undefined || typeof value.markupStampKind === 'string') &&
       isMarkupPointArray(value.markupPoints) &&
       (value.markupStrokeColor === undefined || typeof value.markupStrokeColor === 'string') &&
       (value.markupFillColor === undefined || typeof value.markupFillColor === 'string') &&

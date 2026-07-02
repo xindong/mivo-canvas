@@ -17,6 +17,7 @@ export type ToolId =
   | 'markup-brush'
   | 'markup-note'
   | 'brush'
+  | 'stamp'
   | 'sticker'
   | 'comment'
   | 'image'
@@ -51,7 +52,16 @@ export type CanvasNodeType =
 export type CanvasAssetNodeType = Extract<CanvasNodeType, 'image' | 'markdown' | 'pdf' | 'video'>
 export type SectionBorderStyle = 'solid' | 'dashed'
 export type SectionLockMode = 'all' | 'background'
-export type MarkupKind = 'arrow' | 'line' | 'rect' | 'ellipse' | 'brush' | 'note'
+export type MarkupKind = 'arrow' | 'line' | 'rect' | 'ellipse' | 'brush' | 'note' | 'stamp'
+export type CanvasStampKind =
+  | 'plus-one'
+  | 'heart'
+  | 'star'
+  | 'check'
+  | 'question'
+  | 'eyes'
+  | 'celebrate'
+  | 'thumbs-down'
 export type MarkupStrokeStyle = 'solid' | 'dashed'
 export type MarkdownDisplayMode = 'full' | 'preview'
 export type ConnectorAnchor = 'center' | 'top' | 'right' | 'bottom' | 'left'
@@ -215,6 +225,7 @@ export type MivoCanvasNode = {
   textAutoWidth?: boolean
   markupKind?: MarkupKind
   markupBrushKind?: MarkupBrushKind
+  markupStampKind?: CanvasStampKind
   markupPoints?: MarkupPoint[]
   markupStrokeColor?: string
   markupFillColor?: string
@@ -280,6 +291,7 @@ export type AiCanvasContextNode = {
   targetNodeId?: string
   markupKind?: MarkupKind
   markupBrushKind?: MarkupBrushKind
+  markupStampKind?: CanvasStampKind
   markupPoints?: MarkupPoint[]
   markupStrokeColor?: string
   markupFillColor?: string

@@ -7,7 +7,7 @@ import {
   type SnapGuide,
 } from './canvasGeometry'
 
-export type RuntimeCanvasTool = 'select' | 'hand' | 'text' | 'frame' | 'markup'
+export type RuntimeCanvasTool = 'select' | 'hand' | 'text' | 'frame' | 'markup' | 'stamp'
 
 export type Viewport = {
   x: number
@@ -106,6 +106,7 @@ export const runtimeToolFor = (activeTool: ToolId, temporaryTool?: RuntimeCanvas
   if (temporaryTool) return temporaryTool
   if (activeTool === 'text') return 'text'
   if (activeTool === 'frame') return 'frame'
+  if (activeTool === 'stamp') return 'stamp'
   if (activeTool.startsWith('markup-')) return 'markup'
   return activeTool === 'hand' ? 'hand' : 'select'
 }

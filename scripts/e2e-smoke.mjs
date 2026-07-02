@@ -2585,6 +2585,68 @@ try {
   await page.keyboard.press('Escape')
   await page.waitForFunction(() => !document.querySelector('.brush-options-bar'))
 
+  const stampCountBefore = await page.locator('.dom-node.markup-node[data-markup-kind="stamp"]').count()
+  await page.keyboard.press('s')
+  await page.waitForSelector('.stamp-options-bar')
+  const stampCursor = await page.evaluate(
+    () => window.getComputedStyle(document.querySelector('.canvas-shell')).cursor,
+  )
+  if (!stampCursor.includes('data:image/svg+xml')) {
+    throw new Error(`Stamp tool should show the stamp as cursor, got ${stampCursor}`)
+  }
+  const stampPoint = { x: markupShapeTestPoint.x + 40, y: markupShapeTestPoint.y + 320 }
+  await page.mouse.click(stampPoint.x, stampPoint.y)
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="stamp"]').length === count + 1,
+    stampCountBefore,
+  )
+  const stampButtonClass = await page
+    .locator('.canvas-tool-dock > button[aria-label="Stamp"]')
+    .getAttribute('class')
+  if (!stampButtonClass?.includes('active')) {
+    throw new Error('Stamp should stay active after placing for continuous stamping')
+  }
+  const quickStampNode = page.locator('.dom-node.markup-node[data-markup-kind="stamp"]').last()
+  const quickStampEmoji = (await quickStampNode.locator('.dom-markup-stamp').textContent())?.trim()
+  if (quickStampEmoji !== '👍') {
+    throw new Error(`Default stamp should be the +1 thumbs up, got ${quickStampEmoji}`)
+  }
+  const quickStampBox = await quickStampNode.boundingBox()
+  if (!quickStampBox) throw new Error('Missing stamp geometry after quick click')
+
+  await page.locator('.stamp-options-bar').getByRole('radio', { name: 'Stamp Heart' }).click()
+  await page.mouse.move(stampPoint.x + 90, stampPoint.y)
+  await page.mouse.down()
+  await page.waitForSelector('.stamp-placement-preview')
+  await wait(950)
+  await page.mouse.up()
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="stamp"]').length === count + 2,
+    stampCountBefore,
+  )
+  const heldStampNode = page.locator('.dom-node.markup-node[data-markup-kind="stamp"]').last()
+  const heldStampEmoji = (await heldStampNode.locator('.dom-markup-stamp').textContent())?.trim()
+  if (heldStampEmoji !== '❤️') {
+    throw new Error(`Switching stamps should place the picked stamp, got ${heldStampEmoji}`)
+  }
+  const heldStampBox = await heldStampNode.boundingBox()
+  if (!heldStampBox || heldStampBox.width <= quickStampBox.width + 8) {
+    throw new Error(
+      `Press-and-hold should grow the stamp before placing: quick=${JSON.stringify(quickStampBox)}, held=${JSON.stringify(heldStampBox)}`,
+    )
+  }
+
+  await page.keyboard.press('Escape')
+  await page.waitForFunction(() => !document.querySelector('.stamp-options-bar'))
+  for (let stampIndex = 0; stampIndex < 2; stampIndex += 1) {
+    await page.locator('.dom-node.markup-node[data-markup-kind="stamp"]').last().click()
+    await page.keyboard.press('Backspace')
+    await page.waitForFunction(
+      (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="stamp"]').length === count,
+      stampCountBefore + 1 - stampIndex,
+    )
+  }
+
   const secondNode = page.locator('.dom-node').nth(1)
   const visibleNodeCountBeforeOrganization = await page.locator('.dom-node').count()
   await firstNode.click()

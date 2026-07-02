@@ -11,6 +11,7 @@ import {
 } from './canvasRenderAdapter'
 import type { ResizeCorner } from './canvasGeometry'
 import { renderKindForNode } from './nodeTypes/canvasNodeRegistry'
+import { stampEmojiFor } from './stampDefs'
 import { defaultTextAlign, defaultTextColor, defaultTextFontSize, defaultTextWeight } from './textGeometry'
 import type { TextResizeEdge } from './useCanvasInteractionController'
 
@@ -300,6 +301,18 @@ function MarkupNodeView({
   const lineSegments = lineSegmentsWithLabelGap(node, points, lineLabelActive)
   const showStartArrow = Boolean(node.markupStartArrow)
   const showEndArrow = node.markupEndArrow ?? kind === 'arrow'
+
+  if (kind === 'stamp') {
+    return (
+      <div
+        className="dom-markup-stamp"
+        style={{ fontSize: Math.max(12, Math.min(node.width, node.height) * 0.78) }}
+        aria-label={node.title}
+      >
+        {stampEmojiFor(node.markupStampKind)}
+      </div>
+    )
+  }
 
   if (kind === 'note') {
     return (
