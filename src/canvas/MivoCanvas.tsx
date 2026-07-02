@@ -4,6 +4,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
   type DragEvent as ReactDragEvent,
   type MouseEvent as ReactMouseEvent,
 } from 'react'
@@ -16,6 +17,9 @@ import { canImportCanvasFile, importFilesToCanvas, importImageUrlToCanvas } from
 import { readCanvasImageBlob } from '../lib/canvasImageSource'
 import { editMivoImage } from '../lib/mivoImageClient'
 import { useCanvasStore } from '../store/canvasStore'
+import { brushCursorCssFor } from './brushCursors'
+import { brushOutlinePathFor, highlighterOpacity } from './brushGeometry'
+import { BrushOptionsBar } from './BrushOptionsBar'
 import { CanvasContextMenu } from './CanvasContextMenu'
 import { CanvasAiActionBar } from './CanvasAiActionBar'
 import { CanvasNodeView } from './CanvasNodeView'
@@ -25,6 +29,8 @@ import { NodeActionMenu } from './NodeActionMenu'
 import { SelectionQuickToolbar } from './SelectionQuickToolbar'
 import type { ImageMaskSubmitPayload } from './imageMaskGeometry'
 import type { MivoImageRatio } from '../types/generation'
+import { StampOptionsBar } from './StampOptionsBar'
+import { stampCursorCssFor, stampEmojiFor, stampGrowthSizes } from './stampDefs'
 import { useCanvasInteractionController } from './useCanvasInteractionController'
 
 type ContextMenuState = {
@@ -125,6 +131,9 @@ export function MivoCanvas({
   const [shellSize, setShellSize] = useState({ width: 0, height: 0 })
   const nodes = useCanvasStore((state) => state.nodes)
   const sceneId = useCanvasStore((state) => state.sceneId)
+  const storeActiveTool = useCanvasStore((state) => state.activeTool)
+  const brushStyle = useCanvasStore((state) => state.brushStyle)
+  const activeStampKind = useCanvasStore((state) => state.activeStampKind)
   const selectedNodeId = useCanvasStore((state) => state.selectedNodeId)
   const selectedNodeIds = useCanvasStore((state) => state.selectedNodeIds)
   const selectNode = useCanvasStore((state) => state.selectNode)
@@ -159,6 +168,7 @@ export function MivoCanvas({
     interactionMode,
     selectedNodes,
     selectedBounds,
+    selectionSpacingHandles,
     activeSectionDropTargetId,
     activeConnectorDropTargetId,
     showGroupSelectionBounds,
@@ -167,8 +177,10 @@ export function MivoCanvas({
     activeFrameCreationRect,
     activeMarkupCreationRect,
     markupCreationBox,
+    stampPlacementPreview,
     selectionPreviewSet,
     beginGroupResize,
+    beginSelectionSpacingDrag,
     beginNodePointerDown,
     beginNodeResize,
     editTextNode,
@@ -533,12 +545,30 @@ export function MivoCanvas({
   const handleSize = 14 / viewport.scale
   const handleBorderWidth = 2.5 / viewport.scale
   const selectionStrokeWidth = 2 / viewport.scale
+  const overlayHandleSize = 14
+  const overlayHandleBorderWidth = 2.5
+  const overlaySelectionStrokeWidth = 2
+  const selectionOverlayBounds = selectedBounds
+    ? {
+        x: viewport.x + selectedBounds.x * viewport.scale,
+        y: viewport.y + selectedBounds.y * viewport.scale,
+        width: selectedBounds.width * viewport.scale,
+        height: selectedBounds.height * viewport.scale,
+      }
+    : undefined
+  const canvasToOverlayX = (x: number) => viewport.x + x * viewport.scale
+  const canvasToOverlayY = (y: number) => viewport.y + y * viewport.scale
+
+  const brushToolActive = storeActiveTool === 'markup-brush' && !temporaryTool && !isPanning
+  const stampToolActive = storeActiveTool === 'stamp' && !temporaryTool && !isPanning
 
   return (
     <section
       className={`canvas-shell tool-${interactionMode} ${isPanning ? 'is-panning' : ''} ${
         selectionBox ? 'is-selecting' : ''
-      } ${selectedNodes.length > 1 ? 'has-multi-selection' : ''}`}
+      } ${selectedNodes.length > 1 ? 'has-multi-selection' : ''} ${brushToolActive ? 'brush-tool' : ''} ${
+        stampToolActive ? 'stamp-tool' : ''
+      }`}
       aria-label="Mivo Canvas"
       data-viewport-scale={viewport.scale}
       data-viewport-x={viewport.x}
@@ -557,6 +587,12 @@ export function MivoCanvas({
       style={{
         backgroundPosition: `${viewport.x}px ${viewport.y}px`,
         backgroundSize: `${36 * viewport.scale}px ${36 * viewport.scale}px`,
+        ...(brushToolActive
+          ? ({ '--brush-cursor': brushCursorCssFor(brushStyle.kind, brushStyle.color) } as CSSProperties)
+          : {}),
+        ...(stampToolActive
+          ? ({ '--stamp-cursor': stampCursorCssFor(activeStampKind) } as CSSProperties)
+          : {}),
       }}
     >
       <div className="canvas-host" ref={hostRef} />
@@ -568,6 +604,8 @@ export function MivoCanvas({
         onStartMaskEdit={beginMaskEdit}
         onCancelMaskEdit={cancelMaskEdit}
       />
+      {storeActiveTool === 'markup-brush' && !temporaryTool ? <BrushOptionsBar /> : null}
+      {storeActiveTool === 'stamp' && !temporaryTool ? <StampOptionsBar /> : null}
       <div
         className="dom-canvas-layer"
         style={{ transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})` }}
@@ -666,10 +704,20 @@ export function MivoCanvas({
                   </marker>
                 </defs>
                 {markupCreationBox.kind === 'brush' ? (
-                  <polyline
-                    points={markupCreationBox.points
-                      .map((point) => `${point.x - activeMarkupCreationRect.x},${point.y - activeMarkupCreationRect.y}`)
-                      .join(' ')}
+                  <path
+                    d={brushOutlinePathFor(
+                      markupCreationBox.points.map((point) => ({
+                        ...point,
+                        x: point.x - activeMarkupCreationRect.x,
+                        y: point.y - activeMarkupCreationRect.y,
+                      })),
+                      brushStyle.width,
+                      brushStyle.kind === 'highlighter' ? 'highlighter' : 'marker',
+                      { last: false },
+                    )}
+                    fill={brushStyle.color}
+                    fillOpacity={brushStyle.kind === 'highlighter' ? highlighterOpacity : 1}
+                    stroke="none"
                   />
                 ) : (
                   <line
@@ -684,40 +732,6 @@ export function MivoCanvas({
               </svg>
             ) : null}
           </div>
-        ) : null}
-        {showGroupSelectionBounds && selectedBounds ? (
-          <>
-            <div
-              className="selection-bounds"
-              data-selection-bounds="true"
-              style={{
-                left: selectedBounds.x,
-                top: selectedBounds.y,
-                width: selectedBounds.width,
-                height: selectedBounds.height,
-                borderWidth: selectionStrokeWidth,
-              }}
-            />
-            {(['nw', 'ne', 'sw', 'se'] as const).map((corner) => (
-              <button
-                key={corner}
-                type="button"
-                className={`selection-handle ${corner}`}
-                aria-label={`Resize selection ${corner}`}
-                style={{
-                  left: corner.endsWith('e') ? selectedBounds.x + selectedBounds.width : selectedBounds.x,
-                  top: corner.startsWith('s') ? selectedBounds.y + selectedBounds.height : selectedBounds.y,
-                  width: handleSize,
-                  height: handleSize,
-                  borderWidth: handleBorderWidth,
-                }}
-                onPointerDown={(event) => beginGroupResize(corner, event)}
-                onPointerMove={handleCanvasPointerMove}
-                onPointerUp={handleCanvasPointerEnd}
-                onPointerCancel={handleCanvasPointerEnd}
-              />
-            ))}
-          </>
         ) : null}
         {renderedNodes.map((node) => {
           const selected = selectedNodeIds.includes(node.id)
@@ -765,6 +779,20 @@ export function MivoCanvas({
             />
           )
         })}
+        {stampPlacementPreview ? (
+          <div
+            className="stamp-placement-preview"
+            style={{
+              left: stampPlacementPreview.x - stampGrowthSizes[stampPlacementPreview.stage] / 2,
+              top: stampPlacementPreview.y - stampGrowthSizes[stampPlacementPreview.stage] / 2,
+              width: stampGrowthSizes[stampPlacementPreview.stage],
+              height: stampGrowthSizes[stampPlacementPreview.stage],
+              fontSize: stampGrowthSizes[stampPlacementPreview.stage] * 0.78,
+            }}
+          >
+            {stampEmojiFor(activeStampKind)}
+          </div>
+        ) : null}
         {cropNode ? (
           <ImageCropOverlay
             node={cropNode}
@@ -790,6 +818,68 @@ export function MivoCanvas({
           />
         ) : null}
       </div>
+      {showGroupSelectionBounds && selectionOverlayBounds ? (
+        <>
+          <div
+            className="selection-bounds"
+            data-selection-bounds="true"
+            style={{
+              left: selectionOverlayBounds.x,
+              top: selectionOverlayBounds.y,
+              width: selectionOverlayBounds.width,
+              height: selectionOverlayBounds.height,
+              borderWidth: overlaySelectionStrokeWidth,
+            }}
+          />
+          {(['nw', 'ne', 'sw', 'se'] as const).map((corner) => (
+            <button
+              key={corner}
+              type="button"
+              className={`selection-handle ${corner}`}
+              aria-label={`Resize selection ${corner}`}
+              style={{
+                left: corner.endsWith('e')
+                  ? selectionOverlayBounds.x + selectionOverlayBounds.width
+                  : selectionOverlayBounds.x,
+                top: corner.startsWith('s')
+                  ? selectionOverlayBounds.y + selectionOverlayBounds.height
+                  : selectionOverlayBounds.y,
+                width: overlayHandleSize,
+                height: overlayHandleSize,
+                borderWidth: overlayHandleBorderWidth,
+              }}
+              onPointerDown={(event) => beginGroupResize(corner, event)}
+              onPointerMove={handleCanvasPointerMove}
+              onPointerUp={handleCanvasPointerEnd}
+              onPointerCancel={handleCanvasPointerEnd}
+            />
+          ))}
+          {selectionSpacingHandles.map((handle) => (
+            <button
+              key={handle.id}
+              type="button"
+              className={`selection-spacing-handle ${handle.axis} layout-${handle.layoutKind}`}
+              aria-label={`Adjust ${handle.axis} spacing ${handle.label}px`}
+              title={`${handle.label}px`}
+              data-smart-layout={handle.layoutKind}
+              data-smart-spacing={handle.label}
+              style={{
+                left: canvasToOverlayX(handle.x),
+                top: canvasToOverlayY(handle.y),
+                width: handle.width * viewport.scale,
+                height: handle.height * viewport.scale,
+                fontSize: 10,
+              }}
+              onPointerDown={(event) => beginSelectionSpacingDrag(handle, event)}
+              onPointerMove={handleCanvasPointerMove}
+              onPointerUp={handleCanvasPointerEnd}
+              onPointerCancel={handleCanvasPointerEnd}
+            >
+              <span>{handle.label}</span>
+            </button>
+          ))}
+        </>
+      ) : null}
       {contextMenu && contextMenuNode ? (
         <CanvasContextMenu x={contextMenu.x} y={contextMenu.y}>
           <NodeActionMenu

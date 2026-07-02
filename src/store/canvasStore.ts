@@ -10,8 +10,11 @@ import type {
   CanvasDocument,
   CanvasMaskBounds,
   CanvasTask,
+  BrushToolMode,
+  CanvasStampKind,
   ConnectorBinding,
   DemoSceneId,
+  MarkupBrushKind,
   MarkupKind,
   MarkupPoint,
   MarkdownDisplayMode,
@@ -21,11 +24,14 @@ import type {
   SectionLockMode,
   ToolId,
 } from '../types/mivoCanvas'
+import { defaultBrushWidth, highlighterOpacity } from '../canvas/brushGeometry'
+import { defaultStampKind, stampLabelFor } from '../canvas/stampDefs'
 import { connectorBindingPointFor, isConnectorNode } from '../canvas/connectorGeometry'
 import { defaultSizeForNodeType } from '../canvas/nodeTypes/canvasNodeRegistry'
 import { defaultTextAlign, defaultTextColor, defaultTextFontSize, defaultTextWeight } from '../canvas/textGeometry'
 import {
   markdownDocumentWidth,
+  markdownDocumentSizeFor,
   markdownPreviewHeight,
   markdownShouldUsePreviewMode,
   type ImportedFileMetadata,
@@ -33,7 +39,15 @@ import {
 import { importedImageDisplaySize, type ImportedImageMetadata } from '../lib/imageSizing'
 import { saveGeneratedAsset } from '../lib/assetStorage'
 import { assetBlobForNode, editMivoImage, generateMivoImage } from '../lib/mivoImageClient'
+import { createAiResultNode } from '../model/aiCanvasCommands'
+import { normalizeCanvasSnapshotV2 } from '../model/canvasSnapshotModel'
+import {
+  normalizeCanvasNodeV2,
+  normalizeCanvasNodesV2,
+  setNodeTransform,
+} from '../model/documentModelV2'
 import { buildAiContextSnapshot, chooseAdjacentPlacement } from './aiCanvasWorkflow'
+import { debugLogger } from './debugLogStore'
 import { makeNode, realCaseImages, scenes, snapshotFromScene } from './demoScenes'
 import { mockGenerationAdapter } from './mockGeneration'
 import type { CanvasAssetClipboardItem } from '../app/assetLibraryModel'
@@ -54,6 +68,12 @@ export type CanvasGenerationOptions = {
   referenceFiles?: File[]
   signal?: AbortSignal
 }
+export type SelectionArrangeMode = 'row' | 'column' | 'grid' | 'tidy'
+export type BrushStyle = {
+  color: string
+  width: number
+  kind: BrushToolMode
+}
 
 type CanvasState = {
   canvases: Record<CanvasId, CanvasDocument>
@@ -66,6 +86,8 @@ type CanvasState = {
   sceneId: CanvasId
   clipboardNodes: MivoCanvasNode[]
   clipboardAssets: CanvasAssetClipboardItem[]
+  brushStyle: BrushStyle
+  activeStampKind: CanvasStampKind
   historyPast: MivoCanvasSnapshot[]
   historyFuture: MivoCanvasSnapshot[]
   createCanvas: (title?: string, options?: { projectId?: string; templateId?: DemoSceneId }) => CanvasId
@@ -76,6 +98,9 @@ type CanvasState = {
   selectNode: (nodeId?: string, options?: { additive?: boolean }) => void
   selectNodes: (nodeIds: string[], primaryNodeId?: string) => void
   setActiveTool: (toolId: ToolId) => void
+  setBrushStyle: (style: Partial<BrushStyle>) => void
+  setActiveStampKind: (kind: CanvasStampKind) => void
+  eraseMarkupStrokes: (nodeIds: string[]) => void
   captureHistory: () => void
   undo: () => void
   redo: () => void
@@ -101,7 +126,9 @@ type CanvasState = {
   showAllHiddenNodes: () => void
   alignSelectedNodes: (alignment: SelectionAlignment) => void
   distributeSelectedNodes: (axis: DistributionAxis) => void
+  arrangeSelectedNodes: (mode: SelectionArrangeMode) => void
   copySelectedNodes: () => void
+  cutSelectedNodes: () => void
   pasteClipboardNodes: (position?: { x: number; y: number }) => void
   copyAssetsToClipboard: (assets: CanvasAssetClipboardItem[]) => void
   pasteClipboardAssets: (position?: { x: number; y: number }) => void
@@ -148,6 +175,8 @@ type CanvasState = {
       fillColor?: string
       strokeWidth?: number
       strokeStyle?: MivoCanvasNode['markupStrokeStyle']
+      brushKind?: MarkupBrushKind
+      stampKind?: CanvasStampKind
       startArrow?: boolean
       endArrow?: boolean
       connectorStart?: ConnectorBinding
@@ -228,7 +257,19 @@ type CanvasState = {
 }
 
 type PersistedCanvasState = Partial<
-  Pick<CanvasState, 'canvases' | 'nodes' | 'edges' | 'tasks' | 'sceneId' | 'selectedNodeId' | 'selectedNodeIds' | 'activeTool'>
+  Pick<
+    CanvasState,
+    | 'canvases'
+    | 'nodes'
+    | 'edges'
+    | 'tasks'
+    | 'sceneId'
+    | 'selectedNodeId'
+    | 'selectedNodeIds'
+    | 'activeTool'
+    | 'brushStyle'
+    | 'activeStampKind'
+  >
 >
 
 export { scenes }
@@ -241,7 +282,7 @@ const sceneLabels = new Map(sceneOptions.map((scene) => [scene.id, scene.label])
 const fallbackTitle = (sceneId: CanvasId) => sceneLabels.get(sceneId as DemoSceneId) || sceneId
 
 const cloneNode = (node: MivoCanvasNode): MivoCanvasNode => ({
-  ...node,
+  ...normalizeCanvasNodeV2(node),
   markupPoints: node.markupPoints ? node.markupPoints.map((point) => ({ ...point })) : undefined,
   connectorStart: node.connectorStart ? { ...node.connectorStart } : undefined,
   connectorEnd: node.connectorEnd ? { ...node.connectorEnd } : undefined,
@@ -271,6 +312,35 @@ const cloneNodes = (nodes: MivoCanvasNode[]) => nodes.map(cloneNode)
 const cloneTasks = (tasks: CanvasTask[]) => tasks.map(cloneTask)
 const cloneEdges = (edges: CanvasEdge[] = []) => edges.map(cloneEdge)
 
+const compactNodeForPersist = (node: MivoCanvasNode): MivoCanvasNode => {
+  const compactNode = cloneNode(node)
+  const transform = compactNode.transform
+  const rotation = transform?.rotation ?? 0
+
+  delete compactNode.asset
+  delete compactNode.fills
+  delete compactNode.relations
+  delete compactNode.strokes
+  delete compactNode.transform
+
+  return {
+    ...compactNode,
+    ...(Math.abs(rotation) > 0.0001 ? { transform } : {}),
+  }
+}
+
+const compactDocumentForPersist = (document: CanvasDocument): CanvasDocument => ({
+  ...document,
+  nodes: document.nodes.map(compactNodeForPersist),
+  tasks: cloneTasks(document.tasks),
+  selectedNodeIds: document.selectedNodeIds ? [...document.selectedNodeIds] : undefined,
+})
+
+const compactCanvasesForPersist = (canvases: Record<CanvasId, CanvasDocument>) =>
+  Object.fromEntries(
+    Object.entries(canvases).map(([canvasId, document]) => [canvasId, compactDocumentForPersist(document)]),
+  ) as Record<CanvasId, CanvasDocument>
+
 const normalizeSelection = (nodeIds: string[] | undefined, nodes: MivoCanvasNode[]) => {
   const validIds = new Set(nodes.filter((node) => !node.hidden).map((node) => node.id))
   return Array.from(new Set(nodeIds || [])).filter((nodeId) => validIds.has(nodeId))
@@ -283,15 +353,18 @@ const selectionFrom = (nodeIds: string[] | undefined, selectedNodeId: string | u
   return { selectedNodeId: primary, selectedNodeIds: selection }
 }
 
-const snapshotFromState = (state: Pick<CanvasState, 'sceneId' | 'nodes' | 'edges' | 'tasks' | 'selectedNodeId' | 'selectedNodeIds'>) => ({
-  version: 1 as const,
-  sceneId: state.sceneId,
-  nodes: cloneNodes(state.nodes),
-  edges: cloneEdges(state.edges),
-  tasks: cloneTasks(state.tasks),
-  selectedNodeId: state.selectedNodeId,
-  selectedNodeIds: [...state.selectedNodeIds],
-})
+const snapshotFromState = (
+  state: Pick<CanvasState, 'sceneId' | 'nodes' | 'edges' | 'tasks' | 'selectedNodeId' | 'selectedNodeIds'>,
+) =>
+  normalizeCanvasSnapshotV2({
+    version: 2,
+    sceneId: state.sceneId,
+    nodes: cloneNodes(state.nodes),
+    edges: cloneEdges(state.edges),
+    tasks: cloneTasks(state.tasks),
+    selectedNodeId: state.selectedNodeId,
+    selectedNodeIds: [...state.selectedNodeIds],
+  })
 
 const remember = (state: CanvasState) => ({
   historyPast: [...state.historyPast.slice(-(historyLimit - 1)), snapshotFromState(state)],
@@ -317,10 +390,18 @@ const defaultSectionBorderStyle: SectionBorderStyle = 'dashed'
 const defaultMarkupStrokeColor = '#6957e8'
 const defaultMarkupFillColor = 'rgba(105, 87, 232, 0.08)'
 const defaultMarkupStrokeWidth = 3
+const defaultBrushColor = '#232323'
+const defaultBrushStyle: BrushStyle = {
+  color: defaultBrushColor,
+  width: defaultBrushWidth,
+  kind: 'marker',
+}
 
 const isSectionNode = (node: MivoCanvasNode) => node.type === 'frame'
 const isEditableTextNode = (node: MivoCanvasNode | undefined) =>
-  node?.type === 'text' || node?.type === 'annotation' || node?.type === 'markup'
+  node?.type === 'text' ||
+  node?.type === 'annotation' ||
+  (node?.type === 'markup' && node.markupKind !== 'stamp')
 
 const nodeCenter = (node: Pick<MivoCanvasNode, 'x' | 'y' | 'width' | 'height'>) => ({
   x: node.x + node.width / 2,
@@ -417,16 +498,17 @@ const normalizeConnectorMarkupNodes = (nodes: MivoCanvasNode[]) =>
     if (endBindingPoint) absolutePoints[1] = endBindingPoint
 
     const next = markupGeometryFromAbsolutePoints(absolutePoints)
-    return {
+    return setNodeTransform({
       ...node,
+      markupPoints: next.points.map((point) => ({ x: Math.round(point.x), y: Math.round(point.y) })),
+      connectorStart: startBindingPoint ? node.connectorStart : undefined,
+      connectorEnd: endBindingPoint ? node.connectorEnd : undefined,
+    }, {
       x: Math.round(next.geometry.x),
       y: Math.round(next.geometry.y),
       width: Math.round(next.geometry.width),
       height: Math.round(next.geometry.height),
-      markupPoints: next.points.map((point) => ({ x: Math.round(point.x), y: Math.round(point.y) })),
-      connectorStart: startBindingPoint ? node.connectorStart : undefined,
-      connectorEnd: endBindingPoint ? node.connectorEnd : undefined,
-    }
+    })
   })
 
 const derivationEdgeModel = 'Mivo Derivation Edge'
@@ -482,7 +564,7 @@ const syncDerivationEdgeNodes = (nodes: MivoCanvasNode[], edges: CanvasEdge[]) =
 }
 
 const normalizeCanvasNodes = (nodes: MivoCanvasNode[]) =>
-  normalizeConnectorMarkupNodes(normalizeSectionMembership(nodes))
+  normalizeCanvasNodesV2(normalizeConnectorMarkupNodes(normalizeSectionMembership(nodes)))
 
 const normalizeCanvasGraph = (nodes: MivoCanvasNode[], edges: CanvasEdge[] = []) =>
   normalizeCanvasNodes(syncDerivationEdgeNodes(nodes, edges))
@@ -597,21 +679,22 @@ const patchWithHistory = (
 })
 
 const applySnapshot = (state: CanvasState, snapshot: MivoCanvasSnapshot) => {
-  const currentDocument = documentFor(state.canvases, snapshot.sceneId)
-  const edges = cloneEdges(snapshot.edges || [])
-  const nodes = normalizeCanvasGraph(cloneNodes(snapshot.nodes), edges)
-  const selection = selectionFrom(snapshot.selectedNodeIds, snapshot.selectedNodeId, nodes)
+  const normalizedSnapshot = normalizeCanvasSnapshotV2(snapshot)
+  const currentDocument = documentFor(state.canvases, normalizedSnapshot.sceneId)
+  const edges = cloneEdges(normalizedSnapshot.edges || [])
+  const nodes = normalizeCanvasGraph(cloneNodes(normalizedSnapshot.nodes), edges)
+  const selection = selectionFrom(normalizedSnapshot.selectedNodeIds, normalizedSnapshot.selectedNodeId, nodes)
   const document: CanvasDocument = {
     ...currentDocument,
     nodes,
     edges,
-    tasks: cloneTasks(snapshot.tasks),
+    tasks: cloneTasks(normalizedSnapshot.tasks),
     selectedNodeId: selection.selectedNodeId,
     selectedNodeIds: selection.selectedNodeIds,
   }
 
   return {
-    sceneId: snapshot.sceneId,
+    sceneId: normalizedSnapshot.sceneId,
     nodes: document.nodes,
     edges: document.edges,
     tasks: document.tasks,
@@ -620,7 +703,7 @@ const applySnapshot = (state: CanvasState, snapshot: MivoCanvasSnapshot) => {
     activeTool: 'select' as ToolId,
     canvases: {
       ...state.canvases,
-      [snapshot.sceneId]: document,
+      [normalizedSnapshot.sceneId]: document,
     },
   }
 }
@@ -678,10 +761,7 @@ const importedAssetDisplaySize = (type: CanvasAssetNodeType, metadata?: Imported
           width: markdownDocumentWidth,
           height: markdownPreviewHeight,
         }
-      : {
-          ...defaultSize,
-          width: markdownDocumentWidth,
-        }
+      : markdownDocumentSizeFor(metadata?.text)
   }
 
   return defaultSizeForNodeType(type)
@@ -782,6 +862,139 @@ const selectedNodesFromState = (state: CanvasState) => {
 
 const selectedIdsFromState = (state: CanvasState) => selectedNodesFromState(state).map((node) => node.id)
 
+const arrangeSelectionSpacing = 32
+
+const visualRowOrder = (nodes: MivoCanvasNode[]) =>
+  [...nodes].sort((a, b) => a.y - b.y || a.x - b.x)
+
+const arrangedSubjectNodesFrom = (nodes: MivoCanvasNode[], selectedNodes: MivoCanvasNode[]) => {
+  const selectedSectionIds = new Set(selectedNodes.filter(isSectionNode).map((node) => node.id))
+
+  return selectedNodes.filter(
+    (node) =>
+      !isConnectorNode(node) &&
+      !isEffectivelyLocked(nodes, node) &&
+      !(node.sectionId && selectedSectionIds.has(node.sectionId)),
+  )
+}
+
+const boundsForNodes = (nodes: MivoCanvasNode[]) => {
+  const minX = Math.min(...nodes.map((node) => node.x))
+  const maxX = Math.max(...nodes.map((node) => node.x + node.width))
+  const minY = Math.min(...nodes.map((node) => node.y))
+  const maxY = Math.max(...nodes.map((node) => node.y + node.height))
+
+  return {
+    minX,
+    maxX,
+    minY,
+    maxY,
+    width: maxX - minX,
+    height: maxY - minY,
+  }
+}
+
+const resolvedArrangeModeFor = (mode: SelectionArrangeMode, nodes: MivoCanvasNode[]) => {
+  if (mode !== 'tidy') return mode
+  if (nodes.length <= 2) {
+    const bounds = boundsForNodes(nodes)
+    return bounds.width >= bounds.height ? 'row' : 'column'
+  }
+
+  const bounds = boundsForNodes(nodes)
+  if (bounds.width > bounds.height * 1.8) return 'row'
+  if (bounds.height > bounds.width * 1.8) return 'column'
+  return 'grid'
+}
+
+const gridColumnCountFor = (count: number, bounds: ReturnType<typeof boundsForNodes>) => {
+  const aspect = Math.max(0.45, Math.min(2.8, bounds.width / Math.max(bounds.height, 1)))
+  return Math.max(2, Math.min(count, Math.round(Math.sqrt(count * aspect))))
+}
+
+const arrangedPositionsFor = (
+  nodes: MivoCanvasNode[],
+  requestedMode: SelectionArrangeMode,
+): Map<string, { x: number; y: number }> => {
+  const positions = new Map<string, { x: number; y: number }>()
+  if (nodes.length < 2) return positions
+
+  const bounds = boundsForNodes(nodes)
+  const mode = resolvedArrangeModeFor(requestedMode, nodes)
+
+  if (mode === 'row') {
+    let cursorX = bounds.minX
+    const centerY = bounds.minY + bounds.height / 2
+
+    ;[...nodes]
+      .sort((a, b) => a.x - b.x || a.y - b.y)
+      .forEach((node) => {
+        positions.set(node.id, {
+          x: Math.round(cursorX),
+          y: Math.round(centerY - node.height / 2),
+        })
+        cursorX += node.width + arrangeSelectionSpacing
+      })
+
+    return positions
+  }
+
+  if (mode === 'column') {
+    let cursorY = bounds.minY
+    const centerX = bounds.minX + bounds.width / 2
+
+    ;[...nodes]
+      .sort((a, b) => a.y - b.y || a.x - b.x)
+      .forEach((node) => {
+        positions.set(node.id, {
+          x: Math.round(centerX - node.width / 2),
+          y: Math.round(cursorY),
+        })
+        cursorY += node.height + arrangeSelectionSpacing
+      })
+
+    return positions
+  }
+
+  const sorted = visualRowOrder(nodes)
+  const columnCount = gridColumnCountFor(sorted.length, bounds)
+  const rows: MivoCanvasNode[][] = []
+  sorted.forEach((node, index) => {
+    const rowIndex = Math.floor(index / columnCount)
+    rows[rowIndex] = rows[rowIndex] || []
+    rows[rowIndex].push(node)
+  })
+
+  const columnWidths = Array.from({ length: columnCount }, (_, columnIndex) =>
+    Math.max(...rows.map((row) => row[columnIndex]?.width || 0)),
+  )
+  const rowHeights = rows.map((row) => Math.max(...row.map((node) => node.height)))
+  const columnXs: number[] = []
+  const rowYs: number[] = []
+  let cursorX = bounds.minX
+  let cursorY = bounds.minY
+
+  columnWidths.forEach((width, index) => {
+    columnXs[index] = cursorX
+    cursorX += width + arrangeSelectionSpacing
+  })
+  rowHeights.forEach((height, index) => {
+    rowYs[index] = cursorY
+    cursorY += height + arrangeSelectionSpacing
+  })
+
+  rows.forEach((row, rowIndex) => {
+    row.forEach((node, columnIndex) => {
+      positions.set(node.id, {
+        x: Math.round(columnXs[columnIndex] + (columnWidths[columnIndex] - node.width) / 2),
+        y: Math.round(rowYs[rowIndex] + (rowHeights[rowIndex] - node.height) / 2),
+      })
+    })
+  })
+
+  return positions
+}
+
 const migratePersistedState = (persistedState: unknown, persistedVersion = 0) => {
   const persisted = (persistedState || {}) as PersistedCanvasState
   const shouldNormalizeLongMarkdown = persistedVersion < 6
@@ -837,6 +1050,9 @@ const migratePersistedState = (persistedState: unknown, persistedVersion = 0) =>
     activeTool: persisted.activeTool || 'select',
     clipboardNodes: [],
     clipboardAssets: [],
+    // Version 8 introduced the black default and eraser mode; older persisted styles reset to the new default.
+    brushStyle: persistedVersion < 8 ? defaultBrushStyle : persisted.brushStyle || defaultBrushStyle,
+    activeStampKind: persisted.activeStampKind || defaultStampKind,
     historyPast: [],
     historyFuture: [],
   }
@@ -845,6 +1061,10 @@ const migratePersistedState = (persistedState: unknown, persistedVersion = 0) =>
 const defaultSceneId: CanvasId = 'character-flow'
 const defaultCanvases = initialCanvases()
 const defaultDocument = documentFor(defaultCanvases, defaultSceneId)
+
+const logCanvas = (message: string) => debugLogger.log('Canvas Store', message)
+const warnCanvas = (message: string) => debugLogger.warn('Canvas Store', message)
+const errorCanvas = (message: string) => debugLogger.error('Canvas Store', message)
 
 export const useCanvasStore = create<CanvasState>()(
   persist(
@@ -859,6 +1079,8 @@ export const useCanvasStore = create<CanvasState>()(
       activeTool: 'select',
       clipboardNodes: [],
       clipboardAssets: [],
+      brushStyle: defaultBrushStyle,
+      activeStampKind: defaultStampKind,
       historyPast: [],
       historyFuture: [],
       createCanvas: (title = 'Untitled Canvas', options) => {
@@ -891,13 +1113,17 @@ export const useCanvasStore = create<CanvasState>()(
           }
         })
 
+        logCanvas(`Created canvas "${title}" (${id})`)
         return id
       },
       duplicateCanvas: (canvasId) => {
         const state = get()
         const sourceId = canvasId || state.sceneId
         const sourceDocument = state.canvases[sourceId]
-        if (!sourceDocument) return undefined
+        if (!sourceDocument) {
+          warnCanvas(`Duplicate canvas skipped: missing source ${sourceId}`)
+          return undefined
+        }
 
         const id = createCanvasId()
         const duplicatedDocument = normalizeDocument({
@@ -923,23 +1149,34 @@ export const useCanvasStore = create<CanvasState>()(
           },
         }))
 
+        logCanvas(`Duplicated canvas "${sourceDocument.title}" to ${id}`)
         return id
       },
       deleteCanvas: (canvasId) =>
         set((state) => {
           const targetId = canvasId || state.sceneId
           const canvasIds = Object.keys(state.canvases)
-          if (!state.canvases[targetId] || canvasIds.length <= 1) return {}
+          if (!state.canvases[targetId]) {
+            warnCanvas(`Delete canvas skipped: missing canvas ${targetId}`)
+            return {}
+          }
+          if (canvasIds.length <= 1) {
+            errorCanvas('Delete canvas blocked: at least one canvas must remain')
+            return {}
+          }
 
           const remainingCanvases = { ...state.canvases }
+          const deletedTitle = state.canvases[targetId].title
           delete remainingCanvases[targetId]
 
           if (targetId !== state.sceneId) {
+            logCanvas(`Deleted inactive canvas "${deletedTitle}"`)
             return { canvases: remainingCanvases }
           }
 
           const nextSceneId = canvasIds.find((id) => id !== targetId) || defaultSceneId
           const nextDocument = normalizeDocument(documentFor(remainingCanvases, nextSceneId))
+          logCanvas(`Deleted active canvas "${deletedTitle}" and loaded "${nextDocument.title}"`)
 
           return {
             canvases: remainingCanvases,
@@ -957,6 +1194,7 @@ export const useCanvasStore = create<CanvasState>()(
       loadScene: (sceneId) =>
         set((state) => {
           const document = normalizeDocument(documentFor(state.canvases, sceneId))
+          logCanvas(`Loaded canvas "${document.title}" (${sceneId})`)
 
           return {
             sceneId,
@@ -977,6 +1215,7 @@ export const useCanvasStore = create<CanvasState>()(
       renameCanvas: (sceneId, title) =>
         set((state) => {
           const document = documentFor(state.canvases, sceneId)
+          logCanvas(`Renamed canvas "${document.title}" to "${title}"`)
 
           return {
             canvases: {
@@ -990,10 +1229,16 @@ export const useCanvasStore = create<CanvasState>()(
         }),
       selectNode: (nodeId, options) =>
         set((state) => {
-          if (!nodeId) return patchActiveCanvas(state, { selectedNodeId: undefined, selectedNodeIds: [] })
+          if (!nodeId) {
+            logCanvas('Selection cleared')
+            return patchActiveCanvas(state, { selectedNodeId: undefined, selectedNodeIds: [] })
+          }
 
           const target = state.nodes.find((node) => node.id === nodeId && !node.hidden)
-          if (!target) return {}
+          if (!target) {
+            warnCanvas(`Selection skipped: node ${nodeId} is missing or hidden`)
+            return {}
+          }
 
           const targetNodeIds = target.groupId
             ? state.nodes
@@ -1012,9 +1257,11 @@ export const useCanvasStore = create<CanvasState>()(
               ? state.selectedNodeId
               : normalizedSelection.at(-1)
 
+            logCanvas(`Selection toggled: ${normalizedSelection.length} selected`)
             return patchActiveCanvas(state, { selectedNodeId, selectedNodeIds: normalizedSelection })
           }
 
+          logCanvas(`Selected ${targetNodeIds.length === 1 ? target.title : `${targetNodeIds.length} grouped nodes`}`)
           return patchActiveCanvas(state, { selectedNodeId: nodeId, selectedNodeIds: targetNodeIds })
         }),
       selectNodes: (nodeIds, primaryNodeId) =>
@@ -1022,10 +1269,49 @@ export const useCanvasStore = create<CanvasState>()(
           const selectedNodeIds = normalizeSelection(nodeIds, state.nodes)
           const selectedNodeId =
             primaryNodeId && selectedNodeIds.includes(primaryNodeId) ? primaryNodeId : selectedNodeIds[0]
+          logCanvas(`Selected ${selectedNodeIds.length} node${selectedNodeIds.length === 1 ? '' : 's'}`)
 
           return patchActiveCanvas(state, { selectedNodeId, selectedNodeIds })
         }),
-      setActiveTool: (toolId) => set({ activeTool: toolId }),
+      setActiveTool: (toolId) => {
+        logCanvas(`Tool changed to ${toolId}`)
+        set({ activeTool: toolId })
+      },
+      setBrushStyle: (style) =>
+        set((state) => {
+          const brushStyle = { ...state.brushStyle, ...style }
+          logCanvas(`Brush style set: ${brushStyle.kind}, ${brushStyle.color}, ${brushStyle.width}px`)
+          return { brushStyle }
+        }),
+      setActiveStampKind: (kind) => {
+        logCanvas(`Stamp kind set to ${kind}`)
+        set({ activeStampKind: kind })
+      },
+      eraseMarkupStrokes: (nodeIds) =>
+        set((state) => {
+          // History is captured once per eraser drag by the interaction controller,
+          // so repeated calls during one drag stay a single undo step.
+          const erasableSet = new Set(
+            nodeIds.filter((nodeId) => {
+              const node = state.nodes.find((item) => item.id === nodeId)
+              return (
+                node &&
+                node.type === 'markup' &&
+                node.markupKind === 'brush' &&
+                !isEffectivelyLocked(state.nodes, node)
+              )
+            }),
+          )
+          if (!erasableSet.size) return {}
+
+          logCanvas(`Erased ${erasableSet.size} brush stroke${erasableSet.size === 1 ? '' : 's'}`)
+
+          return patchActiveCanvas(state, {
+            selectedNodeId: erasableSet.has(state.selectedNodeId || '') ? undefined : state.selectedNodeId,
+            selectedNodeIds: state.selectedNodeIds.filter((nodeId) => !erasableSet.has(nodeId)),
+            nodes: normalizeCanvasNodes(state.nodes.filter((node) => !erasableSet.has(node.id))),
+          })
+        }),
       captureHistory: () => set((state) => remember(state)),
       undo: () =>
         set((state) => {
@@ -1056,7 +1342,7 @@ export const useCanvasStore = create<CanvasState>()(
 
           const nodes = normalizeCanvasNodes(
             state.nodes.map((node) =>
-              node.id === nodeId ? { ...node, x: Math.round(x), y: Math.round(y) } : node,
+              node.id === nodeId ? setNodeTransform(node, { x: Math.round(x), y: Math.round(y) }) : node,
             ),
           )
 
@@ -1082,7 +1368,7 @@ export const useCanvasStore = create<CanvasState>()(
           const nodes = normalizeCanvasNodes(
             state.nodes.map((node) =>
               moveSet.has(node.id) && !isEffectivelyLocked(state.nodes, node)
-                ? { ...node, x: node.x + dx, y: node.y + dy }
+                ? setNodeTransform(node, { x: node.x + dx, y: node.y + dy })
                 : node,
             ),
           )
@@ -1097,13 +1383,12 @@ export const useCanvasStore = create<CanvasState>()(
           const nodes = normalizeCanvasNodes(
             state.nodes.map((node) =>
               node.id === nodeId
-                ? {
-                    ...node,
+                ? setNodeTransform(node, {
                     x: Math.round(x),
                     y: Math.round(y),
                     width: Math.round(width),
                     height: Math.round(height),
-                  }
+                  })
                 : node,
             ),
           )
@@ -1119,13 +1404,12 @@ export const useCanvasStore = create<CanvasState>()(
             const update = updatesById.get(node.id)
             if (!update || isEffectivelyLocked(state.nodes, node)) return node
 
-            return {
-              ...node,
+            return setNodeTransform(node, {
               x: Math.round(update.x),
               y: Math.round(update.y),
               width: Math.round(update.width),
               height: Math.round(update.height),
-            }
+            })
           }))
 
           return patchActiveCanvas(state, {
@@ -1146,11 +1430,10 @@ export const useCanvasStore = create<CanvasState>()(
           const nodes = normalizeCanvasNodes(
             state.nodes.map((node) =>
               node.id === nodeId
-                ? {
-                    ...node,
+                ? setNodeTransform(node, {
                     width: nextWidth,
                     height: nextHeight,
-                  }
+                  })
                 : node,
             ),
           )
@@ -1166,11 +1449,10 @@ export const useCanvasStore = create<CanvasState>()(
           const nodes = normalizeCanvasNodes(
             state.nodes.map((node) =>
               node.id === nodeId
-                ? {
+                ? setNodeTransform({
                     ...node,
                     markdownDisplayMode: mode,
-                    height: Math.max(320, Math.round(nextHeight)),
-                  }
+                  }, { height: Math.max(320, Math.round(nextHeight)) })
                 : node,
             ),
           )
@@ -1192,7 +1474,7 @@ export const useCanvasStore = create<CanvasState>()(
           const nodes = normalizeCanvasNodes(
             state.nodes.map((node) =>
               moveSet.has(node.id) && !isEffectivelyLocked(state.nodes, node)
-                ? { ...node, x: node.x + dx, y: node.y + dy }
+                ? setNodeTransform(node, { x: node.x + dx, y: node.y + dy })
                 : node,
             ),
           )
@@ -1434,12 +1716,12 @@ export const useCanvasStore = create<CanvasState>()(
           const nodes = state.nodes.map((node) => {
             if (!selectedSet.has(node.id) || node.locked) return node
 
-            if (alignment === 'left') return { ...node, x: Math.round(minX) }
-            if (alignment === 'center') return { ...node, x: Math.round(centerX - node.width / 2) }
-            if (alignment === 'right') return { ...node, x: Math.round(maxX - node.width) }
-            if (alignment === 'top') return { ...node, y: Math.round(minY) }
-            if (alignment === 'middle') return { ...node, y: Math.round(centerY - node.height / 2) }
-            return { ...node, y: Math.round(maxY - node.height) }
+            if (alignment === 'left') return setNodeTransform(node, { x: Math.round(minX) })
+            if (alignment === 'center') return setNodeTransform(node, { x: Math.round(centerX - node.width / 2) })
+            if (alignment === 'right') return setNodeTransform(node, { x: Math.round(maxX - node.width) })
+            if (alignment === 'top') return setNodeTransform(node, { y: Math.round(minY) })
+            if (alignment === 'middle') return setNodeTransform(node, { y: Math.round(centerY - node.height / 2) })
+            return setNodeTransform(node, { y: Math.round(maxY - node.height) })
           })
 
           return patchWithHistory(state, { nodes, selectedNodeId: state.selectedNodeId, selectedNodeIds: state.selectedNodeIds })
@@ -1468,8 +1750,57 @@ export const useCanvasStore = create<CanvasState>()(
           const nodes = state.nodes.map((node) => {
             const position = positions.get(node.id)
             if (position === undefined || node.locked) return node
-            return axis === 'horizontal' ? { ...node, x: position } : { ...node, y: position }
+            return axis === 'horizontal' ? setNodeTransform(node, { x: position }) : setNodeTransform(node, { y: position })
           })
+
+          return patchWithHistory(state, { nodes, selectedNodeId: state.selectedNodeId, selectedNodeIds: state.selectedNodeIds })
+        }),
+      arrangeSelectedNodes: (mode) =>
+        set((state) => {
+          const selectedNodes = selectedNodesFromState(state)
+          const subjectNodes = arrangedSubjectNodesFrom(state.nodes, selectedNodes)
+          if (subjectNodes.length < 2) return {}
+
+          const positions = arrangedPositionsFor(subjectNodes, mode)
+          if (!positions.size) return {}
+
+          const sectionDeltas = new Map<string, { dx: number; dy: number }>()
+
+          subjectNodes.forEach((node) => {
+            const position = positions.get(node.id)
+            if (!position || !isSectionNode(node)) return
+
+            sectionDeltas.set(node.id, {
+              dx: Math.round(position.x - node.x),
+              dy: Math.round(position.y - node.y),
+            })
+          })
+
+          let changed = false
+          const nodes = normalizeCanvasNodes(
+            state.nodes.map((node) => {
+              const position = positions.get(node.id)
+              if (position) {
+                if (node.x !== position.x || node.y !== position.y) changed = true
+                return setNodeTransform(node, {
+                  x: position.x,
+                  y: position.y,
+                })
+              }
+
+              const sectionDelta = node.sectionId ? sectionDeltas.get(node.sectionId) : undefined
+              if (!sectionDelta || isEffectivelyLocked(state.nodes, node)) return node
+              if (!sectionDelta.dx && !sectionDelta.dy) return node
+
+              changed = true
+              return setNodeTransform(node, {
+                x: Math.round(node.x + sectionDelta.dx),
+                y: Math.round(node.y + sectionDelta.dy),
+              })
+            }),
+          )
+
+          if (!changed) return {}
 
           return patchWithHistory(state, { nodes, selectedNodeId: state.selectedNodeId, selectedNodeIds: state.selectedNodeIds })
         }),
@@ -1480,11 +1811,44 @@ export const useCanvasStore = create<CanvasState>()(
 
           return { clipboardNodes: cloneNodes(selectedNodes), clipboardAssets: [] }
         }),
+      cutSelectedNodes: () =>
+        set((state) => {
+          const selectedNodeIds = selectedIdsFromState(state)
+          if (!selectedNodeIds.length) return {}
+
+          const removedSet = new Set(
+            selectedNodeIds.filter((nodeId) => {
+              const node = state.nodes.find((item) => item.id === nodeId)
+              return node && !isEffectivelyLocked(state.nodes, node)
+            }),
+          )
+          state.nodes.forEach((node) => {
+            if (removedSet.has(node.id) && isSectionNode(node)) {
+              state.nodes
+                .filter((child) => child.sectionId === node.id && !isEffectivelyLocked(state.nodes, child))
+                .forEach((child) => removedSet.add(child.id))
+            }
+          })
+          if (!removedSet.size) return {}
+
+          logCanvas(`Cut ${removedSet.size} node${removedSet.size === 1 ? '' : 's'} to clipboard`)
+
+          return {
+            clipboardNodes: cloneNodes(state.nodes.filter((node) => removedSet.has(node.id))),
+            ...patchWithHistory(state, {
+              selectedNodeId: undefined,
+              selectedNodeIds: [],
+              nodes: normalizeCanvasNodes(state.nodes.filter((node) => !removedSet.has(node.id))),
+            }),
+          }
+        }),
       pasteClipboardNodes: (position) =>
         set((state) => {
           if (!state.clipboardNodes.length) return {}
 
           const groupIdMap = new Map<string, string>()
+          const clipboardIds = new Set(state.clipboardNodes.map((node) => node.id))
+          const cloneIdMap = new Map<string, string>()
           const clones = state.clipboardNodes.map((node, index) => {
             const groupId = node.groupId
               ? groupIdMap.get(node.groupId) || (() => {
@@ -1494,20 +1858,30 @@ export const useCanvasStore = create<CanvasState>()(
                 })()
               : undefined
 
-            return createNodeCopy(node, index, 36, { groupId })
+            const clone = createNodeCopy(node, index, 36, { groupId })
+            cloneIdMap.set(node.id, clone.id)
+            return clone
+          })
+          // Children cut together with their Section keep membership in the pasted Section,
+          // mirroring how groupId is remapped above.
+          const clonesWithSections = clones.map((clone, index) => {
+            const sourceSectionId = state.clipboardNodes[index].sectionId
+            return sourceSectionId && clipboardIds.has(sourceSectionId)
+              ? { ...clone, sectionId: cloneIdMap.get(sourceSectionId) }
+              : clone
           })
           const nextClones = position
             ? (() => {
-                const minX = Math.min(...clones.map((node) => node.x))
-                const maxX = Math.max(...clones.map((node) => node.x + node.width))
-                const minY = Math.min(...clones.map((node) => node.y))
-                const maxY = Math.max(...clones.map((node) => node.y + node.height))
+                const minX = Math.min(...clonesWithSections.map((node) => node.x))
+                const maxX = Math.max(...clonesWithSections.map((node) => node.x + node.width))
+                const minY = Math.min(...clonesWithSections.map((node) => node.y))
+                const maxY = Math.max(...clonesWithSections.map((node) => node.y + node.height))
                 const dx = Math.round(position.x - (minX + (maxX - minX) / 2))
                 const dy = Math.round(position.y - (minY + (maxY - minY) / 2))
 
-                return clones.map((node) => ({ ...node, x: node.x + dx, y: node.y + dy }))
+                return clonesWithSections.map((node) => setNodeTransform(node, { x: node.x + dx, y: node.y + dy }))
               })()
-            : clones
+            : clonesWithSections
 
           return {
             clipboardNodes: nextClones.map(cloneNode),
@@ -1571,6 +1945,7 @@ export const useCanvasStore = create<CanvasState>()(
           })
         }),
       addImportedImage: (assetUrl, title = 'Imported Image', size = 'source', position, metadata) => {
+        logCanvas(`Import image requested: ${title}`)
         get().addImportedFileNode('image', assetUrl, title, size, position, metadata)
       },
       addImportedFileNode: (type, assetUrl, title, size = 'source', position, metadata) => {
@@ -1616,11 +1991,15 @@ export const useCanvasStore = create<CanvasState>()(
             ],
           }),
         )
+        logCanvas(`Imported ${type} node "${nodeTitle}" from ${metadata?.originalName || assetUrl}`)
       },
       cropImageNode: (nodeId, box) =>
         set((state) => {
           const source = state.nodes.find((node) => node.id === nodeId && node.type === 'image')
-          if (!source) return {}
+          if (!source) {
+            warnCanvas(`Crop skipped: image node ${nodeId} not found`)
+            return {}
+          }
 
           const sourceWidth = Math.max(1, source.width)
           const sourceHeight = Math.max(1, source.height)
@@ -1645,17 +2024,19 @@ export const useCanvasStore = create<CanvasState>()(
 
           const nodes = state.nodes.map((node) =>
             node.id === nodeId
-              ? {
+              ? setNodeTransform({
                   ...node,
+                  imageCrop: cropEqualsFullImage(nextCrop) ? undefined : nextCrop,
+                }, {
                   x: Math.round(node.x + cropBox.x),
                   y: Math.round(node.y + cropBox.y),
                   width: Math.round(cropBox.width),
                   height: Math.round(cropBox.height),
-                  imageCrop: cropEqualsFullImage(nextCrop) ? undefined : nextCrop,
-                }
+                })
               : node,
           )
 
+          logCanvas(`Cropped image "${source.title}"`)
           return patchWithHistory(state, { nodes, selectedNodeId: nodeId, selectedNodeIds: [nodeId] })
         }),
       addFrameNode: (position, size, title) => {
@@ -1687,6 +2068,7 @@ export const useCanvasStore = create<CanvasState>()(
           })
         })
 
+        logCanvas(`Created section ${id}`)
         return id
       },
       addAiSlotNode: (position, size, prompt) => {
@@ -1731,6 +2113,7 @@ export const useCanvasStore = create<CanvasState>()(
           })
         })
 
+        logCanvas(`Created AI slot ${id}`)
         return id
       },
       addAnnotationNode: (sourceNodeId, position, instruction, options) => {
@@ -1743,7 +2126,10 @@ export const useCanvasStore = create<CanvasState>()(
           const source =
             state.nodes.find((node) => node.id === sourceNodeId && !node.hidden) ||
             state.nodes.find((node) => node.id === state.selectedNodeId && !node.hidden)
-          if (!source) return {}
+          if (!source) {
+            warnCanvas('Annotation creation skipped: no source node selected')
+            return {}
+          }
 
           const note = instruction?.trim() || 'Describe the image edit here'
           const x = Math.round(position?.x ?? source.x + 28)
@@ -1789,6 +2175,7 @@ export const useCanvasStore = create<CanvasState>()(
           })
         })
 
+        if (created) logCanvas(`Created annotation ${id}`)
         return created ? id : undefined
       },
       addMarkupNode: (kind, position, geometry, options) => {
@@ -1807,7 +2194,9 @@ export const useCanvasStore = create<CanvasState>()(
                   ? 'Ellipse annotation'
                   : kind === 'brush'
                     ? 'Brush annotation'
-                    : 'Markup note'
+                    : kind === 'stamp'
+                      ? `Stamp ${stampLabelFor(options?.stampKind)}`
+                      : 'Markup note'
 
         set((state) => {
           const draft = makeNode({
@@ -1826,12 +2215,18 @@ export const useCanvasStore = create<CanvasState>()(
             height,
             status: 'ready',
             markupKind: kind,
-            markupPoints: options?.points?.map((point) => ({ x: Math.round(point.x), y: Math.round(point.y) })),
+            markupBrushKind: kind === 'brush' ? options?.brushKind || 'marker' : undefined,
+            markupStampKind: kind === 'stamp' ? options?.stampKind || defaultStampKind : undefined,
+            markupPoints: options?.points?.map((point) => ({
+              x: Math.round(point.x),
+              y: Math.round(point.y),
+              ...(point.pressure !== undefined ? { pressure: point.pressure } : {}),
+            })),
             markupStrokeColor: options?.strokeColor || defaultMarkupStrokeColor,
             markupFillColor: options?.fillColor || (kind === 'note' ? '#fff1a8' : defaultMarkupFillColor),
             markupStrokeWidth: options?.strokeWidth || defaultMarkupStrokeWidth,
             markupStrokeStyle: options?.strokeStyle || 'solid',
-            markupOpacity: 1,
+            markupOpacity: kind === 'brush' && options?.brushKind === 'highlighter' ? highlighterOpacity : 1,
             markupStartArrow: options?.startArrow ?? false,
             markupEndArrow: options?.endArrow ?? kind === 'arrow',
             markupCornerRadius: 4,
@@ -1854,6 +2249,7 @@ export const useCanvasStore = create<CanvasState>()(
           })
         })
 
+        logCanvas(`Created ${kind} markup ${id}`)
         return id
       },
       updateMarkupGeometry: (nodeId, geometry, points, bindings) =>
@@ -1864,12 +2260,8 @@ export const useCanvasStore = create<CanvasState>()(
           const nodes = normalizeCanvasNodes(
             state.nodes.map((node) =>
               node.id === nodeId
-                ? {
+                ? setNodeTransform({
                     ...node,
-                    x: Math.round(geometry.x),
-                    y: Math.round(geometry.y),
-                    width: Math.round(geometry.width),
-                    height: Math.round(geometry.height),
                     markupPoints: points?.map((point) => ({
                       x: Math.round(point.x),
                       y: Math.round(point.y),
@@ -1880,7 +2272,12 @@ export const useCanvasStore = create<CanvasState>()(
                     ...(bindings && 'connectorEnd' in bindings
                       ? { connectorEnd: bindings.connectorEnd || undefined }
                       : {}),
-                  }
+                  }, {
+                    x: Math.round(geometry.x),
+                    y: Math.round(geometry.y),
+                    width: Math.round(geometry.width),
+                    height: Math.round(geometry.height),
+                  })
                 : node,
             ),
           )
@@ -1894,10 +2291,7 @@ export const useCanvasStore = create<CanvasState>()(
 
           const nodes = state.nodes.map((node) =>
             node.id === nodeId
-              ? {
-                  ...node,
-                  ...style,
-                }
+              ? normalizeCanvasNodeV2({ ...node, ...style, fills: undefined, strokes: undefined })
               : node,
           )
           return patchWithHistory(state, { nodes, selectedNodeId: nodeId, selectedNodeIds: [nodeId] })
@@ -1907,7 +2301,11 @@ export const useCanvasStore = create<CanvasState>()(
           const section = state.nodes.find((node) => node.id === nodeId && isSectionNode(node))
           if (!section || section.locked) return {}
 
-          const nodes = state.nodes.map((node) => (node.id === nodeId ? { ...node, ...style } : node))
+          const nodes = state.nodes.map((node) =>
+            node.id === nodeId
+              ? normalizeCanvasNodeV2({ ...node, ...style, fills: undefined, strokes: undefined })
+              : node,
+          )
           return patchWithHistory(state, { nodes, selectedNodeId: nodeId, selectedNodeIds: [nodeId] })
         }),
       setSectionLockMode: (nodeId, mode) =>
@@ -1980,26 +2378,34 @@ export const useCanvasStore = create<CanvasState>()(
           }),
         )
 
+        logCanvas(`Created text node ${id}`)
         return id
       },
       updateTextNode: (nodeId, text, geometry) =>
         set((state) => {
           const nodes = state.nodes.map((node) =>
             node.id === nodeId && isEditableTextNode(node)
-              ? {
-                  ...node,
-                  title: node.type === 'markup' ? node.title : text.trim() || 'Text',
-                  text,
-                  width: geometry && node.type !== 'markup' ? Math.round(geometry.width) : node.width,
-                  height: geometry && node.type !== 'markup' ? Math.round(geometry.height) : node.height,
-                  generation:
-                    node.type === 'markup' && node.generation
-                      ? {
-                          ...node.generation,
-                          prompt: text.trim() || node.title,
-                        }
-                      : node.generation,
-                }
+              ? (() => {
+                  const nextNode = {
+                    ...node,
+                    title: node.type === 'markup' ? node.title : text.trim() || 'Text',
+                    text,
+                    generation:
+                      node.type === 'markup' && node.generation
+                        ? {
+                            ...node.generation,
+                            prompt: text.trim() || node.title,
+                          }
+                        : node.generation,
+                  }
+
+                  return geometry && node.type !== 'markup'
+                    ? setNodeTransform(nextNode, {
+                        width: Math.round(geometry.width),
+                        height: Math.round(geometry.height),
+                      })
+                    : nextNode
+                })()
               : node,
           )
 
@@ -2009,12 +2415,12 @@ export const useCanvasStore = create<CanvasState>()(
         set((state) => {
           const nodes = state.nodes.map((node) =>
             node.id === nodeId && isEditableTextNode(node)
-              ? {
-                  ...node,
-                  ...style,
-                  width: geometry && node.type !== 'markup' ? Math.round(geometry.width) : node.width,
-                  height: geometry && node.type !== 'markup' ? Math.round(geometry.height) : node.height,
-                }
+              ? geometry && node.type !== 'markup'
+                ? setNodeTransform({ ...node, ...style }, {
+                    width: Math.round(geometry.width),
+                    height: Math.round(geometry.height),
+                  })
+                : { ...node, ...style }
               : node,
           )
 
@@ -2024,13 +2430,14 @@ export const useCanvasStore = create<CanvasState>()(
         set((state) => {
           const nodes = state.nodes.map((node) =>
             node.id === nodeId && isEditableTextNode(node)
-              ? {
+              ? setNodeTransform({
                   ...node,
+                  textAutoWidth: false,
+                }, {
                   x: Math.round(x),
                   width: Math.round(width),
                   height: Math.round(height),
-                  textAutoWidth: false,
-                }
+                })
               : node,
           )
 
@@ -2168,7 +2575,10 @@ export const useCanvasStore = create<CanvasState>()(
           state.nodes.find((node) => node.id === state.selectedNodeId) ||
           state.nodes[0]
 
-        if (!source) return
+        if (!source) {
+          warnCanvas('Variation generation skipped: no source node available')
+          return
+        }
 
         const batchId = Date.now() % 100000
         const result = mockGenerationAdapter.generateVariations({
@@ -2206,6 +2616,7 @@ export const useCanvasStore = create<CanvasState>()(
             tasks: [result.task, ...current.tasks].slice(0, 5),
           }),
         }))
+        logCanvas(`Generated ${result.nodes.length} variations from "${source.title}"`)
       },
       generateImageEdit: async (sourceNodeId, operation, prompt, options = {}) => {
         const taskId = createNodeId(`task-${operation}`)
@@ -2455,7 +2866,10 @@ export const useCanvasStore = create<CanvasState>()(
           const annotation =
             state.nodes.find((node) => node.id === annotationNodeId && node.type === 'annotation' && !node.hidden) ||
             state.nodes.find((node) => node.id === state.selectedNodeId && node.type === 'annotation' && !node.hidden)
-          if (!annotation) return {}
+          if (!annotation) {
+            warnCanvas('Annotation generation skipped: no annotation selected')
+            return {}
+          }
 
           const sourceId = annotation.aiWorkflow?.sourceNodeIds?.[0] || annotation.parentIds?.[0]
           const source = sourceId ? state.nodes.find((node) => node.id === sourceId && !node.hidden) : undefined
@@ -2470,38 +2884,21 @@ export const useCanvasStore = create<CanvasState>()(
             placement: 'right',
           })
           const resultPrompt = nodePrompt(annotation, '根据批注生成修订版图片')
-          const result = makeNode({
+          const result = createAiResultNode({
             id,
-            type: 'image',
             title: `Edited from ${source?.title || annotation.title}`,
-            x: Math.round(placement.x),
-            y: Math.round(placement.y),
-            width: Math.round(width),
-            height: Math.round(height),
+            sourceNodes: source ? [source] : [annotation],
+            anchorNode: anchor,
+            annotationNode: annotation,
+            operation: 'annotation-edit',
+            prompt: resultPrompt,
+            placement: 'right',
+            position: { x: placement.x, y: placement.y },
+            size: { width, height },
             assetUrl: mockResultAssetUrl(state.nodes),
-            status: 'ready',
-            parentIds: source ? [source.id, annotation.id] : [annotation.id],
-            sourceNodeId: anchor.id,
-            generation: {
-              prompt: resultPrompt,
-              model: 'Mivo Mock Image Workflow',
-              size: `${Math.round(width)}x${Math.round(height)}`,
-              seed: createdAt % 99999,
-              strength: 0.66,
-              taskId: `task-${id}`,
-              createdAt,
-            },
-            aiWorkflow: {
-              kind: 'result',
-              status: 'ready',
-              operation: 'annotation-edit',
-              prompt: resultPrompt,
-              sourceNodeIds: source ? [source.id] : [annotation.id],
-              annotationNodeId: annotation.id,
-              anchorNodeId: anchor.id,
-              placement: 'right',
-              createdAt,
-            },
+            createdAt,
+            taskId: `task-${id}`,
+            strength: 0.66,
           })
           const task: CanvasTask = {
             id: `task-${id}`,
@@ -2519,6 +2916,7 @@ export const useCanvasStore = create<CanvasState>()(
             createdAt,
           }
 
+          logCanvas(`Generated from annotation "${annotation.title}"`)
           return patchWithHistory(state, {
             selectedNodeId: id,
             selectedNodeIds: [id],
@@ -2596,17 +2994,16 @@ export const useCanvasStore = create<CanvasState>()(
     }),
     {
       name: 'mivo-canvas-demo',
-      version: 7,
+      version: 8,
       migrate: migratePersistedState,
       partialize: (state) => ({
-        canvases: state.canvases,
-        nodes: state.nodes,
-        edges: state.edges,
-        tasks: state.tasks,
+        canvases: compactCanvasesForPersist(state.canvases),
         sceneId: state.sceneId,
         selectedNodeId: state.selectedNodeId,
         selectedNodeIds: state.selectedNodeIds,
         activeTool: state.activeTool,
+        brushStyle: state.brushStyle,
+        activeStampKind: state.activeStampKind,
       }),
     },
   ),

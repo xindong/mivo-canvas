@@ -16,6 +16,7 @@ import {
   ChevronsDown,
   ChevronsUp,
   Clipboard,
+  Columns3,
   Copy,
   Crop,
   Download,
@@ -24,15 +25,18 @@ import {
   EyeOff,
   ExternalLink,
   FilePlus2,
+  Grid3X3,
   Group,
   ImagePlus,
   LocateFixed,
   Lock,
+  LayoutGrid,
   Maximize2,
   MessageSquareText,
   Minus,
   PanelTop,
   Pencil,
+  Rows3,
   Square,
   SquareDashed,
   SquareMousePointer,
@@ -42,8 +46,9 @@ import {
   Ungroup,
   Unlock,
   Wand2,
+  WandSparkles,
 } from 'lucide-react'
-import type { DistributionAxis, SelectionAlignment } from '../../store/canvasStore'
+import type { DistributionAxis, SelectionAlignment, SelectionArrangeMode } from '../../store/canvasStore'
 import type { CanvasNodeType, MarkupKind, SectionLockMode, ToolId } from '../../types/mivoCanvas'
 import {
   hasAnyCapability,
@@ -245,7 +250,8 @@ const sectionBorderPresets = [
   { label: 'Gray', value: '#8c8880' },
 ]
 
-const markupColorPresets = [
+export const markupColorPresets = [
+  { label: 'Black', value: '#232323' },
   { label: 'Purple', value: '#6957e8' },
   { label: 'Blue', value: '#159bff' },
   { label: 'Red', value: '#b9473a' },
@@ -467,6 +473,10 @@ const align = (runtime: CanvasActionRuntime, alignment: SelectionAlignment) => {
 
 const distribute = (runtime: CanvasActionRuntime, axis: DistributionAxis) => {
   runtime.distributeSelectedNodes(axis)
+}
+
+const arrange = (runtime: CanvasActionRuntime, mode: SelectionArrangeMode) => {
+  runtime.arrangeSelectedNodes(mode)
 }
 
 type NodeActionExtension = (runtime: CanvasActionRuntime) => CanvasActionGroup[]
@@ -741,23 +751,27 @@ const markupStyleActionsFor = (runtime: CanvasActionRuntime): CanvasActionItem[]
   ]
 }
 
-const markupContextMenuGroupsFor: NodeActionExtension = (runtime) => [
-  {
-    id: 'markup-text',
-    actions: [
-      {
-        id: 'edit-markup-text',
-        label: 'Edit text',
-        icon: Type,
-        onClick: () => runtime.onEditText?.(runtime.context.primaryNode?.id || ''),
-      },
-    ],
-  },
-  {
-    id: 'markup-style',
-    actions: markupStyleActionsFor(runtime),
-  },
-]
+const markupContextMenuGroupsFor: NodeActionExtension = (runtime) => {
+  if (runtime.context.primaryNode?.markupKind === 'stamp') return []
+
+  return [
+    {
+      id: 'markup-text',
+      actions: [
+        {
+          id: 'edit-markup-text',
+          label: 'Edit text',
+          icon: Type,
+          onClick: () => runtime.onEditText?.(runtime.context.primaryNode?.id || ''),
+        },
+      ],
+    },
+    {
+      id: 'markup-style',
+      actions: markupStyleActionsFor(runtime),
+    },
+  ]
+}
 
 const contextMenuExtensionsByNodeType: Partial<Record<CanvasNodeType, NodeActionExtension>> = {
   image: generationContextMenuGroupsFor,
@@ -1067,23 +1081,32 @@ const annotationQuickToolbarGroupsFor: NodeActionExtension = (runtime) => [
   },
 ]
 
-const markupQuickToolbarGroupsFor: NodeActionExtension = (runtime) => [
-  {
-    id: 'markup',
-    actions: [
-      {
-        id: 'edit-markup-text',
-        label: 'Edit text',
-        icon: Type,
-        onClick: () => runtime.onEditText?.(runtime.context.primaryNode?.id || ''),
-      },
-      ...markupStyleActionsFor(runtime),
-      { id: 'duplicate', label: 'Duplicate', icon: Copy, onClick: () => duplicateAction(runtime) },
-      { id: 'bring-front', label: 'Front', icon: ChevronsUp, onClick: () => moveLayerAction(runtime, 'front') },
-      { id: 'delete', label: 'Delete', icon: Trash2, danger: true, onClick: () => deleteAction(runtime) },
-    ],
-  },
-]
+const markupQuickToolbarGroupsFor: NodeActionExtension = (runtime) => {
+  // Stamps are icon objects: no text or stroke/fill styling, just organization actions.
+  const isStamp = runtime.context.primaryNode?.markupKind === 'stamp'
+
+  return [
+    {
+      id: 'markup',
+      actions: [
+        ...(isStamp
+          ? []
+          : [
+              {
+                id: 'edit-markup-text',
+                label: 'Edit text',
+                icon: Type,
+                onClick: () => runtime.onEditText?.(runtime.context.primaryNode?.id || ''),
+              } satisfies CanvasActionItem,
+              ...markupStyleActionsFor(runtime),
+            ]),
+        { id: 'duplicate', label: 'Duplicate', icon: Copy, onClick: () => duplicateAction(runtime) },
+        { id: 'bring-front', label: 'Front', icon: ChevronsUp, onClick: () => moveLayerAction(runtime, 'front') },
+        { id: 'delete', label: 'Delete', icon: Trash2, danger: true, onClick: () => deleteAction(runtime) },
+      ],
+    },
+  ]
+}
 
 const imageQuickToolbarGroupsFor: NodeActionExtension = (runtime) => {
   if (!hasAnyCapability(runtime.context, 'imageAsset')) return []
@@ -1234,6 +1257,24 @@ export const quickToolbarGroupsFor = (runtime: CanvasActionRuntime): CanvasActio
           ]
         : []),
     ]
+    const arrangeActions: CanvasActionItem[] = [
+      { id: 'arrange-row', label: 'Arrange row', icon: Rows3, onClick: () => arrange(runtime, 'row') },
+      { id: 'arrange-column', label: 'Arrange column', icon: Columns3, onClick: () => arrange(runtime, 'column') },
+      {
+        id: 'arrange-grid',
+        label: 'Arrange grid',
+        icon: LayoutGrid,
+        disabled: context.selectedCount < 3,
+        onClick: () => arrange(runtime, 'grid'),
+      },
+      {
+        id: 'arrange-tidy',
+        label: 'Tidy selection',
+        icon: WandSparkles,
+        disabled: context.selectedCount < 3,
+        onClick: () => arrange(runtime, 'tidy'),
+      },
+    ]
 
     return [
       {
@@ -1252,6 +1293,14 @@ export const quickToolbarGroupsFor = (runtime: CanvasActionRuntime): CanvasActio
             menuVariant: 'icon-grid',
             children: alignActions,
             onClick: () => align(runtime, 'center'),
+          },
+          {
+            id: 'arrange-menu',
+            label: 'Arrange',
+            icon: Grid3X3,
+            menuVariant: 'icon-grid',
+            children: arrangeActions,
+            onClick: () => arrange(runtime, 'tidy'),
           },
           {
             id: 'toggle-lock',

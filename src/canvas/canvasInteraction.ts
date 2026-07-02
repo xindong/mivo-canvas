@@ -7,7 +7,7 @@ import {
   type SnapGuide,
 } from './canvasGeometry'
 
-export type RuntimeCanvasTool = 'select' | 'hand' | 'text' | 'frame' | 'markup'
+export type RuntimeCanvasTool = 'select' | 'hand' | 'text' | 'frame' | 'markup' | 'stamp'
 
 export type Viewport = {
   x: number
@@ -106,6 +106,7 @@ export const runtimeToolFor = (activeTool: ToolId, temporaryTool?: RuntimeCanvas
   if (temporaryTool) return temporaryTool
   if (activeTool === 'text') return 'text'
   if (activeTool === 'frame') return 'frame'
+  if (activeTool === 'stamp') return 'stamp'
   if (activeTool.startsWith('markup-')) return 'markup'
   return activeTool === 'hand' ? 'hand' : 'select'
 }
@@ -400,9 +401,14 @@ export const resizeNodeTransform = (
   clientX: number,
   clientY: number,
   viewportScale: number,
+  options?: { centered?: boolean },
 ) => {
-  const dx = (clientX - state.startClientX) / viewportScale
-  const dy = (clientY - state.startClientY) / viewportScale
+  const centered = Boolean(options?.centered)
+  // Centered (Alt) resize doubles the pointer delta so the dragged corner
+  // tracks the cursor while the opposite corner mirrors around the center.
+  const deltaScale = centered ? 2 : 1
+  const dx = ((clientX - state.startClientX) / viewportScale) * deltaScale
+  const dy = ((clientY - state.startClientY) / viewportScale) * deltaScale
   const east = state.corner.endsWith('e')
   const south = state.corner.startsWith('s')
 
@@ -413,6 +419,17 @@ export const resizeNodeTransform = (
     const minHeight = node.type === 'markup' ? minMarkupHeight : minSectionHeight
     const nextWidth = Math.max(minWidth, nextWidthRaw)
     const nextHeight = Math.max(minHeight, nextHeightRaw)
+
+    if (centered) {
+      return {
+        x: state.startX + (state.startWidth - nextWidth) / 2,
+        y: state.startY + (state.startHeight - nextHeight) / 2,
+        width: nextWidth,
+        height: nextHeight,
+        guides: [],
+      }
+    }
+
     const nextX = east ? state.startX : state.startX + state.startWidth - nextWidth
     const nextY = south ? state.startY : state.startY + state.startHeight - nextHeight
 
@@ -441,6 +458,17 @@ export const resizeNodeTransform = (
       : widthFromY
   const nextWidth = Math.min(maxNodeWidth, Math.max(minNodeWidth, nextWidthRaw))
   const nextHeight = nextWidth / state.aspectRatio
+
+  if (centered) {
+    return {
+      x: state.startX + (state.startWidth - nextWidth) / 2,
+      y: state.startY + (state.startHeight - nextHeight) / 2,
+      width: nextWidth,
+      height: nextHeight,
+      guides: [],
+    }
+  }
+
   const nextX = east ? state.startX : state.startX + state.startWidth - nextWidth
   const nextY = south ? state.startY : state.startY + state.startHeight - nextHeight
 
@@ -460,9 +488,12 @@ export const resizeGroupSelection = (
   clientX: number,
   clientY: number,
   viewportScale: number,
+  options?: { centered?: boolean },
 ) => {
-  const dx = (clientX - groupResize.startClientX) / viewportScale
-  const dy = (clientY - groupResize.startClientY) / viewportScale
+  const centered = Boolean(options?.centered)
+  const deltaScale = centered ? 2 : 1
+  const dx = ((clientX - groupResize.startClientX) / viewportScale) * deltaScale
+  const dy = ((clientY - groupResize.startClientY) / viewportScale) * deltaScale
   const east = groupResize.corner.endsWith('e')
   const south = groupResize.corner.startsWith('s')
   const { startBounds } = groupResize
@@ -476,8 +507,16 @@ export const resizeGroupSelection = (
   const nextScale = Math.max(groupResize.minScale, rawWidth / Math.max(startBounds.width, 1))
   const nextWidth = startBounds.width * nextScale
   const nextHeight = startBounds.height * nextScale
-  const nextX = east ? startBounds.x : startBounds.x + startBounds.width - nextWidth
-  const nextY = south ? startBounds.y : startBounds.y + startBounds.height - nextHeight
+  const nextX = centered
+    ? startBounds.x + (startBounds.width - nextWidth) / 2
+    : east
+      ? startBounds.x
+      : startBounds.x + startBounds.width - nextWidth
+  const nextY = centered
+    ? startBounds.y + (startBounds.height - nextHeight) / 2
+    : south
+      ? startBounds.y
+      : startBounds.y + startBounds.height - nextHeight
 
   return {
     bounds: {

@@ -10,6 +10,7 @@ import type {
   MivoCanvasSnapshot,
   NodeStatus,
 } from '../types/mivoCanvas'
+import { normalizeCanvasSnapshotV2 } from '../model/canvasSnapshotModel'
 import type { SerializedCanvasAsset } from './assetStorage'
 
 const nodeStatuses = new Set<NodeStatus>(['ready', 'generating', 'failed', 'queued'])
@@ -47,7 +48,8 @@ const isMarkupKind = (value: unknown) =>
   value === 'rect' ||
   value === 'ellipse' ||
   value === 'brush' ||
-  value === 'note'
+  value === 'note' ||
+  value === 'stamp'
 const isMarkupStrokeStyle = (value: unknown) => value === undefined || value === 'solid' || value === 'dashed'
 const isMarkupPointArray = (value: unknown) =>
   value === undefined ||
@@ -56,7 +58,8 @@ const isMarkupPointArray = (value: unknown) =>
       (point) =>
         isRecord(point) &&
         typeof point.x === 'number' &&
-        typeof point.y === 'number',
+        typeof point.y === 'number' &&
+        (point.pressure === undefined || typeof point.pressure === 'number'),
     ))
 
 const isImageCrop = (value: unknown) => {
@@ -149,6 +152,10 @@ const isCanvasNode = (value: unknown): value is MivoCanvasNode => {
   const markupFieldsValid =
     value.type !== 'markup' ||
     (isMarkupKind(value.markupKind) &&
+      (value.markupBrushKind === undefined ||
+        value.markupBrushKind === 'marker' ||
+        value.markupBrushKind === 'highlighter') &&
+      (value.markupStampKind === undefined || typeof value.markupStampKind === 'string') &&
       isMarkupPointArray(value.markupPoints) &&
       (value.markupStrokeColor === undefined || typeof value.markupStrokeColor === 'string') &&
       (value.markupFillColor === undefined || typeof value.markupFillColor === 'string') &&
@@ -242,7 +249,7 @@ const validateSnapshot = (parsed: unknown) => {
     return { ok: false as const, message: '快照内容必须是对象。' }
   }
 
-  if (parsed.version !== 1) {
+  if (parsed.version !== 2) {
     return { ok: false as const, message: '暂不支持这个快照版本。' }
   }
 
@@ -272,10 +279,7 @@ const validateSnapshot = (parsed: unknown) => {
 
   return {
     ok: true as const,
-    snapshot: {
-      ...(parsed as MivoCanvasSnapshot),
-      edges: (parsed.edges as CanvasEdge[] | undefined) || [],
-    },
+    snapshot: normalizeCanvasSnapshotV2(parsed as MivoCanvasSnapshot),
   }
 }
 

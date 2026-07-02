@@ -12,7 +12,9 @@ import { ProjectSidebar } from './app/ProjectSidebar'
 import { ProjectSidebarControls } from './app/ProjectSidebarControls'
 import { TaskQueue } from './app/TaskQueue'
 import { TopBar } from './app/TopBar'
+import { ToastViewport } from './app/ToastViewport'
 import { useCanvasStore } from './store/canvasStore'
+import { debugLogger, installConsoleCapture } from './store/debugLogStore'
 import type { WorkspaceView } from './app/ProjectSidebar'
 
 const SIDEBAR_PINNING_MS = 300
@@ -23,6 +25,10 @@ type ProjectSidebarState = 'open' | 'closed' | 'closing' | 'peeking' | 'peekClos
 
 function App() {
   const sceneId = useCanvasStore((state) => state.sceneId)
+  const canvases = useCanvasStore((state) => state.canvases)
+  const nodes = useCanvasStore((state) => state.nodes)
+  const activeTool = useCanvasStore((state) => state.activeTool)
+  const selectedNodeIds = useCanvasStore((state) => state.selectedNodeIds)
   const [projectSidebarState, setProjectSidebarState] = useState<ProjectSidebarState>('open')
   const [projectSidebarHoverLocked, setProjectSidebarHoverLocked] = useState(false)
   const [aiPanelOpen, setAiPanelOpen] = useState(true)
@@ -40,6 +46,8 @@ function App() {
   const projectSidebarPeek = projectSidebarState === 'peeking' || projectSidebarState === 'peekClosing'
   const projectSidebarClosing = projectSidebarState === 'closing' || projectSidebarState === 'peekClosing'
   const projectSidebarPinning = projectSidebarState === 'pinning'
+  const canvasTitle = canvases[sceneId]?.title || sceneId
+  const visibleNodeCount = nodes.filter((node) => !node.hidden).length
 
   const clearProjectSidebarTimer = useCallback(() => {
     if (projectSidebarTimerRef.current) {
@@ -151,6 +159,27 @@ function App() {
   }, [clearProjectSidebarTimer, projectSidebarState])
 
   useEffect(() => () => clearProjectSidebarTimer(), [clearProjectSidebarTimer])
+
+  useEffect(() => {
+    installConsoleCapture()
+    debugLogger.log('App', 'App ready')
+  }, [])
+
+  useEffect(() => {
+    debugLogger.log('Canvas', `Canvas loaded: ${canvasTitle}`)
+  }, [canvasTitle])
+
+  useEffect(() => {
+    debugLogger.log('Canvas', `Tool changed: ${activeTool}`)
+  }, [activeTool])
+
+  useEffect(() => {
+    debugLogger.log('Canvas', `Selection changed: ${selectedNodeIds.length} selected`)
+  }, [selectedNodeIds.length])
+
+  useEffect(() => {
+    debugLogger.log('Canvas', `Node count changed: ${visibleNodeCount} visible`)
+  }, [visibleNodeCount])
 
   useEffect(() => {
     if (projectSidebarState !== 'peeking') return
@@ -269,6 +298,7 @@ function App() {
           </div>
         </div>
       ) : null}
+      <ToastViewport />
     </main>
   )
 }

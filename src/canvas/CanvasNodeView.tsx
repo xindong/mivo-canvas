@@ -2,10 +2,18 @@ import { useCallback, useEffect, useRef, useState, type CSSProperties } from 're
 import { MarkdownPreview } from '../lib/MarkdownPreview'
 import { useResolvedAssetUrl } from '../lib/useResolvedAssetUrl'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
+import { brushOutlinePathFor } from './brushGeometry'
+import {
+  frameRenderStyleFor,
+  markupRenderStyleFor,
+  nodeRenderBoxFor,
+  textRenderStyleFor,
+} from './canvasRenderAdapter'
 import type { ResizeCorner } from './canvasGeometry'
 import { ImageMaskEditOverlay } from './ImageMaskEditOverlay'
 import type { ImageMaskSubmitPayload } from './imageMaskGeometry'
 import { renderKindForNode } from './nodeTypes/canvasNodeRegistry'
+import { stampEmojiFor } from './stampDefs'
 import { defaultTextAlign, defaultTextColor, defaultTextFontSize, defaultTextWeight } from './textGeometry'
 import type { TextResizeEdge } from './useCanvasInteractionController'
 
@@ -289,16 +297,29 @@ function MarkupNodeView({
   onFinishTextEdit: (nodeId: string) => void
 }) {
   const kind = node.markupKind || 'rect'
-  const strokeWidth = node.markupStrokeWidth || 3
-  const stroke = node.markupStrokeColor || '#6957e8'
-  const fill = node.markupFillColor || 'rgba(105, 87, 232, 0.08)'
-  const strokeDasharray = node.markupStrokeStyle === 'dashed' ? `${strokeWidth * 2.2} ${strokeWidth * 1.6}` : undefined
+  const renderStyle = markupRenderStyleFor(node)
+  const strokeWidth = renderStyle.strokeWidth
+  const stroke = renderStyle.stroke
+  const fill = renderStyle.fill
+  const strokeDasharray = renderStyle.strokeStyle === 'dashed' ? `${strokeWidth * 2.2} ${strokeWidth * 1.6}` : undefined
   const points = node.markupPoints?.length ? node.markupPoints : defaultMarkupPointsFor(node)
   const markerId = `markup-arrow-${node.id}`
   const lineLabelActive = isLineMarkup(node) && (editing || Boolean(node.text?.trim()))
   const lineSegments = lineSegmentsWithLabelGap(node, points, lineLabelActive)
   const showStartArrow = Boolean(node.markupStartArrow)
   const showEndArrow = node.markupEndArrow ?? kind === 'arrow'
+
+  if (kind === 'stamp') {
+    return (
+      <div
+        className="dom-markup-stamp"
+        style={{ fontSize: Math.max(12, Math.min(node.width, node.height) * 0.78) }}
+        aria-label={node.title}
+      >
+        {stampEmojiFor(node.markupStampKind)}
+      </div>
+    )
+  }
 
   if (kind === 'note') {
     return (
@@ -359,6 +380,7 @@ function MarkupNodeView({
             fill={fill}
             stroke={stroke}
             strokeWidth={strokeWidth}
+            strokeOpacity={renderStyle.strokeOpacity}
             strokeDasharray={strokeDasharray}
           />
         ) : kind === 'ellipse' ? (
@@ -370,18 +392,30 @@ function MarkupNodeView({
             fill={fill}
             stroke={stroke}
             strokeWidth={strokeWidth}
+            strokeOpacity={renderStyle.strokeOpacity}
             strokeDasharray={strokeDasharray}
           />
         ) : kind === 'brush' ? (
-          <polyline
-            points={points.map((point) => `${point.x},${point.y}`).join(' ')}
-            fill="none"
-            stroke={stroke}
-            strokeWidth={strokeWidth}
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            strokeDasharray={strokeDasharray}
-          />
+          renderStyle.strokeStyle === 'dashed' ? (
+            // Filled freehand outlines cannot express dashes; dashed brush keeps the legacy polyline.
+            <polyline
+              points={points.map((point) => `${point.x},${point.y}`).join(' ')}
+              fill="none"
+              stroke={stroke}
+              strokeWidth={strokeWidth}
+              strokeOpacity={renderStyle.strokeOpacity}
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeDasharray={strokeDasharray}
+            />
+          ) : (
+            <path
+              d={brushOutlinePathFor(points, strokeWidth, node.markupBrushKind || 'marker')}
+              fill={stroke}
+              fillOpacity={renderStyle.strokeOpacity}
+              stroke="none"
+            />
+          )
         ) : (
           <>
             <line
@@ -408,6 +442,7 @@ function MarkupNodeView({
                   y2={segment.end.y}
                   stroke={stroke}
                   strokeWidth={strokeWidth}
+                  strokeOpacity={renderStyle.strokeOpacity}
                   strokeLinecap={hasStartMarker || hasEndMarker ? 'butt' : 'round'}
                   strokeDasharray={strokeDasharray}
                   markerStart={hasStartMarker ? `url(#${markerId})` : undefined}
@@ -500,9 +535,7 @@ export function CanvasNodeView({
       }
     : undefined
   const nodeStyle: CSSProperties & { '--node-selection-stroke': string } = {
-    width: node.width,
-    height: node.height,
-    transform: `translate(${node.x}px, ${node.y}px)`,
+    ...nodeRenderBoxFor(node),
     '--node-selection-stroke': `${selectionStrokeWidth}px`,
   }
   const nodeClassName = [
@@ -603,14 +636,7 @@ export function CanvasNodeView({
       {frameNode ? (
         <div
           className="dom-frame-node"
-          style={
-            {
-              '--section-fill-color': node.sectionFillColor || '#ffffff',
-              '--section-border-color': node.sectionBorderColor || node.frameColor || '#ff8a00',
-              '--section-border-width': `${node.sectionBorderWidth ?? 2}px`,
-              '--section-border-style': node.sectionBorderStyle || 'dashed',
-            } as CSSProperties
-          }
+          style={frameRenderStyleFor(node)}
         >
           {node.sectionTitleVisible !== false ? <div className="dom-frame-title">{node.title}</div> : null}
         </div>
@@ -635,12 +661,7 @@ export function CanvasNodeView({
         ) : (
           <div
             className={annotationNode ? 'dom-text-node dom-annotation-node' : 'dom-text-node'}
-            style={{
-              fontSize: node.fontSize || defaultTextFontSize,
-              color: node.textColor || defaultTextColor,
-              fontWeight: node.fontWeight || defaultTextWeight,
-              textAlign: node.textAlign || defaultTextAlign,
-            }}
+            style={textRenderStyleFor(node)}
           >
             {node.text}
           </div>
