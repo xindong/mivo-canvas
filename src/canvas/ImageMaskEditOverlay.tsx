@@ -38,6 +38,16 @@ type DraftRegion =
   | { type: 'box'; start: ImageMaskPoint; current: ImageMaskPoint }
   | { type: 'brush'; points: ImageMaskPoint[] }
 
+type PointAnchor = {
+  center: ImageMaskPoint
+  radius: number
+}
+
+type MaskEditSnapshot = {
+  regions: ImageMaskRegion[]
+  pointAnchors: PointAnchor[]
+}
+
 type FloatingControlsLayout = {
   left: number
   width: number
@@ -84,16 +94,6 @@ const regionPath = (
   naturalSize: { width: number; height: number },
   imageCrop: MivoCanvasNode['imageCrop'],
 ) => {
-  if (region.type === 'point') {
-    const center = imagePixelToNodePoint(region.center, displayRect, naturalSize, imageCrop)
-    return {
-      kind: 'circle' as const,
-      cx: center.x,
-      cy: center.y,
-      r: radiusToNode(region.center, region.radius, displayRect, naturalSize, imageCrop),
-    }
-  }
-
   if (region.type === 'box') {
     const start = imagePixelToNodePoint({ x: region.x, y: region.y }, displayRect, naturalSize, imageCrop)
     const end = imagePixelToNodePoint(
@@ -118,6 +118,20 @@ const regionPath = (
   }
 }
 
+const pointAnchorPath = (
+  anchor: PointAnchor,
+  displayRect: { x: number; y: number; width: number; height: number },
+  naturalSize: { width: number; height: number },
+  imageCrop: MivoCanvasNode['imageCrop'],
+) => {
+  const center = imagePixelToNodePoint(anchor.center, displayRect, naturalSize, imageCrop)
+  return {
+    cx: center.x,
+    cy: center.y,
+    r: radiusToNode(anchor.center, anchor.radius, displayRect, naturalSize, imageCrop),
+  }
+}
+
 export function ImageMaskEditOverlay({
   node,
   naturalSize,
@@ -130,18 +144,21 @@ export function ImageMaskEditOverlay({
   const [tool, setTool] = useState<ImageMaskTool>('box')
   const [prompt, setPrompt] = useState('')
   const [regions, setRegions] = useState<ImageMaskRegion[]>([])
-  const [past, setPast] = useState<ImageMaskRegion[][]>([])
-  const [future, setFuture] = useState<ImageMaskRegion[][]>([])
+  const [pointAnchors, setPointAnchors] = useState<PointAnchor[]>([])
+  const [past, setPast] = useState<MaskEditSnapshot[]>([])
+  const [future, setFuture] = useState<MaskEditSnapshot[]>([])
   const [brushSizePx, setBrushSizePx] = useState(48)
   const [draft, setDraft] = useState<DraftRegion>()
   const [floatingHost, setFloatingHost] = useState<HTMLElement | null>(null)
   const [floatingLayout, setFloatingLayout] = useState<FloatingControlsLayout>()
   const [statusError, setStatusError] = useState('')
   const regionsRef = useRef<ImageMaskRegion[]>([])
+  const pointAnchorsRef = useRef<PointAnchor[]>([])
   const draftRef = useRef<DraftRegion | undefined>(undefined)
   const removeWindowDragListenersRef = useRef<() => void>(() => undefined)
   const promptReady = Boolean(prompt.trim())
-  const maskEditHint = !regions.length
+  const hasAnyAnchor = regions.length > 0 || pointAnchors.length > 0
+  const maskEditHint = !hasAnyAnchor
     ? '先在图片上点选、框选或涂抹要修改的区域。'
     : !promptReady
       ? '输入修改描述后再提交。'
@@ -213,13 +230,35 @@ export function ImageMaskEditOverlay({
     })
   }, [])
 
-  const commitRegions = (nextRegions: ImageMaskRegion[]) => {
-    const previousRegions = regionsRef.current
+  const currentSnapshot = (): MaskEditSnapshot => ({
+    regions: regionsRef.current,
+    pointAnchors: pointAnchorsRef.current,
+  })
+
+  const applySnapshot = (snapshot: MaskEditSnapshot) => {
+    regionsRef.current = snapshot.regions
+    pointAnchorsRef.current = snapshot.pointAnchors
+    setRegions(snapshot.regions)
+    setPointAnchors(snapshot.pointAnchors)
+  }
+
+  const commitMaskState = (nextRegions: ImageMaskRegion[], nextPointAnchors: PointAnchor[]) => {
+    const previous = currentSnapshot()
     regionsRef.current = nextRegions
-    setPast((current) => [...current, previousRegions])
+    pointAnchorsRef.current = nextPointAnchors
+    setPast((current) => [...current, previous])
     setRegions(nextRegions)
+    setPointAnchors(nextPointAnchors)
     setFuture([])
     setStatusError('')
+  }
+
+  const commitRegions = (nextRegions: ImageMaskRegion[]) => {
+    commitMaskState(nextRegions, pointAnchorsRef.current)
+  }
+
+  const commitPointAnchor = (anchor: PointAnchor) => {
+    commitMaskState(regionsRef.current, [...pointAnchorsRef.current, anchor])
   }
 
   useEffect(() => () => removeWindowDragListenersRef.current(), [])
@@ -344,7 +383,7 @@ export function ImageMaskEditOverlay({
 
     event.currentTarget.setPointerCapture(event.pointerId)
     if (tool === 'point') {
-      commitRegions([...regionsRef.current, { type: 'point', center: pixel, radius: brushSizePx }])
+      commitPointAnchor({ center: pixel, radius: brushSizePx })
       return
     }
     if (tool === 'box') {
@@ -359,38 +398,38 @@ export function ImageMaskEditOverlay({
   const undo = () => {
     const previous = past.at(-1)
     if (!previous) return
-    setFuture((current) => [regions, ...current])
-    regionsRef.current = previous
-    setRegions(previous)
+    setFuture((current) => [currentSnapshot(), ...current])
+    applySnapshot(previous)
     setPast((current) => current.slice(0, -1))
   }
 
   const redo = () => {
     const next = future[0]
     if (!next) return
-    setPast((current) => [...current, regions])
-    regionsRef.current = next
-    setRegions(next)
+    setPast((current) => [...current, currentSnapshot()])
+    applySnapshot(next)
     setFuture((current) => current.slice(1))
   }
 
   const clear = () => {
-    if (!regionsRef.current.length) return
-    commitRegions([])
+    if (!regionsRef.current.length && !pointAnchorsRef.current.length) return
+    commitMaskState([], [])
   }
 
   const submit = async () => {
     const trimmedPrompt = prompt.trim()
-    if (!trimmedPrompt || !regions.length || submitting) return
+    if (!trimmedPrompt || !hasAnyAnchor || submitting) return
 
     try {
       setStatusError('')
       validateMaskCanvasSize(naturalSize)
-      const mask = await buildEditMaskBlob({ naturalSize, imageCrop: node.imageCrop, regions })
+      const mask = regions.length
+        ? await buildEditMaskBlob({ naturalSize, imageCrop: node.imageCrop, regions })
+        : undefined
       await onSubmit({
         prompt: trimmedPrompt,
         mask,
-        maskBounds: boundsForRegions(regions, naturalSize),
+        maskBounds: regions.length ? boundsForRegions(regions, naturalSize) : undefined,
         sourceSize: naturalSize,
       })
     } catch (error) {
@@ -457,7 +496,7 @@ export function ImageMaskEditOverlay({
             <button type="button" onClick={redo} disabled={!future.length || submitting} aria-label="Redo mask region">
               <Redo2 size={14} />
             </button>
-            <button type="button" onClick={clear} disabled={!regions.length || submitting} aria-label="Clear mask regions">
+            <button type="button" onClick={clear} disabled={!hasAnyAnchor || submitting} aria-label="Clear mask regions">
               <Trash2 size={14} />
             </button>
             <button type="button" onClick={onCancel} aria-label={submitting ? 'Cancel mask request' : 'Cancel mask edit'}>
@@ -479,7 +518,7 @@ export function ImageMaskEditOverlay({
           />
           {maskEditHint ? <div className="image-mask-edit-hint">{maskEditHint}</div> : null}
           {statusError ? <div className="image-mask-edit-error">{statusError}</div> : null}
-          <button type="button" onClick={() => void submit()} disabled={submitting || !promptReady || !regions.length}>
+          <button type="button" onClick={() => void submit()} disabled={submitting || !promptReady || !hasAnyAnchor}>
             <Sparkles size={15} />
             {submitting ? '重绘中...' : '局部重绘'}
           </button>
@@ -492,7 +531,9 @@ export function ImageMaskEditOverlay({
       <div
         className="image-mask-edit-overlay"
         data-canvas-ui="true"
-        data-region-count={regions.length}
+        data-region-count={regions.length + pointAnchors.length}
+        data-mask-region-count={regions.length}
+        data-point-anchor-count={pointAnchors.length}
         onPointerDown={(event) => event.stopPropagation()}
       >
         <div
@@ -509,11 +550,20 @@ export function ImageMaskEditOverlay({
               height={displayRect.height}
               className="image-mask-edit-display-rect"
             />
+            {pointAnchors.map((anchor, index) => {
+              const shape = pointAnchorPath(anchor, displayRect, naturalSize, node.imageCrop)
+              return (
+                <circle
+                  key={`point-anchor-${index}`}
+                  className="image-mask-edit-region point-anchor"
+                  cx={shape.cx}
+                  cy={shape.cy}
+                  r={shape.r}
+                />
+              )
+            })}
             {renderedRegions.map((region, index) => {
               const shape = regionPath(region, displayRect, naturalSize, node.imageCrop)
-              if (shape.kind === 'circle') {
-                return <circle key={index} className="image-mask-edit-region" cx={shape.cx} cy={shape.cy} r={shape.r} />
-              }
               if (shape.kind === 'rect') {
                 return (
                   <rect

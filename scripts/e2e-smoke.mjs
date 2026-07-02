@@ -3669,8 +3669,18 @@ try {
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }) })
   })
   // Deselect canvas nodes so generate (not edit) is called
-  await page.locator('.canvas-shell').click({ position: { x: 10, y: 10 } })
-  await page.waitForTimeout(200)
+  await page.evaluate(async (moduleSpec) => {
+    const { useCanvasStore } = await import(moduleSpec)
+    useCanvasStore.getState().selectNode(undefined)
+  }, await canvasStoreSpec())
+  await page.waitForFunction(
+    async (moduleSpec) => {
+      const { useCanvasStore } = await import(moduleSpec)
+      return !useCanvasStore.getState().selectedNodeId
+    },
+    await canvasStoreSpec(),
+  )
+  await page.waitForTimeout(100)
   await page.evaluate(async () => {
     const spec = performance.getEntriesByType('resource').map(r => r.name).find(n => n.includes('chatStore.ts'))
     if (!spec) return
@@ -4125,6 +4135,8 @@ try {
     await drawMaskRegion(toolId)
     await page.waitForFunction(() => Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0') > 0)
     const regionCount = Number(await page.locator('.image-mask-edit-overlay').getAttribute('data-region-count'))
+    const maskRegionCount = Number(await page.locator('.image-mask-edit-overlay').getAttribute('data-mask-region-count'))
+    const pointAnchorCount = Number(await page.locator('.image-mask-edit-overlay').getAttribute('data-point-anchor-count'))
     const before = await readCanvasState()
     const beforeSourceEditEdges = before.edges.filter((edge) => edge.from === sourceNodeId && edge.type === 'edit').length
     const editRequestCountBefore = mivoEditRequests.length
@@ -4146,12 +4158,25 @@ try {
     const editEdges = after.edges.filter((edge) => edge.from === sourceNodeId && edge.type === 'edit')
     const resultNode = after.nodes.find((node) => editEdges.some((edge) => edge.to === node.id))
     const latestRequest = mivoEditRequests.at(-1)
+    const expectsMask = toolId !== 'point'
 
     if (mivoEditRequests.length !== editRequestCountBefore + 1) {
       throw new Error(`${sourceLabel}/${toolId} should issue exactly one edit request`)
     }
-    if (!latestRequest?.fileKeys.includes('image:1') || !latestRequest.fileKeys.includes('mask:1')) {
-      throw new Error(`${sourceLabel}/${toolId} edit request should include image and mask: ${JSON.stringify(latestRequest)}`)
+    if (toolId === 'point' && (maskRegionCount !== 0 || pointAnchorCount < 1)) {
+      throw new Error(`${sourceLabel}/${toolId} should keep point anchors out of mask regions: ${JSON.stringify({ maskRegionCount, pointAnchorCount })}`)
+    }
+    if (toolId !== 'point' && maskRegionCount < 1) {
+      throw new Error(`${sourceLabel}/${toolId} should create at least one mask region`)
+    }
+    if (!latestRequest?.fileKeys.includes('image:1')) {
+      throw new Error(`${sourceLabel}/${toolId} edit request should include image: ${JSON.stringify(latestRequest)}`)
+    }
+    if (expectsMask && !latestRequest.fileKeys.includes('mask:1')) {
+      throw new Error(`${sourceLabel}/${toolId} edit request should include mask: ${JSON.stringify(latestRequest)}`)
+    }
+    if (!expectsMask && latestRequest.fileKeys.includes('mask:1')) {
+      throw new Error(`${sourceLabel}/${toolId} point-only edit request should not include mask: ${JSON.stringify(latestRequest)}`)
     }
     if (!after.nodes.some((node) => node.id === sourceNodeId && node.type === 'image')) {
       throw new Error(`${sourceLabel}/${toolId} should keep the source image`)
@@ -4167,6 +4192,8 @@ try {
       source: sourceLabel,
       tool: toolId,
       regionCount,
+      maskRegionCount,
+      pointAnchorCount,
       imagesBefore: imageCountFor(before),
       imagesAfter: imageCountFor(after),
       editEdgesFromSource: editEdges.length,

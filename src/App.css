@@ -4068,6 +4068,11 @@ button:disabled {
   vector-effect: non-scaling-stroke;
 }
 
+.image-mask-edit-region.point-anchor {
+  fill: rgba(86, 109, 137, 0.18);
+  stroke-dasharray: 5 4;
+}
+
 .image-mask-edit-region.brush {
   fill: none;
   stroke: rgba(47, 92, 84, 0.72);
