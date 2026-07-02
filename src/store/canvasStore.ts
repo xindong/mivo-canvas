@@ -1529,9 +1529,13 @@ export const useCanvasStore = create<CanvasState>()(
 
           const start = position || { x: -64 + state.nodes.length * 16, y: -64 + state.nodes.length * 16 }
           const columns = Math.max(1, Math.min(3, Math.ceil(Math.sqrt(state.clipboardAssets.length))))
+          const gap = 32
+          const displaySizes = state.clipboardAssets.map((asset) => clipboardAssetDisplaySize(asset))
+          const cellWidth = Math.max(...displaySizes.map((size) => size.width)) + gap
+          const cellHeight = Math.max(...displaySizes.map((size) => size.height)) + gap
           const createdAt = Date.now()
           const nodes = state.clipboardAssets.map((asset, index) => {
-            const displaySize = clipboardAssetDisplaySize(asset)
+            const displaySize = displaySizes[index]
             const column = index % columns
             const row = Math.floor(index / columns)
             const id = createNodeId('asset')
@@ -1540,8 +1544,8 @@ export const useCanvasStore = create<CanvasState>()(
               id,
               type: 'image',
               title: clipboardAssetTitle(asset),
-              x: Math.round(start.x + column * 36),
-              y: Math.round(start.y + row * 36),
+              x: Math.round(start.x + column * cellWidth),
+              y: Math.round(start.y + row * cellHeight),
               width: displaySize.width,
               height: displaySize.height,
               assetUrl: asset.url,

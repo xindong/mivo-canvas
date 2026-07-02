@@ -13,6 +13,7 @@ const mivoQualitySet = new Set(['low', 'medium', 'high'])
 const mivoImageRequestMaxBytes = 40 * 1024 * 1024
 const mivoJsonRequestMaxBytes = 1024 * 1024
 const mivoUpstreamTimeoutMs = 110_000
+const mivoEditUpstreamTimeoutMs = 180_000
 const mivoImageSizeMap = {
   '1:1': {
     low: '1024x1024',
@@ -57,13 +58,13 @@ class UpstreamRequestTimeoutError extends Error {}
 
 const isAbortError = (error: unknown) => error instanceof Error && error.name === 'AbortError'
 
-const fetchUpstreamWithTimeout = async (url: string, init: RequestInit) => {
+const fetchUpstreamWithTimeout = async (url: string, init: RequestInit, timeoutMs = mivoUpstreamTimeoutMs) => {
   const controller = new AbortController()
   let timedOut = false
   const timeoutId = setTimeout(() => {
     timedOut = true
     controller.abort()
-  }, mivoUpstreamTimeoutMs)
+  }, timeoutMs)
 
   try {
     return await fetch(url, {
@@ -393,13 +394,17 @@ const proxyMivoEdit = async (
     formData.set('size', imageSizeFor(firstMultipartField(fields, 'imgRatio'), quality))
     formData.set('quality', quality)
 
-    const upstreamResponse = await fetchUpstreamWithTimeout(`${mivoImageApiBase}/edits`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${readImageApiKey(imageApiKey)}`,
+    const upstreamResponse = await fetchUpstreamWithTimeout(
+      `${mivoImageApiBase}/edits`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${readImageApiKey(imageApiKey)}`,
+        },
+        body: formData,
       },
-      body: formData,
-    })
+      mivoEditUpstreamTimeoutMs,
+    )
 
     if (!upstreamResponse.ok) {
       sendMivoJson(response, upstreamResponse.status, { error: await readUpstreamError(upstreamResponse) })

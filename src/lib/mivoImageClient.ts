@@ -4,17 +4,18 @@ import { readImportedAssetFile } from './assetStorage'
 
 const defaultModel = 'gpt-image-2'
 const mivoRequestTimeoutMs = 110_000
+const mivoEditRequestTimeoutMs = 185_000
 
 const isAbortError = (error: unknown) => error instanceof Error && error.name === 'AbortError'
 
-const fetchMivoWithTimeout = async (input: RequestInfo | URL, init: RequestInit = {}) => {
+const fetchMivoWithTimeout = async (input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = mivoRequestTimeoutMs) => {
   const controller = new AbortController()
   let timedOut = false
   const parentSignal = init.signal
   const timeoutId = window.setTimeout(() => {
     timedOut = true
     controller.abort()
-  }, mivoRequestTimeoutMs)
+  }, timeoutMs)
   const abortFromParent = () => controller.abort()
 
   if (parentSignal?.aborted) {
@@ -94,11 +95,15 @@ export const editMivoImage = async (request: MivoEditRequest) => {
   formData.set('quality', request.quality || 'medium')
   formData.set('model', request.model || defaultModel)
 
-  const response = await fetchMivoWithTimeout('/api/mivo/edit', {
-    method: 'POST',
-    signal: request.signal,
-    body: formData,
-  })
+  const response = await fetchMivoWithTimeout(
+    '/api/mivo/edit',
+    {
+      method: 'POST',
+      signal: request.signal,
+      body: formData,
+    },
+    mivoEditRequestTimeoutMs,
+  )
 
   if (!response.ok) throw new Error(await readMivoError(response))
   return validateMivoImageResponse(await response.json())

@@ -32,6 +32,8 @@ function App() {
   const [maskCancelRequestId, setMaskCancelRequestId] = useState(0)
   const projectSidebarTimerRef = useRef<number | undefined>(undefined)
   const externalAssetDropRef = useRef<ExternalAssetDropHandler | undefined>(undefined)
+  const aiPanelOpenRef = useRef(aiPanelOpen)
+  const aiPanelBeforeMaskEditRef = useRef<boolean | undefined>(undefined)
   const isCanvasWorkspace = workspaceView === 'canvas' || workspaceView === 'assets'
   const detailsOpen = isCanvasWorkspace && detailsSceneId === sceneId
   const projectSidebarOpen = projectSidebarState === 'open' || projectSidebarState === 'pinning'
@@ -60,6 +62,24 @@ function App() {
 
   const registerExternalAssetDrop = useCallback((handler?: ExternalAssetDropHandler) => {
     externalAssetDropRef.current = handler
+  }, [])
+
+  useEffect(() => {
+    aiPanelOpenRef.current = aiPanelOpen
+  }, [aiPanelOpen])
+
+  const handleMaskEditActiveChange = useCallback((active: boolean) => {
+    if (active) {
+      if (aiPanelBeforeMaskEditRef.current === undefined) {
+        aiPanelBeforeMaskEditRef.current = aiPanelOpenRef.current
+      }
+      setAiPanelOpen(false)
+      return
+    }
+
+    const shouldRestore = aiPanelBeforeMaskEditRef.current
+    aiPanelBeforeMaskEditRef.current = undefined
+    if (shouldRestore) setAiPanelOpen(true)
   }, [])
 
   const handleAssetDrawerDragOver = useCallback((event: ReactDragEvent<HTMLDivElement>) => {
@@ -200,6 +220,7 @@ function App() {
               onOpenDetails={() => setDetailsSceneId(sceneId)}
               onOpenGeneratePanel={openGeneratePanel}
               onRegisterExternalAssetDrop={registerExternalAssetDrop}
+              onMaskEditActiveChange={handleMaskEditActiveChange}
               maskCancelRequestId={maskCancelRequestId}
             />
             <AIToolPanel

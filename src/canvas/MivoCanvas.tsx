@@ -42,6 +42,7 @@ type MivoCanvasProps = {
   onOpenDetails?: () => void
   onOpenGeneratePanel?: () => void
   onRegisterExternalAssetDrop?: (handler?: ExternalAssetDropHandler) => void
+  onMaskEditActiveChange?: (active: boolean) => void
   maskCancelRequestId?: number
 }
 
@@ -109,6 +110,7 @@ export function MivoCanvas({
   onOpenDetails,
   onOpenGeneratePanel,
   onRegisterExternalAssetDrop,
+  onMaskEditActiveChange,
   maskCancelRequestId = 0,
 }: MivoCanvasProps) {
   const shellRef = useRef<HTMLElement | null>(null)
@@ -446,6 +448,15 @@ export function MivoCanvas({
     lastMaskCancelRequestIdRef.current = maskCancelRequestId
     cancelMaskEdit()
   }, [cancelMaskEdit, maskCancelRequestId])
+
+  useEffect(() => {
+    const active = Boolean(maskEditNodeId)
+    onMaskEditActiveChange?.(active)
+
+    return () => {
+      if (active) onMaskEditActiveChange?.(false)
+    }
+  }, [maskEditNodeId, onMaskEditActiveChange])
 
   useEffect(() => () => {
     maskEditAbortRef.current?.abort()
