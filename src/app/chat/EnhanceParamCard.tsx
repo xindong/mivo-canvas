@@ -3,6 +3,7 @@ import { useState } from 'react'
 import { useChatStore } from '../../store/chatStore'
 import type { ChatMessage } from '../../store/chatStore'
 import { RatioIcon } from './RatioPopover'
+import { qualityDisplayLabel } from './chatDisplayLabels'
 
 type EnhanceParamCardProps = {
   message: ChatMessage
@@ -63,7 +64,7 @@ export function EnhanceParamCard({ message }: EnhanceParamCardProps) {
               )}
               {enhance.quality && (
                 <span className="chat-chip chat-chip-quality">
-                  {enhance.quality}
+                  {qualityDisplayLabel(enhance.quality)}
                 </span>
               )}
             </div>

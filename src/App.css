@@ -5661,6 +5661,7 @@ button:disabled {
   background: var(--charcoal);
   color: #fffaf0;
   border-bottom-right-radius: 4px;
+  white-space: pre-wrap;
 }
 
 .chat-bubble-assistant {
@@ -6055,6 +6056,22 @@ button.chat-chip {
   flex-shrink: 0;
 }
 
+/* 交互控件统一 140ms 过渡（对齐画布 flyout 设计语言） */
+.chat-tool-btn,
+.chat-action-btn,
+.chat-send-btn,
+.chat-popover-tabs button,
+.chat-model-option,
+.chat-ratio-btn,
+.chat-quality-btn,
+.chat-notice-locate {
+  transition:
+    color 140ms ease,
+    background-color 140ms ease,
+    border-color 140ms ease,
+    box-shadow 140ms ease;
+}
+
 .chat-tool-btn span {
   max-width: 86px;
   overflow: hidden;
@@ -6144,6 +6161,18 @@ button.chat-chip {
   max-height: min(420px, 60vh);
   overflow-y: auto;
   color: var(--ink, #232323);
+  animation: chat-popover-in 140ms ease;
+}
+
+@keyframes chat-popover-in {
+  from {
+    opacity: 0;
+    transform: translateY(calc(-100% + 4px)) scale(0.99);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(-100%) scale(1);
+  }
 }
 
 .chat-popover-tabs {
