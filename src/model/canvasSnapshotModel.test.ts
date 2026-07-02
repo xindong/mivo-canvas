@@ -5,6 +5,7 @@ import { normalizeCanvasSnapshotV2 } from './canvasSnapshotModel'
 const currentSnapshot = (): MivoCanvasSnapshot => ({
   version: 2,
   sceneId: 'scene-1',
+  edges: [],
   nodes: [
     {
       id: 'image-1',

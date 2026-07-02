@@ -31,7 +31,7 @@ const fetchMivoWithTimeout = async (input: RequestInfo | URL, init: RequestInit 
     })
   } catch (error) {
     if (isAbortError(error)) {
-      throw new Error(timedOut ? '图片请求超时，请重试。' : '图片请求已取消。')
+      throw new Error(timedOut ? '图片请求超时，请重试。' : '图片请求已取消。', { cause: error })
     }
     throw error
   } finally {

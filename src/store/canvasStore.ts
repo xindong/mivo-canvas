@@ -811,11 +811,11 @@ const blobFromCommittedGenerationImage = (image: CommittedGenerationImage) => {
   const base64 = (dataUrlMatch?.[2] || raw).trim()
   if (!base64) throw new Error('Image service returned empty image data')
 
-  let binary = ''
+  let binary: string
   try {
     binary = atob(base64)
-  } catch {
-    throw new Error('Image service returned invalid image data')
+  } catch (error) {
+    throw new Error('Image service returned invalid image data', { cause: error })
   }
   if (!binary.length) throw new Error('Image service returned empty image data')
 

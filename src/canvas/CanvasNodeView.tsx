@@ -495,8 +495,16 @@ export function CanvasNodeView({
   onCancelMaskEdit,
 }: CanvasNodeViewProps) {
   const markdownDocumentRef = useRef<HTMLElement | null>(null)
-  const [naturalSize, setNaturalSize] = useState<{ width: number; height: number }>()
+  // Size is stored together with its source URL so a stale measurement simply stops
+  // applying when the asset changes, instead of being reset from an effect.
+  const [measuredNaturalSize, setMeasuredNaturalSize] = useState<{
+    url: string
+    width: number
+    height: number
+  }>()
   const resolvedAssetUrl = useResolvedAssetUrl(node.assetUrl)
+  const naturalSize =
+    measuredNaturalSize && measuredNaturalSize.url === resolvedAssetUrl ? measuredNaturalSize : undefined
   const renderKind = renderKindForNode(node)
   const textNode = renderKind === 'text' || renderKind === 'annotation'
   const frameNode = renderKind === 'section'
@@ -562,10 +570,6 @@ export function CanvasNodeView({
   ]
     .filter(Boolean)
     .join(' ')
-
-  useEffect(() => {
-    setNaturalSize(undefined)
-  }, [resolvedAssetUrl])
 
   useEffect(() => {
     if (!markdownNode || markdownPreviewMode) return undefined
@@ -730,7 +734,8 @@ export function CanvasNodeView({
               draggable={false}
               style={imageCropStyle}
               onLoad={(event) =>
-                setNaturalSize({
+                setMeasuredNaturalSize({
+                  url: resolvedAssetUrl,
                   width: event.currentTarget.naturalWidth,
                   height: event.currentTarget.naturalHeight,
                 })

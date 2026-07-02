@@ -212,13 +212,6 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
     () => (activeAssetSource === 'eagle' ? eagleAssets : activeAssetSource === 'local' ? localAssets : []),
     [activeAssetSource, eagleAssets, localAssets],
   )
-  const filteredAssets = useMemo(() => {
-    if (activeAssetSource === 'eagle') {
-      if (!selectedEagleTag) return activeAssets
-      return activeAssets.filter((asset) => asset.tags?.some((tag) => tagMatches(tag, selectedEagleTag)))
-    }
-    return activeAssets.filter((asset) => assetMatchesQuery(asset, query))
-  }, [activeAssetSource, activeAssets, query, selectedEagleTag])
   const flatEagleFolders = useMemo(() => flattenEagleFolders(eagleFolders), [eagleFolders])
   const fallbackEagleTags = useMemo<EagleTagItem[]>(() => {
     const tagNames = Array.from(new Set(eagleAssets.flatMap((asset) => asset.tags || [])))
@@ -247,6 +240,19 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
       .filter((tag) => tag.count > 0)
       .sort((left, right) => right.count - left.count || left.name.localeCompare(right.name))
   }, [eagleTagCounts, eagleTags, fallbackEagleTags])
+  // Derived instead of cleared-in-effect: a picked tag that vanished after reload simply stops applying.
+  const effectiveEagleTag = useMemo(() => {
+    if (!selectedEagleTag) return undefined
+    if (eagleLoadState !== 'ready') return selectedEagleTag
+    return activeEagleTags.some((tag) => tagMatches(tag.name, selectedEagleTag)) ? selectedEagleTag : undefined
+  }, [activeEagleTags, eagleLoadState, selectedEagleTag])
+  const filteredAssets = useMemo(() => {
+    if (activeAssetSource === 'eagle') {
+      if (!effectiveEagleTag) return activeAssets
+      return activeAssets.filter((asset) => asset.tags?.some((tag) => tagMatches(tag, effectiveEagleTag)))
+    }
+    return activeAssets.filter((asset) => assetMatchesQuery(asset, query))
+  }, [activeAssetSource, activeAssets, effectiveEagleTag, query])
   const selectedEagleFolder = useMemo(
     () => flatEagleFolders.find((folder) => folder.id === selectedEagleFolderId),
     [flatEagleFolders, selectedEagleFolderId],
@@ -449,26 +455,6 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
   }, [loadEagleAssets, loadEagleTags, loadLocalAssets, loadPinterestStatus])
 
   useEffect(() => {
-    setSelectedAssetIds((current) => {
-      const visibleIds = new Set(filteredAssets.map((asset) => asset.id))
-      const nextIds = current.filter((assetId) => visibleIds.has(assetId))
-      return nextIds.length === current.length ? current : nextIds
-    })
-  }, [filteredAssets])
-
-  useEffect(() => {
-    if (!selectedEagleTag || eagleLoadState !== 'ready') return
-    if (!activeEagleTags.some((tag) => tagMatches(tag.name, selectedEagleTag))) {
-      setSelectedEagleTag(undefined)
-    }
-  }, [activeEagleTags, eagleLoadState, selectedEagleTag])
-
-  useEffect(() => {
-    if (!previewAsset) return
-    setPreviewImageState('loading')
-  }, [previewAsset])
-
-  useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return
       if (previewAsset) {
@@ -629,6 +615,7 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
         return
       }
 
+      setPreviewImageState('loading')
       setPreviewAsset(asset)
     },
     [selectAssetRange, toggleAssetSelection],
@@ -638,6 +625,7 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
     (asset: AssetItem, event: ReactKeyboardEvent<HTMLElement>) => {
       if (event.key !== 'Enter' && event.key !== ' ') return
       event.preventDefault()
+      setPreviewImageState('loading')
       setPreviewAsset(asset)
     },
     [],
@@ -811,7 +799,7 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
                 </div>
                 <button
                   type="button"
-                  className={!selectedEagleTag ? 'eagle-tag-row active' : 'eagle-tag-row'}
+                  className={!effectiveEagleTag ? 'eagle-tag-row active' : 'eagle-tag-row'}
                   onClick={(event) => {
                     event.stopPropagation()
                     toggleEagleTag(undefined)
@@ -824,7 +812,7 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
                   <button
                     key={tag.id}
                     type="button"
-                    className={selectedEagleTag && tagMatches(tag.name, selectedEagleTag) ? 'eagle-tag-row active' : 'eagle-tag-row'}
+                    className={effectiveEagleTag && tagMatches(tag.name, effectiveEagleTag) ? 'eagle-tag-row active' : 'eagle-tag-row'}
                     onClick={(event) => {
                       event.stopPropagation()
                       toggleEagleTag(tag.name)
@@ -846,8 +834,8 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
               <div>
                 <strong>
                   {activeAssetSource === 'eagle'
-                    ? selectedEagleTag
-                      ? `Tag: ${selectedEagleTag}`
+                    ? effectiveEagleTag
+                      ? `Tag: ${effectiveEagleTag}`
                       : selectedEagleFolder
                         ? selectedEagleFolder.name
                         : 'All Eagle assets'
@@ -859,14 +847,14 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
                   {activeAssetSource === 'pinterest'
                     ? 'Connect Pinterest OAuth before boards and pins can appear here.'
                     : activeAssetSource === 'eagle'
-                      ? `${filteredAssets.length} image${filteredAssets.length === 1 ? '' : 's'}${selectedEagleTag ? ' in this tag' : ''}`
+                      ? `${filteredAssets.length} image${filteredAssets.length === 1 ? '' : 's'}${effectiveEagleTag ? ' in this tag' : ''}`
                       : 'Drag any asset into a canvas as a reference or image node.'}
                 </span>
               </div>
               <div className="library-section-actions">
-                {activeAssetSource === 'eagle' && selectedAssetIds.length ? (
+                {activeAssetSource === 'eagle' && selectedAssets.length ? (
                   <>
-                    <span>{selectedAssetIds.length} selected</span>
+                    <span>{selectedAssets.length} selected</span>
                     <button type="button" className="primary" onClick={copySelectedAssets}>
                       <Copy size={15} />
                       Copy selected
@@ -885,7 +873,7 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
                 {activeAssetSource === 'eagle' && copyStatus ? (
                   <span className="asset-copy-status">{copyStatus}</span>
                 ) : null}
-                {activeAssetSource === 'eagle' && selectedEagleTag ? (
+                {activeAssetSource === 'eagle' && effectiveEagleTag ? (
                   <button type="button" onClick={() => toggleEagleTag(undefined)}>
                     <X size={15} />
                     Clear tag
@@ -1019,8 +1007,8 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
                     <strong>
                       {activeAssetSource === 'eagle'
                         ? eagleStatus.connected
-                          ? selectedEagleTag
-                            ? `No assets indexed with ${selectedEagleTag}`
+                          ? effectiveEagleTag
+                            ? `No assets indexed with ${effectiveEagleTag}`
                             : 'No Eagle images found'
                           : 'Eagle is offline'
                         : activeAssetSource === 'pinterest'
@@ -1029,7 +1017,7 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
                     </strong>
                     <span>
                       {activeAssetSource === 'eagle'
-                        ? selectedEagleTag
+                        ? effectiveEagleTag
                           ? 'Clear the tag or choose another category.'
                           : eagleStatus.message || 'Open Eagle and keep its local API available.'
                         : activeAssetSource === 'pinterest'
