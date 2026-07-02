@@ -92,6 +92,7 @@ type CanvasState = {
   distributeSelectedNodes: (axis: DistributionAxis) => void
   arrangeSelectedNodes: (mode: SelectionArrangeMode) => void
   copySelectedNodes: () => void
+  cutSelectedNodes: () => void
   pasteClipboardNodes: (position?: { x: number; y: number }) => void
   addImportedImage: (
     assetUrl: string,
@@ -1526,6 +1527,37 @@ export const useCanvasStore = create<CanvasState>()(
           if (!selectedNodes.length) return {}
 
           return { clipboardNodes: cloneNodes(selectedNodes) }
+        }),
+      cutSelectedNodes: () =>
+        set((state) => {
+          const selectedNodeIds = selectedIdsFromState(state)
+          if (!selectedNodeIds.length) return {}
+
+          const removedSet = new Set(
+            selectedNodeIds.filter((nodeId) => {
+              const node = state.nodes.find((item) => item.id === nodeId)
+              return node && !isEffectivelyLocked(state.nodes, node)
+            }),
+          )
+          state.nodes.forEach((node) => {
+            if (removedSet.has(node.id) && isSectionNode(node)) {
+              state.nodes
+                .filter((child) => child.sectionId === node.id && !isEffectivelyLocked(state.nodes, child))
+                .forEach((child) => removedSet.add(child.id))
+            }
+          })
+          if (!removedSet.size) return {}
+
+          logCanvas(`Cut ${removedSet.size} node${removedSet.size === 1 ? '' : 's'} to clipboard`)
+
+          return {
+            clipboardNodes: cloneNodes(state.nodes.filter((node) => removedSet.has(node.id))),
+            ...patchWithHistory(state, {
+              selectedNodeId: undefined,
+              selectedNodeIds: [],
+              nodes: normalizeCanvasNodes(state.nodes.filter((node) => !removedSet.has(node.id))),
+            }),
+          }
         }),
       pasteClipboardNodes: (position) =>
         set((state) => {
