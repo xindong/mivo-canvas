@@ -302,7 +302,10 @@ export function useCanvasInteractionController({
   const moveSelectedNodesBy = useCanvasStore((state) => state.moveSelectedNodesBy)
   const moveSelectedLayer = useCanvasStore((state) => state.moveSelectedLayer)
   const copySelectedNodes = useCanvasStore((state) => state.copySelectedNodes)
+  const cutSelectedNodes = useCanvasStore((state) => state.cutSelectedNodes)
   const pasteClipboardNodes = useCanvasStore((state) => state.pasteClipboardNodes)
+  const groupSelectedNodes = useCanvasStore((state) => state.groupSelectedNodes)
+  const ungroupSelectedNodes = useCanvasStore((state) => state.ungroupSelectedNodes)
   const deleteSelectedNodes = useCanvasStore((state) => state.deleteSelectedNodes)
   const duplicateSelectedNodes = useCanvasStore((state) => state.duplicateSelectedNodes)
   const addImportedImage = useCanvasStore((state) => state.addImportedImage)
@@ -927,7 +930,11 @@ export function useCanvasInteractionController({
     (event: ReactPointerEvent<HTMLElement>) => {
       const groupResize = groupResizeRef.current
       if (groupResize?.pointerId === event.pointerId) {
-        updateNodesGeometry(resizeGroupSelection(groupResize, event.clientX, event.clientY, viewportRef.current.scale).updates)
+        updateNodesGeometry(
+          resizeGroupSelection(groupResize, event.clientX, event.clientY, viewportRef.current.scale, {
+            centered: event.altKey,
+          }).updates,
+        )
         return
       }
 
@@ -1022,6 +1029,7 @@ export function useCanvasInteractionController({
             event.clientX,
             event.clientY,
             viewportRef.current.scale,
+            { centered: event.altKey },
           )
           setSnapGuides(snapped.guides)
           setActiveSectionDropTargetId(undefined)
@@ -1367,9 +1375,30 @@ export function useCanvasInteractionController({
         return
       }
 
+      if (modifier && key === 'a') {
+        event.preventDefault()
+        // Read nodes via getState so this effect does not re-subscribe on every node change.
+        const allNodes = useCanvasStore.getState().nodes
+        selectNodes(allNodes.filter((node) => !node.hidden).map((node) => node.id))
+        return
+      }
+
       if (modifier && key === 'c') {
         event.preventDefault()
         copySelectedNodes()
+        return
+      }
+
+      if (modifier && key === 'x') {
+        event.preventDefault()
+        cutSelectedNodes()
+        return
+      }
+
+      if (modifier && key === 'g') {
+        event.preventDefault()
+        if (event.shiftKey) ungroupSelectedNodes()
+        else groupSelectedNodes()
         return
       }
 
@@ -1488,11 +1517,13 @@ export function useCanvasInteractionController({
     addFrameNode,
     addImportedImage,
     copySelectedNodes,
+    cutSelectedNodes,
     deleteSelectedNodes,
     deleteNode,
     duplicateSelectedNodes,
     fitAll,
     fitSelection,
+    groupSelectedNodes,
     moveSelectedLayer,
     moveSelectedNodesBy,
     onCloseContextMenu,
@@ -1500,8 +1531,10 @@ export function useCanvasInteractionController({
     redo,
     resetView,
     selectNode,
+    selectNodes,
     setActiveTool,
     undo,
+    ungroupSelectedNodes,
     resizeTextNode,
     updateMarkupGeometry,
     updateTextNode,

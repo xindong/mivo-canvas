@@ -92,6 +92,7 @@ type CanvasState = {
   distributeSelectedNodes: (axis: DistributionAxis) => void
   arrangeSelectedNodes: (mode: SelectionArrangeMode) => void
   copySelectedNodes: () => void
+  cutSelectedNodes: () => void
   pasteClipboardNodes: (position?: { x: number; y: number }) => void
   addImportedImage: (
     assetUrl: string,
@@ -1527,11 +1528,44 @@ export const useCanvasStore = create<CanvasState>()(
 
           return { clipboardNodes: cloneNodes(selectedNodes) }
         }),
+      cutSelectedNodes: () =>
+        set((state) => {
+          const selectedNodeIds = selectedIdsFromState(state)
+          if (!selectedNodeIds.length) return {}
+
+          const removedSet = new Set(
+            selectedNodeIds.filter((nodeId) => {
+              const node = state.nodes.find((item) => item.id === nodeId)
+              return node && !isEffectivelyLocked(state.nodes, node)
+            }),
+          )
+          state.nodes.forEach((node) => {
+            if (removedSet.has(node.id) && isSectionNode(node)) {
+              state.nodes
+                .filter((child) => child.sectionId === node.id && !isEffectivelyLocked(state.nodes, child))
+                .forEach((child) => removedSet.add(child.id))
+            }
+          })
+          if (!removedSet.size) return {}
+
+          logCanvas(`Cut ${removedSet.size} node${removedSet.size === 1 ? '' : 's'} to clipboard`)
+
+          return {
+            clipboardNodes: cloneNodes(state.nodes.filter((node) => removedSet.has(node.id))),
+            ...patchWithHistory(state, {
+              selectedNodeId: undefined,
+              selectedNodeIds: [],
+              nodes: normalizeCanvasNodes(state.nodes.filter((node) => !removedSet.has(node.id))),
+            }),
+          }
+        }),
       pasteClipboardNodes: (position) =>
         set((state) => {
           if (!state.clipboardNodes.length) return {}
 
           const groupIdMap = new Map<string, string>()
+          const clipboardIds = new Set(state.clipboardNodes.map((node) => node.id))
+          const cloneIdMap = new Map<string, string>()
           const clones = state.clipboardNodes.map((node, index) => {
             const groupId = node.groupId
               ? groupIdMap.get(node.groupId) || (() => {
@@ -1541,20 +1575,30 @@ export const useCanvasStore = create<CanvasState>()(
                 })()
               : undefined
 
-            return createNodeCopy(node, index, 36, { groupId })
+            const clone = createNodeCopy(node, index, 36, { groupId })
+            cloneIdMap.set(node.id, clone.id)
+            return clone
+          })
+          // Children cut together with their Section keep membership in the pasted Section,
+          // mirroring how groupId is remapped above.
+          const clonesWithSections = clones.map((clone, index) => {
+            const sourceSectionId = state.clipboardNodes[index].sectionId
+            return sourceSectionId && clipboardIds.has(sourceSectionId)
+              ? { ...clone, sectionId: cloneIdMap.get(sourceSectionId) }
+              : clone
           })
           const nextClones = position
             ? (() => {
-                const minX = Math.min(...clones.map((node) => node.x))
-                const maxX = Math.max(...clones.map((node) => node.x + node.width))
-                const minY = Math.min(...clones.map((node) => node.y))
-                const maxY = Math.max(...clones.map((node) => node.y + node.height))
+                const minX = Math.min(...clonesWithSections.map((node) => node.x))
+                const maxX = Math.max(...clonesWithSections.map((node) => node.x + node.width))
+                const minY = Math.min(...clonesWithSections.map((node) => node.y))
+                const maxY = Math.max(...clonesWithSections.map((node) => node.y + node.height))
                 const dx = Math.round(position.x - (minX + (maxX - minX) / 2))
                 const dy = Math.round(position.y - (minY + (maxY - minY) / 2))
 
-                return clones.map((node) => setNodeTransform(node, { x: node.x + dx, y: node.y + dy }))
+                return clonesWithSections.map((node) => setNodeTransform(node, { x: node.x + dx, y: node.y + dy }))
               })()
-            : clones
+            : clonesWithSections
 
           return {
             clipboardNodes: nextClones.map(cloneNode),
