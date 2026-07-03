@@ -2780,9 +2780,11 @@ button:disabled {
 
 .brush-options-bar {
   position: absolute;
-  left: 84px;
-  top: 70px;
+  left: 50%;
+  bottom: 82px;
+  top: auto;
   z-index: 5;
+  transform: translateX(-50%);
   display: flex;
   align-items: center;
   gap: 6px;
@@ -2854,9 +2856,11 @@ button:disabled {
 
 .stamp-options-bar {
   position: absolute;
-  left: 84px;
-  top: 70px;
+  left: 50%;
+  bottom: 82px;
+  top: auto;
   z-index: 5;
+  transform: translateX(-50%);
   display: flex;
   align-items: center;
   gap: 6px;
@@ -2866,6 +2870,17 @@ button:disabled {
   border-radius: 8px;
   box-shadow: var(--shadow);
   backdrop-filter: blur(14px);
+}
+
+/* Keep the option bars centered over the tool dock (mirror .canvas-tool-dock offsets). */
+.mivo-app:not(.ai-collapsed) .brush-options-bar,
+.mivo-app:not(.ai-collapsed) .stamp-options-bar {
+  left: calc((100% - var(--ai-panel-offset) - var(--ai-panel-w) - var(--floating-gap) - 220px) / 2);
+}
+
+.mivo-app.ai-collapsed .brush-options-bar,
+.mivo-app.ai-collapsed .stamp-options-bar {
+  left: calc((100% - var(--ai-panel-offset) - var(--ai-panel-collapsed-w) - var(--floating-gap) - 220px) / 2);
 }
 
 .stamp-options-group {
