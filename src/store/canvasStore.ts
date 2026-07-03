@@ -90,6 +90,8 @@ type CanvasState = {
   clipboardAssets: CanvasAssetClipboardItem[]
   brushStyle: BrushStyle
   activeStampKind: CanvasStampKind
+  // Transient: id of the most recently placed stamp; drives the drop animation. Not persisted.
+  lastPlacedStampId: string | undefined
   historyPast: MivoCanvasSnapshot[]
   historyFuture: MivoCanvasSnapshot[]
   createCanvas: (title?: string, options?: { projectId?: string; templateId?: DemoSceneId }) => CanvasId
@@ -102,6 +104,7 @@ type CanvasState = {
   setActiveTool: (toolId: ToolId) => void
   setBrushStyle: (style: Partial<BrushStyle>) => void
   setActiveStampKind: (kind: CanvasStampKind) => void
+  noteStampPlaced: (id: string) => void
   eraseMarkupStrokes: (nodeIds: string[]) => void
   captureHistory: () => void
   undo: () => void
@@ -1119,6 +1122,7 @@ const migratePersistedState = (persistedState: unknown, persistedVersion = 0) =>
     // Version 8 introduced the black default and eraser mode; older persisted styles reset to the new default.
     brushStyle: persistedVersion < 8 ? defaultBrushStyle : persisted.brushStyle || defaultBrushStyle,
     activeStampKind: persisted.activeStampKind || defaultStampKind,
+    lastPlacedStampId: undefined,
     historyPast: [],
     historyFuture: [],
   }
@@ -1147,6 +1151,7 @@ export const useCanvasStore = create<CanvasState>()(
       clipboardAssets: [],
       brushStyle: defaultBrushStyle,
       activeStampKind: defaultStampKind,
+      lastPlacedStampId: undefined,
       historyPast: [],
       historyFuture: [],
       createCanvas: (title = 'Untitled Canvas', options) => {
@@ -1352,6 +1357,13 @@ export const useCanvasStore = create<CanvasState>()(
       setActiveStampKind: (kind) => {
         logCanvas(`Stamp kind set to ${kind}`)
         set({ activeStampKind: kind })
+      },
+      noteStampPlaced: (id) => {
+        set({ lastPlacedStampId: id })
+        // Clear after the drop animation so the impact lines disappear.
+        window.setTimeout(() => {
+          set((state) => (state.lastPlacedStampId === id ? { lastPlacedStampId: undefined } : {}))
+        }, 520)
       },
       eraseMarkupStrokes: (nodeIds) =>
         set((state) => {

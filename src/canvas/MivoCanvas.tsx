@@ -30,7 +30,7 @@ import { SelectionQuickToolbar } from './SelectionQuickToolbar'
 import type { ImageMaskSubmitPayload } from './imageMaskGeometry'
 import type { MivoImageRatio } from '../types/generation'
 import { StampOptionsBar } from './StampOptionsBar'
-import { stampCursorCssFor, stampEmojiFor, stampGrowthSizes } from './stampDefs'
+import { stampCursorCssFor, stampGrowthSizes, stampSrcFor } from './stampDefs'
 import { useCanvasInteractionController } from './useCanvasInteractionController'
 
 type ContextMenuState = {
@@ -807,10 +807,9 @@ export function MivoCanvas({
               top: stampPlacementPreview.y - stampGrowthSizes[stampPlacementPreview.stage] / 2,
               width: stampGrowthSizes[stampPlacementPreview.stage],
               height: stampGrowthSizes[stampPlacementPreview.stage],
-              fontSize: stampGrowthSizes[stampPlacementPreview.stage] * 0.78,
             }}
           >
-            {stampEmojiFor(activeStampKind)}
+            <img src={stampSrcFor(activeStampKind)} alt="" draggable={false} />
           </div>
         ) : null}
         {cropNode ? (

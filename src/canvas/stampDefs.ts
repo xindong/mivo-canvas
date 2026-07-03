@@ -1,30 +1,40 @@
 import type { CanvasStampKind } from '../types/mivoCanvas'
 
+/**
+ * A stamp is an SVG image sticker. Each SVG ships with its own white rounded
+ * card; the canvas layer adds the drop shadow.
+ */
 export type StampDefinition = {
   kind: CanvasStampKind
   label: string
-  emoji: string
+  src: string
 }
 
-// FigJam-inspired stamp set: voting, reactions, and review marks.
 export const stampDefinitions: StampDefinition[] = [
-  { kind: 'plus-one', label: '+1', emoji: '👍' },
-  { kind: 'thumbs-down', label: '-1', emoji: '👎' },
-  { kind: 'heart', label: 'Heart', emoji: '❤️' },
-  { kind: 'star', label: 'Star', emoji: '⭐' },
-  { kind: 'check', label: 'Check', emoji: '✅' },
-  { kind: 'question', label: 'Question', emoji: '❓' },
-  { kind: 'eyes', label: 'Eyes', emoji: '👀' },
-  { kind: 'celebrate', label: 'Celebrate', emoji: '🎉' },
+  { kind: 'plus-one', label: '+1', src: '/stickers/plus-one.svg' },
+  { kind: 'heart', label: 'Heart', src: '/stickers/heart.svg' },
+  { kind: 'star', label: 'Star', src: '/stickers/star.svg' },
+  { kind: 'check', label: 'Check', src: '/stickers/check.svg' },
+  { kind: 'question', label: 'Question', src: '/stickers/question.svg' },
+  { kind: 'thumbs-down', label: 'Thumbs down', src: '/stickers/down.svg' },
+  { kind: 'down-2', label: 'Down alt', src: '/stickers/down-2.svg' },
+  { kind: 'face', label: 'Face', src: '/stickers/face.svg' },
+  { kind: 'smile', label: 'Smile', src: '/stickers/smile.svg' },
+  { kind: 'eyes', label: 'Eyes', src: '/stickers/eyes.svg' },
 ]
 
 export const defaultStampKind: CanvasStampKind = 'plus-one'
 
-export const stampEmojiFor = (kind: CanvasStampKind | undefined) =>
-  stampDefinitions.find((definition) => definition.kind === kind)?.emoji || '👍'
+const stampByKind = new Map<CanvasStampKind, StampDefinition>(
+  stampDefinitions.map((definition) => [definition.kind, definition]),
+)
 
-export const stampLabelFor = (kind: CanvasStampKind | undefined) =>
-  stampDefinitions.find((definition) => definition.kind === kind)?.label || '+1'
+export const stampDefinitionFor = (kind: CanvasStampKind | undefined): StampDefinition =>
+  (kind ? stampByKind.get(kind) : undefined) || stampDefinitions[0]
+
+export const stampSrcFor = (kind: CanvasStampKind | undefined): string => stampDefinitionFor(kind).src
+
+export const stampLabelFor = (kind: CanvasStampKind | undefined): string => stampDefinitionFor(kind).label
 
 /**
  * FigJam grows a held stamp through four stages before placement.
@@ -33,12 +43,4 @@ export const stampLabelFor = (kind: CanvasStampKind | undefined) =>
 export const stampGrowthSizes = [44, 60, 82, 112]
 export const stampGrowthIntervalMs = 420
 
-export const stampCursorCssFor = (kind: CanvasStampKind) => {
-  const svg = [
-    `<svg xmlns='http://www.w3.org/2000/svg' width='28' height='28' viewBox='0 0 28 28'>`,
-    `<text x='14' y='15' font-size='20' text-anchor='middle' dominant-baseline='central'>${stampEmojiFor(kind)}</text>`,
-    '</svg>',
-  ].join('')
-
-  return `url("data:image/svg+xml;utf8,${encodeURIComponent(svg)}") 14 14, copy`
-}
+export const stampCursorCssFor = (kind: CanvasStampKind): string => `url("${stampSrcFor(kind)}") 14 14, copy`

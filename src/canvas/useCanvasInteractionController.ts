@@ -330,6 +330,7 @@ export function useCanvasInteractionController({
   const addTextNode = useCanvasStore((state) => state.addTextNode)
   const addFrameNode = useCanvasStore((state) => state.addFrameNode)
   const addMarkupNode = useCanvasStore((state) => state.addMarkupNode)
+  const noteStampPlaced = useCanvasStore((state) => state.noteStampPlaced)
   const updateTextNode = useCanvasStore((state) => state.updateTextNode)
   const resizeTextNode = useCanvasStore((state) => state.resizeTextNode)
   const deleteNode = useCanvasStore((state) => state.deleteNode)
@@ -1390,12 +1391,13 @@ export function useCanvasInteractionController({
           const placement = stampPlacementRef.current
           const point = screenToCanvas(event.clientX, event.clientY)
           const size = stampGrowthSizes[placement.stage]
-          addMarkupNode(
+          const placedStampId = addMarkupNode(
             'stamp',
             { x: point.x - size / 2, y: point.y - size / 2 },
             { width: size, height: size },
             { stampKind: useCanvasStore.getState().activeStampKind, select: false },
           )
+          noteStampPlaced(placedStampId)
         }
         // Stamp stays active for continuous stamping (FigJam convention); Esc or V exits.
         clearStampPlacement()
@@ -1414,6 +1416,7 @@ export function useCanvasInteractionController({
       addFrameNode,
       addMarkupNode,
       addTextNode,
+      noteStampPlaced,
       clearStampPlacement,
       editTextNode,
       finishSelection,
