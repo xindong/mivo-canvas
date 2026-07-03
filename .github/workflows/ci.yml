@@ -57,8 +57,13 @@ jobs:
     name: structure guard (anti-regression)
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      # v2 增量语义需要 merge-base(HEAD, base) 可达,故全量 fetch。
+      # MIVO_GUARD_BASE_SHA 注入 PR base SHA;push 事件(无 PR context)时为空,
+      # 守卫回退用 git merge-base HEAD origin/main。
+      - name: Checkout (full history for merge-base)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Node (LTS)
         uses: actions/setup-node@v4
@@ -67,4 +72,6 @@ jobs:
 
       # 守卫脚本是纯 node(无第三方依赖),无需 npm ci
       - name: Run structure guard
+        env:
+          MIVO_GUARD_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: node scripts/ci/structure-guard.mjs

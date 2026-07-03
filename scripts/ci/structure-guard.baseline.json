@@ -1,7 +1,9 @@
 {
-  "_purpose": "MivoCanvas 结构守卫基线值。行数与 getState 计数取自 origin/main 22e2e4c,对应 productization-roadmap.md §13 SC5.2 防回潮守卫。",
-  "_howToUse": "由 scripts/ci/structure-guard.mjs 读取。白名单内文件行数不得比记录值增长;非白名单文件 >900 行直接 fail;chatStore.ts 的 useCanvasStore.getState( 调用数不得超过记录值。",
-  "_updatePolicy": "重构后下调或新增已收口大文件后上调,均需在 PR 描述中说明理由。切勿为绕过守卫而随意上调。",
+  "_purpose": "MivoCanvas 结构守卫参考基线(v2,2026-07-04)。行数与 getState 计数取自 origin/main 22e2e4c。",
+  "_v2Semantics": "v2 起守卫用「PR 增量」语义(对比 merge-base HEAD origin/main 或 CI 注入的 MIVO_GUARD_BASE_SHA);本文件降级为参考记录:CI 不再用本文件判 FAIL,只在本地无 base 可比时回退为 WARN。定期由 P2 各拆分 PR 下调本文件数值,反映拆分进度。",
+  "_v1History": "v1 用绝对基线(当前 > 记录值即 FAIL),被 main 上并行功能开发自然增长击穿(canvasStore 3168→3180 等),P2 拆分落地前每次 main 合并都误伤,故改 v2 增量语义。",
+  "_howToUse": "由 scripts/ci/structure-guard.mjs 读取。CI:白名单文件当前行数 > merge-base 处行数才 FAIL(PR 增量);非白名单 >900 行绝对 FAIL;chatStore getState 同增量语义。本地无 origin/main 时回退本文件仅 WARN。",
+  "_updatePolicy": "P2 拆分 PR 落地后下调对应数值(反映拆分)。新文件收口后可上调白名单(需 PR 说明)。切勿为绕过守卫随意上调。",
   "_baselineCommit": "22e2e4c (origin/main, 2026-07-03)",
   "_threshold": 900,
   "_scannedDirs": ["src/store", "src/canvas"],
