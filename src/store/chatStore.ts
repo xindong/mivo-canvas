@@ -152,11 +152,25 @@ const enhanceForGeneration = (enhanceResult: EnhanceResponse): ChatEnhanceResult
       }
     : { degradedReason: enhanceResult.degradedReason }
 
+// 审查 B：persist v1→v2 迁移与 retryMessage 入口共用——把不再被当前模型支持的 ratio 收敛掉，
+// 防止老会话的 21:9 在 gemini 能力表去 21:9 后从 generationContext 复活。
+// enhance.imgRatio 保留作历史展示，不在此处收敛。
+const clampChatGenerationContext = (context: ChatGenerationContext): ChatGenerationContext => {
+  const validRatios = getModelCapabilities(context.model).ratios as readonly string[]
+  const requestedImgRatio =
+    context.requestedImgRatio === 'auto' || validRatios.includes(context.requestedImgRatio)
+      ? context.requestedImgRatio
+      : 'auto'
+  const imgRatio =
+    context.imgRatio && validRatios.includes(context.imgRatio) ? context.imgRatio : undefined
+  return { ...context, requestedImgRatio, imgRatio }
+}
+
 export const useChatStore = create<ChatState>()(
   persist(
     (set, get) => ({
       messagesByScene: {},
-      selectedModel: 'gpt-image-2',
+      selectedModel: 'gemini-3-pro-image',
       paramOverrides: { imgRatio: 'auto', quality: 'auto' },
       isBusy: false,
 
@@ -422,8 +436,10 @@ export const useChatStore = create<ChatState>()(
         const targetIndex = messages.findIndex((m) => m.id === messageId)
         const userMsg = messages.slice(0, targetIndex).reverse().find((m) => m.role === 'user')
         if (!userMsg) return
-        const baseContext = targetMsg.generationContext || userMsg.generationContext
-        if (!baseContext) return
+        const rawBaseContext = targetMsg.generationContext || userMsg.generationContext
+        if (!rawBaseContext) return
+        // 防未来能力表变更再漏：retry 入口对 context 跑一遍 clamp（与 persist v1→v2 同一 helper）
+        const baseContext = clampChatGenerationContext(rawBaseContext)
 
         let referenceFiles: File[]
         try {
@@ -730,13 +746,51 @@ export const useChatStore = create<ChatState>()(
     }),
     {
       name: 'mivo-chat-demo',
-      version: 1,
+      version: 2,
       partialize: (state) => ({
         messagesByScene: state.messagesByScene,
         selectedModel: state.selectedModel,
         paramOverrides: state.paramOverrides,
         // isBusy excluded (runtime state)
       }),
+      migrate: (persistedState, version) => {
+        const state = (persistedState ?? {}) as {
+          selectedModel?: string
+          paramOverrides?: ChatParamOverrides
+          messagesByScene?: Record<string, ChatMessage[]>
+        }
+        if (version >= 2) {
+          return state as {
+            selectedModel: string
+            paramOverrides: ChatParamOverrides
+            messagesByScene: Record<string, ChatMessage[]>
+          }
+        }
+        // v1 → v2: gemini 能力表去 21:9，把老会话里不再支持的 ratio 收敛掉
+        // 老用户已选模型保留（selectedModel 原样回填），仅对 ratios 做收敛
+        const selectedModel = state.selectedModel || 'gemini-3-pro-image'
+        const validRatios = getModelCapabilities(selectedModel).ratios as readonly string[]
+        const prevOverrides = state.paramOverrides ?? {
+          imgRatio: 'auto' as const,
+          quality: 'auto' as const,
+        }
+        const paramOverrides: ChatParamOverrides = {
+          imgRatio:
+            prevOverrides.imgRatio !== 'auto' && !validRatios.includes(prevOverrides.imgRatio)
+              ? 'auto'
+              : prevOverrides.imgRatio,
+          quality: prevOverrides.quality,
+        }
+        const messagesByScene: Record<string, ChatMessage[]> = {}
+        for (const [sceneId, messages] of Object.entries(state.messagesByScene ?? {})) {
+          messagesByScene[sceneId] = messages.map((msg) =>
+            msg.generationContext
+              ? { ...msg, generationContext: clampChatGenerationContext(msg.generationContext) }
+              : msg,
+          )
+        }
+        return { selectedModel, paramOverrides, messagesByScene }
+      },
     },
   ),
 )

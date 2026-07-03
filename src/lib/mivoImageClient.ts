@@ -1,5 +1,5 @@
 import type { MivoCanvasNode } from '../types/mivoCanvas'
-import type { EnhanceRequest, EnhanceResponse, MivoEditRequest, MivoGenerateRequest, MivoImageResponse } from '../types/generation'
+import type { EnhanceRequest, EnhanceResponse, MivoEditRequest, MivoGenerateRequest, MivoImageQuality, MivoImageResponse } from '../types/generation'
 import { readImportedAssetFile } from './assetStorage'
 
 const defaultModel = 'gpt-image-2'
@@ -21,10 +21,23 @@ export class MivoImageRequestError extends Error {
   }
 }
 
-export const mivoClientTimeoutMessage = '等待超时，结果可能仍在生成，可稍后重试或降低质量'
-export const mivoUpstreamTimeoutMessage = '上游生成超时，可降低质量重试'
+// 审查 B（Step 4b）：超时文案按 effective quality 条件化——high(2K) 才建议降质，
+// medium/low(1K) 不再误导"降低质量"，改为"稍后重试、换比例或减少参考图"
+const timeoutAdviceForQuality = (quality?: MivoImageQuality) =>
+  quality === 'high' ? '可降低质量重试' : '可稍后重试、换比例或减少参考图'
 
-const fetchMivoWithTimeout = async (input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = mivoRequestTimeoutMs) => {
+export const mivoClientTimeoutMessageFor = (quality?: MivoImageQuality) =>
+  `等待超时，结果可能仍在生成，${timeoutAdviceForQuality(quality)}`
+
+export const mivoUpstreamTimeoutMessageFor = (quality?: MivoImageQuality) =>
+  `上游生成超时，${timeoutAdviceForQuality(quality)}`
+
+const fetchMivoWithTimeout = async (
+  input: RequestInfo | URL,
+  init: RequestInit = {},
+  timeoutMs = mivoRequestTimeoutMs,
+  quality?: MivoImageQuality,
+) => {
   const controller = new AbortController()
   let timedOut = false
   const parentSignal = init.signal
@@ -48,7 +61,7 @@ const fetchMivoWithTimeout = async (input: RequestInfo | URL, init: RequestInit 
   } catch (error) {
     if (isAbortError(error)) {
       throw new MivoImageRequestError(
-        timedOut ? mivoClientTimeoutMessage : '图片请求已取消。',
+        timedOut ? mivoClientTimeoutMessageFor(quality) : '图片请求已取消。',
         timedOut ? 'client-timeout' : 'canceled',
         { cause: error },
       )
@@ -60,8 +73,8 @@ const fetchMivoWithTimeout = async (input: RequestInfo | URL, init: RequestInit 
   }
 }
 
-const readMivoError = async (response: Response) => {
-  if (response.status === 504) return mivoUpstreamTimeoutMessage
+const readMivoError = async (response: Response, quality?: MivoImageQuality) => {
+  if (response.status === 504) return mivoUpstreamTimeoutMessageFor(quality)
 
   try {
     const payload = (await response.json()) as { error?: string; message?: string }
@@ -86,24 +99,29 @@ const fileNameForBlob = (blob: Blob, fallback: string) =>
   blob instanceof File && blob.name ? blob.name : fallback
 
 export const generateMivoImage = async (request: MivoGenerateRequest) => {
-  const response = await fetchMivoWithTimeout('/api/mivo/generate', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
+  const response = await fetchMivoWithTimeout(
+    '/api/mivo/generate',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      signal: request.signal,
+      body: JSON.stringify({
+        prompt: request.prompt,
+        imgRatio: request.imgRatio,
+        quality: request.quality,
+        n: request.n ?? 1,
+        model: request.model || defaultModel,
+      }),
     },
-    signal: request.signal,
-    body: JSON.stringify({
-      prompt: request.prompt,
-      imgRatio: request.imgRatio,
-      quality: request.quality,
-      n: request.n ?? 1,
-      model: request.model || defaultModel,
-    }),
-  })
+    mivoRequestTimeoutMs,
+    request.quality,
+  )
 
   if (!response.ok) {
     throw new MivoImageRequestError(
-      await readMivoError(response),
+      await readMivoError(response, request.quality),
       response.status === 504 ? 'upstream-timeout' : 'upstream-error',
     )
   }
@@ -130,11 +148,12 @@ export const editMivoImage = async (request: MivoEditRequest) => {
       body: formData,
     },
     mivoEditRequestTimeoutMs,
+    request.quality,
   )
 
   if (!response.ok) {
     throw new MivoImageRequestError(
-      await readMivoError(response),
+      await readMivoError(response, request.quality),
       response.status === 504 ? 'upstream-timeout' : 'upstream-error',
     )
   }

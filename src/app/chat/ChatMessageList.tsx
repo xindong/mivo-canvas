@@ -137,7 +137,7 @@ export function ChatMessageList({ sceneId }: ChatMessageListProps) {
                       className="chat-retry-btn chat-retry-btn-secondary"
                       onClick={() => void retryMessage({ sceneId, messageId: message.id, qualityOverride: 'medium' })}
                       disabled={isBusy || Boolean(message.retryDisabledReason)}
-                      title={retryDisabledReason || '以中质量重新生成'}
+                      title={retryDisabledReason || '以中质量重新生成（降到 1K）'}
                     >
                       中质量重试
                     </button>

@@ -153,10 +153,11 @@ const server = spawn(
 
 try {
   await mkdir('test-artifacts', { recursive: true })
-  const [nodeRegistrySource, actionModelSource, viteConfigSource] = await Promise.all([
+  const [nodeRegistrySource, actionModelSource, viteConfigSource, modelCapabilitiesSource] = await Promise.all([
     readFile('src/canvas/nodeTypes/canvasNodeRegistry.ts', 'utf8'),
     readFile('src/canvas/actions/canvasActionModel.ts', 'utf8'),
     readFile('vite.config.ts', 'utf8'),
+    readFile('src/lib/modelCapabilities.ts', 'utf8'),
   ])
   for (const nodeType of [
     'image',
@@ -190,6 +191,42 @@ try {
       throw new Error(`R3 high quality size map should include ${expectedSize}`)
     }
   }
+
+  // ⑥ 能力表双写同步（SC-3）：modelCapabilities.ts 与 vite.config.ts mivoModelRatioMap 的 gemini ratios 必须一致且无 21:9。
+  // vite 侧由并行 worker 同步改——若未合并则本条软失败（等合并），不阻断其余用例；modelCapabilities 侧是硬断言（本仓 own）。
+  const dualWriteWarnings = []
+  {
+    // modelCapabilities.ts: 'gemini-3-pro-image': { ... ratios: ['1:1', ...] }
+    const extractFromModelCaps = (source) => {
+      const match = source.match(/'gemini-3-pro-image':\s*\{[\s\S]*?ratios:\s*\[([^\]]*)\]/)
+      if (!match) return null
+      return match[1].split(',').map((s) => s.trim().replace(/['"]/g, '')).filter(Boolean)
+    }
+    // vite.config.ts mivoModelRatioMap: 'gemini-3-pro-image': ['1:1', ...]（直接数组，无 ratios 键）
+    const extractFromViteMap = (source) => {
+      const match = source.match(/'gemini-3-pro-image':\s*\[([^\]]*)\]/)
+      if (!match) return null
+      return match[1].split(',').map((s) => s.trim().replace(/['"]/g, '')).filter(Boolean)
+    }
+    const capsRatios = extractFromModelCaps(modelCapabilitiesSource)
+    const viteRatios = extractFromViteMap(viteConfigSource)
+    if (!capsRatios) throw new Error(`Could not extract gemini ratios from modelCapabilities.ts`)
+    if (capsRatios.includes('21:9')) {
+      throw new Error(`modelCapabilities gemini must not have 21:9, got ${JSON.stringify(capsRatios)}`)
+    }
+    if (!viteRatios) {
+      dualWriteWarnings.push('dual-write: could not extract gemini ratios from vite.config.ts mivoModelRatioMap')
+    } else {
+      const same = capsRatios.length === viteRatios.length && capsRatios.every((r, i) => r === viteRatios[i])
+      if (!same) {
+        dualWriteWarnings.push(`dual-write: gemini ratios differ — modelCapabilities=${JSON.stringify(capsRatios)} vs vite.mivoModelRatioMap=${JSON.stringify(viteRatios)} (vite 侧等合并)`)
+      }
+      if (viteRatios.includes('21:9')) {
+        dualWriteWarnings.push('dual-write: vite mivoModelRatioMap gemini still has 21:9 (等并行 worker 合并 vite.config.ts)')
+      }
+    }
+  }
+
   await waitForServer(baseUrl)
 
   const browser = await chromium.launch({ headless: true })
@@ -332,6 +369,14 @@ try {
       await wait(50)
     }
     throw new Error(`Timed out waiting for canvas state: ${predicate.toString()}`)
+  }
+
+  // ⑤ 默认模型切 gemini（D-R5b）：localStorage.clear 后新用户吃到新默认，不破既有段落
+  {
+    const chatState = await readChatState()
+    if (chatState.selectedModel !== 'gemini-3-pro-image') {
+      throw new Error(`Default selectedModel should be gemini-3-pro-image after localStorage.clear, got ${chatState.selectedModel}`)
+    }
   }
 
   const logoResponse = await page.request.get(`${baseUrl}/mivo-logo.svg`)
@@ -3779,7 +3824,7 @@ try {
   })
   if (storedMsgCount < 2) throw new Error(`Chat messages should be persisted in localStorage, got ${storedMsgCount}`)
 
-  // NB3: gemini 21:9 → aspect_ratio:"21:9" in upstream payload (no size)
+  // NB3: gemini 4:3 → client sends {model, imgRatio:"4:3"}（gemini 专属比例，gpt 无；走 mivo 平台通道）
   let capturedGeminiPayload = null
   await page.unroute('**/api/mivo/generate')
   await page.route('**/api/mivo/generate', async (route) => {
@@ -3804,8 +3849,22 @@ try {
     if (!spec) return
     const { useChatStore } = await import(new URL(spec).pathname + new URL(spec).search)
     useChatStore.getState().setSelectedModel('gemini-3-pro-image')
-    useChatStore.getState().setParamOverride('imgRatio', '21:9')
+    useChatStore.getState().setParamOverride('imgRatio', '4:3')
   })
+  // ② gemini 比例弹层断言：含 4:3，不含 21:9（能力表去 21:9 的前端表现）
+  {
+    await page.locator('[aria-label="选择比例和质量"]').click()
+    await page.waitForSelector('#chat-ratio-popover .chat-ratio-btn')
+    const ratioLabels = (await page.locator('#chat-ratio-popover .chat-ratio-btn').allInnerTexts()).map((t) => t.trim())
+    if (!ratioLabels.some((t) => t === '4:3')) {
+      throw new Error(`Gemini ratio popover should include 4:3, got: ${JSON.stringify(ratioLabels)}`)
+    }
+    if (ratioLabels.some((t) => t === '21:9')) {
+      throw new Error(`Gemini ratio popover should NOT include 21:9, got: ${JSON.stringify(ratioLabels)}`)
+    }
+    await page.keyboard.press('Escape')
+    await page.waitForSelector('#chat-ratio-popover', { state: 'detached' })
+  }
   const canvasBeforeGemini = await readCanvasState()
   const countBeforeGemini = await page.locator('.dom-node').count()
   await page.locator('.chat-composer-textarea').fill('gemini aspect ratio test')
@@ -3818,9 +3877,9 @@ try {
       await new Promise((resolve) => setTimeout(resolve, 200))
     }
   }
-  // Client sends {model, imgRatio} — Vite proxy transforms to aspect_ratio for gemini
-  if (capturedGeminiPayload?.model !== 'gemini-3-pro-image' || capturedGeminiPayload?.imgRatio !== '21:9') {
-    throw new Error(`gemini 21:9 request should carry model and imgRatio, got: ${JSON.stringify(capturedGeminiPayload)}`)
+  // Client sends {model, imgRatio} — gemini 走 mivo 平台通道（不再经 llm-proxy/aspect_ratio）
+  if (capturedGeminiPayload?.model !== 'gemini-3-pro-image' || capturedGeminiPayload?.imgRatio !== '4:3') {
+    throw new Error(`gemini 4:3 request should carry model and imgRatio, got: ${JSON.stringify(capturedGeminiPayload)}`)
   }
   await page.unroute('**/api/mivo/generate')
   await page.route('**/api/mivo/generate', async (route) => {
@@ -3932,7 +3991,7 @@ try {
     useCanvasStore.getState().loadScene('character-flow')
   }, await canvasStoreSpec())
 
-  // Regression: timeout errors distinguish upstream 504 and offer a medium-quality retry preserving context.
+  // ④ Regression: gemini high 超时 → 出现「中质量重试」且二次请求 quality=medium（Step 4b 条件化）
   const timeoutRetryGenerateRequests = []
   let timeoutRetryGenerateCount = 0
   const timeoutRetryGenerateHandler = async (route) => {
@@ -3959,7 +4018,7 @@ try {
       const { useCanvasStore } = await import(canvasModuleSpec)
       const { useChatStore } = await import(chatModuleSpec)
       useCanvasStore.getState().selectNode(undefined)
-      useChatStore.getState().setSelectedModel('gpt-image-2')
+      useChatStore.getState().setSelectedModel('gemini-3-pro-image')
       useChatStore.getState().setParamOverride('imgRatio', '16:9')
       useChatStore.getState().setParamOverride('quality', 'high')
     }, { canvasModuleSpec: await canvasStoreSpec(), chatModuleSpec: await chatStoreSpec() })
@@ -3998,6 +4057,58 @@ try {
       useChatStore.getState().setParamOverride('imgRatio', 'auto')
       useChatStore.getState().setParamOverride('quality', 'auto')
     })
+  }
+
+  // ④b Regression: gemini medium 超时 → 不出现降质按钮、文案为"稍后重试/换比例"（Step 4b 条件化）
+  {
+    const mediumTimeoutHandler = async (route) => {
+      await route.fulfill({
+        status: 504,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: 'Image API request timed out' }),
+      })
+    }
+    await page.unroute('**/api/mivo/generate')
+    await page.route('**/api/mivo/generate', mediumTimeoutHandler)
+    try {
+      await page.evaluate(async ({ canvasModuleSpec, chatModuleSpec }) => {
+        const { useCanvasStore } = await import(canvasModuleSpec)
+        const { useChatStore } = await import(chatModuleSpec)
+        useCanvasStore.getState().selectNode(undefined)
+        useChatStore.getState().setSelectedModel('gemini-3-pro-image')
+        useChatStore.getState().setParamOverride('imgRatio', '4:3')
+        useChatStore.getState().setParamOverride('quality', 'medium')
+      }, { canvasModuleSpec: await canvasStoreSpec(), chatModuleSpec: await chatStoreSpec() })
+      await page.locator('.chat-composer-textarea').fill('medium timeout should not offer downgrade')
+      await page.locator('.chat-composer-textarea').press('Enter')
+      await page.waitForSelector('.chat-error-text', { timeout: 10000 })
+      await waitForChatIdle()
+      const mediumTimeoutText = await page.locator('.chat-error-text').last().innerText()
+      if (!mediumTimeoutText.includes('稍后重试') || !mediumTimeoutText.includes('换比例')) {
+        throw new Error(`Medium-quality timeout should suggest retry/ratio (not downgrade), got: ${JSON.stringify(mediumTimeoutText)}`)
+      }
+      // medium(1K) 不应出现"中质量重试"降质按钮（showMediumRetry 仅 high 才显示）
+      const mediumRetryBtnCount = await page.locator('.chat-message-assistant').last().getByRole('button', { name: '中质量重试' }).count()
+      if (mediumRetryBtnCount > 0) {
+        throw new Error(`Medium-quality timeout should NOT show a downgrade button, got ${mediumRetryBtnCount}`)
+      }
+    } finally {
+      await page.unroute('**/api/mivo/generate', mediumTimeoutHandler)
+      await page.route('**/api/mivo/generate', async (route) => {
+        await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }) })
+      })
+      // 清掉本用例留下的 error 消息，避免后续 retry-edit 用例的 waitForSelector('.chat-error-text') 命中残留
+      await page.evaluate(async () => {
+        const canvasSpec = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('canvasStore.ts'))
+        const chatSpec = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('chatStore.ts'))
+        if (!canvasSpec || !chatSpec) return
+        const { useCanvasStore } = await import(new URL(canvasSpec).pathname + new URL(canvasSpec).search)
+        const { useChatStore } = await import(new URL(chatSpec).pathname + new URL(chatSpec).search)
+        useChatStore.getState().clearScene(useCanvasStore.getState().sceneId)
+        useChatStore.getState().setParamOverride('imgRatio', 'auto')
+        useChatStore.getState().setParamOverride('quality', 'auto')
+      })
+    }
   }
 
   // Regression: retry reuses the original user message and preserves uploaded reference assets.
@@ -4448,6 +4559,109 @@ try {
     throw new Error(`chatStore should contain at least one mask-edit notice after local repaint, got ${maskNoticeCount}`)
   }
 
+  // ③ persist v1→v2 迁移（SC-6）：独立 browser context（不挂全局 localStorage.clear），
+  // 注入 v1 结构（gemini + 21:9 override + 含 generationContext.imgRatio=21:9 的旧 error 消息），
+  // rehydrate 后断言 override=auto + 消息 context 已 clamp + 弹层无 21:9
+  {
+    const migrationContext = await browser.newContext({ viewport: { width: 1512, height: 900 }, deviceScaleFactor: 1 })
+    const migrationPage = await migrationContext.newPage()
+    await migrationPage.route('**/api/mivo/generate', async (route) => {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }) })
+    })
+    await migrationPage.route('**/api/mivo/edit', async (route) => {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }) })
+    })
+    await migrationPage.route('**/api/mivo/enhance', async (route) => {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ mode: 'generate', scene: 'general', reasoning: 'e2e', richPrompt: 'e2e derived', imgRatio: '1:1', quality: 'medium', enhanced: true }) })
+    })
+    // 注入 v1 storage（version:1）——含 21:9 override 与一条 21:9 旧 error 消息的 generationContext
+    await migrationPage.addInitScript(() => {
+      const v1State = {
+        state: {
+          messagesByScene: {
+            'character-flow': [
+              {
+                id: 'msg-user-legacy',
+                role: 'user',
+                kind: 'text',
+                text: 'legacy 21:9 prompt',
+                createdAt: 1719900000000,
+                status: 'done',
+                generationContext: {
+                  model: 'gemini-3-pro-image',
+                  requestedImgRatio: '21:9',
+                  imgRatio: '21:9',
+                  quality: 'high',
+                  finalPrompt: 'legacy 21:9 prompt',
+                },
+              },
+              {
+                id: 'msg-asst-legacy',
+                role: 'assistant',
+                kind: 'text',
+                text: '',
+                createdAt: 1719900000001,
+                status: 'error',
+                error: '上游生成超时，可降低质量重试',
+                errorKind: 'upstream-timeout',
+                generationContext: {
+                  model: 'gemini-3-pro-image',
+                  requestedImgRatio: '21:9',
+                  imgRatio: '21:9',
+                  quality: 'high',
+                  finalPrompt: 'legacy 21:9 prompt',
+                },
+              },
+            ],
+          },
+          selectedModel: 'gemini-3-pro-image',
+          paramOverrides: { imgRatio: '21:9', quality: 'auto' },
+        },
+        version: 1,
+      }
+      window.localStorage.setItem('mivo-chat-demo', JSON.stringify(v1State))
+    })
+    await migrationPage.goto(baseUrl, { waitUntil: 'networkidle' })
+    await migrationPage.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
+    const migrated = await migrationPage.evaluate(async () => {
+      const spec = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('chatStore.ts'))
+      if (!spec) return null
+      const { useChatStore } = await import(new URL(spec).pathname + new URL(spec).search)
+      const state = useChatStore.getState()
+      const legacyAsst = (state.messagesByScene['character-flow'] || []).find((m) => m.id === 'msg-asst-legacy')
+      return {
+        selectedModel: state.selectedModel,
+        paramOverridesImgRatio: state.paramOverrides.imgRatio,
+        asstRequestedImgRatio: legacyAsst?.generationContext?.requestedImgRatio,
+        asstImgRatio: legacyAsst?.generationContext?.imgRatio,
+      }
+    })
+    if (!migrated) throw new Error('Migration test could not load chatStore')
+    if (migrated.selectedModel !== 'gemini-3-pro-image') {
+      throw new Error(`Persist v1→v2 should keep selectedModel=gemini, got ${migrated.selectedModel}`)
+    }
+    if (migrated.paramOverridesImgRatio !== 'auto') {
+      throw new Error(`Persist v1→v2 should clamp paramOverrides.imgRatio 21:9→auto, got ${migrated.paramOverridesImgRatio}`)
+    }
+    if (migrated.asstRequestedImgRatio !== 'auto') {
+      throw new Error(`Persist v1→v2 should clamp legacy message requestedImgRatio 21:9→auto, got ${migrated.asstRequestedImgRatio}`)
+    }
+    if (migrated.asstImgRatio !== undefined) {
+      throw new Error(`Persist v1→v2 should clamp legacy message imgRatio off 21:9 (to undefined), got ${JSON.stringify(migrated.asstImgRatio)}`)
+    }
+    // 弹层无 21:9（含 4:3）
+    await migrationPage.locator('[aria-label="选择比例和质量"]').click()
+    await migrationPage.waitForSelector('#chat-ratio-popover .chat-ratio-btn')
+    const migrationRatioLabels = (await migrationPage.locator('#chat-ratio-popover .chat-ratio-btn').allInnerTexts()).map((t) => t.trim())
+    if (migrationRatioLabels.some((t) => t === '21:9')) {
+      throw new Error(`Migration: ratio popover should not include 21:9, got ${JSON.stringify(migrationRatioLabels)}`)
+    }
+    if (!migrationRatioLabels.some((t) => t === '4:3')) {
+      throw new Error(`Migration: ratio popover should include 4:3, got ${JSON.stringify(migrationRatioLabels)}`)
+    }
+    await migrationContext.close()
+  }
+
   await page.screenshot({ path: 'test-artifacts/e2e-smoke.png', fullPage: true })
   await browser.close()
 
@@ -4458,6 +4672,10 @@ try {
   )
   if (realErrors.length) {
     throw new Error(`Console errors:\n${realErrors.join('\n')}`)
+  }
+
+  if (dualWriteWarnings.length) {
+    console.warn('[等合并] ' + dualWriteWarnings.join(' | '))
   }
 
   console.log('E2E smoke test passed')
