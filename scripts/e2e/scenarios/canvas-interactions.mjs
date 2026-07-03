@@ -1715,10 +1715,33 @@ export const runCanvasInteractionsScenario = async (context) => {
     throw new Error('Selected canvas text should expose horizontal resize handles')
   }
 
-  await page.mouse.move(textResizeHandle.x + textResizeHandle.width / 2, textResizeHandle.y + textResizeHandle.height / 2)
+  const textResizeGrabPoint = {
+    x: textResizeHandle.x + textResizeHandle.width / 2,
+    // On CI the text box can sit low enough that the handle center falls just
+    // below the viewport. Clamp the grab point back into the visible slice
+    // while still staying inside the handle itself.
+    y: Math.max(
+      textResizeHandle.y + 1,
+      Math.min(
+        textResizeHandle.y + textResizeHandle.height / 2,
+        textResizeHandle.y + textResizeHandle.height - 1,
+        canvasBox.y + canvasBox.height - 8,
+      ),
+    ),
+  }
+
+  await page.mouse.move(textResizeGrabPoint.x, textResizeGrabPoint.y)
   await page.mouse.down()
-  await page.mouse.move(textResizeHandle.x + textResizeHandle.width / 2 + 90, textResizeHandle.y + textResizeHandle.height / 2)
+  await page.mouse.move(textResizeGrabPoint.x + 90, textResizeGrabPoint.y, { steps: 6 })
   await page.mouse.up()
+  await page.waitForFunction(
+    (minWidth) => {
+      const nodes = document.querySelectorAll('.dom-node.text-node')
+      const lastNode = nodes.item(nodes.length - 1)
+      return Boolean(lastNode && lastNode.getBoundingClientRect().width > minWidth)
+    },
+    beforeTextResize.width + 20,
+  )
 
   const afterTextResize = await page.locator('.dom-node.text-node').last().boundingBox()
   if (!afterTextResize || afterTextResize.width <= beforeTextResize.width + 20) {

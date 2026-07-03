@@ -1,4 +1,4 @@
-import { spawn, execSync } from 'node:child_process'
+import { spawn, spawnSync, execSync } from 'node:child_process'
 import path from 'node:path'
 import { mkdir, rm } from 'node:fs/promises'
 import { chromium } from 'playwright'
@@ -6,10 +6,9 @@ import { attachDefaultMivoApiMocks } from './api-mocks.mjs'
 
 export const createBaseUrl = (port) => `http://127.0.0.1:${port}`
 
-// killStaleDevServer:检测并 kill 残留 dev server(之前 e2e 崩溃未走 finally
-// stopSmokeDevServer 时残留)。残留 dev server 用旧 MIVO_DEBUG_LOG_DIR 会导致
-// debug-logs 累积(remote debug GET records 多条),且新 dev server 因 --strictPort
-// 端口占用起不来。起跑前清掉(真卫生 bug,修了全线受益)。
+// killStaleDevServer: detect and kill a leftover dev server from a prior failed
+// e2e run. A stale dev server keeps the old debug log dir and breaks
+// --strictPort restarts.
 const killStaleDevServer = (port) => {
   try {
     const pids = execSync(`lsof -ti:${port} 2>/dev/null || true`, { encoding: 'utf8' }).trim()
@@ -17,9 +16,12 @@ const killStaleDevServer = (port) => {
     console.warn(`[harness] killing stale dev server on port ${port} (pids: ${pids.replace(/\n/g, ' ')})`)
     execSync(`kill ${pids.replace(/\n/g, ' ')} 2>/dev/null || true`, { stdio: 'ignore' })
   } catch {
-    // lsof/kill unavailable (non-macOS/linux?) — skip; --strictPort will error if occupied
+    // lsof/kill unavailable - skip; --strictPort will fail visibly if occupied.
   }
 }
+
+const localBin = (name) =>
+  path.resolve('node_modules', '.bin', process.platform === 'win32' ? `${name}.cmd` : name)
 
 const e2eBridgeModules = {
   canvasStore: [
@@ -82,9 +84,20 @@ export const runCommand = (command, args) =>
     })
   })
 
+const spawnBackgroundProcess = (command, args, options) => {
+  const child = spawn(command, args, options)
+  child.stdout?.on('data', (chunk) => {
+    process.stdout.write(chunk)
+  })
+  child.stderr?.on('data', (chunk) => {
+    process.stderr.write(chunk)
+  })
+  return child
+}
+
 export const startSmokeDevServer = ({ port, localAssetFixtureDir, eagleMockPort, bffPort }) => {
   killStaleDevServer(port)
-  return spawn('npm', ['run', 'dev', '--', '--host', '127.0.0.1', '--port', String(port), '--strictPort'], {
+  return spawnBackgroundProcess(localBin('vite'), ['--host', '127.0.0.1', '--port', String(port), '--strictPort'], {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: {
       ...process.env,
@@ -107,7 +120,7 @@ export const startSmokeBffServer = ({
   enableEagleProxy,
   isPublic = true,
 }) =>
-  spawn('npm', ['run', 'start:server'], {
+  spawnBackgroundProcess(localBin('tsx'), ['server/index.ts'], {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: {
       ...process.env,
@@ -117,35 +130,54 @@ export const startSmokeBffServer = ({
       MIVO_EAGLE_API_URL: `http://127.0.0.1:${eagleMockPort}`,
       MIVO_DEBUG_LOG_DIR: path.resolve('test-artifacts/debug-logs'),
       MIVO_DEBUG_VIEW_TOKEN: debugViewToken,
-      MIVO_IMAGE_API_KEY: 'sk_test',
-      MIVO_LLM_API_KEY: 'sk_test',
-      MIVO_IMAGE_API_BASE: `${upstreamBaseUrl}/v1/images`,
-      MIVO_LLM_API_BASE: `${upstreamBaseUrl}/v1`,
+      MIVO_IMAGE_API_KEY: process.env.MIVO_IMAGE_API_KEY || 'sk_test',
+      MIVO_LLM_API_KEY: process.env.MIVO_LLM_API_KEY || process.env.MIVO_IMAGE_API_KEY || 'sk_test',
       MIVO_ENABLE_LOCAL_ASSETS: enableLocalAssets ? '1' : '0',
       MIVO_ENABLE_EAGLE_PROXY: enableEagleProxy ? '1' : '0',
+      ...(upstreamBaseUrl
+        ? {
+            MIVO_IMAGE_API_BASE: `${upstreamBaseUrl}/v1/images`,
+            MIVO_LLM_API_BASE: `${upstreamBaseUrl}/v1`,
+          }
+        : {}),
     },
   })
+
+const killChildTree = (proc, signal) => {
+  if (!proc?.pid || process.platform === 'win32') return
+  spawnSync('pkill', [`-${signal}`, '-P', String(proc.pid)], { stdio: 'ignore' })
+}
 
 const stopProcess = async (proc) => {
   if (!proc || proc.exitCode !== null || proc.signalCode !== null) return
   await new Promise((resolve) => {
+    const finish = () => resolve(null)
     const forceKillTimer = setTimeout(() => {
       if (proc.exitCode === null && proc.signalCode === null) {
-        proc.kill('SIGKILL')
+        try {
+          killChildTree(proc, 'KILL')
+          proc.kill('SIGKILL')
+        } catch {
+          finish()
+        }
       }
     }, 2000)
 
     proc.once('close', () => {
       clearTimeout(forceKillTimer)
-      resolve(null)
+      finish()
     })
-    proc.kill('SIGTERM')
+    try {
+      killChildTree(proc, 'TERM')
+      proc.kill('SIGTERM')
+    } catch {
+      finish()
+    }
   })
 }
 
 export const stopSmokeDevServer = async (server) => {
   if (!server) return
-  // Dev topology returns { bff, dev }; prod returns a single ChildProcess.
   if (server.bff || server.dev) {
     await Promise.all([stopProcess(server.bff), stopProcess(server.dev)])
     return
@@ -153,7 +185,13 @@ export const stopSmokeDevServer = async (server) => {
   await stopProcess(server)
 }
 
-export const createSmokePage = async ({ baseUrl, generatedImageB64, extraHTTPHeaders, enableStoreBridgeModules = false }) => {
+export const createSmokePage = async ({
+  baseUrl,
+  generatedImageB64,
+  extraHTTPHeaders,
+  enableStoreBridgeModules = false,
+  enableApiRouteMocks = true,
+}) => {
   const browser = await chromium.launch({ headless: true })
   const context = await browser.newContext({
     viewport: { width: 1512, height: 900 },
@@ -170,7 +208,9 @@ export const createSmokePage = async ({ baseUrl, generatedImageB64, extraHTTPHea
   const errors = []
   const mivoEditRequests = []
 
-  await attachDefaultMivoApiMocks(page, { generatedImageB64, mivoEditRequests })
+  if (enableApiRouteMocks) {
+    await attachDefaultMivoApiMocks(page, { generatedImageB64, mivoEditRequests })
+  }
 
   page.on('console', (message) => {
     if (message.type() === 'error' && !message.text().includes('__MIVO_E2E_EXPECTED_ERROR__')) errors.push(message.text())
