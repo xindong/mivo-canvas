@@ -201,6 +201,261 @@ const sendMivoJson = (response: ServerResponse, status: number, payload: unknown
   response.end(JSON.stringify(payload))
 }
 
+type RemoteDebugLevel = 'warning' | 'error'
+
+export type RemoteDebugRecord = {
+  id: string
+  level: RemoteDebugLevel
+  source: string
+  message: string
+  timestamp: number
+  clientId: string
+  sessionId: string
+  appVersion: string
+  pagePath: string
+  userAgent: string
+  language: string
+  timezone: string
+  screen: {
+    width: number
+    height: number
+    pixelRatio: number
+  }
+  ip: string
+  referer: string
+  receivedAt: string
+}
+
+type RemoteDebugPayload = {
+  clientId?: unknown
+  sessionId?: unknown
+  appVersion?: unknown
+  pagePath?: unknown
+  userAgent?: unknown
+  language?: unknown
+  timezone?: unknown
+  screen?: unknown
+  entries?: unknown
+}
+
+type RemoteDebugServerMeta = {
+  ip: string
+  referer: string
+  receivedAt: string
+}
+
+type RemoteDebugRecordFilter = {
+  level?: string
+  clientId?: string
+  sessionId?: string
+  query?: string
+}
+
+const maxRemoteDebugEntries = 40
+const maxRemoteDebugTextLength = 4000
+
+const remoteDebugLogDir = () => path.resolve(process.env.MIVO_DEBUG_LOG_DIR || path.join(process.cwd(), 'data/debug-logs'))
+
+const isRemoteDebugLevel = (value: unknown): value is RemoteDebugLevel => value === 'warning' || value === 'error'
+
+const compactRemoteDebugText = (value: unknown, fallback = '') => {
+  if (typeof value !== 'string') return fallback
+  return value.trim().replace(/\s+/g, ' ')
+}
+
+export const sanitizeRemoteDebugText = (value: unknown, maxLength = maxRemoteDebugTextLength) => {
+  const compact = compactRemoteDebugText(value)
+    .replace(/data:[^,\s]+,[^\s]+/gi, 'data:[redacted]')
+    .replace(/\b(token|api[_-]?key|authorization|password|secret)=([^\s&]+)/gi, '$1=[redacted]')
+    .replace(/\b[A-Za-z0-9+/=_-]{48,}\b/g, '[redacted-base64]')
+
+  return compact.length > maxLength
+    ? `${compact.slice(0, maxLength)}... [truncated]`
+    : compact
+}
+
+const normalizeRemoteDebugScreen = (screen: unknown): RemoteDebugRecord['screen'] => {
+  if (!screen || typeof screen !== 'object') return { width: 0, height: 0, pixelRatio: 1 }
+  const candidate = screen as Partial<RemoteDebugRecord['screen']>
+
+  return {
+    width: Number.isFinite(candidate.width) ? Number(candidate.width) : 0,
+    height: Number.isFinite(candidate.height) ? Number(candidate.height) : 0,
+    pixelRatio: Number.isFinite(candidate.pixelRatio) ? Number(candidate.pixelRatio) : 1,
+  }
+}
+
+export const normalizeRemoteDebugPayload = (
+  payload: RemoteDebugPayload,
+  serverMeta: RemoteDebugServerMeta,
+): RemoteDebugRecord[] => {
+  const entries = Array.isArray(payload.entries) ? payload.entries.slice(0, maxRemoteDebugEntries) : []
+  const clientId = sanitizeRemoteDebugText(payload.clientId || 'unknown-client')
+  const sessionId = sanitizeRemoteDebugText(payload.sessionId || 'unknown-session')
+  const appVersion = sanitizeRemoteDebugText(payload.appVersion || 'unknown')
+  const pagePath = sanitizeRemoteDebugText(payload.pagePath || '/')
+  const userAgent = sanitizeRemoteDebugText(payload.userAgent || 'unknown')
+  const language = sanitizeRemoteDebugText(payload.language || 'unknown')
+  const timezone = sanitizeRemoteDebugText(payload.timezone || 'unknown')
+  const screen = normalizeRemoteDebugScreen(payload.screen)
+
+  return entries.flatMap((entry, index) => {
+    if (!entry || typeof entry !== 'object') return []
+    const candidate = entry as { level?: unknown; source?: unknown; message?: unknown; timestamp?: unknown }
+    if (!isRemoteDebugLevel(candidate.level)) return []
+
+    const timestamp = Number(candidate.timestamp)
+
+    return {
+      id: `${serverMeta.receivedAt}-${index}-${Math.random().toString(36).slice(2, 8)}`,
+      level: candidate.level,
+      source: sanitizeRemoteDebugText(candidate.source || 'Unknown', 160),
+      message: sanitizeRemoteDebugText(candidate.message || ''),
+      timestamp: Number.isFinite(timestamp) ? timestamp : Date.now(),
+      clientId,
+      sessionId,
+      appVersion,
+      pagePath,
+      userAgent,
+      language,
+      timezone,
+      screen,
+      ip: serverMeta.ip,
+      referer: serverMeta.referer,
+      receivedAt: serverMeta.receivedAt,
+    }
+  })
+}
+
+export const filterRemoteDebugRecords = <T extends Partial<RemoteDebugRecord>>(
+  records: T[],
+  filter: RemoteDebugRecordFilter,
+) => {
+  const query = filter.query?.trim().toLowerCase() || ''
+
+  return records.filter((record) => {
+    if (filter.level && record.level !== filter.level) return false
+    if (filter.clientId && record.clientId !== filter.clientId) return false
+    if (filter.sessionId && record.sessionId !== filter.sessionId) return false
+    if (!query) return true
+
+    return [record.source, record.message, record.clientId, record.sessionId]
+      .filter(Boolean)
+      .some((value) => String(value).toLowerCase().includes(query))
+  })
+}
+
+const remoteDebugDate = (date = new Date()) => date.toISOString().slice(0, 10)
+
+const remoteDebugFilePath = (date = remoteDebugDate()) => path.join(remoteDebugLogDir(), `${date}.jsonl`)
+
+const appendRemoteDebugRecords = async (records: RemoteDebugRecord[]) => {
+  if (!records.length) return
+
+  await fs.mkdir(remoteDebugLogDir(), { recursive: true })
+  await fs.appendFile(remoteDebugFilePath(), `${records.map((record) => JSON.stringify(record)).join('\n')}\n`)
+}
+
+const readRemoteDebugDates = async () => {
+  try {
+    const entries = await fs.readdir(remoteDebugLogDir(), { withFileTypes: true })
+    return entries
+      .filter((entry) => entry.isFile() && /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(entry.name))
+      .map((entry) => entry.name.replace(/\.jsonl$/, ''))
+      .sort()
+      .reverse()
+  } catch {
+    return []
+  }
+}
+
+const readRemoteDebugRecords = async (dates: string[]) => {
+  const chunks = await Promise.all(
+    dates.map(async (date) => {
+      try {
+        return await fs.readFile(remoteDebugFilePath(date), 'utf8')
+      } catch {
+        return ''
+      }
+    }),
+  )
+
+  return chunks
+    .join('\n')
+    .split('\n')
+    .flatMap((line) => {
+      if (!line.trim()) return []
+      try {
+        return JSON.parse(line) as RemoteDebugRecord
+      } catch {
+        return []
+      }
+    })
+}
+
+const remoteDebugRequestMeta = (request: IncomingMessage): RemoteDebugServerMeta => {
+  const forwardedFor = Array.isArray(request.headers['x-forwarded-for'])
+    ? request.headers['x-forwarded-for'][0]
+    : request.headers['x-forwarded-for']
+
+  return {
+    ip: (forwardedFor?.split(',')[0] || request.socket.remoteAddress || 'unknown').trim(),
+    referer: Array.isArray(request.headers.referer) ? request.headers.referer[0] : request.headers.referer || '',
+    receivedAt: new Date().toISOString(),
+  }
+}
+
+const hasRemoteDebugViewAccess = (request: IncomingMessage, requestUrl: URL) => {
+  const token = process.env.MIVO_DEBUG_VIEW_TOKEN?.trim()
+  if (!token) return true
+
+  const headerToken = Array.isArray(request.headers['x-mivo-debug-token'])
+    ? request.headers['x-mivo-debug-token'][0]
+    : request.headers['x-mivo-debug-token']
+
+  return headerToken === token || requestUrl.searchParams.get('token') === token
+}
+
+const handleRemoteDebugLogRequest = async (request: IncomingMessage, response: ServerResponse, requestUrl: URL) => {
+  if (request.method === 'POST') {
+    try {
+      const payload = await readJsonRequest<RemoteDebugPayload>(request)
+      const records = normalizeRemoteDebugPayload(payload, remoteDebugRequestMeta(request))
+      await appendRemoteDebugRecords(records)
+      sendMivoJson(response, 200, { ok: true, accepted: records.length })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to store debug logs'
+      sendMivoJson(response, error instanceof RequestBodyTooLargeError ? 413 : 400, { ok: false, error: message })
+    }
+    return
+  }
+
+  if (request.method === 'GET') {
+    if (!hasRemoteDebugViewAccess(request, requestUrl)) {
+      sendMivoJson(response, 403, { ok: false, error: 'Debug report token required' })
+      return
+    }
+
+    const availableDates = await readRemoteDebugDates()
+    const requestedDate = requestUrl.searchParams.get('date') || ''
+    const dates = requestedDate ? [requestedDate] : availableDates.slice(0, 7)
+    const limit = Math.min(Number(requestUrl.searchParams.get('limit')) || 200, 1000)
+    const records = filterRemoteDebugRecords(await readRemoteDebugRecords(dates), {
+      level: requestUrl.searchParams.get('level') || undefined,
+      clientId: requestUrl.searchParams.get('clientId') || undefined,
+      sessionId: requestUrl.searchParams.get('sessionId') || undefined,
+      query: requestUrl.searchParams.get('q') || undefined,
+    })
+      .sort((left, right) => Date.parse(right.receivedAt || '') - Date.parse(left.receivedAt || ''))
+      .slice(0, limit)
+
+    sendMivoJson(response, 200, { ok: true, dates: availableDates, records })
+    return
+  }
+
+  sendMivoJson(response, 405, { ok: false, error: 'Method not allowed' })
+}
+
 const readRequestBuffer = async (request: IncomingMessage, maxBytes: number) =>
   new Promise<Buffer>((resolve, reject) => {
     const chunks: Buffer[] = []
@@ -1154,6 +1409,11 @@ const localAssetLibraryPlugin = ({ imageApiKey, llmApiKey, platformCtx }: { imag
       const url = request.url || ''
       const requestUrl = new URL(url || '/', 'http://127.0.0.1')
       const pathname = requestUrl.pathname
+
+      if (pathname === '/api/mivo/debug-logs') {
+        await handleRemoteDebugLogRequest(request, response, requestUrl)
+        return
+      }
 
       if (pathname === '/api/mivo/generate') {
         await proxyMivoGenerate(request, response, imageApiKey, platformCtx)

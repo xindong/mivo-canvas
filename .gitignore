@@ -37,6 +37,7 @@ credentials/
 secrets/
 
 # ECC session data — not tracked
+data/debug-logs/
 history/checkpoints/
 history/daily/
 .claude/

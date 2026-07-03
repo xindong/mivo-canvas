@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { reportRemoteDebugEntry } from './remoteDebugReporter'
 
 export type DebugLogLevel = 'log' | 'warning' | 'error'
 
@@ -56,10 +57,14 @@ export const debugLogger = {
     useDebugLogStore.getState().addEntry({ level: 'log', source, message })
   },
   warn: (source: string, message: string) => {
-    useDebugLogStore.getState().addEntry({ level: 'warning', source, message })
+    const timestamp = Date.now()
+    useDebugLogStore.getState().addEntry({ level: 'warning', source, message, timestamp })
+    reportRemoteDebugEntry({ level: 'warning', source, message, timestamp })
   },
   error: (source: string, message: string) => {
-    useDebugLogStore.getState().addEntry({ level: 'error', source, message })
+    const timestamp = Date.now()
+    useDebugLogStore.getState().addEntry({ level: 'error', source, message, timestamp })
+    reportRemoteDebugEntry({ level: 'error', source, message, timestamp })
   },
 }
 

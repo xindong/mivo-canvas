@@ -27,6 +27,24 @@ This rule applies to new buttons, menu items, canvas actions, asset workflows, i
 
 Use both systems together when appropriate: `debugLogger` records what happened for diagnosis, while `toastFeedback` tells the user the visible result.
 
+## Remote Debug Reports
+
+`warning` and `error` entries are also queued for transparent remote diagnostics through `src/store/remoteDebugReporter.ts`. Normal `log` entries stay local-only.
+
+- The browser creates an anonymous persistent `clientId` in `localStorage`.
+- Each page load creates a new `sessionId`.
+- Reports include client/session metadata, page path, user agent, language, timezone, and screen size.
+- The server accepts reports at `POST /api/mivo/debug-logs` and stores JSONL files under `data/debug-logs/` by default.
+- Pure static deployments must set `VITE_MIVO_DEBUG_ENDPOINT` to the collector URL, for example `https://debug.example.com/api/mivo/debug-logs`.
+- Set `MIVO_DEBUG_LOG_DIR` to move the server-side log directory.
+- Set `VITE_MIVO_REMOTE_DEBUG=0` to disable browser uploads for a build.
+- Run `npm run debug:server` to start the standalone collector when the app is hosted as static files.
+- Visit `/debug-reports` or `/#/debug-reports` to browse uploaded reports. The hash route works with static hosts that do not rewrite paths to `index.html`.
+- Set `MIVO_DEBUG_VIEW_TOKEN` on the server to require a shared view token.
+- For cross-origin static hosting, set `MIVO_DEBUG_ALLOWED_ORIGIN` on the collector to the public app origin.
+
+Remote report payloads must be diagnosable but not raw data dumps. The server sanitizes likely tokens, data URLs, base64-like payloads, and oversized messages before writing records.
+
 ## Verification
 
 Run:
