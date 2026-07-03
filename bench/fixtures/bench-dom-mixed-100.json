@@ -1,0 +1,2087 @@
+{
+  "meta": {
+    "sceneId": "bench-dom-mixed-100",
+    "label": "100 mixed benchmark fixture",
+    "nodeCount": 100,
+    "seed": 20260704,
+    "counts": {
+      "image": 58,
+      "text": 22,
+      "frame": 8,
+      "connector": 12
+    },
+    "bounds": {
+      "x": -1706,
+      "y": -590,
+      "width": 3373,
+      "height": 1414
+    },
+    "recommendedViewport": {
+      "x": 970.062,
+      "y": 479.628,
+      "scale": 0.516
+    }
+  },
+  "snapshot": {
+    "version": 2,
+    "sceneId": "bench-dom-mixed-100",
+    "nodes": [
+      {
+        "id": "bench-frame-001",
+        "type": "frame",
+        "status": "ready",
+        "title": "Bench Section 01",
+        "x": -1706,
+        "y": -587,
+        "width": 738,
+        "height": 512,
+        "sectionFillColor": "#f6efe3",
+        "sectionBorderColor": "#be8754",
+        "sectionBorderWidth": 2,
+        "sectionBorderStyle": "dashed",
+        "frameColor": "#be8754",
+        "sectionTitleVisible": true
+      },
+      {
+        "id": "bench-frame-002",
+        "type": "frame",
+        "status": "ready",
+        "title": "Bench Section 02",
+        "x": -834,
+        "y": -590,
+        "width": 680,
+        "height": 484,
+        "sectionFillColor": "#e8f1ef",
+        "sectionBorderColor": "#5e9187",
+        "sectionBorderWidth": 2,
+        "sectionBorderStyle": "solid",
+        "frameColor": "#5e9187",
+        "sectionTitleVisible": true
+      },
+      {
+        "id": "bench-frame-003",
+        "type": "frame",
+        "status": "ready",
+        "title": "Bench Section 03",
+        "x": 46,
+        "y": -584,
+        "width": 701,
+        "height": 446,
+        "sectionFillColor": "#eef0f8",
+        "sectionBorderColor": "#6478aa",
+        "sectionBorderWidth": 2,
+        "sectionBorderStyle": "solid",
+        "frameColor": "#6478aa",
+        "sectionTitleVisible": true
+      },
+      {
+        "id": "bench-frame-004",
+        "type": "frame",
+        "status": "ready",
+        "title": "Bench Section 04",
+        "x": 932,
+        "y": -586,
+        "width": 735,
+        "height": 446,
+        "sectionFillColor": "#f8ece9",
+        "sectionBorderColor": "#ba6f65",
+        "sectionBorderWidth": 2,
+        "sectionBorderStyle": "dashed",
+        "frameColor": "#ba6f65",
+        "sectionTitleVisible": true
+      },
+      {
+        "id": "bench-frame-005",
+        "type": "frame",
+        "status": "ready",
+        "title": "Bench Section 05",
+        "x": -1692,
+        "y": 57,
+        "width": 776,
+        "height": 508,
+        "sectionFillColor": "#f6efe3",
+        "sectionBorderColor": "#be8754",
+        "sectionBorderWidth": 2,
+        "sectionBorderStyle": "solid",
+        "frameColor": "#be8754",
+        "sectionTitleVisible": true
+      },
+      {
+        "id": "bench-frame-006",
+        "type": "frame",
+        "status": "ready",
+        "title": "Bench Section 06",
+        "x": -815,
+        "y": 50,
+        "width": 727,
+        "height": 453,
+        "sectionFillColor": "#e8f1ef",
+        "sectionBorderColor": "#5e9187",
+        "sectionBorderWidth": 2,
+        "sectionBorderStyle": "solid",
+        "frameColor": "#5e9187",
+        "sectionTitleVisible": true
+      },
+      {
+        "id": "bench-frame-007",
+        "type": "frame",
+        "status": "ready",
+        "title": "Bench Section 07",
+        "x": 67,
+        "y": 51,
+        "width": 718,
+        "height": 509,
+        "sectionFillColor": "#eef0f8",
+        "sectionBorderColor": "#6478aa",
+        "sectionBorderWidth": 2,
+        "sectionBorderStyle": "dashed",
+        "frameColor": "#6478aa",
+        "sectionTitleVisible": true
+      },
+      {
+        "id": "bench-frame-008",
+        "type": "frame",
+        "status": "ready",
+        "title": "Bench Section 08",
+        "x": 938,
+        "y": 63,
+        "width": 683,
+        "height": 449,
+        "sectionFillColor": "#f8ece9",
+        "sectionBorderColor": "#ba6f65",
+        "sectionBorderWidth": 2,
+        "sectionBorderStyle": "solid",
+        "frameColor": "#ba6f65",
+        "sectionTitleVisible": true
+      },
+      {
+        "id": "bench-image-0001",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0001",
+        "x": -1670,
+        "y": -522,
+        "width": 168,
+        "height": 218,
+        "assetUrl": "/demo-assets/courage-1.jpg",
+        "sectionId": "bench-frame-001",
+        "generation": {
+          "prompt": "角色概念图对比稿，保留冷暖对撞和高饱和点缀",
+          "model": "gpt-image-2",
+          "size": "672x872",
+          "seed": 20260704,
+          "strength": 0.42
+        }
+      },
+      {
+        "id": "bench-image-0002",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0002",
+        "x": -792,
+        "y": -520,
+        "width": 162,
+        "height": 237,
+        "assetUrl": "/demo-assets/courage-2.jpg",
+        "sectionId": "bench-frame-002",
+        "generation": {
+          "prompt": "环境气氛草图，强调前景留白和纵深透视",
+          "model": "gemini-3-pro-image",
+          "size": "648x948",
+          "seed": 20260705,
+          "strength": 0.5
+        }
+      },
+      {
+        "id": "bench-image-0003",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0003",
+        "x": 89,
+        "y": -523,
+        "width": 170,
+        "height": 237,
+        "assetUrl": "/demo-assets/courage-3.jpg",
+        "sectionId": "bench-frame-003",
+        "generation": {
+          "prompt": "商品图变体探索，保持主体比例并改变光效方向",
+          "model": "gpt-image-2",
+          "size": "680x948",
+          "seed": 20260706,
+          "strength": 0.58
+        }
+      },
+      {
+        "id": "bench-image-0004",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0004",
+        "x": 973,
+        "y": -525,
+        "width": 168,
+        "height": 234,
+        "assetUrl": "/demo-assets/courage-1.jpg",
+        "sectionId": "bench-frame-004",
+        "generation": {
+          "prompt": "分镜式参考图，突出动作节奏和焦点引导",
+          "model": "gemini-3-pro-image",
+          "size": "672x936",
+          "seed": 20260707,
+          "strength": 0.66
+        }
+      },
+      {
+        "id": "bench-image-0005",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0005",
+        "x": -1651,
+        "y": 113,
+        "width": 167,
+        "height": 219,
+        "assetUrl": "/demo-assets/courage-2.jpg",
+        "sectionId": "bench-frame-005",
+        "generation": {
+          "prompt": "角色概念图对比稿，保留冷暖对撞和高饱和点缀",
+          "model": "gpt-image-2",
+          "size": "668x876",
+          "seed": 20260708,
+          "strength": 0.74
+        }
+      },
+      {
+        "id": "bench-image-0006",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0006",
+        "x": -785,
+        "y": 109,
+        "width": 169,
+        "height": 226,
+        "assetUrl": "/demo-assets/courage-3.jpg",
+        "sectionId": "bench-frame-006",
+        "generation": {
+          "prompt": "环境气氛草图，强调前景留白和纵深透视",
+          "model": "gemini-3-pro-image",
+          "size": "676x904",
+          "seed": 20260709,
+          "strength": 0.42
+        }
+      },
+      {
+        "id": "bench-image-0007",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0007",
+        "x": 109,
+        "y": 124,
+        "width": 171,
+        "height": 223,
+        "assetUrl": "/demo-assets/courage-1.jpg",
+        "sectionId": "bench-frame-007",
+        "generation": {
+          "prompt": "商品图变体探索，保持主体比例并改变光效方向",
+          "model": "gpt-image-2",
+          "size": "684x892",
+          "seed": 20260710,
+          "strength": 0.5
+        }
+      },
+      {
+        "id": "bench-image-0008",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0008",
+        "x": 971,
+        "y": 125,
+        "width": 165,
+        "height": 234,
+        "assetUrl": "/demo-assets/courage-2.jpg",
+        "sectionId": "bench-frame-008",
+        "generation": {
+          "prompt": "分镜式参考图，突出动作节奏和焦点引导",
+          "model": "gemini-3-pro-image",
+          "size": "660x936",
+          "seed": 20260711,
+          "strength": 0.58
+        }
+      },
+      {
+        "id": "bench-image-0009",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0009",
+        "x": -1445.333,
+        "y": -520,
+        "width": 159,
+        "height": 218,
+        "assetUrl": "/demo-assets/courage-3.jpg",
+        "sectionId": "bench-frame-001",
+        "generation": {
+          "prompt": "角色概念图对比稿，保留冷暖对撞和高饱和点缀",
+          "model": "gpt-image-2",
+          "size": "636x872",
+          "seed": 20260712,
+          "strength": 0.66
+        }
+      },
+      {
+        "id": "bench-image-0010",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0010",
+        "x": -593.667,
+        "y": -527,
+        "width": 160,
+        "height": 229,
+        "assetUrl": "/demo-assets/courage-1.jpg",
+        "sectionId": "bench-frame-002",
+        "generation": {
+          "prompt": "环境气氛草图，强调前景留白和纵深透视",
+          "model": "gemini-3-pro-image",
+          "size": "640x916",
+          "seed": 20260713,
+          "strength": 0.74
+        }
+      },
+      {
+        "id": "bench-image-0011",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0011",
+        "x": 297.333,
+        "y": -510,
+        "width": 164,
+        "height": 219,
+        "assetUrl": "/demo-assets/courage-2.jpg",
+        "sectionId": "bench-frame-003",
+        "generation": {
+          "prompt": "商品图变体探索，保持主体比例并改变光效方向",
+          "model": "gpt-image-2",
+          "size": "656x876",
+          "seed": 20260714,
+          "strength": 0.42
+        }
+      },
+      {
+        "id": "bench-image-0012",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0012",
+        "x": 1193.667,
+        "y": -517,
+        "width": 175,
+        "height": 239,
+        "assetUrl": "/demo-assets/courage-3.jpg",
+        "sectionId": "bench-frame-004",
+        "generation": {
+          "prompt": "分镜式参考图，突出动作节奏和焦点引导",
+          "model": "gemini-3-pro-image",
+          "size": "700x956",
+          "seed": 20260715,
+          "strength": 0.5
+        }
+      },
+      {
+        "id": "bench-image-0013",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0013",
+        "x": -1414.667,
+        "y": 121,
+        "width": 168,
+        "height": 238,
+        "assetUrl": "/demo-assets/courage-1.jpg",
+        "sectionId": "bench-frame-005",
+        "generation": {
+          "prompt": "角色概念图对比稿，保留冷暖对撞和高饱和点缀",
+          "model": "gpt-image-2",
+          "size": "672x952",
+          "seed": 20260716,
+          "strength": 0.58
+        }
+      },
+      {
+        "id": "bench-image-0014",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0014",
+        "x": -558,
+        "y": 125,
+        "width": 160,
+        "height": 215,
+        "assetUrl": "/demo-assets/courage-2.jpg",
+        "sectionId": "bench-frame-006",
+        "generation": {
+          "prompt": "环境气氛草图，强调前景留白和纵深透视",
+          "model": "gemini-3-pro-image",
+          "size": "640x860",
+          "seed": 20260717,
+          "strength": 0.66
+        }
+      },
+      {
+        "id": "bench-image-0015",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0015",
+        "x": 326,
+        "y": 120,
+        "width": 163,
+        "height": 218,
+        "assetUrl": "/demo-assets/courage-3.jpg",
+        "sectionId": "bench-frame-007",
+        "generation": {
+          "prompt": "商品图变体探索，保持主体比例并改变光效方向",
+          "model": "gpt-image-2",
+          "size": "652x872",
+          "seed": 20260718,
+          "strength": 0.74
+        }
+      },
+      {
+        "id": "bench-image-0016",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0016",
+        "x": 1175.333,
+        "y": 121,
+        "width": 171,
+        "height": 217,
+        "assetUrl": "/demo-assets/courage-1.jpg",
+        "sectionId": "bench-frame-008",
+        "generation": {
+          "prompt": "分镜式参考图，突出动作节奏和焦点引导",
+          "model": "gemini-3-pro-image",
+          "size": "684x868",
+          "seed": 20260719,
+          "strength": 0.42
+        }
+      },
+      {
+        "id": "bench-image-0017",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0017",
+        "x": -1223.667,
+        "y": -521,
+        "width": 158,
+        "height": 229,
+        "assetUrl": "/demo-assets/courage-2.jpg",
+        "sectionId": "bench-frame-001",
+        "generation": {
+          "prompt": "角色概念图对比稿，保留冷暖对撞和高饱和点缀",
+          "model": "gpt-image-2",
+          "size": "632x916",
+          "seed": 20260720,
+          "strength": 0.5
+        }
+      },
+      {
+        "id": "bench-image-0018",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0018",
+        "x": -394.333,
+        "y": -515,
+        "width": 162,
+        "height": 235,
+        "assetUrl": "/demo-assets/courage-3.jpg",
+        "sectionId": "bench-frame-002",
+        "generation": {
+          "prompt": "环境气氛草图，强调前景留白和纵深透视",
+          "model": "gemini-3-pro-image",
+          "size": "648x940",
+          "seed": 20260721,
+          "strength": 0.58
+        }
+      },
+      {
+        "id": "bench-image-0019",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0019",
+        "x": 498.667,
+        "y": -518,
+        "width": 163,
+        "height": 234,
+        "assetUrl": "/demo-assets/courage-1.jpg",
+        "sectionId": "bench-frame-003",
+        "generation": {
+          "prompt": "商品图变体探索，保持主体比例并改变光效方向",
+          "model": "gpt-image-2",
+          "size": "652x936",
+          "seed": 20260722,
+          "strength": 0.66
+        }
+      },
+      {
+        "id": "bench-image-0020",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0020",
+        "x": 1417.333,
+        "y": -530,
+        "width": 168,
+        "height": 229,
+        "assetUrl": "/demo-assets/courage-2.jpg",
+        "sectionId": "bench-frame-004",
+        "generation": {
+          "prompt": "分镜式参考图，突出动作节奏和焦点引导",
+          "model": "gemini-3-pro-image",
+          "size": "672x916",
+          "seed": 20260723,
+          "strength": 0.74
+        }
+      },
+      {
+        "id": "bench-image-0021",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0021",
+        "x": -1177.333,
+        "y": 129,
+        "width": 175,
+        "height": 233,
+        "assetUrl": "/demo-assets/courage-3.jpg",
+        "sectionId": "bench-frame-005",
+        "generation": {
+          "prompt": "角色概念图对比稿，保留冷暖对撞和高饱和点缀",
+          "model": "gpt-image-2",
+          "size": "700x932",
+          "seed": 20260724,
+          "strength": 0.42
+        }
+      },
+      {
+        "id": "bench-image-0022",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0022",
+        "x": -344,
+        "y": 123,
+        "width": 159,
+        "height": 218,
+        "assetUrl": "/demo-assets/courage-1.jpg",
+        "sectionId": "bench-frame-006",
+        "generation": {
+          "prompt": "环境气氛草图，强调前景留白和纵深透视",
+          "model": "gemini-3-pro-image",
+          "size": "636x872",
+          "seed": 20260725,
+          "strength": 0.5
+        }
+      },
+      {
+        "id": "bench-image-0023",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0023",
+        "x": 533,
+        "y": 116,
+        "width": 175,
+        "height": 241,
+        "assetUrl": "/demo-assets/courage-2.jpg",
+        "sectionId": "bench-frame-007",
+        "generation": {
+          "prompt": "商品图变体探索，保持主体比例并改变光效方向",
+          "model": "gpt-image-2",
+          "size": "700x964",
+          "seed": 20260726,
+          "strength": 0.58
+        }
+      },
+      {
+        "id": "bench-image-0024",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0024",
+        "x": 1393.667,
+        "y": 132,
+        "width": 162,
+        "height": 224,
+        "assetUrl": "/demo-assets/courage-3.jpg",
+        "sectionId": "bench-frame-008",
+        "generation": {
+          "prompt": "分镜式参考图，突出动作节奏和焦点引导",
+          "model": "gemini-3-pro-image",
+          "size": "648x896",
+          "seed": 20260727,
+          "strength": 0.66
+        }
+      },
+      {
+        "id": "bench-image-0025",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0025",
+        "x": -1676,
+        "y": -291,
+        "width": 175,
+        "height": 224,
+        "assetUrl": "/demo-assets/courage-1.jpg",
+        "sectionId": "bench-frame-001",
+        "generation": {
+          "prompt": "角色概念图对比稿，保留冷暖对撞和高饱和点缀",
+          "model": "gpt-image-2",
+          "size": "700x896",
+          "seed": 20260728,
+          "strength": 0.74
+        }
+      },
+      {
+        "id": "bench-image-0026",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0026",
+        "x": -800,
+        "y": -296,
+        "width": 170,
+        "height": 220,
+        "assetUrl": "/demo-assets/courage-2.jpg",
+        "sectionId": "bench-frame-002",
+        "generation": {
+          "prompt": "环境气氛草图，强调前景留白和纵深透视",
+          "model": "gemini-3-pro-image",
+          "size": "680x880",
+          "seed": 20260729,
+          "strength": 0.42
+        }
+      },
+      {
+        "id": "bench-image-0027",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0027",
+        "x": 83,
+        "y": -286,
+        "width": 170,
+        "height": 222,
+        "assetUrl": "/demo-assets/courage-3.jpg",
+        "sectionId": "bench-frame-003",
+        "generation": {
+          "prompt": "商品图变体探索，保持主体比例并改变光效方向",
+          "model": "gpt-image-2",
+          "size": "680x888",
+          "seed": 20260730,
+          "strength": 0.5
+        }
+      },
+      {
+        "id": "bench-image-0028",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0028",
+        "x": 971,
+        "y": -284,
+        "width": 159,
+        "height": 231,
+        "assetUrl": "/demo-assets/courage-1.jpg",
+        "sectionId": "bench-frame-004",
+        "generation": {
+          "prompt": "分镜式参考图，突出动作节奏和焦点引导",
+          "model": "gemini-3-pro-image",
+          "size": "636x924",
+          "seed": 20260731,
+          "strength": 0.58
+        }
+      },
+      {
+        "id": "bench-image-0029",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0029",
+        "x": -1656,
+        "y": 348,
+        "width": 160,
+        "height": 238,
+        "assetUrl": "/demo-assets/courage-2.jpg",
+        "sectionId": "bench-frame-005",
+        "generation": {
+          "prompt": "角色概念图对比稿，保留冷暖对撞和高饱和点缀",
+          "model": "gpt-image-2",
+          "size": "640x952",
+          "seed": 20260732,
+          "strength": 0.66
+        }
+      },
+      {
+        "id": "bench-image-0030",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0030",
+        "x": -787,
+        "y": 336,
+        "width": 159,
+        "height": 218,
+        "assetUrl": "/demo-assets/courage-3.jpg",
+        "sectionId": "bench-frame-006",
+        "generation": {
+          "prompt": "环境气氛草图，强调前景留白和纵深透视",
+          "model": "gemini-3-pro-image",
+          "size": "636x872",
+          "seed": 20260733,
+          "strength": 0.74
+        }
+      },
+      {
+        "id": "bench-image-0031",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0031",
+        "x": 108,
+        "y": 354,
+        "width": 159,
+        "height": 216,
+        "assetUrl": "/demo-assets/courage-1.jpg",
+        "sectionId": "bench-frame-007",
+        "generation": {
+          "prompt": "商品图变体探索，保持主体比例并改变光效方向",
+          "model": "gpt-image-2",
+          "size": "636x864",
+          "seed": 20260734,
+          "strength": 0.42
+        }
+      },
+      {
+        "id": "bench-image-0032",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0032",
+        "x": 978,
+        "y": 358,
+        "width": 175,
+        "height": 225,
+        "assetUrl": "/demo-assets/courage-2.jpg",
+        "sectionId": "bench-frame-008",
+        "generation": {
+          "prompt": "分镜式参考图，突出动作节奏和焦点引导",
+          "model": "gemini-3-pro-image",
+          "size": "700x900",
+          "seed": 20260735,
+          "strength": 0.5
+        }
+      },
+      {
+        "id": "bench-image-0033",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0033",
+        "x": -1438.333,
+        "y": -294,
+        "width": 173,
+        "height": 232,
+        "assetUrl": "/demo-assets/courage-3.jpg",
+        "sectionId": "bench-frame-001",
+        "generation": {
+          "prompt": "角色概念图对比稿，保留冷暖对撞和高饱和点缀",
+          "model": "gpt-image-2",
+          "size": "692x928",
+          "seed": 20260736,
+          "strength": 0.58
+        }
+      },
+      {
+        "id": "bench-image-0034",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0034",
+        "x": -586.667,
+        "y": -294,
+        "width": 164,
+        "height": 233,
+        "assetUrl": "/demo-assets/courage-1.jpg",
+        "sectionId": "bench-frame-002",
+        "generation": {
+          "prompt": "环境气氛草图，强调前景留白和纵深透视",
+          "model": "gemini-3-pro-image",
+          "size": "656x932",
+          "seed": 20260737,
+          "strength": 0.66
+        }
+      },
+      {
+        "id": "bench-image-0035",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0035",
+        "x": 286.333,
+        "y": -297,
+        "width": 174,
+        "height": 227,
+        "assetUrl": "/demo-assets/courage-2.jpg",
+        "sectionId": "bench-frame-003",
+        "generation": {
+          "prompt": "商品图变体探索，保持主体比例并改变光效方向",
+          "model": "gpt-image-2",
+          "size": "696x908",
+          "seed": 20260738,
+          "strength": 0.74
+        }
+      },
+      {
+        "id": "bench-image-0036",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0036",
+        "x": 1193.667,
+        "y": -281,
+        "width": 163,
+        "height": 230,
+        "assetUrl": "/demo-assets/courage-3.jpg",
+        "sectionId": "bench-frame-004",
+        "generation": {
+          "prompt": "分镜式参考图，突出动作节奏和焦点引导",
+          "model": "gemini-3-pro-image",
+          "size": "652x920",
+          "seed": 20260739,
+          "strength": 0.42
+        }
+      },
+      {
+        "id": "bench-image-0037",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0037",
+        "x": -1412.667,
+        "y": 345,
+        "width": 167,
+        "height": 230,
+        "assetUrl": "/demo-assets/courage-1.jpg",
+        "sectionId": "bench-frame-005",
+        "generation": {
+          "prompt": "角色概念图对比稿，保留冷暖对撞和高饱和点缀",
+          "model": "gpt-image-2",
+          "size": "668x920",
+          "seed": 20260740,
+          "strength": 0.5
+        }
+      },
+      {
+        "id": "bench-image-0038",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0038",
+        "x": -566,
+        "y": 337,
+        "width": 165,
+        "height": 235,
+        "assetUrl": "/demo-assets/courage-2.jpg",
+        "sectionId": "bench-frame-006",
+        "generation": {
+          "prompt": "环境气氛草图，强调前景留白和纵深透视",
+          "model": "gemini-3-pro-image",
+          "size": "660x940",
+          "seed": 20260741,
+          "strength": 0.58
+        }
+      },
+      {
+        "id": "bench-image-0039",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0039",
+        "x": 314,
+        "y": 345,
+        "width": 169,
+        "height": 234,
+        "assetUrl": "/demo-assets/courage-3.jpg",
+        "sectionId": "bench-frame-007",
+        "generation": {
+          "prompt": "商品图变体探索，保持主体比例并改变光效方向",
+          "model": "gpt-image-2",
+          "size": "676x936",
+          "seed": 20260742,
+          "strength": 0.66
+        }
+      },
+      {
+        "id": "bench-image-0040",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0040",
+        "x": 1183.333,
+        "y": 355,
+        "width": 173,
+        "height": 235,
+        "assetUrl": "/demo-assets/courage-1.jpg",
+        "sectionId": "bench-frame-008",
+        "generation": {
+          "prompt": "分镜式参考图，突出动作节奏和焦点引导",
+          "model": "gemini-3-pro-image",
+          "size": "692x940",
+          "seed": 20260743,
+          "strength": 0.74
+        }
+      },
+      {
+        "id": "bench-image-0041",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0041",
+        "x": -1228.667,
+        "y": -291,
+        "width": 166,
+        "height": 215,
+        "assetUrl": "/demo-assets/courage-2.jpg",
+        "sectionId": "bench-frame-001",
+        "generation": {
+          "prompt": "角色概念图对比稿，保留冷暖对撞和高饱和点缀",
+          "model": "gpt-image-2",
+          "size": "664x860",
+          "seed": 20260744,
+          "strength": 0.42
+        }
+      },
+      {
+        "id": "bench-image-0042",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0042",
+        "x": -388.333,
+        "y": -292,
+        "width": 169,
+        "height": 218,
+        "assetUrl": "/demo-assets/courage-3.jpg",
+        "sectionId": "bench-frame-002",
+        "generation": {
+          "prompt": "环境气氛草图，强调前景留白和纵深透视",
+          "model": "gemini-3-pro-image",
+          "size": "676x872",
+          "seed": 20260745,
+          "strength": 0.5
+        }
+      },
+      {
+        "id": "bench-image-0043",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0043",
+        "x": 512.667,
+        "y": -292,
+        "width": 168,
+        "height": 236,
+        "assetUrl": "/demo-assets/courage-1.jpg",
+        "sectionId": "bench-frame-003",
+        "generation": {
+          "prompt": "商品图变体探索，保持主体比例并改变光效方向",
+          "model": "gpt-image-2",
+          "size": "672x944",
+          "seed": 20260746,
+          "strength": 0.58
+        }
+      },
+      {
+        "id": "bench-image-0044",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0044",
+        "x": 1414.333,
+        "y": -300,
+        "width": 174,
+        "height": 236,
+        "assetUrl": "/demo-assets/courage-2.jpg",
+        "sectionId": "bench-frame-004",
+        "generation": {
+          "prompt": "分镜式参考图，突出动作节奏和焦点引导",
+          "model": "gemini-3-pro-image",
+          "size": "696x944",
+          "seed": 20260747,
+          "strength": 0.66
+        }
+      },
+      {
+        "id": "bench-image-0045",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0045",
+        "x": -1181.333,
+        "y": 357,
+        "width": 158,
+        "height": 225,
+        "assetUrl": "/demo-assets/courage-3.jpg",
+        "sectionId": "bench-frame-005",
+        "generation": {
+          "prompt": "角色概念图对比稿，保留冷暖对撞和高饱和点缀",
+          "model": "gpt-image-2",
+          "size": "632x900",
+          "seed": 20260748,
+          "strength": 0.74
+        }
+      },
+      {
+        "id": "bench-image-0046",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0046",
+        "x": -345,
+        "y": 338,
+        "width": 159,
+        "height": 222,
+        "assetUrl": "/demo-assets/courage-1.jpg",
+        "sectionId": "bench-frame-006",
+        "generation": {
+          "prompt": "环境气氛草图，强调前景留白和纵深透视",
+          "model": "gemini-3-pro-image",
+          "size": "636x888",
+          "seed": 20260749,
+          "strength": 0.42
+        }
+      },
+      {
+        "id": "bench-image-0047",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0047",
+        "x": 533,
+        "y": 356,
+        "width": 171,
+        "height": 220,
+        "assetUrl": "/demo-assets/courage-2.jpg",
+        "sectionId": "bench-frame-007",
+        "generation": {
+          "prompt": "商品图变体探索，保持主体比例并改变光效方向",
+          "model": "gpt-image-2",
+          "size": "684x880",
+          "seed": 20260750,
+          "strength": 0.5
+        }
+      },
+      {
+        "id": "bench-image-0048",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0048",
+        "x": 1384.667,
+        "y": 360,
+        "width": 166,
+        "height": 239,
+        "assetUrl": "/demo-assets/courage-3.jpg",
+        "sectionId": "bench-frame-008",
+        "generation": {
+          "prompt": "分镜式参考图，突出动作节奏和焦点引导",
+          "model": "gemini-3-pro-image",
+          "size": "664x956",
+          "seed": 20260751,
+          "strength": 0.58
+        }
+      },
+      {
+        "id": "bench-image-0049",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0049",
+        "x": -1663,
+        "y": -55,
+        "width": 163,
+        "height": 237,
+        "assetUrl": "/demo-assets/courage-1.jpg",
+        "sectionId": "bench-frame-001",
+        "generation": {
+          "prompt": "角色概念图对比稿，保留冷暖对撞和高饱和点缀",
+          "model": "gpt-image-2",
+          "size": "652x948",
+          "seed": 20260752,
+          "strength": 0.66
+        }
+      },
+      {
+        "id": "bench-image-0050",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0050",
+        "x": -799,
+        "y": -73,
+        "width": 174,
+        "height": 222,
+        "assetUrl": "/demo-assets/courage-2.jpg",
+        "sectionId": "bench-frame-002",
+        "generation": {
+          "prompt": "环境气氛草图，强调前景留白和纵深透视",
+          "model": "gemini-3-pro-image",
+          "size": "696x888",
+          "seed": 20260753,
+          "strength": 0.74
+        }
+      },
+      {
+        "id": "bench-image-0051",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0051",
+        "x": 85,
+        "y": -55,
+        "width": 164,
+        "height": 222,
+        "assetUrl": "/demo-assets/courage-3.jpg",
+        "sectionId": "bench-frame-003",
+        "generation": {
+          "prompt": "商品图变体探索，保持主体比例并改变光效方向",
+          "model": "gpt-image-2",
+          "size": "656x888",
+          "seed": 20260754,
+          "strength": 0.42
+        }
+      },
+      {
+        "id": "bench-image-0052",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0052",
+        "x": 971,
+        "y": -53,
+        "width": 159,
+        "height": 238,
+        "assetUrl": "/demo-assets/courage-1.jpg",
+        "sectionId": "bench-frame-004",
+        "generation": {
+          "prompt": "分镜式参考图，突出动作节奏和焦点引导",
+          "model": "gemini-3-pro-image",
+          "size": "636x952",
+          "seed": 20260755,
+          "strength": 0.5
+        }
+      },
+      {
+        "id": "bench-image-0053",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0053",
+        "x": -1651,
+        "y": 583,
+        "width": 168,
+        "height": 241,
+        "assetUrl": "/demo-assets/courage-2.jpg",
+        "sectionId": "bench-frame-005",
+        "generation": {
+          "prompt": "角色概念图对比稿，保留冷暖对撞和高饱和点缀",
+          "model": "gpt-image-2",
+          "size": "672x964",
+          "seed": 20260756,
+          "strength": 0.58
+        }
+      },
+      {
+        "id": "bench-image-0054",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0054",
+        "x": -783,
+        "y": 566,
+        "width": 160,
+        "height": 229,
+        "assetUrl": "/demo-assets/courage-3.jpg",
+        "sectionId": "bench-frame-006",
+        "generation": {
+          "prompt": "环境气氛草图，强调前景留白和纵深透视",
+          "model": "gemini-3-pro-image",
+          "size": "640x916",
+          "seed": 20260757,
+          "strength": 0.66
+        }
+      },
+      {
+        "id": "bench-image-0055",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0055",
+        "x": 110,
+        "y": 580,
+        "width": 158,
+        "height": 217,
+        "assetUrl": "/demo-assets/courage-1.jpg",
+        "sectionId": "bench-frame-007",
+        "generation": {
+          "prompt": "商品图变体探索，保持主体比例并改变光效方向",
+          "model": "gpt-image-2",
+          "size": "632x868",
+          "seed": 20260758,
+          "strength": 0.74
+        }
+      },
+      {
+        "id": "bench-image-0056",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0056",
+        "x": 969,
+        "y": 592,
+        "width": 175,
+        "height": 225,
+        "assetUrl": "/demo-assets/courage-2.jpg",
+        "sectionId": "bench-frame-008",
+        "generation": {
+          "prompt": "分镜式参考图，突出动作节奏和焦点引导",
+          "model": "gemini-3-pro-image",
+          "size": "700x900",
+          "seed": 20260759,
+          "strength": 0.42
+        }
+      },
+      {
+        "id": "bench-image-0057",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0057",
+        "x": -1451.333,
+        "y": -61,
+        "width": 173,
+        "height": 238,
+        "assetUrl": "/demo-assets/courage-3.jpg",
+        "sectionId": "bench-frame-001",
+        "generation": {
+          "prompt": "角色概念图对比稿，保留冷暖对撞和高饱和点缀",
+          "model": "gpt-image-2",
+          "size": "692x952",
+          "seed": 20260760,
+          "strength": 0.5
+        }
+      },
+      {
+        "id": "bench-image-0058",
+        "type": "image",
+        "status": "ready",
+        "title": "Bench Image 0058",
+        "x": -600.667,
+        "y": -65,
+        "width": 172,
+        "height": 222,
+        "assetUrl": "/demo-assets/courage-1.jpg",
+        "sectionId": "bench-frame-002",
+        "generation": {
+          "prompt": "环境气氛草图，强调前景留白和纵深透视",
+          "model": "gemini-3-pro-image",
+          "size": "688x888",
+          "seed": 20260761,
+          "strength": 0.58
+        }
+      },
+      {
+        "id": "bench-text-0001",
+        "type": "text",
+        "status": "ready",
+        "title": "Bench Text 0001",
+        "x": -1669,
+        "y": -225,
+        "width": 269,
+        "height": 105,
+        "text": "Key beats: silhouette, trim light, negative space.",
+        "textColor": "#4f3721",
+        "textAlign": "center",
+        "fontSize": 18,
+        "fontWeight": 600,
+        "sectionId": "bench-frame-001"
+      },
+      {
+        "id": "bench-text-0002",
+        "type": "text",
+        "status": "ready",
+        "title": "Bench Text 0002",
+        "x": -788,
+        "y": -252,
+        "width": 255,
+        "height": 95,
+        "text": "Color callout: push cyan shadows, keep warm accents tight.",
+        "textColor": "#24423e",
+        "textAlign": "left",
+        "fontSize": 20,
+        "fontWeight": 500,
+        "sectionId": "bench-frame-002"
+      },
+      {
+        "id": "bench-text-0003",
+        "type": "text",
+        "status": "ready",
+        "title": "Bench Text 0003",
+        "x": 86,
+        "y": -286,
+        "width": 264,
+        "height": 104,
+        "text": "Layout note: preserve read path from upper-left to focal node.",
+        "textColor": "#2b3554",
+        "textAlign": "left",
+        "fontSize": 22,
+        "fontWeight": 500,
+        "sectionId": "bench-frame-003"
+      },
+      {
+        "id": "bench-text-0004",
+        "type": "text",
+        "status": "ready",
+        "title": "Bench Text 0004",
+        "x": 972,
+        "y": -290,
+        "width": 235,
+        "height": 92,
+        "text": "Anchor copy: keep copy short and production-facing.",
+        "textColor": "#5d2f2f",
+        "textAlign": "center",
+        "fontSize": 18,
+        "fontWeight": 500,
+        "sectionId": "bench-frame-004"
+      },
+      {
+        "id": "bench-text-0005",
+        "type": "text",
+        "status": "ready",
+        "title": "Bench Text 0005",
+        "x": -1657,
+        "y": 420,
+        "width": 241,
+        "height": 106,
+        "text": "QA note: compare crop headroom before sign-off.",
+        "textColor": "#4f3721",
+        "textAlign": "left",
+        "fontSize": 20,
+        "fontWeight": 600,
+        "sectionId": "bench-frame-005"
+      },
+      {
+        "id": "bench-text-0006",
+        "type": "text",
+        "status": "ready",
+        "title": "Bench Text 0006",
+        "x": -780,
+        "y": 350,
+        "width": 259,
+        "height": 89,
+        "text": "Key beats: silhouette, trim light, negative space.",
+        "textColor": "#24423e",
+        "textAlign": "left",
+        "fontSize": 22,
+        "fontWeight": 500,
+        "sectionId": "bench-frame-006"
+      },
+      {
+        "id": "bench-text-0007",
+        "type": "text",
+        "status": "ready",
+        "title": "Bench Text 0007",
+        "x": 114,
+        "y": 414,
+        "width": 254,
+        "height": 94,
+        "text": "Color callout: push cyan shadows, keep warm accents tight.",
+        "textColor": "#2b3554",
+        "textAlign": "center",
+        "fontSize": 18,
+        "fontWeight": 500,
+        "sectionId": "bench-frame-007"
+      },
+      {
+        "id": "bench-text-0008",
+        "type": "text",
+        "status": "ready",
+        "title": "Bench Text 0008",
+        "x": 975,
+        "y": 363,
+        "width": 255,
+        "height": 87,
+        "text": "Layout note: preserve read path from upper-left to focal node.",
+        "textColor": "#5d2f2f",
+        "textAlign": "left",
+        "fontSize": 20,
+        "fontWeight": 500,
+        "sectionId": "bench-frame-008"
+      },
+      {
+        "id": "bench-text-0009",
+        "type": "text",
+        "status": "ready",
+        "title": "Bench Text 0009",
+        "x": -1349,
+        "y": -231,
+        "width": 235,
+        "height": 86,
+        "text": "Anchor copy: keep copy short and production-facing.",
+        "textColor": "#4f3721",
+        "textAlign": "left",
+        "fontSize": 22,
+        "fontWeight": 600,
+        "sectionId": "bench-frame-001"
+      },
+      {
+        "id": "bench-text-0010",
+        "type": "text",
+        "status": "ready",
+        "title": "Bench Text 0010",
+        "x": -498,
+        "y": -254,
+        "width": 235,
+        "height": 103,
+        "text": "QA note: compare crop headroom before sign-off.",
+        "textColor": "#24423e",
+        "textAlign": "center",
+        "fontSize": 18,
+        "fontWeight": 500,
+        "sectionId": "bench-frame-002"
+      },
+      {
+        "id": "bench-text-0011",
+        "type": "text",
+        "status": "ready",
+        "title": "Bench Text 0011",
+        "x": 384.5,
+        "y": -292,
+        "width": 250,
+        "height": 86,
+        "text": "Key beats: silhouette, trim light, negative space.",
+        "textColor": "#2b3554",
+        "textAlign": "left",
+        "fontSize": 20,
+        "fontWeight": 500,
+        "sectionId": "bench-frame-003"
+      },
+      {
+        "id": "bench-text-0012",
+        "type": "text",
+        "status": "ready",
+        "title": "Bench Text 0012",
+        "x": 1285.5,
+        "y": -292,
+        "width": 236,
+        "height": 98,
+        "text": "Color callout: push cyan shadows, keep warm accents tight.",
+        "textColor": "#5d2f2f",
+        "textAlign": "left",
+        "fontSize": 22,
+        "fontWeight": 500,
+        "sectionId": "bench-frame-004"
+      },
+      {
+        "id": "bench-text-0013",
+        "type": "text",
+        "status": "ready",
+        "title": "Bench Text 0013",
+        "x": -1311,
+        "y": 414,
+        "width": 248,
+        "height": 105,
+        "text": "Layout note: preserve read path from upper-left to focal node.",
+        "textColor": "#4f3721",
+        "textAlign": "center",
+        "fontSize": 18,
+        "fontWeight": 600,
+        "sectionId": "bench-frame-005"
+      },
+      {
+        "id": "bench-text-0014",
+        "type": "text",
+        "status": "ready",
+        "title": "Bench Text 0014",
+        "x": -455.5,
+        "y": 353,
+        "width": 264,
+        "height": 99,
+        "text": "Anchor copy: keep copy short and production-facing.",
+        "textColor": "#24423e",
+        "textAlign": "left",
+        "fontSize": 20,
+        "fontWeight": 500,
+        "sectionId": "bench-frame-006"
+      },
+      {
+        "id": "bench-text-0015",
+        "type": "text",
+        "status": "ready",
+        "title": "Bench Text 0015",
+        "x": 423,
+        "y": 408,
+        "width": 247,
+        "height": 97,
+        "text": "QA note: compare crop headroom before sign-off.",
+        "textColor": "#2b3554",
+        "textAlign": "left",
+        "fontSize": 22,
+        "fontWeight": 500,
+        "sectionId": "bench-frame-007"
+      },
+      {
+        "id": "bench-text-0016",
+        "type": "text",
+        "status": "ready",
+        "title": "Bench Text 0016",
+        "x": 1271.5,
+        "y": 359,
+        "width": 231,
+        "height": 95,
+        "text": "Key beats: silhouette, trim light, negative space.",
+        "textColor": "#5d2f2f",
+        "textAlign": "center",
+        "fontSize": 18,
+        "fontWeight": 500,
+        "sectionId": "bench-frame-008"
+      },
+      {
+        "id": "bench-text-0017",
+        "type": "text",
+        "status": "ready",
+        "title": "Bench Text 0017",
+        "x": -1665,
+        "y": -325,
+        "width": 267,
+        "height": 82,
+        "text": "Color callout: push cyan shadows, keep warm accents tight.",
+        "textColor": "#4f3721",
+        "textAlign": "left",
+        "fontSize": 20,
+        "fontWeight": 600,
+        "sectionId": "bench-frame-001"
+      },
+      {
+        "id": "bench-text-0018",
+        "type": "text",
+        "status": "ready",
+        "title": "Bench Text 0018",
+        "x": -793,
+        "y": -350,
+        "width": 248,
+        "height": 88,
+        "text": "Layout note: preserve read path from upper-left to focal node.",
+        "textColor": "#24423e",
+        "textAlign": "left",
+        "fontSize": 22,
+        "fontWeight": 500,
+        "sectionId": "bench-frame-002"
+      },
+      {
+        "id": "bench-text-0019",
+        "type": "text",
+        "status": "ready",
+        "title": "Bench Text 0019",
+        "x": 93,
+        "y": -382,
+        "width": 253,
+        "height": 101,
+        "text": "Anchor copy: keep copy short and production-facing.",
+        "textColor": "#2b3554",
+        "textAlign": "center",
+        "fontSize": 18,
+        "fontWeight": 500,
+        "sectionId": "bench-frame-003"
+      },
+      {
+        "id": "bench-text-0020",
+        "type": "text",
+        "status": "ready",
+        "title": "Bench Text 0020",
+        "x": 971,
+        "y": -394,
+        "width": 265,
+        "height": 100,
+        "text": "QA note: compare crop headroom before sign-off.",
+        "textColor": "#5d2f2f",
+        "textAlign": "left",
+        "fontSize": 20,
+        "fontWeight": 500,
+        "sectionId": "bench-frame-004"
+      },
+      {
+        "id": "bench-text-0021",
+        "type": "text",
+        "status": "ready",
+        "title": "Bench Text 0021",
+        "x": -1650,
+        "y": 322,
+        "width": 260,
+        "height": 91,
+        "text": "Key beats: silhouette, trim light, negative space.",
+        "textColor": "#4f3721",
+        "textAlign": "left",
+        "fontSize": 22,
+        "fontWeight": 600,
+        "sectionId": "bench-frame-005"
+      },
+      {
+        "id": "bench-text-0022",
+        "type": "text",
+        "status": "ready",
+        "title": "Bench Text 0022",
+        "x": -777,
+        "y": 252,
+        "width": 248,
+        "height": 87,
+        "text": "Color callout: push cyan shadows, keep warm accents tight.",
+        "textColor": "#24423e",
+        "textAlign": "center",
+        "fontSize": 18,
+        "fontWeight": 500,
+        "sectionId": "bench-frame-006"
+      },
+      {
+        "id": "bench-connector-0001",
+        "type": "markup",
+        "status": "ready",
+        "title": "Bench Connector 0001",
+        "x": -1530,
+        "y": -441,
+        "width": 334.333,
+        "height": 62.5,
+        "sectionId": "bench-frame-001",
+        "markupKind": "arrow",
+        "markupStrokeColor": "#9c5d31",
+        "markupStrokeWidth": 4,
+        "markupStrokeStyle": "dashed",
+        "markupOpacity": 0.92,
+        "markupEndArrow": true,
+        "text": "flow",
+        "connectorStart": {
+          "nodeId": "bench-image-0001",
+          "anchor": "right",
+          "offset": 0.5
+        },
+        "connectorEnd": {
+          "nodeId": "bench-image-0017",
+          "anchor": "left",
+          "offset": 0.5
+        },
+        "markupPoints": [
+          {
+            "x": 28,
+            "y": 28
+          },
+          {
+            "x": 306.333,
+            "y": 34.5
+          }
+        ]
+      },
+      {
+        "id": "bench-connector-0002",
+        "type": "markup",
+        "status": "ready",
+        "title": "Bench Connector 0002",
+        "x": -541.667,
+        "y": -326,
+        "width": 265.834,
+        "height": 62,
+        "sectionId": "bench-frame-002",
+        "markupKind": "arrow",
+        "markupStrokeColor": "#38665e",
+        "markupStrokeWidth": 4,
+        "markupStrokeStyle": "solid",
+        "markupOpacity": 0.92,
+        "markupEndArrow": true,
+        "connectorStart": {
+          "nodeId": "bench-image-0010",
+          "anchor": "bottom",
+          "offset": 0.5
+        },
+        "connectorEnd": {
+          "nodeId": "bench-image-0042",
+          "anchor": "top",
+          "offset": 0.5
+        },
+        "markupPoints": [
+          {
+            "x": 28,
+            "y": 28
+          },
+          {
+            "x": 237.834,
+            "y": 34
+          }
+        ]
+      },
+      {
+        "id": "bench-connector-0003",
+        "type": "markup",
+        "status": "ready",
+        "title": "Bench Connector 0003",
+        "x": 481.5,
+        "y": -320,
+        "width": 126.667,
+        "height": 64,
+        "sectionId": "bench-frame-003",
+        "markupKind": "arrow",
+        "markupStrokeColor": "#465989",
+        "markupStrokeWidth": 4,
+        "markupStrokeStyle": "solid",
+        "markupOpacity": 0.92,
+        "markupEndArrow": true,
+        "connectorStart": {
+          "nodeId": "bench-image-0019",
+          "anchor": "bottom",
+          "offset": 0.5
+        },
+        "connectorEnd": {
+          "nodeId": "bench-text-0011",
+          "anchor": "top",
+          "offset": 0.5
+        },
+        "markupPoints": [
+          {
+            "x": 98.667,
+            "y": 36
+          },
+          {
+            "x": 28,
+            "y": 28
+          }
+        ]
+      },
+      {
+        "id": "bench-connector-0004",
+        "type": "markup",
+        "status": "ready",
+        "title": "Bench Connector 0004",
+        "x": 1102,
+        "y": -425.5,
+        "width": 119.667,
+        "height": 285,
+        "sectionId": "bench-frame-004",
+        "markupKind": "arrow",
+        "markupStrokeColor": "#8d4f47",
+        "markupStrokeWidth": 4,
+        "markupStrokeStyle": "solid",
+        "markupOpacity": 0.92,
+        "markupEndArrow": true,
+        "connectorStart": {
+          "nodeId": "bench-image-0028",
+          "anchor": "right",
+          "offset": 0.5
+        },
+        "connectorEnd": {
+          "nodeId": "bench-image-0012",
+          "anchor": "left",
+          "offset": 0.5
+        },
+        "markupPoints": [
+          {
+            "x": 28,
+            "y": 257
+          },
+          {
+            "x": 91.667,
+            "y": 28
+          }
+        ]
+      },
+      {
+        "id": "bench-connector-0005",
+        "type": "markup",
+        "status": "ready",
+        "title": "Bench Connector 0005",
+        "x": -1273.667,
+        "y": 432,
+        "width": 120.334,
+        "height": 65.5,
+        "sectionId": "bench-frame-005",
+        "markupKind": "arrow",
+        "markupStrokeColor": "#9c5d31",
+        "markupStrokeWidth": 4,
+        "markupStrokeStyle": "solid",
+        "markupOpacity": 0.92,
+        "markupEndArrow": true,
+        "text": "flow",
+        "connectorStart": {
+          "nodeId": "bench-image-0037",
+          "anchor": "right",
+          "offset": 0.5
+        },
+        "connectorEnd": {
+          "nodeId": "bench-image-0045",
+          "anchor": "left",
+          "offset": 0.5
+        },
+        "markupPoints": [
+          {
+            "x": 28,
+            "y": 28
+          },
+          {
+            "x": 92.334,
+            "y": 37.5
+          }
+        ]
+      },
+      {
+        "id": "bench-connector-0006",
+        "type": "markup",
+        "status": "ready",
+        "title": "Bench Connector 0006",
+        "x": -549,
+        "y": 366.5,
+        "width": 232,
+        "height": 110.5,
+        "sectionId": "bench-frame-006",
+        "markupKind": "arrow",
+        "markupStrokeColor": "#38665e",
+        "markupStrokeWidth": 4,
+        "markupStrokeStyle": "dashed",
+        "markupOpacity": 0.92,
+        "markupEndArrow": true,
+        "connectorStart": {
+          "nodeId": "bench-image-0046",
+          "anchor": "left",
+          "offset": 0.5
+        },
+        "connectorEnd": {
+          "nodeId": "bench-text-0006",
+          "anchor": "right",
+          "offset": 0.5
+        },
+        "markupPoints": [
+          {
+            "x": 204,
+            "y": 82.5
+          },
+          {
+            "x": 28,
+            "y": 28
+          }
+        ]
+      },
+      {
+        "id": "bench-connector-0007",
+        "type": "markup",
+        "status": "ready",
+        "title": "Bench Connector 0007",
+        "x": 161,
+        "y": 329,
+        "width": 487.5,
+        "height": 279,
+        "sectionId": "bench-frame-007",
+        "markupKind": "arrow",
+        "markupStrokeColor": "#465989",
+        "markupStrokeWidth": 4,
+        "markupStrokeStyle": "solid",
+        "markupOpacity": 0.92,
+        "markupEndArrow": true,
+        "connectorStart": {
+          "nodeId": "bench-image-0055",
+          "anchor": "top",
+          "offset": 0.5
+        },
+        "connectorEnd": {
+          "nodeId": "bench-image-0023",
+          "anchor": "bottom",
+          "offset": 0.5
+        },
+        "markupPoints": [
+          {
+            "x": 28,
+            "y": 251
+          },
+          {
+            "x": 459.5,
+            "y": 28
+          }
+        ]
+      },
+      {
+        "id": "bench-connector-0008",
+        "type": "markup",
+        "status": "ready",
+        "title": "Bench Connector 0008",
+        "x": 1202,
+        "y": 378.5,
+        "width": 210.667,
+        "height": 129,
+        "sectionId": "bench-frame-008",
+        "markupKind": "arrow",
+        "markupStrokeColor": "#8d4f47",
+        "markupStrokeWidth": 4,
+        "markupStrokeStyle": "solid",
+        "markupOpacity": 0.92,
+        "markupEndArrow": true,
+        "connectorStart": {
+          "nodeId": "bench-text-0008",
+          "anchor": "right",
+          "offset": 0.5
+        },
+        "connectorEnd": {
+          "nodeId": "bench-image-0048",
+          "anchor": "left",
+          "offset": 0.5
+        },
+        "markupPoints": [
+          {
+            "x": 28,
+            "y": 28
+          },
+          {
+            "x": 182.667,
+            "y": 101
+          }
+        ]
+      },
+      {
+        "id": "bench-connector-0009",
+        "type": "markup",
+        "status": "ready",
+        "title": "Bench Connector 0009",
+        "x": -1466.333,
+        "y": -206,
+        "width": 94.333,
+        "height": 61.5,
+        "sectionId": "bench-frame-001",
+        "markupKind": "arrow",
+        "markupStrokeColor": "#9c5d31",
+        "markupStrokeWidth": 4,
+        "markupStrokeStyle": "solid",
+        "markupOpacity": 0.92,
+        "markupEndArrow": true,
+        "text": "flow",
+        "connectorStart": {
+          "nodeId": "bench-text-0001",
+          "anchor": "right",
+          "offset": 0.5
+        },
+        "connectorEnd": {
+          "nodeId": "bench-image-0033",
+          "anchor": "left",
+          "offset": 0.5
+        },
+        "markupPoints": [
+          {
+            "x": 66.333,
+            "y": 33.5
+          },
+          {
+            "x": 28,
+            "y": 28
+          }
+        ]
+      },
+      {
+        "id": "bench-connector-0010",
+        "type": "markup",
+        "status": "ready",
+        "title": "Bench Connector 0010",
+        "x": -542.667,
+        "y": -179,
+        "width": 190.167,
+        "height": 142,
+        "sectionId": "bench-frame-002",
+        "markupKind": "arrow",
+        "markupStrokeColor": "#38665e",
+        "markupStrokeWidth": 4,
+        "markupStrokeStyle": "solid",
+        "markupOpacity": 0.92,
+        "markupEndArrow": true,
+        "connectorStart": {
+          "nodeId": "bench-text-0010",
+          "anchor": "bottom",
+          "offset": 0.5
+        },
+        "connectorEnd": {
+          "nodeId": "bench-image-0058",
+          "anchor": "top",
+          "offset": 0.5
+        },
+        "markupPoints": [
+          {
+            "x": 162.167,
+            "y": 28
+          },
+          {
+            "x": 28,
+            "y": 114
+          }
+        ]
+      },
+      {
+        "id": "bench-connector-0011",
+        "type": "markup",
+        "status": "ready",
+        "title": "Bench Connector 0011",
+        "x": 231,
+        "y": -432.5,
+        "width": 295.667,
+        "height": 59.5,
+        "sectionId": "bench-frame-003",
+        "markupKind": "arrow",
+        "markupStrokeColor": "#465989",
+        "markupStrokeWidth": 4,
+        "markupStrokeStyle": "dashed",
+        "markupOpacity": 0.92,
+        "markupEndArrow": true,
+        "connectorStart": {
+          "nodeId": "bench-image-0003",
+          "anchor": "right",
+          "offset": 0.5
+        },
+        "connectorEnd": {
+          "nodeId": "bench-image-0019",
+          "anchor": "left",
+          "offset": 0.5
+        },
+        "markupPoints": [
+          {
+            "x": 28,
+            "y": 28
+          },
+          {
+            "x": 267.667,
+            "y": 31.5
+          }
+        ]
+      },
+      {
+        "id": "bench-connector-0012",
+        "type": "markup",
+        "status": "ready",
+        "title": "Bench Connector 0012",
+        "x": 1340.667,
+        "y": -425.5,
+        "width": 101.666,
+        "height": 271.5,
+        "sectionId": "bench-frame-004",
+        "markupKind": "arrow",
+        "markupStrokeColor": "#8d4f47",
+        "markupStrokeWidth": 4,
+        "markupStrokeStyle": "solid",
+        "markupOpacity": 0.92,
+        "markupEndArrow": true,
+        "connectorStart": {
+          "nodeId": "bench-image-0012",
+          "anchor": "right",
+          "offset": 0.5
+        },
+        "connectorEnd": {
+          "nodeId": "bench-image-0044",
+          "anchor": "left",
+          "offset": 0.5
+        },
+        "markupPoints": [
+          {
+            "x": 28,
+            "y": 28
+          },
+          {
+            "x": 73.666,
+            "y": 243.5
+          }
+        ]
+      }
+    ],
+    "edges": [],
+    "tasks": [
+      {
+        "id": "bench-task-100",
+        "label": "100 mixed-node benchmark fixture ready",
+        "status": "done",
+        "progress": 100,
+        "nodeIds": [
+          "bench-frame-001",
+          "bench-frame-002",
+          "bench-frame-003",
+          "bench-frame-004",
+          "bench-frame-005",
+          "bench-frame-006",
+          "bench-frame-007",
+          "bench-frame-008",
+          "bench-image-0001",
+          "bench-image-0002",
+          "bench-image-0003",
+          "bench-image-0004"
+        ]
+      }
+    ],
+    "selectedNodeId": "bench-image-0001",
+    "selectedNodeIds": [
+      "bench-image-0001"
+    ]
+  }
+}

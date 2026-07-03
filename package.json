@@ -8,6 +8,8 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
+    "bench:fixtures": "node scripts/bench/generate-fixtures.mjs",
+    "bench:collect": "node scripts/bench/collect.mjs",
     "debug:server": "node scripts/debug-log-server.mjs",
     "test:unit": "vitest run",
     "verify:logging": "node scripts/verify-debug-logging.mjs",
