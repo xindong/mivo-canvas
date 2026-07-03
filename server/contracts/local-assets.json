@@ -1,0 +1,78 @@
+{
+  "endpoint": "/api/mivo/local-assets and /api/mivo/local-assets/:id",
+  "summary": "Local filesystem image browser. List scans configured root dir(s) for image files; file stream serves a single asset by base64url id. Path-traversal guard is LEXICAL (path.resolve), not symlink-safe realpath.",
+  "sourceFile": "vite.config.ts",
+  "dispatchRef": "list L1433-L1443; file L1588-L1609; readLocalAssets L1103-L1185",
+  "methods": {
+    "GET": "primary",
+    "other": "DISCREPANCY — no method guard. POST/PUT/DELETE to the list or file path returns the same 200 response as GET. See discrepancy note."
+  },
+  "envDeps": ["MIVO_ASSET_DIR (default ~/Desktop/Images then ~/Desktop/images, L137-L148)"],
+  "scenarios": [
+    {
+      "name": "list 200 (empty/nonexistent root)",
+      "request": { "method": "GET", "path": "/api/mivo/local-assets" },
+      "condition": "MIVO_ASSET_DIR unset; ~/Desktop/Images absent",
+      "expected": { "status": 200, "body": { "root": "~/Desktop/images", "assets": [] } },
+      "source": "code-derived",
+      "sourceRef": "readLocalAssets L1103-L1185; root fallback L1182",
+      "note": "When root dir absent, existingRoots=[] → assets=[], root falls back to '~/Desktop/images'. NOT live-captured: the capture run points MIVO_ASSET_DIR at a temp dir with an asset to exercise the file-serving path; the empty variant is the same code path with an absent dir."
+    },
+    {
+      "name": "list 200 (with asset)",
+      "condition": "MIVO_ASSET_DIR set to temp dir containing a .svg/.png",
+      "expected": { "status": 200, "body": { "root": "<dir>", "assets": [{ "id": "<base64url>", "name": "...", "title": "...", "format": "SVG", "sizeBytes": 0, "sourcePath": "...", "updatedAt": 0, "url": "/api/mivo/local-assets/<id>" }] } },
+      "source": "live-capturable",
+      "sourceRef": "L1142-L1179",
+      "capture": "__captures__/local-assets-list-200.json"
+    },
+    {
+      "name": "file 200 (image stream)",
+      "request": { "method": "GET", "path": "/api/mivo/local-assets/<id>" },
+      "expected": { "status": 200, "headers": { "Content-Type": "<mimeForFile>", "Cache-Control": "no-store" }, "body": "<file bytes>" },
+      "source": "live-capturable",
+      "sourceRef": "L1600-L1603; mimeForFile L114-L135; sendImageBuffer pattern L1056-L1060",
+      "capture": "__captures__/local-assets-file-200.json"
+    },
+    {
+      "name": "file path-traversal → 403",
+      "request": { "method": "GET", "path": "/api/mivo/local-assets/<base64url of /etc/passwd>" },
+      "expected": { "status": 403, "headers": { "content-type": "NOT SET" }, "body": "Asset path is outside allowed roots" },
+      "source": "live-capturable",
+      "sourceRef": "decodeAssetPath L152; isInsideRoot L154-L157; L1594-L1597",
+      "capture": "__captures__/local-assets-file-403-traversal.json",
+      "discrepancy": "Plan §6.1 says 'realpath 校验+去重' but isInsideRoot (L154-L157) uses LEXICAL path.resolve, NOT fs.realpath. fs.realpath is used only for dedup in the LISTING path (L1114, L1153), NOT for the file-serving guard. A symlink inside the root pointing outside would escape. BFF should use fs.realpath for the serving guard too — security gap vs plan claim. Also: 403 response has NO Content-Type header and plain-text body (L1595-L1597 sets neither) — inconsistent with JSON error shape elsewhere."
+    },
+    {
+      "name": "file not found (inside root) → 404",
+      "request": { "method": "GET", "path": "/api/mivo/local-assets/<base64url of <root>/nonexistent.png>" },
+      "expected": { "status": 404, "body": "Local asset not found" },
+      "source": "live-capturable",
+      "sourceRef": "L1604-L1606 (catch fs.readFile)",
+      "capture": "__captures__/local-assets-file-404.json"
+    },
+    {
+      "name": "list 500 on stat error (non-dir configured root)",
+      "condition": "MIVO_ASSET_DIR points to a path that errors during readdir",
+      "expected": { "status": 500, "body": "<error.message>" },
+      "source": "code-derived",
+      "sourceRef": "L1438-L1441 (catch → 500 plain text, no Content-Type)"
+    },
+    {
+      "name": "non-GET method on list/file → same 200 (no guard)",
+      "request": { "method": "POST", "path": "/api/mivo/local-assets" },
+      "expected": { "status": 200, "body": "<list JSON>" },
+      "source": "live-capturable",
+      "sourceRef": "L1433-L1443 (no method check); L1588-L1609 (no method check)",
+      "capture": "__captures__/local-assets-list-post-200.json",
+      "discrepancy": "No 405 for non-GET. Plan §6.1 '非常规方法... 保持 dev 行为或统一 405 需列为有意变更' — current dev behavior is 'any method works'. BFF may add 405 (intended-change candidate)."
+    }
+  ],
+  "invariants": [
+    "imageExtensions: .png .jpg .jpeg .webp .gif .svg (L8)",
+    "id = base64url(filePath) (L150); decode via base64url (L152)",
+    "dedup key = realpath(filePath).toLowerCase() in listing (L1153, L1157-L1159)",
+    "Cache-Control: no-store on file stream (L1602)",
+    "mimeForFile sniffs magic bytes (RIFF/WEBP, PNG, JPEG, GIF, SVG) before falling back to extension (L114-L135)"
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "scenario": "eagle-status-offline",
+  "request": {
+    "method": "GET",
+    "path": "/api/mivo/eagle/status",
+    "headers": {}
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": null
+    },
+    "body": {
+      "connected": false,
+      "message": "fetch failed"
+    }
+  },
+  "capturedAt": "2026-07-03T15:23:24.556Z"
+}

@@ -1,0 +1,68 @@
+{
+  "endpoint": "platform channel helpers (internal, not a route)",
+  "summary": "In-memory token + chatSession cache with single-flight + 401 authRetry. Used by generate (platform models) and edit (no-mask platform models). NOT directly exposed as a route; testable via mock platform endpoint in P1-c.",
+  "sourceFile": "vite.config.ts",
+  "sourceRef": "L587-L853",
+  "moduleState": {
+    "vars": "mivoPlatformToken, mivoPlatformChatSessionId, mivoPlatformTokenPromise, mivoPlatformChatSessionPromise (L594-L597) — in-memory only, never persisted",
+    "channels": "MIVO_PLATFORM_CHANNELS L588-L591: gemini-3-pro-image→NANOBANANA, gpt-image-2→GPT",
+    "ctx": "PlatformCtx {platformKey, platformEndpoint} L599; endpoint default https://aigc.xindong.com (L1624)"
+  },
+  "testableItems": [
+    {
+      "name": "token single-flight (mivoPlatformEnsureToken)",
+      "behavior": "If mivoPlatformToken is null, exactly one mivoPlatformRefreshToken call is in flight (mivoPlatformTokenPromise); concurrent callers await the same promise. On settle, promise is cleared (L626-L628).",
+      "source": "code-derived",
+      "sourceRef": "mivoPlatformEnsureToken L623-L631; refresh L607-L621",
+      "p1cTest": "Mock platform endpoint; fire 2+ concurrent ensureToken; assert exactly 1 POST /api/v1/state/token."
+    },
+    {
+      "name": "chatSession single-flight (mivoPlatformEnsureChatSession)",
+      "behavior": "If mivoPlatformChatSessionId is null, exactly one chat-creation call in flight (mivoPlatformChatSessionPromise); concurrent callers share it. On success, caches id; on settle, promise cleared (L650-L652).",
+      "source": "code-derived",
+      "sourceRef": "mivoPlatformEnsureChatSession L633-L655",
+      "p1cTest": "Mock platform; fire 2+ concurrent ensureChatSession; assert exactly 1 POST /api/v1/message/chat."
+    },
+    {
+      "name": "401 → refresh token → retry EXACTLY ONCE (mivoPlatformFetch)",
+      "behavior": "On 401: nulls cached token + tokenPromise → ensureToken (single-flight refresh) → retries the original request ONCE. If retry also 401/fails, returns that failure (NO second retry, NO llm-proxy fallback).",
+      "source": "code-derived",
+      "sourceRef": "mivoPlatformFetch L658-L675; 401 branch L667-L673",
+      "p1cTest": "Mock platform returning 401 on first call, 200 on second → assert exactly 2 fetches, success. Mock returning 401 twice → assert exactly 2 fetches, error propagated (no third call)."
+    },
+    {
+      "name": "submit/poll/signUrl/upload/chat all go through authRetry",
+      "behavior": "submit (L691), poll (L718), signUrl (L747), upload (L773), chat (L638) all call mivoPlatformFetch → all inherit the 401-refresh-once semantics uniformly.",
+      "source": "code-derived",
+      "sourceRef": "L638, L691, L718, L747, L773"
+    },
+    {
+      "name": "upload failure → 502 desensitized (in edit path)",
+      "behavior": "mivoPlatformUploadOne throw (4xx/5xx/no fileId) is caught in proxyMivoEdit → 502 {error:'参考图上传失败，请重试或移除参考图'} (fixed copy, does NOT fall into outer 500 catch).",
+      "source": "code-derived",
+      "sourceRef": "mivoPlatformUploadOne L768-L794; edit catch L972-L981"
+    },
+    {
+      "name": "no-fallback invariant (platform failure never reaches llm-proxy)",
+      "behavior": "All platform errors (submit/poll/download/upload) surface as 502/504 to the client; code never falls through to the llm-proxy branch for platform models.",
+      "source": "code-derived",
+      "sourceRef": "runMivoPlatformImageJob L817-L853 returns handled=true in every terminal branch; generate L894-L896 / edit L989-L990 return on handled"
+    },
+    {
+      "name": "poll loop semantics",
+      "behavior": "Polls /api/v1/message/<jobId> every 2.5s up to 175s deadline; aborted (client disconnect) → returns {status:'aborted'}; completed → {images}; failed → {error sanitized}; deadline → {status:'timeout'}.",
+      "source": "code-derived",
+      "sourceRef": "mivoPlatformPollJob L707-L742; interval L582; deadline L583; sanitizePlatformError L601-L605"
+    },
+    {
+      "name": "download signUrl parsing",
+      "behavior": "signUrl response may be raw string, quoted string, or JSON {url|signUrl|data.url}; protocol-relative '//host' prefixed with 'https:'. Non-http result → throw.",
+      "source": "code-derived",
+      "sourceRef": "mivoPlatformDownloadImage L744-L766"
+    }
+  ],
+  "discrepancies": [
+    "Plan §6.1 lists these as '可测项' (testable items) — for the baseline they are code-derived. P1-c must add mock-platform unit tests (the live platform endpoint cannot be safely hit without a real key).",
+    "In-memory cache means BFF must run single-instance to preserve single-flight semantics until P4 horizontal scaling (plan risk table acknowledges this)."
+  ]
+}

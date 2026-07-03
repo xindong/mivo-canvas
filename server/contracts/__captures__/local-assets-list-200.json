@@ -1,0 +1,31 @@
+{
+  "scenario": "local-assets-list-200",
+  "request": {
+    "method": "GET",
+    "path": "/api/mivo/local-assets",
+    "headers": {}
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": null
+    },
+    "body": {
+      "root": "/var/folders/v9/vclyhlmn7c9cv6jb74z_7lyw0000gn/T/mivo-contract-assets-sQYgw5",
+      "assets": [
+        {
+          "id": "L3Zhci9mb2xkZXJzL3Y5L3ZjbHlobG1uN2M5Y3Y2amI3NHpfN2x5dzAwMDBnbi9UL21pdm8tY29udHJhY3QtYXNzZXRzLXNRWWd3NS90ZXN0LnN2Zw",
+          "name": "test.svg",
+          "title": "test",
+          "format": "SVG",
+          "sizeBytes": 107,
+          "sourcePath": "/var/folders/v9/vclyhlmn7c9cv6jb74z_7lyw0000gn/T/mivo-contract-assets-sQYgw5/test.svg",
+          "updatedAt": 1783092204325.636,
+          "url": "/api/mivo/local-assets/L3Zhci9mb2xkZXJzL3Y5L3ZjbHlobG1uN2M5Y3Y2amI3NHpfN2x5dzAwMDBnbi9UL21pdm8tY29udHJhY3QtYXNzZXRzLXNRWWd3NS90ZXN0LnN2Zw"
+        }
+      ]
+    }
+  },
+  "capturedAt": "2026-07-03T15:23:24.547Z"
+}

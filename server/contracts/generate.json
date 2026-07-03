@@ -1,0 +1,128 @@
+{
+  "endpoint": "/api/mivo/generate",
+  "summary": "Text-to-image generation. Model dispatch: platform channel (gemini-3-pro-image / gpt-image-2: submit→poll→download) else llm-proxy. Platform failure does NOT fall back to llm-proxy.",
+  "sourceFile": "vite.config.ts",
+  "dispatchRef": "L1418-L1421 (middleware route) → proxyMivoGenerate L855-L927",
+  "methods": {
+    "POST": "primary",
+    "GET/PUT/DELETE/PATCH": "405 {error:'Method not allowed'} (L862-L865)"
+  },
+  "envDeps": ["MIVO_IMAGE_API_KEY (llm-proxy path)", "MIVO_PLATFORM_KEY + MIVO_PLATFORM_ENDPOINT (platform path)"],
+  "bodyLimit": "1MB JSON (mivoJsonRequestMaxBytes L33; readRequestBuffer L459-L475) → 413",
+  "scenarios": [
+    {
+      "name": "non-POST method",
+      "request": { "method": "GET", "path": "/api/mivo/generate" },
+      "expected": { "status": 405, "body": { "error": "Method not allowed" } },
+      "source": "live-capturable",
+      "sourceRef": "L862-L865",
+      "capture": "__captures__/generate-405.json"
+    },
+    {
+      "name": "missing prompt",
+      "request": { "method": "POST", "body": {} },
+      "expected": { "status": 400, "body": { "error": "prompt is required" } },
+      "source": "live-capturable",
+      "sourceRef": "L874-L878",
+      "capture": "__captures__/generate-400-no-prompt.json"
+    },
+    {
+      "name": "JSON body exceeds 1MB → 413 intent, observable as ECONNRESET",
+      "request": { "method": "POST", "body": "prompt field >1MB", "contentType": "application/json" },
+      "expected": { "serverIntent": "413 {error:'Request body is too large'}", "observable": "ECONNRESET transport error" },
+      "source": "live-capturable",
+      "sourceRef": "readRequestBuffer L459-L475 (rejects >1MB at L467-L469, calls request.destroy() at L468); catch L923 sendMivoJson 413",
+      "capture": "__captures__/generate-413.json",
+      "discrepancy": "readRequestBuffer calls request.destroy() (L468) immediately after rejecting, which tears down the socket BEFORE the 413 response (sendMivoJson L923) can be delivered. The client therefore observes ECONNRESET, not a clean 413. BFF MUST send a clean 413 without destroying the request prematurely — intended-change candidate."
+    },
+    {
+      "name": "platform model without MIVO_PLATFORM_KEY",
+      "request": { "method": "POST", "body": { "prompt": "x", "model": "gpt-image-2" } },
+      "condition": "MIVO_PLATFORM_KEY unset or not starting with 'mivo_'",
+      "expected": { "status": 500, "body": { "error": "MIVO_PLATFORM_KEY 未配置，请配置或切换 GPT 模型" } },
+      "source": "live-capturable",
+      "sourceRef": "L884-L888",
+      "capture": "__captures__/generate-500-no-platform-key.json",
+      "discrepancy": "Plan §6.1 does not specify a status for this case. Current code returns 500 with a message that names the env var. BFF may want 503 + sanitized message — flag as intended-change candidate."
+    },
+    {
+      "name": "llm-proxy model without MIVO_IMAGE_API_KEY",
+      "request": { "method": "POST", "body": { "prompt": "x", "model": "doubao-seedance-2-0-260128" } },
+      "condition": "model NOT in MIVO_PLATFORM_CHANNELS AND MIVO_IMAGE_API_KEY unset",
+      "expected": { "status": 500, "body": { "error": "MIVO_IMAGE_API_KEY is not set" } },
+      "source": "live-capturable",
+      "sourceRef": "readImageApiKey L192-L196 (throws); catch L920-L926",
+      "capture": "__captures__/generate-500-no-image-key.json",
+      "discrepancy": "Config error surfaced as 500; message leaks env var name. Same intended-change candidate as above."
+    },
+    {
+      "name": "normal 200 (platform channel)",
+      "request": { "method": "POST", "body": { "prompt": "...", "model": "gpt-image-2|gemini-3-pro-image", "imgRatio": "1:1", "quality": "medium" } },
+      "condition": "MIVO_PLATFORM_KEY valid + platform endpoint reachable",
+      "expected": { "status": 200, "body": { "images": [{ "b64": "<base64 png>" }] } },
+      "source": "code-derived",
+      "sourceRef": "runMivoPlatformImageJob L817-L853; success branch L843-L845 (buf.toString('base64')); normalizeMivoImages L545-L564",
+      "note": "NOT live-captured: requires real platform key + reachable upstream. Shape is identical to llm-proxy 200."
+    },
+    {
+      "name": "normal 200 (llm-proxy fallback)",
+      "request": { "method": "POST", "body": { "prompt": "...", "model": "<non-platform model>" } },
+      "condition": "MIVO_IMAGE_API_KEY valid; model not in MIVO_PLATFORM_CHANNELS",
+      "expected": { "status": 200, "body": { "images": [{ "b64": "<base64>" }] } },
+      "source": "code-derived",
+      "sourceRef": "L898-L919; normalizeMivoImages L545-L564",
+      "note": "NOT live-captured: requires real llm-proxy key. n clamped 1-4 (L908); ratio payload via resolveRatioPayload L533-L543."
+    },
+    {
+      "name": "platform poll timeout → 504",
+      "condition": "platform submit accepted but poll exceeds 175s deadline",
+      "expected": { "status": 504, "body": { "error": "上游生成超时，可降低质量重试" } },
+      "altExpected": { "when": "quality != high (resolution != 2K)", "body": { "error": "上游生成超时，可稍后重试、换比例或减少参考图" } },
+      "source": "code-derived",
+      "sourceRef": "mivoPlatformPollDeadlineMs=175000 L583; poll loop L707-L742; timeout branch L827-L832",
+      "note": "NOT live-captured: would need a stalled real platform job. Message is resolution-dependent."
+    },
+    {
+      "name": "llm-proxy upstream timeout → 504",
+      "condition": "upstream response > 240s",
+      "expected": { "status": 504, "body": { "error": "Image API request timed out" } },
+      "source": "code-derived",
+      "sourceRef": "mivoUpstreamTimeoutMs=240000 L34; fetchUpstreamWithTimeout L80-L101; UpstreamRequestTimeoutError catch L923"
+    },
+    {
+      "name": "platform job failed → 502",
+      "condition": "platform poll returns status=failed",
+      "expected": { "status": 502, "body": { "error": "<sanitized platform error>" } },
+      "source": "code-derived",
+      "sourceRef": "L834-L836; sanitizePlatformError L601-L605"
+    },
+    {
+      "name": "platform download empty/failed → 502",
+      "expected": { "status": 502, "body": { "error": "生成失败：结果为空" } },
+      "source": "code-derived",
+      "sourceRef": "empty images L838-L841; download throw L843-L852 (502 sanitized)"
+    },
+    {
+      "name": "llm-proxy upstream 4xx/5xx passthrough",
+      "condition": "upstream returns non-2xx",
+      "expected": { "status": "<upstream status verbatim>", "body": { "error": "<readUpstreamError message>" } },
+      "source": "code-derived",
+      "sourceRef": "L914-L916; readUpstreamError L566-L578",
+      "note": "Status code passed through verbatim (upstream 401 → client 401). Body always {error: <string>}."
+    },
+    {
+      "name": "no-fallback invariant (platform failure does not fall through to llm-proxy)",
+      "condition": "model in MIVO_PLATFORM_CHANNELS",
+      "expected": "runMivoPlatformImageJob returns handled=true in every terminal branch; caller returns without reaching llm-proxy",
+      "source": "code-derived",
+      "sourceRef": "L884-L896 (if handled return); runMivoPlatformImageJob L823-L852 returns true on success/timeout/failed/aborted/error"
+    }
+  ],
+  "invariants": [
+    "n clamped to 1-4 (L908, default 1)",
+    "quality clamped to low|medium|high, default medium (L527-L530)",
+    "model default gpt-image-2 (L30, L881)",
+    "platform path: token single-flight + 401 refresh-once (see platform-helpers.json)",
+    "client abort → controller.abort() on response close (L889-L892)"
+  ]
+}

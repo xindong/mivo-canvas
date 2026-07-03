@@ -1,0 +1,92 @@
+{
+  "scenario": "debug-logs-get-200-header-token",
+  "request": {
+    "method": "GET",
+    "path": "/api/mivo/debug-logs",
+    "headers": {
+      "x-mivo-debug-token": "<redacted>"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": null
+    },
+    "body": {
+      "ok": true,
+      "dates": [
+        "2026-07-03"
+      ],
+      "records": [
+        {
+          "id": "2026-07-03T15:23:24.530Z-1-1vua7e",
+          "level": "warning",
+          "source": "B",
+          "message": "keep",
+          "timestamp": 2,
+          "clientId": "unknown-client",
+          "sessionId": "unknown-session",
+          "appVersion": "unknown",
+          "pagePath": "/",
+          "userAgent": "unknown",
+          "language": "unknown",
+          "timezone": "unknown",
+          "screen": {
+            "width": 0,
+            "height": 0,
+            "pixelRatio": 1
+          },
+          "ip": "127.0.0.1",
+          "referer": "",
+          "receivedAt": "2026-07-03T15:23:24.530Z"
+        },
+        {
+          "id": "2026-07-03T15:23:24.530Z-2-82gaee",
+          "level": "error",
+          "source": "C",
+          "message": "keep",
+          "timestamp": 3,
+          "clientId": "unknown-client",
+          "sessionId": "unknown-session",
+          "appVersion": "unknown",
+          "pagePath": "/",
+          "userAgent": "unknown",
+          "language": "unknown",
+          "timezone": "unknown",
+          "screen": {
+            "width": 0,
+            "height": 0,
+            "pixelRatio": 1
+          },
+          "ip": "127.0.0.1",
+          "referer": "",
+          "receivedAt": "2026-07-03T15:23:24.530Z"
+        },
+        {
+          "id": "2026-07-03T15:23:24.525Z-0-3vekwl",
+          "level": "warning",
+          "source": "S",
+          "message": "m",
+          "timestamp": 1,
+          "clientId": "c1",
+          "sessionId": "s1",
+          "appVersion": "unknown",
+          "pagePath": "/",
+          "userAgent": "unknown",
+          "language": "unknown",
+          "timezone": "unknown",
+          "screen": {
+            "width": 0,
+            "height": 0,
+            "pixelRatio": 1
+          },
+          "ip": "127.0.0.1",
+          "referer": "",
+          "receivedAt": "2026-07-03T15:23:24.525Z"
+        }
+      ]
+    }
+  },
+  "capturedAt": "2026-07-03T15:23:24.541Z"
+}

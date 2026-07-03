@@ -1,0 +1,17 @@
+{
+  "scenario": "local-assets-file-404",
+  "request": {
+    "method": "GET",
+    "path": "/api/mivo/local-assets/L3Zhci9mb2xkZXJzL3Y5L3ZjbHlobG1uN2M5Y3Y2amI3NHpfN2x5dzAwMDBnbi9UL21pdm8tY29udHJhY3QtYXNzZXRzLXNRWWd3NS9ub25leGlzdGVudC5wbmc",
+    "headers": {}
+  },
+  "response": {
+    "status": 404,
+    "headers": {
+      "content-type": null,
+      "cache-control": null
+    },
+    "body": "Local asset not found"
+  },
+  "capturedAt": "2026-07-03T15:23:24.553Z"
+}

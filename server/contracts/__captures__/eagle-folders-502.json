@@ -1,0 +1,17 @@
+{
+  "scenario": "eagle-folders-502",
+  "request": {
+    "method": "GET",
+    "path": "/api/mivo/eagle/folders",
+    "headers": {}
+  },
+  "response": {
+    "status": 502,
+    "headers": {
+      "content-type": null,
+      "cache-control": null
+    },
+    "body": "fetch failed"
+  },
+  "capturedAt": "2026-07-03T15:23:24.557Z"
+}

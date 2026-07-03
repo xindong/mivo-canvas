@@ -1,0 +1,20 @@
+{
+  "scenario": "debug-logs-405",
+  "request": {
+    "method": "PUT",
+    "path": "/api/mivo/debug-logs",
+    "headers": {}
+  },
+  "response": {
+    "status": 405,
+    "headers": {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": null
+    },
+    "body": {
+      "ok": false,
+      "error": "Method not allowed"
+    }
+  },
+  "capturedAt": "2026-07-03T15:23:24.524Z"
+}
