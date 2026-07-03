@@ -11,7 +11,9 @@
     "debug:server": "node scripts/debug-log-server.mjs",
     "test:unit": "vitest run",
     "verify:logging": "node scripts/verify-debug-logging.mjs",
-    "test:e2e": "node scripts/e2e-smoke.mjs",
+    "test:e2e": "npm run test:e2e:dev",
+    "test:e2e:dev": "node scripts/e2e-runner.mjs --topology=dev",
+    "test:e2e:prod": "npm run build && node scripts/e2e-runner.mjs --topology=prod",
     "start:server": "tsx server/index.ts",
     "contract:diff": "node scripts/contract-diff.mjs"
   },
