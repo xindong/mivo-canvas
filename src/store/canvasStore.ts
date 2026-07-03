@@ -40,6 +40,14 @@ import { MivoImageRequestError, assetBlobForNode, editMivoImage, generateMivoIma
 import { createAiResultNode } from '../model/aiCanvasCommands'
 import { normalizeCanvasSnapshotV2 } from '../model/canvasSnapshotModel'
 import {
+  addAnchorToNode,
+  createAnchor,
+  recordAnchorResultOnNode,
+  removeAnchorFromNode,
+  updateAnchorInstruction,
+  type AnchorInput,
+} from '../model/anchorModel'
+import {
   normalizeCanvasNodeV2,
   normalizeCanvasNodesV2,
   setNodeTransform,
@@ -275,6 +283,12 @@ type CanvasState = {
   commitGenerationResult: (payload: CommitGenerationResultPayload) => Promise<string[]>
   toggleFavorite: (nodeId: string) => void
   updatePrompt: (nodeId: string, prompt: string) => void
+  // P2-D1 EXPERIMENTAL — Anchor MVP actions (roadmap §7 组 D). Migration rule
+  // (§9 P4-a):收编为 formal CanvasAnchor, or remove the field + these actions.
+  addAnchor: (nodeId: string, input: AnchorInput) => string | undefined
+  updateAnchorInstruction: (nodeId: string, anchorId: string, instruction: string) => void
+  removeAnchor: (nodeId: string, anchorId: string) => void
+  recordAnchorResult: (nodeId: string, anchorId: string, resultNodeIds: string[]) => void
   resetCurrentScene: () => void
   replaceSnapshot: (snapshot: MivoCanvasSnapshot) => void
   getSnapshot: () => MivoCanvasSnapshot
@@ -3020,6 +3034,56 @@ export const useCanvasStore = create<CanvasState>()(
               [state.sceneId]: document,
             },
           }
+        }),
+      // P2-D1 EXPERIMENTAL — Anchor MVP actions. Pure logic lives in anchorModel;
+      // these wire it to the store + history (patchWithHistory so undo/redo covers
+      // anchor edits). Migration rule (§9 P4-a):收编为 formal CanvasAnchor or remove.
+      addAnchor: (nodeId, input) => {
+        const target = get().nodes.find((n) => n.id === nodeId)
+        if (!target) {
+          warnCanvas('addAnchor: node not found')
+          return undefined
+        }
+        const anchor = createAnchor(input)
+        if (!anchor) {
+          warnCanvas('addAnchor: invalid input (box requires width/height > 0)')
+          return undefined
+        }
+        set((state) => {
+          const t = state.nodes.find((n) => n.id === nodeId)
+          if (!t) return {}
+          const updated = addAnchorToNode(t, anchor)
+          const nodes = normalizeCanvasNodes(state.nodes.map((n) => (n.id === nodeId ? updated : n)))
+          return patchWithHistory(state, { nodes })
+        })
+        return anchor.id
+      },
+      updateAnchorInstruction: (nodeId, anchorId, instruction) =>
+        set((state) => {
+          const target = state.nodes.find((n) => n.id === nodeId)
+          if (!target) return {}
+          const updated = updateAnchorInstruction(target, anchorId, instruction)
+          if (updated === target) return {}
+          const nodes = normalizeCanvasNodes(state.nodes.map((n) => (n.id === nodeId ? updated : n)))
+          return patchWithHistory(state, { nodes })
+        }),
+      removeAnchor: (nodeId, anchorId) =>
+        set((state) => {
+          const target = state.nodes.find((n) => n.id === nodeId)
+          if (!target) return {}
+          const updated = removeAnchorFromNode(target, anchorId)
+          if (updated === target) return {}
+          const nodes = normalizeCanvasNodes(state.nodes.map((n) => (n.id === nodeId ? updated : n)))
+          return patchWithHistory(state, { nodes })
+        }),
+      recordAnchorResult: (nodeId, anchorId, resultNodeIds) =>
+        set((state) => {
+          const target = state.nodes.find((n) => n.id === nodeId)
+          if (!target) return {}
+          const updated = recordAnchorResultOnNode(target, anchorId, resultNodeIds)
+          if (updated === target) return {}
+          const nodes = normalizeCanvasNodes(state.nodes.map((n) => (n.id === nodeId ? updated : n)))
+          return patchWithHistory(state, { nodes })
         }),
       replaceSnapshot: (snapshot) =>
         set((state) => ({

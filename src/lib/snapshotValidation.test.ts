@@ -317,3 +317,46 @@ describe('parseCanvasSnapshot', () => {
     })
   })
 })
+
+describe('experimentalAnchors (P2-D1 light validation)', () => {
+  const parse = (snapshot: MivoCanvasSnapshot) => parseCanvasSnapshot(JSON.stringify(snapshot))
+  const anchorNode = (anchors: unknown): MivoCanvasNode =>
+    validImageNode({ id: 'n1', experimentalAnchors: anchors as MivoCanvasNode['experimentalAnchors'] })
+
+  it('accepts a snapshot with valid point + box anchors', () => {
+    const result = parse(
+      validSnapshot({
+        nodes: [
+          anchorNode([
+            { id: 'a1', type: 'point', targetNodeId: 'n1', x: 1, y: 2, instruction: 'i', createdAt: 1 },
+            { id: 'a2', type: 'box', targetNodeId: 'n1', x: 1, y: 2, width: 10, height: 20, instruction: 'i', createdAt: 2 },
+          ]),
+        ],
+      }),
+    )
+    expect(result.ok).toBe(true)
+  })
+
+  it('rejects a box anchor missing width/height', () => {
+    const result = parse(
+      validSnapshot({
+        nodes: [anchorNode([{ id: 'a1', type: 'box', targetNodeId: 'n1', x: 1, y: 2, instruction: 'i', createdAt: 1 }])],
+      }),
+    )
+    expect(result.ok).toBe(false)
+  })
+
+  it('rejects an anchor missing required fields (no id)', () => {
+    const result = parse(
+      validSnapshot({
+        nodes: [anchorNode([{ type: 'point', targetNodeId: 'n1', x: 1, y: 2, instruction: 'i', createdAt: 1 }])],
+      }),
+    )
+    expect(result.ok).toBe(false)
+  })
+
+  it('accepts a node with no experimentalAnchors (backward compatible)', () => {
+    const result = parse(validSnapshot({ nodes: [validImageNode()] }))
+    expect(result.ok).toBe(true)
+  })
+})

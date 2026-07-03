@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   cloneEdge,
   cloneNode,
@@ -106,6 +106,71 @@ describe('cloneNode (geometry clone + deep isolation)', () => {
     expect(clone.generation).toBeUndefined()
     expect(clone.aiWorkflow).toBeUndefined()
     expect(clone.parentIds).toBeUndefined()
+  })
+
+  // P2-D1 — experimentalAnchors deep-copy + light validation (the cloneNode fix).
+  it('deep-clones experimentalAnchors so history/clipboard/persist copies are isolated', () => {
+    const source = imageNode({
+      id: 'a',
+      experimentalAnchors: [
+        { id: 'an1', type: 'point', targetNodeId: 'a', x: 1, y: 2, instruction: 'i', createdAt: 1 },
+        {
+          id: 'an2',
+          type: 'box',
+          targetNodeId: 'a',
+          x: 1,
+          y: 2,
+          width: 10,
+          height: 20,
+          instruction: 'i',
+          createdAt: 2,
+          resultNodeIds: ['r1'],
+        },
+      ],
+    })
+    const clone = cloneNode(source)
+
+    expect(clone.experimentalAnchors).not.toBe(source.experimentalAnchors)
+    expect(clone.experimentalAnchors![0]).not.toBe(source.experimentalAnchors![0])
+    expect(clone.experimentalAnchors![1]).not.toBe(source.experimentalAnchors![1])
+    expect(clone.experimentalAnchors![1].resultNodeIds).not.toBe(source.experimentalAnchors![1].resultNodeIds)
+
+    // mutate the source after clone; clone must be unaffected
+    source.experimentalAnchors!.push({
+      id: 'an3',
+      type: 'point',
+      targetNodeId: 'a',
+      x: 0,
+      y: 0,
+      instruction: 'x',
+      createdAt: 3,
+    })
+    source.experimentalAnchors![0].instruction = 'changed'
+
+    expect(clone.experimentalAnchors).toHaveLength(2)
+    expect(clone.experimentalAnchors![0].instruction).toBe('i')
+  })
+
+  it('drops a box anchor missing width/height during clone (light validation + warn)', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const source = imageNode({
+      id: 'a',
+      experimentalAnchors: [
+        { id: 'good', type: 'point', targetNodeId: 'a', x: 1, y: 2, instruction: 'i', createdAt: 1 },
+        { id: 'bad', type: 'box', targetNodeId: 'a', x: 1, y: 2, instruction: 'i', createdAt: 2 }, // box missing w/h
+      ],
+    })
+    const clone = cloneNode(source)
+
+    expect(clone.experimentalAnchors).toHaveLength(1)
+    expect(clone.experimentalAnchors![0].id).toBe('good')
+    expect(warnSpy).toHaveBeenCalled()
+    warnSpy.mockRestore()
+  })
+
+  it('leaves experimentalAnchors undefined for a bare node', () => {
+    const clone = cloneNode(imageNode({ id: 'a' }))
+    expect(clone.experimentalAnchors).toBeUndefined()
   })
 })
 
