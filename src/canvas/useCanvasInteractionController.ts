@@ -156,12 +156,32 @@ const rectFromFrameCreation = (box: FrameCreationState): CanvasBounds => ({
   height: Math.abs(box.currentY - box.startY),
 })
 
-const rectFromMarkupCreation = (box: MarkupCreationState): CanvasBounds => ({
-  x: Math.min(box.startX, box.currentX),
-  y: Math.min(box.startY, box.currentY),
-  width: Math.abs(box.currentX - box.startX),
-  height: Math.abs(box.currentY - box.startY),
-})
+const rectFromMarkupCreation = (box: MarkupCreationState): CanvasBounds => {
+  // Freehand brush strokes span every sampled point, not just start→current.
+  // Bounding by start/current alone makes the box origin/size snap around as
+  // the cursor loops back over the start; the preview SVG (viewBox 0 0 w h with
+  // preserveAspectRatio="none") then squashes and mirror-flips the stroke — the
+  // "3D flip" glitch seen while drawing. Bound by the actual points instead.
+  if (box.kind === 'brush' && box.points.length > 0) {
+    let minX = box.points[0].x
+    let minY = box.points[0].y
+    let maxX = box.points[0].x
+    let maxY = box.points[0].y
+    for (const point of box.points) {
+      if (point.x < minX) minX = point.x
+      if (point.x > maxX) maxX = point.x
+      if (point.y < minY) minY = point.y
+      if (point.y > maxY) maxY = point.y
+    }
+    return { x: minX, y: minY, width: maxX - minX, height: maxY - minY }
+  }
+  return {
+    x: Math.min(box.startX, box.currentX),
+    y: Math.min(box.startY, box.currentY),
+    width: Math.abs(box.currentX - box.startX),
+    height: Math.abs(box.currentY - box.startY),
+  }
+}
 
 const constrainBoxPoint = (start: MarkupPoint, current: MarkupPoint): MarkupPoint => {
   const dx = current.x - start.x
