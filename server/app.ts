@@ -5,15 +5,19 @@
 // c.env.incoming/outgoing (HttpBindings) are populated exactly as in production.
 import { Hono } from 'hono'
 import { serveStatic } from '@hono/node-server/serve-static'
-import type { HttpBindings } from '@hono/node-server'
 import { Buffer } from 'node:buffer'
 import { timingSafeEqual } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
+import { resolveFeatureFlags } from './lib/env'
+import type { AppEnv } from './lib/types'
 import { generateHandler } from './routes/generate'
 import { editHandler } from './routes/edit'
 import { enhanceHandler } from './routes/enhance'
 import { debugLogsRoute } from './routes/debug-logs'
+import { createLocalAssetsRoutes } from './routes/local-assets'
+import { createEagleRoutes } from './routes/eagle'
+import { createPinterestRoutes } from './routes/pinterest'
 
 const tokenEquals = (a: string, b: string): boolean => {
   const aBuf = Buffer.from(a)
@@ -22,7 +26,9 @@ const tokenEquals = (a: string, b: string): boolean => {
   return timingSafeEqual(aBuf, bBuf)
 }
 
-export const app = new Hono<{ Bindings: HttpBindings }>()
+const featureFlags = resolveFeatureFlags()
+
+export const app = new Hono<AppEnv>()
 
 // Liveness probe — exempt from the access gate.
 app.get('/healthz', (c) => c.json({ status: 'ok' }))
@@ -50,6 +56,9 @@ app.all('/api/mivo/generate', generateHandler)
 app.all('/api/mivo/edit', editHandler)
 app.all('/api/mivo/enhance', enhanceHandler)
 app.route('/api/mivo', debugLogsRoute)
+app.route('/api/mivo', createLocalAssetsRoutes({ enabled: featureFlags.localAssetsEnabled }))
+app.route('/api/mivo', createEagleRoutes({ enabled: featureFlags.eagleProxyEnabled }))
+app.route('/api/mivo', createPinterestRoutes())
 
 // Same-origin static hosting of dist/ (Vite build output). serveStatic only
 // accepts a root relative to cwd and calls next() on miss, letting the SPA
