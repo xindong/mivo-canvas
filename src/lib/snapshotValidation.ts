@@ -13,10 +13,10 @@ import type {
 import type { SerializedCanvasAsset } from './assetStorage'
 
 const nodeStatuses = new Set<NodeStatus>(['ready', 'generating', 'failed', 'queued'])
-const taskStatuses = new Set<CanvasTask['status']>(['running', 'queued', 'failed', 'done'])
+const taskStatuses = new Set<CanvasTask['status']>(['running', 'queued', 'failed', 'done', 'canceled'])
 const canvasEdgeTypes = new Set<CanvasEdgeType>(['generate', 'edit'])
 const aiWorkflowKinds = new Set<AiWorkflowKind>(['slot', 'annotation', 'result'])
-const aiWorkflowStatuses = new Set<AiWorkflowStatus>(['empty', 'queued', 'generating', 'ready', 'failed'])
+const aiWorkflowStatuses = new Set<AiWorkflowStatus>(['empty', 'queued', 'generating', 'ready', 'failed', 'canceled'])
 const aiWorkflowOperations = new Set<AiWorkflowOperation>([
   'slot-generation',
   'beside-generation',

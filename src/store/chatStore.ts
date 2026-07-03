@@ -2,7 +2,7 @@ import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import type { GenerationRatio, MivoImageQuality } from '../types/generation'
 import { readImportedAssetFile, saveImportedAsset } from '../lib/assetStorage'
-import { enhanceMivoPrompt } from '../lib/mivoImageClient'
+import { MivoImageRequestError, enhanceMivoPrompt, type MivoImageRequestErrorKind } from '../lib/mivoImageClient'
 import { getModelCapabilities } from '../lib/modelCapabilities'
 import { useCanvasStore } from './canvasStore'
 
@@ -10,6 +10,7 @@ const maxMessagesPerScene = 200
 
 export type ChatMessageStatus = 'enhancing' | 'generating' | 'done' | 'error'
 export type ChatMessageOrigin = 'chat' | 'mask-edit'
+export type ChatMessageErrorKind = MivoImageRequestErrorKind | 'unknown'
 
 export type ChatEnhanceResult = {
   scene?: string
@@ -49,6 +50,9 @@ export type ChatMessage = {
   resultNodeIds?: string[]
   origin?: ChatMessageOrigin
   error?: string
+  errorKind?: ChatMessageErrorKind
+  timeoutRetryKey?: string
+  timeoutRetryCount?: number
   selectedNodeId?: string
   selectedNodeType?: string
   generationContext?: ChatGenerationContext
@@ -73,7 +77,7 @@ type ChatState = {
     nodeIds?: string[]
     prompt?: string
   }) => void
-  retryMessage: (options: { sceneId: string; messageId: string }) => Promise<void>
+  retryMessage: (options: { sceneId: string; messageId: string; qualityOverride?: MivoImageQuality }) => Promise<void>
   cancelGeneration: () => void
   clearScene: (sceneId: string) => void
   setSelectedModel: (modelId: string) => void
@@ -83,6 +87,7 @@ type ChatState = {
 const createMessageId = () => `msg-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`
 const canceledGenerationMessage = '已取消生成，可修改提示后重试。'
 const referenceAssetMissingMessage = '参考图已失效，无法重试'
+const timeoutRetryAdvice = '建议降低质量或换比例'
 let activeChatAbortController: AbortController | null = null
 
 const saveReferenceAssets = async (files: File[]) =>
@@ -95,11 +100,36 @@ const referenceFilesFromAssets = async (assetUrls: string[] = []) => {
   return assets.map((asset) => new File([asset!.blob], asset!.name, { type: asset!.type || asset!.blob.type }))
 }
 
-const errorMessageForChat = (err: unknown, signal?: AbortSignal) => {
-  if (signal?.aborted) return canceledGenerationMessage
-  if (err instanceof Error && err.message.includes('已取消')) return canceledGenerationMessage
-  return err instanceof Error ? err.message : 'Generation failed'
+const isTimeoutErrorKind = (kind?: ChatMessageErrorKind) =>
+  kind === 'client-timeout' || kind === 'upstream-timeout'
+
+const timeoutRetryKeyForContext = (context: ChatGenerationContext) =>
+  JSON.stringify({
+    model: context.model,
+    imgRatio: context.imgRatio || '',
+    quality: context.quality || 'medium',
+    finalPrompt: context.finalPrompt || '',
+    sourceNodeId: context.sourceNodeId || '',
+    sourceNodeType: context.sourceNodeType || '',
+    referenceAssetUrls: context.referenceAssetUrls || [],
+  })
+
+const errorInfoForChat = (err: unknown, signal?: AbortSignal): { message: string; kind: ChatMessageErrorKind } => {
+  if (signal?.aborted) return { message: canceledGenerationMessage, kind: 'canceled' }
+  if (err instanceof MivoImageRequestError) {
+    return {
+      message: err.kind === 'canceled' ? canceledGenerationMessage : err.message,
+      kind: err.kind,
+    }
+  }
+  if (err instanceof Error && err.message.includes('已取消')) return { message: canceledGenerationMessage, kind: 'canceled' }
+  return { message: err instanceof Error ? err.message : 'Generation failed', kind: 'unknown' }
 }
+
+const errorTextForChat = (message: string, kind: ChatMessageErrorKind, timeoutRetryCount?: number) =>
+  isTimeoutErrorKind(kind) && (timeoutRetryCount || 0) >= 2
+    ? `${message}，${timeoutRetryAdvice}`
+    : message
 
 const trimSceneMessages = (messages: ChatMessage[]): ChatMessage[] =>
   messages.length > maxMessagesPerScene ? messages.slice(-maxMessagesPerScene) : messages
@@ -161,6 +191,7 @@ export const useChatStore = create<ChatState>()(
           status: 'enhancing',
           generationContext: initialContext,
         }
+        let context = initialContext
 
         set((s) => ({
           isBusy: true,
@@ -197,10 +228,12 @@ export const useChatStore = create<ChatState>()(
 
           // manual override > agent suggestion
           const finalPrompt = enhance.richPrompt || text
-          const finalRatio = paramOverrides.imgRatio !== 'auto' ? paramOverrides.imgRatio : enhance.imgRatio
+          const finalRatio = paramOverrides.imgRatio !== 'auto'
+            ? paramOverrides.imgRatio
+            : enhance.imgRatio || getModelCapabilities(selectedModel).defaultRatio
           const finalQuality: MivoImageQuality =
             paramOverrides.quality !== 'auto' ? (paramOverrides.quality as MivoImageQuality) : (enhance.quality || 'medium')
-          let context: ChatGenerationContext = {
+          context = {
             ...initialContext,
             imgRatio: finalRatio,
             quality: finalQuality,
@@ -282,13 +315,20 @@ export const useChatStore = create<ChatState>()(
                       status: 'done' as const,
                       resultNodeIds: nodeIds,
                       generationContext: context,
+                      error: undefined,
+                      errorKind: undefined,
+                      timeoutRetryKey: undefined,
+                      timeoutRetryCount: undefined,
                     }
                   : m,
               ),
             },
           }))
         } catch (err) {
-          const errorMsg = errorMessageForChat(err, abortController.signal)
+          const errorInfo = errorInfoForChat(err, abortController.signal)
+          const timeoutRetryCount = isTimeoutErrorKind(errorInfo.kind) ? 1 : undefined
+          const timeoutRetryKey = isTimeoutErrorKind(errorInfo.kind) ? timeoutRetryKeyForContext(context) : undefined
+          const errorMsg = errorTextForChat(errorInfo.message, errorInfo.kind, timeoutRetryCount)
           const latestCanvasState = useCanvasStore.getState()
           if (latestCanvasState.sceneId !== sceneId) {
             get().appendNotice({
@@ -303,7 +343,14 @@ export const useChatStore = create<ChatState>()(
               ...s.messagesByScene,
               [sceneId]: (s.messagesByScene[sceneId] || []).map((m) =>
                 m.id === assistantMessageId
-                  ? { ...m, status: 'error' as const, error: errorMsg }
+                  ? {
+                      ...m,
+                      status: 'error' as const,
+                      error: errorMsg,
+                      errorKind: errorInfo.kind,
+                      timeoutRetryKey,
+                      timeoutRetryCount,
+                    }
                   : m,
               ),
             },
@@ -335,7 +382,7 @@ export const useChatStore = create<ChatState>()(
         }))
       },
 
-      retryMessage: async ({ sceneId, messageId }) => {
+      retryMessage: async ({ sceneId, messageId, qualityOverride }) => {
         const state = get()
         if (state.isBusy) return
         const messages = state.messagesByScene[sceneId] || []
@@ -362,6 +409,9 @@ export const useChatStore = create<ChatState>()(
                       ...m,
                       status: 'error' as const,
                       error: errorMsg,
+                      errorKind: 'unknown' as const,
+                      timeoutRetryKey: undefined,
+                      timeoutRetryCount: undefined,
                       retryDisabledReason: referenceAssetMissingMessage,
                     }
                   : m,
@@ -376,7 +426,14 @@ export const useChatStore = create<ChatState>()(
         activeChatAbortController = abortController
         let context = baseContext
         const finalPrompt = context.finalPrompt || targetMsg.enhance?.richPrompt || targetMsg.text || userMsg.text
-        const finalQuality = context.quality || 'medium'
+        const finalQuality = qualityOverride || context.quality || 'medium'
+        const finalRatio = context.imgRatio || getModelCapabilities(context.model).defaultRatio
+        context = {
+          ...context,
+          finalPrompt,
+          imgRatio: finalRatio,
+          quality: finalQuality,
+        }
 
         set((s) => ({
           isBusy: true,
@@ -389,6 +446,9 @@ export const useChatStore = create<ChatState>()(
                     status: 'generating' as const,
                     text: finalPrompt,
                     error: undefined,
+                    errorKind: undefined,
+                    timeoutRetryKey: undefined,
+                    timeoutRetryCount: undefined,
                     retryDisabledReason: undefined,
                     resultNodeIds: undefined,
                     generationContext: context,
@@ -471,13 +531,24 @@ export const useChatStore = create<ChatState>()(
                         finalPrompt,
                         quality: finalQuality,
                       },
+                      error: undefined,
+                      errorKind: undefined,
+                      timeoutRetryKey: undefined,
+                      timeoutRetryCount: undefined,
                     }
                   : m,
               ),
             },
           }))
         } catch (err) {
-          const errorMsg = errorMessageForChat(err, abortController.signal)
+          const errorInfo = errorInfoForChat(err, abortController.signal)
+          const timeoutRetryKey = isTimeoutErrorKind(errorInfo.kind) ? timeoutRetryKeyForContext(context) : undefined
+          const timeoutRetryCount = isTimeoutErrorKind(errorInfo.kind)
+            ? targetMsg.timeoutRetryKey === timeoutRetryKey
+              ? (targetMsg.timeoutRetryCount || 0) + 1
+              : 1
+            : undefined
+          const errorMsg = errorTextForChat(errorInfo.message, errorInfo.kind, timeoutRetryCount)
           const latestCanvasState = useCanvasStore.getState()
           if (latestCanvasState.sceneId !== sceneId) {
             get().appendNotice({
@@ -496,6 +567,10 @@ export const useChatStore = create<ChatState>()(
                       ...m,
                       status: 'error' as const,
                       error: errorMsg,
+                      errorKind: errorInfo.kind,
+                      timeoutRetryKey,
+                      timeoutRetryCount,
+                      generationContext: context,
                       retryDisabledReason: errorMsg === referenceAssetMissingMessage ? referenceAssetMissingMessage : undefined,
                     }
                   : m,

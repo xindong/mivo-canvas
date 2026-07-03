@@ -14,6 +14,23 @@ export function EnhanceParamCard({ message }: EnhanceParamCardProps) {
   const [promptOpen, setPromptOpen] = useState(false)
   const cancelGeneration = useChatStore((s) => s.cancelGeneration)
   const { enhance } = message
+  const context = message.generationContext
+  const effectiveRatio = context?.imgRatio || enhance?.imgRatio
+  const effectiveQuality = context?.quality || enhance?.quality
+  const ratioManuallySet = Boolean(context?.requestedImgRatio && context.requestedImgRatio !== 'auto')
+  const qualityManuallySet = Boolean(context?.requestedQuality && context.requestedQuality !== 'auto')
+  const agentSuggestionChanged = Boolean(
+    enhance &&
+      ((enhance.imgRatio && effectiveRatio && enhance.imgRatio !== effectiveRatio) ||
+        (enhance.quality && effectiveQuality && enhance.quality !== effectiveQuality)),
+  )
+  const agentSuggestionText = agentSuggestionChanged
+    ? [
+        enhance?.imgRatio,
+        enhance?.quality ? qualityDisplayLabel(enhance.quality) : undefined,
+      ].filter(Boolean).join(' / ')
+    : ''
+  const showSlowHint = effectiveQuality === 'high' || effectiveRatio === '16:9' || effectiveRatio === '9:16'
 
   if (!enhance && message.status !== 'enhancing') return null
 
@@ -36,7 +53,7 @@ export function EnhanceParamCard({ message }: EnhanceParamCardProps) {
 
       {enhance && (
         <>
-          {enhance.reasoning && (
+          {(enhance.reasoning || agentSuggestionText) && (
             <div className="chat-param-section">
               <button
                 type="button"
@@ -48,26 +65,37 @@ export function EnhanceParamCard({ message }: EnhanceParamCardProps) {
                 {reasoningOpen ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
               </button>
               {reasoningOpen && (
-                <p className="chat-param-fold-body chat-reasoning-text">{enhance.reasoning}</p>
+                <div className="chat-param-fold-body chat-reasoning-text">
+                  {enhance.reasoning && <p>{enhance.reasoning}</p>}
+                  {agentSuggestionText && (
+                    <p className="chat-agent-suggestion">Agent 建议：{agentSuggestionText}</p>
+                  )}
+                </div>
               )}
             </div>
           )}
 
-          {enhance.scene && (
+          {(enhance.scene || effectiveRatio || effectiveQuality) && (
             <div className="chat-param-chips">
-              <span className="chat-chip chat-chip-scene">{enhance.scene}</span>
-              {enhance.imgRatio && (
+              {enhance.scene && <span className="chat-chip chat-chip-scene">{enhance.scene}</span>}
+              {effectiveRatio && (
                 <span className="chat-chip chat-chip-ratio">
-                  <RatioIcon ratio={enhance.imgRatio} />
-                  <span>{enhance.imgRatio}</span>
+                  <RatioIcon ratio={effectiveRatio} />
+                  <span>{effectiveRatio}</span>
+                  {ratioManuallySet && <span className="chat-chip-manual">手动</span>}
                 </span>
               )}
-              {enhance.quality && (
+              {effectiveQuality && (
                 <span className="chat-chip chat-chip-quality">
-                  {qualityDisplayLabel(enhance.quality)}
+                  {qualityDisplayLabel(effectiveQuality)}
+                  {qualityManuallySet && <span className="chat-chip-manual">手动</span>}
                 </span>
               )}
             </div>
+          )}
+
+          {showSlowHint && (
+            <div className="chat-param-slow-hint">预计较慢（1-3 分钟）</div>
           )}
 
           {enhance.richPrompt && (

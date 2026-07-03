@@ -6,6 +6,7 @@ const TaskIcon = ({ task }: { task: CanvasTask }) => {
   if (task.status === 'running') return <Loader2 size={16} className="spin" />
   if (task.status === 'failed') return <AlertTriangle size={16} />
   if (task.status === 'done') return <CheckCircle2 size={16} />
+  if (task.status === 'canceled') return <CircleDashed size={16} />
   return <CircleDashed size={16} />
 }
 

@@ -3049,6 +3049,12 @@ button:disabled {
   border: 2px dashed rgba(105, 87, 232, 0.72);
 }
 
+.dom-node.ai-canceled .dom-ai-slot-node {
+  color: var(--muted);
+  background: rgba(248, 244, 235, 0.38);
+  border-color: rgba(35, 35, 35, 0.18);
+}
+
 .dom-ai-slot-node::before {
   position: absolute;
   inset: 10px;
@@ -5465,6 +5471,15 @@ button:disabled {
   color: var(--moss);
 }
 
+.queue-item.canceled {
+  color: var(--muted);
+  background: rgba(255, 250, 240, 0.72);
+}
+
+.queue-item.canceled svg {
+  color: var(--muted);
+}
+
 .queue-progress {
   position: absolute;
   inset: auto 0 0;
@@ -5754,9 +5769,21 @@ button:disabled {
   margin: 0;
 }
 
+.chat-param-fold-body p {
+  margin: 0;
+}
+
+.chat-param-fold-body p + p {
+  margin-top: 4px;
+}
+
 .chat-reasoning-text {
   font-style: italic;
   color: var(--quiet);
+}
+
+.chat-agent-suggestion {
+  color: var(--muted);
 }
 
 .chat-param-chips {
@@ -5791,6 +5818,27 @@ button.chat-chip {
   text-transform: uppercase;
   letter-spacing: 0.04em;
   color: var(--muted);
+}
+
+.chat-chip-manual {
+  height: 15px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: rgba(183, 121, 40, 0.14);
+  color: var(--ochre);
+  font-size: 9px;
+  line-height: 15px;
+}
+
+.chat-param-slow-hint {
+  width: fit-content;
+  padding: 3px 7px;
+  border: 1px solid rgba(183, 121, 40, 0.26);
+  border-radius: 999px;
+  background: rgba(183, 121, 40, 0.1);
+  color: var(--ochre);
+  font-size: 11px;
+  font-weight: 760;
 }
 
 .chat-param-not-enhanced {
@@ -5897,6 +5945,10 @@ button.chat-chip {
   color: #c0392b;
 }
 
+.chat-error-row-canceled .chat-error-text {
+  color: var(--muted);
+}
+
 .chat-retry-btn {
   display: inline-flex;
   align-items: center;
@@ -5914,6 +5966,12 @@ button.chat-chip {
 
 .chat-retry-btn:hover {
   background: rgba(248, 244, 235, 0.8);
+}
+
+.chat-retry-btn-secondary {
+  color: var(--ochre);
+  border-color: rgba(183, 121, 40, 0.36);
+  background: rgba(183, 121, 40, 0.08);
 }
 
 /* Composer */

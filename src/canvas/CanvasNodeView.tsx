@@ -466,6 +466,17 @@ export function CanvasNodeView({
   const textNode = renderKind === 'text' || renderKind === 'annotation'
   const frameNode = renderKind === 'section'
   const aiSlotNode = renderKind === 'ai-slot'
+  const aiSlotStatus = node.aiWorkflow?.status
+  const aiSlotStatusLabel =
+    aiSlotStatus === 'ready'
+      ? 'Ready for another result'
+      : aiSlotStatus === 'generating'
+        ? 'Generating...'
+        : aiSlotStatus === 'failed'
+          ? 'Generation failed'
+          : aiSlotStatus === 'canceled'
+            ? 'Generation canceled'
+            : 'Drop an AI result here'
   const taskNode = renderKind === 'task'
   const annotationNode = renderKind === 'annotation'
   const markupNode = renderKind === 'markup'
@@ -525,6 +536,7 @@ export function CanvasNodeView({
     sectionDropTarget && 'section-drop-target',
     connectorDropTarget && 'connector-drop-target',
     markdownPreviewMode && 'markdown-preview-mode',
+    node.aiWorkflow?.status && `ai-${node.aiWorkflow.status}`,
     node.status,
   ]
     .filter(Boolean)
@@ -619,7 +631,7 @@ export function CanvasNodeView({
         <div className="dom-ai-slot-node">
           <div>
             <strong>{node.title}</strong>
-            <span>{node.aiWorkflow?.status === 'ready' ? 'Ready for another result' : 'Drop an AI result here'}</span>
+            <span>{aiSlotStatusLabel}</span>
           </div>
           <em>{node.width} x {node.height}</em>
         </div>

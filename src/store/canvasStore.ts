@@ -32,7 +32,7 @@ import {
 } from '../lib/canvasAssetImport'
 import { importedImageDisplaySize, type ImportedImageMetadata } from '../lib/imageSizing'
 import { saveGeneratedAsset } from '../lib/assetStorage'
-import { assetBlobForNode, editMivoImage, generateMivoImage } from '../lib/mivoImageClient'
+import { MivoImageRequestError, assetBlobForNode, editMivoImage, generateMivoImage } from '../lib/mivoImageClient'
 import { buildAiContextSnapshot, chooseAdjacentPlacement } from './aiCanvasWorkflow'
 import { makeNode, realCaseImages, scenes, snapshotFromScene } from './demoScenes'
 import { mockGenerationAdapter } from './mockGeneration'
@@ -819,6 +819,13 @@ const failedTask = (task: CanvasTask, label: string): CanvasTask => ({
   progress: 100,
 })
 
+const canceledTask = (task: CanvasTask, label: string): CanvasTask => ({
+  ...task,
+  label,
+  status: 'canceled',
+  progress: 100,
+})
+
 const doneTask = (task: CanvasTask, label: string, nodeIds: string[]): CanvasTask => ({
   ...task,
   label,
@@ -826,6 +833,11 @@ const doneTask = (task: CanvasTask, label: string, nodeIds: string[]): CanvasTas
   progress: 100,
   nodeIds,
 })
+
+const isCanceledGenerationError = (error: unknown, signal?: AbortSignal) =>
+  Boolean(signal?.aborted) ||
+  (error instanceof MivoImageRequestError && error.kind === 'canceled') ||
+  (error instanceof Error && error.message.includes('已取消'))
 
 const selectedNodesFromState = (state: CanvasState) => {
   const selected = state.selectedNodeIds.length ? state.selectedNodeIds : state.selectedNodeId ? [state.selectedNodeId] : []
@@ -2353,11 +2365,17 @@ export const useCanvasStore = create<CanvasState>()(
           return nodeIds
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Image edit failed'
+          const canceled = isCanceledGenerationError(error, options.signal)
           set((current) => {
             const targetDocument = current.canvases[targetSceneId]
             if (!targetDocument) return {}
             return patchCanvasDocument(current, targetSceneId, {
-              tasks: upsertTask(targetDocument.tasks, failedTask(runningTask, `${operationLabel} failed: ${message}`)),
+              tasks: upsertTask(
+                targetDocument.tasks,
+                canceled
+                  ? canceledTask(runningTask, `${operationLabel} canceled`)
+                  : failedTask(runningTask, `${operationLabel} failed: ${message}`),
+              ),
             })
           })
           throw error
@@ -2435,11 +2453,17 @@ export const useCanvasStore = create<CanvasState>()(
           return nodeIds
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Generation failed'
+          const canceled = isCanceledGenerationError(error, options.signal)
           set((current) => {
             const targetDocument = current.canvases[targetSceneId]
             if (!targetDocument) return {}
             return patchCanvasDocument(current, targetSceneId, {
-              tasks: upsertTask(targetDocument.tasks, failedTask(runningTask, `旁边生成失败：${message}`)),
+              tasks: upsertTask(
+                targetDocument.tasks,
+                canceled
+                  ? canceledTask(runningTask, `旁边生成已取消：${source.title}`)
+                  : failedTask(runningTask, `旁边生成失败：${message}`),
+              ),
             })
           })
           throw error
@@ -2549,6 +2573,7 @@ export const useCanvasStore = create<CanvasState>()(
           return nodeIds
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Generation failed'
+          const canceled = isCanceledGenerationError(error, options.signal)
           set((current) => {
             const targetDocument = current.canvases[targetSceneId]
             if (!targetDocument) return {}
@@ -2558,14 +2583,19 @@ export const useCanvasStore = create<CanvasState>()(
                     ...node,
                     aiWorkflow: {
                       ...node.aiWorkflow,
-                      status: 'failed' as const,
+                      status: canceled ? 'canceled' as const : 'failed' as const,
                     },
                   }
                 : node,
             )
             return patchCanvasDocument(current, targetSceneId, {
               nodes,
-              tasks: upsertTask(targetDocument.tasks, failedTask(runningTask, `生成到槽位失败：${message}`)),
+              tasks: upsertTask(
+                targetDocument.tasks,
+                canceled
+                  ? canceledTask(runningTask, `生成到槽位已取消：${slot.title}`)
+                  : failedTask(runningTask, `生成到槽位失败：${message}`),
+              ),
             })
           })
           throw error

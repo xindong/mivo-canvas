@@ -11,6 +11,9 @@ type ChatMessageListProps = {
 
 const EMPTY_MESSAGES: import('../../store/chatStore').ChatMessage[] = []
 
+const isTimeoutErrorKind = (kind: string | undefined) =>
+  kind === 'client-timeout' || kind === 'upstream-timeout'
+
 export function ChatMessageList({ sceneId }: ChatMessageListProps) {
   const messages = useChatStore((s) => s.messagesByScene[sceneId] ?? EMPTY_MESSAGES)
   const retryMessage = useChatStore((s) => s.retryMessage)
@@ -77,6 +80,10 @@ export function ChatMessageList({ sceneId }: ChatMessageListProps) {
         // assistant text message
         const resultNodeId = message.resultNodeIds?.[0]
         const retryDisabledReason = message.retryDisabledReason || (isBusy ? '当前仍有生成任务，完成或取消后可重试' : '')
+        const showMediumRetry =
+          message.status === 'error' &&
+          isTimeoutErrorKind(message.errorKind) &&
+          message.generationContext?.quality === 'high'
 
         return (
           <div key={message.id} className="chat-message chat-message-assistant">
@@ -112,7 +119,7 @@ export function ChatMessageList({ sceneId }: ChatMessageListProps) {
               )}
 
               {message.status === 'error' && (
-                <div className="chat-error-row">
+                <div className={`chat-error-row ${message.errorKind === 'canceled' ? 'chat-error-row-canceled' : ''}`}>
                   <span className="chat-error-text">{message.error || '生成失败'}</span>
                   <button
                     type="button"
@@ -124,6 +131,17 @@ export function ChatMessageList({ sceneId }: ChatMessageListProps) {
                     <RefreshCw size={13} />
                     重试
                   </button>
+                  {showMediumRetry && (
+                    <button
+                      type="button"
+                      className="chat-retry-btn chat-retry-btn-secondary"
+                      onClick={() => void retryMessage({ sceneId, messageId: message.id, qualityOverride: 'medium' })}
+                      disabled={isBusy || Boolean(message.retryDisabledReason)}
+                      title={retryDisabledReason || '以中质量重新生成'}
+                    >
+                      中质量重试
+                    </button>
+                  )}
                 </div>
               )}
             </div>

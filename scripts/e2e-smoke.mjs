@@ -153,9 +153,10 @@ const server = spawn(
 
 try {
   await mkdir('test-artifacts', { recursive: true })
-  const [nodeRegistrySource, actionModelSource] = await Promise.all([
+  const [nodeRegistrySource, actionModelSource, viteConfigSource] = await Promise.all([
     readFile('src/canvas/nodeTypes/canvasNodeRegistry.ts', 'utf8'),
     readFile('src/canvas/actions/canvasActionModel.ts', 'utf8'),
+    readFile('vite.config.ts', 'utf8'),
   ])
   for (const nodeType of [
     'image',
@@ -176,6 +177,17 @@ try {
   for (const extensionMap of ['contextMenuExtensionsByNodeType', 'quickToolbarExtensionsByNodeType']) {
     if (!actionModelSource.includes(extensionMap)) {
       throw new Error(`Action model should compose node actions through ${extensionMap}`)
+    }
+  }
+  for (const expectedSize of [
+    "high: '2304x2304'",
+    "high: '3456x2304'",
+    "high: '2304x3456'",
+    "high: '2560x1440'",
+    "high: '1440x2560'",
+  ]) {
+    if (!viteConfigSource.includes(expectedSize)) {
+      throw new Error(`R3 high quality size map should include ${expectedSize}`)
     }
   }
   await waitForServer(baseUrl)
@@ -3616,6 +3628,13 @@ try {
     await page.waitForSelector('.chat-composer-textarea', { state: 'visible' })
   }
   await page.locator(`[data-node-id="${firstNodeId}"]`).click()
+  await page.evaluate(async () => {
+    const spec = performance.getEntriesByType('resource').map(r => r.name).find(n => n.includes('chatStore.ts'))
+    if (!spec) return
+    const { useChatStore } = await import(new URL(spec).pathname + new URL(spec).search)
+    useChatStore.getState().setParamOverride('imgRatio', '16:9')
+    useChatStore.getState().setParamOverride('quality', 'high')
+  })
   const countBeforeGenerate = await page.locator('.dom-node').count()
   await page.locator('.chat-composer-textarea').fill('e2e derived concept image')
   await page.locator('.chat-composer-textarea').press('Enter')
@@ -3642,6 +3661,27 @@ try {
   await page.waitForSelector('.chat-param-card')
   const paramCardVisible = await page.locator('.chat-param-card').isVisible()
   if (!paramCardVisible) throw new Error('Enhance param card should be visible after generation')
+  const paramCard = page.locator('.chat-param-card').last()
+  const paramCardText = await paramCard.innerText()
+  if (!paramCardText.includes('16:9') || !paramCardText.includes('高') || !paramCardText.includes('预计较慢')) {
+    throw new Error(`Enhance param card should show effective high 16:9 values and slow hint: ${JSON.stringify(paramCardText)}`)
+  }
+  const manualChipCount = await paramCard.locator('.chat-chip-manual').count()
+  if (manualChipCount < 2) {
+    throw new Error(`Enhance param card should mark manual ratio and quality overrides, got ${manualChipCount}`)
+  }
+  await paramCard.getByRole('button', { name: '深度思考' }).click()
+  const reasoningText = await paramCard.locator('.chat-param-fold-body').innerText()
+  if (!reasoningText.includes('Agent 建议：1:1 / 中')) {
+    throw new Error(`Enhance param card should move differing agent suggestion into reasoning foldout: ${JSON.stringify(reasoningText)}`)
+  }
+  await page.evaluate(async () => {
+    const spec = performance.getEntriesByType('resource').map(r => r.name).find(n => n.includes('chatStore.ts'))
+    if (!spec) return
+    const { useChatStore } = await import(new URL(spec).pathname + new URL(spec).search)
+    useChatStore.getState().setParamOverride('imgRatio', 'auto')
+    useChatStore.getState().setParamOverride('quality', 'auto')
+  })
 
   // Assert chat state: assistant result bubble present
   const assistantBubbles = await page.locator('.chat-message-assistant').count()
@@ -3805,6 +3845,74 @@ try {
     const { useCanvasStore } = await import(moduleSpec)
     useCanvasStore.getState().loadScene('character-flow')
   }, await canvasStoreSpec())
+
+  // Regression: timeout errors distinguish upstream 504 and offer a medium-quality retry preserving context.
+  const timeoutRetryGenerateRequests = []
+  let timeoutRetryGenerateCount = 0
+  const timeoutRetryGenerateHandler = async (route) => {
+    try { timeoutRetryGenerateRequests.push(JSON.parse(route.request().postData() || '{}')) } catch { timeoutRetryGenerateRequests.push({}) }
+    timeoutRetryGenerateCount += 1
+    if (timeoutRetryGenerateCount === 1) {
+      await route.fulfill({
+        status: 504,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: 'Image API request timed out' }),
+      })
+      return
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }),
+    })
+  }
+  await page.unroute('**/api/mivo/generate')
+  await page.route('**/api/mivo/generate', timeoutRetryGenerateHandler)
+  try {
+    await page.evaluate(async ({ canvasModuleSpec, chatModuleSpec }) => {
+      const { useCanvasStore } = await import(canvasModuleSpec)
+      const { useChatStore } = await import(chatModuleSpec)
+      useCanvasStore.getState().selectNode(undefined)
+      useChatStore.getState().setSelectedModel('gpt-image-2')
+      useChatStore.getState().setParamOverride('imgRatio', '16:9')
+      useChatStore.getState().setParamOverride('quality', 'high')
+    }, { canvasModuleSpec: await canvasStoreSpec(), chatModuleSpec: await chatStoreSpec() })
+    await page.locator('.chat-composer-textarea').fill('timeout retry should lower only quality')
+    await page.locator('.chat-composer-textarea').press('Enter')
+    await page.waitForSelector('.chat-error-text', { timeout: 10000 })
+    const timeoutText = await page.locator('.chat-error-text').last().innerText()
+    if (!timeoutText.includes('上游生成超时，可降低质量重试')) {
+      throw new Error(`Upstream 504 should show a lowering-quality timeout message: ${JSON.stringify(timeoutText)}`)
+    }
+    await page.getByRole('button', { name: '中质量重试' }).last().click()
+    await waitForChatIdle()
+    await page.waitForSelector('.chat-result-image, .chat-result-image-placeholder', { timeout: 10000 })
+    if (timeoutRetryGenerateRequests.length !== 2) {
+      throw new Error(`Timeout retry should issue exactly two generate requests, got ${timeoutRetryGenerateRequests.length}`)
+    }
+    const [firstTimeoutRequest, mediumRetryRequest] = timeoutRetryGenerateRequests
+    if (
+      firstTimeoutRequest.quality !== 'high' ||
+      mediumRetryRequest.quality !== 'medium' ||
+      mediumRetryRequest.imgRatio !== firstTimeoutRequest.imgRatio ||
+      mediumRetryRequest.model !== firstTimeoutRequest.model ||
+      mediumRetryRequest.prompt !== firstTimeoutRequest.prompt
+    ) {
+      throw new Error(`Medium retry should lower only quality: ${JSON.stringify(timeoutRetryGenerateRequests)}`)
+    }
+  } finally {
+    await page.unroute('**/api/mivo/generate', timeoutRetryGenerateHandler)
+    await page.route('**/api/mivo/generate', async (route) => {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }) })
+    })
+    await page.evaluate(async () => {
+      const spec = performance.getEntriesByType('resource').map(r => r.name).find(n => n.includes('chatStore.ts'))
+      if (!spec) return
+      const { useChatStore } = await import(new URL(spec).pathname + new URL(spec).search)
+      useChatStore.getState().setParamOverride('imgRatio', 'auto')
+      useChatStore.getState().setParamOverride('quality', 'auto')
+    })
+  }
 
   // Regression: retry reuses the original user message and preserves uploaded reference assets.
   const retryEditRequests = []
@@ -4258,7 +4366,10 @@ try {
   await browser.close()
 
   // Filter known spurious network errors (Eagle mock uses filesystem paths as image URLs on macOS)
-  const realErrors = errors.filter((e) => !e.includes('ERR_UNKNOWN_URL_SCHEME'))
+  const realErrors = errors.filter((e) =>
+    !e.includes('ERR_UNKNOWN_URL_SCHEME') &&
+    !e.includes('status of 504 (Gateway Timeout)'),
+  )
   if (realErrors.length) {
     throw new Error(`Console errors:\n${realErrors.join('\n')}`)
   }
