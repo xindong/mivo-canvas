@@ -128,6 +128,30 @@ const isGeneration = (value: unknown) => {
   )
 }
 
+// P2-D1 EXPERIMENTAL: light validation for experimentalAnchors. box anchors must
+// carry width/height > 0; resultNodeIds (if present) must be a string array. A
+// malformed anchor rejects the whole snapshot (import guard). Clone-time dropping
+// (cloneNode) handles in-memory bad data; this guards the import path.
+const isExperimentalAnchor = (value: unknown): boolean => {
+  if (!isRecord(value)) return false
+  if (typeof value.id !== 'string' || !value.id) return false
+  if (value.type !== 'point' && value.type !== 'box') return false
+  if (typeof value.targetNodeId !== 'string' || !value.targetNodeId) return false
+  if (typeof value.x !== 'number' || !Number.isFinite(value.x)) return false
+  if (typeof value.y !== 'number' || !Number.isFinite(value.y)) return false
+  if (typeof value.instruction !== 'string') return false
+  if (typeof value.createdAt !== 'number' || !Number.isFinite(value.createdAt)) return false
+  if (value.type === 'box') {
+    if (typeof value.width !== 'number' || !Number.isFinite(value.width) || value.width <= 0) return false
+    if (typeof value.height !== 'number' || !Number.isFinite(value.height) || value.height <= 0) return false
+  }
+  if (value.resultNodeIds !== undefined && !isStringArray(value.resultNodeIds)) return false
+  return true
+}
+
+const isExperimentalAnchorArray = (value: unknown): boolean =>
+  Array.isArray(value) && value.every(isExperimentalAnchor)
+
 const isCanvasNode = (value: unknown): value is MivoCanvasNode => {
   if (!isRecord(value)) return false
   const nodeTypeValid =
@@ -200,7 +224,8 @@ const isCanvasNode = (value: unknown): value is MivoCanvasNode => {
     (value.hidden === undefined || typeof value.hidden === 'boolean') &&
     (value.favorited === undefined || typeof value.favorited === 'boolean') &&
     isGeneration(value.generation) &&
-    isAiWorkflow(value.aiWorkflow)
+    isAiWorkflow(value.aiWorkflow) &&
+    (value.experimentalAnchors === undefined || isExperimentalAnchorArray(value.experimentalAnchors))
   )
 }
 

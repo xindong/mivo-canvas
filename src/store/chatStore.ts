@@ -162,7 +162,8 @@ const enhanceForGeneration = (enhanceResult: EnhanceResponse): ChatEnhanceResult
 // 审查 B：persist v1→v2 迁移与 retryMessage 入口共用——把不再被当前模型支持的 ratio 收敛掉，
 // 防止老会话的 21:9 在 gemini 能力表去 21:9 后从 generationContext 复活。
 // enhance.imgRatio 保留作历史展示，不在此处收敛。
-const clampChatGenerationContext = (context: ChatGenerationContext): ChatGenerationContext => {
+// Exported so chatStoreMigrate.test.ts can cover the ratio-convergence branches directly.
+export const clampChatGenerationContext = (context: ChatGenerationContext): ChatGenerationContext => {
   const validRatios = getModelCapabilities(context.model).ratios as readonly string[]
   const requestedImgRatio =
     context.requestedImgRatio === 'auto' || validRatios.includes(context.requestedImgRatio)
@@ -171,6 +172,52 @@ const clampChatGenerationContext = (context: ChatGenerationContext): ChatGenerat
   const imgRatio =
     context.imgRatio && validRatios.includes(context.imgRatio) ? context.imgRatio : undefined
   return { ...context, requestedImgRatio, imgRatio }
+}
+
+// Persisted-state migration extracted to a named export so chatStoreMigrate.test.ts can
+// cover the v1→v2 ratio-convergence branches. Behavior is identical to the prior inline form.
+export type ChatPersistedState = {
+  selectedModel?: string
+  paramOverrides?: ChatParamOverrides
+  messagesByScene?: Record<string, ChatMessage[]>
+}
+
+export const migrateChatPersistedState = (
+  persistedState: unknown,
+  version = 0,
+): { selectedModel: string; paramOverrides: ChatParamOverrides; messagesByScene: Record<string, ChatMessage[]> } => {
+  const state = (persistedState ?? {}) as ChatPersistedState
+  if (version >= 2) {
+    return state as {
+      selectedModel: string
+      paramOverrides: ChatParamOverrides
+      messagesByScene: Record<string, ChatMessage[]>
+    }
+  }
+  // v1 → v2: gemini 能力表去 21:9，把老会话里不再支持的 ratio 收敛掉
+  // 老用户已选模型保留（selectedModel 原样回填），仅对 ratios 做收敛
+  const selectedModel = state.selectedModel || 'gemini-3-pro-image'
+  const validRatios = getModelCapabilities(selectedModel).ratios as readonly string[]
+  const prevOverrides = state.paramOverrides ?? {
+    imgRatio: 'auto' as const,
+    quality: 'auto' as const,
+  }
+  const paramOverrides: ChatParamOverrides = {
+    imgRatio:
+      prevOverrides.imgRatio !== 'auto' && !validRatios.includes(prevOverrides.imgRatio)
+        ? 'auto'
+        : prevOverrides.imgRatio,
+    quality: prevOverrides.quality,
+  }
+  const messagesByScene: Record<string, ChatMessage[]> = {}
+  for (const [sceneId, messages] of Object.entries(state.messagesByScene ?? {})) {
+    messagesByScene[sceneId] = messages.map((msg) =>
+      msg.generationContext
+        ? { ...msg, generationContext: clampChatGenerationContext(msg.generationContext) }
+        : msg,
+    )
+  }
+  return { selectedModel, paramOverrides, messagesByScene }
 }
 
 export const useChatStore = create<ChatState>()(
@@ -760,44 +807,7 @@ export const useChatStore = create<ChatState>()(
         paramOverrides: state.paramOverrides,
         // isBusy excluded (runtime state)
       }),
-      migrate: (persistedState, version) => {
-        const state = (persistedState ?? {}) as {
-          selectedModel?: string
-          paramOverrides?: ChatParamOverrides
-          messagesByScene?: Record<string, ChatMessage[]>
-        }
-        if (version >= 2) {
-          return state as {
-            selectedModel: string
-            paramOverrides: ChatParamOverrides
-            messagesByScene: Record<string, ChatMessage[]>
-          }
-        }
-        // v1 → v2: gemini 能力表去 21:9，把老会话里不再支持的 ratio 收敛掉
-        // 老用户已选模型保留（selectedModel 原样回填），仅对 ratios 做收敛
-        const selectedModel = state.selectedModel || 'gemini-3-pro-image'
-        const validRatios = getModelCapabilities(selectedModel).ratios as readonly string[]
-        const prevOverrides = state.paramOverrides ?? {
-          imgRatio: 'auto' as const,
-          quality: 'auto' as const,
-        }
-        const paramOverrides: ChatParamOverrides = {
-          imgRatio:
-            prevOverrides.imgRatio !== 'auto' && !validRatios.includes(prevOverrides.imgRatio)
-              ? 'auto'
-              : prevOverrides.imgRatio,
-          quality: prevOverrides.quality,
-        }
-        const messagesByScene: Record<string, ChatMessage[]> = {}
-        for (const [sceneId, messages] of Object.entries(state.messagesByScene ?? {})) {
-          messagesByScene[sceneId] = messages.map((msg) =>
-            msg.generationContext
-              ? { ...msg, generationContext: clampChatGenerationContext(msg.generationContext) }
-              : msg,
-          )
-        }
-        return { selectedModel, paramOverrides, messagesByScene }
-      },
+      migrate: migrateChatPersistedState,
     },
   ),
 )
