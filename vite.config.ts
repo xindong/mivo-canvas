@@ -17,7 +17,7 @@ const mivoEnhanceFallbackTimeoutMs = 8_000
 // SYNC NOTE: keep in sync with src/lib/modelCapabilities.ts
 const mivoModelRatioMap: Record<string, string[]> = {
   'gpt-image-2': ['1:1', '3:2', '2:3', '16:9', '9:16'],
-  'gemini-3-pro-image': ['1:1', '3:2', '2:3', '3:4', '4:3', '16:9', '9:16', '21:9', '5:4', '4:5'],
+  'gemini-3-pro-image': ['1:1', '16:9', '9:16', '4:3', '3:4', '2:3', '3:2', '4:5', '5:4'],
   'doubao-seedance-2-0-260128': ['1:1', '3:4', '4:3', '16:9', '9:16', '21:9'],
   'doubao-seedance-2-0-fast-260128': ['1:1', '3:4', '4:3', '16:9', '9:16', '21:9'],
 }
@@ -322,10 +322,287 @@ const readUpstreamError = async (response: Response) => {
   }
 }
 
+// ─── mivo 平台通道（D-R5a/b/d/e；Step 0 门禁通过：GPT 通道 68s < 75s，image2 走平台） ──────────
+
+const mivoPlatformPollIntervalMs = 2_500
+const mivoPlatformPollDeadlineMs = 175_000 // 2K 实测 40s，预算充足
+const mivoPlatformRatioSet = new Set(['1:1', '16:9', '9:16', '4:3', '3:4', '2:3', '3:2', '4:5', '5:4'])
+const mivoResolutionMap: Record<string, string> = { low: '1K', medium: '1K', high: '2K' }
+
+// 平台通道开关（单点真相源）。Step 0 门禁通过 → gpt-image-2 启用平台 GPT 通道
+const MIVO_PLATFORM_CHANNELS: Record<string, { modelType: string; version: string }> = {
+  'gemini-3-pro-image': { modelType: 'NANOBANANA', version: 'gemini-3-pro-image-preview' },
+  'gpt-image-2': { modelType: 'GPT', version: 'gpt-image-2' },
+}
+
+// 纯内存缓存（D-R5e：不落盘、不读写 ~/.mivo，避免与 MCP 缓存互踩）
+let mivoPlatformToken: string | null = null
+let mivoPlatformChatSessionId: string | null = null
+let mivoPlatformTokenPromise: Promise<string> | null = null
+let mivoPlatformChatSessionPromise: Promise<string> | null = null
+
+type PlatformCtx = { platformKey: string; platformEndpoint: string }
+
+const sanitizePlatformError = (text: string) =>
+  String(text)
+    .replace(/mivo_[A-Za-z0-9_-]+/g, 'mivo_***')
+    .replace(/"(authorization|session|sub|token)"\s*:\s*"[^"]*"/gi, '"$1":"***"')
+    .slice(0, 300)
+
+async function mivoPlatformRefreshToken(ctx: PlatformCtx, signal?: AbortSignal) {
+  const res = await fetch(`${ctx.platformEndpoint}/api/v1/state/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: '', sub: ctx.platformKey, name: '' }),
+    signal,
+  })
+  if (!res.ok) throw new Error(`platform token ${res.status}`)
+  const json = (await res.json()) as { session?: string }
+  if (!json.session) throw new Error('platform token no session')
+  mivoPlatformToken = json.session
+  mivoPlatformChatSessionId = null
+  mivoPlatformChatSessionPromise = null
+  return json.session
+}
+
+async function mivoPlatformEnsureToken(ctx: PlatformCtx, signal?: AbortSignal) {
+  if (mivoPlatformToken) return mivoPlatformToken
+  if (!mivoPlatformTokenPromise) {
+    mivoPlatformTokenPromise = mivoPlatformRefreshToken(ctx, signal).finally(() => {
+      mivoPlatformTokenPromise = null
+    })
+  }
+  return mivoPlatformTokenPromise
+}
+
+async function mivoPlatformEnsureChatSession(ctx: PlatformCtx, signal?: AbortSignal) {
+  if (mivoPlatformChatSessionId) return mivoPlatformChatSessionId
+  if (!mivoPlatformChatSessionPromise) {
+    mivoPlatformChatSessionPromise = (async () => {
+      const token = await mivoPlatformEnsureToken(ctx, signal)
+      const res = await fetch(`${ctx.platformEndpoint}/api/v1/message/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ type: 'freeform' }),
+        signal,
+      })
+      if (res.status === 401) {
+        mivoPlatformToken = null
+        throw new Error('platform chat 401')
+      }
+      if (!res.ok) throw new Error(`platform chat ${res.status}`)
+      const json = (await res.json()) as { object_id?: string; chatSessionId?: string }
+      const id = json.object_id || json.chatSessionId
+      if (!id) throw new Error('platform chat no id')
+      mivoPlatformChatSessionId = id
+      return id
+    })().finally(() => {
+      mivoPlatformChatSessionPromise = null
+    })
+  }
+  return mivoPlatformChatSessionPromise
+}
+
+// 统一 authRetry：401 → 单飞刷 token → 重试一次；不回落 llm-proxy
+async function mivoPlatformFetch(
+  url: string,
+  init: RequestInit,
+  ctx: PlatformCtx,
+  signal?: AbortSignal,
+) {
+  let token = await mivoPlatformEnsureToken(ctx, signal)
+  const authHeaders = { ...init.headers, Authorization: `Bearer ${token}` }
+  let res = await fetch(url, { ...init, headers: authHeaders, signal })
+  if (res.status === 401) {
+    mivoPlatformToken = null
+    mivoPlatformTokenPromise = null
+    token = await mivoPlatformEnsureToken(ctx, signal)
+    const retryHeaders = { ...init.headers, Authorization: `Bearer ${token}` }
+    res = await fetch(url, { ...init, headers: retryHeaders, signal })
+  }
+  return res
+}
+
+async function mivoPlatformSubmitMessage(
+  ctx: PlatformCtx,
+  params: { modelType: string; modelFormat?: { version: string }; payload: Record<string, unknown> },
+  signal?: AbortSignal,
+) {
+  const chatSessionId = await mivoPlatformEnsureChatSession(ctx, signal)
+  const body: Record<string, unknown> = {
+    chatSessionId,
+    messageType: 'image',
+    modelType: params.modelType,
+    action: 'mcp',
+    payload: params.payload,
+  }
+  if (params.modelFormat !== undefined) body.modelFormat = params.modelFormat
+  const res = await mivoPlatformFetch(
+    `${ctx.platformEndpoint}/api/v1/message`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },
+    ctx,
+    signal,
+  )
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw new Error(`platform submit ${res.status}: ${sanitizePlatformError(text)}`)
+  }
+  const json = (await res.json()) as { object_id?: string; jobId?: string }
+  const jobId = json.object_id || json.jobId
+  if (!jobId) throw new Error(`platform submit no jobId: ${sanitizePlatformError(JSON.stringify(json).slice(0, 200))}`)
+  return jobId
+}
+
+async function mivoPlatformPollJob(
+  ctx: PlatformCtx,
+  jobId: string,
+  signal?: AbortSignal,
+  deadlineMs = mivoPlatformPollDeadlineMs,
+  intervalMs = mivoPlatformPollIntervalMs,
+) {
+  const t0 = Date.now()
+  let lastStatus: string | null = null
+  while (Date.now() - t0 < deadlineMs) {
+    if (signal?.aborted) return { status: 'aborted' as const }
+    const res = await mivoPlatformFetch(
+      `${ctx.platformEndpoint}/api/v1/message/${jobId}`,
+      { headers: {} },
+      ctx,
+      signal,
+    )
+    if (!res.ok) throw new Error(`platform poll ${res.status}`)
+    const json = (await res.json()) as {
+      content?: { status?: string; state?: string; images?: string[]; error?: string; message?: string }
+      status?: string
+      images?: string[]
+      error?: string
+    }
+    const content = json.content || (json as { status?: string; state?: string; images?: string[]; error?: string; message?: string })
+    lastStatus = content.status || content.state || 'pending'
+    if (lastStatus === 'completed') {
+      return { status: 'completed' as const, images: content.images || [] }
+    }
+    if (lastStatus === 'failed') {
+      return { status: 'failed' as const, error: sanitizePlatformError(content.error || content.message || 'failed') }
+    }
+    await new Promise((r) => setTimeout(r, intervalMs))
+  }
+  return { status: 'timeout' as const, lastStatus }
+}
+
+async function mivoPlatformDownloadImage(ctx: PlatformCtx, fileUrlPath: string, signal?: AbortSignal) {
+  const fileId = String(fileUrlPath).split('/').pop() || ''
+  if (!fileId) throw new Error('platform download: empty fileId')
+  const signRes = await mivoPlatformFetch(
+    `${ctx.platformEndpoint}/api/v1/file/signUrl/${fileId}`,
+    { headers: {} },
+    ctx,
+    signal,
+  )
+  if (!signRes.ok) throw new Error(`platform signUrl ${signRes.status}`)
+  let signedUrl = (await signRes.text()).trim()
+  if (signedUrl.startsWith('"') && signedUrl.endsWith('"')) signedUrl = signedUrl.slice(1, -1)
+  if (signedUrl.startsWith('{')) {
+    const j = JSON.parse(signedUrl) as { url?: string; signUrl?: string; data?: { url?: string } }
+    signedUrl = j.url || j.signUrl || j.data?.url || ''
+  }
+  // 平台 signUrl 返回协议相对 URL（//host/...），补 https:
+  if (signedUrl.startsWith('//')) signedUrl = `https:${signedUrl}`
+  if (!signedUrl.startsWith('http')) throw new Error('platform signUrl not a url')
+  const imgRes = await fetch(signedUrl, { signal })
+  if (!imgRes.ok) throw new Error(`platform download ${imgRes.status}`)
+  return Buffer.from(await imgRes.arrayBuffer())
+}
+
+async function mivoPlatformUploadOne(ctx: PlatformCtx, file: File, signal?: AbortSignal) {
+  const buf = Buffer.from(await file.arrayBuffer())
+  const blob = new Blob([buf], { type: file.type || 'image/png' })
+  const form = new FormData()
+  form.append('file', blob, file.name || 'reference.png')
+  const res = await mivoPlatformFetch(
+    `${ctx.platformEndpoint}/api/v1/file/`,
+    { method: 'POST', body: form },
+    ctx,
+    signal,
+  )
+  if (!res.ok) throw new Error(`platform upload ${res.status}`)
+  const json = (await res.json()) as unknown
+  const arr = (Array.isArray(json)
+    ? json
+    : (json as { files?: unknown[]; data?: unknown[] })?.files || (json as { data?: unknown[] })?.data || [json]) as Array<{
+    object_id?: string
+    _id?: string
+  }>
+  const id =
+    arr[0]?.object_id ||
+    arr[0]?._id ||
+    (json as { object_id?: string; _id?: string })?.object_id ||
+    (json as { _id?: string })?._id
+  if (!id) throw new Error('platform upload no file id')
+  return id
+}
+
+const resolveMivoPlatformPayload = (
+  modelId: string,
+  imgRatio: unknown,
+  quality: string,
+  prompt: string,
+  images?: string[],
+) => {
+  const channel = MIVO_PLATFORM_CHANNELS[modelId]
+  const rawRatio = typeof imgRatio === 'string' ? imgRatio : '1:1'
+  const clampedRatio = mivoPlatformRatioSet.has(rawRatio) ? rawRatio : '1:1'
+  const resolution = mivoResolutionMap[quality] || '1K'
+  const payload: Record<string, unknown> = { prompt, imgRatio: clampedRatio, resolution, n: 1 }
+  if (images && images.length) payload.images = images
+  return {
+    modelType: channel?.modelType || 'NANOBANANA',
+    modelFormat: channel ? { version: channel.version } : undefined,
+    payload,
+  }
+}
+
+// 平台生图主流程（submit+poll+download+归一 {images:[{b64}]}）；断连由 controller 贯穿
+async function runMivoPlatformImageJob(
+  ctx: PlatformCtx,
+  params: { modelType: string; modelFormat?: { version: string }; payload: Record<string, unknown> },
+  response: ServerResponse,
+  controller: AbortController,
+) {
+  try {
+    const jobId = await mivoPlatformSubmitMessage(ctx, params, controller.signal)
+    const poll = await mivoPlatformPollJob(ctx, jobId, controller.signal)
+    if (poll.status === 'aborted') return true
+    if (poll.status === 'timeout') {
+      if (!response.writableEnded) sendMivoJson(response, 504, { error: '上游生成超时，可降低质量重试' })
+      return true
+    }
+    if (poll.status === 'failed') {
+      if (!response.writableEnded) sendMivoJson(response, 502, { error: poll.error || '生成失败' })
+      return true
+    }
+    const imgPath = poll.images[0]
+    if (!imgPath) {
+      if (!response.writableEnded) sendMivoJson(response, 502, { error: '生成失败：结果为空' })
+      return true
+    }
+    const buf = await mivoPlatformDownloadImage(ctx, imgPath, controller.signal)
+    if (!response.writableEnded) sendMivoJson(response, 200, { images: [{ b64: buf.toString('base64') }] })
+    return true
+  } catch (error) {
+    if (controller.signal.aborted) return true
+    if (!response.writableEnded) {
+      sendMivoJson(response, 502, { error: sanitizePlatformError(error instanceof Error ? error.message : '生成失败') })
+    }
+    return true
+  }
+}
+
 const proxyMivoGenerate = async (
   request: IncomingMessage,
   response: ServerResponse,
   imageApiKey: string,
+  platformCtx: PlatformCtx,
 ) => {
   try {
     if (request.method !== 'POST') {
@@ -348,6 +625,23 @@ const proxyMivoGenerate = async (
 
     const quality = normalizeMivoQuality(body.quality)
     const modelId = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : defaultMivoImageModel
+
+    // 分流：平台通道（gemini + 门禁通过的 gpt-image-2）→ 平台；其余 → llm-proxy
+    if (MIVO_PLATFORM_CHANNELS[modelId]) {
+      if (!platformCtx.platformKey.startsWith('mivo_')) {
+        sendMivoJson(response, 500, { error: 'MIVO_PLATFORM_KEY 未配置，请配置或切换 GPT 模型' })
+        return
+      }
+      const controller = new AbortController()
+      response.on('close', () => {
+        if (!response.writableEnded) controller.abort()
+      })
+      const { modelType, modelFormat, payload } = resolveMivoPlatformPayload(modelId, body.imgRatio, quality, prompt)
+      const handled = await runMivoPlatformImageJob(platformCtx, { modelType, modelFormat, payload }, response, controller)
+      if (handled) return
+    }
+
+    // llm-proxy 路径（兜底：未在平台通道表的模型）
     const upstreamResponse = await fetchUpstreamWithTimeout(`${mivoImageApiBase}/generations`, {
       method: 'POST',
       headers: {
@@ -382,6 +676,7 @@ const proxyMivoEdit = async (
   request: IncomingMessage,
   response: ServerResponse,
   imageApiKey: string,
+  platformCtx: PlatformCtx,
 ) => {
   try {
     if (request.method !== 'POST') {
@@ -404,9 +699,40 @@ const proxyMivoEdit = async (
 
     const quality = normalizeMivoQuality(firstMultipartField(fields, 'quality'))
     const model = firstMultipartField(fields, 'model').trim() || defaultMivoImageModel
+    const mask = multipartFiles(files, 'mask')[0]
+
+    // 分流不变量（审查 A）：mask 存在 → 无条件 llm-proxy gpt-image-2（mivo 无 mask 能力）；
+    // 否则按平台通道分流（gemini/gpt-image-2 走平台，主图+参考图合并上传进 payload.images，主图第一位）
+    const usePlatform = !mask && MIVO_PLATFORM_CHANNELS[model]
+    if (usePlatform) {
+      if (!platformCtx.platformKey.startsWith('mivo_')) {
+        sendMivoJson(response, 500, { error: 'MIVO_PLATFORM_KEY 未配置，请配置或切换 GPT 模型' })
+        return
+      }
+      const controller = new AbortController()
+      response.on('close', () => {
+        if (!response.writableEnded) controller.abort()
+      })
+      const references = [...multipartFiles(files, 'reference[]'), ...multipartFiles(files, 'reference')]
+      const allImages = [image, ...references] // 主图第一位，不许丢
+      const fileIds: string[] = []
+      for (const f of allImages) {
+        fileIds.push(await mivoPlatformUploadOne(platformCtx, f, controller.signal))
+      }
+      const { modelType, modelFormat, payload } = resolveMivoPlatformPayload(
+        model,
+        firstMultipartField(fields, 'imgRatio'),
+        quality,
+        prompt,
+        fileIds,
+      )
+      const handled = await runMivoPlatformImageJob(platformCtx, { modelType, modelFormat, payload }, response, controller)
+      if (handled) return
+    }
+
+    // llm-proxy edit 路径（mask / 未在平台通道表的模型）
     const formData = new FormData()
     appendFile(formData, 'image', image)
-    const mask = multipartFiles(files, 'mask')[0]
     if (mask) appendFile(formData, 'mask', mask)
     for (const reference of [...multipartFiles(files, 'reference[]'), ...multipartFiles(files, 'reference')]) {
       appendFile(formData, 'reference[]', reference)
@@ -816,7 +1142,7 @@ const proxyMivoEnhance = async (
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-const localAssetLibraryPlugin = ({ imageApiKey, llmApiKey }: { imageApiKey: string; llmApiKey: string }): Plugin => ({
+const localAssetLibraryPlugin = ({ imageApiKey, llmApiKey, platformCtx }: { imageApiKey: string; llmApiKey: string; platformCtx: PlatformCtx }): Plugin => ({
   name: 'mivo-local-asset-library',
   configureServer(server: ViteDevServer) {
     server.middlewares.use(async (request, response, next) => {
@@ -825,12 +1151,12 @@ const localAssetLibraryPlugin = ({ imageApiKey, llmApiKey }: { imageApiKey: stri
       const pathname = requestUrl.pathname
 
       if (pathname === '/api/mivo/generate') {
-        await proxyMivoGenerate(request, response, imageApiKey)
+        await proxyMivoGenerate(request, response, imageApiKey, platformCtx)
         return
       }
 
       if (pathname === '/api/mivo/edit') {
-        await proxyMivoEdit(request, response, imageApiKey)
+        await proxyMivoEdit(request, response, imageApiKey, platformCtx)
         return
       }
 
@@ -1028,8 +1354,12 @@ export default defineConfig(({ mode }) => {
   const imageApiKey = env.MIVO_IMAGE_API_KEY || process.env.MIVO_IMAGE_API_KEY || ''
   // LLM key for enhance endpoint: prefer dedicated key, fall back to image key
   const llmApiKey = env.MIVO_LLM_API_KEY || env.MIVO_IMAGE_API_KEY || ''
+  // mivo 平台通道 key/endpoint（D-R5：与 llm-proxy sk- key 严格分离，仅 Node 层读，不进客户端 bundle）
+  const platformKey = env.MIVO_PLATFORM_KEY || process.env.MIVO_PLATFORM_KEY || ''
+  const platformEndpoint = (env.MIVO_PLATFORM_ENDPOINT || process.env.MIVO_PLATFORM_ENDPOINT || 'https://aigc.xindong.com').replace(/\/$/, '')
+  const platformCtx: PlatformCtx = { platformKey, platformEndpoint }
 
   return {
-    plugins: [react(), localAssetLibraryPlugin({ imageApiKey, llmApiKey })],
+    plugins: [react(), localAssetLibraryPlugin({ imageApiKey, llmApiKey, platformCtx })],
   }
 })
