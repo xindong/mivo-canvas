@@ -73,6 +73,7 @@ export type CommittedGenerationImage = {
 export type CommitGenerationResultPayload = {
   sceneId?: CanvasId
   sourceNodeId?: string
+  createDerivationEdge?: boolean
   resultImages: CommittedGenerationImage[]
   prompt: string
   model: string

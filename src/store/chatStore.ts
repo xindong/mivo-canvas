@@ -260,6 +260,7 @@ export const useChatStore = create<ChatState>()(
           const canvasStore = useCanvasStore.getState()
           const genOptions = {
             sceneId,
+            createDerivationEdge: false,
             imgRatio: finalRatio,
             quality: finalQuality,
             model: selectedModel,
@@ -462,6 +463,7 @@ export const useChatStore = create<ChatState>()(
           const canvasStore = useCanvasStore.getState()
           const genOptions = {
             sceneId,
+            createDerivationEdge: false,
             imgRatio: context.imgRatio,
             quality: finalQuality,
             model: context.model,

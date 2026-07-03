@@ -3635,16 +3635,18 @@ try {
     useChatStore.getState().setParamOverride('imgRatio', '16:9')
     useChatStore.getState().setParamOverride('quality', 'high')
   })
+  const canvasBeforeGenerate = await readCanvasState()
   const countBeforeGenerate = await page.locator('.dom-node').count()
   await page.locator('.chat-composer-textarea').fill('e2e derived concept image')
   await page.locator('.chat-composer-textarea').press('Enter')
-  await page.waitForFunction((count) => document.querySelectorAll('.dom-node').length >= count + 2, countBeforeGenerate)
+  await page.waitForFunction((count) => document.querySelectorAll('.dom-node').length >= count + 1, countBeforeGenerate)
 
   const generatedCount = await page.locator('.dom-node').count()
-  if (generatedCount < countBeforeGenerate + 2) {
-    throw new Error(`Expected at least ${countBeforeGenerate + 2} nodes after generation result + edge, got ${generatedCount}`)
+  if (generatedCount < countBeforeGenerate + 1) {
+    throw new Error(`Expected at least ${countBeforeGenerate + 1} nodes after chat generation result, got ${generatedCount}`)
   }
   const besideResult = await page.locator('.dom-node[data-ai-kind="result"][data-ai-operation="beside-generation"]').last().evaluate((node) => ({
+    id: node.getAttribute('data-node-id'),
     kind: node.getAttribute('data-ai-kind'),
     operation: node.getAttribute('data-ai-operation'),
     sourceNodeIds: node.getAttribute('data-ai-source-node-ids'),
@@ -3655,6 +3657,13 @@ try {
     !besideResult.sourceNodeIds?.includes(firstNodeId)
   ) {
     throw new Error(`Immediate generation should create a derived result beside the selected source: ${JSON.stringify(besideResult)}`)
+  }
+  const canvasAfterGenerate = await readCanvasState()
+  const newChatEdges = canvasAfterGenerate.edges.filter((edge) =>
+    !canvasBeforeGenerate.edges.some((beforeEdge) => beforeEdge.id === edge.id),
+  )
+  if (newChatEdges.length !== 0) {
+    throw new Error(`Chat image-to-image should not create derivation edges: ${JSON.stringify(newChatEdges)}`)
   }
 
   // Assert chat state: param card appeared in assistant bubble
@@ -3728,6 +3737,7 @@ try {
     useChatStore.getState().setSelectedModel('gemini-3-pro-image')
     useChatStore.getState().setParamOverride('imgRatio', '21:9')
   })
+  const canvasBeforeGemini = await readCanvasState()
   const countBeforeGemini = await page.locator('.dom-node').count()
   await page.locator('.chat-composer-textarea').fill('gemini aspect ratio test')
   await page.locator('.chat-composer-textarea').press('Enter')
@@ -3765,6 +3775,13 @@ try {
     })
     await waitIdle()
   })
+  const canvasAfterGemini = await readCanvasState()
+  const newGeminiEdges = canvasAfterGemini.edges.filter((edge) =>
+    !canvasBeforeGemini.edges.some((beforeEdge) => beforeEdge.id === edge.id),
+  )
+  if (newGeminiEdges.length !== 0) {
+    throw new Error(`Chat text-to-image should not create derivation edges: ${JSON.stringify(newGeminiEdges)}`)
+  }
 
   // Regression: chat generation must commit to the scene where it started, even after switching canvases.
   const sceneScopedBefore = await page.evaluate(async (moduleSpec) => {

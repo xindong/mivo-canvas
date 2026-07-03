@@ -329,6 +329,7 @@ export function MivoCanvas({
           prompt: payload.prompt,
           model: 'gpt-image-2',
           kind: 'edit',
+          createDerivationEdge: true,
           maskBounds: payload.maskBounds,
           placement: 'right',
         })

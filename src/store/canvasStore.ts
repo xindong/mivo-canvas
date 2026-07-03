@@ -49,6 +49,7 @@ export type SelectionAlignment = 'left' | 'center' | 'right' | 'top' | 'middle' 
 export type DistributionAxis = 'horizontal' | 'vertical'
 export type CanvasGenerationOptions = {
   sceneId?: CanvasId
+  createDerivationEdge?: boolean
   imgRatio?: GenerationRatio
   quality?: MivoImageQuality
   model?: string
@@ -2225,7 +2226,7 @@ export const useCanvasStore = create<CanvasState>()(
             newNodes.push(resultNode)
             nextNodes = [...nextNodes, resultNode]
 
-            if (currentSource) {
+            if (currentSource && payload.createDerivationEdge !== false) {
               newEdges.push({
                 id: createEdgeId(),
                 from: currentSource.id,
@@ -2354,6 +2355,7 @@ export const useCanvasStore = create<CanvasState>()(
             model,
             kind: edgeTypeForOperation(operation),
             taskId,
+            createDerivationEdge: options.createDerivationEdge,
           })
           set((current) => {
             const targetDocument = current.canvases[targetSceneId]
@@ -2442,6 +2444,7 @@ export const useCanvasStore = create<CanvasState>()(
             model,
             kind: 'generate',
             taskId,
+            createDerivationEdge: options.createDerivationEdge,
           })
           set((current) => {
             const targetDocument = current.canvases[targetSceneId]
@@ -2550,6 +2553,7 @@ export const useCanvasStore = create<CanvasState>()(
             kind: 'generate',
             taskId,
             placement: 'right',
+            createDerivationEdge: options.createDerivationEdge,
           })
           set((current) => {
             const targetDocument = current.canvases[targetSceneId]
