@@ -34,7 +34,7 @@ import type {
   CommitGenerationResultPayload,
   CommittedGenerationImage,
   GenerationRatio,
-  MivoImageQuality,
+  MivoImageQuality, VariationParam,
 } from '../types/generation'
 import {
   compactCanvasesForPersist,
@@ -228,7 +228,7 @@ export type CanvasState = {
     geometry?: { width: number; height: number },
   ) => void
   resizeTextNode: (nodeId: string, x: number, width: number, height: number) => void
-  generateVariations: (sourceNodeId?: string) => void
+  generateVariations: (sourceNodeId?: string, variations?: VariationParam[], options?: CanvasGenerationOptions) => Promise<string[]>
   generateImageEdit: (
     sourceNodeId: string | undefined,
     operation: AiWorkflowOperation,
@@ -245,7 +245,7 @@ export type CanvasState = {
     prompt?: string,
     options?: CanvasGenerationOptions,
   ) => Promise<string[]>
-  generateFromAnnotation: (annotationNodeId?: string) => void
+  generateFromAnnotation: (annotationNodeId?: string, options?: CanvasGenerationOptions) => Promise<string[]>
   commitGenerationResult: (payload: CommitGenerationResultPayload) => Promise<string[]>
   toggleFavorite: (nodeId: string) => void
   updatePrompt: (nodeId: string, prompt: string) => void

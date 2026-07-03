@@ -32,6 +32,7 @@ vi.mock('./remoteDebugReporter', () => ({
 const mocks = vi.hoisted(() => ({
   submitEditTask: vi.fn(),
   submitGenerationTask: vi.fn(),
+  submitVariationsTask: vi.fn(),
   pollTask: vi.fn(),
   cancelTask: vi.fn(),
   assetBlobForNode: vi.fn(),
@@ -40,6 +41,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock('../lib/mivoTaskClient', () => ({
   submitEditTask: mocks.submitEditTask,
   submitGenerationTask: mocks.submitGenerationTask,
+  submitVariationsTask: mocks.submitVariationsTask,
   pollTask: mocks.pollTask,
   cancelTask: mocks.cancelTask,
   taskPollIntervalMs: () => 0,
@@ -76,6 +78,7 @@ function committedImage() {
 const {
   submitEditTask: mockSubmitEditTask,
   submitGenerationTask: mockSubmitGenerationTask,
+  submitVariationsTask: mockSubmitVariationsTask,
   pollTask: mockPollTask,
   cancelTask: mockCancelTask,
   assetBlobForNode: mockAssetBlobForNode,
@@ -103,6 +106,27 @@ const failedView = (error: string) => ({
   requestId: 'req-1',
   model: 'gpt-image-2',
   error,
+})
+
+// P2-C2: partial-view payload for variations (some success + some failure). The
+// success subset travels in result.images (with variationIndex); the failed
+// subset in failures[] (with variationIndex + desensitized error). partial does
+// NOT reject — the action resolves the success subset. Images accept blob OR b64
+// (committedImage() carries blob; runtime carries b64) — commitGenerationResult
+// handles both via blobFromCommittedGenerationImage.
+const partialView = (
+  images: Array<{ b64?: string; blob?: Blob; variationIndex?: number }>,
+  failures: Array<{ variationIndex: number; error: string }>,
+) => ({
+  id: 't1',
+  kind: 'variations' as const,
+  status: 'partial' as const,
+  progress: 100,
+  stage: 'done',
+  requestId: 'req-1',
+  model: 'gpt-image-2',
+  result: { images },
+  failures,
 })
 
 const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
@@ -167,6 +191,7 @@ beforeEach(() => {
   useCanvasStore.setState({ ...baseState } as never, true)
   mockSubmitEditTask.mockReset().mockResolvedValue('t1')
   mockSubmitGenerationTask.mockReset().mockResolvedValue('t1')
+  mockSubmitVariationsTask.mockReset().mockResolvedValue({ taskId: 't1', batchId: 'b1', count: 4 })
   mockPollTask.mockReset().mockResolvedValue(doneView())
   mockCancelTask.mockReset().mockResolvedValue(undefined)
   mockAssetBlobForNode.mockReset().mockResolvedValue(new Blob(['mock-source-bytes'], { type: 'image/png' }))
@@ -198,21 +223,28 @@ describe('contract: generation action signatures', () => {
     expect(nodeIds.length).toBeGreaterThan(0)
   })
 
-  // P2-C2 will contractualize variations/annotation return values (currently void + mock).
-  it('generateVariations returns void (mock adapter; P2-C2 will contract this to Promise<string[]>)', () => {
+  // P2-C2: variations/annotation now return Promise<string[]> (de-mocked → async
+  // tasks API), matching the other 3 generation actions.
+  it('generateVariations returns a Promise<string[]>', async () => {
     seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
     const result = useCanvasStore.getState().generateVariations('n1')
-    expect(result).toBeUndefined()
+    expect(result).toBeInstanceOf(Promise)
+    const nodeIds = await result
+    expect(Array.isArray(nodeIds)).toBe(true)
+    expect(nodeIds.every((id) => typeof id === 'string')).toBe(true)
   })
 
-  it('generateFromAnnotation returns void (mock adapter; P2-C2 will contract this to Promise<string[]>)', () => {
+  it('generateFromAnnotation returns a Promise<string[]>', async () => {
     seed({
       ...seedCanvas('character-flow', [imageNode({ id: 'n1' }), annotationNode({ id: 'anno-1', parentIds: ['n1'] })]),
       selectedNodeId: 'anno-1',
       selectedNodeIds: ['anno-1'],
     })
     const result = useCanvasStore.getState().generateFromAnnotation('anno-1')
-    expect(result).toBeUndefined()
+    expect(result).toBeInstanceOf(Promise)
+    const nodeIds = await result
+    expect(Array.isArray(nodeIds)).toBe(true)
+    expect(nodeIds.every((id) => typeof id === 'string')).toBe(true)
   })
 })
 
@@ -380,39 +412,62 @@ describe('contract: task state machine (generation actions)', () => {
   })
 })
 
-describe('contract: variations / annotation (mock adapter — P2-C2 will contract these)', () => {
-  it('generateVariations produces 4 result nodes + derivation edges and switches to the variations tool', () => {
+describe('contract: variations / annotation (P2-C2 de-mocked → async tasks API)', () => {
+  it('generateVariations resolves with result nodeIds + commits derivation edges + done task', async () => {
     seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
-    useCanvasStore.getState().generateVariations('n1')
-
+    mockPollTask.mockResolvedValueOnce(
+      doneView([committedImage(), committedImage(), committedImage(), committedImage()]),
+    )
+    const nodeIds = await useCanvasStore.getState().generateVariations('n1')
+    expect(nodeIds).toHaveLength(4)
     const s = useCanvasStore.getState()
-    // mockGenerationAdapter.generateVariations returns 4 nodes
-    const resultNodes = s.nodes.filter((n) => n.sourceNodeId === 'n1')
-    expect(resultNodes).toHaveLength(4)
     expect(s.edges.filter((e) => e.from === 'n1')).toHaveLength(4)
-    expect(s.activeTool).toBe('variations')
-    expect(s.tasks).toHaveLength(1)
+    expect(s.tasks[0].status).toBe('done')
+    expect(mockSubmitVariationsTask).toHaveBeenCalledWith(
+      expect.objectContaining({ variations: expect.any(Array) }),
+    )
   })
 
-  it('generateFromAnnotation produces a result node with an edit edge (mock)', () => {
+  it('generateVariations partial (2 success + 1 failure) resolves the success subset + creates a visible failed slot', async () => {
+    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+    mockPollTask.mockResolvedValueOnce(
+      partialView(
+        [{ ...committedImage(), variationIndex: 0 }, { ...committedImage(), variationIndex: 1 }],
+        [{ variationIndex: 2, error: 'Upstream error (500)' }],
+      ),
+    )
+    const nodeIds = await useCanvasStore.getState().generateVariations('n1', [
+      { prompt: 'p0' },
+      { prompt: 'p1' },
+      { prompt: 'p2' },
+    ])
+    // partial does NOT reject — resolves the success subset (2 of 3).
+    expect(nodeIds).toHaveLength(2)
+    const s = useCanvasStore.getState()
+    // 失败槽位可见: a failed ai-slot node for the failed variation.
+    const failedSlots = s.nodes.filter((n) => n.type === 'ai-slot' && n.status === 'failed')
+    expect(failedSlots).toHaveLength(1)
+    // partial resolves → done task carrying the success nodeIds.
+    expect(s.tasks[0].status).toBe('done')
+    expect(s.tasks[0].nodeIds).toEqual(nodeIds)
+  })
+
+  it('generateFromAnnotation resolves with a result node + edit edge + done task', async () => {
     seed({
       ...seedCanvas('character-flow', [imageNode({ id: 'n1' }), annotationNode({ id: 'anno-1', parentIds: ['n1'] })]),
       selectedNodeId: 'anno-1',
       selectedNodeIds: ['anno-1'],
     })
-    useCanvasStore.getState().generateFromAnnotation('anno-1')
-
+    const nodeIds = await useCanvasStore.getState().generateFromAnnotation('anno-1')
+    expect(nodeIds).toHaveLength(1)
     const s = useCanvasStore.getState()
-    const resultNode = s.nodes.find((n) => n.aiWorkflow?.operation === 'annotation-edit')
-    expect(resultNode).toBeDefined()
     expect(s.edges.some((e) => e.type === 'edit')).toBe(true)
     expect(s.tasks[0].status).toBe('done')
   })
 
-  it('generateVariations is a no-op when there is no source node', () => {
+  it('generateVariations rejects when there is no source image', async () => {
     seed(seedCanvas('character-flow', []))
-    useCanvasStore.getState().generateVariations()
-    expect(useCanvasStore.getState().nodes).toHaveLength(0)
+    await expect(useCanvasStore.getState().generateVariations()).rejects.toThrow(/没有可用的源图/)
     expect(useCanvasStore.getState().tasks).toHaveLength(0)
   })
 })

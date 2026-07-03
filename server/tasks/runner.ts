@@ -10,7 +10,7 @@
 // Errors are caught and recorded as task failures (never thrown to the caller).
 
 import { defaultMivoImageModel, getEnvConfig, type PlatformCtx } from '../lib/config'
-import { fetchUpstreamWithTimeout, readUpstreamError } from '../lib/upstream'
+import { fetchUpstreamWithTimeout, readUpstreamError, UpstreamRequestTimeoutError } from '../lib/upstream'
 import { normalizeMivoImages, normalizeMivoQuality, resolveRatioPayload } from '../lib/images'
 import {
   MIVO_PLATFORM_CHANNELS,
@@ -19,7 +19,7 @@ import {
   runMivoPlatformImageJob,
   type OnProgress,
 } from '../platform/job'
-import { completeTask, failTask, getTask, updateProgress } from './registry'
+import { completePartialTask, completeTask, failTask, getTask, updateProgress, type TaskFailure, type TaskResultImage } from './registry'
 
 const readImageApiKey = (imageApiKey: string): string => {
   const key = imageApiKey.trim()
@@ -181,4 +181,137 @@ export const runEditTask = async (taskId: string, params: EditParams): Promise<v
     if (canceledInFlight(taskId)) return
     failTask(taskId, error instanceof Error ? error.message : 'task failed')
   }
+}
+
+// ─── P2-C2: variations (batch of N parallel edits sharing one source image) ────
+//
+// Per the C2 contract (server/contracts/tasks-async.md §variations): the client
+// sends the source image + N variation param sets; the BFF fires N parallel
+// llm-proxy /edits calls (one per variation, each = image + that variation's
+// prompt/params), concurrency capped by MIVO_VARIATIONS_CONCURRENCY (default 4,
+// batched). Settled outcomes aggregate into:
+//   all success → completeTask({images: all, with variationIndex})
+//   some success → completePartialTask({images: successes}, failures[])
+//   all fail    → failTask(desensitized first error)
+// Cancel: the task controller's signal aborts every in-flight per-variation fetch
+// (linkExternalSignal in fetchUpstreamWithTimeout); the final canceledInFlight
+// check leaves the registry's 'canceled' state intact (no commit).
+//
+// Variation params mirror /tasks/generate's body (prompt/imgRatio/quality/model);
+// the call is /edits (img-to-img) because variations share the source image
+// ("对一张源图...共享同一源图"). Platform-channel models are NOT dispatched here
+// in C2 (variations stay on llm-proxy /edits); platform variations are a follow-up.
+
+export type VariationParam = {
+  prompt?: unknown
+  imgRatio?: unknown
+  quality?: unknown
+  model?: unknown
+}
+
+export type VariationsParams = {
+  image: File
+  variations: VariationParam[]
+  batchId: string
+}
+
+// Strip URL/key/stack info from a per-variation failure so failures[] carries a
+// safe, stable classifier the client can render (e2e asserts on the status code).
+const desensitizeVariationError = (error: unknown): string => {
+  if (error instanceof UpstreamRequestTimeoutError) return 'upstream-timeout'
+  if (error instanceof Error) {
+    if (error.name === 'AbortError') return 'canceled'
+    const msg = error.message
+    if (/timeout|timed[\s-]?out|超时/i.test(msg)) return 'upstream-timeout'
+    // "Upstream error (NNN)" from runOneVariationEdit's non-OK branch — keep the
+    // status, drop the body (which may carry upstream-internal detail).
+    const statusMatch = msg.match(/Upstream error \((\d+)\)/)
+    if (statusMatch) return `Upstream error (${statusMatch[1]})`
+    return 'upstream-error'
+  }
+  return 'unknown-error'
+}
+
+// One variation = one llm-proxy /edits call (image + prompt + params, n=1). Throws
+// on any failure (the caller's allSettled bucket catches it into failures[]).
+const runOneVariationEdit = async (
+  env: ReturnType<typeof getEnvConfig>,
+  image: File,
+  variation: VariationParam,
+  variationIndex: number,
+  signal: AbortSignal,
+): Promise<TaskResultImage> => {
+  const model = typeof variation.model === 'string' && variation.model.trim() ? variation.model.trim() : defaultMivoImageModel
+  const quality = normalizeMivoQuality(variation.quality)
+  const prompt = (typeof variation.prompt === 'string' ? variation.prompt : '').trim() || '基于当前参考图继续发散'
+  const formData = new FormData()
+  formData.append('image', image, image.name || 'source.png')
+  formData.set('model', model)
+  formData.set('prompt', prompt)
+  formData.set('quality', quality)
+  const ratioPayload = resolveRatioPayload(model, variation.imgRatio, quality)
+  Object.entries(ratioPayload).forEach(([k, v]) => formData.set(k, v))
+
+  const response = await fetchUpstreamWithTimeout(
+    `${env.imageApiBase}/edits`,
+    { method: 'POST', headers: { Authorization: `Bearer ${readImageApiKey(env.imageApiKey)}` }, body: formData },
+    env.editUpstreamTimeoutMs,
+    signal,
+  )
+  if (!response.ok) throw new Error(`Upstream error (${response.status})`)
+  const normalized = normalizeMivoImages(await response.json())
+  const b64 = normalized.images[0]?.b64
+  if (!b64) throw new Error('Upstream returned no image')
+  return { b64, variationIndex }
+}
+
+export const runVariationsTask = async (taskId: string, params: VariationsParams): Promise<void> => {
+  const record = getTask(taskId)
+  if (!record) return
+  if (canceledInFlight(taskId)) return
+  const env = getEnvConfig()
+  const signal = record.controller.signal
+  const total = params.variations.length
+  if (total === 0) {
+    failTask(taskId, 'variations array is empty')
+    return
+  }
+  const concurrency = Math.max(1, Math.min(total, env.variationsConcurrency))
+  updateProgress(taskId, 'submit', 5)
+
+  const successes: TaskResultImage[] = []
+  const failures: TaskFailure[] = []
+  let settled = 0
+
+  // Batched allSettled: launch `concurrency` at a time, wait for the batch, then
+  // start the next. Matching the contract's "并发上限…>4 时分批,每批 4".
+  for (let start = 0; start < total; start += concurrency) {
+    if (canceledInFlight(taskId)) return
+    const batch = params.variations.slice(start, start + concurrency)
+    const results = await Promise.allSettled(
+      batch.map((variation, offset) => runOneVariationEdit(env, params.image, variation, start + offset, signal)),
+    )
+    results.forEach((result, offset) => {
+      const variationIndex = start + offset
+      settled += 1
+      if (result.status === 'fulfilled') {
+        successes.push(result.value)
+      } else {
+        failures.push({ variationIndex, error: desensitizeVariationError(result.reason) })
+      }
+      // Monotonic progress = settled/total, capped at 95 (terminal sets 100).
+      updateProgress(taskId, 'poll', Math.min(95, 5 + Math.round((settled / total) * 90)))
+    })
+  }
+
+  if (canceledInFlight(taskId)) return
+  if (successes.length === 0) {
+    failTask(taskId, failures[0]?.error || 'All variations failed')
+    return
+  }
+  if (failures.length === 0) {
+    completeTask(taskId, { images: successes })
+    return
+  }
+  completePartialTask(taskId, { images: successes }, failures)
 }

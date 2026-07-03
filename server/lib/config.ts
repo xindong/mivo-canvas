@@ -51,6 +51,11 @@ export type MivoEnvConfig = {
   platformPollIntervalMs: number
   jsonRequestMaxBytes: number
   imageRequestMaxBytes: number
+  // P2-C2: max in-flight variations edits per batch (Promise.allSettled batches of
+  // this size). Default 4 = full concurrency for the typical 4-variation batch;
+  // >4 batches in groups of this size. Env-tunable so e2e can pin it to 1 to force
+  // serial partial-failure ordering.
+  variationsConcurrency: number
 }
 
 const num = (value: string | undefined, fallback: number): number => {
@@ -76,4 +81,6 @@ export const getEnvConfig = (): MivoEnvConfig => ({
   // Body limits (env-overridable for tests; defaults match dev middleware)
   jsonRequestMaxBytes: num(process.env.MIVO_JSON_REQUEST_MAX_BYTES, jsonRequestMaxBytes),
   imageRequestMaxBytes: num(process.env.MIVO_IMAGE_REQUEST_MAX_BYTES, imageRequestMaxBytes),
+  // P2-C2: variations concurrency cap (default 4; e2e may lower to 1).
+  variationsConcurrency: num(process.env.MIVO_VARIATIONS_CONCURRENCY, 4),
 })

@@ -1,4 +1,4 @@
-import type { CanvasMaskBounds, CanvasTask, MivoCanvasNode } from './mivoCanvas'
+import type { CanvasMaskBounds } from './mivoCanvas'
 import type { CanvasId } from './mivoCanvas'
 
 export type MivoImageRatio = '1:1' | '3:2' | '2:3' | '16:9' | '9:16'
@@ -40,25 +40,31 @@ export type MivoEditRequest = MivoGenerateRequest & {
   image: Blob
   mask?: Blob
   reference?: Blob[]
+  // P2-C2: annotation area-edit — when maskBounds (+ sourceSize) is present and
+  // `mask` is absent, the BFF generates the mask PNG. Mutually exclusive with
+  // `mask` in practice (brush mask vs bounds-derived mask).
+  maskBounds?: NormalizedMaskBounds
+  sourceSize?: { width: number; height: number }
 }
 
 export type MivoImageResponse = {
   images: Array<{ b64: string }>
 }
 
-export type GenerationRequest = {
-  sourceNode: MivoCanvasNode
-  count: number
-  batchId: number
-}
+// P2-C2: normalized 0-1 mask bounds (relative to the source image's natural pixel
+// grid). The client derives this from an annotation node's canvas-coordinate
+// annotationBounds; the BFF synthesizes the area mask PNG from it (see
+// server/lib/maskPng.ts).
+export type NormalizedMaskBounds = { x: number; y: number; width: number; height: number }
 
-export type GenerationResult = {
-  nodes: MivoCanvasNode[]
-  task: CanvasTask
-}
-
-export type GenerationAdapter = {
-  generateVariations: (request: GenerationRequest) => GenerationResult
+// P2-C2: one variation in a variations batch. Each becomes a parallel llm-proxy
+// /edits call sharing the source image. All fields optional — the action fills
+// sensible defaults from the source node when omitted.
+export type VariationParam = {
+  prompt?: string
+  imgRatio?: GenerationRatio
+  quality?: MivoImageQuality
+  model?: string
 }
 
 export type CommittedGenerationKind = 'generate' | 'edit'

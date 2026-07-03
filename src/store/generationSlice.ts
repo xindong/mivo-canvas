@@ -5,6 +5,7 @@ import type {
   MivoCanvasNode,
 } from '../types/mivoCanvas'
 import type { SliceCreator } from './canvasStore'
+import type { VariationParam, NormalizedMaskBounds } from '../types/generation'
 import { MivoImageRequestError, assetBlobForNode } from '../lib/mivoImageClient'
 import {
   cancelTask,
@@ -12,23 +13,19 @@ import {
   pollTask,
   submitEditTask,
   submitGenerationTask,
+  submitVariationsTask,
   taskPollIntervalMs,
+  type TaskFailure,
+  type TaskResultImage,
 } from '../lib/mivoTaskClient'
-import { createAiResultNode } from '../model/aiCanvasCommands'
-import { chooseAdjacentPlacement } from './aiCanvasWorkflow'
-import { logCanvas, warnCanvas } from './canvasStore'
-import { realCaseImages } from './demoScenes'
+import { logCanvas } from './canvasStore'
 import { createEdgeId, createNodeId, edgeTypeForOperation } from './nodeFactory'
-import { mockGenerationAdapter } from './mockGeneration'
 import {
   defaultDocument,
   nodePrompt,
-  normalizeCanvasNodes,
   patchCanvasDocument,
-  patchWithHistory,
 } from './canvasDocumentModel'
 
-const mockResultAssetUrl = (nodes: MivoCanvasNode[]) => realCaseImages[nodes.length % realCaseImages.length]
 const defaultMivoImageModel = 'gpt-image-2'
 const upsertTask = (tasks: CanvasTask[], task: CanvasTask) => [
   task,
@@ -62,6 +59,65 @@ const isCanceledGenerationError = (error: unknown, signal?: AbortSignal) =>
   (error instanceof MivoImageRequestError && error.kind === 'canceled') ||
   (error instanceof Error && error.message.includes('已取消'))
 
+// P2-C2: default variation params when the caller doesn't pass explicit ones
+// (e.g. the InspectorPanel "Make variations" button). 4 variations reusing the
+// source's prompt — matches the prior mock's "4 方向" intent. Explicit params
+// (e2e N=3 with 2 success + 1 failure) override.
+const defaultVariationParams = (fallbackPrompt: string): VariationParam[] =>
+  Array.from({ length: 4 }, () => ({ prompt: fallbackPrompt }))
+
+// P2-C2: create a visible "failed slot" ai-slot node for a variation that didn't
+// settle successfully. Placed in a grid beside the source (mirrors the prior mock's
+// variant grid). The node carries the variation prompt + desensitized error so the
+// UI can render a marked-red slot ("失败槽位可见").
+const createFailedVariationSlot = (
+  source: MivoCanvasNode,
+  failure: TaskFailure,
+  prompt: string,
+  model: string,
+  taskId: string,
+): { node: MivoCanvasNode; edge: CanvasEdge } => {
+  const index = failure.variationIndex
+  const createdAt = Date.now()
+  const col = index % 2
+  const row = Math.floor(index / 2)
+  const id = createNodeId('variation-failed')
+  const node: MivoCanvasNode = {
+    id,
+    type: 'ai-slot',
+    title: `Variation ${index + 1} 失败`,
+    x: source.x + source.width + 90 + col * 236,
+    y: source.y + row * 404,
+    width: 204,
+    height: 362,
+    status: 'failed',
+    text: failure.error,
+    sourceNodeId: source.id,
+    groupId: `variation-${taskId}`,
+    generation: { prompt, model, createdAt, taskId, strength: 0.58 },
+    aiWorkflow: { kind: 'slot', status: 'failed', operation: 'variation', prompt, sourceNodeIds: [source.id] },
+  }
+  const edge: CanvasEdge = { id: createEdgeId(), from: source.id, to: id, type: 'generate', prompt, createdAt }
+  return { node, edge }
+}
+
+// P2-C2: normalize an annotation node's canvas-coordinate annotationBounds to the
+// source image's relative 0-1 maskBounds (BFF synthesizes the area mask PNG from
+// this). Returns undefined when the annotation has no bounds (whole-image edit).
+const normalizeAnnotationBounds = (
+  source: MivoCanvasNode,
+  annotation: MivoCanvasNode,
+): NormalizedMaskBounds | undefined => {
+  const bounds = annotation.annotationBounds
+  if (!bounds || source.width <= 0 || source.height <= 0) return undefined
+  return {
+    x: (bounds.x - source.x) / source.width,
+    y: (bounds.y - source.y) / source.height,
+    width: bounds.width / source.width,
+    height: bounds.height / source.height,
+  }
+}
+
 // P2-C1b: one-time idempotency key per generation call. Retries (new action
 // invocation) get a new key → new server task. Same-call re-submission (e.g. a
 // transient POST timeout retried by the client) would reuse the key and dedupe
@@ -93,14 +149,18 @@ const sleep = (ms: number, signal?: AbortSignal): Promise<void> =>
     signal?.addEventListener('abort', onAbort, { once: true })
   })
 
-// P2-C1b: poll loop shared by the 3 real generation actions. Submits already
-// happened (serverTaskId in hand). Upserts the running task with the server's
-// real progress/stage on each non-terminal poll. Returns nodeIds on done (after
-// onResult commits). Throws MivoImageRequestError on failed/canceled/unknown —
-// the caller's catch sets the terminal task state and rethrows.
+// P2-C1b: poll loop shared by the 3 real generation actions + P2-C2 variations.
+// Submits already happened (serverTaskId in hand). Upserts the running task with
+// the server's real progress/stage on each non-terminal poll. Returns nodeIds on
+// done/partial (after onResult commits). Throws MivoImageRequestError on
+// failed/canceled/unknown — the caller's catch sets the terminal task state and
+// rethrows.
 //
 // Terminal-state mapping (per server/contracts/tasks-async.md):
 //   done     → return nodeIds (caller sets doneTask)
+//   partial  → return nodeIds (P2-C2 variations; onResult gets failures[] too;
+//              the caller sets doneTask — partial resolves the success subset,
+//              does NOT reject. Failures are surfaced via the task record.)
 //   failed   → throw MivoImageRequestError(message, kindForFailedTask(message))
 //              so chatStore.errorInfoForChat still classifies timeouts (怪癖 6)
 //   canceled → throw canceled (caller sets canceledTask, never commits)
@@ -112,7 +172,7 @@ const runTaskPollLoop = async (
     signal: AbortSignal | undefined
     localTask: CanvasTask
     sceneId: CanvasId
-    onResult: (images: Array<{ b64: string }>) => Promise<string[]>
+    onResult: (result: { images: TaskResultImage[]; failures?: TaskFailure[] }) => Promise<string[]>
   },
 ): Promise<string[]> => {
   const patchRunning = (progress: number, stage: string) =>
@@ -137,7 +197,14 @@ const runTaskPollLoop = async (
     }
     if (view.status === 'done') {
       const images = view.result?.images ?? []
-      return args.onResult(images)
+      return args.onResult({ images, failures: undefined })
+    }
+    // P2-C2: partial — variations batch where some edits succeeded. Resolve the
+    // success subset (onResult commits it); failures[] travel along for the
+    // caller to surface. Does NOT reject (only all-fail → failed → throws).
+    if (view.status === 'partial') {
+      const images = view.result?.images ?? []
+      return args.onResult({ images, failures: view.failures })
     }
     if (view.status === 'failed') {
       const message = view.error || 'Generation failed'
@@ -153,55 +220,129 @@ const runTaskPollLoop = async (
 
 export const createGenerationSlice: SliceCreator = (set, get) => ({
   tasks: defaultDocument.tasks,
-  generateVariations: (sourceNodeId) => {
+  generateVariations: async (sourceNodeId, variations, options = {}) => {
+    const targetSceneId = options.sceneId || get().sceneId
     const state = get()
+    const document = state.canvases[targetSceneId]
+    if (!document) throw new Error('目标画布已删除，无法继续生成。')
     const source =
-      state.nodes.find((node) => node.id === sourceNodeId) ||
-      state.nodes.find((node) => node.id === state.selectedNodeId) ||
-      state.nodes[0]
+      (sourceNodeId
+        ? document.nodes.find((node) => node.id === sourceNodeId && node.type === 'image' && !node.hidden)
+        : undefined) ||
+      document.nodes.find((node) => node.id === document.selectedNodeId && node.type === 'image' && !node.hidden) ||
+      document.nodes.find((node) => node.type === 'image' && !node.hidden)
+    if (sourceNodeId && !source) throw new Error('源节点已删除，无法继续生成。')
+    if (!source) throw new Error('没有可用的源图，无法生成变体。')
 
-    if (!source) {
-      warnCanvas('Variation generation skipped: no source node available')
-      return
+    const basePrompt = source.generation?.prompt || nodePrompt(source) || '基于当前参考图继续发散'
+    const variationParams =
+      variations && variations.length > 0
+        ? variations.slice(0, 4)
+        : defaultVariationParams(basePrompt)
+    const count = variationParams.length
+    const model = (variationParams[0]?.model || source.generation?.model || defaultMivoImageModel) as string
+    const taskId = createNodeId('task-variations')
+    const runningTask: CanvasTask = {
+      id: taskId,
+      label: `变体生成：${source.title}（${count} 个）`,
+      status: 'running',
+      progress: 0,
+      nodeIds: [],
     }
 
-    const batchId = Date.now() % 100000
-    const result = mockGenerationAdapter.generateVariations({
-      sourceNode: source,
-      count: 4,
-      batchId,
+    set((current) => {
+      const doc = current.canvases[targetSceneId]
+      if (!doc) return {}
+      return patchCanvasDocument(current, targetSceneId, { tasks: upsertTask(doc.tasks, runningTask) })
     })
-    const createdAt = Date.now()
-    const resultNodes = result.nodes.map((node) => ({
-      ...node,
-      sourceNodeId: source.id,
-      generation: node.generation
-        ? {
-            ...node.generation,
-            createdAt,
-          }
-        : node.generation,
-    }))
-    const edges = resultNodes.map((node) => ({
-      id: createEdgeId(),
-      from: source.id,
-      to: node.id,
-      type: 'generate' as const,
-      prompt: node.generation?.prompt || nodePrompt(source),
-      createdAt,
-    }))
 
-    set((current) => ({
-      activeTool: 'variations',
-      ...patchWithHistory(current, {
-        selectedNodeId: resultNodes[0]?.id,
-        selectedNodeIds: resultNodes[0] ? [resultNodes[0].id] : [],
-        nodes: [...current.nodes, ...resultNodes],
-        edges: [...current.edges, ...edges],
-        tasks: [result.task, ...current.tasks].slice(0, 5),
-      }),
-    }))
-    logCanvas(`Generated ${result.nodes.length} variations from "${source.title}"`)
+    let serverTaskId: string | undefined
+    try {
+      if (options.signal?.aborted) throw new MivoImageRequestError('图片请求已取消。', 'canceled')
+      const image = await assetBlobForNode(source)
+      serverTaskId = (
+        await submitVariationsTask({
+          image,
+          variations: variationParams,
+          idempotencyKey: newIdempotencyKey(),
+          signal: options.signal,
+        })
+      ).taskId
+      const nodeIds = await runTaskPollLoop(set, {
+        serverTaskId,
+        signal: options.signal,
+        localTask: runningTask,
+        sceneId: targetSceneId,
+        onResult: async ({ images, failures }) => {
+          // Commit the success subset via the canonical path (asset save +
+          // derivation edges). Empty images (all-fail) → runTaskPollLoop wouldn't
+          // reach here (status='failed' throws), but guard anyway. Pass images
+          // as-is: runtime images are {b64}, test mocks may carry {blob} — both
+          // are handled by blobFromCommittedGenerationImage inside commit.
+          const successIds =
+            images.length > 0
+              ? await get().commitGenerationResult({
+                  sceneId: targetSceneId,
+                  sourceNodeId: source.id,
+                  resultImages: images,
+                  prompt: basePrompt,
+                  model,
+                  kind: 'generate',
+                  taskId,
+                })
+              : []
+          // Surface failed variations as visible "failed slot" ai-slot nodes so
+          // the UI can mark them red (contract: 失败槽位可见). Derivation edges
+          // link them to the source for the variant grid.
+          const failedSlots = (failures ?? []).map((failure) =>
+            createFailedVariationSlot(source, failure, basePrompt, model, taskId),
+          )
+          if (failedSlots.length > 0) {
+            set((current) => {
+              const doc = current.canvases[targetSceneId]
+              if (!doc) return {}
+              return patchCanvasDocument(current, targetSceneId, {
+                nodes: [...doc.nodes, ...failedSlots.map((s) => s.node)],
+                edges: [...doc.edges, ...failedSlots.map((s) => s.edge)],
+              })
+            })
+          }
+          return successIds
+        },
+      })
+      const successCount = nodeIds.length
+      set((current) => {
+        const doc = current.canvases[targetSceneId]
+        if (!doc) return {}
+        return patchCanvasDocument(current, targetSceneId, {
+          tasks: upsertTask(
+            doc.tasks,
+            doneTask(runningTask, `变体生成：${source.title}（${successCount}/${count}）`, nodeIds),
+          ),
+        })
+      })
+      logCanvas(`Generated ${successCount}/${count} variations from "${source.title}"`)
+      return nodeIds
+    } catch (error) {
+      const canceled = isCanceledGenerationError(error, options.signal)
+      if (canceled && serverTaskId) {
+        await cancelTask(serverTaskId)
+      }
+      const message = error instanceof Error ? error.message : 'Variations failed'
+      set((current) => {
+        const doc = current.canvases[targetSceneId]
+        if (!doc) return {}
+        return patchCanvasDocument(current, targetSceneId, {
+          tasks: upsertTask(
+            doc.tasks,
+            canceled
+              ? canceledTask(runningTask, `变体生成已取消：${source.title}`)
+              : failedTask(runningTask, `变体生成失败：${message}`),
+          ),
+        })
+      })
+      throw error
+    }
   },
   generateImageEdit: async (sourceNodeId, operation, prompt, options = {}) => {
     const targetSceneId = options.sceneId || get().sceneId
@@ -262,7 +403,7 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
         signal: options.signal,
         localTask: runningTask,
         sceneId: targetSceneId,
-        onResult: async (images) => get().commitGenerationResult({
+        onResult: async ({ images }) => get().commitGenerationResult({
           sceneId: targetSceneId,
           sourceNodeId: source.id,
           resultImages: images,
@@ -367,7 +508,7 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
         signal: options.signal,
         localTask: runningTask,
         sceneId: targetSceneId,
-        onResult: async (images) => get().commitGenerationResult({
+        onResult: async ({ images }) => get().commitGenerationResult({
           sceneId: targetSceneId,
           sourceNodeId: source.id,
           resultImages: images,
@@ -491,7 +632,7 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
         signal: options.signal,
         localTask: runningTask,
         sceneId: targetSceneId,
-        onResult: async (images) => get().commitGenerationResult({
+        onResult: async ({ images }) => get().commitGenerationResult({
           sceneId: targetSceneId,
           sourceNodeId: slot.id,
           resultImages: images,
@@ -556,72 +697,108 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
       throw error
     }
   },
-  generateFromAnnotation: (annotationNodeId) => {
-    const id = createNodeId('annotation-result')
-    const createdAt = Date.now()
+  generateFromAnnotation: async (annotationNodeId, options = {}) => {
+    const targetSceneId = options.sceneId || get().sceneId
+    const state = get()
+    const document = state.canvases[targetSceneId]
+    if (!document) throw new Error('目标画布已删除，无法继续生成。')
+    const annotation =
+      (annotationNodeId
+        ? document.nodes.find((node) => node.id === annotationNodeId && node.type === 'annotation' && !node.hidden)
+        : undefined) ||
+      document.nodes.find((node) => node.id === document.selectedNodeId && node.type === 'annotation' && !node.hidden)
+    if (annotationNodeId && !annotation) throw new Error('批注节点已删除，无法继续生成。')
+    if (!annotation) throw new Error('没有可用的批注，无法生成。')
 
-    set((state) => {
-      const annotation =
-        state.nodes.find((node) => node.id === annotationNodeId && node.type === 'annotation' && !node.hidden) ||
-        state.nodes.find((node) => node.id === state.selectedNodeId && node.type === 'annotation' && !node.hidden)
-      if (!annotation) {
-        warnCanvas('Annotation generation skipped: no annotation selected')
-        return {}
-      }
+    const sourceId = annotation.aiWorkflow?.sourceNodeIds?.[0] || annotation.parentIds?.[0]
+    const source = sourceId
+      ? document.nodes.find((node) => node.id === sourceId && node.type === 'image' && !node.hidden)
+      : undefined
+    if (sourceId && !source) throw new Error('源节点已删除，无法继续生成。')
+    if (!source) throw new Error('批注未关联可用源图，无法生成。')
 
-      const sourceId = annotation.aiWorkflow?.sourceNodeIds?.[0] || annotation.parentIds?.[0]
-      const source = sourceId ? state.nodes.find((node) => node.id === sourceId && !node.hidden) : undefined
-      const anchor = source || annotation
-      const width = source && source.type !== 'text' && source.type !== 'annotation' ? source.width : 320
-      const height = source && source.type !== 'text' && source.type !== 'annotation' ? source.height : 240
-      const placement = chooseAdjacentPlacement({
-        nodes: state.nodes,
-        anchor,
-        width,
-        height,
-        placement: 'right',
-      })
-      const resultPrompt = nodePrompt(annotation, '根据批注生成修订版图片')
-      const result = createAiResultNode({
-        id,
-        title: `Edited from ${source?.title || annotation.title}`,
-        sourceNodes: source ? [source] : [annotation],
-        anchorNode: anchor,
-        annotationNode: annotation,
-        operation: 'annotation-edit',
-        prompt: resultPrompt,
-        placement: 'right',
-        position: { x: placement.x, y: placement.y },
-        size: { width, height },
-        assetUrl: mockResultAssetUrl(state.nodes),
-        createdAt,
-        taskId: `task-${id}`,
-        strength: 0.66,
-      })
-      const task: CanvasTask = {
-        id: `task-${id}`,
-        label: `批注修图：${source?.title || annotation.title}`,
-        status: 'done',
-        progress: 100,
-        nodeIds: [id],
-      }
-      const edge: CanvasEdge = {
-        id: createEdgeId(),
-        from: anchor.id,
-        to: id,
-        type: 'edit',
-        prompt: resultPrompt,
-        createdAt,
-      }
+    const resultPrompt = annotation.text?.trim() || nodePrompt(annotation, '根据批注生成修订版图片')
+    const model = source.generation?.model || defaultMivoImageModel
+    const taskId = createNodeId('task-annotation-edit')
+    const runningTask: CanvasTask = {
+      id: taskId,
+      label: `批注修图：${source.title}`,
+      status: 'running',
+      progress: 0,
+      nodeIds: [],
+    }
 
-      logCanvas(`Generated from annotation "${annotation.title}"`)
-      return patchWithHistory(state, {
-        selectedNodeId: id,
-        selectedNodeIds: [id],
-        nodes: normalizeCanvasNodes([...state.nodes, result]),
-        edges: [...state.edges, edge],
-        tasks: [task, ...state.tasks].slice(0, 5),
-      })
+    set((current) => {
+      const doc = current.canvases[targetSceneId]
+      if (!doc) return {}
+      return patchCanvasDocument(current, targetSceneId, { tasks: upsertTask(doc.tasks, runningTask) })
     })
+
+    // Normalize the annotation's canvas-coordinate bounds to the source image's
+    // relative 0-1 maskBounds; the BFF synthesizes the area mask PNG from this.
+    // No bounds ⇒ whole-image prompt-edit (no mask).
+    const maskBounds = normalizeAnnotationBounds(source, annotation)
+
+    let serverTaskId: string | undefined
+    try {
+      if (options.signal?.aborted) throw new MivoImageRequestError('图片请求已取消。', 'canceled')
+      const image = await assetBlobForNode(source)
+      serverTaskId = await submitEditTask({
+        image,
+        prompt: resultPrompt,
+        maskBounds,
+        sourceSize: maskBounds ? { width: source.width, height: source.height } : undefined,
+        imgRatio: options.imgRatio,
+        quality: options.quality,
+        model,
+        idempotencyKey: newIdempotencyKey(),
+        signal: options.signal,
+      })
+      const nodeIds = await runTaskPollLoop(set, {
+        serverTaskId,
+        signal: options.signal,
+        localTask: runningTask,
+        sceneId: targetSceneId,
+        onResult: async ({ images }) =>
+          get().commitGenerationResult({
+            sceneId: targetSceneId,
+            sourceNodeId: source.id,
+            resultImages: images,
+            prompt: resultPrompt,
+            model,
+            kind: 'edit',
+            taskId,
+            maskBounds: annotation.annotationBounds,
+          }),
+      })
+      set((current) => {
+        const doc = current.canvases[targetSceneId]
+        if (!doc) return {}
+        return patchCanvasDocument(current, targetSceneId, {
+          tasks: upsertTask(doc.tasks, doneTask(runningTask, `批注修图：${source.title}`, nodeIds)),
+        })
+      })
+      logCanvas(`Generated from annotation "${annotation.title}"`)
+      return nodeIds
+    } catch (error) {
+      const canceled = isCanceledGenerationError(error, options.signal)
+      if (canceled && serverTaskId) {
+        await cancelTask(serverTaskId)
+      }
+      const message = error instanceof Error ? error.message : 'Annotation edit failed'
+      set((current) => {
+        const doc = current.canvases[targetSceneId]
+        if (!doc) return {}
+        return patchCanvasDocument(current, targetSceneId, {
+          tasks: upsertTask(
+            doc.tasks,
+            canceled
+              ? canceledTask(runningTask, `批注修图已取消：${source.title}`)
+              : failedTask(runningTask, `批注修图失败：${message}`),
+          ),
+        })
+      })
+      throw error
+    }
   },
 })
