@@ -1,0 +1,17 @@
+{
+  "scenario": "eagle-assets-file-404",
+  "request": {
+    "method": "GET",
+    "path": "/api/mivo/eagle/assets/any-id/file",
+    "headers": {}
+  },
+  "response": {
+    "status": 404,
+    "headers": {
+      "content-type": null,
+      "cache-control": null
+    },
+    "body": "Eagle original not found"
+  },
+  "capturedAt": "2026-07-03T15:23:24.572Z"
+}

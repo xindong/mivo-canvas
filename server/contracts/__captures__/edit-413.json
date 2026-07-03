@@ -1,0 +1,14 @@
+{
+  "scenario": "edit-413",
+  "request": {
+    "method": "POST",
+    "path": "/api/mivo/edit",
+    "headers": {
+      "content-type": "multipart/form-data; boundary=x"
+    }
+  },
+  "response": {
+    "transportError": "ECONNRESET"
+  },
+  "capturedAt": "2026-07-03T15:23:24.513Z"
+}

@@ -1,0 +1,22 @@
+{
+  "scenario": "debug-logs-post-400",
+  "request": {
+    "method": "POST",
+    "path": "/api/mivo/debug-logs",
+    "headers": {
+      "content-type": "application/json"
+    }
+  },
+  "response": {
+    "status": 400,
+    "headers": {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": null
+    },
+    "body": {
+      "ok": false,
+      "error": "Expected property name or '}' in JSON at position 1 (line 1 column 2)"
+    }
+  },
+  "capturedAt": "2026-07-03T15:23:24.537Z"
+}

@@ -1,0 +1,22 @@
+{
+  "scenario": "enhance-200-no-key",
+  "request": {
+    "method": "POST",
+    "path": "/api/mivo/enhance",
+    "headers": {
+      "content-type": "application/json"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": null
+    },
+    "body": {
+      "enhanced": false,
+      "degradedReason": "no-key"
+    }
+  },
+  "capturedAt": "2026-07-03T15:23:24.520Z"
+}

@@ -1,0 +1,20 @@
+{
+  "scenario": "pinterest-status-200",
+  "request": {
+    "method": "GET",
+    "path": "/api/mivo/pinterest/status",
+    "headers": {}
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": null
+    },
+    "body": {
+      "connected": false,
+      "mode": "prototype"
+    }
+  },
+  "capturedAt": "2026-07-03T15:23:24.576Z"
+}

@@ -1,0 +1,17 @@
+{
+  "scenario": "eagle-assets-thumbnail-svg-fallback",
+  "request": {
+    "method": "GET",
+    "path": "/api/mivo/eagle/assets/any-id/thumbnail",
+    "headers": {}
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "content-type": "image/svg+xml",
+      "cache-control": "no-store"
+    },
+    "body": "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"320\" height=\"240\" viewBox=\"0 0 320 240\">\n  <rect width=\"320\" height=\"240\" rx=\"16\" fill=\"#f3f0e8\"/>\n  <path d=\"M76 154l52-62 42 48 28-30 46 44H76z\" fill=\"#c9c1b0\"/>\n  <circle cx=\"220\" cy=\"82\" r=\"22\" fill=\"#d9d1c2\"/>\n</svg>"
+  },
+  "capturedAt": "2026-07-03T15:23:24.574Z"
+}

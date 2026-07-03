@@ -1,0 +1,98 @@
+{
+  "endpoint": "/api/mivo/eagle/* (status | folders | tags | assets | assets/:id/thumbnail | assets/:id/file)",
+  "summary": "Local Eagle app proxy. Host is fixed to MIVO_EAGLE_API_URL (default 127.0.0.1:41595); routes hardcoded (SSRF bounded by construction). NO upstream timeout. Error shapes are INCONSISTENT across sub-routes.",
+  "sourceFile": "vite.config.ts",
+  "dispatchRef": "L1445-L1575 (six sub-routes); eagleApi L1033-L1043; eagleApiBase L9",
+  "methods": {
+    "GET": "primary",
+    "other": "DISCREPANCY — no method guard on any eagle sub-route. Non-GET returns the same response as GET."
+  },
+  "envDeps": ["MIVO_EAGLE_API_URL (default http://127.0.0.1:41595, L9)"],
+  "subRoutes": [
+    {
+      "path": "/api/mivo/eagle/status",
+      "ref": "L1445-L1471",
+      "onlineShape": { "status": 200, "body": { "connected": true, "version": "...", "platform": "...", "folderCount": 0, "libraryPath": "..." } },
+      "offlineShape": { "status": 200, "body": { "connected": false, "message": "<error.message|'Eagle is not reachable'>" } },
+      "note": "Offline is 200 (not 5xx) with connected:false. Content-Type: application/json set in both branches.",
+      "capture": "__captures__/eagle-status-offline.json"
+    },
+    {
+      "path": "/api/mivo/eagle/folders",
+      "ref": "L1473-L1483",
+      "onlineShape": { "status": 200, "body": { "folders": [{ "<folder>": "..." }] } },
+      "errorShape": { "status": 502, "body": "<error.message plain text>", "content-type": "NOT SET" },
+      "discrepancy": "Error response has NO Content-Type header and plain-text body (not JSON). Inconsistent with status sub-route."
+    },
+    {
+      "path": "/api/mivo/eagle/tags",
+      "ref": "L1485-L1504",
+      "onlineShape": { "status": 200, "body": { "tags": [{ "id": "...", "name": "...", "count?": 0 }] } },
+      "errorShape": { "status": 502, "body": "<plain text>", "content-type": "NOT SET" },
+      "note": "Tags normalized: string tags → {id:name,name}; object tags → {id,name,count?}."
+    },
+    {
+      "path": "/api/mivo/eagle/assets?limit=&offset=&folderId=&tag|tags=",
+      "ref": "L1537-L1575",
+      "onlineShape": { "status": 200, "body": { "assets": [{ "id": "...", "name": "...", "title": "...", "format": "...", "sizeBytes": 0, "width": 0, "height": 0, "tags": [], "folders": [], "sourceUrl": "...", "sourcePath": "Eagle library", "updatedAt": 0, "url": "...", "thumbnailUrl": "..." }] } },
+      "errorShape": { "status": 502, "body": "<plain text>", "content-type": "NOT SET" },
+      "note": "Defaults limit=80 offset=0; filters by imageExtensions (L1550)."
+    },
+    {
+      "path": "/api/mivo/eagle/assets/:id/thumbnail",
+      "ref": "L1506-L1520; sendEagleThumbnailFallback L1062-L1073",
+      "onlineShape": { "status": 200, "headers": { "Content-Type": "<mimeForFile>", "Cache-Control": "no-store" }, "body": "<thumbnail bytes>" },
+      "fallbackShape": { "status": 200, "headers": { "Content-Type": "image/svg+xml", "Cache-Control": "no-store" }, "body": "<static fallback SVG L1050-L1054>" },
+      "note": "On thumbnail read failure → tries original file → else SVG fallback. Never 5xx."
+    },
+    {
+      "path": "/api/mivo/eagle/assets/:id/file",
+      "ref": "L1522-L1535; eagleOriginalPathFor L1075-L1099",
+      "onlineShape": { "status": 200, "headers": { "Content-Type": "<mimeForFile>", "Cache-Control": "no-store" }, "body": "<original file bytes>" },
+      "errorShape": { "status": 404, "body": "Eagle original not found", "content-type": "NOT SET" },
+      "note": "itemId decoded via decodeURIComponent (L1524-L1526)."
+    }
+  ],
+  "scenarios": [
+    {
+      "name": "Eagle offline (all sub-routes)",
+      "condition": "Eagle app not running / MIVO_EAGLE_API_URL unreachable",
+      "expected": "status→200 {connected:false,...}; folders/tags/assets→502 plain text (no Content-Type); :id/file→404 plain text (no Content-Type); :id/thumbnail→200 SVG fallback (image/svg+xml, no-store)",
+      "source": "live-capturable",
+      "sourceRef": "requestJson L186-L190 throws on fetch failure; per-route catch blocks",
+      "captures": [
+        "__captures__/eagle-status-offline.json",
+        "__captures__/eagle-folders-502.json",
+        "__captures__/eagle-tags-502.json",
+        "__captures__/eagle-assets-502.json",
+        "__captures__/eagle-assets-file-404.json",
+        "__captures__/eagle-assets-thumbnail-svg-fallback.json"
+      ]
+    },
+    {
+      "name": "no upstream timeout",
+      "expected": "requestJson (L186-L190) and eagle fetches have NO timeout — a hanging Eagle API hangs the request indefinitely",
+      "source": "code-derived",
+      "sourceRef": "requestJson L186-L190; eagleApi L1033-L1043",
+      "discrepancy": "Plan §6.1: '现状无上游超时——BFF 补默认超时并记录为有意变更'. Confirmed: no timeout anywhere in eagle path. BFF MUST add a default timeout (intended-change, explicitly allowed by plan)."
+    },
+    {
+      "name": "SSRF boundary",
+      "expected": "host fixed to eagleApiBase; all routes hardcoded strings — no user-controlled route or host. SSRF bounded by construction.",
+      "source": "code-derived",
+      "sourceRef": "eagleApiBase L9; eagleApi L1033-L1035 (new URL(route, eagleApiBase) with hardcoded route)"
+    },
+    {
+      "name": "non-GET method → same response (no guard)",
+      "source": "live-capturable",
+      "sourceRef": "L1445/L1473/L1485/L1506/L1522/L1537 (none check method)",
+      "discrepancy": "No 405 on any eagle sub-route. Same intended-change candidate as local-assets."
+    },
+    {
+      "name": "error shape inconsistency",
+      "source": "code-derived",
+      "sourceRef": "status JSON L1462-L1469 vs folders plain L1479-L1480 vs tags plain L1500-L1501 vs assets plain L1571-L1572 vs file 404 plain L1531-L1532",
+      "discrepancy": "Plan §6.1 '错误 shape 同上' (referring to {error} envelope) is NOT applied to eagle. Eagle errors are plain-text + missing Content-Type (except status). P1-c must preserve these exact shapes (plan: no new envelope); BFF normalization is a separate later PR."
+    }
+  ]
+}
