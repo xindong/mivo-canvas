@@ -46,8 +46,18 @@ import {
   type SelectionBox,
   type Viewport,
 } from './canvasInteraction'
+import { eraserHitStrokeIds, eraserScreenRadius } from './brushGeometry'
+import { stampGrowthIntervalMs, stampGrowthSizes } from './stampDefs'
 import { canvasToolHandlers, type CanvasToolHandlerContext } from './canvasToolHandlers'
 import { isCanvasToolEnabled, markupKindForTool, toolForKeyboardShortcut } from './canvasToolRegistry'
+import {
+  smartSelectionGapFor,
+  smartSelectionHandlesFor,
+  smartSelectionLayoutFor,
+  smartSelectionSpacingUpdates,
+  type SmartSelectionHandle,
+  type SmartSelectionSpacingDragState,
+} from './smartSelection'
 import { defaultTextFontSize, defaultTextWeight, textGeometryFor } from './textGeometry'
 
 type UseCanvasInteractionControllerOptions = {
@@ -204,6 +214,7 @@ const normalizeMarkupPoints = (box: MarkupCreationState, bounds: CanvasBounds): 
   return sourcePoints.map((point) => ({
     x: point.x - bounds.x,
     y: point.y - bounds.y,
+    ...('pressure' in point && point.pressure !== undefined ? { pressure: point.pressure } : {}),
   }))
 }
 
@@ -245,7 +256,9 @@ const isNodeEffectivelyLocked = (node: MivoCanvasNode, nodes: MivoCanvasNode[]) 
 const isEditableTextNode = (
   node: MivoCanvasNode | undefined,
 ): node is MivoCanvasNode & { type: 'text' | 'annotation' | 'markup' } =>
-  node?.type === 'text' || node?.type === 'annotation' || node?.type === 'markup'
+  node?.type === 'text' ||
+  node?.type === 'annotation' ||
+  (node?.type === 'markup' && node.markupKind !== 'stamp')
 
 const isAutoDeletedEmptyTextNode = (
   node: MivoCanvasNode | undefined,
@@ -271,6 +284,9 @@ export function useCanvasInteractionController({
   const markupPointTransformRef = useRef<MarkupPointTransformState | null>(null)
   const textResizeRef = useRef<TextResizeState | null>(null)
   const groupResizeRef = useRef<GroupResizeState | null>(null)
+  const selectionSpacingDragRef = useRef<SmartSelectionSpacingDragState | null>(null)
+  const eraserDragRef = useRef<{ pointerId: number; historyCaptured: boolean } | null>(null)
+  const stampPlacementRef = useRef<{ pointerId: number; stage: number; growTimer: number } | null>(null)
   const persistedSceneRef = useRef(sceneId)
   const viewportPersistenceTimerRef = useRef<number | undefined>(undefined)
   const [viewport, setViewport] = useState(() => initialViewportFor(sceneId))
@@ -281,6 +297,11 @@ export function useCanvasInteractionController({
   const [textCreationBox, setTextCreationBox] = useState<TextCreationState | null>(null)
   const [frameCreationBox, setFrameCreationBox] = useState<FrameCreationState | null>(null)
   const [markupCreationBox, setMarkupCreationBox] = useState<MarkupCreationState | null>(null)
+  const [stampPlacementPreview, setStampPlacementPreview] = useState<{
+    x: number
+    y: number
+    stage: number
+  } | null>(null)
   const [isPanning, setIsPanning] = useState(false)
   const [temporaryTool, setTemporaryTool] = useState<RuntimeCanvasTool | undefined>()
   const storedActiveTool = useCanvasStore((state) => state.activeTool)
@@ -297,8 +318,12 @@ export function useCanvasInteractionController({
   const moveSelectedNodesBy = useCanvasStore((state) => state.moveSelectedNodesBy)
   const moveSelectedLayer = useCanvasStore((state) => state.moveSelectedLayer)
   const copySelectedNodes = useCanvasStore((state) => state.copySelectedNodes)
+  const cutSelectedNodes = useCanvasStore((state) => state.cutSelectedNodes)
+  const eraseMarkupStrokes = useCanvasStore((state) => state.eraseMarkupStrokes)
   const pasteClipboardNodes = useCanvasStore((state) => state.pasteClipboardNodes)
   const pasteClipboardAssets = useCanvasStore((state) => state.pasteClipboardAssets)
+  const groupSelectedNodes = useCanvasStore((state) => state.groupSelectedNodes)
+  const ungroupSelectedNodes = useCanvasStore((state) => state.ungroupSelectedNodes)
   const deleteSelectedNodes = useCanvasStore((state) => state.deleteSelectedNodes)
   const duplicateSelectedNodes = useCanvasStore((state) => state.duplicateSelectedNodes)
   const addImportedImage = useCanvasStore((state) => state.addImportedImage)
@@ -322,6 +347,16 @@ export function useCanvasInteractionController({
     !selectionBox &&
     Boolean(selectedBounds) &&
     selectedNodes.some((node) => !isNodeEffectivelyLocked(node, nodes))
+  const selectionSpacingHandles = useMemo(
+    () =>
+      showGroupSelectionBounds
+        ? smartSelectionHandlesFor(selectedNodes, {
+            isEffectivelyLocked: (node) => isNodeEffectivelyLocked(node, nodes),
+            viewportScale: viewport.scale,
+          })
+        : [],
+    [nodes, selectedNodes, showGroupSelectionBounds, viewport.scale],
+  )
 
   useEffect(() => {
     viewportRef.current = viewport
@@ -382,6 +417,7 @@ export function useCanvasInteractionController({
       nodeTransformRef.current = null
       textResizeRef.current = null
       groupResizeRef.current = null
+      selectionSpacingDragRef.current = null
     })
 
     return () => window.cancelAnimationFrame(frame)
@@ -560,6 +596,7 @@ export function useCanvasInteractionController({
       setSnapGuides([])
       setActiveSectionDropTargetId(undefined)
       setActiveConnectorDropTargetId(undefined)
+      selectionSpacingDragRef.current = null
       captureHistory()
 
       groupResizeRef.current = createGroupResizeState(
@@ -572,6 +609,43 @@ export function useCanvasInteractionController({
       )
     },
     [captureHistory, discardEmptyEditingText, onCloseContextMenu, selectedBounds, selectedNodes],
+  )
+
+  const beginSelectionSpacingDrag = useCallback(
+    (handle: SmartSelectionHandle, event: ReactPointerEvent<HTMLButtonElement>) => {
+      if (event.button !== 0) return
+
+      const startLayout = smartSelectionLayoutFor(selectedNodes, {
+        isEffectivelyLocked: (node) => isNodeEffectivelyLocked(node, nodes),
+      })
+      if (!startLayout) return
+      const startGap = smartSelectionGapFor(startLayout, handle.axis, handle.index)
+      if (startGap < 0) return
+
+      event.preventDefault()
+      event.stopPropagation()
+      event.currentTarget.setPointerCapture(event.pointerId)
+      onCloseContextMenu()
+      discardEmptyEditingText()
+      setEditingTextNodeId(undefined)
+      setSnapGuides([])
+      setActiveSectionDropTargetId(undefined)
+      setActiveConnectorDropTargetId(undefined)
+      groupResizeRef.current = null
+      captureHistory()
+
+      selectionSpacingDragRef.current = {
+        pointerId: event.pointerId,
+        axis: handle.axis,
+        index: handle.index,
+        layoutKind: startLayout.kind,
+        startClientX: event.clientX,
+        startClientY: event.clientY,
+        startGap,
+        startLayout,
+      }
+    },
+    [captureHistory, discardEmptyEditingText, nodes, onCloseContextMenu, selectedNodes],
   )
 
   const beginNodeMove = useCallback(
@@ -751,6 +825,62 @@ export function useCanvasInteractionController({
     [discardEmptyEditingText, onCloseContextMenu, screenToCanvas],
   )
 
+  const eraseAtClientPoint = useCallback(
+    (clientX: number, clientY: number) => {
+      const drag = eraserDragRef.current
+      if (!drag) return
+
+      const point = screenToCanvas(clientX, clientY)
+      const state = useCanvasStore.getState()
+      const radius = eraserScreenRadius / viewportRef.current.scale
+      const candidates = state.nodes.filter((node) => !isNodeEffectivelyLocked(node, state.nodes))
+      const hits = eraserHitStrokeIds(candidates, point, radius)
+      if (!hits.length) return
+
+      if (!drag.historyCaptured) {
+        captureHistory()
+        drag.historyCaptured = true
+      }
+      eraseMarkupStrokes(hits)
+    },
+    [captureHistory, eraseMarkupStrokes, screenToCanvas],
+  )
+
+  const clearStampPlacement = useCallback(() => {
+    const placement = stampPlacementRef.current
+    if (!placement) return
+
+    window.clearInterval(placement.growTimer)
+    stampPlacementRef.current = null
+    setStampPlacementPreview(null)
+  }, [])
+
+  const beginStampPlacement = useCallback(
+    (event: ReactPointerEvent<HTMLElement>) => {
+      event.preventDefault()
+      event.currentTarget.setPointerCapture(event.pointerId)
+      onCloseContextMenu()
+      discardEmptyEditingText()
+      setEditingTextNodeId(undefined)
+      setSnapGuides([])
+      setSelectionBox(null)
+      selectionRef.current = null
+
+      const point = screenToCanvas(event.clientX, event.clientY)
+      // FigJam-style press-and-hold: the held stamp wiggles and grows through four stages.
+      const growTimer = window.setInterval(() => {
+        const placement = stampPlacementRef.current
+        if (!placement || placement.stage >= stampGrowthSizes.length - 1) return
+
+        placement.stage += 1
+        setStampPlacementPreview((current) => (current ? { ...current, stage: placement.stage } : current))
+      }, stampGrowthIntervalMs)
+      stampPlacementRef.current = { pointerId: event.pointerId, stage: 0, growTimer }
+      setStampPlacementPreview({ x: point.x, y: point.y, stage: 0 })
+    },
+    [discardEmptyEditingText, onCloseContextMenu, screenToCanvas],
+  )
+
   const beginMarkupBox = useCallback(
     (event: ReactPointerEvent<HTMLElement>) => {
       const kind = markupKindForTool(useCanvasStore.getState().activeTool)
@@ -765,6 +895,12 @@ export function useCanvasInteractionController({
       setSelectionBox(null)
       selectionRef.current = null
 
+      if (kind === 'brush' && useCanvasStore.getState().brushStyle.kind === 'eraser') {
+        eraserDragRef.current = { pointerId: event.pointerId, historyCaptured: false }
+        eraseAtClientPoint(event.clientX, event.clientY)
+        return
+      }
+
       const point = screenToCanvas(event.clientX, event.clientY)
       const nextBox: MarkupCreationState = {
         pointerId: event.pointerId,
@@ -778,7 +914,7 @@ export function useCanvasInteractionController({
       markupCreationRef.current = nextBox
       setMarkupCreationBox(nextBox)
     },
-    [discardEmptyEditingText, onCloseContextMenu, screenToCanvas],
+    [discardEmptyEditingText, eraseAtClientPoint, onCloseContextMenu, screenToCanvas],
   )
 
   const updateEditingText = useCallback(
@@ -842,9 +978,20 @@ export function useCanvasInteractionController({
       beginTextBox,
       beginFrameBox,
       beginMarkupBox,
+      beginStampPlacement,
       beginTextEdit,
     }),
-    [beginFrameBox, beginMarkupBox, beginNodeMove, beginPan, beginSelection, beginTextBox, beginTextEdit, startNodeResize],
+    [
+      beginFrameBox,
+      beginMarkupBox,
+      beginNodeMove,
+      beginPan,
+      beginSelection,
+      beginStampPlacement,
+      beginTextBox,
+      beginTextEdit,
+      startNodeResize,
+    ],
   )
 
   const beginNodePointerDown = useCallback(
@@ -874,7 +1021,36 @@ export function useCanvasInteractionController({
     (event: ReactPointerEvent<HTMLElement>) => {
       const groupResize = groupResizeRef.current
       if (groupResize?.pointerId === event.pointerId) {
-        updateNodesGeometry(resizeGroupSelection(groupResize, event.clientX, event.clientY, viewportRef.current.scale).updates)
+        updateNodesGeometry(
+          resizeGroupSelection(groupResize, event.clientX, event.clientY, viewportRef.current.scale, {
+            centered: event.altKey,
+          }).updates,
+        )
+        return
+      }
+
+      if (eraserDragRef.current?.pointerId === event.pointerId) {
+        eraseAtClientPoint(event.clientX, event.clientY)
+        return
+      }
+
+      const stampPlacement = stampPlacementRef.current
+      if (stampPlacement?.pointerId === event.pointerId) {
+        const point = screenToCanvas(event.clientX, event.clientY)
+        setStampPlacementPreview({ x: point.x, y: point.y, stage: stampPlacement.stage })
+        return
+      }
+
+      const selectionSpacingDrag = selectionSpacingDragRef.current
+      if (selectionSpacingDrag?.pointerId === event.pointerId) {
+        const { updates } = smartSelectionSpacingUpdates(
+          selectionSpacingDrag,
+          event.clientX,
+          event.clientY,
+          viewportRef.current.scale,
+        )
+
+        updateNodesGeometry(updates)
         return
       }
 
@@ -918,7 +1094,11 @@ export function useCanvasInteractionController({
           const distance = previousPoint
             ? Math.abs(previousPoint.x - point.x) + Math.abs(previousPoint.y - point.y)
             : Number.POSITIVE_INFINITY
-          if (distance > 2) markupCreation.points.push(point)
+          if (distance > 2) {
+            markupCreation.points.push(
+              event.pointerType === 'pen' ? { ...point, pressure: event.pressure } : point,
+            )
+          }
         }
         setMarkupCreationBox({ ...markupCreation, points: [...markupCreation.points] })
         return
@@ -956,6 +1136,7 @@ export function useCanvasInteractionController({
             event.clientX,
             event.clientY,
             viewportRef.current.scale,
+            { centered: event.altKey },
           )
           setSnapGuides(snapped.guides)
           setActiveSectionDropTargetId(undefined)
@@ -1046,6 +1227,7 @@ export function useCanvasInteractionController({
     },
     [
       captureHistory,
+      eraseAtClientPoint,
       nodes,
       resizeTextNode,
       screenToCanvas,
@@ -1062,6 +1244,10 @@ export function useCanvasInteractionController({
       if (groupResizeRef.current?.pointerId === event.pointerId) {
         groupResizeRef.current = null
         setSnapGuides([])
+      }
+
+      if (selectionSpacingDragRef.current?.pointerId === event.pointerId) {
+        selectionSpacingDragRef.current = null
       }
 
       if (textCreationRef.current?.pointerId === event.pointerId) {
@@ -1149,11 +1335,25 @@ export function useCanvasInteractionController({
           points = next.points
         }
 
-        addMarkupNode(markupCreation.kind, finalPosition, finalSize, { points, select: false, ...connectorOptions })
+        const isBrush = markupCreation.kind === 'brush'
+        const brushStyle = useCanvasStore.getState().brushStyle
+        addMarkupNode(markupCreation.kind, finalPosition, finalSize, {
+          points,
+          select: false,
+          ...(isBrush
+            ? {
+                strokeColor: brushStyle.color,
+                strokeWidth: brushStyle.width,
+                brushKind: brushStyle.kind === 'highlighter' ? ('highlighter' as const) : ('marker' as const),
+              }
+            : {}),
+          ...connectorOptions,
+        })
         markupCreationRef.current = null
         setMarkupCreationBox(null)
         setActiveConnectorDropTargetId(undefined)
-        setActiveTool('select')
+        // Brush stays active for continuous strokes (FigJam/Excalidraw convention); Esc or V exits.
+        if (!isBrush) setActiveTool('select')
       }
 
       if (nodeTransformRef.current?.pointerId === event.pointerId) {
@@ -1181,6 +1381,26 @@ export function useCanvasInteractionController({
         setActiveConnectorDropTargetId(undefined)
       }
 
+      if (eraserDragRef.current?.pointerId === event.pointerId) {
+        eraserDragRef.current = null
+      }
+
+      if (stampPlacementRef.current?.pointerId === event.pointerId) {
+        if (event.type === 'pointerup') {
+          const placement = stampPlacementRef.current
+          const point = screenToCanvas(event.clientX, event.clientY)
+          const size = stampGrowthSizes[placement.stage]
+          addMarkupNode(
+            'stamp',
+            { x: point.x - size / 2, y: point.y - size / 2 },
+            { width: size, height: size },
+            { stampKind: useCanvasStore.getState().activeStampKind, select: false },
+          )
+        }
+        // Stamp stays active for continuous stamping (FigJam convention); Esc or V exits.
+        clearStampPlacement()
+      }
+
       if (panRef.current?.pointerId === event.pointerId) {
         panRef.current = null
         setIsPanning(false)
@@ -1194,10 +1414,12 @@ export function useCanvasInteractionController({
       addFrameNode,
       addMarkupNode,
       addTextNode,
+      clearStampPlacement,
       editTextNode,
       finishSelection,
       nodes,
       resizeTextNode,
+      screenToCanvas,
       selectNode,
       setActiveTool,
     ],
@@ -1250,6 +1472,13 @@ export function useCanvasInteractionController({
         markupCreationRef.current = null
         markupPointTransformRef.current = null
         groupResizeRef.current = null
+        selectionSpacingDragRef.current = null
+        eraserDragRef.current = null
+        if (stampPlacementRef.current) {
+          window.clearInterval(stampPlacementRef.current.growTimer)
+          stampPlacementRef.current = null
+        }
+        setStampPlacementPreview(null)
         nodeTransformRef.current = null
         textResizeRef.current = null
         setEditingTextNodeId(undefined)
@@ -1260,6 +1489,7 @@ export function useCanvasInteractionController({
         setSnapGuides([])
         setActiveConnectorDropTargetId(undefined)
         selectNode(undefined)
+        if (useCanvasStore.getState().activeTool !== 'select') setActiveTool('select')
         return
       }
 
@@ -1300,9 +1530,30 @@ export function useCanvasInteractionController({
         return
       }
 
+      if (modifier && key === 'a') {
+        event.preventDefault()
+        // Read nodes via getState so this effect does not re-subscribe on every node change.
+        const allNodes = useCanvasStore.getState().nodes
+        selectNodes(allNodes.filter((node) => !node.hidden).map((node) => node.id))
+        return
+      }
+
       if (modifier && key === 'c') {
         event.preventDefault()
         copySelectedNodes()
+        return
+      }
+
+      if (modifier && key === 'x') {
+        event.preventDefault()
+        cutSelectedNodes()
+        return
+      }
+
+      if (modifier && key === 'g') {
+        event.preventDefault()
+        if (event.shiftKey) ungroupSelectedNodes()
+        else groupSelectedNodes()
         return
       }
 
@@ -1330,10 +1581,23 @@ export function useCanvasInteractionController({
         return
       }
 
+      if (!modifier && key === 'e') {
+        event.preventDefault()
+        const store = useCanvasStore.getState()
+        store.setActiveTool('markup-brush')
+        if (store.brushStyle.kind !== 'eraser') store.setBrushStyle({ kind: 'eraser' })
+        return
+      }
+
       const shortcutTool = modifier ? undefined : toolForKeyboardShortcut(key)
       if (shortcutTool) {
         event.preventDefault()
         setActiveTool(shortcutTool)
+        if (shortcutTool === 'markup-brush') {
+          // P always means "draw": leaving eraser mode goes back to the marker.
+          const store = useCanvasStore.getState()
+          if (store.brushStyle.kind === 'eraser') store.setBrushStyle({ kind: 'marker' })
+        }
         return
       }
 
@@ -1372,6 +1636,12 @@ export function useCanvasInteractionController({
       markupCreationRef.current = null
       setMarkupCreationBox(null)
       markupPointTransformRef.current = null
+      eraserDragRef.current = null
+      if (stampPlacementRef.current) {
+        window.clearInterval(stampPlacementRef.current.growTimer)
+        stampPlacementRef.current = null
+      }
+      setStampPlacementPreview(null)
       nodeTransformRef.current = null
       textResizeRef.current = null
       setActiveConnectorDropTargetId(undefined)
@@ -1427,12 +1697,14 @@ export function useCanvasInteractionController({
     addFrameNode,
     addImportedImage,
     copySelectedNodes,
+    cutSelectedNodes,
     deleteSelectedNodes,
     deleteNode,
     duplicateSelectedNodes,
     fitAll,
     fitSelection,
     maskEditNodeId,
+    groupSelectedNodes,
     moveSelectedLayer,
     moveSelectedNodesBy,
     onCancelMaskEdit,
@@ -1442,8 +1714,10 @@ export function useCanvasInteractionController({
     redo,
     resetView,
     selectNode,
+    selectNodes,
     setActiveTool,
     undo,
+    ungroupSelectedNodes,
     resizeTextNode,
     updateMarkupGeometry,
     updateTextNode,
@@ -1468,6 +1742,7 @@ export function useCanvasInteractionController({
     interactionMode,
     selectedNodes,
     selectedBounds,
+    selectionSpacingHandles,
     activeSectionDropTargetId,
     activeConnectorDropTargetId,
     showGroupSelectionBounds,
@@ -1476,8 +1751,10 @@ export function useCanvasInteractionController({
     activeFrameCreationRect,
     activeMarkupCreationRect,
     markupCreationBox,
+    stampPlacementPreview,
     selectionPreviewSet,
     beginGroupResize,
+    beginSelectionSpacingDrag,
     beginNodePointerDown,
     beginNodeResize,
     editTextNode,

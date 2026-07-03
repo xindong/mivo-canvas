@@ -138,6 +138,27 @@ await new Promise((resolve) => eagleMockServer.listen(0, '127.0.0.1', resolve))
 const eagleMockAddress = eagleMockServer.address()
 const eagleMockPort = typeof eagleMockAddress === 'object' && eagleMockAddress ? eagleMockAddress.port : 41895
 
+const runCommand = (command, args) =>
+  new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    let output = ''
+
+    child.stdout.on('data', (chunk) => {
+      output += chunk
+    })
+    child.stderr.on('data', (chunk) => {
+      output += chunk
+    })
+    child.on('close', (code) => {
+      if (code === 0) {
+        resolve(output)
+        return
+      }
+
+      reject(new Error(`${command} ${args.join(' ')} failed with ${code}\n${output}`))
+    })
+  })
+
 const server = spawn(
   'npm',
   ['run', 'dev', '--', '--host', '127.0.0.1', '--port', String(port), '--strictPort'],
@@ -153,6 +174,7 @@ const server = spawn(
 
 try {
   await mkdir('test-artifacts', { recursive: true })
+  await runCommand('npm', ['run', 'verify:logging'])
   const [nodeRegistrySource, actionModelSource, viteConfigSource, modelCapabilitiesSource] = await Promise.all([
     readFile('src/canvas/nodeTypes/canvasNodeRegistry.ts', 'utf8'),
     readFile('src/canvas/actions/canvasActionModel.ts', 'utf8'),
@@ -228,6 +250,7 @@ try {
 
   const browser = await chromium.launch({ headless: true })
   const page = await browser.newPage({ viewport: { width: 1512, height: 900 }, deviceScaleFactor: 1 })
+  await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin: baseUrl })
   const errors = []
   const mivoEditRequests = []
   const { readFloatingChrome, readLibraryLayout, readLibrarySurfaceColors } = createPageReaders(page)
@@ -284,7 +307,7 @@ try {
   })
 
   page.on('console', (message) => {
-    if (message.type() === 'error') errors.push(message.text())
+    if (message.type() === 'error' && !message.text().includes('__MIVO_E2E_EXPECTED_ERROR__')) errors.push(message.text())
   })
 
   await page.addInitScript(() => window.localStorage.clear())
@@ -658,6 +681,227 @@ try {
     throw new Error('Back/forward controls should be removed from the workspace chrome')
   }
 
+  const debugLogButton = page.getByRole('button', { name: 'Debug Log', exact: true })
+  if ((await debugLogButton.count()) !== 1) {
+    throw new Error('Project sidebar should expose one Debug Log button above Settings')
+  }
+  const debugLogPlacement = await page.evaluate(() => {
+    const debugLog = document.querySelector('[aria-label="Debug Log"]')?.getBoundingClientRect()
+    const settings = document.querySelector('[aria-label="Settings"]')?.getBoundingClientRect()
+
+    return {
+      debugBottom: debugLog?.bottom,
+      settingsTop: settings?.top,
+    }
+  })
+  if (
+    typeof debugLogPlacement.debugBottom !== 'number' ||
+    typeof debugLogPlacement.settingsTop !== 'number' ||
+    debugLogPlacement.debugBottom > debugLogPlacement.settingsTop
+  ) {
+    throw new Error(`Debug Log should sit directly above Settings: ${JSON.stringify(debugLogPlacement)}`)
+  }
+  const initialDebugBadges = await debugLogButton.evaluate((button) => ({
+    warnings: button.querySelectorAll('.debug-log-badge.warning').length,
+    errors: button.querySelectorAll('.debug-log-badge.error').length,
+  }))
+  if (initialDebugBadges.warnings !== 0 || initialDebugBadges.errors !== 0) {
+    throw new Error(`Debug Log button should hide empty warning/error badges: ${JSON.stringify(initialDebugBadges)}`)
+  }
+  await page.evaluate(() => {
+    console.log('__MIVO_E2E_EXPECTED_LOG__ unity-style log')
+    console.warn('__MIVO_E2E_EXPECTED_WARNING__ unity-style warning')
+    console.error('__MIVO_E2E_EXPECTED_ERROR__ unity-style error')
+  })
+  await page.waitForFunction(() => {
+    const button = document.querySelector('[aria-label="Debug Log"]')
+    return (
+      button?.querySelector('.debug-log-badge.warning')?.textContent?.trim() === '1' &&
+      button?.querySelector('.debug-log-badge.error')?.textContent?.trim() === '1'
+    )
+  })
+  const debugBadgeColors = await debugLogButton.evaluate((button) => {
+    const warning = button.querySelector('.debug-log-badge.warning')
+    const error = button.querySelector('.debug-log-badge.error')
+
+    return {
+      warningText: warning?.textContent?.trim(),
+      warningColor: warning ? window.getComputedStyle(warning).backgroundColor : undefined,
+      warningTextColor: warning ? window.getComputedStyle(warning).color : undefined,
+      errorText: error?.textContent?.trim(),
+      errorColor: error ? window.getComputedStyle(error).backgroundColor : undefined,
+      errorTextColor: error ? window.getComputedStyle(error).color : undefined,
+    }
+  })
+  if (
+    debugBadgeColors.warningText !== '1' ||
+    debugBadgeColors.errorText !== '1' ||
+    !debugBadgeColors.warningColor?.includes('199') ||
+    !debugBadgeColors.errorColor?.includes('191') ||
+    !debugBadgeColors.warningTextColor?.includes('255, 255, 255') ||
+    !debugBadgeColors.errorTextColor?.includes('255, 255, 255')
+  ) {
+    throw new Error(`Debug Log button should show yellow/red counts with white text: ${JSON.stringify(debugBadgeColors)}`)
+  }
+  await page.evaluate(() => {
+    for (let index = 0; index < 11; index += 1) {
+      console.error(`__MIVO_E2E_EXPECTED_ERROR__ badge-center-${index}`)
+    }
+  })
+  await page.waitForFunction(() => document.querySelector('[aria-label="Debug Log"] .debug-log-badge.error')?.textContent?.trim() === '12')
+  const debugBadgeAlignment = await debugLogButton.evaluate((button) => {
+    const warning = button.querySelector('.debug-log-badge.warning')
+    const error = button.querySelector('.debug-log-badge.error')
+    const warningRect = warning?.getBoundingClientRect()
+    const style = error ? window.getComputedStyle(error) : undefined
+    const rect = error?.getBoundingClientRect()
+
+    return {
+      text: error?.textContent?.trim(),
+      display: style?.display,
+      alignItems: style?.alignItems,
+      justifyContent: style?.justifyContent,
+      height: rect?.height,
+      lineHeight: style?.lineHeight,
+      warningRight: warningRect?.right,
+      warningCenterY: warningRect ? warningRect.top + warningRect.height / 2 : undefined,
+      errorLeft: rect?.left,
+      errorCenterY: rect ? rect.top + rect.height / 2 : undefined,
+    }
+  })
+  if (
+    debugBadgeAlignment.text !== '12' ||
+    !['flex', 'inline-flex'].includes(debugBadgeAlignment.display || '') ||
+    debugBadgeAlignment.alignItems !== 'center' ||
+    debugBadgeAlignment.justifyContent !== 'center' ||
+    debugBadgeAlignment.lineHeight !== `${debugBadgeAlignment.height}px` ||
+    typeof debugBadgeAlignment.warningRight !== 'number' ||
+    typeof debugBadgeAlignment.errorLeft !== 'number' ||
+    debugBadgeAlignment.warningRight > debugBadgeAlignment.errorLeft ||
+    Math.abs((debugBadgeAlignment.warningCenterY || 0) - (debugBadgeAlignment.errorCenterY || 0)) > 1
+  ) {
+    throw new Error(`Debug Log count badges should align horizontally and center text: ${JSON.stringify(debugBadgeAlignment)}`)
+  }
+  await debugLogButton.click()
+  const debugLogPanel = page.getByRole('dialog', { name: 'Debug log console' })
+  if ((await debugLogPanel.count()) !== 1) {
+    throw new Error('Debug Log should open a modal console dialog')
+  }
+  const debugLogDialogGeometry = await debugLogPanel.evaluate((dialog) => {
+    const rect = dialog.getBoundingClientRect()
+
+    return {
+      centerX: rect.left + rect.width / 2,
+      centerY: rect.top + rect.height / 2,
+      viewportCenterX: window.innerWidth / 2,
+      viewportCenterY: window.innerHeight / 2,
+    }
+  })
+  if (
+    Math.abs(debugLogDialogGeometry.centerX - debugLogDialogGeometry.viewportCenterX) > 3 ||
+    Math.abs(debugLogDialogGeometry.centerY - debugLogDialogGeometry.viewportCenterY) > 3
+  ) {
+    throw new Error(`Debug Log dialog should be centered in the browser viewport: ${JSON.stringify(debugLogDialogGeometry)}`)
+  }
+  const debugLogDialogStyle = await debugLogPanel.evaluate((dialog) => {
+    const closeButton = dialog.querySelector('[aria-label="Close debug log"]')
+    const logEntry = dialog.querySelector('.debug-log-entry')
+
+    return {
+      panelRadius: Number.parseFloat(window.getComputedStyle(dialog).borderRadius),
+      closeRadius: closeButton ? Number.parseFloat(window.getComputedStyle(closeButton).borderRadius) : 0,
+      entryRadius: logEntry ? Number.parseFloat(window.getComputedStyle(logEntry).borderRadius) : 0,
+      panelBackground: window.getComputedStyle(dialog).backgroundColor,
+    }
+  })
+  if (
+    debugLogDialogStyle.panelRadius < 12 ||
+    debugLogDialogStyle.closeRadius < 8 ||
+    debugLogDialogStyle.entryRadius < 8 ||
+    !debugLogDialogStyle.panelBackground.includes('250')
+  ) {
+    throw new Error(`Debug Log dialog should match the rounded Mivo panel style: ${JSON.stringify(debugLogDialogStyle)}`)
+  }
+  for (const filter of ['All', 'Log', 'Warning', 'Error']) {
+    if ((await debugLogPanel.getByRole('button', { name: new RegExp(`^${filter} \\d+`) }).count()) !== 1) {
+      throw new Error(`Debug Log panel should expose a ${filter} level filter with a count`)
+    }
+  }
+  if ((await debugLogPanel.getByRole('button', { name: 'Clear debug log' }).count()) !== 1) {
+    throw new Error('Debug Log panel should expose a Clear action')
+  }
+  for (const message of ['App ready', 'Canvas loaded', 'Tool changed', 'Selection changed']) {
+    if ((await debugLogPanel.getByText(message, { exact: false }).count()) < 1) {
+      throw new Error(`Debug Log panel should include runtime log: ${message}`)
+    }
+  }
+  for (const message of [
+    '__MIVO_E2E_EXPECTED_LOG__ unity-style log',
+    '__MIVO_E2E_EXPECTED_WARNING__ unity-style warning',
+    '__MIVO_E2E_EXPECTED_ERROR__ unity-style error',
+  ]) {
+    await debugLogPanel.getByText(message, { exact: false }).waitFor()
+  }
+  const logListSelection = await debugLogPanel.locator('.debug-log-list').evaluate((list) => window.getComputedStyle(list).userSelect)
+  if (logListSelection !== 'text') {
+    throw new Error(`Debug Log modal should allow selecting log text for copy, user-select=${logListSelection}`)
+  }
+  await debugLogPanel.getByRole('button', { name: /^Warning \d+/ }).click()
+  if ((await debugLogPanel.getByText('__MIVO_E2E_EXPECTED_WARNING__', { exact: false }).count()) !== 1) {
+    throw new Error('Warning filter should keep warning entries visible')
+  }
+  if ((await debugLogPanel.getByText('__MIVO_E2E_EXPECTED_LOG__', { exact: false }).count()) !== 0) {
+    throw new Error('Warning filter should hide log entries')
+  }
+  await debugLogPanel.getByRole('button', { name: /^Error \d+/ }).click()
+  if ((await debugLogPanel.getByText('__MIVO_E2E_EXPECTED_ERROR__ unity-style error', { exact: false }).count()) !== 1) {
+    throw new Error('Error filter should keep error entries visible')
+  }
+  if ((await debugLogPanel.locator('.debug-log-entry:not(.error) [aria-label^="Copy error log"]').count()) !== 0) {
+    throw new Error('Only error entries should expose copy controls')
+  }
+  const expectedErrorEntry = debugLogPanel
+    .locator('.debug-log-entry.error')
+    .filter({ hasText: '__MIVO_E2E_EXPECTED_ERROR__ unity-style error' })
+  if ((await expectedErrorEntry.getByRole('button', { name: 'Copy error log content' }).count()) !== 1) {
+    throw new Error('Each error entry should expose one copy-log icon button')
+  }
+  await expectedErrorEntry.getByRole('button', { name: 'Copy error log content' }).click()
+  const copiedErrorLog = await page.evaluate(() => navigator.clipboard.readText())
+  if (
+    !copiedErrorLog.includes('[ERROR]') ||
+    !copiedErrorLog.includes('Console') ||
+    !copiedErrorLog.includes('__MIVO_E2E_EXPECTED_ERROR__ unity-style error')
+  ) {
+    throw new Error(`Copying an error log should place the formatted error content on the clipboard: ${copiedErrorLog}`)
+  }
+  const copyToast = page.getByRole('status').filter({ hasText: 'Error log copied' })
+  await copyToast.waitFor()
+  const toastPlacement = await page.locator('.toast-viewport').evaluate((element) => {
+    const rect = element.getBoundingClientRect()
+    const style = window.getComputedStyle(element)
+    return {
+      horizontalCenterDelta: Math.abs(rect.left + rect.width / 2 - window.innerWidth / 2),
+      bottom: style.bottom,
+      pointerEvents: style.pointerEvents,
+    }
+  })
+  if (toastPlacement.horizontalCenterDelta > 2 || toastPlacement.pointerEvents !== 'none') {
+    throw new Error(`Toast viewport should be bottom-centered and non-blocking: ${JSON.stringify(toastPlacement)}`)
+  }
+  await debugLogPanel.getByRole('button', { name: /^All \d+/ }).click()
+  if ((await debugLogPanel.getByText('Copied error log content', { exact: false }).count()) !== 0) {
+    throw new Error('Copying an error log successfully should not add a normal Debug Log entry')
+  }
+  await debugLogPanel.getByRole('button', { name: 'Clear debug log' }).click()
+  if ((await debugLogPanel.getByText('__MIVO_E2E_EXPECTED_ERROR__', { exact: false }).count()) !== 0) {
+    throw new Error('Clear should remove captured debug entries')
+  }
+  await debugLogPanel.getByRole('button', { name: 'Close debug log' }).click()
+  if ((await debugLogPanel.count()) !== 0) {
+    throw new Error('Debug Log modal should close from its close button')
+  }
+
   await page.getByRole('button', { name: 'Settings' }).click()
   if ((await page.getByRole('menu', { name: 'Settings menu' }).count()) !== 1) {
     throw new Error('Settings should expand into an inline menu')
@@ -667,6 +911,8 @@ try {
       throw new Error(`Settings menu should include: ${item}`)
     }
   }
+  await page.getByRole('menuitem', { name: 'Preferences' }).click()
+  await page.waitForFunction(() => document.querySelector('[aria-label="Debug Log"] .debug-log-badge.warning')?.textContent?.trim() === '1')
   const settingsRowDisplay = await page.getByRole('button', { name: 'Settings' }).evaluate((row) => ({
     display: window.getComputedStyle(row).display,
     columns: window.getComputedStyle(row).gridTemplateColumns,
@@ -1125,7 +1371,7 @@ try {
     kind: 'mivo-canvas-archive',
     version: 2,
     snapshot: {
-      version: 1,
+      version: 2,
       sceneId: 'canvas-e2e-archive',
       nodes: [
         {
@@ -1987,10 +2233,16 @@ try {
     const flyout = document.querySelector('.canvas-tool-flyout')
     return flyout && window.getComputedStyle(flyout).visibility === 'visible'
   })
-  for (const tool of ['Arrow', 'Line', 'Rectangle', 'Ellipse', 'Brush']) {
+  for (const tool of ['Arrow', 'Line', 'Rectangle', 'Ellipse']) {
     if ((await page.locator('.canvas-tool-flyout').getByRole('menuitem', { name: tool }).count()) !== 1) {
       throw new Error(`Draw flyout should expose ${tool}`)
     }
+  }
+  if ((await page.locator('.canvas-tool-flyout').getByRole('menuitem', { name: 'Brush' }).count()) !== 0) {
+    throw new Error('Brush should be a first-class dock tool instead of a Draw flyout item')
+  }
+  if ((await page.locator('.canvas-tool-dock > button[aria-label="Brush"]').count()) !== 1) {
+    throw new Error('Brush should render as a top-level dock button')
   }
   await drawToolButton.click()
   await page.mouse.move(farBlankPoint.x, farBlankPoint.y)
@@ -2064,7 +2316,12 @@ try {
       `Dragging an arrow endpoint should edit the arrow geometry: before=${JSON.stringify(lineEndBefore)}, after=${JSON.stringify(lineEndAfter)}, handleBefore=${JSON.stringify(endPointHandle)}, handleAfter=${JSON.stringify(endPointHandleAfter)}`,
     )
   }
-  await arrowMarkupNode.dblclick()
+  const arrowHitLineBox = await arrowMarkupNode.locator('.markup-hit-line').boundingBox()
+  if (!arrowHitLineBox) throw new Error('Arrow markup should expose a line hit target for label editing')
+  await page.mouse.dblclick(
+    arrowHitLineBox.x + arrowHitLineBox.width / 2,
+    arrowHitLineBox.y + arrowHitLineBox.height / 2,
+  )
   await page.waitForSelector('.dom-node.markup-node[data-markup-kind="arrow"].editing .dom-markup-text-editor')
   if ((await page.locator('.details-dialog').count()) !== 0) {
     throw new Error('Double-clicking arrow markup should edit its label instead of opening image details')
@@ -2585,6 +2842,179 @@ try {
   await page.waitForSelector('.selection-quick-toolbar')
   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Delete' }).click()
 
+  const brushCountBefore = await page.locator('.dom-node.markup-node[data-markup-kind="brush"]').count()
+  const brushStrokeStart = { x: markupShapeTestPoint.x, y: markupShapeTestPoint.y + 150 }
+  const drawBrushStroke = async (offsetY) => {
+    await page.mouse.move(brushStrokeStart.x, brushStrokeStart.y + offsetY)
+    await page.mouse.down()
+    await page.mouse.move(brushStrokeStart.x + 60, brushStrokeStart.y + offsetY - 24, { steps: 5 })
+    await page.mouse.move(brushStrokeStart.x + 130, brushStrokeStart.y + offsetY + 12, { steps: 5 })
+    await page.mouse.up()
+  }
+
+  await page.getByRole('button', { name: 'Brush' }).click()
+  await page.waitForSelector('.brush-options-bar')
+  const defaultBrushColorChecked = await page
+    .locator('.brush-options-bar')
+    .getByRole('radio', { name: 'Brush color Black' })
+    .getAttribute('aria-checked')
+  if (defaultBrushColorChecked !== 'true') {
+    throw new Error('Brush should default to the black color preset')
+  }
+  const markerCursor = await page.evaluate(
+    () => window.getComputedStyle(document.querySelector('.canvas-shell')).cursor,
+  )
+  if (!markerCursor.includes('data:image/svg+xml')) {
+    throw new Error(`Brush tool should show a pen cursor instead of the default one, got ${markerCursor}`)
+  }
+  await page.locator('.brush-options-bar').getByRole('radio', { name: 'Brush width Bold' }).click()
+  await page.locator('.brush-options-bar').getByRole('radio', { name: 'Brush color Orange' }).click()
+  await drawBrushStroke(0)
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="brush"]').length === count + 1,
+    brushCountBefore,
+  )
+  const brushButtonClassAfterStroke = await page
+    .locator('.canvas-tool-dock > button[aria-label="Brush"]')
+    .getAttribute('class')
+  if (!brushButtonClassAfterStroke?.includes('active')) {
+    throw new Error('Brush should stay active after a stroke for continuous drawing')
+  }
+  await drawBrushStroke(40)
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="brush"]').length === count + 2,
+    brushCountBefore,
+  )
+  const markerBrushNode = page.locator('.dom-node.markup-node[data-markup-kind="brush"]').last()
+  const markerBrushFill = await markerBrushNode.locator('svg.dom-markup-node > path').getAttribute('fill')
+  if (markerBrushFill !== '#ff8a00') {
+    throw new Error(`Brush strokes should render a filled freehand path in the picked color, got ${markerBrushFill}`)
+  }
+
+  await page.locator('.brush-options-bar').getByRole('radio', { name: 'Highlighter' }).click()
+  await drawBrushStroke(80)
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="brush"]').length === count + 3,
+    brushCountBefore,
+  )
+  const highlighterNode = page.locator('.dom-node.markup-node[data-markup-kind="brush"]').last()
+  const highlighterFillOpacity = await highlighterNode
+    .locator('svg.dom-markup-node > path')
+    .getAttribute('fill-opacity')
+  if (Math.abs(Number(highlighterFillOpacity) - 0.42) > 0.01) {
+    throw new Error(`Highlighter strokes should render semi-transparent, got fill-opacity=${highlighterFillOpacity}`)
+  }
+
+  await page.locator('.brush-options-bar').getByRole('radio', { name: 'Eraser' }).click()
+  const eraserCursor = await page.evaluate(
+    () => window.getComputedStyle(document.querySelector('.canvas-shell')).cursor,
+  )
+  if (!eraserCursor.includes('data:image/svg+xml') || eraserCursor === markerCursor) {
+    throw new Error('Eraser mode should switch to its own cursor')
+  }
+  if (
+    !(await page
+      .locator('.brush-options-bar')
+      .getByRole('radio', { name: 'Brush color Orange' })
+      .isDisabled())
+  ) {
+    throw new Error('Eraser mode should disable stroke color options')
+  }
+  await page.mouse.move(brushStrokeStart.x + 65, brushStrokeStart.y - 40)
+  await page.mouse.down()
+  await page.mouse.move(brushStrokeStart.x + 65, brushStrokeStart.y + 120, { steps: 24 })
+  await page.mouse.up()
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="brush"]').length === count,
+    brushCountBefore,
+  )
+
+  await page.keyboard.press('Escape')
+  await page.waitForFunction(() => {
+    const selectButton = [...document.querySelectorAll('.canvas-tool-dock button')].find(
+      (button) => button.getAttribute('aria-label') === 'Select',
+    )
+    return selectButton?.classList.contains('active') && !document.querySelector('.brush-options-bar')
+  })
+
+  await page.keyboard.press('e')
+  await page.waitForSelector('.brush-options-bar')
+  if (
+    (await page.locator('.brush-options-bar').getByRole('radio', { name: 'Eraser' }).getAttribute('aria-checked')) !==
+    'true'
+  ) {
+    throw new Error('The E shortcut should activate eraser mode')
+  }
+  await page.keyboard.press('p')
+  await page.waitForFunction(() => {
+    const marker = document.querySelector('.brush-options-bar [aria-label="Marker"]')
+    return marker?.getAttribute('aria-checked') === 'true'
+  })
+  await page.keyboard.press('Escape')
+  await page.waitForFunction(() => !document.querySelector('.brush-options-bar'))
+
+  const stampCountBefore = await page.locator('.dom-node.markup-node[data-markup-kind="stamp"]').count()
+  await page.keyboard.press('s')
+  await page.waitForSelector('.stamp-options-bar')
+  const stampCursor = await page.evaluate(
+    () => window.getComputedStyle(document.querySelector('.canvas-shell')).cursor,
+  )
+  if (!stampCursor.includes('data:image/svg+xml')) {
+    throw new Error(`Stamp tool should show the stamp as cursor, got ${stampCursor}`)
+  }
+  const stampPoint = { x: markupShapeTestPoint.x + 40, y: markupShapeTestPoint.y + 320 }
+  await page.mouse.click(stampPoint.x, stampPoint.y)
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="stamp"]').length === count + 1,
+    stampCountBefore,
+  )
+  const stampButtonClass = await page
+    .locator('.canvas-tool-dock > button[aria-label="Stamp"]')
+    .getAttribute('class')
+  if (!stampButtonClass?.includes('active')) {
+    throw new Error('Stamp should stay active after placing for continuous stamping')
+  }
+  const quickStampNode = page.locator('.dom-node.markup-node[data-markup-kind="stamp"]').last()
+  const quickStampEmoji = (await quickStampNode.locator('.dom-markup-stamp').textContent())?.trim()
+  if (quickStampEmoji !== '👍') {
+    throw new Error(`Default stamp should be the +1 thumbs up, got ${quickStampEmoji}`)
+  }
+  const quickStampBox = await quickStampNode.boundingBox()
+  if (!quickStampBox) throw new Error('Missing stamp geometry after quick click')
+
+  await page.locator('.stamp-options-bar').getByRole('radio', { name: 'Stamp Heart' }).click()
+  await page.mouse.move(stampPoint.x + 90, stampPoint.y)
+  await page.mouse.down()
+  await page.waitForSelector('.stamp-placement-preview')
+  await wait(950)
+  await page.mouse.up()
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="stamp"]').length === count + 2,
+    stampCountBefore,
+  )
+  const heldStampNode = page.locator('.dom-node.markup-node[data-markup-kind="stamp"]').last()
+  const heldStampEmoji = (await heldStampNode.locator('.dom-markup-stamp').textContent())?.trim()
+  if (heldStampEmoji !== '❤️') {
+    throw new Error(`Switching stamps should place the picked stamp, got ${heldStampEmoji}`)
+  }
+  const heldStampBox = await heldStampNode.boundingBox()
+  if (!heldStampBox || heldStampBox.width <= quickStampBox.width + 8) {
+    throw new Error(
+      `Press-and-hold should grow the stamp before placing: quick=${JSON.stringify(quickStampBox)}, held=${JSON.stringify(heldStampBox)}`,
+    )
+  }
+
+  await page.keyboard.press('Escape')
+  await page.waitForFunction(() => !document.querySelector('.stamp-options-bar'))
+  for (let stampIndex = 0; stampIndex < 2; stampIndex += 1) {
+    await page.locator('.dom-node.markup-node[data-markup-kind="stamp"]').last().click()
+    await page.keyboard.press('Backspace')
+    await page.waitForFunction(
+      (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="stamp"]').length === count,
+      stampCountBefore + 1 - stampIndex,
+    )
+  }
+
   const secondNode = page.locator('.dom-node').nth(1)
   const visibleNodeCountBeforeOrganization = await page.locator('.dom-node').count()
   await firstNode.click()
@@ -2626,6 +3056,101 @@ try {
   await page.waitForFunction(() => document.querySelectorAll('.dom-node.selected').length === 1)
   if ((await page.locator('.canvas-controls').getByRole('button', { name: 'Fit selection' }).count()) !== 1) {
     throw new Error('Canvas zoom controls should switch to Fit selection when an object is selected')
+  }
+
+  await page.mouse.click(farBlankPoint.x, farBlankPoint.y)
+  await page.waitForFunction(() => document.querySelectorAll('.dom-node.selected').length === 0)
+  await page.keyboard.press('ControlOrMeta+a')
+  await page.waitForFunction(() => {
+    const rendered = document.querySelectorAll('.dom-node').length
+    return rendered > 0 && document.querySelectorAll('.dom-node.selected').length === rendered
+  })
+  await page.keyboard.press('Escape')
+  await page.waitForFunction(() => document.querySelectorAll('.dom-node.selected').length === 0)
+
+  const nodeCountBeforeCut = await page.locator('.dom-node').count()
+  await firstNode.click()
+  await page.waitForFunction(() => document.querySelectorAll('.dom-node.selected').length === 1)
+  await page.keyboard.press('ControlOrMeta+x')
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node').length === count - 1,
+    nodeCountBeforeCut,
+  )
+  await page.mouse.click(farBlankPoint.x, farBlankPoint.y, { button: 'right' })
+  await page.getByRole('menuitem', { name: /^Paste 1 item$/ }).click()
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node').length === count,
+    nodeCountBeforeCut,
+  )
+  await page.keyboard.press('ControlOrMeta+z')
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node').length === count - 1,
+    nodeCountBeforeCut,
+  )
+  await page.keyboard.press('ControlOrMeta+z')
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('.dom-node').length === count,
+    nodeCountBeforeCut,
+  )
+
+  await firstNode.click()
+  await page.keyboard.down('Shift')
+  await secondNode.click()
+  await page.keyboard.up('Shift')
+  await page.waitForFunction(() => document.querySelectorAll('.dom-node.selected').length === 2)
+  await page.keyboard.press('ControlOrMeta+g')
+  await page.mouse.click(farBlankPoint.x, farBlankPoint.y)
+  await page.waitForFunction(() => document.querySelectorAll('.dom-node.selected').length === 0)
+  await firstNode.click()
+  await page.waitForFunction(() => document.querySelectorAll('.dom-node.selected').length === 2)
+  await page.keyboard.press('ControlOrMeta+Shift+g')
+  await page.mouse.click(farBlankPoint.x, farBlankPoint.y)
+  await firstNode.click()
+  await page.waitForFunction(() => document.querySelectorAll('.dom-node.selected').length === 1)
+
+  const altResizeBoxBefore = await firstNode.boundingBox()
+  if (!altResizeBoxBefore) throw new Error('Missing node geometry before Alt centered resize')
+  const altResizeHandleBox = await firstNode.locator('.node-handle.se').boundingBox()
+  if (!altResizeHandleBox) throw new Error('Missing se resize handle for Alt centered resize')
+  await page.keyboard.down('Alt')
+  await page.mouse.move(
+    altResizeHandleBox.x + altResizeHandleBox.width / 2,
+    altResizeHandleBox.y + altResizeHandleBox.height / 2,
+  )
+  await page.mouse.down()
+  await page.mouse.move(
+    altResizeHandleBox.x + altResizeHandleBox.width / 2 + 30,
+    altResizeHandleBox.y + altResizeHandleBox.height / 2 + 30,
+    { steps: 4 },
+  )
+  await page.mouse.up()
+  await page.keyboard.up('Alt')
+  const altResizeBoxAfter = await firstNode.boundingBox()
+  if (
+    !altResizeBoxAfter ||
+    altResizeBoxAfter.width <= altResizeBoxBefore.width + 20 ||
+    !nearlyEqual(
+      altResizeBoxBefore.x + altResizeBoxBefore.width / 2,
+      altResizeBoxAfter.x + altResizeBoxAfter.width / 2,
+      3,
+    ) ||
+    !nearlyEqual(
+      altResizeBoxBefore.y + altResizeBoxBefore.height / 2,
+      altResizeBoxAfter.y + altResizeBoxAfter.height / 2,
+      3,
+    )
+  ) {
+    throw new Error(
+      `Alt corner resize should grow the node around its center: before=${JSON.stringify(altResizeBoxBefore)}, after=${JSON.stringify(altResizeBoxAfter)}`,
+    )
+  }
+  await page.keyboard.press('ControlOrMeta+z')
+  await wait(200)
+  const altResizeBoxRestored = await firstNode.boundingBox()
+  if (!altResizeBoxRestored || !nearlyEqual(altResizeBoxRestored.width, altResizeBoxBefore.width, 2)) {
+    throw new Error(
+      `Undo should restore geometry after Alt centered resize: before=${JSON.stringify(altResizeBoxBefore)}, restored=${JSON.stringify(altResizeBoxRestored)}`,
+    )
   }
 
   const firstNodeBoxForMenu = await firstNode.boundingBox()
@@ -3063,9 +3588,14 @@ try {
 
   textBox = await page.locator('.dom-node.text-node').last().boundingBox()
   if (!textBox) throw new Error('Missing selected text node for drag check')
-  await page.mouse.move(textBox.x + textBox.width / 2, textBox.y + textBox.height / 2)
+  // Use the upper-left text area so the floating bottom toolbar cannot intercept the drag on short viewports.
+  const textDragStart = {
+    x: textBox.x + Math.min(32, textBox.width / 2),
+    y: textBox.y + Math.min(28, textBox.height / 2),
+  }
+  await page.mouse.move(textDragStart.x, textDragStart.y)
   await page.mouse.down()
-  await page.mouse.move(textBox.x + textBox.width / 2 + 54, textBox.y + textBox.height / 2 + 32, { steps: 5 })
+  await page.mouse.move(textDragStart.x + 54, textDragStart.y + 32, { steps: 5 })
   await page.mouse.up()
   const movedTextBox = await page.locator('.dom-node.text-node').last().boundingBox()
   if (
@@ -3152,7 +3682,13 @@ try {
     )
   }
 
-  await page.locator('.dom-node.text-node').last().click({ button: 'right' })
+  const formattedTextBox = await page.locator('.dom-node.text-node').last().boundingBox()
+  if (!formattedTextBox) throw new Error('Missing formatted text node for context menu check')
+  await page.mouse.click(
+    formattedTextBox.x + Math.min(32, formattedTextBox.width / 2),
+    formattedTextBox.y + Math.min(28, formattedTextBox.height / 2),
+    { button: 'right' },
+  )
   for (const action of [
     'Edit text',
     'Copy text',
@@ -3323,6 +3859,111 @@ try {
   }
   await page.keyboard.press('Escape')
   await page.waitForSelector('.selection-quick-toolbar-menu', { state: 'detached' })
+  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Arrange' }).click()
+  if (!(await page.locator('.selection-quick-toolbar-menu').evaluate((menu) => menu.classList.contains('icon-grid-menu')))) {
+    throw new Error('Multi-selection Arrange quick menu should render as an icon grid')
+  }
+  for (const action of ['Arrange row', 'Arrange column', 'Arrange grid', 'Tidy selection']) {
+    if ((await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: action }).count()) !== 1) {
+      throw new Error(`Multi-selection Arrange quick menu should expose ${action}`)
+    }
+  }
+  const arrangeTargetsBefore = await page.locator('.dom-node.selected:not([data-node-type="markup"])').evaluateAll((nodes) =>
+    nodes.map((node) => {
+      const rect = node.getBoundingClientRect()
+      return {
+        id: node.getAttribute('data-node-id'),
+        left: rect.left,
+        top: rect.top,
+      }
+    }),
+  )
+  await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Arrange row' }).click()
+  await page.waitForSelector('.selection-quick-toolbar-menu', { state: 'detached' })
+  const arrangeTargetsAfter = await page.locator('.dom-node.selected:not([data-node-type="markup"])').evaluateAll((nodes) =>
+    nodes.map((node) => {
+      const rect = node.getBoundingClientRect()
+      return {
+        id: node.getAttribute('data-node-id'),
+        left: rect.left,
+        top: rect.top,
+      }
+    }),
+  )
+  const movedArrangeTargets = arrangeTargetsAfter.filter((after) => {
+    const before = arrangeTargetsBefore.find((item) => item.id === after.id)
+    return before && (Math.abs(before.left - after.left) > 2 || Math.abs(before.top - after.top) > 2)
+  })
+  const arrangedRowCenters = await page.locator('.dom-node.selected:not([data-node-type="markup"])').evaluateAll((nodes) =>
+    nodes.map((node) => {
+      const rect = node.getBoundingClientRect()
+      return rect.top + rect.height / 2
+    }),
+  )
+  if (
+    arrangedRowCenters.length < 2 ||
+    movedArrangeTargets.length < 1 ||
+    Math.max(...arrangedRowCenters) - Math.min(...arrangedRowCenters) > 2 ||
+    (await page.locator('.selection-quick-toolbar').count()) !== 1
+  ) {
+    throw new Error(
+      `Arrange row should move selected objects, keep a multi-selection, and align object centers: centers=${JSON.stringify(
+        arrangedRowCenters,
+      )}, before=${JSON.stringify(arrangeTargetsBefore)}, after=${JSON.stringify(arrangeTargetsAfter)}`,
+    )
+  }
+  const selectedRowGapsBefore = await page.locator('.dom-node.selected:not([data-node-type="markup"])').evaluateAll((nodes) => {
+    const sorted = nodes
+      .map((node) => {
+        const rect = node.getBoundingClientRect()
+        return { id: node.getAttribute('data-node-id'), left: rect.left, right: rect.right }
+      })
+      .sort((a, b) => a.left - b.left)
+
+    return sorted.slice(0, -1).map((node, index) => sorted[index + 1].left - node.right)
+  })
+  const spacingHandle = page.locator('.selection-spacing-handle.horizontal').first()
+  if ((await spacingHandle.count()) !== 1 || selectedRowGapsBefore.length < 1) {
+    throw new Error(`Arrange row should expose a draggable horizontal spacing handle: gaps=${JSON.stringify(selectedRowGapsBefore)}`)
+  }
+  const spacingHandleLabelHidden = await spacingHandle.locator('span').evaluate((label) => getComputedStyle(label).opacity === '0')
+  if (!spacingHandleLabelHidden) {
+    throw new Error('Smart spacing labels should stay hidden until hover or drag')
+  }
+  const spacingHandleBox = await spacingHandle.boundingBox()
+  if (!spacingHandleBox) throw new Error('Missing spacing handle bounds')
+  const spacingHandleElement = await spacingHandle.elementHandle()
+  if (!spacingHandleElement) throw new Error('Missing spacing handle element')
+  await page.mouse.move(spacingHandleBox.x + spacingHandleBox.width / 2, spacingHandleBox.y + spacingHandleBox.height / 2)
+  await page.waitForFunction((element) => {
+    const label = element.querySelector('span')
+    return label ? Number(getComputedStyle(label).opacity) > 0.5 : false
+  }, spacingHandleElement)
+  await page.mouse.down()
+  await page.mouse.move(spacingHandleBox.x + spacingHandleBox.width / 2 + 48, spacingHandleBox.y + spacingHandleBox.height / 2, {
+    steps: 6,
+  })
+  await page.mouse.up()
+  const selectedRowGapsAfter = await page.locator('.dom-node.selected:not([data-node-type="markup"])').evaluateAll((nodes) => {
+    const sorted = nodes
+      .map((node) => {
+        const rect = node.getBoundingClientRect()
+        return { id: node.getAttribute('data-node-id'), left: rect.left, right: rect.right }
+      })
+      .sort((a, b) => a.left - b.left)
+
+    return sorted.slice(0, -1).map((node, index) => sorted[index + 1].left - node.right)
+  })
+  const gapSpreadAfterDrag = Math.max(...selectedRowGapsAfter) - Math.min(...selectedRowGapsAfter)
+  if (selectedRowGapsAfter.some((gap) => gap < selectedRowGapsBefore[0] + 24) || gapSpreadAfterDrag > 2) {
+    throw new Error(
+      `Dragging the horizontal spacing handle should create a larger uniform smart-selection gap: before=${JSON.stringify(
+        selectedRowGapsBefore,
+      )}, after=${JSON.stringify(selectedRowGapsAfter)}`,
+    )
+  }
+  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+Z' : 'Control+Z')
+  await page.waitForSelector('.selection-quick-toolbar')
 
   if ((await page.locator('.node-handle').count()) !== 0) {
     throw new Error('Multi-selection should hide individual node resize handles')

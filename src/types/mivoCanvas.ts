@@ -17,6 +17,7 @@ export type ToolId =
   | 'markup-brush'
   | 'markup-note'
   | 'brush'
+  | 'stamp'
   | 'sticker'
   | 'comment'
   | 'image'
@@ -51,14 +52,28 @@ export type CanvasNodeType =
 export type CanvasAssetNodeType = Extract<CanvasNodeType, 'image' | 'markdown' | 'pdf' | 'video'>
 export type SectionBorderStyle = 'solid' | 'dashed'
 export type SectionLockMode = 'all' | 'background'
-export type MarkupKind = 'arrow' | 'line' | 'rect' | 'ellipse' | 'brush' | 'note'
+export type MarkupKind = 'arrow' | 'line' | 'rect' | 'ellipse' | 'brush' | 'note' | 'stamp'
+export type CanvasStampKind =
+  | 'plus-one'
+  | 'heart'
+  | 'star'
+  | 'check'
+  | 'question'
+  | 'eyes'
+  | 'celebrate'
+  | 'thumbs-down'
 export type MarkupStrokeStyle = 'solid' | 'dashed'
 export type MarkdownDisplayMode = 'full' | 'preview'
 export type ConnectorAnchor = 'center' | 'top' | 'right' | 'bottom' | 'left'
 export type MarkupPoint = {
   x: number
   y: number
+  /** Stylus pressure in [0, 1]; only recorded for pen input so mouse strokes keep simulated pressure. */
+  pressure?: number
 }
+export type MarkupBrushKind = 'marker' | 'highlighter'
+/** Brush tool modes: the two stroke kinds plus the FigJam-style whole-stroke eraser. */
+export type BrushToolMode = MarkupBrushKind | 'eraser'
 export type ConnectorBinding = {
   nodeId: string
   anchor: ConnectorAnchor
@@ -113,6 +128,94 @@ export type ImageCrop = {
   height: number
 }
 
+export type CanvasNodeTransform = {
+  x: number
+  y: number
+  width: number
+  height: number
+  rotation: number
+}
+
+export type CanvasNodeSolidFill = {
+  id: string
+  kind: 'solid'
+  color: string
+  opacity: number
+  visible: boolean
+}
+
+export type CanvasNodeImageFill = {
+  id: string
+  kind: 'image'
+  assetUrl: string
+  opacity: number
+  visible: boolean
+  scaleMode: 'fill' | 'fit' | 'crop' | 'tile'
+}
+
+export type CanvasNodeFill = CanvasNodeSolidFill | CanvasNodeImageFill
+
+export type CanvasNodeStroke = {
+  id: string
+  color: string
+  width: number
+  style: MarkupStrokeStyle
+  opacity: number
+  visible: boolean
+}
+
+export type CanvasNodeEffect =
+  | {
+      id: string
+      kind: 'shadow'
+      color: string
+      x: number
+      y: number
+      blur: number
+      spread: number
+      opacity: number
+      visible: boolean
+    }
+  | {
+      id: string
+      kind: 'blur'
+      radius: number
+      visible: boolean
+    }
+
+export type CanvasNodeLayout = {
+  mode: 'none' | 'auto'
+  direction?: 'horizontal' | 'vertical'
+  gap?: number
+  padding?: {
+    top: number
+    right: number
+    bottom: number
+    left: number
+  }
+}
+
+export type CanvasNodeConstraints = {
+  horizontal?: 'left' | 'right' | 'left-right' | 'center' | 'scale'
+  vertical?: 'top' | 'bottom' | 'top-bottom' | 'center' | 'scale'
+}
+
+export type CanvasNodeAssetRef = {
+  url: string
+  mimeType?: string
+  originalName?: string
+  sizeBytes?: number
+}
+
+export type CanvasNodeRelations = {
+  parentIds?: string[]
+  sectionId?: string
+  targetNodeId?: string
+  connectorStart?: ConnectorBinding
+  connectorEnd?: ConnectorBinding
+  aiWorkflow?: CanvasAiWorkflow
+}
+
 export type MivoCanvasNode = {
   id: string
   type: CanvasNodeType
@@ -121,6 +224,14 @@ export type MivoCanvasNode = {
   y: number
   width: number
   height: number
+  transform?: CanvasNodeTransform
+  fills?: CanvasNodeFill[]
+  strokes?: CanvasNodeStroke[]
+  effects?: CanvasNodeEffect[]
+  layout?: CanvasNodeLayout
+  constraints?: CanvasNodeConstraints
+  asset?: CanvasNodeAssetRef
+  relations?: CanvasNodeRelations
   text?: string
   fontSize?: number
   textColor?: string
@@ -128,6 +239,8 @@ export type MivoCanvasNode = {
   textAlign?: 'left' | 'center' | 'right'
   textAutoWidth?: boolean
   markupKind?: MarkupKind
+  markupBrushKind?: MarkupBrushKind
+  markupStampKind?: CanvasStampKind
   markupPoints?: MarkupPoint[]
   markupStrokeColor?: string
   markupFillColor?: string
@@ -195,6 +308,8 @@ export type AiCanvasContextNode = {
   sectionId?: string
   targetNodeId?: string
   markupKind?: MarkupKind
+  markupBrushKind?: MarkupBrushKind
+  markupStampKind?: CanvasStampKind
   markupPoints?: MarkupPoint[]
   markupStrokeColor?: string
   markupFillColor?: string
@@ -238,7 +353,7 @@ export type CanvasTask = {
 }
 
 export type MivoCanvasSnapshot = {
-  version: 1
+  version: 2
   sceneId: CanvasId
   nodes: MivoCanvasNode[]
   edges: CanvasEdge[]

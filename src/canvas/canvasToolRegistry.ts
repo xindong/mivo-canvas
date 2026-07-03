@@ -36,7 +36,6 @@ export const markupShapeToolIds = [
   'markup-line',
   'markup-rect',
   'markup-ellipse',
-  'markup-brush',
 ] as const satisfies ToolId[]
 
 export type MarkupShapeToolId = (typeof markupShapeToolIds)[number]
@@ -79,13 +78,22 @@ export const canvasToolRegistry: CanvasToolDefinition[] = [
     icon: PanelTop,
   },
   {
+    id: 'markup-brush',
+    label: 'Brush',
+    shortcut: 'P',
+    keyboardShortcuts: ['p'],
+    group: 'create',
+    runtimeTool: 'markup',
+    dividerBefore: true,
+    icon: Pencil,
+  },
+  {
     id: 'markup-arrow',
     label: 'Arrow',
     shortcut: 'A',
     keyboardShortcuts: ['a'],
     group: 'create',
     runtimeTool: 'markup',
-    dividerBefore: true,
     icon: ArrowUpRight,
   },
   {
@@ -116,15 +124,6 @@ export const canvasToolRegistry: CanvasToolDefinition[] = [
     icon: Circle,
   },
   {
-    id: 'markup-brush',
-    label: 'Brush',
-    shortcut: 'P',
-    keyboardShortcuts: ['p'],
-    group: 'create',
-    runtimeTool: 'markup',
-    icon: Pencil,
-  },
-  {
     id: 'markup-note',
     label: 'Markup note',
     shortcut: 'N',
@@ -134,11 +133,12 @@ export const canvasToolRegistry: CanvasToolDefinition[] = [
     icon: StickyNote,
   },
   {
-    id: 'sticker',
-    label: 'Sticker',
+    id: 'stamp',
+    label: 'Stamp',
+    shortcut: 'S',
+    keyboardShortcuts: ['s'],
     group: 'create',
-    runtimeTool: 'select',
-    enabled: false,
+    runtimeTool: 'stamp',
     icon: SmilePlus,
   },
   {

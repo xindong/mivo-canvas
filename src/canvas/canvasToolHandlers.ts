@@ -14,6 +14,7 @@ export type CanvasToolHandlerContext = {
   beginTextBox: (event: CanvasSurfacePointerEvent) => void
   beginFrameBox: (event: CanvasSurfacePointerEvent) => void
   beginMarkupBox: (event: CanvasSurfacePointerEvent) => void
+  beginStampPlacement: (event: CanvasSurfacePointerEvent) => void
   beginTextEdit: (nodeId: string, event: CanvasNodePointerEvent) => boolean
 }
 
@@ -128,10 +129,30 @@ const markupToolHandler: CanvasToolHandler = {
   },
 }
 
+const stampToolHandler: CanvasToolHandler = {
+  id: 'stamp',
+  onCanvasPointerDown: (event, context) => {
+    if (event.button !== 0) return
+
+    context.beginStampPlacement(event)
+  },
+  onNodePointerDown: (_nodeId, event, context) => {
+    if (event.button !== 0) return
+
+    // FigJam stamps land on top of objects, so node hits stamp instead of moving.
+    event.stopPropagation()
+    context.beginStampPlacement(event)
+  },
+  onResizeHandlePointerDown: (_nodeId, _corner, event) => {
+    event.stopPropagation()
+  },
+}
+
 export const canvasToolHandlers: Record<RuntimeCanvasTool, CanvasToolHandler> = {
   select: selectToolHandler,
   hand: handToolHandler,
   text: textToolHandler,
   frame: frameToolHandler,
   markup: markupToolHandler,
+  stamp: stampToolHandler,
 }
