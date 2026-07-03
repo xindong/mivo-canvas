@@ -2,7 +2,6 @@ import { ChevronDown, ChevronUp } from 'lucide-react'
 import { useState } from 'react'
 import { useChatStore } from '../../store/chatStore'
 import type { ChatMessage } from '../../store/chatStore'
-import { RatioIcon } from './RatioPopover'
 import { qualityDisplayLabel } from './chatDisplayLabels'
 
 type EnhanceParamCardProps = {
@@ -17,8 +16,6 @@ export function EnhanceParamCard({ message }: EnhanceParamCardProps) {
   const context = message.generationContext
   const effectiveRatio = context?.imgRatio || enhance?.imgRatio
   const effectiveQuality = context?.quality || enhance?.quality
-  const ratioManuallySet = Boolean(context?.requestedImgRatio && context.requestedImgRatio !== 'auto')
-  const qualityManuallySet = Boolean(context?.requestedQuality && context.requestedQuality !== 'auto')
   const agentSuggestionChanged = Boolean(
     enhance &&
       ((enhance.imgRatio && effectiveRatio && enhance.imgRatio !== effectiveRatio) ||
@@ -71,25 +68,6 @@ export function EnhanceParamCard({ message }: EnhanceParamCardProps) {
                     <p className="chat-agent-suggestion">Agent 建议：{agentSuggestionText}</p>
                   )}
                 </div>
-              )}
-            </div>
-          )}
-
-          {(enhance.scene || effectiveRatio || effectiveQuality) && (
-            <div className="chat-param-chips">
-              {enhance.scene && <span className="chat-chip chat-chip-scene">{enhance.scene}</span>}
-              {effectiveRatio && (
-                <span className="chat-chip chat-chip-ratio">
-                  <RatioIcon ratio={effectiveRatio} />
-                  <span>{effectiveRatio}</span>
-                  {ratioManuallySet && <span className="chat-chip-manual">手动</span>}
-                </span>
-              )}
-              {effectiveQuality && (
-                <span className="chat-chip chat-chip-quality">
-                  {qualityDisplayLabel(effectiveQuality)}
-                  {qualityManuallySet && <span className="chat-chip-manual">手动</span>}
-                </span>
               )}
             </div>
           )}

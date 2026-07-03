@@ -1209,6 +1209,22 @@ try {
   if ((await page.locator('.selection-quick-toolbar').count()) !== 0) {
     throw new Error('Markdown selection should not show a download-only quick toolbar')
   }
+  // R6: 底部 TASKS 条移除后画布下沿降低、工具条下移，可能与底部节点重叠遮挡点击。
+  // space+drag 上移画布 140px，使视频节点脱离工具条遮挡（viewport 偏移持续，后续 video dblclick 同样受益）。
+  {
+    const shellBox = await page.locator('.canvas-shell').boundingBox()
+    if (shellBox) {
+      const startX = shellBox.x + shellBox.width / 2
+      const startY = shellBox.y + shellBox.height / 2
+      await page.keyboard.down('Space')
+      await page.mouse.move(startX, startY)
+      await page.mouse.down()
+      await page.mouse.move(startX, startY - 140, { steps: 8 })
+      await page.mouse.up()
+      await page.keyboard.up('Space')
+      await page.waitForTimeout(150)
+    }
+  }
   await page.locator('.dom-node.video-node').click({ position: { x: 20, y: 20 } })
   if ((await page.locator('.selection-quick-toolbar').count()) !== 0) {
     throw new Error('Video selection should not show a download-only quick toolbar')
@@ -3785,13 +3801,16 @@ try {
   const paramCardVisible = await page.locator('.chat-param-card').isVisible()
   if (!paramCardVisible) throw new Error('Enhance param card should be visible after generation')
   const paramCard = page.locator('.chat-param-card').last()
+  // R6 SC-e: 参数卡不再渲染 scene chip 与比例/质量 chips 行（composer 底部按钮已可见，卡内不重复）；保留「预计较慢」提示
   const paramCardText = await paramCard.innerText()
-  if (!paramCardText.includes('16:9') || !paramCardText.includes('高') || !paramCardText.includes('预计较慢')) {
-    throw new Error(`Enhance param card should show effective high 16:9 values and slow hint: ${JSON.stringify(paramCardText)}`)
+  if (!paramCardText.includes('预计较慢')) {
+    throw new Error(`Enhance param card should keep the slow hint: ${JSON.stringify(paramCardText)}`)
   }
-  const manualChipCount = await paramCard.locator('.chat-chip-manual').count()
-  if (manualChipCount < 2) {
-    throw new Error(`Enhance param card should mark manual ratio and quality overrides, got ${manualChipCount}`)
+  const sceneChipCount = await paramCard.locator('.chat-chip-scene').count()
+  const ratioChipCount = await paramCard.locator('.chat-chip-ratio').count()
+  const qualityChipCount = await paramCard.locator('.chat-chip-quality').count()
+  if (sceneChipCount + ratioChipCount + qualityChipCount !== 0) {
+    throw new Error(`Enhance param card should not render scene/ratio/quality chips, got ${JSON.stringify({ sceneChipCount, ratioChipCount, qualityChipCount })}`)
   }
   await paramCard.getByRole('button', { name: '深度思考' }).click()
   const reasoningText = await paramCard.locator('.chat-param-fold-body').innerText()
