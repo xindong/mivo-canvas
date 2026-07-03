@@ -80,25 +80,27 @@ jobs:
     name: secret scan (gitleaks)
     runs-on: ubuntu-latest
     steps:
-      # fetch-depth: 0 取全历史 —— gitleaks 扫提交历史,不只扫工作区。
-      # PR 事件:gitleaks-action 自动扫 PR commit 范围(相对 base)。
-      # push main:扫 push 的 commit 范围(全量历史由 nightly/定期深度扫描覆盖,本 job 卡增量)。
+      # fetch-depth: 0 取全历史 —— gitleaks 扫提交历史,且 PR commit range 需 base SHA 可达
       - name: Checkout (full history for gitleaks)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # gitleaks-action@v2:kirozeng 是个人账号,无需 GITLEAKS_LICENSE。
-      # .gitleaks.toml 用 [extend] useDefault=true 叠加默认规则(sk-/ghp_/AKIA 等),
+      # gitleaks via docker(lead 口径:action 有坑则退 docker)。
+      # 坑:gitleaks-action@v2 基于 Node 20,在 Node 24 runner 上 ScanPullRequest 抛异常
+      # (run 28675083469)。docker 用官方 image,行为与本地 gitleaks CLI 一致。
+      # .gitleaks.toml:[extend] useDefault=true 叠加默认规则(sk-/ghp_/AKIA 等)
       # + [allowlist] 豁免占位/fixture(<redacted>/test-token/e2e-token/.env.example)。
       # 真实 key 形态绝不豁免。job 失败即 CI 红,与其他 job 同级卡口。
-      # 注:v2 基于 Node 20,2026-09-16 后 deprecation;届时升 gitleaks-action@v3(Node 24)。
-      - name: gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_CONFIG: .gitleaks.toml
-          # 不在 PR 上发评论(避免噪音);job summary 仍显示发现;不上传 sarif artifact(省额度)
-          GITLEAKS_ENABLE_COMMENTS: "false"
-          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
-          GITLEAKS_ENABLE_SUMMARY: "true"
+      # PR:扫 PR commit 范围(base..head);push main:扫全量历史(--all)。
+      - name: gitleaks detect
+        run: |
+          set -e
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            LOG_OPTS="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+          else
+            LOG_OPTS="--all"
+          fi
+          echo "gitleaks log-opts: $LOG_OPTS"
+          docker run --rm -v "$PWD":/src gitleaks/gitleaks:latest \
+            detect --source /src --config /src/.gitleaks.toml --log-opts "$LOG_OPTS" --no-banner --redact=100
