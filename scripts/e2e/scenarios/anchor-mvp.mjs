@@ -1,3 +1,5 @@
+import { doneTaskView } from '../api-mocks.mjs'
+
 // scripts/e2e/scenarios/anchor-mvp.mjs
 // P2-D2 — Anchor MVP DOM closed-loop (roadmap §7 组 D). Mock upstream; verify the
 // 「point/box + instruction → generate → tracked」paradigm end-to-end.
@@ -38,32 +40,39 @@ export const runAnchorMvpScenario = async (context) => {
   let anchorGeneratePrompt = null
   const captureAndFulfill = async (route) => {
     const req = route.request()
-    try {
-      const ct = req.headers()['content-type'] || ''
-      if (ct.includes('application/json')) {
-        anchorGeneratePrompt = req.postDataJSON()?.prompt || null
-      } else if (ct.includes('multipart/form-data')) {
-        const formRequest = new Request('http://127.0.0.1/api/mivo/edit', {
+    const method = req.method()
+    const url = req.url()
+    if (method === 'POST' && url.includes('/api/mivo/tasks/generate')) {
+      try { anchorGeneratePrompt = req.postDataJSON()?.prompt || null } catch { anchorGeneratePrompt = null }
+      await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ taskId: 'task-e2e' }) })
+      return
+    }
+    if (method === 'POST' && url.includes('/api/mivo/tasks/edit')) {
+      try {
+        const formRequest = new Request('http://127.0.0.1/api/mivo/tasks/edit', {
           method: 'POST',
           headers: req.headers(),
           body: req.postDataBuffer(),
         })
         const formData = await formRequest.formData()
         anchorGeneratePrompt = String(formData.get('prompt') || '')
+      } catch {
+        anchorGeneratePrompt = null
       }
-    } catch {
-      anchorGeneratePrompt = null
+      await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ taskId: 'task-e2e' }) })
+      return
     }
-    await route.fulfill({
-      status: 200,
-      contentType: 'application/json',
-      body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }),
-    })
+    if (method === 'GET') {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(doneTaskView([{ b64: generatedImageB64 }])) })
+      return
+    }
+    if (method === 'DELETE') {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ id: 'task-e2e', status: 'canceled' }) })
+      return
+    }
+    await route.continue()
   }
-  await page.unroute('**/api/mivo/generate')
-  await page.unroute('**/api/mivo/edit')
-  await page.route('**/api/mivo/generate', captureAndFulfill)
-  await page.route('**/api/mivo/edit', captureAndFulfill)
+  await page.route('**/api/mivo/tasks/**', captureAndFulfill)
 
   // Select an image node so the overlay + generate can target it.
   const anchorImageNodeId = await page.evaluate(async (moduleSpec) => {
@@ -158,6 +167,5 @@ export const runAnchorMvpScenario = async (context) => {
   }, { spec, id: anchorImageNodeId })
   if (!anchorRoundtripOk) throw new Error('Anchor MVP: experimentalAnchors should survive snapshot roundtrip (deep equal)')
 
-  await page.unroute('**/api/mivo/generate')
-  await page.unroute('**/api/mivo/edit')
+  await page.unroute('**/api/mivo/tasks/**', captureAndFulfill)
 }

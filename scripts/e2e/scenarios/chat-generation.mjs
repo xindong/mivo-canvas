@@ -1,3 +1,5 @@
+import { failedTaskView, doneTaskView } from '../api-mocks.mjs'
+
 export const runChatGenerationScenario = async (context) => {
   const {
     Buffer,
@@ -33,13 +35,13 @@ export const runChatGenerationScenario = async (context) => {
       }),
     })
   })
-  await page.unroute('**/api/mivo/generate')
-  await page.route('**/api/mivo/generate', async (route) => {
+  await page.unroute('**/api/mivo/tasks/generate')
+  await page.route('**/api/mivo/tasks/generate', async (route) => {
     chatBranchGenerateRequests += 1
     await route.fulfill({
-      status: 200,
+      status: 202,
       contentType: 'application/json',
-      body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }),
+      body: JSON.stringify({ taskId: 'task-e2e' }),
     })
   })
   await page.evaluate(async (moduleSpec) => {
@@ -78,14 +80,28 @@ export const runChatGenerationScenario = async (context) => {
       }),
     })
   })
-  await page.unroute('**/api/mivo/generate')
-  await page.route('**/api/mivo/generate', async (route) => {
+  // Restore default /tasks/generate (202 {taskId}) for chat-based generation; the
+  // default GET /tasks/:id progressive mock drives real server-side progress.
+  await page.unroute('**/api/mivo/tasks/generate')
+  await page.route('**/api/mivo/tasks/generate', async (route) => {
     await route.fulfill({
-      status: 200,
+      status: 202,
       contentType: 'application/json',
-      body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }),
+      body: JSON.stringify({ taskId: 'task-e2e' }),
     })
   })
+
+  // P2-C1b: subscribe to canvasStore tasks to capture real server-side progress
+  // samples (must be monotonic, non-hardcoded — assert ≥3 strictly increasing).
+  await page.evaluate(async (moduleSpec) => {
+    const { useCanvasStore } = await import(moduleSpec)
+    window.__mivoProgressSamples = []
+    let last = -1
+    window.__mivoProgressUnsub = useCanvasStore.subscribe((s) => {
+      const t = s.tasks[0]
+      if (t && t.progress !== last) { window.__mivoProgressSamples.push(t.progress); last = t.progress }
+    })
+  }, await canvasStoreSpec())
 
   // Chat-based generation: select node, fill composer, send
   await page.locator(`[data-node-id="${firstNodeId}"]`).click()
@@ -105,6 +121,22 @@ export const runChatGenerationScenario = async (context) => {
   const generatedCount = await page.locator('.dom-node').count()
   if (generatedCount < countBeforeGenerate + 1) {
     throw new Error(`Expected at least ${countBeforeGenerate + 1} nodes after chat generation result, got ${generatedCount}`)
+  }
+
+  // P2-C1b: assert ≥3 strictly increasing, non-hardcoded progress samples from
+  // the tasks API (10→30→60→100 — not the old hardcoded 20→100 jump).
+  const progressSamples = await page.evaluate(() => {
+    if (typeof window.__mivoProgressUnsub === 'function') window.__mivoProgressUnsub()
+    return window.__mivoProgressSamples || []
+  })
+  const strictlyIncreasingSamples = progressSamples.filter((v, i, a) => i === 0 || v > a[i - 1])
+  if (strictlyIncreasingSamples.length < 3) {
+    throw new Error(`Expected ≥3 strictly increasing progress samples from the tasks API, got ${JSON.stringify(progressSamples)}`)
+  }
+  // Sanity: the old hardcoded sequence was 20→100 (2 samples). The real sequence
+  // must include intermediate values the server reported, not just start+terminal.
+  if (progressSamples.length < 3 || progressSamples.at(-1) !== 100) {
+    throw new Error(`Progress samples should end at 100 and have intermediate values, got ${JSON.stringify(progressSamples)}`)
   }
   const besideResult = await page.locator('.dom-node[data-ai-kind="result"][data-ai-operation="beside-generation"]').last().evaluate((node) => ({
     id: node.getAttribute('data-node-id'),
@@ -176,10 +208,10 @@ export const runChatGenerationScenario = async (context) => {
 
   // NB3: gemini 4:3 → client sends {model, imgRatio:"4:3"}（gemini 专属比例，gpt 无；走 mivo 平台通道）
   let capturedGeminiPayload = null
-  await page.unroute('**/api/mivo/generate')
-  await page.route('**/api/mivo/generate', async (route) => {
+  await page.unroute('**/api/mivo/tasks/generate')
+  await page.route('**/api/mivo/tasks/generate', async (route) => {
     try { capturedGeminiPayload = JSON.parse(route.request().postData() || '{}') } catch { capturedGeminiPayload = {} }
-    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }) })
+    await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ taskId: 'task-e2e' }) })
   })
   // Deselect canvas nodes so generate (not edit) is called
   await page.evaluate(async (moduleSpec) => {
@@ -231,9 +263,9 @@ export const runChatGenerationScenario = async (context) => {
   if (capturedGeminiPayload?.model !== 'gemini-3-pro-image' || capturedGeminiPayload?.imgRatio !== '4:3') {
     throw new Error(`gemini 4:3 request should carry model and imgRatio, got: ${JSON.stringify(capturedGeminiPayload)}`)
   }
-  await page.unroute('**/api/mivo/generate')
-  await page.route('**/api/mivo/generate', async (route) => {
-    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }) })
+  await page.unroute('**/api/mivo/tasks/generate')
+  await page.route('**/api/mivo/tasks/generate', async (route) => {
+    await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ taskId: 'task-e2e' }) })
   })
   await page.evaluate(async () => {
     const resource = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('chatStore.ts'))
@@ -270,20 +302,32 @@ export const runChatGenerationScenario = async (context) => {
       variantsNodes: state.canvases.variants?.nodes.length || 0,
     }
   }, await canvasStoreSpec())
-  let releaseSceneScopedGenerate
+  let releaseSceneScopedPoll
   let sceneScopedGenerateSeen = false
-  const sceneScopedGenerateHandler = async (route) => {
-    sceneScopedGenerateSeen = true
-    await new Promise((resolve) => {
-      releaseSceneScopedGenerate = resolve
-    })
-    await route.fulfill({
-      status: 200,
-      contentType: 'application/json',
-      body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }),
-    })
+  const sceneScopedTasksHandler = async (route) => {
+    const method = route.request().method()
+    const url = route.request().url()
+    if (method === 'POST' && url.includes('/api/mivo/tasks/generate')) {
+      sceneScopedGenerateSeen = true
+      await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ taskId: 'task-e2e' }) })
+      return
+    }
+    if (method === 'GET') {
+      // Hold the poll until the scene switch happens, then complete — this keeps
+      // the generation in-flight across the scene switch (the regression's point).
+      await new Promise((resolve) => {
+        releaseSceneScopedPoll = resolve
+      })
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(doneTaskView([{ b64: generatedImageB64 }])),
+      })
+      return
+    }
+    await route.continue()
   }
-  await page.route('**/api/mivo/generate', sceneScopedGenerateHandler)
+  await page.route('**/api/mivo/tasks/**', sceneScopedTasksHandler)
   try {
     await page.evaluate(async (moduleSpec) => {
       const { useCanvasStore } = await import(moduleSpec)
@@ -294,15 +338,15 @@ export const runChatGenerationScenario = async (context) => {
     await page.locator('.chat-composer-textarea').press('Enter')
     const startedAt = Date.now()
     while (!sceneScopedGenerateSeen && Date.now() - startedAt < 5000) await wait(25)
-    if (!sceneScopedGenerateSeen) throw new Error('Scene-scoped regression should reach /api/mivo/generate')
+    if (!sceneScopedGenerateSeen) throw new Error('Scene-scoped regression should reach POST /api/mivo/tasks/generate')
     await page.evaluate(async (moduleSpec) => {
       const { useCanvasStore } = await import(moduleSpec)
       useCanvasStore.getState().loadScene('variants')
     }, await canvasStoreSpec())
-    releaseSceneScopedGenerate()
+    releaseSceneScopedPoll()
     await waitForChatIdle()
   } finally {
-    await page.unroute('**/api/mivo/generate', sceneScopedGenerateHandler)
+    await page.unroute('**/api/mivo/tasks/**', sceneScopedTasksHandler)
   }
   const sceneScopedAfter = await page.evaluate(async ({ canvasModuleSpec, chatModuleSpec }) => {
     const { useCanvasStore } = await import(canvasModuleSpec)
@@ -345,24 +389,27 @@ export const runChatGenerationScenario = async (context) => {
   const timeoutRetryGenerateRequests = []
   let timeoutRetryGenerateCount = 0
   const timeoutRetryGenerateHandler = async (route) => {
-    try { timeoutRetryGenerateRequests.push(JSON.parse(route.request().postData() || '{}')) } catch { timeoutRetryGenerateRequests.push({}) }
-    timeoutRetryGenerateCount += 1
-    if (timeoutRetryGenerateCount === 1) {
-      await route.fulfill({
-        status: 504,
-        contentType: 'application/json',
-        body: JSON.stringify({ error: 'Image API request timed out' }),
-      })
+    const method = route.request().method()
+    const url = route.request().url()
+    if (method === 'POST' && url.includes('/api/mivo/tasks/generate')) {
+      try { timeoutRetryGenerateRequests.push(JSON.parse(route.request().postData() || '{}')) } catch { timeoutRetryGenerateRequests.push({}) }
+      timeoutRetryGenerateCount += 1
+      await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ taskId: 'task-e2e' }) })
       return
     }
-    await route.fulfill({
-      status: 200,
-      contentType: 'application/json',
-      body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }),
-    })
+    if (method === 'GET') {
+      // 1st generation: upstream timeout (high quality → offers 中质量重试).
+      // 2nd generation (medium retry): success.
+      if (timeoutRetryGenerateCount === 1) {
+        await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(failedTaskView('上游生成超时，可降低质量重试')) })
+      } else {
+        await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(doneTaskView([{ b64: generatedImageB64 }])) })
+      }
+      return
+    }
+    await route.continue()
   }
-  await page.unroute('**/api/mivo/generate')
-  await page.route('**/api/mivo/generate', timeoutRetryGenerateHandler)
+  await page.route('**/api/mivo/tasks/**', timeoutRetryGenerateHandler)
   try {
     await page.evaluate(async ({ canvasModuleSpec, chatModuleSpec }) => {
       const { useCanvasStore } = await import(canvasModuleSpec)
@@ -401,10 +448,7 @@ export const runChatGenerationScenario = async (context) => {
       throw new Error(`Medium retry should lower only quality: ${JSON.stringify(timeoutRetryGenerateRequests)}`)
     }
   } finally {
-    await page.unroute('**/api/mivo/generate', timeoutRetryGenerateHandler)
-    await page.route('**/api/mivo/generate', async (route) => {
-      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }) })
-    })
+    await page.unroute('**/api/mivo/tasks/**', timeoutRetryGenerateHandler)
     await page.evaluate(async () => {
       const resource = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('chatStore.ts'))
       const moduleSpec = resource ? new URL(resource).pathname + new URL(resource).search : '/src/store/chatStore.ts'
@@ -417,14 +461,19 @@ export const runChatGenerationScenario = async (context) => {
   // ④b Regression: gemini medium 超时 → 不出现降质按钮、文案为"稍后重试/换比例"（Step 4b 条件化）
   {
     const mediumTimeoutHandler = async (route) => {
-      await route.fulfill({
-        status: 504,
-        contentType: 'application/json',
-        body: JSON.stringify({ error: 'Image API request timed out' }),
-      })
+      const method = route.request().method()
+      const url = route.request().url()
+      if (method === 'POST' && url.includes('/api/mivo/tasks/generate')) {
+        await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ taskId: 'task-e2e' }) })
+        return
+      }
+      if (method === 'GET') {
+        await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(failedTaskView('上游生成超时，可稍后重试、换比例或减少参考图')) })
+        return
+      }
+      await route.continue()
     }
-    await page.unroute('**/api/mivo/generate')
-    await page.route('**/api/mivo/generate', mediumTimeoutHandler)
+    await page.route('**/api/mivo/tasks/**', mediumTimeoutHandler)
     try {
       await page.evaluate(async ({ canvasModuleSpec, chatModuleSpec }) => {
         const { useCanvasStore } = await import(canvasModuleSpec)
@@ -448,10 +497,7 @@ export const runChatGenerationScenario = async (context) => {
         throw new Error(`Medium-quality timeout should NOT show a downgrade button, got ${mediumRetryBtnCount}`)
       }
     } finally {
-      await page.unroute('**/api/mivo/generate', mediumTimeoutHandler)
-      await page.route('**/api/mivo/generate', async (route) => {
-        await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }) })
-      })
+      await page.unroute('**/api/mivo/tasks/**', mediumTimeoutHandler)
       // 清掉本用例留下的 error 消息，避免后续 retry-edit 用例的 waitForSelector('.chat-error-text') 命中残留
       await page.evaluate(async () => {
         const canvasResource = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('canvasStore.ts'))
@@ -471,11 +517,20 @@ export const runChatGenerationScenario = async (context) => {
   {
     const retry504Requests = []
     const retry504Handler = async (route) => {
-      try { retry504Requests.push(JSON.parse(route.request().postData() || '{}')) } catch { retry504Requests.push({}) }
-      await route.fulfill({ status: 504, contentType: 'application/json', body: JSON.stringify({ error: 'Image API request timed out' }) })
+      const method = route.request().method()
+      const url = route.request().url()
+      if (method === 'POST' && url.includes('/api/mivo/tasks/generate')) {
+        try { retry504Requests.push(JSON.parse(route.request().postData() || '{}')) } catch { retry504Requests.push({}) }
+        await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ taskId: 'task-e2e' }) })
+        return
+      }
+      if (method === 'GET') {
+        await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(failedTaskView('上游生成超时，可稍后重试、换比例或减少参考图')) })
+        return
+      }
+      await route.continue()
     }
-    await page.unroute('**/api/mivo/generate')
-    await page.route('**/api/mivo/generate', retry504Handler)
+    await page.route('**/api/mivo/tasks/**', retry504Handler)
     try {
       await page.evaluate(async ({ canvasModuleSpec, chatModuleSpec }) => {
         const { useCanvasStore } = await import(canvasModuleSpec)
@@ -513,10 +568,7 @@ export const runChatGenerationScenario = async (context) => {
         throw new Error(`medium retry should keep quality=medium, got ${JSON.stringify(lastRequest.quality)}`)
       }
     } finally {
-      await page.unroute('**/api/mivo/generate', retry504Handler)
-      await page.route('**/api/mivo/generate', async (route) => {
-        await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }) })
-      })
+      await page.unroute('**/api/mivo/tasks/**', retry504Handler)
       await page.evaluate(async () => {
         const canvasResource = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('canvasStore.ts'))
         const chatResource = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('chatStore.ts'))
@@ -535,39 +587,47 @@ export const runChatGenerationScenario = async (context) => {
   const retryEditRequests = []
   let retryEditCount = 0
   const retryEditHandler = async (route) => {
-    const request = route.request()
-    try {
-      const formRequest = new Request('http://127.0.0.1/api/mivo/edit', {
-        method: 'POST',
-        headers: request.headers(),
-        body: request.postDataBuffer(),
-      })
-      const formData = await formRequest.formData()
-      retryEditRequests.push({
-        prompt: String(formData.get('prompt') || ''),
-        fileKeys: ['image', 'mask', 'reference[]', 'reference']
-          .map((key) => `${key}:${formData.getAll(key).length}`)
-          .filter((entry) => !entry.endsWith(':0')),
-      })
-    } catch (error) {
-      retryEditRequests.push({
-        prompt: '',
-        fileKeys: [],
-        parseError: error instanceof Error ? error.message : 'Unable to inspect edit request',
-      })
-    }
-    retryEditCount += 1
-    if (retryEditCount === 1) {
-      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [] }) })
+    const method = route.request().method()
+    const url = route.request().url()
+    if (method === 'POST' && url.includes('/api/mivo/tasks/edit')) {
+      const request = route.request()
+      try {
+        const formRequest = new Request('http://127.0.0.1/api/mivo/tasks/edit', {
+          method: 'POST',
+          headers: request.headers(),
+          body: request.postDataBuffer(),
+        })
+        const formData = await formRequest.formData()
+        retryEditRequests.push({
+          prompt: String(formData.get('prompt') || ''),
+          fileKeys: ['image', 'mask', 'reference[]', 'reference']
+            .map((key) => `${key}:${formData.getAll(key).length}`)
+            .filter((entry) => !entry.endsWith(':0')),
+        })
+      } catch (error) {
+        retryEditRequests.push({
+          prompt: '',
+          fileKeys: [],
+          parseError: error instanceof Error ? error.message : 'Unable to inspect edit request',
+        })
+      }
+      retryEditCount += 1
+      await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ taskId: 'task-e2e' }) })
       return
     }
-    await route.fulfill({
-      status: 200,
-      contentType: 'application/json',
-      body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }),
-    })
+    if (method === 'GET') {
+      // 1st attempt: done but empty images → commit throws → error (retry shown).
+      // 2nd attempt (retry): done with a real image.
+      if (retryEditCount === 1) {
+        await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(doneTaskView([])) })
+      } else {
+        await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(doneTaskView([{ b64: generatedImageB64 }])) })
+      }
+      return
+    }
+    await route.continue()
   }
-  await page.route('**/api/mivo/edit', retryEditHandler)
+  await page.route('**/api/mivo/tasks/**', retryEditHandler)
   try {
     await page.evaluate(async (moduleSpec) => {
       const { useCanvasStore } = await import(moduleSpec)
@@ -594,7 +654,98 @@ export const runChatGenerationScenario = async (context) => {
       throw new Error(`Retry should replay edit with the original reference image: ${JSON.stringify(retryEditRequests)}`)
     }
   } finally {
-    await page.unroute('**/api/mivo/edit', retryEditHandler)
+    await page.unroute('**/api/mivo/tasks/**', retryEditHandler)
+  }
+
+  // P2-C1b: cancel mid-flight — task=canceled, no result node committed, DELETE
+  // /tasks/:id issued, and polling stops after DELETE.
+  {
+    let cancelPostSeen = false
+    let cancelDeleteSeen = false
+    let getBeforeDelete = 0
+    let getAfterDelete = 0
+    const cancelHandler = async (route) => {
+      const method = route.request().method()
+      const url = route.request().url()
+      if (method === 'POST' && url.includes('/api/mivo/tasks/generate')) {
+        cancelPostSeen = true
+        await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ taskId: 'task-e2e' }) })
+        return
+      }
+      if (method === 'DELETE') {
+        cancelDeleteSeen = true
+        await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ id: 'task-e2e', status: 'canceled' }) })
+        return
+      }
+      if (method === 'GET') {
+        if (cancelDeleteSeen) getAfterDelete += 1
+        else getBeforeDelete += 1
+        // Stay running so the generation stays in-flight until the client cancels.
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ id: 'task-e2e', kind: 'generate', status: 'running', progress: 40, stage: 'poll', requestId: 'e2e-cancel', model: 'gpt-image-2' }),
+        })
+        return
+      }
+      await route.continue()
+    }
+    await page.route('**/api/mivo/tasks/**', cancelHandler)
+    try {
+      await page.evaluate(async (moduleSpec) => {
+        const { useCanvasStore } = await import(moduleSpec)
+        useCanvasStore.getState().selectNode(undefined)
+      }, await canvasStoreSpec())
+      await page.locator('.chat-composer-textarea').fill('cancel mid-flight test')
+      await page.locator('.chat-composer-textarea').press('Enter')
+      // Wait until the generation is in-flight: POST seen AND at least one GET poll
+      // landed (the GET only happens after the POST returned 202, so serverTaskId is
+      // set by then — canceling mid-poll exercises the DELETE path, not the pre-submit
+      // short-circuit).
+      const inFlightDeadline = Date.now() + 5000
+      while (!(cancelPostSeen && getBeforeDelete > 0) && Date.now() < inFlightDeadline) {
+        await new Promise((r) => setTimeout(r, 50))
+      }
+      if (!cancelPostSeen) throw new Error('Cancel test: generation POST /tasks/generate not seen')
+      if (getBeforeDelete === 0) throw new Error('Cancel test: generation did not start polling (GET /tasks/:id not seen)')
+      await page.evaluate(async () => {
+        const resource = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('chatStore.ts'))
+        const moduleSpec = resource ? new URL(resource).pathname + new URL(resource).search : '/src/store/chatStore.ts'
+        const { useChatStore } = await import(moduleSpec)
+        useChatStore.getState().cancelGeneration()
+      })
+      await waitForChatIdle()
+      // Allow a brief moment for any stray poll to land, then assert no GET after DELETE.
+      await new Promise((r) => setTimeout(r, 200))
+      const cancelState = await page.evaluate(async (moduleSpec) => {
+        const { useCanvasStore } = await import(moduleSpec)
+        const s = useCanvasStore.getState()
+        return { tasks: s.tasks.map((t) => ({ id: t.id, status: t.status, nodeIds: t.nodeIds })) }
+      }, await canvasStoreSpec())
+      const canceledTask = cancelState.tasks.find((t) => t.status === 'canceled')
+      if (!canceledTask) throw new Error(`Cancel should leave a canceled task, got ${JSON.stringify(cancelState.tasks)}`)
+      // A canceled task must never have committed result nodeIds (cancel short-circuits
+      // before commitGenerationResult). The slot node chatStore creates upfront is fine —
+      // it's not a result, so we check nodeIds, not total node count.
+      if (canceledTask.nodeIds.length !== 0) {
+        throw new Error(`Cancel must not commit result nodeIds, got ${JSON.stringify(canceledTask.nodeIds)}`)
+      }
+      if (!cancelDeleteSeen) throw new Error('Cancel should issue DELETE /tasks/:id')
+      if (getAfterDelete > 0) {
+        throw new Error(`Poll should stop after DELETE; got ${getAfterDelete} GET(s) after DELETE`)
+      }
+    } finally {
+      await page.unroute('**/api/mivo/tasks/**', cancelHandler)
+      await page.evaluate(async () => {
+        const canvasResource = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('canvasStore.ts'))
+        const chatResource = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('chatStore.ts'))
+        const canvasModuleSpec = canvasResource ? new URL(canvasResource).pathname + new URL(canvasResource).search : '/src/store/canvasStore.ts'
+        const chatModuleSpec = chatResource ? new URL(chatResource).pathname + new URL(chatResource).search : '/src/store/chatStore.ts'
+        const { useCanvasStore } = await import(canvasModuleSpec)
+        const { useChatStore } = await import(chatModuleSpec)
+        useChatStore.getState().clearScene(useCanvasStore.getState().sceneId)
+      })
+    }
   }
 
   const workflowCount = await page.evaluate(async (moduleSpec) => {

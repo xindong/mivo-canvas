@@ -376,6 +376,10 @@ export type CanvasTask = {
   label: string
   status: 'running' | 'queued' | 'failed' | 'done' | 'canceled'
   progress: number
+  // P2-C1b: server-side pipeline stage from GET /tasks/:id (submit|upload|poll|
+  // download|request|done|failed|canceled). Optional — legacy/mock tasks
+  // (variations, annotation) don't track stage. Not asserted by A1 contracts.
+  stage?: string
   nodeIds: string[]
 }
 

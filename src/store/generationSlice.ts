@@ -1,10 +1,19 @@
 import type {
   CanvasEdge,
+  CanvasId,
   CanvasTask,
   MivoCanvasNode,
 } from '../types/mivoCanvas'
 import type { SliceCreator } from './canvasStore'
-import { MivoImageRequestError, assetBlobForNode, editMivoImage, generateMivoImage } from '../lib/mivoImageClient'
+import { MivoImageRequestError, assetBlobForNode } from '../lib/mivoImageClient'
+import {
+  cancelTask,
+  kindForFailedTask,
+  pollTask,
+  submitEditTask,
+  submitGenerationTask,
+  taskPollIntervalMs,
+} from '../lib/mivoTaskClient'
 import { createAiResultNode } from '../model/aiCanvasCommands'
 import { chooseAdjacentPlacement } from './aiCanvasWorkflow'
 import { logCanvas, warnCanvas } from './canvasStore'
@@ -52,6 +61,95 @@ const isCanceledGenerationError = (error: unknown, signal?: AbortSignal) =>
   Boolean(signal?.aborted) ||
   (error instanceof MivoImageRequestError && error.kind === 'canceled') ||
   (error instanceof Error && error.message.includes('已取消'))
+
+// P2-C1b: one-time idempotency key per generation call. Retries (new action
+// invocation) get a new key → new server task. Same-call re-submission (e.g. a
+// transient POST timeout retried by the client) would reuse the key and dedupe
+// server-side within the process lifetime. We don't currently retry in-action,
+// so this is forward-compatible plumbing, not a retry loop.
+const newIdempotencyKey = (): string => {
+  const crypto = globalThis.crypto as Crypto | undefined
+  if (crypto?.randomUUID) return crypto.randomUUID()
+  return `mivo-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+}
+
+// Sleep that rejects with MivoImageRequestError(kind='canceled') if the signal
+// aborts mid-wait — so the poll loop's await sleep() surfaces cancel promptly
+// without waiting for the next GET.
+const sleep = (ms: number, signal?: AbortSignal): Promise<void> =>
+  new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new MivoImageRequestError('图片请求已取消。', 'canceled'))
+      return
+    }
+    const onAbort = () => {
+      window.clearTimeout(id)
+      reject(new MivoImageRequestError('图片请求已取消。', 'canceled'))
+    }
+    const id = window.setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+
+// P2-C1b: poll loop shared by the 3 real generation actions. Submits already
+// happened (serverTaskId in hand). Upserts the running task with the server's
+// real progress/stage on each non-terminal poll. Returns nodeIds on done (after
+// onResult commits). Throws MivoImageRequestError on failed/canceled/unknown —
+// the caller's catch sets the terminal task state and rethrows.
+//
+// Terminal-state mapping (per server/contracts/tasks-async.md):
+//   done     → return nodeIds (caller sets doneTask)
+//   failed   → throw MivoImageRequestError(message, kindForFailedTask(message))
+//              so chatStore.errorInfoForChat still classifies timeouts (怪癖 6)
+//   canceled → throw canceled (caller sets canceledTask, never commits)
+//   unknown  → throw 'task expired, retry' (server restarted; never commits)
+const runTaskPollLoop = async (
+  set: Parameters<SliceCreator>[0],
+  args: {
+    serverTaskId: string
+    signal: AbortSignal | undefined
+    localTask: CanvasTask
+    sceneId: CanvasId
+    onResult: (images: Array<{ b64: string }>) => Promise<string[]>
+  },
+): Promise<string[]> => {
+  const patchRunning = (progress: number, stage: string) =>
+    set((current) => {
+      const doc = current.canvases[args.sceneId]
+      if (!doc) return {}
+      return patchCanvasDocument(current, args.sceneId, {
+        tasks: upsertTask(doc.tasks, { ...args.localTask, progress, stage, status: 'running' }),
+      })
+    })
+
+  for (;;) {
+    if (args.signal?.aborted) {
+      throw new MivoImageRequestError('图片请求已取消。', 'canceled')
+    }
+    const view = await pollTask(args.serverTaskId, args.signal)
+
+    if (view.status === 'running' || view.status === 'pending') {
+      patchRunning(view.progress, view.stage)
+      await sleep(taskPollIntervalMs(), args.signal)
+      continue
+    }
+    if (view.status === 'done') {
+      const images = view.result?.images ?? []
+      return args.onResult(images)
+    }
+    if (view.status === 'failed') {
+      const message = view.error || 'Generation failed'
+      throw new MivoImageRequestError(message, kindForFailedTask(message))
+    }
+    if (view.status === 'canceled') {
+      throw new MivoImageRequestError('图片请求已取消。', 'canceled')
+    }
+    // unknown — server restarted / task evicted. Never commit; surface retry.
+    throw new MivoImageRequestError('任务已失效（服务端重启），请重试。', 'upstream-error')
+  }
+}
 
 export const createGenerationSlice: SliceCreator = (set, get) => ({
   tasks: defaultDocument.tasks,
@@ -135,7 +233,7 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
       id: taskId,
       label: `${operationLabel}: ${source.title}`,
       status: 'running',
-      progress: 20,
+      progress: 0,
       nodeIds: [],
     }
 
@@ -145,26 +243,35 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
       return patchCanvasDocument(current, targetSceneId, { tasks: upsertTask(targetDocument.tasks, runningTask) })
     })
 
+    let serverTaskId: string | undefined
     try {
+      if (options.signal?.aborted) throw new MivoImageRequestError('图片请求已取消。', 'canceled')
       const image = await assetBlobForNode(source)
-      const response = await editMivoImage({
+      serverTaskId = await submitEditTask({
         image,
         reference: options.referenceFiles,
         prompt: resultPrompt,
         imgRatio: options.imgRatio || '1:1',
         quality: options.quality || 'medium',
         model,
+        idempotencyKey: newIdempotencyKey(),
         signal: options.signal,
       })
-      const nodeIds = await get().commitGenerationResult({
+      const nodeIds = await runTaskPollLoop(set, {
+        serverTaskId,
+        signal: options.signal,
+        localTask: runningTask,
         sceneId: targetSceneId,
-        sourceNodeId: source.id,
-        resultImages: response.images,
-        prompt: resultPrompt,
-        model,
-        kind: edgeTypeForOperation(operation),
-        taskId,
-        createDerivationEdge: options.createDerivationEdge,
+        onResult: async (images) => get().commitGenerationResult({
+          sceneId: targetSceneId,
+          sourceNodeId: source.id,
+          resultImages: images,
+          prompt: resultPrompt,
+          model,
+          kind: edgeTypeForOperation(operation),
+          taskId,
+          createDerivationEdge: options.createDerivationEdge,
+        }),
       })
       set((current) => {
         const targetDocument = current.canvases[targetSceneId]
@@ -175,8 +282,11 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
       })
       return nodeIds
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Image edit failed'
       const canceled = isCanceledGenerationError(error, options.signal)
+      if (canceled && serverTaskId) {
+        await cancelTask(serverTaskId)
+      }
+      const message = error instanceof Error ? error.message : 'Image edit failed'
       set((current) => {
         const targetDocument = current.canvases[targetSceneId]
         if (!targetDocument) return {}
@@ -213,7 +323,7 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
       id: taskId,
       label: `旁边生成：${source.title}`,
       status: 'running',
-      progress: 20,
+      progress: 0,
       nodeIds: [],
     }
 
@@ -223,37 +333,50 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
       return patchCanvasDocument(current, targetSceneId, { tasks: upsertTask(targetDocument.tasks, runningTask) })
     })
 
+    let serverTaskId: string | undefined
     try {
+      if (options.signal?.aborted) throw new MivoImageRequestError('图片请求已取消。', 'canceled')
       const referenceFiles = options.referenceFiles || []
       const sourceImage = source.type === 'image' && source.assetUrl ? await assetBlobForNode(source) : undefined
       const editImage = sourceImage || referenceFiles[0]
-      const response = editImage
-        ? await editMivoImage({
-            image: editImage,
-            reference: sourceImage ? referenceFiles : referenceFiles.slice(1),
-            prompt: resultPrompt,
-            imgRatio: options.imgRatio || '1:1',
-            quality: options.quality || 'medium',
-            model,
-            signal: options.signal,
-          })
-        : await generateMivoImage({
-            prompt: resultPrompt,
-            imgRatio: options.imgRatio || '1:1',
-            quality: options.quality || 'medium',
-            n: 1,
-            model,
-            signal: options.signal,
-          })
-      const nodeIds = await get().commitGenerationResult({
+      const idempotencyKey = newIdempotencyKey()
+      if (editImage) {
+        serverTaskId = await submitEditTask({
+          image: editImage,
+          reference: sourceImage ? referenceFiles : referenceFiles.slice(1),
+          prompt: resultPrompt,
+          imgRatio: options.imgRatio || '1:1',
+          quality: options.quality || 'medium',
+          model,
+          idempotencyKey,
+          signal: options.signal,
+        })
+      } else {
+        serverTaskId = await submitGenerationTask({
+          prompt: resultPrompt,
+          imgRatio: options.imgRatio || '1:1',
+          quality: options.quality || 'medium',
+          n: 1,
+          model,
+          idempotencyKey,
+          signal: options.signal,
+        })
+      }
+      const nodeIds = await runTaskPollLoop(set, {
+        serverTaskId,
+        signal: options.signal,
+        localTask: runningTask,
         sceneId: targetSceneId,
-        sourceNodeId: source.id,
-        resultImages: response.images,
-        prompt: resultPrompt,
-        model,
-        kind: 'generate',
-        taskId,
-        createDerivationEdge: options.createDerivationEdge,
+        onResult: async (images) => get().commitGenerationResult({
+          sceneId: targetSceneId,
+          sourceNodeId: source.id,
+          resultImages: images,
+          prompt: resultPrompt,
+          model,
+          kind: 'generate',
+          taskId,
+          createDerivationEdge: options.createDerivationEdge,
+        }),
       })
       set((current) => {
         const targetDocument = current.canvases[targetSceneId]
@@ -264,8 +387,11 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
       })
       return nodeIds
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Generation failed'
       const canceled = isCanceledGenerationError(error, options.signal)
+      if (canceled && serverTaskId) {
+        await cancelTask(serverTaskId)
+      }
+      const message = error instanceof Error ? error.message : 'Generation failed'
       set((current) => {
         const targetDocument = current.canvases[targetSceneId]
         if (!targetDocument) return {}
@@ -301,7 +427,7 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
       id: taskId,
       label: `生成到槽位：${slot.title}`,
       status: 'running',
-      progress: 20,
+      progress: 0,
       nodeIds: [],
     }
 
@@ -333,36 +459,49 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
       return patchCanvasDocument(current, targetSceneId, { nodes, tasks: upsertTask(targetDocument.tasks, runningTask) })
     })
 
+    let serverTaskId: string | undefined
     try {
+      if (options.signal?.aborted) throw new MivoImageRequestError('图片请求已取消。', 'canceled')
       const referenceFiles = options.referenceFiles || []
-      const response = referenceFiles[0]
-        ? await editMivoImage({
-            image: referenceFiles[0],
-            reference: referenceFiles.slice(1),
-            prompt: resultPrompt,
-            imgRatio: options.imgRatio || '1:1',
-            quality: options.quality || 'medium',
-            model,
-            signal: options.signal,
-          })
-        : await generateMivoImage({
-            prompt: resultPrompt,
-            imgRatio: options.imgRatio || '1:1',
-            quality: options.quality || 'medium',
-            n: 1,
-            model,
-            signal: options.signal,
-          })
-      const nodeIds = await get().commitGenerationResult({
+      const idempotencyKey = newIdempotencyKey()
+      if (referenceFiles[0]) {
+        serverTaskId = await submitEditTask({
+          image: referenceFiles[0],
+          reference: referenceFiles.slice(1),
+          prompt: resultPrompt,
+          imgRatio: options.imgRatio || '1:1',
+          quality: options.quality || 'medium',
+          model,
+          idempotencyKey,
+          signal: options.signal,
+        })
+      } else {
+        serverTaskId = await submitGenerationTask({
+          prompt: resultPrompt,
+          imgRatio: options.imgRatio || '1:1',
+          quality: options.quality || 'medium',
+          n: 1,
+          model,
+          idempotencyKey,
+          signal: options.signal,
+        })
+      }
+      const nodeIds = await runTaskPollLoop(set, {
+        serverTaskId,
+        signal: options.signal,
+        localTask: runningTask,
         sceneId: targetSceneId,
-        sourceNodeId: slot.id,
-        resultImages: response.images,
-        prompt: resultPrompt,
-        model,
-        kind: 'generate',
-        taskId,
-        placement: 'right',
-        createDerivationEdge: options.createDerivationEdge,
+        onResult: async (images) => get().commitGenerationResult({
+          sceneId: targetSceneId,
+          sourceNodeId: slot.id,
+          resultImages: images,
+          prompt: resultPrompt,
+          model,
+          kind: 'generate',
+          taskId,
+          placement: 'right',
+          createDerivationEdge: options.createDerivationEdge,
+        }),
       })
       set((current) => {
         const targetDocument = current.canvases[targetSceneId]
@@ -385,8 +524,11 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
       })
       return nodeIds
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Generation failed'
       const canceled = isCanceledGenerationError(error, options.signal)
+      if (canceled && serverTaskId) {
+        await cancelTask(serverTaskId)
+      }
+      const message = error instanceof Error ? error.message : 'Generation failed'
       set((current) => {
         const targetDocument = current.canvases[targetSceneId]
         if (!targetDocument) return {}

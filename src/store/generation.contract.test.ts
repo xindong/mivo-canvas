@@ -22,19 +22,32 @@ vi.mock('./remoteDebugReporter', () => ({
   reportRemoteDebugEntry: () => {},
 }))
 
-// Mock the network layer (the stable capability boundary). The 3 real generation actions call
-// assetBlobForNode + editMivoImage/generateMivoImage; controlling these lets us exercise the
-// task state machine (running → done/canceled/failed) without HTTP. vi.hoisted keeps the mock
-// fns available to the vi.mock factory (which is hoisted above top-level declarations).
+// P2-C1b: the 3 real generation actions now go through the async tasks API
+// (submitEditTask/submitGenerationTask → pollTask → cancelTask) instead of the
+// sync editMivoImage/generateMivoImage. The mock boundary moved from
+// mivoImageClient to mivoTaskClient; assetBlobForNode (still in mivoImageClient)
+// stays wired. Controlling submit/poll lets us exercise the task state machine
+// (running → done/canceled/failed) without HTTP. vi.hoisted keeps the mock fns
+// available to the vi.mock factory (which is hoisted above top-level declarations).
 const mocks = vi.hoisted(() => ({
-  editMivoImage: vi.fn(),
-  generateMivoImage: vi.fn(),
+  submitEditTask: vi.fn(),
+  submitGenerationTask: vi.fn(),
+  pollTask: vi.fn(),
+  cancelTask: vi.fn(),
   assetBlobForNode: vi.fn(),
 }))
 
+vi.mock('../lib/mivoTaskClient', () => ({
+  submitEditTask: mocks.submitEditTask,
+  submitGenerationTask: mocks.submitGenerationTask,
+  pollTask: mocks.pollTask,
+  cancelTask: mocks.cancelTask,
+  taskPollIntervalMs: () => 0,
+  kindForFailedTask: (error: string) =>
+    /\btimeout\b|超时|timed[\s-]?out/i.test(error) ? 'upstream-timeout' : 'upstream-error',
+}))
+
 vi.mock('../lib/mivoImageClient', () => ({
-  editMivoImage: mocks.editMivoImage,
-  generateMivoImage: mocks.generateMivoImage,
   assetBlobForNode: mocks.assetBlobForNode,
   MivoImageRequestError: class MivoImageRequestError extends Error {
     kind: string
@@ -60,7 +73,37 @@ function committedImage() {
   }
 }
 
-const { editMivoImage: mockEditMivoImage, generateMivoImage: mockGenerateMivoImage, assetBlobForNode: mockAssetBlobForNode } = mocks
+const {
+  submitEditTask: mockSubmitEditTask,
+  submitGenerationTask: mockSubmitGenerationTask,
+  pollTask: mockPollTask,
+  cancelTask: mockCancelTask,
+  assetBlobForNode: mockAssetBlobForNode,
+} = mocks
+
+// A done-view payload the poll loop will resolve with on success. progress=100 +
+// stage='done' + result.images matches the server's terminal shape.
+const doneView = (images = [committedImage()]) => ({
+  id: 't1',
+  kind: 'edit' as const,
+  status: 'done' as const,
+  progress: 100,
+  stage: 'done',
+  requestId: 'req-1',
+  model: 'gpt-image-2',
+  result: { images },
+})
+
+const failedView = (error: string) => ({
+  id: 't1',
+  kind: 'edit' as const,
+  status: 'failed' as const,
+  progress: 50,
+  stage: 'failed',
+  requestId: 'req-1',
+  model: 'gpt-image-2',
+  error,
+})
 
 const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
   id: 'n1',
@@ -122,8 +165,10 @@ const taskFor = (id: string) => useCanvasStore.getState().tasks.find((t) => t.id
 
 beforeEach(() => {
   useCanvasStore.setState({ ...baseState } as never, true)
-  mockEditMivoImage.mockReset().mockResolvedValue({ images: [committedImage()] })
-  mockGenerateMivoImage.mockReset().mockResolvedValue({ images: [committedImage()] })
+  mockSubmitEditTask.mockReset().mockResolvedValue('t1')
+  mockSubmitGenerationTask.mockReset().mockResolvedValue('t1')
+  mockPollTask.mockReset().mockResolvedValue(doneView())
+  mockCancelTask.mockReset().mockResolvedValue(undefined)
   mockAssetBlobForNode.mockReset().mockResolvedValue(new Blob(['mock-source-bytes'], { type: 'image/png' }))
 })
 
@@ -194,7 +239,6 @@ describe('contract: generateImageEdit orchestration (mock network)', () => {
     seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
     const controller = new AbortController()
     controller.abort()
-    mockEditMivoImage.mockRejectedValueOnce(new Error('aborted'))
 
     await expect(
       useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat', { signal: controller.signal }),
@@ -204,11 +248,13 @@ describe('contract: generateImageEdit orchestration (mock network)', () => {
     expect(tasks).toHaveLength(1)
     expect(tasks[0].status).toBe('canceled')
     expect(useCanvasStore.getState().nodes).toHaveLength(1) // only the source node, no result
+    // Pre-abort short-circuits before submit — no server task is created.
+    expect(mockSubmitEditTask).not.toHaveBeenCalled()
   })
 
   it('failure: a non-abort error marks the task failed and rejects', async () => {
     seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
-    mockEditMivoImage.mockRejectedValueOnce(new Error('upstream 500'))
+    mockPollTask.mockResolvedValueOnce(failedView('upstream 500'))
 
     await expect(
       useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat'),
@@ -224,7 +270,7 @@ describe('contract: generateImageEdit orchestration (mock network)', () => {
     seed(seedCanvas('character-flow', []))
     const nodeIds = await useCanvasStore.getState().generateImageEdit(undefined, 'prompt-edit', 'a cat')
     expect(nodeIds).toEqual([])
-    expect(mockEditMivoImage).not.toHaveBeenCalled()
+    expect(mockSubmitEditTask).not.toHaveBeenCalled()
   })
 
   it('cross-scene: sceneId option commits to the target scene, not the current one', async () => {
@@ -262,12 +308,12 @@ describe('contract: generateBesideNode / generateIntoAiSlot orchestration', () =
     expect(useCanvasStore.getState().nodes.map((n) => n.id)).toContain(nodeIds[0])
   })
 
-  it('generateIntoAiSlot: success marks the task done and commits a result node (uses generateMivoImage for a slot)', async () => {
+  it('generateIntoAiSlot: success marks the task done and commits a result node (uses submitGenerationTask for a slot)', async () => {
     seed(seedCanvas('character-flow', [aiSlotNode({ id: 'slot-1' })]))
     const nodeIds = await useCanvasStore.getState().generateIntoAiSlot('slot-1', 'fill the slot')
     expect(nodeIds.length).toBeGreaterThan(0)
     expect(useCanvasStore.getState().tasks[0].status).toBe('done')
-    expect(mockGenerateMivoImage).toHaveBeenCalled()
+    expect(mockSubmitGenerationTask).toHaveBeenCalled()
   })
 })
 
@@ -290,7 +336,6 @@ describe('contract: task state machine (generation actions)', () => {
     seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
     const controller = new AbortController()
     controller.abort()
-    mockEditMivoImage.mockRejectedValueOnce(new Error('aborted'))
     await expect(
       useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat', { signal: controller.signal }),
     ).rejects.toThrow()
@@ -299,8 +344,10 @@ describe('contract: task state machine (generation actions)', () => {
 
   it('running → failed on error', async () => {
     seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
-    mockEditMivoImage.mockRejectedValueOnce(new Error('boom'))
-    await expect(useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat')).rejects.toThrow()
+    mockPollTask.mockResolvedValueOnce(failedView('boom'))
+    await expect(
+      useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat'),
+    ).rejects.toThrow(/boom/)
     expect(useCanvasStore.getState().tasks[0].status).toBe('failed')
   })
 
