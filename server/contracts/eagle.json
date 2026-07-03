@@ -1,4 +1,17 @@
 {
+  "_p1cImplementation": {
+    "intentionalChanges": [
+      "D5: upstream fetch (requestJson) now has a default 10s timeout (MIVO_EAGLE_TIMEOUT_MS overrides). Timeout surfaces as the same offline shape (502 / connected:false) as a connection failure, just bounded in time. Tested with a slow server + 50ms timeout."
+    ],
+    "preservedQuirks": [
+      "D4: error shapes remain inconsistent — status=JSON, folders/tags/assets=502 plain text, file=404 plain text, most without Content-Type. Not normalized (no new envelope).",
+      "D6: no method guard — app.all returns the same response for any method.",
+      "SSRF boundary preserved: host fixed to MIVO_EAGLE_API_URL; all routes hardcoded strings."
+    ],
+    "frameworkDiffs": [
+      "D4 content-type: @hono/node-server forces `text/plain; charset=UTF-8` on no-Content-Type responses (server.js:382). BFF real-HTTP 502/404 plain-text → content-type=text/plain; charset=UTF-8 (dev: null). In-memory app.request preserves null. Framework diff, not a shape change."
+    ]
+  },
   "endpoint": "/api/mivo/eagle/* (status | folders | tags | assets | assets/:id/thumbnail | assets/:id/file)",
   "summary": "Local Eagle app proxy. Host is fixed to MIVO_EAGLE_API_URL (default 127.0.0.1:41595); routes hardcoded (SSRF bounded by construction). NO upstream timeout. Error shapes are INCONSISTENT across sub-routes.",
   "sourceFile": "vite.config.ts",

@@ -330,6 +330,19 @@ const LIVE_CASES: Array<{ name: string; run: (base: string) => Promise<Capture> 
   },
 ]
 
+// Optional filter for running a subset of live cases — e.g. against a BFF that
+// only implements some endpoint groups (P1-c is staged by group). Setting
+// MIVO_CONTRACT_LIVE_FILTER=assets runs only local-assets/eagle/pinterest cases;
+// any other value is a plain substring match on the case name. Empty/unset = all.
+const LIVE_FILTER = process.env.MIVO_CONTRACT_LIVE_FILTER ?? ''
+const liveFilterMatch = (name: string): boolean => {
+  if (!LIVE_FILTER) return true
+  if (LIVE_FILTER === 'assets') {
+    return name.includes('local-assets') || name.includes('eagle') || name.includes('pinterest')
+  }
+  return name.includes(LIVE_FILTER)
+}
+
 describe.skipIf(!runLive)('server/contracts — live (target = dev middleware or MIVO_CONTRACT_TARGET_URL)', () => {
   let base: string
   let server: { close: () => Promise<void> } | undefined
@@ -358,7 +371,8 @@ describe.skipIf(!runLive)('server/contracts — live (target = dev middleware or
     })
     await s.listen()
     server = s
-    base = `http://127.0.0.1:${s.httpServer.address().port}`
+    const addr = s.httpServer?.address()
+    base = `http://127.0.0.1:${typeof addr === 'object' && addr ? addr.port : 0}`
   })
 
   afterAll(async () => {
@@ -367,7 +381,7 @@ describe.skipIf(!runLive)('server/contracts — live (target = dev middleware or
     if (debugLogDir) await rm(debugLogDir, { recursive: true, force: true })
   })
 
-  for (const c of LIVE_CASES) {
+  for (const c of LIVE_CASES.filter((c) => liveFilterMatch(c.name))) {
     it(`${c.name} matches baseline invariant`, async () => {
       const live = await c.run(base)
       const inv = INVARIANTS[c.name]

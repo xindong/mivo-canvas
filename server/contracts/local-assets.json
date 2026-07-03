@@ -1,4 +1,16 @@
 {
+  "_p1cImplementation": {
+    "intentionalChanges": [
+      "D2: serving guard upgraded from lexical path.resolve to fs.realpath (symlink-safe); 403 response shape preserved; lexical pre-check kept so /etc/passwd and ../x still return 403 (not 404); symlink-escape test added (root-local symlink → outside file must 403)."
+    ],
+    "preservedQuirks": [
+      "D3: 403/404/500 are plain text; route code sets NO Content-Type (matches dev).",
+      "D6: no method guard — app.all returns the same 200 for POST/PUT/DELETE as GET."
+    ],
+    "frameworkDiffs": [
+      "D3 content-type: @hono/node-server (dist/server.js:382 `res['content-type'] ??= 'text/plain; charset=UTF-8'`) forces a default Content-Type on responses that have none. BFF real-HTTP 403/404/500 therefore arrive as content-type=text/plain; charset=UTF-8 (dev middleware: null). Hono c.body(Buffer) at the in-memory layer preserves null (app.request tests pass). Live-suite 403 case against BFF fails on this header only — framework diff, not a route shape change; cannot be removed without patching @hono/node-server."
+    ]
+  },
   "endpoint": "/api/mivo/local-assets and /api/mivo/local-assets/:id",
   "summary": "Local filesystem image browser. List scans configured root dir(s) for image files; file stream serves a single asset by base64url id. Path-traversal guard is LEXICAL (path.resolve), not symlink-safe realpath.",
   "sourceFile": "vite.config.ts",
