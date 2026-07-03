@@ -37,6 +37,7 @@ process.env.MIVO_ASSET_DIR = assetDir
 process.env.MIVO_DEBUG_LOG_DIR = debugLogDir
 process.env.MIVO_DEBUG_VIEW_TOKEN = debugToken
 process.env.MIVO_EAGLE_API_URL = 'http://127.0.0.1:59999' // nothing listening → offline shapes
+process.env.MIVO_API_MODE = 'dev-middleware'
 // MIVO_IMAGE_API_KEY / MIVO_LLM_API_KEY / MIVO_PLATFORM_KEY intentionally unset
 
 const server = await createServer({

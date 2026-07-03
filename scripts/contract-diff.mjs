@@ -243,6 +243,7 @@ const startDev = async () => {
   process.env.MIVO_DEBUG_LOG_DIR = debugLogDir
   process.env.MIVO_DEBUG_VIEW_TOKEN = debugToken
   process.env.MIVO_EAGLE_API_URL = 'http://127.0.0.1:59999'
+  process.env.MIVO_API_MODE = 'dev-middleware'
   const server = await createServer({ root: WORKTREE, logLevel: 'silent', server: { port: 0, host: '127.0.0.1' }, appType: 'custom' })
   await server.listen()
   const port = server.httpServer.address().port
