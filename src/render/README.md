@@ -29,6 +29,32 @@
 
 三条路径都行为敏感,需专项 e2e(Hand-tool pan / 节点拖拽 / mask 编辑 / line-markup 选中)逐一验证,超出本 PR 预算。`interactionAdapter.ts` + `resolveHitTarget` 已就位,follow-up 直接接线。
 
+## P3-0c(全量 dispatch 接线,挂 D10 gate)
+
+> **裁决(lead,2026-07-04)**:P3-0b partial(#45)合入 main(66c2775)。全量 dispatch 接线拆为 **P3-0c**,作为 backlog 项挂在 **D10 gate** 上——gate 若触发 P3,P3-0c 是第一个 PR。
+
+**partial 合并裁决理由**:
+1. **SC6.1 验收口径 = "契约冻结 + 类型隔离 + 命中单测"**——本 PR 的契约层(`interactionAdapter.ts`/`resolveHitTarget`)+ `viewportMatrix` 单一来源 + 29 个函数级用例(`hitTest.test.ts` 22 + `interactionAdapter.test.ts` 7)已满足。全量 dispatch 接线不是 SC6.1 的验收项。
+2. **全量 dispatch 重接线的真正受益方是 P3 Leafer 迁移**(Leafer paint 层需要自有 hit-test 替代 DOM `closest('.dom-node')`)。bench 初测(1000 节点 p95=25.1ms < 33ms 阈值)显示 **D10 gate 大概率判 P3 顺延**。为一个被 gate 挡住的阶段现在硬吃 Hand-tool pan 这类行为风险,收益为负。
+3. **Hand-tool pan 回归的处置**:发现回归 → 立即回退 → 不带病交付 → root cause + 修复路径入文档。记正面档案。
+
+**P3-0c 修复路径(lead 倾向选项 1)**:
+1. **【首选】让 tool handler 的 `setPointerCapture` 显式指向 shell**(而非 `event.currentTarget`)——tool handler 改为接收一个显式的 capture target(shell ref),`beginPan`/`beginNodeMove` 等在 shell 上 capture。这样移除 per-node `onPointerDown` 后,捕获落点稳定在 shell,Hand-tool pan 的 pointermove 流恢复。
+2. 保留 per-node `onPointerDown` 仅作 capture target,shell 经 `topmostHit` 路由 anchor/line-markup hit(节点 hit 仍走 DOM dispatch)——混合模型,部分保留 DOM dispatch。
+3. 在 controller 层显式 `shellRef.current.setPointerCapture` 后再分发到 tool handler——shell 先 capture,tool handler 不再自己 capture。
+
+**P3-0c 触发条件(D10 gate)**:
+- gate 基准文件 `bench/baselines/dom-500-1000-<date>.json`(roadmap §12.1)达标 p95 > 33ms → P3 启动 → P3-0c 是第一个 PR。
+- 或产品侧确认大画布需求(走一页决策记录,roadmap §12.1 D10 例外)。
+- gate 未触发前,P3-0c 停留 backlog,不投入。
+
+**P3-0c 验收清单(触发时)**:
+- [ ] 选项 1 落地:tool handler setPointerCapture 显式指向 shell
+- [ ] 移除 per-node `onPointerDown` + DOM 承载节点委托(pointer-events 策略:容器 none / 内部控件白名单 auto)
+- [ ] `handleCanvasPointerDown` 经 `resolveHitTarget` 路由(anchor → node → empty)
+- [ ] 专项 e2e:Hand-tool pan / 节点拖拽 / mask 编辑 / line-markup 选中 / DOM markdown-PDF 与图片重叠 topmost / selected 提升后顺序 / 编辑态优先级短路 / frame 背景-子节点穿透
+- [ ] 行为零变化红线(全量 e2e:dev 8 scenario 绿)+ 差异点名(如 line-markup stroke tolerance 由 6-unit 容差替代 SVG stroke width,correction 非回归)
+
 ## 模块清单
 
 | 模块 | 职责 | 状态 |
