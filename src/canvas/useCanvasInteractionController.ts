@@ -231,6 +231,9 @@ export function useCanvasInteractionController({
 
   // Scene reset: single rAF (preserves the original structure) resets every hook.
   // Deps are the individual stable reset callbacks (not hook return objects).
+  // Contract: src/canvas/scene-reset.contract.test.ts — new hook with a reset?
+  // Wire it into this rAF sequence AND add the reset name to EXPECTED_SCENE_RESETS
+  // in that test, or scene switches will leak stale interaction state.
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
       resetViewportForScene(sceneId)
