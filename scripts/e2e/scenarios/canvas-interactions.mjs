@@ -962,7 +962,7 @@ export const runCanvasInteractionsScenario = async (context) => {
   const stampCursor = await page.evaluate(
     () => window.getComputedStyle(document.querySelector('.canvas-shell')).cursor,
   )
-  if (!stampCursor.includes('data:image/svg+xml')) {
+  if (!stampCursor.includes('stickers/')) {
     throw new Error(`Stamp tool should show the stamp as cursor, got ${stampCursor}`)
   }
   const stampPoint = { x: markupShapeTestPoint.x + 40, y: markupShapeTestPoint.y + 320 }
@@ -978,14 +978,14 @@ export const runCanvasInteractionsScenario = async (context) => {
     throw new Error('Stamp should stay active after placing for continuous stamping')
   }
   const quickStampNode = page.locator('.dom-node.markup-node[data-markup-kind="stamp"]').last()
-  const quickStampEmoji = (await quickStampNode.locator('.dom-markup-stamp').textContent())?.trim()
-  if (quickStampEmoji !== '👍') {
-    throw new Error(`Default stamp should be the +1 thumbs up, got ${quickStampEmoji}`)
+  const quickStampSrc = await quickStampNode.locator('.dom-markup-stamp img').getAttribute('src')
+  if (!quickStampSrc || !quickStampSrc.includes('plus-one.svg')) {
+    throw new Error(`Default stamp should be the +1 sticker (plus-one.svg), got ${quickStampSrc}`)
   }
   const quickStampBox = await quickStampNode.boundingBox()
   if (!quickStampBox) throw new Error('Missing stamp geometry after quick click')
 
-  await page.locator('.stamp-options-bar').getByRole('radio', { name: 'Stamp Heart' }).click()
+  await page.locator('.stamp-options-bar').getByRole('radio', { name: 'Sticker Heart' }).click()
   await page.mouse.move(stampPoint.x + 90, stampPoint.y)
   await page.mouse.down()
   await page.waitForSelector('.stamp-placement-preview')
@@ -996,9 +996,9 @@ export const runCanvasInteractionsScenario = async (context) => {
     stampCountBefore,
   )
   const heldStampNode = page.locator('.dom-node.markup-node[data-markup-kind="stamp"]').last()
-  const heldStampEmoji = (await heldStampNode.locator('.dom-markup-stamp').textContent())?.trim()
-  if (heldStampEmoji !== '❤️') {
-    throw new Error(`Switching stamps should place the picked stamp, got ${heldStampEmoji}`)
+  const heldStampSrc = await heldStampNode.locator('.dom-markup-stamp img').getAttribute('src')
+  if (!heldStampSrc || !heldStampSrc.includes('heart.svg')) {
+    throw new Error(`Switching stamps should place the picked sticker (heart.svg), got ${heldStampSrc}`)
   }
   const heldStampBox = await heldStampNode.boundingBox()
   if (!heldStampBox || heldStampBox.width <= quickStampBox.width + 8) {

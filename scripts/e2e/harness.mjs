@@ -67,12 +67,12 @@ export const runCommand = (command, args) =>
     })
   })
 
-export const startSmokeDevServer = ({ port, localAssetFixtureDir, eagleMockPort }) =>
+export const startSmokeDevServer = ({ port, localAssetFixtureDir, eagleMockPort, apiMode = 'dev-middleware' }) =>
   spawn('npm', ['run', 'dev', '--', '--host', '127.0.0.1', '--port', String(port), '--strictPort'], {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: {
       ...process.env,
-      MIVO_API_MODE: 'dev-middleware',
+      MIVO_API_MODE: apiMode,
       MIVO_ASSET_DIR: localAssetFixtureDir,
       MIVO_EAGLE_API_URL: `http://127.0.0.1:${eagleMockPort}`,
       MIVO_DEBUG_LOG_DIR: path.resolve('test-artifacts/debug-logs'),

@@ -6,7 +6,6 @@ import {
   useState,
   type PointerEvent as ReactPointerEvent,
   type RefObject,
-  type WheelEvent as ReactWheelEvent,
 } from 'react'
 import { importImageFileToCanvas } from '../lib/canvasAssetImport'
 import { useCanvasStore } from '../store/canvasStore'
@@ -15,36 +14,17 @@ import type { ResizeCorner, SnapGuide } from './canvasGeometry'
 import { nearestConnectorBindingForPoint } from './connectorGeometry'
 import {
   boundsForNodes,
-  clientPointToCanvas,
-  clampViewportScale,
   createGroupResizeState,
-  createNodeMoveState,
-  createNodeResizeState,
-  createPanState,
-  createSelectionBox,
   isActiveSelectionRect,
   isEditingTarget,
-  moveNodeTransform,
-  normalizedWheelDelta,
   previewIdsFromSelectionBox,
   resizeGroupSelection,
-  resizeNodeTransform,
   runtimeToolFor,
-  selectedIdsFromSelectionBox,
   selectionRectFromBox,
-  shouldCommitNodeTransform,
   shouldStartCanvasSurfaceInteraction,
-  viewportCenterPoint,
-  viewportForBounds,
-  viewportFromPan,
-  viewportFromZoom,
-  type GroupResizeState,
   type CanvasBounds,
-  type NodeTransformState,
-  type PanState,
+  type GroupResizeState,
   type RuntimeCanvasTool,
-  type SelectionBox,
-  type Viewport,
 } from './canvasInteraction'
 import { eraserHitStrokeIds, eraserScreenRadius } from './brushGeometry'
 import { stampGrowthIntervalMs, stampGrowthSizes } from './stampDefs'
@@ -59,6 +39,9 @@ import {
   type SmartSelectionSpacingDragState,
 } from './smartSelection'
 import { defaultTextFontSize, defaultTextWeight, textGeometryFor } from './textGeometry'
+import { useViewport } from './useViewport'
+import { useMarqueeSelection } from './useMarqueeSelection'
+import { useNodeTransform, isAutoDeletedEmptyTextNode, isNodeEffectivelyLocked } from './useNodeTransform'
 
 type UseCanvasInteractionControllerOptions = {
   shellRef: RefObject<HTMLElement | null>
@@ -108,40 +91,6 @@ type MarkupPointTransformState = {
   historyCaptured: boolean
 }
 
-export const defaultViewportFor = (sceneId: string): Viewport => ({
-  x: 420,
-  y: 240,
-  scale: sceneId === 'stress-test' ? 0.62 : 1,
-})
-
-const viewportStorageKey = (sceneId: CanvasId) => `mivo-canvas-viewport:${sceneId}`
-
-const persistedViewportFor = (sceneId: CanvasId): Viewport | undefined => {
-  try {
-    const rawViewport = window.localStorage.getItem(viewportStorageKey(sceneId))
-    if (!rawViewport) return undefined
-
-    const viewport = JSON.parse(rawViewport) as Partial<Viewport>
-    if (
-      typeof viewport.x !== 'number' ||
-      typeof viewport.y !== 'number' ||
-      typeof viewport.scale !== 'number'
-    ) {
-      return undefined
-    }
-
-    return {
-      x: viewport.x,
-      y: viewport.y,
-      scale: clampViewportScale(viewport.scale),
-    }
-  } catch {
-    return undefined
-  }
-}
-
-const initialViewportFor = (sceneId: CanvasId) => persistedViewportFor(sceneId) || defaultViewportFor(sceneId)
-
 const rectFromTextCreation = (box: TextCreationState): CanvasBounds => ({
   x: Math.min(box.startX, box.currentX),
   y: Math.min(box.startY, box.currentY),
@@ -156,12 +105,32 @@ const rectFromFrameCreation = (box: FrameCreationState): CanvasBounds => ({
   height: Math.abs(box.currentY - box.startY),
 })
 
-const rectFromMarkupCreation = (box: MarkupCreationState): CanvasBounds => ({
-  x: Math.min(box.startX, box.currentX),
-  y: Math.min(box.startY, box.currentY),
-  width: Math.abs(box.currentX - box.startX),
-  height: Math.abs(box.currentY - box.startY),
-})
+const rectFromMarkupCreation = (box: MarkupCreationState): CanvasBounds => {
+  // Freehand brush strokes span every sampled point, not just start→current.
+  // Bounding by start/current alone makes the box origin/size snap around as
+  // the cursor loops back over the start; the preview SVG (viewBox 0 0 w h with
+  // preserveAspectRatio="none") then squashes and mirror-flips the stroke — the
+  // "3D flip" glitch seen while drawing. Bound by the actual points instead.
+  if (box.kind === 'brush' && box.points.length > 0) {
+    let minX = box.points[0].x
+    let minY = box.points[0].y
+    let maxX = box.points[0].x
+    let maxY = box.points[0].y
+    for (const point of box.points) {
+      if (point.x < minX) minX = point.x
+      if (point.x > maxX) maxX = point.x
+      if (point.y < minY) minY = point.y
+      if (point.y > maxY) maxY = point.y
+    }
+    return { x: minX, y: minY, width: maxX - minX, height: maxY - minY }
+  }
+  return {
+    x: Math.min(box.startX, box.currentX),
+    y: Math.min(box.startY, box.currentY),
+    width: Math.abs(box.currentX - box.startX),
+    height: Math.abs(box.currentY - box.startY),
+  }
+}
 
 const constrainBoxPoint = (start: MarkupPoint, current: MarkupPoint): MarkupPoint => {
   const dx = current.x - start.x
@@ -248,22 +217,12 @@ const markupGeometryFromAbsolutePoints = (points: MarkupPoint[]) => {
   }
 }
 
-const isNodeEffectivelyLocked = (node: MivoCanvasNode, nodes: MivoCanvasNode[]) => {
-  const section = node.sectionId ? nodes.find((item) => item.id === node.sectionId && item.type === 'frame') : undefined
-  return Boolean(node.locked || section?.sectionLockMode === 'all')
-}
-
 const isEditableTextNode = (
   node: MivoCanvasNode | undefined,
 ): node is MivoCanvasNode & { type: 'text' | 'annotation' | 'markup' } =>
   node?.type === 'text' ||
   node?.type === 'annotation' ||
   (node?.type === 'markup' && node.markupKind !== 'stamp')
-
-const isAutoDeletedEmptyTextNode = (
-  node: MivoCanvasNode | undefined,
-): node is MivoCanvasNode & { type: 'text' | 'annotation' } =>
-  node?.type === 'text' || node?.type === 'annotation'
 
 export function useCanvasInteractionController({
   shellRef,
@@ -274,26 +233,18 @@ export function useCanvasInteractionController({
   onCancelMaskEdit,
   onCloseContextMenu,
 }: UseCanvasInteractionControllerOptions) {
-  const viewportRef = useRef<Viewport>(initialViewportFor(sceneId))
-  const panRef = useRef<PanState | null>(null)
-  const selectionRef = useRef<SelectionBox | null>(null)
   const textCreationRef = useRef<TextCreationState | null>(null)
   const frameCreationRef = useRef<FrameCreationState | null>(null)
   const markupCreationRef = useRef<MarkupCreationState | null>(null)
-  const nodeTransformRef = useRef<NodeTransformState | null>(null)
   const markupPointTransformRef = useRef<MarkupPointTransformState | null>(null)
   const textResizeRef = useRef<TextResizeState | null>(null)
   const groupResizeRef = useRef<GroupResizeState | null>(null)
   const selectionSpacingDragRef = useRef<SmartSelectionSpacingDragState | null>(null)
   const eraserDragRef = useRef<{ pointerId: number; historyCaptured: boolean } | null>(null)
   const stampPlacementRef = useRef<{ pointerId: number; stage: number; growTimer: number } | null>(null)
-  const persistedSceneRef = useRef(sceneId)
-  const viewportPersistenceTimerRef = useRef<number | undefined>(undefined)
-  const [viewport, setViewport] = useState(() => initialViewportFor(sceneId))
   const [snapGuides, setSnapGuides] = useState<SnapGuide[]>([])
   const [activeSectionDropTargetId, setActiveSectionDropTargetId] = useState<string | undefined>()
   const [activeConnectorDropTargetId, setActiveConnectorDropTargetId] = useState<string | undefined>()
-  const [selectionBox, setSelectionBox] = useState<SelectionBox | null>(null)
   const [textCreationBox, setTextCreationBox] = useState<TextCreationState | null>(null)
   const [frameCreationBox, setFrameCreationBox] = useState<FrameCreationState | null>(null)
   const [markupCreationBox, setMarkupCreationBox] = useState<MarkupCreationState | null>(null)
@@ -302,7 +253,6 @@ export function useCanvasInteractionController({
     y: number
     stage: number
   } | null>(null)
-  const [isPanning, setIsPanning] = useState(false)
   const [temporaryTool, setTemporaryTool] = useState<RuntimeCanvasTool | undefined>()
   const storedActiveTool = useCanvasStore((state) => state.activeTool)
   const setActiveTool = useCanvasStore((state) => state.setActiveTool)
@@ -330,6 +280,7 @@ export function useCanvasInteractionController({
   const addTextNode = useCanvasStore((state) => state.addTextNode)
   const addFrameNode = useCanvasStore((state) => state.addFrameNode)
   const addMarkupNode = useCanvasStore((state) => state.addMarkupNode)
+  const noteStampPlaced = useCanvasStore((state) => state.noteStampPlaced)
   const updateTextNode = useCanvasStore((state) => state.updateTextNode)
   const resizeTextNode = useCanvasStore((state) => state.resizeTextNode)
   const deleteNode = useCanvasStore((state) => state.deleteNode)
@@ -341,186 +292,25 @@ export function useCanvasInteractionController({
     const selectedNodeSet = new Set(selectedNodeIds)
     return nodes.filter((node) => selectedNodeSet.has(node.id))
   }, [nodes, selectedNodeIds])
-  const selectedBounds = selectedNodes.length > 1 ? boundsForNodes(selectedNodes) : undefined
-  const showGroupSelectionBounds =
-    interactionMode === 'select' &&
-    !selectionBox &&
-    Boolean(selectedBounds) &&
-    selectedNodes.some((node) => !isNodeEffectivelyLocked(node, nodes))
-  const selectionSpacingHandles = useMemo(
-    () =>
-      showGroupSelectionBounds
-        ? smartSelectionHandlesFor(selectedNodes, {
-            isEffectivelyLocked: (node) => isNodeEffectivelyLocked(node, nodes),
-            viewportScale: viewport.scale,
-          })
-        : [],
-    [nodes, selectedNodes, showGroupSelectionBounds, viewport.scale],
-  )
 
-  useEffect(() => {
-    viewportRef.current = viewport
-    const shell = shellRef.current
-    if (shell && (shell.scrollLeft !== 0 || shell.scrollTop !== 0)) {
-      shell.scrollLeft = 0
-      shell.scrollTop = 0
-    }
-  }, [shellRef, viewport])
-
-  useEffect(() => {
-    if (persistedSceneRef.current !== sceneId) return
-
-    window.clearTimeout(viewportPersistenceTimerRef.current)
-    viewportPersistenceTimerRef.current = window.setTimeout(() => {
-      window.localStorage.setItem(viewportStorageKey(sceneId), JSON.stringify(viewport))
-      viewportPersistenceTimerRef.current = undefined
-    }, 180)
-
-    return () => window.clearTimeout(viewportPersistenceTimerRef.current)
-  }, [sceneId, viewport])
-
-  useEffect(() => {
-    const shell = shellRef.current
-    if (!shell) return undefined
-
-    const preventNativeWheelDefault = (event: WheelEvent) => {
-      event.preventDefault()
-    }
-
-    shell.addEventListener('wheel', preventNativeWheelDefault, { passive: false })
-
-    return () => {
-      shell.removeEventListener('wheel', preventNativeWheelDefault)
-    }
-  }, [shellRef])
-
-  useEffect(() => {
-    const frame = window.requestAnimationFrame(() => {
-      persistedSceneRef.current = sceneId
-      setViewport(initialViewportFor(sceneId))
-      setSnapGuides([])
-      setActiveSectionDropTargetId(undefined)
-      setActiveConnectorDropTargetId(undefined)
-      setSelectionBox(null)
-      setTextCreationBox(null)
-      setFrameCreationBox(null)
-      setMarkupCreationBox(null)
-      setIsPanning(false)
-      setTemporaryTool(undefined)
-      setEditingTextNodeId(undefined)
-      panRef.current = null
-      selectionRef.current = null
-      textCreationRef.current = null
-      frameCreationRef.current = null
-      markupCreationRef.current = null
-      markupPointTransformRef.current = null
-      nodeTransformRef.current = null
-      textResizeRef.current = null
-      groupResizeRef.current = null
-      selectionSpacingDragRef.current = null
-    })
-
-    return () => window.cancelAnimationFrame(frame)
-  }, [sceneId])
-
-  const screenToCanvas = useCallback(
-    (clientX: number, clientY: number, sourceViewport = viewportRef.current) => {
-      const rect = shellRef.current?.getBoundingClientRect()
-      return clientPointToCanvas(rect, sourceViewport, clientX, clientY)
-    },
-    [shellRef],
-  )
-
-  const viewportCenter = useCallback(() => {
-    const rect = shellRef.current?.getBoundingClientRect()
-    return viewportCenterPoint(rect, viewportRef.current)
-  }, [shellRef])
-
-  const zoomTo = useCallback(
-    (nextScale: number, center?: { clientX: number; clientY: number }) => {
-      setViewport((current) => {
-        const rect = shellRef.current?.getBoundingClientRect()
-        return viewportFromZoom(current, rect, nextScale, center)
-      })
-    },
-    [shellRef],
-  )
-
-  const zoomBy = useCallback(
-    (factor: number, center?: { clientX: number; clientY: number }) => {
-      zoomTo(viewportRef.current.scale * factor, center)
-    },
-    [zoomTo],
-  )
-
-  const fitToBounds = useCallback(
-    (bounds: CanvasBounds | undefined) => {
-      const rect = shellRef.current?.getBoundingClientRect()
-      const nextViewport = bounds ? viewportForBounds(bounds, rect) : undefined
-
-      setViewport(nextViewport || defaultViewportFor(sceneId))
-    },
-    [sceneId, shellRef],
-  )
-
-  const fitAll = useCallback(() => {
-    fitToBounds(boundsForNodes(nodes.filter((node) => !node.hidden)))
-  }, [fitToBounds, nodes])
-
-  const fitSelection = useCallback(() => {
-    const visibleNodes = nodes.filter((node) => !node.hidden)
-    fitToBounds(boundsForNodes(selectedNodes.length ? selectedNodes : visibleNodes))
-  }, [fitToBounds, nodes, selectedNodes])
-
-  const fit = fitSelection
-
-  const sectionDropTargetFor = useCallback(
-    (movingNode: MivoCanvasNode, nextX: number, nextY: number) => {
-      if (movingNode.type === 'frame') return undefined
-
-      const selectedSet = new Set(selectedNodeIds.includes(movingNode.id) ? selectedNodeIds : [movingNode.id])
-      if (nodes.some((node) => selectedSet.has(node.id) && node.type === 'frame')) return undefined
-
-      const dx = nextX - movingNode.x
-      const dy = nextY - movingNode.y
-      const movingNodes = nodes.filter((node) => selectedSet.has(node.id) && node.type !== 'frame' && !node.hidden)
-      const projectedCenters = (movingNodes.length ? movingNodes : [movingNode]).map((node) => ({
-        x: node.x + dx + node.width / 2,
-        y: node.y + dy + node.height / 2,
-      }))
-
-      return nodes
-        .filter(
-          (node) =>
-            node.type === 'frame' &&
-            !node.hidden &&
-            !selectedSet.has(node.id) &&
-            projectedCenters.every(
-              (center) =>
-                center.x >= node.x &&
-                center.x <= node.x + node.width &&
-                center.y >= node.y &&
-                center.y <= node.y + node.height,
-            ),
-        )
-        .at(-1)?.id
-    },
-    [nodes, selectedNodeIds],
-  )
-
-  const resetView = useCallback(() => {
-    setViewport(defaultViewportFor(sceneId))
-  }, [sceneId])
-
-  const finishSelection = useCallback(() => {
-    const current = selectionRef.current
-    if (!current) return
-
-    selectNodes(selectedIdsFromSelectionBox(current, nodes))
-
-    selectionRef.current = null
-    setSelectionBox(null)
-  }, [nodes, selectNodes])
+  const {
+    viewport,
+    viewportRef,
+    isPanning,
+    screenToCanvas,
+    viewportCenter,
+    zoomBy,
+    fitAll,
+    fitSelection,
+    fit,
+    resetView,
+    handleWheel,
+    startPan,
+    tryMovePan,
+    tryEndPan,
+    resetPan,
+    resetViewportForScene,
+  } = useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseContextMenu })
 
   const discardEmptyEditingText = useCallback(
     (nodeId = editingTextNodeId) => {
@@ -536,185 +326,17 @@ export function useCanvasInteractionController({
     [deleteNode, editingTextNodeId],
   )
 
-  const beginPan = useCallback(
-    (event: ReactPointerEvent<HTMLElement>, options?: { clearSelection?: boolean }) => {
-      if (event.button !== 0 && event.button !== 1) return
-
-      event.preventDefault()
-      event.currentTarget.setPointerCapture(event.pointerId)
-      onCloseContextMenu()
-      discardEmptyEditingText()
-      setEditingTextNodeId(undefined)
-      setSnapGuides([])
-      setActiveSectionDropTargetId(undefined)
-      setActiveConnectorDropTargetId(undefined)
-      selectionRef.current = null
-      setSelectionBox(null)
-      setIsPanning(true)
-      panRef.current = createPanState(event.pointerId, event.clientX, event.clientY, viewportRef.current)
-
-      if (options?.clearSelection) {
-        selectNode(undefined)
-      }
-    },
-    [discardEmptyEditingText, onCloseContextMenu, selectNode],
-  )
-
-  const beginSelection = useCallback(
-    (event: ReactPointerEvent<HTMLElement>) => {
-      event.preventDefault()
-      event.currentTarget.setPointerCapture(event.pointerId)
-      onCloseContextMenu()
-      discardEmptyEditingText()
-      setEditingTextNodeId(undefined)
-      setSnapGuides([])
-      setActiveSectionDropTargetId(undefined)
-      setActiveConnectorDropTargetId(undefined)
-
-      const point = screenToCanvas(event.clientX, event.clientY)
-      const additive = event.shiftKey || event.metaKey || event.ctrlKey
-      selectionRef.current = createSelectionBox(event.pointerId, point, additive, selectedNodeIds)
-      setSelectionBox(selectionRef.current)
-
-      if (!additive) {
-        selectNode(undefined)
-      }
-    },
-    [discardEmptyEditingText, onCloseContextMenu, screenToCanvas, selectNode, selectedNodeIds],
-  )
-
-  const beginGroupResize = useCallback(
-    (corner: ResizeCorner, event: ReactPointerEvent<HTMLButtonElement>) => {
-      if (event.button !== 0 || !selectedBounds || selectedNodes.length < 2) return
-
-      event.preventDefault()
-      event.stopPropagation()
-      event.currentTarget.setPointerCapture(event.pointerId)
-      onCloseContextMenu()
-      discardEmptyEditingText()
-      setEditingTextNodeId(undefined)
-      setSnapGuides([])
-      setActiveSectionDropTargetId(undefined)
-      setActiveConnectorDropTargetId(undefined)
-      selectionSpacingDragRef.current = null
-      captureHistory()
-
-      groupResizeRef.current = createGroupResizeState(
-        event.pointerId,
-        corner,
-        event.clientX,
-        event.clientY,
-        selectedBounds,
-        selectedNodes,
-      )
-    },
-    [captureHistory, discardEmptyEditingText, onCloseContextMenu, selectedBounds, selectedNodes],
-  )
-
-  const beginSelectionSpacingDrag = useCallback(
-    (handle: SmartSelectionHandle, event: ReactPointerEvent<HTMLButtonElement>) => {
-      if (event.button !== 0) return
-
-      const startLayout = smartSelectionLayoutFor(selectedNodes, {
-        isEffectivelyLocked: (node) => isNodeEffectivelyLocked(node, nodes),
-      })
-      if (!startLayout) return
-      const startGap = smartSelectionGapFor(startLayout, handle.axis, handle.index)
-      if (startGap < 0) return
-
-      event.preventDefault()
-      event.stopPropagation()
-      event.currentTarget.setPointerCapture(event.pointerId)
-      onCloseContextMenu()
-      discardEmptyEditingText()
-      setEditingTextNodeId(undefined)
-      setSnapGuides([])
-      setActiveSectionDropTargetId(undefined)
-      setActiveConnectorDropTargetId(undefined)
-      groupResizeRef.current = null
-      captureHistory()
-
-      selectionSpacingDragRef.current = {
-        pointerId: event.pointerId,
-        axis: handle.axis,
-        index: handle.index,
-        layoutKind: startLayout.kind,
-        startClientX: event.clientX,
-        startClientY: event.clientY,
-        startGap,
-        startLayout,
-      }
-    },
-    [captureHistory, discardEmptyEditingText, nodes, onCloseContextMenu, selectedNodes],
-  )
-
-  const beginNodeMove = useCallback(
-    (nodeId: string, event: ReactPointerEvent<HTMLDivElement>) => {
-      if (event.button !== 0) return
-
-      const node = nodes.find((item) => item.id === nodeId)
-      if (!node) return
-
-      event.preventDefault()
-      event.currentTarget.setPointerCapture(event.pointerId)
-      onCloseContextMenu()
-      discardEmptyEditingText()
-      setEditingTextNodeId(undefined)
-      setSnapGuides([])
-      setActiveSectionDropTargetId(undefined)
-      setActiveConnectorDropTargetId(undefined)
-      selectionRef.current = null
-      setSelectionBox(null)
-
-      const additive = event.shiftKey || event.metaKey || event.ctrlKey
-      const alreadySelected = selectedNodeIds.includes(nodeId)
-      const shouldPreserveMultiSelection = !additive && alreadySelected && selectedNodeIds.length > 1
-      const shouldEditTextOnClick =
-        !additive && alreadySelected && selectedNodeIds.length === 1 && isAutoDeletedEmptyTextNode(node)
-
-      if (additive) {
-        selectNode(nodeId, { additive: true })
-      } else if (shouldPreserveMultiSelection) {
-        selectNodes(selectedNodeIds, nodeId)
-      } else {
-        selectNode(nodeId)
-      }
-
-      if (isNodeEffectivelyLocked(node, nodes)) return
-
-      nodeTransformRef.current = createNodeMoveState(node, event.pointerId, event.clientX, event.clientY, {
-        collapseSelectionOnClick: shouldPreserveMultiSelection,
-        editTextOnClick: shouldEditTextOnClick,
-      })
-    },
-    [discardEmptyEditingText, nodes, onCloseContextMenu, selectNode, selectNodes, selectedNodeIds],
-  )
-
-  const startNodeResize = useCallback(
-    (nodeId: string, corner: ResizeCorner, event: ReactPointerEvent<HTMLButtonElement>) => {
-      if (event.button !== 0) return
-
-      const node = nodes.find((item) => item.id === nodeId)
-      if (!node) return
-
-      event.preventDefault()
-      event.stopPropagation()
-      event.currentTarget.setPointerCapture(event.pointerId)
-      onCloseContextMenu()
-      discardEmptyEditingText()
-      setEditingTextNodeId(undefined)
-      setSnapGuides([])
-      setActiveSectionDropTargetId(undefined)
-      setActiveConnectorDropTargetId(undefined)
-      selectionRef.current = null
-      setSelectionBox(null)
-      selectNode(nodeId)
-      if (isNodeEffectivelyLocked(node, nodes)) return
-
-      nodeTransformRef.current = createNodeResizeState(node, event.pointerId, corner, event.clientX, event.clientY)
-    },
-    [discardEmptyEditingText, nodes, onCloseContextMenu, selectNode],
-  )
+  // Shared interaction-start cleanup (6 calls inlined across every begin* in the
+  // original controller). Bundled here for the extracted hooks; behavior
+  // identical — same calls, same order, React-batched.
+  const startInteraction = useCallback(() => {
+    onCloseContextMenu()
+    discardEmptyEditingText()
+    setEditingTextNodeId(undefined)
+    setSnapGuides([])
+    setActiveSectionDropTargetId(undefined)
+    setActiveConnectorDropTargetId(undefined)
+  }, [discardEmptyEditingText, onCloseContextMenu])
 
   const editTextNode = useCallback(
     (nodeId: string) => {
@@ -732,6 +354,134 @@ export function useCanvasInteractionController({
       return true
     },
     [captureHistory, onCloseContextMenu, selectNode],
+  )
+
+  const {
+    selectionBox,
+    beginSelection,
+    clearSelection,
+    tryMoveSelection,
+    tryEndSelection,
+    resetMarquee,
+  } = useMarqueeSelection({
+    screenToCanvas,
+    startInteraction,
+    selectNode,
+    selectNodes,
+    nodes,
+    selectedNodeIds,
+  })
+
+  const selectedBounds = selectedNodes.length > 1 ? boundsForNodes(selectedNodes) : undefined
+  const showGroupSelectionBounds =
+    interactionMode === 'select' &&
+    !selectionBox &&
+    Boolean(selectedBounds) &&
+    selectedNodes.some((node) => !isNodeEffectivelyLocked(node, nodes))
+  const selectionSpacingHandles = useMemo(
+    () =>
+      showGroupSelectionBounds
+        ? smartSelectionHandlesFor(selectedNodes, {
+            isEffectivelyLocked: (node) => isNodeEffectivelyLocked(node, nodes),
+            viewportScale: viewport.scale,
+          })
+        : [],
+    [nodes, selectedNodes, showGroupSelectionBounds, viewport.scale],
+  )
+
+  const {
+    beginNodeMove,
+    startNodeResize,
+    tryMoveNodeTransform,
+    tryEndNodeTransform,
+    resetNodeTransform,
+  } = useNodeTransform({
+    viewportRef,
+    startInteraction,
+    clearSelection,
+    selectNode,
+    selectNodes,
+    captureHistory,
+    updateSelectedNodesPosition,
+    updateNodeGeometry,
+    setSnapGuides,
+    setActiveSectionDropTargetId,
+    setActiveConnectorDropTargetId,
+    editTextNode,
+    nodes,
+    selectedNodeIds,
+  })
+
+  const beginPan = useCallback(
+    (event: ReactPointerEvent<HTMLElement>, options?: { clearSelection?: boolean }) => {
+      if (event.button !== 0 && event.button !== 1) return
+
+      event.preventDefault()
+      event.currentTarget.setPointerCapture(event.pointerId)
+      startInteraction()
+      clearSelection()
+      startPan(event)
+
+      if (options?.clearSelection) {
+        selectNode(undefined)
+      }
+    },
+    [clearSelection, selectNode, startInteraction, startPan],
+  )
+
+  const beginGroupResize = useCallback(
+    (corner: ResizeCorner, event: ReactPointerEvent<HTMLButtonElement>) => {
+      if (event.button !== 0 || !selectedBounds || selectedNodes.length < 2) return
+
+      event.preventDefault()
+      event.stopPropagation()
+      event.currentTarget.setPointerCapture(event.pointerId)
+      startInteraction()
+      selectionSpacingDragRef.current = null
+      captureHistory()
+
+      groupResizeRef.current = createGroupResizeState(
+        event.pointerId,
+        corner,
+        event.clientX,
+        event.clientY,
+        selectedBounds,
+        selectedNodes,
+      )
+    },
+    [captureHistory, selectedBounds, selectedNodes, startInteraction],
+  )
+
+  const beginSelectionSpacingDrag = useCallback(
+    (handle: SmartSelectionHandle, event: ReactPointerEvent<HTMLButtonElement>) => {
+      if (event.button !== 0) return
+
+      const startLayout = smartSelectionLayoutFor(selectedNodes, {
+        isEffectivelyLocked: (node) => isNodeEffectivelyLocked(node, nodes),
+      })
+      if (!startLayout) return
+      const startGap = smartSelectionGapFor(startLayout, handle.axis, handle.index)
+      if (startGap < 0) return
+
+      event.preventDefault()
+      event.stopPropagation()
+      event.currentTarget.setPointerCapture(event.pointerId)
+      startInteraction()
+      groupResizeRef.current = null
+      captureHistory()
+
+      selectionSpacingDragRef.current = {
+        pointerId: event.pointerId,
+        axis: handle.axis,
+        index: handle.index,
+        layoutKind: startLayout.kind,
+        startClientX: event.clientX,
+        startClientY: event.clientY,
+        startGap,
+        startLayout,
+      }
+    },
+    [captureHistory, nodes, selectedNodes, startInteraction],
   )
 
   const beginTextEdit = useCallback(
@@ -752,8 +502,7 @@ export function useCanvasInteractionController({
       onCloseContextMenu()
       discardEmptyEditingText()
       setSnapGuides([])
-      setSelectionBox(null)
-      selectionRef.current = null
+      clearSelection()
       selectNode(undefined)
 
       const point = screenToCanvas(event.clientX, event.clientY)
@@ -767,7 +516,7 @@ export function useCanvasInteractionController({
       textCreationRef.current = nextBox
       setTextCreationBox(nextBox)
     },
-    [discardEmptyEditingText, onCloseContextMenu, screenToCanvas, selectNode],
+    [clearSelection, discardEmptyEditingText, onCloseContextMenu, screenToCanvas, selectNode],
   )
 
   const beginMarkupPointMove = useCallback(
@@ -808,8 +557,7 @@ export function useCanvasInteractionController({
       discardEmptyEditingText()
       setEditingTextNodeId(undefined)
       setSnapGuides([])
-      setSelectionBox(null)
-      selectionRef.current = null
+      clearSelection()
 
       const point = screenToCanvas(event.clientX, event.clientY)
       const nextBox = {
@@ -822,7 +570,7 @@ export function useCanvasInteractionController({
       frameCreationRef.current = nextBox
       setFrameCreationBox(nextBox)
     },
-    [discardEmptyEditingText, onCloseContextMenu, screenToCanvas],
+    [clearSelection, discardEmptyEditingText, onCloseContextMenu, screenToCanvas],
   )
 
   const eraseAtClientPoint = useCallback(
@@ -843,7 +591,7 @@ export function useCanvasInteractionController({
       }
       eraseMarkupStrokes(hits)
     },
-    [captureHistory, eraseMarkupStrokes, screenToCanvas],
+    [captureHistory, eraseMarkupStrokes, screenToCanvas, viewportRef],
   )
 
   const clearStampPlacement = useCallback(() => {
@@ -863,8 +611,7 @@ export function useCanvasInteractionController({
       discardEmptyEditingText()
       setEditingTextNodeId(undefined)
       setSnapGuides([])
-      setSelectionBox(null)
-      selectionRef.current = null
+      clearSelection()
 
       const point = screenToCanvas(event.clientX, event.clientY)
       // FigJam-style press-and-hold: the held stamp wiggles and grows through four stages.
@@ -878,7 +625,7 @@ export function useCanvasInteractionController({
       stampPlacementRef.current = { pointerId: event.pointerId, stage: 0, growTimer }
       setStampPlacementPreview({ x: point.x, y: point.y, stage: 0 })
     },
-    [discardEmptyEditingText, onCloseContextMenu, screenToCanvas],
+    [clearSelection, discardEmptyEditingText, onCloseContextMenu, screenToCanvas],
   )
 
   const beginMarkupBox = useCallback(
@@ -892,8 +639,7 @@ export function useCanvasInteractionController({
       discardEmptyEditingText()
       setEditingTextNodeId(undefined)
       setSnapGuides([])
-      setSelectionBox(null)
-      selectionRef.current = null
+      clearSelection()
 
       if (kind === 'brush' && useCanvasStore.getState().brushStyle.kind === 'eraser') {
         eraserDragRef.current = { pointerId: event.pointerId, historyCaptured: false }
@@ -914,7 +660,7 @@ export function useCanvasInteractionController({
       markupCreationRef.current = nextBox
       setMarkupCreationBox(nextBox)
     },
-    [discardEmptyEditingText, eraseAtClientPoint, onCloseContextMenu, screenToCanvas],
+    [clearSelection, discardEmptyEditingText, eraseAtClientPoint, onCloseContextMenu, screenToCanvas],
   )
 
   const updateEditingText = useCallback(
@@ -1104,48 +850,7 @@ export function useCanvasInteractionController({
         return
       }
 
-      const nodeTransform = nodeTransformRef.current
-      if (nodeTransform?.pointerId === event.pointerId) {
-        const node = nodes.find((item) => item.id === nodeTransform.nodeId)
-        if (!node) return
-
-        const didCommit = shouldCommitNodeTransform(nodeTransform, event.clientX, event.clientY)
-        if (didCommit && !nodeTransform.historyCaptured) {
-          captureHistory()
-          nodeTransform.historyCaptured = true
-        }
-
-        if (nodeTransform.mode === 'move') {
-          if (didCommit) nodeTransform.moved = true
-          const snapped = moveNodeTransform(
-            nodeTransform,
-            node,
-            nodes,
-            event.clientX,
-            event.clientY,
-            viewportRef.current.scale,
-          )
-          setSnapGuides(snapped.guides)
-          setActiveSectionDropTargetId(sectionDropTargetFor(node, snapped.x, snapped.y))
-          updateSelectedNodesPosition(nodeTransform.nodeId, snapped.x, snapped.y)
-        } else {
-          const snapped = resizeNodeTransform(
-            nodeTransform,
-            node,
-            nodes,
-            event.clientX,
-            event.clientY,
-            viewportRef.current.scale,
-            { centered: event.altKey },
-          )
-          setSnapGuides(snapped.guides)
-          setActiveSectionDropTargetId(undefined)
-      setActiveConnectorDropTargetId(undefined)
-          updateNodeGeometry(nodeTransform.nodeId, snapped.x, snapped.y, snapped.width, snapped.height)
-        }
-
-        return
-      }
+      if (tryMoveNodeTransform(event)) return
 
       const markupPointTransform = markupPointTransformRef.current
       if (markupPointTransform?.pointerId === event.pointerId) {
@@ -1211,19 +916,9 @@ export function useCanvasInteractionController({
         return
       }
 
-      const pan = panRef.current
-      if (pan?.pointerId === event.pointerId) {
-        setViewport((current) => viewportFromPan(pan, event.clientX, event.clientY, current))
-        return
-      }
+      if (tryMovePan(event)) return
 
-      const selection = selectionRef.current
-      if (selection?.pointerId === event.pointerId) {
-        const point = screenToCanvas(event.clientX, event.clientY)
-        selection.currentX = point.x
-        selection.currentY = point.y
-        setSelectionBox({ ...selection })
-      }
+      tryMoveSelection(event)
     },
     [
       captureHistory,
@@ -1231,11 +926,12 @@ export function useCanvasInteractionController({
       nodes,
       resizeTextNode,
       screenToCanvas,
-      updateNodeGeometry,
+      tryMoveNodeTransform,
+      tryMovePan,
+      tryMoveSelection,
       updateMarkupGeometry,
       updateNodesGeometry,
-      updateSelectedNodesPosition,
-      sectionDropTargetFor,
+      viewportRef,
     ],
   )
 
@@ -1356,21 +1052,7 @@ export function useCanvasInteractionController({
         if (!isBrush) setActiveTool('select')
       }
 
-      if (nodeTransformRef.current?.pointerId === event.pointerId) {
-        const nodeTransform = nodeTransformRef.current
-        nodeTransformRef.current = null
-        setSnapGuides([])
-        setActiveSectionDropTargetId(undefined)
-        setActiveConnectorDropTargetId(undefined)
-
-        if (nodeTransform.mode === 'move' && nodeTransform.collapseSelectionOnClick && !nodeTransform.moved) {
-          selectNode(nodeTransform.nodeId)
-        }
-
-        if (nodeTransform.mode === 'move' && nodeTransform.editTextOnClick && !nodeTransform.moved) {
-          editTextNode(nodeTransform.nodeId)
-        }
-      }
+      tryEndNodeTransform(event)
 
       if (textResizeRef.current?.pointerId === event.pointerId) {
         textResizeRef.current = null
@@ -1390,60 +1072,36 @@ export function useCanvasInteractionController({
           const placement = stampPlacementRef.current
           const point = screenToCanvas(event.clientX, event.clientY)
           const size = stampGrowthSizes[placement.stage]
-          addMarkupNode(
+          const placedStampId = addMarkupNode(
             'stamp',
             { x: point.x - size / 2, y: point.y - size / 2 },
             { width: size, height: size },
             { stampKind: useCanvasStore.getState().activeStampKind, select: false },
           )
+          noteStampPlaced(placedStampId)
         }
         // Stamp stays active for continuous stamping (FigJam convention); Esc or V exits.
         clearStampPlacement()
       }
 
-      if (panRef.current?.pointerId === event.pointerId) {
-        panRef.current = null
-        setIsPanning(false)
-      }
+      tryEndPan(event)
 
-      if (selectionRef.current?.pointerId === event.pointerId) {
-        finishSelection()
-      }
+      tryEndSelection(event)
     },
     [
       addFrameNode,
       addMarkupNode,
       addTextNode,
       clearStampPlacement,
-      editTextNode,
-      finishSelection,
       nodes,
+      noteStampPlaced,
       resizeTextNode,
       screenToCanvas,
-      selectNode,
       setActiveTool,
+      tryEndNodeTransform,
+      tryEndPan,
+      tryEndSelection,
     ],
-  )
-
-  const handleWheel = useCallback(
-    (event: ReactWheelEvent<HTMLElement>) => {
-      onCloseContextMenu()
-
-      const delta = normalizedWheelDelta(event.nativeEvent)
-      if (event.ctrlKey || event.metaKey) {
-        zoomBy(Math.exp(-delta.y * 0.002), { clientX: event.clientX, clientY: event.clientY })
-        return
-      }
-
-      const deltaX = event.shiftKey && delta.x === 0 ? delta.y : delta.x
-      const deltaY = event.shiftKey && delta.x === 0 ? 0 : delta.y
-      setViewport((current) => ({
-        ...current,
-        x: current.x - deltaX,
-        y: current.y - deltaY,
-      }))
-    },
-    [onCloseContextMenu, zoomBy],
   )
 
   useEffect(() => {
@@ -1466,7 +1124,8 @@ export function useCanvasInteractionController({
           return
         }
         onCloseContextMenu()
-        selectionRef.current = null
+        resetMarquee()
+        resetNodeTransform()
         textCreationRef.current = null
         frameCreationRef.current = null
         markupCreationRef.current = null
@@ -1479,10 +1138,8 @@ export function useCanvasInteractionController({
           stampPlacementRef.current = null
         }
         setStampPlacementPreview(null)
-        nodeTransformRef.current = null
         textResizeRef.current = null
         setEditingTextNodeId(undefined)
-        setSelectionBox(null)
         setTextCreationBox(null)
         setFrameCreationBox(null)
         setMarkupCreationBox(null)
@@ -1626,9 +1283,10 @@ export function useCanvasInteractionController({
 
     const handleWindowBlur = () => {
       setTemporaryTool(undefined)
-      setIsPanning(false)
+      resetPan()
+      resetMarquee()
+      resetNodeTransform()
       setEditingTextNodeId(undefined)
-      panRef.current = null
       textCreationRef.current = null
       setTextCreationBox(null)
       frameCreationRef.current = null
@@ -1642,7 +1300,6 @@ export function useCanvasInteractionController({
         stampPlacementRef.current = null
       }
       setStampPlacementPreview(null)
-      nodeTransformRef.current = null
       textResizeRef.current = null
       setActiveConnectorDropTargetId(undefined)
     }
@@ -1699,7 +1356,6 @@ export function useCanvasInteractionController({
     copySelectedNodes,
     cutSelectedNodes,
     deleteSelectedNodes,
-    deleteNode,
     duplicateSelectedNodes,
     fitAll,
     fitSelection,
@@ -1712,18 +1368,51 @@ export function useCanvasInteractionController({
     pasteClipboardNodes,
     pasteClipboardAssets,
     redo,
+    resetMarquee,
+    resetNodeTransform,
+    resetPan,
     resetView,
     selectNode,
     selectNodes,
     setActiveTool,
     undo,
     ungroupSelectedNodes,
-    resizeTextNode,
-    updateMarkupGeometry,
-    updateTextNode,
     viewportCenter,
     zoomBy,
   ])
+
+  // Scene reset: single rAF (preserves the original structure) resets the viewport
+  // hook + marquee + node-transform hooks + the remaining interaction state/refs.
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      resetViewportForScene(sceneId)
+      resetMarquee()
+      resetNodeTransform()
+      setSnapGuides([])
+      setActiveSectionDropTargetId(undefined)
+      setActiveConnectorDropTargetId(undefined)
+      setTextCreationBox(null)
+      setFrameCreationBox(null)
+      setMarkupCreationBox(null)
+      setStampPlacementPreview(null)
+      setTemporaryTool(undefined)
+      setEditingTextNodeId(undefined)
+      textCreationRef.current = null
+      frameCreationRef.current = null
+      markupCreationRef.current = null
+      markupPointTransformRef.current = null
+      textResizeRef.current = null
+      groupResizeRef.current = null
+      selectionSpacingDragRef.current = null
+      eraserDragRef.current = null
+      if (stampPlacementRef.current) {
+        window.clearInterval(stampPlacementRef.current.growTimer)
+        stampPlacementRef.current = null
+      }
+    })
+
+    return () => window.cancelAnimationFrame(frame)
+  }, [sceneId, resetMarquee, resetNodeTransform, resetViewportForScene])
 
   const selectionRect = selectionBox ? selectionRectFromBox(selectionBox) : undefined
   const activeSelectionRect = selectionRect && isActiveSelectionRect(selectionRect) ? selectionRect : undefined

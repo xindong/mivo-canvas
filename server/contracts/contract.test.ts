@@ -1,16 +1,23 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { readFileSync, readdirSync, existsSync } from 'node:fs'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import process from 'node:process'
 
-// Static contract suite (runs in `npm run test:unit`). Validates every committed
-// capture under __captures__/ against its invariant, and every contract JSON's
-// capture/captures ref resolves to a file. Fast, no server.
-//
-// The LIVE diff suite (SC1.2: "BFF 与 dev middleware 基线逐字段 diff = 0") lives
-// in `scripts/contract-diff.mjs`, invoked via `npm run contract:diff`. That script
-// parameterizes the target (dev middleware or BFF url) and emits a per-field diff
-// report; see server/contracts/README.md.
+// ─── P1-c BFF diff hook ──────────────────────────────────────────────────────
+// This file is the SC1.2 skeleton: "BFF 与 dev middleware 基线逐字段 diff = 0".
+//  1. Static suite (always runs in `npm run test:unit`): validates every committed
+//     capture under __captures__/ against its invariant, and every contract JSON's
+//     capture/captures ref resolves to a file. Fast, no server.
+//  2. Live suite (only when MIVO_CONTRACT_LIVE=1): issues the same requests against
+//     a target and asserts the live response matches the invariant. The target is
+//     `MIVO_CONTRACT_TARGET_URL` if set (→ BFF in P1-c), otherwise an ephemeral
+//     vite dev server started in beforeAll. P1-c workflow:
+//       MIVO_CONTRACT_TARGET_URL=http://127.0.0.1:3000 MIVO_CONTRACT_LIVE=1 npm run test:unit
+//     A green run means BFF responses match the dev-middleware baseline (diff=0 on
+//     the locked fields). Intended-changes (see contract JSONs) are exempted per-scenario.
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const CAPTURE_DIR = join(HERE, '__captures__')
@@ -242,4 +249,133 @@ describe('server/contracts — static baseline', () => {
       expect(existsSync(join(CAPTURE_DIR, rel)), `missing capture ${ref}`).toBe(true)
     }
   })
+})
+// ─── Live suite (env-gated; does NOT run in default `npm run test:unit`) ─────
+const runLive = process.env.MIVO_CONTRACT_LIVE === '1'
+const TARGET = process.env.MIVO_CONTRACT_TARGET_URL ?? ''
+
+type FetchInit = {
+  method?: string
+  headers?: Record<string, string>
+  body?: string | FormData
+}
+
+const execFetch = async (base: string, path: string, init: FetchInit = {}): Promise<Capture> => {
+  try {
+    const res = await fetch(base + path, init)
+    const text = await res.text()
+    let body: unknown = null
+    try {
+      body = text === '' ? null : JSON.parse(text)
+    } catch {
+      body = text
+    }
+    return {
+      scenario: '',
+      response: {
+        status: res.status,
+        headers: {
+          'content-type': res.headers.get('content-type'),
+          'cache-control': res.headers.get('cache-control'),
+        },
+        body,
+      },
+    }
+  } catch (err) {
+    const e = err as { cause?: { code?: string }; message?: string }
+    return { scenario: '', response: { transportError: e.cause?.code ?? e.message ?? 'fetch-error' } }
+  }
+}
+
+const SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><rect width="2" height="2" fill="#000"/></svg>'
+const debugToken = ['test', 'token'].join('-')
+
+// Curated subset exercising every contract family (405 / 400 / 403 / no-key / traversal /
+// eagle-offline / placeholder / non-GET method / multipart). 413 is covered statically.
+const LIVE_CASES: Array<{ name: string; run: (base: string) => Promise<Capture> }> = [
+  { name: 'generate-405', run: (b) => execFetch(b, '/api/mivo/generate', { method: 'GET' }) },
+  {
+    name: 'generate-400-no-prompt',
+    run: (b) => execFetch(b, '/api/mivo/generate', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }),
+  },
+  {
+    name: 'generate-500-no-platform-key',
+    run: (b) => execFetch(b, '/api/mivo/generate', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ prompt: 'x', model: 'gpt-image-2' }) }),
+  },
+  { name: 'enhance-405', run: (b) => execFetch(b, '/api/mivo/enhance', { method: 'GET' }) },
+  {
+    name: 'enhance-200-no-key',
+    run: (b) => execFetch(b, '/api/mivo/enhance', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ prompt: 'a cat' }) }),
+  },
+  { name: 'debug-logs-get-403', run: (b) => execFetch(b, '/api/mivo/debug-logs', { method: 'GET' }) },
+  {
+    name: 'debug-logs-post-200',
+    run: (b) => execFetch(b, '/api/mivo/debug-logs', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ entries: [{ level: 'warning', source: 'S', message: 'm', timestamp: 1 }] }) }),
+  },
+  {
+    name: 'local-assets-file-403-traversal',
+    run: (b) => execFetch(b, `/api/mivo/local-assets/${Buffer.from('/etc/passwd').toString('base64url')}`, { method: 'GET' }),
+  },
+  { name: 'eagle-status-offline', run: (b) => execFetch(b, '/api/mivo/eagle/status', { method: 'GET' }) },
+  { name: 'pinterest-status-200', run: (b) => execFetch(b, '/api/mivo/pinterest/status', { method: 'GET' }) },
+  { name: 'local-assets-list-post-200', run: (b) => execFetch(b, '/api/mivo/local-assets', { method: 'POST' }) },
+  {
+    name: 'edit-400-no-image',
+    run: (b) => {
+      const fd = new FormData()
+      fd.append('prompt', 'x')
+      return execFetch(b, '/api/mivo/edit', { method: 'POST', body: fd })
+    },
+  },
+]
+
+describe.skipIf(!runLive)('server/contracts — live (target = dev middleware or MIVO_CONTRACT_TARGET_URL)', () => {
+  let base: string
+  let server: { close: () => Promise<void> } | undefined
+  let assetDir: string
+  let debugLogDir: string
+
+  beforeAll(async () => {
+    if (TARGET) {
+      base = TARGET
+      return
+    }
+    // Start an ephemeral dev server with the same key-free env as the capture script.
+    assetDir = await mkdtemp(join(tmpdir(), 'mivo-contract-live-assets-'))
+    debugLogDir = await mkdtemp(join(tmpdir(), 'mivo-contract-live-logs-'))
+    await writeFile(join(assetDir, 'test.svg'), SVG, 'utf8')
+    process.env.MIVO_ASSET_DIR = assetDir
+    process.env.MIVO_DEBUG_LOG_DIR = debugLogDir
+    process.env.MIVO_DEBUG_VIEW_TOKEN = debugToken
+    process.env.MIVO_EAGLE_API_URL = 'http://127.0.0.1:59999'
+    const { createServer } = await import('vite')
+    const s = await createServer({
+      root: process.cwd(),
+      logLevel: 'silent',
+      server: { port: 0, host: '127.0.0.1' },
+      appType: 'custom',
+    })
+    await s.listen()
+    server = s
+    const address = s.httpServer?.address()
+    if (!address || typeof address === 'string') {
+      throw new Error(`unexpected dev server address: ${String(address)}`)
+    }
+    base = `http://127.0.0.1:${address.port}`
+  })
+
+  afterAll(async () => {
+    if (server) await server.close()
+    if (assetDir) await rm(assetDir, { recursive: true, force: true })
+    if (debugLogDir) await rm(debugLogDir, { recursive: true, force: true })
+  })
+
+  for (const c of LIVE_CASES) {
+    it(`${c.name} matches baseline invariant`, async () => {
+      const live = await c.run(base)
+      const inv = INVARIANTS[c.name]
+      expect(inv, `no invariant for ${c.name}`).toBeDefined()
+      inv(live)
+    })
+  }
 })

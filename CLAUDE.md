@@ -81,7 +81,7 @@ Project MivoCanvas/
 **核心约定**：
 - 提交触发：手动喊"提交代码"/"commit" → `commit-projects` skill
 - 分支策略：`main` 为主分支
-- Push 策略：日常本地优先；本项目 origin 指向 upstream（kirozeng/MivoCanvas），**不可直接 push**。如需推送个人改动，请先 fork 到 PraiseZhu 或新建 remote。
+- Push 策略：日常本地优先；本项目与 kirozeng 协作共享 `origin`（kirozeng/MivoCanvas），可直接 push `main`；push 前先 `git fetch` 确认 fast-forward，不使用 `--force`。
 
 ---
 

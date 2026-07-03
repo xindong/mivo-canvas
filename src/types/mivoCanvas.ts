@@ -59,9 +59,11 @@ export type CanvasStampKind =
   | 'star'
   | 'check'
   | 'question'
-  | 'eyes'
-  | 'celebrate'
   | 'thumbs-down'
+  | 'down-2'
+  | 'face'
+  | 'smile'
+  | 'eyes'
 export type MarkupStrokeStyle = 'solid' | 'dashed'
 export type MarkdownDisplayMode = 'full' | 'preview'
 export type ConnectorAnchor = 'center' | 'top' | 'right' | 'bottom' | 'left'
@@ -216,6 +218,29 @@ export type CanvasNodeRelations = {
   aiWorkflow?: CanvasAiWorkflow
 }
 
+// P2-D1 EXPERIMENTAL — Anchor MVP field (roadmap §7 组 D). Optional + backward
+// compatible: no persist key/version bump (rides along in compactNodeForPersist via
+// cloneNode). Canvas-coordinate (x/y relative to the canvas, NOT the node). box
+// anchors require width/height; point anchors omit them. NEVER store UI temp state
+// here (drag-in-progress, uncommitted selection) — only committed anchors.
+// Migration rule (roadmap §9 P4-a): this field is either收编为 the formal
+// CanvasAnchor type or removed (with its actions) once the spike resolves.
+export type ExperimentalAnchorType = 'point' | 'box'
+export type ExperimentalAnchor = {
+  id: string
+  type: ExperimentalAnchorType
+  targetNodeId: string
+  x: number
+  y: number
+  instruction: string
+  createdAt: number
+  /** Required for type==='box'; meaningless for type==='point'. */
+  width?: number
+  height?: number
+  /** Node ids produced by generation triggered from this anchor (recorded on success). */
+  resultNodeIds?: string[]
+}
+
 export type MivoCanvasNode = {
   id: string
   type: CanvasNodeType
@@ -287,6 +312,8 @@ export type MivoCanvasNode = {
     maskBounds?: CanvasMaskBounds
   }
   aiWorkflow?: CanvasAiWorkflow
+  /** P2-D1 EXPERIMENTAL — see {@link ExperimentalAnchor}. Undefined on most nodes. */
+  experimentalAnchors?: ExperimentalAnchor[]
 }
 
 export type AiCanvasContextNode = {
