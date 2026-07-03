@@ -1,10 +1,6 @@
-import { spawn } from 'node:child_process'
 import { Buffer } from 'node:buffer'
 import path from 'node:path'
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { mkdir, readFile, rm } from 'node:fs/promises'
-import { createServer } from 'node:http'
-import { chromium } from 'playwright'
+import { readFile } from 'node:fs/promises'
 import {
   assertLibraryLayoutStable,
   createPageReaders,
@@ -13,169 +9,33 @@ import {
   wait,
   waitForServer,
 } from './e2e-helpers.mjs'
+import { startEagleMockServer } from './e2e/eagle-mock-server.mjs'
+import { prepareSmokeFixtures } from './e2e/fixtures.mjs'
+import {
+  createBaseUrl,
+  createSmokePage,
+  prepareSmokeArtifacts,
+  runCommand,
+  startSmokeDevServer,
+  stopSmokeDevServer,
+} from './e2e/harness.mjs'
 
 const port = Number(process.env.MIVO_E2E_PORT ?? 5174)
-const baseUrl = `http://127.0.0.1:${port}`
-const localAssetFixtureDir = path.resolve('test-artifacts/local-assets')
-const eagleMockDir = path.resolve('test-artifacts/eagle-mock')
-const eagleMockItemId = 'E2E-EAGLE-ASSET'
-const eagleMockItemDir = path.join(eagleMockDir, `${eagleMockItemId}.info`)
-const localAssetFixtureSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="96" height="72" viewBox="0 0 96 72">
-  <rect width="96" height="72" rx="10" fill="#fffaf0"/>
-  <circle cx="34" cy="36" r="18" fill="#6957e8"/>
-  <path d="M48 18l22 36H26z" fill="#ff8a00" fill-opacity=".82"/>
-</svg>`
-const eagleMockSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="120" height="90" viewBox="0 0 120 90">
-  <rect width="120" height="90" rx="12" fill="#f4efe6"/>
-  <rect x="18" y="18" width="84" height="54" rx="8" fill="#6957e8"/>
-  <circle cx="60" cy="45" r="18" fill="#ff8a00"/>
-</svg>`
-const horizontalMaskSourceSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
-  <rect width="1600" height="900" fill="#2767c8"/>
-  <rect x="520" y="260" width="560" height="320" rx="48" fill="#ffd35a"/>
-  <circle cx="800" cy="420" r="120" fill="#26a269"/>
-</svg>`
-const generatedImageB64 = `data:image/jpeg;base64,${readFileSync(path.resolve('public/demo-assets/courage-1.jpg')).toString('base64')}`
-const horizontalMaskSourceB64 = `data:image/svg+xml;base64,${Buffer.from(horizontalMaskSourceSvg).toString('base64')}`
-
-mkdirSync(localAssetFixtureDir, { recursive: true })
-mkdirSync(eagleMockItemDir, { recursive: true })
-writeFileSync(path.join(localAssetFixtureDir, 'mivo-local-fixture.svg'), localAssetFixtureSvg)
-writeFileSync(path.join(eagleMockItemDir, 'Mock Eagle Concept.svg'), eagleMockSvg)
-writeFileSync(path.join(eagleMockItemDir, 'Mock Eagle Concept_thumbnail.svg'), eagleMockSvg)
-
-const eagleMockItem = {
-  id: eagleMockItemId,
-  name: 'Mock Eagle Concept',
-  size: Buffer.byteLength(eagleMockSvg),
-  btime: Date.now(),
-  mtime: Date.now(),
-  ext: 'svg',
-  tags: ['mock', 'eagle'],
-  folders: ['MOCK-FOLDER'],
-  isDeleted: false,
-  url: 'https://example.com/mock-eagle-concept',
-  annotation: 'Mock Eagle metadata note',
-  modificationTime: Date.now(),
-  height: 90,
-  width: 120,
-}
-const eagleMockServer = createServer((request, response) => {
-  const requestUrl = new URL(request.url || '/', 'http://127.0.0.1')
-  response.setHeader('Content-Type', 'application/json; charset=utf-8')
-
-  if (requestUrl.pathname === '/api/application/info') {
-    response.end(JSON.stringify({ status: 'success', data: { version: 'E2E', platform: 'darwin' } }))
-    return
-  }
-
-  if (requestUrl.pathname === '/api/library/info') {
-    response.end(
-      JSON.stringify({
-        status: 'success',
-        data: {
-          folders: [{ id: 'MOCK-FOLDER', name: 'Mock Eagle Folder', children: [] }],
-          libPath: eagleMockDir,
-        },
-      }),
-    )
-    return
-  }
-
-  if (requestUrl.pathname === '/api/folder/list') {
-    response.end(
-      JSON.stringify({
-        status: 'success',
-        data: [{ id: 'MOCK-FOLDER', name: 'Mock Eagle Folder', children: [] }],
-      }),
-    )
-    return
-  }
-
-  if (requestUrl.pathname === '/api/tag/list') {
-    response.end(
-      JSON.stringify({
-        status: 'success',
-        data: [
-          { id: 'mock', name: 'mock', count: 1 },
-          { id: 'eagle', name: 'eagle', count: 1 },
-        ],
-      }),
-    )
-    return
-  }
-
-  if (requestUrl.pathname === '/api/item/list') {
-    const folderId = requestUrl.searchParams.get('folderId')
-    const keyword = requestUrl.searchParams.get('keyword')?.toLowerCase() || ''
-    const tag = requestUrl.searchParams.get('tags')?.toLowerCase() || ''
-    const matchesFolder = !folderId || folderId === 'MOCK-FOLDER'
-    const matchesKeyword = !keyword || eagleMockItem.name.toLowerCase().includes(keyword)
-    const matchesTag = !tag || eagleMockItem.tags.some((itemTag) => itemTag.toLowerCase() === tag)
-    response.end(JSON.stringify({ status: 'success', data: matchesFolder && matchesKeyword && matchesTag ? [eagleMockItem] : [] }))
-    return
-  }
-
-  if (requestUrl.pathname === '/api/item/info') {
-    response.end(JSON.stringify({ status: 'success', data: eagleMockItem }))
-    return
-  }
-
-  if (requestUrl.pathname === '/api/item/thumbnail') {
-    response.end(
-      JSON.stringify({
-        status: 'success',
-        data: path.join(eagleMockItemDir, 'Mock Eagle Concept_thumbnail.svg'),
-      }),
-    )
-    return
-  }
-
-  response.statusCode = 404
-  response.end(JSON.stringify({ status: 'error', message: 'not found' }))
-})
-await new Promise((resolve) => eagleMockServer.listen(0, '127.0.0.1', resolve))
-const eagleMockAddress = eagleMockServer.address()
-const eagleMockPort = typeof eagleMockAddress === 'object' && eagleMockAddress ? eagleMockAddress.port : 41895
-
-const runCommand = (command, args) =>
-  new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] })
-    let output = ''
-
-    child.stdout.on('data', (chunk) => {
-      output += chunk
-    })
-    child.stderr.on('data', (chunk) => {
-      output += chunk
-    })
-    child.on('close', (code) => {
-      if (code === 0) {
-        resolve(output)
-        return
-      }
-
-      reject(new Error(`${command} ${args.join(' ')} failed with ${code}\n${output}`))
-    })
-  })
-
-const server = spawn(
-  'npm',
-  ['run', 'dev', '--', '--host', '127.0.0.1', '--port', String(port), '--strictPort'],
-  {
-    stdio: ['ignore', 'pipe', 'pipe'],
-    env: {
-      ...process.env,
-      MIVO_ASSET_DIR: localAssetFixtureDir,
-      MIVO_EAGLE_API_URL: `http://127.0.0.1:${eagleMockPort}`,
-      MIVO_DEBUG_LOG_DIR: path.resolve('test-artifacts/debug-logs'),
-    },
-  },
-)
+const baseUrl = createBaseUrl(port)
+const {
+  eagleMockDir,
+  eagleMockItem,
+  eagleMockItemDir,
+  generatedImageB64,
+  horizontalMaskSourceB64,
+  localAssetFixtureDir,
+  localAssetFixtureSvg,
+} = prepareSmokeFixtures()
+const eagleMockHandle = await startEagleMockServer({ eagleMockDir, eagleMockItem, eagleMockItemDir })
+const server = startSmokeDevServer({ port, localAssetFixtureDir, eagleMockPort: eagleMockHandle.port })
 
 try {
-  await mkdir('test-artifacts', { recursive: true })
-  await rm(path.resolve('test-artifacts/debug-logs'), { recursive: true, force: true })
+  await prepareSmokeArtifacts()
   await runCommand('npm', ['run', 'verify:logging'])
   const [nodeRegistrySource, actionModelSource, viteConfigSource, modelCapabilitiesSource] = await Promise.all([
     readFile('src/canvas/nodeTypes/canvasNodeRegistry.ts', 'utf8'),
@@ -250,67 +110,8 @@ try {
 
   await waitForServer(baseUrl)
 
-  const browser = await chromium.launch({ headless: true })
-  const page = await browser.newPage({ viewport: { width: 1512, height: 900 }, deviceScaleFactor: 1 })
-  await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin: baseUrl })
-  const errors = []
-  const mivoEditRequests = []
+  const { browser, errors, mivoEditRequests, page } = await createSmokePage({ baseUrl, generatedImageB64 })
   const { readFloatingChrome, readLibraryLayout, readLibrarySurfaceColors } = createPageReaders(page)
-
-  await page.route('**/api/mivo/generate', async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: 'application/json',
-      body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }),
-    })
-  })
-  await page.route('**/api/mivo/edit', async (route) => {
-    const request = route.request()
-    try {
-      const formRequest = new Request('http://127.0.0.1/api/mivo/edit', {
-        method: 'POST',
-        headers: request.headers(),
-        body: request.postDataBuffer(),
-      })
-      const formData = await formRequest.formData()
-      mivoEditRequests.push({
-        prompt: String(formData.get('prompt') || ''),
-        fileKeys: ['image', 'mask', 'reference[]', 'reference']
-          .map((key) => `${key}:${formData.getAll(key).length}`)
-          .filter((entry) => !entry.endsWith(':0')),
-      })
-    } catch (error) {
-      mivoEditRequests.push({
-        prompt: '',
-        fileKeys: [],
-        parseError: error instanceof Error ? error.message : 'Unable to inspect edit request',
-      })
-    }
-    await route.fulfill({
-      status: 200,
-      contentType: 'application/json',
-      body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }),
-    })
-  })
-  await page.route('**/api/mivo/enhance', async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: 'application/json',
-      body: JSON.stringify({
-        mode: 'generate',
-        scene: 'general',
-        reasoning: 'e2e',
-        richPrompt: 'e2e derived concept image',
-        imgRatio: '1:1',
-        quality: 'medium',
-        enhanced: true,
-      }),
-    })
-  })
-
-  page.on('console', (message) => {
-    if (message.type() === 'error' && !message.text().includes('__MIVO_E2E_EXPECTED_ERROR__')) errors.push(message.text())
-  })
 
   const remoteDebugResponse = await page.request.post(`${baseUrl}/api/mivo/debug-logs`, {
     data: {
@@ -5642,6 +5443,6 @@ try {
 
   console.log('E2E smoke test passed')
 } finally {
-  server.kill('SIGTERM')
-  eagleMockServer.close()
+  stopSmokeDevServer(server)
+  await eagleMockHandle.close()
 }
