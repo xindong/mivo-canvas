@@ -28,7 +28,7 @@
 |------------------------|---------------------|------|
 | `id` | 保留(`anchor-<uuid>`) | `createAnchorId` 已稳定 |
 | `type` | 保留 `'point'\|'box'` | 不扩,后续 region/polygon 走 P4-a 再加 |
-| `targetNodeId` | **重命名 + 语义澄清**:→ `targetNodeRef: {kind:'node', id}` | 现状 owner(nodeId)与 target 可不同(store action `addAnchor(nodeId, input)`),正式化应**收束为 owner=target**(anchor 宿主即被锚定的节点);若需"锚定到画布自由点"加 `kind:'canvas'`。见 §1.2 |
+| `targetNodeId` | **收束后移除**:formal CanvasAnchor 不保留此字段,target=ownering node 隐式 | 存量核查(见 §1.2)确认 **0 存量 owner≠target**:store action `addAnchor(nodeId, input)`(canvasStore:3053-3072)以 `nodeId` 查 target 节点(变量名即 `target`),所有测试 fixture 的 `targetNodeId` 都等于 owner.id。正式化时从 `AnchorInput` 去掉 `targetNodeId` 或在 store 加 runtime guard `nodeId===input.targetNodeId`;若后续要"锚定到画布自由点"再加 `targetKind:'canvas'`。见 §1.2 |
 | `x, y` | **改坐标系**:canvas → target-node-relative(见 §1.2) | 一次性迁移:formalize 时在 `normalizeCanvasNodeV2` 里减去 target 节点 transform.x/y |
 | `width?, height?` | 保留(box 必填,point 禁填) | 不变 |
 | `instruction` | 保留 string | 指令载体(见 §1.3);P4-a 不升级为结构化,保持 YAGNI |
@@ -47,7 +47,8 @@
 - **语义评估**:产品愿景是"图和锚点是用户的语言"——锚点应在图上,**节点移动时锚点必须跟随**。canvas 坐标下,移动节点不会移动锚点(语义 bug);MVP 阶段靠 `updateSelectedNodesPosition`(canvasStore:1346)在拖拽时手动同步 anchor.x/y,但这只覆盖"拖 anchor 节点"路径,不覆盖"拖 target 节点"路径。
 - **建议正式化采用 target-node-relative**:锚点坐标存为相对 target 节点 transform 的 `(nx, ny)`(+ box 的 `nw, nh`)。投影层(P3-0)用 `targetNode.transform` 把 `(nx, ny)` 转回 canvas 坐标供渲染。收益:① 节点移动锚点自动跟随(语义自洽);② 持久化体积不涨;③ 与"anchor 宿主=target"的收束一致。
 - **迁移成本**:一次性,在 `normalizeCanvasNodeV2` 里 `anchor.x -= targetNode.transform.x`(+y)。已有 snapshotValidation 可守门。
-- **开放问题(留 D2 纪要 / P4-a)**:① target 节点有 rotation 时,box anchor 是否随 rotation 旋转?(MVP 图片节点无 rotation,可暂不处理,但正式化要表态)② owner ≠ target 的存量数据是否存在(需 grep 快照);若存在,收束为 owner=target 时如何处理(归并 or 拒绝)。
+- **存量核查(已完成,2026-07-04)**:owner ≠ target 的存量=**0**。证据:① store action `addAnchor(nodeId, input)`(canvasStore:3053-3072)以 `nodeId` 查 target 节点(变量名即 `target`),`input.targetNodeId` 仅被 `createAnchor` 原样盖章,无调用方传不同值;② 全部测试 fixture(`anchorModel.test.ts:29-51` / `nodeFactory.test.ts:113-129` / `snapshotValidation.test.ts:324-356`)的 `targetNodeId` 都等于 owner.id;③ 无 demo scene / JSON 快照 / e2e 用例引用 experimentalAnchors(D2 DOM 闭环未合入,无 UI 调用方)。**结论:收束规则 owner=target 可直接写死**——formal CanvasAnchor 移除 `targetNodeId` 字段(target=ownering node 隐式),P4-a 落地时 store action 从 `AnchorInput` 去掉 `targetNodeId` 或加 runtime guard。
+- **开放问题(留 D2 纪要 / P4-a)**:target 节点有 rotation 时,box anchor 是否随 rotation 旋转?(MVP 图片节点无 rotation,可暂不处理,但正式化要表态)
 
 ### 1.3 绑定图引用与指令载体
 
