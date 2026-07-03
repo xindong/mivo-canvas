@@ -10,7 +10,6 @@ import { InspectorPanel } from './app/InspectorPanel'
 import { canReadLocalAssetDrag } from './lib/canvasAssetDrag'
 import { ProjectSidebar } from './app/ProjectSidebar'
 import { ProjectSidebarControls } from './app/ProjectSidebarControls'
-import { TaskQueue } from './app/TaskQueue'
 import { TopBar } from './app/TopBar'
 import { useCanvasStore } from './store/canvasStore'
 import type { WorkspaceView } from './app/ProjectSidebar'
@@ -247,7 +246,6 @@ function App() {
               </div>
             ) : null}
           </div>
-          <TaskQueue />
         </div>
       ) : (
         <div className="workspace library-mode">
