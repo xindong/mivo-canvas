@@ -1,0 +1,15 @@
+{
+  "_purpose": "MivoCanvas 结构守卫基线值。行数与 getState 计数取自 origin/main 22e2e4c,对应 productization-roadmap.md §13 SC5.2 防回潮守卫。",
+  "_howToUse": "由 scripts/ci/structure-guard.mjs 读取。白名单内文件行数不得比记录值增长;非白名单文件 >900 行直接 fail;chatStore.ts 的 useCanvasStore.getState( 调用数不得超过记录值。",
+  "_updatePolicy": "重构后下调或新增已收口大文件后上调,均需在 PR 描述中说明理由。切勿为绕过守卫而随意上调。",
+  "_baselineCommit": "22e2e4c (origin/main, 2026-07-03)",
+  "_threshold": 900,
+  "_scannedDirs": ["src/store", "src/canvas"],
+  "fileLines": {
+    "src/store/canvasStore.ts": 3168,
+    "src/canvas/useCanvasInteractionController.ts": 1775,
+    "src/canvas/actions/canvasActionModel.ts": 1320,
+    "src/canvas/MivoCanvas.tsx": 965
+  },
+  "chatStoreGetStateCount": 6
+}
