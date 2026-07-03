@@ -8,6 +8,7 @@ import type {
   SectionLockMode,
   ToolId,
 } from '../../types/mivoCanvas'
+import type { VariationParam } from '../../types/generation'
 import type { CanvasSelectionContext } from './canvasSelectionModel'
 
 export type LayerMove = 'forward' | 'backward' | 'front' | 'back'
@@ -108,7 +109,11 @@ export type CanvasActionRuntime = {
   setSectionLockMode: (nodeId: string, mode?: SectionLockMode) => void
   removeSectionOnly: (nodeId: string) => void
   selectNodes: (nodeIds: string[], primaryNodeId?: string) => void
-  generateVariations: (sourceNodeId?: string) => void
+  generateVariations: (
+    sourceNodeId?: string,
+    variations?: VariationParam[],
+    options?: CanvasGenerationOptions,
+  ) => Promise<string[]>
   generateImageEdit: (
     sourceNodeId: string | undefined,
     operation: AiWorkflowOperation,
@@ -125,7 +130,7 @@ export type CanvasActionRuntime = {
     prompt?: string,
     options?: CanvasGenerationOptions,
   ) => Promise<string[]>
-  generateFromAnnotation: (annotationNodeId?: string) => void
+  generateFromAnnotation: (annotationNodeId?: string, options?: CanvasGenerationOptions) => Promise<string[]>
   duplicateNode: (nodeId: string) => void
   duplicateSelectedNodes: () => void
   groupSelectedNodes: () => void

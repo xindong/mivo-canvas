@@ -13,9 +13,14 @@
 
 import { randomUUID } from 'node:crypto'
 
-export type TaskStatus = 'pending' | 'running' | 'done' | 'failed' | 'canceled'
-export type TaskKind = 'generate' | 'edit'
-export type TaskResult = { images: Array<{ b64: string }> }
+export type TaskStatus = 'pending' | 'running' | 'done' | 'partial' | 'failed' | 'canceled'
+// P2-C2: 'variations' is a batch of N parallel edits sharing one source image;
+// its result carries per-variation images (with variationIndex) + a failures[]
+// list for the subset that didn't settle successfully (status='partial').
+export type TaskKind = 'generate' | 'edit' | 'variations'
+export type TaskFailure = { variationIndex: number; error: string }
+export type TaskResultImage = { b64: string; variationIndex?: number }
+export type TaskResult = { images: TaskResultImage[] }
 
 export type TaskRecord = {
   id: string
@@ -26,6 +31,13 @@ export type TaskRecord = {
   requestId: string
   model: string
   result?: TaskResult
+  // P2-C2: variations-only fields. failures[] lists the variation indices that
+  // didn't settle successfully (status='partial'); batchId groups the N parallel
+  // edits for client-side display; count is the requested variation count (the
+  // success subset length = result.images.length, may be < count on partial).
+  failures?: TaskFailure[]
+  batchId?: string
+  count?: number
   error?: string
   idempotencyKey?: string
   createdAt: number
@@ -42,13 +54,16 @@ export type TaskView = {
   requestId: string
   model: string
   result?: TaskResult
+  failures?: TaskFailure[]
+  batchId?: string
+  count?: number
   error?: string
 }
 
 const tasks = new Map<string, TaskRecord>()
 const idempotencyIndex = new Map<string, string>()
 
-const isTerminal = (s: TaskStatus): boolean => s === 'done' || s === 'failed' || s === 'canceled'
+const isTerminal = (s: TaskStatus): boolean => s === 'done' || s === 'partial' || s === 'failed' || s === 'canceled'
 
 export const newTaskId = (): string => randomUUID()
 
@@ -56,11 +71,14 @@ export const newTaskId = (): string => randomUUID()
 // the existing record (same taskId). Restart-eviction is implicit: the index is
 // in-memory, so a restarted process has no entry → a repeat submission creates a
 // new task (the lead's "重启后失效视为新任务").
+// P2-C2: `meta` carries variations-only fields (batchId, count) that the runner
+// and toView surface to the client. Other kinds ignore it.
 export const createTask = (
   kind: TaskKind,
   model: string,
   requestId: string,
   idempotencyKey?: string,
+  meta?: { batchId?: string; count?: number },
 ): TaskRecord => {
   if (idempotencyKey) {
     const existingId = idempotencyIndex.get(idempotencyKey)
@@ -84,6 +102,8 @@ export const createTask = (
     controller: new AbortController(),
     idempotencyKey,
   }
+  if (meta?.batchId) record.batchId = meta.batchId
+  if (meta?.count !== undefined) record.count = meta.count
   tasks.set(id, record)
   if (idempotencyKey) idempotencyIndex.set(idempotencyKey, id)
   return record
@@ -124,6 +144,22 @@ export const completeTask = (id: string, result: TaskResult): void => {
   r.result = result
 }
 
+// P2-C2: partial completion — a variations batch where some (not all) edits
+// settled successfully. Commits the success subset as result.images (with
+// variationIndex) + failures[] for the rest. Like completeTask, never commits
+// after cancel. progress=100 (terminal). The client resolves the success subset
+// (does NOT reject on partial — only all-fail rejects).
+export const completePartialTask = (id: string, result: TaskResult, failures: TaskFailure[]): void => {
+  const r = tasks.get(id)
+  if (!r) return
+  if (r.status === 'canceled') return // never commit after cancel
+  r.status = 'partial'
+  r.stage = 'done'
+  r.progress = 100
+  r.result = result
+  r.failures = failures
+}
+
 export const failTask = (id: string, error: string): void => {
   const r = tasks.get(id)
   if (!r) return
@@ -144,6 +180,9 @@ export const toView = (r: TaskRecord): TaskView => {
     model: r.model,
   }
   if (r.result) view.result = r.result
+  if (r.failures) view.failures = r.failures
+  if (r.batchId) view.batchId = r.batchId
+  if (r.count !== undefined) view.count = r.count
   if (r.error) view.error = r.error
   return view
 }

@@ -26,7 +26,7 @@
 // uses for '已取消'); otherwise 'upstream-error'. The thrown MivoImageRequestError
 // then carries the kind chatStore expects.
 
-import type { MivoEditRequest, MivoGenerateRequest } from '../types/generation'
+import type { MivoEditRequest, MivoGenerateRequest, VariationParam } from '../types/generation'
 import { MivoImageRequestError } from './mivoImageClient'
 
 const defaultModel = 'gpt-image-2'
@@ -34,18 +34,27 @@ const submitTimeoutMs = 30_000 // POST must return 202 quickly
 const pollTimeoutMs = 15_000 // each GET
 const defaultPollIntervalMs = 1000
 
-export type TaskStatus = 'pending' | 'running' | 'done' | 'failed' | 'canceled' | 'unknown'
-export type TaskResult = { images: Array<{ b64: string }> }
+export type TaskStatus = 'pending' | 'running' | 'done' | 'partial' | 'failed' | 'canceled' | 'unknown'
+export type TaskKind = 'generate' | 'edit' | 'variations'
+export type TaskFailure = { variationIndex: number; error: string }
+export type TaskResultImage = { b64: string; variationIndex?: number }
+export type TaskResult = { images: TaskResultImage[] }
 
 export type TaskView = {
   id: string
-  kind: 'generate' | 'edit'
+  kind: TaskKind
   status: TaskStatus
   progress: number
   stage: string
   requestId: string
   model: string
   result?: TaskResult
+  // P2-C2: variations-only — failures[] lists the variation indices that didn't
+  // settle successfully (status='partial'); batchId groups the batch; count is the
+  // requested variation count (success subset length = result.images.length).
+  failures?: TaskFailure[]
+  batchId?: string
+  count?: number
   error?: string
 }
 
@@ -149,6 +158,13 @@ export const submitEditTask = async (
   const formData = new FormData()
   formData.append('image', request.image, fileNameForBlob(request.image, 'source.png'))
   if (request.mask) formData.append('mask', request.mask, fileNameForBlob(request.mask, 'mask.png'))
+  // P2-C2: annotation area-edit — send normalized maskBounds (+ sourceSize) so the
+  // BFF synthesizes the area mask PNG. Only when no brush mask blob is present
+  // (mutually exclusive: brush mask vs bounds-derived mask).
+  if (request.maskBounds && !request.mask) {
+    formData.set('maskBounds', JSON.stringify(request.maskBounds))
+    if (request.sourceSize) formData.set('sourceSize', JSON.stringify(request.sourceSize))
+  }
   request.reference?.forEach((blob, index) => {
     formData.append('reference[]', blob, fileNameForBlob(blob, `reference-${index + 1}.png`))
   })
@@ -176,6 +192,37 @@ export const submitEditTask = async (
   const body = (await response.json()) as { taskId?: string }
   if (!body.taskId) throw new MivoImageRequestError('任务提交响应无效。', 'upstream-error')
   return body.taskId
+}
+
+// POST /api/mivo/tasks/variations → 202 {taskId, batchId, count}. Multipart: the
+// source image blob + a `variations` JSON field (Array<{prompt?,imgRatio?,quality?,
+// model?}>). The BFF fires N parallel llm-proxy /edits calls and aggregates
+// done/partial/failed. Idempotency-Key is one-time per call (same as generate/edit).
+export const submitVariationsTask = async (
+  request: { image: Blob; variations: VariationParam[]; idempotencyKey: string; signal?: AbortSignal },
+): Promise<{ taskId: string; batchId: string; count: number }> => {
+  const formData = new FormData()
+  formData.append('image', request.image, fileNameForBlob(request.image, 'source.png'))
+  formData.set('variations', JSON.stringify(request.variations))
+  const response = await fetchWithTimeout(
+    '/api/mivo/tasks/variations',
+    {
+      method: 'POST',
+      headers: { 'Idempotency-Key': request.idempotencyKey },
+      body: formData,
+    },
+    submitTimeoutMs,
+    request.signal,
+  )
+  if (!response.ok) {
+    throw new MivoImageRequestError(
+      await readSubmitError(response),
+      response.status === 504 ? 'upstream-timeout' : 'upstream-error',
+    )
+  }
+  const body = (await response.json()) as { taskId?: string; batchId?: string; count?: number }
+  if (!body.taskId) throw new MivoImageRequestError('任务提交响应无效。', 'upstream-error')
+  return { taskId: body.taskId, batchId: body.batchId || '', count: body.count ?? request.variations.length }
 }
 
 // GET /api/mivo/tasks/:id → 200 TaskView | 404 {error:'unknown-task'}.

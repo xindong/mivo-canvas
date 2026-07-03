@@ -108,7 +108,7 @@ const moveLayerAction = (runtime: CanvasActionRuntime, move: LayerMove) => {
 }
 
 const makeVariations = (runtime: CanvasActionRuntime) => {
-  runtime.generateVariations(primaryNodeId(runtime))
+  void runtime.generateVariations(primaryNodeId(runtime))
 }
 
 const generateBesidePrimary = (runtime: CanvasActionRuntime) => {
@@ -208,7 +208,7 @@ const imageAiEditActionsFor = (runtime: CanvasActionRuntime): CanvasActionItem[]
 ]
 
 const generateFromPrimaryAnnotation = (runtime: CanvasActionRuntime) => {
-  runtime.generateFromAnnotation(primaryNodeId(runtime))
+  void runtime.generateFromAnnotation(primaryNodeId(runtime))
 }
 
 const cropPrimaryNode = (runtime: CanvasActionRuntime) => {

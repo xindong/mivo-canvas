@@ -384,7 +384,7 @@ export function InspectorPanel({ onClose }: InspectorPanelProps) {
 
         <div className="panel-actions">
           {canMakeVariations ? (
-            <button type="button" className="primary-action" onClick={() => generateVariations(node.id)}>
+            <button type="button" className="primary-action" onClick={() => void generateVariations(node.id)}>
               <Sparkles size={16} />
               Make variations
             </button>

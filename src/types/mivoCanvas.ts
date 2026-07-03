@@ -314,6 +314,15 @@ export type MivoCanvasNode = {
   aiWorkflow?: CanvasAiWorkflow
   /** P2-D1 EXPERIMENTAL — see {@link ExperimentalAnchor}. Undefined on most nodes. */
   experimentalAnchors?: ExperimentalAnchor[]
+  // P2-C2 EXPERIMENTAL — annotation area-edit bounds (roadmap §7 组 C). Optional +
+  // backward compatible: no persist key/version bump (rides along in
+  // compactNodeForPersist via cloneNode, like experimentalAnchors). Canvas-coordinate
+  // (x/y relative to the canvas, NOT the node). Only meaningful on annotation nodes
+  // (points at the editable region of the source image). The client normalizes this
+  // to the source node's relative 0-1 maskBounds before sending to /tasks/edit; the
+  // BFF synthesizes the mask PNG (see server/lib/maskPng.ts). Migration rule (roadmap
+  // §9 P4-a):收编为 a formal field or removed once the area-edit spike resolves.
+  annotationBounds?: CanvasMaskBounds
 }
 
 export type AiCanvasContextNode = {

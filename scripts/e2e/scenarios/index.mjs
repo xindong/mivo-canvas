@@ -6,6 +6,7 @@ import { runDebugScenario } from './debug.mjs'
 import { runMaskScenario } from './mask.mjs'
 import { runMigrationScenario } from './migration.mjs'
 import { runShellSidebarScenario } from './shell-sidebar.mjs'
+import { runVariationsAnnotationScenario } from './variations-annotation.mjs'
 
 export const scenarioOrder = [
   'debug',
@@ -16,6 +17,7 @@ export const scenarioOrder = [
   'mask',
   'migration',
   'anchor-mvp',
+  'variations-annotation',
 ]
 
 export const scenarioBootstrapPredecessor = {
@@ -34,4 +36,5 @@ export const scenarioRunners = {
   mask: runMaskScenario,
   migration: runMigrationScenario,
   'shell-sidebar': runShellSidebarScenario,
+  'variations-annotation': runVariationsAnnotationScenario,
 }
