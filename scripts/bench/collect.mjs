@@ -100,6 +100,11 @@ const parseArgs = (argv) => {
     seed: DEFAULT_FIXTURE_SEED,
     date: DEFAULT_DATE,
     output: undefined,
+    note: '初测,P2 完成后须重测出正式 gate 值',
+    outputType: 'dom-baseline-initial',
+    gateStatus: 'initial',
+    mainSha: undefined,
+    supersedes: undefined,
     headless: true,
   }
 
@@ -147,6 +152,31 @@ const parseArgs = (argv) => {
 
     if (entry.startsWith('--output=')) {
       options.output = entry.slice('--output='.length).trim()
+      continue
+    }
+
+    if (entry.startsWith('--note=')) {
+      options.note = entry.slice('--note='.length).trim() || options.note
+      continue
+    }
+
+    if (entry.startsWith('--output-type=')) {
+      options.outputType = entry.slice('--output-type='.length).trim() || options.outputType
+      continue
+    }
+
+    if (entry.startsWith('--gate-status=')) {
+      options.gateStatus = entry.slice('--gate-status='.length).trim() || options.gateStatus
+      continue
+    }
+
+    if (entry.startsWith('--main-sha=')) {
+      options.mainSha = entry.slice('--main-sha='.length).trim() || undefined
+      continue
+    }
+
+    if (entry.startsWith('--supersedes=')) {
+      options.supersedes = entry.slice('--supersedes='.length).trim() || undefined
       continue
     }
 
@@ -652,8 +682,8 @@ const main = async () => {
           thresholdMs: 33,
           dprP95FrameMs: dprGateValues,
           worstP95FrameMs: round(worstP95, 3),
-          status: 'initial',
-          note: '初测,P2 完成后须重测出正式 gate 值',
+          status: options.gateStatus,
+          note: options.note,
         },
       })
     }
@@ -673,9 +703,11 @@ const main = async () => {
         motion: 'prefers-reduced-motion + transition/animation disabled',
         syncMeasurement: 'replaceSnapshot(full snapshot) until expected node count / viewport settle',
         traceMarks: ['store-to-renderer-sync', 'canvas-pan', 'canvas-zoom'],
+        ...(options.mainSha ? { mainSha: options.mainSha } : {}),
       },
-      note: '初测,P2 完成后须重测出正式 gate 值',
-      outputType: 'dom-baseline-initial',
+      note: options.note,
+      outputType: options.outputType,
+      ...(options.supersedes ? { supersedes: options.supersedes } : {}),
       configs,
     }
 

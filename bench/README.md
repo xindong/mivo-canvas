@@ -47,6 +47,12 @@ Collect the initial DOM baseline bundle:
 npm run bench:collect -- --nodes=100,500,1000 --dpr=1,2 --runs=5 --output=bench/baselines/dom-500-1000-2026-07-04.json
 ```
 
+Collect the formal D10 gate bundle after P2 completes:
+
+```bash
+npm run bench:collect -- --nodes=100,500,1000 --dpr=1,2 --runs=5 --output=bench/baselines/dom-500-1000-2026-07-04.json --output-type=dom-baseline-formal-gate --gate-status=formal --main-sha=3994f98 --note='formal gate measurement (P2 complete, main=3994f98)'
+```
+
 If Chromium is not installed yet:
 
 ```bash
@@ -71,3 +77,5 @@ The committed `2026-07-04` file is an **initial measurement only**:
 
 - note: `初测,P2 完成后须重测出正式 gate 值`
 - do not use it as the final D10 decision record
+
+If a formal gate re-measurement happens on the same calendar date as the initial file, preserve the initial artifact under a suffixed archival name such as `dom-500-1000-2026-07-04-initial.json`, add a `superseded` note to it, and reserve the canonical `dom-500-1000-2026-07-04.json` path for the formal gate file.
