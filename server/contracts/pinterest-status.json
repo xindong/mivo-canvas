@@ -1,4 +1,11 @@
 {
+  "_p1cImplementation": {
+    "intentionalChanges": [],
+    "preservedQuirks": [
+      "D6: no method guard — app.all returns the same 200 for POST/PUT/DELETE as GET."
+    ],
+    "frameworkDiffs": []
+  },
   "endpoint": "/api/mivo/pinterest/status",
   "summary": "Hardcoded placeholder. Always returns {connected:false, mode:'prototype'}. No upstream, no env, no auth.",
   "sourceFile": "vite.config.ts",
