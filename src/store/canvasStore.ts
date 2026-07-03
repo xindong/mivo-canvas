@@ -5,10 +5,8 @@ import type {
   AiWorkflowOperation,
   CanvasAssetNodeType,
   CanvasEdge,
-  CanvasEdgeType,
   CanvasId,
   CanvasDocument,
-  CanvasMaskBounds,
   CanvasTask,
   BrushToolMode,
   CanvasStampKind,
@@ -24,7 +22,7 @@ import type {
   SectionLockMode,
   ToolId,
 } from '../types/mivoCanvas'
-import { connectorAnchorPointFor, connectorBindingPointFor, derivationConnectorBindingsFor, isConnectorNode } from '../canvas/connectorGeometry'
+import { connectorBindingPointFor, isConnectorNode } from '../canvas/connectorGeometry'
 import { defaultBrushWidth, highlighterOpacity } from '../canvas/brushGeometry'
 import { defaultStampKind, stampLabelFor } from '../canvas/stampDefs'
 import { defaultSizeForNodeType } from '../canvas/nodeTypes/canvasNodeRegistry'
@@ -56,6 +54,23 @@ import {
   snapshotFromState as buildHistorySnapshot,
   type HistoryCloneFns,
 } from './historyManager'
+import {
+  cloneEdge,
+  cloneEdges,
+  cloneNode,
+  cloneNodes,
+  cloneTask,
+  cloneTasks,
+  createCanvasId,
+  createDerivationEdgeNode,
+  createEdgeId,
+  createGenerationResultNode,
+  createGroupId,
+  createNodeId,
+  createNodeCopy,
+  edgeTypeForOperation,
+  isDerivationEdgeNode,
+} from './nodeFactory'
 import { mockGenerationAdapter } from './mockGeneration'
 import type { CanvasAssetClipboardItem } from '../app/assetLibraryModel'
 import type {
@@ -290,37 +305,6 @@ const sceneLabels = new Map(sceneOptions.map((scene) => [scene.id, scene.label])
 
 const fallbackTitle = (sceneId: CanvasId) => sceneLabels.get(sceneId as DemoSceneId) || sceneId
 
-const cloneNode = (node: MivoCanvasNode): MivoCanvasNode => ({
-  ...normalizeCanvasNodeV2(node),
-  markupPoints: node.markupPoints ? node.markupPoints.map((point) => ({ ...point })) : undefined,
-  connectorStart: node.connectorStart ? { ...node.connectorStart } : undefined,
-  connectorEnd: node.connectorEnd ? { ...node.connectorEnd } : undefined,
-  parentIds: node.parentIds ? [...node.parentIds] : undefined,
-  generation: node.generation
-    ? {
-        ...node.generation,
-        maskBounds: node.generation.maskBounds ? { ...node.generation.maskBounds } : undefined,
-      }
-    : undefined,
-  aiWorkflow: node.aiWorkflow
-    ? {
-        ...node.aiWorkflow,
-        sourceNodeIds: node.aiWorkflow.sourceNodeIds ? [...node.aiWorkflow.sourceNodeIds] : undefined,
-      }
-    : undefined,
-})
-
-const cloneTask = (task: CanvasTask): CanvasTask => ({
-  ...task,
-  nodeIds: [...task.nodeIds],
-})
-
-const cloneEdge = (edge: CanvasEdge): CanvasEdge => ({ ...edge })
-
-const cloneNodes = (nodes: MivoCanvasNode[]) => nodes.map(cloneNode)
-const cloneTasks = (tasks: CanvasTask[]) => tasks.map(cloneTask)
-const cloneEdges = (edges: CanvasEdge[] = []) => edges.map(cloneEdge)
-
 // Inject the canvasStore clone helpers into the pure history functions (historyManager.ts),
 // keeping this module the single source of truth for *how* nodes/edges/tasks are deep-cloned
 // while historyManager owns the push/undo/redo/trim logic.
@@ -376,18 +360,6 @@ const snapshotFromState = (
 ) => buildHistorySnapshot(state, historyCloneFns)
 
 const remember = (state: CanvasState) => pushHistory(state, historyCloneFns)
-
-const createCanvasId = () => {
-  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
-    return `canvas-${crypto.randomUUID()}`
-  }
-
-  return `canvas-${Date.now()}-${Math.random().toString(16).slice(2)}`
-}
-
-const createGroupId = () => `group-${Date.now()}-${Math.random().toString(16).slice(2)}`
-const createNodeId = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`
-const createEdgeId = () => createNodeId('edge')
 
 const defaultSectionFillColor = '#ffffff'
 const defaultSectionBorderColor = '#ff8a00'
@@ -516,53 +488,6 @@ const normalizeConnectorMarkupNodes = (nodes: MivoCanvasNode[]) =>
       height: Math.round(next.geometry.height),
     })
   })
-
-const derivationEdgeModel = 'Mivo Derivation Edge'
-const derivationEdgeNodeId = (edgeId: string) => `derivation-${edgeId}`
-const isDerivationEdgeNode = (node: MivoCanvasNode) =>
-  node.type === 'markup' && node.generation?.model === derivationEdgeModel
-
-const createDerivationEdgeNode = (edge: CanvasEdge, nodes: MivoCanvasNode[]): MivoCanvasNode | undefined => {
-  const source = nodes.find((node) => node.id === edge.from && !node.hidden)
-  const target = nodes.find((node) => node.id === edge.to && !node.hidden)
-  if (!source || !target) return undefined
-
-  // M10: dynamic anchor selection — pick shortest-distance anchor pair
-  const { start, end } = derivationConnectorBindingsFor(source, target)
-  const startPt = connectorAnchorPointFor(source, start.anchor, 0.5)
-  const endPt = connectorAnchorPointFor(target, end.anchor, 0.5)
-
-  return makeNode({
-    id: derivationEdgeNodeId(edge.id),
-    type: 'markup',
-    title: edge.type === 'edit' ? 'Edit derivation' : 'Generation derivation',
-    // Initial geometry; overridden by normalizeConnectorMarkupNodes from binding anchor points
-    x: Math.min(startPt.x, endPt.x),
-    y: Math.min(startPt.y, endPt.y),
-    width: Math.max(24, Math.abs(endPt.x - startPt.x)),
-    height: Math.max(24, Math.abs(endPt.y - startPt.y)),
-    markupKind: 'arrow',
-    markupStrokeColor: '#497466',
-    markupStrokeWidth: 3,
-    markupStrokeStyle: 'solid',
-    markupOpacity: 0.82,
-    markupStartArrow: false,
-    markupEndArrow: true,
-    markupPoints: [
-      { x: 0, y: 0 },
-      { x: Math.max(24, Math.abs(endPt.x - startPt.x)), y: Math.round(endPt.y - startPt.y) },
-    ],
-    connectorStart: start,
-    connectorEnd: end,
-    status: 'ready',
-    locked: true,
-    generation: {
-      prompt: edge.prompt,
-      model: derivationEdgeModel,
-      createdAt: edge.createdAt,
-    },
-  })
-}
 
 const syncDerivationEdgeNodes = (nodes: MivoCanvasNode[], edges: CanvasEdge[]) => {
   const contentNodes = nodes.filter((node) => !isDerivationEdgeNode(node))
@@ -765,25 +690,6 @@ const applySnapshot = (state: CanvasState, snapshot: MivoCanvasSnapshot) => {
   }
 }
 
-const createNodeCopy = (
-  source: MivoCanvasNode,
-  index: number,
-  offset = 28,
-  overrides?: Partial<MivoCanvasNode>,
-): MivoCanvasNode => ({
-  ...cloneNode(source),
-  id: `${source.id}-copy-${Date.now()}-${index}`,
-  title: `${source.title} Copy`,
-  x: source.x + offset,
-  y: source.y + offset,
-  groupId: undefined,
-  sectionId: undefined,
-  connectorStart: undefined,
-  connectorEnd: undefined,
-  hidden: undefined,
-  ...overrides,
-})
-
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value))
 
 const cropEqualsFullImage = (crop: { x: number; y: number; width: number; height: number }) =>
@@ -848,14 +754,6 @@ const importedAssetModelFor = (type: Exclude<CanvasAssetNodeType, 'markdown'>) =
   if (type === 'video') return 'Imported Video'
   return 'Imported'
 }
-
-const cloneMaskBounds = (maskBounds?: CanvasMaskBounds) =>
-  maskBounds ? { ...maskBounds } : undefined
-
-const edgeTypeForOperation = (operation: AiWorkflowOperation): CanvasEdgeType =>
-  operation === 'slot-generation' || operation === 'beside-generation' || operation === 'variation'
-    ? 'generate'
-    : 'edit'
 
 const blobFromCommittedGenerationImage = (image: CommittedGenerationImage) => {
   if (image.blob) return image.blob
@@ -2597,41 +2495,27 @@ export const useCanvasStore = create<CanvasState>()(
                 : currentSource?.type === 'ai-slot'
                   ? 'slot-generation'
                   : 'beside-generation'
-            const resultNode = makeNode({
+            const resultNode = createGenerationResultNode({
               id: nodeId,
-              type: 'image',
               title: image.title?.trim() || `Generated image ${index + 1}`,
-              x: Math.round(placement.x),
-              y: Math.round(placement.y),
-              width: Math.round(displaySize.width),
-              height: Math.round(displaySize.height),
-              assetUrl: asset.assetUrl,
-              assetMimeType: asset.type,
-              assetOriginalName: asset.name,
-              assetSizeBytes: asset.sizeBytes,
-              imageHasTransparency: asset.hasTransparency,
-              status: 'ready',
-              parentIds: currentSource ? [currentSource.id] : undefined,
-              sourceNodeId: currentSource?.id,
-              generation: {
-                prompt,
-                model: payload.model,
+              placement,
+              displaySize,
+              asset: {
+                assetUrl: asset.assetUrl,
+                type: asset.type,
+                name: asset.name,
+                sizeBytes: asset.sizeBytes,
+                hasTransparency: asset.hasTransparency,
                 size: asset.size,
-                taskId,
-                createdAt,
-                maskBounds: cloneMaskBounds(payload.maskBounds),
               },
-              aiWorkflow: {
-                kind: 'result',
-                status: 'ready',
-                operation,
-                prompt,
-                sourceNodeIds: currentSource ? [currentSource.id] : undefined,
-                anchorNodeId: currentSource?.id,
-                slotId: currentSource?.type === 'ai-slot' ? currentSource.id : undefined,
-                placement: payload.placement || 'right',
-                createdAt,
-              },
+              prompt,
+              model: payload.model,
+              taskId,
+              createdAt,
+              maskBounds: payload.maskBounds,
+              operation,
+              sourceNode: currentSource,
+              placementDirection: payload.placement || 'right',
             })
 
             createdNodeIds.push(nodeId)
