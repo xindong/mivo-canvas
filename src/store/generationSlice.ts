@@ -32,18 +32,20 @@ const upsertTask = (tasks: CanvasTask[], task: CanvasTask) => [
   ...tasks.filter((item) => item.id !== task.id),
 ].slice(0, 5)
 
+// P1 fix (rev-behavior): failed/canceled tasks preserve the last observed progress
+// (not hardcoded 100), matching the server contract "失败/取消停在最后值". The caller
+// passes the LIVE task (read from the store at catch time) so its progress reflects
+// the last patchRunning sample — the stale `runningTask` (progress 0) is NOT used.
 const failedTask = (task: CanvasTask, label: string): CanvasTask => ({
   ...task,
   label,
   status: 'failed',
-  progress: 100,
 })
 
 const canceledTask = (task: CanvasTask, label: string): CanvasTask => ({
   ...task,
   label,
   status: 'canceled',
-  progress: 100,
 })
 
 const doneTask = (task: CanvasTask, label: string, nodeIds: string[]): CanvasTask => ({
@@ -332,12 +334,13 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
       set((current) => {
         const doc = current.canvases[targetSceneId]
         if (!doc) return {}
+        const liveTask = doc.tasks.find((t) => t.id === runningTask.id) ?? runningTask
         return patchCanvasDocument(current, targetSceneId, {
           tasks: upsertTask(
             doc.tasks,
             canceled
-              ? canceledTask(runningTask, `变体生成已取消：${source.title}`)
-              : failedTask(runningTask, `变体生成失败：${message}`),
+              ? canceledTask(liveTask, `变体生成已取消：${source.title}`)
+              : failedTask(liveTask, `变体生成失败：${message}`),
           ),
         })
       })
@@ -431,12 +434,13 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
       set((current) => {
         const targetDocument = current.canvases[targetSceneId]
         if (!targetDocument) return {}
+        const liveTask = targetDocument.tasks.find((t) => t.id === runningTask.id) ?? runningTask
         return patchCanvasDocument(current, targetSceneId, {
           tasks: upsertTask(
             targetDocument.tasks,
             canceled
-              ? canceledTask(runningTask, `${operationLabel} canceled`)
-              : failedTask(runningTask, `${operationLabel} failed: ${message}`),
+              ? canceledTask(liveTask, `${operationLabel} canceled`)
+              : failedTask(liveTask, `${operationLabel} failed: ${message}`),
           ),
         })
       })
@@ -536,12 +540,13 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
       set((current) => {
         const targetDocument = current.canvases[targetSceneId]
         if (!targetDocument) return {}
+        const liveTask = targetDocument.tasks.find((t) => t.id === runningTask.id) ?? runningTask
         return patchCanvasDocument(current, targetSceneId, {
           tasks: upsertTask(
             targetDocument.tasks,
             canceled
-              ? canceledTask(runningTask, `旁边生成已取消：${source.title}`)
-              : failedTask(runningTask, `旁边生成失败：${message}`),
+              ? canceledTask(liveTask, `旁边生成已取消：${source.title}`)
+              : failedTask(liveTask, `旁边生成失败：${message}`),
           ),
         })
       })
@@ -673,6 +678,7 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
       set((current) => {
         const targetDocument = current.canvases[targetSceneId]
         if (!targetDocument) return {}
+        const liveTask = targetDocument.tasks.find((t) => t.id === runningTask.id) ?? runningTask
         const nodes = targetDocument.nodes.map((node) =>
           node.id === slot.id && node.aiWorkflow
             ? {
@@ -689,8 +695,8 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
           tasks: upsertTask(
             targetDocument.tasks,
             canceled
-              ? canceledTask(runningTask, `生成到槽位已取消：${slot.title}`)
-              : failedTask(runningTask, `生成到槽位失败：${message}`),
+              ? canceledTask(liveTask, `生成到槽位已取消：${slot.title}`)
+              : failedTask(liveTask, `生成到槽位失败：${message}`),
           ),
         })
       })
@@ -789,12 +795,13 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
       set((current) => {
         const doc = current.canvases[targetSceneId]
         if (!doc) return {}
+        const liveTask = doc.tasks.find((t) => t.id === runningTask.id) ?? runningTask
         return patchCanvasDocument(current, targetSceneId, {
           tasks: upsertTask(
             doc.tasks,
             canceled
-              ? canceledTask(runningTask, `批注修图已取消：${source.title}`)
-              : failedTask(runningTask, `批注修图失败：${message}`),
+              ? canceledTask(liveTask, `批注修图已取消：${source.title}`)
+              : failedTask(liveTask, `批注修图失败：${message}`),
           ),
         })
       })

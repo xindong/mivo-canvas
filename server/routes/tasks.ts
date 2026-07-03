@@ -56,12 +56,18 @@ tasksRoute.post('/generate', async (c) => {
   }
   const model = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : defaultMivoImageModel
   const idempotencyKey = c.req.header('idempotency-key') || undefined
-  const record = createTask('generate', model, requestId, idempotencyKey)
-  // Fire-and-forget: the runner records progress/result into the registry. The
-  // .catch is a safety net only — the runner catches internally.
-  void runGenerateTask(record.id, { prompt, imgRatio: body.imgRatio, quality: body.quality, model: body.model, n: body.n }).catch((err) => {
-    failTask(record.id, err instanceof Error ? err.message : 'runner crashed')
-  })
+  const { record, created } = createTask('generate', model, requestId, idempotencyKey)
+  // P1 fix (rev-behavior): only launch the runner on first creation. A repeat
+  // submission with the same Idempotency-Key returns the existing task
+  // (created=false) — re-running would duplicate upstream calls (billing) + race
+  // on the same record. The existing taskId is returned unchanged.
+  if (created) {
+    // Fire-and-forget: the runner records progress/result into the registry. The
+    // .catch is a safety net only — the runner catches internally.
+    void runGenerateTask(record.id, { prompt, imgRatio: body.imgRatio, quality: body.quality, model: body.model, n: body.n }).catch((err) => {
+      failTask(record.id, err instanceof Error ? err.message : 'runner crashed')
+    })
+  }
   logRequest({ method: c.req.method, path: c.req.path, requestId, status: 202, latencyMs: Date.now() - t0, upstream: 'task' })
   return c.json({ taskId: record.id }, 202)
 })
@@ -137,18 +143,21 @@ tasksRoute.post('/edit', async (c) => {
     }
   }
 
-  const record = createTask('edit', modelField, requestId, idempotencyKey)
-  void runEditTask(record.id, {
-    image,
-    prompt,
-    imgRatio: firstMultipartField(fields, 'imgRatio'),
-    quality: firstMultipartField(fields, 'quality'),
-    model: modelField,
-    mask,
-    references,
-  }).catch((err) => {
-    failTask(record.id, err instanceof Error ? err.message : 'runner crashed')
-  })
+  const { record, created } = createTask('edit', modelField, requestId, idempotencyKey)
+  // P1 fix: only launch the runner on first creation (see /generate).
+  if (created) {
+    void runEditTask(record.id, {
+      image,
+      prompt,
+      imgRatio: firstMultipartField(fields, 'imgRatio'),
+      quality: firstMultipartField(fields, 'quality'),
+      model: modelField,
+      mask,
+      references,
+    }).catch((err) => {
+      failTask(record.id, err instanceof Error ? err.message : 'runner crashed')
+    })
+  }
   logRequest({ method: c.req.method, path: c.req.path, requestId, status: 202, latencyMs: Date.now() - t0, upstream: 'task' })
   return c.json({ taskId: record.id }, 202)
 })
@@ -201,12 +210,17 @@ tasksRoute.post('/variations', async (c) => {
   // batchId groups this batch's N edits for client-side display (variant grid).
   // Not the taskId — the taskId is the registry id returned to the client.
   const batchId = `batch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
-  const record = createTask('variations', modelField, requestId, idempotencyKey, { batchId, count: variations.length })
-  void runVariationsTask(record.id, { image, variations, batchId }).catch((err) => {
-    failTask(record.id, err instanceof Error ? err.message : 'runner crashed')
-  })
+  const { record, created } = createTask('variations', modelField, requestId, idempotencyKey, { batchId, count: variations.length })
+  // P1 fix: only launch the runner on first creation (see /generate). On a repeat
+  // submission the existing batchId/count are returned from the record, so the
+  // client still sees the original batch grouping.
+  if (created) {
+    void runVariationsTask(record.id, { image, variations, batchId }).catch((err) => {
+      failTask(record.id, err instanceof Error ? err.message : 'runner crashed')
+    })
+  }
   logRequest({ method: c.req.method, path: c.req.path, requestId, status: 202, latencyMs: Date.now() - t0, upstream: 'task' })
-  return c.json({ taskId: record.id, batchId, count: variations.length }, 202)
+  return c.json({ taskId: record.id, batchId: record.batchId ?? batchId, count: record.count ?? variations.length }, 202)
 })
 
 tasksRoute.get('/:id', (c) => {

@@ -328,6 +328,35 @@ describe('contract: generateImageEdit orchestration (mock network)', () => {
     expect(useCanvasStore.getState().nodes).toHaveLength(1) // only the source node, no result
     // Pre-abort short-circuits before submit — no server task is created.
     expect(mockSubmitEditTask).not.toHaveBeenCalled()
+    // P1 fix: progress preserved at the last observed sample (0 — never polled),
+    // not hardcoded 100 (server contract: 取消停在最后值).
+    expect(tasks[0].progress).toBeLessThan(100)
+    expect(tasks[0].progress).toBe(0)
+  })
+
+  it('cancel preserves the last observed progress (not hardcoded 100)', async () => {
+    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+    const controller = new AbortController()
+    // 1st poll returns running(60) AND aborts. The loop's top-check already passed
+    // (signal not yet aborted), so the poll lands + patchRunning(60) commits the
+    // sample. The subsequent sleep(0, aborted) hits sleep's aborted branch (rejects
+    // canceled without touching window.setTimeout) → loop throws. The live task's
+    // last sample was 60, so canceledTask preserves progress=60.
+    mockPollTask.mockImplementation(async () => {
+      controller.abort()
+      return { id: 't1', kind: 'edit', status: 'running', progress: 60, stage: 'poll', requestId: 'r', model: 'gpt-image-2' }
+    })
+
+    const promise = useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat', { signal: controller.signal })
+    await expect(promise).rejects.toThrow()
+
+    const task = useCanvasStore.getState().tasks[0]
+    expect(task.status).toBe('canceled')
+    // P1 fix (rev-behavior): progress preserved at the last observed sample (60),
+    // not hardcoded 100. Without the fix (progress:100 in canceledTask) this would
+    // be 100; with the stale runningTask (progress 0) it would be 0 — both wrong.
+    expect(task.progress).toBe(60)
+    expect(task.progress).toBeLessThan(100)
   })
 
   it('failure: a non-abort error marks the task failed and rejects', async () => {
