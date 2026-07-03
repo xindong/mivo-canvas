@@ -323,18 +323,23 @@ describe('experimentalAnchors (P2-D1 light validation)', () => {
   const anchorNode = (anchors: unknown): MivoCanvasNode =>
     validImageNode({ id: 'n1', experimentalAnchors: anchors as MivoCanvasNode['experimentalAnchors'] })
 
-  it('accepts a snapshot with valid point + box anchors', () => {
+  it('accepts a snapshot with valid point + box anchors (normalized anchors deep-equal, preserving box width/height + resultNodeIds)', () => {
+    const anchors = [
+      { id: 'a1', type: 'point', targetNodeId: 'n1', x: 1, y: 2, instruction: 'i', createdAt: 1, resultNodeIds: ['r1', 'r2'] },
+      { id: 'a2', type: 'box', targetNodeId: 'n1', x: 1, y: 2, width: 10, height: 20, instruction: 'i', createdAt: 2 },
+    ]
     const result = parse(
       validSnapshot({
-        nodes: [
-          anchorNode([
-            { id: 'a1', type: 'point', targetNodeId: 'n1', x: 1, y: 2, instruction: 'i', createdAt: 1 },
-            { id: 'a2', type: 'box', targetNodeId: 'n1', x: 1, y: 2, width: 10, height: 20, instruction: 'i', createdAt: 2 },
-          ]),
-        ],
+        nodes: [anchorNode(anchors)],
       }),
     )
     expect(result.ok).toBe(true)
+    if (!result.ok) return
+    // Strengthened (rev-verify top-3 weakest): normalize preserves the anchors
+    // deep-equal — including the box's width/height (not dropped) and the point's
+    // resultNodeIds (not dropped). Was: only `expect(result.ok).toBe(true)`.
+    const normalizedAnchors = result.snapshot.nodes[0].experimentalAnchors
+    expect(normalizedAnchors).toEqual(anchors)
   })
 
   it('rejects a box anchor missing width/height', () => {

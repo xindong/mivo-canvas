@@ -207,6 +207,20 @@ describe('contract: generation action signatures', () => {
     const nodeIds = await result
     expect(Array.isArray(nodeIds)).toBe(true)
     expect(nodeIds.every((id) => typeof id === 'string')).toBe(true)
+
+    // Strengthened binding (rev-verify top-3 weakest): each returned id is a real
+    // result node in the target scene, sourced from n1, with a derivation edge
+    // from n1, and the associated task reached terminal 'done' carrying exactly
+    // these nodeIds (not just "is a string array").
+    const s = useCanvasStore.getState()
+    nodeIds.forEach((id) => {
+      const node = s.nodes.find((n) => n.id === id)
+      expect(node).toBeDefined()
+      expect(node?.sourceNodeId).toBe('n1')
+    })
+    expect(s.edges.filter((e) => nodeIds.includes(e.to) && e.from === 'n1')).toHaveLength(nodeIds.length)
+    expect(s.tasks[0]?.status).toBe('done')
+    expect(s.tasks[0]?.nodeIds).toEqual(nodeIds)
   })
 
   it('generateBesideNode returns a Promise<string[]>', async () => {
@@ -214,6 +228,24 @@ describe('contract: generation action signatures', () => {
     const nodeIds = await useCanvasStore.getState().generateBesideNode('n1', 'a cat')
     expect(Array.isArray(nodeIds)).toBe(true)
     expect(nodeIds.length).toBeGreaterThan(0)
+
+    // Strengthened binding: result node is sourced from n1 + placed on the
+    // source's right side (chooseAdjacentPlacement 'right' → x = source.x +
+    // source.width + margin, so x ≥ source.x + source.width) + a 'generate'
+    // derivation edge from n1 + task 'done'.
+    const s = useCanvasStore.getState()
+    const source = s.nodes.find((n) => n.id === 'n1')
+    expect(source).toBeDefined()
+    nodeIds.forEach((id) => {
+      const node = s.nodes.find((n) => n.id === id)
+      expect(node).toBeDefined()
+      expect(node?.sourceNodeId).toBe('n1')
+      expect(node?.x).toBeGreaterThanOrEqual(source!.x + source!.width)
+    })
+    expect(
+      s.edges.filter((e) => nodeIds.includes(e.to) && e.from === 'n1' && e.type === 'generate'),
+    ).toHaveLength(nodeIds.length)
+    expect(s.tasks[0]?.status).toBe('done')
   })
 
   it('generateIntoAiSlot returns a Promise<string[]>', async () => {
@@ -221,6 +253,20 @@ describe('contract: generation action signatures', () => {
     const nodeIds = await useCanvasStore.getState().generateIntoAiSlot('slot-1', 'a cat')
     expect(Array.isArray(nodeIds)).toBe(true)
     expect(nodeIds.length).toBeGreaterThan(0)
+
+    // Strengthened binding: result node is sourced from the specified slot
+    // (sourceNodeId = 'slot-1') + a derivation edge from the slot + the slot's
+    // aiWorkflow transitioned to 'ready' (was 'generating') + task 'done'.
+    const s = useCanvasStore.getState()
+    nodeIds.forEach((id) => {
+      const node = s.nodes.find((n) => n.id === id)
+      expect(node).toBeDefined()
+      expect(node?.sourceNodeId).toBe('slot-1')
+    })
+    expect(s.edges.filter((e) => nodeIds.includes(e.to) && e.from === 'slot-1')).toHaveLength(nodeIds.length)
+    const slot = s.nodes.find((n) => n.id === 'slot-1')
+    expect(slot?.aiWorkflow?.status).toBe('ready')
+    expect(s.tasks[0]?.status).toBe('done')
   })
 
   // P2-C2: variations/annotation now return Promise<string[]> (de-mocked → async
