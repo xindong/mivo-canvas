@@ -87,7 +87,15 @@ npm run contract:diff -- --target=dev
 当前 `INTENDED` 表(随各组 PR 扩充):
 | 场景 | ID | 说明 | BFF 期望 |
 |------|----|------|---------|
+| generate-413 | D1 | 干净 413 vs dev ECONNRESET | status=413, body={error:'Request body is too large'} |
+| edit-413 | D1 | 干净 413 vs dev ECONNRESET | status=413, body={error:'Request body is too large'} |
 | debug-logs-post-413 | D1 | 干净 413 vs dev ECONNRESET | status=413, body={ok:false,error:'Request body is too large'} |
+| local-assets-file-403-traversal | D3 | frameworkDiff: `@hono/node-server` 强制补 `text/plain; charset=UTF-8` | 仅 `content-type` 与基线不同 |
+| local-assets-file-404 | D3 | frameworkDiff: `@hono/node-server` 强制补 `text/plain; charset=UTF-8` | 仅 `content-type` 与基线不同 |
+| eagle-folders-502 | D4 | frameworkDiff: `@hono/node-server` 强制补 `text/plain; charset=UTF-8` | 仅 `content-type` 与基线不同 |
+| eagle-tags-502 | D4 | frameworkDiff: `@hono/node-server` 强制补 `text/plain; charset=UTF-8` | 仅 `content-type` 与基线不同 |
+| eagle-assets-502 | D4 | frameworkDiff: `@hono/node-server` 强制补 `text/plain; charset=UTF-8` | 仅 `content-type` 与基线不同 |
+| eagle-assets-file-404 | D4 | frameworkDiff: `@hono/node-server` 强制补 `text/plain; charset=UTF-8` | 仅 `content-type` 与基线不同 |
 
 ## 重新采集快照
 

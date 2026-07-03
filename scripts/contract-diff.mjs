@@ -60,10 +60,17 @@ const formImagePrompt = (model) => {
   return fd
 }
 const traversalId = Buffer.from('/etc/passwd').toString('base64url')
-const missingAssetId = () => Buffer.from(join(process.env.MIVO_ASSET_DIR, 'nonexistent.png')).toString('base64url')
-const firstAssetId = async (base) => {
+const expandHome = (value) => value.replace(/^~(?=\/|$)/, process.env.HOME ?? '~')
+const readLocalAssetsList = async (base) => {
   const res = await fetch(`${base}/api/mivo/local-assets`)
-  const body = await res.json()
+  return res.json()
+}
+const missingAssetId = async (base) => {
+  const body = await readLocalAssetsList(base)
+  return Buffer.from(join(expandHome(body.root), 'nonexistent.png')).toString('base64url')
+}
+const firstAssetId = async (base) => {
+  const body = await readLocalAssetsList(base)
   return body.assets[0]?.id ? `/api/mivo/local-assets/${body.assets[0].id}` : '/api/mivo/local-assets/none'
 }
 
@@ -113,14 +120,14 @@ const SCENARIOS = [
   { name: 'local-assets-list-200', group: 'local-assets', method: 'GET', path: '/api/mivo/local-assets', locks: [['status', L.status], ['assets', L.bodyAssetsArr]] },
   { name: 'local-assets-list-post-200', group: 'local-assets', method: 'POST', path: '/api/mivo/local-assets', locks: [['status', L.status], ['assets', L.bodyAssetsArr]] },
   { name: 'local-assets-file-200', group: 'local-assets', method: 'GET', path: firstAssetId, locks: [['status', L.status], ['content-type', L.ct], ['body', L.bodyExact]] },
-  { name: 'local-assets-file-403-traversal', group: 'local-assets', method: 'GET', path: `/api/mivo/local-assets/${traversalId}`, locks: [['status', L.status], ['body', L.bodyExact]] },
-  { name: 'local-assets-file-404', group: 'local-assets', method: 'GET', path: () => `/api/mivo/local-assets/${missingAssetId()}`, locks: [['status', L.status], ['body', L.bodyExact]] },
+  { name: 'local-assets-file-403-traversal', group: 'local-assets', method: 'GET', path: `/api/mivo/local-assets/${traversalId}`, locks: [['status', L.status], ['content-type', L.ct], ['body', L.bodyExact]] },
+  { name: 'local-assets-file-404', group: 'local-assets', method: 'GET', path: async (base) => `/api/mivo/local-assets/${await missingAssetId(base)}`, locks: [['status', L.status], ['content-type', L.ct], ['body', L.bodyExact]] },
   // eagle
   { name: 'eagle-status-offline', group: 'eagle', method: 'GET', path: '/api/mivo/eagle/status', locks: [['status', L.status], ['connected', L.bodyConnected]] },
   { name: 'eagle-folders-502', group: 'eagle', method: 'GET', path: '/api/mivo/eagle/folders', locks: [['status', L.status], ['content-type', L.ct]] },
   { name: 'eagle-tags-502', group: 'eagle', method: 'GET', path: '/api/mivo/eagle/tags', locks: [['status', L.status], ['content-type', L.ct]] },
   { name: 'eagle-assets-502', group: 'eagle', method: 'GET', path: '/api/mivo/eagle/assets', locks: [['status', L.status], ['content-type', L.ct]] },
-  { name: 'eagle-assets-file-404', group: 'eagle', method: 'GET', path: '/api/mivo/eagle/assets/any-id/file', locks: [['status', L.status], ['body', L.bodyExact]] },
+  { name: 'eagle-assets-file-404', group: 'eagle', method: 'GET', path: '/api/mivo/eagle/assets/any-id/file', locks: [['status', L.status], ['content-type', L.ct], ['body', L.bodyExact]] },
   { name: 'eagle-assets-thumbnail-svg-fallback', group: 'eagle', method: 'GET', path: '/api/mivo/eagle/assets/any-id/thumbnail', locks: [['status', L.status], ['content-type', L.ct]] },
   // pinterest
   { name: 'pinterest-status-200', group: 'pinterest', method: 'GET', path: '/api/mivo/pinterest/status', locks: [['status', L.status], ['body', L.bodyExact]] },
@@ -131,13 +138,75 @@ const SCENARIOS = [
 // from the dev baseline. Verified against the live response; if it does NOT match,
 // the diff is UNEXPECTED (the intended change was not implemented correctly).
 const INTENDED = {
-  'debug-logs-post-413': { id: 'D1', note: 'clean 413 vs dev ECONNRESET', expectStatus: 413 },
+  'debug-logs-post-413': {
+    id: 'D1',
+    class: 'intentionalChange',
+    note: 'clean 413 vs dev ECONNRESET',
+    allowedDiffs: ['status'],
+    match: (live) => live.response.status === 413,
+  },
+  'generate-413': {
+    id: 'D1',
+    class: 'intentionalChange',
+    note: 'clean 413 vs dev ECONNRESET',
+    allowedDiffs: ['status'],
+    match: (live) => live.response.status === 413,
+  },
+  'edit-413': {
+    id: 'D1',
+    class: 'intentionalChange',
+    note: 'clean 413 vs dev ECONNRESET',
+    allowedDiffs: ['status'],
+    match: (live) => live.response.status === 413,
+  },
+  'local-assets-file-403-traversal': {
+    id: 'D3',
+    class: 'frameworkDiff',
+    note: '@hono/node-server forces text/plain on header-less 403',
+    allowedDiffs: ['content-type'],
+    match: (live) => live.response.status === 403 && L.ct(live) === 'text/plain; charset=UTF-8',
+  },
+  'local-assets-file-404': {
+    id: 'D3',
+    class: 'frameworkDiff',
+    note: '@hono/node-server forces text/plain on header-less 404',
+    allowedDiffs: ['content-type'],
+    match: (live) => live.response.status === 404 && L.ct(live) === 'text/plain; charset=UTF-8',
+  },
+  'eagle-folders-502': {
+    id: 'D4',
+    class: 'frameworkDiff',
+    note: '@hono/node-server forces text/plain on header-less 502',
+    allowedDiffs: ['content-type'],
+    match: (live) => live.response.status === 502 && L.ct(live) === 'text/plain; charset=UTF-8',
+  },
+  'eagle-tags-502': {
+    id: 'D4',
+    class: 'frameworkDiff',
+    note: '@hono/node-server forces text/plain on header-less 502',
+    allowedDiffs: ['content-type'],
+    match: (live) => live.response.status === 502 && L.ct(live) === 'text/plain; charset=UTF-8',
+  },
+  'eagle-assets-502': {
+    id: 'D4',
+    class: 'frameworkDiff',
+    note: '@hono/node-server forces text/plain on header-less 502',
+    allowedDiffs: ['content-type'],
+    match: (live) => live.response.status === 502 && L.ct(live) === 'text/plain; charset=UTF-8',
+  },
+  'eagle-assets-file-404': {
+    id: 'D4',
+    class: 'frameworkDiff',
+    note: '@hono/node-server forces text/plain on header-less 404',
+    allowedDiffs: ['content-type'],
+    match: (live) => live.response.status === 404 && L.ct(live) === 'text/plain; charset=UTF-8',
+  },
 }
 
 // ─── Live request + capture-shaped response ──────────────────────────────────
 const execFetch = async (base, s) => {
   const path = typeof s.path === 'function' ? await s.path(base) : s.path
-  const init = { method: s.method, headers: { ...(s.headers || {}) } }
+  const init = { method: s.method, headers: { connection: 'close', ...(s.headers || {}) } }
   if (s.body !== undefined) {
     init.body = s.body
     if (s.ct) init.headers['content-type'] = s.ct
@@ -217,11 +286,14 @@ const main = async () => {
     if (intendedEntry) {
       // Verify the live matches the intended expectation.
       const liveStatus = live.response.status
-      if (intendedEntry.expectStatus !== undefined && liveStatus === intendedEntry.expectStatus) {
-        console.log(`  ~ ${s.name.padEnd(34)} INTENDED ${intendedEntry.id}: ${intendedEntry.note}`)
+      const onlyAllowedDiffs = diffs.every((d) => intendedEntry.allowedDiffs.includes(d.label))
+      if (onlyAllowedDiffs && intendedEntry.match(live)) {
+        console.log(`  ~ ${s.name.padEnd(34)} INTENDED ${intendedEntry.id} (${intendedEntry.class}): ${intendedEntry.note}`)
         intended++
       } else {
-        console.log(`  ✗ ${s.name.padEnd(34)} UNEXPECTED (intended ${intendedEntry.id} not met; expected status ${intendedEntry.expectStatus}, got ${liveStatus ?? 'transport:' + live.response.transportError})`)
+        const got = liveStatus ?? `transport:${live.response.transportError}`
+        console.log(`  ✗ ${s.name.padEnd(34)} UNEXPECTED (intended ${intendedEntry.id} not met; got ${got})`)
+        for (const d of diffs) console.log(`      ${d.label}: baseline=${d.baseline} live=${d.live}`)
         unexpected++
       }
       continue

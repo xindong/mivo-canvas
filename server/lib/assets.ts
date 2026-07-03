@@ -86,16 +86,17 @@ export type AssetResolution =
 // outside the roots yields 'outside' (→ 403, incl. symlink escape).
 export const resolveAssetFile = async (filePath: string, roots: string[]): Promise<AssetResolution> => {
   const absPath = path.resolve(filePath)
+  const realRoots = await resolveRealRoots(roots)
+  const lexicalRoots = [...new Set([...roots, ...realRoots])]
   // Lexical pre-check: reject obvious traversals (absolute paths and ../ outside
   // root) with 403, exactly as the dev middleware did. Without this, a
   // non-existent traversal target would fall through to realpath → 404.
-  const lexicalInside = roots.some((root) => absPath === root || absPath.startsWith(`${root}${path.sep}`))
+  const lexicalInside = lexicalRoots.some((root) => absPath === root || absPath.startsWith(`${root}${path.sep}`))
   if (!lexicalInside) {
     return { kind: 'outside' }
   }
   // D2: realpath check to defeat symlink escape. A root-local symlink pointing
   // outside the root resolves outside realRoots → 403.
-  const realRoots = await resolveRealRoots(roots)
   let realFile: string
   try {
     realFile = await fs.realpath(absPath)

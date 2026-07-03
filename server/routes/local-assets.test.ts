@@ -17,14 +17,19 @@ const buildApp = (enabled: boolean): Hono<AppEnv> => {
 
 describe('local-assets routes', () => {
   let root: string
+  let rootAliasParent: string
+  let rootAlias: string
   let outside: string
   let app: Hono<AppEnv>
 
   beforeAll(async () => {
     root = await mkdtemp(join(tmpdir(), 'mivo-la-root-'))
+    rootAliasParent = await mkdtemp(join(tmpdir(), 'mivo-la-alias-'))
+    rootAlias = join(rootAliasParent, 'root-link')
     outside = await mkdtemp(join(tmpdir(), 'mivo-la-outside-'))
     await writeFile(join(root, 'test.svg'), '<svg xmlns="http://www.w3.org/2000/svg"/>', 'utf8')
     await writeFile(join(outside, 'secret.txt'), 'TOPSECRET', 'utf8')
+    await symlink(root, rootAlias)
     // D2 test fixture: a symlink inside the root pointing to a file outside.
     await symlink(join(outside, 'secret.txt'), join(root, 'link.svg'))
     process.env.MIVO_ASSET_DIR = root
@@ -34,6 +39,7 @@ describe('local-assets routes', () => {
   afterAll(async () => {
     delete process.env.MIVO_ASSET_DIR
     await rm(root, { recursive: true, force: true })
+    await rm(rootAliasParent, { recursive: true, force: true })
     await rm(outside, { recursive: true, force: true })
   })
 
@@ -52,6 +58,23 @@ describe('local-assets routes', () => {
     expect(res.status).toBe(200)
     expect(res.headers.get('content-type')).toBe('image/svg+xml')
     expect(res.headers.get('cache-control')).toBe('no-store')
+  })
+
+  it('file 200 when list id is generated from a symlinked root alias', async () => {
+    const saved = process.env.MIVO_ASSET_DIR
+    process.env.MIVO_ASSET_DIR = rootAlias
+    try {
+      const aliasApp = buildApp(true)
+      const listRes = await aliasApp.request('/api/mivo/local-assets')
+      expect(listRes.status).toBe(200)
+      const listBody = (await listRes.json()) as { assets: Array<{ url: string }> }
+      const fileRes = await aliasApp.request(listBody.assets[0].url)
+      expect(fileRes.status).toBe(200)
+      expect(fileRes.headers.get('content-type')).toBe('image/svg+xml')
+    } finally {
+      if (saved === undefined) delete process.env.MIVO_ASSET_DIR
+      else process.env.MIVO_ASSET_DIR = saved
+    }
   })
 
   it('traversal /etc/passwd → 403, no Content-Type (D3 preserved)', async () => {
