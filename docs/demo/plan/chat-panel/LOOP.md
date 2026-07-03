@@ -146,3 +146,57 @@ lead 只读诊断结论：
 - [终审 1/2 2026-07-03] func 视角（audit-mask-anchor）：APPROVED 零阻塞。实跑 build/lint/e2e 全 exit 0；核验 scene-scoped 写回链路、跨 scene notice/删除降级、retry 上下文（含 asset 失效禁用重试）、mask point/regions 彻底分离、regenerateWithParams 无悬空引用。非阻塞建议 1 条（补 asset 缺失分支 e2e）→ 记入 deferred。等 UI 视角终审。
 - [终审 2/2 2026-07-03] UI 视角（audit-ui-layout）：APPROVED 零阻塞。A1-A9 逐条复核达标，lead 打磨 4 项无副作用，e2e 竞态修复判定合理；实跑 build/lint/e2e 全 exit 0 + 1024px 视口真机度量。非阻塞建议 2 条（Escape 后焦点还给触发按钮 / 清理 App.css 旧选择器残留）→ 记入 deferred。
 - [双终审通过 → 进入 submit-pr] deferred 汇总：① asset 缺失分支 e2e ② Escape 焦点归还 ③ App.css 旧选择器清理 ④ A7 窄屏响应式。
+
+## Loop R3：生成链路提速与稳定（2026-07-03 用户设定）
+- 目标：① enhance 提示词 agent 单次响应 ≤30s（硬指标，最坏路径也不得超；用户 2026-07-03 由 20s 调整为 30s）② 图片生成不再频繁超时（预算/尺寸映射/重试引导修正）③ 参数卡展示实际生效值
+- 状态来源：本 LOOP.md + _tmp/probe-timeout-{func,ui}/ + worker 报告
+- 单轮动作：机制探针回报 → lead 判读定修法 → 自动派 worker 修 → 自动全量 e2e → lead 真机抽验指标
+- 验证方式：enhance 实测多样本全部 ≤30s（含降级路径最坏值）；generate 超时预算修正后真机高质量出图；e2e 全绿
+- 停止条件：三目标全达成 + e2e 绿 + 用户真机确认
+- 预算限制：修复单 worker（gpt-5.5 xhigh），重试≤1；真上游采样合计 ≤10 次调用
+- 人工升级条件：若上游模型本身 P95 延迟高于任何合理预算（配置无法修）→ 停下报用户选替代模型
+- 已知输入：UI 层探针已回（参数卡显示 bug/重试硬重放/无降级引导/16:9 high=3840x2160 尺寸过激/prompt 无默认 medium 约束）；等机制层真上游延迟实测。
+- 用户授权：探针回来后 lead 自动判修法 → 自动派修 → 自动 e2e，无需逐步确认。
+- [R3 授权扩展 2026-07-03] 用户明确：达成 ≤30s 目标手段不限，**换提示词模型也可以**（原"国内模型优先"约束解除）。已有延迟数据：kimi-k2.6 ≈3.5s（现主力，保留）；qwen3.6-plus ≈14.3s（兜底，偏慢）；gpt-5.4-mini ≈0.3s（P0 实测，json_object 稳定）。候选修法：兜底 qwen → gpt-5.4-mini（最坏链路 10s+~2s ≈12s，远优于现在 25s，且兜底质量换速度可接受——兜底本来就是保命路径）。待机制探针回报后与其余修法一并定稿。
+- [R3 探针齐+修法定稿 2026-07-03] 机制实测：gpt-image-2 high 全样本 130-204s 成功，110s 预算系统性误杀（proxy 实测 504@110s）；medium 75-79s。修法 F1 超时 240/245s、F2 high 尺寸降档（像素≈medium×1.25）、F3 enhance 兜底换 gpt-5.4-mini+默认 medium 约束、F4 参数卡实际值/中质量重试/文案分层/预计较慢提示、F5 e2e。已按用户授权自动派 audit-func-bugs 执行。lead 验收指标：enhance 最坏 ≤30s、high 16:9 真机出图零误杀、参数卡手动标记正确。
+- [R3 修复交付+lead 真机抽验通过 2026-07-03] worker 交付 89e41b5（F1 超时 240/245 + F2 high 降档 + F3 兜底换 gpt-5.4-mini/默认 medium 约束）+ 2c6cde7（F4 参数卡真实值/手动标记/文案分层/中质量重试/预计较慢/取消弱化 + F5 e2e），build/lint/e2e 全绿。指标：enhance 6 样本最坏 3.3s、fallback 路径 2.3s、降级路径 0.2s；真上游 high 16:9 新尺寸 113.5s 成功出图。Lead 真机抽验：参数卡 2:3+手动 标记正确、预计较慢提示出现、enhance 可见延迟 4.3s。R3 三目标达成，待用户真机确认后收口。
+- [R3 档位优化 2026-07-03] 用户提出 enhance 是简单任务不需重推理档位。Lead 实测 5 候选（各 2 发真实 prompt）：haiku-4-5 1.6-2.8s 决策质量与 kimi 齐平 → 换主力（commit 见 git log）；主超时 10→8s；proxy 实测 3 发 2.2-3.1s 全 medium/1:1 正确。gemini-flash/deepseek-flash JSON 不稳出局。dev 5173 已重启生效。
+- [R3b+R4 交付并经 lead 真机复验 2026-07-03] 68edb15 衍生边仅留局部重绘（三截图核验：文生图/图生图无线、mask 有线；非聊天画布入口维持现状待用户拍板 A/B）。38f4a48 对话分支：enhance 增加 mode chat|generate + Mivo 设计助手 persona；真上游 4 发分流全对（chat 1.7-3.5s，歧义会追问）；lead 复验 5173 重启后 "这里能对话么" mode=chat 1.7s 自然回复。build/lint/e2e 全绿。
+- [用户拍板 2026-07-03] 连线范围选 A：画布直发派生操作（去背景/扩图/放大/变体/批注）保留连线，聊天路径无线、局部重绘有线——现状即终态，无需改码。PR 事宜：用户继续真机测试中，暂缓建 PR，等其确认后走「提交 PR」流程。
+
+## mivo 平台接入评估（2026-07-03 拆包 mivo-mcp@0.3.0 得出）
+- 包位置：~/.npm/_npx/73ef7d9c64cfd75e/node_modules/mivo-mcp（stdio MCP，非 HTTP 服务）
+- 底层是纯 HTTP API（app 可直连，无需 MCP 协议）：
+  1. 鉴权：POST aigc.xindong.com/api/v1/state/token，body {id:"",sub:"<mivo_ key>",name:""} → {session_id,session}，缓存 ~/.mivo/token.json 30 天
+  2. 会话：POST /api/v1/message/chat {type:"freeform"} → chatSessionId
+  3. 生图：POST /api/v1/message {chatSessionId,messageType:"image",modelType:"NANOBANANA",modelFormat:{version},action:"mcp",payload:{prompt,imgRatio,resolution,n}} → jobId
+  4. **异步**：SSE /api/v1/message/{id}/result/sse 或 poll status（pending/processing/completed/failed）
+  5. 取图：/api/v1/file/download/{fileId} 或 signUrl
+- 实测：`sub:<mivo_ key>` 打 token 端点返回「API Key 无效」401 → 机制正确但用户给的 key(mivo_23eA...) 被拒；平台截图里的 key 是另一个(mivo_8CfGx...)。需有效 key 才能测速+接入。
+- 接入代价：中等。mivo 是异步(submit+poll/SSE)，现 gpt-image-2 是同步，非 drop-in——vite 中间层要加 job 提交+poll 循环，chatStore 生成流要改。
+- 下一步门禁：拿到有效 key → 先测 mivo 出图速度 vs gpt-image-2 的 75-204s，快得明显才动 app。
+
+## mivo 出图实测（2026-07-03 新 key mivo_5veb... 全链路跑通）
+- 鉴权✓ 建会话✓ 提交✓ 轮询✓：token→chatSession→POST /message→poll status→images
+- 出图耗时：**30.4s**（NANOBANANA=gemini-3-pro-image-preview，1:1，1K），返回 images:["/file/image/{fileId}"]
+- 对比 gpt-image-2（llm-proxy）：75-204s。mivo 快 2.5-6.7 倍（模型更快 + 平台更快双重因素）
+- 结论：值得接。速度门禁通过。
+- 接入方案（vite 中间层，异步 poll）：
+  - .env 加 MIVO_PLATFORM_SUB=<mivo_ key>、MIVO_PLATFORM_ENDPOINT=https://aigc.xindong.com
+  - 新 proxy：/api/mivo/platform-generate（token 缓存→建会话→submit→poll→取 fileId→signUrl/download 转 blob 回前端）
+  - chatStore 生成流保持现有 optimistic UI；生图源切到新 proxy；enhance/对话链路不动
+  - 兼容现有 mivoImageSizeMap→imgRatio/resolution 映射；模型可选 NANOBANANA
+
+## Loop R5 执行开始（2026-07-03 计划已批准）
+- 计划终稿：docs/demo/plan/chat-panel/r5-plan.md（双审 8 阻塞全采纳；GPT 通道/2K 转 Step 0 门禁）
+- 编排：glm-5.2(effort max)+goal 单 worker 串行执行 → 双 gpt-5.5 xhigh 审代码+结果 → e2e+冒烟（双模型速度+多任务队列 pending）→ lead 真机终审
+- 速度目标：banana ≤45s；image2 走平台则较 75-204s 至少减半（Step 0 门禁定案，不通升级用户）
+
+## Loop R5 Step 0 探针结论（2026-07-03 worker 实测）
+- GPT 通道（modelType:"GPT" + modelFormat:{version:"gpt-image-2"}）：可用，69.4s completed < 75s baseline，下载 6MB
+- NANOBANANA 2K（gemini-3-pro-image-preview）：38.7s completed，下载 7MB（< 150s 预算，poll deadline 175s 充足无需调）
+- signUrl 修正：平台返回协议相对 URL（//host/...），补 https: 后下载成功（已写入 vite 平台 helper）
+- 门禁判定：image2_platform — GPT 通道可用，image2 走平台 GPT 通道（MIVO_PLATFORM_CHANNELS 启用 gpt-image-2 entry）
+- 证据：_tmp/fix-r5-out/probe/probe-results.json（+ probe-results-v1.json 备份）
+- .env.local 说明：worker 权限 deny .env* 写入，MIVO_PLATFORM_KEY/ENDPOINT 改走 process.env（dev server 启动时 export），不落 git 不进 bundle，符合边界
+- [R5 前端包完成 2026-07-03] dev-r5-glm-b 交付 c06352e@r5-part-b（worktree 隔离，6 files +338/-36，边界严守零越权）。SC-3/SC-6/Step4b 全 pass；worktree 内全量 e2e 退出码 0；双写同步断言按预期"等合并"（modelCapabilities 硬断言已绿，vite 侧待 A 合并转绿）。等服务端包（dev-r5-glm A：Step0 门禁+vite provider+计时）→ lead 合并 → 全量验证。
