@@ -211,6 +211,30 @@ if (chatStoreSrc !== undefined) {
   }
 }
 
+// --- 规则 ③ mockGeneration ban(roadmap §13 防回潮明文项)---
+// 生产路径(排除 *.test.* / *.spec.* / __tests__)出现 mockGeneration 引用或
+// mockGenerationAdapter import 即 FAIL。当前基线 0(P2-C2 去 mock 后,已删
+// src/store/mockGeneration.ts);任何命中即红(防止 variations/annotation 重新
+// 走 mock 回潮)。测试 fixture 放 *.test.* 或 __tests__。
+const PROD_BAN_PATTERNS = ['mockGeneration', 'mockGenerationAdapter']
+const prodBanFiles = listTsFiles(join(REPO_ROOT, 'src')).filter(
+  (f) => !/\.(test|spec)\.(ts|tsx)$/.test(f) && !/__tests__/.test(f)
+)
+let banHits = 0
+for (const f of prodBanFiles) {
+  const rel = relative(REPO_ROOT, f).replace(/\\/g, '/')
+  const content = readFileSync(f, 'utf8')
+  for (const pattern of PROD_BAN_PATTERNS) {
+    if (content.includes(pattern)) {
+      banHits++
+      failures.push(
+        `[FAIL] 生产路径引用 ${pattern}: ${rel}(roadmap §13 防回潮:variations/annotation 须接真端点,禁走 mock;测试 fixture 放 *.test.* 或 __tests__)`
+      )
+    }
+  }
+}
+console.log(`[OK] mockGeneration/mockGenerationAdapter 生产路径 ban: ${prodBanFiles.length} 个生产文件扫描,${banHits} 命中(基线 0,任何命中即 FAIL)`)
+
 // --- 汇总 ---
 console.log(`\n结构守卫: ${allFiles.length} 个文件扫描完毕,${failures.length} FAIL,${warnings.length} WARN`)
 
