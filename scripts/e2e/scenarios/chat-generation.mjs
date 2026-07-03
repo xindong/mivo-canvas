@@ -90,9 +90,9 @@ export const runChatGenerationScenario = async (context) => {
   // Chat-based generation: select node, fill composer, send
   await page.locator(`[data-node-id="${firstNodeId}"]`).click()
   await page.evaluate(async () => {
-    const spec = performance.getEntriesByType('resource').map(r => r.name).find(n => n.includes('chatStore.ts'))
-    if (!spec) return
-    const { useChatStore } = await import(new URL(spec).pathname + new URL(spec).search)
+    const resource = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('chatStore.ts'))
+    const moduleSpec = resource ? new URL(resource).pathname + new URL(resource).search : '/src/store/chatStore.ts'
+    const { useChatStore } = await import(moduleSpec)
     useChatStore.getState().setParamOverride('imgRatio', '16:9')
     useChatStore.getState().setParamOverride('quality', 'high')
   })
@@ -149,9 +149,9 @@ export const runChatGenerationScenario = async (context) => {
     throw new Error(`Enhance param card should move differing agent suggestion into reasoning foldout: ${JSON.stringify(reasoningText)}`)
   }
   await page.evaluate(async () => {
-    const spec = performance.getEntriesByType('resource').map(r => r.name).find(n => n.includes('chatStore.ts'))
-    if (!spec) return
-    const { useChatStore } = await import(new URL(spec).pathname + new URL(spec).search)
+    const resource = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('chatStore.ts'))
+    const moduleSpec = resource ? new URL(resource).pathname + new URL(resource).search : '/src/store/chatStore.ts'
+    const { useChatStore } = await import(moduleSpec)
     useChatStore.getState().setParamOverride('imgRatio', 'auto')
     useChatStore.getState().setParamOverride('quality', 'auto')
   })
@@ -195,9 +195,9 @@ export const runChatGenerationScenario = async (context) => {
   )
   await page.waitForTimeout(100)
   await page.evaluate(async () => {
-    const spec = performance.getEntriesByType('resource').map(r => r.name).find(n => n.includes('chatStore.ts'))
-    if (!spec) return
-    const { useChatStore } = await import(new URL(spec).pathname + new URL(spec).search)
+    const resource = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('chatStore.ts'))
+    const moduleSpec = resource ? new URL(resource).pathname + new URL(resource).search : '/src/store/chatStore.ts'
+    const { useChatStore } = await import(moduleSpec)
     useChatStore.getState().setSelectedModel('gemini-3-pro-image')
     useChatStore.getState().setParamOverride('imgRatio', '4:3')
   })
@@ -236,17 +236,17 @@ export const runChatGenerationScenario = async (context) => {
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }) })
   })
   await page.evaluate(async () => {
-    const spec = performance.getEntriesByType('resource').map(r => r.name).find(n => n.includes('chatStore.ts'))
-    if (!spec) return
-    const { useChatStore } = await import(new URL(spec).pathname + new URL(spec).search)
+    const resource = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('chatStore.ts'))
+    const moduleSpec = resource ? new URL(resource).pathname + new URL(resource).search : '/src/store/chatStore.ts'
+    const { useChatStore } = await import(moduleSpec)
     useChatStore.getState().setSelectedModel('gpt-image-2')
     useChatStore.getState().setParamOverride('imgRatio', 'auto')
   })
   // Wait for isBusy to clear after gemini generation
   await page.evaluate(async () => {
-    const spec = performance.getEntriesByType('resource').map(r => r.name).find(n => n.includes('chatStore.ts'))
-    if (!spec) return
-    const { useChatStore } = await import(new URL(spec).pathname + new URL(spec).search)
+    const resource = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('chatStore.ts'))
+    const moduleSpec = resource ? new URL(resource).pathname + new URL(resource).search : '/src/store/chatStore.ts'
+    const { useChatStore } = await import(moduleSpec)
     const waitIdle = () => new Promise((resolve) => {
       if (!useChatStore.getState().isBusy) return resolve(null)
       const unsub = useChatStore.subscribe((s) => { if (!s.isBusy) { unsub(); resolve(null) } })
@@ -406,9 +406,9 @@ export const runChatGenerationScenario = async (context) => {
       await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }) })
     })
     await page.evaluate(async () => {
-      const spec = performance.getEntriesByType('resource').map(r => r.name).find(n => n.includes('chatStore.ts'))
-      if (!spec) return
-      const { useChatStore } = await import(new URL(spec).pathname + new URL(spec).search)
+      const resource = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('chatStore.ts'))
+      const moduleSpec = resource ? new URL(resource).pathname + new URL(resource).search : '/src/store/chatStore.ts'
+      const { useChatStore } = await import(moduleSpec)
       useChatStore.getState().setParamOverride('imgRatio', 'auto')
       useChatStore.getState().setParamOverride('quality', 'auto')
     })
@@ -454,11 +454,12 @@ export const runChatGenerationScenario = async (context) => {
       })
       // 清掉本用例留下的 error 消息，避免后续 retry-edit 用例的 waitForSelector('.chat-error-text') 命中残留
       await page.evaluate(async () => {
-        const canvasSpec = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('canvasStore.ts'))
-        const chatSpec = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('chatStore.ts'))
-        if (!canvasSpec || !chatSpec) return
-        const { useCanvasStore } = await import(new URL(canvasSpec).pathname + new URL(canvasSpec).search)
-        const { useChatStore } = await import(new URL(chatSpec).pathname + new URL(chatSpec).search)
+        const canvasResource = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('canvasStore.ts'))
+        const chatResource = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('chatStore.ts'))
+        const canvasModuleSpec = canvasResource ? new URL(canvasResource).pathname + new URL(canvasResource).search : '/src/store/canvasStore.ts'
+        const chatModuleSpec = chatResource ? new URL(chatResource).pathname + new URL(chatResource).search : '/src/store/chatStore.ts'
+        const { useCanvasStore } = await import(canvasModuleSpec)
+        const { useChatStore } = await import(chatModuleSpec)
         useChatStore.getState().clearScene(useCanvasStore.getState().sceneId)
         useChatStore.getState().setParamOverride('imgRatio', 'auto')
         useChatStore.getState().setParamOverride('quality', 'auto')
@@ -517,11 +518,12 @@ export const runChatGenerationScenario = async (context) => {
         await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }) })
       })
       await page.evaluate(async () => {
-        const canvasSpec = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('canvasStore.ts'))
-        const chatSpec = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('chatStore.ts'))
-        if (!canvasSpec || !chatSpec) return
-        const { useCanvasStore } = await import(new URL(canvasSpec).pathname + new URL(canvasSpec).search)
-        const { useChatStore } = await import(new URL(chatSpec).pathname + new URL(chatSpec).search)
+        const canvasResource = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('canvasStore.ts'))
+        const chatResource = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('chatStore.ts'))
+        const canvasModuleSpec = canvasResource ? new URL(canvasResource).pathname + new URL(canvasResource).search : '/src/store/canvasStore.ts'
+        const chatModuleSpec = chatResource ? new URL(chatResource).pathname + new URL(chatResource).search : '/src/store/chatStore.ts'
+        const { useCanvasStore } = await import(canvasModuleSpec)
+        const { useChatStore } = await import(chatModuleSpec)
         useChatStore.getState().clearScene(useCanvasStore.getState().sceneId)
         useChatStore.getState().setParamOverride('imgRatio', 'auto')
         useChatStore.getState().setParamOverride('quality', 'auto')

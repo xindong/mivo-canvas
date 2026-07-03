@@ -11,18 +11,42 @@ import {
 import { attachDefaultMivoApiMocks } from './e2e/api-mocks.mjs'
 import { startEagleMockServer } from './e2e/eagle-mock-server.mjs'
 import { prepareSmokeFixtures } from './e2e/fixtures.mjs'
-import { scenarioBootstrapPredecessor, scenarioOrder, scenarioRunners } from './e2e/scenarios/index.mjs'
+import { startUpstreamMockServer } from './e2e/upstream-mock-server.mjs'
+import { scenarioOrder, scenarioRunners } from './e2e/scenarios/index.mjs'
 import {
   createBaseUrl,
   createSmokePage,
   prepareSmokeArtifacts,
   runCommand,
+  startSmokeBffServer,
   startSmokeDevServer,
   stopSmokeDevServer,
 } from './e2e/harness.mjs'
 
 const port = Number(process.env.MIVO_E2E_PORT ?? 5174)
+const cliArgs = process.argv.slice(2)
+const resolveTopology = (argv) => {
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index]
+    if (arg === '--topology') {
+      const value = argv[index + 1]
+      if (value === 'prod') return 'prod'
+      if (value === 'dev') return 'dev'
+      throw new Error('--topology requires dev or prod')
+    }
+    if (arg.startsWith('--topology=')) {
+      const value = arg.slice('--topology='.length)
+      if (value === 'prod' || value === 'dev') return value
+      throw new Error(`Unknown --topology value: ${value}`)
+    }
+  }
+  return 'dev'
+}
+const topology = resolveTopology(cliArgs)
+const isProdTopology = topology === 'prod'
 const baseUrl = createBaseUrl(port)
+const bffToken = 'e2e-token'
+const debugViewToken = 'test-token'
 const {
   eagleMockDir,
   eagleMockItem,
@@ -33,11 +57,84 @@ const {
   localAssetFixtureSvg,
 } = prepareSmokeFixtures()
 const eagleMockHandle = await startEagleMockServer({ eagleMockDir, eagleMockItem, eagleMockItemDir })
-const server = startSmokeDevServer({ port, localAssetFixtureDir, eagleMockPort: eagleMockHandle.port })
+const upstreamMockHandle = isProdTopology ? await startUpstreamMockServer({ generatedImageB64 }) : null
+const startTopologyServer = ({ debugViewToken: serverDebugViewToken, enableLocalAssets, enableEagleProxy }) =>
+  isProdTopology
+    ? startSmokeBffServer({
+        port,
+        localAssetFixtureDir,
+        eagleMockPort: eagleMockHandle.port,
+        upstreamBaseUrl: upstreamMockHandle.url,
+        bffToken,
+        debugViewToken: serverDebugViewToken,
+        enableLocalAssets,
+        enableEagleProxy,
+      })
+    : startSmokeDevServer({ port, localAssetFixtureDir, eagleMockPort: eagleMockHandle.port })
+
+let server
 
 try {
   await prepareSmokeArtifacts()
   await runCommand('npm', ['run', 'verify:logging'])
+  server = startTopologyServer({
+    debugViewToken: '',
+    enableLocalAssets: !isProdTopology,
+    enableEagleProxy: !isProdTopology,
+  })
+  await waitForServer(isProdTopology ? `${baseUrl}/healthz` : baseUrl)
+
+  if (isProdTopology) {
+    const authedFetch = async (input, init = {}) =>
+      fetch(input, {
+        ...init,
+        headers: {
+          'x-mivo-bff-token': bffToken,
+          ...(init.headers || {}),
+        },
+      })
+    const parseResponse = async (response) => {
+      const text = await response.text()
+      try {
+        return JSON.parse(text)
+      } catch {
+        return text
+      }
+    }
+
+    const localAssetsDisabled = await authedFetch(`${baseUrl}/api/mivo/local-assets`)
+    if (localAssetsDisabled.status !== 404) {
+      throw new Error(`prod security: local-assets should default 404 in public mode, got ${localAssetsDisabled.status}`)
+    }
+
+    const eagleDisabled = await authedFetch(`${baseUrl}/api/mivo/eagle/status`)
+    if (eagleDisabled.status !== 404) {
+      throw new Error(`prod security: eagle should default 404 in public mode, got ${eagleDisabled.status}`)
+    }
+
+    const debugViewDenied = await authedFetch(`${baseUrl}/api/mivo/debug-logs`)
+    if (debugViewDenied.status !== 403) {
+      throw new Error(`prod security: debug GET without debug token should 403, got ${debugViewDenied.status}`)
+    }
+
+    const nakedGenerate = await fetch(`${baseUrl}/api/mivo/generate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ prompt: 'auth smoke', model: 'doubao-seedance-2-0-fast-260128' }),
+    })
+    if (nakedGenerate.status !== 401) {
+      throw new Error(`prod security: bare generate request should 401, got ${nakedGenerate.status}`)
+    }
+
+    await stopSmokeDevServer(server)
+    server = startTopologyServer({
+      debugViewToken,
+      enableLocalAssets: true,
+      enableEagleProxy: true,
+    })
+    await waitForServer(`${baseUrl}/healthz`)
+  }
+
   const [nodeRegistrySource, actionModelSource, viteConfigSource, modelCapabilitiesSource] = await Promise.all([
     readFile('src/canvas/nodeTypes/canvasNodeRegistry.ts', 'utf8'),
     readFile('src/canvas/actions/canvasActionModel.ts', 'utf8'),
@@ -109,10 +206,85 @@ try {
     }
   }
 
-  await waitForServer(baseUrl)
+  const createScenarioSmokePage = () => createSmokePage({
+    baseUrl,
+    generatedImageB64,
+    enableStoreBridgeModules: isProdTopology,
+    extraHTTPHeaders: isProdTopology
+      ? {
+          'x-mivo-bff-token': bffToken,
+          'x-mivo-debug-token': debugViewToken,
+        }
+      : undefined,
+  })
+  let smokePage = await createScenarioSmokePage()
+  let { browser, context, errors, mivoEditRequests, page } = smokePage
+  let { readFloatingChrome, readLibraryLayout, readLibrarySurfaceColors } = createPageReaders(page)
+  const prodExtraHTTPHeaders = isProdTopology
+    ? {
+        'x-mivo-bff-token': bffToken,
+        'x-mivo-debug-token': debugViewToken,
+      }
+    : undefined
 
-  const { browser, errors, mivoEditRequests, page } = await createSmokePage({ baseUrl, generatedImageB64 })
-  const { readFloatingChrome, readLibraryLayout, readLibrarySurfaceColors } = createPageReaders(page)
+  if (isProdTopology) {
+    const generateResponse = await context.request.post(`${baseUrl}/api/mivo/generate`, {
+      data: { prompt: 'prod token generate', model: 'doubao-seedance-2-0-fast-260128' },
+    })
+    const generateBody = await generateResponse.json()
+    if (!generateResponse.ok() || !Array.isArray(generateBody.images) || generateBody.images.length !== 1) {
+      throw new Error(`prod auth chain: generate should 200 with token, got ${JSON.stringify(generateBody)}`)
+    }
+
+    const editResponse = await context.request.fetch(`${baseUrl}/api/mivo/edit`, {
+      method: 'POST',
+      multipart: {
+        image: {
+          name: 'prod-e2e.svg',
+          mimeType: 'image/svg+xml',
+          buffer: Buffer.from(localAssetFixtureSvg),
+        },
+        prompt: 'prod token edit',
+        model: 'doubao-seedance-2-0-fast-260128',
+      },
+    })
+    const editBody = await editResponse.json()
+    if (!editResponse.ok() || !Array.isArray(editBody.images) || editBody.images.length !== 1) {
+      throw new Error(`prod auth chain: edit should 200 with token, got ${JSON.stringify(editBody)}`)
+    }
+
+    const enhanceResponse = await context.request.post(`${baseUrl}/api/mivo/enhance`, {
+      data: { prompt: 'prod token enhance' },
+    })
+    const enhanceBody = await enhanceResponse.json()
+    if (!enhanceResponse.ok() || enhanceBody.enhanced !== true) {
+      throw new Error(`prod auth chain: enhance should 200 with token, got ${JSON.stringify(enhanceBody)}`)
+    }
+
+    const debugPostResponse = await context.request.post(`${baseUrl}/api/mivo/debug-logs`, {
+      data: {
+        clientId: 'prod-e2e',
+        sessionId: 'prod-e2e',
+        entries: [{ level: 'warning', source: 'prod-e2e', message: 'prod token', timestamp: Date.now() }],
+      },
+    })
+    const debugPostBody = await debugPostResponse.json()
+    if (!debugPostResponse.ok() || debugPostBody.ok !== true) {
+      throw new Error(`prod auth chain: debug POST should 200 with token, got ${JSON.stringify(debugPostBody)}`)
+    }
+
+    const authedLocalAssets = await context.request.get(`${baseUrl}/api/mivo/local-assets`)
+    const authedLocalAssetsBody = await authedLocalAssets.json()
+    if (!authedLocalAssets.ok() || !Array.isArray(authedLocalAssetsBody.assets) || authedLocalAssetsBody.assets.length < 1) {
+      throw new Error(`prod auth chain: local-assets should 200 with token, got ${JSON.stringify(authedLocalAssetsBody)}`)
+    }
+
+    const authedEagle = await context.request.get(`${baseUrl}/api/mivo/eagle/status`)
+    const authedEagleBody = await authedEagle.json()
+    if (!authedEagle.ok() || authedEagleBody.connected !== true) {
+      throw new Error(`prod auth chain: eagle status should 200 connected=true with token, got ${JSON.stringify(authedEagleBody)}`)
+    }
+  }
 
 
   const canvasStoreSpec = async () =>
@@ -308,8 +480,7 @@ try {
     await page.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
   }
 
-  const selectedScenarios = resolveScenarioSelection(process.argv.slice(2))
-  const isFilteredRun = selectedScenarios.length !== scenarioOrder.length
+  const selectedScenarios = resolveScenarioSelection(cliArgs)
   const scenarioContext = {
     Buffer,
     assertLibraryLayoutStable,
@@ -321,10 +492,12 @@ try {
     firstNodeId: undefined,
     generatedImageB64,
     horizontalMaskSourceB64,
+    isProdTopology,
     localAssetFixtureSvg,
     mivoEditRequests,
     nearlyEqual,
     page,
+    prodExtraHTTPHeaders,
     readCanvasState,
     readChatState,
     readFloatingChrome,
@@ -337,24 +510,38 @@ try {
     waitForChatIdle,
     assertTasksHeaderCopy,
   }
+  const allErrors = []
+  const rebindSmokePage = (nextSmokePage) => {
+    smokePage = nextSmokePage
+    ;({ browser, context, errors, mivoEditRequests, page } = smokePage)
+    ;({ readFloatingChrome, readLibraryLayout, readLibrarySurfaceColors } = createPageReaders(page))
+    scenarioContext.browser = browser
+    scenarioContext.mivoEditRequests = mivoEditRequests
+    scenarioContext.page = page
+    scenarioContext.readFloatingChrome = readFloatingChrome
+    scenarioContext.readLibraryLayout = readLibraryLayout
+    scenarioContext.readLibrarySurfaceColors = readLibrarySurfaceColors
+  }
 
-  let previousScenarioName = null
-  for (const scenarioName of selectedScenarios) {
-    const requiredPrevious = scenarioBootstrapPredecessor[scenarioName]
-    if (isFilteredRun && requiredPrevious && previousScenarioName !== requiredPrevious) {
-      scenarioContext.firstNodeId = undefined
-      await bootstrapBaseCanvas()
+  for (let index = 0; index < selectedScenarios.length; index += 1) {
+    const scenarioName = selectedScenarios[index]
+    if (index > 0) {
+      allErrors.push(...errors)
+      await browser.close()
+      rebindSmokePage(await createScenarioSmokePage())
     }
+    scenarioContext.firstNodeId = undefined
+    await bootstrapBaseCanvas()
     await scenarioRunners[scenarioName](scenarioContext)
-    previousScenarioName = scenarioName
   }
 
 
+  allErrors.push(...errors)
   await page.screenshot({ path: 'test-artifacts/e2e-smoke.png', fullPage: true })
   await browser.close()
 
   // Filter known spurious network errors (Eagle mock uses filesystem paths as image URLs on macOS)
-  const realErrors = errors.filter((e) =>
+  const realErrors = allErrors.filter((e) =>
     !e.includes('ERR_UNKNOWN_URL_SCHEME') &&
     !e.includes('status of 504 (Gateway Timeout)'),
   )
@@ -364,6 +551,7 @@ try {
 
   console.log('E2E smoke test passed')
 } finally {
-  stopSmokeDevServer(server)
+  await stopSmokeDevServer(server)
   await eagleMockHandle.close()
+  if (upstreamMockHandle) await upstreamMockHandle.close()
 }

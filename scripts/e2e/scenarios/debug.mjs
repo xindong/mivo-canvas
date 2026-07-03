@@ -1,9 +1,12 @@
 export const runDebugScenario = async (context) => {
   const { baseUrl, page } = context
+  const runId = Date.now().toString(36)
+  const clientId = `e2e-client-${runId}`
+  const remoteErrorText = `e2e-remote error ${runId}`
 
   const remoteDebugResponse = await page.request.post(`${baseUrl}/api/mivo/debug-logs`, {
     data: {
-      clientId: 'e2e-client',
+      clientId,
       sessionId: 'e2e-session',
       appVersion: 'e2e',
       pagePath: '/canvas',
@@ -14,7 +17,7 @@ export const runDebugScenario = async (context) => {
       entries: [
         { level: 'log', source: 'E2E', message: 'not uploaded', timestamp: Date.now() },
         { level: 'warning', source: 'E2E Warning', message: 'e2e-remote warning', timestamp: Date.now() },
-        { level: 'error', source: 'E2E Error', message: 'e2e-remote error token=SHOULD_HIDE', timestamp: Date.now() },
+        { level: 'error', source: 'E2E Error', message: `${remoteErrorText} token=SHOULD_HIDE`, timestamp: Date.now() },
         ...Array.from({ length: 32 }, (_, index) => ({
           level: 'error',
           source: 'E2E Overflow',
@@ -28,22 +31,20 @@ export const runDebugScenario = async (context) => {
   if (!remoteDebugResponse.ok() || remoteDebugPost.accepted !== 34) {
     throw new Error(`Remote debug POST should accept warning/error only: ${JSON.stringify(remoteDebugPost)}`)
   }
-  const remoteDebugQueryResponse = await page.request.get(`${baseUrl}/api/mivo/debug-logs?level=error&q=e2e-remote%20error`)
+  const remoteDebugQueryResponse = await page.request.get(`${baseUrl}/api/mivo/debug-logs?level=error&q=${encodeURIComponent(remoteErrorText)}`)
   const remoteDebugQuery = await remoteDebugQueryResponse.json()
   if (
     !remoteDebugQueryResponse.ok() ||
     remoteDebugQuery.records?.length !== 1 ||
-    remoteDebugQuery.records[0].clientId !== 'e2e-client' ||
+    remoteDebugQuery.records[0].clientId !== clientId ||
     !remoteDebugQuery.records[0].message.includes('token=[redacted]')
   ) {
     throw new Error(`Remote debug GET should return sanitized filtered records: ${JSON.stringify(remoteDebugQuery)}`)
   }
-  await page.goto(`${baseUrl}/#/debug-reports`, { waitUntil: 'networkidle' })
-  if ((await page.getByRole('heading', { name: 'Remote Debug Reports' }).count()) !== 1) {
-    throw new Error('Debug reports browser should render at /debug-reports')
-  }
-  await page.getByText('e2e-remote error', { exact: false }).waitFor()
-  if ((await page.getByText('e2e-remote error', { exact: false }).count()) !== 1) {
+  await page.goto(`${baseUrl}/?debugReports=1`, { waitUntil: 'networkidle' })
+  await page.getByRole('heading', { name: 'Remote Debug Reports' }).waitFor()
+  await page.getByText(remoteErrorText, { exact: false }).waitFor()
+  if ((await page.getByText(remoteErrorText, { exact: false }).count()) !== 1) {
     throw new Error('Debug reports browser should show uploaded remote error records')
   }
   if ((await page.locator('.debug-reports-table-heading').count()) !== 1) {

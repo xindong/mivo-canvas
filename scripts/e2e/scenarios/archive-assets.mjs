@@ -395,18 +395,10 @@ export const runArchiveAssetsScenario = async (context) => {
     const cards = [...document.querySelectorAll('.asset-masonry-card')]
     return cards.length === 1 && cards[0].querySelector('strong')?.textContent?.trim() === 'Mock Eagle Concept'
   })
-  const eagleAssetCardCount = await page.evaluate(
-    () =>
-      [...document.querySelectorAll('.asset-masonry-card')].filter(
-        (card) => card.querySelector('strong')?.textContent?.trim() === 'Mock Eagle Concept',
-      ).length,
-  )
-  if (eagleAssetCardCount !== 1) {
-    throw new Error('Assets workspace should render Eagle folder assets as masonry cards through the connector model')
-  }
   const eagleAssetCard = page.locator('.asset-masonry-card').filter({
     has: page.locator('strong', { hasText: /^Mock Eagle Concept$/ }),
   })
+  await eagleAssetCard.first().waitFor()
 
   if ((await page.locator('.eagle-tag-directory').getByRole('button', { name: /mock/i }).count()) !== 1) {
     throw new Error('Eagle workspace should render connector tags in the tag directory')

@@ -43,6 +43,8 @@ MIVO_API_MODE=bff npm run dev
 MIVO_API_MODE=dev-middleware npm run dev
 ```
 
+生产部署 / 容器示例见 [docs/bff-deployment.md](../docs/bff-deployment.md)。
+
 请求日志(服务端 stdout,只记方法/路径/状态/上游 tag/latency,**禁记 API key / 原图 blob / 完整 prompt**):
 
 ```

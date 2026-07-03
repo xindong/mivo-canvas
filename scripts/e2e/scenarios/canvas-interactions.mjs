@@ -1,6 +1,29 @@
 export const runCanvasInteractionsScenario = async (context) => {
   const { canvasStoreSpec, nearlyEqual, page, wait } = context
   const initialCount = context.initialCount ?? await page.locator('.dom-node').count()
+  const shortcutModifier = process.platform === 'darwin'
+    ? { metaKey: true, ctrlKey: false }
+    : { metaKey: false, ctrlKey: true }
+  const pressCanvasShortcut = async (key, { shiftKey = false } = {}) => {
+    await page.locator('.canvas-shell').click({ position: { x: 32, y: 32 }, force: true })
+    await page.evaluate(
+      ({ keyValue, metaKey, ctrlKey, shiftKey: shortcutShiftKey }) => {
+        const code = keyValue.length === 1 ? `Key${keyValue.toUpperCase()}` : keyValue
+        const eventInit = {
+          key: keyValue,
+          code,
+          metaKey,
+          ctrlKey,
+          shiftKey: shortcutShiftKey,
+          bubbles: true,
+          cancelable: true,
+        }
+        window.dispatchEvent(new KeyboardEvent('keydown', eventInit))
+        window.dispatchEvent(new KeyboardEvent('keyup', eventInit))
+      },
+      { keyValue: key, shiftKey, ...shortcutModifier },
+    )
+  }
 
   const firstNode = page.locator('.dom-node').first()
   const firstNodeId = await firstNode.getAttribute('data-node-id')
@@ -1040,7 +1063,7 @@ export const runCanvasInteractionsScenario = async (context) => {
 
   await page.mouse.click(farBlankPoint.x, farBlankPoint.y)
   await page.waitForFunction(() => document.querySelectorAll('.dom-node.selected').length === 0)
-  await page.keyboard.press('ControlOrMeta+a')
+  await pressCanvasShortcut('a')
   await page.waitForFunction(() => {
     const rendered = document.querySelectorAll('.dom-node').length
     return rendered > 0 && document.querySelectorAll('.dom-node.selected').length === rendered
@@ -1051,7 +1074,7 @@ export const runCanvasInteractionsScenario = async (context) => {
   const nodeCountBeforeCut = await page.locator('.dom-node').count()
   await firstNode.click()
   await page.waitForFunction(() => document.querySelectorAll('.dom-node.selected').length === 1)
-  await page.keyboard.press('ControlOrMeta+x')
+  await pressCanvasShortcut('x')
   await page.waitForFunction(
     (count) => document.querySelectorAll('.dom-node').length === count - 1,
     nodeCountBeforeCut,
@@ -1062,12 +1085,12 @@ export const runCanvasInteractionsScenario = async (context) => {
     (count) => document.querySelectorAll('.dom-node').length === count,
     nodeCountBeforeCut,
   )
-  await page.keyboard.press('ControlOrMeta+z')
+  await pressCanvasShortcut('z')
   await page.waitForFunction(
     (count) => document.querySelectorAll('.dom-node').length === count - 1,
     nodeCountBeforeCut,
   )
-  await page.keyboard.press('ControlOrMeta+z')
+  await pressCanvasShortcut('z')
   await page.waitForFunction(
     (count) => document.querySelectorAll('.dom-node').length === count,
     nodeCountBeforeCut,
@@ -1078,12 +1101,12 @@ export const runCanvasInteractionsScenario = async (context) => {
   await secondNode.click()
   await page.keyboard.up('Shift')
   await page.waitForFunction(() => document.querySelectorAll('.dom-node.selected').length === 2)
-  await page.keyboard.press('ControlOrMeta+g')
+  await pressCanvasShortcut('g')
   await page.mouse.click(farBlankPoint.x, farBlankPoint.y)
   await page.waitForFunction(() => document.querySelectorAll('.dom-node.selected').length === 0)
   await firstNode.click()
   await page.waitForFunction(() => document.querySelectorAll('.dom-node.selected').length === 2)
-  await page.keyboard.press('ControlOrMeta+Shift+g')
+  await pressCanvasShortcut('g', { shiftKey: true })
   await page.mouse.click(farBlankPoint.x, farBlankPoint.y)
   await firstNode.click()
   await page.waitForFunction(() => document.querySelectorAll('.dom-node.selected').length === 1)
@@ -1124,7 +1147,7 @@ export const runCanvasInteractionsScenario = async (context) => {
       `Alt corner resize should grow the node around its center: before=${JSON.stringify(altResizeBoxBefore)}, after=${JSON.stringify(altResizeBoxAfter)}`,
     )
   }
-  await page.keyboard.press('ControlOrMeta+z')
+  await pressCanvasShortcut('z')
   await wait(200)
   const altResizeBoxRestored = await firstNode.boundingBox()
   if (!altResizeBoxRestored || !nearlyEqual(altResizeBoxRestored.width, altResizeBoxBefore.width, 2)) {
@@ -1942,7 +1965,7 @@ export const runCanvasInteractionsScenario = async (context) => {
       )}, after=${JSON.stringify(selectedRowGapsAfter)}`,
     )
   }
-  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+Z' : 'Control+Z')
+  await pressCanvasShortcut('z')
   await page.waitForSelector('.selection-quick-toolbar')
 
   if ((await page.locator('.node-handle').count()) !== 0) {
@@ -2091,7 +2114,7 @@ export const runCanvasInteractionsScenario = async (context) => {
     throw new Error('Group resize should preserve and scale the relative spacing between selected nodes')
   }
 
-  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+Z' : 'Control+Z')
+  await pressCanvasShortcut('z')
   await page.waitForFunction(
     ({ nodeId, width }) => {
       const media = document.querySelector(`[data-node-id="${nodeId}"] .dom-node-media`)
