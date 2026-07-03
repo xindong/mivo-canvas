@@ -1,3 +1,8 @@
+// DEPRECATED (SC1.3): the dev middleware this script captured has been deleted
+// from vite.config.ts. Use `npm run contract:diff -- --target=<BFF URL>` to
+// capture/replay contracts against the standalone BFF instead. This script is
+// kept for historical reference only and will not run successfully.
+//
 // Capture dev-middleware contract baselines for server/contracts/.
 //
 // Starts the real vite dev server (vite.config.ts) with NO upstream keys, then hits
