@@ -24,7 +24,8 @@ export const MODEL_CAPABILITIES: Record<string, ModelCapabilities> = {
   },
   'gemini-3-pro-image': {
     modality: 'image',
-    ratios: ['1:1', '2:3', '3:2', '3:4', '4:3', '9:16', '16:9', '21:9', '5:4', '4:5'],
+    // mivo 平台 NANOBANANA 仅支持 9 档比例（无 21:9）；与 vite.config.ts mivoModelRatioMap 双写
+    ratios: ['1:1', '16:9', '9:16', '4:3', '3:4', '2:3', '3:2', '4:5', '5:4'],
     qualities: ['low', 'medium', 'high'],
     defaultRatio: '1:1',
     availability: 'ok',
