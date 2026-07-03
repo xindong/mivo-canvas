@@ -1,0 +1,116 @@
+# Nightly full prod-topology e2e.
+#
+# - mock-upstream full sweep runs daily and can also be started manually
+# - real-upstream placeholder job is wired for GitHub Secrets, but skips cleanly when
+#   secrets are absent (default on this repo today)
+# - failure notification uses GitHub Actions defaults (repository / user email)
+
+name: nightly-e2e
+
+on:
+  schedule:
+    - cron: '17 19 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  e2e-prod-full:
+    name: e2e prod full (mock upstream)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node (LTS)
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Cache Playwright Chromium
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-chromium-${{ hashFiles('package-lock.json') }}
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Build production bundle
+        run: npm run build
+
+      - name: Run full prod e2e
+        run: |
+          set -o pipefail
+          mkdir -p test-artifacts
+          npm run test:e2e:prod:full 2>&1 | tee test-artifacts/nightly-e2e-prod-full.log
+
+      - name: Upload failing nightly artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-e2e-prod-full-artifacts
+          path: test-artifacts
+          if-no-files-found: warn
+          retention-days: 14
+
+  real-upstream-placeholder:
+    name: real upstream auth chain (placeholder)
+    if: ${{ secrets.MIVO_IMAGE_API_KEY != '' && secrets.MIVO_LLM_API_KEY != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      MIVO_E2E_USE_REAL_UPSTREAM: '1'
+      MIVO_IMAGE_API_KEY: ${{ secrets.MIVO_IMAGE_API_KEY }}
+      MIVO_LLM_API_KEY: ${{ secrets.MIVO_LLM_API_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node (LTS)
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Cache Playwright Chromium
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-chromium-${{ hashFiles('package-lock.json') }}
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Build production bundle
+        run: npm run build
+
+      - name: Run direct real-upstream auth smoke
+        run: |
+          set -o pipefail
+          mkdir -p test-artifacts
+          # Placeholder scope: direct BFF auth chain only. Full page scenarios still mock
+          # generate/edit/enhance and stay on the mock-upstream nightly job above.
+          npm run test:e2e:gated:authorized 2>&1 | tee test-artifacts/nightly-e2e-real-upstream.log
+
+      - name: Upload failing real-upstream artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-e2e-real-upstream-artifacts
+          path: test-artifacts
+          if-no-files-found: warn
+          retention-days: 14

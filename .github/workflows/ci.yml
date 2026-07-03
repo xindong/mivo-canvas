@@ -1,17 +1,15 @@
-# MivoCanvas CI — P1-f phase 1
+# MivoCanvas CI — P1-f phase 2
 #
-# 基础半程: lint + tsc + 单元测试 + 日志规则守卫 + 结构守卫(防回潮)。
+# PR 基线: lint + tsc + 单元测试 + 日志规则守卫 + 结构守卫(防回潮)
+# + prod 真拓扑 e2e(mock upstream) + MIVO_BFF_TOKEN gated matrix。
 # 对应 productization-roadmap.md §6.2 P1-f 与 §13 SC5.2。
 #
 # secret-scan 已移至独立 workflow .github/workflows/secret-scan.yml(直推 main,
 # 对所有 PR 立即生效,不等本 PR 合并)。本 ci.yml 不再含 secret-scan job,
 # .gitleaks.toml 也由 main 上的独立 workflow 持有(避免合并撞车)。
 #
-# 后续 P1-f phase2(占位,尚未实现):
-#   - e2e(mock 上游 generation 链路)job
-#   - MIVO_BFF_TOKEN gated 矩阵
-#   - nightly 真链路
-# 见 productization-roadmap.md §6.2 P1-f phase2 与 §13 SC5.2 后半程。
+# nightly 全量 prod e2e 与真上游占位链路见独立 workflow:
+# .github/workflows/nightly-e2e.yml
 
 name: CI
 
@@ -79,3 +77,99 @@ jobs:
         env:
           MIVO_GUARD_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: node scripts/ci/structure-guard.mjs
+
+  e2e-prod-subset:
+    name: e2e prod subset (mock upstream)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node (LTS)
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Cache Playwright Chromium
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-chromium-${{ hashFiles('package-lock.json') }}
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Build production bundle
+        run: npm run build
+
+      - name: Run prod subset e2e
+        run: |
+          set -o pipefail
+          mkdir -p test-artifacts
+          npm run test:e2e:prod:subset 2>&1 | tee test-artifacts/e2e-prod-subset.log
+
+      - name: Upload failing e2e artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-prod-subset-artifacts
+          path: test-artifacts
+          if-no-files-found: warn
+          retention-days: 14
+
+  e2e-token-gated:
+    name: e2e token gate (${{ matrix.mode }})
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        mode:
+          - unauthorized
+          - authorized
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node (LTS)
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Cache Playwright Chromium
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-chromium-${{ hashFiles('package-lock.json') }}
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Build production bundle
+        run: npm run build
+
+      - name: Run gated auth matrix
+        run: |
+          set -o pipefail
+          mkdir -p test-artifacts
+          node scripts/e2e-gated-check.mjs --mode=${{ matrix.mode }} 2>&1 | tee test-artifacts/e2e-token-gated-${{ matrix.mode }}.log
+
+      - name: Upload failing gated artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-token-gated-${{ matrix.mode }}-artifacts
+          path: test-artifacts
+          if-no-files-found: warn
+          retention-days: 14

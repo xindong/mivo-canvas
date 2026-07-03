@@ -100,12 +100,16 @@ export const startSmokeBffServer = ({
       MIVO_EAGLE_API_URL: `http://127.0.0.1:${eagleMockPort}`,
       MIVO_DEBUG_LOG_DIR: path.resolve('test-artifacts/debug-logs'),
       MIVO_DEBUG_VIEW_TOKEN: debugViewToken,
-      MIVO_IMAGE_API_KEY: 'sk_test',
-      MIVO_LLM_API_KEY: 'sk_test',
-      MIVO_IMAGE_API_BASE: `${upstreamBaseUrl}/v1/images`,
-      MIVO_LLM_API_BASE: `${upstreamBaseUrl}/v1`,
+      MIVO_IMAGE_API_KEY: process.env.MIVO_IMAGE_API_KEY || 'sk_test',
+      MIVO_LLM_API_KEY: process.env.MIVO_LLM_API_KEY || process.env.MIVO_IMAGE_API_KEY || 'sk_test',
       MIVO_ENABLE_LOCAL_ASSETS: enableLocalAssets ? '1' : '0',
       MIVO_ENABLE_EAGLE_PROXY: enableEagleProxy ? '1' : '0',
+      ...(upstreamBaseUrl
+        ? {
+            MIVO_IMAGE_API_BASE: `${upstreamBaseUrl}/v1/images`,
+            MIVO_LLM_API_BASE: `${upstreamBaseUrl}/v1`,
+          }
+        : {}),
     },
   })
 
@@ -129,7 +133,13 @@ export const stopSmokeDevServer = async (server) => {
   })
 }
 
-export const createSmokePage = async ({ baseUrl, generatedImageB64, extraHTTPHeaders, enableStoreBridgeModules = false }) => {
+export const createSmokePage = async ({
+  baseUrl,
+  generatedImageB64,
+  extraHTTPHeaders,
+  enableStoreBridgeModules = false,
+  enableApiRouteMocks = true,
+}) => {
   const browser = await chromium.launch({ headless: true })
   const context = await browser.newContext({
     viewport: { width: 1512, height: 900 },
@@ -146,7 +156,9 @@ export const createSmokePage = async ({ baseUrl, generatedImageB64, extraHTTPHea
   const errors = []
   const mivoEditRequests = []
 
-  await attachDefaultMivoApiMocks(page, { generatedImageB64, mivoEditRequests })
+  if (enableApiRouteMocks) {
+    await attachDefaultMivoApiMocks(page, { generatedImageB64, mivoEditRequests })
+  }
 
   page.on('console', (message) => {
     if (message.type() === 'error' && !message.text().includes('__MIVO_E2E_EXPECTED_ERROR__')) errors.push(message.text())
