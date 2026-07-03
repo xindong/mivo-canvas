@@ -9,14 +9,30 @@ export class UpstreamRequestTimeoutError extends Error {}
 export const isAbortError = (error: unknown): boolean =>
   error instanceof Error && error.name === 'AbortError'
 
+// Link an external cancel signal (e.g. a task's AbortController) into the
+// timeout controller so either trigger aborts the fetch. Avoids AbortSignal.any
+// for lib-portability; the `timedOut` flag below still distinguishes the cause
+// (timeout → UpstreamRequestTimeoutError; external cancel → AbortError rethrow).
+const linkExternalSignal = (controller: AbortController, external?: AbortSignal): void => {
+  if (!external) return
+  if (external.aborted) {
+    controller.abort()
+    return
+  }
+  external.addEventListener('abort', () => controller.abort(), { once: true })
+}
+
 export const fetchUpstreamWithTimeout = async (
   url: string,
   init: RequestInit,
   timeoutMs?: number,
+  externalSignal?: AbortSignal,
 ): Promise<Response> => {
   const limit = timeoutMs ?? getEnvConfig().upstreamTimeoutMs
   const controller = new AbortController()
   let timedOut = false
+  // P2-C1a: propagate task cancel into the upstream fetch (llm-proxy path).
+  linkExternalSignal(controller, externalSignal)
   const timeoutId = setTimeout(() => {
     timedOut = true
     controller.abort()

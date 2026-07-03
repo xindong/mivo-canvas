@@ -30,6 +30,7 @@ export type MockState = {
   downloadStatus: number
   downloadBody: Buffer
   downloadUrl: string
+  downloadDelayMs: number
   uploadStatus: number
   uploadId: string
   generateStatus: number
@@ -69,6 +70,7 @@ export const defaultMockState = (): MockState => ({
   downloadStatus: 200,
   downloadBody: PNG_BYTES,
   downloadUrl: '',
+  downloadDelayMs: 0,
   uploadStatus: 200,
   uploadId: 'img-1',
   generateStatus: 200,
@@ -189,6 +191,7 @@ async function handle(state: MockState, req: IncomingMessage, res: ServerRespons
   }
   if (path.startsWith('/dl/') && method === 'GET') {
     state.downloadCalls += 1
+    if (state.downloadDelayMs) await new Promise((r) => setTimeout(r, state.downloadDelayMs))
     if (state.downloadStatus !== 200) {
       send(res, state.downloadStatus, '', 'image/png')
       return

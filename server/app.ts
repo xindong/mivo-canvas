@@ -18,6 +18,7 @@ import { debugLogsRoute } from './routes/debug-logs'
 import { createLocalAssetsRoutes } from './routes/local-assets'
 import { createEagleRoutes } from './routes/eagle'
 import { createPinterestRoutes } from './routes/pinterest'
+import { tasksRoute } from './routes/tasks'
 
 const tokenEquals = (a: string, b: string): boolean => {
   const aBuf = Buffer.from(a)
@@ -59,6 +60,10 @@ app.route('/api/mivo', debugLogsRoute)
 app.route('/api/mivo', createLocalAssetsRoutes({ enabled: featureFlags.localAssetsEnabled }))
 app.route('/api/mivo', createEagleRoutes({ enabled: featureFlags.eagleProxyEnabled }))
 app.route('/api/mivo', createPinterestRoutes())
+
+// P2-C1a: async task endpoints (additive — not in dev diff baseline).
+// POST /tasks/generate|edit → 202 {taskId}; GET/DELETE /tasks/:id.
+app.route('/api/mivo/tasks', tasksRoute)
 
 // Same-origin static hosting of dist/ (Vite build output). serveStatic only
 // accepts a root relative to cwd and calls next() on miss, letting the SPA
