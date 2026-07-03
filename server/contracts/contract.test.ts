@@ -358,7 +358,11 @@ describe.skipIf(!runLive)('server/contracts — live (target = dev middleware or
     })
     await s.listen()
     server = s
-    base = `http://127.0.0.1:${s.httpServer.address().port}`
+    const address = s.httpServer?.address()
+    if (!address || typeof address === 'string') {
+      throw new Error(`unexpected dev server address: ${String(address)}`)
+    }
+    base = `http://127.0.0.1:${address.port}`
   })
 
   afterAll(async () => {
