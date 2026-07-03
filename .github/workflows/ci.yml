@@ -102,5 +102,5 @@ jobs:
             LOG_OPTS="--all"
           fi
           echo "gitleaks log-opts: $LOG_OPTS"
-          docker run --rm -v "$PWD":/src gitleaks/gitleaks:latest \
+          docker run --rm -v "$PWD":/src ghcr.io/gitleaks/gitleaks:latest \
             detect --source /src --config /src/.gitleaks.toml --log-opts "$LOG_OPTS" --no-banner --redact=100
