@@ -211,35 +211,46 @@ export function DebugReportsPage() {
       {error ? <p className="debug-reports-error">{error}</p> : null}
 
       <ol className="debug-reports-list" aria-label="Remote debug records">
+        <li className="debug-reports-table-heading" aria-hidden="true">
+          <span>Level</span>
+          <span>Time</span>
+          <span>Source</span>
+          <span>Message</span>
+          <span>Client</span>
+          <span>Session</span>
+          <span>Path</span>
+          <span>IP</span>
+          <span></span>
+        </li>
         {records.map((record) => (
           <li key={record.id} className={`debug-reports-record ${record.level}`}>
-            <div className="debug-reports-record-meta">
+            <div className="debug-reports-record-grid">
               <strong>{record.level}</strong>
               <time>{formatDebugReportTime(record.receivedAt)}</time>
-              <span>{record.source}</span>
+              <span title={record.source}>{record.source}</span>
+              <p>{record.message}</p>
+              <div className="debug-reports-record-details">
+                <span title={record.clientId}>
+                  <b>Client</b>
+                  <em>{record.clientId}</em>
+                </span>
+                <span title={record.sessionId}>
+                  <b>Session</b>
+                  <em>{record.sessionId}</em>
+                </span>
+                <span title={record.pagePath}>
+                  <b>Path</b>
+                  <em>{record.pagePath}</em>
+                </span>
+                <span title={record.ip}>
+                  <b>IP</b>
+                  <em>{record.ip}</em>
+                </span>
+              </div>
               <button type="button" aria-label="Copy debug report" onClick={() => copyRecordText(record)}>
                 <Copy size={14} />
               </button>
             </div>
-            <p>{record.message}</p>
-            <dl>
-              <div>
-                <dt>Client</dt>
-                <dd>{record.clientId}</dd>
-              </div>
-              <div>
-                <dt>Session</dt>
-                <dd>{record.sessionId}</dd>
-              </div>
-              <div>
-                <dt>Path</dt>
-                <dd>{record.pagePath}</dd>
-              </div>
-              <div>
-                <dt>IP</dt>
-                <dd>{record.ip}</dd>
-              </div>
-            </dl>
           </li>
         ))}
         {!records.length && !loading ? <li className="debug-reports-empty">No remote debug records</li> : null}
