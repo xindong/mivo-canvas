@@ -1,6 +1,6 @@
 > REVIEW_DOMAIN: 应用代码
 > REVIEW_FOCUS: 可落地性 / 工作量颗粒度 / 验收可证伪性
-> 审查状态: Claude 自审 ✅ + GPT-5.5 xhigh 架构评审 APPROVED ✅ + GPT-5.5 xhigh 执行评审 APPROVED ✅(2026-07-03)
+> 审查状态: Claude 自审 ✅ + GPT-5.5 xhigh 架构评审 APPROVED_WITH_NOTES(notes 已清)✅ + GPT-5.5 xhigh 执行评审 APPROVED_WITH_NOTES(notes 已清)✅(2026-07-03)
 
 # MivoCanvas 产品化改进方案(P0-P4,rev4.4)
 
@@ -147,7 +147,7 @@ flowchart LR
 |------|------|
 | P1-a server/ 骨架 | Hono + `@hono/node-server`(pin ≥1.19.13);同源托管 dist;`server/` 目录结构:routes/ platform/ lib/ |
 | P1-b 契约基线 | **先对 dev middleware 录契约基线**(每端点:正常/超时/413/上游 4xx5xx/Eagle 离线/路径越权的响应 shape+状态码),存 `server/contracts/`;vite.config.test.ts 的 debug 归一/脱敏/过滤用例随迁 |
-| P1-c 端点平移(3 个 PR:生成组 generate/edit/enhance+平台 helpers → 资产组 local-assets/eagle/pinterest → debug-logs) | 按 6.1 清单与契约语义列逐组平移;**响应 body shape 原样保留(见原则,不引入新 envelope)**;requestId 进 header+日志;请求日志分类(上游状态/latency/timeout/abort),**禁止记录 API key/原图 blob/完整 prompt**;**访问门契约**——定位是"内部门禁/临时防滥用",**不等同用户鉴权**:server **默认 bind 127.0.0.1**,显式 `MIVO_PUBLIC=1` 才监听公网且公网模式强制要求 `MIVO_BFF_TOKEN`;token 经 header 携带,**禁止进前端 bundle**(本地部署=启动时注入/内网网关注入/HttpOnly session 三选一,不用 VITE_ 变量);CI 断言未授权 401/403;真实用户鉴权 P4 对接 mivoserver;生产安全模型按 §6.1 执行 |
+| P1-c 端点平移(3 个 PR:生成组 generate/edit/enhance+平台 helpers → 资产组 local-assets/eagle/pinterest → debug-logs) | 按 6.1 清单与契约语义列逐组平移;**响应 body shape 原样保留(见原则,不引入新 envelope)**;requestId 进 header+日志;请求日志分类(上游状态/latency/timeout/abort),**禁止记录 API key/原图 blob/完整 prompt**;**访问门契约**——定位是"内部门禁/临时防滥用",**不等同用户鉴权**:server **默认 bind 127.0.0.1**,显式 `MIVO_PUBLIC=1` 才监听公网且公网模式强制要求 `MIVO_BFF_TOKEN`;token 经 header 携带,**禁止进前端 bundle**(本地部署=启动时注入/内网网关注入/HttpOnly session 三选一,不用 VITE_ 变量;选 HttpOnly cookie 时由网关/BFF 在服务端把 cookie 换算为等价内部认证,BFF 鉴权中间件统一按「header 或 cookie 二者其一」判定,测试与部署文档用同一口径);CI 断言未授权 401/403;真实用户鉴权 P4 对接 mivoserver;生产安全模型按 §6.1 执行 |
 | P1-d dev 接线 + 回滚开关 | vite 改 `server.proxy` → 本地 BFF;**middleware 代码暂不删除,加 `MIVO_API_MODE=dev-middleware\|bff` 开关**(缺省 bff),P1 全部验收通过后的独立收尾 PR 才删 middleware——回滚 = 改一个环境变量;revert 步骤写进 server/README |
 | P1-e0 e2e 拆分(**两个独立前置 PR,只移动不改行为**) | e2e-smoke.mjs(5647 行)不是可直接切块的文件(顶部起服务/mock,中段共享 page/route/store readers,后段顺序状态)。分两步:**e0a** 提取 harness/fixtures/API mock/server launcher(单入口行为不变);**e0b** 按 scenario 纯搬移(debug / shell-sidebar / archive-assets / canvas-interactions / chat-generation / mask / migration),提供 `--scenario` 过滤。每步验收:旧 `npm run test:e2e` 仍全绿、同场景断言数一致、mock 记录/截图路径不变(行为 diff=0) |
 | P1-e 生产运行 | `npm run start:server` + Dockerfile;**`/healthz` 探活**;反向代理 body limit 与 BFF 对齐说明、静态 dist history fallback、日志目录持久化卷、secret 注入方式(env/secret file)写进部署文档;e2e 启动器抽参数,拆 `test:e2e:dev`(vite dev+proxy)/`test:e2e:prod`(build+BFF 真拓扑)——在 P1-e0 拆好的模块上做,不与搬移混在一个 PR |
