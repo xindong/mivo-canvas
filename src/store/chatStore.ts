@@ -4,7 +4,7 @@ import type { EnhanceResponse, GenerationRatio, MivoImageQuality } from '../type
 import { readImportedAssetFile, saveImportedAsset } from '../lib/assetStorage'
 import { MivoImageRequestError, enhanceMivoPrompt, type MivoImageRequestErrorKind } from '../lib/mivoImageClient'
 import { getModelCapabilities } from '../lib/modelCapabilities'
-import { useCanvasStore } from './canvasStore'
+import { generationFacade } from './generationFacade'
 
 const maxMessagesPerScene = 200
 
@@ -354,7 +354,6 @@ export const useChatStore = create<ChatState>()(
             },
           }))
 
-          const canvasStore = useCanvasStore.getState()
           const genOptions = {
             sceneId,
             createDerivationEdge: false,
@@ -365,22 +364,19 @@ export const useChatStore = create<ChatState>()(
             signal: abortController.signal,
           }
 
-          let nodeIds: string[]
-          if (hasSelectedImage && selectedNodeId) {
-            nodeIds = await canvasStore.generateBesideNode(selectedNodeId, finalPrompt, genOptions)
-          } else {
-            const targetDocument = canvasStore.canvases[sceneId]
-            if (!targetDocument) throw new Error('目标画布已删除，无法继续生成。')
-            const selectedNode = selectedNodeId ? targetDocument.nodes.find((n) => n.id === selectedNodeId) : undefined
-            const slotX = selectedNode ? selectedNode.x + selectedNode.width + 56 : -160 + targetDocument.nodes.length * 18
-            const slotY = selectedNode ? selectedNode.y : -160 + targetDocument.nodes.length * 18
-            const slotId = canvasStore.addAiSlotNode(
-              { x: slotX, y: slotY },
-              { width: 320, height: 320 },
-              finalPrompt,
-              { sceneId },
-            )
-            context = { ...context, pendingSlotId: slotId }
+          // P2-A3: generation goes through the facade (SC3.1) — chatStore no longer
+          // calls useCanvasStore.getState() for generation actions or canvas reads.
+          // prepareChatSlot is sync + creates the slot before the async generate, so
+          // on failure the message's pendingSlotId is set for retry to reuse.
+          const prep = generationFacade.prepareChatSlot({
+            sceneId,
+            selectedNodeId,
+            hasSelectedImage,
+            pendingSlotId: context.pendingSlotId,
+            prompt: finalPrompt,
+          })
+          if (prep.slotId && prep.slotId !== context.pendingSlotId) {
+            context = { ...context, pendingSlotId: prep.slotId }
             set((s) => ({
               messagesByScene: {
                 ...s.messagesByScene,
@@ -389,16 +385,18 @@ export const useChatStore = create<ChatState>()(
                 ),
               },
             }))
-            nodeIds = await canvasStore.generateIntoAiSlot(slotId, finalPrompt, genOptions)
           }
 
-          const latestCanvasState = useCanvasStore.getState()
-          if (latestCanvasState.sceneId !== sceneId) {
-            const title = latestCanvasState.canvases[sceneId]?.title || sceneId
+          const nodeIds = prep.mode === 'beside' && selectedNodeId
+            ? await generationFacade.generateBesideNode(selectedNodeId, finalPrompt, genOptions)
+            : await generationFacade.generateIntoAiSlot(prep.slotId, finalPrompt, genOptions)
+
+          const sceneChange = generationFacade.getSceneChangeInfo(sceneId)
+          if (sceneChange.sceneChanged) {
             get().appendNotice({
-              sceneId: latestCanvasState.sceneId,
+              sceneId: sceneChange.currentSceneId,
               origin: 'chat',
-              prompt: `结果已生成到画布 ${title}`,
+              prompt: `结果已生成到画布 ${sceneChange.sceneTitle}`,
             })
           }
 
@@ -427,10 +425,10 @@ export const useChatStore = create<ChatState>()(
           const timeoutRetryCount = isTimeoutErrorKind(errorInfo.kind) ? 1 : undefined
           const timeoutRetryKey = isTimeoutErrorKind(errorInfo.kind) ? timeoutRetryKeyForContext(context) : undefined
           const errorMsg = errorTextForChat(errorInfo.message, errorInfo.kind, timeoutRetryCount, context.quality)
-          const latestCanvasState = useCanvasStore.getState()
-          if (latestCanvasState.sceneId !== sceneId) {
+          const failureSceneChange = generationFacade.getSceneChangeInfo(sceneId)
+          if (failureSceneChange.sceneChanged) {
             get().appendNotice({
-              sceneId: latestCanvasState.sceneId,
+              sceneId: failureSceneChange.currentSceneId,
               origin: 'chat',
               prompt: `生成失败：${errorMsg}`,
             })
@@ -640,7 +638,6 @@ export const useChatStore = create<ChatState>()(
             },
           }))
 
-          const canvasStore = useCanvasStore.getState()
           const genOptions = {
             sceneId,
             createDerivationEdge: false,
@@ -651,50 +648,38 @@ export const useChatStore = create<ChatState>()(
             signal: abortController.signal,
           }
 
-          let nodeIds: string[]
-          if (context.sourceNodeType === 'image' && context.sourceNodeId) {
-            nodeIds = await canvasStore.generateBesideNode(context.sourceNodeId, finalPrompt, genOptions)
-          } else {
-            const targetDocument = canvasStore.canvases[sceneId]
-            if (!targetDocument) throw new Error('目标画布已删除，无法继续生成。')
-            let slotId = context.pendingSlotId
-            const reusableSlot = slotId
-              ? targetDocument.nodes.find((node) => node.id === slotId && node.type === 'ai-slot' && !node.hidden)
-              : undefined
-
-            if (!reusableSlot) {
-              const selectedNode = context.sourceNodeId
-                ? targetDocument.nodes.find((node) => node.id === context.sourceNodeId && !node.hidden)
-                : undefined
-              const slotX = selectedNode ? selectedNode.x + selectedNode.width + 56 : -160 + targetDocument.nodes.length * 18
-              const slotY = selectedNode ? selectedNode.y : -160 + targetDocument.nodes.length * 18
-              slotId = canvasStore.addAiSlotNode(
-                { x: slotX, y: slotY },
-                { width: 320, height: 320 },
-                finalPrompt,
-                { sceneId },
-              )
-              context = { ...context, pendingSlotId: slotId }
-              set((s) => ({
-                messagesByScene: {
-                  ...s.messagesByScene,
-                  [sceneId]: (s.messagesByScene[sceneId] || []).map((m) =>
-                    m.id === messageId ? { ...m, generationContext: context } : m,
-                  ),
-                },
-              }))
-            }
-
-            nodeIds = await canvasStore.generateIntoAiSlot(slotId, finalPrompt, genOptions)
+          // P2-A3: generation via the facade (SC3.1). prepareChatSlot reuses the
+          // existing pendingSlotId if the slot is still present, else creates one.
+          const hasSelectedImage = context.sourceNodeType === 'image' && Boolean(context.sourceNodeId)
+          const prep = generationFacade.prepareChatSlot({
+            sceneId,
+            selectedNodeId: context.sourceNodeId,
+            hasSelectedImage,
+            pendingSlotId: context.pendingSlotId,
+            prompt: finalPrompt,
+          })
+          if (prep.slotId && prep.slotId !== context.pendingSlotId) {
+            context = { ...context, pendingSlotId: prep.slotId }
+            set((s) => ({
+              messagesByScene: {
+                ...s.messagesByScene,
+                [sceneId]: (s.messagesByScene[sceneId] || []).map((m) =>
+                  m.id === messageId ? { ...m, generationContext: context } : m,
+                ),
+              },
+            }))
           }
 
-          const latestCanvasState = useCanvasStore.getState()
-          if (latestCanvasState.sceneId !== sceneId) {
-            const title = latestCanvasState.canvases[sceneId]?.title || sceneId
+          const nodeIds = prep.mode === 'beside' && context.sourceNodeId
+            ? await generationFacade.generateBesideNode(context.sourceNodeId, finalPrompt, genOptions)
+            : await generationFacade.generateIntoAiSlot(prep.slotId, finalPrompt, genOptions)
+
+          const sceneChange = generationFacade.getSceneChangeInfo(sceneId)
+          if (sceneChange.sceneChanged) {
             get().appendNotice({
-              sceneId: latestCanvasState.sceneId,
+              sceneId: sceneChange.currentSceneId,
               origin: 'chat',
-              prompt: `结果已生成到画布 ${title}`,
+              prompt: `结果已生成到画布 ${sceneChange.sceneTitle}`,
             })
           }
 
@@ -731,10 +716,10 @@ export const useChatStore = create<ChatState>()(
               : 1
             : undefined
           const errorMsg = errorTextForChat(errorInfo.message, errorInfo.kind, timeoutRetryCount, context.quality)
-          const latestCanvasState = useCanvasStore.getState()
-          if (latestCanvasState.sceneId !== sceneId) {
+          const failureSceneChange = generationFacade.getSceneChangeInfo(sceneId)
+          if (failureSceneChange.sceneChanged) {
             get().appendNotice({
-              sceneId: latestCanvasState.sceneId,
+              sceneId: failureSceneChange.currentSceneId,
               origin: 'chat',
               prompt: `生成失败：${errorMsg}`,
             })

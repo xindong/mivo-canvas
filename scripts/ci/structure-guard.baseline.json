@@ -6,6 +6,7 @@
   "_updatePolicy": "P2 拆分 PR 落地后下调对应数值(反映拆分)。新文件收口后可上调白名单(需 PR 说明)。切勿为绕过守卫随意上调。",
   "_baselineCommit": "22e2e4c (origin/main, 2026-07-03)",
   "_a2Update": "2026-07-04 P2-A2 重做:canvasStore.ts 由 3168 行单体拆为 420 行门面 + 5 slice(documentSlice 377 / nodeMutationSlice 469 / nodeCreationSlice 554 / generationSlice 485 / selectionSlice 375)+ canvasDocumentModel 635。新 slice 文件保持非白名单(由 >900 绝对红线兜底),不上调白名单以免新文件 merge-base=0 触发增量 FAIL。",
+  "_a3Update": "2026-07-04 P2-A3:chatStore 经 generationFacade 解耦,useCanvasStore.getState() 计数 6→0(chatStore 不再 import useCanvasStore)。白名单=空。",
   "_threshold": 900,
   "_scannedDirs": ["src/store", "src/canvas"],
   "fileLines": {
@@ -14,5 +15,5 @@
     "src/canvas/actions/canvasActionModel.ts": 1320,
     "src/canvas/MivoCanvas.tsx": 965
   },
-  "chatStoreGetStateCount": 6
+  "chatStoreGetStateCount": 0
 }
