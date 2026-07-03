@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react'
+import { memo, useCallback, useEffect, useRef, useState, type CSSProperties } from 'react'
 import { MarkdownPreview } from '../lib/MarkdownPreview'
 import { useResolvedAssetUrl } from '../lib/useResolvedAssetUrl'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
@@ -473,7 +473,7 @@ function MarkupNodeView({
   )
 }
 
-export function CanvasNodeView({
+export const CanvasNodeView = memo(function CanvasNodeView({
   node,
   selected,
   selectionPreview,
@@ -836,4 +836,4 @@ export function CanvasNodeView({
       ) : null}
     </div>
   )
-}
+})
