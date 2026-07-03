@@ -5930,6 +5930,7 @@ button.chat-chip {
   font-size: var(--text-sm);
   color: var(--ink);
   margin: 0;
+  white-space: pre-wrap;
   word-break: break-word;
 }
 

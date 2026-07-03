@@ -238,6 +238,7 @@ try {
       status: 200,
       contentType: 'application/json',
       body: JSON.stringify({
+        mode: 'generate',
         scene: 'general',
         reasoning: 'e2e',
         richPrompt: 'e2e derived concept image',
@@ -3622,11 +3623,79 @@ try {
   await page.getByRole('button', { name: 'Close details' }).click()
   await page.waitForSelector('.details-dialog', { state: 'detached' })
 
-  // Chat-based generation: ensure ChatPanel is open, select node, fill composer, send
+  // Chat branch: mode=chat should render a text reply without creating canvas nodes or generating images.
   if (await page.locator('.ai-panel.collapsed').isVisible()) {
     await page.getByRole('button', { name: 'Open AI panel' }).click()
     await page.waitForSelector('.chat-composer-textarea', { state: 'visible' })
   }
+  let chatBranchGenerateRequests = 0
+  await page.unroute('**/api/mivo/enhance')
+  await page.route('**/api/mivo/enhance', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        mode: 'chat',
+        replyText: '可以。你可以直接和我讨论游戏美术方向，也可以让我帮你生成角色、场景、UI 或道具图。',
+        enhanced: true,
+      }),
+    })
+  })
+  await page.unroute('**/api/mivo/generate')
+  await page.route('**/api/mivo/generate', async (route) => {
+    chatBranchGenerateRequests += 1
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }),
+    })
+  })
+  await page.evaluate(async (moduleSpec) => {
+    const { useCanvasStore } = await import(moduleSpec)
+    useCanvasStore.getState().selectNode(undefined)
+  }, await canvasStoreSpec())
+  const chatBranchBefore = await readCanvasState()
+  await page.locator('.chat-composer-textarea').fill('这里能对话么')
+  await page.locator('.chat-composer-textarea').press('Enter')
+  await waitForChatIdle()
+  const chatReply = await page.locator('.chat-assistant-text').last().innerText()
+  if (!chatReply.includes('可以') || !chatReply.includes('游戏美术')) {
+    throw new Error(`Chat mode should render reply text, got: ${JSON.stringify(chatReply)}`)
+  }
+  const chatBranchAfter = await readCanvasState()
+  if (chatBranchAfter.nodes.length !== chatBranchBefore.nodes.length || chatBranchGenerateRequests !== 0) {
+    throw new Error(`Chat mode should not create nodes or call generate: ${JSON.stringify({ before: chatBranchBefore.nodes.length, after: chatBranchAfter.nodes.length, chatBranchGenerateRequests })}`)
+  }
+  const latestAssistantParamCards = await page.locator('.chat-message-assistant').last().locator('.chat-param-card').count()
+  if (latestAssistantParamCards !== 0) {
+    throw new Error('Chat mode reply should not render enhance parameter card')
+  }
+  await page.unroute('**/api/mivo/enhance')
+  await page.route('**/api/mivo/enhance', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        mode: 'generate',
+        scene: 'general',
+        reasoning: 'e2e',
+        richPrompt: 'e2e derived concept image',
+        imgRatio: '1:1',
+        quality: 'medium',
+        enhanced: true,
+      }),
+    })
+  })
+  await page.unroute('**/api/mivo/generate')
+  await page.route('**/api/mivo/generate', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }),
+    })
+  })
+
+  // Chat-based generation: select node, fill composer, send
   await page.locator(`[data-node-id="${firstNodeId}"]`).click()
   await page.evaluate(async () => {
     const spec = performance.getEntriesByType('resource').map(r => r.name).find(n => n.includes('chatStore.ts'))

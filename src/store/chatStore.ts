@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import type { GenerationRatio, MivoImageQuality } from '../types/generation'
+import type { EnhanceResponse, GenerationRatio, MivoImageQuality } from '../types/generation'
 import { readImportedAssetFile, saveImportedAsset } from '../lib/assetStorage'
 import { MivoImageRequestError, enhanceMivoPrompt, type MivoImageRequestErrorKind } from '../lib/mivoImageClient'
 import { getModelCapabilities } from '../lib/modelCapabilities'
@@ -136,9 +136,21 @@ const trimSceneMessages = (messages: ChatMessage[]): ChatMessage[] =>
 
 const historyForEnhance = (messages: ChatMessage[], limit = 6) =>
   messages
-    .filter((m) => m.status === 'done' && (m.role === 'user' || m.enhance?.richPrompt))
+    .filter((m) => m.status === 'done' && m.kind !== 'notice' && (m.role === 'user' || m.role === 'assistant') && Boolean(m.enhance?.richPrompt || m.text))
     .slice(-limit)
     .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.enhance?.richPrompt || m.text }))
+
+const enhanceForGeneration = (enhanceResult: EnhanceResponse): ChatEnhanceResult =>
+  enhanceResult.enhanced
+    ? {
+        scene: enhanceResult.scene,
+        reasoning: enhanceResult.reasoning,
+        richPrompt: enhanceResult.richPrompt,
+        imgRatio: enhanceResult.imgRatio,
+        quality: enhanceResult.quality,
+        degradedReason: enhanceResult.degradedReason,
+      }
+    : { degradedReason: enhanceResult.degradedReason }
 
 export const useChatStore = create<ChatState>()(
   persist(
@@ -215,16 +227,33 @@ export const useChatStore = create<ChatState>()(
           })
           if (abortController.signal.aborted) throw new Error(canceledGenerationMessage)
 
-          const enhance: ChatEnhanceResult = enhanceResult.enhanced
-            ? {
-                scene: enhanceResult.scene,
-                reasoning: enhanceResult.reasoning,
-                richPrompt: enhanceResult.richPrompt,
-                imgRatio: enhanceResult.imgRatio,
-                quality: enhanceResult.quality,
-                degradedReason: enhanceResult.degradedReason,
-              }
-            : { degradedReason: enhanceResult.degradedReason }
+          if (enhanceResult.mode === 'chat' && enhanceResult.replyText?.trim()) {
+            set((s) => ({
+              isBusy: false,
+              messagesByScene: {
+                ...s.messagesByScene,
+                [sceneId]: (s.messagesByScene[sceneId] || []).map((m) =>
+                  m.id === assistantMessageId
+                    ? {
+                        ...m,
+                        status: 'done' as const,
+                        text: enhanceResult.replyText!.trim(),
+                        enhance: undefined,
+                        generationContext: undefined,
+                        resultNodeIds: undefined,
+                        error: undefined,
+                        errorKind: undefined,
+                        timeoutRetryKey: undefined,
+                        timeoutRetryCount: undefined,
+                      }
+                    : m,
+                ),
+              },
+            }))
+            return
+          }
+
+          const enhance = enhanceForGeneration(enhanceResult)
 
           // manual override > agent suggestion
           const finalPrompt = enhance.richPrompt || text
@@ -426,9 +455,10 @@ export const useChatStore = create<ChatState>()(
         const abortController = new AbortController()
         activeChatAbortController = abortController
         let context = baseContext
-        const finalPrompt = context.finalPrompt || targetMsg.enhance?.richPrompt || targetMsg.text || userMsg.text
-        const finalQuality = qualityOverride || context.quality || 'medium'
-        const finalRatio = context.imgRatio || getModelCapabilities(context.model).defaultRatio
+        let retryEnhance = targetMsg.enhance
+        let finalPrompt = context.finalPrompt || targetMsg.enhance?.richPrompt || targetMsg.text || userMsg.text
+        let finalQuality = qualityOverride || context.quality || 'medium'
+        let finalRatio = context.imgRatio || getModelCapabilities(context.model).defaultRatio
         context = {
           ...context,
           finalPrompt,
@@ -436,30 +466,110 @@ export const useChatStore = create<ChatState>()(
           quality: finalQuality,
         }
 
-        set((s) => ({
-          isBusy: true,
-          messagesByScene: {
-            ...s.messagesByScene,
-            [sceneId]: (s.messagesByScene[sceneId] || []).map((m) =>
-              m.id === messageId
-                ? {
-                    ...m,
-                    status: 'generating' as const,
-                    text: finalPrompt,
-                    error: undefined,
-                    errorKind: undefined,
-                    timeoutRetryKey: undefined,
-                    timeoutRetryCount: undefined,
-                    retryDisabledReason: undefined,
-                    resultNodeIds: undefined,
-                    generationContext: context,
-                  }
-                : m,
-            ),
-          },
-        }))
-
         try {
+          if (!baseContext.finalPrompt) {
+            set((s) => ({
+              isBusy: true,
+              messagesByScene: {
+                ...s.messagesByScene,
+                [sceneId]: (s.messagesByScene[sceneId] || []).map((m) =>
+                  m.id === messageId
+                    ? {
+                        ...m,
+                        status: 'enhancing' as const,
+                        text: '',
+                        enhance: undefined,
+                        error: undefined,
+                        errorKind: undefined,
+                        timeoutRetryKey: undefined,
+                        timeoutRetryCount: undefined,
+                        retryDisabledReason: undefined,
+                        resultNodeIds: undefined,
+                        generationContext: context,
+                      }
+                    : m,
+                ),
+              },
+            }))
+
+            const userIndex = messages.findIndex((m) => m.id === userMsg.id)
+            const enhanceResult = await enhanceMivoPrompt({
+              prompt: userMsg.text,
+              modelId: context.model,
+              history: historyForEnhance(messages.slice(0, Math.max(0, userIndex))),
+              hasSelectedImage: context.sourceNodeType === 'image',
+              sceneId,
+              signal: abortController.signal,
+            })
+            if (abortController.signal.aborted) throw new Error(canceledGenerationMessage)
+
+            if (enhanceResult.mode === 'chat' && enhanceResult.replyText?.trim()) {
+              set((s) => ({
+                isBusy: false,
+                messagesByScene: {
+                  ...s.messagesByScene,
+                  [sceneId]: (s.messagesByScene[sceneId] || []).map((m) =>
+                    m.id === messageId
+                      ? {
+                          ...m,
+                          status: 'done' as const,
+                          text: enhanceResult.replyText!.trim(),
+                          enhance: undefined,
+                          generationContext: undefined,
+                          retryDisabledReason: undefined,
+                          resultNodeIds: undefined,
+                          error: undefined,
+                          errorKind: undefined,
+                          timeoutRetryKey: undefined,
+                          timeoutRetryCount: undefined,
+                        }
+                      : m,
+                  ),
+                },
+              }))
+              return
+            }
+
+            const enhance = enhanceForGeneration(enhanceResult)
+            retryEnhance = enhance
+            finalPrompt = enhance.richPrompt || userMsg.text
+            finalRatio = context.requestedImgRatio !== 'auto'
+              ? context.requestedImgRatio
+              : enhance.imgRatio || getModelCapabilities(context.model).defaultRatio
+            finalQuality = qualityOverride ||
+              (context.requestedQuality !== 'auto' ? (context.requestedQuality as MivoImageQuality) : (enhance.quality || 'medium'))
+            context = {
+              ...context,
+              imgRatio: finalRatio,
+              quality: finalQuality,
+              finalPrompt,
+            }
+          }
+
+          set((s) => ({
+            isBusy: true,
+            messagesByScene: {
+              ...s.messagesByScene,
+              [sceneId]: (s.messagesByScene[sceneId] || []).map((m) =>
+                m.id === messageId
+                  ? {
+                      ...m,
+                      status: 'generating' as const,
+                      text: finalPrompt,
+                      enhance: retryEnhance,
+                      error: undefined,
+                      errorKind: undefined,
+                      timeoutRetryKey: undefined,
+                      timeoutRetryCount: undefined,
+                      retryDisabledReason: undefined,
+                      resultNodeIds: undefined,
+                      generationContext: context,
+                    }
+                  : m,
+              ),
+            },
+          }))
+
           const canvasStore = useCanvasStore.getState()
           const genOptions = {
             sceneId,

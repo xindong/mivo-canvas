@@ -17,6 +17,8 @@ export type EnhanceRequest = {
 
 export type EnhanceResponse = {
   enhanced: boolean
+  mode?: 'chat' | 'generate'
+  replyText?: string
   scene?: string
   reasoning?: string
   richPrompt?: string

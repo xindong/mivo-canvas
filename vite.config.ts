@@ -601,35 +601,54 @@ const readLocalAssets = async () => {
 // ─── enhance helpers ──────────────────────────────────────────────────────────
 
 const buildEnhanceSystemPrompt = (allowedRatios: string[]) =>
-  `You are an AI image generation prompt enhancer. Analyze the user input and return a single JSON object (no markdown fences) with these fields:
-- scene: brief scene category (e.g. "portrait", "landscape", "product", "abstract", "illustration")
-- reasoning: one sentence in Chinese explaining key enhancement decisions
-- richPrompt: enhanced English image prompt — specific and vivid; faithfully preserve user intent; do NOT add entities the user did not mention; do NOT pile style words like masterpiece/8k/cinematic/high quality unless the user asked
-- imgRatio: choose from allowed list: ${allowedRatios.join(', ')}; pick what best fits the scene composition
-- quality: "low" (fast sketch), "medium" (standard), or "high" (fine detail/print)
-
-Additional rules:
-- Chinese or very short input → expand into a specific English visual description
-- When history is provided → this is a refinement; evolve the previous richPrompt rather than starting fresh
-- Default to "medium"; choose "high" only when the user explicitly asks for print-grade output, fine detail, or preserving small text
-- Output ONLY the JSON object, no surrounding text`
+  `You are Mivo, a game art creative design assistant. Return ONLY one JSON object.
+Modes:
+- Use "chat" for questions, discussion, advice, capability questions, casual talk, or ambiguous intent. Return {"mode":"chat","replyText":"中文纯文本，简洁自然，200字以内；歧义时追问澄清"}.
+- Chat replyText must not use markdown, bullets, headings, bold markers, or asterisks.
+- Use "generate" only when the user clearly asks to generate/draw/modify/outpaint/restyle/create a set. Return mode, scene, reasoning, richPrompt, imgRatio, quality.
+Persona: you help create game characters, scenes, UI, props, logos, style transfer, outpainting, element separation, sprite/action/VFX assets, design advice, and visual optimization.
+Generate rules:
+- richPrompt must be vivid English, faithful to user intent; do not add unmentioned entities or pile words like masterpiece/8k/cinematic/high quality.
+- imgRatio must be one of: ${allowedRatios.join(', ')}.
+- quality is low, medium, or high. Default medium; high only for explicit print-grade, fine detail, or preserving small text.
+- Chinese or short generate requests should become specific English prompts.
+- With history, treat it as refinement and evolve the previous direction.`
 
 type EnhanceLlmResponse = {
   choices?: Array<{ message?: { content?: string } }>
 }
 
 type EnhanceParsed = {
-  scene: string
-  reasoning: string
-  richPrompt: string
-  imgRatio: string
-  quality: string
+  mode: 'chat' | 'generate'
+  replyText?: string
+  scene?: string
+  reasoning?: string
+  richPrompt?: string
+  imgRatio?: string
+  quality?: string
+}
+
+const normalizeChatReplyText = (value: string) => {
+  const text = value
+    .replace(/\*\*/g, '')
+    .replace(/[`#]/g, '')
+    .replace(/^[\s>*•-]+/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+  return text.length > 200 ? `${text.slice(0, 199)}…` : text
 }
 
 const parseEnhanceJson = (raw: string): EnhanceParsed | null => {
   try {
     const stripped = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/i, '').trim()
     const parsed = JSON.parse(stripped) as Record<string, unknown>
+    const mode = parsed.mode === 'chat' ? 'chat' : 'generate'
+    if (mode === 'chat' && typeof parsed.replyText === 'string' && parsed.replyText.trim()) {
+      return {
+        mode,
+        replyText: normalizeChatReplyText(parsed.replyText),
+      }
+    }
     if (
       typeof parsed.scene === 'string' &&
       typeof parsed.reasoning === 'string' &&
@@ -638,6 +657,7 @@ const parseEnhanceJson = (raw: string): EnhanceParsed | null => {
       typeof parsed.quality === 'string'
     ) {
       return {
+        mode: 'generate',
         scene: parsed.scene,
         reasoning: parsed.reasoning,
         richPrompt: parsed.richPrompt,
@@ -758,10 +778,26 @@ const proxyMivoEnhance = async (
       return
     }
 
-    const clampedRatio = (allowedRatios as string[]).includes(result.imgRatio) ? result.imgRatio : defaultRatio
-    const quality = ['low', 'medium', 'high'].includes(result.quality) ? result.quality : 'medium'
+    if (result.mode === 'chat') {
+      sendMivoJson(response, 200, {
+        mode: 'chat',
+        replyText: result.replyText,
+        enhanced: true,
+      })
+      return
+    }
+
+    const clampedRatio =
+      typeof result.imgRatio === 'string' && (allowedRatios as string[]).includes(result.imgRatio)
+        ? result.imgRatio
+        : defaultRatio
+    const quality =
+      typeof result.quality === 'string' && ['low', 'medium', 'high'].includes(result.quality)
+        ? result.quality
+        : 'medium'
 
     sendMivoJson(response, 200, {
+      mode: 'generate',
       scene: result.scene,
       reasoning: result.reasoning,
       richPrompt: result.richPrompt,
