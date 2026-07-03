@@ -1,191 +1,132 @@
-<!--
-Review 对齐:
-- REVIEW_DOMAIN: 应用代码
-- REVIEW_FOCUS: 可落地性 / 工作量颗粒度 / 验收可证伪性
-- PLAN_SOURCE: approved_plan（两轮 GPT-5.5 xhigh 独立评审已整合）
--->
+> REVIEW_DOMAIN: 应用代码
+> REVIEW_FOCUS: 可落地性 / 工作量颗粒度 / 验收可证伪性
 
-# MivoCanvas 产品化改进方案(P0-P4,rev2 — 已整合双评审)
+# MivoCanvas 产品化改进方案(P0-P4,rev3 — 已对齐 origin/main 22e2e4c)
 
-## Context
+> rev 历史:rev1 初稿(基线 5a7439d)→ rev2 整合 2× GPT-5.5 xhigh 双评审 → **rev3 对齐 main 最新 44 commits**(3× 骨折 GPT-5.5 high 盘查:inv-core / inv-ui / plan-fit,verdict = NEEDS_UPDATE,已全部吸收)。
+> 勘误:rev1/rev2 的"零单元测试""无 V2 模型"两条基于 demo 分支测量,对 main 不成立,本版已改写。
 
-MivoCanvas 当前是跑通了「对话 + 无限画布 + AI 生成链路」的高完成度 Demo(分支 demo/improve-hud,超 main 10 commits)。产品愿景已定稿:对话式 + 无限画布,用户是美术/设计师,目标四层架构 = L1 画布文档层(Canvas/Node/Anchor/Edge/Version 真相源)→ L2 Agent 编排层 → L3 能力层(复用 mivoserver)→ L4 渲染交互层(薄)。对标 Figma + Lovart。
+## Context(基线:origin/main = 22e2e4c,demo/improve-hud 已并入)
 
-本轮探查(2 sonnet + 1 haiku worker + 本人抽查)核实的关键事实,**其中两条修正了此前评估**:
+产品愿景不变:对话式 + 无限画布,用户是美术/设计师;四层架构 L1 画布文档(Canvas/Node/Anchor/Edge/Version)→ L2 Agent 编排 → L3 能力层(复用 mivoserver)→ L4 薄渲染。对标 Figma + Lovart。用户决策不变:① 真接入 Leafer;② P0-P4 全量规划。
 
-| # | 已核实事实 | 影响 |
-|---|-----------|------|
-| 1 | 所有 `/api/mivo/*` 端点实现在 `vite.config.ts` dev middleware(L782-997),生产构建后不存在 | **产品化头号硬阻断** |
-| 2 | **全仓零单元测试**(此前"41 个测试全过"有误),只有 Playwright e2e-smoke;无 vitest 依赖 | 重构前必须先建安全网 |
-| 3 | **无 V2 数据模型双轨**(此前评估有误):只有单一 `MivoCanvasNode`(src/types/mivoCanvas.ts:116-177);normalize 是 store 变更时 eager 内聚修复,非每帧开销 | Anchor/Version 是全新设计而非收尾 |
-| 4 | Leafer 三依赖(^2.1.7)零绘制调用(MivoCanvas.tsx:465-499 空实例);渲染 100% React DOM + CSS transform;culling 已有(overscan 520px);CanvasNodeView 无 memo;**`.canvas-host` 为 `pointer-events:none`,全部命中判定依赖 DOM 节点事件**(canvasInteraction.ts:134-137) | 用户拍板真接入 Leafer;事件桥是 P3 最大前置 |
-| 5 | canvasStore.ts 2616 行 6 域混杂;快照历史 60 条;persist key 'mivo-canvas-demo' v7;104 处单字段 selector;**chatStore 直接 getState() 调 canvasStore 生成 action**(chatStore.ts:162-179) | 按 slice 门面方案拆,chatStore 纳入拆分边界 |
-| 6 | useCanvasInteractionController.ts 1498 行,6 条天然缝隙 | P2 拆 hooks,P3 前置 |
-| 7 | **资产存 IndexedDB(assetStorage.ts:61-68),节点只记 `mivo-asset:` 伪 URL**;localStorage persist 不含 blob | P4 必须含资产服务端迁移,否则跨设备丢图 |
-| 8 | 已知债:局部重绘 54-98s 无进度/取消;Eagle 拖拽被 backdrop 截获;横图 mask 遮挡;variations/annotation 仍 mock(canvasStore.ts:2157-2192/2429-2508) | 归 P2 收口 |
-| 9 | origin 指向 upstream(kirozeng)不可 push;无 CI workflow | 执行前先 fork;CI 在 P1 落地 |
+### 已核实事实(rev3,全部对 origin/main 复核)
 
-**用户决策**:① Leafer **真正接入**(不移除);② P0-P4 全量规划,后期阶段进入前再细化。
+| # | main 现状 | 对计划的影响 |
+|---|----------|------------|
+| 1 | 所有 `/api/mivo/*` 仍在 vite.config.ts dev middleware,但文件已 **1630 行**:新增 `/api/mivo/debug-logs`(vite.config.ts:419-457)、`/api/mivo/enhance`、**mivo 平台通道**(gemini-3-pro-image/gpt-image-2 走平台 submit/poll/download + 内存 token/chatSession 缓存 + 401 authRetry 单飞,vite.config.ts:587-793;mask 场景回落 llm-proxy) | **P1 仍是头号阻断,但迁移面大幅扩大** |
+| 2 | **测试网已起步**:vitest ^4.1.9 + `test:unit`,10 个 *.test.ts(canvasInteraction/brushGeometry/smartSelection/stampDefs/canvasRenderAdapter/documentModelV2/canvasSnapshotModel/aiCanvasCommands/remoteDebugReporter/vite.config);e2e-smoke 5647 行覆盖 chat/debug/mask 回归;`verify:logging` 守卫 | P0 从"建"改"补强" |
+| 3 | **V2 数据模型已存在**:MivoCanvasNode 已带 transform/fills/strokes/effects/layout/constraints/asset/relations 语义字段(types/mivoCanvas.ts:131-290);documentModelV2.ts 做 legacy→V2 归一;snapshot version=2;**canvasRenderAdapter.ts 已从 V2 字段计算 DOM 渲染样式(带单测)** | P3-0 接续现有 adapter;P4 是演进非 greenfield |
+| 4 | Leafer 仍空实例零绘制(MivoCanvas.tsx:501-534);DOM+CSS 渲染;culling 520px(MivoCanvas.tsx:219-247);CanvasNodeView(830 行)仍无 memo;`.canvas-host` 仍 pointer-events:none | P3 动机与策略不变 |
+| 5 | canvasStore.ts **3168 行**;persist `mivo-canvas-demo` **v8**(brushStyle 重置迁移);chatStore.ts **803 行**独立 store,persist `mivo-chat-demo` **v2**(v1→v2 ratio 收敛迁移);chatStore 经 getState() 直调 canvas 生成 action(chatStore.ts:310-356 sendMessage / 596-652 retryMessage 两条入口);task 已有 **canceled** 态 | P2 slice/contract 按 v8+v2 设计 |
+| 6 | useCanvasInteractionController.ts **1775 行**(rev1 的 1498 系测量口径错误;M8/M10 未动它),新增职责:brush/stamp/smart-selection/连接吸附;canvasInteraction.ts 已抽出部分纯函数+单测。缝隙重标:viewport 111-475/几何 145-249/框选 563-583+1220/节点变换 586-716+1022-1145/文本批注 719-957+1057-1211+1253-1356/全局事件 1449-1726 | P2 拆分仍必要,按新缝隙 |
+| 7 | 资产仍 IndexedDB + `mivo-asset:` 伪 URL(assetStorage.ts:61-69);persist 不含 blob | P4 资产服务端化仍是硬需求 |
+| 8 | 旧 P2 债重估:**Eagle 拖拽已修**(App.tsx:93-112 backdrop 转发)→降回归项;**横图 mask 已被 e2e 覆盖**(e2e-smoke.mjs:5346-5489)→降回归项;**长任务已有** AbortController 取消/canceled 态/超时文案条件化/重试(chatStore.ts:88-138,572-641),**仍缺**真实进度(progress 硬编码 20→100)与服务端任务 registry;**variations/annotation 仍 mock**(canvasStore.ts:2672-2708/3019-3084) | P2 债清单洗牌 |
+| 9 | **可观测体系已落地**:debugLogger→remoteDebugReporter(仅 warning/error,脱敏,批量 flush)→/api/mivo/debug-logs(JSONL)→DebugReportsPage(`#/debug-reports`);独立 scripts/debug-log-server.mjs(静态部署用);无 CI workflow;origin(kirozeng)实测有 push 权限 | P1 迁移+CI 需纳入 |
 
-## 评审整合(2× GPT-5.5 xhigh 独立评审)
+## 评审整合记录
 
-- **eval-arch**(架构/排序/风险):ADOPT_WITH_CHANGES。核心必改:P3 前置渲染投影契约、DOM 渲染器保留到 P4 后、事件桥/命中语义/坐标同步/文本度量升级为架构前置与验收项、BFF 安全面、P4 并发冲突模型、P1 契约测试。→ **全部采纳**。
-- **eval-exec**(落地/颗粒度/遗漏):ADOPT_WITH_CHANGES。核心必改:PR 颗粒度重估(P2/P4 远超 2-4 PR)、slice vs 多 store 二义性、chatStore 归属、P4 资产迁移、P1 部署形态/CORS、错误与日志规范、e2e CI 落地、验收去形容词化。→ **全部采纳**。
-- **冲突裁决**(静态托管):eval-arch 倾向 Hono 只做 API(serveStatic 有 CVE-2026-29087/39406,<1.19.13 受影响);eval-exec 倾向 BFF 同源托管 dist 消 CORS。**裁决:默认同源托管 dist + pin `@hono/node-server` ≥1.19.13**,单人部署最简、无浏览器 CORS 面;上平台托管时再切分离模式(届时补 origin allowlist)。
-- **store 拆分形态裁决**:探查期草案是"多个独立 store + getState() 互调",eval-exec 指出这与"104 处 selector 零改动"矛盾。**裁决:采用单一 persisted `useCanvasStore` 门面 + slice 模块化**(文档/生成/选择三个 slice 文件组合进同一 store),真·多 store 化留待 P4 后再评估。
+- rev2 双评审(xhigh):P3-0 投影契约、DOM 渲染器保留至 P4 后、事件桥/命中/坐标/文本度量为架构前置、BFF 安全面、P4 冲突模型、颗粒度重估、slice 门面裁决、chatStore 归属、资产迁移、同源托管+pin `@hono/node-server`≥1.19.13——**全部保留**。
+- rev3 盘查(high×3):9 条事实 6 条改写;工作项按下文 [删/改/增] 落定;**阶段主序维持 P0→P1→P2→(P3-0)→P3→P4**,plan-fit 建议的两点调整已采纳:P3-0 可并入 P2 尾部提前冻结;P4 schema spike 在 P2/P3 期间并行启动。
 
 ---
 
-## 总体排序与依赖
+## 总体排序与工作量(rev3)
 
 ```mermaid
 flowchart LR
-    P0["P0 地基<br/>测试网+纯函数"] --> P1["P1 BFF 剥离<br/>+部署/CI"]
-    P0 --> P2["P2 slice 化+交互拆分<br/>+还债"]
-    P1 --> P2X["P2 长任务协议/去 mock"]
-    P2 --> P30["P3-0 渲染投影契约<br/>(与 P4 schema 并行冻结)"]
+    P0["P0 测试网补强<br/>+纯函数抽取"] --> P1["P1 BFF 剥离(全量面)<br/>+部署/CI"]
+    P0 --> P2["P2 slice 化+交互拆分<br/>+去 mock/长任务协议"]
+    P1 --> P2X["P2 长任务服务端协议/去 mock"]
+    P2 --> P30["P3-0 固化 canvasRenderAdapter<br/>为投影契约(可并入 P2 尾)"]
     P30 --> P3["P3 Leafer 迁移<br/>(flag 双轨,不删 DOM)"]
-    P1 --> P4["P4 数据模型+资产+服务端<br/>+mivoserver"]
+    P1 --> P4["P4 V2→Anchor/Version 演进<br/>+资产+服务端+mivoserver"]
     P3 --> P4
-    P4 -->|"P4 验收通过后"| CLEAN["删 DOM 渲染器/flag"]
+    P4 -->|"验收通过后"| CLEAN["删 DOM 渲染器/flag"]
 ```
 
-排序原则:测试网最先;生产阻断次之;渲染迁移在 store/交互拆干净之后、且必须先冻结「渲染投影契约」避免绑定旧模型;数据模型最后但 schema 设计与 P3 并行;**DOM 渲染器作为回滚阀保留到 P4 验收通过后才删**。mivoserver 只读 spike 提前到 P2/P3 期间做(不接入,只摸契约),防 P4 反向推翻 BFF API 与 Anchor 设计。
+| 阶段 | 子 PR 数 | 周期 | rev3 变化 |
+|------|---------|------|----------|
+| P0 | 2-3 | 2-4 天 | 缩(测试网已有底子) |
+| P1 | 5-7 | 7-10 天 | 扩(平台通道+debug-logs 入迁移面) |
+| P2 | 8-11 | 2-3 周 | 缩(两项债已修) |
+| P3 | 1+6-8 | 2-3 周 | P3-0 起点更实(adapter 已存在) |
+| P4 | spike+10-15 | ≥4 周 | 演进式(V2 已在),spike 提前并行 |
 
-工作量总览(单人+AI agent,评审校准后):
+## P0 — 测试网补强 + 纯函数抽取(2-3 PR)
 
-| 阶段 | 子 PR 数 | 预估周期 |
-|------|---------|---------|
-| P0 | 3-4 | 3-5 天 |
-| P1 | 4-6 | 5-8 天 |
-| P2 | 9-13(分四组) | 2-3 周 |
-| P3 | 1(P3-0)+ 6-8 | 2-3 周 |
-| P4 | 设计 spike + 10-15+ | 另行细化,≥4 周 |
+**[改]** 不再安装 vitest(已有);统一测试入口(`test:unit` 已存在,验收命令改用它);**[改]** 抽取清单避开已抽模块(documentModelV2/canvasSnapshotModel/canvasInteraction/canvasRenderAdapter/brushGeometry/smartSelection 已存在勿重建)。
 
----
+- P0-a 补缺口单测:`snapshotValidation.ts`(存在但无测试,P4 守门员)、persist v8 迁移分支(brushStyle 重置/`<6` markdown 归一/flat state 兼容)、chatStore v1→v2 迁移纯函数。
+- P0-b 抽 `historyManager`(快照 push/undo/redo/60 条裁剪,仍内嵌 canvasStore)+ 单测。
+- P0-c 抽 `nodeFactory`(节点构造纯部分)+ 单测;coverage-v8 报告仅参考。
 
-## P0 — 地基:测试网 + 纯函数抽取(3-4 PR,3-5 天)
+**验收**:`npm run test:unit` 全绿;缺口用例清单覆盖;`tsc -b` + `npm run test:e2e` + `npm run verify:logging` 不回归。
 
-**只做「提取+引用」,不改 store 对外 action 签名,不动 persist key。**
+## P1 — 后端剥离:独立 BFF(全量面)+ 部署/CI(5-7 PR)
 
-| 子项 | 内容 |
-|------|------|
-| P0-a | vitest + `@vitest/coverage-v8`(复用 vite alias,不引 jsdom),`npm run test` |
-| P0-b | 抽 `src/store/historyManager.ts`(snapshotFromState/remember/patchWithHistory/applySnapshot,源 canvasStore.ts L286-626)+ 单测:undo/redo/60 条裁剪边界 |
-| P0-c | 抽 `src/canvas/geometry/nodeGeometry.ts`(normalizeCanvasNodes/syncDerivationEdgeNodes/rectsIntersect/culling 判定)+ 单测 |
-| P0-d | 抽 `src/store/nodeFactory.ts`(cloneNode/createNodeCopy/节点构造;注意生成结果落库路径的异步耦合,只抽纯构造部分)+ `snapshotValidation.ts` 单测(P4 迁移守门员) |
+**[改]** 迁移面按 main 实际:不再是"直连 llm-proxy 平移"——**mivo 平台通道整体随迁**(token/chatSession 内存缓存语义、401 authRetry 单飞、文件 upload/signUrl/poll/download、mask 回落 llm-proxy 的分流规则);**[增]** `/api/mivo/debug-logs` 收集端点入迁移清单(可基于现成 scripts/debug-log-server.mjs 合并实现);**[增]** enhance(kimi→qwen 降级)、eagle 全家、local-assets、pinterest。
 
-**验收**(可证伪):`npm run test` 绿;关键分支用例清单全覆盖——undo/redo/裁剪、normalize/edge sync/culling、clone/createNodeCopy、snapshotValidation v1-v7 分支(coverage-v8 报告作参考,不设硬指标);`tsc -b` + e2e-smoke 不回归。
+- P1-a server/ 骨架(Hono):同源托管 dist,pin `@hono/node-server`≥1.19.13。
+- P1-b 端点平移(保留 body limit/上游超时 240s/180s/错误映射语义);统一 error envelope+request id;日志脱敏(禁 key/blob/完整 prompt——debug-logs 已有脱敏函数可复用);路径穿越/SSRF/文件类型白名单。
+- P1-c **契约测试**:对 dev middleware 录基线→BFF 断言一致;**[增]** 覆盖 debug-logs(仅 warning/error+脱敏)、eagle assets/:id/file|thumbnail、平台通道成功/401 重试/超时/upload/poll。
+- P1-d vite 改 server.proxy,删 configureServer API 逻辑。
+- P1-e 生产运行:start:server + Dockerfile;e2e 拆 test:e2e:dev / test:e2e:prod。
+- P1-f CI:lint + tsc + test:unit + **verify:logging** + e2e(mock 上游);真链路 nightly;截图 artifacts。
 
-## P1 — 后端剥离:独立 BFF + 部署/CI(4-6 PR,5-8 天)
+**验收**:契约全绿;build+BFF 全链路可跑;错误用例断言;bundle 无 key;CI 全绿。
 
-**1:1 平移语义,不换上游**(继续直连 llm-proxy;mivoserver 留 P4)。端点契约与现状一致,前端零改动。
+## P2 — slice 化 + 交互拆分 + 剩余债(8-11 PR,三组)
 
-| 子项 | 内容 |
-|------|------|
-| P1-a | 新建 `server/`(Hono);**部署形态定死:BFF 同源托管 dist + `/api/mivo/*`,无浏览器 CORS**;pin `@hono/node-server` ≥1.19.13(serveStatic CVE) |
-| P1-b | 端点平移:generate/edit/enhance/local-assets/eagle/*/pinterest。**不是裸搬 handler**:保留并规范化现有 body limit(mivoImageRequestMaxBytes)/上游超时(mivoUpstreamTimeoutMs)/错误映射(readUpstreamError);统一 error envelope + request id;日志分类(上游状态/latency/timeout/abort),**禁止记录 API key/原图 blob/完整 prompt**;local-assets 路径穿越防护、Eagle 代理 SSRF 边界、文件类型白名单 |
-| P1-c | **API contract tests**:固定 generate/edit/enhance/local-assets/eagle/status 的响应 shape、错误码、超时、multipart 行为(先对 vite middleware 录基线,平移后断言一致) |
-| P1-d | vite 改 `server.proxy` → 本地 BFF,删 configureServer API 逻辑;dev 体验不变 |
-| P1-e | 生产运行:`npm run start:server` + Dockerfile;e2e 拆 `test:e2e:dev` / `test:e2e:prod`(build+BFF 真启动拓扑,当前 e2e-smoke.mjs:141 固定起 dev 需改造) |
-| P1-f | CI(GitHub Actions):lint + tsc + test + e2e(**mock BFF 上游/fixture 模式,不打真实 llm-proxy**);真链路留手动/nightly;上传截图 artifacts |
+**组 1:store slice 化(3-4 PR)** — 单一 persisted `useCanvasStore` 门面 + documentSlice/generationSlice/selectionSlice;**[改]** contract tests 按 **persist v8 + chat v2 + snapshot v2** 设计;chatStore 只留会话 UI 态,**sendMessage 与 retryMessage 两条入口**都改走 generation facade(chatStore.ts:310-356/596-652);hydration/partialize 专项测试。
 
-**验收**:契约测试全绿(与 dev middleware 基线一致);`vite build` + BFF 启动后完整生成链路可跑;错误用例(超时/413/上游 4xx5xx/Eagle 离线/路径越权)有断言;grep 确认前端 bundle 无 key;CI 全绿。
+**组 2:交互控制器拆 hooks(2-3 PR)** — 按 rev3 新缝隙(含 brush/stamp/smart-selection 职责归置);复用已有 canvasInteraction.ts 纯函数;CanvasNodeView 加 React.memo。
 
-## P2 — slice 化 + 交互拆分 + 还债(9-13 PR,分四组,2-3 周)
+**组 3:剩余债(2-3 PR,依赖 P1)** — **[改]** 长任务从"客户端取消+粗进度"升级为**服务端任务协议**(BFF registry、SSE/轮询真进度替换硬编码 20→100、client abort→upstream abort、幂等 key;验收:取消后不再 commit result);**[改]** variations/annotation 去 mock(先定端点契约;验收 `rg mockGeneration` 生产路径零命中);**[删]** Eagle 拖拽、横图 mask 移出待修 → e2e 回归项保留。
 
-**组 1:store slice 化(3-4 PR)** — 单一 persisted `useCanvasStore` 门面不变,内部拆 slice 文件:
-- `documentSlice`(canvases/nodes/edges/历史/commitGenerationResult)、`generationSlice`(5 个生成 action 的网络编排 + tasks,经稳定 facade 暴露)、`selectionSlice`(activeTool/selection/剪贴板)。104 处 selector 零改动;persist v7 key 不动。
-- **chatStore 纳入边界**:只保留会话 UI 状态/模型参数/消息持久化,生成命令改调 generation facade(替换 chatStore.ts:162-179 的 getState() 直调);文档写入仍经 commitGenerationResult。
-- 拆分前先补 **store contract tests**:persist v7 JSON shape、selectNode(s)/undo/redo/commitGenerationResult/task 状态/chatStore→facade,含 hydration 顺序与 partialize 行为。
+**期间并行**:mivoserver 只读 spike + **P4 schema spike 启动**(V2 字段→Anchor/Version 演进设计,一页纪要)。
 
-**组 2:交互控制器拆 hooks(2-3 PR)** — 按 6 缝隙:`useViewport`(L101-345)/几何引 P0-c(L390-437)/`useMarqueeSelection`(L479-575)/`useNodeTransform`(L577-750)/`useTextAnnotation`(L752-1050)/`useGlobalCanvasEvents`(L1206-1452)。CanvasNodeView 加 React.memo。
+## P3 — Leafer 渲染迁移(P3-0 + 6-8 PR)
 
-**组 3:长任务协议(2-3 PR,依赖 P1)** — BFF 任务 registry;进度(SSE 或轮询);client abort → upstream abort 的真取消语义(非仅 UI 取消);重试幂等 key;验收:取消后 task 态为 canceled、BFF 收到 abort、**不再 commit result**。
+**P3-0(可并入 P2 尾部)[改]**:**基于现有 canvasRenderAdapter.ts 固化**为正式 RenderNode/RenderEdge 投影(renderer 不直接消费 MivoCanvasNode;V2 语义字段是现成投影输入);统一 viewport matrix;Layer enum;InteractionAdapter 契约 + 命中纯函数补齐(点选/描边命中/topmost/frame 穿透/locked-hidden,带单测——现状命中全靠 DOM 事件,`.canvas-host` pointer-events:none)。
 
-**组 4:体验债 + 去 mock(2-3 PR,依赖 P1)** — Eagle 拖拽 backdrop(App.tsx:180/184, LibraryWorkspace.tsx:924/934);横图 mask 遮挡(ImageMaskEditOverlay.tsx:319/367/412);variations/annotation 去 mock(先设计端点契约再接;验收 `rg mockGeneration` 生产路径零命中 + prod e2e)。
+**混合渲染矩阵与迁移切片不变**(图片→frame/markup/连线→静态文本;markdown/pdf/video/task/ai-slot/annotation 卡片与所有编辑态/浮层永久留 DOM;flag 双轨;文本度量 golden fixtures;**DomRenderer 保留至 P4 验收后**)。
 
-**期间并行**:mivoserver 只读 spike(任务/存储/鉴权/模型能力/board schema 边界,产出一页纪要供 P3-0/P4 消费)。
+**验收不变**:双模式 e2e 全绿;固定场景截图 diff 阈值;坐标同步专项(zoom/pan/DPR);1000 节点 p95 frame time 对照 DOM 基线;命中单测全绿。
 
-**验收**:contract tests + e2e 全绿;长任务取消语义断言;100 节点 stress 拖拽/缩放性能 trace(p95 frame time 阈值,基线在组 2 前录制)。
+## P4 — V2 → Anchor/Version 演进 + 资产 + 服务端 + mivoserver(spike+10-15 PR)
 
-## P3 — Leafer 渲染迁移(P3-0 + 6-8 PR,2-3 周)
+**[改]** 定性为**演进**:在已有 V2 语义字段/documentModelV2/snapshot v2 之上扩展 Anchor(坐标+绑定图+指令,Node 之上引用层)与 Version;renderer 只改 P3-0 投影层。
+- 资产服务端化:/api/assets + `mivo-asset:` blob 上传 + 节点 URL 重写;chat history 持久化归属在 spike 定。
+- 文档持久化:GET/PUT /api/canvas/:id(先 SQLite 后对齐 mivoserver);revision/etag + 幂等 PUT + LWW + 冲突提示;**[改]** 迁移 fixtures 用 **canvas v8 + chat v2 + snapshot v2**(含导入图/生成图/视频/PDF/Markdown);snapshotValidation 守门 + 备份回滚 + 中断恢复。
+- **[增]** debug/logging 隐私策略随部署形态复核(JSONL 落盘位置/token/CORS——debug-log-server 已有独立 CORS collector 模式)。
+- L2 编排上移 BFF + mivoserver 对接(Celery 任务态 BFF 消化);验收通过后删 DomRenderer/flag。
 
-**P3-0 渲染投影契约(先行 PR,与 P4 schema 设计并行冻结)**:
-- 定义 `RenderNode/RenderEdge` 投影类型(renderer 不直接消费 `MivoCanvasNode`,P4 引入 Anchor 后只改投影层,不重写 renderer sync);
-- 统一 **viewport matrix** 单一来源(Leafer 相机与 DOM overlay 共享同一矩阵);
-- 显式 **Layer enum**(frame 底层/内容/selected 提升/preview/handles/floating UI),对齐现有 DOM 顺序+z-index 语义;
-- **InteractionAdapter 契约**:pointer event → viewport 逆变换 → 自有 topmost hit-test → 现有 interaction hooks。**当前命中全靠 DOM 节点事件(`.canvas-host` pointer-events:none),迁移后必须补齐纯函数命中**:点选、路径/描边命中(连线箭头现依赖 SVG pointer-events:stroke)、重叠 topmost、frame 背景/子节点穿透、locked/hidden 规则——全部带单测。
+## 不做什么(不变项从略,新增/修改)
 
-**混合渲染矩阵(明确哪些节点永不迁)**:
+- 不重建 main 已有模块(documentModelV2/canvasSnapshotModel/canvasInteraction/canvasRenderAdapter 等)——只扩展。
+- 不做多人协作;不拆 persist key;不追组件覆盖率;不重写 undo;P3 不引 @leafer-in/editor;P3 完成前不删 DOM 渲染;P2/P3 期间 mivoserver 只读 spike。
 
-| 走 Leafer paint | 永久留 DOM overlay |
-|---|---|
-| 图片、frame/section、画笔/markup、连线、静态文本 | markdown/pdf/video/task-placeholder/ai-slot/annotation 卡片、文字编辑态、选择框/handles、工具条、ChatPanel、菜单、mask/crop overlay |
+## 风险清单(rev3 增量)
 
-**迁移切片(每 PR 保持 dom 模式可用)**:
-- P3-a `RendererAdapter` 接口 + DomRenderer 包装 + flag(`?renderer=leafer|dom`),e2e 双模式;
-- P3-b 图片节点(收益最大):Leafer Image + 资源生命周期单列(IndexedDB blob URL 异步加载/失败占位/revoke/naturalSize/crop 语义/CORS taint);
-- P3-c frame/section + markup(Path)+ 连线(connectorGeometry 喂 Leafer);
-- P3-d 静态文本:**先建文本度量 golden fixtures**(CJK/wrap/line-height/weight,对照 DOM 测量;textGeometryFor 与 Markdown scrollHeight 回写高度是已知耦合点),编辑态切 DOM overlay;
-- P3-e 收尾:culling 策略基准择一(Leafer 内建 vs 自有 culling 只 sync 视口内);stress 500/1000 节点基准。**不删 DomRenderer/flag——保留到 P4 验收通过。**
-
-**验收**(可证伪):e2e M1-M6 双渲染模式全绿;固定关键场景清单(5 个 demo scene + mask/crop/文字编辑态)截图 diff ≤ 设定阈值;坐标同步专项(zoom/pan/DPR/浏览器缩放/ResizeObserver 下 overlay 与 paint 层像素对齐);1000 节点 pan/zoom p95 frame time 阈值 + sync diff 耗时 + heap 增量,对照 DOM 基线;命中判定纯函数单测全绿。
-
-## P4 — 数据模型 + 资产 + 服务端持久化 + mivoserver(spike + 10-15 PR,进入前另行细化)
-
-先做**设计 spike**(消费 P2 期间的 mivoserver 纪要),再拆执行 PR:
-
-- P4-a L1 schema:`Canvas/Node/Anchor/Edge/Version`。Anchor(坐标+绑定图+指令)为 Node 之上引用/派生层,渐进引入;renderer 只需扩展 P3-0 投影层。
-- P4-b **资产服务端化(评审补入的关键遗漏)**:`/api/assets` 上传/下载(或对象存储 facade);迁移器把 IndexedDB `mivo-asset:` blob 上传并**重写节点 URL** 为服务端 asset id;chat history 是否随 canvas 服务端持久化在 spike 中定。
-- P4-c 文档持久化:`GET/PUT /api/canvas/:id`(先 SQLite,后对齐 mivoserver Mongo/PG);**并发/冲突模型**:document revision/etag + 幂等 PUT + last-write-wins(多 tab/跨设备/离线缓存),冲突提示;迁移器(localStorage v7 → 服务端)带单测 + snapshotValidation 守门 + 本地备份回滚 + 中断恢复。
-- P4-d L2 编排上移 BFF + 对接 mivoserver 能力层,Celery 任务态在 BFF 消化不泄漏前端。
-- P4 验收通过后:删 DomRenderer/flag(P3 遗留)。
-
-**验收**:固定 v7 fixtures(含导入图/生成图/视频/PDF/Markdown 的旧数据)跨浏览器加载,断言节点/边/任务/选择/asset URL 重写逐项一致;Anchor 创建/绑定/挂指令可用;Version 可回溯;冲突用例(双 tab 并发写)有确定行为断言。
-
----
-
-## 不做什么(防 scope creep)
-
-- 不做多人实时协作(CRDT/OT/presence)——冲突模型仅到 revision/etag + LWW 级别。
-- 不在 P1 换能力后端;P2/P3 期间对 mivoserver 只做只读 spike。
-- 不拆 persist key;P2 只做 slice 门面,真·多 store 化 P4 后再议。
-- 不追组件级覆盖率指标(纯函数单测 + contract tests + e2e 兜底)。
-- 不重写 undo(快照式保留;千级节点后依据 P3-e 基准数据再评估 command-based)。
-- P3 不引 @leafer-in/editor(选择编辑走自有 overlay;确认无用则移除该子包)。
-- 不动 demoScenes/stress-test(P3 基准基线)。
-- P3 完成前不删 DOM 渲染路径(回滚阀)。
-
-## 风险清单
+rev2 全部保留,新增/修订:
 
 | 风险 | 阶段 | 影响 | 缓解 |
 |------|------|------|------|
-| Leafer 事件桥/命中语义(pointer-events:none 现状) | P3 | 高 | P3-0 InteractionAdapter 契约先行 + 命中纯函数单测 |
-| 渲染语义差异(文字度量/图片时序/zIndex/DPR/overlay 坐标) | P3 | 高 | 投影契约 + golden fixtures + 截图 diff 阈值 + flag 双轨每 PR 可回滚 |
-| renderer 绑死旧模型,P4 Anchor 引入后重写 | P3/P4 | 高 | P3-0 RenderNode 投影层隔离 + P4 schema 并行冻结 |
-| 资产(IndexedDB blob)迁移丢失 | P4 | 高 | /api/assets + URL 重写迁移器 + 含资产 fixtures 验收 |
-| store 拆分破坏 104 处 selector / hydration 顺序 | P2 | 高 | slice 门面(非多 store)+ contract tests 先行 + e2e 每 PR |
-| BFF 安全面(路径穿越/SSRF/body limit/日志泄密) | P1 | 高 | P1-b 安全项显式验收 + 错误用例断言 |
-| BFF dev/prod 行为分叉 | P1 | 高 | 契约测试录基线 + test:e2e:prod |
-| localStorage→服务端迁移丢数据/中断 | P4 | 高 | 迁移器单测 + snapshotValidation + 备份回滚 + 中断恢复 |
-| 长任务取消只到 UI 层,服务端任务悬挂 | P2 | 中 | BFF 任务 registry + upstream abort 语义断言 |
-| mivoserver 契约反推翻 BFF/Anchor 设计 | P4 | 中 | P2/P3 期间只读 spike 提前摸底 |
-| serveStatic CVE(<1.19.13) | P1 | 中 | pin ≥1.19.13;平台托管时切分离模式 |
-| CI 依赖真实 llm-proxy/Eagle 不稳定 | P1+ | 中 | CI mock 上游,真链路 nightly/手动 |
-| origin 指向 upstream 不可 push | 全程 | 低 | 执行前 fork(PraiseZhu)或新建 remote |
+| mivo 平台通道迁移破坏 token/chatSession 缓存语义(内存单飞) | P1 | 高 | 契约测试覆盖 401 重试/会话复用;BFF 内保持单实例缓存语义 |
+| debug-logs 迁移后日志隐私/脱敏回归 | P1 | 中 | 复用现有 sanitize 函数+vite.config.test.ts 用例随迁 |
+| e2e(5647 行)与 BFF 拓扑耦合(内置 MIVO_DEBUG_LOG_DIR 等) | P1 | 中 | e2e 启动器抽参数,dev/prod 两套 |
+| P2 拆分撞上 main 持续演进(demo 迭代未停) | P2 | 中 | 每子 PR 快进 rebase main;拆分 PR 保持小 |
 
-## 关键文件
+## 关键文件(rev3 更新)
 
-- `src/store/canvasStore.ts`(2616 行:P0 抽取源/P2 slice 化主体/commitGenerationResult 枢纽)
-- `src/store/chatStore.ts`(L162-179 getState() 直调:P2 改走 generation facade)
-- `vite.config.ts`(L782-997:P1 迁出源,body limit/超时/错误映射语义须保留)
-- `src/canvas/useCanvasInteractionController.ts`(1498 行:P2 拆 hooks)+ `canvasInteraction.ts`(命中判定补齐处)
-- `src/canvas/MivoCanvas.tsx` + `CanvasNodeView.tsx`(P3 主战场;Leafer 空实例 MivoCanvas.tsx:465-499)
-- `src/lib/assetStorage.ts` + `canvasArchive.ts`(P4 资产迁移源)
-- `src/types/mivoCanvas.ts`(P4 数据模型真相源)/ `src/lib/snapshotValidation.ts`(P0 补测,P4 守门)
-- `scripts/e2e-smoke.mjs`(P1 拆 dev/prod 两套启动器)
+- `src/store/canvasStore.ts`(3168 行)/ `src/store/chatStore.ts`(803 行,双入口耦合点 310-356/596-652)
+- `vite.config.ts`(1630 行,P1 迁出源:平台通道 587-793/debug-logs 419-457/路由 1405-1614)
+- `src/canvas/useCanvasInteractionController.ts`(1775 行,rev3 缝隙表)/ `canvasInteraction.ts`(已有纯函数+测试)
+- `src/canvas/canvasRenderAdapter.ts`(P3-0 基础)/ `src/model/documentModelV2.ts` + `canvasSnapshotModel.ts`(P4 演进基础)
+- `src/canvas/MivoCanvas.tsx:501-534`(Leafer 空实例)/ `CanvasNodeView.tsx`(830 行无 memo)
+- `src/lib/assetStorage.ts` / `snapshotValidation.ts`(P0 补测)/ `scripts/debug-log-server.mjs`(P1 复用)/ `scripts/e2e-smoke.mjs`(5647 行)
 
 ## 验证方式
 
-每子 PR:`tsc -b` + `npm run lint` + `npm run test` + 对应 e2e 模式。P1 起:契约测试 + test:e2e:prod + CI(mock 上游)。P2 起:store contract tests + 长任务取消断言 + 性能 trace 基线。P3 起:双渲染模式 e2e + 截图 diff(固定场景清单+阈值)+ 1000 节点基准(p95 frame time/sync 耗时/heap)。P4:v7 含资产 fixtures 迁移断言 + 双 tab 冲突用例。
+每子 PR:`tsc -b` + `npm run lint` + `npm run test:unit` + `npm run verify:logging` + 对应 e2e 模式。P1 起:契约测试+test:e2e:prod+CI。P2 起:store contract(v8/v2)+取消语义断言+性能 trace。P3 起:双渲染 e2e+截图 diff+1000 节点基准。P4:v8/v2 含资产 fixtures+双 tab 冲突用例。
