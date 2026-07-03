@@ -1,0 +1,17 @@
+{
+  "scenario": "local-assets-file-403-traversal",
+  "request": {
+    "method": "GET",
+    "path": "/api/mivo/local-assets/L2V0Yy9wYXNzd2Q",
+    "headers": {}
+  },
+  "response": {
+    "status": 403,
+    "headers": {
+      "content-type": null,
+      "cache-control": null
+    },
+    "body": "Asset path is outside allowed roots"
+  },
+  "capturedAt": "2026-07-03T15:23:24.551Z"
+}

@@ -1,0 +1,17 @@
+{
+  "scenario": "local-assets-file-200",
+  "request": {
+    "method": "GET",
+    "path": "/api/mivo/local-assets/L3Zhci9mb2xkZXJzL3Y5L3ZjbHlobG1uN2M5Y3Y2amI3NHpfN2x5dzAwMDBnbi9UL21pdm8tY29udHJhY3QtYXNzZXRzLXNRWWd3NS90ZXN0LnN2Zw",
+    "headers": {}
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "content-type": "image/svg+xml",
+      "cache-control": "no-store"
+    },
+    "body": "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"2\" height=\"2\"><rect width=\"2\" height=\"2\" fill=\"#000\"/></svg>"
+  },
+  "capturedAt": "2026-07-03T15:23:24.550Z"
+}

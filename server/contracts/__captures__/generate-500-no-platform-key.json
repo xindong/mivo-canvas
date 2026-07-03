@@ -1,0 +1,21 @@
+{
+  "scenario": "generate-500-no-platform-key",
+  "request": {
+    "method": "POST",
+    "path": "/api/mivo/generate",
+    "headers": {
+      "content-type": "application/json"
+    }
+  },
+  "response": {
+    "status": 500,
+    "headers": {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": null
+    },
+    "body": {
+      "error": "MIVO_PLATFORM_KEY 未配置，请配置或切换 GPT 模型"
+    }
+  },
+  "capturedAt": "2026-07-03T15:23:24.407Z"
+}

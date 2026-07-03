@@ -1,0 +1,136 @@
+{
+  "endpoint": "/api/mivo/debug-logs",
+  "summary": "Remote debug log collector. POST: normalize (warning/error only) + sanitize + JSONL append. GET: query with token-gated access. Shares pure helpers with vite.config.test.ts (normalizeRemoteDebugPayload / sanitizeRemoteDebugText / filterRemoteDebugRecords).",
+  "sourceFile": "vite.config.ts",
+  "dispatchRef": "L1413-L1416 (middleware route) → handleRemoteDebugLogRequest L419-L457",
+  "methods": {
+    "POST": "append records",
+    "GET": "query records",
+    "other": "405 {ok:false, error:'Method not allowed'} (L456)"
+  },
+  "envDeps": ["MIVO_DEBUG_LOG_DIR (default <cwd>/data/debug-logs, L257)", "MIVO_DEBUG_VIEW_TOKEN (optional; if unset, GET is open)"],
+  "bodyLimit": "1MB JSON (L33) → 413 on POST",
+  "normalizationRefs": {
+    "testFile": "vite.config.test.ts",
+    "describe": "remote debug server helpers",
+    "exportedHelpers": ["normalizeRemoteDebugPayload (L288-L328)", "sanitizeRemoteDebugText (L266-L275)", "filterRemoteDebugRecords (L330-L346)"],
+    "note": "Referenced, NOT re-implemented. P1-c BFF must preserve these exact behaviors; the existing vitest cases remain the canonical proof."
+  },
+  "postScenarios": [
+    {
+      "name": "POST valid payload → 200",
+      "request": { "method": "POST", "body": { "clientId": "c1", "sessionId": "s1", "entries": [{ "level": "warning", "source": "S", "message": "m", "timestamp": 1 }] } },
+      "expected": { "status": 200, "body": { "ok": true, "accepted": 1 } },
+      "source": "live-capturable",
+      "sourceRef": "L420-L425",
+      "capture": "__captures__/debug-logs-post-200.json"
+    },
+    {
+      "name": "POST filters to warning/error only (log/info dropped)",
+      "request": { "body": { "entries": [{ "level": "log" }, { "level": "warning" }, { "level": "error" }] } },
+      "expected": { "status": 200, "body": { "ok": true, "accepted": 2 } },
+      "source": "live-capturable",
+      "sourceRef": "isRemoteDebugLevel L259; normalizeRemoteDebugPayload L302-L305",
+      "capture": "__captures__/debug-logs-post-filter-level.json",
+      "note": "Cap: entries.slice(0,40) (maxRemoteDebugEntries L254). Excess entries silently dropped."
+    },
+    {
+      "name": "POST sanitizes secrets/data-urls/long-base64",
+      "source": "code-derived + existing vitest",
+      "sourceRef": "sanitizeRemoteDebugText L266-L275; vite.config.test.ts 'redacts likely secrets...' case",
+      "note": "Regexes: data: URIs → 'data:[redacted]'; token/api_key/authorization/password/secret=val → '$1=[redacted]'; ≥48-char base64-like → '[redacted-base64]'; truncate 4000."
+    },
+    {
+      "name": "POST body exceeds 1MB → 413 intent, observable as ECONNRESET",
+      "expected": { "serverIntent": "413 {ok:false, error:'Request body is too large'}", "observable": "ECONNRESET transport error" },
+      "source": "live-capturable",
+      "sourceRef": "readJsonRequest L477-L481 (request.destroy() at L468); catch L428 sendMivoJson 413",
+      "capture": "__captures__/debug-logs-post-413.json",
+      "discrepancy": "Same request.destroy() race as generate-413/edit-413: socket torn down before the 413 response is delivered. BFF must send clean 413."
+    },
+    {
+      "name": "POST invalid JSON → 400",
+      "expected": { "status": 400, "body": { "ok": false, "error": "<SyntaxError message>" } },
+      "source": "live-capturable",
+      "sourceRef": "JSON.parse L480; catch L426-L429",
+      "capture": "__captures__/debug-logs-post-400.json"
+    },
+    {
+      "name": "POST origin restriction",
+      "expected": "NONE — no origin/CORS/Referer check in current dev middleware",
+      "source": "code-derived",
+      "sourceRef": "handleRemoteDebugLogRequest L419-L430 (no origin inspection)",
+      "discrepancy": "Plan §6.1 says 'POST: body limit/origin 限制' but current code has NO origin restriction. The 'origin 限制' is a P1-c intended addition (生产安全模型 §6.1: 'POST 限 origin/rate/body'), NOT current dev behavior. BFF must ADD origin gating; record as intended-change."
+    }
+  ],
+  "getScenarios": [
+    {
+      "name": "GET without token when MIVO_DEBUG_VIEW_TOKEN unset → 200 open",
+      "condition": "MIVO_DEBUG_VIEW_TOKEN env empty/unset",
+      "expected": { "status": 200, "body": { "ok": true, "dates": ["<iso-date>"], "records": [{ "<RemoteDebugRecord>": "..." }] } },
+      "source": "code-derived",
+      "sourceRef": "hasRemoteDebugViewAccess L408-L410 (returns true when no token configured)",
+      "discrepancy": "Open-by-default GET is a production risk; plan §6.1 生产安全模型 requires GET to need a token in prod. Current dev = open. BFF must enforce token in prod. NOT live-captured: the capture run sets MIVO_DEBUG_VIEW_TOKEN to exercise the 403/token branches; the open branch is a trivial 2-line guard (L409-L410) verified by reading."
+    },
+    {
+      "name": "GET without token when MIVO_DEBUG_VIEW_TOKEN set → 403",
+      "condition": "MIVO_DEBUG_VIEW_TOKEN set",
+      "request": { "headers": {}, "query": {} },
+      "expected": { "status": 403, "body": { "ok": false, "error": "Debug report token required" } },
+      "source": "live-capturable",
+      "sourceRef": "hasRemoteDebugViewAccess L408-L417; L434-L436",
+      "capture": "__captures__/debug-logs-get-403.json"
+    },
+    {
+      "name": "GET with token via header (x-mivo-debug-token) → 200",
+      "condition": "MIVO_DEBUG_VIEW_TOKEN set",
+      "request": { "headers": { "x-mivo-debug-token": "<token>" } },
+      "expected": { "status": 200, "body": { "ok": true, "dates": ["<iso-date>"], "records": [{ "<RemoteDebugRecord>": "..." }] } },
+      "source": "live-capturable",
+      "sourceRef": "L412-L414",
+      "capture": "__captures__/debug-logs-get-200-header-token.json"
+    },
+    {
+      "name": "GET with token via query (?token=) → 200",
+      "condition": "MIVO_DEBUG_VIEW_TOKEN set",
+      "request": { "query": { "token": "<token>" } },
+      "expected": { "status": 200, "body": { "ok": true, "dates": ["<iso-date>"], "records": [{ "<RemoteDebugRecord>": "..." }] } },
+      "source": "live-capturable",
+      "sourceRef": "L416",
+      "capture": "__captures__/debug-logs-get-200-query-token.json"
+    },
+    {
+      "name": "GET default window = last 7 days, limit cap 1000 (default 200)",
+      "request": { "query": {} },
+      "expected": "dates = availableDates.slice(0,7); limit = min(Number(?limit)||200, 1000); records sorted by receivedAt desc",
+      "source": "code-derived",
+      "sourceRef": "L439-L450",
+      "discrepancy": "Plan §6.1 says 'limit cap 1000' but omits the default-200. Recorded for completeness."
+    },
+    {
+      "name": "GET filters: level / clientId / sessionId / q",
+      "source": "code-derived + existing vitest",
+      "sourceRef": "filterRemoteDebugRecords L330-L346; vite.config.test.ts 'filters records...' case",
+      "note": "q matches source/message/clientId/sessionId (case-insensitive contains)."
+    },
+    {
+      "name": "GET records sorted by receivedAt desc",
+      "source": "code-derived",
+      "sourceRef": "L449 (.sort by Date.parse(receivedAt))"
+    }
+  ],
+  "methodGuardScenarios": [
+    {
+      "name": "PUT/DELETE/PATCH → 405",
+      "expected": { "status": 405, "body": { "ok": false, "error": "Method not allowed" } },
+      "source": "live-capturable",
+      "sourceRef": "L456",
+      "capture": "__captures__/debug-logs-405.json"
+    }
+  ],
+  "recordShape": {
+    "ref": "RemoteDebugRecord type L206-L227",
+    "fields": ["id", "level", "source", "message", "timestamp", "clientId", "sessionId", "appVersion", "pagePath", "userAgent", "language", "timezone", "screen{width,height,pixelRatio}", "ip", "referer", "receivedAt"],
+    "idFormat": "`${receivedAt}-${index}-${random6}` (L310)"
+  }
+}

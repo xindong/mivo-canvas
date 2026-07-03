@@ -1,0 +1,33 @@
+{
+  "endpoint": "/api/mivo/pinterest/status",
+  "summary": "Hardcoded placeholder. Always returns {connected:false, mode:'prototype'}. No upstream, no env, no auth.",
+  "sourceFile": "vite.config.ts",
+  "dispatchRef": "L1577-L1586",
+  "methods": {
+    "GET": "primary",
+    "other": "DISCREPANCY — no method guard. Non-GET returns the same 200 response."
+  },
+  "scenarios": [
+    {
+      "name": "GET 200 placeholder",
+      "request": { "method": "GET", "path": "/api/mivo/pinterest/status" },
+      "expected": { "status": 200, "headers": { "Content-Type": "application/json; charset=utf-8" }, "body": { "connected": false, "mode": "prototype" } },
+      "source": "live-capturable",
+      "sourceRef": "L1577-L1586",
+      "capture": "__captures__/pinterest-status-200.json"
+    },
+    {
+      "name": "non-GET method → same 200 (no guard)",
+      "request": { "method": "POST", "path": "/api/mivo/pinterest/status" },
+      "expected": { "status": 200, "body": { "connected": false, "mode": "prototype" } },
+      "source": "live-capturable",
+      "sourceRef": "L1577-L1586 (no method check)",
+      "capture": "__captures__/pinterest-status-post-200.json",
+      "discrepancy": "No 405. Same intended-change candidate as local-assets/eagle."
+    }
+  ],
+  "invariants": [
+    "Deterministic response (no upstream call, no env read).",
+    "Content-Type: application/json; charset=utf-8 always set (L1578)."
+  ]
+}
