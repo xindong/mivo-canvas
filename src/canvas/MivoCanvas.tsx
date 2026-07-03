@@ -24,6 +24,7 @@ import { BrushOptionsBar } from './BrushOptionsBar'
 import { CanvasContextMenu } from './CanvasContextMenu'
 import { CanvasNodeView } from './CanvasNodeView'
 import { CanvasToolDock } from './CanvasToolDock'
+import { AnchorOverlay } from './AnchorOverlay'
 import { ImageCropOverlay, type ImageCropBox } from './ImageCropOverlay'
 import { NodeActionMenu } from './NodeActionMenu'
 import { SelectionQuickToolbar } from './SelectionQuickToolbar'
@@ -144,6 +145,9 @@ export function MivoCanvas({
   const cropImageNode = useCanvasStore((state) => state.cropImageNode)
   const renameNode = useCanvasStore((state) => state.renameNode)
   const commitGenerationResult = useCanvasStore((state) => state.commitGenerationResult)
+  // P2-D2: only mount the AnchorOverlay when at least one anchor exists (cheap
+  // boolean selector — stable false when no anchors, so no re-render cost).
+  const hasAnchors = useCanvasStore((state) => state.nodes.some((node) => Boolean(node.experimentalAnchors?.length)))
   const contextMenuNodeId = contextMenu?.nodeId
   const visibleNodes = useMemo(() => nodes.filter((node) => !node.hidden), [nodes])
   const contextMenuNode =
@@ -959,6 +963,11 @@ export function MivoCanvas({
         </button>
         <span className="zoom-readout">{Math.round(viewport.scale * 100)}%</span>
       </div>
+      {/* P2-D2 EXPERIMENTAL — Anchor MVP overlay. Only mounted when at least one
+          anchor exists (hasAnchors selector) so unrelated views (assets drawer) pay
+          zero overhead. Marks sit above dom-canvas-layer; each is small + positioned
+          so canvas events pass through everywhere else. */}
+      {hasAnchors ? <AnchorOverlay viewport={viewport} /> : null}
     </section>
   )
 }

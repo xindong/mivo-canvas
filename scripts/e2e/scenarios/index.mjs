@@ -1,3 +1,4 @@
+import { runAnchorMvpScenario } from './anchor-mvp.mjs'
 import { runArchiveAssetsScenario } from './archive-assets.mjs'
 import { runCanvasInteractionsScenario } from './canvas-interactions.mjs'
 import { runChatGenerationScenario } from './chat-generation.mjs'
@@ -14,7 +15,8 @@ export const scenarioOrder = [
   'chat-generation',
   'mask',
   'migration',
-] 
+  'anchor-mvp',
+]
 
 export const scenarioBootstrapPredecessor = {
   'archive-assets': 'shell-sidebar',
@@ -24,6 +26,7 @@ export const scenarioBootstrapPredecessor = {
 }
 
 export const scenarioRunners = {
+  'anchor-mvp': runAnchorMvpScenario,
   'archive-assets': runArchiveAssetsScenario,
   'canvas-interactions': runCanvasInteractionsScenario,
   'chat-generation': runChatGenerationScenario,
