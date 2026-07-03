@@ -368,6 +368,96 @@ try {
     throw new Error(`Timed out waiting for canvas state: ${predicate.toString()}`)
   }
 
+  const ensureChatPanelOpen = async () => {
+    if (await page.locator('.ai-panel.collapsed').isVisible()) {
+      await page.getByRole('button', { name: 'Open AI panel' }).click()
+      await page.waitForSelector('.chat-composer-textarea', { state: 'visible' })
+    }
+    await page.waitForSelector('.ai-panel-header')
+  }
+
+  const assertNoTasksCopy = async (label) => {
+    const tasksCopy = await page.evaluate(() => ({
+      bodyText: document.body.innerText.includes('TASKS'),
+      title: Boolean(document.querySelector('[title*="TASKS"]')),
+      aria: Boolean(document.querySelector('[aria-label*="TASKS"]')),
+      headerText: document.querySelector('.ai-panel-header')?.textContent || '',
+    }))
+    if (tasksCopy.bodyText || tasksCopy.title || tasksCopy.aria || tasksCopy.headerText.includes('TASKS')) {
+      throw new Error(`${label}: page should not expose TASKS copy: ${JSON.stringify(tasksCopy)}`)
+    }
+  }
+
+  const readHeaderTasksIndicator = async () => page.evaluate(() => {
+    const rectFor = (element) => {
+      const rect = element?.getBoundingClientRect()
+      return rect ? {
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+        width: rect.width,
+        height: rect.height,
+      } : null
+    }
+    const header = document.querySelector('.ai-panel-header')
+    const indicator = document.querySelector('.ai-panel-tasks')
+    const spinner = document.querySelector('.ai-panel-tasks-spinner')
+    const headerStyle = header ? window.getComputedStyle(header) : null
+    const expectedLeft = header && headerStyle ? header.getBoundingClientRect().left + Number.parseFloat(headerStyle.paddingLeft) : null
+    return {
+      hasIndicator: Boolean(indicator),
+      hasSpinner: Boolean(spinner),
+      header: rectFor(header),
+      indicator: rectFor(indicator),
+      spinner: rectFor(spinner),
+      expectedLeft,
+    }
+  })
+
+  await ensureChatPanelOpen()
+  await assertNoTasksCopy('idle header')
+  const idleTasksIndicator = await readHeaderTasksIndicator()
+  if (idleTasksIndicator.hasIndicator || idleTasksIndicator.hasSpinner) {
+    throw new Error(`Idle header should not render the generation spinner: ${JSON.stringify(idleTasksIndicator)}`)
+  }
+  const previousTasks = await page.evaluate(async (moduleSpec) => {
+    const { useCanvasStore } = await import(moduleSpec)
+    const previousTasks = useCanvasStore.getState().tasks
+    useCanvasStore.setState({
+      tasks: [{
+        id: 'e2e-running-header-spinner',
+        label: 'E2E running header spinner',
+        status: 'running',
+        progress: 50,
+        nodeIds: [],
+      }],
+    })
+    return previousTasks
+  }, await canvasStoreSpec())
+  try {
+    await page.waitForSelector('.ai-panel-tasks-spinner', { state: 'visible' })
+    await assertNoTasksCopy('running header')
+    const runningTasksIndicator = await readHeaderTasksIndicator()
+    if (!runningTasksIndicator.hasIndicator || !runningTasksIndicator.hasSpinner) {
+      throw new Error(`Running header should render the generation spinner: ${JSON.stringify(runningTasksIndicator)}`)
+    }
+    if (
+      runningTasksIndicator.expectedLeft === null ||
+      !runningTasksIndicator.indicator ||
+      Math.abs(runningTasksIndicator.indicator.left - runningTasksIndicator.expectedLeft) > 1.5
+    ) {
+      throw new Error(`Running spinner should align to the header content left edge: ${JSON.stringify(runningTasksIndicator)}`)
+    }
+  } finally {
+    await page.evaluate(async ({ moduleSpec, previousTasks }) => {
+      const { useCanvasStore } = await import(moduleSpec)
+      useCanvasStore.setState({ tasks: previousTasks })
+    }, { moduleSpec: await canvasStoreSpec(), previousTasks })
+  }
+  await page.waitForSelector('.ai-panel-tasks-spinner', { state: 'detached' })
+  await assertNoTasksCopy('restored idle header')
+
   // ⑤ 默认模型切 gemini（D-R5b）：localStorage.clear 后新用户吃到新默认，不破既有段落
   {
     const chatState = await readChatState()
@@ -1206,7 +1296,7 @@ try {
   if ((await page.locator('.selection-quick-toolbar').count()) !== 0) {
     throw new Error('Markdown selection should not show a download-only quick toolbar')
   }
-  // R6: 底部 TASKS 条移除后画布下沿降低、工具条下移，可能与底部节点重叠遮挡点击。
+  // R6: 底部任务条移除后画布下沿降低、工具条下移，可能与底部节点重叠遮挡点击。
   // space+drag 上移画布 140px，使视频节点脱离工具条遮挡（viewport 偏移持续，后续 video dblclick 同样受益）。
   {
     const shellBox = await page.locator('.canvas-shell').boundingBox()

@@ -10,24 +10,15 @@ type ChatPanelProps = {
   focusRequestId?: number
 }
 
-// R6：TASKS 指示器进面板头部（替代原「AI / AI 对话」title）。
-// 数据源与原底部任务条同一 store selector（state.tasks）；只显示队列数量与进度，不放详情列表。
-// 格式 TASKS {done}/{total} + running 时小 spinner；空队列 0/0 subdued（保持头部不跳动）。
+// R6：面板头部仅在生成中显示旋转指示。
 const TasksIndicator = () => {
   const tasks = useCanvasStore((state) => state.tasks)
-  const total = tasks.length
-  const done = tasks.filter((task) => task.status === 'done').length
   const running = tasks.some((task) => task.status === 'running')
-  const idle = total === 0
+  if (!running) return null
+
   return (
-    <div
-      className={`ai-panel-tasks${idle ? ' ai-panel-tasks-idle' : ''}`}
-      aria-label={`任务队列 ${done}/${total}${running ? '，生成中' : ''}`}
-      title={`TASKS ${done}/${total}`}
-    >
-      <span className="ai-panel-tasks-label">TASKS</span>
-      <span className="ai-panel-tasks-count">{done}/{total}</span>
-      {running ? <Loader2 size={14} className="spin ai-panel-tasks-spinner" /> : null}
+    <div className="ai-panel-tasks" aria-label="生成中" title="生成中">
+      <Loader2 size={14} className="spin ai-panel-tasks-spinner" />
     </div>
   )
 }

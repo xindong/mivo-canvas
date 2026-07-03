@@ -4476,36 +4476,17 @@ button:disabled {
   padding: 16px 18px 12px;
 }
 
-/* R6：面板头部 TASKS 指示器（替代原「AI / AI 对话」title）；只显示队列数量与进度 */
 .ai-panel-tasks {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
-  min-width: 0;
-  font-size: 13px;
-  font-variant-numeric: tabular-nums;
-}
-
-.ai-panel-tasks-label {
-  color: var(--muted);
-  font-size: var(--text-xs);
-  font-weight: 850;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-}
-
-.ai-panel-tasks-count {
-  color: var(--ink);
-  font-size: 13px;
-  font-weight: 800;
+  justify-content: flex-start;
+  flex: 0 0 14px;
+  width: 14px;
+  height: 36px;
 }
 
 .ai-panel-tasks-spinner {
   color: var(--ochre);
-}
-
-.ai-panel-tasks-idle {
-  opacity: 0.5;
 }
 
 .ai-panel-toggle,
@@ -4518,6 +4499,10 @@ button:disabled {
   background: rgba(248, 244, 235, 0.74);
   border: 1px solid var(--line);
   border-radius: var(--radius-md);
+}
+
+.ai-panel-toggle {
+  margin-left: auto;
 }
 
 .ai-panel-toggle:hover,
