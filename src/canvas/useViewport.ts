@@ -10,11 +10,9 @@ import {
 import type { CanvasId, MivoCanvasNode } from '../types/mivoCanvas'
 import {
   boundsForNodes,
-  clientPointToCanvas,
   clampViewportScale,
   createPanState,
   normalizedWheelDelta,
-  viewportCenterPoint,
   viewportForBounds,
   viewportFromPan,
   viewportFromZoom,
@@ -22,6 +20,7 @@ import {
   type PanState,
   type Viewport,
 } from './canvasInteraction'
+import { screenToCanvas as screenToCanvasPoint } from '../render/viewportMatrix'
 
 export const defaultViewportFor = (sceneId: string): Viewport => ({
   x: 420,
@@ -115,14 +114,15 @@ export function useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseCo
   const screenToCanvas = useCallback(
     (clientX: number, clientY: number, sourceViewport: Viewport = viewportRef.current) => {
       const rect = shellRef.current?.getBoundingClientRect()
-      return clientPointToCanvas(rect, sourceViewport, clientX, clientY)
+      return screenToCanvasPoint(rect, sourceViewport, clientX, clientY)
     },
     [shellRef],
   )
 
   const viewportCenter = useCallback(() => {
     const rect = shellRef.current?.getBoundingClientRect()
-    return viewportCenterPoint(rect, viewportRef.current)
+    if (!rect) return { x: 0, y: 0 }
+    return screenToCanvasPoint(rect, viewportRef.current, rect.left + rect.width / 2, rect.top + rect.height / 2)
   }, [shellRef])
 
   const zoomTo = useCallback(

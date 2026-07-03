@@ -1,11 +1,35 @@
-# src/render — 渲染投影与交互契约(P3-0a)
+# src/render — 渲染投影与交互契约(P3-0a + P3-0b partial)
 
-> SC6.1 主体第一段。本目录是 renderer 与数据模型之间的**契约层**:
+> SC6.1 主体。本目录是 renderer 与数据模型之间的**契约层**:
 > renderer 只许消费 `RenderNode`/`RenderEdge`/`RenderAnchor` + 叶视觉类型
 > (`CanvasNodeFill` 等),**不得直接依赖 `MivoCanvasNode`**。
 > Anchor(P4-a CanvasAnchor)演进时只改 `projection.ts` 的投影函数,不动 renderer。
 
-## 模块清单(P3-0a 全部为新增模块 + 测试,不改 renderer/controller 运行行为)
+## P3-0b 状态(本 PR):partial — 全量 dispatch 接线 deferred
+
+**已落地(本 PR,行为零变化,e2e 8 scenario 全绿)**:
+- `interactionAdapter.ts` + test:`resolveHitTarget` 纯函数(edit-state 短路 + 委托 `topmostHit`)+ `isEditStateActive`。模块就位,作为未来全量接线的契约层。
+- `useViewport.screenToCanvas` 切到 `viewportMatrix.screenToCanvas`(bit-for-bit 等价,与 `canvasInteraction.clientPointToCanvas` 逐位相同,viewportMatrix 单测交叉验证 + 全量 e2e 8 scenario 绿)。
+
+**Deferred(全量 dispatch 接线,root cause 见下)**:
+- InteractionAdapter 接入 controller(`handleCanvasPointerDown` 用 `resolveHitTarget`)+ 移除 per-node `onPointerDown` + DOM 承载节点委托。
+- Layer enum 接线到 overlay 容器(zIndex)。
+- AnchorOverlay → `RenderAnchor.screenX/Y`。
+- 专项 e2e(topmostHit 集成级;函数级已由 `hitTest.test.ts` 22 用例 + `interactionAdapter.test.ts` 覆盖)。
+
+**Root cause(全量 dispatch 接线的阻断点)**:
+本 PR 曾尝试全量接线(shell `handleCanvasPointerDown` 经 `topmostHit` 路由 + 移除 per-node `onPointerDown`),`tsc`/`lint`/`test:unit` 全绿,但 `canvas-interactions` e2e 回归:Hand-tool 拖拽空白画布不再 pan(viewport 不动),而 Select-tool 拖拽同点 marquee 正常。
+
+根因:**移除 per-node `onPointerDown` 后,tool handler 的 `event.currentTarget.setPointerCapture` 落点从 `.dom-node` 变为 shell**。`beginPan` 用 `event.currentTarget.setPointerCapture(pointerId)` 捕获指针,旧路径 currentTarget=`.dom-node`(节点 div),新路径 currentTarget=shell;捕获落点改变导致 Hand-tool pan 的 pointermove 流不复现。Select-tool marquee 不依赖 setPointerCapture 同路,故正常。
+
+**修复路径(follow-up PR,P3-0c)**:
+1. 让 tool handler 的 setPointerCapture 显式指向 shell(而非 `event.currentTarget`),或
+2. 保留 per-node `onPointerDown` 仅作 capture target,shell 经 `topmostHit` 路由 anchor/line-markup hit(节点 hit 仍走 DOM dispatch),或
+3. 在 controller 层显式 `shellRef.current.setPointerCapture` 后再分发到 tool handler。
+
+三条路径都行为敏感,需专项 e2e(Hand-tool pan / 节点拖拽 / mask 编辑 / line-markup 选中)逐一验证,超出本 PR 预算。`interactionAdapter.ts` + `resolveHitTarget` 已就位,follow-up 直接接线。
+
+## 模块清单
 
 | 模块 | 职责 | 状态 |
 |------|------|------|
