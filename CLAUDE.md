@@ -51,7 +51,8 @@ Project MivoCanvas/
 
 - 遵循 `~/.claude/rules/node/` 下的语言规范（项目为 node/TS）
 - 全局规范：`~/.claude/rules/common/`
-- 项目特定 invariants：本节后续追加
+- 项目特定 invariants：
+  - **开发反馈/日志**：所有用户可见功能必须遵循 `docs/development-logging.md`。会改变状态、加载数据、执行工作流、跳过不可用路径或失败的操作，都必须通过 `debugLogger` 写入 Debug Log；需要即时用户反馈的操作同步使用 `toastFeedback`。新增按钮、菜单项、画布动作、资源流程、导入导出、设置项和 AI 工作流时，默认把成功、跳过、失败路径的日志一起补齐，不等到 review 再提醒。
 
 ## 敏感数据保护
 
@@ -68,6 +69,7 @@ Project MivoCanvas/
 - **构建**：`npm run build`（`tsc -b && vite build`，含类型检查）
 - **Lint**：`npm run lint`（eslint .）
 - **预览**：`npm run preview`
+- **日志规则守卫**：`npm run verify:logging`
 - **E2E**：`npm run test:e2e`（`node scripts/e2e-smoke.mjs`，Playwright）
 - **本地资源目录**：默认读 `~/Desktop/Images`，可用 `MIVO_ASSET_DIR=/path npm run dev` 覆盖
 - **Eagle 接入**：默认 `http://127.0.0.1:41595`，可用 `MIVO_EAGLE_API_URL` 覆盖
