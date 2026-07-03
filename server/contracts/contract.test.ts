@@ -358,7 +358,11 @@ describe.skipIf(!runLive)('server/contracts — live (target = dev middleware or
     })
     await s.listen()
     server = s
-    base = `http://127.0.0.1:${s.httpServer.address().port}`
+    const httpServer = s.httpServer
+    if (!httpServer) throw new Error('vite dev server did not start an http server')
+    const addr = httpServer.address()
+    const livePort = typeof addr === 'object' && addr ? addr.port : 0
+    base = `http://127.0.0.1:${livePort}`
   })
 
   afterAll(async () => {
