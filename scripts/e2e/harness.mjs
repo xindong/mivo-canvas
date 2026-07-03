@@ -20,6 +20,9 @@ const killStaleDevServer = (port) => {
   }
 }
 
+const localBin = (name) =>
+  path.resolve('node_modules', '.bin', process.platform === 'win32' ? `${name}.cmd` : name)
+
 const e2eBridgeModules = {
   canvasStore: [
     "const bridge = globalThis.__MIVO_E2E__",
@@ -94,7 +97,7 @@ const spawnBackgroundProcess = (command, args, options) => {
 
 export const startSmokeDevServer = ({ port, localAssetFixtureDir, eagleMockPort, bffPort }) => {
   killStaleDevServer(port)
-  return spawnBackgroundProcess('npm', ['run', 'dev', '--', '--host', '127.0.0.1', '--port', String(port), '--strictPort'], {
+  return spawnBackgroundProcess(localBin('vite'), ['--host', '127.0.0.1', '--port', String(port), '--strictPort'], {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: {
       ...process.env,
@@ -117,7 +120,7 @@ export const startSmokeBffServer = ({
   enableEagleProxy,
   isPublic = true,
 }) =>
-  spawnBackgroundProcess('npm', ['run', 'start:server'], {
+  spawnBackgroundProcess(localBin('tsx'), ['server/index.ts'], {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: {
       ...process.env,
