@@ -3,7 +3,12 @@ import {
   filterRemoteDebugRecords,
   normalizeRemoteDebugPayload,
   sanitizeRemoteDebugText,
-} from './vite.config'
+  type RemoteDebugRecord,
+} from './debug-records'
+
+// Migrated from vite.config.test.ts (P1-c Task A). Assertion semantics are
+// preserved 1:1 — these are the canonical proof that the BFF's debug-log
+// normalize/sanitize/filter behavior matches the dev middleware baseline.
 
 describe('remote debug server helpers', () => {
   it('normalizes only warning and error entries with server metadata', () => {
@@ -53,7 +58,7 @@ describe('remote debug server helpers', () => {
   })
 
   it('filters records for the debug report browser', () => {
-    const records = [
+    const records: Partial<RemoteDebugRecord>[] = [
       { level: 'warning', source: 'Settings', message: 'missing feature', clientId: 'client-a', sessionId: 's1' },
       { level: 'error', source: 'Canvas Import', message: 'failed import', clientId: 'client-b', sessionId: 's2' },
     ]

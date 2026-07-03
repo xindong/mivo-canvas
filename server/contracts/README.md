@@ -37,30 +37,57 @@ server/contracts/
 
 **不可安全实测的**(真实生成链路 / 真实平台 / 真实 LLM / 240s 超时)只 `code-derived`,附行号。`live-capturable` 场景都附 `capture: "__captures__/<name>.json"`(或 `captures: [...]`)指向提交的快照。
 
-## 如何在 P1-c 用它做 BFF diff 测试
+## 如何在 P1-c 用它做 BFF diff 测试(SC1.2 执行入口)
 
-`contract.test.ts` 是 SC1.2 骨架。两个套件:
+两件套:
 
-1. **静态套件**(默认 `npm run test:unit` 跑):验证每个 `__captures__/` 快照满足其 invariant(锁定 status + 关键 body 字段),且每个契约 JSON 的 `capture`/`captures` 引用都能解析到文件。快、无服务。
-2. **live 套件**(仅 `MIVO_CONTRACT_LIVE=1` 跑):对 target 重发请求,断言 live 响应满足同一 invariant。target 由 `MIVO_CONTRACT_TARGET_URL` 指定,缺省起一个临时 vite dev server。
+1. **静态套件**(`npm run test:unit` 默认跑,`server/contracts/contract.test.ts`):验证每个 `__captures__/` 快照满足其 invariant(锁定 status + 关键 body 字段),且每个契约 JSON 的 `capture`/`captures` 引用都能解析到文件。快、无服务。
+2. **live diff**(`npm run contract:diff`,`scripts/contract-diff.mjs`):对 target 重发每个场景的请求,逐字段比对 live 响应与 `__captures__/` 基线,输出 `diff=0 / DIFFERS / INTENDED` 报告。target 参数化(dev middleware 或 BFF url),`--group` 可按组过滤。**这是 SC1.2 的执行入口,生成组/资产组 worker 也在用,保持向后兼容。**
 
-P1-c 工作流:
+### contract:diff 用法
+
 ```bash
-# 1. BFF 起在本机 3000 端口
-MIVO_BFF_TOKEN=... node dist/server/main.js  # (示意,P1-e 落地后)
+# 对 dev middleware 跑全量(基线自证,应全 diff=0)
+npm run contract:diff -- --target=dev
 
-# 2. 把 target 指向 BFF,跑 live 套件
-MIVO_CONTRACT_TARGET_URL=http://127.0.0.1:3000 \
-MIVO_CONTRACT_LIVE=1 \
-npm run test:unit -- server/contracts/contract.test.ts
+# 对 BFF 跑全量
+npm run contract:diff -- --target=http://127.0.0.1:8080
+
+# 对 BFF 只跑某一组(P1-c 各组 PR 各自验证自己那组)
+npm run contract:diff -- --target=http://127.0.0.1:8080 --group=debug-logs
+# 等价: MIVO_CONTRACT_TARGET_URL=http://127.0.0.1:8080 npm run contract:diff -- --group=debug-logs
 ```
-全绿 = BFF 对锁定字段的响应与 dev middleware 基线 diff=0。
+
+退出码:0 = 无意外 diff;1 = 有意外 diff;2 = 运行错误。
+
+### P1-c 工作流(以 debug-logs 组为例)
+
+```bash
+# 1. 起 BFF(本地模式,无 MIVO_BFF_TOKEN;配 debug view token 与基线一致)
+MIVO_DEBUG_VIEW_TOKEN=test-token MIVO_DEBUG_LOG_DIR=/tmp/mivo-logs \
+  MIVO_PORT=8080 npm run start:server &
+
+# 2. 对 BFF 跑 debug-logs 组 diff
+npm run contract:diff -- --target=http://127.0.0.1:8080 --group=debug-logs
+# 期望: 7 match + 1 intended (D1: clean 413 vs dev ECONNRESET), 0 unexpected
+
+# 3. 对 dev 跑全量(基线自证)
+npm run contract:diff -- --target=dev
+# 期望: 33 match, 0 unexpected
+```
+
+全绿 = BFF 对锁定字段的响应与 dev middleware 基线 diff=0(有意变更除外)。
 
 ### "有意变更"如何处理
 
-契约 JSON 里 `discrepancy` 字段标出的项,是 dev middleware 当前行为与计划 §6.1 不符、或 BFF 应主动改的点(例如:413 应发干净响应而非 ECONNRESET、Eagle 应补超时、local-assets 403 应补 Content-Type、各端点应补 405)。P1-c 平移时:
-- **保持 dev 行为**的项 → 必须通过 live 套件 diff=0。
-- **有意变更**的项 → 在 BFF 改完后,在契约 JSON 里把 `source` 升级并更新 `__captures__/`(或新建 `__captures-bff/`),在 PR 描述单列"有意变更清单 + 各自测试"。SC1.2 要求"有意变更单独列表且各有测试"。
+契约 JSON 里 `discrepancy` 字段标出的项,是 dev middleware 当前行为与计划 §6.1 不符、或 BFF 应主动改的点。`contract-diff.mjs` 的 `INTENDED` 表登记每个有意变更的 BFF 期望(如 D1: `debug-logs-post-413` 期望 `status:413`),运行时:
+- **保持 dev 行为**的项 → 必须 `diff=0`。
+- **有意变更**的项 → live 命中 `INTENDED` 期望 → 标 `~ INTENDED Dx`(算通过);未命中 → `✗ UNEXPECTED`(有意变更没实现对)。SC1.2 要求"有意变更单独列表且各有测试"——`INTENDED` 表 + 各组 route 测试即是。
+
+当前 `INTENDED` 表(随各组 PR 扩充):
+| 场景 | ID | 说明 | BFF 期望 |
+|------|----|------|---------|
+| debug-logs-post-413 | D1 | 干净 413 vs dev ECONNRESET | status=413, body={ok:false,error:'Request body is too large'} |
 
 ## 重新采集快照
 
@@ -74,10 +101,10 @@ node scripts/capture-contracts.mjs
 
 ## debug 归一/脱敏/过滤
 
-`vite.config.test.ts` 的 `remote debug server helpers` 用例(`normalizeRemoteDebugPayload` / `sanitizeRemoteDebugText` / `filterRemoteDebugRecords`)是这些行为的**权威证据**。本基线**引用不复制**——见 `debug-logs.json` 的 `normalizationRefs`。P1-c BFF 必须保持这些纯函数行为不变;现有 vitest 用例继续作为 canonical proof。
+归一/脱敏/过滤纯函数(`normalizeRemoteDebugPayload` / `sanitizeRemoteDebugText` / `filterRemoteDebugRecords`)的实现已随 P1-c debug-logs 组迁到 `server/lib/debug-records.ts`,测试用例随迁到 `server/lib/debug-records.test.ts`(从 `vite.config.test.ts` 迁移,断言语义不变)。`vite.config.ts` 的 dev middleware 副本留到 P1-d 收尾删除;两边逻辑必须 1:1,不许漂移。见 `debug-logs.json` 的 `normalizationRefs`。
 
 ## 门禁
 
-`npx tsc -b && npm run lint && npm run test:unit && npm run verify:logging` 全绿。
-- `contract.test.ts` 不在 `tsconfig.node.json` include 内(与 `vite.config.test.ts` 同惯例),`tsc -b` 不检查它;vitest 跑、eslint lint。
-- live 套件默认 skip,不拖垮 `test:unit`。
+`npx tsc -b && npm run lint && npm run test:unit && npm run verify:logging` 全绿;P1-c 起追加 `npm run contract:diff`(对 dev 与 BFF 双跑,见上)。
+- `server/` 由 `tsconfig.server.json` 纳入 `tsc -b`(`noEmit`,仅类型检查,Vite 不打包 `server/`)。`contract.test.ts` / `debug-records.test.ts` / `debug-logs.route.test.ts` 均被 tsc 检。
+- live diff 默认不跑(独立 `npm run contract:diff`),不拖垮 `test:unit`。

@@ -13,6 +13,7 @@ import { resolve } from 'node:path'
 import { generateHandler } from './routes/generate'
 import { editHandler } from './routes/edit'
 import { enhanceHandler } from './routes/enhance'
+import { debugLogsRoute } from './routes/debug-logs'
 
 const tokenEquals = (a: string, b: string): boolean => {
   const aBuf = Buffer.from(a)
@@ -48,6 +49,7 @@ app.use('*', async (c, next) => {
 app.all('/api/mivo/generate', generateHandler)
 app.all('/api/mivo/edit', editHandler)
 app.all('/api/mivo/enhance', enhanceHandler)
+app.route('/api/mivo', debugLogsRoute)
 
 // Same-origin static hosting of dist/ (Vite build output). serveStatic only
 // accepts a root relative to cwd and calls next() on miss, letting the SPA

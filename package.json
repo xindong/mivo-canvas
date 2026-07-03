@@ -12,7 +12,8 @@
     "test:unit": "vitest run",
     "verify:logging": "node scripts/verify-debug-logging.mjs",
     "test:e2e": "node scripts/e2e-smoke.mjs",
-    "start:server": "tsx server/index.ts"
+    "start:server": "tsx server/index.ts",
+    "contract:diff": "node scripts/contract-diff.mjs"
   },
   "dependencies": {
     "@hono/node-server": "^1.19.14",
