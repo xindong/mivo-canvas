@@ -200,3 +200,9 @@ lead 只读诊断结论：
 - 证据：_tmp/fix-r5-out/probe/probe-results.json（+ probe-results-v1.json 备份）
 - .env.local 说明：worker 权限 deny .env* 写入，MIVO_PLATFORM_KEY/ENDPOINT 改走 process.env（dev server 启动时 export），不落 git 不进 bundle，符合边界
 - [R5 前端包完成 2026-07-03] dev-r5-glm-b 交付 c06352e@r5-part-b（worktree 隔离，6 files +338/-36，边界严守零越权）。SC-3/SC-6/Step4b 全 pass；worktree 内全量 e2e 退出码 0；双写同步断言按预期"等合并"（modelCapabilities 硬断言已绿，vite 侧待 A 合并转绿）。等服务端包（dev-r5-glm A：Step0 门禁+vite provider+计时）→ lead 合并 → 全量验证。
+- [R5 服务端包+合并完成 2026-07-03] A 交付 89bb590(docs)+68593fd(feat)：GPT 通道门禁通过(探针 69.4s)，双通道全通，计时表 gemini 1K 33.3s / 2K high 33.5s / image2 平台 77.3s(与 llm-proxy 下限持平，冒烟后定夺) / i2i 35.9s / mask 85.2s 零回归；key 防泄漏 CLEAN。lead 合并 c814bc9 零冲突；合并 HEAD build/lint/e2e 全绿零警告；key 入 .env.local，5173 已带 key 重启。→ 派双 gpt-5.5 xhigh 终审代码+执行结果。
+- [R6 任务下达 2026-07-03] 用户 UI 重构：①删底部 TASKS 槽位条 ②主工具条/缩放组件/对话面板三者下移扩展到底部对齐 ③TASKS 以「队列数+进度」形态放进对话面板头部（替代 AI 对话 title，参考图4 TASKS 0/5+spinner）。派 dev-r5-glm-b 于 worktree r6-tasks-ui 执行（主树有终审 e2e 在跑，隔离防扰）。R5 服务端 2 阻塞修复暂持，待前端终审回报后与 R6 合并统一处理。
+- [R5 终审阻塞修复完成 2026-07-03] A 交付 0bd4919：3 阻塞（chatSession authRetry/上传502/二次超时文案条件化）+ 5 采纳项全落地；build/lint/全量 e2e 绿（中途自纠一次 ReferenceError）。e2e 冲突区已备案（双写断言块/④④b④c 超时段/迁移段），R6 合并时 lead 按此手工核对。R5 代码侧至此双终审阻塞清零。等 R6。
+- [R6 合并+验证完成 2026-07-03] merge 96a1403 零冲突；build/lint/全量 e2e 绿；lead 真机目检过（TASKS 头部 1/1、底部三件套对齐、参数卡瘦身、默认 Gemini）。5173 已重启。→ 派冒烟：双模型速度复测 + 多任务队列 pending 排查。
+- [R5 冒烟收口 2026-07-03] 全链冒烟（96a1403 只读）：e2e 退出码 0；速度表——gemini 1K med 25.9/28.1s（目标 ≤45s 达标）、2K high 51.1s、image2 平台 82.0/81.6s。image2 平台通道 vs llm-proxy medium 75-79s **未明显提速**（历史 69.4/77.3 + 本次 81.8 avg，持平偏慢）→ 触发计划人工升级条件，去留报用户决断（回退=MIVO_PLATFORM_CHANNELS 注释一行）。多任务队列判定：卡点 BOTH——前端 isBusy 串行锁（连发静默丢弃）+ 平台 429 限流（≥3s 间隔、无服务端排队）；如需连发排队须前端建队列（串行 submit+429 退避），属新需求待用户拍板。0bd4919 两修复代码核对已落实。证据 _tmp/smoke-r5r6/。R5 loop 除 image2 决断外全部达成。
+- [用户拍板 2026-07-03] image2 去留：**保持现状**（继续走 mivo 平台 GPT 通道，不回退 llm-proxy）。用户判断冒烟速度对比数据不准（n=2 样本小、可能平台波动），以实际使用体感为准。R5 loop 至此全部收口。
