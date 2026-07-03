@@ -10,9 +10,9 @@ const eagleApiBase = process.env.MIVO_EAGLE_API_URL?.trim() || 'http://127.0.0.1
 const mivoImageApiBase = 'https://llm-proxy.tapsvc.com/v1/images'
 // Enhance endpoint (chat completions)
 const mivoLlmApiBase = 'https://llm-proxy.tapsvc.com/v1'
-const mivoEnhancePrimaryModel = 'moonshotai/kimi-k2.6'
+const mivoEnhancePrimaryModel = 'claude-haiku-4-5'
 const mivoEnhanceFallbackModel = 'gpt-5.4-mini'
-const mivoEnhancePrimaryTimeoutMs = 10_000
+const mivoEnhancePrimaryTimeoutMs = 8_000
 const mivoEnhanceFallbackTimeoutMs = 8_000
 // SYNC NOTE: keep in sync with src/lib/modelCapabilities.ts
 const mivoModelRatioMap: Record<string, string[]> = {
