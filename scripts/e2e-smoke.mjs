@@ -376,15 +376,29 @@ try {
     await page.waitForSelector('.ai-panel-header')
   }
 
-  const assertNoTasksCopy = async (label) => {
-    const tasksCopy = await page.evaluate(() => ({
-      bodyText: document.body.innerText.includes('TASKS'),
-      title: Boolean(document.querySelector('[title*="TASKS"]')),
-      aria: Boolean(document.querySelector('[aria-label*="TASKS"]')),
-      headerText: document.querySelector('.ai-panel-header')?.textContent || '',
-    }))
-    if (tasksCopy.bodyText || tasksCopy.title || tasksCopy.aria || tasksCopy.headerText.includes('TASKS')) {
-      throw new Error(`${label}: page should not expose TASKS copy: ${JSON.stringify(tasksCopy)}`)
+  const assertTasksHeaderCopy = async (label) => {
+    const tasksCopy = await page.evaluate(() => {
+      const countPattern = /\b\d+\s*\/\s*\d+\b/
+      const titleWithCount = Array.from(document.querySelectorAll('[title]'))
+        .map((element) => element.getAttribute('title') || '')
+        .find((title) => countPattern.test(title)) || null
+      const ariaWithCount = Array.from(document.querySelectorAll('[aria-label]'))
+        .map((element) => element.getAttribute('aria-label') || '')
+        .find((ariaLabel) => countPattern.test(ariaLabel)) || null
+      const bodyCountText = document.body.innerText.match(countPattern)?.[0] || null
+      return {
+        labelText: document.querySelector('.ai-panel-tasks-label')?.textContent?.trim() || '',
+        headerText: document.querySelector('.ai-panel-header')?.textContent || '',
+        bodyCountText,
+        titleWithCount,
+        ariaWithCount,
+      }
+    })
+    if (tasksCopy.labelText !== 'TASKS' || !tasksCopy.headerText.includes('TASKS')) {
+      throw new Error(`${label}: header should keep TASKS title: ${JSON.stringify(tasksCopy)}`)
+    }
+    if (tasksCopy.bodyCountText || tasksCopy.titleWithCount || tasksCopy.ariaWithCount) {
+      throw new Error(`${label}: header should not expose done/total count: ${JSON.stringify(tasksCopy)}`)
     }
   }
 
@@ -402,24 +416,34 @@ try {
     }
     const header = document.querySelector('.ai-panel-header')
     const indicator = document.querySelector('.ai-panel-tasks')
+    const label = document.querySelector('.ai-panel-tasks-label')
     const spinner = document.querySelector('.ai-panel-tasks-spinner')
     const headerStyle = header ? window.getComputedStyle(header) : null
     const expectedLeft = header && headerStyle ? header.getBoundingClientRect().left + Number.parseFloat(headerStyle.paddingLeft) : null
     return {
       hasIndicator: Boolean(indicator),
+      hasLabel: label?.textContent?.trim() === 'TASKS',
       hasSpinner: Boolean(spinner),
       header: rectFor(header),
       indicator: rectFor(indicator),
+      label: rectFor(label),
       spinner: rectFor(spinner),
       expectedLeft,
     }
   })
 
   await ensureChatPanelOpen()
-  await assertNoTasksCopy('idle header')
+  await assertTasksHeaderCopy('idle header')
   const idleTasksIndicator = await readHeaderTasksIndicator()
-  if (idleTasksIndicator.hasIndicator || idleTasksIndicator.hasSpinner) {
-    throw new Error(`Idle header should not render the generation spinner: ${JSON.stringify(idleTasksIndicator)}`)
+  if (!idleTasksIndicator.hasIndicator || !idleTasksIndicator.hasLabel || idleTasksIndicator.hasSpinner) {
+    throw new Error(`Idle header should keep TASKS title without spinner: ${JSON.stringify(idleTasksIndicator)}`)
+  }
+  if (
+    idleTasksIndicator.expectedLeft === null ||
+    !idleTasksIndicator.label ||
+    Math.abs(idleTasksIndicator.label.left - idleTasksIndicator.expectedLeft) > 1.5
+  ) {
+    throw new Error(`Idle TASKS title should align to the header content left edge: ${JSON.stringify(idleTasksIndicator)}`)
   }
   const previousTasks = await page.evaluate(async (moduleSpec) => {
     const { useCanvasStore } = await import(moduleSpec)
@@ -437,17 +461,18 @@ try {
   }, await canvasStoreSpec())
   try {
     await page.waitForSelector('.ai-panel-tasks-spinner', { state: 'visible' })
-    await assertNoTasksCopy('running header')
+    await assertTasksHeaderCopy('running header')
     const runningTasksIndicator = await readHeaderTasksIndicator()
-    if (!runningTasksIndicator.hasIndicator || !runningTasksIndicator.hasSpinner) {
-      throw new Error(`Running header should render the generation spinner: ${JSON.stringify(runningTasksIndicator)}`)
+    if (!runningTasksIndicator.hasIndicator || !runningTasksIndicator.hasLabel || !runningTasksIndicator.hasSpinner) {
+      throw new Error(`Running header should keep TASKS title and render the generation spinner: ${JSON.stringify(runningTasksIndicator)}`)
     }
     if (
       runningTasksIndicator.expectedLeft === null ||
-      !runningTasksIndicator.indicator ||
-      Math.abs(runningTasksIndicator.indicator.left - runningTasksIndicator.expectedLeft) > 1.5
+      !runningTasksIndicator.label ||
+      Math.abs(runningTasksIndicator.label.left - runningTasksIndicator.expectedLeft) > 1.5 ||
+      Math.abs(runningTasksIndicator.label.left - idleTasksIndicator.label.left) > 1
     ) {
-      throw new Error(`Running spinner should align to the header content left edge: ${JSON.stringify(runningTasksIndicator)}`)
+      throw new Error(`Running TASKS title should not shift when spinner appears: ${JSON.stringify({ idleTasksIndicator, runningTasksIndicator })}`)
     }
   } finally {
     await page.evaluate(async ({ moduleSpec, previousTasks }) => {
@@ -456,7 +481,7 @@ try {
     }, { moduleSpec: await canvasStoreSpec(), previousTasks })
   }
   await page.waitForSelector('.ai-panel-tasks-spinner', { state: 'detached' })
-  await assertNoTasksCopy('restored idle header')
+  await assertTasksHeaderCopy('restored idle header')
 
   // ⑤ 默认模型切 gemini（D-R5b）：localStorage.clear 后新用户吃到新默认，不破既有段落
   {

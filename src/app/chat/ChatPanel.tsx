@@ -10,15 +10,16 @@ type ChatPanelProps = {
   focusRequestId?: number
 }
 
-// R6：面板头部仅在生成中显示旋转指示。
+// R6：面板头部常驻 TASKS 标题，生成中在标题旁显示旋转指示。
 const TasksIndicator = () => {
   const tasks = useCanvasStore((state) => state.tasks)
   const running = tasks.some((task) => task.status === 'running')
-  if (!running) return null
+  const statusText = running ? '任务，生成中' : '任务'
 
   return (
-    <div className="ai-panel-tasks" aria-label="生成中" title="生成中">
-      <Loader2 size={14} className="spin ai-panel-tasks-spinner" />
+    <div className="ai-panel-tasks" aria-label={statusText} title={statusText}>
+      <span className="ai-panel-tasks-label">TASKS</span>
+      {running ? <Loader2 size={14} className="spin ai-panel-tasks-spinner" /> : null}
     </div>
   )
 }

@@ -4479,10 +4479,19 @@ button:disabled {
 .ai-panel-tasks {
   display: inline-flex;
   align-items: center;
-  justify-content: flex-start;
-  flex: 0 0 14px;
-  width: 14px;
+  gap: 7px;
   height: 36px;
+  min-width: 0;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ai-panel-tasks-label {
+  color: var(--muted);
+  font-size: var(--text-xs);
+  font-weight: 850;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
 }
 
 .ai-panel-tasks-spinner {
