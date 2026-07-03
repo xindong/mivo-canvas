@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, type CSSProperties } from 're
 import { MarkdownPreview } from '../lib/MarkdownPreview'
 import { useResolvedAssetUrl } from '../lib/useResolvedAssetUrl'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
+import { useCanvasStore } from '../store/canvasStore'
 import { brushOutlinePathFor } from './brushGeometry'
 import {
   frameRenderStyleFor,
@@ -13,7 +14,7 @@ import type { ResizeCorner } from './canvasGeometry'
 import { ImageMaskEditOverlay } from './ImageMaskEditOverlay'
 import type { ImageMaskSubmitPayload } from './imageMaskGeometry'
 import { renderKindForNode } from './nodeTypes/canvasNodeRegistry'
-import { stampEmojiFor } from './stampDefs'
+import { stampSrcFor } from './stampDefs'
 import { defaultTextAlign, defaultTextColor, defaultTextFontSize, defaultTextWeight } from './textGeometry'
 import type { TextResizeEdge } from './useCanvasInteractionController'
 
@@ -297,6 +298,7 @@ function MarkupNodeView({
   onFinishTextEdit: (nodeId: string) => void
 }) {
   const kind = node.markupKind || 'rect'
+  const lastPlacedStampId = useCanvasStore((state) => state.lastPlacedStampId)
   const renderStyle = markupRenderStyleFor(node)
   const strokeWidth = renderStyle.strokeWidth
   const stroke = renderStyle.stroke
@@ -310,13 +312,20 @@ function MarkupNodeView({
   const showEndArrow = node.markupEndArrow ?? kind === 'arrow'
 
   if (kind === 'stamp') {
+    const justPlaced = lastPlacedStampId === node.id
     return (
       <div
-        className="dom-markup-stamp"
-        style={{ fontSize: Math.max(12, Math.min(node.width, node.height) * 0.78) }}
+        className={`dom-markup-stamp dom-markup-stamp-svg${justPlaced ? ' just-placed' : ''}`}
         aria-label={node.title}
       >
-        {stampEmojiFor(node.markupStampKind)}
+        <img src={stampSrcFor(node.markupStampKind)} alt={node.title || ''} draggable={false} />
+        {justPlaced ? (
+          <span className="stamp-impact" aria-hidden="true">
+            {Array.from({ length: 8 }).map((_, index) => (
+              <i key={index} style={{ '--impact-angle': `${index * 45}deg` } as CSSProperties} />
+            ))}
+          </span>
+        ) : null}
       </div>
     )
   }
