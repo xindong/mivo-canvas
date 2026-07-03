@@ -4,6 +4,7 @@ import { serveStatic } from '@hono/node-server/serve-static'
 import { timingSafeEqual } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
+import { debugLogsRoute } from './routes/debug-logs'
 
 // P1-a: BFF skeleton. Endpoint migration (P1-c) will populate server/routes,
 // server/platform, server/lib. This file intentionally keeps all skeleton
@@ -60,6 +61,10 @@ app.use('*', async (c, next) => {
   }
   return next()
 })
+
+// API routes (mounted before serveStatic + SPA fallback so /api/* takes
+// precedence over dist files). Each P1-c group PR mounts its own sub-app.
+app.route('/api/mivo', debugLogsRoute)
 
 // Same-origin static hosting of the Vite build output (dist/).
 // serveStatic only accepts a root relative to cwd and calls next() when a
