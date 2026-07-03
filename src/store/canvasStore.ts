@@ -49,6 +49,13 @@ import {
 import { buildAiContextSnapshot, chooseAdjacentPlacement } from './aiCanvasWorkflow'
 import { debugLogger } from './debugLogStore'
 import { makeNode, realCaseImages, scenes, snapshotFromScene } from './demoScenes'
+import {
+  pushHistory,
+  redoHistory,
+  undoHistory,
+  snapshotFromState as buildHistorySnapshot,
+  type HistoryCloneFns,
+} from './historyManager'
 import { mockGenerationAdapter } from './mockGeneration'
 import type { CanvasAssetClipboardItem } from '../app/assetLibraryModel'
 import type {
@@ -280,7 +287,6 @@ type PersistedCanvasState = Partial<
 
 export { scenes }
 
-const historyLimit = 60
 const sceneOptions = scenes()
 const sceneIds = new Set<DemoSceneId>(sceneOptions.map((scene) => scene.id))
 const sceneLabels = new Map(sceneOptions.map((scene) => [scene.id, scene.label]))
@@ -317,6 +323,15 @@ const cloneEdge = (edge: CanvasEdge): CanvasEdge => ({ ...edge })
 const cloneNodes = (nodes: MivoCanvasNode[]) => nodes.map(cloneNode)
 const cloneTasks = (tasks: CanvasTask[]) => tasks.map(cloneTask)
 const cloneEdges = (edges: CanvasEdge[] = []) => edges.map(cloneEdge)
+
+// Inject the canvasStore clone helpers into the pure history functions (historyManager.ts),
+// keeping this module the single source of truth for *how* nodes/edges/tasks are deep-cloned
+// while historyManager owns the push/undo/redo/trim logic.
+const historyCloneFns: HistoryCloneFns = {
+  cloneNode,
+  cloneEdge,
+  cloneTask,
+}
 
 const compactNodeForPersist = (node: MivoCanvasNode): MivoCanvasNode => {
   const compactNode = cloneNode(node)
@@ -360,22 +375,10 @@ const selectionFrom = (nodeIds: string[] | undefined, selectedNodeId: string | u
 }
 
 const snapshotFromState = (
-  state: Pick<CanvasState, 'sceneId' | 'nodes' | 'edges' | 'tasks' | 'selectedNodeId' | 'selectedNodeIds'>,
-) =>
-  normalizeCanvasSnapshotV2({
-    version: 2,
-    sceneId: state.sceneId,
-    nodes: cloneNodes(state.nodes),
-    edges: cloneEdges(state.edges),
-    tasks: cloneTasks(state.tasks),
-    selectedNodeId: state.selectedNodeId,
-    selectedNodeIds: [...state.selectedNodeIds],
-  })
+  state: Parameters<typeof buildHistorySnapshot>[0],
+) => buildHistorySnapshot(state, historyCloneFns)
 
-const remember = (state: CanvasState) => ({
-  historyPast: [...state.historyPast.slice(-(historyLimit - 1)), snapshotFromState(state)],
-  historyFuture: [],
-})
+const remember = (state: CanvasState) => pushHistory(state, historyCloneFns)
 
 const createCanvasId = () => {
   if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
@@ -1395,24 +1398,24 @@ export const useCanvasStore = create<CanvasState>()(
       captureHistory: () => set((state) => remember(state)),
       undo: () =>
         set((state) => {
-          const previous = state.historyPast.at(-1)
-          if (!previous) return {}
+          const result = undoHistory(state, historyCloneFns)
+          if (!result) return {}
 
           return {
-            ...applySnapshot(state, previous),
-            historyPast: state.historyPast.slice(0, -1),
-            historyFuture: [snapshotFromState(state), ...state.historyFuture.slice(0, historyLimit - 1)],
+            ...applySnapshot(state, result.snapshotToApply),
+            historyPast: result.historyPast,
+            historyFuture: result.historyFuture,
           }
         }),
       redo: () =>
         set((state) => {
-          const next = state.historyFuture[0]
-          if (!next) return {}
+          const result = redoHistory(state, historyCloneFns)
+          if (!result) return {}
 
           return {
-            ...applySnapshot(state, next),
-            historyPast: [...state.historyPast.slice(-(historyLimit - 1)), snapshotFromState(state)],
-            historyFuture: state.historyFuture.slice(1),
+            ...applySnapshot(state, result.snapshotToApply),
+            historyPast: result.historyPast,
+            historyFuture: result.historyFuture,
           }
         }),
       updateNodePosition: (nodeId, x, y) =>
