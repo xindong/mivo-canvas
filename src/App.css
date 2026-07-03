@@ -4433,12 +4433,12 @@ button:disabled {
 .ai-panel {
   position: absolute;
   right: var(--ai-panel-offset);
+  top: 12px;
   bottom: 12px;
-  top: auto;
   z-index: 8;
   width: min(var(--ai-panel-w), calc(100% - 28px));
-  height: min(680px, calc(100% - 28px));
-  max-height: min(680px, calc(100% - 28px));
+  height: auto;
+  max-height: none;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
   overflow: hidden;
@@ -4453,6 +4453,7 @@ button:disabled {
   grid-template-rows: auto auto auto auto minmax(0, 1fr);
   justify-items: center;
   width: var(--ai-panel-collapsed-w);
+  top: auto;
   height: auto;
   max-height: none;
   gap: 9px;
