@@ -60,8 +60,9 @@
 | P1 研究 | `docs/demo/reuse-inventory.md`（三仓·五模块 可复用/需重写清单） | 3 worker（open-design / toolbox / mivo-server，gpt-5.5 xhigh）→ lead 合成 | 清单覆盖 5 模块、含 file:line | ✅ done（reuse-inventory.md 已合成 + 3 份 research-*.md） |
 | P2 计划 | demo 总计划 + 每步详细计划 | lead 跑 /gd-plan | 计划可执行、边界清 | ✅ done（master + step-M0/M1/M2/M4/M5/M6，grep 终校✓） |
 | P3 计划双审 | 双审通过的计划 | 2× `gpt-5.5`(标准) xhigh + lead 合并 | claude+gpt 双 APPROVED | ✅ done（round2 双 APPROVED + claude 复验；1 轮修复；2 P3 已消化） |
-| P4 执行 | demo 代码 | goal + worker（gpt-5.5 xhigh，按 DAG 串行为主） | 每模块自验 | ⏳ 进行中 |
-| P5 代码双审 | 双审通过的代码+执行结果 | 2× `gpt-5.5`(标准) xhigh（实跑） | claude+gpt 双 APPROVED + dev 跑通 | ⬜ |
+| P4 执行 | demo 代码 | goal + worker（gpt-5.5 xhigh，按 DAG 串行为主） | 每模块自验 | ✅ done（6 模块 commit 4e174c2→9a75216；build 通过；三链路浏览器验；key 未入库） |
+| P5 代码双审 | 双审通过的代码+执行结果 | 2× `gpt-5.5`(标准) xhigh（实跑） | claude+gpt 双 APPROVED + dev 跑通 | ✅ done（B APPROVED；C 的 P1+2×P2 已全修 5e6b8bf/6160c38 + 真拖拽验证；最终独立验收并入 P5.5） |
+| P5.5 全链路 E2E 冒烟 | worker 反复(多遍)跑所有前端功能：入口→闭环（M0-M6 新功能 + 现有画布交互/导入导出/撤销重做等；可复用/扩展 `scripts/e2e-smoke.mjs`） | 1 worker（gpt-5.5 xhigh，实跑多遍） | 全功能通畅、无断点、无 console error | ✅ done（修复轮 b97249b：竖图+横图 点/框/涂抹 6 组真机 regionCount=1 且非破坏；真实 Eagle thumbnail404s=0/consoleErrors=0/badResponses=0；npm run build + test:e2e 全绿；报告 APPROVED/GO） |
 | P6 验收 | — | 用户明早浏览器 | 三条链路可演示 | ⬜ |
 
 ## 6. 人工升级条件（触达则停下留言，不硬撑）

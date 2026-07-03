@@ -3,14 +3,13 @@ import { useCallback, type DragEvent as ReactDragEvent } from 'react'
 import { useEffect } from 'react'
 import { useRef } from 'react'
 import { useState } from 'react'
-import { AIToolPanel } from './app/AIToolPanel'
+import { ChatPanel } from './app/chat/ChatPanel'
 import { LibraryWorkspace } from './app/LibraryWorkspace'
 import { MivoCanvas, type ExternalAssetDropHandler } from './canvas/MivoCanvas'
 import { InspectorPanel } from './app/InspectorPanel'
 import { canReadLocalAssetDrag } from './lib/canvasAssetDrag'
 import { ProjectSidebar } from './app/ProjectSidebar'
 import { ProjectSidebarControls } from './app/ProjectSidebarControls'
-import { TaskQueue } from './app/TaskQueue'
 import { TopBar } from './app/TopBar'
 import { ToastViewport } from './app/ToastViewport'
 import { useCanvasStore } from './store/canvasStore'
@@ -252,7 +251,7 @@ function App() {
               onMaskEditActiveChange={handleMaskEditActiveChange}
               maskCancelRequestId={maskCancelRequestId}
             />
-            <AIToolPanel
+            <ChatPanel
               open={aiPanelOpen}
               onToggle={() => setAiPanelOpen((current) => !current)}
               focusRequestId={aiPanelFocusRequestId}
@@ -276,7 +275,6 @@ function App() {
               </div>
             ) : null}
           </div>
-          <TaskQueue />
         </div>
       ) : (
         <div className="workspace library-mode">

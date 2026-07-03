@@ -175,9 +175,11 @@ const server = spawn(
 try {
   await mkdir('test-artifacts', { recursive: true })
   await runCommand('npm', ['run', 'verify:logging'])
-  const [nodeRegistrySource, actionModelSource] = await Promise.all([
+  const [nodeRegistrySource, actionModelSource, viteConfigSource, modelCapabilitiesSource] = await Promise.all([
     readFile('src/canvas/nodeTypes/canvasNodeRegistry.ts', 'utf8'),
     readFile('src/canvas/actions/canvasActionModel.ts', 'utf8'),
+    readFile('vite.config.ts', 'utf8'),
+    readFile('src/lib/modelCapabilities.ts', 'utf8'),
   ])
   for (const nodeType of [
     'image',
@@ -200,6 +202,50 @@ try {
       throw new Error(`Action model should compose node actions through ${extensionMap}`)
     }
   }
+  for (const expectedSize of [
+    "high: '2304x2304'",
+    "high: '3456x2304'",
+    "high: '2304x3456'",
+    "high: '2560x1440'",
+    "high: '1440x2560'",
+  ]) {
+    if (!viteConfigSource.includes(expectedSize)) {
+      throw new Error(`R3 high quality size map should include ${expectedSize}`)
+    }
+  }
+
+  // ⑥ 能力表双写同步（SC-3）：modelCapabilities.ts 与 vite.config.ts mivoModelRatioMap 的 gemini ratios 必须一致且无 21:9（hard fail，两端已合并）。
+  {
+    // modelCapabilities.ts: 'gemini-3-pro-image': { ... ratios: ['1:1', ...] }
+    const extractFromModelCaps = (source) => {
+      const match = source.match(/'gemini-3-pro-image':\s*\{[\s\S]*?ratios:\s*\[([^\]]*)\]/)
+      if (!match) return null
+      return match[1].split(',').map((s) => s.trim().replace(/['"]/g, '')).filter(Boolean)
+    }
+    // vite.config.ts mivoModelRatioMap: 'gemini-3-pro-image': ['1:1', ...]（直接数组，无 ratios 键）
+    const extractFromViteMap = (source) => {
+      const match = source.match(/'gemini-3-pro-image':\s*\[([^\]]*)\]/)
+      if (!match) return null
+      return match[1].split(',').map((s) => s.trim().replace(/['"]/g, '')).filter(Boolean)
+    }
+    const capsRatios = extractFromModelCaps(modelCapabilitiesSource)
+    const viteRatios = extractFromViteMap(viteConfigSource)
+    if (!capsRatios) throw new Error(`Could not extract gemini ratios from modelCapabilities.ts`)
+    if (capsRatios.includes('21:9')) {
+      throw new Error(`modelCapabilities gemini must not have 21:9, got ${JSON.stringify(capsRatios)}`)
+    }
+    if (!viteRatios) {
+      throw new Error(`dual-write: could not extract gemini ratios from vite.config.ts mivoModelRatioMap`)
+    }
+    const same = capsRatios.length === viteRatios.length && capsRatios.every((r, i) => r === viteRatios[i])
+    if (!same) {
+      throw new Error(`dual-write: gemini ratios differ — modelCapabilities=${JSON.stringify(capsRatios)} vs vite.mivoModelRatioMap=${JSON.stringify(viteRatios)}`)
+    }
+    if (viteRatios.includes('21:9')) {
+      throw new Error(`dual-write: vite mivoModelRatioMap gemini must not have 21:9, got ${JSON.stringify(viteRatios)}`)
+    }
+  }
+
   await waitForServer(baseUrl)
 
   const browser = await chromium.launch({ headless: true })
@@ -244,6 +290,21 @@ try {
       body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }),
     })
   })
+  await page.route('**/api/mivo/enhance', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        mode: 'generate',
+        scene: 'general',
+        reasoning: 'e2e',
+        richPrompt: 'e2e derived concept image',
+        imgRatio: '1:1',
+        quality: 'medium',
+        enhanced: true,
+      }),
+    })
+  })
 
   page.on('console', (message) => {
     if (message.type() === 'error' && !message.text().includes('__MIVO_E2E_EXPECTED_ERROR__')) errors.push(message.text())
@@ -259,6 +320,13 @@ try {
         .map((entry) => entry.name)
         .find((name) => name.includes('/src/store/canvasStore.ts'))
       return resource ? new URL(resource).pathname + new URL(resource).search : '/src/store/canvasStore.ts'
+    })
+  const chatStoreSpec = async () =>
+    page.evaluate(() => {
+      const resource = performance.getEntriesByType('resource')
+        .map((entry) => entry.name)
+        .find((name) => name.includes('/src/store/chatStore.ts'))
+      return resource ? new URL(resource).pathname + new URL(resource).search : '/src/store/chatStore.ts'
     })
 
   const readCanvasState = async () => {
@@ -281,6 +349,34 @@ try {
     }, spec)
   }
 
+  const readChatState = async () => {
+    const spec = await chatStoreSpec()
+    return page.evaluate(async (moduleSpec) => {
+      const { useChatStore } = await import(moduleSpec)
+      const state = useChatStore.getState()
+      return {
+        isBusy: state.isBusy,
+        messagesByScene: state.messagesByScene,
+        selectedModel: state.selectedModel,
+        paramOverrides: state.paramOverrides,
+      }
+    }, spec)
+  }
+
+  const waitForChatIdle = async () => {
+    const spec = await chatStoreSpec()
+    const startedAt = Date.now()
+    while (Date.now() - startedAt < 10000) {
+      const idle = await page.evaluate(async (moduleSpec) => {
+        const { useChatStore } = await import(moduleSpec)
+        return !useChatStore.getState().isBusy
+      }, spec)
+      if (idle) return
+      await wait(50)
+    }
+    throw new Error('Timed out waiting for chat generation to finish')
+  }
+
   const waitForCanvasState = async (predicate, payload) => {
     const spec = await canvasStoreSpec()
     const startedAt = Date.now()
@@ -293,6 +389,129 @@ try {
       await wait(50)
     }
     throw new Error(`Timed out waiting for canvas state: ${predicate.toString()}`)
+  }
+
+  const ensureChatPanelOpen = async () => {
+    if (await page.locator('.ai-panel.collapsed').isVisible()) {
+      await page.getByRole('button', { name: 'Open AI panel' }).click()
+      await page.waitForSelector('.chat-composer-textarea', { state: 'visible' })
+    }
+    await page.waitForSelector('.ai-panel-header')
+  }
+
+  const assertTasksHeaderCopy = async (label) => {
+    const tasksCopy = await page.evaluate(() => {
+      const countPattern = /\b\d+\s*\/\s*\d+\b/
+      const titleWithCount = Array.from(document.querySelectorAll('[title]'))
+        .map((element) => element.getAttribute('title') || '')
+        .find((title) => countPattern.test(title)) || null
+      const ariaWithCount = Array.from(document.querySelectorAll('[aria-label]'))
+        .map((element) => element.getAttribute('aria-label') || '')
+        .find((ariaLabel) => countPattern.test(ariaLabel)) || null
+      const bodyCountText = document.body.innerText.match(countPattern)?.[0] || null
+      return {
+        labelText: document.querySelector('.ai-panel-tasks-label')?.textContent?.trim() || '',
+        headerText: document.querySelector('.ai-panel-header')?.textContent || '',
+        bodyCountText,
+        titleWithCount,
+        ariaWithCount,
+      }
+    })
+    if (tasksCopy.labelText !== 'TASKS' || !tasksCopy.headerText.includes('TASKS')) {
+      throw new Error(`${label}: header should keep TASKS title: ${JSON.stringify(tasksCopy)}`)
+    }
+    if (tasksCopy.bodyCountText || tasksCopy.titleWithCount || tasksCopy.ariaWithCount) {
+      throw new Error(`${label}: header should not expose done/total count: ${JSON.stringify(tasksCopy)}`)
+    }
+  }
+
+  const readHeaderTasksIndicator = async () => page.evaluate(() => {
+    const rectFor = (element) => {
+      const rect = element?.getBoundingClientRect()
+      return rect ? {
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+        width: rect.width,
+        height: rect.height,
+      } : null
+    }
+    const header = document.querySelector('.ai-panel-header')
+    const indicator = document.querySelector('.ai-panel-tasks')
+    const label = document.querySelector('.ai-panel-tasks-label')
+    const spinner = document.querySelector('.ai-panel-tasks-spinner')
+    const headerStyle = header ? window.getComputedStyle(header) : null
+    const expectedLeft = header && headerStyle ? header.getBoundingClientRect().left + Number.parseFloat(headerStyle.paddingLeft) : null
+    return {
+      hasIndicator: Boolean(indicator),
+      hasLabel: label?.textContent?.trim() === 'TASKS',
+      hasSpinner: Boolean(spinner),
+      header: rectFor(header),
+      indicator: rectFor(indicator),
+      label: rectFor(label),
+      spinner: rectFor(spinner),
+      expectedLeft,
+    }
+  })
+
+  await ensureChatPanelOpen()
+  await assertTasksHeaderCopy('idle header')
+  const idleTasksIndicator = await readHeaderTasksIndicator()
+  if (!idleTasksIndicator.hasIndicator || !idleTasksIndicator.hasLabel || idleTasksIndicator.hasSpinner) {
+    throw new Error(`Idle header should keep TASKS title without spinner: ${JSON.stringify(idleTasksIndicator)}`)
+  }
+  if (
+    idleTasksIndicator.expectedLeft === null ||
+    !idleTasksIndicator.label ||
+    Math.abs(idleTasksIndicator.label.left - idleTasksIndicator.expectedLeft) > 1.5
+  ) {
+    throw new Error(`Idle TASKS title should align to the header content left edge: ${JSON.stringify(idleTasksIndicator)}`)
+  }
+  const previousTasks = await page.evaluate(async (moduleSpec) => {
+    const { useCanvasStore } = await import(moduleSpec)
+    const previousTasks = useCanvasStore.getState().tasks
+    useCanvasStore.setState({
+      tasks: [{
+        id: 'e2e-running-header-spinner',
+        label: 'E2E running header spinner',
+        status: 'running',
+        progress: 50,
+        nodeIds: [],
+      }],
+    })
+    return previousTasks
+  }, await canvasStoreSpec())
+  try {
+    await page.waitForSelector('.ai-panel-tasks-spinner', { state: 'visible' })
+    await assertTasksHeaderCopy('running header')
+    const runningTasksIndicator = await readHeaderTasksIndicator()
+    if (!runningTasksIndicator.hasIndicator || !runningTasksIndicator.hasLabel || !runningTasksIndicator.hasSpinner) {
+      throw new Error(`Running header should keep TASKS title and render the generation spinner: ${JSON.stringify(runningTasksIndicator)}`)
+    }
+    if (
+      runningTasksIndicator.expectedLeft === null ||
+      !runningTasksIndicator.label ||
+      Math.abs(runningTasksIndicator.label.left - runningTasksIndicator.expectedLeft) > 1.5 ||
+      Math.abs(runningTasksIndicator.label.left - idleTasksIndicator.label.left) > 1
+    ) {
+      throw new Error(`Running TASKS title should not shift when spinner appears: ${JSON.stringify({ idleTasksIndicator, runningTasksIndicator })}`)
+    }
+  } finally {
+    await page.evaluate(async ({ moduleSpec, previousTasks }) => {
+      const { useCanvasStore } = await import(moduleSpec)
+      useCanvasStore.setState({ tasks: previousTasks })
+    }, { moduleSpec: await canvasStoreSpec(), previousTasks })
+  }
+  await page.waitForSelector('.ai-panel-tasks-spinner', { state: 'detached' })
+  await assertTasksHeaderCopy('restored idle header')
+
+  // ⑤ 默认模型切 gemini（D-R5b）：localStorage.clear 后新用户吃到新默认，不破既有段落
+  {
+    const chatState = await readChatState()
+    if (chatState.selectedModel !== 'gemini-3-pro-image') {
+      throw new Error(`Default selectedModel should be gemini-3-pro-image after localStorage.clear, got ${chatState.selectedModel}`)
+    }
   }
 
   const logoResponse = await page.request.get(`${baseUrl}/mivo-logo.svg`)
@@ -1347,6 +1566,22 @@ try {
   await page.locator('.dom-node.markdown-node').click({ position: { x: 20, y: 20 } })
   if ((await page.locator('.selection-quick-toolbar').count()) !== 0) {
     throw new Error('Markdown selection should not show a download-only quick toolbar')
+  }
+  // R6: 底部任务条移除后画布下沿降低、工具条下移，可能与底部节点重叠遮挡点击。
+  // space+drag 上移画布 140px，使视频节点脱离工具条遮挡（viewport 偏移持续，后续 video dblclick 同样受益）。
+  {
+    const shellBox = await page.locator('.canvas-shell').boundingBox()
+    if (shellBox) {
+      const startX = shellBox.x + shellBox.width / 2
+      const startY = shellBox.y + shellBox.height / 2
+      await page.keyboard.down('Space')
+      await page.mouse.move(startX, startY)
+      await page.mouse.down()
+      await page.mouse.move(startX, startY - 140, { steps: 8 })
+      await page.mouse.up()
+      await page.keyboard.up('Space')
+      await page.waitForTimeout(150)
+    }
   }
   await page.locator('.dom-node.video-node').click({ position: { x: 20, y: 20 } })
   if ((await page.locator('.selection-quick-toolbar').count()) !== 0) {
@@ -3353,9 +3588,14 @@ try {
 
   textBox = await page.locator('.dom-node.text-node').last().boundingBox()
   if (!textBox) throw new Error('Missing selected text node for drag check')
-  await page.mouse.move(textBox.x + textBox.width / 2, textBox.y + textBox.height / 2)
+  // Use the upper-left text area so the floating bottom toolbar cannot intercept the drag on short viewports.
+  const textDragStart = {
+    x: textBox.x + Math.min(32, textBox.width / 2),
+    y: textBox.y + Math.min(28, textBox.height / 2),
+  }
+  await page.mouse.move(textDragStart.x, textDragStart.y)
   await page.mouse.down()
-  await page.mouse.move(textBox.x + textBox.width / 2 + 54, textBox.y + textBox.height / 2 + 32, { steps: 5 })
+  await page.mouse.move(textDragStart.x + 54, textDragStart.y + 32, { steps: 5 })
   await page.mouse.up()
   const movedTextBox = await page.locator('.dom-node.text-node').last().boundingBox()
   if (
@@ -3442,7 +3682,13 @@ try {
     )
   }
 
-  await page.locator('.dom-node.text-node').last().click({ button: 'right' })
+  const formattedTextBox = await page.locator('.dom-node.text-node').last().boundingBox()
+  if (!formattedTextBox) throw new Error('Missing formatted text node for context menu check')
+  await page.mouse.click(
+    formattedTextBox.x + Math.min(32, formattedTextBox.width / 2),
+    formattedTextBox.y + Math.min(28, formattedTextBox.height / 2),
+    { button: 'right' },
+  )
   for (const action of [
     'Edit text',
     'Copy text',
@@ -4191,17 +4437,99 @@ try {
   await page.getByRole('button', { name: 'Close details' }).click()
   await page.waitForSelector('.details-dialog', { state: 'detached' })
 
+  // Chat branch: mode=chat should render a text reply without creating canvas nodes or generating images.
+  if (await page.locator('.ai-panel.collapsed').isVisible()) {
+    await page.getByRole('button', { name: 'Open AI panel' }).click()
+    await page.waitForSelector('.chat-composer-textarea', { state: 'visible' })
+  }
+  let chatBranchGenerateRequests = 0
+  await page.unroute('**/api/mivo/enhance')
+  await page.route('**/api/mivo/enhance', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        mode: 'chat',
+        replyText: '可以。你可以直接和我讨论游戏美术方向，也可以让我帮你生成角色、场景、UI 或道具图。',
+        enhanced: true,
+      }),
+    })
+  })
+  await page.unroute('**/api/mivo/generate')
+  await page.route('**/api/mivo/generate', async (route) => {
+    chatBranchGenerateRequests += 1
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }),
+    })
+  })
+  await page.evaluate(async (moduleSpec) => {
+    const { useCanvasStore } = await import(moduleSpec)
+    useCanvasStore.getState().selectNode(undefined)
+  }, await canvasStoreSpec())
+  const chatBranchBefore = await readCanvasState()
+  await page.locator('.chat-composer-textarea').fill('这里能对话么')
+  await page.locator('.chat-composer-textarea').press('Enter')
+  await waitForChatIdle()
+  const chatReply = await page.locator('.chat-assistant-text').last().innerText()
+  if (!chatReply.includes('可以') || !chatReply.includes('游戏美术')) {
+    throw new Error(`Chat mode should render reply text, got: ${JSON.stringify(chatReply)}`)
+  }
+  const chatBranchAfter = await readCanvasState()
+  if (chatBranchAfter.nodes.length !== chatBranchBefore.nodes.length || chatBranchGenerateRequests !== 0) {
+    throw new Error(`Chat mode should not create nodes or call generate: ${JSON.stringify({ before: chatBranchBefore.nodes.length, after: chatBranchAfter.nodes.length, chatBranchGenerateRequests })}`)
+  }
+  const latestAssistantParamCards = await page.locator('.chat-message-assistant').last().locator('.chat-param-card').count()
+  if (latestAssistantParamCards !== 0) {
+    throw new Error('Chat mode reply should not render enhance parameter card')
+  }
+  await page.unroute('**/api/mivo/enhance')
+  await page.route('**/api/mivo/enhance', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        mode: 'generate',
+        scene: 'general',
+        reasoning: 'e2e',
+        richPrompt: 'e2e derived concept image',
+        imgRatio: '1:1',
+        quality: 'medium',
+        enhanced: true,
+      }),
+    })
+  })
+  await page.unroute('**/api/mivo/generate')
+  await page.route('**/api/mivo/generate', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }),
+    })
+  })
+
+  // Chat-based generation: select node, fill composer, send
+  await page.locator(`[data-node-id="${firstNodeId}"]`).click()
+  await page.evaluate(async () => {
+    const spec = performance.getEntriesByType('resource').map(r => r.name).find(n => n.includes('chatStore.ts'))
+    if (!spec) return
+    const { useChatStore } = await import(new URL(spec).pathname + new URL(spec).search)
+    useChatStore.getState().setParamOverride('imgRatio', '16:9')
+    useChatStore.getState().setParamOverride('quality', 'high')
+  })
+  const canvasBeforeGenerate = await readCanvasState()
   const countBeforeGenerate = await page.locator('.dom-node').count()
-  await page.locator('.canvas-ai-action-bar').getByRole('button', { name: '生成' }).click()
-  await page.locator('.ai-prompt-box textarea').fill('e2e derived concept image')
-  await page.getByRole('button', { name: '立即生成' }).click()
-  await page.waitForFunction((count) => document.querySelectorAll('.dom-node').length >= count + 2, countBeforeGenerate)
+  await page.locator('.chat-composer-textarea').fill('e2e derived concept image')
+  await page.locator('.chat-composer-textarea').press('Enter')
+  await page.waitForFunction((count) => document.querySelectorAll('.dom-node').length >= count + 1, countBeforeGenerate)
 
   const generatedCount = await page.locator('.dom-node').count()
-  if (generatedCount < countBeforeGenerate + 2) {
-    throw new Error(`Expected at least ${countBeforeGenerate + 2} nodes after generation result + edge, got ${generatedCount}`)
+  if (generatedCount < countBeforeGenerate + 1) {
+    throw new Error(`Expected at least ${countBeforeGenerate + 1} nodes after chat generation result, got ${generatedCount}`)
   }
   const besideResult = await page.locator('.dom-node[data-ai-kind="result"][data-ai-operation="beside-generation"]').last().evaluate((node) => ({
+    id: node.getAttribute('data-node-id'),
     kind: node.getAttribute('data-ai-kind'),
     operation: node.getAttribute('data-ai-operation'),
     sourceNodeIds: node.getAttribute('data-ai-source-node-ids'),
@@ -4213,71 +4541,498 @@ try {
   ) {
     throw new Error(`Immediate generation should create a derived result beside the selected source: ${JSON.stringify(besideResult)}`)
   }
-
-  const countBeforeSlot = await page.locator('.dom-node').count()
-  await page.getByRole('button', { name: '新建生成槽位' }).click()
-  await page.waitForSelector('.dom-node.ai-slot-node')
-  await page.waitForFunction((count) => document.querySelectorAll('.dom-node').length === count + 1, countBeforeSlot)
-  const slotNodeId = await page.locator('.dom-node.ai-slot-node').last().getAttribute('data-node-id')
-  if (!slotNodeId) throw new Error('AI slot creation should produce a selectable slot node')
-  await page.getByRole('button', { name: '生成到槽位' }).click()
-  await page.waitForFunction((count) => document.querySelectorAll('.dom-node').length >= count + 3, countBeforeSlot)
-  const slotResult = await page.locator('.dom-node[data-ai-kind="result"][data-ai-operation="slot-generation"]').last().evaluate((node) => ({
-    kind: node.getAttribute('data-ai-kind'),
-    operation: node.getAttribute('data-ai-operation'),
-    sourceNodeIds: node.getAttribute('data-ai-source-node-ids'),
-  }))
-  if (
-    slotResult.kind !== 'result' ||
-    slotResult.operation !== 'slot-generation' ||
-    !slotResult.sourceNodeIds?.includes(slotNodeId)
-  ) {
-    throw new Error(`Slot generation should keep the slot and create a result linked to it: ${JSON.stringify(slotResult)}`)
+  const canvasAfterGenerate = await readCanvasState()
+  const newChatEdges = canvasAfterGenerate.edges.filter((edge) =>
+    !canvasBeforeGenerate.edges.some((beforeEdge) => beforeEdge.id === edge.id),
+  )
+  if (newChatEdges.length !== 0) {
+    throw new Error(`Chat image-to-image should not create derivation edges: ${JSON.stringify(newChatEdges)}`)
   }
 
-  const countBeforeAnnotation = await page.locator('.dom-node').count()
-  await page.locator(`[data-node-id="${firstNodeId}"]`).click()
-  await page.getByRole('button', { name: '添加批注修图' }).click()
-  await page.waitForSelector('.dom-node.annotation-node')
-  await page.waitForFunction((count) => document.querySelectorAll('.dom-node').length === count + 1, countBeforeAnnotation)
-  const annotationNodeId = await page.locator('.dom-node.annotation-node').last().getAttribute('data-node-id')
-  if (!annotationNodeId) throw new Error('Annotation creation should produce a selectable note node')
-  await page.getByRole('button', { name: '从批注生成' }).click()
-  await page.waitForFunction((count) => document.querySelectorAll('.dom-node').length >= count + 3, countBeforeAnnotation)
-  const annotationResult = await page.locator('.dom-node[data-ai-kind="result"][data-ai-operation="annotation-edit"]').last().evaluate((node) => ({
-    kind: node.getAttribute('data-ai-kind'),
-    operation: node.getAttribute('data-ai-operation'),
-    sourceNodeIds: node.getAttribute('data-ai-source-node-ids'),
-  }))
-  if (
-    annotationResult.kind !== 'result' ||
-    annotationResult.operation !== 'annotation-edit' ||
-    !annotationResult.sourceNodeIds?.includes(firstNodeId)
-  ) {
-    throw new Error(`Annotation generation should create a clean derived result beside the source: ${JSON.stringify(annotationResult)}`)
+  // Assert chat state: param card appeared in assistant bubble
+  await page.waitForSelector('.chat-param-card')
+  const paramCardVisible = await page.locator('.chat-param-card').isVisible()
+  if (!paramCardVisible) throw new Error('Enhance param card should be visible after generation')
+  const paramCard = page.locator('.chat-param-card').last()
+  // R6 SC-e: 参数卡不再渲染 scene chip 与比例/质量 chips 行（composer 底部按钮已可见，卡内不重复）；保留「预计较慢」提示
+  const paramCardText = await paramCard.innerText()
+  if (!paramCardText.includes('预计较慢')) {
+    throw new Error(`Enhance param card should keep the slow hint: ${JSON.stringify(paramCardText)}`)
+  }
+  const sceneChipCount = await paramCard.locator('.chat-chip-scene').count()
+  const ratioChipCount = await paramCard.locator('.chat-chip-ratio').count()
+  const qualityChipCount = await paramCard.locator('.chat-chip-quality').count()
+  if (sceneChipCount + ratioChipCount + qualityChipCount !== 0) {
+    throw new Error(`Enhance param card should not render scene/ratio/quality chips, got ${JSON.stringify({ sceneChipCount, ratioChipCount, qualityChipCount })}`)
+  }
+  await paramCard.getByRole('button', { name: '深度思考' }).click()
+  const reasoningText = await paramCard.locator('.chat-param-fold-body').innerText()
+  if (!reasoningText.includes('Agent 建议：1:1 / 中')) {
+    throw new Error(`Enhance param card should move differing agent suggestion into reasoning foldout: ${JSON.stringify(reasoningText)}`)
+  }
+  await page.evaluate(async () => {
+    const spec = performance.getEntriesByType('resource').map(r => r.name).find(n => n.includes('chatStore.ts'))
+    if (!spec) return
+    const { useChatStore } = await import(new URL(spec).pathname + new URL(spec).search)
+    useChatStore.getState().setParamOverride('imgRatio', 'auto')
+    useChatStore.getState().setParamOverride('quality', 'auto')
+  })
+
+  // Assert chat state: assistant result bubble present
+  const assistantBubbles = await page.locator('.chat-message-assistant').count()
+  if (assistantBubbles < 1) throw new Error('Assistant message bubble should appear after generation')
+
+  // Persist check: verify messages are durably stored in localStorage before reload
+  const storedMsgCount = await page.evaluate(() => {
+    try {
+      const raw = localStorage.getItem('mivo-chat-demo')
+      if (!raw) return 0
+      const parsed = JSON.parse(raw)
+      const byScene = parsed?.state?.messagesByScene ?? {}
+      return Object.values(byScene).flat().length
+    } catch {
+      return 0
+    }
+  })
+  if (storedMsgCount < 2) throw new Error(`Chat messages should be persisted in localStorage, got ${storedMsgCount}`)
+
+  // NB3: gemini 4:3 → client sends {model, imgRatio:"4:3"}（gemini 专属比例，gpt 无；走 mivo 平台通道）
+  let capturedGeminiPayload = null
+  await page.unroute('**/api/mivo/generate')
+  await page.route('**/api/mivo/generate', async (route) => {
+    try { capturedGeminiPayload = JSON.parse(route.request().postData() || '{}') } catch { capturedGeminiPayload = {} }
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }) })
+  })
+  // Deselect canvas nodes so generate (not edit) is called
+  await page.evaluate(async (moduleSpec) => {
+    const { useCanvasStore } = await import(moduleSpec)
+    useCanvasStore.getState().selectNode(undefined)
+  }, await canvasStoreSpec())
+  await page.waitForFunction(
+    async (moduleSpec) => {
+      const { useCanvasStore } = await import(moduleSpec)
+      return !useCanvasStore.getState().selectedNodeId
+    },
+    await canvasStoreSpec(),
+  )
+  await page.waitForTimeout(100)
+  await page.evaluate(async () => {
+    const spec = performance.getEntriesByType('resource').map(r => r.name).find(n => n.includes('chatStore.ts'))
+    if (!spec) return
+    const { useChatStore } = await import(new URL(spec).pathname + new URL(spec).search)
+    useChatStore.getState().setSelectedModel('gemini-3-pro-image')
+    useChatStore.getState().setParamOverride('imgRatio', '4:3')
+  })
+  // ② gemini 比例弹层断言：含 4:3，不含 21:9（能力表去 21:9 的前端表现）
+  {
+    await page.locator('[aria-label="选择比例和质量"]').click()
+    await page.waitForSelector('#chat-ratio-popover .chat-ratio-btn')
+    const ratioLabels = (await page.locator('#chat-ratio-popover .chat-ratio-btn').allInnerTexts()).map((t) => t.trim())
+    if (!ratioLabels.some((t) => t === '4:3')) {
+      throw new Error(`Gemini ratio popover should include 4:3, got: ${JSON.stringify(ratioLabels)}`)
+    }
+    if (ratioLabels.some((t) => t === '21:9')) {
+      throw new Error(`Gemini ratio popover should NOT include 21:9, got: ${JSON.stringify(ratioLabels)}`)
+    }
+    await page.keyboard.press('Escape')
+    await page.waitForSelector('#chat-ratio-popover', { state: 'detached' })
+  }
+  const canvasBeforeGemini = await readCanvasState()
+  const countBeforeGemini = await page.locator('.dom-node').count()
+  await page.locator('.chat-composer-textarea').fill('gemini aspect ratio test')
+  await page.locator('.chat-composer-textarea').press('Enter')
+  await page.waitForFunction((before) => document.querySelectorAll('.dom-node').length > before, countBeforeGemini, { timeout: 30000 })
+  // 节点增长（slot 创建）先于 generate 请求发出 —— 轮询直到请求被捕获，消除竞态
+  {
+    const geminiDeadline = Date.now() + 30000
+    while (!capturedGeminiPayload && Date.now() < geminiDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 200))
+    }
+  }
+  // Client sends {model, imgRatio} — gemini 走 mivo 平台通道（不再经 llm-proxy/aspect_ratio）
+  if (capturedGeminiPayload?.model !== 'gemini-3-pro-image' || capturedGeminiPayload?.imgRatio !== '4:3') {
+    throw new Error(`gemini 4:3 request should carry model and imgRatio, got: ${JSON.stringify(capturedGeminiPayload)}`)
+  }
+  await page.unroute('**/api/mivo/generate')
+  await page.route('**/api/mivo/generate', async (route) => {
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }) })
+  })
+  await page.evaluate(async () => {
+    const spec = performance.getEntriesByType('resource').map(r => r.name).find(n => n.includes('chatStore.ts'))
+    if (!spec) return
+    const { useChatStore } = await import(new URL(spec).pathname + new URL(spec).search)
+    useChatStore.getState().setSelectedModel('gpt-image-2')
+    useChatStore.getState().setParamOverride('imgRatio', 'auto')
+  })
+  // Wait for isBusy to clear after gemini generation
+  await page.evaluate(async () => {
+    const spec = performance.getEntriesByType('resource').map(r => r.name).find(n => n.includes('chatStore.ts'))
+    if (!spec) return
+    const { useChatStore } = await import(new URL(spec).pathname + new URL(spec).search)
+    const waitIdle = () => new Promise((resolve) => {
+      if (!useChatStore.getState().isBusy) return resolve(null)
+      const unsub = useChatStore.subscribe((s) => { if (!s.isBusy) { unsub(); resolve(null) } })
+    })
+    await waitIdle()
+  })
+  const canvasAfterGemini = await readCanvasState()
+  const newGeminiEdges = canvasAfterGemini.edges.filter((edge) =>
+    !canvasBeforeGemini.edges.some((beforeEdge) => beforeEdge.id === edge.id),
+  )
+  if (newGeminiEdges.length !== 0) {
+    throw new Error(`Chat text-to-image should not create derivation edges: ${JSON.stringify(newGeminiEdges)}`)
   }
 
-  await page.getByRole('button', { name: '查看 AI 上下文' }).click()
-  const aiContextPreview = await page.locator('.ai-context-preview').textContent()
-  if (
-    !aiContextPreview?.includes('"slots": 1') ||
-    !aiContextPreview.includes('"annotations": 1') ||
-    !aiContextPreview.includes('"annotation-edit"') ||
-    !aiContextPreview.includes('"slot-generation"')
-  ) {
-    throw new Error(`AI context preview should serialize slots, annotations, and derivation links: ${aiContextPreview}`)
+  // Regression: chat generation must commit to the scene where it started, even after switching canvases.
+  const sceneScopedBefore = await page.evaluate(async (moduleSpec) => {
+    const { useCanvasStore } = await import(moduleSpec)
+    const state = useCanvasStore.getState()
+    return {
+      nodes: state.canvases['character-flow']?.nodes.length || 0,
+      variantsNodes: state.canvases.variants?.nodes.length || 0,
+    }
+  }, await canvasStoreSpec())
+  let releaseSceneScopedGenerate
+  let sceneScopedGenerateSeen = false
+  const sceneScopedGenerateHandler = async (route) => {
+    sceneScopedGenerateSeen = true
+    await new Promise((resolve) => {
+      releaseSceneScopedGenerate = resolve
+    })
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }),
+    })
   }
-  const aiContext = JSON.parse(aiContextPreview)
-  const aiLinkKeys = aiContext.links.map((link) => `${link.kind}:${link.fromNodeId}:${link.toNodeId}`)
-  if (new Set(aiLinkKeys).size !== aiLinkKeys.length) {
-    throw new Error(`AI context links should be de-duplicated: ${aiLinkKeys.join(', ')}`)
+  await page.route('**/api/mivo/generate', sceneScopedGenerateHandler)
+  try {
+    await page.evaluate(async (moduleSpec) => {
+      const { useCanvasStore } = await import(moduleSpec)
+      useCanvasStore.getState().loadScene('character-flow')
+      useCanvasStore.getState().selectNode(undefined)
+    }, await canvasStoreSpec())
+    await page.locator('.chat-composer-textarea').fill('scene scoped generation regression')
+    await page.locator('.chat-composer-textarea').press('Enter')
+    const startedAt = Date.now()
+    while (!sceneScopedGenerateSeen && Date.now() - startedAt < 5000) await wait(25)
+    if (!sceneScopedGenerateSeen) throw new Error('Scene-scoped regression should reach /api/mivo/generate')
+    await page.evaluate(async (moduleSpec) => {
+      const { useCanvasStore } = await import(moduleSpec)
+      useCanvasStore.getState().loadScene('variants')
+    }, await canvasStoreSpec())
+    releaseSceneScopedGenerate()
+    await waitForChatIdle()
+  } finally {
+    await page.unroute('**/api/mivo/generate', sceneScopedGenerateHandler)
   }
-  const workflowCount = await page.locator('.dom-node').count()
+  const sceneScopedAfter = await page.evaluate(async ({ canvasModuleSpec, chatModuleSpec }) => {
+    const { useCanvasStore } = await import(canvasModuleSpec)
+    const { useChatStore } = await import(chatModuleSpec)
+    const canvasState = useCanvasStore.getState()
+    const chatState = useChatStore.getState()
+    return {
+      activeSceneId: canvasState.sceneId,
+      characterNodes: canvasState.canvases['character-flow']?.nodes.length || 0,
+      variantsNodes: canvasState.canvases.variants?.nodes.length || 0,
+      characterAssistantErrors: (chatState.messagesByScene['character-flow'] || [])
+        .filter((message) => message.role === 'assistant' && message.status === 'error')
+        .map((message) => message.error || ''),
+      currentNotices: (chatState.messagesByScene[canvasState.sceneId] || [])
+        .filter((message) => message.kind === 'notice')
+        .map((message) => message.text),
+    }
+  }, { canvasModuleSpec: await canvasStoreSpec(), chatModuleSpec: await chatStoreSpec() })
+  if (sceneScopedAfter.activeSceneId !== 'variants') {
+    throw new Error(`Scene-scoped regression should leave user on variants, got ${sceneScopedAfter.activeSceneId}`)
+  }
+  if (sceneScopedAfter.characterNodes <= sceneScopedBefore.nodes) {
+    throw new Error(`Scene-scoped generation should add nodes to character-flow: ${JSON.stringify({ sceneScopedBefore, sceneScopedAfter })}`)
+  }
+  if (sceneScopedAfter.variantsNodes !== sceneScopedBefore.variantsNodes) {
+    throw new Error(`Scene-scoped generation should not patch active variants nodes: ${JSON.stringify({ sceneScopedBefore, sceneScopedAfter })}`)
+  }
+  if (sceneScopedAfter.characterAssistantErrors.some((error) => error.includes('Source node not found'))) {
+    throw new Error(`Scene-scoped generation should not surface Source node not found: ${JSON.stringify(sceneScopedAfter.characterAssistantErrors)}`)
+  }
+  if (!sceneScopedAfter.currentNotices.some((text) => text.includes('结果已生成到画布'))) {
+    throw new Error(`Scene switch completion should append a current-scene notice: ${JSON.stringify(sceneScopedAfter.currentNotices)}`)
+  }
+  await page.evaluate(async (moduleSpec) => {
+    const { useCanvasStore } = await import(moduleSpec)
+    useCanvasStore.getState().loadScene('character-flow')
+  }, await canvasStoreSpec())
+
+  // ④ Regression: gemini high 超时 → 出现「中质量重试」且二次请求 quality=medium（Step 4b 条件化）
+  const timeoutRetryGenerateRequests = []
+  let timeoutRetryGenerateCount = 0
+  const timeoutRetryGenerateHandler = async (route) => {
+    try { timeoutRetryGenerateRequests.push(JSON.parse(route.request().postData() || '{}')) } catch { timeoutRetryGenerateRequests.push({}) }
+    timeoutRetryGenerateCount += 1
+    if (timeoutRetryGenerateCount === 1) {
+      await route.fulfill({
+        status: 504,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: 'Image API request timed out' }),
+      })
+      return
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }),
+    })
+  }
+  await page.unroute('**/api/mivo/generate')
+  await page.route('**/api/mivo/generate', timeoutRetryGenerateHandler)
+  try {
+    await page.evaluate(async ({ canvasModuleSpec, chatModuleSpec }) => {
+      const { useCanvasStore } = await import(canvasModuleSpec)
+      const { useChatStore } = await import(chatModuleSpec)
+      useCanvasStore.getState().selectNode(undefined)
+      useChatStore.getState().setSelectedModel('gemini-3-pro-image')
+      useChatStore.getState().setParamOverride('imgRatio', '16:9')
+      useChatStore.getState().setParamOverride('quality', 'high')
+    }, { canvasModuleSpec: await canvasStoreSpec(), chatModuleSpec: await chatStoreSpec() })
+    await page.locator('.chat-composer-textarea').fill('timeout retry should lower only quality')
+    await page.locator('.chat-composer-textarea').press('Enter')
+    await page.waitForSelector('.chat-error-text', { timeout: 10000 })
+    const timeoutText = await page.locator('.chat-error-text').last().innerText()
+    if (!timeoutText.includes('上游生成超时，可降低质量重试')) {
+      throw new Error(`Upstream 504 should show a lowering-quality timeout message: ${JSON.stringify(timeoutText)}`)
+    }
+    // 采纳 8：中质量重试按钮 title 含"降到 1K"
+    const mediumRetryBtnTitle = await page.locator('.chat-message-assistant').last().getByRole('button', { name: '中质量重试' }).first().getAttribute('title') || ''
+    if (!mediumRetryBtnTitle.includes('降到 1K')) {
+      throw new Error(`medium-retry button title should include "降到 1K", got: ${JSON.stringify(mediumRetryBtnTitle)}`)
+    }
+    await page.getByRole('button', { name: '中质量重试' }).last().click()
+    await waitForChatIdle()
+    await page.waitForSelector('.chat-result-image, .chat-result-image-placeholder', { timeout: 10000 })
+    if (timeoutRetryGenerateRequests.length !== 2) {
+      throw new Error(`Timeout retry should issue exactly two generate requests, got ${timeoutRetryGenerateRequests.length}`)
+    }
+    const [firstTimeoutRequest, mediumRetryRequest] = timeoutRetryGenerateRequests
+    if (
+      firstTimeoutRequest.quality !== 'high' ||
+      mediumRetryRequest.quality !== 'medium' ||
+      mediumRetryRequest.imgRatio !== firstTimeoutRequest.imgRatio ||
+      mediumRetryRequest.model !== firstTimeoutRequest.model ||
+      mediumRetryRequest.prompt !== firstTimeoutRequest.prompt
+    ) {
+      throw new Error(`Medium retry should lower only quality: ${JSON.stringify(timeoutRetryGenerateRequests)}`)
+    }
+  } finally {
+    await page.unroute('**/api/mivo/generate', timeoutRetryGenerateHandler)
+    await page.route('**/api/mivo/generate', async (route) => {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }) })
+    })
+    await page.evaluate(async () => {
+      const spec = performance.getEntriesByType('resource').map(r => r.name).find(n => n.includes('chatStore.ts'))
+      if (!spec) return
+      const { useChatStore } = await import(new URL(spec).pathname + new URL(spec).search)
+      useChatStore.getState().setParamOverride('imgRatio', 'auto')
+      useChatStore.getState().setParamOverride('quality', 'auto')
+    })
+  }
+
+  // ④b Regression: gemini medium 超时 → 不出现降质按钮、文案为"稍后重试/换比例"（Step 4b 条件化）
+  {
+    const mediumTimeoutHandler = async (route) => {
+      await route.fulfill({
+        status: 504,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: 'Image API request timed out' }),
+      })
+    }
+    await page.unroute('**/api/mivo/generate')
+    await page.route('**/api/mivo/generate', mediumTimeoutHandler)
+    try {
+      await page.evaluate(async ({ canvasModuleSpec, chatModuleSpec }) => {
+        const { useCanvasStore } = await import(canvasModuleSpec)
+        const { useChatStore } = await import(chatModuleSpec)
+        useCanvasStore.getState().selectNode(undefined)
+        useChatStore.getState().setSelectedModel('gemini-3-pro-image')
+        useChatStore.getState().setParamOverride('imgRatio', '4:3')
+        useChatStore.getState().setParamOverride('quality', 'medium')
+      }, { canvasModuleSpec: await canvasStoreSpec(), chatModuleSpec: await chatStoreSpec() })
+      await page.locator('.chat-composer-textarea').fill('medium timeout should not offer downgrade')
+      await page.locator('.chat-composer-textarea').press('Enter')
+      await page.waitForSelector('.chat-error-text', { timeout: 10000 })
+      await waitForChatIdle()
+      const mediumTimeoutText = await page.locator('.chat-error-text').last().innerText()
+      if (!mediumTimeoutText.includes('稍后重试') || !mediumTimeoutText.includes('换比例')) {
+        throw new Error(`Medium-quality timeout should suggest retry/ratio (not downgrade), got: ${JSON.stringify(mediumTimeoutText)}`)
+      }
+      // medium(1K) 不应出现"中质量重试"降质按钮（showMediumRetry 仅 high 才显示）
+      const mediumRetryBtnCount = await page.locator('.chat-message-assistant').last().getByRole('button', { name: '中质量重试' }).count()
+      if (mediumRetryBtnCount > 0) {
+        throw new Error(`Medium-quality timeout should NOT show a downgrade button, got ${mediumRetryBtnCount}`)
+      }
+    } finally {
+      await page.unroute('**/api/mivo/generate', mediumTimeoutHandler)
+      await page.route('**/api/mivo/generate', async (route) => {
+        await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }) })
+      })
+      // 清掉本用例留下的 error 消息，避免后续 retry-edit 用例的 waitForSelector('.chat-error-text') 命中残留
+      await page.evaluate(async () => {
+        const canvasSpec = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('canvasStore.ts'))
+        const chatSpec = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('chatStore.ts'))
+        if (!canvasSpec || !chatSpec) return
+        const { useCanvasStore } = await import(new URL(canvasSpec).pathname + new URL(canvasSpec).search)
+        const { useChatStore } = await import(new URL(chatSpec).pathname + new URL(chatSpec).search)
+        useChatStore.getState().clearScene(useCanvasStore.getState().sceneId)
+        useChatStore.getState().setParamOverride('imgRatio', 'auto')
+        useChatStore.getState().setParamOverride('quality', 'auto')
+      })
+    }
+  }
+
+  // ④c Regression: medium 504 → 点普通重试 → 再 504 → 断言无"降低质量"字样、无中质量重试按钮、二次 quality=medium
+  {
+    const retry504Requests = []
+    const retry504Handler = async (route) => {
+      try { retry504Requests.push(JSON.parse(route.request().postData() || '{}')) } catch { retry504Requests.push({}) }
+      await route.fulfill({ status: 504, contentType: 'application/json', body: JSON.stringify({ error: 'Image API request timed out' }) })
+    }
+    await page.unroute('**/api/mivo/generate')
+    await page.route('**/api/mivo/generate', retry504Handler)
+    try {
+      await page.evaluate(async ({ canvasModuleSpec, chatModuleSpec }) => {
+        const { useCanvasStore } = await import(canvasModuleSpec)
+        const { useChatStore } = await import(chatModuleSpec)
+        useCanvasStore.getState().selectNode(undefined)
+        useChatStore.getState().setSelectedModel('gemini-3-pro-image')
+        useChatStore.getState().setParamOverride('imgRatio', '4:3')
+        useChatStore.getState().setParamOverride('quality', 'medium')
+      }, { canvasModuleSpec: await canvasStoreSpec(), chatModuleSpec: await chatStoreSpec() })
+      await page.locator('.chat-composer-textarea').fill('medium retry 504 no downgrade')
+      await page.locator('.chat-composer-textarea').press('Enter')
+      await page.waitForSelector('.chat-error-text', { timeout: 10000 })
+      await waitForChatIdle()
+      // 点普通重试（非中质量重试）
+      const requestsBefore = retry504Requests.length
+      await page.locator('.chat-message-assistant').last().getByRole('button', { name: '重试' }).click()
+      const retryDeadline = Date.now() + 10000
+      while (retry504Requests.length <= requestsBefore && Date.now() < retryDeadline) {
+        await new Promise((r) => setTimeout(r, 200))
+      }
+      if (retry504Requests.length <= requestsBefore) {
+        throw new Error('medium retry-504: retry did not issue a new request')
+      }
+      await waitForChatIdle()
+      const retryText = await page.locator('.chat-error-text').last().innerText()
+      if (retryText.includes('降低质量')) {
+        throw new Error(`medium retry-504 should not mention downgrade, got: ${JSON.stringify(retryText)}`)
+      }
+      const retryMediumBtn = await page.locator('.chat-message-assistant').last().getByRole('button', { name: '中质量重试' }).count()
+      if (retryMediumBtn > 0) {
+        throw new Error(`medium retry-504 should NOT show medium-quality retry button, got ${retryMediumBtn}`)
+      }
+      const lastRequest = retry504Requests[retry504Requests.length - 1]
+      if (lastRequest.quality !== 'medium') {
+        throw new Error(`medium retry should keep quality=medium, got ${JSON.stringify(lastRequest.quality)}`)
+      }
+    } finally {
+      await page.unroute('**/api/mivo/generate', retry504Handler)
+      await page.route('**/api/mivo/generate', async (route) => {
+        await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }) })
+      })
+      await page.evaluate(async () => {
+        const canvasSpec = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('canvasStore.ts'))
+        const chatSpec = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('chatStore.ts'))
+        if (!canvasSpec || !chatSpec) return
+        const { useCanvasStore } = await import(new URL(canvasSpec).pathname + new URL(canvasSpec).search)
+        const { useChatStore } = await import(new URL(chatSpec).pathname + new URL(chatSpec).search)
+        useChatStore.getState().clearScene(useCanvasStore.getState().sceneId)
+        useChatStore.getState().setParamOverride('imgRatio', 'auto')
+        useChatStore.getState().setParamOverride('quality', 'auto')
+      })
+    }
+  }
+
+  // Regression: retry reuses the original user message and preserves uploaded reference assets.
+  const retryEditRequests = []
+  let retryEditCount = 0
+  const retryEditHandler = async (route) => {
+    const request = route.request()
+    try {
+      const formRequest = new Request('http://127.0.0.1/api/mivo/edit', {
+        method: 'POST',
+        headers: request.headers(),
+        body: request.postDataBuffer(),
+      })
+      const formData = await formRequest.formData()
+      retryEditRequests.push({
+        prompt: String(formData.get('prompt') || ''),
+        fileKeys: ['image', 'mask', 'reference[]', 'reference']
+          .map((key) => `${key}:${formData.getAll(key).length}`)
+          .filter((entry) => !entry.endsWith(':0')),
+      })
+    } catch (error) {
+      retryEditRequests.push({
+        prompt: '',
+        fileKeys: [],
+        parseError: error instanceof Error ? error.message : 'Unable to inspect edit request',
+      })
+    }
+    retryEditCount += 1
+    if (retryEditCount === 1) {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [] }) })
+      return
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }),
+    })
+  }
+  await page.route('**/api/mivo/edit', retryEditHandler)
+  try {
+    await page.evaluate(async (moduleSpec) => {
+      const { useCanvasStore } = await import(moduleSpec)
+      useCanvasStore.getState().selectNode(undefined)
+    }, await canvasStoreSpec())
+    await page.locator('.ai-panel input[type="file"][accept*="image/png"]').setInputFiles({
+      name: 'retry-reference.png',
+      mimeType: 'image/png',
+      buffer: Buffer.from(localAssetFixtureSvg),
+    })
+    await page.waitForSelector('.chat-ref-chip')
+    const retryUserCountBefore = (await readChatState()).messagesByScene['character-flow'].filter((message) => message.role === 'user').length
+    await page.locator('.chat-composer-textarea').fill('retry should preserve uploaded reference')
+    await page.locator('.chat-composer-textarea').press('Enter')
+    await page.waitForSelector('.chat-error-text', { timeout: 10000 })
+    await page.locator('.chat-retry-btn').last().click()
+    await waitForChatIdle()
+    await page.waitForSelector('.chat-result-image, .chat-result-image-placeholder', { timeout: 10000 })
+    const retryUserCountAfter = (await readChatState()).messagesByScene['character-flow'].filter((message) => message.role === 'user').length
+    if (retryUserCountAfter !== retryUserCountBefore + 1) {
+      throw new Error(`Retry should not duplicate the original user message: before=${retryUserCountBefore}, after=${retryUserCountAfter}`)
+    }
+    if (retryEditRequests.length !== 2 || !retryEditRequests.every((request) => request.fileKeys.includes('image:1'))) {
+      throw new Error(`Retry should replay edit with the original reference image: ${JSON.stringify(retryEditRequests)}`)
+    }
+  } finally {
+    await page.unroute('**/api/mivo/edit', retryEditHandler)
+  }
+
+  const workflowCount = await page.evaluate(async (moduleSpec) => {
+    const { useCanvasStore } = await import(moduleSpec)
+    return useCanvasStore.getState().nodes.length
+  }, await canvasStoreSpec())
 
   await page.getByRole('button', { name: '4 张变体结果' }).click()
   await page.waitForFunction(() => document.querySelector('.top-title-lockup strong')?.textContent === '4 张变体结果')
   await page.getByRole('button', { name: '角色参考图流程' }).click()
-  await page.waitForFunction((count) => document.querySelectorAll('.dom-node').length === count, workflowCount)
+  await page.waitForFunction(
+    async ({ moduleSpec, count }) => {
+      const { useCanvasStore } = await import(moduleSpec)
+      const state = useCanvasStore.getState()
+      return state.sceneId === 'character-flow' && state.nodes.length === count
+    },
+    { moduleSpec: await canvasStoreSpec(), count: workflowCount },
+  )
 
   page.once('dialog', (dialog) => {
     void dialog.accept('Mivo Persistent Canvas')
@@ -4307,7 +5062,14 @@ try {
   await page.getByRole('heading', { name: 'Assets' }).waitFor()
   await page.getByRole('button', { name: 'Mivo Persistent Canvas' }).click()
   await page.waitForFunction(() => document.querySelector('.top-title-lockup strong')?.textContent === 'Mivo Persistent Canvas')
-  await page.waitForFunction((count) => document.querySelectorAll('.dom-node').length === count, workflowCount)
+  await page.waitForFunction(
+    async ({ moduleSpec, count }) => {
+      const { useCanvasStore } = await import(moduleSpec)
+      const state = useCanvasStore.getState()
+      return state.sceneId && state.nodes.length === count
+    },
+    { moduleSpec: await canvasStoreSpec(), count: workflowCount },
+  )
 
   const geometry = await page.evaluate(() => {
     const controls = document.querySelector('.canvas-controls')?.getBoundingClientRect()
@@ -4340,7 +5102,11 @@ try {
     throw new Error('Canvas is being squeezed by floating overlays')
   }
 
-  const countBeforeClipboardPaste = await page.locator('.dom-node').count()
+  await page.locator('.canvas-shell').click({ position: { x: 160, y: 160 }, force: true })
+  const countBeforeClipboardPaste = await page.evaluate(async (moduleSpec) => {
+    const { useCanvasStore } = await import(moduleSpec)
+    return useCanvasStore.getState().nodes.length
+  }, await canvasStoreSpec())
   await page.evaluate(async () => {
     const response = await fetch('/demo-assets/courage-1.jpg')
     const blob = await response.blob()
@@ -4352,12 +5118,19 @@ try {
     window.dispatchEvent(event)
   })
   await page.waitForFunction(
-    (count) => document.querySelectorAll('.dom-node').length === count + 1,
-    countBeforeClipboardPaste,
+    async ({ moduleSpec, count }) => {
+      const { useCanvasStore } = await import(moduleSpec)
+      return useCanvasStore.getState().nodes.length === count + 1
+    },
+    { moduleSpec: await canvasStoreSpec(), count: countBeforeClipboardPaste },
   )
 
   await page.getByRole('button', { name: 'Reset view' }).click()
-  const countBeforeTransparentPaste = await page.locator('.dom-node[data-node-type="image"]').count()
+  await page.locator('.canvas-shell').click({ position: { x: 160, y: 160 }, force: true })
+  const countBeforeTransparentPaste = await page.evaluate(async (moduleSpec) => {
+    const { useCanvasStore } = await import(moduleSpec)
+    return useCanvasStore.getState().nodes.filter((node) => node.type === 'image').length
+  }, await canvasStoreSpec())
   await page.evaluate(async () => {
     const canvas = document.createElement('canvas')
     canvas.width = 128
@@ -4382,8 +5155,11 @@ try {
     window.dispatchEvent(event)
   })
   await page.waitForFunction(
-    (count) => document.querySelectorAll('.dom-node[data-node-type="image"]').length === count + 1,
-    countBeforeTransparentPaste,
+    async ({ moduleSpec, count }) => {
+      const { useCanvasStore } = await import(moduleSpec)
+      return useCanvasStore.getState().nodes.filter((node) => node.type === 'image').length === count + 1
+    },
+    { moduleSpec: await canvasStoreSpec(), count: countBeforeTransparentPaste },
   )
   const transparentImageNode = page.locator('.dom-node[data-node-type="image"]').last()
   await transparentImageNode.locator('.dom-node-media img').waitFor({ state: 'visible' })
@@ -4502,13 +5278,17 @@ try {
   const imageCountFor = (state) => state.nodes.filter((node) => node.type === 'image').length
   const verifyMaskEditFlow = async ({ sourceNodeId, sourceLabel, toolId, toolLabel }) => {
     await page.locator(`[data-node-id="${sourceNodeId}"]`).click()
-    await page.locator('.canvas-ai-action-bar').getByRole('button', { name: '局部重绘' }).click()
+    await page.waitForSelector('.selection-quick-toolbar')
+    await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
+    await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
     await page.waitForSelector('.image-mask-edit-stage')
     await assertMaskFloatingControlsSeparated()
     await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: toolLabel, exact: true }).click()
     await drawMaskRegion(toolId)
     await page.waitForFunction(() => Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0') > 0)
     const regionCount = Number(await page.locator('.image-mask-edit-overlay').getAttribute('data-region-count'))
+    const maskRegionCount = Number(await page.locator('.image-mask-edit-overlay').getAttribute('data-mask-region-count'))
+    const pointAnchorCount = Number(await page.locator('.image-mask-edit-overlay').getAttribute('data-point-anchor-count'))
     const before = await readCanvasState()
     const beforeSourceEditEdges = before.edges.filter((edge) => edge.from === sourceNodeId && edge.type === 'edit').length
     const editRequestCountBefore = mivoEditRequests.length
@@ -4530,12 +5310,25 @@ try {
     const editEdges = after.edges.filter((edge) => edge.from === sourceNodeId && edge.type === 'edit')
     const resultNode = after.nodes.find((node) => editEdges.some((edge) => edge.to === node.id))
     const latestRequest = mivoEditRequests.at(-1)
+    const expectsMask = toolId !== 'point'
 
     if (mivoEditRequests.length !== editRequestCountBefore + 1) {
       throw new Error(`${sourceLabel}/${toolId} should issue exactly one edit request`)
     }
-    if (!latestRequest?.fileKeys.includes('image:1') || !latestRequest.fileKeys.includes('mask:1')) {
-      throw new Error(`${sourceLabel}/${toolId} edit request should include image and mask: ${JSON.stringify(latestRequest)}`)
+    if (toolId === 'point' && (maskRegionCount !== 0 || pointAnchorCount < 1)) {
+      throw new Error(`${sourceLabel}/${toolId} should keep point anchors out of mask regions: ${JSON.stringify({ maskRegionCount, pointAnchorCount })}`)
+    }
+    if (toolId !== 'point' && maskRegionCount < 1) {
+      throw new Error(`${sourceLabel}/${toolId} should create at least one mask region`)
+    }
+    if (!latestRequest?.fileKeys.includes('image:1')) {
+      throw new Error(`${sourceLabel}/${toolId} edit request should include image: ${JSON.stringify(latestRequest)}`)
+    }
+    if (expectsMask && !latestRequest.fileKeys.includes('mask:1')) {
+      throw new Error(`${sourceLabel}/${toolId} edit request should include mask: ${JSON.stringify(latestRequest)}`)
+    }
+    if (!expectsMask && latestRequest.fileKeys.includes('mask:1')) {
+      throw new Error(`${sourceLabel}/${toolId} point-only edit request should not include mask: ${JSON.stringify(latestRequest)}`)
     }
     if (!after.nodes.some((node) => node.id === sourceNodeId && node.type === 'image')) {
       throw new Error(`${sourceLabel}/${toolId} should keep the source image`)
@@ -4551,6 +5344,8 @@ try {
       source: sourceLabel,
       tool: toolId,
       regionCount,
+      maskRegionCount,
+      pointAnchorCount,
       imagesBefore: imageCountFor(before),
       imagesAfter: imageCountFor(after),
       editEdgesFromSource: editEdges.length,
@@ -4588,11 +5383,155 @@ try {
     throw new Error(`Mask edit smoke should mark at least one region per tool: ${JSON.stringify(maskEditSmokeResults)}`)
   }
 
+  // Assert mask-edit notice persisted in chatStore after local repaint
+  const maskNoticeCount = await page.evaluate(() => {
+    try {
+      const raw = localStorage.getItem('mivo-chat-demo')
+      if (!raw) return 0
+      const parsed = JSON.parse(raw)
+      const byScene = parsed?.state?.messagesByScene ?? {}
+      return Object.values(byScene).flat().filter((m) => m.kind === 'notice' && m.origin === 'mask-edit').length
+    } catch {
+      return 0
+    }
+  })
+  if (maskNoticeCount < 1) {
+    throw new Error(`chatStore should contain at least one mask-edit notice after local repaint, got ${maskNoticeCount}`)
+  }
+
+  // ③ persist v1→v2 迁移（SC-6）：独立 browser context（不挂全局 localStorage.clear），
+  // 注入 v1 结构（gemini + 21:9 override + 含 generationContext.imgRatio=21:9 的旧 error 消息），
+  // rehydrate 后断言 override=auto + 消息 context 已 clamp + 弹层无 21:9
+  {
+    const migrationContext = await browser.newContext({ viewport: { width: 1512, height: 900 }, deviceScaleFactor: 1 })
+    const migrationPage = await migrationContext.newPage()
+    try {
+    await migrationPage.route('**/api/mivo/generate', async (route) => {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }) })
+    })
+    await migrationPage.route('**/api/mivo/edit', async (route) => {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }) })
+    })
+    await migrationPage.route('**/api/mivo/enhance', async (route) => {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ mode: 'generate', scene: 'general', reasoning: 'e2e', richPrompt: 'e2e derived', imgRatio: '1:1', quality: 'medium', enhanced: true }) })
+    })
+    // 注入 v1 storage（version:1）——含 21:9 override 与一条 21:9 旧 error 消息的 generationContext
+    await migrationPage.addInitScript(() => {
+      const v1State = {
+        state: {
+          messagesByScene: {
+            'character-flow': [
+              {
+                id: 'msg-user-legacy',
+                role: 'user',
+                kind: 'text',
+                text: 'legacy 21:9 prompt',
+                createdAt: 1719900000000,
+                status: 'done',
+                generationContext: {
+                  model: 'gemini-3-pro-image',
+                  requestedImgRatio: '21:9',
+                  imgRatio: '21:9',
+                  quality: 'high',
+                  finalPrompt: 'legacy 21:9 prompt',
+                },
+              },
+              {
+                id: 'msg-asst-legacy',
+                role: 'assistant',
+                kind: 'text',
+                text: '',
+                createdAt: 1719900000001,
+                status: 'error',
+                error: '上游生成超时，可降低质量重试',
+                errorKind: 'upstream-timeout',
+                generationContext: {
+                  model: 'gemini-3-pro-image',
+                  requestedImgRatio: '21:9',
+                  imgRatio: '21:9',
+                  quality: 'high',
+                  finalPrompt: 'legacy 21:9 prompt',
+                },
+              },
+            ],
+          },
+          selectedModel: 'gemini-3-pro-image',
+          paramOverrides: { imgRatio: '21:9', quality: 'auto' },
+        },
+        version: 1,
+      }
+      window.localStorage.setItem('mivo-chat-demo', JSON.stringify(v1State))
+    })
+    await migrationPage.goto(baseUrl, { waitUntil: 'networkidle' })
+    await migrationPage.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
+    const migrated = await migrationPage.evaluate(async () => {
+      const spec = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('chatStore.ts'))
+      if (!spec) return null
+      const { useChatStore } = await import(new URL(spec).pathname + new URL(spec).search)
+      const state = useChatStore.getState()
+      const legacyUser = (state.messagesByScene['character-flow'] || []).find((m) => m.id === 'msg-user-legacy')
+      const legacyAsst = (state.messagesByScene['character-flow'] || []).find((m) => m.id === 'msg-asst-legacy')
+      return {
+        selectedModel: state.selectedModel,
+        paramOverridesImgRatio: state.paramOverrides.imgRatio,
+        userRequestedImgRatio: legacyUser?.generationContext?.requestedImgRatio,
+        userImgRatio: legacyUser?.generationContext?.imgRatio,
+        asstRequestedImgRatio: legacyAsst?.generationContext?.requestedImgRatio,
+        asstImgRatio: legacyAsst?.generationContext?.imgRatio,
+      }
+    })
+    if (!migrated) throw new Error('Migration test could not load chatStore')
+    if (migrated.selectedModel !== 'gemini-3-pro-image') {
+      throw new Error(`Persist v1→v2 should keep selectedModel=gemini, got ${migrated.selectedModel}`)
+    }
+    if (migrated.paramOverridesImgRatio !== 'auto') {
+      throw new Error(`Persist v1→v2 should clamp paramOverrides.imgRatio 21:9→auto, got ${migrated.paramOverridesImgRatio}`)
+    }
+    if (migrated.userRequestedImgRatio !== 'auto') {
+      throw new Error(`Persist v1→v2 should clamp legacy user requestedImgRatio 21:9→auto, got ${migrated.userRequestedImgRatio}`)
+    }
+    if (migrated.userImgRatio !== undefined) {
+      throw new Error(`Persist v1→v2 should clamp legacy user imgRatio off 21:9 (to undefined), got ${JSON.stringify(migrated.userImgRatio)}`)
+    }
+    if (migrated.asstRequestedImgRatio !== 'auto') {
+      throw new Error(`Persist v1→v2 should clamp legacy asst requestedImgRatio 21:9→auto, got ${migrated.asstRequestedImgRatio}`)
+    }
+    if (migrated.asstImgRatio !== undefined) {
+      throw new Error(`Persist v1→v2 should clamp legacy asst imgRatio off 21:9 (to undefined), got ${JSON.stringify(migrated.asstImgRatio)}`)
+    }
+    // 弹层无 21:9（含 4:3）
+    await migrationPage.locator('[aria-label="选择比例和质量"]').click()
+    await migrationPage.waitForSelector('#chat-ratio-popover .chat-ratio-btn')
+    const migrationRatioLabels = (await migrationPage.locator('#chat-ratio-popover .chat-ratio-btn').allInnerTexts()).map((t) => t.trim())
+    if (migrationRatioLabels.some((t) => t === '21:9')) {
+      throw new Error(`Migration: ratio popover should not include 21:9, got ${JSON.stringify(migrationRatioLabels)}`)
+    }
+    if (!migrationRatioLabels.some((t) => t === '4:3')) {
+      throw new Error(`Migration: ratio popover should include 4:3, got ${JSON.stringify(migrationRatioLabels)}`)
+    }
+    // 采纳 8：RatioPopover 质量项 title 标注 高(2K)/中(1K)/低(1K)
+    const qualityTitles = await migrationPage.locator('#chat-ratio-popover .chat-quality-btn').evaluateAll((btns) => btns.map((b) => b.getAttribute('title') || ''))
+    if (!qualityTitles.some((t) => t.includes('2K'))) {
+      throw new Error(`RatioPopover quality title should include 2K for high, got ${JSON.stringify(qualityTitles)}`)
+    }
+    if (!qualityTitles.some((t) => t.includes('1K') && !t.includes('2K'))) {
+      throw new Error(`RatioPopover quality title should include 1K for medium/low, got ${JSON.stringify(qualityTitles)}`)
+    }
+    } finally {
+      await migrationContext.close()
+    }
+  }
+
   await page.screenshot({ path: 'test-artifacts/e2e-smoke.png', fullPage: true })
   await browser.close()
 
-  if (errors.length) {
-    throw new Error(`Console errors:\n${errors.join('\n')}`)
+  // Filter known spurious network errors (Eagle mock uses filesystem paths as image URLs on macOS)
+  const realErrors = errors.filter((e) =>
+    !e.includes('ERR_UNKNOWN_URL_SCHEME') &&
+    !e.includes('status of 504 (Gateway Timeout)'),
+  )
+  if (realErrors.length) {
+    throw new Error(`Console errors:\n${realErrors.join('\n')}`)
   }
 
   console.log('E2E smoke test passed')

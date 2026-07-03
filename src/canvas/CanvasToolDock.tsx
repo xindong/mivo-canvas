@@ -1,4 +1,5 @@
-import { useMemo, useState } from 'react'
+import { Fragment, useMemo, useState } from 'react'
+import { Brush } from 'lucide-react'
 import { useCanvasStore } from '../store/canvasStore'
 import type { ToolId } from '../types/mivoCanvas'
 import {
@@ -10,11 +11,18 @@ import {
 
 type CanvasToolDockProps = {
   previewTool?: ToolId
+  onStartMaskEdit?: (nodeId: string) => void
 }
 
-export function CanvasToolDock({ previewTool }: CanvasToolDockProps) {
+export function CanvasToolDock({ previewTool, onStartMaskEdit }: CanvasToolDockProps) {
   const activeTool = useCanvasStore((state) => state.activeTool)
   const setActiveTool = useCanvasStore((state) => state.setActiveTool)
+  const selectedNodeId = useCanvasStore((state) => state.selectedNodeId)
+  const nodes = useCanvasStore((state) => state.nodes)
+  const selectedImageNodeId = (() => {
+    const node = selectedNodeId ? nodes.find((n) => n.id === selectedNodeId) : undefined
+    return node?.type === 'image' && !node.hidden ? selectedNodeId : undefined
+  })()
   const shownTool = previewTool || (isCanvasToolEnabled(activeTool) ? activeTool : 'select')
   const markupShapeToolSet = useMemo(() => new Set<ToolId>(markupShapeToolIds), [])
   const markupShapeTools = useMemo(
@@ -73,6 +81,31 @@ export function CanvasToolDock({ previewTool }: CanvasToolDockProps) {
                 })}
               </div>
             </div>
+          )
+        }
+
+        if (id === 'select') {
+          return (
+            <Fragment key="select-mask-group">
+              <button
+                type="button"
+                className={shownTool === id ? 'active' : ''}
+                onClick={() => setActiveTool(id)}
+                aria-label={label}
+                title={shortcut ? `${label} (${shortcut})` : label}
+              >
+                <Icon size={20} />
+              </button>
+              <button
+                type="button"
+                onClick={() => selectedImageNodeId && onStartMaskEdit?.(selectedImageNodeId)}
+                disabled={!selectedImageNodeId || !onStartMaskEdit}
+                aria-label="局部重绘"
+                title={selectedImageNodeId ? '局部重绘' : '先选择一张图片'}
+              >
+                <Brush size={20} />
+              </button>
+            </Fragment>
           )
         }
 

@@ -1,14 +1,43 @@
 import type { MivoCanvasNode } from '../types/mivoCanvas'
-import type { MivoEditRequest, MivoGenerateRequest, MivoImageResponse } from '../types/generation'
+import type { EnhanceRequest, EnhanceResponse, MivoEditRequest, MivoGenerateRequest, MivoImageQuality, MivoImageResponse } from '../types/generation'
 import { readImportedAssetFile } from './assetStorage'
 
 const defaultModel = 'gpt-image-2'
-const mivoRequestTimeoutMs = 110_000
+const mivoRequestTimeoutMs = 245_000
 const mivoEditRequestTimeoutMs = 185_000
+const mivoEnhanceTimeoutMs = 30_000
 
 const isAbortError = (error: unknown) => error instanceof Error && error.name === 'AbortError'
 
-const fetchMivoWithTimeout = async (input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = mivoRequestTimeoutMs) => {
+export type MivoImageRequestErrorKind = 'client-timeout' | 'upstream-timeout' | 'canceled' | 'upstream-error'
+
+export class MivoImageRequestError extends Error {
+  kind: MivoImageRequestErrorKind
+
+  constructor(message: string, kind: MivoImageRequestErrorKind, options?: ErrorOptions) {
+    super(message, options)
+    this.name = 'MivoImageRequestError'
+    this.kind = kind
+  }
+}
+
+// 审查 B（Step 4b）：超时文案按 effective quality 条件化——high(2K) 才建议降质，
+// medium/low(1K) 不再误导"降低质量"，改为"稍后重试、换比例或减少参考图"
+const timeoutAdviceForQuality = (quality?: MivoImageQuality) =>
+  quality === 'high' ? '可降低质量重试' : '可稍后重试、换比例或减少参考图'
+
+export const mivoClientTimeoutMessageFor = (quality?: MivoImageQuality) =>
+  `等待超时，结果可能仍在生成，${timeoutAdviceForQuality(quality)}`
+
+export const mivoUpstreamTimeoutMessageFor = (quality?: MivoImageQuality) =>
+  `上游生成超时，${timeoutAdviceForQuality(quality)}`
+
+const fetchMivoWithTimeout = async (
+  input: RequestInfo | URL,
+  init: RequestInit = {},
+  timeoutMs = mivoRequestTimeoutMs,
+  quality?: MivoImageQuality,
+) => {
   const controller = new AbortController()
   let timedOut = false
   const parentSignal = init.signal
@@ -31,7 +60,11 @@ const fetchMivoWithTimeout = async (input: RequestInfo | URL, init: RequestInit 
     })
   } catch (error) {
     if (isAbortError(error)) {
-      throw new Error(timedOut ? '图片请求超时，请重试。' : '图片请求已取消。', { cause: error })
+      throw new MivoImageRequestError(
+        timedOut ? mivoClientTimeoutMessageFor(quality) : '图片请求已取消。',
+        timedOut ? 'client-timeout' : 'canceled',
+        { cause: error },
+      )
     }
     throw error
   } finally {
@@ -40,7 +73,9 @@ const fetchMivoWithTimeout = async (input: RequestInfo | URL, init: RequestInit 
   }
 }
 
-const readMivoError = async (response: Response) => {
+const readMivoError = async (response: Response, quality?: MivoImageQuality) => {
+  if (response.status === 504) return mivoUpstreamTimeoutMessageFor(quality)
+
   try {
     const payload = (await response.json()) as { error?: string; message?: string }
     return payload.error || payload.message || `${response.status} ${response.statusText}`
@@ -64,22 +99,32 @@ const fileNameForBlob = (blob: Blob, fallback: string) =>
   blob instanceof File && blob.name ? blob.name : fallback
 
 export const generateMivoImage = async (request: MivoGenerateRequest) => {
-  const response = await fetchMivoWithTimeout('/api/mivo/generate', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
+  const response = await fetchMivoWithTimeout(
+    '/api/mivo/generate',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      signal: request.signal,
+      body: JSON.stringify({
+        prompt: request.prompt,
+        imgRatio: request.imgRatio,
+        quality: request.quality,
+        n: request.n ?? 1,
+        model: request.model || defaultModel,
+      }),
     },
-    signal: request.signal,
-    body: JSON.stringify({
-      prompt: request.prompt,
-      imgRatio: request.imgRatio,
-      quality: request.quality,
-      n: request.n ?? 1,
-      model: request.model || defaultModel,
-    }),
-  })
+    mivoRequestTimeoutMs,
+    request.quality,
+  )
 
-  if (!response.ok) throw new Error(await readMivoError(response))
+  if (!response.ok) {
+    throw new MivoImageRequestError(
+      await readMivoError(response, request.quality),
+      response.status === 504 ? 'upstream-timeout' : 'upstream-error',
+    )
+  }
   return validateMivoImageResponse(await response.json())
 }
 
@@ -103,10 +148,36 @@ export const editMivoImage = async (request: MivoEditRequest) => {
       body: formData,
     },
     mivoEditRequestTimeoutMs,
+    request.quality,
   )
 
-  if (!response.ok) throw new Error(await readMivoError(response))
+  if (!response.ok) {
+    throw new MivoImageRequestError(
+      await readMivoError(response, request.quality),
+      response.status === 504 ? 'upstream-timeout' : 'upstream-error',
+    )
+  }
   return validateMivoImageResponse(await response.json())
+}
+
+export const enhanceMivoPrompt = async (request: EnhanceRequest): Promise<EnhanceResponse> => {
+  const { signal, ...body } = request
+  try {
+    const response = await fetchMivoWithTimeout(
+      '/api/mivo/enhance',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal,
+        body: JSON.stringify(body),
+      },
+      mivoEnhanceTimeoutMs,
+    )
+    if (!response.ok) return { enhanced: false, degradedReason: 'upstream-error' }
+    return (await response.json()) as EnhanceResponse
+  } catch {
+    return { enhanced: false, degradedReason: 'upstream-error' }
+  }
 }
 
 export const assetBlobForNode = async (node: MivoCanvasNode) => {
