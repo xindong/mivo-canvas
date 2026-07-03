@@ -8,6 +8,7 @@ import type {
   MivoCanvasNode,
 } from '../types/mivoCanvas'
 import { normalizeCanvasNodeV2 } from '../model/documentModelV2'
+import { normalizeAnchors } from '../model/anchorModel'
 import { connectorAnchorPointFor, derivationConnectorBindingsFor } from '../canvas/connectorGeometry'
 import { makeNode } from './demoScenes'
 
@@ -43,6 +44,12 @@ export const cloneNode = (node: MivoCanvasNode): MivoCanvasNode => ({
         sourceNodeIds: node.aiWorkflow.sourceNodeIds ? [...node.aiWorkflow.sourceNodeIds] : undefined,
       }
     : undefined,
+  // P2-D1: explicit deep-copy + light validation for experimentalAnchors. The
+  // spread above only shallow-copies the array (nested anchor objects would be
+  // shared across history/clipboard/persist). normalizeAnchors deep-copies each
+  // anchor, drops box anchors missing width/height (with a dev warning), and
+  // returns undefined when none remain — so a bare node stays bare.
+  experimentalAnchors: normalizeAnchors(node.experimentalAnchors, true),
 })
 
 export const cloneTask = (task: CanvasTask): CanvasTask => ({
