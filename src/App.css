@@ -87,6 +87,234 @@ button:disabled {
   opacity: 0.48;
 }
 
+.debug-reports-page {
+  box-sizing: border-box;
+  min-height: 100svh;
+  padding: 28px;
+  color: var(--ink);
+  background: var(--canvas);
+}
+
+.debug-reports-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  max-width: 1180px;
+  margin: 0 auto 16px;
+}
+
+.debug-reports-header span {
+  color: var(--muted);
+  font-size: var(--text-xs);
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.debug-reports-header h1 {
+  margin: 2px 0 0;
+  font-size: 24px;
+  letter-spacing: 0;
+}
+
+.debug-reports-header button,
+.debug-reports-token button,
+.debug-reports-record-meta button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  height: 34px;
+  padding: 0 12px;
+  color: var(--ink);
+  background: rgba(255, 250, 240, 0.72);
+  border: 1px solid rgba(35, 35, 35, 0.1);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+}
+
+.debug-reports-toolbar,
+.debug-reports-token,
+.debug-reports-summary,
+.debug-reports-list {
+  box-sizing: border-box;
+  max-width: 1180px;
+  margin-right: auto;
+  margin-left: auto;
+}
+
+.debug-reports-token,
+.debug-reports-toolbar,
+.debug-reports-summary {
+  margin-bottom: 10px;
+  background: rgba(255, 250, 240, 0.78);
+  border: 1px solid rgba(35, 35, 35, 0.08);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 16px 42px rgba(35, 35, 35, 0.08);
+}
+
+.debug-reports-token {
+  display: flex;
+  align-items: end;
+  gap: 10px;
+  padding: 12px;
+}
+
+.debug-reports-toolbar {
+  display: grid;
+  grid-template-columns: 140px 140px minmax(140px, 1fr) minmax(140px, 1fr) minmax(220px, 1.2fr);
+  gap: 10px;
+  padding: 12px;
+}
+
+.debug-reports-token label,
+.debug-reports-toolbar label {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  font-weight: 700;
+}
+
+.debug-reports-token input,
+.debug-reports-toolbar input,
+.debug-reports-toolbar select {
+  box-sizing: border-box;
+  width: 100%;
+  height: 34px;
+  min-width: 0;
+  padding: 0 10px;
+  color: var(--ink);
+  background: rgba(255, 250, 240, 0.9);
+  border: 1px solid rgba(35, 35, 35, 0.1);
+  border-radius: var(--radius-md);
+}
+
+.debug-reports-search span {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  height: 34px;
+  padding: 0 9px;
+  background: rgba(255, 250, 240, 0.9);
+  border: 1px solid rgba(35, 35, 35, 0.1);
+  border-radius: var(--radius-md);
+}
+
+.debug-reports-search input {
+  height: auto;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+}
+
+.debug-reports-summary {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 10px 12px;
+  color: var(--muted);
+  font-size: var(--text-sm);
+}
+
+.debug-reports-summary strong {
+  color: var(--ink);
+}
+
+.debug-reports-error {
+  max-width: 1180px;
+  margin: 10px auto;
+  color: #a7352c;
+  font-size: var(--text-sm);
+}
+
+.debug-reports-list {
+  display: grid;
+  gap: 8px;
+  padding: 0;
+  list-style: none;
+}
+
+.debug-reports-record,
+.debug-reports-empty {
+  background: rgba(255, 250, 240, 0.82);
+  border: 1px solid rgba(35, 35, 35, 0.08);
+  border-left: 4px solid #c78217;
+  border-radius: var(--radius-lg);
+  box-shadow: 0 12px 32px rgba(35, 35, 35, 0.07);
+}
+
+.debug-reports-record.error {
+  border-left-color: #bf3b2f;
+}
+
+.debug-reports-record {
+  padding: 12px;
+}
+
+.debug-reports-record-meta {
+  display: grid;
+  grid-template-columns: 70px 120px minmax(0, 1fr) 34px;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted);
+  font-size: var(--text-xs);
+}
+
+.debug-reports-record-meta strong {
+  color: var(--ink);
+  text-transform: uppercase;
+}
+
+.debug-reports-record-meta button {
+  width: 34px;
+  padding: 0;
+}
+
+.debug-reports-record p {
+  margin: 10px 0;
+  overflow-wrap: anywhere;
+  font-size: var(--text-sm);
+  line-height: 1.45;
+  user-select: text;
+}
+
+.debug-reports-record dl {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+  color: var(--quiet);
+  font-size: var(--text-xs);
+}
+
+.debug-reports-record dl div {
+  min-width: 0;
+}
+
+.debug-reports-record dt {
+  font-weight: 800;
+}
+
+.debug-reports-record dd {
+  min-width: 0;
+  margin: 2px 0 0;
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.debug-reports-empty {
+  padding: 28px 12px;
+  color: var(--muted);
+  font-size: var(--text-sm);
+  text-align: center;
+}
+
 .toast-viewport {
   position: fixed;
   right: auto;

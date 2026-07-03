@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process'
 import { Buffer } from 'node:buffer'
 import path from 'node:path'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { mkdir, readFile } from 'node:fs/promises'
+import { mkdir, readFile, rm } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { chromium } from 'playwright'
 import {
@@ -168,12 +168,14 @@ const server = spawn(
       ...process.env,
       MIVO_ASSET_DIR: localAssetFixtureDir,
       MIVO_EAGLE_API_URL: `http://127.0.0.1:${eagleMockPort}`,
+      MIVO_DEBUG_LOG_DIR: path.resolve('test-artifacts/debug-logs'),
     },
   },
 )
 
 try {
   await mkdir('test-artifacts', { recursive: true })
+  await rm(path.resolve('test-artifacts/debug-logs'), { recursive: true, force: true })
   await runCommand('npm', ['run', 'verify:logging'])
   const [nodeRegistrySource, actionModelSource] = await Promise.all([
     readFile('src/canvas/nodeTypes/canvasNodeRegistry.ts', 'utf8'),
@@ -248,6 +250,46 @@ try {
   page.on('console', (message) => {
     if (message.type() === 'error' && !message.text().includes('__MIVO_E2E_EXPECTED_ERROR__')) errors.push(message.text())
   })
+
+  const remoteDebugResponse = await page.request.post(`${baseUrl}/api/mivo/debug-logs`, {
+    data: {
+      clientId: 'e2e-client',
+      sessionId: 'e2e-session',
+      appVersion: 'e2e',
+      pagePath: '/canvas',
+      userAgent: 'E2E Browser',
+      language: 'zh-CN',
+      timezone: 'Asia/Shanghai',
+      screen: { width: 1512, height: 900, pixelRatio: 1 },
+      entries: [
+        { level: 'log', source: 'E2E', message: 'not uploaded', timestamp: Date.now() },
+        { level: 'warning', source: 'E2E Warning', message: 'e2e-remote warning', timestamp: Date.now() },
+        { level: 'error', source: 'E2E Error', message: 'e2e-remote error token=SHOULD_HIDE', timestamp: Date.now() },
+      ],
+    },
+  })
+  const remoteDebugPost = await remoteDebugResponse.json()
+  if (!remoteDebugResponse.ok() || remoteDebugPost.accepted !== 2) {
+    throw new Error(`Remote debug POST should accept warning/error only: ${JSON.stringify(remoteDebugPost)}`)
+  }
+  const remoteDebugQueryResponse = await page.request.get(`${baseUrl}/api/mivo/debug-logs?level=error&q=e2e-remote`)
+  const remoteDebugQuery = await remoteDebugQueryResponse.json()
+  if (
+    !remoteDebugQueryResponse.ok() ||
+    remoteDebugQuery.records?.length !== 1 ||
+    remoteDebugQuery.records[0].clientId !== 'e2e-client' ||
+    !remoteDebugQuery.records[0].message.includes('token=[redacted]')
+  ) {
+    throw new Error(`Remote debug GET should return sanitized filtered records: ${JSON.stringify(remoteDebugQuery)}`)
+  }
+  await page.goto(`${baseUrl}/#/debug-reports`, { waitUntil: 'networkidle' })
+  if ((await page.getByRole('heading', { name: 'Remote Debug Reports' }).count()) !== 1) {
+    throw new Error('Debug reports browser should render at /debug-reports')
+  }
+  await page.getByText('e2e-remote error', { exact: false }).waitFor()
+  if ((await page.getByText('e2e-remote error', { exact: false }).count()) !== 1) {
+    throw new Error('Debug reports browser should show uploaded remote error records')
+  }
 
   await page.addInitScript(() => window.localStorage.clear())
   await page.goto(baseUrl, { waitUntil: 'networkidle' })

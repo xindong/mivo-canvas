@@ -15,6 +15,7 @@ import { TopBar } from './app/TopBar'
 import { ToastViewport } from './app/ToastViewport'
 import { useCanvasStore } from './store/canvasStore'
 import { debugLogger, installConsoleCapture } from './store/debugLogStore'
+import { installRemoteDebugReporter } from './store/remoteDebugReporter'
 import type { WorkspaceView } from './app/ProjectSidebar'
 
 const SIDEBAR_PINNING_MS = 300
@@ -161,6 +162,7 @@ function App() {
   useEffect(() => () => clearProjectSidebarTimer(), [clearProjectSidebarTimer])
 
   useEffect(() => {
+    installRemoteDebugReporter()
     installConsoleCapture()
     debugLogger.log('App', 'App ready')
   }, [])
