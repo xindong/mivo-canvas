@@ -82,13 +82,13 @@ export const runCommand = (command, args) =>
     })
   })
 
-export const startSmokeDevServer = ({ port, localAssetFixtureDir, eagleMockPort, apiMode = 'dev-middleware' }) => {
+export const startSmokeDevServer = ({ port, localAssetFixtureDir, eagleMockPort, bffPort }) => {
   killStaleDevServer(port)
   return spawn('npm', ['run', 'dev', '--', '--host', '127.0.0.1', '--port', String(port), '--strictPort'], {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: {
       ...process.env,
-      MIVO_API_MODE: apiMode,
+      MIVO_PORT: String(bffPort),
       MIVO_ASSET_DIR: localAssetFixtureDir,
       MIVO_EAGLE_API_URL: `http://127.0.0.1:${eagleMockPort}`,
       MIVO_DEBUG_LOG_DIR: path.resolve('test-artifacts/debug-logs'),
@@ -105,14 +105,14 @@ export const startSmokeBffServer = ({
   debugViewToken,
   enableLocalAssets,
   enableEagleProxy,
+  isPublic = true,
 }) =>
   spawn('npm', ['run', 'start:server'], {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: {
       ...process.env,
       MIVO_PORT: String(port),
-      MIVO_PUBLIC: '1',
-      MIVO_BFF_TOKEN: bffToken,
+      ...(isPublic ? { MIVO_PUBLIC: '1', MIVO_BFF_TOKEN: bffToken } : {}),
       MIVO_ASSET_DIR: localAssetFixtureDir,
       MIVO_EAGLE_API_URL: `http://127.0.0.1:${eagleMockPort}`,
       MIVO_DEBUG_LOG_DIR: path.resolve('test-artifacts/debug-logs'),
@@ -126,24 +126,31 @@ export const startSmokeBffServer = ({
     },
   })
 
-export const stopSmokeDevServer = async (server) => {
-  if (!server) return
-  if (server.exitCode !== null || server.signalCode !== null) return
-
+const stopProcess = async (proc) => {
+  if (!proc || proc.exitCode !== null || proc.signalCode !== null) return
   await new Promise((resolve) => {
-    const finish = () => resolve(null)
     const forceKillTimer = setTimeout(() => {
-      if (server.exitCode === null && server.signalCode === null) {
-        server.kill('SIGKILL')
+      if (proc.exitCode === null && proc.signalCode === null) {
+        proc.kill('SIGKILL')
       }
     }, 2000)
 
-    server.once('close', () => {
+    proc.once('close', () => {
       clearTimeout(forceKillTimer)
-      finish()
+      resolve(null)
     })
-    server.kill('SIGTERM')
+    proc.kill('SIGTERM')
   })
+}
+
+export const stopSmokeDevServer = async (server) => {
+  if (!server) return
+  // Dev topology returns { bff, dev }; prod returns a single ChildProcess.
+  if (server.bff || server.dev) {
+    await Promise.all([stopProcess(server.bff), stopProcess(server.dev)])
+    return
+  }
+  await stopProcess(server)
 }
 
 export const createSmokePage = async ({ baseUrl, generatedImageB64, extraHTTPHeaders, enableStoreBridgeModules = false }) => {

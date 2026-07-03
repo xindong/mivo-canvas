@@ -168,10 +168,10 @@ npm run contract:diff -- --target=dev
 
 ## 回滚
 
-P1-d 不删 `vite.config.ts` middleware。回滚 dev 接线只需:
+SC1.3 删除了 `vite.config.ts` 的全部 mivo dev middleware + `MIVO_API_MODE` 开关(bff 成为唯一模式)。回滚 = `git revert` 本 PR:
 
 ```bash
-MIVO_API_MODE=dev-middleware npm run dev
+git revert <this-pr-commit>      # 恢复 dev middleware + MIVO_API_MODE 开关
 ```
 
-如需连带撤销 P1-c BFF 路由代码,再另行 `git revert` 对应提交。
+revert 后,`MIVO_API_MODE=dev-middleware npm run dev` 重新可用(回到 P1-d 的双模式)。
