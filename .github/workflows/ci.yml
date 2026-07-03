@@ -1,0 +1,70 @@
+# MivoCanvas CI — P1-f phase 1
+#
+# 基础半程: lint + tsc + 单元测试 + 日志规则守卫 + 结构守卫(防回潮)。
+# 对应 productization-roadmap.md §6.2 P1-f 与 §13 SC5.2。
+#
+# 后续 P1-f phase2(占位,尚未实现):
+#   - e2e(mock 上游 generation 链路)job —— 不打真链路,用 mock BFF/image 服务验证 UI 流程
+#   - MIVO_BFF_TOKEN gated 矩阵 —— 需要真链路的 job 在此 secret 可用时才跑,默认跳过
+#   - nightly 真链路 —— 每日定时跑真实 generation 链路,失败只告警不阻断
+# 见 productization-roadmap.md §6.2 P1-f phase2 与 §13 SC5.2 后半程。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 同一分支/PR 的新推送取消旧运行,省额度
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: lint + tsc + unit + logging
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node (LTS)
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check (tsc -b)
+        run: npx tsc -b
+
+      - name: Lint (eslint)
+        run: npm run lint
+
+      - name: Unit tests (vitest)
+        run: npm run test:unit
+
+      - name: Verify logging rules
+        run: npm run verify:logging
+
+  structure-guard:
+    name: structure guard (anti-regression)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node (LTS)
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      # 守卫脚本是纯 node(无第三方依赖),无需 npm ci
+      - name: Run structure guard
+        run: node scripts/ci/structure-guard.mjs
