@@ -1,4 +1,5 @@
 import type {
+  CanvasAssetNodeType,
   CanvasDocument,
   CanvasEdge,
   CanvasId,
@@ -10,13 +11,18 @@ import type {
   ToolId,
 } from '../types/mivoCanvas'
 import type { BrushStyle, CanvasState, SelectionArrangeMode } from './canvasStore'
+import type { CanvasAssetClipboardItem } from '../app/assetLibraryModel'
 import { connectorBindingPointFor, isConnectorNode } from '../canvas/connectorGeometry'
 import { defaultBrushWidth } from '../canvas/brushGeometry'
+import { defaultSizeForNodeType } from '../canvas/nodeTypes/canvasNodeRegistry'
 import {
   markdownDocumentWidth,
+  markdownDocumentSizeFor,
   markdownPreviewHeight,
   markdownShouldUsePreviewMode,
+  type ImportedFileMetadata,
 } from '../lib/canvasAssetImport'
+import { importedImageDisplaySize } from '../lib/imageSizing'
 import { normalizeCanvasSnapshotV2 } from '../model/canvasSnapshotModel'
 import { normalizeCanvasNodesV2, setNodeTransform } from '../model/documentModelV2'
 import { scenes, snapshotFromScene } from './demoScenes'
@@ -584,3 +590,46 @@ export const arrangedPositionsFor = (
 export const defaultSceneId: CanvasId = 'character-flow'
 export const defaultCanvases = initialCanvases()
 export const defaultDocument = documentFor(defaultCanvases, defaultSceneId)
+export const importedAssetDisplaySize = (type: CanvasAssetNodeType, metadata?: ImportedFileMetadata) => {
+  if (type === 'image' || type === 'video') {
+    return metadata?.dimensions ? importedImageDisplaySize(metadata.dimensions) : defaultSizeForNodeType(type)
+  }
+
+  if (type === 'markdown') {
+    const defaultSize = defaultSizeForNodeType(type)
+    return markdownShouldUsePreviewMode(metadata?.text)
+      ? {
+          ...defaultSize,
+          width: markdownDocumentWidth,
+          height: markdownPreviewHeight,
+        }
+      : markdownDocumentSizeFor(metadata?.text)
+  }
+
+  return defaultSizeForNodeType(type)
+}
+
+export const importedAssetPromptFor = (type: Exclude<CanvasAssetNodeType, 'markdown'>) => {
+  if (type === 'pdf') return '本地导入 PDF 文档，可作为后续 AI 上下文'
+  if (type === 'video') return '本地导入视频文件，可作为后续 AI 上下文'
+  return '本地导入图片，可作为后续 AI 上下文'
+}
+
+export const clipboardAssetTitle = (asset: CanvasAssetClipboardItem) =>
+  asset.title?.trim() || asset.name?.replace(/\.[^.]+$/, '') || 'Eagle asset'
+
+export const clipboardAssetDisplaySize = (asset: CanvasAssetClipboardItem) =>
+  importedImageDisplaySize(
+    asset.width && asset.height
+      ? {
+          width: asset.width,
+          height: asset.height,
+        }
+      : undefined,
+  )
+
+export const importedAssetModelFor = (type: Exclude<CanvasAssetNodeType, 'markdown'>) => {
+  if (type === 'pdf') return 'Imported PDF'
+  if (type === 'video') return 'Imported Video'
+  return 'Imported'
+}
