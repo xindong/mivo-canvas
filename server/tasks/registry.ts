@@ -67,10 +67,20 @@ const isTerminal = (s: TaskStatus): boolean => s === 'done' || s === 'partial' |
 
 export const newTaskId = (): string => randomUUID()
 
+// P1 fix (rev-behavior): createTask returns {record, created} so the caller can
+// gate runner startup on `created`. Without this, a repeat submission with the same
+// Idempotency-Key returned the existing record BUT the route still unconditionally
+// launched a second runner — duplicate upstream calls (billing) + a double-runner
+// race on the same task record. Now: `created=false` ⇒ the route returns the
+// existing taskId (and for variations, the existing batchId/count) WITHOUT
+// re-running anything, matching the tasks-async.md "同 key → 同 taskId,不重新跑"
+// contract.
+export type CreateTaskResult = { record: TaskRecord; created: boolean }
+
 // Create a task. If idempotencyKey was seen (and the task still exists), return
-// the existing record (same taskId). Restart-eviction is implicit: the index is
-// in-memory, so a restarted process has no entry → a repeat submission creates a
-// new task (the lead's "重启后失效视为新任务").
+// the existing record (same taskId, created=false → caller MUST NOT re-run).
+// Restart-eviction is implicit: the index is in-memory, so a restarted process
+// has no entry → a repeat submission creates a new task (created=true).
 // P2-C2: `meta` carries variations-only fields (batchId, count) that the runner
 // and toView surface to the client. Other kinds ignore it.
 export const createTask = (
@@ -79,12 +89,12 @@ export const createTask = (
   requestId: string,
   idempotencyKey?: string,
   meta?: { batchId?: string; count?: number },
-): TaskRecord => {
+): CreateTaskResult => {
   if (idempotencyKey) {
     const existingId = idempotencyIndex.get(idempotencyKey)
     if (existingId) {
       const existing = tasks.get(existingId)
-      if (existing) return existing
+      if (existing) return { record: existing, created: false }
       // Index entry without a record (shouldn't happen in-process); fall through to create.
       idempotencyIndex.delete(idempotencyKey)
     }
@@ -106,7 +116,7 @@ export const createTask = (
   if (meta?.count !== undefined) record.count = meta.count
   tasks.set(id, record)
   if (idempotencyKey) idempotencyIndex.set(idempotencyKey, id)
-  return record
+  return { record, created: true }
 }
 
 export const getTask = (id: string): TaskRecord | undefined => tasks.get(id)

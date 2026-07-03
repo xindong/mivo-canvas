@@ -223,12 +223,44 @@ describe('C1a — cancel propagates to upstream', () => {
 })
 
 describe('C1a — idempotency, 404, concurrency, validation', () => {
-  it('Idempotency-Key returns the same taskId on repeat', async () => {
+  it('Idempotency-Key returns the same taskId on repeat + does NOT re-run upstream', async () => {
     const a = await req('/api/mivo/tasks/generate', jsonReq({ prompt: 'a', model: 'doubao-seedance-2-0-260128' }, { 'idempotency-key': 'k-1' }))
     const b = await req('/api/mivo/tasks/generate', jsonReq({ prompt: 'a', model: 'doubao-seedance-2-0-260128' }, { 'idempotency-key': 'k-1' }))
     expect(a.status).toBe(202)
     expect(b.status).toBe(202)
     expect(field(b.body, 'taskId')).toBe(field(a.body, 'taskId'))
+    // P1 fix (rev-behavior): same key → same task → upstream called ONCE (the
+    // second submission returns the existing task without launching a runner).
+    // Without the fix, the second submission would start a second runner →
+    // generateCalls=2 (duplicate billing + double-runner race).
+    const done = await pollTask(field(a.body, 'taskId') as string, (v) => v.status === 'done' || v.status === 'failed')
+    expect(done).not.toBeNull()
+    expect(mockState.generateCalls).toBe(1)
+  })
+
+  it('Idempotency-Key on variations returns same taskId + batchId/count + does NOT re-run upstream', async () => {
+    const variationsForm = () => {
+      const f = new FormData()
+      f.append('image', new File([Buffer.from('png-bytes')], 'image.png', { type: 'image/png' }))
+      f.append('variations', JSON.stringify([{ prompt: 'v0' }, { prompt: 'v1' }]))
+      f.append('model', 'doubao-seedance-2-0-260128')
+      return f
+    }
+    const a = await req('/api/mivo/tasks/variations', { method: 'POST', headers: { 'idempotency-key': 'kv-1' }, body: variationsForm() })
+    const b = await req('/api/mivo/tasks/variations', { method: 'POST', headers: { 'idempotency-key': 'kv-1' }, body: variationsForm() })
+    expect(a.status).toBe(202)
+    expect(b.status).toBe(202)
+    expect(field(b.body, 'taskId')).toBe(field(a.body, 'taskId'))
+    // Same batchId + count on repeat (existing record's fields returned).
+    expect(field(b.body, 'batchId')).toBe(field(a.body, 'batchId'))
+    expect(field(b.body, 'count')).toBe(2)
+    // Upstream called once per variation (2 /edits calls), NOT doubled (4).
+    const done = await pollTask(
+      field(a.body, 'taskId') as string,
+      (v) => v.status === 'done' || v.status === 'partial' || v.status === 'failed',
+    )
+    expect(done).not.toBeNull()
+    expect(mockState.editCalls).toBe(2)
   })
 
   it('unknown task → 404 {error:"unknown-task"}', async () => {

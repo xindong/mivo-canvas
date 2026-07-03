@@ -81,9 +81,11 @@
 ## 幂等
 
 `Idempotency-Key` header(可选)。registry 维护 `idempotencyIndex: Map<key, taskId>`:
-- 同 key + 任务仍存在 → 返回同 taskId(不重新跑)。
+- 同 key + 任务仍存在 → 返回同 taskId,**且不重新启动 runner、不重复调用上游**。`createTask` 返回 `{record, created=false}`,route 据此**跳过 runner 启动**(`if (created) void runXxxTask(...)`)。重复提交仅返回既有 taskId,不再 fire-and-forget 第二个 runner——避免重复计费 + 同 taskId 双 runner 竞态(P1 bug,已修;rev-behavior 复现固化)。
 - 同 key + 任务已被清除(不应发生,内存期任务不清除)→ 创建新任务。
 - 重启后 index 清空 → 同 key 视为新任务(新 taskId)。
+
+variations 重复提交:返回同 taskId + 既有 `batchId`/`count`(从 record 读,不重新生成 batchId,客户端仍见原批次分组)。
 
 幂等不跨进程;客户端重试应带同一 key 以避免重复生成。
 
