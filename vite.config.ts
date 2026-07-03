@@ -183,6 +183,18 @@ type EagleTag = string | {
   count?: number
 }
 
+type MivoApiMode = 'dev-middleware' | 'bff'
+
+const resolveMivoApiMode = (value: string | undefined): MivoApiMode =>
+  value === 'dev-middleware' ? 'dev-middleware' : 'bff'
+
+const resolveDevBffTarget = (env: Record<string, string>): string => {
+  const explicit = env.MIVO_BFF_DEV_URL || process.env.MIVO_BFF_DEV_URL || ''
+  if (explicit.trim()) return explicit.replace(/\/$/, '')
+  const port = env.MIVO_PORT || process.env.MIVO_PORT || '8080'
+  return `http://127.0.0.1:${port}`
+}
+
 const requestJson = async <T>(url: string, init?: RequestInit) => {
   const response = await fetch(url, init)
   if (!response.ok) throw new Error(`${response.status} ${response.statusText}`)
@@ -1617,6 +1629,8 @@ const localAssetLibraryPlugin = ({ imageApiKey, llmApiKey, platformCtx }: { imag
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
   const imageApiKey = env.MIVO_IMAGE_API_KEY || process.env.MIVO_IMAGE_API_KEY || ''
+  const apiMode = resolveMivoApiMode(env.MIVO_API_MODE || process.env.MIVO_API_MODE)
+  const devBffTarget = resolveDevBffTarget(env)
   // LLM key for enhance endpoint: prefer dedicated key, fall back to image key
   const llmApiKey = env.MIVO_LLM_API_KEY || env.MIVO_IMAGE_API_KEY || ''
   // mivo 平台通道 key/endpoint（D-R5：与 llm-proxy sk- key 严格分离，仅 Node 层读，不进客户端 bundle）
@@ -1625,6 +1639,22 @@ export default defineConfig(({ mode }) => {
   const platformCtx: PlatformCtx = { platformKey, platformEndpoint }
 
   return {
-    plugins: [react(), localAssetLibraryPlugin({ imageApiKey, llmApiKey, platformCtx })],
+    plugins: [
+      react(),
+      ...(apiMode === 'dev-middleware'
+        ? [localAssetLibraryPlugin({ imageApiKey, llmApiKey, platformCtx })]
+        : []),
+    ],
+    server: apiMode === 'bff'
+      ? {
+          proxy: {
+            '/api/mivo': {
+              target: devBffTarget,
+              changeOrigin: false,
+              secure: false,
+            },
+          },
+        }
+      : undefined,
   }
 })

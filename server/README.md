@@ -1,6 +1,6 @@
 # MivoCanvas BFF (server/)
 
-基于 Hono + `@hono/node-server` 的独立 BFF:同源托管 `dist/` 静态产物、`/healthz` 探活、`/api/mivo/{generate,edit,enhance}` 端点(P1-c 平移自 `vite.config.ts` dev middleware)。资产组 / debug-logs 端点见后续 P1-c 子项。
+基于 Hono + `@hono/node-server` 的独立 BFF:同源托管 `dist/` 静态产物、`/healthz` 探活、`/api/mivo/*` 全量端点(P1-c 已从 `vite.config.ts` dev middleware 平移完生成组 / debug-logs / 资产组)。
 
 ## 启动
 
@@ -16,6 +16,31 @@ npm run start:server
 
 ```
 [mivo-bff] listening on http://127.0.0.1:8080 [local 127.0.0.1, open (no MIVO_BFF_TOKEN)]
+```
+
+### dev 接线(P1-d)
+
+`vite.config.ts` 现有双模式开关:
+
+| 变量 | 默认 | 作用 |
+|------|------|------|
+| `MIVO_API_MODE` | `bff` | `bff`=`npm run dev` 通过 `server.proxy` 转发 `/api/mivo/*` 到本地 BFF; `dev-middleware`=继续走 `vite.config.ts` 里旧 middleware |
+| `MIVO_BFF_DEV_URL` | `http://127.0.0.1:${MIVO_PORT:-8080}` | `bff` 模式下 Vite proxy 的目标地址; 未设时跟随 `MIVO_PORT` 推导 |
+
+推荐的本地开发编排(两个终端):
+
+```bash
+# 终端 A: BFF(API)
+MIVO_PORT=8080 npm run start:server
+
+# 终端 B: 前端 dev server(默认 bff 模式)
+MIVO_API_MODE=bff npm run dev
+```
+
+回滚到旧开发链路(不删 middleware,只改一个 env):
+
+```bash
+MIVO_API_MODE=dev-middleware npm run dev
 ```
 
 请求日志(服务端 stdout,只记方法/路径/状态/上游 tag/latency,**禁记 API key / 原图 blob / 完整 prompt**):
@@ -72,6 +97,11 @@ Token 携带二选一:`Authorization: Bearer <token>` 或 `X-Mivo-Bff-Token: <to
 | `POST /api/mivo/generate` | POST(非 POST → 405) | 模型分流:gemini-3-pro-image / gpt-image-2 → 平台 submit→poll→download;其余 → llm-proxy。平台失败不回落。JSON 1MB→413;上游 240s→504 |
 | `POST /api/mivo/edit` | POST(multipart,非 POST → 405) | 无 mask + 平台模型 → 平台(主图 index 0);有 mask 或非平台模型 → llm-proxy gpt-image-2。multipart 40MB→413;上游 180s→504;上传失败固定 502 脱敏 |
 | `POST /api/mivo/enhance` | POST(非 POST → 405) | 降级链 claude-haiku-4-5(8s) → gpt-5.4-mini(8s);无 key → `200 {enhanced:false,degradedReason:'no-key'}`;双失败 → `200 {enhanced:false,degradedReason}`;从不 5xx |
+| `GET/POST /api/mivo/debug-logs` | GET/POST | POST 记录远端 debug 日志; GET 读取最近记录。保留 token gate / 过滤 / 默认 7 天窗口; D1/D7/D8 见 `server/contracts/debug-logs.json` |
+| `ALL /api/mivo/local-assets` | ALL(dev 兼容,无 method guard) | 本地图像列表; 本地模式默认开,`MIVO_PUBLIC=1` 时默认关,可用 `MIVO_ENABLE_LOCAL_ASSETS=1` 显式打开 |
+| `ALL /api/mivo/local-assets/:id` | ALL | 本地图像文件读取; symlink escape 用 realpath 守卫; 403/404 明文错误的 `text/plain` header 属 framework diff |
+| `ALL /api/mivo/eagle/*` | ALL(dev 兼容,无 method guard) | Eagle 状态 / 文件夹 / 标签 / 资产 / 缩略图 / 原图; 本地模式默认开,`MIVO_PUBLIC=1` 时默认关,可用 `MIVO_ENABLE_EAGLE_PROXY=1` 显式打开 |
+| `ALL /api/mivo/pinterest/status` | ALL | 固定占位 `{connected:false,mode:'prototype'}` |
 | `/*` | GET | serveStatic(`dist/`)+ SPA history fallback |
 
 每个响应带 `X-Request-Id` header(uuid),服务端日志同步 rid。
@@ -80,12 +110,16 @@ Token 携带二选一:`Authorization: Bearer <token>` 或 `X-Mivo-Bff-Token: <to
 
 ```
 server/
-├── app.ts              # Hono app:healthz + 访问门 + 3 路由 + serveStatic + SPA fallback
+├── app.ts              # Hono app:healthz + 访问门 + 全量 /api/mivo 路由 + serveStatic + SPA fallback
 ├── index.ts            # 入口:bind + 公网守卫 + serve()(app 在 app.ts,测试可单独 import)
 ├── routes/
 │   ├── generate.ts     # POST /api/mivo/generate
 │   ├── edit.ts         # POST /api/mivo/edit
-│   └── enhance.ts      # POST /api/mivo/enhance + helpers(system prompt / parse / normalize)
+│   ├── enhance.ts      # POST /api/mivo/enhance + helpers(system prompt / parse / normalize)
+│   ├── debug-logs.ts   # GET/POST /api/mivo/debug-logs
+│   ├── local-assets.ts # /api/mivo/local-assets*
+│   ├── eagle.ts        # /api/mivo/eagle/*
+│   └── pinterest.ts    # /api/mivo/pinterest/status
 ├── platform/
 │   ├── state.ts        # 内存 token/chatSession 缓存 + 单飞 + 401 authRetry(mivoPlatformFetch)
 │   └── job.ts          # channels + submit/poll/download/upload + runMivoPlatformImageJob
@@ -109,13 +143,12 @@ npm run test:unit
 # 仅 P1-c mock 套件
 npx vitest run server/__tests__/p1c.test.ts
 
-# live 契约 diff(对 BFF):先启 BFF,再跑 p1b live 套件过滤 generate|enhance|edit
+# live 契约 diff(对 BFF)
 MIVO_PORT=18080 npm run start:server &
-MIVO_CONTRACT_LIVE=1 MIVO_CONTRACT_TARGET_URL=http://127.0.0.1:18080 \
-  npx vitest run server/contracts/contract.test.ts -t 'generate|enhance|edit'
+npm run contract:diff -- --target=http://127.0.0.1:18080
 
-# live 契约基线(对 dev middleware,无 TARGET → 临时 vite dev server)
-MIVO_CONTRACT_LIVE=1 npx vitest run server/contracts/contract.test.ts -t 'generate|enhance|edit'
+# live 契约基线(对 dev middleware → 临时 vite dev server,脚本强制 MIVO_API_MODE=dev-middleware)
+npm run contract:diff -- --target=dev
 ```
 
 ## 有意变更(相对 dev middleware,各带测试)
@@ -133,10 +166,10 @@ MIVO_CONTRACT_LIVE=1 npx vitest run server/contracts/contract.test.ts -t 'genera
 
 ## 回滚
 
-本 PR 新增 `server/{app.ts,routes/*,platform/*,lib/*,__tests__/*}`、改 `server/index.ts`(拆出 app)、修 `server/contracts/contract.test.ts`(预存 tsc 空值错误)。**未动 `vite.config.ts`、未动 `src/`、未改 dev/build 流程**。
+P1-d 不删 `vite.config.ts` middleware。回滚 dev 接线只需:
 
 ```bash
-git revert <this-pr-commit>      # 撤销本 PR
+MIVO_API_MODE=dev-middleware npm run dev
 ```
 
-dev 接线(P1-d)才会改 `vite.config.ts` 的 `server.proxy` + `MIVO_API_MODE` 回滚开关。
+如需连带撤销 P1-c BFF 路由代码,再另行 `git revert` 对应提交。
