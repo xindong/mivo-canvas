@@ -11,9 +11,9 @@ const mivoImageApiBase = 'https://llm-proxy.tapsvc.com/v1/images'
 // Enhance endpoint (chat completions)
 const mivoLlmApiBase = 'https://llm-proxy.tapsvc.com/v1'
 const mivoEnhancePrimaryModel = 'moonshotai/kimi-k2.6'
-const mivoEnhanceFallbackModel = 'qwen/qwen3.6-plus'
+const mivoEnhanceFallbackModel = 'gpt-5.4-mini'
 const mivoEnhancePrimaryTimeoutMs = 10_000
-const mivoEnhanceFallbackTimeoutMs = 15_000
+const mivoEnhanceFallbackTimeoutMs = 8_000
 // SYNC NOTE: keep in sync with src/lib/modelCapabilities.ts
 const mivoModelRatioMap: Record<string, string[]> = {
   'gpt-image-2': ['1:1', '3:2', '2:3', '16:9', '9:16'],
@@ -31,33 +31,33 @@ const defaultMivoImageModel = 'gpt-image-2'
 const mivoQualitySet = new Set(['low', 'medium', 'high'])
 const mivoImageRequestMaxBytes = 40 * 1024 * 1024
 const mivoJsonRequestMaxBytes = 1024 * 1024
-const mivoUpstreamTimeoutMs = 110_000
+const mivoUpstreamTimeoutMs = 240_000
 const mivoEditUpstreamTimeoutMs = 180_000
 const mivoImageSizeMap = {
   '1:1': {
     low: '1024x1024',
     medium: '2048x2048',
-    high: '2880x2880',
+    high: '2304x2304',
   },
   '3:2': {
     low: '1536x1024',
     medium: '3072x2048',
-    high: '3504x2336',
+    high: '3456x2304',
   },
   '2:3': {
     low: '1024x1536',
     medium: '2048x3072',
-    high: '2336x3504',
+    high: '2304x3456',
   },
   '16:9': {
     low: '1824x1024',
     medium: '2048x1152',
-    high: '3840x2160',
+    high: '2560x1440',
   },
   '9:16': {
     low: '1024x1824',
     medium: '1152x2048',
-    high: '2160x3840',
+    high: '1440x2560',
   },
 } as const
 
@@ -611,6 +611,7 @@ const buildEnhanceSystemPrompt = (allowedRatios: string[]) =>
 Additional rules:
 - Chinese or very short input → expand into a specific English visual description
 - When history is provided → this is a refinement; evolve the previous richPrompt rather than starting fresh
+- Default to "medium"; choose "high" only when the user explicitly asks for print-grade output, fine detail, or preserving small text
 - Output ONLY the JSON object, no surrounding text`
 
 type EnhanceLlmResponse = {
@@ -745,7 +746,7 @@ const proxyMivoEnhance = async (
     // Primary: kimi-k2.6 (10s)
     let { result, reason: degradedReason } = await callEnhanceLlm(mivoEnhancePrimaryModel, llmMessages, llmApiKey.trim(), mivoEnhancePrimaryTimeoutMs)
 
-    // Fallback: qwen3.6-plus (15s) — no response_format per probe-results
+    // Fallback: fast JSON-stable mini model (8s)
     if (!result) {
       const fallback = await callEnhanceLlm(mivoEnhanceFallbackModel, llmMessages, llmApiKey.trim(), mivoEnhanceFallbackTimeoutMs)
       result = fallback.result

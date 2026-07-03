@@ -3,11 +3,26 @@ import type { EnhanceRequest, EnhanceResponse, MivoEditRequest, MivoGenerateRequ
 import { readImportedAssetFile } from './assetStorage'
 
 const defaultModel = 'gpt-image-2'
-const mivoRequestTimeoutMs = 110_000
+const mivoRequestTimeoutMs = 245_000
 const mivoEditRequestTimeoutMs = 185_000
 const mivoEnhanceTimeoutMs = 30_000
 
 const isAbortError = (error: unknown) => error instanceof Error && error.name === 'AbortError'
+
+export type MivoImageRequestErrorKind = 'client-timeout' | 'upstream-timeout' | 'canceled' | 'upstream-error'
+
+export class MivoImageRequestError extends Error {
+  kind: MivoImageRequestErrorKind
+
+  constructor(message: string, kind: MivoImageRequestErrorKind, options?: ErrorOptions) {
+    super(message, options)
+    this.name = 'MivoImageRequestError'
+    this.kind = kind
+  }
+}
+
+export const mivoClientTimeoutMessage = '等待超时，结果可能仍在生成，可稍后重试或降低质量'
+export const mivoUpstreamTimeoutMessage = '上游生成超时，可降低质量重试'
 
 const fetchMivoWithTimeout = async (input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = mivoRequestTimeoutMs) => {
   const controller = new AbortController()
@@ -32,7 +47,11 @@ const fetchMivoWithTimeout = async (input: RequestInfo | URL, init: RequestInit 
     })
   } catch (error) {
     if (isAbortError(error)) {
-      throw new Error(timedOut ? '图片请求超时，请重试。' : '图片请求已取消。', { cause: error })
+      throw new MivoImageRequestError(
+        timedOut ? mivoClientTimeoutMessage : '图片请求已取消。',
+        timedOut ? 'client-timeout' : 'canceled',
+        { cause: error },
+      )
     }
     throw error
   } finally {
@@ -42,6 +61,8 @@ const fetchMivoWithTimeout = async (input: RequestInfo | URL, init: RequestInit 
 }
 
 const readMivoError = async (response: Response) => {
+  if (response.status === 504) return mivoUpstreamTimeoutMessage
+
   try {
     const payload = (await response.json()) as { error?: string; message?: string }
     return payload.error || payload.message || `${response.status} ${response.statusText}`
@@ -80,7 +101,12 @@ export const generateMivoImage = async (request: MivoGenerateRequest) => {
     }),
   })
 
-  if (!response.ok) throw new Error(await readMivoError(response))
+  if (!response.ok) {
+    throw new MivoImageRequestError(
+      await readMivoError(response),
+      response.status === 504 ? 'upstream-timeout' : 'upstream-error',
+    )
+  }
   return validateMivoImageResponse(await response.json())
 }
 
@@ -106,7 +132,12 @@ export const editMivoImage = async (request: MivoEditRequest) => {
     mivoEditRequestTimeoutMs,
   )
 
-  if (!response.ok) throw new Error(await readMivoError(response))
+  if (!response.ok) {
+    throw new MivoImageRequestError(
+      await readMivoError(response),
+      response.status === 504 ? 'upstream-timeout' : 'upstream-error',
+    )
+  }
   return validateMivoImageResponse(await response.json())
 }
 
