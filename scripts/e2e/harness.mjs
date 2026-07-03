@@ -6,10 +6,9 @@ import { attachDefaultMivoApiMocks } from './api-mocks.mjs'
 
 export const createBaseUrl = (port) => `http://127.0.0.1:${port}`
 
-// killStaleDevServer:检测并 kill 残留 dev server(之前 e2e 崩溃未走 finally
-// stopSmokeDevServer 时残留)。残留 dev server 用旧 MIVO_DEBUG_LOG_DIR 会导致
-// debug-logs 累积(remote debug GET records 多条),且新 dev server 因 --strictPort
-// 端口占用起不来。起跑前清掉(真卫生 bug,修了全线受益)。
+// killStaleDevServer: detect and kill a leftover dev server from a prior failed
+// e2e run. A stale dev server keeps the old debug log dir and breaks
+// --strictPort restarts.
 const killStaleDevServer = (port) => {
   try {
     const pids = execSync(`lsof -ti:${port} 2>/dev/null || true`, { encoding: 'utf8' }).trim()
@@ -17,7 +16,7 @@ const killStaleDevServer = (port) => {
     console.warn(`[harness] killing stale dev server on port ${port} (pids: ${pids.replace(/\n/g, ' ')})`)
     execSync(`kill ${pids.replace(/\n/g, ' ')} 2>/dev/null || true`, { stdio: 'ignore' })
   } catch {
-    // lsof/kill unavailable (non-macOS/linux?) — skip; --strictPort will error if occupied
+    // lsof/kill unavailable - skip; --strictPort will fail visibly if occupied.
   }
 }
 
@@ -93,13 +92,13 @@ const spawnBackgroundProcess = (command, args, options) => {
   return child
 }
 
-export const startSmokeDevServer = ({ port, localAssetFixtureDir, eagleMockPort, apiMode = 'dev-middleware' }) => {
+export const startSmokeDevServer = ({ port, localAssetFixtureDir, eagleMockPort, bffPort }) => {
   killStaleDevServer(port)
   return spawnBackgroundProcess('npm', ['run', 'dev', '--', '--host', '127.0.0.1', '--port', String(port), '--strictPort'], {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: {
       ...process.env,
-      MIVO_API_MODE: apiMode,
+      MIVO_PORT: String(bffPort),
       MIVO_ASSET_DIR: localAssetFixtureDir,
       MIVO_EAGLE_API_URL: `http://127.0.0.1:${eagleMockPort}`,
       MIVO_DEBUG_LOG_DIR: path.resolve('test-artifacts/debug-logs'),
@@ -116,14 +115,14 @@ export const startSmokeBffServer = ({
   debugViewToken,
   enableLocalAssets,
   enableEagleProxy,
+  isPublic = true,
 }) =>
   spawnBackgroundProcess('npm', ['run', 'start:server'], {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: {
       ...process.env,
       MIVO_PORT: String(port),
-      MIVO_PUBLIC: '1',
-      MIVO_BFF_TOKEN: bffToken,
+      ...(isPublic ? { MIVO_PUBLIC: '1', MIVO_BFF_TOKEN: bffToken } : {}),
       MIVO_ASSET_DIR: localAssetFixtureDir,
       MIVO_EAGLE_API_URL: `http://127.0.0.1:${eagleMockPort}`,
       MIVO_DEBUG_LOG_DIR: path.resolve('test-artifacts/debug-logs'),
@@ -141,39 +140,46 @@ export const startSmokeBffServer = ({
     },
   })
 
-const killChildTree = (server, signal) => {
-  if (!server?.pid || process.platform === 'win32') return
-  spawnSync('pkill', [`-${signal}`, '-P', String(server.pid)], { stdio: 'ignore' })
+const killChildTree = (proc, signal) => {
+  if (!proc?.pid || process.platform === 'win32') return
+  spawnSync('pkill', [`-${signal}`, '-P', String(proc.pid)], { stdio: 'ignore' })
 }
 
-export const stopSmokeDevServer = async (server) => {
-  if (!server) return
-  if (server.exitCode !== null || server.signalCode !== null) return
-
+const stopProcess = async (proc) => {
+  if (!proc || proc.exitCode !== null || proc.signalCode !== null) return
   await new Promise((resolve) => {
     const finish = () => resolve(null)
     const forceKillTimer = setTimeout(() => {
-      if (server.exitCode === null && server.signalCode === null) {
+      if (proc.exitCode === null && proc.signalCode === null) {
         try {
-          killChildTree(server, 'KILL')
-          server.kill('SIGKILL')
+          killChildTree(proc, 'KILL')
+          proc.kill('SIGKILL')
         } catch {
           finish()
         }
       }
     }, 2000)
 
-    server.once('close', () => {
+    proc.once('close', () => {
       clearTimeout(forceKillTimer)
       finish()
     })
     try {
-      killChildTree(server, 'TERM')
-      server.kill('SIGTERM')
+      killChildTree(proc, 'TERM')
+      proc.kill('SIGTERM')
     } catch {
       finish()
     }
   })
+}
+
+export const stopSmokeDevServer = async (server) => {
+  if (!server) return
+  if (server.bff || server.dev) {
+    await Promise.all([stopProcess(server.bff), stopProcess(server.dev)])
+    return
+  }
+  await stopProcess(server)
 }
 
 export const createSmokePage = async ({

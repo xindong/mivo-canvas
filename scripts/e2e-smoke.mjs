@@ -55,6 +55,7 @@ const securityPort = requestedPort
 const runtimePort = isProdTopology ? requestedPort + 1 : requestedPort
 const securityBaseUrl = createBaseUrl(securityPort)
 const baseUrl = createBaseUrl(runtimePort)
+const devBffBaseUrl = createBaseUrl(requestedPort + 1)
 const bffToken = 'e2e-token'
 const debugViewToken = 'test-token'
 const {
@@ -67,9 +68,7 @@ const {
   localAssetFixtureSvg,
 } = prepareSmokeFixtures()
 const eagleMockHandle = await startEagleMockServer({ eagleMockDir, eagleMockItem, eagleMockItemDir })
-const upstreamMockHandle = isProdTopology && !useRealUpstream
-  ? await startUpstreamMockServer({ generatedImageB64 })
-  : null
+const upstreamMockHandle = useRealUpstream ? null : await startUpstreamMockServer({ generatedImageB64 })
 const startTopologyServer = ({ activePort, debugViewToken: serverDebugViewToken, enableLocalAssets, enableEagleProxy }) =>
   isProdTopology
     ? startSmokeBffServer({
@@ -82,7 +81,22 @@ const startTopologyServer = ({ activePort, debugViewToken: serverDebugViewToken,
         enableLocalAssets,
         enableEagleProxy,
       })
-    : startSmokeDevServer({ port: activePort, localAssetFixtureDir, eagleMockPort: eagleMockHandle.port })
+    : (() => {
+        const bffPort = activePort + 1
+        const bff = startSmokeBffServer({
+          port: bffPort,
+          localAssetFixtureDir,
+          eagleMockPort: eagleMockHandle.port,
+          upstreamBaseUrl: upstreamMockHandle?.url,
+          bffToken: '',
+          debugViewToken: serverDebugViewToken,
+          enableLocalAssets,
+          enableEagleProxy,
+          isPublic: false,
+        })
+        const dev = startSmokeDevServer({ port: activePort, localAssetFixtureDir, eagleMockPort: eagleMockHandle.port, bffPort })
+        return { bff, dev }
+      })()
 
 let server
 
@@ -96,6 +110,9 @@ try {
     enableEagleProxy: !isProdTopology,
   })
   await waitForServer(isProdTopology ? `${securityBaseUrl}/healthz` : baseUrl)
+  if (!isProdTopology) {
+    await waitForServer(`${devBffBaseUrl}/healthz`)
+  }
 
   if (isProdTopology) {
     const authedFetch = async (input, init = {}) =>
@@ -129,10 +146,10 @@ try {
     await waitForServer(`${baseUrl}/healthz`)
   }
 
-  const [nodeRegistrySource, actionModelSource, viteConfigSource, modelCapabilitiesSource] = await Promise.all([
+  const [nodeRegistrySource, actionModelSource, bffConfigSource, modelCapabilitiesSource] = await Promise.all([
     readFile('src/canvas/nodeTypes/canvasNodeRegistry.ts', 'utf8'),
     readFile('src/canvas/actions/canvasActionModel.ts', 'utf8'),
-    readFile('vite.config.ts', 'utf8'),
+    readFile('server/lib/config.ts', 'utf8'),
     readFile('src/lib/modelCapabilities.ts', 'utf8'),
   ])
   for (const nodeType of [
@@ -163,12 +180,12 @@ try {
     "high: '2560x1440'",
     "high: '1440x2560'",
   ]) {
-    if (!viteConfigSource.includes(expectedSize)) {
+    if (!bffConfigSource.includes(expectedSize)) {
       throw new Error(`R3 high quality size map should include ${expectedSize}`)
     }
   }
 
-  // ⑥ 能力表双写同步（SC-3）：modelCapabilities.ts 与 vite.config.ts mivoModelRatioMap 的 gemini ratios 必须一致且无 21:9（hard fail，两端已合并）。
+  // ⑥ 能力表双写同步（SC-3）：modelCapabilities.ts 与 server/lib/config.ts mivoModelRatioMap 的 gemini ratios 必须一致且无 21:9（hard fail，两端已合并）。
   {
     // modelCapabilities.ts: 'gemini-3-pro-image': { ... ratios: ['1:1', ...] }
     const extractFromModelCaps = (source) => {
@@ -176,14 +193,14 @@ try {
       if (!match) return null
       return match[1].split(',').map((s) => s.trim().replace(/['"]/g, '')).filter(Boolean)
     }
-    // vite.config.ts mivoModelRatioMap: 'gemini-3-pro-image': ['1:1', ...]（直接数组，无 ratios 键）
+    // server/lib/config.ts mivoModelRatioMap: 'gemini-3-pro-image': ['1:1', ...]（直接数组，无 ratios 键）
     const extractFromViteMap = (source) => {
       const match = source.match(/'gemini-3-pro-image':\s*\[([^\]]*)\]/)
       if (!match) return null
       return match[1].split(',').map((s) => s.trim().replace(/['"]/g, '')).filter(Boolean)
     }
     const capsRatios = extractFromModelCaps(modelCapabilitiesSource)
-    const viteRatios = extractFromViteMap(viteConfigSource)
+    const viteRatios = extractFromViteMap(bffConfigSource)
     if (!capsRatios) throw new Error(`Could not extract gemini ratios from modelCapabilities.ts`)
     if (capsRatios.includes('21:9')) {
       throw new Error(`modelCapabilities gemini must not have 21:9, got ${JSON.stringify(capsRatios)}`)
