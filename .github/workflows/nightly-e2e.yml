@@ -64,9 +64,29 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  real-upstream-gate:
+    name: real upstream gate
+    runs-on: ubuntu-latest
+    outputs:
+      has_secrets: ${{ steps.gate.outputs.has_secrets }}
+    steps:
+      - name: Check required secrets
+        id: gate
+        env:
+          MIVO_IMAGE_API_KEY: ${{ secrets.MIVO_IMAGE_API_KEY }}
+          MIVO_LLM_API_KEY: ${{ secrets.MIVO_LLM_API_KEY }}
+        run: |
+          if [ -n "$MIVO_IMAGE_API_KEY" ] && [ -n "$MIVO_LLM_API_KEY" ]; then
+            echo "has_secrets=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_secrets=false" >> "$GITHUB_OUTPUT"
+            echo "Missing real-upstream secrets; placeholder job will be skipped."
+          fi
+
   real-upstream-placeholder:
     name: real upstream auth chain (placeholder)
-    if: ${{ secrets.MIVO_IMAGE_API_KEY != '' && secrets.MIVO_LLM_API_KEY != '' }}
+    needs: real-upstream-gate
+    if: ${{ needs.real-upstream-gate.outputs.has_secrets == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 12
     env:
