@@ -92,6 +92,9 @@ export const startSmokeDevServer = ({ port, localAssetFixtureDir, eagleMockPort,
       MIVO_ASSET_DIR: localAssetFixtureDir,
       MIVO_EAGLE_API_URL: `http://127.0.0.1:${eagleMockPort}`,
       MIVO_DEBUG_LOG_DIR: path.resolve('test-artifacts/debug-logs'),
+      // P2-C1b: fast task polling so the progressive /tasks/:id mock (10→30→60→
+      // done) completes in ~150ms instead of 3s, keeping chat-generation fast.
+      VITE_MIVO_TASK_POLL_INTERVAL_MS: '50',
     },
   })
 }

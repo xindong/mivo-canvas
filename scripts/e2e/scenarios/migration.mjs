@@ -17,11 +17,21 @@ export const runMigrationScenario = async (context) => {
     }
     const migrationPage = await migrationContext.newPage()
     try {
-      await migrationPage.route('**/api/mivo/generate', async (route) => {
-        await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }) })
-      })
-      await migrationPage.route('**/api/mivo/edit', async (route) => {
-        await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }) })
+      await migrationPage.route('**/api/mivo/tasks/**', async (route) => {
+        const method = route.request().method()
+        if (method === 'POST') {
+          await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ taskId: 'task-e2e' }) })
+          return
+        }
+        if (method === 'GET') {
+          await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ id: 'task-e2e', kind: 'generate', status: 'done', progress: 100, stage: 'done', requestId: 'e2e-mig', model: 'gpt-image-2', result: { images: [{ b64: generatedImageB64 }] } }) })
+          return
+        }
+        if (method === 'DELETE') {
+          await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ id: 'task-e2e', status: 'canceled' }) })
+          return
+        }
+        await route.continue()
       })
       await migrationPage.route('**/api/mivo/enhance', async (route) => {
         await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ mode: 'generate', scene: 'general', reasoning: 'e2e', richPrompt: 'e2e derived', imgRatio: '1:1', quality: 'medium', enhanced: true }) })

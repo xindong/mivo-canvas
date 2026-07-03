@@ -87,6 +87,9 @@ export const runMaskScenario = async (context) => {
     const beforeSourceEditEdges = before.edges.filter((edge) => edge.from === sourceNodeId && edge.type === 'edit').length
     const editRequestCountBefore = mivoEditRequests.length
     await page.locator('.image-mask-edit-prompt textarea').fill(`E2E ${sourceLabel} ${toolId} repaint`)
+    // P2-C1b: the mask-edit path (MivoCanvas submitMaskEdit) still uses the sync
+    // /api/mivo/edit route (out of generationSlice scope); wait for its 200. The
+    // substring '/api/mivo/edit' does not match '/api/mivo/tasks/edit'.
     const editResponse = page.waitForResponse((response) => response.url().includes('/api/mivo/edit') && response.status() === 200)
     await page.locator('.image-mask-edit-prompt').getByRole('button', { name: '局部重绘' }).click()
     await editResponse
