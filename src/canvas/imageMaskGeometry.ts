@@ -6,7 +6,6 @@ export type ImageMaskPoint = {
 }
 
 export type ImageMaskRegion =
-  | { type: 'point'; center: ImageMaskPoint; radius: number }
   | { type: 'box'; x: number; y: number; width: number; height: number }
   | { type: 'brush'; points: ImageMaskPoint[]; radius: number }
 
@@ -19,7 +18,7 @@ export type ImageMaskBounds = {
 
 export type ImageMaskSubmitPayload = {
   prompt: string
-  mask: Blob
+  mask?: Blob
   maskBounds?: ImageMaskBounds
   sourceSize: { width: number; height: number }
 }
@@ -127,14 +126,6 @@ export const boundsForRegions = (
   if (!regions.length) return undefined
 
   const bounds = regions.map((region): ImageMaskBounds | undefined => {
-    if (region.type === 'point') {
-      return {
-        x: region.center.x - region.radius,
-        y: region.center.y - region.radius,
-        width: region.radius * 2,
-        height: region.radius * 2,
-      }
-    }
     if (region.type === 'box') return region
     if (!region.points.length) return undefined
 
@@ -157,11 +148,6 @@ export const boundsForRegions = (
 
 const drawRegion = (context: CanvasRenderingContext2D, region: ImageMaskRegion) => {
   context.beginPath()
-  if (region.type === 'point') {
-    context.arc(region.center.x, region.center.y, region.radius, 0, Math.PI * 2)
-    context.fill()
-    return
-  }
   if (region.type === 'box') {
     context.fillRect(region.x, region.y, region.width, region.height)
     return

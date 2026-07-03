@@ -17,11 +17,11 @@ import { canImportCanvasFile, importFilesToCanvas, importImageUrlToCanvas } from
 import { readCanvasImageBlob } from '../lib/canvasImageSource'
 import { editMivoImage } from '../lib/mivoImageClient'
 import { useCanvasStore } from '../store/canvasStore'
+import { useChatStore } from '../store/chatStore'
 import { brushCursorCssFor } from './brushCursors'
 import { brushOutlinePathFor, highlighterOpacity } from './brushGeometry'
 import { BrushOptionsBar } from './BrushOptionsBar'
 import { CanvasContextMenu } from './CanvasContextMenu'
-import { CanvasAiActionBar } from './CanvasAiActionBar'
 import { CanvasNodeView } from './CanvasNodeView'
 import { CanvasToolDock } from './CanvasToolDock'
 import { ImageCropOverlay, type ImageCropBox } from './ImageCropOverlay'
@@ -114,7 +114,6 @@ const isNodeEffectivelyLocked = (nodeId: string, nodes: Array<{ id: string; type
 
 export function MivoCanvas({
   onOpenDetails,
-  onOpenGeneratePanel,
   onRegisterExternalAssetDrop,
   onMaskEditActiveChange,
   maskCancelRequestId = 0,
@@ -149,7 +148,6 @@ export function MivoCanvas({
   const visibleNodes = useMemo(() => nodes.filter((node) => !node.hidden), [nodes])
   const contextMenuNode =
     contextMenu?.kind === 'node' ? visibleNodes.find((node) => node.id === contextMenuNodeId) : undefined
-  const selectedNode = selectedNodeId ? visibleNodes.find((node) => node.id === selectedNodeId) : undefined
   const cropNode = cropNodeId ? visibleNodes.find((node) => node.id === cropNodeId && node.type === 'image') : undefined
   const closeContextMenu = useCallback(() => setContextMenu(null), [])
   const cancelMaskEdit = useCallback(() => {
@@ -315,7 +313,10 @@ export function MivoCanvas({
 
   const submitMaskEdit = useCallback(
     async (nodeId: string, resolvedAssetUrl: string, payload: ImageMaskSubmitPayload) => {
-      const source = useCanvasStore.getState().nodes.find((node) => node.id === nodeId && node.type === 'image' && !node.hidden)
+      const targetSceneId = sceneId
+      const source = useCanvasStore
+        .getState()
+        .canvases[targetSceneId]?.nodes.find((node) => node.id === nodeId && node.type === 'image' && !node.hidden)
       if (!source) throw new Error('Source image not found')
 
       setMaskEditSubmittingNodeId(nodeId)
@@ -333,16 +334,39 @@ export function MivoCanvas({
           model: 'gpt-image-2',
           signal: abortController.signal,
         })
-        await commitGenerationResult({
+        const nodeIds = await commitGenerationResult({
+          sceneId: targetSceneId,
           sourceNodeId: source.id,
           resultImages: response.images,
           prompt: payload.prompt,
           model: 'gpt-image-2',
           kind: 'edit',
+          createDerivationEdge: true,
           maskBounds: payload.maskBounds,
           placement: 'right',
         })
+        const latestCanvasState = useCanvasStore.getState()
+        useChatStore.getState().appendNotice({ sceneId: targetSceneId, origin: 'mask-edit', nodeIds, prompt: payload.prompt })
+        if (latestCanvasState.sceneId !== targetSceneId) {
+          const title = latestCanvasState.canvases[targetSceneId]?.title || targetSceneId
+          useChatStore.getState().appendNotice({
+            sceneId: latestCanvasState.sceneId,
+            origin: 'mask-edit',
+            prompt: `结果已生成到画布 ${title}`,
+          })
+        }
         setMaskEditNodeId(undefined)
+      } catch (error) {
+        const latestCanvasState = useCanvasStore.getState()
+        if (latestCanvasState.sceneId !== targetSceneId) {
+          const message = error instanceof Error ? error.message : '局部重绘失败'
+          useChatStore.getState().appendNotice({
+            sceneId: latestCanvasState.sceneId,
+            origin: 'mask-edit',
+            prompt: `局部重绘失败：${message}`,
+          })
+        }
+        throw error
       } finally {
         if (maskEditAbortRef.current === abortController) {
           maskEditAbortRef.current = null
@@ -350,7 +374,7 @@ export function MivoCanvas({
         setMaskEditSubmittingNodeId(undefined)
       }
     },
-    [commitGenerationResult],
+    [commitGenerationResult, sceneId],
   )
 
   const downloadOriginal = useCallback((node?: typeof contextMenuNode) => {
@@ -596,13 +620,9 @@ export function MivoCanvas({
       }}
     >
       <div className="canvas-host" ref={hostRef} />
-      <CanvasToolDock previewTool={temporaryTool === 'hand' ? 'hand' : undefined} />
-      <CanvasAiActionBar
-        selectedNode={selectedNode}
-        maskEditActive={Boolean(maskEditNodeId)}
-        onOpenGeneratePanel={onOpenGeneratePanel || (() => undefined)}
+      <CanvasToolDock
+        previewTool={temporaryTool === 'hand' ? 'hand' : undefined}
         onStartMaskEdit={beginMaskEdit}
-        onCancelMaskEdit={cancelMaskEdit}
       />
       {storeActiveTool === 'markup-brush' && !temporaryTool ? <BrushOptionsBar /> : null}
       {storeActiveTool === 'stamp' && !temporaryTool ? <StampOptionsBar /> : null}
@@ -914,7 +934,10 @@ export function MivoCanvas({
       ) : null}
       {visibleNodes.length === 0 ? (
         <div className="empty-canvas-note">
-          <span>空画布</span>
+          <span>
+            <strong>空画布</strong>
+            <em>从右侧 AI 对话生成，或把素材拖到这里</em>
+          </span>
         </div>
       ) : null}
       <div className="canvas-controls" aria-label="Canvas zoom controls">

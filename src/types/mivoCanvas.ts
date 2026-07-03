@@ -95,7 +95,7 @@ export type CanvasEdge = {
   createdAt: number
 }
 export type AiWorkflowKind = 'slot' | 'annotation' | 'result'
-export type AiWorkflowStatus = 'empty' | 'queued' | 'generating' | 'ready' | 'failed'
+export type AiWorkflowStatus = 'empty' | 'queued' | 'generating' | 'ready' | 'failed' | 'canceled'
 export type AiWorkflowOperation =
   | 'slot-generation'
   | 'beside-generation'
@@ -347,7 +347,7 @@ export type AiCanvasContextSnapshot = {
 export type CanvasTask = {
   id: string
   label: string
-  status: 'running' | 'queued' | 'failed' | 'done'
+  status: 'running' | 'queued' | 'failed' | 'done' | 'canceled'
   progress: number
   nodeIds: string[]
 }

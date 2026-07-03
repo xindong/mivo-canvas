@@ -455,6 +455,32 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }: 
   }, [loadEagleAssets, loadEagleTags, loadLocalAssets, loadPinterestStatus])
 
   useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setSelectedAssetIds((current) => {
+        const visibleIds = new Set(filteredAssets.map((asset) => asset.id))
+        const nextIds = current.filter((assetId) => visibleIds.has(assetId))
+        return nextIds.length === current.length ? current : nextIds
+      })
+    }, 0)
+
+    return () => window.clearTimeout(timer)
+  }, [filteredAssets])
+
+  useEffect(() => {
+    if (!selectedEagleTag || eagleLoadState !== 'ready') return
+    if (!activeEagleTags.some((tag) => tagMatches(tag.name, selectedEagleTag))) {
+      const timer = window.setTimeout(() => setSelectedEagleTag(undefined), 0)
+      return () => window.clearTimeout(timer)
+    }
+  }, [activeEagleTags, eagleLoadState, selectedEagleTag])
+
+  useEffect(() => {
+    if (!previewAsset) return
+    const timer = window.setTimeout(() => setPreviewImageState('loading'), 0)
+    return () => window.clearTimeout(timer)
+  }, [previewAsset])
+
+  useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return
       if (previewAsset) {
