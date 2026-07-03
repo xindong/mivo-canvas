@@ -28,7 +28,7 @@ import {
   stopSmokeDevServer,
 } from './e2e/harness.mjs'
 
-const port = Number(process.env.MIVO_E2E_PORT ?? 5174)
+const requestedPort = Number(process.env.MIVO_E2E_PORT ?? 5174)
 const cliArgs = process.argv.slice(2)
 const resolveTopology = (argv) => {
   for (let index = 0; index < argv.length; index += 1) {
@@ -51,7 +51,10 @@ const topology = resolveTopology(cliArgs)
 const isProdTopology = topology === 'prod'
 const useRealUpstream = process.env.MIVO_E2E_USE_REAL_UPSTREAM === '1'
 const disableApiRouteMocks = process.env.MIVO_E2E_DISABLE_API_ROUTE_MOCKS === '1'
-const baseUrl = createBaseUrl(port)
+const securityPort = requestedPort
+const runtimePort = isProdTopology ? requestedPort + 1 : requestedPort
+const securityBaseUrl = createBaseUrl(securityPort)
+const baseUrl = createBaseUrl(runtimePort)
 const bffToken = 'e2e-token'
 const debugViewToken = 'test-token'
 const {
@@ -67,10 +70,10 @@ const eagleMockHandle = await startEagleMockServer({ eagleMockDir, eagleMockItem
 const upstreamMockHandle = isProdTopology && !useRealUpstream
   ? await startUpstreamMockServer({ generatedImageB64 })
   : null
-const startTopologyServer = ({ debugViewToken: serverDebugViewToken, enableLocalAssets, enableEagleProxy }) =>
+const startTopologyServer = ({ activePort, debugViewToken: serverDebugViewToken, enableLocalAssets, enableEagleProxy }) =>
   isProdTopology
     ? startSmokeBffServer({
-        port,
+        port: activePort,
         localAssetFixtureDir,
         eagleMockPort: eagleMockHandle.port,
         upstreamBaseUrl: upstreamMockHandle?.url,
@@ -79,7 +82,7 @@ const startTopologyServer = ({ debugViewToken: serverDebugViewToken, enableLocal
         enableLocalAssets,
         enableEagleProxy,
       })
-    : startSmokeDevServer({ port, localAssetFixtureDir, eagleMockPort: eagleMockHandle.port })
+    : startSmokeDevServer({ port: activePort, localAssetFixtureDir, eagleMockPort: eagleMockHandle.port })
 
 let server
 
@@ -87,11 +90,12 @@ try {
   await prepareSmokeArtifacts()
   await runCommand('npm', ['run', 'verify:logging'])
   server = startTopologyServer({
+    activePort: securityPort,
     debugViewToken: '',
     enableLocalAssets: !isProdTopology,
     enableEagleProxy: !isProdTopology,
   })
-  await waitForServer(isProdTopology ? `${baseUrl}/healthz` : baseUrl)
+  await waitForServer(isProdTopology ? `${securityBaseUrl}/healthz` : baseUrl)
 
   if (isProdTopology) {
     const authedFetch = async (input, init = {}) =>
@@ -102,21 +106,22 @@ try {
           ...(init.headers || {}),
         },
       })
-    await assertProdPublicRestrictions({ baseUrl, authedFetch })
+    await assertProdPublicRestrictions({ baseUrl: securityBaseUrl, authedFetch })
 
     const nakedRequestPage = await createSmokePage({
-      baseUrl,
+      baseUrl: securityBaseUrl,
       generatedImageB64,
       enableApiRouteMocks: false,
     })
     try {
-      await assertProdUnauthorizedGate({ requestContext: nakedRequestPage.page.request, baseUrl })
+      await assertProdUnauthorizedGate({ requestContext: nakedRequestPage.page.request, baseUrl: securityBaseUrl })
     } finally {
       await nakedRequestPage.browser.close()
     }
 
     await stopSmokeDevServer(server)
     server = startTopologyServer({
+      activePort: runtimePort,
       debugViewToken,
       enableLocalAssets: true,
       enableEagleProxy: true,

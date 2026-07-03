@@ -34,8 +34,11 @@ const parseMode = (argv) => {
 
 const mode = parseMode(process.argv.slice(2))
 const useRealUpstream = process.env.MIVO_E2E_USE_REAL_UPSTREAM === '1'
-const port = Number(process.env.MIVO_E2E_PORT ?? 7174)
-const baseUrl = createBaseUrl(port)
+const requestedPort = Number(process.env.MIVO_E2E_PORT ?? 7174)
+const securityPort = requestedPort
+const runtimePort = requestedPort + 1
+const securityBaseUrl = createBaseUrl(securityPort)
+const baseUrl = createBaseUrl(runtimePort)
 const bffToken = 'e2e-token'
 const debugViewToken = 'test-token'
 const {
@@ -53,9 +56,9 @@ const upstreamMockHandle = useRealUpstream ? null : await startUpstreamMockServe
 let server
 let smokePage
 
-const launchServer = ({ enableLocalAssets, enableEagleProxy, debugViewToken: activeDebugViewToken }) =>
+const launchServer = ({ activePort, enableLocalAssets, enableEagleProxy, debugViewToken: activeDebugViewToken }) =>
   startSmokeBffServer({
-    port,
+    port: activePort,
     localAssetFixtureDir,
     eagleMockPort: eagleMockHandle.port,
     upstreamBaseUrl: upstreamMockHandle?.url,
@@ -68,11 +71,12 @@ const launchServer = ({ enableLocalAssets, enableEagleProxy, debugViewToken: act
 try {
   await prepareSmokeArtifacts()
   server = launchServer({
+    activePort: securityPort,
     debugViewToken: '',
     enableLocalAssets: false,
     enableEagleProxy: false,
   })
-  await waitForServer(`${baseUrl}/healthz`)
+  await waitForServer(`${securityBaseUrl}/healthz`)
 
   if (mode === 'unauthorized') {
     const authedFetch = async (input, init = {}) =>
@@ -84,17 +88,18 @@ try {
         },
       })
 
-    await assertProdPublicRestrictions({ baseUrl, authedFetch })
+    await assertProdPublicRestrictions({ baseUrl: securityBaseUrl, authedFetch })
 
     smokePage = await createSmokePage({
-      baseUrl,
+      baseUrl: securityBaseUrl,
       generatedImageB64,
       enableApiRouteMocks: false,
     })
-    await assertProdUnauthorizedGate({ requestContext: smokePage.page.request, baseUrl })
+    await assertProdUnauthorizedGate({ requestContext: smokePage.page.request, baseUrl: securityBaseUrl })
   } else {
     await stopSmokeDevServer(server)
     server = launchServer({
+      activePort: runtimePort,
       debugViewToken,
       enableLocalAssets: true,
       enableEagleProxy: true,

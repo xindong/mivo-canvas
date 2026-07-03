@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import path from 'node:path'
 import { mkdir, rm } from 'node:fs/promises'
 import { chromium } from 'playwright'
@@ -67,8 +67,19 @@ export const runCommand = (command, args) =>
     })
   })
 
+const spawnBackgroundProcess = (command, args, options) => {
+  const child = spawn(command, args, options)
+  child.stdout?.on('data', (chunk) => {
+    process.stdout.write(chunk)
+  })
+  child.stderr?.on('data', (chunk) => {
+    process.stderr.write(chunk)
+  })
+  return child
+}
+
 export const startSmokeDevServer = ({ port, localAssetFixtureDir, eagleMockPort, apiMode = 'dev-middleware' }) =>
-  spawn('npm', ['run', 'dev', '--', '--host', '127.0.0.1', '--port', String(port), '--strictPort'], {
+  spawnBackgroundProcess('npm', ['run', 'dev', '--', '--host', '127.0.0.1', '--port', String(port), '--strictPort'], {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: {
       ...process.env,
@@ -89,7 +100,7 @@ export const startSmokeBffServer = ({
   enableLocalAssets,
   enableEagleProxy,
 }) =>
-  spawn('npm', ['run', 'start:server'], {
+  spawnBackgroundProcess('npm', ['run', 'start:server'], {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: {
       ...process.env,
@@ -113,6 +124,11 @@ export const startSmokeBffServer = ({
     },
   })
 
+const killChildTree = (server, signal) => {
+  if (!server?.pid || process.platform === 'win32') return
+  spawnSync('pkill', [`-${signal}`, '-P', String(server.pid)], { stdio: 'ignore' })
+}
+
 export const stopSmokeDevServer = async (server) => {
   if (!server) return
   if (server.exitCode !== null || server.signalCode !== null) return
@@ -121,7 +137,12 @@ export const stopSmokeDevServer = async (server) => {
     const finish = () => resolve(null)
     const forceKillTimer = setTimeout(() => {
       if (server.exitCode === null && server.signalCode === null) {
-        server.kill('SIGKILL')
+        try {
+          killChildTree(server, 'KILL')
+          server.kill('SIGKILL')
+        } catch {
+          finish()
+        }
       }
     }, 2000)
 
@@ -129,7 +150,12 @@ export const stopSmokeDevServer = async (server) => {
       clearTimeout(forceKillTimer)
       finish()
     })
-    server.kill('SIGTERM')
+    try {
+      killChildTree(server, 'TERM')
+      server.kill('SIGTERM')
+    } catch {
+      finish()
+    }
   })
 }
 
