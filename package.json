@@ -11,11 +11,14 @@
     "debug:server": "node scripts/debug-log-server.mjs",
     "test:unit": "vitest run",
     "verify:logging": "node scripts/verify-debug-logging.mjs",
-    "test:e2e": "node scripts/e2e-smoke.mjs"
+    "test:e2e": "node scripts/e2e-smoke.mjs",
+    "start:server": "tsx server/index.ts"
   },
   "dependencies": {
+    "@hono/node-server": "^1.19.14",
     "@leafer-in/editor": "^2.1.7",
     "@leafer-in/view": "^2.1.7",
+    "hono": "^4.12.27",
     "leafer-ui": "^2.1.7",
     "lucide-react": "^1.21.0",
     "perfect-freehand": "^1.2.3",
@@ -36,6 +39,7 @@
     "eslint-plugin-react-refresh": "^0.5.2",
     "globals": "^17.6.0",
     "playwright": "^1.61.0",
+    "tsx": "^4.23.0",
     "typescript": "~6.0.2",
     "typescript-eslint": "^8.59.2",
     "vite": "^8.0.12",
