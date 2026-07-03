@@ -34,11 +34,10 @@ type UseCanvasInteractionControllerOptions = {
   onCloseContextMenu: () => void
 }
 
-// Thin assembly shell over the extracted interaction hooks (F7 split):
-// useViewport / useMarqueeSelection / useNodeTransform / useGroupTransform /
-// useTextAnnotation / useBrushStamp / useGlobalCanvasEvents. Owns only the
-// shared interaction state (snap guides, drop targets, editing text, temp tool)
-// + the dispatcher that fans pointer events out to the hooks.
+// Thin assembly shell over the extracted interaction hooks (F7 split). Hook
+// returns are destructured to bare stable callbacks so React.memo on
+// CanvasNodeView actually skips unchanged nodes (object deps would recreate
+// the callbacks every render and defeat the memo).
 export function useCanvasInteractionController({
   shellRef, sceneId, nodes, selectedNodeIds, maskEditNodeId, onCancelMaskEdit, onCloseContextMenu,
 }: UseCanvasInteractionControllerOptions) {
@@ -64,7 +63,11 @@ export function useCanvasInteractionController({
     return nodes.filter((node) => selectedNodeSet.has(node.id))
   }, [nodes, selectedNodeIds])
 
-  const viewport = useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseContextMenu })
+  const {
+    viewport: viewportState, viewportRef, isPanning, screenToCanvas, viewportCenter, zoomBy,
+    fit, fitAll, fitSelection, resetView, handleWheel, startPan, tryMovePan, tryEndPan, resetPan,
+    resetViewportForScene,
+  } = useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseContextMenu })
 
   const discardEmptyEditingText = useCallback((nodeId = editingTextNodeId) => {
     if (!nodeId) return
@@ -73,9 +76,6 @@ export function useCanvasInteractionController({
     setEditingTextNodeId((current) => (current === nodeId ? undefined : current))
   }, [deleteNode, editingTextNodeId])
 
-  // Shared interaction-start cleanup (the 6 calls inlined across every begin*
-  // that originally had them). Bundled here for the extracted hooks; behavior
-  // identical — same calls, same order, React-batched.
   const startInteraction = useCallback(() => {
     onCloseContextMenu()
     discardEmptyEditingText()
@@ -99,44 +99,60 @@ export function useCanvasInteractionController({
     return true
   }, [captureHistory, onCloseContextMenu, selectNode])
 
-  const marquee = useMarqueeSelection({
-    screenToCanvas: viewport.screenToCanvas, startInteraction, selectNode, selectNodes, nodes, selectedNodeIds,
+  const {
+    selectionBox, beginSelection, clearSelection, tryMoveSelection, tryEndSelection, resetMarquee,
+  } = useMarqueeSelection({ screenToCanvas, startInteraction, selectNode, selectNodes, nodes, selectedNodeIds })
+
+  const {
+    stampPlacementPreview, beginStampPlacement, beginEraserDrag, tryMoveEraser, tryMoveStamp,
+    tryEndEraser, tryEndStamp, resetBrushStamp,
+  } = useBrushStamp({
+    screenToCanvas, viewportRef, onCloseContextMenu, discardEmptyEditingText, setEditingTextNodeId,
+    setSnapGuides, clearSelection,
   })
-  const brush = useBrushStamp({
-    screenToCanvas: viewport.screenToCanvas, viewportRef: viewport.viewportRef, onCloseContextMenu,
-    discardEmptyEditingText, setEditingTextNodeId, setSnapGuides, clearSelection: marquee.clearSelection,
+
+  const {
+    markupCreationBox, activeTextCreationRect, activeFrameCreationRect,
+    activeMarkupCreationRect, beginTextEdit, beginTextBox, beginMarkupPointMove, beginFrameBox,
+    beginMarkupBox, updateEditingText, beginTextResize, finishTextEditing,
+    tryMoveTextCreation, tryMoveFrameCreation, tryMoveMarkupCreation, tryMoveMarkupPointTransform,
+    tryMoveTextResize, tryEndTextCreation, tryEndFrameCreation, tryEndMarkupCreation,
+    tryEndMarkupPointTransform, tryEndTextResize, resetTextAnnotation,
+  } = useTextAnnotation({
+    screenToCanvas, viewportRef, onCloseContextMenu, discardEmptyEditingText, setEditingTextNodeId,
+    setSnapGuides, setActiveConnectorDropTargetId, clearSelection, selectNode, editTextNode,
+    beginEraserDrag, setActiveTool, nodes,
   })
-  const text = useTextAnnotation({
-    screenToCanvas: viewport.screenToCanvas, viewportRef: viewport.viewportRef, onCloseContextMenu,
-    discardEmptyEditingText, setEditingTextNodeId, setSnapGuides, setActiveConnectorDropTargetId,
-    clearSelection: marquee.clearSelection, selectNode, editTextNode, beginEraserDrag: brush.beginEraserDrag,
-    setActiveTool, nodes,
-  })
-  const nodeTransform = useNodeTransform({
-    viewportRef: viewport.viewportRef, startInteraction, clearSelection: marquee.clearSelection,
-    selectNode, selectNodes, captureHistory, updateSelectedNodesPosition, updateNodeGeometry,
-    setSnapGuides, setActiveSectionDropTargetId, setActiveConnectorDropTargetId,
-    editTextNode, nodes, selectedNodeIds,
+
+  const {
+    beginNodeMove, startNodeResize, tryMoveNodeTransform, tryEndNodeTransform, resetNodeTransform,
+  } = useNodeTransform({
+    viewportRef, startInteraction, clearSelection, selectNode, selectNodes, captureHistory,
+    updateSelectedNodesPosition, updateNodeGeometry, setSnapGuides, setActiveSectionDropTargetId,
+    setActiveConnectorDropTargetId, editTextNode, nodes, selectedNodeIds,
   })
 
   const selectedBounds = selectedNodes.length > 1 ? boundsForNodes(selectedNodes) : undefined
   const showGroupSelectionBounds =
-    interactionMode === 'select' && !marquee.selectionBox && Boolean(selectedBounds) &&
+    interactionMode === 'select' && !selectionBox && Boolean(selectedBounds) &&
     selectedNodes.some((node) => !isNodeEffectivelyLocked(node, nodes))
   const selectionSpacingHandles = useMemo(
     () =>
       showGroupSelectionBounds
         ? smartSelectionHandlesFor(selectedNodes, {
             isEffectivelyLocked: (node) => isNodeEffectivelyLocked(node, nodes),
-            viewportScale: viewport.viewport.scale,
+            viewportScale: viewportState.scale,
           })
         : [],
-    [nodes, selectedNodes, showGroupSelectionBounds, viewport.viewport.scale],
+    [nodes, selectedNodes, showGroupSelectionBounds, viewportState.scale],
   )
 
-  const group = useGroupTransform({
-    selectedBounds, selectedNodes, nodes, viewportRef: viewport.viewportRef,
-    startInteraction, captureHistory, updateNodesGeometry, setSnapGuides,
+  const {
+    beginGroupResize, beginSelectionSpacingDrag, tryMoveGroupResize, tryMoveSpacing,
+    tryEndGroupResize, tryEndSpacing, resetGroupTransform,
+  } = useGroupTransform({
+    selectedBounds, selectedNodes, nodes, viewportRef, startInteraction, captureHistory,
+    updateNodesGeometry, setSnapGuides,
   })
 
   const beginPan = useCallback((event: ReactPointerEvent<HTMLElement>, options?: { clearSelection?: boolean }) => {
@@ -144,22 +160,22 @@ export function useCanvasInteractionController({
     event.preventDefault()
     event.currentTarget.setPointerCapture(event.pointerId)
     startInteraction()
-    marquee.clearSelection()
-    viewport.startPan(event)
+    clearSelection()
+    startPan(event)
     if (options?.clearSelection) selectNode(undefined)
-  }, [marquee, selectNode, startInteraction, viewport])
+  }, [clearSelection, selectNode, startInteraction, startPan])
 
   const toolHandlerContext = useMemo<CanvasToolHandlerContext>(() => ({
     beginPan,
-    beginSelection: marquee.beginSelection,
-    beginNodeMove: nodeTransform.beginNodeMove,
-    beginNodeResize: nodeTransform.startNodeResize,
-    beginTextBox: text.beginTextBox,
-    beginFrameBox: text.beginFrameBox,
-    beginMarkupBox: text.beginMarkupBox,
-    beginStampPlacement: brush.beginStampPlacement,
-    beginTextEdit: text.beginTextEdit,
-  }), [beginPan, brush, marquee, nodeTransform, text])
+    beginSelection,
+    beginNodeMove,
+    beginNodeResize: startNodeResize,
+    beginTextBox,
+    beginFrameBox,
+    beginMarkupBox,
+    beginStampPlacement,
+    beginTextEdit,
+  }), [beginFrameBox, beginMarkupBox, beginNodeMove, beginPan, beginSelection, beginStampPlacement, beginTextBox, beginTextEdit, startNodeResize])
 
   const beginNodePointerDown = useCallback(
     (nodeId: string, event: ReactPointerEvent<HTMLDivElement>) => {
@@ -177,54 +193,44 @@ export function useCanvasInteractionController({
   // Dispatcher: fan pointer events out to the hook tryMove/tryEnd handlers in
   // the original if-chain order. Each hook owns its ref + branch logic.
   const handleCanvasPointerMove = useCallback((event: ReactPointerEvent<HTMLElement>) => {
-    if (group.tryMoveGroupResize(event)) return
-    if (brush.tryMoveEraser(event)) return
-    if (brush.tryMoveStamp(event)) return
-    if (group.tryMoveSpacing(event)) return
-    if (text.tryMoveTextCreation(event)) return
-    if (text.tryMoveFrameCreation(event)) return
-    if (text.tryMoveMarkupCreation(event)) return
-    if (nodeTransform.tryMoveNodeTransform(event)) return
-    if (text.tryMoveMarkupPointTransform(event)) return
-    if (text.tryMoveTextResize(event)) return
-    if (viewport.tryMovePan(event)) return
-    marquee.tryMoveSelection(event)
-  }, [brush, group, marquee, nodeTransform, text, viewport])
+    if (tryMoveGroupResize(event)) return
+    if (tryMoveEraser(event)) return
+    if (tryMoveStamp(event)) return
+    if (tryMoveSpacing(event)) return
+    if (tryMoveTextCreation(event)) return
+    if (tryMoveFrameCreation(event)) return
+    if (tryMoveMarkupCreation(event)) return
+    if (tryMoveNodeTransform(event)) return
+    if (tryMoveMarkupPointTransform(event)) return
+    if (tryMoveTextResize(event)) return
+    if (tryMovePan(event)) return
+    tryMoveSelection(event)
+  }, [tryMoveEraser, tryMoveFrameCreation, tryMoveGroupResize, tryMoveMarkupCreation, tryMoveMarkupPointTransform, tryMoveNodeTransform, tryMovePan, tryMoveSelection, tryMoveSpacing, tryMoveStamp, tryMoveTextCreation, tryMoveTextResize])
 
   const handleCanvasPointerEnd = useCallback((event: ReactPointerEvent<HTMLElement>) => {
-    group.tryEndGroupResize(event)
-    group.tryEndSpacing(event)
-    text.tryEndTextCreation(event)
-    text.tryEndFrameCreation(event)
-    text.tryEndMarkupCreation(event)
-    nodeTransform.tryEndNodeTransform(event)
-    text.tryEndTextResize(event)
-    text.tryEndMarkupPointTransform(event)
-    brush.tryEndEraser(event)
-    brush.tryEndStamp(event)
-    viewport.tryEndPan(event)
-    marquee.tryEndSelection(event)
-  }, [brush, group, marquee, nodeTransform, text, viewport])
+    tryEndGroupResize(event)
+    tryEndSpacing(event)
+    tryEndTextCreation(event)
+    tryEndFrameCreation(event)
+    tryEndMarkupCreation(event)
+    tryEndNodeTransform(event)
+    tryEndTextResize(event)
+    tryEndMarkupPointTransform(event)
+    tryEndEraser(event)
+    tryEndStamp(event)
+    tryEndPan(event)
+    tryEndSelection(event)
+  }, [tryEndEraser, tryEndFrameCreation, tryEndGroupResize, tryEndMarkupCreation, tryEndMarkupPointTransform, tryEndNodeTransform, tryEndPan, tryEndSelection, tryEndSpacing, tryEndStamp, tryEndTextCreation, tryEndTextResize])
 
   useGlobalCanvasEvents({
     maskEditNodeId, onCancelMaskEdit, onCloseContextMenu, setTemporaryTool, setEditingTextNodeId,
-    setSnapGuides, setActiveConnectorDropTargetId, zoomBy: viewport.zoomBy, fitAll: viewport.fitAll,
-    fitSelection: viewport.fitSelection, resetView: viewport.resetView, viewportCenter: viewport.viewportCenter,
-    resetMarquee: marquee.resetMarquee, resetNodeTransform: nodeTransform.resetNodeTransform,
-    resetPan: viewport.resetPan, resetTextAnnotation: text.resetTextAnnotation,
-    resetBrushStamp: brush.resetBrushStamp, resetGroupTransform: group.resetGroupTransform,
+    setSnapGuides, setActiveConnectorDropTargetId, zoomBy, fitAll, fitSelection, resetView,
+    viewportCenter, resetMarquee, resetNodeTransform, resetPan, resetTextAnnotation,
+    resetBrushStamp, resetGroupTransform,
   })
 
-  const resetViewportForScene = viewport.resetViewportForScene
-  const resetMarquee = marquee.resetMarquee
-  const resetNodeTransform = nodeTransform.resetNodeTransform
-  const resetGroupTransform = group.resetGroupTransform
-  const resetTextAnnotation = text.resetTextAnnotation
-  const resetBrushStamp = brush.resetBrushStamp
   // Scene reset: single rAF (preserves the original structure) resets every hook.
-  // Deps are the individual stable reset callbacks (not the hook return objects,
-  // which are new every render — depending on those would re-run this effect
-  // every render and reset pan/selection/transform mid-interaction).
+  // Deps are the individual stable reset callbacks (not hook return objects).
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
       resetViewportForScene(sceneId)
@@ -242,22 +248,18 @@ export function useCanvasInteractionController({
     return () => window.cancelAnimationFrame(frame)
   }, [sceneId, resetBrushStamp, resetGroupTransform, resetMarquee, resetNodeTransform, resetTextAnnotation, resetViewportForScene])
 
-  const selectionRect = marquee.selectionBox ? selectionRectFromBox(marquee.selectionBox) : undefined
+  const selectionRect = selectionBox ? selectionRectFromBox(selectionBox) : undefined
   const activeSelectionRect = selectionRect && isActiveSelectionRect(selectionRect) ? selectionRect : undefined
-  const selectionPreviewSet = previewIdsFromSelectionBox(marquee.selectionBox, nodes)
+  const selectionPreviewSet = previewIdsFromSelectionBox(selectionBox, nodes)
 
   return {
-    viewport: viewport.viewport, snapGuides, selectionBox: marquee.selectionBox, isPanning: viewport.isPanning,
-    temporaryTool, editingTextNodeId, interactionMode, selectedNodes, selectedBounds, selectionSpacingHandles,
-    activeSectionDropTargetId, activeConnectorDropTargetId, showGroupSelectionBounds, activeSelectionRect,
-    activeTextCreationRect: text.activeTextCreationRect, activeFrameCreationRect: text.activeFrameCreationRect,
-    activeMarkupCreationRect: text.activeMarkupCreationRect, markupCreationBox: text.markupCreationBox,
-    stampPlacementPreview: brush.stampPlacementPreview, selectionPreviewSet,
-    beginGroupResize: group.beginGroupResize, beginSelectionSpacingDrag: group.beginSelectionSpacingDrag,
-    beginNodePointerDown, beginNodeResize, editTextNode, beginTextResize: text.beginTextResize,
-    beginMarkupPointMove: text.beginMarkupPointMove, updateEditingText: text.updateEditingText,
-    finishTextEditing: text.finishTextEditing, handleCanvasPointerDown, handleCanvasPointerMove,
-    handleCanvasPointerEnd, handleWheel: viewport.handleWheel, zoomBy: viewport.zoomBy, fit: viewport.fit,
-    fitAll: viewport.fitAll, fitSelection: viewport.fitSelection, resetView: viewport.resetView,
+    viewport: viewportState, snapGuides, selectionBox, isPanning, temporaryTool, editingTextNodeId,
+    interactionMode, selectedNodes, selectedBounds, selectionSpacingHandles, activeSectionDropTargetId,
+    activeConnectorDropTargetId, showGroupSelectionBounds, activeSelectionRect,
+    activeTextCreationRect, activeFrameCreationRect, activeMarkupCreationRect, markupCreationBox,
+    stampPlacementPreview, selectionPreviewSet, beginGroupResize, beginSelectionSpacingDrag,
+    beginNodePointerDown, beginNodeResize, editTextNode, beginTextResize, beginMarkupPointMove,
+    updateEditingText, finishTextEditing, handleCanvasPointerDown, handleCanvasPointerMove,
+    handleCanvasPointerEnd, handleWheel, zoomBy, fit, fitAll, fitSelection, resetView,
   }
 }
