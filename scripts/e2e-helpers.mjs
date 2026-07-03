@@ -127,3 +127,18 @@ export const assertLibraryLayoutStable = (label, before, after) => {
     )
   }
 }
+
+// waitForCount:轮询 locator.count()===expected,谓词与调用方断言用同一 locator
+// (避免 waitForFunction 谓词与 locator.count() 口径不一致)。load-flake(高负载下
+// skeleton→loaded 切换/StrictMode 双 render/connector 资产挂载时序让 count 短暂
+// 0 或 >1)下等渲染稳定。timeout throw specific msg(合一 wait+assert,消除 wait 与
+// assert 间隙的 flaky);调用方传 message。供 scenarios 复用统一等待模式。
+export const waitForCount = async (page, locator, expected, { timeout = 30000, message } = {}) => {
+  const deadline = Date.now() + timeout
+  while (Date.now() < deadline) {
+    if ((await locator.count()) === expected) return
+    await page.waitForTimeout(50)
+  }
+  const last = await locator.count()
+  throw new Error(message || `locator count !== ${expected} after ${timeout}ms (last: ${last})`)
+}

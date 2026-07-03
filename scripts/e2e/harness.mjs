@@ -1,10 +1,25 @@
-import { spawn } from 'node:child_process'
+import { spawn, execSync } from 'node:child_process'
 import path from 'node:path'
 import { mkdir, rm } from 'node:fs/promises'
 import { chromium } from 'playwright'
 import { attachDefaultMivoApiMocks } from './api-mocks.mjs'
 
 export const createBaseUrl = (port) => `http://127.0.0.1:${port}`
+
+// killStaleDevServer:检测并 kill 残留 dev server(之前 e2e 崩溃未走 finally
+// stopSmokeDevServer 时残留)。残留 dev server 用旧 MIVO_DEBUG_LOG_DIR 会导致
+// debug-logs 累积(remote debug GET records 多条),且新 dev server 因 --strictPort
+// 端口占用起不来。起跑前清掉(真卫生 bug,修了全线受益)。
+const killStaleDevServer = (port) => {
+  try {
+    const pids = execSync(`lsof -ti:${port} 2>/dev/null || true`, { encoding: 'utf8' }).trim()
+    if (!pids) return
+    console.warn(`[harness] killing stale dev server on port ${port} (pids: ${pids.replace(/\n/g, ' ')})`)
+    execSync(`kill ${pids.replace(/\n/g, ' ')} 2>/dev/null || true`, { stdio: 'ignore' })
+  } catch {
+    // lsof/kill unavailable (non-macOS/linux?) — skip; --strictPort will error if occupied
+  }
+}
 
 const e2eBridgeModules = {
   canvasStore: [
@@ -67,8 +82,9 @@ export const runCommand = (command, args) =>
     })
   })
 
-export const startSmokeDevServer = ({ port, localAssetFixtureDir, eagleMockPort, apiMode = 'dev-middleware' }) =>
-  spawn('npm', ['run', 'dev', '--', '--host', '127.0.0.1', '--port', String(port), '--strictPort'], {
+export const startSmokeDevServer = ({ port, localAssetFixtureDir, eagleMockPort, apiMode = 'dev-middleware' }) => {
+  killStaleDevServer(port)
+  return spawn('npm', ['run', 'dev', '--', '--host', '127.0.0.1', '--port', String(port), '--strictPort'], {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: {
       ...process.env,
@@ -78,6 +94,7 @@ export const startSmokeDevServer = ({ port, localAssetFixtureDir, eagleMockPort,
       MIVO_DEBUG_LOG_DIR: path.resolve('test-artifacts/debug-logs'),
     },
   })
+}
 
 export const startSmokeBffServer = ({
   port,
