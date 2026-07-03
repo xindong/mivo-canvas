@@ -1061,7 +1061,9 @@ const arrangedPositionsFor = (
   return positions
 }
 
-const migratePersistedState = (persistedState: unknown, persistedVersion = 0) => {
+// Persisted-state migration is exported so canvasStoreMigrate.test.ts can cover the
+// v8 migration branches (flat-state compat, <6 markdown normalization, <8 brushStyle reset).
+export const migratePersistedState = (persistedState: unknown, persistedVersion = 0) => {
   const persisted = (persistedState || {}) as PersistedCanvasState
   const shouldNormalizeLongMarkdown = persistedVersion < 6
   const canvases = {
