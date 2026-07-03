@@ -1,0 +1,27 @@
+# Build artifacts — regenerate via npm install/build, never bake into image
+node_modules
+dist
+
+# Test / CI artifacts — large, ephemeral, not runtime deps
+test-artifacts
+
+# ECC session data (checkpoints/daily) — local-only, never in image
+history
+
+# Git metadata
+.git
+.gitignore
+
+# Git worktrees (separate checkouts, e.g. worktrees/exec-*)
+worktrees
+
+# Temp / debug scratch
+_tmp
+
+# OS / IDE
+.DS_Store
+
+# Env files — never leak into image (real secrets injected at runtime)
+.env
+.env.*
+!.env.example
