@@ -53,17 +53,24 @@ const upstreamMockHandle = useRealUpstream ? null : await startUpstreamMockServe
 let server
 let smokePage
 
-try {
-  await prepareSmokeArtifacts()
-  server = startSmokeBffServer({
+const launchServer = ({ enableLocalAssets, enableEagleProxy, debugViewToken: activeDebugViewToken }) =>
+  startSmokeBffServer({
     port,
     localAssetFixtureDir,
     eagleMockPort: eagleMockHandle.port,
     upstreamBaseUrl: upstreamMockHandle?.url,
     bffToken,
-    debugViewToken: mode === 'authorized' ? debugViewToken : '',
-    enableLocalAssets: mode === 'authorized',
-    enableEagleProxy: mode === 'authorized',
+    debugViewToken: activeDebugViewToken,
+    enableLocalAssets,
+    enableEagleProxy,
+  })
+
+try {
+  await prepareSmokeArtifacts()
+  server = launchServer({
+    debugViewToken: '',
+    enableLocalAssets: false,
+    enableEagleProxy: false,
   })
   await waitForServer(`${baseUrl}/healthz`)
 
@@ -86,6 +93,14 @@ try {
     })
     await assertProdUnauthorizedGate({ requestContext: smokePage.page.request, baseUrl })
   } else {
+    await stopSmokeDevServer(server)
+    server = launchServer({
+      debugViewToken,
+      enableLocalAssets: true,
+      enableEagleProxy: true,
+    })
+    await waitForServer(`${baseUrl}/healthz`)
+
     smokePage = await createSmokePage({
       baseUrl,
       generatedImageB64,
