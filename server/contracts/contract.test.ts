@@ -250,7 +250,6 @@ describe('server/contracts — static baseline', () => {
     }
   })
 })
-
 // ─── Live suite (env-gated; does NOT run in default `npm run test:unit`) ─────
 const runLive = process.env.MIVO_CONTRACT_LIVE === '1'
 const TARGET = process.env.MIVO_CONTRACT_TARGET_URL ?? ''
