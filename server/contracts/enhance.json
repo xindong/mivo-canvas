@@ -1,0 +1,92 @@
+{
+  "endpoint": "/api/mivo/enhance",
+  "summary": "Prompt enhancement via chat completions. Degraded chain: primary claude-haiku-4-5 (8s) → fallback gpt-5.4-mini (8s). On no-key or both-fail returns 200 {enhanced:false, degradedReason}. Never 5xx for upstream failures (graceful degrade).",
+  "sourceFile": "vite.config.ts",
+  "dispatchRef": "L1428-L1431 (middleware route) → proxyMivoEnhance L1301-L1401",
+  "methods": {
+    "POST": "primary",
+    "GET/PUT/DELETE/PATCH": "405 {error:'Method not allowed'} (L1307-L1310)"
+  },
+  "envDeps": ["MIVO_LLM_API_KEY (falls back to MIVO_IMAGE_API_KEY, L1621)"],
+  "bodyLimit": "1MB JSON (L33) → 413",
+  "degradedReasonEnum": ["no-key", "upstream-error", "timeout", "bad-json"],
+  "scenarios": [
+    {
+      "name": "non-POST method",
+      "request": { "method": "GET", "path": "/api/mivo/enhance" },
+      "expected": { "status": 405, "body": { "error": "Method not allowed" } },
+      "source": "live-capturable",
+      "sourceRef": "L1307-L1310",
+      "capture": "__captures__/enhance-405.json"
+    },
+    {
+      "name": "no LLM key → 200 degraded no-key",
+      "request": { "method": "POST", "body": { "prompt": "a cat" } },
+      "condition": "MIVO_LLM_API_KEY and MIVO_IMAGE_API_KEY both unset/empty",
+      "expected": { "status": 200, "body": { "enhanced": false, "degradedReason": "no-key" } },
+      "source": "live-capturable",
+      "sourceRef": "L1312-L1315",
+      "capture": "__captures__/enhance-200-no-key.json"
+    },
+    {
+      "name": "missing prompt (with key set)",
+      "request": { "method": "POST", "body": {} },
+      "condition": "llmApiKey non-empty",
+      "expected": { "status": 400, "body": { "error": "prompt is required" } },
+      "source": "code-derived",
+      "sourceRef": "L1317-L1322",
+      "note": "Order: no-key check (200) happens BEFORE prompt-required check (400). With no key, empty prompt still returns 200 no-key. Live-capturing the 400 requires a non-empty MIVO_LLM_API_KEY (fake key works — prompt check fires before any upstream call), but kept code-derived to keep the capture run key-free."
+    },
+    {
+      "name": "JSON body exceeds 1MB → 413 (only when key set)",
+      "condition": "llmApiKey non-empty (so flow reaches readJsonRequest)",
+      "expected": { "status": 413, "body": { "ok": false, "error": "Request body is too large" } },
+      "source": "code-derived",
+      "sourceRef": "readJsonRequest L477-L481; catch L1397 (RequestBodyTooLargeError → 413)",
+      "note": "NOT live-captured: with no key the no-key early return (L1312-L1315) fires BEFORE readJsonRequest, so any body size returns 200 no-key regardless. Capturing the 413 requires a non-empty MIVO_LLM_API_KEY (fake key works — body limit fires before any upstream call). See generate-413 for the observable ECONNRESET artifact of the same body-limit path."
+    },
+    {
+      "name": "normal 200 generate mode",
+      "condition": "primary or fallback returns valid JSON with mode=generate",
+      "expected": { "status": 200, "body": { "mode": "generate", "scene": "...", "reasoning": "...", "richPrompt": "...", "imgRatio": "<clamped>", "quality": "<low|medium|high>", "enhanced": true } },
+      "source": "code-derived",
+      "sourceRef": "L1376-L1393; ratio clamped to allowedRatios (L1325, L1376-L1379); quality clamped (L1380-L1383)",
+      "note": "NOT live-captured: requires real LLM key + well-formed LLM response."
+    },
+    {
+      "name": "normal 200 chat mode",
+      "condition": "LLM returns mode=chat with replyText",
+      "expected": { "status": 200, "body": { "mode": "chat", "replyText": "<normalized ≤200 chars>", "enhanced": true } },
+      "source": "code-derived",
+      "sourceRef": "L1367-L1374; normalizeChatReplyText L1217-L1225 (strips markdown/bullets, truncates 200)",
+      "note": "NOT live-captured: requires real LLM key."
+    },
+    {
+      "name": "both models fail → 200 degraded",
+      "condition": "primary returns no result, fallback also fails",
+      "expected": { "status": 200, "body": { "enhanced": false, "degradedReason": "<timeout|upstream-error|bad-json>" } },
+      "source": "code-derived",
+      "sourceRef": "callEnhanceLlm L1260-L1291 (returns reason); fallback L1356-L1360; degrade L1362-L1365",
+      "note": "degradedReason reflects last failure: 'timeout' if UpstreamRequestTimeoutError, 'upstream-error' if !ok or other, 'bad-json' if parse failed."
+    },
+    {
+      "name": "upstream timeout semantics (per-level 8s, not 30s)",
+      "source": "code-derived",
+      "sourceRef": "mivoEnhancePrimaryTimeoutMs=8000 L15; mivoEnhanceFallbackTimeoutMs=8000 L16",
+      "discrepancy": "Plan §6.1 says '上游每级 8s(客户端 30s)'. The middleware has NO 30s ceiling — each level is 8s, total worst case ~16s. The '客户端 30s' is a client-side (chatStore) concern, NOT a middleware contract. BFF contract = 8s+8s only."
+    },
+    {
+      "name": "stale code comment",
+      "source": "code-derived",
+      "sourceRef": "L1352 comment says 'Primary: kimi-k2.6 (10s)' but actual primary is claude-haiku-4-5 @ 8s (L13,L15)",
+      "discrepancy": "Stale comment in source; behavior matches plan §6.1 (claude-haiku-4-5 → gpt-5.4-mini). BFF migration uses the constants, not the comment."
+    }
+  ],
+  "invariants": [
+    "modelId default 'gpt-image-2' (L1324); allowedRatios looked up from mivoModelRatioMap (L1325-L1326)",
+    "history filtered to last 6 entries with {role,content} shape (L1328-L1339)",
+    "system prompt built from allowedRatios (L1341, L1189-L1201)",
+    "response_format NOT set (L1275 comment: kimi faster without, qwen hangs with json_object)",
+    "no-key 200 returned before prompt-required 400 (L1312 before L1319)"
+  ]
+}

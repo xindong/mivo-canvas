@@ -1,0 +1,14 @@
+{
+  "scenario": "debug-logs-post-413",
+  "request": {
+    "method": "POST",
+    "path": "/api/mivo/debug-logs",
+    "headers": {
+      "content-type": "application/json"
+    }
+  },
+  "response": {
+    "transportError": "ECONNRESET"
+  },
+  "capturedAt": "2026-07-03T15:23:24.534Z"
+}

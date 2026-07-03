@@ -1,0 +1,22 @@
+{
+  "scenario": "debug-logs-post-200",
+  "request": {
+    "method": "POST",
+    "path": "/api/mivo/debug-logs",
+    "headers": {
+      "content-type": "application/json"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": null
+    },
+    "body": {
+      "ok": true,
+      "accepted": 1
+    }
+  },
+  "capturedAt": "2026-07-03T15:23:24.528Z"
+}
