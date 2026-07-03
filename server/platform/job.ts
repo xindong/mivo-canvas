@@ -27,6 +27,12 @@ export type PlatformJobResult =
   | { status: 502; body: { error: string } }
   | { aborted: true }
 
+// P2-C1a: progress reporting hook. Optional; #24's sync callers pass nothing
+// (behavior unchanged). The async task runner passes a callback that updates the
+// task registry. progress is 0-100, monotonic by contract (the registry clamps).
+export type ProgressReport = { stage: string; progress: number }
+export type OnProgress = (report: ProgressReport) => void
+
 export const resolveMivoPlatformPayload = (
   modelId: string,
   imgRatio: unknown,
@@ -88,12 +94,17 @@ export const mivoPlatformPollJob = async (
   ctx: PlatformCtx,
   jobId: string,
   signal?: AbortSignal,
+  onProgress?: OnProgress,
 ): Promise<PollResult> => {
   const { platformPollDeadlineMs, platformPollIntervalMs } = getEnvConfig()
   const t0 = Date.now()
   let lastStatus: string | null = null
   while (Date.now() - t0 < platformPollDeadlineMs) {
     if (signal?.aborted) return { status: 'aborted' }
+    // P2-C1a: map elapsed/deadline to 20-90 (real progress, not hardcoded).
+    const elapsed = Date.now() - t0
+    const pollProgress = 20 + Math.min(1, elapsed / platformPollDeadlineMs) * 70
+    onProgress?.({ stage: 'poll', progress: pollProgress })
     const res = await mivoPlatformFetch(
       `${ctx.platformEndpoint}/api/v1/message/${jobId}`,
       { headers: {} },
@@ -189,10 +200,12 @@ export const runMivoPlatformImageJob = async (
   ctx: PlatformCtx,
   params: PlatformJobParams,
   signal?: AbortSignal,
+  onProgress?: OnProgress,
 ): Promise<PlatformJobResult> => {
   try {
+    onProgress?.({ stage: 'submit', progress: 10 })
     const jobId = await mivoPlatformSubmitMessage(ctx, params, signal)
-    const poll = await mivoPlatformPollJob(ctx, jobId, signal)
+    const poll = await mivoPlatformPollJob(ctx, jobId, signal, onProgress)
     if (poll.status === 'aborted') return { aborted: true }
     if (poll.status === 'timeout') {
       const isHigh = params.payload.resolution === '2K'
@@ -212,7 +225,9 @@ export const runMivoPlatformImageJob = async (
     if (!imgPath) {
       return { status: 502, body: { error: '生成失败：结果为空' } }
     }
+    onProgress?.({ stage: 'download', progress: 95 })
     const buf = await mivoPlatformDownloadImage(ctx, imgPath, signal)
+    onProgress?.({ stage: 'done', progress: 100 })
     return { status: 200, body: { images: [{ b64: buf.toString('base64') }] } }
   } catch (error) {
     if (signal?.aborted) return { aborted: true }
