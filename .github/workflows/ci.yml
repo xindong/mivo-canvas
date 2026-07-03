@@ -3,10 +3,14 @@
 # 基础半程: lint + tsc + 单元测试 + 日志规则守卫 + 结构守卫(防回潮)。
 # 对应 productization-roadmap.md §6.2 P1-f 与 §13 SC5.2。
 #
+# secret-scan 已移至独立 workflow .github/workflows/secret-scan.yml(直推 main,
+# 对所有 PR 立即生效,不等本 PR 合并)。本 ci.yml 不再含 secret-scan job,
+# .gitleaks.toml 也由 main 上的独立 workflow 持有(避免合并撞车)。
+#
 # 后续 P1-f phase2(占位,尚未实现):
-#   - e2e(mock 上游 generation 链路)job —— 不打真链路,用 mock BFF/image 服务验证 UI 流程
-#   - MIVO_BFF_TOKEN gated 矩阵 —— 需要真链路的 job 在此 secret 可用时才跑,默认跳过
-#   - nightly 真链路 —— 每日定时跑真实 generation 链路,失败只告警不阻断
+#   - e2e(mock 上游 generation 链路)job
+#   - MIVO_BFF_TOKEN gated 矩阵
+#   - nightly 真链路
 # 见 productization-roadmap.md §6.2 P1-f phase2 与 §13 SC5.2 后半程。
 
 name: CI
@@ -75,32 +79,3 @@ jobs:
         env:
           MIVO_GUARD_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: node scripts/ci/structure-guard.mjs
-
-  secret-scan:
-    name: secret scan (gitleaks)
-    runs-on: ubuntu-latest
-    steps:
-      # fetch-depth: 0 取全历史 —— gitleaks 扫提交历史,且 PR commit range 需 base SHA 可达
-      - name: Checkout (full history for gitleaks)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      # gitleaks via docker(lead 口径:action 有坑则退 docker)。
-      # 坑:gitleaks-action@v2 基于 Node 20,在 Node 24 runner 上 ScanPullRequest 抛异常
-      # (run 28675083469)。docker 用官方 image,行为与本地 gitleaks CLI 一致。
-      # .gitleaks.toml:[extend] useDefault=true 叠加默认规则(sk-/ghp_/AKIA 等)
-      # + [allowlist] 豁免占位/fixture(<redacted>/test-token/e2e-token/.env.example)。
-      # 真实 key 形态绝不豁免。job 失败即 CI 红,与其他 job 同级卡口。
-      # PR:扫 PR commit 范围(base..head);push main:扫全量历史(--all)。
-      - name: gitleaks detect
-        run: |
-          set -e
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            LOG_OPTS="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
-          else
-            LOG_OPTS="--all"
-          fi
-          echo "gitleaks log-opts: $LOG_OPTS"
-          docker run --rm -v "$PWD":/src ghcr.io/gitleaks/gitleaks:latest \
-            detect --source /src --config /src/.gitleaks.toml --log-opts "$LOG_OPTS" --no-banner --redact=100
