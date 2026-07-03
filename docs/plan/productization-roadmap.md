@@ -293,6 +293,40 @@ flowchart LR
 | D10 例外决策 | "产品侧确认大画布需求"走一页决策记录模板(`docs/decisions/`):需求来源/预期节点规模/时间窗/签署人——没有记录不得以"产品需要"为由绕过基准数据启动 P3 |
 | 产物 | CI 上传可下载 artifacts;任何阈值失败能定位到具体 scene + metric;bench/README 记录复现命令 |
 
+## 十三、目标级成功标准:「代码结构技术债修复完毕,可持续产品化」
+
+> 边界:本目标对应 **P0 + P1 + P2 + P3-0**(P3 Leafer 迁移、P4 服务端化属产品能力演进,不在本目标验收内)。每条 SC 均为二值、可命令验证;全绿才可宣布达成。
+
+### SC 清单(按六项债)
+
+| # | SC | 验证方式 |
+|---|----|---------|
+| SC1.1 | `vite build` 产物 + 独立 BFF 启动后 `test:e2e:prod` 全链路通过 | CI job 日志 |
+| SC1.2 | 契约测试:BFF 与 dev middleware 基线逐字段 diff=0,有意变更单独列表且各有测试 | `server/contracts/` 全绿 |
+| SC1.3 | vite.config.ts 无任何 API handler(收尾 PR 后),行数降至纯构建配置量级(<300) | `grep -c "api/mivo" vite.config.ts` = 0(proxy 配置除外) |
+| SC1.4 | 生产安全断言:local-assets/Eagle 默认 404/403、debug GET 无 token 403、设 token 后裸请求 401、bundle 无真实 key | CI gated job |
+| SC2.1 | canvasStore 拆为门面+3 slice,单文件 ≤~800 行;组件侧 selector 零改动 | `wc -l src/store/*.ts` + contract tests |
+| SC2.2 | 交互控制器拆为 6 hooks,主文件只剩组装(<300 行) | `wc -l` + e2e 交互用例 |
+| SC2.3 | e2e 拆为 harness+7 scenario,`--scenario` 可过滤,行为 diff=0(断言数一致) | 拆分前后 test:e2e 对比 |
+| SC3.1 | chatStore 不再直调生成 action:`rg "useCanvasStore.getState" src/store/chatStore.ts` 仅剩只读白名单;双入口走 facade | grep + facade 契约测试 |
+| SC4.1 | `rg mockGeneration src/` 生产路径零命中;variations/annotation 真端点 + prod e2e 覆盖 | grep + e2e |
+| SC4.2 | 进度非硬编码(单调真实);取消后 BFF 停上游轮询且不再 commit;kill -9 重启无僵尸 commit | C1 专项断言 |
+| SC5.1 | 缺口单测齐:snapshotValidation/persist v8 迁移/chat v2 迁移/historyManager/nodeFactory | test:unit + 用例清单点名 |
+| SC5.2 | CI 存在且为 required check(lint+tsc+test:unit+verify:logging+契约+e2e mock 上游);故意失败 PR 被拦截 | .github/workflows/ + 演练 |
+| SC6.1 | RenderNode/RenderEdge 投影 + InteractionAdapter + Layer enum 冻结,renderer 不直接依赖 MivoCanvasNode 类型 | 类型依赖检查 + 命中单测 |
+| SC6.2 | gate 基准文件 `bench/baselines/dom-500-1000-<date>.json` 已产出,P3 启动或顺延有决策记录 | 文件存在 + docs/decisions/ |
+
+### 终局演练(一次过)
+
+1. 干净机器 `docker build` + 启动 → `/healthz` → 浏览器全链路可用(**不依赖 vite dev**)。
+2. CI 全绿 + 真链路 nightly 手动触发一次通过。
+3. **改动局部性抽检(可持续性的直接证据)**:做一个典型新需求 PR(如"图片节点加一个新右键操作"),验证只需改 1 个 slice + 1 个 action 注册点,不碰交互控制器/渲染器/其他 slice——修债前同样改动需在 3168 行 store 与 1775 行 hook 里各动一刀。
+4. 100 节点 stress 性能 trace 不劣于修债前基线 10%(结构重构未偷走性能)。
+
+### 防回潮守卫(长期生效)
+
+CI 加结构守卫:store/canvas 目录单文件 >900 行报警;`rg` 守卫禁止新增跨 store getState 直调生成 action、禁止生产路径引用 mockGeneration——违规 PR 直接红。没有守卫,债会长回来。
+
 ## 附:关键文件索引
 
 `src/store/canvasStore.ts`(3168)· `src/store/chatStore.ts`(803,耦合点 L310-356/596-652)· `vite.config.ts`(1630,平台通道 L587-793/debug L419-457/路由 L1405-1614)· `src/canvas/useCanvasInteractionController.ts`(1775,缝隙见 F7)· `src/canvas/canvasInteraction.ts`(纯函数+测试)· `src/canvas/canvasRenderAdapter.ts`(P3-0 基础)· `src/model/documentModelV2.ts`+`canvasSnapshotModel.ts`(P4 基础)· `src/canvas/MivoCanvas.tsx:501-534`(Leafer 空实例)/`:219-247`(culling)· `src/canvas/CanvasNodeView.tsx`(830,无 memo)· `src/lib/assetStorage.ts`(F8)· `src/lib/snapshotValidation.ts`(P0 补测)· `scripts/debug-log-server.mjs`(P1 复用)· `scripts/e2e-smoke.mjs`(5647)
