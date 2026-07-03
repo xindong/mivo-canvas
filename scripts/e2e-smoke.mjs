@@ -192,9 +192,7 @@ try {
     }
   }
 
-  // ⑥ 能力表双写同步（SC-3）：modelCapabilities.ts 与 vite.config.ts mivoModelRatioMap 的 gemini ratios 必须一致且无 21:9。
-  // vite 侧由并行 worker 同步改——若未合并则本条软失败（等合并），不阻断其余用例；modelCapabilities 侧是硬断言（本仓 own）。
-  const dualWriteWarnings = []
+  // ⑥ 能力表双写同步（SC-3）：modelCapabilities.ts 与 vite.config.ts mivoModelRatioMap 的 gemini ratios 必须一致且无 21:9（hard fail，两端已合并）。
   {
     // modelCapabilities.ts: 'gemini-3-pro-image': { ... ratios: ['1:1', ...] }
     const extractFromModelCaps = (source) => {
@@ -215,15 +213,14 @@ try {
       throw new Error(`modelCapabilities gemini must not have 21:9, got ${JSON.stringify(capsRatios)}`)
     }
     if (!viteRatios) {
-      dualWriteWarnings.push('dual-write: could not extract gemini ratios from vite.config.ts mivoModelRatioMap')
-    } else {
-      const same = capsRatios.length === viteRatios.length && capsRatios.every((r, i) => r === viteRatios[i])
-      if (!same) {
-        dualWriteWarnings.push(`dual-write: gemini ratios differ — modelCapabilities=${JSON.stringify(capsRatios)} vs vite.mivoModelRatioMap=${JSON.stringify(viteRatios)} (vite 侧等合并)`)
-      }
-      if (viteRatios.includes('21:9')) {
-        dualWriteWarnings.push('dual-write: vite mivoModelRatioMap gemini still has 21:9 (等并行 worker 合并 vite.config.ts)')
-      }
+      throw new Error(`dual-write: could not extract gemini ratios from vite.config.ts mivoModelRatioMap`)
+    }
+    const same = capsRatios.length === viteRatios.length && capsRatios.every((r, i) => r === viteRatios[i])
+    if (!same) {
+      throw new Error(`dual-write: gemini ratios differ — modelCapabilities=${JSON.stringify(capsRatios)} vs vite.mivoModelRatioMap=${JSON.stringify(viteRatios)}`)
+    }
+    if (viteRatios.includes('21:9')) {
+      throw new Error(`dual-write: vite mivoModelRatioMap gemini must not have 21:9, got ${JSON.stringify(viteRatios)}`)
     }
   }
 
@@ -4029,6 +4026,11 @@ try {
     if (!timeoutText.includes('上游生成超时，可降低质量重试')) {
       throw new Error(`Upstream 504 should show a lowering-quality timeout message: ${JSON.stringify(timeoutText)}`)
     }
+    // 采纳 8：中质量重试按钮 title 含"降到 1K"
+    const mediumRetryBtnTitle = await page.locator('.chat-message-assistant').last().getByRole('button', { name: '中质量重试' }).first().getAttribute('title') || ''
+    if (!mediumRetryBtnTitle.includes('降到 1K')) {
+      throw new Error(`medium-retry button title should include "降到 1K", got: ${JSON.stringify(mediumRetryBtnTitle)}`)
+    }
     await page.getByRole('button', { name: '中质量重试' }).last().click()
     await waitForChatIdle()
     await page.waitForSelector('.chat-result-image, .chat-result-image-placeholder', { timeout: 10000 })
@@ -4098,6 +4100,69 @@ try {
         await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }) })
       })
       // 清掉本用例留下的 error 消息，避免后续 retry-edit 用例的 waitForSelector('.chat-error-text') 命中残留
+      await page.evaluate(async () => {
+        const canvasSpec = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('canvasStore.ts'))
+        const chatSpec = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('chatStore.ts'))
+        if (!canvasSpec || !chatSpec) return
+        const { useCanvasStore } = await import(new URL(canvasSpec).pathname + new URL(canvasSpec).search)
+        const { useChatStore } = await import(new URL(chatSpec).pathname + new URL(chatSpec).search)
+        useChatStore.getState().clearScene(useCanvasStore.getState().sceneId)
+        useChatStore.getState().setParamOverride('imgRatio', 'auto')
+        useChatStore.getState().setParamOverride('quality', 'auto')
+      })
+    }
+  }
+
+  // ④c Regression: medium 504 → 点普通重试 → 再 504 → 断言无"降低质量"字样、无中质量重试按钮、二次 quality=medium
+  {
+    const retry504Requests = []
+    const retry504Handler = async (route) => {
+      try { retry504Requests.push(JSON.parse(route.request().postData() || '{}')) } catch { retry504Requests.push({}) }
+      await route.fulfill({ status: 504, contentType: 'application/json', body: JSON.stringify({ error: 'Image API request timed out' }) })
+    }
+    await page.unroute('**/api/mivo/generate')
+    await page.route('**/api/mivo/generate', retry504Handler)
+    try {
+      await page.evaluate(async ({ canvasModuleSpec, chatModuleSpec }) => {
+        const { useCanvasStore } = await import(canvasModuleSpec)
+        const { useChatStore } = await import(chatModuleSpec)
+        useCanvasStore.getState().selectNode(undefined)
+        useChatStore.getState().setSelectedModel('gemini-3-pro-image')
+        useChatStore.getState().setParamOverride('imgRatio', '4:3')
+        useChatStore.getState().setParamOverride('quality', 'medium')
+      }, { canvasModuleSpec: await canvasStoreSpec(), chatModuleSpec: await chatStoreSpec() })
+      await page.locator('.chat-composer-textarea').fill('medium retry 504 no downgrade')
+      await page.locator('.chat-composer-textarea').press('Enter')
+      await page.waitForSelector('.chat-error-text', { timeout: 10000 })
+      await waitForChatIdle()
+      // 点普通重试（非中质量重试）
+      const requestsBefore = retry504Requests.length
+      await page.locator('.chat-message-assistant').last().getByRole('button', { name: '重试' }).click()
+      const retryDeadline = Date.now() + 10000
+      while (retry504Requests.length <= requestsBefore && Date.now() < retryDeadline) {
+        await new Promise((r) => setTimeout(r, 200))
+      }
+      if (retry504Requests.length <= requestsBefore) {
+        throw new Error('medium retry-504: retry did not issue a new request')
+      }
+      await waitForChatIdle()
+      const retryText = await page.locator('.chat-error-text').last().innerText()
+      if (retryText.includes('降低质量')) {
+        throw new Error(`medium retry-504 should not mention downgrade, got: ${JSON.stringify(retryText)}`)
+      }
+      const retryMediumBtn = await page.locator('.chat-message-assistant').last().getByRole('button', { name: '中质量重试' }).count()
+      if (retryMediumBtn > 0) {
+        throw new Error(`medium retry-504 should NOT show medium-quality retry button, got ${retryMediumBtn}`)
+      }
+      const lastRequest = retry504Requests[retry504Requests.length - 1]
+      if (lastRequest.quality !== 'medium') {
+        throw new Error(`medium retry should keep quality=medium, got ${JSON.stringify(lastRequest.quality)}`)
+      }
+    } finally {
+      await page.unroute('**/api/mivo/generate', retry504Handler)
+      await page.route('**/api/mivo/generate', async (route) => {
+        await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }) })
+      })
       await page.evaluate(async () => {
         const canvasSpec = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('canvasStore.ts'))
         const chatSpec = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('chatStore.ts'))
@@ -4565,6 +4630,7 @@ try {
   {
     const migrationContext = await browser.newContext({ viewport: { width: 1512, height: 900 }, deviceScaleFactor: 1 })
     const migrationPage = await migrationContext.newPage()
+    try {
     await migrationPage.route('**/api/mivo/generate', async (route) => {
       await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }) })
     })
@@ -4628,10 +4694,13 @@ try {
       if (!spec) return null
       const { useChatStore } = await import(new URL(spec).pathname + new URL(spec).search)
       const state = useChatStore.getState()
+      const legacyUser = (state.messagesByScene['character-flow'] || []).find((m) => m.id === 'msg-user-legacy')
       const legacyAsst = (state.messagesByScene['character-flow'] || []).find((m) => m.id === 'msg-asst-legacy')
       return {
         selectedModel: state.selectedModel,
         paramOverridesImgRatio: state.paramOverrides.imgRatio,
+        userRequestedImgRatio: legacyUser?.generationContext?.requestedImgRatio,
+        userImgRatio: legacyUser?.generationContext?.imgRatio,
         asstRequestedImgRatio: legacyAsst?.generationContext?.requestedImgRatio,
         asstImgRatio: legacyAsst?.generationContext?.imgRatio,
       }
@@ -4643,11 +4712,17 @@ try {
     if (migrated.paramOverridesImgRatio !== 'auto') {
       throw new Error(`Persist v1→v2 should clamp paramOverrides.imgRatio 21:9→auto, got ${migrated.paramOverridesImgRatio}`)
     }
+    if (migrated.userRequestedImgRatio !== 'auto') {
+      throw new Error(`Persist v1→v2 should clamp legacy user requestedImgRatio 21:9→auto, got ${migrated.userRequestedImgRatio}`)
+    }
+    if (migrated.userImgRatio !== undefined) {
+      throw new Error(`Persist v1→v2 should clamp legacy user imgRatio off 21:9 (to undefined), got ${JSON.stringify(migrated.userImgRatio)}`)
+    }
     if (migrated.asstRequestedImgRatio !== 'auto') {
-      throw new Error(`Persist v1→v2 should clamp legacy message requestedImgRatio 21:9→auto, got ${migrated.asstRequestedImgRatio}`)
+      throw new Error(`Persist v1→v2 should clamp legacy asst requestedImgRatio 21:9→auto, got ${migrated.asstRequestedImgRatio}`)
     }
     if (migrated.asstImgRatio !== undefined) {
-      throw new Error(`Persist v1→v2 should clamp legacy message imgRatio off 21:9 (to undefined), got ${JSON.stringify(migrated.asstImgRatio)}`)
+      throw new Error(`Persist v1→v2 should clamp legacy asst imgRatio off 21:9 (to undefined), got ${JSON.stringify(migrated.asstImgRatio)}`)
     }
     // 弹层无 21:9（含 4:3）
     await migrationPage.locator('[aria-label="选择比例和质量"]').click()
@@ -4659,7 +4734,17 @@ try {
     if (!migrationRatioLabels.some((t) => t === '4:3')) {
       throw new Error(`Migration: ratio popover should include 4:3, got ${JSON.stringify(migrationRatioLabels)}`)
     }
-    await migrationContext.close()
+    // 采纳 8：RatioPopover 质量项 title 标注 高(2K)/中(1K)/低(1K)
+    const qualityTitles = await migrationPage.locator('#chat-ratio-popover .chat-quality-btn').evaluateAll((btns) => btns.map((b) => b.getAttribute('title') || ''))
+    if (!qualityTitles.some((t) => t.includes('2K'))) {
+      throw new Error(`RatioPopover quality title should include 2K for high, got ${JSON.stringify(qualityTitles)}`)
+    }
+    if (!qualityTitles.some((t) => t.includes('1K') && !t.includes('2K'))) {
+      throw new Error(`RatioPopover quality title should include 1K for medium/low, got ${JSON.stringify(qualityTitles)}`)
+    }
+    } finally {
+      await migrationContext.close()
+    }
   }
 
   await page.screenshot({ path: 'test-artifacts/e2e-smoke.png', fullPage: true })
@@ -4672,10 +4757,6 @@ try {
   )
   if (realErrors.length) {
     throw new Error(`Console errors:\n${realErrors.join('\n')}`)
-  }
-
-  if (dualWriteWarnings.length) {
-    console.warn('[等合并] ' + dualWriteWarnings.join(' | '))
   }
 
   console.log('E2E smoke test passed')

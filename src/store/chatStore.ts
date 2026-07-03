@@ -87,7 +87,8 @@ type ChatState = {
 const createMessageId = () => `msg-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`
 const canceledGenerationMessage = '已取消生成，可修改提示后重试。'
 const referenceAssetMissingMessage = '参考图已失效，无法重试'
-const timeoutRetryAdvice = '建议降低质量或换比例'
+const timeoutRetryAdviceHigh = '建议降低质量或换比例'
+const timeoutRetryAdviceNeutral = '可稍后重试、换比例或减少参考图'
 let activeChatAbortController: AbortController | null = null
 
 const saveReferenceAssets = async (files: File[]) =>
@@ -126,10 +127,16 @@ const errorInfoForChat = (err: unknown, signal?: AbortSignal): { message: string
   return { message: err instanceof Error ? err.message : 'Generation failed', kind: 'unknown' }
 }
 
-const errorTextForChat = (message: string, kind: ChatMessageErrorKind, timeoutRetryCount?: number) =>
-  isTimeoutErrorKind(kind) && (timeoutRetryCount || 0) >= 2
-    ? `${message}，${timeoutRetryAdvice}`
-    : message
+const errorTextForChat = (
+  message: string,
+  kind: ChatMessageErrorKind,
+  timeoutRetryCount?: number,
+  quality?: string,
+) => {
+  if (!isTimeoutErrorKind(kind) || (timeoutRetryCount || 0) < 2) return message
+  const advice = quality === 'high' ? timeoutRetryAdviceHigh : timeoutRetryAdviceNeutral
+  return `${message}，${advice}`
+}
 
 const trimSceneMessages = (messages: ChatMessage[]): ChatMessage[] =>
   messages.length > maxMessagesPerScene ? messages.slice(-maxMessagesPerScene) : messages
@@ -372,7 +379,7 @@ export const useChatStore = create<ChatState>()(
           const errorInfo = errorInfoForChat(err, abortController.signal)
           const timeoutRetryCount = isTimeoutErrorKind(errorInfo.kind) ? 1 : undefined
           const timeoutRetryKey = isTimeoutErrorKind(errorInfo.kind) ? timeoutRetryKeyForContext(context) : undefined
-          const errorMsg = errorTextForChat(errorInfo.message, errorInfo.kind, timeoutRetryCount)
+          const errorMsg = errorTextForChat(errorInfo.message, errorInfo.kind, timeoutRetryCount, context.quality)
           const latestCanvasState = useCanvasStore.getState()
           if (latestCanvasState.sceneId !== sceneId) {
             get().appendNotice({
@@ -676,7 +683,7 @@ export const useChatStore = create<ChatState>()(
               ? (targetMsg.timeoutRetryCount || 0) + 1
               : 1
             : undefined
-          const errorMsg = errorTextForChat(errorInfo.message, errorInfo.kind, timeoutRetryCount)
+          const errorMsg = errorTextForChat(errorInfo.message, errorInfo.kind, timeoutRetryCount, context.quality)
           const latestCanvasState = useCanvasStore.getState()
           if (latestCanvasState.sceneId !== sceneId) {
             get().appendNotice({

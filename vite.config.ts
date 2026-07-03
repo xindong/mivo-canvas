@@ -379,17 +379,13 @@ async function mivoPlatformEnsureChatSession(ctx: PlatformCtx, signal?: AbortSig
   if (mivoPlatformChatSessionId) return mivoPlatformChatSessionId
   if (!mivoPlatformChatSessionPromise) {
     mivoPlatformChatSessionPromise = (async () => {
-      const token = await mivoPlatformEnsureToken(ctx, signal)
-      const res = await fetch(`${ctx.platformEndpoint}/api/v1/message/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ type: 'freeform' }),
+      // 走统一 authRetry（401→单飞刷 token→重试一次），与 submit/poll/signUrl/upload 四类调用一致
+      const res = await mivoPlatformFetch(
+        `${ctx.platformEndpoint}/api/v1/message/chat`,
+        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'freeform' }) },
+        ctx,
         signal,
-      })
-      if (res.status === 401) {
-        mivoPlatformToken = null
-        throw new Error('platform chat 401')
-      }
+      )
       if (!res.ok) throw new Error(`platform chat ${res.status}`)
       const json = (await res.json()) as { object_id?: string; chatSessionId?: string }
       const id = json.object_id || json.chatSessionId
@@ -574,7 +570,10 @@ async function runMivoPlatformImageJob(
     const poll = await mivoPlatformPollJob(ctx, jobId, controller.signal)
     if (poll.status === 'aborted') return true
     if (poll.status === 'timeout') {
-      if (!response.writableEnded) sendMivoJson(response, 504, { error: '上游生成超时，可降低质量重试' })
+      if (!response.writableEnded) {
+        const isHigh = params.payload.resolution === '2K'
+        sendMivoJson(response, 504, { error: isHigh ? '上游生成超时，可降低质量重试' : '上游生成超时，可稍后重试、换比例或减少参考图' })
+      }
       return true
     }
     if (poll.status === 'failed') {
@@ -716,8 +715,14 @@ const proxyMivoEdit = async (
       const references = [...multipartFiles(files, 'reference[]'), ...multipartFiles(files, 'reference')]
       const allImages = [image, ...references] // 主图第一位，不许丢
       const fileIds: string[] = []
-      for (const f of allImages) {
-        fileIds.push(await mivoPlatformUploadOne(platformCtx, f, controller.signal))
+      try {
+        for (const f of allImages) {
+          fileIds.push(await mivoPlatformUploadOne(platformCtx, f, controller.signal))
+        }
+      } catch {
+        // 上传 4xx/5xx/重试仍败 → 502 + 脱敏文案（不落入外层泛化 catch→500）
+        if (!response.writableEnded) sendMivoJson(response, 502, { error: '参考图上传失败，请重试或移除参考图' })
+        return
       }
       const { modelType, modelFormat, payload } = resolveMivoPlatformPayload(
         model,
