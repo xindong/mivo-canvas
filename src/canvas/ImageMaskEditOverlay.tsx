@@ -12,6 +12,7 @@ import {
 import { createPortal } from 'react-dom'
 import { debugLogger } from '../store/debugLogStore'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
+import type { MivoImageQuality } from '../types/generation'
 import {
   boundsForRegions,
   buildEditMaskBlob,
@@ -163,6 +164,10 @@ export function ImageMaskEditOverlay({
   const stageRef = useRef<HTMLDivElement | null>(null)
   const [tool, setTool] = useState<ImageMaskTool>('point')
   const [prompt, setPrompt] = useState('')
+  // W2.1: quality low/medium toggle on the overlay; default low (重绘提速快赢包).
+  // Mirrors RatioPopover's quality row pattern but inlined (overlay is a floating
+  // panel, not a popover). Low = 1K, faster; medium = 1K, more compute.
+  const [quality, setQuality] = useState<MivoImageQuality>('low')
   const [regions, setRegions] = useState<ImageMaskRegion[]>([])
   const [pointAnchors, setPointAnchors] = useState<PointAnchor[]>([])
   const [past, setPast] = useState<MaskEditSnapshot[]>([])
@@ -516,6 +521,7 @@ export function ImageMaskEditOverlay({
         mask,
         maskBounds: regions.length ? boundsForRegions(regions, naturalSize) : undefined,
         sourceSize: naturalSize,
+        quality,
       })
     } catch (error) {
       setStatusError(error instanceof Error ? error.message : '局部重绘失败。')
@@ -639,6 +645,22 @@ export function ImageMaskEditOverlay({
           />
           {maskEditHint ? <div className="image-mask-edit-hint">{maskEditHint}</div> : null}
           {statusError ? <div className="image-mask-edit-error">{statusError}</div> : null}
+          <div className="image-mask-edit-quality" data-canvas-ui="true" data-quality={quality}>
+            <span className="image-mask-edit-quality-label">质量</span>
+            {(['low', 'medium'] as const).map((q) => (
+              <button
+                key={q}
+                type="button"
+                className={quality === q ? 'active' : undefined}
+                onClick={() => setQuality(q)}
+                disabled={submitting}
+                aria-pressed={quality === q}
+                title={q === 'low' ? '低质量（1K，更快）' : '中质量（1K，更细致）'}
+              >
+                {q === 'low' ? '低' : '中'}
+              </button>
+            ))}
+          </div>
           <button type="button" onClick={() => void submit()} disabled={submitting || !promptReady || !hasAnyAnchor}>
             <Sparkles size={15} />
             {submitting ? '重绘中...' : '局部重绘'}

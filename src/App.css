@@ -4265,6 +4265,42 @@ button:disabled {
   text-align: center;
 }
 
+/* F5 (QoL batch): live progress + stage + elapsed during async mask-edit generation. */
+.ai-slot-progress {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 4px 8px;
+  margin-top: 4px;
+  font-size: 11px;
+}
+.ai-slot-progress-stage {
+  color: var(--muted);
+  font-weight: 720;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.ai-slot-progress-elapsed {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.ai-slot-progress-bar {
+  grid-column: 1 / -1;
+  display: block;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(80, 68, 201, 0.18);
+  overflow: hidden;
+}
+.ai-slot-progress-bar::after {
+  content: "";
+  display: block;
+  width: 30%;
+  height: 100%;
+  background: rgba(80, 68, 201, 0.9);
+  border-radius: 2px;
+}
+
 .dom-node.ai-generating .dom-ai-slot-node .ai-slot-copy {
   transform: translateY(64px);
 }
@@ -5428,6 +5464,41 @@ button:disabled {
   font-size: 12px;
   font-weight: 760;
   line-height: 1.35;
+}
+
+/* W2.1: low/medium quality toggle on the mask-edit overlay (default low). */
+.image-mask-edit-quality {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 0;
+}
+.image-mask-edit-quality-label {
+  font-size: 11px;
+  font-weight: 760;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.image-mask-edit-quality button {
+  flex: 0 0 auto;
+  padding: 4px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(80, 68, 201, 0.24);
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 720;
+  cursor: pointer;
+}
+.image-mask-edit-quality button.active {
+  background: rgba(80, 68, 201, 0.12);
+  border-color: rgba(80, 68, 201, 0.6);
+  color: var(--ink);
+}
+.image-mask-edit-quality button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .image-mask-edit-hint {

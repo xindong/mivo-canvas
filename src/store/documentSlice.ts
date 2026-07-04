@@ -307,7 +307,13 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
               width: image.width || defaultSizeForNodeType('image').width,
               height: image.height || defaultSizeForNodeType('image').height,
             }
-        const displaySize = displaySizeForGeneratedAsset(asset, fallbackSize)
+        // F5 (QoL batch): when replacing a placeholder slot, keep the placeholder's
+        // displaySize (fallbackSize) so a low-quality 1K result doesn't resize the
+        // node / trigger reflow. Non-slot placements still use the asset's natural
+        // size via displaySizeForGeneratedAsset.
+        const displaySize = replacingSlot
+          ? fallbackSize
+          : displaySizeForGeneratedAsset(asset, fallbackSize)
         const placement = replacingSlot
           ? { x: replacingSlot.x, y: replacingSlot.y }
           : currentSource

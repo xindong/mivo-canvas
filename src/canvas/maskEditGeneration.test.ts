@@ -139,4 +139,36 @@ describe('mask-edit placeholder rollback (S01)', () => {
     expect(state.canvases['other-scene'].nodes.some((n) => n.id === slotId)).toBe(false)
     expect(state.historyPast).toHaveLength(0) // 未 push 也未 pop
   })
+
+  // SC-W2 ④: 生成中用户编辑其他节点后取消 → 用户编辑不被回滚吞（#81 三态之取消）。
+  // 与 failure 路径同语义（expectedBaseline 不匹配 → filter-removal），但显式 canceled:true
+  // 覆盖取消态，证明 removeMaskEditPlaceholder 的 baselineSnapshot 守卫在 cancel 路径也成立。
+  it('remove preserves user edits on cancel when栈顶 changed during async (canceled path)', () => {
+    const source = imageNode({ id: 'src-1' })
+    seed(seedCanvas('character-flow', [source]))
+
+    const { slotId, baselineSnapshot } = prepareMaskEditPlaceholder('character-flow', source, 'edit prompt')
+    expect(baselineSnapshot).toBeDefined()
+
+    // 异步生成期间用户在别处追加节点 + captureHistory，栈顶已不是生成基线
+    const userEditNode = imageNode({ id: 'user-edit-cancel', x: 700 })
+    useCanvasStore.setState((s) => {
+      const sceneDoc = s.canvases['character-flow']
+      const nextNodes = [...sceneDoc.nodes, userEditNode]
+      return {
+        nodes: nextNodes,
+        canvases: { ...s.canvases, 'character-flow': { ...sceneDoc, nodes: nextNodes } },
+      }
+    })
+    useCanvasStore.getState().captureHistory()
+    expect(useCanvasStore.getState().historyPast.at(-1)).not.toBe(baselineSnapshot)
+
+    // 取消态：canceled:true，仍带同一 baselineSnapshot
+    removeMaskEditPlaceholder('character-flow', slotId, { canceled: true, baselineSnapshot })
+
+    const state = useCanvasStore.getState()
+    expect(state.nodes.some((n) => n.id === slotId)).toBe(false) // placeholder removed
+    expect(state.nodes.some((n) => n.id === 'user-edit-cancel')).toBe(true) // 用户编辑保留
+    expect(state.historyPast).toHaveLength(2) // 基线 + 用户编辑，均未被 pop
+  })
 })

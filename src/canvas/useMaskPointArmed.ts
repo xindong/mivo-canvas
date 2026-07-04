@@ -159,6 +159,7 @@ export function useMaskPointArmed({
           resolvedAssetUrl,
           payload,
           imgRatio: closestMivoRatioForSize(payload.sourceSize),
+          quality: payload.quality,
           signal: abortController.signal,
         })
         maskEditNodeIdRef.current = undefined

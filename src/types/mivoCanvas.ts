@@ -120,6 +120,15 @@ export type CanvasAiWorkflow = {
   slotId?: string
   placement?: AiWorkflowPlacement
   createdAt?: number
+  /** F5 (QoL batch): monotonic server progress 0..100, patched on each poll. */
+  progress?: number
+  /** F5 (QoL batch): server stage label (e.g. "enhancing" / "rendering"). */
+  stage?: string
+  /** F5 (QoL batch): epoch ms when generation started, for elapsed-time display. */
+  startedAt?: number
+  /** F5 (QoL batch): derived elapsed seconds (now - startedAt), patched on each
+   *  poll so the render stays pure (no Date.now() during render). */
+  elapsedSec?: number
 }
 
 export type ImageCrop = {

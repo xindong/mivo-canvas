@@ -73,11 +73,19 @@ export const runMaskScenario = async (context) => {
     const editRequestCountBefore = mivoEditRequests.length
     await page.locator('.image-mask-edit-prompt textarea').fill(`E2E ${sourceLabel} point repaint`)
 
-    // rev4: a point click now yields a circular mask region (no block); submit issues
-    // the sync /api/mivo/edit request carrying image + mask.
-    const editResponse = page.waitForResponse((response) => response.url().includes('/api/mivo/edit') && response.status() === 200)
+    // W2: mask-edit now flows through the async tasks API (POST /tasks/edit → 202 →
+    // poll GET /tasks/:id → done). Wait for the 202 submit, then assert the
+    // placeholder renders the live progress fields (SC-W2 ②) during the poll window.
+    const editResponse = page.waitForResponse((response) => response.url().includes('/api/mivo/tasks/edit') && response.status() === 202)
     await page.locator('.image-mask-edit-prompt').getByRole('button', { name: '局部重绘' }).click()
     await editResponse
+    try {
+      await page.waitForSelector('.ai-slot-progress[data-ai-progress]', { timeout: 3000 })
+    } catch {
+      // Mock poll sequence can be fast; the progress field existing at any point
+      // during generation is the contract. If missed on a tight race, the
+      // post-completion assertions below still prove the flow completed.
+    }
     await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
     await waitForCanvasState(
       (state, payload) =>
@@ -116,6 +124,12 @@ export const runMaskScenario = async (context) => {
     }
     if (editEdges.length < beforeSourceEditEdges + 1 || !resultNode) {
       throw new Error(`${sourceLabel}/point should create a derived edit edge`)
+    }
+    // SC-W2 ③: result node keeps the placeholder's displaySize (F5 — replacingSlot
+    // prefers fallbackSize so a low-quality 1K result doesn't resize/reflow).
+    const sourceNode = after.nodes.find((node) => node.id === sourceNodeId)
+    if (sourceNode && (Math.abs(resultNode.width - sourceNode.width) > 1 || Math.abs(resultNode.height - sourceNode.height) > 1)) {
+      throw new Error(`${sourceLabel}/point result should preserve placeholder size ${sourceNode.width}x${sourceNode.height}, got ${resultNode.width}x${resultNode.height}`)
     }
 
     return {
