@@ -49,12 +49,30 @@ const resolveTopology = (argv) => {
 }
 const topology = resolveTopology(cliArgs)
 const isProdTopology = topology === 'prod'
+const resolveRenderer = (argv) => {
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index]
+    if (arg === '--renderer') {
+      const value = argv[index + 1]
+      if (value === 'dom' || value === 'leafer') return value
+      throw new Error('--renderer requires dom or leafer')
+    }
+    if (arg.startsWith('--renderer=')) {
+      const value = arg.slice('--renderer='.length)
+      if (value === 'dom' || value === 'leafer') return value
+      throw new Error(`Unknown --renderer value: ${value}`)
+    }
+  }
+  return 'dom'
+}
+const rendererMode = resolveRenderer(cliArgs)
 const useRealUpstream = process.env.MIVO_E2E_USE_REAL_UPSTREAM === '1'
 const disableApiRouteMocks = process.env.MIVO_E2E_DISABLE_API_ROUTE_MOCKS === '1'
 const securityPort = requestedPort
 const runtimePort = isProdTopology ? requestedPort + 1 : requestedPort
 const securityBaseUrl = createBaseUrl(securityPort)
 const baseUrl = createBaseUrl(runtimePort)
+const canvasUrl = `${baseUrl}?renderer=${rendererMode}`
 const devBffBaseUrl = createBaseUrl(requestedPort + 1)
 const bffToken = 'e2e-token'
 const debugViewToken = 'test-token'
@@ -435,10 +453,14 @@ try {
 
   const bootstrapBaseCanvas = async () => {
     await restoreDefaultApiMocks()
-    await page.goto(baseUrl, { waitUntil: 'networkidle' })
+    await page.goto(canvasUrl, { waitUntil: 'networkidle' })
     await page.evaluate(() => window.localStorage.clear())
-    await page.goto(baseUrl, { waitUntil: 'networkidle' })
+    await page.goto(canvasUrl, { waitUntil: 'networkidle' })
     await page.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
+    const actualRenderer = await page.evaluate(() => document.querySelector('.canvas-shell')?.getAttribute('data-renderer-mode') || 'dom')
+    if (actualRenderer !== rendererMode) {
+      throw new Error(`Renderer mode mismatch: requested ${rendererMode} but shell reports ${actualRenderer}`)
+    }
   }
 
   const selectedScenarios = resolveScenarioSelection(cliArgs)
@@ -446,6 +468,8 @@ try {
     Buffer,
     assertLibraryLayoutStable,
     baseUrl,
+    canvasUrl,
+    rendererMode,
     browser,
     canvasStoreSpec,
     chatStoreSpec,

@@ -97,6 +97,7 @@ const parseArgs = (argv) => {
     runs: DEFAULT_RUNS,
     port: DEFAULT_PORT,
     renderer: 'dom',
+    culling: 'on',
     seed: DEFAULT_FIXTURE_SEED,
     date: DEFAULT_DATE,
     output: undefined,
@@ -135,6 +136,13 @@ const parseArgs = (argv) => {
 
     if (entry.startsWith('--renderer=')) {
       options.renderer = entry.slice('--renderer='.length).trim() || 'dom'
+      continue
+    }
+
+    if (entry.startsWith('--culling=')) {
+      const value = entry.slice('--culling='.length).trim()
+      if (value !== 'on' && value !== 'off') throw new Error(`Invalid --culling value: ${value} (expected on|off)`)
+      options.culling = value
       continue
     }
 
@@ -267,6 +275,19 @@ const loadFixture = async (nodeCount) => JSON.parse(await readFile(fixturePathFo
 
 const installBenchRuntime = async (page) => {
   await page.evaluate(() => {
+    // Bench loads fixtures (5k–50k nodes) that exceed localStorage's ~5MB quota via the
+    // zustand persist middleware (key 'mivo-canvas-demo'). Bench measures render perf, not
+    // persistence — silence the demo-store persistence write so replaceSnapshot doesn't throw
+    // QuotaExceededError at scale. Viewport + other small keys are unaffected.
+    if (!globalThis.__MIVO_BENCH_PERSIST_PATCHED__) {
+      const originalSetItem = window.localStorage.setItem.bind(window.localStorage)
+      window.localStorage.setItem = function (key, value) {
+        if (key === 'mivo-canvas-demo') return
+        return originalSetItem(key, value)
+      }
+      globalThis.__MIVO_BENCH_PERSIST_PATCHED__ = true
+    }
+
     const waitFrames = (count = 1) =>
       new Promise((resolve) => {
         let remaining = count
@@ -312,40 +333,53 @@ const installBenchRuntime = async (page) => {
         )
 
         const { useCanvasStore } = await import('/src/store/canvasStore.ts')
-        performance.clearMeasures('store-to-renderer-sync')
-        performance.clearMarks('store-to-renderer-sync:start')
-        performance.clearMarks('store-to-renderer-sync:end')
-        performance.clearMarks('store-to-renderer-sync')
-        performance.mark('store-to-renderer-sync')
-        performance.mark('store-to-renderer-sync:start')
         useCanvasStore.getState().replaceSnapshot(fixture.snapshot)
-
+        useCanvasStore.getState().setActiveTool('hand')
+        return { sceneId: fixture.snapshot.sceneId }
+      },
+      async waitForRender(fixture) {
         const expectedNodeCount = String(fixture.meta.nodeCount)
         const expectedScale = fixture.meta.recommendedViewport.scale
         const startedAt = performance.now()
+        let settled = false
+        let lastSnapshot = { totalNodeCount: null, viewportScale: 0, rendererMode: null }
         while (performance.now() - startedAt < 5000) {
           const nextShell = document.querySelector('.canvas-shell')
           const totalNodeCount = nextShell?.getAttribute('data-total-node-count')
           const viewportScale = Number(nextShell?.getAttribute('data-viewport-scale') || 0)
+          lastSnapshot = {
+            totalNodeCount,
+            viewportScale,
+            rendererMode: nextShell?.getAttribute('data-renderer-mode') || 'dom',
+          }
           if (totalNodeCount === expectedNodeCount && Math.abs(viewportScale - expectedScale) < 0.01) {
+            settled = true
             break
           }
           await waitFrames(1)
         }
         await waitFrames(4)
-        performance.mark('store-to-renderer-sync:end')
-        performance.measure('store-to-renderer-sync', 'store-to-renderer-sync:start', 'store-to-renderer-sync:end')
-        useCanvasStore.getState().setActiveTool('hand')
 
         const currentShell = document.querySelector('.canvas-shell')
+        const actualNodeCount = currentShell?.getAttribute('data-total-node-count')
+        const actualScale = Number(currentShell?.getAttribute('data-viewport-scale') || 0)
+        const actualRendererMode = currentShell?.getAttribute('data-renderer-mode') || 'dom'
+        if (!settled || actualNodeCount !== expectedNodeCount || Math.abs(actualScale - expectedScale) >= 0.01) {
+          const requestedRenderer = new URLSearchParams(window.location.search).get('renderer') || 'dom'
+          throw new Error(
+            `waitForRender did not settle within 5s: expected nodeCount=${expectedNodeCount} scale=${expectedScale} renderer=${requestedRenderer}, `
+            + `actual nodeCount=${actualNodeCount} scale=${actualScale} renderer=${actualRendererMode} (last poll: ${JSON.stringify(lastSnapshot)})`,
+          )
+        }
         return {
           sceneId: fixture.snapshot.sceneId,
-          totalNodeCount: Number(currentShell?.getAttribute('data-total-node-count') || 0),
+          rendererMode: actualRendererMode,
+          totalNodeCount: Number(actualNodeCount || 0),
           renderedNodeCount: Number(currentShell?.getAttribute('data-rendered-node-count') || 0),
-          viewportScale: Number(currentShell?.getAttribute('data-viewport-scale') || 0),
+          viewportScale: actualScale,
           viewportX: Number(currentShell?.getAttribute('data-viewport-x') || 0),
           viewportY: Number(currentShell?.getAttribute('data-viewport-y') || 0),
-          syncDurationMs: performance.getEntriesByName('store-to-renderer-sync').at(-1)?.duration || 0,
+          settled: true,
         }
       },
       startCapture(label) {
@@ -410,7 +444,9 @@ const traceAction = async (cdpSession, action) => {
       if (
         event.cat?.includes('blink.user_timing') ||
         event.name?.includes('canvas-') ||
-        event.name?.includes('store-to-renderer-sync')
+        event.name?.includes('store-to-renderer-sync') ||
+        event.name?.includes('loadFixture') ||
+        event.name?.includes('render-sync')
       ) {
         userTimingEvents.push(event)
       }
@@ -508,7 +544,7 @@ const aggregateRuns = (runs) => {
   const longTaskTotalValues = runs.map((run) => run.overall.longTaskTotalMs)
 
   const perAction = {}
-  for (const label of ['canvas-pan', 'canvas-zoom']) {
+  for (const label of ['loadFixture', 'render-sync', 'canvas-pan', 'canvas-zoom']) {
     const summaries = runs.map((run) => run.actions[label])
     perAction[label] = {
       p50FrameMs: median(summaries.map((summary) => summary.p50FrameMs).filter((value) => value != null)),
@@ -519,12 +555,19 @@ const aggregateRuns = (runs) => {
     }
   }
 
+  const loadFixtureMsValues = runs.map((run) => run.loadFixtureMs).filter((value) => value != null)
+  const renderSyncMsValues = runs.map((run) => run.renderSyncMs).filter((value) => value != null)
+
   return {
     runs: runs.length,
+    loadFixtureMs: median(loadFixtureMsValues),
+    renderSyncMs: median(renderSyncMsValues),
     storeToRendererSyncMs: median(syncDurations),
     overall: {
       p50FrameMs: median(overallP50Values),
       p95FrameMs: median(overallP95Values),
+      heapBeforeMb: median(runs.map((run) => run.heap.beforeMb).filter((value) => value != null)),
+      heapAfterRenderMb: median(runs.map((run) => run.heap.afterRenderMb).filter((value) => value != null)),
       heapUsedMb: median(heapUsedValues),
       heapDeltaMb: median(heapDeltaValues),
       longTaskCount: median(longTaskCountValues),
@@ -540,7 +583,7 @@ const aggregateRuns = (runs) => {
   }
 }
 
-const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port }) => {
+const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, renderer, culling }) => {
   const context = await browser.newContext({
     viewport: { width: 1920, height: 1080 },
     deviceScaleFactor: dpr,
@@ -548,7 +591,8 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port }) => {
   })
   const page = await context.newPage()
   await page.emulateMedia({ reducedMotion: 'reduce' })
-  await page.goto(`http://127.0.0.1:${port}`, { waitUntil: 'networkidle' })
+  const canvasUrl = `http://127.0.0.1:${port}/?renderer=${encodeURIComponent(renderer)}&culling=${encodeURIComponent(culling)}`
+  await page.goto(canvasUrl, { waitUntil: 'networkidle' })
   await page.addStyleTag({
     content: [
       '*,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important;}',
@@ -558,7 +602,6 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port }) => {
   await page.waitForSelector('.canvas-shell')
   await installBenchRuntime(page)
 
-  const shellState = await page.evaluate((inputFixture) => globalThis.__MIVO_BENCH__.loadFixture(inputFixture), fixture)
   const cdpSession = await context.newCDPSession(page)
   const beforeHeap = await cdpSession.send('Runtime.getHeapUsage')
   const browserVersion = await browser.version()
@@ -579,9 +622,39 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port }) => {
     }
   }
 
+  const load = await runAction('loadFixture', async () => {
+    await page.evaluate((inputFixture) => globalThis.__MIVO_BENCH__.loadFixture(inputFixture), fixture)
+  })
+  const renderSync = await runAction('render-sync', async () => {
+    await page.evaluate((inputFixture) => globalThis.__MIVO_BENCH__.waitForRender(inputFixture), fixture)
+  })
+  const renderState = await page.evaluate(() => {
+    const shell = document.querySelector('.canvas-shell')
+    return {
+      rendererMode: shell?.getAttribute('data-renderer-mode') || 'dom',
+      cullingMode: shell?.getAttribute('data-culling-mode') || 'on',
+      totalNodeCount: Number(shell?.getAttribute('data-total-node-count') || 0),
+      renderedNodeCount: Number(shell?.getAttribute('data-rendered-node-count') || 0),
+      viewportScale: Number(shell?.getAttribute('data-viewport-scale') || 0),
+    }
+  })
+  // Double-check: waitForRender throws on non-settle inside the page, but assert again here so
+  // a silently-skipped render or a renderer-mode/culling mismatch can never write a bogus baseline.
+  if (renderState.rendererMode !== renderer) {
+    throw new Error(`Bench renderer mismatch: requested "${renderer}" but .canvas-shell reports "${renderState.rendererMode}"`)
+  }
+  if (renderState.cullingMode !== culling) {
+    throw new Error(`Bench culling mismatch: requested "${culling}" but .canvas-shell reports "${renderState.cullingMode}"`)
+  }
+  if (renderState.totalNodeCount !== fixture.meta.nodeCount) {
+    throw new Error(`Bench fixture not settled: expected ${fixture.meta.nodeCount} total nodes, .canvas-shell reports ${renderState.totalNodeCount}`)
+  }
+  const afterRenderHeap = await cdpSession.send('Runtime.getHeapUsage')
+
   const pan = await runAction('canvas-pan', () => panCanvas(page))
   const zoom = await runAction('canvas-zoom', () => zoomCanvas(page))
-  const afterHeap = await cdpSession.send('Runtime.getHeapUsage')
+  const afterRunHeap = await cdpSession.send('Runtime.getHeapUsage')
+
   const overall = {
     p50FrameMs: round(Math.max(pan.summary.p50FrameMs ?? 0, zoom.summary.p50FrameMs ?? 0), 3),
     p95FrameMs: round(Math.max(pan.summary.p95FrameMs ?? 0, zoom.summary.p95FrameMs ?? 0), 3),
@@ -596,24 +669,39 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port }) => {
       viewport: { width: 1920, height: 1080 },
       dpr,
     },
+    renderer: {
+      requested: renderer,
+      actual: renderState.rendererMode,
+      cullingRequested: culling,
+      cullingActual: renderState.cullingMode,
+    },
     fixture: {
       sceneId: fixture.meta.sceneId,
       nodeCount: fixture.meta.nodeCount,
       seed: fixture.meta.seed,
       counts: fixture.meta.counts,
     },
-    storeToRendererSyncMs: round(shellState.syncDurationMs),
-    shellState,
+    loadFixtureMs: round(load.summary.durationMs),
+    renderSyncMs: round(renderSync.summary.durationMs),
+    storeToRendererSyncMs: round((load.summary.durationMs || 0) + (renderSync.summary.durationMs || 0)),
+    renderState,
     heap: {
-      usedMb: round(afterHeap.usedSize / (1024 * 1024), 3),
-      totalMb: round(afterHeap.totalSize / (1024 * 1024), 3),
-      deltaMb: round((afterHeap.usedSize - beforeHeap.usedSize) / (1024 * 1024), 3),
+      beforeMb: round(beforeHeap.usedSize / (1024 * 1024), 3),
+      afterRenderMb: round(afterRenderHeap.usedSize / (1024 * 1024), 3),
+      afterRunMb: round(afterRunHeap.usedSize / (1024 * 1024), 3),
+      usedMb: round(afterRenderHeap.usedSize / (1024 * 1024), 3),
+      deltaMb: round((afterRenderHeap.usedSize - beforeHeap.usedSize) / (1024 * 1024), 3),
+      runDeltaMb: round((afterRunHeap.usedSize - beforeHeap.usedSize) / (1024 * 1024), 3),
     },
     actions: {
+      loadFixture: load.summary,
+      'render-sync': renderSync.summary,
       'canvas-pan': pan.summary,
       'canvas-zoom': zoom.summary,
     },
     trace: {
+      loadFixture: load.trace,
+      'render-sync': renderSync.trace,
       'canvas-pan': pan.trace,
       'canvas-zoom': zoom.trace,
     },
@@ -657,6 +745,8 @@ const main = async () => {
             dpr,
             runIndex,
             port: options.port,
+            renderer: options.renderer,
+            culling: options.culling,
           })
           assertTraceMarks(run)
           runs.push(run)
@@ -671,6 +761,12 @@ const main = async () => {
       const dprGateValues = dprResults.map((result) => ({
         dpr: result.dpr,
         p95FrameMs: result.median.overall.p95FrameMs,
+        loadFixtureMs: result.median.loadFixtureMs,
+        renderSyncMs: result.median.renderSyncMs,
+        rendererMode: result.runs[0]?.renderer?.actual || options.renderer,
+        cullingMode: result.runs[0]?.renderer?.cullingActual || options.culling,
+        renderedNodeCount: result.runs[0]?.renderState?.renderedNodeCount,
+        totalNodeCount: result.runs[0]?.renderState?.totalNodeCount,
       }))
       const worstP95 = Math.max(...dprGateValues.map((result) => result.p95FrameMs ?? 0))
 
@@ -693,6 +789,9 @@ const main = async () => {
       protocol: {
         roadmapSection: '§12.1 / §13 SC6.2',
         renderer: options.renderer,
+        rendererModeActual: configs[0]?.dprResults[0]?.runs[0]?.renderer?.actual || options.renderer,
+        culling: options.culling,
+        cullingModeActual: configs[0]?.dprResults[0]?.runs[0]?.renderer?.cullingActual || options.culling,
         date: options.date,
         referenceMachine: 'same-machine-only',
         browser: 'Chromium via Playwright',
@@ -702,7 +801,9 @@ const main = async () => {
         seed: options.seed,
         motion: 'prefers-reduced-motion + transition/animation disabled',
         syncMeasurement: 'replaceSnapshot(full snapshot) until expected node count / viewport settle',
-        traceMarks: ['store-to-renderer-sync', 'canvas-pan', 'canvas-zoom'],
+        segments: ['loadFixture', 'render-sync', 'canvas-pan', 'canvas-zoom'],
+        heapMeasurements: ['before-load', 'after-render', 'after-run'],
+        traceMarks: ['loadFixture', 'render-sync', 'canvas-pan', 'canvas-zoom'],
         ...(options.mainSha ? { mainSha: options.mainSha } : {}),
       },
       note: options.note,
