@@ -54,12 +54,20 @@ class PlatformHttpError extends Error {
   }
 }
 
+class DownloadRetryExhaustedError extends Error {
+  constructor(cause: unknown) {
+    super('platform download retry exhausted', { cause })
+    this.name = 'DownloadRetryExhaustedError'
+  }
+}
+
 const shortPlatformJobId = (jobId: string): string => jobId.slice(-8)
 
 const platformResponseError = async (operation: string, res: Response): Promise<PlatformHttpError> =>
   new PlatformHttpError(operation, res.status, await res.text().catch(() => ''))
 
 const isRetriablePlatformError = (error: unknown): boolean => {
+  if (error instanceof DownloadRetryExhaustedError) return false
   if (error instanceof PlatformHttpError) {
     return error.status >= 500 && error.status < 600 && error.status !== 504
   }
@@ -237,7 +245,7 @@ export const mivoPlatformDownloadImage = async (
       return Buffer.from(await imgRes.arrayBuffer())
     })
   } catch (error) {
-    if (isRetriablePlatformError(error)) throw new Error('platform download retry exhausted', { cause: error })
+    if (isRetriablePlatformError(error)) throw new DownloadRetryExhaustedError(error)
     throw error
   }
 }
