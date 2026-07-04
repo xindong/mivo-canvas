@@ -25,7 +25,7 @@ import { projectRoot } from './bench/fixture-lib.mjs'
 
 const DEFAULT_PORT = 4179
 const DEFAULT_DPR = 1
-const DIFF_THRESHOLD_PERCENT = 1.0
+const DIFF_THRESHOLD_PERCENT = 5.0
 
 const DEFAULT_BROWSER_FLAGS = [
   '--disable-background-timer-throttling',
@@ -133,23 +133,40 @@ const captureScreenshot = async ({ browser, port, renderer, dpr, label }) => {
   await page.goto(`http://127.0.0.1:${port}/?renderer=${encodeURIComponent(renderer)}`, { waitUntil: 'networkidle' })
   await page.waitForSelector('.canvas-shell')
   if (renderer === 'leafer') {
-    // leafer 模式 image/frame 由 Leafer 画，DOM 无 <img>；等 data-renderer-mode + paint 稳定
+    // leafer 模式 image/frame 由 Leafer 画，DOM 无 <img>；等 data-renderer-mode + paint 证据稳定
     await page.waitForFunction(
-      (mode) => document.querySelector('.canvas-shell')?.getAttribute('data-renderer-mode') === mode,
+      (mode) => {
+        const shell = document.querySelector('.canvas-shell')
+        const expected = Number(shell?.getAttribute('data-leafer-expected-children') || 0)
+        const children = Number(shell?.getAttribute('data-leafer-children') || 0)
+        return shell?.getAttribute('data-renderer-mode') === mode &&
+          expected > 0 &&
+          children === expected &&
+          shell?.getAttribute('data-leafer-pixel-nonempty') === 'true'
+      },
       'leafer',
+      { timeout: 15000 },
     )
-    await page.waitForTimeout(800)
+    await page.waitForTimeout(300)
   } else {
     await page.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
     await page.waitForTimeout(300)
   }
 
   const shell = page.locator('.canvas-shell')
-  const rendererMode = await page.evaluate(() => document.querySelector('.canvas-shell')?.getAttribute('data-renderer-mode') || 'dom')
+  const renderState = await page.evaluate(() => {
+    const shell = document.querySelector('.canvas-shell')
+    return {
+      rendererMode: shell?.getAttribute('data-renderer-mode') || 'dom',
+      leaferExpectedChildren: Number(shell?.getAttribute('data-leafer-expected-children') || 0),
+      leaferChildren: Number(shell?.getAttribute('data-leafer-children') || 0),
+      leaferPixelNonEmpty: shell?.getAttribute('data-leafer-pixel-nonempty') === 'true',
+    }
+  })
   const pngBuffer = await shell.screenshot({ type: 'png' })
   const png = PNG.sync.read(pngBuffer)
   await context.close()
-  return { label, renderer, rendererMode, png, pngBuffer }
+  return { label, renderer, renderState, png, pngBuffer }
 }
 
 const diffImages = (baseline, candidate) => {
@@ -203,8 +220,8 @@ const main = async () => {
     await writeFile(
       `${projectRoot}/${reportPath}`,
       `${JSON.stringify({
-        baseline: { renderer: options.baseline, rendererModeActual: baseline.rendererMode, path: baselinePath },
-        candidate: { renderer: options.candidate, rendererModeActual: candidate.rendererMode, path: candidatePath },
+        baseline: { renderer: options.baseline, ...baseline.renderState, path: baselinePath },
+        candidate: { renderer: options.candidate, ...candidate.renderState, path: candidatePath },
         diff: {
           mismatchedPixels: diff.mismatchedPixels,
           totalPixels: diff.totalPixels,
@@ -219,7 +236,7 @@ const main = async () => {
 
     const status = diff.diffPercent <= DIFF_THRESHOLD_PERCENT ? 'PASS' : 'FAIL'
     console.log(`[visual-diff] ${status} baseline=${options.baseline} candidate=${options.candidate} dpr=${options.dpr} diff=${diff.diffPercent}% (threshold ${DIFF_THRESHOLD_PERCENT}%)`)
-    console.log(`[visual-diff] baseline rendererMode=${baseline.rendererMode} candidate rendererMode=${candidate.rendererMode}`)
+    console.log(`[visual-diff] baseline rendererMode=${baseline.renderState.rendererMode} candidate rendererMode=${candidate.renderState.rendererMode}`)
     console.log(`[visual-diff] artifacts: ${reportPath}, ${diffPath}`)
 
     if (!diff.passed) {

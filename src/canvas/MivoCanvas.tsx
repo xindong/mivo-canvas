@@ -228,9 +228,9 @@ export function MivoCanvas({
     [viewport.scale, viewport.x, viewport.y],
   )
 
-  const renderedNodes = useMemo(() => {
+  const canvasRenderedNodes = useMemo(() => {
     if (cullingMode === 'off' || !shellSize.width || !shellSize.height) {
-      return filterDomNodesForLeaferSpike(visibleNodes, rendererMode)
+      return visibleNodes
     }
     const viewportRect = {
       x: (-viewport.x - canvasRenderOverscanPx) / viewport.scale,
@@ -244,10 +244,7 @@ export function MivoCanvas({
     if (maskEditNodeId) pinnedNodeIds.add(maskEditNodeId)
     if (contextMenuNodeId) pinnedNodeIds.add(contextMenuNodeId)
 
-    return filterDomNodesForLeaferSpike(
-      visibleNodes.filter((node) => pinnedNodeIds.has(node.id) || rectsIntersectInclusive(node, viewportRect)),
-      rendererMode,
-    )
+    return visibleNodes.filter((node) => pinnedNodeIds.has(node.id) || rectsIntersectInclusive(node, viewportRect))
   }, [
     contextMenuNodeId,
     cropNodeId,
@@ -261,6 +258,10 @@ export function MivoCanvas({
     viewport.y,
     visibleNodes,
   ])
+  const renderedNodes = useMemo(
+    () => filterDomNodesForLeaferSpike(canvasRenderedNodes, rendererMode),
+    [canvasRenderedNodes],
+  )
 
   const openNodeContextMenu = useCallback(
     (nodeId: string, clientX: number, clientY: number) => {
@@ -418,7 +419,7 @@ export function MivoCanvas({
     return () => onRegisterExternalAssetDrop?.(undefined)
   }, [importLocalAssetAtClientPoint, onRegisterExternalAssetDrop])
 
-  useLeaferSpikeRenderer({ hostRef, viewport, nodes: visibleNodes, rendererMode })
+  const leaferSpikeStats = useLeaferSpikeRenderer({ hostRef, viewport, nodes: visibleNodes, rendererMode })
 
   useEffect(() => {
     const shell = shellRef.current
@@ -485,6 +486,11 @@ export function MivoCanvas({
       data-viewport-y={viewport.y}
       data-rendered-node-count={renderedNodes.length}
       data-total-node-count={visibleNodes.length}
+      data-leafer-expected-children={leaferSpikeStats.expectedChildren}
+      data-leafer-children={leaferSpikeStats.children}
+      data-leafer-pixel-nonempty={leaferSpikeStats.pixelNonEmpty ? 'true' : 'false'}
+      data-leafer-pixel-sample-count={leaferSpikeStats.pixelSampleCount}
+      data-leafer-sync-version={leaferSpikeStats.syncVersion}
       ref={shellRef}
       onWheel={handleWheel}
       onPointerDown={wrapCanvasPointerDown}

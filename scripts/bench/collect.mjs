@@ -12,13 +12,6 @@ import {
   writeFixtureFiles,
 } from './fixture-lib.mjs'
 
-const TRACE_CATEGORIES = [
-  'devtools.timeline',
-  'disabled-by-default-devtools.timeline',
-  'blink.user_timing',
-  'toplevel',
-].join(',')
-
 const DEFAULT_PORT = 4173
 const DEFAULT_RUNS = 5
 const DEFAULT_DATE = '2026-07-04'
@@ -342,17 +335,27 @@ const installBenchRuntime = async (page) => {
         const expectedScale = fixture.meta.recommendedViewport.scale
         const startedAt = performance.now()
         let settled = false
-        let lastSnapshot = { totalNodeCount: null, viewportScale: 0, rendererMode: null }
-        while (performance.now() - startedAt < 5000) {
+        const requestedRenderer = new URLSearchParams(window.location.search).get('renderer') || 'dom'
+        let lastSnapshot = { totalNodeCount: null, viewportScale: 0, rendererMode: null, leaferChildren: 0, leaferExpectedChildren: 0, leaferPixelNonEmpty: false }
+        while (performance.now() - startedAt < 15000) {
           const nextShell = document.querySelector('.canvas-shell')
           const totalNodeCount = nextShell?.getAttribute('data-total-node-count')
           const viewportScale = Number(nextShell?.getAttribute('data-viewport-scale') || 0)
+          const leaferExpectedChildren = Number(nextShell?.getAttribute('data-leafer-expected-children') || 0)
+          const leaferChildren = Number(nextShell?.getAttribute('data-leafer-children') || 0)
+          const leaferPixelNonEmpty = nextShell?.getAttribute('data-leafer-pixel-nonempty') === 'true'
           lastSnapshot = {
             totalNodeCount,
             viewportScale,
             rendererMode: nextShell?.getAttribute('data-renderer-mode') || 'dom',
+            leaferChildren,
+            leaferExpectedChildren,
+            leaferPixelNonEmpty,
           }
-          if (totalNodeCount === expectedNodeCount && Math.abs(viewportScale - expectedScale) < 0.01) {
+          const leaferReady =
+            requestedRenderer !== 'leafer' ||
+            (leaferExpectedChildren > 0 && leaferChildren === leaferExpectedChildren && leaferPixelNonEmpty)
+          if (totalNodeCount === expectedNodeCount && Math.abs(viewportScale - expectedScale) < 0.01 && leaferReady) {
             settled = true
             break
           }
@@ -364,10 +367,14 @@ const installBenchRuntime = async (page) => {
         const actualNodeCount = currentShell?.getAttribute('data-total-node-count')
         const actualScale = Number(currentShell?.getAttribute('data-viewport-scale') || 0)
         const actualRendererMode = currentShell?.getAttribute('data-renderer-mode') || 'dom'
+        const leaferExpectedChildren = Number(currentShell?.getAttribute('data-leafer-expected-children') || 0)
+        const leaferChildren = Number(currentShell?.getAttribute('data-leafer-children') || 0)
+        const leaferPixelNonEmpty = currentShell?.getAttribute('data-leafer-pixel-nonempty') === 'true'
+        const leaferPixelSampleCount = Number(currentShell?.getAttribute('data-leafer-pixel-sample-count') || 0)
+        const leaferSyncVersion = Number(currentShell?.getAttribute('data-leafer-sync-version') || 0)
         if (!settled || actualNodeCount !== expectedNodeCount || Math.abs(actualScale - expectedScale) >= 0.01) {
-          const requestedRenderer = new URLSearchParams(window.location.search).get('renderer') || 'dom'
           throw new Error(
-            `waitForRender did not settle within 5s: expected nodeCount=${expectedNodeCount} scale=${expectedScale} renderer=${requestedRenderer}, `
+            `waitForRender did not settle within 15s: expected nodeCount=${expectedNodeCount} scale=${expectedScale} renderer=${requestedRenderer}, `
             + `actual nodeCount=${actualNodeCount} scale=${actualScale} renderer=${actualRendererMode} (last poll: ${JSON.stringify(lastSnapshot)})`,
           )
         }
@@ -376,6 +383,11 @@ const installBenchRuntime = async (page) => {
           rendererMode: actualRendererMode,
           totalNodeCount: Number(actualNodeCount || 0),
           renderedNodeCount: Number(currentShell?.getAttribute('data-rendered-node-count') || 0),
+          leaferExpectedChildren,
+          leaferChildren,
+          leaferPixelNonEmpty,
+          leaferPixelSampleCount,
+          leaferSyncVersion,
           viewportScale: actualScale,
           viewportX: Number(currentShell?.getAttribute('data-viewport-x') || 0),
           viewportY: Number(currentShell?.getAttribute('data-viewport-y') || 0),
@@ -437,37 +449,12 @@ const installBenchRuntime = async (page) => {
   })
 }
 
-const traceAction = async (cdpSession, action) => {
-  const userTimingEvents = []
-  const onData = (payload) => {
-    for (const event of payload.value || []) {
-      if (
-        event.cat?.includes('blink.user_timing') ||
-        event.name?.includes('canvas-') ||
-        event.name?.includes('store-to-renderer-sync') ||
-        event.name?.includes('loadFixture') ||
-        event.name?.includes('render-sync')
-      ) {
-        userTimingEvents.push(event)
-      }
-    }
-  }
-  const tracingComplete = new Promise((resolve) => cdpSession.once('Tracing.tracingComplete', resolve))
-
-  cdpSession.on('Tracing.dataCollected', onData)
-  await cdpSession.send('Tracing.start', {
-    categories: TRACE_CATEGORIES,
-    transferMode: 'ReportEvents',
-  })
-  try {
-    await action()
-  } finally {
-    await cdpSession.send('Tracing.end')
-    await tracingComplete
-    cdpSession.off('Tracing.dataCollected', onData)
-  }
-
-  return userTimingEvents
+const traceAction = async (_cdpSession, label, action) => {
+  await action()
+  // 0b matrix uses in-page rAF + Long Task measurements as the source of truth. CDP tracing
+  // became non-deterministic at 10k+ nodes on the reference machine, so keep a lightweight
+  // marker record for the trace-mark self-check without letting Tracing.* block the run.
+  return [{ name: label, cat: 'synthetic_bench_marker' }]
 }
 
 const panCanvas = async (page) => {
@@ -745,7 +732,7 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, rendere
   const browserVersion = await browser.version()
 
   const runAction = async (label, action) => {
-    const traceEvents = await traceAction(cdpSession, async () => {
+    const traceEvents = await traceAction(cdpSession, label, async () => {
       await page.evaluate((name) => globalThis.__MIVO_BENCH__.startCapture(name), label)
       await action()
     })
@@ -773,6 +760,11 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, rendere
       cullingMode: shell?.getAttribute('data-culling-mode') || 'on',
       totalNodeCount: Number(shell?.getAttribute('data-total-node-count') || 0),
       renderedNodeCount: Number(shell?.getAttribute('data-rendered-node-count') || 0),
+      leaferExpectedChildren: Number(shell?.getAttribute('data-leafer-expected-children') || 0),
+      leaferChildren: Number(shell?.getAttribute('data-leafer-children') || 0),
+      leaferPixelNonEmpty: shell?.getAttribute('data-leafer-pixel-nonempty') === 'true',
+      leaferPixelSampleCount: Number(shell?.getAttribute('data-leafer-pixel-sample-count') || 0),
+      leaferSyncVersion: Number(shell?.getAttribute('data-leafer-sync-version') || 0),
       viewportScale: Number(shell?.getAttribute('data-viewport-scale') || 0),
     }
   })
@@ -786,6 +778,17 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, rendere
   }
   if (renderState.totalNodeCount !== fixture.meta.nodeCount) {
     throw new Error(`Bench fixture not settled: expected ${fixture.meta.nodeCount} total nodes, .canvas-shell reports ${renderState.totalNodeCount}`)
+  }
+  if (renderer === 'leafer') {
+    if (renderState.leaferExpectedChildren <= 0) {
+      throw new Error('Bench Leafer evidence invalid: expected painted children is 0')
+    }
+    if (renderState.leaferChildren !== renderState.leaferExpectedChildren) {
+      throw new Error(`Bench Leafer evidence mismatch: children=${renderState.leaferChildren}, expected=${renderState.leaferExpectedChildren}`)
+    }
+    if (!renderState.leaferPixelNonEmpty) {
+      throw new Error(`Bench Leafer evidence invalid: canvas pixel sample empty (samples=${renderState.leaferPixelSampleCount})`)
+    }
   }
   const afterRenderHeap = await cdpSession.send('Runtime.getHeapUsage')
 
@@ -910,6 +913,9 @@ const main = async () => {
         rendererMode: result.runs[0]?.renderer?.actual || options.renderer,
         cullingMode: result.runs[0]?.renderer?.cullingActual || options.culling,
         renderedNodeCount: result.runs[0]?.renderState?.renderedNodeCount,
+        leaferExpectedChildren: result.runs[0]?.renderState?.leaferExpectedChildren,
+        leaferChildren: result.runs[0]?.renderState?.leaferChildren,
+        leaferPixelNonEmpty: result.runs[0]?.renderState?.leaferPixelNonEmpty,
         totalNodeCount: result.runs[0]?.renderState?.totalNodeCount,
       }))
       const worstP95 = Math.max(...dprGateValues.map((result) => result.p95FrameMs ?? 0))

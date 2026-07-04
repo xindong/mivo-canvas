@@ -4,9 +4,8 @@
  * 在不同 zoom / pan / DPR 下，采样若干节点的四角/中心屏幕坐标
  * （getBoundingClientRect），输出 JSON artifact。
  *
- * 当前只对 DOM 采（leafer renderer 未实现，等同 dom）。
- * 本 PR 只建立采集框架；Phase 2+ Leafer 上线后，同一 scenario 跑双模式
- * 对照 DOM/Leafer 屏幕坐标偏差 ≤1 CSS px。
+ * text/connector 等非 Leafer 真画节点在 dom/leafer 两种模式都走 DOM；leafer
+ * 模式额外记录 image/frame 的 Leafer probe screenRect，用来定位 DOM 坐标一致但真画几何偏移的问题。
  *
  * probe 性质：不断言精确值，仅校验采样到足够节点 + viewport 已推进，
  * 避免空跑。zoom/pan 驱动用真实交互（Ctrl+wheel / hand-drag），actual
@@ -32,13 +31,28 @@ const readViewport = async (page) =>
 
 const sampleNodes = async (page) => {
   const shellBox = await page.locator('.canvas-shell').boundingBox()
-  const nodes = await page.evaluate((limit) => {
-    const elements = Array.from(document.querySelectorAll('.dom-node')).slice(0, limit)
+  const sample = await page.evaluate((limit) => {
+    const preferred = Array.from(
+      document.querySelectorAll(
+        [
+          '.dom-node[data-node-type="text"]',
+          '.dom-node[data-node-type="connector"]',
+          '.dom-node[data-node-type="task-placeholder"]',
+          '.dom-node[data-node-type="ai-slot"]',
+          '.dom-node:not([data-node-type="image"]):not([data-node-type="frame"]):not([data-markup-kind="rect"])',
+        ].join(','),
+      ),
+    )
+    const elements = (preferred.length >= 3 ? preferred : Array.from(document.querySelectorAll('.dom-node'))).slice(0, limit)
+    const sampleKind = preferred.length >= 3 ? 'dom-non-painted' : 'dom-all-fallback'
     return elements.map((element) => {
       const id = element.getAttribute('data-node-id') || element.getAttribute('data-id') || null
       const rect = element.getBoundingClientRect()
       return {
         id,
+        sampleKind,
+        nodeType: element.getAttribute('data-node-type'),
+        markupKind: element.getAttribute('data-markup-kind'),
         rect: { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom, width: rect.width, height: rect.height },
         corners: {
           topLeft: { x: rect.left, y: rect.top },
@@ -51,7 +65,12 @@ const sampleNodes = async (page) => {
     })
   }, SAMPLE_NODE_LIMIT)
   const viewport = await readViewport(page)
-  return { viewport, shellBox, nodeCount: nodes.length, nodes }
+  const leafer = await page.evaluate(() => {
+    const stats = window.__MIVO_LEAFER_SPIKE__?.getStats?.() || null
+    const paintedNodes = window.__MIVO_LEAFER_SPIKE__?.getPaintedNodes?.().slice(0, 6) || []
+    return { stats, paintedNodes }
+  })
+  return { viewport, shellBox, nodeCount: sample.length, nodes: sample, leafer }
 }
 
 const wheelZoom = async (page, steps, direction) => {
@@ -106,8 +125,12 @@ const serialize = (results) =>
     viewport: r.viewport,
     shellBox: r.shellBox,
     nodeCount: r.nodeCount,
+    leafer: r.leafer,
     nodes: (r.nodes || []).map((node) => ({
       id: node.id,
+      sampleKind: node.sampleKind,
+      nodeType: node.nodeType,
+      markupKind: node.markupKind,
       rect: node.rect,
       corners: Object.fromEntries(
         Object.entries(node.corners).map(([key, point]) => [key, { x: round(point.x), y: round(point.y) }]),
@@ -132,7 +155,16 @@ export const runCoordinateProbeScenario = async (context) => {
     await dpr2Page.goto(canvasUrl || baseUrl, { waitUntil: 'networkidle' })
     await dpr2Page.addStyleTag({ content: '*,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important;}' })
     await dpr2Page.waitForSelector('.canvas-shell')
-    await dpr2Page.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
+    if (context.rendererMode === 'leafer') {
+      await dpr2Page.waitForFunction(() => {
+        const shell = document.querySelector('.canvas-shell')
+        const expected = Number(shell?.getAttribute('data-leafer-expected-children') || 0)
+        const children = Number(shell?.getAttribute('data-leafer-children') || 0)
+        return expected > 0 && children === expected && shell?.getAttribute('data-leafer-pixel-nonempty') === 'true'
+      }, { timeout: 15000 })
+    } else {
+      await dpr2Page.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
+    }
     await dpr2Page.waitForTimeout(300)
     dpr2Results = await probeSequence(dpr2Page, 'dpr2')
     await dpr2Context.close()
@@ -145,7 +177,7 @@ export const runCoordinateProbeScenario = async (context) => {
       scenario: 'coordinate-probe',
       renderer: context.rendererMode,
       dprValues: [1, 2],
-      note: 'Leafer renderer 未实现，本 PR 仅采集 DOM 屏幕坐标作为基线框架；Phase 2+ Leafer 上线后同 scenario 跑双模式对照 (≤1 CSS px)。',
+      note: 'text/connector 等非 Leafer 真画节点两模式都走 DOM；坐标应逐像素一致。Leafer 模式额外记录真画节点 probe rect。',
       sampleNodeLimit: SAMPLE_NODE_LIMIT,
     },
     dpr1: serialize(dpr1Results),
@@ -159,8 +191,12 @@ export const runCoordinateProbeScenario = async (context) => {
 
   // Framework self-check: baseline DPR=1 must sample >=3 nodes and have a non-zero viewport scale.
   const baseline = dpr1Results[0]
-  if (!baseline || baseline.nodeCount < 3) {
-    throw new Error(`Coordinate probe framework check failed: expected >=3 sampled nodes at DPR=1 baseline, got ${baseline?.nodeCount ?? 0}`)
+  const leaferPaintedCount = baseline?.leafer?.stats?.children || 0
+  if (!baseline || (baseline.nodeCount < 3 && leaferPaintedCount < 3)) {
+    throw new Error(
+      `Coordinate probe framework check failed: expected >=3 sampled DOM nodes or Leafer painted nodes at DPR=1 baseline, `
+      + `got dom=${baseline?.nodeCount ?? 0} leafer=${leaferPaintedCount}`,
+    )
   }
   if (!baseline.viewport.scale || baseline.viewport.scale <= 0) {
     throw new Error(`Coordinate probe framework check failed: viewport scale not reported (${baseline.viewport.scale})`)

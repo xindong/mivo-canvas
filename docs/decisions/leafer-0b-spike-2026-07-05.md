@@ -1,76 +1,98 @@
-# Leafer 0b Spike — 规模对照与 go/no-go 判定
+# Leafer 0b Spike - final go/no-go
 
-> 日期：2026-07-05 ｜ 分支：feat/leafer-0b-spike ｜ 基线：origin/main @ 80c37d8（含 PR-1）
-> 工装：PR-1 的 bench（10k+ 四段指标 + settle 断言 + localStorage shim）、visual-diff、coordinate-probe、--renderer/--culling
-> 详设参考：~/.claude/plans/leafer-designs/phase2b-adapter-camera-zorder.md（0b spike 是其最小子集，正式化时按详设重构）
+> Date: 2026-07-05
+> Branch: `feat/leafer-0b-spike`
+> Baseline: `origin/main @ 65c03f1`
+> Gate: 20k Leafer pan p95 <= 33ms
+> Verdict: **NO-GO for Phase 2b without a culling/virtualization spike first**
 
-## 1. spike 实现范围（最小，非终态）
+## Scope
 
-- `src/render/useLeaferSpikeRenderer.ts`：Leafer init（**hittable:false** D1，rAF 等 host 有非零尺寸再 init，避免 canvas 塌成 1px）+ **相机单向同步**（React viewport → `leafer.zoomLayer.set({x,y,scaleX,scaleY})`，禁反向监听 `zoomLayer.__`）+ paint image/frame/rect（diff add/update/remove，Map<id, object>）+ `leaferReady` state 触发 paint/cameraSync 在 init 后跑。
-- `src/render/leaferSpikeFilter.ts`：leafer 模式从 DOM 渲染列表剔除 image/frame/markup-rect（否则测不出差异）；dom 模式原样返回（零变化）。
-- `src/render/rendererMode.ts`：leafer warn → log「spike renderer active (image/frame/rect only)」。
-- MivoCanvas：删旧 Leafer init effect（-35 行）+ leaferRef 定义，接 `useLeaferSpikeRenderer`，renderedNodes useMemo 套 `filterDomNodesForLeaferSpike`。**净 -30 行（955→925）**，structure-guard 0 FAIL。
-- **只画 image/frame/rect 三类**；text/markdown/ai-slot/markup 非 rect 等继续 DOM。交互在 leafer 模式允许暂时残缺（spike 只测渲染性能；pan/zoom 走 viewport 不依赖节点命中）。
-- **0b spike 代码非终态**：Phase 2b 正式化时按 phase2b 详设拆 useLeaferHost + useLeaferCameraSync + RendererAdapter + EditOverlayLayer + z-order 契约。
+Phase 0b implemented the smallest useful Leafer renderer:
 
-## 2. 对照矩阵（runs=3 median，DPR1，culling=on）
+- Leafer host with `hittable:false`, initialized only after the host has non-zero layout.
+- One-way camera sync: React viewport -> `leafer.zoomLayer.set({ x, y, scaleX, scaleY })`.
+- True Leafer paint for `image`, `frame`, and `markup rect`; those nodes are removed from DOM in `?renderer=leafer`.
+- Text, connectors, markdown, AI slots, and non-rect markup remain DOM.
+- Reconcile is id-based and updates only when paint-relevant node content changes; pan/zoom only syncs camera.
+- Bench and visual tools now wait for actual Leafer paint evidence before accepting numbers.
 
-| nodes | renderer | panP95(ms) | panLongTaskTotal(s) | panLongTaskCount | zoomP95(ms) | heapΔ(MB) |
-|------:|---------|-----------:|--------------------:|-----------------:|-----------:|----------:|
-| 5000  | dom     | 43.0       | 47.3                | 146              | 33.4       | 84.8      |
-| 5000  | leafer  | 175.0      | 15.8                | 146              | 25.4       | 47.3      |
-| 10000 | dom     | 10.3       | 121.5               | 218              | 41.3       | 139.0     |
-| 10000 | leafer  | 391.5      | 39.8                | 147              | 50.1       | 87.5      |
-| 20000 | dom†    | 25.0       | 233.0               | 218              | 41.8       | 267.8     |
-| 20000 | leafer  | 10.4*      | 91.3                | 147              | 59.7       | 151.2     |
+`src/canvas/MivoCanvas.tsx` is still under the red line: `origin/main` 885 lines -> final 861 lines.
 
-† 20k dom on 为 runs=1（runs=3 transient 失败，单跑补数）。* 20k leafer panP95=10.4 不可信：long task 阻塞 rAF 致 frame 采样稀疏（frameCount 未采集到），p95 取到少数短间隔；**真实卡顿看 panLongTaskTotal=91.3s**。
+## Invalidated Data
 
-culling=off 数据：未完整采集（rerun transient 失败）。**culling 对 leafer 影响小**——本 spike 的 culling 只作用于 DOM 节点（text/connector），Leafer 始终全量画 image+frame（无 Leafer-level culling）。因此 `--culling=on/off` 对 leafer pan 几乎无差异，对照实验需等 Leafer culling 实现后再做。
+The two earlier 0b runs are invalid and were moved to `bench/baselines/0b-invalid-*`.
 
-## 3. 数据解读
+What failed:
 
-**可靠指标（panLongTaskTotal / heap）：**
-- **heap**：leafer 始终省 ~40%（5k 47 vs 85、10k 88 vs 139、20k 151 vs 268）。Leafer canvas 单层位图 vs DOM 1N 个 div+img，内存优势确定。
-- **panLongTaskTotal**：leafer 是 dom 的 ~1/3（5k 16s vs 47s、10k 40s vs 122s、20k 91s vs 233s）。Leafer canvas paint 比 DOM div paint 的主线程阻塞更轻。
+- Bench accepted `?renderer=leafer` numbers without proving Leafer actually painted.
+- This allowed empty-canvas runs to look unrealistically fast, especially the prior 20k Leafer p95=10.4ms.
+- Visual diff captured before Leafer paint settled, producing the earlier 10.47% diff.
+- CDP tracing was unstable at 10k+ and could hang; the final matrix uses in-page rAF frame intervals plus Long Task data as the measurement source, with synthetic trace markers only for self-check shape.
 
-**不可靠指标（panP95 frame interval）：**
-- leafer panP95 噪声极大（5k 175、10k 391、20k 10.4）—— rAF 采样被 long task 扰乱，frame 数稀疏时不反映真实卡顿。dom 同样受扰但趋势更稳。**panP95 不可单独作 gate**，须配 panLongTaskTotal。
+Final validity checks:
 
-**zoom**：leafer 5k 25ms < dom 33ms（快），但 10k/20k leafer 50/60ms > dom 41/42ms（慢）—— 10k+ zoom 时 Leafer 全量重绘 image 比 DOM transform 慢。
+- Each Leafer run records `renderState.leaferExpectedChildren`, `renderState.leaferChildren`, `renderState.leaferPixelNonEmpty`, and `renderState.leaferSyncVersion`.
+- Bench rejects Leafer runs unless `children === expectedChildren`, expected is >0, and a canvas pixel sample is non-empty.
+- Visual diff waits on the same evidence.
 
-## 4. go/no-go 判定
+## Final Matrix
 
-**bar（lead 定义）**：20k leafer pan p95 ≤33ms = go；20k 全量超标 + culling 达标 = go 但虚拟化前移；两者都超 = no-go 升级。
+Runs: 3 each. Browser: Playwright Chromium. Viewport: 1920x1080. DPR: 1. Seed: 20260704.
 
-**判定：go 但虚拟化前移（Leafer 路线继续，culling/虚拟化独立 track 前移进计划）。**
+| nodes | renderer | culling | pan p95 ms | zoom p95 ms | load ms | sync ms | heap delta MB | long tasks | Leafer children |
+|---:|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 5000 | dom | on | 43.3 | 33.4 | 2484.6 | 438.5 | 68.5 | 156 | 0 |
+| 5000 | dom | off | 42.7 | 50.0 | 2451.6 | 455.3 | 68.5 | 168 | 0 |
+| 5000 | leafer | on | 173.5 | 25.1 | 1781.2 | 431.8 | 39.9 | 152 | 3300 / 3300 |
+| 5000 | leafer | off | 175.1 | 133.3 | 1784.5 | 435.0 | 46.2 | 160 | 3300 / 3300 |
+| 10000 | dom | on | 58.6 | 91.8 | 5697.7 | 797.5 | 121.8 | 159 | 0 |
+| 10000 | dom | off | 66.7 | 950.0 | 5745.0 | 813.3 | 127.4 | 177 | 0 |
+| 10000 | leafer | on | 592.6 | 150.0 | 4431.2 | 808.4 | 89.0 | 155 | 6600 / 6600 |
+| 10000 | leafer | off | 666.9 | 524.1 | 4461.9 | 797.7 | 89.4 | 164 | 6600 / 6600 |
+| 20000 | dom | on | 100.1 | 149.9 | 13825.5 | 1555.6 | 242.9 | 232 | 0 |
+| 20000 | dom | off | 125.1 | 150.0 | 14691.1 | 1559.1 | 300.8 | 249 | 0 |
+| 20000 | leafer | on | 75.3 | 274.2 | 11379.6 | 1557.3 | 150.1 | 155 | 13200 / 13200 |
+| 20000 | leafer | off | 83.4 | 66.9 | 12065.9 | 1553.1 | 130.8 | 169 | 13200 / 13200 |
 
-理由：
-1. **leafer 渲染效率有优势**：heap 省 40%、panLongTaskTotal 是 dom 的 1/3——Leafer canvas 单层位图 + zoomLayer transform 的上限优于 DOM 1N div。**不是 no-go 升级**（换 PixiJS/自研 WebGL 无必要，Leafer 渲染层达标）。
-2. **pan 卡顿根因明确 = 全量画**：spike 的 Leafer 无 culling，20k 全量画 ~12k image+frame，pan 时 zoomLayer.set 移动 12k 节点 + 重绘。`--culling` 对 leafer 无效（culling 只 DOM）。
-3. **culling 达标不成立**：当前 culling 不影响 Leafer paint，无法验" +culling 达标"。但根因（全量画）可由 **Leafer-level culling / 虚拟化**（只画视口内 image+frame，与 DOM culling 同语义）解决——这是独立 track，需前移进计划（Phase 0c 或 Phase 6 前移）。
-4. **不达 33ms bar 但路线正确**：20k leafer panLongTaskTotal 91s 仍卡，但已比 dom 233s 好 1/3。加 Leafer culling 后预期大幅下降（视口内 ~几十节点 vs 12k）。
+All Leafer rows had `leaferPixelNonEmpty=true`.
 
-**转 PixiJS/自研 WebGL 阈值（写清）**：若 Leafer + 虚拟化（只画视口内）20k pan p95 仍 >33ms / panLongTaskTotal >30s → 转 PixiJS 或自研 WebGL。本 spike 未达此阈值前（虚拟化未实现），不触发。
+## Interpretation
 
-## 5. 坐标一致性初验（design-p2 pixelRatio 风险）
+The gate fails: **20k Leafer pan p95 is 75.3ms with culling on and 83.4ms with culling off**, both above 33ms.
 
-- **visual-diff DOM baseline vs leafer candidate（默认 canvas 3 节点，同 viewport）**：**diff 0.29%（passed，threshold 1%）**。三类图形位置重合，pixelRatio 偏移风险未现（rAF init + zoomLayer.set 路径正确）。
-- 0.29% 差异为渲染细节（抗锯齿 / image 解码像素级），非几何偏移。
-- **coordinate-probe**：dom 模式采到 3 节点坐标（baseline viewport scale=1 x=420 y=240，first node corners topLeft 380,50）。leafer 模式 probe TimeoutError——默认 canvas 3 节点全为 image，leafer 模式被 Leafer 画、DOM 无节点，probe 采不到（**属预期**，lead 已标注）。需 fixture 场景（含 text 节点）才能采 leafer 模式 DOM 节点坐标对比——留 Phase 2b。
+The final data still has one anomaly: 10k Leafer pan is much worse than 20k Leafer pan even though both prove full paint. This is stable across all three runs, so it is not the old empty-canvas race. The likely cause is workload shape and browser scheduling, not missing paint. Because the 20k measured value is already above the gate, this anomaly does not change the go/no-go decision.
 
-## 6. 50k 数据
+Important constraint: current `--culling` does not cull Leafer paint. It only affects the remaining DOM nodes. Leafer still paints all image/frame nodes, so the culling comparison is not yet a true Leafer virtualization test.
 
-**未跑**。20k leafer panLongTaskTotal 91s（卡顿），按 lead「50000 若 20k 结果健康再加跑」——20k 不健康，50k 必然更卡，不跑。
+## Visual And Coordinate Checks
 
-## 7. 残余风险 / 下一步
+`npm run visual:diff -- --candidate=leafer --port=4189`
 
-- **Leafer culling 缺失**：当前 Leafer 全量画，pan 卡顿根因。**虚拟化 track 前移**（Phase 0c：Leafer 视口 culling，与 DOM culling 同 viewportRect 语义，只画视口内 image/frame）。
-- **panP95 不可靠**：bench 的 frame 采样被 long task 扰乱。**改进 bench 指标**：pan gate 改用 panLongTaskTotal + frame p95 双指标，或用 CDP trace 的 raster 阶段。
-- **交互残缺**：leafer 模式 image/frame 无 DOM 命中（hittable:false）。Phase 2b 的 shell 统一 hit-test + Leafer 不接事件（D1）解决。
-- **数据噪声**：runs=3 中部分配置 transient 失败（dev server networkidle / page.evaluate 时序），20k dom on 用 runs=1 补。生产 gate 需重跑稳定数据。
-- **culling off 对照缺**：rerun transient 失败未补全；culling 对 leafer 影响小（已说明），非 gate 阻塞。
+- Final diff: **0.2897%**, threshold 5%, pass.
+- Candidate evidence: `leaferExpectedChildren=3`, `leaferChildren=3`, `leaferPixelNonEmpty=true`.
+- Earlier 10.47% diff was a timing artifact: capture happened before Leafer paint settled.
 
-## 8. 结论
+`npm run test:e2e:dev -- --scenario=coordinate-probe --renderer=both`
 
-Leafer 作为 2D paint 后端**路线可行**（heap/longTaskTotal 优于 DOM），但**必须配虚拟化**才能兑现 pan 性能。0b spike 验证了渲染层 + 相机单向同步 + 坐标重合（0.29%），暴露了全量画的 pan 瓶颈。**下一步：Phase 0c Leafer culling（前移）→ Phase 2b 正式化（拆 hook + z-order + EditOverlayLayer + 交互重建）**。不转 PixiJS/自研 WebGL（未达阈值）。
+- Both DOM and Leafer coordinate probes pass.
+- Default demo has only the three image nodes, so there are no shared text nodes to compare in that scene.
+- The Leafer probe exposes painted-node screen rects; comparing the three demo image rects against DOM gives max delta **0 CSS px** across DPR1 zoom/pan samples.
+
+## Decision
+
+**NO-GO to proceed directly into Phase 2b formalization.**
+
+Proceed first with a small Phase 0c: Leafer-level viewport culling / virtualization for image and frame nodes, using the same viewport rect semantics as DOM culling. Re-run the exact matrix with the same paint evidence gates.
+
+Continue with Leafer only if Phase 0c brings 20k Leafer culling-on pan p95 to <=33ms and does not regress visual/coordinate checks. If Phase 0c still misses the gate, revisit renderer choice or move to a more aggressive WebGL/Pixi-style backend evaluation.
+
+## Validation
+
+- `npm run build` passed.
+- `npm run lint` passed.
+- `npm run test:unit` passed: 48 files, 554 passed, 12 skipped.
+- `npm run verify:logging` passed.
+- `node scripts/ci/structure-guard.mjs` passed: 0 FAIL, 1 existing warning.
+- `npm run visual:diff -- --candidate=leafer --port=4189` passed.
+- `npm run test:e2e:dev -- --scenario=coordinate-probe --renderer=both` passed.
