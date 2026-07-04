@@ -59,7 +59,8 @@ vi.mock('./remoteDebugReporter', () => ({
 
 import { useCanvasStore, migratePersistedState } from './canvasStore'
 import { useChatStore } from './chatStore'
-import type { MivoCanvasNode } from '../types/mivoCanvas'
+import type { ChatMessage } from './chatStore'
+import type { CanvasTask, MivoCanvasNode } from '../types/mivoCanvas'
 
 // Helpers ---------------------------------------------------------------------
 
@@ -73,6 +74,36 @@ const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => (
   height: 200,
   status: 'ready',
   assetUrl: '/a.png',
+  ...overrides,
+})
+
+const aiSlotNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
+  id: 'slot-1',
+  type: 'ai-slot',
+  title: 'Slot',
+  x: 10,
+  y: 20,
+  width: 320,
+  height: 320,
+  status: 'ready',
+  ...overrides,
+})
+
+const task = (overrides: Partial<CanvasTask> = {}): CanvasTask => ({
+  id: 'task-1',
+  label: '生成到槽位：Slot',
+  status: 'done',
+  progress: 100,
+  nodeIds: [],
+  ...overrides,
+})
+
+const chatMessage = (overrides: Partial<ChatMessage> = {}): ChatMessage => ({
+  id: 'msg-1',
+  role: 'assistant',
+  text: 'rich prompt',
+  createdAt: 1000,
+  status: 'done',
   ...overrides,
 })
 
@@ -163,6 +194,49 @@ describe('contract: canvas persist v8 shape (partialize field set)', () => {
     expect(useCanvasStore.getState().canvases['character-flow']?.title).toBe('Hydrated')
     expect(useCanvasStore.getState().brushStyle).toEqual({ color: '#000000', width: 8, kind: 'marker' })
   })
+
+  it('hydration: settles expired canvas generation slots/tasks and syncs the active document', async () => {
+    const slot = aiSlotNode({
+      status: 'generating',
+      generation: { prompt: 'p', model: 'gpt-image-2', taskId: 'task-1' },
+      aiWorkflow: { kind: 'slot', status: 'generating', operation: 'slot-generation', prompt: 'p' },
+    })
+    const runningTask = task({ status: 'running', progress: 42, stage: 'poll' })
+    const persisted = {
+      state: {
+        canvases: {
+          'character-flow': {
+            title: 'Hydrated',
+            nodes: [slot],
+            edges: [],
+            tasks: [runningTask],
+            selectedNodeId: undefined,
+            selectedNodeIds: [],
+          },
+        },
+        sceneId: 'character-flow',
+        selectedNodeId: undefined,
+        selectedNodeIds: [],
+        activeTool: 'select',
+        brushStyle: { color: '#000000', width: 8, kind: 'marker' },
+        activeStampKind: useCanvasStore.getState().activeStampKind,
+      },
+      version: 8,
+    }
+    ;(globalThis as { localStorage: { setItem: (k: string, v: string) => void } }).localStorage.setItem('mivo-canvas-demo', JSON.stringify(persisted))
+
+    await useCanvasStore.persist.rehydrate()
+
+    const state = useCanvasStore.getState()
+    const activeDoc = state.canvases['character-flow']
+    expect(activeDoc.nodes[0].aiWorkflow?.status).toBe('failed')
+    expect(activeDoc.nodes[0].status).toBe('failed')
+    expect(activeDoc.nodes[0].generation?.taskId).toBe('task-1')
+    expect(activeDoc.tasks[0].status).toBe('failed')
+    expect(activeDoc.tasks[0].progress).toBe(42)
+    expect(state.nodes[0].aiWorkflow?.status).toBe('failed')
+    expect(state.tasks[0].status).toBe('failed')
+  })
 })
 
 describe('contract: chat persist v2 shape', () => {
@@ -179,6 +253,97 @@ describe('contract: chat persist v2 shape', () => {
     const opts = useChatStore.persist.getOptions()
     const partialized = opts.partialize!(useChatStore.getState()) as Record<string, unknown>
     expect(partialized).not.toHaveProperty('isBusy')
+  })
+
+  it('hydration: settles persisted generating/enhancing messages and clears busy state', async () => {
+    const persisted = {
+      state: {
+        selectedModel: 'gemini-3-pro-image',
+        paramOverrides: { imgRatio: 'auto', quality: 'auto' },
+        messagesByScene: {
+          'character-flow': [
+            chatMessage({ id: 'msg-enhance', status: 'enhancing', generationContext: { model: 'gemini-3-pro-image', requestedImgRatio: 'auto', requestedQuality: 'auto' } }),
+            chatMessage({ id: 'msg-generate', status: 'generating', generationContext: { model: 'gemini-3-pro-image', requestedImgRatio: 'auto', requestedQuality: 'auto', pendingSlotId: 'slot-1' } }),
+          ],
+        },
+      },
+      version: 2,
+    }
+    useChatStore.setState({ ...useChatStore.getInitialState(), isBusy: true } as never, true)
+    ;(globalThis as { localStorage: { setItem: (k: string, v: string) => void } }).localStorage.setItem('mivo-chat-demo', JSON.stringify(persisted))
+
+    await useChatStore.persist.rehydrate()
+
+    const state = useChatStore.getState()
+    const messages = state.messagesByScene['character-flow']
+    expect(state.isBusy).toBe(false)
+    expect(messages.map((message) => message.status)).toEqual(['error', 'error'])
+    expect(messages.map((message) => message.error)).toEqual(['任务已过期,请重试。', '任务已过期,请重试。'])
+    expect(messages.map((message) => message.errorKind)).toEqual(['unknown', 'unknown'])
+    expect(messages[1].generationContext?.pendingSlotId).toBe('slot-1')
+  })
+})
+
+describe('contract: chat cancel fallback without an active controller', () => {
+  it('settles the chat message and matching canvas slot/task locally', () => {
+    const slot = aiSlotNode({
+      status: 'generating',
+      generation: { prompt: 'p', model: 'gpt-image-2', taskId: 'task-1' },
+      aiWorkflow: { kind: 'slot', status: 'generating', operation: 'slot-generation', prompt: 'p' },
+    })
+    const runningTask = task({ status: 'running', progress: 35, stage: 'poll' })
+    seed({
+      canvases: {
+        'character-flow': {
+          title: 'character-flow',
+          nodes: [slot],
+          edges: [],
+          tasks: [runningTask],
+          selectedNodeId: undefined,
+          selectedNodeIds: [],
+        },
+      },
+      sceneId: 'character-flow',
+      nodes: [slot],
+      edges: [],
+      tasks: [runningTask],
+      selectedNodeId: undefined,
+      selectedNodeIds: [],
+    })
+    useChatStore.setState({
+      ...useChatStore.getInitialState(),
+      isBusy: true,
+      messagesByScene: {
+        'character-flow': [
+          chatMessage({
+            id: 'msg-cancel',
+            status: 'generating',
+            generationContext: {
+              model: 'gemini-3-pro-image',
+              requestedImgRatio: 'auto',
+              requestedQuality: 'auto',
+              finalPrompt: 'p',
+              pendingSlotId: 'slot-1',
+            },
+          }),
+        ],
+      },
+    } as never, true)
+
+    useChatStore.getState().cancelGeneration({ sceneId: 'character-flow', messageId: 'msg-cancel' })
+
+    const chatState = useChatStore.getState()
+    const message = chatState.messagesByScene['character-flow'][0]
+    expect(chatState.isBusy).toBe(false)
+    expect(message.status).toBe('error')
+    expect(message.errorKind).toBe('canceled')
+    expect(message.error).toBe('已取消生成，可修改提示后重试。')
+
+    const canvasState = useCanvasStore.getState()
+    expect(canvasState.nodes[0].aiWorkflow?.status).toBe('canceled')
+    expect(canvasState.nodes[0].status).toBe('failed')
+    expect(canvasState.tasks[0].status).toBe('canceled')
+    expect(canvasState.tasks[0].progress).toBe(35)
   })
 })
 

@@ -4,6 +4,9 @@ import type { EnhanceResponse, GenerationRatio, MivoImageQuality } from '../type
 import { readImportedAssetFile, saveImportedAsset } from '../lib/assetStorage'
 import { MivoImageRequestError, enhanceMivoPrompt, type MivoImageRequestErrorKind } from '../lib/mivoImageClient'
 import { getModelCapabilities } from '../lib/modelCapabilities'
+import { settleCanvasGenerationLocally } from './canvasGenerationCancel'
+import { fallbackCancelTarget, settleExpiredChatMessages } from './chatGenerationHydration'
+import { debugLogger } from './debugLogStore'
 import { generationFacade } from './generationFacade'
 
 const maxMessagesPerScene = 200
@@ -78,7 +81,7 @@ type ChatState = {
     prompt?: string
   }) => void
   retryMessage: (options: { sceneId: string; messageId: string; qualityOverride?: MivoImageQuality }) => Promise<void>
-  cancelGeneration: () => void
+  cancelGeneration: (options?: { sceneId?: string; messageId?: string }) => void
   clearScene: (sceneId: string) => void
   setSelectedModel: (modelId: string) => void
   setParamOverride: (key: keyof ChatParamOverrides, value: string) => void
@@ -751,9 +754,51 @@ export const useChatStore = create<ChatState>()(
         }
       },
 
-      cancelGeneration: () => {
-        if (!activeChatAbortController || activeChatAbortController.signal.aborted) return
-        activeChatAbortController.abort()
+      cancelGeneration: (options = {}) => {
+        if (activeChatAbortController && !activeChatAbortController.signal.aborted) {
+          activeChatAbortController.abort()
+          return
+        }
+
+        const target = fallbackCancelTarget(get().messagesByScene, options)
+        if (!target) {
+          debugLogger.warn('Chat Store', 'Cancel fallback skipped: no in-flight chat message found')
+          return
+        }
+
+        set((s) => ({
+          isBusy: false,
+          messagesByScene: {
+            ...s.messagesByScene,
+            [target.sceneId]: (s.messagesByScene[target.sceneId] || []).map((message) =>
+              message.id === target.message.id
+                ? {
+                    ...message,
+                    status: 'error' as const,
+                    error: canceledGenerationMessage,
+                    errorKind: 'canceled' as const,
+                    timeoutRetryKey: undefined,
+                    timeoutRetryCount: undefined,
+                    retryDisabledReason: undefined,
+                  }
+                : message,
+            ),
+          },
+        }))
+
+        const slotId = target.message.generationContext?.pendingSlotId
+        const canvasResult = slotId
+          ? settleCanvasGenerationLocally({
+              sceneId: target.sceneId,
+              slotId,
+              status: 'canceled',
+            })
+          : { settledSlots: 0, settledTasks: 0 }
+
+        debugLogger.warn(
+          'Chat Store',
+          `Cancel fallback settled message ${target.message.id} in ${target.sceneId}; slots=${canvasResult.settledSlots}; tasks=${canvasResult.settledTasks}`,
+        )
       },
 
       clearScene: (sceneId) =>
@@ -793,6 +838,22 @@ export const useChatStore = create<ChatState>()(
         // isBusy excluded (runtime state)
       }),
       migrate: migrateChatPersistedState,
+      merge: (persistedState, currentState) => {
+        const persisted = (persistedState ?? {}) as Partial<ChatState>
+        const merged = {
+          ...currentState,
+          ...persisted,
+          isBusy: false,
+        }
+        const result = settleExpiredChatMessages(merged.messagesByScene || {})
+        if (result.settledMessages > 0) {
+          debugLogger.warn('Chat Store', `Hydration settled ${result.settledMessages} expired chat generation message(s)`)
+        }
+        return {
+          ...merged,
+          messagesByScene: result.messagesByScene,
+        }
+      },
     },
   ),
 )

@@ -90,6 +90,7 @@ export function ChatMessageList({ sceneId }: ChatMessageListProps) {
             <div className="chat-bubble chat-bubble-assistant">
               <EnhanceParamCard
                 message={message}
+                sceneId={sceneId}
               />
 
               {message.status === 'generating' && (
@@ -99,7 +100,7 @@ export function ChatMessageList({ sceneId }: ChatMessageListProps) {
                   <button
                     type="button"
                     className="chat-cancel-btn"
-                    onClick={cancelGeneration}
+                    onClick={() => cancelGeneration({ sceneId, messageId: message.id })}
                     title="取消本次生成"
                   >
                     取消
