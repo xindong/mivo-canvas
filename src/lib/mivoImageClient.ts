@@ -4,7 +4,7 @@ import { debugLogger } from '../store/debugLogStore'
 import { readImportedAssetFile } from './assetStorage'
 
 const defaultModel = 'gpt-image-2'
-const mivoRequestTimeoutMs = 245_000
+const mivoRequestTimeoutMs = 310_000
 const mivoEditRequestTimeoutMs = 185_000
 const mivoEnhanceTimeoutMs = 30_000
 

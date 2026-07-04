@@ -103,6 +103,7 @@ beforeEach(() => {
   __resetTaskRegistry()
   Object.assign(mockState, defaultMockState())
   mockState.downloadUrl = mockUrl
+  applyEnv()
 })
 
 const pollTask = async (
@@ -150,6 +151,33 @@ describe('C1a — progress is monotonic + stage-driven (not hardcoded)', () => {
             line.includes('promptLength=5'),
         ),
       ).toBe(true)
+    } finally {
+      logSpy.mockRestore()
+    }
+  })
+
+  it('runner writes platform quality, ratio, resolution, deadline, and job metadata', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined)
+    try {
+      const create = await req(
+        '/api/mivo/tasks/generate',
+        jsonReq({ prompt: 'a cat', model: 'gpt-image-2', quality: 'high', imgRatio: '16:9' }),
+      )
+      expect(create.status).toBe(202)
+      const taskId = field(create.body, 'taskId') as string
+      const done = await pollTask(taskId, (b) => b.status === 'done' || b.status === 'failed')
+      expect(done).not.toBeNull()
+      expect(done!.status).toBe('done')
+      const taskLog = logSpy.mock.calls
+        .map((call) => String(call[0]))
+        .find((line) => line.includes('[mivo-bff-task]') && line.includes(`taskId=${taskId}`))
+      expect(taskLog).toBeTruthy()
+      expect(taskLog).toMatch(/ts=\d{4}-\d{2}-\d{2}T[\d:.]+Z/)
+      expect(taskLog).toContain('quality=high')
+      expect(taskLog).toContain('imgRatio=16:9')
+      expect(taskLog).toContain('resolution=2K')
+      expect(taskLog).toContain('pollDeadlineMs=600')
+      expect(taskLog).toContain('platformJobIdHash=job-1')
     } finally {
       logSpy.mockRestore()
     }

@@ -144,6 +144,40 @@ describe('platform channel — generate/edit job', () => {
     expect(mockState.downloadCalls).toBe(1)
   })
 
+  it('transient submit 5xx → retries once → success', async () => {
+    mockState.submitStatusSequence = [500, 200]
+    const r = await req('/api/mivo/generate', jsonReq({ prompt: 'a cat', model: 'gpt-image-2' }))
+    expect(r.status).toBe(200)
+    expect(mockState.submitCalls).toBe(2)
+    expect(mockState.generateCalls).toBe(0)
+  })
+
+  it('platform safety-style 400 is not retried', async () => {
+    mockState.submitStatus = 400
+    const r = await req('/api/mivo/generate', jsonReq({ prompt: 'a cat', model: 'gpt-image-2' }))
+    expect(r.status).toBe(502)
+    expect(mockState.submitCalls).toBe(1)
+    expect(mockState.generateCalls).toBe(0)
+  })
+
+  it('platform HTTP 504 is not retried', async () => {
+    mockState.submitStatus = 504
+    const r = await req('/api/mivo/generate', jsonReq({ prompt: 'a cat', model: 'gpt-image-2' }))
+    expect(r.status).toBe(502)
+    expect(mockState.submitCalls).toBe(1)
+    expect(mockState.generateCalls).toBe(0)
+  })
+
+  it('ClosedChannelException poll failure → retries once → success', async () => {
+    mockState.pollSequence = ['failed', 'completed']
+    mockState.pollError = 'java.nio.channels.ClosedChannelException'
+    const r = await req('/api/mivo/generate', jsonReq({ prompt: 'a cat', model: 'gpt-image-2' }))
+    expect(r.status).toBe(200)
+    expect(mockState.submitCalls).toBe(2)
+    expect(mockState.pollCalls).toBe(2)
+    expect(mockState.generateCalls).toBe(0)
+  })
+
   it('platform poll failed → 502 sanitized', async () => {
     mockState.pollSequence = ['failed']
     const r = await req('/api/mivo/generate', jsonReq({ prompt: 'x', model: 'gpt-image-2' }))
@@ -156,6 +190,7 @@ describe('platform channel — generate/edit job', () => {
     const r = await req('/api/mivo/generate', jsonReq({ prompt: 'x', model: 'gpt-image-2', quality: 'medium' }))
     expect(r.status).toBe(504)
     expect((r.body as { error: string }).error).toContain('上游生成超时')
+    expect(mockState.submitCalls).toBe(1)
   })
 
   it('platform download empty → 502 结果为空', async () => {
@@ -273,6 +308,15 @@ describe('enhance', () => {
     expect(body.imgRatio).toBe('1:1')
     expect(body.quality).toBe('medium')
     expect(body.enhanced).toBe(true)
+  })
+
+  it('system prompt blocks real-person likeness and brand/IP names in richPrompt', async () => {
+    const r = await req('/api/mivo/enhance', jsonReq({ prompt: 'Mario celebrates like Ronaldo on a Switch', modelId: 'gpt-image-2' }))
+    expect(r.status).toBe(200)
+    expect(mockState.lastEnhanceBodyText).toContain('must not output real person')
+    expect(mockState.lastEnhanceBodyText).toContain('a fictional footballer performing an iconic celebratory jump')
+    expect(mockState.lastEnhanceBodyText).toContain('must not output brand, IP, or product names')
+    expect(mockState.lastEnhanceBodyText).toContain('bright family-friendly 3D platformer aesthetic')
   })
 
   it('200 chat mode (replyText normalized, no markdown)', async () => {
