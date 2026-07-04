@@ -11,14 +11,19 @@ This directory holds the stress fixtures and baseline summaries used by roadmap 
 - Fonts: do not change the machine font set between comparison runs.
 - Motion: force `prefers-reduced-motion` and inject a no-animation / no-transition stylesheet.
 - Seed: use a fixed deterministic seed.
-- Fixtures: fixed mixed-node snapshots at `100`, `500`, and `1000` nodes.
+- Fixtures: fixed mixed-node snapshots at `100`, `500`, `1000`, `5000`, `10000`, `20000`, and `50000` nodes. Small fixtures (≤1000) are committed for reproducibility; 5k+ fixtures are generated on demand (see `.gitignore`) because they exceed reasonable VCS size.
+- Renderer mode: the page is loaded with `?renderer=<dom|leafer>`; the report records `protocol.rendererModeActual` read from `.canvas-shell`'s `data-renderer-mode` so a requested `leafer` run that silently fell back to `dom` can never be mistaken for a real Leafer measurement.
+- Culling mode: the page is loaded with `?culling=<on|off>` (`on` = default viewport culling + overscan, `off` = render all `visibleNodes`); the report records `protocol.cullingModeActual` from `data-culling-mode`. `off` is the basis for the Phase 0b 「Leafer full vs Leafer+culling vs DOM」对照 experiment.
 - Scripted interactions: fixed canvas pan and zoom gestures only.
 - Sampling: run each configuration `5` times and use the median for baseline comparison.
 - Frame metric: compute `p50` / `p95` from sampled frame durations.
-- Other metrics: record heap usage and long-task counts / duration.
-- Current DOM pre-P2 sync metric: `store-to-renderer-sync` wraps `replaceSnapshot(snapshot)` until the canvas shell settles on the expected node count / viewport. Treat it as a full-snapshot load sync, not the future small-delta `applyDelta` metric.
+- Segments: each run captures four segments — `loadFixture` (replaceSnapshot ingestion), `render-sync` (settle until shell reports expected node count / viewport), `canvas-pan`, `canvas-zoom` — each with p95 frame, long-task count/total, and duration.
+- Other metrics: record heap usage at three points — `before-load`, `after-render` (render growth), `after-run` (total) — plus long-task counts / duration per segment.
+- Settle guard: `waitForRender` throws if the shell does not report the expected `data-total-node-count` / `data-viewport-scale` within 5 s; `runSingleCapture` re-asserts `renderer.actual === requested`, `culling.actual === requested`, and `totalNodeCount === fixture.meta.nodeCount` before writing a baseline, so a silently skipped render can never produce a bogus gate record.
+- Persistence shim: bench silences the `mivo-canvas-demo` localStorage write (zustand persist middleware) because 5k+ node snapshots exceed the ~5 MB quota. Bench measures render perf, not persistence.
 - Trace marks: keep these names stable:
-  - `store-to-renderer-sync`
+  - `loadFixture`
+  - `render-sync`
   - `canvas-pan`
   - `canvas-zoom`
 
@@ -39,6 +44,18 @@ Collect one configuration:
 
 ```bash
 npm run bench:collect -- --nodes=500 --dpr=1,2 --runs=5
+```
+
+Renderer / culling modes (`--renderer=dom|leafer`, `--culling=on|off`; both default to `dom` / `on`). The page URL carries both params and the report records the actual mode read back from `.canvas-shell`:
+
+```bash
+npm run bench:collect -- --nodes=10000 --renderer=dom --culling=off --runs=1
+```
+
+Large node counts (5k+) require the bench persistence shim (see Protocol); 10k+ DOM runs are the Phase 0 scale-probe target:
+
+```bash
+npm run bench:collect -- --nodes=10000,20000,50000 --renderer=dom --runs=3
 ```
 
 Collect the initial DOM baseline bundle:

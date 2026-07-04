@@ -4,6 +4,7 @@ import { runArchiveAssetsScenario } from './archive-assets.mjs'
 import { runMaskReflowScenario } from './mask-reflow.mjs'
 import { runCanvasInteractionsScenario } from './canvas-interactions.mjs'
 import { runChatGenerationScenario } from './chat-generation.mjs'
+import { runCoordinateProbeScenario } from './coordinate-probe.mjs'
 import { runDebugScenario } from './debug.mjs'
 import { runMaskScenario } from './mask.mjs'
 import { runMaskPointScenario } from './mask-point.mjs'
@@ -26,6 +27,7 @@ export const scenarioOrder = [
   'ai-slot-placeholder',
   'mask-reflow',
   'mask-point',
+  'coordinate-probe',
 ]
 
 export const scenarioBootstrapPredecessor = {
@@ -42,6 +44,7 @@ export const scenarioRunners = {
   'mask-reflow': runMaskReflowScenario,
   'canvas-interactions': runCanvasInteractionsScenario,
   'chat-generation': runChatGenerationScenario,
+  'coordinate-probe': runCoordinateProbeScenario,
   debug: runDebugScenario,
   mask: runMaskScenario,
   'mask-point': runMaskPointScenario,

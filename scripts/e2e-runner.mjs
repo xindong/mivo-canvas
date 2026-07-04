@@ -19,6 +19,23 @@ const parseTopology = (argv) => {
   return 'dev'
 }
 
+const parseRenderer = (argv) => {
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index]
+    if (arg === '--renderer') {
+      const value = argv[index + 1]
+      if (value === 'dom' || value === 'leafer' || value === 'both') return value
+      throw new Error('--renderer requires dom, leafer, or both')
+    }
+    if (arg.startsWith('--renderer=')) {
+      const value = arg.slice('--renderer='.length)
+      if (value === 'dom' || value === 'leafer' || value === 'both') return value
+      throw new Error(`Unknown --renderer value: ${value}`)
+    }
+  }
+  return 'dom'
+}
+
 const parseScenarios = (argv) => {
   const values = []
 
@@ -44,6 +61,7 @@ const parseScenarios = (argv) => {
 
 const argv = process.argv.slice(2)
 const topology = parseTopology(argv)
+const renderer = parseRenderer(argv)
 const requestedScenarios = parseScenarios(argv)
 const selectedScenarios = requestedScenarios.length === 0
   ? scenarioOrder
@@ -58,13 +76,15 @@ if (unknownScenarios.length > 0) {
 
 const smokeScript = fileURLToPath(new URL('./e2e-smoke.mjs', import.meta.url))
 
-const runScenarioAttempt = (scenarioName, index, attempt) =>
+const rendererModes = renderer === 'both' ? ['dom', 'leafer'] : [renderer]
+
+const runScenarioAttempt = (scenarioName, index, attempt, rendererMode) =>
   new Promise((resolve, reject) => {
     const scenarioPort = String((topology === 'prod' ? 6174 : 5174) + index * 10 + attempt)
-    console.log(`[e2e-runner] topology=${topology} scenario=${scenarioName} attempt=${attempt} port=${scenarioPort}`)
+    console.log(`[e2e-runner] topology=${topology} scenario=${scenarioName} renderer=${rendererMode} attempt=${attempt} port=${scenarioPort}`)
     const child = spawn(
       process.execPath,
-      [smokeScript, '--topology', topology, '--scenario', scenarioName],
+      [smokeScript, '--topology', topology, '--scenario', scenarioName, '--renderer', rendererMode],
       {
         stdio: 'inherit',
         env: {
@@ -79,33 +99,35 @@ const runScenarioAttempt = (scenarioName, index, attempt) =>
         resolve()
         return
       }
-      reject(new Error(`Scenario failed: ${scenarioName} (exit ${code ?? 'unknown'})`))
+      reject(new Error(`Scenario failed: ${scenarioName} renderer=${rendererMode} (exit ${code ?? 'unknown'})`))
     })
   })
 
 const maxAttempts = 2
 
-for (const [index, scenarioName] of selectedScenarios.entries()) {
-  let succeeded = false
+for (const rendererMode of rendererModes) {
+  for (const [index, scenarioName] of selectedScenarios.entries()) {
+    let succeeded = false
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    try {
-      await runScenarioAttempt(scenarioName, index, attempt)
-      succeeded = true
-      break
-    } catch (error) {
-      if (attempt === maxAttempts) throw error
-      console.warn(
-        `[e2e-runner] retrying scenario=${scenarioName} after attempt=${attempt} failure: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      )
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        await runScenarioAttempt(scenarioName, index, attempt, rendererMode)
+        succeeded = true
+        break
+      } catch (error) {
+        if (attempt === maxAttempts) throw error
+        console.warn(
+          `[e2e-runner] retrying scenario=${scenarioName} renderer=${rendererMode} after attempt=${attempt} failure: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        )
+      }
     }
-  }
 
-  if (!succeeded) {
-    throw new Error(`Scenario failed after ${maxAttempts} attempts: ${scenarioName}`)
+    if (!succeeded) {
+      throw new Error(`Scenario failed after ${maxAttempts} attempts: ${scenarioName} renderer=${rendererMode}`)
+    }
   }
 }
 
-console.log(`[e2e-runner] topology=${topology} passed ${selectedScenarios.length} scenario(s)`)
+console.log(`[e2e-runner] topology=${topology} renderer=${renderer} passed ${selectedScenarios.length} scenario(s) across ${rendererModes.length} renderer mode(s)`)
