@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import type { RenderAnchor, RenderNode } from './projection'
 import {
+  defaultLineMarkupPointsFor,
   defaultZOrderCompare,
   distToPolyline,
+  markupPointsToCanvas,
   pointInAnchor,
   pointInMarkupStroke,
   pointInNode,
@@ -85,9 +87,31 @@ describe('pointInNodeBounds / pointInNode', () => {
   })
 })
 
+describe('markupPointsToCanvas / defaultLineMarkupPointsFor', () => {
+  it('markupPointsToCanvas offsets node-local points by geometry.x/y', () => {
+    const node = makeNode({ id: 'l', geometry: { x: 200, y: 100, width: 100, height: 0, rotation: 0 } })
+    const canvas = markupPointsToCanvas(node, [
+      { x: 0, y: 0 },
+      { x: 100, y: 0 },
+    ])
+    expect(canvas).toEqual([
+      { x: 200, y: 100 },
+      { x: 300, y: 100 },
+    ])
+  })
+
+  it('defaultLineMarkupPointsFor returns bottom-left → top-right local endpoints', () => {
+    const node = makeNode({ id: 'l', geometry: { x: 0, y: 0, width: 80, height: 60, rotation: 0 } })
+    expect(defaultLineMarkupPointsFor(node)).toEqual([
+      { x: 0, y: 60 },
+      { x: 80, y: 0 },
+    ])
+  })
+})
+
 describe('pointInMarkupStroke', () => {
   const tol = 6
-  it('hits a line segment within tolerance', () => {
+  it('hits a line segment within tolerance (strokeWidth 0 → effective tol 7)', () => {
     const node = makeNode({
       id: 'l1',
       type: 'markup',
@@ -97,21 +121,76 @@ describe('pointInMarkupStroke', () => {
     })
     expect(pointInMarkupStroke(node, { x: 50, y: 0 }, tol)).toBe(true) // on the line
     expect(pointInMarkupStroke(node, { x: 50, y: 5 }, tol)).toBe(true) // within tol
-    expect(pointInMarkupStroke(node, { x: 50, y: 7 }, tol)).toBe(false)
-    expect(pointInMarkupStroke(node, { x: 200, y: 0 }, tol)).toBe(false) // past the end
+    expect(pointInMarkupStroke(node, { x: 50, y: 7 }, tol)).toBe(true) // lineHitTolerance bumps to 7
+    expect(pointInMarkupStroke(node, { x: 50, y: 8 }, tol)).toBe(false) // past bumped tol
+    expect(pointInMarkupStroke(node, { x: 200, y: 0 }, tol)).toBe(false) // past the end segment
   })
 
-  it('hits a brush polyline within tolerance', () => {
+  it('line: local points + geometry offset hit in canvas space', () => {
+    // Node at (200,100); local points (0,0)→(100,0) → canvas (200,100)→(300,100).
+    const node = makeNode({
+      id: 'l2',
+      type: 'markup',
+      markupKind: 'line',
+      geometry: { x: 200, y: 100, width: 100, height: 0, rotation: 0 },
+      markupPoints: [{ x: 0, y: 0 }, { x: 100, y: 0 }],
+    })
+    expect(pointInMarkupStroke(node, { x: 250, y: 100 }, tol)).toBe(true) // on canvas line
+    expect(pointInMarkupStroke(node, { x: 250, y: 107 }, tol)).toBe(true) // within bumped tol 7
+    expect(pointInMarkupStroke(node, { x: 50, y: 100 }, tol)).toBe(false) // pre-offset local x=50 — not on canvas line
+    expect(pointInMarkupStroke(node, { x: 250, y: 108 }, tol)).toBe(false) // past tol
+  })
+
+  it('line: falls back to default endpoints when markupPoints missing', () => {
+    // geometry 80×60, no points → default local (0,60)→(80,0) → canvas (10,70)→(90,10).
+    const node = makeNode({
+      id: 'l3',
+      type: 'markup',
+      markupKind: 'line',
+      geometry: { x: 10, y: 10, width: 80, height: 60, rotation: 0 },
+    })
+    const mid = { x: 10 + 40, y: 10 + 30 } // canvas midpoint of the default diagonal
+    expect(pointInMarkupStroke(node, mid, tol)).toBe(true)
+    expect(pointInMarkupStroke(node, { x: 10, y: 10 }, tol)).toBe(false) // corner, off the diagonal
+  })
+
+  it('line endpoint tolerance aligns with DOM .markup-hit-line (max(14, sw+10)/2)', () => {
+    // strokeWidth 0 → DOM strokeWidth=max(14,10)=14 → radius 7. Endpoint at canvas (200,100).
+    const thin = makeNode({
+      id: 'lt',
+      type: 'markup',
+      markupKind: 'line',
+      geometry: { x: 200, y: 100, width: 100, height: 0, rotation: 0 },
+      markupPoints: [{ x: 0, y: 0 }, { x: 100, y: 0 }],
+      markupStrokeWidth: 0,
+    })
+    expect(pointInMarkupStroke(thin, { x: 200, y: 107 }, 6)).toBe(true) // endpoint within 7
+    expect(pointInMarkupStroke(thin, { x: 200, y: 108 }, 6)).toBe(false)
+    // strokeWidth 20 → DOM strokeWidth=max(14,30)=30 → radius 15.
+    const thick = makeNode({ ...thin, id: 'lt2', markupStrokeWidth: 20 })
+    expect(pointInMarkupStroke(thick, { x: 200, y: 115 }, 6)).toBe(true) // endpoint within 15
+    expect(pointInMarkupStroke(thick, { x: 200, y: 116 }, 6)).toBe(false)
+  })
+
+  it('hits a brush polyline within tolerance (local points + geometry offset)', () => {
+    // Node at (50,30); local polyline (0,0)→(100,100)→(200,0) → canvas (50,30)→(150,130)→(250,30).
     const node = makeNode({
       id: 'b1',
       type: 'markup',
       markupKind: 'brush',
-      geometry: { x: 0, y: 0, width: 100, height: 100, rotation: 0 },
+      geometry: { x: 50, y: 30, width: 200, height: 100, rotation: 0 },
       markupPoints: [{ x: 0, y: 0 }, { x: 100, y: 100 }, { x: 200, y: 0 }],
     })
-    expect(pointInMarkupStroke(node, { x: 50, y: 50 }, tol)).toBe(true) // on seg 1
-    expect(pointInMarkupStroke(node, { x: 150, y: 50 }, tol)).toBe(true) // on seg 2
-    expect(pointInMarkupStroke(node, { x: 50, y: 60 }, tol)).toBe(false) // too far from both
+    // Seg 1 midpoint = canvas (100,80); seg 2 midpoint = canvas (200,80).
+    expect(pointInMarkupStroke(node, { x: 100, y: 80 }, tol)).toBe(true) // on seg 1 (canvas)
+    expect(pointInMarkupStroke(node, { x: 200, y: 80 }, tol)).toBe(true) // on seg 2 (canvas)
+    // (100,90): nearest point on seg 1 is (105,85), dist ~7.07 > tol 6 → miss.
+    expect(pointInMarkupStroke(node, { x: 100, y: 90 }, tol)).toBe(false)
+    // Canvas-space start of seg 1 — proves the geometry offset is applied.
+    expect(pointInMarkupStroke(node, { x: 50, y: 30 }, tol)).toBe(true)
+    // Pre-offset local-space point (0,0) must NOT hit (it maps to canvas (50,30) only via offset;
+    // here we pass (0,0) directly as a canvas point, which is far from the canvas polyline).
+    expect(pointInMarkupStroke(node, { x: 0, y: 0 }, tol)).toBe(false)
   })
 
   it('hits a rect border (not interior) within tolerance', () => {
@@ -130,6 +209,71 @@ describe('pointInMarkupStroke', () => {
   it('ellipse/note/stamp return false (bounds hit covers them)', () => {
     const ellipse = makeNode({ id: 'e1', type: 'markup', markupKind: 'ellipse', geometry: { x: 0, y: 0, width: 100, height: 100, rotation: 0 } })
     expect(pointInMarkupStroke(ellipse, { x: 50, y: 50 }, tol)).toBe(false)
+  })
+})
+
+describe('pointInNode — line/arrow stroke-only parity', () => {
+  const tol = 6
+  it('line: click inside bbox but off the stroke does NOT hit (stroke-only)', () => {
+    // Line at canvas (200,100)→(300,100); bbox is x[200,300] y[100,100] (zero height).
+    // Give it a non-zero bbox by setting height so bounds would catch an interior point.
+    const node = makeNode({
+      id: 'l',
+      type: 'markup',
+      markupKind: 'line',
+      geometry: { x: 200, y: 100, width: 100, height: 80, rotation: 0 },
+      markupPoints: [{ x: 0, y: 0 }, { x: 100, y: 0 }],
+    })
+    // (250, 150) is inside the 100×80 bbox but far from the stroke at y=100.
+    expect(pointInNodeBounds(node, { x: 250, y: 150 })).toBe(true) // bbox would catch
+    expect(pointInNode(node, { x: 250, y: 150 }, tol)).toBe(false) // stroke-only: falls through
+    expect(pointInNode(node, { x: 250, y: 100 }, tol)).toBe(true) // on the stroke
+  })
+
+  it('brush: bbox OR stroke (interior still hits via bounds)', () => {
+    const node = makeNode({
+      id: 'b',
+      type: 'markup',
+      markupKind: 'brush',
+      geometry: { x: 0, y: 0, width: 100, height: 100, rotation: 0 },
+      markupPoints: [{ x: 0, y: 0 }, { x: 100, y: 100 }],
+    })
+    expect(pointInNode(node, { x: 50, y: 50 }, tol)).toBe(true) // interior via bounds
+    expect(pointInNode(node, { x: 50, y: 0 }, tol)).toBe(true) // on the stroke
+  })
+
+  it('rect: bbox covers interior; border also stroke-toleranced', () => {
+    const node = makeNode({
+      id: 'r',
+      type: 'markup',
+      markupKind: 'rect',
+      geometry: { x: 0, y: 0, width: 100, height: 100, rotation: 0 },
+    })
+    expect(pointInNode(node, { x: 50, y: 50 }, tol)).toBe(true) // interior via bounds
+    expect(pointInNode(node, { x: 50, y: 0 }, tol)).toBe(true) // top border via stroke
+  })
+})
+
+describe('topmostHit — line stroke-only falls through to node below', () => {
+  const tol = 6
+  it('click on line stroke hits the line; click on line bbox (off stroke) hits the node below', () => {
+    // Image fills 0..200; line sits on top at canvas (50,50)→(150,50) inside the image.
+    const image = makeNode({ id: 'img', geometry: { x: 0, y: 0, width: 200, height: 200, rotation: 0 } })
+    const line = makeNode({
+      id: 'line',
+      type: 'markup',
+      markupKind: 'line',
+      geometry: { x: 50, y: 50, width: 100, height: 80, rotation: 0 },
+      markupPoints: [{ x: 0, y: 0 }, { x: 100, y: 0 }],
+    })
+    // Back-to-front: image (back) then line (front). Both are content rank; stable
+    // sort preserves input order, so pass image first.
+    const ordered = sortForHitTest([image, line])
+    expect(ordered[ordered.length - 1].id).toBe('line') // line on top
+    // On the stroke → line (topmost stroke hit).
+    expect(topmostHit(ordered, { x: 100, y: 50 }, { strokeHitTolerance: tol })).toEqual({ kind: 'node', nodeId: 'line' })
+    // Inside line bbox but off stroke (y=120 is in 100×80 bbox, far from stroke at y=50) → falls through to image.
+    expect(topmostHit(ordered, { x: 100, y: 120 }, { strokeHitTolerance: tol })).toEqual({ kind: 'node', nodeId: 'img' })
   })
 })
 
