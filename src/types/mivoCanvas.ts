@@ -1,3 +1,5 @@
+import type { ImageDimensions } from '../lib/imageSizing'
+
 export type ToolId =
   | 'select'
   | 'hand'
@@ -290,6 +292,7 @@ export type MivoCanvasNode = {
   assetSizeBytes?: number
   markdownDisplayMode?: MarkdownDisplayMode
   imageHasTransparency?: boolean
+  assetSourceDimensions?: ImageDimensions
   imageCrop?: ImageCrop
   status: NodeStatus
   parentIds?: string[]

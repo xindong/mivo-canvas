@@ -67,6 +67,7 @@ export const createNodeCreationSlice: SliceCreator = (set, get) => ({
             assetSizeBytes: metadata?.sizeBytes,
             markdownDisplayMode: type === 'markdown' ? markdownDisplayMode : undefined,
             imageHasTransparency: type === 'image' ? metadata?.hasTransparency : undefined,
+            assetSourceDimensions: type === 'image' ? metadata?.sourceDimensions : undefined,
             generation:
               type === 'markdown'
                 ? undefined
