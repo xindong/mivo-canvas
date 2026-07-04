@@ -40,6 +40,10 @@ export type ProgressReport = { stage: string; progress: number }
 export type OnProgress = (report: ProgressReport) => void
 
 const platformRetryBackoffMs = 1_000
+// V03: how many consecutive transient poll failures (fetch reject or 5xx) the
+// poll loop tolerates before giving up. 3 ≈ "a blip + a retry pair" — a single
+// 5xx/timeout no longer voids a 170s generation. 4xx stays a hard throw.
+const platformPollMaxFailures = 3
 const transientPlatformErrorPattern =
   /ClosedChannelException|ECONNRESET|ECONNABORTED|EPIPE|ETIMEDOUT|connection reset|connection terminated|socket hang up|socket terminated|fetch failed|UND_ERR/i
 
@@ -97,6 +101,13 @@ const waitForPlatformRetry = async (signal?: AbortSignal): Promise<void> => {
 const logPlatformTransientRetry = (operation: string, error: unknown): void => {
   const reason = sanitizePlatformError(error instanceof Error ? error.message : String(error))
   console.log(`[mivo-bff] event=platform-transient-retry operation=${operation} attempt=2 reason=${reason}`)
+}
+
+// V03: like logPlatformTransientRetry but with the real attempt number — the poll
+// loop retries more than once, so the streak counter is what observers want.
+const logPollTransientRetry = (attempt: number, error: unknown): void => {
+  const reason = sanitizePlatformError(error instanceof Error ? error.message : String(error))
+  console.log(`[mivo-bff] event=platform-transient-retry operation=poll attempt=${attempt} reason=${reason}`)
 }
 
 const withPlatformTransientRetry = async <T>(
@@ -181,19 +192,50 @@ export const mivoPlatformPollJob = async (
   const platformPollDeadlineMs = pollDeadlineMs ?? resolveMivoPlatformPollDeadlineMs('1K')
   const t0 = Date.now()
   let lastStatus: string | null = null
+  // V03: tolerate transient poll failures (fetch reject or 5xx). A single blip
+  // no longer voids a long generation — only `platformPollMaxFailures` in a row
+  // do. Any 2xx response resets the streak. 4xx stays a hard throw (permanent).
+  // Aborts surface immediately. The outer while-deadline still bounds total time,
+  // so retry waits cannot extend past platformPollDeadlineMs.
+  let consecutiveFailures = 0
   while (Date.now() - t0 < platformPollDeadlineMs) {
     if (signal?.aborted) return { status: 'aborted' }
     // P2-C1a: map elapsed/deadline to 20-90 (real progress, not hardcoded).
     const elapsed = Date.now() - t0
     const pollProgress = 20 + Math.min(1, elapsed / platformPollDeadlineMs) * 70
     onProgress?.({ stage: 'poll', progress: pollProgress })
-    const res = await mivoPlatformFetch(
-      `${ctx.platformEndpoint}/api/v1/message/${jobId}`,
-      { headers: {} },
-      ctx,
-      signal,
-    )
-    if (!res.ok) throw await platformResponseError('poll', res)
+    let res: Response
+    try {
+      res = await mivoPlatformFetch(
+        `${ctx.platformEndpoint}/api/v1/message/${jobId}`,
+        { headers: {} },
+        ctx,
+        signal,
+      )
+    } catch (error) {
+      // V03: abort is not a transient failure — surface it immediately.
+      if (signal?.aborted) return { status: 'aborted' }
+      // V03: fetch reject (network stall, V05 per-request timeout, ECONNRESET, …)
+      // is transient — count it, wait one interval, keep polling.
+      consecutiveFailures += 1
+      logPollTransientRetry(consecutiveFailures, error)
+      if (consecutiveFailures >= platformPollMaxFailures) throw error
+      await new Promise((r) => setTimeout(r, platformPollIntervalMs))
+      continue
+    }
+    if (!res.ok) {
+      // 4xx is permanent (bad jobId / auth / shape) — never retry, throw now.
+      if (res.status < 500) throw await platformResponseError('poll', res)
+      // 5xx is transient — same streak path as a fetch reject.
+      const err = await platformResponseError('poll', res)
+      consecutiveFailures += 1
+      logPollTransientRetry(consecutiveFailures, err)
+      if (consecutiveFailures >= platformPollMaxFailures) throw err
+      await new Promise((r) => setTimeout(r, platformPollIntervalMs))
+      continue
+    }
+    // A 2xx response resets the streak — only sustained failure throws.
+    consecutiveFailures = 0
     const json = (await res.json()) as {
       content?: { status?: string; state?: string; images?: string[]; error?: string; message?: string }
       status?: string
