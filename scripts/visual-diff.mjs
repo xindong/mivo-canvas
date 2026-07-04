@@ -132,8 +132,17 @@ const captureScreenshot = async ({ browser, port, renderer, dpr, label }) => {
   await page.evaluate(() => window.localStorage.clear())
   await page.goto(`http://127.0.0.1:${port}/?renderer=${encodeURIComponent(renderer)}`, { waitUntil: 'networkidle' })
   await page.waitForSelector('.canvas-shell')
-  await page.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
-  await page.waitForTimeout(300)
+  if (renderer === 'leafer') {
+    // leafer 模式 image/frame 由 Leafer 画，DOM 无 <img>；等 data-renderer-mode + paint 稳定
+    await page.waitForFunction(
+      (mode) => document.querySelector('.canvas-shell')?.getAttribute('data-renderer-mode') === mode,
+      'leafer',
+    )
+    await page.waitForTimeout(800)
+  } else {
+    await page.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
+    await page.waitForTimeout(300)
+  }
 
   const shell = page.locator('.canvas-shell')
   const rendererMode = await page.evaluate(() => document.querySelector('.canvas-shell')?.getAttribute('data-renderer-mode') || 'dom')
