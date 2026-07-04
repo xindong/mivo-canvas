@@ -57,14 +57,15 @@ describe('resolveHitTarget', () => {
     expect(target).toEqual({ kind: 'edit-overlay-cancel', nodeId: 'n1', editKind: 'mask' })
   })
 
-  it('edit-overlay-cancel carries the active editKind for mask/crop/text-edit', () => {
-    for (const editKind of ['mask', 'crop', 'text-edit'] as const) {
+  it.each(['mask', 'crop', 'text-edit'] as const)(
+    'edit-overlay-cancel carries the active editKind (%s)',
+    (editKind) => {
       const target = resolveHitTarget(nodes, { x: 75, y: 75 }, {
         editState: { activeEditNodeId: 'edit-node', activeEditKind: editKind },
       })
       expect(target).toEqual({ kind: 'edit-overlay-cancel', nodeId: 'edit-node', editKind })
-    }
-  })
+    },
+  )
 
   it('does NOT short-circuit when edit state is incomplete', () => {
     // Only nodeId set (no kind) → not active → hit-test proceeds.
