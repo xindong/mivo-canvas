@@ -150,10 +150,10 @@ export const runMaskPointScenario = async (context) => {
   // 修复前 beginMaskEdit 不 disarm，shell 会残留 mask-armed class。
   await dockMaskButton.click()
   await page.waitForFunction(() => document.querySelector('.canvas-shell')?.classList.contains('mask-armed'))
-  await page.evaluate(async (moduleSpec, id) => {
+  await page.evaluate(async ({ moduleSpec, id }) => {
     const { useCanvasStore } = await import(moduleSpec)
     useCanvasStore.getState().selectNode(id)
-  }, spec, imageId)
+  }, { moduleSpec: spec, id: imageId })
   await page.waitForFunction((id) => document.querySelector(`[data-node-id="${id}"]`)?.classList.contains('selected'), imageId)
   await dockMaskButton.click()
   await page.waitForSelector('.image-mask-edit-stage')

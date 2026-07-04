@@ -1,4 +1,4 @@
-import { doneTaskView } from '../api-mocks.mjs'
+import { doneTaskView, failedTaskView } from '../api-mocks.mjs'
 
 export const runMaskScenario = async (context) => {
   const { canvasStoreSpec, horizontalMaskSourceB64, mivoEditRequests, page, readCanvasState, waitForCanvasState } = context
@@ -257,4 +257,50 @@ export const runMaskScenario = async (context) => {
   if (blackPlateEditTaskIds[0] === blackPlateEditTaskIds[1]) {
     throw new Error(`SC-W1 retry should produce a different taskId, got ${JSON.stringify(blackPlateEditTaskIds)}`)
   }
+
+  // SC-W2②: cancel/failed 三态 —— poll 返 failed/canceled → placeholder 回滚，
+  // 无新 image node、无新 edit edge。failedTaskView 复用 api-mocks helper。
+  const verifyMaskEditTerminalFailure = async ({ label, taskView }) => {
+    await page.unroute('**/api/mivo/tasks/edit')
+    await page.route('**/api/mivo/tasks/edit', async (route) => {
+      await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ taskId: `task-${label}` }) })
+    })
+    await page.unroute('**/api/mivo/tasks/*')
+    await page.route('**/api/mivo/tasks/*', async (route) => {
+      const method = route.request().method()
+      if (method === 'DELETE') { await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ id: `task-${label}`, status: 'canceled' }) }); return }
+      if (method !== 'GET') { await route.fallback(); return }
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(taskView) })
+    })
+
+    await page.evaluate(async (moduleSpec) => {
+      const { useCanvasStore } = await import(moduleSpec)
+      useCanvasStore.getState().loadScene('character-flow')
+      useCanvasStore.getState().resetCurrentScene()
+    }, await canvasStoreSpec())
+    await page.waitForSelector('[data-node-id="ref-hero"]')
+    const before = await readCanvasState()
+    const beforeImageCount = before.nodes.filter((n) => n.type === 'image').length
+    await page.locator('[data-node-id="ref-hero"]').click()
+    await page.waitForSelector('.selection-quick-toolbar')
+    await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
+    await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
+    await page.waitForSelector('.image-mask-edit-stage')
+    await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: '点选', exact: true }).click()
+    const stage = await page.locator('.image-mask-edit-stage').boundingBox()
+    if (!stage) throw new Error(`Mask edit stage should be visible for ${label} path`)
+    await page.mouse.click(stage.x + stage.width * 0.52, stage.y + stage.height * 0.5)
+    await page.waitForFunction(() => Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0') > 0)
+    await page.locator('.image-mask-edit-prompt textarea').fill(`E2E ${label} path`)
+    await page.locator('.image-mask-edit-prompt').getByRole('button', { name: '局部重绘' }).click()
+    await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
+    const after = await readCanvasState()
+    const afterImageCount = after.nodes.filter((n) => n.type === 'image').length
+    if (afterImageCount !== beforeImageCount) {
+      throw new Error(`SC-W2② ${label} path should roll back placeholder (no new image node), got before=${beforeImageCount} after=${afterImageCount}`)
+    }
+  }
+
+  await verifyMaskEditTerminalFailure({ label: 'failed', taskView: failedTaskView('upstream 500', { status: 'failed', progress: 50 }) })
+  await verifyMaskEditTerminalFailure({ label: 'canceled', taskView: failedTaskView('用户取消', { status: 'canceled', progress: 50, stage: 'canceled' }) })
 }
