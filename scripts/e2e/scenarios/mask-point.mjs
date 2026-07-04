@@ -144,6 +144,30 @@ export const runMaskPointScenario = async (context) => {
   await cancelMaskEdit(page)
   await clearCanvasSelection(page, spec)
 
+  // GREPTILE-P2: dock 直接入口（D4）调用 beginMaskEdit 时必须解除 armed。
+  // 构造 armed 残留场景：无选区 dock click arm → 通过 store API 选中图片
+  // （绕过 wrapNodePointerDown 的指针路径 disarm）→ 再次 dock click 走 D4 直接入口。
+  // 修复前 beginMaskEdit 不 disarm，shell 会残留 mask-armed class。
+  await dockMaskButton.click()
+  await page.waitForFunction(() => document.querySelector('.canvas-shell')?.classList.contains('mask-armed'))
+  await page.evaluate(async (moduleSpec, id) => {
+    const { useCanvasStore } = await import(moduleSpec)
+    useCanvasStore.getState().selectNode(id)
+  }, spec, imageId)
+  await page.waitForFunction((id) => document.querySelector(`[data-node-id="${id}"]`)?.classList.contains('selected'), imageId)
+  await dockMaskButton.click()
+  await page.waitForSelector('.image-mask-edit-stage')
+  await page.waitForFunction(() => !document.querySelector('.canvas-shell')?.classList.contains('mask-armed'))
+  const d4Disarmed = await page.evaluate(() => ({
+    armed: document.querySelector('.canvas-shell')?.classList.contains('mask-armed'),
+    stageOpen: Boolean(document.querySelector('.image-mask-edit-stage')),
+  }))
+  if (d4Disarmed.armed || !d4Disarmed.stageOpen) {
+    throw new Error(`GREPTILE-P2: D4 dock entry must disarm armed and open overlay, got ${JSON.stringify(d4Disarmed)}`)
+  }
+  await cancelMaskEdit(page)
+  await clearCanvasSelection(page, spec)
+
   // FIX-3: fast double-click in armed mode should open one overlay and keep one initial region.
   await dockMaskButton.click()
   await page.waitForFunction(() => document.querySelector('.canvas-shell')?.classList.contains('mask-armed'))

@@ -114,6 +114,9 @@ export function useMaskPointArmed({
   }, [clearPendingInitialPoint, setMaskArmed])
 
   const beginMaskEdit = useCallback((nodeId: string) => {
+    // D4 直接入口（dock 按钮 / 上下文菜单）与指针路径同语义：开镜时立即解除 armed，
+    // 避免 armed 残留导致下一次点击被 wrapNodePointerDown 当作 armed 命中处理。
+    setMaskArmed(false, 'mask edit started')
     const node = useCanvasStore.getState().nodes.find((item) => item.id === nodeId && item.type === 'image' && !item.hidden)
     if (!node) {
       debugLogger.log('Mask Edit', `Mask edit start skipped; image node not available: ${nodeId}`)
@@ -133,7 +136,7 @@ export function useMaskPointArmed({
     setMaskEditNodeId(nodeId)
     debugLogger.log('Mask Edit', `Mask edit started for ${nodeId}`)
     return true
-  }, [clearCropNode, closeContextMenu, selectNode, updatePendingInitialPoint])
+  }, [clearCropNode, closeContextMenu, selectNode, setMaskArmed, updatePendingInitialPoint])
 
   const submitMaskEdit = useCallback(
     async (nodeId: string, resolvedAssetUrl: string, payload: ImageMaskSubmitPayload) => {
