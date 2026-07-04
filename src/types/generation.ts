@@ -24,7 +24,13 @@ export type EnhanceResponse = {
   richPrompt?: string
   imgRatio?: GenerationRatio
   quality?: MivoImageQuality
-  degradedReason?: 'timeout' | 'bad-json' | 'no-key' | 'upstream-error'
+  /** W4: 细分降级原因。upstream-http = LLM 返 non-2xx；upstream-network = fetch
+   *  抛错（DNS/连接/CORS）；timeout = 上游超时；bad-json = 响应非约定 JSON；
+   *  no-key = 未配 LLM key；upstream-error = 旧值，向后兼容保留。 */
+  degradedReason?: 'timeout' | 'bad-json' | 'no-key' | 'upstream-error' | 'upstream-http' | 'upstream-network'
+  /** W4: 哪一档 LLM 给出的降级（primary=claude-haiku-4-5，fallback=gpt-5.4-mini），
+   *  供前端标签展示与服务端测试矩阵断言。 */
+  stage?: 'primary' | 'fallback'
 }
 
 export type MivoGenerateRequest = {

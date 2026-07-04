@@ -17,7 +17,9 @@ export const runChatGenerationScenario = async (context) => {
   } = context
   const firstNodeId = context.firstNodeId ?? await page.locator('.dom-node').first().getAttribute('data-node-id')
 
-  // Chat branch: mode=chat should render a text reply without creating canvas nodes or generating images.
+  // Chat branch (W4): mode=chat now also generates an image (enhance always ships
+  // first). replyText surfaces as a notice; the assistant message shows the final
+  // prompt and a param card; /tasks/generate is called once.
   if (await page.locator('.ai-panel.collapsed').isVisible()) {
     await page.getByRole('button', { name: 'Open AI panel' }).click()
     await page.waitForSelector('.chat-composer-textarea', { state: 'visible' })
@@ -52,17 +54,22 @@ export const runChatGenerationScenario = async (context) => {
   await page.locator('.chat-composer-textarea').fill('这里能对话么')
   await page.locator('.chat-composer-textarea').press('Enter')
   await waitForChatIdle()
-  const chatReply = await page.locator('.chat-assistant-text').last().innerText()
-  if (!chatReply.includes('可以') || !chatReply.includes('游戏美术')) {
-    throw new Error(`Chat mode should render reply text, got: ${JSON.stringify(chatReply)}`)
-  }
+  // W4: chat 模式也生图 —— /tasks/generate 调 1 次、node +1、param card ≥1。
+  // replyText 作附言展示在 .chat-notice-text。
   const chatBranchAfter = await readCanvasState()
-  if (chatBranchAfter.nodes.length !== chatBranchBefore.nodes.length || chatBranchGenerateRequests !== 0) {
-    throw new Error(`Chat mode should not create nodes or call generate: ${JSON.stringify({ before: chatBranchBefore.nodes.length, after: chatBranchAfter.nodes.length, chatBranchGenerateRequests })}`)
+  if (chatBranchGenerateRequests !== 1) {
+    throw new Error(`W4 chat mode should call /tasks/generate once (image always generated), got ${chatBranchGenerateRequests}`)
+  }
+  if (chatBranchAfter.nodes.length <= chatBranchBefore.nodes.length) {
+    throw new Error(`W4 chat mode should create a canvas node, got before=${chatBranchBefore.nodes.length} after=${chatBranchAfter.nodes.length}`)
   }
   const latestAssistantParamCards = await page.locator('.chat-message-assistant').last().locator('.chat-param-card').count()
-  if (latestAssistantParamCards !== 0) {
-    throw new Error('Chat mode reply should not render enhance parameter card')
+  if (latestAssistantParamCards < 1) {
+    throw new Error('W4 chat mode should render enhance parameter card (image always generated)')
+  }
+  const chatNoticeText = await page.locator('.chat-notice-text').last().innerText()
+  if (!chatNoticeText.includes('可以') || !chatNoticeText.includes('游戏美术')) {
+    throw new Error(`W4 chat mode replyText should surface as notice, got: ${JSON.stringify(chatNoticeText)}`)
   }
   await page.unroute('**/api/mivo/enhance')
   await page.route('**/api/mivo/enhance', async (route) => {

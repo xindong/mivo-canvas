@@ -10,7 +10,7 @@ const mivoEnhanceTimeoutMs = 30_000
 
 const isAbortError = (error: unknown) => error instanceof Error && error.name === 'AbortError'
 
-export type MivoImageRequestErrorKind = 'client-timeout' | 'upstream-timeout' | 'canceled' | 'upstream-error'
+export type MivoImageRequestErrorKind = 'client-timeout' | 'upstream-timeout' | 'canceled' | 'upstream-error' | 'client-error'
 
 export class MivoImageRequestError extends Error {
   kind: MivoImageRequestErrorKind
@@ -201,10 +201,16 @@ export const enhanceMivoPrompt = async (request: EnhanceRequest): Promise<Enhanc
       },
       mivoEnhanceTimeoutMs,
     )
-    if (!response.ok) return { enhanced: false, degradedReason: 'upstream-error' }
+    // W4: non-2xx 细分为 upstream-http（与 fetch 抛错的 upstream-network 区分）。
+    // bad-json / no-key 由服务端在 payload 里带 degradedReason，前端透传。
+    if (!response.ok) return { enhanced: false, degradedReason: 'upstream-http' }
     return (await response.json()) as EnhanceResponse
-  } catch {
-    return { enhanced: false, degradedReason: 'upstream-error' }
+  } catch (error) {
+    // W4: 前端 client-timeout → 'timeout'；其余网络/CORS/abort 抛错 → 'upstream-network'。
+    if (error instanceof MivoImageRequestError && error.kind === 'client-timeout') {
+      return { enhanced: false, degradedReason: 'timeout' }
+    }
+    return { enhanced: false, degradedReason: 'upstream-network' }
   }
 }
 

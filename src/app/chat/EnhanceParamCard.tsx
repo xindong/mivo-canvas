@@ -4,6 +4,20 @@ import { useChatStore } from '../../store/chatStore'
 import type { ChatMessage } from '../../store/chatStore'
 import { qualityDisplayLabel } from './chatDisplayLabels'
 
+// W4: 把细分 degradedReason 映射为中文可读文案。所有分支都补"已用原始描述出图"
+// —— enhance 永远先出图，降级只影响是否走了 agent 润色，不影响生图本身。
+const degradedReasonLabel = (reason: string): string => {
+  switch (reason) {
+    case 'upstream-http': return '上游服务异常，已用原始描述出图'
+    case 'upstream-network': return '增强服务网络失败，已用原始描述出图'
+    case 'timeout': return '增强超时，已用原始描述出图'
+    case 'bad-json': return '增强响应格式异常，已用原始描述出图'
+    case 'no-key': return '未配置增强模型，已用原始描述出图'
+    case 'upstream-error': return '增强服务异常，已用原始描述出图'
+    default: return `未增强（${reason}）`
+  }
+}
+
 type EnhanceParamCardProps = {
   message: ChatMessage
   sceneId: string
@@ -95,8 +109,8 @@ export function EnhanceParamCard({ message, sceneId }: EnhanceParamCardProps) {
           )}
 
           {!enhance.scene && enhance.degradedReason && (
-            <div className="chat-param-not-enhanced">
-              未增强（{enhance.degradedReason}）
+            <div className="chat-param-not-enhanced" data-degraded-reason={enhance.degradedReason}>
+              {degradedReasonLabel(enhance.degradedReason)}
             </div>
           )}
         </>
