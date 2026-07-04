@@ -48,12 +48,22 @@ describe('resolveHitTarget', () => {
     expect(resolveHitTarget(nodes, { x: 999, y: 999 })).toBeNull()
   })
 
-  it('short-circuits when edit state is active (no hit-test)', () => {
-    // Point is on a node, but edit state active → null (edit overlay owns pointer).
+  it('short-circuits to edit-overlay-cancel when edit state is active (no hit-test)', () => {
+    // Point is on a node, but edit state active → edit overlay owns pointer;
+    // shell returns a cancel target for the caller to route to the cancel handler.
     const target = resolveHitTarget(nodes, { x: 75, y: 75 }, {
       editState: { activeEditNodeId: 'n1', activeEditKind: 'mask' },
     })
-    expect(target).toBeNull()
+    expect(target).toEqual({ kind: 'edit-overlay-cancel', nodeId: 'n1', editKind: 'mask' })
+  })
+
+  it('edit-overlay-cancel carries the active editKind for mask/crop/text-edit', () => {
+    for (const editKind of ['mask', 'crop', 'text-edit'] as const) {
+      const target = resolveHitTarget(nodes, { x: 75, y: 75 }, {
+        editState: { activeEditNodeId: 'edit-node', activeEditKind: editKind },
+      })
+      expect(target).toEqual({ kind: 'edit-overlay-cancel', nodeId: 'edit-node', editKind })
+    }
   })
 
   it('does NOT short-circuit when edit state is incomplete', () => {
