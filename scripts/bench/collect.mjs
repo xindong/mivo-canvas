@@ -791,7 +791,7 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, rendere
 
   const pan = await runAction('canvas-pan', () => panCanvas(page))
   const zoom = await runAction('canvas-zoom', () => zoomCanvas(page))
-  // v3: canvas-dag runs AFTER pan/zoom — it mutates the store (node-move write path),
+  // v3: canvas-drag runs AFTER pan/zoom — it mutates the store (node-move write path),
   // so running it earlier would dirty the clean fixture pan/zoom are measured on.
   // overall/gate below still aggregates ONLY pan/zoom; canvas-drag is a standalone metric.
   const drag = await runAction('canvas-drag', () => dragNode(page))
