@@ -2,15 +2,7 @@ import { useCallback, useEffect, useMemo, useState, type PointerEvent as ReactPo
 import { useCanvasStore } from '../store/canvasStore'
 import type { CanvasId, MivoCanvasNode } from '../types/mivoCanvas'
 import type { ResizeCorner, SnapGuide } from './canvasGeometry'
-import {
-  boundsForNodes,
-  isActiveSelectionRect,
-  previewIdsFromSelectionBox,
-  runtimeToolFor,
-  selectionRectFromBox,
-  shouldStartCanvasSurfaceInteraction,
-  type RuntimeCanvasTool,
-} from './canvasInteraction'
+import { boundsForNodes, isActiveSelectionRect, previewIdsFromSelectionBox, runtimeToolFor, selectionRectFromBox, shouldStartCanvasSurfaceInteraction, type RuntimeCanvasTool } from './canvasInteraction'
 import { canvasToolHandlers, type CanvasToolHandlerContext } from './canvasToolHandlers'
 import { isCanvasToolEnabled } from './canvasToolRegistry'
 import { smartSelectionHandlesFor } from './smartSelection'
@@ -21,6 +13,7 @@ import { useGroupTransform } from './useGroupTransform'
 import { useBrushStamp } from './useBrushStamp'
 import { useTextAnnotation, isEditableTextNode } from './useTextAnnotation'
 import { useGlobalCanvasEvents } from './useGlobalCanvasEvents'
+import { useZoomTool } from './useZoomTool'
 
 export type { TextResizeEdge } from './useTextAnnotation'
 
@@ -46,6 +39,7 @@ export function useCanvasInteractionController({
   const [activeConnectorDropTargetId, setActiveConnectorDropTargetId] = useState<string | undefined>()
   const [editingTextNodeId, setEditingTextNodeId] = useState<string | undefined>()
   const [temporaryTool, setTemporaryTool] = useState<RuntimeCanvasTool | undefined>()
+  const [zoomOutCursor, setZoomOutCursor] = useState(false)
   const setActiveTool = useCanvasStore((state) => state.setActiveTool)
   const selectNode = useCanvasStore((state) => state.selectNode)
   const selectNodes = useCanvasStore((state) => state.selectNodes)
@@ -65,8 +59,8 @@ export function useCanvasInteractionController({
 
   const {
     viewport: viewportState, viewportRef, isPanning, screenToCanvas, viewportCenter, zoomBy,
-    fit, fitAll, fitSelection, resetView, handleWheel, startPan, tryMovePan, tryEndPan, resetPan,
-    resetViewportForScene,
+    zoomTo, fitToBounds, fit, fitAll, fitSelection, resetView, handleWheel, startPan, tryMovePan,
+    tryEndPan, resetPan, resetViewportForScene,
   } = useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseContextMenu })
 
   const discardEmptyEditingText = useCallback((nodeId = editingTextNodeId) => {
@@ -155,6 +149,10 @@ export function useCanvasInteractionController({
     updateNodesGeometry, setSnapGuides,
   })
 
+  const { beginZoomGesture, tryMoveZoomGesture, tryEndZoomGesture, resetZoomGesture } = useZoomTool({
+    shellRef, viewportRef, startInteraction, zoomBy, fitToBounds, zoomOutCursor: interactionMode === 'zoom' && zoomOutCursor,
+  })
+
   const beginPan = useCallback((event: ReactPointerEvent<HTMLElement>, options?: { clearSelection?: boolean }) => {
     if (event.button !== 0 && event.button !== 1) return
     event.preventDefault()
@@ -168,6 +166,7 @@ export function useCanvasInteractionController({
   const toolHandlerContext = useMemo<CanvasToolHandlerContext>(() => ({
     beginPan,
     beginSelection,
+    beginZoomGesture,
     beginNodeMove,
     beginNodeResize: startNodeResize,
     beginTextBox,
@@ -175,7 +174,7 @@ export function useCanvasInteractionController({
     beginMarkupBox,
     beginStampPlacement,
     beginTextEdit,
-  }), [beginFrameBox, beginMarkupBox, beginNodeMove, beginPan, beginSelection, beginStampPlacement, beginTextBox, beginTextEdit, startNodeResize])
+  }), [beginFrameBox, beginMarkupBox, beginNodeMove, beginPan, beginSelection, beginStampPlacement, beginTextBox, beginTextEdit, beginZoomGesture, startNodeResize])
 
   const beginNodePointerDown = useCallback(
     (nodeId: string, event: ReactPointerEvent<HTMLDivElement>) => {
@@ -193,6 +192,7 @@ export function useCanvasInteractionController({
   // Dispatcher: fan pointer events out to the hook tryMove/tryEnd handlers in
   // the original if-chain order. Each hook owns its ref + branch logic.
   const handleCanvasPointerMove = useCallback((event: ReactPointerEvent<HTMLElement>) => {
+    if (tryMoveZoomGesture(event)) return
     if (tryMoveGroupResize(event)) return
     if (tryMoveEraser(event)) return
     if (tryMoveStamp(event)) return
@@ -205,9 +205,10 @@ export function useCanvasInteractionController({
     if (tryMoveTextResize(event)) return
     if (tryMovePan(event)) return
     tryMoveSelection(event)
-  }, [tryMoveEraser, tryMoveFrameCreation, tryMoveGroupResize, tryMoveMarkupCreation, tryMoveMarkupPointTransform, tryMoveNodeTransform, tryMovePan, tryMoveSelection, tryMoveSpacing, tryMoveStamp, tryMoveTextCreation, tryMoveTextResize])
+  }, [tryMoveEraser, tryMoveFrameCreation, tryMoveGroupResize, tryMoveMarkupCreation, tryMoveMarkupPointTransform, tryMoveNodeTransform, tryMovePan, tryMoveSelection, tryMoveSpacing, tryMoveStamp, tryMoveTextCreation, tryMoveTextResize, tryMoveZoomGesture])
 
   const handleCanvasPointerEnd = useCallback((event: ReactPointerEvent<HTMLElement>) => {
+    tryEndZoomGesture(event)
     tryEndGroupResize(event)
     tryEndSpacing(event)
     tryEndTextCreation(event)
@@ -220,20 +221,17 @@ export function useCanvasInteractionController({
     tryEndStamp(event)
     tryEndPan(event)
     tryEndSelection(event)
-  }, [tryEndEraser, tryEndFrameCreation, tryEndGroupResize, tryEndMarkupCreation, tryEndMarkupPointTransform, tryEndNodeTransform, tryEndPan, tryEndSelection, tryEndSpacing, tryEndStamp, tryEndTextCreation, tryEndTextResize])
+  }, [tryEndEraser, tryEndFrameCreation, tryEndGroupResize, tryEndMarkupCreation, tryEndMarkupPointTransform, tryEndNodeTransform, tryEndPan, tryEndSelection, tryEndSpacing, tryEndStamp, tryEndTextCreation, tryEndTextResize, tryEndZoomGesture])
 
   useGlobalCanvasEvents({
     maskEditNodeId, onCancelMaskEdit, onCloseContextMenu, setTemporaryTool, setEditingTextNodeId,
-    setSnapGuides, setActiveConnectorDropTargetId, zoomBy, fitAll, fitSelection, resetView,
+    setSnapGuides, setActiveConnectorDropTargetId, setZoomOutCursor, zoomBy, zoomTo, fitAll, fitSelection,
     viewportCenter, resetMarquee, resetNodeTransform, resetPan, resetTextAnnotation,
-    resetBrushStamp, resetGroupTransform,
+    resetBrushStamp, resetGroupTransform, resetZoomGesture,
   })
 
-  // Scene reset: single rAF (preserves the original structure) resets every hook.
-  // Deps are the individual stable reset callbacks (not hook return objects).
-  // Contract: src/canvas/scene-reset.contract.test.ts — new hook with a reset?
-  // Wire it into this rAF sequence AND add the reset name to EXPECTED_SCENE_RESETS
-  // in that test, or scene switches will leak stale interaction state.
+  // Scene reset: one rAF resets every interaction hook.
+  // Contract: scene-reset.contract.test.ts must list every hook reset below.
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
       resetViewportForScene(sceneId)
@@ -242,6 +240,7 @@ export function useCanvasInteractionController({
       resetGroupTransform()
       resetTextAnnotation()
       resetBrushStamp()
+      resetZoomGesture()
       setSnapGuides([])
       setActiveSectionDropTargetId(undefined)
       setActiveConnectorDropTargetId(undefined)
@@ -249,7 +248,7 @@ export function useCanvasInteractionController({
       setEditingTextNodeId(undefined)
     })
     return () => window.cancelAnimationFrame(frame)
-  }, [sceneId, resetBrushStamp, resetGroupTransform, resetMarquee, resetNodeTransform, resetTextAnnotation, resetViewportForScene])
+  }, [sceneId, resetBrushStamp, resetGroupTransform, resetMarquee, resetNodeTransform, resetTextAnnotation, resetViewportForScene, resetZoomGesture])
 
   const selectionRect = selectionBox ? selectionRectFromBox(selectionBox) : undefined
   const activeSelectionRect = selectionRect && isActiveSelectionRect(selectionRect) ? selectionRect : undefined
@@ -263,6 +262,6 @@ export function useCanvasInteractionController({
     stampPlacementPreview, selectionPreviewSet, beginGroupResize, beginSelectionSpacingDrag,
     beginNodePointerDown, beginNodeResize, editTextNode, beginTextResize, beginMarkupPointMove,
     updateEditingText, finishTextEditing, handleCanvasPointerDown, handleCanvasPointerMove,
-    handleCanvasPointerEnd, handleWheel, zoomBy, fit, fitAll, fitSelection, resetView,
+    handleCanvasPointerEnd, handleWheel, zoomTo, zoomBy, fitToBounds, fit, fitAll, fitSelection, resetView,
   }
 }

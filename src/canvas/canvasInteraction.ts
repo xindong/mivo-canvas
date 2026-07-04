@@ -7,7 +7,7 @@ import {
   type SnapGuide,
 } from './canvasGeometry'
 
-export type RuntimeCanvasTool = 'select' | 'hand' | 'text' | 'frame' | 'markup' | 'stamp'
+export type RuntimeCanvasTool = 'select' | 'hand' | 'text' | 'frame' | 'markup' | 'stamp' | 'zoom'
 
 export type Viewport = {
   x: number
@@ -45,6 +45,18 @@ export type SelectionBox = {
   currentY: number
   additive: boolean
   baseSelectedNodeIds: string[]
+}
+
+export type ZoomMarqueeBox = {
+  pointerId: number
+  shellLeft: number
+  shellTop: number
+  shellWidth: number
+  shellHeight: number
+  startClientX: number
+  startClientY: number
+  currentClientX: number
+  currentClientY: number
 }
 
 export type GroupResizeState = {
@@ -93,7 +105,7 @@ type ClientRectLike = Pick<DOMRect, 'left' | 'top' | 'width' | 'height'>
 
 const minViewportScale = 0.08
 const maxViewportScale = 4
-const minSelectionDrag = 4
+export const minSelectionDrag = 4
 const minNodeTransformDrag = 4
 const minNodeWidth = 96
 const maxNodeWidth = 6000
@@ -263,6 +275,54 @@ export const createSelectionBox = (
   additive,
   baseSelectedNodeIds,
 })
+
+export const createZoomMarqueeBox = (
+  pointerId: number,
+  clientX: number,
+  clientY: number,
+  shellRect: ViewportFitRect,
+): ZoomMarqueeBox => ({
+  pointerId,
+  shellLeft: shellRect.left,
+  shellTop: shellRect.top,
+  shellWidth: shellRect.width,
+  shellHeight: shellRect.height,
+  startClientX: clientX,
+  startClientY: clientY,
+  currentClientX: clientX,
+  currentClientY: clientY,
+})
+
+export const zoomMarqueeOverlayRect = (box: ZoomMarqueeBox): CanvasBounds => ({
+  x: Math.min(box.startClientX, box.currentClientX) - box.shellLeft,
+  y: Math.min(box.startClientY, box.currentClientY) - box.shellTop,
+  width: Math.abs(box.currentClientX - box.startClientX),
+  height: Math.abs(box.currentClientY - box.startClientY),
+})
+
+export const isVisibleZoomMarqueeRect = (rect: CanvasBounds) =>
+  rect.width > minSelectionDrag - 1 || rect.height > minSelectionDrag - 1
+
+export const isZoomToBoundsMarqueeRect = (rect: CanvasBounds) =>
+  rect.width >= minSelectionDrag && rect.height >= minSelectionDrag
+
+export const canvasBoundsFromZoomMarquee = (box: ZoomMarqueeBox, viewport: Viewport): CanvasBounds => {
+  const shellRect = {
+    left: box.shellLeft,
+    top: box.shellTop,
+    width: box.shellWidth,
+    height: box.shellHeight,
+  }
+  const start = clientPointToCanvas(shellRect, viewport, box.startClientX, box.startClientY)
+  const current = clientPointToCanvas(shellRect, viewport, box.currentClientX, box.currentClientY)
+
+  return {
+    x: Math.min(start.x, current.x),
+    y: Math.min(start.y, current.y),
+    width: Math.abs(current.x - start.x),
+    height: Math.abs(current.y - start.y),
+  }
+}
 
 export const selectionRectFromBox = (box: SelectionBox): CanvasBounds => ({
   x: Math.min(box.startX, box.currentX),

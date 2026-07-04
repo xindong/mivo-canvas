@@ -143,9 +143,9 @@ export function useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseCo
   )
 
   const fitToBounds = useCallback(
-    (bounds: CanvasBounds | undefined) => {
+    (bounds: CanvasBounds | undefined, options?: { padding?: number; minPadding?: number }) => {
       const rect = shellRef.current?.getBoundingClientRect()
-      const nextViewport = bounds ? viewportForBounds(bounds, rect) : undefined
+      const nextViewport = bounds ? viewportForBounds(bounds, rect, options) : undefined
 
       setViewport(nextViewport || defaultViewportFor(sceneId))
     },
