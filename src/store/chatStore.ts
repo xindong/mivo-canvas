@@ -8,6 +8,7 @@ import { settleCanvasGenerationLocally } from './canvasGenerationCancel'
 import { fallbackCancelTarget, settleExpiredChatMessages } from './chatGenerationHydration'
 import { debugLogger } from './debugLogStore'
 import { generationFacade } from './generationFacade'
+import { clampChatGenerationContext, migrateChatPersistedState } from './chatStoreMigrate'
 
 const maxMessagesPerScene = 200
 
@@ -161,66 +162,9 @@ const enhanceForGeneration = (enhanceResult: EnhanceResponse): ChatEnhanceResult
       }
     : { degradedReason: enhanceResult.degradedReason }
 
-// 审查 B：persist v1→v2 迁移与 retryMessage 入口共用——把不再被当前模型支持的 ratio 收敛掉，
-// 防止老会话的 21:9 在 gemini 能力表去 21:9 后从 generationContext 复活。
-// enhance.imgRatio 保留作历史展示，不在此处收敛。
-// Exported so chatStoreMigrate.test.ts can cover the ratio-convergence branches directly.
-export const clampChatGenerationContext = (context: ChatGenerationContext): ChatGenerationContext => {
-  const validRatios = getModelCapabilities(context.model).ratios as readonly string[]
-  const requestedImgRatio =
-    context.requestedImgRatio === 'auto' || validRatios.includes(context.requestedImgRatio)
-      ? context.requestedImgRatio
-      : 'auto'
-  const imgRatio =
-    context.imgRatio && validRatios.includes(context.imgRatio) ? context.imgRatio : undefined
-  return { ...context, requestedImgRatio, imgRatio }
-}
-
-// Persisted-state migration extracted to a named export so chatStoreMigrate.test.ts can
-// cover the v1→v2 ratio-convergence branches. Behavior is identical to the prior inline form.
-export type ChatPersistedState = {
-  selectedModel?: string
-  paramOverrides?: ChatParamOverrides
-  messagesByScene?: Record<string, ChatMessage[]>
-}
-
-export const migrateChatPersistedState = (
-  persistedState: unknown,
-  version = 0,
-): { selectedModel: string; paramOverrides: ChatParamOverrides; messagesByScene: Record<string, ChatMessage[]> } => {
-  const state = (persistedState ?? {}) as ChatPersistedState
-  if (version >= 2) {
-    return state as {
-      selectedModel: string
-      paramOverrides: ChatParamOverrides
-      messagesByScene: Record<string, ChatMessage[]>
-    }
-  }
-  // v1 → v2: gemini 能力表去 21:9，把老会话里不再支持的 ratio 收敛掉
-  // 老用户已选模型保留（selectedModel 原样回填），仅对 ratios 做收敛
-  const selectedModel = state.selectedModel || 'gemini-3-pro-image'
-  const validRatios = getModelCapabilities(selectedModel).ratios as readonly string[]
-  const prevOverrides = state.paramOverrides ?? {
-    imgRatio: 'auto' as const,
-    quality: 'auto' as const,
-  }
-  const paramOverrides: ChatParamOverrides = {
-    imgRatio:
-      prevOverrides.imgRatio !== 'auto' && !validRatios.includes(prevOverrides.imgRatio)
-        ? 'auto'
-        : prevOverrides.imgRatio,
-    quality: prevOverrides.quality,
-  }
-  const messagesByScene: Record<string, ChatMessage[]> = {}
-  for (const [sceneId, messages] of Object.entries(state.messagesByScene ?? {})) {
-    messagesByScene[sceneId] = messages.map((msg) =>
-      msg.generationContext
-        ? { ...msg, generationContext: clampChatGenerationContext(msg.generationContext) }
-        : msg,
-    )
-  }
-  return { selectedModel, paramOverrides, messagesByScene }
-}
+// clampChatGenerationContext / migrateChatPersistedState / ChatPersistedState /
+// sanitizeMessagesByScene 已抽到 ./chatStoreMigrate.ts（保持本文件在 structure-guard
+// 900 行阈值内，同 #76 把 migratePersistedState 搬到 canvasGenerationHydration.ts 的先例）。
 
 export const useChatStore = create<ChatState>()(
   persist(
@@ -235,7 +179,52 @@ export const useChatStore = create<ChatState>()(
         if (state.isBusy) return
 
         const { selectedModel, paramOverrides } = state
-        const referenceAssetUrls = await saveReferenceAssets(referenceFiles)
+        // S03b: 参考图保存失败不再静默丢消息——catch 内自包含地构造并落 user +
+        // assistant 两条消息（那时 userMessage 尚未构造，不能依赖函数后续逻辑），
+        // 避免用户输入凭空消失。isBusy 此刻未置 true，无残留。
+        let referenceAssetUrls: string[]
+        try {
+          referenceAssetUrls = await saveReferenceAssets(referenceFiles)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          debugLogger.error('Chat Store', `参考图保存失败，消息以失败态落档：${message}`)
+          const failedUserMessage: ChatMessage = {
+            id: createMessageId(),
+            role: 'user',
+            kind: 'text',
+            text,
+            createdAt: Date.now(),
+            status: 'done',
+            selectedNodeId,
+            selectedNodeType,
+          }
+          const failedAssistantMessage: ChatMessage = {
+            id: createMessageId(),
+            role: 'assistant',
+            kind: 'text',
+            text: `参考图保存失败：${message}`,
+            createdAt: Date.now(),
+            status: 'error',
+            error: `参考图保存失败：${message}`,
+            errorKind: 'unknown',
+            // S03b: 无 generationContext 可供 retryMessage 重放（参考图未保存成功），
+            // 显式禁用 Retry 按钮避免死按钮（ChatMessageList 对 status:'error' 且无
+            // retryDisabledReason 的消息会渲染可点 Retry，点击后 retryMessage 因无
+            // context 直接 return）。引导用户重新选择图片后再发送。
+            retryDisabledReason: '参考图保存失败，请重新选择图片后再发送',
+          }
+          set((s) => ({
+            messagesByScene: {
+              ...s.messagesByScene,
+              [sceneId]: trimSceneMessages([
+                ...(s.messagesByScene[sceneId] || []),
+                failedUserMessage,
+                failedAssistantMessage,
+              ]),
+            },
+          }))
+          return
+        }
         if (get().isBusy) return
 
         const abortController = new AbortController()

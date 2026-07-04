@@ -3,6 +3,7 @@ import type {
   CanvasId,
   CanvasTask,
   MivoCanvasNode,
+  MivoCanvasSnapshot,
 } from '../types/mivoCanvas'
 import type { SliceCreator } from './canvasStore'
 import type { VariationParam, NormalizedMaskBounds } from '../types/generation'
@@ -578,8 +579,13 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
     const skipSlotHistoryBaseline = Boolean(
       (options as { skipSlotHistoryBaseline?: boolean }).skipSlotHistoryBaseline,
     )
+    // S01: 捕获生成开始时的 history 基线引用。失败回滚时仅当栈顶仍是该引用才 pop
+    // （snapshot 对象身份判据，不改 snapshot schema）。异步期间用户编辑/undo 过 →
+    // 栈顶已不是该基线 → 回滚返回 undefined → caller 走 filter-removal，保留编辑。
+    let baselineSnapshot: MivoCanvasSnapshot | undefined
     if (!skipSlotHistoryBaseline && targetSceneId === state.sceneId) {
       get().captureHistory()
+      baselineSnapshot = get().historyPast.at(-1)
     }
 
     set((current) => {
@@ -686,7 +692,16 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
       set((current) => {
         const targetDocument = current.canvases[targetSceneId]
         if (!targetDocument) return {}
-        const rollback = rollbackLatestHistoryBaseline(current, targetSceneId, { removeNodeId: slot.id })
+        // S01: 仅当栈顶仍是生成开始时捕获的基线引用才回滚；baselineSnapshot 为
+        // undefined（chat 新建槽位 skip 路径）或栈顶已变（用户异步期间编辑过）时
+        // 走 filter-removal —— 删槽位与运行中 task，但 historyPast/historyFuture
+        // 不动，保留用户编辑与 redo 栈。
+        const rollback = baselineSnapshot
+          ? rollbackLatestHistoryBaseline(current, targetSceneId, {
+              removeNodeId: slot.id,
+              expectedBaseline: baselineSnapshot,
+            })
+          : undefined
         if (rollback) return rollback
 
         return patchCanvasDocument(current, targetSceneId, {

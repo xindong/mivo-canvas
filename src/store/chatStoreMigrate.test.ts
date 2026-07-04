@@ -7,7 +7,7 @@ vi.mock('../lib/demoImages', () => ({
   createDemoImage: () => 'data:image/png;base64,mock-demo-image',
 }))
 
-import { clampChatGenerationContext, migrateChatPersistedState } from './chatStore'
+import { clampChatGenerationContext, migrateChatPersistedState } from './chatStoreMigrate'
 import type { ChatGenerationContext, ChatMessage, ChatParamOverrides } from './chatStore'
 
 // Helpers ---------------------------------------------------------------------
@@ -226,5 +226,58 @@ describe('migrateChatPersistedState (chat persist v1→v2)', () => {
     expect(result.paramOverrides.imgRatio).toBe('auto')
     expect(result.messagesByScene['scene-1'][0].generationContext?.requestedImgRatio).toBe('auto')
     expect(result.messagesByScene['scene-1'][0].generationContext?.imgRatio).toBeUndefined()
+  })
+})
+
+describe('S04: sanitizeMessagesByScene (chat migrate 非数组条目防护)', () => {
+  it('v>=2: drops non-array messagesByScene entries, keeps valid ones', () => {
+    const result = migrateChatPersistedState(
+      {
+        selectedModel: 'gemini-3-pro-image',
+        paramOverrides: overrides(),
+        messagesByScene: {
+          good: [message()],
+          'bad-number': 42 as never,
+          'bad-object': { not: 'array' } as never,
+          'bad-null': null as never,
+        },
+      },
+      2,
+    )
+
+    expect(Object.keys(result.messagesByScene)).toEqual(['good'])
+    expect(result.messagesByScene.good[0].id).toBe('msg-1')
+  })
+
+  it('v>=2: falls back to default selectedModel and paramOverrides when missing', () => {
+    const result = migrateChatPersistedState({ messagesByScene: {} }, 2)
+
+    expect(result.selectedModel).toBe('gemini-3-pro-image')
+    expect(result.paramOverrides).toEqual({ imgRatio: 'auto', quality: 'auto' })
+  })
+
+  it('v1: drops non-array messagesByScene entries, still clamps valid arrays', () => {
+    const result = migrateChatPersistedState(
+      {
+        selectedModel: 'gemini-3-pro-image',
+        paramOverrides: overrides(),
+        messagesByScene: {
+          good: [
+            message({
+              generationContext: context({ requestedImgRatio: '21:9', imgRatio: '21:9' }),
+            }),
+          ],
+          'bad-null': null as never,
+          'bad-object': { nope: true } as never,
+        },
+      },
+      1,
+    )
+
+    // 非数组条目丢弃
+    expect(Object.keys(result.messagesByScene)).toEqual(['good'])
+    // 合法数组仍被 clamp（21:9 → auto）
+    expect(result.messagesByScene.good[0].generationContext?.requestedImgRatio).toBe('auto')
+    expect(result.messagesByScene.good[0].generationContext?.imgRatio).toBeUndefined()
   })
 })

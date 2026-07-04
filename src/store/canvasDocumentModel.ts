@@ -432,10 +432,15 @@ export const applySnapshot = (state: CanvasState, snapshot: MivoCanvasSnapshot) 
 export const rollbackLatestHistoryBaseline = (
   state: CanvasState,
   sceneId: CanvasId,
-  options: { removeNodeId?: string } = {},
+  options: { removeNodeId?: string; expectedBaseline?: MivoCanvasSnapshot } = {},
 ) => {
   const snapshot = state.historyPast.at(-1)
   if (!snapshot || snapshot.sceneId !== sceneId) return undefined
+  // S01: 仅当栈顶快照正是生成开始时捕获的基线引用才回滚。异步生成期间用户若编辑过
+  // （pushHistory 推了新快照），栈顶已不是该基线，回滚会吞掉用户编辑并清空
+  // historyFuture —— 此时返回 undefined 让 caller 走 filter-removal（删节点但保留
+  // history 栈）。刻意取舍：保编辑 > 还原 reflow 位移。
+  if (options.expectedBaseline && snapshot !== options.expectedBaseline) return undefined
 
   const normalizedSnapshot = normalizeCanvasSnapshotV2(snapshot)
   const currentDocument = documentFor(state.canvases, sceneId)

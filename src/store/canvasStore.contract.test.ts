@@ -61,6 +61,7 @@ import { useCanvasStore, migratePersistedState } from './canvasStore'
 import { useChatStore } from './chatStore'
 import type { ChatMessage } from './chatStore'
 import type { CanvasTask, MivoCanvasNode } from '../types/mivoCanvas'
+import { saveGeneratedAsset } from '../lib/assetStorage'
 
 // Helpers ---------------------------------------------------------------------
 
@@ -663,4 +664,150 @@ describe('contract: commitGenerationResult (incl. cross-scene)', () => {
 
     expect(useCanvasStore.getState().nodes.find((node) => node.id === 'obstacle')?.x).toBe(180)
   })
+
+  // S02: 资产落盘后 lineageSource/replacementSlot 在 await 期间被删 → 显式抛错带资产名。
+  // 旧语义：set 内静默 return {} 造成"生成成功但画布无节点"假成功 + 孤儿资产无法找回。
+  it('S02: rejects with saved asset names when replaceSlot is deleted during asset save', async () => {
+    seed(seedCanvas('character-flow', [
+      imageNode({ id: 'src-1' }),
+      aiSlotNode({ id: 'slot-1', x: 400, y: 20 }),
+    ]))
+    vi.mocked(saveGeneratedAsset).mockImplementationOnce(async (_blob: Blob, name: string, type?: string) => {
+      // 模拟：资产落盘期间 replaceSlot 被删（同步更新 canvases 与顶层 nodes，镜像真实删除）
+      useCanvasStore.setState((s) => {
+        const doc = s.canvases['character-flow']
+        const nextNodes = doc.nodes.filter((n) => n.id !== 'slot-1')
+        return {
+          nodes: s.sceneId === 'character-flow' ? nextNodes : s.nodes,
+          canvases: { ...s.canvases, 'character-flow': { ...doc, nodes: nextNodes } },
+        }
+      })
+      return {
+        assetUrl: 'mivo-asset://mock-asset',
+        name,
+        type: type || 'image/png',
+        sizeBytes: 1,
+        title: name,
+        hasTransparency: false,
+        size: '300x200',
+        dimensions: undefined,
+        sourceDimensions: { width: 300, height: 200 },
+      }
+    })
+
+    const payload = {
+      sceneId: 'character-flow',
+      sourceNodeId: 'src-1',
+      replaceSlotId: 'slot-1',
+      resultImages: [resultImage()],
+      prompt: 'edit',
+      model: 'gpt-image-2',
+      kind: 'edit' as const,
+    }
+
+    await expect(
+      useCanvasStore.getState().commitGenerationResult(payload),
+    ).rejects.toThrow(/AI 生成槽位已删除，生成结果未落画布。已保存资产：Generated image 1/)
+
+    // 源节点未被误删（只删了 replaceSlot）
+    const state = useCanvasStore.getState()
+    expect(state.nodes.some((n) => n.id === 'src-1')).toBe(true)
+    expect(state.nodes.some((n) => n.id === 'slot-1')).toBe(false)
+  })
+
+  it('S02: rejects with saved asset names when lineageSource is deleted during asset save', async () => {
+    seed(seedCanvas('character-flow', [
+      imageNode({ id: 'src-1' }),
+      imageNode({ id: 'lineage-src', x: 500 }),
+      aiSlotNode({ id: 'slot-1', x: 400, y: 20 }),
+    ]))
+    vi.mocked(saveGeneratedAsset).mockImplementationOnce(async (_blob: Blob, name: string, type?: string) => {
+      useCanvasStore.setState((s) => {
+        const doc = s.canvases['character-flow']
+        const nextNodes = doc.nodes.filter((n) => n.id !== 'lineage-src')
+        return {
+          nodes: s.sceneId === 'character-flow' ? nextNodes : s.nodes,
+          canvases: { ...s.canvases, 'character-flow': { ...doc, nodes: nextNodes } },
+        }
+      })
+      return {
+        assetUrl: 'mivo-asset://mock-asset',
+        name,
+        type: type || 'image/png',
+        sizeBytes: 1,
+        title: name,
+        hasTransparency: false,
+        size: '300x200',
+        dimensions: undefined,
+        sourceDimensions: { width: 300, height: 200 },
+      }
+    })
+
+    const payload = {
+      sceneId: 'character-flow',
+      sourceNodeId: 'slot-1',
+      lineageSourceId: 'lineage-src',
+      replaceSlotId: 'slot-1',
+      resultImages: [resultImage()],
+      prompt: 'edit',
+      model: 'gpt-image-2',
+      kind: 'edit' as const,
+    }
+
+    await expect(
+      useCanvasStore.getState().commitGenerationResult(payload),
+    ).rejects.toThrow(/源节点已删除，生成结果未落画布。已保存资产：Generated image 1/)
+  })
+
+  it('S02: rejects with saved asset names when sourceNodeId is deleted during asset save (no explicit lineageSourceId)', async () => {
+    // 覆盖 generateBesideNode / image edit / annotation edit 这类不带显式 lineageSourceId
+    // 的常见路径：sourceNodeId 在资产落盘期间被删 → 上提校验 throw 带资产名。
+    seed(seedCanvas('character-flow', [
+      imageNode({ id: 'src-1' }),
+      aiSlotNode({ id: 'slot-1', x: 400, y: 20 }),
+    ]))
+    vi.mocked(saveGeneratedAsset).mockImplementationOnce(async (_blob: Blob, name: string, type?: string) => {
+      useCanvasStore.setState((s) => {
+        const doc = s.canvases['character-flow']
+        const nextNodes = doc.nodes.filter((n) => n.id !== 'src-1')
+        return {
+          nodes: s.sceneId === 'character-flow' ? nextNodes : s.nodes,
+          canvases: { ...s.canvases, 'character-flow': { ...doc, nodes: nextNodes } },
+        }
+      })
+      return {
+        assetUrl: 'mivo-asset://mock-asset',
+        name,
+        type: type || 'image/png',
+        sizeBytes: 1,
+        title: name,
+        hasTransparency: false,
+        size: '300x200',
+        dimensions: undefined,
+        sourceDimensions: { width: 300, height: 200 },
+      }
+    })
+
+    const payload = {
+      sceneId: 'character-flow',
+      sourceNodeId: 'src-1',
+      replaceSlotId: 'slot-1',
+      resultImages: [resultImage()],
+      prompt: 'edit',
+      model: 'gpt-image-2',
+      kind: 'edit' as const,
+    }
+
+    await expect(
+      useCanvasStore.getState().commitGenerationResult(payload),
+    ).rejects.toThrow(/源节点已删除，生成结果未落画布。已保存资产：Generated image 1/)
+  })
+
+  // S02: set 后落地断言（savedImages > 0 && createdNodeIds === 0）是同 tick 竞态的防御性
+  // 最后防线。正常流下上提校验（画布存在/sourceNodeId/lineageSource/replaceSlot）已在
+  // await 之后、set 之前拦截所有"节点在保存期间被删"场景；set 内静默守卫与上提校验
+  // 查同一份 get() 状态（documentSlice :255 get() 与 :265 set 回调之间无 await），故
+  // createdNodeIds 恒等于 savedImages.length，该断言在单测中无法自然触发（stub get/set
+  // 会破坏 zustand 内部闭包，不可靠）。保留该分支作为防御性存在并写明原因，不静默跳过——
+  // 上提校验由前两条用例覆盖，此处仅记录落地断言语义。
 })
