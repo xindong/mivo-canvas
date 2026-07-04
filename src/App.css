@@ -3040,7 +3040,7 @@ button:disabled {
 .canvas-tool-dock {
   position: absolute;
   left: 50%;
-  bottom: 18px;
+  bottom: var(--ai-panel-offset);
   top: auto;
   z-index: 5;
   display: flex;
@@ -5560,7 +5560,7 @@ button:disabled {
 .canvas-controls {
   position: absolute;
   right: 14px;
-  bottom: 14px;
+  bottom: var(--ai-panel-offset);
   z-index: 5;
   display: flex;
   align-items: center;
@@ -5568,7 +5568,7 @@ button:disabled {
   padding: 6px;
   background: rgba(255, 250, 240, 0.9);
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: 999px;
   box-shadow: var(--shadow);
   backdrop-filter: blur(14px);
 }
