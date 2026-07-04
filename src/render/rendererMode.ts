@@ -30,7 +30,7 @@ const parseRendererModeFromUrl = (): RendererMode => {
   }
 
   if (normalized === 'leafer') {
-    debugLogger.warn('Renderer', 'leafer renderer 未实现，暂用 dom 渲染')
+    debugLogger.log('Renderer', 'leafer spike renderer active (image/frame/rect only; Phase 2b 正式化时扩展)')
     return 'leafer'
   }
 

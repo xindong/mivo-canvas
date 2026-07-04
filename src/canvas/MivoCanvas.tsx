@@ -9,8 +9,8 @@ import {
   type DragEvent as ReactDragEvent,
   type MouseEvent as ReactMouseEvent,
 } from 'react'
-import { Leafer } from 'leafer-ui'
-import '@leafer-in/view'
+import { useLeaferSpikeRenderer } from '../render/useLeaferSpikeRenderer'
+import { filterDomNodesForLeaferSpike } from '../render/leaferSpikeFilter'
 import { LocateFixed, Minus, Plus, RotateCcw } from 'lucide-react'
 import { downloadCanvasNodeOriginal } from '../lib/assetDownload'
 import { canReadLocalAssetDrag, parseLocalAssetDragPayload } from '../lib/canvasAssetDrag'
@@ -101,7 +101,6 @@ export function MivoCanvas({
 }: MivoCanvasProps) {
   const shellRef = useRef<HTMLElement | null>(null)
   const hostRef = useRef<HTMLDivElement | null>(null)
-  const leaferRef = useRef<Leafer | null>(null)
   const maskPointInteractionRef = useRef<MaskPointArmedInteractionApi>({
     beginNodePointerDown: () => undefined,
     handleCanvasPointerDown: () => undefined,
@@ -229,8 +228,10 @@ export function MivoCanvas({
     [viewport.scale, viewport.x, viewport.y],
   )
 
-  const renderedNodes = useMemo(() => {
-    if (cullingMode === 'off' || !shellSize.width || !shellSize.height) return visibleNodes
+  const canvasRenderedNodes = useMemo(() => {
+    if (cullingMode === 'off' || !shellSize.width || !shellSize.height) {
+      return visibleNodes
+    }
     const viewportRect = {
       x: (-viewport.x - canvasRenderOverscanPx) / viewport.scale,
       y: (-viewport.y - canvasRenderOverscanPx) / viewport.scale,
@@ -257,6 +258,10 @@ export function MivoCanvas({
     viewport.y,
     visibleNodes,
   ])
+  const renderedNodes = useMemo(
+    () => filterDomNodesForLeaferSpike(canvasRenderedNodes, rendererMode),
+    [canvasRenderedNodes],
+  )
 
   const openNodeContextMenu = useCallback(
     (nodeId: string, clientX: number, clientY: number) => {
@@ -414,41 +419,7 @@ export function MivoCanvas({
     return () => onRegisterExternalAssetDrop?.(undefined)
   }, [importLocalAssetAtClientPoint, onRegisterExternalAssetDrop])
 
-  useEffect(() => {
-    if (!hostRef.current || leaferRef.current) return
-
-    const host = hostRef.current
-    const size = host.getBoundingClientRect()
-    const leafer = new Leafer({
-      view: host,
-      type: 'design',
-      width: Math.max(1, Math.floor(size.width)),
-      height: Math.max(1, Math.floor(size.height)),
-      fill: 'rgba(246, 243, 235, 0)',
-      smooth: true,
-    })
-
-    leaferRef.current = leafer
-    leafer.start()
-
-    const resizeObserver = new ResizeObserver(([entry]) => {
-      if (!entry) return
-      const { width, height } = entry.contentRect
-      leafer.resize({
-        width: Math.max(1, Math.floor(width)),
-        height: Math.max(1, Math.floor(height)),
-        pixelRatio: window.devicePixelRatio,
-      })
-    })
-
-    resizeObserver.observe(host)
-
-    return () => {
-      resizeObserver.disconnect()
-      leafer.destroy()
-      leaferRef.current = null
-    }
-  }, [])
+  const leaferSpikeStats = useLeaferSpikeRenderer({ hostRef, viewport, nodes: visibleNodes, rendererMode })
 
   useEffect(() => {
     const shell = shellRef.current
@@ -515,6 +486,11 @@ export function MivoCanvas({
       data-viewport-y={viewport.y}
       data-rendered-node-count={renderedNodes.length}
       data-total-node-count={visibleNodes.length}
+      data-leafer-expected-children={leaferSpikeStats.expectedChildren}
+      data-leafer-children={leaferSpikeStats.children}
+      data-leafer-pixel-nonempty={leaferSpikeStats.pixelNonEmpty ? 'true' : 'false'}
+      data-leafer-pixel-sample-count={leaferSpikeStats.pixelSampleCount}
+      data-leafer-sync-version={leaferSpikeStats.syncVersion}
       ref={shellRef}
       onWheel={handleWheel}
       onPointerDown={wrapCanvasPointerDown}

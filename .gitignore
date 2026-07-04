@@ -63,3 +63,7 @@ bench/fixtures/bench-dom-mixed-50000.json
 bench/baselines/verify-*.json
 # PR-C drag-perf BEFORE/AFTER comparison JSONs (local measurement artifacts, not for git)
 bench-results/
+
+# 0b spike bench baselines (spike 产物,数据见 docs/decisions/leafer-0b-spike-*.md)
+bench/baselines/0b-*.json
+bench/baselines/.0b-*.log

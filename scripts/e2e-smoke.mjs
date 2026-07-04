@@ -456,7 +456,16 @@ try {
     await page.goto(canvasUrl, { waitUntil: 'networkidle' })
     await page.evaluate(() => window.localStorage.clear())
     await page.goto(canvasUrl, { waitUntil: 'networkidle' })
-    await page.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
+    if (rendererMode === 'leafer') {
+      await page.waitForFunction(() => {
+        const shell = document.querySelector('.canvas-shell')
+        const expected = Number(shell?.getAttribute('data-leafer-expected-children') || 0)
+        const children = Number(shell?.getAttribute('data-leafer-children') || 0)
+        return expected > 0 && children === expected && shell?.getAttribute('data-leafer-pixel-nonempty') === 'true'
+      }, { timeout: 15000 })
+    } else {
+      await page.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
+    }
     const actualRenderer = await page.evaluate(() => document.querySelector('.canvas-shell')?.getAttribute('data-renderer-mode') || 'dom')
     if (actualRenderer !== rendererMode) {
       throw new Error(`Renderer mode mismatch: requested ${rendererMode} but shell reports ${actualRenderer}`)
