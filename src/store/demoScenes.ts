@@ -192,6 +192,7 @@ const sceneDefinitions = (): Record<DemoSceneId, SceneDefinition> => {
           status: 'running',
           progress: 62,
           nodeIds: ['loading-task'],
+          preset: true,
         },
         {
           id: 'task-failed',
@@ -276,6 +277,7 @@ const sceneDefinitions = (): Record<DemoSceneId, SceneDefinition> => {
           status: 'queued',
           progress: 38,
           nodeIds: ['asset-final-a'],
+          preset: true,
         },
       ],
     },
