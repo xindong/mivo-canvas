@@ -7,7 +7,7 @@ import type {
 import type { SliceCreator } from './canvasStore'
 import { saveGeneratedAsset } from '../lib/assetStorage'
 import { defaultSizeForNodeType } from '../canvas/nodeTypes/canvasNodeRegistry'
-import { buildAiContextSnapshot, chooseAdjacentPlacement } from './aiCanvasWorkflow'
+import { AI_SLOT_GAP, buildAiContextSnapshot, chooseAdjacentPlacement, reflowRightObstacles } from './aiCanvasWorkflow'
 import { blobFromCommittedGenerationImage, displaySizeForGeneratedAsset, logCanvas, warnCanvas, errorCanvas } from './canvasStore'
 import { redoHistory, undoHistory } from './historyManager'
 import {
@@ -215,6 +215,13 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
     if (!prompt) throw new Error('Prompt is required')
     if (!payload.resultImages.length) throw new Error('No generated images returned')
     const targetSceneId = payload.sceneId || get().sceneId
+    const payloadExtras = payload as {
+      replaceSlotId?: string
+      lineageSourceId?: string
+      reflow?: boolean
+    }
+    const replaceSlotId = payloadExtras.replaceSlotId
+    const lineageSourceId = payloadExtras.lineageSourceId || payload.sourceNodeId
 
     const initialState = get()
     const initialDocument = initialState.canvases[targetSceneId]
@@ -223,6 +230,14 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
       ? initialDocument.nodes.find((node) => node.id === payload.sourceNodeId && !node.hidden)
       : undefined
     if (payload.sourceNodeId && !source) throw new Error('源节点已删除，无法继续生成。')
+    const lineageSource = lineageSourceId
+      ? initialDocument.nodes.find((node) => node.id === lineageSourceId && !node.hidden)
+      : undefined
+    if (lineageSourceId && !lineageSource) throw new Error('源节点已删除，无法继续生成。')
+    const replacementSlot = replaceSlotId
+      ? initialDocument.nodes.find((node) => node.id === replaceSlotId && node.type === 'ai-slot' && !node.hidden)
+      : undefined
+    if (replaceSlotId && !replacementSlot) throw new Error('AI 生成槽位已删除，无法继续生成。')
 
     const createdAt = Date.now()
     const savedImages = await Promise.all(
@@ -255,6 +270,14 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
         ? targetDocument.nodes.find((node) => node.id === payload.sourceNodeId && !node.hidden)
         : undefined
       if (payload.sourceNodeId && !currentSource) return {}
+      const currentLineageSource = lineageSourceId
+        ? targetDocument.nodes.find((node) => node.id === lineageSourceId && !node.hidden)
+        : undefined
+      if (lineageSourceId && !currentLineageSource) return {}
+      const currentReplacementSlot = replaceSlotId
+        ? targetDocument.nodes.find((node) => node.id === replaceSlotId && node.type === 'ai-slot' && !node.hidden)
+        : undefined
+      if (replaceSlotId && !currentReplacementSlot) return {}
 
       let nextNodes = targetDocument.nodes.filter((node) => !isDerivationEdgeNode(node))
       const nextEdges = cloneEdges(targetDocument.edges || [])
@@ -262,14 +285,20 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
       const newEdges: CanvasEdge[] = []
 
       savedImages.forEach(({ image, asset }, index) => {
-        const fallbackSize = currentSource
-          ? { width: currentSource.width, height: currentSource.height }
+        const replacingSlot = index === 0 ? currentReplacementSlot : undefined
+        const lineageNode =
+          currentLineageSource && currentLineageSource.id !== replacingSlot?.id ? currentLineageSource : undefined
+        const fallbackNode = replacingSlot || currentSource
+        const fallbackSize = fallbackNode
+          ? { width: fallbackNode.width, height: fallbackNode.height }
           : {
               width: image.width || defaultSizeForNodeType('image').width,
               height: image.height || defaultSizeForNodeType('image').height,
             }
         const displaySize = displaySizeForGeneratedAsset(asset, fallbackSize)
-        const placement = currentSource
+        const placement = replacingSlot
+          ? { x: replacingSlot.x, y: replacingSlot.y }
+          : currentSource
           ? chooseAdjacentPlacement({
               nodes: nextNodes,
               anchor: currentSource,
@@ -278,12 +307,12 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
               placement: payload.placement || 'right',
             })
           : { x: index * 36, y: index * 36 }
-        const nodeId = createNodeId(`${payload.kind}-result`)
+        const nodeId = replacingSlot?.id || createNodeId(`${payload.kind}-result`)
         const taskId = payload.taskId || `task-${nodeId}`
         const operation: AiWorkflowOperation =
           payload.kind === 'edit'
             ? 'area-edit'
-            : currentSource?.type === 'ai-slot'
+            : replacingSlot || currentSource?.type === 'ai-slot'
               ? 'slot-generation'
               : 'beside-generation'
         const resultNode = createGenerationResultNode({
@@ -305,18 +334,25 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
           createdAt,
           maskBounds: payload.maskBounds,
           operation,
-          sourceNode: currentSource,
+          sourceNode: lineageNode,
           placementDirection: payload.placement || 'right',
         })
 
         createdNodeIds.push(nodeId)
-        newNodes.push(resultNode)
-        nextNodes = [...nextNodes, resultNode]
+        if (replacingSlot) {
+          nextNodes = nextNodes.map((node) => (node.id === replacingSlot.id ? resultNode : node))
+        } else {
+          newNodes.push(resultNode)
+          nextNodes = [...nextNodes, resultNode]
+        }
+        if (payloadExtras.reflow) {
+          nextNodes = reflowRightObstacles(nextNodes, resultNode, AI_SLOT_GAP)
+        }
 
-        if (currentSource && payload.createDerivationEdge !== false) {
+        if (lineageNode && payload.createDerivationEdge !== false) {
           newEdges.push({
             id: createEdgeId(),
-            from: currentSource.id,
+            from: lineageNode.id,
             to: nodeId,
             type: payload.kind,
             prompt,
@@ -332,7 +368,7 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
         selectedNodeIds: createdNodeIds,
         nodes: nextNodes,
         edges: nextEdges,
-      }, { history: true })
+      }, { history: !replaceSlotId })
     })
 
     return createdNodeIds

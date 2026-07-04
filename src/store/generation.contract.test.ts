@@ -62,6 +62,7 @@ vi.mock('../lib/mivoImageClient', () => ({
 }))
 
 import { useCanvasStore } from './canvasStore'
+import { generationFacade } from './generationFacade'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 
 // Helpers ---------------------------------------------------------------------
@@ -254,18 +255,20 @@ describe('contract: generation action signatures', () => {
     expect(Array.isArray(nodeIds)).toBe(true)
     expect(nodeIds.length).toBeGreaterThan(0)
 
-    // Strengthened binding: result node is sourced from the specified slot
-    // (sourceNodeId = 'slot-1') + a derivation edge from the slot + the slot's
-    // aiWorkflow transitioned to 'ready' (was 'generating') + task 'done'.
+    // Slot results replace the slot in place and must not keep a self lineage
+    // (sourceNodeId/parentIds/edge from slot-1 to slot-1).
     const s = useCanvasStore.getState()
+    expect(nodeIds).toEqual(['slot-1'])
     nodeIds.forEach((id) => {
       const node = s.nodes.find((n) => n.id === id)
       expect(node).toBeDefined()
-      expect(node?.sourceNodeId).toBe('slot-1')
+      expect(node?.type).toBe('image')
+      expect(node?.sourceNodeId).toBeUndefined()
+      expect(node?.parentIds).toBeUndefined()
     })
-    expect(s.edges.filter((e) => nodeIds.includes(e.to) && e.from === 'slot-1')).toHaveLength(nodeIds.length)
-    const slot = s.nodes.find((n) => n.id === 'slot-1')
-    expect(slot?.aiWorkflow?.status).toBe('ready')
+    expect(s.edges.filter((e) => nodeIds.includes(e.to) && e.from === 'slot-1')).toHaveLength(0)
+    const result = s.nodes.find((n) => n.id === 'slot-1')
+    expect(result?.aiWorkflow?.status).toBe('ready')
     expect(s.tasks[0]?.status).toBe('done')
   })
 
@@ -421,6 +424,72 @@ describe('contract: generateBesideNode / generateIntoAiSlot orchestration', () =
     expect(nodeIds.length).toBeGreaterThan(0)
     expect(useCanvasStore.getState().tasks[0].status).toBe('done')
     expect(mockSubmitGenerationTask).toHaveBeenCalled()
+  })
+
+  it('generateIntoAiSlot: undo after success returns to the ready empty slot', async () => {
+    seed(seedCanvas('character-flow', [aiSlotNode({ id: 'slot-1', x: 12, y: 24 })]))
+
+    const nodeIds = await useCanvasStore.getState().generateIntoAiSlot('slot-1', 'fill the slot')
+
+    expect(nodeIds).toEqual(['slot-1'])
+    let node = useCanvasStore.getState().nodes.find((item) => item.id === 'slot-1')
+    expect(node?.type).toBe('image')
+    expect(useCanvasStore.getState().historyPast).toHaveLength(1)
+
+    useCanvasStore.getState().undo()
+    node = useCanvasStore.getState().nodes.find((item) => item.id === 'slot-1')
+    expect(node?.type).toBe('ai-slot')
+    expect(node?.aiWorkflow?.status).not.toBe('generating')
+    expect(useCanvasStore.getState().nodes.filter((item) => item.type === 'image')).toHaveLength(0)
+  })
+
+  it('generateIntoAiSlot: failure removes the placeholder via the generation baseline', async () => {
+    seed(seedCanvas('character-flow', [aiSlotNode({ id: 'slot-1', x: 12, y: 24 })]))
+    mockPollTask.mockResolvedValueOnce(failedView('boom'))
+
+    await expect(useCanvasStore.getState().generateIntoAiSlot('slot-1', 'fill the slot')).rejects.toThrow(/boom/)
+
+    const state = useCanvasStore.getState()
+    expect(state.nodes.some((node) => node.id === 'slot-1')).toBe(false)
+    expect(state.nodes.some((node) => node.aiWorkflow?.status === 'failed')).toBe(false)
+    expect(state.tasks.some((task) => task.status === 'failed')).toBe(false)
+    expect(state.historyPast).toHaveLength(0)
+    expect(state.historyFuture).toHaveLength(0)
+  })
+
+  it('generateIntoAiSlot: cancellation removes the placeholder via the generation baseline', async () => {
+    seed(seedCanvas('character-flow', [aiSlotNode({ id: 'slot-1' })]))
+    const controller = new AbortController()
+    controller.abort()
+
+    await expect(
+      useCanvasStore.getState().generateIntoAiSlot('slot-1', 'fill the slot', { signal: controller.signal }),
+    ).rejects.toThrow()
+
+    const state = useCanvasStore.getState()
+    expect(state.nodes.some((node) => node.id === 'slot-1')).toBe(false)
+    expect(state.nodes.some((node) => node.aiWorkflow?.status === 'canceled')).toBe(false)
+    expect(state.historyPast).toHaveLength(0)
+    expect(state.historyFuture).toHaveLength(0)
+  })
+
+  it('chat-created slot: failure rolls back to the pre-slot canvas', async () => {
+    seed(seedCanvas('character-flow', []))
+    const prep = generationFacade.prepareChatSlot({
+      sceneId: 'character-flow',
+      hasSelectedImage: false,
+      prompt: 'fill the slot',
+    })
+    mockPollTask.mockResolvedValueOnce(failedView('boom'))
+
+    await expect(
+      generationFacade.generateIntoAiSlot(prep.slotId, 'fill the slot', { sceneId: 'character-flow' }),
+    ).rejects.toThrow(/boom/)
+
+    const state = useCanvasStore.getState()
+    expect(state.nodes).toHaveLength(0)
+    expect(state.historyPast).toHaveLength(0)
+    expect(state.historyFuture).toHaveLength(0)
   })
 })
 

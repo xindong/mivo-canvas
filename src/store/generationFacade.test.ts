@@ -22,6 +22,7 @@ vi.mock('../lib/mivoImageClient', () => ({
 
 import { useCanvasStore } from './canvasStore'
 import { generationFacade } from './generationFacade'
+import { AI_SLOT_GAP } from './aiCanvasWorkflow'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 
 const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
@@ -61,6 +62,41 @@ describe('generationFacade.prepareChatSlot', () => {
     // the slot was committed to the canvas
     const created = useCanvasStore.getState().nodes.find((n) => n.id === prep.slotId)
     expect(created?.type).toBe('ai-slot')
+    expect(created?.x).toBe(10)
+    expect(created?.y).toBe(20 + 200 + AI_SLOT_GAP)
+    expect(created?.width).toBe(320)
+    expect(created?.height).toBe(320)
+  })
+
+  it('keeps the selectedNode right-side path at +56 when selectedNode is not an image generation source', () => {
+    seedCanvas([slotNode({ id: 'slot-1', x: 5, y: 7, width: 200, height: 180 })])
+
+    const prep = generationFacade.prepareChatSlot({
+      sceneId: 'c1',
+      selectedNodeId: 'slot-1',
+      hasSelectedImage: false,
+      prompt: 'a cat',
+    })
+
+    const created = useCanvasStore.getState().nodes.find((n) => n.id === prep.slotId)
+    expect(created?.x).toBe(5 + 200 + AI_SLOT_GAP)
+    expect(created?.y).toBe(7)
+  })
+
+  it('uses a fixed no-image fallback instead of the old node-count diagonal', () => {
+    seedCanvas([
+      slotNode({ id: 'slot-1' }),
+      slotNode({ id: 'slot-2', x: 80 }),
+      slotNode({ id: 'slot-3', x: 160 }),
+    ])
+
+    const prep = generationFacade.prepareChatSlot({ sceneId: 'c1', hasSelectedImage: false, prompt: 'a cat' })
+
+    const created = useCanvasStore.getState().nodes.find((n) => n.id === prep.slotId)
+    expect(created?.x).toBe(-160)
+    expect(created?.y).toBe(-160)
+    expect(created?.x).not.toBe(-160 + 3 * 18)
+    expect(created?.y).not.toBe(-160 + 3 * 18)
   })
 
   it('reuses an existing pendingSlotId when the slot is still present', () => {

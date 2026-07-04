@@ -14,10 +14,9 @@ import { LocateFixed, Minus, Plus, RotateCcw } from 'lucide-react'
 import { downloadCanvasNodeOriginal } from '../lib/assetDownload'
 import { canReadLocalAssetDrag, parseLocalAssetDragPayload } from '../lib/canvasAssetDrag'
 import { canImportCanvasFile, importFilesToCanvas, importImageUrlToCanvas } from '../lib/canvasAssetImport'
-import { readCanvasImageBlob } from '../lib/canvasImageSource'
-import { editMivoImage } from '../lib/mivoImageClient'
 import { useCanvasStore } from '../store/canvasStore'
 import { useChatStore } from '../store/chatStore'
+import { prepareMaskEditPlaceholder, removeMaskEditPlaceholder, runMaskEditGeneration } from './maskEditGeneration'
 import { brushCursorCssFor } from './brushCursors'
 import { brushOutlinePathFor, highlighterOpacity } from './brushGeometry'
 import { BrushOptionsBar } from './BrushOptionsBar'
@@ -144,7 +143,6 @@ export function MivoCanvas({
   const updateNodeMeasuredSize = useCanvasStore((state) => state.updateNodeMeasuredSize)
   const cropImageNode = useCanvasStore((state) => state.cropImageNode)
   const renameNode = useCanvasStore((state) => state.renameNode)
-  const commitGenerationResult = useCanvasStore((state) => state.commitGenerationResult)
   // P2-D2: only mount the AnchorOverlay when at least one anchor exists (cheap
   // boolean selector — stable false when no anchors, so no re-render cost).
   const hasAnchors = useCanvasStore((state) => state.nodes.some((node) => Boolean(node.experimentalAnchors?.length)))
@@ -323,51 +321,35 @@ export function MivoCanvas({
         .canvases[targetSceneId]?.nodes.find((node) => node.id === nodeId && node.type === 'image' && !node.hidden)
       if (!source) throw new Error('Source image not found')
 
+      const slotId = prepareMaskEditPlaceholder(targetSceneId, source, payload.prompt)
       setMaskEditSubmittingNodeId(nodeId)
       const abortController = new AbortController()
       maskEditAbortRef.current?.abort()
       maskEditAbortRef.current = abortController
       try {
-        const image = await readCanvasImageBlob(source, resolvedAssetUrl)
-        const response = await editMivoImage({
-          image,
-          mask: payload.mask,
-          prompt: payload.prompt,
+        await runMaskEditGeneration({
+          sceneId: targetSceneId,
+          source,
+          slotId,
+          resolvedAssetUrl,
+          payload,
           imgRatio: closestMivoRatioForSize(payload.sourceSize),
-          quality: 'medium',
-          model: 'gpt-image-2',
           signal: abortController.signal,
         })
-        const nodeIds = await commitGenerationResult({
-          sceneId: targetSceneId,
-          sourceNodeId: source.id,
-          resultImages: response.images,
-          prompt: payload.prompt,
-          model: 'gpt-image-2',
-          kind: 'edit',
-          createDerivationEdge: true,
-          maskBounds: payload.maskBounds,
-          placement: 'right',
-        })
-        const latestCanvasState = useCanvasStore.getState()
-        useChatStore.getState().appendNotice({ sceneId: targetSceneId, origin: 'mask-edit', nodeIds, prompt: payload.prompt })
-        if (latestCanvasState.sceneId !== targetSceneId) {
-          const title = latestCanvasState.canvases[targetSceneId]?.title || targetSceneId
-          useChatStore.getState().appendNotice({
-            sceneId: latestCanvasState.sceneId,
-            origin: 'mask-edit',
-            prompt: `结果已生成到画布 ${title}`,
-          })
-        }
         setMaskEditNodeId(undefined)
       } catch (error) {
+        const logMessage = error instanceof Error ? error.message : '局部重绘失败'
+        removeMaskEditPlaceholder(targetSceneId, slotId, {
+          canceled: abortController.signal.aborted,
+          error: logMessage,
+          sourceTitle: source.title,
+        })
         const latestCanvasState = useCanvasStore.getState()
         if (latestCanvasState.sceneId !== targetSceneId) {
-          const message = error instanceof Error ? error.message : '局部重绘失败'
           useChatStore.getState().appendNotice({
             sceneId: latestCanvasState.sceneId,
             origin: 'mask-edit',
-            prompt: `局部重绘失败：${message}`,
+            prompt: `局部重绘失败：${logMessage}`,
           })
         }
         throw error
@@ -378,7 +360,7 @@ export function MivoCanvas({
         setMaskEditSubmittingNodeId(undefined)
       }
     },
-    [commitGenerationResult, sceneId],
+    [sceneId],
   )
 
   const downloadOriginal = useCallback((node?: typeof contextMenuNode) => {
