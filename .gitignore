@@ -52,3 +52,12 @@ coverage/
 .cache/
 .turbo/
 _tmp/
+
+# Bench: large fixtures (5k+ nodes) and one-off verification baselines are
+# generated on-demand (npm run bench:fixtures / bench:collect); only small
+# committed fixtures (100/500/1000) are tracked for reproducibility.
+bench/fixtures/bench-dom-mixed-5000.json
+bench/fixtures/bench-dom-mixed-10000.json
+bench/fixtures/bench-dom-mixed-20000.json
+bench/fixtures/bench-dom-mixed-50000.json
+bench/baselines/verify-*.json

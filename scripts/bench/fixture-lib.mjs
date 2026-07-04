@@ -3,7 +3,7 @@ import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 export const DEFAULT_FIXTURE_SEED = 20260704
-export const SUPPORTED_NODE_COUNTS = [100, 500, 1000]
+export const SUPPORTED_NODE_COUNTS = [100, 500, 1000, 5000, 10000, 20000, 50000]
 export const SUPPORTED_DPRS = [1, 2]
 
 const __dirname = dirname(fileURLToPath(import.meta.url))

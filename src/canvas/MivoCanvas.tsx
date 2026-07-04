@@ -32,7 +32,8 @@ import type { MivoImageRatio } from '../types/generation'
 import { StampOptionsBar } from './StampOptionsBar'
 import { stampCursorCssFor, stampGrowthSizes, stampSrcFor } from './stampDefs'
 import { useCanvasInteractionController } from './useCanvasInteractionController'
-
+import { rendererMode } from '../render/rendererMode'
+import { cullingMode } from '../render/cullingMode'
 type ContextMenuState = {
   kind: 'node' | 'blank'
   nodeId?: string
@@ -219,8 +220,7 @@ export function MivoCanvas({
   )
 
   const renderedNodes = useMemo(() => {
-    if (!shellSize.width || !shellSize.height) return visibleNodes
-
+    if (cullingMode === 'off' || !shellSize.width || !shellSize.height) return visibleNodes
     const viewportRect = {
       x: (-viewport.x - canvasRenderOverscanPx) / viewport.scale,
       y: (-viewport.y - canvasRenderOverscanPx) / viewport.scale,
@@ -579,7 +579,7 @@ export function MivoCanvas({
       } ${selectedNodes.length > 1 ? 'has-multi-selection' : ''} ${brushToolActive ? 'brush-tool' : ''} ${
         stampToolActive ? 'stamp-tool' : ''
       }`}
-      aria-label="Mivo Canvas"
+      aria-label="Mivo Canvas" data-renderer-mode={rendererMode} data-culling-mode={cullingMode}
       data-viewport-scale={viewport.scale}
       data-viewport-x={viewport.x}
       data-viewport-y={viewport.y}

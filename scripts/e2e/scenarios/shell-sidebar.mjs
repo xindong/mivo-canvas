@@ -3,6 +3,7 @@ export const runShellSidebarScenario = async (context) => {
     assertTasksHeaderCopy,
     baseUrl,
     canvasStoreSpec,
+    canvasUrl,
     ensureChatPanelOpen,
     nearlyEqual,
     page,
@@ -13,7 +14,7 @@ export const runShellSidebarScenario = async (context) => {
   } = context
 
   await page.addInitScript(() => window.localStorage.clear())
-  await page.goto(baseUrl, { waitUntil: 'networkidle' })
+  await page.goto(canvasUrl || baseUrl, { waitUntil: 'networkidle' })
   await page.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
 
   await ensureChatPanelOpen()
