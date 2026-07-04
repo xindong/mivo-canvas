@@ -58,9 +58,7 @@ const doneTask = (task: CanvasTask, label: string, nodeIds: string[]): CanvasTas
 })
 
 const isCanceledGenerationError = (error: unknown, signal?: AbortSignal) =>
-  Boolean(signal?.aborted) ||
-  (error instanceof MivoImageRequestError && error.kind === 'canceled') ||
-  (error instanceof Error && error.message.includes('已取消'))
+  Boolean(signal?.aborted) || (error instanceof MivoImageRequestError && error.kind === 'canceled')
 
 // P2-C2: default variation params when the caller doesn't pass explicit ones
 // (e.g. the InspectorPanel "Make variations" button). 4 variations reusing the

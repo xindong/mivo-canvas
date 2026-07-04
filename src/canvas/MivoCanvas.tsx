@@ -16,6 +16,8 @@ import { canReadLocalAssetDrag, parseLocalAssetDragPayload } from '../lib/canvas
 import { canImportCanvasFile, importFilesToCanvas, importImageUrlToCanvas } from '../lib/canvasAssetImport'
 import { useCanvasStore } from '../store/canvasStore'
 import { useChatStore } from '../store/chatStore'
+import { debugLogger } from '../store/debugLogStore'
+import { toastFeedback } from '../store/toastStore'
 import { prepareMaskEditPlaceholder, removeMaskEditPlaceholder, runMaskEditGeneration } from './maskEditGeneration'
 import { brushCursorCssFor } from './brushCursors'
 import { brushOutlinePathFor, highlighterOpacity } from './brushGeometry'
@@ -262,6 +264,25 @@ export function MivoCanvas({
     [screenToCanvasPoint],
   )
 
+  // C01: stable callback so memo(CanvasNodeView) doesn't break on every render.
+  // Previously an inline closure here → new ref each render →全量击穿 memo.
+  const handleOpenNodeDetails = useCallback(
+    (nodeId: string) => {
+      setContextMenu(null)
+      selectNode(nodeId)
+      onOpenDetails?.()
+    },
+    [selectNode, onOpenDetails],
+  )
+
+  // C02: shared error sink for fire-and-forget asset imports. Without this the
+  // downstream reject becomes an unhandled rejection with zero user feedback.
+  const handleImportError = useCallback((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error)
+    debugLogger.error('Canvas Import', `Asset import failed: ${message}`)
+    toastFeedback.error(`素材导入失败：${message}`)
+  }, [])
+
   const openBlankContextMenu = useCallback(
     (event: ReactMouseEvent<HTMLElement>) => {
       if (isCanvasChromeTarget(event.target)) return
@@ -412,12 +433,12 @@ export function MivoCanvas({
 
       input.onchange = async () => {
         const files = Array.from(input.files || [])
-        await importFilesToCanvas(files, position, addImportedFileNode)
+        await importFilesToCanvas(files, position, addImportedFileNode).catch(handleImportError)
       }
 
       input.click()
     },
-    [addImportedFileNode],
+    [addImportedFileNode, handleImportError],
   )
 
   const importLocalAssetAtClientPoint = useCallback(
@@ -425,10 +446,10 @@ export function MivoCanvas({
       const payload = parseLocalAssetDragPayload(dataTransfer)
       if (!payload) return false
 
-      void importImageUrlToCanvas(payload.url, payload.name, screenToCanvasPoint(clientX, clientY), addImportedImage)
+      void importImageUrlToCanvas(payload.url, payload.name, screenToCanvasPoint(clientX, clientY), addImportedImage).catch(handleImportError)
       return true
     },
-    [addImportedImage, screenToCanvasPoint],
+    [addImportedImage, screenToCanvasPoint, handleImportError],
   )
 
   const handleCanvasDragOver = useCallback((event: ReactDragEvent<HTMLElement>) => {
@@ -450,14 +471,14 @@ export function MivoCanvas({
       const position = screenToCanvasPoint(event.clientX, event.clientY)
       const files = Array.from(event.dataTransfer.files)
       if (files.length) {
-        void importFilesToCanvas(files, position, addImportedFileNode)
+        void importFilesToCanvas(files, position, addImportedFileNode).catch(handleImportError)
         return
       }
 
       const payload = parseLocalAssetDragPayload(event.dataTransfer)
-      if (payload) void importImageUrlToCanvas(payload.url, payload.name, position, addImportedImage)
+      if (payload) void importImageUrlToCanvas(payload.url, payload.name, position, addImportedImage).catch(handleImportError)
     },
-    [addImportedFileNode, addImportedImage, screenToCanvasPoint],
+    [addImportedFileNode, addImportedImage, screenToCanvasPoint, handleImportError],
   )
 
   useEffect(() => {
@@ -776,11 +797,7 @@ export function MivoCanvas({
               onResizeNodeToContent={updateNodeMeasuredSize}
               onSubmitMaskEdit={submitMaskEdit}
               onCancelMaskEdit={cancelMaskEdit}
-              onOpenDetails={(nodeId) => {
-                setContextMenu(null)
-                selectNode(nodeId)
-                onOpenDetails?.()
-              }}
+              onOpenDetails={handleOpenNodeDetails}
               onOpenContextMenu={openNodeContextMenu}
             />
           )
