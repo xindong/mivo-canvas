@@ -190,6 +190,23 @@ export const mivoPlatformPollJob = async (
 ): Promise<PollResult> => {
   const { platformPollIntervalMs } = getEnvConfig()
   const platformPollDeadlineMs = pollDeadlineMs ?? resolveMivoPlatformPollDeadlineMs('1K')
+  // V03 (Greptile review): signal-aware poll-interval wait for the retry paths.
+  // Resolves early on abort so the loop-top `if (signal?.aborted)` returns
+  // {status:'aborted'} without waiting the full interval. The pre-existing
+  // pending-path wait stays a plain setTimeout (its behavior is unchanged).
+  const waitForPollInterval = (signal: AbortSignal | undefined): Promise<void> =>
+    new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, platformPollIntervalMs)
+      const onAbort = () => {
+        clearTimeout(timer)
+        resolve()
+      }
+      if (signal?.aborted) {
+        onAbort()
+        return
+      }
+      signal?.addEventListener('abort', onAbort, { once: true })
+    })
   const t0 = Date.now()
   let lastStatus: string | null = null
   // V03: tolerate transient poll failures (fetch reject or 5xx). A single blip
@@ -220,7 +237,7 @@ export const mivoPlatformPollJob = async (
       consecutiveFailures += 1
       logPollTransientRetry(consecutiveFailures, error)
       if (consecutiveFailures >= platformPollMaxFailures) throw error
-      await new Promise((r) => setTimeout(r, platformPollIntervalMs))
+      await waitForPollInterval(signal)
       continue
     }
     if (!res.ok) {
@@ -231,7 +248,7 @@ export const mivoPlatformPollJob = async (
       consecutiveFailures += 1
       logPollTransientRetry(consecutiveFailures, err)
       if (consecutiveFailures >= platformPollMaxFailures) throw err
-      await new Promise((r) => setTimeout(r, platformPollIntervalMs))
+      await waitForPollInterval(signal)
       continue
     }
     // A 2xx response resets the streak — only sustained failure throws.

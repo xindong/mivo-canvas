@@ -92,7 +92,11 @@ export const __sweepTerminalTasks = (): void => {
     if (record.terminalAt === undefined) continue
     if (now - record.terminalAt <= TERMINAL_TTL_MS) continue
     tasks.delete(id)
-    if (record.idempotencyKey) idempotencyIndex.delete(record.idempotencyKey)
+    // Defensive: only drop the index entry if it still points at this task
+    // (symmetric with createTask's "index entry without a record" lazy-cleanup).
+    if (record.idempotencyKey && idempotencyIndex.get(record.idempotencyKey) === id) {
+      idempotencyIndex.delete(record.idempotencyKey)
+    }
   }
 }
 
