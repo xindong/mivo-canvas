@@ -58,6 +58,25 @@ export const runMaskPointScenario = async (context) => {
   const { page, canvasStoreSpec } = context
   const spec = await canvasStoreSpec()
 
+  const dockMaskButton = page.locator('.canvas-tool-dock').getByRole('button', { name: '局部重绘' })
+
+  // P2 — no selected image and no image on canvas: dock entry stays enabled, warns, and does not arm.
+  await page.evaluate(async (moduleSpec) => {
+    const { useCanvasStore } = await import(moduleSpec)
+    const { useToastStore } = await import('/src/store/toastStore.ts')
+    useCanvasStore.getState().createCanvas('E2E Mask Point Empty')
+    useCanvasStore.getState().selectNode(undefined)
+    useToastStore.getState().clearToasts()
+  }, spec)
+  await dockMaskButton.click()
+  await page.waitForFunction(() => {
+    const armed = document.querySelector('.canvas-shell')?.classList.contains('mask-armed')
+    const warning = Array.from(document.querySelectorAll('.toast-item.warning .toast-message')).some((item) =>
+      /画布上还没有图片/.test(item.textContent || ''),
+    )
+    return !armed && warning
+  })
+
   // Fresh canvas with one real (loadable) image to open the mask editor onto.
   const imageId = await page.evaluate(async (moduleSpec) => {
     const { useCanvasStore } = await import(moduleSpec)
@@ -69,9 +88,40 @@ export const runMaskPointScenario = async (context) => {
     })
     const state = useCanvasStore.getState()
     const node = state.nodes[state.nodes.length - 1]
-    useCanvasStore.getState().selectNode(node.id)
+    useCanvasStore.getState().selectNode(undefined)
     return node.id
   }, spec)
+
+  // P3 — no selection: dock click arms, image click selects + opens overlay + drops the first point.
+  await dockMaskButton.click()
+  await page.waitForFunction(() => document.querySelector('.canvas-shell')?.classList.contains('mask-armed'))
+  const armedButtonActive = await dockMaskButton.evaluate((button) => button.classList.contains('active'))
+  if (!armedButtonActive) throw new Error('P3: dock mask button should be active while point selection is armed')
+  const nodeBox = await page.locator(`[data-node-id="${imageId}"]`).boundingBox()
+  if (!nodeBox) throw new Error('P3: source image node should be visible')
+  await page.mouse.click(nodeBox.x + nodeBox.width * 0.5, nodeBox.y + nodeBox.height * 0.5)
+  await page.waitForSelector('.image-mask-edit-stage')
+  await waitForRegionCount(page, 1)
+  const armedState = await page.evaluate(() => {
+    const overlay = document.querySelector('.image-mask-edit-overlay')
+    return {
+      armed: document.querySelector('.canvas-shell')?.classList.contains('mask-armed'),
+      selectedNodeId: document.querySelector('.dom-node.selected')?.getAttribute('data-node-id'),
+      region: Number(overlay?.getAttribute('data-region-count') || '0'),
+      mask: Number(overlay?.getAttribute('data-mask-region-count') || '0'),
+      point: Number(overlay?.getAttribute('data-point-anchor-count') || '0'),
+      markers: document.querySelectorAll('.image-mask-edit-stage svg .image-mask-edit-point-marker').length,
+      rings: document.querySelectorAll('.image-mask-edit-stage svg .image-mask-edit-point-ring').length,
+    }
+  })
+  if (armedState.armed || armedState.selectedNodeId !== imageId || armedState.mask !== 1 || armedState.point !== 0) {
+    throw new Error(`P3: armed image click should select image, open mask edit, and consume one mask region: ${JSON.stringify(armedState)}`)
+  }
+  if (armedState.markers < 1 || armedState.rings < 1) {
+    throw new Error(`P3: initial point should render marker + radius ring: ${JSON.stringify(armedState)}`)
+  }
+  await page.locator('.image-mask-edit-history').getByRole('button', { name: 'Cancel mask edit' }).click()
+  await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' }).catch(() => {})
 
   await page.locator(`[data-node-id="${imageId}"]`).click()
   await page.waitForSelector('.selection-quick-toolbar')
@@ -107,12 +157,13 @@ export const runMaskPointScenario = async (context) => {
     throw new Error(`SC6.2: point click should not leave a standalone point anchor (it is a circle region), got ${JSON.stringify(afterClick)}`)
   }
   // 回归守卫（bug: 单点 brush 渲染成单点 polyline → 无任何可见反馈）：点选后
-  // stage SVG 里必须出现可见的圆形反馈元素。
-  const visibleCircleCount = await page.evaluate(
-    () => document.querySelectorAll('.image-mask-edit-stage svg circle.image-mask-edit-region').length,
-  )
-  if (visibleCircleCount < 1) {
-    throw new Error(`SC6.2: point click should render a visible circle feedback in the stage SVG, got ${visibleCircleCount}`)
+  // stage SVG 里必须出现紫色 marker 与真实半径圆环。
+  const visiblePointFeedback = await page.evaluate(() => ({
+    markers: document.querySelectorAll('.image-mask-edit-stage svg .image-mask-edit-point-marker').length,
+    rings: document.querySelectorAll('.image-mask-edit-stage svg .image-mask-edit-point-ring').length,
+  }))
+  if (visiblePointFeedback.markers < 1 || visiblePointFeedback.rings < 1) {
+    throw new Error(`SC6.2: point click should render marker + radius ring feedback, got ${JSON.stringify(visiblePointFeedback)}`)
   }
   const blocked = await page.evaluate(() => {
     const err = document.querySelector('.image-mask-edit-error')?.textContent || ''

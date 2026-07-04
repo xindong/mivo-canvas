@@ -3011,6 +3011,12 @@ button:disabled {
   cursor: crosshair;
 }
 
+.canvas-shell.mask-armed,
+.canvas-shell.mask-armed .dom-canvas-layer,
+.canvas-shell.mask-armed .dom-node {
+  cursor: crosshair;
+}
+
 .canvas-shell.tool-text,
 .canvas-shell.tool-text .dom-canvas-layer {
   cursor: text;
@@ -5285,6 +5291,33 @@ button:disabled {
 .image-mask-edit-region.point-anchor {
   fill: rgba(86, 109, 137, 0.18);
   stroke-dasharray: 5 4;
+}
+
+.image-mask-edit-point-marker {
+  color: var(--violet);
+  fill: var(--violet);
+  stroke: var(--violet);
+  pointer-events: none;
+}
+
+.image-mask-edit-point-ring {
+  fill: rgba(105, 87, 232, 0.08);
+  stroke: rgba(105, 87, 232, 0.74);
+  stroke-width: 2px;
+  stroke-dasharray: 6 5;
+  vector-effect: non-scaling-stroke;
+}
+
+.image-mask-edit-point-crosshair {
+  stroke: var(--violet);
+  stroke-linecap: round;
+}
+
+.image-mask-edit-point-core {
+  fill: var(--violet);
+  stroke: #ffffff;
+  stroke-width: 1.5px;
+  vector-effect: non-scaling-stroke;
 }
 
 .image-mask-edit-region.brush {
