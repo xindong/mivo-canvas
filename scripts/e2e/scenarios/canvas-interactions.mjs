@@ -204,6 +204,47 @@ export const runCanvasInteractionsScenario = async (context) => {
     throw new Error(`Reset view should restore the default viewport: before=${JSON.stringify(beforePan)}, after=${JSON.stringify(afterReset)}`)
   }
 
+  // Phase 1b-1: large-delta drag past the node bbox keeps tracking the pointer
+  // via setPointerCapture (move stream sustained even after the pointer exits
+  // the node's bounding rect). Run early while the first node is unlocked.
+  await firstNode.click()
+  await page.waitForFunction(() => document.querySelectorAll('.dom-node.selected').length === 1)
+  const captureDragBefore = await firstNodeMedia.boundingBox()
+  if (!captureDragBefore) throw new Error('Missing first node for pointer-capture drag check')
+  const captureDelta = { x: 300, y: 200 }
+  await page.mouse.move(captureDragBefore.x + 24, captureDragBefore.y + 24)
+  await page.mouse.down()
+  await page.mouse.move(
+    captureDragBefore.x + 24 + captureDelta.x,
+    captureDragBefore.y + 24 + captureDelta.y,
+    { steps: 14 },
+  )
+  await page.mouse.up()
+  const captureDragAfter = await firstNodeMedia.boundingBox()
+  // Tolerance covers snap-alignment to peer node edges (the drag still tracks
+  // the full pointer path past the node bbox; snapping only shifts the final
+  // position by a few px near a peer edge).
+  if (
+    !captureDragAfter ||
+    !nearlyEqual(captureDragAfter.x - captureDragBefore.x, captureDelta.x, 12) ||
+    !nearlyEqual(captureDragAfter.y - captureDragBefore.y, captureDelta.y, 12)
+  ) {
+    throw new Error(
+      `Large-delta drag past the node bbox should keep tracking via pointer capture: before=${JSON.stringify(captureDragBefore)}, after=${JSON.stringify(captureDragAfter)}, delta=${JSON.stringify(captureDelta)}`,
+    )
+  }
+  await pressCanvasShortcut('z')
+  await page.waitForFunction(
+    ({ nodeId, x, y }) => {
+      const media = document.querySelector(`[data-node-id="${nodeId}"] .dom-node-media`)
+      if (!media) return false
+      const rect = media.getBoundingClientRect()
+      return Math.abs(rect.x - x) <= 2 && Math.abs(rect.y - y) <= 2
+    },
+    { nodeId: firstNodeId, x: captureDragBefore.x, y: captureDragBefore.y },
+  )
+  await page.mouse.click(farBlankPoint.x, farBlankPoint.y)
+
   await page.mouse.click(farBlankPoint.x, farBlankPoint.y, { button: 'right' })
   for (const action of [
     'New text here',
@@ -2462,6 +2503,35 @@ export const runCanvasInteractionsScenario = async (context) => {
   await page.waitForSelector('.details-dialog[role="dialog"]')
   await page.getByRole('button', { name: 'Close details' }).click()
   await page.waitForSelector('.details-dialog', { state: 'detached' })
+
+  // Phase 1b-1 pointer capture plumbing: Hand-on-node pans (not moves) the node,
+  // Select large-delta drag past the node bbox keeps tracking via pointer capture.
+  await page.getByRole('button', { name: 'Reset view' }).click()
+  await page.waitForFunction(() => {
+    const shell = document.querySelector('.canvas-shell')
+    return shell && Number(shell.getAttribute('data-viewport-scale')) === 1
+  })
+  const handOnNodeViewportBefore = Number(await page.locator('.canvas-shell').getAttribute('data-viewport-x'))
+  const handOnNodeMediaBefore = await firstNodeMedia.boundingBox()
+  if (!handOnNodeMediaBefore) throw new Error('Missing first node for Hand-on-node pan check')
+  await page.getByRole('button', { name: 'Hand' }).click()
+  await page.mouse.move(
+    handOnNodeMediaBefore.x + handOnNodeMediaBefore.width / 2,
+    handOnNodeMediaBefore.y + handOnNodeMediaBefore.height / 2,
+  )
+  await page.mouse.down()
+  await page.mouse.move(
+    handOnNodeMediaBefore.x + handOnNodeMediaBefore.width / 2 + 70,
+    handOnNodeMediaBefore.y + handOnNodeMediaBefore.height / 2 + 50,
+    { steps: 6 },
+  )
+  await page.mouse.up()
+  const handOnNodeViewportAfter = Number(await page.locator('.canvas-shell').getAttribute('data-viewport-x'))
+  if (handOnNodeViewportAfter === handOnNodeViewportBefore) {
+    throw new Error(
+      `Hand tool dragging on a node should pan the viewport instead of moving the node: before=${handOnNodeViewportBefore}, after=${handOnNodeViewportAfter}`,
+    )
+  }
 
   context.firstNodeId = firstNodeId
 }

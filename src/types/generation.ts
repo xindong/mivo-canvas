@@ -81,6 +81,13 @@ export type CommittedGenerationImage = {
 export type CommitGenerationResultPayload = {
   sceneId?: CanvasId
   sourceNodeId?: string
+  // S07: previously smuggled via `as` in documentSlice — now declared on the
+  // payload type. replaceSlotId swaps an existing ai-slot in place; lineageSourceId
+  // overrides the derivation-edge source (defaults to sourceNodeId); reflow pushes
+  // right-side obstacles after placing the result.
+  replaceSlotId?: string
+  lineageSourceId?: string
+  reflow?: boolean
   createDerivationEdge?: boolean
   resultImages: CommittedGenerationImage[]
   prompt: string

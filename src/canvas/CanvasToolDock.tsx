@@ -12,9 +12,11 @@ import {
 type CanvasToolDockProps = {
   previewTool?: ToolId
   onStartMaskEdit?: (nodeId: string) => void
+  maskArmed?: boolean
+  onToggleMaskArmed?: () => void
 }
 
-export function CanvasToolDock({ previewTool, onStartMaskEdit }: CanvasToolDockProps) {
+export function CanvasToolDock({ previewTool, onStartMaskEdit, maskArmed = false, onToggleMaskArmed }: CanvasToolDockProps) {
   const activeTool = useCanvasStore((state) => state.activeTool)
   const setActiveTool = useCanvasStore((state) => state.setActiveTool)
   const selectedNodeId = useCanvasStore((state) => state.selectedNodeId)
@@ -98,10 +100,14 @@ export function CanvasToolDock({ previewTool, onStartMaskEdit }: CanvasToolDockP
               </button>
               <button
                 type="button"
-                onClick={() => selectedImageNodeId && onStartMaskEdit?.(selectedImageNodeId)}
-                disabled={!selectedImageNodeId || !onStartMaskEdit}
+                className={maskArmed ? 'active' : ''}
+                onClick={() => {
+                  if (selectedImageNodeId) onStartMaskEdit?.(selectedImageNodeId)
+                  else onToggleMaskArmed?.()
+                }}
+                disabled={!onStartMaskEdit}
                 aria-label="局部重绘"
-                title={selectedImageNodeId ? '局部重绘' : '先选择一张图片'}
+                title={selectedImageNodeId ? '局部重绘' : '点击图片上要修改的位置'}
               >
                 <Crosshair size={20} />
               </button>

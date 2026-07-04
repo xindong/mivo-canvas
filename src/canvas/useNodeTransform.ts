@@ -23,6 +23,7 @@ export const isAutoDeletedEmptyTextNode = (
 
 type UseNodeTransformOptions = {
   viewportRef: RefObject<Viewport>
+  shellRef: RefObject<HTMLElement | null>
   startInteraction: () => void
   clearSelection: () => void
   selectNode: (id: string | undefined, options?: { additive?: boolean }) => void
@@ -43,6 +44,7 @@ type UseNodeTransformOptions = {
 // Pure extraction; geometry stays in canvasInteraction/canvasGeometry.
 export function useNodeTransform({
   viewportRef,
+  shellRef,
   startInteraction,
   clearSelection,
   selectNode,
@@ -93,15 +95,19 @@ export function useNodeTransform({
     [nodes, selectedNodeIds],
   )
 
-  const beginNodeMove = useCallback(
-    (nodeId: string, event: ReactPointerEvent<HTMLDivElement>) => {
+  const beginNodeMoveWithCapture = useCallback(
+    (
+      nodeId: string,
+      event: ReactPointerEvent<HTMLElement>,
+      captureTarget: HTMLElement | null | undefined,
+    ) => {
       if (event.button !== 0) return
 
       const node = nodes.find((item) => item.id === nodeId)
       if (!node) return
 
       event.preventDefault()
-      event.currentTarget.setPointerCapture(event.pointerId)
+      captureTarget?.setPointerCapture(event.pointerId)
       startInteraction()
       clearSelection()
 
@@ -127,6 +133,26 @@ export function useNodeTransform({
       })
     },
     [clearSelection, nodes, selectNode, selectNodes, selectedNodeIds, startInteraction],
+  )
+
+  // Thin wrapper preserving the per-node dispatch entry: captureTarget is the
+  // node element that owns the pointerdown. Behavior is identical to pre-1b-1.
+  const beginNodeMove = useCallback(
+    (nodeId: string, event: ReactPointerEvent<HTMLDivElement>) =>
+      beginNodeMoveWithCapture(nodeId, event, event.currentTarget),
+    [beginNodeMoveWithCapture],
+  )
+
+  // Shell-dispatch entry (1b-1): callers that route pointerdown through the
+  // canvas shell pass shellRef.current as the default capture target so the
+  // move stream stays captured even when the pointer leaves the node bbox.
+  const beginNodeMoveFromShell = useCallback(
+    (
+      nodeId: string,
+      event: ReactPointerEvent<HTMLElement>,
+      captureTarget?: HTMLElement | null,
+    ) => beginNodeMoveWithCapture(nodeId, event, captureTarget ?? shellRef.current),
+    [beginNodeMoveWithCapture, shellRef],
   )
 
   const startNodeResize = useCallback(
@@ -236,6 +262,7 @@ export function useNodeTransform({
 
   return {
     beginNodeMove,
+    beginNodeMoveFromShell,
     startNodeResize,
     tryMoveNodeTransform,
     tryEndNodeTransform,

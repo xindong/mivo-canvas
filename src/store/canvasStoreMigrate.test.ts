@@ -283,3 +283,140 @@ describe('migratePersistedState (canvas persist v8)', () => {
     })
   })
 })
+
+// SC-2: legacy persisted v<9 state may have the demo seed tasks (task-running,
+// task-asset) already settled to failed + "（任务已过期，请重试）" by a prior boot's
+// hydration settle pass. The v<9 migration branch restores their seed form so
+// the demo doesn't ship with red warning badges. Only these two fixed ids are
+// touched — real/user tasks pass through untouched.
+describe('v9 preset task restoration (persistedVersion < 9)', () => {
+  const expiredSuffix = '（任务已过期，请重试）'
+
+  it('restores polluted task-running and task-asset to seed form at version 8', () => {
+    // Simulate a legacy v8 persisted state where a prior boot's settle pass
+    // already failed the two demo seed tasks.
+    const pollutedCanvases = {
+      'task-states': {
+        title: '任务状态',
+        nodes: [],
+        edges: [],
+        tasks: [
+          {
+            id: 'task-running',
+            label: `图生图变体生成中${expiredSuffix}`,
+            status: 'failed',
+            progress: 62,
+            stage: 'failed',
+            nodeIds: ['loading-task'],
+          },
+        ],
+        selectedNodeId: undefined,
+        selectedNodeIds: [],
+      },
+      'asset-handoff': {
+        title: '资产入库流程',
+        nodes: [],
+        edges: [],
+        tasks: [
+          {
+            id: 'task-asset',
+            label: `3 张候选已收束，1 张待入库${expiredSuffix}`,
+            status: 'failed',
+            progress: 38,
+            stage: 'failed',
+            nodeIds: ['asset-final-a'],
+          },
+        ],
+        selectedNodeId: undefined,
+        selectedNodeIds: [],
+      },
+    }
+
+    const result = migratePersistedState(
+      { sceneId: 'task-states', canvases: pollutedCanvases } as never,
+      8,
+    )
+
+    const restoredRunning = result.canvases['task-states'].tasks.find((t) => t.id === 'task-running')!
+    expect(restoredRunning.status).toBe('running')
+    expect(restoredRunning.label).toBe('图生图变体生成中')
+    expect(restoredRunning.progress).toBe(62)
+    expect(restoredRunning.stage).toBeUndefined()
+    expect(restoredRunning.preset).toBe(true)
+
+    const restoredAsset = result.canvases['asset-handoff'].tasks.find((t) => t.id === 'task-asset')!
+    expect(restoredAsset.status).toBe('queued')
+    expect(restoredAsset.label).toBe('3 张候选已收束，1 张待入库')
+    expect(restoredAsset.progress).toBe(38)
+    expect(restoredAsset.stage).toBeUndefined()
+    expect(restoredAsset.preset).toBe(true)
+  })
+
+  it('does NOT touch non-preset user tasks during v8 → v9 restoration', () => {
+    const userTask = {
+      id: 'task-custom',
+      label: '用户自定义任务',
+      status: 'failed' as const,
+      progress: 50,
+      stage: 'failed',
+      nodeIds: ['img-1'],
+    }
+
+    const result = migratePersistedState(
+      {
+        sceneId: 'character-flow',
+        canvases: {
+          'character-flow': {
+            title: '角色流程',
+            nodes: [],
+            edges: [],
+            tasks: [userTask],
+            selectedNodeId: undefined,
+            selectedNodeIds: [],
+          },
+        },
+      } as never,
+      8,
+    )
+
+    const task = result.canvases['character-flow'].tasks[0]
+    expect(task.id).toBe('task-custom')
+    expect(task.status).toBe('failed') // unchanged — restoration only targets task-running/task-asset
+    expect(task.label).toBe('用户自定义任务')
+    expect(task.preset).toBeUndefined()
+  })
+
+  it('does not restore at version 9 (preset tasks pass through as-is)', () => {
+    // At version 9 the v<9 branch is a no-op; preset tasks already carry
+    // preset:true in persisted state and the settle pass skips them.
+    const result = migratePersistedState(
+      {
+        sceneId: 'task-states',
+        canvases: {
+          'task-states': {
+            title: '任务状态',
+            nodes: [],
+            edges: [],
+            tasks: [
+              {
+                id: 'task-running',
+                label: '图生图变体生成中',
+                status: 'running',
+                progress: 62,
+                nodeIds: ['loading-task'],
+                preset: true,
+              },
+            ],
+            selectedNodeId: undefined,
+            selectedNodeIds: [],
+          },
+        },
+      } as never,
+      9,
+    )
+
+    const task = result.canvases['task-states'].tasks[0]
+    expect(task.status).toBe('running')
+    expect(task.preset).toBe(true)
+  })
+})

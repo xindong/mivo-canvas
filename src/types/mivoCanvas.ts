@@ -387,6 +387,12 @@ export type CanvasTask = {
   // (variations, annotation) don't track stage. Not asserted by A1 contracts.
   stage?: string
   nodeIds: string[]
+  // Demo seed tasks (task-running, task-asset) carry preset:true so the
+  // hydration settle pass (canvasGenerationHydration.ts) skips them instead of
+  // misjudging them as expired generations on boot. Real/user tasks never set
+  // this — only the two fixed demo ids in demoScenes.ts. Persisted as-is (rides
+  // along in compactDocumentForPersist via cloneTask) so it survives rehydrate.
+  preset?: true
 }
 
 export type MivoCanvasSnapshot = {

@@ -126,7 +126,6 @@ const errorInfoForChat = (err: unknown, signal?: AbortSignal): { message: string
       kind: err.kind,
     }
   }
-  if (err instanceof Error && err.message.includes('已取消')) return { message: canceledGenerationMessage, kind: 'canceled' }
   return { message: err instanceof Error ? err.message : 'Generation failed', kind: 'unknown' }
 }
 

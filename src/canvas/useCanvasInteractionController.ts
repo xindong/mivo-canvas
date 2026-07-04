@@ -29,8 +29,7 @@ type UseCanvasInteractionControllerOptions = {
 
 // Thin assembly shell over the extracted interaction hooks (F7 split). Hook
 // returns are destructured to bare stable callbacks so React.memo on
-// CanvasNodeView actually skips unchanged nodes (object deps would recreate
-// the callbacks every render and defeat the memo).
+// CanvasNodeView skips unchanged nodes (object deps would recreate callbacks).
 export function useCanvasInteractionController({
   shellRef, sceneId, nodes, selectedNodeIds, maskEditNodeId, onCancelMaskEdit, onCloseContextMenu,
 }: UseCanvasInteractionControllerOptions) {
@@ -119,9 +118,9 @@ export function useCanvasInteractionController({
   })
 
   const {
-    beginNodeMove, startNodeResize, tryMoveNodeTransform, tryEndNodeTransform, resetNodeTransform,
+    beginNodeMove, beginNodeMoveFromShell, startNodeResize, tryMoveNodeTransform, tryEndNodeTransform, resetNodeTransform,
   } = useNodeTransform({
-    viewportRef, startInteraction, clearSelection, selectNode, selectNodes, captureHistory,
+    viewportRef, shellRef, startInteraction, clearSelection, selectNode, selectNodes, captureHistory,
     updateSelectedNodesPosition, updateNodeGeometry, setSnapGuides, setActiveSectionDropTargetId,
     setActiveConnectorDropTargetId, editTextNode, nodes, selectedNodeIds,
   })
@@ -156,25 +155,26 @@ export function useCanvasInteractionController({
   const beginPan = useCallback((event: ReactPointerEvent<HTMLElement>, options?: { clearSelection?: boolean }) => {
     if (event.button !== 0 && event.button !== 1) return
     event.preventDefault()
-    event.currentTarget.setPointerCapture(event.pointerId)
+    ;(shellRef.current ?? event.currentTarget).setPointerCapture(event.pointerId)
     startInteraction()
     clearSelection()
     startPan(event)
     if (options?.clearSelection) selectNode(undefined)
-  }, [clearSelection, selectNode, startInteraction, startPan])
+  }, [clearSelection, selectNode, startInteraction, startPan, shellRef])
 
   const toolHandlerContext = useMemo<CanvasToolHandlerContext>(() => ({
     beginPan,
     beginSelection,
     beginZoomGesture,
     beginNodeMove,
+    beginNodeMoveFromShell,
     beginNodeResize: startNodeResize,
     beginTextBox,
     beginFrameBox,
     beginMarkupBox,
     beginStampPlacement,
     beginTextEdit,
-  }), [beginFrameBox, beginMarkupBox, beginNodeMove, beginPan, beginSelection, beginStampPlacement, beginTextBox, beginTextEdit, beginZoomGesture, startNodeResize])
+  }), [beginFrameBox, beginMarkupBox, beginNodeMove, beginNodeMoveFromShell, beginPan, beginSelection, beginStampPlacement, beginTextBox, beginTextEdit, beginZoomGesture, startNodeResize])
 
   const beginNodePointerDown = useCallback(
     (nodeId: string, event: ReactPointerEvent<HTMLDivElement>) => {

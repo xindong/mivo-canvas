@@ -13,9 +13,14 @@
 // FIRST-CLASS interaction state — clicking an anchor mark selects the anchor,
 // not the underlying node. Hence the two-pass order.
 //
-// Coordinate convention: all points are in CANVAS space (screenToCanvas applied
-// by the caller before calling these). markupPoints are assumed canvas coords
-// (consistent with brushGeometry recording); P3-0b will validate during wiring.
+// Coordinate convention: all points passed to these functions are in CANVAS
+// space (screenToCanvas applied by the caller before calling). node.geometry
+// is canvas-space; markupPoints are NODE-LOCAL (relative to geometry.x/y,
+// matching the DOM SVG which renders inside the node's positioned container).
+// markupPointsToCanvas applies the geometry offset before stroke hit-testing;
+// it does NOT rotate (markup line/arrow nodes are not independently rotated).
+// Phase 1b-2 (this file) keeps markupPoints local so persistence/useTextAnnotation/
+// CanvasNodeView SVG stay untouched; the hit layer converts internally.
 
 import type { RenderAnchor, RenderNode } from './projection'
 
@@ -91,6 +96,37 @@ export const distToPolyline = (p: CanvasPoint, points: CanvasPoint[]): number =>
 
 // --- node hit ----------------------------------------------------------------
 
+/**
+ * Convert node-local markupPoints to canvas coords by adding geometry offset.
+ * Phase 1b-2: markupPoints stay local in persistence/SVG; the hit layer
+ * converts internally so callers keep passing canvas-space points.
+ * Rotation is not applied (markup line/arrow nodes are not independently rotated).
+ */
+export const markupPointsToCanvas = (
+  node: RenderNode,
+  points: readonly CanvasPoint[],
+): CanvasPoint[] =>
+  points.map((p) => ({ x: node.geometry.x + p.x, y: node.geometry.y + p.y }))
+
+/**
+ * Default line/arrow endpoints when markupPoints is absent, matching the DOM
+ * .markup-hit-line fallback (x1=0, y1=height, x2=width, y2=0 — bottom-left to
+ * top-right). Returns node-local points; callers canvas-ize via markupPointsToCanvas.
+ */
+export const defaultLineMarkupPointsFor = (node: RenderNode): CanvasPoint[] => [
+  { x: 0, y: node.geometry.height },
+  { x: node.geometry.width, y: 0 },
+]
+
+/**
+ * Stroke hit tolerance for line/arrow, aligning with the DOM .markup-hit-line
+ * element whose strokeWidth is max(14, markupStrokeWidth + 10) with round caps
+ * (effective hit radius = strokeWidth / 2). `fallback` is the caller-supplied
+ * generic stroke tolerance; we take the max so thin lines stay grabbable.
+ */
+const lineHitTolerance = (fallback: number, strokeWidth: number): number =>
+  Math.max(fallback, Math.max(14, strokeWidth + 10) / 2)
+
 /** Bounds hit (rotated rect) for any node. */
 export const pointInNodeBounds = (node: RenderNode, point: CanvasPoint): boolean =>
   pointInRotatedRect(node.geometry, point)
@@ -101,7 +137,8 @@ export const pointInNodeBounds = (node: RenderNode, point: CanvasPoint): boolean
  * (not the interior — interior is covered by pointInNodeBounds). For ellipse /
  * note / stamp, returns false (bounds hit in pointInNode suffices).
  *
- * Assumes markupPoints are in canvas coords. P3-0b validates during wiring.
+ * Phase 1b-2: markupPoints are node-local; line/arrow/brush convert to canvas
+ * coords here. line/arrow tolerance aligns with DOM .markup-hit-line.
  */
 export const pointInMarkupStroke = (
   node: RenderNode,
@@ -114,13 +151,17 @@ export const pointInMarkupStroke = (
   switch (node.markupKind) {
     case 'line':
     case 'arrow': {
-      const pts = node.markupPoints
-      if (!pts || pts.length < 2) return false
-      return distToSegment(point, pts[0], pts[1]) <= tolerance
+      const local =
+        node.markupPoints && node.markupPoints.length >= 2
+          ? node.markupPoints
+          : defaultLineMarkupPointsFor(node)
+      const pts = markupPointsToCanvas(node, local)
+      const tol = lineHitTolerance(tolerance, node.markupStrokeWidth ?? 0)
+      return distToSegment(point, pts[0], pts[1]) <= tol
     }
     case 'brush': {
-      const pts = node.markupPoints
-      if (!pts || pts.length < 2) return false
+      if (!node.markupPoints || node.markupPoints.length < 2) return false
+      const pts = markupPointsToCanvas(node, node.markupPoints)
       return distToPolyline(point, pts) <= tolerance
     }
     case 'rect': {
@@ -145,9 +186,19 @@ export const pointInMarkupStroke = (
   }
 }
 
-/** True if the point hits the node (bounds OR stroke). */
-export const pointInNode = (node: RenderNode, point: CanvasPoint, tolerance: number): boolean =>
-  pointInNodeBounds(node, point) || pointInMarkupStroke(node, point, tolerance)
+/**
+ * True if the point hits the node. line/arrow are STROKE-ONLY (a click inside
+ * the line's bounding rect but off the stroke falls through to nodes below —
+ * matches FigJam line semantics). rect/ellipse/note/stamp hit by bounds (rect
+ * border also stroke-toleranced); brush hits by bounds OR stroke (filled path
+ * covers the bbox interior; stroke covers the polyline sweep).
+ */
+export const pointInNode = (node: RenderNode, point: CanvasPoint, tolerance: number): boolean => {
+  if (node.markupKind === 'line' || node.markupKind === 'arrow') {
+    return pointInMarkupStroke(node, point, tolerance)
+  }
+  return pointInNodeBounds(node, point) || pointInMarkupStroke(node, point, tolerance)
+}
 
 // --- anchor hit --------------------------------------------------------------
 

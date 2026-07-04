@@ -1,9 +1,11 @@
-# src/render — 渲染投影与交互契约(P3-0a + P3-0b partial)
+# src/render — 渲染投影与交互契约(目标契约,尚未全量接线;P3-0b partial 已落,全量 dispatch 挂 P3-0c gate)
 
-> SC6.1 主体。本目录是 renderer 与数据模型之间的**契约层**:
+> SC6.1 主体。本目录是 renderer 与数据模型之间的**目标契约层**(契约类型已冻结,全量 dispatch 接线尚未落地):
 > renderer 只许消费 `RenderNode`/`RenderEdge`/`RenderAnchor` + 叶视觉类型
 > (`CanvasNodeFill` 等),**不得直接依赖 `MivoCanvasNode`**。
 > Anchor(P4-a CanvasAnchor)演进时只改 `projection.ts` 的投影函数,不动 renderer。
+>
+> **当前接线状态**:projection 类型/函数已就位但**生产渲染零消费**(renderer 仍走 `canvasRenderAdapter` 直读 `MivoCanvasNode`)。全量 dispatch 接线挂 **P3-0c gate**(详见下文),gate 触发前不算生效。
 
 ## P3-0b 状态(本 PR):partial — 全量 dispatch 接线 deferred
 

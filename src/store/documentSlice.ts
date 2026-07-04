@@ -215,13 +215,8 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
     if (!prompt) throw new Error('Prompt is required')
     if (!payload.resultImages.length) throw new Error('No generated images returned')
     const targetSceneId = payload.sceneId || get().sceneId
-    const payloadExtras = payload as {
-      replaceSlotId?: string
-      lineageSourceId?: string
-      reflow?: boolean
-    }
-    const replaceSlotId = payloadExtras.replaceSlotId
-    const lineageSourceId = payloadExtras.lineageSourceId || payload.sourceNodeId
+    const replaceSlotId = payload.replaceSlotId
+    const lineageSourceId = payload.lineageSourceId || payload.sourceNodeId
 
     const initialState = get()
     const initialDocument = initialState.canvases[targetSceneId]
@@ -362,7 +357,7 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
           newNodes.push(resultNode)
           nextNodes = [...nextNodes, resultNode]
         }
-        if (payloadExtras.reflow) {
+        if (payload.reflow) {
           nextNodes = reflowRightObstacles(nextNodes, resultNode, AI_SLOT_GAP)
         }
 
