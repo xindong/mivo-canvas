@@ -50,6 +50,7 @@ import { createNodeMutationSlice } from './nodeMutationSlice'
 import { createNodeCreationSlice } from './nodeCreationSlice'
 import { createGenerationSlice } from './generationSlice'
 import { createSelectionSlice } from './selectionSlice'
+import { mergeCanvasPersistedState } from './canvasGenerationHydration'
 
 type LayerMove = 'forward' | 'backward' | 'front' | 'back'
 export type SelectionAlignment = 'left' | 'center' | 'right' | 'top' | 'middle' | 'bottom'
@@ -278,9 +279,6 @@ type PersistedCanvasState = Partial<
 >
 
 export { scenes }
-
-
-
 export const blobFromCommittedGenerationImage = (image: CommittedGenerationImage) => {
   if (image.blob) return image.blob
 
@@ -406,6 +404,8 @@ export const useCanvasStore = create<CanvasState>()(
       name: 'mivo-canvas-demo',
       version: 8,
       migrate: migratePersistedState,
+      merge: (persistedState, currentState) =>
+        mergeCanvasPersistedState(persistedState, currentState, migratePersistedState, warnCanvas),
       partialize: (state) => ({
         canvases: compactCanvasesForPersist(state.canvases),
         sceneId: state.sceneId,

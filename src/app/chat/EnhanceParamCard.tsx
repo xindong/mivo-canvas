@@ -6,9 +6,10 @@ import { qualityDisplayLabel } from './chatDisplayLabels'
 
 type EnhanceParamCardProps = {
   message: ChatMessage
+  sceneId: string
 }
 
-export function EnhanceParamCard({ message }: EnhanceParamCardProps) {
+export function EnhanceParamCard({ message, sceneId }: EnhanceParamCardProps) {
   const [reasoningOpen, setReasoningOpen] = useState(false)
   const [promptOpen, setPromptOpen] = useState(false)
   const cancelGeneration = useChatStore((s) => s.cancelGeneration)
@@ -40,7 +41,7 @@ export function EnhanceParamCard({ message }: EnhanceParamCardProps) {
           <button
             type="button"
             className="chat-cancel-btn"
-            onClick={cancelGeneration}
+            onClick={() => cancelGeneration({ sceneId, messageId: message.id })}
             title="取消本次生成"
           >
             取消
