@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import type { ExperimentalAnchor, MivoCanvasNode } from '../types/mivoCanvas'
+import type { CanvasNodeSolidFill, ExperimentalAnchor, MivoCanvasNode } from '../types/mivoCanvas'
 import { normalizeCanvasNodeV2 } from '../model/documentModelV2'
-import { nodeRenderBoxFor } from '../canvas/canvasRenderAdapter'
+import {
+  frameRenderStyleFor,
+  markupRenderStyleFor,
+  nodeRenderBoxFor,
+} from '../canvas/canvasRenderAdapter'
 import {
   projectAnchor,
   projectEdge,
@@ -202,6 +206,217 @@ describe('projectNode — cross-check with canvasRenderAdapter (geometry consist
     expect(r.geometry.height).toBe(box.height)
     // nodeRenderBoxFor formats transform as 'translate(Xpx, Ypx) rotate(Rdeg)'
     expect(box.transform).toBe(`translate(${r.geometry.x}px, ${r.geometry.y}px) rotate(${r.geometry.rotation}deg)`)
+  })
+})
+
+// --- Phase 1a: visual defaults sunk from canvasRenderAdapter -------------------
+//
+// Locks projection's synthetic fills/strokes to be field-by-field equivalent to the
+// CSS fallback in canvasRenderAdapter.frameRenderStyleFor / markupRenderStyleFor.
+// The renderer (DOM today, Leafer tomorrow) can read projectNode output directly
+// without re-implementing the fallback chain. If the two implementations drift, the
+// assertions below fail — the DOM adapter is NOT modified by Phase 1a, so this test
+// is the contract that locks them.
+
+const frameNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
+  id: 'frame-1',
+  type: 'frame',
+  title: 'Frame',
+  status: 'ready',
+  x: 0, y: 0, width: 400, height: 300,
+  ...overrides,
+})
+
+const markupNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
+  id: 'markup-1',
+  type: 'markup',
+  title: 'Markup',
+  status: 'ready',
+  x: 0, y: 0, width: 100, height: 100,
+  markupKind: 'rect',
+  ...overrides,
+})
+
+describe('projectNode — frame visual defaults match canvasRenderAdapter', () => {
+  it('frame with no fills/strokes gets synthetic defaults equivalent to frameRenderStyleFor', () => {
+    const node = frameNode()
+    const r = projectNode(node)
+    const adapter = frameRenderStyleFor(node)
+
+    // fill: sectionFillColor || '#ffffff'
+    expect(r.fills).toHaveLength(1)
+    const fill = r.fills[0] as CanvasNodeSolidFill
+    expect(fill.kind).toBe('solid')
+    expect(fill.visible).toBe(true)
+    expect(fill.color).toBe(adapter['--section-fill-color'])
+    expect(fill.color).toBe('#ffffff')
+
+    // stroke: sectionBorderColor || frameColor || '#ff8a00', width 2, style dashed
+    expect(r.strokes).toHaveLength(1)
+    const stroke = r.strokes[0]
+    expect(stroke.visible).toBe(true)
+    expect(stroke.color).toBe(adapter['--section-border-color'])
+    expect(stroke.color).toBe('#ff8a00')
+    expect(stroke.width).toBe(Number(adapter['--section-border-width'].replace('px', '')))
+    expect(stroke.width).toBe(2)
+    expect(stroke.style).toBe(adapter['--section-border-style'])
+    expect(stroke.style).toBe('dashed')
+  })
+
+  it('frame honors the section* fallback chain (field-by-field vs adapter)', () => {
+    const node = frameNode({
+      fills: [],
+      strokes: [],
+      sectionFillColor: '#f0f0f0',
+      sectionBorderColor: '#123456',
+      sectionBorderWidth: 5,
+      sectionBorderStyle: 'solid',
+    })
+    const r = projectNode(node)
+    const adapter = frameRenderStyleFor(node)
+
+    expect((r.fills[0] as CanvasNodeSolidFill).color).toBe('#f0f0f0')
+    expect((r.fills[0] as CanvasNodeSolidFill).color).toBe(adapter['--section-fill-color'])
+    expect(r.strokes[0].color).toBe('#123456')
+    expect(r.strokes[0].color).toBe(adapter['--section-border-color'])
+    expect(r.strokes[0].width).toBe(5)
+    expect(r.strokes[0].width).toBe(Number(adapter['--section-border-width'].replace('px', '')))
+    expect(r.strokes[0].style).toBe('solid')
+    expect(r.strokes[0].style).toBe(adapter['--section-border-style'])
+  })
+
+  it('frame falls back to frameColor when sectionBorderColor is absent (matches adapter)', () => {
+    const node = frameNode({
+      fills: [], strokes: [],
+      frameColor: '#ffaa00',
+    })
+    const r = projectNode(node)
+    const adapter = frameRenderStyleFor(node)
+    expect(r.strokes[0].color).toBe('#ffaa00')
+    expect(r.strokes[0].color).toBe(adapter['--section-border-color'])
+  })
+
+  it('frame with explicit visible solid fill/stroke is NOT overridden', () => {
+    const node = frameNode({
+      fills: [{ id: 'real-fill', kind: 'solid', color: '#aabbcc', opacity: 1, visible: true }],
+      strokes: [{ id: 'real-stroke', color: '#ddeeff', width: 7, style: 'solid', opacity: 1, visible: true }],
+    })
+    const r = projectNode(node)
+    const adapter = frameRenderStyleFor(node)
+
+    expect(r.fills).toHaveLength(1)
+    expect((r.fills[0] as CanvasNodeSolidFill).color).toBe('#aabbcc')
+    expect(adapter['--section-fill-color']).toBe('#aabbcc')
+    expect(r.strokes).toHaveLength(1)
+    expect(r.strokes[0].color).toBe('#ddeeff')
+    expect(r.strokes[0].width).toBe(7)
+    expect(adapter['--section-border-color']).toBe('#ddeeff')
+  })
+
+  it('frame with only an invisible solid fill still gets the synthetic default (matches adapter firstSolidFillFor)', () => {
+    const node = frameNode({
+      fills: [{ id: 'hidden', kind: 'solid', color: '#aabbcc', opacity: 1, visible: false }],
+    })
+    const r = projectNode(node)
+    const adapter = frameRenderStyleFor(node)
+    // adapter's firstSolidFillFor skips invisible solids → falls back to '#ffffff'
+    expect(adapter['--section-fill-color']).toBe('#ffffff')
+    expect(r.fills).toHaveLength(2)
+    const synthetic = r.fills[1] as CanvasNodeSolidFill
+    expect(synthetic.color).toBe('#ffffff')
+    expect(synthetic.visible).toBe(true)
+  })
+})
+
+describe('projectNode — markup visual defaults match canvasRenderAdapter', () => {
+  it('markup with no fills/strokes gets synthetic defaults equivalent to markupRenderStyleFor', () => {
+    const node = markupNode()
+    const r = projectNode(node)
+    const adapter = markupRenderStyleFor(node)
+
+    // fill: markupFillColor || 'rgba(105, 87, 232, 0.08)'
+    expect(r.fills).toHaveLength(1)
+    const fill = r.fills[0] as CanvasNodeSolidFill
+    expect(fill.kind).toBe('solid')
+    expect(fill.visible).toBe(true)
+    expect(fill.color).toBe(adapter.fill)
+    expect(fill.color).toBe('rgba(105, 87, 232, 0.08)')
+
+    // stroke: markupStrokeColor || '#6957e8', width 3, style solid, opacity markupOpacity??1
+    expect(r.strokes).toHaveLength(1)
+    const stroke = r.strokes[0]
+    expect(stroke.visible).toBe(true)
+    expect(stroke.color).toBe(adapter.stroke)
+    expect(stroke.color).toBe('#6957e8')
+    expect(stroke.width).toBe(adapter.strokeWidth)
+    expect(stroke.width).toBe(3)
+    expect(stroke.style).toBe(adapter.strokeStyle)
+    expect(stroke.style).toBe('solid')
+    expect(stroke.opacity).toBe(adapter.strokeOpacity)
+    expect(stroke.opacity).toBe(1)
+  })
+
+  it('markup honors the markup* fallback chain incl. markupOpacity on stroke (field-by-field vs adapter)', () => {
+    const node = markupNode({
+      fills: [], strokes: [],
+      markupFillColor: '#aaaaaa',
+      markupStrokeColor: '#bbbbbb',
+      markupStrokeWidth: 9,
+      markupStrokeStyle: 'dashed',
+      markupOpacity: 0.5,
+    })
+    const r = projectNode(node)
+    const adapter = markupRenderStyleFor(node)
+
+    expect((r.fills[0] as CanvasNodeSolidFill).color).toBe('#aaaaaa')
+    expect((r.fills[0] as CanvasNodeSolidFill).color).toBe(adapter.fill)
+    expect(r.strokes[0].color).toBe('#bbbbbb')
+    expect(r.strokes[0].color).toBe(adapter.stroke)
+    expect(r.strokes[0].width).toBe(9)
+    expect(r.strokes[0].width).toBe(adapter.strokeWidth)
+    expect(r.strokes[0].style).toBe('dashed')
+    expect(r.strokes[0].style).toBe(adapter.strokeStyle)
+    expect(r.strokes[0].opacity).toBe(0.5)
+    expect(r.strokes[0].opacity).toBe(adapter.strokeOpacity)
+  })
+
+  it('markup with explicit visible solid fill/stroke is NOT overridden', () => {
+    const node = markupNode({
+      fills: [{ id: 'real', kind: 'solid', color: '#aabbcc', opacity: 1, visible: true }],
+      strokes: [{ id: 'rs', color: '#ddeeff', width: 4, style: 'dashed', opacity: 1, visible: true }],
+    })
+    const r = projectNode(node)
+    const adapter = markupRenderStyleFor(node)
+
+    expect(r.fills).toHaveLength(1)
+    expect((r.fills[0] as CanvasNodeSolidFill).color).toBe('#aabbcc')
+    expect(adapter.fill).toBe('#aabbcc')
+    expect(r.strokes).toHaveLength(1)
+    expect(r.strokes[0].color).toBe('#ddeeff')
+    expect(adapter.stroke).toBe('#ddeeff')
+  })
+})
+
+describe('projectNode — non-frame/non-markup nodes get NO synthetic defaults', () => {
+  it('image node with no fills/strokes stays empty (no product-default pollution)', () => {
+    const node: MivoCanvasNode = {
+      id: 'img-1', type: 'image', title: 'I', status: 'ready',
+      x: 0, y: 0, width: 10, height: 10,
+    }
+    const r = projectNode(node)
+    expect(r.fills).toHaveLength(0)
+    expect(r.strokes).toHaveLength(0)
+  })
+
+  it('text node with no fills/strokes stays empty', () => {
+    const node: MivoCanvasNode = {
+      id: 'text-1', type: 'text', title: 'T', status: 'ready',
+      x: 0, y: 0, width: 10, height: 10,
+      text: 'hi',
+    }
+    const r = projectNode(node)
+    expect(r.fills).toHaveLength(0)
+    expect(r.strokes).toHaveLength(0)
   })
 })
 

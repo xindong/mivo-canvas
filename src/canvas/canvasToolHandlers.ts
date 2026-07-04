@@ -7,10 +7,15 @@ type CanvasNodePointerEvent = ReactPointerEvent<HTMLDivElement>
 type ResizeHandlePointerEvent = ReactPointerEvent<HTMLButtonElement>
 
 export type CanvasToolHandlerContext = {
-  beginPan: (event: CanvasSurfacePointerEvent) => void
+  beginPan: (event: CanvasSurfacePointerEvent, options?: { clearSelection?: boolean }) => void
   beginSelection: (event: CanvasSurfacePointerEvent) => void
   beginZoomGesture: (event: CanvasSurfacePointerEvent | CanvasNodePointerEvent | ResizeHandlePointerEvent) => void
   beginNodeMove: (nodeId: string, event: CanvasNodePointerEvent) => void
+  beginNodeMoveFromShell: (
+    nodeId: string,
+    event: CanvasSurfacePointerEvent,
+    captureTarget?: HTMLElement | null,
+  ) => void
   beginNodeResize: (nodeId: string, corner: ResizeCorner, event: ResizeHandlePointerEvent) => void
   beginTextBox: (event: CanvasSurfacePointerEvent) => void
   beginFrameBox: (event: CanvasSurfacePointerEvent) => void

@@ -19,6 +19,7 @@ import type {
   CanvasMaskBounds,
   CanvasNodeEffect,
   CanvasNodeFill,
+  CanvasNodeSolidFill,
   CanvasNodeStroke,
   CanvasNodeType,
   CanvasStampKind,
@@ -194,6 +195,87 @@ const cloneFill = (fill: CanvasNodeFill): CanvasNodeFill => ({ ...fill })
 const cloneStroke = (stroke: CanvasNodeStroke): CanvasNodeStroke => ({ ...stroke })
 const cloneEffect = (effect: CanvasNodeEffect): CanvasNodeEffect => ({ ...effect })
 
+// --- visual default sinking (Phase 1a) ---------------------------------------
+
+// These product defaults previously lived in canvasRenderAdapter.ts:58-81
+// (frameRenderStyleFor / markupRenderStyleFor) as CSS fallbacks. projection now
+// materializes them as synthetic solid fills/strokes so any renderer (DOM today,
+// Leafer tomorrow) reads complete visuals from RenderNode directly, without
+// re-implementing the fallback chain.
+//
+// Red line (review P2-1): documentModelV2 is NOT touched. Model normalization only
+// derives fills/strokes from legacy section*/markup* fields — it never invents the
+// product colors. projection adds them here, on the render-only side of the boundary,
+// so persistence stays free of product-default visual pollution.
+
+const isVisibleSolidFill = (fill: CanvasNodeFill): fill is CanvasNodeSolidFill =>
+  fill.kind === 'solid' && fill.visible
+const isVisibleStroke = (stroke: CanvasNodeStroke) => stroke.visible
+
+const FRAME_FILL_DEFAULT = '#ffffff'
+const FRAME_STROKE_COLOR_DEFAULT = '#ff8a00'
+const FRAME_STROKE_WIDTH_DEFAULT = 2
+const FRAME_STROKE_STYLE_DEFAULT: MarkupStrokeStyle = 'dashed'
+const MARKUP_FILL_DEFAULT = 'rgba(105, 87, 232, 0.08)'
+const MARKUP_STROKE_COLOR_DEFAULT = '#6957e8'
+const MARKUP_STROKE_WIDTH_DEFAULT = 3
+const MARKUP_STROKE_STYLE_DEFAULT: MarkupStrokeStyle = 'solid'
+
+/**
+ * Append render-only synthetic solid fills/strokes when a frame/markup node has no
+ * visible solid fill / visible stroke. Field-by-field equivalent to the CSS fallback
+ * in canvasRenderAdapter.frameRenderStyleFor / markupRenderStyleFor — locked by
+ * `projection.test.ts` "visual defaults match canvasRenderAdapter".
+ *
+ * Only frame/markup nodes get product defaults — image/text/other types are untouched
+ * (the adapter only applies these fallbacks for frame/markup rendering).
+ */
+const sinkVisualDefaults = (r: RenderNode, n: MivoCanvasNode): void => {
+  if (n.type === 'frame') {
+    if (!r.fills.some(isVisibleSolidFill)) {
+      r.fills = [...r.fills, {
+        id: `${n.id}-frame-fill-default`,
+        kind: 'solid',
+        color: n.sectionFillColor || FRAME_FILL_DEFAULT,
+        opacity: 1,
+        visible: true,
+      }]
+    }
+    if (!r.strokes.some(isVisibleStroke)) {
+      r.strokes = [...r.strokes, {
+        id: `${n.id}-frame-stroke-default`,
+        color: n.sectionBorderColor || n.frameColor || FRAME_STROKE_COLOR_DEFAULT,
+        width: n.sectionBorderWidth ?? FRAME_STROKE_WIDTH_DEFAULT,
+        style: n.sectionBorderStyle || FRAME_STROKE_STYLE_DEFAULT,
+        opacity: 1,
+        visible: true,
+      }]
+    }
+    return
+  }
+  if (n.type === 'markup') {
+    if (!r.fills.some(isVisibleSolidFill)) {
+      r.fills = [...r.fills, {
+        id: `${n.id}-markup-fill-default`,
+        kind: 'solid',
+        color: n.markupFillColor || MARKUP_FILL_DEFAULT,
+        opacity: 1,
+        visible: true,
+      }]
+    }
+    if (!r.strokes.some(isVisibleStroke)) {
+      r.strokes = [...r.strokes, {
+        id: `${n.id}-markup-stroke-default`,
+        color: n.markupStrokeColor || MARKUP_STROKE_COLOR_DEFAULT,
+        width: n.markupStrokeWidth ?? MARKUP_STROKE_WIDTH_DEFAULT,
+        style: n.markupStrokeStyle || MARKUP_STROKE_STYLE_DEFAULT,
+        opacity: n.markupOpacity ?? 1,
+        visible: true,
+      }]
+    }
+  }
+}
+
 /**
  * Project a (possibly legacy) MivoCanvasNode → RenderNode. Runs
  * normalizeCanvasNodeV2 so legacy + V2 inputs both yield the same V2-shaped
@@ -223,6 +305,10 @@ export const projectNode = (node: MivoCanvasNode, ctx?: ProjectionContext): Rend
     fills: n.fills ? n.fills.map(cloneFill) : [],
     strokes: n.strokes ? n.strokes.map(cloneStroke) : [],
   }
+
+  // Phase 1a: sink render-only visual defaults (frame/markup product colors) so the
+  // renderer reads complete visuals from RenderNode. See sinkVisualDefaults.
+  sinkVisualDefaults(r, n)
 
   if (n.effects) r.effects = n.effects.map(cloneEffect)
 

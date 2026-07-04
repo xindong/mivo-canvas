@@ -17,6 +17,7 @@ import { renderKindForNode } from './nodeTypes/canvasNodeRegistry'
 import { stampSrcFor } from './stampDefs'
 import { defaultTextAlign, defaultTextColor, defaultTextFontSize, defaultTextWeight } from './textGeometry'
 import type { TextResizeEdge } from './useCanvasInteractionController'
+import type { MaskInitialClientPoint } from './maskPointPending'
 
 type CanvasNodeViewProps = {
   node: MivoCanvasNode
@@ -32,6 +33,7 @@ type CanvasNodeViewProps = {
   selectionStrokeWidth: number
   maskEditActive: boolean
   maskEditSubmitting: boolean
+  initialMaskClientPoint?: MaskInitialClientPoint
   viewportScale: number
   onSelect: (nodeId: string, options?: { additive?: boolean }) => void
   onPointerDown: (nodeId: string, event: React.PointerEvent<HTMLDivElement>) => void
@@ -59,6 +61,11 @@ type CanvasNodeViewProps = {
   onResizeNodeToContent: (nodeId: string, width: number, height: number) => void
   onSubmitMaskEdit: (nodeId: string, resolvedAssetUrl: string, payload: ImageMaskSubmitPayload) => Promise<void>
   onCancelMaskEdit: () => void
+  onInitialMaskClientPointHandled: (
+    nodeId: string,
+    outcome: 'consumed' | 'discarded',
+    reason?: string,
+  ) => void
 }
 
 function CanvasTextEditor({
@@ -487,6 +494,7 @@ export const CanvasNodeView = memo(function CanvasNodeView({
   selectionStrokeWidth,
   maskEditActive,
   maskEditSubmitting,
+  initialMaskClientPoint,
   viewportScale,
   onSelect,
   onPointerDown,
@@ -502,6 +510,7 @@ export const CanvasNodeView = memo(function CanvasNodeView({
   onResizeNodeToContent,
   onSubmitMaskEdit,
   onCancelMaskEdit,
+  onInitialMaskClientPointHandled,
 }: CanvasNodeViewProps) {
   const markdownDocumentRef = useRef<HTMLElement | null>(null)
   // Size is stored together with its source URL so a stale measurement simply stops
@@ -648,6 +657,7 @@ export const CanvasNodeView = memo(function CanvasNodeView({
       }}
       onDoubleClick={(event) => {
         event.stopPropagation()
+        if (maskEditActive) return
         onSelect(node.id)
         if (textNode || markupNode) {
           onEditText(node.id)
@@ -776,8 +786,10 @@ export const CanvasNodeView = memo(function CanvasNodeView({
               naturalSize={naturalSize}
               viewportScale={viewportScale}
               submitting={maskEditSubmitting}
+              initialClientPoint={initialMaskClientPoint}
               onCancel={onCancelMaskEdit}
               onSubmit={(payload) => onSubmitMaskEdit(node.id, resolvedAssetUrl, payload)}
+              onInitialClientPointHandled={onInitialMaskClientPointHandled}
             />
           ) : null}
         </div>
