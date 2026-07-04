@@ -236,7 +236,47 @@ export const useChatStore = create<ChatState>()(
         if (state.isBusy) return
 
         const { selectedModel, paramOverrides } = state
-        const referenceAssetUrls = await saveReferenceAssets(referenceFiles)
+        // S03b: 参考图保存失败不再静默丢消息——catch 内自包含地构造并落 user +
+        // assistant 两条消息（那时 userMessage 尚未构造，不能依赖函数后续逻辑），
+        // 避免用户输入凭空消失。isBusy 此刻未置 true，无残留。
+        let referenceAssetUrls: string[]
+        try {
+          referenceAssetUrls = await saveReferenceAssets(referenceFiles)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          debugLogger.error('Chat Store', `参考图保存失败，消息以失败态落档：${message}`)
+          const failedUserMessage: ChatMessage = {
+            id: createMessageId(),
+            role: 'user',
+            kind: 'text',
+            text,
+            createdAt: Date.now(),
+            status: 'done',
+            selectedNodeId,
+            selectedNodeType,
+          }
+          const failedAssistantMessage: ChatMessage = {
+            id: createMessageId(),
+            role: 'assistant',
+            kind: 'text',
+            text: `参考图保存失败：${message}`,
+            createdAt: Date.now(),
+            status: 'error',
+            error: `参考图保存失败：${message}`,
+            errorKind: 'unknown',
+          }
+          set((s) => ({
+            messagesByScene: {
+              ...s.messagesByScene,
+              [sceneId]: trimSceneMessages([
+                ...(s.messagesByScene[sceneId] || []),
+                failedUserMessage,
+                failedAssistantMessage,
+              ]),
+            },
+          }))
+          return
+        }
         if (get().isBusy) return
 
         const abortController = new AbortController()
