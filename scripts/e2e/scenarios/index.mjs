@@ -10,12 +10,14 @@ import { runMaskPointScenario } from './mask-point.mjs'
 import { runMigrationScenario } from './migration.mjs'
 import { runShellSidebarScenario } from './shell-sidebar.mjs'
 import { runVariationsAnnotationScenario } from './variations-annotation.mjs'
+import { runZoomToolScenario } from './zoom-tool.mjs'
 
 export const scenarioOrder = [
   'debug',
   'shell-sidebar',
   'archive-assets',
   'canvas-interactions',
+  'zoom-tool',
   'chat-generation',
   'mask',
   'migration',
@@ -46,4 +48,5 @@ export const scenarioRunners = {
   migration: runMigrationScenario,
   'shell-sidebar': runShellSidebarScenario,
   'variations-annotation': runVariationsAnnotationScenario,
+  'zoom-tool': runZoomToolScenario,
 }
