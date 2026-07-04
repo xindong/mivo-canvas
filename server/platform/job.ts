@@ -41,7 +41,7 @@ export type OnProgress = (report: ProgressReport) => void
 
 const platformRetryBackoffMs = 1_000
 const transientPlatformErrorPattern =
-  /ClosedChannelException|ECONNRESET|ECONNABORTED|EPIPE|ETIMEDOUT|connection reset|socket hang up|fetch failed|network error|terminated|UND_ERR/i
+  /ClosedChannelException|ECONNRESET|ECONNABORTED|EPIPE|ETIMEDOUT|connection reset|connection terminated|socket hang up|socket terminated|fetch failed|UND_ERR/i
 
 class PlatformHttpError extends Error {
   status: number
@@ -212,27 +212,34 @@ export const mivoPlatformDownloadImage = async (
   fileUrlPath: string,
   signal?: AbortSignal,
 ): Promise<Buffer> => {
-  const fileId = String(fileUrlPath).split('/').pop() || ''
-  if (!fileId) throw new Error('platform download: empty fileId')
-  const signRes = await mivoPlatformFetch(
-    `${ctx.platformEndpoint}/api/v1/file/signUrl/${fileId}`,
-    { headers: {} },
-    ctx,
-    signal,
-  )
-  if (!signRes.ok) throw await platformResponseError('signUrl', signRes)
-  let signedUrl = (await signRes.text()).trim()
-  if (signedUrl.startsWith('"') && signedUrl.endsWith('"')) signedUrl = signedUrl.slice(1, -1)
-  if (signedUrl.startsWith('{')) {
-    const j = JSON.parse(signedUrl) as { url?: string; signUrl?: string; data?: { url?: string } }
-    signedUrl = j.url || j.signUrl || j.data?.url || ''
+  try {
+    return await withPlatformTransientRetry('download', signal, async () => {
+      const fileId = String(fileUrlPath).split('/').pop() || ''
+      if (!fileId) throw new Error('platform download: empty fileId')
+      const signRes = await mivoPlatformFetch(
+        `${ctx.platformEndpoint}/api/v1/file/signUrl/${fileId}`,
+        { headers: {} },
+        ctx,
+        signal,
+      )
+      if (!signRes.ok) throw await platformResponseError('signUrl', signRes)
+      let signedUrl = (await signRes.text()).trim()
+      if (signedUrl.startsWith('"') && signedUrl.endsWith('"')) signedUrl = signedUrl.slice(1, -1)
+      if (signedUrl.startsWith('{')) {
+        const j = JSON.parse(signedUrl) as { url?: string; signUrl?: string; data?: { url?: string } }
+        signedUrl = j.url || j.signUrl || j.data?.url || ''
+      }
+      // signUrl may be protocol-relative (//host/...); prefix https:
+      if (signedUrl.startsWith('//')) signedUrl = `https:${signedUrl}`
+      if (!signedUrl.startsWith('http')) throw new Error('platform signUrl not a url')
+      const imgRes = await fetch(signedUrl, { signal })
+      if (!imgRes.ok) throw new PlatformHttpError('download', imgRes.status)
+      return Buffer.from(await imgRes.arrayBuffer())
+    })
+  } catch (error) {
+    if (isRetriablePlatformError(error)) throw new Error('platform download retry exhausted', { cause: error })
+    throw error
   }
-  // signUrl may be protocol-relative (//host/...); prefix https:
-  if (signedUrl.startsWith('//')) signedUrl = `https:${signedUrl}`
-  if (!signedUrl.startsWith('http')) throw new Error('platform signUrl not a url')
-  const imgRes = await fetch(signedUrl, { signal })
-  if (!imgRes.ok) throw new PlatformHttpError('download', imgRes.status)
-  return Buffer.from(await imgRes.arrayBuffer())
 }
 
 export const mivoPlatformUploadOne = async (
@@ -319,10 +326,7 @@ export const runMivoPlatformImageJob = async (
   onProgress?: OnProgress,
 ): Promise<PlatformJobResult> => {
   const resolution = String(params.payload.resolution || '1K')
-  let metadata: PlatformJobMetadata = {
-    resolution,
-    pollDeadlineMs: resolveMivoPlatformPollDeadlineMs(params.payload.resolution),
-  }
+  let metadata: PlatformJobMetadata = { resolution }
   return withPlatformTransientRetry('image-job', signal, async () => {
     try {
       metadata = {
