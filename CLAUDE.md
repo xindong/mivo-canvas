@@ -2,7 +2,7 @@
 
 > 创建日期：2026-07-01
 > 技术栈：node（TypeScript + Vite + React + LeaferJS + Zustand）
-> 来源：完整克隆自 github.com/kirozeng/MivoCanvas（保留全部 commit 历史，origin 指向 upstream）
+> 来源：完整克隆自 github.com/xindong/mivo-canvas（2026-07-04 迁移到组织仓，保留全部 commit 历史，origin 指向组织仓）
 
 ## 项目目标
 
@@ -65,12 +65,12 @@ Project MivoCanvas/
 
 ## 测试与守卫
 
-- **开发**：`npm run dev`（Vite dev server）
+- **开发**：双进程拓扑，先启动 `npm run start:server`（BFF），再启动 `npm run dev`（Vite dev server）
 - **构建**：`npm run build`（`tsc -b && vite build`，含类型检查）
 - **Lint**：`npm run lint`（eslint .）
 - **预览**：`npm run preview`
 - **日志规则守卫**：`npm run verify:logging`
-- **E2E**：`npm run test:e2e`（`node scripts/e2e-smoke.mjs`，Playwright）
+- **E2E**：`npm run test:e2e`（dev 双进程拓扑，Playwright）
 - **本地资源目录**：默认读 `~/Desktop/Images`，可用 `MIVO_ASSET_DIR=/path npm run dev` 覆盖
 - **Eagle 接入**：默认 `http://127.0.0.1:41595`，可用 `MIVO_EAGLE_API_URL` 覆盖
 
@@ -81,13 +81,13 @@ Project MivoCanvas/
 **核心约定**：
 - 提交触发：手动喊"提交代码"/"commit" → `commit-projects` skill
 - 分支策略：`main` 为主分支
-- Push 策略：日常本地优先；本项目与 kirozeng 协作共享 `origin`（kirozeng/MivoCanvas），可直接 push `main`；push 前先 `git fetch` 确认 fast-forward，不使用 `--force`。
+- Push 策略：`main` 有分支保护（PR + 6 项 CI 必绿 + 管理员不豁免）；一律从分支提 PR，禁止直接 push `main`。
 
 ---
 
 ## 项目特定记录
 
-- **来源**：2026-07-01 完整克隆自 github.com/kirozeng/MivoCanvas（5 commits，main 分支）。源仓无 license，仅供本地学习/二次开发，勿公开再发布。
+- **来源**：2026-07-01 完整克隆自原始仓；2026-07-04 迁移到组织仓 github.com/xindong/mivo-canvas（保留 main 分支与 commit 历史）。
 - **脚手架**：CLAUDE.md / VERSIONING.md / .gitignore（ECC 合并）/ history/ / pre-commit hook 由 `new-project` skill 于克隆后叠加，作为独立 commit 入库。
 
 （在此追加项目的具体决策、踩坑、TODO）
