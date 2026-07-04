@@ -2,7 +2,7 @@
 
 > 创建日期：2026-07-01
 > 技术栈：node（TypeScript + Vite + React + LeaferJS + Zustand）
-> 来源：完整克隆自 github.com/kirozeng/MivoCanvas（保留全部 commit 历史，origin 指向 upstream）
+> 仓库：github.com/xindong/mivo-canvas（2026-07-04 由 kirozeng/MivoCanvas Transfer 迁入公司组织，全部提交历史与 PR 保留，旧地址自动跳转）
 
 ## 项目目标
 
@@ -81,13 +81,13 @@ Project MivoCanvas/
 **核心约定**：
 - 提交触发：手动喊"提交代码"/"commit" → `commit-projects` skill
 - 分支策略：`main` 为主分支
-- Push 策略：日常本地优先；本项目与 kirozeng 协作共享 `origin`（kirozeng/MivoCanvas），可直接 push `main`；push 前先 `git fetch` 确认 fast-forward，不使用 `--force`。
+- Push 策略：`origin` 为公司组织仓库（xindong/mivo-canvas）。**组织规则强制 main 只能经 PR 合入**（含 CodeQL 扫描),不可直推、不使用 `--force`;日常改动走 feature 分支 + PR。访问需对 xindong 组织完成 SAML SSO 授权(token/SSH key 首次使用时授权一次)。
 
 ---
 
 ## 项目特定记录
 
-- **来源**：2026-07-01 完整克隆自 github.com/kirozeng/MivoCanvas（5 commits，main 分支）。源仓无 license，仅供本地学习/二次开发，勿公开再发布。
+- **来源**：2026-07-01 始于 github.com/kirozeng/MivoCanvas（个人仓）；2026-07-04 经 GitHub Transfer 迁入公司组织 xindong/mivo-canvas（历史与 PR #1–#61 完整保留）。私有仓库，未授权勿对外发布。
 - **脚手架**：CLAUDE.md / VERSIONING.md / .gitignore（ECC 合并）/ history/ / pre-commit hook 由 `new-project` skill 于克隆后叠加，作为独立 commit 入库。
 
 （在此追加项目的具体决策、踩坑、TODO）
