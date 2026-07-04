@@ -81,7 +81,9 @@ const isCanvasChromeTarget = (target: EventTarget | null) =>
 
 const canvasRenderOverscanPx = 520
 
-const rectsIntersect = (
+// C05: closed-interval (>=) intersection — culling over-renders to avoid border popping.
+// Disambiguates from canvasInteraction.rectsIntersect (open-interval, selection-semantics).
+const rectsIntersectInclusive = (
   a: { x: number; y: number; width: number; height: number },
   b: { x: number; y: number; width: number; height: number },
 ) => a.x + a.width >= b.x && b.x + b.width >= a.x && a.y + a.height >= b.y && b.y + b.height >= a.y
@@ -241,7 +243,7 @@ export function MivoCanvas({
     if (maskEditNodeId) pinnedNodeIds.add(maskEditNodeId)
     if (contextMenuNodeId) pinnedNodeIds.add(contextMenuNodeId)
 
-    return visibleNodes.filter((node) => pinnedNodeIds.has(node.id) || rectsIntersect(node, viewportRect))
+    return visibleNodes.filter((node) => pinnedNodeIds.has(node.id) || rectsIntersectInclusive(node, viewportRect))
   }, [
     contextMenuNodeId,
     cropNodeId,
