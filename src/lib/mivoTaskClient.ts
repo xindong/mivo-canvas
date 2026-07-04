@@ -27,7 +27,7 @@
 // then carries the kind chatStore expects.
 
 import type { MivoEditRequest, MivoGenerateRequest, VariationParam } from '../types/generation'
-import { MivoImageRequestError } from './mivoImageClient'
+import { MivoImageRequestError, formatMivoClientError } from './mivoImageClient'
 
 const defaultModel = 'gpt-image-2'
 const submitTimeoutMs = 30_000 // POST must return 202 quickly
@@ -108,12 +108,14 @@ const fetchWithTimeout = async (
 }
 
 const readSubmitError = async (response: Response): Promise<string> => {
+  let rawMessage = `${response.status} ${response.statusText}`
   try {
     const payload = (await response.json()) as { error?: string; message?: string }
-    return payload.error || payload.message || `${response.status} ${response.statusText}`
+    rawMessage = payload.error || payload.message || rawMessage
   } catch {
-    return `${response.status} ${response.statusText}`
+    // Keep the status text fallback.
   }
+  return formatMivoClientError(response.status, rawMessage, 'Mivo Task')
 }
 
 // POST /api/mivo/tasks/generate → 202 {taskId}. Body is the same JSON as /generate.
@@ -253,7 +255,17 @@ export const pollTask = async (taskId: string, signal?: AbortSignal): Promise<Ta
       response.status === 504 ? 'upstream-timeout' : 'upstream-error',
     )
   }
-  return (await response.json()) as TaskView
+  const view = (await response.json()) as TaskView
+  if (view.status === 'failed' && view.error) {
+    view.error = formatMivoClientError(undefined, view.error, 'Mivo Task')
+  }
+  if (view.status === 'partial' && view.failures?.length) {
+    view.failures = view.failures.map((failure) => ({
+      ...failure,
+      error: formatMivoClientError(undefined, failure.error, 'Mivo Task'),
+    }))
+  }
+  return view
 }
 
 // DELETE /api/mivo/tasks/:id → 200 {id,status:'canceled'} | 404 (already gone).

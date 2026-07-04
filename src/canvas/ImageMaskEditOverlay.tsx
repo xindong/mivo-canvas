@@ -9,13 +9,17 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from 'react'
 import { createPortal } from 'react-dom'
+import { debugLogger } from '../store/debugLogStore'
+import { toastFeedback } from '../store/toastStore'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 import {
   boundsForRegions,
   buildEditMaskBlob,
   displayRectForImage,
   imagePixelToNodePoint,
+  isPointOnlyMaskEdit,
   nodePointToImagePixel,
+  pointOnlyMaskEditMessage,
   validateMaskCanvasSize,
   type ImageMaskPoint,
   type ImageMaskRegion,
@@ -419,6 +423,12 @@ export function ImageMaskEditOverlay({
   const submit = async () => {
     const trimmedPrompt = prompt.trim()
     if (!trimmedPrompt || !hasAnyAnchor || submitting) return
+    if (isPointOnlyMaskEdit({ regionCount: regions.length, pointAnchorCount: pointAnchors.length })) {
+      setStatusError(pointOnlyMaskEditMessage)
+      debugLogger.warn('Mask Edit', 'Blocked local redraw submit: point anchors need a drawn mask region')
+      toastFeedback.warn(pointOnlyMaskEditMessage)
+      return
+    }
 
     try {
       setStatusError('')

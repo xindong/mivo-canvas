@@ -199,6 +199,20 @@ describe('platform channel — generate/edit job', () => {
     expect(mockState.editCalls).toBe(1)
     expect(mockState.uploadCalls).toBe(0)
   })
+
+  it('edit (mask present) overrides platform model to gpt-image-2 before llm-proxy dispatch', async () => {
+    const fd = new FormData()
+    fd.append('image', new Blob([Buffer.from('png')], { type: 'image/png' }), 'i.png')
+    fd.append('mask', new Blob([Buffer.from('mask')], { type: 'image/png' }), 'm.png')
+    fd.append('prompt', 'edit this')
+    fd.append('model', 'gemini-3-pro-image')
+    const r = await req('/api/mivo/edit', { method: 'POST', body: fd })
+    expect(r.status).toBe(200)
+    expect(mockState.editCalls).toBe(1)
+    expect(mockState.uploadCalls).toBe(0)
+    expect(mockState.lastEditBodyText).toMatch(/name="model"[\s\S]*gpt-image-2/)
+    expect(mockState.lastEditBodyText).not.toMatch(/name="model"[\s\S]*gemini-3-pro-image/)
+  })
 })
 
 describe('llm-proxy path — generate', () => {

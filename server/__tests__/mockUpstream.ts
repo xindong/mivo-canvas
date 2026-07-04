@@ -17,6 +17,7 @@ export type MockState = {
   generateCalls: number
   editCalls: number
   enhanceCalls: number
+  lastEditBodyText: string
   // configurable responses
   tokenStatus: number
   chatStatus: number
@@ -58,6 +59,7 @@ export const defaultMockState = (): MockState => ({
   generateCalls: 0,
   editCalls: 0,
   enhanceCalls: 0,
+  lastEditBodyText: '',
   tokenStatus: 200,
   chatStatus: 200,
   chat401Once: false,
@@ -211,7 +213,7 @@ async function handle(state: MockState, req: IncomingMessage, res: ServerRespons
   }
   if (path === '/v1/images/edits' && method === 'POST') {
     state.editCalls += 1
-    await readBody(req)
+    state.lastEditBodyText = (await readBody(req)).toString('utf8')
     if (state.editStatus !== 200) {
       send(res, state.editStatus, { error: { message: 'edit failed' } })
       return
