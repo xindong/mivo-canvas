@@ -1,7 +1,7 @@
 // server/routes/edit.ts
 // POST /api/mivo/edit (multipart) — ported from vite.config.ts proxyMivoEdit L929-L1031.
 // Dispatch invariant: no mask + platform model → platform (main image index 0, refs after);
-// mask present OR non-platform model → llm-proxy gpt-image-2. Mask unconditionally llm-proxy.
+// mask present → llm-proxy gpt-image-2; non-platform no-mask edits use their requested llm-proxy model.
 import type { Handler } from 'hono'
 import type { ContentfulStatusCode } from 'hono/utils/http-status'
 import type { HttpBindings } from '@hono/node-server'
@@ -16,6 +16,7 @@ import { normalizeMivoImages, normalizeMivoQuality, resolveRatioPayload } from '
 import {
   appendFile,
   firstMultipartField,
+  logMaskModelOverride,
   logRequest,
   multipartFiles,
   newRequestId,
@@ -71,13 +72,24 @@ export const editHandler: Handler<{ Bindings: HttpBindings }> = async (c) => {
     }
 
     const quality = normalizeMivoQuality(firstMultipartField(fields, 'quality'))
-    const model = firstMultipartField(fields, 'model').trim() || defaultMivoImageModel
+    const requestedModel = firstMultipartField(fields, 'model').trim() || defaultMivoImageModel
     const mask = multipartFiles(files, 'mask')[0]
+    const hasMaskBounds = Boolean(firstMultipartField(fields, 'maskBounds').trim())
+    const hasMaskInput = Boolean(mask || hasMaskBounds)
+    const model = hasMaskInput ? defaultMivoImageModel : requestedModel
+    if (hasMaskInput && requestedModel !== model) {
+      logMaskModelOverride({
+        requestId,
+        path: c.req.path,
+        fromModel: requestedModel,
+        toModel: model,
+      })
+    }
 
     // Dispatch invariant (review A): mask present ⇒ unconditionally llm-proxy gpt-image-2
     // (mivo platform has no mask capability); otherwise platform channel for platform
     // models (main image index 0, references appended after — do not drop main image).
-    const usePlatform = !mask && MIVO_PLATFORM_CHANNELS[model]
+    const usePlatform = !hasMaskInput && MIVO_PLATFORM_CHANNELS[model]
     if (usePlatform) {
       if (!platformCtx.platformKey.startsWith('mivo_')) {
         log(500)

@@ -12,6 +12,7 @@
 import { defaultMivoImageModel, getEnvConfig, type PlatformCtx } from '../lib/config'
 import { fetchUpstreamWithTimeout, readUpstreamError, UpstreamRequestTimeoutError } from '../lib/upstream'
 import { normalizeMivoImages, normalizeMivoQuality, resolveRatioPayload } from '../lib/images'
+import { logMaskModelOverride, logTaskTerminal } from '../lib/request'
 import {
   MIVO_PLATFORM_CHANNELS,
   mivoPlatformUploadOne,
@@ -19,7 +20,17 @@ import {
   runMivoPlatformImageJob,
   type OnProgress,
 } from '../platform/job'
-import { completePartialTask, completeTask, failTask, getTask, updateProgress, type TaskFailure, type TaskResultImage } from './registry'
+import {
+  completePartialTask,
+  completeTask,
+  failTask,
+  getTask,
+  updateProgress,
+  type TaskFailure,
+  type TaskRecord,
+  type TaskResult,
+  type TaskResultImage,
+} from './registry'
 
 const readImageApiKey = (imageApiKey: string): string => {
   const key = imageApiKey.trim()
@@ -36,6 +47,88 @@ const canceledInFlight = (taskId: string): boolean => {
 }
 
 const progressSink = (taskId: string): OnProgress => (report) => updateProgress(taskId, report.stage, report.progress)
+
+type TaskLogContext = {
+  record: TaskRecord
+  model: string
+  hasMask: boolean
+  hasReferences: boolean
+  channel: 'platform' | 'llm-proxy'
+  promptLength?: number
+}
+
+const errorClassFor = (error: unknown): string =>
+  error instanceof Error ? error.constructor.name || error.name || 'Error' : 'unknown-error'
+
+const statusFromErrorText = (error: string | undefined): number | undefined => {
+  const match = error?.match(/\b([45]\d\d)\b/)
+  return match ? Number(match[1]) : undefined
+}
+
+const logTerminal = (
+  context: TaskLogContext,
+  finalStatus: 'done' | 'partial' | 'failed',
+  details: { errorClass?: string; httpStatus?: number } = {},
+): void => {
+  logTaskTerminal({
+    taskId: context.record.id,
+    requestId: context.record.requestId,
+    kind: context.record.kind,
+    model: context.model,
+    hasMask: context.hasMask,
+    hasReferences: context.hasReferences,
+    channel: context.channel,
+    finalStatus,
+    latencyMs: Date.now() - context.record.createdAt,
+    promptLength: context.promptLength,
+    errorClass: details.errorClass,
+    httpStatus: details.httpStatus,
+  })
+}
+
+const completeTaskLogged = (taskId: string, result: TaskResult, context: TaskLogContext): void => {
+  completeTask(taskId, result)
+  if (getTask(taskId)?.status === 'done') logTerminal(context, 'done')
+}
+
+const completePartialTaskLogged = (
+  taskId: string,
+  result: TaskResult,
+  failures: TaskFailure[],
+  context: TaskLogContext,
+): void => {
+  completePartialTask(taskId, result, failures)
+  if (getTask(taskId)?.status === 'partial') {
+    logTerminal(context, 'partial', {
+      errorClass: 'partial-upstream-error',
+      httpStatus: statusFromErrorText(failures[0]?.error),
+    })
+  }
+}
+
+const failTaskLogged = (
+  taskId: string,
+  error: string,
+  context: TaskLogContext,
+  details: { errorClass?: string; httpStatus?: number } = {},
+): void => {
+  failTask(taskId, error)
+  if (getTask(taskId)?.status === 'failed') logTerminal(context, 'failed', details)
+}
+
+const effectiveModelForMask = (requestedModel: string, hasMask: boolean, record: TaskRecord): string => {
+  if (!hasMask) return requestedModel
+  if (requestedModel !== defaultMivoImageModel) {
+    logMaskModelOverride({
+      requestId: record.requestId,
+      taskId: record.id,
+      path: '/api/mivo/tasks/edit',
+      fromModel: requestedModel,
+      toModel: defaultMivoImageModel,
+    })
+  }
+  return defaultMivoImageModel
+}
 
 export type GenerateParams = {
   prompt: string
@@ -65,11 +158,23 @@ export const runGenerateTask = async (taskId: string, params: GenerateParams): P
   const platformCtx: PlatformCtx = { platformKey: env.platformKey, platformEndpoint: env.platformEndpoint }
   const quality = normalizeMivoQuality(params.quality)
   const model = typeof params.model === 'string' && params.model.trim() ? params.model.trim() : defaultMivoImageModel
+  const channel = MIVO_PLATFORM_CHANNELS[model] ? 'platform' : 'llm-proxy'
+  const logContext: TaskLogContext = {
+    record,
+    model,
+    hasMask: false,
+    hasReferences: false,
+    channel,
+    promptLength: params.prompt.length,
+  }
 
   try {
     if (MIVO_PLATFORM_CHANNELS[model]) {
       if (!platformCtx.platformKey.startsWith('mivo_')) {
-        failTask(taskId, 'MIVO_PLATFORM_KEY 未配置，请配置或切换 GPT 模型')
+        failTaskLogged(taskId, 'MIVO_PLATFORM_KEY 未配置，请配置或切换 GPT 模型', logContext, {
+          errorClass: 'config',
+          httpStatus: 500,
+        })
         return
       }
       const { modelType, modelFormat, payload } = resolveMivoPlatformPayload(model, params.imgRatio, quality, params.prompt)
@@ -77,10 +182,13 @@ export const runGenerateTask = async (taskId: string, params: GenerateParams): P
       if (canceledInFlight(taskId)) return
       if ('aborted' in result) return // abort without explicit cancel — leave as-is (no commit)
       if (result.status === 200) {
-        completeTask(taskId, result.body)
+        completeTaskLogged(taskId, result.body, logContext)
         return
       }
-      failTask(taskId, result.body.error)
+      failTaskLogged(taskId, result.body.error, logContext, {
+        errorClass: 'platform-status',
+        httpStatus: result.status,
+      })
       return
     }
 
@@ -99,19 +207,25 @@ export const runGenerateTask = async (taskId: string, params: GenerateParams): P
     )
     if (canceledInFlight(taskId)) return
     if (!upstreamResponse.ok) {
-      failTask(taskId, await readUpstreamError(upstreamResponse))
+      failTaskLogged(taskId, await readUpstreamError(upstreamResponse), logContext, {
+        errorClass: 'upstream-status',
+        httpStatus: upstreamResponse.status,
+      })
       return
     }
-    completeTask(taskId, normalizeMivoImages(await upstreamResponse.json()))
+    completeTaskLogged(taskId, normalizeMivoImages(await upstreamResponse.json()), logContext)
   } catch (error) {
     if (canceledInFlight(taskId)) return // cancel wins over failure
-    failTask(taskId, error instanceof Error ? error.message : 'task failed')
+    failTaskLogged(taskId, error instanceof Error ? error.message : 'task failed', logContext, {
+      errorClass: errorClassFor(error),
+      httpStatus: error instanceof UpstreamRequestTimeoutError ? 504 : undefined,
+    })
   }
 }
 
-// Edit task. Dispatch invariant (matches #24 sync edit handler): no mask + platform
-// model → platform (upload images, main first, then run job); mask OR non-platform
-// model → llm-proxy gpt-image-2.
+// Edit task. Dispatch invariant (matches sync edit handler): no mask + platform
+// model → platform (upload images, main first, then run job); mask → llm-proxy
+// gpt-image-2; non-platform no-mask edits use their requested llm-proxy model.
 export const runEditTask = async (taskId: string, params: EditParams): Promise<void> => {
   const record = getTask(taskId)
   if (!record) return
@@ -119,14 +233,26 @@ export const runEditTask = async (taskId: string, params: EditParams): Promise<v
   const env = getEnvConfig()
   const platformCtx: PlatformCtx = { platformKey: env.platformKey, platformEndpoint: env.platformEndpoint }
   const quality = normalizeMivoQuality(params.quality)
-  const model = typeof params.model === 'string' && params.model.trim() ? params.model.trim() : defaultMivoImageModel
   const mask = params.mask
+  const requestedModel = typeof params.model === 'string' && params.model.trim() ? params.model.trim() : defaultMivoImageModel
+  const model = effectiveModelForMask(requestedModel, Boolean(mask), record)
   const usePlatform = !mask && Boolean(MIVO_PLATFORM_CHANNELS[model])
+  const logContext: TaskLogContext = {
+    record,
+    model,
+    hasMask: Boolean(mask),
+    hasReferences: params.references.length > 0,
+    channel: usePlatform ? 'platform' : 'llm-proxy',
+    promptLength: params.prompt.length,
+  }
 
   try {
     if (usePlatform) {
       if (!platformCtx.platformKey.startsWith('mivo_')) {
-        failTask(taskId, 'MIVO_PLATFORM_KEY 未配置，请配置或切换 GPT 模型')
+        failTaskLogged(taskId, 'MIVO_PLATFORM_KEY 未配置，请配置或切换 GPT 模型', logContext, {
+          errorClass: 'config',
+          httpStatus: 500,
+        })
         return
       }
       updateProgress(taskId, 'upload', 5)
@@ -137,7 +263,10 @@ export const runEditTask = async (taskId: string, params: EditParams): Promise<v
           fileIds.push(await mivoPlatformUploadOne(platformCtx, f, record.controller.signal))
         }
       } catch {
-        failTask(taskId, '参考图上传失败，请重试或移除参考图')
+        failTaskLogged(taskId, '参考图上传失败，请重试或移除参考图', logContext, {
+          errorClass: 'platform-upload',
+          httpStatus: 502,
+        })
         return
       }
       if (canceledInFlight(taskId)) return
@@ -146,10 +275,13 @@ export const runEditTask = async (taskId: string, params: EditParams): Promise<v
       if (canceledInFlight(taskId)) return
       if ('aborted' in result) return
       if (result.status === 200) {
-        completeTask(taskId, result.body)
+        completeTaskLogged(taskId, result.body, logContext)
         return
       }
-      failTask(taskId, result.body.error)
+      failTaskLogged(taskId, result.body.error, logContext, {
+        errorClass: 'platform-status',
+        httpStatus: result.status,
+      })
       return
     }
 
@@ -173,13 +305,19 @@ export const runEditTask = async (taskId: string, params: EditParams): Promise<v
     )
     if (canceledInFlight(taskId)) return
     if (!upstreamResponse.ok) {
-      failTask(taskId, await readUpstreamError(upstreamResponse))
+      failTaskLogged(taskId, await readUpstreamError(upstreamResponse), logContext, {
+        errorClass: 'upstream-status',
+        httpStatus: upstreamResponse.status,
+      })
       return
     }
-    completeTask(taskId, normalizeMivoImages(await upstreamResponse.json()))
+    completeTaskLogged(taskId, normalizeMivoImages(await upstreamResponse.json()), logContext)
   } catch (error) {
     if (canceledInFlight(taskId)) return
-    failTask(taskId, error instanceof Error ? error.message : 'task failed')
+    failTaskLogged(taskId, error instanceof Error ? error.message : 'task failed', logContext, {
+      errorClass: errorClassFor(error),
+      httpStatus: error instanceof UpstreamRequestTimeoutError ? 504 : undefined,
+    })
   }
 }
 
@@ -273,8 +411,31 @@ export const runVariationsTask = async (taskId: string, params: VariationsParams
   const signal = record.controller.signal
   const total = params.variations.length
   if (total === 0) {
-    failTask(taskId, 'variations array is empty')
+    failTaskLogged(
+      taskId,
+      'variations array is empty',
+      {
+        record,
+        model: record.model,
+        hasMask: false,
+        hasReferences: false,
+        channel: 'llm-proxy',
+        promptLength: 0,
+      },
+      { errorClass: 'validation', httpStatus: 400 },
+    )
     return
+  }
+  const logContext: TaskLogContext = {
+    record,
+    model: record.model,
+    hasMask: false,
+    hasReferences: false,
+    channel: 'llm-proxy',
+    promptLength: params.variations.reduce((sum, variation) => {
+      const prompt = typeof variation.prompt === 'string' ? variation.prompt : ''
+      return sum + prompt.length
+    }, 0),
   }
   const concurrency = Math.max(1, Math.min(total, env.variationsConcurrency))
   updateProgress(taskId, 'submit', 5)
@@ -306,12 +467,16 @@ export const runVariationsTask = async (taskId: string, params: VariationsParams
 
   if (canceledInFlight(taskId)) return
   if (successes.length === 0) {
-    failTask(taskId, failures[0]?.error || 'All variations failed')
+    const error = failures[0]?.error || 'All variations failed'
+    failTaskLogged(taskId, error, logContext, {
+      errorClass: 'upstream-status',
+      httpStatus: statusFromErrorText(error),
+    })
     return
   }
   if (failures.length === 0) {
-    completeTask(taskId, { images: successes })
+    completeTaskLogged(taskId, { images: successes }, logContext)
     return
   }
-  completePartialTask(taskId, { images: successes }, failures)
+  completePartialTaskLogged(taskId, { images: successes }, failures, logContext)
 }

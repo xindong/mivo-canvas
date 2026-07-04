@@ -104,3 +104,54 @@ export const logRequest = (info: {
   ].filter(Boolean)
   console.log(parts.join(' '))
 }
+
+export const logMaskModelOverride = (info: {
+  requestId: string
+  path: string
+  fromModel: string
+  toModel: string
+  taskId?: string
+}): void => {
+  const parts = [
+    '[mivo-bff]',
+    `rid=${info.requestId}`,
+    info.taskId ? `taskId=${info.taskId}` : '',
+    `event=mask-model-override`,
+    `path=${info.path}`,
+    `from=${info.fromModel}`,
+    `to=${info.toModel}`,
+  ].filter(Boolean)
+  console.log(parts.join(' '))
+}
+
+export const logTaskTerminal = (info: {
+  taskId: string
+  requestId: string
+  kind: string
+  model: string
+  hasMask: boolean
+  hasReferences: boolean
+  channel: string
+  finalStatus: string
+  latencyMs: number
+  promptLength?: number
+  errorClass?: string
+  httpStatus?: number
+}): void => {
+  const parts = [
+    '[mivo-bff-task]',
+    `taskId=${info.taskId}`,
+    `rid=${info.requestId}`,
+    `kind=${info.kind}`,
+    `model=${info.model}`,
+    `hasMask=${info.hasMask ? 'true' : 'false'}`,
+    `hasReferences=${info.hasReferences ? 'true' : 'false'}`,
+    `channel=${info.channel}`,
+    `finalStatus=${info.finalStatus}`,
+    `latency=${info.latencyMs}ms`,
+    info.promptLength !== undefined ? `promptLength=${info.promptLength}` : '',
+    info.errorClass ? `errorClass=${info.errorClass}` : '',
+    info.httpStatus !== undefined ? `httpStatus=${info.httpStatus}` : '',
+  ].filter(Boolean)
+  console.log(parts.join(' '))
+}

@@ -9,7 +9,7 @@
 //  - unknown task 404
 //  - N concurrent tasks don't cross-talk
 //  - bad request (missing prompt) → 400
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest'
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest'
 import { serve } from '@hono/node-server'
 import type { Server } from 'node:http'
 import { Buffer } from 'node:buffer'
@@ -126,6 +126,35 @@ const pollTask = async (
 }
 
 describe('C1a — progress is monotonic + stage-driven (not hardcoded)', () => {
+  it('runner writes a terminal BFF log with task metadata on completion', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined)
+    try {
+      const create = await req('/api/mivo/tasks/generate', jsonReq({ prompt: 'a cat', model: 'doubao-seedance-2-0-260128' }))
+      expect(create.status).toBe(202)
+      const taskId = field(create.body, 'taskId') as string
+      const done = await pollTask(taskId, (b) => b.status === 'done' || b.status === 'failed')
+      expect(done).not.toBeNull()
+      expect(done!.status).toBe('done')
+      const lines = logSpy.mock.calls.map((call) => String(call[0]))
+      expect(
+        lines.some(
+          (line) =>
+            line.includes('[mivo-bff-task]') &&
+            line.includes(`taskId=${taskId}`) &&
+            line.includes('kind=generate') &&
+            line.includes('model=doubao-seedance-2-0-260128') &&
+            line.includes('hasMask=false') &&
+            line.includes('hasReferences=false') &&
+            line.includes('channel=llm-proxy') &&
+            line.includes('finalStatus=done') &&
+            line.includes('promptLength=5'),
+        ),
+      ).toBe(true)
+    } finally {
+      logSpy.mockRestore()
+    }
+  })
+
   it('platform generate: 10 → poll(20-90) → 95 → 100, monotonic', async () => {
     mockState.pollSequence = ['pending', 'pending', 'pending', 'pending', 'completed']
     mockState.downloadDelayMs = 80 // make the 'download' stage sampleable by GET polling
@@ -309,5 +338,22 @@ describe('C1a — edit task (platform, no mask)', () => {
     expect(done!.status).toBe('done')
     expect(done!.result?.images?.[0]?.b64).toBeTruthy()
     expect(mockState.uploadCalls).toBe(1)
+  })
+
+  it('mask edit task overrides platform model to gpt-image-2 before llm-proxy dispatch', async () => {
+    const form = new FormData()
+    form.append('image', new File([Buffer.from('png-bytes')], 'image.png', { type: 'image/png' }))
+    form.append('mask', new File([Buffer.from('mask-bytes')], 'mask.png', { type: 'image/png' }))
+    form.append('prompt', 'edit this')
+    form.append('model', 'gemini-3-pro-image')
+    const create = await req('/api/mivo/tasks/edit', { method: 'POST', body: form })
+    expect(create.status).toBe(202)
+    const done = await pollTask(field(create.body, 'taskId') as string, (b) => b.status === 'done' || b.status === 'failed', 2000)
+    expect(done).not.toBeNull()
+    expect(done!.status).toBe('done')
+    expect(mockState.editCalls).toBe(1)
+    expect(mockState.uploadCalls).toBe(0)
+    expect(mockState.lastEditBodyText).toMatch(/name="model"[\s\S]*gpt-image-2/)
+    expect(mockState.lastEditBodyText).not.toMatch(/name="model"[\s\S]*gemini-3-pro-image/)
   })
 })

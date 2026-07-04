@@ -1,5 +1,6 @@
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 import type { EnhanceRequest, EnhanceResponse, MivoEditRequest, MivoGenerateRequest, MivoImageQuality, MivoImageResponse } from '../types/generation'
+import { debugLogger } from '../store/debugLogStore'
 import { readImportedAssetFile } from './assetStorage'
 
 const defaultModel = 'gpt-image-2'
@@ -31,6 +32,31 @@ export const mivoClientTimeoutMessageFor = (quality?: MivoImageQuality) =>
 
 export const mivoUpstreamTimeoutMessageFor = (quality?: MivoImageQuality) =>
   `上游生成超时，${timeoutAdviceForQuality(quality)}`
+
+export const mivoUpstreamTemporaryFailureMessage = '上游服务临时失败，请重试'
+export const mivoUpstreamSafetyFailureMessage = '内容被上游安全系统拦截，可尝试修改描述后重试'
+
+const safetyFailurePattern =
+  /safety|content policy|policy violation|moderation|blocked|unsafe|refused|sensitive|内容安全|安全策略|安全系统|违规|不合规|敏感/i
+const upstream5xxFailurePattern = /ClosedChannelException|java\.[\w.]+Exception|Upstream error \((5\d\d)\)|\b5\d\d\b/i
+
+export const formatMivoClientError = (status: number | undefined, rawMessage: string, source = 'Mivo Image') => {
+  const normalizedRaw = rawMessage.trim() || 'Image request failed'
+  let message = normalizedRaw
+  if ((status === 400 || status === undefined) && safetyFailurePattern.test(normalizedRaw)) {
+    message = mivoUpstreamSafetyFailureMessage
+  } else if (
+    status !== 504 &&
+    ((status !== undefined && status >= 500 && status < 600) || upstream5xxFailurePattern.test(normalizedRaw))
+  ) {
+    message = mivoUpstreamTemporaryFailureMessage
+  }
+  if (message !== normalizedRaw) {
+    const statusPart = status !== undefined ? `status=${status}` : 'status=unknown'
+    debugLogger.error(source, `Raw upstream image error (${statusPart}): ${normalizedRaw}`)
+  }
+  return message
+}
 
 const fetchMivoWithTimeout = async (
   input: RequestInfo | URL,
@@ -76,12 +102,14 @@ const fetchMivoWithTimeout = async (
 const readMivoError = async (response: Response, quality?: MivoImageQuality) => {
   if (response.status === 504) return mivoUpstreamTimeoutMessageFor(quality)
 
+  let rawMessage = `${response.status} ${response.statusText}`
   try {
     const payload = (await response.json()) as { error?: string; message?: string }
-    return payload.error || payload.message || `${response.status} ${response.statusText}`
+    rawMessage = payload.error || payload.message || rawMessage
   } catch {
-    return `${response.status} ${response.statusText}`
+    // Keep the status text fallback.
   }
+  return formatMivoClientError(response.status, rawMessage)
 }
 
 const validateMivoImageResponse = (payload: unknown): MivoImageResponse => {

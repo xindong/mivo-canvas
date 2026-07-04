@@ -87,6 +87,41 @@ export const runMaskScenario = async (context) => {
     const beforeSourceEditEdges = before.edges.filter((edge) => edge.from === sourceNodeId && edge.type === 'edit').length
     const editRequestCountBefore = mivoEditRequests.length
     await page.locator('.image-mask-edit-prompt textarea').fill(`E2E ${sourceLabel} ${toolId} repaint`)
+    if (toolId === 'point') {
+      await page.locator('.image-mask-edit-prompt').getByRole('button', { name: '局部重绘' }).click()
+      await page.locator('.image-mask-edit-error').getByText('请框选或涂抹要重绘的区域。').waitFor()
+      const after = await readCanvasState()
+      const editEdges = after.edges.filter((edge) => edge.from === sourceNodeId && edge.type === 'edit')
+
+      if (mivoEditRequests.length !== editRequestCountBefore) {
+        throw new Error(`${sourceLabel}/${toolId} should not issue an edit request without a mask region`)
+      }
+      if (maskRegionCount !== 0 || pointAnchorCount < 1) {
+        throw new Error(`${sourceLabel}/${toolId} should keep point anchors out of mask regions: ${JSON.stringify({ maskRegionCount, pointAnchorCount })}`)
+      }
+      if (imageCountFor(after) !== imageCountFor(before)) {
+        throw new Error(`${sourceLabel}/${toolId} should not create a new image node when blocked`)
+      }
+      if (editEdges.length !== beforeSourceEditEdges) {
+        throw new Error(`${sourceLabel}/${toolId} should not create a derived edit edge when blocked`)
+      }
+
+      await page.locator('.image-mask-edit-history').getByRole('button', { name: 'Cancel mask edit' }).click()
+      await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
+
+      return {
+        source: sourceLabel,
+        tool: toolId,
+        regionCount,
+        maskRegionCount,
+        pointAnchorCount,
+        imagesBefore: imageCountFor(before),
+        imagesAfter: imageCountFor(after),
+        editEdgesFromSource: editEdges.length,
+        requestFiles: [],
+      }
+    }
+
     // P2-C1b: the mask-edit path (MivoCanvas submitMaskEdit) still uses the sync
     // /api/mivo/edit route (out of generationSlice scope); wait for its 200. The
     // substring '/api/mivo/edit' does not match '/api/mivo/tasks/edit'.
@@ -107,25 +142,18 @@ export const runMaskScenario = async (context) => {
     const editEdges = after.edges.filter((edge) => edge.from === sourceNodeId && edge.type === 'edit')
     const resultNode = after.nodes.find((node) => editEdges.some((edge) => edge.to === node.id))
     const latestRequest = mivoEditRequests.at(-1)
-    const expectsMask = toolId !== 'point'
 
     if (mivoEditRequests.length !== editRequestCountBefore + 1) {
       throw new Error(`${sourceLabel}/${toolId} should issue exactly one edit request`)
     }
-    if (toolId === 'point' && (maskRegionCount !== 0 || pointAnchorCount < 1)) {
-      throw new Error(`${sourceLabel}/${toolId} should keep point anchors out of mask regions: ${JSON.stringify({ maskRegionCount, pointAnchorCount })}`)
-    }
-    if (toolId !== 'point' && maskRegionCount < 1) {
+    if (maskRegionCount < 1) {
       throw new Error(`${sourceLabel}/${toolId} should create at least one mask region`)
     }
     if (!latestRequest?.fileKeys.includes('image:1')) {
       throw new Error(`${sourceLabel}/${toolId} edit request should include image: ${JSON.stringify(latestRequest)}`)
     }
-    if (expectsMask && !latestRequest.fileKeys.includes('mask:1')) {
+    if (!latestRequest.fileKeys.includes('mask:1')) {
       throw new Error(`${sourceLabel}/${toolId} edit request should include mask: ${JSON.stringify(latestRequest)}`)
-    }
-    if (!expectsMask && latestRequest.fileKeys.includes('mask:1')) {
-      throw new Error(`${sourceLabel}/${toolId} point-only edit request should not include mask: ${JSON.stringify(latestRequest)}`)
     }
     if (!after.nodes.some((node) => node.id === sourceNodeId && node.type === 'image')) {
       throw new Error(`${sourceLabel}/${toolId} should keep the source image`)
