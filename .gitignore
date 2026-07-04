@@ -61,3 +61,5 @@ bench/fixtures/bench-dom-mixed-10000.json
 bench/fixtures/bench-dom-mixed-20000.json
 bench/fixtures/bench-dom-mixed-50000.json
 bench/baselines/verify-*.json
+# PR-C drag-perf BEFORE/AFTER comparison JSONs (local measurement artifacts, not for git)
+bench-results/

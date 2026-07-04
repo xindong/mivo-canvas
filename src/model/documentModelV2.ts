@@ -177,7 +177,13 @@ const withLegacyGeometry = (node: MivoCanvasNode, transform: CanvasNodeTransform
   transform,
 })
 
-export const normalizeCanvasNodeV2 = (node: MivoCanvasNode): MivoCanvasNode => {
+// Clone entry: always full rebuild + shallow-clone every sub-object. Clone semantics
+// are byte-for-byte identical to the pre-split normalizeCanvasNodeV2 body — history /
+// clipboard / persist consumers that rely on "clone always produces new sub-objects"
+// (nodeFactory.cloneNode) must call this entry, NOT normalizeCanvasNodeV2, so the
+// fast-path optimization added in commit #2 (return-same-reference-when-normalized)
+// can never break clone isolation.
+export const cloneCanvasNodeV2 = (node: MivoCanvasNode): MivoCanvasNode => {
   const transform = transformForNode(node)
 
   return withLegacyGeometry(
@@ -194,6 +200,16 @@ export const normalizeCanvasNodeV2 = (node: MivoCanvasNode): MivoCanvasNode => {
     transform,
   )
 }
+
+// Normalize entry. Commit #1: delegates directly to cloneCanvasNodeV2 — zero behavior
+// change versus the pre-split single function. Commit #2 adds the
+// isNormalizedCanvasNodeV2 fast-path predicate (return the same reference when the
+// node is already normalized) so unchanged nodes skip the per-field rebuild during
+// drag; the predicate is deliberately NOT wired here yet so cloneNode can switch to
+// cloneCanvasNodeV2 first and prove (via the deep-copy contract tests) that clone
+// isolation no longer depends on normalize.
+export const normalizeCanvasNodeV2 = (node: MivoCanvasNode): MivoCanvasNode =>
+  cloneCanvasNodeV2(node)
 
 export const normalizeCanvasNodesV2 = (nodes: MivoCanvasNode[]) => nodes.map(normalizeCanvasNodeV2)
 

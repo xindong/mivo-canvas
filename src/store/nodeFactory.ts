@@ -7,7 +7,7 @@ import type {
   CanvasTask,
   MivoCanvasNode,
 } from '../types/mivoCanvas'
-import { normalizeCanvasNodeV2 } from '../model/documentModelV2'
+import { cloneCanvasNodeV2 } from '../model/documentModelV2'
 import { normalizeAnchors } from '../model/anchorModel'
 import { connectorAnchorPointFor, derivationConnectorBindingsFor } from '../canvas/connectorGeometry'
 import { makeNode } from './demoScenes'
@@ -27,8 +27,13 @@ import type { ImageDimensions } from '../lib/imageSizing'
 
 // --- clone helpers -----------------------------------------------------------
 
+// cloneNode serves history / clipboard / persist, where sub-objects must NOT be
+// shared with the source (a later mutation of the source must not leak into the
+// clone). It therefore calls cloneCanvasNodeV2 (always full rebuild) rather than
+// normalizeCanvasNodeV2 — the latter gains a return-same-reference fast path in
+// commit #2 which would break clone isolation. See documentModelV2.ts.
 export const cloneNode = (node: MivoCanvasNode): MivoCanvasNode => ({
-  ...normalizeCanvasNodeV2(node),
+  ...cloneCanvasNodeV2(node),
   markupPoints: node.markupPoints ? node.markupPoints.map((point) => ({ ...point })) : undefined,
   connectorStart: node.connectorStart ? { ...node.connectorStart } : undefined,
   connectorEnd: node.connectorEnd ? { ...node.connectorEnd } : undefined,
