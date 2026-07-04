@@ -10,6 +10,13 @@
 // Restart semantics: the registry is process-memory; a restart empties it. GET on
 // an unknown taskId returns 404 {error:'unknown-task'} — clients must NOT commit
 // results for tasks they can no longer see (per §7 C1).
+//
+// TTL semantics (V02): terminal tasks (done/partial/failed/canceled) are stamped
+// with `terminalAt` and evicted by a module-level sweeper once they are older
+// than TERMINAL_TTL_MS (10 min); their idempotencyIndex entries are dropped in
+// lockstep. A swept task GETs as 404 'unknown-task' — the same path as a freshly
+// restarted process, so clients already tolerate it. The sweeper runs every
+// SWEEP_INTERVAL_MS (60s) and is .unref()'d so it never blocks process exit.
 
 import { randomUUID } from 'node:crypto'
 
@@ -41,6 +48,10 @@ export type TaskRecord = {
   error?: string
   idempotencyKey?: string
   createdAt: number
+  // V02: wall-clock ms when the task entered a terminal state. Undefined for
+  // pending/running. The sweeper reads this to evict stale terminal records
+  // (whose result.images base64 would otherwise leak until process restart).
+  terminalAt?: number
   controller: AbortController
 }
 
@@ -64,6 +75,34 @@ const tasks = new Map<string, TaskRecord>()
 const idempotencyIndex = new Map<string, string>()
 
 const isTerminal = (s: TaskStatus): boolean => s === 'done' || s === 'partial' || s === 'failed' || s === 'canceled'
+
+// V02: terminal-task TTL + sweeper. Terminal records hold result.images base64
+// (a single 2K image is 10MB+); without eviction they leak until the process
+// restarts. The sweeper deletes records whose terminalAt is older than the TTL
+// and drops their idempotencyIndex entries in lockstep. Started lazily on the
+// first createTask() so test suites using vi.useFakeTimers() can drive the
+// interval deterministically instead of fighting a real timer from import time.
+const TERMINAL_TTL_MS = 10 * 60_000
+const SWEEP_INTERVAL_MS = 60_000
+
+// Test-visible sweep body. Production callers reach it via the interval.
+export const __sweepTerminalTasks = (): void => {
+  const now = Date.now()
+  for (const [id, record] of tasks) {
+    if (record.terminalAt === undefined) continue
+    if (now - record.terminalAt <= TERMINAL_TTL_MS) continue
+    tasks.delete(id)
+    if (record.idempotencyKey) idempotencyIndex.delete(record.idempotencyKey)
+  }
+}
+
+let sweepTimer: ReturnType<typeof setInterval> | null = null
+const ensureSweeper = (): void => {
+  if (sweepTimer !== null) return
+  const timer = setInterval(__sweepTerminalTasks, SWEEP_INTERVAL_MS)
+  timer.unref()
+  sweepTimer = timer
+}
 
 export const newTaskId = (): string => randomUUID()
 
@@ -116,6 +155,7 @@ export const createTask = (
   if (meta?.count !== undefined) record.count = meta.count
   tasks.set(id, record)
   if (idempotencyKey) idempotencyIndex.set(idempotencyKey, id)
+  ensureSweeper()
   return { record, created: true }
 }
 
@@ -129,6 +169,7 @@ export const cancelTask = (id: string): boolean => {
   if (isTerminal(r.status)) return true
   r.status = 'canceled'
   r.stage = 'canceled'
+  r.terminalAt = Date.now()
   r.controller.abort()
   return true
 }
@@ -150,6 +191,7 @@ export const completeTask = (id: string, result: TaskResult): void => {
   if (r.status === 'canceled') return // never commit after cancel
   r.status = 'done'
   r.stage = 'done'
+  r.terminalAt = Date.now()
   r.progress = 100
   r.result = result
 }
@@ -165,6 +207,7 @@ export const completePartialTask = (id: string, result: TaskResult, failures: Ta
   if (r.status === 'canceled') return // never commit after cancel
   r.status = 'partial'
   r.stage = 'done'
+  r.terminalAt = Date.now()
   r.progress = 100
   r.result = result
   r.failures = failures
@@ -176,6 +219,7 @@ export const failTask = (id: string, error: string): void => {
   if (r.status === 'canceled') return // cancel wins over failure
   r.status = 'failed'
   r.stage = 'failed'
+  r.terminalAt = Date.now()
   r.error = error
 }
 
@@ -197,8 +241,12 @@ export const toView = (r: TaskRecord): TaskView => {
   return view
 }
 
-// Test-only: clear the registry between tests.
+// Test-only: clear the registry (and stop the sweeper) between tests.
 export const __resetTaskRegistry = (): void => {
   tasks.clear()
   idempotencyIndex.clear()
+  if (sweepTimer !== null) {
+    clearInterval(sweepTimer)
+    sweepTimer = null
+  }
 }
