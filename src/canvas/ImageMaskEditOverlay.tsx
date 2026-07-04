@@ -6,6 +6,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from 'react'
 import { createPortal } from 'react-dom'
@@ -23,6 +24,7 @@ import {
   type ImageMaskRegion,
   type ImageMaskSubmitPayload,
 } from './imageMaskGeometry'
+import type { MaskInitialClientPoint } from './maskPointPending'
 
 type ImageMaskTool = 'point' | 'box' | 'brush'
 
@@ -32,8 +34,14 @@ type ImageMaskEditOverlayProps = {
   naturalSize: { width: number; height: number }
   viewportScale: number
   submitting: boolean
+  initialClientPoint?: MaskInitialClientPoint
   onCancel: () => void
   onSubmit: (payload: ImageMaskSubmitPayload) => Promise<void>
+  onInitialClientPointHandled?: (
+    nodeId: string,
+    outcome: 'consumed' | 'discarded',
+    reason?: string,
+  ) => void
 }
 
 type DraftRegion =
@@ -111,12 +119,10 @@ const regionPath = (
     }
   }
 
-  // 单点 brush（点选工具产物）：SVG 单点 polyline 不绘制任何内容，按 mask 实际
-  // 覆盖范围（buildEditMaskBlob 对单点填充圆）渲染为圆形反馈。
   if (region.points.length === 1) {
     const center = imagePixelToNodePoint(region.points[0], displayRect, naturalSize, imageCrop)
     return {
-      kind: 'circle' as const,
+      kind: 'point' as const,
       cx: center.x,
       cy: center.y,
       r: radiusToNode(region.points[0], region.radius, displayRect, naturalSize, imageCrop),
@@ -149,8 +155,10 @@ export function ImageMaskEditOverlay({
   naturalSize,
   viewportScale,
   submitting,
+  initialClientPoint,
   onCancel,
   onSubmit,
+  onInitialClientPointHandled,
 }: ImageMaskEditOverlayProps) {
   const stageRef = useRef<HTMLDivElement | null>(null)
   const [tool, setTool] = useState<ImageMaskTool>('point')
@@ -168,6 +176,8 @@ export function ImageMaskEditOverlay({
   const pointAnchorsRef = useRef<PointAnchor[]>([])
   const draftRef = useRef<DraftRegion | undefined>(undefined)
   const removeWindowDragListenersRef = useRef<() => void>(() => undefined)
+  const handledInitialClientPointKeyRef = useRef<string | undefined>(undefined)
+  const initialFollowupPointerRef = useRef<{ clientX: number; clientY: number } | undefined>(undefined)
   const promptReady = Boolean(prompt.trim())
   const hasAnyAnchor = regions.length > 0 || pointAnchors.length > 0
   const maskEditHint = !hasAnyAnchor
@@ -255,7 +265,10 @@ export function ImageMaskEditOverlay({
   }
 
   const commitMaskState = (nextRegions: ImageMaskRegion[], nextPointAnchors: PointAnchor[]) => {
-    const previous = currentSnapshot()
+    const previous = {
+      regions: regionsRef.current,
+      pointAnchors: pointAnchorsRef.current,
+    }
     regionsRef.current = nextRegions
     pointAnchorsRef.current = nextPointAnchors
     setPast((current) => [...current, previous])
@@ -268,6 +281,54 @@ export function ImageMaskEditOverlay({
   const commitRegions = (nextRegions: ImageMaskRegion[]) => {
     commitMaskState(nextRegions, pointAnchorsRef.current)
   }
+
+  useEffect(() => {
+    if (!initialClientPoint) return
+    const key = `${initialClientPoint.nodeId}:${initialClientPoint.clientX}:${initialClientPoint.clientY}`
+    if (handledInitialClientPointKeyRef.current === key) return
+    handledInitialClientPointKeyRef.current = key
+
+    if (initialClientPoint.nodeId !== node.id) {
+      debugLogger.log(
+        'Mask Edit',
+        `Initial client point discarded: expected ${node.id}, got ${initialClientPoint.nodeId}`,
+      )
+      onInitialClientPointHandled?.(initialClientPoint.nodeId, 'discarded', 'node mismatch')
+      return
+    }
+
+    const rect = stageRef.current?.getBoundingClientRect()
+    const localPoint = rect
+      ? {
+          x: ((initialClientPoint.clientX - rect.left) / Math.max(1, rect.width)) * node.width,
+          y: ((initialClientPoint.clientY - rect.top) / Math.max(1, rect.height)) * node.height,
+        }
+      : undefined
+    const pixel = localPoint ? nodePointToImagePixel(localPoint, displayRect, naturalSize, node.imageCrop) : undefined
+    if (!pixel) {
+      debugLogger.warn('Mask Edit', `Initial client point for ${node.id} discarded: outside image pixels`)
+      onInitialClientPointHandled?.(node.id, 'discarded', 'pixel unavailable')
+      return
+    }
+
+    const radius = pointMaskRadiusFor(naturalSize)
+    const previous = {
+      regions: regionsRef.current,
+      pointAnchors: pointAnchorsRef.current,
+    }
+    const nextRegions = [...regionsRef.current, { type: 'brush' as const, points: [pixel], radius }]
+    regionsRef.current = nextRegions
+    setPast((current) => [...current, previous])
+    setRegions(nextRegions)
+    setFuture([])
+    setStatusError('')
+    initialFollowupPointerRef.current = {
+      clientX: initialClientPoint.clientX,
+      clientY: initialClientPoint.clientY,
+    }
+    debugLogger.log('Mask Edit', `Initial client point consumed for ${node.id} with radius ${radius}px`)
+    onInitialClientPointHandled?.(node.id, 'consumed')
+  }, [displayRect, initialClientPoint, naturalSize, node.height, node.id, node.imageCrop, node.width, onInitialClientPointHandled])
 
   useEffect(() => () => removeWindowDragListenersRef.current(), [])
 
@@ -384,6 +445,19 @@ export function ImageMaskEditOverlay({
   const beginPointer = (event: ReactPointerEvent<HTMLElement>) => {
     event.preventDefault()
     event.stopPropagation()
+    const initialFollowupPointer = initialFollowupPointerRef.current
+    if (initialFollowupPointer) {
+      initialFollowupPointerRef.current = undefined
+      const sameInitialPoint =
+        Math.hypot(
+          event.clientX - initialFollowupPointer.clientX,
+          event.clientY - initialFollowupPointer.clientY,
+        ) <= 2
+      if (event.detail > 1 || sameInitialPoint) {
+        debugLogger.log('Mask Edit', 'Ignored double-click follow-up after armed initial point')
+        return
+      }
+    }
     if (submitting) return
 
     const pixel = pixelForClient(event.clientX, event.clientY)
@@ -448,6 +522,13 @@ export function ImageMaskEditOverlay({
     }
   }
 
+  const handlePromptKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key !== 'Escape') return
+    event.preventDefault()
+    event.stopPropagation()
+    onCancel()
+  }
+
   const renderedRegions = draft
     ? [
         ...regions,
@@ -462,6 +543,46 @@ export function ImageMaskEditOverlay({
           : { type: 'brush' as const, points: draft.points, radius: brushSizePx },
       ]
     : regions
+
+  const renderPointMarker = (center: ImageMaskPoint, radiusNode: number, index: string | number) => {
+    const scale = Math.max(0.1, viewportScale)
+    const armLength = 10 / scale
+    const centerRadius = 3.5 / scale
+    const strokeWidth = 2 / scale
+
+    return (
+      <g key={`point-marker-${index}`} className="image-mask-edit-point-marker">
+        <circle
+          className="image-mask-edit-point-ring"
+          cx={center.x}
+          cy={center.y}
+          r={radiusNode}
+        />
+        <line
+          className="image-mask-edit-point-crosshair"
+          x1={center.x - armLength}
+          y1={center.y}
+          x2={center.x + armLength}
+          y2={center.y}
+          strokeWidth={strokeWidth}
+        />
+        <line
+          className="image-mask-edit-point-crosshair"
+          x1={center.x}
+          y1={center.y - armLength}
+          x2={center.x}
+          y2={center.y + armLength}
+          strokeWidth={strokeWidth}
+        />
+        <circle
+          className="image-mask-edit-point-core"
+          cx={center.x}
+          cy={center.y}
+          r={centerRadius}
+        />
+      </g>
+    )
+  }
 
   const floatingControls =
     floatingLayout && floatingHost ? (
@@ -513,6 +634,7 @@ export function ImageMaskEditOverlay({
             value={prompt}
             disabled={submitting}
             onChange={(event) => setPrompt(event.target.value)}
+            onKeyDown={handlePromptKeyDown}
             placeholder="描述这个区域要怎么改..."
           />
           {maskEditHint ? <div className="image-mask-edit-hint">{maskEditHint}</div> : null}
@@ -551,28 +673,12 @@ export function ImageMaskEditOverlay({
             />
             {pointAnchors.map((anchor, index) => {
               const shape = pointAnchorPath(anchor, displayRect, naturalSize, node.imageCrop)
-              return (
-                <circle
-                  key={`point-anchor-${index}`}
-                  className="image-mask-edit-region point-anchor"
-                  cx={shape.cx}
-                  cy={shape.cy}
-                  r={shape.r}
-                />
-              )
+              return renderPointMarker({ x: shape.cx, y: shape.cy }, shape.r, `anchor-${index}`)
             })}
             {renderedRegions.map((region, index) => {
               const shape = regionPath(region, displayRect, naturalSize, node.imageCrop)
-              if (shape.kind === 'circle') {
-                return (
-                  <circle
-                    key={index}
-                    className="image-mask-edit-region point-anchor"
-                    cx={shape.cx}
-                    cy={shape.cy}
-                    r={shape.r}
-                  />
-                )
+              if (shape.kind === 'point') {
+                return renderPointMarker({ x: shape.cx, y: shape.cy }, shape.r, index)
               }
               if (shape.kind === 'rect') {
                 return (

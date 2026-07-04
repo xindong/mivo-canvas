@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -15,8 +16,6 @@ import { downloadCanvasNodeOriginal } from '../lib/assetDownload'
 import { canReadLocalAssetDrag, parseLocalAssetDragPayload } from '../lib/canvasAssetDrag'
 import { canImportCanvasFile, importFilesToCanvas, importImageUrlToCanvas } from '../lib/canvasAssetImport'
 import { useCanvasStore } from '../store/canvasStore'
-import { useChatStore } from '../store/chatStore'
-import { prepareMaskEditPlaceholder, removeMaskEditPlaceholder, runMaskEditGeneration } from './maskEditGeneration'
 import { brushCursorCssFor } from './brushCursors'
 import { brushOutlinePathFor, highlighterOpacity } from './brushGeometry'
 import { BrushOptionsBar } from './BrushOptionsBar'
@@ -27,13 +26,13 @@ import { AnchorOverlay } from './AnchorOverlay'
 import { ImageCropOverlay, type ImageCropBox } from './ImageCropOverlay'
 import { NodeActionMenu } from './NodeActionMenu'
 import { SelectionQuickToolbar } from './SelectionQuickToolbar'
-import type { ImageMaskSubmitPayload } from './imageMaskGeometry'
-import type { MivoImageRatio } from '../types/generation'
 import { StampOptionsBar } from './StampOptionsBar'
 import { stampCursorCssFor, stampGrowthSizes, stampSrcFor } from './stampDefs'
 import { useCanvasInteractionController } from './useCanvasInteractionController'
+import { useMaskPointArmed, type MaskPointArmedInteractionApi } from './useMaskPointArmed'
 import { rendererMode } from '../render/rendererMode'
 import { cullingMode } from '../render/cullingMode'
+
 type ContextMenuState = {
   kind: 'node' | 'blank'
   nodeId?: string
@@ -80,21 +79,6 @@ const isCanvasChromeTarget = (target: EventTarget | null) =>
 
 const canvasRenderOverscanPx = 520
 
-const supportedMivoRatios: Array<{ id: MivoImageRatio; value: number }> = [
-  { id: '1:1', value: 1 },
-  { id: '3:2', value: 3 / 2 },
-  { id: '2:3', value: 2 / 3 },
-  { id: '16:9', value: 16 / 9 },
-  { id: '9:16', value: 9 / 16 },
-]
-
-const closestMivoRatioForSize = (size: { width: number; height: number }): MivoImageRatio => {
-  const ratio = Math.max(1, size.width) / Math.max(1, size.height)
-  return supportedMivoRatios.reduce((best, candidate) => (
-    Math.abs(Math.log(ratio / candidate.value)) < Math.abs(Math.log(ratio / best.value)) ? candidate : best
-  )).id
-}
-
 const rectsIntersect = (
   a: { x: number; y: number; width: number; height: number },
   b: { x: number; y: number; width: number; height: number },
@@ -122,12 +106,14 @@ export function MivoCanvas({
   const shellRef = useRef<HTMLElement | null>(null)
   const hostRef = useRef<HTMLDivElement | null>(null)
   const leaferRef = useRef<Leafer | null>(null)
-  const maskEditAbortRef = useRef<AbortController | null>(null)
-  const lastMaskCancelRequestIdRef = useRef(maskCancelRequestId)
+  const maskPointInteractionRef = useRef<MaskPointArmedInteractionApi>({
+    beginNodePointerDown: () => undefined,
+    handleCanvasPointerDown: () => undefined,
+    temporaryTool: undefined,
+    isPanning: false,
+  })
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null)
   const [cropNodeId, setCropNodeId] = useState<string>()
-  const [maskEditNodeId, setMaskEditNodeId] = useState<string>()
-  const [maskEditSubmittingNodeId, setMaskEditSubmittingNodeId] = useState<string>()
   const [shellSize, setShellSize] = useState({ width: 0, height: 0 })
   const nodes = useCanvasStore((state) => state.nodes)
   const sceneId = useCanvasStore((state) => state.sceneId)
@@ -153,12 +139,28 @@ export function MivoCanvas({
     contextMenu?.kind === 'node' ? visibleNodes.find((node) => node.id === contextMenuNodeId) : undefined
   const cropNode = cropNodeId ? visibleNodes.find((node) => node.id === cropNodeId && node.type === 'image') : undefined
   const closeContextMenu = useCallback(() => setContextMenu(null), [])
-  const cancelMaskEdit = useCallback(() => {
-    maskEditAbortRef.current?.abort()
-    maskEditAbortRef.current = null
-    setMaskEditNodeId(undefined)
-    setMaskEditSubmittingNodeId(undefined)
-  }, [])
+  const clearCropNode = useCallback(() => setCropNodeId(undefined), [])
+  const {
+    maskArmed,
+    maskEditNodeId,
+    maskEditSubmittingNodeId,
+    initialClientPoint,
+    beginMaskEdit,
+    submitMaskEdit,
+    cancelMaskEdit,
+    toggleMaskArmed,
+    wrapNodePointerDown,
+    wrapCanvasPointerDown,
+    handleInitialClientPointHandled,
+  } = useMaskPointArmed({
+    sceneId,
+    maskCancelRequestId,
+    onMaskEditActiveChange,
+    selectNode,
+    closeContextMenu,
+    clearCropNode,
+    interactionRef: maskPointInteractionRef,
+  })
   const {
     viewport,
     snapGuides,
@@ -206,6 +208,15 @@ export function MivoCanvas({
     onCancelMaskEdit: cancelMaskEdit,
     onCloseContextMenu: closeContextMenu,
   })
+
+  useLayoutEffect(() => {
+    maskPointInteractionRef.current = {
+      beginNodePointerDown,
+      handleCanvasPointerDown,
+      temporaryTool,
+      isPanning,
+    }
+  }, [beginNodePointerDown, handleCanvasPointerDown, isPanning, temporaryTool])
 
   const screenToCanvasPoint = useCallback(
     (clientX: number, clientY: number) => {
@@ -298,69 +309,6 @@ export function MivoCanvas({
       setCropNodeId(undefined)
     },
     [cropImageNode],
-  )
-
-  const beginMaskEdit = useCallback(
-    (nodeId: string) => {
-      const node = useCanvasStore.getState().nodes.find((item) => item.id === nodeId && item.type === 'image' && !item.hidden)
-      if (!node) return
-
-      selectNode(nodeId)
-      setContextMenu(null)
-      setCropNodeId(undefined)
-      setMaskEditNodeId(nodeId)
-    },
-    [selectNode],
-  )
-
-  const submitMaskEdit = useCallback(
-    async (nodeId: string, resolvedAssetUrl: string, payload: ImageMaskSubmitPayload) => {
-      const targetSceneId = sceneId
-      const source = useCanvasStore
-        .getState()
-        .canvases[targetSceneId]?.nodes.find((node) => node.id === nodeId && node.type === 'image' && !node.hidden)
-      if (!source) throw new Error('Source image not found')
-
-      const slotId = prepareMaskEditPlaceholder(targetSceneId, source, payload.prompt)
-      setMaskEditSubmittingNodeId(nodeId)
-      const abortController = new AbortController()
-      maskEditAbortRef.current?.abort()
-      maskEditAbortRef.current = abortController
-      try {
-        await runMaskEditGeneration({
-          sceneId: targetSceneId,
-          source,
-          slotId,
-          resolvedAssetUrl,
-          payload,
-          imgRatio: closestMivoRatioForSize(payload.sourceSize),
-          signal: abortController.signal,
-        })
-        setMaskEditNodeId(undefined)
-      } catch (error) {
-        const logMessage = error instanceof Error ? error.message : '局部重绘失败'
-        removeMaskEditPlaceholder(targetSceneId, slotId, {
-          canceled: abortController.signal.aborted,
-          error: logMessage,
-          sourceTitle: source.title,
-        })
-        const latestCanvasState = useCanvasStore.getState()
-        if (latestCanvasState.sceneId !== targetSceneId) {
-          useChatStore.getState().appendNotice({
-            sceneId: latestCanvasState.sceneId,
-            origin: 'mask-edit',
-            prompt: `局部重绘失败：${logMessage}`,
-          })
-        }
-        throw error
-      } finally {
-        if (maskEditAbortRef.current === abortController) {
-          maskEditAbortRef.current = null
-        }
-        setMaskEditSubmittingNodeId(undefined)
-      }
-    },
-    [sceneId],
   )
 
   const downloadOriginal = useCallback((node?: typeof contextMenuNode) => {
@@ -466,25 +414,6 @@ export function MivoCanvas({
   }, [importLocalAssetAtClientPoint, onRegisterExternalAssetDrop])
 
   useEffect(() => {
-    if (lastMaskCancelRequestIdRef.current === maskCancelRequestId) return
-    lastMaskCancelRequestIdRef.current = maskCancelRequestId
-    cancelMaskEdit()
-  }, [cancelMaskEdit, maskCancelRequestId])
-
-  useEffect(() => {
-    const active = Boolean(maskEditNodeId)
-    onMaskEditActiveChange?.(active)
-
-    return () => {
-      if (active) onMaskEditActiveChange?.(false)
-    }
-  }, [maskEditNodeId, onMaskEditActiveChange])
-
-  useEffect(() => () => {
-    maskEditAbortRef.current?.abort()
-  }, [])
-
-  useEffect(() => {
     if (!hostRef.current || leaferRef.current) return
 
     const host = hostRef.current
@@ -578,7 +507,7 @@ export function MivoCanvas({
         selectionBox ? 'is-selecting' : ''
       } ${selectedNodes.length > 1 ? 'has-multi-selection' : ''} ${brushToolActive ? 'brush-tool' : ''} ${
         stampToolActive ? 'stamp-tool' : ''
-      }`}
+      } ${maskArmed ? 'mask-armed' : ''}`}
       aria-label="Mivo Canvas" data-renderer-mode={rendererMode} data-culling-mode={cullingMode}
       data-viewport-scale={viewport.scale}
       data-viewport-x={viewport.x}
@@ -587,7 +516,7 @@ export function MivoCanvas({
       data-total-node-count={visibleNodes.length}
       ref={shellRef}
       onWheel={handleWheel}
-      onPointerDown={handleCanvasPointerDown}
+      onPointerDown={wrapCanvasPointerDown}
       onPointerMove={handleCanvasPointerMove}
       onPointerUp={handleCanvasPointerEnd}
       onPointerCancel={handleCanvasPointerEnd}
@@ -609,6 +538,8 @@ export function MivoCanvas({
       <CanvasToolDock
         previewTool={temporaryTool === 'hand' ? 'hand' : undefined}
         onStartMaskEdit={beginMaskEdit}
+        maskArmed={maskArmed}
+        onToggleMaskArmed={toggleMaskArmed}
       />
       {storeActiveTool === 'markup-brush' && !temporaryTool ? <BrushOptionsBar /> : null}
       {storeActiveTool === 'stamp' && !temporaryTool ? <StampOptionsBar /> : null}
@@ -763,9 +694,10 @@ export function MivoCanvas({
               selectionStrokeWidth={selectionStrokeWidth}
               maskEditActive={node.id === maskEditNodeId}
               maskEditSubmitting={node.id === maskEditSubmittingNodeId}
+              initialMaskClientPoint={initialClientPoint?.nodeId === node.id ? initialClientPoint : undefined}
               viewportScale={viewport.scale}
               onSelect={selectNode}
-              onPointerDown={beginNodePointerDown}
+              onPointerDown={wrapNodePointerDown}
               onResizeHandlePointerDown={beginNodeResize}
               onMarkupPointPointerDown={beginMarkupPointMove}
               onTextResizeHandlePointerDown={beginTextResize}
@@ -776,6 +708,7 @@ export function MivoCanvas({
               onResizeNodeToContent={updateNodeMeasuredSize}
               onSubmitMaskEdit={submitMaskEdit}
               onCancelMaskEdit={cancelMaskEdit}
+              onInitialMaskClientPointHandled={handleInitialClientPointHandled}
               onOpenDetails={(nodeId) => {
                 setContextMenu(null)
                 selectNode(nodeId)
