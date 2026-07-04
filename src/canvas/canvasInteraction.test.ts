@@ -1,10 +1,15 @@
 import { describe, expect, it } from 'vitest'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 import {
+  canvasBoundsFromZoomMarquee,
+  createZoomMarqueeBox,
   createGroupResizeState,
   createNodeResizeState,
+  isZoomToBoundsMarqueeRect,
   resizeGroupSelection,
   resizeNodeTransform,
+  runtimeToolFor,
+  zoomMarqueeOverlayRect,
 } from './canvasInteraction'
 
 const baseNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
@@ -82,5 +87,32 @@ describe('resizeGroupSelection', () => {
       { id: 'node-a', x: -60, y: -40, width: 140, height: 140 },
       { id: 'node-b', x: 220, y: 100, width: 140, height: 140 },
     ])
+  })
+})
+
+describe('runtimeToolFor', () => {
+  it('uses the temporary zoom tool without making zoom a persisted ToolId', () => {
+    expect(runtimeToolFor('select', 'zoom')).toBe('zoom')
+  })
+})
+
+describe('zoom marquee helpers', () => {
+  it('converts a shell/client zoom marquee to canvas bounds', () => {
+    const marquee = createZoomMarqueeBox(1, 110, 220, { left: 10, top: 20, width: 800, height: 600 })
+    marquee.currentClientX = 310
+    marquee.currentClientY = 420
+
+    expect(zoomMarqueeOverlayRect(marquee)).toEqual({ x: 100, y: 200, width: 200, height: 200 })
+    expect(canvasBoundsFromZoomMarquee(marquee, { x: 50, y: 100, scale: 2 })).toEqual({
+      x: 25,
+      y: 50,
+      width: 100,
+      height: 100,
+    })
+  })
+
+  it('treats sub-4px zoom marquees as click zooms', () => {
+    expect(isZoomToBoundsMarqueeRect({ x: 0, y: 0, width: 3, height: 4 })).toBe(false)
+    expect(isZoomToBoundsMarqueeRect({ x: 0, y: 0, width: 4, height: 4 })).toBe(true)
   })
 })

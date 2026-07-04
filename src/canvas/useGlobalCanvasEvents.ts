@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import type { RuntimeCanvasTool } from './canvasInteraction'
 import type { SnapGuide } from './canvasGeometry'
 import { isEditingTarget } from './canvasInteraction'
@@ -14,10 +14,11 @@ export type GlobalEventsApi = {
   setEditingTextNodeId: (id: string | undefined) => void
   setSnapGuides: (guides: SnapGuide[]) => void
   setActiveConnectorDropTargetId: (id: string | undefined) => void
+  setZoomOutCursor: (active: boolean) => void
   zoomBy: (factor: number, center?: { clientX: number; clientY: number }) => void
+  zoomTo: (scale: number, center?: { clientX: number; clientY: number }) => void
   fitAll: () => void
   fitSelection: () => void
-  resetView: () => void
   viewportCenter: () => { x: number; y: number }
   resetMarquee: () => void
   resetNodeTransform: () => void
@@ -25,6 +26,7 @@ export type GlobalEventsApi = {
   resetTextAnnotation: () => void
   resetBrushStamp: () => void
   resetGroupTransform: () => void
+  resetZoomGesture: () => void
 }
 
 // Global window keyboard / wheel / paste / blur handling. Extracted from
@@ -41,10 +43,11 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
     setEditingTextNodeId,
     setSnapGuides,
     setActiveConnectorDropTargetId,
+    setZoomOutCursor,
     zoomBy,
+    zoomTo,
     fitAll,
     fitSelection,
-    resetView,
     viewportCenter,
     resetMarquee,
     resetNodeTransform,
@@ -52,19 +55,46 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
     resetTextAnnotation,
     resetBrushStamp,
     resetGroupTransform,
+    resetZoomGesture,
   } = api
+  const pressedTemporaryToolsRef = useRef<RuntimeCanvasTool[]>([])
 
   useEffect(() => {
+    const pressTemporaryTool = (tool: RuntimeCanvasTool) => {
+      const pressedTools = pressedTemporaryToolsRef.current.filter((item) => item !== tool)
+      pressedTools.push(tool)
+      pressedTemporaryToolsRef.current = pressedTools
+      setTemporaryTool(tool)
+    }
+
+    const releaseTemporaryTool = (tool: RuntimeCanvasTool) => {
+      const pressedTools = pressedTemporaryToolsRef.current.filter((item) => item !== tool)
+      pressedTemporaryToolsRef.current = pressedTools
+      setTemporaryTool(pressedTools.at(-1))
+    }
+
+    const resetTemporaryTools = () => {
+      pressedTemporaryToolsRef.current = []
+      setTemporaryTool(undefined)
+    }
+
     const handleKeyDown = (event: KeyboardEvent) => {
       if (isEditingTarget(event.target)) return
 
       const store = useCanvasStore.getState()
       const modifier = event.metaKey || event.ctrlKey
       const key = event.key.toLowerCase()
+      setZoomOutCursor(event.altKey || event.key === 'Alt')
 
       if (event.code === 'Space') {
         event.preventDefault()
-        if (!event.repeat) setTemporaryTool('hand')
+        if (!event.repeat) pressTemporaryTool('hand')
+        return
+      }
+
+      if (event.code === 'KeyZ' && !modifier && !event.repeat) {
+        event.preventDefault()
+        pressTemporaryTool('zoom')
         return
       }
 
@@ -80,6 +110,7 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
         resetGroupTransform()
         resetTextAnnotation()
         resetBrushStamp()
+        resetZoomGesture()
         setEditingTextNodeId(undefined)
         setSnapGuides([])
         setActiveConnectorDropTargetId(undefined)
@@ -102,7 +133,19 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
 
       if (modifier && event.code === 'Digit0') {
         event.preventDefault()
-        resetView()
+        zoomTo(1)
+        return
+      }
+
+      if (!modifier && !event.altKey && (event.key === '=' || event.key === '+' || event.code === 'Equal' || event.code === 'NumpadAdd')) {
+        event.preventDefault()
+        zoomBy(1.12)
+        return
+      }
+
+      if (!modifier && !event.altKey && (event.key === '-' || event.code === 'Minus' || event.code === 'NumpadSubtract')) {
+        event.preventDefault()
+        zoomBy(1 / 1.12)
         return
       }
 
@@ -211,20 +254,29 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
     }
 
     const handleKeyUp = (event: KeyboardEvent) => {
+      setZoomOutCursor(event.altKey && event.key !== 'Alt')
+
       if (event.code === 'Space') {
         event.preventDefault()
-        setTemporaryTool(undefined)
+        releaseTemporaryTool('hand')
+      }
+
+      if (event.code === 'KeyZ') {
+        event.preventDefault()
+        releaseTemporaryTool('zoom')
       }
     }
 
     const handleWindowBlur = () => {
-      setTemporaryTool(undefined)
+      resetTemporaryTools()
+      setZoomOutCursor(false)
       resetPan()
       resetMarquee()
       resetNodeTransform()
       resetGroupTransform()
       resetTextAnnotation()
       resetBrushStamp()
+      resetZoomGesture()
       setEditingTextNodeId(undefined)
       setActiveConnectorDropTargetId(undefined)
     }
@@ -288,12 +340,14 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
     resetNodeTransform,
     resetPan,
     resetTextAnnotation,
-    resetView,
+    resetZoomGesture,
     setActiveConnectorDropTargetId,
     setEditingTextNodeId,
     setSnapGuides,
     setTemporaryTool,
+    setZoomOutCursor,
     viewportCenter,
     zoomBy,
+    zoomTo,
   ])
 }

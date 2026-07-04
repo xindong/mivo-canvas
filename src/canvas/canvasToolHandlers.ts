@@ -9,6 +9,7 @@ type ResizeHandlePointerEvent = ReactPointerEvent<HTMLButtonElement>
 export type CanvasToolHandlerContext = {
   beginPan: (event: CanvasSurfacePointerEvent) => void
   beginSelection: (event: CanvasSurfacePointerEvent) => void
+  beginZoomGesture: (event: CanvasSurfacePointerEvent | CanvasNodePointerEvent | ResizeHandlePointerEvent) => void
   beginNodeMove: (nodeId: string, event: CanvasNodePointerEvent) => void
   beginNodeResize: (nodeId: string, corner: ResizeCorner, event: ResizeHandlePointerEvent) => void
   beginTextBox: (event: CanvasSurfacePointerEvent) => void
@@ -148,6 +149,27 @@ const stampToolHandler: CanvasToolHandler = {
   },
 }
 
+const zoomToolHandler: CanvasToolHandler = {
+  id: 'zoom',
+  onCanvasPointerDown: (event, context) => {
+    if (event.button !== 0) return
+
+    context.beginZoomGesture(event)
+  },
+  onNodePointerDown: (_nodeId, event, context) => {
+    if (event.button !== 0) return
+
+    event.stopPropagation()
+    context.beginZoomGesture(event)
+  },
+  onResizeHandlePointerDown: (_nodeId, _corner, event, context) => {
+    if (event.button !== 0) return
+
+    event.stopPropagation()
+    context.beginZoomGesture(event)
+  },
+}
+
 export const canvasToolHandlers: Record<RuntimeCanvasTool, CanvasToolHandler> = {
   select: selectToolHandler,
   hand: handToolHandler,
@@ -155,4 +177,5 @@ export const canvasToolHandlers: Record<RuntimeCanvasTool, CanvasToolHandler> = 
   frame: frameToolHandler,
   markup: markupToolHandler,
   stamp: stampToolHandler,
+  zoom: zoomToolHandler,
 }

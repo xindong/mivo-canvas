@@ -2,8 +2,6 @@ import {
   ArrowUpRight,
   Circle,
   Hand,
-  ImagePlus,
-  MessageSquare,
   Minus,
   MousePointer2,
   PanelTop,
@@ -12,7 +10,6 @@ import {
   SmilePlus,
   StickyNote,
   Type,
-  Video,
 } from 'lucide-react'
 import type { MarkupKind, ToolId } from '../types/mivoCanvas'
 import type { RuntimeCanvasTool } from './canvasInteraction'
@@ -140,31 +137,6 @@ export const canvasToolRegistry: CanvasToolDefinition[] = [
     group: 'create',
     runtimeTool: 'stamp',
     icon: SmilePlus,
-  },
-  {
-    id: 'comment',
-    label: 'Comment',
-    group: 'create',
-    runtimeTool: 'select',
-    enabled: false,
-    icon: MessageSquare,
-  },
-  {
-    id: 'image',
-    label: 'Image',
-    group: 'media',
-    runtimeTool: 'select',
-    dividerBefore: true,
-    enabled: false,
-    icon: ImagePlus,
-  },
-  {
-    id: 'video',
-    label: 'Video',
-    group: 'media',
-    runtimeTool: 'select',
-    enabled: false,
-    icon: Video,
   },
 ]
 

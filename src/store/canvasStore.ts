@@ -369,7 +369,7 @@ export const migratePersistedState = (persistedState: unknown, persistedVersion 
     tasks: activeDocument.tasks,
     selectedNodeId: selection.selectedNodeId,
     selectedNodeIds: selection.selectedNodeIds,
-    activeTool: persisted.activeTool || 'select',
+    activeTool: ['comment', 'image', 'video'].includes(String(persisted.activeTool)) ? 'select' : persisted.activeTool || 'select',
     clipboardNodes: [],
     clipboardAssets: [],
     // Version 8 introduced the black default and eraser mode; older persisted styles reset to the new default.

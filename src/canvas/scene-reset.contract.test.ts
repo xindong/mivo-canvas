@@ -25,9 +25,9 @@ import { describe, expect, it } from 'vitest'
 import controllerSource from './useCanvasInteractionController.ts?raw'
 
 // The registered hooks' reset functions that MUST be called on every scene reset.
-// Source of truth: the 6 interaction hooks that own mutable interaction state
+// Source of truth: the 7 interaction hooks that own mutable interaction state
 // (viewport pan/zoom, marquee selection, node transform, group transform, text
-// annotation, brush stamp). Global canvas events (useGlobalCanvasEvents) takes the
+// annotation, brush stamp, zoom tool). Global canvas events (useGlobalCanvasEvents) takes the
 // resets as args — it doesn't own a reset of its own. The plain setState calls
 // (setSnapGuides([]), setActiveSectionDropTargetId, etc.) are not hooks and are
 // not part of this contract.
@@ -38,6 +38,7 @@ const EXPECTED_SCENE_RESETS = [
   'resetGroupTransform',
   'resetTextAnnotation',
   'resetBrushStamp',
+  'resetZoomGesture',
 ] as const
 
 // Extract the scene-reset useEffect body. Located by the "Scene reset:" marker

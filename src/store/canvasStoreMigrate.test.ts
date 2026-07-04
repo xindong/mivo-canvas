@@ -187,5 +187,10 @@ describe('migratePersistedState (canvas persist v8)', () => {
       const result = migratePersistedState({ activeTool: 'brush' } as never, 8)
       expect(result.activeTool).toBe('brush')
     })
+
+    it.each(['comment', 'image', 'video'])('falls back from removed activeTool "%s"', (activeTool) => {
+      const result = migratePersistedState({ activeTool } as never, 8)
+      expect(result.activeTool).toBe('select')
+    })
   })
 })

@@ -3016,6 +3016,18 @@ button:disabled {
   cursor: text;
 }
 
+.canvas-shell.tool-zoom,
+.canvas-shell.tool-zoom .dom-canvas-layer,
+.canvas-shell.tool-zoom .dom-node {
+  cursor: zoom-in;
+}
+
+.canvas-shell.tool-zoom.zoom-out-cursor,
+.canvas-shell.tool-zoom.zoom-out-cursor .dom-canvas-layer,
+.canvas-shell.tool-zoom.zoom-out-cursor .dom-node {
+  cursor: zoom-out;
+}
+
 .canvas-shell.is-panning .dom-canvas-layer,
 .canvas-shell.is-panning .dom-node {
   cursor: grabbing;
@@ -3483,6 +3495,14 @@ button:disabled {
   pointer-events: none;
   background: rgba(105, 87, 232, 0.1);
   border: solid rgba(105, 87, 232, 0.72);
+}
+
+.zoom-marquee {
+  position: absolute;
+  z-index: 24;
+  pointer-events: none;
+  background: rgba(105, 87, 232, 0.1);
+  border: 1px solid rgba(105, 87, 232, 0.72);
 }
 
 .text-creation-box {
