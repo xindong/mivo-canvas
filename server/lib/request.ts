@@ -129,6 +129,11 @@ export const logTaskTerminal = (info: {
   requestId: string
   kind: string
   model: string
+  quality?: string
+  imgRatio?: string
+  resolution?: string
+  pollDeadlineMs?: number
+  platformJobIdHash?: string
   hasMask: boolean
   hasReferences: boolean
   channel: string
@@ -140,10 +145,16 @@ export const logTaskTerminal = (info: {
 }): void => {
   const parts = [
     '[mivo-bff-task]',
+    `ts=${new Date().toISOString()}`,
     `taskId=${info.taskId}`,
     `rid=${info.requestId}`,
     `kind=${info.kind}`,
     `model=${info.model}`,
+    info.quality ? `quality=${info.quality}` : '',
+    info.imgRatio ? `imgRatio=${info.imgRatio}` : '',
+    info.resolution ? `resolution=${info.resolution}` : '',
+    info.pollDeadlineMs !== undefined ? `pollDeadlineMs=${info.pollDeadlineMs}` : '',
+    info.platformJobIdHash ? `platformJobIdHash=${info.platformJobIdHash}` : '',
     `hasMask=${info.hasMask ? 'true' : 'false'}`,
     `hasReferences=${info.hasReferences ? 'true' : 'false'}`,
     `channel=${info.channel}`,

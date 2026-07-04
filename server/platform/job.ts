@@ -4,7 +4,7 @@
 // to the response directly — the Hono handler maps result → c.json(body, status)).
 import { Buffer } from 'node:buffer'
 import type { PlatformCtx } from '../lib/config'
-import { getEnvConfig } from '../lib/config'
+import { getEnvConfig, resolveMivoPlatformPollDeadlineMs } from '../lib/config'
 import { mivoPlatformEnsureChatSession, mivoPlatformFetch, sanitizePlatformError } from './state'
 
 export const MIVO_PLATFORM_CHANNELS: Record<string, { modelType: string; version: string }> = {
@@ -21,10 +21,16 @@ export type PlatformJobParams = {
   payload: Record<string, unknown>
 }
 
+export type PlatformJobMetadata = {
+  resolution?: string
+  pollDeadlineMs?: number
+  platformJobIdHash?: string
+}
+
 export type PlatformJobResult =
-  | { status: 200; body: { images: Array<{ b64: string }> } }
-  | { status: 504; body: { error: string } }
-  | { status: 502; body: { error: string } }
+  | { status: 200; body: { images: Array<{ b64: string }> }; metadata?: PlatformJobMetadata }
+  | { status: 504; body: { error: string }; metadata?: PlatformJobMetadata }
+  | { status: 502; body: { error: string }; metadata?: PlatformJobMetadata }
   | { aborted: true }
 
 // P2-C1a: progress reporting hook. Optional; #24's sync callers pass nothing
@@ -32,6 +38,73 @@ export type PlatformJobResult =
 // task registry. progress is 0-100, monotonic by contract (the registry clamps).
 export type ProgressReport = { stage: string; progress: number }
 export type OnProgress = (report: ProgressReport) => void
+
+const platformRetryBackoffMs = 1_000
+const transientPlatformErrorPattern =
+  /ClosedChannelException|ECONNRESET|ECONNABORTED|EPIPE|ETIMEDOUT|connection reset|socket hang up|fetch failed|network error|terminated|UND_ERR/i
+
+class PlatformHttpError extends Error {
+  status: number
+
+  constructor(operation: string, status: number, bodyText = '') {
+    const sanitized = sanitizePlatformError(bodyText)
+    super(`platform ${operation} ${status}${sanitized ? `: ${sanitized}` : ''}`)
+    this.name = 'PlatformHttpError'
+    this.status = status
+  }
+}
+
+const shortPlatformJobId = (jobId: string): string => jobId.slice(-8)
+
+const platformResponseError = async (operation: string, res: Response): Promise<PlatformHttpError> =>
+  new PlatformHttpError(operation, res.status, await res.text().catch(() => ''))
+
+const isRetriablePlatformError = (error: unknown): boolean => {
+  if (error instanceof PlatformHttpError) {
+    return error.status >= 500 && error.status < 600 && error.status !== 504
+  }
+  if (error instanceof Error && error.name === 'AbortError') return false
+  const text =
+    error instanceof Error
+      ? `${error.message} ${String((error as Error & { cause?: unknown }).cause || '')}`
+      : String(error)
+  return transientPlatformErrorPattern.test(text)
+}
+
+const waitForPlatformRetry = async (signal?: AbortSignal): Promise<void> => {
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(resolve, platformRetryBackoffMs)
+    const onAbort = () => {
+      clearTimeout(timeout)
+      reject(new DOMException('Aborted', 'AbortError'))
+    }
+    if (signal?.aborted) {
+      onAbort()
+      return
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+const logPlatformTransientRetry = (operation: string, error: unknown): void => {
+  const reason = sanitizePlatformError(error instanceof Error ? error.message : String(error))
+  console.log(`[mivo-bff] event=platform-transient-retry operation=${operation} attempt=2 reason=${reason}`)
+}
+
+const withPlatformTransientRetry = async <T>(
+  operation: string,
+  signal: AbortSignal | undefined,
+  run: () => Promise<T>,
+): Promise<T> => {
+  try {
+    return await run()
+  } catch (error) {
+    if (signal?.aborted || !isRetriablePlatformError(error)) throw error
+    logPlatformTransientRetry(operation, error)
+    await waitForPlatformRetry(signal)
+    return run()
+  }
+}
 
 export const resolveMivoPlatformPayload = (
   modelId: string,
@@ -74,8 +147,7 @@ export const mivoPlatformSubmitMessage = async (
     signal,
   )
   if (!res.ok) {
-    const text = await res.text().catch(() => '')
-    throw new Error(`platform submit ${res.status}: ${sanitizePlatformError(text)}`)
+    throw await platformResponseError('submit', res)
   }
   const json = (await res.json()) as { object_id?: string; jobId?: string }
   const jobId = json.object_id || json.jobId
@@ -95,8 +167,10 @@ export const mivoPlatformPollJob = async (
   jobId: string,
   signal?: AbortSignal,
   onProgress?: OnProgress,
+  pollDeadlineMs?: number,
 ): Promise<PollResult> => {
-  const { platformPollDeadlineMs, platformPollIntervalMs } = getEnvConfig()
+  const { platformPollIntervalMs } = getEnvConfig()
+  const platformPollDeadlineMs = pollDeadlineMs ?? resolveMivoPlatformPollDeadlineMs('1K')
   const t0 = Date.now()
   let lastStatus: string | null = null
   while (Date.now() - t0 < platformPollDeadlineMs) {
@@ -111,7 +185,7 @@ export const mivoPlatformPollJob = async (
       ctx,
       signal,
     )
-    if (!res.ok) throw new Error(`platform poll ${res.status}`)
+    if (!res.ok) throw await platformResponseError('poll', res)
     const json = (await res.json()) as {
       content?: { status?: string; state?: string; images?: string[]; error?: string; message?: string }
       status?: string
@@ -146,7 +220,7 @@ export const mivoPlatformDownloadImage = async (
     ctx,
     signal,
   )
-  if (!signRes.ok) throw new Error(`platform signUrl ${signRes.status}`)
+  if (!signRes.ok) throw await platformResponseError('signUrl', signRes)
   let signedUrl = (await signRes.text()).trim()
   if (signedUrl.startsWith('"') && signedUrl.endsWith('"')) signedUrl = signedUrl.slice(1, -1)
   if (signedUrl.startsWith('{')) {
@@ -157,7 +231,7 @@ export const mivoPlatformDownloadImage = async (
   if (signedUrl.startsWith('//')) signedUrl = `https:${signedUrl}`
   if (!signedUrl.startsWith('http')) throw new Error('platform signUrl not a url')
   const imgRes = await fetch(signedUrl, { signal })
-  if (!imgRes.ok) throw new Error(`platform download ${imgRes.status}`)
+  if (!imgRes.ok) throw new PlatformHttpError('download', imgRes.status)
   return Buffer.from(await imgRes.arrayBuffer())
 }
 
@@ -167,29 +241,71 @@ export const mivoPlatformUploadOne = async (
   signal?: AbortSignal,
 ): Promise<string> => {
   const buf = Buffer.from(await file.arrayBuffer())
-  const blob = new Blob([buf], { type: file.type || 'image/png' })
-  const form = new FormData()
-  form.append('file', blob, file.name || 'reference.png')
-  const res = await mivoPlatformFetch(
-    `${ctx.platformEndpoint}/api/v1/file/`,
-    { method: 'POST', body: form },
-    ctx,
-    signal,
-  )
-  if (!res.ok) throw new Error(`platform upload ${res.status}`)
-  const json = (await res.json()) as unknown
-  const arr = (Array.isArray(json)
-    ? json
-    : (json as { files?: unknown[]; data?: unknown[] })?.files ||
-      (json as { data?: unknown[] })?.data ||
-      [json]) as Array<{ object_id?: string; _id?: string }>
-  const id =
-    arr[0]?.object_id ||
-    arr[0]?._id ||
-    (json as { object_id?: string; _id?: string })?.object_id ||
-    (json as { _id?: string })?._id
-  if (!id) throw new Error('platform upload no file id')
-  return id
+  return withPlatformTransientRetry('upload', signal, async () => {
+    const blob = new Blob([buf], { type: file.type || 'image/png' })
+    const form = new FormData()
+    form.append('file', blob, file.name || 'reference.png')
+    const res = await mivoPlatformFetch(
+      `${ctx.platformEndpoint}/api/v1/file/`,
+      { method: 'POST', body: form },
+      ctx,
+      signal,
+    )
+    if (!res.ok) throw await platformResponseError('upload', res)
+    const json = (await res.json()) as unknown
+    const arr = (Array.isArray(json)
+      ? json
+      : (json as { files?: unknown[]; data?: unknown[] })?.files ||
+        (json as { data?: unknown[] })?.data ||
+        [json]) as Array<{ object_id?: string; _id?: string }>
+    const id =
+      arr[0]?.object_id ||
+      arr[0]?._id ||
+      (json as { object_id?: string; _id?: string })?.object_id ||
+      (json as { _id?: string })?._id
+    if (!id) throw new Error('platform upload no file id')
+    return id
+  })
+}
+
+const runMivoPlatformImageJobOnce = async (
+  ctx: PlatformCtx,
+  params: PlatformJobParams,
+  signal: AbortSignal | undefined,
+  onProgress: OnProgress | undefined,
+  metadata: PlatformJobMetadata,
+): Promise<PlatformJobResult> => {
+  onProgress?.({ stage: 'submit', progress: 10 })
+  const jobId = await mivoPlatformSubmitMessage(ctx, params, signal)
+  metadata.platformJobIdHash = shortPlatformJobId(jobId)
+  const poll = await mivoPlatformPollJob(ctx, jobId, signal, onProgress, metadata.pollDeadlineMs)
+  if (poll.status === 'aborted') return { aborted: true }
+  if (poll.status === 'timeout') {
+    const isHigh = params.payload.resolution === '2K'
+    return {
+      status: 504,
+      body: {
+        error: isHigh
+          ? '上游生成超时，可降低质量重试'
+          : '上游生成超时，可稍后重试、换比例或减少参考图',
+      },
+      metadata,
+    }
+  }
+  if (poll.status === 'failed') {
+    if (isRetriablePlatformError(new Error(poll.error || 'platform poll failed'))) {
+      throw new Error(poll.error || 'platform poll failed')
+    }
+    return { status: 502, body: { error: poll.error || '生成失败' }, metadata }
+  }
+  const imgPath = poll.images?.[0]
+  if (!imgPath) {
+    return { status: 502, body: { error: '生成失败：结果为空' }, metadata }
+  }
+  onProgress?.({ stage: 'download', progress: 95 })
+  const buf = await mivoPlatformDownloadImage(ctx, imgPath, signal)
+  onProgress?.({ stage: 'done', progress: 100 })
+  return { status: 200, body: { images: [{ b64: buf.toString('base64') }] }, metadata }
 }
 
 // Platform image job runner: submit + poll + download + normalize {images:[{b64}]}.
@@ -202,38 +318,33 @@ export const runMivoPlatformImageJob = async (
   signal?: AbortSignal,
   onProgress?: OnProgress,
 ): Promise<PlatformJobResult> => {
-  try {
-    onProgress?.({ stage: 'submit', progress: 10 })
-    const jobId = await mivoPlatformSubmitMessage(ctx, params, signal)
-    const poll = await mivoPlatformPollJob(ctx, jobId, signal, onProgress)
-    if (poll.status === 'aborted') return { aborted: true }
-    if (poll.status === 'timeout') {
-      const isHigh = params.payload.resolution === '2K'
+  const resolution = String(params.payload.resolution || '1K')
+  let metadata: PlatformJobMetadata = {
+    resolution,
+    pollDeadlineMs: resolveMivoPlatformPollDeadlineMs(params.payload.resolution),
+  }
+  return withPlatformTransientRetry('image-job', signal, async () => {
+    try {
+      metadata = {
+        resolution,
+        pollDeadlineMs: resolveMivoPlatformPollDeadlineMs(params.payload.resolution),
+      }
+      return await runMivoPlatformImageJobOnce(ctx, params, signal, onProgress, metadata)
+    } catch (error) {
+      if (signal?.aborted) return { aborted: true as const }
+      if (isRetriablePlatformError(error)) throw error
       return {
-        status: 504,
-        body: {
-          error: isHigh
-            ? '上游生成超时，可降低质量重试'
-            : '上游生成超时，可稍后重试、换比例或减少参考图',
-        },
+        status: 502 as const,
+        body: { error: sanitizePlatformError(error instanceof Error ? error.message : '生成失败') },
+        metadata,
       }
     }
-    if (poll.status === 'failed') {
-      return { status: 502, body: { error: poll.error || '生成失败' } }
-    }
-    const imgPath = poll.images?.[0]
-    if (!imgPath) {
-      return { status: 502, body: { error: '生成失败：结果为空' } }
-    }
-    onProgress?.({ stage: 'download', progress: 95 })
-    const buf = await mivoPlatformDownloadImage(ctx, imgPath, signal)
-    onProgress?.({ stage: 'done', progress: 100 })
-    return { status: 200, body: { images: [{ b64: buf.toString('base64') }] } }
-  } catch (error) {
-    if (signal?.aborted) return { aborted: true }
+  }).catch((error) => {
+    if (signal?.aborted) return { aborted: true as const }
     return {
-      status: 502,
+      status: 502 as const,
       body: { error: sanitizePlatformError(error instanceof Error ? error.message : '生成失败') },
+      metadata,
     }
-  }
+  })
 }

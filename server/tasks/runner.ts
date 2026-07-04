@@ -51,6 +51,11 @@ const progressSink = (taskId: string): OnProgress => (report) => updateProgress(
 type TaskLogContext = {
   record: TaskRecord
   model: string
+  quality?: string
+  imgRatio?: string
+  resolution?: string
+  pollDeadlineMs?: number
+  platformJobIdHash?: string
   hasMask: boolean
   hasReferences: boolean
   channel: 'platform' | 'llm-proxy'
@@ -75,6 +80,11 @@ const logTerminal = (
     requestId: context.record.requestId,
     kind: context.record.kind,
     model: context.model,
+    quality: context.quality,
+    imgRatio: context.imgRatio,
+    resolution: context.resolution,
+    pollDeadlineMs: context.pollDeadlineMs,
+    platformJobIdHash: context.platformJobIdHash,
     hasMask: context.hasMask,
     hasReferences: context.hasReferences,
     channel: context.channel,
@@ -162,6 +172,7 @@ export const runGenerateTask = async (taskId: string, params: GenerateParams): P
   const logContext: TaskLogContext = {
     record,
     model,
+    quality,
     hasMask: false,
     hasReferences: false,
     channel,
@@ -178,9 +189,14 @@ export const runGenerateTask = async (taskId: string, params: GenerateParams): P
         return
       }
       const { modelType, modelFormat, payload } = resolveMivoPlatformPayload(model, params.imgRatio, quality, params.prompt)
+      logContext.imgRatio = typeof payload.imgRatio === 'string' ? payload.imgRatio : undefined
+      logContext.resolution = typeof payload.resolution === 'string' ? payload.resolution : undefined
       const result = await runMivoPlatformImageJob(platformCtx, { modelType, modelFormat, payload }, record.controller.signal, progressSink(taskId))
       if (canceledInFlight(taskId)) return
       if ('aborted' in result) return // abort without explicit cancel — leave as-is (no commit)
+      logContext.pollDeadlineMs = result.metadata?.pollDeadlineMs
+      logContext.platformJobIdHash = result.metadata?.platformJobIdHash
+      logContext.resolution = result.metadata?.resolution || logContext.resolution
       if (result.status === 200) {
         completeTaskLogged(taskId, result.body, logContext)
         return
@@ -240,6 +256,7 @@ export const runEditTask = async (taskId: string, params: EditParams): Promise<v
   const logContext: TaskLogContext = {
     record,
     model,
+    quality,
     hasMask: Boolean(mask),
     hasReferences: params.references.length > 0,
     channel: usePlatform ? 'platform' : 'llm-proxy',
@@ -271,9 +288,14 @@ export const runEditTask = async (taskId: string, params: EditParams): Promise<v
       }
       if (canceledInFlight(taskId)) return
       const { modelType, modelFormat, payload } = resolveMivoPlatformPayload(model, params.imgRatio, quality, params.prompt, fileIds)
+      logContext.imgRatio = typeof payload.imgRatio === 'string' ? payload.imgRatio : undefined
+      logContext.resolution = typeof payload.resolution === 'string' ? payload.resolution : undefined
       const result = await runMivoPlatformImageJob(platformCtx, { modelType, modelFormat, payload }, record.controller.signal, progressSink(taskId))
       if (canceledInFlight(taskId)) return
       if ('aborted' in result) return
+      logContext.pollDeadlineMs = result.metadata?.pollDeadlineMs
+      logContext.platformJobIdHash = result.metadata?.platformJobIdHash
+      logContext.resolution = result.metadata?.resolution || logContext.resolution
       if (result.status === 200) {
         completeTaskLogged(taskId, result.body, logContext)
         return

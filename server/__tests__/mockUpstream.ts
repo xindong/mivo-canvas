@@ -18,11 +18,13 @@ export type MockState = {
   editCalls: number
   enhanceCalls: number
   lastEditBodyText: string
+  lastEnhanceBodyText: string
   // configurable responses
   tokenStatus: number
   chatStatus: number
   chat401Once: boolean
   submitStatus: number
+  submitStatusSequence: number[]
   pollFailMode: 'none' | '401-once' | '401-always'
   pollSequence: string[]
   pollImages: string[]
@@ -60,10 +62,12 @@ export const defaultMockState = (): MockState => ({
   editCalls: 0,
   enhanceCalls: 0,
   lastEditBodyText: '',
+  lastEnhanceBodyText: '',
   tokenStatus: 200,
   chatStatus: 200,
   chat401Once: false,
   submitStatus: 200,
+  submitStatusSequence: [],
   pollFailMode: 'none',
   pollSequence: ['pending', 'completed'],
   pollImages: ['/dl/img-1'],
@@ -143,8 +147,9 @@ async function handle(state: MockState, req: IncomingMessage, res: ServerRespons
   }
   if (path === '/api/v1/message' && method === 'POST') {
     state.submitCalls += 1
-    if (state.submitStatus !== 200) {
-      send(res, state.submitStatus, {})
+    const submitStatus = state.submitStatusSequence[state.submitCalls - 1] ?? state.submitStatus
+    if (submitStatus !== 200) {
+      send(res, submitStatus, {})
       return
     }
     send(res, 200, { object_id: 'job-1' })
@@ -223,6 +228,7 @@ async function handle(state: MockState, req: IncomingMessage, res: ServerRespons
   }
   if (path === '/v1/chat/completions' && method === 'POST') {
     state.enhanceCalls += 1
+    state.lastEnhanceBodyText = (await readBody(req)).toString('utf8')
     if (state.enhanceDelayMs) await new Promise((r) => setTimeout(r, state.enhanceDelayMs))
     if (state.enhanceStatus !== 200) {
       send(res, state.enhanceStatus, { error: { message: 'enhance failed' } })

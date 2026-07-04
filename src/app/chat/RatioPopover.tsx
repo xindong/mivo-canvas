@@ -46,13 +46,12 @@ export function RatioPopover({ id, anchorRef, onClose }: RatioPopoverProps) {
   const ratios = ['auto', ...capabilities.ratios]
   const qualities = qualityOptions.filter((quality) => quality === 'auto' || capabilities.qualities.includes(quality))
 
-  // 审查 B（Step 4b）：gemini 经 mivo 平台，质量→分辨率映射 low/medium=1K、high=2K；
-  // 在质量项 title 上标注分辨率，避免 medium 误以为可"降质"（与 1K 同档）
+  // Platform image models map low/medium to 1K and high to 2K.
   const qualityTitleFor = (quality: string): string | undefined => {
-    if (selectedModel !== 'gemini-3-pro-image') return undefined
+    if (selectedModel !== 'gemini-3-pro-image' && selectedModel !== 'gpt-image-2') return undefined
     const resolutionMap: Record<string, string> = { high: '2K', medium: '1K', low: '1K' }
     const res = resolutionMap[quality]
-    return res ? `${qualityDisplayLabel(quality)}质量（${res}）` : undefined
+    return res ? `${qualityDisplayLabel(quality)}质量（${res}${quality === 'high' ? '，更耗时' : ''}）` : undefined
   }
 
   useEffect(() => {

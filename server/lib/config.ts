@@ -34,6 +34,7 @@ export type MivoImageRatio = keyof typeof mivoImageSizeMap
 export type MivoImageQuality = keyof (typeof mivoImageSizeMap)['1:1']
 export type MivoImageResponse = { images: Array<{ b64: string }> }
 export type PlatformCtx = { platformKey: string; platformEndpoint: string }
+export type MivoPlatformResolution = '1K' | '2K'
 
 // ─── Env-derived config (lazy; tests override via process.env) ───────────────
 export type MivoEnvConfig = {
@@ -48,6 +49,7 @@ export type MivoEnvConfig = {
   enhancePrimaryTimeoutMs: number
   enhanceFallbackTimeoutMs: number
   platformPollDeadlineMs: number
+  platformPollDeadlineByResolutionMs: Record<MivoPlatformResolution, number>
   platformPollIntervalMs: number
   jsonRequestMaxBytes: number
   imageRequestMaxBytes: number
@@ -63,24 +65,45 @@ const num = (value: string | undefined, fallback: number): number => {
   return Number.isFinite(n) && n > 0 ? n : fallback
 }
 
-export const getEnvConfig = (): MivoEnvConfig => ({
-  imageApiKey: process.env.MIVO_IMAGE_API_KEY || '',
-  llmApiKey: process.env.MIVO_LLM_API_KEY || process.env.MIVO_IMAGE_API_KEY || '',
-  platformKey: process.env.MIVO_PLATFORM_KEY || '',
-  platformEndpoint: (process.env.MIVO_PLATFORM_ENDPOINT || 'https://aigc.xindong.com').replace(/\/$/, ''),
-  // Upstream URLs (env-overridable for tests; defaults match dev middleware exactly)
-  imageApiBase: process.env.MIVO_IMAGE_API_BASE || 'https://llm-proxy.tapsvc.com/v1/images',
-  llmApiBase: process.env.MIVO_LLM_API_BASE || 'https://llm-proxy.tapsvc.com/v1',
-  // Timeouts (env-overridable for tests; defaults match dev middleware)
-  upstreamTimeoutMs: num(process.env.MIVO_UPSTREAM_TIMEOUT_MS, 240_000),
-  editUpstreamTimeoutMs: num(process.env.MIVO_EDIT_UPSTREAM_TIMEOUT_MS, 180_000),
-  enhancePrimaryTimeoutMs: num(process.env.MIVO_ENHANCE_PRIMARY_TIMEOUT_MS, 8_000),
-  enhanceFallbackTimeoutMs: num(process.env.MIVO_ENHANCE_FALLBACK_TIMEOUT_MS, 8_000),
-  platformPollDeadlineMs: num(process.env.MIVO_PLATFORM_POLL_DEADLINE_MS, 175_000),
-  platformPollIntervalMs: num(process.env.MIVO_PLATFORM_POLL_INTERVAL_MS, 2_500),
-  // Body limits (env-overridable for tests; defaults match dev middleware)
-  jsonRequestMaxBytes: num(process.env.MIVO_JSON_REQUEST_MAX_BYTES, jsonRequestMaxBytes),
-  imageRequestMaxBytes: num(process.env.MIVO_IMAGE_REQUEST_MAX_BYTES, imageRequestMaxBytes),
-  // P2-C2: variations concurrency cap (default 4; e2e may lower to 1).
-  variationsConcurrency: num(process.env.MIVO_VARIATIONS_CONCURRENCY, 4),
-})
+export const normalizeMivoPlatformResolution = (resolution: unknown): MivoPlatformResolution =>
+  resolution === '2K' ? '2K' : '1K'
+
+export const getEnvConfig = (): MivoEnvConfig => {
+  const platformPollDeadlineOverride = num(process.env.MIVO_PLATFORM_POLL_DEADLINE_MS, 0)
+  const platformPollDeadlineByResolutionMs: Record<MivoPlatformResolution, number> = {
+    '1K': num(process.env.MIVO_PLATFORM_POLL_DEADLINE_1K_MS, platformPollDeadlineOverride || 240_000),
+    '2K': num(process.env.MIVO_PLATFORM_POLL_DEADLINE_2K_MS, platformPollDeadlineOverride || 300_000),
+  }
+  return {
+    imageApiKey: process.env.MIVO_IMAGE_API_KEY || '',
+    llmApiKey: process.env.MIVO_LLM_API_KEY || process.env.MIVO_IMAGE_API_KEY || '',
+    platformKey: process.env.MIVO_PLATFORM_KEY || '',
+    platformEndpoint: (process.env.MIVO_PLATFORM_ENDPOINT || 'https://aigc.xindong.com').replace(/\/$/, ''),
+    // Upstream URLs (env-overridable for tests; defaults match dev middleware exactly)
+    imageApiBase: process.env.MIVO_IMAGE_API_BASE || 'https://llm-proxy.tapsvc.com/v1/images',
+    llmApiBase: process.env.MIVO_LLM_API_BASE || 'https://llm-proxy.tapsvc.com/v1',
+    // Timeouts (env-overridable for tests; defaults match dev middleware)
+    upstreamTimeoutMs: num(process.env.MIVO_UPSTREAM_TIMEOUT_MS, 240_000),
+    editUpstreamTimeoutMs: num(process.env.MIVO_EDIT_UPSTREAM_TIMEOUT_MS, 180_000),
+    enhancePrimaryTimeoutMs: num(process.env.MIVO_ENHANCE_PRIMARY_TIMEOUT_MS, 8_000),
+    enhanceFallbackTimeoutMs: num(process.env.MIVO_ENHANCE_FALLBACK_TIMEOUT_MS, 8_000),
+    // Legacy scalar is the max effective deadline; platform polling resolves the
+    // tiered value by payload resolution.
+    platformPollDeadlineMs: Math.max(
+      platformPollDeadlineByResolutionMs['1K'],
+      platformPollDeadlineByResolutionMs['2K'],
+    ),
+    platformPollDeadlineByResolutionMs,
+    platformPollIntervalMs: num(process.env.MIVO_PLATFORM_POLL_INTERVAL_MS, 2_500),
+    // Body limits (env-overridable for tests; defaults match dev middleware)
+    jsonRequestMaxBytes: num(process.env.MIVO_JSON_REQUEST_MAX_BYTES, jsonRequestMaxBytes),
+    imageRequestMaxBytes: num(process.env.MIVO_IMAGE_REQUEST_MAX_BYTES, imageRequestMaxBytes),
+    // P2-C2: variations concurrency cap (default 4; e2e may lower to 1).
+    variationsConcurrency: num(process.env.MIVO_VARIATIONS_CONCURRENCY, 4),
+  }
+}
+
+export const resolveMivoPlatformPollDeadlineMs = (
+  resolution: unknown,
+  config: Pick<MivoEnvConfig, 'platformPollDeadlineByResolutionMs'> = getEnvConfig(),
+): number => config.platformPollDeadlineByResolutionMs[normalizeMivoPlatformResolution(resolution)]
