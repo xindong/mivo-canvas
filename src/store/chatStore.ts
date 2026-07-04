@@ -185,16 +185,30 @@ export type ChatPersistedState = {
   messagesByScene?: Record<string, ChatMessage[]>
 }
 
+// S04: 共用 sanitize helper——对 messagesByScene 的每个条目做 Array 校验，非数组条目
+// warn + drop，避免 .map 抛错让整个 migrate 崩掉（裸断言 → 单条损坏全盘丢数据）。
+// v>=2 与 v1 分支共用。
+const sanitizeMessagesByScene = (raw: unknown): Record<string, ChatMessage[]> => {
+  const result: Record<string, ChatMessage[]> = {}
+  for (const [sceneId, messages] of Object.entries((raw ?? {}) as Record<string, unknown>)) {
+    if (Array.isArray(messages)) result[sceneId] = messages as ChatMessage[]
+    else debugLogger.warn('Chat Store', `migrate 丢弃损坏会话 ${sceneId}（非数组）`)
+  }
+  return result
+}
+
 export const migrateChatPersistedState = (
   persistedState: unknown,
   version = 0,
 ): { selectedModel: string; paramOverrides: ChatParamOverrides; messagesByScene: Record<string, ChatMessage[]> } => {
   const state = (persistedState ?? {}) as ChatPersistedState
   if (version >= 2) {
-    return state as {
-      selectedModel: string
-      paramOverrides: ChatParamOverrides
-      messagesByScene: Record<string, ChatMessage[]>
+    // S04: v>=2 也走 sanitize + 形状回落（旧实现裸 `state as {...}` 对非数组
+    // messagesByScene 条目与缺失 selectedModel/paramOverrides 无防护）。
+    return {
+      selectedModel: state.selectedModel || 'gemini-3-pro-image',
+      paramOverrides: state.paramOverrides ?? { imgRatio: 'auto' as const, quality: 'auto' as const },
+      messagesByScene: sanitizeMessagesByScene(state.messagesByScene),
     }
   }
   // v1 → v2: gemini 能力表去 21:9，把老会话里不再支持的 ratio 收敛掉
@@ -212,8 +226,11 @@ export const migrateChatPersistedState = (
         : prevOverrides.imgRatio,
     quality: prevOverrides.quality,
   }
+  // S04: .map 前先过 sanitizeMessagesByScene——非数组条目 warn + drop，合法数组再
+  // 走 clampChatGenerationContext 收敛。
+  const sanitized = sanitizeMessagesByScene(state.messagesByScene)
   const messagesByScene: Record<string, ChatMessage[]> = {}
-  for (const [sceneId, messages] of Object.entries(state.messagesByScene ?? {})) {
+  for (const [sceneId, messages] of Object.entries(sanitized)) {
     messagesByScene[sceneId] = messages.map((msg) =>
       msg.generationContext
         ? { ...msg, generationContext: clampChatGenerationContext(msg.generationContext) }
