@@ -177,6 +177,91 @@ const withLegacyGeometry = (node: MivoCanvasNode, transform: CanvasNodeTransform
   transform,
 })
 
+// --- R01 fast-path predicate (commit #2) ---------------------------------------
+//
+// isNormalizedCanvasNodeV2 returns true when cloneCanvasNodeV2(node) would produce a
+// node value-equal to `node` itself — in which case normalize can return the SAME
+// reference (zero allocation) instead of rebuilding every sub-object. The predicate
+// mirrors each synthetic trigger condition of fillsForNode / strokesForNode /
+// assetForNode / relationsForNode so that any "half-normalized" or legacy-shaped node
+// falls through to the full rebuild. Shape checks (⓪) keep malformed fields (null /
+// non-array fills / non-object asset) on the full path, preserving the old behavior
+// (fills:null → normalized to undefined/synthetic; fills:{} → .map throws) instead of
+// silently swallowing them via the fast path.
+//
+// Locked-invariant tests in documentModelV2.test.ts cover: idempotency on already-
+// normalized nodes (toBe same reference), empty-array idempotency (fills:[] does NOT
+// trigger synthesis), semi-normalized guards, and malformed-field fallthrough.
+
+const isArrayOrUndefined = (value: unknown): boolean =>
+  value === undefined || Array.isArray(value)
+
+const isPlainObjectOrUndefined = (value: unknown): boolean =>
+  value === undefined || (typeof value === 'object' && value !== null && !Array.isArray(value))
+
+const isNormalizedCanvasNodeV2 = (node: MivoCanvasNode): boolean => {
+  // ⓪ semantic field shape checks — violators go to the full path (reproduces old behavior)
+  if (
+    !isArrayOrUndefined(node.fills) ||
+    !isArrayOrUndefined(node.strokes) ||
+    !isArrayOrUndefined(node.effects)
+  ) {
+    return false
+  }
+  if (
+    !isPlainObjectOrUndefined(node.asset) ||
+    !isPlainObjectOrUndefined(node.relations) ||
+    !isPlainObjectOrUndefined(node.layout) ||
+    !isPlainObjectOrUndefined(node.constraints)
+  ) {
+    return false
+  }
+
+  // ① transform present, rotation is a number, and legacy x/y/w/h mirror it
+  //    (guards against half-normalized: transform present but legacy x stale)
+  const t = node.transform
+  if (!t || typeof t.rotation !== 'number') return false
+  if (t.x !== node.x || t.y !== node.y || t.width !== node.width || t.height !== node.height) {
+    return false
+  }
+
+  // ② when fills is absent, no legacy field that would trigger synthesis may remain
+  //    (mirrors fillsForNode:82-123). Note `!node.fills` (truthiness) — empty array []
+  //    is treated as "already normalized", matching the old path's `if (node.fills)` early return.
+  if (!node.fills) {
+    if ((node.type === 'image' || node.type === 'task-placeholder') && node.assetUrl) return false
+    if (node.type === 'frame' && node.sectionFillColor) return false
+    if (node.type === 'markup' && node.markupFillColor) return false
+  }
+
+  // ③ when strokes is absent, no synthesis trigger may remain (mirrors strokesForNode:125-155)
+  if (!node.strokes) {
+    if (node.type === 'frame' && (node.sectionBorderColor || node.frameColor || node.sectionBorderWidth)) {
+      return false
+    }
+    if (node.type === 'markup' && (node.markupStrokeColor || node.markupStrokeWidth)) return false
+  }
+
+  // ④ asset absent but legacy assetUrl present → needs synthesis (mirrors assetForNode:70-80)
+  if (!node.asset && node.assetUrl) return false
+
+  // ⑤ relations absent but any legacy relation field present → needs synthesis
+  //   (mirrors relationsForNode:157-169)
+  if (
+    !node.relations &&
+    (node.parentIds ||
+      node.sectionId ||
+      node.targetNodeId ||
+      node.connectorStart ||
+      node.connectorEnd ||
+      node.aiWorkflow)
+  ) {
+    return false
+  }
+
+  return true
+}
+
 // Clone entry: always full rebuild + shallow-clone every sub-object. Clone semantics
 // are byte-for-byte identical to the pre-split normalizeCanvasNodeV2 body — history /
 // clipboard / persist consumers that rely on "clone always produces new sub-objects"
@@ -201,15 +286,14 @@ export const cloneCanvasNodeV2 = (node: MivoCanvasNode): MivoCanvasNode => {
   )
 }
 
-// Normalize entry. Commit #1: delegates directly to cloneCanvasNodeV2 — zero behavior
-// change versus the pre-split single function. Commit #2 adds the
-// isNormalizedCanvasNodeV2 fast-path predicate (return the same reference when the
-// node is already normalized) so unchanged nodes skip the per-field rebuild during
-// drag; the predicate is deliberately NOT wired here yet so cloneNode can switch to
-// cloneCanvasNodeV2 first and prove (via the deep-copy contract tests) that clone
-// isolation no longer depends on normalize.
+// Normalize entry. Commit #2: fast path — when the node is already normalized, return
+// the SAME reference (zero allocation, no sub-object rebuild). This is the R01 drag-perf
+// target: unchanged nodes during a pointermove frame skip the per-field rebuild, and
+// their stable reference keeps CanvasNodeView's React.memo from re-rendering. Any node
+// that fails the predicate falls through to cloneCanvasNodeV2 (full rebuild) — behavior
+// identical to the pre-optimization normalize for those nodes.
 export const normalizeCanvasNodeV2 = (node: MivoCanvasNode): MivoCanvasNode =>
-  cloneCanvasNodeV2(node)
+  isNormalizedCanvasNodeV2(node) ? node : cloneCanvasNodeV2(node)
 
 export const normalizeCanvasNodesV2 = (nodes: MivoCanvasNode[]) => nodes.map(normalizeCanvasNodeV2)
 
