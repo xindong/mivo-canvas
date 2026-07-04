@@ -26,9 +26,15 @@ import type { RenderAnchor, RenderNode } from './projection'
 
 export type CanvasPoint = { x: number; y: number }
 
+/** Active edit-overlay kind. When an edit overlay is active, the shell short-circuits
+ * hit-testing and returns an `edit-overlay-cancel` target so the caller can route to
+ * the matching cancel handler (onCancelMaskEdit / cancel-crop / exit-text-edit). */
+export type HitTestEditKind = 'mask' | 'crop' | 'text-edit'
+
 export type HitTestTarget =
   | { kind: 'anchor'; nodeId: string; anchorId: string }
   | { kind: 'node'; nodeId: string }
+  | { kind: 'edit-overlay-cancel'; nodeId: string; editKind: HitTestEditKind }
 
 export type HitTestOptions = {
   /** Canvas-space radius for point-anchor hit (default 8). */

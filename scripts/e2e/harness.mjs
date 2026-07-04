@@ -6,14 +6,27 @@ import { attachDefaultMivoApiMocks } from './api-mocks.mjs'
 
 export const createBaseUrl = (port) => `http://127.0.0.1:${port}`
 
-// killStaleDevServer: detect and kill a leftover dev server from a prior failed
-// e2e run. A stale dev server keeps the old debug log dir and breaks
-// --strictPort restarts.
+// killStaleDevServer: detect and kill leftover dev/bff servers from a prior failed
+// e2e run *within the current worker's port-base segment only*. A stale dev/bff server
+// keeps the old debug log dir and breaks --strictPort restarts.
+//
+// 多 worker 并行隔离:每个 worker 用不同的 MIVO_E2E_PORT_BASE(见 e2e-runner.mjs)。
+// 这里只清自己 base 段 [base, base+SEGMENT_SIZE) 内残留的端口,不会误杀别的 worker 的
+// dev server。dev port=base+index*10+attempt,bff=dev+1,单次 run 实际只用其中 2 个端口,
+// 但前次失败可能残留 attempt 偏移或 bff 端口,所以遍历整个段兜底。
+const SEGMENT_SIZE = 50
 const killStaleDevServer = (port) => {
+  const base = Number(process.env.MIVO_E2E_PORT_BASE ?? port)
+  // 防御:若显式传入的 port 不在自己 base 段内(配置错误),只杀该 port 不展开范围,
+  // 避免误杀。正常情况下 port = base + index*10 + attempt 必然落在段内。
+  const inSegment = port >= base && port < base + SEGMENT_SIZE
+  const targets = inSegment
+    ? Array.from({ length: SEGMENT_SIZE }, (_, i) => base + i)
+    : [port]
   try {
-    const pids = execSync(`lsof -ti:${port} 2>/dev/null || true`, { encoding: 'utf8' }).trim()
+    const pids = execSync(`lsof -ti:${targets.join(',')} 2>/dev/null || true`, { encoding: 'utf8' }).trim()
     if (!pids) return
-    console.warn(`[harness] killing stale dev server on port ${port} (pids: ${pids.replace(/\n/g, ' ')})`)
+    console.warn(`[harness] killing stale dev/bff servers in base range [${base}, ${base + SEGMENT_SIZE}) (pids: ${pids.replace(/\n/g, ' ')})`)
     execSync(`kill ${pids.replace(/\n/g, ' ')} 2>/dev/null || true`, { stdio: 'ignore' })
   } catch {
     // lsof/kill unavailable - skip; --strictPort will fail visibly if occupied.

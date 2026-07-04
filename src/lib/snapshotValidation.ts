@@ -80,6 +80,23 @@ const isImageCrop = (value: unknown) => {
   )
 }
 
+// assetSourceDimensions: optional {width, height} with finite positive numbers. A
+// malformed value (0 / negative / non-numeric / string) rejects the snapshot so a
+// bad import can't poison the canvas. Undefined passes (legacy snapshots + non-image
+// nodes). Rides along without a version bump (experimentalAnchors precedent).
+const isImageDimensions = (value: unknown): boolean => {
+  if (value === undefined) return true
+  if (!isRecord(value)) return false
+  return (
+    typeof value.width === 'number' &&
+    typeof value.height === 'number' &&
+    Number.isFinite(value.width) &&
+    Number.isFinite(value.height) &&
+    value.width > 0 &&
+    value.height > 0
+  )
+}
+
 const isCanvasMaskBounds = (value: unknown) => {
   if (value === undefined) return true
   if (!isRecord(value)) return false
@@ -216,6 +233,7 @@ const isCanvasNode = (value: unknown): value is MivoCanvasNode => {
     (value.assetSizeBytes === undefined || typeof value.assetSizeBytes === 'number') &&
     isMarkdownDisplayMode(value.markdownDisplayMode) &&
     (value.imageHasTransparency === undefined || typeof value.imageHasTransparency === 'boolean') &&
+    isImageDimensions(value.assetSourceDimensions) &&
     isImageCrop(value.imageCrop) &&
     (value.parentIds === undefined || isStringArray(value.parentIds)) &&
     (value.sourceNodeId === undefined || typeof value.sourceNodeId === 'string') &&

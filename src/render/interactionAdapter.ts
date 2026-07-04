@@ -15,11 +15,21 @@
 // difference is stroke tolerance for markup line/brush (topmostHit uses a 6-unit
 // canvas tolerance vs SVG pointer-events:stroke width) — easier to hit thin
 // strokes, framed as a correction (was too hard to click), not a regression.
+//
+// Edit-overlay dispatch contract (Phase 1b-3): when an edit overlay (mask/crop/
+// text-edit) is active, it owns the pointer at Layer.EditOverlay (highest,
+// pointer-events:auto). Overlay-INTERNAL pointer events are captured by the
+// overlay DOM itself and never reach the shell. The shell only receives events
+// OUTSIDE the overlay (e.g. outside-click to dismiss); resolveHitTarget returns
+// an `edit-overlay-cancel` target for those so the caller can route to the
+// matching cancel handler and return WITHOUT selecting/transforming nodes
+// underneath. The actual cancel + return wiring lands in 1b-4 (shell dispatch);
+// this module only produces the target.
 
 import type { RenderNode } from './projection'
-import { topmostHit, type HitTestOptions, type HitTestTarget } from './hitTest'
+import { topmostHit, type HitTestEditKind, type HitTestOptions, type HitTestTarget } from './hitTest'
 
-export type { HitTestTarget } from './hitTest'
+export type { HitTestTarget, HitTestEditKind } from './hitTest'
 
 export type CanvasPoint = { x: number; y: number }
 
@@ -27,11 +37,11 @@ export type CanvasPoint = { x: number; y: number }
 // overlay (crop/mask/text-edit) is active, it owns the pointer at Layer.EditOverlay
 // (highest); the shell does NOT hit-test. Edit overlays capture their own events
 // via pointer-events:auto, so the shell only receives events OUTSIDE the overlay
-// — resolveHitTarget returns 'edit-overlay-cancel' so the caller can route to
-// onCancelMaskEdit / cancel-crop rather than selecting a different node.
+// — resolveHitTarget returns `edit-overlay-cancel` so the caller can route to
+// onCancelMaskEdit / cancel-crop / exit-text-edit rather than selecting a node.
 export type EditState = {
   activeEditNodeId?: string
-  activeEditKind?: 'mask' | 'crop' | 'text-edit'
+  activeEditKind?: HitTestEditKind
 }
 
 export type ResolveHitOptions = HitTestOptions & {
@@ -43,9 +53,11 @@ export const isEditStateActive = (editState?: EditState): boolean =>
 
 /**
  * Resolve the topmost hit-test target at `point`. Short-circuits when an edit
- * overlay is active (returns null — the shell should not hit-test; the edit
- * overlay owns the pointer). Otherwise delegates to topmostHit (anchors first,
- * then nodes, front-to-back).
+ * overlay is active: returns an `edit-overlay-cancel` target (the edit overlay
+ * owns the pointer; the shell should not hit-test or select/transform nodes
+ * underneath). The caller routes the cancel target to the matching handler and
+ * returns WITHOUT delegating to topmostHit. Otherwise delegates to topmostHit
+ * (anchors first, then nodes, front-to-back).
  *
  * Callers pass `nodes` in BACK-TO-FRONT z-order (use sortForHitTest for the
  * default frame < content < selected ordering).
@@ -57,7 +69,13 @@ export const resolveHitTarget = (
 ): HitTestTarget | null => {
   // Edit-state short-circuit: the edit overlay has pointer priority; the shell
   // does not select/transform nodes underneath. (Edit overlays capture their own
-  // events; this guards shell-received events during edit, e.g. outside-click.)
-  if (isEditStateActive(options.editState)) return null
+  // events via pointer-events:auto; this guards shell-received events during edit,
+  // e.g. outside-click.) Extract locals for TS optional narrowing, then surface a
+  // cancel target the caller can route to the matching cancel handler.
+  const editNodeId = options.editState?.activeEditNodeId
+  const editKind = options.editState?.activeEditKind
+  if (editNodeId && editKind) {
+    return { kind: 'edit-overlay-cancel', nodeId: editNodeId, editKind }
+  }
   return topmostHit(nodes, point, options)
 }
