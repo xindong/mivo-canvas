@@ -19,6 +19,7 @@ import {
   Columns3,
   Copy,
   Crop,
+  Crosshair,
   Download,
   Eraser,
   Eye,
@@ -166,7 +167,7 @@ const imageAiEditActionsFor = (runtime: CanvasActionRuntime): CanvasActionItem[]
   {
     id: 'select-area-edit',
     label: 'Select area',
-    icon: SquareMousePointer,
+    icon: Crosshair,
     onClick: () => {
       const nodeId = primaryNodeId(runtime)
       if (nodeId) runtime.onStartImageMaskEdit?.(nodeId)

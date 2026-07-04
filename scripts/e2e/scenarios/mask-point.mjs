@@ -106,6 +106,14 @@ export const runMaskPointScenario = async (context) => {
   if (afterClick.point !== 0) {
     throw new Error(`SC6.2: point click should not leave a standalone point anchor (it is a circle region), got ${JSON.stringify(afterClick)}`)
   }
+  // 回归守卫（bug: 单点 brush 渲染成单点 polyline → 无任何可见反馈）：点选后
+  // stage SVG 里必须出现可见的圆形反馈元素。
+  const visibleCircleCount = await page.evaluate(
+    () => document.querySelectorAll('.image-mask-edit-stage svg circle.image-mask-edit-region').length,
+  )
+  if (visibleCircleCount < 1) {
+    throw new Error(`SC6.2: point click should render a visible circle feedback in the stage SVG, got ${visibleCircleCount}`)
+  }
   const blocked = await page.evaluate(() => {
     const err = document.querySelector('.image-mask-edit-error')?.textContent || ''
     return { errText: err, hasBlockMsg: /请框选或涂抹/.test(err) }
