@@ -321,7 +321,7 @@ export function MivoCanvas({
         .canvases[targetSceneId]?.nodes.find((node) => node.id === nodeId && node.type === 'image' && !node.hidden)
       if (!source) throw new Error('Source image not found')
 
-      const slotId = prepareMaskEditPlaceholder(targetSceneId, source, payload.prompt)
+      const { slotId, baselineSnapshot } = prepareMaskEditPlaceholder(targetSceneId, source, payload.prompt)
       setMaskEditSubmittingNodeId(nodeId)
       const abortController = new AbortController()
       maskEditAbortRef.current?.abort()
@@ -343,6 +343,7 @@ export function MivoCanvas({
           canceled: abortController.signal.aborted,
           error: logMessage,
           sourceTitle: source.title,
+          baselineSnapshot,
         })
         const latestCanvasState = useCanvasStore.getState()
         if (latestCanvasState.sceneId !== targetSceneId) {

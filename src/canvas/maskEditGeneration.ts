@@ -2,7 +2,7 @@
 // 态 ai-slot 占位符（并挤开右侧障碍），生成失败/取消时回退到生成前 history 基线以
 // 移除该占位符并撤销 reflow 位移。从 MivoCanvas 抽出，保持该视图在 structure-guard
 // 行数预算内，也让"局部重绘占位符"这一职责独立可测。
-import type { MivoCanvasNode } from '../types/mivoCanvas'
+import type { MivoCanvasNode, MivoCanvasSnapshot } from '../types/mivoCanvas'
 import type { MivoImageRatio } from '../types/generation'
 import { useCanvasStore } from '../store/canvasStore'
 import { useChatStore } from '../store/chatStore'
@@ -58,12 +58,17 @@ const patchMaskEditSlotStatus = (
   })
 }
 
-/** Prebuild a generating ai-slot placeholder to the right of the source image. */
+/** Prebuild a generating ai-slot placeholder to the right of the source image.
+ *  Returns the slot id plus the history baseline snapshot captured right after
+ *  addAiSlotNode pushes it (undefined when the target scene isn't the active one,
+ *  since addAiSlotNode only pushes history for the active scene — see
+ *  patchCanvasDocument). The caller threads baselineSnapshot into
+ *  removeMaskEditPlaceholder so the rollback is gated on object identity (S01). */
 export const prepareMaskEditPlaceholder = (
   sceneId: string,
   source: MivoCanvasNode,
   prompt: string,
-): string => {
+): { slotId: string; baselineSnapshot: MivoCanvasSnapshot | undefined } => {
   const slotId = useCanvasStore
     .getState()
     .addAiSlotNode(
@@ -72,20 +77,39 @@ export const prepareMaskEditPlaceholder = (
       prompt,
       { sceneId },
     )
+  // S01: addAiSlotNode 内部 { history: true } 仅在 sceneId === state.sceneId 时
+  // push 基线。非活跃场景下不 push，栈顶是无关快照 —— 此时 baselineSnapshot 必须
+  // 置 undefined，否则 removeMaskEditPlaceholder 的 expectedBaseline 校验会误判。
+  const baselineSnapshot =
+    sceneId === useCanvasStore.getState().sceneId
+      ? useCanvasStore.getState().historyPast.at(-1)
+      : undefined
   patchMaskEditSlotStatus(sceneId, slotId, 'generating', prompt)
   debugLogger.log('Canvas', `Prepared mask edit placeholder for ${source.title}`)
-  return slotId
+  return { slotId, baselineSnapshot }
 }
 
 /** Remove the placeholder on failure/cancel: revert to the pre-generation history
- * baseline (also undoing reflow shifts), falling back to a plain node delete. */
+ *  baseline (also undoing reflow shifts) only when the栈顶仍是 prepare 时捕获的基线
+ *  引用； otherwise fall back to a plain node delete that preserves user edits made
+ *  during the async generation (S01: 保编辑 > 还原位移). */
 export const removeMaskEditPlaceholder = (
   sceneId: string,
   slotId: string,
-  context: { canceled?: boolean; error?: string; sourceTitle?: string } = {},
+  context: {
+    canceled?: boolean
+    error?: string
+    sourceTitle?: string
+    baselineSnapshot?: MivoCanvasSnapshot
+  } = {},
 ) => {
   useCanvasStore.setState((current) => {
-    const rollback = rollbackLatestHistoryBaseline(current, sceneId, { removeNodeId: slotId })
+    const rollback = context.baselineSnapshot
+      ? rollbackLatestHistoryBaseline(current, sceneId, {
+          removeNodeId: slotId,
+          expectedBaseline: context.baselineSnapshot,
+        })
+      : undefined
     if (rollback) return rollback
 
     const document = current.canvases[sceneId]

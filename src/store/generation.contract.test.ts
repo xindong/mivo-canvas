@@ -473,13 +473,30 @@ describe('contract: generateBesideNode / generateIntoAiSlot orchestration', () =
     expect(state.historyFuture).toHaveLength(0)
   })
 
-  it('chat-created slot: failure rolls back to the pre-slot canvas', async () => {
+  it('chat-created slot: failure removes the slot without popping the pre-slot baseline', async () => {
+    // S01: chat 路径新建槽位时 generationFacade 传 skipSlotHistoryBaseline →
+    // generateIntoAiSlot 不 captureHistory、baselineSnapshot=undefined → 失败时
+    // 跳过 rollback 走 filter-removal：删槽位但保留 prepareChatSlot 推入的 pre-slot
+    // 基线与 historyFuture（旧语义会 pop 基线并清空 historyFuture）。
     seed(seedCanvas('character-flow', []))
     const prep = generationFacade.prepareChatSlot({
       sceneId: 'character-flow',
       hasSelectedImage: false,
       prompt: 'fill the slot',
     })
+    // prepareChatSlot 的 addAiSlotNode({ history: true }) 在活跃画布上 push 了 pre-slot 基线
+    expect(useCanvasStore.getState().historyPast).toHaveLength(1)
+    // 注入 sentinel 到 historyFuture：旧 rollback 路径会清空它，filter-removal 不会
+    const futureSentinel = {
+      version: 2 as const,
+      sceneId: 'character-flow',
+      nodes: [],
+      edges: [],
+      tasks: [],
+      selectedNodeId: undefined,
+      selectedNodeIds: [],
+    }
+    useCanvasStore.setState({ historyFuture: [futureSentinel] })
     mockPollTask.mockResolvedValueOnce(failedView('boom'))
 
     await expect(
@@ -487,9 +504,9 @@ describe('contract: generateBesideNode / generateIntoAiSlot orchestration', () =
     ).rejects.toThrow(/boom/)
 
     const state = useCanvasStore.getState()
-    expect(state.nodes).toHaveLength(0)
-    expect(state.historyPast).toHaveLength(0)
-    expect(state.historyFuture).toHaveLength(0)
+    expect(state.nodes.some((node) => node.id === prep.slotId)).toBe(false)
+    expect(state.historyPast).toHaveLength(1) // pre-slot 基线保留（未被 pop）
+    expect(state.historyFuture).toHaveLength(1) // sentinel 存活 → 失败路径未清空
   })
 })
 
