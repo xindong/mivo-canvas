@@ -178,6 +178,37 @@ describe('platform channel — generate/edit job', () => {
     expect(mockState.generateCalls).toBe(0)
   })
 
+  it('generic terminated poll failure is not treated as transient', async () => {
+    mockState.pollSequence = ['failed']
+    mockState.pollError = 'Image generation terminated by safety filter'
+    const r = await req('/api/mivo/generate', jsonReq({ prompt: 'a cat', model: 'gpt-image-2' }))
+    expect(r.status).toBe(502)
+    expect(mockState.submitCalls).toBe(1)
+    expect(mockState.pollCalls).toBe(1)
+    expect((r.body as { error: string }).error).toContain('terminated by safety filter')
+  })
+
+  it('download transient 5xx retries download only, not the full platform job', async () => {
+    mockState.downloadStatusSequence = [500, 200]
+    const r = await req('/api/mivo/generate', jsonReq({ prompt: 'a cat', model: 'gpt-image-2' }))
+    expect(r.status).toBe(200)
+    expect(mockState.submitCalls).toBe(1)
+    expect(mockState.pollCalls).toBe(2)
+    expect(mockState.signUrlCalls).toBe(2)
+    expect(mockState.downloadCalls).toBe(2)
+  })
+
+  it('download network retry exhaustion does not resubmit the full platform job', async () => {
+    mockState.downloadResetSequence = [true, true]
+    const r = await req('/api/mivo/generate', jsonReq({ prompt: 'a cat', model: 'gpt-image-2' }))
+    expect(r.status).toBe(502)
+    expect((r.body as { error: string }).error).toBe('platform download retry exhausted')
+    expect(mockState.submitCalls).toBe(1)
+    expect(mockState.pollCalls).toBe(2)
+    expect(mockState.signUrlCalls).toBe(2)
+    expect(mockState.downloadCalls).toBe(2)
+  })
+
   it('platform poll failed → 502 sanitized', async () => {
     mockState.pollSequence = ['failed']
     const r = await req('/api/mivo/generate', jsonReq({ prompt: 'x', model: 'gpt-image-2' }))

@@ -31,6 +31,8 @@ export type MockState = {
   pollError: string
   signUrlBody: string | null
   downloadStatus: number
+  downloadStatusSequence: number[]
+  downloadResetSequence: boolean[]
   downloadBody: Buffer
   downloadUrl: string
   downloadDelayMs: number
@@ -74,6 +76,8 @@ export const defaultMockState = (): MockState => ({
   pollError: 'platform boom',
   signUrlBody: null,
   downloadStatus: 200,
+  downloadStatusSequence: [],
+  downloadResetSequence: [],
   downloadBody: PNG_BYTES,
   downloadUrl: '',
   downloadDelayMs: 0,
@@ -199,8 +203,13 @@ async function handle(state: MockState, req: IncomingMessage, res: ServerRespons
   if (path.startsWith('/dl/') && method === 'GET') {
     state.downloadCalls += 1
     if (state.downloadDelayMs) await new Promise((r) => setTimeout(r, state.downloadDelayMs))
-    if (state.downloadStatus !== 200) {
-      send(res, state.downloadStatus, '', 'image/png')
+    if (state.downloadResetSequence[state.downloadCalls - 1]) {
+      res.destroy(new Error('ECONNRESET'))
+      return
+    }
+    const downloadStatus = state.downloadStatusSequence[state.downloadCalls - 1] ?? state.downloadStatus
+    if (downloadStatus !== 200) {
+      send(res, downloadStatus, '', 'image/png')
       return
     }
     send(res, 200, state.downloadBody, 'image/png')
