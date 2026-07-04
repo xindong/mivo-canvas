@@ -73,8 +73,40 @@ describe('sendMessage (S03b: 参考图保存失败不丢消息)', () => {
     })
     expect(messages[1].text).toMatch(/参考图保存失败.*磁盘满了/)
     expect(messages[1].error).toMatch(/参考图保存失败.*磁盘满了/)
+    // S03b: 无 generationContext 可供 retryMessage 重放，显式禁用 Retry 按钮避免死按钮
+    expect(messages[1].retryDisabledReason).toBe('参考图保存失败，请重新选择图片后再发送')
     // isBusy 从未置 true，无残留
     expect(useChatStore.getState().isBusy).toBe(false)
+  })
+
+  it('参考图保存失败的 assistant 消息禁用 Retry（避免死按钮：retryMessage 无 context 会静默 return）', async () => {
+    // ChatMessageList 对 status:'error' 且无 retryDisabledReason 的消息渲染可点 Retry 按钮，
+    // 点击后 retryMessage 因无 generationContext 在 :550-551 直接 return——按钮点了没反应。
+    // failedAssistantMessage 显式带 retryDisabledReason → 按钮 disabled，引导用户重选图片。
+    vi.mocked(saveImportedAsset).mockRejectedValueOnce(new Error('磁盘满了'))
+    const file = new File(['x'], 'ref.png', { type: 'image/png' })
+
+    await useChatStore.getState().sendMessage({
+      sceneId: 'scene-3',
+      text: '画一只橘猫',
+      referenceFiles: [file],
+    })
+
+    const messages = useChatStore.getState().messagesByScene['scene-3']
+    const failedAssistant = messages[1]
+    expect(failedAssistant.status).toBe('error')
+    expect(failedAssistant.generationContext).toBeUndefined() // 无 context 可重放
+    expect(failedAssistant.retryDisabledReason).toBeTruthy() // 显式禁用 Retry
+    // retryMessage 对该消息应直接 return（无 context），不抛错也不重放
+    const retryResult = useChatStore.getState().retryMessage({
+      sceneId: 'scene-3',
+      messageId: failedAssistant.id,
+    })
+    await retryResult
+    // 重试后消息形态不变（仍是 error + retryDisabledReason）
+    const afterRetry = useChatStore.getState().messagesByScene['scene-3'][1]
+    expect(afterRetry.status).toBe('error')
+    expect(afterRetry.retryDisabledReason).toBeTruthy()
   })
 
   it('无参考图时正常路径不触发 catch（回归保护）', async () => {

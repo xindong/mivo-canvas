@@ -250,17 +250,17 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
     const currentState = get()
     const currentDocument = currentState.canvases[targetSceneId]
     if (!currentDocument) throw new Error('目标画布已删除，无法继续生成。')
+    // S02: 资产已落盘——sourceNodeId / lineageSource / replacementSlot 在 await 期间被删
+    // 时必须显式抛错（文案带已保存资产名，便于人工找回孤儿资产），不再让 set 内静默
+    // return 造成"生成成功但画布无节点"的假成功。await 前的入参校验（:228-240）保持
+    // 原文案不变（那时还没有资产）。savedNames 在所有 post-save 校验之前计算一次。
+    const savedNames = savedImages.map((s) => s.asset.name).join(', ')
     if (
       payload.sourceNodeId &&
       !currentDocument.nodes.find((node) => node.id === payload.sourceNodeId && !node.hidden)
     ) {
-      throw new Error('源节点已删除，无法继续生成。')
+      throw new Error(`源节点已删除，生成结果未落画布。已保存资产：${savedNames}`)
     }
-    // S02: 资产已落盘——lineageSource / replacementSlot 在 await 期间被删时必须显式抛错
-    // （文案带已保存资产名，便于人工找回孤儿资产），不再让 set 内静默 return 造成
-    // "生成成功但画布无节点"的假成功。await 前的入参校验（:228-240）保持原文案不变
-    // （那时还没有资产）。
-    const savedNames = savedImages.map((s) => s.asset.name).join(', ')
     const currentLineageSource = lineageSourceId
       ? currentDocument.nodes.find((node) => node.id === lineageSourceId && !node.hidden)
       : undefined

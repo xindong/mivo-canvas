@@ -508,6 +508,60 @@ describe('contract: generateBesideNode / generateIntoAiSlot orchestration', () =
     expect(state.historyPast).toHaveLength(1) // pre-slot 基线保留（未被 pop）
     expect(state.historyFuture).toHaveLength(1) // sentinel 存活 → 失败路径未清空
   })
+
+  it('generateIntoAiSlot: user edits during async poll are preserved (S01 deferred-poll)', async () => {
+    // S01 编排级回归：captureHistory 捕获基线后，异步 poll 期间用户编辑（pushHistory
+    // 推新快照）使栈顶不再是基线 → 失败时 rollback 的 expectedBaseline 不匹配 →
+    // filter-removal 保留编辑、不清空 historyFuture、不错误 pop historyPast。
+    seed(seedCanvas('character-flow', [aiSlotNode({ id: 'slot-1', x: 12, y: 24 })]))
+    // 让 poll 挂起，期间做用户编辑
+    let resolvePoll!: (view: unknown) => void
+    mockPollTask.mockReturnValueOnce(new Promise((resolve) => { resolvePoll = resolve }))
+
+    const generatePromise = useCanvasStore.getState().generateIntoAiSlot('slot-1', 'fill the slot')
+    // 让 generateIntoAiSlot 跑到 poll 挂起（submitGenerationTask 已 mock 立即 resolve）
+    for (let i = 0; i < 10; i++) await Promise.resolve()
+    expect(mockPollTask).toHaveBeenCalled()
+    // captureHistory 已推入基线（generateIntoAiSlot 入口的 captureHistory）
+    expect(useCanvasStore.getState().historyPast).toHaveLength(1)
+    const baseline = useCanvasStore.getState().historyPast.at(-1)
+
+    // 模拟用户编辑：追加节点 + captureHistory 推新快照（栈顶不再是基线）
+    const userEditNode = imageNode({ id: 'user-edit', x: 500, y: 500 })
+    useCanvasStore.setState((s) => {
+      const doc = s.canvases['character-flow']
+      const nextNodes = [...doc.nodes, userEditNode]
+      return { nodes: nextNodes, canvases: { ...s.canvases, 'character-flow': { ...doc, nodes: nextNodes } } }
+    })
+    useCanvasStore.getState().captureHistory()
+    // 注入 sentinel 到 historyFuture：旧 rollback 会清空，filter-removal 不会
+    const futureSentinel = {
+      version: 2 as const,
+      sceneId: 'character-flow',
+      nodes: [],
+      edges: [],
+      tasks: [],
+      selectedNodeId: undefined,
+      selectedNodeIds: [],
+    }
+    useCanvasStore.setState({ historyFuture: [futureSentinel] })
+    // 栈顶已是用户编辑快照，与 baseline 不是同一引用
+    expect(useCanvasStore.getState().historyPast.at(-1)).not.toBe(baseline)
+
+    // poll 失败 → 走 catch → expectedBaseline 不匹配 → filter-removal
+    resolvePoll(failedView('boom'))
+    await expect(generatePromise).rejects.toThrow(/boom/)
+
+    const finalState = useCanvasStore.getState()
+    // slot 被删（filter-removal）
+    expect(finalState.nodes.some((n) => n.id === 'slot-1')).toBe(false)
+    // 用户编辑保留
+    expect(finalState.nodes.some((n) => n.id === 'user-edit')).toBe(true)
+    // historyPast 未被错误 pop（基线 + 用户编辑都在）
+    expect(finalState.historyPast).toHaveLength(2)
+    // historyFuture 未被清空（sentinel 存活）
+    expect(finalState.historyFuture).toHaveLength(1)
+  })
 })
 
 describe('contract: task state machine (generation actions)', () => {

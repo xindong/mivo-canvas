@@ -280,6 +280,11 @@ export const useChatStore = create<ChatState>()(
             status: 'error',
             error: `参考图保存失败：${message}`,
             errorKind: 'unknown',
+            // S03b: 无 generationContext 可供 retryMessage 重放（参考图未保存成功），
+            // 显式禁用 Retry 按钮避免死按钮（ChatMessageList 对 status:'error' 且无
+            // retryDisabledReason 的消息会渲染可点 Retry，点击后 retryMessage 因无
+            // context 直接 return）。引导用户重新选择图片后再发送。
+            retryDisabledReason: '参考图保存失败，请重新选择图片后再发送',
           }
           set((s) => ({
             messagesByScene: {
