@@ -6,6 +6,7 @@ const context = (): CanvasToolHandlerContext => ({
   beginSelection: vi.fn(),
   beginZoomGesture: vi.fn(),
   beginNodeMove: vi.fn(),
+  beginNodeMoveFromShell: vi.fn(),
   beginNodeResize: vi.fn(),
   beginTextBox: vi.fn(),
   beginFrameBox: vi.fn(),
