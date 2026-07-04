@@ -11,13 +11,16 @@ import { rollbackLatestHistoryBaseline } from '../store/canvasDocumentModel'
 import { debugLogger } from '../store/debugLogStore'
 import { readCanvasImageBlob } from '../lib/canvasImageSource'
 import { MivoImageRequestError } from '../lib/mivoImageClient'
+import { inspectMaskResultForBlackPlate } from '../lib/maskResultInspection'
 import {
   cancelTask,
   kindForFailedTask,
   pollTask,
   submitEditTask,
   taskPollIntervalMs,
+  type TaskResultImage,
 } from '../lib/mivoTaskClient'
+import { toastFeedback } from '../store/toastStore'
 import type { ImageMaskSubmitPayload } from './imageMaskGeometry'
 
 const patchMaskEditSlotStatus = (
@@ -230,30 +233,33 @@ export const runMaskEditGeneration = async (args: {
   const startedAt = Date.now()
   const image = await readCanvasImageBlob(source, resolvedAssetUrl)
 
-  let serverTaskId: string | undefined
-  const submitStartedAt = Date.now()
-  try {
+  // W1: submit+poll 抽成单次尝试，便于黑盘自愈时用新 idempotencyKey 重跑一次。
+  // newIdempotencyKey 必须每次重试都重新生成 —— BFF registry 按 key dedupe，复用
+  // 原失败调用的 key 会静默返回缓存的黑盘 task（F3）。progress patch 在 poll loop
+  // 内，重试时 placeholder 仍在，进度字段继续刷新。
+  const runOneAttempt = async (idempotencyKey: string): Promise<{ taskId: string; images: TaskResultImage[] }> => {
     if (signal.aborted) throw new MivoImageRequestError('图片请求已取消。', 'canceled')
-    serverTaskId = await submitEditTask({
+    const submitStartedAt = Date.now()
+    const taskId = await submitEditTask({
       image,
       mask: payload.mask,
       prompt: payload.prompt,
       imgRatio,
       quality,
       model: 'gpt-image-2',
-      idempotencyKey: newIdempotencyKey(),
+      idempotencyKey,
       signal,
     })
     debugLogger.log(
       'Mask Edit',
-      `Task ${serverTaskId} submitted for ${source.title} (quality=${quality}) in ${Date.now() - submitStartedAt}ms`,
+      `Task ${taskId} submitted for ${source.title} (quality=${quality}) in ${Date.now() - submitStartedAt}ms`,
     )
 
     // Poll loop (mirrors generationSlice.runTaskPollLoop; inlined to keep this
     // module self-contained and avoid a cross-slice refactor).
     for (;;) {
       if (signal.aborted) throw new MivoImageRequestError('图片请求已取消。', 'canceled')
-      const view = await pollTask(serverTaskId, signal)
+      const view = await pollTask(taskId, signal)
 
       if (view.status === 'running' || view.status === 'pending') {
         patchMaskEditProgress(sceneId, slotId, view.progress, view.stage)
@@ -261,36 +267,7 @@ export const runMaskEditGeneration = async (args: {
         continue
       }
       if (view.status === 'done') {
-        const images = view.result?.images ?? []
-        const commitStartedAt = Date.now()
-        const commitPayload = {
-          sceneId,
-          sourceNodeId: source.id,
-          lineageSourceId: source.id,
-          replaceSlotId: slotId,
-          reflow: true,
-          resultImages: images,
-          prompt: payload.prompt,
-          model: 'gpt-image-2',
-          kind: 'edit' as const,
-          createDerivationEdge: true,
-          maskBounds: payload.maskBounds,
-          placement: 'right' as const,
-        }
-        const nodeIds = await useCanvasStore.getState().commitGenerationResult(commitPayload)
-        const latest = useCanvasStore.getState()
-        useChatStore.getState().appendNotice({ sceneId, origin: 'mask-edit', nodeIds, prompt: payload.prompt })
-        if (latest.sceneId !== sceneId) {
-          const title = latest.canvases[sceneId]?.title || sceneId
-          useChatStore
-            .getState()
-            .appendNotice({ sceneId: latest.sceneId, origin: 'mask-edit', prompt: `结果已生成到画布 ${title}` })
-        }
-        debugLogger.log(
-          'Mask Edit',
-          `Task ${serverTaskId} done for ${source.title}; commit ${Date.now() - commitStartedAt}ms; total ${Date.now() - startedAt}ms`,
-        )
-        return nodeIds
+        return { taskId, images: view.result?.images ?? [] }
       }
       if (view.status === 'failed') {
         const message = view.error || '局部重绘失败'
@@ -302,6 +279,78 @@ export const runMaskEditGeneration = async (args: {
       // unknown — server restarted / task evicted. Never commit; surface retry.
       throw new MivoImageRequestError('任务已失效（服务端重启），请重试。', 'upstream-error')
     }
+  }
+
+  let serverTaskId: string | undefined
+  try {
+    const first = await runOneAttempt(newIdempotencyKey())
+    serverTaskId = first.taskId
+    let images = first.images
+    const attemptTaskIds = [first.taskId]
+
+    // W1 self-heal: 检测结果图黑盘 → 新 idempotencyKey 重试 1 次。
+    // 仅当有 maskBounds（annotation area-edit 模式）且有结果 b64 时检测；brush
+    // mask 模式无 bounds，跳过检测（保守不重试）。二次仍黑 → 照常 commit 重试
+    // 结果 + warn toast + debugLogger.error 附两个 taskId 证据。
+    const canInspect = Boolean(payload.maskBounds && images[0]?.b64)
+    if (canInspect) {
+      const blackPlate = await inspectMaskResultForBlackPlate(
+        { sourceSizePx: payload.sourceSize, maskBoundsPx: payload.maskBounds! },
+        { sourceBlob: image, resultB64: images[0].b64 },
+      )
+      if (blackPlate) {
+        const second = await runOneAttempt(newIdempotencyKey())
+        attemptTaskIds.push(second.taskId)
+        serverTaskId = second.taskId
+        const secondBlack = await inspectMaskResultForBlackPlate(
+          { sourceSizePx: payload.sourceSize, maskBoundsPx: payload.maskBounds! },
+          { sourceBlob: image, resultB64: second.images[0]?.b64 ?? '' },
+        )
+        if (secondBlack) {
+          toastFeedback.warn('局部重绘结果异常，已使用重试结果，请检查画面')
+          debugLogger.error(
+            'Mask Edit',
+            `Black plate detected for ${source.title}; both attempts returned black plates. taskIds=${attemptTaskIds.join(',')}`,
+          )
+        } else {
+          debugLogger.warn(
+            'Mask Edit',
+            `Black plate detected for ${source.title}; retry recovered. taskIds=${attemptTaskIds.join(',')}`,
+          )
+        }
+        images = second.images
+      }
+    }
+
+    const commitStartedAt = Date.now()
+    const commitPayload = {
+      sceneId,
+      sourceNodeId: source.id,
+      lineageSourceId: source.id,
+      replaceSlotId: slotId,
+      reflow: true,
+      resultImages: images,
+      prompt: payload.prompt,
+      model: 'gpt-image-2',
+      kind: 'edit' as const,
+      createDerivationEdge: true,
+      maskBounds: payload.maskBounds,
+      placement: 'right' as const,
+    }
+    const nodeIds = await useCanvasStore.getState().commitGenerationResult(commitPayload)
+    const latest = useCanvasStore.getState()
+    useChatStore.getState().appendNotice({ sceneId, origin: 'mask-edit', nodeIds, prompt: payload.prompt })
+    if (latest.sceneId !== sceneId) {
+      const title = latest.canvases[sceneId]?.title || sceneId
+      useChatStore
+        .getState()
+        .appendNotice({ sceneId: latest.sceneId, origin: 'mask-edit', prompt: `结果已生成到画布 ${title}` })
+    }
+    debugLogger.log(
+      'Mask Edit',
+      `Task ${serverTaskId} done for ${source.title}; commit ${Date.now() - commitStartedAt}ms; total ${Date.now() - startedAt}ms`,
+    )
+    return nodeIds
   } catch (error) {
     // W2.2: overlay X/Esc → best-effort DELETE the upstream task before rethrowing
     // so the caller's removeMaskEditPlaceholder rolls back with #81 baselineSnapshot.

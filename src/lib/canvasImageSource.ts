@@ -6,7 +6,40 @@ const safeImageName = (node: MivoCanvasNode) => {
   return /\.[a-z0-9]+$/i.test(baseName) ? baseName : `${baseName}.png`
 }
 
-export const readCanvasImageBlob = async (node: MivoCanvasNode, resolvedAssetUrl?: string) => {
+// W1: 生成结果（kind='result'）可能是透明 PNG —— 透明区在 PNG 编码下 RGB 常为 0
+// （黑），直接送上游 mask-edit 会被当黑源处理，结果图该区易出黑盘。对 result kind
+// 且实测 alpha<255 的图，先 flatten 到白底再送上游。非 result kind（用户导入的源图）
+// 透明语义不变，不触发解码。
+const flattenAlphaToWhiteIfNeeded = async (file: File, node: MivoCanvasNode): Promise<File> => {
+  if (node.aiWorkflow?.kind !== 'result') return file
+  try {
+    const bitmap = await createImageBitmap(file)
+    const canvas = document.createElement('canvas')
+    canvas.width = bitmap.width
+    canvas.height = bitmap.height
+    const ctx = canvas.getContext('2d')
+    if (!ctx) { bitmap.close?.(); return file }
+    ctx.drawImage(bitmap, 0, 0)
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height)
+    let hasTranslucent = false
+    for (let i = 3; i < imageData.data.length; i += 4) {
+      if (imageData.data[i] < 255) { hasTranslucent = true; break }
+    }
+    if (!hasTranslucent) { bitmap.close?.(); return file }
+    // flatten: 白底 + 重绘源图（source-over 合成，透明区被白底填充）
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, canvas.width, canvas.height)
+    ctx.drawImage(bitmap, 0, 0)
+    bitmap.close?.()
+    const mime = file.type || 'image/png'
+    const flattened: Blob | null = await new Promise((resolve) => canvas.toBlob(resolve, mime))
+    return new File([flattened || file], file.name, { type: mime })
+  } catch {
+    return file // 解码失败 → 保守返回原 file，不阻断生成
+  }
+}
+
+const readSourceImageFile = async (node: MivoCanvasNode, resolvedAssetUrl?: string): Promise<File> => {
   const importedAsset = await readImportedAssetFile(node.assetUrl)
   if (importedAsset) {
     return new File([importedAsset.blob], importedAsset.name || safeImageName(node), {
@@ -61,4 +94,9 @@ export const readCanvasImageBlob = async (node: MivoCanvasNode, resolvedAssetUrl
   return new File([blob], safeImageName(node), {
     type: blob.type || node.assetMimeType || 'image/png',
   })
+}
+
+export const readCanvasImageBlob = async (node: MivoCanvasNode, resolvedAssetUrl?: string) => {
+  const file = await readSourceImageFile(node, resolvedAssetUrl)
+  return flattenAlphaToWhiteIfNeeded(file, node)
 }

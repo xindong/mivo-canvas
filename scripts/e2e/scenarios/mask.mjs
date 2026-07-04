@@ -1,3 +1,5 @@
+import { doneTaskView } from '../api-mocks.mjs'
+
 export const runMaskScenario = async (context) => {
   const { canvasStoreSpec, horizontalMaskSourceB64, mivoEditRequests, page, readCanvasState, waitForCanvasState } = context
 
@@ -182,5 +184,77 @@ export const runMaskScenario = async (context) => {
   })
   if (maskNoticeCount < 1) {
     throw new Error(`chatStore should contain at least one mask-edit notice after local repaint, got ${maskNoticeCount}`)
+  }
+
+  // SC-W1: 黑盘 self-heal —— mock 第一次 done 返黑盘结果，断言 /tasks/edit 被调
+  // 2 次（新 idempotencyKey 重试，F3）且 taskId 不同。检测器在浏览器解码黑盘
+  // b64（8x8 全黑 PNG，canvas 即时生成），命中后 runMaskEditGeneration 用新 key
+  // 重跑一次；第二次 done 返正常图，自愈成功，commit 正常结果。
+  const blackPlateB64 = await page.evaluate(() => {
+    const canvas = document.createElement('canvas')
+    canvas.width = 8
+    canvas.height = 8
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return ''
+    ctx.fillStyle = '#000000'
+    ctx.fillRect(0, 0, 8, 8)
+    return canvas.toDataURL('image/png').split(',')[1]
+  })
+  if (!blackPlateB64) throw new Error('Unable to synthesize black-plate b64 for W1 e2e')
+
+  const blackPlateEditTaskIds = []
+  await page.unroute('**/api/mivo/tasks/edit')
+  await page.route('**/api/mivo/tasks/edit', async (route) => {
+    const taskId = `task-black-${blackPlateEditTaskIds.length + 1}`
+    blackPlateEditTaskIds.push(taskId)
+    await route.fulfill({
+      status: 202,
+      contentType: 'application/json',
+      body: JSON.stringify({ taskId }),
+    })
+  })
+
+  let blackPlateGetCall = 0
+  await page.unroute('**/api/mivo/tasks/*')
+  await page.route('**/api/mivo/tasks/*', async (route) => {
+    const method = route.request().method()
+    if (method === 'DELETE') {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ id: 'task-black', status: 'canceled' }) })
+      return
+    }
+    if (method !== 'GET') { await route.fallback(); return }
+    blackPlateGetCall += 1
+    const view = blackPlateGetCall === 1
+      ? doneTaskView([{ b64: blackPlateB64 }])
+      : doneTaskView([{ b64: horizontalMaskSourceB64 }])
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(view) })
+  })
+
+  // 重置场景让 ref-hero 回来，再触发一次 mask edit 走 self-heal 路径
+  await page.evaluate(async (moduleSpec) => {
+    const { useCanvasStore } = await import(moduleSpec)
+    useCanvasStore.getState().loadScene('character-flow')
+    useCanvasStore.getState().resetCurrentScene()
+  }, await canvasStoreSpec())
+  await page.waitForSelector('[data-node-id="ref-hero"]')
+  await page.locator('[data-node-id="ref-hero"]').click()
+  await page.waitForSelector('.selection-quick-toolbar')
+  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
+  await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
+  await page.waitForSelector('.image-mask-edit-stage')
+  await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: '点选', exact: true }).click()
+  const bpStage = await page.locator('.image-mask-edit-stage').boundingBox()
+  if (!bpStage) throw new Error('Mask edit stage should be visible for black-plate self-heal')
+  await page.mouse.click(bpStage.x + bpStage.width * 0.52, bpStage.y + bpStage.height * 0.5)
+  await page.waitForFunction(() => Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0') > 0)
+  await page.locator('.image-mask-edit-prompt textarea').fill('E2E black-plate self-heal')
+  await page.locator('.image-mask-edit-prompt').getByRole('button', { name: '局部重绘' }).click()
+  await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
+
+  if (blackPlateEditTaskIds.length !== 2) {
+    throw new Error(`SC-W1 black-plate self-heal should call /tasks/edit twice (retry with new idempotencyKey), got ${blackPlateEditTaskIds.length}: ${JSON.stringify(blackPlateEditTaskIds)}`)
+  }
+  if (blackPlateEditTaskIds[0] === blackPlateEditTaskIds[1]) {
+    throw new Error(`SC-W1 retry should produce a different taskId, got ${JSON.stringify(blackPlateEditTaskIds)}`)
   }
 }
