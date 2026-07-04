@@ -14,13 +14,9 @@ import { LocateFixed, Minus, Plus, RotateCcw } from 'lucide-react'
 import { downloadCanvasNodeOriginal } from '../lib/assetDownload'
 import { canReadLocalAssetDrag, parseLocalAssetDragPayload } from '../lib/canvasAssetDrag'
 import { canImportCanvasFile, importFilesToCanvas, importImageUrlToCanvas } from '../lib/canvasAssetImport'
-import { readCanvasImageBlob } from '../lib/canvasImageSource'
-import { editMivoImage } from '../lib/mivoImageClient'
 import { useCanvasStore } from '../store/canvasStore'
 import { useChatStore } from '../store/chatStore'
-import { AI_SLOT_GAP, reflowRightObstacles } from '../store/aiCanvasWorkflow'
-import { rollbackLatestHistoryBaseline } from '../store/canvasDocumentModel'
-import { debugLogger } from '../store/debugLogStore'
+import { prepareMaskEditPlaceholder, removeMaskEditPlaceholder, runMaskEditGeneration } from './maskEditGeneration'
 import { brushCursorCssFor } from './brushCursors'
 import { brushOutlinePathFor, highlighterOpacity } from './brushGeometry'
 import { BrushOptionsBar } from './BrushOptionsBar'
@@ -98,77 +94,6 @@ const closestMivoRatioForSize = (size: { width: number; height: number }): MivoI
   )).id
 }
 
-const patchMaskEditSlotStatus = (
-  sceneId: string,
-  slotId: string,
-  status: 'generating' | 'failed' | 'canceled',
-  prompt: string,
-) => {
-  const createdAt = Date.now()
-  useCanvasStore.setState((current) => {
-    const document = current.canvases[sceneId]
-    if (!document) return {}
-
-    const nodes = document.nodes.map((node) =>
-      node.id === slotId && node.type === 'ai-slot'
-        ? {
-            ...node,
-            generation: {
-              prompt,
-              model: 'gpt-image-2',
-              size: node.generation?.size || `${Math.round(node.width)}x${Math.round(node.height)}`,
-              seed: node.generation?.seed,
-              strength: node.generation?.strength,
-              createdAt,
-            },
-            aiWorkflow: {
-              ...(node.aiWorkflow || { kind: 'slot' as const }),
-              status,
-              operation: 'area-edit' as const,
-              prompt,
-              placement: 'right' as const,
-              createdAt,
-            },
-          }
-        : node,
-    )
-    const slot = nodes.find((node) => node.id === slotId)
-    const nextNodes = status === 'generating' && slot
-      ? reflowRightObstacles(nodes, slot, AI_SLOT_GAP)
-      : nodes
-    const nextDocument = { ...document, nodes: nextNodes }
-
-    return {
-      ...(sceneId === current.sceneId ? { nodes: nextNodes } : {}),
-      canvases: {
-        ...current.canvases,
-        [sceneId]: nextDocument,
-      },
-    }
-  })
-}
-
-const removeMaskEditPlaceholder = (sceneId: string, slotId: string) => {
-  useCanvasStore.setState((current) => {
-    const rollback = rollbackLatestHistoryBaseline(current, sceneId, { removeNodeId: slotId })
-    if (rollback) return rollback
-
-    const document = current.canvases[sceneId]
-    if (!document) return {}
-    const nodes = document.nodes.filter((node) => node.id !== slotId)
-    const edges = (document.edges || []).filter((edge) => edge.from !== slotId && edge.to !== slotId)
-    const nextDocument = { ...document, nodes, edges }
-
-    return {
-      ...(sceneId === current.sceneId ? { nodes, edges } : {}),
-      canvases: {
-        ...current.canvases,
-        [sceneId]: nextDocument,
-      },
-    }
-  })
-}
-
 const rectsIntersect = (
   a: { x: number; y: number; width: number; height: number },
   b: { x: number; y: number; width: number; height: number },
@@ -218,7 +143,6 @@ export function MivoCanvas({
   const updateNodeMeasuredSize = useCanvasStore((state) => state.updateNodeMeasuredSize)
   const cropImageNode = useCanvasStore((state) => state.cropImageNode)
   const renameNode = useCanvasStore((state) => state.renameNode)
-  const commitGenerationResult = useCanvasStore((state) => state.commitGenerationResult)
   // P2-D2: only mount the AnchorOverlay when at least one anchor exists (cheap
   // boolean selector — stable false when no anchors, so no re-render cost).
   const hasAnchors = useCanvasStore((state) => state.nodes.some((node) => Boolean(node.experimentalAnchors?.length)))
@@ -397,65 +321,29 @@ export function MivoCanvas({
         .canvases[targetSceneId]?.nodes.find((node) => node.id === nodeId && node.type === 'image' && !node.hidden)
       if (!source) throw new Error('Source image not found')
 
-      const slotId = useCanvasStore.getState().addAiSlotNode(
-        { x: source.x + source.width + AI_SLOT_GAP, y: source.y },
-        { width: source.width, height: source.height },
-        payload.prompt,
-        { sceneId: targetSceneId },
-      )
-      patchMaskEditSlotStatus(targetSceneId, slotId, 'generating', payload.prompt)
-      debugLogger.log('Canvas', `Prepared mask edit placeholder for ${source.title}`)
-
+      const slotId = prepareMaskEditPlaceholder(targetSceneId, source, payload.prompt)
       setMaskEditSubmittingNodeId(nodeId)
       const abortController = new AbortController()
       maskEditAbortRef.current?.abort()
       maskEditAbortRef.current = abortController
       try {
-        const image = await readCanvasImageBlob(source, resolvedAssetUrl)
-        const response = await editMivoImage({
-          image,
-          mask: payload.mask,
-          prompt: payload.prompt,
+        await runMaskEditGeneration({
+          sceneId: targetSceneId,
+          source,
+          slotId,
+          resolvedAssetUrl,
+          payload,
           imgRatio: closestMivoRatioForSize(payload.sourceSize),
-          quality: 'medium',
-          model: 'gpt-image-2',
           signal: abortController.signal,
         })
-        const commitPayload = {
-          sceneId: targetSceneId,
-          sourceNodeId: source.id,
-          lineageSourceId: source.id,
-          replaceSlotId: slotId,
-          reflow: true,
-          resultImages: response.images,
-          prompt: payload.prompt,
-          model: 'gpt-image-2',
-          kind: 'edit' as const,
-          createDerivationEdge: true,
-          maskBounds: payload.maskBounds,
-          placement: 'right' as const,
-        }
-        const nodeIds = await commitGenerationResult(commitPayload)
-        const latestCanvasState = useCanvasStore.getState()
-        useChatStore.getState().appendNotice({ sceneId: targetSceneId, origin: 'mask-edit', nodeIds, prompt: payload.prompt })
-        if (latestCanvasState.sceneId !== targetSceneId) {
-          const title = latestCanvasState.canvases[targetSceneId]?.title || targetSceneId
-          useChatStore.getState().appendNotice({
-            sceneId: latestCanvasState.sceneId,
-            origin: 'mask-edit',
-            prompt: `结果已生成到画布 ${title}`,
-          })
-        }
         setMaskEditNodeId(undefined)
       } catch (error) {
-        const canceled = abortController.signal.aborted
-        removeMaskEditPlaceholder(targetSceneId, slotId)
         const logMessage = error instanceof Error ? error.message : '局部重绘失败'
-        if (canceled) {
-          debugLogger.warn('Canvas', `Mask edit canceled for ${source.title}; placeholder removed`)
-        } else {
-          debugLogger.error('Canvas', `Mask edit failed for ${source.title}; placeholder removed: ${logMessage}`)
-        }
+        removeMaskEditPlaceholder(targetSceneId, slotId, {
+          canceled: abortController.signal.aborted,
+          error: logMessage,
+          sourceTitle: source.title,
+        })
         const latestCanvasState = useCanvasStore.getState()
         if (latestCanvasState.sceneId !== targetSceneId) {
           useChatStore.getState().appendNotice({
@@ -472,7 +360,7 @@ export function MivoCanvas({
         setMaskEditSubmittingNodeId(undefined)
       }
     },
-    [commitGenerationResult, sceneId],
+    [sceneId],
   )
 
   const downloadOriginal = useCallback((node?: typeof contextMenuNode) => {
