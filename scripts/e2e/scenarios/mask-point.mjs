@@ -214,6 +214,7 @@ export const runMaskPointScenario = async (context) => {
     useCanvasStore.getState().selectNode(undefined)
     return { sourceId, survivorId }
   }, spec)
+  await page.waitForFunction(() => !document.querySelector('.mivo-app')?.classList.contains('ai-collapsed'))
   await dockMaskButton.click()
   await page.waitForFunction(() => document.querySelector('.canvas-shell')?.classList.contains('mask-armed'))
   const deleteSourceBox = await page.locator(`[data-node-id="${deleteCase.sourceId}"]`).boundingBox()
@@ -221,12 +222,14 @@ export const runMaskPointScenario = async (context) => {
   await page.mouse.click(deleteSourceBox.x + deleteSourceBox.width * 0.5, deleteSourceBox.y + deleteSourceBox.height * 0.5)
   await page.waitForSelector('.image-mask-edit-stage')
   await waitForRegionCount(page, 1)
+  await page.waitForFunction(() => document.querySelector('.mivo-app')?.classList.contains('ai-collapsed'))
   await page.keyboard.press('Delete')
   await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
   await page.waitForFunction(
     (sourceId) => !document.querySelector(`[data-node-id="${sourceId}"]`),
     deleteCase.sourceId,
   )
+  await page.waitForFunction(() => !document.querySelector('.mivo-app')?.classList.contains('ai-collapsed'))
   await page.locator(`[data-node-id="${deleteCase.survivorId}"]`).click()
   await page.waitForSelector('.selection-quick-toolbar')
 
