@@ -321,6 +321,7 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
             name: asset.name,
             sizeBytes: asset.sizeBytes,
             hasTransparency: asset.hasTransparency,
+            sourceDimensions: asset.sourceDimensions,
             size: asset.size,
           },
           prompt,

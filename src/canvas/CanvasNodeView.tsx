@@ -1,6 +1,7 @@
-import { memo, useCallback, useEffect, useRef, useState, type CSSProperties } from 'react'
+import { memo, useCallback, useEffect, useRef, type CSSProperties } from 'react'
 import { MarkdownPreview } from '../lib/MarkdownPreview'
 import { useResolvedAssetUrl } from '../lib/useResolvedAssetUrl'
+import { useImageNaturalSize } from '../lib/useImageNaturalSize'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 import { useCanvasStore } from '../store/canvasStore'
 import { brushOutlinePathFor } from './brushGeometry'
@@ -513,16 +514,11 @@ export const CanvasNodeView = memo(function CanvasNodeView({
   onInitialMaskClientPointHandled,
 }: CanvasNodeViewProps) {
   const markdownDocumentRef = useRef<HTMLElement | null>(null)
-  // Size is stored together with its source URL so a stale measurement simply stops
-  // applying when the asset changes, instead of being reset from an effect.
-  const [measuredNaturalSize, setMeasuredNaturalSize] = useState<{
-    url: string
-    width: number
-    height: number
-  }>()
   const resolvedAssetUrl = useResolvedAssetUrl(node.assetUrl)
-  const naturalSize =
-    measuredNaturalSize && measuredNaturalSize.url === resolvedAssetUrl ? measuredNaturalSize : undefined
+  const { naturalSize, onLoad: onImageLoad } = useImageNaturalSize(
+    node.assetUrl,
+    node.assetSourceDimensions,
+  )
   const renderKind = renderKindForNode(node)
   const textNode = renderKind === 'text' || renderKind === 'annotation'
   const frameNode = renderKind === 'section'
@@ -767,13 +763,7 @@ export const CanvasNodeView = memo(function CanvasNodeView({
               decoding="async"
               draggable={false}
               style={imageCropStyle}
-              onLoad={(event) =>
-                setMeasuredNaturalSize({
-                  url: resolvedAssetUrl,
-                  width: event.currentTarget.naturalWidth,
-                  height: event.currentTarget.naturalHeight,
-                })
-              }
+              onLoad={onImageLoad}
             />
           ) : (
             <div className="dom-node-placeholder" />

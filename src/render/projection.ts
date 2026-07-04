@@ -36,6 +36,7 @@ import type {
   SectionBorderStyle,
   SectionLockMode,
 } from '../types/mivoCanvas'
+import type { ImageDimensions } from '../lib/imageSizing'
 import { normalizeCanvasNodeV2 } from '../model/documentModelV2'
 import type { ViewportMatrix } from './viewportMatrix'
 
@@ -136,6 +137,7 @@ export type RenderNode = {
   assetOriginalName?: string
   assetSizeBytes?: number
   imageHasTransparency?: boolean
+  assetSourceDimensions?: ImageDimensions
   imageCrop?: ImageCrop
   // relations (normalized — always the V2 form)
   parentIds?: string[]
@@ -352,6 +354,7 @@ export const projectNode = (node: MivoCanvasNode, ctx?: ProjectionContext): Rend
   if (n.assetOriginalName !== undefined) r.assetOriginalName = n.assetOriginalName
   if (n.assetSizeBytes !== undefined) r.assetSizeBytes = n.assetSizeBytes
   if (n.imageHasTransparency !== undefined) r.imageHasTransparency = n.imageHasTransparency
+  if (n.assetSourceDimensions !== undefined) r.assetSourceDimensions = { ...n.assetSourceDimensions }
   if (n.imageCrop !== undefined) r.imageCrop = n.imageCrop
 
   // relations (normalized V2 form — parentIds cloned, connector bindings cloned)

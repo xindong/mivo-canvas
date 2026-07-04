@@ -11,6 +11,7 @@ import { normalizeCanvasNodeV2 } from '../model/documentModelV2'
 import { normalizeAnchors } from '../model/anchorModel'
 import { connectorAnchorPointFor, derivationConnectorBindingsFor } from '../canvas/connectorGeometry'
 import { makeNode } from './demoScenes'
+import type { ImageDimensions } from '../lib/imageSizing'
 
 /**
  * nodeFactory — pure helpers for cloning and constructing canvas nodes.
@@ -166,6 +167,7 @@ export type GenerationResultAsset = {
   name: string
   sizeBytes: number
   hasTransparency?: boolean
+  sourceDimensions?: ImageDimensions
   size: string
 }
 
@@ -220,6 +222,7 @@ export const createGenerationResultNode = (options: GenerationResultNodeOptions)
     assetOriginalName: asset.name,
     assetSizeBytes: asset.sizeBytes,
     imageHasTransparency: asset.hasTransparency,
+    assetSourceDimensions: asset.sourceDimensions,
     status: 'ready',
     parentIds: sourceNode ? [sourceNode.id] : undefined,
     sourceNodeId: sourceNode?.id,

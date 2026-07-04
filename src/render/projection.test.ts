@@ -209,6 +209,32 @@ describe('projectNode — cross-check with canvasRenderAdapter (geometry consist
   })
 })
 
+// --- Phase 3a: assetSourceDimensions projection (metrics track) ---------------
+
+describe('projectNode — assetSourceDimensions passthrough (Phase 3a)', () => {
+  it('projects assetSourceDimensions from the node', () => {
+    const node = v2ImageNode({ assetSourceDimensions: { width: 1920, height: 1080 } })
+    const r = projectNode(node)
+    expect(r.assetSourceDimensions).toEqual({ width: 1920, height: 1080 })
+  })
+
+  it('deep-clones assetSourceDimensions (no shared reference with the source node)', () => {
+    const dims = { width: 800, height: 600 }
+    const node = v2ImageNode({ assetSourceDimensions: dims })
+    const r = projectNode(node)
+    expect(r.assetSourceDimensions).not.toBe(dims)
+    expect(r.assetSourceDimensions).toEqual(dims)
+    // mutating the source must not leak into the projection
+    dims.width = 9999
+    expect(r.assetSourceDimensions!.width).toBe(800)
+  })
+
+  it('omits assetSourceDimensions when the node has none (not synthesized)', () => {
+    const r = projectNode(v2ImageNode())
+    expect(r.assetSourceDimensions).toBeUndefined()
+  })
+})
+
 // --- Phase 1a: visual defaults sunk from canvasRenderAdapter -------------------
 //
 // Locks projection's synthetic fills/strokes to be field-by-field equivalent to the
