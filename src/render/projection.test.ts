@@ -397,6 +397,101 @@ describe('projectNode — markup visual defaults match canvasRenderAdapter', () 
   })
 })
 
+// --- FU-1: fallback parity vs canvasRenderAdapter firstSolidFillFor/firstStrokeFor ---
+//
+// #72 事后批审 P2 指出：当时只测了 frame 的 invisible solid fill 这一条 fallback
+// 路径。补全矩阵——markup/frame 的 fills/strokes 非空但不满足 "visible solid" /
+// "visible stroke" 判据时，projection 必须与 canvasRenderAdapter 的
+// firstSolidFillFor / firstStrokeFor 同判据地补缺省。每组都是 projection vs
+// adapter 的对照断言，锁两实现、防迁移漂移。
+
+describe('projectNode — fallback parity vs canvasRenderAdapter (FU-1)', () => {
+  it('markup: fills all hidden → sinks synthetic default fill (matches adapter firstSolidFillFor)', () => {
+    const node = markupNode({
+      fills: [{ id: 'hidden-solid', kind: 'solid', color: '#aabbcc', opacity: 1, visible: false }],
+    })
+    const r = projectNode(node)
+    const adapter = markupRenderStyleFor(node)
+    // adapter firstSolidFillFor skips invisible solids → markupFillColor || default
+    expect(adapter.fill).toBe('rgba(105, 87, 232, 0.08)')
+    expect(r.fills).toHaveLength(2)
+    const synthetic = r.fills[1] as CanvasNodeSolidFill
+    expect(synthetic.kind).toBe('solid')
+    expect(synthetic.visible).toBe(true)
+    expect(synthetic.color).toBe('rgba(105, 87, 232, 0.08)')
+    expect(synthetic.color).toBe(adapter.fill)
+  })
+
+  it('markup: fills only image (no solid) → sinks synthetic default fill (adapter firstSolidFillFor skips image)', () => {
+    const node = markupNode({
+      fills: [{ id: 'img-fill', kind: 'image', assetUrl: 'https://example.com/x.png', opacity: 1, visible: true, scaleMode: 'fill' }],
+    })
+    const r = projectNode(node)
+    const adapter = markupRenderStyleFor(node)
+    // adapter firstSolidFillFor only matches kind:'solid' → visible image fill is skipped → fallback
+    expect(adapter.fill).toBe('rgba(105, 87, 232, 0.08)')
+    expect(r.fills).toHaveLength(2)
+    expect((r.fills[1] as CanvasNodeSolidFill).color).toBe('rgba(105, 87, 232, 0.08)')
+    expect((r.fills[1] as CanvasNodeSolidFill).color).toBe(adapter.fill)
+    // The original image fill is preserved (not dropped) — projection clones it through.
+    expect(r.fills[0]).toEqual(expect.objectContaining({ id: 'img-fill', kind: 'image' }))
+  })
+
+  it('markup: strokes all hidden → sinks synthetic default stroke (matches adapter firstStrokeFor)', () => {
+    const node = markupNode({
+      strokes: [{ id: 'hidden-stroke', color: '#abcdef', width: 5, style: 'solid', opacity: 1, visible: false }],
+    })
+    const r = projectNode(node)
+    const adapter = markupRenderStyleFor(node)
+    // adapter firstStrokeFor skips invisible strokes → markupStrokeColor || default
+    expect(adapter.stroke).toBe('#6957e8')
+    expect(r.strokes).toHaveLength(2)
+    const synthetic = r.strokes[1]
+    expect(synthetic.visible).toBe(true)
+    expect(synthetic.color).toBe('#6957e8')
+    expect(synthetic.color).toBe(adapter.stroke)
+    expect(synthetic.width).toBe(adapter.strokeWidth)
+    expect(synthetic.style).toBe(adapter.strokeStyle)
+  })
+
+  it('frame: strokes all hidden → sinks synthetic default stroke (matches adapter firstStrokeFor)', () => {
+    const node = frameNode({
+      fills: [],
+      strokes: [{ id: 'hidden-stroke', color: '#abcdef', width: 9, style: 'solid', opacity: 1, visible: false }],
+    })
+    const r = projectNode(node)
+    const adapter = frameRenderStyleFor(node)
+    // adapter firstStrokeFor skips invisible → sectionBorderColor || frameColor || '#ff8a00'
+    expect(adapter['--section-border-color']).toBe('#ff8a00')
+    expect(r.strokes).toHaveLength(2)
+    const synthetic = r.strokes[1]
+    expect(synthetic.visible).toBe(true)
+    expect(synthetic.color).toBe('#ff8a00')
+    expect(synthetic.color).toBe(adapter['--section-border-color'])
+    expect(synthetic.width).toBe(Number(adapter['--section-border-width'].replace('px', '')))
+    expect(synthetic.style).toBe(adapter['--section-border-style'])
+  })
+
+  it('frame: fills only a visible image fill (no solid) → both sides skip image and use fallback (parity)', () => {
+    const node = frameNode({
+      fills: [{ id: 'img-fill', kind: 'image', assetUrl: 'https://example.com/y.png', opacity: 1, visible: true, scaleMode: 'fill' }],
+      strokes: [],
+    })
+    const r = projectNode(node)
+    const adapter = frameRenderStyleFor(node)
+    // adapter firstSolidFillFor only matches kind:'solid' → visible image fill skipped → '#ffffff'
+    expect(adapter['--section-fill-color']).toBe('#ffffff')
+    expect(r.fills).toHaveLength(2)
+    // Original image fill preserved; synthetic solid appended.
+    expect(r.fills[0]).toEqual(expect.objectContaining({ id: 'img-fill', kind: 'image' }))
+    const synthetic = r.fills[1] as CanvasNodeSolidFill
+    expect(synthetic.kind).toBe('solid')
+    expect(synthetic.visible).toBe(true)
+    expect(synthetic.color).toBe('#ffffff')
+    expect(synthetic.color).toBe(adapter['--section-fill-color'])
+  })
+})
+
 describe('projectNode — non-frame/non-markup nodes get NO synthetic defaults', () => {
   it('image node with no fills/strokes stays empty (no product-default pollution)', () => {
     const node: MivoCanvasNode = {
