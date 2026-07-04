@@ -3058,11 +3058,11 @@ button:disabled {
 }
 
 .mivo-app:not(.ai-collapsed) .canvas-tool-dock {
-  left: calc((100% - var(--ai-panel-offset) - var(--ai-panel-w) - var(--floating-gap) - 220px) / 2);
+  left: calc((100% - var(--ai-panel-offset) - var(--ai-panel-w) - var(--floating-gap)) / 2);
 }
 
 .mivo-app.ai-collapsed .canvas-tool-dock {
-  left: calc((100% - var(--ai-panel-offset) - var(--ai-panel-collapsed-w) - var(--floating-gap) - 220px) / 2);
+  left: calc((100% - var(--ai-panel-offset) - var(--ai-panel-collapsed-w) - var(--floating-gap)) / 2);
 }
 
 .canvas-tool-dock button {
@@ -3246,12 +3246,12 @@ button:disabled {
 /* Keep the option bars centered over the tool dock (mirror .canvas-tool-dock offsets). */
 .mivo-app:not(.ai-collapsed) .brush-options-bar,
 .mivo-app:not(.ai-collapsed) .stamp-options-bar {
-  left: calc((100% - var(--ai-panel-offset) - var(--ai-panel-w) - var(--floating-gap) - 220px) / 2);
+  left: calc((100% - var(--ai-panel-offset) - var(--ai-panel-w) - var(--floating-gap)) / 2);
 }
 
 .mivo-app.ai-collapsed .brush-options-bar,
 .mivo-app.ai-collapsed .stamp-options-bar {
-  left: calc((100% - var(--ai-panel-offset) - var(--ai-panel-collapsed-w) - var(--floating-gap) - 220px) / 2);
+  left: calc((100% - var(--ai-panel-offset) - var(--ai-panel-collapsed-w) - var(--floating-gap)) / 2);
 }
 
 .stamp-options-group {
