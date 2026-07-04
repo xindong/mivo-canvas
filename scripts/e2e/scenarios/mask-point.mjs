@@ -54,6 +54,18 @@ const waitForRegionCount = async (page, expected, { timeout = 5000 } = {}) => {
   throw new Error(`Timed out waiting for region-count=${expected}, last=${JSON.stringify(last)}`)
 }
 
+const cancelMaskEdit = async (page) => {
+  await page.locator('.image-mask-edit-history').getByRole('button', { name: 'Cancel mask edit' }).click()
+  await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' }).catch(() => {})
+}
+
+const clearCanvasSelection = async (page, moduleSpec) => {
+  await page.evaluate(async (spec) => {
+    const { useCanvasStore } = await import(spec)
+    useCanvasStore.getState().selectNode(undefined)
+  }, moduleSpec)
+}
+
 export const runMaskPointScenario = async (context) => {
   const { page, canvasStoreSpec } = context
   const spec = await canvasStoreSpec()
@@ -120,11 +132,104 @@ export const runMaskPointScenario = async (context) => {
   if (armedState.markers < 1 || armedState.rings < 1) {
     throw new Error(`P3: initial point should render marker + radius ring: ${JSON.stringify(armedState)}`)
   }
-  await page.locator('.image-mask-edit-history').getByRole('button', { name: 'Cancel mask edit' }).click()
-  await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' }).catch(() => {})
 
+  // FIX-3: initial armed point must not block legitimate fast follow-up points in the overlay.
+  await clickStage(page, 0.42, 0.5)
+  await clickStage(page, 0.58, 0.5)
+  await waitForRegionCount(page, 3)
+  const afterFastOverlayClicks = await regionCounts(page)
+  if (afterFastOverlayClicks.mask !== 3 || afterFastOverlayClicks.point !== 0) {
+    throw new Error(`FIX-3: two fast overlay points after armed initial point should both land, got ${JSON.stringify(afterFastOverlayClicks)}`)
+  }
+  await cancelMaskEdit(page)
+  await clearCanvasSelection(page, spec)
+
+  // FIX-3: fast double-click in armed mode should open one overlay and keep one initial region.
+  await dockMaskButton.click()
+  await page.waitForFunction(() => document.querySelector('.canvas-shell')?.classList.contains('mask-armed'))
+  await page.mouse.dblclick(nodeBox.x + nodeBox.width * 0.5, nodeBox.y + nodeBox.height * 0.5)
+  await page.waitForSelector('.image-mask-edit-stage')
+  await waitForRegionCount(page, 1)
+  await page.waitForTimeout(120)
+  const fastDoubleClickState = await page.evaluate(() => ({
+    detailsOpen: Boolean(document.querySelector('.details-dialog-backdrop')),
+    counts: {
+      region: Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0'),
+      mask: Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-mask-region-count') || '0'),
+      point: Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-point-anchor-count') || '0'),
+    },
+  }))
+  if (
+    fastDoubleClickState.detailsOpen ||
+    fastDoubleClickState.counts.region !== 1 ||
+    fastDoubleClickState.counts.mask !== 1 ||
+    fastDoubleClickState.counts.point !== 0
+  ) {
+    throw new Error(`FIX-3: armed fast double-click should keep one initial region and no details dialog, got ${JSON.stringify(fastDoubleClickState)}`)
+  }
+  await cancelMaskEdit(page)
+  await clearCanvasSelection(page, spec)
+
+  // FIX-3: slow double-click sequence should also not add a second same-point region.
+  await dockMaskButton.click()
+  await page.waitForFunction(() => document.querySelector('.canvas-shell')?.classList.contains('mask-armed'))
+  await page.mouse.click(nodeBox.x + nodeBox.width * 0.5, nodeBox.y + nodeBox.height * 0.5)
+  await page.waitForSelector('.image-mask-edit-stage')
+  await waitForRegionCount(page, 1)
+  await page.waitForTimeout(450)
+  await page.mouse.click(nodeBox.x + nodeBox.width * 0.5, nodeBox.y + nodeBox.height * 0.5)
+  await page.waitForTimeout(120)
+  const slowDoubleClickCounts = await regionCounts(page)
+  if (slowDoubleClickCounts.region !== 1 || slowDoubleClickCounts.mask !== 1 || slowDoubleClickCounts.point !== 0) {
+    throw new Error(`FIX-3: armed slow double-click should keep one initial region, got ${JSON.stringify(slowDoubleClickCounts)}`)
+  }
+  await cancelMaskEdit(page)
+
+  // FIX-1: Escape must cancel overlay even while the prompt textarea is focused.
   await page.locator(`[data-node-id="${imageId}"]`).click()
   await page.waitForSelector('.selection-quick-toolbar')
+  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
+  await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
+  await page.waitForSelector('.image-mask-edit-stage')
+  await page.locator('.image-mask-edit-prompt textarea').focus()
+  await page.keyboard.press('Escape')
+  await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
+
+  // FIX-2: deleting the target image while mask edit is active must clear all mask edit state.
+  const deleteCase = await page.evaluate(async (moduleSpec) => {
+    const { useCanvasStore } = await import(moduleSpec)
+    useCanvasStore.getState().createCanvas('E2E Mask Delete Target')
+    useCanvasStore.getState().addImportedImage('/demo-assets/courage-1.jpg', 'delete-source', 'source', { x: -120, y: 0 }, {
+      dimensions: { width: 320, height: 320 },
+      mimeType: 'image/jpeg',
+      originalName: 'delete-source.jpg',
+    })
+    const sourceId = useCanvasStore.getState().nodes.at(-1).id
+    useCanvasStore.getState().addImportedImage('/demo-assets/courage-1.jpg', 'survivor-source', 'source', { x: 260, y: 0 }, {
+      dimensions: { width: 320, height: 320 },
+      mimeType: 'image/jpeg',
+      originalName: 'survivor-source.jpg',
+    })
+    const survivorId = useCanvasStore.getState().nodes.at(-1).id
+    useCanvasStore.getState().selectNode(undefined)
+    return { sourceId, survivorId }
+  }, spec)
+  await dockMaskButton.click()
+  await page.waitForFunction(() => document.querySelector('.canvas-shell')?.classList.contains('mask-armed'))
+  const deleteSourceBox = await page.locator(`[data-node-id="${deleteCase.sourceId}"]`).boundingBox()
+  if (!deleteSourceBox) throw new Error('FIX-2: delete source image should be visible')
+  await page.mouse.click(deleteSourceBox.x + deleteSourceBox.width * 0.5, deleteSourceBox.y + deleteSourceBox.height * 0.5)
+  await page.waitForSelector('.image-mask-edit-stage')
+  await waitForRegionCount(page, 1)
+  await page.keyboard.press('Delete')
+  await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
+  await page.waitForFunction(
+    (sourceId) => !document.querySelector(`[data-node-id="${sourceId}"]`),
+    deleteCase.sourceId,
+  )
+  await page.locator(`[data-node-id="${deleteCase.survivorId}"]`).click()
+  await page.waitForSelector('.selection-quick-toolbar')
+
   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
   await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
   await page.waitForSelector('.image-mask-edit-stage')
@@ -193,6 +298,5 @@ export const runMaskPointScenario = async (context) => {
   await waitForRegionCount(page, 0)
 
   // Tear down the overlay so the shared page is clean for the next scenario.
-  await page.locator('.image-mask-edit-history').getByRole('button', { name: 'Cancel mask edit' }).click()
-  await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' }).catch(() => {})
+  await cancelMaskEdit(page)
 }

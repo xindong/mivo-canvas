@@ -6,6 +6,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from 'react'
 import { createPortal } from 'react-dom'
@@ -176,7 +177,7 @@ export function ImageMaskEditOverlay({
   const draftRef = useRef<DraftRegion | undefined>(undefined)
   const removeWindowDragListenersRef = useRef<() => void>(() => undefined)
   const handledInitialClientPointKeyRef = useRef<string | undefined>(undefined)
-  const suppressPointerDownUntilRef = useRef(0)
+  const initialFollowupPointerRef = useRef<{ clientX: number; clientY: number } | undefined>(undefined)
   const promptReady = Boolean(prompt.trim())
   const hasAnyAnchor = regions.length > 0 || pointAnchors.length > 0
   const maskEditHint = !hasAnyAnchor
@@ -321,7 +322,10 @@ export function ImageMaskEditOverlay({
     setRegions(nextRegions)
     setFuture([])
     setStatusError('')
-    suppressPointerDownUntilRef.current = performance.now() + 350
+    initialFollowupPointerRef.current = {
+      clientX: initialClientPoint.clientX,
+      clientY: initialClientPoint.clientY,
+    }
     debugLogger.log('Mask Edit', `Initial client point consumed for ${node.id} with radius ${radius}px`)
     onInitialClientPointHandled?.(node.id, 'consumed')
   }, [displayRect, initialClientPoint, naturalSize, node.height, node.id, node.imageCrop, node.width, onInitialClientPointHandled])
@@ -441,10 +445,18 @@ export function ImageMaskEditOverlay({
   const beginPointer = (event: ReactPointerEvent<HTMLElement>) => {
     event.preventDefault()
     event.stopPropagation()
-    if (suppressPointerDownUntilRef.current > performance.now()) {
-      suppressPointerDownUntilRef.current = 0
-      debugLogger.log('Mask Edit', 'Suppressed duplicate pointer after armed initial point')
-      return
+    const initialFollowupPointer = initialFollowupPointerRef.current
+    if (initialFollowupPointer) {
+      initialFollowupPointerRef.current = undefined
+      const sameInitialPoint =
+        Math.hypot(
+          event.clientX - initialFollowupPointer.clientX,
+          event.clientY - initialFollowupPointer.clientY,
+        ) <= 2
+      if (event.detail > 1 || sameInitialPoint) {
+        debugLogger.log('Mask Edit', 'Ignored double-click follow-up after armed initial point')
+        return
+      }
     }
     if (submitting) return
 
@@ -508,6 +520,13 @@ export function ImageMaskEditOverlay({
     } catch (error) {
       setStatusError(error instanceof Error ? error.message : '局部重绘失败。')
     }
+  }
+
+  const handlePromptKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key !== 'Escape') return
+    event.preventDefault()
+    event.stopPropagation()
+    onCancel()
   }
 
   const renderedRegions = draft
@@ -615,6 +634,7 @@ export function ImageMaskEditOverlay({
             value={prompt}
             disabled={submitting}
             onChange={(event) => setPrompt(event.target.value)}
+            onKeyDown={handlePromptKeyDown}
             placeholder="描述这个区域要怎么改..."
           />
           {maskEditHint ? <div className="image-mask-edit-hint">{maskEditHint}</div> : null}

@@ -55,6 +55,7 @@ export function useMaskPointArmed({
 }: UseMaskPointArmedOptions) {
   const maskEditAbortRef = useRef<AbortController | null>(null)
   const maskArmedRef = useRef(false)
+  const maskEditNodeIdRef = useRef<string | undefined>(undefined)
   const pendingInitialClientPointRef = useRef<MaskInitialClientPoint | undefined>(undefined)
   const lastMaskCancelRequestIdRef = useRef(maskCancelRequestId)
   const mountedRef = useRef(true)
@@ -105,6 +106,7 @@ export function useMaskPointArmed({
   const cancelMaskEdit = useCallback(() => {
     maskEditAbortRef.current?.abort()
     maskEditAbortRef.current = null
+    maskEditNodeIdRef.current = undefined
     setMaskEditNodeId(undefined)
     setMaskEditSubmittingNodeId(undefined)
     setMaskArmed(false, 'mask edit canceled')
@@ -127,6 +129,7 @@ export function useMaskPointArmed({
     selectNode(nodeId)
     closeContextMenu()
     clearCropNode()
+    maskEditNodeIdRef.current = nodeId
     setMaskEditNodeId(nodeId)
     debugLogger.log('Mask Edit', `Mask edit started for ${nodeId}`)
     return true
@@ -155,6 +158,7 @@ export function useMaskPointArmed({
           imgRatio: closestMivoRatioForSize(payload.sourceSize),
           signal: abortController.signal,
         })
+        maskEditNodeIdRef.current = undefined
         setMaskEditNodeId(undefined)
         clearPendingInitialPoint('mask edit submitted')
       } catch (error) {
@@ -273,6 +277,17 @@ export function useMaskPointArmed({
       if (maskArmedRef.current && !hasVisibleImage(state.nodes)) {
         scheduleStateSync(() => setMaskArmed(false, 'no visible images remain'))
       }
+      const activeMaskNodeId = maskEditNodeIdRef.current
+      if (
+        activeMaskNodeId &&
+        !state.nodes.some((node) => node.id === activeMaskNodeId && node.type === 'image' && !node.hidden)
+      ) {
+        maskEditNodeIdRef.current = undefined
+        scheduleStateSync(() => {
+          debugLogger.log('Mask Edit', `Mask edit canceled: target image unavailable ${activeMaskNodeId}`)
+          cancelMaskEdit()
+        })
+      }
       const pending = pendingInitialClientPointRef.current
       if (pending && !state.nodes.some((node) => node.id === pending.nodeId && node.type === 'image' && !node.hidden)) {
         scheduleStateSync(() => {
@@ -283,7 +298,7 @@ export function useMaskPointArmed({
       }
     })
     return unsubscribe
-  }, [clearPendingInitialPoint, scheduleStateSync, setMaskArmed, updatePendingInitialPoint])
+  }, [cancelMaskEdit, clearPendingInitialPoint, scheduleStateSync, setMaskArmed, updatePendingInitialPoint])
 
   useEffect(() => {
     if (lastMaskCancelRequestIdRef.current === maskCancelRequestId) return
