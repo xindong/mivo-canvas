@@ -15,7 +15,7 @@ import {
   MAX_PROXY_HOPS,
   isPrivateHostLiteral,
   parseProxyUrl,
-} from '../../src/lib/proxyImageSecurity'
+} from '../lib/proxyImageSecurity'
 import { jsonResponse } from '../lib/response'
 import type { App, AppEnv } from '../lib/types'
 
