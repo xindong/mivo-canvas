@@ -1771,10 +1771,36 @@ export const runCanvasInteractionsScenario = async (context) => {
     ),
   }
 
-  await page.mouse.move(textResizeGrabPoint.x, textResizeGrabPoint.y)
-  await page.mouse.down()
-  await page.mouse.move(textResizeGrabPoint.x + 90, textResizeGrabPoint.y, { steps: 6 })
-  await page.mouse.up()
+  // 在 dev topology 下 Playwright `page.mouse.down()` 合成的 pointerdown 不会命中
+  // handle button 的 React onPointerDown(导致 beginTextResize 不执行、textResizeRef 不
+  // 设置、后续 pointermove 的 pointerId 全部不匹配 → resizeTextNode 从不调用 → width
+  // 不增长 → waitForFunction 超时)。prod topology 受 store bridge 等差异影响不复发。
+  // 这里直接在 handle 元素上 dispatch native PointerEvent 序列,绕开 Playwright mouse
+  // 合成的时序问题,让 beginTextResize → setPointerCapture → tryMoveTextResize 正常走通。
+  await page.evaluate(({ grabX, grabY, endX }) => {
+    const handle = document.querySelector('.dom-node.text-node .text-resize-handle.e')
+    if (!handle) throw new Error('text-resize handle not found for pointer dispatch')
+    const fire = (type, x, y, buttons) => {
+      handle.dispatchEvent(new PointerEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        pointerId: 1,
+        pointerType: 'mouse',
+        isPrimary: true,
+        button: 0,
+        buttons,
+        clientX: x,
+        clientY: y,
+      }))
+    }
+    fire('pointerdown', grabX, grabY, 1)
+    const steps = 6
+    for (let index = 1; index <= steps; index += 1) {
+      const x = grabX + (endX - grabX) * (index / steps)
+      fire('pointermove', x, grabY, 1)
+    }
+    fire('pointerup', endX, grabY, 0)
+  }, { grabX: textResizeGrabPoint.x, grabY: textResizeGrabPoint.y, endX: textResizeGrabPoint.x + 90 })
   await page.waitForFunction(
     (minWidth) => {
       const nodes = document.querySelectorAll('.dom-node.text-node')
