@@ -59,8 +59,14 @@ const parseScenarios = (argv) => {
   return values.flatMap((value) => value.split(',')).map((value) => value.trim()).filter(Boolean)
 }
 
+// 端口 base:默认 dev=5174 / prod=6174。多 worker(或多个 worktree)并行跑 e2e 时,
+// 每个 worker 必须设不同的 MIVO_E2E_PORT_BASE(例如 5174 / 6274 / 7374 ...),否则同一
+// scenario 在 selectedScenarios 中的 index 相同 → 端口撞车 → vite --strictPort 启动失败
+// 或 killStaleDevServer 互杀对方的 dev server。base 间隔 ≥ 100 即可避免(单次 run 端口
+// 跨度 ≤ 14*10+2=142,但同 worker 串行,实际只用当前 scenario 的 base+index*10+attempt)。
 const argv = process.argv.slice(2)
 const topology = parseTopology(argv)
+const portBase = Number(process.env.MIVO_E2E_PORT_BASE ?? (topology === 'prod' ? 6174 : 5174))
 const renderer = parseRenderer(argv)
 const requestedScenarios = parseScenarios(argv)
 const selectedScenarios = requestedScenarios.length === 0
@@ -80,8 +86,8 @@ const rendererModes = renderer === 'both' ? ['dom', 'leafer'] : [renderer]
 
 const runScenarioAttempt = (scenarioName, index, attempt, rendererMode) =>
   new Promise((resolve, reject) => {
-    const scenarioPort = String((topology === 'prod' ? 6174 : 5174) + index * 10 + attempt)
-    console.log(`[e2e-runner] topology=${topology} scenario=${scenarioName} renderer=${rendererMode} attempt=${attempt} port=${scenarioPort}`)
+    const scenarioPort = String(portBase + index * 10 + attempt)
+    console.log(`[e2e-runner] topology=${topology} scenario=${scenarioName} renderer=${rendererMode} attempt=${attempt} port=${scenarioPort} base=${portBase}`)
     const child = spawn(
       process.execPath,
       [smokeScript, '--topology', topology, '--scenario', scenarioName, '--renderer', rendererMode],
@@ -90,6 +96,7 @@ const runScenarioAttempt = (scenarioName, index, attempt, rendererMode) =>
         env: {
           ...process.env,
           MIVO_E2E_PORT: scenarioPort,
+          MIVO_E2E_PORT_BASE: String(portBase),
         },
       },
     )

@@ -267,8 +267,39 @@ export const runShellSidebarScenario = async (context) => {
     warnings: button.querySelectorAll('.debug-log-badge.warning').length,
     errors: button.querySelectorAll('.debug-log-badge.error').length,
   }))
-  if (initialDebugBadges.warnings !== 0 || initialDebugBadges.errors !== 0) {
-    throw new Error(`Debug Log button should hide empty warning/error badges: ${JSON.stringify(initialDebugBadges)}`)
+  // errors 严格 0;warnings 容忍 hydration 类(S276 zombie generation cleanup)。
+  // dev topology 用真实 canvasStore persist/merge,demo scenes 初始含 running/queued
+  // task,hydrate 时 settleExpiredCanvasGenerations 会 warn("Hydration settled expired
+  // canvas generations: ...")(见 src/store/canvasGenerationHydration.ts:69)。这是产品
+  // 预期行为,不是测试 bug。prod topology 用 store bridge 绕过 persist,不触发,故 CI
+  // 全绿而本地 dev 红。这里容忍 0 或 N 条 hydration 类 warning,其他 warning 仍失败。
+  if (initialDebugBadges.errors !== 0) {
+    throw new Error(`Debug Log button should show 0 error badges at init: ${JSON.stringify(initialDebugBadges)}`)
+  }
+  if (initialDebugBadges.warnings > 0) {
+    const warningEntries = await page.evaluate(async () => {
+      const resource = performance
+        .getEntriesByType('resource')
+        .map((entry) => entry.name)
+        .find((name) => name.includes('/src/store/debugLogStore.ts'))
+      if (!resource) return null
+      const { useDebugLogStore } = await import(new URL(resource).pathname + new URL(resource).search)
+      return useDebugLogStore
+        .getState()
+        .entries.filter((entry) => entry.level === 'warning')
+        .map((entry) => ({ source: entry.source, message: entry.message }))
+    })
+    if (warningEntries === null) {
+      throw new Error(
+        `Debug Log shows ${initialDebugBadges.warnings} warning badge(s) but debugLogStore module was not reachable to verify they are hydration-class: ${JSON.stringify(initialDebugBadges)}`,
+      )
+    }
+    const nonHydration = warningEntries.filter((entry) => !(entry.message || '').includes('Hydration settled'))
+    if (nonHydration.length > 0) {
+      throw new Error(
+        `Debug Log init should only contain hydration-class warnings (S276 zombie cleanup), got non-hydration: ${JSON.stringify(nonHydration)}`,
+      )
+    }
   }
   await page.evaluate(() => {
     console.log('__MIVO_E2E_EXPECTED_LOG__ unity-style log')
