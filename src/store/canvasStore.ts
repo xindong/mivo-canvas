@@ -320,41 +320,62 @@ export const displaySizeForGeneratedAsset = (
 export const migratePersistedState = (persistedState: unknown, persistedVersion = 0) => {
   const persisted = (persistedState || {}) as PersistedCanvasState
   const shouldNormalizeLongMarkdown = persistedVersion < 6
+  const fallbackCanvases = initialCanvases()
   const canvases = {
-    ...initialCanvases(),
+    ...fallbackCanvases,
     ...(persisted.canvases || {}),
   }
 
+  // S03: per-canvas try/catch——单条损坏画布不再让整个 migrate 抛掉。normalizeDocument
+  // 对非数组 nodes/edges/tasks 会抛 TypeError（cloneNodes → .map），try 捕获后用初始
+  // 画布回退（demo scene id 命中）或删除条目（自定义 id），其余画布不受影响。
   Object.entries(canvases).forEach(([id, document]) => {
-    const normalizedDocument = normalizeDocument(document)
-    canvases[id] = shouldNormalizeLongMarkdown
-      ? {
-          ...normalizedDocument,
-          nodes: normalizeLongMarkdownPreviewNodes(normalizedDocument.nodes),
-        }
-      : normalizedDocument
+    try {
+      const normalizedDocument = normalizeDocument(document)
+      canvases[id] = shouldNormalizeLongMarkdown
+        ? {
+            ...normalizedDocument,
+            nodes: normalizeLongMarkdownPreviewNodes(normalizedDocument.nodes),
+          }
+        : normalizedDocument
+    } catch (error) {
+      warnCanvas(`hydration 丢弃损坏画布 ${id}，其余画布不受影响：${error instanceof Error ? error.message : String(error)}`)
+      const fallback = fallbackCanvases[id]
+      if (fallback) canvases[id] = fallback
+      else delete canvases[id]
+    }
   })
   const sceneId =
     persisted.sceneId && canvases[persisted.sceneId]
       ? persisted.sceneId
       : 'character-flow'
 
-  if (persisted.nodes && persisted.tasks) {
-    const currentDocument = documentFor(canvases, sceneId)
-    const normalizedDocument = normalizeDocument({
-      ...currentDocument,
-      nodes: persisted.nodes,
-      edges: persisted.edges || currentDocument.edges || [],
-      tasks: persisted.tasks,
-      selectedNodeId: persisted.selectedNodeId,
-      selectedNodeIds: persisted.selectedNodeIds,
-    })
-    canvases[sceneId] = shouldNormalizeLongMarkdown
-      ? {
-          ...normalizedDocument,
-          nodes: normalizeLongMarkdownPreviewNodes(normalizedDocument.nodes),
-        }
-      : normalizedDocument
+  // S03: legacy flat-state 分支同样纳入防护。入口加最小形状校验（nodes/tasks 须为数组；
+  // edges 存在时也须为数组），并把 normalizeDocument 包 try/catch——失败时 warnCanvas 后
+  // 跳过整个 legacy overlay，保留上方已修复的 canvases。
+  if (Array.isArray(persisted.nodes) && Array.isArray(persisted.tasks)) {
+    try {
+      if (persisted.edges !== undefined && !Array.isArray(persisted.edges)) {
+        throw new Error('persisted.edges 不是数组')
+      }
+      const currentDocument = documentFor(canvases, sceneId)
+      const normalizedDocument = normalizeDocument({
+        ...currentDocument,
+        nodes: persisted.nodes,
+        edges: persisted.edges || currentDocument.edges || [],
+        tasks: persisted.tasks,
+        selectedNodeId: persisted.selectedNodeId,
+        selectedNodeIds: persisted.selectedNodeIds,
+      })
+      canvases[sceneId] = shouldNormalizeLongMarkdown
+        ? {
+            ...normalizedDocument,
+            nodes: normalizeLongMarkdownPreviewNodes(normalizedDocument.nodes),
+          }
+        : normalizedDocument
+    } catch (error) {
+      warnCanvas(`hydration 跳过 legacy flat-state overlay（损坏）：${error instanceof Error ? error.message : String(error)}`)
+    }
   }
 
   const activeDocument = documentFor(canvases, sceneId)

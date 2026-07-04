@@ -193,4 +193,93 @@ describe('migratePersistedState (canvas persist v8)', () => {
       expect(result.activeTool).toBe('select')
     })
   })
+
+  describe('S03: hydration corrupt-entry isolation', () => {
+    it('drops a single corrupt canvas while preserving the rest (two good, one bad)', () => {
+      const good1 = { title: 'g1', nodes: [imageNode({ id: 'g1-img' })], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] }
+      const good2 = { title: 'g2', nodes: [imageNode({ id: 'g2-img' })], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] }
+      const bad = { title: 'bad', nodes: 42 as never, edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] }
+
+      const result = migratePersistedState(
+        { sceneId: 'g1', canvases: { g1: good1, g2: good2, 'bad-canvas': bad } },
+        8,
+      )
+
+      expect(result.canvases.g1.nodes.map((n) => n.id)).toContain('g1-img')
+      expect(result.canvases.g2.nodes.map((n) => n.id)).toContain('g2-img')
+      expect(result.canvases['bad-canvas']).toBeUndefined() // 自定义 id 无 fallback → 删除
+      expect(result.sceneId).toBe('g1')
+    })
+
+    it('falls back to the default scene when the active canvas is the corrupt one', () => {
+      const good = { title: 'g', nodes: [imageNode({ id: 'g-img' })], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] }
+      const bad = { title: 'bad', nodes: {} as never, edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] }
+
+      const result = migratePersistedState(
+        { sceneId: 'bad-active', canvases: { 'good-scene': good, 'bad-active': bad } },
+        8,
+      )
+
+      expect(result.canvases['good-scene'].nodes.map((n) => n.id)).toContain('g-img')
+      expect(result.canvases['bad-active']).toBeUndefined()
+      expect(result.sceneId).toBe('character-flow') // 坏活跃画布 → 回落默认
+    })
+
+    it('restores the initial demo canvas when a corrupt entry has a demo scene id', () => {
+      const bad = { title: 'bad', nodes: 42 as never, edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] }
+
+      const result = migratePersistedState(
+        { sceneId: 'character-flow', canvases: { 'character-flow': bad } },
+        8,
+      )
+
+      expect(result.canvases['character-flow']).toBeDefined()
+      expect(Array.isArray(result.canvases['character-flow'].nodes)).toBe(true)
+      expect(result.sceneId).toBe('character-flow')
+    })
+
+    it('skips the legacy flat-state overlay when top-level nodes is corrupt (non-array)', () => {
+      const good = { title: 'g', nodes: [imageNode({ id: 'g-img' })], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] }
+
+      const result = migratePersistedState(
+        { sceneId: 'g', canvases: { g: good }, nodes: 42 as never, tasks: [task()] },
+        7,
+      )
+
+      // canvases 保留；legacy overlay 未进入（nodes 非数组），不抛错
+      expect(result.canvases.g.nodes.map((n) => n.id)).toContain('g-img')
+      expect(result.sceneId).toBe('g')
+    })
+
+    it('skips the legacy flat-state overlay when edges is corrupt but nodes/tasks are arrays', () => {
+      const good = { title: 'g', nodes: [imageNode({ id: 'g-img' })], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] }
+
+      const result = migratePersistedState(
+        {
+          sceneId: 'g',
+          canvases: { g: good },
+          nodes: [imageNode({ id: 'legacy-img' })],
+          edges: 42 as never,
+          tasks: [task()],
+        },
+        7,
+      )
+
+      // canvases 保留（overlay 抛错被 catch，跳过）
+      expect(result.canvases.g.nodes.map((n) => n.id)).toContain('g-img')
+      // legacy overlay 未应用（g 仍是原 good，没被 legacy 覆盖）
+      expect(result.canvases.g.nodes.some((n) => n.id === 'legacy-img')).toBe(false)
+    })
+
+    it('is idempotent: migrating twice yields the same result', () => {
+      const good = { title: 'g', nodes: [imageNode({ id: 'g-img' })], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] }
+      const input = { sceneId: 'g', canvases: { g: good } }
+
+      const first = migratePersistedState(input, 8)
+      const second = migratePersistedState(first, 8)
+
+      expect(second.canvases.g.nodes.map((n) => n.id)).toEqual(first.canvases.g.nodes.map((n) => n.id))
+      expect(second.sceneId).toBe(first.sceneId)
+    })
+  })
 })
