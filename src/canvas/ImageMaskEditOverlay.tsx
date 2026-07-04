@@ -111,6 +111,18 @@ const regionPath = (
     }
   }
 
+  // 单点 brush（点选工具产物）：SVG 单点 polyline 不绘制任何内容，按 mask 实际
+  // 覆盖范围（buildEditMaskBlob 对单点填充圆）渲染为圆形反馈。
+  if (region.points.length === 1) {
+    const center = imagePixelToNodePoint(region.points[0], displayRect, naturalSize, imageCrop)
+    return {
+      kind: 'circle' as const,
+      cx: center.x,
+      cy: center.y,
+      r: radiusToNode(region.points[0], region.radius, displayRect, naturalSize, imageCrop),
+    }
+  }
+
   return {
     kind: 'polyline' as const,
     points: region.points.map((point) => imagePixelToNodePoint(point, displayRect, naturalSize, imageCrop)),
@@ -551,6 +563,17 @@ export function ImageMaskEditOverlay({
             })}
             {renderedRegions.map((region, index) => {
               const shape = regionPath(region, displayRect, naturalSize, node.imageCrop)
+              if (shape.kind === 'circle') {
+                return (
+                  <circle
+                    key={index}
+                    className="image-mask-edit-region point-anchor"
+                    cx={shape.cx}
+                    cy={shape.cy}
+                    r={shape.r}
+                  />
+                )
+              }
               if (shape.kind === 'rect') {
                 return (
                   <rect

@@ -1,5 +1,5 @@
 import { Fragment, useMemo, useState } from 'react'
-import { Brush } from 'lucide-react'
+import { Crosshair } from 'lucide-react'
 import { useCanvasStore } from '../store/canvasStore'
 import type { ToolId } from '../types/mivoCanvas'
 import {
@@ -103,7 +103,7 @@ export function CanvasToolDock({ previewTool, onStartMaskEdit }: CanvasToolDockP
                 aria-label="局部重绘"
                 title={selectedImageNodeId ? '局部重绘' : '先选择一张图片'}
               >
-                <Brush size={20} />
+                <Crosshair size={20} />
               </button>
             </Fragment>
           )
