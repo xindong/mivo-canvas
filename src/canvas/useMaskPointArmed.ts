@@ -173,6 +173,12 @@ export function useMaskPointArmed({
           sourceTitle: source.title,
           baselineSnapshot,
         })
+        // W2 fix: 失败/取消终态同样要清 maskEditNodeId，否则 overlay 不 detach
+        // （CanvasNodeView 的 ImageMaskEditOverlay gated on node.id===maskEditNodeId）。
+        // 成功路径在 try 末尾清；失败路径此前漏清 → SC-W2② 三态 e2e 超时。
+        maskEditNodeIdRef.current = undefined
+        setMaskEditNodeId(undefined)
+        clearPendingInitialPoint('mask edit failed')
         const latestCanvasState = useCanvasStore.getState()
         if (latestCanvasState.sceneId !== targetSceneId) {
           useChatStore.getState().appendNotice({
