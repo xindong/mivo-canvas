@@ -9,8 +9,54 @@
 //  SC4.3 出图后占位符原地替换为结果图（位置=A 右侧 56px、复用 slot id、血缘挂原图 A）
 //  SC4.5 非局部重绘生成（beside）不触发挤开：右侧障碍不被推走
 //
-// mask-edit 走同步 /api/mivo/edit 路由（submitMaskEdit 不经 generationSlice）；用一个
-// gated /edit mock 把响应挂起，以便在「预建槽 + reflow 已发生、出图前」观测 SC4.1/SC4.2。
+// W2 (QoL batch): mask-edit 从 sync /api/mivo/edit 迁移到 async tasks API
+// (POST /tasks/edit → 202 → poll GET /tasks/:id)。用一个 gated /tasks/* GET mock
+// 把 poll 挂起，以便在「预建槽 + reflow 已发生、出图前」观测 SC4.1/SC4.2；release
+// 后返 done（SC4.3 原地替换）或 failed（SC5.3 回滚）。SC4.5 用默认 progressive mock，
+// 故每次 gated 段结束后须 unroute + 恢复默认 /tasks/* 给后续用例。
+import { doneTaskView, failedTaskView } from '../api-mocks.mjs'
+
+// 恢复默认 progressive /tasks/* GET mock（SC4.5 beside 生成依赖它 poll 到 done）。
+// 与 api-mocks.attachDefaultMivoApiMocks 的 /tasks/* 路由同形；mask-reflow 在 gated
+// 段 unroute 后调用本函数重建。内联而非 import 是为避免改共享文件误伤其他 e2e。
+const restoreDefaultTasksGetMock = async (page, generatedImageB64) => {
+  const sequence = [
+    { id: 'task-e2e', kind: 'generate', status: 'running', progress: 10, stage: 'submit', requestId: 'e2e-1', model: 'gpt-image-2' },
+    { id: 'task-e2e', kind: 'generate', status: 'running', progress: 30, stage: 'poll', requestId: 'e2e-1', model: 'gpt-image-2' },
+    { id: 'task-e2e', kind: 'generate', status: 'running', progress: 60, stage: 'poll', requestId: 'e2e-1', model: 'gpt-image-2' },
+    { id: 'task-e2e', kind: 'generate', status: 'done', progress: 100, stage: 'done', requestId: 'e2e-1', model: 'gpt-image-2', result: { images: [{ b64: generatedImageB64 }] } },
+  ]
+  let getCalls = 0
+  await page.route('**/api/mivo/tasks/*', async (route) => {
+    const method = route.request().method()
+    if (method === 'DELETE') {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ id: 'task-e2e', status: 'canceled' }) })
+      return
+    }
+    if (method !== 'GET') { await route.fallback(); return }
+    getCalls += 1
+    const view = sequence[Math.min(getCalls - 1, sequence.length - 1)]
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(view) })
+  })
+}
+
+// Gated /tasks/* GET mock：poll 被 gate Promise 挂起直到 release()；释放后返回 releaseView。
+// POST/DELETE 走 fallback/取消，不阻塞 /tasks/edit POST（落到默认 /tasks/edit 路由）。
+const attachGatedTasksGetMock = async (page, releaseView) => {
+  let release
+  const gate = new Promise((resolve) => { release = resolve })
+  await page.route('**/api/mivo/tasks/*', async (route) => {
+    const method = route.request().method()
+    if (method === 'DELETE') {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ id: 'task-e2e', status: 'canceled' }) })
+      return
+    }
+    if (method !== 'GET') { await route.fallback(); return }
+    await gate
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(releaseView) })
+  })
+  return release
+}
 
 const readNodeGeometry = async (page, spec) =>
   page.evaluate(async (moduleSpec) => {
@@ -133,16 +179,12 @@ export const runMaskReflowScenario = async (context) => {
   await page.locator(`[data-node-id="${imgA.id}"]`).click()
   await openMaskPointRegion(page)
 
-  // submitMaskEdit → editMivoImage POSTs the sync /api/mivo/edit route (returns
-  // images directly). Gate that response so the prebuilt generating slot + reflow
-  // are observable before the result lands; releaseEdit() lets it finish.
-  let releaseEdit
-  const editGate = new Promise((resolve) => { releaseEdit = resolve })
-  const editHandler = async (route) => {
-    await editGate
-    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: generatedImageB64 }] }) })
-  }
-  await page.route('**/api/mivo/edit', editHandler)
+  // submitMaskEdit → POST /tasks/edit (202) → poll GET /tasks/:id. Unroute the
+  // default progressive /tasks/* mock and attach a gated one that holds the poll
+  // so the prebuilt generating slot + reflow are observable before the result
+  // lands; releaseEdit() lets the poll return done (SC4.3 in-place replace).
+  await page.unroute('**/api/mivo/tasks/*')
+  const releaseEdit = await attachGatedTasksGetMock(page, doneTaskView([{ b64: generatedImageB64 }]))
 
   let slotId
   try {
@@ -209,9 +251,11 @@ export const runMaskReflowScenario = async (context) => {
       throw new Error(`SC4.3: result lineage should point at source A, not itself: ${JSON.stringify(lineageOk)}`)
     }
   } finally {
-    // Ensure the gate is released and the overlay is torn down before moving on.
+    // Ensure the gate is released, the gated /tasks/* mock is removed, and the
+    // default progressive /tasks/* is restored for the SC4.5 beside generation.
     releaseEdit()
-    await page.unroute('**/api/mivo/edit', editHandler)
+    await page.unroute('**/api/mivo/tasks/*')
+    await restoreDefaultTasksGetMock(page, generatedImageB64)
     await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' }).catch(() => {})
   }
 
@@ -269,18 +313,14 @@ export const runMaskReflowScenario = async (context) => {
   await page.locator(`[data-node-id="${failA.id}"]`).click()
   await openMaskPointRegion(page)
 
-  // Gate the /edit response, then return a 200 whose body fails client-side
-  // validation (empty b64) so editMivoImage throws WITHOUT a browser-level resource
-  // error (a raw 5xx would be flagged by the harness console-error guard). This drives
-  // submitMaskEdit's catch → removeMaskEditPlaceholder (rollback to the pre-slot
-  // baseline: slot removed + reflow displacement undone).
-  let releaseFail
-  const failGate = new Promise((resolve) => { releaseFail = resolve })
-  const failHandler = async (route) => {
-    await failGate
-    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ images: [{ b64: '' }] }) })
-  }
-  await page.route('**/api/mivo/edit', failHandler)
+  // Gate the /tasks/:id poll, then release with a failed view so the poll loop
+  // throws → submitMaskEdit's catch → removeMaskEditPlaceholder (rollback to the
+  // pre-slot baseline: slot removed + reflow displacement undone). failedTaskView
+  // drives failure through runMaskEditGeneration's debugLogger.error path (not
+  // console.error), so the harness console-error guard isn't tripped — same pattern
+  // as mask.mjs SC-W2② terminal-failure e2e.
+  await page.unroute('**/api/mivo/tasks/*')
+  const releaseFail = await attachGatedTasksGetMock(page, failedTaskView('mask edit e2e failure', { status: 'failed', progress: 50 }))
   try {
     await page.locator('.image-mask-edit-prompt textarea').fill('E2E mask edit failure cleanup')
     await page.locator('.image-mask-edit-prompt').getByRole('button', { name: '局部重绘' }).click()
@@ -307,7 +347,8 @@ export const runMaskReflowScenario = async (context) => {
     }
   } finally {
     releaseFail()
-    await page.unroute('**/api/mivo/edit', failHandler)
+    await page.unroute('**/api/mivo/tasks/*')
+    await restoreDefaultTasksGetMock(page, generatedImageB64)
     await page.keyboard.press('Escape').catch(() => {})
     await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' }).catch(() => {})
   }

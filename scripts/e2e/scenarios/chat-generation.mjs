@@ -87,8 +87,7 @@ export const runChatGenerationScenario = async (context) => {
       }),
     })
   })
-  // Restore default /tasks/generate (202 {taskId}) for chat-based generation; the
-  // default GET /tasks/:id progressive mock drives real server-side progress.
+  // Restore default /tasks/generate (202 {taskId}) for chat-based generation.
   await page.unroute('**/api/mivo/tasks/generate')
   await page.route('**/api/mivo/tasks/generate', async (route) => {
     await route.fulfill({
@@ -96,6 +95,30 @@ export const runChatGenerationScenario = async (context) => {
       contentType: 'application/json',
       body: JSON.stringify({ taskId: 'task-e2e' }),
     })
+  })
+  // Re-register GET /tasks/:id with a FRESH progressive counter. The default mock
+  // (attachDefaultMivoApiMocks) holds a module-level getCalls that the first chat
+  // branch already exhausted (4 GETs → 10/30/60/100). Without this reset, the
+  // second generation's first GET clamps to sequence[3]=done(100) → no
+  // intermediate samples → "Expected ≥3 strictly increasing" fails with [100,0,100].
+  await page.unroute('**/api/mivo/tasks/*')
+  let secondGenGetCalls = 0
+  const secondGenSequence = [
+    { id: 'task-e2e', kind: 'generate', status: 'running', progress: 10, stage: 'submit', requestId: 'e2e-1', model: 'gpt-image-2' },
+    { id: 'task-e2e', kind: 'generate', status: 'running', progress: 30, stage: 'poll', requestId: 'e2e-1', model: 'gpt-image-2' },
+    { id: 'task-e2e', kind: 'generate', status: 'running', progress: 60, stage: 'poll', requestId: 'e2e-1', model: 'gpt-image-2' },
+    { id: 'task-e2e', kind: 'generate', status: 'done', progress: 100, stage: 'done', requestId: 'e2e-1', model: 'gpt-image-2', result: { images: [{ b64: generatedImageB64 }] } },
+  ]
+  await page.route('**/api/mivo/tasks/*', async (route) => {
+    const method = route.request().method()
+    if (method === 'DELETE') {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ id: 'task-e2e', status: 'canceled' }) })
+      return
+    }
+    if (method !== 'GET') { await route.fallback(); return }
+    secondGenGetCalls += 1
+    const view = secondGenSequence[Math.min(secondGenGetCalls - 1, secondGenSequence.length - 1)]
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(view) })
   })
 
   // P2-C1b: subscribe to canvasStore tasks to capture real server-side progress
@@ -166,11 +189,15 @@ export const runChatGenerationScenario = async (context) => {
     throw new Error(`Chat image-to-image should not create derivation edges: ${JSON.stringify(newChatEdges)}`)
   }
 
-  // Assert chat state: param card appeared in assistant bubble
-  await page.waitForSelector('.chat-param-card')
-  const paramCardVisible = await page.locator('.chat-param-card').isVisible()
-  if (!paramCardVisible) throw new Error('Enhance param card should be visible after generation')
+  // Assert chat state: param card appeared in assistant bubble. W4 makes BOTH
+  // chat branches generate (image always ships), so two .chat-param-card exist
+  // by this point. The first (from the earlier "这里能对话么" branch) may be
+  // scrolled/collapsed out of visibility; target the LAST one — the card from
+  // the generation that just completed — consistent with the .last() usage below.
   const paramCard = page.locator('.chat-param-card').last()
+  await paramCard.waitFor({ state: 'visible' })
+  const paramCardVisible = await paramCard.isVisible()
+  if (!paramCardVisible) throw new Error('Enhance param card should be visible after generation')
   // R6 SC-e: 参数卡不再渲染 scene chip 与比例/质量 chips 行（composer 底部按钮已可见，卡内不重复）；保留「预计较慢」提示
   const paramCardText = await paramCard.innerText()
   if (!paramCardText.includes('预计较慢')) {
