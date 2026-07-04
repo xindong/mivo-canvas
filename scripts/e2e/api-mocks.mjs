@@ -115,7 +115,13 @@ export const attachDefaultMivoApiMocks = async (page, { generatedImageB64, mivoE
       return
     }
     if (method !== 'GET') {
-      await route.continue()
+      // W2/W3 (QoL batch): mask-edit now POSTs /tasks/edit (async) instead of the
+      // sync /edit route. This catch-all must NOT continue POSTs to /tasks/edit or
+      // /tasks/generate through to the real BFF (it would burn a real upstream call
+      // and bypass the mivoEditRequests capture). Defer to the more-specific routes
+      // registered above (L48 /tasks/generate, L58 /tasks/edit) via fallback; only
+      // fall through to the network if no other route matches.
+      await route.fallback()
       return
     }
     getCalls += 1
