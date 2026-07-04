@@ -14,6 +14,7 @@ import {
   isDerivationEdgeNode,
 } from './nodeFactory'
 import type { CanvasEdge, MivoCanvasNode } from '../types/mivoCanvas'
+import { normalizeCanvasNodeV2 } from '../model/documentModelV2'
 
 // Helpers ---------------------------------------------------------------------
 
@@ -171,6 +172,84 @@ describe('cloneNode (geometry clone + deep isolation)', () => {
   it('leaves experimentalAnchors undefined for a bare node', () => {
     const clone = cloneNode(imageNode({ id: 'a' }))
     expect(clone.experimentalAnchors).toBeUndefined()
+  })
+})
+
+describe('cloneNode — deep-copy contract for the seven normalized sub-objects', () => {
+  // Locks the commit #1 split: cloneNode must call cloneCanvasNodeV2 (always full
+  // rebuild), NOT normalizeCanvasNodeV2 (which gains a return-same-reference fast
+  // path in commit #2). history / clipboard / persist rely on every sub-object being
+  // a fresh clone — if cloneNode ever shared a sub-object reference with the source, a
+  // later source mutation would leak into the clone. The seven sub-objects: fills,
+  // strokes, effects, layout, constraints, asset, relations (with nested parentIds /
+  // connectorStart / aiWorkflow.sourceNodeIds).
+  const buildOnce = (): MivoCanvasNode => {
+    const source: MivoCanvasNode = {
+      id: 'clone-src',
+      type: 'frame',
+      title: 'Clone source',
+      x: 10,
+      y: 20,
+      width: 300,
+      height: 200,
+      status: 'ready',
+      transform: { x: 10, y: 20, width: 300, height: 200, rotation: 0 },
+      fills: [{ id: 'fill-1', kind: 'solid', color: '#123456', opacity: 0.5, visible: true }],
+      strokes: [{ id: 'stroke-1', color: '#654321', width: 4, style: 'dashed', opacity: 0.75, visible: true }],
+      effects: [{ id: 'effect-1', kind: 'shadow', color: '#000000', x: 2, y: 2, blur: 4, spread: 0, opacity: 0.5, visible: true }],
+      layout: { mode: 'auto', direction: 'horizontal', gap: 8, padding: { top: 1, right: 2, bottom: 3, left: 4 } },
+      constraints: { horizontal: 'left', vertical: 'top' },
+      asset: { url: '/asset.png', mimeType: 'image/png', originalName: 'asset.png', sizeBytes: 128 },
+      relations: {
+        parentIds: ['parent-1'],
+        sectionId: 'section-1',
+        connectorStart: { nodeId: 'from-1', anchor: 'center' },
+        aiWorkflow: { kind: 'result', sourceNodeIds: ['source-2'] },
+      },
+    }
+    return normalizeCanvasNodeV2(source)
+  }
+
+  it('produces fresh references for all seven sub-objects (not shared with the source)', () => {
+    const once = buildOnce()
+    const clone = cloneNode(once)
+
+    expect(clone.fills).not.toBe(once.fills)
+    expect(clone.strokes).not.toBe(once.strokes)
+    expect(clone.effects).not.toBe(once.effects)
+    expect(clone.layout).not.toBe(once.layout)
+    expect(clone.constraints).not.toBe(once.constraints)
+    expect(clone.asset).not.toBe(once.asset)
+    expect(clone.relations).not.toBe(once.relations)
+  })
+
+  it('produces fresh references for nested relations fields (parentIds / connectorStart / aiWorkflow.sourceNodeIds)', () => {
+    const once = buildOnce()
+    const clone = cloneNode(once)
+
+    expect(clone.relations?.parentIds).not.toBe(once.relations?.parentIds)
+    expect(clone.relations?.connectorStart).not.toBe(once.relations?.connectorStart)
+    expect(clone.relations?.aiWorkflow?.sourceNodeIds).not.toBe(once.relations?.aiWorkflow?.sourceNodeIds)
+  })
+
+  it('isolates mutations: changing the source after clone does not leak into the clone', () => {
+    const once = buildOnce()
+    const clone = cloneNode(once)
+
+    ;(once.fills![0] as { color: string }).color = '#ff0000'
+    once.relations!.parentIds!.push('parent-2')
+    once.layout!.padding!.top = 99
+
+    expect((clone.fills![0] as { color: string }).color).toBe('#123456')
+    expect(clone.relations?.parentIds).toEqual(['parent-1'])
+    expect(clone.layout?.padding?.top).toBe(1)
+  })
+
+  it('is value-equal to the source (deep)', () => {
+    const once = buildOnce()
+    const clone = cloneNode(once)
+
+    expect(clone).toEqual(once)
   })
 })
 

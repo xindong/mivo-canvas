@@ -31,6 +31,7 @@ import { StampOptionsBar } from './StampOptionsBar'
 import { stampCursorCssFor, stampGrowthSizes, stampSrcFor } from './stampDefs'
 import { useCanvasInteractionController } from './useCanvasInteractionController'
 import { useMaskPointArmed, type MaskPointArmedInteractionApi } from './useMaskPointArmed'
+import { lockedNodeIdSetFor } from './useNodeTransform'
 import { rendererMode } from '../render/rendererMode'
 import { cullingMode } from '../render/cullingMode'
 
@@ -80,7 +81,9 @@ const isCanvasChromeTarget = (target: EventTarget | null) =>
 
 const canvasRenderOverscanPx = 520
 
-const rectsIntersect = (
+// C05: closed-interval (>=) intersection — culling over-renders to avoid border popping.
+// Disambiguates from canvasInteraction.rectsIntersect (open-interval, selection-semantics).
+const rectsIntersectInclusive = (
   a: { x: number; y: number; width: number; height: number },
   b: { x: number; y: number; width: number; height: number },
 ) => a.x + a.width >= b.x && b.x + b.width >= a.x && a.y + a.height >= b.y && b.y + b.height >= a.y
@@ -89,14 +92,6 @@ const canImportDataTransfer = (dataTransfer: DataTransfer) =>
   Array.from(dataTransfer.files).some(canImportCanvasFile) ||
   dataTransfer.types.includes('Files') ||
   canReadLocalAssetDrag(dataTransfer)
-
-const isNodeEffectivelyLocked = (nodeId: string, nodes: Array<{ id: string; type: string; sectionId?: string; locked?: boolean; sectionLockMode?: string }>) => {
-  const node = nodes.find((item) => item.id === nodeId)
-  if (!node) return false
-
-  const section = node.sectionId ? nodes.find((item) => item.id === node.sectionId && item.type === 'frame') : undefined
-  return Boolean(node.locked || section?.sectionLockMode === 'all')
-}
 
 export function MivoCanvas({
   onOpenDetails,
@@ -136,6 +131,9 @@ export function MivoCanvas({
   const hasAnchors = useCanvasStore((state) => state.nodes.some((node) => Boolean(node.experimentalAnchors?.length)))
   const contextMenuNodeId = contextMenu?.nodeId
   const visibleNodes = useMemo(() => nodes.filter((node) => !node.hidden), [nodes])
+  // C03+C04 (commit #4): O(n) memoized locked-id set replaces the per-rendered-node
+  // local find (was O(n²) on renderedNodes). Re-derived only when visibleNodes changes.
+  const lockedNodeIds = useMemo(() => lockedNodeIdSetFor(visibleNodes), [visibleNodes])
   const contextMenuNode =
     contextMenu?.kind === 'node' ? visibleNodes.find((node) => node.id === contextMenuNodeId) : undefined
   const cropNode = cropNodeId ? visibleNodes.find((node) => node.id === cropNodeId && node.type === 'image') : undefined
@@ -245,7 +243,7 @@ export function MivoCanvas({
     if (maskEditNodeId) pinnedNodeIds.add(maskEditNodeId)
     if (contextMenuNodeId) pinnedNodeIds.add(contextMenuNodeId)
 
-    return visibleNodes.filter((node) => pinnedNodeIds.has(node.id) || rectsIntersect(node, viewportRect))
+    return visibleNodes.filter((node) => pinnedNodeIds.has(node.id) || rectsIntersectInclusive(node, viewportRect))
   }, [
     contextMenuNodeId,
     cropNodeId,
@@ -691,7 +689,7 @@ export function MivoCanvas({
                 node.id === selectedNodeId &&
                 node.id !== cropNodeId
               }
-              effectiveLocked={isNodeEffectivelyLocked(node.id, visibleNodes)}
+              effectiveLocked={lockedNodeIds.has(node.id)}
               handleSize={handleSize}
               handleBorderWidth={handleBorderWidth}
               selectionStrokeWidth={selectionStrokeWidth}
