@@ -365,3 +365,63 @@ describe('experimentalAnchors (P2-D1 light validation)', () => {
     expect(result.ok).toBe(true)
   })
 })
+
+// --- Phase 3a: assetSourceDimensions validation (metrics track) ---------------
+
+describe('assetSourceDimensions (Phase 3a light validation)', () => {
+  it('accepts a node with valid assetSourceDimensions', () => {
+    const result = parse(
+      validSnapshot({
+        nodes: [validImageNode({ assetSourceDimensions: { width: 1920, height: 1080 } })],
+      }),
+    )
+    expect(result.ok).toBe(true)
+  })
+
+  it('accepts a node with no assetSourceDimensions (legacy / backward compatible)', () => {
+    const result = parse(validSnapshot({ nodes: [validImageNode()] }))
+    expect(result.ok).toBe(true)
+  })
+
+  it('rejects { width: 0 } (non-positive)', () => {
+    const result = parse(
+      validSnapshot({ nodes: [validImageNode({ assetSourceDimensions: { width: 0, height: 100 } as unknown as never })] }),
+    )
+    expect(result.ok).toBe(false)
+  })
+
+  it('rejects { height: -1 } (negative)', () => {
+    const result = parse(
+      validSnapshot({ nodes: [validImageNode({ assetSourceDimensions: { width: 100, height: -1 } as unknown as never })] }),
+    )
+    expect(result.ok).toBe(false)
+  })
+
+  it('rejects { width: "1" } (non-numeric)', () => {
+    const result = parse(
+      validSnapshot({ nodes: [validImageNode({ assetSourceDimensions: { width: '1', height: 1 } as unknown as never })] }),
+    )
+    expect(result.ok).toBe(false)
+  })
+
+  it('rejects a non-object assetSourceDimensions', () => {
+    const result = parse(
+      validSnapshot({ nodes: [validImageNode({ assetSourceDimensions: 'big' as unknown as never })] }),
+    )
+    expect(result.ok).toBe(false)
+  })
+
+  it('an old snapshot (no assetSourceDimensions anywhere) still parses', () => {
+    // Minimal legacy snapshot — no assetSourceDimensions field on any node.
+    const result = parse({
+      version: 2,
+      sceneId: 'legacy',
+      nodes: [
+        { id: 'a', type: 'image', title: 'A', x: 0, y: 0, width: 10, height: 10, status: 'ready', assetUrl: '/a.png' },
+      ],
+      edges: [],
+      tasks: [],
+    })
+    expect(result.ok).toBe(true)
+  })
+})
