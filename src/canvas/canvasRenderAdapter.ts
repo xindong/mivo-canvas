@@ -30,20 +30,30 @@ const isVisibleSolidFill = (fill: CanvasNodeFill): fill is CanvasNodeSolidFill =
 
 const visibleStroke = (stroke: CanvasNodeStroke) => stroke.visible
 
-const firstSolidFillFor = (node: MivoCanvasNode) => normalizeCanvasNodeV2(node).fills?.find(isVisibleSolidFill)
+// R02 (commit #3): the three helpers no longer normalize internally — each exported
+// function below normalizes exactly once and passes the already-normalized node in.
+// Before this change, frameRenderStyleFor / markupRenderStyleFor each called
+// firstSolidFillFor + firstStrokeFor (2 normalizes) + transformFor (1) = up to 3
+// normalizes per node per frame. With the R01 fast path, normalize on a store node is
+// an O(1) predicate that returns the same reference — but collapsing to one call still
+// removes the redundant predicate passes and makes the cost obvious in profiles.
+const firstSolidFillOf = (n: MivoCanvasNode) => n.fills?.find(isVisibleSolidFill)
 
-const firstStrokeFor = (node: MivoCanvasNode) => normalizeCanvasNodeV2(node).strokes?.find(visibleStroke)
+const firstStrokeOf = (n: MivoCanvasNode) => n.strokes?.find(visibleStroke)
 
-const transformFor = (node: MivoCanvasNode) => normalizeCanvasNodeV2(node).transform || {
-  x: node.x,
-  y: node.y,
-  width: node.width,
-  height: node.height,
-  rotation: 0,
-}
+const transformOf = (n: MivoCanvasNode) =>
+  n.transform || {
+    x: n.x,
+    y: n.y,
+    width: n.width,
+    height: n.height,
+    rotation: 0,
+  }
 
 export const nodeRenderBoxFor = (node: MivoCanvasNode): NodeRenderBox => {
-  const transform = transformFor(node)
+  // defensive normalize once — store nodes are already normalized (R01 fast path makes
+  // this an O(1) same-ref return), but external callers may pass legacy-shaped nodes.
+  const transform = transformOf(normalizeCanvasNodeV2(node))
   const translate = `translate(${transform.x}px, ${transform.y}px)`
   const rotate = transform.rotation ? ` rotate(${transform.rotation}deg)` : ''
 
@@ -56,8 +66,9 @@ export const nodeRenderBoxFor = (node: MivoCanvasNode): NodeRenderBox => {
 }
 
 export const frameRenderStyleFor = (node: MivoCanvasNode): FrameRenderStyle => {
-  const fill = firstSolidFillFor(node)
-  const stroke = firstStrokeFor(node)
+  const n = normalizeCanvasNodeV2(node) // exactly one normalize per call
+  const fill = firstSolidFillOf(n)
+  const stroke = firstStrokeOf(n)
 
   return {
     '--section-fill-color': fill?.color || node.sectionFillColor || '#ffffff',
@@ -68,8 +79,9 @@ export const frameRenderStyleFor = (node: MivoCanvasNode): FrameRenderStyle => {
 }
 
 export const markupRenderStyleFor = (node: MivoCanvasNode): MarkupRenderStyle => {
-  const fill = firstSolidFillFor(node)
-  const stroke = firstStrokeFor(node)
+  const n = normalizeCanvasNodeV2(node) // exactly one normalize per call
+  const fill = firstSolidFillOf(n)
+  const stroke = firstStrokeOf(n)
 
   return {
     fill: fill?.color || node.markupFillColor || 'rgba(105, 87, 232, 0.08)',
