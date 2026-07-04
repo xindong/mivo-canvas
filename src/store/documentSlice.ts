@@ -261,6 +261,23 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
     ) {
       throw new Error('源节点已删除，无法继续生成。')
     }
+    // S02: 资产已落盘——lineageSource / replacementSlot 在 await 期间被删时必须显式抛错
+    // （文案带已保存资产名，便于人工找回孤儿资产），不再让 set 内静默 return 造成
+    // "生成成功但画布无节点"的假成功。await 前的入参校验（:228-240）保持原文案不变
+    // （那时还没有资产）。
+    const savedNames = savedImages.map((s) => s.asset.name).join(', ')
+    const currentLineageSource = lineageSourceId
+      ? currentDocument.nodes.find((node) => node.id === lineageSourceId && !node.hidden)
+      : undefined
+    if (lineageSourceId && !currentLineageSource) {
+      throw new Error(`源节点已删除，生成结果未落画布。已保存资产：${savedNames}`)
+    }
+    const currentReplacementSlot = replaceSlotId
+      ? currentDocument.nodes.find((node) => node.id === replaceSlotId && node.type === 'ai-slot' && !node.hidden)
+      : undefined
+    if (replaceSlotId && !currentReplacementSlot) {
+      throw new Error(`AI 生成槽位已删除，生成结果未落画布。已保存资产：${savedNames}`)
+    }
 
     set((state) => {
       const targetDocument = state.canvases[targetSceneId]
@@ -370,6 +387,13 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
         edges: nextEdges,
       }, { history: !replaceSlotId })
     })
+
+    // S02: 落地断言——资产已保存但无任何节点落地（set 内同 tick 竞态最后防线触发了
+    // 静默 return {}）时显式抛错带资产名，避免假成功。正常流下上提校验已拦住所有
+    // 删除场景，此断言为防御性最后防线。
+    if (savedImages.length > 0 && createdNodeIds.length === 0) {
+      throw new Error(`生成结果未落画布（画布状态在保存期间变化）。已保存资产：${savedNames}`)
+    }
 
     return createdNodeIds
   },
