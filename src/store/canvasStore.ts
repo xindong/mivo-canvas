@@ -22,7 +22,6 @@ import type {
   SectionLockMode,
   ToolId,
 } from '../types/mivoCanvas'
-import { defaultStampKind } from '../canvas/stampDefs'
 import { type ImportedFileMetadata } from '../lib/canvasAssetImport'
 import { importedImageDisplaySize, type ImportedImageMetadata } from '../lib/imageSizing'
 import { saveGeneratedAsset } from '../lib/assetStorage'
@@ -36,21 +35,13 @@ import type {
   GenerationRatio,
   MivoImageQuality, VariationParam,
 } from '../types/generation'
-import {
-  compactCanvasesForPersist,
-  defaultBrushStyle,
-  documentFor,
-  initialCanvases,
-  normalizeDocument,
-  normalizeLongMarkdownPreviewNodes,
-  selectionFrom,
-} from './canvasDocumentModel'
+import { compactCanvasesForPersist } from './canvasDocumentModel'
 import { createDocumentSlice } from './documentSlice'
 import { createNodeMutationSlice } from './nodeMutationSlice'
 import { createNodeCreationSlice } from './nodeCreationSlice'
 import { createGenerationSlice } from './generationSlice'
 import { createSelectionSlice } from './selectionSlice'
-import { mergeCanvasPersistedState } from './canvasGenerationHydration'
+import { mergeCanvasPersistedState, migratePersistedState } from './canvasGenerationHydration'
 
 type LayerMove = 'forward' | 'backward' | 'front' | 'back'
 export type SelectionAlignment = 'left' | 'center' | 'right' | 'top' | 'middle' | 'bottom'
@@ -262,22 +253,6 @@ export type CanvasState = {
   getAiContextSnapshot: () => AiCanvasContextSnapshot
 }
 
-type PersistedCanvasState = Partial<
-  Pick<
-    CanvasState,
-    | 'canvases'
-    | 'nodes'
-    | 'edges'
-    | 'tasks'
-    | 'sceneId'
-    | 'selectedNodeId'
-    | 'selectedNodeIds'
-    | 'activeTool'
-    | 'brushStyle'
-    | 'activeStampKind'
-  >
->
-
 export { scenes }
 export const blobFromCommittedGenerationImage = (image: CommittedGenerationImage) => {
   if (image.blob) return image.blob
@@ -315,71 +290,11 @@ export const displaySizeForGeneratedAsset = (
 
 
 
-// Persisted-state migration is exported so canvasStoreMigrate.test.ts can cover the
-// v8 migration branches (flat-state compat, <6 markdown normalization, <8 brushStyle reset).
-export const migratePersistedState = (persistedState: unknown, persistedVersion = 0) => {
-  const persisted = (persistedState || {}) as PersistedCanvasState
-  const shouldNormalizeLongMarkdown = persistedVersion < 6
-  const canvases = {
-    ...initialCanvases(),
-    ...(persisted.canvases || {}),
-  }
-
-  Object.entries(canvases).forEach(([id, document]) => {
-    const normalizedDocument = normalizeDocument(document)
-    canvases[id] = shouldNormalizeLongMarkdown
-      ? {
-          ...normalizedDocument,
-          nodes: normalizeLongMarkdownPreviewNodes(normalizedDocument.nodes),
-        }
-      : normalizedDocument
-  })
-  const sceneId =
-    persisted.sceneId && canvases[persisted.sceneId]
-      ? persisted.sceneId
-      : 'character-flow'
-
-  if (persisted.nodes && persisted.tasks) {
-    const currentDocument = documentFor(canvases, sceneId)
-    const normalizedDocument = normalizeDocument({
-      ...currentDocument,
-      nodes: persisted.nodes,
-      edges: persisted.edges || currentDocument.edges || [],
-      tasks: persisted.tasks,
-      selectedNodeId: persisted.selectedNodeId,
-      selectedNodeIds: persisted.selectedNodeIds,
-    })
-    canvases[sceneId] = shouldNormalizeLongMarkdown
-      ? {
-          ...normalizedDocument,
-          nodes: normalizeLongMarkdownPreviewNodes(normalizedDocument.nodes),
-        }
-      : normalizedDocument
-  }
-
-  const activeDocument = documentFor(canvases, sceneId)
-  const selection = selectionFrom(activeDocument.selectedNodeIds, activeDocument.selectedNodeId, activeDocument.nodes)
-
-  return {
-    ...persisted,
-    canvases,
-    sceneId,
-    nodes: activeDocument.nodes,
-    edges: activeDocument.edges || [],
-    tasks: activeDocument.tasks,
-    selectedNodeId: selection.selectedNodeId,
-    selectedNodeIds: selection.selectedNodeIds,
-    activeTool: ['comment', 'image', 'video'].includes(String(persisted.activeTool)) ? 'select' : persisted.activeTool || 'select',
-    clipboardNodes: [],
-    clipboardAssets: [],
-    // Version 8 introduced the black default and eraser mode; older persisted styles reset to the new default.
-    brushStyle: persistedVersion < 8 ? defaultBrushStyle : persisted.brushStyle || defaultBrushStyle,
-    activeStampKind: persisted.activeStampKind || defaultStampKind,
-    lastPlacedStampId: undefined,
-    historyPast: [],
-    historyFuture: [],
-  }
-}
+// migratePersistedState lives in canvasGenerationHydration.ts (co-located with
+// settleExpiredCanvasGenerations / mergeCanvasPersistedState — all version-gated
+// hydration logic). Re-exported here so canvasStoreMigrate.test.ts and the
+// persist `migrate` option can keep importing it from the store facade.
+export { migratePersistedState }
 
 export const logCanvas = (message: string) => debugLogger.log('Canvas Store', message)
 export const warnCanvas = (message: string) => debugLogger.warn('Canvas Store', message)
@@ -402,7 +317,7 @@ export const useCanvasStore = create<CanvasState>()(
     }) as CanvasState,
     {
       name: 'mivo-canvas-demo',
-      version: 8,
+      version: 9,
       migrate: migratePersistedState,
       merge: (persistedState, currentState) =>
         mergeCanvasPersistedState(persistedState, currentState, migratePersistedState, warnCanvas),
