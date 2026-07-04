@@ -7,7 +7,7 @@ vi.mock('../lib/demoImages', () => ({
   createDemoImage: () => 'data:image/png;base64,mock-demo-image',
 }))
 
-import { clampChatGenerationContext, migrateChatPersistedState } from './chatStore'
+import { clampChatGenerationContext, migrateChatPersistedState } from './chatStoreMigrate'
 import type { ChatGenerationContext, ChatMessage, ChatParamOverrides } from './chatStore'
 
 // Helpers ---------------------------------------------------------------------
