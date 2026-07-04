@@ -14,25 +14,75 @@ AI-native 的无限画布交互 Demo:以桌面级无限画布为基座,面向视
 
 ## 快速开始
 
+本地开发需要两个进程:BFF 提供 `/api/mivo/*`,前端 dev server 只负责页面与代理。
+
 ```bash
 npm install
-npm run dev        # http://127.0.0.1:5173/
+
+# 终端 A:BFF(API,默认 http://127.0.0.1:8080)
+npm run start:server
+
+# 终端 B:前端(Vite,默认 http://127.0.0.1:5173/)
+npm run dev
 ```
 
-AI 生图为可选功能:在 `.env.local` 中配置 `MIVO_IMAGE_API_KEY`(仅 dev server 使用,不会进入前端)。
+`npm run dev` 会把 `/api/mivo/*` 代理到 BFF。只启动前端时,页面能打开,但 AI 生图 / debug logs / 本地资产等 API 会不可用。
+
+AI 生图为可选功能:密钥由 BFF 进程读取,不会进入前端 bundle。BFF 不会自动加载 `.env.local`,启动前需要把环境导入 shell:
+
+```bash
+set -a && source .env.local && set +a && npm run start:server
+```
+
+常用环境变量:
+
+| 变量 | 作用 |
+|------|------|
+| `MIVO_IMAGE_API_KEY` | llm-proxy 图像生成 / 编辑密钥 |
+| `MIVO_PLATFORM_KEY` | Mivo 平台图像通道密钥(`mivo_` 前缀) |
+| `MIVO_PLATFORM_ENDPOINT` | Mivo 平台 endpoint,默认 `https://aigc.xindong.com` |
+| `MIVO_PORT` | BFF 监听端口,默认 `8080`;改端口时前端进程也要带同一变量 |
+| `MIVO_BFF_DEV_URL` | Vite dev server 代理目标;默认按 `MIVO_PORT` 推导为 `http://127.0.0.1:8080` |
+| `MIVO_BFF_TOKEN` | BFF 访问门 token;本地默认不设,公网模式必须设置 |
+
+完整说明见 [server/README.md](server/README.md) 与 [BFF 部署文档](docs/bff-deployment.md)。
 
 其他命令:
 
 ```bash
-npm run build          # 类型检查 + 构建
-npm run lint           # ESLint
-npm run test:unit      # 单元测试(Vitest)
-npm run test:e2e       # 冒烟测试(Playwright)
+npm run build                  # tsc -b + Vite production build
+npm run lint                   # ESLint
+npm run preview                # 预览 production build
+npm run test:unit              # Vitest 单元测试
+npm run verify:logging         # Debug Log / toast 规则守卫
+npm run test:e2e               # 默认 dev 双进程拓扑 e2e
+npm run test:e2e:dev           # dev 拓扑 e2e
+npm run test:e2e:prod:subset   # production+BFF 子集 e2e(mock upstream)
+npm run test:e2e:prod:full     # production+BFF 全量 e2e(mock upstream)
+npm run test:e2e:prod          # build 后跑 production 拓扑 e2e
+npm run test:e2e:gated:unauthorized  # BFF token gate 未授权 e2e
+npm run test:e2e:gated:authorized    # BFF token gate 已授权 e2e
+npm run start:server           # 启动 BFF(Hono + @hono/node-server)
+npm run contract:diff          # BFF 契约 diff
+npm run bench:fixtures         # 生成性能基准 fixtures
+npm run bench:collect          # 收集性能基准数据
+npm run debug:server           # 本地 Debug Log 读取服务
 ```
 
 ## 技术栈
 
-React 19 · TypeScript · Vite · Zustand · perfect-freehand · react-markdown
+React 19 · TypeScript · Vite · Zustand · Hono + @hono/node-server · perfect-freehand · react-markdown
+
+## 贡献流程
+
+给协作者看的两句话: `main` 有分支保护,所有改动都从分支提 PR,不要直接推 `main`。PR 合并前必须等 6 项 CI 全绿;如果红了,把失败日志交给 AI 助手,让它读日志并修到全绿。
+
+给 AI 助手看的细节:
+
+- 开工先从最新 `origin/main` 拉分支,提交后 push 分支并创建 PR。
+- 提 PR 前本地先跑四件套:`npx tsc -b`、`npm run lint`、`npm run test:unit`、`npm run verify:logging`。
+- PR 必须通过 6 项检查:`lint + tsc + unit + logging`、`structure guard (anti-regression)`、`e2e prod subset (mock upstream)`、`e2e token gate (unauthorized)`、`e2e token gate (authorized)`、`secret scan (gitleaks)`。
+- 若任一检查失败,先读对应 job 日志,修复后重新 push;不要绕过保护,管理员也不豁免。
 
 ## 文档
 
@@ -40,3 +90,4 @@ React 19 · TypeScript · Vite · Zustand · perfect-freehand · react-markdown
 - [数据模型 v2](docs/mivo-data-model-v2.md)
 - [Debug Log 与反馈规则](docs/development-logging.md)
 - [开发决策记录](docs/development-record.md)
+- [BFF 部署文档](docs/bff-deployment.md)
