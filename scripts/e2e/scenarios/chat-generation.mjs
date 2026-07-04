@@ -657,8 +657,11 @@ export const runChatGenerationScenario = async (context) => {
     await page.unroute('**/api/mivo/tasks/**', retryEditHandler)
   }
 
-  // P2-C1b: cancel mid-flight — task=canceled, no result node committed, DELETE
-  // /tasks/:id issued, and polling stops after DELETE.
+  // Cancel mid-flight. rev4 (SC5.2): canceling a chat first-time generation now
+  // REMOVES the temporary ai-slot placeholder (rollback to the pre-generation
+  // history baseline) and drops its task — it no longer leaves a lingering
+  // status='canceled' task/slot. Still: DELETE /tasks/:id is issued, polling stops
+  // after DELETE, and no result node is committed.
   {
     let cancelPostSeen = false
     let cancelDeleteSeen = false
@@ -696,6 +699,14 @@ export const runChatGenerationScenario = async (context) => {
         const { useCanvasStore } = await import(moduleSpec)
         useCanvasStore.getState().selectNode(undefined)
       }, await canvasStoreSpec())
+      const cancelBaseline = await page.evaluate(async (moduleSpec) => {
+        const { useCanvasStore } = await import(moduleSpec)
+        const s = useCanvasStore.getState()
+        return {
+          aiSlots: s.nodes.filter((n) => n.type === 'ai-slot').length,
+          images: s.nodes.filter((n) => n.type === 'image').length,
+        }
+      }, await canvasStoreSpec())
       await page.locator('.chat-composer-textarea').fill('cancel mid-flight test')
       await page.locator('.chat-composer-textarea').press('Enter')
       // Wait until the generation is in-flight: POST seen AND at least one GET poll
@@ -720,15 +731,27 @@ export const runChatGenerationScenario = async (context) => {
       const cancelState = await page.evaluate(async (moduleSpec) => {
         const { useCanvasStore } = await import(moduleSpec)
         const s = useCanvasStore.getState()
-        return { tasks: s.tasks.map((t) => ({ id: t.id, status: t.status, nodeIds: t.nodeIds })) }
+        return {
+          tasks: s.tasks.map((t) => ({ id: t.id, status: t.status, nodeIds: t.nodeIds })),
+          aiSlots: s.nodes.filter((n) => n.type === 'ai-slot').length,
+          images: s.nodes.filter((n) => n.type === 'image').length,
+          lingeringSlotStatuses: s.nodes.filter((n) => n.type === 'ai-slot').map((n) => n.aiWorkflow?.status),
+        }
       }, await canvasStoreSpec())
-      const canceledTask = cancelState.tasks.find((t) => t.status === 'canceled')
-      if (!canceledTask) throw new Error(`Cancel should leave a canceled task, got ${JSON.stringify(cancelState.tasks)}`)
-      // A canceled task must never have committed result nodeIds (cancel short-circuits
-      // before commitGenerationResult). The slot node chatStore creates upfront is fine —
-      // it's not a result, so we check nodeIds, not total node count.
-      if (canceledTask.nodeIds.length !== 0) {
-        throw new Error(`Cancel must not commit result nodeIds, got ${JSON.stringify(canceledTask.nodeIds)}`)
+      // rev4: the placeholder + its task are rolled back on cancel — no lingering
+      // canceled/generating slot, ai-slot count returns to the pre-submit baseline.
+      if (cancelState.aiSlots !== cancelBaseline.aiSlots) {
+        throw new Error(`Cancel should remove the placeholder (ai-slots back to ${cancelBaseline.aiSlots}), got ${cancelState.aiSlots}`)
+      }
+      if (cancelState.lingeringSlotStatuses.some((status) => status === 'canceled' || status === 'generating')) {
+        throw new Error(`Cancel should not leave a canceled/generating placeholder, got ${JSON.stringify(cancelState.lingeringSlotStatuses)}`)
+      }
+      if (cancelState.tasks.some((t) => t.status === 'canceled' || (t.status === 'running' && t.nodeIds.length === 0))) {
+        throw new Error(`Cancel should drop the placeholder's task (no lingering canceled/running task), got ${JSON.stringify(cancelState.tasks)}`)
+      }
+      // Cancel must never commit a result image.
+      if (cancelState.images !== cancelBaseline.images) {
+        throw new Error(`Cancel must not commit a result image (before ${cancelBaseline.images}, after ${cancelState.images})`)
       }
       if (!cancelDeleteSeen) throw new Error('Cancel should issue DELETE /tasks/:id')
       if (getAfterDelete > 0) {

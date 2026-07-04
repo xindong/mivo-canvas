@@ -15,10 +15,15 @@
 import { useCanvasStore } from './canvasStore'
 import type { CanvasGenerationOptions, CanvasState } from './canvasStore'
 import type { CanvasId } from '../types/mivoCanvas'
+import { defaultSizeForNodeType } from '../canvas/nodeTypes/canvasNodeRegistry'
+import { AI_SLOT_GAP, chooseAdjacentPlacement } from './aiCanvasWorkflow'
+import { firstAnchorImageFor } from './canvasDocumentModel'
 
 type ChatSlotPrep =
   | { mode: 'beside'; slotId: undefined }
   | { mode: 'slot'; slotId: string }
+
+const freshlyCreatedChatSlots = new Set<string>()
 
 export const generationFacade = {
   // ─── the 5 generation actions (stable signatures; delegate to the live store) ───
@@ -26,8 +31,15 @@ export const generationFacade = {
     useCanvasStore.getState().generateImageEdit(...args),
   generateBesideNode: (...args: Parameters<CanvasState['generateBesideNode']>) =>
     useCanvasStore.getState().generateBesideNode(...args),
-  generateIntoAiSlot: (...args: Parameters<CanvasState['generateIntoAiSlot']>) =>
-    useCanvasStore.getState().generateIntoAiSlot(...args),
+  generateIntoAiSlot: (
+    slotId?: Parameters<CanvasState['generateIntoAiSlot']>[0],
+    prompt?: Parameters<CanvasState['generateIntoAiSlot']>[1],
+    options?: Parameters<CanvasState['generateIntoAiSlot']>[2],
+  ) => {
+    const skipSlotHistoryBaseline = Boolean(slotId && freshlyCreatedChatSlots.delete(slotId))
+    const nextOptions = skipSlotHistoryBaseline ? { ...options, skipSlotHistoryBaseline } : options
+    return useCanvasStore.getState().generateIntoAiSlot(slotId, prompt, nextOptions)
+  },
   generateVariations: (...args: Parameters<CanvasState['generateVariations']>) =>
     useCanvasStore.getState().generateVariations(...args),
   generateFromAnnotation: (...args: Parameters<CanvasState['generateFromAnnotation']>) =>
@@ -59,14 +71,28 @@ export const generationFacade = {
     const selectedNode = params.selectedNodeId
       ? doc.nodes.find((n) => n.id === params.selectedNodeId && !n.hidden)
       : undefined
-    const slotX = selectedNode ? selectedNode.x + selectedNode.width + 56 : -160 + doc.nodes.length * 18
-    const slotY = selectedNode ? selectedNode.y : -160 + doc.nodes.length * 18
+    const slotSize = defaultSizeForNodeType('ai-slot')
+    const slotPosition = selectedNode
+      ? { x: selectedNode.x + selectedNode.width + AI_SLOT_GAP, y: selectedNode.y }
+      : (() => {
+          const anchor = firstAnchorImageFor(doc.nodes)
+          if (!anchor) return { x: -Math.round(slotSize.width / 2), y: -Math.round(slotSize.height / 2) }
+          return chooseAdjacentPlacement({
+            nodes: doc.nodes,
+            anchor,
+            width: slotSize.width,
+            height: slotSize.height,
+            placement: 'below',
+            margin: AI_SLOT_GAP,
+          })
+        })()
     const slotId = store.addAiSlotNode(
-      { x: slotX, y: slotY },
-      { width: 320, height: 320 },
+      slotPosition,
+      slotSize,
       params.prompt ?? '',
       { sceneId: params.sceneId },
     )
+    freshlyCreatedChatSlots.add(slotId)
     return { mode: 'slot', slotId }
   },
 

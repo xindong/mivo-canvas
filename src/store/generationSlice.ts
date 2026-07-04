@@ -18,12 +18,13 @@ import {
   type TaskFailure,
   type TaskResultImage,
 } from '../lib/mivoTaskClient'
-import { logCanvas } from './canvasStore'
+import { errorCanvas, logCanvas, warnCanvas } from './canvasStore'
 import { createEdgeId, createNodeId, edgeTypeForOperation } from './nodeFactory'
 import {
   defaultDocument,
   nodePrompt,
   patchCanvasDocument,
+  rollbackLatestHistoryBaseline,
 } from './canvasDocumentModel'
 
 const defaultMivoImageModel = 'gpt-image-2'
@@ -576,6 +577,12 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
       progress: 0,
       nodeIds: [],
     }
+    const skipSlotHistoryBaseline = Boolean(
+      (options as { skipSlotHistoryBaseline?: boolean }).skipSlotHistoryBaseline,
+    )
+    if (!skipSlotHistoryBaseline && targetSceneId === state.sceneId) {
+      get().captureHistory()
+    }
 
     set((current) => {
       const targetDocument = current.canvases[targetSceneId]
@@ -637,17 +644,20 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
         signal: options.signal,
         localTask: runningTask,
         sceneId: targetSceneId,
-        onResult: async ({ images }) => get().commitGenerationResult({
-          sceneId: targetSceneId,
-          sourceNodeId: slot.id,
-          resultImages: images,
-          prompt: resultPrompt,
-          model,
-          kind: 'generate',
-          taskId,
-          placement: 'right',
-          createDerivationEdge: options.createDerivationEdge,
-        }),
+        onResult: async ({ images }) => {
+          const commitPayload = {
+            sceneId: targetSceneId,
+            sourceNodeId: slot.id,
+            replaceSlotId: slot.id,
+            resultImages: images,
+            prompt: resultPrompt,
+            model,
+            kind: 'generate' as const,
+            taskId,
+            createDerivationEdge: options.createDerivationEdge,
+          }
+          return get().commitGenerationResult(commitPayload)
+        },
       })
       set((current) => {
         const targetDocument = current.canvases[targetSceneId]
@@ -678,28 +688,20 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
       set((current) => {
         const targetDocument = current.canvases[targetSceneId]
         if (!targetDocument) return {}
-        const liveTask = targetDocument.tasks.find((t) => t.id === runningTask.id) ?? runningTask
-        const nodes = targetDocument.nodes.map((node) =>
-          node.id === slot.id && node.aiWorkflow
-            ? {
-                ...node,
-                aiWorkflow: {
-                  ...node.aiWorkflow,
-                  status: canceled ? 'canceled' as const : 'failed' as const,
-                },
-              }
-            : node,
-        )
+        const rollback = rollbackLatestHistoryBaseline(current, targetSceneId, { removeNodeId: slot.id })
+        if (rollback) return rollback
+
         return patchCanvasDocument(current, targetSceneId, {
-          nodes,
-          tasks: upsertTask(
-            targetDocument.tasks,
-            canceled
-              ? canceledTask(liveTask, `生成到槽位已取消：${slot.title}`)
-              : failedTask(liveTask, `生成到槽位失败：${message}`),
-          ),
+          nodes: targetDocument.nodes.filter((node) => node.id !== slot.id),
+          edges: (targetDocument.edges || []).filter((edge) => edge.from !== slot.id && edge.to !== slot.id),
+          tasks: targetDocument.tasks.filter((task) => task.id !== runningTask.id),
         })
       })
+      if (canceled) {
+        warnCanvas(`生成到槽位已取消，已移除占位符：${slot.title}`)
+      } else {
+        errorCanvas(`生成到槽位失败，已移除占位符：${message}`)
+      }
       throw error
     }
   },
@@ -749,11 +751,23 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
     try {
       if (options.signal?.aborted) throw new MivoImageRequestError('图片请求已取消。', 'canceled')
       const image = await assetBlobForNode(source)
+      // sourceSize must be the image's natural pixel size, not the node's canvas
+      // display size, so the BFF synthesizes the area mask at matching resolution
+      // (maskBounds are 0-1 relative, so only resolution changes). Falls back to
+      // the node display size if the blob cannot be decoded.
+      let sourceNaturalSize = { width: source.width, height: source.height }
+      try {
+        const bitmap = await createImageBitmap(image)
+        sourceNaturalSize = { width: bitmap.width, height: bitmap.height }
+        bitmap.close?.()
+      } catch {
+        // keep node display size fallback
+      }
       serverTaskId = await submitEditTask({
         image,
         prompt: resultPrompt,
         maskBounds,
-        sourceSize: maskBounds ? { width: source.width, height: source.height } : undefined,
+        sourceSize: maskBounds ? sourceNaturalSize : undefined,
         imgRatio: options.imgRatio,
         quality: options.quality,
         model,

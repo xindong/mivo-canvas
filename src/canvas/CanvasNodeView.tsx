@@ -667,7 +667,10 @@ export const CanvasNodeView = memo(function CanvasNodeView({
         </div>
       ) : aiSlotNode ? (
         <div className="dom-ai-slot-node">
-          <div>
+          {aiSlotStatus === 'generating' ? (
+            <span className="mivo-logo ai-slot-mivo-logo" aria-hidden="true" />
+          ) : null}
+          <div className="ai-slot-copy">
             <strong>{node.title}</strong>
             <span>{aiSlotStatusLabel}</span>
           </div>

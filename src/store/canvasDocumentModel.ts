@@ -429,6 +429,53 @@ export const applySnapshot = (state: CanvasState, snapshot: MivoCanvasSnapshot) 
   }
 }
 
+export const rollbackLatestHistoryBaseline = (
+  state: CanvasState,
+  sceneId: CanvasId,
+  options: { removeNodeId?: string } = {},
+) => {
+  const snapshot = state.historyPast.at(-1)
+  if (!snapshot || snapshot.sceneId !== sceneId) return undefined
+
+  const normalizedSnapshot = normalizeCanvasSnapshotV2(snapshot)
+  const currentDocument = documentFor(state.canvases, sceneId)
+  const removeNodeId = options.removeNodeId
+  const edges = cloneEdges(normalizedSnapshot.edges || []).filter(
+    (edge) => !removeNodeId || (edge.from !== removeNodeId && edge.to !== removeNodeId),
+  )
+  const nodes = normalizeCanvasGraph(
+    cloneNodes(normalizedSnapshot.nodes).filter((node) => node.id !== removeNodeId),
+    edges,
+  )
+  const selection = selectionFrom(normalizedSnapshot.selectedNodeIds, normalizedSnapshot.selectedNodeId, nodes)
+  const document: CanvasDocument = {
+    ...currentDocument,
+    nodes,
+    edges,
+    tasks: cloneTasks(normalizedSnapshot.tasks),
+    selectedNodeId: selection.selectedNodeId,
+    selectedNodeIds: selection.selectedNodeIds || [],
+  }
+
+  return {
+    ...(state.sceneId === sceneId
+      ? {
+          nodes: document.nodes,
+          edges: document.edges,
+          tasks: document.tasks,
+          selectedNodeId: document.selectedNodeId,
+          selectedNodeIds: document.selectedNodeIds || [],
+        }
+      : {}),
+    historyPast: state.historyPast.slice(0, -1),
+    historyFuture: [],
+    canvases: {
+      ...state.canvases,
+      [sceneId]: document,
+    },
+  }
+}
+
 export const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value))
 
 export const cropEqualsFullImage = (crop: { x: number; y: number; width: number; height: number }) =>
@@ -459,6 +506,25 @@ export const arrangeSelectionSpacing = 32
 
 export const visualRowOrder = (nodes: MivoCanvasNode[]) =>
   [...nodes].sort((a, b) => a.y - b.y || a.x - b.x)
+
+const medianNodeHeight = (nodes: MivoCanvasNode[]) => {
+  if (!nodes.length) return 0
+  const heights = nodes.map((node) => Math.max(1, node.height)).sort((a, b) => a - b)
+  const mid = Math.floor(heights.length / 2)
+  return heights.length % 2 === 0 ? (heights[mid - 1] + heights[mid]) / 2 : heights[mid]
+}
+
+export const firstAnchorImageFor = (nodes: MivoCanvasNode[]) => {
+  const images = nodes.filter((node) => node.type === 'image' && !node.hidden)
+  if (!images.length) return undefined
+
+  const ordered = visualRowOrder(images)
+  const first = ordered[0]
+  const rowTolerance = medianNodeHeight(images) / 2
+  return ordered
+    .filter((node) => Math.abs(node.y - first.y) < rowTolerance)
+    .sort((a, b) => a.x - b.x || a.y - b.y)[0]
+}
 
 export const arrangedSubjectNodesFrom = (nodes: MivoCanvasNode[], selectedNodes: MivoCanvasNode[]) => {
   const selectedSectionIds = new Set(selectedNodes.filter(isSectionNode).map((node) => node.id))

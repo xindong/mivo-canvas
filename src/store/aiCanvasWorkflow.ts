@@ -5,6 +5,7 @@ import type {
   CanvasId,
   MivoCanvasNode,
 } from '../types/mivoCanvas'
+import { debugLogger } from './debugLogStore'
 
 type AiContextState = {
   sceneId: CanvasId
@@ -15,6 +16,8 @@ type AiContextState = {
 }
 
 const derivationEdgeModel = 'Mivo Derivation Edge'
+
+export const AI_SLOT_GAP = 56
 
 const rectsOverlap = (
   a: Pick<MivoCanvasNode, 'x' | 'y' | 'width' | 'height'>,
@@ -27,6 +30,11 @@ const rectsOverlap = (
     a.y + a.height + padding <= b.y ||
     b.y + b.height + padding <= a.y
   )
+
+const yProjectionsOverlap = (
+  a: Pick<MivoCanvasNode, 'y' | 'height'>,
+  b: Pick<MivoCanvasNode, 'y' | 'height'>,
+) => a.y < b.y + b.height && b.y < a.y + a.height
 
 const selectedIdsForSnapshot = (
   selectedNodeIds: string[],
@@ -46,7 +54,7 @@ export const chooseAdjacentPlacement = ({
   width,
   height,
   placement = 'right',
-  margin = 56,
+  margin = AI_SLOT_GAP,
   ignoredObstacleIds = [],
 }: {
   nodes: MivoCanvasNode[]
@@ -83,6 +91,58 @@ export const chooseAdjacentPlacement = ({
   }
 
   return { x, y }
+}
+
+type ReflowRect = Pick<MivoCanvasNode, 'x' | 'y' | 'width' | 'height'> & { id?: string }
+
+const canReflowNode = (node: MivoCanvasNode, placedRect: ReflowRect) =>
+  !node.hidden &&
+  !node.locked &&
+  !node.sectionId &&
+  node.id !== placedRect.id &&
+  node.x + node.width > placedRect.x
+
+export const reflowRightObstacles = (
+  nodes: MivoCanvasNode[],
+  placedRect: ReflowRect,
+  gap = AI_SLOT_GAP,
+  maxIterations = 60,
+) => {
+  let nextNodes = nodes
+  const queue: ReflowRect[] = [placedRect]
+  const movedIds = new Set<string>()
+  let iterations = 0
+
+  while (queue.length && iterations < maxIterations) {
+    const blocker = queue.shift()
+    if (!blocker) continue
+
+    const requiredX = blocker.x + blocker.width + gap
+    const candidate = [...nextNodes]
+      .sort((a, b) => a.x - b.x || a.y - b.y)
+      .find(
+        (node) =>
+          canReflowNode(node, placedRect) &&
+          node.id !== blocker.id &&
+          !movedIds.has(node.id) &&
+          yProjectionsOverlap(node, blocker) &&
+          node.x < requiredX,
+      )
+
+    if (!candidate) continue
+
+    const moved = { ...candidate, x: Math.round(requiredX) }
+    movedIds.add(candidate.id)
+    nextNodes = nextNodes.map((node) => (node.id === candidate.id ? moved : node))
+    queue.push(moved)
+    iterations += 1
+  }
+
+  if (queue.length) {
+    debugLogger.warn('AI Slot Reflow', `Stopped after ${iterations} iterations; right-side obstacles may still overlap.`)
+  }
+
+  return nextNodes
 }
 
 export const buildAiContextSnapshot = (state: AiContextState): AiCanvasContextSnapshot => {

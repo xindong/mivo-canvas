@@ -81,8 +81,8 @@ const aiSlotNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => 
   id: 'slot-1',
   type: 'ai-slot',
   title: 'Slot',
-  x: 10,
-  y: 20,
+  x: 40,
+  y: 60,
   width: 320,
   height: 320,
   status: 'ready',
@@ -566,5 +566,101 @@ describe('contract: commitGenerationResult (incl. cross-scene)', () => {
     expect(edge).toBeDefined()
     expect(edge?.from).toBe('n1')
     expect(edge?.type).toBe('generate')
+  })
+
+  it('replaces an ai-slot in place and does not add history from the commit', async () => {
+    seed(seedCanvas('character-flow', [aiSlotNode({ id: 'slot-1', x: 44, y: 88 })]))
+
+    const commitPayload = {
+      sceneId: 'character-flow',
+      sourceNodeId: 'slot-1',
+      replaceSlotId: 'slot-1',
+      resultImages: [resultImage()],
+      prompt: 'fill the slot',
+      model: 'gpt-image-2',
+      kind: 'generate' as const,
+    }
+    const nodeIds = await useCanvasStore.getState().commitGenerationResult(commitPayload)
+
+    expect(nodeIds).toEqual(['slot-1'])
+    const state = useCanvasStore.getState()
+    expect(state.historyPast).toHaveLength(0)
+    expect(state.nodes.filter((node) => node.type === 'ai-slot')).toHaveLength(0)
+    const result = state.nodes.find((node) => node.id === 'slot-1')
+    expect(result?.type).toBe('image')
+    expect(result?.x).toBe(44)
+    expect(result?.y).toBe(88)
+    expect(result?.parentIds).toBeUndefined()
+    expect(result?.sourceNodeId).toBeUndefined()
+    expect(result?.aiWorkflow?.sourceNodeIds).toBeUndefined()
+    expect(state.edges.some((edge) => edge.from === 'slot-1' && edge.to === 'slot-1')).toBe(false)
+  })
+
+  it('uses lineageSourceId for replacement lineage without moving the slot result', async () => {
+    seed(seedCanvas('character-flow', [
+      imageNode({ id: 'src-1', x: 10, y: 20 }),
+      aiSlotNode({ id: 'slot-1', x: 366, y: 20 }),
+    ]))
+
+    const commitPayload = {
+      sceneId: 'character-flow',
+      sourceNodeId: 'slot-1',
+      lineageSourceId: 'src-1',
+      replaceSlotId: 'slot-1',
+      resultImages: [resultImage()],
+      prompt: 'edit area',
+      model: 'gpt-image-2',
+      kind: 'edit' as const,
+    }
+    const nodeIds = await useCanvasStore.getState().commitGenerationResult(commitPayload)
+
+    expect(nodeIds).toEqual(['slot-1'])
+    const state = useCanvasStore.getState()
+    const result = state.nodes.find((node) => node.id === 'slot-1')
+    expect(result?.type).toBe('image')
+    expect(result?.x).toBe(366)
+    expect(result?.y).toBe(20)
+    expect(result?.parentIds).toEqual(['src-1'])
+    expect(result?.sourceNodeId).toBe('src-1')
+    expect(result?.aiWorkflow?.sourceNodeIds).toEqual(['src-1'])
+    const edge = state.edges.find((item) => item.to === 'slot-1')
+    expect(edge?.from).toBe('src-1')
+    expect(edge?.type).toBe('edit')
+  })
+
+  it('reflows right-side obstacles only when the payload opts in', async () => {
+    seed(seedCanvas('character-flow', [
+      imageNode({ id: 'src-1', x: 0, y: 0, width: 100, height: 100 }),
+      aiSlotNode({ id: 'slot-1', x: 156, y: 0, width: 100, height: 100 }),
+      imageNode({ id: 'obstacle', x: 180, y: 0, width: 100, height: 100 }),
+    ]))
+
+    const commitPayload = {
+      sceneId: 'character-flow',
+      sourceNodeId: 'src-1',
+      lineageSourceId: 'src-1',
+      replaceSlotId: 'slot-1',
+      reflow: true,
+      resultImages: [resultImage()],
+      prompt: 'edit area',
+      model: 'gpt-image-2',
+      kind: 'edit' as const,
+    }
+    await useCanvasStore.getState().commitGenerationResult(commitPayload)
+
+    const state = useCanvasStore.getState()
+    const result = state.nodes.find((node) => node.id === 'slot-1')
+    expect(state.nodes.find((node) => node.id === 'obstacle')?.x).toBe(result!.x + result!.width + 56)
+
+    seed(seedCanvas('character-flow', [
+      imageNode({ id: 'src-1', x: 0, y: 0, width: 100, height: 100 }),
+      aiSlotNode({ id: 'slot-1', x: 156, y: 0, width: 100, height: 100 }),
+      imageNode({ id: 'obstacle', x: 180, y: 0, width: 100, height: 100 }),
+    ]))
+
+    const nonReflowPayload = { ...commitPayload, reflow: false }
+    await useCanvasStore.getState().commitGenerationResult(nonReflowPayload)
+
+    expect(useCanvasStore.getState().nodes.find((node) => node.id === 'obstacle')?.x).toBe(180)
   })
 })

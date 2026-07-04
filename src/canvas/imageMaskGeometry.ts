@@ -23,15 +23,10 @@ export type ImageMaskSubmitPayload = {
   sourceSize: { width: number; height: number }
 }
 
-export const pointOnlyMaskEditMessage = '请框选或涂抹要重绘的区域。'
+export const pointMaskRadiusRatio = 0.08
 
-export const isPointOnlyMaskEdit = ({
-  regionCount,
-  pointAnchorCount,
-}: {
-  regionCount: number
-  pointAnchorCount: number
-}): boolean => pointAnchorCount > 0 && regionCount === 0
+export const pointMaskRadiusFor = (naturalSize: { width: number; height: number }) =>
+  Math.max(1, Math.round(Math.min(naturalSize.width, naturalSize.height) * pointMaskRadiusRatio))
 
 export const maxMaskCanvasPixels = 24_000_000
 export const maxMaskCanvasEdge = 6000

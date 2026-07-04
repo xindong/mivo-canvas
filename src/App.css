@@ -4170,6 +4170,24 @@ button:disabled {
   border: 2px dashed rgba(105, 87, 232, 0.72);
 }
 
+.dom-node.ai-generating .dom-ai-slot-node {
+  color: #3f37a8;
+  background: rgba(246, 245, 255, 0.72);
+  border-color: rgba(105, 87, 232, 0.88);
+}
+
+.dom-node.ai-ready .dom-ai-slot-node {
+  color: #27614f;
+  background: rgba(234, 249, 239, 0.54);
+  border-color: rgba(39, 133, 94, 0.72);
+}
+
+.dom-node.ai-failed .dom-ai-slot-node {
+  color: #8e322b;
+  background: rgba(255, 239, 236, 0.56);
+  border-color: rgba(199, 71, 61, 0.72);
+}
+
 .dom-node.ai-canceled .dom-ai-slot-node {
   color: var(--muted);
   background: rgba(248, 244, 235, 0.38);
@@ -4183,11 +4201,59 @@ button:disabled {
   border: 1px solid rgba(105, 87, 232, 0.18);
 }
 
-.dom-ai-slot-node div {
+.dom-node.ai-generating .dom-ai-slot-node::after {
+  position: absolute;
+  inset: 0;
+  content: "";
+  background:
+    linear-gradient(
+      135deg,
+      rgba(105, 87, 232, 0) 0%,
+      rgba(105, 87, 232, 0.08) 32%,
+      rgba(255, 255, 255, 0.72) 50%,
+      rgba(105, 87, 232, 0.12) 68%,
+      rgba(105, 87, 232, 0) 100%
+    );
+  background-size: 200% 200%;
+  animation: ai-slot-shimmer 1.35s linear infinite;
+  pointer-events: none;
+  will-change: background-position;
+}
+
+@keyframes ai-slot-shimmer {
+  0% {
+    background-position: 0% 0%;
+  }
+
+  100% {
+    background-position: 100% 100%;
+  }
+}
+
+.dom-ai-slot-node .ai-slot-copy {
+  position: relative;
+  z-index: 1;
   display: grid;
   gap: 6px;
   min-width: 0;
   text-align: center;
+}
+
+.dom-node.ai-generating .dom-ai-slot-node .ai-slot-copy {
+  transform: translateY(64px);
+}
+
+.dom-ai-slot-node .ai-slot-mivo-logo {
+  position: absolute;
+  z-index: 2;
+  left: 50%;
+  top: 50%;
+  width: min(23%, 72px);
+  height: min(23%, 72px);
+  min-width: 42px;
+  min-height: 42px;
+  color: rgba(80, 68, 201, 0.9);
+  transform: translate(-50%, -50%);
 }
 
 .dom-ai-slot-node strong,
@@ -4213,6 +4279,7 @@ button:disabled {
 
 .dom-ai-slot-node em {
   position: absolute;
+  z-index: 1;
   right: 12px;
   bottom: 10px;
 }

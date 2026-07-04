@@ -1,4 +1,4 @@
-import { Brush, MousePointer2, Redo2, Sparkles, Square, Trash2, Undo2, X } from 'lucide-react'
+import { MousePointer2, Redo2, Sparkles, Trash2, Undo2, X } from 'lucide-react'
 import {
   useCallback,
   useEffect,
@@ -10,16 +10,14 @@ import {
 } from 'react'
 import { createPortal } from 'react-dom'
 import { debugLogger } from '../store/debugLogStore'
-import { toastFeedback } from '../store/toastStore'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 import {
   boundsForRegions,
   buildEditMaskBlob,
   displayRectForImage,
   imagePixelToNodePoint,
-  isPointOnlyMaskEdit,
   nodePointToImagePixel,
-  pointOnlyMaskEditMessage,
+  pointMaskRadiusFor,
   validateMaskCanvasSize,
   type ImageMaskPoint,
   type ImageMaskRegion,
@@ -61,8 +59,6 @@ type FloatingControlsLayout = {
 
 const toolItems: Array<{ id: ImageMaskTool; label: string; icon: typeof MousePointer2 }> = [
   { id: 'point', label: '点选', icon: MousePointer2 },
-  { id: 'box', label: '框选', icon: Square },
-  { id: 'brush', label: '涂抹', icon: Brush },
 ]
 
 const minimumBoxSizePx = 8
@@ -145,13 +141,13 @@ export function ImageMaskEditOverlay({
   onSubmit,
 }: ImageMaskEditOverlayProps) {
   const stageRef = useRef<HTMLDivElement | null>(null)
-  const [tool, setTool] = useState<ImageMaskTool>('box')
+  const [tool, setTool] = useState<ImageMaskTool>('point')
   const [prompt, setPrompt] = useState('')
   const [regions, setRegions] = useState<ImageMaskRegion[]>([])
   const [pointAnchors, setPointAnchors] = useState<PointAnchor[]>([])
   const [past, setPast] = useState<MaskEditSnapshot[]>([])
   const [future, setFuture] = useState<MaskEditSnapshot[]>([])
-  const [brushSizePx, setBrushSizePx] = useState(48)
+  const brushSizePx = 48
   const [draft, setDraft] = useState<DraftRegion>()
   const [floatingHost, setFloatingHost] = useState<HTMLElement | null>(null)
   const [floatingLayout, setFloatingLayout] = useState<FloatingControlsLayout>()
@@ -163,7 +159,7 @@ export function ImageMaskEditOverlay({
   const promptReady = Boolean(prompt.trim())
   const hasAnyAnchor = regions.length > 0 || pointAnchors.length > 0
   const maskEditHint = !hasAnyAnchor
-    ? '先在图片上点选、框选或涂抹要修改的区域。'
+    ? '先在图片上点选要修改的区域。'
     : !promptReady
       ? '输入修改描述后再提交。'
       : ''
@@ -259,10 +255,6 @@ export function ImageMaskEditOverlay({
 
   const commitRegions = (nextRegions: ImageMaskRegion[]) => {
     commitMaskState(nextRegions, pointAnchorsRef.current)
-  }
-
-  const commitPointAnchor = (anchor: PointAnchor) => {
-    commitMaskState(regionsRef.current, [...pointAnchorsRef.current, anchor])
   }
 
   useEffect(() => () => removeWindowDragListenersRef.current(), [])
@@ -387,7 +379,9 @@ export function ImageMaskEditOverlay({
 
     event.currentTarget.setPointerCapture(event.pointerId)
     if (tool === 'point') {
-      commitPointAnchor({ center: pixel, radius: brushSizePx })
+      const radius = pointMaskRadiusFor(naturalSize)
+      commitRegions([...regionsRef.current, { type: 'brush', points: [pixel], radius }])
+      debugLogger.log('Mask Edit', `Point region added with radius ${radius}px`)
       return
     }
     if (tool === 'box') {
@@ -402,8 +396,9 @@ export function ImageMaskEditOverlay({
   const undo = () => {
     const previous = past.at(-1)
     if (!previous) return
-    setFuture((current) => [currentSnapshot(), ...current])
+    const snapshotBeforeUndo = currentSnapshot()
     applySnapshot(previous)
+    setFuture((current) => [snapshotBeforeUndo, ...current])
     setPast((current) => current.slice(0, -1))
   }
 
@@ -423,12 +418,6 @@ export function ImageMaskEditOverlay({
   const submit = async () => {
     const trimmedPrompt = prompt.trim()
     if (!trimmedPrompt || !hasAnyAnchor || submitting) return
-    if (isPointOnlyMaskEdit({ regionCount: regions.length, pointAnchorCount: pointAnchors.length })) {
-      setStatusError(pointOnlyMaskEditMessage)
-      debugLogger.warn('Mask Edit', 'Blocked local redraw submit: point anchors need a drawn mask region')
-      toastFeedback.warn(pointOnlyMaskEditMessage)
-      return
-    }
 
     try {
       setStatusError('')
@@ -487,18 +476,6 @@ export function ImageMaskEditOverlay({
               </button>
             ))}
           </div>
-          <label className="image-mask-edit-size">
-            <span>画笔</span>
-            <input
-              type="range"
-              min="12"
-              max="180"
-              value={brushSizePx}
-              disabled={submitting}
-              onChange={(event) => setBrushSizePx(Number(event.target.value))}
-            />
-            <em>{brushSizePx}px</em>
-          </label>
           <div className="image-mask-edit-history">
             <button type="button" onClick={undo} disabled={!past.length || submitting} aria-label="Undo mask region">
               <Undo2 size={14} />
