@@ -23,11 +23,35 @@
 
 | 变量 | 默认 | 必填性 | 生效 | 备注 |
 |------|------|--------|------|------|
-| `MIVO_BFF_TOKEN` | `''` | 公网必填 | 访问门(全部端点) | 缺省=dev/prod 全兼容;设了则裸请求 401。header 或 cookie 携带;**禁止进前端 bundle** |
-| `MIVO_API_MODE` | `bff` | 可选 | dev 接线开关 | `dev-middleware` 回退到原 vite middleware(P1-d 回滚阀) |
+| `MIVO_BFF_TOKEN` | `''` | 公网必填 | 访问门(全部端点) | 缺省=dev/prod 全兼容;设了则裸请求 401。`Authorization: Bearer <token>` 或 `X-Mivo-Bff-Token: <token>` header 携带(实现见 `server/app.ts:40-51`);**禁止进前端 bundle** |
 | `MIVO_ENABLE_LOCAL_ASSETS` | `false`(prod) | 可选 | local-assets | 生产默认关(读服务器本机文件=泄露面);启用需 localhost 绑定或管理 token |
 | `MIVO_ENABLE_EAGLE_PROXY` | `false`(prod) | 可选 | eagle/* | 同上;生产默认关 |
 | `VITE_MIVO_DEBUG_ENDPOINT` | — | 客户端 | (前端 remoteDebugReporter) | `VITE_` 前缀=进 bundle;仅前端用,非 middleware env |
+
+> V08 契约漂移修正:① 删除已不存在的 `MIVO_API_MODE` 行(P1-d 回滚阀已下线,BFF 不再读);② token 携带方式修正为 header(`server/app.ts` 读 `Authorization`/`X-Mivo-Bff-Token`,不经 cookie);③ 以下 env 在 `server/lib/config.ts`(`getEnvConfig()`)或 `server/index.ts`/`server/lib/env.ts` 集中读取,原矩阵遗漏,补遗如下。
+
+## BFF config.ts / 启动期 env(矩阵补遗)
+
+| 变量 | 默认 | 读取位置 | 用途 |
+|------|------|----------|------|
+| `MIVO_PORT` | `8080` | `server/index.ts:9` | BFF 监听端口 |
+| `MIVO_PUBLIC` | 未设=`''` | `server/index.ts:10`/`server/lib/env.ts:26`/`server/routes/debug-logs.ts:37` | `=1` 监听 `0.0.0.0`(公网)并强制 `MIVO_BFF_TOKEN`,否则 `127.0.0.1`;同时收紧 debug-logs GET(无 view token → 403) |
+| `MIVO_DEBUG_ALLOWED_ORIGINS` | localhost | `server/routes/debug-logs.ts:47` | debug-logs POST origin allowlist(CORS);逗号分隔 |
+| `MIVO_DEBUG_POST_RATE_LIMIT` | `60` | `server/routes/debug-logs.ts:40` | debug-logs POST 每 IP 每分钟上限 |
+| `MIVO_EAGLE_TIMEOUT_MS` | 内置 | `server/lib/eagle.ts:13` | eagle 代理请求超时 |
+| `MIVO_IMAGE_API_BASE` | `https://llm-proxy.tapsvc.com/v1/images` | `server/lib/config.ts:83` | llm-proxy 图片生成/编辑 endpoint |
+| `MIVO_LLM_API_BASE` | `https://llm-proxy.tapsvc.com/v1` | `server/lib/config.ts:84` | llm-proxy enhance endpoint |
+| `MIVO_UPSTREAM_TIMEOUT_MS` | `240000` | `server/lib/config.ts:86` | 上游 generate 总超时 |
+| `MIVO_EDIT_UPSTREAM_TIMEOUT_MS` | `180000` | `server/lib/config.ts:87` | 上游 edit 总超时 |
+| `MIVO_ENHANCE_PRIMARY_TIMEOUT_MS` | `8000` | `server/lib/config.ts:88` | enhance 主模型超时 |
+| `MIVO_ENHANCE_FALLBACK_TIMEOUT_MS` | `8000` | `server/lib/config.ts:89` | enhance fallback 超时 |
+| `MIVO_PLATFORM_POLL_INTERVAL_MS` | `2500` | `server/lib/config.ts:97` | 平台任务轮询间隔 |
+| `MIVO_PLATFORM_POLL_DEADLINE_MS` | `0`(覆盖) | `server/lib/config.ts:72` | 平台轮询截止(同时覆盖 1K/2K);`0` 走分分辨率默认 |
+| `MIVO_PLATFORM_POLL_DEADLINE_1K_MS` | `240000` | `server/lib/config.ts:74` | 1K 分辨率轮询截止 |
+| `MIVO_PLATFORM_POLL_DEADLINE_2K_MS` | `300000` | `server/lib/config.ts:75` | 2K 分辨率轮询截止 |
+| `MIVO_IMAGE_REQUEST_MAX_BYTES` | `41943040` | `server/lib/config.ts:100` | 图片(multipart)请求体上限 |
+| `MIVO_JSON_REQUEST_MAX_BYTES` | `1048576` | `server/lib/config.ts:99` | JSON 请求体上限 |
+| `MIVO_VARIATIONS_CONCURRENCY` | `4` | `server/lib/config.ts:102` | 变体批并发上限(e2e 可降到 1 强制串行) |
 
 ## key 分离不变量
 

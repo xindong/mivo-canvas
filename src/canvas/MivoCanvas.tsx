@@ -16,6 +16,7 @@ import { downloadCanvasNodeOriginal } from '../lib/assetDownload'
 import { canReadLocalAssetDrag, parseLocalAssetDragPayload } from '../lib/canvasAssetDrag'
 import { canImportCanvasFile, importFilesToCanvas, importImageUrlToCanvas } from '../lib/canvasAssetImport'
 import { useCanvasStore } from '../store/canvasStore'
+import { handleImportError, useOpenNodeDetails } from './canvasImportHandlers'
 import { brushCursorCssFor } from './brushCursors'
 import { brushOutlinePathFor, highlighterOpacity } from './brushGeometry'
 import { BrushOptionsBar } from './BrushOptionsBar'
@@ -273,6 +274,8 @@ export function MivoCanvas({
     [screenToCanvasPoint],
   )
 
+  const handleOpenNodeDetails = useOpenNodeDetails(setContextMenu, selectNode, onOpenDetails)
+
   const openBlankContextMenu = useCallback(
     (event: ReactMouseEvent<HTMLElement>) => {
       if (isCanvasChromeTarget(event.target)) return
@@ -360,7 +363,7 @@ export function MivoCanvas({
 
       input.onchange = async () => {
         const files = Array.from(input.files || [])
-        await importFilesToCanvas(files, position, addImportedFileNode)
+        await importFilesToCanvas(files, position, addImportedFileNode).catch(handleImportError)
       }
 
       input.click()
@@ -373,7 +376,7 @@ export function MivoCanvas({
       const payload = parseLocalAssetDragPayload(dataTransfer)
       if (!payload) return false
 
-      void importImageUrlToCanvas(payload.url, payload.name, screenToCanvasPoint(clientX, clientY), addImportedImage)
+      void importImageUrlToCanvas(payload.url, payload.name, screenToCanvasPoint(clientX, clientY), addImportedImage).catch(handleImportError)
       return true
     },
     [addImportedImage, screenToCanvasPoint],
@@ -398,12 +401,12 @@ export function MivoCanvas({
       const position = screenToCanvasPoint(event.clientX, event.clientY)
       const files = Array.from(event.dataTransfer.files)
       if (files.length) {
-        void importFilesToCanvas(files, position, addImportedFileNode)
+        void importFilesToCanvas(files, position, addImportedFileNode).catch(handleImportError)
         return
       }
 
       const payload = parseLocalAssetDragPayload(event.dataTransfer)
-      if (payload) void importImageUrlToCanvas(payload.url, payload.name, position, addImportedImage)
+      if (payload) void importImageUrlToCanvas(payload.url, payload.name, position, addImportedImage).catch(handleImportError)
     },
     [addImportedFileNode, addImportedImage, screenToCanvasPoint],
   )
@@ -709,11 +712,7 @@ export function MivoCanvas({
               onSubmitMaskEdit={submitMaskEdit}
               onCancelMaskEdit={cancelMaskEdit}
               onInitialMaskClientPointHandled={handleInitialClientPointHandled}
-              onOpenDetails={(nodeId) => {
-                setContextMenu(null)
-                selectNode(nodeId)
-                onOpenDetails?.()
-              }}
+              onOpenDetails={handleOpenNodeDetails}
               onOpenContextMenu={openNodeContextMenu}
             />
           )

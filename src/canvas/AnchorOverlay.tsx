@@ -135,7 +135,10 @@ export const AnchorOverlay = ({ viewport }: Props) => {
   // Dev/e2e hook: expose the anchor-selection setter + a generate trigger on window
   // so tests can drive the closed-loop without relying on mark/button hit-tests
   // (small marks + off-screen panels race the click). Manual UI still works.
+  // C12: never mount in production builds — e2e runs under DEV so behavior is
+  // unchanged there, but a prod build must not expose the hook.
   useEffect(() => {
+    if (!import.meta.env.DEV) return
     const w = window as {
       __setSelectedAnchorId?: (id: string | null) => void
       __anchorGenerate?: () => Promise<void>

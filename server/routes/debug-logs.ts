@@ -177,6 +177,13 @@ debugLogsRoute.get('/debug-logs', async (c) => {
 
   const availableDates = await readRemoteDebugDates()
   const requestedDate = c.req.query('date') || ''
+  // V01: validate the date query before it reaches the file-path layer.
+  // readRemoteDebugRecords → remoteDebugFilePath does resolve(logDir, `${date}.jsonl`),
+  // so an unchecked `../../../etc/passwd` style value would traverse out of the
+  // log dir. Lock to YYYY-MM-DD; reject anything else with 400.
+  if (requestedDate && !/^\d{4}-\d{2}-\d{2}$/.test(requestedDate)) {
+    return c.json({ ok: false, error: 'Invalid date format (expected YYYY-MM-DD)' }, 400)
+  }
   const dates = requestedDate ? [requestedDate] : availableDates.slice(0, 7)
   const limit = Math.min(Number(c.req.query('limit')) || 200, 1000)
   const records = filterRemoteDebugRecords(await readRemoteDebugRecords(dates), {
