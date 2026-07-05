@@ -216,9 +216,11 @@ const patchMaskEditProgress = (
  *
  *  W2: switched from sync editMivoImage to the async tasks API (submitEditTask →
  *  poll → cancelTask) so overlay X/Esc can best-effort DELETE the upstream task,
- *  and so the placeholder can show real progress/stage/elapsed. Quality defaults
- *  to 'medium' — the overlay's quality button group (low/medium) overrides it;
- *  FIX-5: low 不提速（冒烟实测 low≈medium 延迟），默认改回 medium，low/medium 选择器供成本权衡。 */
+ *  and so the placeholder can show real progress/stage/elapsed. Quality 透传:
+ *  overlay 四档选择器（auto/low/medium/high），auto = quality undefined 一路穿透
+ *  到 submitEditTask（不带 quality 字段，与 chat 生图路径一致）；server
+ *  normalizeMivoQuality 对缺省默认即 medium，行为不回退。low/medium/high 直接
+ *  作为 request.quality 传入 submitEditTask。 */
 export const runMaskEditGeneration = async (args: {
   sceneId: string
   source: MivoCanvasNode
@@ -230,7 +232,9 @@ export const runMaskEditGeneration = async (args: {
   signal: AbortSignal
 }): Promise<string[]> => {
   const { sceneId, source, slotId, resolvedAssetUrl, payload, imgRatio, signal } = args
-  const quality: MivoImageQuality = args.quality || payload.quality || 'medium'
+  // auto 路径：args.quality 与 payload.quality 均缺省 → undefined 透传，submitEditTask
+  // 不带 quality 字段；不再强制回填 medium（与 chat 生图路径一致，由 server 默认）。
+  const quality: MivoImageQuality | undefined = args.quality ?? payload.quality
   const startedAt = Date.now()
   const image = await readCanvasImageBlob(source, resolvedAssetUrl)
 
