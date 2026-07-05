@@ -1,0 +1,3 @@
+# PixiJS probe — local-only artifacts (fixtures are shared with scripts/bench, results
+# stay local like 0b baselines). node_modules is already covered by the root gitignore.
+results/

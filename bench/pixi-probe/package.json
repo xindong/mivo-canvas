@@ -1,0 +1,10 @@
+{
+  "name": "mivo-pixi-probe",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Standalone PixiJS bare-render ceiling probe for MivoCanvas engine-selection comparison. Not part of the app build; driven by run.mjs with Playwright. See REPORT.md.",
+  "dependencies": {
+    "pixi.js": "8.19.0"
+  }
+}

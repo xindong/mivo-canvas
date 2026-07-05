@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>MivoCanvas · PixiJS bare-render probe</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: #111;
+        color: #eee;
+        font: 13px/1.45 system-ui, -apple-system, sans-serif;
+        overflow: hidden;
+        width: 100%;
+        height: 100%;
+      }
+      /* The probe's shell mirrors the app's .canvas-shell contract so the existing
+         Playwright pan/zoom gesture code (which targets .canvas-shell) works unchanged.
+         data-* attributes are written by bench-runtime.mjs and read by the driver. */
+      .canvas-shell {
+        position: fixed;
+        inset: 0;
+        overflow: clip;
+        background: #1a1a1a;
+      }
+      .canvas-shell canvas {
+        display: block;
+      }
+      #hud {
+        position: fixed;
+        top: 8px;
+        left: 8px;
+        z-index: 10;
+        background: rgba(0, 0, 0, 0.6);
+        padding: 6px 10px;
+        border-radius: 6px;
+        pointer-events: none;
+        max-width: 60vw;
+      }
+      #hud .err {
+        color: #ff8a8a;
+      }
+    </style>
+  </head>
+  <body>
+    <div
+      id="shell"
+      class="canvas-shell"
+      data-renderer-mode="pixi"
+      data-culling-mode="off"
+      data-total-node-count="0"
+      data-pixi-children="0"
+      data-pixi-pixel-nonempty="false"
+      data-pixi-pixel-sample-count="0"
+      data-viewport-scale="0"
+      data-viewport-x="0"
+      data-viewport-y="0"
+      data-pixi-status="idle"
+    ></div>
+    <div id="hud">pixi probe — booting…</div>
+    <script type="module" src="./bench-runtime.mjs"></script>
+  </body>
+</html>
