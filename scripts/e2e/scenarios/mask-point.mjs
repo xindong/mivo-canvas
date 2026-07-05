@@ -67,7 +67,7 @@ const clearCanvasSelection = async (page, moduleSpec) => {
 }
 
 export const runMaskPointScenario = async (context) => {
-  const { page, canvasStoreSpec } = context
+  const { page, canvasStoreSpec, generatedImageB64 } = context
   const spec = await canvasStoreSpec()
 
   const dockMaskButton = page.locator('.canvas-tool-dock').getByRole('button', { name: '局部重绘' })
@@ -209,7 +209,9 @@ export const runMaskPointScenario = async (context) => {
   }
   await cancelMaskEdit(page)
 
-  // FIX-1: Escape must cancel overlay even while the prompt textarea is focused.
+  // SC-09 (mask-chat-card): 提交前 Esc 只关交互层（overlay/draft），不 abort 已提交任务。
+  // 这里仍是提交前阶段：overlay 打开、prompt 聚焦、尚未点「局部重绘」。
+  // Esc 关闭 overlay，不触达任何后台 task（此时还没有 task）。
   await page.locator(`[data-node-id="${imageId}"]`).click()
   await page.waitForSelector('.selection-quick-toolbar')
   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
@@ -218,6 +220,101 @@ export const runMaskPointScenario = async (context) => {
   await page.locator('.image-mask-edit-prompt textarea').focus()
   await page.keyboard.press('Escape')
   await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
+
+  // SC-09 (mask-chat-card): 提交后 Esc 不 cancel —— 拦截 task GET 挂起，提交，按 Esc，
+  // 断言 DELETE 未发生、card 仍 generating、release GET 后 done。
+  // 准备：重新打开 overlay，画一个 region，填 prompt，提交。GET 挂起保证提交后仍 generating。
+  let releaseSc09Get
+  const sc09GetGate = new Promise((resolve) => { releaseSc09Get = resolve })
+  let sc09GetCount = 0
+  let sc09DeleteCount = 0
+  // 先拦截 GET /tasks/* 与 DELETE，让 GET 挂起。
+  await page.route('**/api/mivo/tasks/*', async (route) => {
+    const method = route.request().method()
+    if (method === 'DELETE') {
+      sc09DeleteCount += 1
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ status: 'canceled' }) })
+      return
+    }
+    if (method !== 'GET') { await route.fallback(); return }
+    sc09GetCount += 1
+    await sc09GetGate
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        id: 'task-sc09',
+        kind: 'edit',
+        status: 'done',
+        progress: 100,
+        stage: 'done',
+        requestId: 'e2e-sc09',
+        model: 'gpt-image-2',
+        result: { images: [{ b64: generatedImageB64 }] },
+      }),
+    })
+  })
+  // /enhance 返回 generate mode 快速通过（不 gate enhance，只 gate GET poll）。
+  await page.route('**/api/mivo/enhance', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ mode: 'generate', scene: 'general', reasoning: 'e2e', richPrompt: 'e2e sc09 rich prompt', imgRatio: '1:1', quality: 'medium', enhanced: true }),
+    })
+  })
+  // /tasks/edit POST 返回 202。
+  await page.route('**/api/mivo/tasks/edit', async (route) => {
+    await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ taskId: 'task-sc09' }) })
+  })
+
+  await page.locator(`[data-node-id="${imageId}"]`).click()
+  await page.waitForSelector('.selection-quick-toolbar')
+  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
+  await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
+  await page.waitForSelector('.image-mask-edit-stage')
+  await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: '点选', exact: true }).click()
+  await addPointRegion(page, 0.5, 0.5)
+  await page.locator('.image-mask-edit-prompt textarea').fill('E2E SC-09 submit then Esc')
+  await page.locator('.image-mask-edit-prompt').getByRole('button', { name: '局部重绘' }).click()
+  await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
+  // 提交后 chat panel 应出现 generating 卡片（先确保 panel 展开）。
+  if (await page.locator('.ai-panel.collapsed').isVisible()) {
+    await page.getByRole('button', { name: 'Open AI panel' }).click()
+    await page.waitForSelector('.chat-composer-textarea', { state: 'visible' })
+  }
+  await page.waitForSelector('.chat-message-assistant .chat-param-card', { timeout: 5000 })
+  // 等 /tasks/edit POST 落地（提交已发出）。
+  await new Promise((r) => setTimeout(r, 300))
+
+  // 提交后按 Esc —— 不应 cancel task（Esc 只在 overlay 打开时关 overlay，overlay 已关）。
+  const deleteBeforeEsc = sc09DeleteCount
+  await page.keyboard.press('Escape')
+  await new Promise((r) => setTimeout(r, 400))
+  if (sc09DeleteCount !== deleteBeforeEsc) {
+    throw new Error(`SC-09: Esc after submit must not DELETE task, got ${sc09DeleteCount - deleteBeforeEsc} DELETE(s)`)
+  }
+  // 卡片仍 generating（GET 挂起，未 done 也未 error）。
+  const sc09CardWhilePending = await page.evaluate(() => {
+    const last = document.querySelector('.chat-message-assistant:last-child')
+    if (!last) return { found: false }
+    return {
+      found: true,
+      hasGenerating: Boolean(last.querySelector('.chat-generating-indicator') || last.querySelector('.chat-thinking-placeholder')),
+      hasError: Boolean(last.querySelector('.chat-error-row')),
+    }
+  })
+  if (!sc09CardWhilePending.found || (!sc09CardWhilePending.hasGenerating) || sc09CardWhilePending.hasError) {
+    throw new Error(`SC-09: card should still be generating after Esc (no cancel), got: ${JSON.stringify(sc09CardWhilePending)}`)
+  }
+
+  // Release GET → done。
+  releaseSc09Get()
+  await page.waitForSelector('.chat-message-assistant .chat-result-image', { timeout: 10000 })
+
+  // 清理 SC-09 路由。
+  await page.unroute('**/api/mivo/tasks/*')
+  await page.unroute('**/api/mivo/enhance')
+  await page.unroute('**/api/mivo/tasks/edit')
 
   // FIX-2: deleting the target image while mask edit is active must clear all mask edit state.
   const deleteCase = await page.evaluate(async (moduleSpec) => {
