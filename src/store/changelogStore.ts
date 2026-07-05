@@ -6,17 +6,53 @@ import { recentDays } from '../lib/changelogDate'
 import { debugLogger } from './debugLogStore'
 import { toastFeedback } from './toastStore'
 
+export type ChangelogItem = {
+  text: string
+  by: string
+}
+
 export type ChangelogEntry = {
   date: string
   prs: number[]
-  features: string[]
-  fixes: string[]
+  features: ChangelogItem[]
+  fixes: ChangelogItem[]
 }
 
 type ChangelogDocument = {
   lastGithash?: string
   updatedAt?: string
-  entries?: ChangelogEntry[]
+  entries?: unknown[]
+}
+
+// 向后兼容防御:旧版 changelog.json 的条目是 string,新版是 {text, by}。
+// 读到 string 时当作 {text: 该串, by: ''}(by 为空面板不显示作者名)。
+const normalizeItems = (raw: unknown): ChangelogItem[] => {
+  if (!Array.isArray(raw)) return []
+  return raw
+    .map((item): ChangelogItem => {
+      if (typeof item === 'string') return { text: item, by: '' }
+      if (item && typeof item === 'object') {
+        const record = item as { text?: unknown; by?: unknown }
+        return {
+          text: typeof record.text === 'string' ? record.text : '',
+          by: typeof record.by === 'string' ? record.by : '',
+        }
+      }
+      return { text: '', by: '' }
+    })
+    .filter((item) => item.text.length > 0)
+}
+
+const normalizeEntry = (raw: unknown): ChangelogEntry | null => {
+  if (!raw || typeof raw !== 'object') return null
+  const record = raw as { date?: unknown; prs?: unknown; features?: unknown; fixes?: unknown }
+  if (typeof record.date !== 'string' || !record.date) return null
+  return {
+    date: record.date,
+    prs: Array.isArray(record.prs) ? record.prs.filter((pr): pr is number => typeof pr === 'number') : [],
+    features: normalizeItems(record.features),
+    fixes: normalizeItems(record.fixes),
+  }
 }
 
 const lastReadStorageKey = 'mivo.changelog.lastRead'
@@ -48,7 +84,9 @@ export const useChangelogStore = create<ChangelogState>()((set, get) => ({
       const response = await fetch(`/changelog.json?t=${Date.now()}`)
       if (!response.ok) throw new Error(`HTTP ${response.status}`)
       const doc = (await response.json()) as ChangelogDocument
-      const entries = Array.isArray(doc.entries) ? doc.entries : []
+      const entries = (Array.isArray(doc.entries) ? doc.entries : [])
+        .map(normalizeEntry)
+        .filter((entry): entry is ChangelogEntry => entry !== null)
       set({ entries, updatedAt: doc.updatedAt ?? '', loaded: true })
       if (!entries.length) {
         debugLogger.warn('Changelog', 'Changelog loaded but no entries recorded yet')

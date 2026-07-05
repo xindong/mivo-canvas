@@ -22,8 +22,12 @@ export const runChangelogScenario = async (context) => {
       {
         date: today,
         prs: [9001],
-        features: ['e2e-changelog 新功能条目'],
-        fixes: ['e2e-changelog 修复条目'],
+        // 新 schema {text, by} + 一条旧版纯 string(向后兼容:无作者标签渲染)
+        features: [
+          { text: 'e2e-changelog 新功能条目', by: 'E2E Author' },
+          'e2e-changelog 旧格式条目',
+        ],
+        fixes: [{ text: 'e2e-changelog 修复条目', by: 'E2E Author' }],
       },
     ],
   }
@@ -42,12 +46,12 @@ export const runChangelogScenario = async (context) => {
   await page.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
 
   // ① 入口唯一且位于 Debug Log 正上方
-  const changelogButton = page.getByRole('button', { name: '更新日志', exact: true })
+  const changelogButton = page.getByRole('button', { name: 'Changelog', exact: true })
   if ((await changelogButton.count()) !== 1) {
-    throw new Error('Project sidebar should expose one 更新日志 button')
+    throw new Error('Project sidebar should expose one Changelog button')
   }
   const placement = await page.evaluate(() => {
-    const changelog = document.querySelector('[aria-label="更新日志"]')?.getBoundingClientRect()
+    const changelog = document.querySelector('[aria-label="Changelog"]')?.getBoundingClientRect()
     const debugLog = document.querySelector('[aria-label="Debug Log"]')?.getBoundingClientRect()
     return { changelogBottom: changelog?.bottom, debugLogTop: debugLog?.top }
   })
@@ -56,11 +60,11 @@ export const runChangelogScenario = async (context) => {
     typeof placement.debugLogTop !== 'number' ||
     placement.changelogBottom > placement.debugLogTop
   ) {
-    throw new Error(`更新日志 entry should sit directly above Debug Log: ${JSON.stringify(placement)}`)
+    throw new Error(`Changelog entry should sit directly above Debug Log: ${JSON.stringify(placement)}`)
   }
 
   // ② 未读红点:localStorage 清空 + fixture updatedAt → 必有未读
-  await page.waitForSelector('[aria-label="更新日志"] .changelog-badge-dot')
+  await page.waitForSelector('[aria-label="Changelog"] .changelog-badge-dot')
 
   // ③ 打开面板:按天双列布局
   await changelogButton.click()
@@ -85,8 +89,22 @@ export const runChangelogScenario = async (context) => {
   await page.getByText('e2e-changelog 新功能条目').waitFor()
   await page.getByText('e2e-changelog 修复条目').waitFor()
 
+  // ③ 续:作者名灰字标签——新 schema 条目带 by 标签,旧 string 条目无标签
+  const authorTags = await page.evaluate(() => {
+    const items = Array.from(document.querySelectorAll('.changelog-day li'))
+    return items.map((item) => ({
+      text: item.textContent ?? '',
+      byTag: item.querySelector('.changelog-item-by')?.textContent ?? null,
+    }))
+  })
+  const withAuthor = authorTags.filter((item) => item.byTag === 'E2E Author')
+  const legacyItem = authorTags.find((item) => item.text.includes('旧格式条目'))
+  if (withAuthor.length !== 2 || !legacyItem || legacyItem.byTag !== null) {
+    throw new Error(`Changelog items should show contributor tags (legacy strings without): ${JSON.stringify(authorTags)}`)
+  }
+
   // ② 续:打开即已读,红点消失
-  await page.waitForSelector('[aria-label="更新日志"] .changelog-badge-dot', { state: 'detached' })
+  await page.waitForSelector('[aria-label="Changelog"] .changelog-badge-dot', { state: 'detached' })
 
   // 关闭面板
   await page.getByRole('button', { name: '关闭更新日志' }).click()
@@ -111,15 +129,15 @@ export const runChangelogScenario = async (context) => {
   await page.getByRole('dialog', { name: '更新日志' }).waitFor()
   await page.getByRole('button', { name: '关闭更新日志' }).click()
   await page.waitForSelector('.changelog-panel', { state: 'detached' })
-  if (await page.locator('[aria-label="更新日志"] .changelog-badge-dot').count()) {
+  if (await page.locator('[aria-label="Changelog"] .changelog-badge-dot').count()) {
     throw new Error('Changelog badge dot should stay cleared after reading')
   }
 
   // 已读状态跨 reload 保持:updatedAt 不变时红点不重亮
   await page.reload({ waitUntil: 'networkidle' })
   await page.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
-  await page.getByRole('button', { name: '更新日志', exact: true }).waitFor()
-  if (await page.locator('[aria-label="更新日志"] .changelog-badge-dot').count()) {
+  await page.getByRole('button', { name: 'Changelog', exact: true }).waitFor()
+  if (await page.locator('[aria-label="Changelog"] .changelog-badge-dot').count()) {
     throw new Error('Changelog badge dot should stay cleared across reload when updatedAt is unchanged')
   }
 
@@ -128,7 +146,7 @@ export const runChangelogScenario = async (context) => {
   fixture.entries[0].fixes = [...fixture.entries[0].fixes, 'e2e-changelog 同日追加的修复条目']
   await page.reload({ waitUntil: 'networkidle' })
   await page.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
-  await page.waitForSelector('[aria-label="更新日志"] .changelog-badge-dot')
+  await page.waitForSelector('[aria-label="Changelog"] .changelog-badge-dot')
 
   await page.unroute('**/changelog.json*')
 }

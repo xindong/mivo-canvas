@@ -1284,6 +1284,17 @@ button:disabled {
   line-height: 1.5;
 }
 
+.changelog-item-by {
+  margin-left: 6px;
+  color: var(--quiet);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+.changelog-item-by::before {
+  content: '@';
+}
+
 .changelog-column-empty,
 .changelog-empty {
   margin: 0;

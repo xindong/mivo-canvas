@@ -61,8 +61,11 @@ export const ChangelogPanel = ({ openedAt, onClose }: ChangelogPanelProps) => {
                     <h4>✨ 新功能</h4>
                     {entry.features.length ? (
                       <ul>
-                        {entry.features.map((item) => (
-                          <li key={item}>{item}</li>
+                        {entry.features.map((item, index) => (
+                          <li key={`${index}-${item.text}`}>
+                            {item.text}
+                            {item.by ? <span className="changelog-item-by">{item.by}</span> : null}
+                          </li>
                         ))}
                       </ul>
                     ) : (
@@ -73,8 +76,11 @@ export const ChangelogPanel = ({ openedAt, onClose }: ChangelogPanelProps) => {
                     <h4>🔧 修复的问题</h4>
                     {entry.fixes.length ? (
                       <ul>
-                        {entry.fixes.map((item) => (
-                          <li key={item}>{item}</li>
+                        {entry.fixes.map((item, index) => (
+                          <li key={`${index}-${item.text}`}>
+                            {item.text}
+                            {item.by ? <span className="changelog-item-by">{item.by}</span> : null}
+                          </li>
                         ))}
                       </ul>
                     ) : (
