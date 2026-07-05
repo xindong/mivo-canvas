@@ -15,8 +15,31 @@ import {
 import { RequestBodyTooLargeError, UpstreamRequestTimeoutError, fetchUpstreamWithTimeout } from '../lib/upstream'
 import { logRequest, newRequestId, readJsonBody } from '../lib/request'
 
-const buildEnhanceSystemPrompt = (allowedRatios: string[]): string =>
-  `You are Mivo, a game art creative design assistant. Return ONLY one JSON object.
+// intent='edit' → edit-specific system prompt (partial-modification guidance).
+// intent omitted / 'generate' / anything else → existing generate prompt, byte-for-byte unchanged.
+const buildEnhanceSystemPrompt = (allowedRatios: string[], intent?: 'generate' | 'edit'): string => {
+  if (intent === 'edit') {
+    return `You are Mivo, a game art creative design assistant. Return ONLY one JSON object.
+Modes:
+- Use "chat" for questions, discussion, advice, capability questions, casual talk, or ambiguous intent. Return {"mode":"chat","replyText":"中文纯文本，简洁自然，200字以内；歧义时追问澄清"}.
+- Chat replyText must not use markdown, bullets, headings, bold markers, or asterisks.
+- Use "generate" when the user asks to edit, modify, or refine a selected region of an existing image. Return mode, scene, reasoning, richPrompt, imgRatio, quality.
+Edit intent:
+- The user's input is a PARTIAL MODIFICATION INSTRUCTION for a selected/masked region of an existing source image, NOT a description of a brand-new image or full scene.
+- richPrompt must be a vivid English EDIT INSTRUCTION describing ONLY what should change in the selected/masked area.
+- preserve unmasked areas: do not instruct changes outside the user-indicated mask/selection.
+- preserve source identity: keep the existing character, object, lighting, style, and composition continuity of the source image.
+- Only change the selected/masked area; do not invent a full new scene or replace the overall image.
+- richPrompt must be vivid English, faithful to user intent; do not add unmentioned entities or pile words like masterpiece/8k/cinematic/high quality.
+- For image prompts, avoid negative safety disclaimers such as "no blood or violence" and avoid unnecessary weapon emphasis; describe the intended peaceful or neutral visual outcome in affirmative terms.
+- richPrompt must not output real person's names, portrait likeness, team logos, jersey marks, or other identifying real-world persona signals. When the user references a real person, generalize to a fictional role description, e.g. "a fictional footballer performing an iconic celebratory jump".
+- richPrompt must not output brand, IP, or product names such as Mario, Nintendo Switch, or Sonic. Convert them to generic art-direction language, e.g. "bright family-friendly 3D platformer aesthetic".
+- imgRatio must be one of: ${allowedRatios.join(', ')}.
+- quality is low, medium, or high. Default medium; high only for explicit print-grade, fine detail, or preserving small text.
+- Chinese or short edit requests should become specific English edit instructions.
+- With history, treat it as refinement and evolve the previous edit direction.`
+  }
+  return `You are Mivo, a game art creative design assistant. Return ONLY one JSON object.
 Modes:
 - Use "chat" for questions, discussion, advice, capability questions, casual talk, or ambiguous intent. Return {"mode":"chat","replyText":"中文纯文本，简洁自然，200字以内；歧义时追问澄清"}.
 - Chat replyText must not use markdown, bullets, headings, bold markers, or asterisks.
@@ -31,6 +54,7 @@ Generate rules:
 - quality is low, medium, or high. Default medium; high only for explicit print-grade, fine detail, or preserving small text.
 - Chinese or short generate requests should become specific English prompts.
 - With history, treat it as refinement and evolve the previous direction.`
+}
 
 type EnhanceLlmResponse = {
   choices?: Array<{ message?: { content?: string } }>
@@ -87,6 +111,74 @@ const parseEnhanceJson = (raw: string): EnhanceParsed | null => {
 
 type EnhanceDegradedReason = 'upstream-http' | 'upstream-network' | 'timeout' | 'bad-json'
 
+// P1-c Step 2 (mask-chat-card): edit intent sanitize. Non-conforming fields are
+// silently dropped (no 400) per contract — frontend sends loose shapes and we
+// only keep what the edit system prompt + user content need.
+type EditContext = {
+  sourceTitle?: string
+  hasMask?: boolean
+  maskKind?: 'brush' | 'bounds'
+  maskBoundsPx?: { x: number; y: number; width: number; height: number }
+  sourceSize?: { width: number; height: number }
+}
+
+const sanitizeEditContext = (raw: unknown): EditContext => {
+  if (typeof raw !== 'object' || raw === null) return {}
+  const obj = raw as Record<string, unknown>
+  const out: EditContext = {}
+  if (typeof obj.sourceTitle === 'string') out.sourceTitle = obj.sourceTitle
+  if (typeof obj.hasMask === 'boolean') out.hasMask = obj.hasMask
+  if (obj.maskKind === 'brush' || obj.maskKind === 'bounds') out.maskKind = obj.maskKind
+  const mb = obj.maskBoundsPx
+  if (typeof mb === 'object' && mb !== null) {
+    const m = mb as Record<string, unknown>
+    if (
+      typeof m.x === 'number' &&
+      typeof m.y === 'number' &&
+      typeof m.width === 'number' &&
+      typeof m.height === 'number'
+    ) {
+      out.maskBoundsPx = { x: m.x, y: m.y, width: m.width, height: m.height }
+    }
+  }
+  const ss = obj.sourceSize
+  if (typeof ss === 'object' && ss !== null) {
+    const s = ss as Record<string, unknown>
+    if (typeof s.width === 'number' && typeof s.height === 'number') {
+      out.sourceSize = { width: s.width, height: s.height }
+    }
+  }
+  return out
+}
+
+// Edit-intent user content. Coordinates are in source image pixel space — the
+// string "normalized" must NEVER appear here (per mask-chat-card Step 2 contract).
+// Omit maskBoundsPx / sourceSize lines when absent rather than fabricating values.
+const buildEditUserContent = (
+  prompt: string,
+  ec: EditContext,
+  historyEntries: Array<{ role: string; content: string }>,
+): string => {
+  const lines: string[] = []
+  if (historyEntries.length > 0) {
+    lines.push('Previous conversation:')
+    lines.push(historyEntries.map((e) => `${e.role}: ${e.content}`).join('\n'))
+    lines.push('')
+  }
+  lines.push(`Edit instruction: ${prompt}`)
+  lines.push(`Source title: ${ec.sourceTitle || 'untitled'}`)
+  lines.push(`Mask: ${ec.hasMask ? (ec.maskKind || 'bounds') : 'none'}`)
+  if (ec.maskBoundsPx) {
+    lines.push(
+      `Mask bounds (px, in source image space): ${ec.maskBoundsPx.x},${ec.maskBoundsPx.y},${ec.maskBoundsPx.width},${ec.maskBoundsPx.height}`,
+    )
+  }
+  if (ec.sourceSize) {
+    lines.push(`Source size: ${ec.sourceSize.width}x${ec.sourceSize.height} px`)
+  }
+  return lines.join('\n')
+}
+
 const callEnhanceLlm = async (
   model: string,
   messages: Array<{ role: string; content: string }>,
@@ -125,6 +217,8 @@ type EnhanceRequestBody = {
   history?: unknown
   hasSelectedImage?: unknown
   sceneId?: unknown
+  intent?: unknown
+  editContext?: unknown
 }
 
 export const enhanceHandler: Handler<{ Bindings: HttpBindings }> = async (c) => {
@@ -178,11 +272,16 @@ export const enhanceHandler: Handler<{ Bindings: HttpBindings }> = async (c) => 
           .slice(-6)
       : []
 
-    const systemPrompt = buildEnhanceSystemPrompt(allowedRatios)
+    const intent: 'generate' | 'edit' = body.intent === 'edit' ? 'edit' : 'generate'
+    const editContext = intent === 'edit' ? sanitizeEditContext(body.editContext) : {}
+
+    const systemPrompt = buildEnhanceSystemPrompt(allowedRatios, intent)
     const userContent =
-      historyEntries.length > 0
-        ? `Previous conversation:\n${historyEntries.map((e) => `${e.role}: ${e.content}`).join('\n')}\n\nNew request: ${prompt}`
-        : prompt
+      intent === 'edit'
+        ? buildEditUserContent(prompt, editContext, historyEntries)
+        : historyEntries.length > 0
+          ? `Previous conversation:\n${historyEntries.map((e) => `${e.role}: ${e.content}`).join('\n')}\n\nNew request: ${prompt}`
+          : prompt
 
     const llmMessages = [
       { role: 'system', content: systemPrompt },

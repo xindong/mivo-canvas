@@ -197,6 +197,9 @@ export function ImageMaskEditOverlay({
   const removeWindowDragListenersRef = useRef<() => void>(() => undefined)
   const handledInitialClientPointKeyRef = useRef<string | undefined>(undefined)
   const initialFollowupPointerRef = useRef<{ clientX: number; clientY: number } | undefined>(undefined)
+  // F1 (审 P2): 同步 in-flight guard，防快速双击/大图 toBlob 慢导致双提交。
+  // 进入 submit 即置位；成功后 overlay 卸载（hook 清 maskEditNodeId）自然解除；失败 catch 清回。
+  const submitInFlightRef = useRef(false)
   const promptReady = Boolean(prompt.trim())
   const hasAnyAnchor = regions.length > 0 || pointAnchors.length > 0
   const maskEditHint = !hasAnyAnchor
@@ -523,6 +526,10 @@ export function ImageMaskEditOverlay({
   const submit = async () => {
     const trimmedPrompt = prompt.trim()
     if (!trimmedPrompt || !hasAnyAnchor || submitting) return
+    // F1 (审 P2): 同步 guard，覆盖 buildEditMaskBlob 前窗口（父层 setMaskEditSubmittingNodeId
+    // 只能在 submitMaskEdit 入口置位，覆盖不了 toBlob 慢的这段）。双击/大图 toBlob 慢时只产生一个 chat card + 一次 edit POST。
+    if (submitInFlightRef.current) return
+    submitInFlightRef.current = true
 
     try {
       setStatusError('')
@@ -537,7 +544,9 @@ export function ImageMaskEditOverlay({
         sourceSize: naturalSize,
         quality: quality === 'auto' ? undefined : quality,
       })
+      // 成功：overlay 由 hook 清 maskEditNodeId 卸载，submitInFlightRef 随卸载解除，不主动清。
     } catch (error) {
+      submitInFlightRef.current = false // 调度失败清回，允许重试
       setStatusError(error instanceof Error ? error.message : '局部重绘失败。')
     }
   }

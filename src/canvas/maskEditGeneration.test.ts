@@ -345,3 +345,192 @@ describe('runMaskEditGeneration quality pass-through (auto/low/medium/high parit
     expect(capturedRequest().quality).toBe('high')
   })
 })
+
+// SC-13: runMaskEditGeneration 的 callbacks 契约 + 返回值 {nodeIds, sourceDeleted}。
+// - onTaskSubmitted(taskId): submitEditTask 返回后、poll 前触发(写 message.maskEdit.serverTaskId)。
+// - onSelfHealRetry(taskIds): 黑盘自愈重试开始时触发,card 保持 generating。
+// - 返回值:source 存在时 sourceDeleted=false;nodeIds 来自 commitGenerationResult。
+describe('runMaskEditGeneration callbacks + return value (SC-13)', () => {
+  beforeEach(() => {
+    taskClientSpies.submitEditTask.mockReset()
+    taskClientSpies.pollTask.mockReset()
+    taskClientSpies.cancelTask.mockReset()
+    inspectBlackPlateSpy.mockReset()
+  })
+
+  it('onTaskSubmitted: submitEditTask 返 task-1 → onTaskSubmitted 在 poll 前被调 with task-1', async () => {
+    const source = imageNode({ id: 'src-1' })
+    seed(seedCanvas('character-flow', [source]))
+    const { slotId } = prepareMaskEditPlaceholder('character-flow', source, 'p')
+    // 覆盖 commitGenerationResult 避免真实 commit 落图(只测 callback 契约)
+    useCanvasStore.setState({
+      commitGenerationResult: vi.fn(async () => ['n1']),
+    } as never)
+
+    taskClientSpies.submitEditTask.mockResolvedValueOnce('task-1')
+    const onTaskSubmitted = vi.fn()
+    // pollTask mock 内部断言 onTaskSubmitted 已在 poll 前被调
+    taskClientSpies.pollTask.mockImplementationOnce(async () => {
+      expect(onTaskSubmitted).toHaveBeenCalledWith('task-1')
+      return {
+        status: 'done', progress: 100, stage: 'done',
+        result: { images: [{ b64: 'ok-b64' }] },
+      }
+    })
+
+    const result = await runMaskEditGeneration({
+      sceneId: 'character-flow',
+      source,
+      slotId,
+      resolvedAssetUrl: undefined,
+      // 无 maskBounds → canInspect=false,跳过黑盘检查,直接 commit
+      payload: { prompt: 'p', sourceSize: { width: 200, height: 200 } } as never,
+      imgRatio: '1:1' as never,
+      signal: new AbortController().signal,
+      callbacks: { onTaskSubmitted },
+    })
+
+    expect(onTaskSubmitted).toHaveBeenCalledWith('task-1')
+    expect(result.nodeIds).toEqual(['n1'])
+  })
+
+  it('onSelfHealRetry: 首 attempt done+black → 第二 attempt → onSelfHealRetry([task-1, task-2]) 被调', async () => {
+    const source = imageNode({ id: 'src-1' })
+    seed(seedCanvas('character-flow', [source]))
+    const { slotId } = prepareMaskEditPlaceholder('character-flow', source, 'p')
+    useCanvasStore.setState({
+      commitGenerationResult: vi.fn(async () => ['n1']),
+    } as never)
+
+    taskClientSpies.submitEditTask
+      .mockResolvedValueOnce('task-1') // first attempt
+      .mockResolvedValueOnce('task-2') // self-heal retry
+    taskClientSpies.pollTask
+      .mockResolvedValueOnce({
+        status: 'done', progress: 100, stage: 'done',
+        result: { images: [{ b64: 'black-plate-b64' }] }, // first attempt returns black-plate
+      })
+      .mockResolvedValueOnce({
+        status: 'done', progress: 100, stage: 'done',
+        result: { images: [{ b64: 'ok-b64' }] }, // retry returns non-black
+      })
+    inspectBlackPlateSpy
+      .mockResolvedValueOnce(true) // first result detected as black → retry
+      .mockResolvedValueOnce(false) // retry result not black → no warn
+
+    const onSelfHealRetry = vi.fn()
+    await runMaskEditGeneration({
+      sceneId: 'character-flow',
+      source,
+      slotId,
+      resolvedAssetUrl: undefined,
+      // 有 maskBounds → canInspect=true,触发黑盘检查
+      payload: {
+        prompt: 'p',
+        sourceSize: { width: 200, height: 200 },
+        maskBounds: { x: 10, y: 10, width: 50, height: 50 },
+      } as never,
+      imgRatio: '1:1' as never,
+      signal: new AbortController().signal,
+      callbacks: { onSelfHealRetry },
+    })
+
+    // SC-13: onSelfHealRetry 收到两个 attempt 的 taskId 列表
+    expect(onSelfHealRetry).toHaveBeenCalledWith(['task-1', 'task-2'])
+  })
+
+  it('返回值 {nodeIds, sourceDeleted}: source 存在时 sourceDeleted=false,nodeIds 来自 commitGenerationResult', async () => {
+    const source = imageNode({ id: 'src-exists' })
+    seed(seedCanvas('character-flow', [source]))
+    const { slotId } = prepareMaskEditPlaceholder('character-flow', source, 'p')
+    useCanvasStore.setState({
+      commitGenerationResult: vi.fn(async () => ['n1']),
+    } as never)
+
+    taskClientSpies.submitEditTask.mockResolvedValueOnce('task-1')
+    taskClientSpies.pollTask.mockResolvedValueOnce({
+      status: 'done', progress: 100, stage: 'done',
+      result: { images: [{ b64: 'ok-b64' }] },
+    })
+
+    const result = await runMaskEditGeneration({
+      sceneId: 'character-flow',
+      source,
+      slotId,
+      resolvedAssetUrl: undefined,
+      payload: { prompt: 'p', sourceSize: { width: 200, height: 200 } } as never,
+      imgRatio: '1:1' as never,
+      signal: new AbortController().signal,
+    })
+
+    // source 仍在 canvas → sourceDeleted=false
+    expect(result.sourceDeleted).toBe(false)
+    // nodeIds 来自 commitGenerationResult 的返回值
+    expect(result.nodeIds).toEqual(['n1'])
+  })
+})
+
+// F2 (审 P2): onSelfHealRetry 时机——拿到 task-2 后立即触发（submit 后、第二次 poll done 前）。
+// 旧实现在第二次 runOneAttempt 完整结束后才触发 onSelfHealRetry（phase 几乎不可见）；
+// 修复后在 runOneAttempt 的 onSubmitted 回调里触发,即 submitEditTask 返回 task-2 后、poll 前。
+// 断言手段:第二次 pollTask 被调时,onSelfHealRetry 应已被调（证明它在 poll 返回 done 前触发）。
+describe('runMaskEditGeneration onSelfHealRetry 时机 (F2)', () => {
+  beforeEach(() => {
+    taskClientSpies.submitEditTask.mockReset()
+    taskClientSpies.pollTask.mockReset()
+    taskClientSpies.cancelTask.mockReset()
+    inspectBlackPlateSpy.mockReset()
+  })
+
+  it('onSelfHealRetry 在 task-2 submit 后、第二次 poll done 前被调', async () => {
+    const source = imageNode({ id: 'src-1' })
+    seed(seedCanvas('character-flow', [source]))
+    const { slotId } = prepareMaskEditPlaceholder('character-flow', source, 'p')
+    useCanvasStore.setState({
+      commitGenerationResult: vi.fn(async () => ['n1']),
+    } as never)
+
+    taskClientSpies.submitEditTask
+      .mockResolvedValueOnce('task-1') // first attempt
+      .mockResolvedValueOnce('task-2') // self-heal retry
+    inspectBlackPlateSpy
+      .mockResolvedValueOnce(true)  // first result black → retry
+      .mockResolvedValueOnce(false) // retry result not black → no warn
+
+    const onSelfHealRetry = vi.fn()
+    // F2 关键:第二次 pollTask 被调时,断言 onSelfHealRetry 已经被调过
+    // (证明它在 submitEditTask 返回 task-2 后、第二次 poll done 前触发)
+    taskClientSpies.pollTask
+      .mockResolvedValueOnce({
+        status: 'done', progress: 100, stage: 'done',
+        result: { images: [{ b64: 'black-plate-b64' }] }, // first attempt returns black-plate
+      })
+      .mockImplementationOnce(async () => {
+        // 此时 onSelfHealRetry 应已触发(F2: onSubmitted 回调在 poll 前)
+        expect(onSelfHealRetry).toHaveBeenCalledWith(['task-1', 'task-2'])
+        return {
+          status: 'done', progress: 100, stage: 'done',
+          result: { images: [{ b64: 'ok-b64' }] }, // retry returns non-black
+        }
+      })
+
+    await runMaskEditGeneration({
+      sceneId: 'character-flow',
+      source,
+      slotId,
+      resolvedAssetUrl: undefined,
+      // 有 maskBounds → canInspect=true,触发黑盘检查
+      payload: {
+        prompt: 'p',
+        sourceSize: { width: 200, height: 200 },
+        maskBounds: { x: 10, y: 10, width: 50, height: 50 },
+      } as never,
+      imgRatio: '1:1' as never,
+      signal: new AbortController().signal,
+      callbacks: { onSelfHealRetry },
+    })
+
+    // 最终 onSelfHealRetry 收到 [task-1, task-2]
+    expect(onSelfHealRetry).toHaveBeenCalledWith(['task-1', 'task-2'])
+  })
+})

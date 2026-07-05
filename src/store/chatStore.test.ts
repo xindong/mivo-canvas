@@ -66,6 +66,20 @@ const genFacadeSpies = vi.hoisted(() => ({
 }))
 vi.mock('./generationFacade', () => ({ generationFacade: genFacadeSpies }))
 
+// SC-19: mock chatMaskEditFlow 的 cancelMaskEditMessage 为 spy,验证 cancelGeneration
+// 分支顺序——origin:'mask-edit' 的 in-flight message 委托 cancelMaskEditMessage,
+// 不走全局 activeChatAbortController(保证 chat×mask 并行取消隔离)。
+const maskEditFlowSpies = vi.hoisted(() => ({
+  cancelMaskEditMessage: vi.fn(),
+}))
+vi.mock('./chatMaskEditFlow', () => ({
+  cancelMaskEditMessage: maskEditFlowSpies.cancelMaskEditMessage,
+  beginMaskEditMessage: vi.fn(() => 'mask-msg-stub'),
+  runMaskEditChatFlow: vi.fn(async () => {}),
+  finishMaskEditMessage: vi.fn(),
+  failMaskEditMessage: vi.fn(),
+}))
+
 import { useChatStore } from './chatStore'
 import { saveImportedAsset } from '../lib/assetStorage'
 import { enhanceMivoPrompt } from '../lib/mivoImageClient'
@@ -267,5 +281,66 @@ describe('chatStore hydration (FIX-A: merge 路径 sanitize 脏 degradedReason)'
     await useChatStore.persist.rehydrate()
     const msg = useChatStore.getState().messagesByScene['scene-fixb']?.[0]
     expect(msg?.enhance?.degradedReason).toBe('upstream-http')
+  })
+})
+
+// SC-19 (审 F1): cancelGeneration 分支顺序。普通 chat generating 与 mask generating
+// 并行时,点 mask 卡取消只触发 mask 的 abort/DELETE/回滚,普通 chat 的
+// activeChatAbortController 不被 abort;反向取消 chat 卡不影响 mask 任务。
+// 分支顺序硬约束:先按 sceneId/messageId 精确解析 target → target.origin === 'mask-edit'
+// 在触碰任何 activeChatAbortController 逻辑之前委托 cancelMaskEditMessage 并 return。
+describe('cancelGeneration (SC-19: chat×mask 并行取消隔离)', () => {
+  beforeEach(() => {
+    maskEditFlowSpies.cancelMaskEditMessage.mockReset()
+  })
+
+  it('origin=mask-edit 的 in-flight message → 委托 cancelMaskEditMessage,不走全局 abort,message 不被 cancelGeneration 自己改 error', () => {
+    // seed 一条 origin:'mask-edit' status:'generating' 的 assistant message
+    useChatStore.setState({
+      messagesByScene: {
+        'scene-mask': [
+          { id: 'u1', role: 'user', kind: 'text', text: '改背景', createdAt: 0, status: 'done', origin: 'mask-edit' },
+          {
+            id: 'a1', role: 'assistant', kind: 'text', text: '', createdAt: 0, status: 'generating',
+            origin: 'mask-edit',
+            generationContext: { model: 'gpt-image-2', requestedImgRatio: 'auto', requestedQuality: 'auto', pendingSlotId: 'slot-m' },
+          },
+        ],
+      },
+    } as never)
+
+    useChatStore.getState().cancelGeneration({ sceneId: 'scene-mask', messageId: 'a1' })
+
+    // 委托 cancelMaskEditMessage(sceneId, messageId)
+    expect(maskEditFlowSpies.cancelMaskEditMessage).toHaveBeenCalledWith('scene-mask', 'a1')
+    expect(maskEditFlowSpies.cancelMaskEditMessage).toHaveBeenCalledTimes(1)
+    // message 未被 cancelGeneration 自己改成 error(由 cancelMaskEditMessage 负责)
+    const msg = useChatStore.getState().messagesByScene['scene-mask'][1]
+    expect(msg.status).toBe('generating')
+    expect(msg.errorKind).toBeUndefined()
+  })
+
+  it('origin 非 mask-edit 的 in-flight message + 无 activeChatAbortController → 走 fallback settle,cancelMaskEditMessage 未被调', () => {
+    // seed 一条普通 chat(无 origin)status:'generating' 的 assistant message
+    useChatStore.setState({
+      messagesByScene: {
+        'scene-chat': [
+          { id: 'u2', role: 'user', kind: 'text', text: '画猫', createdAt: 0, status: 'done' },
+          {
+            id: 'a2', role: 'assistant', kind: 'text', text: '', createdAt: 0, status: 'generating',
+            generationContext: { model: 'gpt-image-2', requestedImgRatio: 'auto', requestedQuality: 'auto', pendingSlotId: 'slot-c' },
+          },
+        ],
+      },
+    } as never)
+
+    useChatStore.getState().cancelGeneration({ sceneId: 'scene-chat', messageId: 'a2' })
+
+    // 普通 chat 分支:cancelMaskEditMessage 未被调
+    expect(maskEditFlowSpies.cancelMaskEditMessage).not.toHaveBeenCalled()
+    // fallback settle 把 message 标 error/canceled
+    const msg = useChatStore.getState().messagesByScene['scene-chat'][1]
+    expect(msg.status).toBe('error')
+    expect(msg.errorKind).toBe('canceled')
   })
 })

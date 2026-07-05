@@ -1,6 +1,10 @@
 import type { ChatMessage, ChatMessageStatus } from './chatStore'
 
 const expiredGenerationMessage = '任务已过期,请重试。'
+// mask-chat-card: 局部重绘刷新后无 runtime controller 可恢复轮询，chat card settle 为
+// error 且第一版不支持 card Retry，引导用户重新选择区域。保留 pendingSlotId 让 canvas
+// hydration 的 failed slot 与卡片对应（SC-15）。
+const maskEditExpiredRetryDisabledReason = '局部重绘任务已过期，请重新选择区域后再试'
 
 const isInFlightChatStatus = (status: ChatMessageStatus) => status === 'enhancing' || status === 'generating'
 
@@ -19,7 +23,9 @@ export const settleExpiredChatMessages = (messagesByScene: Record<string, ChatMe
           errorKind: 'unknown' as const,
           timeoutRetryKey: undefined,
           timeoutRetryCount: undefined,
-          retryDisabledReason: undefined,
+          // mask-chat-card: mask-edit 卡片第一版不支持 Retry；保留 generationContext.pendingSlotId。
+          retryDisabledReason:
+            message.origin === 'mask-edit' ? maskEditExpiredRetryDisabledReason : undefined,
         }
       }),
     ]),

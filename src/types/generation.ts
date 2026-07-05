@@ -12,6 +12,22 @@ export type EnhanceRequest = {
   history?: Array<{ role: 'user' | 'assistant'; content: string }>
   hasSelectedImage?: boolean
   sceneId?: string
+  /** mask-chat-card Step 3: 标记本次 enhance 是"生成"还是"编辑"意图。
+   *  调用方（chatStore mask-edit 分支）传入，供 BFF/LLM 侧区分是否需要参照
+   *  editContext 里的源图与 mask 信息。未传时按既有 generate 流程处理（向后兼容）。 */
+  intent?: 'generate' | 'edit'
+  /** mask-chat-card Step 3: mask-edit 调用点附加的源图/mask 上下文。
+   *  与 ImageMaskSubmitPayload 同源派生 —— maskBoundsPx 是源图 natural pixel
+   *  空间（不是 0-1 normalized），与 ImageMaskSubmitPayload.maskBounds 同源同单位，
+   *  BFF 可据此合成 area mask 或直接透传给 LLM 作为区域提示。 */
+  editContext?: {
+    sourceTitle?: string
+    hasMask?: boolean
+    maskKind?: 'brush' | 'bounds'
+    /** 源图 natural pixel 空间，与 ImageMaskSubmitPayload.maskBounds 同源同单位，不是 0-1 normalized */
+    maskBoundsPx?: { x: number; y: number; width: number; height: number }
+    sourceSize?: { width: number; height: number }
+  }
   signal?: AbortSignal
 }
 
