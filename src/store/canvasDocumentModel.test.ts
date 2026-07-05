@@ -5,7 +5,8 @@ vi.mock('../lib/demoImages', () => ({
 }))
 
 import type { MivoCanvasNode } from '../types/mivoCanvas'
-import { firstAnchorImageFor, rollbackLatestHistoryBaseline } from './canvasDocumentModel'
+import { firstAnchorImageFor, normalizeCanvasNodes, rollbackLatestHistoryBaseline } from './canvasDocumentModel'
+import { normalizeCanvasNodeV2 } from '../model/documentModelV2'
 
 const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
   id: 'img-1',
@@ -218,5 +219,167 @@ describe('rollbackLatestHistoryBaseline', () => {
     })
 
     expect(patch).toBeUndefined()
+  })
+})
+
+describe('normalizeCanvasNodes — write-path reference preservation (R01 fast path)', () => {
+  // The R01 fast path (commit #2) makes normalizeCanvasNodesV2 return the SAME reference
+  // for already-normalized nodes. This locks the write-path contract: unmoved, non-
+  // connector, membership-unchanged nodes keep their reference through the full 3-layer
+  // pipeline (sectionMembership → connectorMarkup → normalizeCanvasNodesV2), so
+  // CanvasNodeView's React.memo skips re-render for them during a drag frame. Connectors
+  // always rebuild in layer 2 (setNodeTransform); membership-changed nodes rebuild in
+  // layer 1 + layer 3. Both are excluded from the "retains ref" assertion.
+
+  // 20 normalized nodes: 1 frame (section), 2 members inside it, 1 markup-arrow
+  // connector bound to member-1 + outside-1, 16 outside images. Members carry
+  // sectionId='frame-1' matching their geometric membership so layer 1 returns same ref.
+  const buildFixture = (): MivoCanvasNode[] => {
+    const frame = normalizeCanvasNodeV2({
+      id: 'frame-1',
+      type: 'frame',
+      title: 'F',
+      status: 'ready',
+      x: 0,
+      y: 0,
+      width: 500,
+      height: 500,
+      sectionFillColor: '#eee',
+    })
+    const member = (id: string, x: number, y: number): MivoCanvasNode =>
+      normalizeCanvasNodeV2({
+        id,
+        type: 'image',
+        title: id,
+        status: 'ready',
+        x,
+        y,
+        width: 80,
+        height: 80,
+        assetUrl: `/${id}.png`,
+        sectionId: 'frame-1',
+      })
+    const outside = (id: string, x: number, y: number): MivoCanvasNode =>
+      normalizeCanvasNodeV2({
+        id,
+        type: 'image',
+        title: id,
+        status: 'ready',
+        x,
+        y,
+        width: 80,
+        height: 80,
+        assetUrl: `/${id}.png`,
+      })
+    const connector = normalizeCanvasNodeV2({
+      id: 'conn-1',
+      type: 'markup',
+      title: 'C1',
+      status: 'ready',
+      markupKind: 'arrow',
+      x: 180,
+      y: 140,
+      width: 820,
+      height: 860,
+      markupStrokeColor: '#497466',
+      markupStrokeWidth: 3,
+      markupStrokeStyle: 'solid',
+      markupOpacity: 0.82,
+      markupPoints: [
+        { x: 0, y: 0 },
+        { x: 820, y: 860 },
+      ],
+      connectorStart: { nodeId: 'member-1', anchor: 'right' },
+      connectorEnd: { nodeId: 'outside-1', anchor: 'left' },
+    })
+
+    const members = [member('member-1', 100, 100), member('member-2', 300, 300)]
+    const outsides = Array.from({ length: 16 }, (_, index) =>
+      outside(`outside-${index + 1}`, 1000 + index * 100, 1000 + index * 100),
+    )
+    return [frame, ...members, connector, ...outsides]
+  }
+
+  // Helper: a normalized node moved to a new position (transform + legacy x/y kept in sync
+  // so the result is still normalized — the fast path returns the same ref for it too).
+  const movedNode = (node: MivoCanvasNode, newX: number, newY: number): MivoCanvasNode => ({
+    ...node,
+    x: newX,
+    y: newY,
+    transform: { ...node.transform!, x: newX, y: newY },
+  })
+
+  it('a) unmoved non-connector / membership-unchanged nodes retain their reference (toBe)', () => {
+    const fixture = buildFixture()
+    const originalByIndex = fixture.map((node) => node)
+    // move outside-2 (non-member, non-connector, not bound to the connector) to a new
+    // position that is still outside the frame → its sectionId stays undefined
+    const movedIndex = fixture.findIndex((node) => node.id === 'outside-2')
+    const moved = movedNode(fixture[movedIndex], 5000, 5000)
+    const input = fixture.map((node, index) => (index === movedIndex ? moved : node))
+
+    const result = normalizeCanvasNodes(input)
+
+    // the moved node is excluded; the connector is excluded (always rebuilds in layer 2)
+    const connectorIndex = fixture.findIndex((node) => node.id === 'conn-1')
+    result.forEach((node, index) => {
+      if (index === movedIndex || index === connectorIndex) return
+      expect(node).toBe(originalByIndex[index])
+    })
+  })
+
+  it('b) the moved node lands at its new position', () => {
+    const fixture = buildFixture()
+    const movedIndex = fixture.findIndex((node) => node.id === 'outside-3')
+    const input = fixture.map((node, index) =>
+      index === movedIndex ? movedNode(node, 4321, 1234) : node,
+    )
+    const result = normalizeCanvasNodes(input)
+    expect(result[movedIndex].x).toBe(4321)
+    expect(result[movedIndex].y).toBe(1234)
+    expect(result[movedIndex].transform?.x).toBe(4321)
+  })
+
+  it('c) connector geometry recomputes when a bound endpoint moves', () => {
+    const fixture = buildFixture()
+    const connectorIndex = fixture.findIndex((node) => node.id === 'conn-1')
+    const originalConnector = fixture[connectorIndex]
+    // move member-1 (a bound endpoint) within the frame so its membership is unchanged
+    const memberIndex = fixture.findIndex((node) => node.id === 'member-1')
+    const input = fixture.map((node, index) =>
+      index === memberIndex ? movedNode(node, 150, 150) : node,
+    )
+    const result = normalizeCanvasNodes(input)
+    const connector = result[connectorIndex]
+    // layer 2 always rebuilds a bound connector → new reference
+    expect(connector).not.toBe(originalConnector)
+    // geometry follows the moved endpoint → at least one of x/y/width/height differs
+    const geometryChanged =
+      connector.x !== originalConnector.x ||
+      connector.y !== originalConnector.y ||
+      connector.width !== originalConnector.width ||
+      connector.height !== originalConnector.height
+    expect(geometryChanged).toBe(true)
+  })
+
+  it('d) frame dragged over a non-member recomputes that node sectionId', () => {
+    const fixture = buildFixture()
+    const frameIndex = fixture.findIndex((node) => node.id === 'frame-1')
+    const targetIndex = fixture.findIndex((node) => node.id === 'outside-4') // currently outside
+    expect(fixture[targetIndex].sectionId).toBeUndefined()
+    // move the frame so it now covers outside-4 (originally at 1300,1300)
+    const frame = fixture[frameIndex]
+    const movedFrame: MivoCanvasNode = {
+      ...frame,
+      x: 1100,
+      y: 1100,
+      transform: { ...frame.transform!, x: 1100, y: 1100 },
+    }
+    const input = fixture.map((node, index) => (index === frameIndex ? movedFrame : node))
+    const result = normalizeCanvasNodes(input)
+    // outside-4's center is now inside the moved frame → sectionId recomputed to frame-1
+    expect(result[targetIndex].sectionId).toBe('frame-1')
+    // and because membership changed, layer 1 produced a new object → not the same ref
+    expect(result[targetIndex]).not.toBe(fixture[targetIndex])
   })
 })

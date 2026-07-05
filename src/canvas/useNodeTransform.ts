@@ -11,9 +11,37 @@ import {
 } from './canvasInteraction'
 import type { ResizeCorner, SnapGuide } from './canvasGeometry'
 
-export const isNodeEffectivelyLocked = (node: MivoCanvasNode, nodes: MivoCanvasNode[]): boolean => {
-  const section = node.sectionId ? nodes.find((item) => item.id === node.sectionId && item.type === 'frame') : undefined
-  return Boolean(node.locked || section?.sectionLockMode === 'all')
+// C03+C04 (commit #4): the single source of truth for the canvas-layer lock rule.
+// isLockedWithSection is a pure boolean primitive; the two consumer entry points below
+// each own their lookup strategy (single-node find vs batch Map). Keeping the rule text
+// in one place closes the v1 double-implementation drift — MivoCanvas previously had a
+// local copy of `locked || sectionLockMode==='all'` AND this module exported its own.
+const isLockedWithSection = (node: MivoCanvasNode, section: MivoCanvasNode | undefined): boolean =>
+  Boolean(node.locked || section?.sectionLockMode === 'all')
+
+// Single-node entry: signature + complexity unchanged so the interaction path
+// (useCanvasInteractionController.ts `selectedNodes.some(n => isNodeEffectivelyLocked(n, nodes))`)
+// does not regress. MUST NOT be rewritten to build an internal Set — that would allocate
+// a Set on every call and turn the some() loop into O(n²)+alloc instead of O(n).
+export const isNodeEffectivelyLocked = (node: MivoCanvasNode, nodes: MivoCanvasNode[]): boolean =>
+  isLockedWithSection(
+    node,
+    node.sectionId ? nodes.find((item) => item.id === node.sectionId && item.type === 'frame') : undefined,
+  )
+
+// Batch entry (render path): O(n) — build a Map of frame sections once, then one pass
+// over nodes. Replaces MivoCanvas's per-rendered-node local find (was O(n²) on
+// renderedNodes via the local isNodeEffectivelyLocked). `renderedNodes ⊆ visibleNodes`
+// guarantees every rendered node is accounted for in the set.
+export const lockedNodeIdSetFor = (nodes: MivoCanvasNode[]): Set<string> => {
+  const sectionsById = new Map(
+    nodes.filter((n) => n.type === 'frame').map((n) => [n.id, n] as const),
+  )
+  return new Set(
+    nodes
+      .filter((n) => isLockedWithSection(n, n.sectionId ? sectionsById.get(n.sectionId) : undefined))
+      .map((n) => n.id),
+  )
 }
 
 export const isAutoDeletedEmptyTextNode = (

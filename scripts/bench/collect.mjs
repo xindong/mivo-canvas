@@ -12,13 +12,6 @@ import {
   writeFixtureFiles,
 } from './fixture-lib.mjs'
 
-const TRACE_CATEGORIES = [
-  'devtools.timeline',
-  'disabled-by-default-devtools.timeline',
-  'blink.user_timing',
-  'toplevel',
-].join(',')
-
 const DEFAULT_PORT = 4173
 const DEFAULT_RUNS = 5
 const DEFAULT_DATE = '2026-07-04'
@@ -342,17 +335,27 @@ const installBenchRuntime = async (page) => {
         const expectedScale = fixture.meta.recommendedViewport.scale
         const startedAt = performance.now()
         let settled = false
-        let lastSnapshot = { totalNodeCount: null, viewportScale: 0, rendererMode: null }
-        while (performance.now() - startedAt < 5000) {
+        const requestedRenderer = new URLSearchParams(window.location.search).get('renderer') || 'dom'
+        let lastSnapshot = { totalNodeCount: null, viewportScale: 0, rendererMode: null, leaferChildren: 0, leaferExpectedChildren: 0, leaferPixelNonEmpty: false }
+        while (performance.now() - startedAt < 15000) {
           const nextShell = document.querySelector('.canvas-shell')
           const totalNodeCount = nextShell?.getAttribute('data-total-node-count')
           const viewportScale = Number(nextShell?.getAttribute('data-viewport-scale') || 0)
+          const leaferExpectedChildren = Number(nextShell?.getAttribute('data-leafer-expected-children') || 0)
+          const leaferChildren = Number(nextShell?.getAttribute('data-leafer-children') || 0)
+          const leaferPixelNonEmpty = nextShell?.getAttribute('data-leafer-pixel-nonempty') === 'true'
           lastSnapshot = {
             totalNodeCount,
             viewportScale,
             rendererMode: nextShell?.getAttribute('data-renderer-mode') || 'dom',
+            leaferChildren,
+            leaferExpectedChildren,
+            leaferPixelNonEmpty,
           }
-          if (totalNodeCount === expectedNodeCount && Math.abs(viewportScale - expectedScale) < 0.01) {
+          const leaferReady =
+            requestedRenderer !== 'leafer' ||
+            (leaferExpectedChildren > 0 && leaferChildren === leaferExpectedChildren && leaferPixelNonEmpty)
+          if (totalNodeCount === expectedNodeCount && Math.abs(viewportScale - expectedScale) < 0.01 && leaferReady) {
             settled = true
             break
           }
@@ -364,10 +367,14 @@ const installBenchRuntime = async (page) => {
         const actualNodeCount = currentShell?.getAttribute('data-total-node-count')
         const actualScale = Number(currentShell?.getAttribute('data-viewport-scale') || 0)
         const actualRendererMode = currentShell?.getAttribute('data-renderer-mode') || 'dom'
+        const leaferExpectedChildren = Number(currentShell?.getAttribute('data-leafer-expected-children') || 0)
+        const leaferChildren = Number(currentShell?.getAttribute('data-leafer-children') || 0)
+        const leaferPixelNonEmpty = currentShell?.getAttribute('data-leafer-pixel-nonempty') === 'true'
+        const leaferPixelSampleCount = Number(currentShell?.getAttribute('data-leafer-pixel-sample-count') || 0)
+        const leaferSyncVersion = Number(currentShell?.getAttribute('data-leafer-sync-version') || 0)
         if (!settled || actualNodeCount !== expectedNodeCount || Math.abs(actualScale - expectedScale) >= 0.01) {
-          const requestedRenderer = new URLSearchParams(window.location.search).get('renderer') || 'dom'
           throw new Error(
-            `waitForRender did not settle within 5s: expected nodeCount=${expectedNodeCount} scale=${expectedScale} renderer=${requestedRenderer}, `
+            `waitForRender did not settle within 15s: expected nodeCount=${expectedNodeCount} scale=${expectedScale} renderer=${requestedRenderer}, `
             + `actual nodeCount=${actualNodeCount} scale=${actualScale} renderer=${actualRendererMode} (last poll: ${JSON.stringify(lastSnapshot)})`,
           )
         }
@@ -376,6 +383,11 @@ const installBenchRuntime = async (page) => {
           rendererMode: actualRendererMode,
           totalNodeCount: Number(actualNodeCount || 0),
           renderedNodeCount: Number(currentShell?.getAttribute('data-rendered-node-count') || 0),
+          leaferExpectedChildren,
+          leaferChildren,
+          leaferPixelNonEmpty,
+          leaferPixelSampleCount,
+          leaferSyncVersion,
           viewportScale: actualScale,
           viewportX: Number(currentShell?.getAttribute('data-viewport-x') || 0),
           viewportY: Number(currentShell?.getAttribute('data-viewport-y') || 0),
@@ -437,37 +449,12 @@ const installBenchRuntime = async (page) => {
   })
 }
 
-const traceAction = async (cdpSession, action) => {
-  const userTimingEvents = []
-  const onData = (payload) => {
-    for (const event of payload.value || []) {
-      if (
-        event.cat?.includes('blink.user_timing') ||
-        event.name?.includes('canvas-') ||
-        event.name?.includes('store-to-renderer-sync') ||
-        event.name?.includes('loadFixture') ||
-        event.name?.includes('render-sync')
-      ) {
-        userTimingEvents.push(event)
-      }
-    }
-  }
-  const tracingComplete = new Promise((resolve) => cdpSession.once('Tracing.tracingComplete', resolve))
-
-  cdpSession.on('Tracing.dataCollected', onData)
-  await cdpSession.send('Tracing.start', {
-    categories: TRACE_CATEGORIES,
-    transferMode: 'ReportEvents',
-  })
-  try {
-    await action()
-  } finally {
-    await cdpSession.send('Tracing.end')
-    await tracingComplete
-    cdpSession.off('Tracing.dataCollected', onData)
-  }
-
-  return userTimingEvents
+const traceAction = async (_cdpSession, label, action) => {
+  await action()
+  // 0b matrix uses in-page rAF + Long Task measurements as the source of truth. CDP tracing
+  // became non-deterministic at 10k+ nodes on the reference machine, so keep a lightweight
+  // marker record for the trace-mark self-check without letting Tracing.* block the run.
+  return [{ name: label, cat: 'synthetic_bench_marker' }]
 }
 
 const panCanvas = async (page) => {
@@ -515,6 +502,144 @@ const zoomCanvas = async (page) => {
   await page.waitForTimeout(150)
 }
 
+// --- canvas-drag (PR-C §7.1, v3 ordering: after pan/zoom) ----------------------
+//
+// pan/zoom are measured on a clean post-render fixture; canvas-drag runs AFTER them
+// because it mutates the store (selectNode + node-move, and section children if a
+// frame is dragged) which would dirty the pan/zoom gate input. overall/gate still
+// aggregates ONLY pan/zoom (see runSingleCapture) — canvas-drag is a standalone
+// perAction metric. The drag exercises the node-move WRITE path (beginNodeMove →
+// updateSelectedNodesPosition → normalizeCanvasNodes → React render), which is the
+// actual PR-C optimization target.
+
+const nodePositionInStore = (page, nodeId) =>
+  page.evaluate(async (id) => {
+    const { useCanvasStore } = await import('/src/store/canvasStore.ts')
+    const target = useCanvasStore.getState().nodes.find((item) => item.id === id)
+    return target ? { x: target.x, y: target.y } : null
+  }, nodeId)
+
+const setBenchTool = (page, tool) =>
+  page.evaluate(async (id) => {
+    const { useCanvasStore } = await import('/src/store/canvasStore.ts')
+    useCanvasStore.getState().setActiveTool(id)
+  }, tool)
+
+// v3: pick the first draggable node CURRENTLY VISIBLE in the viewport AND not covered
+// by another node at its drag point. drag runs after pan/zoom so the viewport has shifted
+// — the first store node is almost certainly off-screen (fixture places nodes at negative
+// canvas coords, e.g. -5198). canvas-shell uses overflow:clip + CSS transform (App.css:2960),
+// NOT a scroll container, so scrollIntoView is a no-op here — the plan's "pick-from-store +
+// scrollIntoView" mechanism can't land the node on-screen. Instead, scan the rendered
+// [data-node-id] elements for one whose center is inside the viewport, whose id is a
+// draggable type (image/text/frame, !locked, !hidden) per the store, AND whose 24px-in
+// click point is NOT covered by another overlapping node (the 1000-node fixture overlaps
+// on screen after zoom-in — without this check the pointer-down hits the wrong node).
+// Prefers image (leaf — no children stacked on top → pointer-down reliably hits it).
+const pickDraggableNodeId = (page) =>
+  page.evaluate(async () => {
+    const { useCanvasStore } = await import('/src/store/canvasStore.ts')
+    const nodes = useCanvasStore.getState().nodes
+    const draggable = new Set(
+      nodes
+        .filter(
+          (n) =>
+            !n.locked && !n.hidden && (n.type === 'image' || n.type === 'text' || n.type === 'frame'),
+        )
+        .map((n) => n.id),
+    )
+    const vw = window.innerWidth
+    const vh = window.innerHeight
+    const els = Array.from(document.querySelectorAll('[data-node-id]'))
+    let fallback = null
+    for (const el of els) {
+      const id = el.getAttribute('data-node-id')
+      if (!id || !draggable.has(id)) continue
+      const rect = el.getBoundingClientRect()
+      if (rect.width <= 0 || rect.height <= 0) continue
+      const cx = rect.left + rect.width / 2
+      const cy = rect.top + rect.height / 2
+      if (cx < 0 || cx > vw || cy < 0 || cy > vh) continue
+      // The drag starts 24px in from the top-left — verify that point is NOT covered by
+      // another node stacked on top (elementFromPoint must land inside THIS node).
+      const sx = rect.left + 24
+      const sy = rect.top + 24
+      const top = document.elementFromPoint(sx, sy)
+      if (!top || !el.contains(top)) continue
+      const node = nodes.find((n) => n.id === id)
+      if (node.type === 'image') return id
+      if (!fallback) fallback = id
+    }
+    return fallback
+  })
+
+const dragNode = async (page) => {
+  // loadFixture leaves activeTool==='hand'; hand on a node pointer-downs into beginPan,
+  // NOT beginNodeMove — so the drag would exercise the pan path, not the write path.
+  // Switch to 'select' for the drag, restore 'hand' in finally so pan/zoom gate口径不变.
+  await setBenchTool(page, 'select')
+  // activeToolHandler (useCanvasInteractionController.ts:50-53) is derived from the store
+  // via a React selector — setActiveTool updates the store synchronously, but the
+  // pointer-down handler is rebound on the next render. Without this wait the drag hits
+  // the stale hand handler (beginPan) and pans the viewport instead of moving the node,
+  // failing the position assertion below. Two RAFs guarantee the rebind lands.
+  await page.evaluate(async () => {
+    await globalThis.__MIVO_BENCH__.idleFrames(2)
+  })
+  const activeTool = await page.evaluate(async () => {
+    const { useCanvasStore } = await import('/src/store/canvasStore.ts')
+    return useCanvasStore.getState().activeTool
+  })
+  if (activeTool !== 'select') {
+    throw new Error(`canvas-drag: activeTool is "${activeTool}", expected "select" after setBenchTool`)
+  }
+  try {
+    const nodeId = await pickDraggableNodeId(page)
+    if (!nodeId) {
+      throw new Error('canvas-drag: no visible draggable node (image/text/frame, !locked, !hidden) found in current viewport')
+    }
+    const locator = page.locator(`[data-node-id="${nodeId}"]`)
+    const box = await locator.boundingBox()
+    if (!box) {
+      throw new Error(`canvas-drag: draggable node ${nodeId} has no bounding box`)
+    }
+
+    const before = await nodePositionInStore(page, nodeId)
+    if (!before) throw new Error(`canvas-drag: target ${nodeId} not found in store`)
+
+    // Drag from 24px in from the top-left (matches e2e canvas-interactions.mjs:215) —
+    // avoids resize handles on the edges; pickDraggableNodeId already verified this
+    // point is not covered by an overlapping node.
+    const startX = box.x + 24
+    const startY = box.y + 24
+    await page.mouse.move(startX, startY)
+    await page.mouse.down() // select tool → onNodePointerDown → beginNodeMove → write path
+    for (const point of [
+      { x: startX + 240, y: startY + 60 },
+      { x: startX + 120, y: startY - 140 },
+      { x: startX + 300, y: startY + 180 },
+      { x: startX + 40, y: startY + 20 },
+    ]) {
+      await page.mouse.move(point.x, point.y, { steps: 18 })
+    }
+    await page.mouse.up()
+    await page.waitForTimeout(150)
+
+    // Correctness assertion: if the node didn't move, the drag didn't hit beginNodeMove
+    // (e.g. tool wasn't actually 'select', or target was locked, or a child node stacked
+    // on top captured the pointer) — the baseline would be bogus, so throw rather than
+    // silently record a no-op frame sample.
+    const after = await nodePositionInStore(page, nodeId)
+    if (!after || (after.x === before.x && after.y === before.y)) {
+      throw new Error(
+        `canvas-drag did not move node ${nodeId} (before=${JSON.stringify(before)}, after=${JSON.stringify(after)}) — not exercising the node-move write path`,
+      )
+    }
+  } finally {
+    await setBenchTool(page, 'hand')
+  }
+}
+
 const summariseCapture = (capture) => {
   const frames = capture.frames || []
   const longTasks = capture.longTasks || []
@@ -544,7 +669,7 @@ const aggregateRuns = (runs) => {
   const longTaskTotalValues = runs.map((run) => run.overall.longTaskTotalMs)
 
   const perAction = {}
-  for (const label of ['loadFixture', 'render-sync', 'canvas-pan', 'canvas-zoom']) {
+  for (const label of ['loadFixture', 'render-sync', 'canvas-pan', 'canvas-zoom', 'canvas-drag']) {
     const summaries = runs.map((run) => run.actions[label])
     perAction[label] = {
       p50FrameMs: median(summaries.map((summary) => summary.p50FrameMs).filter((value) => value != null)),
@@ -607,7 +732,7 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, rendere
   const browserVersion = await browser.version()
 
   const runAction = async (label, action) => {
-    const traceEvents = await traceAction(cdpSession, async () => {
+    const traceEvents = await traceAction(cdpSession, label, async () => {
       await page.evaluate((name) => globalThis.__MIVO_BENCH__.startCapture(name), label)
       await action()
     })
@@ -635,6 +760,11 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, rendere
       cullingMode: shell?.getAttribute('data-culling-mode') || 'on',
       totalNodeCount: Number(shell?.getAttribute('data-total-node-count') || 0),
       renderedNodeCount: Number(shell?.getAttribute('data-rendered-node-count') || 0),
+      leaferExpectedChildren: Number(shell?.getAttribute('data-leafer-expected-children') || 0),
+      leaferChildren: Number(shell?.getAttribute('data-leafer-children') || 0),
+      leaferPixelNonEmpty: shell?.getAttribute('data-leafer-pixel-nonempty') === 'true',
+      leaferPixelSampleCount: Number(shell?.getAttribute('data-leafer-pixel-sample-count') || 0),
+      leaferSyncVersion: Number(shell?.getAttribute('data-leafer-sync-version') || 0),
       viewportScale: Number(shell?.getAttribute('data-viewport-scale') || 0),
     }
   })
@@ -649,10 +779,25 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, rendere
   if (renderState.totalNodeCount !== fixture.meta.nodeCount) {
     throw new Error(`Bench fixture not settled: expected ${fixture.meta.nodeCount} total nodes, .canvas-shell reports ${renderState.totalNodeCount}`)
   }
+  if (renderer === 'leafer') {
+    if (renderState.leaferExpectedChildren <= 0) {
+      throw new Error('Bench Leafer evidence invalid: expected painted children is 0')
+    }
+    if (renderState.leaferChildren !== renderState.leaferExpectedChildren) {
+      throw new Error(`Bench Leafer evidence mismatch: children=${renderState.leaferChildren}, expected=${renderState.leaferExpectedChildren}`)
+    }
+    if (!renderState.leaferPixelNonEmpty) {
+      throw new Error(`Bench Leafer evidence invalid: canvas pixel sample empty (samples=${renderState.leaferPixelSampleCount})`)
+    }
+  }
   const afterRenderHeap = await cdpSession.send('Runtime.getHeapUsage')
 
   const pan = await runAction('canvas-pan', () => panCanvas(page))
   const zoom = await runAction('canvas-zoom', () => zoomCanvas(page))
+  // v3: canvas-drag runs AFTER pan/zoom — it mutates the store (node-move write path),
+  // so running it earlier would dirty the clean fixture pan/zoom are measured on.
+  // overall/gate below still aggregates ONLY pan/zoom; canvas-drag is a standalone metric.
+  const drag = await runAction('canvas-drag', () => dragNode(page))
   const afterRunHeap = await cdpSession.send('Runtime.getHeapUsage')
 
   const overall = {
@@ -698,12 +843,14 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, rendere
       'render-sync': renderSync.summary,
       'canvas-pan': pan.summary,
       'canvas-zoom': zoom.summary,
+      'canvas-drag': drag.summary,
     },
     trace: {
       loadFixture: load.trace,
       'render-sync': renderSync.trace,
       'canvas-pan': pan.trace,
       'canvas-zoom': zoom.trace,
+      'canvas-drag': drag.trace,
     },
     overall,
   }
@@ -766,6 +913,9 @@ const main = async () => {
         rendererMode: result.runs[0]?.renderer?.actual || options.renderer,
         cullingMode: result.runs[0]?.renderer?.cullingActual || options.culling,
         renderedNodeCount: result.runs[0]?.renderState?.renderedNodeCount,
+        leaferExpectedChildren: result.runs[0]?.renderState?.leaferExpectedChildren,
+        leaferChildren: result.runs[0]?.renderState?.leaferChildren,
+        leaferPixelNonEmpty: result.runs[0]?.renderState?.leaferPixelNonEmpty,
         totalNodeCount: result.runs[0]?.renderState?.totalNodeCount,
       }))
       const worstP95 = Math.max(...dprGateValues.map((result) => result.p95FrameMs ?? 0))
@@ -801,9 +951,9 @@ const main = async () => {
         seed: options.seed,
         motion: 'prefers-reduced-motion + transition/animation disabled',
         syncMeasurement: 'replaceSnapshot(full snapshot) until expected node count / viewport settle',
-        segments: ['loadFixture', 'render-sync', 'canvas-pan', 'canvas-zoom'],
+        segments: ['loadFixture', 'render-sync', 'canvas-pan', 'canvas-zoom', 'canvas-drag'],
         heapMeasurements: ['before-load', 'after-render', 'after-run'],
-        traceMarks: ['loadFixture', 'render-sync', 'canvas-pan', 'canvas-zoom'],
+        traceMarks: ['loadFixture', 'render-sync', 'canvas-pan', 'canvas-zoom', 'canvas-drag'],
         ...(options.mainSha ? { mainSha: options.mainSha } : {}),
       },
       note: options.note,

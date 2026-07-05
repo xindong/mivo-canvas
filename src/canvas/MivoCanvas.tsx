@@ -9,8 +9,8 @@ import {
   type DragEvent as ReactDragEvent,
   type MouseEvent as ReactMouseEvent,
 } from 'react'
-import { Leafer } from 'leafer-ui'
-import '@leafer-in/view'
+import { useLeaferSpikeRenderer } from '../render/useLeaferSpikeRenderer'
+import { filterDomNodesForLeaferSpike } from '../render/leaferSpikeFilter'
 import { LocateFixed, Minus, Plus, RotateCcw } from 'lucide-react'
 import { downloadCanvasNodeOriginal } from '../lib/assetDownload'
 import { canReadLocalAssetDrag, parseLocalAssetDragPayload } from '../lib/canvasAssetDrag'
@@ -31,6 +31,7 @@ import { StampOptionsBar } from './StampOptionsBar'
 import { stampCursorCssFor, stampGrowthSizes, stampSrcFor } from './stampDefs'
 import { useCanvasInteractionController } from './useCanvasInteractionController'
 import { useMaskPointArmed, type MaskPointArmedInteractionApi } from './useMaskPointArmed'
+import { lockedNodeIdSetFor } from './useNodeTransform'
 import { rendererMode } from '../render/rendererMode'
 import { cullingMode } from '../render/cullingMode'
 
@@ -80,7 +81,9 @@ const isCanvasChromeTarget = (target: EventTarget | null) =>
 
 const canvasRenderOverscanPx = 520
 
-const rectsIntersect = (
+// C05: closed-interval (>=) intersection — culling over-renders to avoid border popping.
+// Disambiguates from canvasInteraction.rectsIntersect (open-interval, selection-semantics).
+const rectsIntersectInclusive = (
   a: { x: number; y: number; width: number; height: number },
   b: { x: number; y: number; width: number; height: number },
 ) => a.x + a.width >= b.x && b.x + b.width >= a.x && a.y + a.height >= b.y && b.y + b.height >= a.y
@@ -90,14 +93,6 @@ const canImportDataTransfer = (dataTransfer: DataTransfer) =>
   dataTransfer.types.includes('Files') ||
   canReadLocalAssetDrag(dataTransfer)
 
-const isNodeEffectivelyLocked = (nodeId: string, nodes: Array<{ id: string; type: string; sectionId?: string; locked?: boolean; sectionLockMode?: string }>) => {
-  const node = nodes.find((item) => item.id === nodeId)
-  if (!node) return false
-
-  const section = node.sectionId ? nodes.find((item) => item.id === node.sectionId && item.type === 'frame') : undefined
-  return Boolean(node.locked || section?.sectionLockMode === 'all')
-}
-
 export function MivoCanvas({
   onOpenDetails,
   onRegisterExternalAssetDrop,
@@ -106,7 +101,6 @@ export function MivoCanvas({
 }: MivoCanvasProps) {
   const shellRef = useRef<HTMLElement | null>(null)
   const hostRef = useRef<HTMLDivElement | null>(null)
-  const leaferRef = useRef<Leafer | null>(null)
   const maskPointInteractionRef = useRef<MaskPointArmedInteractionApi>({
     beginNodePointerDown: () => undefined,
     handleCanvasPointerDown: () => undefined,
@@ -136,6 +130,9 @@ export function MivoCanvas({
   const hasAnchors = useCanvasStore((state) => state.nodes.some((node) => Boolean(node.experimentalAnchors?.length)))
   const contextMenuNodeId = contextMenu?.nodeId
   const visibleNodes = useMemo(() => nodes.filter((node) => !node.hidden), [nodes])
+  // C03+C04 (commit #4): O(n) memoized locked-id set replaces the per-rendered-node
+  // local find (was O(n²) on renderedNodes). Re-derived only when visibleNodes changes.
+  const lockedNodeIds = useMemo(() => lockedNodeIdSetFor(visibleNodes), [visibleNodes])
   const contextMenuNode =
     contextMenu?.kind === 'node' ? visibleNodes.find((node) => node.id === contextMenuNodeId) : undefined
   const cropNode = cropNodeId ? visibleNodes.find((node) => node.id === cropNodeId && node.type === 'image') : undefined
@@ -231,8 +228,10 @@ export function MivoCanvas({
     [viewport.scale, viewport.x, viewport.y],
   )
 
-  const renderedNodes = useMemo(() => {
-    if (cullingMode === 'off' || !shellSize.width || !shellSize.height) return visibleNodes
+  const canvasRenderedNodes = useMemo(() => {
+    if (cullingMode === 'off' || !shellSize.width || !shellSize.height) {
+      return visibleNodes
+    }
     const viewportRect = {
       x: (-viewport.x - canvasRenderOverscanPx) / viewport.scale,
       y: (-viewport.y - canvasRenderOverscanPx) / viewport.scale,
@@ -245,7 +244,7 @@ export function MivoCanvas({
     if (maskEditNodeId) pinnedNodeIds.add(maskEditNodeId)
     if (contextMenuNodeId) pinnedNodeIds.add(contextMenuNodeId)
 
-    return visibleNodes.filter((node) => pinnedNodeIds.has(node.id) || rectsIntersect(node, viewportRect))
+    return visibleNodes.filter((node) => pinnedNodeIds.has(node.id) || rectsIntersectInclusive(node, viewportRect))
   }, [
     contextMenuNodeId,
     cropNodeId,
@@ -259,6 +258,10 @@ export function MivoCanvas({
     viewport.y,
     visibleNodes,
   ])
+  const renderedNodes = useMemo(
+    () => filterDomNodesForLeaferSpike(canvasRenderedNodes, rendererMode),
+    [canvasRenderedNodes],
+  )
 
   const openNodeContextMenu = useCallback(
     (nodeId: string, clientX: number, clientY: number) => {
@@ -416,41 +419,7 @@ export function MivoCanvas({
     return () => onRegisterExternalAssetDrop?.(undefined)
   }, [importLocalAssetAtClientPoint, onRegisterExternalAssetDrop])
 
-  useEffect(() => {
-    if (!hostRef.current || leaferRef.current) return
-
-    const host = hostRef.current
-    const size = host.getBoundingClientRect()
-    const leafer = new Leafer({
-      view: host,
-      type: 'design',
-      width: Math.max(1, Math.floor(size.width)),
-      height: Math.max(1, Math.floor(size.height)),
-      fill: 'rgba(246, 243, 235, 0)',
-      smooth: true,
-    })
-
-    leaferRef.current = leafer
-    leafer.start()
-
-    const resizeObserver = new ResizeObserver(([entry]) => {
-      if (!entry) return
-      const { width, height } = entry.contentRect
-      leafer.resize({
-        width: Math.max(1, Math.floor(width)),
-        height: Math.max(1, Math.floor(height)),
-        pixelRatio: window.devicePixelRatio,
-      })
-    })
-
-    resizeObserver.observe(host)
-
-    return () => {
-      resizeObserver.disconnect()
-      leafer.destroy()
-      leaferRef.current = null
-    }
-  }, [])
+  const leaferSpikeStats = useLeaferSpikeRenderer({ hostRef, viewport, nodes: visibleNodes, rendererMode })
 
   useEffect(() => {
     const shell = shellRef.current
@@ -517,6 +486,11 @@ export function MivoCanvas({
       data-viewport-y={viewport.y}
       data-rendered-node-count={renderedNodes.length}
       data-total-node-count={visibleNodes.length}
+      data-leafer-expected-children={leaferSpikeStats.expectedChildren}
+      data-leafer-children={leaferSpikeStats.children}
+      data-leafer-pixel-nonempty={leaferSpikeStats.pixelNonEmpty ? 'true' : 'false'}
+      data-leafer-pixel-sample-count={leaferSpikeStats.pixelSampleCount}
+      data-leafer-sync-version={leaferSpikeStats.syncVersion}
       ref={shellRef}
       onWheel={handleWheel}
       onPointerDown={wrapCanvasPointerDown}
@@ -691,7 +665,7 @@ export function MivoCanvas({
                 node.id === selectedNodeId &&
                 node.id !== cropNodeId
               }
-              effectiveLocked={isNodeEffectivelyLocked(node.id, visibleNodes)}
+              effectiveLocked={lockedNodeIds.has(node.id)}
               handleSize={handleSize}
               handleBorderWidth={handleBorderWidth}
               selectionStrokeWidth={selectionStrokeWidth}
