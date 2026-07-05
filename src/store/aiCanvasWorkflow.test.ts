@@ -6,7 +6,7 @@ vi.mock('./remoteDebugReporter', () => ({
 
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 import { useDebugLogStore } from './debugLogStore'
-import { reflowRightObstacles, slotSizeForRatio } from './aiCanvasWorkflow'
+import { equalAreaSizeForDimensions, reflowRightObstacles } from './aiCanvasWorkflow'
 
 const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
   id: 'img-1',
@@ -76,32 +76,26 @@ describe('reflowRightObstacles', () => {
 })
 
 
-describe('slotSizeForRatio (占位符比例跟随请求比例)', () => {
+describe('equalAreaSizeForDimensions (chat slot 替换按结果图比例落画布)', () => {
   const base = { width: 320, height: 320 }
 
-  it('keeps the base square for 1:1 / auto / undefined (无回归)', () => {
-    expect(slotSizeForRatio(base, '1:1')).toEqual(base)
-    expect(slotSizeForRatio(base, 'auto')).toEqual(base)
-    expect(slotSizeForRatio(base, undefined)).toEqual(base)
-  })
-
-  it('matches 16:9 within rounding and preserves the base area', () => {
-    const size = slotSizeForRatio(base, '16:9')
+  it('matches the result aspect ratio and preserves the placeholder area (16:9)', () => {
+    const size = equalAreaSizeForDimensions(base, { width: 1920, height: 1080 })
     expect(size.width / size.height).toBeCloseTo(16 / 9, 1)
     expect(size.width * size.height).toBeGreaterThan(base.width * base.height * 0.95)
     expect(size.width * size.height).toBeLessThan(base.width * base.height * 1.05)
   })
 
-  it('matches 3:2 and the portrait counterpart 2:3', () => {
-    const landscape = slotSizeForRatio(base, '3:2')
-    expect(landscape.width / landscape.height).toBeCloseTo(3 / 2, 1)
-    const portrait = slotSizeForRatio(base, '2:3')
-    expect(portrait.width / portrait.height).toBeCloseTo(2 / 3, 1)
-    expect(portrait.width).toBeLessThan(portrait.height)
+  it('handles portrait results (1080×1920 → 240×427)', () => {
+    expect(equalAreaSizeForDimensions(base, { width: 1080, height: 1920 })).toEqual({ width: 240, height: 427 })
   })
 
-  it('falls back to base on malformed ratios', () => {
-    expect(slotSizeForRatio(base, '0:9' as never)).toEqual(base)
-    expect(slotSizeForRatio(base, 'x:y' as never)).toEqual(base)
+  it('keeps a square result at the placeholder size (1:1 无跳变)', () => {
+    expect(equalAreaSizeForDimensions(base, { width: 1024, height: 1024 })).toEqual(base)
+  })
+
+  it('falls back to the placeholder size without natural dimensions', () => {
+    expect(equalAreaSizeForDimensions(base, undefined)).toEqual(base)
+    expect(equalAreaSizeForDimensions(base, { width: 0, height: 900 })).toEqual(base)
   })
 })
