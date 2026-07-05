@@ -159,6 +159,12 @@ export const shapePaintPropsFor = (
     y: r.geometry.y,
     width: clampDim(r.geometry.width),
     height: clampDim(r.geometry.height),
+    // FU-8: DOM applies `translate(x,y) rotate(θ)` with transformOrigin 50% 50%
+    // (canvasRenderAdapter.nodeRenderBoxFor) — Leafer equivalent is rotation +
+    // origin:'center' (x/y stay the unrotated box top-left). rotation is ALWAYS
+    // present (0 default) so a rotate-then-reset update clears the old angle.
+    rotation: r.geometry.rotation || 0,
+    origin: 'center',
     ...(zIndex !== undefined ? { zIndex } : {}),
   }
 

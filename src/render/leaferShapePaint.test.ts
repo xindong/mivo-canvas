@@ -219,6 +219,24 @@ describe('shapePaintPropsFor — DOM 视觉等价（消费 projection 下沉缺�
     const props = shapePaintPropsFor(projectNode(frameNode()), 'frame', 42)
     expect(props.zIndex).toBe(42)
   })
+
+  it('FU-8 rotation：geometry.rotation 透传 + origin center（DOM transformOrigin 50% 50% 等价）', () => {
+    const node = markupNode({
+      transform: { x: 0, y: 0, width: 100, height: 80, rotation: 30 },
+    } as Partial<MivoCanvasNode>)
+    const props = shapePaintPropsFor(projectNode(node), 'markup-rect', undefined)
+    expect(props.rotation).toBe(30)
+    expect(props.origin).toBe('center')
+  })
+
+  it('FU-8 rotation：未旋转节点 rotation 显式为 0（update 回退清除旧角度）', () => {
+    for (const kind of ['frame', 'markup-rect', 'markup-ellipse', 'markup-note'] as const) {
+      const node = kind === 'frame' ? frameNode() : markupNode({ markupKind: kind.replace('markup-', '') as MivoCanvasNode['markupKind'] })
+      const props = shapePaintPropsFor(projectNode(node), kind, undefined)
+      expect(props.rotation).toBe(0)
+      expect(props.origin).toBe('center')
+    }
+  })
 })
 
 describe('createLeaferShapePaint — diffReconcilePlan 收支 (no leak, no resurrect)', () => {

@@ -3,7 +3,7 @@ import { Image, Rect, Leafer, Text } from 'leafer-ui'
 import '@leafer-in/view'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 import type { RendererMode } from './rendererMode'
-import { isLeaferShapePaintedNode, isLeaferSpikePainted } from './leaferSpikeFilter'
+import { isLeaferLinePaintedNode, isLeaferShapePaintedNode, isLeaferSpikePainted } from './leaferSpikeFilter'
 import { useCanvasStore } from '../store/canvasStore'
 import { debugLogger } from '../store/debugLogStore'
 import { registerEngineSpikeCamera } from './engineSpikeCameraBridge'
@@ -18,6 +18,7 @@ import {
   type EngineLodStatsCarrier,
 } from './engineSpikeLod'
 import { createLeaferImagePaint } from './leaferImagePaint'
+import { createLeaferLinePaint } from './leaferLinePaint'
 import { createLeaferShapePaint, leaferZOrderMapFor } from './leaferShapePaint'
 
 /**
@@ -27,10 +28,12 @@ import { createLeaferShapePaint, leaferZOrderMapFor } from './leaferShapePaint'
  * 最小 LeaferRenderer：初始化 Leafer（hittable:false，D1 不抢 pointer；canvas-host CSS
  * pointer-events:none 已是双保险）+ 相机单向同步（React viewport → leafer.zoomLayer.set，
  * 禁反向监听）+ paint 编排：image → leaferImagePaint（3c），frame/markup shape →
- * leaferShapePaint（4a），bench-only LOD text → inline loop（diff add/update/remove）。
+ * leaferShapePaint（4a），markup line/arrow/connector → leaferLinePaint（4b），
+ * bench-only LOD text → inline loop（diff add/update/remove）。
  *
  * dom 模式仅保留 Leafer init（空白 canvas，与 PR-1 前行为一致），不 paint、不 sync。
- * leafer 模式画 image/frame/rect/ellipse/note；其余节点继续 DOM（见 leaferSpikeFilter）。
+ * leafer 模式画 image/frame/rect/ellipse/note/line/arrow；其余节点继续 DOM
+ * （见 leaferSpikeFilter）。
  *
  * 交互在 leafer 模式下允许暂时残缺（spike 只测渲染性能；pan/zoom 走 viewport 不依赖节点命中）。
  */
@@ -167,6 +170,14 @@ const paintSignatureFor = (node: MivoCanvasNode, viewport: ViewportState): strin
     markupFillColor: node.markupFillColor,
     markupStrokeColor: node.markupStrokeColor,
     markupStrokeWidth: node.markupStrokeWidth,
+    // 4b line paint inputs: endpoint edits change markupPoints without touching
+    // x/y; arrow toggles / dash / opacity / rotation likewise must re-sync.
+    markupPoints: node.markupPoints,
+    markupStrokeStyle: node.markupStrokeStyle,
+    markupOpacity: node.markupOpacity,
+    markupStartArrow: node.markupStartArrow,
+    markupEndArrow: node.markupEndArrow,
+    rotation: node.transform?.rotation,
     sectionFillColor: node.sectionFillColor,
     sectionBorderColor: node.sectionBorderColor,
     sectionBorderWidth: node.sectionBorderWidth,
@@ -226,6 +237,10 @@ export const useLeaferSpikeRenderer = ({
   // Phase 4a: frame / markup shape (rect/ellipse/note) paint is formalized into
   // leaferShapePaint (projection sunk defaults + diffReconcilePlan + 2b-2 z-order).
   const shapePaintRef = useRef<ReturnType<typeof createLeaferShapePaint> | null>(null)
+  // Phase 4b: markup line/arrow (incl. connector / derivation edge) paint is
+  // formalized into leaferLinePaint — consumes normalized markupPoints from the
+  // store only (connector geometry stays model-driven, D1).
+  const linePaintRef = useRef<ReturnType<typeof createLeaferLinePaint> | null>(null)
   const lodSummaryRef = useRef<string | undefined>(undefined)
   const panCacheEnabled = useMemo(() => parsePanCacheEnabled(), [])
   const frozenViewportRef = useRef<ViewportState | null>(null)
@@ -249,11 +264,19 @@ export const useLeaferSpikeRenderer = ({
   // paintedNodes (incl. image/shape) still drives expectedChildren + lodStats +
   // the signature dep so the effect re-runs when any painted node changes.
   const inlinePaintedNodes = useMemo(
-    () => paintedNodes.filter((node) => node.type !== 'image' && !isLeaferShapePaintedNode(node)),
+    () =>
+      paintedNodes.filter(
+        (node) =>
+          node.type !== 'image' && !isLeaferShapePaintedNode(node) && !isLeaferLinePaintedNode(node),
+      ),
     [paintedNodes],
   )
   const shapePaintedNodes = useMemo(
     () => paintedNodes.filter(isLeaferShapePaintedNode),
+    [paintedNodes],
+  )
+  const linePaintedNodes = useMemo(
+    () => paintedNodes.filter(isLeaferLinePaintedNode),
     [paintedNodes],
   )
   const imagePaintedNodes = useMemo(
@@ -348,6 +371,8 @@ export const useLeaferSpikeRenderer = ({
       imagePaintRef.current = createLeaferImagePaint(leafer)
       // Bind the shape paint module (4a) to the same Leafer instance.
       shapePaintRef.current = createLeaferShapePaint(leafer)
+      // Bind the line paint module (4b) to the same Leafer instance.
+      linePaintRef.current = createLeaferLinePaint(leafer)
 
       resizeObserver = new ResizeObserver(([entry]) => {
         if (!entry || !leaferRef.current) return
@@ -369,6 +394,8 @@ export const useLeaferSpikeRenderer = ({
       imagePaintRef.current = null
       shapePaintRef.current?.dispose()
       shapePaintRef.current = null
+      linePaintRef.current?.dispose()
+      linePaintRef.current = null
       leafer?.destroy()
       leaferRef.current = null
       setLeaferReady(false)
@@ -506,6 +533,8 @@ export const useLeaferSpikeRenderer = ({
       imagePaintRef.current?.sync([], emptyCtx)
       // 4a: clear all shape objects the same way when leaving leafer mode.
       shapePaintRef.current?.sync([], emptyCtx)
+      // 4b: clear all line/arrow objects too.
+      linePaintRef.current?.sync([], emptyCtx)
       queueMicrotask(() => publishStats({ ...EMPTY_STATS, panCacheEnabled }))
       return
     }
@@ -574,6 +603,10 @@ export const useLeaferSpikeRenderer = ({
     // diffReconcilePlan contract (创建/更新/删除收支 asserted in unit tests).
     shapePaintRef.current?.sync(shapePaintedNodes, syncCtx)
 
+    // 4b: reconcile markup line/arrow (incl. connectors) — consumes the store's
+    // normalized markupPoints only; never reads geometry back from Leafer (D1).
+    linePaintRef.current?.sync(linePaintedNodes, syncCtx)
+
     // 3c: reconcile image nodes through the lease + clip + diffReconcilePlan
     // contract. Acquire/release is balanced per sync (created/updated/deleted
     // returned here for accounting; lease balance asserted in unit tests).
@@ -617,7 +650,7 @@ export const useLeaferSpikeRenderer = ({
     return () => {
       cancelled = true
     }
-  }, [hostRef, imagePaintedNodes, inlinePaintedNodes, leaferReady, lodViewport, panCacheEnabled, paintedNodes, paintedNodeSignature, publishStats, rendererMode, shapePaintedNodes])
+  }, [hostRef, imagePaintedNodes, inlinePaintedNodes, leaferReady, linePaintedNodes, lodViewport, panCacheEnabled, paintedNodes, paintedNodeSignature, publishStats, rendererMode, shapePaintedNodes])
 
   useEffect(() => {
     window.__MIVO_LEAFER_SPIKE__ = {

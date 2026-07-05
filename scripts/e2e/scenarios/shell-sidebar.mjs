@@ -12,6 +12,17 @@ export const runShellSidebarScenario = async (context) => {
     readHeaderTasksIndicator,
     wait,
   } = context
+  const sidebarGap = 14
+  const sidebarWidth = 240
+  const sidebarBorderWidth = 1
+  const sidebarPadding = 14
+  const sidebarColumnWidth = sidebarWidth + sidebarGap * 2
+  const sidebarContentLeft = sidebarGap + sidebarBorderWidth + sidebarPadding
+  const sidebarContentTop = sidebarGap + sidebarBorderWidth + sidebarPadding
+  const sidebarLogoTop = sidebarContentTop + 2
+  const sidebarToggleLeft = sidebarContentLeft + 78 + 8
+  const sidebarWorkspaceTitleLeft = sidebarColumnWidth + sidebarGap
+  const collapsedTitleLeft = sidebarGap + 154
 
   // FU4-2: clear web storage before app scripts. addInitScript runs sync before the
   // hydration gate, so it can't await an IDB clear — but each scenario runs on a fresh
@@ -133,12 +144,12 @@ export const runShellSidebarScenario = async (context) => {
   if (
     !openSidebarChrome.logo ||
     !openSidebarChrome.button ||
-    !nearlyEqual(openSidebarChrome.logo.left, 14) ||
-    !nearlyEqual(openSidebarChrome.logo.top, 16) ||
+    !nearlyEqual(openSidebarChrome.logo.left, sidebarContentLeft) ||
+    !nearlyEqual(openSidebarChrome.logo.top, sidebarLogoTop) ||
     !nearlyEqual(openSidebarChrome.logo.width, 78) ||
     !nearlyEqual(openSidebarChrome.logo.height, 40) ||
-    !nearlyEqual(openSidebarChrome.button.left, 100) ||
-    !nearlyEqual(openSidebarChrome.button.top, 14) ||
+    !nearlyEqual(openSidebarChrome.button.left, sidebarToggleLeft) ||
+    !nearlyEqual(openSidebarChrome.button.top, sidebarContentTop) ||
     !nearlyEqual(openSidebarChrome.button.width, 44) ||
     !nearlyEqual(openSidebarChrome.button.height, 44)
   ) {
@@ -185,7 +196,7 @@ export const runShellSidebarScenario = async (context) => {
     openTitle.titleTextOverflow !== 'clip' ||
     openTitle.metaOverflow !== 'visible' ||
     openTitle.metaTextOverflow !== 'clip' ||
-    !nearlyEqual(openTitle.areaLeft ?? -1, 254) ||
+    !nearlyEqual(openTitle.areaLeft ?? -1, sidebarWorkspaceTitleLeft) ||
     openTitle.areaRadius !== '999px'
   ) {
     throw new Error(`Canvas title should stay untruncated at the open-sidebar anchor: ${JSON.stringify(openTitle)}`)
@@ -696,7 +707,7 @@ export const runShellSidebarScenario = async (context) => {
     !nearlyEqual(collapsedLayout.openButton.top, openSidebarChrome.button.top) ||
     !nearlyEqual(collapsedLayout.openButton.width, collapsedLayout.openButton.height) ||
     collapsedLayout.openButton.radius !== '999px' ||
-    !nearlyEqual(collapsedLayout.titleAreaLeft ?? -1, 154) ||
+    !nearlyEqual(collapsedLayout.titleAreaLeft ?? -1, collapsedTitleLeft) ||
     !(collapsedLayout.titleAreaLeft < openTitle.areaLeft) ||
     collapsedLayout.titleAreaRadius !== '999px' ||
     collapsedLayout.title !== '角色参考图流程' ||
@@ -718,7 +729,7 @@ export const runShellSidebarScenario = async (context) => {
       sidebar &&
       app?.classList.contains('project-collapsed') &&
       sidebar.getBoundingClientRect().width > 200 &&
-      Math.abs(sidebar.getBoundingClientRect().left) <= 2 &&
+      Math.abs(sidebar.getBoundingClientRect().left - 14) <= 2 &&
       workspace &&
       Math.abs(workspace.getBoundingClientRect().width - window.innerWidth) <= 2
     )
@@ -752,8 +763,8 @@ export const runShellSidebarScenario = async (context) => {
   if (
     peekLayout.projectWidth !== '0px' ||
     !peekLayout.appCollapsed ||
-    !nearlyEqual(peekLayout.drawerLeft ?? -1, 0) ||
-    !nearlyEqual(peekLayout.drawerWidth ?? -1, 240, 2) ||
+    !nearlyEqual(peekLayout.drawerLeft ?? -1, sidebarGap) ||
+    !nearlyEqual(peekLayout.drawerWidth ?? -1, sidebarWidth, 2) ||
     peekLayout.drawerHeaderVisibility !== 'hidden' ||
     !peekLayout.isTitleCoveredByDrawer ||
     !nearlyEqual(peekLayout.openButtonLeft ?? -1, collapsedLayout.openButton.left) ||
@@ -843,8 +854,8 @@ export const runShellSidebarScenario = async (context) => {
   if (
     drawerLoopState.drawerCount !== 1 ||
     drawerLoopState.isClosing ||
-    !nearlyEqual(drawerLoopState.drawerLeft ?? -1, 0) ||
-    !nearlyEqual(drawerLoopState.drawerWidth ?? -1, 240, 2)
+    !nearlyEqual(drawerLoopState.drawerLeft ?? -1, sidebarGap) ||
+    !nearlyEqual(drawerLoopState.drawerWidth ?? -1, sidebarWidth, 2)
   ) {
     throw new Error(
       `Moving between the peek trigger and drawer should not restart the drawer animation: ${JSON.stringify(drawerLoopState)}`,
@@ -861,7 +872,7 @@ export const runShellSidebarScenario = async (context) => {
       drawerLeft: drawerRect?.left,
     }
   })
-  if (drawerLoopSettled.drawerCount !== 1 || drawerLoopSettled.isClosing || !nearlyEqual(drawerLoopSettled.drawerLeft ?? -1, 0)) {
+  if (drawerLoopSettled.drawerCount !== 1 || drawerLoopSettled.isClosing || !nearlyEqual(drawerLoopSettled.drawerLeft ?? -1, sidebarGap)) {
     throw new Error(
       `Peeked drawer should remain stable after returning to the trigger: ${JSON.stringify(drawerLoopSettled)}`,
     )
@@ -872,7 +883,7 @@ export const runShellSidebarScenario = async (context) => {
   await page.waitForFunction(() => {
     const sidebar = document.querySelector('.project-sidebar.drawer')
 
-    return sidebar && sidebar.getBoundingClientRect().width > 200 && Math.abs(sidebar.getBoundingClientRect().left) <= 2
+    return sidebar && sidebar.getBoundingClientRect().width > 200 && Math.abs(sidebar.getBoundingClientRect().left - 14) <= 2
   })
   await page.getByRole('button', { name: 'Open projects' }).click()
   await page.waitForSelector('.mivo-app.project-pinning')
@@ -901,8 +912,8 @@ export const runShellSidebarScenario = async (context) => {
     pinningMotion.sidebarAnimationName !== 'none' ||
     pinningMotion.sidebarIsDrawer ||
     pinningMotion.sidebarIsClosed ||
-    !nearlyEqual(pinningMotion.sidebarLeft ?? -1, 0) ||
-    !nearlyEqual(pinningMotion.sidebarWidth ?? -1, 240, 2)
+    !nearlyEqual(pinningMotion.sidebarLeft ?? -1, sidebarGap) ||
+    !nearlyEqual(pinningMotion.sidebarWidth ?? -1, sidebarWidth, 2)
   ) {
     throw new Error(
       `Pinning an already-peeked drawer should keep canvas layout motion but not replay the drawer slide: ${JSON.stringify(pinningMotion)}`,
