@@ -90,7 +90,7 @@
 }
 
 .mivo-app.library-active .project-sidebar:not(.drawer) {
-  background: rgba(248, 244, 235, 0.84);
+  background: #fff; /* 2026-07-06 用户:侧栏卡片不透明白色,不许画布内容透出(原 rgba .84 半透明) */
   border-color: var(--line);
 }
 
@@ -593,7 +593,7 @@ button:disabled {
   margin: var(--floating-gap) 0 var(--floating-gap) var(--floating-gap);
   padding: 14px;
   overflow: hidden;
-  background: rgba(248, 244, 235, 0.84);
+  background: #fff; /* 2026-07-06 用户:侧栏卡片不透明白色,不许画布内容透出(原 rgba .84 半透明) */
   border: 1px solid var(--line);
   border-radius: 14px;
   opacity: 1;
@@ -3053,6 +3053,11 @@ button:disabled {
 
 .top-bar.sidebar-closed {
   position: absolute;
+  /* 2026-07-06 用户:折叠态标题药丸与左侧展开按钮垂直居中对齐。按钮中心
+     y=50(.project-floating-chrome top 28 + 44px 按钮的一半);top+translateY(-50%)
+     把药丸中心锚到同一水平线,对药丸自身高度变化免疫。 */
+  top: 50px;
+  transform: translateY(-50%);
 }
 
 .top-bar > * {
