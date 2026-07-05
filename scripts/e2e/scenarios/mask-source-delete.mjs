@@ -6,6 +6,7 @@
 //  - assistant message 的 generationContext.maskEdit.sourceDeleted === true
 
 import { doneTaskView } from '../api-mocks.mjs'
+import { clickCanvasNode, waitForNodeRendered } from '../renderer-evidence.mjs'
 
 const ensureChatPanelOpen = async (page) => {
   if (await page.locator('.ai-panel.collapsed').isVisible()) {
@@ -22,8 +23,8 @@ const collapseChatPanel = async (page) => {
   }
 }
 
-const openMaskEditorOn = async (page, sourceNodeId) => {
-  await page.locator(`[data-node-id="${sourceNodeId}"]`).click()
+const openMaskEditorOn = async (page, rendererMode, sourceNodeId) => {
+  await clickCanvasNode(page, rendererMode, sourceNodeId)
   await page.waitForSelector('.selection-quick-toolbar')
   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
   await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
@@ -46,7 +47,7 @@ const waitForCondition = async (fn, { timeout = 8000, interval = 50 } = {}) => {
 }
 
 export const runMaskSourceDeleteScenario = async (context) => {
-  const { canvasStoreSpec, chatStoreSpec, generatedImageB64, page } = context
+  const { canvasStoreSpec, chatStoreSpec, generatedImageB64, page, rendererMode } = context
 
   // ── 准备 ──
   await page.evaluate(async (moduleSpec) => {
@@ -54,7 +55,7 @@ export const runMaskSourceDeleteScenario = async (context) => {
     useCanvasStore.getState().loadScene('character-flow')
     useCanvasStore.getState().resetCurrentScene()
   }, await canvasStoreSpec())
-  await page.waitForSelector('[data-node-id="ref-hero"]')
+  await waitForNodeRendered(page, rendererMode, 'ref-hero')
 
   // enhance 返回 generate mode
   await page.unroute('**/api/mivo/enhance')
@@ -112,7 +113,7 @@ export const runMaskSourceDeleteScenario = async (context) => {
 
   // 提交 mask edit
   await collapseChatPanel(page)
-  await openMaskEditorOn(page, 'ref-hero')
+  await openMaskEditorOn(page, rendererMode, 'ref-hero')
   await drawPointRegion(page)
   await page.waitForFunction(() => Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0') > 0)
   await page.locator('.image-mask-edit-prompt textarea').fill('E2E source-delete mask')

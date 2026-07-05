@@ -5,6 +5,8 @@
 //  - reload → hydration settle：chat card error + retryDisabledReason、slot failed
 //  - 用 #90 IDB harness (waitForPersistedKv) 确认 generating 态已持久化再 reload
 
+import { clickCanvasNode, waitForNodeRendered } from '../renderer-evidence.mjs'
+
 const ensureChatPanelOpen = async (page) => {
   if (await page.locator('.ai-panel.collapsed').isVisible()) {
     await page.getByRole('button', { name: 'Open AI panel' }).click()
@@ -20,8 +22,8 @@ const collapseChatPanel = async (page) => {
   }
 }
 
-const openMaskEditorOn = async (page, sourceNodeId) => {
-  await page.locator(`[data-node-id="${sourceNodeId}"]`).click()
+const openMaskEditorOn = async (page, rendererMode, sourceNodeId) => {
+  await clickCanvasNode(page, rendererMode, sourceNodeId)
   await page.waitForSelector('.selection-quick-toolbar')
   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
   await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
@@ -44,7 +46,7 @@ const waitForCondition = async (fn, { timeout = 8000, interval = 50 } = {}) => {
 }
 
 export const runMaskHydrationScenario = async (context) => {
-  const { canvasStoreSpec, canvasUrl, chatStoreSpec, generatedImageB64, page, waitForPersistedKv } = context
+  const { canvasStoreSpec, canvasUrl, chatStoreSpec, generatedImageB64, page, rendererMode, waitForPersistedKv } = context
 
   // ── 准备 ──
   await page.evaluate(async (moduleSpec) => {
@@ -52,7 +54,7 @@ export const runMaskHydrationScenario = async (context) => {
     useCanvasStore.getState().loadScene('character-flow')
     useCanvasStore.getState().resetCurrentScene()
   }, await canvasStoreSpec())
-  await page.waitForSelector('[data-node-id="ref-hero"]')
+  await waitForNodeRendered(page, rendererMode, 'ref-hero')
 
   // enhance 返回 generate mode
   await page.unroute('**/api/mivo/enhance')
@@ -98,7 +100,7 @@ export const runMaskHydrationScenario = async (context) => {
 
   // 提交 mask edit
   await collapseChatPanel(page)
-  await openMaskEditorOn(page, 'ref-hero')
+  await openMaskEditorOn(page, rendererMode, 'ref-hero')
   await drawPointRegion(page)
   await page.waitForFunction(() => Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0') > 0)
   await page.locator('.image-mask-edit-prompt textarea').fill('E2E hydration seed')

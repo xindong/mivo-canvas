@@ -24,8 +24,10 @@ const toShortDate = (day) => {
   return `${Number(month)}-${date}`
 }
 
+import { waitForCanvasReady } from '../renderer-evidence.mjs'
+
 export const runChangelogScenario = async (context) => {
-  const { baseUrl, canvasUrl, page } = context
+  const { baseUrl, canvasUrl, page, rendererMode } = context
 
   const today = toChangelogDay(Date.now())
   const olderDay = addChangelogDays(today, -1)
@@ -69,7 +71,7 @@ export const runChangelogScenario = async (context) => {
     try { window.sessionStorage.clear() } catch { /* opaque origin */ }
   })
   await page.reload({ waitUntil: 'networkidle' })
-  await page.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
+  await waitForCanvasReady(page, rendererMode)
 
   // ① 入口唯一且位于 Debug Log 正上方
   const changelogButton = page.getByRole('button', { name: 'Change Log', exact: true })
@@ -259,7 +261,7 @@ export const runChangelogScenario = async (context) => {
 
   // 已读状态跨 reload 保持:updatedAt 不变时红点不重亮
   await page.reload({ waitUntil: 'networkidle' })
-  await page.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
+  await waitForCanvasReady(page, rendererMode)
   await page.getByRole('button', { name: 'Change Log', exact: true }).waitFor()
   if (await page.locator('[aria-label="Change Log"] .changelog-badge-dot').count()) {
     throw new Error('Changelog badge dot should stay cleared across reload when updatedAt is unchanged')
@@ -269,7 +271,7 @@ export const runChangelogScenario = async (context) => {
   fixture.updatedAt = '2099-02-02T12:00:00+08:00'
   fixture.entries[0].fixes = [...fixture.entries[0].fixes, 'e2e-changelog 同日追加的修复条目']
   await page.reload({ waitUntil: 'networkidle' })
-  await page.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
+  await waitForCanvasReady(page, rendererMode)
   await page.waitForSelector('[aria-label="Change Log"] .changelog-badge-dot')
 
   await page.unroute('**/changelog.json*')

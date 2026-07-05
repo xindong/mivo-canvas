@@ -14,6 +14,7 @@
 // #90 IDB harness：断言走 zustand store / route 捕获，不碰 localStorage。
 
 import pngjs from 'pngjs'
+import { clickCanvasNode, waitForNodeRendered } from '../renderer-evidence.mjs'
 
 const { PNG } = pngjs
 
@@ -104,7 +105,7 @@ const countPngAlphaLt255 = (base64) => {
 }
 
 export const runMaskBlackblockScenario = async (context) => {
-  const { page, canvasStoreSpec, chatStoreSpec } = context
+  const { page, canvasStoreSpec, chatStoreSpec, rendererMode } = context
   const spec = await canvasStoreSpec()
 
   // ── 浏览器侧合成测试图（raw b64，无 data: 前缀 —— 检测器 atob 直接可解） ──
@@ -182,7 +183,7 @@ export const runMaskBlackblockScenario = async (context) => {
       useCanvasStore.getState().loadScene('character-flow')
       useCanvasStore.getState().resetCurrentScene()
     }, spec)
-    await page.waitForSelector('[data-node-id="ref-hero"]')
+    await waitForNodeRendered(page, rendererMode, 'ref-hero')
   }
 
   // 已知底色（蓝 + 黄块）的 1600x900 PNG 源图 —— 检测器"源本黑"判定不受 demo 资产
@@ -214,12 +215,12 @@ export const runMaskBlackblockScenario = async (context) => {
       }
       state.updateNodePosition(targetId, -280, 260)
     }, { moduleSpec: spec, targetId })
-    await page.waitForSelector(`[data-node-id="${targetId}"]`, { state: 'visible' })
+    await waitForNodeRendered(page, rendererMode, targetId)
   }
 
   const openMaskEditorOn = async (nodeId) => {
     await ensureChatPanelCollapsed(page)
-    await page.locator(`[data-node-id="${nodeId}"]`).click()
+    await clickCanvasNode(page, rendererMode, nodeId)
     await page.waitForSelector('.selection-quick-toolbar')
     await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
     await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()

@@ -10,6 +10,7 @@
 //   #90 IDB harness: 不用 localStorage 断言；状态读取走 store bridge（同 mask-source-delete 模式）。
 
 import { doneTaskView, failedTaskView } from '../api-mocks.mjs'
+import { clickCanvasNode, waitForNodeRendered } from '../renderer-evidence.mjs'
 
 const ensureChatPanelOpen = async (page) => {
   if (await page.locator('.ai-panel.collapsed').isVisible()) {
@@ -26,8 +27,8 @@ const collapseChatPanel = async (page) => {
   }
 }
 
-const openMaskEditorOn = async (page, sourceNodeId) => {
-  await page.locator(`[data-node-id="${sourceNodeId}"]`).click()
+const openMaskEditorOn = async (page, rendererMode, sourceNodeId) => {
+  await clickCanvasNode(page, rendererMode, sourceNodeId)
   await page.waitForSelector('.selection-quick-toolbar')
   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
   await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
@@ -72,7 +73,7 @@ const readLastMaskEditAssistant = async (page, chatStoreSpec) => {
 }
 
 export const runMaskTimeoutRetryScenario = async (context) => {
-  const { canvasStoreSpec, chatStoreSpec, generatedImageB64, page } = context
+  const { canvasStoreSpec, chatStoreSpec, generatedImageB64, page, rendererMode } = context
 
   // ── 准备 ──
   await page.evaluate(async (moduleSpec) => {
@@ -80,7 +81,7 @@ export const runMaskTimeoutRetryScenario = async (context) => {
     useCanvasStore.getState().loadScene('character-flow')
     useCanvasStore.getState().resetCurrentScene()
   }, await canvasStoreSpec())
-  await page.waitForSelector('[data-node-id="ref-hero"]')
+  await waitForNodeRendered(page, rendererMode, 'ref-hero')
 
   // enhance 返回 generate mode（快速返回）
   await page.unroute('**/api/mivo/enhance')
@@ -172,7 +173,7 @@ export const runMaskTimeoutRetryScenario = async (context) => {
   // ══ Phase 1: 超时 → 重试 → 成功 ══
 
   await collapseChatPanel(page)
-  await openMaskEditorOn(page, 'ref-hero')
+  await openMaskEditorOn(page, rendererMode, 'ref-hero')
   await drawPointRegion(page)
   await page.waitForFunction(() => Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0') > 0)
   await page.locator('.image-mask-edit-prompt textarea').fill('E2E mask timeout retry phase1')
@@ -225,8 +226,8 @@ export const runMaskTimeoutRetryScenario = async (context) => {
 
   await collapseChatPanel(page)
   // ref-hero 仍存在（Phase 1 结果是新节点，不替换 source）
-  await page.waitForSelector('[data-node-id="ref-hero"]')
-  await openMaskEditorOn(page, 'ref-hero')
+  await waitForNodeRendered(page, rendererMode, 'ref-hero')
+  await openMaskEditorOn(page, rendererMode, 'ref-hero')
   await drawPointRegion(page)
   await page.waitForFunction(() => Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0') > 0)
   await page.locator('.image-mask-edit-prompt textarea').fill('E2E mask timeout retry phase2')

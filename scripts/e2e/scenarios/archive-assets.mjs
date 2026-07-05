@@ -1,3 +1,5 @@
+import { waitForCanvasReady } from '../renderer-evidence.mjs'
+
 export const runArchiveAssetsScenario = async (context) => {
   const {
     Buffer,
@@ -9,15 +11,26 @@ export const runArchiveAssetsScenario = async (context) => {
     readLibrarySurfaceColors,
     wait,
   } = context
+  const { rendererMode } = context
+  const leaferMode = rendererMode === 'leafer'
 
-  const initialCount = await page.locator('.dom-node').count()
-  const initialSources = await page
-    .locator('.dom-node-media img')
-    .evaluateAll((imgs) => imgs.map((img) => img.getAttribute('src')))
-
-  if (initialCount !== 3) throw new Error(`Expected 3 initial nodes, got ${initialCount}`)
-  if (!initialSources.every((src) => src?.startsWith('/demo-assets/courage-'))) {
-    throw new Error(`Initial sources are not real demo assets: ${initialSources.join(', ')}`)
+  // leafer 模式 image 无 DOM:初始节点数/资产来源改读 store(assetUrl 与 <img src> 同源);
+  // dom 模式保持原 DOM 断言。
+  const initial = leaferMode
+    ? await page.evaluate(async (moduleSpec) => {
+        const { useCanvasStore } = await import(moduleSpec)
+        const nodes = useCanvasStore.getState().nodes.filter((node) => !node.hidden)
+        return { count: nodes.length, sources: nodes.map((node) => node.assetUrl || '') }
+      }, await canvasStoreSpec())
+    : {
+        count: await page.locator('.dom-node').count(),
+        sources: await page
+          .locator('.dom-node-media img')
+          .evaluateAll((imgs) => imgs.map((img) => img.getAttribute('src'))),
+      }
+  if (initial.count !== 3) throw new Error(`Expected 3 initial nodes, got ${initial.count}`)
+  if (!initial.sources.every((src) => src?.startsWith('/demo-assets/courage-'))) {
+    throw new Error(`Initial sources are not real demo assets: ${initial.sources.join(', ')}`)
   }
 
   await page.getByRole('searchbox').fill('courage')
@@ -127,28 +140,41 @@ export const runArchiveAssetsScenario = async (context) => {
     { storeSpec: await canvasStoreSpec(), archiveText: JSON.stringify(archive) },
   )
   await page.waitForFunction(
-    async (moduleSpec) => {
+    async ({ moduleSpec, expectedDomCount }) => {
       const { useCanvasStore } = await import(moduleSpec)
       const state = useCanvasStore.getState()
       return (
         state.canvases[state.sceneId]?.title === 'canvas-e2e-archive' &&
-        document.querySelectorAll('.dom-node').length === 2 &&
+        state.nodes.length === 2 &&
+        document.querySelectorAll('.dom-node').length === expectedDomCount &&
         document.querySelector('.dom-node.text-node .dom-text-node')?.textContent?.includes('Archive text')
       )
     },
-    await canvasStoreSpec(),
+    // leafer 模式 image 归 Leafer 真画:DOM 只剩 text 节点(1);dom 模式两个都在(2)。
+    { moduleSpec: await canvasStoreSpec(), expectedDomCount: leaferMode ? 1 : 2 },
   )
-  const importedArchiveAsset = await page.locator('[data-node-id="archive-image"] .dom-node-media img').evaluate((image) => ({
-    src: image.getAttribute('src') || '',
-    naturalWidth: image instanceof HTMLImageElement ? image.naturalWidth : 0,
-    naturalHeight: image instanceof HTMLImageElement ? image.naturalHeight : 0,
-  }))
-  if (
-    !importedArchiveAsset.src.startsWith('blob:') ||
-    importedArchiveAsset.naturalWidth !== 64 ||
-    importedArchiveAsset.naturalHeight !== 64
-  ) {
-    throw new Error(`Importing a Mivo archive should restore embedded local assets: ${JSON.stringify(importedArchiveAsset)}`)
+  if (leaferMode) {
+    const restored = await page.evaluate(async (moduleSpec) => {
+      const { useCanvasStore } = await import(moduleSpec)
+      const node = useCanvasStore.getState().nodes.find((entry) => entry.id === 'archive-image')
+      return node ? { assetUrl: node.assetUrl || '' } : null
+    }, await canvasStoreSpec())
+    if (!restored || !(restored.assetUrl.startsWith('blob:') || restored.assetUrl.startsWith('mivo-asset:'))) {
+      throw new Error(`Importing a Mivo archive should restore embedded local assets (store assetUrl): ${JSON.stringify(restored)}`)
+    }
+  } else {
+    const importedArchiveAsset = await page.locator('[data-node-id="archive-image"] .dom-node-media img').evaluate((image) => ({
+      src: image.getAttribute('src') || '',
+      naturalWidth: image instanceof HTMLImageElement ? image.naturalWidth : 0,
+      naturalHeight: image instanceof HTMLImageElement ? image.naturalHeight : 0,
+    }))
+    if (
+      !importedArchiveAsset.src.startsWith('blob:') ||
+      importedArchiveAsset.naturalWidth !== 64 ||
+      importedArchiveAsset.naturalHeight !== 64
+    ) {
+      throw new Error(`Importing a Mivo archive should restore embedded local assets: ${JSON.stringify(importedArchiveAsset)}`)
+    }
   }
 
   await page.evaluate(async () => {
@@ -500,17 +526,24 @@ export const runArchiveAssetsScenario = async (context) => {
   }
   await page.locator('.asset-detail-panel').getByRole('button', { name: 'Add to canvas' }).click()
   await page.waitForSelector('.canvas-shell')
-  await page.waitForFunction(
-    () =>
-      [...document.querySelectorAll('.dom-node')].some(
-        (node) =>
-          node.getAttribute('data-node-id')?.startsWith('imported-') &&
-          node.querySelector('.dom-node-media img')?.getAttribute('src')?.startsWith('blob:'),
-      ),
-  )
+  if (leaferMode) {
+    await page.waitForFunction(async (moduleSpec) => {
+      const { useCanvasStore } = await import(moduleSpec)
+      return useCanvasStore.getState().nodes.some((node) => node.id.startsWith('imported-'))
+    }, await canvasStoreSpec())
+  } else {
+    await page.waitForFunction(
+      () =>
+        [...document.querySelectorAll('.dom-node')].some(
+          (node) =>
+            node.getAttribute('data-node-id')?.startsWith('imported-') &&
+            node.querySelector('.dom-node-media img')?.getAttribute('src')?.startsWith('blob:'),
+        ),
+    )
+  }
 
   await page.getByRole('button', { name: '角色参考图流程' }).click()
-  await page.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
+  await waitForCanvasReady(page, rendererMode)
 
   await page.getByRole('button', { name: 'Assets' }).click()
   await page.getByRole('heading', { name: 'Assets' }).waitFor()
@@ -737,5 +770,5 @@ export const runArchiveAssetsScenario = async (context) => {
     throw new Error('Expanded project should show its canvas rows')
   }
   await page.getByRole('button', { name: '角色参考图流程' }).click()
-  await page.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
+  await waitForCanvasReady(page, rendererMode)
 }

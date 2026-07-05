@@ -14,6 +14,7 @@
 // #90 IDB harness: 用 waitForPersistedKv 读 persisted chat state，禁止 localStorage 断言。
 
 import { doneTaskView, failedTaskView } from '../api-mocks.mjs'
+import { clickCanvasNode, waitForNodeRendered } from '../renderer-evidence.mjs'
 
 const RICH_PROMPT = 'E2E mask rich prompt: replace the selected masked character with a handsome male character while preserving the unmasked image.'
 const CHAT_REPLY_TEXT = '我会按你选中的区域改，未选区域保持不变。'
@@ -72,6 +73,7 @@ export const runMaskScenario = async (context) => {
     mivoEditRequests,
     page,
     readCanvasState,
+    rendererMode,
     waitForCanvasState,
     waitForPersistedKv,
   } = context
@@ -97,7 +99,7 @@ export const runMaskScenario = async (context) => {
   }
 
   const openMaskEditorOn = async (sourceNodeId) => {
-    await page.locator(`[data-node-id="${sourceNodeId}"]`).click()
+    await clickCanvasNode(page, rendererMode, sourceNodeId)
     await page.waitForSelector('.selection-quick-toolbar')
     await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
     await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
@@ -112,7 +114,7 @@ export const runMaskScenario = async (context) => {
     useCanvasStore.getState().loadScene('character-flow')
     useCanvasStore.getState().resetCurrentScene()
   }, await canvasStoreSpec())
-  await page.waitForSelector('[data-node-id="ref-hero"]')
+  await waitForNodeRendered(page, rendererMode, 'ref-hero')
 
   // 自定义 /api/mivo/enhance：gated（延迟 release），capture request body，返回 generate mode。
   // 顺便保留 mivoEditRequests（/tasks/edit 的 prompt/fileKeys）由默认 mock 捕获。
@@ -344,7 +346,7 @@ export const runMaskScenario = async (context) => {
     useCanvasStore.getState().loadScene('character-flow')
     useCanvasStore.getState().resetCurrentScene()
   }, await canvasStoreSpec())
-  await page.waitForSelector('[data-node-id="ref-hero"]')
+  await waitForNodeRendered(page, rendererMode, 'ref-hero')
   await openMaskEditorOn('ref-hero')
   await drawPointRegion()
   await page.waitForFunction(() => Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0') > 0)
@@ -410,7 +412,7 @@ export const runMaskScenario = async (context) => {
       useCanvasStore.getState().loadScene('character-flow')
       useCanvasStore.getState().resetCurrentScene()
     }, await canvasStoreSpec())
-    await page.waitForSelector('[data-node-id="ref-hero"]')
+    await waitForNodeRendered(page, rendererMode, 'ref-hero')
     const before = await readCanvasState()
     const beforeImageCount = before.nodes.filter((n) => n.type === 'image').length
     await openMaskEditorOn('ref-hero')
@@ -450,7 +452,7 @@ export const runMaskScenario = async (context) => {
     useCanvasStore.getState().loadScene('character-flow')
     useCanvasStore.getState().resetCurrentScene()
   }, await canvasStoreSpec())
-  await page.waitForSelector('[data-node-id="ref-hero"]')
+  await waitForNodeRendered(page, rendererMode, 'ref-hero')
 
   // enhance 返回默认 generate mode（快速返回，不 gate）。
   await page.unroute('**/api/mivo/enhance')
@@ -606,7 +608,7 @@ export const runMaskScenario = async (context) => {
     useCanvasStore.getState().loadScene('character-flow')
     useCanvasStore.getState().resetCurrentScene()
   }, await canvasStoreSpec())
-  await page.waitForSelector('[data-node-id="ref-hero"]')
+  await waitForNodeRendered(page, rendererMode, 'ref-hero')
   const degradedPrompt = 'E2E degraded mask repaint'
   await openMaskEditorOn('ref-hero')
   await drawPointRegion()
@@ -637,7 +639,7 @@ export const runMaskScenario = async (context) => {
     useCanvasStore.getState().loadScene('character-flow')
     useCanvasStore.getState().resetCurrentScene()
   }, await canvasStoreSpec())
-  await page.waitForSelector('[data-node-id="ref-hero"]')
+  await waitForNodeRendered(page, rendererMode, 'ref-hero')
   const chatModePrompt = 'E2E chat mode mask repaint'
   await openMaskEditorOn('ref-hero')
   await drawPointRegion()

@@ -15,6 +15,7 @@
 // 后返 done（SC4.3 原地替换）或 failed（SC5.3 回滚）。SC4.5 用默认 progressive mock，
 // 故每次 gated 段结束后须 unroute + 恢复默认 /tasks/* 给后续用例。
 import { doneTaskView, failedTaskView } from '../api-mocks.mjs'
+import { clickCanvasNode, waitForNodeRendered } from '../renderer-evidence.mjs'
 
 // 恢复默认 progressive /tasks/* GET mock（SC4.5 beside 生成依赖它 poll 到 done）。
 // 与 api-mocks.attachDefaultMivoApiMocks 的 /tasks/* 路由同形；mask-reflow 在 gated
@@ -159,7 +160,7 @@ const waitForNoAiSlot = async (page, spec, { timeout = 15000 } = {}) => {
 }
 
 export const runMaskReflowScenario = async (context) => {
-  const { page, generatedImageB64, canvasStoreSpec, nearlyEqual, wait } = context
+  const { page, generatedImageB64, canvasStoreSpec, nearlyEqual, rendererMode, wait } = context
   const spec = await canvasStoreSpec()
 
   // ── SC4.1 / SC4.2 / SC4.3 — mask edit on A with obstacles B, C on its right ──
@@ -176,7 +177,7 @@ export const runMaskReflowScenario = async (context) => {
     { moduleSpec: spec, id: imgC.id },
   )
 
-  await page.locator(`[data-node-id="${imgA.id}"]`).click()
+  await clickCanvasNode(page, rendererMode, imgA.id)
   await openMaskPointRegion(page)
 
   // submitMaskEdit → POST /tasks/edit (202) → poll GET /tasks/:id. Unroute the
@@ -310,7 +311,7 @@ export const runMaskReflowScenario = async (context) => {
     },
     { moduleSpec: spec, id: failB.id },
   )
-  await page.locator(`[data-node-id="${failA.id}"]`).click()
+  await clickCanvasNode(page, rendererMode, failA.id)
   await openMaskPointRegion(page)
 
   // Gate the /tasks/:id poll, then release with a failed view so the poll loop

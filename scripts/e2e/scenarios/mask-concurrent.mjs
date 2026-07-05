@@ -10,6 +10,7 @@
 //  - 用 page.route 捕获 DELETE 的 taskId（route.request().url() 提取）
 
 import { doneTaskView } from '../api-mocks.mjs'
+import { clickCanvasNode, waitForNodeRendered } from '../renderer-evidence.mjs'
 
 const ensureChatPanelOpen = async (page) => {
   if (await page.locator('.ai-panel.collapsed').isVisible()) {
@@ -26,8 +27,8 @@ const collapseChatPanel = async (page) => {
   }
 }
 
-const openMaskEditorOn = async (page, sourceNodeId) => {
-  await page.locator(`[data-node-id="${sourceNodeId}"]`).click()
+const openMaskEditorOn = async (page, rendererMode, sourceNodeId) => {
+  await clickCanvasNode(page, rendererMode, sourceNodeId)
   await page.waitForSelector('.selection-quick-toolbar')
   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
   await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
@@ -70,7 +71,7 @@ const readMaskEditAssistants = async (page, chatStoreSpec) => {
 }
 
 export const runMaskConcurrentScenario = async (context) => {
-  const { canvasStoreSpec, chatStoreSpec, generatedImageB64, horizontalMaskSourceB64, page } = context
+  const { canvasStoreSpec, chatStoreSpec, generatedImageB64, horizontalMaskSourceB64, page, rendererMode } = context
 
   // ── 准备：character-flow + 两张 source image ──
   await page.evaluate(async (moduleSpec) => {
@@ -93,7 +94,7 @@ export const runMaskConcurrentScenario = async (context) => {
       },
       { moduleSpec: spec, assetUrl: horizontalMaskSourceB64, label, position },
     )
-    await page.waitForSelector(`[data-node-id="${nodeId}"]`)
+    await waitForNodeRendered(page, rendererMode, nodeId)
     return nodeId
   }
 
@@ -169,7 +170,7 @@ export const runMaskConcurrentScenario = async (context) => {
 
   // ── 提交 mask edit A ──
   await collapseChatPanel(page)
-  await openMaskEditorOn(page, sourceAId)
+  await openMaskEditorOn(page, rendererMode, sourceAId)
   await drawPointRegion(page)
   await page.waitForFunction(() => Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0') > 0)
   await page.locator('.image-mask-edit-prompt textarea').fill('E2E concurrent mask A')
@@ -185,7 +186,7 @@ export const runMaskConcurrentScenario = async (context) => {
 
   // ── 提交 mask edit B ──
   await collapseChatPanel(page)
-  await openMaskEditorOn(page, sourceBId)
+  await openMaskEditorOn(page, rendererMode, sourceBId)
   await drawPointRegion(page)
   await page.waitForFunction(() => Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0') > 0)
   await page.locator('.image-mask-edit-prompt textarea').fill('E2E concurrent mask B')

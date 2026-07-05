@@ -1,3 +1,5 @@
+import { waitForCanvasReady } from '../renderer-evidence.mjs'
+
 export const runShellSidebarScenario = async (context) => {
   const {
     assertTasksHeaderCopy,
@@ -10,6 +12,7 @@ export const runShellSidebarScenario = async (context) => {
     readChatState,
     readFloatingChrome,
     readHeaderTasksIndicator,
+    rendererMode,
     wait,
   } = context
   const sidebarGap = 14
@@ -31,7 +34,7 @@ export const runShellSidebarScenario = async (context) => {
     try { window.sessionStorage.clear() } catch { /* opaque origin */ }
   })
   await page.goto(canvasUrl || baseUrl, { waitUntil: 'networkidle' })
-  await page.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
+  await waitForCanvasReady(page, rendererMode)
 
   await ensureChatPanelOpen()
   await assertTasksHeaderCopy('idle header')
@@ -715,7 +718,7 @@ export const runShellSidebarScenario = async (context) => {
   }
 
   await page.getByRole('button', { name: 'Canvas', exact: true }).click()
-  await page.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
+  await waitForCanvasReady(page, rendererMode)
   const peekChromeAfterCanvasSwitch = await readFloatingChrome()
   if (
     !peekChromeAfterCanvasSwitch.logo ||

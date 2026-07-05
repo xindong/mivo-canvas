@@ -12,6 +12,7 @@
 // The store calls exercise the same React closures (submit → poll → commit).
 
 import { doneTaskView } from '../api-mocks.mjs'
+import { readTotalNodeCount, waitForTotalNodeCountAtLeast } from '../renderer-evidence.mjs'
 
 const resolveCanvasStoreSpec = async (page) => {
   const spec = await page.evaluate(() => {
@@ -25,7 +26,9 @@ const resolveCanvasStoreSpec = async (page) => {
 }
 
 export const runVariationsAnnotationScenario = async (context) => {
-  const { page, generatedImageB64 } = context
+  const { page, generatedImageB64, rendererMode } = context
+  // leafer 模式 image 无 DOM,节点计数走 data-total-node-count(全量口径);dom 模式保持原断言。
+  const countRenderedNodes = () => (rendererMode === 'leafer' ? readTotalNodeCount(page) : page.locator('.dom-node').count())
 
   const spec = await resolveCanvasStoreSpec(page)
 
@@ -132,7 +135,7 @@ export const runVariationsAnnotationScenario = async (context) => {
   if (!imageId) throw new Error('variations-annotation: no image node to use as source')
 
   // ─── ① variations partial (2 success + 1 failure) ───────────────────────────
-  const beforeVariationsCount = await page.locator('.dom-node').count()
+  const beforeVariationsCount = await countRenderedNodes()
   await page.evaluate(async (moduleSpecAndId) => {
     const { useCanvasStore } = await import(moduleSpecAndId.spec)
     await useCanvasStore.getState().generateVariations(moduleSpecAndId.id, [
@@ -142,10 +145,14 @@ export const runVariationsAnnotationScenario = async (context) => {
     ])
   }, { spec, id: imageId })
   // 2 success result nodes + 1 failed slot = +3 nodes.
-  await page.waitForFunction(
-    (c) => document.querySelectorAll('.dom-node').length >= c + 3,
-    beforeVariationsCount,
-  )
+  if (rendererMode === 'leafer') {
+    await waitForTotalNodeCountAtLeast(page, beforeVariationsCount + 3)
+  } else {
+    await page.waitForFunction(
+      (c) => document.querySelectorAll('.dom-node').length >= c + 3,
+      beforeVariationsCount,
+    )
+  }
 
   const variationsState = await page.evaluate(async (moduleSpecAndId) => {
     const { useCanvasStore } = await import(moduleSpecAndId.spec)
@@ -217,16 +224,20 @@ export const runVariationsAnnotationScenario = async (context) => {
     return id
   }, { spec, id: imageId })
 
-  const beforeAnnotationCount = await page.locator('.dom-node').count()
+  const beforeAnnotationCount = await countRenderedNodes()
   await page.evaluate(async (moduleSpecAndId) => {
     const { useCanvasStore } = await import(moduleSpecAndId.spec)
     await useCanvasStore.getState().generateFromAnnotation(moduleSpecAndId.id)
   }, { spec, id: annotationId })
   // 1 result node from the edit.
-  await page.waitForFunction(
-    (c) => document.querySelectorAll('.dom-node').length >= c + 1,
-    beforeAnnotationCount,
-  )
+  if (rendererMode === 'leafer') {
+    await waitForTotalNodeCountAtLeast(page, beforeAnnotationCount + 1)
+  } else {
+    await page.waitForFunction(
+      (c) => document.querySelectorAll('.dom-node').length >= c + 1,
+      beforeAnnotationCount,
+    )
+  }
 
   // /tasks/edit carried maskBounds (normalized 0-1) + sourceSize — the BFF area-edit
   // path. Verify the normalization: the annotationBounds were a 60×60 region offset
