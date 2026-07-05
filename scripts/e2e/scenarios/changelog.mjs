@@ -22,8 +22,12 @@ export const runChangelogScenario = async (context) => {
       {
         date: today,
         prs: [9001],
-        features: ['e2e-changelog 新功能条目'],
-        fixes: ['e2e-changelog 修复条目'],
+        // 新 schema {text, by} + 一条旧版纯 string(向后兼容:无作者标签渲染)
+        features: [
+          { text: 'e2e-changelog 新功能条目', by: 'E2E Author' },
+          'e2e-changelog 旧格式条目',
+        ],
+        fixes: [{ text: 'e2e-changelog 修复条目', by: 'E2E Author' }],
       },
     ],
   }
@@ -84,6 +88,20 @@ export const runChangelogScenario = async (context) => {
   }
   await page.getByText('e2e-changelog 新功能条目').waitFor()
   await page.getByText('e2e-changelog 修复条目').waitFor()
+
+  // ③ 续:作者名灰字标签——新 schema 条目带 by 标签,旧 string 条目无标签
+  const authorTags = await page.evaluate(() => {
+    const items = Array.from(document.querySelectorAll('.changelog-day li'))
+    return items.map((item) => ({
+      text: item.textContent ?? '',
+      byTag: item.querySelector('.changelog-item-by')?.textContent ?? null,
+    }))
+  })
+  const withAuthor = authorTags.filter((item) => item.byTag === 'E2E Author')
+  const legacyItem = authorTags.find((item) => item.text.includes('旧格式条目'))
+  if (withAuthor.length !== 2 || !legacyItem || legacyItem.byTag !== null) {
+    throw new Error(`Changelog items should show contributor tags (legacy strings without): ${JSON.stringify(authorTags)}`)
+  }
 
   // ② 续:打开即已读,红点消失
   await page.waitForSelector('[aria-label="更新日志"] .changelog-badge-dot', { state: 'detached' })
