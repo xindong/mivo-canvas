@@ -12,6 +12,15 @@
             "command": "npm run codemap --silent"
           }
         ]
+      },
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npm run codemap --silent"
+          }
+        ]
       }
     ]
   }
