@@ -22,7 +22,8 @@
     "test:e2e:prod:full": "node scripts/e2e-runner.mjs --topology=prod",
     "test:e2e:prod": "npm run build && node scripts/e2e-runner.mjs --topology=prod",
     "start:server": "tsx server/index.ts",
-    "contract:diff": "node scripts/contract-diff.mjs"
+    "contract:diff": "node scripts/contract-diff.mjs",
+    "codemap": "node scripts/codemap.mjs"
   },
   "dependencies": {
     "@hono/node-server": "^1.19.14",
