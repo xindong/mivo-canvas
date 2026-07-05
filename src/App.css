@@ -5916,8 +5916,10 @@ button:disabled {
 .ai-panel {
   position: absolute;
   right: var(--ai-panel-offset);
-  top: 12px;
-  bottom: 12px;
+  /* top/bottom 引用同一 offset 变量：折叠态锚定 calc 也用它，二者锁定，
+     改 offset 不会破坏「展开/折叠收起按钮同屏坐标」不变量。 */
+  top: var(--ai-panel-offset);
+  bottom: var(--ai-panel-offset);
   z-index: 8;
   width: min(var(--ai-panel-w), calc(100% - 28px));
   height: auto;
