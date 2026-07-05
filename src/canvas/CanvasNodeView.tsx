@@ -20,7 +20,7 @@ import { defaultTextAlign, defaultTextColor, defaultTextFontSize, defaultTextWei
 import type { TextResizeEdge } from './useCanvasInteractionController'
 import type { MaskInitialClientPoint } from './maskPointPending'
 
-type CanvasNodeViewProps = {
+export type CanvasNodeViewProps = {
   node: MivoCanvasNode
   selected: boolean
   selectionPreview: boolean
