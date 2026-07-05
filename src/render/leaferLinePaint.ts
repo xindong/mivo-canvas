@@ -34,11 +34,13 @@
 //     cap/join, orient auto / auto-start-reverse. Reproduced as chevron
 //     polylines anchored at the endpoints (arrowHeadPointsFor) — no
 //     @leafer-in/arrow dependency, exact DOM geometry instead.
-//   - label gap: the DOM splits the line into two segments around an active
-//     text label. The label layer (MarkupTextLayer) is DOM-only and filtered
-//     out in leafer mode until Phase 5, so painting the gap without the label
-//     would look broken — leafer paints ONE continuous line (same accepted
-//     tradeoff as the 4a note text layer; leaferSpikeFilter.ts header).
+//   - label gap (FU-11): the DOM splits the line into two segments around an
+//     active text label (editing || text). Phase 5 判决后 label 以 DOM 文字壳
+//     恢复（leaferSpikeFilter needsMarkupTextShell），leafer 侧按同一份
+//     markupTextGeometry.lineSegmentsWithLabelGap 数学断开线体 —— 估宽/缺口
+//     比例与 DOM 完全同源，编辑态经 ctx.editingNodeId 对齐（编辑空 label 时
+//     DOM 出现编辑器，线体同步断开）。gap 在旋转后的端点上按比例切分——
+//     旋转是刚体变换，与 DOM "未旋转切分 + CSS 整体旋转" 逐像素等价。
 //   - rotation (FU-8): the DOM applies `translate(x,y) rotate(θ)` with
 //     transformOrigin 50% 50%. Rect/Ellipse/Image reproduce it with Leafer
 //     `rotation` + `origin:'center'`; for lines we BAKE the rotation into the
@@ -69,6 +71,7 @@
 
 import { Group, Line } from 'leafer-ui'
 import type { Leafer } from 'leafer-ui'
+import { lineSegmentsWithLabelGap } from '../canvas/markupTextGeometry'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 import { debugLogger } from '../store/debugLogStore'
 import { isLeaferLinePaintedNode } from './leaferSpikeFilter'
@@ -86,6 +89,8 @@ type LineEntry = {
   nodeId: string
   group: Group
   main: Line
+  /** FU-11 label 缺口的后半段线体（labelActive 时存在）。 */
+  second: Line | null
   startHead: Line | null
   endHead: Line | null
 }
@@ -162,8 +167,11 @@ export const arrowHeadPointsFor = (anchor: LinePoint, angleRad: number): number[
 export type LinePaintProps = {
   /** Group container props: geometry offset + zIndex. */
   group: Record<string, unknown>
-  /** Main line props (node-local, rotation baked into points). */
+  /** Main line props (node-local, rotation baked into points). Label 缺口
+   *  激活时是前半段。 */
   main: Record<string, unknown>
+  /** FU-11 label 缺口后半段，null = 无缺口（整线画在 main 里）。 */
+  second: Record<string, unknown> | null
   /** Chevron head props, null when the corresponding arrow is hidden. */
   startHead: Record<string, unknown> | null
   endHead: Record<string, unknown> | null
@@ -179,12 +187,21 @@ const firstVisibleStroke = (r: RenderNode) => r.strokes.find((stroke) => stroke.
 export const linePaintPropsFor = (
   r: RenderNode,
   zIndex: number | undefined,
+  editingNodeId?: string,
 ): LinePaintProps => {
   const g = r.geometry
   const { start, end } = lineEndpointsFor(r)
   const rad = (g.rotation || 0) * (Math.PI / 180)
   const p0 = rotateAroundCenter(start, g.width / 2, g.height / 2, rad)
   const p1 = rotateAroundCenter(end, g.width / 2, g.height / 2, rad)
+  // FU-11: DOM 的 lineLabelActive = editing || text（CanvasNodeView）。缺口比例
+  // 沿线长切分，旋转后切分与 DOM 未旋转切分 + CSS 旋转等价（刚体变换）。
+  const labelActive = Boolean(r.text?.trim()) || r.id === editingNodeId
+  const segments = lineSegmentsWithLabelGap(
+    { width: g.width, height: g.height, text: r.text, fontSize: r.fontSize },
+    [p0, p1],
+    labelActive,
+  )
 
   const stroke = firstVisibleStroke(r)
   const strokeWidth = stroke?.width ?? 0
@@ -211,20 +228,34 @@ export const linePaintPropsFor = (
     strokeJoin: 'round',
   })
 
+  // Per-segment caps mirror the DOM `strokeLinecap={hasStartMarker || hasEndMarker
+  // ? 'butt' : 'round'}`: segment 0 carries the start marker, the LAST segment
+  // carries the end marker（无缺口时同一段两者兼具）。
+  const segmentProps = (
+    segment: { start: LinePoint; end: LinePoint },
+    hasStartMarker: boolean,
+    hasEndMarker: boolean,
+  ): Record<string, unknown> => ({
+    points: [segment.start.x, segment.start.y, segment.end.x, segment.end.y],
+    stroke: stroke?.color,
+    strokeWidth,
+    strokeCap: hasStartMarker || hasEndMarker ? 'butt' : 'round',
+    dashPattern: dashed ? dashPatternFor(strokeWidth) : undefined,
+    opacity: strokeOpacity,
+  })
+  const lastSegment = segments[segments.length - 1]
+
   return {
     group: {
       x: g.x,
       y: g.y,
       ...(zIndex !== undefined ? { zIndex } : {}),
     },
-    main: {
-      points: [p0.x, p0.y, p1.x, p1.y],
-      stroke: stroke?.color,
-      strokeWidth,
-      strokeCap: showStartArrow || showEndArrow ? 'butt' : 'round',
-      dashPattern: dashed ? dashPatternFor(strokeWidth) : undefined,
-      opacity: strokeOpacity,
-    },
+    main: segmentProps(segments[0], showStartArrow, segments[0].markerEnd && showEndArrow),
+    second:
+      segments.length > 1
+        ? segmentProps(lastSegment, false, lastSegment.markerEnd && showEndArrow)
+        : null,
     startHead: showStartArrow ? headProps(p0, angle + Math.PI) : null,
     endHead: showEndArrow ? headProps(p1, angle) : null,
   }
@@ -270,13 +301,16 @@ export const createLeaferLinePaint = (leafer: Leafer): LeaferLinePaint => {
     const group = new Group(props.group)
     const main = new Line(props.main)
     group.add(main)
-    // Heads AFTER the main line: same paint order as the DOM, where the SVG
+    // FU-11: label 缺口后半段，紧随前半段（同为线体层）。
+    const second = props.second ? new Line(props.second) : null
+    if (second) group.add(second)
+    // Heads AFTER the line body: same paint order as the DOM, where the SVG
     // marker renders over the line body.
     const startHead = props.startHead ? new Line(props.startHead) : null
     if (startHead) group.add(startHead)
     const endHead = props.endHead ? new Line(props.endHead) : null
     if (endHead) group.add(endHead)
-    return { nodeId, group, main, startHead, endHead }
+    return { nodeId, group, main, second, startHead, endHead }
   }
 
   const sync: LeaferLinePaint['sync'] = (nodes, ctx) => {
@@ -313,7 +347,7 @@ export const createLeaferLinePaint = (leafer: Leafer): LeaferLinePaint => {
 
     for (const node of lineNodes) {
       const projected = projectNode(node)
-      const props = linePaintPropsFor(projected, ctx.layerOf?.(node.id))
+      const props = linePaintPropsFor(projected, ctx.layerOf?.(node.id), ctx.editingNodeId)
       const existing = entries.get(node.id)
 
       if (plan.created.has(node.id) || !existing) {
@@ -324,8 +358,20 @@ export const createLeaferLinePaint = (leafer: Leafer): LeaferLinePaint => {
         continue
       }
 
+      // FU-11: 缺口从无到有（或反向）会改变 Group 子对象拓扑——直接重建，
+      // 保证"线体在前、箭头头在后"的绘制顺序（否则后 add 的线体会盖住头）。
+      if (Boolean(props.second) !== Boolean(existing.second)) {
+        destroyEntry(existing)
+        const entry = buildEntry(node.id, props)
+        entries.set(node.id, entry)
+        leafer.add(entry.group)
+        updated += 1
+        continue
+      }
+
       setProps(existing.group, props.group)
       setProps(existing.main, props.main)
+      existing.second = reconcileHead(existing.group, existing.second, props.second)
       existing.startHead = reconcileHead(existing.group, existing.startHead, props.startHead)
       existing.endHead = reconcileHead(existing.group, existing.endHead, props.endHead)
       updated += 1

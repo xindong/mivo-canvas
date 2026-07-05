@@ -25,6 +25,7 @@ import { projectRoot } from './bench/fixture-lib.mjs'
  *       # FU-8 旋转对照：注入旋转 image/rect/ellipse/note/line/arrow + connector
  *       # 固定文档（bench 同款 replaceSnapshot 注入），DOM vs Leafer 像素对照
  *   node scripts/visual-diff.mjs --candidate=leafer --fixture=brush-stamp
+ *   node scripts/visual-diff.mjs --candidate=leafer --fixture=markup-text
  *       # Phase 4c 对照：marker/highlighter/dashed/旋转 brush + stamp（含旋转）
  *       # + FU-10 半透明描边 rect/ellipse，DOM vs Leafer 像素对照
  */
@@ -212,6 +213,34 @@ const textFixtureNodes = () => {
   ]
 }
 
+
+/**
+ * FU-11 markup 文字层对照 fixture：note 正文 / rect、ellipse 标注 / line、arrow
+ * 线上 label（缺口）+ 旋转、dashed、自定义字号/颜色。文字两种模式都走 DOM
+ * （leafer 模式为 markup-text-overlay 纯文字壳），差异应集中在本体描边的
+ * 抗锯齿；line/arrow 的 label 缺口数学与 DOM 同源（markupTextGeometry）。
+ * mt-rect-empty 无文字——leafer 模式不应产生 DOM 壳（空壳回归探针）。
+ */
+const markupTextFixtureNodes = () => {
+  const node = (props) => ({ status: 'ready', title: props.id, type: 'markup', ...props })
+  const rotated = (props, rotation) => ({
+    ...node(props),
+    transform: { x: props.x, y: props.y, width: props.width, height: props.height, rotation },
+  })
+  return [
+    node({ id: 'mt-note', markupKind: 'note', x: 40, y: 40, width: 200, height: 160, text: '便签正文：文字层 DOM overlay 收口验证' }),
+    node({ id: 'mt-rect', markupKind: 'rect', x: 300, y: 40, width: 220, height: 140, text: 'Rect 标注文字' }),
+    node({ id: 'mt-ellipse', markupKind: 'ellipse', x: 580, y: 40, width: 220, height: 140, text: 'Ellipse label', textColor: '#b3261e', fontSize: 20 }),
+    node({ id: 'mt-line', markupKind: 'line', x: 860, y: 60, width: 260, height: 120, markupStrokeWidth: 4, markupPoints: [{ x: 8, y: 112 }, { x: 252, y: 8 }], text: '线上 label' }),
+    node({ id: 'mt-arrow', markupKind: 'arrow', x: 40, y: 300, width: 300, height: 140, markupStrokeWidth: 3, markupStartArrow: true, markupPoints: [{ x: 10, y: 10 }, { x: 290, y: 130 }], text: 'Flow label' }),
+    rotated({ id: 'mt-rect-rot', markupKind: 'rect', x: 420, y: 300, width: 200, height: 130, text: '旋转标注', fontWeight: 700 }, 30),
+    rotated({ id: 'mt-arrow-rot', markupKind: 'arrow', x: 700, y: 300, width: 260, height: 140, markupPoints: [{ x: 10, y: 130 }, { x: 250, y: 10 }], text: 'Rotated' }, -20),
+    node({ id: 'mt-line-dashed', markupKind: 'line', x: 40, y: 520, width: 280, height: 100, markupStrokeStyle: 'dashed', markupStrokeWidth: 4, markupPoints: [{ x: 10, y: 90 }, { x: 270, y: 10 }], text: 'dashed 缺口' }),
+    node({ id: 'mt-brush', markupKind: 'brush', markupBrushKind: 'marker', x: 620, y: 500, width: 260, height: 140, markupStrokeColor: '#d9542a', markupStrokeWidth: 6, markupPoints: [{ x: 12, y: 96 }, { x: 83, y: 40 }, { x: 145, y: 108 }, { x: 248, y: 48 }], text: 'brush 标注' }),
+    node({ id: 'mt-rect-empty', markupKind: 'rect', x: 380, y: 520, width: 160, height: 100 }),
+  ]
+}
+
 const fixtureFor = (fixture) => {
   if (!fixture) return null
   if (fixture === 'rotation') {
@@ -224,6 +253,10 @@ const fixtureFor = (fixture) => {
   if (fixture === 'brush-stamp') {
     // dom 模式等 stamp 贴纸 <img> 挂载（笔迹是同步 SVG path）。
     return { nodes: brushStampFixtureNodes(), domReadySelector: '.dom-markup-stamp img' }
+  }
+  if (fixture === 'markup-text') {
+    // 文字层两种模式都是 DOM——等 label 挂载即可。
+    return { nodes: markupTextFixtureNodes(), domReadySelector: '.dom-markup-label' }
   }
   throw new Error(`Unknown --fixture value: ${fixture}`)
 }

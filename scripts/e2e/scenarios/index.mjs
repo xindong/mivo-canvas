@@ -15,6 +15,7 @@ import { runMaskCrossSceneScenario } from './mask-cross-scene.mjs'
 import { runMaskHydrationScenario } from './mask-hydration.mjs'
 import { runMaskPointScenario } from './mask-point.mjs'
 import { runMaskSourceDeleteScenario } from './mask-source-delete.mjs'
+import { runMarkupTextOverlayScenario } from './markup-text-overlay.mjs'
 import { runMaskTimeoutRetryScenario } from './mask-timeout-retry.mjs'
 import { runMigrationScenario } from './migration.mjs'
 import { runShellSidebarScenario } from './shell-sidebar.mjs'
@@ -27,6 +28,7 @@ export const scenarioOrder = [
   'changelog',
   'archive-assets',
   'canvas-interactions',
+  'markup-text-overlay',
   'zoom-tool',
   'chat-generation',
   'chat-copy',
@@ -72,6 +74,7 @@ export const scenarioRunners = {
   'mask-source-delete': runMaskSourceDeleteScenario,
   'mask-timeout-retry': runMaskTimeoutRetryScenario,
   'mask-hydration': runMaskHydrationScenario,
+  'markup-text-overlay': runMarkupTextOverlayScenario,
   migration: runMigrationScenario,
   'shell-sidebar': runShellSidebarScenario,
   'variations-annotation': runVariationsAnnotationScenario,
