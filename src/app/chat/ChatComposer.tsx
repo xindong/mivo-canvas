@@ -74,6 +74,7 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
         const textarea = textareaRef.current
         if (!textarea || document.activeElement !== textarea) return
         if (event.target instanceof Node && composerRef.current?.contains(event.target)) return
+        if (event.target instanceof Element && event.target.closest('.chat-floating-popover')) return
         textarea.blur()
       }
 
