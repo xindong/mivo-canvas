@@ -40,7 +40,9 @@ secrets/
 data/debug-logs/
 history/checkpoints/
 history/daily/
-.claude/
+# .claude/ 整体不入库，仅放行项目级 settings.json（SessionStart hook 仓库地图）
+.claude/*
+!.claude/settings.json
 
 # macOS / iCloud placeholders
 *.icloud
