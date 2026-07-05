@@ -1,4 +1,4 @@
-import { Fragment, useState } from 'react'
+import { Fragment, useEffect, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
   Bug,
@@ -25,9 +25,11 @@ import {
   X,
 } from 'lucide-react'
 import { scenes, useCanvasStore } from '../store/canvasStore'
+import { selectHasUnreadChangelog, useChangelogStore } from '../store/changelogStore'
 import { debugLogger, useDebugLogStore, type DebugLogEntry, type DebugLogLevel } from '../store/debugLogStore'
 import { toastFeedback } from '../store/toastStore'
 import type { CanvasId } from '../types/mivoCanvas'
+import { ChangelogPanel } from './ChangelogPanel'
 
 export type WorkspaceView = 'canvas' | 'assets' | 'plugins' | 'skills'
 
@@ -126,12 +128,24 @@ export function ProjectSidebar({
   const debugEntries = useDebugLogStore((state) => state.entries)
   const clearDebugLog = useDebugLogStore((state) => state.clear)
   const [projectsOpen, setProjectsOpen] = useState(true)
+  const [changelogOpenedAt, setChangelogOpenedAt] = useState<number | null>(null)
   const [debugLogOpen, setDebugLogOpen] = useState(false)
   const [debugLogFilter, setDebugLogFilter] = useState<DebugLogLevel | 'all'>('all')
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [expandedProjects, setExpandedProjects] = useState<Record<string, boolean>>({
     'concept-battlepass': true,
   })
+  const hasUnreadChangelog = useChangelogStore(selectHasUnreadChangelog)
+  const loadChangelog = useChangelogStore((state) => state.loadChangelog)
+
+  useEffect(() => {
+    void loadChangelog()
+  }, [loadChangelog])
+
+  const openChangelog = () => {
+    setChangelogOpenedAt(Date.now())
+    debugLogger.log('Changelog', 'Changelog panel opened')
+  }
 
   const openCanvas = (canvasId: CanvasId) => {
     loadScene(canvasId)
@@ -375,6 +389,21 @@ export function ProjectSidebar({
       </div>
 
       <div className={settingsOpen ? 'settings-area open' : 'settings-area'}>
+        <div className="changelog-area">
+          {changelogOpenedAt !== null ? (
+            <ChangelogPanel openedAt={changelogOpenedAt} onClose={() => setChangelogOpenedAt(null)} />
+          ) : null}
+          <button
+            type="button"
+            className="debug-log-row changelog-row"
+            aria-label="更新日志"
+            onClick={openChangelog}
+          >
+            <Sparkles size={17} />
+            <span>更新日志</span>
+            {hasUnreadChangelog ? <span className="changelog-badge-dot" aria-hidden="true" /> : null}
+          </button>
+        </div>
         <div className="debug-log-area">
           {debugLogOpen
             ? createPortal(
