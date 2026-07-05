@@ -643,29 +643,18 @@ export const CanvasNodeView = memo(function CanvasNodeView({
       ) : aiSlotNode ? (
         <div className="dom-ai-slot-node">
           {aiSlotStatus === 'generating' ? (
+            // 规格(2026-07-05 用户):生成中占位符只留 mivo logo——标题/状态文案/
+            // 进度行/右下角尺寸角标全部不渲染,保持干净的 loading 视觉。
             <span className="mivo-logo ai-slot-mivo-logo" aria-hidden="true" />
-          ) : null}
-          <div className="ai-slot-copy">
-            <strong>{node.title}</strong>
-            <span>{aiSlotStatusLabel}</span>
-            {aiSlotStatus === 'generating' && node.aiWorkflow?.startedAt ? (
-              <div
-                className="ai-slot-progress"
-                data-canvas-ui="true"
-                data-ai-progress={Math.min(100, Math.max(0, Math.round(node.aiWorkflow.progress ?? 0)))}
-                data-ai-stage={node.aiWorkflow.stage || ''}
-                data-ai-elapsed={node.aiWorkflow.elapsedSec ?? 0}
-              >
-                <span className="ai-slot-progress-stage">{node.aiWorkflow.stage || '生成中'}</span>
-                <span className="ai-slot-progress-elapsed">{node.aiWorkflow.elapsedSec ?? 0}s</span>
-                <i
-                  className="ai-slot-progress-bar"
-                  style={{ width: `${Math.min(100, Math.max(0, Math.round(node.aiWorkflow.progress ?? 0)))}%` }}
-                />
+          ) : (
+            <>
+              <div className="ai-slot-copy">
+                <strong>{node.title}</strong>
+                <span>{aiSlotStatusLabel}</span>
               </div>
-            ) : null}
-          </div>
-          <em>{node.width} x {node.height}</em>
+              <em>{node.width} x {node.height}</em>
+            </>
+          )}
         </div>
       ) : markupNode ? (
         <MarkupNodeView
