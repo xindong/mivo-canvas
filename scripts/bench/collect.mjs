@@ -268,18 +268,12 @@ const loadFixture = async (nodeCount) => JSON.parse(await readFile(fixturePathFo
 
 const installBenchRuntime = async (page) => {
   await page.evaluate(() => {
-    // Bench loads fixtures (5k–50k nodes) that exceed localStorage's ~5MB quota via the
-    // zustand persist middleware (key 'mivo-canvas-demo'). Bench measures render perf, not
-    // persistence — silence the demo-store persistence write so replaceSnapshot doesn't throw
-    // QuotaExceededError at scale. Viewport + other small keys are unaffected.
-    if (!globalThis.__MIVO_BENCH_PERSIST_PATCHED__) {
-      const originalSetItem = window.localStorage.setItem.bind(window.localStorage)
-      window.localStorage.setItem = function (key, value) {
-        if (key === 'mivo-canvas-demo') return
-        return originalSetItem(key, value)
-      }
-      globalThis.__MIVO_BENCH_PERSIST_PATCHED__ = true
-    }
+    // FU4-2: the canvas store now persists to IndexedDB (no 5MB quota), but the
+    // bench measures render perf, not persistence — skip the IDB write entirely so
+    // 50k-node fixtures don't serialize+put on every replaceSnapshot. The adapter
+    // (src/lib/persistIdbStorage.ts) checks this flag in setItem. (Was a
+    // localStorage.setItem no-op shim, which no longer intercepts the IDB write.)
+    globalThis.__MIVO_BENCH_PERSIST_SKIP__ = true
 
     const waitFrames = (count = 1) =>
       new Promise((resolve) => {

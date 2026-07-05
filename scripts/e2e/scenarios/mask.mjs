@@ -1,7 +1,7 @@
 import { doneTaskView, failedTaskView } from '../api-mocks.mjs'
 
 export const runMaskScenario = async (context) => {
-  const { canvasStoreSpec, horizontalMaskSourceB64, mivoEditRequests, page, readCanvasState, waitForCanvasState } = context
+  const { canvasStoreSpec, horizontalMaskSourceB64, mivoEditRequests, page, readCanvasState, waitForCanvasState, waitForPersistedKv } = context
 
   const assertMaskFloatingControlsSeparated = async () => {
     const layout = await page.evaluate(() => {
@@ -170,11 +170,20 @@ export const runMaskScenario = async (context) => {
     throw new Error(`Mask edit smoke should mark at least one region per source: ${JSON.stringify(maskEditSmokeResults)}`)
   }
 
-  // Assert mask-edit notice persisted in chatStore after local repaint
-  const maskNoticeCount = await page.evaluate(() => {
+  // Assert mask-edit notice persisted in chatStore after local repaint. The IDB
+  // write is async, so poll until the notice appears. (FU4-2: was a sync
+  // localStorage.getItem.)
+  const maskNoticeCount = await waitForPersistedKv(page, 'mivo-chat-demo', (raw) => {
     try {
-      const raw = localStorage.getItem('mivo-chat-demo')
-      if (!raw) return 0
+      const parsed = JSON.parse(raw)
+      const byScene = parsed?.state?.messagesByScene ?? {}
+      return Object.values(byScene).flat().filter((m) => m.kind === 'notice' && m.origin === 'mask-edit').length >= 1
+    } catch {
+      return false
+    }
+  }).then((raw) => {
+    if (!raw) return 0
+    try {
       const parsed = JSON.parse(raw)
       const byScene = parsed?.state?.messagesByScene ?? {}
       return Object.values(byScene).flat().filter((m) => m.kind === 'notice' && m.origin === 'mask-edit').length

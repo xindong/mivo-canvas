@@ -13,7 +13,15 @@ export const runShellSidebarScenario = async (context) => {
     wait,
   } = context
 
-  await page.addInitScript(() => window.localStorage.clear())
+  // FU4-2: clear web storage before app scripts. addInitScript runs sync before the
+  // hydration gate, so it can't await an IDB clear — but each scenario runs on a fresh
+  // browser (IDB empty), so clearing localStorage + sessionStorage (migration markers)
+  // suffices. e2e-smoke's bootstrapBaseCanvas uses the async clearAllStorage for the
+  // shared-page case.
+  await page.addInitScript(() => {
+    try { window.localStorage.clear() } catch { /* opaque origin */ }
+    try { window.sessionStorage.clear() } catch { /* opaque origin */ }
+  })
   await page.goto(canvasUrl || baseUrl, { waitUntil: 'networkidle' })
   await page.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
 
