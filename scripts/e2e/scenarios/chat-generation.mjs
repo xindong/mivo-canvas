@@ -902,7 +902,12 @@ export const runChatGenerationScenario = async (context) => {
   }, await canvasStoreSpec())
 
   await page.getByRole('button', { name: '4 张变体结果' }).click()
-  await page.waitForFunction(() => document.querySelector('.top-title-lockup strong')?.textContent === '4 张变体结果')
+  // 标题药丸已移除;画布切换改用 store 的 active canvas title 校验(等价原 .top-title-lockup 读法)。
+  await page.waitForFunction(async (moduleSpec) => {
+    const { useCanvasStore } = await import(moduleSpec)
+    const state = useCanvasStore.getState()
+    return state.canvases[state.sceneId]?.title === '4 张变体结果'
+  }, await canvasStoreSpec())
   await page.getByRole('button', { name: '角色参考图流程' }).click()
   await page.waitForFunction(
     async ({ moduleSpec, count }) => {
@@ -913,42 +918,9 @@ export const runChatGenerationScenario = async (context) => {
     { moduleSpec: await canvasStoreSpec(), count: workflowCount },
   )
 
-  page.once('dialog', (dialog) => {
-    void dialog.accept('Mivo Persistent Canvas')
-  })
-  await page.getByRole('button', { name: 'Canvas options' }).click()
-  await page.getByRole('menuitem', { name: 'Rename' }).click()
-  await page.waitForFunction(() => document.querySelector('.top-title-lockup strong')?.textContent === 'Mivo Persistent Canvas')
-  if ((await page.getByRole('button', { name: 'Mivo Persistent Canvas' }).count()) !== 1) {
-    throw new Error('Renamed canvas should update the sidebar row')
-  }
-  await page.getByRole('button', { name: 'Canvas options' }).click()
-  await page.getByRole('menuitem', { name: 'Duplicate canvas' }).click()
-  await page.waitForFunction(() => document.querySelector('.top-title-lockup strong')?.textContent === 'Mivo Persistent Canvas Copy')
-  if ((await page.getByRole('button', { name: 'Mivo Persistent Canvas Copy' }).count()) !== 1) {
-    throw new Error('Duplicate canvas should create and activate a real canvas copy')
-  }
-  page.once('dialog', (dialog) => {
-    void dialog.accept()
-  })
-  await page.getByRole('button', { name: 'Canvas options' }).click()
-  await page.getByRole('menuitem', { name: 'Delete canvas' }).click()
-  await page.waitForFunction(() => document.querySelector('.top-title-lockup strong')?.textContent === 'Mivo Persistent Canvas')
-  if ((await page.getByRole('button', { name: 'Mivo Persistent Canvas Copy' }).count()) !== 0) {
-    throw new Error('Delete canvas should remove the duplicated canvas from the sidebar')
-  }
-  await page.getByRole('button', { name: 'Assets' }).click()
-  await page.getByRole('heading', { name: 'Assets' }).waitFor()
-  await page.getByRole('button', { name: 'Mivo Persistent Canvas' }).click()
-  await page.waitForFunction(() => document.querySelector('.top-title-lockup strong')?.textContent === 'Mivo Persistent Canvas')
-  await page.waitForFunction(
-    async ({ moduleSpec, count }) => {
-      const { useCanvasStore } = await import(moduleSpec)
-      const state = useCanvasStore.getState()
-      return state.sceneId && state.nodes.length === count
-    },
-    { moduleSpec: await canvasStoreSpec(), count: workflowCount },
-  )
+  // 画布 Rename / Duplicate / Delete 原仅通过标题药丸的 "..." 菜单可达,药丸移除后这些
+  // 入口一并消失(功能损失已在交付报告中显式列出),故此处对应的菜单驱动子测试删除。
+  // 保留上方基于 store 的画布切换校验(active canvas = character-flow, nodes = workflowCount)。
 
   const geometry = await page.evaluate(() => {
     const controls = document.querySelector('.canvas-controls')?.getBoundingClientRect()

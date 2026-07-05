@@ -10,7 +10,6 @@ import { InspectorPanel } from './app/InspectorPanel'
 import { canReadLocalAssetDrag } from './lib/canvasAssetDrag'
 import { ProjectSidebar } from './app/ProjectSidebar'
 import { ProjectSidebarControls } from './app/ProjectSidebarControls'
-import { TopBar } from './app/TopBar'
 import { ToastViewport } from './app/ToastViewport'
 import { useCanvasStore } from './store/canvasStore'
 import { debugLogger, installConsoleCapture } from './store/debugLogStore'
@@ -253,7 +252,6 @@ function App() {
       ) : null}
       {isCanvasWorkspace ? (
         <div className="workspace">
-          <TopBar projectSidebarOpen={projectSidebarOpen} />
           <div className="work-surface">
             <MivoCanvas
               key={sceneId}

@@ -801,7 +801,6 @@ button:disabled {
 
 .sidebar-toggle svg,
 .top-nav-button svg,
-.canvas-menu-button svg,
 .settings-row svg,
 .nav-row svg,
 .project-row svg,
@@ -3040,46 +3039,6 @@ button:disabled {
   color: var(--moss);
 }
 
-.top-bar {
-  position: absolute;
-  top: 14px;
-  left: 14px;
-  right: 14px;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-height: 0;
-  overflow: visible;
-  padding: 0;
-  pointer-events: none;
-}
-
-.top-bar.sidebar-open {
-  /* 画布全铺后 workspace 从 x=0 起,打开态标题左移避开浮动侧栏卡片。
-     取旧布局像素位置(旧 col 宽 240+2gap=268,再加 top-bar 自身 left 14 → 282),
-     与全铺前视觉零位移,shell-sidebar e2e 的 282 锚点断言原样成立。 */
-  left: calc(var(--project-sidebar-w) + var(--floating-gap) * 3);
-  right: auto;
-  max-width: min(520px, calc(100% - var(--project-sidebar-w) - var(--floating-gap) * 4));
-}
-
-.top-bar.sidebar-closed {
-  position: absolute;
-  /* 2026-07-06 用户:折叠态标题药丸与左侧展开按钮垂直居中对齐。按钮中心
-     y=50(.project-floating-chrome top 28 + 44px 按钮的一半);top+translateY(-50%)
-     把药丸中心锚到同一水平线,对药丸自身高度变化免疫。 */
-  top: 50px;
-  transform: translateY(-50%);
-  /* transform 会给 .top-bar 建栈上下文,把药丸的 z-index:70 困在内部,导致整条
-     top-bar(z-auto)被 DOM 靠后的 .work-surface/canvas 覆盖(药丸可测但不可见)。
-     给折叠态 top-bar 显式 z-index 抬到画布之上(< 浮动 chrome 的 100)。 */
-  z-index: 70;
-}
-
-.top-bar > * {
-  pointer-events: auto;
-}
-
 .project-floating-chrome {
   position: fixed;
   top: calc(var(--floating-gap) + 14px);
@@ -3116,8 +3075,7 @@ button:disabled {
   height: 40px;
 }
 
-.top-nav-button,
-.canvas-menu-button {
+.top-nav-button {
   display: grid;
   place-items: center;
   width: 34px;
@@ -3129,9 +3087,7 @@ button:disabled {
   cursor: pointer;
 }
 
-.top-nav-button:hover,
-.canvas-menu-button:hover,
-.canvas-menu-button[aria-expanded="true"] {
+.top-nav-button:hover {
   color: var(--ink);
   background: rgba(35, 35, 35, 0.06);
 }
@@ -3157,136 +3113,6 @@ button:disabled {
 .top-navigation .top-nav-button.round:hover {
   color: var(--ink);
   background: rgba(255, 250, 240, 0.92);
-}
-
-.top-title-area {
-  position: relative;
-  z-index: 70;
-  display: flex;
-  align-items: center;
-  flex: 0 1 auto;
-  min-width: 0;
-  width: max-content;
-  max-width: none;
-  min-height: 42px;
-  gap: 10px;
-  padding: 4px 6px 4px 14px;
-  background: rgba(248, 244, 235, 0.78);
-  border: 1px solid rgba(35, 35, 35, 0.12);
-  border-radius: var(--radius-pill);
-  box-shadow: 0 14px 36px rgba(35, 35, 35, 0.12);
-  backdrop-filter: blur(18px);
-}
-
-.top-bar.sidebar-closed .top-title-area {
-  margin-left: 154px;
-}
-
-.top-title-lockup {
-  display: grid;
-  min-width: max-content;
-  gap: 1px;
-}
-
-.top-title-lockup strong,
-.top-title-lockup span {
-  display: block;
-  overflow: visible;
-  text-overflow: clip;
-  white-space: nowrap;
-}
-
-.top-title-lockup strong {
-  color: var(--ink);
-  font-size: 16px;
-  line-height: 1.08;
-}
-
-.top-title-lockup span {
-  color: var(--muted);
-  font-size: var(--text-xs);
-  line-height: 1.2;
-}
-
-.top-error {
-  display: inline-flex;
-  align-items: center;
-  height: 34px;
-  gap: 7px;
-  padding: 0 10px;
-  border-radius: var(--radius-md);
-  font-size: var(--text-md);
-  white-space: nowrap;
-}
-
-.top-error {
-  max-width: 260px;
-  overflow: hidden;
-  color: #9f3c31;
-  background: rgba(185, 71, 58, 0.08);
-  border: 1px solid rgba(185, 71, 58, 0.22);
-  text-overflow: ellipsis;
-}
-
-.canvas-menu-wrap {
-  position: relative;
-  flex: 0 0 auto;
-}
-
-.canvas-title-menu {
-  position: absolute;
-  top: calc(100% + 8px);
-  right: 0;
-  z-index: 120;
-  display: grid;
-  width: 220px;
-  padding: 6px;
-  background: rgba(255, 250, 240, 0.98);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow);
-}
-
-.canvas-title-menu button {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  align-items: center;
-  gap: 9px;
-  min-width: 0;
-  height: 34px;
-  padding: 0 9px;
-  color: #554f48;
-  background: transparent;
-  border-radius: var(--radius-sm);
-  font-size: var(--text-md);
-  text-align: left;
-  cursor: pointer;
-}
-
-.canvas-title-menu button:hover {
-  color: var(--ink);
-  background: rgba(35, 35, 35, 0.06);
-}
-
-.canvas-title-menu button:disabled {
-  cursor: not-allowed;
-  opacity: 0.42;
-}
-
-.canvas-title-menu button.danger {
-  color: #9f3c31;
-}
-
-.canvas-title-menu span:not(.canvas-menu-separator) {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.canvas-menu-separator {
-  height: 1px;
-  margin: 6px 4px;
-  background: rgba(35, 35, 35, 0.1);
 }
 
 .work-surface {
@@ -7158,10 +6984,6 @@ button:disabled {
   .asset-masonry,
   .asset-library-drawer .asset-masonry {
     column-count: 1;
-  }
-
-  .top-bar {
-    gap: 10px;
   }
 
   .canvas-tool-dock {

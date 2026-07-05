@@ -7,7 +7,13 @@ export const runCanvasInteractionsScenario = async (context) => {
     ? { metaKey: true, ctrlKey: false }
     : { metaKey: false, ctrlKey: true }
   const pressCanvasShortcut = async (key, { shiftKey = false } = {}) => {
-    await page.locator('.canvas-shell').click({ position: { x: 300, y: 32 }, force: true })
+    // 快捷键前只需保证焦点不在文本输入里(否则走浏览器原生行为)。原先点画布 (300,32) 借
+    // 标题药丸挡住该点、不误碰画布;药丸移除后 (300,32) 变裸画布,点击会取消节点选中,
+    // 令依赖选中的 cut/group/ungroup 快捷键失效。改为直接 blur 当前焦点,不触碰画布选中。
+    await page.evaluate(() => {
+      const active = document.activeElement
+      if (active instanceof HTMLElement) active.blur()
+    })
     await page.evaluate(
       ({ keyValue, metaKey, ctrlKey, shiftKey: shortcutShiftKey }) => {
         const code = keyValue.length === 1 ? `Key${keyValue.toUpperCase()}` : keyValue
@@ -460,7 +466,7 @@ export const runCanvasInteractionsScenario = async (context) => {
   ) {
     throw new Error('Node context menu should render nested markup style actions')
   }
-  await page.locator('.top-title-area').click() // 全铺后(12,12)落在画布会误取消选中、Escape 会连选中一起清;点标题药丸(非交互 UI)只关菜单不碰选中,等价旧布局点侧栏死区
+  await page.locator('.sidebar-mark').click() // 标题药丸已移除;改点侧栏 Mivo logo(非交互 UI 死区):点画布会取消选中、Escape 会连选中一起清,而点侧栏死区只关右键菜单不碰画布选中,保持原语义
   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Line' }).click()
   if (
     !(await page.locator('.selection-quick-toolbar-menu').evaluate((menu) => menu.classList.contains('palette-menu'))) ||

@@ -16,13 +16,10 @@ export const runShellSidebarScenario = async (context) => {
   const sidebarWidth = 240
   const sidebarBorderWidth = 1
   const sidebarPadding = 14
-  const sidebarColumnWidth = sidebarWidth + sidebarGap * 2
   const sidebarContentLeft = sidebarGap + sidebarBorderWidth + sidebarPadding
   const sidebarContentTop = sidebarGap + sidebarBorderWidth + sidebarPadding
   const sidebarLogoTop = sidebarContentTop + 2
   const sidebarToggleLeft = sidebarContentLeft + 78 + 8
-  const sidebarWorkspaceTitleLeft = sidebarColumnWidth + sidebarGap
-  const collapsedTitleLeft = sidebarGap + 154
 
   // FU4-2: clear web storage before app scripts. addInitScript runs sync before the
   // hydration gate, so it can't await an IDB clear — but each scenario runs on a fresh
@@ -167,73 +164,21 @@ export const runShellSidebarScenario = async (context) => {
   const faviconHref = await page.locator('link[rel="icon"]').getAttribute('href')
   if (faviconHref !== '/mivo-logo.svg') throw new Error(`Expected Mivo logo favicon, got ${faviconHref}`)
 
-  const openTitle = await page.locator('.top-title-lockup').evaluate((lockup) => {
-    const title = lockup.querySelector('strong')
-    const meta = lockup.querySelector('span')
-    const titleStyle = title ? window.getComputedStyle(title) : undefined
-    const metaStyle = meta ? window.getComputedStyle(meta) : undefined
-    const titleArea = lockup.closest('.top-title-area')?.getBoundingClientRect()
-    const titleAreaStyle = lockup.closest('.top-title-area')
-      ? window.getComputedStyle(lockup.closest('.top-title-area'))
-      : undefined
-
-    return {
-      title: title?.textContent,
-      meta: meta?.textContent,
-      titleOverflow: titleStyle?.overflow,
-      titleTextOverflow: titleStyle?.textOverflow,
-      metaOverflow: metaStyle?.overflow,
-      metaTextOverflow: metaStyle?.textOverflow,
-      areaLeft: titleArea?.left,
-      areaRadius: titleAreaStyle?.borderRadius,
-    }
-  })
-  if (openTitle.title !== '角色参考图流程' || openTitle.meta !== '3 nodes · 1 tasks') {
-    throw new Error(`Top bar should show only canvas title and meta: ${JSON.stringify(openTitle)}`)
-  }
+  // 画布标题药丸(TopBar / .top-title-area)已整体移除(用户: "这个小面板直接砍掉")。
+  // 断言其在展开态彻底不存在,替代原 openTitle/floatingChrome 几何断言块。
+  const removedTitlePill = await page.evaluate(() => ({
+    topBar: document.querySelectorAll('.top-bar').length,
+    titleArea: document.querySelectorAll('.top-title-area').length,
+    titleLockup: document.querySelectorAll('.top-title-lockup').length,
+    canvasOptions: document.querySelectorAll('[aria-label="Canvas options"]').length,
+  }))
   if (
-    openTitle.titleOverflow !== 'visible' ||
-    openTitle.titleTextOverflow !== 'clip' ||
-    openTitle.metaOverflow !== 'visible' ||
-    openTitle.metaTextOverflow !== 'clip' ||
-    !nearlyEqual(openTitle.areaLeft ?? -1, sidebarWorkspaceTitleLeft) ||
-    openTitle.areaRadius !== '999px'
+    removedTitlePill.topBar !== 0 ||
+    removedTitlePill.titleArea !== 0 ||
+    removedTitlePill.titleLockup !== 0 ||
+    removedTitlePill.canvasOptions !== 0
   ) {
-    throw new Error(`Canvas title should stay untruncated at the open-sidebar anchor: ${JSON.stringify(openTitle)}`)
-  }
-  const floatingChrome = await page.evaluate(() => {
-    const topBar = document.querySelector('.top-bar')
-    const topBarRect = topBar?.getBoundingClientRect()
-    const canvasRect = document.querySelector('.canvas-shell')?.getBoundingClientRect()
-    const topBarStyle = topBar ? window.getComputedStyle(topBar) : undefined
-
-    return {
-      position: topBarStyle?.position,
-      backgroundColor: topBarStyle?.backgroundColor,
-      borderBottomWidth: topBarStyle?.borderBottomWidth,
-      topBar: topBarRect
-        ? {
-            top: topBarRect.top,
-            bottom: topBarRect.bottom,
-          }
-        : undefined,
-      canvas: canvasRect
-        ? {
-            top: canvasRect.top,
-          }
-        : undefined,
-    }
-  })
-  if (
-    floatingChrome.position !== 'absolute' ||
-    floatingChrome.backgroundColor !== 'rgba(0, 0, 0, 0)' ||
-    floatingChrome.borderBottomWidth !== '0px' ||
-    !floatingChrome.topBar ||
-    !floatingChrome.canvas ||
-    floatingChrome.canvas.top > 1 ||
-    floatingChrome.topBar.bottom <= floatingChrome.canvas.top
-  ) {
-    throw new Error(`Canvas title chrome should float over the canvas: ${JSON.stringify(floatingChrome)}`)
+    throw new Error(`Canvas title pill should be fully removed: ${JSON.stringify(removedTitlePill)}`)
   }
 
   if ((await page.locator('.top-navigation').count()) !== 0) {
@@ -546,36 +491,8 @@ export const runShellSidebarScenario = async (context) => {
   }
   await page.getByRole('button', { name: 'Settings' }).click()
 
-  const canvasMenuButton = page.getByRole('button', { name: 'Canvas options' })
-  if ((await canvasMenuButton.count()) !== 1) throw new Error('Top bar should expose one canvas options menu')
-  await canvasMenuButton.click()
-  for (const action of [
-    'Rename',
-    'Duplicate canvas',
-    'Move to project',
-    'Delete canvas',
-    'Copy JSON',
-    'Export JSON',
-    'Import JSON',
-  ]) {
-    if ((await page.getByRole('menuitem', { name: action }).count()) !== 1) {
-      throw new Error(`Canvas options menu should include: ${action}`)
-    }
-  }
-  const canvasMenuLayer = await page.locator('.canvas-title-menu').evaluate((menu) => {
-    const rect = menu.getBoundingClientRect()
-    const topElement = document.elementFromPoint(rect.left + rect.width / 2, rect.top + 12)
-
-    return {
-      menuTop: rect.top,
-      topElementClass: topElement?.className?.toString(),
-      isMenuOnTop: Boolean(topElement?.closest('.canvas-title-menu')),
-    }
-  })
-  if (!canvasMenuLayer.isMenuOnTop) {
-    throw new Error(`Canvas options menu should render above canvas overlays: ${JSON.stringify(canvasMenuLayer)}`)
-  }
-  await canvasMenuButton.click()
+  // 画布 "..." 选项菜单(Rename/Duplicate/Delete/Copy·Export·Import JSON)随药丸一并移除,
+  // 原 canvas options 菜单断言块删除(功能损失已在交付报告中显式列出)。
 
   await page.getByRole('button', { name: 'Collapse projects' }).click()
   await page.waitForSelector('[aria-label="Open projects"]')
@@ -634,11 +551,6 @@ export const runShellSidebarScenario = async (context) => {
     const workspace = document.querySelector('.workspace')?.getBoundingClientRect()
     const sidebar = document.querySelector('.project-sidebar')?.getBoundingClientRect()
     const sidebarElement = document.querySelector('.project-sidebar')
-    const title = document.querySelector('.top-title-lockup')
-    const titleArea = document.querySelector('.top-title-area')?.getBoundingClientRect()
-    const titleAreaStyle = document.querySelector('.top-title-area')
-      ? window.getComputedStyle(document.querySelector('.top-title-area'))
-      : undefined
     const floatingLogoWrap = document.querySelector('.floating-sidebar-mark')
     const floatingLogo = floatingLogoWrap?.querySelector('.mivo-logo')
     const floatingLogoRect = floatingLogo?.getBoundingClientRect()
@@ -676,10 +588,6 @@ export const runShellSidebarScenario = async (context) => {
             radius: openButtonStyle?.borderRadius,
           }
         : undefined,
-      title: title?.querySelector('strong')?.textContent,
-      titleAreaLeft: titleArea?.left,
-      titleAreaRadius: titleAreaStyle?.borderRadius,
-      meta: title?.querySelector('span')?.textContent,
     }
   })
   if (
@@ -706,14 +614,9 @@ export const runShellSidebarScenario = async (context) => {
     !nearlyEqual(collapsedLayout.openButton.left, openSidebarChrome.button.left) ||
     !nearlyEqual(collapsedLayout.openButton.top, openSidebarChrome.button.top) ||
     !nearlyEqual(collapsedLayout.openButton.width, collapsedLayout.openButton.height) ||
-    collapsedLayout.openButton.radius !== '999px' ||
-    !nearlyEqual(collapsedLayout.titleAreaLeft ?? -1, collapsedTitleLeft) ||
-    !(collapsedLayout.titleAreaLeft < openTitle.areaLeft) ||
-    collapsedLayout.titleAreaRadius !== '999px' ||
-    collapsedLayout.title !== '角色参考图流程' ||
-    collapsedLayout.meta !== '3 nodes · 1 tasks'
+    collapsedLayout.openButton.radius !== '999px'
   ) {
-    throw new Error(`Collapsed top bar should show floating logo, a circular menu button, title, and meta: ${JSON.stringify(collapsedLayout)}`)
+    throw new Error(`Collapsed chrome should show floating logo + a circular open button: ${JSON.stringify(collapsedLayout)}`)
   }
 
   await page.getByRole('button', { name: 'Open projects' }).hover()
@@ -740,10 +643,6 @@ export const runShellSidebarScenario = async (context) => {
     const drawerHeader = document.querySelector('.project-sidebar.drawer .sidebar-header')
     const drawerHeaderStyle = drawerHeader ? window.getComputedStyle(drawerHeader) : undefined
     const openButton = document.querySelector('[aria-label="Open projects"]')?.getBoundingClientRect()
-    const titleArea = document.querySelector('.top-title-area')?.getBoundingClientRect()
-    const titleProbe = titleArea
-      ? document.elementFromPoint(titleArea.left + 12, titleArea.top + titleArea.height / 2)
-      : undefined
     const workspace = document.querySelector('.workspace')?.getBoundingClientRect()
 
     return {
@@ -752,7 +651,6 @@ export const runShellSidebarScenario = async (context) => {
       drawerWidth: drawer?.width,
       drawerLeft: drawer?.left,
       drawerHeaderVisibility: drawerHeaderStyle?.visibility,
-      isTitleCoveredByDrawer: Boolean(titleProbe?.closest('.project-sidebar.drawer')),
       openButtonLeft: openButton?.left,
       openButtonTop: openButton?.top,
       workspaceLeft: workspace?.left,
@@ -766,7 +664,6 @@ export const runShellSidebarScenario = async (context) => {
     !nearlyEqual(peekLayout.drawerLeft ?? -1, sidebarGap) ||
     !nearlyEqual(peekLayout.drawerWidth ?? -1, sidebarWidth, 2) ||
     peekLayout.drawerHeaderVisibility !== 'hidden' ||
-    !peekLayout.isTitleCoveredByDrawer ||
     !nearlyEqual(peekLayout.openButtonLeft ?? -1, collapsedLayout.openButton.left) ||
     !nearlyEqual(peekLayout.openButtonTop ?? -1, collapsedLayout.openButton.top) ||
     !nearlyEqual(peekLayout.workspaceLeft ?? -1, 0) ||

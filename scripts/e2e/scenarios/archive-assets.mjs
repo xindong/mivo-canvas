@@ -3,6 +3,7 @@ export const runArchiveAssetsScenario = async (context) => {
     Buffer,
     assertLibraryLayoutStable,
     baseUrl,
+    canvasStoreSpec,
     page,
     readLibraryLayout,
     readLibrarySurfaceColors,
@@ -40,11 +41,18 @@ export const runArchiveAssetsScenario = async (context) => {
     return button ? Number(window.getComputedStyle(button).opacity) > 0.9 : false
   })
   await newCanvasButton.click()
+  // 标题药丸已移除;新建画布的标题/计数校验改读 store(active canvas title + 空节点)。
   await page.waitForFunction(
-    () =>
-      document.querySelector('.top-title-lockup strong')?.textContent === 'Untitled Canvas' &&
-      document.querySelector('.top-title-lockup span')?.textContent === '0 nodes · 0 tasks' &&
-      document.querySelectorAll('.dom-node').length === 0,
+    async (moduleSpec) => {
+      const { useCanvasStore } = await import(moduleSpec)
+      const state = useCanvasStore.getState()
+      return (
+        state.canvases[state.sceneId]?.title === 'Untitled Canvas' &&
+        state.nodes.length === 0 &&
+        document.querySelectorAll('.dom-node').length === 0
+      )
+    },
+    await canvasStoreSpec(),
   )
   if ((await page.getByRole('button', { name: 'Untitled Canvas' }).count()) !== 1) {
     throw new Error('Creating a canvas should add a dynamic standalone canvas row')
@@ -103,16 +111,32 @@ export const runArchiveAssetsScenario = async (context) => {
       },
     ],
   }
-  await page.locator('input[type="file"][accept="application/json"]').setInputFiles({
-    name: 'mivo-archive.json',
-    mimeType: 'application/json',
-    buffer: Buffer.from(JSON.stringify(archive)),
-  })
+  // Import JSON 的 UI 入口(标题药丸 "..." 菜单里的 file input)随药丸移除(功能损失已在
+  // 交付报告列出)。归档还原逻辑(parseCanvasSnapshot + restoreCanvasImportAssets +
+  // replaceSnapshot)仍在 src/lib，故此处经 store 直接驱动同一管线,保留归档回灌逻辑覆盖。
+  await page.evaluate(
+    async ({ storeSpec, archiveText }) => {
+      const { parseCanvasSnapshot } = await import('/src/lib/snapshotValidation.ts')
+      const { restoreCanvasImportAssets } = await import('/src/lib/canvasArchive.ts')
+      const { useCanvasStore } = await import(storeSpec)
+      const result = parseCanvasSnapshot(archiveText)
+      if (!result.ok) throw new Error(`archive parse failed: ${result.message}`)
+      await restoreCanvasImportAssets(result)
+      useCanvasStore.getState().replaceSnapshot(result.snapshot)
+    },
+    { storeSpec: await canvasStoreSpec(), archiveText: JSON.stringify(archive) },
+  )
   await page.waitForFunction(
-    () =>
-      document.querySelector('.top-title-lockup strong')?.textContent === 'canvas-e2e-archive' &&
-      document.querySelectorAll('.dom-node').length === 2 &&
-      document.querySelector('.dom-node.text-node .dom-text-node')?.textContent?.includes('Archive text'),
+    async (moduleSpec) => {
+      const { useCanvasStore } = await import(moduleSpec)
+      const state = useCanvasStore.getState()
+      return (
+        state.canvases[state.sceneId]?.title === 'canvas-e2e-archive' &&
+        document.querySelectorAll('.dom-node').length === 2 &&
+        document.querySelector('.dom-node.text-node .dom-text-node')?.textContent?.includes('Archive text')
+      )
+    },
+    await canvasStoreSpec(),
   )
   const importedArchiveAsset = await page.locator('[data-node-id="archive-image"] .dom-node-media img').evaluate((image) => ({
     src: image.getAttribute('src') || '',
