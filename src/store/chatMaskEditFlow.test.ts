@@ -440,6 +440,86 @@ describe('runMaskEditChatFlow (SC-04/10/05/06/07/12/16)', () => {
   })
 })
 
+// F3 (审 P3): buildEditContext maskKind 派生。buildEditContext 未导出,通过 runMaskEditChatFlow
+// 间接测——mock enhanceMivoPrompt 捕获入参 editContext,验证三种 payload 的 hasMask/maskKind 组合。
+// 修复点:旧实现 bounds-only payload(maskBounds 有、mask 无)会派生 hasMask=false+maskKind='bounds'
+// 的矛盾语义;修复后 hasMask=true+maskKind='bounds'。
+describe('runMaskEditChatFlow buildEditContext maskKind 派生 (F3)', () => {
+  it('mask blob + maskBounds → hasMask=true, maskKind=brush', async () => {
+    vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({
+      enhanced: true, mode: 'generate', richPrompt: 'x',
+    } as never)
+    maskEditGenSpies.runMaskEditGeneration.mockResolvedValueOnce({ nodeIds: ['n1'], sourceDeleted: false })
+
+    const source = imageNode({ id: 'src-f3a' })
+    const messageId = beginMaskEditMessage({
+      sceneId: 'scene-1', source, prompt: 'p', slotId: 'slot-1', imgRatio: '1:1', quality: 'medium',
+    })
+    const record = makeRecord({
+      messageId, sceneId: 'scene-1', slotId: 'slot-1', source,
+      payload: basePayload({ mask: new Blob([], { type: 'image/png' }) }),
+    })
+    registerMaskEditTask(record)
+    await runMaskEditChatFlow(record)
+
+    const call = vi.mocked(enhanceMivoPrompt).mock.calls.at(-1)![0] as {
+      editContext: { hasMask: boolean; maskKind: 'brush' | 'bounds' | undefined }
+    }
+    expect(call.editContext.hasMask).toBe(true)
+    expect(call.editContext.maskKind).toBe('brush')
+  })
+
+  it('仅 maskBounds（bounds-only 无 mask blob）→ hasMask=true, maskKind=bounds（F3 修复点）', async () => {
+    vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({
+      enhanced: true, mode: 'generate', richPrompt: 'x',
+    } as never)
+    maskEditGenSpies.runMaskEditGeneration.mockResolvedValueOnce({ nodeIds: ['n1'], sourceDeleted: false })
+
+    const source = imageNode({ id: 'src-f3b' })
+    const messageId = beginMaskEditMessage({
+      sceneId: 'scene-1', source, prompt: 'p', slotId: 'slot-1', imgRatio: '1:1', quality: 'medium',
+    })
+    // basePayload 默认有 maskBounds 无 mask — 正好是 bounds-only 场景
+    const record = makeRecord({
+      messageId, sceneId: 'scene-1', slotId: 'slot-1', source,
+      payload: basePayload(),
+    })
+    registerMaskEditTask(record)
+    await runMaskEditChatFlow(record)
+
+    const call = vi.mocked(enhanceMivoPrompt).mock.calls.at(-1)![0] as {
+      editContext: { hasMask: boolean; maskKind: 'brush' | 'bounds' | undefined }
+    }
+    // F3 修复点:旧实现 hasMask=false + maskKind='bounds' 矛盾;修复后 hasMask=true + maskKind='bounds'
+    expect(call.editContext.hasMask).toBe(true)
+    expect(call.editContext.maskKind).toBe('bounds')
+  })
+
+  it('两者都无 → hasMask=false, maskKind=undefined', async () => {
+    vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({
+      enhanced: true, mode: 'generate', richPrompt: 'x',
+    } as never)
+    maskEditGenSpies.runMaskEditGeneration.mockResolvedValueOnce({ nodeIds: ['n1'], sourceDeleted: false })
+
+    const source = imageNode({ id: 'src-f3c' })
+    const messageId = beginMaskEditMessage({
+      sceneId: 'scene-1', source, prompt: 'p', slotId: 'slot-1', imgRatio: '1:1', quality: 'medium',
+    })
+    const record = makeRecord({
+      messageId, sceneId: 'scene-1', slotId: 'slot-1', source,
+      payload: basePayload({ maskBounds: undefined }),
+    })
+    registerMaskEditTask(record)
+    await runMaskEditChatFlow(record)
+
+    const call = vi.mocked(enhanceMivoPrompt).mock.calls.at(-1)![0] as {
+      editContext: { hasMask: boolean; maskKind: 'brush' | 'bounds' | undefined }
+    }
+    expect(call.editContext.hasMask).toBe(false)
+    expect(call.editContext.maskKind).toBeUndefined()
+  })
+})
+
 describe('cancelMaskEditMessage (SC-08/15)', () => {
   it('SC-08 runtime 在: register record → cancelMaskEditMessage abort 了 controller,返回,不删 registry(由后台 catch 收口),不调 removeMaskEditPlaceholder', () => {
     const ac = new AbortController()

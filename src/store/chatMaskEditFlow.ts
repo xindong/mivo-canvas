@@ -34,8 +34,11 @@ const createId = (prefix: string) =>
 /** 构造 enhance edit 的 editContext（源图像素空间，零换算透传 payload.maskBounds）。 */
 const buildEditContext = (source: MivoCanvasNode, payload: ImageMaskSubmitPayload) => ({
   sourceTitle: source.title,
-  hasMask: Boolean(payload.mask),
-  maskKind: (payload.maskBounds ? 'bounds' : 'brush') as 'brush' | 'bounds',
+  // F3 (审 P3): bounds-only payload（maskBounds 有、mask 无）也判 hasMask=true，
+  // 避免 "Mask: none 却带 bounds" 的矛盾语义给 LLM。
+  hasMask: Boolean(payload.mask || payload.maskBounds),
+  // F3: mask blob 在 → brush；否则 maskBounds 在 → bounds；都没有 → undefined。
+  maskKind: (payload.mask ? 'brush' : payload.maskBounds ? 'bounds' : undefined) as 'brush' | 'bounds' | undefined,
   maskBoundsPx: payload.maskBounds,
   sourceSize: payload.sourceSize,
 })

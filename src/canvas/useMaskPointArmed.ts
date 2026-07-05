@@ -150,53 +150,63 @@ export function useMaskPointArmed({
         .getState()
         .canvases[targetSceneId]?.nodes.find((node) => node.id === nodeId && node.type === 'image' && !node.hidden)
       if (!source) throw new Error('Source image not found')
-
-      const { slotId, baselineSnapshot } = prepareMaskEditPlaceholder(targetSceneId, source, payload.prompt)
-      // mask-chat-card: 调度后台任务，不 await 全程。创建 chat enhancing card + runtime
-      // record 后立即关闭 overlay；enhance→edit→finish 由 runMaskEditChatFlow 后台驱动，
-      // 卡片状态由 chatMaskEditFlow 经 callbacks 收口。多 mask 并发允许（不 abort 旧任务）。
-      const imgRatio = closestMivoRatioForSize(payload.sourceSize)
-      const messageId = beginMaskEditMessage({
-        sceneId: targetSceneId,
-        source,
-        prompt: payload.prompt,
-        slotId,
-        imgRatio,
-        quality: payload.quality,
+      // F1 (审 P2): 双保险 in-flight guard。overlay 的 submitInFlightRef 覆盖 buildEditMaskBlob
+      // 前窗口；本 setMaskEditSubmittingNodeId 覆盖 submitMaskEdit 执行窗口（buildEditMaskBlob
+      // 之后到 cancelMaskEdit 之前）。成功路径 cancelMaskEdit 清回；catch 清回失败路径。
+      // 防快速双击/大图 toBlob 慢导致双提交（两个 placeholder + 两组 chat message + 两条 edit POST）。
+      setMaskEditSubmittingNodeId(nodeId)
+      try {
+        const { slotId, baselineSnapshot } = prepareMaskEditPlaceholder(targetSceneId, source, payload.prompt)
+        // mask-chat-card: 调度后台任务，不 await 全程。创建 chat enhancing card + runtime
+        // record 后立即关闭 overlay；enhance→edit→finish 由 runMaskEditChatFlow 后台驱动，
+        // 卡片状态由 chatMaskEditFlow 经 callbacks 收口。多 mask 并发允许（不 abort 旧任务）。
+        const imgRatio = closestMivoRatioForSize(payload.sourceSize)
+        const messageId = beginMaskEditMessage({
+          sceneId: targetSceneId,
+          source,
+          prompt: payload.prompt,
+          slotId,
+          imgRatio,
+          quality: payload.quality,
+        })
+        const abortController = new AbortController()
+        registerMaskEditTask({
+          sceneId: targetSceneId,
+          messageId,
+          slotId,
+          baselineSnapshot,
+          abortController,
+          source,
+          resolvedAssetUrl,
+          payload,
+          imgRatio,
+          quality: payload.quality,
+        })
+        // 关闭 overlay 交互层（不 abort runtime task）；submitMaskEdit 立即返回，
+        // overlay 由本 cancelMaskEdit 关闭（同时清 setMaskEditSubmittingNodeId），enhance/edit 后台继续。
+        cancelMaskEdit('mask edit submitted')
+        void runMaskEditChatFlow({
+          sceneId: targetSceneId,
+          messageId,
+          slotId,
+          baselineSnapshot,
+          abortController,
+          source,
+          resolvedAssetUrl,
+          payload,
+          imgRatio,
+          quality: payload.quality,
+        }).catch((error) => {
+          debugLogger.error(
+            'Mask Edit',
+            `runMaskEditChatFlow crashed for ${source.title} (msg ${messageId}): ${error instanceof Error ? error.message : 'unknown'}`,
+          )
       })
-      const abortController = new AbortController()
-      registerMaskEditTask({
-        sceneId: targetSceneId,
-        messageId,
-        slotId,
-        baselineSnapshot,
-        abortController,
-        source,
-        resolvedAssetUrl,
-        payload,
-        imgRatio,
-        quality: payload.quality,
-      })
-      // 关闭 overlay 交互层（不 abort runtime task）；submitMaskEdit 立即返回，
-      // overlay 由本 cancelMaskEdit 关闭，enhance/edit 后台继续。
-      cancelMaskEdit('mask edit submitted')
-      void runMaskEditChatFlow({
-        sceneId: targetSceneId,
-        messageId,
-        slotId,
-        baselineSnapshot,
-        abortController,
-        source,
-        resolvedAssetUrl,
-        payload,
-        imgRatio,
-        quality: payload.quality,
-      }).catch((error) => {
-        debugLogger.error(
-          'Mask Edit',
-          `runMaskEditChatFlow crashed for ${source.title} (msg ${messageId}): ${error instanceof Error ? error.message : 'unknown'}`,
-        )
-      })
+      } catch (error) {
+        // F1: 调度失败清回 submitting（成功路径 cancelMaskEdit 已清），允许重试。
+        setMaskEditSubmittingNodeId(undefined)
+        throw error
+      }
     },
     [cancelMaskEdit, sceneId],
   )

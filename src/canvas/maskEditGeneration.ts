@@ -263,7 +263,12 @@ export const runMaskEditGeneration = async (args: {
   // newIdempotencyKey 必须每次重试都重新生成 —— BFF registry 按 key dedupe，复用
   // 原失败调用的 key 会静默返回缓存的黑盘 task（F3）。progress patch 在 poll loop
   // 内，重试时 placeholder 仍在，进度字段继续刷新。
-  const runOneAttempt = async (idempotencyKey: string): Promise<{ taskId: string; images: TaskResultImage[] }> => {
+  const runOneAttempt = async (
+    idempotencyKey: string,
+    /** F2 (审 P2): per-attempt 钩子，submitEditTask 返回后立即触发（poll 前）。
+     *  self-heal 用它在 task-2 submit 后立刻 onSelfHealRetry，使重试期间 phase=self-heal-retry 可观测。 */
+    onSubmitted?: (taskId: string) => void,
+  ): Promise<{ taskId: string; images: TaskResultImage[] }> => {
     if (signal.aborted) throw new MivoImageRequestError('图片请求已取消。', 'canceled')
     const submitStartedAt = Date.now()
     const taskId = await submitEditTask({
@@ -280,6 +285,7 @@ export const runMaskEditGeneration = async (args: {
     currentTaskId = taskId
     // mask-chat-card: 通知 chat flow 已拿到 taskId（写 message.maskEdit.serverTaskId 供 cancel fallback/debug）。
     callbacks.onTaskSubmitted?.(taskId)
+    onSubmitted?.(taskId)
     debugLogger.log(
       'Mask Edit',
       `Task ${taskId} submitted for ${source.title} (quality=${quality}) in ${Date.now() - submitStartedAt}ms`,
@@ -330,11 +336,13 @@ export const runMaskEditGeneration = async (args: {
         { sourceBlob: image, resultB64: images[0].b64 },
       )
       if (blackPlate) {
-        const second = await runOneAttempt(newIdempotencyKey())
+        // F2 (审 P2): 拿到 task-2 后立即 onSelfHealRetry（poll 期间 phase=self-heal-retry 可观测），
+        // 不再等第二次 attempt 完整结束才触发（旧实现 phase 几乎不可见，SC-13 语义打折）。
+        const second = await runOneAttempt(newIdempotencyKey(), (task2Id) => {
+          callbacks.onSelfHealRetry?.([first.taskId, task2Id])
+        })
         attemptTaskIds.push(second.taskId)
         serverTaskId = second.taskId
-        // mask-chat-card: 通知 chat flow 进入 self-heal 重试（card 保持 generating，不落中间 error）。
-        callbacks.onSelfHealRetry?.(attemptTaskIds)
         const secondBlack = await inspectMaskResultForBlackPlate(
           { sourceSizePx: payload.sourceSize, maskBoundsPx: payload.maskBounds! },
           { sourceBlob: image, resultB64: second.images[0]?.b64 ?? '' },
