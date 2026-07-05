@@ -16,6 +16,7 @@ import {
   withEngineLodStats,
   type EngineLodStatsCarrier,
 } from './engineSpikeLod'
+import { createLeaferImagePaint } from './leaferImagePaint'
 
 /**
  * 0b spike — Phase 2b 正式化时按 phase2b-adapter-camera-zorder.md 重构
@@ -78,6 +79,11 @@ const EMPTY_STATS: LeaferSpikeStats = {
   panCacheLastDeltaX: 0,
   panCacheLastDeltaY: 0,
 }
+
+// Stable empty set for RendererSyncContext.selectedNodeIds — the image paint
+// module does not read selection (selection stroke is a DOM overlay concern),
+// so a shared empty set avoids allocating one per sync.
+const EMPTY_SELECTED_IDS: ReadonlySet<string> = new Set()
 
 const parsePanCacheEnabled = () => {
   if (typeof window === 'undefined' || typeof window.location === 'undefined') return false
@@ -217,6 +223,10 @@ export const useLeaferSpikeRenderer = ({
   const paintedRef = useRef<Map<string, PaintedEntry>>(new Map())
   const signatureRef = useRef<Map<string, string>>(new Map())
   const statsRef = useRef<LeaferSpikeStats>(EMPTY_STATS)
+  // Phase 3c: image paint is formalized into leaferImagePaint (lease + crop +
+  // diffReconcilePlan). One instance per Leafer; created on init, disposed on
+  // teardown so every image lease is released when Leafer is destroyed.
+  const imagePaintRef = useRef<ReturnType<typeof createLeaferImagePaint> | null>(null)
   const lodSummaryRef = useRef<string | undefined>(undefined)
   const panCacheEnabled = useMemo(() => parsePanCacheEnabled(), [])
   const frozenViewportRef = useRef<ViewportState | null>(null)
@@ -233,6 +243,18 @@ export const useLeaferSpikeRenderer = ({
   const lodViewport = useMemo(() => ({ x: 0, y: 0, scale: viewport.scale }), [viewport.scale])
 
   const paintedNodes = useMemo(() => nodes.filter(isLeaferEngineComboPainted), [nodes])
+  // Phase 3c: image nodes are painted by leaferImagePaint (lease + crop + contract),
+  // not the inline spike loop. The inline loop handles frame / markup-rect / text;
+  // paintedNodes (incl. image) still drives expectedChildren + lodStats + the
+  // signature dep so the effect re-runs when image nodes change.
+  const nonImagePaintedNodes = useMemo(
+    () => paintedNodes.filter((node) => node.type !== 'image'),
+    [paintedNodes],
+  )
+  const imagePaintedNodes = useMemo(
+    () => paintedNodes.filter((node) => node.type === 'image'),
+    [paintedNodes],
+  )
   const paintedNodeSignature = useMemo(
     () => paintedNodes.map((node) => `${node.id}:${paintSignatureFor(node, lodViewport)}`).join('|'),
     [lodViewport, paintedNodes],
@@ -316,6 +338,9 @@ export const useLeaferSpikeRenderer = ({
       leaferRef.current = leafer
       leafer.start()
       setLeaferReady(true)
+      // Bind the image paint module to this Leafer instance. Disposed in the
+      // cleanup below so every image lease is released on Leafer teardown.
+      imagePaintRef.current = createLeaferImagePaint(leafer)
 
       resizeObserver = new ResizeObserver(([entry]) => {
         if (!entry || !leaferRef.current) return
@@ -333,6 +358,8 @@ export const useLeaferSpikeRenderer = ({
     return () => {
       cancelAnimationFrame(raf)
       resizeObserver?.disconnect()
+      imagePaintRef.current?.dispose()
+      imagePaintRef.current = null
       leafer?.destroy()
       leaferRef.current = null
       setLeaferReady(false)
@@ -457,6 +484,16 @@ export const useLeaferSpikeRenderer = ({
         painted.clear()
         signatures.clear()
       }
+      // Release every image lease too (3c): sync([]) deletes all image entries,
+      // revoking shared blob URLs so dom mode owns the only outstanding leases.
+      imagePaintRef.current?.sync([], {
+        viewport: lodViewport,
+        selectedNodeIds: EMPTY_SELECTED_IDS,
+        // isPanning is informational only; leaferImagePaint does not read it.
+        // Passing false (not the prop) keeps this effect off the isPanning dep
+        // so pan does not re-run paint → no setStats → 0g invariant 1 holds.
+        isPanning: false,
+      })
       queueMicrotask(() => publishStats({ ...EMPTY_STATS, panCacheEnabled }))
       return
     }
@@ -464,7 +501,10 @@ export const useLeaferSpikeRenderer = ({
     const lodStats = summarizeEngineLod(paintedNodes, lodViewport)
     recordEngineLodSummary('Leafer Spike', lodStats, lodSummaryRef)
     const nextIds = new Set<string>()
-    for (const node of paintedNodes) {
+    // Phase 3c: image nodes are reconciled by leaferImagePaint (lease + crop +
+    // diffReconcilePlan) after the inline loop. The inline loop only handles
+    // frame / markup-rect / text (nonImagePaintedNodes).
+    for (const node of nonImagePaintedNodes) {
       nextIds.add(node.id)
       const signature = paintSignatureFor(node, lodViewport)
       const existing = painted.get(node.id)
@@ -498,6 +538,16 @@ export const useLeaferSpikeRenderer = ({
         signatures.delete(id)
       }
     }
+
+    // 3c: reconcile image nodes through the lease + clip + diffReconcilePlan
+    // contract. Acquire/release is balanced per sync (created/updated/deleted
+    // returned here for accounting; lease balance asserted in unit tests).
+    imagePaintRef.current?.sync(imagePaintedNodes, {
+      viewport: lodViewport,
+      selectedNodeIds: EMPTY_SELECTED_IDS,
+      // isPanning informational only (module ignores); see note above on 0g invariant 1.
+      isPanning: false,
+    })
 
     const syncVersion = statsRef.current.syncVersion + 1
     publishStats(withEngineLodStats({
@@ -537,7 +587,7 @@ export const useLeaferSpikeRenderer = ({
     return () => {
       cancelled = true
     }
-  }, [hostRef, leaferReady, lodViewport, panCacheEnabled, paintedNodes, paintedNodeSignature, publishStats, rendererMode])
+  }, [hostRef, imagePaintedNodes, leaferReady, lodViewport, nonImagePaintedNodes, panCacheEnabled, paintedNodes, paintedNodeSignature, publishStats, rendererMode])
 
   useEffect(() => {
     window.__MIVO_LEAFER_SPIKE__ = {
