@@ -1,0 +1,744 @@
+{
+  "protocol": {
+    "roadmapSection": "§12.1 / §13 SC6.2",
+    "renderer": "dom",
+    "rendererModeActual": "dom",
+    "culling": "on",
+    "cullingModeActual": "on",
+    "panCache": "off",
+    "panCacheActual": "off",
+    "virtualize": "on",
+    "virtualizeActual": "on",
+    "date": "2026-07-05",
+    "referenceMachine": "same-machine-only",
+    "browser": "Chromium via Playwright",
+    "viewport": {
+      "width": 1920,
+      "height": 1080
+    },
+    "dprs": [
+      1
+    ],
+    "runsPerConfig": 3,
+    "seed": 20260704,
+    "fixtureProfile": "mixed",
+    "motion": "prefers-reduced-motion + transition/animation disabled",
+    "syncMeasurement": "replaceSnapshot(full snapshot) until expected node count / viewport settle",
+    "segments": [
+      "loadFixture",
+      "render-sync",
+      "canvas-pan",
+      "canvas-zoom"
+    ],
+    "heapMeasurements": [
+      "before-load",
+      "after-render",
+      "after-run"
+    ],
+    "traceMarks": [
+      "loadFixture",
+      "render-sync",
+      "canvas-pan",
+      "canvas-zoom"
+    ]
+  },
+  "note": "Phase 0e DOM virtualization final matrix",
+  "outputType": "0e-dom-virtualization",
+  "configs": [
+    {
+      "nodeCount": 10000,
+      "fixture": {
+        "sceneId": "bench-dom-mixed-10000",
+        "label": "10000 mixed benchmark fixture",
+        "nodeCount": 10000,
+        "seed": 20260704,
+        "counts": {
+          "image": 5800,
+          "text": 2200,
+          "frame": 800,
+          "connector": 1200
+        },
+        "bounds": {
+          "x": -16674,
+          "y": -6994,
+          "width": 33353,
+          "height": 14227
+        },
+        "recommendedViewport": {
+          "x": 959.8,
+          "y": 530.44,
+          "scale": 0.08
+        }
+      },
+      "dprResults": [
+        {
+          "dpr": 1,
+          "median": {
+            "runs": 3,
+            "loadFixtureMs": 2856.4,
+            "renderSyncMs": 6012.7,
+            "storeToRendererSyncMs": 8869.1,
+            "overall": {
+              "p50FrameMs": 8.4,
+              "p95FrameMs": 606.8,
+              "heapBeforeMb": 22.451,
+              "heapAfterRenderMb": 155.306,
+              "heapUsedMb": 155.306,
+              "heapDeltaMb": 132.832,
+              "longTaskCount": 81,
+              "longTaskTotalMs": 45992
+            },
+            "actions": {
+              "loadFixture": {
+                "p50FrameMs": 8.3,
+                "p95FrameMs": 9.2,
+                "durationMs": 2856.4,
+                "longTaskCount": 2,
+                "longTaskTotalMs": 2446
+              },
+              "render-sync": {
+                "p50FrameMs": 424.5,
+                "p95FrameMs": 834.2,
+                "durationMs": 6012.7,
+                "longTaskCount": 24,
+                "longTaskTotalMs": 5990
+              },
+              "canvas-pan": {
+                "p50FrameMs": 8.4,
+                "p95FrameMs": 606.8,
+                "durationMs": 45383.8,
+                "longTaskCount": 75,
+                "longTaskTotalMs": 44535
+              },
+              "canvas-zoom": {
+                "p50FrameMs": 8.4,
+                "p95FrameMs": 50.1,
+                "durationMs": 2377.2,
+                "longTaskCount": 6,
+                "longTaskTotalMs": 1443
+              }
+            },
+            "stability": {
+              "p95MinMs": 605.5,
+              "p95MaxMs": 608.9,
+              "p95StdDevMs": 1.401,
+              "spreadMs": 3.4
+            }
+          },
+          "runs": [
+            {
+              "runIndex": 1,
+              "browser": {
+                "chromiumVersion": "149.0.7827.55",
+                "viewport": {
+                  "width": 1920,
+                  "height": 1080
+                },
+                "dpr": 1
+              },
+              "renderer": {
+                "requested": "dom",
+                "actual": "dom",
+                "cullingRequested": "on",
+                "cullingActual": "on",
+                "panCacheRequested": "off",
+                "panCacheActual": "off",
+                "virtualizeRequested": "on",
+                "virtualizeActual": "on",
+                "pixiTextStrategy": "bitmap",
+                "pixiTexturePoolSize": 0
+              },
+              "fixture": {
+                "sceneId": "bench-dom-mixed-10000",
+                "nodeCount": 10000,
+                "seed": 20260704,
+                "profile": "mixed",
+                "counts": {
+                  "image": 5800,
+                  "text": 2200,
+                  "frame": 800,
+                  "connector": 1200
+                }
+              },
+              "loadFixtureMs": 2851.5,
+              "renderSyncMs": 6303,
+              "storeToRendererSyncMs": 9154.5,
+              "renderState": {
+                "rendererMode": "dom",
+                "cullingMode": "on",
+                "totalNodeCount": 10000,
+                "renderedNodeCount": 6262,
+                "leaferExpectedChildren": 0,
+                "leaferChildren": 0,
+                "leaferPixelNonEmpty": false,
+                "leaferPixelSampleCount": 0,
+                "leaferSyncVersion": 0,
+                "leaferPanCacheEnabled": false,
+                "leaferPanCacheFrozen": false,
+                "leaferPanCacheCaptures": 0,
+                "leaferPanCacheLastDx": 0,
+                "leaferPanCacheLastDy": 0,
+                "pixiExpectedChildren": 0,
+                "pixiChildren": 0,
+                "pixiPixelNonEmpty": false,
+                "pixiPixelSampleCount": 0,
+                "pixiSyncVersion": 0,
+                "pixiTextStrategy": "bitmap",
+                "pixiTexturePoolSize": 0,
+                "virtualizeMode": "on",
+                "virtualizeActive": true,
+                "virtualizePending": false,
+                "virtualizeTargetNodeCount": 6262,
+                "virtualizeMaterializedNodeCount": 6262,
+                "virtualizeOverscanPx": 0,
+                "virtualizeBatchRuns": 1,
+                "virtualizeReconcileVersion": 1,
+                "viewportScale": 0.08,
+                "domPixelNonEmpty": true,
+                "domPixelSampleCount": 72
+              },
+              "afterPanRenderState": {
+                "rendererMode": "dom",
+                "cullingMode": "on",
+                "totalNodeCount": 10000,
+                "renderedNodeCount": 5809,
+                "leaferExpectedChildren": 0,
+                "leaferChildren": 0,
+                "leaferPixelNonEmpty": false,
+                "leaferPixelSampleCount": 0,
+                "leaferSyncVersion": 0,
+                "leaferPanCacheEnabled": false,
+                "leaferPanCacheFrozen": false,
+                "leaferPanCacheCaptures": 0,
+                "leaferPanCacheLastDx": 0,
+                "leaferPanCacheLastDy": 0,
+                "pixiExpectedChildren": 0,
+                "pixiChildren": 0,
+                "pixiPixelNonEmpty": false,
+                "pixiPixelSampleCount": 0,
+                "pixiSyncVersion": 0,
+                "pixiTextStrategy": "bitmap",
+                "pixiTexturePoolSize": 0,
+                "virtualizeMode": "on",
+                "virtualizeActive": true,
+                "virtualizePending": true,
+                "virtualizeTargetNodeCount": 5917,
+                "virtualizeMaterializedNodeCount": 5809,
+                "virtualizeOverscanPx": 0,
+                "virtualizeBatchRuns": 2,
+                "virtualizeReconcileVersion": 1,
+                "viewportScale": 0.08,
+                "domPixelNonEmpty": true,
+                "domPixelSampleCount": 72
+              },
+              "heap": {
+                "beforeMb": 22.433,
+                "afterRenderMb": 161.278,
+                "afterRunMb": 184.289,
+                "usedMb": 161.278,
+                "deltaMb": 138.845,
+                "runDeltaMb": 161.856
+              },
+              "actions": {
+                "loadFixture": {
+                  "durationMs": 2851.5,
+                  "frameCount": 77,
+                  "p50FrameMs": 8.3,
+                  "p95FrameMs": 9.1,
+                  "fpsAtP50": 120.48,
+                  "fpsAtP95": 109.89,
+                  "longTaskCount": 2,
+                  "longTaskTotalMs": 2420,
+                  "longTaskMaxMs": 1868
+                },
+                "render-sync": {
+                  "durationMs": 6303,
+                  "frameCount": 16,
+                  "p50FrameMs": 408.3,
+                  "p95FrameMs": 774.9,
+                  "fpsAtP50": 2.45,
+                  "fpsAtP95": 1.29,
+                  "longTaskCount": 24,
+                  "longTaskTotalMs": 6021,
+                  "longTaskMaxMs": 619
+                },
+                "canvas-pan": {
+                  "durationMs": 45339.2,
+                  "frameCount": 221,
+                  "p50FrameMs": 8.4,
+                  "p95FrameMs": 606.8,
+                  "fpsAtP50": 119.05,
+                  "fpsAtP95": 1.65,
+                  "longTaskCount": 75,
+                  "longTaskTotalMs": 44362,
+                  "longTaskMaxMs": 636
+                },
+                "canvas-zoom": {
+                  "durationMs": 2359.4,
+                  "frameCount": 77,
+                  "p50FrameMs": 8.4,
+                  "p95FrameMs": 75.8,
+                  "fpsAtP50": 119.05,
+                  "fpsAtP95": 13.19,
+                  "longTaskCount": 6,
+                  "longTaskTotalMs": 1443,
+                  "longTaskMaxMs": 428
+                }
+              },
+              "trace": {
+                "loadFixture": {
+                  "eventCount": 1,
+                  "markNamesSeen": [
+                    "loadFixture"
+                  ]
+                },
+                "render-sync": {
+                  "eventCount": 1,
+                  "markNamesSeen": [
+                    "render-sync"
+                  ]
+                },
+                "canvas-pan": {
+                  "eventCount": 1,
+                  "markNamesSeen": [
+                    "canvas-pan"
+                  ]
+                },
+                "canvas-zoom": {
+                  "eventCount": 1,
+                  "markNamesSeen": [
+                    "canvas-zoom"
+                  ]
+                }
+              },
+              "overall": {
+                "p50FrameMs": 8.4,
+                "p95FrameMs": 606.8,
+                "longTaskCount": 81,
+                "longTaskTotalMs": 45805
+              }
+            },
+            {
+              "runIndex": 2,
+              "browser": {
+                "chromiumVersion": "149.0.7827.55",
+                "viewport": {
+                  "width": 1920,
+                  "height": 1080
+                },
+                "dpr": 1
+              },
+              "renderer": {
+                "requested": "dom",
+                "actual": "dom",
+                "cullingRequested": "on",
+                "cullingActual": "on",
+                "panCacheRequested": "off",
+                "panCacheActual": "off",
+                "virtualizeRequested": "on",
+                "virtualizeActual": "on",
+                "pixiTextStrategy": "bitmap",
+                "pixiTexturePoolSize": 0
+              },
+              "fixture": {
+                "sceneId": "bench-dom-mixed-10000",
+                "nodeCount": 10000,
+                "seed": 20260704,
+                "profile": "mixed",
+                "counts": {
+                  "image": 5800,
+                  "text": 2200,
+                  "frame": 800,
+                  "connector": 1200
+                }
+              },
+              "loadFixtureMs": 2856.4,
+              "renderSyncMs": 6012.7,
+              "storeToRendererSyncMs": 8869.1,
+              "renderState": {
+                "rendererMode": "dom",
+                "cullingMode": "on",
+                "totalNodeCount": 10000,
+                "renderedNodeCount": 6262,
+                "leaferExpectedChildren": 0,
+                "leaferChildren": 0,
+                "leaferPixelNonEmpty": false,
+                "leaferPixelSampleCount": 0,
+                "leaferSyncVersion": 0,
+                "leaferPanCacheEnabled": false,
+                "leaferPanCacheFrozen": false,
+                "leaferPanCacheCaptures": 0,
+                "leaferPanCacheLastDx": 0,
+                "leaferPanCacheLastDy": 0,
+                "pixiExpectedChildren": 0,
+                "pixiChildren": 0,
+                "pixiPixelNonEmpty": false,
+                "pixiPixelSampleCount": 0,
+                "pixiSyncVersion": 0,
+                "pixiTextStrategy": "bitmap",
+                "pixiTexturePoolSize": 0,
+                "virtualizeMode": "on",
+                "virtualizeActive": true,
+                "virtualizePending": false,
+                "virtualizeTargetNodeCount": 6262,
+                "virtualizeMaterializedNodeCount": 6262,
+                "virtualizeOverscanPx": 0,
+                "virtualizeBatchRuns": 1,
+                "virtualizeReconcileVersion": 1,
+                "viewportScale": 0.08,
+                "domPixelNonEmpty": true,
+                "domPixelSampleCount": 72
+              },
+              "afterPanRenderState": {
+                "rendererMode": "dom",
+                "cullingMode": "on",
+                "totalNodeCount": 10000,
+                "renderedNodeCount": 5809,
+                "leaferExpectedChildren": 0,
+                "leaferChildren": 0,
+                "leaferPixelNonEmpty": false,
+                "leaferPixelSampleCount": 0,
+                "leaferSyncVersion": 0,
+                "leaferPanCacheEnabled": false,
+                "leaferPanCacheFrozen": false,
+                "leaferPanCacheCaptures": 0,
+                "leaferPanCacheLastDx": 0,
+                "leaferPanCacheLastDy": 0,
+                "pixiExpectedChildren": 0,
+                "pixiChildren": 0,
+                "pixiPixelNonEmpty": false,
+                "pixiPixelSampleCount": 0,
+                "pixiSyncVersion": 0,
+                "pixiTextStrategy": "bitmap",
+                "pixiTexturePoolSize": 0,
+                "virtualizeMode": "on",
+                "virtualizeActive": true,
+                "virtualizePending": true,
+                "virtualizeTargetNodeCount": 5917,
+                "virtualizeMaterializedNodeCount": 5809,
+                "virtualizeOverscanPx": 0,
+                "virtualizeBatchRuns": 2,
+                "virtualizeReconcileVersion": 1,
+                "viewportScale": 0.08,
+                "domPixelNonEmpty": true,
+                "domPixelSampleCount": 72
+              },
+              "heap": {
+                "beforeMb": 22.474,
+                "afterRenderMb": 155.306,
+                "afterRunMb": 185.578,
+                "usedMb": 155.306,
+                "deltaMb": 132.832,
+                "runDeltaMb": 163.104
+              },
+              "actions": {
+                "loadFixture": {
+                  "durationMs": 2856.4,
+                  "frameCount": 74,
+                  "p50FrameMs": 8.3,
+                  "p95FrameMs": 9.2,
+                  "fpsAtP50": 120.48,
+                  "fpsAtP95": 108.7,
+                  "longTaskCount": 2,
+                  "longTaskTotalMs": 2446,
+                  "longTaskMaxMs": 1891
+                },
+                "render-sync": {
+                  "durationMs": 6012.7,
+                  "frameCount": 16,
+                  "p50FrameMs": 424.5,
+                  "p95FrameMs": 841.8,
+                  "fpsAtP50": 2.36,
+                  "fpsAtP95": 1.19,
+                  "longTaskCount": 24,
+                  "longTaskTotalMs": 5990,
+                  "longTaskMaxMs": 622
+                },
+                "canvas-pan": {
+                  "durationMs": 45383.8,
+                  "frameCount": 223,
+                  "p50FrameMs": 8.3,
+                  "p95FrameMs": 605.5,
+                  "fpsAtP50": 120.48,
+                  "fpsAtP95": 1.65,
+                  "longTaskCount": 75,
+                  "longTaskTotalMs": 44535,
+                  "longTaskMaxMs": 632
+                },
+                "canvas-zoom": {
+                  "durationMs": 2456.8,
+                  "frameCount": 85,
+                  "p50FrameMs": 8.4,
+                  "p95FrameMs": 49.9,
+                  "fpsAtP50": 119.05,
+                  "fpsAtP95": 20.04,
+                  "longTaskCount": 6,
+                  "longTaskTotalMs": 1457,
+                  "longTaskMaxMs": 439
+                }
+              },
+              "trace": {
+                "loadFixture": {
+                  "eventCount": 1,
+                  "markNamesSeen": [
+                    "loadFixture"
+                  ]
+                },
+                "render-sync": {
+                  "eventCount": 1,
+                  "markNamesSeen": [
+                    "render-sync"
+                  ]
+                },
+                "canvas-pan": {
+                  "eventCount": 1,
+                  "markNamesSeen": [
+                    "canvas-pan"
+                  ]
+                },
+                "canvas-zoom": {
+                  "eventCount": 1,
+                  "markNamesSeen": [
+                    "canvas-zoom"
+                  ]
+                }
+              },
+              "overall": {
+                "p50FrameMs": 8.4,
+                "p95FrameMs": 605.5,
+                "longTaskCount": 81,
+                "longTaskTotalMs": 45992
+              }
+            },
+            {
+              "runIndex": 3,
+              "browser": {
+                "chromiumVersion": "149.0.7827.55",
+                "viewport": {
+                  "width": 1920,
+                  "height": 1080
+                },
+                "dpr": 1
+              },
+              "renderer": {
+                "requested": "dom",
+                "actual": "dom",
+                "cullingRequested": "on",
+                "cullingActual": "on",
+                "panCacheRequested": "off",
+                "panCacheActual": "off",
+                "virtualizeRequested": "on",
+                "virtualizeActual": "on",
+                "pixiTextStrategy": "bitmap",
+                "pixiTexturePoolSize": 0
+              },
+              "fixture": {
+                "sceneId": "bench-dom-mixed-10000",
+                "nodeCount": 10000,
+                "seed": 20260704,
+                "profile": "mixed",
+                "counts": {
+                  "image": 5800,
+                  "text": 2200,
+                  "frame": 800,
+                  "connector": 1200
+                }
+              },
+              "loadFixtureMs": 2858,
+              "renderSyncMs": 5914.1,
+              "storeToRendererSyncMs": 8772.1,
+              "renderState": {
+                "rendererMode": "dom",
+                "cullingMode": "on",
+                "totalNodeCount": 10000,
+                "renderedNodeCount": 6262,
+                "leaferExpectedChildren": 0,
+                "leaferChildren": 0,
+                "leaferPixelNonEmpty": false,
+                "leaferPixelSampleCount": 0,
+                "leaferSyncVersion": 0,
+                "leaferPanCacheEnabled": false,
+                "leaferPanCacheFrozen": false,
+                "leaferPanCacheCaptures": 0,
+                "leaferPanCacheLastDx": 0,
+                "leaferPanCacheLastDy": 0,
+                "pixiExpectedChildren": 0,
+                "pixiChildren": 0,
+                "pixiPixelNonEmpty": false,
+                "pixiPixelSampleCount": 0,
+                "pixiSyncVersion": 0,
+                "pixiTextStrategy": "bitmap",
+                "pixiTexturePoolSize": 0,
+                "virtualizeMode": "on",
+                "virtualizeActive": true,
+                "virtualizePending": false,
+                "virtualizeTargetNodeCount": 6262,
+                "virtualizeMaterializedNodeCount": 6262,
+                "virtualizeOverscanPx": 0,
+                "virtualizeBatchRuns": 1,
+                "virtualizeReconcileVersion": 1,
+                "viewportScale": 0.08,
+                "domPixelNonEmpty": true,
+                "domPixelSampleCount": 72
+              },
+              "afterPanRenderState": {
+                "rendererMode": "dom",
+                "cullingMode": "on",
+                "totalNodeCount": 10000,
+                "renderedNodeCount": 5809,
+                "leaferExpectedChildren": 0,
+                "leaferChildren": 0,
+                "leaferPixelNonEmpty": false,
+                "leaferPixelSampleCount": 0,
+                "leaferSyncVersion": 0,
+                "leaferPanCacheEnabled": false,
+                "leaferPanCacheFrozen": false,
+                "leaferPanCacheCaptures": 0,
+                "leaferPanCacheLastDx": 0,
+                "leaferPanCacheLastDy": 0,
+                "pixiExpectedChildren": 0,
+                "pixiChildren": 0,
+                "pixiPixelNonEmpty": false,
+                "pixiPixelSampleCount": 0,
+                "pixiSyncVersion": 0,
+                "pixiTextStrategy": "bitmap",
+                "pixiTexturePoolSize": 0,
+                "virtualizeMode": "on",
+                "virtualizeActive": true,
+                "virtualizePending": true,
+                "virtualizeTargetNodeCount": 5917,
+                "virtualizeMaterializedNodeCount": 5809,
+                "virtualizeOverscanPx": 0,
+                "virtualizeBatchRuns": 2,
+                "virtualizeReconcileVersion": 1,
+                "viewportScale": 0.08,
+                "domPixelNonEmpty": true,
+                "domPixelSampleCount": 72
+              },
+              "heap": {
+                "beforeMb": 22.451,
+                "afterRenderMb": 146.346,
+                "afterRunMb": 181.976,
+                "usedMb": 146.346,
+                "deltaMb": 123.895,
+                "runDeltaMb": 159.524
+              },
+              "actions": {
+                "loadFixture": {
+                  "durationMs": 2858,
+                  "frameCount": 74,
+                  "p50FrameMs": 8.3,
+                  "p95FrameMs": 9.3,
+                  "fpsAtP50": 120.48,
+                  "fpsAtP95": 107.53,
+                  "longTaskCount": 2,
+                  "longTaskTotalMs": 2462,
+                  "longTaskMaxMs": 1886
+                },
+                "render-sync": {
+                  "durationMs": 5914.1,
+                  "frameCount": 15,
+                  "p50FrameMs": 432.9,
+                  "p95FrameMs": 834.2,
+                  "fpsAtP50": 2.31,
+                  "fpsAtP95": 1.2,
+                  "longTaskCount": 24,
+                  "longTaskTotalMs": 5913,
+                  "longTaskMaxMs": 619
+                },
+                "canvas-pan": {
+                  "durationMs": 45472.5,
+                  "frameCount": 210,
+                  "p50FrameMs": 8.4,
+                  "p95FrameMs": 608.9,
+                  "fpsAtP50": 119.05,
+                  "fpsAtP95": 1.64,
+                  "longTaskCount": 75,
+                  "longTaskTotalMs": 44640,
+                  "longTaskMaxMs": 633
+                },
+                "canvas-zoom": {
+                  "durationMs": 2377.2,
+                  "frameCount": 82,
+                  "p50FrameMs": 8.4,
+                  "p95FrameMs": 50.1,
+                  "fpsAtP50": 119.05,
+                  "fpsAtP95": 19.96,
+                  "longTaskCount": 6,
+                  "longTaskTotalMs": 1429,
+                  "longTaskMaxMs": 431
+                }
+              },
+              "trace": {
+                "loadFixture": {
+                  "eventCount": 1,
+                  "markNamesSeen": [
+                    "loadFixture"
+                  ]
+                },
+                "render-sync": {
+                  "eventCount": 1,
+                  "markNamesSeen": [
+                    "render-sync"
+                  ]
+                },
+                "canvas-pan": {
+                  "eventCount": 1,
+                  "markNamesSeen": [
+                    "canvas-pan"
+                  ]
+                },
+                "canvas-zoom": {
+                  "eventCount": 1,
+                  "markNamesSeen": [
+                    "canvas-zoom"
+                  ]
+                }
+              },
+              "overall": {
+                "p50FrameMs": 8.4,
+                "p95FrameMs": 608.9,
+                "longTaskCount": 81,
+                "longTaskTotalMs": 46069
+              }
+            }
+          ]
+        }
+      ],
+      "gate": {
+        "thresholdMs": 33,
+        "dprP95FrameMs": [
+          {
+            "dpr": 1,
+            "p95FrameMs": 606.8,
+            "loadFixtureMs": 2856.4,
+            "renderSyncMs": 6012.7,
+            "rendererMode": "dom",
+            "cullingMode": "on",
+            "virtualizeMode": "on",
+            "virtualizeActive": true,
+            "virtualizeTargetNodeCount": 6262,
+            "virtualizeMaterializedNodeCount": 6262,
+            "virtualizeOverscanPx": 0,
+            "domPixelNonEmpty": true,
+            "domPixelSampleCount": 72,
+            "renderedNodeCount": 6262,
+            "leaferExpectedChildren": 0,
+            "leaferChildren": 0,
+            "leaferPixelNonEmpty": false,
+            "leaferPanCacheEnabled": false,
+            "leaferPanCacheCaptures": 0,
+            "pixiExpectedChildren": 0,
+            "pixiChildren": 0,
+            "pixiPixelNonEmpty": false,
+            "pixiTextStrategy": "bitmap",
+            "totalNodeCount": 10000
+          }
+        ],
+        "worstP95FrameMs": 606.8,
+        "status": "final",
+        "note": "Phase 0e DOM virtualization final matrix"
+      }
+    }
+  ]
+}

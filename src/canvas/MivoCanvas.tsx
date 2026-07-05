@@ -36,6 +36,7 @@ import { useMaskPointArmed, type MaskPointArmedInteractionApi } from './useMaskP
 import { lockedNodeIdSetFor } from './useNodeTransform'
 import { rendererMode } from '../render/rendererMode'
 import { cullingMode } from '../render/cullingMode'
+import { useCanvasVirtualization } from './useCanvasVirtualization'
 
 type ContextMenuState = {
   kind: 'node' | 'blank'
@@ -57,15 +58,6 @@ type MivoCanvasProps = {
 }
 
 export type ExternalAssetDropHandler = (dataTransfer: DataTransfer, clientX: number, clientY: number) => boolean
-
-const canvasRenderOverscanPx = 520
-
-// C05: closed-interval (>=) intersection — culling over-renders to avoid border popping.
-// Disambiguates from canvasInteraction.rectsIntersect (open-interval, selection-semantics).
-const rectsIntersectInclusive = (
-  a: { x: number; y: number; width: number; height: number },
-  b: { x: number; y: number; width: number; height: number },
-) => a.x + a.width >= b.x && b.x + b.width >= a.x && a.y + a.height >= b.y && b.y + b.height >= a.y
 
 const canImportDataTransfer = (dataTransfer: DataTransfer) =>
   Array.from(dataTransfer.files).some(canImportCanvasFile) ||
@@ -202,36 +194,10 @@ export function MivoCanvas({
     [viewport.scale, viewport.x, viewport.y],
   )
 
-  const canvasRenderedNodes = useMemo(() => {
-    if (cullingMode === 'off' || !shellSize.width || !shellSize.height) {
-      return visibleNodes
-    }
-    const viewportRect = {
-      x: (-viewport.x - canvasRenderOverscanPx) / viewport.scale,
-      y: (-viewport.y - canvasRenderOverscanPx) / viewport.scale,
-      width: (shellSize.width + canvasRenderOverscanPx * 2) / viewport.scale,
-      height: (shellSize.height + canvasRenderOverscanPx * 2) / viewport.scale,
-    }
-    const pinnedNodeIds = new Set(selectedNodeIds)
-    if (selectedNodeId) pinnedNodeIds.add(selectedNodeId)
-    if (cropNodeId) pinnedNodeIds.add(cropNodeId)
-    if (maskEditNodeId) pinnedNodeIds.add(maskEditNodeId)
-    if (contextMenuNodeId) pinnedNodeIds.add(contextMenuNodeId)
-
-    return visibleNodes.filter((node) => pinnedNodeIds.has(node.id) || rectsIntersectInclusive(node, viewportRect))
-  }, [
-    contextMenuNodeId,
-    cropNodeId,
-    maskEditNodeId,
-    selectedNodeId,
-    selectedNodeIds,
-    shellSize.height,
-    shellSize.width,
-    viewport.scale,
-    viewport.x,
-    viewport.y,
-    visibleNodes,
-  ])
+  const { nodes: canvasRenderedNodes, stats: virtualizationStats } = useCanvasVirtualization({
+    cullingMode, visibleNodes, shellSize, viewport, selectedNodeId, selectedNodeIds,
+    cropNodeId, maskEditNodeId, contextMenuNodeId,
+  })
   const pixiSpikeStats = usePixiSpikeRenderer({ hostRef, viewport, nodes: visibleNodes, rendererMode }), effectiveRendererMode = pixiSpikeStats.fallbackToDom ? 'dom' : rendererMode
   const renderedNodes = useMemo(() => filterDomNodesForRendererSpike(canvasRenderedNodes, effectiveRendererMode), [canvasRenderedNodes, effectiveRendererMode])
 
@@ -476,6 +442,8 @@ export function MivoCanvas({
       data-viewport-scale={viewport.scale} data-viewport-x={viewport.x} data-viewport-y={viewport.y}
       data-rendered-node-count={renderedNodes.length}
       data-total-node-count={visibleNodes.length}
+      data-virtualize-mode={virtualizationStats.mode} data-virtualize-active={virtualizationStats.active ? 'true' : 'false'} data-virtualize-pending={virtualizationStats.pending ? 'true' : 'false'} data-virtualize-target-node-count={virtualizationStats.targetNodeCount} data-virtualize-materialized-node-count={virtualizationStats.materializedNodeCount} data-virtualize-overscan-px={virtualizationStats.overscanPx}
+      data-virtualize-batch-runs={virtualizationStats.batchRuns} data-virtualize-reconcile-version={virtualizationStats.reconcileVersion}
       data-leafer-expected-children={leaferSpikeStats.expectedChildren}
       data-leafer-children={leaferSpikeStats.children}
       data-leafer-pixel-nonempty={leaferSpikeStats.pixelNonEmpty ? 'true' : 'false'}

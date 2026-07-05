@@ -2995,6 +2995,10 @@ button:disabled {
   touch-action: none;
 }
 
+.canvas-shell[data-virtualize-active="true"] .dom-canvas-layer {
+  will-change: transform;
+}
+
 .canvas-shell.tool-hand .dom-canvas-layer {
   cursor: grab;
 }
