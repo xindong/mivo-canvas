@@ -7,6 +7,8 @@ import { runChatGenerationScenario } from './chat-generation.mjs'
 import { runCoordinateProbeScenario } from './coordinate-probe.mjs'
 import { runDebugScenario } from './debug.mjs'
 import { runMaskScenario } from './mask.mjs'
+import { runMaskConcurrentScenario } from './mask-concurrent.mjs'
+import { runMaskCrossSceneScenario } from './mask-cross-scene.mjs'
 import { runMaskPointScenario } from './mask-point.mjs'
 import { runMigrationScenario } from './migration.mjs'
 import { runShellSidebarScenario } from './shell-sidebar.mjs'
@@ -27,6 +29,8 @@ export const scenarioOrder = [
   'ai-slot-placeholder',
   'mask-reflow',
   'mask-point',
+  'mask-cross-scene',
+  'mask-concurrent',
   'coordinate-probe',
 ]
 
@@ -47,6 +51,8 @@ export const scenarioRunners = {
   'coordinate-probe': runCoordinateProbeScenario,
   debug: runDebugScenario,
   mask: runMaskScenario,
+  'mask-concurrent': runMaskConcurrentScenario,
+  'mask-cross-scene': runMaskCrossSceneScenario,
   'mask-point': runMaskPointScenario,
   migration: runMigrationScenario,
   'shell-sidebar': runShellSidebarScenario,
