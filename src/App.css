@@ -7420,7 +7420,7 @@ button:disabled {
   box-sizing: border-box;
 }
 
-.chat-composer-input-shell:focus-within {
+.mivo-app .chat-composer-input-shell:focus-within {
   border-color: var(--ink);
 }
 
