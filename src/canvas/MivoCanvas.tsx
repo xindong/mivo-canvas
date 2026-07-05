@@ -20,7 +20,7 @@ import { brushCursorCssFor } from './brushCursors'
 import { brushOutlinePathFor, highlighterOpacity } from './brushGeometry'
 import { BrushOptionsBar } from './BrushOptionsBar'
 import { CanvasContextMenu } from './CanvasContextMenu'
-import { CanvasNodeView } from './CanvasNodeView'
+import { DomRenderer } from '../render/DomRenderer'
 import { CanvasToolDock } from './CanvasToolDock'
 import { AnchorOverlay } from './AnchorOverlay'
 import { ImageCropOverlay, type ImageCropBox } from './ImageCropOverlay'
@@ -597,44 +597,39 @@ export function MivoCanvas({
             ) : null}
           </div>
         ) : null}
-        {renderedNodes.map((node) => {
-          const selected = selectedNodeIds.includes(node.id)
-
-          return (
-            <CanvasNodeView
-              key={node.id}
-              node={node}
-              selected={selected}
-              selectionPreview={selectionPreviewSet.has(node.id)}
-              sectionDropTarget={node.id === activeSectionDropTargetId}
-              connectorDropTarget={node.id === activeConnectorDropTargetId}
-              editing={editingTextNodeId === node.id}
-              primarySelected={
-                interactionMode === 'select' &&
-                selectedNodeIds.length === 1 &&
-                node.id === selectedNodeId &&
-                node.id !== cropNodeId
-              }
-              effectiveLocked={lockedNodeIds.has(node.id)}
-              handleSize={handleSize}
-              handleBorderWidth={handleBorderWidth}
-              selectionStrokeWidth={selectionStrokeWidth}
-              maskEditActive={node.id === maskEditNodeId}
-              maskEditSubmitting={node.id === maskEditSubmittingNodeId}
-              initialMaskClientPoint={initialClientPoint?.nodeId === node.id ? initialClientPoint : undefined}
-              viewportScale={viewport.scale}
-              onResizeHandlePointerDown={beginNodeResize}
-              onMarkupPointPointerDown={beginMarkupPointMove}
-              onTextResizeHandlePointerDown={beginTextResize}
-              onUpdateText={updateEditingText}
-              onFinishTextEdit={finishTextEditing}
-              onResizeNodeToContent={updateNodeMeasuredSize}
-              onSubmitMaskEdit={submitMaskEdit}
-              onCancelMaskEdit={cancelMaskEdit}
-              onInitialMaskClientPointHandled={handleInitialClientPointHandled}
-            />
-          )
-        })}
+        <DomRenderer
+          renderedNodes={renderedNodes}
+          getNodeViewProps={(node) => ({
+            node,
+            selected: selectedNodeIds.includes(node.id),
+            selectionPreview: selectionPreviewSet.has(node.id),
+            sectionDropTarget: node.id === activeSectionDropTargetId,
+            connectorDropTarget: node.id === activeConnectorDropTargetId,
+            editing: editingTextNodeId === node.id,
+            primarySelected:
+              interactionMode === 'select' &&
+              selectedNodeIds.length === 1 &&
+              node.id === selectedNodeId &&
+              node.id !== cropNodeId,
+            effectiveLocked: lockedNodeIds.has(node.id),
+            handleSize,
+            handleBorderWidth,
+            selectionStrokeWidth,
+            maskEditActive: node.id === maskEditNodeId,
+            maskEditSubmitting: node.id === maskEditSubmittingNodeId,
+            initialMaskClientPoint: initialClientPoint?.nodeId === node.id ? initialClientPoint : undefined,
+            viewportScale: viewport.scale,
+            onResizeHandlePointerDown: beginNodeResize,
+            onMarkupPointPointerDown: beginMarkupPointMove,
+            onTextResizeHandlePointerDown: beginTextResize,
+            onUpdateText: updateEditingText,
+            onFinishTextEdit: finishTextEditing,
+            onResizeNodeToContent: updateNodeMeasuredSize,
+            onSubmitMaskEdit: submitMaskEdit,
+            onCancelMaskEdit: cancelMaskEdit,
+            onInitialMaskClientPointHandled: handleInitialClientPointHandled,
+          })}
+        />
         {stampPlacementPreview ? (
           <div
             className="stamp-placement-preview"

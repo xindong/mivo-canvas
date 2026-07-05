@@ -216,15 +216,25 @@ export const pointInAnchor = (anchor: RenderAnchor, point: CanvasPoint, radius: 
 
 // --- z-order -----------------------------------------------------------------
 
-// Default back-to-front comparator: frame < content < selected. P3-0b may replace
-// with a richer comparator (e.g. explicit DOM order / Layer assignment).
+// Default back-to-front comparator (P3-0b, 4 levels — single source: the
+// projection's layer/renderOrder/surface defaults in projectNode):
+//   1. layer       — Frame(0) < Content(10) < SelectedElevated(20) < Preview(30)
+//                    < Handles(40) < FloatingUI(50) < EditOverlay(60)
+//   2. renderOrder — within-layer stable order (bring-to-front without leaving
+//                    the layer; default 0)
+//   3. selected    — a selected node lifts above an unselected one inside the
+//                    same layer+renderOrder (mirrors the legacy DOM-order lift)
+//   4. surface     — 'overlay' > 'canvas' (anchor marks / edit-state overlays paint
+//                    above canvas-surface siblings in the same layer)
+// Stable: Array.prototype.sort is stable in V8, so equal comparands keep input order.
 export const defaultZOrderCompare = (a: RenderNode, b: RenderNode): number => {
-  const rank = (n: RenderNode): number => {
-    if (n.type === 'frame') return 0 // Frame layer (bottom)
-    if (n.selected) return 2 // SelectedElevated
-    return 1 // Content
-  }
-  return rank(a) - rank(b)
+  if (a.layer !== b.layer) return a.layer - b.layer
+  if (a.renderOrder !== b.renderOrder) return a.renderOrder - b.renderOrder
+  const selRank = (n: RenderNode): number => (n.selected ? 1 : 0)
+  const selDiff = selRank(a) - selRank(b)
+  if (selDiff !== 0) return selDiff
+  const surfRank = (n: RenderNode): number => (n.surface === 'overlay' ? 1 : 0)
+  return surfRank(a) - surfRank(b)
 }
 
 /** Return a back-to-front copy using defaultZOrderCompare (stable). */
