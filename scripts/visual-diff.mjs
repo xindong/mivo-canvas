@@ -21,6 +21,9 @@ import { projectRoot } from './bench/fixture-lib.mjs'
  *   node scripts/visual-diff.mjs --candidate=leafer      # DOM baseline vs leafer candidate（占位）
  *   node scripts/visual-diff.mjs --dpr=2                 # 固定 DPR=2
  *   node scripts/visual-diff.mjs --port=4180             # 自定义 dev 端口
+ *   node scripts/visual-diff.mjs --candidate=leafer --fixture=rotation
+ *       # FU-8 旋转对照：注入旋转 image/rect/ellipse/note/line/arrow + connector
+ *       # 固定文档（bench 同款 replaceSnapshot 注入），DOM vs Leafer 像素对照
  */
 
 const DEFAULT_PORT = 4179
@@ -41,10 +44,12 @@ const parseArgs = (argv) => {
     port: DEFAULT_PORT,
     headless: true,
     outputDir: 'test-artifacts/visual-diff',
+    fixture: null,
   }
   for (const entry of argv) {
     if (entry.startsWith('--baseline=')) options.baseline = entry.slice('--baseline='.length) || 'dom'
     else if (entry.startsWith('--candidate=')) options.candidate = entry.slice('--candidate='.length) || 'dom'
+    else if (entry.startsWith('--fixture=')) options.fixture = entry.slice('--fixture='.length) || null
     else if (entry.startsWith('--dpr=')) {
       const dpr = Number.parseInt(entry.slice('--dpr='.length), 10)
       if (Number.isFinite(dpr) && dpr > 0) options.dpr = dpr
@@ -114,14 +119,64 @@ const startDevServer = async (port) => {
   }
 }
 
-const captureScreenshot = async ({ browser, port, renderer, dpr, label }) => {
+/**
+ * FU-8 / Phase 4b 旋转对照 fixture：旋转 image / rect / ellipse / note / dashed
+ * line / 双头 arrow + 一对 connector 绑定节点。rotation 走 V2 transform（store
+ * normalize 保留）；connector 的 markupPoints 由 replaceSnapshot 内的
+ * normalizeCanvasGraph 归一化 —— DOM 与 Leafer 消费同一份归一化输出。
+ * 坐标按默认 viewport (420,240,scale 1) 全部落在 1920×1080 视口内。
+ */
+const rotationFixtureNodes = () => {
+  const node = (props) => ({ status: 'ready', title: props.id, ...props })
+  const rotated = (props, rotation) => ({
+    ...node(props),
+    transform: { x: props.x, y: props.y, width: props.width, height: props.height, rotation },
+  })
+  return [
+    rotated({ id: 'rot-image', type: 'image', x: 40, y: 40, width: 216, height: 384, assetUrl: '/demo-assets/courage-1.jpg' }, 30),
+    rotated({ id: 'rot-rect', type: 'markup', markupKind: 'rect', x: 340, y: 60, width: 160, height: 120, markupFillColor: '#ffeecc', markupStrokeColor: '#112233', markupStrokeWidth: 4 }, 45),
+    rotated({ id: 'rot-ellipse', type: 'markup', markupKind: 'ellipse', x: 560, y: 60, width: 160, height: 120 }, 20),
+    rotated({ id: 'rot-note', type: 'markup', markupKind: 'note', x: 780, y: 80, width: 140, height: 140 }, -15),
+    rotated({ id: 'rot-line', type: 'markup', markupKind: 'line', x: 340, y: 260, width: 220, height: 120, markupStrokeWidth: 4, markupStrokeStyle: 'dashed', markupPoints: [{ x: 10, y: 110 }, { x: 210, y: 10 }] }, 25),
+    node({ id: 'flat-arrow', type: 'markup', markupKind: 'arrow', x: 620, y: 260, width: 240, height: 140, markupStrokeWidth: 3, markupOpacity: 0.82, markupStartArrow: true, markupPoints: [{ x: 10, y: 10 }, { x: 230, y: 130 }] }),
+    node({ id: 'conn-a', type: 'markup', markupKind: 'rect', x: 40, y: 520, width: 120, height: 90 }),
+    node({ id: 'conn-b', type: 'markup', markupKind: 'rect', x: 400, y: 620, width: 120, height: 90 }),
+    node({
+      id: 'conn-arrow',
+      type: 'markup',
+      markupKind: 'arrow',
+      x: 160,
+      y: 560,
+      width: 240,
+      height: 100,
+      markupPoints: [{ x: 0, y: 0 }, { x: 240, y: 100 }],
+      connectorStart: { nodeId: 'conn-a', anchor: 'right', offset: 0.5 },
+      connectorEnd: { nodeId: 'conn-b', anchor: 'left', offset: 0.5 },
+    }),
+  ]
+}
+
+const fixtureNodesFor = (fixture) => {
+  if (!fixture) return null
+  if (fixture === 'rotation') return rotationFixtureNodes()
+  throw new Error(`Unknown --fixture value: ${fixture}`)
+}
+
+const captureScreenshot = async ({ browser, port, renderer, dpr, label, fixture }) => {
   const context = await browser.newContext({
     viewport: { width: 1920, height: 1080 },
     deviceScaleFactor: dpr,
     colorScheme: 'light',
   })
+  const fixtureNodes = fixtureNodesFor(fixture)
   const page = await context.newPage()
   await page.emulateMedia({ reducedMotion: 'reduce' })
+  if (fixtureNodes) {
+    // bench 同款：注入文档不写 IDB（persistIdbStorage 读此 flag），两次采集互不污染。
+    await page.addInitScript(() => {
+      globalThis.__MIVO_BENCH_PERSIST_SKIP__ = true
+    })
+  }
   await page.goto(`http://127.0.0.1:${port}/?renderer=${encodeURIComponent(renderer)}`, { waitUntil: 'networkidle' })
   await page.addStyleTag({
     content: [
@@ -132,7 +187,41 @@ const captureScreenshot = async ({ browser, port, renderer, dpr, label }) => {
   await page.evaluate(() => window.localStorage.clear())
   await page.goto(`http://127.0.0.1:${port}/?renderer=${encodeURIComponent(renderer)}`, { waitUntil: 'networkidle' })
   await page.waitForSelector('.canvas-shell')
-  if (renderer === 'leafer') {
+  if (fixtureNodes) {
+    // 注入固定文档（replaceSnapshot 内部跑 normalizeCanvasGraph → connector
+    // markupPoints 归一化，DOM/Leafer 消费同一输出）。
+    await page.evaluate(async (nodes) => {
+      const { useCanvasStore } = await import('/src/store/canvasStore.ts')
+      const snapshot = useCanvasStore.getState().getSnapshot()
+      useCanvasStore.getState().replaceSnapshot({
+        ...snapshot,
+        nodes,
+        edges: [],
+        tasks: [],
+        selectedNodeId: undefined,
+        selectedNodeIds: [],
+      })
+    }, fixtureNodes)
+    if (renderer === 'leafer') {
+      await page.waitForFunction(
+        (mode) => {
+          const shell = document.querySelector('.canvas-shell')
+          const expected = Number(shell?.getAttribute('data-leafer-expected-children') || 0)
+          const children = Number(shell?.getAttribute('data-leafer-children') || 0)
+          return shell?.getAttribute('data-renderer-mode') === mode &&
+            expected > 0 &&
+            children === expected &&
+            shell?.getAttribute('data-leafer-pixel-nonempty') === 'true'
+        },
+        'leafer',
+        { timeout: 15000 },
+      )
+    } else {
+      // dom 模式等注入的旋转图片位图落地（唯一的异步资源）。
+      await page.waitForSelector('.dom-node img[src="/demo-assets/courage-1.jpg"]')
+    }
+    await page.waitForTimeout(300)
+  } else if (renderer === 'leafer') {
     // leafer 模式 image/frame 由 Leafer 画，DOM 无 <img>；等 data-renderer-mode + paint 证据稳定
     await page.waitForFunction(
       (mode) => {
@@ -199,6 +288,7 @@ const main = async () => {
       renderer: options.baseline,
       dpr: options.dpr,
       label: 'baseline',
+      fixture: options.fixture,
     })
     const candidate = await captureScreenshot({
       browser,
@@ -206,13 +296,15 @@ const main = async () => {
       renderer: options.candidate,
       dpr: options.dpr,
       label: 'candidate',
+      fixture: options.fixture,
     })
 
     const diff = diffImages(baseline, candidate)
-    const baselinePath = `${options.outputDir}/baseline-${options.baseline}.png`
-    const candidatePath = `${options.outputDir}/candidate-${options.candidate}.png`
-    const diffPath = `${options.outputDir}/diff-${options.baseline}-vs-${options.candidate}.png`
-    const reportPath = `${options.outputDir}/diff-report.json`
+    const fixtureSuffix = options.fixture ? `-${options.fixture}` : ''
+    const baselinePath = `${options.outputDir}/baseline-${options.baseline}${fixtureSuffix}.png`
+    const candidatePath = `${options.outputDir}/candidate-${options.candidate}${fixtureSuffix}.png`
+    const diffPath = `${options.outputDir}/diff-${options.baseline}-vs-${options.candidate}${fixtureSuffix}.png`
+    const reportPath = `${options.outputDir}/diff-report${fixtureSuffix}.json`
 
     await writeFile(`${projectRoot}/${baselinePath}`, PNG.sync.write(baseline.png))
     await writeFile(`${projectRoot}/${candidatePath}`, PNG.sync.write(candidate.png))
@@ -231,11 +323,12 @@ const main = async () => {
           artifactPath: diffPath,
         },
         dpr: options.dpr,
+        fixture: options.fixture,
       }, null, 2)}\n`,
     )
 
     const status = diff.diffPercent <= DIFF_THRESHOLD_PERCENT ? 'PASS' : 'FAIL'
-    console.log(`[visual-diff] ${status} baseline=${options.baseline} candidate=${options.candidate} dpr=${options.dpr} diff=${diff.diffPercent}% (threshold ${DIFF_THRESHOLD_PERCENT}%)`)
+    console.log(`[visual-diff] ${status} baseline=${options.baseline} candidate=${options.candidate} dpr=${options.dpr}${options.fixture ? ` fixture=${options.fixture}` : ''} diff=${diff.diffPercent}% (threshold ${DIFF_THRESHOLD_PERCENT}%)`)
     console.log(`[visual-diff] baseline rendererMode=${baseline.renderState.rendererMode} candidate rendererMode=${candidate.renderState.rendererMode}`)
     console.log(`[visual-diff] artifacts: ${reportPath}, ${diffPath}`)
 

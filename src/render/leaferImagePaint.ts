@@ -85,6 +85,16 @@ export const SOURCE = 'Leafer Image'
 
 const clampDim = (value: number) => Math.max(1, value)
 
+/** FU-8: node rotation lives on the V2 transform (store nodes are normalized;
+ *  legacy-shaped nodes without transform → 0). DOM applies it as
+ *  `translate(x,y) rotate(θ)` with transformOrigin 50% 50%
+ *  (canvasRenderAdapter.nodeRenderBoxFor); Leafer equivalent is `rotation` +
+ *  `origin:'center'`. Applied to ALL kinds — the LOD rect must occupy the same
+ *  rotated footprint the HD bitmap resolves into; for 'image-crop' the rotation
+ *  sits on the outer Group so the crop child rotates with it (CSS container
+ *  rotation semantics). */
+const rotationOf = (node: MivoCanvasNode): number => node.transform?.rotation ?? 0
+
 /**
  * Crop child geometry mirroring the DOM CSS negative-offset technique
  * (CanvasNodeView imageCropStyle). The image is scaled so the crop region fills
@@ -132,6 +142,8 @@ const createObject = (node: MivoCanvasNode, kind: ImageEntryKind, zIndex?: numbe
   const width = clampDim(node.width)
   const height = clampDim(node.height)
   const zProps = zIndex !== undefined ? { zIndex } : {}
+  // FU-8: rotation always present (0 default) so rotate-then-reset clears.
+  const rotationProps = { rotation: rotationOf(node), origin: 'center' as const }
   if (kind === 'lod-rect') {
     return {
       object: new Rect({
@@ -141,6 +153,7 @@ const createObject = (node: MivoCanvasNode, kind: ImageEntryKind, zIndex?: numbe
         height,
         fill: engineLodFillFor(node),
         strokeWidth: 0,
+        ...rotationProps,
         ...zProps,
       }),
     }
@@ -151,14 +164,14 @@ const createObject = (node: MivoCanvasNode, kind: ImageEntryKind, zIndex?: numbe
       // Defensive: desiredKindFor only returns 'image-crop' when imageCrop exists,
       // but a stale kind on a node whose crop was just cleared falls back to plain
       // image geometry rather than crashing.
-      return { object: new Image({ x, y, width, height, ...zProps }) }
+      return { object: new Image({ x, y, width, height, ...rotationProps, ...zProps }) }
     }
-    const group = new Group({ x, y, width, height, overflow: 'hidden', ...zProps })
+    const group = new Group({ x, y, width, height, overflow: 'hidden', ...rotationProps, ...zProps })
     const child = new Image(cropChildLocal(width, height, crop))
     group.add(child)
     return { object: group, innerImage: child }
   }
-  return { object: new Image({ x, y, width, height, ...zProps }) }
+  return { object: new Image({ x, y, width, height, ...rotationProps, ...zProps }) }
 }
 
 const setProps = (object: ImageObject, props: Record<string, unknown>) => {
@@ -183,19 +196,21 @@ const updateGeometry = (entry: ImageEntry, node: MivoCanvasNode, zIndex?: number
   // zIndex rides along on update too: the document index can shift (node
   // inserted/removed elsewhere) without this node's own fields changing.
   const zProps = zIndex !== undefined ? { zIndex } : {}
+  // FU-8: rotation rides along on every update (0 default clears old angle).
+  const rotationProps = { rotation: rotationOf(node), origin: 'center' as const }
   if (entry.kind === 'lod-rect') {
-    setProps(entry.object, { x, y, width, height, fill: engineLodFillFor(node), ...zProps })
+    setProps(entry.object, { x, y, width, height, fill: engineLodFillFor(node), ...rotationProps, ...zProps })
     return
   }
   if (entry.kind === 'image-crop') {
-    setProps(entry.object, { x, y, width, height, ...zProps })
+    setProps(entry.object, { x, y, width, height, ...rotationProps, ...zProps })
     const crop = node.imageCrop
     if (crop && entry.innerImage) {
       setProps(entry.innerImage, cropChildLocal(width, height, crop))
     }
     return
   }
-  setProps(entry.object, { x, y, width, height, ...zProps })
+  setProps(entry.object, { x, y, width, height, ...rotationProps, ...zProps })
 }
 
 /**
