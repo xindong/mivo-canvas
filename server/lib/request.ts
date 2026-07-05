@@ -149,6 +149,8 @@ export const logTaskTerminal = (info: {
   promptLength?: number
   errorClass?: string
   httpStatus?: number
+  /** edit-timeout-batch: 分档后的上游超时（ms），据此定位撞线 case。 */
+  timeoutMs?: number
 }): void => {
   const parts = [
     '[mivo-bff-task]',
@@ -161,6 +163,7 @@ export const logTaskTerminal = (info: {
     info.imgRatio ? `imgRatio=${info.imgRatio}` : '',
     info.resolution ? `resolution=${info.resolution}` : '',
     info.pollDeadlineMs !== undefined ? `pollDeadlineMs=${info.pollDeadlineMs}` : '',
+    info.timeoutMs !== undefined ? `timeoutMs=${info.timeoutMs}` : '',
     info.platformJobIdHash ? `platformJobIdHash=${info.platformJobIdHash}` : '',
     `hasMask=${info.hasMask ? 'true' : 'false'}`,
     `hasReferences=${info.hasReferences ? 'true' : 'false'}`,
