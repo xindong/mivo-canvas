@@ -5,6 +5,7 @@ import type {
   CanvasId,
   MivoCanvasNode,
 } from '../types/mivoCanvas'
+import type { GenerationRatio } from '../types/generation'
 import { debugLogger } from './debugLogStore'
 
 type AiContextState = {
@@ -18,6 +19,20 @@ type AiContextState = {
 const derivationEdgeModel = 'Mivo Derivation Edge'
 
 export const AI_SLOT_GAP = 56
+
+/** ai-slot 占位符尺寸按本次请求比例计算(bug: 占位符恒 1:1,commitGenerationResult
+ *  的 replacingSlot 分支保留占位尺寸 → 宽幅结果被塞进方形框)。面积与 base(注册表
+ *  默认 320×320)保持一致,只变长宽比;'auto'/缺省/非法比例回退 base,1:1 不回归。 */
+export const slotSizeForRatio = (
+  base: { width: number; height: number },
+  ratio?: GenerationRatio | 'auto',
+): { width: number; height: number } => {
+  if (!ratio || ratio === 'auto' || ratio === '1:1') return base
+  const [ratioW, ratioH] = ratio.split(':').map(Number)
+  if (!Number.isFinite(ratioW) || !Number.isFinite(ratioH) || ratioW <= 0 || ratioH <= 0) return base
+  const width = Math.round(Math.sqrt((base.width * base.height * ratioW) / ratioH))
+  return { width, height: Math.round((width * ratioH) / ratioW) }
+}
 
 const rectsOverlap = (
   a: Pick<MivoCanvasNode, 'x' | 'y' | 'width' | 'height'>,
