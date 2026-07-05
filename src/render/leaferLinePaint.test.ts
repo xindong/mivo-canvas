@@ -51,6 +51,7 @@ import {
 } from './leaferLinePaint'
 import type { LeaferLinePaint } from './leaferLinePaint'
 import { isLeaferLinePaintedNode } from './leaferSpikeFilter'
+import { lineSegmentsWithLabelGap } from '../canvas/markupTextGeometry'
 import { projectNode } from './projection'
 import { markupPointsToCanvas } from './hitTest'
 import { normalizeConnectorMarkupNodes } from '../store/canvasDocumentModel'
@@ -474,5 +475,115 @@ describe('createLeaferLinePaint — D1 source-contract (pure paint, no Leafer ba
   it('module source never reads connector geometry from Leafer objects (consumes markupPoints only)', () => {
     // 反向依赖的常见形态：读取 Leafer 对象的 x/y/worldTransform 回写 store。
     expect(moduleSource).not.toMatch(/worldTransform|getBounds|__world/)
+  })
+})
+
+describe('FU-11 label 缺口 — 与 DOM lineSegmentsWithLabelGap 同源数学', () => {
+  const points = [
+    { x: 10, y: 20 },
+    { x: 190, y: 80 },
+  ]
+
+  it('无文字：单段整线，second 为 null', () => {
+    const props = linePaintPropsFor(projectNode(lineNode({ markupPoints: points })), undefined)
+    expect(props.second).toBeNull()
+    expect(props.main.points).toEqual([10, 20, 190, 80])
+  })
+
+  it('有文字：main/second 端点与共享几何输出逐值一致（估宽/缺口比例同源）', () => {
+    const n = lineNode({ markupPoints: points, text: 'Flow label' })
+    const props = linePaintPropsFor(projectNode(n), undefined)
+    const segments = lineSegmentsWithLabelGap(
+      { width: n.width, height: n.height, text: n.text, fontSize: n.fontSize },
+      points,
+      true,
+    )
+    expect(segments.length).toBe(2)
+    expect(props.main.points).toEqual([
+      segments[0].start.x,
+      segments[0].start.y,
+      segments[0].end.x,
+      segments[0].end.y,
+    ])
+    expect(props.second?.points).toEqual([
+      segments[1].start.x,
+      segments[1].start.y,
+      segments[1].end.x,
+      segments[1].end.y,
+    ])
+  })
+
+  it('编辑态（ctx.editingNodeId 命中）：空文字也断开——DOM 此刻渲染编辑器（lineLabelActive = editing || text）', () => {
+    const r = projectNode(lineNode({ markupPoints: points }))
+    expect(linePaintPropsFor(r, undefined, 'l1').second).not.toBeNull()
+    expect(linePaintPropsFor(r, undefined, 'other').second).toBeNull()
+  })
+
+  it('arrow + 文字：end head 仍锚在 p1；per-segment cap——前段 round（无 start arrow）、后段 butt（携带 end marker）', () => {
+    const props = linePaintPropsFor(projectNode(arrowNode({ markupPoints: points, text: 'Go' })), undefined)
+    expect(props.second).not.toBeNull()
+    expect(props.main.strokeCap).toBe('round')
+    expect(props.second?.strokeCap).toBe('butt')
+    expect(props.endHead).not.toBeNull()
+    const headPoints = props.endHead?.points as number[]
+    // chevron ref 锚在 p1 = (190, 80)：第 2 个顶点（索引 2,3）即锚点
+    expectClose(headPoints[2], 190)
+    expectClose(headPoints[3], 80)
+  })
+
+  it('FU-8 rotation × FU-11 gap：旋转后端点上按比例切分 == 未旋转切分后再旋转（刚体等价）', () => {
+    const n = lineNode({
+      markupPoints: points,
+      text: 'Rotated',
+      transform: { x: 40, y: 60, width: 200, height: 100, rotation: 30 },
+    })
+    const props = linePaintPropsFor(projectNode(n), undefined)
+    const rad = (30 * Math.PI) / 180
+    const rotate = (p: { x: number; y: number }) => ({
+      x: 100 + (p.x - 100) * Math.cos(rad) - (p.y - 50) * Math.sin(rad),
+      y: 50 + (p.x - 100) * Math.sin(rad) + (p.y - 50) * Math.cos(rad),
+    })
+    const segments = lineSegmentsWithLabelGap(
+      { width: 200, height: 100, text: 'Rotated', fontSize: undefined },
+      points,
+      true,
+    ).map((segment) => ({ start: rotate(segment.start), end: rotate(segment.end) }))
+    const main = props.main.points as number[]
+    const second = props.second?.points as number[]
+    expectClose(main[0], segments[0].start.x)
+    expectClose(main[1], segments[0].start.y)
+    expectClose(main[2], segments[0].end.x)
+    expectClose(main[3], segments[0].end.y)
+    expectClose(second[0], segments[1].start.x)
+    expectClose(second[1], segments[1].start.y)
+    expectClose(second[2], segments[1].end.x)
+    expectClose(second[3], segments[1].end.y)
+  })
+
+  it('sync update：文字从无到有 → 拓扑重建，子对象顺序保持 线体们在前、head 在后', () => {
+    const leafer = makeFakeLeafer()
+    const paint = createLeaferLinePaint(leafer)
+    paint.sync([arrowNode({ id: 'a', markupPoints: points })], ctx())
+    const before = groupAt(leafer, 0)
+    expect(before.children.length).toBe(2) // main + end head
+
+    const counts = paint.sync([arrowNode({ id: 'a', markupPoints: points, text: 'hi' })], ctx())
+    expect(counts).toEqual({ created: 0, updated: 1, deleted: 0 })
+    expect(before.removed).toBe(true) // 旧 group 整体重建
+    const rebuilt = (leafer.children as unknown as FakeGroupUI[]).find((child) => !child.removed)
+    expect(rebuilt?.children.length).toBe(3) // main + second + end head
+    const pointLengths = rebuilt?.children.map((child) => (child.props.points as number[]).length)
+    expect(pointLengths).toEqual([4, 4, 6])
+  })
+
+  it('sync update：编辑结束（文字仍为空）→ 缺口收回，单段整线', () => {
+    const leafer = makeFakeLeafer()
+    const paint = createLeaferLinePaint(leafer)
+    paint.sync([lineNode({ id: 'a', markupPoints: points })], { ...ctx(), editingNodeId: 'a' })
+    expect(groupAt(leafer, 0).children.length).toBe(2) // main + second（编辑态断开）
+
+    paint.sync([lineNode({ id: 'a', markupPoints: points })], ctx())
+    const rebuilt = (leafer.children as unknown as FakeGroupUI[]).find((child) => !child.removed)
+    expect(rebuilt?.children.length).toBe(1) // 只剩 main
   })
 })

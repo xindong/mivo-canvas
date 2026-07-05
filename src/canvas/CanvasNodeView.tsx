@@ -12,10 +12,19 @@ import {
   textRenderStyleFor,
 } from './canvasRenderAdapter'
 import type { ResizeCorner } from './canvasGeometry'
+import {
+  defaultMarkupPointsFor,
+  isLineMarkup,
+  lineLabelPositionFor,
+  lineSegmentsWithLabelGap,
+  markupTextAlignFor,
+} from './markupTextGeometry'
 import { renderKindForNode } from './nodeTypes/canvasNodeRegistry'
 import { stampSrcFor } from './stampDefs'
 import { defaultTextAlign, defaultTextColor, defaultTextFontSize, defaultTextWeight } from './textGeometry'
 import type { TextResizeEdge } from './useCanvasInteractionController'
+import { isLeaferSpikePainted } from '../render/leaferSpikeFilter'
+import { rendererMode } from '../render/rendererMode'
 
 export type CanvasNodeViewProps = {
   node: MivoCanvasNode
@@ -119,86 +128,6 @@ function CanvasTextEditor({
       }}
     />
   )
-}
-
-const defaultMarkupPointsFor = (node: MivoCanvasNode) => {
-  if (node.markupKind === 'arrow' || node.markupKind === 'line') {
-    return [
-      { x: Math.max(2, node.markupStrokeWidth || 3), y: Math.max(2, node.height - (node.markupStrokeWidth || 3)) },
-      { x: Math.max(2, node.width - (node.markupStrokeWidth || 3)), y: Math.max(2, node.markupStrokeWidth || 3) },
-    ]
-  }
-
-  if (node.markupKind === 'brush') {
-    return [
-      { x: 8, y: node.height * 0.6 },
-      { x: node.width * 0.32, y: node.height * 0.25 },
-      { x: node.width * 0.56, y: node.height * 0.68 },
-      { x: node.width - 8, y: node.height * 0.3 },
-    ]
-  }
-
-  return []
-}
-
-const isLineMarkup = (node: MivoCanvasNode) => node.markupKind === 'arrow' || node.markupKind === 'line'
-
-const markupTextAlignFor = (node: MivoCanvasNode) =>
-  node.textAlign || (node.markupKind === 'note' ? defaultTextAlign : 'center')
-
-const lineLabelPositionFor = (node: MivoCanvasNode, points: Array<{ x: number; y: number }>) => {
-  const start = points[0] || { x: 0, y: node.height }
-  const end = points[1] || { x: node.width, y: 0 }
-
-  return {
-    x: (start.x + end.x) / 2,
-    y: (start.y + end.y) / 2,
-  }
-}
-
-const estimatedMarkupLabelWidth = (text: string, fontSize: number) => {
-  const chars = Array.from(text || ' ')
-  const rawWidth = chars.reduce((width, char) => {
-    if (/[\u2e80-\u9fff\uf900-\ufaff]/.test(char)) return width + fontSize
-    if (char === ' ') return width + fontSize * 0.35
-    if (/[A-Z0-9]/.test(char)) return width + fontSize * 0.68
-    return width + fontSize * 0.56
-  }, 0)
-
-  return Math.max(54, Math.min(360, rawWidth + 18))
-}
-
-const lineSegmentsWithLabelGap = (
-  node: MivoCanvasNode,
-  points: Array<{ x: number; y: number }>,
-  labelActive: boolean,
-) => {
-  const start = points[0] || { x: 0, y: node.height }
-  const end = points[1] || { x: node.width, y: 0 }
-
-  if (!labelActive) return [{ start, end, markerEnd: true }]
-
-  const dx = end.x - start.x
-  const dy = end.y - start.y
-  const length = Math.hypot(dx, dy)
-  if (length < 1) return [{ start, end, markerEnd: true }]
-
-  const labelWidth = estimatedMarkupLabelWidth(node.text || 'Label', node.fontSize || defaultTextFontSize)
-  const gap = Math.min(length * 0.42, labelWidth / 2 + 10)
-  const gapRatio = gap / length
-  const beforeEnd = {
-    x: start.x + dx * Math.max(0, 0.5 - gapRatio),
-    y: start.y + dy * Math.max(0, 0.5 - gapRatio),
-  }
-  const afterStart = {
-    x: start.x + dx * Math.min(1, 0.5 + gapRatio),
-    y: start.y + dy * Math.min(1, 0.5 + gapRatio),
-  }
-
-  return [
-    { start, end: beforeEnd, markerEnd: false },
-    { start: afterStart, end, markerEnd: true },
-  ]
 }
 
 function MarkupTextLayer({
@@ -504,6 +433,9 @@ export const CanvasNodeView = memo(function CanvasNodeView({
   const taskNode = renderKind === 'task'
   const annotationNode = renderKind === 'annotation'
   const markupNode = renderKind === 'markup'
+  // FU-11: leafer 模式下被 Leafer 真画的 markup 节点,DOM 侧只保留"纯文字壳"。
+  // 能走到这里说明 leaferSpikeFilter 已判定该节点需要文字层(有文字/编辑中)。
+  const markupTextOverlayOnly = markupNode && rendererMode === 'leafer' && isLeaferSpikePainted(node)
   const markdownNode = renderKind === 'markdown'
   const markdownDisplayMode = markdownNode ? node.markdownDisplayMode || 'full' : undefined
   const markdownPreviewMode = markdownDisplayMode === 'preview'
@@ -592,6 +524,30 @@ export const CanvasNodeView = memo(function CanvasNodeView({
       resizeObserver.disconnect()
     }
   }, [markdownNode, markdownPreviewMode, node.height, node.id, node.text, node.width, onResizeNodeToContent])
+
+  if (markupTextOverlayOnly) {
+    // 壳只承载 MarkupTextLayer:定位/transform 链与整节点一致(nodeRenderBoxFor),
+    // 双击编辑/失焦提交沿用 canvas hit-test → editing prop 的既有链路;本体
+    // (SVG/note 背景)跳过,由 Leafer 真画。选中态视觉/handle 不在壳上渲染,
+    // 与 leafer 模式下无文字 markup 的现状保持一口径。
+    return (
+      <div
+        data-node-id={node.id}
+        data-node-type={node.type}
+        data-markup-kind={node.markupKind}
+        className={`dom-node markup-node markup-text-overlay${editing ? ' editing' : ''}`}
+        style={nodeStyle}
+      >
+        <MarkupTextLayer
+          node={node}
+          points={node.markupPoints?.length ? node.markupPoints : defaultMarkupPointsFor(node)}
+          editing={editing}
+          onUpdateText={onUpdateText}
+          onFinishTextEdit={onFinishTextEdit}
+        />
+      </div>
+    )
+  }
 
   return (
     <div

@@ -48,6 +48,9 @@ export type RendererSyncContext = {
   selectedNodeIds: ReadonlySet<string>
   /** True while a pan is in flight — adapter may freeze (0g invariant 1). */
   isPanning: boolean
+  /** FU-11: 正在文字编辑的节点 id。line paint 用它在编辑空 label 时也断开线体
+   *  （DOM 侧此刻已渲染编辑器）——与 DOM 的 lineLabelActive(editing||text) 同口径。 */
+  editingNodeId?: string
 }
 
 /** A record of create/update/delete operations a sync performed. Contract tests
