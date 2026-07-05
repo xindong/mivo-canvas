@@ -5300,7 +5300,6 @@ button:disabled {
 
 .image-mask-edit-overlay {
   position: absolute;
-  inset: 0;
   z-index: 35;
   overflow: visible;
   pointer-events: auto;

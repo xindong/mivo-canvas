@@ -23,7 +23,8 @@ import { CanvasContextMenu } from './CanvasContextMenu'
 import { DomRenderer } from '../render/DomRenderer'
 import { CanvasToolDock } from './CanvasToolDock'
 import { AnchorOverlay } from './AnchorOverlay'
-import { ImageCropOverlay, type ImageCropBox } from './ImageCropOverlay'
+import { MaskCropOverlayHost } from './MaskCropOverlayHost'
+import { type ImageCropBox } from './ImageCropOverlay'
 import { NodeActionMenu } from './NodeActionMenu'
 import { SelectionQuickToolbar } from './SelectionQuickToolbar'
 import { StampOptionsBar } from './StampOptionsBar'
@@ -126,6 +127,7 @@ export function MivoCanvas({
     clearCropNode,
     interactionRef: maskPointInteractionRef,
   })
+  // 3b: mask overlay state moved to useMaskEditOverlay hook (consumed by <MaskCropOverlayHost> below).
   const {
     viewport,
     snapGuides,
@@ -615,19 +617,12 @@ export function MivoCanvas({
             handleSize,
             handleBorderWidth,
             selectionStrokeWidth,
-            maskEditActive: node.id === maskEditNodeId,
-            maskEditSubmitting: node.id === maskEditSubmittingNodeId,
-            initialMaskClientPoint: initialClientPoint?.nodeId === node.id ? initialClientPoint : undefined,
-            viewportScale: viewport.scale,
             onResizeHandlePointerDown: beginNodeResize,
             onMarkupPointPointerDown: beginMarkupPointMove,
             onTextResizeHandlePointerDown: beginTextResize,
             onUpdateText: updateEditingText,
             onFinishTextEdit: finishTextEditing,
             onResizeNodeToContent: updateNodeMeasuredSize,
-            onSubmitMaskEdit: submitMaskEdit,
-            onCancelMaskEdit: cancelMaskEdit,
-            onInitialMaskClientPointHandled: handleInitialClientPointHandled,
           })}
         />
         {stampPlacementPreview ? (
@@ -642,14 +637,6 @@ export function MivoCanvas({
           >
             <img src={stampSrcFor(activeStampKind)} alt="" draggable={false} />
           </div>
-        ) : null}
-        {cropNode ? (
-          <ImageCropOverlay
-            node={cropNode}
-            scale={viewport.scale}
-            onCommit={(box) => commitCropNode(cropNode.id, box)}
-            onCancel={() => setCropNodeId(undefined)}
-          />
         ) : null}
         {!cropNode && !maskEditNodeId ? (
           <SelectionQuickToolbar
@@ -794,6 +781,19 @@ export function MivoCanvas({
           anchor exists (hasAnchors selector) so unrelated views (assets drawer) pay
           zero overhead. Marks sit above dom-canvas-layer; each is small + positioned
           so canvas events pass through everywhere else. */}
+      <MaskCropOverlayHost
+        maskEditNodeId={maskEditNodeId}
+        visibleNodes={visibleNodes}
+        viewport={viewport}
+        cropNode={cropNode}
+        maskEditSubmittingNodeId={maskEditSubmittingNodeId}
+        initialClientPoint={initialClientPoint}
+        onSubmitMaskEdit={submitMaskEdit}
+        onCancelMaskEdit={cancelMaskEdit}
+        onInitialMaskClientPointHandled={handleInitialClientPointHandled}
+        onCommitCrop={(box) => cropNode && commitCropNode(cropNode.id, box)}
+        onCancelCrop={() => setCropNodeId(undefined)}
+      />
       {hasAnchors ? <AnchorOverlay viewport={viewport} /> : null}
     </section>
   )

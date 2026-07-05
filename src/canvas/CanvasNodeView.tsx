@@ -12,13 +12,10 @@ import {
   textRenderStyleFor,
 } from './canvasRenderAdapter'
 import type { ResizeCorner } from './canvasGeometry'
-import { ImageMaskEditOverlay } from './ImageMaskEditOverlay'
-import type { ImageMaskSubmitPayload } from './imageMaskGeometry'
 import { renderKindForNode } from './nodeTypes/canvasNodeRegistry'
 import { stampSrcFor } from './stampDefs'
 import { defaultTextAlign, defaultTextColor, defaultTextFontSize, defaultTextWeight } from './textGeometry'
 import type { TextResizeEdge } from './useCanvasInteractionController'
-import type { MaskInitialClientPoint } from './maskPointPending'
 
 export type CanvasNodeViewProps = {
   node: MivoCanvasNode
@@ -32,10 +29,6 @@ export type CanvasNodeViewProps = {
   handleSize: number
   handleBorderWidth: number
   selectionStrokeWidth: number
-  maskEditActive: boolean
-  maskEditSubmitting: boolean
-  initialMaskClientPoint?: MaskInitialClientPoint
-  viewportScale: number
   onResizeHandlePointerDown: (
     nodeId: string,
     corner: ResizeCorner,
@@ -54,13 +47,6 @@ export type CanvasNodeViewProps = {
   onUpdateText: (nodeId: string, text: string) => void
   onFinishTextEdit: (nodeId: string) => void
   onResizeNodeToContent: (nodeId: string, width: number, height: number) => void
-  onSubmitMaskEdit: (nodeId: string, resolvedAssetUrl: string, payload: ImageMaskSubmitPayload) => Promise<void>
-  onCancelMaskEdit: () => void
-  onInitialMaskClientPointHandled: (
-    nodeId: string,
-    outcome: 'consumed' | 'discarded',
-    reason?: string,
-  ) => void
 }
 
 function CanvasTextEditor({
@@ -487,23 +473,16 @@ export const CanvasNodeView = memo(function CanvasNodeView({
   handleSize,
   handleBorderWidth,
   selectionStrokeWidth,
-  maskEditActive,
-  maskEditSubmitting,
-  initialMaskClientPoint,
-  viewportScale,
   onResizeHandlePointerDown,
   onMarkupPointPointerDown,
   onTextResizeHandlePointerDown,
   onUpdateText,
   onFinishTextEdit,
   onResizeNodeToContent,
-  onSubmitMaskEdit,
-  onCancelMaskEdit,
-  onInitialMaskClientPointHandled,
 }: CanvasNodeViewProps) {
   const markdownDocumentRef = useRef<HTMLElement | null>(null)
   const resolvedAssetUrl = useResolvedAssetUrl(node.assetUrl)
-  const { naturalSize, onLoad: onImageLoad } = useImageNaturalSize(
+  const { onLoad: onImageLoad } = useImageNaturalSize(
     node.assetUrl,
     node.assetSourceDimensions,
   )
@@ -743,19 +722,6 @@ export const CanvasNodeView = memo(function CanvasNodeView({
             <div className="dom-node-placeholder" />
           )
           )}
-          {imageNode && maskEditActive && resolvedAssetUrl && naturalSize ? (
-            <ImageMaskEditOverlay
-              node={node}
-              resolvedAssetUrl={resolvedAssetUrl}
-              naturalSize={naturalSize}
-              viewportScale={viewportScale}
-              submitting={maskEditSubmitting}
-              initialClientPoint={initialMaskClientPoint}
-              onCancel={onCancelMaskEdit}
-              onSubmit={(payload) => onSubmitMaskEdit(node.id, resolvedAssetUrl, payload)}
-              onInitialClientPointHandled={onInitialMaskClientPointHandled}
-            />
-          ) : null}
         </div>
       )}
       {primarySelected && !editing && textNode && !effectiveLocked ? (
