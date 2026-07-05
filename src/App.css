@@ -6,6 +6,10 @@
   --line-strong: #b9afa1;
   --panel: #f8f4eb;
   --panel-2: #fffaf0;
+  /* 统一面板底色 = 画布主工具条基准色 rgba(255,250,240,.92) 的不透明等效值。
+     所有画布默认视图面板(左侧栏/右 TASKS/缩放条/折叠态浮动按钮)背景引用此变量,
+     去掉半透明,一处改色全局生效 (2026-07-06 用户反馈)。 */
+  --panel-surface: #fffaf0;
   --canvas: #ebe4d7;
   --charcoal: #27302c;
   --moss: #497466;
@@ -102,7 +106,7 @@
 }
 
 .mivo-app.library-active .project-sidebar:not(.drawer) {
-  background: #fff; /* 2026-07-06 用户:侧栏卡片不透明白色,不许画布内容透出(原 rgba .84 半透明) */
+  background: var(--panel-surface); /* 2026-07-06 用户:侧栏底色统一到主工具条基准色(不透明,覆盖 #123 的 #fff) */
   border-color: var(--line);
 }
 
@@ -605,7 +609,7 @@ button:disabled {
   margin: var(--floating-gap) 0 var(--floating-gap) var(--floating-gap);
   padding: 14px;
   overflow: hidden;
-  background: #fff; /* 2026-07-06 用户:侧栏卡片不透明白色,不许画布内容透出(原 rgba .84 半透明) */
+  background: var(--panel-surface); /* 2026-07-06 用户:侧栏底色统一到主工具条基准色(不透明,覆盖 #123 的 #fff) */
   border: 1px solid var(--line);
   border-radius: 14px;
   opacity: 1;
@@ -3103,7 +3107,7 @@ button:disabled {
   width: 44px;
   height: 44px;
   color: var(--muted);
-  background: rgba(248, 244, 235, 0.78);
+  background: var(--panel-surface); /* 2026-07-06 用户:折叠态浮动按钮底色统一到主工具条基准色(去半透明) */
   border: 1px solid rgba(35, 35, 35, 0.12);
   border-radius: var(--radius-pill);
   box-shadow: 0 14px 36px rgba(35, 35, 35, 0.12);
@@ -4087,9 +4091,11 @@ button:disabled {
   box-shadow: none;
 }
 
-/* FU-11: leafer 模式纯文字壳——本体由 Leafer 真画，壳不拦手势/不改光标；
-   编辑态由 .dom-markup-label.editing 的 pointer-events:auto 恢复输入。 */
-.dom-node.markup-node.markup-text-overlay {
+/* FU-11/12: leafer 模式纯文字壳（markup 文字层 / frame 标题）——本体由 Leafer
+   真画，壳不拦手势/不改光标；markup 编辑态由 .dom-markup-label.editing 的
+   pointer-events:auto 恢复输入，frame 改名走 window.prompt 无需壳接管指针。 */
+.dom-node.markup-node.markup-text-overlay,
+.dom-node.frame-node.frame-title-overlay {
   pointer-events: none;
 }
 
@@ -5835,7 +5841,7 @@ button:disabled {
   align-items: center;
   gap: 7px;
   padding: 6px;
-  background: rgba(255, 250, 240, 0.9);
+  background: var(--panel-surface); /* 2026-07-06 用户:缩放条底色统一到主工具条基准色(去半透明) */
   border: 1px solid var(--line);
   border-radius: 999px;
   box-shadow: var(--shadow);
@@ -5929,7 +5935,9 @@ button:disabled {
   grid-template-rows: auto minmax(0, 1fr) auto;
   overflow: hidden;
   color: var(--ink);
-  background: rgba(255, 253, 248, 0.95);
+  /* 2026-07-06 用户:对话框面板去掉半透明(原 rgba(255,253,248,.95),空态画布透出明显),
+     底色统一到主工具条基准色。 */
+  background: var(--panel-surface);
   border: var(--ai-panel-border) solid var(--line);
   border-radius: var(--radius-lg);
   box-shadow: 0 12px 30px rgba(35, 35, 35, 0.1);
