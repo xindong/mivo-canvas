@@ -5,7 +5,6 @@ import type {
   CanvasId,
   MivoCanvasNode,
 } from '../types/mivoCanvas'
-import type { GenerationRatio } from '../types/generation'
 import { debugLogger } from './debugLogStore'
 
 type AiContextState = {
@@ -20,18 +19,18 @@ const derivationEdgeModel = 'Mivo Derivation Edge'
 
 export const AI_SLOT_GAP = 56
 
-/** ai-slot 占位符尺寸按本次请求比例计算(bug: 占位符恒 1:1,commitGenerationResult
- *  的 replacingSlot 分支保留占位尺寸 → 宽幅结果被塞进方形框)。面积与 base(注册表
- *  默认 320×320)保持一致,只变长宽比;'auto'/缺省/非法比例回退 base,1:1 不回归。 */
-export const slotSizeForRatio = (
+/** chat 生图 slot 替换时的结果落图尺寸:按结果图自然宽高比、与占位符等面积
+ *  (视觉跳变最小)。规格(2026-07-05 用户澄清):chat 占位符恒 1:1 方形 loading,
+ *  完成替换时结果图按自己的比例落画布;#86 W2-F5「替换保留占位尺寸」契约收窄
+ *  为 mask-edit 专属。结果图无自然尺寸信息时回退占位符尺寸。 */
+export const equalAreaSizeForDimensions = (
   base: { width: number; height: number },
-  ratio?: GenerationRatio | 'auto',
+  dimensions?: { width: number; height: number },
 ): { width: number; height: number } => {
-  if (!ratio || ratio === 'auto' || ratio === '1:1') return base
-  const [ratioW, ratioH] = ratio.split(':').map(Number)
-  if (!Number.isFinite(ratioW) || !Number.isFinite(ratioH) || ratioW <= 0 || ratioH <= 0) return base
-  const width = Math.round(Math.sqrt((base.width * base.height * ratioW) / ratioH))
-  return { width, height: Math.round((width * ratioH) / ratioW) }
+  if (!dimensions || dimensions.width <= 0 || dimensions.height <= 0) return base
+  const width = Math.round(Math.sqrt((base.width * base.height * dimensions.width) / dimensions.height))
+  if (width <= 0) return base
+  return { width, height: Math.round((width * dimensions.height) / dimensions.width) }
 }
 
 const rectsOverlap = (
