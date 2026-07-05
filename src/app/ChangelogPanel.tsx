@@ -14,11 +14,14 @@ type ChangelogPanelProps = {
 
 export const ChangelogPanel = ({ openedAt, onClose }: ChangelogPanelProps) => {
   const entries = useChangelogStore((state) => state.entries)
+  const updatedAt = useChangelogStore((state) => state.updatedAt)
   const markRead = useChangelogStore((state) => state.markRead)
 
+  // 依赖 updatedAt:面板打开早于 fetch 完成时,首次 markRead 空转(updatedAt 尚为空),
+  // 数据到达后需再标记一次,否则红点会在面板开着时点亮且关闭不清除。
   useEffect(() => {
     markRead()
-  }, [markRead])
+  }, [markRead, updatedAt])
 
   const visibleEntries = useMemo(() => {
     const window7 = new Set(recentDays(openedAt))
