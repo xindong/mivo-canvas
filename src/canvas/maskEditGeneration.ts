@@ -7,6 +7,7 @@ import type { MivoImageQuality, MivoImageRatio } from '../types/generation'
 import { useCanvasStore } from '../store/canvasStore'
 import { useCameraFocusStore } from '../store/cameraFocusStore'
 import { AI_SLOT_GAP, reflowRightObstacles } from '../store/aiCanvasWorkflow'
+import { defaultSizeForNodeType } from './nodeTypes/canvasNodeRegistry'
 import { rollbackLatestHistoryBaseline } from '../store/canvasDocumentModel'
 import { debugLogger } from '../store/debugLogStore'
 import { readCanvasImageBlob } from '../lib/canvasImageSource'
@@ -96,11 +97,15 @@ export const prepareMaskEditPlaceholder = (
   source: MivoCanvasNode,
   prompt: string,
 ): { slotId: string; baselineSnapshot: MivoCanvasSnapshot | undefined } => {
+  // 规格(2026-07-05 用户澄清):所有生图占位符一律 1:1 方形 loading,局部重绘不例外
+  // (此前按源图全尺寸建占位 → 用户看到 3:2 大占位符);结果比例由生成本身保证
+  // (edit 结果与源图同比例),替换时按结果图自然比例等面积落画布(documentSlice)。
+  const slotSize = defaultSizeForNodeType('ai-slot')
   const slotId = useCanvasStore
     .getState()
     .addAiSlotNode(
       { x: source.x + source.width + AI_SLOT_GAP, y: source.y },
-      { width: source.width, height: source.height },
+      slotSize,
       prompt,
       { sceneId },
     )

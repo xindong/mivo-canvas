@@ -12,13 +12,10 @@ import {
   textRenderStyleFor,
 } from './canvasRenderAdapter'
 import type { ResizeCorner } from './canvasGeometry'
-import { ImageMaskEditOverlay } from './ImageMaskEditOverlay'
-import type { ImageMaskSubmitPayload } from './imageMaskGeometry'
 import { renderKindForNode } from './nodeTypes/canvasNodeRegistry'
 import { stampSrcFor } from './stampDefs'
 import { defaultTextAlign, defaultTextColor, defaultTextFontSize, defaultTextWeight } from './textGeometry'
 import type { TextResizeEdge } from './useCanvasInteractionController'
-import type { MaskInitialClientPoint } from './maskPointPending'
 
 export type CanvasNodeViewProps = {
   node: MivoCanvasNode
@@ -32,10 +29,6 @@ export type CanvasNodeViewProps = {
   handleSize: number
   handleBorderWidth: number
   selectionStrokeWidth: number
-  maskEditActive: boolean
-  maskEditSubmitting: boolean
-  initialMaskClientPoint?: MaskInitialClientPoint
-  viewportScale: number
   onResizeHandlePointerDown: (
     nodeId: string,
     corner: ResizeCorner,
@@ -54,13 +47,6 @@ export type CanvasNodeViewProps = {
   onUpdateText: (nodeId: string, text: string) => void
   onFinishTextEdit: (nodeId: string) => void
   onResizeNodeToContent: (nodeId: string, width: number, height: number) => void
-  onSubmitMaskEdit: (nodeId: string, resolvedAssetUrl: string, payload: ImageMaskSubmitPayload) => Promise<void>
-  onCancelMaskEdit: () => void
-  onInitialMaskClientPointHandled: (
-    nodeId: string,
-    outcome: 'consumed' | 'discarded',
-    reason?: string,
-  ) => void
 }
 
 function CanvasTextEditor({
@@ -487,23 +473,16 @@ export const CanvasNodeView = memo(function CanvasNodeView({
   handleSize,
   handleBorderWidth,
   selectionStrokeWidth,
-  maskEditActive,
-  maskEditSubmitting,
-  initialMaskClientPoint,
-  viewportScale,
   onResizeHandlePointerDown,
   onMarkupPointPointerDown,
   onTextResizeHandlePointerDown,
   onUpdateText,
   onFinishTextEdit,
   onResizeNodeToContent,
-  onSubmitMaskEdit,
-  onCancelMaskEdit,
-  onInitialMaskClientPointHandled,
 }: CanvasNodeViewProps) {
   const markdownDocumentRef = useRef<HTMLElement | null>(null)
   const resolvedAssetUrl = useResolvedAssetUrl(node.assetUrl)
-  const { naturalSize, onLoad: onImageLoad } = useImageNaturalSize(
+  const { onLoad: onImageLoad } = useImageNaturalSize(
     node.assetUrl,
     node.assetSourceDimensions,
   )
@@ -643,29 +622,18 @@ export const CanvasNodeView = memo(function CanvasNodeView({
       ) : aiSlotNode ? (
         <div className="dom-ai-slot-node">
           {aiSlotStatus === 'generating' ? (
+            // 规格(2026-07-05 用户):生成中占位符只留 mivo logo——标题/状态文案/
+            // 进度行/右下角尺寸角标全部不渲染,保持干净的 loading 视觉。
             <span className="mivo-logo ai-slot-mivo-logo" aria-hidden="true" />
-          ) : null}
-          <div className="ai-slot-copy">
-            <strong>{node.title}</strong>
-            <span>{aiSlotStatusLabel}</span>
-            {aiSlotStatus === 'generating' && node.aiWorkflow?.startedAt ? (
-              <div
-                className="ai-slot-progress"
-                data-canvas-ui="true"
-                data-ai-progress={Math.min(100, Math.max(0, Math.round(node.aiWorkflow.progress ?? 0)))}
-                data-ai-stage={node.aiWorkflow.stage || ''}
-                data-ai-elapsed={node.aiWorkflow.elapsedSec ?? 0}
-              >
-                <span className="ai-slot-progress-stage">{node.aiWorkflow.stage || '生成中'}</span>
-                <span className="ai-slot-progress-elapsed">{node.aiWorkflow.elapsedSec ?? 0}s</span>
-                <i
-                  className="ai-slot-progress-bar"
-                  style={{ width: `${Math.min(100, Math.max(0, Math.round(node.aiWorkflow.progress ?? 0)))}%` }}
-                />
+          ) : (
+            <>
+              <div className="ai-slot-copy">
+                <strong>{node.title}</strong>
+                <span>{aiSlotStatusLabel}</span>
               </div>
-            ) : null}
-          </div>
-          <em>{node.width} x {node.height}</em>
+              <em>{node.width} x {node.height}</em>
+            </>
+          )}
         </div>
       ) : markupNode ? (
         <MarkupNodeView
@@ -754,19 +722,6 @@ export const CanvasNodeView = memo(function CanvasNodeView({
             <div className="dom-node-placeholder" />
           )
           )}
-          {imageNode && maskEditActive && resolvedAssetUrl && naturalSize ? (
-            <ImageMaskEditOverlay
-              node={node}
-              resolvedAssetUrl={resolvedAssetUrl}
-              naturalSize={naturalSize}
-              viewportScale={viewportScale}
-              submitting={maskEditSubmitting}
-              initialClientPoint={initialMaskClientPoint}
-              onCancel={onCancelMaskEdit}
-              onSubmit={(payload) => onSubmitMaskEdit(node.id, resolvedAssetUrl, payload)}
-              onInitialClientPointHandled={onInitialMaskClientPointHandled}
-            />
-          ) : null}
         </div>
       )}
       {primarySelected && !editing && textNode && !effectiveLocked ? (

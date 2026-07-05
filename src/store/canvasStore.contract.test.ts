@@ -621,7 +621,7 @@ describe('contract: commitGenerationResult (incl. cross-scene)', () => {
     expect(result?.y).toBe(88)
   })
 
-  it('mask-edit slot replacement (kind edit) keeps the placeholder size (#86 W2-F5 契约收窄为 mask-edit 专属)', async () => {
+  it('mask-edit slot replacement (kind edit) also resizes to the result aspect ratio, equal-area (2026-07-05 规格:占位一律方形,替换统一按结果比例,无 kind 特例)', async () => {
     seed(seedCanvas('character-flow', [
       imageNode({ id: 'src-1', x: 10, y: 20 }),
       aiSlotNode({ id: 'slot-1', x: 366, y: 20, width: 320, height: 320 }),
@@ -640,7 +640,11 @@ describe('contract: commitGenerationResult (incl. cross-scene)', () => {
 
     const result = useCanvasStore.getState().nodes.find((node) => node.id === 'slot-1')
     expect(result?.type).toBe('image')
-    expect({ width: result!.width, height: result!.height }).toEqual({ width: 320, height: 320 })
+    expect(result!.width / result!.height).toBeCloseTo(300 / 200, 1)
+    expect(result!.width * result!.height).toBeGreaterThan(320 * 320 * 0.95)
+    expect(result!.width * result!.height).toBeLessThan(320 * 320 * 1.05)
+    expect(result?.x).toBe(366)
+    expect(result?.y).toBe(20)
   })
 
   it('uses lineageSourceId for replacement lineage without moving the slot result', async () => {

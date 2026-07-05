@@ -5,6 +5,7 @@ import { runMaskReflowScenario } from './mask-reflow.mjs'
 import { runCanvasInteractionsScenario } from './canvas-interactions.mjs'
 import { runChangelogScenario } from './changelog.mjs'
 import { runChatGenerationScenario } from './chat-generation.mjs'
+import { runChatCopyScenario } from './chat-copy.mjs'
 import { runCoordinateProbeScenario } from './coordinate-probe.mjs'
 import { runDebugScenario } from './debug.mjs'
 import { runMaskScenario } from './mask.mjs'
@@ -28,6 +29,7 @@ export const scenarioOrder = [
   'canvas-interactions',
   'zoom-tool',
   'chat-generation',
+  'chat-copy',
   'mask',
   'migration',
   'anchor-mvp',
@@ -59,6 +61,7 @@ export const scenarioRunners = {
   'canvas-interactions': runCanvasInteractionsScenario,
   changelog: runChangelogScenario,
   'chat-generation': runChatGenerationScenario,
+  'chat-copy': runChatCopyScenario,
   'coordinate-probe': runCoordinateProbeScenario,
   debug: runDebugScenario,
   mask: runMaskScenario,

@@ -307,15 +307,13 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
               width: image.width || defaultSizeForNodeType('image').width,
               height: image.height || defaultSizeForNodeType('image').height,
             }
-        // F5 (QoL batch) 契约收窄(2026-07-05 用户澄清规格):「替换保留占位符
-        // displaySize」只适用 mask-edit(kind 'edit',结果与源图同比例,保尺寸防
-        // 跳变/防 reflow 仍成立)。chat 生图(kind 'generate')占位符恒 1:1 方形,
-        // 替换时按结果图自然宽高比、与占位符等面积落画布(16:9 请求 → 方形占位
-        // loading → 完成落宽幅图)。Non-slot placements 不变,仍用资产自然尺寸。
+        // 规格(2026-07-05 用户二次澄清,取代 #86 W2-F5「替换保留占位尺寸」契约):
+        // 所有生图占位符一律 1:1 方形 loading(chat 与局部重绘同规,无 kind 特例),
+        // 替换时统一按结果图自然宽高比、与占位符等面积落画布——edit 结果与源图同
+        // 比例由生成本身保证,无需靠占位尺寸传递;结果无自然尺寸信息时 equalArea
+        // 内部回退占位尺寸。Non-slot placements 不变,仍用资产自然尺寸。
         const displaySize = replacingSlot
-          ? payload.kind === 'edit'
-            ? fallbackSize
-            : equalAreaSizeForDimensions(fallbackSize, asset.sourceDimensions)
+          ? equalAreaSizeForDimensions(fallbackSize, asset.sourceDimensions)
           : displaySizeForGeneratedAsset(asset, fallbackSize)
         const placement = replacingSlot
           ? { x: replacingSlot.x, y: replacingSlot.y }

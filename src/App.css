@@ -5443,7 +5443,6 @@ button:disabled {
 
 .image-mask-edit-overlay {
   position: absolute;
-  inset: 0;
   z-index: 35;
   overflow: visible;
   pointer-events: auto;
@@ -7058,6 +7057,37 @@ button:disabled {
   color: #fffaf0;
   border-bottom-right-radius: 4px;
   white-space: pre-wrap;
+}
+
+/* 用户提示词气泡下的「复制提示词」按钮:常驻低调 icon(muted,hover 提亮),
+   stack 只是给气泡外套一层列容器,气泡自身样式不动(88% 上限移到 stack)。 */
+.chat-message-user-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 3px;
+  max-width: 88%;
+}
+
+.chat-message-user-stack .chat-bubble {
+  max-width: 100%;
+}
+
+.chat-copy-prompt-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3px 5px;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.chat-copy-prompt-btn:hover {
+  color: var(--ink);
+  background: rgba(35, 35, 35, 0.06);
 }
 
 .chat-bubble-assistant {
