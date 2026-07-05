@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 import {
   canvasBoundsFromZoomMarquee,
@@ -9,6 +9,7 @@ import {
   resizeGroupSelection,
   resizeNodeTransform,
   runtimeToolFor,
+  shouldStartCanvasSurfaceInteraction,
   zoomMarqueeOverlayRect,
 } from './canvasInteraction'
 
@@ -114,5 +115,65 @@ describe('zoom marquee helpers', () => {
   it('treats sub-4px zoom marquees as click zooms', () => {
     expect(isZoomToBoundsMarqueeRect({ x: 0, y: 0, width: 3, height: 4 })).toBe(false)
     expect(isZoomToBoundsMarqueeRect({ x: 0, y: 0, width: 4, height: 4 })).toBe(true)
+  })
+})
+
+// Phase 1b-4 correction: shouldStartCanvasSurfaceInteraction 的 gate 用 instanceof Element
+// (HTMLElement + SVGElement 基类),否则 line/arrow 的 .markup-hit-line(SVG <line>)会被
+// 拒绝 → dispatchPointerDown 在 resolveCanvasHit 之前 skip → line/arrow 无法选中。
+// 钉死防回潮:SVG canvas-surface 通过 + UI 容器内 SVG 被 isCanvasUiTarget 的 closest 兜底拒。
+// 项目无 jsdom,用 vi.stubGlobal mock Element + closest(同 imageMaskGeometry.test.ts 风格)。
+describe('shouldStartCanvasSurfaceInteraction (1b-4 SVG gate correction)', () => {
+  // FakeElement:实例通过 instanceof Element 检查,closest 行为由构造参数决定
+  // (模拟 SVG/HTMLElement 在 DOM 树中的位置)。
+  class FakeElement {
+    private readonly closestImpl: (selector: string) => FakeElement | null
+    constructor(closestImpl: (selector: string) => FakeElement | null = () => null) {
+      this.closestImpl = closestImpl
+    }
+    closest(selector: string): FakeElement | null {
+      return this.closestImpl(selector)
+    }
+    // EventTarget stubs:shouldStartCanvasSurfaceInteraction 签名要 EventTarget,
+    // 测试不调用这些方法,仅为结构类型兼容(空参方法可赋给多参可选签名的 EventTarget)。
+    addEventListener(): void { /* noop */ }
+    removeEventListener(): void { /* noop */ }
+    dispatchEvent(): boolean { return false }
+  }
+
+  let originalElement: unknown
+  beforeEach(() => {
+    originalElement = (globalThis as { Element?: unknown }).Element
+    ;(globalThis as { Element?: unknown }).Element = FakeElement as unknown
+  })
+  afterEach(() => {
+    ;(globalThis as { Element?: unknown }).Element = originalElement
+    vi.unstubAllGlobals()
+  })
+
+  it('accepts SVG canvas-surface target (markup-hit-line, no UI ancestor) — the 1b-4 bug', () => {
+    const line = new FakeElement(() => null) // closest 不命中任何 UI 容器
+    expect(shouldStartCanvasSurfaceInteraction(line)).toBe(true)
+  })
+
+  it('rejects SVG inside .node-handle via closest fallback', () => {
+    const handle = new FakeElement()
+    const icon = new FakeElement(() => handle) // closest 命中 UI 容器
+    expect(shouldStartCanvasSurfaceInteraction(icon)).toBe(false)
+  })
+
+  it('rejects SVG inside .selection-quick-toolbar via closest fallback', () => {
+    const toolbar = new FakeElement()
+    const icon = new FakeElement(() => toolbar)
+    expect(shouldStartCanvasSurfaceInteraction(icon)).toBe(false)
+  })
+
+  it('accepts HTMLElement canvas surface (regression)', () => {
+    const shell = new FakeElement(() => null) // 无 UI 祖先
+    expect(shouldStartCanvasSurfaceInteraction(shell)).toBe(true)
+  })
+
+  it('rejects null / non-Element targets', () => {
+    expect(shouldStartCanvasSurfaceInteraction(null)).toBe(false)
   })
 })

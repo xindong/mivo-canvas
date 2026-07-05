@@ -79,3 +79,27 @@ export const resolveHitTarget = (
   }
   return topmostHit(nodes, point, options)
 }
+
+/**
+ * Shell-space → canvas-space → resolveHitTarget. Pure: takes the shell rect
+ * (getBoundingClientRect), viewport (x/y/scale), back-to-front hit-test nodes,
+ * and clientX/clientY. No store/canvas imports — the controller feeds params.
+ *
+ * Phase 1b-4: the shell dispatches pointerdown via this; useMaskPointArmed also
+ * peeks it (armed image-hit → beginMaskEdit) so the per-node wrapper is gone.
+ */
+export type ViewportLike = { x: number; y: number; scale: number }
+export type ShellRectLike = { left: number; top: number }
+
+export const resolveCanvasHitAtClientPoint = (
+  shellRect: ShellRectLike | undefined,
+  viewport: ViewportLike,
+  nodes: readonly RenderNode[],
+  clientX: number,
+  clientY: number,
+  options: ResolveHitOptions = {},
+): HitTestTarget | null => {
+  const canvasX = (clientX - (shellRect?.left ?? 0) - viewport.x) / viewport.scale
+  const canvasY = (clientY - (shellRect?.top ?? 0) - viewport.y) / viewport.scale
+  return resolveHitTarget(nodes, { x: canvasX, y: canvasY }, options)
+}

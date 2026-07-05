@@ -7,11 +7,14 @@ import type { MivoCanvasNode } from '../types/mivoCanvas'
 import type { MivoImageRatio } from '../types/generation'
 import { prepareMaskEditPlaceholder, removeMaskEditPlaceholder, runMaskEditGeneration } from './maskEditGeneration'
 import type { ImageMaskSubmitPayload } from './imageMaskGeometry'
-import type { RuntimeCanvasTool } from './canvasInteraction'
+import { nodeIdFromDomTarget, type RuntimeCanvasTool } from './canvasInteraction'
 import { reduceMaskPointPending, shouldCancelPendingMaskEdit, type MaskInitialClientPoint, type MaskPointPendingAction } from './maskPointPending'
+import type { HitTestTarget } from '../render/hitTest'
 
 export type MaskPointArmedInteractionApi = {
-  beginNodePointerDown: (nodeId: string, event: ReactPointerEvent<HTMLDivElement>) => void
+  /** Shell hit-test peek (screenToCanvas + resolveHitTarget). Armed mode peeks
+   * this to detect image hits → beginMaskEdit, since per-node dispatch is gone. */
+  resolveCanvasHit: (clientX: number, clientY: number) => HitTestTarget | null
   handleCanvasPointerDown: (event: ReactPointerEvent<HTMLElement>) => void
   temporaryTool: RuntimeCanvasTool | undefined
   isPanning: boolean
@@ -231,63 +234,59 @@ export function useMaskPointArmed({
     ))
   }, [updatePendingInitialPoint])
 
-  const wrapNodePointerDown = useCallback((nodeId: string, event: ReactPointerEvent<HTMLDivElement>) => {
-    const { beginNodePointerDown, temporaryTool, isPanning } = interactionRef.current
-    if (!maskArmedRef.current || temporaryTool || isPanning) {
-      // W5 (QoL batch): maskEditNodeId is set but the overlay hasn't mounted yet
-      // (naturalSize not ready). During that window, a pointerdown on a different
-      // node must fully cancel the pending mask edit (abort + clear state + pending
-      // point) so the late-arriving overlay doesn't pop up over a new selection.
-      // No #81 baselineSnapshot rollback here — the placeholder isn't created until
-      // submitMaskEdit, so cancelMaskEdit's pre-submit semantics are correct.
-      const pendingMaskNodeId = maskEditNodeIdRef.current
-      if (shouldCancelPendingMaskEdit(pendingMaskNodeId, nodeId)) {
-        cancelMaskEdit()
-      }
-      beginNodePointerDown(nodeId, event)
-      return
-    }
-
-    const primaryUnmodified = event.button === 0 && !event.ctrlKey && !event.metaKey
-    if (!primaryUnmodified) {
-      debugLogger.log('Mask Edit', `Armed node pointer ignored for ${nodeId}: non-primary or modified click`)
-      setMaskArmed(false, 'non-primary node pointer')
-      beginNodePointerDown(nodeId, event)
-      return
-    }
-
-    const node = useCanvasStore.getState().nodes.find((item) => item.id === nodeId)
-    if (node?.type === 'image' && !node.hidden) {
-      event.preventDefault()
-      event.stopPropagation()
-      recordPendingInitialPoint({ nodeId, clientX: event.clientX, clientY: event.clientY })
-      beginMaskEdit(nodeId)
-      setMaskArmed(false, 'image hit')
-      debugLogger.log('Mask Edit', `Armed image hit: ${nodeId}`)
-      return
-    }
-
-    debugLogger.log('Mask Edit', `Armed node miss: ${nodeId}`)
-    setMaskArmed(false, 'node miss')
-    beginNodePointerDown(nodeId, event)
-  }, [beginMaskEdit, cancelMaskEdit, interactionRef, recordPendingInitialPoint, setMaskArmed])
-
+  // Phase 1b-4: per-node dispatch is gone; the shell resolves hits. Armed mode
+  // peeks resolveCanvasHit to detect image hits → beginMaskEdit (was
+  // wrapNodePointerDown's job). Non-image / blank / non-primary → disarm + fall
+  // through to handleCanvasPointerDown, mirroring the pre-1b-4 unconditional
+  // disarm that ran before handleCanvasPointerDown's UI-skip (so UI targets like
+  // the tool dock still disarm; SelectionQuickToolbar stops propagation at the DOM
+  // level so it never reaches here — both behaviors preserved as-is).
+  // W5 (QoL batch, from #87): maskEditNodeId set but overlay not mounted →
+  // pointerdown on a different node/blank must cancel the pending mask edit so the
+  // late-arriving overlay doesn't pop up over a new selection. 1b-4 把 #87 的
+  // wrapNodePointerDown node-branch W5 + blank-canvas W5 合并到 wrapCanvasPointerDown
+  // 的非 armed 分支(resolveCanvasHit 取 hitNodeId,undefined 覆盖 blank)。
   const wrapCanvasPointerDown = useCallback((event: ReactPointerEvent<HTMLElement>) => {
-    const { handleCanvasPointerDown, temporaryTool, isPanning } = interactionRef.current
+    const { handleCanvasPointerDown, resolveCanvasHit, temporaryTool, isPanning } = interactionRef.current
     if (!maskArmedRef.current || temporaryTool || isPanning) {
-      // W5: blank-canvas pointerdown during the overlay-mounting window also cancels
-      // the pending mask edit (same rationale as wrapNodePointerDown's node branch).
-      if (shouldCancelPendingMaskEdit(maskEditNodeIdRef.current, undefined)) {
+      // DOM-first(同 ctx/dbl):pending 窗口 resolveCanvasHit 因 activeEditState 激活返回
+      // edit-overlay-cancel 而非 node,hitNodeId 恒 undefined → shouldCancelPendingMaskEdit
+      // 误判 blank 误取消同节点 re-engage(Greptile P1)。改 nodeIdFromDomTarget 绕开短路。
+      const pendingMaskNodeId = maskEditNodeIdRef.current
+      const hitNodeId = nodeIdFromDomTarget(event.target) ?? undefined
+      if (shouldCancelPendingMaskEdit(pendingMaskNodeId, hitNodeId)) {
         cancelMaskEdit()
       }
       handleCanvasPointerDown(event)
       return
     }
 
-    debugLogger.log('Mask Edit', 'Armed canvas miss')
-    setMaskArmed(false, 'canvas miss')
+    const primaryUnmodified = event.button === 0 && !event.ctrlKey && !event.metaKey
+    if (!primaryUnmodified) {
+      debugLogger.log('Mask Edit', 'Armed pointer ignored: non-primary or modified click')
+      setMaskArmed(false, 'non-primary node pointer')
+      handleCanvasPointerDown(event)
+      return
+    }
+
+    const target = resolveCanvasHit(event.clientX, event.clientY)
+    const node = target?.kind === 'node'
+      ? useCanvasStore.getState().nodes.find((item) => item.id === target.nodeId)
+      : undefined
+    if (node?.type === 'image' && !node.hidden) {
+      event.preventDefault()
+      event.stopPropagation()
+      recordPendingInitialPoint({ nodeId: node.id, clientX: event.clientX, clientY: event.clientY })
+      beginMaskEdit(node.id)
+      setMaskArmed(false, 'image hit')
+      debugLogger.log('Mask Edit', `Armed image hit: ${node.id}`)
+      return
+    }
+
+    setMaskArmed(false, node ? 'node miss' : 'canvas miss')
+    debugLogger.log('Mask Edit', node ? `Armed node miss: ${node.id}` : 'Armed canvas miss')
     handleCanvasPointerDown(event)
-  }, [cancelMaskEdit, interactionRef, setMaskArmed])
+  }, [beginMaskEdit, cancelMaskEdit, interactionRef, recordPendingInitialPoint, setMaskArmed])
 
   useEffect(() => {
     const unsubscribe = useCanvasStore.subscribe((state, previous) => {
@@ -375,7 +374,6 @@ export function useMaskPointArmed({
     submitMaskEdit,
     cancelMaskEdit,
     toggleMaskArmed,
-    wrapNodePointerDown,
     wrapCanvasPointerDown,
     handleInitialClientPointHandled,
   }

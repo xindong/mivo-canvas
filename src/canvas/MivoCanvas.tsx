@@ -30,6 +30,7 @@ import { SelectionQuickToolbar } from './SelectionQuickToolbar'
 import { StampOptionsBar } from './StampOptionsBar'
 import { stampCursorCssFor, stampGrowthSizes, stampSrcFor } from './stampDefs'
 import { useCanvasInteractionController } from './useCanvasInteractionController'
+import { clampContextMenuPosition, isCanvasChromeTarget, nodeIdFromDomTarget } from './canvasInteraction'
 import { useMaskPointArmed, type MaskPointArmedInteractionApi } from './useMaskPointArmed'
 import { lockedNodeIdSetFor } from './useNodeTransform'
 import { rendererMode } from '../render/rendererMode'
@@ -56,29 +57,6 @@ type MivoCanvasProps = {
 
 export type ExternalAssetDropHandler = (dataTransfer: DataTransfer, clientX: number, clientY: number) => boolean
 
-const contextMenuWidth = 252
-const contextMenuMaxHeight = 620
-const contextMenuMargin = 12
-
-const clampContextMenuPosition = (clientX: number, clientY: number, maxHeight = contextMenuMaxHeight) => ({
-  x: Math.min(
-    Math.max(contextMenuMargin, clientX),
-    Math.max(contextMenuMargin, window.innerWidth - contextMenuWidth - contextMenuMargin),
-  ),
-  y: Math.min(
-    Math.max(contextMenuMargin, clientY),
-    Math.max(contextMenuMargin, window.innerHeight - maxHeight - contextMenuMargin),
-  ),
-})
-
-const isCanvasChromeTarget = (target: EventTarget | null) =>
-  target instanceof HTMLElement &&
-  Boolean(
-    target.closest(
-      '[data-canvas-ui="true"], .canvas-controls, .canvas-tool-dock, .canvas-ai-action-bar, .node-context-menu, .empty-canvas-note',
-    ),
-  )
-
 const canvasRenderOverscanPx = 520
 
 // C05: closed-interval (>=) intersection — culling over-renders to avoid border popping.
@@ -102,7 +80,7 @@ export function MivoCanvas({
   const shellRef = useRef<HTMLElement | null>(null)
   const hostRef = useRef<HTMLDivElement | null>(null)
   const maskPointInteractionRef = useRef<MaskPointArmedInteractionApi>({
-    beginNodePointerDown: () => undefined,
+    resolveCanvasHit: () => null,
     handleCanvasPointerDown: () => undefined,
     temporaryTool: undefined,
     isPanning: false,
@@ -147,7 +125,6 @@ export function MivoCanvas({
     submitMaskEdit,
     cancelMaskEdit,
     toggleMaskArmed,
-    wrapNodePointerDown,
     wrapCanvasPointerDown,
     handleInitialClientPointHandled,
   } = useMaskPointArmed({
@@ -182,13 +159,13 @@ export function MivoCanvas({
     selectionPreviewSet,
     beginGroupResize,
     beginSelectionSpacingDrag,
-    beginNodePointerDown,
     beginNodeResize,
     editTextNode,
     beginTextResize,
     beginMarkupPointMove,
     updateEditingText,
     finishTextEditing,
+    resolveCanvasHit,
     handleCanvasPointerDown,
     handleCanvasPointerMove,
     handleCanvasPointerEnd,
@@ -198,23 +175,19 @@ export function MivoCanvas({
     fitSelection,
     resetView,
   } = useCanvasInteractionController({
-    shellRef,
-    sceneId,
-    nodes: visibleNodes,
-    selectedNodeIds,
-    maskEditNodeId,
-    onCancelMaskEdit: cancelMaskEdit,
+    shellRef, sceneId, nodes: visibleNodes, selectedNodeIds, maskEditNodeId,
+    onCancelMaskEdit: cancelMaskEdit, cropEditNodeId: cropNodeId, onCancelCropEdit: clearCropNode,
     onCloseContextMenu: closeContextMenu,
   })
 
   useLayoutEffect(() => {
     maskPointInteractionRef.current = {
-      beginNodePointerDown,
+      resolveCanvasHit,
       handleCanvasPointerDown,
       temporaryTool,
       isPanning,
     }
-  }, [beginNodePointerDown, handleCanvasPointerDown, isPanning, temporaryTool])
+  }, [resolveCanvasHit, handleCanvasPointerDown, isPanning, temporaryTool])
 
   const screenToCanvasPoint = useCallback(
     (clientX: number, clientY: number) => {
@@ -278,24 +251,6 @@ export function MivoCanvas({
   )
 
   const handleOpenNodeDetails = useOpenNodeDetails(setContextMenu, selectNode, onOpenDetails)
-
-  const openBlankContextMenu = useCallback(
-    (event: ReactMouseEvent<HTMLElement>) => {
-      if (isCanvasChromeTarget(event.target)) return
-
-      event.preventDefault()
-      event.stopPropagation()
-
-      const position = clampContextMenuPosition(event.clientX, event.clientY, 300)
-      setContextMenu({
-        kind: 'blank',
-        x: position.x,
-        y: position.y,
-        canvasPosition: screenToCanvasPoint(event.clientX, event.clientY),
-      })
-    },
-    [screenToCanvasPoint],
-  )
 
   const beginCropNode = useCallback(
     (nodeId: string) => {
@@ -473,6 +428,44 @@ export function MivoCanvas({
   const brushToolActive = storeActiveTool === 'markup-brush' && !temporaryTool && !isPanning
   const stampToolActive = storeActiveTool === 'stamp' && !temporaryTool && !isPanning
 
+  // Phase 1b-4: shell-unified contextmenu + doubleclick (per-node root handlers gone;
+  // .dom-node is pointer-events:none so these events reach the shell directly).
+  const handleCanvasContextMenu = useCallback((event: ReactMouseEvent<HTMLElement>) => {
+    if (isCanvasChromeTarget(event.target)) return
+    event.preventDefault(); event.stopPropagation()
+    // DOM-first(见 nodeIdFromDomTarget):右键哪个 DOM 开哪个菜单,fallback 坐标兜底空白。
+    const targetNodeId = nodeIdFromDomTarget(event.target)
+    if (targetNodeId) {
+      if (!selectedNodeIds.includes(targetNodeId)) selectNode(targetNodeId)
+      openNodeContextMenu(targetNodeId, event.clientX, event.clientY); return
+    }
+    const target = resolveCanvasHit(event.clientX, event.clientY)
+    if (target?.kind === 'node') {
+      if (!selectedNodeIds.includes(target.nodeId)) selectNode(target.nodeId)
+      openNodeContextMenu(target.nodeId, event.clientX, event.clientY); return
+    }
+    const position = clampContextMenuPosition(event.clientX, event.clientY, 300)
+    setContextMenu({ kind: 'blank', x: position.x, y: position.y, canvasPosition: screenToCanvasPoint(event.clientX, event.clientY) })
+  }, [resolveCanvasHit, openNodeContextMenu, screenToCanvasPoint, selectNode, selectedNodeIds])
+
+  const handleCanvasDoubleClick = useCallback((event: ReactMouseEvent<HTMLElement>) => {
+    if (isCanvasChromeTarget(event.target)) return
+    // DOM-first(见 nodeIdFromDomTarget):双击哪个 DOM 处理哪个,fallback 坐标兜底。
+    const targetNodeId = nodeIdFromDomTarget(event.target)
+    const target = targetNodeId
+      ? { kind: 'node' as const, nodeId: targetNodeId }
+      : resolveCanvasHit(event.clientX, event.clientY)
+    if (target?.kind !== 'node') return
+    const node = visibleNodes.find((item) => item.id === target.nodeId)
+    if (!node) return
+    // mask overlay 开着时不开 details(恢复 per-node onDoubleClick 的 maskEditActive guard)。
+    if (node.id === maskEditNodeId) return
+    selectNode(node.id)
+    if (node.type === 'text' || node.type === 'annotation' || node.type === 'markup') editTextNode(node.id)
+    else if (node.type === 'frame') promptRenameNode(node.id)
+    else handleOpenNodeDetails(node.id)
+  }, [editTextNode, handleOpenNodeDetails, maskEditNodeId, promptRenameNode, resolveCanvasHit, selectNode, visibleNodes])
+
   return (
     <section
       className={`canvas-shell tool-${interactionMode} ${isPanning ? 'is-panning' : ''} ${
@@ -499,7 +492,8 @@ export function MivoCanvas({
       onPointerCancel={handleCanvasPointerEnd}
       onDragOver={handleCanvasDragOver}
       onDrop={handleCanvasDrop}
-      onContextMenu={openBlankContextMenu}
+      onContextMenu={handleCanvasContextMenu}
+      onDoubleClick={handleCanvasDoubleClick}
       style={{
         backgroundPosition: `${viewport.x}px ${viewport.y}px`,
         backgroundSize: `${36 * viewport.scale}px ${36 * viewport.scale}px`,
@@ -673,21 +667,15 @@ export function MivoCanvas({
               maskEditSubmitting={node.id === maskEditSubmittingNodeId}
               initialMaskClientPoint={initialClientPoint?.nodeId === node.id ? initialClientPoint : undefined}
               viewportScale={viewport.scale}
-              onSelect={selectNode}
-              onPointerDown={wrapNodePointerDown}
               onResizeHandlePointerDown={beginNodeResize}
               onMarkupPointPointerDown={beginMarkupPointMove}
               onTextResizeHandlePointerDown={beginTextResize}
-              onEditText={editTextNode}
-              onRenameNode={promptRenameNode}
               onUpdateText={updateEditingText}
               onFinishTextEdit={finishTextEditing}
               onResizeNodeToContent={updateNodeMeasuredSize}
               onSubmitMaskEdit={submitMaskEdit}
               onCancelMaskEdit={cancelMaskEdit}
               onInitialMaskClientPointHandled={handleInitialClientPointHandled}
-              onOpenDetails={handleOpenNodeDetails}
-              onOpenContextMenu={openNodeContextMenu}
             />
           )
         })}

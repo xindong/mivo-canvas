@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState, type PointerEvent as ReactPo
 import { useCanvasStore } from '../store/canvasStore'
 import type { CanvasId, MivoCanvasNode } from '../types/mivoCanvas'
 import type { ResizeCorner, SnapGuide } from './canvasGeometry'
-import { boundsForNodes, isActiveSelectionRect, previewIdsFromSelectionBox, runtimeToolFor, selectionRectFromBox, shouldStartCanvasSurfaceInteraction, type RuntimeCanvasTool } from './canvasInteraction'
+import { boundsForNodes, isActiveSelectionRect, previewIdsFromSelectionBox, runtimeToolFor, selectionRectFromBox, type RuntimeCanvasTool } from './canvasInteraction'
 import { canvasToolHandlers, type CanvasToolHandlerContext } from './canvasToolHandlers'
 import { isCanvasToolEnabled } from './canvasToolRegistry'
 import { smartSelectionHandlesFor } from './smartSelection'
@@ -14,6 +14,7 @@ import { useBrushStamp } from './useBrushStamp'
 import { useTextAnnotation, isEditableTextNode } from './useTextAnnotation'
 import { useGlobalCanvasEvents } from './useGlobalCanvasEvents'
 import { useZoomTool } from './useZoomTool'
+import { useCanvasHitDispatch } from './interactionDispatch'
 
 export type { TextResizeEdge } from './useTextAnnotation'
 
@@ -24,6 +25,8 @@ type UseCanvasInteractionControllerOptions = {
   selectedNodeIds: string[]
   maskEditNodeId?: string
   onCancelMaskEdit?: () => void
+  cropEditNodeId?: string
+  onCancelCropEdit?: () => void
   onCloseContextMenu: () => void
 }
 
@@ -31,7 +34,7 @@ type UseCanvasInteractionControllerOptions = {
 // returns are destructured to bare stable callbacks so React.memo on
 // CanvasNodeView skips unchanged nodes (object deps would recreate callbacks).
 export function useCanvasInteractionController({
-  shellRef, sceneId, nodes, selectedNodeIds, maskEditNodeId, onCancelMaskEdit, onCloseContextMenu,
+  shellRef, sceneId, nodes, selectedNodeIds, maskEditNodeId, onCancelMaskEdit, cropEditNodeId, onCancelCropEdit, onCloseContextMenu,
 }: UseCanvasInteractionControllerOptions) {
   const [snapGuides, setSnapGuides] = useState<SnapGuide[]>([])
   const [activeSectionDropTargetId, setActiveSectionDropTargetId] = useState<string | undefined>()
@@ -176,18 +179,15 @@ export function useCanvasInteractionController({
     beginTextEdit,
   }), [beginFrameBox, beginMarkupBox, beginNodeMove, beginNodeMoveFromShell, beginPan, beginSelection, beginStampPlacement, beginTextBox, beginTextEdit, beginZoomGesture, startNodeResize])
 
-  const beginNodePointerDown = useCallback(
-    (nodeId: string, event: ReactPointerEvent<HTMLDivElement>) => {
-      activeToolHandler.onNodePointerDown(nodeId, event, toolHandlerContext)
-    }, [activeToolHandler, toolHandlerContext])
-  const beginNodeResize = useCallback(
-    (nodeId: string, corner: ResizeCorner, event: ReactPointerEvent<HTMLButtonElement>) => {
-      activeToolHandler.onResizeHandlePointerDown(nodeId, corner, event, toolHandlerContext)
-    }, [activeToolHandler, toolHandlerContext])
-  const handleCanvasPointerDown = useCallback((event: ReactPointerEvent<HTMLElement>) => {
-    if (!shouldStartCanvasSurfaceInteraction(event.target)) return
-    activeToolHandler.onCanvasPointerDown(event, toolHandlerContext)
+  const { resolveCanvasHit, dispatchPointerDown } = useCanvasHitDispatch({
+    shellRef, viewport: viewportState, nodes, selectedNodeIds, maskEditNodeId, cropEditNodeId,
+    editingTextNodeId, onCancelMaskEdit, onCancelCropEdit, exitTextEdit: discardEmptyEditingText })
+  const beginNodeResize = useCallback((nodeId: string, corner: ResizeCorner, event: ReactPointerEvent<HTMLButtonElement>) => {
+    activeToolHandler.onResizeHandlePointerDown(nodeId, corner, event, toolHandlerContext)
   }, [activeToolHandler, toolHandlerContext])
+  const handleCanvasPointerDown = useCallback(
+    (event: ReactPointerEvent<HTMLElement>) => dispatchPointerDown(event, activeToolHandler, toolHandlerContext),
+    [activeToolHandler, dispatchPointerDown, toolHandlerContext])
 
   // Dispatcher: fan pointer events out to the hook tryMove/tryEnd handlers in
   // the original if-chain order. Each hook owns its ref + branch logic.
@@ -260,8 +260,8 @@ export function useCanvasInteractionController({
     activeConnectorDropTargetId, showGroupSelectionBounds, activeSelectionRect,
     activeTextCreationRect, activeFrameCreationRect, activeMarkupCreationRect, markupCreationBox,
     stampPlacementPreview, selectionPreviewSet, beginGroupResize, beginSelectionSpacingDrag,
-    beginNodePointerDown, beginNodeResize, editTextNode, beginTextResize, beginMarkupPointMove,
-    updateEditingText, finishTextEditing, handleCanvasPointerDown, handleCanvasPointerMove,
+    beginNodeResize, editTextNode, beginTextResize, beginMarkupPointMove, updateEditingText,
+    finishTextEditing, resolveCanvasHit, handleCanvasPointerDown, handleCanvasPointerMove,
     handleCanvasPointerEnd, handleWheel, zoomTo, zoomBy, fitToBounds, fit, fitAll, fitSelection, resetView,
   }
 }

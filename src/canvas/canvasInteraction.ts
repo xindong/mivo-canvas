@@ -129,15 +129,34 @@ export const isEditingTarget = (target: EventTarget | null) => {
 }
 
 export const isCanvasUiTarget = (target: EventTarget | null) => {
-  if (!(target instanceof HTMLElement)) return false
+  // Phase 1b-4 correction: 同 shouldStartCanvasSurfaceInteraction,用 instanceof Element
+  // 接受 SVGElement,否则 UI 容器(如 .node-handle)内的 SVG 图标会因 instanceof HTMLElement
+  // 直接 return false 而绕过 closest 兜底 → 误判为非 UI → 错误通过 dispatch gate。
+  if (!(target instanceof Element)) return false
 
   return Boolean(
     target.closest(
       [
         '.canvas-tool-dock',
         '.canvas-controls',
+        '.canvas-ai-action-bar',
         '.node-context-menu',
+        '.node-action-menu',
+        '.node-action-submenu',
+        '.selection-quick-toolbar',
+        '.selection-quick-toolbar-menu',
+        '.brush-options-bar',
+        '.stamp-options-bar',
+        '.image-crop-overlay',
+        '.image-crop-handle',
+        '.node-handle',
+        '.text-resize-handle',
+        '.markup-point-handle',
+        '.dom-text-editor',
+        '.dom-markup-text-editor',
+        '.empty-canvas-note',
         '.selection-handle',
+        '.selection-spacing-handle',
         '[data-canvas-ui="true"]',
       ].join(', '),
     ),
@@ -145,9 +164,57 @@ export const isCanvasUiTarget = (target: EventTarget | null) => {
 }
 
 export const shouldStartCanvasSurfaceInteraction = (target: EventTarget | null) => {
-  if (!(target instanceof HTMLElement)) return false
-  return !isCanvasUiTarget(target) && !target.closest('.dom-node')
+  // Phase 1b-4 correction: gate 用 instanceof Element(HTMLElement + SVGElement 基类)
+  // 而非 instanceof HTMLElement。line/arrow 的 .markup-hit-line 是 SVG <line>
+  // (pointer-events:stroke),native/dispatch 的 pointerdown target 是 SVGElement,
+  // 旧 instanceof HTMLElement 会拒绝它 → dispatchPointerDown 在 resolveCanvasHit 之前
+  // skip → line/arrow 无法选中(1b-4 dispatch gate 自带缺陷,详设原文写错为 HTMLElement)。
+  // isCanvasUiTarget 的 closest 在 SVGElement 上同样可用,UI 内 SVG(handle 图标等)
+  // 仍被兜底拒绝。旧 DOM 路径 React handler 挂在 div 上、SVG 子元素冒泡进来无 instanceof
+  // 检查,从来不存在这道闸,故此修复不破旧行为。
+  if (!(target instanceof Element)) return false
+  // Phase 1b-4: .dom-node is pointer-events:none; node hits fall through to the
+  // shell which dispatches via resolveCanvasHitAtClientPoint. Only UI targets
+  // (handles/editors/overlays/menus/docks) short-circuit here.
+  return !isCanvasUiTarget(target)
 }
+
+// 1b-4: DOM-first node id resolution for "gesture on visible element" handlers
+// (contextmenu / doubleclick / mask-point armed pending cancel).event.target.closest
+// 跟 DOM 层叠走,绕开 resolveCanvasHit 的 activeEditState 短路(pending mask 窗口
+// resolveCanvasHit 返回 edit-overlay-cancel 而非 node,会导致 shouldCancelPendingMaskEdit
+// 误判 blank 误取消同节点 re-engage)。等节点迁到 Leafer 无 DOM 时这些手势回落坐标兜底。
+export const nodeIdFromDomTarget = (target: EventTarget | null): string | null => {
+  if (!(target instanceof Element)) return null
+  const domNode = target.closest<HTMLElement>('.dom-node[data-node-id]')
+  return domNode?.getAttribute('data-node-id') ?? null
+}
+
+// Shell-level chrome target check (controls/dock/ai-action-bar/menus). Used by
+// handleCanvasContextMenu/DoubleClick to short-circuit UI clicks. Kept here
+// alongside isCanvasUiTarget so UI-gate logic lives in one module.
+export const isCanvasChromeTarget = (target: EventTarget | null) =>
+  target instanceof HTMLElement &&
+  Boolean(
+    target.closest(
+      '[data-canvas-ui="true"], .canvas-controls, .canvas-tool-dock, .canvas-ai-action-bar, .node-context-menu, .empty-canvas-note',
+    ),
+  )
+
+const contextMenuWidth = 252
+const contextMenuMaxHeight = 620
+const contextMenuMargin = 12
+
+export const clampContextMenuPosition = (clientX: number, clientY: number, maxHeight = contextMenuMaxHeight) => ({
+  x: Math.min(
+    Math.max(contextMenuMargin, clientX),
+    Math.max(contextMenuMargin, window.innerWidth - contextMenuWidth - contextMenuMargin),
+  ),
+  y: Math.min(
+    Math.max(contextMenuMargin, clientY),
+    Math.max(contextMenuMargin, window.innerHeight - maxHeight - contextMenuMargin),
+  ),
+})
 
 export const clientPointToCanvas = (
   rect: ClientRectLike | undefined,
