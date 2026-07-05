@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { CanvasNodeSolidFill, ExperimentalAnchor, MivoCanvasNode } from '../types/mivoCanvas'
 import { normalizeCanvasNodeV2 } from '../model/documentModelV2'
+import { Layer } from './layers'
 import {
   frameRenderStyleFor,
   markupRenderStyleFor,
@@ -600,5 +601,39 @@ describe('RenderNode type has no MivoCanvasNode dependency (SC6.1)', () => {
     const r: RenderNode = projectNode(v2ImageNode())
     const ctx: ProjectionContext = { selectedNodeIds: new Set([r.id]) }
     expect(ctx.selectedNodeIds!.has(r.id)).toBe(true)
+  })
+})
+
+describe('projectNode — z-order defaults (2b-2: layer / renderOrder / surface)', () => {
+  it('frame → Layer.Frame; non-frame → Layer.Content', () => {
+    expect(projectNode(v2ImageNode({ type: 'frame' })).layer).toBe(Layer.Frame)
+    expect(projectNode(v2ImageNode()).layer).toBe(Layer.Content)
+    expect(projectNode(v2ImageNode({ type: 'text' })).layer).toBe(Layer.Content)
+    expect(projectNode(v2ImageNode({ type: 'markup' })).layer).toBe(Layer.Content)
+  })
+
+  it('renderOrder defaults to 0', () => {
+    expect(projectNode(v2ImageNode()).renderOrder).toBe(0)
+  })
+
+  it('surface defaults to "canvas"', () => {
+    expect(projectNode(v2ImageNode()).surface).toBe('canvas')
+  })
+
+  it('model does NOT carry layer/renderOrder/surface (persistence boundary)', () => {
+    // projectNode adds these on the render side; normalizeCanvasNodeV2 (the model)
+    // must not — they are render-only, NOT in documentModelV2. Keeps persistence
+    // free of render-layer policy (red line, review P2-1).
+    const n = normalizeCanvasNodeV2(v2ImageNode()) as Record<string, unknown>
+    expect(n.layer).toBeUndefined()
+    expect(n.renderOrder).toBeUndefined()
+    expect(n.surface).toBeUndefined()
+  })
+
+  it('RenderNode exposes layer/renderOrder/surface as typed fields', () => {
+    const r = projectNode(v2ImageNode())
+    expect(typeof r.layer).toBe('number')
+    expect(typeof r.renderOrder).toBe('number')
+    expect(r.surface).toMatch(/^(canvas|overlay)$/)
   })
 })

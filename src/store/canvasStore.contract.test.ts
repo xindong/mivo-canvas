@@ -597,6 +597,52 @@ describe('contract: commitGenerationResult (incl. cross-scene)', () => {
     expect(state.edges.some((edge) => edge.from === 'slot-1' && edge.to === 'slot-1')).toBe(false)
   })
 
+  it('chat slot replacement (kind generate) resizes to the result aspect ratio, equal-area', async () => {
+    // 规格(2026-07-05):chat 占位符恒方形 loading,替换时按结果图自然比例落画布。
+    // mock 资产 sourceDimensions 300×200(3:2),320×320 占位等面积 → 392×261。
+    seed(seedCanvas('character-flow', [aiSlotNode({ id: 'slot-1', x: 44, y: 88 })]))
+
+    await useCanvasStore.getState().commitGenerationResult({
+      sceneId: 'character-flow',
+      sourceNodeId: 'slot-1',
+      replaceSlotId: 'slot-1',
+      resultImages: [resultImage()],
+      prompt: 'wide result',
+      model: 'gpt-image-2',
+      kind: 'generate',
+    })
+
+    const result = useCanvasStore.getState().nodes.find((node) => node.id === 'slot-1')
+    expect(result?.type).toBe('image')
+    expect(result!.width / result!.height).toBeCloseTo(300 / 200, 1)
+    expect(result!.width * result!.height).toBeGreaterThan(320 * 320 * 0.95)
+    expect(result!.width * result!.height).toBeLessThan(320 * 320 * 1.05)
+    expect(result?.x).toBe(44)
+    expect(result?.y).toBe(88)
+  })
+
+  it('mask-edit slot replacement (kind edit) keeps the placeholder size (#86 W2-F5 契约收窄为 mask-edit 专属)', async () => {
+    seed(seedCanvas('character-flow', [
+      imageNode({ id: 'src-1', x: 10, y: 20 }),
+      aiSlotNode({ id: 'slot-1', x: 366, y: 20, width: 320, height: 320 }),
+    ]))
+
+    await useCanvasStore.getState().commitGenerationResult({
+      sceneId: 'character-flow',
+      sourceNodeId: 'slot-1',
+      lineageSourceId: 'src-1',
+      replaceSlotId: 'slot-1',
+      resultImages: [resultImage()],
+      prompt: 'edit area',
+      model: 'gpt-image-2',
+      kind: 'edit',
+    })
+
+    const result = useCanvasStore.getState().nodes.find((node) => node.id === 'slot-1')
+    expect(result?.type).toBe('image')
+    expect({ width: result!.width, height: result!.height }).toEqual({ width: 320, height: 320 })
+  })
+
   it('uses lineageSourceId for replacement lineage without moving the slot result', async () => {
     seed(seedCanvas('character-flow', [
       imageNode({ id: 'src-1', x: 10, y: 20 }),

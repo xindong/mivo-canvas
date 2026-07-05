@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type CSSProperties } from 'react'
 import { useCanvasStore } from '../store/canvasStore'
+import { Layer, layerZIndex } from '../render/layers'
 import type { ExperimentalAnchor, MivoCanvasNode } from '../types/mivoCanvas'
 
 // AnchorOverlay — P2-D2 minimal DOM closed-loop (roadmap §7 组 D).
@@ -213,7 +214,7 @@ export const AnchorOverlay = ({ viewport }: Props) => {
                 cursor: 'pointer',
                 pointerEvents: 'auto',
                 boxSizing: 'border-box',
-                zIndex: 60,
+                zIndex: layerZIndex(Layer.FloatingUI),
               }}
             />
           )
@@ -265,7 +266,7 @@ export const AnchorOverlay = ({ viewport }: Props) => {
             borderRadius: 6,
             boxShadow: '0 2px 8px rgba(0,0,0,0.12)',
             pointerEvents: 'auto',
-            zIndex: 50,
+            zIndex: layerZIndex(Layer.FloatingUI),
             minWidth: 220,
           }}
         >
@@ -326,7 +327,7 @@ const toolbarStyle: CSSProperties = {
   borderRadius: 6,
   boxShadow: '0 1px 4px rgba(0,0,0,0.08)',
   pointerEvents: 'auto',
-  zIndex: 40,
+  zIndex: layerZIndex(Layer.Handles),
 }
 
 const btnStyle: CSSProperties = {
