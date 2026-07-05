@@ -932,7 +932,7 @@ export const runShellSidebarScenario = async (context) => {
       !sidebar.classList.contains('closed') &&
       sidebar.getBoundingClientRect().width > 200 &&
       workspace &&
-      workspace.getBoundingClientRect().left === 0
+      Math.abs(workspace.getBoundingClientRect().left) < 0.5
     )
   })
 }

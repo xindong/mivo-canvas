@@ -79,6 +79,8 @@
   position: fixed;
   inset: var(--floating-gap) auto var(--floating-gap) var(--floating-gap);
   z-index: 80;
+  width: var(--project-sidebar-w);
+  max-width: min(var(--project-sidebar-w), calc(100vw - var(--floating-gap) - var(--floating-gap)));
   height: auto;
   margin: 0;
 }

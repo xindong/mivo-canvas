@@ -1,8 +1,8 @@
 export const runCanvasInteractionsScenario = async (context) => {
   const { canvasStoreSpec, nearlyEqual, page, wait } = context
   const initialCount = context.initialCount ?? await page.locator('.dom-node').count()
-// 画布全铺(2026-07-05):canvas-shell 从 x=0 起(旧起点 268),本文件所有 canvasBox.x 相对
-// 常量整体 +268 保持屏幕坐标与旧布局逐点一致(x<268 现为浮动侧栏卡片覆盖区)。
+  // 画布全铺(2026-07-05):canvas-shell 从 x=0 起(旧起点 268),本文件所有 canvasBox.x 相对
+  // 常量整体 +268 保持屏幕坐标与旧布局逐点一致(x<268 现为浮动侧栏卡片覆盖区)。
   const shortcutModifier = process.platform === 'darwin'
     ? { metaKey: true, ctrlKey: false }
     : { metaKey: false, ctrlKey: true }
