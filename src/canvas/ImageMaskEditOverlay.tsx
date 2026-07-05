@@ -10,6 +10,7 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from 'react'
 import { createPortal } from 'react-dom'
+import { qualityDisplayLabel } from '../app/chat/chatDisplayLabels'
 import { debugLogger } from '../store/debugLogStore'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 import type { MivoImageQuality } from '../types/generation'
@@ -77,6 +78,17 @@ const floatingToolbarHeight = 114
 const floatingPromptHeight = 146
 const floatingControlsMinWidth = 320
 const floatingControlsMaxWidth = 420
+
+// Mask edit always targets gpt-image-2 (maskEditGeneration.submitEditTask hardcodes
+// model: 'gpt-image-2'), so the platform-image resolution map always applies.
+// Mirrors RatioPopover's qualityTitleFor so the two surfaces share文案 + 分辨率提示
+// 模式（high 带「更耗时」）；auto 无分辨率映射，返回 undefined 与 chat 一致。
+const qualityTitleFor = (quality: 'auto' | MivoImageQuality): string | undefined => {
+  const resolutionMap: Record<MivoImageQuality, string> = { high: '2K', medium: '1K', low: '1K' }
+  const res = resolutionMap[quality as MivoImageQuality]
+  if (!res) return undefined
+  return `${qualityDisplayLabel(quality)}质量（${res}${quality === 'high' ? '，更耗时' : ''}）`
+}
 
 const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max)
 
@@ -164,11 +176,12 @@ export function ImageMaskEditOverlay({
   const stageRef = useRef<HTMLDivElement | null>(null)
   const [tool, setTool] = useState<ImageMaskTool>('point')
   const [prompt, setPrompt] = useState('')
-  // W2.1: quality low/medium toggle on the overlay; default medium.
-  // Mirrors RatioPopover's quality row pattern but inlined (overlay is a floating
-  // panel, not a popover). FIX-5: 冒烟实测 low≈medium 延迟（low 不提速），默认改回
-  // medium；low/medium 选择器供成本权衡（low 省 upstream 算力/成本），不再以提速为由。
-  const [quality, setQuality] = useState<MivoImageQuality>('medium')
+  // Quality selector mirrors the chat RatioPopover four-tier options (auto/low/
+  // medium/high). Default 'auto' = payload.quality 留 undefined 一路穿透到 BFF
+  // (submitEditTask 不带 quality 字段，与 chat 生图路径一致)，server
+  // normalizeMivoQuality 对缺省默认即 medium，行为不回退。high 文案带「更耗时」，
+  // 复用 qualityDisplayLabel + chat 的分辨率提示模式，保持两处 UI 同源。
+  const [quality, setQuality] = useState<'auto' | MivoImageQuality>('auto')
   const [regions, setRegions] = useState<ImageMaskRegion[]>([])
   const [pointAnchors, setPointAnchors] = useState<PointAnchor[]>([])
   const [past, setPast] = useState<MaskEditSnapshot[]>([])
@@ -522,7 +535,7 @@ export function ImageMaskEditOverlay({
         mask,
         maskBounds: regions.length ? boundsForRegions(regions, naturalSize) : undefined,
         sourceSize: naturalSize,
-        quality,
+        quality: quality === 'auto' ? undefined : quality,
       })
     } catch (error) {
       setStatusError(error instanceof Error ? error.message : '局部重绘失败。')
@@ -648,7 +661,7 @@ export function ImageMaskEditOverlay({
           {statusError ? <div className="image-mask-edit-error">{statusError}</div> : null}
           <div className="image-mask-edit-quality" data-canvas-ui="true" data-quality={quality}>
             <span className="image-mask-edit-quality-label">质量</span>
-            {(['low', 'medium'] as const).map((q) => (
+            {(['auto', 'low', 'medium', 'high'] as const).map((q) => (
               <button
                 key={q}
                 type="button"
@@ -656,9 +669,9 @@ export function ImageMaskEditOverlay({
                 onClick={() => setQuality(q)}
                 disabled={submitting}
                 aria-pressed={quality === q}
-                title={q === 'low' ? '低质量（1K，省算力）' : '中质量（1K，更细致）'}
+                title={qualityTitleFor(q)}
               >
-                {q === 'low' ? '低' : '中'}
+                {qualityDisplayLabel(q)}
               </button>
             ))}
           </div>

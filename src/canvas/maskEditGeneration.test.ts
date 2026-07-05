@@ -277,3 +277,71 @@ describe('runMaskEditGeneration cancel (FIX-1: DELETE the in-flight task)', () =
     expect(taskClientSpies.cancelTask).toHaveBeenCalledTimes(1)
   })
 })
+
+// Quality parity (auto/low/medium/high): overlay 四档选择器 → payload.quality →
+// runMaskEditGeneration 透传 → submitEditTask request.quality。auto = undefined 一路
+// 穿透（不带 quality 字段，与 chat 生图路径一致）；low/medium/high 原样下发。
+// 证据：四档各自 submitEditTask 调用的 request.quality 实际值。
+//
+// 测试让 pollTask 直接返回 failed，runOneAttempt 抛错 → 外层 catch 跳过 commit
+// 直接 rethrow（canceled=false → 不走 cancelTask）。这样只验证 submitEditTask 收
+// 到的 request.quality，不耦合 commitGenerationResult 的全流程。
+describe('runMaskEditGeneration quality pass-through (auto/low/medium/high parity)', () => {
+  beforeEach(() => {
+    taskClientSpies.submitEditTask.mockReset()
+    taskClientSpies.pollTask.mockReset()
+    taskClientSpies.cancelTask.mockReset()
+    inspectBlackPlateSpy.mockReset()
+  })
+
+  const baseSubmitPayload = {
+    prompt: 'p',
+    sourceSize: { width: 200, height: 200 },
+    // No maskBounds → black-plate inspection skipped (canInspect=false).
+  }
+
+  const runFor = (quality: 'auto' | 'low' | 'medium' | 'high') => {
+    const source = imageNode({ id: 'src-1' })
+    seed(seedCanvas('character-flow', [source]))
+    const { slotId } = prepareMaskEditPlaceholder('character-flow', source, 'p')
+    taskClientSpies.submitEditTask.mockResolvedValueOnce('task-q')
+    taskClientSpies.pollTask.mockResolvedValueOnce({
+      status: 'failed', progress: 0, stage: 'submit', error: 'upstream boom',
+    })
+    return runMaskEditGeneration({
+      sceneId: 'character-flow',
+      source,
+      slotId,
+      resolvedAssetUrl: undefined,
+      payload: {
+        ...baseSubmitPayload,
+        quality: quality === 'auto' ? undefined : (quality as never),
+      } as never,
+      imgRatio: '1:1' as never,
+      signal: new AbortController().signal,
+    })
+  }
+
+  const capturedRequest = (): { quality?: string } =>
+    taskClientSpies.submitEditTask.mock.calls.at(-1)?.[0] as { quality?: string }
+
+  it('auto → submitEditTask request.quality 为 undefined（不带 quality 字段，对齐 chat 生图路径）', async () => {
+    await expect(runFor('auto')).rejects.toThrow()
+    expect(capturedRequest().quality).toBeUndefined()
+  })
+
+  it('low → submitEditTask request.quality === "low"', async () => {
+    await expect(runFor('low')).rejects.toThrow()
+    expect(capturedRequest().quality).toBe('low')
+  })
+
+  it('medium → submitEditTask request.quality === "medium"', async () => {
+    await expect(runFor('medium')).rejects.toThrow()
+    expect(capturedRequest().quality).toBe('medium')
+  })
+
+  it('high → submitEditTask request.quality === "high"', async () => {
+    await expect(runFor('high')).rejects.toThrow()
+    expect(capturedRequest().quality).toBe('high')
+  })
+})
