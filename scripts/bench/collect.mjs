@@ -3,12 +3,15 @@ import { spawn } from 'node:child_process'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import process from 'node:process'
 import { chromium } from 'playwright'
+import { PNG } from 'pngjs'
 import {
   DEFAULT_FIXTURE_SEED,
   SUPPORTED_DPRS,
   SUPPORTED_NODE_COUNTS,
+  boundsForNodes,
   fixturePathFor,
   projectRoot,
+  viewportForBounds,
   writeFixtureFiles,
 } from './fixture-lib.mjs'
 
@@ -92,6 +95,8 @@ const parseArgs = (argv) => {
     renderer: 'dom',
     culling: 'on',
     panCache: 'off',
+    virtualize: 'off',
+    fixtureProfile: 'mixed',
     seed: DEFAULT_FIXTURE_SEED,
     date: DEFAULT_DATE,
     output: undefined,
@@ -148,10 +153,26 @@ const parseArgs = (argv) => {
       continue
     }
 
+    if (entry.startsWith('--virtualize=')) {
+      const value = entry.slice('--virtualize='.length).trim()
+      if (value !== 'on' && value !== 'off') throw new Error(`Invalid --virtualize value: ${value} (expected on|off)`)
+      options.virtualize = value
+      continue
+    }
+
     if (entry.startsWith('--seed=')) {
       const seed = Number.parseInt(entry.slice('--seed='.length), 10)
       if (!Number.isFinite(seed)) throw new Error(`Invalid --seed value: ${entry}`)
       options.seed = seed
+      continue
+    }
+
+    if (entry.startsWith('--fixture-profile=')) {
+      const value = entry.slice('--fixture-profile='.length).trim()
+      if (value !== 'mixed' && value !== 'large-images') {
+        throw new Error(`Invalid --fixture-profile value: ${value} (expected mixed|large-images)`)
+      }
+      options.fixtureProfile = value
       continue
     }
 
@@ -280,6 +301,38 @@ const startDevServer = async (port) => {
 
 const loadFixture = async (nodeCount) => JSON.parse(await readFile(fixturePathFor(nodeCount), 'utf8'))
 
+const fixtureWithProfile = (fixture, profile) => {
+  if (profile !== 'large-images') return fixture
+
+  const clone = structuredClone(fixture)
+  clone.snapshot.sceneId = `${clone.snapshot.sceneId}-large-images`
+  clone.snapshot.nodes = clone.snapshot.nodes.map((node, index) => {
+    if (node.type !== 'image') return node
+    const width = 520 + (index % 3) * 120
+    const height = 700 + (index % 4) * 90
+    return {
+      ...node,
+      title: `${node.title} large`,
+      width,
+      height,
+      generation: {
+        ...node.generation,
+        size: `${width * 4}x${height * 4}`,
+      },
+    }
+  })
+  const bounds = boundsForNodes(clone.snapshot.nodes)
+  clone.meta = {
+    ...clone.meta,
+    sceneId: clone.snapshot.sceneId,
+    label: `${clone.meta.nodeCount} large-image benchmark fixture`,
+    profile,
+    bounds,
+    recommendedViewport: viewportForBounds(bounds),
+  }
+  return clone
+}
+
 const installBenchRuntime = async (page) => {
   await page.evaluate(() => {
     // FU4-2: the canvas store now persists to IndexedDB (no 5MB quota), but the
@@ -344,7 +397,8 @@ const installBenchRuntime = async (page) => {
         const startedAt = performance.now()
         let settled = false
         const requestedRenderer = new URLSearchParams(window.location.search).get('renderer') || 'dom'
-        let lastSnapshot = { totalNodeCount: null, viewportScale: 0, rendererMode: null, leaferChildren: 0, leaferExpectedChildren: 0, leaferPixelNonEmpty: false, pixiChildren: 0, pixiExpectedChildren: 0, pixiPixelNonEmpty: false }
+        const requestedVirtualize = new URLSearchParams(window.location.search).get('virtualize') || 'off'
+        let lastSnapshot = { totalNodeCount: null, viewportScale: 0, rendererMode: null, leaferChildren: 0, leaferExpectedChildren: 0, leaferPixelNonEmpty: false, pixiChildren: 0, pixiExpectedChildren: 0, pixiPixelNonEmpty: false, virtualizeActive: false, virtualizePending: false, virtualizeMaterialized: 0, virtualizeTarget: 0 }
         while (performance.now() - startedAt < 15000) {
           const nextShell = document.querySelector('.canvas-shell')
           const totalNodeCount = nextShell?.getAttribute('data-total-node-count')
@@ -355,6 +409,10 @@ const installBenchRuntime = async (page) => {
           const pixiExpectedChildren = Number(nextShell?.getAttribute('data-pixi-expected-children') || 0)
           const pixiChildren = Number(nextShell?.getAttribute('data-pixi-children') || 0)
           const pixiPixelNonEmpty = nextShell?.getAttribute('data-pixi-pixel-nonempty') === 'true'
+          const virtualizeActive = nextShell?.getAttribute('data-virtualize-active') === 'true'
+          const virtualizePending = nextShell?.getAttribute('data-virtualize-pending') === 'true'
+          const virtualizeMaterialized = Number(nextShell?.getAttribute('data-virtualize-materialized-node-count') || 0)
+          const virtualizeTarget = Number(nextShell?.getAttribute('data-virtualize-target-node-count') || 0)
           lastSnapshot = {
             totalNodeCount,
             viewportScale,
@@ -365,6 +423,10 @@ const installBenchRuntime = async (page) => {
             pixiChildren,
             pixiExpectedChildren,
             pixiPixelNonEmpty,
+            virtualizeActive,
+            virtualizePending,
+            virtualizeMaterialized,
+            virtualizeTarget,
           }
           const leaferReady =
             requestedRenderer !== 'leafer' ||
@@ -372,7 +434,10 @@ const installBenchRuntime = async (page) => {
           const pixiReady =
             requestedRenderer !== 'pixi' ||
             (pixiExpectedChildren > 0 && pixiChildren === pixiExpectedChildren && pixiPixelNonEmpty)
-          if (totalNodeCount === expectedNodeCount && Math.abs(viewportScale - expectedScale) < 0.01 && leaferReady && pixiReady) {
+          const virtualizeReady =
+            requestedVirtualize !== 'on' ||
+            (virtualizeActive && !virtualizePending && virtualizeTarget > 0 && virtualizeMaterialized === virtualizeTarget)
+          if (totalNodeCount === expectedNodeCount && Math.abs(viewportScale - expectedScale) < 0.01 && leaferReady && pixiReady && virtualizeReady) {
             settled = true
             break
           }
@@ -394,6 +459,14 @@ const installBenchRuntime = async (page) => {
         const pixiPixelNonEmpty = currentShell?.getAttribute('data-pixi-pixel-nonempty') === 'true'
         const pixiPixelSampleCount = Number(currentShell?.getAttribute('data-pixi-pixel-sample-count') || 0)
         const pixiSyncVersion = Number(currentShell?.getAttribute('data-pixi-sync-version') || 0)
+        const virtualizeMode = currentShell?.getAttribute('data-virtualize-mode') || 'off'
+        const virtualizeActive = currentShell?.getAttribute('data-virtualize-active') === 'true'
+        const virtualizePending = currentShell?.getAttribute('data-virtualize-pending') === 'true'
+        const virtualizeTargetNodeCount = Number(currentShell?.getAttribute('data-virtualize-target-node-count') || 0)
+        const virtualizeMaterializedNodeCount = Number(currentShell?.getAttribute('data-virtualize-materialized-node-count') || 0)
+        const virtualizeOverscanPx = Number(currentShell?.getAttribute('data-virtualize-overscan-px') || 0)
+        const virtualizeBatchRuns = Number(currentShell?.getAttribute('data-virtualize-batch-runs') || 0)
+        const virtualizeReconcileVersion = Number(currentShell?.getAttribute('data-virtualize-reconcile-version') || 0)
         if (!settled || actualNodeCount !== expectedNodeCount || Math.abs(actualScale - expectedScale) >= 0.01) {
           throw new Error(
             `waitForRender did not settle within 15s: expected nodeCount=${expectedNodeCount} scale=${expectedScale} renderer=${requestedRenderer}, `
@@ -415,6 +488,14 @@ const installBenchRuntime = async (page) => {
           pixiPixelNonEmpty,
           pixiPixelSampleCount,
           pixiSyncVersion,
+          virtualizeMode,
+          virtualizeActive,
+          virtualizePending,
+          virtualizeTargetNodeCount,
+          virtualizeMaterializedNodeCount,
+          virtualizeOverscanPx,
+          virtualizeBatchRuns,
+          virtualizeReconcileVersion,
           viewportScale: actualScale,
           viewportX: Number(currentShell?.getAttribute('data-viewport-x') || 0),
           viewportY: Number(currentShell?.getAttribute('data-viewport-y') || 0),
@@ -762,11 +843,60 @@ const readRenderState = (page) =>
       pixiSyncVersion: Number(shell?.getAttribute('data-pixi-sync-version') || 0),
       pixiTextStrategy: shell?.getAttribute('data-pixi-text-strategy') || 'none',
       pixiTexturePoolSize: Number(shell?.getAttribute('data-pixi-texture-pool-size') || 0),
+      virtualizeMode: shell?.getAttribute('data-virtualize-mode') || 'off',
+      virtualizeActive: shell?.getAttribute('data-virtualize-active') === 'true',
+      virtualizePending: shell?.getAttribute('data-virtualize-pending') === 'true',
+      virtualizeTargetNodeCount: Number(shell?.getAttribute('data-virtualize-target-node-count') || 0),
+      virtualizeMaterializedNodeCount: Number(shell?.getAttribute('data-virtualize-materialized-node-count') || 0),
+      virtualizeOverscanPx: Number(shell?.getAttribute('data-virtualize-overscan-px') || 0),
+      virtualizeBatchRuns: Number(shell?.getAttribute('data-virtualize-batch-runs') || 0),
+      virtualizeReconcileVersion: Number(shell?.getAttribute('data-virtualize-reconcile-version') || 0),
       viewportScale: Number(shell?.getAttribute('data-viewport-scale') || 0),
     }
   })
 
-const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, renderer, culling, panCache, includeDrag }) => {
+const sampleDomPixels = async (page) => {
+  const boxes = await page.evaluate(() => {
+    const viewportWidth = window.innerWidth
+    const viewportHeight = window.innerHeight
+    return Array.from(document.querySelectorAll('[data-node-id]'))
+      .map((element) => {
+        const rect = element.getBoundingClientRect()
+        return { left: rect.left, top: rect.top, width: rect.width, height: rect.height }
+      })
+      .filter((rect) => rect.width > 8 && rect.height > 8 && rect.left < viewportWidth && rect.top < viewportHeight && rect.left + rect.width > 0 && rect.top + rect.height > 0)
+      .slice(0, 24)
+  })
+  if (!boxes.length) return { nonEmpty: false, sampleCount: 0 }
+
+  const screenshot = PNG.sync.read(await page.screenshot({ type: 'png' }))
+  let nonBackgroundSamples = 0
+  let sampleCount = 0
+  for (const box of boxes) {
+    const points = [
+      [0.35, 0.35],
+      [0.5, 0.5],
+      [0.65, 0.65],
+    ]
+    for (const [px, py] of points) {
+      const x = Math.max(0, Math.min(screenshot.width - 1, Math.round(box.left + box.width * px)))
+      const y = Math.max(0, Math.min(screenshot.height - 1, Math.round(box.top + box.height * py)))
+      const offset = (y * screenshot.width + x) * 4
+      const r = screenshot.data[offset]
+      const g = screenshot.data[offset + 1]
+      const b = screenshot.data[offset + 2]
+      const a = screenshot.data[offset + 3]
+      sampleCount += 1
+      if (a > 0 && (Math.abs(r - 248) > 8 || Math.abs(g - 247) > 8 || Math.abs(b - 242) > 8)) {
+        nonBackgroundSamples += 1
+      }
+    }
+  }
+
+  return { nonEmpty: nonBackgroundSamples > 0, sampleCount }
+}
+
+const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, renderer, culling, panCache, virtualize, includeDrag }) => {
   const context = await browser.newContext({
     viewport: { width: 1920, height: 1080 },
     deviceScaleFactor: dpr,
@@ -774,7 +904,7 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, rendere
   })
   const page = await context.newPage()
   await page.emulateMedia({ reducedMotion: 'reduce' })
-  const canvasUrl = `http://127.0.0.1:${port}/?renderer=${encodeURIComponent(renderer)}&culling=${encodeURIComponent(culling)}&panCache=${encodeURIComponent(panCache)}`
+  const canvasUrl = `http://127.0.0.1:${port}/?renderer=${encodeURIComponent(renderer)}&culling=${encodeURIComponent(culling)}&panCache=${encodeURIComponent(panCache)}&virtualize=${encodeURIComponent(virtualize)}`
   await page.goto(canvasUrl, { waitUntil: 'networkidle' })
   await page.addStyleTag({
     content: [
@@ -812,6 +942,11 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, rendere
     await page.evaluate((inputFixture) => globalThis.__MIVO_BENCH__.waitForRender(inputFixture), fixture)
   })
   const renderState = await readRenderState(page)
+  if (renderer === 'dom') {
+    const domPixelEvidence = await sampleDomPixels(page)
+    renderState.domPixelNonEmpty = domPixelEvidence.nonEmpty
+    renderState.domPixelSampleCount = domPixelEvidence.sampleCount
+  }
   // Double-check: waitForRender throws on non-settle inside the page, but assert again here so
   // a silently-skipped render or a renderer-mode/culling mismatch can never write a bogus baseline.
   if (renderState.rendererMode !== renderer) {
@@ -851,10 +986,34 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, rendere
       throw new Error(`Bench Pixi evidence invalid: textStrategy=${renderState.pixiTextStrategy}, expected bitmap`)
     }
   }
+  if (renderer === 'dom') {
+    if (virtualize === 'on') {
+      if (!renderState.virtualizeActive) {
+        throw new Error('Bench DOM virtualization evidence invalid: requested virtualize=on but shell reports inactive')
+      }
+      if (renderState.virtualizePending) {
+        throw new Error('Bench DOM virtualization evidence invalid: batch reconcile still pending')
+      }
+      if (renderState.virtualizeTargetNodeCount <= 0 || renderState.virtualizeMaterializedNodeCount <= 0) {
+        throw new Error('Bench DOM virtualization evidence invalid: materialized/target count is 0')
+      }
+      if (renderState.virtualizeMaterializedNodeCount !== renderState.virtualizeTargetNodeCount) {
+        throw new Error(`Bench DOM virtualization evidence mismatch: materialized=${renderState.virtualizeMaterializedNodeCount}, target=${renderState.virtualizeTargetNodeCount}`)
+      }
+    }
+    if (!renderState.domPixelNonEmpty) {
+      throw new Error(`Bench DOM evidence invalid: screenshot pixel sample empty (samples=${renderState.domPixelSampleCount || 0})`)
+    }
+  }
   const afterRenderHeap = await cdpSession.send('Runtime.getHeapUsage')
 
   const pan = await runAction('canvas-pan', () => panCanvas(page))
   const afterPanRenderState = await readRenderState(page)
+  if (renderer === 'dom') {
+    const domPixelEvidence = await sampleDomPixels(page)
+    afterPanRenderState.domPixelNonEmpty = domPixelEvidence.nonEmpty
+    afterPanRenderState.domPixelSampleCount = domPixelEvidence.sampleCount
+  }
   if (renderer === 'leafer' && panCache === 'on' && afterPanRenderState.leaferPanCacheCaptures < 1) {
     throw new Error('Bench Leafer pan-cache evidence invalid: pan completed without a snapshot capture')
   }
@@ -886,6 +1045,8 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, rendere
       cullingActual: renderState.cullingMode,
       panCacheRequested: panCache,
       panCacheActual: renderState.leaferPanCacheEnabled ? 'on' : 'off',
+      virtualizeRequested: virtualize,
+      virtualizeActual: renderState.virtualizeActive ? 'on' : 'off',
       pixiTextStrategy: renderState.pixiTextStrategy,
       pixiTexturePoolSize: renderState.pixiTexturePoolSize,
     },
@@ -893,6 +1054,7 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, rendere
       sceneId: fixture.meta.sceneId,
       nodeCount: fixture.meta.nodeCount,
       seed: fixture.meta.seed,
+      profile: fixture.meta.profile || 'mixed',
       counts: fixture.meta.counts,
     },
     loadFixtureMs: round(load.summary.durationMs),
@@ -951,7 +1113,7 @@ const main = async () => {
   try {
     const configs = []
     for (const nodeCount of options.nodes) {
-      const fixture = await loadFixture(nodeCount)
+      const fixture = fixtureWithProfile(await loadFixture(nodeCount), options.fixtureProfile)
       const dprResults = []
       for (const dpr of options.dprs) {
         const runs = []
@@ -963,9 +1125,10 @@ const main = async () => {
             runIndex,
             port: options.port,
             renderer: options.renderer,
-            culling: options.culling,
-            panCache: options.panCache,
-            includeDrag: options.includeDrag,
+          culling: options.culling,
+          panCache: options.panCache,
+          virtualize: options.virtualize,
+          includeDrag: options.includeDrag,
           })
           assertTraceMarks(run)
           runs.push(run)
@@ -984,6 +1147,13 @@ const main = async () => {
         renderSyncMs: result.median.renderSyncMs,
         rendererMode: result.runs[0]?.renderer?.actual || options.renderer,
         cullingMode: result.runs[0]?.renderer?.cullingActual || options.culling,
+        virtualizeMode: result.runs[0]?.renderState?.virtualizeMode,
+        virtualizeActive: result.runs[0]?.renderState?.virtualizeActive,
+        virtualizeTargetNodeCount: result.runs[0]?.renderState?.virtualizeTargetNodeCount,
+        virtualizeMaterializedNodeCount: result.runs[0]?.renderState?.virtualizeMaterializedNodeCount,
+        virtualizeOverscanPx: result.runs[0]?.renderState?.virtualizeOverscanPx,
+        domPixelNonEmpty: result.runs[0]?.renderState?.domPixelNonEmpty,
+        domPixelSampleCount: result.runs[0]?.renderState?.domPixelSampleCount,
         renderedNodeCount: result.runs[0]?.renderState?.renderedNodeCount,
         leaferExpectedChildren: result.runs[0]?.renderState?.leaferExpectedChildren,
         leaferChildren: result.runs[0]?.renderState?.leaferChildren,
@@ -1022,6 +1192,8 @@ const main = async () => {
         cullingModeActual: configs[0]?.dprResults[0]?.runs[0]?.renderer?.cullingActual || options.culling,
         panCache: options.panCache,
         panCacheActual: configs[0]?.dprResults[0]?.runs[0]?.renderer?.panCacheActual || options.panCache,
+        virtualize: options.virtualize,
+        virtualizeActual: configs[0]?.dprResults[0]?.runs[0]?.renderer?.virtualizeActual || options.virtualize,
         date: options.date,
         referenceMachine: 'same-machine-only',
         browser: 'Chromium via Playwright',
@@ -1029,6 +1201,7 @@ const main = async () => {
         dprs: options.dprs,
         runsPerConfig: options.runs,
         seed: options.seed,
+        fixtureProfile: options.fixtureProfile,
         motion: 'prefers-reduced-motion + transition/animation disabled',
         syncMeasurement: 'replaceSnapshot(full snapshot) until expected node count / viewport settle',
         segments: options.includeDrag

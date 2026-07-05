@@ -22,6 +22,8 @@ import {
   type Viewport,
 } from './canvasInteraction'
 import { screenToCanvas as screenToCanvasPoint } from '../render/viewportMatrix'
+import { cullingMode } from '../render/cullingMode'
+import { virtualizationMode } from '../render/virtualizationMode'
 
 export const defaultViewportFor = (sceneId: string): Viewport => ({
   x: 420,
@@ -63,6 +65,8 @@ const panCacheEnabledFromUrl = () => {
   return value === 'on' || value === 'true' || value === '1'
 }
 
+const virtualizedPanEnabled = () => virtualizationMode === 'on' && cullingMode === 'on'
+
 const applyViewportImperatively = (shell: HTMLElement | null, viewport: Viewport) => {
   if (!shell) return
   shell.dataset.viewportScale = String(viewport.scale)
@@ -95,6 +99,8 @@ export function useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseCo
   const viewportRef = useRef<Viewport>(initialViewportFor(sceneId))
   const panRef = useRef<PanState | null>(null)
   const panCacheEnabled = useMemo(() => panCacheEnabledFromUrl(), [])
+  const freezePanEnabled = panCacheEnabled || virtualizedPanEnabled()
+  const virtualizeCommitTimerRef = useRef<number | undefined>(undefined)
   const persistedSceneRef = useRef(sceneId)
   const viewportPersistenceTimerRef = useRef<number | undefined>(undefined)
   const [viewport, setViewport] = useState<Viewport>(() => initialViewportFor(sceneId))
@@ -217,6 +223,7 @@ export function useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseCo
   // sequence (pointer capture + cross-cutting cleanup + clearSelection + startPan).
   const startPan = useCallback(
     (event: ReactPointerEvent<HTMLElement>) => {
+      window.clearTimeout(virtualizeCommitTimerRef.current)
       setIsPanning(true)
       panRef.current = createPanState(event.pointerId, event.clientX, event.clientY, viewportRef.current)
     },
@@ -228,7 +235,7 @@ export function useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseCo
     (event: ReactPointerEvent<HTMLElement>): boolean => {
       const pan = panRef.current
       if (pan?.pointerId !== event.pointerId) return false
-      if (panCacheEnabled) {
+      if (freezePanEnabled) {
         const nextViewport = viewportFromPan(pan, event.clientX, event.clientY, viewportRef.current)
         viewportRef.current = nextViewport
         applyViewportImperatively(shellRef.current, nextViewport)
@@ -237,7 +244,7 @@ export function useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseCo
       setViewport((current) => viewportFromPan(pan, event.clientX, event.clientY, current))
       return true
     },
-    [panCacheEnabled, shellRef],
+    [freezePanEnabled, shellRef],
   )
 
   // Dispatcher (handleCanvasPointerEnd) pan branch.
@@ -245,6 +252,10 @@ export function useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseCo
     if (panRef.current?.pointerId === event.pointerId) {
       panRef.current = null
       if (panCacheEnabled) setViewport(viewportRef.current)
+      else if (virtualizedPanEnabled()) {
+        window.clearTimeout(virtualizeCommitTimerRef.current)
+        virtualizeCommitTimerRef.current = window.setTimeout(() => setViewport(viewportRef.current), 120)
+      }
       setIsPanning(false)
     }
   }, [panCacheEnabled])
@@ -252,13 +263,15 @@ export function useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseCo
   // Window blur reset (unconditional).
   const resetPan = useCallback(() => {
     panRef.current = null
-    if (panCacheEnabled) setViewport(viewportRef.current)
+    window.clearTimeout(virtualizeCommitTimerRef.current)
+    if (freezePanEnabled) setViewport(viewportRef.current)
     setIsPanning(false)
-  }, [panCacheEnabled])
+  }, [freezePanEnabled])
 
   // Scene reset (called from the controller's cross-cutting scene-reset rAF).
   const resetViewportForScene = useCallback((nextSceneId: CanvasId) => {
     persistedSceneRef.current = nextSceneId
+    window.clearTimeout(virtualizeCommitTimerRef.current)
     setViewport(initialViewportFor(nextSceneId))
     setIsPanning(false)
     panRef.current = null
