@@ -30,6 +30,7 @@ import { SelectionQuickToolbar } from './SelectionQuickToolbar'
 import { StampOptionsBar } from './StampOptionsBar'
 import { stampCursorCssFor, stampGrowthSizes, stampSrcFor } from './stampDefs'
 import { useCanvasInteractionController } from './useCanvasInteractionController'
+import { clampContextMenuPosition, isCanvasChromeTarget, nodeIdFromDomTarget } from './canvasInteraction'
 import { useMaskPointArmed, type MaskPointArmedInteractionApi } from './useMaskPointArmed'
 import { lockedNodeIdSetFor } from './useNodeTransform'
 import { rendererMode } from '../render/rendererMode'
@@ -55,29 +56,6 @@ type MivoCanvasProps = {
 }
 
 export type ExternalAssetDropHandler = (dataTransfer: DataTransfer, clientX: number, clientY: number) => boolean
-
-const contextMenuWidth = 252
-const contextMenuMaxHeight = 620
-const contextMenuMargin = 12
-
-const clampContextMenuPosition = (clientX: number, clientY: number, maxHeight = contextMenuMaxHeight) => ({
-  x: Math.min(
-    Math.max(contextMenuMargin, clientX),
-    Math.max(contextMenuMargin, window.innerWidth - contextMenuWidth - contextMenuMargin),
-  ),
-  y: Math.min(
-    Math.max(contextMenuMargin, clientY),
-    Math.max(contextMenuMargin, window.innerHeight - maxHeight - contextMenuMargin),
-  ),
-})
-
-const isCanvasChromeTarget = (target: EventTarget | null) =>
-  target instanceof HTMLElement &&
-  Boolean(
-    target.closest(
-      '[data-canvas-ui="true"], .canvas-controls, .canvas-tool-dock, .canvas-ai-action-bar, .node-context-menu, .empty-canvas-note',
-    ),
-  )
 
 const canvasRenderOverscanPx = 520
 
@@ -455,15 +433,8 @@ export function MivoCanvas({
   const handleCanvasContextMenu = useCallback((event: ReactMouseEvent<HTMLElement>) => {
     if (isCanvasChromeTarget(event.target)) return
     event.preventDefault(); event.stopPropagation()
-    // 1b-4: contextmenu 优先用 event.target 的 .dom-node[data-node-id] 确定节点
-    // (恢复 per-node onContextMenu 语义:右键哪个 DOM 开哪个菜单)。resolveCanvasHit(坐标)
-    // 对"section 含 image"等容器场景会命中子节点(image back-to-front 优先),误开子节点菜单。
-    // event.target.closest 直接跟 DOM 层叠走,与 origin/main per-node 行为一致;等节点迁到
-    // Leafer 无 DOM 时自然回落 resolveCanvasHit 坐标兜底路径(fallback 已是这个结构)。
-    const domNode = event.target instanceof Element
-      ? event.target.closest<HTMLElement>('.dom-node[data-node-id]')
-      : null
-    const targetNodeId = domNode?.getAttribute('data-node-id') ?? null
+    // DOM-first(见 nodeIdFromDomTarget):右键哪个 DOM 开哪个菜单,fallback 坐标兜底空白。
+    const targetNodeId = nodeIdFromDomTarget(event.target)
     if (targetNodeId) {
       if (!selectedNodeIds.includes(targetNodeId)) selectNode(targetNodeId)
       openNodeContextMenu(targetNodeId, event.clientX, event.clientY); return
@@ -479,23 +450,15 @@ export function MivoCanvas({
 
   const handleCanvasDoubleClick = useCallback((event: ReactMouseEvent<HTMLElement>) => {
     if (isCanvasChromeTarget(event.target)) return
-    // 1b-4: dblclick 同 contextmenu,优先用 event.target.closest('.dom-node[data-node-id]')
-    // 取 nodeId(针对可见元素的手势跟 DOM 层叠走),取不到才 fallback 坐标命中。双击 line/arrow
-    // stroke(target=.markup-hit-line SVG)→ closest 到 markup 节点,比坐标命中更直接更稳。
-    const domNode = event.target instanceof Element
-      ? event.target.closest<HTMLElement>('.dom-node[data-node-id]')
-      : null
-    const targetNodeId = domNode?.getAttribute('data-node-id') ?? null
+    // DOM-first(见 nodeIdFromDomTarget):双击哪个 DOM 处理哪个,fallback 坐标兜底。
+    const targetNodeId = nodeIdFromDomTarget(event.target)
     const target = targetNodeId
       ? { kind: 'node' as const, nodeId: targetNodeId }
       : resolveCanvasHit(event.clientX, event.clientY)
     if (target?.kind !== 'node') return
     const node = visibleNodes.find((item) => item.id === target.nodeId)
     if (!node) return
-    // 1b-4: 恢复 per-node onDoubleClick 的 maskEditActive guard——mask overlay 开着时
-    // 双击该节点(含 mask overlay 内的点击,target 经 closest 落到 image .dom-node)
-    // 不应开 details / rename / edit,让 mask overlay 自己处理。等价 origin/main
-    // CanvasNodeView image onDoubleClick 的 `if (maskEditActive) return`。
+    // mask overlay 开着时不开 details(恢复 per-node onDoubleClick 的 maskEditActive guard)。
     if (node.id === maskEditNodeId) return
     selectNode(node.id)
     if (node.type === 'text' || node.type === 'annotation' || node.type === 'markup') editTextNode(node.id)

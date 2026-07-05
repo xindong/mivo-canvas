@@ -179,6 +179,43 @@ export const shouldStartCanvasSurfaceInteraction = (target: EventTarget | null) 
   return !isCanvasUiTarget(target)
 }
 
+// 1b-4: DOM-first node id resolution for "gesture on visible element" handlers
+// (contextmenu / doubleclick / mask-point armed pending cancel).event.target.closest
+// 跟 DOM 层叠走,绕开 resolveCanvasHit 的 activeEditState 短路(pending mask 窗口
+// resolveCanvasHit 返回 edit-overlay-cancel 而非 node,会导致 shouldCancelPendingMaskEdit
+// 误判 blank 误取消同节点 re-engage)。等节点迁到 Leafer 无 DOM 时这些手势回落坐标兜底。
+export const nodeIdFromDomTarget = (target: EventTarget | null): string | null => {
+  if (!(target instanceof Element)) return null
+  const domNode = target.closest<HTMLElement>('.dom-node[data-node-id]')
+  return domNode?.getAttribute('data-node-id') ?? null
+}
+
+// Shell-level chrome target check (controls/dock/ai-action-bar/menus). Used by
+// handleCanvasContextMenu/DoubleClick to short-circuit UI clicks. Kept here
+// alongside isCanvasUiTarget so UI-gate logic lives in one module.
+export const isCanvasChromeTarget = (target: EventTarget | null) =>
+  target instanceof HTMLElement &&
+  Boolean(
+    target.closest(
+      '[data-canvas-ui="true"], .canvas-controls, .canvas-tool-dock, .canvas-ai-action-bar, .node-context-menu, .empty-canvas-note',
+    ),
+  )
+
+const contextMenuWidth = 252
+const contextMenuMaxHeight = 620
+const contextMenuMargin = 12
+
+export const clampContextMenuPosition = (clientX: number, clientY: number, maxHeight = contextMenuMaxHeight) => ({
+  x: Math.min(
+    Math.max(contextMenuMargin, clientX),
+    Math.max(contextMenuMargin, window.innerWidth - contextMenuWidth - contextMenuMargin),
+  ),
+  y: Math.min(
+    Math.max(contextMenuMargin, clientY),
+    Math.max(contextMenuMargin, window.innerHeight - maxHeight - contextMenuMargin),
+  ),
+})
+
 export const clientPointToCanvas = (
   rect: ClientRectLike | undefined,
   viewport: Viewport,

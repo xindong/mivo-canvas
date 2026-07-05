@@ -7,7 +7,7 @@ import type { MivoCanvasNode } from '../types/mivoCanvas'
 import type { MivoImageRatio } from '../types/generation'
 import { prepareMaskEditPlaceholder, removeMaskEditPlaceholder, runMaskEditGeneration } from './maskEditGeneration'
 import type { ImageMaskSubmitPayload } from './imageMaskGeometry'
-import type { RuntimeCanvasTool } from './canvasInteraction'
+import { nodeIdFromDomTarget, type RuntimeCanvasTool } from './canvasInteraction'
 import { reduceMaskPointPending, shouldCancelPendingMaskEdit, type MaskInitialClientPoint, type MaskPointPendingAction } from './maskPointPending'
 import type { HitTestTarget } from '../render/hitTest'
 
@@ -249,9 +249,11 @@ export function useMaskPointArmed({
   const wrapCanvasPointerDown = useCallback((event: ReactPointerEvent<HTMLElement>) => {
     const { handleCanvasPointerDown, resolveCanvasHit, temporaryTool, isPanning } = interactionRef.current
     if (!maskArmedRef.current || temporaryTool || isPanning) {
+      // DOM-first(同 ctx/dbl):pending 窗口 resolveCanvasHit 因 activeEditState 激活返回
+      // edit-overlay-cancel 而非 node,hitNodeId 恒 undefined → shouldCancelPendingMaskEdit
+      // 误判 blank 误取消同节点 re-engage(Greptile P1)。改 nodeIdFromDomTarget 绕开短路。
       const pendingMaskNodeId = maskEditNodeIdRef.current
-      const pendingTarget = resolveCanvasHit(event.clientX, event.clientY)
-      const hitNodeId = pendingTarget?.kind === 'node' ? pendingTarget.nodeId : undefined
+      const hitNodeId = nodeIdFromDomTarget(event.target) ?? undefined
       if (shouldCancelPendingMaskEdit(pendingMaskNodeId, hitNodeId)) {
         cancelMaskEdit()
       }
