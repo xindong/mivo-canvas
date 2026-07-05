@@ -1,4 +1,4 @@
-import { Loader2, PanelRightClose, PanelRightOpen, Sparkles } from 'lucide-react'
+import { Loader2, PanelRightClose, PanelRightOpen } from 'lucide-react'
 import { useRef } from 'react'
 import { useCanvasStore } from '../../store/canvasStore'
 import { ChatComposer, type ChatComposerHandle } from './ChatComposer'
@@ -29,22 +29,18 @@ export function ChatPanel({ open, onToggle, focusRequestId = 0 }: ChatPanelProps
   const composerRef = useRef<ChatComposerHandle>(null)
 
   if (!open) {
+    // R6+：折叠态唯一入口。位置与展开态 header 右上角的收起按钮屏幕坐标一致
+    // （见 App.css .ai-panel.collapsed），点击即在原地重新展开，不再有右下角浮动按钮。
     return (
       <aside className="ai-panel collapsed" aria-label="AI chat panel">
-        <button type="button" className="ai-compact-toggle" onClick={onToggle} aria-label="Open AI panel">
-          <PanelRightOpen size={18} />
-        </button>
         <button
           type="button"
-          className="ai-compact-icon active"
-          onClick={() => {
-            onToggle()
-            composerRef.current?.focus()
-          }}
-          aria-label="AI 对话"
-          title="AI 对话"
+          className="ai-panel-toggle"
+          onClick={onToggle}
+          aria-label="Open AI panel"
+          title="展开对话"
         >
-          <Sparkles size={19} />
+          <PanelRightOpen size={18} />
         </button>
       </aside>
     )
