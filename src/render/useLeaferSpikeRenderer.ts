@@ -262,12 +262,15 @@ export const useLeaferSpikeRenderer = ({
   nodes,
   rendererMode,
   isPanning,
+  editingNodeId,
 }: {
   hostRef: React.MutableRefObject<HTMLDivElement | null>
   viewport: ViewportState
   nodes: MivoCanvasNode[]
   rendererMode: RendererMode
   isPanning: boolean
+  /** FU-11: 正在文字编辑的节点 id —— line paint 用它复现 DOM 的编辑态 label 缺口。 */
+  editingNodeId?: string
 }): LeaferSpikeStats => {
   const leaferRef = useRef<Leafer | null>(null)
   const paintedRef = useRef<Map<string, PaintedEntry>>(new Map())
@@ -609,6 +612,8 @@ export const useLeaferSpikeRenderer = ({
       viewport: lodViewport,
       selectedNodeIds: EMPTY_SELECTED_IDS,
       layerOf: (nodeId: string) => zOrder.get(nodeId),
+      // FU-11: line/arrow 编辑空 label 时也要断开线体（DOM 同步出现编辑器）。
+      editingNodeId,
       // isPanning informational only (modules ignore); passing false (not the
       // prop) keeps this effect off the isPanning dep → 0g invariant 1 holds.
       isPanning: false,
@@ -713,7 +718,7 @@ export const useLeaferSpikeRenderer = ({
     return () => {
       cancelled = true
     }
-  }, [brushStampPaintedNodes, hostRef, imagePaintedNodes, inlinePaintedNodes, leaferReady, linePaintedNodes, lodViewport, panCacheEnabled, paintedNodes, paintedNodeSignature, publishStats, rendererMode, shapePaintedNodes])
+  }, [brushStampPaintedNodes, editingNodeId, hostRef, imagePaintedNodes, inlinePaintedNodes, leaferReady, linePaintedNodes, lodViewport, panCacheEnabled, paintedNodes, paintedNodeSignature, publishStats, rendererMode, shapePaintedNodes])
 
   useEffect(() => {
     window.__MIVO_LEAFER_SPIKE__ = {

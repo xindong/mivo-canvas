@@ -4261,6 +4261,12 @@ button:disabled {
   box-shadow: none;
 }
 
+/* FU-11: leafer 模式纯文字壳——本体由 Leafer 真画，壳不拦手势/不改光标；
+   编辑态由 .dom-markup-label.editing 的 pointer-events:auto 恢复输入。 */
+.dom-node.markup-node.markup-text-overlay {
+  pointer-events: none;
+}
+
 .dom-node.markup-node[data-markup-kind='arrow'],
 .dom-node.markup-node[data-markup-kind='line'] {
   pointer-events: none;

@@ -198,7 +198,7 @@ export function MivoCanvas({
     cropNodeId, maskEditNodeId, contextMenuNodeId,
   })
   const { renderedNodes, engineSpikeDataAttrs } = useEngineSpikeRenderers({
-    hostRef, viewport, visibleNodes, canvasRenderedNodes, isPanning,
+    hostRef, viewport, visibleNodes, canvasRenderedNodes, isPanning, editingNodeId: editingTextNodeId,
   })
 
   const openNodeContextMenu = useCallback(
