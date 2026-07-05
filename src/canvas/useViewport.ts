@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type PointerEvent as ReactPointerEvent,
@@ -56,6 +57,29 @@ const persistedViewportFor = (sceneId: CanvasId): Viewport | undefined => {
 
 const initialViewportFor = (sceneId: CanvasId) => persistedViewportFor(sceneId) || defaultViewportFor(sceneId)
 
+const panCacheEnabledFromUrl = () => {
+  if (typeof window === 'undefined' || typeof window.location === 'undefined') return false
+  const value = new URLSearchParams(window.location.search).get('panCache')
+  return value === 'on' || value === 'true' || value === '1'
+}
+
+const applyViewportImperatively = (shell: HTMLElement | null, viewport: Viewport) => {
+  if (!shell) return
+  shell.dataset.viewportScale = String(viewport.scale)
+  shell.dataset.viewportX = String(viewport.x)
+  shell.dataset.viewportY = String(viewport.y)
+  shell.style.backgroundPosition = `${viewport.x}px ${viewport.y}px`
+  shell.style.backgroundSize = `${36 * viewport.scale}px ${36 * viewport.scale}px`
+  const domLayer = shell.querySelector<HTMLElement>('.dom-canvas-layer')
+  if (domLayer) domLayer.style.transform = `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})`
+  const leaferCanvas = shell.querySelector<HTMLCanvasElement>('.canvas-host canvas')
+  const frozenX = Number(leaferCanvas?.dataset.panCacheFrozenX ?? viewport.x)
+  const frozenY = Number(leaferCanvas?.dataset.panCacheFrozenY ?? viewport.y)
+  if (leaferCanvas?.dataset.panCacheFrozen === 'true') {
+    leaferCanvas.style.transform = `translate3d(${viewport.x - frozenX}px, ${viewport.y - frozenY}px, 0)`
+  }
+}
+
 type UseViewportOptions = {
   shellRef: RefObject<HTMLElement | null>
   sceneId: CanvasId
@@ -70,6 +94,7 @@ type UseViewportOptions = {
 export function useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseContextMenu }: UseViewportOptions) {
   const viewportRef = useRef<Viewport>(initialViewportFor(sceneId))
   const panRef = useRef<PanState | null>(null)
+  const panCacheEnabled = useMemo(() => panCacheEnabledFromUrl(), [])
   const persistedSceneRef = useRef(sceneId)
   const viewportPersistenceTimerRef = useRef<number | undefined>(undefined)
   const [viewport, setViewport] = useState<Viewport>(() => initialViewportFor(sceneId))
@@ -203,25 +228,33 @@ export function useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseCo
     (event: ReactPointerEvent<HTMLElement>): boolean => {
       const pan = panRef.current
       if (pan?.pointerId !== event.pointerId) return false
+      if (panCacheEnabled) {
+        const nextViewport = viewportFromPan(pan, event.clientX, event.clientY, viewportRef.current)
+        viewportRef.current = nextViewport
+        applyViewportImperatively(shellRef.current, nextViewport)
+        return true
+      }
       setViewport((current) => viewportFromPan(pan, event.clientX, event.clientY, current))
       return true
     },
-    [],
+    [panCacheEnabled, shellRef],
   )
 
   // Dispatcher (handleCanvasPointerEnd) pan branch.
   const tryEndPan = useCallback((event: ReactPointerEvent<HTMLElement>): void => {
     if (panRef.current?.pointerId === event.pointerId) {
       panRef.current = null
+      if (panCacheEnabled) setViewport(viewportRef.current)
       setIsPanning(false)
     }
-  }, [])
+  }, [panCacheEnabled])
 
   // Window blur reset (unconditional).
   const resetPan = useCallback(() => {
     panRef.current = null
+    if (panCacheEnabled) setViewport(viewportRef.current)
     setIsPanning(false)
-  }, [])
+  }, [panCacheEnabled])
 
   // Scene reset (called from the controller's cross-cutting scene-reset rAF).
   const resetViewportForScene = useCallback((nextSceneId: CanvasId) => {
