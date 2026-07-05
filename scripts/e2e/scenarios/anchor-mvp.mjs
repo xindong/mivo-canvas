@@ -1,4 +1,5 @@
 import { doneTaskView } from '../api-mocks.mjs'
+import { clickCanvasNode, readTotalNodeCount, waitForTotalNodeCountAtLeast } from '../renderer-evidence.mjs'
 
 // scripts/e2e/scenarios/anchor-mvp.mjs
 // P2-D2 — Anchor MVP DOM closed-loop (roadmap §7 组 D). Mock upstream; verify the
@@ -30,7 +31,7 @@ const resolveCanvasStoreSpec = async (page) => {
 }
 
 export const runAnchorMvpScenario = async (context) => {
-  const { baseUrl, page, generatedImageB64 } = context
+  const { baseUrl, page, generatedImageB64, rendererMode } = context
 
   const spec = await resolveCanvasStoreSpec(page)
 
@@ -82,7 +83,7 @@ export const runAnchorMvpScenario = async (context) => {
     return image?.id || null
   }, spec)
   if (!anchorImageNodeId) throw new Error('Anchor MVP: no image node to anchor onto')
-  await page.locator(`[data-node-id="${anchorImageNodeId}"]`).click()
+  await clickCanvasNode(page, rendererMode, anchorImageNodeId)
 
   // ① Create a point anchor via the store action (debug entry — real canvas tool
   //    integration deferred per the task's allowance). The mark overlay then renders.
@@ -118,12 +119,19 @@ export const runAnchorMvpScenario = async (context) => {
   // ③ Type instruction + generate (via the dev hook — button is off-screen-prone).
   await page.locator('[data-testid="anchor-instruction-input"]').fill('make it neon', { force: true })
   await new Promise((r) => setTimeout(r, 100)) // let React state settle
-  const beforeAnchorNodeCount = await page.locator('.dom-node').count()
+  // leafer 模式 image 无 DOM,节点计数走 data-total-node-count(全量口径);dom 模式保持原断言。
+  const beforeAnchorNodeCount = rendererMode === 'leafer'
+    ? await readTotalNodeCount(page)
+    : await page.locator('.dom-node').count()
   await page.evaluate(() => {
     const fn = window.__anchorGenerate
     if (fn) void fn()
   })
-  await page.waitForFunction((c) => document.querySelectorAll('.dom-node').length >= c + 1, beforeAnchorNodeCount)
+  if (rendererMode === 'leafer') {
+    await waitForTotalNodeCountAtLeast(page, beforeAnchorNodeCount + 1)
+  } else {
+    await page.waitForFunction((c) => document.querySelectorAll('.dom-node').length >= c + 1, beforeAnchorNodeCount)
+  }
 
   // ④ Request prompt includes the instruction (+ geometry context).
   if (!anchorGeneratePrompt || !anchorGeneratePrompt.includes('make it neon')) {

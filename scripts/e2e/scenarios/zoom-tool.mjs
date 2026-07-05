@@ -11,6 +11,8 @@ const expectNear = (actual, expected, tolerance, message) => {
   }
 }
 
+import { nodeScreenRect, waitForNodeRendered } from '../renderer-evidence.mjs'
+
 const readViewport = async (page) => {
   const viewport = await page.evaluate(() => {
     const shell = document.querySelector('.canvas-shell')
@@ -90,7 +92,7 @@ const resetView = async (page) => {
   await waitForDefaultViewport(page)
 }
 
-const setupZoomCanvas = async (page, canvasStoreModuleSpec) => {
+const setupZoomCanvas = async (page, canvasStoreModuleSpec, rendererMode) => {
   const setup = await page.evaluate(async (moduleSpec) => {
     const { useCanvasStore } = await import(moduleSpec)
     const store = useCanvasStore.getState()
@@ -107,7 +109,7 @@ const setupZoomCanvas = async (page, canvasStoreModuleSpec) => {
     return { sceneId, nodeId: node.id }
   }, canvasStoreModuleSpec)
 
-  await page.waitForSelector(`[data-node-id="${setup.nodeId}"]`)
+  await waitForNodeRendered(page, rendererMode, setup.nodeId)
   await waitForDefaultViewport(page)
   return setup
 }
@@ -163,11 +165,29 @@ const assertScreenAnchorPreserved = ({ label, shellBox, beforeViewport, afterVie
   expectNear(projectedPoint.y, screenPoint.y, 2, `${label}: zoom should preserve pointer y`)
 }
 
-const findBlankPoint = async (page, preferredFractions = []) => {
-  const point = await page.evaluate((preferredFractions) => {
+const findBlankPoint = async (page, preferredFractions = [], { leaferMode = false } = {}) => {
+  const point = await page.evaluate(async ({ preferredFractions, leaferMode }) => {
     const shell = document.querySelector('.canvas-shell')
     const shellRect = shell?.getBoundingClientRect()
     if (!shell || !shellRect) return null
+
+    // leafer 模式:真画节点(image/frame/markup)无 DOM,elementFromPoint 拦不住,
+    // 用 store 几何投影出屏幕矩形做排除(公式与 DOM .dom-canvas-layer transform 同式)。
+    let leaferNodeRects = []
+    if (leaferMode) {
+      const resource = performance.getEntriesByType('resource').map((entry) => entry.name).find((name) => name.includes('/src/store/canvasStore.ts'))
+      const moduleSpec = resource ? new URL(resource).pathname + new URL(resource).search : '/src/store/canvasStore.ts'
+      const { useCanvasStore } = await import(moduleSpec)
+      const scale = Number(shell.getAttribute('data-viewport-scale') || 1)
+      const viewportX = Number(shell.getAttribute('data-viewport-x') || 0)
+      const viewportY = Number(shell.getAttribute('data-viewport-y') || 0)
+      leaferNodeRects = useCanvasStore.getState().nodes.filter((node) => !node.hidden).map((node) => ({
+        left: shellRect.left + viewportX + node.x * scale,
+        top: shellRect.top + viewportY + node.y * scale,
+        right: shellRect.left + viewportX + (node.x + node.width) * scale,
+        bottom: shellRect.top + viewportY + (node.y + node.height) * scale,
+      }))
+    }
 
     const fractions = [
       ...preferredFractions,
@@ -197,13 +217,13 @@ const findBlankPoint = async (page, preferredFractions = []) => {
       const x = shellRect.left + shellRect.width * fx
       const y = shellRect.top + shellRect.height * fy
       const target = document.elementFromPoint(x, y)
-      if (target?.closest('.canvas-shell') && !target.closest(blockedSelector)) {
-        return { x, y }
-      }
+      if (!target?.closest('.canvas-shell') || target.closest(blockedSelector)) continue
+      if (leaferNodeRects.some((rect) => x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom)) continue
+      return { x, y }
     }
 
     return null
-  }, preferredFractions)
+  }, { preferredFractions, leaferMode })
 
   if (!point) throw new Error('Could not find a blank canvas point for zoom interaction')
   return point
@@ -349,14 +369,15 @@ const assertInputFocusIgnoresZoomKeys = async (page, ensureChatPanelOpen) => {
 }
 
 export const runZoomToolScenario = async (context) => {
-  const { canvasStoreSpec, ensureChatPanelOpen, page } = context
+  const { canvasStoreSpec, ensureChatPanelOpen, page, rendererMode } = context
+  const leaferMode = rendererMode === 'leafer'
   const canvasStoreModuleSpec = await canvasStoreSpec()
-  const { sceneId, nodeId } = await setupZoomCanvas(page, canvasStoreModuleSpec)
+  const { sceneId, nodeId } = await setupZoomCanvas(page, canvasStoreModuleSpec, rendererMode)
 
   await assertToolbarRetiredButtonsRemoved(page)
 
   await setActiveTool(page, 'Hand', 'tool-hand')
-  const blankZoomPoint = await findBlankPoint(page, [[0.22, 0.28]])
+  const blankZoomPoint = await findBlankPoint(page, [[0.22, 0.28]], { leaferMode })
   const shellBoxForClick = await page.locator('.canvas-shell').boundingBox()
   if (!shellBoxForClick) throw new Error('Missing canvas shell geometry for hold-Z click')
   const beforeHoldZoom = await readViewport(page)
@@ -375,7 +396,7 @@ export const runZoomToolScenario = async (context) => {
 
   await setActiveTool(page, 'Select', 'tool-select')
   await resetView(page)
-  const altPoint = await findBlankPoint(page, [[0.26, 0.64]])
+  const altPoint = await findBlankPoint(page, [[0.26, 0.64]], { leaferMode })
   const shellBoxForAlt = await page.locator('.canvas-shell').boundingBox()
   if (!shellBoxForAlt) throw new Error('Missing canvas shell geometry for Alt zoom')
   const beforeAltZoom = await readViewport(page)
@@ -401,7 +422,7 @@ export const runZoomToolScenario = async (context) => {
   await clearSelection(page, canvasStoreModuleSpec)
   const nodeBeforeZoom = await readNodeGeometry(page, canvasStoreModuleSpec, nodeId)
   if (!nodeBeforeZoom) throw new Error('Missing imported image node before node zoom')
-  const nodeBoxBeforeZoom = await page.locator(`[data-node-id="${nodeId}"]`).boundingBox()
+  const nodeBoxBeforeZoom = await nodeScreenRect(page, rendererMode, nodeId)
   const shellBoxForNode = await page.locator('.canvas-shell').boundingBox()
   if (!nodeBoxBeforeZoom || !shellBoxForNode) throw new Error('Missing node or shell geometry for node zoom')
   const nodeZoomPoint = {

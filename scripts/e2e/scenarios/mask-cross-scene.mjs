@@ -14,6 +14,7 @@
 // #90 IDB harness: 用 waitForPersistedKv 读 persisted chat state，禁止 localStorage 断言。
 
 import { doneTaskView, failedTaskView } from '../api-mocks.mjs'
+import { clickCanvasNode, waitForNodeRendered } from '../renderer-evidence.mjs'
 
 const ensureChatPanelOpen = async (page) => {
   if (await page.locator('.ai-panel.collapsed').isVisible()) {
@@ -23,8 +24,8 @@ const ensureChatPanelOpen = async (page) => {
   await page.waitForSelector('.ai-panel-header')
 }
 
-const openMaskEditorOn = async (page, sourceNodeId) => {
-  await page.locator(`[data-node-id="${sourceNodeId}"]`).click()
+const openMaskEditorOn = async (page, rendererMode, sourceNodeId) => {
+  await clickCanvasNode(page, rendererMode, sourceNodeId)
   await page.waitForSelector('.selection-quick-toolbar')
   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
   await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
@@ -62,7 +63,7 @@ const waitForCondition = async (fn, { timeout = 8000, interval = 50 } = {}) => {
 }
 
 export const runMaskCrossSceneScenario = async (context) => {
-  const { canvasStoreSpec, chatStoreSpec, generatedImageB64, page, waitForPersistedKv } = context
+  const { canvasStoreSpec, chatStoreSpec, generatedImageB64, page, rendererMode, waitForPersistedKv } = context
 
   const resetCharacterFlow = async () => {
     await page.evaluate(async (moduleSpec) => {
@@ -70,7 +71,7 @@ export const runMaskCrossSceneScenario = async (context) => {
       useCanvasStore.getState().loadScene('character-flow')
       useCanvasStore.getState().resetCurrentScene()
     }, await canvasStoreSpec())
-    await page.waitForSelector('[data-node-id="ref-hero"]')
+    await waitForNodeRendered(page, rendererMode, 'ref-hero')
   }
 
   const switchScene = async (sceneId) => {
@@ -132,7 +133,7 @@ export const runMaskCrossSceneScenario = async (context) => {
   })
 
   // 提交 mask edit
-  await openMaskEditorOn(page, 'ref-hero')
+  await openMaskEditorOn(page, rendererMode, 'ref-hero')
   await drawPointRegion(page)
   await page.waitForFunction(() => Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0') > 0)
   await page.locator('.image-mask-edit-prompt textarea').fill('E2E cross-scene done mask')
@@ -174,7 +175,7 @@ export const runMaskCrossSceneScenario = async (context) => {
 
   // 切回 scene A (character-flow)
   await switchScene('character-flow')
-  await page.waitForSelector('[data-node-id="ref-hero"]')
+  await waitForNodeRendered(page, rendererMode, 'ref-hero')
   await ensureChatPanelOpen(page)
 
   // SC-11: assistant card status='done' + resultNodeIds + .chat-result-image
@@ -223,7 +224,7 @@ export const runMaskCrossSceneScenario = async (context) => {
   })
 
   // 提交 mask edit
-  await openMaskEditorOn(page, 'ref-hero')
+  await openMaskEditorOn(page, rendererMode, 'ref-hero')
   await drawPointRegion(page)
   await page.waitForFunction(() => Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0') > 0)
   await page.locator('.image-mask-edit-prompt textarea').fill('E2E cross-scene failed mask')
@@ -262,7 +263,7 @@ export const runMaskCrossSceneScenario = async (context) => {
 
   // 切回 scene A
   await switchScene('character-flow')
-  await page.waitForSelector('[data-node-id="ref-hero"]')
+  await waitForNodeRendered(page, rendererMode, 'ref-hero')
   await ensureChatPanelOpen(page)
 
   // SC-11: assistant status='error'

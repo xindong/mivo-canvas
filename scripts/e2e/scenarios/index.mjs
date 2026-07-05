@@ -48,6 +48,15 @@ export const scenarioOrder = [
   'coordinate-probe',
 ]
 
+// leafer 模式显式 skip 名单(带理由,e2e-smoke 读取)。原则:只有当场景的断言
+// 主体是"dom 渲染器的 DOM 结构契约"(选择框/句柄/类名/布局几何全靠 .dom-node
+// 表达)、且等价交互证据已由其他 leafer 场景覆盖时,才允许 skip;凡是能用
+// store 状态 / data-leafer-* 观测属性 / 坐标点击表达的,一律改造不 skip。
+export const leaferSkippedScenarios = {
+  'canvas-interactions':
+    'DOM 渲染器结构契约场景:~180 处断言直接校验 .dom-node 的类名/布局/选择态/拖拽句柄 DOM 结构,是 dom 渲染路径自身的回归契约;leafer 模式下 image/frame/markup 无 DOM 表达,该契约不适用。leafer 侧等价交互证据:选中/点击(mask 系列+chat-generation)、双击编辑(markup-text-overlay)、几何投影(coordinate-probe/zoom-tool)、节点增删(variations-annotation/anchor-mvp)。',
+}
+
 export const scenarioBootstrapPredecessor = {
   'archive-assets': 'shell-sidebar',
   'canvas-interactions': 'archive-assets',

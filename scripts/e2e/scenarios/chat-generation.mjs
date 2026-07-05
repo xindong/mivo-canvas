@@ -1,4 +1,5 @@
 import { failedTaskView, doneTaskView } from '../api-mocks.mjs'
+import { clickCanvasNode, nodeScreenRect } from '../renderer-evidence.mjs'
 
 const readViewport = async (page) => {
   const viewport = await page.evaluate(() => {
@@ -24,20 +25,14 @@ const waitForViewport = async (page, predicate, label, { timeout = 3000 } = {}) 
   throw new Error(`Timed out waiting for viewport: ${label}; last=${JSON.stringify(await readViewport(page))}`)
 }
 
-const nodeCenterDeltaFromCanvasCenter = async (page, nodeId) => {
-  const delta = await page.evaluate((targetNodeId) => {
-    const shell = document.querySelector('.canvas-shell')
-    const node = document.querySelector(`[data-node-id="${targetNodeId}"]`)
-    if (!shell || !node) return null
-    const shellRect = shell.getBoundingClientRect()
-    const nodeRect = node.getBoundingClientRect()
-    return {
-      dx: nodeRect.left + nodeRect.width / 2 - (shellRect.left + shellRect.width / 2),
-      dy: nodeRect.top + nodeRect.height / 2 - (shellRect.top + shellRect.height / 2),
-    }
-  }, nodeId)
-  if (!delta) throw new Error(`Canvas node should render after focus: ${nodeId}`)
-  return delta
+const nodeCenterDeltaFromCanvasCenter = async (page, rendererMode, nodeId) => {
+  const shellBox = await page.locator('.canvas-shell').boundingBox()
+  const rect = await nodeScreenRect(page, rendererMode, nodeId)
+  if (!shellBox || !rect) throw new Error(`Canvas node should render after focus: ${nodeId}`)
+  return {
+    dx: rect.x + rect.width / 2 - (shellBox.x + shellBox.width / 2),
+    dy: rect.y + rect.height / 2 - (shellBox.y + shellBox.height / 2),
+  }
 }
 
 export const runChatGenerationScenario = async (context) => {
@@ -56,7 +51,16 @@ export const runChatGenerationScenario = async (context) => {
     waitForChatIdle,
     waitForPersistedKv,
   } = context
-  const firstNodeId = context.firstNodeId ?? await page.locator('.dom-node').first().getAttribute('data-node-id')
+  const { rendererMode } = context
+  const leaferMode = rendererMode === 'leafer'
+  // leafer 模式 image 无 DOM,首节点 id 从 store 取;计数走 data-total-node-count
+  // (全量口径);dom 模式保持原断言不变。
+  const countRenderedNodes = () => (leaferMode
+    ? page.evaluate(() => Number(document.querySelector('.canvas-shell')?.getAttribute('data-total-node-count') || 0))
+    : page.locator('.dom-node').count())
+  const firstNodeId = context.firstNodeId ?? (leaferMode
+    ? (await readCanvasState()).nodes[0]?.id
+    : await page.locator('.dom-node').first().getAttribute('data-node-id'))
 
   // Chat branch (W4): mode=chat now also generates an image (enhance always ships
   // first). replyText surfaces as a notice; the assistant message shows the final
@@ -175,7 +179,7 @@ export const runChatGenerationScenario = async (context) => {
   }, await canvasStoreSpec())
 
   // Chat-based generation: select node, fill composer, send
-  await page.locator(`[data-node-id="${firstNodeId}"]`).click()
+  await clickCanvasNode(page, rendererMode, firstNodeId)
   await page.evaluate(async () => {
     const resource = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('chatStore.ts'))
     const moduleSpec = resource ? new URL(resource).pathname + new URL(resource).search : '/src/store/chatStore.ts'
@@ -184,12 +188,19 @@ export const runChatGenerationScenario = async (context) => {
     useChatStore.getState().setParamOverride('quality', 'high')
   })
   const canvasBeforeGenerate = await readCanvasState()
-  const countBeforeGenerate = await page.locator('.dom-node').count()
+  const countBeforeGenerate = await countRenderedNodes()
   await page.locator('.chat-composer-textarea').fill('e2e derived concept image')
   await page.locator('.chat-composer-textarea').press('Enter')
-  await page.waitForFunction((count) => document.querySelectorAll('.dom-node').length >= count + 1, countBeforeGenerate)
+  if (leaferMode) {
+    await page.waitForFunction(
+      (count) => Number(document.querySelector('.canvas-shell')?.getAttribute('data-total-node-count') || 0) >= count + 1,
+      countBeforeGenerate,
+    )
+  } else {
+    await page.waitForFunction((count) => document.querySelectorAll('.dom-node').length >= count + 1, countBeforeGenerate)
+  }
 
-  const generatedCount = await page.locator('.dom-node').count()
+  const generatedCount = await countRenderedNodes()
   if (generatedCount < countBeforeGenerate + 1) {
     throw new Error(`Expected at least ${countBeforeGenerate + 1} nodes after chat generation result, got ${generatedCount}`)
   }
@@ -209,12 +220,29 @@ export const runChatGenerationScenario = async (context) => {
   if (progressSamples.length < 3 || progressSamples.at(-1) !== 100) {
     throw new Error(`Progress samples should end at 100 and have intermediate values, got ${JSON.stringify(progressSamples)}`)
   }
-  const besideResult = await page.locator('.dom-node[data-ai-kind="result"][data-ai-operation="beside-generation"]').last().evaluate((node) => ({
-    id: node.getAttribute('data-node-id'),
-    kind: node.getAttribute('data-ai-kind'),
-    operation: node.getAttribute('data-ai-operation'),
-    sourceNodeIds: node.getAttribute('data-ai-source-node-ids'),
-  }))
+  // leafer 模式 image 无 DOM;data-ai-* 与 store node.aiWorkflow 同源(CanvasNodeView
+  // 直接透传),leafer 分支从 store 读同字段。
+  const besideResult = leaferMode
+    ? await page.evaluate(async (moduleSpec) => {
+        const { useCanvasStore } = await import(moduleSpec)
+        const results = useCanvasStore.getState().nodes.filter(
+          (node) => node.aiWorkflow?.kind === 'result' && node.aiWorkflow?.operation === 'beside-generation',
+        )
+        const node = results.at(-1)
+        if (!node) return { id: null, kind: null, operation: null, sourceNodeIds: null }
+        return {
+          id: node.id,
+          kind: node.aiWorkflow.kind,
+          operation: node.aiWorkflow.operation,
+          sourceNodeIds: node.aiWorkflow.sourceNodeIds?.join(',') ?? null,
+        }
+      }, await canvasStoreSpec())
+    : await page.locator('.dom-node[data-ai-kind="result"][data-ai-operation="beside-generation"]').last().evaluate((node) => ({
+        id: node.getAttribute('data-node-id'),
+        kind: node.getAttribute('data-ai-kind'),
+        operation: node.getAttribute('data-ai-operation'),
+        sourceNodeIds: node.getAttribute('data-ai-source-node-ids'),
+      }))
   if (
     besideResult.kind !== 'result' ||
     besideResult.operation !== 'beside-generation' ||
@@ -245,15 +273,21 @@ export const runChatGenerationScenario = async (context) => {
   )
   await page.locator('.chat-result-image-btn').last().click()
   await page.waitForFunction(
-    (nodeId) => document.querySelector(`[data-node-id="${nodeId}"]`)?.classList.contains('selected'),
-    besideResult.id,
+    async ({ nodeId, leaferMode, moduleSpec }) => {
+      if (document.querySelector(`[data-node-id="${nodeId}"]`)?.classList.contains('selected')) return true
+      if (!leaferMode) return false
+      const { useCanvasStore } = await import(moduleSpec)
+      const state = useCanvasStore.getState()
+      return state.selectedNodeId === nodeId || (state.selectedNodeIds || []).includes(nodeId)
+    },
+    { nodeId: besideResult.id, leaferMode, moduleSpec: await canvasStoreSpec() },
   )
   await waitForViewport(
     page,
     (viewport) => Math.abs(viewport.x - viewportBeforeLocate.x) > 40 || Math.abs(viewport.y - viewportBeforeLocate.y) > 40,
     'chat result image click recenters viewport',
   )
-  const resultFocusDelta = await nodeCenterDeltaFromCanvasCenter(page, besideResult.id)
+  const resultFocusDelta = await nodeCenterDeltaFromCanvasCenter(page, rendererMode, besideResult.id)
   if (Math.abs(resultFocusDelta.dx) > 4 || Math.abs(resultFocusDelta.dy) > 4) {
     throw new Error(`Clicking a chat result image should center its canvas node: ${JSON.stringify(resultFocusDelta)}`)
   }
@@ -1012,6 +1046,7 @@ export const runChatGenerationScenario = async (context) => {
     },
     { moduleSpec: await canvasStoreSpec(), count: countBeforeTransparentPaste },
   )
+  if (!leaferMode) {
   const transparentImageNode = page.locator('.dom-node[data-node-type="image"]').last()
   await transparentImageNode.locator('.dom-node-media img').waitFor({ state: 'visible' })
   await page.waitForFunction(() => {
@@ -1056,5 +1091,6 @@ export const runChatGenerationScenario = async (context) => {
     transparentPasteRender.naturalHeight !== 128
   ) {
     throw new Error(`Transparent PNG paste should keep the original image frame while rendering alpha transparently: ${JSON.stringify(transparentPasteRender)}`)
+  }
   }
 }

@@ -16,7 +16,7 @@ const storeHelpers = async (context) => {
 }
 
 export const runChatCopyScenario = async (context) => {
-  const { page, readCanvasState } = context
+  const { page, readCanvasState, rendererMode } = context
   const { spec, readClipboardNodesCount } = await storeHelpers(context)
 
   if (await page.locator('.ai-panel.collapsed').isVisible()) {
@@ -140,7 +140,10 @@ export const runChatCopyScenario = async (context) => {
   await page.evaluate(() => window.getSelection()?.removeAllRanges())
 
   // ── SC3: 画布选中节点 cmd+C/V 照常 ──
-  const firstNodeId = await page.locator('.dom-node').first().getAttribute('data-node-id')
+  // leafer 模式 image 无 DOM,首节点 id 从 store 取(与 .dom-node 渲染顺序同源同序)。
+  const firstNodeId = rendererMode === 'leafer'
+    ? (await readCanvasState()).nodes[0]?.id
+    : await page.locator('.dom-node').first().getAttribute('data-node-id')
   await page.evaluate(async ({ moduleSpec, nodeId }) => {
     const { useCanvasStore } = await import(moduleSpec)
     useCanvasStore.getState().selectNode(nodeId)

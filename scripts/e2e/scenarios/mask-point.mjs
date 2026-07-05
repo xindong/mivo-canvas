@@ -7,6 +7,8 @@
 // SC6.3（点选提交→占位符→成功替换/失败消失）由 mask-reflow.mjs 的 SC4.x（成功）+
 // SC5.3（失败）以点选驱动覆盖，此处不再重复生成。
 
+import { clickCanvasNode, nodeScreenRect } from '../renderer-evidence.mjs'
+
 const regionCounts = async (page) =>
   page.evaluate(() => {
     const overlay = document.querySelector('.image-mask-edit-overlay')
@@ -67,7 +69,8 @@ const clearCanvasSelection = async (page, moduleSpec) => {
 }
 
 export const runMaskPointScenario = async (context) => {
-  const { page, canvasStoreSpec, generatedImageB64 } = context
+  const { page, canvasStoreSpec, generatedImageB64, rendererMode } = context
+  const leaferMode = rendererMode === 'leafer'
   const spec = await canvasStoreSpec()
 
   const dockMaskButton = page.locator('.canvas-tool-dock').getByRole('button', { name: '局部重绘' })
@@ -109,23 +112,29 @@ export const runMaskPointScenario = async (context) => {
   await page.waitForFunction(() => document.querySelector('.canvas-shell')?.classList.contains('mask-armed'))
   const armedButtonActive = await dockMaskButton.evaluate((button) => button.classList.contains('active'))
   if (!armedButtonActive) throw new Error('P3: dock mask button should be active while point selection is armed')
-  const nodeBox = await page.locator(`[data-node-id="${imageId}"]`).boundingBox()
+  const nodeBox = await nodeScreenRect(page, rendererMode, imageId)
   if (!nodeBox) throw new Error('P3: source image node should be visible')
   await page.mouse.click(nodeBox.x + nodeBox.width * 0.5, nodeBox.y + nodeBox.height * 0.5)
   await page.waitForSelector('.image-mask-edit-stage')
   await waitForRegionCount(page, 1)
-  const armedState = await page.evaluate(() => {
+  const armedState = await page.evaluate(async ({ leaferMode, moduleSpec }) => {
     const overlay = document.querySelector('.image-mask-edit-overlay')
+    // leafer 模式 image 无 DOM(.dom-node.selected 不存在),选中态读 store 真相源。
+    let selectedNodeId = document.querySelector('.dom-node.selected')?.getAttribute('data-node-id')
+    if (leaferMode && !selectedNodeId) {
+      const { useCanvasStore } = await import(moduleSpec)
+      selectedNodeId = useCanvasStore.getState().selectedNodeId
+    }
     return {
       armed: document.querySelector('.canvas-shell')?.classList.contains('mask-armed'),
-      selectedNodeId: document.querySelector('.dom-node.selected')?.getAttribute('data-node-id'),
+      selectedNodeId,
       region: Number(overlay?.getAttribute('data-region-count') || '0'),
       mask: Number(overlay?.getAttribute('data-mask-region-count') || '0'),
       point: Number(overlay?.getAttribute('data-point-anchor-count') || '0'),
       markers: document.querySelectorAll('.image-mask-edit-stage svg .image-mask-edit-point-marker').length,
       pins: document.querySelectorAll('.image-mask-edit-stage svg .image-mask-edit-point-pin').length,
     }
-  })
+  }, { leaferMode, moduleSpec: spec })
   if (armedState.armed || armedState.selectedNodeId !== imageId || armedState.mask !== 1 || armedState.point !== 0) {
     throw new Error(`P3: armed image click should select image, open mask edit, and consume one mask region: ${JSON.stringify(armedState)}`)
   }
@@ -154,7 +163,12 @@ export const runMaskPointScenario = async (context) => {
     const { useCanvasStore } = await import(moduleSpec)
     useCanvasStore.getState().selectNode(id)
   }, { moduleSpec: spec, id: imageId })
-  await page.waitForFunction((id) => document.querySelector(`[data-node-id="${id}"]`)?.classList.contains('selected'), imageId)
+  await page.waitForFunction(async ({ id, leaferMode, moduleSpec }) => {
+    if (document.querySelector(`[data-node-id="${id}"]`)?.classList.contains('selected')) return true
+    if (!leaferMode) return false
+    const { useCanvasStore } = await import(moduleSpec)
+    return useCanvasStore.getState().selectedNodeId === id
+  }, { id: imageId, leaferMode, moduleSpec: spec })
   await dockMaskButton.click()
   await page.waitForSelector('.image-mask-edit-stage')
   await page.waitForFunction(() => !document.querySelector('.canvas-shell')?.classList.contains('mask-armed'))
@@ -212,7 +226,7 @@ export const runMaskPointScenario = async (context) => {
   // SC-09 (mask-chat-card): 提交前 Esc 只关交互层（overlay/draft），不 abort 已提交任务。
   // 这里仍是提交前阶段：overlay 打开、prompt 聚焦、尚未点「局部重绘」。
   // Esc 关闭 overlay，不触达任何后台 task（此时还没有 task）。
-  await page.locator(`[data-node-id="${imageId}"]`).click()
+  await clickCanvasNode(page, rendererMode, imageId)
   await page.waitForSelector('.selection-quick-toolbar')
   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
   await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
@@ -267,7 +281,7 @@ export const runMaskPointScenario = async (context) => {
     await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ taskId: 'task-sc09' }) })
   })
 
-  await page.locator(`[data-node-id="${imageId}"]`).click()
+  await clickCanvasNode(page, rendererMode, imageId)
   await page.waitForSelector('.selection-quick-toolbar')
   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
   await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
@@ -338,7 +352,7 @@ export const runMaskPointScenario = async (context) => {
   await page.waitForFunction(() => !document.querySelector('.mivo-app')?.classList.contains('ai-collapsed'))
   await dockMaskButton.click()
   await page.waitForFunction(() => document.querySelector('.canvas-shell')?.classList.contains('mask-armed'))
-  const deleteSourceBox = await page.locator(`[data-node-id="${deleteCase.sourceId}"]`).boundingBox()
+  const deleteSourceBox = await nodeScreenRect(page, rendererMode, deleteCase.sourceId)
   if (!deleteSourceBox) throw new Error('FIX-2: delete source image should be visible')
   await page.mouse.click(deleteSourceBox.x + deleteSourceBox.width * 0.5, deleteSourceBox.y + deleteSourceBox.height * 0.5)
   await page.waitForSelector('.image-mask-edit-stage')
@@ -347,11 +361,17 @@ export const runMaskPointScenario = async (context) => {
   await page.keyboard.press('Delete')
   await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
   await page.waitForFunction(
-    (sourceId) => !document.querySelector(`[data-node-id="${sourceId}"]`),
-    deleteCase.sourceId,
+    async ({ sourceId, leaferMode, moduleSpec }) => {
+      if (document.querySelector(`[data-node-id="${sourceId}"]`)) return false
+      if (!leaferMode) return true
+      // leafer 模式 image 本就无 DOM,"删除完成"以 store 中节点消失为证据。
+      const { useCanvasStore } = await import(moduleSpec)
+      return !useCanvasStore.getState().nodes.some((node) => node.id === sourceId)
+    },
+    { sourceId: deleteCase.sourceId, leaferMode, moduleSpec: spec },
   )
   await page.waitForFunction(() => !document.querySelector('.mivo-app')?.classList.contains('ai-collapsed'))
-  await page.locator(`[data-node-id="${deleteCase.survivorId}"]`).click()
+  await clickCanvasNode(page, rendererMode, deleteCase.survivorId)
   await page.waitForSelector('.selection-quick-toolbar')
 
   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()

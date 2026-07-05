@@ -17,7 +17,7 @@ import {
   assertProdUnauthorizedGate,
 } from './e2e/prod-auth-assertions.mjs'
 import { startUpstreamMockServer } from './e2e/upstream-mock-server.mjs'
-import { scenarioOrder, scenarioRunners } from './e2e/scenarios/index.mjs'
+import { leaferSkippedScenarios, scenarioOrder, scenarioRunners } from './e2e/scenarios/index.mjs'
 import {
   clearAllStorage,
   createBaseUrl,
@@ -119,6 +119,28 @@ const startTopologyServer = ({ activePort, debugViewToken: serverDebugViewToken,
         const dev = startSmokeDevServer({ port: activePort, localAssetFixtureDir, eagleMockPort: eagleMockHandle.port, bffPort })
         return { bff, dev }
       })()
+
+// prod topology 跑的是 dist/ 静态产物;逐场景直接调 runner 不会重新 build,
+// dist 落后 src 时跑的是过期代码(2026-07-06 验收事故:旧 dist 无 FU-11/3c,
+// prod leafer 假失败)。这里只警告不中断——CI 的 test:e2e:prod 永远先 build。
+if (isProdTopology) {
+  try {
+    const { statSync } = await import('node:fs')
+    const { execSync } = await import('node:child_process')
+    const distMtime = statSync('dist/index.html').mtimeMs
+    const newestSrc = execSync(
+      "find src server -type f -newer dist/index.html 2>/dev/null | head -5",
+      { encoding: 'utf8' },
+    ).trim()
+    if (newestSrc) {
+      console.warn(
+        `[e2e-smoke] WARNING: dist/ (${new Date(distMtime).toISOString()}) 比以下源码文件旧,prod 跑的可能是过期构建;请先 npm run build(或用 npm run test:e2e:prod):\n${newestSrc}`,
+      )
+    }
+  } catch {
+    console.warn('[e2e-smoke] WARNING: dist/index.html 不存在或不可读,prod topology 需要先 npm run build')
+  }
+}
 
 let server
 
@@ -479,7 +501,15 @@ try {
     }
   }
 
-  const selectedScenarios = resolveScenarioSelection(cliArgs)
+  // leafer 模式显式 skip(名单+理由见 scenarios/index.mjs leaferSkippedScenarios)。
+  // skip 打印在 stdout,矩阵汇总时可见;dom 模式不受影响。
+  const selectedScenarios = resolveScenarioSelection(cliArgs).filter((name) => {
+    if (rendererMode === 'leafer' && leaferSkippedScenarios[name]) {
+      console.log(`[e2e-smoke] SKIP scenario=${name} renderer=leafer reason=${leaferSkippedScenarios[name]}`)
+      return false
+    }
+    return true
+  })
   const scenarioContext = {
     Buffer,
     assertLibraryLayoutStable,
