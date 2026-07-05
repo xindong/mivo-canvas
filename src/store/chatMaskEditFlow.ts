@@ -7,7 +7,7 @@
 //
 // 运行时循环注意：本模块 import useChatStore（runtime），chatStore 反向 import cancelMaskEditMessage
 // （runtime）—— ESM live binding，双方只在函数体内访问对方导出，不在模块加载期访问，无 TDZ。
-import type { ChatGenerationContext, ChatMessage, ChatEnhanceResult } from './chatStore'
+import type { ChatGenerationContext, ChatMessage } from './chatStore'
 import type { EnhanceResponse, MivoImageQuality, MivoImageRatio } from '../types/generation'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 import type { ImageMaskSubmitPayload } from '../canvas/imageMaskGeometry'
@@ -15,7 +15,7 @@ import { useChatStore } from './chatStore'
 import { useCanvasStore } from './canvasStore'
 import { debugLogger } from './debugLogStore'
 import { enhanceMivoPrompt, MivoImageRequestError } from '../lib/mivoImageClient'
-import { resolveMaskEditEnhance } from './chatEnhanceFlow'
+import { resolveMaskEditEnhance, enhanceForGeneration } from './chatEnhanceFlow'
 import { removeMaskEditPlaceholder, runMaskEditGeneration } from '../canvas/maskEditGeneration'
 import {
   clearMaskEditTask,
@@ -227,19 +227,7 @@ export const runMaskEditChatFlow = async (record: ActiveMaskEditTask): Promise<v
 
     // 2. resolve finalPrompt/noticeText（W4 三态：generate/chat/degraded 都先出图）。
     const { finalPrompt, noticeText } = resolveMaskEditEnhance(enhanceResult, payload.prompt)
-    const enhance: ChatEnhanceResult | undefined = enhanceResult.enhanced
-      ? {
-          scene: enhanceResult.scene,
-          reasoning: enhanceResult.reasoning,
-          richPrompt: enhanceResult.richPrompt,
-          imgRatio: enhanceResult.imgRatio,
-          quality: enhanceResult.quality,
-          degradedReason: enhanceResult.degradedReason,
-          stage: enhanceResult.stage,
-        }
-      : enhanceResult.degradedReason
-        ? { degradedReason: enhanceResult.degradedReason, stage: enhanceResult.stage }
-        : undefined
+    const enhance = enhanceForGeneration(enhanceResult)
 
     // 3. patch assistant → generating（写 enhance/finalPrompt/noticeText/maskEdit.phase=submitting）。
     patchAssistantMessage(sceneId, messageId, (m) => ({
