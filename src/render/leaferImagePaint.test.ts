@@ -236,6 +236,16 @@ describe('createLeaferImagePaint — diffReconcilePlan 收支 (no leak, no resur
     // (the contract invariant; here verified by the counts above + painted size)
     expect(paint.paintedCount()).toBe(1)
   })
+
+  it('ctx.layerOf feeds zIndex on create AND update (4a cross-module z-order)', () => {
+    paint.sync([imgNode({ id: 'a', assetUrl: 'http://x' })], { ...ctx(), layerOf: () => 1000010 })
+    const object = leafer.children[0] as unknown as FakeUI
+    expect(object.props.zIndex).toBe(1000010)
+
+    // doc index shift without node field change → update refreshes zIndex
+    paint.sync([imgNode({ id: 'a', assetUrl: 'http://x' })], { ...ctx(), layerOf: () => 1000042 })
+    expect(object.props.zIndex).toBe(1000042)
+  })
 })
 
 describe('createLeaferImagePaint — crop via Group(overflow:hidden) + child Image', () => {

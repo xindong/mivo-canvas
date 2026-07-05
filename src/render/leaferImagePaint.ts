@@ -25,8 +25,11 @@
 // D1 (hard constraint): pure paint. `hittable:false` is set on the Leafer root
 // (useLeaferHost), not per-object; this module never subscribes to Leafer events
 // and never touches the engine camera layer. z-order uses the 2b-2 Layer enum —
-// images are Layer.Content (Layer.Frame is reserved for frame/section nodes);
-// within Content the stable document order of the input node list is preserved.
+// images are Layer.Content (Layer.Frame is reserved for frame/section nodes).
+// Since 4a every object also carries an explicit `zIndex` from ctx.layerOf
+// (layer band × document order, built once per sync by the hook), so document
+// order holds ACROSS paint modules (a markup shape drawn after an image stacks
+// above it, exactly like the DOM) instead of relying on per-module insertion order.
 //
 // 0g three invariants: pan walks the camera only — this module's `sync` is NOT
 // called during pan (the spike's paint effect re-runs on node/signature change,
@@ -123,11 +126,12 @@ const desiredKindFor = (node: MivoCanvasNode, viewport: ViewportState): ImageEnt
 
 type CreatedObject = { object: ImageObject; innerImage?: Image }
 
-const createObject = (node: MivoCanvasNode, kind: ImageEntryKind): CreatedObject => {
+const createObject = (node: MivoCanvasNode, kind: ImageEntryKind, zIndex?: number): CreatedObject => {
   const x = node.x
   const y = node.y
   const width = clampDim(node.width)
   const height = clampDim(node.height)
+  const zProps = zIndex !== undefined ? { zIndex } : {}
   if (kind === 'lod-rect') {
     return {
       object: new Rect({
@@ -137,6 +141,7 @@ const createObject = (node: MivoCanvasNode, kind: ImageEntryKind): CreatedObject
         height,
         fill: engineLodFillFor(node),
         strokeWidth: 0,
+        ...zProps,
       }),
     }
   }
@@ -146,14 +151,14 @@ const createObject = (node: MivoCanvasNode, kind: ImageEntryKind): CreatedObject
       // Defensive: desiredKindFor only returns 'image-crop' when imageCrop exists,
       // but a stale kind on a node whose crop was just cleared falls back to plain
       // image geometry rather than crashing.
-      return { object: new Image({ x, y, width, height }) }
+      return { object: new Image({ x, y, width, height, ...zProps }) }
     }
-    const group = new Group({ x, y, width, height, overflow: 'hidden' })
+    const group = new Group({ x, y, width, height, overflow: 'hidden', ...zProps })
     const child = new Image(cropChildLocal(width, height, crop))
     group.add(child)
     return { object: group, innerImage: child }
   }
-  return { object: new Image({ x, y, width, height }) }
+  return { object: new Image({ x, y, width, height, ...zProps }) }
 }
 
 const setProps = (object: ImageObject, props: Record<string, unknown>) => {
@@ -170,24 +175,27 @@ const applyUrl = (entry: ImageEntry, url: string) => {
   }
 }
 
-const updateGeometry = (entry: ImageEntry, node: MivoCanvasNode) => {
+const updateGeometry = (entry: ImageEntry, node: MivoCanvasNode, zIndex?: number) => {
   const x = node.x
   const y = node.y
   const width = clampDim(node.width)
   const height = clampDim(node.height)
+  // zIndex rides along on update too: the document index can shift (node
+  // inserted/removed elsewhere) without this node's own fields changing.
+  const zProps = zIndex !== undefined ? { zIndex } : {}
   if (entry.kind === 'lod-rect') {
-    setProps(entry.object, { x, y, width, height, fill: engineLodFillFor(node) })
+    setProps(entry.object, { x, y, width, height, fill: engineLodFillFor(node), ...zProps })
     return
   }
   if (entry.kind === 'image-crop') {
-    setProps(entry.object, { x, y, width, height })
+    setProps(entry.object, { x, y, width, height, ...zProps })
     const crop = node.imageCrop
     if (crop && entry.innerImage) {
       setProps(entry.innerImage, cropChildLocal(width, height, crop))
     }
     return
   }
-  setProps(entry.object, { x, y, width, height })
+  setProps(entry.object, { x, y, width, height, ...zProps })
 }
 
 /**
@@ -273,9 +281,10 @@ export const createLeaferImagePaint = (leafer: Leafer): LeaferImagePaint => {
       const existing = entries.get(node.id)
       const desired = desiredKindFor(node, ctx.viewport)
       const isNew = plan.created.has(node.id)
+      const zIndex = ctx.layerOf?.(node.id)
 
       if (isNew || !existing) {
-        const { object, innerImage } = createObject(node, desired)
+        const { object, innerImage } = createObject(node, desired, zIndex)
         const entry: ImageEntry = { nodeId: node.id, object, kind: desired, innerImage }
         entries.set(node.id, entry)
         leafer.add(object)
@@ -289,13 +298,13 @@ export const createLeaferImagePaint = (leafer: Leafer): LeaferImagePaint => {
         // entry's in-flight lease (if any) sees disposed=true and releases; the
         // new entry acquires fresh if it's a bitmap kind.
         destroyEntry(existing)
-        const { object, innerImage } = createObject(node, desired)
+        const { object, innerImage } = createObject(node, desired, zIndex)
         const fresh: ImageEntry = { nodeId: node.id, object, kind: desired, innerImage }
         entries.set(node.id, fresh)
         leafer.add(object)
         if (desired !== 'lod-rect') acquireLease(fresh, node.assetUrl)
       } else {
-        updateGeometry(existing, node)
+        updateGeometry(existing, node, zIndex)
         if (desired !== 'lod-rect' && existing.assetUrl !== node.assetUrl) {
           releaseLease(existing)
           acquireLease(existing, node.assetUrl)
