@@ -107,3 +107,21 @@ export const resolveMivoPlatformPollDeadlineMs = (
   resolution: unknown,
   config: Pick<MivoEnvConfig, 'platformPollDeadlineByResolutionMs'> = getEnvConfig(),
 ): number => config.platformPollDeadlineByResolutionMs[normalizeMivoPlatformResolution(resolution)]
+
+/**
+ * edit-timeout-batch: mask edit (llm-proxy /edits) 上游超时分级。#63 的分辨率分级只覆盖
+ * platform 轮询，mask edit 因 hasMask 强制走 llm-proxy 吃不到分级，固定 180s 对 high/大尺寸
+ * 高危撞线（实测 high 在 180040ms 被 504 截断，medium 已耗 95-98s）。
+ *
+ * 分档：low/medium=180s；high 或大尺寸(16:9/9:16，与 EnhanceParamCard 慢提示同口径)→300s
+ * （对齐 platform 2K 的 300s）。显式 env MIVO_EDIT_UPSTREAM_TIMEOUT_MS 整体覆盖（优先级最高）。
+ */
+export const resolveEditUpstreamTimeoutMs = (
+  input: { quality?: string; imgRatio?: string },
+  config: Pick<MivoEnvConfig, 'editUpstreamTimeoutMs'> = getEnvConfig(),
+): number => {
+  // 显式 env 整体覆盖（num() 在 getEnvConfig 已解析非法值回退 180_000）
+  if (process.env.MIVO_EDIT_UPSTREAM_TIMEOUT_MS) return config.editUpstreamTimeoutMs
+  const largeRatio = input.imgRatio === '16:9' || input.imgRatio === '9:16'
+  return input.quality === 'high' || largeRatio ? 300_000 : 180_000
+}

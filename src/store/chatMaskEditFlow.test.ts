@@ -66,21 +66,26 @@ vi.mock('./generationFacade', () => ({ generationFacade: genFacadeSpies }))
 
 // mask-chat-card 专属 mock: runMaskEditGeneration / removeMaskEditPlaceholder
 // (chat flow 不直写 canvas,经 callbacks 驱动卡片状态)。
+// edit-timeout-batch: prepareMaskEditPlaceholder 也纳入 hoisted spies,供 retry 单测
+// 控制「新 slotId」返回值（retryMaskEditMessage 会调它建新 placeholder）。
 const maskEditGenSpies = vi.hoisted(() => ({
   runMaskEditGeneration: vi.fn(),
   removeMaskEditPlaceholder: vi.fn(),
+  prepareMaskEditPlaceholder: vi.fn(() => ({ slotId: 'slot-1', baselineSnapshot: undefined })),
 }))
 vi.mock('../canvas/maskEditGeneration', () => ({
   runMaskEditGeneration: maskEditGenSpies.runMaskEditGeneration,
   removeMaskEditPlaceholder: maskEditGenSpies.removeMaskEditPlaceholder,
-  prepareMaskEditPlaceholder: vi.fn(() => ({ slotId: 'slot-1', baselineSnapshot: undefined })),
+  prepareMaskEditPlaceholder: maskEditGenSpies.prepareMaskEditPlaceholder,
 }))
 
 // 控制 useCanvasStore.getState() 返回的 sceneId/canvases(用于跨场景 notice 逻辑)。
 // chatMaskEditFlow 的 finishMaskEditMessage/failMaskEditMessage 只读 sceneId + canvases[sceneId].title。
+// edit-timeout-batch: failMaskEditMessage/retryMaskEditMessage 还读 canvases[sceneId].nodes
+// 判 source 是否仍存在（some(n.id === sourceNodeId && n.type==='image' && !n.hidden)）。
 const canvasStoreStub = vi.hoisted(() => ({
   sceneId: 'scene-1',
-  canvases: {} as Record<string, { title: string }>,
+  canvases: {} as Record<string, { title: string; nodes?: { id: string; type: string; hidden?: boolean }[] }>,
 }))
 vi.mock('../store/canvasStore', () => ({
   useCanvasStore: {
@@ -110,6 +115,7 @@ import {
   beginMaskEditMessage,
   runMaskEditChatFlow,
   cancelMaskEditMessage,
+  retryMaskEditMessage,
 } from './chatMaskEditFlow'
 import {
   registerMaskEditTask,
@@ -164,6 +170,8 @@ beforeEach(() => {
   vi.mocked(enhanceMivoPrompt).mockReset()
   maskEditGenSpies.runMaskEditGeneration.mockReset()
   maskEditGenSpies.removeMaskEditPlaceholder.mockReset()
+  maskEditGenSpies.prepareMaskEditPlaceholder.mockReset()
+  maskEditGenSpies.prepareMaskEditPlaceholder.mockImplementation(() => ({ slotId: 'slot-1', baselineSnapshot: undefined }))
   taskClientSpies.cancelTask.mockReset()
   taskClientSpies.cancelTask.mockImplementation(() => Promise.resolve())
   __resetMaskEditTaskRegistryForTests()
@@ -580,5 +588,256 @@ describe('cancelMaskEditMessage (SC-08/15)', () => {
     // cancelTask 被调(task-x) — 动态 import 是 fire-and-forget,需等 macrotask 让链 resolve
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(taskClientSpies.cancelTask).toHaveBeenCalledWith('task-x')
+  })
+})
+
+// edit-timeout-batch: 超时分级中文文案 + 可重试 CTA + 超时保留 record 供卡片重试复用。
+// Item2: failMaskEditMessage 对 upstream-timeout/client-timeout 映射中文「局部重绘上游超时，
+// 可稍后重试或降低质量重试」；canceled 维持「已取消生成」；其他错误原样。超时 + source 仍存在
+// → retryDisabledReason=undefined（可重试）；超时 + source 已删 → maskEditSourceDeletedRetryDisabledReason；
+// canceled/非超时 → maskEditRetryDisabledReason。
+describe('runMaskEditChatFlow edit-timeout-batch: 超时文案 + retryable (Item2)', () => {
+  it('upstream-timeout + source 存在 → assistant.error=局部重绘上游超时 + retryDisabledReason=undefined + errorKind=upstream-timeout + record 保留', async () => {
+    vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({ enhanced: true, mode: 'generate', richPrompt: 'x' } as never)
+    maskEditGenSpies.runMaskEditGeneration.mockRejectedValueOnce(
+      new MivoImageRequestError('Image API request timed out', 'upstream-timeout'),
+    )
+    const source = imageNode({ id: 'src-timeout-1' })
+    canvasStoreStub.canvases = { 'scene-1': { title: 'Scene One', nodes: [source] } }
+
+    const messageId = beginMaskEditMessage({
+      sceneId: 'scene-1', source, prompt: 'p', slotId: 'slot-1', imgRatio: '1:1', quality: 'medium',
+    })
+    const record = makeRecord({ messageId, sceneId: 'scene-1', slotId: 'slot-1', source })
+    registerMaskEditTask(record)
+    await runMaskEditChatFlow(record)
+
+    const assistant = useChatStore.getState().messagesByScene['scene-1'].find((m) => m.id === messageId)!
+    expect(assistant.status).toBe('error')
+    expect(assistant.error).toBe('局部重绘上游超时，可稍后重试或降低质量重试')
+    expect(assistant.errorKind).toBe('upstream-timeout')
+    expect(assistant.retryDisabledReason).toBeUndefined()
+    // Item3: 超时失败保留 runtime record（含 mask blob/payload）供卡片重试复用
+    expect(getMaskEditTask(messageId)).toBeDefined()
+  })
+
+  it('upstream-timeout + source 已删 → retryDisabledReason=原图已被删除，无法重试局部重绘', async () => {
+    vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({ enhanced: true, mode: 'generate', richPrompt: 'x' } as never)
+    maskEditGenSpies.runMaskEditGeneration.mockRejectedValueOnce(
+      new MivoImageRequestError('Image API request timed out', 'upstream-timeout'),
+    )
+    const source = imageNode({ id: 'src-timeout-del' })
+    // source 已删：canvases[scene].nodes 不含 source 节点
+    canvasStoreStub.canvases = { 'scene-1': { title: 'Scene One', nodes: [] } }
+
+    const messageId = beginMaskEditMessage({
+      sceneId: 'scene-1', source, prompt: 'p', slotId: 'slot-1', imgRatio: '1:1', quality: 'medium',
+    })
+    const record = makeRecord({ messageId, sceneId: 'scene-1', slotId: 'slot-1', source })
+    registerMaskEditTask(record)
+    await runMaskEditChatFlow(record)
+
+    const assistant = useChatStore.getState().messagesByScene['scene-1'].find((m) => m.id === messageId)!
+    expect(assistant.status).toBe('error')
+    expect(assistant.error).toBe('局部重绘上游超时，可稍后重试或降低质量重试')
+    expect(assistant.errorKind).toBe('upstream-timeout')
+    expect(assistant.retryDisabledReason).toBe('原图已被删除，无法重试局部重绘')
+    // record 仍保留（超时一律保留，无论 source 是否存在）
+    expect(getMaskEditTask(messageId)).toBeDefined()
+  })
+
+  it('client-timeout + source 存在 → assistant.error=局部重绘上游超时 + retryDisabledReason=undefined + errorKind=client-timeout', async () => {
+    vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({ enhanced: true, mode: 'generate', richPrompt: 'x' } as never)
+    maskEditGenSpies.runMaskEditGeneration.mockRejectedValueOnce(
+      new MivoImageRequestError('Image API request timed out', 'client-timeout'),
+    )
+    const source = imageNode({ id: 'src-ctimeout' })
+    canvasStoreStub.canvases = { 'scene-1': { title: 'Scene One', nodes: [source] } }
+
+    const messageId = beginMaskEditMessage({
+      sceneId: 'scene-1', source, prompt: 'p', slotId: 'slot-1', imgRatio: '1:1', quality: 'medium',
+    })
+    const record = makeRecord({ messageId, sceneId: 'scene-1', slotId: 'slot-1', source })
+    registerMaskEditTask(record)
+    await runMaskEditChatFlow(record)
+
+    const assistant = useChatStore.getState().messagesByScene['scene-1'].find((m) => m.id === messageId)!
+    expect(assistant.status).toBe('error')
+    expect(assistant.error).toBe('局部重绘上游超时，可稍后重试或降低质量重试')
+    expect(assistant.errorKind).toBe('client-timeout')
+    expect(assistant.retryDisabledReason).toBeUndefined()
+    expect(getMaskEditTask(messageId)).toBeDefined()
+  })
+
+  it('canceled (runMaskEditGeneration reject) → error=已取消生成 + retryDisabledReason=maskEditRetryDisabledReason + record 清空', async () => {
+    vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({ enhanced: true, mode: 'generate', richPrompt: 'x' } as never)
+    maskEditGenSpies.runMaskEditGeneration.mockRejectedValueOnce(
+      new MivoImageRequestError('取消', 'canceled'),
+    )
+    const source = imageNode({ id: 'src-cancel-reject' })
+    canvasStoreStub.canvases = { 'scene-1': { title: 'Scene One', nodes: [source] } }
+
+    const messageId = beginMaskEditMessage({
+      sceneId: 'scene-1', source, prompt: 'p', slotId: 'slot-1', imgRatio: '1:1', quality: 'medium',
+    })
+    const record = makeRecord({ messageId, sceneId: 'scene-1', slotId: 'slot-1', source })
+    registerMaskEditTask(record)
+    await runMaskEditChatFlow(record)
+
+    const assistant = useChatStore.getState().messagesByScene['scene-1'].find((m) => m.id === messageId)!
+    expect(assistant.status).toBe('error')
+    expect(assistant.error).toBe('已取消生成，可修改提示后重试。')
+    expect(assistant.errorKind).toBe('canceled')
+    expect(assistant.retryDisabledReason).toBe('局部重绘任务已结束，请重新选择区域后再试')
+    // canceled → record 清空（不可重试）
+    expect(getMaskEditTask(messageId)).toBeUndefined()
+  })
+
+  it('非超时 (upstream-error) → error=原 message + retryDisabledReason=maskEditRetryDisabledReason + record 清空', async () => {
+    vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({ enhanced: true, mode: 'generate', richPrompt: 'x' } as never)
+    maskEditGenSpies.runMaskEditGeneration.mockRejectedValueOnce(
+      new MivoImageRequestError('上游失败', 'upstream-error'),
+    )
+    const source = imageNode({ id: 'src-upstream-err' })
+    canvasStoreStub.canvases = { 'scene-1': { title: 'Scene One', nodes: [source] } }
+
+    const messageId = beginMaskEditMessage({
+      sceneId: 'scene-1', source, prompt: 'p', slotId: 'slot-1', imgRatio: '1:1', quality: 'medium',
+    })
+    const record = makeRecord({ messageId, sceneId: 'scene-1', slotId: 'slot-1', source })
+    registerMaskEditTask(record)
+    await runMaskEditChatFlow(record)
+
+    const assistant = useChatStore.getState().messagesByScene['scene-1'].find((m) => m.id === messageId)!
+    expect(assistant.status).toBe('error')
+    // 非超时错误：原 message 原样透传
+    expect(assistant.error).toBe('上游失败')
+    expect(assistant.errorKind).toBe('upstream-error')
+    expect(assistant.retryDisabledReason).toBe('局部重绘任务已结束，请重新选择区域后再试')
+    // 非超时 → record 清空
+    expect(getMaskEditTask(messageId)).toBeUndefined()
+  })
+})
+
+// Item3: retryMaskEditMessage — 超时卡片重试。复用原 runtime record（含 mask blob/payload/source，
+// 超时失败时未清），新建 placeholder + 新 abortController，patch message 回 enhancing，
+// 重跑 runMaskEditChatFlow。硬约束：runtime record 在 + source 仍存在且未隐藏。
+describe('retryMaskEditMessage (Item3)', () => {
+  it('record 在 + source 存在 → prepareMaskEditPlaceholder 被调（新 slotId）、runMaskEditChatFlow 被调（retryRecord）、message patch 回 enhancing、返回 true', async () => {
+    // 先制造超时失败（record 保留）
+    vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({ enhanced: true, mode: 'generate', richPrompt: 'x' } as never)
+    maskEditGenSpies.runMaskEditGeneration.mockRejectedValueOnce(
+      new MivoImageRequestError('Image API request timed out', 'upstream-timeout'),
+    )
+    const source = imageNode({ id: 'src-retry-ok' })
+    canvasStoreStub.canvases = { 'scene-1': { title: 'Scene One', nodes: [source] } }
+
+    const messageId = beginMaskEditMessage({
+      sceneId: 'scene-1', source, prompt: '把妹子换成帅哥', slotId: 'slot-1', imgRatio: '1:1', quality: 'high',
+    })
+    const record = makeRecord({ messageId, sceneId: 'scene-1', slotId: 'slot-1', source, quality: 'high' })
+    registerMaskEditTask(record)
+    await runMaskEditChatFlow(record)
+    // 确认超时后 record 仍在
+    expect(getMaskEditTask(messageId)).toBeDefined()
+
+    // retry 准备：新 slotId + enhance/generation mock 成功
+    maskEditGenSpies.prepareMaskEditPlaceholder.mockImplementationOnce(() => ({ slotId: 'slot-2', baselineSnapshot: undefined }))
+    vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({ enhanced: true, mode: 'generate', richPrompt: 'x' } as never)
+    maskEditGenSpies.runMaskEditGeneration.mockResolvedValueOnce({ nodeIds: ['n1'], sourceDeleted: false })
+
+    const result = retryMaskEditMessage('scene-1', messageId)
+    expect(result).toBe(true)
+
+    // prepareMaskEditPlaceholder 被调（sceneId, source, prompt）
+    expect(maskEditGenSpies.prepareMaskEditPlaceholder).toHaveBeenCalledWith('scene-1', source, '把妹子换成帅哥')
+
+    // message patch 回 status='enhancing'
+    const msgAfter = useChatStore.getState().messagesByScene['scene-1'].find((m) => m.id === messageId)!
+    expect(msgAfter.status).toBe('enhancing')
+    expect(msgAfter.error).toBeUndefined()
+    expect(msgAfter.retryDisabledReason).toBeUndefined()
+    // pendingSlotId 更新为新 slot
+    expect(msgAfter.generationContext?.pendingSlotId).toBe('slot-2')
+
+    // 等 runMaskEditChatFlow 推进到 runMaskEditGeneration 被调（retryRecord 传参）
+    await vi.waitFor(() => {
+      expect(maskEditGenSpies.runMaskEditGeneration).toHaveBeenCalled()
+    })
+    const genCall = maskEditGenSpies.runMaskEditGeneration.mock.calls.at(-1)?.[0] as { slotId: string; source: { id: string } }
+    // retryRecord 用新 slotId
+    expect(genCall.slotId).toBe('slot-2')
+    // source 复用原 record 的
+    expect(genCall.source.id).toBe('src-retry-ok')
+  })
+
+  it('source 已删 → 返回 false、runMaskEditGeneration 未调', async () => {
+    // 先制造超时失败（record 保留）
+    vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({ enhanced: true, mode: 'generate', richPrompt: 'x' } as never)
+    maskEditGenSpies.runMaskEditGeneration.mockRejectedValueOnce(
+      new MivoImageRequestError('Image API request timed out', 'upstream-timeout'),
+    )
+    const source = imageNode({ id: 'src-retry-del' })
+    canvasStoreStub.canvases = { 'scene-1': { title: 'Scene One', nodes: [source] } }
+
+    const messageId = beginMaskEditMessage({
+      sceneId: 'scene-1', source, prompt: 'p', slotId: 'slot-1', imgRatio: '1:1', quality: 'medium',
+    })
+    const record = makeRecord({ messageId, sceneId: 'scene-1', slotId: 'slot-1', source })
+    registerMaskEditTask(record)
+    await runMaskEditChatFlow(record)
+    expect(getMaskEditTask(messageId)).toBeDefined()
+
+    // 删除 source（canvases.nodes 清空）
+    canvasStoreStub.canvases = { 'scene-1': { title: 'Scene One', nodes: [] } }
+
+    const genCallsBefore = maskEditGenSpies.runMaskEditGeneration.mock.calls.length
+    const result = retryMaskEditMessage('scene-1', messageId)
+    expect(result).toBe(false)
+    // 等一拍确保 fire-and-forget 没偷偷调
+    await new Promise((r) => setTimeout(r, 0))
+    expect(maskEditGenSpies.runMaskEditGeneration.mock.calls.length).toBe(genCallsBefore)
+  })
+
+  it('record 不在（非超时已清）→ 返回 false', async () => {
+    // 不 register record（模拟刷新后 runtime 丢失 / 非超时已清）
+    const result = retryMaskEditMessage('scene-1', 'msg-no-record')
+    expect(result).toBe(false)
+    expect(maskEditGenSpies.runMaskEditGeneration).not.toHaveBeenCalled()
+  })
+
+  it('qualityOverride=medium → retryRecord.quality === medium', async () => {
+    // 先制造超时失败（record 保留，原 quality=high）
+    vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({ enhanced: true, mode: 'generate', richPrompt: 'x' } as never)
+    maskEditGenSpies.runMaskEditGeneration.mockRejectedValueOnce(
+      new MivoImageRequestError('Image API request timed out', 'upstream-timeout'),
+    )
+    const source = imageNode({ id: 'src-retry-med' })
+    canvasStoreStub.canvases = { 'scene-1': { title: 'Scene One', nodes: [source] } }
+
+    const messageId = beginMaskEditMessage({
+      sceneId: 'scene-1', source, prompt: 'p', slotId: 'slot-1', imgRatio: '1:1', quality: 'high',
+    })
+    const record = makeRecord({ messageId, sceneId: 'scene-1', slotId: 'slot-1', source, quality: 'high' })
+    registerMaskEditTask(record)
+    await runMaskEditChatFlow(record)
+
+    // retry with qualityOverride='medium'
+    maskEditGenSpies.prepareMaskEditPlaceholder.mockImplementationOnce(() => ({ slotId: 'slot-2', baselineSnapshot: undefined }))
+    vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({ enhanced: true, mode: 'generate', richPrompt: 'x' } as never)
+    maskEditGenSpies.runMaskEditGeneration.mockResolvedValueOnce({ nodeIds: ['n1'], sourceDeleted: false })
+
+    retryMaskEditMessage('scene-1', messageId, 'medium')
+
+    // message context.quality 同步降为 medium
+    const msgAfter = useChatStore.getState().messagesByScene['scene-1'].find((m) => m.id === messageId)!
+    expect(msgAfter.generationContext?.quality).toBe('medium')
+
+    // runMaskEditGeneration 收到的 retryRecord.quality === 'medium'
+    await vi.waitFor(() => {
+      expect(maskEditGenSpies.runMaskEditGeneration).toHaveBeenCalled()
+    })
+    const genCall = maskEditGenSpies.runMaskEditGeneration.mock.calls.at(-1)?.[0] as { quality: string }
+    expect(genCall.quality).toBe('medium')
   })
 })

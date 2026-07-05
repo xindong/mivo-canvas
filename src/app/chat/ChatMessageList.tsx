@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef } from 'react'
 import { RefreshCw } from 'lucide-react'
 import { useChatStore } from '../../store/chatStore'
 import { useCanvasStore } from '../../store/canvasStore'
+import { retryMaskEditMessage } from '../../store/chatMaskEditFlow'
 import { EnhanceParamCard } from './EnhanceParamCard'
 import { ChatResultImage } from './ChatResultImage'
 
@@ -125,7 +126,11 @@ export function ChatMessageList({ sceneId }: ChatMessageListProps) {
                   <button
                     type="button"
                     className="chat-retry-btn"
-                    onClick={() => void retryMessage({ sceneId, messageId: message.id })}
+                    onClick={() =>
+                      void (message.origin === 'mask-edit'
+                        ? retryMaskEditMessage(sceneId, message.id)
+                        : retryMessage({ sceneId, messageId: message.id }))
+                    }
                     disabled={isBusy || Boolean(message.retryDisabledReason)}
                     title={retryDisabledReason || '重新生成'}
                   >
@@ -136,7 +141,11 @@ export function ChatMessageList({ sceneId }: ChatMessageListProps) {
                     <button
                       type="button"
                       className="chat-retry-btn chat-retry-btn-secondary"
-                      onClick={() => void retryMessage({ sceneId, messageId: message.id, qualityOverride: 'medium' })}
+                      onClick={() =>
+                        void (message.origin === 'mask-edit'
+                          ? retryMaskEditMessage(sceneId, message.id, 'medium')
+                          : retryMessage({ sceneId, messageId: message.id, qualityOverride: 'medium' }))
+                      }
                       disabled={isBusy || Boolean(message.retryDisabledReason)}
                       title={retryDisabledReason || '以中质量重新生成（降到 1K）'}
                     >

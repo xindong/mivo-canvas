@@ -16,15 +16,22 @@ import { useCanvasStore } from './canvasStore'
 import { debugLogger } from './debugLogStore'
 import { enhanceMivoPrompt, MivoImageRequestError } from '../lib/mivoImageClient'
 import { resolveMaskEditEnhance, enhanceForGeneration } from './chatEnhanceFlow'
-import { removeMaskEditPlaceholder, runMaskEditGeneration } from '../canvas/maskEditGeneration'
+import { removeMaskEditPlaceholder, prepareMaskEditPlaceholder, runMaskEditGeneration } from '../canvas/maskEditGeneration'
 import {
   clearMaskEditTask,
   abortMaskEditTask,
+  getMaskEditTask,
+  registerMaskEditTask,
   type ActiveMaskEditTask,
 } from './maskEditTaskRuntime'
 
 const canceledGenerationMessage = '已取消生成，可修改提示后重试。'
 const maskEditRetryDisabledReason = '局部重绘任务已结束，请重新选择区域后再试'
+// edit-timeout-batch: mask edit 上游超时中文文案（client-timeout/upstream-timeout 两类可重试超时
+// 与 canceled 不可重试）。原 BFF 英文 "Image API request timed out" 对用户不可读。
+const maskEditTimeoutMessage = '局部重绘上游超时，可稍后重试或降低质量重试'
+// edit-timeout-batch: 超时本可重试，但原图已删（source 不在）→ 不可重试。
+const maskEditSourceDeletedRetryDisabledReason = '原图已被删除，无法重试局部重绘'
 
 export type MaskEditMessagePhase = 'enhancing' | 'submitting' | 'polling' | 'self-heal-retry'
 
@@ -169,7 +176,9 @@ export const finishMaskEditMessage = (args: {
   }
 }
 
-/** 失败收口：移除 placeholder + message 转 error + retryDisabledReason + 跨场景 notice。 */
+/** 失败收口：移除 placeholder + message 转 error + retryDisabledReason + 跨场景 notice。
+ *  edit-timeout-batch: 超时错误（client-timeout/upstream-timeout）映射中文文案，且当 source
+ *  仍存在时不写 retryDisabledReason（提供重试 CTA）；source 已删则不可重试。canceled/其他错误维持 disabled。 */
 export const failMaskEditMessage = (args: {
   sceneId: string
   messageId: string
@@ -179,6 +188,7 @@ export const failMaskEditMessage = (args: {
   slotId: string
   baselineSnapshot?: unknown
   sourceTitle?: string
+  sourceNodeId?: string
 }): void => {
   removeMaskEditPlaceholder(args.sceneId, args.slotId, {
     canceled: args.canceled,
@@ -186,14 +196,32 @@ export const failMaskEditMessage = (args: {
     sourceTitle: args.sourceTitle,
     baselineSnapshot: args.baselineSnapshot as never,
   })
+  // edit-timeout-batch: 区分 client-timeout/upstream-timeout（可重试）vs canceled（不可重试）vs 其他。
+  const isTimeout = !args.canceled && (args.errorKind === 'upstream-timeout' || args.errorKind === 'client-timeout')
+  const errorMessage = args.canceled
+    ? canceledGenerationMessage
+    : isTimeout
+      ? maskEditTimeoutMessage
+      : args.error
+  // 超时 + source 仍存在 → 可重试（不写 retryDisabledReason）；source 已删 → 不可重试。
+  const sourceStillExists = args.sourceNodeId
+    ? Boolean(useCanvasStore.getState().canvases[args.sceneId]?.nodes?.some(
+        (n) => n.id === args.sourceNodeId && n.type === 'image' && !n.hidden,
+      ))
+    : false
+  const retryDisabledReason = args.canceled
+    ? maskEditRetryDisabledReason
+    : isTimeout
+      ? (sourceStillExists ? undefined : maskEditSourceDeletedRetryDisabledReason)
+      : maskEditRetryDisabledReason
   patchAssistantMessage(args.sceneId, args.messageId, (m) => ({
     ...m,
     status: 'error' as const,
-    error: args.canceled ? canceledGenerationMessage : args.error,
+    error: errorMessage,
     errorKind: (args.canceled ? 'canceled' : args.errorKind || 'unknown') as never,
     timeoutRetryKey: undefined,
     timeoutRetryCount: undefined,
-    retryDisabledReason: maskEditRetryDisabledReason,
+    retryDisabledReason,
     generationContext: {
       ...(m.generationContext as ChatGenerationContext),
       maskEdit: { ...((m.generationContext as ChatGenerationContext).maskEdit), phase: undefined },
@@ -204,7 +232,7 @@ export const failMaskEditMessage = (args: {
     useChatStore.getState().appendNotice({
       sceneId: currentSceneId,
       origin: 'mask-edit',
-      prompt: `局部重绘失败：${args.error}`,
+      prompt: `局部重绘失败：${errorMessage}`,
     })
   }
 }
@@ -283,9 +311,13 @@ export const runMaskEditChatFlow = async (record: ActiveMaskEditTask): Promise<v
       slotId,
       baselineSnapshot: record.baselineSnapshot,
       sourceTitle: source.title,
+      sourceNodeId: source.id,
     })
-    clearMaskEditTask(messageId)
-    debugLogger.log('Mask Edit', `Mask chat flow failed for ${source.title} (msg ${messageId}): ${logMessage}`)
+    // edit-timeout-batch: 超时失败保留 runtime record（含 mask blob/payload）供卡片重试复用；
+    // canceled/其他错误清掉（不可重试）。
+    const isTimeoutFailure = !canceled && (errorKind === 'upstream-timeout' || errorKind === 'client-timeout')
+    if (!isTimeoutFailure) clearMaskEditTask(messageId)
+    debugLogger.log('Mask Edit', `Mask chat flow failed for ${source.title} (msg ${messageId}): ${logMessage}${isTimeoutFailure ? ' (timeout, record retained for retry)' : ''}`)
   }
 }
 
@@ -320,4 +352,72 @@ export const cancelMaskEditMessage = (sceneId: string, messageId: string): void 
     timeoutRetryCount: undefined,
     retryDisabledReason: maskEditRetryDisabledReason,
   }))
+}
+
+/** edit-timeout-batch: 超时卡片重试。复用原 runtime record（含 mask blob/payload/source，
+ *  超时失败时未清），新建 placeholder + 新 abortController，patch message 回 enhancing，
+ *  重跑 runMaskEditChatFlow（新 idempotencyKey 由 runMaskEditGeneration 内部生成）。
+ *  硬约束：runtime record 在 + source 仍存在且未隐藏。qualityOverride 供「降质重试」。
+ *  返回 true 表示已调度重试。 */
+export const retryMaskEditMessage = (
+  sceneId: string,
+  messageId: string,
+  qualityOverride?: MivoImageQuality,
+): boolean => {
+  const record = getMaskEditTask(messageId)
+  if (!record) {
+    debugLogger.warn('Mask Edit', `retryMaskEditMessage: 无 runtime record for ${messageId}（非超时失败或已清）`)
+    return false
+  }
+  const sourceStillExists = Boolean(
+    useCanvasStore.getState().canvases[sceneId]?.nodes.some(
+      (n) => n.id === record.source.id && n.type === 'image' && !n.hidden,
+    ),
+  )
+  if (!sourceStillExists) {
+    debugLogger.warn('Mask Edit', `retryMaskEditMessage: 原图 ${record.source.id} 已删/隐藏，重试阻断`)
+    return false
+  }
+  // 新 placeholder + 新 abortController；payload（含 mask blob/prompt）+ source 复用，quality 可降质覆盖。
+  const { slotId, baselineSnapshot } = prepareMaskEditPlaceholder(sceneId, record.source, record.payload.prompt)
+  const abortController = new AbortController()
+  const retryRecord: ActiveMaskEditTask = {
+    ...record,
+    slotId,
+    baselineSnapshot,
+    abortController,
+    quality: qualityOverride ?? record.quality,
+  }
+  registerMaskEditTask(retryRecord) // 覆盖旧 record（同 messageId）
+  // 降质重试时同步 patch context.quality，保持卡片展示与实际请求一致。
+  const retryQuality = qualityOverride ?? record.quality
+  patchAssistantMessage(sceneId, messageId, (m) => ({
+    ...m,
+    status: 'enhancing' as const,
+    text: '',
+    error: undefined,
+    errorKind: undefined,
+    timeoutRetryKey: undefined,
+    timeoutRetryCount: undefined,
+    retryDisabledReason: undefined,
+    generationContext: {
+      ...(m.generationContext as ChatGenerationContext),
+      pendingSlotId: slotId,
+      quality: retryQuality,
+      maskEdit: {
+        ...((m.generationContext as ChatGenerationContext).maskEdit),
+        phase: 'enhancing',
+        serverTaskId: undefined,
+        sourceDeleted: undefined,
+      },
+    },
+  }))
+  void runMaskEditChatFlow(retryRecord).catch((error) => {
+    debugLogger.error(
+      'Mask Edit',
+      `retryMaskEditChatFlow crashed for ${record.source.title} (msg ${messageId}): ${error instanceof Error ? error.message : 'unknown'}`,
+    )
+  })
+  debugLogger.log('Mask Edit', `retryMaskEditMessage dispatched for ${messageId} (new slot ${slotId}, quality=${retryQuality ?? 'auto'})`)
+  return true
 }
