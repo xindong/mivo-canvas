@@ -396,11 +396,11 @@ export function ProjectSidebar({
           <button
             type="button"
             className="debug-log-row changelog-row"
-            aria-label="更新日志"
+            aria-label="Changelog"
             onClick={openChangelog}
           >
             <Sparkles size={17} />
-            <span>更新日志</span>
+            <span>Changelog</span>
             {hasUnreadChangelog ? <span className="changelog-badge-dot" aria-hidden="true" /> : null}
           </button>
         </div>
