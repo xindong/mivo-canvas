@@ -117,15 +117,16 @@ export const ChangelogPanel = ({ openedAt, onClose }: ChangelogPanelProps) => {
   const goEarlier = () => setCurrentIndex((index) => Math.min(Math.min(index, maxIndex) + 1, maxIndex))
   const goNewer = () => setCurrentIndex((index) => Math.max(Math.min(index, maxIndex) - 1, 0))
 
+  // 轮播轨道语义:最左是最新的一天,越往右越早——左键朝最新走,右键朝更早走。
   const handlePanelKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
     if (event.defaultPrevented || maxIndex < 1) return
     if (event.key === 'ArrowLeft') {
       event.preventDefault()
-      goEarlier()
+      goNewer()
     }
     if (event.key === 'ArrowRight') {
       event.preventDefault()
-      goNewer()
+      goEarlier()
     }
   }
 
@@ -160,35 +161,13 @@ export const ChangelogPanel = ({ openedAt, onClose }: ChangelogPanelProps) => {
         <div className="changelog-carousel" aria-label="最近更新">
           {currentEntry ? (
             <>
-              <div className="changelog-carousel-bar">
+              <div className="changelog-date-bar" aria-live="polite">
+                <span className="changelog-current-date">{formatCarouselDate(currentEntry.date)}</span>
+              </div>
+              <div className="changelog-carousel-stage">
                 <button
                   type="button"
-                  className="changelog-carousel-button"
-                  aria-label="切换到更早更新日志"
-                  disabled={!canGoEarlier}
-                  onClick={() => {
-                    goEarlier()
-                    focusPanel()
-                  }}
-                >
-                  <ChevronLeft size={16} />
-                  <span>更早</span>
-                </button>
-                <div className="changelog-carousel-status" aria-live="polite">
-                  <span className="changelog-current-date">{formatCarouselDate(currentEntry.date)}</span>
-                  <span>{`${activeIndex + 1}/${visibleEntries.length}`}</span>
-                  <span className="changelog-dots" aria-hidden="true">
-                    {visibleEntries.map((entry, index) => (
-                      <span
-                        key={entry.date}
-                        className={index === activeIndex ? 'changelog-dot active' : 'changelog-dot'}
-                      />
-                    ))}
-                  </span>
-                </div>
-                <button
-                  type="button"
-                  className="changelog-carousel-button"
+                  className="changelog-carousel-arrow"
                   aria-label="切换到更新的更新日志"
                   disabled={!canGoNewer}
                   onClick={() => {
@@ -196,19 +175,38 @@ export const ChangelogPanel = ({ openedAt, onClose }: ChangelogPanelProps) => {
                     focusPanel()
                   }}
                 >
-                  <span>更近</span>
-                  <ChevronRight size={16} />
+                  <ChevronLeft size={18} />
+                </button>
+                <article key={currentEntry.date} className="changelog-day" data-date={currentEntry.date}>
+                  <h3 className="changelog-day-date">{currentEntry.date}</h3>
+                  <div className="changelog-day-scroll">
+                    <div className="changelog-day-columns">
+                      <ChangelogColumn title="✨ 新功能" items={currentEntry.features} />
+                      <ChangelogColumn title="🔧 修复的问题" items={currentEntry.fixes} />
+                    </div>
+                  </div>
+                </article>
+                <button
+                  type="button"
+                  className="changelog-carousel-arrow"
+                  aria-label="切换到更早更新日志"
+                  disabled={!canGoEarlier}
+                  onClick={() => {
+                    goEarlier()
+                    focusPanel()
+                  }}
+                >
+                  <ChevronRight size={18} />
                 </button>
               </div>
-              <article key={currentEntry.date} className="changelog-day" data-date={currentEntry.date}>
-                <h3 className="changelog-day-date">{currentEntry.date}</h3>
-                <div className="changelog-day-scroll">
-                  <div className="changelog-day-columns">
-                    <ChangelogColumn title="✨ 新功能" items={currentEntry.features} />
-                    <ChangelogColumn title="🔧 修复的问题" items={currentEntry.fixes} />
-                  </div>
-                </div>
-              </article>
+              <div className="changelog-dots" aria-hidden="true">
+                {visibleEntries.map((entry, index) => (
+                  <span
+                    key={entry.date}
+                    className={index === activeIndex ? 'changelog-dot active' : 'changelog-dot'}
+                  />
+                ))}
+              </div>
             </>
           ) : (
             <p className="changelog-empty">最近 7 天暂无更新</p>
