@@ -48,11 +48,13 @@ const parseArgs = (argv) => {
     headless: true,
     outputDir: 'test-artifacts/visual-diff',
     fixture: null,
+    textPaint: null,
   }
   for (const entry of argv) {
     if (entry.startsWith('--baseline=')) options.baseline = entry.slice('--baseline='.length) || 'dom'
     else if (entry.startsWith('--candidate=')) options.candidate = entry.slice('--candidate='.length) || 'dom'
     else if (entry.startsWith('--fixture=')) options.fixture = entry.slice('--fixture='.length) || null
+    else if (entry === '--text-paint=leafer') options.textPaint = 'leafer'
     else if (entry.startsWith('--dpr=')) {
       const dpr = Number.parseInt(entry.slice('--dpr='.length), 10)
       if (Number.isFinite(dpr) && dpr > 0) options.dpr = dpr
@@ -189,11 +191,35 @@ const brushStampFixtureNodes = () => {
   ]
 }
 
+/**
+ * Phase 5 静态文本 golden fixture:CJK 长段 / 中英混排 / 英文长词(anywhere
+ * 断行)/ 显式换行(pre-wrap)/ 字号 12-24 / 字重 500 vs 700 / 三种对齐 /
+ * 自定义颜色。node.width 决定换行盒宽,浏览器与 Leafer 的断行差异会直接
+ * 表现为行数/字位错位 → 像素 diff 放大,是文本去向判决的核心证据。
+ */
+const textFixtureNodes = () => {
+  const node = (props) => ({ status: 'ready', title: props.id, type: 'text', ...props })
+  return [
+    node({ id: 'txt-cjk', x: 40, y: 40, width: 280, height: 220, fontSize: 16, text: '无限画布要在内容越来越多的时候仍然保持流畅,渲染层就必须只处理视口内可见的那一小部分节点;缩小到全景时再用降级绘制兜底。这段话用于验证中日韩文字的逐字断行与行高。' }),
+    node({ id: 'txt-mixed', x: 360, y: 40, width: 260, height: 200, fontSize: 16, text: 'Leafer 接入后 20k 节点 pan p95 只有 17.3ms(bar 是 33ms),比 DOM 的 100.1ms 快了 5.8x——mixed CJK/ASCII wrapping test 12345。' }),
+    node({ id: 'txt-longword', x: 660, y: 40, width: 200, height: 180, fontSize: 16, text: 'Supercalifragilisticexpialidocious pneumonoultramicroscopicsilicovolcanoconiosis overflow-wrap-anywhere behavior check' }),
+    node({ id: 'txt-newline', x: 900, y: 40, width: 240, height: 200, fontSize: 16, text: '第一行\n第二行较长一些用于观察\n\n空行之后的第四行' }),
+    node({ id: 'txt-small', x: 40, y: 300, width: 220, height: 120, fontSize: 12, text: '小字号 12px:界面注释与图注常用尺寸,验证小字距下的断行稳定性。small 12px annotation text.' }),
+    node({ id: 'txt-big-bold', x: 300, y: 300, width: 320, height: 160, fontSize: 24, fontWeight: 700, text: '大标题 24px 700 粗体 Heading Weight' }),
+    node({ id: 'txt-center', x: 660, y: 300, width: 240, height: 120, fontSize: 16, textAlign: 'center', text: '居中对齐的多行文本\ncenter aligned lines' }),
+    node({ id: 'txt-right', x: 940, y: 300, width: 240, height: 120, fontSize: 16, textAlign: 'right', text: '右对齐的多行文本\nright aligned lines' }),
+    node({ id: 'txt-color', x: 40, y: 460, width: 280, height: 120, fontSize: 16, textColor: '#b3261e', text: '自定义颜色 #b3261e 的文本,验证 fill 透传。colored text sample.' }),
+  ]
+}
+
 const fixtureFor = (fixture) => {
   if (!fixture) return null
   if (fixture === 'rotation') {
     // dom 模式等注入的旋转图片位图落地（唯一的异步资源）。
     return { nodes: rotationFixtureNodes(), domReadySelector: '.dom-node img[src="/demo-assets/courage-1.jpg"]' }
+  }
+  if (fixture === 'text') {
+    return { nodes: textFixtureNodes(), domReadySelector: '.dom-text-node' }
   }
   if (fixture === 'brush-stamp') {
     // dom 模式等 stamp 贴纸 <img> 挂载（笔迹是同步 SVG path）。
@@ -202,7 +228,8 @@ const fixtureFor = (fixture) => {
   throw new Error(`Unknown --fixture value: ${fixture}`)
 }
 
-const captureScreenshot = async ({ browser, port, renderer, dpr, label, fixture }) => {
+const captureScreenshot = async ({ browser, port, renderer, dpr, label, fixture, textPaint }) => {
+  const pageQuery = `renderer=${encodeURIComponent(renderer)}${textPaint && renderer === 'leafer' ? `&textPaint=${encodeURIComponent(textPaint)}` : ''}`
   const context = await browser.newContext({
     viewport: { width: 1920, height: 1080 },
     deviceScaleFactor: dpr,
@@ -218,7 +245,7 @@ const captureScreenshot = async ({ browser, port, renderer, dpr, label, fixture 
       globalThis.__MIVO_BENCH_PERSIST_SKIP__ = true
     })
   }
-  await page.goto(`http://127.0.0.1:${port}/?renderer=${encodeURIComponent(renderer)}`, { waitUntil: 'networkidle' })
+  await page.goto(`http://127.0.0.1:${port}/?${pageQuery}`, { waitUntil: 'networkidle' })
   await page.addStyleTag({
     content: [
       '*,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important;}',
@@ -226,7 +253,7 @@ const captureScreenshot = async ({ browser, port, renderer, dpr, label, fixture 
     ].join(''),
   })
   await page.evaluate(() => window.localStorage.clear())
-  await page.goto(`http://127.0.0.1:${port}/?renderer=${encodeURIComponent(renderer)}`, { waitUntil: 'networkidle' })
+  await page.goto(`http://127.0.0.1:${port}/?${pageQuery}`, { waitUntil: 'networkidle' })
   await page.waitForSelector('.canvas-shell')
   if (fixtureNodes) {
     // 注入固定文档（replaceSnapshot 内部跑 normalizeCanvasGraph → connector
@@ -337,6 +364,7 @@ const main = async () => {
       dpr: options.dpr,
       label: 'candidate',
       fixture: options.fixture,
+      textPaint: options.textPaint,
     })
 
     const diff = diffImages(baseline, candidate)

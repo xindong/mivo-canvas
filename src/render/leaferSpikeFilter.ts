@@ -1,6 +1,7 @@
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 import type { RendererMode } from './rendererMode'
 import { isEngineLodRequested } from './engineLodMode'
+import { isLeaferTextPaintRequested } from './textPaintMode'
 
 /**
  * 0b spike — Phase 2b 正式化时按 phase2b-adapter-camera-zorder.md 重构。
@@ -60,8 +61,16 @@ export const isPixiSpikePainted = (node: MivoCanvasNode): boolean =>
   (node.type === 'markup' && node.markupKind === 'rect') ||
   node.type === 'text'
 
+/** Phase 5 spike:`?textPaint=leafer` 时 text 节点(type='text',annotation 是
+ *  独立类型不受影响)交给 Leafer Text 绘制,DOM 侧同集过滤。默认 off,
+ *  生产 leafer 模式行为不变。 */
+export const isLeaferTextSpikePaintedNode = (node: MivoCanvasNode): boolean =>
+  isLeaferTextPaintRequested && node.type === 'text'
+
 const isLeaferDomFiltered = (node: MivoCanvasNode): boolean =>
-  isLeaferSpikePainted(node) || (isEngineLodRequested && node.type === 'text')
+  isLeaferSpikePainted(node) ||
+  isLeaferTextSpikePaintedNode(node) ||
+  (isEngineLodRequested && node.type === 'text')
 
 /**
  * leafer 模式下从 DOM 渲染列表里剔除已被 Leafer 画的节点。
