@@ -8,7 +8,15 @@ import {
   isLeaferLinePaintedNode,
   isLeaferShapePaintedNode,
   isLeaferSpikePainted,
+  isLeaferTextSpikePaintedNode,
 } from './leaferSpikeFilter'
+import { isLeaferTextPaintRequested } from './textPaintMode'
+import {
+  defaultTextAlign,
+  defaultTextColor,
+  defaultTextFontSize,
+  defaultTextWeight,
+} from '../canvas/textGeometry'
 import { useCanvasStore } from '../store/canvasStore'
 import { debugLogger } from '../store/debugLogStore'
 import { registerEngineSpikeCamera } from './engineSpikeCameraBridge'
@@ -105,7 +113,9 @@ const parsePanCacheEnabled = () => {
 }
 
 const isLeaferEngineComboPainted = (node: MivoCanvasNode): boolean =>
-  isLeaferSpikePainted(node) || (isEngineLodRequested && node.type === 'text')
+  isLeaferSpikePainted(node) ||
+  isLeaferTextSpikePaintedNode(node) ||
+  (isEngineLodRequested && node.type === 'text')
 
 const leaferObjectKindFor = (node: MivoCanvasNode, viewport: ViewportState): LeaferObjectKind => {
   if (shouldUseEngineLod(node, viewport)) return 'rect'
@@ -128,6 +138,28 @@ const leaferSpikePaintProps = (node: MivoCanvasNode, viewport: ViewportState) =>
     return { ...base, url: node.assetUrl ?? '' }
   }
   if (node.type === 'text') {
+    if (isLeaferTextPaintRequested) {
+      // Phase 5 golden fixture spike: DOM 等价 props——.dom-text-node 的
+      // padding 6px 10px / line-height 1.28 / pre-wrap + overflow-wrap:anywhere
+      // (textWrap:'break' 是 Leafer 里最接近 anywhere 的断行) / textGeometry
+      // 同源字体栈与产品缺省(24px/#232323/500/left)。
+      return {
+        x: node.x + 10,
+        y: node.y + 6,
+        width: Math.max(1, node.width - 20),
+        height: Math.max(1, node.height - 12),
+        text: node.text || '',
+        fill: node.textColor || defaultTextColor,
+        fontFamily:
+          'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+        fontSize: node.fontSize || defaultTextFontSize,
+        fontWeight: node.fontWeight || defaultTextWeight,
+        textAlign: node.textAlign || defaultTextAlign,
+        lineHeight: { type: 'percent', value: 1.28 },
+        textWrap: 'break',
+        verticalAlign: 'top',
+      }
+    }
     return {
       ...base,
       text: node.text || '',
