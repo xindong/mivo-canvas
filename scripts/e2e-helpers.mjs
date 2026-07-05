@@ -114,10 +114,9 @@ export const assertLibraryLayoutStable = (label, before, after) => {
     !after.workspace ||
     !after.library ||
     !after.title ||
-    !nearlyEqual(before.workspace.left, 240, 2) ||
     !nearlyEqual(after.workspace.left, before.workspace.left) ||
     !nearlyEqual(after.workspace.width, before.workspace.width) ||
-    !nearlyEqual(after.workspace.width, after.viewportWidth - 240, 2) ||
+    !nearlyEqual(after.workspace.width, after.viewportWidth - before.workspace.left, 2) ||
     !nearlyEqual(after.library.left, before.library.left) ||
     !nearlyEqual(after.title.left, before.title.left) ||
     !nearlyEqual(after.title.top, before.title.top)

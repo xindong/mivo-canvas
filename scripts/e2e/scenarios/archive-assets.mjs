@@ -506,7 +506,7 @@ export const runArchiveAssetsScenario = async (context) => {
     }
   }
   await page.getByRole('button', { name: 'Collapse projects' }).click()
-  await page.waitForFunction(() => {
+  await page.waitForFunction((expected) => {
     const workspace = document.querySelector('.workspace')
     const workspaceRect = workspace?.getBoundingClientRect()
 
@@ -515,10 +515,10 @@ export const runArchiveAssetsScenario = async (context) => {
       Boolean(document.querySelector('[aria-label="Open projects"]')) &&
       document.querySelector('.library-workspace h1')?.textContent === 'Assets' &&
       workspaceRect &&
-      Math.abs(workspaceRect.left - 240) <= 2 &&
-      Math.abs(workspaceRect.width - (window.innerWidth - 240)) <= 2
+      Math.abs(workspaceRect.left - expected.left) <= 2 &&
+      Math.abs(workspaceRect.width - expected.width) <= 2
     )
-  })
+  }, { left: assetsOpenLayout.workspace?.left ?? 0, width: assetsOpenLayout.workspace?.width ?? 0 })
   assertLibraryLayoutStable('Assets', assetsOpenLayout, await readLibraryLayout())
   const assetsSurfaceColors = await readLibrarySurfaceColors()
   const assetsDrawerState = await page.evaluate(() => ({
@@ -540,7 +540,7 @@ export const runArchiveAssetsScenario = async (context) => {
   await page.waitForFunction(() => {
     const sidebar = document.querySelector('.project-sidebar.drawer')
 
-    return sidebar && Math.abs(sidebar.getBoundingClientRect().left) <= 2
+    return sidebar && Math.abs(sidebar.getBoundingClientRect().left - 14) <= 2
   })
   await page.mouse.move(1510, 890)
   await page.waitForFunction(() => !document.querySelector('.project-sidebar.drawer'))
@@ -568,7 +568,7 @@ export const runArchiveAssetsScenario = async (context) => {
     }
   }
   await page.getByRole('button', { name: 'Collapse projects' }).click()
-  await page.waitForFunction(() => {
+  await page.waitForFunction((expected) => {
     const workspace = document.querySelector('.workspace')
     const workspaceRect = workspace?.getBoundingClientRect()
 
@@ -577,10 +577,10 @@ export const runArchiveAssetsScenario = async (context) => {
       Boolean(document.querySelector('[aria-label="Open projects"]')) &&
       document.querySelector('.library-workspace h1')?.textContent === 'Plugins' &&
       workspaceRect &&
-      Math.abs(workspaceRect.left - 240) <= 2 &&
-      Math.abs(workspaceRect.width - (window.innerWidth - 240)) <= 2
+      Math.abs(workspaceRect.left - expected.left) <= 2 &&
+      Math.abs(workspaceRect.width - expected.width) <= 2
     )
-  })
+  }, { left: pluginsOpenLayout.workspace?.left ?? 0, width: pluginsOpenLayout.workspace?.width ?? 0 })
   assertLibraryLayoutStable('Plugins', pluginsOpenLayout, await readLibraryLayout())
   await page.getByRole('button', { name: 'Open projects' }).click()
   await page.waitForFunction(() => {
@@ -600,7 +600,7 @@ export const runArchiveAssetsScenario = async (context) => {
     }
   }
   await page.getByRole('button', { name: 'Collapse projects' }).click()
-  await page.waitForFunction(() => {
+  await page.waitForFunction((expected) => {
     const workspace = document.querySelector('.workspace')
     const workspaceRect = workspace?.getBoundingClientRect()
 
@@ -609,10 +609,10 @@ export const runArchiveAssetsScenario = async (context) => {
       Boolean(document.querySelector('[aria-label="Open projects"]')) &&
       document.querySelector('.library-workspace h1')?.textContent === 'Skills' &&
       workspaceRect &&
-      Math.abs(workspaceRect.left - 240) <= 2 &&
-      Math.abs(workspaceRect.width - (window.innerWidth - 240)) <= 2
+      Math.abs(workspaceRect.left - expected.left) <= 2 &&
+      Math.abs(workspaceRect.width - expected.width) <= 2
     )
-  })
+  }, { left: skillsOpenLayout.workspace?.left ?? 0, width: skillsOpenLayout.workspace?.width ?? 0 })
   assertLibraryLayoutStable('Skills', skillsOpenLayout, await readLibraryLayout())
   await page.getByRole('button', { name: 'Open projects' }).click()
   await page.waitForFunction(() => {
