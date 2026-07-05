@@ -3,6 +3,7 @@ import { runAnchorMvpScenario } from './anchor-mvp.mjs'
 import { runArchiveAssetsScenario } from './archive-assets.mjs'
 import { runMaskReflowScenario } from './mask-reflow.mjs'
 import { runCanvasInteractionsScenario } from './canvas-interactions.mjs'
+import { runChangelogScenario } from './changelog.mjs'
 import { runChatGenerationScenario } from './chat-generation.mjs'
 import { runCoordinateProbeScenario } from './coordinate-probe.mjs'
 import { runDebugScenario } from './debug.mjs'
@@ -22,6 +23,7 @@ import { runZoomToolScenario } from './zoom-tool.mjs'
 export const scenarioOrder = [
   'debug',
   'shell-sidebar',
+  'changelog',
   'archive-assets',
   'canvas-interactions',
   'zoom-tool',
@@ -55,6 +57,7 @@ export const scenarioRunners = {
   'archive-assets': runArchiveAssetsScenario,
   'mask-reflow': runMaskReflowScenario,
   'canvas-interactions': runCanvasInteractionsScenario,
+  changelog: runChangelogScenario,
   'chat-generation': runChatGenerationScenario,
   'coordinate-probe': runCoordinateProbeScenario,
   debug: runDebugScenario,
