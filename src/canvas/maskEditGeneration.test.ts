@@ -40,10 +40,28 @@ vi.mock('../lib/mivoTaskClient', () => ({
 vi.mock('../lib/canvasImageSource', () => ({
   readCanvasImageBlob: vi.fn(async () => new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], 'src.png', { type: 'image/png' })),
 }))
-const inspectBlackPlateSpy = vi.hoisted(() => vi.fn())
+const inspectArtifactsSpy = vi.hoisted(() => vi.fn())
 vi.mock('../lib/maskResultInspection', () => ({
-  inspectMaskResultForBlackPlate: inspectBlackPlateSpy,
+  inspectMaskResultForBlackArtifacts: inspectArtifactsSpy,
+  // 纯等比映射，与真实实现同语义（prior-bounds 断言依赖它算出的期望值）。
+  mapBoundsToResultSpace: (bounds: { x: number; y: number; width: number; height: number }, from: { width: number; height: number }, to: { width: number; height: number }) => {
+    const scaleX = to.width / Math.max(1, from.width)
+    const scaleY = to.height / Math.max(1, from.height)
+    const x = Math.max(0, Math.floor(bounds.x * scaleX))
+    const y = Math.max(0, Math.floor(bounds.y * scaleY))
+    const right = Math.min(to.width, Math.ceil((bounds.x + bounds.width) * scaleX))
+    const bottom = Math.min(to.height, Math.ceil((bounds.y + bounds.height) * scaleY))
+    return { x, y, width: Math.max(1, right - x), height: Math.max(1, bottom - y) }
+  },
 }))
+
+// 黑块检测 mock 返回值助手。
+const artifactHit = (reason = 'out-of-mask-new-black-component') => ({
+  hasArtifact: true,
+  reason,
+  components: [{ bounds: { x: 48, y: 48, width: 110, height: 110 }, areaPx: 9500, bboxFillRatio: 0.78, sourceBlackRatio: 0 }],
+})
+const artifactClean = () => ({ hasArtifact: false, components: [] })
 
 import { useCanvasStore } from '../store/canvasStore'
 import { prepareMaskEditPlaceholder, removeMaskEditPlaceholder, runMaskEditGeneration } from './maskEditGeneration'
@@ -205,7 +223,7 @@ describe('runMaskEditGeneration cancel (FIX-1: DELETE the in-flight task)', () =
     taskClientSpies.submitEditTask.mockReset()
     taskClientSpies.pollTask.mockReset()
     taskClientSpies.cancelTask.mockReset()
-    inspectBlackPlateSpy.mockReset()
+    inspectArtifactsSpy.mockReset()
   })
 
   const basePayload = {
@@ -258,7 +276,7 @@ describe('runMaskEditGeneration cancel (FIX-1: DELETE the in-flight task)', () =
         ac.abort() // second attempt poll → abort mid-poll
         return { status: 'running', progress: 10, stage: 'submit' }
       })
-    inspectBlackPlateSpy.mockResolvedValueOnce(true) // first result detected as black → retry
+    inspectArtifactsSpy.mockResolvedValueOnce(artifactHit()) // first result detected as black → retry
 
     await expect(runMaskEditGeneration({
       sceneId: 'character-flow',
@@ -291,7 +309,7 @@ describe('runMaskEditGeneration quality pass-through (auto/low/medium/high parit
     taskClientSpies.submitEditTask.mockReset()
     taskClientSpies.pollTask.mockReset()
     taskClientSpies.cancelTask.mockReset()
-    inspectBlackPlateSpy.mockReset()
+    inspectArtifactsSpy.mockReset()
   })
 
   const baseSubmitPayload = {
@@ -355,7 +373,7 @@ describe('runMaskEditGeneration callbacks + return value (SC-13)', () => {
     taskClientSpies.submitEditTask.mockReset()
     taskClientSpies.pollTask.mockReset()
     taskClientSpies.cancelTask.mockReset()
-    inspectBlackPlateSpy.mockReset()
+    inspectArtifactsSpy.mockReset()
   })
 
   it('onTaskSubmitted: submitEditTask 返 task-1 → onTaskSubmitted 在 poll 前被调 with task-1', async () => {
@@ -414,9 +432,9 @@ describe('runMaskEditGeneration callbacks + return value (SC-13)', () => {
         status: 'done', progress: 100, stage: 'done',
         result: { images: [{ b64: 'ok-b64' }] }, // retry returns non-black
       })
-    inspectBlackPlateSpy
-      .mockResolvedValueOnce(true) // first result detected as black → retry
-      .mockResolvedValueOnce(false) // retry result not black → no warn
+    inspectArtifactsSpy
+      .mockResolvedValueOnce(artifactHit()) // first result detected as black → retry
+      .mockResolvedValueOnce(artifactClean()) // retry result not black → no warn
 
     const onSelfHealRetry = vi.fn()
     await runMaskEditGeneration({
@@ -479,7 +497,7 @@ describe('runMaskEditGeneration onSelfHealRetry 时机 (F2)', () => {
     taskClientSpies.submitEditTask.mockReset()
     taskClientSpies.pollTask.mockReset()
     taskClientSpies.cancelTask.mockReset()
-    inspectBlackPlateSpy.mockReset()
+    inspectArtifactsSpy.mockReset()
   })
 
   it('onSelfHealRetry 在 task-2 submit 后、第二次 poll done 前被调', async () => {
@@ -493,9 +511,9 @@ describe('runMaskEditGeneration onSelfHealRetry 时机 (F2)', () => {
     taskClientSpies.submitEditTask
       .mockResolvedValueOnce('task-1') // first attempt
       .mockResolvedValueOnce('task-2') // self-heal retry
-    inspectBlackPlateSpy
-      .mockResolvedValueOnce(true)  // first result black → retry
-      .mockResolvedValueOnce(false) // retry result not black → no warn
+    inspectArtifactsSpy
+      .mockResolvedValueOnce(artifactHit())  // first result black → retry
+      .mockResolvedValueOnce(artifactClean()) // retry result not black → no warn
 
     const onSelfHealRetry = vi.fn()
     // F2 关键:第二次 pollTask 被调时,断言 onSelfHealRetry 已经被调过
@@ -532,5 +550,167 @@ describe('runMaskEditGeneration onSelfHealRetry 时机 (F2)', () => {
 
     // 最终 onSelfHealRetry 收到 [task-1, task-2]
     expect(onSelfHealRetry).toHaveBeenCalledWith(['task-1', 'task-2'])
+  })
+})
+
+// 黑块修复：自愈失败不 commit + 历史洞区/坐标空间元数据。
+//  ① 第一次区域外黑 → 新 idempotency 重试；第二次干净 → commit（带 maskSourceSize）。
+//  ② 两次全黑 → reject（upstream-error）且 commitGenerationResult 未被调 —— 宁可失败不落坏图。
+//  ③ source 带 generation.maskBounds+maskSourceSize → 检测输入携带映射后的 priorMaskBoundsPx。
+describe('runMaskEditGeneration 黑块自愈失败不 commit（黑块修复）', () => {
+  beforeEach(() => {
+    taskClientSpies.submitEditTask.mockReset()
+    taskClientSpies.pollTask.mockReset()
+    taskClientSpies.cancelTask.mockReset()
+    inspectArtifactsSpy.mockReset()
+  })
+
+  const boundsPayload = {
+    prompt: 'p',
+    sourceSize: { width: 200, height: 200 },
+    maskBounds: { x: 10, y: 10, width: 50, height: 50 },
+  }
+
+  it('① 第一次区域外黑 → 重试；第二次干净 → commit，且 commit payload 带 maskSourceSize', async () => {
+    const source = imageNode({ id: 'src-1' })
+    seed(seedCanvas('character-flow', [source]))
+    const { slotId } = prepareMaskEditPlaceholder('character-flow', source, 'p')
+    const commitSpy = vi.fn(async () => ['n1'])
+    useCanvasStore.setState({ commitGenerationResult: commitSpy } as never)
+
+    taskClientSpies.submitEditTask
+      .mockResolvedValueOnce('task-1')
+      .mockResolvedValueOnce('task-2')
+    taskClientSpies.pollTask
+      .mockResolvedValueOnce({ status: 'done', progress: 100, stage: 'done', result: { images: [{ b64: 'black-out-of-mask' }] } })
+      .mockResolvedValueOnce({ status: 'done', progress: 100, stage: 'done', result: { images: [{ b64: 'clean-b64' }] } })
+    inspectArtifactsSpy
+      .mockResolvedValueOnce(artifactHit('out-of-mask-new-black-component'))
+      .mockResolvedValueOnce(artifactClean())
+
+    const result = await runMaskEditGeneration({
+      sceneId: 'character-flow',
+      source,
+      slotId,
+      resolvedAssetUrl: undefined,
+      payload: boundsPayload as never,
+      imgRatio: '1:1' as never,
+      signal: new AbortController().signal,
+    })
+
+    expect(taskClientSpies.submitEditTask).toHaveBeenCalledTimes(2)
+    // 重试必须换新 idempotencyKey（BFF 按 key dedupe，复用会返回缓存的坏 task）
+    const key1 = (taskClientSpies.submitEditTask.mock.calls[0][0] as { idempotencyKey: string }).idempotencyKey
+    const key2 = (taskClientSpies.submitEditTask.mock.calls[1][0] as { idempotencyKey: string }).idempotencyKey
+    expect(key1).toBeTruthy()
+    expect(key2).toBeTruthy()
+    expect(key1).not.toBe(key2)
+    expect(result.nodeIds).toEqual(['n1'])
+    expect(commitSpy).toHaveBeenCalledTimes(1)
+    const commitPayload = (commitSpy.mock.calls[0] as unknown[])[0] as { maskSourceSize?: { width: number; height: number }; resultImages: Array<{ b64: string }> }
+    // 坐标空间标定：结果节点作为下次编辑 source 时用于历史洞区检测
+    expect(commitPayload.maskSourceSize).toEqual({ width: 200, height: 200 })
+    // commit 的是重试（干净）结果
+    expect(commitPayload.resultImages[0].b64).toBe('clean-b64')
+  })
+
+  it('② 两次全黑 → reject 且 commitGenerationResult 未被调', async () => {
+    const source = imageNode({ id: 'src-1' })
+    seed(seedCanvas('character-flow', [source]))
+    const { slotId } = prepareMaskEditPlaceholder('character-flow', source, 'p')
+    const commitSpy = vi.fn(async () => ['n1'])
+    useCanvasStore.setState({ commitGenerationResult: commitSpy } as never)
+
+    taskClientSpies.submitEditTask
+      .mockResolvedValueOnce('task-1')
+      .mockResolvedValueOnce('task-2')
+    taskClientSpies.pollTask
+      .mockResolvedValueOnce({ status: 'done', progress: 100, stage: 'done', result: { images: [{ b64: 'black-1' }] } })
+      .mockResolvedValueOnce({ status: 'done', progress: 100, stage: 'done', result: { images: [{ b64: 'black-2' }] } })
+    inspectArtifactsSpy
+      .mockResolvedValueOnce(artifactHit('current-mask-black-plate'))
+      .mockResolvedValueOnce(artifactHit('out-of-mask-new-black-component'))
+
+    await expect(runMaskEditGeneration({
+      sceneId: 'character-flow',
+      source,
+      slotId,
+      resolvedAssetUrl: undefined,
+      payload: boundsPayload as never,
+      imgRatio: '1:1' as never,
+      signal: new AbortController().signal,
+    })).rejects.toMatchObject({ message: '局部重绘结果异常，请重新选择区域或换源图后重试。', kind: 'upstream-error' })
+
+    // 宁可失败不落坏图：坏图绝不 commit
+    expect(commitSpy).not.toHaveBeenCalled()
+    expect(taskClientSpies.submitEditTask).toHaveBeenCalledTimes(2)
+  })
+
+  it('③ source 带上次洞区元数据 → 检测输入携带映射后的 priorMaskBoundsPx', async () => {
+    // 上次编辑：源图 400x400、洞区 (100,100,80,80)；本次源图（上次结果）200x200
+    // → 等比映射为 (50,50,40,40)。
+    const source = imageNode({
+      id: 'src-result',
+      generation: {
+        prompt: 'prev',
+        model: 'gpt-image-2',
+        maskBounds: { x: 100, y: 100, width: 80, height: 80 },
+        maskSourceSize: { width: 400, height: 400 },
+      },
+      aiWorkflow: { kind: 'result', status: 'ready' } as never,
+    })
+    seed(seedCanvas('character-flow', [source]))
+    const { slotId } = prepareMaskEditPlaceholder('character-flow', source, 'p')
+    useCanvasStore.setState({ commitGenerationResult: vi.fn(async () => ['n1']) } as never)
+
+    taskClientSpies.submitEditTask.mockResolvedValueOnce('task-1')
+    taskClientSpies.pollTask.mockResolvedValueOnce({ status: 'done', progress: 100, stage: 'done', result: { images: [{ b64: 'ok-b64' }] } })
+    inspectArtifactsSpy.mockResolvedValueOnce(artifactClean())
+
+    await runMaskEditGeneration({
+      sceneId: 'character-flow',
+      source,
+      slotId,
+      resolvedAssetUrl: undefined,
+      payload: boundsPayload as never,
+      imgRatio: '1:1' as never,
+      signal: new AbortController().signal,
+    })
+
+    expect(inspectArtifactsSpy).toHaveBeenCalledTimes(1)
+    const input = inspectArtifactsSpy.mock.calls[0][0] as { priorMaskBoundsPx?: Array<{ x: number; y: number; width: number; height: number }> }
+    expect(input.priorMaskBoundsPx).toEqual([{ x: 50, y: 50, width: 40, height: 40 }])
+  })
+
+  it('③b maskSourceSize 缺失（旧数据）→ priorMaskBoundsPx 不携带（坐标空间不明，跳过）', async () => {
+    const source = imageNode({
+      id: 'src-legacy',
+      generation: {
+        prompt: 'prev',
+        model: 'gpt-image-2',
+        maskBounds: { x: 100, y: 100, width: 80, height: 80 },
+        // 无 maskSourceSize
+      },
+    })
+    seed(seedCanvas('character-flow', [source]))
+    const { slotId } = prepareMaskEditPlaceholder('character-flow', source, 'p')
+    useCanvasStore.setState({ commitGenerationResult: vi.fn(async () => ['n1']) } as never)
+
+    taskClientSpies.submitEditTask.mockResolvedValueOnce('task-1')
+    taskClientSpies.pollTask.mockResolvedValueOnce({ status: 'done', progress: 100, stage: 'done', result: { images: [{ b64: 'ok-b64' }] } })
+    inspectArtifactsSpy.mockResolvedValueOnce(artifactClean())
+
+    await runMaskEditGeneration({
+      sceneId: 'character-flow',
+      source,
+      slotId,
+      resolvedAssetUrl: undefined,
+      payload: boundsPayload as never,
+      imgRatio: '1:1' as never,
+      signal: new AbortController().signal,
+    })
+
+    const input = inspectArtifactsSpy.mock.calls[0][0] as { priorMaskBoundsPx?: unknown }
+    expect(input.priorMaskBoundsPx).toBeUndefined()
   })
 })

@@ -129,6 +129,9 @@ export type CommitGenerationResultPayload = {
   model: string
   kind: CommittedGenerationKind
   maskBounds?: CanvasMaskBounds
+  // 黑块修复：maskBounds 的坐标空间（提交编辑时源图 natural pixel 尺寸），
+  // 随结果节点 generation.maskSourceSize 持久化，供二次重绘历史洞区检测。
+  maskSourceSize?: { width: number; height: number }
   taskId?: string
   placement?: 'right' | 'below' | 'left'
 }
