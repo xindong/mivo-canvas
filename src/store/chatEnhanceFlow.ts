@@ -33,3 +33,33 @@ export const resolveChatEnhance = (
     finalPrompt: enhanceResult.richPrompt || originalText,
   }
 }
+
+/** mask-chat-card Step 3: mask-edit 调用点专用的 enhance 解析。
+ *  - chat 模式（mode='chat' && replyText 非空）：finalPrompt = 原始 text，
+ *    noticeText = replyText.trim()（用户输入作生图 prompt，agent 回复作附言）
+ *  - degraded（enhanced=false）：finalPrompt = 原始 text，noticeText = undefined
+ *    （降级原因 degradedReason/stage 不在此处理，由调用方透传/展示）
+ *  - generate 模式（enhanced）：finalPrompt = richPrompt || 原始 text，无 noticeText
+ *
+ *  与 resolveChatEnhance 同语义，独立命名是为了 mask-edit 调用点可读性 +
+ *  未来分叉（mask edit 可能追加 mask 区域提示、把 editContext 透传给 LLM 等）。 */
+export const resolveMaskEditEnhance = (
+  enhanceResult: EnhanceResponse,
+  originalText: string,
+): ChatEnhanceResolution => {
+  // degraded：直接用原始 text 生图，不读 richPrompt（避免降级残留 richPrompt 的边界）
+  if (enhanceResult.enhanced === false) {
+    return { finalPrompt: originalText }
+  }
+  // chat：用原始 text 生图，replyText 作附言
+  if (enhanceResult.mode === 'chat' && enhanceResult.replyText?.trim()) {
+    return {
+      finalPrompt: originalText,
+      noticeText: enhanceResult.replyText.trim(),
+    }
+  }
+  // generate（enhanced）：用润色后的 richPrompt，退化回 originalText
+  return {
+    finalPrompt: enhanceResult.richPrompt || originalText,
+  }
+}
