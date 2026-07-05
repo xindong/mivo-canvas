@@ -1,5 +1,25 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 
+// FIX-A test: zustand v5 persist only attaches `api.persist` when
+// `createJSONStorage(() => localStorage)` resolves a storage. Node env has no
+// window/localStorage, so we install an in-memory localStorage before the store
+// module loads (same pattern as canvasStore.contract.test.ts). Runs in vi.hoisted
+// so it executes before the `import` below.
+vi.hoisted(() => {
+  const store = new Map<string, string>()
+  const memStorage = {
+    get length() { return store.size },
+    clear: () => store.clear(),
+    getItem: (k: string) => store.get(k) ?? null,
+    key: (i: number) => [...store.keys()][i] ?? null,
+    removeItem: (k: string) => { store.delete(k) },
+    setItem: (k: string, v: string) => { store.set(k, String(v)) },
+  }
+  const g = globalThis as Record<string, unknown>
+  if (g.window === undefined) g.window = { localStorage: memStorage }
+  if (g.localStorage === undefined) g.localStorage = memStorage
+})
+
 // Hermetic setup: stub demo-image canvas renderer (canvasStore triggers scenes() at
 // module load), the IndexedDB-backed asset store, the enhance endpoint, and the remote
 // debug-log flusher — same approach as canvasStore.contract.test.ts.
@@ -51,6 +71,9 @@ import { saveImportedAsset } from '../lib/assetStorage'
 import { enhanceMivoPrompt } from '../lib/mivoImageClient'
 
 beforeEach(() => {
+  // Clear the in-memory localStorage so each test starts clean (FIX-A hydration
+  // test writes to it; other tests must not see stale persisted state).
+  ;(globalThis as { localStorage: { clear: () => void } }).localStorage.clear()
   useChatStore.setState({ ...useChatStore.getInitialState() } as never, true)
   vi.mocked(saveImportedAsset).mockReset()
 })
@@ -189,5 +212,60 @@ describe('retryMessage (FIX-4: retry 补 chat 澄清附言)', () => {
     expect(notices.at(-1)?.text).toContain('可以画角色')
     // 证明 retry 跳过了 enhance（finalPrompt 已存在），noticeText 来自 context 而非重跑
     expect(vi.mocked(enhanceMivoPrompt)).not.toHaveBeenCalled()
+  })
+})
+
+// FIX-A: zustand v5 persisted version == options version (v2==v2) 时 migrate 不走，
+// 只走 merge。86ce7d4 之前写入的脏 degradedReason string 会经 merge 进 runtime/UI。
+// 真实 hydration 测试（非只测 migrateChatPersistedState 函数）：localStorage 写入
+// version:2 + unknown degradedReason → persist.rehydrate() → 断言 undefined。
+describe('chatStore hydration (FIX-A: merge 路径 sanitize 脏 degradedReason)', () => {
+  it('persisted v2 == options v2 → 走 merge（非 migrate）仍 normalize 脏 degradedReason', async () => {
+    const ls = (globalThis as { localStorage: { setItem: (k: string, v: string) => void } }).localStorage
+    // 模拟 86ce7d4 之前写入的脏 v2 状态：unknown degradedReason string
+    const dirtyPersisted = {
+      state: {
+        messagesByScene: {
+          'scene-fixa': [{
+            id: 'm-fixa', role: 'assistant', kind: 'text', text: 't', createdAt: 0, status: 'done',
+            enhance: { degradedReason: 'legacy-unknown-string' },
+          }],
+        },
+        selectedModel: 'gpt-image-2',
+        paramOverrides: { imgRatio: 'auto', quality: 'auto' },
+      },
+      version: 2, // == options.version → zustand v5 不调 migrate，只调 merge
+    }
+    ls.setItem('mivo-chat-demo', JSON.stringify(dirtyPersisted))
+
+    // 强制 rehydrate → 走 merge（settleExpiredChatMessages + FIX-A sanitize map）
+    await useChatStore.persist.rehydrate()
+
+    const msg = useChatStore.getState().messagesByScene['scene-fixa']?.[0]
+    expect(msg).toBeDefined()
+    expect(msg?.id).toBe('m-fixa')
+    // FIX-A: merge 路径也 normalize —— 脏 string 不经 migrate 也被清为 undefined
+    expect(msg?.enhance?.degradedReason).toBeUndefined()
+  })
+
+  it('persisted v2 valid union member 保留（merge 不误杀合法值）', async () => {
+    const ls = (globalThis as { localStorage: { setItem: (k: string, v: string) => void } }).localStorage
+    const cleanPersisted = {
+      state: {
+        messagesByScene: {
+          'scene-fixb': [{
+            id: 'm-fixb', role: 'assistant', kind: 'text', text: 't', createdAt: 0, status: 'done',
+            enhance: { degradedReason: 'upstream-http' },
+          }],
+        },
+        selectedModel: 'gpt-image-2',
+        paramOverrides: { imgRatio: 'auto', quality: 'auto' },
+      },
+      version: 2,
+    }
+    ls.setItem('mivo-chat-demo', JSON.stringify(cleanPersisted))
+    await useChatStore.persist.rehydrate()
+    const msg = useChatStore.getState().messagesByScene['scene-fixb']?.[0]
+    expect(msg?.enhance?.degradedReason).toBe('upstream-http')
   })
 })

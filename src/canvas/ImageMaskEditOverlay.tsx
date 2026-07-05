@@ -656,7 +656,7 @@ export function ImageMaskEditOverlay({
                 onClick={() => setQuality(q)}
                 disabled={submitting}
                 aria-pressed={quality === q}
-                title={q === 'low' ? '低质量（1K，更快）' : '中质量（1K，更细致）'}
+                title={q === 'low' ? '低质量（1K，省算力）' : '中质量（1K，更细致）'}
               >
                 {q === 'low' ? '低' : '中'}
               </button>

@@ -9,7 +9,7 @@ import { fallbackCancelTarget, settleExpiredChatMessages } from './chatGeneratio
 import { resolveChatEnhance } from './chatEnhanceFlow'
 import { debugLogger } from './debugLogStore'
 import { generationFacade } from './generationFacade'
-import { clampChatGenerationContext, migrateChatPersistedState } from './chatStoreMigrate'
+import { clampChatGenerationContext, migrateChatPersistedState, sanitizeEnhanceDegradedReason } from './chatStoreMigrate'
 
 const maxMessagesPerScene = 200
 
@@ -810,9 +810,17 @@ export const useChatStore = create<ChatState>()(
         if (result.settledMessages > 0) {
           debugLogger.warn('Chat Store', `Hydration settled ${result.settledMessages} expired chat generation message(s)`)
         }
+        // FIX-A: zustand v5 persisted version == options version (v2==v2) 时 migrate
+        // 不走，只走 merge。86ce7d4 之前写入的脏 degradedReason string 仍会经 merge 进
+        // runtime/UI。在 merge 必经路径对每条 message 跑 sanitizeEnhanceDegradedReason
+        // （与 settle 同一处 map），保证 hydration 后 degradedReason 必为 union 成员或 undefined。
+        const sanitizedMessages: Record<string, ChatMessage[]> = {}
+        for (const [sceneId, messages] of Object.entries(result.messagesByScene)) {
+          sanitizedMessages[sceneId] = messages.map(sanitizeEnhanceDegradedReason)
+        }
         return {
           ...merged,
-          messagesByScene: result.messagesByScene,
+          messagesByScene: sanitizedMessages,
         }
       },
     },
