@@ -117,6 +117,67 @@ describe('cropChildLocal — CSS negative-offset equivalence', () => {
   })
 })
 
+describe('FU-8 rotation — transform.rotation 透传（DOM translate+rotate/origin 50% 50% 等价）', () => {
+  const rotatedNode = (rotation: number, opts: NodeOpts = {}): MivoCanvasNode => {
+    const base = imgNode(opts) as unknown as Record<string, unknown>
+    return {
+      ...base,
+      transform: {
+        x: base.x as number,
+        y: base.y as number,
+        width: base.width as number,
+        height: base.height as number,
+        rotation,
+      },
+    } as unknown as MivoCanvasNode
+  }
+
+  it('create：plain image 携带 rotation + origin center；无 transform → rotation 0（回退显式清角）', () => {
+    const leafer = makeFakeLeafer()
+    const paint = createLeaferImagePaint(leafer)
+    paint.sync([rotatedNode(30, { id: 'r' }), imgNode({ id: 'p' })], ctx())
+    const [rotated, plain] = leafer.children
+    expect(rotated.props.rotation).toBe(30)
+    expect(rotated.props.origin).toBe('center')
+    expect(plain.props.rotation).toBe(0)
+    expect(plain.props.origin).toBe('center')
+    paint.dispose()
+  })
+
+  it('update：rotation 变化跟随；旋转清零后 rotation 回 0', () => {
+    const leafer = makeFakeLeafer()
+    const paint = createLeaferImagePaint(leafer)
+    paint.sync([rotatedNode(30, { id: 'r' })], ctx())
+    const object = leafer.children[0]
+    paint.sync([rotatedNode(45, { id: 'r' })], ctx())
+    expect(object.props.rotation).toBe(45)
+    paint.sync([imgNode({ id: 'r' })], ctx())
+    expect(object.props.rotation).toBe(0)
+    paint.dispose()
+  })
+
+  it('crop Group：rotation 落在外层 Group（子 Image 不带 rotation，随容器旋转）', () => {
+    const leafer = makeFakeLeafer()
+    const paint = createLeaferImagePaint(leafer)
+    paint.sync([rotatedNode(15, { id: 'c', imageCrop: { x: 0.25, y: 0.25, width: 0.5, height: 0.5 } })], ctx())
+    const group = leafer.children[0] as unknown as FakeGroup
+    expect(group.props.rotation).toBe(15)
+    expect(group.props.origin).toBe('center')
+    expect('rotation' in group.children[0].props).toBe(false)
+    paint.dispose()
+  })
+
+  it('LOD rect：旋转 footprint 与 HD 位图一致（rotation 也透传）', () => {
+    const leafer = makeFakeLeafer()
+    const paint = createLeaferImagePaint(leafer)
+    // scale 0.01 → 500px 节点投影 5px < 32px 阈值 → lod-rect
+    paint.sync([rotatedNode(60, { id: 'lod' })], ctx(0.01))
+    expect(leafer.children[0].props.rotation).toBe(60)
+    expect(leafer.children[0].props.origin).toBe('center')
+    paint.dispose()
+  })
+})
+
 describe('imageLayer — 2b-2 z-order', () => {
   it('images paint in Layer.Content (Layer.Frame reserved for frame/section)', () => {
     expect(imageLayer()).toBe(Layer.Content)
