@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { RenderAnchor, RenderNode } from './projection'
+import { Layer } from './layers'
 import {
   defaultLineMarkupPointsFor,
   defaultZOrderCompare,
@@ -17,19 +18,27 @@ import {
   topmostNodeHit,
 } from './hitTest'
 
-const makeNode = (overrides: Partial<RenderNode> & { id: string }): RenderNode => ({
-  type: 'image',
-  status: 'ready',
-  title: 'n',
-  geometry: { x: 0, y: 0, width: 100, height: 100, rotation: 0 },
-  hidden: false,
-  locked: false,
-  favorited: false,
-  selected: false,
-  fills: [],
-  strokes: [],
-  ...overrides,
-})
+const makeNode = (overrides: Partial<RenderNode> & { id: string }): RenderNode => {
+  // Default layer mirrors projectNode: frame → Layer.Frame; else → Layer.Content.
+  // Tests that need a different layer / renderOrder / surface pass them in overrides.
+  const type = overrides.type ?? 'image'
+  return {
+    type: 'image',
+    status: 'ready',
+    title: 'n',
+    geometry: { x: 0, y: 0, width: 100, height: 100, rotation: 0 },
+    hidden: false,
+    locked: false,
+    favorited: false,
+    selected: false,
+    layer: type === 'frame' ? Layer.Frame : Layer.Content,
+    renderOrder: 0,
+    surface: 'canvas',
+    fills: [],
+    strokes: [],
+    ...overrides,
+  }
+}
 
 const makeAnchor = (overrides: Partial<RenderAnchor> & { id: string }): RenderAnchor => ({
   type: 'point',
@@ -369,5 +378,40 @@ describe('z-order comparator', () => {
     const a = makeNode({ id: 'a' })
     const b = makeNode({ id: 'b' })
     expect(defaultZOrderCompare(a, b)).toBe(0)
+  })
+
+  it('layer is the 1st tiebreaker (Frame < Content < Handles)', () => {
+    const handle = makeNode({ id: 'h', layer: Layer.Handles })
+    const frame = makeNode({ id: 'f', type: 'frame' }) // layer = Layer.Frame
+    const content = makeNode({ id: 'c' }) // layer = Layer.Content
+    const ordered = sortForHitTest([handle, frame, content])
+    expect(ordered.map((n) => n.id)).toEqual(['f', 'c', 'h'])
+  })
+
+  it('renderOrder breaks ties within a layer (2nd tiebreaker)', () => {
+    const a = makeNode({ id: 'a', renderOrder: 5 })
+    const b = makeNode({ id: 'b', renderOrder: 1 })
+    expect(sortForHitTest([a, b]).map((n) => n.id)).toEqual(['b', 'a'])
+  })
+
+  it('selected lifts above unselected within same layer+renderOrder (3rd)', () => {
+    const sel = makeNode({ id: 'sel', selected: true })
+    const plain = makeNode({ id: 'plain' })
+    expect(sortForHitTest([sel, plain]).map((n) => n.id)).toEqual(['plain', 'sel'])
+  })
+
+  it('overlay surface paints above canvas within same layer+order+sel (4th)', () => {
+    const overlay = makeNode({ id: 'ov', surface: 'overlay' })
+    const canvas = makeNode({ id: 'cv', surface: 'canvas' })
+    expect(sortForHitTest([overlay, canvas]).map((n) => n.id)).toEqual(['cv', 'ov'])
+  })
+
+  it('layer wins over surface: lower-layer overlay stays below higher-layer canvas', () => {
+    // 4-level precedence: layer(1) > renderOrder(2) > selected(3) > surface(4).
+    // An overlay-surface node in Content must NOT jump above a canvas-surface
+    // node in Handles — layer is checked first.
+    const lowOverlay = makeNode({ id: 'lo', layer: Layer.Content, surface: 'overlay' })
+    const highCanvas = makeNode({ id: 'hc', layer: Layer.Handles, surface: 'canvas' })
+    expect(sortForHitTest([lowOverlay, highCanvas]).map((n) => n.id)).toEqual(['lo', 'hc'])
   })
 })
