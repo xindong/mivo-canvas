@@ -114,13 +114,14 @@ export function ImageCropOverlay({ node, viewport, onCommit, onCancel }: ImageCr
     dragRef.current = null
   }
 
+  const screenPos = toContainer(viewport, node.x, node.y)
   return (
     <div
       className="image-crop-overlay"
       data-canvas-ui="true"
       style={{
-        left: toContainer(viewport, node.x, node.y).x,
-        top: toContainer(viewport, node.x, node.y).y,
+        left: screenPos.x,
+        top: screenPos.y,
         width: node.width,
         height: node.height,
         transform: `scale(${scale})`,

@@ -39,8 +39,14 @@ export function useMaskEditOverlay(
     ? visibleNodes.find((node) => node.id === maskEditNodeId && node.type === 'image')
     : undefined
   const resolvedMaskAssetUrl = useResolvedAssetUrl(maskEditNode?.assetUrl)
+  // P1 fix (Greptile): pass the ORIGINAL assetUrl (local:// for imported nodes),
+  // not resolvedMaskAssetUrl (a blob URL). getImageMetrics treats non-imported URLs
+  // as undecodable (no IDB blob) and returns undefined; with no <img onLoad> fallback
+  // in the overlay path, a legacy imported node without assetSourceDimensions would
+  // silently never resolve naturalSize → mask overlay never mounts. resolvedMaskAssetUrl
+  // is still used for the <img> src; metrics use the original local:// URL (IDB decode).
   const { naturalSize: maskNaturalSize } = useImageNaturalSize(
-    resolvedMaskAssetUrl,
+    maskEditNode?.assetUrl,
     maskEditNode?.assetSourceDimensions,
   )
 
