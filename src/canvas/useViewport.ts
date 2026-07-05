@@ -26,7 +26,7 @@ import { cullingMode } from '../render/cullingMode'
 import { virtualizationMode } from '../render/virtualizationMode'
 import { useCameraFocusStore } from '../store/cameraFocusStore'
 import { debugLogger } from '../store/debugLogStore'
-import { viewportToRevealBounds } from './autoFocusPlaceholder'
+import { viewportToCenterBounds, viewportToRevealBounds } from './autoFocusPlaceholder'
 import { applyEngineSpikeCamera } from '../render/engineSpikeCameraBridge'
 
 export const defaultViewportFor = (sceneId: string): Viewport => ({
@@ -171,16 +171,18 @@ export function useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseCo
       clearPlaceholderFocus()
       return
     }
-    const nextViewport = viewportToRevealBounds(
-      viewportRef.current,
-      { width: rect.width, height: rect.height },
-      { x: node.x, y: node.y, width: node.width, height: node.height },
-    )
+    const mode = pendingFocus.mode ?? 'reveal'
+    const shell = { width: rect.width, height: rect.height }
+    const bounds = { x: node.x, y: node.y, width: node.width, height: node.height }
+    const nextViewport =
+      mode === 'center'
+        ? viewportToCenterBounds(viewportRef.current, shell, bounds)
+        : viewportToRevealBounds(viewportRef.current, shell, bounds)
     if (!nextViewport) {
-      debugLogger.log('Camera', `Auto-focus skipped (already visible): ${pendingFocus.nodeId}`)
+      debugLogger.log('Camera', `Auto-focus skipped (${mode === 'reveal' ? 'already visible' : 'no shell size'}): ${pendingFocus.nodeId}`)
     } else {
       setViewport(nextViewport)
-      debugLogger.log('Camera', `Auto-focus placeholder ${pendingFocus.nodeId} (${pendingFocus.source})`)
+      debugLogger.log('Camera', `Auto-focus ${mode} ${pendingFocus.nodeId} (${pendingFocus.source})`)
     }
     clearPlaceholderFocus()
   }, [nodes, pendingFocus, shellRef])

@@ -1,5 +1,45 @@
 import { failedTaskView, doneTaskView } from '../api-mocks.mjs'
 
+const readViewport = async (page) => {
+  const viewport = await page.evaluate(() => {
+    const shell = document.querySelector('.canvas-shell')
+    if (!shell) return null
+    return {
+      x: Number(shell.getAttribute('data-viewport-x')),
+      y: Number(shell.getAttribute('data-viewport-y')),
+      scale: Number(shell.getAttribute('data-viewport-scale')),
+    }
+  })
+  if (!viewport) throw new Error('Canvas shell should expose viewport attributes')
+  return viewport
+}
+
+const waitForViewport = async (page, predicate, label, { timeout = 3000 } = {}) => {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < timeout) {
+    const viewport = await readViewport(page)
+    if (predicate(viewport)) return viewport
+    await page.waitForTimeout(40)
+  }
+  throw new Error(`Timed out waiting for viewport: ${label}; last=${JSON.stringify(await readViewport(page))}`)
+}
+
+const nodeCenterDeltaFromCanvasCenter = async (page, nodeId) => {
+  const delta = await page.evaluate((targetNodeId) => {
+    const shell = document.querySelector('.canvas-shell')
+    const node = document.querySelector(`[data-node-id="${targetNodeId}"]`)
+    if (!shell || !node) return null
+    const shellRect = shell.getBoundingClientRect()
+    const nodeRect = node.getBoundingClientRect()
+    return {
+      dx: nodeRect.left + nodeRect.width / 2 - (shellRect.left + shellRect.width / 2),
+      dy: nodeRect.top + nodeRect.height / 2 - (shellRect.top + shellRect.height / 2),
+    }
+  }, nodeId)
+  if (!delta) throw new Error(`Canvas node should render after focus: ${nodeId}`)
+  return delta
+}
+
 export const runChatGenerationScenario = async (context) => {
   const {
     Buffer,
@@ -189,6 +229,35 @@ export const runChatGenerationScenario = async (context) => {
   if (newChatEdges.length !== 0) {
     throw new Error(`Chat image-to-image should not create derivation edges: ${JSON.stringify(newChatEdges)}`)
   }
+
+  const shellBoxForResultFocus = await page.locator('.canvas-shell').boundingBox()
+  if (!shellBoxForResultFocus) throw new Error('Canvas shell should be measurable for result focus check')
+  await page.getByRole('button', { name: 'Hand' }).click()
+  const viewportBeforePan = await readViewport(page)
+  await page.mouse.move(shellBoxForResultFocus.x + 140, shellBoxForResultFocus.y + 140)
+  await page.mouse.down()
+  await page.mouse.move(shellBoxForResultFocus.x + 320, shellBoxForResultFocus.y + 260)
+  await page.mouse.up()
+  const viewportBeforeLocate = await waitForViewport(
+    page,
+    (viewport) => Math.abs(viewport.x - viewportBeforePan.x) > 80 || Math.abs(viewport.y - viewportBeforePan.y) > 80,
+    'manual pan before chat result locate',
+  )
+  await page.locator('.chat-result-image-btn').last().click()
+  await page.waitForFunction(
+    (nodeId) => document.querySelector(`[data-node-id="${nodeId}"]`)?.classList.contains('selected'),
+    besideResult.id,
+  )
+  await waitForViewport(
+    page,
+    (viewport) => Math.abs(viewport.x - viewportBeforeLocate.x) > 40 || Math.abs(viewport.y - viewportBeforeLocate.y) > 40,
+    'chat result image click recenters viewport',
+  )
+  const resultFocusDelta = await nodeCenterDeltaFromCanvasCenter(page, besideResult.id)
+  if (Math.abs(resultFocusDelta.dx) > 4 || Math.abs(resultFocusDelta.dy) > 4) {
+    throw new Error(`Clicking a chat result image should center its canvas node: ${JSON.stringify(resultFocusDelta)}`)
+  }
+  await page.getByRole('button', { name: /^Select$/ }).click()
 
   // Assert chat state: param card appeared in assistant bubble. W4 makes BOTH
   // chat branches generate (image always ships), so two .chat-param-card exist

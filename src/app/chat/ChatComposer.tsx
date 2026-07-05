@@ -40,6 +40,7 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
     const [referenceError, setReferenceError] = useState('')
     const [openPopover, setOpenPopover] = useState<'model' | 'ratio' | null>(null)
 
+    const composerRef = useRef<HTMLDivElement>(null)
     const textareaRef = useRef<HTMLTextAreaElement>(null)
     const fileInputRef = useRef<HTMLInputElement>(null)
     const modelButtonRef = useRef<HTMLButtonElement>(null)
@@ -67,6 +68,19 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
       if (!focusRequestId) return
       textareaRef.current?.focus()
     }, [focusRequestId])
+
+    useEffect(() => {
+      const handlePointerDown = (event: PointerEvent) => {
+        const textarea = textareaRef.current
+        if (!textarea || document.activeElement !== textarea) return
+        if (event.target instanceof Node && composerRef.current?.contains(event.target)) return
+        if (event.target instanceof Element && event.target.closest('.chat-floating-popover')) return
+        textarea.blur()
+      }
+
+      document.addEventListener('pointerdown', handlePointerDown, { capture: true })
+      return () => document.removeEventListener('pointerdown', handlePointerDown, { capture: true })
+    }, [])
 
     useEffect(
       () => () => {
@@ -152,6 +166,7 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
 
     return (
       <div
+        ref={composerRef}
         className={`chat-composer ${isBusy ? 'is-busy' : ''}`}
         onDrop={handleDrop}
         onDragOver={(e) => e.preventDefault()}

@@ -8,6 +8,7 @@ import { debugLogger } from './debugLogStore'
 export type CameraFocusRequest = {
   nodeId: string
   source: string
+  mode?: 'reveal' | 'center'
 }
 
 type CameraFocusState = {
@@ -15,6 +16,10 @@ type CameraFocusState = {
   requestPlaceholderFocus: (
     nodeId: string,
     context: { targetSceneId: string; activeSceneId: string; source: string },
+  ) => void
+  requestNodeFocus: (
+    nodeId: string,
+    context: { targetSceneId: string; activeSceneId: string; source: string; mode: CameraFocusRequest['mode'] },
   ) => void
   clearPlaceholderFocus: () => void
 }
@@ -31,6 +36,16 @@ export const useCameraFocusStore = create<CameraFocusState>()((set) => ({
     }
     // 每次请求都换新对象引用,同一 nodeId 重复触发(如 retry 复用 slot)也能驱动 effect。
     set({ pendingFocus: { nodeId, source } })
+  },
+  requestNodeFocus: (nodeId, { targetSceneId, activeSceneId, source, mode }) => {
+    if (targetSceneId !== activeSceneId) {
+      debugLogger.log(
+        'Camera',
+        `Auto-focus skipped (cross-scene): ${source} node ${nodeId} targets ${targetSceneId}, active ${activeSceneId}`,
+      )
+      return
+    }
+    set({ pendingFocus: { nodeId, source, mode } })
   },
   clearPlaceholderFocus: () => set({ pendingFocus: undefined }),
 }))

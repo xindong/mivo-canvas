@@ -18,6 +18,12 @@ const boundsFullyVisible = (viewport: Viewport, shell: ShellSize, bounds: Canvas
   )
 }
 
+const viewportToCenter = (viewport: Viewport, shell: ShellSize, bounds: CanvasBounds): Viewport => ({
+  x: shell.width / 2 - (bounds.x + bounds.width / 2) * viewport.scale,
+  y: shell.height / 2 - (bounds.y + bounds.height / 2) * viewport.scale,
+  scale: viewport.scale,
+})
+
 export const viewportToRevealBounds = (
   viewport: Viewport,
   shell: ShellSize,
@@ -26,9 +32,15 @@ export const viewportToRevealBounds = (
   if (shell.width <= 0 || shell.height <= 0) return undefined
   if (boundsFullyVisible(viewport, shell, bounds)) return undefined
 
-  return {
-    x: shell.width / 2 - (bounds.x + bounds.width / 2) * viewport.scale,
-    y: shell.height / 2 - (bounds.y + bounds.height / 2) * viewport.scale,
-    scale: viewport.scale,
-  }
+  return viewportToCenter(viewport, shell, bounds)
+}
+
+export const viewportToCenterBounds = (
+  viewport: Viewport,
+  shell: ShellSize,
+  bounds: CanvasBounds,
+): Viewport | undefined => {
+  if (shell.width <= 0 || shell.height <= 0) return undefined
+
+  return viewportToCenter(viewport, shell, bounds)
 }

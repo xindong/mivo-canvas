@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { viewportToRevealBounds } from './autoFocusPlaceholder'
+import { viewportToCenterBounds, viewportToRevealBounds } from './autoFocusPlaceholder'
 
 const shell = { width: 1200, height: 800 }
 
@@ -43,5 +43,30 @@ describe('viewportToRevealBounds', () => {
 
   it('returns undefined for a degenerate shell size', () => {
     expect(viewportToRevealBounds({ x: 0, y: 0, scale: 1 }, { width: 0, height: 0 }, { x: 9999, y: 9999, width: 10, height: 10 })).toBeUndefined()
+  })
+})
+
+describe('viewportToCenterBounds', () => {
+  it('centers bounds even when they are already fully visible', () => {
+    const viewport = { x: 0, y: 0, scale: 1 }
+    const bounds = { x: 100, y: 100, width: 300, height: 200 }
+    const result = viewportToCenterBounds(viewport, shell, bounds)
+    expect(result).toBeDefined()
+    expect((bounds.x + bounds.width / 2) * result!.scale + result!.x).toBeCloseTo(shell.width / 2)
+    expect((bounds.y + bounds.height / 2) * result!.scale + result!.y).toBeCloseTo(shell.height / 2)
+    expect(result!.scale).toBe(viewport.scale)
+  })
+
+  it('keeps a non-1 user scale untouched when centering', () => {
+    const viewport = { x: 200, y: 100, scale: 0.5 }
+    const bounds = { x: 4000, y: 4000, width: 400, height: 400 }
+    const result = viewportToCenterBounds(viewport, shell, bounds)
+    expect(result!.scale).toBe(0.5)
+    expect(result!.x).toBeCloseTo(shell.width / 2 - 4200 * 0.5)
+    expect(result!.y).toBeCloseTo(shell.height / 2 - 4200 * 0.5)
+  })
+
+  it('returns undefined for a degenerate shell size', () => {
+    expect(viewportToCenterBounds({ x: 0, y: 0, scale: 1 }, { width: 0, height: 0 }, { x: 100, y: 100, width: 10, height: 10 })).toBeUndefined()
   })
 })
