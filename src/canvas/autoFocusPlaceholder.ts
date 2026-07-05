@@ -32,3 +32,17 @@ export const viewportToRevealBounds = (
     scale: viewport.scale,
   }
 }
+
+export const viewportToCenterBounds = (
+  viewport: Viewport,
+  shell: ShellSize,
+  bounds: CanvasBounds,
+): Viewport | undefined => {
+  if (shell.width <= 0 || shell.height <= 0) return undefined
+
+  return {
+    x: shell.width / 2 - (bounds.x + bounds.width / 2) * viewport.scale,
+    y: shell.height / 2 - (bounds.y + bounds.height / 2) * viewport.scale,
+    scale: viewport.scale,
+  }
+}

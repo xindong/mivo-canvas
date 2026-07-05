@@ -3,6 +3,7 @@ import { Copy, RefreshCw } from 'lucide-react'
 import { copyPromptText } from './copyPromptText'
 import { useChatStore } from '../../store/chatStore'
 import { useCanvasStore } from '../../store/canvasStore'
+import { useCameraFocusStore } from '../../store/cameraFocusStore'
 import { retryMaskEditMessage } from '../../store/chatMaskEditFlow'
 import { EnhanceParamCard } from './EnhanceParamCard'
 import { ChatResultImage } from './ChatResultImage'
@@ -22,9 +23,20 @@ export function ChatMessageList({ sceneId }: ChatMessageListProps) {
   const cancelGeneration = useChatStore((s) => s.cancelGeneration)
   const isBusy = useChatStore((s) => s.isBusy)
   const selectNode = useCanvasStore((s) => s.selectNode)
+  const requestNodeFocus = useCameraFocusStore((s) => s.requestNodeFocus)
 
   const listRef = useRef<HTMLDivElement>(null)
   const shouldAutoScrollRef = useRef(true)
+
+  const locateResultNode = useCallback((nodeId: string) => {
+    selectNode(nodeId)
+    requestNodeFocus(nodeId, {
+      targetSceneId: sceneId,
+      activeSceneId: useCanvasStore.getState().sceneId,
+      source: 'chat-result',
+      mode: 'center',
+    })
+  }, [requestNodeFocus, sceneId, selectNode])
 
   const handleScroll = useCallback(() => {
     const el = listRef.current
@@ -62,7 +74,7 @@ export function ChatMessageList({ sceneId }: ChatMessageListProps) {
                 <button
                   type="button"
                   className="chat-notice-locate"
-                  onClick={() => selectNode(message.resultNodeIds![0])}
+                  onClick={() => locateResultNode(message.resultNodeIds![0])}
                 >
                   定位
                 </button>
@@ -124,7 +136,7 @@ export function ChatMessageList({ sceneId }: ChatMessageListProps) {
               {message.status === 'done' && resultNodeId && (
                 <ChatResultImage
                   nodeId={resultNodeId}
-                  onLocate={() => selectNode(resultNodeId)}
+                  onLocate={() => locateResultNode(resultNodeId)}
                 />
               )}
 

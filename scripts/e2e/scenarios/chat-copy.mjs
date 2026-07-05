@@ -69,6 +69,37 @@ export const runChatCopyScenario = async (context) => {
   }
   await composer.fill('')
 
+  // SC1b: 点击 composer 之外的画布应让输入框失焦，#108 的聚焦边框恢复默认色。
+  await composer.fill('blur target')
+  await composer.focus()
+  const focusedComposerStyle = await page.evaluate(() => {
+    const shell = document.querySelector('.chat-composer-input-shell')
+    const textarea = document.querySelector('.chat-composer-textarea')
+    return {
+      focused: document.activeElement === textarea,
+      borderTopColor: shell ? getComputedStyle(shell).borderTopColor : '',
+    }
+  })
+  if (!focusedComposerStyle.focused) {
+    throw new Error(`SC1b: composer should be focused before outside click: ${JSON.stringify(focusedComposerStyle)}`)
+  }
+  await page.locator('.canvas-shell').click({ position: { x: 32, y: 32 }, force: true })
+  await page.waitForFunction(() => document.activeElement !== document.querySelector('.chat-composer-textarea'))
+  const blurredComposerStyle = await page.evaluate(() => {
+    const shell = document.querySelector('.chat-composer-input-shell')
+    const textarea = document.querySelector('.chat-composer-textarea')
+    return {
+      focused: document.activeElement === textarea,
+      borderTopColor: shell ? getComputedStyle(shell).borderTopColor : '',
+    }
+  })
+  if (blurredComposerStyle.focused || blurredComposerStyle.borderTopColor === focusedComposerStyle.borderTopColor) {
+    throw new Error(
+      `SC1b: outside canvas click should blur composer and restore the default border: ${JSON.stringify({ focusedComposerStyle, blurredComposerStyle })}`,
+    )
+  }
+  await composer.fill('')
+
   // ── SC2: chat 气泡选中文本 cmd+C 复制到系统剪贴板 ──
   await page.evaluate(() => {
     const bubble = document.querySelector('.chat-message-user .chat-bubble-user')
