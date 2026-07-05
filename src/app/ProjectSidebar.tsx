@@ -396,11 +396,11 @@ export function ProjectSidebar({
           <button
             type="button"
             className="debug-log-row changelog-row"
-            aria-label="Changelog"
+            aria-label="Change Log"
             onClick={openChangelog}
           >
             <Sparkles size={17} />
-            <span>Changelog</span>
+            <span>Change Log</span>
             {hasUnreadChangelog ? <span className="changelog-badge-dot" aria-hidden="true" /> : null}
           </button>
         </div>

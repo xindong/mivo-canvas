@@ -1,10 +1,10 @@
 // 更新日志面板:复用 Debug Log 的 createPortal + backdrop 模式(ProjectSidebar 内联版)。
-// 每天一个区块,左列"✨ 新功能"、右列"🔧 修复的问题",只展示最近 7 个结算日。
-import { useEffect, useMemo } from 'react'
+// 最近 7 个结算日内有数据的日期按天轮播,单日卡片内部保留滚动区。
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { createPortal } from 'react-dom'
-import { X } from 'lucide-react'
+import { ChevronLeft, ChevronRight, X } from 'lucide-react'
 import { recentDays } from '../lib/changelogDate'
-import { useChangelogStore } from '../store/changelogStore'
+import { useChangelogStore, type ChangelogItem } from '../store/changelogStore'
 
 type ChangelogPanelProps = {
   // 打开面板那一刻的时间戳(事件处理器里取,规避 render 期调用 Date.now 的纯度限制)。
@@ -12,10 +12,86 @@ type ChangelogPanelProps = {
   onClose: () => void
 }
 
+type ChangelogAuthorGroup = {
+  author: string
+  items: ChangelogItem[]
+}
+
+const groupItemsByAuthor = (items: ChangelogItem[]): ChangelogAuthorGroup[] => {
+  const order: string[] = []
+  const buckets = new Map<string, ChangelogItem[]>()
+  const anonymous: ChangelogItem[] = []
+
+  for (const item of items) {
+    const author = item.by.trim()
+    if (!author) {
+      anonymous.push(item)
+      continue
+    }
+
+    if (!buckets.has(author)) {
+      buckets.set(author, [])
+      order.push(author)
+    }
+    buckets.get(author)?.push(item)
+  }
+
+  const groups = order.map((author) => ({ author, items: buckets.get(author) ?? [] }))
+  if (anonymous.length) {
+    groups.push({ author: '', items: anonymous })
+  }
+  return groups
+}
+
+const formatCarouselDate = (date: string) => {
+  const [, month = '', day = ''] = date.split('-')
+  return `${Number(month)}-${day}`
+}
+
+type ChangelogColumnProps = {
+  title: string
+  items: ChangelogItem[]
+}
+
+const ChangelogColumn = ({ title, items }: ChangelogColumnProps) => {
+  const groups = groupItemsByAuthor(items)
+
+  return (
+    <div className="changelog-column">
+      <h4>{title}</h4>
+      {groups.length ? (
+        <div className="changelog-author-groups">
+          {groups.map((group, groupIndex) => (
+            <section
+              key={group.author || `anonymous-${groupIndex}`}
+              className={group.author ? 'changelog-author-group' : 'changelog-author-group anonymous'}
+            >
+              {group.author ? <strong className="changelog-author-name">{group.author}</strong> : null}
+              <ul>
+                {group.items.map((item, index) => (
+                  <li key={`${group.author}-${index}-${item.text}`}>{item.text}</li>
+                ))}
+              </ul>
+            </section>
+          ))}
+        </div>
+      ) : (
+        <p className="changelog-column-empty">暂无</p>
+      )}
+    </div>
+  )
+}
+
 export const ChangelogPanel = ({ openedAt, onClose }: ChangelogPanelProps) => {
   const entries = useChangelogStore((state) => state.entries)
   const updatedAt = useChangelogStore((state) => state.updatedAt)
   const markRead = useChangelogStore((state) => state.markRead)
+  const panelRef = useRef<HTMLElement | null>(null)
+  const [currentIndex, setCurrentIndex] = useState(0)
+
+  useEffect(() => {
+    panelRef.current?.focus()
+  }, [])
 
   // 依赖 updatedAt:面板打开早于 fetch 完成时,首次 markRead 空转(updatedAt 尚为空),
   // 数据到达后需再标记一次,否则红点会在面板开着时点亮且关闭不清除。
@@ -31,6 +107,28 @@ export const ChangelogPanel = ({ openedAt, onClose }: ChangelogPanelProps) => {
       .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0))
   }, [entries, openedAt])
 
+  const maxIndex = Math.max(visibleEntries.length - 1, 0)
+  const activeIndex = Math.min(currentIndex, maxIndex)
+
+  const currentEntry = visibleEntries[activeIndex]
+  const canGoEarlier = activeIndex < visibleEntries.length - 1
+  const canGoNewer = activeIndex > 0
+  const focusPanel = () => panelRef.current?.focus()
+  const goEarlier = () => setCurrentIndex((index) => Math.min(Math.min(index, maxIndex) + 1, maxIndex))
+  const goNewer = () => setCurrentIndex((index) => Math.max(Math.min(index, maxIndex) - 1, 0))
+
+  const handlePanelKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
+    if (event.defaultPrevented || maxIndex < 1) return
+    if (event.key === 'ArrowLeft') {
+      event.preventDefault()
+      goEarlier()
+    }
+    if (event.key === 'ArrowRight') {
+      event.preventDefault()
+      goNewer()
+    }
+  }
+
   return createPortal(
     <div
       className="changelog-backdrop"
@@ -41,9 +139,17 @@ export const ChangelogPanel = ({ openedAt, onClose }: ChangelogPanelProps) => {
         }
       }}
     >
-      <section className="changelog-panel" role="dialog" aria-modal="true" aria-label="更新日志">
+      <section
+        ref={panelRef}
+        className="changelog-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-label="更新日志"
+        tabIndex={-1}
+        onKeyDown={handlePanelKeyDown}
+      >
         <header className="changelog-header">
-          <div>
+          <div className="changelog-title-block">
             <strong>更新日志</strong>
             <span>最近 7 天</span>
           </div>
@@ -51,45 +157,59 @@ export const ChangelogPanel = ({ openedAt, onClose }: ChangelogPanelProps) => {
             <X size={16} />
           </button>
         </header>
-        <div className="changelog-list" aria-label="最近更新">
-          {visibleEntries.length ? (
-            visibleEntries.map((entry) => (
-              <article key={entry.date} className="changelog-day">
-                <h3 className="changelog-day-date">{entry.date}</h3>
-                <div className="changelog-day-columns">
-                  <div className="changelog-column">
-                    <h4>✨ 新功能</h4>
-                    {entry.features.length ? (
-                      <ul>
-                        {entry.features.map((item, index) => (
-                          <li key={`${index}-${item.text}`}>
-                            {item.text}
-                            {item.by ? <span className="changelog-item-by">{item.by}</span> : null}
-                          </li>
-                        ))}
-                      </ul>
-                    ) : (
-                      <p className="changelog-column-empty">暂无</p>
-                    )}
-                  </div>
-                  <div className="changelog-column">
-                    <h4>🔧 修复的问题</h4>
-                    {entry.fixes.length ? (
-                      <ul>
-                        {entry.fixes.map((item, index) => (
-                          <li key={`${index}-${item.text}`}>
-                            {item.text}
-                            {item.by ? <span className="changelog-item-by">{item.by}</span> : null}
-                          </li>
-                        ))}
-                      </ul>
-                    ) : (
-                      <p className="changelog-column-empty">暂无</p>
-                    )}
+        <div className="changelog-carousel" aria-label="最近更新">
+          {currentEntry ? (
+            <>
+              <div className="changelog-carousel-bar">
+                <button
+                  type="button"
+                  className="changelog-carousel-button"
+                  aria-label="切换到更早更新日志"
+                  disabled={!canGoEarlier}
+                  onClick={() => {
+                    goEarlier()
+                    focusPanel()
+                  }}
+                >
+                  <ChevronLeft size={16} />
+                  <span>更早</span>
+                </button>
+                <div className="changelog-carousel-status" aria-live="polite">
+                  <span className="changelog-current-date">{formatCarouselDate(currentEntry.date)}</span>
+                  <span>{`${activeIndex + 1}/${visibleEntries.length}`}</span>
+                  <span className="changelog-dots" aria-hidden="true">
+                    {visibleEntries.map((entry, index) => (
+                      <span
+                        key={entry.date}
+                        className={index === activeIndex ? 'changelog-dot active' : 'changelog-dot'}
+                      />
+                    ))}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className="changelog-carousel-button"
+                  aria-label="切换到更新的更新日志"
+                  disabled={!canGoNewer}
+                  onClick={() => {
+                    goNewer()
+                    focusPanel()
+                  }}
+                >
+                  <span>更近</span>
+                  <ChevronRight size={16} />
+                </button>
+              </div>
+              <article key={currentEntry.date} className="changelog-day" data-date={currentEntry.date}>
+                <h3 className="changelog-day-date">{currentEntry.date}</h3>
+                <div className="changelog-day-scroll">
+                  <div className="changelog-day-columns">
+                    <ChangelogColumn title="✨ 新功能" items={currentEntry.features} />
+                    <ChangelogColumn title="🔧 修复的问题" items={currentEntry.fixes} />
                   </div>
                 </div>
               </article>
-            ))
+            </>
           ) : (
             <p className="changelog-empty">最近 7 天暂无更新</p>
           )}
