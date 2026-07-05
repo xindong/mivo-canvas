@@ -194,25 +194,10 @@ describe('generationFacade.prepareChatSlot — camera auto-focus request (镜头
 })
 
 
-describe('generationFacade.prepareChatSlot — 占位符比例跟随请求比例', () => {
-  it('creates a 16:9 slot for a 16:9 request (replacingSlot 保尺寸契约下出图不再错位)', () => {
-    const prep = generationFacade.prepareChatSlot({ sceneId: 'c1', hasSelectedImage: false, prompt: 'p', imgRatio: '16:9' })
+describe('generationFacade.prepareChatSlot — 占位符恒 1:1 方形(2026-07-05 规格澄清)', () => {
+  it('creates the slot at the square base size regardless of request ratio (API 已不接收比例)', () => {
+    const prep = generationFacade.prepareChatSlot({ sceneId: 'c1', hasSelectedImage: false, prompt: 'p' })
     const slot = useCanvasStore.getState().nodes.find((n) => n.id === prep.slotId)
-    expect(slot).toBeDefined()
-    expect(slot!.width / slot!.height).toBeCloseTo(16 / 9, 1)
-  })
-
-  it('creates a 3:2 slot for a 3:2 request', () => {
-    const prep = generationFacade.prepareChatSlot({ sceneId: 'c1', hasSelectedImage: false, prompt: 'p', imgRatio: '3:2' })
-    const slot = useCanvasStore.getState().nodes.find((n) => n.id === prep.slotId)
-    expect(slot!.width / slot!.height).toBeCloseTo(3 / 2, 1)
-  })
-
-  it('keeps the 320×320 square for 1:1 and auto (无回归)', () => {
-    for (const imgRatio of ['1:1', 'auto'] as const) {
-      const prep = generationFacade.prepareChatSlot({ sceneId: 'c1', hasSelectedImage: false, prompt: 'p', imgRatio })
-      const slot = useCanvasStore.getState().nodes.find((n) => n.id === prep.slotId)
-      expect({ width: slot!.width, height: slot!.height }).toEqual({ width: 320, height: 320 })
-    }
+    expect({ width: slot!.width, height: slot!.height }).toEqual({ width: 320, height: 320 })
   })
 })

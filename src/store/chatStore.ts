@@ -342,7 +342,6 @@ export const useChatStore = create<ChatState>()(
             hasSelectedImage,
             pendingSlotId: context.pendingSlotId,
             prompt: finalPrompt,
-            imgRatio: finalRatio,
           })
           if (prep.slotId && prep.slotId !== context.pendingSlotId) {
             context = { ...context, pendingSlotId: prep.slotId }
@@ -609,7 +608,6 @@ export const useChatStore = create<ChatState>()(
             hasSelectedImage,
             pendingSlotId: context.pendingSlotId,
             prompt: finalPrompt,
-            imgRatio: finalRatio,
           })
           if (prep.slotId && prep.slotId !== context.pendingSlotId) {
             context = { ...context, pendingSlotId: prep.slotId }

@@ -7,7 +7,7 @@ import type {
 import type { SliceCreator } from './canvasStore'
 import { saveGeneratedAsset } from '../lib/assetStorage'
 import { defaultSizeForNodeType } from '../canvas/nodeTypes/canvasNodeRegistry'
-import { AI_SLOT_GAP, buildAiContextSnapshot, chooseAdjacentPlacement, reflowRightObstacles } from './aiCanvasWorkflow'
+import { AI_SLOT_GAP, buildAiContextSnapshot, chooseAdjacentPlacement, equalAreaSizeForDimensions, reflowRightObstacles } from './aiCanvasWorkflow'
 import { blobFromCommittedGenerationImage, displaySizeForGeneratedAsset, logCanvas, warnCanvas, errorCanvas } from './canvasStore'
 import { redoHistory, undoHistory } from './historyManager'
 import {
@@ -307,12 +307,15 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
               width: image.width || defaultSizeForNodeType('image').width,
               height: image.height || defaultSizeForNodeType('image').height,
             }
-        // F5 (QoL batch): when replacing a placeholder slot, keep the placeholder's
-        // displaySize (fallbackSize) so a low-quality 1K result doesn't resize the
-        // node / trigger reflow. Non-slot placements still use the asset's natural
-        // size via displaySizeForGeneratedAsset.
+        // F5 (QoL batch) 契约收窄(2026-07-05 用户澄清规格):「替换保留占位符
+        // displaySize」只适用 mask-edit(kind 'edit',结果与源图同比例,保尺寸防
+        // 跳变/防 reflow 仍成立)。chat 生图(kind 'generate')占位符恒 1:1 方形,
+        // 替换时按结果图自然宽高比、与占位符等面积落画布(16:9 请求 → 方形占位
+        // loading → 完成落宽幅图)。Non-slot placements 不变,仍用资产自然尺寸。
         const displaySize = replacingSlot
-          ? fallbackSize
+          ? payload.kind === 'edit'
+            ? fallbackSize
+            : equalAreaSizeForDimensions(fallbackSize, asset.sourceDimensions)
           : displaySizeForGeneratedAsset(asset, fallbackSize)
         const placement = replacingSlot
           ? { x: replacingSlot.x, y: replacingSlot.y }

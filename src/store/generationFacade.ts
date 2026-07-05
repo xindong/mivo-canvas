@@ -16,9 +16,8 @@ import { useCanvasStore } from './canvasStore'
 import { useCameraFocusStore } from './cameraFocusStore'
 import type { CanvasGenerationOptions, CanvasState } from './canvasStore'
 import type { CanvasId } from '../types/mivoCanvas'
-import type { GenerationRatio } from '../types/generation'
 import { defaultSizeForNodeType } from '../canvas/nodeTypes/canvasNodeRegistry'
-import { AI_SLOT_GAP, chooseAdjacentPlacement, slotSizeForRatio } from './aiCanvasWorkflow'
+import { AI_SLOT_GAP, chooseAdjacentPlacement } from './aiCanvasWorkflow'
 import { firstAnchorImageFor } from './canvasDocumentModel'
 
 type ChatSlotPrep =
@@ -57,7 +56,6 @@ export const generationFacade = {
     hasSelectedImage: boolean
     pendingSlotId?: string
     prompt: string
-    imgRatio?: GenerationRatio | 'auto'
   }): ChatSlotPrep => {
     if (params.hasSelectedImage && params.selectedNodeId) {
       return { mode: 'beside', slotId: undefined }
@@ -86,9 +84,10 @@ export const generationFacade = {
     const selectedNode = params.selectedNodeId
       ? doc.nodes.find((n) => n.id === params.selectedNodeId && !n.hidden)
       : undefined
-    // 占位比例跟随请求比例:出图后 replacingSlot 保留占位尺寸(#86 W2-F5 防跳变
-    // 契约不动),所以比例必须在创建时就定对,否则宽幅结果被塞进方形框。
-    const slotSize = slotSizeForRatio(defaultSizeForNodeType('ai-slot'), params.imgRatio)
+    // 规格(2026-07-05 用户澄清,推翻 #99 比例跟随):chat 占位符恒 1:1 方形
+    // loading,与请求比例无关;结果比例在 commitGenerationResult 替换时按结果图
+    // 自然宽高比落画布(equalAreaSizeForDimensions)。
+    const slotSize = defaultSizeForNodeType('ai-slot')
     const slotPosition = selectedNode
       ? { x: selectedNode.x + selectedNode.width + AI_SLOT_GAP, y: selectedNode.y }
       : (() => {

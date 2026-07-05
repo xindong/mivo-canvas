@@ -292,10 +292,22 @@ export const runChatGenerationScenario = async (context) => {
     await page.waitForSelector('#chat-ratio-popover', { state: 'detached' })
   }
   const canvasBeforeGemini = await readCanvasState()
-  const countBeforeGemini = await page.locator('.dom-node').count()
   await page.locator('.chat-composer-textarea').fill('gemini aspect ratio test')
   await page.locator('.chat-composer-textarea').press('Enter')
-  await page.waitForFunction((before) => document.querySelectorAll('.dom-node').length > before, countBeforeGemini, { timeout: 30000 })
+  // 断言绑行为(slot 创建落 store):镜头跟随会把视口平移到新 slot,culling(overscan
+  // 520px)下 .dom-node 数量随视口变化不再单调增长,不能作为 slot 创建信号。
+  {
+    const deadline = Date.now() + 30000
+    let nodesNow = canvasBeforeGemini.nodes.length
+    while (Date.now() < deadline) {
+      nodesNow = (await readCanvasState()).nodes.length
+      if (nodesNow > canvasBeforeGemini.nodes.length) break
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    if (nodesNow <= canvasBeforeGemini.nodes.length) {
+      throw new Error(`gemini submit should create an ai-slot node in the store, count stuck at ${nodesNow}`)
+    }
+  }
   // 节点增长（slot 创建）先于 generate 请求发出 —— 轮询直到请求被捕获，消除竞态
   {
     const geminiDeadline = Date.now() + 30000

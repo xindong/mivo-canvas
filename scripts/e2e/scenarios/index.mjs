@@ -13,6 +13,7 @@ import { runMaskCrossSceneScenario } from './mask-cross-scene.mjs'
 import { runMaskHydrationScenario } from './mask-hydration.mjs'
 import { runMaskPointScenario } from './mask-point.mjs'
 import { runMaskSourceDeleteScenario } from './mask-source-delete.mjs'
+import { runMaskTimeoutRetryScenario } from './mask-timeout-retry.mjs'
 import { runMigrationScenario } from './migration.mjs'
 import { runShellSidebarScenario } from './shell-sidebar.mjs'
 import { runVariationsAnnotationScenario } from './variations-annotation.mjs'
@@ -36,6 +37,7 @@ export const scenarioOrder = [
   'mask-cross-scene',
   'mask-concurrent',
   'mask-source-delete',
+  'mask-timeout-retry',
   'mask-hydration',
   'coordinate-probe',
 ]
@@ -62,6 +64,7 @@ export const scenarioRunners = {
   'mask-cross-scene': runMaskCrossSceneScenario,
   'mask-point': runMaskPointScenario,
   'mask-source-delete': runMaskSourceDeleteScenario,
+  'mask-timeout-retry': runMaskTimeoutRetryScenario,
   'mask-hydration': runMaskHydrationScenario,
   migration: runMigrationScenario,
   'shell-sidebar': runShellSidebarScenario,

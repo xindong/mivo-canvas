@@ -9,7 +9,7 @@
 // runGenerateTask/runEditTask WITHOUT awaiting, and returns {taskId} immediately.
 // Errors are caught and recorded as task failures (never thrown to the caller).
 
-import { defaultMivoImageModel, getEnvConfig, type PlatformCtx } from '../lib/config'
+import { defaultMivoImageModel, getEnvConfig, resolveEditUpstreamTimeoutMs, type PlatformCtx } from '../lib/config'
 import { fetchUpstreamWithTimeout, readUpstreamError, UpstreamRequestTimeoutError } from '../lib/upstream'
 import { normalizeMivoImages, normalizeMivoQuality, resolveRatioPayload } from '../lib/images'
 import { logMaskModelOverride, logTaskTerminal } from '../lib/request'
@@ -60,6 +60,8 @@ type TaskLogContext = {
   hasReferences: boolean
   channel: 'platform' | 'llm-proxy'
   promptLength?: number
+  /** edit-timeout-batch: 分档后的上游超时（ms），terminal 日志据此定位撞线 case。 */
+  timeoutMs?: number
 }
 
 const errorClassFor = (error: unknown): string =>
@@ -93,6 +95,7 @@ const logTerminal = (
     promptLength: context.promptLength,
     errorClass: details.errorClass,
     httpStatus: details.httpStatus,
+    timeoutMs: context.timeoutMs,
   })
 }
 
@@ -318,11 +321,16 @@ export const runEditTask = async (taskId: string, params: EditParams): Promise<v
     formData.set('quality', quality)
     const ratioPayload = resolveRatioPayload(model, params.imgRatio, quality)
     Object.entries(ratioPayload).forEach(([k, v]) => formData.set(k, v))
+    // edit-timeout-batch: 按 quality/size 分档超时（high/大尺寸 300s，low/medium 180s；env 可整体覆盖）
+    const editImgRatio = typeof params.imgRatio === 'string' ? params.imgRatio : undefined
+    const editTimeoutMs = resolveEditUpstreamTimeoutMs({ quality, imgRatio: editImgRatio }, env)
+    logContext.imgRatio = editImgRatio
+    logContext.timeoutMs = editTimeoutMs
 
     const upstreamResponse = await fetchUpstreamWithTimeout(
       `${env.imageApiBase}/edits`,
       { method: 'POST', headers: { Authorization: `Bearer ${readImageApiKey(env.imageApiKey)}` }, body: formData },
-      env.editUpstreamTimeoutMs,
+      editTimeoutMs,
       record.controller.signal,
     )
     if (canceledInFlight(taskId)) return

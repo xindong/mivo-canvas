@@ -76,17 +76,17 @@ Token 携带二选一:`Authorization: Bearer <token>` 或 `X-Mivo-Bff-Token: <to
 
 ### 测试专用覆盖(默认与 dev 一致,仅供测试改小)
 
-> 这些 env 让 240s/180s/175s 等长超时与远端上游可在本地 mock 测试覆盖。**生产不要设**。
+> 这些 env 让 240s/180s/300s 等长超时与远端上游可在本地 mock 测试覆盖。**生产不要设**。
 
 | 变量 | 默认 | 作用 |
 |------|------|------|
 | `MIVO_IMAGE_API_BASE` | `https://llm-proxy.tapsvc.com/v1/images` | llm-proxy 图像 base(generate/edit) |
 | `MIVO_LLM_API_BASE` | `https://llm-proxy.tapsvc.com/v1` | llm-proxy chat base(enhance) |
 | `MIVO_UPSTREAM_TIMEOUT_MS` | `240000` | generate llm-proxy 超时 → 504 |
-| `MIVO_EDIT_UPSTREAM_TIMEOUT_MS` | `180000` | edit llm-proxy 超时 → 504 |
+| `MIVO_EDIT_UPSTREAM_TIMEOUT_MS` | 分级（见下） | edit llm-proxy 超时 → 504。**edit-timeout-batch**：low/medium=180s，high 或大尺寸(16:9/9:16)=300s（对齐 platform 2K）；显式设此 env 则整体覆盖（不分档） |
 | `MIVO_ENHANCE_PRIMARY_TIMEOUT_MS` | `8000` | enhance 主模型超时(claude-haiku-4-5) |
 | `MIVO_ENHANCE_FALLBACK_TIMEOUT_MS` | `8000` | enhance 兜底模型超时(gpt-5.4-mini) |
-| `MIVO_PLATFORM_POLL_DEADLINE_MS` | `175000` | 平台 poll 上限 → 504 |
+| `MIVO_PLATFORM_POLL_DEADLINE_MS` | 分级（见下） | 平台 poll 上限 → 504。按分辨率分档：1K=240000，2K=300000；显式设此 env 则整体覆盖（不分档）。细粒度用 `MIVO_PLATFORM_POLL_DEADLINE_1K_MS` / `MIVO_PLATFORM_POLL_DEADLINE_2K_MS` |
 | `MIVO_PLATFORM_POLL_INTERVAL_MS` | `2500` | 平台 poll 间隔 |
 | `MIVO_JSON_REQUEST_MAX_BYTES` | `1048576` | JSON body 上限 → 413(D1:干净 413,非 ECONNRESET) |
 | `MIVO_IMAGE_REQUEST_MAX_BYTES` | `41943040` | multipart body 上限 → 413 |
