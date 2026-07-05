@@ -15,6 +15,7 @@ import { ToastViewport } from './app/ToastViewport'
 import { useCanvasStore } from './store/canvasStore'
 import { debugLogger, installConsoleCapture } from './store/debugLogStore'
 import { installRemoteDebugReporter } from './store/remoteDebugReporter'
+import { useStoreHydration } from './app/useStoreHydration'
 import type { WorkspaceView } from './app/ProjectSidebar'
 
 const SIDEBAR_PINNING_MS = 300
@@ -24,6 +25,11 @@ const SIDEBAR_PEEK_CLOSE_MS = 220
 type ProjectSidebarState = 'open' | 'closed' | 'closing' | 'peeking' | 'peekClosing' | 'pinning'
 
 function App() {
+  // FU4-2: wait for IDB-backed persist rehydration before mounting the canvas. Both
+  // stores use skipHydration + async IDB storage; rendering before hydration would
+  // flash the demo-seed default state. The placeholder is intentionally bare (no
+  // selectors e2e waits for) so scenarios stall on the real content appearing.
+  const hydrated = useStoreHydration()
   const sceneId = useCanvasStore((state) => state.sceneId)
   const canvases = useCanvasStore((state) => state.canvases)
   const nodes = useCanvasStore((state) => state.nodes)
@@ -204,6 +210,10 @@ function App() {
       window.removeEventListener('pointermove', closeWhenPointerLeavesDrawer)
     }
   }, [closeProjectSidebarPeek, projectSidebarState])
+
+  if (!hydrated) {
+    return <div className="canvas-boot-placeholder" aria-busy="true" data-hydrated="false" />
+  }
 
   return (
     <main
