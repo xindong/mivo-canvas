@@ -363,6 +363,8 @@ export const useLeaferSpikeRenderer = ({
       current.lodNodeCount === next.lodNodeCount &&
       current.lodImageCount === next.lodImageCount &&
       current.lodTextCount === next.lodTextCount &&
+      current.lodShapeCount === next.lodShapeCount &&
+      current.lodLineCount === next.lodLineCount &&
       current.highFidelityNodeCount === next.highFidelityNodeCount
         ? current
         : next,

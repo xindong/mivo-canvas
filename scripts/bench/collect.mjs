@@ -493,6 +493,8 @@ const installBenchRuntime = async (page) => {
         const engineLodNodeCount = Number(currentShell?.getAttribute('data-engine-lod-node-count') || 0)
         const engineLodImageCount = Number(currentShell?.getAttribute('data-engine-lod-image-count') || 0)
         const engineLodTextCount = Number(currentShell?.getAttribute('data-engine-lod-text-count') || 0)
+        const engineLodShapeCount = Number(currentShell?.getAttribute('data-engine-lod-shape-count') || 0)
+        const engineLodLineCount = Number(currentShell?.getAttribute('data-engine-lod-line-count') || 0)
         const engineHighFidelityNodeCount = Number(currentShell?.getAttribute('data-engine-high-fidelity-node-count') || 0)
         if (!settled || actualNodeCount !== expectedNodeCount || Math.abs(actualScale - expectedScale) >= 0.01) {
           throw new Error(
@@ -529,6 +531,8 @@ const installBenchRuntime = async (page) => {
           engineLodNodeCount,
           engineLodImageCount,
           engineLodTextCount,
+          engineLodShapeCount,
+          engineLodLineCount,
           engineHighFidelityNodeCount,
           viewportScale: actualScale,
           viewportX: Number(currentShell?.getAttribute('data-viewport-x') || 0),
@@ -865,6 +869,7 @@ const readRenderState = (page) =>
       leaferPixelNonEmpty: shell?.getAttribute('data-leafer-pixel-nonempty') === 'true',
       leaferPixelSampleCount: Number(shell?.getAttribute('data-leafer-pixel-sample-count') || 0),
       leaferSyncVersion: Number(shell?.getAttribute('data-leafer-sync-version') || 0),
+      leaferMarkupTextShells: Number(shell?.getAttribute('data-leafer-markup-text-shells') || 0),
       leaferPanCacheEnabled: shell?.getAttribute('data-leafer-pan-cache-enabled') === 'true',
       leaferPanCacheFrozen: shell?.getAttribute('data-leafer-pan-cache-frozen') === 'true',
       leaferPanCacheCaptures: Number(shell?.getAttribute('data-leafer-pan-cache-captures') || 0),
@@ -891,6 +896,8 @@ const readRenderState = (page) =>
       engineLodNodeCount: Number(shell?.getAttribute('data-engine-lod-node-count') || 0),
       engineLodImageCount: Number(shell?.getAttribute('data-engine-lod-image-count') || 0),
       engineLodTextCount: Number(shell?.getAttribute('data-engine-lod-text-count') || 0),
+      engineLodShapeCount: Number(shell?.getAttribute('data-engine-lod-shape-count') || 0),
+      engineLodLineCount: Number(shell?.getAttribute('data-engine-lod-line-count') || 0),
       engineHighFidelityNodeCount: Number(shell?.getAttribute('data-engine-high-fidelity-node-count') || 0),
       viewportScale: Number(shell?.getAttribute('data-viewport-scale') || 0),
     }
@@ -940,7 +947,12 @@ const sampleDomPixels = async (page) => {
 const expectedEngineLodNodeCount = (fixture, thresholdPx) => {
   const scale = fixture.meta.recommendedViewport.scale
   return fixture.snapshot.nodes.filter((node) => {
-    if (node.type !== 'image' && node.type !== 'text') return false
+    const shapeCandidate =
+      node.type === 'frame' ||
+      (node.type === 'markup' &&
+        (node.markupKind === 'rect' || node.markupKind === 'ellipse' || node.markupKind === 'note'))
+    const lineCandidate = node.type === 'markup' && (node.markupKind === 'line' || node.markupKind === 'arrow')
+    if (node.type !== 'image' && node.type !== 'text' && !shapeCandidate && !lineCandidate) return false
     return Math.max(Math.abs(node.width || 0), Math.abs(node.height || 0)) * scale < thresholdPx
   }).length
 }
@@ -1114,7 +1126,10 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, rendere
       lodNodeCount: renderState.engineLodNodeCount,
       lodImageCount: renderState.engineLodImageCount,
       lodTextCount: renderState.engineLodTextCount,
+      lodShapeCount: renderState.engineLodShapeCount,
+      lodLineCount: renderState.engineLodLineCount,
       highFidelityNodeCount: renderState.engineHighFidelityNodeCount,
+      markupTextShellCount: renderState.leaferMarkupTextShells,
       pixiTextStrategy: renderState.pixiTextStrategy,
       pixiTexturePoolSize: renderState.pixiTexturePoolSize,
     },
@@ -1227,6 +1242,8 @@ const main = async () => {
         engineLodNodeCount: result.runs[0]?.renderState?.engineLodNodeCount,
         engineLodImageCount: result.runs[0]?.renderState?.engineLodImageCount,
         engineLodTextCount: result.runs[0]?.renderState?.engineLodTextCount,
+        engineLodShapeCount: result.runs[0]?.renderState?.engineLodShapeCount,
+        engineLodLineCount: result.runs[0]?.renderState?.engineLodLineCount,
         engineHighFidelityNodeCount: result.runs[0]?.renderState?.engineHighFidelityNodeCount,
         domPixelNonEmpty: result.runs[0]?.renderState?.domPixelNonEmpty,
         domPixelSampleCount: result.runs[0]?.renderState?.domPixelSampleCount,
@@ -1234,6 +1251,7 @@ const main = async () => {
         leaferExpectedChildren: result.runs[0]?.renderState?.leaferExpectedChildren,
         leaferChildren: result.runs[0]?.renderState?.leaferChildren,
         leaferPixelNonEmpty: result.runs[0]?.renderState?.leaferPixelNonEmpty,
+        leaferMarkupTextShells: result.runs[0]?.renderState?.leaferMarkupTextShells,
         leaferPanCacheEnabled: result.runs[0]?.renderState?.leaferPanCacheEnabled,
         leaferPanCacheCaptures: result.runs[0]?.afterPanRenderState?.leaferPanCacheCaptures,
         pixiExpectedChildren: result.runs[0]?.renderState?.pixiExpectedChildren,
