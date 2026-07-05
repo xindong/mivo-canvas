@@ -1,10 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Image, Rect, Leafer } from 'leafer-ui'
+import { Image, Rect, Leafer, Text } from 'leafer-ui'
 import '@leafer-in/view'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 import type { RendererMode } from './rendererMode'
 import { isLeaferSpikePainted } from './leaferSpikeFilter'
 import { useCanvasStore } from '../store/canvasStore'
+import { registerEngineSpikeCamera } from './engineSpikeCameraBridge'
+import { isEngineLodRequested } from './engineLodMode'
+import {
+  emptyEngineLodStats,
+  engineLodFillFor,
+  recordEngineLodSummary,
+  shouldUseEngineLod,
+  summarizeEngineLod,
+  withEngineLodStats,
+  type EngineLodStatsCarrier,
+} from './engineSpikeLod'
 
 /**
  * 0b spike — Phase 2b 正式化时按 phase2b-adapter-camera-zorder.md 重构
@@ -22,8 +33,10 @@ import { useCanvasStore } from '../store/canvasStore'
 
 export type ViewportState = { x: number; y: number; scale: number }
 
-type PaintedEntry = { object: Image | Rect; node: MivoCanvasNode }
-type LeaferSpikeStats = {
+type LeaferDisplayObject = Image | Rect | Text
+type LeaferObjectKind = 'image' | 'rect' | 'text'
+type PaintedEntry = { object: LeaferDisplayObject; node: MivoCanvasNode; kind: LeaferObjectKind }
+type LeaferSpikeStats = EngineLodStatsCarrier & {
   expectedChildren: number
   children: number
   pixelNonEmpty: boolean
@@ -53,6 +66,7 @@ declare global {
 }
 
 const EMPTY_STATS: LeaferSpikeStats = {
+  ...emptyEngineLodStats(),
   expectedChildren: 0,
   children: 0,
   pixelNonEmpty: false,
@@ -71,15 +85,38 @@ const parsePanCacheEnabled = () => {
   return value === 'on' || value === 'true' || value === '1'
 }
 
-const leaferSpikePaintProps = (node: MivoCanvasNode) => {
+const isLeaferEngineComboPainted = (node: MivoCanvasNode): boolean =>
+  isLeaferSpikePainted(node) || (isEngineLodRequested && node.type === 'text')
+
+const leaferObjectKindFor = (node: MivoCanvasNode, viewport: ViewportState): LeaferObjectKind => {
+  if (shouldUseEngineLod(node, viewport)) return 'rect'
+  if (node.type === 'image') return 'image'
+  if (node.type === 'text') return 'text'
+  return 'rect'
+}
+
+const leaferSpikePaintProps = (node: MivoCanvasNode, viewport: ViewportState) => {
   const base = {
     x: node.x,
     y: node.y,
     width: Math.max(1, node.width),
     height: Math.max(1, node.height),
   }
+  if (shouldUseEngineLod(node, viewport)) {
+    return { ...base, fill: engineLodFillFor(node), strokeWidth: 0 }
+  }
   if (node.type === 'image') {
     return { ...base, url: node.assetUrl ?? '' }
+  }
+  if (node.type === 'text') {
+    return {
+      ...base,
+      text: node.text || '',
+      fill: node.textColor || '#2f2f2f',
+      fontSize: node.fontSize || 18,
+      fontWeight: node.fontWeight || 400,
+      textAlign: node.textAlign || 'left',
+    }
   }
   if (node.type === 'frame') {
     return {
@@ -98,17 +135,32 @@ const leaferSpikePaintProps = (node: MivoCanvasNode) => {
   }
 }
 
-const createLeaferSpikeObject = (node: MivoCanvasNode): Image | Rect =>
-  node.type === 'image' ? new Image(leaferSpikePaintProps(node)) : new Rect(leaferSpikePaintProps(node))
+const createLeaferSpikeObject = (node: MivoCanvasNode, viewport: ViewportState): PaintedEntry => {
+  const kind = leaferObjectKindFor(node, viewport)
+  const props = leaferSpikePaintProps(node, viewport)
+  const object = kind === 'image' ? new Image(props) : kind === 'text' ? new Text(props) : new Rect(props)
+  return { object, node, kind }
+}
 
-const paintSignatureFor = (node: MivoCanvasNode): string =>
+const setLeaferSpikeObjectProps = (object: LeaferDisplayObject, node: MivoCanvasNode, viewport: ViewportState) => {
+  const mutableObject = object as { set: (props: unknown) => void }
+  mutableObject.set(leaferSpikePaintProps(node, viewport))
+}
+
+const paintSignatureFor = (node: MivoCanvasNode, viewport: ViewportState): string =>
   JSON.stringify({
     type: node.type,
+    lod: shouldUseEngineLod(node, viewport),
     x: node.x,
     y: node.y,
     width: node.width,
     height: node.height,
     assetUrl: node.assetUrl,
+    text: node.text,
+    fontSize: node.fontSize,
+    textColor: node.textColor,
+    textAlign: node.textAlign,
+    fontWeight: node.fontWeight,
     markupKind: node.markupKind,
     markupFillColor: node.markupFillColor,
     markupStrokeColor: node.markupStrokeColor,
@@ -165,6 +217,7 @@ export const useLeaferSpikeRenderer = ({
   const paintedRef = useRef<Map<string, PaintedEntry>>(new Map())
   const signatureRef = useRef<Map<string, string>>(new Map())
   const statsRef = useRef<LeaferSpikeStats>(EMPTY_STATS)
+  const lodSummaryRef = useRef<string | undefined>(undefined)
   const panCacheEnabled = useMemo(() => parsePanCacheEnabled(), [])
   const frozenViewportRef = useRef<ViewportState | null>(null)
   const frozenCanvasRef = useRef<HTMLCanvasElement | null>(null)
@@ -177,11 +230,12 @@ export const useLeaferSpikeRenderer = ({
     panCacheEnabled,
   })
   const [, setStoreNodeVersion] = useState(0)
+  const lodViewport = useMemo(() => ({ x: 0, y: 0, scale: viewport.scale }), [viewport.scale])
 
-  const paintedNodes = useMemo(() => nodes.filter(isLeaferSpikePainted), [nodes])
+  const paintedNodes = useMemo(() => nodes.filter(isLeaferEngineComboPainted), [nodes])
   const paintedNodeSignature = useMemo(
-    () => paintedNodes.map((node) => `${node.id}:${paintSignatureFor(node)}`).join('|'),
-    [paintedNodes],
+    () => paintedNodes.map((node) => `${node.id}:${paintSignatureFor(node, lodViewport)}`).join('|'),
+    [lodViewport, paintedNodes],
   )
 
   const publishStats = useCallback((next: LeaferSpikeStats) => {
@@ -196,7 +250,14 @@ export const useLeaferSpikeRenderer = ({
       current.panCacheFrozen === next.panCacheFrozen &&
       current.panCacheCaptures === next.panCacheCaptures &&
       current.panCacheLastDeltaX === next.panCacheLastDeltaX &&
-      current.panCacheLastDeltaY === next.panCacheLastDeltaY
+      current.panCacheLastDeltaY === next.panCacheLastDeltaY &&
+      current.lodMode === next.lodMode &&
+      current.lodEnabled === next.lodEnabled &&
+      current.lodThresholdPx === next.lodThresholdPx &&
+      current.lodNodeCount === next.lodNodeCount &&
+      current.lodImageCount === next.lodImageCount &&
+      current.lodTextCount === next.lodTextCount &&
+      current.highFidelityNodeCount === next.highFidelityNodeCount
         ? current
         : next,
     )
@@ -305,6 +366,21 @@ export const useLeaferSpikeRenderer = ({
   }, [leaferReady, panCacheEnabled, rendererMode, viewport.x, viewport.y, viewport.scale])
 
   useEffect(() => {
+    if (!leaferReady || rendererMode !== 'leafer') return undefined
+    return registerEngineSpikeCamera((nextViewport) => {
+      if (panCacheEnabled && frozenCanvasRef.current) return
+      const leafer = leaferRef.current
+      if (!leafer) return
+      leafer.zoomLayer.set({
+        x: nextViewport.x,
+        y: nextViewport.y,
+        scaleX: nextViewport.scale,
+        scaleY: nextViewport.scale,
+      })
+    })
+  }, [leaferReady, panCacheEnabled, rendererMode])
+
+  useEffect(() => {
     if (!leaferReady || rendererMode !== 'leafer' || !panCacheEnabled) return
 
     const host = hostRef.current
@@ -385,21 +461,32 @@ export const useLeaferSpikeRenderer = ({
       return
     }
 
+    const lodStats = summarizeEngineLod(paintedNodes, lodViewport)
+    recordEngineLodSummary('Leafer Spike', lodStats, lodSummaryRef)
     const nextIds = new Set<string>()
     for (const node of paintedNodes) {
       nextIds.add(node.id)
-      const signature = paintSignatureFor(node)
+      const signature = paintSignatureFor(node, lodViewport)
       const existing = painted.get(node.id)
       if (existing) {
         if (signatures.get(node.id) !== signature) {
-          existing.object.set(leaferSpikePaintProps(node))
-          existing.node = node
-          signatures.set(node.id, signature)
+          const nextKind = leaferObjectKindFor(node, lodViewport)
+          if (existing.kind === nextKind) {
+            setLeaferSpikeObjectProps(existing.object, node, lodViewport)
+            existing.node = node
+            signatures.set(node.id, signature)
+          } else {
+            existing.object.remove()
+            const nextEntry = createLeaferSpikeObject(node, lodViewport)
+            leafer.add(nextEntry.object)
+            painted.set(node.id, nextEntry)
+            signatures.set(node.id, signature)
+          }
         }
       } else {
-        const object = createLeaferSpikeObject(node)
-        leafer.add(object)
-        painted.set(node.id, { object, node })
+        const entry = createLeaferSpikeObject(node, lodViewport)
+        leafer.add(entry.object)
+        painted.set(node.id, entry)
         signatures.set(node.id, signature)
       }
     }
@@ -413,7 +500,7 @@ export const useLeaferSpikeRenderer = ({
     }
 
     const syncVersion = statsRef.current.syncVersion + 1
-    publishStats({
+    publishStats(withEngineLodStats({
       ...statsRef.current,
       expectedChildren: paintedNodes.length,
       children: countLeaferChildren(leafer),
@@ -422,7 +509,7 @@ export const useLeaferSpikeRenderer = ({
       syncVersion,
       panCacheEnabled,
       panCacheCaptures: panCacheCapturesRef.current,
-    })
+    }, lodStats))
 
     let cancelled = false
     let attempts = 0
@@ -430,7 +517,7 @@ export const useLeaferSpikeRenderer = ({
       requestAnimationFrame(() => {
         if (cancelled) return
         const sample = sampleNonEmptyCanvasPixels(hostRef.current)
-        publishStats({
+        publishStats(withEngineLodStats({
           ...statsRef.current,
           expectedChildren: paintedNodes.length,
           children: countLeaferChildren(leaferRef.current),
@@ -439,7 +526,7 @@ export const useLeaferSpikeRenderer = ({
           syncVersion,
           panCacheEnabled,
           panCacheCaptures: panCacheCapturesRef.current,
-        })
+        }, lodStats))
         attempts += 1
         if (!sample.nonEmpty && attempts < 30) {
           window.setTimeout(sampleSoon, 100)
@@ -450,7 +537,7 @@ export const useLeaferSpikeRenderer = ({
     return () => {
       cancelled = true
     }
-  }, [hostRef, leaferReady, panCacheEnabled, paintedNodes, paintedNodeSignature, publishStats, rendererMode])
+  }, [hostRef, leaferReady, lodViewport, panCacheEnabled, paintedNodes, paintedNodeSignature, publishStats, rendererMode])
 
   useEffect(() => {
     window.__MIVO_LEAFER_SPIKE__ = {

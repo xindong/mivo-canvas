@@ -9,9 +9,7 @@ import {
   type DragEvent as ReactDragEvent,
   type MouseEvent as ReactMouseEvent,
 } from 'react'
-import { useLeaferSpikeRenderer } from '../render/useLeaferSpikeRenderer'
-import { usePixiSpikeRenderer } from '../render/usePixiSpikeRenderer'
-import { filterDomNodesForRendererSpike } from '../render/leaferSpikeFilter'
+import { useEngineSpikeRenderers } from '../render/useEngineSpikeRenderers'
 import { LocateFixed, Minus, Plus, RotateCcw } from 'lucide-react'
 import { downloadCanvasNodeOriginal } from '../lib/assetDownload'
 import { canReadLocalAssetDrag, parseLocalAssetDragPayload } from '../lib/canvasAssetDrag'
@@ -34,7 +32,6 @@ import { useCanvasInteractionController } from './useCanvasInteractionController
 import { clampContextMenuPosition, isCanvasChromeTarget, nodeIdFromDomTarget } from './canvasInteraction'
 import { useMaskPointArmed, type MaskPointArmedInteractionApi } from './useMaskPointArmed'
 import { lockedNodeIdSetFor } from './useNodeTransform'
-import { rendererMode } from '../render/rendererMode'
 import { cullingMode } from '../render/cullingMode'
 import { useCanvasVirtualization } from './useCanvasVirtualization'
 
@@ -198,8 +195,9 @@ export function MivoCanvas({
     cullingMode, visibleNodes, shellSize, viewport, selectedNodeId, selectedNodeIds,
     cropNodeId, maskEditNodeId, contextMenuNodeId,
   })
-  const pixiSpikeStats = usePixiSpikeRenderer({ hostRef, viewport, nodes: visibleNodes, rendererMode }), effectiveRendererMode = pixiSpikeStats.fallbackToDom ? 'dom' : rendererMode
-  const renderedNodes = useMemo(() => filterDomNodesForRendererSpike(canvasRenderedNodes, effectiveRendererMode), [canvasRenderedNodes, effectiveRendererMode])
+  const { renderedNodes, engineSpikeDataAttrs } = useEngineSpikeRenderers({
+    hostRef, viewport, visibleNodes, canvasRenderedNodes, isPanning,
+  })
 
   const openNodeContextMenu = useCallback(
     (nodeId: string, clientX: number, clientY: number) => {
@@ -339,8 +337,6 @@ export function MivoCanvas({
     return () => onRegisterExternalAssetDrop?.(undefined)
   }, [importLocalAssetAtClientPoint, onRegisterExternalAssetDrop])
 
-  const leaferSpikeStats = useLeaferSpikeRenderer({ hostRef, viewport, nodes: visibleNodes, rendererMode: effectiveRendererMode, isPanning })
-
   useEffect(() => {
     const shell = shellRef.current
     if (!shell) return undefined
@@ -438,19 +434,12 @@ export function MivoCanvas({
       } ${selectedNodes.length > 1 ? 'has-multi-selection' : ''} ${brushToolActive ? 'brush-tool' : ''} ${
         stampToolActive ? 'stamp-tool' : ''
       } ${maskArmed ? 'mask-armed' : ''}`}
-      aria-label="Mivo Canvas" data-renderer-mode={effectiveRendererMode} data-culling-mode={cullingMode}
+      aria-label="Mivo Canvas" {...engineSpikeDataAttrs} data-culling-mode={cullingMode}
       data-viewport-scale={viewport.scale} data-viewport-x={viewport.x} data-viewport-y={viewport.y}
       data-rendered-node-count={renderedNodes.length}
       data-total-node-count={visibleNodes.length}
       data-virtualize-mode={virtualizationStats.mode} data-virtualize-active={virtualizationStats.active ? 'true' : 'false'} data-virtualize-pending={virtualizationStats.pending ? 'true' : 'false'} data-virtualize-target-node-count={virtualizationStats.targetNodeCount} data-virtualize-materialized-node-count={virtualizationStats.materializedNodeCount} data-virtualize-overscan-px={virtualizationStats.overscanPx}
       data-virtualize-batch-runs={virtualizationStats.batchRuns} data-virtualize-reconcile-version={virtualizationStats.reconcileVersion}
-      data-leafer-expected-children={leaferSpikeStats.expectedChildren}
-      data-leafer-children={leaferSpikeStats.children}
-      data-leafer-pixel-nonempty={leaferSpikeStats.pixelNonEmpty ? 'true' : 'false'}
-      data-leafer-pixel-sample-count={leaferSpikeStats.pixelSampleCount}
-      data-leafer-sync-version={leaferSpikeStats.syncVersion}
-      data-leafer-pan-cache-enabled={leaferSpikeStats.panCacheEnabled ? 'true' : 'false'} data-leafer-pan-cache-frozen={leaferSpikeStats.panCacheFrozen ? 'true' : 'false'} data-leafer-pan-cache-captures={leaferSpikeStats.panCacheCaptures} data-leafer-pan-cache-last-dx={leaferSpikeStats.panCacheLastDeltaX} data-leafer-pan-cache-last-dy={leaferSpikeStats.panCacheLastDeltaY}
-      data-pixi-expected-children={pixiSpikeStats.expectedChildren} data-pixi-children={pixiSpikeStats.children} data-pixi-pixel-nonempty={pixiSpikeStats.pixelNonEmpty ? 'true' : 'false'} data-pixi-pixel-sample-count={pixiSpikeStats.pixelSampleCount} data-pixi-sync-version={pixiSpikeStats.syncVersion} data-pixi-text-strategy={pixiSpikeStats.textStrategy} data-pixi-texture-pool-size={pixiSpikeStats.texturePoolSize}
       ref={shellRef}
       onWheel={handleWheel}
       onPointerDown={wrapCanvasPointerDown}

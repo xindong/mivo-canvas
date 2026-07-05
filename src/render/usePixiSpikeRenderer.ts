@@ -7,11 +7,21 @@ import { toastFeedback } from '../store/toastStore'
 import type { RendererMode } from './rendererMode'
 import { isPixiSpikePainted } from './leaferSpikeFilter'
 import type { ViewportState } from './useLeaferSpikeRenderer'
+import { registerEngineSpikeCamera } from './engineSpikeCameraBridge'
+import {
+  emptyEngineLodStats,
+  engineLodFillFor,
+  recordEngineLodSummary,
+  shouldUseEngineLod,
+  summarizeEngineLod,
+  withEngineLodStats,
+  type EngineLodStatsCarrier,
+} from './engineSpikeLod'
 
 type PixiModule = typeof import('pixi.js')
 type PixiDisplayObject = Sprite | Graphics | BitmapText
 
-type PixiStats = {
+type PixiStats = EngineLodStatsCarrier & {
   expectedChildren: number
   children: number
   pixelNonEmpty: boolean
@@ -49,6 +59,7 @@ const TEXT_CHARS =
   'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 .,;:!?()[]{}+-=/&%#@"\'_<>|\\\n'
 
 const EMPTY_STATS: PixiStats = {
+  ...emptyEngineLodStats(),
   expectedChildren: 0,
   children: 0,
   pixelNonEmpty: false,
@@ -68,9 +79,10 @@ const colorToInt = (value: string | undefined, fallback = 0xffffff) => {
   return fallback
 }
 
-const paintSignatureFor = (node: MivoCanvasNode): string =>
+const paintSignatureFor = (node: MivoCanvasNode, viewport: ViewportState): string =>
   JSON.stringify({
     type: node.type,
+    lod: shouldUseEngineLod(node, viewport),
     x: node.x,
     y: node.y,
     width: node.width,
@@ -123,8 +135,15 @@ const createFallbackTexture = (pixi: PixiModule, seed: number) => {
   return pixi.Texture.from(canvas)
 }
 
-const loadTextures = async (pixi: PixiModule, nodes: MivoCanvasNode[]) => {
-  const urls = Array.from(new Set(nodes.filter((node) => node.type === 'image').map((node) => node.assetUrl).filter(Boolean))) as string[]
+const loadTextures = async (pixi: PixiModule, nodes: MivoCanvasNode[], viewport: ViewportState) => {
+  const urls = Array.from(
+    new Set(
+      nodes
+        .filter((node) => node.type === 'image' && !shouldUseEngineLod(node, viewport))
+        .map((node) => node.assetUrl)
+        .filter(Boolean),
+    ),
+  ) as string[]
   const textures = new Map<string, Texture>()
   await Promise.all(
     urls.map(async (url, index) => {
@@ -138,7 +157,21 @@ const loadTextures = async (pixi: PixiModule, nodes: MivoCanvasNode[]) => {
   return textures
 }
 
-const createObject = (pixi: PixiModule, node: MivoCanvasNode, textures: Map<string, Texture>): PixiDisplayObject => {
+const createLodObject = (pixi: PixiModule, node: MivoCanvasNode): Graphics => {
+  const graphic = new pixi.Graphics()
+  graphic
+    .rect(node.x, node.y, Math.max(1, node.width), Math.max(1, node.height))
+    .fill({ color: colorToInt(engineLodFillFor(node), 0xb7b0a8), alpha: node.type === 'text' ? 0.74 : 0.88 })
+  return graphic
+}
+
+const createObject = (
+  pixi: PixiModule,
+  node: MivoCanvasNode,
+  textures: Map<string, Texture>,
+  viewport: ViewportState,
+): PixiDisplayObject => {
+  if (shouldUseEngineLod(node, viewport)) return createLodObject(pixi, node)
   if (node.type === 'image') {
     const sprite = new pixi.Sprite((node.assetUrl && textures.get(node.assetUrl)) || pixi.Texture.WHITE)
     sprite.x = node.x
@@ -177,8 +210,14 @@ const createObject = (pixi: PixiModule, node: MivoCanvasNode, textures: Map<stri
   return graphic
 }
 
-const updateObject = (entry: PaintedEntry, pixi: PixiModule, node: MivoCanvasNode, textures: Map<string, Texture>) => {
-  const next = createObject(pixi, node, textures)
+const updateObject = (
+  entry: PaintedEntry,
+  pixi: PixiModule,
+  node: MivoCanvasNode,
+  textures: Map<string, Texture>,
+  viewport: ViewportState,
+) => {
+  const next = createObject(pixi, node, textures, viewport)
   const parent = entry.object.parent
   if (parent) {
     const index = parent.getChildIndex(entry.object)
@@ -188,7 +227,7 @@ const updateObject = (entry: PaintedEntry, pixi: PixiModule, node: MivoCanvasNod
   }
   entry.object = next
   entry.node = node
-  entry.signature = paintSignatureFor(node)
+  entry.signature = paintSignatureFor(node, viewport)
 }
 
 const countChildren = (stage: Container | null) => stage?.children.length ?? 0
@@ -235,14 +274,16 @@ export const usePixiSpikeRenderer = ({
   const refs = useRef<PixiRefs | null>(null)
   const paintedRef = useRef<Map<string, PaintedEntry>>(new Map())
   const statsRef = useRef<PixiStats>(EMPTY_STATS)
+  const lodSummaryRef = useRef<string | undefined>(undefined)
   const [ready, setReady] = useState(false)
   const [stats, setStats] = useState<PixiStats>(EMPTY_STATS)
   const [, setStoreNodeVersion] = useState(0)
+  const lodViewport = useMemo(() => ({ x: 0, y: 0, scale: viewport.scale }), [viewport.scale])
 
   const paintedNodes = useMemo(() => nodes.filter(isPixiSpikePainted), [nodes])
   const paintedNodeSignature = useMemo(
-    () => paintedNodes.map((node) => `${node.id}:${paintSignatureFor(node)}`).join('|'),
-    [paintedNodes],
+    () => paintedNodes.map((node) => `${node.id}:${paintSignatureFor(node, lodViewport)}`).join('|'),
+    [lodViewport, paintedNodes],
   )
 
   const publishStats = useCallback((next: PixiStats) => {
@@ -254,7 +295,14 @@ export const usePixiSpikeRenderer = ({
       current.pixelSampleCount === next.pixelSampleCount &&
       current.syncVersion === next.syncVersion &&
       current.texturePoolSize === next.texturePoolSize &&
-      current.fallbackToDom === next.fallbackToDom
+      current.fallbackToDom === next.fallbackToDom &&
+      current.lodMode === next.lodMode &&
+      current.lodEnabled === next.lodEnabled &&
+      current.lodThresholdPx === next.lodThresholdPx &&
+      current.lodNodeCount === next.lodNodeCount &&
+      current.lodImageCount === next.lodImageCount &&
+      current.lodTextCount === next.lodTextCount &&
+      current.highFidelityNodeCount === next.highFidelityNodeCount
         ? current
         : next,
     )
@@ -351,6 +399,16 @@ export const usePixiSpikeRenderer = ({
   }, [ready, rendererMode, viewport.scale, viewport.x, viewport.y])
 
   useEffect(() => {
+    if (!ready || rendererMode !== 'pixi') return undefined
+    return registerEngineSpikeCamera((nextViewport) => {
+      const current = refs.current
+      if (!current) return
+      current.stage.position.set(nextViewport.x, nextViewport.y)
+      current.stage.scale.set(nextViewport.scale)
+    })
+  }, [ready, rendererMode])
+
+  useEffect(() => {
     if (!ready || rendererMode !== 'pixi') {
       if (rendererMode !== 'pixi') queueMicrotask(() => publishStats(EMPTY_STATS))
       return
@@ -360,7 +418,9 @@ export const usePixiSpikeRenderer = ({
     const sync = async () => {
       const current = refs.current
       if (!current) return
-      current.textures = await loadTextures(current.pixi, paintedNodes)
+      const lodStats = summarizeEngineLod(paintedNodes, lodViewport)
+      recordEngineLodSummary(SOURCE, lodStats, lodSummaryRef)
+      current.textures = await loadTextures(current.pixi, paintedNodes, lodViewport)
       if (cancelled) return
 
       const painted = paintedRef.current
@@ -372,13 +432,13 @@ export const usePixiSpikeRenderer = ({
         }
       }
       for (const node of paintedNodes) {
-        const signature = paintSignatureFor(node)
+        const signature = paintSignatureFor(node, lodViewport)
         const existing = painted.get(node.id)
         if (existing && existing.signature === signature) continue
         if (existing) {
-          updateObject(existing, current.pixi, node, current.textures)
+          updateObject(existing, current.pixi, node, current.textures, lodViewport)
         } else {
-          const object = createObject(current.pixi, node, current.textures)
+          const object = createObject(current.pixi, node, current.textures, lodViewport)
           object.eventMode = 'none'
           current.stage.addChild(object)
           painted.set(node.id, { object, node, signature })
@@ -386,7 +446,7 @@ export const usePixiSpikeRenderer = ({
       }
 
       const syncVersion = statsRef.current.syncVersion + 1
-      publishStats({
+      publishStats(withEngineLodStats({
         ...statsRef.current,
         expectedChildren: paintedNodes.length,
         children: countChildren(current.stage),
@@ -395,14 +455,14 @@ export const usePixiSpikeRenderer = ({
         syncVersion,
         textStrategy: 'bitmap',
         texturePoolSize: current.textures.size,
-      })
+      }, lodStats))
 
       let attempts = 0
       const sample = () => {
         if (cancelled) return
         const latest = refs.current
         const pixels = sampleNonEmptyWebglPixels(latest?.app ?? null)
-        publishStats({
+        publishStats(withEngineLodStats({
           ...statsRef.current,
           expectedChildren: paintedNodes.length,
           children: countChildren(latest?.stage ?? null),
@@ -411,7 +471,7 @@ export const usePixiSpikeRenderer = ({
           syncVersion,
           textStrategy: 'bitmap',
           texturePoolSize: latest?.textures.size ?? 0,
-        })
+        }, lodStats))
         attempts += 1
         if (!pixels.nonEmpty && attempts < 30) window.setTimeout(sample, 50)
       }
@@ -422,7 +482,7 @@ export const usePixiSpikeRenderer = ({
     return () => {
       cancelled = true
     }
-  }, [failToDom, paintedNodeSignature, paintedNodes, publishStats, ready, rendererMode])
+  }, [failToDom, lodViewport, paintedNodeSignature, paintedNodes, publishStats, ready, rendererMode])
 
   useEffect(() => {
     window.__MIVO_PIXI_SPIKE__ = {
