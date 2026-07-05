@@ -1,3 +1,4 @@
+import type { ComponentType } from 'react'
 import type { LucideIcon } from 'lucide-react'
 import type { CanvasGenerationOptions, DistributionAxis, SelectionAlignment, SelectionArrangeMode } from '../../store/canvasStore'
 import type {
@@ -13,10 +14,14 @@ import type { CanvasSelectionContext } from './canvasSelectionModel'
 
 export type LayerMove = 'forward' | 'backward' | 'front' | 'back'
 
+// icon 放宽为 lucide 图标或自绘 size/className 兼容组件(如 MaskPointIcon)——
+// 渲染点只传 size,两类组件都满足。
+export type CanvasActionIcon = LucideIcon | ComponentType<{ size?: number; className?: string }>
+
 export type CanvasActionItem = {
   id: string
   label: string
-  icon?: LucideIcon
+  icon?: CanvasActionIcon
   text?: string
   menuVariant?: 'list' | 'palette' | 'segmented' | 'icon-grid'
   swatch?: {

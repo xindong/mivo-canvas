@@ -18,8 +18,7 @@ import {
   Clipboard,
   Columns3,
   Copy,
-  Crop, Crosshair,
-  Download,
+  Crop, Download,
   Eraser,
   Eye,
   EyeOff,
@@ -48,6 +47,7 @@ import {
   Wand2,
   WandSparkles,
 } from 'lucide-react'
+import { MaskPointIcon } from '../MaskPointIcon'
 import type { DistributionAxis, SelectionAlignment, SelectionArrangeMode } from '../../store/canvasStore'
 import type { CanvasNodeType, MarkupKind, SectionLockMode, ToolId } from '../../types/mivoCanvas'
 import {
@@ -166,7 +166,7 @@ const imageAiEditActionsFor = (runtime: CanvasActionRuntime): CanvasActionItem[]
   {
     id: 'select-area-edit',
     label: 'Select area',
-    icon: Crosshair,
+    icon: MaskPointIcon,
     onClick: () => {
       const nodeId = primaryNodeId(runtime)
       if (nodeId) runtime.onStartImageMaskEdit?.(nodeId)

@@ -26,6 +26,7 @@ import {
   type ImageMaskRegion,
   type ImageMaskSubmitPayload,
 } from './imageMaskGeometry'
+import { MaskPointMarker } from './MaskPointIcon'
 import type { MaskInitialClientPoint } from './maskPointPending'
 
 type ImageMaskTool = 'point' | 'box' | 'brush'
@@ -573,45 +574,14 @@ export function ImageMaskEditOverlay({
       ]
     : regions
 
-  const renderPointMarker = (center: ImageMaskPoint, radiusNode: number, index: string | number) => {
-    const scale = Math.max(0.1, viewportScale)
-    const armLength = 10 / scale
-    const centerRadius = 3.5 / scale
-    const strokeWidth = 2 / scale
-
-    return (
-      <g key={`point-marker-${index}`} className="image-mask-edit-point-marker">
-        <circle
-          className="image-mask-edit-point-ring"
-          cx={center.x}
-          cy={center.y}
-          r={radiusNode}
-        />
-        <line
-          className="image-mask-edit-point-crosshair"
-          x1={center.x - armLength}
-          y1={center.y}
-          x2={center.x + armLength}
-          y2={center.y}
-          strokeWidth={strokeWidth}
-        />
-        <line
-          className="image-mask-edit-point-crosshair"
-          x1={center.x}
-          y1={center.y - armLength}
-          x2={center.x}
-          y2={center.y + armLength}
-          strokeWidth={strokeWidth}
-        />
-        <circle
-          className="image-mask-edit-point-core"
-          cx={center.x}
-          cy={center.y}
-          r={centerRadius}
-        />
-      </g>
-    )
-  }
+  // 用户反馈:旧的「虚线大圆环 + 十字线」太大且表达不精准。锚点只保留一枚固定
+  // 屏幕尺寸的紫色实心坐标 pin,尖端精确落在点击坐标;半径圆环不再可视化,
+  // 但重绘区域几何(pointMaskRadiusFor / maskBounds)不变。
+  const renderPointMarker = (center: ImageMaskPoint, index: string | number) => (
+    <g key={`point-marker-${index}`} className="image-mask-edit-point-marker">
+      <MaskPointMarker tipX={center.x} tipY={center.y} viewportScale={viewportScale} />
+    </g>
+  )
 
   const floatingControls =
     floatingLayout && floatingHost ? (
@@ -718,12 +688,12 @@ export function ImageMaskEditOverlay({
             />
             {pointAnchors.map((anchor, index) => {
               const shape = pointAnchorPath(anchor, displayRect, naturalSize, node.imageCrop)
-              return renderPointMarker({ x: shape.cx, y: shape.cy }, shape.r, `anchor-${index}`)
+              return renderPointMarker({ x: shape.cx, y: shape.cy }, `anchor-${index}`)
             })}
             {renderedRegions.map((region, index) => {
               const shape = regionPath(region, displayRect, naturalSize, node.imageCrop)
               if (shape.kind === 'point') {
-                return renderPointMarker({ x: shape.cx, y: shape.cy }, shape.r, index)
+                return renderPointMarker({ x: shape.cx, y: shape.cy }, index)
               }
               if (shape.kind === 'rect') {
                 return (

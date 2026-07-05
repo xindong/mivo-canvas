@@ -24,6 +24,9 @@ import {
 import { screenToCanvas as screenToCanvasPoint } from '../render/viewportMatrix'
 import { cullingMode } from '../render/cullingMode'
 import { virtualizationMode } from '../render/virtualizationMode'
+import { useCameraFocusStore } from '../store/cameraFocusStore'
+import { debugLogger } from '../store/debugLogStore'
+import { viewportToRevealBounds } from './autoFocusPlaceholder'
 import { applyEngineSpikeCamera } from '../render/engineSpikeCameraBridge'
 
 export const defaultViewportFor = (sceneId: string): Viewport => ({
@@ -148,6 +151,39 @@ export function useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseCo
       shell.removeEventListener('wheel', preventNativeWheelDefault)
     }
   }, [shellRef])
+
+  // 生图占位符镜头跟随:prepareChatSlot / prepareMaskEditPlaceholder 建占位后发出
+  // 请求,这里消费。已完全可见不动;用户正在拖拽平移中跳过(不打断操作);其余
+  // 平移到居中,scale 保持用户当前值。跨场景请求在 cameraFocusStore 写侧已拦下。
+  const pendingFocus = useCameraFocusStore((state) => state.pendingFocus)
+  useEffect(() => {
+    if (!pendingFocus) return
+    const clearPlaceholderFocus = useCameraFocusStore.getState().clearPlaceholderFocus
+    const node = nodes.find((candidate) => candidate.id === pendingFocus.nodeId && !candidate.hidden)
+    const rect = shellRef.current?.getBoundingClientRect()
+    if (!node || !rect) {
+      debugLogger.warn('Camera', `Auto-focus skipped (${node ? 'no shell rect' : 'node missing'}): ${pendingFocus.nodeId}`)
+      clearPlaceholderFocus()
+      return
+    }
+    if (panRef.current) {
+      debugLogger.log('Camera', `Auto-focus skipped (user panning): ${pendingFocus.nodeId}`)
+      clearPlaceholderFocus()
+      return
+    }
+    const nextViewport = viewportToRevealBounds(
+      viewportRef.current,
+      { width: rect.width, height: rect.height },
+      { x: node.x, y: node.y, width: node.width, height: node.height },
+    )
+    if (!nextViewport) {
+      debugLogger.log('Camera', `Auto-focus skipped (already visible): ${pendingFocus.nodeId}`)
+    } else {
+      setViewport(nextViewport)
+      debugLogger.log('Camera', `Auto-focus placeholder ${pendingFocus.nodeId} (${pendingFocus.source})`)
+    }
+    clearPlaceholderFocus()
+  }, [nodes, pendingFocus, shellRef])
 
   const screenToCanvas = useCallback(
     (clientX: number, clientY: number, sourceViewport: Viewport = viewportRef.current) => {

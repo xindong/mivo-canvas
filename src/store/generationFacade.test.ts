@@ -22,6 +22,7 @@ vi.mock('../lib/mivoImageClient', () => ({
 
 import { useCanvasStore } from './canvasStore'
 import { generationFacade } from './generationFacade'
+import { useCameraFocusStore } from './cameraFocusStore'
 import { AI_SLOT_GAP } from './aiCanvasWorkflow'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 
@@ -156,5 +157,62 @@ describe('generationFacade — delegation + failure rethrow (SC3.1 / A1 quirks)'
     const spy = vi.spyOn(useCanvasStore.getState(), 'generateBesideNode').mockRejectedValue(new Error('upstream 500'))
     await expect(generationFacade.generateBesideNode('img-1', 'p', { sceneId: 'c1' })).rejects.toThrow('upstream 500')
     spy.mockRestore()
+  })
+})
+
+
+describe('generationFacade.prepareChatSlot — camera auto-focus request (镜头跟随)', () => {
+  beforeEach(() => {
+    useCameraFocusStore.setState({ pendingFocus: undefined })
+  })
+
+  it('requests focus for a freshly created slot in the active scene', () => {
+    const prep = generationFacade.prepareChatSlot({ sceneId: 'c1', hasSelectedImage: false, prompt: 'p' })
+    expect(useCameraFocusStore.getState().pendingFocus).toEqual({ nodeId: prep.slotId, source: 'chat-slot' })
+  })
+
+  it('requests focus when reusing an existing pendingSlotId (retry path)', () => {
+    generationFacade.prepareChatSlot({ sceneId: 'c1', hasSelectedImage: false, pendingSlotId: 'slot-1', prompt: 'p' })
+    expect(useCameraFocusStore.getState().pendingFocus).toEqual({ nodeId: 'slot-1', source: 'chat-slot' })
+  })
+
+  it('does not request focus in beside mode', () => {
+    generationFacade.prepareChatSlot({ sceneId: 'c1', selectedNodeId: 'img-1', hasSelectedImage: true, prompt: 'p' })
+    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
+  })
+
+  it('skips the request when the target scene is not active (#95 跨场景语义:不动镜头)', () => {
+    useCanvasStore.setState({
+      canvases: {
+        ...useCanvasStore.getState().canvases,
+        c2: { title: 'Canvas Two', nodes: [], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] },
+      },
+    })
+    generationFacade.prepareChatSlot({ sceneId: 'c2', hasSelectedImage: false, prompt: 'p' })
+    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
+  })
+})
+
+
+describe('generationFacade.prepareChatSlot — 占位符比例跟随请求比例', () => {
+  it('creates a 16:9 slot for a 16:9 request (replacingSlot 保尺寸契约下出图不再错位)', () => {
+    const prep = generationFacade.prepareChatSlot({ sceneId: 'c1', hasSelectedImage: false, prompt: 'p', imgRatio: '16:9' })
+    const slot = useCanvasStore.getState().nodes.find((n) => n.id === prep.slotId)
+    expect(slot).toBeDefined()
+    expect(slot!.width / slot!.height).toBeCloseTo(16 / 9, 1)
+  })
+
+  it('creates a 3:2 slot for a 3:2 request', () => {
+    const prep = generationFacade.prepareChatSlot({ sceneId: 'c1', hasSelectedImage: false, prompt: 'p', imgRatio: '3:2' })
+    const slot = useCanvasStore.getState().nodes.find((n) => n.id === prep.slotId)
+    expect(slot!.width / slot!.height).toBeCloseTo(3 / 2, 1)
+  })
+
+  it('keeps the 320×320 square for 1:1 and auto (无回归)', () => {
+    for (const imgRatio of ['1:1', 'auto'] as const) {
+      const prep = generationFacade.prepareChatSlot({ sceneId: 'c1', hasSelectedImage: false, prompt: 'p', imgRatio })
+      const slot = useCanvasStore.getState().nodes.find((n) => n.id === prep.slotId)
+      expect({ width: slot!.width, height: slot!.height }).toEqual({ width: 320, height: 320 })
+    }
   })
 })

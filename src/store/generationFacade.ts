@@ -13,10 +13,12 @@
 // may throw if the target canvas was deleted (matches the prior inline guard).
 
 import { useCanvasStore } from './canvasStore'
+import { useCameraFocusStore } from './cameraFocusStore'
 import type { CanvasGenerationOptions, CanvasState } from './canvasStore'
 import type { CanvasId } from '../types/mivoCanvas'
+import type { GenerationRatio } from '../types/generation'
 import { defaultSizeForNodeType } from '../canvas/nodeTypes/canvasNodeRegistry'
-import { AI_SLOT_GAP, chooseAdjacentPlacement } from './aiCanvasWorkflow'
+import { AI_SLOT_GAP, chooseAdjacentPlacement, slotSizeForRatio } from './aiCanvasWorkflow'
 import { firstAnchorImageFor } from './canvasDocumentModel'
 
 type ChatSlotPrep =
@@ -55,6 +57,7 @@ export const generationFacade = {
     hasSelectedImage: boolean
     pendingSlotId?: string
     prompt: string
+    imgRatio?: GenerationRatio | 'auto'
   }): ChatSlotPrep => {
     if (params.hasSelectedImage && params.selectedNodeId) {
       return { mode: 'beside', slotId: undefined }
@@ -63,15 +66,29 @@ export const generationFacade = {
     const doc = store.canvases[params.sceneId]
     if (!doc) throw new Error('目标画布已删除，无法继续生成。')
 
+    // 镜头跟随契约:占位 slot 准备好后请求 auto-focus(新建与 retry 复用同待遇);
+    // 跨场景 skip 判定在 cameraFocusStore 内(#95 语义:不切场景、不动镜头)。
+    const requestSlotFocus = (slotId: string) =>
+      useCameraFocusStore.getState().requestPlaceholderFocus(slotId, {
+        targetSceneId: params.sceneId,
+        activeSceneId: store.sceneId,
+        source: 'chat-slot',
+      })
+
     const existing = params.pendingSlotId
       ? doc.nodes.find((n) => n.id === params.pendingSlotId && n.type === 'ai-slot' && !n.hidden)
       : undefined
-    if (existing) return { mode: 'slot', slotId: existing.id }
+    if (existing) {
+      requestSlotFocus(existing.id)
+      return { mode: 'slot', slotId: existing.id }
+    }
 
     const selectedNode = params.selectedNodeId
       ? doc.nodes.find((n) => n.id === params.selectedNodeId && !n.hidden)
       : undefined
-    const slotSize = defaultSizeForNodeType('ai-slot')
+    // 占位比例跟随请求比例:出图后 replacingSlot 保留占位尺寸(#86 W2-F5 防跳变
+    // 契约不动),所以比例必须在创建时就定对,否则宽幅结果被塞进方形框。
+    const slotSize = slotSizeForRatio(defaultSizeForNodeType('ai-slot'), params.imgRatio)
     const slotPosition = selectedNode
       ? { x: selectedNode.x + selectedNode.width + AI_SLOT_GAP, y: selectedNode.y }
       : (() => {
@@ -93,6 +110,7 @@ export const generationFacade = {
       { sceneId: params.sceneId },
     )
     freshlyCreatedChatSlots.add(slotId)
+    requestSlotFocus(slotId)
     return { mode: 'slot', slotId }
   },
 

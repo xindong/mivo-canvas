@@ -6,7 +6,7 @@ vi.mock('./remoteDebugReporter', () => ({
 
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 import { useDebugLogStore } from './debugLogStore'
-import { reflowRightObstacles } from './aiCanvasWorkflow'
+import { reflowRightObstacles, slotSizeForRatio } from './aiCanvasWorkflow'
 
 const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
   id: 'img-1',
@@ -72,5 +72,36 @@ describe('reflowRightObstacles', () => {
     reflowRightObstacles(nodes, placed, 10)
 
     expect(useDebugLogStore.getState().entries.some((entry) => entry.source === 'AI Slot Reflow')).toBe(true)
+  })
+})
+
+
+describe('slotSizeForRatio (占位符比例跟随请求比例)', () => {
+  const base = { width: 320, height: 320 }
+
+  it('keeps the base square for 1:1 / auto / undefined (无回归)', () => {
+    expect(slotSizeForRatio(base, '1:1')).toEqual(base)
+    expect(slotSizeForRatio(base, 'auto')).toEqual(base)
+    expect(slotSizeForRatio(base, undefined)).toEqual(base)
+  })
+
+  it('matches 16:9 within rounding and preserves the base area', () => {
+    const size = slotSizeForRatio(base, '16:9')
+    expect(size.width / size.height).toBeCloseTo(16 / 9, 1)
+    expect(size.width * size.height).toBeGreaterThan(base.width * base.height * 0.95)
+    expect(size.width * size.height).toBeLessThan(base.width * base.height * 1.05)
+  })
+
+  it('matches 3:2 and the portrait counterpart 2:3', () => {
+    const landscape = slotSizeForRatio(base, '3:2')
+    expect(landscape.width / landscape.height).toBeCloseTo(3 / 2, 1)
+    const portrait = slotSizeForRatio(base, '2:3')
+    expect(portrait.width / portrait.height).toBeCloseTo(2 / 3, 1)
+    expect(portrait.width).toBeLessThan(portrait.height)
+  })
+
+  it('falls back to base on malformed ratios', () => {
+    expect(slotSizeForRatio(base, '0:9' as never)).toEqual(base)
+    expect(slotSizeForRatio(base, 'x:y' as never)).toEqual(base)
   })
 })

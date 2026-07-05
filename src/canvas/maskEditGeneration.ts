@@ -5,6 +5,7 @@
 import type { MivoCanvasNode, MivoCanvasSnapshot } from '../types/mivoCanvas'
 import type { MivoImageQuality, MivoImageRatio } from '../types/generation'
 import { useCanvasStore } from '../store/canvasStore'
+import { useCameraFocusStore } from '../store/cameraFocusStore'
 import { AI_SLOT_GAP, reflowRightObstacles } from '../store/aiCanvasWorkflow'
 import { rollbackLatestHistoryBaseline } from '../store/canvasDocumentModel'
 import { debugLogger } from '../store/debugLogStore'
@@ -111,6 +112,13 @@ export const prepareMaskEditPlaceholder = (
       ? useCanvasStore.getState().historyPast.at(-1)
       : undefined
   patchMaskEditSlotStatus(sceneId, slotId, 'generating', prompt)
+  // 镜头跟随契约:占位建好后请求 auto-focus;跨场景 skip 判定在 cameraFocusStore
+  // 内(#95 语义:不切场景、不动镜头)。
+  useCameraFocusStore.getState().requestPlaceholderFocus(slotId, {
+    targetSceneId: sceneId,
+    activeSceneId: useCanvasStore.getState().sceneId,
+    source: 'mask-edit',
+  })
   debugLogger.log('Canvas', `Prepared mask edit placeholder for ${source.title}`)
   return { slotId, baselineSnapshot }
 }

@@ -123,14 +123,14 @@ export const runMaskPointScenario = async (context) => {
       mask: Number(overlay?.getAttribute('data-mask-region-count') || '0'),
       point: Number(overlay?.getAttribute('data-point-anchor-count') || '0'),
       markers: document.querySelectorAll('.image-mask-edit-stage svg .image-mask-edit-point-marker').length,
-      rings: document.querySelectorAll('.image-mask-edit-stage svg .image-mask-edit-point-ring').length,
+      pins: document.querySelectorAll('.image-mask-edit-stage svg .image-mask-edit-point-pin').length,
     }
   })
   if (armedState.armed || armedState.selectedNodeId !== imageId || armedState.mask !== 1 || armedState.point !== 0) {
     throw new Error(`P3: armed image click should select image, open mask edit, and consume one mask region: ${JSON.stringify(armedState)}`)
   }
-  if (armedState.markers < 1 || armedState.rings < 1) {
-    throw new Error(`P3: initial point should render marker + radius ring: ${JSON.stringify(armedState)}`)
+  if (armedState.markers < 1 || armedState.pins < 1) {
+    throw new Error(`P3: initial point should render a coordinate-pin marker: ${JSON.stringify(armedState)}`)
   }
 
   // FIX-3: initial armed point must not block legitimate fast follow-up points in the overlay.
@@ -386,13 +386,13 @@ export const runMaskPointScenario = async (context) => {
     throw new Error(`SC6.2: point click should not leave a standalone point anchor (it is a circle region), got ${JSON.stringify(afterClick)}`)
   }
   // 回归守卫（bug: 单点 brush 渲染成单点 polyline → 无任何可见反馈）：点选后
-  // stage SVG 里必须出现紫色 marker 与真实半径圆环。
+  // stage SVG 里必须出现紫色坐标 pin 标记（固定屏幕尺寸，尖端锚在点击坐标）。
   const visiblePointFeedback = await page.evaluate(() => ({
     markers: document.querySelectorAll('.image-mask-edit-stage svg .image-mask-edit-point-marker').length,
-    rings: document.querySelectorAll('.image-mask-edit-stage svg .image-mask-edit-point-ring').length,
+    pins: document.querySelectorAll('.image-mask-edit-stage svg .image-mask-edit-point-pin').length,
   }))
-  if (visiblePointFeedback.markers < 1 || visiblePointFeedback.rings < 1) {
-    throw new Error(`SC6.2: point click should render marker + radius ring feedback, got ${JSON.stringify(visiblePointFeedback)}`)
+  if (visiblePointFeedback.markers < 1 || visiblePointFeedback.pins < 1) {
+    throw new Error(`SC6.2: point click should render coordinate-pin marker feedback, got ${JSON.stringify(visiblePointFeedback)}`)
   }
   const blocked = await page.evaluate(() => {
     const err = document.querySelector('.image-mask-edit-error')?.textContent || ''
