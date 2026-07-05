@@ -11,9 +11,9 @@ import { debugLogger } from '../store/debugLogStore'
  * 解析在模块加载时执行一次（renderer mode 在页面生命周期内不变）。
  */
 
-export type RendererMode = 'dom' | 'leafer'
+export type RendererMode = 'dom' | 'leafer' | 'pixi'
 
-const VALID_MODES: ReadonlySet<string> = new Set(['dom', 'leafer'])
+const VALID_MODES: ReadonlySet<string> = new Set(['dom', 'leafer', 'pixi'])
 
 const normalize = (raw: string): string => raw.trim().toLowerCase()
 
@@ -32,6 +32,10 @@ const parseRendererModeFromUrl = (): RendererMode => {
   if (normalized === 'leafer') {
     debugLogger.log('Renderer', 'leafer spike renderer active (image/frame/rect only; Phase 2b 正式化时扩展)')
     return 'leafer'
+  }
+  if (normalized === 'pixi') {
+    debugLogger.log('Renderer', 'pixi 0d spike renderer active (image/frame/rect/text; dynamic import)')
+    return 'pixi'
   }
 
   return 'dom'

@@ -344,7 +344,7 @@ const installBenchRuntime = async (page) => {
         const startedAt = performance.now()
         let settled = false
         const requestedRenderer = new URLSearchParams(window.location.search).get('renderer') || 'dom'
-        let lastSnapshot = { totalNodeCount: null, viewportScale: 0, rendererMode: null, leaferChildren: 0, leaferExpectedChildren: 0, leaferPixelNonEmpty: false }
+        let lastSnapshot = { totalNodeCount: null, viewportScale: 0, rendererMode: null, leaferChildren: 0, leaferExpectedChildren: 0, leaferPixelNonEmpty: false, pixiChildren: 0, pixiExpectedChildren: 0, pixiPixelNonEmpty: false }
         while (performance.now() - startedAt < 15000) {
           const nextShell = document.querySelector('.canvas-shell')
           const totalNodeCount = nextShell?.getAttribute('data-total-node-count')
@@ -352,6 +352,9 @@ const installBenchRuntime = async (page) => {
           const leaferExpectedChildren = Number(nextShell?.getAttribute('data-leafer-expected-children') || 0)
           const leaferChildren = Number(nextShell?.getAttribute('data-leafer-children') || 0)
           const leaferPixelNonEmpty = nextShell?.getAttribute('data-leafer-pixel-nonempty') === 'true'
+          const pixiExpectedChildren = Number(nextShell?.getAttribute('data-pixi-expected-children') || 0)
+          const pixiChildren = Number(nextShell?.getAttribute('data-pixi-children') || 0)
+          const pixiPixelNonEmpty = nextShell?.getAttribute('data-pixi-pixel-nonempty') === 'true'
           lastSnapshot = {
             totalNodeCount,
             viewportScale,
@@ -359,11 +362,17 @@ const installBenchRuntime = async (page) => {
             leaferChildren,
             leaferExpectedChildren,
             leaferPixelNonEmpty,
+            pixiChildren,
+            pixiExpectedChildren,
+            pixiPixelNonEmpty,
           }
           const leaferReady =
             requestedRenderer !== 'leafer' ||
             (leaferExpectedChildren > 0 && leaferChildren === leaferExpectedChildren && leaferPixelNonEmpty)
-          if (totalNodeCount === expectedNodeCount && Math.abs(viewportScale - expectedScale) < 0.01 && leaferReady) {
+          const pixiReady =
+            requestedRenderer !== 'pixi' ||
+            (pixiExpectedChildren > 0 && pixiChildren === pixiExpectedChildren && pixiPixelNonEmpty)
+          if (totalNodeCount === expectedNodeCount && Math.abs(viewportScale - expectedScale) < 0.01 && leaferReady && pixiReady) {
             settled = true
             break
           }
@@ -380,6 +389,11 @@ const installBenchRuntime = async (page) => {
         const leaferPixelNonEmpty = currentShell?.getAttribute('data-leafer-pixel-nonempty') === 'true'
         const leaferPixelSampleCount = Number(currentShell?.getAttribute('data-leafer-pixel-sample-count') || 0)
         const leaferSyncVersion = Number(currentShell?.getAttribute('data-leafer-sync-version') || 0)
+        const pixiExpectedChildren = Number(currentShell?.getAttribute('data-pixi-expected-children') || 0)
+        const pixiChildren = Number(currentShell?.getAttribute('data-pixi-children') || 0)
+        const pixiPixelNonEmpty = currentShell?.getAttribute('data-pixi-pixel-nonempty') === 'true'
+        const pixiPixelSampleCount = Number(currentShell?.getAttribute('data-pixi-pixel-sample-count') || 0)
+        const pixiSyncVersion = Number(currentShell?.getAttribute('data-pixi-sync-version') || 0)
         if (!settled || actualNodeCount !== expectedNodeCount || Math.abs(actualScale - expectedScale) >= 0.01) {
           throw new Error(
             `waitForRender did not settle within 15s: expected nodeCount=${expectedNodeCount} scale=${expectedScale} renderer=${requestedRenderer}, `
@@ -396,6 +410,11 @@ const installBenchRuntime = async (page) => {
           leaferPixelNonEmpty,
           leaferPixelSampleCount,
           leaferSyncVersion,
+          pixiExpectedChildren,
+          pixiChildren,
+          pixiPixelNonEmpty,
+          pixiPixelSampleCount,
+          pixiSyncVersion,
           viewportScale: actualScale,
           viewportX: Number(currentShell?.getAttribute('data-viewport-x') || 0),
           viewportY: Number(currentShell?.getAttribute('data-viewport-y') || 0),
@@ -736,6 +755,13 @@ const readRenderState = (page) =>
       leaferPanCacheCaptures: Number(shell?.getAttribute('data-leafer-pan-cache-captures') || 0),
       leaferPanCacheLastDx: Number(shell?.getAttribute('data-leafer-pan-cache-last-dx') || 0),
       leaferPanCacheLastDy: Number(shell?.getAttribute('data-leafer-pan-cache-last-dy') || 0),
+      pixiExpectedChildren: Number(shell?.getAttribute('data-pixi-expected-children') || 0),
+      pixiChildren: Number(shell?.getAttribute('data-pixi-children') || 0),
+      pixiPixelNonEmpty: shell?.getAttribute('data-pixi-pixel-nonempty') === 'true',
+      pixiPixelSampleCount: Number(shell?.getAttribute('data-pixi-pixel-sample-count') || 0),
+      pixiSyncVersion: Number(shell?.getAttribute('data-pixi-sync-version') || 0),
+      pixiTextStrategy: shell?.getAttribute('data-pixi-text-strategy') || 'none',
+      pixiTexturePoolSize: Number(shell?.getAttribute('data-pixi-texture-pool-size') || 0),
       viewportScale: Number(shell?.getAttribute('data-viewport-scale') || 0),
     }
   })
@@ -811,6 +837,20 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, rendere
       throw new Error('Bench Leafer pan-cache evidence invalid: requested pan-cache on but shell reports disabled')
     }
   }
+  if (renderer === 'pixi') {
+    if (renderState.pixiExpectedChildren <= 0) {
+      throw new Error('Bench Pixi evidence invalid: expected painted children is 0')
+    }
+    if (renderState.pixiChildren !== renderState.pixiExpectedChildren) {
+      throw new Error(`Bench Pixi evidence mismatch: children=${renderState.pixiChildren}, expected=${renderState.pixiExpectedChildren}`)
+    }
+    if (!renderState.pixiPixelNonEmpty) {
+      throw new Error(`Bench Pixi evidence invalid: canvas pixel sample empty (samples=${renderState.pixiPixelSampleCount})`)
+    }
+    if (renderState.pixiTextStrategy !== 'bitmap') {
+      throw new Error(`Bench Pixi evidence invalid: textStrategy=${renderState.pixiTextStrategy}, expected bitmap`)
+    }
+  }
   const afterRenderHeap = await cdpSession.send('Runtime.getHeapUsage')
 
   const pan = await runAction('canvas-pan', () => panCanvas(page))
@@ -846,6 +886,8 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, rendere
       cullingActual: renderState.cullingMode,
       panCacheRequested: panCache,
       panCacheActual: renderState.leaferPanCacheEnabled ? 'on' : 'off',
+      pixiTextStrategy: renderState.pixiTextStrategy,
+      pixiTexturePoolSize: renderState.pixiTexturePoolSize,
     },
     fixture: {
       sceneId: fixture.meta.sceneId,
@@ -948,6 +990,10 @@ const main = async () => {
         leaferPixelNonEmpty: result.runs[0]?.renderState?.leaferPixelNonEmpty,
         leaferPanCacheEnabled: result.runs[0]?.renderState?.leaferPanCacheEnabled,
         leaferPanCacheCaptures: result.runs[0]?.afterPanRenderState?.leaferPanCacheCaptures,
+        pixiExpectedChildren: result.runs[0]?.renderState?.pixiExpectedChildren,
+        pixiChildren: result.runs[0]?.renderState?.pixiChildren,
+        pixiPixelNonEmpty: result.runs[0]?.renderState?.pixiPixelNonEmpty,
+        pixiTextStrategy: result.runs[0]?.renderState?.pixiTextStrategy,
         totalNodeCount: result.runs[0]?.renderState?.totalNodeCount,
       }))
       const worstP95 = Math.max(...dprGateValues.map((result) => result.p95FrameMs ?? 0))
