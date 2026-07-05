@@ -433,9 +433,11 @@ export const CanvasNodeView = memo(function CanvasNodeView({
   const taskNode = renderKind === 'task'
   const annotationNode = renderKind === 'annotation'
   const markupNode = renderKind === 'markup'
-  // FU-11: leafer 模式下被 Leafer 真画的 markup 节点,DOM 侧只保留"纯文字壳"。
-  // 能走到这里说明 leaferSpikeFilter 已判定该节点需要文字层(有文字/编辑中)。
+  // FU-11/12: leafer 模式下被 Leafer 真画的节点,DOM 侧只保留"纯文字壳"——
+  // markup 的 MarkupTextLayer / frame 的 dom-frame-title。能走到这里说明
+  // leaferSpikeFilter 已判定该节点需要文字层(有文字或编辑中/标题可见)。
   const markupTextOverlayOnly = markupNode && rendererMode === 'leafer' && isLeaferSpikePainted(node)
+  const frameTitleOverlayOnly = frameNode && rendererMode === 'leafer' && isLeaferSpikePainted(node)
   const markdownNode = renderKind === 'markdown'
   const markdownDisplayMode = markdownNode ? node.markdownDisplayMode || 'full' : undefined
   const markdownPreviewMode = markdownDisplayMode === 'preview'
@@ -524,6 +526,23 @@ export const CanvasNodeView = memo(function CanvasNodeView({
       resizeObserver.disconnect()
     }
   }, [markdownNode, markdownPreviewMode, node.height, node.id, node.text, node.width, onResizeNodeToContent])
+
+  if (frameTitleOverlayOnly) {
+    // 壳只承载标题药丸:dom-frame-title 相对节点盒绝对定位(top:-38px 悬于上沿),
+    // 壳与整节点同一 nodeRenderBoxFor 定位链;盒体(dom-frame-node 底/虚线框)
+    // 由 Leafer 真画。改名(双击 → window.prompt)走画布 hit-test,不依赖本壳。
+    return (
+      <div
+        data-node-id={node.id}
+        data-node-type={node.type}
+        data-section-id={node.sectionId}
+        className="dom-node frame-node frame-title-overlay"
+        style={nodeStyle}
+      >
+        <div className="dom-frame-title">{node.title}</div>
+      </div>
+    )
+  }
 
   if (markupTextOverlayOnly) {
     // 壳只承载 MarkupTextLayer:定位/transform 链与整节点一致(nodeRenderBoxFor),

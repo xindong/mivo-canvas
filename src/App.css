@@ -4265,9 +4265,11 @@ button:disabled {
   box-shadow: none;
 }
 
-/* FU-11: leafer 模式纯文字壳——本体由 Leafer 真画，壳不拦手势/不改光标；
-   编辑态由 .dom-markup-label.editing 的 pointer-events:auto 恢复输入。 */
-.dom-node.markup-node.markup-text-overlay {
+/* FU-11/12: leafer 模式纯文字壳（markup 文字层 / frame 标题）——本体由 Leafer
+   真画，壳不拦手势/不改光标；markup 编辑态由 .dom-markup-label.editing 的
+   pointer-events:auto 恢复输入，frame 改名走 window.prompt 无需壳接管指针。 */
+.dom-node.markup-node.markup-text-overlay,
+.dom-node.frame-node.frame-title-overlay {
   pointer-events: none;
 }
 

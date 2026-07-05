@@ -102,6 +102,17 @@ describe('CanvasNodeView markup 纯文字壳（leafer 模式，FU-11）', () => 
     expect(html).not.toContain('markup-point-handle')
   })
 
+  it('frame：纯标题壳只含 dom-frame-title——盒体（底色/虚线框）由 Leafer 真画不出现在 DOM（FU-12）', () => {
+    const html = renderNodeView(
+      markupNode({ type: 'frame', markupKind: undefined, title: 'Section 1', width: 560, height: 320 }),
+    )
+    expect(html).toContain('frame-title-overlay')
+    expect(html).toContain('dom-frame-title')
+    expect(html).toContain('Section 1')
+    expect(html).not.toContain('dom-frame-node')
+    expect(html).not.toContain('node-handle')
+  })
+
   it('非 Leafer 真画类型（text 节点）不受影响：leafer 模式下仍全量 DOM 渲染', () => {
     const html = renderNodeView(
       markupNode({ type: 'text', markupKind: undefined, text: 'plain' }),
