@@ -25,7 +25,7 @@ vi.mock('../lib/useResolvedAssetUrl', () => ({
   useResolvedAssetUrl: (...a: unknown[]) => useResolvedAssetUrlMock(...a as [string | undefined]),
 }))
 vi.mock('../lib/useImageNaturalSize', () => ({
-  useImageNaturalSize: (...a: unknown[]) => useImageNaturalSizeMock(...a as [string | undefined, unknown]),
+  useImageNaturalSize: (...a: unknown[]) => useImageNaturalSizeMock(a[0] as string | undefined),
 }))
 vi.mock('../store/debugLogStore', () => ({ debugLogger: { warn: vi.fn(), log: vi.fn() } }))
 
@@ -43,7 +43,7 @@ describe('useMaskEditOverlay — P1: original assetUrl (not resolved blob) to us
 
     // P1: useImageNaturalSize receives the original local:// URL (decodable via IDB),
     // NOT the resolved blob: URL (non-imported → getImageMetrics returns undefined).
-    expect(useImageNaturalSizeMock).toHaveBeenCalledWith('mivo-asset:abc', undefined)
-    expect(useImageNaturalSizeMock).not.toHaveBeenCalledWith('blob:mivo-asset:abc', undefined)
+    expect(useImageNaturalSizeMock).toHaveBeenCalledWith('mivo-asset:abc')
+    expect(useImageNaturalSizeMock).not.toHaveBeenCalledWith('blob:mivo-asset:abc')
   })
 })
