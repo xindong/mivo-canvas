@@ -128,6 +128,14 @@ export const isEditingTarget = (target: EventTarget | null) => {
   return Boolean(target.closest('input, textarea, select, [contenteditable="true"]'))
 }
 
+/** 全局 cmd/ctrl+C/X 是否应放行给浏览器:窗口存在未折叠的文字选区(如 chat 气泡
+ *  里选中的文本)时,系统复制优先于画布节点复制。这种"选中了文字但焦点在 body"
+ *  的场景 keydown target 不在可编辑元素内,isEditingTarget 覆盖不到;画布节点文本
+ *  (.dom-node 系)均为 user-select: none,不会产生这类选区,画布快捷键不受影响。 */
+export const hasActiveTextSelection = (
+  selection: Pick<Selection, 'isCollapsed'> | null = typeof window === 'undefined' ? null : window.getSelection(),
+) => Boolean(selection && !selection.isCollapsed)
+
 export const isCanvasUiTarget = (target: EventTarget | null) => {
   // Phase 1b-4 correction: 同 shouldStartCanvasSurfaceInteraction,用 instanceof Element
   // 接受 SVGElement,否则 UI 容器(如 .node-handle)内的 SVG 图标会因 instanceof HTMLElement

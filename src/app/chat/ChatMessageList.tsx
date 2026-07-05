@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef } from 'react'
-import { RefreshCw } from 'lucide-react'
+import { Copy, RefreshCw } from 'lucide-react'
+import { copyPromptText } from './copyPromptText'
 import { useChatStore } from '../../store/chatStore'
 import { useCanvasStore } from '../../store/canvasStore'
 import { retryMaskEditMessage } from '../../store/chatMaskEditFlow'
@@ -73,7 +74,18 @@ export function ChatMessageList({ sceneId }: ChatMessageListProps) {
         if (message.role === 'user') {
           return (
             <div key={message.id} className="chat-message chat-message-user">
-              <div className="chat-bubble chat-bubble-user">{message.text}</div>
+              <div className="chat-message-user-stack">
+                <div className="chat-bubble chat-bubble-user">{message.text}</div>
+                <button
+                  type="button"
+                  className="chat-copy-prompt-btn"
+                  onClick={() => void copyPromptText(message.text)}
+                  aria-label="复制提示词"
+                  title="复制提示词"
+                >
+                  <Copy size={13} />
+                </button>
+              </div>
             </div>
           )
         }

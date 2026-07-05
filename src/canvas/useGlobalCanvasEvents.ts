@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react'
 import type { RuntimeCanvasTool } from './canvasInteraction'
 import type { SnapGuide } from './canvasGeometry'
-import { isEditingTarget } from './canvasInteraction'
+import { hasActiveTextSelection, isEditingTarget } from './canvasInteraction'
 import { toolForKeyboardShortcut } from './canvasToolRegistry'
 import { importImageFileToCanvas } from '../lib/canvasAssetImport'
 import { useCanvasStore } from '../store/canvasStore'
@@ -177,12 +177,15 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
       }
 
       if (modifier && key === 'c') {
+        // 有活动文字选区(chat 气泡等)→ 放行系统复制;preventDefault 会吞掉它。
+        if (hasActiveTextSelection()) return
         event.preventDefault()
         store.copySelectedNodes()
         return
       }
 
       if (modifier && key === 'x') {
+        if (hasActiveTextSelection()) return
         event.preventDefault()
         store.cutSelectedNodes()
         return
