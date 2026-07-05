@@ -57,3 +57,46 @@ export const layerName = (layer: Layer): string => {
       return 'unknown'
   }
 }
+
+// CSS variable name (declared in App.css :root) for each layer. App.css defines:
+//   :root {
+//     --layer-frame: 0; --layer-content: 10; --layer-selected-elevated: 20;
+//     --layer-preview: 30; --layer-handles: 40; --layer-floating-ui: 50;
+//     --layer-edit-overlay: 60;
+//   }
+// Canvas-layer rules use `z-index: var(--layer-handles)` so DOM z-order reads from
+// the same source as layerZIndex() (inline styles) and RenderNode.layer (hit-test).
+// Keep the :root values in App.css in sync with the Layer enum above.
+export const LayerCssVar = {
+  Frame: '--layer-frame',
+  Content: '--layer-content',
+  SelectedElevated: '--layer-selected-elevated',
+  Preview: '--layer-preview',
+  Handles: '--layer-handles',
+  FloatingUI: '--layer-floating-ui',
+  EditOverlay: '--layer-edit-overlay',
+} as const
+
+// `var(...)` expression for a layer — for CSS-in-JS / dynamic stylesheets that want
+// the indirection. Inline React styles should use layerZIndex() (numeric) instead,
+// so the value is available without a CSS variable lookup.
+export const layerCssVar = (layer: Layer): string => {
+  switch (layer) {
+    case Layer.Frame:
+      return `var(${LayerCssVar.Frame})`
+    case Layer.Content:
+      return `var(${LayerCssVar.Content})`
+    case Layer.SelectedElevated:
+      return `var(${LayerCssVar.SelectedElevated})`
+    case Layer.Preview:
+      return `var(${LayerCssVar.Preview})`
+    case Layer.Handles:
+      return `var(${LayerCssVar.Handles})`
+    case Layer.FloatingUI:
+      return `var(${LayerCssVar.FloatingUI})`
+    case Layer.EditOverlay:
+      return `var(${LayerCssVar.EditOverlay})`
+    default:
+      return `var(${LayerCssVar.Content})`
+  }
+}

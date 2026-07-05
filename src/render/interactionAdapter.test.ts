@@ -1,20 +1,28 @@
 import { describe, expect, it } from 'vitest'
 import type { RenderNode } from './projection'
+import { Layer } from './layers'
 import { isEditStateActive, resolveHitTarget } from './interactionAdapter'
 
-const makeNode = (overrides: Partial<RenderNode> & { id: string }): RenderNode => ({
-  type: 'image',
-  status: 'ready',
-  title: 'n',
-  geometry: { x: 0, y: 0, width: 100, height: 100, rotation: 0 },
-  hidden: false,
-  locked: false,
-  favorited: false,
-  selected: false,
-  fills: [],
-  strokes: [],
-  ...overrides,
-})
+const makeNode = (overrides: Partial<RenderNode> & { id: string }): RenderNode => {
+  // Default layer mirrors projectNode: frame → Layer.Frame; else → Layer.Content.
+  const type = overrides.type ?? 'image'
+  return {
+    type: 'image',
+    status: 'ready',
+    title: 'n',
+    geometry: { x: 0, y: 0, width: 100, height: 100, rotation: 0 },
+    hidden: false,
+    locked: false,
+    favorited: false,
+    selected: false,
+    layer: type === 'frame' ? Layer.Frame : Layer.Content,
+    renderOrder: 0,
+    surface: 'canvas',
+    fills: [],
+    strokes: [],
+    ...overrides,
+  }
+}
 
 describe('isEditStateActive', () => {
   it('is false when no edit state', () => {

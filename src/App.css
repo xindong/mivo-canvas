@@ -22,6 +22,18 @@
   --radius-lg: 16px;
   --radius-pill: 999px;
   --shadow: 0 18px 48px rgba(35, 35, 35, 0.12);
+
+  /* P3-0b z-order layers — single source for canvas-layer z-index. Keep in sync
+     with src/render/layers.ts (Layer enum + LayerCssVar). Canvas-layer rules use
+     `z-index: var(--layer-*)`. Values are the enum's stable bucket values; rules
+     whose current z-index does not align to a bucket stay on a literal until 2b-3. */
+  --layer-frame: 0;
+  --layer-content: 10;
+  --layer-selected-elevated: 20;
+  --layer-preview: 30;
+  --layer-handles: 40;
+  --layer-floating-ui: 50;
+  --layer-edit-overlay: 60;
 }
 
 .mivo-app {
@@ -3911,7 +3923,7 @@ button:disabled {
 }
 
 .dom-node.selected {
-  z-index: 20;
+  z-index: var(--layer-selected-elevated);
   outline: var(--node-selection-stroke, 2px) solid var(--violet);
   box-shadow:
     0 0 0 4px rgba(105, 87, 232, 0.18),
@@ -4072,14 +4084,14 @@ button:disabled {
 }
 
 .dom-node.frame-node {
-  z-index: 0;
+  z-index: var(--layer-frame);
   min-width: 180px;
   min-height: 120px;
   box-shadow: none;
 }
 
 .dom-node.frame-node.selected {
-  z-index: 0;
+  z-index: var(--layer-frame);
   outline: var(--node-selection-stroke, 2px) solid #159bff;
   box-shadow: 0 0 0 4px rgba(105, 87, 232, 0.08);
 }
@@ -4831,7 +4843,7 @@ button:disabled {
 }
 
 .text-format-toolbar {
-  z-index: 40;
+  z-index: var(--layer-handles);
   gap: 3px;
 }
 

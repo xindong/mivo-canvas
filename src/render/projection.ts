@@ -38,6 +38,7 @@ import type {
 } from '../types/mivoCanvas'
 import type { ImageDimensions } from '../lib/imageSizing'
 import { normalizeCanvasNodeV2 } from '../model/documentModelV2'
+import { Layer } from './layers'
 import type { ViewportMatrix } from './viewportMatrix'
 
 // --- Render types (renderer consumes; never MivoCanvasNode directly) ---------
@@ -86,6 +87,12 @@ export type RenderGeneration = {
   maskBounds?: CanvasMaskBounds
 }
 
+// Surface a node paints on. 'canvas' = inside the viewport transform (pan/zoom
+// applies); 'overlay' = screen-space, above the canvas layer (anchor marks, edit-
+// state overlays). The DOM overlay + Leafer child order + hit-test all read this
+// from the projection so the three surfaces stay in sync from one source.
+export type RenderSurface = 'canvas' | 'overlay'
+
 export type RenderNode = {
   id: string
   type: CanvasNodeType
@@ -97,6 +104,26 @@ export type RenderNode = {
   favorited: boolean
   /** Projected from selection state (ProjectionContext.selectedNodeIds). */
   selected: boolean
+  /**
+   * P3-0b z-order: which stable layer this node paints in. Frame → Layer.Frame;
+   * every other type → Layer.Content. The renderer (DOM zIndex + Leafer child order)
+   * and hit-test (defaultZOrderCompare) all read this so z-order has one source.
+   * Not in documentModelV2 — persistence stays free of render-layer policy.
+   */
+  layer: Layer
+  /**
+   * P3-0b z-order: within-layer stable order. Default 0; callers can set a node's
+   * renderOrder to break ties inside a layer (e.g. bring-to-front without leaving
+   * the Content layer). defaultZOrderCompare uses this as the 2nd tiebreaker.
+   */
+  renderOrder: number
+  /**
+   * P3-0b z-order: paint surface — 'canvas' (inside viewport transform) or
+   * 'overlay' (screen-space, above canvas). defaultZOrderCompare promotes overlay
+   * above canvas within the same layer. EditOverlayLayer (2b-2) is the host for
+   * overlay-surface children.
+   */
+  surface: RenderSurface
   fills: CanvasNodeFill[]
   strokes: CanvasNodeStroke[]
   effects?: CanvasNodeEffect[]
@@ -304,6 +331,14 @@ export const projectNode = (node: MivoCanvasNode, ctx?: ProjectionContext): Rend
     locked: Boolean(n.locked),
     favorited: Boolean(n.favorited),
     selected,
+    // P3-0b z-order defaults. Frame → Layer.Frame (bottom); everything else →
+    // Layer.Content. renderOrder 0 = no within-layer preference. surface 'canvas'
+    // = inside the viewport transform (the DOM .dom-canvas-layer + Leafer children).
+    // Projection owns these defaults so documentModelV2 never carries render-layer
+    // policy; the renderer + hit-test read them from RenderNode directly.
+    layer: n.type === 'frame' ? Layer.Frame : Layer.Content,
+    renderOrder: 0,
+    surface: 'canvas',
     fills: n.fills ? n.fills.map(cloneFill) : [],
     strokes: n.strokes ? n.strokes.map(cloneStroke) : [],
   }
