@@ -6,19 +6,24 @@ import { isEngineLodRequested } from './engineLodMode'
  * 0b spike — Phase 2b 正式化时按 phase2b-adapter-camera-zorder.md 重构。
  *
  * leafer 模式下 image / frame / markup shape(rect/ellipse/note) /
- * markup line/arrow(含 connector、derivation edge) 由 Leafer 真画，
- * 不再渲染 DOM 节点。其余类型（text / markdown / ai-slot / task-placeholder /
- * markup brush/stamp 等）继续走 DOM。
+ * markup line/arrow(含 connector、derivation edge) / markup brush/stamp
+ * 由 Leafer 真画，不再渲染 DOM 节点。其余类型（text / markdown / ai-slot /
+ * task-placeholder 等）继续走 DOM。
  *
  * Phase 4a 把 shape 集从 spike 的 markup-rect 扩到 rect/ellipse/note（frame 已在
- * 0b 集内）；Phase 4b 加入 line/arrow/connector；brush/stamp 归 4c，静态文本归
- * Phase 5。
+ * 0b 集内）；Phase 4b 加入 line/arrow/connector；Phase 4c 加入 brush/stamp；
+ * 静态文本归 Phase 5。
  *
  * 已知取舍（Phase 5 前）：markup 的文字层（MarkupTextLayer —— note 的正文、
  * rect/ellipse 的标注文字、line/arrow 的线上 label）随 DOM 节点一起被过滤，
  * leafer 模式下暂不可见/不可编辑 —— 与 spike 已有的 markup-rect 行为一致，
  * Phase 5 静态文本 spike 决定去向。line/arrow 因此也不画 label 缺口
  * （leaferLinePaint.ts 画完整单段线）。
+ *
+ * 4c 已知取舍：stamp 的 just-placed 落地动画（stamp-pop 弹跳 + impact 放射线，
+ * App.css DOM-only 转瞬效果）在 leafer 模式暂不复现 —— 与 note 文本层同级的
+ * 接受损失；绘制中的 brush 预览是 MivoCanvas 的 overlay SVG（非节点），两种
+ * 模式都保持 DOM，落笔成节点后才由 Leafer 接手。
  */
 
 /** Phase 4a shape 集：frame(section) + markup rect/ellipse/note。
@@ -35,8 +40,16 @@ export const isLeaferShapePaintedNode = (node: MivoCanvasNode): boolean =>
 export const isLeaferLinePaintedNode = (node: MivoCanvasNode): boolean =>
   node.type === 'markup' && (node.markupKind === 'line' || node.markupKind === 'arrow')
 
+/** Phase 4c brush/stamp 集：markup brush（画笔/荧光笔笔迹）+ stamp（图章）。
+ *  leaferBrushStampPaint.ts 消费同一谓词（filter/paint 同集约定同上）。 */
+export const isLeaferBrushStampPaintedNode = (node: MivoCanvasNode): boolean =>
+  node.type === 'markup' && (node.markupKind === 'brush' || node.markupKind === 'stamp')
+
 export const isLeaferSpikePainted = (node: MivoCanvasNode): boolean =>
-  node.type === 'image' || isLeaferShapePaintedNode(node) || isLeaferLinePaintedNode(node)
+  node.type === 'image' ||
+  isLeaferShapePaintedNode(node) ||
+  isLeaferLinePaintedNode(node) ||
+  isLeaferBrushStampPaintedNode(node)
 
 /** Pixi spike 谓词冻结在 0b 集（image/frame/markup-rect/text）：pixi 已 NO-GO
  *  （engine-combo-0g），其 paint 分支不扩 4a shape 集，避免 pixi 模式下 DOM 被

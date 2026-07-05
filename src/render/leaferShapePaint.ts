@@ -92,6 +92,57 @@ export const dashPatternFor = (strokeWidth: number): number[] => [
   strokeWidth * 1.6,
 ]
 
+const HEX_COLOR_RE = /^#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i
+const RGB_COLOR_RE = /^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*(?:,\s*([\d.]+)\s*)?\)$/i
+
+const round3 = (value: number) => Math.round(value * 1000) / 1000
+
+/**
+ * FU-10: bake a stroke opacity into the color as `rgba()`.
+ *
+ * Leafer 2.1.10 does not apply `{type:'solid', color, opacity}` opacity on a
+ * STROKE at render time (pixel-probed in PR #116: DOM #000@0.82 over beige =
+ * (40,39,37), Leafer painted (0,0,0) full-opacity), so 4a's solid-paint-object
+ * stroke rendered translucent markup borders fully opaque. Shapes carry fill +
+ * stroke on ONE object, so the 4b fix (object-level opacity — exact for a Line,
+ * which has no fill) is not available here: it would fade the fill too. Baking
+ * the alpha into the rgba color reproduces the SVG strokeOpacity semantics
+ * (stroke alpha = color alpha × strokeOpacity) without touching the fill.
+ *
+ * Supports the in-repo color forms (#rgb/#rgba/#rrggbb/#rrggbbaa, rgb()/rgba()).
+ * Anything else (named colors, hsl, gradients) falls back to the original color
+ * at full opacity — the pre-fix FU-10 behavior — and warns (fail visibly).
+ */
+export const strokeColorWithBakedOpacity = (color: string, opacity: number): string => {
+  if (opacity >= 1) return color
+  const trimmed = color.trim()
+
+  const hex = HEX_COLOR_RE.exec(trimmed)
+  if (hex) {
+    const digits = hex[1]
+    const size = digits.length <= 4 ? 1 : 2
+    const channel = (index: number) => {
+      const raw = digits.slice(index * size, index * size + size)
+      return Number.parseInt(size === 1 ? raw + raw : raw, 16)
+    }
+    const hasAlpha = digits.length === 4 || digits.length === 8
+    const baseAlpha = hasAlpha ? channel(3) / 255 : 1
+    return `rgba(${channel(0)}, ${channel(1)}, ${channel(2)}, ${round3(baseAlpha * opacity)})`
+  }
+
+  const rgb = RGB_COLOR_RE.exec(trimmed)
+  if (rgb) {
+    const baseAlpha = rgb[4] === undefined ? 1 : Number.parseFloat(rgb[4])
+    return `rgba(${rgb[1]}, ${rgb[2]}, ${rgb[3]}, ${round3(baseAlpha * opacity)})`
+  }
+
+  debugLogger.warn(
+    SOURCE,
+    `stroke opacity bake skipped for unsupported color "${color}" — painting at full opacity (FU-10 fallback)`,
+  )
+  return color
+}
+
 /** Layer a shape node paints in (2b-2 z-order): frame → Layer.Frame (bottom),
  *  markup shapes → Layer.Content — same policy projection.projectNode writes
  *  into RenderNode.layer. Exported for the hook's z-order map + tests. */
@@ -141,8 +192,8 @@ const firstVisibleStroke = (r: RenderNode) => r.strokes.find((stroke) => stroke.
  *    background ignore CanvasNodeFill.opacity (any translucency lives in the
  *    rgba color string), so Leafer does the same.
  *  - markup rect/ellipse stroke opacity = stroke.opacity ?? markupOpacity ?? 1
- *    (canvasRenderAdapter.markupRenderStyleFor), emitted as a solid stroke
- *    paint `{ type:'solid', color, opacity }` only when < 1.
+ *    (canvasRenderAdapter.markupRenderStyleFor), baked into an rgba() color
+ *    only when < 1 (FU-10 — see strokeColorWithBakedOpacity).
  *  - frame stroke has no opacity channel in the DOM (CSS border-color) →
  *    always a plain color string.
  *  - note ignores markup stroke width/style entirely (fixed 2px solid border
@@ -202,13 +253,11 @@ export const shapePaintPropsFor = (
     return props
   }
 
-  // markup rect / ellipse
+  // markup rect / ellipse — FU-10: translucent strokes bake the opacity into
+  // the rgba color (Leafer ignores solid-paint-object opacity on strokes, and
+  // object-level opacity would fade the fill too).
   const strokeOpacity = stroke?.opacity ?? r.markupOpacity ?? 1
-  props.stroke = !stroke
-    ? undefined
-    : strokeOpacity < 1
-      ? { type: 'solid', color: stroke.color, opacity: strokeOpacity }
-      : stroke.color
+  props.stroke = !stroke ? undefined : strokeColorWithBakedOpacity(stroke.color, strokeOpacity)
   if (kind === 'markup-rect') {
     props.cornerRadius = r.markupCornerRadius ?? MARKUP_RECT_CORNER_RADIUS_DEFAULT
   }
