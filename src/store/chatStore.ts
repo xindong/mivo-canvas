@@ -1,7 +1,8 @@
 import { create } from 'zustand'
-import { persist } from 'zustand/middleware'
+import { createJSONStorage, persist } from 'zustand/middleware'
 import type { EnhanceDegradedReason, EnhanceResponse, GenerationRatio, MivoImageQuality } from '../types/generation'
 import { readImportedAssetFile, saveImportedAsset } from '../lib/assetStorage'
+import { idbStateStorage } from '../lib/persistIdbStorage'
 import { MivoImageRequestError, enhanceMivoPrompt, type MivoImageRequestErrorKind } from '../lib/mivoImageClient'
 import { getModelCapabilities } from '../lib/modelCapabilities'
 import { settleCanvasGenerationLocally } from './canvasGenerationCancel'
@@ -792,6 +793,10 @@ export const useChatStore = create<ChatState>()(
     {
       name: 'mivo-chat-demo',
       version: 2,
+      // FU4-2: persist to IndexedDB alongside canvasStore. skipHydration defers to
+      // the App-layer hydration gate (no first-paint flash). migrate/merge unchanged.
+      storage: createJSONStorage(() => idbStateStorage),
+      skipHydration: true,
       partialize: (state) => ({
         messagesByScene: state.messagesByScene,
         selectedModel: state.selectedModel,
