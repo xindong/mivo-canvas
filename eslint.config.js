@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url'
 const tsconfigRootDir = dirname(fileURLToPath(import.meta.url))
 
 export default defineConfig([
-  globalIgnores(['dist', 'worktrees/**']),
+  globalIgnores(['dist', 'worktrees/**', '_tmp/**']),
   {
     files: ['**/*.{ts,tsx}'],
     extends: [

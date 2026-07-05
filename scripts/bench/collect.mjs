@@ -91,6 +91,7 @@ const parseArgs = (argv) => {
     port: DEFAULT_PORT,
     renderer: 'dom',
     culling: 'on',
+    panCache: 'off',
     seed: DEFAULT_FIXTURE_SEED,
     date: DEFAULT_DATE,
     output: undefined,
@@ -100,6 +101,7 @@ const parseArgs = (argv) => {
     mainSha: undefined,
     supersedes: undefined,
     headless: true,
+    includeDrag: true,
   }
 
   for (const entry of argv) {
@@ -136,6 +138,13 @@ const parseArgs = (argv) => {
       const value = entry.slice('--culling='.length).trim()
       if (value !== 'on' && value !== 'off') throw new Error(`Invalid --culling value: ${value} (expected on|off)`)
       options.culling = value
+      continue
+    }
+
+    if (entry.startsWith('--pan-cache=')) {
+      const value = entry.slice('--pan-cache='.length).trim()
+      if (value !== 'on' && value !== 'off') throw new Error(`Invalid --pan-cache value: ${value} (expected on|off)`)
+      options.panCache = value
       continue
     }
 
@@ -183,6 +192,11 @@ const parseArgs = (argv) => {
 
     if (entry === '--headed') {
       options.headless = false
+      continue
+    }
+
+    if (entry === '--skip-drag') {
+      options.includeDrag = false
     }
   }
 
@@ -669,7 +683,9 @@ const aggregateRuns = (runs) => {
   const longTaskTotalValues = runs.map((run) => run.overall.longTaskTotalMs)
 
   const perAction = {}
-  for (const label of ['loadFixture', 'render-sync', 'canvas-pan', 'canvas-zoom', 'canvas-drag']) {
+  const actionLabels = ['loadFixture', 'render-sync', 'canvas-pan', 'canvas-zoom']
+  if (runs.some((run) => run.actions['canvas-drag'])) actionLabels.push('canvas-drag')
+  for (const label of actionLabels) {
     const summaries = runs.map((run) => run.actions[label])
     perAction[label] = {
       p50FrameMs: median(summaries.map((summary) => summary.p50FrameMs).filter((value) => value != null)),
@@ -708,7 +724,29 @@ const aggregateRuns = (runs) => {
   }
 }
 
-const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, renderer, culling }) => {
+const readRenderState = (page) =>
+  page.evaluate(() => {
+    const shell = document.querySelector('.canvas-shell')
+    return {
+      rendererMode: shell?.getAttribute('data-renderer-mode') || 'dom',
+      cullingMode: shell?.getAttribute('data-culling-mode') || 'on',
+      totalNodeCount: Number(shell?.getAttribute('data-total-node-count') || 0),
+      renderedNodeCount: Number(shell?.getAttribute('data-rendered-node-count') || 0),
+      leaferExpectedChildren: Number(shell?.getAttribute('data-leafer-expected-children') || 0),
+      leaferChildren: Number(shell?.getAttribute('data-leafer-children') || 0),
+      leaferPixelNonEmpty: shell?.getAttribute('data-leafer-pixel-nonempty') === 'true',
+      leaferPixelSampleCount: Number(shell?.getAttribute('data-leafer-pixel-sample-count') || 0),
+      leaferSyncVersion: Number(shell?.getAttribute('data-leafer-sync-version') || 0),
+      leaferPanCacheEnabled: shell?.getAttribute('data-leafer-pan-cache-enabled') === 'true',
+      leaferPanCacheFrozen: shell?.getAttribute('data-leafer-pan-cache-frozen') === 'true',
+      leaferPanCacheCaptures: Number(shell?.getAttribute('data-leafer-pan-cache-captures') || 0),
+      leaferPanCacheLastDx: Number(shell?.getAttribute('data-leafer-pan-cache-last-dx') || 0),
+      leaferPanCacheLastDy: Number(shell?.getAttribute('data-leafer-pan-cache-last-dy') || 0),
+      viewportScale: Number(shell?.getAttribute('data-viewport-scale') || 0),
+    }
+  })
+
+const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, renderer, culling, panCache, includeDrag }) => {
   const context = await browser.newContext({
     viewport: { width: 1920, height: 1080 },
     deviceScaleFactor: dpr,
@@ -716,7 +754,7 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, rendere
   })
   const page = await context.newPage()
   await page.emulateMedia({ reducedMotion: 'reduce' })
-  const canvasUrl = `http://127.0.0.1:${port}/?renderer=${encodeURIComponent(renderer)}&culling=${encodeURIComponent(culling)}`
+  const canvasUrl = `http://127.0.0.1:${port}/?renderer=${encodeURIComponent(renderer)}&culling=${encodeURIComponent(culling)}&panCache=${encodeURIComponent(panCache)}`
   await page.goto(canvasUrl, { waitUntil: 'networkidle' })
   await page.addStyleTag({
     content: [
@@ -753,21 +791,7 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, rendere
   const renderSync = await runAction('render-sync', async () => {
     await page.evaluate((inputFixture) => globalThis.__MIVO_BENCH__.waitForRender(inputFixture), fixture)
   })
-  const renderState = await page.evaluate(() => {
-    const shell = document.querySelector('.canvas-shell')
-    return {
-      rendererMode: shell?.getAttribute('data-renderer-mode') || 'dom',
-      cullingMode: shell?.getAttribute('data-culling-mode') || 'on',
-      totalNodeCount: Number(shell?.getAttribute('data-total-node-count') || 0),
-      renderedNodeCount: Number(shell?.getAttribute('data-rendered-node-count') || 0),
-      leaferExpectedChildren: Number(shell?.getAttribute('data-leafer-expected-children') || 0),
-      leaferChildren: Number(shell?.getAttribute('data-leafer-children') || 0),
-      leaferPixelNonEmpty: shell?.getAttribute('data-leafer-pixel-nonempty') === 'true',
-      leaferPixelSampleCount: Number(shell?.getAttribute('data-leafer-pixel-sample-count') || 0),
-      leaferSyncVersion: Number(shell?.getAttribute('data-leafer-sync-version') || 0),
-      viewportScale: Number(shell?.getAttribute('data-viewport-scale') || 0),
-    }
-  })
+  const renderState = await readRenderState(page)
   // Double-check: waitForRender throws on non-settle inside the page, but assert again here so
   // a silently-skipped render or a renderer-mode/culling mismatch can never write a bogus baseline.
   if (renderState.rendererMode !== renderer) {
@@ -789,15 +813,22 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, rendere
     if (!renderState.leaferPixelNonEmpty) {
       throw new Error(`Bench Leafer evidence invalid: canvas pixel sample empty (samples=${renderState.leaferPixelSampleCount})`)
     }
+    if (panCache === 'on' && !renderState.leaferPanCacheEnabled) {
+      throw new Error('Bench Leafer pan-cache evidence invalid: requested pan-cache on but shell reports disabled')
+    }
   }
   const afterRenderHeap = await cdpSession.send('Runtime.getHeapUsage')
 
   const pan = await runAction('canvas-pan', () => panCanvas(page))
+  const afterPanRenderState = await readRenderState(page)
+  if (renderer === 'leafer' && panCache === 'on' && afterPanRenderState.leaferPanCacheCaptures < 1) {
+    throw new Error('Bench Leafer pan-cache evidence invalid: pan completed without a snapshot capture')
+  }
   const zoom = await runAction('canvas-zoom', () => zoomCanvas(page))
   // v3: canvas-drag runs AFTER pan/zoom — it mutates the store (node-move write path),
   // so running it earlier would dirty the clean fixture pan/zoom are measured on.
   // overall/gate below still aggregates ONLY pan/zoom; canvas-drag is a standalone metric.
-  const drag = await runAction('canvas-drag', () => dragNode(page))
+  const drag = includeDrag ? await runAction('canvas-drag', () => dragNode(page)) : undefined
   const afterRunHeap = await cdpSession.send('Runtime.getHeapUsage')
 
   const overall = {
@@ -819,6 +850,8 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, rendere
       actual: renderState.rendererMode,
       cullingRequested: culling,
       cullingActual: renderState.cullingMode,
+      panCacheRequested: panCache,
+      panCacheActual: renderState.leaferPanCacheEnabled ? 'on' : 'off',
     },
     fixture: {
       sceneId: fixture.meta.sceneId,
@@ -830,6 +863,7 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, rendere
     renderSyncMs: round(renderSync.summary.durationMs),
     storeToRendererSyncMs: round((load.summary.durationMs || 0) + (renderSync.summary.durationMs || 0)),
     renderState,
+    afterPanRenderState,
     heap: {
       beforeMb: round(beforeHeap.usedSize / (1024 * 1024), 3),
       afterRenderMb: round(afterRenderHeap.usedSize / (1024 * 1024), 3),
@@ -843,14 +877,14 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, rendere
       'render-sync': renderSync.summary,
       'canvas-pan': pan.summary,
       'canvas-zoom': zoom.summary,
-      'canvas-drag': drag.summary,
+      ...(drag ? { 'canvas-drag': drag.summary } : {}),
     },
     trace: {
       loadFixture: load.trace,
       'render-sync': renderSync.trace,
       'canvas-pan': pan.trace,
       'canvas-zoom': zoom.trace,
-      'canvas-drag': drag.trace,
+      ...(drag ? { 'canvas-drag': drag.trace } : {}),
     },
     overall,
   }
@@ -894,6 +928,8 @@ const main = async () => {
             port: options.port,
             renderer: options.renderer,
             culling: options.culling,
+            panCache: options.panCache,
+            includeDrag: options.includeDrag,
           })
           assertTraceMarks(run)
           runs.push(run)
@@ -916,6 +952,8 @@ const main = async () => {
         leaferExpectedChildren: result.runs[0]?.renderState?.leaferExpectedChildren,
         leaferChildren: result.runs[0]?.renderState?.leaferChildren,
         leaferPixelNonEmpty: result.runs[0]?.renderState?.leaferPixelNonEmpty,
+        leaferPanCacheEnabled: result.runs[0]?.renderState?.leaferPanCacheEnabled,
+        leaferPanCacheCaptures: result.runs[0]?.afterPanRenderState?.leaferPanCacheCaptures,
         totalNodeCount: result.runs[0]?.renderState?.totalNodeCount,
       }))
       const worstP95 = Math.max(...dprGateValues.map((result) => result.p95FrameMs ?? 0))
@@ -942,6 +980,8 @@ const main = async () => {
         rendererModeActual: configs[0]?.dprResults[0]?.runs[0]?.renderer?.actual || options.renderer,
         culling: options.culling,
         cullingModeActual: configs[0]?.dprResults[0]?.runs[0]?.renderer?.cullingActual || options.culling,
+        panCache: options.panCache,
+        panCacheActual: configs[0]?.dprResults[0]?.runs[0]?.renderer?.panCacheActual || options.panCache,
         date: options.date,
         referenceMachine: 'same-machine-only',
         browser: 'Chromium via Playwright',
@@ -951,9 +991,13 @@ const main = async () => {
         seed: options.seed,
         motion: 'prefers-reduced-motion + transition/animation disabled',
         syncMeasurement: 'replaceSnapshot(full snapshot) until expected node count / viewport settle',
-        segments: ['loadFixture', 'render-sync', 'canvas-pan', 'canvas-zoom', 'canvas-drag'],
+        segments: options.includeDrag
+          ? ['loadFixture', 'render-sync', 'canvas-pan', 'canvas-zoom', 'canvas-drag']
+          : ['loadFixture', 'render-sync', 'canvas-pan', 'canvas-zoom'],
         heapMeasurements: ['before-load', 'after-render', 'after-run'],
-        traceMarks: ['loadFixture', 'render-sync', 'canvas-pan', 'canvas-zoom', 'canvas-drag'],
+        traceMarks: options.includeDrag
+          ? ['loadFixture', 'render-sync', 'canvas-pan', 'canvas-zoom', 'canvas-drag']
+          : ['loadFixture', 'render-sync', 'canvas-pan', 'canvas-zoom'],
         ...(options.mainSha ? { mainSha: options.mainSha } : {}),
       },
       note: options.note,

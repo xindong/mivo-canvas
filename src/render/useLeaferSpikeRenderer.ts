@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Image, Rect, Leafer } from 'leafer-ui'
 import '@leafer-in/view'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
@@ -29,6 +29,11 @@ type LeaferSpikeStats = {
   pixelNonEmpty: boolean
   pixelSampleCount: number
   syncVersion: number
+  panCacheEnabled: boolean
+  panCacheFrozen: boolean
+  panCacheCaptures: number
+  panCacheLastDeltaX: number
+  panCacheLastDeltaY: number
 }
 
 type LeaferSpikeProbeNode = {
@@ -53,6 +58,17 @@ const EMPTY_STATS: LeaferSpikeStats = {
   pixelNonEmpty: false,
   pixelSampleCount: 0,
   syncVersion: 0,
+  panCacheEnabled: false,
+  panCacheFrozen: false,
+  panCacheCaptures: 0,
+  panCacheLastDeltaX: 0,
+  panCacheLastDeltaY: 0,
+}
+
+const parsePanCacheEnabled = () => {
+  if (typeof window === 'undefined' || typeof window.location === 'undefined') return false
+  const value = new URLSearchParams(window.location.search).get('panCache')
+  return value === 'on' || value === 'true' || value === '1'
 }
 
 const leaferSpikePaintProps = (node: MivoCanvasNode) => {
@@ -130,23 +146,36 @@ const sampleNonEmptyCanvasPixels = (host: HTMLDivElement | null) => {
   return { nonEmpty: false, sampleCount }
 }
 
+const leaferCanvasFor = (host: HTMLDivElement | null): HTMLCanvasElement | null => host?.querySelector('canvas') || null
+
 export const useLeaferSpikeRenderer = ({
   hostRef,
   viewport,
   nodes,
   rendererMode,
+  isPanning,
 }: {
   hostRef: React.MutableRefObject<HTMLDivElement | null>
   viewport: ViewportState
   nodes: MivoCanvasNode[]
   rendererMode: RendererMode
+  isPanning: boolean
 }): LeaferSpikeStats => {
   const leaferRef = useRef<Leafer | null>(null)
   const paintedRef = useRef<Map<string, PaintedEntry>>(new Map())
   const signatureRef = useRef<Map<string, string>>(new Map())
   const statsRef = useRef<LeaferSpikeStats>(EMPTY_STATS)
+  const panCacheEnabled = useMemo(() => parsePanCacheEnabled(), [])
+  const frozenViewportRef = useRef<ViewportState | null>(null)
+  const frozenCanvasRef = useRef<HTMLCanvasElement | null>(null)
+  const panCacheCapturesRef = useRef(0)
+  const panCacheLastDeltaRef = useRef({ x: 0, y: 0 })
+  const panCacheEndTimerRef = useRef<number | undefined>(undefined)
   const [leaferReady, setLeaferReady] = useState(false)
-  const [stats, setStats] = useState<LeaferSpikeStats>(EMPTY_STATS)
+  const [stats, setStats] = useState<LeaferSpikeStats>({
+    ...EMPTY_STATS,
+    panCacheEnabled,
+  })
   const [, setStoreNodeVersion] = useState(0)
 
   const paintedNodes = useMemo(() => nodes.filter(isLeaferSpikePainted), [nodes])
@@ -155,18 +184,32 @@ export const useLeaferSpikeRenderer = ({
     [paintedNodes],
   )
 
-  const publishStats = (next: LeaferSpikeStats) => {
+  const publishStats = useCallback((next: LeaferSpikeStats) => {
     statsRef.current = next
     setStats((current) =>
       current.expectedChildren === next.expectedChildren &&
       current.children === next.children &&
       current.pixelNonEmpty === next.pixelNonEmpty &&
       current.pixelSampleCount === next.pixelSampleCount &&
-      current.syncVersion === next.syncVersion
+      current.syncVersion === next.syncVersion &&
+      current.panCacheEnabled === next.panCacheEnabled &&
+      current.panCacheFrozen === next.panCacheFrozen &&
+      current.panCacheCaptures === next.panCacheCaptures &&
+      current.panCacheLastDeltaX === next.panCacheLastDeltaX &&
+      current.panCacheLastDeltaY === next.panCacheLastDeltaY
         ? current
         : next,
     )
-  }
+  }, [])
+
+  const publishPanCacheStats = useCallback((patch: Partial<LeaferSpikeStats>) => {
+    publishStats({
+      ...statsRef.current,
+      panCacheEnabled,
+      panCacheCaptures: panCacheCapturesRef.current,
+      ...patch,
+    })
+  }, [panCacheEnabled, publishStats])
 
   // Bench fixture injection calls replaceSnapshot from outside React. Subscribe to the store so
   // Leafer gets a deterministic sync pass after node content changes, independent of mount timing.
@@ -187,6 +230,7 @@ export const useLeaferSpikeRenderer = ({
     const host = hostRef.current
     const painted = paintedRef.current
     const signatures = signatureRef.current
+    const cacheEnabled = panCacheEnabled
     let raf = 0
     let resizeObserver: ResizeObserver | null = null
     let leafer: Leafer | null = null
@@ -232,13 +276,23 @@ export const useLeaferSpikeRenderer = ({
       setLeaferReady(false)
       painted.clear()
       signatures.clear()
-      publishStats(EMPTY_STATS)
+      window.clearTimeout(panCacheEndTimerRef.current)
+      if (frozenCanvasRef.current) frozenCanvasRef.current.style.transform = ''
+      if (frozenCanvasRef.current) {
+        delete frozenCanvasRef.current.dataset.panCacheFrozen
+        delete frozenCanvasRef.current.dataset.panCacheFrozenX
+        delete frozenCanvasRef.current.dataset.panCacheFrozenY
+      }
+      frozenCanvasRef.current = null
+      frozenViewportRef.current = null
+      publishStats({ ...EMPTY_STATS, panCacheEnabled: cacheEnabled })
     }
-  }, [hostRef])
+  }, [hostRef, panCacheEnabled, publishStats])
 
   // Camera sync (leafer only, 单向 React → zoomLayer.set; D1 禁反向监听 zoomLayer.__).
   useEffect(() => {
     if (!leaferReady || rendererMode !== 'leafer') return
+    if (panCacheEnabled && frozenCanvasRef.current) return
     const leafer = leaferRef.current
     if (!leafer) return
     leafer.zoomLayer.set({
@@ -247,7 +301,69 @@ export const useLeaferSpikeRenderer = ({
       scaleX: viewport.scale,
       scaleY: viewport.scale,
     })
-  }, [leaferReady, rendererMode, viewport.x, viewport.y, viewport.scale])
+  }, [leaferReady, panCacheEnabled, rendererMode, viewport.x, viewport.y, viewport.scale])
+
+  useEffect(() => {
+    if (!leaferReady || rendererMode !== 'leafer' || !panCacheEnabled) return
+
+    const host = hostRef.current
+    if (isPanning) {
+      window.clearTimeout(panCacheEndTimerRef.current)
+      if (!frozenCanvasRef.current) {
+        frozenCanvasRef.current = leaferCanvasFor(host)
+        if (frozenCanvasRef.current) {
+          frozenCanvasRef.current.style.transformOrigin = '0 0'
+          frozenCanvasRef.current.dataset.panCacheFrozen = 'true'
+          frozenCanvasRef.current.dataset.panCacheFrozenX = String(viewport.x)
+          frozenCanvasRef.current.dataset.panCacheFrozenY = String(viewport.y)
+          frozenViewportRef.current = { ...viewport }
+          panCacheCapturesRef.current += 1
+          publishPanCacheStats({ panCacheFrozen: true, panCacheLastDeltaX: 0, panCacheLastDeltaY: 0 })
+        }
+      }
+    } else if (frozenCanvasRef.current) {
+      window.clearTimeout(panCacheEndTimerRef.current)
+      panCacheEndTimerRef.current = window.setTimeout(() => {
+        if (frozenCanvasRef.current) {
+          frozenCanvasRef.current.style.transform = ''
+          delete frozenCanvasRef.current.dataset.panCacheFrozen
+          delete frozenCanvasRef.current.dataset.panCacheFrozenX
+          delete frozenCanvasRef.current.dataset.panCacheFrozenY
+        }
+        frozenCanvasRef.current = null
+        frozenViewportRef.current = null
+        const leafer = leaferRef.current
+        if (leafer) {
+          leafer.zoomLayer.set({
+            x: viewport.x,
+            y: viewport.y,
+            scaleX: viewport.scale,
+            scaleY: viewport.scale,
+          })
+        }
+        publishPanCacheStats({
+          panCacheFrozen: false,
+          panCacheLastDeltaX: panCacheLastDeltaRef.current.x,
+          panCacheLastDeltaY: panCacheLastDeltaRef.current.y,
+        })
+      }, 150)
+    }
+
+    return () => window.clearTimeout(panCacheEndTimerRef.current)
+  }, [hostRef, isPanning, leaferReady, panCacheEnabled, publishPanCacheStats, rendererMode, viewport])
+
+  useEffect(() => {
+    const snapshot = frozenCanvasRef.current
+    const frozenViewport = frozenViewportRef.current
+    if (!snapshot || !frozenViewport) return
+    const dx = viewport.x - frozenViewport.x
+    const dy = viewport.y - frozenViewport.y
+    snapshot.style.transform = `translate(${dx}px, ${dy}px)`
+    panCacheLastDeltaRef.current = {
+      x: Math.round(dx * 1000) / 1000,
+      y: Math.round(dy * 1000) / 1000,
+    }
+  }, [viewport.x, viewport.y])
 
   // Paint (leafer only, diff add/update/remove).
   useEffect(() => {
@@ -264,7 +380,7 @@ export const useLeaferSpikeRenderer = ({
         painted.clear()
         signatures.clear()
       }
-      queueMicrotask(() => publishStats(EMPTY_STATS))
+      queueMicrotask(() => publishStats({ ...EMPTY_STATS, panCacheEnabled }))
       return
     }
 
@@ -297,11 +413,14 @@ export const useLeaferSpikeRenderer = ({
 
     const syncVersion = statsRef.current.syncVersion + 1
     publishStats({
+      ...statsRef.current,
       expectedChildren: paintedNodes.length,
       children: countLeaferChildren(leafer),
       pixelNonEmpty: false,
       pixelSampleCount: 0,
       syncVersion,
+      panCacheEnabled,
+      panCacheCaptures: panCacheCapturesRef.current,
     })
 
     let cancelled = false
@@ -311,11 +430,14 @@ export const useLeaferSpikeRenderer = ({
         if (cancelled) return
         const sample = sampleNonEmptyCanvasPixels(hostRef.current)
         publishStats({
+          ...statsRef.current,
           expectedChildren: paintedNodes.length,
           children: countLeaferChildren(leaferRef.current),
           pixelNonEmpty: sample.nonEmpty,
           pixelSampleCount: sample.sampleCount,
           syncVersion,
+          panCacheEnabled,
+          panCacheCaptures: panCacheCapturesRef.current,
         })
         attempts += 1
         if (!sample.nonEmpty && attempts < 30) {
@@ -327,7 +449,7 @@ export const useLeaferSpikeRenderer = ({
     return () => {
       cancelled = true
     }
-  }, [hostRef, leaferReady, rendererMode, paintedNodes, paintedNodeSignature])
+  }, [hostRef, leaferReady, panCacheEnabled, paintedNodes, paintedNodeSignature, publishStats, rendererMode])
 
   useEffect(() => {
     window.__MIVO_LEAFER_SPIKE__ = {

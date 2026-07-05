@@ -374,7 +374,7 @@ export function MivoCanvas({
     return () => onRegisterExternalAssetDrop?.(undefined)
   }, [importLocalAssetAtClientPoint, onRegisterExternalAssetDrop])
 
-  const leaferSpikeStats = useLeaferSpikeRenderer({ hostRef, viewport, nodes: visibleNodes, rendererMode })
+  const leaferSpikeStats = useLeaferSpikeRenderer({ hostRef, viewport, nodes: visibleNodes, rendererMode, isPanning })
 
   useEffect(() => {
     const shell = shellRef.current
@@ -474,9 +474,7 @@ export function MivoCanvas({
         stampToolActive ? 'stamp-tool' : ''
       } ${maskArmed ? 'mask-armed' : ''}`}
       aria-label="Mivo Canvas" data-renderer-mode={rendererMode} data-culling-mode={cullingMode}
-      data-viewport-scale={viewport.scale}
-      data-viewport-x={viewport.x}
-      data-viewport-y={viewport.y}
+      data-viewport-scale={viewport.scale} data-viewport-x={viewport.x} data-viewport-y={viewport.y}
       data-rendered-node-count={renderedNodes.length}
       data-total-node-count={visibleNodes.length}
       data-leafer-expected-children={leaferSpikeStats.expectedChildren}
@@ -484,6 +482,7 @@ export function MivoCanvas({
       data-leafer-pixel-nonempty={leaferSpikeStats.pixelNonEmpty ? 'true' : 'false'}
       data-leafer-pixel-sample-count={leaferSpikeStats.pixelSampleCount}
       data-leafer-sync-version={leaferSpikeStats.syncVersion}
+      data-leafer-pan-cache-enabled={leaferSpikeStats.panCacheEnabled ? 'true' : 'false'} data-leafer-pan-cache-frozen={leaferSpikeStats.panCacheFrozen ? 'true' : 'false'} data-leafer-pan-cache-captures={leaferSpikeStats.panCacheCaptures} data-leafer-pan-cache-last-dx={leaferSpikeStats.panCacheLastDeltaX} data-leafer-pan-cache-last-dy={leaferSpikeStats.panCacheLastDeltaY}
       ref={shellRef}
       onWheel={handleWheel}
       onPointerDown={wrapCanvasPointerDown}
