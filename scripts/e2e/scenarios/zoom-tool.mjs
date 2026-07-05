@@ -1,4 +1,4 @@
-const DEFAULT_VIEWPORT = { x: 420, y: 240, scale: 1 }
+const DEFAULT_VIEWPORT = { x: 688, y: 240, scale: 1 } // 全铺后默认视口 x=688(旧 420+旧列宽 268)
 const MIN_SCALE = 0.08
 const MAX_SCALE = 4
 const KEYBOARD_ZOOM_FACTOR = 1.12

@@ -196,7 +196,7 @@ export const runArchiveAssetsScenario = async (context) => {
         bubbles: true,
         cancelable: true,
         dataTransfer: transfer,
-        clientX: rect.left + rect.width / 2,
+        clientX: rect.left + rect.width / 2 + 134, // 画布全铺后 shell 中心左移 134px,补偿回旧屏幕落点,避免导入节点压进顶部标题条拦截区
         clientY: rect.top + rect.height / 2,
       }),
     )
@@ -249,8 +249,9 @@ export const runArchiveAssetsScenario = async (context) => {
   ) {
     throw new Error(`Multi-format imports should render Markdown, PDF, and Video nodes: ${JSON.stringify(importedFileNodes)}`)
   }
+  // 画布全铺(2026-07-05):shell 从 x=0 起,x<268 被浮动侧栏卡片覆盖,空白点击右移出卡片区。
 
-  await page.locator('.canvas-shell').click({ position: { x: 12, y: 820 } })
+  await page.locator('.canvas-shell').click({ position: { x: 300, y: 820 } })
   await page.locator('.dom-node.markdown-node').click({ position: { x: 20, y: 20 } })
   if ((await page.locator('.selection-quick-toolbar').count()) !== 0) {
     throw new Error('Markdown selection should not show a download-only quick toolbar')
@@ -280,7 +281,7 @@ export const runArchiveAssetsScenario = async (context) => {
   if ((await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Download original' }).count()) !== 1) {
     throw new Error('PDF selection should keep the original-file download quick action')
   }
-  await page.locator('.canvas-shell').click({ position: { x: 12, y: 820 } })
+  await page.locator('.canvas-shell').click({ position: { x: 300, y: 820 } })
 
   await page.locator('.dom-node.markdown-node').dblclick({ position: { x: 20, y: 20 } })
   await page.getByRole('dialog', { name: 'Asset details' }).waitFor()
@@ -312,7 +313,7 @@ export const runArchiveAssetsScenario = async (context) => {
     throw new Error('PDF details should render a blob-backed document viewer')
   }
   await page.getByRole('button', { name: 'Close details' }).click()
-  await page.locator('.canvas-shell').click({ position: { x: 12, y: 820 } })
+  await page.locator('.canvas-shell').click({ position: { x: 300, y: 820 } })
   await page.locator('.dom-node.video-node').dblclick({ position: { x: 20, y: 20 } })
   await page.getByRole('dialog', { name: 'Asset details' }).waitFor()
   if ((await page.locator('video.node-preview-video[src^="blob:"]').count()) !== 1) {
@@ -346,7 +347,7 @@ export const runArchiveAssetsScenario = async (context) => {
         bubbles: true,
         cancelable: true,
         dataTransfer: transfer,
-        clientX: rect.left + rect.width / 2 + 260,
+        clientX: rect.left + rect.width / 2 + 260 + 134, // 同上:全铺补偿
         clientY: rect.top + rect.height / 2,
       }),
     )

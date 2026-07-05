@@ -919,6 +919,9 @@ export const runShellSidebarScenario = async (context) => {
       `Pinning an already-peeked drawer should keep canvas layout motion but not replay the drawer slide: ${JSON.stringify(pinningMotion)}`,
     )
   }
+  // 旧断言→新断言(2026-07-05 画布全铺):旧布局 pin 落定后 workspace 被 grid 列推回
+  // 右侧(left>200);新布局画布恒全铺、侧栏 fixed 浮其上,pin 落定后 workspace 保持
+  // left=0 全宽,侧栏卡片仍在 gap 位且展开(width>200)。
   await page.waitForFunction(() => {
     const sidebar = document.querySelector('.project-sidebar')
     const workspace = document.querySelector('.workspace')
@@ -929,7 +932,7 @@ export const runShellSidebarScenario = async (context) => {
       !sidebar.classList.contains('closed') &&
       sidebar.getBoundingClientRect().width > 200 &&
       workspace &&
-      workspace.getBoundingClientRect().left > 200
+      Math.abs(workspace.getBoundingClientRect().left) < 0.5
     )
   })
 }

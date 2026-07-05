@@ -234,9 +234,9 @@ export const runChatGenerationScenario = async (context) => {
   if (!shellBoxForResultFocus) throw new Error('Canvas shell should be measurable for result focus check')
   await page.getByRole('button', { name: 'Hand' }).click()
   const viewportBeforePan = await readViewport(page)
-  await page.mouse.move(shellBoxForResultFocus.x + 140, shellBoxForResultFocus.y + 140)
+  await page.mouse.move(shellBoxForResultFocus.x + 408, shellBoxForResultFocus.y + 140)
   await page.mouse.down()
-  await page.mouse.move(shellBoxForResultFocus.x + 320, shellBoxForResultFocus.y + 260)
+  await page.mouse.move(shellBoxForResultFocus.x + 588, shellBoxForResultFocus.y + 260 /* 全铺补偿:起终点 x+268,旧屏幕轨迹不变 */)
   await page.mouse.up()
   const viewportBeforeLocate = await waitForViewport(
     page,
