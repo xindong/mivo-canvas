@@ -398,6 +398,113 @@ describe('enhance', () => {
     expect(body.replyText).toContain('猫')
     expect(body.enhanced).toBe(true)
   })
+
+  it('edit intent: edit-specific system prompt + px user content + generate mode response', async () => {
+    // mask-chat-card Step 2: intent='edit' routes through edit system prompt
+    // (preserve/unmasked) and edit user content (source pixel space, "px",
+    // never "normalized"). Response shape unchanged — still mode/richPrompt.
+    const r = await req(
+      '/api/mivo/enhance',
+      jsonReq({
+        prompt: 'change the cape to red',
+        intent: 'edit',
+        editContext: {
+          sourceTitle: 'hero-001',
+          hasMask: true,
+          maskKind: 'bounds',
+          maskBoundsPx: { x: 720, y: 0, width: 160, height: 200 },
+          sourceSize: { width: 1024, height: 1024 },
+        },
+        modelId: 'gpt-image-2',
+      }),
+    )
+    expect(r.status).toBe(200)
+    const body = r.body as { mode: string; richPrompt: string; enhanced: boolean }
+    expect(body.mode).toBe('generate')
+    expect(body.richPrompt).toBe('rich')
+    expect(body.enhanced).toBe(true)
+    expect(mockState.enhanceCalls).toBe(1) // primary succeeds, no fallback
+    // edit-specific system prompt rules
+    expect(mockState.lastEnhanceBodyText).toContain('preserve')
+    expect(mockState.lastEnhanceBodyText).toContain('unmasked')
+    // user content carries source pixel space marker, never "normalized"
+    expect(mockState.lastEnhanceBodyText).toContain('px')
+    expect(mockState.lastEnhanceBodyText).not.toContain('normalized')
+    // edit user content structure
+    expect(mockState.lastEnhanceBodyText).toContain('Edit instruction: change the cape to red')
+    expect(mockState.lastEnhanceBodyText).toContain('Source title: hero-001')
+    expect(mockState.lastEnhanceBodyText).toContain('Mask: bounds')
+    expect(mockState.lastEnhanceBodyText).toContain('Mask bounds (px, in source image space): 720,0,160,200')
+    expect(mockState.lastEnhanceBodyText).toContain('Source size: 1024x1024 px')
+  })
+
+  it('edit intent without maskBoundsPx/sourceSize omits those lines (no fabrication)', async () => {
+    const r = await req(
+      '/api/mivo/enhance',
+      jsonReq({
+        prompt: 'brighten the whole image',
+        intent: 'edit',
+        editContext: { sourceTitle: 'scene-042', hasMask: false },
+        modelId: 'gpt-image-2',
+      }),
+    )
+    expect(r.status).toBe(200)
+    expect(mockState.enhanceCalls).toBe(1)
+    expect(mockState.lastEnhanceBodyText).toContain('Mask: none')
+    expect(mockState.lastEnhanceBodyText).not.toContain('Mask bounds')
+    expect(mockState.lastEnhanceBodyText).not.toContain('Source size')
+    expect(mockState.lastEnhanceBodyText).not.toContain('normalized')
+  })
+
+  it('edit intent with non-conforming editContext shape drops fields silently (no 400)', async () => {
+    // junk fields + wrong types must be dropped, not rejected.
+    const r = await req(
+      '/api/mivo/enhance',
+      jsonReq({
+        prompt: 'fix the eyes',
+        intent: 'edit',
+        editContext: {
+          sourceTitle: 42,
+          hasMask: 'yes',
+          maskKind: 'polygon',
+          maskBoundsPx: { x: 'a', y: 0, width: 10, height: 10 },
+          sourceSize: { width: 'big', height: 1024 },
+          extraUnknownField: 'drop me',
+        },
+        modelId: 'gpt-image-2',
+      }),
+    )
+    expect(r.status).toBe(200)
+    expect(mockState.enhanceCalls).toBe(1)
+    // all non-conforming fields dropped → falls back to untitled / none
+    expect(mockState.lastEnhanceBodyText).toContain('Source title: untitled')
+    expect(mockState.lastEnhanceBodyText).toContain('Mask: none')
+    expect(mockState.lastEnhanceBodyText).not.toContain('Mask bounds')
+    expect(mockState.lastEnhanceBodyText).not.toContain('Source size')
+    expect(mockState.lastEnhanceBodyText).not.toContain('drop me')
+  })
+
+  it('intent other than "edit" falls back to generate path (generate system prompt, no edit user content)', async () => {
+    // 'generate' / unknown intent values must NOT trigger edit prompt.
+    const r = await req(
+      '/api/mivo/enhance',
+      jsonReq({
+        prompt: 'a castle',
+        intent: 'generate',
+        editContext: { sourceTitle: 'ignored', hasMask: true, maskKind: 'bounds' },
+        modelId: 'gpt-image-2',
+      }),
+    )
+    expect(r.status).toBe(200)
+    expect(mockState.enhanceCalls).toBe(1)
+    // generate system prompt marker (Persona line is generate-only)
+    expect(mockState.lastEnhanceBodyText).toContain('Persona: you help create')
+    // edit-specific markers absent
+    expect(mockState.lastEnhanceBodyText).not.toContain('Edit instruction')
+    expect(mockState.lastEnhanceBodyText).not.toContain('preserve unmasked')
+    // editContext ignored on generate path
+    expect(mockState.lastEnhanceBodyText).not.toContain('Source title: ignored')
+  })
 })
 
 describe('method / validation / 413 (D1 clean)', () => {
