@@ -49,6 +49,11 @@
      折叠态按钮与折叠态缩放条据此锚定到展开态收起按钮的同一屏幕坐标。 */
   --ai-panel-toggle-top: 16px;
   --ai-panel-toggle-right: 18px;
+  /* 主工具条居中基准:可视画布区 = 左浮层侧栏(展开时占位) 到 右 TASKS 面板(展开时占位)
+     之间。#122 画布全铺后 work-surface 占满全窗,居中须同时扣掉左右两侧浮层占位。
+     折叠态由 .project-collapsed / .ai-collapsed 各自把对应 inset 归零。 */
+  --dock-left-inset: calc(var(--floating-gap) + var(--project-sidebar-w));
+  --dock-right-inset: calc(var(--ai-panel-offset) + var(--ai-panel-w));
   display: grid;
   grid-template-columns: var(--project-w) minmax(0, 1fr);
   width: 100vw;
@@ -64,6 +69,13 @@
 
 .mivo-app.project-collapsed {
   --project-w: 0px;
+  /* 侧栏折叠→左侧无占位,工具条居中左界归零。 */
+  --dock-left-inset: 0px;
+}
+
+.mivo-app.ai-collapsed {
+  /* TASKS 面板折叠→仅右上角小按钮,不占底部条带,工具条居中右界归零。 */
+  --dock-right-inset: 0px;
 }
 
 /* 画布模式侧栏浮层化(2026-07-05 用户反馈:圆角卡片外要直接露出带网格的画布)。
@@ -90,7 +102,7 @@
 }
 
 .mivo-app.library-active .project-sidebar:not(.drawer) {
-  background: rgba(248, 244, 235, 0.84);
+  background: #fff; /* 2026-07-06 用户:侧栏卡片不透明白色,不许画布内容透出(原 rgba .84 半透明) */
   border-color: var(--line);
 }
 
@@ -593,7 +605,7 @@ button:disabled {
   margin: var(--floating-gap) 0 var(--floating-gap) var(--floating-gap);
   padding: 14px;
   overflow: hidden;
-  background: rgba(248, 244, 235, 0.84);
+  background: #fff; /* 2026-07-06 用户:侧栏卡片不透明白色,不许画布内容透出(原 rgba .84 半透明) */
   border: 1px solid var(--line);
   border-radius: 14px;
   opacity: 1;
@@ -3053,6 +3065,15 @@ button:disabled {
 
 .top-bar.sidebar-closed {
   position: absolute;
+  /* 2026-07-06 用户:折叠态标题药丸与左侧展开按钮垂直居中对齐。按钮中心
+     y=50(.project-floating-chrome top 28 + 44px 按钮的一半);top+translateY(-50%)
+     把药丸中心锚到同一水平线,对药丸自身高度变化免疫。 */
+  top: 50px;
+  transform: translateY(-50%);
+  /* transform 会给 .top-bar 建栈上下文,把药丸的 z-index:70 困在内部,导致整条
+     top-bar(z-auto)被 DOM 靠后的 .work-surface/canvas 覆盖(药丸可测但不可见)。
+     给折叠态 top-bar 显式 z-index 抬到画布之上(< 浮动 chrome 的 100)。 */
+  z-index: 70;
 }
 
 .top-bar > * {
@@ -3372,7 +3393,9 @@ button:disabled {
 
 .canvas-tool-dock {
   position: absolute;
-  left: 50%;
+  /* 居中于可视画布区中点:( 左界 + (视口宽 - 右界) ) / 2,再 translateX(-50%) 把
+     工具条自身中心对齐到该点。左右 inset 随侧栏/面板折叠态由 CSS 变量切换。 */
+  left: calc((var(--dock-left-inset) + 100% - var(--dock-right-inset)) / 2);
   bottom: var(--ai-panel-offset);
   top: auto;
   z-index: 5;
@@ -3388,14 +3411,6 @@ button:disabled {
   box-shadow: var(--shadow);
   backdrop-filter: blur(14px);
   transform: translateX(-50%);
-}
-
-.mivo-app:not(.ai-collapsed) .canvas-tool-dock {
-  left: calc((100% - var(--ai-panel-offset) - var(--ai-panel-w) - var(--floating-gap)) / 2);
-}
-
-.mivo-app.ai-collapsed .canvas-tool-dock {
-  left: calc((100% - var(--ai-panel-offset) - var(--ai-panel-collapsed-w) - var(--floating-gap)) / 2);
 }
 
 .canvas-tool-dock button {
