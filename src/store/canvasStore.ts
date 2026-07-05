@@ -25,6 +25,7 @@ import type {
 import { type ImportedFileMetadata } from '../lib/canvasAssetImport'
 import { importedImageDisplaySize, type ImportedImageMetadata } from '../lib/imageSizing'
 import { saveGeneratedAsset } from '../lib/assetStorage'
+import { canvasPersistOptions } from './canvasPersistConfig'
 import { type AnchorInput } from '../model/anchorModel'
 import { debugLogger } from './debugLogStore'
 import { scenes } from './demoScenes'
@@ -35,13 +36,12 @@ import type {
   GenerationRatio,
   MivoImageQuality, VariationParam,
 } from '../types/generation'
-import { compactCanvasesForPersist } from './canvasDocumentModel'
 import { createDocumentSlice } from './documentSlice'
 import { createNodeMutationSlice } from './nodeMutationSlice'
 import { createNodeCreationSlice } from './nodeCreationSlice'
 import { createGenerationSlice } from './generationSlice'
 import { createSelectionSlice } from './selectionSlice'
-import { mergeCanvasPersistedState, migratePersistedState } from './canvasGenerationHydration'
+import { migratePersistedState } from './canvasGenerationHydration'
 
 type LayerMove = 'forward' | 'backward' | 'front' | 'back'
 export type SelectionAlignment = 'left' | 'center' | 'right' | 'top' | 'middle' | 'bottom'
@@ -315,21 +315,6 @@ export const useCanvasStore = create<CanvasState>()(
       ...createGenerationSlice(set, get),
       ...createSelectionSlice(set, get),
     }) as CanvasState,
-    {
-      name: 'mivo-canvas-demo',
-      version: 9,
-      migrate: migratePersistedState,
-      merge: (persistedState, currentState) =>
-        mergeCanvasPersistedState(persistedState, currentState, migratePersistedState, warnCanvas),
-      partialize: (state) => ({
-        canvases: compactCanvasesForPersist(state.canvases),
-        sceneId: state.sceneId,
-        selectedNodeId: state.selectedNodeId,
-        selectedNodeIds: state.selectedNodeIds,
-        activeTool: state.activeTool,
-        brushStyle: state.brushStyle,
-        activeStampKind: state.activeStampKind,
-      }),
-    },
+    canvasPersistOptions,
   ),
 )

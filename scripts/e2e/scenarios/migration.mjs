@@ -1,4 +1,4 @@
-import { installE2EStoreBridge } from '../harness.mjs'
+import { installE2EStoreBridge, writePersistedKv } from '../harness.mjs'
 
 export const runMigrationScenario = async (context) => {
   const { baseUrl, browser, generatedImageB64, isProdTopology, prodExtraHTTPHeaders } = context
@@ -37,53 +37,56 @@ export const runMigrationScenario = async (context) => {
         await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ mode: 'generate', scene: 'general', reasoning: 'e2e', richPrompt: 'e2e derived', imgRatio: '1:1', quality: 'medium', enhanced: true }) })
       })
       // 注入 v1 storage（version:1）——含 21:9 override 与一条 21:9 旧 error 消息的 generationContext
-      await migrationPage.addInitScript(() => {
-        const v1State = {
-          state: {
-            messagesByScene: {
-              'character-flow': [
-                {
-                  id: 'msg-user-legacy',
-                  role: 'user',
-                  kind: 'text',
-                  text: 'legacy 21:9 prompt',
-                  createdAt: 1719900000000,
-                  status: 'done',
-                  generationContext: {
-                    model: 'gemini-3-pro-image',
-                    requestedImgRatio: '21:9',
-                    imgRatio: '21:9',
-                    quality: 'high',
-                    finalPrompt: 'legacy 21:9 prompt',
-                  },
+      // FU4-2: inject v1 chat state into IDB (was localStorage.setItem via
+      // addInitScript). addInitScript can't await an async IDB write, so establish
+      // origin first (goto loads app with empty IDB → defaults), write v1 to IDB,
+      // then reload to trigger v1→v2 migration on the hydration gate.
+      const v1State = {
+        state: {
+          messagesByScene: {
+            'character-flow': [
+              {
+                id: 'msg-user-legacy',
+                role: 'user',
+                kind: 'text',
+                text: 'legacy 21:9 prompt',
+                createdAt: 1719900000000,
+                status: 'done',
+                generationContext: {
+                  model: 'gemini-3-pro-image',
+                  requestedImgRatio: '21:9',
+                  imgRatio: '21:9',
+                  quality: 'high',
+                  finalPrompt: 'legacy 21:9 prompt',
                 },
-                {
-                  id: 'msg-asst-legacy',
-                  role: 'assistant',
-                  kind: 'text',
-                  text: '',
-                  createdAt: 1719900000001,
-                  status: 'error',
-                  error: '上游生成超时，可降低质量重试',
-                  errorKind: 'upstream-timeout',
-                  generationContext: {
-                    model: 'gemini-3-pro-image',
-                    requestedImgRatio: '21:9',
-                    imgRatio: '21:9',
-                    quality: 'high',
-                    finalPrompt: 'legacy 21:9 prompt',
-                  },
+              },
+              {
+                id: 'msg-asst-legacy',
+                role: 'assistant',
+                kind: 'text',
+                text: '',
+                createdAt: 1719900000001,
+                status: 'error',
+                error: '上游生成超时，可降低质量重试',
+                errorKind: 'upstream-timeout',
+                generationContext: {
+                  model: 'gemini-3-pro-image',
+                  requestedImgRatio: '21:9',
+                  imgRatio: '21:9',
+                  quality: 'high',
+                  finalPrompt: 'legacy 21:9 prompt',
                 },
-              ],
-            },
-            selectedModel: 'gemini-3-pro-image',
-            paramOverrides: { imgRatio: '21:9', quality: 'auto' },
+              },
+            ],
           },
-          version: 1,
-        }
-        window.localStorage.setItem('mivo-chat-demo', JSON.stringify(v1State))
-      })
+          selectedModel: 'gemini-3-pro-image',
+          paramOverrides: { imgRatio: '21:9', quality: 'auto' },
+        },
+        version: 1,
+      }
       await migrationPage.goto(baseUrl, { waitUntil: 'networkidle' })
+      await writePersistedKv(migrationPage, 'mivo-chat-demo', JSON.stringify(v1State))
+      await migrationPage.reload({ waitUntil: 'networkidle' })
       await migrationPage.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
       const migrated = await migrationPage.evaluate(async () => {
         const resource = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('chatStore.ts'))

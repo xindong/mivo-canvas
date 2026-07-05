@@ -7636,3 +7636,10 @@ button:disabled {
   0%, 100% { opacity: 0.5; }
   50% { opacity: 1; }
 }
+
+/* FU4-2: lightweight pre-hydration placeholder (no selectors e2e waits for). */
+.canvas-boot-placeholder {
+  position: fixed;
+  inset: 0;
+  background: var(--mivo-app-bg, #0e0e12);
+}

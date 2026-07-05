@@ -172,7 +172,10 @@ export const submitEditTask = async (
   })
   formData.set('prompt', request.prompt)
   formData.set('imgRatio', request.imgRatio || '1:1')
-  formData.set('quality', request.quality || 'medium')
+  // Quality 留空时不下发字段 —— 与 submitGenerationTask 一致（chat 生图路径：
+  // auto = 不显式传 quality，server normalizeMivoQuality 对缺省默认即 medium）。
+  // 之前 `request.quality || 'medium'` 会把 auto 强制回填成 medium，破坏 auto 语义。
+  if (request.quality) formData.set('quality', request.quality)
   formData.set('model', request.model || defaultModel)
 
   const response = await fetchWithTimeout(
