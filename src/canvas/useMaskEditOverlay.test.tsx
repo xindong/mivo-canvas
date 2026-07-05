@@ -15,7 +15,7 @@ import type { MivoCanvasNode } from '../types/mivoCanvas'
 // is invoked; useEffect (the warn-on-missing logger) does not run server-side, which
 // is fine: the assertion is about the useImageNaturalSize call arg, not the effect.
 
-const useImageNaturalSizeMock = vi.fn((url?: string, _dims?: unknown) => ({
+const useImageNaturalSizeMock = vi.fn((url?: string) => ({
   naturalSize: url?.startsWith('mivo-asset:') ? { width: 400, height: 300 } : undefined,
   onLoad: vi.fn(),
 }))
