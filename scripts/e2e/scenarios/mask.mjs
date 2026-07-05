@@ -285,15 +285,16 @@ export const runMaskScenario = async (context) => {
   // 结果图自然比例(fixture courage-1.jpg 1080×1920 = 9:16)与占位等面积落画布。
   const mainAfter = await readCanvasState()
   const mainResultNode = mainAfter.nodes.find((n) => n.id === mainAssistant.resultNodeIds[0])
-  if (mainResultNode) {
-    const ratio = mainResultNode.width / mainResultNode.height
-    const area = mainResultNode.width * mainResultNode.height
-    if (Math.abs(ratio - 1080 / 1920) > 0.05) {
-      throw new Error(`SC-10: result ratio should match result image 9:16, got ${mainResultNode.width}x${mainResultNode.height}`)
-    }
-    if (area < 320 * 320 * 0.9 || area > 320 * 320 * 1.1) {
-      throw new Error(`SC-10: result should be equal-area with 320x320 placeholder, got ${mainResultNode.width}x${mainResultNode.height}`)
-    }
+  if (!mainResultNode) {
+    throw new Error(`SC-10: result node ${mainAssistant.resultNodeIds[0]} not found in canvas state`)
+  }
+  const mainResultRatio = mainResultNode.width / mainResultNode.height
+  const mainResultArea = mainResultNode.width * mainResultNode.height
+  if (Math.abs(mainResultRatio - 1080 / 1920) > 0.05) {
+    throw new Error(`SC-10: result ratio should match result image 9:16, got ${mainResultNode.width}x${mainResultNode.height}`)
+  }
+  if (mainResultArea < 320 * 320 * 0.9 || mainResultArea > 320 * 320 * 1.1) {
+    throw new Error(`SC-10: result should be equal-area with 320x320 placeholder, got ${mainResultNode.width}x${mainResultNode.height}`)
   }
 
   // ── SC-13: 黑盘自愈重试 ──
