@@ -28,6 +28,7 @@ import {
 } from './imageMaskGeometry'
 import { MaskPointMarker } from './MaskPointIcon'
 import type { MaskInitialClientPoint } from './maskPointPending'
+import { toContainer, type Viewport } from '../render/EditOverlayLayer'
 
 type ImageMaskTool = 'point' | 'box' | 'brush'
 
@@ -35,7 +36,14 @@ type ImageMaskEditOverlayProps = {
   node: MivoCanvasNode
   resolvedAssetUrl: string
   naturalSize: { width: number; height: number }
-  viewportScale: number
+  /**
+   * 3b (Phase 3b): the mask overlay moved out of the image DOM node into
+   * EditOverlayLayer (canvas-shell direct child, screen space). Positioning is
+   * viewport + node geometry (container transform-scale at toContainer(node.x/y)),
+   * so it no longer reads the image DOM node's rect — image DOM node can move to
+   * Leafer (3c) without breaking the overlay. viewportScale is derived internally.
+   */
+  viewport: Viewport
   submitting: boolean
   initialClientPoint?: MaskInitialClientPoint
   onCancel: () => void
@@ -167,13 +175,17 @@ const pointAnchorPath = (
 export function ImageMaskEditOverlay({
   node,
   naturalSize,
-  viewportScale,
+  viewport,
   submitting,
   initialClientPoint,
   onCancel,
   onSubmit,
   onInitialClientPointHandled,
 }: ImageMaskEditOverlayProps) {
+  // 3b: viewport replaces the old viewportScale prop. Alias kept so the rest of
+  // the component (deps arrays, MaskPointMarker, strokeWidth) reads viewportScale
+  // unchanged — only the positioning container + Props changed.
+  const { scale: viewportScale } = viewport
   const stageRef = useRef<HTMLDivElement | null>(null)
   const [tool, setTool] = useState<ImageMaskTool>('point')
   const [prompt, setPrompt] = useState('')
@@ -662,6 +674,12 @@ export function ImageMaskEditOverlay({
       </div>
     ) : null
 
+  // 3b: mask overlay moved to EditOverlayLayer (screen space). Position at the image
+  // node's screen rect via toContainer + transform-scale — equivalent to the old
+  // image-DOM-node transform, so stageRef.getBoundingClientRect() still yields the
+  // image node's screen rect and localPointForClient math is unchanged.
+  const screenPos = toContainer(viewport, node.x, node.y)
+
   return (
     <>
       <div
@@ -671,6 +689,14 @@ export function ImageMaskEditOverlay({
         data-mask-region-count={regions.length}
         data-point-anchor-count={pointAnchors.length}
         onPointerDown={(event) => event.stopPropagation()}
+        style={{
+          left: screenPos.x,
+          top: screenPos.y,
+          width: node.width,
+          height: node.height,
+          transform: `scale(${viewport.scale})`,
+          transformOrigin: 'top left',
+        }}
       >
         <div
           ref={stageRef}

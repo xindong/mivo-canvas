@@ -1,5 +1,6 @@
 import { useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
+import { toContainer, type Viewport } from '../render/EditOverlayLayer'
 
 export type ImageCropBox = {
   x: number
@@ -20,7 +21,10 @@ type CropDragState = {
 
 type ImageCropOverlayProps = {
   node: MivoCanvasNode
-  scale: number
+  /** 3b: crop overlay moved to EditOverlayLayer (screen space); viewport drives
+   *  toContainer positioning + transform-scale (equivalent to the old dom-canvas-
+   *  layer transform, so handle/border 1/scale math is unchanged). */
+  viewport: Viewport
   onCommit: (box: ImageCropBox) => void
   onCancel: () => void
 }
@@ -71,7 +75,8 @@ const resizeBox = (
   }
 }
 
-export function ImageCropOverlay({ node, scale, onCommit, onCancel }: ImageCropOverlayProps) {
+export function ImageCropOverlay({ node, viewport, onCommit, onCancel }: ImageCropOverlayProps) {
+  const { scale } = viewport
   const [box, setBox] = useState(() => initialCropBoxFor(node))
   const dragRef = useRef<CropDragState | null>(null)
   const handleSize = 12 / scale
@@ -114,10 +119,12 @@ export function ImageCropOverlay({ node, scale, onCommit, onCancel }: ImageCropO
       className="image-crop-overlay"
       data-canvas-ui="true"
       style={{
-        left: node.x,
-        top: node.y,
+        left: toContainer(viewport, node.x, node.y).x,
+        top: toContainer(viewport, node.x, node.y).y,
         width: node.width,
         height: node.height,
+        transform: `scale(${scale})`,
+        transformOrigin: 'top left',
       }}
       onPointerDown={(event) => event.stopPropagation()}
     >
