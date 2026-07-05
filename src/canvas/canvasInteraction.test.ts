@@ -11,6 +11,7 @@ import {
   runtimeToolFor,
   shouldStartCanvasSurfaceInteraction,
   zoomMarqueeOverlayRect,
+  hasActiveTextSelection,
 } from './canvasInteraction'
 
 const baseNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
@@ -175,5 +176,21 @@ describe('shouldStartCanvasSurfaceInteraction (1b-4 SVG gate correction)', () =>
 
   it('rejects null / non-Element targets', () => {
     expect(shouldStartCanvasSurfaceInteraction(null)).toBe(false)
+  })
+})
+
+
+describe('hasActiveTextSelection (cmd+C/X 放行系统复制 guard)', () => {
+  it('true for a non-collapsed selection (chat 气泡选中文本 → 放行浏览器复制)', () => {
+    expect(hasActiveTextSelection({ isCollapsed: false })).toBe(true)
+  })
+
+  it('false for a collapsed selection (无选区 → 画布节点复制照常)', () => {
+    expect(hasActiveTextSelection({ isCollapsed: true })).toBe(false)
+  })
+
+  it('false for null selection / non-browser environment', () => {
+    expect(hasActiveTextSelection(null)).toBe(false)
+    expect(hasActiveTextSelection()).toBe(false)
   })
 })
