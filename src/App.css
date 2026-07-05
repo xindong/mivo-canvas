@@ -56,7 +56,9 @@
   min-width: 0;
   overflow: hidden;
   color: var(--ink);
-  background: #d9d2c6;
+  /* 外壳背景与画布同色(2026-07-05 用户反馈):侧栏圆角卡片(#113)四周不再露出
+     灰色底柱,浮动卡片周围的留白与画布底色连成一体。 */
+  background: var(--canvas);
   transition: grid-template-columns 260ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
