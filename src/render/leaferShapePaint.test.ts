@@ -35,6 +35,7 @@ vi.mock('leafer-ui', () => {
 import {
   createLeaferShapePaint,
   dashPatternFor,
+  strokeColorWithBakedOpacity,
   leaferZOrderMapFor,
   LEAFER_Z_LAYER_STEP,
   shapeLayerFor,
@@ -178,11 +179,21 @@ describe('shapePaintPropsFor — DOM 视觉等价（消费 projection 下沉缺�
     expect(props.dashPattern).toEqual([11, 8])
   })
 
-  it('markupOpacity < 1 → stroke 变 solid paint 对象携带 opacity（strokeOpacity 只作用于描边，fill 不受影响 — DOM parity）', () => {
+  it('FU-10：markupOpacity < 1 → opacity 烘进 rgba 描边颜色（Leafer 不吃 solid paint 对象的 stroke opacity；对象级 opacity 会连 fill 一起变淡），fill 不受影响', () => {
     const node = markupNode({ markupOpacity: 0.5 })
     const props = shapePaintPropsFor(projectNode(node), 'markup-rect', undefined)
-    expect(props.stroke).toEqual({ type: 'solid', color: '#6957e8', opacity: 0.5 })
+    expect(props.stroke).toBe('rgba(105, 87, 232, 0.5)')
     expect(props.fill).toBe('rgba(105, 87, 232, 0.08)')
+  })
+
+  it('FU-10：ellipse 同样烘 opacity；显式 stroke.opacity 优先于 markupOpacity', () => {
+    const node = markupNode({
+      markupKind: 'ellipse',
+      markupOpacity: 0.9,
+      strokes: [{ id: 's', color: '#112233', width: 4, style: 'solid', opacity: 0.25, visible: true }],
+    } as Partial<MivoCanvasNode>)
+    const props = shapePaintPropsFor(projectNode(node), 'markup-ellipse', undefined)
+    expect(props.stroke).toBe('rgba(17, 34, 51, 0.25)')
   })
 
   it('V2 显式 fills/strokes（可见 solid fill + 可见 stroke）优先于 markup* 字段', () => {
@@ -338,6 +349,42 @@ describe('filter/paint 同集（isLeaferShapePaintedNode 是唯一谓词）', ()
       expect(isLeaferShapePaintedNode(markupNode({ markupKind: kind }))).toBe(false)
     }
     expect(isLeaferShapePaintedNode({ id: 't', type: 'text' } as unknown as MivoCanvasNode)).toBe(false)
+  })
+})
+
+describe('strokeColorWithBakedOpacity — FU-10 颜色烘焙', () => {
+  it('opacity >= 1 原样返回', () => {
+    expect(strokeColorWithBakedOpacity('#6957e8', 1)).toBe('#6957e8')
+  })
+
+  it('#rrggbb → rgba 乘 opacity', () => {
+    expect(strokeColorWithBakedOpacity('#6957e8', 0.5)).toBe('rgba(105, 87, 232, 0.5)')
+  })
+
+  it('#rgb 短格式展开', () => {
+    expect(strokeColorWithBakedOpacity('#fff', 0.42)).toBe('rgba(255, 255, 255, 0.42)')
+  })
+
+  it('#rrggbbaa：基础 alpha 与 opacity 相乘', () => {
+    expect(strokeColorWithBakedOpacity('#11223380', 0.5)).toBe('rgba(17, 34, 51, 0.251)')
+  })
+
+  it('rgba() 输入：alpha 相乘', () => {
+    expect(strokeColorWithBakedOpacity('rgba(105, 87, 232, 0.8)', 0.5)).toBe('rgba(105, 87, 232, 0.4)')
+  })
+
+  it('rgb() 输入：按 alpha=1 处理', () => {
+    expect(strokeColorWithBakedOpacity('rgb(1, 2, 3)', 0.3)).toBe('rgba(1, 2, 3, 0.3)')
+  })
+
+  it('不支持的颜色形式：warn + 原样返回（修复前行为，fail visibly）', () => {
+    const warnSpy = vi.spyOn(debugLogger, 'warn').mockImplementation(() => {})
+    try {
+      expect(strokeColorWithBakedOpacity('tomato', 0.5)).toBe('tomato')
+      expect(warnSpy).toHaveBeenCalledWith(SOURCE, expect.stringContaining('tomato'))
+    } finally {
+      warnSpy.mockRestore()
+    }
   })
 })
 
