@@ -66,6 +66,23 @@
   --project-w: 0px;
 }
 
+/* 画布模式侧栏浮层化(2026-07-05 用户反馈:圆角卡片外要直接露出带网格的画布)。
+   状态机收敛:折叠态本就 --project-w:0、peek/pin 本就 fixed 浮层,这里把最后一个
+   例外(默认打开态)也收敛进 pinning 同款定位——canvas 列恒全铺(网格纹理随视口
+   平移,只能让真画布铺到侧栏下方),侧栏 fixed 浮其上。附带收益:开关侧栏不再
+   挤压画布列宽,视口零位移。library 模式(.library-active)保持 grid 占列不变。 */
+.mivo-app:not(.library-active) {
+  --project-w: 0px;
+}
+
+.mivo-app:not(.library-active) .project-sidebar:not(.drawer) {
+  position: fixed;
+  inset: var(--floating-gap) auto var(--floating-gap) var(--floating-gap);
+  z-index: 80;
+  height: auto;
+  margin: 0;
+}
+
 .mivo-app.library-active {
   background: var(--panel);
 }
@@ -3024,8 +3041,12 @@ button:disabled {
 }
 
 .top-bar.sidebar-open {
+  /* 画布全铺后 workspace 从 x=0 起,打开态标题左移避开浮动侧栏卡片。
+     取旧布局像素位置(旧 col 宽 240+2gap=268,再加 top-bar 自身 left 14 → 282),
+     与全铺前视觉零位移,shell-sidebar e2e 的 282 锚点断言原样成立。 */
+  left: calc(var(--project-sidebar-w) + var(--floating-gap) * 3);
   right: auto;
-  max-width: min(520px, calc(100% - 28px));
+  max-width: min(520px, calc(100% - var(--project-sidebar-w) - var(--floating-gap) * 4));
 }
 
 .top-bar.sidebar-closed {

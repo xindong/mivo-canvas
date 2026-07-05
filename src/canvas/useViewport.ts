@@ -30,7 +30,10 @@ import { viewportToCenterBounds, viewportToRevealBounds } from './autoFocusPlace
 import { applyEngineSpikeCamera } from '../render/engineSpikeCameraBridge'
 
 export const defaultViewportFor = (sceneId: string): Viewport => ({
-  x: 420,
+  // 画布全铺(2026-07-05):shell 原点从旧 grid 列右缘(268px)左移到 0,默认偏移
+  // 补上旧列宽(420+268=688)保持首屏内容的屏幕位置与全铺前一致,也避免默认视口
+  // 下内容落在浮动侧栏卡片(x<268)底下。已持久化的视口不迁移(用户平移即恢复)。
+  x: 688,
   y: 240,
   scale: sceneId === 'stress-test' ? 0.62 : 1,
 })

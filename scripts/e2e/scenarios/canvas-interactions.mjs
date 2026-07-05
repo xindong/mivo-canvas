@@ -1,11 +1,13 @@
 export const runCanvasInteractionsScenario = async (context) => {
   const { canvasStoreSpec, nearlyEqual, page, wait } = context
   const initialCount = context.initialCount ?? await page.locator('.dom-node').count()
+// 画布全铺(2026-07-05):canvas-shell 从 x=0 起(旧起点 268),本文件所有 canvasBox.x 相对
+// 常量整体 +268 保持屏幕坐标与旧布局逐点一致(x<268 现为浮动侧栏卡片覆盖区)。
   const shortcutModifier = process.platform === 'darwin'
     ? { metaKey: true, ctrlKey: false }
     : { metaKey: false, ctrlKey: true }
   const pressCanvasShortcut = async (key, { shiftKey = false } = {}) => {
-    await page.locator('.canvas-shell').click({ position: { x: 32, y: 32 }, force: true })
+    await page.locator('.canvas-shell').click({ position: { x: 300, y: 32 }, force: true })
     await page.evaluate(
       ({ keyValue, metaKey, ctrlKey, shiftKey: shortcutShiftKey }) => {
         const code = keyValue.length === 1 ? `Key${keyValue.toUpperCase()}` : keyValue
@@ -164,7 +166,7 @@ export const runCanvasInteractionsScenario = async (context) => {
   const beforePan = await firstNodeMedia.boundingBox()
   const canvasBox = await page.locator('.canvas-shell').boundingBox()
   if (!beforePan || !canvasBox) throw new Error('Missing canvas geometry for pan check')
-  const farBlankPoint = { x: canvasBox.x + 120, y: canvasBox.y + 200 }
+  const farBlankPoint = { x: canvasBox.x + 388, y: canvasBox.y + 200 }
 
   await selectedNode.click()
   if ((await page.locator('.dom-node.selected').count()) === 0) {
@@ -458,7 +460,7 @@ export const runCanvasInteractionsScenario = async (context) => {
   ) {
     throw new Error('Node context menu should render nested markup style actions')
   }
-  await page.mouse.click(12, 12)
+  await page.locator('.top-title-area').click() // 全铺后(12,12)落在画布会误取消选中、Escape 会连选中一起清;点标题药丸(非交互 UI)只关菜单不碰选中,等价旧布局点侧栏死区
   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Line' }).click()
   if (
     !(await page.locator('.selection-quick-toolbar-menu').evaluate((menu) => menu.classList.contains('palette-menu'))) ||
@@ -779,7 +781,7 @@ export const runCanvasInteractionsScenario = async (context) => {
     noteCountBeforeConnector,
   )
 
-  const markupShapeTestPoint = { x: canvasBox.x + 520, y: canvasBox.y + 240 }
+  const markupShapeTestPoint = { x: canvasBox.x + 788, y: canvasBox.y + 240 }
   const rectMarkupCountBefore = await page.locator('.dom-node.markup-node[data-markup-kind="rect"]').count()
   await chooseDrawTool('Rectangle')
   await page.keyboard.down('Shift')
@@ -1471,7 +1473,7 @@ export const runCanvasInteractionsScenario = async (context) => {
 
   await selectedNode.dragTo(page.locator('.canvas-shell'), {
     targetPosition: {
-      x: 32,
+      x: 300, // 全铺补偿:旧 32(screen 300),x<268 现为侧栏卡片覆盖区
       y: canvasBox.height - 64,
     },
   })
@@ -1509,7 +1511,7 @@ export const runCanvasInteractionsScenario = async (context) => {
   const imageBoxInsideBackgroundLockedSection = await selectedNode.boundingBox()
   if (!imageBoxInsideBackgroundLockedSection) throw new Error('Missing image geometry inside background-locked section')
   await selectedNode.dragTo(page.locator('.canvas-shell'), {
-    targetPosition: { x: 32, y: canvasBox.height - 64 },
+    targetPosition: { x: 300, y: canvasBox.height - 64 } // 全铺补偿:旧 32(screen 300),
   })
   await page.waitForFunction((imageId) => !document.querySelector(`[data-node-id="${imageId}"]`)?.getAttribute('data-section-id'), firstNodeId)
 
@@ -1532,7 +1534,7 @@ export const runCanvasInteractionsScenario = async (context) => {
   const lockedBySectionImageBox = await selectedNode.boundingBox()
   if (!lockedBySectionImageBox) throw new Error('Missing lock-all child geometry')
   await selectedNode.dragTo(page.locator('.canvas-shell'), {
-    targetPosition: { x: 32, y: canvasBox.height - 64 },
+    targetPosition: { x: 300, y: canvasBox.height - 64 } // 全铺补偿:旧 32(screen 300),
   })
   const lockedBySectionImageBoxAfterDrag = await selectedNode.boundingBox()
   if (
@@ -1564,7 +1566,7 @@ export const runCanvasInteractionsScenario = async (context) => {
     throw new Error('The V shortcut should restore Select after testing the section tool')
   }
 
-  const postSectionBlankPoint = { x: canvasBox.x + 130, y: canvasBox.y + canvasBox.height - 170 }
+  const postSectionBlankPoint = { x: canvasBox.x + 398, y: canvasBox.y + canvasBox.height - 170 }
   await page.keyboard.press('t')
   await page.mouse.click(postSectionBlankPoint.x, postSectionBlankPoint.y)
   await page.waitForSelector('.dom-node.text-node.editing .dom-text-editor')
@@ -1627,7 +1629,7 @@ export const runCanvasInteractionsScenario = async (context) => {
   }
 
   const lowerBlankPoint = {
-    x: canvasBox.x + 40,
+    x: canvasBox.x + 308,
     y: canvasBox.y + canvasBox.height - 40,
   }
   await page.mouse.click(lowerBlankPoint.x, lowerBlankPoint.y)
@@ -1845,7 +1847,7 @@ export const runCanvasInteractionsScenario = async (context) => {
     return (
       shell &&
       Number(shell.getAttribute('data-viewport-scale')) === 1 &&
-      Math.abs(Number(shell.getAttribute('data-viewport-x')) - 420) <= 0.5 &&
+      Math.abs(Number(shell.getAttribute('data-viewport-x')) - 688) <= 0.5 /* 全铺后默认视口 x=688(旧 420+旧列宽 268) */ &&
       Math.abs(Number(shell.getAttribute('data-viewport-y')) - 240) <= 0.5
     )
   })
@@ -1922,11 +1924,11 @@ export const runCanvasInteractionsScenario = async (context) => {
   if (!beforeGroupSelectFirst || !beforeGroupSelectSecond) throw new Error('Missing nodes for group selection check')
 
   const groupSelectStart = {
-    x: canvasBox.x + 32,
+    x: canvasBox.x + 300,
     y: canvasBox.y + canvasBox.height - 72,
   }
   const groupSelectEnd = {
-    x: canvasBox.x + 980,
+    x: canvasBox.x + 1248,
     y: canvasBox.y + 120,
   }
 
