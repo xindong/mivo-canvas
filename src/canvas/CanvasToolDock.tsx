@@ -1,5 +1,5 @@
 import { Fragment, useMemo, useState } from 'react'
-import { Crosshair } from 'lucide-react'
+import { MaskPointIcon } from './MaskPointIcon'
 import { useCanvasStore } from '../store/canvasStore'
 import type { ToolId } from '../types/mivoCanvas'
 import {
@@ -109,7 +109,7 @@ export function CanvasToolDock({ previewTool, onStartMaskEdit, maskArmed = false
                 aria-label="局部重绘"
                 title={selectedImageNodeId ? '局部重绘' : '点击图片上要修改的位置'}
               >
-                <Crosshair size={20} />
+                <MaskPointIcon size={20} />
               </button>
             </Fragment>
           )

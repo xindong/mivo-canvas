@@ -5330,28 +5330,25 @@ button:disabled {
 
 .image-mask-edit-point-marker {
   color: var(--violet);
-  fill: var(--violet);
-  stroke: var(--violet);
   pointer-events: none;
 }
 
-.image-mask-edit-point-ring {
-  fill: rgba(105, 87, 232, 0.08);
-  stroke: rgba(105, 87, 232, 0.74);
-  stroke-width: 2px;
-  stroke-dasharray: 6 5;
-  vector-effect: non-scaling-stroke;
-}
-
-.image-mask-edit-point-crosshair {
-  stroke: var(--violet);
-  stroke-linecap: round;
-}
-
-.image-mask-edit-point-core {
+.image-mask-edit-point-pin {
   fill: var(--violet);
   stroke: #ffffff;
   stroke-width: 1.5px;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.image-mask-edit-point-pin-dot {
+  fill: #ffffff;
+}
+
+.image-mask-edit-point-pin-tick {
+  stroke: var(--violet);
+  stroke-width: 2px;
+  stroke-linecap: round;
   vector-effect: non-scaling-stroke;
 }
 
