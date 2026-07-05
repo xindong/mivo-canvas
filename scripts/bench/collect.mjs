@@ -96,6 +96,8 @@ const parseArgs = (argv) => {
     culling: 'on',
     panCache: 'off',
     virtualize: 'off',
+    lod: 'off',
+    lodPx: 32,
     fixtureProfile: 'mixed',
     seed: DEFAULT_FIXTURE_SEED,
     date: DEFAULT_DATE,
@@ -157,6 +159,20 @@ const parseArgs = (argv) => {
       const value = entry.slice('--virtualize='.length).trim()
       if (value !== 'on' && value !== 'off') throw new Error(`Invalid --virtualize value: ${value} (expected on|off)`)
       options.virtualize = value
+      continue
+    }
+
+    if (entry.startsWith('--lod=')) {
+      const value = entry.slice('--lod='.length).trim()
+      if (value !== 'on' && value !== 'off') throw new Error(`Invalid --lod value: ${value} (expected on|off)`)
+      options.lod = value
+      continue
+    }
+
+    if (entry.startsWith('--lod-px=')) {
+      const value = Number(entry.slice('--lod-px='.length).trim())
+      if (!Number.isFinite(value) || value <= 0) throw new Error(`Invalid --lod-px value: ${entry}`)
+      options.lodPx = value
       continue
     }
 
@@ -398,7 +414,7 @@ const installBenchRuntime = async (page) => {
         let settled = false
         const requestedRenderer = new URLSearchParams(window.location.search).get('renderer') || 'dom'
         const requestedVirtualize = new URLSearchParams(window.location.search).get('virtualize') || 'off'
-        let lastSnapshot = { totalNodeCount: null, viewportScale: 0, rendererMode: null, leaferChildren: 0, leaferExpectedChildren: 0, leaferPixelNonEmpty: false, pixiChildren: 0, pixiExpectedChildren: 0, pixiPixelNonEmpty: false, virtualizeActive: false, virtualizePending: false, virtualizeMaterialized: 0, virtualizeTarget: 0 }
+        let lastSnapshot = { totalNodeCount: null, viewportScale: 0, rendererMode: null, leaferChildren: 0, leaferExpectedChildren: 0, leaferPixelNonEmpty: false, pixiChildren: 0, pixiExpectedChildren: 0, pixiPixelNonEmpty: false, virtualizeActive: false, virtualizePending: false, virtualizeMaterialized: 0, virtualizeTarget: 0, engineLodMode: 'off', engineLodNodeCount: 0 }
         while (performance.now() - startedAt < 15000) {
           const nextShell = document.querySelector('.canvas-shell')
           const totalNodeCount = nextShell?.getAttribute('data-total-node-count')
@@ -413,6 +429,8 @@ const installBenchRuntime = async (page) => {
           const virtualizePending = nextShell?.getAttribute('data-virtualize-pending') === 'true'
           const virtualizeMaterialized = Number(nextShell?.getAttribute('data-virtualize-materialized-node-count') || 0)
           const virtualizeTarget = Number(nextShell?.getAttribute('data-virtualize-target-node-count') || 0)
+          const engineLodMode = nextShell?.getAttribute('data-engine-lod-mode') || 'off'
+          const engineLodNodeCount = Number(nextShell?.getAttribute('data-engine-lod-node-count') || 0)
           lastSnapshot = {
             totalNodeCount,
             viewportScale,
@@ -427,6 +445,8 @@ const installBenchRuntime = async (page) => {
             virtualizePending,
             virtualizeMaterialized,
             virtualizeTarget,
+            engineLodMode,
+            engineLodNodeCount,
           }
           const leaferReady =
             requestedRenderer !== 'leafer' ||
@@ -467,6 +487,13 @@ const installBenchRuntime = async (page) => {
         const virtualizeOverscanPx = Number(currentShell?.getAttribute('data-virtualize-overscan-px') || 0)
         const virtualizeBatchRuns = Number(currentShell?.getAttribute('data-virtualize-batch-runs') || 0)
         const virtualizeReconcileVersion = Number(currentShell?.getAttribute('data-virtualize-reconcile-version') || 0)
+        const engineLodMode = currentShell?.getAttribute('data-engine-lod-mode') || 'off'
+        const engineLodEnabled = currentShell?.getAttribute('data-engine-lod-enabled') === 'true'
+        const engineLodThresholdPx = Number(currentShell?.getAttribute('data-engine-lod-threshold-px') || 0)
+        const engineLodNodeCount = Number(currentShell?.getAttribute('data-engine-lod-node-count') || 0)
+        const engineLodImageCount = Number(currentShell?.getAttribute('data-engine-lod-image-count') || 0)
+        const engineLodTextCount = Number(currentShell?.getAttribute('data-engine-lod-text-count') || 0)
+        const engineHighFidelityNodeCount = Number(currentShell?.getAttribute('data-engine-high-fidelity-node-count') || 0)
         if (!settled || actualNodeCount !== expectedNodeCount || Math.abs(actualScale - expectedScale) >= 0.01) {
           throw new Error(
             `waitForRender did not settle within 15s: expected nodeCount=${expectedNodeCount} scale=${expectedScale} renderer=${requestedRenderer}, `
@@ -496,6 +523,13 @@ const installBenchRuntime = async (page) => {
           virtualizeOverscanPx,
           virtualizeBatchRuns,
           virtualizeReconcileVersion,
+          engineLodMode,
+          engineLodEnabled,
+          engineLodThresholdPx,
+          engineLodNodeCount,
+          engineLodImageCount,
+          engineLodTextCount,
+          engineHighFidelityNodeCount,
           viewportScale: actualScale,
           viewportX: Number(currentShell?.getAttribute('data-viewport-x') || 0),
           viewportY: Number(currentShell?.getAttribute('data-viewport-y') || 0),
@@ -851,6 +885,13 @@ const readRenderState = (page) =>
       virtualizeOverscanPx: Number(shell?.getAttribute('data-virtualize-overscan-px') || 0),
       virtualizeBatchRuns: Number(shell?.getAttribute('data-virtualize-batch-runs') || 0),
       virtualizeReconcileVersion: Number(shell?.getAttribute('data-virtualize-reconcile-version') || 0),
+      engineLodMode: shell?.getAttribute('data-engine-lod-mode') || 'off',
+      engineLodEnabled: shell?.getAttribute('data-engine-lod-enabled') === 'true',
+      engineLodThresholdPx: Number(shell?.getAttribute('data-engine-lod-threshold-px') || 0),
+      engineLodNodeCount: Number(shell?.getAttribute('data-engine-lod-node-count') || 0),
+      engineLodImageCount: Number(shell?.getAttribute('data-engine-lod-image-count') || 0),
+      engineLodTextCount: Number(shell?.getAttribute('data-engine-lod-text-count') || 0),
+      engineHighFidelityNodeCount: Number(shell?.getAttribute('data-engine-high-fidelity-node-count') || 0),
       viewportScale: Number(shell?.getAttribute('data-viewport-scale') || 0),
     }
   })
@@ -896,7 +937,15 @@ const sampleDomPixels = async (page) => {
   return { nonEmpty: nonBackgroundSamples > 0, sampleCount }
 }
 
-const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, renderer, culling, panCache, virtualize, includeDrag }) => {
+const expectedEngineLodNodeCount = (fixture, thresholdPx) => {
+  const scale = fixture.meta.recommendedViewport.scale
+  return fixture.snapshot.nodes.filter((node) => {
+    if (node.type !== 'image' && node.type !== 'text') return false
+    return Math.max(Math.abs(node.width || 0), Math.abs(node.height || 0)) * scale < thresholdPx
+  }).length
+}
+
+const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, renderer, culling, panCache, virtualize, lod, lodPx, includeDrag }) => {
   const context = await browser.newContext({
     viewport: { width: 1920, height: 1080 },
     deviceScaleFactor: dpr,
@@ -904,7 +953,7 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, rendere
   })
   const page = await context.newPage()
   await page.emulateMedia({ reducedMotion: 'reduce' })
-  const canvasUrl = `http://127.0.0.1:${port}/?renderer=${encodeURIComponent(renderer)}&culling=${encodeURIComponent(culling)}&panCache=${encodeURIComponent(panCache)}&virtualize=${encodeURIComponent(virtualize)}`
+  const canvasUrl = `http://127.0.0.1:${port}/?renderer=${encodeURIComponent(renderer)}&culling=${encodeURIComponent(culling)}&panCache=${encodeURIComponent(panCache)}&virtualize=${encodeURIComponent(virtualize)}&lod=${encodeURIComponent(lod)}&lodPx=${encodeURIComponent(String(lodPx))}`
   await page.goto(canvasUrl, { waitUntil: 'networkidle' })
   await page.addStyleTag({
     content: [
@@ -986,6 +1035,18 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, rendere
       throw new Error(`Bench Pixi evidence invalid: textStrategy=${renderState.pixiTextStrategy}, expected bitmap`)
     }
   }
+  if (renderer !== 'dom' && lod === 'on') {
+    const expectedLodCount = expectedEngineLodNodeCount(fixture, lodPx)
+    if (!renderState.engineLodEnabled || renderState.engineLodMode !== 'on') {
+      throw new Error(`Bench LOD evidence invalid: requested lod=on but shell reports mode=${renderState.engineLodMode}`)
+    }
+    if (renderState.engineLodThresholdPx !== lodPx) {
+      throw new Error(`Bench LOD evidence invalid: threshold=${renderState.engineLodThresholdPx}, expected=${lodPx}`)
+    }
+    if (renderState.engineLodNodeCount !== expectedLodCount) {
+      throw new Error(`Bench LOD evidence mismatch: lodNodes=${renderState.engineLodNodeCount}, expected=${expectedLodCount}`)
+    }
+  }
   if (renderer === 'dom') {
     if (virtualize === 'on') {
       if (!renderState.virtualizeActive) {
@@ -1047,6 +1108,13 @@ const runSingleCapture = async ({ browser, fixture, dpr, runIndex, port, rendere
       panCacheActual: renderState.leaferPanCacheEnabled ? 'on' : 'off',
       virtualizeRequested: virtualize,
       virtualizeActual: renderState.virtualizeActive ? 'on' : 'off',
+      lodRequested: lod,
+      lodActual: renderState.engineLodMode,
+      lodThresholdPx: renderState.engineLodThresholdPx,
+      lodNodeCount: renderState.engineLodNodeCount,
+      lodImageCount: renderState.engineLodImageCount,
+      lodTextCount: renderState.engineLodTextCount,
+      highFidelityNodeCount: renderState.engineHighFidelityNodeCount,
       pixiTextStrategy: renderState.pixiTextStrategy,
       pixiTexturePoolSize: renderState.pixiTexturePoolSize,
     },
@@ -1125,10 +1193,12 @@ const main = async () => {
             runIndex,
             port: options.port,
             renderer: options.renderer,
-          culling: options.culling,
-          panCache: options.panCache,
-          virtualize: options.virtualize,
-          includeDrag: options.includeDrag,
+            culling: options.culling,
+            panCache: options.panCache,
+            virtualize: options.virtualize,
+            lod: options.lod,
+            lodPx: options.lodPx,
+            includeDrag: options.includeDrag,
           })
           assertTraceMarks(run)
           runs.push(run)
@@ -1152,6 +1222,12 @@ const main = async () => {
         virtualizeTargetNodeCount: result.runs[0]?.renderState?.virtualizeTargetNodeCount,
         virtualizeMaterializedNodeCount: result.runs[0]?.renderState?.virtualizeMaterializedNodeCount,
         virtualizeOverscanPx: result.runs[0]?.renderState?.virtualizeOverscanPx,
+        engineLodMode: result.runs[0]?.renderState?.engineLodMode,
+        engineLodThresholdPx: result.runs[0]?.renderState?.engineLodThresholdPx,
+        engineLodNodeCount: result.runs[0]?.renderState?.engineLodNodeCount,
+        engineLodImageCount: result.runs[0]?.renderState?.engineLodImageCount,
+        engineLodTextCount: result.runs[0]?.renderState?.engineLodTextCount,
+        engineHighFidelityNodeCount: result.runs[0]?.renderState?.engineHighFidelityNodeCount,
         domPixelNonEmpty: result.runs[0]?.renderState?.domPixelNonEmpty,
         domPixelSampleCount: result.runs[0]?.renderState?.domPixelSampleCount,
         renderedNodeCount: result.runs[0]?.renderState?.renderedNodeCount,
@@ -1167,6 +1243,17 @@ const main = async () => {
         totalNodeCount: result.runs[0]?.renderState?.totalNodeCount,
       }))
       const worstP95 = Math.max(...dprGateValues.map((result) => result.p95FrameMs ?? 0))
+      const dprPanGateValues = dprResults.map((result) => ({
+        dpr: result.dpr,
+        p95FrameMs: result.median.actions['canvas-pan'].p95FrameMs,
+        durationMs: result.median.actions['canvas-pan'].durationMs,
+        longTaskCount: result.median.actions['canvas-pan'].longTaskCount,
+        longTaskTotalMs: result.median.actions['canvas-pan'].longTaskTotalMs,
+        zoomP95FrameMs: result.median.actions['canvas-zoom'].p95FrameMs,
+        zoomDurationMs: result.median.actions['canvas-zoom'].durationMs,
+        zoomLongTaskTotalMs: result.median.actions['canvas-zoom'].longTaskTotalMs,
+      }))
+      const worstPanP95 = Math.max(...dprPanGateValues.map((result) => result.p95FrameMs ?? 0))
 
       configs.push({
         nodeCount,
@@ -1176,6 +1263,11 @@ const main = async () => {
           thresholdMs: 33,
           dprP95FrameMs: dprGateValues,
           worstP95FrameMs: round(worstP95, 3),
+          panGate: {
+            thresholdMs: 33,
+            dprP95FrameMs: dprPanGateValues,
+            worstP95FrameMs: round(worstPanP95, 3),
+          },
           status: options.gateStatus,
           note: options.note,
         },
@@ -1194,6 +1286,9 @@ const main = async () => {
         panCacheActual: configs[0]?.dprResults[0]?.runs[0]?.renderer?.panCacheActual || options.panCache,
         virtualize: options.virtualize,
         virtualizeActual: configs[0]?.dprResults[0]?.runs[0]?.renderer?.virtualizeActual || options.virtualize,
+        lod: options.lod,
+        lodActual: configs[0]?.dprResults[0]?.runs[0]?.renderer?.lodActual || options.lod,
+        lodThresholdPx: options.lodPx,
         date: options.date,
         referenceMachine: 'same-machine-only',
         browser: 'Chromium via Playwright',

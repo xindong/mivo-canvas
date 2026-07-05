@@ -1,5 +1,6 @@
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 import type { RendererMode } from './rendererMode'
+import { isEngineLodRequested } from './engineLodMode'
 
 /**
  * 0b spike — Phase 2b 正式化时按 phase2b-adapter-camera-zorder.md 重构。
@@ -20,6 +21,9 @@ export const isLeaferSpikePainted = (node: MivoCanvasNode): boolean =>
 export const isPixiSpikePainted = (node: MivoCanvasNode): boolean =>
   isLeaferSpikePainted(node) || node.type === 'text'
 
+const isLeaferDomFiltered = (node: MivoCanvasNode): boolean =>
+  isLeaferSpikePainted(node) || (isEngineLodRequested && node.type === 'text')
+
 /**
  * leafer 模式下从 DOM 渲染列表里剔除已被 Leafer 画的节点。
  * dom 模式原样返回（默认行为零变化）。
@@ -29,7 +33,7 @@ export const filterDomNodesForRendererSpike = (
   rendererMode: RendererMode,
 ): MivoCanvasNode[] =>
   rendererMode === 'leafer'
-    ? nodes.filter((node) => !isLeaferSpikePainted(node))
+    ? nodes.filter((node) => !isLeaferDomFiltered(node))
     : rendererMode === 'pixi'
       ? nodes.filter((node) => !isPixiSpikePainted(node))
       : nodes
