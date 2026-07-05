@@ -100,9 +100,40 @@ export const runChangelogScenario = async (context) => {
   if (initialDate !== today) {
     throw new Error(`Changelog carousel should default to the latest day: ${initialDate}`)
   }
-  const initialIndicator = await page.locator('.changelog-carousel-status').textContent()
-  if (!initialIndicator?.includes(toShortDate(today)) || !initialIndicator.includes('1/2')) {
-    throw new Error(`Changelog carousel should expose date and position: ${initialIndicator}`)
+  const dateBarText = (await page.locator('.changelog-date-bar').textContent())?.trim()
+  if (dateBarText !== toShortDate(today)) {
+    throw new Error(`Changelog date bar should show only the centered date (no 1/N): ${dateBarText}`)
+  }
+  // 等卡片入场动画(changelog-day-in 150ms 带位移)播完再量布局,否则中点会测在动画半途。
+  await page.waitForFunction(() => {
+    const day = document.querySelector('.changelog-day')
+    return day instanceof HTMLElement && day.getAnimations().length === 0
+  })
+  const navLayout = await page.evaluate(() => {
+    const card = document.querySelector('.changelog-day')?.getBoundingClientRect()
+    const dots = document.querySelector('.changelog-dots')?.getBoundingClientRect()
+    const arrows = Array.from(document.querySelectorAll('.changelog-carousel-arrow')).map((el) =>
+      el.getBoundingClientRect(),
+    )
+    if (!card || !dots || arrows.length !== 2) return null
+    return {
+      dotsGap: dots.top - card.bottom,
+      dotsCenterDelta: Math.abs((dots.left + dots.right) / 2 - (card.left + card.right) / 2),
+      leftArrowFlanks: arrows[0].right <= card.left,
+      rightArrowFlanks: arrows[1].left >= card.right,
+    }
+  })
+  if (
+    !navLayout ||
+    navLayout.dotsGap < 10 ||
+    navLayout.dotsGap > 14 ||
+    navLayout.dotsCenterDelta > 2 ||
+    !navLayout.leftArrowFlanks ||
+    !navLayout.rightArrowFlanks
+  ) {
+    throw new Error(
+      `Changelog nav should be arrows flanking the card with centered dots ~12px below: ${JSON.stringify(navLayout)}`,
+    )
   }
   const dayLayout = await page.evaluate(() => {
     const day = document.querySelector('.changelog-day')
@@ -181,7 +212,7 @@ export const runChangelogScenario = async (context) => {
     throw new Error(`Changelog day card should keep an internal scroll area: ${JSON.stringify(scrollProbe)}`)
   }
 
-  // ⑤ 轮播:按钮切到更早日期,键盘右箭头切回更近日期
+  // ⑤ 轮播:右箭头 icon 切到更早日期,键盘左箭头切回最新(轨道语义:最左=最新)
   await page.getByRole('button', { name: '切换到更早更新日志' }).click()
   await page.waitForFunction((expected) => document.querySelector('.changelog-day-date')?.textContent === expected, olderDay)
   await page.getByText('e2e-changelog 更早功能条目').waitFor()
@@ -189,7 +220,7 @@ export const runChangelogScenario = async (context) => {
   if (!olderButtonDisabled) {
     throw new Error('Changelog carousel should disable the earlier button at the oldest day')
   }
-  await page.keyboard.press('ArrowRight')
+  await page.keyboard.press('ArrowLeft')
   await page.waitForFunction((expected) => document.querySelector('.changelog-day-date')?.textContent === expected, today)
   const newerButtonDisabled = await page.getByRole('button', { name: '切换到更新的更新日志' }).isDisabled()
   if (!newerButtonDisabled) {
