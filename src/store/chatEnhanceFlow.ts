@@ -4,6 +4,7 @@
 // return 分支共用此 helper。先例：chatStoreMigrate.ts（把逻辑抽出保持 chatStore
 // 在 structure-guard 847 行红线内，净增即 FAIL）。
 import type { EnhanceResponse } from '../types/generation'
+import type { ChatEnhanceResult, ChatMessage } from './chatStore'
 
 export type ChatEnhanceResolution = {
   /** 用于生图的最终 prompt。chat 模式用原始 text（用户说什么画什么），
@@ -63,3 +64,32 @@ export const resolveMaskEditEnhance = (
     finalPrompt: enhanceResult.richPrompt || originalText,
   }
 }
+
+/** mask-chat-card: 从 chatStore 外迁的 enhance→ChatEnhanceResult 映射（保持 chatStore <= 833 行）。
+ *  enhanced 时透传 scene/reasoning/richPrompt/imgRatio/quality/degradedReason/stage；
+ *  degraded 时只留 degradedReason/stage。供 sendMessage/retryMessage/mask flow 共用。 */
+export const enhanceForGeneration = (enhanceResult: EnhanceResponse): ChatEnhanceResult =>
+  enhanceResult.enhanced
+    ? {
+        scene: enhanceResult.scene,
+        reasoning: enhanceResult.reasoning,
+        richPrompt: enhanceResult.richPrompt,
+        imgRatio: enhanceResult.imgRatio,
+        quality: enhanceResult.quality,
+        degradedReason: enhanceResult.degradedReason,
+        stage: enhanceResult.stage,
+      }
+    : { degradedReason: enhanceResult.degradedReason, stage: enhanceResult.stage }
+
+/** mask-chat-card: 从 chatStore 外迁的 history 提取（取最近 limit 条 done 的 user/assistant，
+ *  content 用 richPrompt 回退 text）。保持 chatStore <= 833 行。 */
+export const historyForEnhance = (messages: ChatMessage[], limit = 6) =>
+  messages
+    .filter((m) => m.status === 'done' && m.kind !== 'notice' && (m.role === 'user' || m.role === 'assistant') && Boolean(m.enhance?.richPrompt || m.text))
+    .slice(-limit)
+    .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.enhance?.richPrompt || m.text }))
+
+/** mask-chat-card: 从 chatStore 外迁的消息裁剪（保持 chatStore <= 833 行）。 */
+export const maxMessagesPerScene = 200
+export const trimSceneMessages = (messages: ChatMessage[]): ChatMessage[] =>
+  messages.length > maxMessagesPerScene ? messages.slice(-maxMessagesPerScene) : messages

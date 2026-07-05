@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type RefObject } from 'react'
 import { useCanvasStore } from '../store/canvasStore'
-import { useChatStore } from '../store/chatStore'
 import { debugLogger } from '../store/debugLogStore'
 import { toastFeedback } from '../store/toastStore'
+import { beginMaskEditMessage, runMaskEditChatFlow } from '../store/chatMaskEditFlow'
+import { registerMaskEditTask } from '../store/maskEditTaskRuntime'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 import type { MivoImageRatio } from '../types/generation'
-import { prepareMaskEditPlaceholder, removeMaskEditPlaceholder, runMaskEditGeneration } from './maskEditGeneration'
+import { prepareMaskEditPlaceholder } from './maskEditGeneration'
 import type { ImageMaskSubmitPayload } from './imageMaskGeometry'
 import { nodeIdFromDomTarget, type RuntimeCanvasTool } from './canvasInteraction'
 import { reduceMaskPointPending, shouldCancelPendingMaskEdit, type MaskInitialClientPoint, type MaskPointPendingAction } from './maskPointPending'
@@ -56,7 +57,6 @@ export function useMaskPointArmed({
   clearCropNode,
   interactionRef,
 }: UseMaskPointArmedOptions) {
-  const maskEditAbortRef = useRef<AbortController | null>(null)
   const maskArmedRef = useRef(false)
   const maskEditNodeIdRef = useRef<string | undefined>(undefined)
   const pendingInitialClientPointRef = useRef<MaskInitialClientPoint | undefined>(undefined)
@@ -106,14 +106,16 @@ export function useMaskPointArmed({
     })
   }, [])
 
-  const cancelMaskEdit = useCallback(() => {
-    maskEditAbortRef.current?.abort()
-    maskEditAbortRef.current = null
+  // mask-chat-card: cancelMaskEdit 现在只关闭交互层（overlay/draft），不 abort 已提交的
+  // 后台任务。runtime abortController 已移入 maskEditTaskRuntime registry，由卡片取消
+  // （cancelGeneration → cancelMaskEditMessage）统一终止；Esc/点画布/overlay X/target
+  // 删除/unmount/maskCancelRequestId 都走本函数，只清本 hook 的 draft state。
+  const cancelMaskEdit = useCallback((reason = 'mask edit canceled') => {
     maskEditNodeIdRef.current = undefined
     setMaskEditNodeId(undefined)
     setMaskEditSubmittingNodeId(undefined)
-    setMaskArmed(false, 'mask edit canceled')
-    clearPendingInitialPoint('mask edit canceled')
+    setMaskArmed(false, reason)
+    clearPendingInitialPoint(reason)
   }, [clearPendingInitialPoint, setMaskArmed])
 
   const beginMaskEdit = useCallback((nodeId: string) => {
@@ -150,55 +152,53 @@ export function useMaskPointArmed({
       if (!source) throw new Error('Source image not found')
 
       const { slotId, baselineSnapshot } = prepareMaskEditPlaceholder(targetSceneId, source, payload.prompt)
-      setMaskEditSubmittingNodeId(nodeId)
+      // mask-chat-card: 调度后台任务，不 await 全程。创建 chat enhancing card + runtime
+      // record 后立即关闭 overlay；enhance→edit→finish 由 runMaskEditChatFlow 后台驱动，
+      // 卡片状态由 chatMaskEditFlow 经 callbacks 收口。多 mask 并发允许（不 abort 旧任务）。
+      const imgRatio = closestMivoRatioForSize(payload.sourceSize)
+      const messageId = beginMaskEditMessage({
+        sceneId: targetSceneId,
+        source,
+        prompt: payload.prompt,
+        slotId,
+        imgRatio,
+        quality: payload.quality,
+      })
       const abortController = new AbortController()
-      maskEditAbortRef.current?.abort()
-      maskEditAbortRef.current = abortController
-      try {
-        await runMaskEditGeneration({
-          sceneId: targetSceneId,
-          source,
-          slotId,
-          resolvedAssetUrl,
-          payload,
-          imgRatio: closestMivoRatioForSize(payload.sourceSize),
-          quality: payload.quality,
-          signal: abortController.signal,
-        })
-        maskEditNodeIdRef.current = undefined
-        setMaskEditNodeId(undefined)
-        clearPendingInitialPoint('mask edit submitted')
-      } catch (error) {
-        const logMessage = error instanceof Error ? error.message : '局部重绘失败'
-        removeMaskEditPlaceholder(targetSceneId, slotId, {
-          canceled: abortController.signal.aborted,
-          error: logMessage,
-          sourceTitle: source.title,
-          baselineSnapshot,
-        })
-        // W2 fix: 失败/取消终态同样要清 maskEditNodeId，否则 overlay 不 detach
-        // （CanvasNodeView 的 ImageMaskEditOverlay gated on node.id===maskEditNodeId）。
-        // 成功路径在 try 末尾清；失败路径此前漏清 → SC-W2② 三态 e2e 超时。
-        maskEditNodeIdRef.current = undefined
-        setMaskEditNodeId(undefined)
-        clearPendingInitialPoint('mask edit failed')
-        const latestCanvasState = useCanvasStore.getState()
-        if (latestCanvasState.sceneId !== targetSceneId) {
-          useChatStore.getState().appendNotice({
-            sceneId: latestCanvasState.sceneId,
-            origin: 'mask-edit',
-            prompt: `局部重绘失败：${logMessage}`,
-          })
-        }
-        throw error
-      } finally {
-        if (maskEditAbortRef.current === abortController) {
-          maskEditAbortRef.current = null
-        }
-        setMaskEditSubmittingNodeId(undefined)
-      }
+      registerMaskEditTask({
+        sceneId: targetSceneId,
+        messageId,
+        slotId,
+        baselineSnapshot,
+        abortController,
+        source,
+        resolvedAssetUrl,
+        payload,
+        imgRatio,
+        quality: payload.quality,
+      })
+      // 关闭 overlay 交互层（不 abort runtime task）；submitMaskEdit 立即返回，
+      // overlay 由本 cancelMaskEdit 关闭，enhance/edit 后台继续。
+      cancelMaskEdit('mask edit submitted')
+      void runMaskEditChatFlow({
+        sceneId: targetSceneId,
+        messageId,
+        slotId,
+        baselineSnapshot,
+        abortController,
+        source,
+        resolvedAssetUrl,
+        payload,
+        imgRatio,
+        quality: payload.quality,
+      }).catch((error) => {
+        debugLogger.error(
+          'Mask Edit',
+          `runMaskEditChatFlow crashed for ${source.title} (msg ${messageId}): ${error instanceof Error ? error.message : 'unknown'}`,
+        )
+      })
     },
-    [clearPendingInitialPoint, sceneId],
+    [cancelMaskEdit, sceneId],
   )
 
   const toggleMaskArmed = useCallback(() => {
@@ -328,7 +328,7 @@ export function useMaskPointArmed({
   useEffect(() => {
     if (lastMaskCancelRequestIdRef.current === maskCancelRequestId) return
     lastMaskCancelRequestIdRef.current = maskCancelRequestId
-    const frame = window.requestAnimationFrame(cancelMaskEdit)
+    const frame = window.requestAnimationFrame(() => cancelMaskEdit('mask cancel request'))
     return () => window.cancelAnimationFrame(frame)
   }, [cancelMaskEdit, maskCancelRequestId])
 
@@ -358,7 +358,8 @@ export function useMaskPointArmed({
     mountedRef.current = true
     return () => {
       mountedRef.current = false
-      maskEditAbortRef.current?.abort()
+      // mask-chat-card: unmount 不 abort runtime task（后台 task 由 registry 管理，卡片取消收口）；
+      // 只清本 hook 的 draft state。
       if (pendingInitialClientPointRef.current) {
         debugLogger.log('Mask Edit', `Pending initial point for ${pendingInitialClientPointRef.current.nodeId} cleared: unmount`)
       }

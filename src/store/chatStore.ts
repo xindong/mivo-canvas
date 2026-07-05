@@ -1,18 +1,17 @@
 import { create } from 'zustand'
 import { createJSONStorage, persist } from 'zustand/middleware'
-import type { EnhanceDegradedReason, EnhanceResponse, GenerationRatio, MivoImageQuality } from '../types/generation'
+import type { EnhanceDegradedReason, GenerationRatio, MivoImageQuality } from '../types/generation'
 import { readImportedAssetFile, saveImportedAsset } from '../lib/assetStorage'
 import { idbStateStorage } from '../lib/persistIdbStorage'
 import { MivoImageRequestError, enhanceMivoPrompt, type MivoImageRequestErrorKind } from '../lib/mivoImageClient'
 import { getModelCapabilities } from '../lib/modelCapabilities'
 import { settleCanvasGenerationLocally } from './canvasGenerationCancel'
 import { fallbackCancelTarget, settleExpiredChatMessages } from './chatGenerationHydration'
-import { resolveChatEnhance } from './chatEnhanceFlow'
+import { resolveChatEnhance, enhanceForGeneration, historyForEnhance, trimSceneMessages } from './chatEnhanceFlow'
+import { cancelMaskEditMessage } from './chatMaskEditFlow'
 import { debugLogger } from './debugLogStore'
 import { generationFacade } from './generationFacade'
 import { clampChatGenerationContext, migrateChatPersistedState, sanitizeEnhanceDegradedReason } from './chatStoreMigrate'
-
-const maxMessagesPerScene = 200
 
 export type ChatMessageStatus = 'enhancing' | 'generating' | 'done' | 'error'
 export type ChatMessageOrigin = 'chat' | 'mask-edit'
@@ -36,6 +35,13 @@ export type ChatParamOverrides = {
   quality: 'auto' | MivoImageQuality
 }
 
+export type MaskEditMessageContext = {
+  sourceTitle?: string
+  serverTaskId?: string
+  sourceDeleted?: boolean
+  phase?: 'enhancing' | 'submitting' | 'polling' | 'self-heal-retry'
+}
+
 export type ChatGenerationContext = {
   sourceNodeId?: string
   sourceNodeType?: string
@@ -50,6 +56,9 @@ export type ChatGenerationContext = {
   /** FIX-4: chat 模式澄清附言（replyText）持久化到 context，retry 不重跑 enhance
    *  时也能从 context 读回并在生成成功后 appendNotice，与 send 路径语义一致。 */
   noticeText?: string
+  /** mask-chat-card: mask edit 卡片状态机。runtime 不持久化（abortController/Blob 不可序列化），
+   *  但 serverTaskId/sourceDeleted 持久化供刷新后 cancel fallback 与归因。 */
+  maskEdit?: MaskEditMessageContext
 }
 
 export type ChatMessage = {
@@ -150,27 +159,8 @@ const errorTextForChat = (
   return `${message}，${advice}`
 }
 
-const trimSceneMessages = (messages: ChatMessage[]): ChatMessage[] =>
-  messages.length > maxMessagesPerScene ? messages.slice(-maxMessagesPerScene) : messages
-
-const historyForEnhance = (messages: ChatMessage[], limit = 6) =>
-  messages
-    .filter((m) => m.status === 'done' && m.kind !== 'notice' && (m.role === 'user' || m.role === 'assistant') && Boolean(m.enhance?.richPrompt || m.text))
-    .slice(-limit)
-    .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.enhance?.richPrompt || m.text }))
-
-const enhanceForGeneration = (enhanceResult: EnhanceResponse): ChatEnhanceResult =>
-  enhanceResult.enhanced
-    ? {
-        scene: enhanceResult.scene,
-        reasoning: enhanceResult.reasoning,
-        richPrompt: enhanceResult.richPrompt,
-        imgRatio: enhanceResult.imgRatio,
-        quality: enhanceResult.quality,
-        degradedReason: enhanceResult.degradedReason,
-        stage: enhanceResult.stage,
-      }
-    : { degradedReason: enhanceResult.degradedReason, stage: enhanceResult.stage }
+// enhanceForGeneration / historyForEnhance / trimSceneMessages / maxMessagesPerScene
+// 已外迁到 ./chatEnhanceFlow.ts（mask-chat-card：保持 chatStore.ts <= 833 行红线）。
 
 // clampChatGenerationContext / migrateChatPersistedState / ChatPersistedState /
 // sanitizeMessagesByScene 已抽到 ./chatStoreMigrate.ts（保持本文件在 structure-guard
@@ -717,12 +707,22 @@ export const useChatStore = create<ChatState>()(
       },
 
       cancelGeneration: (options = {}) => {
+        // mask-chat-card (审 F1 / SC-19): 先按 sceneId/messageId 精确解析 target。
+        // target 是 origin:'mask-edit' 且 in-flight → 在触碰 activeChatAbortController
+        // 之前委托 cancelMaskEditMessage 并 return。保证 chat×mask 并行时点 mask 卡取消
+        // 不会 abort 普通 chat 的全局 controller（mask 不置 isBusy、不用 activeChatAbortController）。
+        const target = fallbackCancelTarget(get().messagesByScene, options)
+        if (target && target.message.origin === 'mask-edit') {
+          cancelMaskEditMessage(target.sceneId, target.message.id)
+          return
+        }
+
+        // 普通 chat 分支：保持原有全局 abort + settleCanvasGenerationLocally 路径（零变化）。
         if (activeChatAbortController && !activeChatAbortController.signal.aborted) {
           activeChatAbortController.abort()
           return
         }
 
-        const target = fallbackCancelTarget(get().messagesByScene, options)
         if (!target) {
           debugLogger.warn('Chat Store', 'Cancel fallback skipped: no in-flight chat message found')
           return

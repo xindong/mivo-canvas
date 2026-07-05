@@ -5,7 +5,6 @@
 import type { MivoCanvasNode, MivoCanvasSnapshot } from '../types/mivoCanvas'
 import type { MivoImageQuality, MivoImageRatio } from '../types/generation'
 import { useCanvasStore } from '../store/canvasStore'
-import { useChatStore } from '../store/chatStore'
 import { AI_SLOT_GAP, reflowRightObstacles } from '../store/aiCanvasWorkflow'
 import { rollbackLatestHistoryBaseline } from '../store/canvasDocumentModel'
 import { debugLogger } from '../store/debugLogStore'
@@ -22,6 +21,16 @@ import {
 } from '../lib/mivoTaskClient'
 import { toastFeedback } from '../store/toastStore'
 import type { ImageMaskSubmitPayload } from './imageMaskGeometry'
+
+/** mask-chat-card: runMaskEditGeneration 回调，让 chat flow 驱动卡片状态而不直写 chat。 */
+export type MaskEditGenerationCallbacks = {
+  /** submitEditTask 返回 taskId 后立即触发（写入 message.maskEdit.serverTaskId 供 cancel fallback/debug）。 */
+  onTaskSubmitted?: (taskId: string) => void
+  /** 每次 poll 返 running 进度时触发（先只 patch maskEdit.phase，不新增进度 UI）。 */
+  onProgress?: (view: Awaited<ReturnType<typeof pollTask>>) => void
+  /** 黑盘自愈重试开始时触发（phase 置 self-heal-retry，card 保持 generating）。 */
+  onSelfHealRetry?: (taskIds: string[]) => void
+}
 
 const patchMaskEditSlotStatus = (
   sceneId: string,
@@ -230,8 +239,11 @@ export const runMaskEditGeneration = async (args: {
   imgRatio: MivoImageRatio
   quality?: MivoImageQuality
   signal: AbortSignal
-}): Promise<string[]> => {
+  /** mask-chat-card: chat flow 经回调驱动卡片状态，runMaskEditGeneration 不再直写 chat。 */
+  callbacks?: MaskEditGenerationCallbacks
+}): Promise<{ nodeIds: string[]; sourceDeleted: boolean }> => {
   const { sceneId, source, slotId, resolvedAssetUrl, payload, imgRatio, signal } = args
+  const callbacks = args.callbacks ?? {}
   // auto 路径：args.quality 与 payload.quality 均缺省 → undefined 透传，submitEditTask
   // 不带 quality 字段；不再强制回填 medium（与 chat 生图路径一致，由 server 默认）。
   const quality: MivoImageQuality | undefined = args.quality ?? payload.quality
@@ -266,6 +278,8 @@ export const runMaskEditGeneration = async (args: {
     })
     // FIX-1: 立即写外层 currentTaskId — poll 中途 abort 时 catch 的 cancelTask 才能 DELETE 这个在途 task。
     currentTaskId = taskId
+    // mask-chat-card: 通知 chat flow 已拿到 taskId（写 message.maskEdit.serverTaskId 供 cancel fallback/debug）。
+    callbacks.onTaskSubmitted?.(taskId)
     debugLogger.log(
       'Mask Edit',
       `Task ${taskId} submitted for ${source.title} (quality=${quality}) in ${Date.now() - submitStartedAt}ms`,
@@ -279,6 +293,7 @@ export const runMaskEditGeneration = async (args: {
 
       if (view.status === 'running' || view.status === 'pending') {
         patchMaskEditProgress(sceneId, slotId, view.progress, view.stage)
+        callbacks.onProgress?.(view)
         await sleep(taskPollIntervalMs(), signal)
         continue
       }
@@ -318,6 +333,8 @@ export const runMaskEditGeneration = async (args: {
         const second = await runOneAttempt(newIdempotencyKey())
         attemptTaskIds.push(second.taskId)
         serverTaskId = second.taskId
+        // mask-chat-card: 通知 chat flow 进入 self-heal 重试（card 保持 generating，不落中间 error）。
+        callbacks.onSelfHealRetry?.(attemptTaskIds)
         const secondBlack = await inspectMaskResultForBlackPlate(
           { sourceSizePx: payload.sourceSize, maskBoundsPx: payload.maskBounds! },
           { sourceBlob: image, resultB64: second.images[0]?.b64 ?? '' },
@@ -339,34 +356,34 @@ export const runMaskEditGeneration = async (args: {
     }
 
     const commitStartedAt = Date.now()
+    // mask-chat-card: commit 前重新检查 source 是否仍存在。source 已删时仍以 replaceSlotId
+    // 原位替换 placeholder，但不传 sourceNodeId/lineageSourceId/createDerivationEdge（避免
+    // documentSlice 的 source 校验阻断落图）；sourceDeleted 回传给 chat flow 写 message。
+    const sourceStillExists = useCanvasStore
+      .getState()
+      .canvases[sceneId]?.nodes.some((n) => n.id === source.id && n.type === 'image' && !n.hidden) ?? false
     const commitPayload = {
       sceneId,
-      sourceNodeId: source.id,
-      lineageSourceId: source.id,
+      ...(sourceStillExists
+        ? { sourceNodeId: source.id, lineageSourceId: source.id, createDerivationEdge: true as const }
+        : {}),
       replaceSlotId: slotId,
       reflow: true,
       resultImages: images,
       prompt: payload.prompt,
       model: 'gpt-image-2',
       kind: 'edit' as const,
-      createDerivationEdge: true,
       maskBounds: payload.maskBounds,
       placement: 'right' as const,
     }
     const nodeIds = await useCanvasStore.getState().commitGenerationResult(commitPayload)
-    const latest = useCanvasStore.getState()
-    useChatStore.getState().appendNotice({ sceneId, origin: 'mask-edit', nodeIds, prompt: payload.prompt })
-    if (latest.sceneId !== sceneId) {
-      const title = latest.canvases[sceneId]?.title || sceneId
-      useChatStore
-        .getState()
-        .appendNotice({ sceneId: latest.sceneId, origin: 'mask-edit', prompt: `结果已生成到画布 ${title}` })
-    }
+    // mask-chat-card: 不再在此处 appendNotice —— 同场景结果图由 chat flow 落 resultNodeIds，
+    // 跨场景 notice / chat mode replyText notice 由 chatMaskEditFlow 统一处理。
     debugLogger.log(
       'Mask Edit',
-      `Task ${serverTaskId} done for ${source.title}; commit ${Date.now() - commitStartedAt}ms; total ${Date.now() - startedAt}ms`,
+      `Task ${serverTaskId} done for ${source.title}; commit ${Date.now() - commitStartedAt}ms; total ${Date.now() - startedAt}ms; sourceDeleted=${!sourceStillExists}`,
     )
-    return nodeIds
+    return { nodeIds, sourceDeleted: !sourceStillExists }
   } catch (error) {
     // W2.2: overlay X/Esc → best-effort DELETE the upstream task before rethrowing
     // so the caller's removeMaskEditPlaceholder rolls back with #81 baselineSnapshot.
