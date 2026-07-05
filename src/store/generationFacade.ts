@@ -13,6 +13,7 @@
 // may throw if the target canvas was deleted (matches the prior inline guard).
 
 import { useCanvasStore } from './canvasStore'
+import { useCameraFocusStore } from './cameraFocusStore'
 import type { CanvasGenerationOptions, CanvasState } from './canvasStore'
 import type { CanvasId } from '../types/mivoCanvas'
 import { defaultSizeForNodeType } from '../canvas/nodeTypes/canvasNodeRegistry'
@@ -63,10 +64,22 @@ export const generationFacade = {
     const doc = store.canvases[params.sceneId]
     if (!doc) throw new Error('目标画布已删除，无法继续生成。')
 
+    // 镜头跟随契约:占位 slot 准备好后请求 auto-focus(新建与 retry 复用同待遇);
+    // 跨场景 skip 判定在 cameraFocusStore 内(#95 语义:不切场景、不动镜头)。
+    const requestSlotFocus = (slotId: string) =>
+      useCameraFocusStore.getState().requestPlaceholderFocus(slotId, {
+        targetSceneId: params.sceneId,
+        activeSceneId: store.sceneId,
+        source: 'chat-slot',
+      })
+
     const existing = params.pendingSlotId
       ? doc.nodes.find((n) => n.id === params.pendingSlotId && n.type === 'ai-slot' && !n.hidden)
       : undefined
-    if (existing) return { mode: 'slot', slotId: existing.id }
+    if (existing) {
+      requestSlotFocus(existing.id)
+      return { mode: 'slot', slotId: existing.id }
+    }
 
     const selectedNode = params.selectedNodeId
       ? doc.nodes.find((n) => n.id === params.selectedNodeId && !n.hidden)
@@ -93,6 +106,7 @@ export const generationFacade = {
       { sceneId: params.sceneId },
     )
     freshlyCreatedChatSlots.add(slotId)
+    requestSlotFocus(slotId)
     return { mode: 'slot', slotId }
   },
 

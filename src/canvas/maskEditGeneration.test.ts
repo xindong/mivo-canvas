@@ -47,6 +47,7 @@ vi.mock('../lib/maskResultInspection', () => ({
 
 import { useCanvasStore } from '../store/canvasStore'
 import { prepareMaskEditPlaceholder, removeMaskEditPlaceholder, runMaskEditGeneration } from './maskEditGeneration'
+import { useCameraFocusStore } from '../store/cameraFocusStore'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 
 // Helpers ---------------------------------------------------------------------
@@ -532,5 +533,36 @@ describe('runMaskEditGeneration onSelfHealRetry 时机 (F2)', () => {
 
     // 最终 onSelfHealRetry 收到 [task-1, task-2]
     expect(onSelfHealRetry).toHaveBeenCalledWith(['task-1', 'task-2'])
+  })
+})
+
+describe('mask-edit placeholder camera auto-focus request (镜头跟随)', () => {
+  beforeEach(() => {
+    useCameraFocusStore.setState({ pendingFocus: undefined })
+  })
+
+  it('prepare requests placeholder focus for the active scene', () => {
+    const source = imageNode({ id: 'src-1' })
+    seed(seedCanvas('character-flow', [source]))
+
+    const { slotId } = prepareMaskEditPlaceholder('character-flow', source, 'p')
+
+    expect(useCameraFocusStore.getState().pendingFocus).toEqual({ nodeId: slotId, source: 'mask-edit' })
+  })
+
+  it('prepare skips the focus request for a non-active scene (#95 跨场景语义:不动镜头)', () => {
+    const source = imageNode({ id: 'src-1' })
+    const otherScene = { title: 'other-scene', nodes: [source], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] }
+    seed({
+      ...seedCanvas('character-flow', []),
+      canvases: {
+        'character-flow': { title: 'character-flow', nodes: [], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] },
+        'other-scene': otherScene,
+      },
+    })
+
+    prepareMaskEditPlaceholder('other-scene', source, 'p')
+
+    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
   })
 })

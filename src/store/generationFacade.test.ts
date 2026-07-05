@@ -22,6 +22,7 @@ vi.mock('../lib/mivoImageClient', () => ({
 
 import { useCanvasStore } from './canvasStore'
 import { generationFacade } from './generationFacade'
+import { useCameraFocusStore } from './cameraFocusStore'
 import { AI_SLOT_GAP } from './aiCanvasWorkflow'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 
@@ -156,5 +157,38 @@ describe('generationFacade — delegation + failure rethrow (SC3.1 / A1 quirks)'
     const spy = vi.spyOn(useCanvasStore.getState(), 'generateBesideNode').mockRejectedValue(new Error('upstream 500'))
     await expect(generationFacade.generateBesideNode('img-1', 'p', { sceneId: 'c1' })).rejects.toThrow('upstream 500')
     spy.mockRestore()
+  })
+})
+
+
+describe('generationFacade.prepareChatSlot — camera auto-focus request (镜头跟随)', () => {
+  beforeEach(() => {
+    useCameraFocusStore.setState({ pendingFocus: undefined })
+  })
+
+  it('requests focus for a freshly created slot in the active scene', () => {
+    const prep = generationFacade.prepareChatSlot({ sceneId: 'c1', hasSelectedImage: false, prompt: 'p' })
+    expect(useCameraFocusStore.getState().pendingFocus).toEqual({ nodeId: prep.slotId, source: 'chat-slot' })
+  })
+
+  it('requests focus when reusing an existing pendingSlotId (retry path)', () => {
+    generationFacade.prepareChatSlot({ sceneId: 'c1', hasSelectedImage: false, pendingSlotId: 'slot-1', prompt: 'p' })
+    expect(useCameraFocusStore.getState().pendingFocus).toEqual({ nodeId: 'slot-1', source: 'chat-slot' })
+  })
+
+  it('does not request focus in beside mode', () => {
+    generationFacade.prepareChatSlot({ sceneId: 'c1', selectedNodeId: 'img-1', hasSelectedImage: true, prompt: 'p' })
+    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
+  })
+
+  it('skips the request when the target scene is not active (#95 跨场景语义:不动镜头)', () => {
+    useCanvasStore.setState({
+      canvases: {
+        ...useCanvasStore.getState().canvases,
+        c2: { title: 'Canvas Two', nodes: [], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] },
+      },
+    })
+    generationFacade.prepareChatSlot({ sceneId: 'c2', hasSelectedImage: false, prompt: 'p' })
+    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
   })
 })
