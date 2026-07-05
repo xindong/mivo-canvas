@@ -14,6 +14,7 @@ export const runChatGenerationScenario = async (context) => {
     rectsOverlap,
     wait,
     waitForChatIdle,
+    waitForPersistedKv,
   } = context
   const firstNodeId = context.firstNodeId ?? await page.locator('.dom-node').first().getAttribute('data-node-id')
 
@@ -226,11 +227,20 @@ export const runChatGenerationScenario = async (context) => {
   const assistantBubbles = await page.locator('.chat-message-assistant').count()
   if (assistantBubbles < 1) throw new Error('Assistant message bubble should appear after generation')
 
-  // Persist check: verify messages are durably stored in localStorage before reload
-  const storedMsgCount = await page.evaluate(() => {
+  // Persist check: verify messages are durably stored in IDB before reload. The IDB
+  // write is async (zustand persist fire-and-forgets setItem), so poll until the
+  // stored count reflects the generation. (FU4-2: was a sync localStorage.getItem.)
+  const storedMsgCount = await waitForPersistedKv(page, 'mivo-chat-demo', (raw) => {
     try {
-      const raw = localStorage.getItem('mivo-chat-demo')
-      if (!raw) return 0
+      const parsed = JSON.parse(raw)
+      const byScene = parsed?.state?.messagesByScene ?? {}
+      return Object.values(byScene).flat().length >= 2
+    } catch {
+      return false
+    }
+  }).then((raw) => {
+    if (!raw) return 0
+    try {
       const parsed = JSON.parse(raw)
       const byScene = parsed?.state?.messagesByScene ?? {}
       return Object.values(byScene).flat().length
@@ -238,7 +248,7 @@ export const runChatGenerationScenario = async (context) => {
       return 0
     }
   })
-  if (storedMsgCount < 2) throw new Error(`Chat messages should be persisted in localStorage, got ${storedMsgCount}`)
+  if (storedMsgCount < 2) throw new Error(`Chat messages should be persisted in IDB, got ${storedMsgCount}`)
 
   // NB3: gemini 4:3 → client sends {model, imgRatio:"4:3"}（gemini 专属比例，gpt 无；走 mivo 平台通道）
   let capturedGeminiPayload = null

@@ -19,13 +19,17 @@ import {
 import { startUpstreamMockServer } from './e2e/upstream-mock-server.mjs'
 import { scenarioOrder, scenarioRunners } from './e2e/scenarios/index.mjs'
 import {
+  clearAllStorage,
   createBaseUrl,
   createSmokePage,
   prepareSmokeArtifacts,
+  readPersistedKv,
   runCommand,
   startSmokeBffServer,
   startSmokeDevServer,
   stopSmokeDevServer,
+  waitForPersistedKv,
+  writePersistedKv,
 } from './e2e/harness.mjs'
 
 const requestedPort = Number(process.env.MIVO_E2E_PORT ?? 5174)
@@ -454,7 +458,10 @@ try {
   const bootstrapBaseCanvas = async () => {
     await restoreDefaultApiMocks()
     await page.goto(canvasUrl, { waitUntil: 'networkidle' })
-    await page.evaluate(() => window.localStorage.clear())
+    // FU4-2: clear IDB + localStorage + sessionStorage (migration markers). Each
+    // scenario runs on a fresh browser so this is defensive, but it guarantees no
+    // stale persisted state bleeds into the next scenario.
+    await clearAllStorage(page)
     await page.goto(canvasUrl, { waitUntil: 'networkidle' })
     if (rendererMode === 'leafer') {
       await page.waitForFunction(() => {
@@ -482,6 +489,7 @@ try {
     browser,
     canvasStoreSpec,
     chatStoreSpec,
+    clearAllStorage,
     ensureChatPanelOpen,
     firstNodeId: undefined,
     generatedImageB64,
@@ -498,10 +506,13 @@ try {
     readHeaderTasksIndicator,
     readLibraryLayout,
     readLibrarySurfaceColors,
+    readPersistedKv,
     rectsOverlap,
     wait,
     waitForCanvasState,
     waitForChatIdle,
+    waitForPersistedKv,
+    writePersistedKv,
     assertTasksHeaderCopy,
   }
   const allErrors = []

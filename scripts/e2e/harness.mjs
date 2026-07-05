@@ -6,6 +6,126 @@ import { attachDefaultMivoApiMocks } from './api-mocks.mjs'
 
 export const createBaseUrl = (port) => `http://127.0.0.1:${port}`
 
+// FU4-2: IndexedDB-backed persist helpers. The app's two stores (canvas + chat) now
+// persist to IDB ('mivo-canvas-persist' / 'kv'), so e2e scenarios that read/write the
+// persisted state or clear storage between scenarios must go through IDB, not
+// localStorage. These helpers open their own short-lived connection (coexists with
+// the app's long-lived one) and clear/Read/write the KV store. deleteDatabase is NOT
+// used because the app's open connection blocks it.
+//
+// NOTE: page.evaluate callbacks run in the BROWSER, so they cannot reference Node-side
+// closures (IDB_NAME/IDB_STORE). The DB + store names are inlined as string literals
+// inside each evaluate body. Keep them in sync if they ever change.
+
+/**
+ * Clear all persist storage: localStorage + sessionStorage (migration markers) +
+ * the IDB KV store. Safe to call while the app has an open IDB connection (uses a
+ * readwrite clear, NOT deleteDatabase). Runs in-page via page.evaluate.
+ */
+export const clearAllStorage = async (page) => {
+  await page.evaluate(async () => {
+    try { localStorage.clear() } catch { /* opaque origin */ }
+    try { sessionStorage.clear() } catch { /* opaque origin */ }
+    try {
+      await new Promise((resolve) => {
+        const req = indexedDB.open('mivo-canvas-persist', 1)
+        req.onupgradeneeded = () => {
+          if (!req.result.objectStoreNames.contains('kv')) {
+            req.result.createObjectStore('kv', { keyPath: 'key' })
+          }
+        }
+        req.onsuccess = () => {
+          const db = req.result
+          if (!db.objectStoreNames.contains('kv')) { db.close(); resolve(); return }
+          try {
+            const tx = db.transaction('kv', 'readwrite')
+            tx.objectStore('kv').clear()
+            tx.oncomplete = () => { db.close(); resolve() }
+            tx.onerror = () => { db.close(); resolve() }
+          } catch {
+            db.close()
+            resolve()
+          }
+        }
+        req.onerror = () => resolve()
+      })
+    } catch {
+      // IDB unavailable — nothing to clear
+    }
+  })
+}
+
+/** Read a persisted KV value (the raw JSON string zustand persist stored). */
+export const readPersistedKv = async (page, key) => {
+  return page.evaluate(async (k) => {
+    return new Promise((resolve) => {
+      const req = indexedDB.open('mivo-canvas-persist', 1)
+      req.onupgradeneeded = () => {
+        if (!req.result.objectStoreNames.contains('kv')) {
+          req.result.createObjectStore('kv', { keyPath: 'key' })
+        }
+      }
+      req.onsuccess = () => {
+        const db = req.result
+        if (!db.objectStoreNames.contains('kv')) { db.close(); resolve(null); return }
+        try {
+          const tx = db.transaction('kv', 'readonly')
+          const getReq = tx.objectStore('kv').get(k)
+          getReq.onsuccess = () => resolve(getReq.result ? getReq.result.value : null)
+          tx.oncomplete = () => db.close()
+          tx.onerror = () => { db.close(); resolve(null) }
+        } catch {
+          db.close()
+          resolve(null)
+        }
+      }
+      req.onerror = () => resolve(null)
+    })
+  }, key)
+}
+
+/** Write a persisted KV value (put upsert). Used by the migration scenario to inject
+ *  legacy v1 state before the app rehydrates from IDB. */
+export const writePersistedKv = async (page, key, value) => {
+  await page.evaluate(async ({ k, v }) => {
+    return new Promise((resolve) => {
+      const req = indexedDB.open('mivo-canvas-persist', 1)
+      req.onupgradeneeded = () => {
+        if (!req.result.objectStoreNames.contains('kv')) {
+          req.result.createObjectStore('kv', { keyPath: 'key' })
+        }
+      }
+      req.onsuccess = () => {
+        const db = req.result
+        if (!db.objectStoreNames.contains('kv')) { db.close(); resolve(); return }
+        try {
+          const tx = db.transaction('kv', 'readwrite')
+          tx.objectStore('kv').put({ key: k, value: v })
+          tx.oncomplete = () => { db.close(); resolve() }
+          tx.onerror = () => { db.close(); resolve() }
+        } catch {
+          db.close()
+          resolve()
+        }
+      }
+      req.onerror = () => resolve()
+    })
+  }, { k: key, v: value })
+}
+
+/** Poll readPersistedKv until predicate(rawString) returns true or timeout. Used for
+ *  persist checks where the IDB write is async (zustand persist fire-and-forgets the
+ *  setItem promise, so the read might lag the state change). */
+export const waitForPersistedKv = async (page, key, predicate, { timeout = 2000, interval = 50 } = {}) => {
+  const deadline = Date.now() + timeout
+  while (Date.now() < deadline) {
+    const raw = await readPersistedKv(page, key)
+    if (raw !== null && predicate(raw)) return raw
+    await new Promise((r) => setTimeout(r, interval))
+  }
+  return readPersistedKv(page, key)
+}
+
 // killStaleDevServer: detect and kill leftover dev/bff servers from a prior failed
 // e2e run *within the current worker's port-base segment only*. A stale dev/bff server
 // keeps the old debug log dir and breaks --strictPort restarts.

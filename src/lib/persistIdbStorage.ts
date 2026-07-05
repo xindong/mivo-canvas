@@ -160,6 +160,16 @@ export const idbStateStorage = {
   },
 
   setItem: async (name: string, value: string): Promise<void> => {
+    // Bench opt-out: the bench measures render perf, not persistence. Setting
+    // __MIVO_BENCH_PERSIST_SKIP__ makes setItem a no-op so 50k-node fixtures don't
+    // serialize+put on every replaceSnapshot (the old localStorage shim no-ops
+    // localStorage.setItem, which no longer intercepts this IDB-backed write).
+    if (
+      typeof globalThis !== 'undefined' &&
+      (globalThis as unknown as { __MIVO_BENCH_PERSIST_SKIP__?: boolean }).__MIVO_BENCH_PERSIST_SKIP__
+    ) {
+      return
+    }
     if (!isIdbAvailable()) {
       debugLogger.warn(SOURCE, 'IndexedDB unavailable; writing to localStorage')
       if (typeof localStorage !== 'undefined') localStorage.setItem(name, value)
