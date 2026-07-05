@@ -10,7 +10,8 @@ import {
   type MouseEvent as ReactMouseEvent,
 } from 'react'
 import { useLeaferSpikeRenderer } from '../render/useLeaferSpikeRenderer'
-import { filterDomNodesForLeaferSpike } from '../render/leaferSpikeFilter'
+import { usePixiSpikeRenderer } from '../render/usePixiSpikeRenderer'
+import { filterDomNodesForRendererSpike } from '../render/leaferSpikeFilter'
 import { LocateFixed, Minus, Plus, RotateCcw } from 'lucide-react'
 import { downloadCanvasNodeOriginal } from '../lib/assetDownload'
 import { canReadLocalAssetDrag, parseLocalAssetDragPayload } from '../lib/canvasAssetDrag'
@@ -231,10 +232,8 @@ export function MivoCanvas({
     viewport.y,
     visibleNodes,
   ])
-  const renderedNodes = useMemo(
-    () => filterDomNodesForLeaferSpike(canvasRenderedNodes, rendererMode),
-    [canvasRenderedNodes],
-  )
+  const pixiSpikeStats = usePixiSpikeRenderer({ hostRef, viewport, nodes: visibleNodes, rendererMode }), effectiveRendererMode = pixiSpikeStats.fallbackToDom ? 'dom' : rendererMode
+  const renderedNodes = useMemo(() => filterDomNodesForRendererSpike(canvasRenderedNodes, effectiveRendererMode), [canvasRenderedNodes, effectiveRendererMode])
 
   const openNodeContextMenu = useCallback(
     (nodeId: string, clientX: number, clientY: number) => {
@@ -374,7 +373,7 @@ export function MivoCanvas({
     return () => onRegisterExternalAssetDrop?.(undefined)
   }, [importLocalAssetAtClientPoint, onRegisterExternalAssetDrop])
 
-  const leaferSpikeStats = useLeaferSpikeRenderer({ hostRef, viewport, nodes: visibleNodes, rendererMode, isPanning })
+  const leaferSpikeStats = useLeaferSpikeRenderer({ hostRef, viewport, nodes: visibleNodes, rendererMode: effectiveRendererMode, isPanning })
 
   useEffect(() => {
     const shell = shellRef.current
@@ -473,7 +472,7 @@ export function MivoCanvas({
       } ${selectedNodes.length > 1 ? 'has-multi-selection' : ''} ${brushToolActive ? 'brush-tool' : ''} ${
         stampToolActive ? 'stamp-tool' : ''
       } ${maskArmed ? 'mask-armed' : ''}`}
-      aria-label="Mivo Canvas" data-renderer-mode={rendererMode} data-culling-mode={cullingMode}
+      aria-label="Mivo Canvas" data-renderer-mode={effectiveRendererMode} data-culling-mode={cullingMode}
       data-viewport-scale={viewport.scale} data-viewport-x={viewport.x} data-viewport-y={viewport.y}
       data-rendered-node-count={renderedNodes.length}
       data-total-node-count={visibleNodes.length}
@@ -483,6 +482,7 @@ export function MivoCanvas({
       data-leafer-pixel-sample-count={leaferSpikeStats.pixelSampleCount}
       data-leafer-sync-version={leaferSpikeStats.syncVersion}
       data-leafer-pan-cache-enabled={leaferSpikeStats.panCacheEnabled ? 'true' : 'false'} data-leafer-pan-cache-frozen={leaferSpikeStats.panCacheFrozen ? 'true' : 'false'} data-leafer-pan-cache-captures={leaferSpikeStats.panCacheCaptures} data-leafer-pan-cache-last-dx={leaferSpikeStats.panCacheLastDeltaX} data-leafer-pan-cache-last-dy={leaferSpikeStats.panCacheLastDeltaY}
+      data-pixi-expected-children={pixiSpikeStats.expectedChildren} data-pixi-children={pixiSpikeStats.children} data-pixi-pixel-nonempty={pixiSpikeStats.pixelNonEmpty ? 'true' : 'false'} data-pixi-pixel-sample-count={pixiSpikeStats.pixelSampleCount} data-pixi-sync-version={pixiSpikeStats.syncVersion} data-pixi-text-strategy={pixiSpikeStats.textStrategy} data-pixi-texture-pool-size={pixiSpikeStats.texturePoolSize}
       ref={shellRef}
       onWheel={handleWheel}
       onPointerDown={wrapCanvasPointerDown}
