@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   filterDomNodesForRendererSpike,
   hasMarkupTextLayer,
+  needsFrameTitleShell,
   needsMarkupTextShell,
 } from './leaferSpikeFilter'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
@@ -73,6 +74,33 @@ describe('needsMarkupTextShell — 文字壳判定', () => {
   })
 })
 
+describe('needsFrameTitleShell — frame 标题壳判定（FU-12）', () => {
+  const frame = (opts: Partial<MivoCanvasNode> = {}) =>
+    node({ type: 'frame', markupKind: undefined, title: 'Section 1', width: 560, height: 320, ...opts })
+
+  it('标题可见且非空 → 需要壳；空/全空白标题 → 不需要', () => {
+    expect(needsFrameTitleShell(frame())).toBe(true)
+    expect(needsFrameTitleShell(frame({ title: '' }))).toBe(false)
+    expect(needsFrameTitleShell(frame({ title: '   ' }))).toBe(false)
+    expect(needsFrameTitleShell(frame({ title: undefined }))).toBe(false)
+  })
+
+  it('sectionTitleVisible=false（标题隐藏）→ 不产生壳', () => {
+    expect(needsFrameTitleShell(frame({ sectionTitleVisible: false }))).toBe(false)
+  })
+
+  it('非 frame 类型一律 false（markup 走 needsMarkupTextShell）', () => {
+    expect(needsFrameTitleShell(node({ markupKind: 'rect', text: 'x', title: 't' }))).toBe(false)
+    expect(needsFrameTitleShell(node({ type: 'image', markupKind: undefined, title: 't' }))).toBe(false)
+  })
+
+  it('engine LOD 全景态：屏幕投影 < 阈值 → 标题随降级隐藏（与 markup 文字壳同口径）', () => {
+    expect(needsFrameTitleShell(frame(), { lodRequested: true, viewportScale: 0.05, lodThresholdPx: 32 })).toBe(false)
+    expect(needsFrameTitleShell(frame(), { lodRequested: true, viewportScale: 0.5, lodThresholdPx: 32 })).toBe(true)
+    expect(needsFrameTitleShell(frame(), { lodRequested: false, viewportScale: 0.05 })).toBe(true)
+  })
+})
+
 describe('filterDomNodesForRendererSpike — FU-11 文字壳放行', () => {
   const image = node({ id: 'img', type: 'image', markupKind: undefined })
   const rectWithText = node({ id: 'rt', text: '标注' })
@@ -81,24 +109,27 @@ describe('filterDomNodesForRendererSpike — FU-11 文字壳放行', () => {
   const arrowWithText = node({ id: 'at', markupKind: 'arrow', text: 'Flow' })
   const stampNode = node({ id: 'bt', markupKind: 'stamp', text: 'x' })
   const plainText = node({ id: 'tx', type: 'text', markupKind: undefined, text: 'hello' })
-  const all = [image, rectWithText, rectNoText, noteWithText, arrowWithText, stampNode, plainText]
+  const frameTitled = node({ id: 'ft', type: 'frame', markupKind: undefined, title: 'Section 1' })
+  const frameHiddenTitle = node({ id: 'fh', type: 'frame', markupKind: undefined, title: 'Hidden', sectionTitleVisible: false })
+  const all = [image, rectWithText, rectNoText, noteWithText, arrowWithText, stampNode, plainText, frameTitled, frameHiddenTitle]
 
   it('dom 模式：原样返回（默认行为零变化）', () => {
     expect(filterDomNodesForRendererSpike(all, 'dom')).toEqual(all)
   })
 
-  it('leafer 模式：有文字的 markup 放行文字壳，其余 Leafer 真画节点照旧过滤', () => {
+  it('leafer 模式：有文字的 markup 放行文字壳、标题可见的 frame 放行标题壳，其余 Leafer 真画节点照旧过滤', () => {
     expect(filterDomNodesForRendererSpike(all, 'leafer').map((n) => n.id)).toEqual([
       'rt',
       'nt',
       'at',
       'tx',
+      'ft',
     ])
   })
 
-  it('leafer 模式 + 编辑空文字 markup：编辑节点放行', () => {
+  it('leafer 模式 + 编辑空文字 markup：编辑节点放行（frame 隐藏标题仍不放行）', () => {
     expect(
       filterDomNodesForRendererSpike(all, 'leafer', { editingNodeId: 'rn' }).map((n) => n.id),
-    ).toEqual(['rt', 'rn', 'nt', 'at', 'tx'])
+    ).toEqual(['rt', 'rn', 'nt', 'at', 'tx', 'ft'])
   })
 })

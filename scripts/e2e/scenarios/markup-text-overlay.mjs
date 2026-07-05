@@ -10,6 +10,10 @@
  * （canvasActionModel.createMarkupAtContext: x-80, y-48），arrow 默认端点
  * (8,88)-(152,8) 的中点恰是节点中心 —— 因此对同一屏幕点 dblclick 一定命中
  * 本体（rect/note 面、arrow 线身），leafer 模式无 DOM 元素也能走画布 hit-test。
+ *
+ * FU-12：追加 frame(section) 标题壳断言——"New section here" 同样在 context 点
+ * 居中创建（560×320），标题默认 'Section N' 落地即可见；改名走双击 →
+ * window.prompt（page.once('dialog')驱动），两模式行为一致。
  */
 
 export const runMarkupTextOverlayScenario = async (context) => {
@@ -160,4 +164,48 @@ export const runMarkupTextOverlayScenario = async (context) => {
   } else if ((await page.locator('.dom-node.markup-node[data-markup-kind="rect"]').count()) !== 1) {
     throw new Error('dom mode: rect markup node should stay rendered after clearing text')
   }
+
+  // ---- frame(section) 标题壳（FU-12）：默认标题落地即可见 + 双击改名 ----
+  // 再 pan 一段到全新空白区，避免 560×320 的 section 压到前面创建的 markup
+  // （frame 层级在内容之下，dblclick 会被上层 markup 抢走命中）。
+  await page.mouse.move(shellBox.x + shellBox.width / 2, shellBox.y + shellBox.height / 2)
+  await page.mouse.wheel(2000, 0)
+  await page.waitForTimeout(200)
+  const frameSpot = { x: shellBox.x + shellBox.width * 0.5, y: shellBox.y + shellBox.height * 0.45 }
+  const nodeCountBeforeFrame = await readTotalNodeCount()
+  await page.mouse.click(frameSpot.x, frameSpot.y, { button: 'right' })
+  await page.getByRole('menuitem', { name: 'New section here' }).click()
+  await page.waitForFunction(
+    (expected) => Number(document.querySelector('.canvas-shell')?.getAttribute('data-total-node-count') || 0) === expected,
+    nodeCountBeforeFrame + 1,
+  )
+  await page.waitForSelector('.dom-node[data-node-type="frame"] .dom-frame-title')
+  const frameTitleText = await page.locator('.dom-node[data-node-type="frame"] .dom-frame-title').textContent()
+  if (!frameTitleText?.trim()) {
+    throw new Error(`section default title should be visible right after creation, got ${JSON.stringify(frameTitleText)}`)
+  }
+  const frameShellInfo = await page.evaluate(() => {
+    const shells = Array.from(document.querySelectorAll('.dom-node[data-node-type="frame"]'))
+    return shells.map((element) => ({
+      overlay: element.classList.contains('frame-title-overlay'),
+      bodyCount: element.querySelectorAll('.dom-frame-node').length,
+    }))
+  })
+  if (leaferMode) {
+    // 标题壳必须纯净：无盒体（底色/虚线框由 Leafer 真画）。
+    if (frameShellInfo.some((info) => !info.overlay || info.bodyCount !== 0)) {
+      throw new Error(`leafer mode: frame title shell must be title-only: ${JSON.stringify(frameShellInfo)}`)
+    }
+  } else if (frameShellInfo.some((info) => info.overlay || info.bodyCount !== 1)) {
+    throw new Error(`dom mode: frame should render its full body without overlay shell: ${JSON.stringify(frameShellInfo)}`)
+  }
+
+  // 改名：双击 frame 体 → window.prompt → 标题壳即时更新（两模式同一交互）。
+  const renamedTitle = `Renamed 分区 ${rendererMode}`
+  page.once('dialog', (dialog) => dialog.accept(renamedTitle))
+  await page.mouse.dblclick(frameSpot.x, frameSpot.y)
+  await page.waitForFunction(
+    (expected) => document.querySelector('.dom-node[data-node-type="frame"] .dom-frame-title')?.textContent === expected,
+    renamedTitle,
+  )
 }

@@ -24,6 +24,13 @@ import { isLeaferTextPaintRequested } from './textPaintMode'
  * bench-only engine LOD 全景态下文字壳随降级隐藏（0g 口径）。line/arrow 的
  * label 缺口由 leaferLinePaint 按同一份 markupTextGeometry 数学补画。
  *
+ * FU-12：frame(section) 标题同样收口——leaferShapePaint 只画 frame 盒体不画
+ * 标题，此前 dom-frame-title 随 DOM 被过滤（未记录的取舍）。现对"标题可见且
+ * 非空"的 frame 放行 DOM 节点，CanvasNodeView 只渲染 dom-frame-title
+ * （frame-title-overlay 壳）。无标题/隐藏标题不产生空壳；LOD 全景态与 markup
+ * 文字壳同口径隐藏。改名交互（双击 → window.prompt）走画布 hit-test，本就
+ * 不依赖 DOM 节点，两模式一致。
+ *
  * 4c 已知取舍：stamp 的 just-placed 落地动画（stamp-pop 弹跳 + impact 放射线，
  * App.css DOM-only 转瞬效果）在 leafer 模式暂不复现 —— 与 note 文本层同级的
  * 接受损失；绘制中的 brush 预览是 MivoCanvas 的 overlay SVG（非节点），两种
@@ -89,9 +96,19 @@ export type MarkupTextShellOptions = {
 /** 拥有 MarkupTextLayer 的 Leafer 真画集：stamp 以外的全部 markup——
  *  MarkupNodeView 对 note/rect/ellipse/brush/line/arrow 都渲染 MarkupTextLayer，
  *  且 isEditableTextNode 只排除 stamp（brush 也能双击编辑文字）。frame 标题
- *  是 dom-frame-title，非 MarkupTextLayer，不在本集。 */
+ *  是 dom-frame-title，非 MarkupTextLayer（FU-12 另立 needsFrameTitleShell）。 */
 export const hasMarkupTextLayer = (node: MivoCanvasNode): boolean =>
   node.type === 'markup' && node.markupKind !== 'stamp'
+
+/** 0g 口径：全景 LOD 态文字随降级隐藏。本体不参与 LOD（纯矢量），文字壳按
+ *  与 image/text 相同的屏幕投影阈值(engineSpikeLod)隐藏。 */
+const passesTextShellLod = (node: MivoCanvasNode, options: MarkupTextShellOptions): boolean => {
+  const lodRequested = options.lodRequested ?? isEngineLodRequested
+  if (!lodRequested) return true
+  const scale = options.viewportScale ?? 1
+  const thresholdPx = options.lodThresholdPx ?? engineLodThresholdPx
+  return Math.max(Math.abs(node.width), Math.abs(node.height)) * scale >= thresholdPx
+}
 
 /** leafer 模式下该节点是否保留"纯文字 DOM 壳"（CanvasNodeView markup-text-overlay）。 */
 export const needsMarkupTextShell = (
@@ -100,20 +117,25 @@ export const needsMarkupTextShell = (
 ): boolean => {
   if (!hasMarkupTextLayer(node)) return false
   if (!node.text?.trim() && node.id !== options.editingNodeId) return false
+  return passesTextShellLod(node, options)
+}
 
-  const lodRequested = options.lodRequested ?? isEngineLodRequested
-  if (!lodRequested) return true
-  // 0g 口径：全景 LOD 态文字随降级隐藏。markup 本体不参与 LOD（纯矢量），
-  // 文字壳按与 image/text 相同的屏幕投影阈值(engineSpikeLod)隐藏。
-  const scale = options.viewportScale ?? 1
-  const thresholdPx = options.lodThresholdPx ?? engineLodThresholdPx
-  return Math.max(Math.abs(node.width), Math.abs(node.height)) * scale >= thresholdPx
+/** FU-12: leafer 模式下 frame 是否保留"纯标题 DOM 壳"（CanvasNodeView
+ *  frame-title-overlay）。标题隐藏（sectionTitleVisible=false）或为空 → 无壳；
+ *  改名走 window.prompt，无编辑态壳需求（对比 markup 的 editingNodeId）。 */
+export const needsFrameTitleShell = (
+  node: MivoCanvasNode,
+  options: MarkupTextShellOptions = {},
+): boolean => {
+  if (node.type !== 'frame') return false
+  if (node.sectionTitleVisible === false || !node.title?.trim()) return false
+  return passesTextShellLod(node, options)
 }
 
 /**
  * leafer 模式下从 DOM 渲染列表里剔除已被 Leafer 画的节点；FU-11 起对需要
- * 文字层的 markup 节点放行（CanvasNodeView 渲染纯文字壳）。
- * dom 模式原样返回（默认行为零变化）。
+ * 文字层的 markup 节点放行（CanvasNodeView 渲染纯文字壳），FU-12 起对标题
+ * 可见的 frame 放行（纯标题壳）。dom 模式原样返回（默认行为零变化）。
  */
 export const filterDomNodesForRendererSpike = (
   nodes: MivoCanvasNode[],
@@ -121,7 +143,12 @@ export const filterDomNodesForRendererSpike = (
   textShellOptions: MarkupTextShellOptions = {},
 ): MivoCanvasNode[] =>
   rendererMode === 'leafer'
-    ? nodes.filter((node) => !isLeaferDomFiltered(node) || needsMarkupTextShell(node, textShellOptions))
+    ? nodes.filter(
+        (node) =>
+          !isLeaferDomFiltered(node) ||
+          needsMarkupTextShell(node, textShellOptions) ||
+          needsFrameTitleShell(node, textShellOptions),
+      )
     : rendererMode === 'pixi'
       ? nodes.filter((node) => !isPixiSpikePainted(node))
       : nodes

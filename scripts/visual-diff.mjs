@@ -220,6 +220,8 @@ const textFixtureNodes = () => {
  * （leafer 模式为 markup-text-overlay 纯文字壳），差异应集中在本体描边的
  * 抗锯齿；line/arrow 的 label 缺口数学与 DOM 同源（markupTextGeometry）。
  * mt-rect-empty 无文字——leafer 模式不应产生 DOM 壳（空壳回归探针）。
+ * FU-12：mt-frame 标题壳对照；mt-frame-hidden 标题隐藏——两模式都不画标题
+ * （dom 由 sectionTitleVisible 判断、leafer 由 filter 不放行壳，同为隐藏探针）。
  */
 const markupTextFixtureNodes = () => {
   const node = (props) => ({ status: 'ready', title: props.id, type: 'markup', ...props })
@@ -238,6 +240,8 @@ const markupTextFixtureNodes = () => {
     node({ id: 'mt-line-dashed', markupKind: 'line', x: 40, y: 520, width: 280, height: 100, markupStrokeStyle: 'dashed', markupStrokeWidth: 4, markupPoints: [{ x: 10, y: 90 }, { x: 270, y: 10 }], text: 'dashed 缺口' }),
     node({ id: 'mt-brush', markupKind: 'brush', markupBrushKind: 'marker', x: 620, y: 500, width: 260, height: 140, markupStrokeColor: '#d9542a', markupStrokeWidth: 6, markupPoints: [{ x: 12, y: 96 }, { x: 83, y: 40 }, { x: 145, y: 108 }, { x: 248, y: 48 }], text: 'brush 标注' }),
     node({ id: 'mt-rect-empty', markupKind: 'rect', x: 380, y: 520, width: 160, height: 100 }),
+    { status: 'ready', id: 'mt-frame', type: 'frame', title: '分区标题 Section', x: 1160, y: 120, width: 320, height: 220 },
+    { status: 'ready', id: 'mt-frame-hidden', type: 'frame', title: 'Hidden title', sectionTitleVisible: false, x: 1160, y: 420, width: 320, height: 200 },
   ]
 }
 
