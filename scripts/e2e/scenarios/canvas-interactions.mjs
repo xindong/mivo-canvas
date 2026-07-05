@@ -324,7 +324,18 @@ export const runCanvasInteractionsScenario = async (context) => {
   if ((await page.locator('.selection-quick-toolbar').count()) !== 0) {
     throw new Error('Freshly drawn markup should wait for a second click before showing edit controls')
   }
-  await arrowMarkupNode.click()
+  // Phase 1b-4: line/arrow are stroke-only hits (1b-2). Playwright actionability
+  // can't reliably click pointer-events:stroke SVG, so click the .markup-hit-line
+  // bbox center via page.mouse (coordinate-based, no actionability) — lands on the
+  // stroke, shell dispatch resolves the hit. 1b-4 correction: shouldStartCanvasSurface
+  // Interaction 的 gate 已改为 instanceof Element(接受 SVGElement),.markup-hit-line
+  // (SVG <line>) 的 native 事件不再被 dispatch gate 拒绝,真实点击能选中。
+  const clickMarkupStroke = async (nodeLocator) => {
+    const hitBox = await nodeLocator.locator('.markup-hit-line').boundingBox()
+    if (!hitBox) throw new Error('markup-hit-line not found for stroke click')
+    await page.mouse.click(hitBox.x + hitBox.width / 2, hitBox.y + hitBox.height / 2)
+  }
+  await clickMarkupStroke(arrowMarkupNode)
   await page.waitForSelector('.selection-quick-toolbar')
   await page.waitForFunction(() => document.querySelectorAll('.dom-node.markup-node.selected .markup-point-handle').length === 2)
   if ((await arrowMarkupNode.locator('.node-handle').count()) !== 0) {
