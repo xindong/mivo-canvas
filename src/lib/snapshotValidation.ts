@@ -141,8 +141,16 @@ const isGeneration = (value: unknown) => {
     (value.strength === undefined || typeof value.strength === 'number') &&
     (value.taskId === undefined || typeof value.taskId === 'string') &&
     (value.createdAt === undefined || typeof value.createdAt === 'number') &&
-    isCanvasMaskBounds(value.maskBounds)
+    isCanvasMaskBounds(value.maskBounds) &&
+    isMaskSourceSize(value.maskSourceSize)
   )
+}
+
+// 黑块修复：generation.maskSourceSize（可选，maskBounds 的坐标空间标定）。
+const isMaskSourceSize = (value: unknown) => {
+  if (value === undefined) return true
+  if (!isRecord(value)) return false
+  return typeof value.width === 'number' && typeof value.height === 'number'
 }
 
 // P2-D1 EXPERIMENTAL: light validation for experimentalAnchors. box anchors must

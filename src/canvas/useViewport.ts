@@ -27,6 +27,7 @@ import { virtualizationMode } from '../render/virtualizationMode'
 import { useCameraFocusStore } from '../store/cameraFocusStore'
 import { debugLogger } from '../store/debugLogStore'
 import { viewportToRevealBounds } from './autoFocusPlaceholder'
+import { applyEngineSpikeCamera } from '../render/engineSpikeCameraBridge'
 
 export const defaultViewportFor = (sceneId: string): Viewport => ({
   x: 420,
@@ -75,16 +76,22 @@ const applyViewportImperatively = (shell: HTMLElement | null, viewport: Viewport
   shell.dataset.viewportScale = String(viewport.scale)
   shell.dataset.viewportX = String(viewport.x)
   shell.dataset.viewportY = String(viewport.y)
-  shell.style.backgroundPosition = `${viewport.x}px ${viewport.y}px`
-  shell.style.backgroundSize = `${36 * viewport.scale}px ${36 * viewport.scale}px`
+  const engineOnlyPan =
+    shell.dataset.engineLodEnabled === 'true' &&
+    (shell.dataset.rendererMode === 'leafer' || shell.dataset.rendererMode === 'pixi')
+  if (!engineOnlyPan) {
+    shell.style.backgroundPosition = `${viewport.x}px ${viewport.y}px`
+    shell.style.backgroundSize = `${36 * viewport.scale}px ${36 * viewport.scale}px`
+  }
   const domLayer = shell.querySelector<HTMLElement>('.dom-canvas-layer')
-  if (domLayer) domLayer.style.transform = `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})`
+  if (domLayer && !engineOnlyPan) domLayer.style.transform = `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})`
   const leaferCanvas = shell.querySelector<HTMLCanvasElement>('.canvas-host canvas')
   const frozenX = Number(leaferCanvas?.dataset.panCacheFrozenX ?? viewport.x)
   const frozenY = Number(leaferCanvas?.dataset.panCacheFrozenY ?? viewport.y)
   if (leaferCanvas?.dataset.panCacheFrozen === 'true') {
     leaferCanvas.style.transform = `translate3d(${viewport.x - frozenX}px, ${viewport.y - frozenY}px, 0)`
   }
+  applyEngineSpikeCamera(viewport)
 }
 
 type UseViewportOptions = {

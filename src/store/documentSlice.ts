@@ -352,6 +352,7 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
           taskId,
           createdAt,
           maskBounds: payload.maskBounds,
+          maskSourceSize: payload.maskSourceSize,
           operation,
           sourceNode: lineageNode,
           placementDirection: payload.placement || 'right',

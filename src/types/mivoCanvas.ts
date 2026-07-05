@@ -319,6 +319,11 @@ export type MivoCanvasNode = {
     taskId?: string
     createdAt?: number
     maskBounds?: CanvasMaskBounds
+    // 黑块修复：maskBounds 的坐标空间标定。仅局部重绘（area-edit）结果节点携带，
+    // 值为提交编辑时源图的 natural pixel 尺寸 —— 二次重绘时把上次洞区等比映射到
+    // 新源图空间做高优先黑块检测。可选 + 向后兼容：不 bump persist version，
+    // 缺失（旧数据 / annotation 画布坐标路径）时检测器跳过历史洞区。
+    maskSourceSize?: { width: number; height: number }
   }
   aiWorkflow?: CanvasAiWorkflow
   /** P2-D1 EXPERIMENTAL — see {@link ExperimentalAnchor}. Undefined on most nodes. */
