@@ -3,8 +3,9 @@ import { Image, Rect, Leafer, Text } from 'leafer-ui'
 import '@leafer-in/view'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 import type { RendererMode } from './rendererMode'
-import { isLeaferSpikePainted } from './leaferSpikeFilter'
+import { isLeaferShapePaintedNode, isLeaferSpikePainted } from './leaferSpikeFilter'
 import { useCanvasStore } from '../store/canvasStore'
+import { debugLogger } from '../store/debugLogStore'
 import { registerEngineSpikeCamera } from './engineSpikeCameraBridge'
 import { isEngineLodRequested } from './engineLodMode'
 import {
@@ -17,6 +18,7 @@ import {
   type EngineLodStatsCarrier,
 } from './engineSpikeLod'
 import { createLeaferImagePaint } from './leaferImagePaint'
+import { createLeaferShapePaint, leaferZOrderMapFor } from './leaferShapePaint'
 
 /**
  * 0b spike — Phase 2b 正式化时按 phase2b-adapter-camera-zorder.md 重构
@@ -24,10 +26,11 @@ import { createLeaferImagePaint } from './leaferImagePaint'
  *
  * 最小 LeaferRenderer：初始化 Leafer（hittable:false，D1 不抢 pointer；canvas-host CSS
  * pointer-events:none 已是双保险）+ 相机单向同步（React viewport → leafer.zoomLayer.set，
- * 禁反向监听）+ paint image/frame/rect（diff add/update/remove）。
+ * 禁反向监听）+ paint 编排：image → leaferImagePaint（3c），frame/markup shape →
+ * leaferShapePaint（4a），bench-only LOD text → inline loop（diff add/update/remove）。
  *
  * dom 模式仅保留 Leafer init（空白 canvas，与 PR-1 前行为一致），不 paint、不 sync。
- * leafer 模式当前只画三类；其余节点继续 DOM（见 leaferSpikeFilter）。
+ * leafer 模式画 image/frame/rect/ellipse/note；其余节点继续 DOM（见 leaferSpikeFilter）。
  *
  * 交互在 leafer 模式下允许暂时残缺（spike 只测渲染性能；pan/zoom 走 viewport 不依赖节点命中）。
  */
@@ -124,21 +127,14 @@ const leaferSpikePaintProps = (node: MivoCanvasNode, viewport: ViewportState) =>
       textAlign: node.textAlign || 'left',
     }
   }
-  if (node.type === 'frame') {
-    return {
-      ...base,
-      fill: node.sectionFillColor ?? node.frameColor ?? '#ffffff',
-      stroke: node.sectionBorderColor ?? node.frameColor,
-      strokeWidth: node.sectionBorderWidth ?? 0,
-    }
-  }
-  // markup-rect
-  return {
-    ...base,
-    fill: node.markupFillColor ?? 'rgba(105,87,232,0.08)',
-    stroke: node.markupStrokeColor ?? '#6957e8',
-    strokeWidth: node.markupStrokeWidth ?? 0,
-  }
+  // 4a 之后 inline loop 只会收到 bench-only LOD text（frame/markup shape 走
+  // leaferShapePaint，image 走 leaferImagePaint）；这里兜底画占位矩形并 fail
+  // visibly，避免路由 drift 时静默画错。
+  debugLogger.warn(
+    'Leafer Spike',
+    `inline loop received unexpected node ${node.id} (type=${node.type}) — paint routing drift, drawing placeholder rect`,
+  )
+  return { ...base, fill: 'rgba(105,87,232,0.08)', strokeWidth: 0 }
 }
 
 const createLeaferSpikeObject = (node: MivoCanvasNode, viewport: ViewportState): PaintedEntry => {
@@ -227,6 +223,9 @@ export const useLeaferSpikeRenderer = ({
   // diffReconcilePlan). One instance per Leafer; created on init, disposed on
   // teardown so every image lease is released when Leafer is destroyed.
   const imagePaintRef = useRef<ReturnType<typeof createLeaferImagePaint> | null>(null)
+  // Phase 4a: frame / markup shape (rect/ellipse/note) paint is formalized into
+  // leaferShapePaint (projection sunk defaults + diffReconcilePlan + 2b-2 z-order).
+  const shapePaintRef = useRef<ReturnType<typeof createLeaferShapePaint> | null>(null)
   const lodSummaryRef = useRef<string | undefined>(undefined)
   const panCacheEnabled = useMemo(() => parsePanCacheEnabled(), [])
   const frozenViewportRef = useRef<ViewportState | null>(null)
@@ -243,12 +242,18 @@ export const useLeaferSpikeRenderer = ({
   const lodViewport = useMemo(() => ({ x: 0, y: 0, scale: viewport.scale }), [viewport.scale])
 
   const paintedNodes = useMemo(() => nodes.filter(isLeaferEngineComboPainted), [nodes])
-  // Phase 3c: image nodes are painted by leaferImagePaint (lease + crop + contract),
-  // not the inline spike loop. The inline loop handles frame / markup-rect / text;
-  // paintedNodes (incl. image) still drives expectedChildren + lodStats + the
-  // signature dep so the effect re-runs when image nodes change.
-  const nonImagePaintedNodes = useMemo(
-    () => paintedNodes.filter((node) => node.type !== 'image'),
+  // Phase 3c/4a: image nodes are painted by leaferImagePaint (lease + crop +
+  // contract), frame/markup shapes by leaferShapePaint (projection defaults +
+  // contract + z-order). The inline loop only handles what neither module owns
+  // — in practice text under the bench-only engine-LOD combo mode.
+  // paintedNodes (incl. image/shape) still drives expectedChildren + lodStats +
+  // the signature dep so the effect re-runs when any painted node changes.
+  const inlinePaintedNodes = useMemo(
+    () => paintedNodes.filter((node) => node.type !== 'image' && !isLeaferShapePaintedNode(node)),
+    [paintedNodes],
+  )
+  const shapePaintedNodes = useMemo(
+    () => paintedNodes.filter(isLeaferShapePaintedNode),
     [paintedNodes],
   )
   const imagePaintedNodes = useMemo(
@@ -341,6 +346,8 @@ export const useLeaferSpikeRenderer = ({
       // Bind the image paint module to this Leafer instance. Disposed in the
       // cleanup below so every image lease is released on Leafer teardown.
       imagePaintRef.current = createLeaferImagePaint(leafer)
+      // Bind the shape paint module (4a) to the same Leafer instance.
+      shapePaintRef.current = createLeaferShapePaint(leafer)
 
       resizeObserver = new ResizeObserver(([entry]) => {
         if (!entry || !leaferRef.current) return
@@ -360,6 +367,8 @@ export const useLeaferSpikeRenderer = ({
       resizeObserver?.disconnect()
       imagePaintRef.current?.dispose()
       imagePaintRef.current = null
+      shapePaintRef.current?.dispose()
+      shapePaintRef.current = null
       leafer?.destroy()
       leaferRef.current = null
       setLeaferReady(false)
@@ -486,25 +495,41 @@ export const useLeaferSpikeRenderer = ({
       }
       // Release every image lease too (3c): sync([]) deletes all image entries,
       // revoking shared blob URLs so dom mode owns the only outstanding leases.
-      imagePaintRef.current?.sync([], {
+      const emptyCtx = {
         viewport: lodViewport,
         selectedNodeIds: EMPTY_SELECTED_IDS,
-        // isPanning is informational only; leaferImagePaint does not read it.
+        // isPanning is informational only; the paint modules do not read it.
         // Passing false (not the prop) keeps this effect off the isPanning dep
         // so pan does not re-run paint → no setStats → 0g invariant 1 holds.
         isPanning: false,
-      })
+      }
+      imagePaintRef.current?.sync([], emptyCtx)
+      // 4a: clear all shape objects the same way when leaving leafer mode.
+      shapePaintRef.current?.sync([], emptyCtx)
       queueMicrotask(() => publishStats({ ...EMPTY_STATS, panCacheEnabled }))
       return
     }
 
     const lodStats = summarizeEngineLod(paintedNodes, lodViewport)
     recordEngineLodSummary('Leafer Spike', lodStats, lodSummaryRef)
+    // 4a (2b-2 z-order): one z-order map over the FULL painted list (shapes +
+    // images + inline text), shared by every paint module via ctx.layerOf, so
+    // frames stack under content and document order holds across modules —
+    // matching the DOM zIndex / hitTest defaultZOrderCompare policy.
+    const zOrder = leaferZOrderMapFor(paintedNodes)
+    const syncCtx = {
+      viewport: lodViewport,
+      selectedNodeIds: EMPTY_SELECTED_IDS,
+      layerOf: (nodeId: string) => zOrder.get(nodeId),
+      // isPanning informational only (modules ignore); passing false (not the
+      // prop) keeps this effect off the isPanning dep → 0g invariant 1 holds.
+      isPanning: false,
+    }
     const nextIds = new Set<string>()
-    // Phase 3c: image nodes are reconciled by leaferImagePaint (lease + crop +
-    // diffReconcilePlan) after the inline loop. The inline loop only handles
-    // frame / markup-rect / text (nonImagePaintedNodes).
-    for (const node of nonImagePaintedNodes) {
+    // Phase 3c/4a: image nodes → leaferImagePaint, frame/markup shapes →
+    // leaferShapePaint (both after this loop). The inline loop only handles
+    // inlinePaintedNodes (bench-only engine-LOD text).
+    for (const node of inlinePaintedNodes) {
       nextIds.add(node.id)
       const signature = paintSignatureFor(node, lodViewport)
       const existing = painted.get(node.id)
@@ -529,6 +554,12 @@ export const useLeaferSpikeRenderer = ({
         painted.set(node.id, entry)
         signatures.set(node.id, signature)
       }
+      // z-order also applies to inline objects (outside the signature gate:
+      // the doc index can shift without the node's own fields changing).
+      const zIndex = zOrder.get(node.id)
+      if (zIndex !== undefined) {
+        ;(painted.get(node.id)?.object as unknown as { set: (props: unknown) => void } | undefined)?.set({ zIndex })
+      }
     }
 
     for (const [id, entry] of painted) {
@@ -539,15 +570,14 @@ export const useLeaferSpikeRenderer = ({
       }
     }
 
+    // 4a: reconcile frame/markup shapes through the projection-defaults +
+    // diffReconcilePlan contract (创建/更新/删除收支 asserted in unit tests).
+    shapePaintRef.current?.sync(shapePaintedNodes, syncCtx)
+
     // 3c: reconcile image nodes through the lease + clip + diffReconcilePlan
     // contract. Acquire/release is balanced per sync (created/updated/deleted
     // returned here for accounting; lease balance asserted in unit tests).
-    imagePaintRef.current?.sync(imagePaintedNodes, {
-      viewport: lodViewport,
-      selectedNodeIds: EMPTY_SELECTED_IDS,
-      // isPanning informational only (module ignores); see note above on 0g invariant 1.
-      isPanning: false,
-    })
+    imagePaintRef.current?.sync(imagePaintedNodes, syncCtx)
 
     const syncVersion = statsRef.current.syncVersion + 1
     publishStats(withEngineLodStats({
@@ -587,7 +617,7 @@ export const useLeaferSpikeRenderer = ({
     return () => {
       cancelled = true
     }
-  }, [hostRef, imagePaintedNodes, leaferReady, lodViewport, nonImagePaintedNodes, panCacheEnabled, paintedNodes, paintedNodeSignature, publishStats, rendererMode])
+  }, [hostRef, imagePaintedNodes, inlinePaintedNodes, leaferReady, lodViewport, panCacheEnabled, paintedNodes, paintedNodeSignature, publishStats, rendererMode, shapePaintedNodes])
 
   useEffect(() => {
     window.__MIVO_LEAFER_SPIKE__ = {

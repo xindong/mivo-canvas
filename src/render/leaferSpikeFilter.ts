@@ -5,21 +5,37 @@ import { isEngineLodRequested } from './engineLodMode'
 /**
  * 0b spike — Phase 2b 正式化时按 phase2b-adapter-camera-zorder.md 重构。
  *
- * leafer 模式下 image / frame / markup-rect 由 LeaferRenderer 真画，不再渲染 DOM 节点，
- * 否则测不出渲染性能差异。其余类型（text / markdown / ai-slot / task-placeholder /
- * markup 非 rect / connector 等）继续走 DOM。
+ * leafer 模式下 image / frame / markup shape(rect/ellipse/note) 由 Leafer 真画，
+ * 不再渲染 DOM 节点。其余类型（text / markdown / ai-slot / task-placeholder /
+ * markup line/arrow/brush/stamp / connector 等）继续走 DOM。
  *
- * spike 只画三类（image/frame/rect）是 0b 规模验证的最小集；Phase 3+ 才扩展到
- * line/brush/stamp/static-text 等其余 paint 类型。
+ * Phase 4a 把 shape 集从 spike 的 markup-rect 扩到 rect/ellipse/note（frame 已在
+ * 0b 集内）；line/arrow/connector 归 4b，brush/stamp 归 4c，静态文本归 Phase 5。
+ *
+ * 已知取舍（Phase 5 前）：markup shape 的文字层（MarkupTextLayer —— note 的正文、
+ * rect/ellipse 的标注文字）随 DOM 节点一起被过滤，leafer 模式下暂不可见/不可编辑
+ * —— 与 spike 已有的 markup-rect 行为一致，Phase 5 静态文本 spike 决定去向。
  */
 
+/** Phase 4a shape 集：frame(section) + markup rect/ellipse/note。
+ *  leaferShapePaint.ts 消费同一谓词，保证 filter（DOM 不画）与 paint（Leafer 画）
+ *  永远同集，不会出现两边都画/两边都不画。 */
+export const isLeaferShapePaintedNode = (node: MivoCanvasNode): boolean =>
+  node.type === 'frame' ||
+  (node.type === 'markup' &&
+    (node.markupKind === 'rect' || node.markupKind === 'ellipse' || node.markupKind === 'note'))
+
 export const isLeaferSpikePainted = (node: MivoCanvasNode): boolean =>
+  node.type === 'image' || isLeaferShapePaintedNode(node)
+
+/** Pixi spike 谓词冻结在 0b 集（image/frame/markup-rect/text）：pixi 已 NO-GO
+ *  （engine-combo-0g），其 paint 分支不扩 4a shape 集，避免 pixi 模式下 DOM 被
+ *  过滤而 pixi 只会画矩形的 ellipse/note 视觉错位。 */
+export const isPixiSpikePainted = (node: MivoCanvasNode): boolean =>
   node.type === 'image' ||
   node.type === 'frame' ||
-  (node.type === 'markup' && node.markupKind === 'rect')
-
-export const isPixiSpikePainted = (node: MivoCanvasNode): boolean =>
-  isLeaferSpikePainted(node) || node.type === 'text'
+  (node.type === 'markup' && node.markupKind === 'rect') ||
+  node.type === 'text'
 
 const isLeaferDomFiltered = (node: MivoCanvasNode): boolean =>
   isLeaferSpikePainted(node) || (isEngineLodRequested && node.type === 'text')
