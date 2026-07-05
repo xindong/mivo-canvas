@@ -41,6 +41,11 @@
   --ai-panel-w: 340px;
   --ai-panel-collapsed-w: 58px;
   --ai-panel-offset: 12px;
+  --ai-panel-border: 1px;
+  /* 收起按钮相对面板左上角的内边距（= .ai-panel-header 的 top/right padding）。
+     折叠态按钮与折叠态缩放条据此锚定到展开态收起按钮的同一屏幕坐标。 */
+  --ai-panel-toggle-top: 16px;
+  --ai-panel-toggle-right: 18px;
   --floating-gap: 14px;
   display: grid;
   grid-template-columns: var(--project-w) minmax(0, 1fr);
@@ -708,8 +713,6 @@ button:disabled {
 .section-heading button,
 .compact-icon,
 .ai-panel-toggle,
-.ai-compact-toggle,
-.ai-compact-icon,
 .icon-command,
 .panel-close,
 .favorite,
@@ -5969,8 +5972,9 @@ button:disabled {
   right: calc(var(--ai-panel-offset) + var(--ai-panel-w) + var(--floating-gap));
 }
 
+/* 折叠后缩放条右缘对齐折叠态收起按钮的右缘（同一屏幕 x：offset + 边框 + header 右内边距）。 */
 .mivo-app.ai-collapsed .canvas-controls {
-  right: calc(var(--ai-panel-offset) + var(--ai-panel-collapsed-w) + var(--floating-gap));
+  right: calc(var(--ai-panel-offset) + var(--ai-panel-border) + var(--ai-panel-toggle-right));
 }
 
 .canvas-controls button {
@@ -6039,8 +6043,10 @@ button:disabled {
 .ai-panel {
   position: absolute;
   right: var(--ai-panel-offset);
-  top: 12px;
-  bottom: 12px;
+  /* top/bottom 引用同一 offset 变量：折叠态锚定 calc 也用它，二者锁定，
+     改 offset 不会破坏「展开/折叠收起按钮同屏坐标」不变量。 */
+  top: var(--ai-panel-offset);
+  bottom: var(--ai-panel-offset);
   z-index: 8;
   width: min(var(--ai-panel-w), calc(100% - 28px));
   height: auto;
@@ -6050,21 +6056,30 @@ button:disabled {
   overflow: hidden;
   color: var(--ink);
   background: rgba(255, 253, 248, 0.95);
-  border: 1px solid var(--line);
+  border: var(--ai-panel-border) solid var(--line);
   border-radius: var(--radius-lg);
   box-shadow: 0 12px 30px rgba(35, 35, 35, 0.1);
 }
 
+/* 折叠态：不再是右下角浮动的窄栏 + 两个 icon，而是把唯一的展开按钮锚定到
+   展开态收起按钮所在的屏幕坐标（面板左上角 offset + 边框 + header 内边距），
+   点它原地展开。按钮自身样式沿用 .ai-panel-toggle，与展开态像素一致。 */
 .ai-panel.collapsed {
-  grid-template-rows: auto auto auto auto minmax(0, 1fr);
-  justify-items: center;
-  width: var(--ai-panel-collapsed-w);
-  top: auto;
+  top: calc(var(--ai-panel-offset) + var(--ai-panel-border) + var(--ai-panel-toggle-top));
+  right: calc(var(--ai-panel-offset) + var(--ai-panel-border) + var(--ai-panel-toggle-right));
+  bottom: auto;
+  left: auto;
+  display: block;
+  width: auto;
   height: auto;
   max-height: none;
-  gap: 9px;
-  padding: 12px 8px;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  /* 壳透明无边框，圆角不可见；但保留共享面板圆角不变量（e2e 校验 .ai-panel = --radius-lg）。 */
   border-radius: var(--radius-lg);
+  box-shadow: none;
+  overflow: visible;
 }
 
 .ai-panel-header {
@@ -6073,7 +6088,7 @@ button:disabled {
   justify-content: space-between;
   min-width: 0;
   gap: 12px;
-  padding: 16px 18px 12px;
+  padding: var(--ai-panel-toggle-top) var(--ai-panel-toggle-right) 12px;
 }
 
 .ai-panel-tasks {
@@ -6098,9 +6113,7 @@ button:disabled {
   color: var(--ochre);
 }
 
-.ai-panel-toggle,
-.ai-compact-toggle,
-.ai-compact-icon {
+.ai-panel-toggle {
   width: 36px;
   height: 36px;
   padding: 0;
@@ -6110,14 +6123,11 @@ button:disabled {
   border-radius: var(--radius-md);
 }
 
-.ai-panel-toggle {
+.ai-panel-header .ai-panel-toggle {
   margin-left: auto;
 }
 
-.ai-panel-toggle:hover,
-.ai-compact-toggle:hover,
-.ai-compact-icon:hover,
-.ai-compact-icon.active {
+.ai-panel-toggle:hover {
   color: var(--ink);
   background: #fffaf0;
   border-color: #b9afa1;
