@@ -10,7 +10,11 @@ import { rollbackLatestHistoryBaseline } from '../store/canvasDocumentModel'
 import { debugLogger } from '../store/debugLogStore'
 import { readCanvasImageBlob } from '../lib/canvasImageSource'
 import { MivoImageRequestError } from '../lib/mivoImageClient'
-import { inspectMaskResultForBlackPlate } from '../lib/maskResultInspection'
+import {
+  inspectMaskResultForBlackArtifacts,
+  mapBoundsToResultSpace,
+  type MaskArtifactInput,
+} from '../lib/maskResultInspection'
 import {
   cancelTask,
   kindForFailedTask,
@@ -19,7 +23,6 @@ import {
   taskPollIntervalMs,
   type TaskResultImage,
 } from '../lib/mivoTaskClient'
-import { toastFeedback } from '../store/toastStore'
 import type { ImageMaskSubmitPayload } from './imageMaskGeometry'
 
 /** mask-chat-card: runMaskEditGeneration 回调，让 chat flow 驱动卡片状态而不直写 chat。 */
@@ -325,17 +328,32 @@ export const runMaskEditGeneration = async (args: {
     let images = first.images
     const attemptTaskIds = [first.taskId]
 
-    // W1 self-heal: 检测结果图黑盘 → 新 idempotencyKey 重试 1 次。
-    // 仅当有 maskBounds（annotation area-edit 模式）且有结果 b64 时检测；brush
-    // mask 模式无 bounds，跳过检测（保守不重试）。二次仍黑 → 照常 commit 重试
-    // 结果 + warn toast + debugLogger.error 附两个 taskId 证据。
+    // W1 self-heal（黑块修复扩面）: 结果图黑块检测 → 新 idempotencyKey 重试 1 次；
+    // 第二次仍异常 → 绝不 commitGenerationResult，抛错走 failMaskEditMessage（移除
+    // placeholder + 卡片 error）。宁可失败不落坏图。检测覆盖：当前 mask 区 plate、
+    // 上次编辑洞区（source.generation.maskBounds+maskSourceSize 映射）、全图近黑
+    // 连通组件（区域外黑块）。仅当有 maskBounds（annotation area-edit 模式）且有
+    // 结果 b64 时检测；brush mask 模式无 bounds，跳过检测（保守不重试，行为不变）。
     const canInspect = Boolean(payload.maskBounds && images[0]?.b64)
     if (canInspect) {
-      const blackPlate = await inspectMaskResultForBlackPlate(
-        { sourceSizePx: payload.sourceSize, maskBoundsPx: payload.maskBounds! },
-        { sourceBlob: image, resultB64: images[0].b64 },
-      )
-      if (blackPlate) {
+      // 历史洞区：source 若是上次局部重绘的结果（generation.maskBounds + maskSourceSize），
+      // 把上次洞区从"上次源图空间"等比映射到"当前源图空间"作为高优先检测区。
+      // maskSourceSize 缺失（旧数据 / annotation 画布坐标路径）→ 坐标空间不明，跳过。
+      const sourceGeneration = source.generation
+      const priorMaskBoundsPx =
+        sourceGeneration?.maskBounds && sourceGeneration.maskSourceSize
+          ? [mapBoundsToResultSpace(sourceGeneration.maskBounds, sourceGeneration.maskSourceSize, payload.sourceSize)]
+          : undefined
+      const inspectionInput: MaskArtifactInput = {
+        sourceSizePx: payload.sourceSize,
+        maskBoundsPx: payload.maskBounds!,
+        priorMaskBoundsPx,
+      }
+      const firstInspection = await inspectMaskResultForBlackArtifacts(inspectionInput, {
+        sourceBlob: image,
+        resultB64: images[0].b64,
+      })
+      if (firstInspection.hasArtifact) {
         // F2 (审 P2): 拿到 task-2 后立即 onSelfHealRetry（poll 期间 phase=self-heal-retry 可观测），
         // 不再等第二次 attempt 完整结束才触发（旧实现 phase 几乎不可见，SC-13 语义打折）。
         const second = await runOneAttempt(newIdempotencyKey(), (task2Id) => {
@@ -343,22 +361,25 @@ export const runMaskEditGeneration = async (args: {
         })
         attemptTaskIds.push(second.taskId)
         serverTaskId = second.taskId
-        const secondBlack = await inspectMaskResultForBlackPlate(
-          { sourceSizePx: payload.sourceSize, maskBoundsPx: payload.maskBounds! },
-          { sourceBlob: image, resultB64: second.images[0]?.b64 ?? '' },
-        )
-        if (secondBlack) {
-          toastFeedback.warn('局部重绘结果异常，已使用重试结果，请检查画面')
+        const secondInspection = await inspectMaskResultForBlackArtifacts(inspectionInput, {
+          sourceBlob: image,
+          resultB64: second.images[0]?.b64 ?? '',
+        })
+        if (secondInspection.hasArtifact) {
+          // 自愈失败不 commit：记录 taskIds + 组件证据后抛错，占位符与卡片由
+          // chatMaskEditFlow.failMaskEditMessage 统一收口。
           debugLogger.error(
             'Mask Edit',
-            `Black plate detected for ${source.title}; both attempts returned black plates. taskIds=${attemptTaskIds.join(',')}`,
+            `Black artifact persisted for ${source.title}; rejecting commit. taskIds=${attemptTaskIds.join(',')} ` +
+              `first=${firstInspection.reason} second=${secondInspection.reason} ` +
+              `components=${JSON.stringify(secondInspection.components)}`,
           )
-        } else {
-          debugLogger.warn(
-            'Mask Edit',
-            `Black plate detected for ${source.title}; retry recovered. taskIds=${attemptTaskIds.join(',')}`,
-          )
+          throw new MivoImageRequestError('局部重绘结果异常，请重新选择区域或换源图后重试。', 'upstream-error')
         }
+        debugLogger.warn(
+          'Mask Edit',
+          `Black artifact detected for ${source.title} (${firstInspection.reason}); retry recovered. taskIds=${attemptTaskIds.join(',')}`,
+        )
         images = second.images
       }
     }
@@ -382,6 +403,9 @@ export const runMaskEditGeneration = async (args: {
       model: 'gpt-image-2',
       kind: 'edit' as const,
       maskBounds: payload.maskBounds,
+      // 黑块修复：标定 maskBounds 的坐标空间（本次源图 natural pixel 尺寸），
+      // 结果节点作为下次编辑的 source 时用于历史洞区高优先检测。
+      maskSourceSize: payload.maskBounds ? { ...payload.sourceSize } : undefined,
       placement: 'right' as const,
     }
     const nodeIds = await useCanvasStore.getState().commitGenerationResult(commitPayload)

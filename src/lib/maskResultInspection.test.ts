@@ -5,6 +5,9 @@ import {
   blackRatioInRegion,
   judgeBlackPlate,
   inspectMaskResultForBlackPlate,
+  findNearBlackComponents,
+  overlapRatioOf,
+  inspectMaskResultForBlackArtifacts,
 } from './maskResultInspection'
 import type { ImageMaskBounds } from '../canvas/imageMaskGeometry'
 
@@ -268,5 +271,205 @@ describe('inspectMaskResultForBlackPlate 集成', () => {
       { sourceBlob: new Blob([]), resultB64: 'AAAA' },
     )
     expect(detected).toBe(false)
+  })
+})
+
+// —— 黑块修复：全图近黑连通组件 + 检测扩面 ————————————————————————————————
+
+// 区域涂色助手（直接改 rgba）。
+const paintRect = (
+  rgba: Uint8ClampedArray,
+  imageWidth: number,
+  rect: { x: number; y: number; width: number; height: number },
+  color: [number, number, number, number],
+) => {
+  for (let y = rect.y; y < rect.y + rect.height; y++) {
+    for (let x = rect.x; x < rect.x + rect.width; x++) {
+      const idx = (y * imageWidth + x) * 4
+      rgba[idx] = color[0]
+      rgba[idx + 1] = color[1]
+      rgba[idx + 2] = color[2]
+      rgba[idx + 3] = color[3]
+    }
+  }
+}
+
+describe('findNearBlackComponents（纯函数阈值边界）', () => {
+  it('512x512 白底 + 110x110 黑块 → 命中 1 个组件（全图占比仅 4.6%，单一全图阈值会漏）', () => {
+    const size = { width: 512, height: 512 }
+    const rgba = fillRgba(size.width, size.height, 'white')
+    paintRect(rgba, size.width, { x: 70, y: 60, width: 110, height: 110 }, [0, 0, 0, 255])
+    const components = findNearBlackComponents(rgba, size)
+    expect(components).toHaveLength(1)
+    expect(components[0].bounds).toEqual({ x: 70, y: 60, width: 110, height: 110 })
+    expect(components[0].bboxFillRatio).toBeCloseTo(1, 2)
+  })
+
+  it('luma<35 的暗灰块（rgb 30,30,30，RGB 阈值不命中）也按近黑组件命中', () => {
+    const size = { width: 512, height: 512 }
+    const rgba = fillRgba(size.width, size.height, 'white')
+    paintRect(rgba, size.width, { x: 100, y: 100, width: 80, height: 80 }, [30, 30, 30, 255])
+    const components = findNearBlackComponents(rgba, size)
+    expect(components).toHaveLength(1)
+  })
+
+  it('细黑线（200x8，最小边 <24）→ 过滤', () => {
+    const size = { width: 512, height: 512 }
+    const rgba = fillRgba(size.width, size.height, 'white')
+    paintRect(rgba, size.width, { x: 50, y: 50, width: 200, height: 8 }, [0, 0, 0, 255])
+    expect(findNearBlackComponents(rgba, size)).toHaveLength(0)
+  })
+
+  it('小字级黑点（20x20=400px < 900 面积下限）→ 过滤', () => {
+    const size = { width: 512, height: 512 }
+    const rgba = fillRgba(size.width, size.height, 'white')
+    paintRect(rgba, size.width, { x: 50, y: 50, width: 20, height: 20 }, [0, 0, 0, 255])
+    paintRect(rgba, size.width, { x: 90, y: 50, width: 20, height: 20 }, [0, 0, 0, 255])
+    expect(findNearBlackComponents(rgba, size)).toHaveLength(0)
+  })
+
+  it('稀疏笔画（L 形，bbox 填充率 <0.35）→ 过滤', () => {
+    const size = { width: 512, height: 512 }
+    const rgba = fillRgba(size.width, size.height, 'white')
+    // L 形：150x25 横 + 25x150 竖（相连），bbox 150x150，fill≈0.306
+    paintRect(rgba, size.width, { x: 100, y: 100, width: 150, height: 25 }, [0, 0, 0, 255])
+    paintRect(rgba, size.width, { x: 100, y: 100, width: 25, height: 150 }, [0, 0, 0, 255])
+    expect(findNearBlackComponents(rgba, size)).toHaveLength(0)
+  })
+
+  it('透明区（alpha=0，RGB=0）不计入组件', () => {
+    const size = { width: 512, height: 512 }
+    const rgba = fillRgba(size.width, size.height, 'white')
+    paintRect(rgba, size.width, { x: 70, y: 60, width: 110, height: 110 }, [0, 0, 0, 0])
+    expect(findNearBlackComponents(rgba, size)).toHaveLength(0)
+  })
+})
+
+describe('overlapRatioOf', () => {
+  it('完全包含 → 1；不相交 → 0；半交叠 → 0.5', () => {
+    expect(overlapRatioOf({ x: 10, y: 10, width: 20, height: 20 }, { x: 0, y: 0, width: 100, height: 100 })).toBe(1)
+    expect(overlapRatioOf({ x: 0, y: 0, width: 10, height: 10 }, { x: 50, y: 50, width: 10, height: 10 })).toBe(0)
+    expect(overlapRatioOf({ x: 0, y: 0, width: 20, height: 10 }, { x: 10, y: 0, width: 100, height: 100 })).toBeCloseTo(0.5, 5)
+  })
+})
+
+// 集成：mock 解码链，驱动 inspectMaskResultForBlackArtifacts 编排 ----------------
+describe('inspectMaskResultForBlackArtifacts 集成', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  // 第一次 createImageBitmap/getImageData = result，第二次起 = source。
+  const stubDecoders = (
+    result: { size: { width: number; height: number }; data: Uint8ClampedArray },
+    source: { size: { width: number; height: number }; data: Uint8ClampedArray },
+  ) => {
+    let bitmapCall = 0
+    vi.stubGlobal('createImageBitmap', vi.fn(async () => {
+      bitmapCall++
+      const size = bitmapCall === 1 ? result.size : source.size
+      return { width: size.width, height: size.height, close: vi.fn() }
+    }))
+    let imageDataCall = 0
+    const fakeCtx = {
+      drawImage: vi.fn(),
+      getImageData: vi.fn(() => {
+        imageDataCall++
+        const target = imageDataCall === 1 ? result : source
+        return { data: target.data, width: target.size.width, height: target.size.height } as ImageData
+      }),
+    }
+    vi.stubGlobal('OffscreenCanvas', class {
+      width: number; height: number
+      constructor(w: number, h: number) { this.width = w; this.height = h }
+      getContext() { return fakeCtx }
+    })
+  }
+
+  const size512 = { width: 512, height: 512 }
+  const maskBoundsPx = { x: 360, y: 360, width: 80, height: 80 }
+
+  it('区域外 110x110 黑块 + 源同区不黑 → hasArtifact=true, reason=out-of-mask-new-black-component', async () => {
+    const resultData = fillRgba(512, 512, 'white')
+    paintRect(resultData, 512, { x: 70, y: 60, width: 110, height: 110 }, [0, 0, 0, 255])
+    stubDecoders({ size: size512, data: resultData }, { size: size512, data: fillRgba(512, 512, 'white') })
+
+    const inspection = await inspectMaskResultForBlackArtifacts(
+      { sourceSizePx: size512, maskBoundsPx },
+      { sourceBlob: new Blob([]), resultB64: 'AAAA' },
+    )
+    expect(inspection.hasArtifact).toBe(true)
+    expect(inspection.reason).toBe('out-of-mask-new-black-component')
+    expect(inspection.components).toHaveLength(1)
+    expect(inspection.components[0].bounds).toEqual({ x: 70, y: 60, width: 110, height: 110 })
+  })
+
+  it('源图同区本黑 → hasArtifact=false（源本黑忽略）', async () => {
+    const resultData = fillRgba(512, 512, 'white')
+    paintRect(resultData, 512, { x: 70, y: 60, width: 110, height: 110 }, [0, 0, 0, 255])
+    const sourceData = fillRgba(512, 512, 'white')
+    paintRect(sourceData, 512, { x: 70, y: 60, width: 110, height: 110 }, [0, 0, 0, 255])
+    stubDecoders({ size: size512, data: resultData }, { size: size512, data: sourceData })
+
+    const inspection = await inspectMaskResultForBlackArtifacts(
+      { sourceSizePx: size512, maskBoundsPx },
+      { sourceBlob: new Blob([]), resultB64: 'AAAA' },
+    )
+    expect(inspection.hasArtifact).toBe(false)
+    expect(inspection.components).toHaveLength(0)
+  })
+
+  it('当前 mask 区整片黑（plate）→ reason=current-mask-black-plate（保留现有判定）', async () => {
+    const resultData = fillRgba(512, 512, 'white')
+    paintRect(resultData, 512, maskBoundsPx, [0, 0, 0, 255])
+    stubDecoders({ size: size512, data: resultData }, { size: size512, data: fillRgba(512, 512, 'white') })
+
+    const inspection = await inspectMaskResultForBlackArtifacts(
+      { sourceSizePx: size512, maskBoundsPx },
+      { sourceBlob: new Blob([]), resultB64: 'AAAA' },
+    )
+    expect(inspection.hasArtifact).toBe(true)
+    expect(inspection.reason).toBe('current-mask-black-plate')
+  })
+
+  it('mask 区内的大黑块（本次编辑内容）→ 不按区域外黑块误报', async () => {
+    const resultData = fillRgba(512, 512, 'white')
+    // 黑块完全落在 mask 区内且未占满区（plate 判定 <70% 不触发；组件 in-mask 跳过）
+    paintRect(resultData, 512, { x: 380, y: 380, width: 40, height: 40 }, [0, 0, 0, 255])
+    stubDecoders(
+      { size: size512, data: resultData },
+      { size: size512, data: fillRgba(512, 512, 'white') },
+    )
+    const inspection = await inspectMaskResultForBlackArtifacts(
+      { sourceSizePx: size512, maskBoundsPx: { x: 360, y: 360, width: 100, height: 100 } },
+      { sourceBlob: new Blob([]), resultB64: 'AAAA' },
+    )
+    expect(inspection.hasArtifact).toBe(false)
+  })
+
+  it('历史洞区（priorMaskBoundsPx）整片黑但组件阈值不命中（20x20 小洞）→ 高优先检出', async () => {
+    const resultData = fillRgba(512, 512, 'white')
+    const priorHole = { x: 200, y: 200, width: 20, height: 20 } // 400px < 900 组件面积下限
+    paintRect(resultData, 512, priorHole, [0, 0, 0, 255])
+    stubDecoders({ size: size512, data: resultData }, { size: size512, data: fillRgba(512, 512, 'white') })
+
+    const inspection = await inspectMaskResultForBlackArtifacts(
+      { sourceSizePx: size512, maskBoundsPx, priorMaskBoundsPx: [priorHole] },
+      { sourceBlob: new Blob([]), resultB64: 'AAAA' },
+    )
+    expect(inspection.hasArtifact).toBe(true)
+    expect(inspection.reason).toBe('out-of-mask-new-black-component')
+  })
+
+  it('解码失败 → 保守 hasArtifact=false', async () => {
+    vi.stubGlobal('createImageBitmap', vi.fn(async () => { throw new Error('decode failed') }))
+    vi.stubGlobal('OffscreenCanvas', class {
+      getContext() { return null }
+    })
+    const inspection = await inspectMaskResultForBlackArtifacts(
+      { sourceSizePx: size512, maskBoundsPx },
+      { sourceBlob: new Blob([]), resultB64: 'AAAA' },
+    )
+    expect(inspection.hasArtifact).toBe(false)
   })
 })

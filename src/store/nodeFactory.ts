@@ -42,6 +42,7 @@ export const cloneNode = (node: MivoCanvasNode): MivoCanvasNode => ({
     ? {
         ...node.generation,
         maskBounds: node.generation.maskBounds ? { ...node.generation.maskBounds } : undefined,
+        maskSourceSize: node.generation.maskSourceSize ? { ...node.generation.maskSourceSize } : undefined,
       }
     : undefined,
   aiWorkflow: node.aiWorkflow
@@ -187,6 +188,7 @@ export type GenerationResultNodeOptions = {
   taskId: string
   createdAt: number
   maskBounds?: CanvasMaskBounds
+  maskSourceSize?: { width: number; height: number }
   operation: AiWorkflowOperation
   sourceNode?: MivoCanvasNode
   placementDirection?: AiWorkflowPlacement
@@ -209,6 +211,7 @@ export const createGenerationResultNode = (options: GenerationResultNodeOptions)
     taskId,
     createdAt,
     maskBounds,
+    maskSourceSize,
     operation,
     sourceNode,
     placementDirection,
@@ -238,6 +241,7 @@ export const createGenerationResultNode = (options: GenerationResultNodeOptions)
       taskId,
       createdAt,
       maskBounds: cloneMaskBounds(maskBounds),
+      maskSourceSize: maskSourceSize ? { ...maskSourceSize } : undefined,
     },
     aiWorkflow: {
       kind: 'result',
