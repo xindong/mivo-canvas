@@ -225,6 +225,7 @@ export const useLeaferSpikeRenderer = ({
   // 用 rAF 等 host 有非零尺寸再 init（mount 时 layout 未完成，getBoundingClientRect 可能 0×0，
   // Leafer canvas 会塌成 1px 高，paint 不可见）。
   useEffect(() => {
+    if (rendererMode === 'pixi') return
     if (!hostRef.current || leaferRef.current) return
 
     const host = hostRef.current
@@ -287,7 +288,7 @@ export const useLeaferSpikeRenderer = ({
       frozenViewportRef.current = null
       publishStats({ ...EMPTY_STATS, panCacheEnabled: cacheEnabled })
     }
-  }, [hostRef, panCacheEnabled, publishStats])
+  }, [hostRef, panCacheEnabled, publishStats, rendererMode])
 
   // Camera sync (leafer only, 单向 React → zoomLayer.set; D1 禁反向监听 zoomLayer.__).
   useEffect(() => {

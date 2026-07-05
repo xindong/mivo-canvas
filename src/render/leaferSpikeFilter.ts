@@ -17,12 +17,21 @@ export const isLeaferSpikePainted = (node: MivoCanvasNode): boolean =>
   node.type === 'frame' ||
   (node.type === 'markup' && node.markupKind === 'rect')
 
+export const isPixiSpikePainted = (node: MivoCanvasNode): boolean =>
+  isLeaferSpikePainted(node) || node.type === 'text'
+
 /**
  * leafer 模式下从 DOM 渲染列表里剔除已被 Leafer 画的节点。
  * dom 模式原样返回（默认行为零变化）。
  */
-export const filterDomNodesForLeaferSpike = (
+export const filterDomNodesForRendererSpike = (
   nodes: MivoCanvasNode[],
   rendererMode: RendererMode,
 ): MivoCanvasNode[] =>
-  rendererMode === 'leafer' ? nodes.filter((node) => !isLeaferSpikePainted(node)) : nodes
+  rendererMode === 'leafer'
+    ? nodes.filter((node) => !isLeaferSpikePainted(node))
+    : rendererMode === 'pixi'
+      ? nodes.filter((node) => !isPixiSpikePainted(node))
+      : nodes
+
+export const filterDomNodesForLeaferSpike = filterDomNodesForRendererSpike
