@@ -11,6 +11,8 @@ export type EngineLodStats = {
   lodNodeCount: number
   lodImageCount: number
   lodTextCount: number
+  lodShapeCount: number
+  lodLineCount: number
   highFidelityNodeCount: number
 }
 
@@ -21,6 +23,8 @@ export type EngineLodStatsCarrier = {
   lodNodeCount: number
   lodImageCount: number
   lodTextCount: number
+  lodShapeCount: number
+  lodLineCount: number
   highFidelityNodeCount: number
 }
 
@@ -38,9 +42,20 @@ const hashString = (value: string) => {
 export const screenProjectionPxFor = (node: MivoCanvasNode, viewport: ViewportState): number =>
   Math.max(Math.abs(node.width), Math.abs(node.height)) * viewport.scale
 
+export const isEngineLodShapeCandidate = (node: MivoCanvasNode): boolean =>
+  node.type === 'frame' ||
+  (node.type === 'markup' &&
+    (node.markupKind === 'rect' || node.markupKind === 'ellipse' || node.markupKind === 'note'))
+
+export const isEngineLodLineCandidate = (node: MivoCanvasNode): boolean =>
+  node.type === 'markup' && (node.markupKind === 'line' || node.markupKind === 'arrow')
+
 export const shouldUseEngineLod = (node: MivoCanvasNode, viewport: ViewportState): boolean =>
   engineLodMode === 'on' &&
-  (node.type === 'image' || node.type === 'text') &&
+  (node.type === 'image' ||
+    node.type === 'text' ||
+    isEngineLodShapeCandidate(node) ||
+    isEngineLodLineCandidate(node)) &&
   screenProjectionPxFor(node, viewport) < engineLodThresholdPx
 
 export const engineLodFillFor = (node: MivoCanvasNode): string => {
@@ -51,14 +66,18 @@ export const engineLodFillFor = (node: MivoCanvasNode): string => {
 export const summarizeEngineLod = (nodes: MivoCanvasNode[], viewport: ViewportState): EngineLodStats => {
   let lodImageCount = 0
   let lodTextCount = 0
+  let lodShapeCount = 0
+  let lodLineCount = 0
 
   for (const node of nodes) {
     if (!shouldUseEngineLod(node, viewport)) continue
     if (node.type === 'image') lodImageCount += 1
     if (node.type === 'text') lodTextCount += 1
+    if (isEngineLodShapeCandidate(node)) lodShapeCount += 1
+    if (isEngineLodLineCandidate(node)) lodLineCount += 1
   }
 
-  const lodNodeCount = lodImageCount + lodTextCount
+  const lodNodeCount = lodImageCount + lodTextCount + lodShapeCount + lodLineCount
   return {
     mode: engineLodMode,
     enabled: engineLodMode === 'on',
@@ -66,6 +85,8 @@ export const summarizeEngineLod = (nodes: MivoCanvasNode[], viewport: ViewportSt
     lodNodeCount,
     lodImageCount,
     lodTextCount,
+    lodShapeCount,
+    lodLineCount,
     highFidelityNodeCount: nodes.length - lodNodeCount,
   }
 }
@@ -77,6 +98,8 @@ export const emptyEngineLodStats = (): EngineLodStatsCarrier => ({
   lodNodeCount: 0,
   lodImageCount: 0,
   lodTextCount: 0,
+  lodShapeCount: 0,
+  lodLineCount: 0,
   highFidelityNodeCount: 0,
 })
 
@@ -88,6 +111,8 @@ export const withEngineLodStats = <T extends object>(stats: T, lodStats: EngineL
   lodNodeCount: lodStats.lodNodeCount,
   lodImageCount: lodStats.lodImageCount,
   lodTextCount: lodStats.lodTextCount,
+  lodShapeCount: lodStats.lodShapeCount,
+  lodLineCount: lodStats.lodLineCount,
   highFidelityNodeCount: lodStats.highFidelityNodeCount,
 })
 
@@ -97,12 +122,12 @@ export const recordEngineLodSummary = (
   previousSummaryRef: { current?: string },
 ) => {
   if (!stats.enabled) return
-  const summary = `${stats.lodNodeCount}/${stats.lodImageCount}/${stats.lodTextCount}/${stats.thresholdPx}`
+  const summary = `${stats.lodNodeCount}/${stats.lodImageCount}/${stats.lodTextCount}/${stats.lodShapeCount}/${stats.lodLineCount}/${stats.thresholdPx}`
   if (previousSummaryRef.current === summary) return
   previousSummaryRef.current = summary
   debugLogger.log(
     'Renderer',
-    `${source} LOD switch: ${stats.lodNodeCount} nodes (${stats.lodImageCount} image, ${stats.lodTextCount} text) below ${stats.thresholdPx}px`,
+    `${source} LOD switch: ${stats.lodNodeCount} nodes (${stats.lodImageCount} image, ${stats.lodTextCount} text, ${stats.lodShapeCount} shape, ${stats.lodLineCount} line) below ${stats.thresholdPx}px`,
   )
 }
 
@@ -119,6 +144,8 @@ export const engineLodDataAttrsFor = (
     'data-engine-lod-node-count': stats.lodNodeCount,
     'data-engine-lod-image-count': stats.lodImageCount,
     'data-engine-lod-text-count': stats.lodTextCount,
+    'data-engine-lod-shape-count': stats.lodShapeCount,
+    'data-engine-lod-line-count': stats.lodLineCount,
     'data-engine-high-fidelity-node-count': stats.highFidelityNodeCount,
   }
 }

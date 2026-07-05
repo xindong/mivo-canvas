@@ -65,15 +65,16 @@
 // hitTest.ts (stroke-only, canvas coords) — untouched by this module.
 //
 // 0g three invariants: pan walks the camera only (paint effect does not depend
-// on viewport.x/y); line/arrow do not participate in threshold LOD (0g口径:
-// thin vector strokes, no texture/text cost — same policy as 4a shapes); zoom
-// settle behavior for image/text is untouched.
+// on viewport.x/y); line/arrow below the panorama threshold paint as one solid
+// LOD Rect instead of a Group with body/head children; zoom settle restores the
+// HD line/arrow group when the projected size crosses the threshold.
 
-import { Group, Line } from 'leafer-ui'
+import { Group, Line, Rect } from 'leafer-ui'
 import type { Leafer } from 'leafer-ui'
 import { lineSegmentsWithLabelGap } from '../canvas/markupTextGeometry'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 import { debugLogger } from '../store/debugLogStore'
+import { engineLodFillFor, shouldUseEngineLod } from './engineSpikeLod'
 import { isLeaferLinePaintedNode } from './leaferSpikeFilter'
 import { projectNode, type RenderNode } from './projection'
 import { dashPatternFor } from './leaferShapePaint'
@@ -87,8 +88,10 @@ type LinePoint = { x: number; y: number }
 
 type LineEntry = {
   nodeId: string
-  group: Group
-  main: Line
+  kind: 'line' | 'lod-rect'
+  object: Group | Rect
+  group: Group | null
+  main: Line | null
   /** FU-11 label 缺口的后半段线体（labelActive 时存在）。 */
   second: Line | null
   startHead: Line | null
@@ -178,6 +181,23 @@ export type LinePaintProps = {
 }
 
 const firstVisibleStroke = (r: RenderNode) => r.strokes.find((stroke) => stroke.visible)
+const clampDim = (value: number) => Math.max(1, value)
+const rotationOf = (node: MivoCanvasNode): number => node.transform?.rotation ?? 0
+
+export const lineLodPaintPropsFor = (
+  node: MivoCanvasNode,
+  zIndex: number | undefined,
+): Record<string, unknown> => ({
+  x: node.x,
+  y: node.y,
+  width: clampDim(node.width),
+  height: clampDim(node.height),
+  fill: engineLodFillFor(node),
+  strokeWidth: 0,
+  rotation: rotationOf(node),
+  origin: 'center',
+  ...(zIndex !== undefined ? { zIndex } : {}),
+})
 
 /**
  * Map a projected RenderNode → Leafer paint props for one line/arrow node.
@@ -261,7 +281,7 @@ export const linePaintPropsFor = (
   }
 }
 
-const setProps = (object: Line | Group, props: Record<string, unknown>) => {
+const setProps = (object: Line | Group | Rect, props: Record<string, unknown>) => {
   ;(object as { set: (props: unknown) => void }).set(props)
 }
 
@@ -293,8 +313,9 @@ export const createLeaferLinePaint = (leafer: Leafer): LeaferLinePaint => {
   const entries = new Map<string, LineEntry>()
 
   const destroyEntry = (entry: LineEntry) => {
-    // Removing the Group removes its child Lines with it.
-    entry.group.remove()
+    // Removing the Group removes its child Lines with it; LOD entries are a
+    // single Rect with no children.
+    entry.object.remove()
   }
 
   const buildEntry = (nodeId: string, props: LinePaintProps): LineEntry => {
@@ -310,7 +331,12 @@ export const createLeaferLinePaint = (leafer: Leafer): LeaferLinePaint => {
     if (startHead) group.add(startHead)
     const endHead = props.endHead ? new Line(props.endHead) : null
     if (endHead) group.add(endHead)
-    return { nodeId, group, main, second, startHead, endHead }
+    return { nodeId, kind: 'line', object: group, group, main, second, startHead, endHead }
+  }
+
+  const buildLodEntry = (nodeId: string, props: Record<string, unknown>): LineEntry => {
+    const object = new Rect(props)
+    return { nodeId, kind: 'lod-rect', object, group: null, main: null, second: null, startHead: null, endHead: null }
   }
 
   const sync: LeaferLinePaint['sync'] = (nodes, ctx) => {
@@ -346,34 +372,63 @@ export const createLeaferLinePaint = (leafer: Leafer): LeaferLinePaint => {
     }
 
     for (const node of lineNodes) {
-      const projected = projectNode(node)
-      const props = linePaintPropsFor(projected, ctx.layerOf?.(node.id), ctx.editingNodeId)
+      const lod = shouldUseEngineLod(node, ctx.viewport)
+      const props = lod
+        ? lineLodPaintPropsFor(node, ctx.layerOf?.(node.id))
+        : linePaintPropsFor(projectNode(node), ctx.layerOf?.(node.id), ctx.editingNodeId)
       const existing = entries.get(node.id)
 
       if (plan.created.has(node.id) || !existing) {
-        const entry = buildEntry(node.id, props)
+        const entry = lod ? buildLodEntry(node.id, props as Record<string, unknown>) : buildEntry(node.id, props as LinePaintProps)
         entries.set(node.id, entry)
-        leafer.add(entry.group)
+        leafer.add(entry.object)
         created += 1
         continue
       }
 
-      // FU-11: 缺口从无到有（或反向）会改变 Group 子对象拓扑——直接重建，
-      // 保证"线体在前、箭头头在后"的绘制顺序（否则后 add 的线体会盖住头）。
-      if (Boolean(props.second) !== Boolean(existing.second)) {
+      if ((lod && existing.kind !== 'lod-rect') || (!lod && existing.kind !== 'line')) {
         destroyEntry(existing)
-        const entry = buildEntry(node.id, props)
+        const entry = lod ? buildLodEntry(node.id, props as Record<string, unknown>) : buildEntry(node.id, props as LinePaintProps)
         entries.set(node.id, entry)
-        leafer.add(entry.group)
+        leafer.add(entry.object)
         updated += 1
         continue
       }
 
-      setProps(existing.group, props.group)
-      setProps(existing.main, props.main)
-      existing.second = reconcileHead(existing.group, existing.second, props.second)
-      existing.startHead = reconcileHead(existing.group, existing.startHead, props.startHead)
-      existing.endHead = reconcileHead(existing.group, existing.endHead, props.endHead)
+      if (lod) {
+        setProps(existing.object, props as Record<string, unknown>)
+        updated += 1
+        continue
+      }
+
+      const lineProps = props as LinePaintProps
+
+      // FU-11: 缺口从无到有（或反向）会改变 Group 子对象拓扑——直接重建，
+      // 保证"线体在前、箭头头在后"的绘制顺序（否则后 add 的线体会盖住头）。
+      if (Boolean(lineProps.second) !== Boolean(existing.second)) {
+        destroyEntry(existing)
+        const entry = buildEntry(node.id, lineProps)
+        entries.set(node.id, entry)
+        leafer.add(entry.object)
+        updated += 1
+        continue
+      }
+
+      if (!existing.group || !existing.main) {
+        debugLogger.warn(SOURCE, `line entry ${node.id} missing group/main during HD update — rebuilding`)
+        destroyEntry(existing)
+        const entry = buildEntry(node.id, lineProps)
+        entries.set(node.id, entry)
+        leafer.add(entry.object)
+        updated += 1
+        continue
+      }
+
+      setProps(existing.group, lineProps.group)
+      setProps(existing.main, lineProps.main)
+      existing.second = reconcileHead(existing.group, existing.second, lineProps.second)
+      existing.startHead = reconcileHead(existing.group, existing.startHead, lineProps.startHead)
+      existing.endHead = reconcileHead(existing.group, existing.endHead, lineProps.endHead)
       updated += 1
     }
 

@@ -36,15 +36,15 @@
 // layer (asserted by the source-contract tests in leaferShapePaint.test.ts).
 //
 // 0g three invariants: pan walks the camera only — `sync` is NOT called during
-// pan (the paint effect re-runs on node change, not viewport.x/y). Shapes do
-// not participate in threshold LOD by design: 0g measured them as "本来就是
-// 矩形" (solid vector fills, no texture/text cost), shouldUseEngineLod only
-// covers image/text. Zoom settle behavior for image/text is untouched.
+// pan (the paint effect re-runs on node change / zoom LOD changes, not
+// viewport.x/y). Shapes below the panorama threshold paint as a solid LOD Rect
+// with no shadow/dash/ellipse path, matching the image/text LOD cost envelope.
 
 import { Ellipse, Rect } from 'leafer-ui'
 import type { Leafer } from 'leafer-ui'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 import { debugLogger } from '../store/debugLogStore'
+import { engineLodFillFor, shouldUseEngineLod } from './engineSpikeLod'
 import { Layer } from './layers'
 import { isLeaferShapePaintedNode } from './leaferSpikeFilter'
 import { projectNode, type RenderNode } from './projection'
@@ -55,7 +55,7 @@ import {
 } from './rendererAdapter'
 
 type ShapeObject = Rect | Ellipse
-type ShapeEntryKind = 'frame' | 'markup-rect' | 'markup-ellipse' | 'markup-note'
+type ShapeEntryKind = 'frame' | 'markup-rect' | 'markup-ellipse' | 'markup-note' | 'lod-rect'
 
 type ShapeEntry = {
   nodeId: string
@@ -174,6 +174,19 @@ const shapeKindFor = (node: MivoCanvasNode): ShapeEntryKind | null => {
 }
 
 const clampDim = (value: number) => Math.max(1, value)
+const rotationOf = (node: MivoCanvasNode): number => node.transform?.rotation ?? 0
+
+const lodShapePaintPropsFor = (node: MivoCanvasNode, zIndex: number | undefined): Record<string, unknown> => ({
+  x: node.x,
+  y: node.y,
+  width: clampDim(node.width),
+  height: clampDim(node.height),
+  fill: engineLodFillFor(node),
+  strokeWidth: 0,
+  rotation: rotationOf(node),
+  origin: 'center',
+  ...(zIndex !== undefined ? { zIndex } : {}),
+})
 
 const firstVisibleSolidFillColor = (r: RenderNode): string | undefined => {
   for (const fill of r.fills) {
@@ -316,9 +329,10 @@ export const createLeaferShapePaint = (leafer: Leafer): LeaferShapePaint => {
     }
 
     for (const node of shapeNodes) {
-      const kind = shapeKindFor(node) as ShapeEntryKind
-      const projected = projectNode(node)
-      const props = shapePaintPropsFor(projected, kind, ctx.layerOf?.(node.id))
+      const kind = shouldUseEngineLod(node, ctx.viewport) ? 'lod-rect' : shapeKindFor(node) as ShapeEntryKind
+      const props = kind === 'lod-rect'
+        ? lodShapePaintPropsFor(node, ctx.layerOf?.(node.id))
+        : shapePaintPropsFor(projectNode(node), kind, ctx.layerOf?.(node.id))
       const existing = entries.get(node.id)
 
       if (plan.created.has(node.id) || !existing) {
