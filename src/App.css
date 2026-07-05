@@ -7420,6 +7420,10 @@ button:disabled {
   box-sizing: border-box;
 }
 
+.mivo-app .chat-composer-input-shell:focus-within {
+  border-color: var(--ink);
+}
+
 .chat-composer-textarea {
   width: 100%;
   height: 100%;
@@ -7437,7 +7441,8 @@ button:disabled {
   overflow-y: auto;
 }
 
-.chat-composer-textarea:focus {
+.mivo-app .chat-composer-textarea:focus,
+.mivo-app .chat-composer-textarea:focus-visible {
   outline: none;
 }
 
