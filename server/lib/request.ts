@@ -84,6 +84,9 @@ export const newRequestId = (): string => randomUUID()
 
 // Request logger — records upstream status / latency / timeout / abort.
 // NEVER logs API key, original image blob, or full prompt (per §6.1).
+// W2.6 (QoL batch): optional bodyBytes (request body size, desensitized — just the
+// byte count, never the bytes) + upstreamMs (time spent waiting on the upstream
+// image API, distinct from total latencyMs which covers the whole BFF handler).
 export const logRequest = (info: {
   method: string
   path: string
@@ -91,6 +94,8 @@ export const logRequest = (info: {
   status: number
   upstream?: string
   latencyMs: number
+  bodyBytes?: number
+  upstreamMs?: number
   note?: string
 }): void => {
   const parts = [
@@ -100,6 +105,8 @@ export const logRequest = (info: {
     `-> ${info.status}`,
     info.upstream ? `upstream=${info.upstream}` : '',
     `latency=${info.latencyMs}ms`,
+    info.bodyBytes !== undefined ? `body=${info.bodyBytes}B` : '',
+    info.upstreamMs !== undefined ? `upstreamMs=${info.upstreamMs}ms` : '',
     info.note || '',
   ].filter(Boolean)
   console.log(parts.join(' '))

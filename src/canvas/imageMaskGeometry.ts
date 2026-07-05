@@ -1,4 +1,5 @@
 import type { ImageCrop } from '../types/mivoCanvas'
+import type { MivoImageQuality } from '../types/generation'
 
 export type ImageMaskPoint = {
   x: number
@@ -21,6 +22,8 @@ export type ImageMaskSubmitPayload = {
   mask?: Blob
   maskBounds?: ImageMaskBounds
   sourceSize: { width: number; height: number }
+  /** W2 (QoL batch): low/medium quality selector on the overlay; default medium (FIX-5). */
+  quality?: MivoImageQuality
 }
 
 export const pointMaskRadiusRatio = 0.08

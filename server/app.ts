@@ -18,6 +18,7 @@ import { debugLogsRoute } from './routes/debug-logs'
 import { createLocalAssetsRoutes } from './routes/local-assets'
 import { createEagleRoutes } from './routes/eagle'
 import { createPinterestRoutes } from './routes/pinterest'
+import { createProxyImageRoutes } from './routes/proxy-image'
 import { tasksRoute } from './routes/tasks'
 
 const tokenEquals = (a: string, b: string): boolean => {
@@ -60,6 +61,8 @@ app.route('/api/mivo', debugLogsRoute)
 app.route('/api/mivo', createLocalAssetsRoutes({ enabled: featureFlags.localAssetsEnabled }))
 app.route('/api/mivo', createEagleRoutes({ enabled: featureFlags.eagleProxyEnabled }))
 app.route('/api/mivo', createPinterestRoutes())
+// W3: CORS proxy for external images (readCanvasImageBlob fallback). SSRF-hardened.
+app.route('/api/mivo', createProxyImageRoutes())
 
 // P2-C1a: async task endpoints (additive — not in dev diff baseline).
 // POST /tasks/generate|edit → 202 {taskId}; GET/DELETE /tasks/:id.

@@ -20,3 +20,16 @@ export const reduceMaskPointPending = (
   if (action.type === 'discard-stale') return current.nodeId === action.nodeId ? current : undefined
   return undefined
 }
+
+// W5 (QoL batch): during the overlay-mounting window (maskEditNodeId set but the
+// overlay's naturalSize not yet ready), a pointerdown on a different node or blank
+// canvas should cancel the pending mask edit so the late-arriving overlay doesn't
+// pop up over the new selection. clickedNodeId=undefined means blank canvas.
+// Returns false when the click is on the mask-edit target itself (re-engage, keep).
+export const shouldCancelPendingMaskEdit = (
+  maskEditNodeId: string | undefined,
+  clickedNodeId: string | undefined,
+): boolean => {
+  if (!maskEditNodeId) return false
+  return clickedNodeId !== maskEditNodeId
+}

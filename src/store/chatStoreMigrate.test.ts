@@ -7,7 +7,7 @@ vi.mock('../lib/demoImages', () => ({
   createDemoImage: () => 'data:image/png;base64,mock-demo-image',
 }))
 
-import { clampChatGenerationContext, migrateChatPersistedState } from './chatStoreMigrate'
+import { clampChatGenerationContext, migrateChatPersistedState, sanitizeEnhanceDegradedReason } from './chatStoreMigrate'
 import type { ChatGenerationContext, ChatMessage, ChatParamOverrides } from './chatStore'
 
 // Helpers ---------------------------------------------------------------------
@@ -279,5 +279,69 @@ describe('S04: sanitizeMessagesByScene (chat migrate 非数组条目防护)', ()
     // 合法数组仍被 clamp（21:9 → auto）
     expect(result.messagesByScene.good[0].generationContext?.requestedImgRatio).toBe('auto')
     expect(result.messagesByScene.good[0].generationContext?.imgRatio).toBeUndefined()
+  })
+})
+
+// FIX-3: persisted legacy enhance.degradedReason（非 union 字符串）在 migrate 层
+// runtime normalize 到 undefined，业务类型保持收窄为 EnhanceDegradedReason union。
+describe('sanitizeEnhanceDegradedReason (FIX-3: legacy string normalize)', () => {
+  const msg = (degradedReason?: unknown): ChatMessage =>
+    ({
+      id: 'm1', role: 'assistant', text: 't', createdAt: 0, status: 'done',
+      enhance: degradedReason === undefined ? {} : { degradedReason: degradedReason as never },
+    }) as ChatMessage
+
+  it('keeps valid union members untouched', () => {
+    for (const r of ['timeout', 'bad-json', 'no-key', 'upstream-error', 'upstream-http', 'upstream-network']) {
+      expect(sanitizeEnhanceDegradedReason(msg(r)).enhance?.degradedReason).toBe(r)
+    }
+  })
+
+  it('coerces an unknown legacy string to undefined', () => {
+    const out = sanitizeEnhanceDegradedReason(msg('some-old-string'))
+    expect(out.enhance?.degradedReason).toBeUndefined()
+  })
+
+  it('leaves messages without enhance.degradedReason untouched', () => {
+    const noEnhance = sanitizeEnhanceDegradedReason({ id: 'm', role: 'assistant', text: 't', createdAt: 0, status: 'done' } as ChatMessage)
+    expect(noEnhance.enhance).toBeUndefined()
+    const emptyReason = sanitizeEnhanceDegradedReason(msg(undefined))
+    expect(emptyReason.enhance?.degradedReason).toBeUndefined()
+  })
+
+  it('migrate v>=2 path also normalizes legacy degradedReason', () => {
+    const result = migrateChatPersistedState(
+      {
+        selectedModel: 'gpt-image-2',
+        paramOverrides: { imgRatio: 'auto', quality: 'auto' },
+        messagesByScene: {
+          s: [msg('upstream-http'), msg('legacy-unknown'), msg('bad-json')],
+        },
+      },
+      2,
+    )
+    const msgs = result.messagesByScene.s
+    expect(msgs[0].enhance?.degradedReason).toBe('upstream-http')
+    expect(msgs[1].enhance?.degradedReason).toBeUndefined()
+    expect(msgs[2].enhance?.degradedReason).toBe('bad-json')
+  })
+
+  it('migrate v1 path also normalizes legacy degradedReason alongside ratio clamp', () => {
+    const result = migrateChatPersistedState(
+      {
+        selectedModel: 'gemini-3-pro-image',
+        paramOverrides: { imgRatio: '21:9', quality: 'auto' },
+        messagesByScene: {
+          s: [{
+            id: 'm', role: 'assistant', text: 't', createdAt: 0, status: 'done',
+            enhance: { degradedReason: 'legacy-bad' as never },
+            generationContext: context({ model: 'gemini-3-pro-image', requestedImgRatio: '21:9' as never }),
+          }],
+        },
+      },
+      1,
+    )
+    expect(result.messagesByScene.s[0].enhance?.degradedReason).toBeUndefined()
+    expect(result.messagesByScene.s[0].generationContext?.requestedImgRatio).toBe('auto')
   })
 })

@@ -8,7 +8,7 @@ import type { MivoImageRatio } from '../types/generation'
 import { prepareMaskEditPlaceholder, removeMaskEditPlaceholder, runMaskEditGeneration } from './maskEditGeneration'
 import type { ImageMaskSubmitPayload } from './imageMaskGeometry'
 import type { RuntimeCanvasTool } from './canvasInteraction'
-import { reduceMaskPointPending, type MaskInitialClientPoint, type MaskPointPendingAction } from './maskPointPending'
+import { reduceMaskPointPending, shouldCancelPendingMaskEdit, type MaskInitialClientPoint, type MaskPointPendingAction } from './maskPointPending'
 
 export type MaskPointArmedInteractionApi = {
   beginNodePointerDown: (nodeId: string, event: ReactPointerEvent<HTMLDivElement>) => void
@@ -159,6 +159,7 @@ export function useMaskPointArmed({
           resolvedAssetUrl,
           payload,
           imgRatio: closestMivoRatioForSize(payload.sourceSize),
+          quality: payload.quality,
           signal: abortController.signal,
         })
         maskEditNodeIdRef.current = undefined
@@ -172,6 +173,12 @@ export function useMaskPointArmed({
           sourceTitle: source.title,
           baselineSnapshot,
         })
+        // W2 fix: 失败/取消终态同样要清 maskEditNodeId，否则 overlay 不 detach
+        // （CanvasNodeView 的 ImageMaskEditOverlay gated on node.id===maskEditNodeId）。
+        // 成功路径在 try 末尾清；失败路径此前漏清 → SC-W2② 三态 e2e 超时。
+        maskEditNodeIdRef.current = undefined
+        setMaskEditNodeId(undefined)
+        clearPendingInitialPoint('mask edit failed')
         const latestCanvasState = useCanvasStore.getState()
         if (latestCanvasState.sceneId !== targetSceneId) {
           useChatStore.getState().appendNotice({
@@ -227,6 +234,16 @@ export function useMaskPointArmed({
   const wrapNodePointerDown = useCallback((nodeId: string, event: ReactPointerEvent<HTMLDivElement>) => {
     const { beginNodePointerDown, temporaryTool, isPanning } = interactionRef.current
     if (!maskArmedRef.current || temporaryTool || isPanning) {
+      // W5 (QoL batch): maskEditNodeId is set but the overlay hasn't mounted yet
+      // (naturalSize not ready). During that window, a pointerdown on a different
+      // node must fully cancel the pending mask edit (abort + clear state + pending
+      // point) so the late-arriving overlay doesn't pop up over a new selection.
+      // No #81 baselineSnapshot rollback here — the placeholder isn't created until
+      // submitMaskEdit, so cancelMaskEdit's pre-submit semantics are correct.
+      const pendingMaskNodeId = maskEditNodeIdRef.current
+      if (shouldCancelPendingMaskEdit(pendingMaskNodeId, nodeId)) {
+        cancelMaskEdit()
+      }
       beginNodePointerDown(nodeId, event)
       return
     }
@@ -253,11 +270,16 @@ export function useMaskPointArmed({
     debugLogger.log('Mask Edit', `Armed node miss: ${nodeId}`)
     setMaskArmed(false, 'node miss')
     beginNodePointerDown(nodeId, event)
-  }, [beginMaskEdit, interactionRef, recordPendingInitialPoint, setMaskArmed])
+  }, [beginMaskEdit, cancelMaskEdit, interactionRef, recordPendingInitialPoint, setMaskArmed])
 
   const wrapCanvasPointerDown = useCallback((event: ReactPointerEvent<HTMLElement>) => {
     const { handleCanvasPointerDown, temporaryTool, isPanning } = interactionRef.current
     if (!maskArmedRef.current || temporaryTool || isPanning) {
+      // W5: blank-canvas pointerdown during the overlay-mounting window also cancels
+      // the pending mask edit (same rationale as wrapNodePointerDown's node branch).
+      if (shouldCancelPendingMaskEdit(maskEditNodeIdRef.current, undefined)) {
+        cancelMaskEdit()
+      }
       handleCanvasPointerDown(event)
       return
     }
@@ -265,7 +287,7 @@ export function useMaskPointArmed({
     debugLogger.log('Mask Edit', 'Armed canvas miss')
     setMaskArmed(false, 'canvas miss')
     handleCanvasPointerDown(event)
-  }, [interactionRef, setMaskArmed])
+  }, [cancelMaskEdit, interactionRef, setMaskArmed])
 
   useEffect(() => {
     const unsubscribe = useCanvasStore.subscribe((state, previous) => {

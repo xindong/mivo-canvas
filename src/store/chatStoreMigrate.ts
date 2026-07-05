@@ -4,8 +4,23 @@
 // import clampChatGenerationContext / migrateChatPersistedState；本模块仅 type-only
 // 反向引用 chatStore 的类型，无运行时循环。
 import type { ChatGenerationContext, ChatParamOverrides, ChatMessage } from './chatStore'
+import type { EnhanceDegradedReason } from '../types/generation'
 import { getModelCapabilities } from '../lib/modelCapabilities'
 import { debugLogger } from './debugLogStore'
+
+// FIX-3: persisted legacy enhance.degradedReason 可能是非 union 字符串（旧版本/手改
+// localStorage）。业务类型已收窄为 EnhanceDegradedReason union，这里在 migrate 层做
+// runtime normalize：非 union 成员 → undefined，避免脏值经类型逃逸到运行时渲染。
+const ENHANCE_DEGRADED_REASONS: readonly EnhanceDegradedReason[] = [
+  'timeout', 'bad-json', 'no-key', 'upstream-error', 'upstream-http', 'upstream-network',
+]
+export const sanitizeEnhanceDegradedReason = (msg: ChatMessage): ChatMessage => {
+  if (!msg.enhance?.degradedReason) return msg
+  const reason = msg.enhance.degradedReason as string
+  if (ENHANCE_DEGRADED_REASONS.includes(reason as EnhanceDegradedReason)) return msg
+  debugLogger.warn('Chat Store', `migrate 丢弃未知 enhance.degradedReason: ${reason}`)
+  return { ...msg, enhance: { ...msg.enhance, degradedReason: undefined } }
+}
 
 // 审查 B：persist v1→v2 迁移与 retryMessage 入口共用——把不再被当前模型支持的 ratio 收敛掉，
 // 防止老会话的 21:9 在 gemini 能力表去 21:9 后从 generationContext 复活。
@@ -50,10 +65,16 @@ export const migrateChatPersistedState = (
   if (version >= 2) {
     // S04: v>=2 也走 sanitize + 形状回落（旧实现裸 `state as {...}` 对非数组
     // messagesByScene 条目与缺失 selectedModel/paramOverrides 无防护）。
+    // FIX-3: v>=2 也跑 sanitizeEnhanceDegradedReason（legacy 脏值可能跨版本存在）。
+    const sanitizedV2 = sanitizeMessagesByScene(state.messagesByScene)
+    const messagesBySceneV2: Record<string, ChatMessage[]> = {}
+    for (const [sceneId, messages] of Object.entries(sanitizedV2)) {
+      messagesBySceneV2[sceneId] = messages.map(sanitizeEnhanceDegradedReason)
+    }
     return {
       selectedModel: state.selectedModel || 'gemini-3-pro-image',
       paramOverrides: state.paramOverrides ?? { imgRatio: 'auto' as const, quality: 'auto' as const },
-      messagesByScene: sanitizeMessagesByScene(state.messagesByScene),
+      messagesByScene: messagesBySceneV2,
     }
   }
   // v1 → v2: gemini 能力表去 21:9，把老会话里不再支持的 ratio 收敛掉
@@ -72,15 +93,16 @@ export const migrateChatPersistedState = (
     quality: prevOverrides.quality,
   }
   // S04: .map 前先过 sanitizeMessagesByScene——非数组条目 warn + drop，合法数组再
-  // 走 clampChatGenerationContext 收敛。
+  // 走 clampChatGenerationContext 收敛。FIX-3: 同时跑 sanitizeEnhanceDegradedReason。
   const sanitized = sanitizeMessagesByScene(state.messagesByScene)
   const messagesByScene: Record<string, ChatMessage[]> = {}
   for (const [sceneId, messages] of Object.entries(sanitized)) {
-    messagesByScene[sceneId] = messages.map((msg) =>
-      msg.generationContext
-        ? { ...msg, generationContext: clampChatGenerationContext(msg.generationContext) }
-        : msg,
-    )
+    messagesByScene[sceneId] = messages.map((msg) => {
+      const cleaned = sanitizeEnhanceDegradedReason(msg)
+      return cleaned.generationContext
+        ? { ...cleaned, generationContext: clampChatGenerationContext(cleaned.generationContext) }
+        : cleaned
+    })
   }
   return { selectedModel, paramOverrides, messagesByScene }
 }

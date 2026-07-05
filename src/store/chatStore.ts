@@ -1,14 +1,15 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import type { EnhanceResponse, GenerationRatio, MivoImageQuality } from '../types/generation'
+import type { EnhanceDegradedReason, EnhanceResponse, GenerationRatio, MivoImageQuality } from '../types/generation'
 import { readImportedAssetFile, saveImportedAsset } from '../lib/assetStorage'
 import { MivoImageRequestError, enhanceMivoPrompt, type MivoImageRequestErrorKind } from '../lib/mivoImageClient'
 import { getModelCapabilities } from '../lib/modelCapabilities'
 import { settleCanvasGenerationLocally } from './canvasGenerationCancel'
 import { fallbackCancelTarget, settleExpiredChatMessages } from './chatGenerationHydration'
+import { resolveChatEnhance } from './chatEnhanceFlow'
 import { debugLogger } from './debugLogStore'
 import { generationFacade } from './generationFacade'
-import { clampChatGenerationContext, migrateChatPersistedState } from './chatStoreMigrate'
+import { clampChatGenerationContext, migrateChatPersistedState, sanitizeEnhanceDegradedReason } from './chatStoreMigrate'
 
 const maxMessagesPerScene = 200
 
@@ -22,7 +23,11 @@ export type ChatEnhanceResult = {
   richPrompt?: string
   imgRatio?: GenerationRatio
   quality?: MivoImageQuality
-  degradedReason?: string
+  /** FIX-3: 收窄为 union，不放宽回 string。persisted legacy 字符串在
+   *  chatStoreMigrate.sanitizeEnhanceDegradedReason 处 runtime normalize。 */
+  degradedReason?: EnhanceDegradedReason
+  /** W4: 哪一档 LLM 降级（primary/fallback），透传自 EnhanceResponse.stage。 */
+  stage?: 'primary' | 'fallback'
 }
 
 export type ChatParamOverrides = {
@@ -41,6 +46,9 @@ export type ChatGenerationContext = {
   quality?: MivoImageQuality
   finalPrompt?: string
   pendingSlotId?: string
+  /** FIX-4: chat 模式澄清附言（replyText）持久化到 context，retry 不重跑 enhance
+   *  时也能从 context 读回并在生成成功后 appendNotice，与 send 路径语义一致。 */
+  noticeText?: string
 }
 
 export type ChatMessage = {
@@ -159,8 +167,9 @@ const enhanceForGeneration = (enhanceResult: EnhanceResponse): ChatEnhanceResult
         imgRatio: enhanceResult.imgRatio,
         quality: enhanceResult.quality,
         degradedReason: enhanceResult.degradedReason,
+        stage: enhanceResult.stage,
       }
-    : { degradedReason: enhanceResult.degradedReason }
+    : { degradedReason: enhanceResult.degradedReason, stage: enhanceResult.stage }
 
 // clampChatGenerationContext / migrateChatPersistedState / ChatPersistedState /
 // sanitizeMessagesByScene 已抽到 ./chatStoreMigrate.ts（保持本文件在 structure-guard
@@ -286,36 +295,11 @@ export const useChatStore = create<ChatState>()(
           })
           if (abortController.signal.aborted) throw new Error(canceledGenerationMessage)
 
-          if (enhanceResult.mode === 'chat' && enhanceResult.replyText?.trim()) {
-            set((s) => ({
-              isBusy: false,
-              messagesByScene: {
-                ...s.messagesByScene,
-                [sceneId]: (s.messagesByScene[sceneId] || []).map((m) =>
-                  m.id === assistantMessageId
-                    ? {
-                        ...m,
-                        status: 'done' as const,
-                        text: enhanceResult.replyText!.trim(),
-                        enhance: undefined,
-                        generationContext: undefined,
-                        resultNodeIds: undefined,
-                        error: undefined,
-                        errorKind: undefined,
-                        timeoutRetryKey: undefined,
-                        timeoutRetryCount: undefined,
-                      }
-                    : m,
-                ),
-              },
-            }))
-            return
-          }
-
           const enhance = enhanceForGeneration(enhanceResult)
-
+          // W4: chat 模式不再早 return —— 用原始 text 生图，replyText 经 appendNotice
+          // 作附言。generate 模式 finalPrompt = richPrompt || text，无附言。
+          const { finalPrompt, noticeText } = resolveChatEnhance(enhanceResult, text)
           // manual override > agent suggestion
-          const finalPrompt = enhance.richPrompt || text
           const finalRatio = paramOverrides.imgRatio !== 'auto'
             ? paramOverrides.imgRatio
             : enhance.imgRatio || getModelCapabilities(selectedModel).defaultRatio
@@ -326,6 +310,8 @@ export const useChatStore = create<ChatState>()(
             imgRatio: finalRatio,
             quality: finalQuality,
             finalPrompt,
+            // FIX-4: 持久化 chat 附言到 context，retry 不重跑 enhance 时可读回。
+            noticeText,
           }
 
           set((s) => ({
@@ -389,6 +375,10 @@ export const useChatStore = create<ChatState>()(
               origin: 'chat',
               prompt: `结果已生成到画布 ${sceneChange.sceneTitle}`,
             })
+          }
+          // W4: chat 模式的澄清附言 —— replyText 作 notice 展示在生成结果后。
+          if (noticeText) {
+            get().appendNotice({ sceneId: sceneChange.currentSceneId, origin: 'chat', prompt: noticeText })
           }
 
           set((s) => ({
@@ -518,6 +508,7 @@ export const useChatStore = create<ChatState>()(
         let finalPrompt = context.finalPrompt || targetMsg.enhance?.richPrompt || targetMsg.text || userMsg.text
         let finalQuality = qualityOverride || context.quality || 'medium'
         let finalRatio = context.imgRatio || getModelCapabilities(context.model).defaultRatio
+        let retryNoticeText = context.noticeText
         context = {
           ...context,
           finalPrompt,
@@ -562,36 +553,12 @@ export const useChatStore = create<ChatState>()(
             })
             if (abortController.signal.aborted) throw new Error(canceledGenerationMessage)
 
-            if (enhanceResult.mode === 'chat' && enhanceResult.replyText?.trim()) {
-              set((s) => ({
-                isBusy: false,
-                messagesByScene: {
-                  ...s.messagesByScene,
-                  [sceneId]: (s.messagesByScene[sceneId] || []).map((m) =>
-                    m.id === messageId
-                      ? {
-                          ...m,
-                          status: 'done' as const,
-                          text: enhanceResult.replyText!.trim(),
-                          enhance: undefined,
-                          generationContext: undefined,
-                          retryDisabledReason: undefined,
-                          resultNodeIds: undefined,
-                          error: undefined,
-                          errorKind: undefined,
-                          timeoutRetryKey: undefined,
-                          timeoutRetryCount: undefined,
-                        }
-                      : m,
-                  ),
-                },
-              }))
-              return
-            }
-
             const enhance = enhanceForGeneration(enhanceResult)
             retryEnhance = enhance
-            finalPrompt = enhance.richPrompt || userMsg.text
+            // W4: chat 模式不再早 return —— 用原始 text 生图，replyText 作附言。
+            const chatResolution = resolveChatEnhance(enhanceResult, userMsg.text)
+            finalPrompt = chatResolution.finalPrompt
+            retryNoticeText = chatResolution.noticeText
             finalRatio = context.requestedImgRatio !== 'auto'
               ? context.requestedImgRatio
               : enhance.imgRatio || getModelCapabilities(context.model).defaultRatio
@@ -602,6 +569,8 @@ export const useChatStore = create<ChatState>()(
               imgRatio: finalRatio,
               quality: finalQuality,
               finalPrompt,
+              // FIX-4: retry 重跑 enhance 时刷新 noticeText 到 context，保持与 send 一致。
+              noticeText: retryNoticeText,
             }
           }
 
@@ -672,6 +641,10 @@ export const useChatStore = create<ChatState>()(
               origin: 'chat',
               prompt: `结果已生成到画布 ${sceneChange.sceneTitle}`,
             })
+          }
+          // W4: chat 模式的澄清附言 —— replyText 作 notice 展示在生成结果后。
+          if (retryNoticeText) {
+            get().appendNotice({ sceneId: sceneChange.currentSceneId, origin: 'chat', prompt: retryNoticeText })
           }
 
           set((s) => ({
@@ -837,9 +810,17 @@ export const useChatStore = create<ChatState>()(
         if (result.settledMessages > 0) {
           debugLogger.warn('Chat Store', `Hydration settled ${result.settledMessages} expired chat generation message(s)`)
         }
+        // FIX-A: zustand v5 persisted version == options version (v2==v2) 时 migrate
+        // 不走，只走 merge。86ce7d4 之前写入的脏 degradedReason string 仍会经 merge 进
+        // runtime/UI。在 merge 必经路径对每条 message 跑 sanitizeEnhanceDegradedReason
+        // （与 settle 同一处 map），保证 hydration 后 degradedReason 必为 union 成员或 undefined。
+        const sanitizedMessages: Record<string, ChatMessage[]> = {}
+        for (const [sceneId, messages] of Object.entries(result.messagesByScene)) {
+          sanitizedMessages[sceneId] = messages.map(sanitizeEnhanceDegradedReason)
+        }
         return {
           ...merged,
-          messagesByScene: result.messagesByScene,
+          messagesByScene: sanitizedMessages,
         }
       },
     },

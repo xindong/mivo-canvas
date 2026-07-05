@@ -314,20 +314,42 @@ describe('enhance', () => {
     expect(mockState.enhanceCalls).toBe(0)
   })
 
-  it('both models fail → 200 degraded {enhanced:false}', async () => {
+  it('W4 both models fail (http) → 200 degraded {degradedReason:upstream-http, stage:fallback}', async () => {
     mockState.enhanceStatus = 500
     const r = await req('/api/mivo/enhance', jsonReq({ prompt: 'a cat' }))
     expect(r.status).toBe(200)
     expect((r.body as { enhanced: boolean }).enhanced).toBe(false)
-    expect((r.body as { degradedReason: string }).degradedReason).toBe('upstream-error')
+    expect((r.body as { degradedReason: string }).degradedReason).toBe('upstream-http')
+    expect((r.body as { stage: string }).stage).toBe('fallback')
     expect(mockState.enhanceCalls).toBe(2) // primary + fallback
   })
 
-  it('upstream timeout → 200 degraded {degradedReason:"timeout"}', async () => {
+  it('W4 upstream timeout → 200 degraded {degradedReason:timeout, stage:fallback}', async () => {
     mockState.enhanceDelayMs = 1000
     const r = await req('/api/mivo/enhance', jsonReq({ prompt: 'a cat' }))
     expect(r.status).toBe(200)
     expect((r.body as { degradedReason: string }).degradedReason).toBe('timeout')
+    expect((r.body as { stage: string }).stage).toBe('fallback')
+  })
+
+  it('W4 bad-json (LLM returns non-agreed content) → 200 degraded {degradedReason:bad-json, stage:fallback}', async () => {
+    mockState.enhanceBody = { choices: [{ message: { content: 'this is not json' } }] }
+    const r = await req('/api/mivo/enhance', jsonReq({ prompt: 'a cat' }))
+    expect(r.status).toBe(200)
+    expect((r.body as { enhanced: boolean }).enhanced).toBe(false)
+    expect((r.body as { degradedReason: string }).degradedReason).toBe('bad-json')
+    expect((r.body as { stage: string }).stage).toBe('fallback')
+    expect(mockState.enhanceCalls).toBe(2) // primary bad-json + fallback bad-json
+  })
+
+  it('W4 upstream-network (LLM endpoint unreachable) → 200 degraded {degradedReason:upstream-network, stage:fallback}', async () => {
+    applyEnv({ MIVO_LLM_API_BASE: 'http://127.0.0.1:1' })
+    const r = await req('/api/mivo/enhance', jsonReq({ prompt: 'a cat' }))
+    expect(r.status).toBe(200)
+    expect((r.body as { enhanced: boolean }).enhanced).toBe(false)
+    expect((r.body as { degradedReason: string }).degradedReason).toBe('upstream-network')
+    expect((r.body as { stage: string }).stage).toBe('fallback')
+    expect(mockState.enhanceCalls).toBe(0) // never reached the mock
   })
 
   it('200 generate mode (ratio/quality clamped)', async () => {
@@ -348,6 +370,20 @@ describe('enhance', () => {
     expect(mockState.lastEnhanceBodyText).toContain('a fictional footballer performing an iconic celebratory jump')
     expect(mockState.lastEnhanceBodyText).toContain('must not output brand, IP, or product names')
     expect(mockState.lastEnhanceBodyText).toContain('bright family-friendly 3D platformer aesthetic')
+  })
+
+  it('W4 IP 泛化：刺客信条奥德赛/Mario/C罗/奥德赛 → enhanced:true + system prompt 含 IP 泛化规则', async () => {
+    // mock LLM 不打真上游；验证 enhance 路由对含 IP/真名的输入正常返 enhanced:true，
+    // 且发给 LLM 的 system prompt 一致携带 IP 泛化规则（不因输入不同而漏注入）。
+    for (const prompt of ['刺客信条奥德赛的主角', 'Mario 跳跃', 'C罗庆祝动作', '奥德赛']) {
+      mockState.enhanceCalls = 0
+      const r = await req('/api/mivo/enhance', jsonReq({ prompt, modelId: 'gpt-image-2' }))
+      expect(r.status).toBe(200)
+      expect((r.body as { enhanced: boolean }).enhanced).toBe(true)
+      expect(mockState.enhanceCalls).toBe(1) // primary 成功，不调 fallback
+      expect(mockState.lastEnhanceBodyText).toContain('must not output real person')
+      expect(mockState.lastEnhanceBodyText).toContain('must not output brand, IP, or product names')
+    }
   })
 
   it('200 chat mode (replyText normalized, no markdown)', async () => {

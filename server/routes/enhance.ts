@@ -85,13 +85,15 @@ const parseEnhanceJson = (raw: string): EnhanceParsed | null => {
   }
 }
 
+type EnhanceDegradedReason = 'upstream-http' | 'upstream-network' | 'timeout' | 'bad-json'
+
 const callEnhanceLlm = async (
   model: string,
   messages: Array<{ role: string; content: string }>,
   llmApiKey: string,
   timeoutMs: number,
   llmApiBase: string,
-): Promise<{ result: EnhanceParsed | null; reason: string }> => {
+): Promise<{ result: EnhanceParsed | null; reason: EnhanceDegradedReason | '' }> => {
   try {
     const response = await fetchUpstreamWithTimeout(
       `${llmApiBase}/chat/completions`,
@@ -103,7 +105,8 @@ const callEnhanceLlm = async (
       },
       timeoutMs,
     )
-    if (!response.ok) return { result: null, reason: 'upstream-error' }
+    // W4: non-2xx → upstream-http（与下方 throw 的 upstream-network 区分）。
+    if (!response.ok) return { result: null, reason: 'upstream-http' }
     const payload = (await response.json()) as EnhanceLlmResponse
     const content = payload.choices?.[0]?.message?.content || ''
     const parsed = parseEnhanceJson(content)
@@ -111,7 +114,7 @@ const callEnhanceLlm = async (
   } catch (error) {
     return {
       result: null,
-      reason: error instanceof UpstreamRequestTimeoutError ? 'timeout' : 'upstream-error',
+      reason: error instanceof UpstreamRequestTimeoutError ? 'timeout' : 'upstream-network',
     }
   }
 }
@@ -196,6 +199,8 @@ export const enhanceHandler: Handler<{ Bindings: HttpBindings }> = async (c) => 
       env.enhancePrimaryTimeoutMs,
       env.llmApiBase,
     )
+    // W4: stage 标哪一档 LLM 给出的降级，供前端标签 + 服务端测试矩阵断言。
+    let stage: 'primary' | 'fallback' = 'primary'
 
     // Fallback: fast JSON-stable mini model (8s)
     if (!result) {
@@ -207,12 +212,14 @@ export const enhanceHandler: Handler<{ Bindings: HttpBindings }> = async (c) => 
         env.llmApiBase,
       )
       result = fallback.result
+      stage = 'fallback'
       if (!result) degradedReason = fallback.reason || degradedReason
     }
 
     if (!result) {
-      log(200, `degraded:${degradedReason}`)
-      return c.json({ enhanced: false, degradedReason }, 200)
+      const reason = degradedReason || 'upstream-network'
+      log(200, `degraded:${reason}:${stage}`)
+      return c.json({ enhanced: false, degradedReason: reason, stage }, 200)
     }
 
     if (result.mode === 'chat') {
