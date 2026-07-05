@@ -21,13 +21,13 @@ export type CanvasToolHandlerContext = {
   beginFrameBox: (event: CanvasSurfacePointerEvent) => void
   beginMarkupBox: (event: CanvasSurfacePointerEvent) => void
   beginStampPlacement: (event: CanvasSurfacePointerEvent) => void
-  beginTextEdit: (nodeId: string, event: CanvasNodePointerEvent) => boolean
+  beginTextEdit: (nodeId: string, event: CanvasSurfacePointerEvent) => boolean
 }
 
 export type CanvasToolHandler = {
   id: RuntimeCanvasTool
   onCanvasPointerDown: (event: CanvasSurfacePointerEvent, context: CanvasToolHandlerContext) => void
-  onNodePointerDown: (nodeId: string, event: CanvasNodePointerEvent, context: CanvasToolHandlerContext) => void
+  onNodePointerDown: (nodeId: string, event: CanvasSurfacePointerEvent, context: CanvasToolHandlerContext) => void
   onResizeHandlePointerDown: (
     nodeId: string,
     corner: ResizeCorner,
@@ -52,7 +52,7 @@ const selectToolHandler: CanvasToolHandler = {
     if (event.button !== 0) return
 
     event.stopPropagation()
-    context.beginNodeMove(nodeId, event)
+    context.beginNodeMoveFromShell(nodeId, event)
   },
   onResizeHandlePointerDown: (nodeId, corner, event, context) => {
     if (event.button !== 0) return
@@ -91,7 +91,7 @@ const textToolHandler: CanvasToolHandler = {
 
     event.stopPropagation()
     if (!context.beginTextEdit(nodeId, event)) {
-      context.beginNodeMove(nodeId, event)
+      context.beginNodeMoveFromShell(nodeId, event)
     }
   },
   onResizeHandlePointerDown: (_nodeId, _corner, event) => {
@@ -110,7 +110,7 @@ const frameToolHandler: CanvasToolHandler = {
     if (event.button !== 0) return
 
     event.stopPropagation()
-    context.beginNodeMove(nodeId, event)
+    context.beginNodeMoveFromShell(nodeId, event)
   },
   onResizeHandlePointerDown: (_nodeId, _corner, event) => {
     event.stopPropagation()

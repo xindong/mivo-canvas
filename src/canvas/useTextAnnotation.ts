@@ -233,7 +233,7 @@ export function useTextAnnotation({
   const [markupCreationBox, setMarkupCreationBox] = useState<MarkupCreationState | null>(null)
 
   const beginTextEdit = useCallback(
-    (nodeId: string, event: ReactPointerEvent<HTMLDivElement>) => {
+    (nodeId: string, event: ReactPointerEvent<HTMLElement>) => {
       if (event.button !== 0) return false
 
       event.preventDefault()

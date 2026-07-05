@@ -36,8 +36,6 @@ type CanvasNodeViewProps = {
   maskEditSubmitting: boolean
   initialMaskClientPoint?: MaskInitialClientPoint
   viewportScale: number
-  onSelect: (nodeId: string, options?: { additive?: boolean }) => void
-  onPointerDown: (nodeId: string, event: React.PointerEvent<HTMLDivElement>) => void
   onResizeHandlePointerDown: (
     nodeId: string,
     corner: ResizeCorner,
@@ -53,10 +51,6 @@ type CanvasNodeViewProps = {
     edge: TextResizeEdge,
     event: React.PointerEvent<HTMLButtonElement>,
   ) => void
-  onOpenDetails: (nodeId: string) => void
-  onOpenContextMenu: (nodeId: string, x: number, y: number) => void
-  onEditText: (nodeId: string) => void
-  onRenameNode: (nodeId: string) => void
   onUpdateText: (nodeId: string, text: string) => void
   onFinishTextEdit: (nodeId: string) => void
   onResizeNodeToContent: (nodeId: string, width: number, height: number) => void
@@ -497,15 +491,9 @@ export const CanvasNodeView = memo(function CanvasNodeView({
   maskEditSubmitting,
   initialMaskClientPoint,
   viewportScale,
-  onSelect,
-  onPointerDown,
   onResizeHandlePointerDown,
   onMarkupPointPointerDown,
   onTextResizeHandlePointerDown,
-  onOpenDetails,
-  onOpenContextMenu,
-  onEditText,
-  onRenameNode,
   onUpdateText,
   onFinishTextEdit,
   onResizeNodeToContent,
@@ -644,25 +632,6 @@ export const CanvasNodeView = memo(function CanvasNodeView({
       data-connector-end-offset={node.connectorEnd?.offset}
       className={nodeClassName}
       style={nodeStyle}
-      onPointerDown={(event) => onPointerDown(node.id, event)}
-      onContextMenu={(event) => {
-        event.preventDefault()
-        event.stopPropagation()
-        if (!selected) onSelect(node.id)
-        onOpenContextMenu(node.id, event.clientX, event.clientY)
-      }}
-      onDoubleClick={(event) => {
-        event.stopPropagation()
-        if (maskEditActive) return
-        onSelect(node.id)
-        if (textNode || markupNode) {
-          onEditText(node.id)
-        } else if (frameNode) {
-          onRenameNode(node.id)
-        } else {
-          onOpenDetails(node.id)
-        }
-      }}
     >
       {frameNode ? (
         <div

@@ -102,7 +102,7 @@ export function MivoCanvas({
   const shellRef = useRef<HTMLElement | null>(null)
   const hostRef = useRef<HTMLDivElement | null>(null)
   const maskPointInteractionRef = useRef<MaskPointArmedInteractionApi>({
-    beginNodePointerDown: () => undefined,
+    resolveCanvasHit: () => null,
     handleCanvasPointerDown: () => undefined,
     temporaryTool: undefined,
     isPanning: false,
@@ -147,7 +147,6 @@ export function MivoCanvas({
     submitMaskEdit,
     cancelMaskEdit,
     toggleMaskArmed,
-    wrapNodePointerDown,
     wrapCanvasPointerDown,
     handleInitialClientPointHandled,
   } = useMaskPointArmed({
@@ -182,13 +181,13 @@ export function MivoCanvas({
     selectionPreviewSet,
     beginGroupResize,
     beginSelectionSpacingDrag,
-    beginNodePointerDown,
     beginNodeResize,
     editTextNode,
     beginTextResize,
     beginMarkupPointMove,
     updateEditingText,
     finishTextEditing,
+    resolveCanvasHit,
     handleCanvasPointerDown,
     handleCanvasPointerMove,
     handleCanvasPointerEnd,
@@ -198,23 +197,19 @@ export function MivoCanvas({
     fitSelection,
     resetView,
   } = useCanvasInteractionController({
-    shellRef,
-    sceneId,
-    nodes: visibleNodes,
-    selectedNodeIds,
-    maskEditNodeId,
-    onCancelMaskEdit: cancelMaskEdit,
+    shellRef, sceneId, nodes: visibleNodes, selectedNodeIds, maskEditNodeId,
+    onCancelMaskEdit: cancelMaskEdit, cropEditNodeId: cropNodeId, onCancelCropEdit: clearCropNode,
     onCloseContextMenu: closeContextMenu,
   })
 
   useLayoutEffect(() => {
     maskPointInteractionRef.current = {
-      beginNodePointerDown,
+      resolveCanvasHit,
       handleCanvasPointerDown,
       temporaryTool,
       isPanning,
     }
-  }, [beginNodePointerDown, handleCanvasPointerDown, isPanning, temporaryTool])
+  }, [resolveCanvasHit, handleCanvasPointerDown, isPanning, temporaryTool])
 
   const screenToCanvasPoint = useCallback(
     (clientX: number, clientY: number) => {
@@ -278,24 +273,6 @@ export function MivoCanvas({
   )
 
   const handleOpenNodeDetails = useOpenNodeDetails(setContextMenu, selectNode, onOpenDetails)
-
-  const openBlankContextMenu = useCallback(
-    (event: ReactMouseEvent<HTMLElement>) => {
-      if (isCanvasChromeTarget(event.target)) return
-
-      event.preventDefault()
-      event.stopPropagation()
-
-      const position = clampContextMenuPosition(event.clientX, event.clientY, 300)
-      setContextMenu({
-        kind: 'blank',
-        x: position.x,
-        y: position.y,
-        canvasPosition: screenToCanvasPoint(event.clientX, event.clientY),
-      })
-    },
-    [screenToCanvasPoint],
-  )
 
   const beginCropNode = useCallback(
     (nodeId: string) => {
@@ -473,6 +450,59 @@ export function MivoCanvas({
   const brushToolActive = storeActiveTool === 'markup-brush' && !temporaryTool && !isPanning
   const stampToolActive = storeActiveTool === 'stamp' && !temporaryTool && !isPanning
 
+  // Phase 1b-4: shell-unified contextmenu + doubleclick (per-node root handlers gone;
+  // .dom-node is pointer-events:none so these events reach the shell directly).
+  const handleCanvasContextMenu = useCallback((event: ReactMouseEvent<HTMLElement>) => {
+    if (isCanvasChromeTarget(event.target)) return
+    event.preventDefault(); event.stopPropagation()
+    // 1b-4: contextmenu 优先用 event.target 的 .dom-node[data-node-id] 确定节点
+    // (恢复 per-node onContextMenu 语义:右键哪个 DOM 开哪个菜单)。resolveCanvasHit(坐标)
+    // 对"section 含 image"等容器场景会命中子节点(image back-to-front 优先),误开子节点菜单。
+    // event.target.closest 直接跟 DOM 层叠走,与 origin/main per-node 行为一致;等节点迁到
+    // Leafer 无 DOM 时自然回落 resolveCanvasHit 坐标兜底路径(fallback 已是这个结构)。
+    const domNode = event.target instanceof Element
+      ? event.target.closest<HTMLElement>('.dom-node[data-node-id]')
+      : null
+    const targetNodeId = domNode?.getAttribute('data-node-id') ?? null
+    if (targetNodeId) {
+      if (!selectedNodeIds.includes(targetNodeId)) selectNode(targetNodeId)
+      openNodeContextMenu(targetNodeId, event.clientX, event.clientY); return
+    }
+    const target = resolveCanvasHit(event.clientX, event.clientY)
+    if (target?.kind === 'node') {
+      if (!selectedNodeIds.includes(target.nodeId)) selectNode(target.nodeId)
+      openNodeContextMenu(target.nodeId, event.clientX, event.clientY); return
+    }
+    const position = clampContextMenuPosition(event.clientX, event.clientY, 300)
+    setContextMenu({ kind: 'blank', x: position.x, y: position.y, canvasPosition: screenToCanvasPoint(event.clientX, event.clientY) })
+  }, [resolveCanvasHit, openNodeContextMenu, screenToCanvasPoint, selectNode, selectedNodeIds])
+
+  const handleCanvasDoubleClick = useCallback((event: ReactMouseEvent<HTMLElement>) => {
+    if (isCanvasChromeTarget(event.target)) return
+    // 1b-4: dblclick 同 contextmenu,优先用 event.target.closest('.dom-node[data-node-id]')
+    // 取 nodeId(针对可见元素的手势跟 DOM 层叠走),取不到才 fallback 坐标命中。双击 line/arrow
+    // stroke(target=.markup-hit-line SVG)→ closest 到 markup 节点,比坐标命中更直接更稳。
+    const domNode = event.target instanceof Element
+      ? event.target.closest<HTMLElement>('.dom-node[data-node-id]')
+      : null
+    const targetNodeId = domNode?.getAttribute('data-node-id') ?? null
+    const target = targetNodeId
+      ? { kind: 'node' as const, nodeId: targetNodeId }
+      : resolveCanvasHit(event.clientX, event.clientY)
+    if (target?.kind !== 'node') return
+    const node = visibleNodes.find((item) => item.id === target.nodeId)
+    if (!node) return
+    // 1b-4: 恢复 per-node onDoubleClick 的 maskEditActive guard——mask overlay 开着时
+    // 双击该节点(含 mask overlay 内的点击,target 经 closest 落到 image .dom-node)
+    // 不应开 details / rename / edit,让 mask overlay 自己处理。等价 origin/main
+    // CanvasNodeView image onDoubleClick 的 `if (maskEditActive) return`。
+    if (node.id === maskEditNodeId) return
+    selectNode(node.id)
+    if (node.type === 'text' || node.type === 'annotation' || node.type === 'markup') editTextNode(node.id)
+    else if (node.type === 'frame') promptRenameNode(node.id)
+    else handleOpenNodeDetails(node.id)
+  }, [editTextNode, handleOpenNodeDetails, maskEditNodeId, promptRenameNode, resolveCanvasHit, selectNode, visibleNodes])
+
   return (
     <section
       className={`canvas-shell tool-${interactionMode} ${isPanning ? 'is-panning' : ''} ${
@@ -499,7 +529,8 @@ export function MivoCanvas({
       onPointerCancel={handleCanvasPointerEnd}
       onDragOver={handleCanvasDragOver}
       onDrop={handleCanvasDrop}
-      onContextMenu={openBlankContextMenu}
+      onContextMenu={handleCanvasContextMenu}
+      onDoubleClick={handleCanvasDoubleClick}
       style={{
         backgroundPosition: `${viewport.x}px ${viewport.y}px`,
         backgroundSize: `${36 * viewport.scale}px ${36 * viewport.scale}px`,
@@ -673,21 +704,15 @@ export function MivoCanvas({
               maskEditSubmitting={node.id === maskEditSubmittingNodeId}
               initialMaskClientPoint={initialClientPoint?.nodeId === node.id ? initialClientPoint : undefined}
               viewportScale={viewport.scale}
-              onSelect={selectNode}
-              onPointerDown={wrapNodePointerDown}
               onResizeHandlePointerDown={beginNodeResize}
               onMarkupPointPointerDown={beginMarkupPointMove}
               onTextResizeHandlePointerDown={beginTextResize}
-              onEditText={editTextNode}
-              onRenameNode={promptRenameNode}
               onUpdateText={updateEditingText}
               onFinishTextEdit={finishTextEditing}
               onResizeNodeToContent={updateNodeMeasuredSize}
               onSubmitMaskEdit={submitMaskEdit}
               onCancelMaskEdit={cancelMaskEdit}
               onInitialMaskClientPointHandled={handleInitialClientPointHandled}
-              onOpenDetails={handleOpenNodeDetails}
-              onOpenContextMenu={openNodeContextMenu}
             />
           )
         })}
