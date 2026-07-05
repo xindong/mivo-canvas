@@ -24,6 +24,9 @@ import { projectRoot } from './bench/fixture-lib.mjs'
  *   node scripts/visual-diff.mjs --candidate=leafer --fixture=rotation
  *       # FU-8 旋转对照：注入旋转 image/rect/ellipse/note/line/arrow + connector
  *       # 固定文档（bench 同款 replaceSnapshot 注入），DOM vs Leafer 像素对照
+ *   node scripts/visual-diff.mjs --candidate=leafer --fixture=brush-stamp
+ *       # Phase 4c 对照：marker/highlighter/dashed/旋转 brush + stamp（含旋转）
+ *       # + FU-10 半透明描边 rect/ellipse，DOM vs Leafer 像素对照
  */
 
 const DEFAULT_PORT = 4179
@@ -45,11 +48,13 @@ const parseArgs = (argv) => {
     headless: true,
     outputDir: 'test-artifacts/visual-diff',
     fixture: null,
+    textPaint: null,
   }
   for (const entry of argv) {
     if (entry.startsWith('--baseline=')) options.baseline = entry.slice('--baseline='.length) || 'dom'
     else if (entry.startsWith('--candidate=')) options.candidate = entry.slice('--candidate='.length) || 'dom'
     else if (entry.startsWith('--fixture=')) options.fixture = entry.slice('--fixture='.length) || null
+    else if (entry === '--text-paint=leafer') options.textPaint = 'leafer'
     else if (entry.startsWith('--dpr=')) {
       const dpr = Number.parseInt(entry.slice('--dpr='.length), 10)
       if (Number.isFinite(dpr) && dpr > 0) options.dpr = dpr
@@ -156,19 +161,82 @@ const rotationFixtureNodes = () => {
   ]
 }
 
-const fixtureNodesFor = (fixture) => {
+/**
+ * Phase 4c brush/stamp 对照 fixture：marker 实心笔迹 / highlighter（0.42 半透明
+ * 宽笔）/ dashed 笔迹（legacy polyline）/ 旋转笔迹 + stamp 贴纸（含旋转）+
+ * FU-10 半透明描边 rect/ellipse（修复前 Leafer 会画成全不透明描边）。
+ * 坐标按默认 viewport (420,240,scale 1) 全部落在 1920×1080 视口内。
+ */
+const brushStampFixtureNodes = () => {
+  const node = (props) => ({ status: 'ready', title: props.id, ...props })
+  const rotated = (props, rotation) => ({
+    ...node(props),
+    transform: { x: props.x, y: props.y, width: props.width, height: props.height, rotation },
+  })
+  const wave = [
+    { x: 12, y: 96 },
+    { x: 83, y: 40 },
+    { x: 145, y: 108 },
+    { x: 248, y: 48 },
+  ]
+  return [
+    node({ id: 'brush-marker', type: 'markup', markupKind: 'brush', markupBrushKind: 'marker', x: 40, y: 40, width: 260, height: 160, markupPoints: wave, markupStrokeColor: '#d9542a', markupStrokeWidth: 6 }),
+    node({ id: 'brush-highlighter', type: 'markup', markupKind: 'brush', markupBrushKind: 'highlighter', x: 360, y: 40, width: 260, height: 160, markupPoints: wave, markupStrokeColor: '#f7b500', markupStrokeWidth: 6, markupOpacity: 0.42 }),
+    node({ id: 'brush-dashed', type: 'markup', markupKind: 'brush', markupBrushKind: 'marker', x: 680, y: 40, width: 260, height: 160, markupPoints: wave, markupStrokeColor: '#2563eb', markupStrokeWidth: 4, markupStrokeStyle: 'dashed' }),
+    rotated({ id: 'brush-rotated', type: 'markup', markupKind: 'brush', markupBrushKind: 'marker', x: 40, y: 300, width: 260, height: 160, markupPoints: wave, markupStrokeColor: '#16a34a', markupStrokeWidth: 6 }, 30),
+    node({ id: 'stamp-plus-one', type: 'markup', markupKind: 'stamp', markupStampKind: 'plus-one', x: 400, y: 320, width: 112, height: 112 }),
+    rotated({ id: 'stamp-heart', type: 'markup', markupKind: 'stamp', markupStampKind: 'heart', x: 570, y: 330, width: 82, height: 82 }, -20),
+    node({ id: 'fu10-rect', type: 'markup', markupKind: 'rect', x: 760, y: 300, width: 180, height: 120, markupStrokeColor: '#112233', markupStrokeWidth: 6, markupOpacity: 0.5 }),
+    node({ id: 'fu10-ellipse', type: 'markup', markupKind: 'ellipse', x: 760, y: 470, width: 180, height: 120, markupStrokeColor: '#7c3aed', markupStrokeWidth: 6, markupOpacity: 0.35 }),
+  ]
+}
+
+/**
+ * Phase 5 静态文本 golden fixture:CJK 长段 / 中英混排 / 英文长词(anywhere
+ * 断行)/ 显式换行(pre-wrap)/ 字号 12-24 / 字重 500 vs 700 / 三种对齐 /
+ * 自定义颜色。node.width 决定换行盒宽,浏览器与 Leafer 的断行差异会直接
+ * 表现为行数/字位错位 → 像素 diff 放大,是文本去向判决的核心证据。
+ */
+const textFixtureNodes = () => {
+  const node = (props) => ({ status: 'ready', title: props.id, type: 'text', ...props })
+  return [
+    node({ id: 'txt-cjk', x: 40, y: 40, width: 280, height: 220, fontSize: 16, text: '无限画布要在内容越来越多的时候仍然保持流畅,渲染层就必须只处理视口内可见的那一小部分节点;缩小到全景时再用降级绘制兜底。这段话用于验证中日韩文字的逐字断行与行高。' }),
+    node({ id: 'txt-mixed', x: 360, y: 40, width: 260, height: 200, fontSize: 16, text: 'Leafer 接入后 20k 节点 pan p95 只有 17.3ms(bar 是 33ms),比 DOM 的 100.1ms 快了 5.8x——mixed CJK/ASCII wrapping test 12345。' }),
+    node({ id: 'txt-longword', x: 660, y: 40, width: 200, height: 180, fontSize: 16, text: 'Supercalifragilisticexpialidocious pneumonoultramicroscopicsilicovolcanoconiosis overflow-wrap-anywhere behavior check' }),
+    node({ id: 'txt-newline', x: 900, y: 40, width: 240, height: 200, fontSize: 16, text: '第一行\n第二行较长一些用于观察\n\n空行之后的第四行' }),
+    node({ id: 'txt-small', x: 40, y: 300, width: 220, height: 120, fontSize: 12, text: '小字号 12px:界面注释与图注常用尺寸,验证小字距下的断行稳定性。small 12px annotation text.' }),
+    node({ id: 'txt-big-bold', x: 300, y: 300, width: 320, height: 160, fontSize: 24, fontWeight: 700, text: '大标题 24px 700 粗体 Heading Weight' }),
+    node({ id: 'txt-center', x: 660, y: 300, width: 240, height: 120, fontSize: 16, textAlign: 'center', text: '居中对齐的多行文本\ncenter aligned lines' }),
+    node({ id: 'txt-right', x: 940, y: 300, width: 240, height: 120, fontSize: 16, textAlign: 'right', text: '右对齐的多行文本\nright aligned lines' }),
+    node({ id: 'txt-color', x: 40, y: 460, width: 280, height: 120, fontSize: 16, textColor: '#b3261e', text: '自定义颜色 #b3261e 的文本,验证 fill 透传。colored text sample.' }),
+  ]
+}
+
+const fixtureFor = (fixture) => {
   if (!fixture) return null
-  if (fixture === 'rotation') return rotationFixtureNodes()
+  if (fixture === 'rotation') {
+    // dom 模式等注入的旋转图片位图落地（唯一的异步资源）。
+    return { nodes: rotationFixtureNodes(), domReadySelector: '.dom-node img[src="/demo-assets/courage-1.jpg"]' }
+  }
+  if (fixture === 'text') {
+    return { nodes: textFixtureNodes(), domReadySelector: '.dom-text-node' }
+  }
+  if (fixture === 'brush-stamp') {
+    // dom 模式等 stamp 贴纸 <img> 挂载（笔迹是同步 SVG path）。
+    return { nodes: brushStampFixtureNodes(), domReadySelector: '.dom-markup-stamp img' }
+  }
   throw new Error(`Unknown --fixture value: ${fixture}`)
 }
 
-const captureScreenshot = async ({ browser, port, renderer, dpr, label, fixture }) => {
+const captureScreenshot = async ({ browser, port, renderer, dpr, label, fixture, textPaint }) => {
+  const pageQuery = `renderer=${encodeURIComponent(renderer)}${textPaint && renderer === 'leafer' ? `&textPaint=${encodeURIComponent(textPaint)}` : ''}`
   const context = await browser.newContext({
     viewport: { width: 1920, height: 1080 },
     deviceScaleFactor: dpr,
     colorScheme: 'light',
   })
-  const fixtureNodes = fixtureNodesFor(fixture)
+  const fixtureDescriptor = fixtureFor(fixture)
+  const fixtureNodes = fixtureDescriptor?.nodes ?? null
   const page = await context.newPage()
   await page.emulateMedia({ reducedMotion: 'reduce' })
   if (fixtureNodes) {
@@ -177,7 +245,7 @@ const captureScreenshot = async ({ browser, port, renderer, dpr, label, fixture 
       globalThis.__MIVO_BENCH_PERSIST_SKIP__ = true
     })
   }
-  await page.goto(`http://127.0.0.1:${port}/?renderer=${encodeURIComponent(renderer)}`, { waitUntil: 'networkidle' })
+  await page.goto(`http://127.0.0.1:${port}/?${pageQuery}`, { waitUntil: 'networkidle' })
   await page.addStyleTag({
     content: [
       '*,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important;}',
@@ -185,7 +253,7 @@ const captureScreenshot = async ({ browser, port, renderer, dpr, label, fixture 
     ].join(''),
   })
   await page.evaluate(() => window.localStorage.clear())
-  await page.goto(`http://127.0.0.1:${port}/?renderer=${encodeURIComponent(renderer)}`, { waitUntil: 'networkidle' })
+  await page.goto(`http://127.0.0.1:${port}/?${pageQuery}`, { waitUntil: 'networkidle' })
   await page.waitForSelector('.canvas-shell')
   if (fixtureNodes) {
     // 注入固定文档（replaceSnapshot 内部跑 normalizeCanvasGraph → connector
@@ -217,8 +285,7 @@ const captureScreenshot = async ({ browser, port, renderer, dpr, label, fixture 
         { timeout: 15000 },
       )
     } else {
-      // dom 模式等注入的旋转图片位图落地（唯一的异步资源）。
-      await page.waitForSelector('.dom-node img[src="/demo-assets/courage-1.jpg"]')
+      await page.waitForSelector(fixtureDescriptor.domReadySelector)
     }
     await page.waitForTimeout(300)
   } else if (renderer === 'leafer') {
@@ -297,6 +364,7 @@ const main = async () => {
       dpr: options.dpr,
       label: 'candidate',
       fixture: options.fixture,
+      textPaint: options.textPaint,
     })
 
     const diff = diffImages(baseline, candidate)

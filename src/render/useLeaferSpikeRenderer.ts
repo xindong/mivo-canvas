@@ -3,7 +3,20 @@ import { Image, Rect, Leafer, Text } from 'leafer-ui'
 import '@leafer-in/view'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 import type { RendererMode } from './rendererMode'
-import { isLeaferLinePaintedNode, isLeaferShapePaintedNode, isLeaferSpikePainted } from './leaferSpikeFilter'
+import {
+  isLeaferBrushStampPaintedNode,
+  isLeaferLinePaintedNode,
+  isLeaferShapePaintedNode,
+  isLeaferSpikePainted,
+  isLeaferTextSpikePaintedNode,
+} from './leaferSpikeFilter'
+import { isLeaferTextPaintRequested } from './textPaintMode'
+import {
+  defaultTextAlign,
+  defaultTextColor,
+  defaultTextFontSize,
+  defaultTextWeight,
+} from '../canvas/textGeometry'
 import { useCanvasStore } from '../store/canvasStore'
 import { debugLogger } from '../store/debugLogStore'
 import { registerEngineSpikeCamera } from './engineSpikeCameraBridge'
@@ -17,6 +30,7 @@ import {
   withEngineLodStats,
   type EngineLodStatsCarrier,
 } from './engineSpikeLod'
+import { createLeaferBrushStampPaint } from './leaferBrushStampPaint'
 import { createLeaferImagePaint } from './leaferImagePaint'
 import { createLeaferLinePaint } from './leaferLinePaint'
 import { createLeaferShapePaint, leaferZOrderMapFor } from './leaferShapePaint'
@@ -29,11 +43,12 @@ import { createLeaferShapePaint, leaferZOrderMapFor } from './leaferShapePaint'
  * pointer-events:none 已是双保险）+ 相机单向同步（React viewport → leafer.zoomLayer.set，
  * 禁反向监听）+ paint 编排：image → leaferImagePaint（3c），frame/markup shape →
  * leaferShapePaint（4a），markup line/arrow/connector → leaferLinePaint（4b），
- * bench-only LOD text → inline loop（diff add/update/remove）。
+ * markup brush/stamp → leaferBrushStampPaint（4c），bench-only LOD text →
+ * inline loop（diff add/update/remove）。
  *
  * dom 模式仅保留 Leafer init（空白 canvas，与 PR-1 前行为一致），不 paint、不 sync。
- * leafer 模式画 image/frame/rect/ellipse/note/line/arrow；其余节点继续 DOM
- * （见 leaferSpikeFilter）。
+ * leafer 模式画 image/frame/rect/ellipse/note/line/arrow/brush/stamp；其余节点
+ * 继续 DOM（见 leaferSpikeFilter）。
  *
  * 交互在 leafer 模式下允许暂时残缺（spike 只测渲染性能；pan/zoom 走 viewport 不依赖节点命中）。
  */
@@ -98,7 +113,9 @@ const parsePanCacheEnabled = () => {
 }
 
 const isLeaferEngineComboPainted = (node: MivoCanvasNode): boolean =>
-  isLeaferSpikePainted(node) || (isEngineLodRequested && node.type === 'text')
+  isLeaferSpikePainted(node) ||
+  isLeaferTextSpikePaintedNode(node) ||
+  (isEngineLodRequested && node.type === 'text')
 
 const leaferObjectKindFor = (node: MivoCanvasNode, viewport: ViewportState): LeaferObjectKind => {
   if (shouldUseEngineLod(node, viewport)) return 'rect'
@@ -121,6 +138,28 @@ const leaferSpikePaintProps = (node: MivoCanvasNode, viewport: ViewportState) =>
     return { ...base, url: node.assetUrl ?? '' }
   }
   if (node.type === 'text') {
+    if (isLeaferTextPaintRequested) {
+      // Phase 5 golden fixture spike: DOM 等价 props——.dom-text-node 的
+      // padding 6px 10px / line-height 1.28 / pre-wrap + overflow-wrap:anywhere
+      // (textWrap:'break' 是 Leafer 里最接近 anywhere 的断行) / textGeometry
+      // 同源字体栈与产品缺省(24px/#232323/500/left)。
+      return {
+        x: node.x + 10,
+        y: node.y + 6,
+        width: Math.max(1, node.width - 20),
+        height: Math.max(1, node.height - 12),
+        text: node.text || '',
+        fill: node.textColor || defaultTextColor,
+        fontFamily:
+          'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+        fontSize: node.fontSize || defaultTextFontSize,
+        fontWeight: node.fontWeight || defaultTextWeight,
+        textAlign: node.textAlign || defaultTextAlign,
+        lineHeight: { type: 'percent', value: 1.28 },
+        textWrap: 'break',
+        verticalAlign: 'top',
+      }
+    }
     return {
       ...base,
       text: node.text || '',
@@ -167,6 +206,10 @@ const paintSignatureFor = (node: MivoCanvasNode, viewport: ViewportState): strin
     textAlign: node.textAlign,
     fontWeight: node.fontWeight,
     markupKind: node.markupKind,
+    // 4c brush/stamp paint inputs: brush kind switches the outline width/
+    // pressure simulation; stamp kind switches the sticker url.
+    markupBrushKind: node.markupBrushKind,
+    markupStampKind: node.markupStampKind,
     markupFillColor: node.markupFillColor,
     markupStrokeColor: node.markupStrokeColor,
     markupStrokeWidth: node.markupStrokeWidth,
@@ -241,6 +284,9 @@ export const useLeaferSpikeRenderer = ({
   // formalized into leaferLinePaint — consumes normalized markupPoints from the
   // store only (connector geometry stays model-driven, D1).
   const linePaintRef = useRef<ReturnType<typeof createLeaferLinePaint> | null>(null)
+  // Phase 4c: markup brush/stamp paint is formalized into leaferBrushStampPaint
+  // (perfect-freehand outline via brushGeometry + stamp sticker image fill).
+  const brushStampPaintRef = useRef<ReturnType<typeof createLeaferBrushStampPaint> | null>(null)
   const lodSummaryRef = useRef<string | undefined>(undefined)
   const panCacheEnabled = useMemo(() => parsePanCacheEnabled(), [])
   const frozenViewportRef = useRef<ViewportState | null>(null)
@@ -267,7 +313,10 @@ export const useLeaferSpikeRenderer = ({
     () =>
       paintedNodes.filter(
         (node) =>
-          node.type !== 'image' && !isLeaferShapePaintedNode(node) && !isLeaferLinePaintedNode(node),
+          node.type !== 'image' &&
+          !isLeaferShapePaintedNode(node) &&
+          !isLeaferLinePaintedNode(node) &&
+          !isLeaferBrushStampPaintedNode(node),
       ),
     [paintedNodes],
   )
@@ -277,6 +326,10 @@ export const useLeaferSpikeRenderer = ({
   )
   const linePaintedNodes = useMemo(
     () => paintedNodes.filter(isLeaferLinePaintedNode),
+    [paintedNodes],
+  )
+  const brushStampPaintedNodes = useMemo(
+    () => paintedNodes.filter(isLeaferBrushStampPaintedNode),
     [paintedNodes],
   )
   const imagePaintedNodes = useMemo(
@@ -373,6 +426,8 @@ export const useLeaferSpikeRenderer = ({
       shapePaintRef.current = createLeaferShapePaint(leafer)
       // Bind the line paint module (4b) to the same Leafer instance.
       linePaintRef.current = createLeaferLinePaint(leafer)
+      // Bind the brush/stamp paint module (4c) to the same Leafer instance.
+      brushStampPaintRef.current = createLeaferBrushStampPaint(leafer)
 
       resizeObserver = new ResizeObserver(([entry]) => {
         if (!entry || !leaferRef.current) return
@@ -396,6 +451,8 @@ export const useLeaferSpikeRenderer = ({
       shapePaintRef.current = null
       linePaintRef.current?.dispose()
       linePaintRef.current = null
+      brushStampPaintRef.current?.dispose()
+      brushStampPaintRef.current = null
       leafer?.destroy()
       leaferRef.current = null
       setLeaferReady(false)
@@ -535,6 +592,8 @@ export const useLeaferSpikeRenderer = ({
       shapePaintRef.current?.sync([], emptyCtx)
       // 4b: clear all line/arrow objects too.
       linePaintRef.current?.sync([], emptyCtx)
+      // 4c: clear all brush/stamp objects too.
+      brushStampPaintRef.current?.sync([], emptyCtx)
       queueMicrotask(() => publishStats({ ...EMPTY_STATS, panCacheEnabled }))
       return
     }
@@ -607,6 +666,10 @@ export const useLeaferSpikeRenderer = ({
     // normalized markupPoints only; never reads geometry back from Leafer (D1).
     linePaintRef.current?.sync(linePaintedNodes, syncCtx)
 
+    // 4c: reconcile markup brush/stamp — brush consumes the same brushGeometry
+    // outline the DOM renders; stamp paints the sticker via an image fill.
+    brushStampPaintRef.current?.sync(brushStampPaintedNodes, syncCtx)
+
     // 3c: reconcile image nodes through the lease + clip + diffReconcilePlan
     // contract. Acquire/release is balanced per sync (created/updated/deleted
     // returned here for accounting; lease balance asserted in unit tests).
@@ -650,7 +713,7 @@ export const useLeaferSpikeRenderer = ({
     return () => {
       cancelled = true
     }
-  }, [hostRef, imagePaintedNodes, inlinePaintedNodes, leaferReady, linePaintedNodes, lodViewport, panCacheEnabled, paintedNodes, paintedNodeSignature, publishStats, rendererMode, shapePaintedNodes])
+  }, [brushStampPaintedNodes, hostRef, imagePaintedNodes, inlinePaintedNodes, leaferReady, linePaintedNodes, lodViewport, panCacheEnabled, paintedNodes, paintedNodeSignature, publishStats, rendererMode, shapePaintedNodes])
 
   useEffect(() => {
     window.__MIVO_LEAFER_SPIKE__ = {
