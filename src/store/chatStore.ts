@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import type { EnhanceResponse, GenerationRatio, MivoImageQuality } from '../types/generation'
+import type { EnhanceDegradedReason, EnhanceResponse, GenerationRatio, MivoImageQuality } from '../types/generation'
 import { readImportedAssetFile, saveImportedAsset } from '../lib/assetStorage'
 import { MivoImageRequestError, enhanceMivoPrompt, type MivoImageRequestErrorKind } from '../lib/mivoImageClient'
 import { getModelCapabilities } from '../lib/modelCapabilities'
@@ -23,7 +23,9 @@ export type ChatEnhanceResult = {
   richPrompt?: string
   imgRatio?: GenerationRatio
   quality?: MivoImageQuality
-  degradedReason?: string
+  /** FIX-3: 收窄为 union，不放宽回 string。persisted legacy 字符串在
+   *  chatStoreMigrate.sanitizeEnhanceDegradedReason 处 runtime normalize。 */
+  degradedReason?: EnhanceDegradedReason
   /** W4: 哪一档 LLM 降级（primary/fallback），透传自 EnhanceResponse.stage。 */
   stage?: 'primary' | 'fallback'
 }
@@ -44,6 +46,9 @@ export type ChatGenerationContext = {
   quality?: MivoImageQuality
   finalPrompt?: string
   pendingSlotId?: string
+  /** FIX-4: chat 模式澄清附言（replyText）持久化到 context，retry 不重跑 enhance
+   *  时也能从 context 读回并在生成成功后 appendNotice，与 send 路径语义一致。 */
+  noticeText?: string
 }
 
 export type ChatMessage = {
@@ -305,6 +310,8 @@ export const useChatStore = create<ChatState>()(
             imgRatio: finalRatio,
             quality: finalQuality,
             finalPrompt,
+            // FIX-4: 持久化 chat 附言到 context，retry 不重跑 enhance 时可读回。
+            noticeText,
           }
 
           set((s) => ({
@@ -501,7 +508,7 @@ export const useChatStore = create<ChatState>()(
         let finalPrompt = context.finalPrompt || targetMsg.enhance?.richPrompt || targetMsg.text || userMsg.text
         let finalQuality = qualityOverride || context.quality || 'medium'
         let finalRatio = context.imgRatio || getModelCapabilities(context.model).defaultRatio
-        let retryNoticeText: string | undefined
+        let retryNoticeText = context.noticeText
         context = {
           ...context,
           finalPrompt,
@@ -562,6 +569,8 @@ export const useChatStore = create<ChatState>()(
               imgRatio: finalRatio,
               quality: finalQuality,
               finalPrompt,
+              // FIX-4: retry 重跑 enhance 时刷新 noticeText 到 context，保持与 send 一致。
+              noticeText: retryNoticeText,
             }
           }
 

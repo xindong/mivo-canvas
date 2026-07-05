@@ -78,7 +78,14 @@ export const isPrivateHostLiteral = (host: string): boolean => {
     const lower = h.toLowerCase()
     if (lower === '::1' || lower === '0:0:0:0:0:0:0:1') return true // loopback
     if (lower.startsWith('fc') || lower.startsWith('fd')) return true // ULA fc00::/7
-    if (lower.startsWith('fe80')) return true // link-local fe80::/10
+    // FIX-2: fe80::/10 link-local covers fe80::–febf:: (first hextet & 0xffc0 === 0xfe80).
+    // The old `startsWith('fe80')` only caught fe80* and let fe90::1/febf::1 slip through.
+    // ::-compression safe: take the first hextet before any '::' or ':'.
+    {
+      const firstHextet = lower.split('::')[0].split(':')[0]
+      const first = parseInt(firstHextet, 16)
+      if (Number.isFinite(first) && (first & 0xffc0) === 0xfe80) return true
+    }
     if (lower.startsWith('::ffff:')) return true // IPv4-mapped (re-check, mapped branch above usually catches)
     if (lower === '::') return true // unspecified
     return false

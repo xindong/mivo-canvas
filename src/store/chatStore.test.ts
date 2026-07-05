@@ -36,8 +36,19 @@ vi.mock('./remoteDebugReporter', () => ({
   reportRemoteDebugEntry: () => {},
 }))
 
+// FIX-4 test: mock generationFacade so retryMessage can be driven without the
+// canvas store. Spies are controllable per-test (resolve/reject generateIntoAiSlot).
+const genFacadeSpies = vi.hoisted(() => ({
+  prepareChatSlot: vi.fn(),
+  generateIntoAiSlot: vi.fn(),
+  generateBesideNode: vi.fn(),
+  getSceneChangeInfo: vi.fn(),
+}))
+vi.mock('./generationFacade', () => ({ generationFacade: genFacadeSpies }))
+
 import { useChatStore } from './chatStore'
 import { saveImportedAsset } from '../lib/assetStorage'
+import { enhanceMivoPrompt } from '../lib/mivoImageClient'
 
 beforeEach(() => {
   useChatStore.setState({ ...useChatStore.getInitialState() } as never, true)
@@ -121,5 +132,62 @@ describe('sendMessage (S03b: 参考图保存失败不丢消息)', () => {
     const messages = useChatStore.getState().messagesByScene['scene-2'] || []
     // 正常流会落 user + assistant（enhancing→...），但不应是"参考图保存失败"的 error
     expect(messages.some((m) => m.error?.includes('参考图保存失败'))).toBe(false)
+  })
+})
+
+// FIX-4: retry 的 chat 语义与 send 一致 —— 失败后 retry 成功也要补澄清附言。
+// 之前 retryNoticeText 是局部变量，仅在 retry 重跑 enhance（!baseContext.finalPrompt）
+// 时赋值；send 已设 finalPrompt → retry 跳过 enhance → retryNoticeText 永远 undefined
+// → retry 成功不补附言。修法：noticeText 持久化到 generationContext，retry 从 context 读回。
+describe('retryMessage (FIX-4: retry 补 chat 澄清附言)', () => {
+  beforeEach(() => {
+    genFacadeSpies.prepareChatSlot.mockReset()
+    genFacadeSpies.generateIntoAiSlot.mockReset()
+    genFacadeSpies.generateBesideNode.mockReset()
+    genFacadeSpies.getSceneChangeInfo.mockReset()
+    vi.mocked(enhanceMivoPrompt).mockReset()
+  })
+
+  it('retry 不重跑 enhance 时从 context.noticeText 补澄清附言', async () => {
+    // retry 成功的 generation
+    genFacadeSpies.prepareChatSlot.mockReturnValue({ slotId: 'slot-1', mode: 'into-slot' })
+    genFacadeSpies.getSceneChangeInfo.mockReturnValue({ sceneChanged: false, currentSceneId: 'scene-1' })
+    genFacadeSpies.generateIntoAiSlot.mockResolvedValueOnce(['node-1'])
+
+    // Seed: 一条 chat 模式 send 失败后的 assistant error 消息，generationContext
+    // 已持久化 noticeText（send 路径在 generation 前写 context.noticeText）。
+    // 用 merge（不带 true）避免冲掉 store 上的 retryMessage 等方法。
+    useChatStore.setState({
+      messagesByScene: {
+        'scene-1': [
+          { id: 'u1', role: 'user', kind: 'text', text: '能画角色么', createdAt: 0, status: 'done' },
+          {
+            id: 'a1', role: 'assistant', kind: 'text', text: '', createdAt: 0, status: 'error',
+            error: '上游超时', errorKind: 'timeout',
+            generationContext: {
+              model: 'gpt-image-2',
+              requestedImgRatio: 'auto', requestedQuality: 'auto',
+              imgRatio: '1:1', quality: 'medium',
+              finalPrompt: '能画角色么', // 存在 → retry 跳过 enhance 块
+              noticeText: '可以画角色、场景、UI 哦', // FIX-4: 持久化的 chat 附言
+            },
+          },
+        ],
+      },
+    } as never)
+
+    const beforeNotices = useChatStore.getState().messagesByScene['scene-1'].filter((m) => m.kind === 'notice').length
+
+    await useChatStore.getState().retryMessage({ sceneId: 'scene-1', messageId: 'a1' })
+
+    const after = useChatStore.getState().messagesByScene['scene-1']
+    // retry 成功 → assistant 转 done
+    expect(after.find((m) => m.id === 'a1')?.status).toBe('done')
+    // FIX-4: notice 从 context.noticeText 补回（retry 未重跑 enhance）
+    const notices = after.filter((m) => m.kind === 'notice')
+    expect(notices.length).toBe(beforeNotices + 1)
+    expect(notices.at(-1)?.text).toContain('可以画角色')
+    // 证明 retry 跳过了 enhance（finalPrompt 已存在），noticeText 来自 context 而非重跑
+    expect(vi.mocked(enhanceMivoPrompt)).not.toHaveBeenCalled()
   })
 })

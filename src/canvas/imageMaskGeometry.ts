@@ -22,7 +22,7 @@ export type ImageMaskSubmitPayload = {
   mask?: Blob
   maskBounds?: ImageMaskBounds
   sourceSize: { width: number; height: number }
-  /** W2 (QoL batch): low/medium quality selector on the overlay; default low. */
+  /** W2 (QoL batch): low/medium quality selector on the overlay; default medium (FIX-5). */
   quality?: MivoImageQuality
 }
 

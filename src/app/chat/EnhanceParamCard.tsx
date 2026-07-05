@@ -2,11 +2,15 @@ import { ChevronDown, ChevronUp } from 'lucide-react'
 import { useState } from 'react'
 import { useChatStore } from '../../store/chatStore'
 import type { ChatMessage } from '../../store/chatStore'
+import type { EnhanceDegradedReason } from '../../types/generation'
 import { qualityDisplayLabel } from './chatDisplayLabels'
 
 // W4: 把细分 degradedReason 映射为中文可读文案。所有分支都补"已用原始描述出图"
 // —— enhance 永远先出图，降级只影响是否走了 agent 润色，不影响生图本身。
-const degradedReasonLabel = (reason: string): string => {
+// FIX-3: 参数收窄为 EnhanceDegradedReason union（不放宽回 string）；default 兜底
+// persisted legacy 字符串（理论上 chatStoreMigrate 已 normalize 到 undefined，
+// 但运行时守卫保守保留，避免渲染抛错）。
+const degradedReasonLabel = (reason: EnhanceDegradedReason): string => {
   switch (reason) {
     case 'upstream-http': return '上游服务异常，已用原始描述出图'
     case 'upstream-network': return '增强服务网络失败，已用原始描述出图'

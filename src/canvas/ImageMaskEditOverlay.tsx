@@ -164,10 +164,11 @@ export function ImageMaskEditOverlay({
   const stageRef = useRef<HTMLDivElement | null>(null)
   const [tool, setTool] = useState<ImageMaskTool>('point')
   const [prompt, setPrompt] = useState('')
-  // W2.1: quality low/medium toggle on the overlay; default low (重绘提速快赢包).
+  // W2.1: quality low/medium toggle on the overlay; default medium.
   // Mirrors RatioPopover's quality row pattern but inlined (overlay is a floating
-  // panel, not a popover). Low = 1K, faster; medium = 1K, more compute.
-  const [quality, setQuality] = useState<MivoImageQuality>('low')
+  // panel, not a popover). FIX-5: 冒烟实测 low≈medium 延迟（low 不提速），默认改回
+  // medium；low/medium 选择器供成本权衡（low 省 upstream 算力/成本），不再以提速为由。
+  const [quality, setQuality] = useState<MivoImageQuality>('medium')
   const [regions, setRegions] = useState<ImageMaskRegion[]>([])
   const [pointAnchors, setPointAnchors] = useState<PointAnchor[]>([])
   const [past, setPast] = useState<MaskEditSnapshot[]>([])

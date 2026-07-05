@@ -217,7 +217,8 @@ const patchMaskEditProgress = (
  *  W2: switched from sync editMivoImage to the async tasks API (submitEditTask →
  *  poll → cancelTask) so overlay X/Esc can best-effort DELETE the upstream task,
  *  and so the placeholder can show real progress/stage/elapsed. Quality defaults
- *  to 'low' (W2.1) — the overlay's quality button group overrides it. */
+ *  to 'medium' — the overlay's quality button group (low/medium) overrides it;
+ *  FIX-5: low 不提速（冒烟实测 low≈medium 延迟），默认改回 medium，low/medium 选择器供成本权衡。 */
 export const runMaskEditGeneration = async (args: {
   sceneId: string
   source: MivoCanvasNode
@@ -229,9 +230,18 @@ export const runMaskEditGeneration = async (args: {
   signal: AbortSignal
 }): Promise<string[]> => {
   const { sceneId, source, slotId, resolvedAssetUrl, payload, imgRatio, signal } = args
-  const quality: MivoImageQuality = args.quality || payload.quality || 'low'
+  const quality: MivoImageQuality = args.quality || payload.quality || 'medium'
   const startedAt = Date.now()
   const image = await readCanvasImageBlob(source, resolvedAssetUrl)
+
+  // FIX-1: currentTaskId tracks the IN-FLIGHT server task for cancel. Set inside
+  // runOneAttempt right after submitEditTask returns (BEFORE the poll loop), so an
+  // abort during poll still knows which task to DELETE. serverTaskId (assigned only
+  // after a successful attempt) stays undefined mid-attempt → cancelTask silently
+  // no-op'd, orphaning the in-flight task; self-heal retry abort could even DELETE
+  // the previous attempt's stale id. Each attempt overwrites currentTaskId with its
+  // own fresh id so retry-abort DELETEs the right (new) task.
+  let currentTaskId: string | undefined
 
   // W1: submit+poll 抽成单次尝试，便于黑盘自愈时用新 idempotencyKey 重跑一次。
   // newIdempotencyKey 必须每次重试都重新生成 —— BFF registry 按 key dedupe，复用
@@ -250,6 +260,8 @@ export const runMaskEditGeneration = async (args: {
       idempotencyKey,
       signal,
     })
+    // FIX-1: 立即写外层 currentTaskId — poll 中途 abort 时 catch 的 cancelTask 才能 DELETE 这个在途 task。
+    currentTaskId = taskId
     debugLogger.log(
       'Mask Edit',
       `Task ${taskId} submitted for ${source.title} (quality=${quality}) in ${Date.now() - submitStartedAt}ms`,
@@ -354,14 +366,17 @@ export const runMaskEditGeneration = async (args: {
   } catch (error) {
     // W2.2: overlay X/Esc → best-effort DELETE the upstream task before rethrowing
     // so the caller's removeMaskEditPlaceholder rolls back with #81 baselineSnapshot.
+    // FIX-1: cancel the IN-FLIGHT task (currentTaskId, set mid-attempt), not
+    // serverTaskId (only set after a successful attempt). Without this, an abort
+    // during poll left serverTaskId undefined → cancelTask no-op'd → orphaned task.
     const canceled = Boolean(signal.aborted) || (error instanceof MivoImageRequestError && error.kind === 'canceled')
-    if (canceled && serverTaskId) {
-      await cancelTask(serverTaskId)
+    if (canceled && currentTaskId) {
+      await cancelTask(currentTaskId)
     }
     if (error instanceof MivoImageRequestError) {
       debugLogger.error(
         'Mask Edit',
-        `Task ${serverTaskId || '?'} failed for ${source.title} after ${Date.now() - startedAt}ms: ${error.message}`,
+        `Task ${currentTaskId || serverTaskId || '?'} failed for ${source.title} after ${Date.now() - startedAt}ms: ${error.message}`,
       )
     }
     throw error

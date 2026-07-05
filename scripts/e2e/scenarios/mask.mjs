@@ -203,10 +203,14 @@ export const runMaskScenario = async (context) => {
   if (!blackPlateB64) throw new Error('Unable to synthesize black-plate b64 for W1 e2e')
 
   const blackPlateEditTaskIds = []
+  // 顺手（审查者建议）：捕获每次 POST /tasks/edit 的 Idempotency-Key header，
+  // 断言 self-heal 重试用了新 key（F3：BFF registry 按 key dedupe，复用会静默返回缓存黑盘 task）。
+  const blackPlateIdempotencyKeys = []
   await page.unroute('**/api/mivo/tasks/edit')
   await page.route('**/api/mivo/tasks/edit', async (route) => {
     const taskId = `task-black-${blackPlateEditTaskIds.length + 1}`
     blackPlateEditTaskIds.push(taskId)
+    blackPlateIdempotencyKeys.push(route.request().headers()['idempotency-key'] || '')
     await route.fulfill({
       status: 202,
       contentType: 'application/json',
@@ -256,6 +260,17 @@ export const runMaskScenario = async (context) => {
   }
   if (blackPlateEditTaskIds[0] === blackPlateEditTaskIds[1]) {
     throw new Error(`SC-W1 retry should produce a different taskId, got ${JSON.stringify(blackPlateEditTaskIds)}`)
+  }
+  // 顺手：self-heal 重试必须用新的 Idempotency-Key（F3：BFF registry 按 key dedupe，
+  // 复用原失败调用的 key 会静默返回缓存的黑盘 task，重试假装跑了实际没跑）。
+  if (blackPlateIdempotencyKeys.length !== 2) {
+    throw new Error(`SC-W1 self-heal should send two Idempotency-Key headers, got ${blackPlateIdempotencyKeys.length}: ${JSON.stringify(blackPlateIdempotencyKeys)}`)
+  }
+  if (!blackPlateIdempotencyKeys[0] || !blackPlateIdempotencyKeys[1]) {
+    throw new Error(`SC-W1 each /tasks/edit must carry an Idempotency-Key header, got ${JSON.stringify(blackPlateIdempotencyKeys)}`)
+  }
+  if (blackPlateIdempotencyKeys[0] === blackPlateIdempotencyKeys[1]) {
+    throw new Error(`SC-W1 self-heal retry must use a different Idempotency-Key (F3 dedupe), got duplicate ${JSON.stringify(blackPlateIdempotencyKeys)}`)
   }
 
   // SC-W2②: cancel/failed 三态 —— poll 返 failed/canceled → placeholder 回滚，

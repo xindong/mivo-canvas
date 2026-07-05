@@ -59,6 +59,17 @@ describe('isPrivateHostLiteral (W3 SSRF IP classification)', () => {
     expect(isPrivateHostLiteral('::')).toBe(true) // unspecified
   })
 
+  it('FIX-2: flags the full fe80::/10 link-local range (fe80–febf), not just fe80*', () => {
+    expect(isPrivateHostLiteral('fe90::1')).toBe(true) // previously slipped through
+    expect(isPrivateHostLiteral('fe8f::1')).toBe(true) // boundary: last in fe80* but via hextet mask
+    expect(isPrivateHostLiteral('fea0::1')).toBe(true)
+    expect(isPrivateHostLiteral('febf::1')).toBe(true) // boundary: last /10 hextet
+    expect(isPrivateHostLiteral('febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff')).toBe(true)
+    // fec0::/10 is deprecated site-local (NOT link-local) — must NOT be flagged by the /10 check.
+    expect(isPrivateHostLiteral('fec0::1')).toBe(false)
+    expect(isPrivateHostLiteral('ff00::1')).toBe(false) // multicast, not link-local
+  })
+
   it('does not flag hostnames (DNS resolved server-side) or public IPv6', () => {
     expect(isPrivateHostLiteral('example.com')).toBe(false)
     expect(isPrivateHostLiteral('2606:4700:4700::1111')).toBe(false) // Cloudflare public DNS
