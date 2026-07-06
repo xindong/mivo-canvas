@@ -98,14 +98,19 @@ export function ProjectRow(props: {
           ) : (
             <span className="project-row-name">{project.name}</span>
           )}
+          {/* row-hover-arrow must be the 3rd DOM child (right after the name) — the
+              archive-assets e2e asserts children[2] carries this class and is hidden
+              (opacity 0) by default, same contract as canvas rows. The count badge
+              follows as children[3]; both are hidden during rename. */}
+          {!renaming &&
+            (collapsed ? (
+              <ChevronRight size={14} className="row-hover-arrow" />
+            ) : (
+              <ChevronDown size={14} className="row-hover-arrow" />
+            ))}
           {!renaming && (
-            <span className="project-row-tail">
-              <span className="project-row-count">{canvasCount}</span>
-              {collapsed ? (
-                <ChevronRight size={14} className="row-hover-arrow" />
-              ) : (
-                <ChevronDown size={14} className="row-hover-arrow" />
-              )}
+            <span className="project-row-count" aria-hidden="true">
+              {canvasCount}
             </span>
           )}
         </button>
@@ -113,7 +118,7 @@ export function ProjectRow(props: {
           <button
             type="button"
             className="project-row-create"
-            aria-label={`在此项目新建画板:${project.name}`}
+            aria-label="在此项目新建画板"
             title={`在此项目新建画板:${project.name}`}
             onClick={(event) => {
               event.stopPropagation()
