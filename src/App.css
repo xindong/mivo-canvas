@@ -1150,7 +1150,7 @@ button:disabled {
 
 .canvas-row {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 7px;
   width: 100%;
@@ -8097,7 +8097,9 @@ button:disabled {
 }
 
 /* --- Sidebar row wiring (Phase 4 / B9·B14) -------------------------------- */
-/* canvas-row: icon | title | time (3-col grid; time hidden while renaming).   */
+/* canvas-row: icon | title | arrow | time (4-col grid; arrow hidden until hover,
+   time hidden while renaming). children[2] must be the row-hover-arrow per the
+   archive-assets e2e row-structure contract. */
 /* project-row-wrap: flex [project-row button][hover +].                       */
 
 .canvas-row-icon {

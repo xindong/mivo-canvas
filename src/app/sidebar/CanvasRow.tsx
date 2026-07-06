@@ -5,7 +5,7 @@
 // relative time label (title = absolute). Self-contained: subscribes to the store
 // for its data + actions, manages its own menu/confirm/rename state.
 import { useState } from 'react'
-import { Copy, Folder, FolderInput, MonitorUp, Move, Pencil, Trash2 } from 'lucide-react'
+import { ChevronRight, Copy, Folder, FolderInput, MonitorUp, Move, Pencil, Trash2 } from 'lucide-react'
 import { useCanvasStore } from '../../store/canvasStore'
 import { toastFeedback } from '../../store/toastStore'
 import { formatSidebarTime, formatSidebarTimeTitle } from '../../lib/formatSidebarTime'
@@ -150,6 +150,10 @@ export function CanvasRow(props: {
         ) : (
           <span className="canvas-row-title">{title}</span>
         )}
+        {/* row-hover-arrow must be the 3rd DOM child (right after the name) — the
+            archive-assets e2e asserts children[2] carries this class and is hidden
+            (opacity 0) by default. The time label follows it as children[3]. */}
+        {!renaming && <ChevronRight size={14} className="row-hover-arrow" />}
         {!renaming && (
           <time className="canvas-row-time" dateTime={updatedAt} title={formatSidebarTimeTitle(updatedAt)}>
             {formatSidebarTime(updatedAt)}
