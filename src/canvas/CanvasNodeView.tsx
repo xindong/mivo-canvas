@@ -479,6 +479,7 @@ export const CanvasNodeView = memo(function CanvasNodeView({
     aiSlotNode && 'ai-slot-node',
     annotationNode && 'annotation-node',
     markupNode && 'markup-node',
+    markupNode && node.markupKind === 'stamp' && 'stamp-node',
     fileNode && 'file-node',
     markdownNode && 'markdown-node',
     pdfNode && 'pdf-node',

@@ -49,6 +49,7 @@ import { Layer } from './layers'
 import { isLeaferShapePaintedNode } from './leaferSpikeFilter'
 import { projectNode, type RenderNode } from './projection'
 import { paintSignatureFor } from './leaferPaintSignature'
+import { layerForNode, renderZRankForNode } from './zRank'
 import {
   diffReconcilePlan,
   type RendererReconcileCounts,
@@ -148,21 +149,33 @@ export const strokeColorWithBakedOpacity = (color: string, opacity: number): str
 
 /** Layer a shape node paints in (2b-2 z-order): frame → Layer.Frame (bottom),
  *  markup shapes → Layer.Content — same policy projection.projectNode writes
- *  into RenderNode.layer. Exported for the hook's z-order map + tests. */
-export const shapeLayerFor = (node: MivoCanvasNode): Layer =>
-  node.type === 'frame' ? Layer.Frame : Layer.Content
+ *  into RenderNode.layer. Delegates to the shared zRank helper so the DOM zIndex,
+ *  Leafer child order and hit-test all read one source. Exported for the hook's
+ *  z-order map + tests. */
+export const shapeLayerFor = (node: MivoCanvasNode): Layer => layerForNode(node)
 
-/** Stable z-order for the Leafer children (2b-2): layer band × document order.
- *  Mirrors hitTest defaultZOrderCompare (layer → renderOrder(0) → doc order) so
- *  the Leafer canvas stacks like the DOM zIndex does. The hook builds this once
- *  per sync over the FULL painted list (shapes + images) and hands it to every
- *  paint module via ctx.layerOf, so cross-module insertion order stops mattering. */
+/** Stable z-order for the Leafer children (2b-2): layer band × renderOrder ×
+ *  document order. Mirrors hitTest defaultZOrderCompare (layer → renderOrder →
+ *  selected → surface → stable doc order) so the Leafer canvas stacks like the
+ *  DOM zIndex does. The hook builds this once per sync over the FULL painted list
+ *  (shapes + images) and hands it to every paint module via ctx.layerOf, so
+ *  cross-module insertion order stops mattering.
+ *
+ *  V2 stamp: renderOrder (1 for stamp, 0 otherwise — see zRank.renderZRankForNode)
+ *  is encoded as a sub-band so a stamp outranks every other Content node (incl. a
+ *  selected image) in Leafer, matching the hit-test comparator's renderOrder-before-
+ *  selected precedence. */
 export const LEAFER_Z_LAYER_STEP = 1_000_000
+/** Within-layer sub-band for renderOrder. Must exceed the max per-layer node count
+ *  so renderOrder=1 (stamp) outranks every renderOrder=0 node regardless of doc
+ *  index. 100k = 5× the 20k bench ceiling. */
+export const LEAFER_Z_RENDERORDER_STEP = 100_000
 export const leaferZOrderMapFor = (nodes: MivoCanvasNode[]): Map<string, number> => {
   const map = new Map<string, number>()
   nodes.forEach((node, index) => {
-    const layer = node.type === 'frame' ? Layer.Frame : Layer.Content
-    map.set(node.id, layer * LEAFER_Z_LAYER_STEP + index)
+    const layer = layerForNode(node)
+    const renderOrder = renderZRankForNode(node)
+    map.set(node.id, layer * LEAFER_Z_LAYER_STEP + renderOrder * LEAFER_Z_RENDERORDER_STEP + index)
   })
   return map
 }

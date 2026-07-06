@@ -237,9 +237,12 @@ describe('brushStampPaintPlanFor — DOM 视觉等价（消费 projection 下沉
     expect(plan.props.rotation).toBe(0)
   })
 
-  it('zIndex 透传（2b-2 z-order）', () => {
+  it('zIndex 透传（2b-2 z-order）— brush 直传 props；stamp 走 groupProps（Group 是 z-order 容器）', () => {
     expect(brushStampPaintPlanFor(projectNode(brushNode()), 42).props.zIndex).toBe(42)
-    expect(brushStampPaintPlanFor(projectNode(stampNode()), 7).props.zIndex).toBe(7)
+    const stampPlan = brushStampPaintPlanFor(projectNode(stampNode()), 7)
+    // V2: stamp 顶层是 Group，zIndex 在 groupProps；sticker 无 zIndex（子对象）
+    expect(stampPlan.groupProps?.zIndex).toBe(7)
+    expect(stampPlan.props.zIndex).toBeUndefined()
   })
 })
 
@@ -267,13 +270,44 @@ describe('createLeaferBrushStampPaint — diffReconcilePlan 收支 (no leak, no 
     expect(paint.paintedCount()).toBe(0)
   })
 
-  it('update 路径：同 kind 复用对象（stamp 换贴纸只 set 新 fill url）', () => {
+  it('V2 stamp 顶层 Group 结构：1 顶层 Group + 1 sticker 子对象；getStampObject 返回 handle', () => {
+    paint.sync([stampNode({ id: 's' })], ctx(() => 25))
+    expect(leafer.children.length).toBe(1) // 1 顶层 Group
+    const group = childAt(leafer, 0) as unknown as { children: FakeUI[]; props: Record<string, unknown> }
+    expect(group.children.length).toBe(1) // sticker 是唯一子对象（fx 的 rays 此时不存在）
+    const sticker = group.children[0]
+    expect((sticker.props.fill as { type: string }).type).toBe('image')
+    expect((sticker.props.fill as { url: string }).url).toBe('/stickers/heart.svg')
+    expect(sticker.props.origin).toBe('center')
+    // zIndex 在 Group 上，不在 sticker 上
+    expect(group.props.zIndex).toBe(25)
+    expect(sticker.props.zIndex).toBeUndefined()
+    // getStampObject 返回同一 sticker + Group
+    const handle = paint.getStampObject('s')
+    expect(handle?.nodeId).toBe('s')
+    expect(handle?.sticker).toBe(sticker)
+    expect(handle?.group).toBe(group)
+  })
+
+  it('getStampObject：brush 节点 / 不存在 id / dispose 后均返回 undefined', () => {
+    paint.sync([brushNode({ id: 'b' }), stampNode({ id: 's' })], ctx())
+    expect(paint.getStampObject('b')).toBeUndefined() // brush 不是 stamp
+    expect(paint.getStampObject('missing')).toBeUndefined()
+    paint.dispose()
+    expect(paint.getStampObject('s')).toBeUndefined() // dispose 后 entry 清空
+  })
+
+  it('update 路径：同 kind 复用对象（stamp 换贴纸只 set 新 fill url 到 sticker）', () => {
     paint.sync([stampNode({ id: 'a', markupStampKind: 'heart' })], ctx())
-    const object = childAt(leafer, 0)
+    const object = childAt(leafer, 0) // Group
+    const handleBefore = paint.getStampObject('a')
     paint.sync([stampNode({ id: 'a', markupStampKind: 'star' })], ctx())
-    expect(leafer.children.length).toBe(1)
-    expect(childAt(leafer, 0)).toBe(object)
-    expect((object.props.fill as { url: string }).url).toBe('/stickers/star.svg')
+    expect(leafer.children.length).toBe(1) // 1 顶层 Group / node
+    expect(childAt(leafer, 0)).toBe(object) // Group 复用
+    // V2: fill 在 sticker（Group 子对象）上，不在 Group 上；getStampObject 返回同一 sticker
+    const handle = paint.getStampObject('a')
+    expect(handle?.sticker).toBe(handleBefore?.sticker)
+    expect(((handle?.sticker as unknown as FakeUI).props.fill as { url: string }).url).toBe('/stickers/star.svg')
     expect(object.removed).toBe(false)
   })
 
@@ -289,21 +323,33 @@ describe('createLeaferBrushStampPaint — diffReconcilePlan 收支 (no leak, no 
     expect(paint.paintedCount()).toBe(1)
   })
 
-  it('kind swap：同 id brush → stamp 销毁重建', () => {
+  it('kind swap：同 id brush → stamp 销毁重建（Group 顶层，image fill 在 sticker）', () => {
     paint.sync([brushNode({ id: 'a' })], ctx())
     const brush = childAt(leafer, 0)
     const counts = paint.sync([stampNode({ id: 'a' })], ctx())
     expect(counts).toEqual({ created: 0, updated: 1, deleted: 0 })
     expect(brush.removed).toBe(true)
-    expect((childAt(leafer, 1).props.fill as { type: string }).type).toBe('image')
+    // V2: stamp 顶层是 Group；image fill 在其 sticker 子对象上
+    const stampGroup = childAt(leafer, 1) as unknown as { children: FakeUI[] }
+    expect(stampGroup.children.length).toBe(1)
+    expect((stampGroup.children[0].props.fill as { type: string }).type).toBe('image')
+    expect(paint.getStampObject('a')?.sticker).toBe(stampGroup.children[0])
   })
 
-  it('ctx.layerOf 提供 zIndex 且 update 跟随变化', () => {
+  it('ctx.layerOf 提供 zIndex 且 update 跟随变化（brush props / stamp groupProps）', () => {
     paint.sync([brushNode({ id: 'a' })], ctx(() => 7))
     const object = childAt(leafer, 0)
     expect(object.props.zIndex).toBe(7)
     paint.sync([brushNode({ id: 'a' })], ctx(() => 9))
     expect(object.props.zIndex).toBe(9)
+
+    // V2 stamp: zIndex 落在 Group（顶层），sticker 不带 zIndex
+    paint.sync([stampNode({ id: 's' })], ctx(() => 25))
+    const group = childAt(leafer, 1)
+    expect(group.props.zIndex).toBe(25)
+    expect((paint.getStampObject('s')?.sticker as unknown as FakeUI).props.zIndex).toBeUndefined()
+    paint.sync([stampNode({ id: 's' })], ctx(() => 30))
+    expect(group.props.zIndex).toBe(30)
   })
 
   it('dispose() 移除全部对象', () => {

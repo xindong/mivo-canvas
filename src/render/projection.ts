@@ -39,6 +39,7 @@ import type {
 import type { ImageDimensions } from '../lib/imageSizing'
 import { normalizeCanvasNodeV2 } from '../model/documentModelV2'
 import { Layer } from './layers'
+import { layerForNode, renderZRankForNode } from './zRank'
 import type { ViewportMatrix } from './viewportMatrix'
 
 // --- Render types (renderer consumes; never MivoCanvasNode directly) ---------
@@ -331,13 +332,15 @@ export const projectNode = (node: MivoCanvasNode, ctx?: ProjectionContext): Rend
     locked: Boolean(n.locked),
     favorited: Boolean(n.favorited),
     selected,
-    // P3-0b z-order defaults. Frame → Layer.Frame (bottom); everything else →
-    // Layer.Content. renderOrder 0 = no within-layer preference. surface 'canvas'
-    // = inside the viewport transform (the DOM .dom-canvas-layer + Leafer children).
-    // Projection owns these defaults so documentModelV2 never carries render-layer
-    // policy; the renderer + hit-test read them from RenderNode directly.
-    layer: n.type === 'frame' ? Layer.Frame : Layer.Content,
-    renderOrder: 0,
+    // P3-0b z-order defaults. layer + renderOrder come from the shared zRank policy
+    // (single source for DOM zIndex / Leafer child order / hit-test — see zRank.ts).
+    // Frame → Layer.Frame (bottom); stamp → renderOrder 1 (above every other Content
+    // node incl. a selected image; defaultZOrderCompare checks renderOrder before
+    // `selected`); everything else → renderOrder 0. surface 'canvas' = inside the
+    // viewport transform. Projection owns these defaults so documentModelV2 never
+    // carries render-layer policy; the renderer + hit-test read them from RenderNode.
+    layer: layerForNode(n),
+    renderOrder: renderZRankForNode(n),
     surface: 'canvas',
     fills: n.fills ? n.fills.map(cloneFill) : [],
     strokes: n.strokes ? n.strokes.map(cloneStroke) : [],

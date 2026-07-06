@@ -35,6 +35,7 @@ import { createLeaferBrushStampPaint } from './leaferBrushStampPaint'
 import { createLeaferImagePaint } from './leaferImagePaint'
 import { createLeaferLinePaint } from './leaferLinePaint'
 import { createLeaferShapePaint, leaferZOrderMapFor } from './leaferShapePaint'
+import { createLeaferStampFx } from './leaferStampFx'
 
 /**
  * 0b spike — Phase 2b 正式化时按 phase2b-adapter-camera-zorder.md 重构
@@ -299,6 +300,11 @@ export const useLeaferSpikeRenderer = ({
   // Phase 4c: markup brush/stamp paint is formalized into leaferBrushStampPaint
   // (perfect-freehand outline via brushGeometry + stamp sticker image fill).
   const brushStampPaintRef = useRef<ReturnType<typeof createLeaferBrushStampPaint> | null>(null)
+  // V2 stamp fx: drives the drop pop + impact rays on the stamp Group/sticker.
+  // Subscribes to lastPlacedStampId; queries brushStampPaint.getStampObject. Created
+  // after brushStampPaint binds (so getStampObject is live) and disposed before it
+  // tears down (so the rAF never queries a disposed paint module).
+  const stampFxRef = useRef<ReturnType<typeof createLeaferStampFx> | null>(null)
   const lodSummaryRef = useRef<string | undefined>(undefined)
   const panCacheEnabled = useMemo(() => parsePanCacheEnabled(), [])
   const frozenViewportRef = useRef<ViewportState | null>(null)
@@ -474,6 +480,12 @@ export const useLeaferSpikeRenderer = ({
         linePaintRef.current = createLeaferLinePaint(leafer)
         // Bind the brush/stamp paint module (4c) to the same Leafer instance.
         brushStampPaintRef.current = createLeaferBrushStampPaint(leafer)
+        // V2 stamp fx: bind after brushStampPaint so getStampObject is live. Leafer
+        // mode only — in dom mode brushStampPaint stays empty so the fx is a no-op
+        // (getStampObject always undefined → retry + visible warn, harmless).
+        stampFxRef.current = createLeaferStampFx({
+          getStampObject: (nodeId) => brushStampPaintRef.current?.getStampObject(nodeId),
+        })
       } catch (error) {
         // R-01: new Leafer / leafer.start() / paint 模块绑定任一抛错 → 降级 dom。
         // 清掉 local leafer 引用，避免 cleanup 二次 destroy 已损坏实例。
@@ -504,6 +516,10 @@ export const useLeaferSpikeRenderer = ({
       shapePaintRef.current = null
       linePaintRef.current?.dispose()
       linePaintRef.current = null
+      // V2 stamp fx: dispose BEFORE brushStampPaint so the rAF never queries a
+      // disposed paint module (cancels in-flight animation + removes ray children).
+      stampFxRef.current?.dispose()
+      stampFxRef.current = null
       brushStampPaintRef.current?.dispose()
       brushStampPaintRef.current = null
       leafer?.destroy()

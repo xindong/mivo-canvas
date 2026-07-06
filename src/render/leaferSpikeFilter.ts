@@ -31,10 +31,11 @@ import { isLeaferTextPaintRequested } from './textPaintMode'
  * 文字壳同口径隐藏。改名交互（双击 → window.prompt）走画布 hit-test，本就
  * 不依赖 DOM 节点，两模式一致。
  *
- * 4c 已知取舍：stamp 的 just-placed 落地动画（stamp-pop 弹跳 + impact 放射线，
- * App.css DOM-only 转瞬效果）在 leafer 模式暂不复现 —— 与 note 文本层同级的
- * 接受损失；绘制中的 brush 预览是 MivoCanvas 的 overlay SVG（非节点），两种
- * 模式都保持 DOM，落笔成节点后才由 Leafer 接手。
+ * 4c 已知取舍（V2 已消除）：stamp 的 just-placed 落地动画（stamp-pop 弹跳 +
+ *  impact 放射线）现由 leaferStampFx 在 leafer 模式原生复现（pop 作用于 sticker
+ *  Rect，impact lines 是 Group 内兄弟，420ms 后销毁）；绘制中的 brush 预览是
+ *  MivoCanvas 的 overlay SVG（非节点），两种模式都保持 DOM，落笔成节点后才由
+ *  Leafer 接手。
  */
 
 /** Phase 4a shape 集：frame(section) + markup rect/ellipse/note。

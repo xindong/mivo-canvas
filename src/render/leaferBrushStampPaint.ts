@@ -34,15 +34,19 @@
 //     rotate(outline(points)). Stamp is a box-defined Rect → Leafer `rotation`
 //     + `origin:'center'` (same as 4a shapes / 3c images).
 //
-// Known 4c tradeoff (documented in leaferSpikeFilter.ts): the stamp
-// just-placed pop animation + impact rays are DOM-only transient effects and
-// do not replay in leafer mode; the in-progress brush preview is a MivoCanvas
-// overlay (not a node) and stays DOM in both modes.
+// V2 stamp: the just-placed pop + impact rays now replay in leafer mode. The
+// stamp top-level object is a stable Group (z-order host) with the sticker Rect
+// (image fill, original visual props) as a child — leaferStampFx scales the
+// STICKER for the pop and adds 8 impact-line Rects as Group children for the rays
+// (siblings of the sticker so the pop scale does not deform them). The Group
+// keeps the one-top-level-object-per-node invariant (children === expectedChildren
+// is the e2e/visual-diff paint-evidence gate: stamp = 1 top-level Group, the
+// sticker + transient rays are its children). The in-progress brush preview is a
+// MivoCanvas overlay (not a node) and stays DOM in both modes.
 //
 // Contract: create/update/delete 收支 goes through diffReconcilePlan; z-order
-// via ctx.layerOf (2b-2, layer band × document order, shared across modules).
-// One TOP-LEVEL Leafer object per node (children === expectedChildren is the
-// e2e/visual-diff paint-evidence gate).
+// via ctx.layerOf (2b-2, layer band × renderOrder × document order, shared across
+// modules — stamp renderOrder 1 lifts it above every other Content node).
 //
 // D1 (hard constraint): pure paint. `hittable:false` is on the Leafer root;
 // this module never subscribes to Leafer events and never touches the camera
@@ -54,7 +58,7 @@
 // vector strokes / tiny SVG stickers, no bitmap decode cost at scale — same
 // policy as 4a/4b); zoom settle behavior for image/text is untouched.
 
-import { Line, Path, Rect } from 'leafer-ui'
+import { Group, Line, Path, Rect } from 'leafer-ui'
 import type { Leafer } from 'leafer-ui'
 import type { MarkupPoint, MivoCanvasNode } from '../types/mivoCanvas'
 import { brushOutlinePathFor } from '../canvas/brushGeometry'
@@ -70,7 +74,13 @@ import {
   type RendererSyncContext,
 } from './rendererAdapter'
 
-type BrushStampObject = Path | Line | Rect
+// V2 stamp: the top-level object for a stamp is a stable Group (not a Rect). The
+// Group carries the z-order (zIndex from ctx.layerOf) and hosts the sticker Rect
+// (image fill, the original visual props) + the transient fx children (impact lines
+// from leaferStampFx). The pop animation scales the STICKER Rect, not the Group, so
+// the impact lines (Group siblings of the sticker) do not deform. Brush kinds stay
+// single top-level objects (Path / Line) — unchanged.
+type BrushStampObject = Path | Line | Group
 type BrushStampEntryKind = 'brush-path' | 'brush-polyline' | 'stamp'
 
 type BrushStampEntry = {
@@ -79,6 +89,17 @@ type BrushStampEntry = {
   kind: BrushStampEntryKind
   /** PR-R2 per-node 签名：未变 → 跳过 projectNode + set。 */
   signature: string
+  /** stamp-only: the sticker Rect (image fill) — the pop animation target. Hosts
+   *  the stamp's visual props; the Group is a pure z-order/fx container. */
+  sticker?: Rect
+}
+
+/** Handle for the fx controller (leaferStampFx): the sticker (pop target) + the
+ *  Group (fx children host). Only stamp entries produce a handle. */
+export type StampObjectHandle = {
+  nodeId: string
+  sticker: Rect
+  group: Group
 }
 
 export type LeaferBrushStampPaint = {
@@ -89,6 +110,9 @@ export type LeaferBrushStampPaint = {
   dispose(): void
   /** Painted entry count (for stats + reconcile assertions). */
   paintedCount(): number
+  /** V2 stamp fx: look up the stamp Group + sticker for `nodeId`. Returns
+   *  undefined when the node is not a painted stamp (incl. after dispose / undo). */
+  getStampObject(nodeId: string): StampObjectHandle | undefined
 }
 
 export const SOURCE = 'Leafer BrushStamp'
@@ -132,6 +156,10 @@ export const brushLocalPointsFor = (r: RenderNode): MarkupPoint[] => {
 export type BrushStampPaintPlan = {
   kind: BrushStampEntryKind
   props: Record<string, unknown>
+  /** stamp-only: Group-level props (zIndex from ctx.layerOf). The sticker visual
+   *  props stay in `props`; the Group is a pure z-order/fx container so zIndex
+   *  belongs on the Group, not the sticker. */
+  groupProps?: { zIndex?: number }
 }
 
 /**
@@ -139,13 +167,17 @@ export type BrushStampPaintPlan = {
  * brush/stamp node. Every visual key is ALWAYS present within a kind
  * (undefined = clear) so the merging `set()` update path never keeps a stale
  * value; dashed↔solid and brush↔stamp change the KIND and recreate instead.
+ *
+ * V2 stamp: `props` are the STICKER Rect's visual props (no zIndex — zIndex is
+ * on the Group via `groupProps`). The sticker is the pop-animation target; the
+ * Group hosts z-order + fx children.
  */
 export const brushStampPaintPlanFor = (
   r: RenderNode,
   zIndex: number | undefined,
 ): BrushStampPaintPlan => {
   const g = r.geometry
-  const zProps = zIndex !== undefined ? { zIndex } : {}
+  const groupProps = zIndex !== undefined ? { zIndex } : undefined
 
   if (r.markupKind === 'stamp') {
     return {
@@ -161,11 +193,12 @@ export const brushStampPaintPlanFor = (
         shadow: { ...STAMP_SHADOW },
         rotation: g.rotation || 0,
         origin: 'center',
-        ...zProps,
       },
+      groupProps,
     }
   }
 
+  const zProps = zIndex !== undefined ? { zIndex } : {}
   const stroke = firstVisibleStroke(r)
   const strokeWidth = stroke?.width ?? 0
   const strokeOpacity = stroke?.opacity ?? r.markupOpacity ?? 1
@@ -207,8 +240,21 @@ export const brushStampPaintPlanFor = (
   }
 }
 
-const createBrushStampObject = (plan: BrushStampPaintPlan): BrushStampObject =>
-  plan.kind === 'stamp' ? new Rect(plan.props) : plan.kind === 'brush-polyline' ? new Line(plan.props) : new Path(plan.props)
+/** Create the top-level Leafer object for a plan. For stamp this is a Group with
+ *  the sticker Rect added as a child; the sticker is returned so the entry (and the
+ *  fx controller via getStampObject) can drive the pop animation on it. */
+const createBrushStampObject = (
+  plan: BrushStampPaintPlan,
+): { object: BrushStampObject; sticker?: Rect } => {
+  if (plan.kind === 'stamp') {
+    const group = new Group(plan.groupProps ?? {})
+    const sticker = new Rect(plan.props)
+    group.add(sticker)
+    return { object: group, sticker }
+  }
+  const object = plan.kind === 'brush-polyline' ? new Line(plan.props) : new Path(plan.props)
+  return { object }
+}
 
 const setProps = (object: BrushStampObject, props: Record<string, unknown>) => {
   ;(object as { set: (props: unknown) => void }).set(props)
@@ -265,8 +311,14 @@ export const createLeaferBrushStampPaint = (leafer: Leafer): LeaferBrushStampPai
 
       if (plan.created.has(node.id) || !existing) {
         const paintPlan = brushStampPaintPlanFor(projectNode(node), ctx.layerOf?.(node.id))
-        const object = createBrushStampObject(paintPlan)
-        entries.set(node.id, { nodeId: node.id, object, kind: paintPlan.kind, signature: sig })
+        const { object, sticker } = createBrushStampObject(paintPlan)
+        entries.set(node.id, {
+          nodeId: node.id,
+          object,
+          kind: paintPlan.kind,
+          signature: sig,
+          ...(sticker ? { sticker } : {}),
+        })
         leafer.add(object)
         created += 1
         continue
@@ -288,9 +340,22 @@ export const createLeaferBrushStampPaint = (leafer: Leafer): LeaferBrushStampPai
         // dashed↔solid brush or brush↔stamp under the same id: the Leafer class
         // differs, so destroy + recreate — same kind-swap pattern as 3c/4a.
         destroyEntry(existing)
-        const object = createBrushStampObject(paintPlan)
-        entries.set(node.id, { nodeId: node.id, object, kind: paintPlan.kind, signature: sig })
+        const { object, sticker } = createBrushStampObject(paintPlan)
+        entries.set(node.id, {
+          nodeId: node.id,
+          object,
+          kind: paintPlan.kind,
+          signature: sig,
+          ...(sticker ? { sticker } : {}),
+        })
         leafer.add(object)
+      } else if (paintPlan.kind === 'stamp') {
+        // stamp: sticker visual props on the child Rect, zIndex on the Group.
+        // The fx controller holds the same sticker reference (getStampObject),
+        // so updating in place keeps a running pop animation on the right object.
+        if (existing.sticker) setProps(existing.sticker, paintPlan.props)
+        if (paintPlan.groupProps) setProps(existing.object, paintPlan.groupProps)
+        existing.signature = sig
       } else {
         setProps(existing.object, paintPlan.props)
         existing.signature = sig
@@ -308,5 +373,11 @@ export const createLeaferBrushStampPaint = (leafer: Leafer): LeaferBrushStampPai
 
   const paintedCount: LeaferBrushStampPaint['paintedCount'] = () => entries.size
 
-  return { sync, dispose, paintedCount }
+  const getStampObject: LeaferBrushStampPaint['getStampObject'] = (nodeId) => {
+    const entry = entries.get(nodeId)
+    if (!entry || entry.kind !== 'stamp' || !entry.sticker) return undefined
+    return { nodeId, sticker: entry.sticker, group: entry.object as Group }
+  }
+
+  return { sync, dispose, paintedCount, getStampObject }
 }
