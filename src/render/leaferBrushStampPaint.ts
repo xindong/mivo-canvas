@@ -62,6 +62,7 @@ import { stampSrcFor } from '../canvas/stampDefs'
 import { debugLogger } from '../store/debugLogStore'
 import { isLeaferBrushStampPaintedNode } from './leaferSpikeFilter'
 import { projectNode, type RenderNode } from './projection'
+import { paintSignatureFor } from './leaferPaintSignature'
 import { dashPatternFor } from './leaferShapePaint'
 import {
   diffReconcilePlan,
@@ -76,6 +77,8 @@ type BrushStampEntry = {
   nodeId: string
   object: BrushStampObject
   kind: BrushStampEntryKind
+  /** PR-R2 per-node 签名：未变 → 跳过 projectNode + set。 */
+  signature: string
 }
 
 export type LeaferBrushStampPaint = {
@@ -257,27 +260,40 @@ export const createLeaferBrushStampPaint = (leafer: Leafer): LeaferBrushStampPai
     }
 
     for (const node of brushStampNodes) {
-      const projected = projectNode(node)
-      const paintPlan = brushStampPaintPlanFor(projected, ctx.layerOf?.(node.id))
+      const sig = paintSignatureFor(node, ctx)
       const existing = entries.get(node.id)
 
       if (plan.created.has(node.id) || !existing) {
+        const paintPlan = brushStampPaintPlanFor(projectNode(node), ctx.layerOf?.(node.id))
         const object = createBrushStampObject(paintPlan)
-        entries.set(node.id, { nodeId: node.id, object, kind: paintPlan.kind })
+        entries.set(node.id, { nodeId: node.id, object, kind: paintPlan.kind, signature: sig })
         leafer.add(object)
         created += 1
         continue
       }
+
+      if (existing.signature === sig) {
+        // signature 未变 → 跳过 projectNode + set（R-03b）。kind 由 markupKind
+        // (stamp vs brush) + stroke.style (dashed → polyline) 决定，二者均在签名
+        // 中（markupKind / markupStrokeStyle / 显式 strokes），故签名不变 ⇒ kind
+        // 不变，无需 kind-swap 检查。
+        updated += 1
+        continue
+      }
+
+      // signature 变了 → 重算 projectNode + plan。
+      const paintPlan = brushStampPaintPlanFor(projectNode(node), ctx.layerOf?.(node.id))
 
       if (existing.kind !== paintPlan.kind) {
         // dashed↔solid brush or brush↔stamp under the same id: the Leafer class
         // differs, so destroy + recreate — same kind-swap pattern as 3c/4a.
         destroyEntry(existing)
         const object = createBrushStampObject(paintPlan)
-        entries.set(node.id, { nodeId: node.id, object, kind: paintPlan.kind })
+        entries.set(node.id, { nodeId: node.id, object, kind: paintPlan.kind, signature: sig })
         leafer.add(object)
       } else {
         setProps(existing.object, paintPlan.props)
+        existing.signature = sig
       }
       updated += 1
     }

@@ -48,6 +48,7 @@ import { engineLodFillFor, shouldUseEngineLod } from './engineSpikeLod'
 import { Layer } from './layers'
 import { isLeaferShapePaintedNode } from './leaferSpikeFilter'
 import { projectNode, type RenderNode } from './projection'
+import { paintSignatureFor } from './leaferPaintSignature'
 import {
   diffReconcilePlan,
   type RendererReconcileCounts,
@@ -61,6 +62,8 @@ type ShapeEntry = {
   nodeId: string
   object: ShapeObject
   kind: ShapeEntryKind
+  /** PR-R2 per-node 签名：未变 → 跳过 projectNode + set。 */
+  signature: string
 }
 
 export type LeaferShapePaint = {
@@ -284,6 +287,18 @@ const setProps = (object: ShapeObject, props: Record<string, unknown>) => {
   ;(object as { set: (props: unknown) => void }).set(props)
 }
 
+/** PR-R2: props 解析惰性化——仅在 create/kind-swap/signature 变化时调用，
+ *  避免未变节点付 projectNode 代价。lod-rect 走 lodShapePaintPropsFor（raw node），
+ *  HD 走 shapePaintPropsFor(projectNode(node), …)。 */
+const shapePropsForNode = (
+  node: MivoCanvasNode,
+  kind: ShapeEntryKind,
+  zIndex: number | undefined,
+): Record<string, unknown> =>
+  kind === 'lod-rect'
+    ? lodShapePaintPropsFor(node, zIndex)
+    : shapePaintPropsFor(projectNode(node), kind, zIndex)
+
 /**
  * Create a Leafer shape paint module bound to one Leafer instance. The hook
  * creates one when Leafer inits and disposes it when Leafer is destroyed; all
@@ -329,15 +344,16 @@ export const createLeaferShapePaint = (leafer: Leafer): LeaferShapePaint => {
     }
 
     for (const node of shapeNodes) {
-      const kind = shouldUseEngineLod(node, ctx.viewport) ? 'lod-rect' : shapeKindFor(node) as ShapeEntryKind
-      const props = kind === 'lod-rect'
-        ? lodShapePaintPropsFor(node, ctx.layerOf?.(node.id))
-        : shapePaintPropsFor(projectNode(node), kind, ctx.layerOf?.(node.id))
+      // Greptile P2: shouldUseEngineLod 每节点每帧只算一次，kind 判定 + 签名复用。
+      const lod = shouldUseEngineLod(node, ctx.viewport)
+      const kind: ShapeEntryKind = lod ? 'lod-rect' : shapeKindFor(node) as ShapeEntryKind
+      const sig = paintSignatureFor(node, ctx, lod)
       const existing = entries.get(node.id)
 
       if (plan.created.has(node.id) || !existing) {
+        const props = shapePropsForNode(node, kind, ctx.layerOf?.(node.id))
         const object = createShapeObject(kind, props)
-        entries.set(node.id, { nodeId: node.id, object, kind })
+        entries.set(node.id, { nodeId: node.id, object, kind, signature: sig })
         leafer.add(object)
         created += 1
         continue
@@ -347,11 +363,19 @@ export const createLeaferShapePaint = (leafer: Leafer): LeaferShapePaint => {
         // markupKind changed under the same id (e.g. rect → ellipse): the Leafer
         // class differs, so destroy + recreate — same kind-swap pattern as 3c.
         destroyEntry(existing)
+        const props = shapePropsForNode(node, kind, ctx.layerOf?.(node.id))
         const object = createShapeObject(kind, props)
-        entries.set(node.id, { nodeId: node.id, object, kind })
+        entries.set(node.id, { nodeId: node.id, object, kind, signature: sig })
         leafer.add(object)
-      } else {
+        updated += 1
+        continue
+      }
+
+      if (existing.signature !== sig) {
+        // signature 变了 → 重算 projectNode + set；未变则跳过（R-03b）。
+        const props = shapePropsForNode(node, kind, ctx.layerOf?.(node.id))
         setProps(existing.object, props)
+        existing.signature = sig
       }
       updated += 1
     }

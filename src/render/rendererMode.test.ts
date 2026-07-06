@@ -6,16 +6,19 @@ import { describe, expect, it, vi } from 'vitest'
 
 const loadWithSearch = async (search: string | null) => {
   vi.resetModules()
+  const logSpy = vi.fn()
+  const warnSpy = vi.fn()
   if (search === null) {
     vi.stubGlobal('window', undefined as unknown as Window & typeof globalThis)
   } else {
     vi.stubGlobal('window', { location: { search } } as unknown as Window & typeof globalThis)
   }
   vi.doMock('../store/debugLogStore', () => ({
-    debugLogger: { warn: vi.fn(), log: vi.fn() },
+    debugLogger: { warn: warnSpy, log: logSpy },
   }))
   try {
-    return await import('./rendererMode')
+    const mod = await import('./rendererMode')
+    return { ...mod, debugLogger: { log: logSpy, warn: warnSpy } }
   } finally {
     vi.unstubAllGlobals()
   }
@@ -52,5 +55,41 @@ describe('rendererMode(默认 leafer,dom 为应急回退通道)', () => {
   it('?renderer=pixi spike 通道保留(工装用)', async () => {
     const mod = await loadWithSearch('?renderer=pixi')
     expect(mod.rendererMode).toBe('pixi')
+  })
+})
+
+describe('rendererMode R-14 — 默认 leafer 渲染器身份 Debug Log', () => {
+  it('缺省启动:有且仅有一条渲染器身份 log,无 warn', async () => {
+    const mod = await loadWithSearch('')
+    expect(mod.debugLogger.log).toHaveBeenCalledTimes(1)
+    expect(mod.debugLogger.warn).not.toHaveBeenCalled()
+    expect(mod.debugLogger.log.mock.calls[0][0]).toBe('Renderer')
+    expect(String(mod.debugLogger.log.mock.calls[0][1])).toContain('leafer')
+    expect(String(mod.debugLogger.log.mock.calls[0][1])).toContain('identity')
+  })
+
+  it('显式 ?renderer=leafer:同样一条身份 log', async () => {
+    const mod = await loadWithSearch('?renderer=leafer')
+    expect(mod.debugLogger.log).toHaveBeenCalledTimes(1)
+    expect(mod.debugLogger.warn).not.toHaveBeenCalled()
+  })
+
+  it('非法值:warn 一条,不额外打身份 log（warn 即身份记录）', async () => {
+    const mod = await loadWithSearch('?renderer=webgl2')
+    expect(mod.debugLogger.warn).toHaveBeenCalledTimes(1)
+    expect(mod.debugLogger.log).not.toHaveBeenCalled()
+  })
+
+  it('?renderer=dom:走 dom 通道 log,不打 leafer 身份 log', async () => {
+    const mod = await loadWithSearch('?renderer=dom')
+    expect(mod.debugLogger.log).toHaveBeenCalledTimes(1)
+    expect(String(mod.debugLogger.log.mock.calls[0][1])).toContain('dom renderer requested')
+  })
+
+  it('非浏览器环境（SSR/单测）不打身份 log（Greptile P2：避免污染未 mock debugLogger 的测试）', async () => {
+    const mod = await loadWithSearch(null)
+    expect(mod.rendererMode).toBe('leafer')
+    expect(mod.debugLogger.log).not.toHaveBeenCalled()
+    expect(mod.debugLogger.warn).not.toHaveBeenCalled()
   })
 })
