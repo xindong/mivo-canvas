@@ -19,6 +19,7 @@ import {
 } from '../canvas/textGeometry'
 import { useCanvasStore } from '../store/canvasStore'
 import { debugLogger } from '../store/debugLogStore'
+import { toastFeedback } from '../store/toastStore'
 import { registerEngineSpikeCamera } from './engineSpikeCameraBridge'
 import { isEngineLodRequested } from './engineLodMode'
 import {
@@ -69,6 +70,9 @@ type LeaferSpikeStats = EngineLodStatsCarrier & {
   panCacheCaptures: number
   panCacheLastDeltaX: number
   panCacheLastDeltaY: number
+  /** R-01: Leafer init 失败时置 true，useEngineSpikeRenderers 据此把
+   *  effectiveRendererMode 降级到 dom（与 pixi 的 fallbackToDom 同口径）。 */
+  fallbackToDom: boolean
 }
 
 type LeaferSpikeProbeNode = {
@@ -99,6 +103,7 @@ const EMPTY_STATS: LeaferSpikeStats = {
   panCacheCaptures: 0,
   panCacheLastDeltaX: 0,
   panCacheLastDeltaY: 0,
+  fallbackToDom: false,
 }
 
 // Stable empty set for RendererSyncContext.selectedNodeIds — the image paint
@@ -233,6 +238,10 @@ const countLeaferChildren = (leafer: Leafer | null): number => {
 }
 
 const sampleNonEmptyCanvasPixels = (host: HTMLDivElement | null) => {
+  // R-02: 像素探针是 DEV-only 的白屏 canary。生产构建直接信任 Leafer 已上像素，
+  // 跳过 getImageData 扫描（避免每帧 48×32=1536 次 readback 的性能/能耗开销）。
+  if (!import.meta.env.DEV) return { nonEmpty: true, sampleCount: 0 }
+
   const canvas = host?.querySelector('canvas')
   if (!canvas) return { nonEmpty: false, sampleCount: 0 }
 
@@ -357,6 +366,7 @@ export const useLeaferSpikeRenderer = ({
       current.panCacheCaptures === next.panCacheCaptures &&
       current.panCacheLastDeltaX === next.panCacheLastDeltaX &&
       current.panCacheLastDeltaY === next.panCacheLastDeltaY &&
+      current.fallbackToDom === next.fallbackToDom &&
       current.lodMode === next.lodMode &&
       current.lodEnabled === next.lodEnabled &&
       current.lodThresholdPx === next.lodThresholdPx &&
@@ -390,6 +400,36 @@ export const useLeaferSpikeRenderer = ({
     [],
   )
 
+  // R-01: Leafer init 失败（new Leafer / start 抛错，或 paint 模块绑定抛错）时的兜底。
+  // 镜像 usePixiSpikeRenderer.ts 的 failToDom 范式：销毁半成品实例 + 清空 refs +
+  // debugLogger.error 一条 + toast 一条 + publishStats(fallbackToDom:true)，让
+  // useEngineSpikeRenderers 把 effectiveRendererMode 降到 dom，DOM 接管全部节点（非白屏）。
+  const failToDom = useCallback((message: string) => {
+    const current = leaferRef.current
+    leaferRef.current = null
+    paintedRef.current.clear()
+    signatureRef.current.clear()
+    imagePaintRef.current?.dispose()
+    imagePaintRef.current = null
+    shapePaintRef.current?.dispose()
+    shapePaintRef.current = null
+    linePaintRef.current?.dispose()
+    linePaintRef.current = null
+    brushStampPaintRef.current?.dispose()
+    brushStampPaintRef.current = null
+    if (current) {
+      try {
+        current.destroy()
+      } catch {
+        // Leafer 已处于损坏态；吞掉二次 destroy 的异常，保持降级路径干净。
+      }
+    }
+    setLeaferReady(false)
+    debugLogger.error('Leafer Spike', message)
+    toastFeedback.error('Leafer 渲染器初始化失败，已降级到 DOM 渲染。')
+    publishStats({ ...EMPTY_STATS, panCacheEnabled, fallbackToDom: true })
+  }, [panCacheEnabled, publishStats])
+
   // Init Leafer (dom + leafer 都 init，保留 dom 空白 canvas 行为；hittable:false D1 双保险).
   // 用 rAF 等 host 有非零尺寸再 init（mount 时 layout 未完成，getBoundingClientRect 可能 0×0，
   // Leafer canvas 会塌成 1px 高，paint 不可见）。
@@ -412,27 +452,35 @@ export const useLeaferSpikeRenderer = ({
         raf = requestAnimationFrame(init)
         return
       }
-      leafer = new Leafer({
-        view: host,
-        type: 'design',
-        width: Math.max(1, Math.floor(rect.width)),
-        height: Math.max(1, Math.floor(rect.height)),
-        fill: 'rgba(246, 243, 235, 0)',
-        smooth: true,
-        hittable: false,
-      })
-      leaferRef.current = leafer
-      leafer.start()
-      setLeaferReady(true)
-      // Bind the image paint module to this Leafer instance. Disposed in the
-      // cleanup below so every image lease is released on Leafer teardown.
-      imagePaintRef.current = createLeaferImagePaint(leafer)
-      // Bind the shape paint module (4a) to the same Leafer instance.
-      shapePaintRef.current = createLeaferShapePaint(leafer)
-      // Bind the line paint module (4b) to the same Leafer instance.
-      linePaintRef.current = createLeaferLinePaint(leafer)
-      // Bind the brush/stamp paint module (4c) to the same Leafer instance.
-      brushStampPaintRef.current = createLeaferBrushStampPaint(leafer)
+      try {
+        leafer = new Leafer({
+          view: host,
+          type: 'design',
+          width: Math.max(1, Math.floor(rect.width)),
+          height: Math.max(1, Math.floor(rect.height)),
+          fill: 'rgba(246, 243, 235, 0)',
+          smooth: true,
+          hittable: false,
+        })
+        leaferRef.current = leafer
+        leafer.start()
+        setLeaferReady(true)
+        // Bind the image paint module to this Leafer instance. Disposed in the
+        // cleanup below so every image lease is released on Leafer teardown.
+        imagePaintRef.current = createLeaferImagePaint(leafer)
+        // Bind the shape paint module (4a) to the same Leafer instance.
+        shapePaintRef.current = createLeaferShapePaint(leafer)
+        // Bind the line paint module (4b) to the same Leafer instance.
+        linePaintRef.current = createLeaferLinePaint(leafer)
+        // Bind the brush/stamp paint module (4c) to the same Leafer instance.
+        brushStampPaintRef.current = createLeaferBrushStampPaint(leafer)
+      } catch (error) {
+        // R-01: new Leafer / leafer.start() / paint 模块绑定任一抛错 → 降级 dom。
+        // 清掉 local leafer 引用，避免 cleanup 二次 destroy 已损坏实例。
+        leafer = null
+        failToDom(`leafer init failed: ${error instanceof Error ? error.message : String(error)}`)
+        return
+      }
 
       resizeObserver = new ResizeObserver(([entry]) => {
         if (!entry || !leaferRef.current) return
@@ -474,7 +522,7 @@ export const useLeaferSpikeRenderer = ({
       frozenViewportRef.current = null
       publishStats({ ...EMPTY_STATS, panCacheEnabled: cacheEnabled })
     }
-  }, [hostRef, panCacheEnabled, publishStats, rendererMode])
+  }, [failToDom, hostRef, panCacheEnabled, publishStats, rendererMode])
 
   // Camera sync (leafer only, 单向 React → zoomLayer.set; D1 禁反向监听 zoomLayer.__).
   useEffect(() => {
@@ -722,7 +770,13 @@ export const useLeaferSpikeRenderer = ({
     }
   }, [brushStampPaintedNodes, editingNodeId, hostRef, imagePaintedNodes, inlinePaintedNodes, leaferReady, linePaintedNodes, lodViewport, panCacheEnabled, paintedNodes, paintedNodeSignature, publishStats, rendererMode, shapePaintedNodes])
 
+  // R-06: 调试探针 window.__MIVO_LEAFER_SPIKE__ 仅在 DEV 暴露（生产构建不挂到 window，
+  // 避免泄漏内部 stats / 节点几何给第三方脚本，也省一条无用的 window 赋值副作用）。
   useEffect(() => {
+    if (!import.meta.env.DEV) {
+      window.__MIVO_LEAFER_SPIKE__ = undefined
+      return
+    }
     window.__MIVO_LEAFER_SPIKE__ = {
       getStats: () => statsRef.current,
       getPaintedNodes: () => {

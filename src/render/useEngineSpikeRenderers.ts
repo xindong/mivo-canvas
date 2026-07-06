@@ -4,6 +4,7 @@ import type { MivoCanvasNode } from '../types/mivoCanvas'
 import { debugLogger } from '../store/debugLogStore'
 import { filterDomNodesForRendererSpike, isLeaferSpikePainted } from './leaferSpikeFilter'
 import { rendererMode } from './rendererMode'
+import { computeEffectiveRendererMode } from './rendererFallback'
 import { useLeaferSpikeRenderer, type ViewportState } from './useLeaferSpikeRenderer'
 import { usePixiSpikeRenderer } from './usePixiSpikeRenderer'
 import { engineLodDataAttrsFor } from './engineSpikeLod'
@@ -30,10 +31,28 @@ export const useEngineSpikeRenderers = ({
   selectedNodeIds: string[]
 }) => {
   const pixiSpikeStats = usePixiSpikeRenderer({ hostRef, viewport, nodes: visibleNodes, rendererMode })
-  const effectiveRendererMode = pixiSpikeStats.fallbackToDom ? 'dom' : rendererMode
+  // 第一段：仅看 pixi fallback，决定喂给 leafer 的 rendererMode（pixi 已失败时
+  // leafer 收到 'dom'，不 init Leafer 实例，避免无谓的失败重试）。
+  const pixiEffectiveMode = computeEffectiveRendererMode(rendererMode, pixiSpikeStats.fallbackToDom, false)
   // Memo 成 Set 给 filter 做 O(1) 命中；dep 选数组（store 稳定引用），Set 随之稳定，
   // 避免 renderedNodes useMemo 每次重跑触发 paint。
   const selectedNodeIdSet = useMemo(() => new Set(selectedNodeIds), [selectedNodeIds])
+  const leaferSpikeStats = useLeaferSpikeRenderer({
+    hostRef,
+    viewport,
+    nodes: visibleNodes,
+    rendererMode: pixiEffectiveMode,
+    isPanning,
+    editingNodeId,
+  })
+  // 第二段：再看 leafer fallback，算最终 effectiveRendererMode。leafer init 抛错时
+  // leaferSpikeStats.fallbackToDom=true → 降到 'dom'，renderedNodes 不再被 leafer 过滤，
+  // DOM 渲染全部节点（非白屏）。
+  const effectiveRendererMode = computeEffectiveRendererMode(
+    rendererMode,
+    pixiSpikeStats.fallbackToDom,
+    leaferSpikeStats.fallbackToDom,
+  )
   const renderedNodes = useMemo(
     () =>
       filterDomNodesForRendererSpike(canvasRenderedNodes, effectiveRendererMode, {
@@ -53,14 +72,6 @@ export const useEngineSpikeRenderers = ({
     textShellCountRef.current = textShellCount
     debugLogger.log('Renderer', `leafer markup 文字壳: ${textShellCount} 个 DOM overlay`)
   }, [textShellCount])
-  const leaferSpikeStats = useLeaferSpikeRenderer({
-    hostRef,
-    viewport,
-    nodes: visibleNodes,
-    rendererMode: effectiveRendererMode,
-    isPanning,
-    editingNodeId,
-  })
   const engineSpikeDataAttrs = useMemo(
     () => ({
       'data-renderer-mode': effectiveRendererMode,
