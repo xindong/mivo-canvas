@@ -81,7 +81,20 @@ export const acquireAssetUrl = async (assetUrl?: string): Promise<AssetLease> =>
   const existing = leaseMap.get(assetUrl)
   if (existing) {
     existing.refCount += 1
-    const blobUrl = await existing.inFlight
+    let blobUrl: string
+    try {
+      blobUrl = await existing.inFlight
+    } catch (err) {
+      // The in-flight resolution rejected — a poisoned entry would otherwise
+      // keep re-rejecting for every future acquire. Drop it so the next acquire
+      // re-attempts resolution from scratch, then surface the original error.
+      leaseMap.delete(assetUrl)
+      debugLogger.warn(
+        LEASE_SOURCE,
+        `asset resolution rejected for ${assetUrl}; poisoned entry removed, rethrowing (${err instanceof Error ? err.message : String(err)})`,
+      )
+      throw err
+    }
     // IDB miss / non-blob resolution: the originating acquire will drop the entry.
     // Hand back a no-op release — there is no blob to revoke.
     if (!blobUrl || !blobUrl.startsWith('blob:')) {
@@ -94,7 +107,19 @@ export const acquireAssetUrl = async (assetUrl?: string): Promise<AssetLease> =>
   const entry: LeaseEntry = { blobUrl: '', refCount: 1, inFlight }
   leaseMap.set(assetUrl, entry)
 
-  const blobUrl = await inFlight
+  let blobUrl: string
+  try {
+    blobUrl = await inFlight
+  } catch (err) {
+    // Resolution rejected — drop the entry so the next acquire re-resolves
+    // instead of caching a rejected promise (poisoned cache, N-02).
+    leaseMap.delete(assetUrl)
+    debugLogger.warn(
+      LEASE_SOURCE,
+      `asset resolution rejected for ${assetUrl}; poisoned entry removed, rethrowing (${err instanceof Error ? err.message : String(err)})`,
+    )
+    throw err
+  }
   entry.blobUrl = blobUrl
 
   if (!blobUrl || !blobUrl.startsWith('blob:')) {
