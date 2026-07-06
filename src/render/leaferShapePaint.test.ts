@@ -38,6 +38,7 @@ import {
   strokeColorWithBakedOpacity,
   leaferZOrderMapFor,
   LEAFER_Z_LAYER_STEP,
+  LEAFER_Z_RENDERORDER_STEP,
   shapeLayerFor,
   shapePaintPropsFor,
   SOURCE,
@@ -120,6 +121,17 @@ describe('shapeLayerFor / leaferZOrderMapFor — 2b-2 z-order', () => {
     expect(map.get('m-early')!).toBeLessThan(map.get('m-late')!)
     // band arithmetic: frame band starts at Layer.Frame * STEP
     expect(map.get('f-late')).toBe(Layer.Frame * LEAFER_Z_LAYER_STEP + 1)
+  })
+
+  it('V2 stamp (renderOrder 1) outranks image (renderOrder 0) in Content regardless of doc order', () => {
+    const stampEarly = markupNode({ id: 'stamp-early', markupKind: 'stamp' })
+    const imageLate = { id: 'img-late', type: 'image', status: 'ready', x: 0, y: 0, width: 10, height: 10 } as MivoCanvasNode
+    const map = leaferZOrderMapFor([stampEarly, imageLate])
+    // stamp 在 doc 前面（index 0）但仍高于 image（index 1）—— renderOrder 子带胜过 doc order
+    expect(map.get('stamp-early')!).toBeGreaterThan(map.get('img-late')!)
+    // band 算术：stamp = Content*STEP + 1*SUB + 0；image = Content*STEP + 0*SUB + 1
+    expect(map.get('stamp-early')).toBe(Layer.Content * LEAFER_Z_LAYER_STEP + 1 * LEAFER_Z_RENDERORDER_STEP + 0)
+    expect(map.get('img-late')).toBe(Layer.Content * LEAFER_Z_LAYER_STEP + 0 * LEAFER_Z_RENDERORDER_STEP + 1)
   })
 })
 

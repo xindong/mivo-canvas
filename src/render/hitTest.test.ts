@@ -400,6 +400,34 @@ describe('z-order comparator', () => {
     expect(sortForHitTest([sel, plain]).map((n) => n.id)).toEqual(['plain', 'sel'])
   })
 
+  it('V2 stamp (renderOrder 1) hit-tests above image (renderOrder 0) in Layer.Content', () => {
+    const stamp = makeNode({ id: 'stamp', type: 'markup', markupKind: 'stamp', renderOrder: 1 })
+    const image = makeNode({ id: 'img', renderOrder: 0 })
+    // back-to-front: image then stamp
+    expect(sortForHitTest([stamp, image]).map((n) => n.id)).toEqual(['img', 'stamp'])
+  })
+
+  it('V2 stamp (renderOrder 1, unselected) above SELECTED image — renderOrder beats selected', () => {
+    const stamp = makeNode({ id: 'stamp', type: 'markup', markupKind: 'stamp', renderOrder: 1, selected: false })
+    const selectedImage = makeNode({ id: 'img', renderOrder: 0, selected: true })
+    expect(sortForHitTest([stamp, selectedImage]).map((n) => n.id)).toEqual(['img', 'stamp'])
+  })
+
+  it('V2 topmostHit: stamp above overlapping image → stamp is hit (普通 + selected image)', () => {
+    const image = makeNode({ id: 'img', geometry: { x: 0, y: 0, width: 100, height: 100, rotation: 0 } })
+    const stamp = makeNode({
+      id: 'stamp',
+      type: 'markup',
+      markupKind: 'stamp',
+      geometry: { x: 20, y: 20, width: 60, height: 60, rotation: 0 },
+      renderOrder: 1,
+    })
+    expect(topmostHit(sortForHitTest([image, stamp]), { x: 50, y: 50 })?.nodeId).toBe('stamp')
+    // selected image 仍在 stamp 之下
+    const selectedImage = makeNode({ id: 'img2', selected: true, geometry: { x: 0, y: 0, width: 100, height: 100, rotation: 0 } })
+    expect(topmostHit(sortForHitTest([selectedImage, stamp]), { x: 50, y: 50 })?.nodeId).toBe('stamp')
+  })
+
   it('overlay surface paints above canvas within same layer+order+sel (4th)', () => {
     const overlay = makeNode({ id: 'ov', surface: 'overlay' })
     const canvas = makeNode({ id: 'cv', surface: 'canvas' })
