@@ -184,16 +184,11 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
     set((state) => {
       const document = documentFor(state.canvases, sceneId)
       logCanvas(`Renamed canvas "${document.title}" to "${title}"`)
-
-      return {
-        canvases: {
-          ...state.canvases,
-          [sceneId]: {
-            ...document,
-            title,
-          },
-        },
-      }
+      // Route through patchCanvasDocument so updatedAt bumps (title is a content
+      // change — Phase 1d bump hub, single source of truth). The active-scene path
+      // also surfaces unchanged nodes/edges/tasks/selection (no-op merge); the
+      // non-active path returns { canvases } exactly as before.
+      return patchCanvasDocument(state, sceneId, { title })
     }),
   moveCanvasToProject: (canvasId, projectId) =>
     set((state) => {

@@ -57,6 +57,7 @@ import {
   rollbackLatestHistoryBaseline,
 } from './canvasDocumentModel'
 import { useCanvasStore } from './canvasStore'
+import { buildSidebarModel } from '../app/sidebar/projectSidebarModel'
 import { normalizeCanvasNodeV2 } from '../model/documentModelV2'
 
 const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
@@ -699,6 +700,31 @@ describe('updatedAt bump hub: store actions (createCanvas / duplicateCanvas / re
     })
     expect(useCanvasStore.getState().canvases['c1'].updatedAt > before).toBe(true)
   })
+
+  it('renameCanvas bumps updatedAt so the renamed canvas floats to the top (real action, not setState)', () => {
+    // Two canvases: A (newer) and B (older, active). Renaming B via the REAL
+    // store action bumps B.updatedAt to now → B overtakes A in buildSidebarModel's
+    // standalone order. This guards the Phase 1d "title bump" rule + SC4; the
+    // earlier project-sidebar.mjs §6 setState workaround had masked the gap.
+    const beforeA = '2026-07-03T00:00:00.000Z'
+    const beforeB = '2026-07-01T00:00:00.000Z'
+    seedStore({
+      a: blankDoc({ title: 'Canvas A', updatedAt: beforeA }),
+      b: blankDoc({ title: 'Canvas B', updatedAt: beforeB }),
+    }, 'b')
+
+    const beforeModel = buildSidebarModel(useCanvasStore.getState().projects, useCanvasStore.getState().canvases)
+    expect(beforeModel.standaloneCanvasIds[0]).toBe('a') // A newer → A first
+
+    useCanvasStore.getState().renameCanvas('b', 'Canvas B Renamed')
+
+    const after = useCanvasStore.getState()
+    expect(after.canvases['b'].title).toBe('Canvas B Renamed')
+    expect(after.canvases['b'].updatedAt > beforeB).toBe(true)
+    expect(after.canvases['b'].updatedAt > beforeA).toBe(true) // overtook A
+    const afterModel = buildSidebarModel(after.projects, after.canvases)
+    expect(afterModel.standaloneCanvasIds[0]).toBe('b') // B now first
+  })
 })
 
 // Mask-edit routing (1d): patchMaskEditSlotStatus / patchMaskEditProgress /
@@ -706,4 +732,3 @@ describe('updatedAt bump hub: store actions (createCanvas / duplicateCanvas / re
 // bumpUpdatedAt contract they rely on is covered by the patchCanvasDocument
 // describe above (content patch bumps; bumpUpdatedAt:false on the poll-progress
 // path does not). The end-to-end mask-edit flow is exercised by Phase 6 e2e.
-
