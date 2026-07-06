@@ -7,8 +7,12 @@
 // exact thing the TOCTOU fix guarantees.
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { Buffer } from 'node:buffer'
+import { createServer, type Server } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import {
   createProxyImageRoutes,
+  fetchPinned,
+  nodeHttpTransport,
   type ProxyTransport,
   type ProxyTransportRequest,
   type ProxyTransportResponse,
@@ -304,5 +308,73 @@ describe('proxy-image route (V-18 SSRF + V-21 relative Location)', () => {
     const r = await call(app, 'https://cdn.example.com/not-modified')
     expect(r.status).toBe(502)
     expect(JSON.parse(r.body.toString('utf8')).error).toMatch(/upstream status 302/)
+  })
+})
+
+describe('proxy-image nit fixes (G2 round 2)', () => {
+  it('nit2: fetchPinned skips DNS when the signal is already aborted', async () => {
+    // Between redirect hops (or a client disconnect during a streak) the signal can
+    // be aborted before fetchPinned runs. The fix short-circuits before resolveIps
+    // so we don't do a lookup whose result we'll throw away.
+    const resolveIps = vi.fn(async () => ['93.184.216.34'])
+    const transport = vi.fn(async () =>
+      transportResponse({ status: 200, headers: { 'content-type': 'image/png' }, body: PNG_BYTES }),
+    )
+    const ac = new AbortController()
+    ac.abort()
+    await expect(
+      fetchPinned('https://cdn.example.com/img.png', ac.signal, {
+        resolveIps,
+        transport,
+        timeoutMs: 15_000,
+        maxBytes: 30 * 1024 * 1024,
+      }),
+    ).rejects.toThrow(/aborted/)
+    expect(resolveIps).not.toHaveBeenCalled()
+    expect(transport).not.toHaveBeenCalled()
+  })
+
+  it('nit1: nodeHttpTransport onAbort releases timer + listener immediately (no leak on abort)', async () => {
+    // Local server that accepts the connection but never responds — the only way
+    // the transport settles is via abort, exercising the onAbort cleanup path.
+    // The spy asserts the abort listener is removed synchronously in onAbort
+    // (the old code left it live until the async req 'error' event fired).
+    const server: Server = createServer(() => {
+      /* accept and hold; never res.end() */
+    })
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
+    const port = (server.address() as AddressInfo).port
+    const ac = new AbortController()
+    const addSpy = vi.spyOn(ac.signal, 'addEventListener')
+    const removeSpy = vi.spyOn(ac.signal, 'removeEventListener')
+    const url = new URL(`http://127.0.0.1:${port}/img.png`)
+
+    const promise = nodeHttpTransport({
+      url,
+      pinnedIp: '127.0.0.1',
+      signal: ac.signal,
+      timeoutMs: 10_000,
+      maxBytes: 30 * 1024 * 1024,
+    })
+    // Let the connection establish, then abort.
+    await new Promise((r) => setTimeout(r, 50))
+    ac.abort()
+    // onAbort runs SYNCHRONOUSLY during the abort dispatch and calls cleanup()
+    // → removeEventListener fires before the async req 'error' handler. This is
+    // the "no release window" guarantee: the old code only removed via the async
+    // error path, so right after abort the listener was still live.
+    const removesRightAfterAbort = removeSpy.mock.calls.filter((c) => c[0] === 'abort').length
+    expect(removesRightAfterAbort).toBeGreaterThanOrEqual(1)
+    await expect(promise).rejects.toThrow(/aborted/)
+    // No leak: every registered listener was removed (the async error path removes
+    // again — idempotent — so removes >= adds, never less).
+    const adds = addSpy.mock.calls.filter((c) => c[0] === 'abort').length
+    const removes = removeSpy.mock.calls.filter((c) => c[0] === 'abort').length
+    expect(adds).toBeGreaterThan(0)
+    expect(removes).toBeGreaterThanOrEqual(adds)
+
+    // Tear down the held connection + server.
+    server.closeAllConnections?.()
+    await new Promise<void>((r) => server.close(() => r()))
   })
 })

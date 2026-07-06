@@ -87,7 +87,8 @@ export type ProxyTransport = (req: ProxyTransportRequest) => Promise<ProxyTransp
 
 // Default transport: node http/https against the pinned IP. Aborts on signal,
 // enforces the defensive size cap mid-stream (throws ProxyTooLargeError).
-const nodeHttpTransport: ProxyTransport = ({ url, pinnedIp, signal, timeoutMs, maxBytes }) => {
+// Exported so the abort-cleanup path can be exercised against a real local socket.
+export const nodeHttpTransport: ProxyTransport = ({ url, pinnedIp, signal, timeoutMs, maxBytes }) => {
   const isTls = url.protocol === 'https:'
   const port = url.port ? Number(url.port) : isTls ? 443 : 80
   const path = `${url.pathname}${url.search}`
@@ -109,24 +110,33 @@ const nodeHttpTransport: ProxyTransport = ({ url, pinnedIp, signal, timeoutMs, m
   const req = isTls ? httpsRequest(options) : httpRequest(options)
 
   let settled = false
-  const onAbort = () => {
+  // cleanup is shared by every settle path (timer-fires, abort, response-end,
+  // too-large, error). Idempotent — settled + clear/remove being no-ops makes a
+  // second call safe. function declarations are hoisted so cleanup↔onAbort can
+  // reference each other without TDZ.
+  function cleanup(): void {
+    clearTimeout(timer)
+    signal.removeEventListener('abort', onAbort)
+  }
+  // Nit 1: on abort, run cleanup() SYNCHRONOUSLY right now (clear the timer +
+  // drop the abort listener) instead of only relying on the async req 'error'
+  // event. The old code destroyed the socket but left the timer/listener live
+  // until the error event fired — a release window. settled keeps it idempotent;
+  // the subsequent req 'error' handler runs cleanup() again as a no-op and rejects.
+  function onAbort(): void {
     if (settled) return
+    cleanup()
     req.destroy(new Error('aborted'))
   }
+  const timer = setTimeout(() => {
+    if (settled) return
+    cleanup()
+    req.destroy(new Error('timeout'))
+  }, timeoutMs)
   if (signal.aborted) {
     onAbort()
   } else {
     signal.addEventListener('abort', onAbort, { once: true })
-  }
-  // Belt-and-suspenders timeout (the route also passes AbortSignal.timeout, but
-  // a destroyed socket surfaces the error deterministically here).
-  const timer = setTimeout(() => {
-    if (settled) return
-    req.destroy(new Error('timeout'))
-  }, timeoutMs)
-  const cleanup = () => {
-    clearTimeout(timer)
-    signal.removeEventListener('abort', onAbort)
   }
 
   return new Promise<ProxyTransportResponse>((resolve, reject) => {
@@ -182,29 +192,46 @@ export type ProxyImageDeps = {
   transport?: ProxyTransport
 }
 
+export type FetchPinnedDeps = {
+  resolveIps: (hostname: string) => Promise<string[]>
+  transport: ProxyTransport
+  timeoutMs: number
+  maxBytes: number
+}
+
+// V-18 + nit 2: resolve the hostname ONCE, block-check the resolved IPs, then
+// connect directly to a pinned public IP. The transport never re-resolves DNS,
+// so a rebinding flip between check and connect has no effect. Reject-on-any-
+// private matches the original isHostBlocked semantics: a mixed resolution is
+// blocked wholesale, not cherry-picked. Nit 2: if the signal already aborted
+// (e.g. between redirect hops, or a client disconnect during a streak), skip the
+// DNS query entirely — no point doing a lookup whose result we'll throw away.
+// Exported so the abort-before-DNS guard can be unit-tested in isolation.
+export const fetchPinned = async (
+  urlString: string,
+  signal: AbortSignal,
+  deps: FetchPinnedDeps,
+): Promise<ProxyTransportResponse> => {
+  if (signal.aborted) throw new Error('aborted')
+  const url = new URL(urlString)
+  const ips = await deps.resolveIps(url.hostname)
+  if (ips.length === 0) throw new ProxyBlockedError()
+  if (ips.some((ip) => isPrivateHostLiteral(ip))) throw new ProxyBlockedError()
+  // All resolved IPs are public — pin the first. The transport connects here
+  // directly (Host header carries the original hostname), so no second DNS
+  // lookup can rebind the connection to an internal IP.
+  const pinnedIp = ips[0]
+  return deps.transport({ url, pinnedIp, signal, timeoutMs: deps.timeoutMs, maxBytes: deps.maxBytes })
+}
+
 export const createProxyImageRoutes = (deps: ProxyImageDeps = {}): App => {
   const resolveIps = deps.resolveIps ?? resolveHostIps
   const transport = deps.transport ?? nodeHttpTransport
-
-  // V-18: resolve the hostname ONCE, block-check the resolved IPs, then connect
-  // directly to a pinned public IP. The transport never re-resolves DNS, so a
-  // rebinding flip between check and connect has no effect. Reject-on-any-private
-  // matches the original isHostBlocked semantics: a mixed resolution (public +
-  // private) is blocked wholesale, not cherry-picked — we never pick the public
-  // IP from a mixed answer.
-  const fetchPinned = async (
-    urlString: string,
-    signal: AbortSignal,
-  ): Promise<ProxyTransportResponse> => {
-    const url = new URL(urlString)
-    const ips = await resolveIps(url.hostname)
-    if (ips.length === 0) throw new ProxyBlockedError()
-    if (ips.some((ip) => isPrivateHostLiteral(ip))) throw new ProxyBlockedError()
-    // All resolved IPs are public — pin the first. The transport connects here
-    // directly (Host header carries the original hostname), so no second DNS
-    // lookup can rebind the connection to an internal IP.
-    const pinnedIp = ips[0]
-    return transport({ url, pinnedIp, signal, timeoutMs: PROXY_TIMEOUT_MS, maxBytes: PROXY_MAX_BYTES })
+  const fetchPinnedDeps: FetchPinnedDeps = {
+    resolveIps,
+    transport,
+    timeoutMs: PROXY_TIMEOUT_MS,
+    maxBytes: PROXY_MAX_BYTES,
   }
 
   const app: App = new Hono<AppEnv>()
@@ -219,7 +246,7 @@ export const createProxyImageRoutes = (deps: ProxyImageDeps = {}): App => {
     const signal = AbortSignal.timeout(PROXY_TIMEOUT_MS)
     let response: ProxyTransportResponse
     try {
-      response = await fetchPinned(currentUrl, signal)
+      response = await fetchPinned(currentUrl, signal, fetchPinnedDeps)
     } catch (error) {
       if (error instanceof ProxyTooLargeError) return jsonResponse({ error: 'image too large' }, 413)
       if (error instanceof ProxyBlockedError) return jsonResponse({ error: 'blocked host' }, 400)
@@ -254,7 +281,7 @@ export const createProxyImageRoutes = (deps: ProxyImageDeps = {}): App => {
       }
       currentUrl = nextParsed.url.toString()
       try {
-        response = await fetchPinned(currentUrl, signal)
+        response = await fetchPinned(currentUrl, signal, fetchPinnedDeps)
       } catch (error) {
         if (error instanceof ProxyTooLargeError) return jsonResponse({ error: 'image too large' }, 413)
         if (error instanceof ProxyBlockedError) return jsonResponse({ error: 'blocked host' }, 400)
