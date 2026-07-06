@@ -15,6 +15,7 @@ export const useEngineSpikeRenderers = ({
   canvasRenderedNodes,
   isPanning,
   editingNodeId,
+  selectedNodeIds,
 }: {
   hostRef: MutableRefObject<HTMLDivElement | null>
   viewport: ViewportState
@@ -23,16 +24,24 @@ export const useEngineSpikeRenderers = ({
   isPanning: boolean
   /** MivoCanvas editingTextNodeId —— FU-11 markup 文字壳在编辑空文字时也保留。 */
   editingNodeId?: string
+  /** 选中的节点 id 数组（MivoCanvas store 的 selectedNodeIds）—— leafer 模式下
+   *  选中 image 保留纯选中 DOM 壳（外框 + resize handle），否则选中态外框随
+   *  DOM 壳被过滤掉。hook 内 memo 成 Set 给 filter 做 O(1) 命中。 */
+  selectedNodeIds: string[]
 }) => {
   const pixiSpikeStats = usePixiSpikeRenderer({ hostRef, viewport, nodes: visibleNodes, rendererMode })
   const effectiveRendererMode = pixiSpikeStats.fallbackToDom ? 'dom' : rendererMode
+  // Memo 成 Set 给 filter 做 O(1) 命中；dep 选数组（store 稳定引用），Set 随之稳定，
+  // 避免 renderedNodes useMemo 每次重跑触发 paint。
+  const selectedNodeIdSet = useMemo(() => new Set(selectedNodeIds), [selectedNodeIds])
   const renderedNodes = useMemo(
     () =>
       filterDomNodesForRendererSpike(canvasRenderedNodes, effectiveRendererMode, {
         editingNodeId,
         viewportScale: viewport.scale,
+        selectedNodeIds: selectedNodeIdSet,
       }),
-    [canvasRenderedNodes, editingNodeId, effectiveRendererMode, viewport.scale],
+    [canvasRenderedNodes, editingNodeId, effectiveRendererMode, viewport.scale, selectedNodeIdSet],
   )
   // FU-11 可观测性：文字壳数量变化时记一条 Debug Log（数量不变不重复刷）。
   const textShellCountRef = useRef(0)

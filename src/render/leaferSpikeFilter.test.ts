@@ -3,6 +3,7 @@ import {
   filterDomNodesForRendererSpike,
   hasMarkupTextLayer,
   needsFrameTitleShell,
+  needsImageSelectionShell,
   needsMarkupTextShell,
 } from './leaferSpikeFilter'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
@@ -131,5 +132,34 @@ describe('filterDomNodesForRendererSpike — FU-11 文字壳放行', () => {
     expect(
       filterDomNodesForRendererSpike(all, 'leafer', { editingNodeId: 'rn' }).map((n) => n.id),
     ).toEqual(['rt', 'rn', 'nt', 'at', 'tx', 'ft'])
+  })
+
+  it('leafer 模式 + 选中 image：选中 image 放行纯选中壳，未选中 image 仍过滤', () => {
+    // 选中 img → 放行（img 在 all 首位，filter 保序）；其余 Leafer 真画节点照旧过滤
+    const selectedIds = new Set(['img'])
+    expect(
+      filterDomNodesForRendererSpike(all, 'leafer', { selectedNodeIds: selectedIds }).map((n) => n.id),
+    ).toEqual(['img', 'rt', 'nt', 'at', 'tx', 'ft'])
+    // 选中非 image 节点（如 rect）不会把 image 拉回 DOM 列表
+    expect(
+      filterDomNodesForRendererSpike(all, 'leafer', { selectedNodeIds: new Set(['rt']) }).map((n) => n.id),
+    ).toEqual(['rt', 'nt', 'at', 'tx', 'ft'])
+    // dom 模式：selectedNodeIds 不影响（原样返回）
+    expect(filterDomNodesForRendererSpike(all, 'dom', { selectedNodeIds: selectedIds })).toEqual(all)
+  })
+})
+
+describe('needsImageSelectionShell — image 选中壳判定', () => {
+  const image = node({ id: 'img', type: 'image', markupKind: undefined })
+  const rect = node({ id: 'rt', text: '标注' })
+
+  it('选中 image → 需要壳；未选中 image → 不需要', () => {
+    expect(needsImageSelectionShell(image, { selectedNodeIds: new Set(['img']) })).toBe(true)
+    expect(needsImageSelectionShell(image, { selectedNodeIds: new Set(['other']) })).toBe(false)
+    expect(needsImageSelectionShell(image, {})).toBe(false)
+  })
+
+  it('非 image 节点即使选中也不产生选中壳（markup 走文字壳/frame 走标题壳）', () => {
+    expect(needsImageSelectionShell(rect, { selectedNodeIds: new Set(['rt']) })).toBe(false)
   })
 })

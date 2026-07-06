@@ -670,6 +670,11 @@ export const CanvasNodeView = memo(function CanvasNodeView({
             </>
           )}
         </div>
+      ) : imageNode && rendererMode === 'leafer' && isLeaferSpikePainted(node) ? (
+        // leafer 模式下 image 本体由 leaferImagePaint 真画，DOM 壳不画 <img>
+        // （filter 仅对选中 image 放行至此，故此处壳承载 .dom-node.selected
+        // 外框 + primarySelected 的 4 角 handle；未选中 image 不进 DOM 列表）。
+        null
       ) : (
         <div
           className={imageCrop ? 'dom-node-media cropped' : 'dom-node-media'}
