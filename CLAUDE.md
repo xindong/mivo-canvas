@@ -90,4 +90,6 @@ Project MivoCanvas/
 - **来源**：2026-07-01 完整克隆自原始仓；2026-07-04 迁移到组织仓 github.com/xindong/mivo-canvas（保留 main 分支与 commit 历史）。
 - **脚手架**：CLAUDE.md / VERSIONING.md / .gitignore（ECC 合并）/ history/ / pre-commit hook 由 `new-project` skill 于克隆后叠加，作为独立 commit 入库。
 
+- **默认渲染器**:2026-07-06 起默认 `leafer`(Leafer 正式化最终验收通过后切换);`?renderer=dom` 为应急回退通道,DomRenderer 与双轨代码保留,观察窗后另行决策。
+
 （在此追加项目的具体决策、踩坑、TODO）
