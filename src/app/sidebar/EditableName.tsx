@@ -74,7 +74,9 @@ export function EditableName(props: {
       onClick={(event) => event.stopPropagation()}
       onDoubleClick={(event) => event.stopPropagation()}
       onKeyDown={(event) => {
-        if (event.key === 'Enter') {
+        // IME guard (maker ProjectNode rename input 同款):中文输入法组合期间的
+        // Enter 是确认候选词,不是提交重命名。
+        if (event.key === 'Enter' && !event.nativeEvent.isComposing) {
           event.preventDefault()
           commit()
         } else if (event.key === 'Escape') {

@@ -44,14 +44,15 @@ export function ConfirmDialog(props: {
         <div className="sidebar-confirm-title">{title}</div>
         <div className="sidebar-confirm-description">{description}</div>
         <div className="sidebar-confirm-actions">
-          <button type="button" className="sidebar-confirm-cancel" onClick={onCancel}>
+          {/* 默认焦点落在「取消」(maker/Radix AlertDialog 破坏性操作安全默认):
+              弹窗刚出现时误敲 Enter 不应直接执行删除。 */}
+          <button type="button" className="sidebar-confirm-cancel" onClick={onCancel} autoFocus>
             取消
           </button>
           <button
             type="button"
             className={`sidebar-confirm-confirm${danger ? ' is-danger' : ''}`}
             onClick={onConfirm}
-            autoFocus
           >
             {confirmLabel}
           </button>
