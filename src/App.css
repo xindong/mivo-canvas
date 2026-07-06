@@ -8071,3 +8071,85 @@ button:disabled {
   color: var(--charcoal);
   outline: none;
 }
+
+/* --- Sidebar row wiring (Phase 4 / B9·B14) -------------------------------- */
+/* canvas-row: icon | title | time (3-col grid; time hidden while renaming).   */
+/* project-row-wrap: flex [project-row button][hover +].                       */
+
+.canvas-row-icon {
+  display: flex;
+  align-items: center;
+  opacity: 0.8;
+}
+
+.canvas-row-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.canvas-row-time {
+  color: #8a8278;
+  font-size: var(--text-xs);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.canvas-row.active .canvas-row-time {
+  color: rgba(255, 250, 240, 0.62);
+}
+
+.project-row-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.project-row-wrap .project-row {
+  flex: 1;
+  min-width: 0;
+}
+
+.project-row-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-row-tail {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.project-row-count {
+  color: #8a8278;
+  font-size: var(--text-xs);
+}
+
+.project-row-create {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  color: #554f48;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease-out;
+}
+
+.project-row-wrap:hover .project-row-create,
+.project-row-create:focus-visible {
+  opacity: 1;
+}
+
+.project-row-create:hover {
+  background: rgba(105, 87, 232, 0.14);
+  color: var(--violet);
+}
