@@ -26,8 +26,8 @@ const MENU_WIDTH = 224
 const ITEM_HEIGHT = 32
 const MENU_PADDING = 12
 // Submenu clamp estimates (kept in sync with .sidebar-context-menu-submenu CSS:
-// min-width 168 + margin 4; max-height 240).
-const SUBMENU_WIDTH = 172
+// max-width 240 + margin 4; max-height 240).
+const SUBMENU_WIDTH = 244
 const SUBMENU_MAX_HEIGHT = 240
 
 export function ContextMenu(props: {
