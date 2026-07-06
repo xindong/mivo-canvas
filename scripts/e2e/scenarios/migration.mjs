@@ -1,7 +1,7 @@
 import { installE2EStoreBridge, writePersistedKv } from '../harness.mjs'
 
 export const runMigrationScenario = async (context) => {
-  const { baseUrl, browser, generatedImageB64, isProdTopology, prodExtraHTTPHeaders } = context
+  const { browser, canvasUrl, generatedImageB64, isProdTopology, prodExtraHTTPHeaders, rendererMode } = context
 
   // ③ persist v1→v2 迁移（SC-6）：独立 browser context（不挂全局 localStorage.clear），
   // 注入 v1 结构（gemini + 21:9 override + 含 generationContext.imgRatio=21:9 的旧 error 消息），
@@ -84,10 +84,21 @@ export const runMigrationScenario = async (context) => {
         },
         version: 1,
       }
-      await migrationPage.goto(baseUrl, { waitUntil: 'networkidle' })
+      // 默认渲染器切 leafer 后,子页面不再依赖"无参数=dom":显式携带当前矩阵的
+      // renderer 参数,就绪信号按渲染器分流(dom 等 <img>,leafer 等真画证据)。
+      await migrationPage.goto(canvasUrl, { waitUntil: 'networkidle' })
       await writePersistedKv(migrationPage, 'mivo-chat-demo', JSON.stringify(v1State))
       await migrationPage.reload({ waitUntil: 'networkidle' })
-      await migrationPage.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
+      if (rendererMode === 'leafer') {
+        await migrationPage.waitForFunction(() => {
+          const shell = document.querySelector('.canvas-shell')
+          const expected = Number(shell?.getAttribute('data-leafer-expected-children') || 0)
+          const children = Number(shell?.getAttribute('data-leafer-children') || 0)
+          return expected > 0 && children === expected && shell?.getAttribute('data-leafer-pixel-nonempty') === 'true'
+        }, { timeout: 15000 })
+      } else {
+        await migrationPage.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
+      }
       const migrated = await migrationPage.evaluate(async () => {
         const resource = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('chatStore.ts'))
         const moduleSpec = resource ? new URL(resource).pathname + new URL(resource).search : '/src/store/chatStore.ts'
