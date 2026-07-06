@@ -344,8 +344,10 @@ export const createLeaferShapePaint = (leafer: Leafer): LeaferShapePaint => {
     }
 
     for (const node of shapeNodes) {
-      const kind = shouldUseEngineLod(node, ctx.viewport) ? 'lod-rect' : shapeKindFor(node) as ShapeEntryKind
-      const sig = paintSignatureFor(node, ctx)
+      // Greptile P2: shouldUseEngineLod 每节点每帧只算一次，kind 判定 + 签名复用。
+      const lod = shouldUseEngineLod(node, ctx.viewport)
+      const kind: ShapeEntryKind = lod ? 'lod-rect' : shapeKindFor(node) as ShapeEntryKind
+      const sig = paintSignatureFor(node, ctx, lod)
       const existing = entries.get(node.id)
 
       if (plan.created.has(node.id) || !existing) {

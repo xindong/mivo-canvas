@@ -119,4 +119,15 @@ describe('paintSignatureFor — 字段覆盖契约（漏字段 = 视觉漂移）
     const s2 = paintSignatureFor(node, ctx({ selectedNodeIds: new Set(['n1']) }))
     expect(s2).toBe(s1)
   })
+
+  it('precomputedLod 参数复用调用方已算的 lod（Greptile P2：避免每节点每帧算两次 shouldUseEngineLod）', () => {
+    const node = baseNode()
+    // engineLodMode 默认 off → 内部 shouldUseEngineLod 返回 false
+    const sigDefault = paintSignatureFor(node, ctx())
+    const sigFalse = paintSignatureFor(node, ctx(), false)
+    const sigTrue = paintSignatureFor(node, ctx(), true)
+    // 显式 false 与内部算（都 false）等价；显式 true 翻转 lod 字段 → 签名变。
+    expect(sigFalse).toBe(sigDefault)
+    expect(sigTrue).not.toBe(sigDefault)
+  })
 })

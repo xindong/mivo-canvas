@@ -386,7 +386,8 @@ export const createLeaferLinePaint = (leafer: Leafer): LeaferLinePaint => {
 
     for (const node of lineNodes) {
       const lod = shouldUseEngineLod(node, ctx.viewport)
-      const sig = paintSignatureFor(node, ctx)
+      // Greptile P2: lod 复用进签名，避免每节点每帧算两次 shouldUseEngineLod。
+      const sig = paintSignatureFor(node, ctx, lod)
       const existing = entries.get(node.id)
 
       if (plan.created.has(node.id) || !existing) {

@@ -49,7 +49,6 @@ import {
   type RendererSyncContext,
 } from './rendererAdapter'
 import { engineLodFillFor, shouldUseEngineLod } from './engineSpikeLod'
-import type { ViewportState } from './useLeaferSpikeRenderer'
 
 type ImageObject = Image | Group | Rect
 type ImageEntryKind = 'image' | 'image-crop' | 'lod-rect'
@@ -132,8 +131,10 @@ export const cropChildLocal = (
  *  spike sort image objects by the same layer value the DOM zIndex reads. */
 export const imageLayer = (): Layer => Layer.Content
 
-const desiredKindFor = (node: MivoCanvasNode, viewport: ViewportState): ImageEntryKind => {
-  if (shouldUseEngineLod(node, viewport)) return 'lod-rect'
+/** Greptile P2: 改为接收预计算的 lod（调用方在循环里算一次 shouldUseEngineLod，
+ *  kind 判定 + 签名复用，避免每节点每帧算两次）。 */
+const desiredKindFor = (node: MivoCanvasNode, lod: boolean): ImageEntryKind => {
+  if (lod) return 'lod-rect'
   return node.imageCrop ? 'image-crop' : 'image'
 }
 
@@ -296,11 +297,13 @@ export const createLeaferImagePaint = (leafer: Leafer): LeaferImagePaint => {
     }
 
     for (const node of nodes) {
+      // Greptile P2: shouldUseEngineLod 每节点每帧只算一次，desiredKind + 签名复用。
+      const lod = shouldUseEngineLod(node, ctx.viewport)
       const existing = entries.get(node.id)
-      const desired = desiredKindFor(node, ctx.viewport)
+      const desired = desiredKindFor(node, lod)
       const isNew = plan.created.has(node.id)
       const zIndex = ctx.layerOf?.(node.id)
-      const sig = paintSignatureFor(node, ctx)
+      const sig = paintSignatureFor(node, ctx, lod)
 
       if (isNew || !existing) {
         const { object, innerImage } = createObject(node, desired, zIndex)

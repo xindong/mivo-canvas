@@ -39,6 +39,13 @@ export const useEngineSpikeRenderers = ({
   // Memo 成 Set 给 filter 做 O(1) 命中；dep 选数组（store 稳定引用），Set 随之稳定，
   // 避免 renderedNodes useMemo 每次重跑触发 paint。
   const selectedNodeIdSet = useMemo(() => new Set(selectedNodeIds), [selectedNodeIds])
+  // Greptile P2（hook 顺序前移）：useLeaferSpikeRenderer 必须在 renderedNodes useMemo
+  // 之前调用——renderedNodes 依赖 effectiveRendererMode（line 53），而 effectiveRendererMode
+  // 依赖 leaferSpikeStats.fallbackToDom。若把 leafer 挪回 renderedNodes 之后，leafer init
+  // 失败时 renderedNodes 会用 stale（pixi-only）mode 过滤掉 leafer-painted 节点 → 白屏一帧，
+  // 违反 R1 SC"非白屏"。故此顺序是**数据依赖必需**，非可选项。
+  // HMR 安全：hook 顺序在每次 render 固定（5 个 hook 全非条件调用），正常 runtime 不会触发
+  // "fewer hooks"；Fast-Refresh 改文件时的瞬态告警 full reload 即恢复，生产无 HMR 不受影响。
   const leaferSpikeStats = useLeaferSpikeRenderer({
     hostRef,
     viewport,

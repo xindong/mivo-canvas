@@ -85,4 +85,11 @@ describe('rendererMode R-14 — 默认 leafer 渲染器身份 Debug Log', () => 
     expect(mod.debugLogger.log).toHaveBeenCalledTimes(1)
     expect(String(mod.debugLogger.log.mock.calls[0][1])).toContain('dom renderer requested')
   })
+
+  it('非浏览器环境（SSR/单测）不打身份 log（Greptile P2：避免污染未 mock debugLogger 的测试）', async () => {
+    const mod = await loadWithSearch(null)
+    expect(mod.rendererMode).toBe('leafer')
+    expect(mod.debugLogger.log).not.toHaveBeenCalled()
+    expect(mod.debugLogger.warn).not.toHaveBeenCalled()
+  })
 })

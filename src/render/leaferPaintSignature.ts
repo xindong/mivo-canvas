@@ -11,6 +11,10 @@ import { shouldUseEngineLod } from './engineSpikeLod'
  * 的并集。漏字段 = 该重画的不重画（视觉漂移），故此字段集是契约——
  * leaferPaintSignature.test.ts 锁定每个关键字段变更都能翻转签名。
  *
+ * `precomputedLod`：调用方若已在循环里算过 shouldUseEngineLod（用于 kind 判定），
+ * 传进来复用，避免每节点每帧算两次（Greptile P2）。未传则内部算（brush 模块
+ * 无 kind 判定、不另算 lod，走这条）。
+ *
  * 覆盖范围：
  *  - geometry：x/y/width/height/rotation（所有模块）
  *  - 显式 fills/strokes 数组：projectNode 优先用 node 自带的，sinkVisualDefaults
@@ -25,18 +29,19 @@ import { shouldUseEngineLod } from './engineSpikeLod'
  *    zIndex（ctx.layerOf，文档序变化时需重 set）、isEditing（line label 缺口）
  *
  * 性能：JSON.stringify ~35 字段/节点，1000 节点 ≈ 1-2ms（远小于省下的 999 次
- * projectNode+set 的开销，net 净赚）。type/marmarkupKind 等标量在签名对象里是
- * 稳定 key，JSON 序列化代价低。
+ * projectNode+set 的开销，net 净赚）。
  */
 export const paintSignatureFor = (
   node: MivoCanvasNode,
   ctx: RendererSyncContext,
-): string =>
-  JSON.stringify({
+  precomputedLod?: boolean,
+): string => {
+  const lod = precomputedLod ?? shouldUseEngineLod(node, ctx.viewport)
+  return JSON.stringify({
     type: node.type,
     // LOD boolean 捕获 viewport.scale 对 kind 切换的影响（HD 内部 scale 不影响输出，
     // 故无需把 scale 直接入签名；kind 切换由 lod 翻转体现）。
-    lod: shouldUseEngineLod(node, ctx.viewport),
+    lod,
     // geometry
     x: node.x,
     y: node.y,
@@ -78,3 +83,4 @@ export const paintSignatureFor = (
     zIndex: ctx.layerOf?.(node.id),
     isEditing: ctx.editingNodeId === node.id,
   })
+}

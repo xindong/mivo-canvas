@@ -25,8 +25,9 @@ const normalize = (raw: string): string => raw.trim().toLowerCase()
 
 const parseRendererModeFromUrl = (): RendererMode => {
   if (typeof window === 'undefined' || typeof window.location === 'undefined') {
-    // R-14: 非浏览器环境（SSR/单测）也走默认 leafer，记一条渲染器身份。
-    debugLogger.log('Renderer', `renderer identity: ${DEFAULT_MODE} (non-browser → default)`)
+    // 非浏览器环境（SSR/单测/Node）→ 默认 leafer，不打身份 log（Greptile P2）：
+    // 此路径在 module-load 时执行，Node/SSR 无渲染场景无需 renderer 身份日志，
+    // 且避免污染未 mock debugLogger 的测试。
     return DEFAULT_MODE
   }
 
