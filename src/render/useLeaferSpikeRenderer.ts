@@ -770,34 +770,34 @@ export const useLeaferSpikeRenderer = ({
     }
   }, [brushStampPaintedNodes, editingNodeId, hostRef, imagePaintedNodes, inlinePaintedNodes, leaferReady, linePaintedNodes, lodViewport, panCacheEnabled, paintedNodes, paintedNodeSignature, publishStats, rendererMode, shapePaintedNodes])
 
-  // R-06: 调试探针 window.__MIVO_LEAFER_SPIKE__ 仅在 DEV 暴露（生产构建不挂到 window，
-  // 避免泄漏内部 stats / 节点几何给第三方脚本，也省一条无用的 window 赋值副作用）。
+  // R-06: 调试探针 window.__MIVO_LEAFER_SPIKE__ 仅在 DEV 暴露。正向 DEV 分支让生产
+  // 构建里 `if (false) {...}` 整块被 tree-shake——effect body 为空，无 window 写、
+  // 无全局赋值副作用（反转写法 `if(!DEV){window=undefined;return}` 在生产是
+  // `if(true){...}` 仍执行 window=undefined 一次，违背"生产零 window 写"）。
   useEffect(() => {
-    if (!import.meta.env.DEV) {
-      window.__MIVO_LEAFER_SPIKE__ = undefined
-      return
-    }
-    window.__MIVO_LEAFER_SPIKE__ = {
-      getStats: () => statsRef.current,
-      getPaintedNodes: () => {
-        const shellRect = hostRef.current?.closest('.canvas-shell')?.getBoundingClientRect()
-        return Array.from(paintedRef.current.values()).map(({ node }) => ({
-          id: node.id,
-          type: node.type,
-          canvasRect: { x: node.x, y: node.y, width: node.width, height: node.height },
-          screenRect: {
-            left: (shellRect?.left || 0) + viewport.x + node.x * viewport.scale,
-            top: (shellRect?.top || 0) + viewport.y + node.y * viewport.scale,
-            right: (shellRect?.left || 0) + viewport.x + (node.x + node.width) * viewport.scale,
-            bottom: (shellRect?.top || 0) + viewport.y + (node.y + node.height) * viewport.scale,
-            width: node.width * viewport.scale,
-            height: node.height * viewport.scale,
-          },
-        }))
-      },
-    }
-    return () => {
-      window.__MIVO_LEAFER_SPIKE__ = undefined
+    if (import.meta.env.DEV) {
+      window.__MIVO_LEAFER_SPIKE__ = {
+        getStats: () => statsRef.current,
+        getPaintedNodes: () => {
+          const shellRect = hostRef.current?.closest('.canvas-shell')?.getBoundingClientRect()
+          return Array.from(paintedRef.current.values()).map(({ node }) => ({
+            id: node.id,
+            type: node.type,
+            canvasRect: { x: node.x, y: node.y, width: node.width, height: node.height },
+            screenRect: {
+              left: (shellRect?.left || 0) + viewport.x + node.x * viewport.scale,
+              top: (shellRect?.top || 0) + viewport.y + node.y * viewport.scale,
+              right: (shellRect?.left || 0) + viewport.x + (node.x + node.width) * viewport.scale,
+              bottom: (shellRect?.top || 0) + viewport.y + (node.y + node.height) * viewport.scale,
+              width: node.width * viewport.scale,
+              height: node.height * viewport.scale,
+            },
+          }))
+        },
+      }
+      return () => {
+        window.__MIVO_LEAFER_SPIKE__ = undefined
+      }
     }
   }, [hostRef, viewport.scale, viewport.x, viewport.y])
 

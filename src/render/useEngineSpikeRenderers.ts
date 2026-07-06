@@ -31,8 +31,10 @@ export const useEngineSpikeRenderers = ({
   selectedNodeIds: string[]
 }) => {
   const pixiSpikeStats = usePixiSpikeRenderer({ hostRef, viewport, nodes: visibleNodes, rendererMode })
-  // 第一段：仅看 pixi fallback，决定喂给 leafer 的 rendererMode（pixi 已失败时
-  // leafer 收到 'dom'，不 init Leafer 实例，避免无谓的失败重试）。
+  // 第一段：仅看 pixi fallback，决定喂给 leafer 的 rendererMode。pixi 失败时 leafer
+  // 收到 'dom'——注意 useLeaferSpikeRenderer 的 init effect 对 dom+leafer 都 init
+  // （空白 canvas，仅 'pixi' 早退），故这里不阻止 Leafer init，只是让 leafer 走 dom
+  // 分支不 paint、effectiveRendererMode 最终降到 dom 让 DOM 接管全部节点。
   const pixiEffectiveMode = computeEffectiveRendererMode(rendererMode, pixiSpikeStats.fallbackToDom, false)
   // Memo 成 Set 给 filter 做 O(1) 命中；dep 选数组（store 稳定引用），Set 随之稳定，
   // 避免 renderedNodes useMemo 每次重跑触发 paint。
