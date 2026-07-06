@@ -77,6 +77,7 @@ import { debugLogger } from '../store/debugLogStore'
 import { engineLodFillFor, shouldUseEngineLod } from './engineSpikeLod'
 import { isLeaferLinePaintedNode } from './leaferSpikeFilter'
 import { projectNode, type RenderNode } from './projection'
+import { paintSignatureFor } from './leaferPaintSignature'
 import { dashPatternFor } from './leaferShapePaint'
 import {
   diffReconcilePlan,
@@ -96,6 +97,8 @@ type LineEntry = {
   second: Line | null
   startHead: Line | null
   endHead: Line | null
+  /** PR-R2 per-node 签名：未变 → 跳过 projectNode + set。 */
+  signature: string
 }
 
 export type LeaferLinePaint = {
@@ -318,7 +321,7 @@ export const createLeaferLinePaint = (leafer: Leafer): LeaferLinePaint => {
     entry.object.remove()
   }
 
-  const buildEntry = (nodeId: string, props: LinePaintProps): LineEntry => {
+  const buildEntry = (nodeId: string, props: LinePaintProps, signature: string): LineEntry => {
     const group = new Group(props.group)
     const main = new Line(props.main)
     group.add(main)
@@ -331,13 +334,23 @@ export const createLeaferLinePaint = (leafer: Leafer): LeaferLinePaint => {
     if (startHead) group.add(startHead)
     const endHead = props.endHead ? new Line(props.endHead) : null
     if (endHead) group.add(endHead)
-    return { nodeId, kind: 'line', object: group, group, main, second, startHead, endHead }
+    return { nodeId, kind: 'line', object: group, group, main, second, startHead, endHead, signature }
   }
 
-  const buildLodEntry = (nodeId: string, props: Record<string, unknown>): LineEntry => {
+  const buildLodEntry = (nodeId: string, props: Record<string, unknown>, signature: string): LineEntry => {
     const object = new Rect(props)
-    return { nodeId, kind: 'lod-rect', object, group: null, main: null, second: null, startHead: null, endHead: null }
+    return { nodeId, kind: 'lod-rect', object, group: null, main: null, second: null, startHead: null, endHead: null, signature }
   }
+
+  /** PR-R2: props 解析惰性化——仅在 create/kind-swap/signature 变化时调用 projectNode。 */
+  const linePropsForNode = (
+    node: MivoCanvasNode,
+    lod: boolean,
+    ctx: RendererSyncContext,
+  ): LinePaintProps | Record<string, unknown> =>
+    lod
+      ? lineLodPaintPropsFor(node, ctx.layerOf?.(node.id))
+      : linePaintPropsFor(projectNode(node), ctx.layerOf?.(node.id), ctx.editingNodeId)
 
   const sync: LeaferLinePaint['sync'] = (nodes, ctx) => {
     // Defensive: the leaferSpikeFilter predicate guarantees only line/arrow
@@ -373,13 +386,12 @@ export const createLeaferLinePaint = (leafer: Leafer): LeaferLinePaint => {
 
     for (const node of lineNodes) {
       const lod = shouldUseEngineLod(node, ctx.viewport)
-      const props = lod
-        ? lineLodPaintPropsFor(node, ctx.layerOf?.(node.id))
-        : linePaintPropsFor(projectNode(node), ctx.layerOf?.(node.id), ctx.editingNodeId)
+      const sig = paintSignatureFor(node, ctx)
       const existing = entries.get(node.id)
 
       if (plan.created.has(node.id) || !existing) {
-        const entry = lod ? buildLodEntry(node.id, props as Record<string, unknown>) : buildEntry(node.id, props as LinePaintProps)
+        const props = linePropsForNode(node, lod, ctx)
+        const entry = lod ? buildLodEntry(node.id, props as Record<string, unknown>, sig) : buildEntry(node.id, props as LinePaintProps, sig)
         entries.set(node.id, entry)
         leafer.add(entry.object)
         created += 1
@@ -387,16 +399,28 @@ export const createLeaferLinePaint = (leafer: Leafer): LeaferLinePaint => {
       }
 
       if ((lod && existing.kind !== 'lod-rect') || (!lod && existing.kind !== 'line')) {
+        // LOD↔HD kind swap：destroy + recreate（projectNode 需要重算）。
+        const props = linePropsForNode(node, lod, ctx)
         destroyEntry(existing)
-        const entry = lod ? buildLodEntry(node.id, props as Record<string, unknown>) : buildEntry(node.id, props as LinePaintProps)
+        const entry = lod ? buildLodEntry(node.id, props as Record<string, unknown>, sig) : buildEntry(node.id, props as LinePaintProps, sig)
         entries.set(node.id, entry)
         leafer.add(entry.object)
         updated += 1
         continue
       }
 
+      if (existing.signature === sig) {
+        // signature 未变 → 跳过 projectNode + set（R-03b）。
+        updated += 1
+        continue
+      }
+
+      // signature 变了 → 重算 props（projectNode）+ set/reconcile。
+      const props = linePropsForNode(node, lod, ctx)
+
       if (lod) {
         setProps(existing.object, props as Record<string, unknown>)
+        existing.signature = sig
         updated += 1
         continue
       }
@@ -405,9 +429,11 @@ export const createLeaferLinePaint = (leafer: Leafer): LeaferLinePaint => {
 
       // FU-11: 缺口从无到有（或反向）会改变 Group 子对象拓扑——直接重建，
       // 保证"线体在前、箭头头在后"的绘制顺序（否则后 add 的线体会盖住头）。
+      // second-presence 翻转必伴随 signature 翻转（text/editingNodeId 入签名），
+      // 故此处只在 signature 已变时检查。
       if (Boolean(lineProps.second) !== Boolean(existing.second)) {
         destroyEntry(existing)
-        const entry = buildEntry(node.id, lineProps)
+        const entry = buildEntry(node.id, lineProps, sig)
         entries.set(node.id, entry)
         leafer.add(entry.object)
         updated += 1
@@ -417,7 +443,7 @@ export const createLeaferLinePaint = (leafer: Leafer): LeaferLinePaint => {
       if (!existing.group || !existing.main) {
         debugLogger.warn(SOURCE, `line entry ${node.id} missing group/main during HD update — rebuilding`)
         destroyEntry(existing)
-        const entry = buildEntry(node.id, lineProps)
+        const entry = buildEntry(node.id, lineProps, sig)
         entries.set(node.id, entry)
         leafer.add(entry.object)
         updated += 1
@@ -429,6 +455,7 @@ export const createLeaferLinePaint = (leafer: Leafer): LeaferLinePaint => {
       existing.second = reconcileHead(existing.group, existing.second, lineProps.second)
       existing.startHead = reconcileHead(existing.group, existing.startHead, lineProps.startHead)
       existing.endHead = reconcileHead(existing.group, existing.endHead, lineProps.endHead)
+      existing.signature = sig
       updated += 1
     }
 
