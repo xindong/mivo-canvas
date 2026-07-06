@@ -7,9 +7,9 @@
 //
 // 运行时循环注意：本模块 import useChatStore（runtime），chatStore 反向 import cancelMaskEditMessage
 // （runtime）—— ESM live binding，双方只在函数体内访问对方导出，不在模块加载期访问，无 TDZ。
-import type { ChatGenerationContext, ChatMessage } from './chatStore'
+import type { ChatGenerationContext, ChatMessage, ChatMessageErrorKind } from './chatStore'
 import type { EnhanceResponse, MivoImageQuality, MivoImageRatio } from '../types/generation'
-import type { MivoCanvasNode } from '../types/mivoCanvas'
+import type { MivoCanvasNode, MivoCanvasSnapshot } from '../types/mivoCanvas'
 import type { ImageMaskSubmitPayload } from '../canvas/imageMaskGeometry'
 import { useChatStore } from './chatStore'
 import { useCanvasStore } from './canvasStore'
@@ -184,9 +184,9 @@ export const failMaskEditMessage = (args: {
   messageId: string
   canceled: boolean
   error: string
-  errorKind?: string
+  errorKind?: ChatMessageErrorKind
   slotId: string
-  baselineSnapshot?: unknown
+  baselineSnapshot?: MivoCanvasSnapshot
   sourceTitle?: string
   sourceNodeId?: string
 }): void => {
@@ -194,7 +194,7 @@ export const failMaskEditMessage = (args: {
     canceled: args.canceled,
     error: args.error,
     sourceTitle: args.sourceTitle,
-    baselineSnapshot: args.baselineSnapshot as never,
+    baselineSnapshot: args.baselineSnapshot,
   })
   // edit-timeout-batch: 区分 client-timeout/upstream-timeout（可重试）vs canceled（不可重试）vs 其他。
   const isTimeout = !args.canceled && (args.errorKind === 'upstream-timeout' || args.errorKind === 'client-timeout')
@@ -218,7 +218,7 @@ export const failMaskEditMessage = (args: {
     ...m,
     status: 'error' as const,
     error: errorMessage,
-    errorKind: (args.canceled ? 'canceled' : args.errorKind || 'unknown') as never,
+    errorKind: args.canceled ? 'canceled' : args.errorKind || 'unknown',
     timeoutRetryKey: undefined,
     timeoutRetryCount: undefined,
     retryDisabledReason,
@@ -347,7 +347,7 @@ export const cancelMaskEditMessage = (sceneId: string, messageId: string): void 
     ...m,
     status: 'error' as const,
     error: canceledGenerationMessage,
-    errorKind: 'canceled' as never,
+    errorKind: 'canceled',
     timeoutRetryKey: undefined,
     timeoutRetryCount: undefined,
     retryDisabledReason: maskEditRetryDisabledReason,

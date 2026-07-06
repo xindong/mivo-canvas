@@ -9,6 +9,7 @@ import { settleCanvasGenerationLocally } from './canvasGenerationCancel'
 import { fallbackCancelTarget, settleExpiredChatMessages } from './chatGenerationHydration'
 import { resolveChatEnhance, enhanceForGeneration, historyForEnhance, trimSceneMessages } from './chatEnhanceFlow'
 import { cancelMaskEditMessage } from './chatMaskEditFlow'
+import { buildBusyDropMessages } from './chatBusyDrop'
 import { debugLogger } from './debugLogStore'
 import { generationFacade } from './generationFacade'
 import { clampChatGenerationContext, migrateChatPersistedState, sanitizeEnhanceDegradedReason } from './chatStoreMigrate'
@@ -225,7 +226,39 @@ export const useChatStore = create<ChatState>()(
           }))
           return
         }
-        if (get().isBusy) return
+        if (get().isBusy) {
+          // S01: 参考图已落 IDB，此刻另一生成在飞——直接 return 会丢弃用户输入并产生
+          // 孤儿参考图（保存的 assetUrl 无任何消息引用）。落失败态 user+assistant 消息：
+          // generationContext.referenceAssetUrls 引用已保存参考图，retry 可重放消费；
+          // 不设 retryDisabledReason（isBusy 瞬时，另一生成结束后 Retry 可用）。
+          // 构造逻辑抽到 chatBusyDrop.ts（保持本文件 ≤833 行红线，参考 chatEnhanceFlow
+          // 先例）；finalPrompt=text 固化在该模块内，retry 用对 prompt。
+          debugLogger.warn(
+            'Chat Store',
+            'sendMessage dropped: another generation is in flight, preserving input as a failed message',
+          )
+          const { userMessage: droppedUserMessage, assistantMessage: droppedAssistantMessage } =
+            buildBusyDropMessages({
+              text,
+              selectedNodeId,
+              selectedNodeType,
+              referenceAssetUrls,
+              model: selectedModel,
+              requestedImgRatio: paramOverrides.imgRatio,
+              requestedQuality: paramOverrides.quality,
+            })
+          set((s) => ({
+            messagesByScene: {
+              ...s.messagesByScene,
+              [sceneId]: trimSceneMessages([
+                ...(s.messagesByScene[sceneId] || []),
+                droppedUserMessage,
+                droppedAssistantMessage,
+              ]),
+            },
+          }))
+          return
+        }
 
         const abortController = new AbortController()
         activeChatAbortController = abortController
@@ -491,7 +524,16 @@ export const useChatStore = create<ChatState>()(
           return
         }
 
-        if (get().isBusy) return
+        if (get().isBusy) {
+          // S01: retry 入口此刻另一生成在飞。targetMsg 仍是 error 态、用户输入仍在
+          // messagesByScene；referenceFiles 是从 IDB 临时读出未消费，asset 未删，无孤儿。
+          // 仅 warn 后 return，用户可待当前生成结束后再次点 Retry。
+          debugLogger.warn(
+            'Chat Store',
+            `retryMessage dropped for ${messageId}: another generation is in flight`,
+          )
+          return
+        }
         const abortController = new AbortController()
         activeChatAbortController = abortController
         let context = baseContext
