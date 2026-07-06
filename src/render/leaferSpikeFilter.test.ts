@@ -5,6 +5,7 @@ import {
   needsFrameTitleShell,
   needsImageSelectionShell,
   needsMarkupTextShell,
+  needsStampSelectionShell,
 } from './leaferSpikeFilter'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 
@@ -147,6 +148,16 @@ describe('filterDomNodesForRendererSpike — FU-11 文字壳放行', () => {
     // dom 模式：selectedNodeIds 不影响（原样返回）
     expect(filterDomNodesForRendererSpike(all, 'dom', { selectedNodeIds: selectedIds })).toEqual(all)
   })
+
+  it('leafer 模式 + 选中 stamp：选中 stamp 放行纯选中壳，未选中 stamp 仍过滤', () => {
+    const selectedIds = new Set(['bt'])
+    expect(
+      filterDomNodesForRendererSpike(all, 'leafer', { selectedNodeIds: selectedIds }).map((n) => n.id),
+    ).toEqual(['rt', 'nt', 'at', 'bt', 'tx', 'ft'])
+    expect(
+      filterDomNodesForRendererSpike(all, 'leafer', { selectedNodeIds: new Set(['other']) }).map((n) => n.id),
+    ).toEqual(['rt', 'nt', 'at', 'tx', 'ft'])
+  })
 })
 
 describe('needsImageSelectionShell — image 选中壳判定', () => {
@@ -161,5 +172,22 @@ describe('needsImageSelectionShell — image 选中壳判定', () => {
 
   it('非 image 节点即使选中也不产生选中壳（markup 走文字壳/frame 走标题壳）', () => {
     expect(needsImageSelectionShell(rect, { selectedNodeIds: new Set(['rt']) })).toBe(false)
+  })
+})
+
+describe('needsStampSelectionShell — stamp 选中壳判定', () => {
+  const stamp = node({ id: 'stamp', markupKind: 'stamp' })
+  const rect = node({ id: 'rt', text: '标注' })
+  const image = node({ id: 'img', type: 'image', markupKind: undefined })
+
+  it('选中 stamp → 需要壳；未选中 stamp → 不需要', () => {
+    expect(needsStampSelectionShell(stamp, { selectedNodeIds: new Set(['stamp']) })).toBe(true)
+    expect(needsStampSelectionShell(stamp, { selectedNodeIds: new Set(['other']) })).toBe(false)
+    expect(needsStampSelectionShell(stamp, {})).toBe(false)
+  })
+
+  it('非 stamp 节点即使选中也不产生 stamp 选中壳', () => {
+    expect(needsStampSelectionShell(rect, { selectedNodeIds: new Set(['rt']) })).toBe(false)
+    expect(needsStampSelectionShell(image, { selectedNodeIds: new Set(['img']) })).toBe(false)
   })
 })

@@ -26,8 +26,8 @@ export const useEngineSpikeRenderers = ({
   /** MivoCanvas editingTextNodeId —— FU-11 markup 文字壳在编辑空文字时也保留。 */
   editingNodeId?: string
   /** 选中的节点 id 数组（MivoCanvas store 的 selectedNodeIds）—— leafer 模式下
-   *  选中 image 保留纯选中 DOM 壳（外框 + resize handle），否则选中态外框随
-   *  DOM 壳被过滤掉。hook 内 memo 成 Set 给 filter 做 O(1) 命中。 */
+   *  选中 image/stamp 保留纯选中 DOM 壳（外框 + resize handle），否则选中态
+   *  外框随 DOM 壳被过滤掉。hook 内 memo 成 Set 给 filter 做 O(1) 命中。 */
   selectedNodeIds: string[]
 }) => {
   const pixiSpikeStats = usePixiSpikeRenderer({ hostRef, viewport, nodes: visibleNodes, rendererMode })

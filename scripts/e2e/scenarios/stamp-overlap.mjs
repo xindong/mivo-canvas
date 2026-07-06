@@ -13,6 +13,9 @@
  *      不是 image)。这是"点击目标与视觉一致"的行为证据;视觉 z-order 由
  *      hitTest.test.ts 的 defaultZOrderCompare(renderOrder 先于 selected)+ leafer
  *      z-order map 的 renderOrder 子带单测锁定。
+ * 3. leafer stamp 选中壳 + 等比 resize:选中 stamp 后必须出现 DOM-only selected
+ *    shell(本体仍由 Leafer Group 画),outline 命中,且只暴露 4 个角 handle;拖角后
+ *    store 几何保持 width===height。
  *
  * 两模式都跑(renderer=both)。不依赖 `__MIVO_LEAFER_SPIKE__.getPaintedNodes`
  * (它只覆盖 inline 文本,看不到 brushStamp 私有 entries —— 见 D6)。
@@ -89,6 +92,72 @@ const stampCount = async (page) => {
     const { useCanvasStore } = await import(moduleSpec)
     return useCanvasStore.getState().nodes.filter((node) => node.type === 'markup' && node.markupKind === 'stamp').length
   }, spec)
+}
+
+const readStampNode = async (page, nodeId) => {
+  const spec = await canvasStoreSpec(page)
+  return page.evaluate(async ([moduleSpec, id]) => {
+    const { useCanvasStore } = await import(moduleSpec)
+    const node = useCanvasStore.getState().nodes.find((n) => n.id === id)
+    if (!node) return null
+    return {
+      id: node.id,
+      type: node.type,
+      markupKind: node.markupKind,
+      x: node.x,
+      y: node.y,
+      width: node.width,
+      height: node.height,
+    }
+  }, [spec, nodeId])
+}
+
+const assertLeaferStampSelectionShell = async (page, stampId) => {
+  await page.waitForFunction((id) => {
+    const shell = Array.from(document.querySelectorAll('.dom-node.stamp-node.selected'))
+      .find((node) => node.getAttribute('data-node-id') === id)
+    return Boolean(shell)
+  }, stampId, { timeout: 5000 })
+
+  const evidence = await page.evaluate((id) => {
+    const shell = Array.from(document.querySelectorAll('.dom-node.stamp-node.selected'))
+      .find((node) => node.getAttribute('data-node-id') === id)
+    if (!shell) return null
+    const style = getComputedStyle(shell)
+    const handles = Array.from(shell.querySelectorAll('.node-handle'))
+      .map((handle) => Array.from(handle.classList).filter((entry) => entry !== 'node-handle').sort().join(' '))
+      .sort()
+    return {
+      className: shell.className,
+      outlineStyle: style.outlineStyle,
+      outlineWidth: style.outlineWidth,
+      outlineColor: style.outlineColor,
+      boxShadow: style.boxShadow,
+      handles,
+      textHandles: shell.querySelectorAll('.text-resize-handle').length,
+      pointHandles: shell.querySelectorAll('.markup-point-handle').length,
+      stickerBody: shell.querySelectorAll('.dom-markup-stamp, img').length,
+    }
+  }, stampId)
+
+  if (!evidence) throw new Error(`stamp-overlap: leafer selected stamp shell missing for ${stampId}`)
+  if (evidence.outlineStyle === 'none' || evidence.outlineWidth === '0px') {
+    throw new Error(`stamp-overlap: selected stamp shell outline missing: ${JSON.stringify(evidence)}`)
+  }
+  if (evidence.stickerBody !== 0) {
+    throw new Error(`stamp-overlap: leafer selected stamp shell must not render DOM sticker body: ${JSON.stringify(evidence)}`)
+  }
+  const expectedHandles = ['ne', 'nw', 'se', 'sw']
+  if (JSON.stringify(evidence.handles) !== JSON.stringify(expectedHandles)) {
+    throw new Error(`stamp-overlap: selected stamp should expose only corner handles: ${JSON.stringify(evidence)}`)
+  }
+  if (evidence.textHandles !== 0 || evidence.pointHandles !== 0) {
+    throw new Error(`stamp-overlap: selected stamp should not expose side/text/point handles: ${JSON.stringify(evidence)}`)
+  }
+
+  console.log(
+    `[stamp-overlap] leafer stamp selected shell ok: outline=${evidence.outlineWidth} ${evidence.outlineStyle} handles=${evidence.handles.join(',')}`,
+  )
 }
 
 export const runStampOverlapScenario = async (context) => {
@@ -190,5 +259,39 @@ export const runStampOverlapScenario = async (context) => {
     if (!isStamp) {
       throw new Error(`stamp-overlap: leafer hit-test 期望命中 stamp,实际 selectedNodeId=${selectedId}`)
     }
+    await assertLeaferStampSelectionShell(page, selectedId)
+
+    const beforeResize = await readStampNode(page, selectedId)
+    if (!beforeResize) throw new Error(`stamp-overlap: missing selected stamp before resize (${selectedId})`)
+    const handle = await page.locator(`.dom-node.stamp-node.selected[data-node-id="${selectedId}"] .node-handle.se`).boundingBox()
+    if (!handle) throw new Error(`stamp-overlap: missing selected stamp se resize handle (${selectedId})`)
+    const startX = handle.x + handle.width / 2
+    const startY = handle.y + handle.height / 2
+    await page.mouse.move(startX, startY)
+    await page.mouse.down()
+    await page.mouse.move(startX + 60, startY + 25, { steps: 6 })
+    await page.mouse.up()
+    await page.waitForFunction(
+      async ([moduleSpec, id, beforeWidth]) => {
+        const { useCanvasStore } = await import(moduleSpec)
+        const node = useCanvasStore.getState().nodes.find((n) => n.id === id)
+        return Boolean(
+          node &&
+          node.type === 'markup' &&
+          node.markupKind === 'stamp' &&
+          Math.abs(node.width - node.height) < 0.001 &&
+          node.width > beforeWidth + 20,
+        )
+      },
+      [spec, selectedId, beforeResize.width],
+      { timeout: 5000 },
+    )
+    const afterResize = await readStampNode(page, selectedId)
+    if (!afterResize || Math.abs(afterResize.width - afterResize.height) > 0.001) {
+      throw new Error(`stamp-overlap: stamp resize should stay square, before=${JSON.stringify(beforeResize)} after=${JSON.stringify(afterResize)}`)
+    }
+    console.log(
+      `[stamp-overlap] leafer stamp corner resize kept square: ${beforeResize.width}x${beforeResize.height} -> ${afterResize.width}x${afterResize.height}`,
+    )
   }
 }

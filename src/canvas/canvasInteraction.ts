@@ -547,6 +547,40 @@ export const resizeNodeTransform = (
   const east = state.corner.endsWith('e')
   const south = state.corner.startsWith('s')
 
+  if (node.type === 'markup' && node.markupKind === 'stamp') {
+    const widthFromX = state.startWidth + (east ? dx : -dx)
+    const heightFromY = state.startHeight + (south ? dy : -dy)
+    const rawSize =
+      Math.abs(widthFromX - state.startWidth) > Math.abs(heightFromY - state.startHeight)
+        ? widthFromX
+        : heightFromY
+    const size = Math.max(minMarkupWidth, rawSize)
+
+    if (centered) {
+      return {
+        x: state.startX + (state.startWidth - size) / 2,
+        y: state.startY + (state.startHeight - size) / 2,
+        width: size,
+        height: size,
+        guides: [],
+      }
+    }
+
+    const fixedX = east ? state.startX : state.startX + state.startWidth
+    const fixedY = south ? state.startY : state.startY + state.startHeight
+    const nextRect = {
+      x: east ? fixedX : fixedX - size,
+      y: south ? fixedY : fixedY - size,
+      width: size,
+      height: size,
+    }
+
+    return getSnappedResize(node, nodes, nextRect, state.corner, 1, fixedX, fixedY, {
+      minWidth: minMarkupWidth,
+      maxWidth: Number.POSITIVE_INFINITY,
+    })
+  }
+
   if (node.type === 'frame' || node.type === 'markup') {
     const nextWidthRaw = state.startWidth + (east ? dx : -dx)
     const nextHeightRaw = state.startHeight + (south ? dy : -dy)
