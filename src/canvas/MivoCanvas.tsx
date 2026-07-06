@@ -197,8 +197,12 @@ export function MivoCanvas({
     cullingMode, visibleNodes, shellSize, viewport, selectedNodeId, selectedNodeIds,
     cropNodeId, maskEditNodeId, contextMenuNodeId,
   })
+  // leafer 模式下选中 image 需要保留纯选中 DOM 壳（外框 + handle）；用 Set 给
+  // filter 做 O(1) 命中，memo 化避免每次 render 新引用触发 paint useMemo 重跑。
+  const selectedNodeIdSet = useMemo(() => new Set(selectedNodeIds), [selectedNodeIds])
   const { renderedNodes, engineSpikeDataAttrs } = useEngineSpikeRenderers({
     hostRef, viewport, visibleNodes, canvasRenderedNodes, isPanning, editingNodeId: editingTextNodeId,
+    selectedNodeIds: selectedNodeIdSet,
   })
 
   const openNodeContextMenu = useCallback(

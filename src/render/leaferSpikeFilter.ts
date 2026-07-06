@@ -91,6 +91,11 @@ export type MarkupTextShellOptions = {
   viewportScale?: number
   lodRequested?: boolean
   lodThresholdPx?: number
+  /** 选中的节点 id 集合。leafer 模式下被 Leafer 真画的 image 节点选中时，
+   *  保留一个"纯选中 DOM 壳"承载 .dom-node.selected 外框 + resize handles
+   *  （image 本体仍由 leaferImagePaint 真画，DOM 壳不画 <img>）。未选中 image
+   *  不产生空壳（虚拟化省下的 DOM 不加回来）。 */
+  selectedNodeIds?: ReadonlySet<string>
 }
 
 /** 拥有 MarkupTextLayer 的 Leafer 真画集：stamp 以外的全部 markup——
@@ -132,10 +137,21 @@ export const needsFrameTitleShell = (
   return passesTextShellLod(node, options)
 }
 
+/** leafer 模式下 image 节点选中时保留"纯选中 DOM 壳"。image 本体由
+ *  leaferImagePaint 真画，DOM 壳不画 <img>，只承载 .dom-node.selected 的
+ *  outline/box-shadow + primarySelected 时的 4 角 resize handle——否则 leafer
+ *  模式下点选 image 选中态外框会随 DOM 壳一起被过滤掉（次级工具条独立定位
+ *  仍显示，故表现为"只丢外框"）。未选中 image 不产生空壳。 */
+export const needsImageSelectionShell = (
+  node: MivoCanvasNode,
+  options: MarkupTextShellOptions = {},
+): boolean => node.type === 'image' && Boolean(options.selectedNodeIds?.has(node.id))
+
 /**
  * leafer 模式下从 DOM 渲染列表里剔除已被 Leafer 画的节点；FU-11 起对需要
  * 文字层的 markup 节点放行（CanvasNodeView 渲染纯文字壳），FU-12 起对标题
- * 可见的 frame 放行（纯标题壳）。dom 模式原样返回（默认行为零变化）。
+ * 可见的 frame 放行（纯标题壳），image 选中时放行纯选中壳（外框 + handle）。
+ * dom 模式原样返回（默认行为零变化）。
  */
 export const filterDomNodesForRendererSpike = (
   nodes: MivoCanvasNode[],
@@ -147,7 +163,8 @@ export const filterDomNodesForRendererSpike = (
         (node) =>
           !isLeaferDomFiltered(node) ||
           needsMarkupTextShell(node, textShellOptions) ||
-          needsFrameTitleShell(node, textShellOptions),
+          needsFrameTitleShell(node, textShellOptions) ||
+          needsImageSelectionShell(node, textShellOptions),
       )
     : rendererMode === 'pixi'
       ? nodes.filter((node) => !isPixiSpikePainted(node))

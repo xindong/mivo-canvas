@@ -15,6 +15,7 @@ export const useEngineSpikeRenderers = ({
   canvasRenderedNodes,
   isPanning,
   editingNodeId,
+  selectedNodeIds,
 }: {
   hostRef: MutableRefObject<HTMLDivElement | null>
   viewport: ViewportState
@@ -23,6 +24,9 @@ export const useEngineSpikeRenderers = ({
   isPanning: boolean
   /** MivoCanvas editingTextNodeId —— FU-11 markup 文字壳在编辑空文字时也保留。 */
   editingNodeId?: string
+  /** 选中的节点 id 集合 —— leafer 模式下选中 image 保留纯选中 DOM 壳
+   *  （外框 + resize handle），否则选中态外框随 DOM 壳被过滤掉。 */
+  selectedNodeIds: ReadonlySet<string>
 }) => {
   const pixiSpikeStats = usePixiSpikeRenderer({ hostRef, viewport, nodes: visibleNodes, rendererMode })
   const effectiveRendererMode = pixiSpikeStats.fallbackToDom ? 'dom' : rendererMode
@@ -31,8 +35,9 @@ export const useEngineSpikeRenderers = ({
       filterDomNodesForRendererSpike(canvasRenderedNodes, effectiveRendererMode, {
         editingNodeId,
         viewportScale: viewport.scale,
+        selectedNodeIds,
       }),
-    [canvasRenderedNodes, editingNodeId, effectiveRendererMode, viewport.scale],
+    [canvasRenderedNodes, editingNodeId, effectiveRendererMode, viewport.scale, selectedNodeIds],
   )
   // FU-11 可观测性：文字壳数量变化时记一条 Debug Log（数量不变不重复刷）。
   const textShellCountRef = useRef(0)
