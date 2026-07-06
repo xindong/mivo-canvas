@@ -137,12 +137,13 @@ beforeEach(() => {
 
 // Tests -----------------------------------------------------------------------
 
-describe('contract: canvas persist v9 shape (partialize field set)', () => {
+describe('contract: canvas persist v10 shape (partialize field set)', () => {
   const expectedFields = [
     'activeStampKind',
     'activeTool',
     'brushStyle',
     'canvases',
+    'projects',
     'sceneId',
     'selectedNodeId',
     'selectedNodeIds',
@@ -151,7 +152,7 @@ describe('contract: canvas persist v9 shape (partialize field set)', () => {
   it('pins the persist name and version', () => {
     const opts = useCanvasStore.persist.getOptions()
     expect(opts.name).toBe('mivo-canvas-demo')
-    expect(opts.version).toBe(9)
+    expect(opts.version).toBe(10)
   })
 
   it('pins the migrate function reference (A2 must not silently swap migrators)', () => {
@@ -180,7 +181,7 @@ describe('contract: canvas persist v9 shape (partialize field set)', () => {
     const raw = (globalThis as { localStorage: { getItem: (k: string) => string | null } }).localStorage.getItem('mivo-canvas-demo')
     expect(raw).not.toBeNull()
     const parsed = JSON.parse(raw!) as { state: Record<string, unknown>; version: number }
-    expect(parsed.version).toBe(9)
+    expect(parsed.version).toBe(10)
     expect(Object.keys(parsed.state).sort()).toEqual(expectedFields)
     expect(parsed.state.activeTool).toBe('brush')
   })

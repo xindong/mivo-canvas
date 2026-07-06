@@ -8,6 +8,7 @@ import type {
   CanvasEdge,
   CanvasId,
   CanvasDocument,
+  CanvasProject,
   CanvasTask,
   BrushToolMode,
   CanvasStampKind,
@@ -41,6 +42,7 @@ import { createNodeMutationSlice } from './nodeMutationSlice'
 import { createNodeCreationSlice } from './nodeCreationSlice'
 import { createGenerationSlice } from './generationSlice'
 import { createSelectionSlice } from './selectionSlice'
+import { createProjectsSlice } from './projectsSlice'
 import { migratePersistedState } from './canvasGenerationHydration'
 
 type LayerMove = 'forward' | 'backward' | 'front' | 'back'
@@ -64,6 +66,7 @@ export type BrushStyle = {
 
 export type CanvasState = {
   canvases: Record<CanvasId, CanvasDocument>
+  projects: CanvasProject[]
   nodes: MivoCanvasNode[]
   edges: CanvasEdge[]
   tasks: CanvasTask[]
@@ -79,6 +82,10 @@ export type CanvasState = {
   lastPlacedStampId: string | undefined
   historyPast: MivoCanvasSnapshot[]
   historyFuture: MivoCanvasSnapshot[]
+  createProject: (name?: string) => string
+  renameProject: (projectId: string, name: string) => void
+  deleteProject: (projectId: string) => void
+  moveCanvasToProject: (canvasId: CanvasId, projectId?: string) => void
   createCanvas: (title?: string, options?: { projectId?: string; templateId?: DemoSceneId }) => CanvasId
   duplicateCanvas: (canvasId?: CanvasId) => CanvasId | undefined
   deleteCanvas: (canvasId?: CanvasId) => void
@@ -309,6 +316,7 @@ export type SliceCreator = (
 export const useCanvasStore = create<CanvasState>()(
   persist(
     (set, get) => ({
+      ...createProjectsSlice(set, get),
       ...createDocumentSlice(set, get),
       ...createNodeMutationSlice(set, get),
       ...createNodeCreationSlice(set, get),

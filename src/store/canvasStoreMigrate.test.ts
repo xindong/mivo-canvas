@@ -420,3 +420,112 @@ describe('v9 preset task restoration (persistedVersion < 9)', () => {
     expect(task.preset).toBe(true)
   })
 })
+
+// SC-6 / Phase 1 (C3 / C12): v9 → v10 migration. Introduces the `projects` field,
+// backfills createdAt/updatedAt on every canvas (defensive — normalizeDocument
+// handles missing timestamps at all versions), and clears orphan projectIds
+// (projectId pointing to a project not in the projects list). At v<10 projects is
+// necessarily empty, so every canvas with a projectId is treated as an orphan.
+describe('v10 migration (persistedVersion < 10): projects + timestamps + orphan cleanup', () => {
+  it('defaults projects to [] when missing', () => {
+    const result = migratePersistedState(
+      {
+        sceneId: 'character-flow',
+        canvases: {
+          'character-flow': { title: 'C', nodes: [], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] },
+        },
+      } as never,
+      9,
+    )
+
+    expect(result.projects).toEqual([])
+  })
+
+  it('backfills createdAt/updatedAt on every canvas missing timestamps', () => {
+    const before = Date.now()
+    const result = migratePersistedState(
+      {
+        sceneId: 'c1',
+        canvases: {
+          c1: { title: 'C1', nodes: [], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] },
+          c2: { title: 'C2', nodes: [], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] },
+        },
+      } as never,
+      9,
+    )
+    const after = Date.now()
+
+    for (const id of ['c1', 'c2']) {
+      const doc = result.canvases[id]
+      expect(doc.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/)
+      expect(doc.updatedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/)
+      const ms = Date.parse(doc.updatedAt)
+      expect(ms >= before).toBe(true)
+      expect(ms <= after).toBe(true)
+    }
+  })
+
+  it('clears orphan projectIds at v9 (projects is empty → every projectId is an orphan)', () => {
+    const result = migratePersistedState(
+      {
+        sceneId: 'c1',
+        canvases: {
+          c1: { title: 'C1', projectId: 'project-ghost', nodes: [], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] },
+        },
+      } as never,
+      9,
+    )
+
+    expect(result.projects).toEqual([])
+    expect(result.canvases.c1.projectId).toBeUndefined()
+  })
+
+  it('preserves a valid projectId when the project exists in the projects list (v10)', () => {
+    const result = migratePersistedState(
+      {
+        sceneId: 'c1',
+        projects: [{ id: 'p1', name: 'P', createdAt: '2026-01-01T00:00:00.000Z' }],
+        canvases: {
+          c1: { title: 'C1', projectId: 'p1', createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z', nodes: [], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] },
+        },
+      } as never,
+      10,
+    )
+
+    expect(result.projects).toHaveLength(1)
+    expect(result.canvases.c1.projectId).toBe('p1')
+  })
+
+  it('clears orphan projectIds at v10 too (后续版本同规则)', () => {
+    const result = migratePersistedState(
+      {
+        sceneId: 'c1',
+        projects: [{ id: 'p1', name: 'P', createdAt: '2026-01-01T00:00:00.000Z' }],
+        canvases: {
+          c1: { title: 'C1', projectId: 'p1', createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z', nodes: [], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] },
+          c2: { title: 'C2', projectId: 'project-ghost', createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z', nodes: [], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] },
+        },
+      } as never,
+      10,
+    )
+
+    expect(result.canvases.c1.projectId).toBe('p1') // valid — kept
+    expect(result.canvases.c2.projectId).toBeUndefined() // orphan — cleared
+  })
+
+  it('preserves existing timestamps at v10 (no re-backfill)', () => {
+    const result = migratePersistedState(
+      {
+        sceneId: 'c1',
+        projects: [],
+        canvases: {
+          c1: { title: 'C1', createdAt: '2026-02-02T00:00:00.000Z', updatedAt: '2026-03-03T00:00:00.000Z', nodes: [], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] },
+        },
+      } as never,
+      10,
+    )
+
+    expect(result.canvases.c1.createdAt).toBe('2026-02-02T00:00:00.000Z')
+    expect(result.canvases.c1.updatedAt).toBe('2026-03-03T00:00:00.000Z')
+  })
+})

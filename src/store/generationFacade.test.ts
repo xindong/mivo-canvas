@@ -37,7 +37,7 @@ const seedCanvas = (nodes: MivoCanvasNode[], sceneId = 'c1') => {
   useCanvasStore.setState({
     sceneId,
     nodes,
-    canvases: { [sceneId]: { title: 'Canvas One', nodes, edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] } },
+    canvases: { [sceneId]: { title: 'Canvas One', createdAt: '2026-07-01T00:00:00.000Z', updatedAt: '2026-07-01T00:00:00.000Z', nodes, edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] } },
     selectedNodeId: undefined,
     selectedNodeIds: [],
     historyPast: [],
@@ -128,7 +128,7 @@ describe('generationFacade.getSceneChangeInfo', () => {
   })
 
   it('reports a change + the current scene when the user switched scenes', () => {
-    useCanvasStore.setState({ sceneId: 'c2', canvases: { c1: useCanvasStore.getState().canvases['c1'], c2: { title: 'Canvas Two', nodes: [], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] } } })
+    useCanvasStore.setState({ sceneId: 'c2', canvases: { c1: useCanvasStore.getState().canvases['c1'], c2: { title: 'Canvas Two', createdAt: '2026-07-01T00:00:00.000Z', updatedAt: '2026-07-01T00:00:00.000Z', nodes: [], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] } } })
     const info = generationFacade.getSceneChangeInfo('c1')
     expect(info.sceneChanged).toBe(true)
     expect(info.currentSceneId).toBe('c2')
@@ -185,7 +185,7 @@ describe('generationFacade.prepareChatSlot — camera auto-focus request (镜头
     useCanvasStore.setState({
       canvases: {
         ...useCanvasStore.getState().canvases,
-        c2: { title: 'Canvas Two', nodes: [], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] },
+        c2: { title: 'Canvas Two', createdAt: '2026-07-01T00:00:00.000Z', updatedAt: '2026-07-01T00:00:00.000Z', nodes: [], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] },
       },
     })
     generationFacade.prepareChatSlot({ sceneId: 'c2', hasSelectedImage: false, prompt: 'p' })

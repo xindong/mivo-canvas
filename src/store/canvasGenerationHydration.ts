@@ -18,11 +18,19 @@ import type { CanvasState } from './canvasStore'
 const logCanvas = (message: string) => debugLogger.log('Canvas Store', message)
 const warnCanvas = (message: string) => debugLogger.warn('Canvas Store', message)
 
+// Single source of truth for the persist version. Shared by canvasPersistConfig
+// (the persist `version` field) and mergeCanvasPersistedState (the migrate call
+// inside merge) so the merge always re-runs migration at the current version
+// rather than a stale hardcoded number — otherwise every hydration would re-run
+// the v9 branches (duplicate warns / duplicate orphan cleanup).
+export const CANVAS_PERSIST_VERSION = 10
+
 // Persisted-state shape (subset of CanvasState that survives compactCanvasesForPersist).
 type PersistedCanvasState = Partial<
   Pick<
     CanvasState,
     | 'canvases'
+    | 'projects'
     | 'nodes'
     | 'edges'
     | 'tasks'
@@ -158,9 +166,29 @@ export const migratePersistedState = (persistedState: unknown, persistedVersion 
   const activeDocument = documentFor(canvases, sceneId)
   const selection = selectionFrom(activeDocument.selectedNodeIds, activeDocument.selectedNodeId, activeDocument.nodes)
 
+  // v10: projects field + orphan projectId cleanup. At v<10 the field didn't
+  // exist, so projects defaults to [] and EVERY canvas with a projectId is an
+  // orphan (cleared). 后续版本同规则: at v10+ only projectIds pointing to a
+  // project missing from the projects list are cleared. normalizeDocument
+  // already backfilled createdAt/updatedAt per-canvas above; orphan cleanup is
+  // a separate concern (reclassification, not a content change — no bump).
+  const projects = Array.isArray(persisted.projects) ? persisted.projects : []
+  const knownProjectIds = new Set(projects.map((p) => p.id))
+  let orphanCount = 0
+  for (const [canvasId, document] of Object.entries(canvases)) {
+    if (document.projectId && !knownProjectIds.has(document.projectId)) {
+      orphanCount += 1
+      canvases[canvasId] = { ...document, projectId: undefined }
+    }
+  }
+  if (orphanCount > 0) {
+    warnCanvas(`Hydration cleared ${orphanCount} orphan projectId(s) (not in projects list)`)
+  }
+
   return {
     ...persisted,
     canvases,
+    projects,
     sceneId,
     nodes: activeDocument.nodes,
     edges: activeDocument.edges || [],
@@ -227,7 +255,12 @@ export const mergeCanvasPersistedState = (
   migrate: (persistedState: unknown, persistedVersion?: number) => unknown,
   warn: (message: string) => void,
 ): CanvasState => {
-  const merged = { ...currentState, ...(migrate(persistedState, 9) as Partial<CanvasState>) }
+  // Re-run migrate at the CURRENT persist version (not a stale hardcoded 9) so
+  // the v10 orphan-cleanup / timestamp-backfill branches apply on every
+  // hydration. migrate is idempotent for already-v10 state (normalizeDocument
+  // preserves existing timestamps; orphan cleanup is a no-op when projectIds
+  // are all valid).
+  const merged = { ...currentState, ...(migrate(persistedState, CANVAS_PERSIST_VERSION) as Partial<CanvasState>) }
   const result = settleExpiredCanvasGenerations(merged)
   if (result.counts.settledTasks > 0 || result.counts.settledSlots > 0) {
     warn(`Hydration settled expired canvas generations: slots=${result.counts.settledSlots}; tasks=${result.counts.settledTasks}`)

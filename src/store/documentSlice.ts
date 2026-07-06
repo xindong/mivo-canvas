@@ -86,12 +86,20 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
     }
 
     const id = createCanvasId()
-    const duplicatedDocument = normalizeDocument({
-      ...sourceDocument,
-      title: `${sourceDocument.title} Copy`,
-      nodes: cloneNodes(sourceDocument.nodes),
-      tasks: cloneTasks(sourceDocument.tasks),
-    })
+    // C8: duplicate does NOT inherit the source's timestamps — the copy is a new
+    // entity with fresh createdAt/updatedAt. projectId IS inherited (copy stays
+    // in the same project); only the title gets a " Copy" suffix.
+    const now = new Date().toISOString()
+    const duplicatedDocument = {
+      ...normalizeDocument({
+        ...sourceDocument,
+        title: `${sourceDocument.title} Copy`,
+        nodes: cloneNodes(sourceDocument.nodes),
+        tasks: cloneTasks(sourceDocument.tasks),
+      }),
+      createdAt: now,
+      updatedAt: now,
+    }
 
     set((current) => ({
       sceneId: id,
@@ -183,6 +191,36 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
           [sceneId]: {
             ...document,
             title,
+          },
+        },
+      }
+    }),
+  moveCanvasToProject: (canvasId, projectId) =>
+    set((state) => {
+      const document = state.canvases[canvasId]
+      if (!document) {
+        warnCanvas(`Move canvas skipped: missing canvas ${canvasId}`)
+        return {}
+      }
+      // projectId === undefined → move back to the Canvas 区 (clear projectId).
+      if (projectId !== undefined && !state.projects.some((p) => p.id === projectId)) {
+        warnCanvas(`Move canvas skipped: target project ${projectId} does not exist`)
+        return {}
+      }
+      // Target === current归属 → no-op (no bump, no log).
+      if (document.projectId === projectId) return {}
+
+      const target = projectId === undefined ? 'Canvas' : projectId
+      logCanvas(`Moved canvas "${document.title}" (${canvasId}) → ${target}`)
+      return {
+        canvases: {
+          ...state.canvases,
+          [canvasId]: {
+            ...document,
+            projectId,
+            // Moving is a user-visible reclassification → bump (mirrors maker's
+            // move → recent-list refresh semantics).
+            updatedAt: new Date().toISOString(),
           },
         },
       }

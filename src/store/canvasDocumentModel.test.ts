@@ -1,11 +1,62 @@
 import { describe, expect, it, vi } from 'vitest'
 
+// Persist middleware only attaches `api.persist` when a storage resolves; install an
+// in-memory localStorage + window before the store module loads (same hermetic setup
+// as canvasStore.contract.test.ts) so store-action timestamp tests can exercise
+// createCanvas/duplicateCanvas/resetCurrentScene/undo/redo/replaceSnapshot.
+vi.hoisted(() => {
+  const store = new Map<string, string>()
+  const memStorage = {
+    get length() {
+      return store.size
+    },
+    clear: () => store.clear(),
+    getItem: (k: string) => store.get(k) ?? null,
+    key: (i: number) => [...store.keys()][i] ?? null,
+    removeItem: (k: string) => {
+      store.delete(k)
+    },
+    setItem: (k: string, v: string) => {
+      store.set(k, String(v))
+    },
+  }
+  const g = globalThis as Record<string, unknown>
+  if (g.window === undefined) g.window = { localStorage: memStorage }
+  if (g.localStorage === undefined) g.localStorage = memStorage
+})
+
 vi.mock('../lib/demoImages', () => ({
   createDemoImage: () => 'data:image/png;base64,mock-demo-image',
 }))
 
-import type { MivoCanvasNode } from '../types/mivoCanvas'
-import { firstAnchorImageFor, normalizeCanvasNodes, rollbackLatestHistoryBaseline } from './canvasDocumentModel'
+vi.mock('../lib/assetStorage', () => ({
+  saveGeneratedAsset: vi.fn(async (_blob: Blob, name: string, type: string) => ({
+    assetUrl: 'mivo-asset://mock-asset',
+    name,
+    type,
+    sizeBytes: 1234,
+    hasTransparency: false,
+    size: '300x200',
+    sourceDimensions: { width: 300, height: 200 },
+  })),
+  saveImportedAsset: vi.fn(async () => ({ assetUrl: 'mivo-asset://mock-imported' })),
+  readImportedAssetFile: vi.fn(),
+}))
+
+vi.mock('./remoteDebugReporter', () => ({
+  reportRemoteDebugEntry: () => {},
+}))
+
+import type { MivoCanvasNode, CanvasDocument } from '../types/mivoCanvas'
+import {
+  applySnapshot,
+  firstAnchorImageFor,
+  normalizeCanvasNodes,
+  normalizeDocument,
+  patchCanvasDocument,
+  rollbackLatestHistoryBaseline,
+} from './canvasDocumentModel'
+import { useCanvasStore } from './canvasStore'
 import { normalizeCanvasNodeV2 } from '../model/documentModelV2'
 
 const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
@@ -383,3 +434,276 @@ describe('normalizeCanvasNodes — write-path reference preservation (R01 fast p
     expect(result[targetIndex]).not.toBe(fixture[targetIndex])
   })
 })
+
+// ---------------------------------------------------------------------------
+// updatedAt bump hub (Phase 1 — C4). Documents gain createdAt/updatedAt; content
+// patches bump updatedAt, selection-only patches do not, and an explicit
+// bumpUpdatedAt:false override covers high-frequency machine updates (mask-edit
+// poll progress). These pure-function tests cover the contract that mask-edit
+// (src/canvas/maskEditGeneration.ts) routes through once 1d lands.
+// ---------------------------------------------------------------------------
+
+const blankDoc = (overrides: Partial<CanvasDocument> = {}): CanvasDocument => ({
+  title: 'C',
+  createdAt: '2026-07-01T00:00:00.000Z',
+  updatedAt: '2026-07-01T00:00:00.000Z',
+  nodes: [],
+  edges: [],
+  tasks: [],
+  selectedNodeId: undefined,
+  selectedNodeIds: [],
+  ...overrides,
+})
+
+const stateWith = (canvases: Record<string, CanvasDocument>, sceneId: string) =>
+  ({
+    canvases,
+    sceneId,
+    nodes: canvases[sceneId]?.nodes ?? [],
+    edges: canvases[sceneId]?.edges ?? [],
+    tasks: canvases[sceneId]?.tasks ?? [],
+    selectedNodeId: canvases[sceneId]?.selectedNodeId,
+    selectedNodeIds: canvases[sceneId]?.selectedNodeIds ?? [],
+    activeTool: 'select',
+    clipboardNodes: [],
+    clipboardAssets: [],
+    historyPast: [],
+    historyFuture: [],
+    projects: [],
+  }) as unknown as Parameters<typeof patchCanvasDocument>[0]
+
+describe('updatedAt bump hub: patchCanvasDocument', () => {
+  const node = (id: string): MivoCanvasNode =>
+    normalizeCanvasNodeV2({
+      id,
+      type: 'image',
+      title: id,
+      status: 'ready',
+      x: 0,
+      y: 0,
+      width: 100,
+      height: 100,
+      assetUrl: `/${id}.png`,
+    })
+
+  it('bumps updatedAt when the patch contains nodes (content change)', () => {
+    const before = '2026-07-01T00:00:00.000Z'
+    const state = stateWith({ c1: blankDoc({ updatedAt: before, nodes: [node('n1')] }) }, 'c1')
+    const result = patchCanvasDocument(state, 'c1', { nodes: [node('n1'), node('n2')] })
+    const updated = (result.canvases as Record<string, CanvasDocument>)['c1']
+    expect(updated.updatedAt > before).toBe(true)
+    // ISO 8601 shape sanity
+    expect(updated.updatedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/)
+  })
+
+  it('bumps updatedAt when the patch contains tasks or edges or title', () => {
+    const before = '2026-07-01T00:00:00.000Z'
+    const state = stateWith({ c1: blankDoc({ updatedAt: before, nodes: [node('n1')] }) }, 'c1')
+    const tasks = [{ id: 'task-1', label: 't', status: 'done' as const, progress: 100, nodeIds: [] }]
+    const result = patchCanvasDocument(state, 'c1', { tasks })
+    expect((result.canvases as Record<string, CanvasDocument>)['c1'].updatedAt > before).toBe(true)
+  })
+
+  it('does NOT bump updatedAt on a selection-only patch (selectedNodeId/selectedNodeIds)', () => {
+    const before = '2026-07-01T00:00:00.000Z'
+    const state = stateWith({ c1: blankDoc({ updatedAt: before, nodes: [node('n1')] }) }, 'c1')
+    const result = patchCanvasDocument(state, 'c1', { selectedNodeId: 'n1', selectedNodeIds: ['n1'] })
+    expect((result.canvases as Record<string, CanvasDocument>)['c1'].updatedAt).toBe(before)
+  })
+
+  it('does NOT bump updatedAt when bumpUpdatedAt:false is passed explicitly (mask-edit poll progress path)', () => {
+    const before = '2026-07-01T00:00:00.000Z'
+    const state = stateWith({ c1: blankDoc({ updatedAt: before, nodes: [node('n1')] }) }, 'c1')
+    const result = patchCanvasDocument(state, 'c1', { nodes: [node('n1')] }, { bumpUpdatedAt: false })
+    expect((result.canvases as Record<string, CanvasDocument>)['c1'].updatedAt).toBe(before)
+  })
+
+  it('bumps updatedAt on the active-scene path too (patchActiveCanvas)', () => {
+    const before = '2026-07-01T00:00:00.000Z'
+    const state = stateWith({ c1: blankDoc({ updatedAt: before, nodes: [node('n1')] }) }, 'c1')
+    const result = patchCanvasDocument(state, 'c1', { nodes: [node('n1'), node('n2')] })
+    // active scene surfaces nodes at top level + writes canvases
+    expect((result.canvases as Record<string, CanvasDocument>)['c1'].updatedAt > before).toBe(true)
+  })
+})
+
+describe('updatedAt bump hub: normalizeDocument backfill', () => {
+  it('backfills createdAt/updatedAt with now when missing (defensive for old snapshots/demo scenes)', () => {
+    const before = Date.now()
+    const doc = normalizeDocument({
+      title: 'Legacy',
+      nodes: [],
+      edges: [],
+      tasks: [],
+    } as unknown as CanvasDocument)
+    const after = Date.now()
+    expect(doc.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/)
+    expect(doc.updatedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/)
+    const updatedAtMs = Date.parse(doc.updatedAt)
+    expect(updatedAtMs >= before).toBe(true)
+    expect(updatedAtMs <= after).toBe(true)
+  })
+
+  it('preserves existing timestamps rather than overwriting them', () => {
+    const doc = normalizeDocument({
+      title: 'Existing',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-02-02T00:00:00.000Z',
+      nodes: [],
+      edges: [],
+      tasks: [],
+    } as CanvasDocument)
+    expect(doc.createdAt).toBe('2026-01-01T00:00:00.000Z')
+    expect(doc.updatedAt).toBe('2026-02-02T00:00:00.000Z')
+  })
+})
+
+describe('updatedAt bump hub: applySnapshot / rollbackLatestHistoryBaseline', () => {
+  const node = (id: string): MivoCanvasNode =>
+    normalizeCanvasNodeV2({
+      id,
+      type: 'image',
+      title: id,
+      status: 'ready',
+      x: 0,
+      y: 0,
+      width: 100,
+      height: 100,
+      assetUrl: `/${id}.png`,
+    })
+
+  it('applySnapshot bumps updatedAt (undo/redo/replaceSnapshot = user action)', () => {
+    const before = '2026-07-01T00:00:00.000Z'
+    const state = stateWith({ c1: blankDoc({ updatedAt: before, nodes: [node('n1')] }) }, 'c1')
+    const result = applySnapshot(state, {
+      version: 2,
+      sceneId: 'c1',
+      nodes: [node('n1'), node('n2')],
+      edges: [],
+      tasks: [],
+    })
+    expect((result.canvases as Record<string, CanvasDocument>)['c1'].updatedAt > before).toBe(true)
+  })
+
+  it('rollbackLatestHistoryBaseline bumps updatedAt (mask-edit failure/cancel rollback = content change)', () => {
+    const before = '2026-07-01T00:00:00.000Z'
+    const source = node('src')
+    const obstacleBefore = node('obstacle')
+    const slot = { ...node('slot'), type: 'ai-slot' as const }
+    const state = {
+      ...stateWith(
+        { c1: blankDoc({ updatedAt: before, nodes: [source, slot] }) },
+        'c1',
+      ),
+      historyPast: [{
+        version: 2 as const,
+        sceneId: 'c1',
+        nodes: [source, obstacleBefore],
+        edges: [],
+        tasks: [],
+        selectedNodeId: undefined,
+        selectedNodeIds: [],
+      }],
+      historyFuture: [],
+    } as unknown as Parameters<typeof rollbackLatestHistoryBaseline>[0]
+
+    const patch = rollbackLatestHistoryBaseline(state, 'c1', { removeNodeId: 'slot' })
+    expect(patch).toBeDefined()
+    expect((patch!.canvases as Record<string, CanvasDocument>)['c1'].updatedAt > before).toBe(true)
+  })
+})
+
+describe('updatedAt bump hub: store actions (createCanvas / duplicateCanvas / resetCurrentScene / replaceSnapshot)', () => {
+  const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
+    id: 'img-1',
+    type: 'image',
+    title: 'Image',
+    x: 0,
+    y: 0,
+    width: 100,
+    height: 100,
+    status: 'ready',
+    assetUrl: '/a.png',
+    ...overrides,
+  })
+
+  const baseState = useCanvasStore.getState()
+  const seedStore = (canvases: Record<string, CanvasDocument>, sceneId: string) =>
+    useCanvasStore.setState(
+      {
+        ...baseState,
+        canvases,
+        sceneId,
+        nodes: canvases[sceneId]?.nodes ?? [],
+        edges: canvases[sceneId]?.edges ?? [],
+        tasks: canvases[sceneId]?.tasks ?? [],
+        selectedNodeId: undefined,
+        selectedNodeIds: [],
+      } as never,
+      true,
+    )
+
+  it('createCanvas sets createdAt = updatedAt = now', () => {
+    const before = Date.now()
+    const id = useCanvasStore.getState().createCanvas('Fresh')
+    const after = Date.now()
+    const doc = useCanvasStore.getState().canvases[id]
+    expect(doc.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/)
+    expect(doc.updatedAt).toBe(doc.createdAt)
+    const ms = Date.parse(doc.createdAt)
+    expect(ms >= before).toBe(true)
+    expect(ms <= after).toBe(true)
+  })
+
+  it('duplicateCanvas sets fresh createdAt/updatedAt = now (does NOT inherit source timestamps — C8)', () => {
+    const sourceTime = '2026-01-01T00:00:00.000Z'
+    const sourceId = useCanvasStore.getState().createCanvas('Original')
+    // Pin the source to an old timestamp (merge mode — replace=true would strip
+    // the store's action functions, so only the canvases slice is updated here).
+    useCanvasStore.setState((s) => ({
+      canvases: {
+        ...s.canvases,
+        [sourceId]: { ...s.canvases[sourceId], createdAt: sourceTime, updatedAt: sourceTime },
+      },
+    }) as never)
+
+    const before = Date.now()
+    const dupId = useCanvasStore.getState().duplicateCanvas(sourceId)
+    const after = Date.now()
+    const dup = useCanvasStore.getState().canvases[dupId!]
+    expect(dup.createdAt).not.toBe(sourceTime)
+    expect(dup.updatedAt).not.toBe(sourceTime)
+    expect(dup.createdAt).toBe(dup.updatedAt)
+    const ms = Date.parse(dup.createdAt)
+    expect(ms >= before).toBe(true)
+    expect(ms <= after).toBe(true)
+  })
+
+  it('resetCurrentScene bumps updatedAt (user explicit reset)', () => {
+    const before = '2026-07-01T00:00:00.000Z'
+    // Use a non-demo scene id so resetCurrentScene falls back to createBlankDocument
+    seedStore({ 'custom-scene': blankDoc({ title: 'Custom', updatedAt: before, nodes: [imageNode({ id: 'n1' })] }) }, 'custom-scene')
+    useCanvasStore.getState().resetCurrentScene()
+    expect(useCanvasStore.getState().canvases['custom-scene'].updatedAt > before).toBe(true)
+  })
+
+  it('replaceSnapshot bumps updatedAt (user explicit replace)', () => {
+    const before = '2026-07-01T00:00:00.000Z'
+    seedStore({ 'c1': blankDoc({ title: 'C', updatedAt: before, nodes: [imageNode({ id: 'n1' })] }) }, 'c1')
+    useCanvasStore.getState().replaceSnapshot({
+      version: 2,
+      sceneId: 'c1',
+      nodes: [imageNode({ id: 'n1' }), imageNode({ id: 'n2', x: 200 })],
+      edges: [],
+      tasks: [],
+    })
+    expect(useCanvasStore.getState().canvases['c1'].updatedAt > before).toBe(true)
+  })
+})
+
+// Mask-edit routing (1d): patchMaskEditSlotStatus / patchMaskEditProgress /
+// removeMaskEditPlaceholder all route through patchCanvasDocument after 1d. The
+// bumpUpdatedAt contract they rely on is covered by the patchCanvasDocument
+// describe above (content patch bumps; bumpUpdatedAt:false on the poll-progress
+// path does not). The end-to-end mask-edit flow is exercised by Phase 6 e2e.
+

@@ -53,6 +53,26 @@ export const historyCloneFns: HistoryCloneFns = {
   cloneTask,
 }
 
+// Phase 1 (C4): updatedAt bump hub. Documents carry createdAt/updatedAt (ISO).
+// Content patches (nodes/edges/tasks/title) bump updatedAt; selection-only patches
+// do not; an explicit bumpUpdatedAt:false covers high-frequency machine updates
+// (mask-edit poll progress). Hydration/normalize backfill missing timestamps.
+const nowIso = () => new Date().toISOString()
+
+/** Subset of CanvasDocument a patch may carry. Declared at module top so the
+ *  bump helpers below can reference it before the patch functions are defined. */
+type CanvasDocumentPatch = Partial<
+  Pick<CanvasDocument, 'nodes' | 'edges' | 'tasks' | 'selectedNodeId' | 'selectedNodeIds' | 'title'>
+>
+
+/** A patch is "content" if it changes nodes/edges/tasks/title (not just selection). */
+const hasContentPatch = (patch: CanvasDocumentPatch) =>
+  'nodes' in patch || 'edges' in patch || 'tasks' in patch || 'title' in patch
+
+/** Bump on content patches unless the caller explicitly opts out (mask-edit progress). */
+const shouldBumpUpdatedAt = (patch: CanvasDocumentPatch, bumpUpdatedAt?: boolean) =>
+  bumpUpdatedAt !== false && hasContentPatch(patch)
+
 export const compactNodeForPersist = (node: MivoCanvasNode): MivoCanvasNode => {
   const compactNode = cloneNode(node)
   const transform = compactNode.transform
@@ -257,23 +277,31 @@ export const normalizeLongMarkdownPreviewNodes = (nodes: MivoCanvasNode[]) =>
     }
   })
 
-export const createBlankDocument = (title = 'Untitled Canvas', projectId?: string): CanvasDocument => ({
-  title,
-  projectId,
-  nodes: [],
-  edges: [],
-  tasks: [],
-  selectedNodeId: undefined,
-  selectedNodeIds: [],
-})
+export const createBlankDocument = (title = 'Untitled Canvas', projectId?: string): CanvasDocument => {
+  const now = nowIso()
+  return {
+    title,
+    projectId,
+    createdAt: now,
+    updatedAt: now,
+    nodes: [],
+    edges: [],
+    tasks: [],
+    selectedNodeId: undefined,
+    selectedNodeIds: [],
+  }
+}
 
 export const canvasDocumentFromScene = (sceneId: DemoSceneId): CanvasDocument => {
   const snapshot = snapshotFromScene(sceneId)
   const selection = selectionFrom(snapshot.selectedNodeIds, snapshot.selectedNodeId, snapshot.nodes)
+  const now = nowIso()
 
   return {
     title: fallbackTitle(sceneId),
     sourceTemplateId: sceneId,
+    createdAt: now,
+    updatedAt: now,
     nodes: normalizeCanvasGraph(cloneNodes(snapshot.nodes), snapshot.edges || []),
     edges: cloneEdges(snapshot.edges || []),
     tasks: cloneTasks(snapshot.tasks),
@@ -295,11 +323,15 @@ export const normalizeDocument = (document: CanvasDocument): CanvasDocument => {
   const edges = cloneEdges(document.edges || [])
   const nodes = normalizeCanvasGraph(cloneNodes(document.nodes), edges)
   const selection = selectionFrom(document.selectedNodeIds, document.selectedNodeId, nodes)
+  // Backfill timestamps for legacy snapshots / demo scenes that predate createdAt/updatedAt.
+  const now = nowIso()
 
   return {
     ...document,
     projectId: document.projectId,
     sourceTemplateId: document.sourceTemplateId,
+    createdAt: document.createdAt || now,
+    updatedAt: document.updatedAt || now,
     nodes,
     edges,
     tasks: cloneTasks(document.tasks),
@@ -310,7 +342,8 @@ export const normalizeDocument = (document: CanvasDocument): CanvasDocument => {
 
 export const patchActiveCanvas = (
   state: CanvasState,
-  patch: Partial<Pick<CanvasDocument, 'nodes' | 'edges' | 'tasks' | 'selectedNodeId' | 'selectedNodeIds' | 'title'>>,
+  patch: CanvasDocumentPatch,
+  options: { bumpUpdatedAt?: boolean } = {},
 ) => {
   const currentDocument = documentFor(state.canvases, state.sceneId)
   const nextEdges = 'edges' in patch ? cloneEdges(patch.edges || []) : state.edges
@@ -323,7 +356,8 @@ export const patchActiveCanvas = (
     'selectedNodeId' in patch ? patch.selectedNodeId : state.selectedNodeId,
     nextNodes,
   )
-  const nextDocument = {
+  const bump = shouldBumpUpdatedAt(patch, options.bumpUpdatedAt)
+  const nextDocument: CanvasDocument = {
     ...currentDocument,
     ...patch,
     nodes: nextNodes,
@@ -331,6 +365,7 @@ export const patchActiveCanvas = (
     tasks: patch.tasks || currentDocument.tasks,
     selectedNodeId: selection.selectedNodeId,
     selectedNodeIds: selection.selectedNodeIds,
+    ...(bump ? { updatedAt: nowIso() } : {}),
   }
 
   return {
@@ -348,24 +383,23 @@ export const patchActiveCanvas = (
 
 export const patchWithHistory = (
   state: CanvasState,
-  patch: Partial<Pick<CanvasDocument, 'nodes' | 'edges' | 'tasks' | 'selectedNodeId' | 'selectedNodeIds' | 'title'>>,
+  patch: CanvasDocumentPatch,
+  options: { bumpUpdatedAt?: boolean } = {},
 ) => ({
   ...remember(state),
-  ...patchActiveCanvas(state, patch),
+  ...patchActiveCanvas(state, patch, options),
 })
-
-type CanvasDocumentPatch = Partial<
-  Pick<CanvasDocument, 'nodes' | 'edges' | 'tasks' | 'selectedNodeId' | 'selectedNodeIds' | 'title'>
->
 
 export const patchCanvasDocument = (
   state: CanvasState,
   sceneId: CanvasId,
   patch: CanvasDocumentPatch,
-  options: { history?: boolean } = {},
+  options: { history?: boolean; bumpUpdatedAt?: boolean } = {},
 ) => {
   if (sceneId === state.sceneId) {
-    return options.history ? patchWithHistory(state, patch) : patchActiveCanvas(state, patch)
+    return options.history
+      ? patchWithHistory(state, patch, { bumpUpdatedAt: options.bumpUpdatedAt })
+      : patchActiveCanvas(state, patch, { bumpUpdatedAt: options.bumpUpdatedAt })
   }
 
   const currentDocument = state.canvases[sceneId]
@@ -381,6 +415,7 @@ export const patchCanvasDocument = (
     'selectedNodeId' in patch ? patch.selectedNodeId : currentDocument.selectedNodeId,
     nextNodes,
   )
+  const bump = shouldBumpUpdatedAt(patch, options.bumpUpdatedAt)
   const nextDocument: CanvasDocument = {
     ...currentDocument,
     ...patch,
@@ -389,6 +424,7 @@ export const patchCanvasDocument = (
     tasks: patch.tasks ? cloneTasks(patch.tasks) : cloneTasks(currentDocument.tasks),
     selectedNodeId: selection.selectedNodeId,
     selectedNodeIds: selection.selectedNodeIds,
+    ...(bump ? { updatedAt: nowIso() } : {}),
   }
 
   return {
@@ -412,6 +448,8 @@ export const applySnapshot = (state: CanvasState, snapshot: MivoCanvasSnapshot) 
     tasks: cloneTasks(normalizedSnapshot.tasks),
     selectedNodeId: selection.selectedNodeId,
     selectedNodeIds: selection.selectedNodeIds,
+    // undo/redo/replaceSnapshot are user-visible content restores → bump.
+    updatedAt: nowIso(),
   }
 
   return {
@@ -460,6 +498,8 @@ export const rollbackLatestHistoryBaseline = (
     tasks: cloneTasks(normalizedSnapshot.tasks),
     selectedNodeId: selection.selectedNodeId,
     selectedNodeIds: selection.selectedNodeIds || [],
+    // mask-edit failure/cancel rollback removes a placeholder → content change → bump.
+    updatedAt: nowIso(),
   }
 
   return {

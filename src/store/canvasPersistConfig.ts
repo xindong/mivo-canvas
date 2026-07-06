@@ -6,7 +6,7 @@
 import { createJSONStorage } from 'zustand/middleware'
 import { idbStateStorage } from '../lib/persistIdbStorage'
 import { compactCanvasesForPersist } from './canvasDocumentModel'
-import { mergeCanvasPersistedState, migratePersistedState } from './canvasGenerationHydration'
+import { CANVAS_PERSIST_VERSION, mergeCanvasPersistedState, migratePersistedState } from './canvasGenerationHydration'
 import { debugLogger } from './debugLogStore'
 import type { CanvasState } from './canvasStore'
 
@@ -17,7 +17,7 @@ const warnCanvas = (message: string) => debugLogger.warn('Canvas Store', message
 
 export const canvasPersistOptions = {
   name: 'mivo-canvas-demo',
-  version: 9,
+  version: CANVAS_PERSIST_VERSION,
   // FU4-2: persist to IndexedDB (10k+ node snapshots exceed localStorage's ~5MB
   // quota). skipHydration defers rehydrate to the App-layer hydration gate so the
   // first paint is the real state, not a demo-seed flash. migrate/merge unchanged.
@@ -28,6 +28,7 @@ export const canvasPersistOptions = {
     mergeCanvasPersistedState(persistedState, currentState, migratePersistedState, warnCanvas),
   partialize: (state: CanvasState) => ({
     canvases: compactCanvasesForPersist(state.canvases),
+    projects: state.projects,
     sceneId: state.sceneId,
     selectedNodeId: state.selectedNodeId,
     selectedNodeIds: state.selectedNodeIds,
