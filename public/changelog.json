@@ -1,7 +1,26 @@
 {
-  "lastGithash": "2cfe5e117a2d55ad48c1a61a44740ddac24a708e",
-  "updatedAt": "2026-07-06T08:02:16+08:00",
+  "lastGithash": "baba13804832f5840bc9a61bca47df5d536ace2b",
+  "updatedAt": "2026-07-06T11:22:54+08:00",
   "entries": [
+    {
+      "date": "2026-07-06",
+      "prs": [
+        130,
+        131
+      ],
+      "features": [
+        {
+          "text": "画布默认启用新一代渲染引擎:大量图片下拖动、缩放明显更流畅;若遇到显示异常,在网址后加 ?renderer=dom 可临时切回旧渲染",
+          "by": "Praise"
+        }
+      ],
+      "fixes": [
+        {
+          "text": "更新日志面板补录了昨天合入的最后一批改动",
+          "by": "Praise"
+        }
+      ]
+    },
     {
       "date": "2026-07-05",
       "prs": [
