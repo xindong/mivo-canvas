@@ -190,19 +190,25 @@ export const mivoPlatformPollJob = async (
 ): Promise<PollResult> => {
   const { platformPollIntervalMs } = getEnvConfig()
   const platformPollDeadlineMs = pollDeadlineMs ?? resolveMivoPlatformPollDeadlineMs('1K')
-  // V03 (Greptile review): signal-aware poll-interval wait for the retry paths.
-  // Resolves early on abort so the loop-top `if (signal?.aborted)` returns
-  // {status:'aborted'} without waiting the full interval. The pre-existing
-  // pending-path wait stays a plain setTimeout (its behavior is unchanged).
+  // V03/V-20: signal-aware poll-interval wait. Used by BOTH the retry paths and
+  // the pending-path tail (V-20 flipped the bare setTimeout to this), so the
+  // cleanup must run on BOTH paths — otherwise every normal pending tick leaks a
+  // stale abort listener that never fires (96+/long task). settled guards against
+  // a double-resolve when timer + abort race.
   const waitForPollInterval = (signal: AbortSignal | undefined): Promise<void> =>
     new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, platformPollIntervalMs)
-      const onAbort = () => {
+      let settled = false
+      const finish = () => {
+        if (settled) return
+        settled = true
         clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
         resolve()
       }
+      const onAbort = () => finish()
+      const timer = setTimeout(finish, platformPollIntervalMs)
       if (signal?.aborted) {
-        onAbort()
+        finish()
         return
       }
       signal?.addEventListener('abort', onAbort, { once: true })
@@ -269,7 +275,12 @@ export const mivoPlatformPollJob = async (
     if (lastStatus === 'failed') {
       return { status: 'failed', error: sanitizePlatformError(content.error || content.message || 'failed') }
     }
-    await new Promise((r) => setTimeout(r, platformPollIntervalMs))
+    // V-20: pending-path wait must be abort-aware too (was a bare setTimeout).
+    // Otherwise a client disconnect during a long pending streak holds the poll
+    // loop for a full interval before the loop-top aborted check fires. The retry
+    // paths above already used waitForPollInterval(signal); this aligns the
+    // success-but-pending tail with them so abort resolves within one tick.
+    await waitForPollInterval(signal)
   }
   return { status: 'timeout', lastStatus }
 }
