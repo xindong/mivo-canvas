@@ -56,6 +56,7 @@ import {
   patchCanvasDocument,
   rollbackLatestHistoryBaseline,
 } from './canvasDocumentModel'
+import { AI_SLOT_GAP, reflowRightObstacles } from './aiCanvasWorkflow'
 import { useCanvasStore } from './canvasStore'
 import { buildSidebarModel } from '../app/sidebar/projectSidebarModel'
 import { normalizeCanvasNodeV2 } from '../model/documentModelV2'
@@ -732,3 +733,51 @@ describe('updatedAt bump hub: store actions (createCanvas / duplicateCanvas / re
 // bumpUpdatedAt contract they rely on is covered by the patchCanvasDocument
 // describe above (content patch bumps; bumpUpdatedAt:false on the poll-progress
 // path does not). The end-to-end mask-edit flow is exercised by Phase 6 e2e.
+
+describe('reflowRightObstacles — normalize-stable output (mask-edit SC4.2)', () => {
+  // Regression: routing patchMaskEditSlotStatus through patchCanvasDocument (1d)
+  // ran its reflowed nodes through normalizeCanvasGraph → normalizeCanvasNodeV2.
+  // reflowRightObstacles had only patched the legacy `node.x`, leaving
+  // `node.transform.x` stale. isNormalizedCanvasNodeV2 flagged the half-normalized
+  // node, cloneCanvasNodeV2 re-derived x from the stale transform, and the reflow
+  // was silently undone — so B stayed at its original x instead of being pushed to
+  // slot.right+AI_SLOT_GAP (e2e mask-reflow SC4.2). reflow must keep transform in
+  // sync with the legacy geometry so normalize is a no-op on reflowed nodes.
+  const normalizedImage = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode =>
+    normalizeCanvasNodeV2({
+      id: 'img',
+      type: 'image',
+      title: 'Image',
+      x: 0,
+      y: 0,
+      width: 100,
+      height: 100,
+      status: 'ready',
+      assetUrl: '/a.png',
+      ...overrides,
+    })
+
+  it('reflowed x survives normalizeCanvasNodes (transform kept in sync with x)', () => {
+    const source = normalizedImage({ id: 'a', x: 0, y: 0, width: 300, height: 300 })
+    const obstacle = normalizedImage({ id: 'b', x: 500, y: 0, width: 300, height: 300 })
+    const slot = normalizedImage({
+      id: 'slot',
+      type: 'ai-slot',
+      x: 356,
+      y: 0,
+      width: 320,
+      height: 320,
+      status: 'generating',
+    })
+
+    const reflowed = reflowRightObstacles([source, obstacle, slot], slot, AI_SLOT_GAP)
+    // Sanity: reflow itself pushed B to slot.right + gap.
+    expect(reflowed.find((node) => node.id === 'b')?.x).toBe(slot.x + slot.width + AI_SLOT_GAP)
+
+    const normalized = normalizeCanvasNodes(reflowed)
+    const bAfter = normalized.find((node) => node.id === 'b')!
+    // The reflow must survive normalize (this is what patchCanvasDocument applies).
+    expect(bAfter.x).toBe(slot.x + slot.width + AI_SLOT_GAP) // 732
+    expect(bAfter.transform?.x).toBe(slot.x + slot.width + AI_SLOT_GAP)
+  })
+})

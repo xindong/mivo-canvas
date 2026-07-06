@@ -145,7 +145,17 @@ export const reflowRightObstacles = (
 
     if (!candidate) continue
 
-    const moved = { ...candidate, x: Math.round(requiredX) }
+    // Keep transform.x in sync with the legacy geometry so the reflowed node stays
+    // V2-normalized. Without this, normalizeCanvasNodeV2 (run by patchCanvasDocument
+    // → normalizeCanvasGraph) flags the half-normalized node (transform.x !== x),
+    // re-derives x from the stale transform, and silently undoes the reflow — the
+    // mask-edit SC4.2 regression where B stayed at its original x instead of being
+    // pushed to slot.right+gap. y/width/height are unchanged by reflow, so only x
+    // needs syncing.
+    const movedX = Math.round(requiredX)
+    const moved = candidate.transform
+      ? { ...candidate, x: movedX, transform: { ...candidate.transform, x: movedX } }
+      : { ...candidate, x: movedX }
     movedIds.add(candidate.id)
     nextNodes = nextNodes.map((node) => (node.id === candidate.id ? moved : node))
     queue.push(moved)
