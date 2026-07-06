@@ -5,7 +5,7 @@
 // relative time label (title = absolute). Self-contained: subscribes to the store
 // for its data + actions, manages its own menu/confirm/rename state.
 import { useState } from 'react'
-import { Copy, FolderInput, MonitorUp, Move, Pencil, Trash2 } from 'lucide-react'
+import { Copy, Folder, FolderInput, MonitorUp, Move, Pencil, Trash2 } from 'lucide-react'
 import { useCanvasStore } from '../../store/canvasStore'
 import { toastFeedback } from '../../store/toastStore'
 import { formatSidebarTime, formatSidebarTimeTitle } from '../../lib/formatSidebarTime'
@@ -93,13 +93,26 @@ export function CanvasRow(props: {
       label: '移动到项目',
       icon: Move,
       items: [
-        ...projects.map((p) => ({
-          kind: 'item' as const,
-          id: `move-${p.id}`,
-          label: p.name,
-          disabled: p.id === currentProjectId,
-          onSelect: () => moveTo(p.id),
-        })),
+        // maker parity (SessionProjectMoveSubmenu): project entries carry a Folder
+        // icon; an empty project list shows a disabled "暂无项目" placeholder.
+        ...(projects.length > 0
+          ? projects.map((p) => ({
+              kind: 'item' as const,
+              id: `move-${p.id}`,
+              label: p.name,
+              icon: Folder,
+              disabled: p.id === currentProjectId,
+              onSelect: () => moveTo(p.id),
+            }))
+          : [
+              {
+                kind: 'item' as const,
+                id: 'move-no-projects',
+                label: '暂无项目',
+                disabled: true,
+                onSelect: () => {},
+              },
+            ]),
         { kind: 'separator' as const, id: 'sep-move-to-canvas' },
         {
           kind: 'item' as const,

@@ -25,6 +25,10 @@ export type ContextMenuItem =
 const MENU_WIDTH = 224
 const ITEM_HEIGHT = 32
 const MENU_PADDING = 12
+// Submenu clamp estimates (kept in sync with .sidebar-context-menu-submenu CSS:
+// min-width 168 + margin 4; max-height 240).
+const SUBMENU_WIDTH = 172
+const SUBMENU_MAX_HEIGHT = 240
 
 export function ContextMenu(props: {
   position: { x: number; y: number }
@@ -33,7 +37,7 @@ export function ContextMenu(props: {
 }) {
   const { position, items, onClose } = props
   const ref = useRef<HTMLDivElement>(null)
-  const [openSubmenu, setOpenSubmenu] = useState<string | null>(null)
+  const [openSubmenu, setOpenSubmenu] = useState<{ id: string; flipX: boolean; flipY: boolean } | null>(null)
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -68,7 +72,14 @@ export function ContextMenu(props: {
         }
         if (item.kind === 'submenu') {
           const Icon = item.icon
-          const isOpen = openSubmenu === item.id
+          const isOpen = openSubmenu?.id === item.id
+          const submenuClass = [
+            'sidebar-context-menu-submenu',
+            openSubmenu?.flipX ? 'is-flip-x' : '',
+            openSubmenu?.flipY ? 'is-flip-y' : '',
+          ]
+            .filter(Boolean)
+            .join(' ')
           return (
             <div key={item.id} className="sidebar-context-menu-submenu-wrap">
               <button
@@ -77,15 +88,27 @@ export function ContextMenu(props: {
                 className={`sidebar-context-menu-item${isOpen ? ' is-open' : ''}`}
                 onClick={(event) => {
                   event.stopPropagation()
-                  setOpenSubmenu(isOpen ? null : item.id)
+                  if (isOpen) {
+                    setOpenSubmenu(null)
+                    return
+                  }
+                  // Viewport-edge handling for the submenu (mirrors the root menu
+                  // clamp): flip to the left edge / open upward when the default
+                  // right/down placement would overflow.
+                  const rect = event.currentTarget.getBoundingClientRect()
+                  setOpenSubmenu({
+                    id: item.id,
+                    flipX: rect.right + SUBMENU_WIDTH > window.innerWidth - 8,
+                    flipY: rect.top + SUBMENU_MAX_HEIGHT > window.innerHeight - 8,
+                  })
                 }}
               >
-                {Icon && <Icon size={14} className="sidebar-context-menu-icon" />}
+                <span className="sidebar-context-menu-icon">{Icon ? <Icon size={14} /> : null}</span>
                 <span className="sidebar-context-menu-label">{item.label}</span>
                 <ChevronRight size={14} className="sidebar-context-menu-chevron" />
               </button>
               {isOpen && (
-                <div className="sidebar-context-menu-submenu" role="menu">
+                <div className={submenuClass} role="menu">
                   {item.items.map((sub) => {
                     if (sub.kind === 'separator') {
                       return <div key={sub.id} className="sidebar-context-menu-separator" role="separator" />
@@ -105,7 +128,7 @@ export function ContextMenu(props: {
                             close()
                           }}
                         >
-                          {SubIcon && <SubIcon size={14} className="sidebar-context-menu-icon" />}
+                          <span className="sidebar-context-menu-icon">{SubIcon ? <SubIcon size={14} /> : null}</span>
                           <span className="sidebar-context-menu-label">{sub.label}</span>
                         </button>
                       )
@@ -132,7 +155,7 @@ export function ContextMenu(props: {
               close()
             }}
           >
-            {Icon && <Icon size={14} className="sidebar-context-menu-icon" />}
+            <span className="sidebar-context-menu-icon">{Icon ? <Icon size={14} /> : null}</span>
             <span className="sidebar-context-menu-label">{item.label}</span>
           </button>
         )
