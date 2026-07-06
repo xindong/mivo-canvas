@@ -7963,6 +7963,9 @@ button:disabled {
   top: 0;
   left: 100%;
   margin-left: 4px;
+  /* abspos + left:100% 的 shrink-to-fit 可用宽度为 0,会被钉死在 min-width;
+     width:max-content 让面板随最长项目名撑开(240px 上限内,超出才 ellipsis)。 */
+  width: max-content;
   min-width: 168px;
   max-width: 240px;
   /* maker parity (SessionProjectMoveSubmenu max-h-[224px] scroll): cap height so a
