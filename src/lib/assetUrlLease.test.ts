@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { acquireAssetUrl, __leaseMapSize } from './assetUrlLease'
+import { debugLogger } from '../store/debugLogStore'
 
 // Mock resolveAssetUrl so tests don't touch IDB. The mock calls the (spied)
 // URL.createObjectURL at call-time so the global call count reflects what the
@@ -20,6 +21,18 @@ vi.mock('./assetStorage', () => ({
   isImportedAssetUrl: (url?: string) => Boolean(url?.startsWith('mivo-asset:')),
   resolveAssetUrl: (assetUrl?: string) => resolveAssetUrlMock(assetUrl),
 }))
+
+// Stub debugLogger so tests can assert log calls without touching the zustand
+// store. Only `warn` is exercised by assetUrlLease; log/error are no-ops.
+vi.mock('../store/debugLogStore', () => ({
+  debugLogger: {
+    warn: vi.fn(),
+    log: vi.fn(),
+    error: vi.fn(),
+  },
+}))
+
+const debugWarn = vi.mocked(debugLogger.warn)
 
 beforeEach(() => {
   resolveAssetUrlMock.mockClear()
@@ -198,6 +211,72 @@ describe('acquireAssetUrl — A→B→A switching (lease lifecycle)', () => {
     const a2 = await acquireAssetUrl(ASSET)
     a2.release()
     b.release()
+    expect(__leaseMapSize()).toBe(0)
+  })
+})
+
+describe('acquireAssetUrl — resolution reject does not poison the cache (N-02)', () => {
+  const ASSET_FAIL = 'mivo-asset:fail-once'
+  const rejectionError = new Error('boom: resolveAssetUrl rejected')
+
+  beforeEach(() => {
+    // First call rejects, subsequent calls resolve normally (re-resolution path).
+    resolveAssetUrlMock
+      .mockReset()
+      .mockImplementationOnce(async () => {
+        throw rejectionError
+      })
+      .mockImplementation(async (assetUrl?: string): Promise<string> => {
+        if (!assetUrl) return ''
+        const blob = new Blob([assetUrl], { type: 'image/png' })
+        return URL.createObjectURL(blob)
+      })
+    debugWarn.mockClear()
+  })
+
+  it('originating acquire rejects → entry is deleted → next acquire re-resolves (not poisoned)', async () => {
+    // First acquire rejects. The entry must be dropped so it isn't cached as a
+    // rejected promise (poisoned cache).
+    await expect(acquireAssetUrl(ASSET_FAIL)).rejects.toThrow(rejectionError)
+    expect(__leaseMapSize()).toBe(0)
+    // Failure path must log a warn (state changed: entry deleted) per logging rules.
+    expect(debugWarn).toHaveBeenCalledTimes(1)
+    expect(debugWarn).toHaveBeenCalledWith(
+      'Asset Lease',
+      expect.stringContaining(`asset resolution rejected for ${ASSET_FAIL}`),
+    )
+
+    // Second acquire must re-resolve from scratch (not hit a poisoned in-flight),
+    // producing a fresh blob URL lease.
+    const lease = await acquireAssetUrl(ASSET_FAIL)
+    expect(lease.url.startsWith('blob:')).toBe(true)
+    expect(__leaseMapSize()).toBe(1)
+    expect(resolveAssetUrlMock).toHaveBeenCalledTimes(2)
+
+    lease.release()
+    expect(__leaseMapSize()).toBe(0)
+  })
+
+  it('concurrent acquire on a rejecting in-flight: reject surfaces + entry deleted + next acquire re-resolves', async () => {
+    // Fire two overlapping acquires so #2 dedups on #1's in-flight (rejected) promise.
+    const p1 = acquireAssetUrl(ASSET_FAIL)
+    const p2 = acquireAssetUrl(ASSET_FAIL)
+    await expect(p1).rejects.toThrow(rejectionError)
+    await expect(p2).rejects.toThrow(rejectionError)
+
+    // The poisoned entry must have been dropped by the catch path.
+    expect(__leaseMapSize()).toBe(0)
+    // Both acquire paths hit the rejection; each logs a warn on cleanup.
+    expect(debugWarn).toHaveBeenCalledTimes(2)
+    expect(debugWarn).toHaveBeenCalledWith(
+      'Asset Lease',
+      expect.stringContaining(`asset resolution rejected for ${ASSET_FAIL}`),
+    )
+
+    // Next acquire re-resolves instead of hitting the rejected in-flight.
+    const lease = await acquireAssetUrl(ASSET_FAIL)
+    expect(lease.url.startsWith('blob:')).toBe(true)
+    lease.release()
     expect(__leaseMapSize()).toBe(0)
   })
 })
