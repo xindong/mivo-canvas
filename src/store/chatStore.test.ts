@@ -81,8 +81,9 @@ vi.mock('./chatMaskEditFlow', () => ({
 }))
 
 import { useChatStore } from './chatStore'
-import { saveImportedAsset } from '../lib/assetStorage'
+import { saveImportedAsset, readImportedAssetFile } from '../lib/assetStorage'
 import { enhanceMivoPrompt } from '../lib/mivoImageClient'
+import { debugLogger } from './debugLogStore'
 
 beforeEach(() => {
   // Clear the in-memory localStorage so each test starts clean (FIX-A hydration
@@ -169,6 +170,156 @@ describe('sendMessage (S03b: 参考图保存失败不丢消息)', () => {
     const messages = useChatStore.getState().messagesByScene['scene-2'] || []
     // 正常流会落 user + assistant（enhancing→...），但不应是"参考图保存失败"的 error
     expect(messages.some((m) => m.error?.includes('参考图保存失败'))).toBe(false)
+  })
+})
+
+// S01: sendMessage(:228) / retryMessage(:494) 第二道 isBusy return 不能静默丢输入。
+// send 路径：参考图已落 IDB，必须落失败态消息引用 referenceAssetUrls（不孤儿、不丢输入）。
+// retry 路径：targetMsg 仍在、referenceFiles 临时读出未消费，warn 后 return 即可。
+describe('S01: isBusy 第二道 return 不丢输入/无孤儿参考图', () => {
+  beforeEach(() => {
+    vi.mocked(saveImportedAsset).mockReset()
+    vi.mocked(readImportedAssetFile).mockReset()
+    vi.mocked(enhanceMivoPrompt).mockReset()
+  })
+
+  it('参考图保存后 isBusy → 落 user+assistant(error) 消息，referenceAssetUrls 被引用，可 retry', async () => {
+    // 模拟 await saveReferenceAssets 期间另一生成启动：saveImportedAsset 在 resolve 前
+    // 把 isBusy 翻成 true，命中 :228 第二道 return。
+    vi.mocked(saveImportedAsset).mockImplementationOnce(async () => {
+      useChatStore.setState({ isBusy: true })
+      return {
+        assetUrl: 'mivo-asset://busy-ref',
+        name: 'ref.png',
+        type: 'image/png',
+        sizeBytes: 1,
+        title: 'ref',
+        size: '100x100',
+        dimensions: undefined,
+        sourceDimensions: { width: 100, height: 100 },
+        hasTransparency: false,
+      }
+    })
+    const warnSpy = vi.spyOn(debugLogger, 'warn')
+    const file = new File(['x'], 'ref.png', { type: 'image/png' })
+
+    await useChatStore.getState().sendMessage({
+      sceneId: 'scene-busy',
+      text: '画一只橘猫',
+      referenceFiles: [file],
+    })
+
+    const messages = useChatStore.getState().messagesByScene['scene-busy']
+    expect(messages).toHaveLength(2)
+    // 用户输入保留
+    expect(messages[0]).toMatchObject({ role: 'user', text: '画一只橘猫', status: 'done' })
+    // assistant 失败态
+    expect(messages[1]).toMatchObject({ role: 'assistant', status: 'error', errorKind: 'unknown' })
+    // 参考图被 generationContext 引用（不孤儿），retry 可重放消费
+    expect(messages[0].generationContext?.referenceAssetUrls).toEqual(['mivo-asset://busy-ref'])
+    expect(messages[1].generationContext?.referenceAssetUrls).toEqual(['mivo-asset://busy-ref'])
+    // 不设 retryDisabledReason —— isBusy 瞬时，另一生成结束后 Retry 可用
+    expect(messages[1].retryDisabledReason).toBeUndefined()
+    // warn 已记
+    expect(warnSpy.mock.calls.some((c) => /another generation is in flight/i.test(String(c[1])))).toBe(true)
+    // isBusy 未被本路径翻回 false（仍为 true，由抢先的生成负责收尾）
+    expect(useChatStore.getState().isBusy).toBe(true)
+  })
+
+  it('retryMessage 第二道 isBusy → warn 后 return，消息形态不变且不进 enhance', async () => {
+    // seed: assistant error + user，generationContext 有 referenceAssetUrls。
+    // readImportedAssetFile 在 resolve 前 flip isBusy=true 命中 :494。
+    vi.mocked(readImportedAssetFile).mockImplementationOnce(async () => {
+      useChatStore.setState({ isBusy: true })
+      return { name: 'ref.png', type: 'image/png', blob: new Blob(['x']), createdAt: 0 }
+    })
+    const warnSpy = vi.spyOn(debugLogger, 'warn')
+    useChatStore.setState({
+      messagesByScene: {
+        'scene-retry-busy': [
+          { id: 'u1', role: 'user', kind: 'text', text: '画猫', createdAt: 0, status: 'done' },
+          {
+            id: 'a1', role: 'assistant', kind: 'text', text: '', createdAt: 0, status: 'error',
+            error: '上游超时', errorKind: 'upstream-timeout',
+            generationContext: {
+              model: 'gpt-image-2',
+              requestedImgRatio: 'auto', requestedQuality: 'auto',
+              referenceAssetUrls: ['mivo-asset://retry-ref'],
+            },
+          },
+        ],
+      },
+    } as never)
+
+    await useChatStore.getState().retryMessage({ sceneId: 'scene-retry-busy', messageId: 'a1' })
+
+    const after = useChatStore.getState().messagesByScene['scene-retry-busy']
+    // 消息形态不变（仍 error），未进入 enhance/generate
+    expect(after.find((m) => m.id === 'a1')?.status).toBe('error')
+    expect(vi.mocked(enhanceMivoPrompt)).not.toHaveBeenCalled()
+    expect(warnSpy.mock.calls.some((c) => /retryMessage dropped/i.test(String(c[1])))).toBe(true)
+  })
+
+  it('busy-drop 后 retry 该消息：generate 用用户原始 text 当 prompt，不是 busyRetryAdvice', async () => {
+    // P1（Greptile）：droppedContext 必须落 finalPrompt=text，否则 retry 推导命中
+    // targetMsg.text=busyRetryAdvice 当 prompt。本用例锁行为：retry 调 generateIntoAiSlot
+    // 时第 2 参（finalPrompt）=== 用户原始 text。
+    genFacadeSpies.prepareChatSlot.mockReset()
+    genFacadeSpies.generateIntoAiSlot.mockReset()
+    genFacadeSpies.generateBesideNode.mockReset()
+    genFacadeSpies.getSceneChangeInfo.mockReset()
+
+    // 1) send busy 路径：落失败消息，generationContext.finalPrompt 固化为原始 text
+    vi.mocked(saveImportedAsset).mockImplementationOnce(async () => {
+      useChatStore.setState({ isBusy: true })
+      return {
+        assetUrl: 'mivo-asset://busy-ref',
+        name: 'ref.png',
+        type: 'image/png',
+        sizeBytes: 1,
+        title: 'ref',
+        size: '100x100',
+        dimensions: undefined,
+        sourceDimensions: { width: 100, height: 100 },
+        hasTransparency: false,
+      }
+    })
+    const file = new File(['x'], 'ref.png', { type: 'image/png' })
+    await useChatStore.getState().sendMessage({
+      sceneId: 'scene-busy-retry',
+      text: '画一只橘猫',
+      referenceFiles: [file],
+    })
+    const assistant = useChatStore.getState().messagesByScene['scene-busy-retry'][1]
+    // 前置：finalPrompt 已固化为用户原始输入
+    expect(assistant.generationContext?.finalPrompt).toBe('画一只橘猫')
+
+    // 2) 另一生成结束，isBus 复位（retry 第二道 isBusy 不再命中）
+    useChatStore.setState({ isBusy: false })
+
+    // 3) retry：readImportedAssetFile 返合法 asset 使 referenceFilesFromAssets 不抛
+    vi.mocked(readImportedAssetFile).mockResolvedValueOnce({
+      name: 'ref.png', type: 'image/png', blob: new Blob(['x']), createdAt: 0,
+    })
+    genFacadeSpies.prepareChatSlot.mockReturnValue({ slotId: 'slot-1', mode: 'into-slot' })
+    genFacadeSpies.getSceneChangeInfo.mockReturnValue({ sceneChanged: false, currentSceneId: 'scene-busy-retry' })
+    genFacadeSpies.generateIntoAiSlot.mockResolvedValueOnce(['node-1'])
+
+    await useChatStore.getState().retryMessage({ sceneId: 'scene-busy-retry', messageId: assistant.id })
+
+    // 行为断言：generate 拿到的 finalPrompt 是用户原始 text，不是 busyRetryAdvice
+    expect(genFacadeSpies.generateIntoAiSlot).toHaveBeenCalledWith(
+      'slot-1',
+      '画一只橘猫',
+      expect.objectContaining({ sceneId: 'scene-busy-retry' }),
+    )
+    const callPrompt = genFacadeSpies.generateIntoAiSlot.mock.calls[0]?.[1]
+    expect(callPrompt).toBe('画一只橘猫')
+    // 负例锚点：绝不命中 busyRetryAdvice 文案
+    expect(callPrompt).not.toBe('已有生成进行中，请稍后重试')
+    // retry 成功 → assistant 转 done
+    const after = useChatStore.getState().messagesByScene['scene-busy-retry']
+    expect(after.find((m) => m.id === assistant.id)?.status).toBe('done')
   })
 })
 
