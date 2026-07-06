@@ -92,10 +92,10 @@ export type MarkupTextShellOptions = {
   viewportScale?: number
   lodRequested?: boolean
   lodThresholdPx?: number
-  /** 选中的节点 id 集合。leafer 模式下被 Leafer 真画的 image 节点选中时，
+  /** 选中的节点 id 集合。leafer 模式下被 Leafer 真画的 image/stamp 节点选中时，
    *  保留一个"纯选中 DOM 壳"承载 .dom-node.selected 外框 + resize handles
-   *  （image 本体仍由 leaferImagePaint 真画，DOM 壳不画 <img>）。未选中 image
-   *  不产生空壳（虚拟化省下的 DOM 不加回来）。 */
+   *  （本体仍由 Leafer 真画，DOM 壳不画 <img>/贴纸）。未选中节点不产生空壳
+   *  （虚拟化省下的 DOM 不加回来）。 */
   selectedNodeIds?: ReadonlySet<string>
 }
 
@@ -148,10 +148,21 @@ export const needsImageSelectionShell = (
   options: MarkupTextShellOptions = {},
 ): boolean => node.type === 'image' && Boolean(options.selectedNodeIds?.has(node.id))
 
+/** leafer 模式下 stamp 选中时保留"纯选中 DOM 壳"。stamp 本体由
+ *  leaferBrushStampPaint 的 Group/sticker 真画；DOM 壳只承载 .dom-node.selected
+ *  外框 + 4 角等比 resize handle，不渲染 dom-markup-stamp。 */
+export const needsStampSelectionShell = (
+  node: MivoCanvasNode,
+  options: MarkupTextShellOptions = {},
+): boolean =>
+  node.type === 'markup' &&
+  node.markupKind === 'stamp' &&
+  Boolean(options.selectedNodeIds?.has(node.id))
+
 /**
  * leafer 模式下从 DOM 渲染列表里剔除已被 Leafer 画的节点；FU-11 起对需要
  * 文字层的 markup 节点放行（CanvasNodeView 渲染纯文字壳），FU-12 起对标题
- * 可见的 frame 放行（纯标题壳），image 选中时放行纯选中壳（外框 + handle）。
+ * 可见的 frame 放行（纯标题壳），image/stamp 选中时放行纯选中壳（外框 + handle）。
  * dom 模式原样返回（默认行为零变化）。
  */
 export const filterDomNodesForRendererSpike = (
@@ -165,7 +176,8 @@ export const filterDomNodesForRendererSpike = (
           !isLeaferDomFiltered(node) ||
           needsMarkupTextShell(node, textShellOptions) ||
           needsFrameTitleShell(node, textShellOptions) ||
-          needsImageSelectionShell(node, textShellOptions),
+          needsImageSelectionShell(node, textShellOptions) ||
+          needsStampSelectionShell(node, textShellOptions),
       )
     : rendererMode === 'pixi'
       ? nodes.filter((node) => !isPixiSpikePainted(node))
