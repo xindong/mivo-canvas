@@ -25,7 +25,7 @@ import {
 import { importedImageDisplaySize } from '../lib/imageSizing'
 import { normalizeCanvasSnapshotV2 } from '../model/canvasSnapshotModel'
 import { normalizeCanvasNodesV2, setNodeTransform } from '../model/documentModelV2'
-import { scenes, snapshotFromScene } from './demoScenes'
+import { DEMO_SCENE_PROJECT_MAP, scenes, snapshotFromScene } from './demoScenes'
 import { pushHistory, snapshotFromState as buildHistorySnapshot, type HistoryCloneFns } from './historyManager'
 import {
   cloneEdge,
@@ -300,6 +300,13 @@ export const canvasDocumentFromScene = (sceneId: DemoSceneId): CanvasDocument =>
   return {
     title: fallbackTitle(sceneId),
     sourceTemplateId: sceneId,
+    // Demo scenes that belong to a demo project carry its projectId here so the
+    // fresh default state (initialCanvases) groups them under the demo project
+    // rows in the sidebar. Scenes not in the map (task-states, empty) stay
+    // standalone. createCanvas({templateId}) overrides this with the explicit
+    // options.projectId (undefined when not passed) so template-new canvases do
+    // NOT auto-attach a demo project.
+    projectId: DEMO_SCENE_PROJECT_MAP[sceneId],
     createdAt: now,
     updatedAt: now,
     nodes: normalizeCanvasGraph(cloneNodes(snapshot.nodes), snapshot.edges || []),

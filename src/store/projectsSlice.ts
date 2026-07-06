@@ -8,6 +8,7 @@
 // user benefits from immediate acknowledgement (see Phase 5).
 import type { SliceCreator } from './canvasStore'
 import { logCanvas, warnCanvas } from './canvasStore'
+import { DEMO_PROJECTS } from './demoScenes'
 
 // Project ids use a `project-` prefix (distinct from `canvas-` / `group-`) so a
 // projectId is never confused with a canvasId. Mirrors createCanvasId's fallback
@@ -24,7 +25,12 @@ const nowIso = () => new Date().toISOString()
 const DEFAULT_PROJECT_NAME = 'Untitled Project'
 
 export const createProjectsSlice: SliceCreator = (set, get) => ({
-  projects: [],
+  // Fresh default state seeds the two demo projects (Concept Battlepass /
+  // 商品图方向) so the sidebar shows the demo grouping on a clean install.
+  // A copy per store creation so slice mutations never touch the shared constant.
+  // v9→v10 migration re-seeds the same projects (canvasGenerationHydration); v10+
+  // persisted state is used as-is so user-deleted demo projects do not revive.
+  projects: DEMO_PROJECTS.map((project) => ({ ...project })),
   createProject: (name) => {
     const id = createProjectId()
     const trimmed = name?.trim() || DEFAULT_PROJECT_NAME

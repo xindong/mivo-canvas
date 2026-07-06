@@ -1,7 +1,7 @@
 import { createDemoImage } from '../lib/demoImages'
 import { normalizeCanvasSnapshotV2 } from '../model/canvasSnapshotModel'
 import { normalizeCanvasNodeV2 } from '../model/documentModelV2'
-import type { DemoSceneId, MivoCanvasNode, MivoCanvasSnapshot, SceneDefinition } from '../types/mivoCanvas'
+import type { CanvasProject, DemoSceneId, MivoCanvasNode, MivoCanvasSnapshot, SceneDefinition } from '../types/mivoCanvas'
 
 export const modelNames = ['Mivo Art SDXL', 'Mivo Character v3', 'Mivo Concept Fast']
 
@@ -10,6 +10,35 @@ export const realCaseImages = [
   '/demo-assets/courage-2.jpg',
   '/demo-assets/courage-3.jpg',
 ]
+
+// Demo project grouping — single source of truth for the sidebar's demo projects.
+// Shared by the fresh default state (canvasDocumentFromScene seeds projectId;
+// createProjectsSlice seeds the project rows) and the v9→v10 migration relink
+// (canvasGenerationHydration). Stable literal ids so a v9 snapshot relinks to the
+// same project the fresh default uses. Scenes NOT in the map (task-states, empty)
+// stay standalone — mirrors origin/main's starterCanvasIds. Do not duplicate this
+// mapping elsewhere; both the store initial state and the migration import from here.
+export const DEMO_PROJECT_IDS = {
+  conceptBattlepass: 'project-demo-concept-battlepass',
+  productDirection: 'project-demo-product-direction',
+} as const
+
+// Fixed createdAt so demo project rows sort deterministically and the sidebar
+// time label is stable across boots (not a content change — demo seed only).
+const DEMO_PROJECT_CREATED_AT = '2026-07-01T00:00:00.000Z'
+
+export const DEMO_PROJECTS: CanvasProject[] = [
+  { id: DEMO_PROJECT_IDS.conceptBattlepass, name: 'Concept Battlepass', createdAt: DEMO_PROJECT_CREATED_AT },
+  { id: DEMO_PROJECT_IDS.productDirection, name: '商品图方向', createdAt: DEMO_PROJECT_CREATED_AT },
+]
+
+// sceneId → demo projectId, only for scenes that belong to a demo project.
+export const DEMO_SCENE_PROJECT_MAP: Partial<Record<DemoSceneId, string>> = {
+  'character-flow': DEMO_PROJECT_IDS.conceptBattlepass,
+  variants: DEMO_PROJECT_IDS.conceptBattlepass,
+  'asset-handoff': DEMO_PROJECT_IDS.conceptBattlepass,
+  'stress-test': DEMO_PROJECT_IDS.productDirection,
+}
 
 const image = (
   label: string,
