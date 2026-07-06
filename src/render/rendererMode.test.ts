@@ -14,9 +14,11 @@ const loadWithSearch = async (search: string | null) => {
   vi.doMock('../store/debugLogStore', () => ({
     debugLogger: { warn: vi.fn(), log: vi.fn() },
   }))
-  const mod = await import('./rendererMode')
-  vi.unstubAllGlobals()
-  return mod
+  try {
+    return await import('./rendererMode')
+  } finally {
+    vi.unstubAllGlobals()
+  }
 }
 
 describe('rendererMode(默认 leafer,dom 为应急回退通道)', () => {

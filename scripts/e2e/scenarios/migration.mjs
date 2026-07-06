@@ -1,4 +1,5 @@
 import { installE2EStoreBridge, writePersistedKv } from '../harness.mjs'
+import { waitForCanvasReady } from '../renderer-evidence.mjs'
 
 export const runMigrationScenario = async (context) => {
   const { browser, canvasUrl, generatedImageB64, isProdTopology, prodExtraHTTPHeaders, rendererMode } = context
@@ -85,20 +86,11 @@ export const runMigrationScenario = async (context) => {
         version: 1,
       }
       // 默认渲染器切 leafer 后,子页面不再依赖"无参数=dom":显式携带当前矩阵的
-      // renderer 参数,就绪信号按渲染器分流(dom 等 <img>,leafer 等真画证据)。
+      // renderer 参数,就绪信号复用 renderer-evidence 的按渲染器分流封装。
       await migrationPage.goto(canvasUrl, { waitUntil: 'networkidle' })
       await writePersistedKv(migrationPage, 'mivo-chat-demo', JSON.stringify(v1State))
       await migrationPage.reload({ waitUntil: 'networkidle' })
-      if (rendererMode === 'leafer') {
-        await migrationPage.waitForFunction(() => {
-          const shell = document.querySelector('.canvas-shell')
-          const expected = Number(shell?.getAttribute('data-leafer-expected-children') || 0)
-          const children = Number(shell?.getAttribute('data-leafer-children') || 0)
-          return expected > 0 && children === expected && shell?.getAttribute('data-leafer-pixel-nonempty') === 'true'
-        }, { timeout: 15000 })
-      } else {
-        await migrationPage.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
-      }
+      await waitForCanvasReady(migrationPage, rendererMode, { timeout: 15000 })
       const migrated = await migrationPage.evaluate(async () => {
         const resource = performance.getEntriesByType('resource').map((r) => r.name).find((n) => n.includes('chatStore.ts'))
         const moduleSpec = resource ? new URL(resource).pathname + new URL(resource).search : '/src/store/chatStore.ts'
