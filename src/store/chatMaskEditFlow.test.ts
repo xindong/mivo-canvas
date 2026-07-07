@@ -221,13 +221,13 @@ describe('beginMaskEditMessage (SC-01)', () => {
   })
 })
 
-describe('runMaskEditChatFlow (SC-04/10/05/06/07/12/16)', () => {
-  it('SC-04/10 成功路径: enhance generate mode → generating→done, resultNodeIds, sourceDeleted=false, registry 清空', async () => {
-    vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({
-      enhanced: true,
-      mode: 'generate',
-      richPrompt: 'Replace the selected masked character with a handsome male.',
-    } as never)
+describe('runMaskEditChatFlow (SC-04/10/12/16)', () => {
+  // 2026-07-07 产品决策:局部重绘不做提示词增强(红圈指认已把「改哪」说清,再润色只会
+  // 膨胀/改写原意)。enhanceMivoPrompt / buildEditContext / resolveMaskEditEnhance 已从
+  // runMaskEditChatFlow 删除,finalPrompt = payload.prompt 原样透传,enhance 字段恒 undefined。
+  // 旧 SC-05(degraded 透传)/ SC-06(chat mode replyText notice)/ SC-07(enhance 阶段取消)
+  // 测的都是已删 enhance 内部行为,场景不复存在,整段删除。
+  it('SC-04/10 成功路径: finalPrompt 原样透传 → generating→done, resultNodeIds, sourceDeleted=false, enhance=undefined, registry 清空', async () => {
     maskEditGenSpies.runMaskEditGeneration.mockImplementationOnce(async (args) => {
       // SC-13 契约:onTaskSubmitted 在 poll 前触发,写 serverTaskId
       args.callbacks?.onTaskSubmitted?.('task-1')
@@ -251,133 +251,49 @@ describe('runMaskEditChatFlow (SC-04/10/05/06/07/12/16)', () => {
     const messages = useChatStore.getState().messagesByScene['scene-1']
     const assistant = messages.find((m) => m.id === messageId)!
 
-    // enhance generate mode:patch 后 status 经 generating → done
+    // 新契约:不做 enhance,runMaskEditGeneration 收到的 payload.prompt 原样等于用户输入
+    const genCall = maskEditGenSpies.runMaskEditGeneration.mock.calls.at(-1)?.[0] as {
+      payload: { prompt: string }
+    }
+    expect(genCall.payload.prompt).toBe('把妹子换成帅哥')
+    // enhance 字段恒 undefined(不再有 enhance 阶段)
+    expect(assistant.enhance).toBeUndefined()
+    // 卡片 text 逐字等于用户输入(原样展示)
+    expect(assistant.text).toBe('把妹子换成帅哥')
+    // status 流转 generating → done
     expect(assistant.status).toBe('done')
     expect(assistant.resultNodeIds).toEqual(['n1'])
     // SC-16 反向:source 存在时 sourceDeleted 落到 message 为 false(实现按 args.sourceDeleted 写)
     expect(assistant.generationContext?.maskEdit?.sourceDeleted).toBe(false)
-    // SC-04:runMaskEditGeneration 收到的 payload.prompt 用 richPrompt
-    const genCall = maskEditGenSpies.runMaskEditGeneration.mock.calls.at(-1)?.[0] as {
-      payload: { prompt: string }
-    }
-    expect(genCall.payload.prompt).toBe('Replace the selected masked character with a handsome male.')
     // registry 清空
     expect(getMaskEditTask(messageId)).toBeUndefined()
   })
 
-  it('SC-05 degraded: enhance 返 degradedReason=timeout → runMaskEditGeneration payload.prompt 用原始 overlay prompt,enhance.degradedReason 透传', async () => {
-    vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({
-      enhanced: false,
-      degradedReason: 'timeout',
-      stage: 'fallback',
-    } as never)
+  // 正向契约测试(2026-07-07 enhance 删除后):runMaskEditChatFlow 全程不发任何 enhance
+  // 请求,卡片 text / finalPrompt 逐字等于用户输入 —— 钉住新行为核心。
+  it('新契约:不发 enhance 请求 + finalPrompt/text 逐字等于用户输入(enhance 删除后正向)', async () => {
     maskEditGenSpies.runMaskEditGeneration.mockResolvedValueOnce({ nodeIds: ['n1'], sourceDeleted: false })
 
-    const source = imageNode({ id: 'src-deg' })
+    const source = imageNode({ id: 'src-no-enhance' })
     const messageId = beginMaskEditMessage({
-      sceneId: 'scene-1',
-      source,
-      prompt: '把妹子换成帅哥',
-      slotId: 'slot-1',
-      imgRatio: '1:1',
-      quality: 'medium',
+      sceneId: 'scene-1', source, prompt: '把眼睛改成红色', slotId: 'slot-1', imgRatio: '1:1', quality: 'medium',
     })
-    const record = makeRecord({ messageId, sceneId: 'scene-1', slotId: 'slot-1', source })
+    const record = makeRecord({
+      messageId, sceneId: 'scene-1', slotId: 'slot-1', source,
+      payload: basePayload({ prompt: '把眼睛改成红色' }),
+    })
     registerMaskEditTask(record)
-
     await runMaskEditChatFlow(record)
 
-    // SC-05:runMaskEditGeneration 收到的 payload.prompt 是原始 overlay prompt(未用 richPrompt)
+    // 全程未调 enhanceMivoPrompt(新实现不做提示词增强)
+    expect(enhanceMivoPrompt).not.toHaveBeenCalled()
     const genCall = maskEditGenSpies.runMaskEditGeneration.mock.calls.at(-1)?.[0] as {
       payload: { prompt: string }
     }
-    expect(genCall.payload.prompt).toBe('把妹子换成帅哥')
-
+    expect(genCall.payload.prompt).toBe('把眼睛改成红色')
     const assistant = useChatStore.getState().messagesByScene['scene-1'].find((m) => m.id === messageId)!
-    expect(assistant.status).toBe('done')
-    // degradedReason/stage 透传到 message.enhance
-    expect(assistant.enhance?.degradedReason).toBe('timeout')
-    expect(assistant.enhance?.stage).toBe('fallback')
-    expect(getMaskEditTask(messageId)).toBeUndefined()
-  })
-
-  it('SC-06 chat mode: enhance 返 replyText → runMaskEditGeneration payload.prompt 用原始 prompt,done 后当前 scene 有 mask-edit notice 含 replyText', async () => {
-    vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({
-      enhanced: true,
-      mode: 'chat',
-      replyText: '我会按你选中的区域改,未选区域保持不变。',
-    } as never)
-    maskEditGenSpies.runMaskEditGeneration.mockResolvedValueOnce({ nodeIds: ['n1'], sourceDeleted: false })
-
-    const source = imageNode({ id: 'src-chat' })
-    const messageId = beginMaskEditMessage({
-      sceneId: 'scene-1',
-      source,
-      prompt: '把妹子换成帅哥',
-      slotId: 'slot-1',
-      imgRatio: '1:1',
-      quality: 'medium',
-    })
-    const record = makeRecord({ messageId, sceneId: 'scene-1', slotId: 'slot-1', source })
-    registerMaskEditTask(record)
-
-    await runMaskEditChatFlow(record)
-
-    // SC-06:runMaskEditGeneration 收到的 payload.prompt 是原始 overlay prompt
-    const genCall = maskEditGenSpies.runMaskEditGeneration.mock.calls.at(-1)?.[0] as {
-      payload: { prompt: string }
-    }
-    expect(genCall.payload.prompt).toBe('把妹子换成帅哥')
-
-    const messages = useChatStore.getState().messagesByScene['scene-1']
-    const assistant = messages.find((m) => m.id === messageId)!
-    expect(assistant.status).toBe('done')
-
-    // SC-06:done 后当前 scene 有 origin:'mask-edit' notice 文本含 replyText
-    const notices = messages.filter((m) => m.kind === 'notice' && m.origin === 'mask-edit')
-    expect(notices.length).toBeGreaterThanOrEqual(1)
-    expect(notices.at(-1)?.text).toContain('我会按你选中的区域改')
-  })
-
-  it('SC-07 enhance 阶段取消: abort 后 flow 自己查 signal.aborted 抛 canceled,runMaskEditGeneration 未调,removeMaskEditPlaceholder(canceled),assistant error/canceled,registry 清空', async () => {
-    // enhance 返正常值(不 reject),但 flow 在 await 后查 signal.aborted === true → throw canceled
-    vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({
-      enhanced: true,
-      mode: 'generate',
-      richPrompt: 'x',
-    } as never)
-
-    const ac = new AbortController()
-    const source = imageNode({ id: 'src-cancel' })
-    const messageId = beginMaskEditMessage({
-      sceneId: 'scene-1',
-      source,
-      prompt: '把妹子换成帅哥',
-      slotId: 'slot-1',
-      imgRatio: '1:1',
-      quality: 'medium',
-    })
-    const record = makeRecord({ messageId, sceneId: 'scene-1', slotId: 'slot-1', source, abortController: ac })
-    registerMaskEditTask(record)
-
-    // 提交前先 abort(模拟卡片取消在 enhance 阶段触发)
-    ac.abort()
-    await runMaskEditChatFlow(record)
-
-    // SC-07:cancel 在 enhance 阶段 → 不得 POST /tasks/edit
-    expect(maskEditGenSpies.runMaskEditGeneration).not.toHaveBeenCalled()
-    // removeMaskEditPlaceholder 被调(canceled:true)
-    expect(maskEditGenSpies.removeMaskEditPlaceholder).toHaveBeenCalledWith(
-      'scene-1',
-      'slot-1',
-      expect.objectContaining({ canceled: true }),
-    )
-    const assistant = useChatStore.getState().messagesByScene['scene-1'].find((m) => m.id === messageId)!
-    expect(assistant.status).toBe('error')
-    expect(assistant.errorKind).toBe('canceled')
-    expect(assistant.retryDisabledReason).toBeTruthy()
-    // registry 清空(后台 catch 收口 clearMaskEditTask)
-    expect(getMaskEditTask(messageId)).toBeUndefined()
+    expect(assistant.text).toBe('把眼睛改成红色')
+    expect(assistant.enhance).toBeUndefined()
   })
 
   it('SC-12 失败: runMaskEditGeneration reject MivoImageRequestError(upstream-error) → removeMaskEditPlaceholder(canceled:false),assistant error/upstream-error,registry 清空', async () => {
@@ -448,85 +364,9 @@ describe('runMaskEditChatFlow (SC-04/10/05/06/07/12/16)', () => {
   })
 })
 
-// F3 (审 P3): buildEditContext maskKind 派生。buildEditContext 未导出,通过 runMaskEditChatFlow
-// 间接测——mock enhanceMivoPrompt 捕获入参 editContext,验证三种 payload 的 hasMask/maskKind 组合。
-// 修复点:旧实现 bounds-only payload(maskBounds 有、mask 无)会派生 hasMask=false+maskKind='bounds'
-// 的矛盾语义;修复后 hasMask=true+maskKind='bounds'。
-describe('runMaskEditChatFlow buildEditContext maskKind 派生 (F3)', () => {
-  it('mask blob + maskBounds → hasMask=true, maskKind=brush', async () => {
-    vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({
-      enhanced: true, mode: 'generate', richPrompt: 'x',
-    } as never)
-    maskEditGenSpies.runMaskEditGeneration.mockResolvedValueOnce({ nodeIds: ['n1'], sourceDeleted: false })
-
-    const source = imageNode({ id: 'src-f3a' })
-    const messageId = beginMaskEditMessage({
-      sceneId: 'scene-1', source, prompt: 'p', slotId: 'slot-1', imgRatio: '1:1', quality: 'medium',
-    })
-    const record = makeRecord({
-      messageId, sceneId: 'scene-1', slotId: 'slot-1', source,
-      payload: basePayload({ mask: new Blob([], { type: 'image/png' }) }),
-    })
-    registerMaskEditTask(record)
-    await runMaskEditChatFlow(record)
-
-    const call = vi.mocked(enhanceMivoPrompt).mock.calls.at(-1)![0] as {
-      editContext: { hasMask: boolean; maskKind: 'brush' | 'bounds' | undefined }
-    }
-    expect(call.editContext.hasMask).toBe(true)
-    expect(call.editContext.maskKind).toBe('brush')
-  })
-
-  it('仅 maskBounds（bounds-only 无 mask blob）→ hasMask=true, maskKind=bounds（F3 修复点）', async () => {
-    vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({
-      enhanced: true, mode: 'generate', richPrompt: 'x',
-    } as never)
-    maskEditGenSpies.runMaskEditGeneration.mockResolvedValueOnce({ nodeIds: ['n1'], sourceDeleted: false })
-
-    const source = imageNode({ id: 'src-f3b' })
-    const messageId = beginMaskEditMessage({
-      sceneId: 'scene-1', source, prompt: 'p', slotId: 'slot-1', imgRatio: '1:1', quality: 'medium',
-    })
-    // basePayload 默认有 maskBounds 无 mask — 正好是 bounds-only 场景
-    const record = makeRecord({
-      messageId, sceneId: 'scene-1', slotId: 'slot-1', source,
-      payload: basePayload(),
-    })
-    registerMaskEditTask(record)
-    await runMaskEditChatFlow(record)
-
-    const call = vi.mocked(enhanceMivoPrompt).mock.calls.at(-1)![0] as {
-      editContext: { hasMask: boolean; maskKind: 'brush' | 'bounds' | undefined }
-    }
-    // F3 修复点:旧实现 hasMask=false + maskKind='bounds' 矛盾;修复后 hasMask=true + maskKind='bounds'
-    expect(call.editContext.hasMask).toBe(true)
-    expect(call.editContext.maskKind).toBe('bounds')
-  })
-
-  it('两者都无 → hasMask=false, maskKind=undefined', async () => {
-    vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({
-      enhanced: true, mode: 'generate', richPrompt: 'x',
-    } as never)
-    maskEditGenSpies.runMaskEditGeneration.mockResolvedValueOnce({ nodeIds: ['n1'], sourceDeleted: false })
-
-    const source = imageNode({ id: 'src-f3c' })
-    const messageId = beginMaskEditMessage({
-      sceneId: 'scene-1', source, prompt: 'p', slotId: 'slot-1', imgRatio: '1:1', quality: 'medium',
-    })
-    const record = makeRecord({
-      messageId, sceneId: 'scene-1', slotId: 'slot-1', source,
-      payload: basePayload({ maskBounds: undefined }),
-    })
-    registerMaskEditTask(record)
-    await runMaskEditChatFlow(record)
-
-    const call = vi.mocked(enhanceMivoPrompt).mock.calls.at(-1)![0] as {
-      editContext: { hasMask: boolean; maskKind: 'brush' | 'bounds' | undefined }
-    }
-    expect(call.editContext.hasMask).toBe(false)
-    expect(call.editContext.maskKind).toBeUndefined()
-  })
-})
+// F3 buildEditContext maskKind 派生:已随 2026-07-07 enhance 删除而删除(buildEditContext
+// 不复存在,enhanceMivoPrompt 不再被调,editContext.hasMask/maskKind 无来源)。三个
+// maskKind 派生场景不再适用,整段删除。
 
 describe('cancelMaskEditMessage (SC-08/15)', () => {
   it('SC-08 runtime 在: register record → cancelMaskEditMessage abort 了 controller,返回,不删 registry(由后台 catch 收口),不调 removeMaskEditPlaceholder', () => {
@@ -752,9 +592,11 @@ describe('retryMaskEditMessage (Item3)', () => {
     // prepareMaskEditPlaceholder 被调（sceneId, source, prompt）
     expect(maskEditGenSpies.prepareMaskEditPlaceholder).toHaveBeenCalledWith('scene-1', source, '把妹子换成帅哥')
 
-    // message patch 回 status='enhancing'
+    // enhance 删除后,runMaskEditChatFlow 不再 await enhance,patch 'enhancing' 被后续
+    // patch 'generating' 即时覆盖,同步无法断言 status='enhancing';retry 清除
+    // error/retryDisabledReason 的效果仍断言(pendingSlotId/runMaskEditGeneration 见下)。
     const msgAfter = useChatStore.getState().messagesByScene['scene-1'].find((m) => m.id === messageId)!
-    expect(msgAfter.status).toBe('enhancing')
+    expect(msgAfter.status).toBe('generating')
     expect(msgAfter.error).toBeUndefined()
     expect(msgAfter.retryDisabledReason).toBeUndefined()
     // pendingSlotId 更新为新 slot
