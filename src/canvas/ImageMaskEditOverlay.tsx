@@ -42,18 +42,15 @@ import {
   type ImageMaskSubmitPayload,
 } from './imageMaskGeometry'
 import {
-  anchorContextBlob,
   buildAnchorMarkedImage,
-  cropRegionBlob,
-  describeRegionCrop,
   type MarkedShape,
-  type RegionCandidate,
 } from '../lib/regionDescribe'
 import { anchorPositions, buildDualImagePrompt } from '../lib/maskPromptBuilder'
 import { composeMaskEditBody } from '../lib/maskEditCompose'
 import { MaskPointMarker } from './MaskPointIcon'
 import type { MaskInitialClientPoint } from './maskPointPending'
 import { toContainer, type Viewport } from '../render/EditOverlayLayer'
+import { recognitionLabel, useMaskAnchorRecognition } from './useMaskAnchorRecognition'
 
 type ImageMaskTool = 'point' | 'box' | 'ellipse' | 'loop'
 
@@ -100,21 +97,6 @@ type FloatingControlsLayout = {
   width: number
   toolbarTop: number
   promptTop: number
-}
-
-// Per-anchor recognition state (Lovart-style multi-anchor). selectedIndex -1 =
-// the custom-text option; otherwise an index into candidates.
-type AnchorRecognition = {
-  candidates: RegionCandidate[]
-  selectedIndex: number
-  customLabel: string
-  recognizing: boolean
-}
-
-// Selected label for one anchor's recognition ('' when none / not yet resolved).
-const recognitionLabel = (rec: AnchorRecognition | undefined): string => {
-  if (!rec) return ''
-  return (rec.selectedIndex >= 0 ? rec.candidates[rec.selectedIndex]?.label ?? '' : rec.customLabel).trim()
 }
 
 // 圈选工具族（2026-07-07 用户）：红圈让用户自己画——椭圆/矩形/手绘圈选/点选
@@ -240,24 +222,6 @@ export function ImageMaskEditOverlay({
   const [tool, setTool] = useState<ImageMaskTool>('ellipse')
   // 局部重绘固定用 Gemini（nano-banana，2K 指令式局部重绘）——不再提供 GPT 选项。
   // 质量由模型固定映射（maskEditQualityFor(maskEditDefaultModel) = high）。
-  // Anchor semantics（Lovart 式多锚点）：每个锚点各自识别，返回「由粗到细」的候选
-  // 列表（整体主体 … 具体部位）。每个锚点一个标签块内嵌进输入框（富文本式），点
-  // 箭头展开自己的「已标记对象」卡切换/自定义。识别只是辅助，失败静默。
-  // recognitions 按 regionKey 存每个锚点的识别态；ref 镜像供 effect 读取不触发重跑。
-  const [recognitions, setRecognitions] = useState<Record<string, AnchorRecognition>>({})
-  const recognitionsRef = useRef<Record<string, AnchorRecognition>>({})
-  const writeRecognitions = useCallback(
-    (updater: (current: Record<string, AnchorRecognition>) => Record<string, AnchorRecognition>) => {
-      const next = updater(recognitionsRef.current)
-      recognitionsRef.current = next
-      setRecognitions(next)
-    },
-    [],
-  )
-  // 每个锚点识别请求的独立 AbortController，按 regionKey 存；只在卸载时全部中止。
-  const recognitionAbortRef = useRef<Map<string, AbortController>>(new Map())
-  // openChipKey：当前展开卡片的锚点 key；null 表示收起。
-  const [openChipKey, setOpenChipKey] = useState<string | null>(null)
   const fieldRef = useRef<HTMLDivElement | null>(null)
   // 富文本编辑器 DOM（chip token + 文字混排，命令式维护 chip，不受 React 重渲染影响）。
   const editorRef = useRef<HTMLDivElement | null>(null)
@@ -292,15 +256,14 @@ export function ImageMaskEditOverlay({
     [naturalSize.height, naturalSize.width, node.height, node.imageCrop, node.width],
   )
 
-  // Stable per-anchor key from its rounded natural-pixel bounds — identity for
-  // storing/looking up recognition state across immutable region-array updates.
-  const regionKey = useCallback(
-    (region: ImageMaskRegion): string => {
-      const bounds = boundsForRegions([region], naturalSize)
-      return bounds ? [bounds.x, bounds.y, bounds.width, bounds.height].map((v) => Math.round(v)).join(':') : ''
-    },
-    [naturalSize],
-  )
+  const {
+    recognitions,
+    recognitionsRef,
+    writeRecognitions,
+    openChipKey,
+    setOpenChipKey,
+    regionKey,
+  } = useMaskAnchorRecognition({ regions, naturalSize, resolvedAssetUrl })
 
   const updateDraft = (nextDraft?: DraftRegion) => {
     draftRef.current = nextDraft
@@ -982,73 +945,8 @@ export function ImageMaskEditOverlay({
     editorRef.current?.classList.toggle('is-empty-text', !readEditor().hasText)
   }, [normalizeEditorDom, syncEditorChips, readEditor])
 
-  // Anchor semantics（多锚点）：每个新锚点落定 600ms 后各自裁剪送识别，结果按
-  // regionKey 存进 recognitions。已识别过的锚点不重复调；单点锚点把锚点位置画进
-  // 裁剪图（红圈），让识别只描述锚点指向的部位。识别只是提示，失败静默不阻塞。
-  // 关键：每个锚点用【独立】AbortController。新增锚点导致 regions 变化时，effect
-  // 清理只取消尚未触发的 debounce，绝不中止已在飞的请求——否则后放的锚点会把先放
-  // 锚点的在途请求打断，令其永远停在「识别中」（服务端已返回但客户端丢弃）。
-  useEffect(() => {
-    if (!regions.length) return undefined
-    const pending = regions
-      .map((region) => ({ region, key: regionKey(region) }))
-      .filter(({ key }) => key && !(key in recognitionsRef.current))
-    if (!pending.length) return undefined
-
-    const controllers = recognitionAbortRef.current
-    const timer = window.setTimeout(() => {
-      // 先给待识别锚点置 recognizing 占位，避免重复 kick + 让标签块显示「识别中」。
-      writeRecognitions((current) => {
-        const next = { ...current }
-        for (const { key } of pending) {
-          if (!(key in next)) next[key] = { candidates: [], selectedIndex: -1, customLabel: '', recognizing: true }
-        }
-        return next
-      })
-      for (const { region, key } of pending) {
-        const controller = new AbortController()
-        controllers.set(key, controller)
-        void (async () => {
-          const bounds = boundsForRegions([region], naturalSize)
-          if (!bounds) return
-          const marker =
-            region.type === 'brush' && region.points.length === 1
-              ? { x: region.points[0].x, y: region.points[0].y }
-              : undefined
-          // 双图识别:全图缩略(红圈标锚点位置)给全局归属,放大特写给细节 —— 修
-          // 「点在衣服花纹上只认出图案、候选里没有衣服」的裁剪视野问题。
-          const [crop, contextImage] = await Promise.all([
-            cropRegionBlob(resolvedAssetUrl, naturalSize, bounds, controller.signal, marker),
-            marker ? anchorContextBlob(resolvedAssetUrl, naturalSize, marker, controller.signal) : Promise.resolve(null),
-          ])
-          const list = crop ? await describeRegionCrop(crop, controller.signal, contextImage) : []
-          controllers.delete(key)
-          if (controller.signal.aborted) return
-          writeRecognitions((current) => ({
-            ...current,
-            // 默认选最具体的部位（列表末位）；列表为空则留在自定义。
-            [key]: {
-              candidates: list,
-              selectedIndex: list.length ? list.length - 1 : -1,
-              customLabel: '',
-              recognizing: false,
-            },
-          }))
-        })()
-      }
-    }, 600)
-    // 只清 debounce 定时器；在飞的各锚点请求让它们各自跑完（不 abort）。
-    return () => window.clearTimeout(timer)
-  }, [regions, naturalSize, resolvedAssetUrl, regionKey, writeRecognitions])
-
-  // 组件卸载时统一中止所有在途识别请求（防卸载后 setState）。
-  useEffect(() => {
-    const controllers = recognitionAbortRef.current
-    return () => {
-      controllers.forEach((controller) => controller.abort())
-      controllers.clear()
-    }
-  }, [])
+  // 识别 debounce effect + 卸载 abort effect 已搬入 useMaskAnchorRecognition hook
+  // (structure guard >900 机械抽离,行为不变)。
 
   // 卡片展开时，点字段外部（含在图片上放新锚点）即收起。
   useEffect(() => {

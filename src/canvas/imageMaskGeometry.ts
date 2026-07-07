@@ -20,6 +20,12 @@ export type ImageMaskBounds = {
   height: number
 }
 
+/** A point anchor drawn on the mask overlay (center + brush radius, in natural px). */
+export type PointAnchor = {
+  center: ImageMaskPoint
+  radius: number
+}
+
 /** Mask-edit dual-model: gemini = platform instruction-based edit (no mask file
  *  upstream, region rides in the prompt, 2K); gpt = llm-proxy alpha-mask
  *  inpainting (1K medium). Quality is fixed per model by product decision. */
