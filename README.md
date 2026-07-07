@@ -84,6 +84,16 @@ React 19 · TypeScript · Vite · Zustand · Hono + @hono/node-server · perfect
 - PR 必须通过 6 项检查:`lint + tsc + unit + logging`、`structure guard (anti-regression)`、`e2e prod subset (mock upstream)`、`e2e token gate (unauthorized)`、`e2e token gate (authorized)`、`secret scan (gitleaks)`。
 - 若任一检查失败,先读对应 job 日志,修复后重新 push;不要绕过保护,管理员也不豁免。
 
+## 本地验证 / pre-push
+
+推送前自动跑五道本地验证,把"推上去才发现 tsc 都没过"这类问题挡在本地。背景:PR #146 作者推送前没跑任何本地验证(类型错误 + 整个模块漏提交),而 GitHub 对存在冲突的 PR 不触发 `pull_request` CI,问题被静默掩盖,直到 review 才暴露。
+
+- **怎么生效**:`npm ci` / `npm install` 时自动执行 `prepare` 脚本,运行 `git config core.hooksPath .githooks`,把 `.githooks/` 目录接线为 git hook 目录。CI 与服务器跑 `prepare` 也无害(只改本地 git 配置)。
+- **跑什么**:`git push` 触发 `.githooks/pre-push`,执行 `npm run preflight`,按快→慢依次:`tsc -b` → `npm run lint` → `npm run verify:logging` → `node scripts/ci/structure-guard.mjs` → `npm run test:unit`。任一失败即阻止 push。
+- **附带警示(不阻断)**:若 `git status` 里有未跟踪的 `src/**/*.ts(x)` 文件,打印黄色警告,提示确认是否漏 `git add`(本次事故正是整个模块漏提交)。
+- **怎么跳过**:仅在确认非代码问题(如紧急修复 CI 配置本身)时,用 `PREFLIGHT_SKIP=1 git push` 逃生。日常开发不要跳。`git push --no-verify` 同样会绕过本 hook(git 原生机制,无法禁止),但它静默无提示、不留任何记录,不推荐;需要跳过时请显式用 `PREFLIGHT_SKIP=1 git push`,意图可见。
+- **手动接线**(老仓库或未跑过 install 时):`git config core.hooksPath .githooks`,或直接 `npm run prepare`。
+
 ## 文档
 
 - [产品与架构笔记](docs/product-notes.md)

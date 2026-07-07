@@ -23,7 +23,9 @@
     "test:e2e:prod": "npm run build && node scripts/e2e-runner.mjs --topology=prod",
     "start:server": "tsx server/index.ts",
     "contract:diff": "node scripts/contract-diff.mjs",
-    "codemap": "node scripts/codemap.mjs"
+    "codemap": "node scripts/codemap.mjs",
+    "preflight": "tsc -b && npm run lint && npm run verify:logging && node scripts/ci/structure-guard.mjs && npm run test:unit",
+    "prepare": "git rev-parse --git-dir >/dev/null 2>&1 && git config core.hooksPath .githooks || true"
   },
   "dependencies": {
     "@hono/node-server": "^1.19.14",
