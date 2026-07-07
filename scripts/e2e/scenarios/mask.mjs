@@ -1,9 +1,11 @@
 // scripts/e2e/scenarios/mask.mjs
 // mask-chat-card: 局部重绘并入对话生图卡片链路的主覆盖场景。
-//  新实现(2026-07-07):局部重绘不做提示词增强,/tasks/edit prompt 原样透传,无 /enhance 请求。
+//  新实现(2026-07-07):局部重绘不做 LLM 提示词增强(/enhance 零调用,SC-01 末断言);
+//  /tasks/edit prompt 走双图模板外壳(commit 253bd42 设计,runner.ts:BFF 透传前端 buildDualImagePrompt),
+//  用户原文逐字嵌在外壳内——「无增强」在网络层的形态 = 原文不被 LLM 改写,而非裸等于原文。
 //  旧 SC-02(enhance gate)/SC-03(enhance body)/SC-05(degraded)/SC-06(chat mode)已随 enhance 删除。
 //  SC-01 提交后 chat panel 立即出现 user prompt + assistant 卡片(enhancing→generating)
-//  SC-04 /tasks/edit multipart prompt === 原始用户输入(原样透传,无 richPrompt)
+//  SC-04 /tasks/edit prompt 内逐字嵌着用户原文(双图模板外壳内,无 LLM 增强)
 //  SC-10 成功后 chat 落 .chat-result-image（resultNodeIds[0]）；同场景不再只落 notice；画布 placeholder 原位替换
 //  SC-13 黑盘自愈：两次 /tasks/edit 不同 Idempotency-Key；期间 assistant 不出现 error；最终 done
 //  SC-19 chat×mask 并行取消隔离：点 mask 卡取消只 DELETE edit task，chat 卡仍 generating
@@ -184,10 +186,16 @@ export const runMaskScenario = async (context) => {
   }
   await page.waitForSelector('.chat-message-assistant .chat-result-image', { timeout: 10000 })
 
-  // SC-04: /tasks/edit multipart prompt === 原始用户输入(新实现原样透传,无 richPrompt)。
+  // SC-04: /tasks/edit 层契约 = 双图模板外壳内逐字嵌着用户原文(无 LLM 增强)。
+  //  外壳 = 确定性模板(作者设计,commit 253bd42;runner.ts:BFF 透传前端 buildDualImagePrompt);
+  //  无 LLM 增强由 /enhance 零调用断言(SC-01 末)守护;用户原文逐字性由 includes 守护。
   const mainLatestRequest = mivoEditRequests.at(-1)
-  if (!mainLatestRequest || mainLatestRequest.prompt !== mainPrompt) {
-    throw new Error(`SC-04: /tasks/edit prompt should equal original user input, got: ${JSON.stringify(mainLatestRequest?.prompt)}`)
+  if (!mainLatestRequest || !mainLatestRequest.prompt.includes(mainPrompt)) {
+    throw new Error(`SC-04: /tasks/edit prompt should embed original user input verbatim, got: ${JSON.stringify(mainLatestRequest?.prompt)}`)
+  }
+  // 防退化:成功路径(markedImage 生成成功)必走 Set-of-Mark 双图模板,外壳引用"图2"(标注图)。
+  if (!mainLatestRequest.prompt.includes('图2')) {
+    throw new Error(`SC-04: /tasks/edit prompt should carry dual-image template shell referencing 图2, got: ${JSON.stringify(mainLatestRequest.prompt)}`)
   }
 
   // SC-10: assistant done + resultNodeIds + .chat-result-image；同场景不再只落 notice。
