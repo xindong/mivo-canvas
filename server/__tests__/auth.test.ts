@@ -238,22 +238,29 @@ describe('Access gate — JWT cookie (primary credential)', () => {
   })
 })
 
-// ── 3. /api/auth/me ──────────────────────────────────────────────────────────
+// ── 3. /api/auth/me (200 探测语义:未登录答 null,不是 401/503) ───────────────
 describe('GET /api/auth/me', () => {
-  it('no cookie → 401', async () => {
+  it('no cookie → 200 {authenticated:false, user:null}', async () => {
     const r = await req('/api/auth/me')
-    expect(r.status).toBe(401)
+    expect(r.status).toBe(200)
+    expect(r.body).toEqual({ authenticated: false, user: null })
   })
-  it('valid cookie → 200 {id,name,avatar} (proxies maker /api/user/me)', async () => {
+  it('valid cookie → 200 {authenticated:true, user} (proxies maker /api/user/me)', async () => {
     const token = await signJwt('user-1')
     const r = await req('/api/auth/me', { headers: { cookie: `mivo_auth=${token}` } })
     expect(r.status).toBe(200)
-    expect(r.body).toEqual(TEST_USER)
+    expect(r.body).toEqual({ authenticated: true, user: TEST_USER })
   })
-  it('expired cookie → 401 (local verify, no maker call)', async () => {
+  it('expired cookie → 200 {authenticated:false, user:null} (local verify, no maker call)', async () => {
     const token = await signJwt('user-1', 'd', -10)
     const r = await req('/api/auth/me', { headers: { cookie: `mivo_auth=${token}` } })
-    expect(r.status).toBe(401)
+    expect(r.status).toBe(200)
+    expect(r.body).toEqual({ authenticated: false, user: null })
+  })
+  it('garbage cookie → 200 {authenticated:false, user:null} (invalid treated as not logged in)', async () => {
+    const r = await req('/api/auth/me', { headers: { cookie: 'mivo_auth=not-a-jwt' } })
+    expect(r.status).toBe(200)
+    expect(r.body).toEqual({ authenticated: false, user: null })
   })
 })
 
@@ -302,10 +309,10 @@ describe('GET /api/auth/callback — state validation', () => {
     // 3. mivo_auth cookie set
     const authCookie = cookiesFrom(r, 'mivo_auth')
     expect(authCookie).not.toBeNull()
-    // 4. that cookie works against /me
+    // 4. that cookie works against /me (200 {authenticated:true, user})
     const meRes = await req('/api/auth/me', { headers: { cookie: `mivo_auth=${authCookie}` } })
     expect(meRes.status).toBe(200)
-    expect(meRes.body).toEqual(TEST_USER)
+    expect(meRes.body).toEqual({ authenticated: true, user: TEST_USER })
   })
 })
 
@@ -342,9 +349,10 @@ describe('GET /api/auth/login-url', () => {
     // oauth state cookie set
     expect(cookiesFrom(r, 'mivo_oauth')).not.toBeNull()
   })
-  it('missing MAKER_SERVER_URL → 503', async () => {
+  it('missing MAKER_SERVER_URL → 200 {authorizeUrl:null, error} (not 503, no console noise)', async () => {
     delete process.env.MAKER_SERVER_URL
     const r = await req('/api/auth/login-url')
-    expect(r.status).toBe(503)
+    expect(r.status).toBe(200)
+    expect(r.body).toMatchObject({ authorizeUrl: null, error: 'auth_not_configured' })
   })
 })

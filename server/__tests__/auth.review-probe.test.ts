@@ -197,6 +197,64 @@ describe('A-3 review probe: dev-login production double-lock', () => {
 })
 
 // ═══════════════════════════════════════════════════════════════════════════
+// /me 200 探测语义:未登录/未配置/无效 cookie → 200 {authenticated:false, user:null},
+// 绝不返 401/503(避免浏览器 console 网络错污染 e2e)。安全属性:无效 cookie 不认证。
+// ═══════════════════════════════════════════════════════════════════════════
+describe('review probe: /me 200 probe semantics (no console noise, no security regression)', () => {
+  beforeEach(() => {
+    restoreEnv()
+    delete process.env.MIVO_BFF_TOKEN
+    process.env.MIVO_COOKIE_SECURE = '0'
+    delete process.env.NODE_ENV
+    delete process.env.MIVO_PUBLIC
+  })
+  afterEach(() => {
+    restoreEnv()
+    vi.resetModules()
+  })
+
+  it('not configured (no JWT_SECRET) → 200 {authenticated:false}, not 503', async () => {
+    delete process.env.JWT_SECRET
+    const app = await loadFreshApp()
+    const res = await app.request('/api/auth/me')
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ authenticated: false, user: null })
+  })
+
+  it('configured but no cookie → 200 {authenticated:false}', async () => {
+    process.env.JWT_SECRET = VALID_JWT_SECRET_RAW
+    const app = await loadFreshApp()
+    const res = await app.request('/api/auth/me')
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ authenticated: false, user: null })
+  })
+
+  it('invalid cookie → 200 {authenticated:false} (NOT authenticated, no info leak)', async () => {
+    process.env.JWT_SECRET = VALID_JWT_SECRET_RAW
+    const app = await loadFreshApp()
+    const res = await app.request('/api/auth/me', { headers: { cookie: 'mivo_auth=garbage.not-a-jwt' } })
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ authenticated: false, user: null })
+  })
+
+  it('expired cookie → 200 {authenticated:false}', async () => {
+    process.env.JWT_SECRET = VALID_JWT_SECRET_RAW
+    const app = await loadFreshApp()
+    const { SignJWT } = await import('jose')
+    const secretBytes = new Uint8Array(Buffer.from(VALID_JWT_SECRET_RAW, 'base64'))
+    const expired = await new SignJWT({ device: 'd' })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setSubject('user-1')
+      .setIssuedAt()
+      .setExpirationTime('-10s')
+      .sign(secretBytes)
+    const res = await app.request('/api/auth/me', { headers: { cookie: `mivo_auth=${expired}` } })
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ authenticated: false, user: null })
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
 // OAuth state cookie tamper resistance (unchanged by A-*; kept green)
 // ═══════════════════════════════════════════════════════════════════════════
 describe('review probe: OAuth state cookie tamper resistance', () => {

@@ -2,11 +2,13 @@
 // F2 regression guard: the old .settings-row Settings button + .settings-menu
 // were deleted and replaced by UserChip. Unauthenticated state shows a "Log In"
 // row; clicking it triggers the REAL login() flow (GET /api/auth/login-url).
-// In the dev e2e env the BFF has no JWT_SECRET, so login-url returns 503 and
-// login() surfaces an observable "登录启动失败" error log (per
-// docs/development-logging.md). We assert that failure path is observable, not a
-// crash — the logged-in success path (302 to Feishu) needs a configured auth env
-// + ops callback allowlist and is out of scope for local e2e.
+// In the dev e2e env the BFF has no JWT_SECRET, so login-url returns 200 with
+// {authorizeUrl:null, error:'auth_not_configured'} (200-probe semantics — a 503
+// would pollute the browser console and trip the harness console-error guard).
+// login() sees no authorizeUrl → throws → surfaces an observable "登录启动失败"
+// error log (per docs/development-logging.md). We assert that failure path is
+// observable, not a crash — the logged-in success path (302 to Feishu) needs a
+// configured auth env + ops callback allowlist and is out of scope for local e2e.
 export const runUserChipScenario = async (context) => {
   const { baseUrl, page } = context
   await page.goto(baseUrl, { waitUntil: 'networkidle' })
@@ -23,9 +25,10 @@ export const runUserChipScenario = async (context) => {
   await loginRow.waitFor()
   await loginRow.click()
 
-  // Real login() calls /api/auth/login-url; dev BFF (no JWT_SECRET) → 503, so
-  // login() logs a debugLogger.error. Verify it landed in the Debug Log so the
-  // failure path is observable (getByText retries, tolerating the async fetch).
+  // Real login() calls /api/auth/login-url; dev BFF (no JWT_SECRET) → 200 with
+  // authorizeUrl:null, so login() throws + logs a debugLogger.error. Verify it
+  // landed in the Debug Log so the failure path is observable (getByText retries,
+  // tolerating the async fetch).
   await page.getByRole('button', { name: 'Debug Log', exact: true }).click()
   await page.locator('.debug-log-panel').waitFor()
   await page.getByText('登录启动失败', { exact: false }).first().waitFor()

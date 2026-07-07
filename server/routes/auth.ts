@@ -72,7 +72,10 @@ authRoute.get('/login-url', async (c) => {
   const cfg = getAuthConfig()
   const missing = assertAuthConfigured(cfg)
   if (missing) {
-    return c.json({ error: 'auth_not_configured', message: missing }, 503)
+    // 未配置鉴权 → 200 + error body(非 503):login() 据此 toast + log "登录启动失败",
+    // 避免浏览器对 503 记 "Failed to load resource" 网络错污染 console(e2e userchip
+    // 场景点击 login 会触发)。生产环境误配置由 startup 守卫(A-1)exit 拦截,此处只兜底 dev。
+    return c.json({ authorizeUrl: null, error: 'auth_not_configured', message: missing })
   }
 
   const { codeVerifier, codeChallenge } = generatePKCE()
@@ -186,16 +189,26 @@ authRoute.get('/callback', async (c) => {
 })
 
 // --- 3. GET /api/auth/me ---
+// "当前会话是谁"是探测查询,总能成功回答:未登录的答案是 null,不是错误
+// (GitHub 等 SPA 惯例)。故未配置 / 无 cookie / 无效过期 cookie 一律 200
+// {authenticated:false, user:null} —— 避免浏览器对 non-2xx 记 "Failed to load
+// resource" 网络错(e2e console-error 断言会误挂,且 main.tsx 启动即 hydrate→/me
+// 会污染全量场景)。仅 maker 真正不可达(有效 cookie 但 maker down)返 502 真错误。
+//
+// 安全未倒退:gate(server/app.ts)独立 —— /api/auth/* 在 isGateWhitelisted 白名单,
+// 不经过 gate;/me 改 200 不影响 /api/mivo/* 受保护路由的 401。无效 cookie → 未登录
+// (null),不泄露信息、不签发 cookie。gate 对受保护路由仍 401(mivoTaskClient 401 处理不变)。
 authRoute.get('/me', async (c) => {
   const cfg = getAuthConfig()
-  if (!cfg.jwtSecretBytes) return c.json({ error: 'auth_not_configured' }, 503)
+  // 未配置鉴权(JWT_SECRET 缺)→ 未登录,无会话可验。
+  if (!cfg.jwtSecretBytes) return c.json({ authenticated: false, user: null })
 
   const token = getCookie(c, AUTH_COOKIE_NAME)
-  if (!token) return c.json({ error: 'unauthorized' }, 401)
+  if (!token) return c.json({ authenticated: false, user: null })
 
-  // 本地验签(无网络):失败直接 401,不打扰 maker。
+  // 本地验签(无网络):无效/过期 cookie → 未登录。
   const payload = await verifyAccessToken(token, cfg.jwtSecretBytes)
-  if (!payload) return c.json({ error: 'unauthorized' }, 401)
+  if (!payload) return c.json({ authenticated: false, user: null })
 
   // 代理 maker /api/user/me 拿姓名/头像(JWT claims 只有 sub+device,无展示信息)。
   let makerResp: Response
@@ -204,16 +217,19 @@ authRoute.get('/me', async (c) => {
       headers: { Authorization: `Bearer ${token}` },
     })
   } catch {
+    // 有效 cookie 但 maker 不可达 = 真错误(非"未登录"),返 502。e2e dev 环境无有效
+    // cookie,不会走到这;生产 maker 应可用。
     return c.json({ error: 'maker_unreachable' }, 502)
   }
-  if (makerResp.status === 401) return c.json({ error: 'unauthorized' }, 401)
+  // maker 401(JWT 在 maker 侧判过期,本地验签因时钟漂移通过)→ 未登录,非 401。
+  if (makerResp.status === 401) return c.json({ authenticated: false, user: null })
   if (!makerResp.ok) return c.json({ error: 'maker_user_me_failed' }, 502)
 
   const body = (await makerResp.json()) as { user?: { id?: string; name?: string; avatar?: string | null } }
   const user = body?.user
   if (!user?.id) return c.json({ error: 'maker_user_me_malformed' }, 502)
 
-  return c.json({ id: user.id, name: user.name ?? '', avatar: user.avatar ?? null })
+  return c.json({ authenticated: true, user: { id: user.id, name: user.name ?? '', avatar: user.avatar ?? null } })
 })
 
 // --- 4. POST /api/auth/logout ---

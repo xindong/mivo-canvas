@@ -27,7 +27,8 @@ export type AuthStatus = 'unknown' | 'authenticated' | 'unauthenticated'
 type AuthState = {
   user: AuthUser | null
   status: AuthStatus
-  // 启动时调:GET /api/auth/me 水合登录态。401 → 未登录;其他错 → 未登录 + 警告日志。
+  // 启动时调:GET /api/auth/me 水合登录态。200 {authenticated:false} → 未登录(info);
+  // non-2xx(502 maker 不可达)→ 未登录 + 警告日志。
   hydrate: () => Promise<void>
   // 未登录入口:GET /api/auth/login-url → 整页跳转飞书 authorize。
   login: () => Promise<void>
@@ -45,20 +46,22 @@ export const useAuthStore = create<AuthState>()((set, get) => ({
 
   hydrate: async () => {
     try {
-      const user = await fetchMe()
-      set({ user, status: 'authenticated' })
-      debugLogger.log('Auth', `会话已恢复:${user.name} (${user.id})`)
-    } catch (err) {
-      set({ user: null, status: 'unauthenticated' })
-      // 401 = 有鉴权但无有效会话;503 = BFF 未配鉴权(本地/未启用,GET /me 返
-      // auth_not_configured)。两者都是预期的「未登录」,打 info,不当异常告警 ——
-      // 否则本地/dev 环境每次启动都会刷一条 warn(e2e init-warning 断言也会误挂)。
-      if (err instanceof AuthError && (err.status === 401 || err.status === 503)) {
-        debugLogger.log('Auth', err.status === 503 ? '鉴权未配置(本地/未启用),按未登录处理' : '未登录(无有效会话)')
+      const me = await fetchMe()
+      if (me.authenticated && me.user) {
+        set({ user: me.user, status: 'authenticated' })
+        debugLogger.log('Auth', `会话已恢复:${me.user.name} (${me.user.id})`)
       } else {
-        const msg = err instanceof Error ? err.message : String(err)
-        debugLogger.warn('Auth', `会话恢复失败,按未登录处理:${msg}`)
+        // /me 200 探测语义:authenticated=false = 未登录(含未配置鉴权 / 无 cookie /
+        // 无效过期 cookie)。这是预期态,打 info 不告警 —— 避免本地/dev 环境每次启动
+        // 刷 warn(e2e init-warning 断言也会误挂),且浏览器 console 零网络错(200)。
+        set({ user: null, status: 'unauthenticated' })
+        debugLogger.log('Auth', '未登录(无有效会话)')
       }
+    } catch (err) {
+      // non-2xx 真错误(maker 不可达 502 等)→ 未登录 + 警告日志。
+      set({ user: null, status: 'unauthenticated' })
+      const msg = err instanceof Error ? err.message : String(err)
+      debugLogger.warn('Auth', `会话恢复失败,按未登录处理:${msg}`)
     }
   },
 
