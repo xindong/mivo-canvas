@@ -28,6 +28,21 @@
 
 import type { MivoEditRequest, MivoGenerateRequest, VariationParam } from '../types/generation'
 import { MivoImageRequestError, formatMivoClientError } from './mivoImageClient'
+import { useSettingsStore } from '../store/settingsSlice'
+
+// Per-request key headers (B1: keys live browser-side). X-Mivo-Api-Key is wired
+// into the BFF platform ctx + per-key token bucketing (server/lib/keys.ts +
+// server/platform/state.ts); X-Gateway-Key is a reserved passthrough slot the BFF
+// does not read yet (env MIVO_IMAGE_API_KEY stays SSoT for llm-proxy). Reading
+// getState() per call (not a hook) keeps this module usable from non-component
+// call sites and always reflects the latest persisted key.
+const authHeaders = (): Record<string, string> => {
+  const { mivoKey, gatewayKey } = useSettingsStore.getState()
+  const headers: Record<string, string> = {}
+  if (mivoKey) headers['X-Mivo-Api-Key'] = mivoKey
+  if (gatewayKey) headers['X-Gateway-Key'] = gatewayKey
+  return headers
+}
 
 const defaultModel = 'gpt-image-2'
 const submitTimeoutMs = 30_000 // POST must return 202 quickly
@@ -128,6 +143,7 @@ export const submitGenerationTask = async (
     {
       method: 'POST',
       headers: {
+        ...authHeaders(),
         'Content-Type': 'application/json',
         'Idempotency-Key': request.idempotencyKey,
       },
@@ -182,7 +198,7 @@ export const submitEditTask = async (
     '/api/mivo/tasks/edit',
     {
       method: 'POST',
-      headers: { 'Idempotency-Key': request.idempotencyKey },
+      headers: { ...authHeaders(), 'Idempotency-Key': request.idempotencyKey },
       body: formData,
     },
     submitTimeoutMs,
@@ -213,7 +229,7 @@ export const submitVariationsTask = async (
     '/api/mivo/tasks/variations',
     {
       method: 'POST',
-      headers: { 'Idempotency-Key': request.idempotencyKey },
+      headers: { ...authHeaders(), 'Idempotency-Key': request.idempotencyKey },
       body: formData,
     },
     submitTimeoutMs,
@@ -237,7 +253,7 @@ export const submitVariationsTask = async (
 export const pollTask = async (taskId: string, signal?: AbortSignal): Promise<TaskView> => {
   const response = await fetchWithTimeout(
     `/api/mivo/tasks/${encodeURIComponent(taskId)}`,
-    { method: 'GET' },
+    { method: 'GET', headers: { ...authHeaders() } },
     pollTimeoutMs,
     signal,
   )
@@ -279,7 +295,7 @@ export const cancelTask = async (taskId: string, signal?: AbortSignal): Promise<
   try {
     await fetchWithTimeout(
       `/api/mivo/tasks/${encodeURIComponent(taskId)}`,
-      { method: 'DELETE' },
+      { method: 'DELETE', headers: { ...authHeaders() } },
       pollTimeoutMs,
       signal,
     )

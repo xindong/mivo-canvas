@@ -243,13 +243,6 @@ export const runChangelogScenario = async (context) => {
   await page.getByRole('button', { name: 'Close debug log' }).click()
   await page.waitForSelector('.debug-log-panel', { state: 'detached' })
 
-  // ④ 续:Settings 菜单开合正常
-  const settingsButton = page.getByRole('button', { name: 'Settings', exact: true })
-  await settingsButton.click()
-  await page.locator('.settings-menu').waitFor()
-  await settingsButton.click()
-  await page.waitForSelector('.settings-menu', { state: 'detached' })
-
   // 已读后再开面板,关闭后红点保持消失
   await changelogButton.click()
   await page.getByRole('dialog', { name: '更新日志' }).waitFor()

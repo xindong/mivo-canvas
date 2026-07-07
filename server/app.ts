@@ -19,6 +19,7 @@ import { createLocalAssetsRoutes } from './routes/local-assets'
 import { createEagleRoutes } from './routes/eagle'
 import { createPinterestRoutes } from './routes/pinterest'
 import { createProxyImageRoutes } from './routes/proxy-image'
+import { keysRoute } from './routes/keys'
 import { tasksRoute } from './routes/tasks'
 
 const tokenEquals = (a: string, b: string): boolean => {
@@ -106,6 +107,11 @@ app.route('/api/mivo', createProxyImageRoutes())
 // P2-C1a: async task endpoints (additive — not in dev diff baseline).
 // POST /tasks/generate|edit → 202 {taskId}; GET/DELETE /tasks/:id.
 app.route('/api/mivo/tasks', tasksRoute)
+
+// E2: gateway key probe — BFF proxies GET llm-proxy /v1/models so the browser
+// never exposes the sk- key to CORS or upstream logs. Stateless (no DB); still
+// protected by the access gate above (not in the /api/auth/* whitelist).
+app.route('/api/keys', keysRoute)
 
 // Same-origin static hosting of dist/ (Vite build output). serveStatic only
 // accepts a root relative to cwd and calls next() on miss, letting the SPA

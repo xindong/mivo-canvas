@@ -205,6 +205,74 @@ export const idbStateStorage = {
 }
 
 /**
+ * Strict IDB-only StateStorage for SECRETS (B1: the two API keys must NEVER touch
+ * localStorage — it is less protected than IDB and survives neither tab close nor
+ * "clear recent history" the way an encrypted OS keychain would). Unlike
+ * idbStateStorage, this NEVER falls back to localStorage: if IDB is unavailable or
+ * a write fails, the value stays in-memory only (survives the session, not a
+ * reload) and the user is told via toast so they can re-enter the key. Reads skip
+ * the legacy localStorage migration — a brand-new secret store has no legacy key
+ * to migrate, and we don't want to read a possibly-stale localStorage blob when
+ * IDB is the only authority. canvasStore keeps its own canvas-friendly fallback
+ * path via idbStateStorage; this strict variant is opt-in for secret stores only.
+ */
+export const strictIdbStateStorage = {
+  getItem: async (name: string): Promise<string | null> => {
+    if (!isIdbAvailable()) {
+      debugLogger.error(SOURCE, `IDB unavailable; cannot load ${name} (no localStorage fallback for secrets)`)
+      return null
+    }
+    try {
+      const record = await runTransaction<KvRecord | undefined>('readonly', (store) =>
+        store.get(name) as IDBRequest<KvRecord | undefined>,
+      )
+      return record?.value ?? null
+    } catch (error) {
+      debugLogger.error(SOURCE, `getItem failed for ${name} (no fallback): ${errMessage(error)}`)
+      return null
+    }
+  },
+
+  setItem: async (name: string, value: string): Promise<void> => {
+    if (
+      typeof globalThis !== 'undefined' &&
+      (globalThis as unknown as { __MIVO_BENCH_PERSIST_SKIP__?: boolean }).__MIVO_BENCH_PERSIST_SKIP__
+    ) {
+      return
+    }
+    if (!isIdbAvailable()) {
+      debugLogger.error(SOURCE, `IDB unavailable; ${name} not persisted (will not survive reload)`)
+      toastFeedback.error('浏览器存储不可用，Key 未持久化。请检查隐私模式或浏览器存储设置。')
+      return
+    }
+    try {
+      await runTransaction('readwrite', (store) =>
+        store.put({ key: name, value } as unknown as KvRecord),
+      )
+    } catch (error) {
+      if (isQuotaError(error)) {
+        debugLogger.error(SOURCE, `quota exceeded writing ${name}; secret not persisted`)
+        toastFeedback.error('存储已满，Key 未保存。请清理浏览器存储后重试。')
+        return
+      }
+      debugLogger.error(SOURCE, `setItem failed for ${name} (no fallback): ${errMessage(error)}`)
+      toastFeedback.error('Key 持久化失败，请重试。')
+    }
+  },
+
+  removeItem: async (name: string): Promise<void> => {
+    // No localStorage fallback path ever wrote anything, so when IDB is down there
+    // is nothing to delete. Just log + no-op.
+    if (!isIdbAvailable()) return
+    try {
+      await runTransaction('readwrite', (store) => store.delete(name))
+    } catch (error) {
+      debugLogger.warn(SOURCE, `removeItem failed for ${name}: ${errMessage(error)}`)
+    }
+  },
+}
+
+/**
  * Test-only: close the cached DB connection + delete the DB so the next call
  * reopens from scratch. Not for app code. Async because IDB close/delete are
  * async (a long-lived connection blocks `deleteDatabase` until closed).
