@@ -9,7 +9,8 @@
 // runGenerateTask/runEditTask WITHOUT awaiting, and returns {taskId} immediately.
 // Errors are caught and recorded as task failures (never thrown to the caller).
 
-import { defaultMivoImageModel, getEnvConfig, resolveEditUpstreamTimeoutMs, type PlatformCtx } from '../lib/config'
+import { defaultMivoImageModel, getEnvConfig, resolveEditUpstreamTimeoutMs } from '../lib/config'
+import { platformCtxFromKey } from '../lib/keys'
 import { fetchUpstreamWithTimeout, readUpstreamError, UpstreamRequestTimeoutError } from '../lib/upstream'
 import { normalizeMivoImages, normalizeMivoQuality, resolveRatioPayload } from '../lib/images'
 import { logMaskModelOverride, logTaskTerminal } from '../lib/request'
@@ -149,6 +150,10 @@ export type GenerateParams = {
   quality?: unknown // raw; normalized here
   model?: unknown // raw; normalized here
   n?: unknown
+  /** Per-request mivo_ key from the X-Mivo-Api-Key header (B1: keys live
+   * browser-side). Falls back to env MIVO_PLATFORM_KEY when absent so legacy
+   * single-deployment configs keep working. Drives per-key token bucketing. */
+  platformKey?: string
 }
 
 export type EditParams = {
@@ -159,6 +164,8 @@ export type EditParams = {
   model?: unknown
   mask?: File
   references: File[]
+  /** Per-request mivo_ key from X-Mivo-Api-Key (see GenerateParams.platformKey). */
+  platformKey?: string
 }
 
 // Generate task. Dispatch: platform channel → runMivoPlatformImageJob (real
@@ -168,7 +175,7 @@ export const runGenerateTask = async (taskId: string, params: GenerateParams): P
   if (!record) return
   if (canceledInFlight(taskId)) return
   const env = getEnvConfig()
-  const platformCtx: PlatformCtx = { platformKey: env.platformKey, platformEndpoint: env.platformEndpoint }
+  const platformCtx = platformCtxFromKey(params.platformKey)
   const quality = normalizeMivoQuality(params.quality)
   const model = typeof params.model === 'string' && params.model.trim() ? params.model.trim() : defaultMivoImageModel
   const channel = MIVO_PLATFORM_CHANNELS[model] ? 'platform' : 'llm-proxy'
@@ -250,7 +257,7 @@ export const runEditTask = async (taskId: string, params: EditParams): Promise<v
   if (!record) return
   if (canceledInFlight(taskId)) return
   const env = getEnvConfig()
-  const platformCtx: PlatformCtx = { platformKey: env.platformKey, platformEndpoint: env.platformEndpoint }
+  const platformCtx = platformCtxFromKey(params.platformKey)
   const quality = normalizeMivoQuality(params.quality)
   const mask = params.mask
   const requestedModel = typeof params.model === 'string' && params.model.trim() ? params.model.trim() : defaultMivoImageModel

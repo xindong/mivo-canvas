@@ -1734,69 +1734,6 @@ button:disabled {
   text-align: center;
 }
 
-.settings-menu {
-  display: grid;
-  gap: 2px;
-  padding: 6px;
-  background: rgba(255, 250, 240, 0.86);
-  border: 1px solid rgba(35, 35, 35, 0.08);
-  border-radius: var(--radius-md);
-  box-shadow: 0 14px 34px rgba(35, 35, 35, 0.1);
-  animation: settings-menu-in 160ms cubic-bezier(0.22, 1, 0.36, 1);
-  transform-origin: bottom left;
-}
-
-.settings-menu button {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 9px;
-  height: 32px;
-  padding: 0 8px;
-  color: #554f48;
-  background: transparent;
-  border-radius: var(--radius-sm);
-  font-size: var(--text-md);
-  text-align: left;
-  cursor: pointer;
-}
-
-.settings-menu button:hover {
-  color: var(--ink);
-  background: rgba(35, 35, 35, 0.06);
-}
-
-.settings-menu span:not(.settings-menu-separator),
-.settings-menu em {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.settings-menu em {
-  color: var(--quiet);
-  font-size: 11px;
-  font-style: normal;
-}
-
-.settings-menu-separator {
-  height: 1px;
-  margin: 5px 4px;
-  background: rgba(35, 35, 35, 0.1);
-}
-
-@keyframes settings-menu-in {
-  from {
-    opacity: 0;
-    transform: translateY(8px) scale(0.98);
-  }
-
-  to {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-  }
-}
-
 @keyframes debug-log-dialog-in {
   from {
     opacity: 0;
@@ -8171,4 +8108,483 @@ button:disabled {
 .project-row-create:hover {
   background: rgba(105, 87, 232, 0.14);
   color: var(--violet);
+}
+
+/* ===== E2: settings UI — user chip, settings panel, gateway key dialog, mivo key ===== */
+/* User chip (sidebar bottom, authenticated state). Not-authenticated state reuses
+   the existing .settings-row grid so "Log In" matches the sidebar bottom rows. */
+.user-chip {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  color: var(--muted);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm, 8px);
+  cursor: pointer;
+  text-align: left;
+}
+.user-chip:hover {
+  background: rgba(35, 35, 35, 0.05);
+}
+.user-chip-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+  background: rgba(105, 87, 232, 0.16);
+  color: var(--violet);
+}
+.user-chip-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.user-chip-avatar-fallback {
+  font-size: 12px;
+  font-weight: 600;
+}
+.user-chip-text {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+.user-chip-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--fg, #242424);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.user-chip-sub {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* Settings panel + backdrop (same pattern as ChangelogPanel / debug-log-panel) */
+.settings-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(35, 35, 35, 0.28);
+}
+.settings-panel {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 12px;
+  width: min(560px, calc(100vw - 48px));
+  max-height: min(620px, calc(100vh - 48px));
+  padding: 16px;
+  color: var(--muted);
+  background: rgba(255, 250, 240, 0.94);
+  border: 1px solid rgba(35, 35, 35, 0.1);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 24px 64px rgba(35, 35, 35, 0.22);
+  backdrop-filter: blur(18px) saturate(1.08);
+  animation: debug-log-dialog-in 160ms cubic-bezier(0.22, 1, 0.36, 1);
+  overflow: hidden;
+}
+.settings-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 4px 6px;
+  border-bottom: 1px solid rgba(35, 35, 35, 0.08);
+}
+.settings-panel-header strong {
+  font-size: 15px;
+  color: var(--fg, #242424);
+}
+.settings-panel-header button {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  border-radius: 8px;
+  cursor: pointer;
+}
+.settings-panel-header button:hover {
+  background: rgba(35, 35, 35, 0.06);
+}
+.settings-panel-body {
+  display: grid;
+  gap: 18px;
+  overflow-y: auto;
+  padding: 2px 4px;
+}
+.settings-section {
+  display: grid;
+  gap: 10px;
+}
+.settings-section h4 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.settings-account-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+}
+.settings-account-info {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+.settings-account-name {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--fg, #242424);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.settings-account-sub {
+  font-size: 12px;
+  color: var(--muted);
+}
+.settings-logout-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  font-size: 13px;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid rgba(35, 35, 35, 0.14);
+  border-radius: 999px;
+  cursor: pointer;
+}
+.settings-logout-btn:hover {
+  background: rgba(35, 35, 35, 0.05);
+}
+
+/* Gateway key row (inline in settings panel) */
+.gateway-key-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid rgba(35, 35, 35, 0.1);
+  border-radius: 12px;
+}
+.gateway-key-row-info {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.gateway-key-row-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--fg, #242424);
+}
+.gateway-key-row-meta {
+  font-size: 12px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gateway-key-row-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.gateway-key-disconnect {
+  font-size: 12px;
+  color: #bf3b2f;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 8px;
+}
+.gateway-key-disconnect:hover {
+  background: rgba(191, 59, 47, 0.1);
+}
+
+/* Pill buttons (primary / secondary) */
+.btn-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 16px;
+  font-size: 13px;
+  font-weight: 500;
+  border-radius: 999px;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+.btn-pill:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.btn-pill-primary {
+  color: #fff;
+  background: var(--violet);
+  border-color: var(--violet);
+}
+.btn-pill-primary:hover:not(:disabled) {
+  filter: brightness(1.06);
+}
+.btn-pill-secondary {
+  color: var(--muted);
+  background: transparent;
+  border-color: rgba(35, 35, 35, 0.16);
+}
+.btn-pill-secondary:hover:not(:disabled) {
+  background: rgba(35, 35, 35, 0.05);
+}
+
+/* Gateway key dialog (modal) */
+.gateway-key-dialog {
+  display: grid;
+  gap: 12px;
+  width: min(440px, calc(100vw - 48px));
+  padding: 18px;
+  color: var(--muted);
+  background: rgba(255, 250, 240, 0.96);
+  border: 1px solid rgba(35, 35, 35, 0.1);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 24px 64px rgba(35, 35, 35, 0.22);
+  backdrop-filter: blur(18px) saturate(1.08);
+  animation: debug-log-dialog-in 160ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.gateway-key-dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.gateway-key-dialog-header strong {
+  font-size: 15px;
+  color: var(--fg, #242424);
+}
+.gateway-key-dialog-header button {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  border-radius: 8px;
+  cursor: pointer;
+}
+.gateway-key-dialog-header button:hover {
+  background: rgba(35, 35, 35, 0.06);
+}
+.gateway-key-dialog-desc {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+.gateway-key-input-wrap {
+  position: relative;
+}
+.gateway-key-input {
+  width: 100%;
+  height: 40px;
+  padding: 0 40px 0 12px;
+  font-size: 13px;
+  color: var(--fg, #242424);
+  background: rgba(35, 35, 35, 0.04);
+  border: 1px solid rgba(35, 35, 35, 0.14);
+  border-radius: 10px;
+  outline: none;
+}
+.gateway-key-input.error {
+  border-color: #bf3b2f;
+  background: rgba(191, 59, 47, 0.06);
+}
+.gateway-key-input:focus {
+  border-color: var(--violet);
+}
+.gateway-key-eye {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.gateway-key-eye:hover {
+  color: var(--fg, #242424);
+}
+.gateway-key-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0;
+  font-size: 12px;
+  color: #bf3b2f;
+}
+.gateway-key-console-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--violet);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  width: fit-content;
+}
+.gateway-key-console-link:hover {
+  text-decoration: underline;
+}
+.gateway-key-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* Mivo key section (debounced auto-save card) */
+.mivo-key-section {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid rgba(35, 35, 35, 0.1);
+  border-radius: 12px;
+}
+.mivo-key-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.mivo-key-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--fg, #242424);
+}
+.mivo-key-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  font-size: 11px;
+  border-radius: 999px;
+  border: 1px solid rgba(35, 35, 35, 0.12);
+  background: rgba(35, 35, 35, 0.04);
+}
+.mivo-key-badge.saved {
+  color: #2f7d4f;
+}
+.mivo-key-badge.needs-config {
+  color: var(--muted);
+}
+.mivo-key-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: currentColor;
+}
+.mivo-key-desc {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+.mivo-key-input-wrap {
+  position: relative;
+}
+.mivo-key-input {
+  width: 100%;
+  height: 40px;
+  padding: 0 40px 0 12px;
+  font-size: 13px;
+  color: var(--fg, #242424);
+  background: rgba(35, 35, 35, 0.04);
+  border: 1px solid rgba(35, 35, 35, 0.14);
+  border-radius: 10px;
+  outline: none;
+}
+.mivo-key-input.error {
+  border-color: #bf3b2f;
+  background: rgba(191, 59, 47, 0.06);
+}
+.mivo-key-input:focus {
+  border-color: var(--violet);
+}
+.mivo-key-eye {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.mivo-key-eye:hover {
+  color: var(--fg, #242424);
+}
+.mivo-key-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 18px;
+}
+.mivo-key-error {
+  font-size: 12px;
+  color: #bf3b2f;
+}
+.mivo-key-masked {
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.mivo-key-console-link {
+  font-size: 12px;
+  color: var(--violet);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+}
+.mivo-key-console-link:hover {
+  text-decoration: underline;
+}
+.mivo-key-clear {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  color: #bf3b2f;
+  cursor: pointer;
+  border-radius: 8px;
+}
+.mivo-key-clear:hover {
+  background: rgba(191, 59, 47, 0.1);
 }

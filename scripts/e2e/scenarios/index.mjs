@@ -23,6 +23,7 @@ import { runShellSidebarScenario } from './shell-sidebar.mjs'
 import { runStampOverlapScenario } from './stamp-overlap.mjs'
 import { runVariationsAnnotationScenario } from './variations-annotation.mjs'
 import { runZoomToolScenario } from './zoom-tool.mjs'
+import { runUserChipScenario } from './userchip.mjs'
 
 export const scenarioOrder = [
   'debug',
@@ -50,6 +51,7 @@ export const scenarioOrder = [
   'coordinate-probe',
   'stamp-overlap',
   'project-sidebar',
+  'userchip',
 ]
 
 // leafer 模式显式 skip 名单(带理由,e2e-smoke 读取)。原则:只有当场景的断言
@@ -94,4 +96,5 @@ export const scenarioRunners = {
   'stamp-overlap': runStampOverlapScenario,
   'variations-annotation': runVariationsAnnotationScenario,
   'zoom-tool': runZoomToolScenario,
+  'userchip': runUserChipScenario,
 }
