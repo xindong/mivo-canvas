@@ -725,7 +725,7 @@ export function ImageMaskEditOverlay({
       .replace(/\s+/g, ' ')
       .trim()
     return { prompt, hasText: textChars.trim().length > 0 }
-  }, [])
+  }, [recognitionsRef])
 
   const buildChipNode = useCallback((key: string, n: number, label: string): HTMLElement => {
     const chip = document.createElement('span')
@@ -958,7 +958,7 @@ export function ImageMaskEditOverlay({
     }
     window.addEventListener('pointerdown', handlePointerDown, true)
     return () => window.removeEventListener('pointerdown', handlePointerDown, true)
-  }, [openChipKey])
+  }, [openChipKey, setOpenChipKey])
 
   // Cmd/Ctrl+Z 撤销锚点、Cmd/Ctrl+Shift+Z 重做(Mac 用 Cmd,Win/Linux 用 Ctrl)。
   // 焦点在文本框/输入框内时交给浏览器原生撤销,不劫持打字撤销。
