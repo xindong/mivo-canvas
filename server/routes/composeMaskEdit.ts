@@ -11,7 +11,7 @@ import type { Handler } from 'hono'
 import type { HttpBindings } from '@hono/node-server'
 import { getEnvConfig, mivoDescribeFallbackModel, mivoDescribePrimaryModel } from '../lib/config'
 import { fetchUpstreamWithTimeout } from '../lib/upstream'
-import { logRequest, newRequestId } from '../lib/request'
+import { logRequest, newRequestId, readJsonBody } from '../lib/request'
 
 type ComposeAnchor = { n: number; label: string; position?: string }
 
@@ -110,7 +110,7 @@ export const composeMaskEditHandler: Handler<{ Bindings: HttpBindings }> = async
       log(405)
       return c.json({ error: 'Method not allowed' }, 405)
     }
-    const body = (await c.req.json().catch(() => ({}))) as { instruction?: unknown; anchors?: unknown }
+    const body = await readJsonBody<{ instruction?: unknown; anchors?: unknown }>(c)
     const instruction = typeof body.instruction === 'string' ? body.instruction.trim().slice(0, 1000) : ''
     const anchors = sanitizeAnchors(body.anchors)
     if (!instruction || !anchors.length) {
