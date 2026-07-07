@@ -28,11 +28,24 @@
 
 import type { MivoEditRequest, MivoGenerateRequest, VariationParam } from '../types/generation'
 import { MivoImageRequestError, formatMivoClientError } from './mivoImageClient'
+import { useAuthStore } from '../store/authSlice'
+import { toastFeedback } from '../store/toastStore'
 
 const defaultModel = 'gpt-image-2'
 const submitTimeoutMs = 30_000 // POST must return 202 quickly
 const pollTimeoutMs = 15_000 // each GET
 const defaultPollIntervalMs = 1000
+
+// feat/auth-feishu-login: 受保护 AI/生图 API 401(未登录 / 会话过期)→ 置未登录态
+// + toast 提示登录。幂等:仅在从未登录态转出时 toast 一次,避免批量 401 刷屏。
+// 集中在 fetchWithTimeout 一处,E2 的 X-Mivo-Api-Key header 注入在调用方 headers,
+// 两处改动落在不同行段,降低 app.ts/mivoTaskClient 合并冲突面。
+const onProtectedApi401 = (): void => {
+  const { status, markUnauthenticated } = useAuthStore.getState()
+  if (status === 'unauthenticated') return
+  markUnauthenticated()
+  toastFeedback.warn('请先登录后再使用此功能。')
+}
 
 export type TaskStatus = 'pending' | 'running' | 'done' | 'partial' | 'failed' | 'canceled' | 'unknown'
 export type TaskKind = 'generate' | 'edit' | 'variations'
@@ -91,7 +104,13 @@ const fetchWithTimeout = async (
     signal?.addEventListener('abort', abortFromParent, { once: true })
   }
   try {
-    return await fetch(input, { ...init, signal: controller.signal })
+    const response = await fetch(input, { ...init, signal: controller.signal })
+    // feat/auth-feishu-login: 401 = 会话失效/未登录,置未登录态 + toast(幂等)。
+    // 响应仍原样返回,调用方 !response.ok 分支照常抛 MivoImageRequestError。
+    if (response.status === 401) {
+      onProtectedApi401()
+    }
+    return response
   } catch (error) {
     if (error instanceof Error && error.name === 'AbortError') {
       throw new MivoImageRequestError(
