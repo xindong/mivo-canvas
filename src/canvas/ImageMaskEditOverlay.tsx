@@ -24,21 +24,17 @@ import { createPortal } from 'react-dom'
 import { debugLogger } from '../store/debugLogStore'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 import {
-  boundsForRegions,
   buildEditMaskBlob,
   displayRectForImage,
-  maskEditDefaultModel,
-  maskEditQualityFor,
   nodePointToImagePixel,
   pointMaskRadiusFor,
   validateMaskCanvasSize,
-  type ImageMaskBounds,
   type ImageMaskPoint,
   type ImageMaskRegion,
   type ImageMaskSubmitPayload,
 } from './imageMaskGeometry'
 import type { MaskInitialClientPoint } from './maskPointPending'
-import { buildMaskEditPromptBundle } from './maskEditSubmit'
+import { buildMaskEditSubmission } from './maskEditSubmit'
 import { useMaskRichEditor } from './useMaskRichEditor'
 import {
   pointAnchorPath,
@@ -47,7 +43,7 @@ import {
   renderRegionBadge,
 } from './maskEditOverlayRender'
 import { toContainer, type Viewport } from '../render/EditOverlayLayer'
-import { recognitionLabel, useMaskAnchorRecognition } from './useMaskAnchorRecognition'
+import { useMaskAnchorRecognition } from './useMaskAnchorRecognition'
 
 type ImageMaskTool = 'point' | 'box' | 'ellipse' | 'loop'
 
@@ -116,10 +112,7 @@ const floatingControlsMaxWidth = 480
 
 const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max)
 
-// 渲染辅助(radiusToNode / regionPath / pointAnchorPath / renderPointMarker /
-// renderRegionBadge)已抽离到 ./maskEditOverlayRender (structure guard >900,
-// 机械抽离,行为不变)。
-
+// 渲染辅助已抽离到 ./maskEditOverlayRender(机械抽离,行为不变)。
 export function ImageMaskEditOverlay({
   node,
   resolvedAssetUrl,
@@ -558,34 +551,18 @@ export function ImageMaskEditOverlay({
       const mask = regions.length
         ? await buildEditMaskBlob({ naturalSize, imageCrop: node.imageCrop, regions })
         : undefined
-      // 多锚点：每个锚点带识别标签 + 自身 bounds（供红圈标注图 + 兜底用）。
-      const subjects = regions
-        .map((region) => {
-          const label = recognitionLabel(recognitionsRef.current[regionKey(region)])
-          const bounds = boundsForRegions([region], naturalSize)
-          return label && bounds ? { label, bounds } : undefined
-        })
-        .filter((subject): subject is { label: string; bounds: ImageMaskBounds } => Boolean(subject))
-      // 提交装配(锚点方位编排 + 结构化提示词组装 + 红圈标注图)已抽离到
-      // ./maskEditSubmit (structure guard >900,机械抽离,行为不变)。
-      const { finalPrompt, markedImage } = await buildMaskEditPromptBundle({
-        body,
-        regions,
-        naturalSize,
-        resolvedAssetUrl,
-        recognitionsRef,
-        regionKey,
-      })
-      await onSubmit({
-        prompt: finalPrompt,
-        mask,
-        maskBounds: regions.length ? boundsForRegions(regions, naturalSize) : undefined,
-        sourceSize: naturalSize,
-        model: maskEditDefaultModel,
-        quality: maskEditQualityFor(maskEditDefaultModel),
-        subjects: subjects.length ? subjects : undefined,
-        markedImage: markedImage ?? undefined,
-      })
+      // 提交装配已抽离到 ./maskEditSubmit(机械抽离,行为不变);mask 由外部 await 后传入。
+      await onSubmit(
+        await buildMaskEditSubmission({
+          body,
+          regions,
+          naturalSize,
+          resolvedAssetUrl,
+          recognitionsRef,
+          regionKey,
+          mask,
+        }),
+      )
       // 成功：overlay 由 hook 清 maskEditNodeId 卸载，submitInFlightRef 随卸载解除，不主动清。
     } catch (error) {
       submitInFlightRef.current = false // 调度失败清回，允许重试
@@ -593,8 +570,7 @@ export function ImageMaskEditOverlay({
     }
   }
 
-  // 富文本编辑器(chip 维护/序列化/输入/粘贴/键盘/点击 + 同步 effect)已抽离到
-  // ./useMaskRichEditor (structure guard >900,机械抽离,行为不变)。
+  // 富文本编辑器已抽离到 ./useMaskRichEditor(机械抽离,行为不变)。
   const {
     readEditor,
     handleEditorInput,
@@ -615,9 +591,6 @@ export function ImageMaskEditOverlay({
     onCancel,
     commitMaskState,
   })
-
-  // 识别 debounce effect + 卸载 abort effect 已搬入 useMaskAnchorRecognition hook
-  // (structure guard >900 机械抽离,行为不变)。
 
   // 卡片展开时，点字段外部（含在图片上放新锚点）即收起。
   useEffect(() => {
