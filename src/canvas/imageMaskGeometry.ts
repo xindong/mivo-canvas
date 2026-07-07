@@ -9,6 +9,9 @@ export type ImageMaskPoint = {
 export type ImageMaskRegion =
   | { type: 'box'; x: number; y: number; width: number; height: number }
   | { type: 'brush'; points: ImageMaskPoint[]; radius: number }
+  // 椭圆套索（bbox 存储）与手绘圈选（闭合自由套索,点序即路径,首尾自动闭合）。
+  | { type: 'ellipse'; x: number; y: number; width: number; height: number }
+  | { type: 'loop'; points: ImageMaskPoint[] }
 
 export type ImageMaskBounds = {
   x: number
@@ -17,6 +20,23 @@ export type ImageMaskBounds = {
   height: number
 }
 
+/** A point anchor drawn on the mask overlay (center + brush radius, in natural px). */
+export type PointAnchor = {
+  center: ImageMaskPoint
+  radius: number
+}
+
+/** Mask-edit dual-model: gemini = platform instruction-based edit (no mask file
+ *  upstream, region rides in the prompt, 2K); gpt = llm-proxy alpha-mask
+ *  inpainting (1K medium). Quality is fixed per model by product decision. */
+export type MaskEditModelId = 'gemini-3-pro-image' | 'gpt-image-2'
+export const maskEditDefaultModel: MaskEditModelId = 'gemini-3-pro-image'
+export const maskEditQualityFor = (model: MaskEditModelId): MivoImageQuality =>
+  model === 'gemini-3-pro-image' ? 'high' : 'medium'
+
+/** Multi-anchor: one marked object = recognized label + bounds (natural px) + 该圈的编辑动作。 */
+export type MaskEditSubject = { label: string; bounds: ImageMaskBounds; action?: string }
+
 export type ImageMaskSubmitPayload = {
   prompt: string
   mask?: Blob
@@ -24,6 +44,14 @@ export type ImageMaskSubmitPayload = {
   sourceSize: { width: number; height: number }
   /** W2 (QoL batch): low/medium quality selector on the overlay; default medium (FIX-5). */
   quality?: MivoImageQuality
+  /** Mask-edit dual-model selector; default gemini (maskEditDefaultModel). */
+  model?: MaskEditModelId
+  /** Anchor semantics: recognizer label for what the selection contains (single-anchor legacy). */
+  subjectLabel?: string
+  /** Multi-anchor: per-marked-object label + bounds. Preferred over subjectLabel when present. */
+  subjects?: MaskEditSubject[]
+  /** Dual-image Set-of-Mark: full source copy with numbered red rings at the anchors (image 2). */
+  markedImage?: Blob
 }
 
 export const pointMaskRadiusRatio = 0.08
@@ -134,13 +162,14 @@ export const boundsForRegions = (
   if (!regions.length) return undefined
 
   const bounds = regions.map((region): ImageMaskBounds | undefined => {
-    if (region.type === 'box') return region
+    if (region.type === 'box' || region.type === 'ellipse') return region
     if (!region.points.length) return undefined
+    const radius = region.type === 'brush' ? region.radius : 0
 
-    const minX = Math.min(...region.points.map((point) => point.x)) - region.radius
-    const maxX = Math.max(...region.points.map((point) => point.x)) + region.radius
-    const minY = Math.min(...region.points.map((point) => point.y)) - region.radius
-    const maxY = Math.max(...region.points.map((point) => point.y)) + region.radius
+    const minX = Math.min(...region.points.map((point) => point.x)) - radius
+    const maxX = Math.max(...region.points.map((point) => point.x)) + radius
+    const minY = Math.min(...region.points.map((point) => point.y)) - radius
+    const maxY = Math.max(...region.points.map((point) => point.y)) + radius
     return { x: minX, y: minY, width: maxX - minX, height: maxY - minY }
   }).filter((bounds): bounds is ImageMaskBounds => Boolean(bounds))
 
@@ -160,7 +189,28 @@ const drawRegion = (context: CanvasRenderingContext2D, region: ImageMaskRegion) 
     context.fillRect(region.x, region.y, region.width, region.height)
     return
   }
+  if (region.type === 'ellipse') {
+    context.ellipse(
+      region.x + region.width / 2,
+      region.y + region.height / 2,
+      Math.max(1, region.width / 2),
+      Math.max(1, region.height / 2),
+      0,
+      0,
+      Math.PI * 2,
+    )
+    context.fill()
+    return
+  }
   if (!region.points.length) return
+  if (region.type === 'loop') {
+    // 手绘圈选：闭合路径,mask = 圈住的内部区域。
+    context.moveTo(region.points[0].x, region.points[0].y)
+    region.points.slice(1).forEach((point) => context.lineTo(point.x, point.y))
+    context.closePath()
+    context.fill()
+    return
+  }
 
   context.lineCap = 'round'
   context.lineJoin = 'round'

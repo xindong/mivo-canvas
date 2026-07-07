@@ -1,25 +1,30 @@
 // scripts/e2e/scenarios/mask.mjs
 // mask-chat-card: 局部重绘并入对话生图卡片链路的主覆盖场景。
-//  SC-01 提交后 chat panel 立即出现 user prompt + assistant enhancing 卡片
-//       （.chat-param-card / .chat-thinking-placeholder），不自造 mask 专属 loading 组件
-//  SC-02 enhance 完成前 /tasks/edit 不得发出（gated /api/mivo/enhance 延迟断言）
-//  SC-03 enhance request body 含 intent:'edit' + editContext.maskBoundsPx/sourceSize/hasMask/sourceTitle
-//  SC-04 enhance generate mode → /tasks/edit multipart prompt === richPrompt；卡片「增强 Prompt」折叠区含 richPrompt
+//  新实现(2026-07-07):局部重绘不做 LLM 提示词增强(/enhance 零调用,SC-01 末断言);
+//  /tasks/edit prompt 走双图模板外壳(commit 253bd42 设计,runner.ts:BFF 透传前端 buildDualImagePrompt),
+//  用户原文逐字嵌在外壳内——「无增强」在网络层的形态 = 原文不被 LLM 改写,而非裸等于原文。
+//  旧 SC-02(enhance gate)/SC-03(enhance body)/SC-05(degraded)/SC-06(chat mode)已随 enhance 删除。
+//  SC-01 提交后 chat panel 立即出现 user prompt + assistant 卡片(enhancing→generating)
+//  SC-04 /tasks/edit prompt 内逐字嵌着用户原文(双图模板外壳内,无 LLM 增强)
 //  SC-10 成功后 chat 落 .chat-result-image（resultNodeIds[0]）；同场景不再只落 notice；画布 placeholder 原位替换
 //  SC-13 黑盘自愈：两次 /tasks/edit 不同 Idempotency-Key；期间 assistant 不出现 error；最终 done
 //  SC-19 chat×mask 并行取消隔离：点 mask 卡取消只 DELETE edit task，chat 卡仍 generating
-//  SC-05 enhance degraded → /tasks/edit prompt === 原始 + .chat-param-not-enhanced[data-degraded-reason]
-//  SC-06 enhance chat mode → /tasks/edit prompt === 原始 + 生成后 notice 文本为 replyText
 //
 // #90 IDB harness: 用 waitForPersistedKv 读 persisted chat state，禁止 localStorage 断言。
 
 import { doneTaskView, failedTaskView } from '../api-mocks.mjs'
 import { clickCanvasNode, waitForNodeRendered } from '../renderer-evidence.mjs'
 
-const RICH_PROMPT = 'E2E mask rich prompt: replace the selected masked character with a handsome male character while preserving the unmasked image.'
-const CHAT_REPLY_TEXT = '我会按你选中的区域改，未选区域保持不变。'
 
 const canceledGenerationMessage = '已取消生成，可修改提示后重试。'
+
+// contentEditable 富文本编辑器(非 textarea)输入:click 聚焦 + insertText,
+// 触发 input 事件让 overlay 的 hasText/占位符逻辑生效。
+const fillMaskPrompt = async (page, text) => {
+  const editor = page.locator('.image-mask-edit-prompt .image-mask-edit-editor')
+  await editor.click()
+  await page.evaluate((t) => { document.execCommand('insertText', false, t) }, text)
+}
 
 // 等待 chat panel 展开（mask overlay 关闭后可能仍折叠）。
 const ensureChatPanelOpen = async (page) => {
@@ -107,6 +112,19 @@ export const runMaskScenario = async (context) => {
     await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: '点选', exact: true }).click()
   }
 
+  // 2026-07-07 决策:局部重绘不做提示词增强。新实现里 /enhance 不应被调用;注册计数
+  // route 钉住契约,SC-01 末尾断言计数 === 0。后续 SC-W2②/SC-19 会 unroute 重注册自己
+  // 的 /enhance(那些场景故意走 enhance 路径,不在此契约范围)。
+  let enhanceCallCount = 0
+  await page.route('**/api/mivo/enhance', async (route) => {
+    enhanceCallCount += 1
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ mode: 'generate', scene: 'general', reasoning: 'e2e', richPrompt: 'e2e derived concept image', imgRatio: '1:1', quality: 'medium', enhanced: true }),
+    })
+  })
+
   // ── SC-01/02/03/04/10: 主覆盖 —— enhance generate mode 全链路断言 ──
   // 重置场景让 ref-hero 回来。
   await page.evaluate(async (moduleSpec) => {
@@ -116,31 +134,8 @@ export const runMaskScenario = async (context) => {
   }, await canvasStoreSpec())
   await waitForNodeRendered(page, rendererMode, 'ref-hero')
 
-  // 自定义 /api/mivo/enhance：gated（延迟 release），capture request body，返回 generate mode。
-  // 顺便保留 mivoEditRequests（/tasks/edit 的 prompt/fileKeys）由默认 mock 捕获。
-  const enhanceRequests = []
-  let releaseEnhance
-  const enhanceGate = new Promise((resolve) => { releaseEnhance = resolve })
-  await page.unroute('**/api/mivo/enhance')
-  await page.route('**/api/mivo/enhance', async (route) => {
-    let body = null
-    try { body = route.request().postDataJSON() } catch { body = null }
-    enhanceRequests.push(body || {})
-    await enhanceGate
-    await route.fulfill({
-      status: 200,
-      contentType: 'application/json',
-      body: JSON.stringify({
-        mode: 'generate',
-        scene: 'general',
-        reasoning: 'e2e mask reasoning',
-        richPrompt: RICH_PROMPT,
-        imgRatio: '1:1',
-        quality: 'medium',
-        enhanced: true,
-      }),
-    })
-  })
+  // 新实现(2026-07-07):局部重绘不做提示词增强,无 /enhance 请求,/tasks/edit prompt
+  // 原样透传。SC-02(enhance gate)/SC-03(enhance body)场景已随 enhance 删除不复存在。
 
   // 重置默认 GET /tasks/* 计数器（前面的 scenario 可能已耗尽 progressive 序列）。
   let mainGetCalls = 0
@@ -171,85 +166,19 @@ export const runMaskScenario = async (context) => {
   const mainBefore = await readCanvasState()
   const mainBeforeImageCount = mainBefore.nodes.filter((n) => n.type === 'image').length
   const mainPrompt = 'E2E main mask repaint'
-  await page.locator('.image-mask-edit-prompt textarea').fill(mainPrompt)
+  await fillMaskPrompt(page, mainPrompt)
 
-  // SC-01/02: 提交后立即出现 enhancing 卡片；enhance gated 期间 /tasks/edit POST count=0。
+  // SC-01: 提交后立即出现 chat 卡片(enhancing→generating);新实现不做 enhance,
+  // /tasks/edit 立即发出(无 enhance gate,SC-02 删除)。
   await page.locator('.image-mask-edit-prompt').getByRole('button', { name: '局部重绘' }).click()
   await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
   await ensureChatPanelOpen(page)
-  // SC-01: assistant enhancing 卡片已渲染（.chat-param-card + .chat-thinking-placeholder）
-  await page.waitForSelector('.chat-message-assistant .chat-param-card', { timeout: 5000 })
-  await page.waitForSelector('.chat-message-assistant .chat-thinking-placeholder', { timeout: 5000 })
-  const enhancingCardText = await page.locator('.chat-message-assistant').last().locator('.chat-thinking-placeholder').innerText()
-  if (!/深度思考中/.test(enhancingCardText)) {
-    throw new Error(`SC-01: enhancing card should show "深度思考中…", got: ${JSON.stringify(enhancingCardText)}`)
-  }
+  await page.waitForSelector('.chat-message-assistant .chat-generating-indicator', { timeout: 5000 })
 
-  // SC-02: enhance 仍在 gated，/tasks/edit POST count 必须为 0。
-  // 给一点时间让潜在的错误 POST 被观察到（不应有）。
-  await new Promise((r) => setTimeout(r, 300))
-  if (mivoEditRequests.length !== editRequestCountBefore) {
-    throw new Error(`SC-02: /tasks/edit must not fire before /enhance resolves, got ${mivoEditRequests.length - editRequestCountBefore} extra POST(s)`)
-  }
-
-  // SC-03: enhance request body 含 intent:'edit' + editContext 字段。
-  if (enhanceRequests.length === 0) {
-    throw new Error('SC-03: /enhance should have been called with intent:"edit" before /tasks/edit')
-  }
-  const enhanceBody = enhanceRequests[0]
-  if (enhanceBody.intent !== 'edit') {
-    throw new Error(`SC-03: enhance body should carry intent:"edit", got: ${JSON.stringify(enhanceBody.intent)}`)
-  }
-  const editContext = enhanceBody.editContext
-  if (!editContext) {
-    throw new Error(`SC-03: enhance body should carry editContext, got: ${JSON.stringify(enhanceBody)}`)
-  }
-  for (const field of ['maskBoundsPx', 'sourceSize', 'hasMask', 'sourceTitle']) {
-    if (!(field in editContext)) {
-      throw new Error(`SC-03: editContext should carry ${field}, got: ${JSON.stringify(editContext)}`)
-    }
-  }
-  // maskBoundsPx 与 flow 捕获值逐字段相等；满足 0<=x<=x+width<=sourceSize.width。
-  const mb = editContext.maskBoundsPx
-  const ss = editContext.sourceSize
-  if (mb && ss && typeof mb.x === 'number' && typeof mb.width === 'number' && typeof ss.width === 'number') {
-    if (!(mb.x >= 0 && mb.x + mb.width <= ss.width)) {
-      throw new Error(`SC-03: maskBoundsPx out of bounds: x=${mb.x} width=${mb.width} sourceWidth=${ss.width}`)
-    }
-  }
-
-  // Release enhance → generate mode with richPrompt.
-  releaseEnhance()
-
-  // SC-04: 等 enhancing → generating 转换完成（enhance 返回后 patch 成 generating）。
-  await page.waitForFunction(
-    () => {
-      const cards = Array.from(document.querySelectorAll('.chat-message-assistant'))
-      const last = cards[cards.length - 1]
-      if (!last) return false
-      const card = last.querySelector('.chat-param-card')
-      const thinking = last.querySelector('.chat-thinking-placeholder')
-      return card && !thinking
-    },
-    { timeout: 5000 },
-  ).catch(() => {})
-  // 展开「增强 Prompt」折叠区。
-  const promptFoldBtn = page.locator('.chat-message-assistant').last().locator('.chat-param-fold-btn', { hasText: '增强 Prompt' })
-  if (await promptFoldBtn.count() > 0) {
-    await promptFoldBtn.click()
-    await page.waitForFunction(
-      (expected) => {
-        const cards = Array.from(document.querySelectorAll('.chat-message-assistant'))
-        const last = cards[cards.length - 1]
-        if (!last) return false
-        const body = last.querySelector('.chat-param-fold-body')
-        return body && body.textContent && body.textContent.includes(expected)
-      },
-      RICH_PROMPT,
-      { timeout: 5000 },
-    )
-  }
-
+  // SC-02 提交链路改写合并到此(新实现不做 enhance,gating 从「enhance 完成后提交」改为
+  // 「直接提交」;断言 /tasks/edit prompt 逐字等于用户输入;提交→轮询→出图主链路原样保留)。
+  // SC-03(enhance body)/SC-05(degraded)/SC-06(chat mode)整场景只测已删 enhance 死行为,
+  // 整删;其活断言(prompt===原始)由本 SC-04 覆盖,错误展示路径由 SC-W2② 覆盖。
   // 等 /tasks/edit POST 落地（mivoEditRequests 由默认 mock 推入）。
   const editPostDeadline = Date.now() + 5000
   while (Date.now() < editPostDeadline && mivoEditRequests.length <= editRequestCountBefore) {
@@ -257,10 +186,16 @@ export const runMaskScenario = async (context) => {
   }
   await page.waitForSelector('.chat-message-assistant .chat-result-image', { timeout: 10000 })
 
-  // SC-04: /tasks/edit multipart prompt === richPrompt。
+  // SC-04: /tasks/edit 层契约 = 双图模板外壳内逐字嵌着用户原文(无 LLM 增强)。
+  //  外壳 = 确定性模板(作者设计,commit 253bd42;runner.ts:BFF 透传前端 buildDualImagePrompt);
+  //  无 LLM 增强由 /enhance 零调用断言(SC-01 末)守护;用户原文逐字性由 includes 守护。
   const mainLatestRequest = mivoEditRequests.at(-1)
-  if (!mainLatestRequest || mainLatestRequest.prompt !== RICH_PROMPT) {
-    throw new Error(`SC-04: /tasks/edit prompt should equal richPrompt, got: ${JSON.stringify(mainLatestRequest?.prompt)}`)
+  if (!mainLatestRequest || !mainLatestRequest.prompt.includes(mainPrompt)) {
+    throw new Error(`SC-04: /tasks/edit prompt should embed original user input verbatim, got: ${JSON.stringify(mainLatestRequest?.prompt)}`)
+  }
+  // 防退化:成功路径(markedImage 生成成功)必走 Set-of-Mark 双图模板,外壳引用"图2"(标注图)。
+  if (!mainLatestRequest.prompt.includes('图2')) {
+    throw new Error(`SC-04: /tasks/edit prompt should carry dual-image template shell referencing 图2, got: ${JSON.stringify(mainLatestRequest.prompt)}`)
   }
 
   // SC-10: assistant done + resultNodeIds + .chat-result-image；同场景不再只落 notice。
@@ -297,6 +232,11 @@ export const runMaskScenario = async (context) => {
   }
   if (mainResultArea < 320 * 320 * 0.9 || mainResultArea > 320 * 320 * 1.1) {
     throw new Error(`SC-10: result should be equal-area with 320x320 placeholder, got ${mainResultNode.width}x${mainResultNode.height}`)
+  }
+
+  // 2026-07-07 决策:局部重绘不做提示词增强。新实现 /enhance 不被调用,计数应 === 0。
+  if (enhanceCallCount !== 0) {
+    throw new Error(`SC-01: /enhance should not be called for mask edit (2026-07-07 decision: no prompt enhancement), got ${enhanceCallCount} calls`)
   }
 
   // ── SC-13: 黑盘自愈重试 ──
@@ -350,7 +290,7 @@ export const runMaskScenario = async (context) => {
   await openMaskEditorOn('ref-hero')
   await drawPointRegion()
   await page.waitForFunction(() => Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0') > 0)
-  await page.locator('.image-mask-edit-prompt textarea').fill('E2E black-plate self-heal')
+  await fillMaskPrompt(page, 'E2E black-plate self-heal')
   await page.locator('.image-mask-edit-prompt').getByRole('button', { name: '局部重绘' }).click()
   await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
   await ensureChatPanelOpen(page)
@@ -418,7 +358,7 @@ export const runMaskScenario = async (context) => {
     await openMaskEditorOn('ref-hero')
     await drawPointRegion()
     await page.waitForFunction(() => Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0') > 0)
-    await page.locator('.image-mask-edit-prompt textarea').fill(`E2E ${label} path`)
+    await fillMaskPrompt(page, `E2E ${label} path`)
     await page.locator('.image-mask-edit-prompt').getByRole('button', { name: '局部重绘' }).click()
     await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
     await ensureChatPanelOpen(page)
@@ -524,7 +464,7 @@ export const runMaskScenario = async (context) => {
   await openMaskEditorOn('ref-hero')
   await drawPointRegion()
   await page.waitForFunction(() => Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0') > 0)
-  await page.locator('.image-mask-edit-prompt textarea').fill('E2E parallel mask edit')
+  await fillMaskPrompt(page, 'E2E parallel mask edit')
   await page.locator('.image-mask-edit-prompt').getByRole('button', { name: '局部重绘' }).click()
   await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
   await ensureChatPanelOpen(page)
@@ -573,101 +513,4 @@ export const runMaskScenario = async (context) => {
     throw new Error(`SC-19: mask card error text mismatch, got: ${JSON.stringify(parallelMaskState.error)}`)
   }
 
-  // ── SC-05: enhance degraded ──
-  await page.unroute('**/api/mivo/enhance')
-  await page.route('**/api/mivo/enhance', async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: 'application/json',
-      body: JSON.stringify({ enhanced: false, degradedReason: 'timeout', stage: 'fallback' }),
-    })
-  })
-  // 重置 GET /tasks/* 为 done 序列。
-  let degradedGetCalls = 0
-  await page.unroute('**/api/mivo/tasks/*')
-  await page.route('**/api/mivo/tasks/*', async (route) => {
-    const method = route.request().method()
-    if (method === 'DELETE') { await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ status: 'canceled' }) }); return }
-    if (method !== 'GET') { await route.fallback(); return }
-    degradedGetCalls += 1
-    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(doneTaskView([{ b64: generatedImageB64 }])) })
-  })
-  await page.unroute('**/api/mivo/tasks/edit')
-  await page.route('**/api/mivo/tasks/edit', async (route) => {
-    try {
-      const request = route.request()
-      const formRequest = new Request('http://127.0.0.1/api/mivo/tasks/edit', { method: 'POST', headers: request.headers(), body: request.postDataBuffer() })
-      const formData = await formRequest.formData()
-      parallelEditRequests.push({ prompt: String(formData.get('prompt') || '') })
-    } catch { parallelEditRequests.push({ prompt: '' }) }
-    await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ taskId: 'task-degraded' }) })
-  })
-
-  await page.evaluate(async (moduleSpec) => {
-    const { useCanvasStore } = await import(moduleSpec)
-    useCanvasStore.getState().loadScene('character-flow')
-    useCanvasStore.getState().resetCurrentScene()
-  }, await canvasStoreSpec())
-  await waitForNodeRendered(page, rendererMode, 'ref-hero')
-  const degradedPrompt = 'E2E degraded mask repaint'
-  await openMaskEditorOn('ref-hero')
-  await drawPointRegion()
-  await page.waitForFunction(() => Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0') > 0)
-  await page.locator('.image-mask-edit-prompt textarea').fill(degradedPrompt)
-  await page.locator('.image-mask-edit-prompt').getByRole('button', { name: '局部重绘' }).click()
-  await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
-  await ensureChatPanelOpen(page)
-  await page.waitForSelector('.chat-message-assistant .chat-param-not-enhanced[data-degraded-reason="timeout"]', { timeout: 5000 })
-  await page.waitForSelector('.chat-message-assistant .chat-result-image', { timeout: 10000 })
-  // SC-05: /tasks/edit prompt === 原始 prompt（degraded 用原始 overlay prompt）。
-  const degradedRequest = parallelEditRequests.at(-1)
-  if (!degradedRequest || degradedRequest.prompt !== degradedPrompt) {
-    throw new Error(`SC-05: degraded /tasks/edit prompt should equal original prompt, got: ${JSON.stringify(degradedRequest?.prompt)}`)
-  }
-
-  // ── SC-06: enhance chat mode ──
-  await page.unroute('**/api/mivo/enhance')
-  await page.route('**/api/mivo/enhance', async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: 'application/json',
-      body: JSON.stringify({ mode: 'chat', replyText: CHAT_REPLY_TEXT, enhanced: true }),
-    })
-  })
-  await page.evaluate(async (moduleSpec) => {
-    const { useCanvasStore } = await import(moduleSpec)
-    useCanvasStore.getState().loadScene('character-flow')
-    useCanvasStore.getState().resetCurrentScene()
-  }, await canvasStoreSpec())
-  await waitForNodeRendered(page, rendererMode, 'ref-hero')
-  const chatModePrompt = 'E2E chat mode mask repaint'
-  await openMaskEditorOn('ref-hero')
-  await drawPointRegion()
-  await page.waitForFunction(() => Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0') > 0)
-  await page.locator('.image-mask-edit-prompt textarea').fill(chatModePrompt)
-  await page.locator('.image-mask-edit-prompt').getByRole('button', { name: '局部重绘' }).click()
-  await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
-  await ensureChatPanelOpen(page)
-  await page.waitForSelector('.chat-message-assistant .chat-result-image', { timeout: 10000 })
-  // SC-06: /tasks/edit prompt === 原始 prompt（chat mode 也用原始 prompt 出图）。
-  const chatModeRequest = parallelEditRequests.at(-1)
-  if (!chatModeRequest || chatModeRequest.prompt !== chatModePrompt) {
-    throw new Error(`SC-06: chat mode /tasks/edit prompt should equal original prompt, got: ${JSON.stringify(chatModeRequest?.prompt)}`)
-  }
-  // SC-06: 生成后 notice 文本为 replyText。
-  const chatModeNoticeRaw = await waitForPersistedKv(
-    page,
-    'mivo-chat-demo',
-    (raw) => {
-      try {
-        const parsed = JSON.parse(raw)
-        const byScene = parsed?.state?.messagesByScene ?? {}
-        return Object.values(byScene).flat().some((m) => m.kind === 'notice' && m.origin === 'mask-edit' && (m.text || m.prompt || '').includes(CHAT_REPLY_TEXT))
-      } catch { return false }
-    },
-    { timeout: 3000 },
-  )
-  if (!chatModeNoticeRaw) {
-    throw new Error('SC-06: chat mode should append a mask-edit notice with replyText after generation')
-  }
 }

@@ -344,9 +344,11 @@ describe('runMaskEditGeneration quality pass-through (auto/low/medium/high parit
   const capturedRequest = (): { quality?: string } =>
     taskClientSpies.submitEditTask.mock.calls.at(-1)?.[0] as { quality?: string }
 
-  it('auto → submitEditTask request.quality 为 undefined（不带 quality 字段，对齐 chat 生图路径）', async () => {
+  // 局部重绘固定 Gemini（无模型选择器、无 auto）：未显式指定 quality 时回退到
+  // 模型固定质量 maskEditQualityFor(gemini) = 'high'（2K），不再是 undefined 透传。
+  it('未指定 quality → 回退到模型固定质量（gemini = high）', async () => {
     await expect(runFor('auto')).rejects.toThrow()
-    expect(capturedRequest().quality).toBeUndefined()
+    expect(capturedRequest().quality).toBe('high')
   })
 
   it('low → submitEditTask request.quality === "low"', async () => {

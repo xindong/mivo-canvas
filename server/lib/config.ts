@@ -27,6 +27,11 @@ export const mivoImageSizeMap = {
 } as const
 export const mivoEnhancePrimaryModel = 'claude-haiku-4-5'
 export const mivoEnhanceFallbackModel = 'gpt-5.4-mini'
+// 局部重绘锚点识别（/describe-region）独立于 /enhance 选型：多锚点对比测试显示
+// gpt-5.4-mini 在准确率/速度上与 haiku 打平且候选更细（2026-07-07），主用之；
+// haiku 作兜底（同样识别正常）。
+export const mivoDescribePrimaryModel = 'gpt-5.4-mini'
+export const mivoDescribeFallbackModel = 'claude-haiku-4-5'
 export const jsonRequestMaxBytes = 1024 * 1024
 export const imageRequestMaxBytes = 40 * 1024 * 1024
 

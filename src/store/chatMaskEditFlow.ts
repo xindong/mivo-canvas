@@ -8,14 +8,12 @@
 // 运行时循环注意：本模块 import useChatStore（runtime），chatStore 反向 import cancelMaskEditMessage
 // （runtime）—— ESM live binding，双方只在函数体内访问对方导出，不在模块加载期访问，无 TDZ。
 import type { ChatGenerationContext, ChatMessage, ChatMessageErrorKind } from './chatStore'
-import type { EnhanceResponse, MivoImageQuality, MivoImageRatio } from '../types/generation'
+import type { MivoImageQuality, MivoImageRatio } from '../types/generation'
 import type { MivoCanvasNode, MivoCanvasSnapshot } from '../types/mivoCanvas'
-import type { ImageMaskSubmitPayload } from '../canvas/imageMaskGeometry'
 import { useChatStore } from './chatStore'
 import { useCanvasStore } from './canvasStore'
 import { debugLogger } from './debugLogStore'
-import { enhanceMivoPrompt, MivoImageRequestError } from '../lib/mivoImageClient'
-import { resolveMaskEditEnhance, enhanceForGeneration } from './chatEnhanceFlow'
+import { MivoImageRequestError } from '../lib/mivoImageClient'
 import { removeMaskEditPlaceholder, prepareMaskEditPlaceholder, runMaskEditGeneration } from '../canvas/maskEditGeneration'
 import {
   clearMaskEditTask,
@@ -37,18 +35,6 @@ export type MaskEditMessagePhase = 'enhancing' | 'submitting' | 'polling' | 'sel
 
 const createId = (prefix: string) =>
   `${prefix}-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`
-
-/** 构造 enhance edit 的 editContext（源图像素空间，零换算透传 payload.maskBounds）。 */
-const buildEditContext = (source: MivoCanvasNode, payload: ImageMaskSubmitPayload) => ({
-  sourceTitle: source.title,
-  // F3 (审 P3): bounds-only payload（maskBounds 有、mask 无）也判 hasMask=true，
-  // 避免 "Mask: none 却带 bounds" 的矛盾语义给 LLM。
-  hasMask: Boolean(payload.mask || payload.maskBounds),
-  // F3: mask blob 在 → brush；否则 maskBounds 在 → bounds；都没有 → undefined。
-  maskKind: (payload.mask ? 'brush' : payload.maskBounds ? 'bounds' : undefined) as 'brush' | 'bounds' | undefined,
-  maskBoundsPx: payload.maskBounds,
-  sourceSize: payload.sourceSize,
-})
 
 /** patch 一条 assistant message（按 sceneId/messageId 精确定位）。 */
 const patchAssistantMessage = (
@@ -243,22 +229,11 @@ export const runMaskEditChatFlow = async (record: ActiveMaskEditTask): Promise<v
   const { sceneId, messageId, slotId, source, resolvedAssetUrl, payload, abortController, imgRatio, quality } = record
   const signal = abortController.signal
   try {
-    // 1. enhance(intent:'edit')。await 后立即查 signal.aborted —— enhanceMivoPrompt 把 abort
-    //    归类为 upstream-network，不能依赖它区分，必须自己查，否则 cancel 后会当 degraded 继续 edit。
-    const enhanceResult: EnhanceResponse = await enhanceMivoPrompt({
-      prompt: payload.prompt,
-      modelId: 'gpt-image-2',
-      hasSelectedImage: true,
-      sceneId,
-      intent: 'edit',
-      editContext: buildEditContext(source, payload),
-      signal,
-    })
-    if (signal.aborted) throw new MivoImageRequestError(canceledGenerationMessage, 'canceled')
-
-    // 2. resolve finalPrompt/noticeText（W4 三态：generate/chat/degraded 都先出图）。
-    const { finalPrompt, noticeText } = resolveMaskEditEnhance(enhanceResult, payload.prompt)
-    const enhance = enhanceForGeneration(enhanceResult)
+    // 1. 局部重绘【不做提示词增强】（用户 2026-07-07）：红圈指认已把「改哪」说清，
+    //    再让 LLM 润色只会膨胀/改写原意、稀释精确指令。用户输入什么就原样出图。
+    const finalPrompt = payload.prompt
+    const noticeText: string | undefined = undefined
+    const enhance = undefined
 
     // 3. patch assistant → generating（写 enhance/finalPrompt/noticeText/maskEdit.phase=submitting）。
     patchAssistantMessage(sceneId, messageId, (m) => ({

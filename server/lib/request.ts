@@ -151,6 +151,10 @@ export const logTaskTerminal = (info: {
   httpStatus?: number
   /** edit-timeout-batch: 分档后的上游超时（ms），据此定位撞线 case。 */
   timeoutMs?: number
+  /** 双图指认排查：平台路径实际上传的图片数（2 = 原图+红圈标注图）。 */
+  imagesUploaded?: number
+  /** mask 区域指令版本：marked=红圈指认 / region=文字坐标定位。 */
+  maskClause?: string
 }): void => {
   const parts = [
     '[mivo-bff-task]',
@@ -168,6 +172,8 @@ export const logTaskTerminal = (info: {
     `hasMask=${info.hasMask ? 'true' : 'false'}`,
     `hasReferences=${info.hasReferences ? 'true' : 'false'}`,
     `channel=${info.channel}`,
+    info.imagesUploaded !== undefined ? `imagesUploaded=${info.imagesUploaded}` : '',
+    info.maskClause ? `maskClause=${info.maskClause}` : '',
     `finalStatus=${info.finalStatus}`,
     `latency=${info.latencyMs}ms`,
     info.promptLength !== undefined ? `promptLength=${info.promptLength}` : '',

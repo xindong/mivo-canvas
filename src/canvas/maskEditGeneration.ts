@@ -25,7 +25,7 @@ import {
   taskPollIntervalMs,
   type TaskResultImage,
 } from '../lib/mivoTaskClient'
-import type { ImageMaskSubmitPayload } from './imageMaskGeometry'
+import { maskEditDefaultModel, maskEditQualityFor, type ImageMaskSubmitPayload, type MaskEditModelId } from './imageMaskGeometry'
 
 /** mask-chat-card: runMaskEditGeneration 回调，让 chat flow 驱动卡片状态而不直写 chat。 */
 export type MaskEditGenerationCallbacks = {
@@ -42,6 +42,7 @@ const patchMaskEditSlotStatus = (
   slotId: string,
   status: 'generating' | 'failed' | 'canceled',
   prompt: string,
+  model: string = maskEditDefaultModel,
 ) => {
   const createdAt = Date.now()
   useCanvasStore.setState((current) => {
@@ -54,7 +55,7 @@ const patchMaskEditSlotStatus = (
             ...node,
             generation: {
               prompt,
-              model: 'gpt-image-2',
+              model,
               size: node.generation?.size || `${Math.round(node.width)}x${Math.round(node.height)}`,
               seed: node.generation?.seed,
               strength: node.generation?.strength,
@@ -97,6 +98,7 @@ export const prepareMaskEditPlaceholder = (
   sceneId: string,
   source: MivoCanvasNode,
   prompt: string,
+  model: string = maskEditDefaultModel,
 ): { slotId: string; baselineSnapshot: MivoCanvasSnapshot | undefined } => {
   // 规格(2026-07-05 用户澄清):所有生图占位符一律 1:1 方形 loading,局部重绘不例外
   // (此前按源图全尺寸建占位 → 用户看到 3:2 大占位符);结果比例由生成本身保证
@@ -117,7 +119,7 @@ export const prepareMaskEditPlaceholder = (
     sceneId === useCanvasStore.getState().sceneId
       ? useCanvasStore.getState().historyPast.at(-1)
       : undefined
-  patchMaskEditSlotStatus(sceneId, slotId, 'generating', prompt)
+  patchMaskEditSlotStatus(sceneId, slotId, 'generating', prompt, model)
   // 镜头跟随契约:占位建好后请求 auto-focus;跨场景 skip 判定在 cameraFocusStore
   // 内(#95 语义:不切场景、不动镜头)。
   useCameraFocusStore.getState().requestPlaceholderFocus(slotId, {
@@ -258,9 +260,10 @@ export const runMaskEditGeneration = async (args: {
 }): Promise<{ nodeIds: string[]; sourceDeleted: boolean }> => {
   const { sceneId, source, slotId, resolvedAssetUrl, payload, imgRatio, signal } = args
   const callbacks = args.callbacks ?? {}
-  // auto 路径：args.quality 与 payload.quality 均缺省 → undefined 透传，submitEditTask
-  // 不带 quality 字段；不再强制回填 medium（与 chat 生图路径一致，由 server 默认）。
-  const quality: MivoImageQuality | undefined = args.quality ?? payload.quality
+  // Mask-edit dual-model: overlay/chat 传 payload.model，缺省 gemini。质量按模型
+  // 固定（gemini→high=2K，gpt→medium=1K）；显式 quality 仍优先（chat 路径可覆盖）。
+  const model: MaskEditModelId = payload.model ?? maskEditDefaultModel
+  const quality: MivoImageQuality | undefined = args.quality ?? payload.quality ?? maskEditQualityFor(model)
   const startedAt = Date.now()
   const image = await readCanvasImageBlob(source, resolvedAssetUrl)
 
@@ -288,10 +291,15 @@ export const runMaskEditGeneration = async (args: {
     const taskId = await submitEditTask({
       image,
       mask: payload.mask,
+      maskBounds: payload.maskBounds,
+      sourceSize: payload.sourceSize,
+      subjectLabel: payload.subjectLabel,
+      subjects: payload.subjects,
+      markedImage: payload.markedImage,
       prompt: payload.prompt,
       imgRatio,
       quality,
-      model: 'gpt-image-2',
+      model,
       idempotencyKey,
       signal,
     })
@@ -411,7 +419,7 @@ export const runMaskEditGeneration = async (args: {
       reflow: true,
       resultImages: images,
       prompt: payload.prompt,
-      model: 'gpt-image-2',
+      model,
       kind: 'edit' as const,
       maskBounds: payload.maskBounds,
       // 黑块修复：标定 maskBounds 的坐标空间（本次源图 natural pixel 尺寸），

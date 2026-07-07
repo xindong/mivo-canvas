@@ -25,9 +25,11 @@ import {
 import {
   MIVO_PLATFORM_CHANNELS,
   mivoPlatformUploadOne,
+  nanoBananaImageModel,
   resolveMivoPlatformPayload,
   runMivoPlatformImageJob,
 } from '../platform/job'
+import { withMaskRegionClause } from '../lib/maskRegion'
 
 const readImageApiKey = (imageApiKey: string): string => {
   const key = imageApiKey.trim()
@@ -76,7 +78,11 @@ export const editHandler: Handler<{ Bindings: HttpBindings }> = async (c) => {
     const mask = multipartFiles(files, 'mask')[0]
     const hasMaskBounds = Boolean(firstMultipartField(fields, 'maskBounds').trim())
     const hasMaskInput = Boolean(mask || hasMaskBounds)
-    const model = hasMaskInput ? defaultMivoImageModel : requestedModel
+    // Mask-edit dual-model: gemini-3-pro-image (platform, instruction-based) and
+    // gpt-image-2 (llm-proxy, alpha-mask inpainting) both allowed; anything else
+    // falls back to gpt-image-2 (historical mask model).
+    const maskCapable = requestedModel === nanoBananaImageModel || requestedModel === defaultMivoImageModel
+    const model = hasMaskInput && !maskCapable ? defaultMivoImageModel : requestedModel
     if (hasMaskInput && requestedModel !== model) {
       logMaskModelOverride({
         requestId,
@@ -86,10 +92,11 @@ export const editHandler: Handler<{ Bindings: HttpBindings }> = async (c) => {
       })
     }
 
-    // Dispatch invariant (review A): mask present ⇒ unconditionally llm-proxy gpt-image-2
-    // (mivo platform has no mask capability); otherwise platform channel for platform
-    // models (main image index 0, references appended after — do not drop main image).
-    const usePlatform = !hasMaskInput && MIVO_PLATFORM_CHANNELS[model]
+    // Dispatch invariant: mask + gemini → platform instruction-based edit (mask
+    // file dropped, region rides in the prompt); mask + gpt-image-2 → llm-proxy
+    // inpainting; otherwise platform channel for platform models (main image
+    // index 0, references appended after — do not drop main image).
+    const usePlatform = (!hasMaskInput || model === nanoBananaImageModel) && MIVO_PLATFORM_CHANNELS[model]
     if (usePlatform) {
       if (!platformCtx.platformKey.startsWith('mivo_')) {
         log(500)
@@ -111,11 +118,20 @@ export const editHandler: Handler<{ Bindings: HttpBindings }> = async (c) => {
         log(502, 'upload-failed')
         return c.json({ error: '参考图上传失败，请重试或移除参考图' }, 502)
       }
+      const platformPrompt = hasMaskInput
+        ? withMaskRegionClause(
+            prompt,
+            firstMultipartField(fields, 'maskBounds'),
+            firstMultipartField(fields, 'sourceSize'),
+            firstMultipartField(fields, 'subjectLabel'),
+            firstMultipartField(fields, 'subjects'),
+          )
+        : prompt
       const { modelType, modelFormat, payload } = resolveMivoPlatformPayload(
         model,
         firstMultipartField(fields, 'imgRatio'),
         quality,
-        prompt,
+        platformPrompt,
         fileIds,
       )
       const result = await runMivoPlatformImageJob(

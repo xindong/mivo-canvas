@@ -266,7 +266,9 @@ describe('platform channel — generate/edit job', () => {
     expect(mockState.uploadCalls).toBe(0)
   })
 
-  it('edit (mask present) overrides platform model to gpt-image-2 before llm-proxy dispatch', async () => {
+  // Mask-edit dual-model: gemini + mask → platform instruction-based edit (mask
+  // file dropped, region clause folded into the prompt; generic clause when no bounds).
+  it('edit (mask + gemini) dispatches to platform with region clause in prompt', async () => {
     const fd = new FormData()
     fd.append('image', new Blob([Buffer.from('png')], { type: 'image/png' }), 'i.png')
     fd.append('mask', new Blob([Buffer.from('mask')], { type: 'image/png' }), 'm.png')
@@ -274,10 +276,25 @@ describe('platform channel — generate/edit job', () => {
     fd.append('model', 'gemini-3-pro-image')
     const r = await req('/api/mivo/edit', { method: 'POST', body: fd })
     expect(r.status).toBe(200)
+    expect(mockState.editCalls).toBe(0)
+    expect(mockState.uploadCalls).toBe(1) // main image only — the mask file is NOT uploaded
+    expect(mockState.lastSubmitBodyText).toContain('edit this')
+    // 无 bounds/subject 时的通用回退 clause（已中文化）。
+    expect(mockState.lastSubmitBodyText).toContain('只修改用户选中的区域')
+  })
+
+  // Non-mask-capable models still fall back to gpt-image-2 on the llm-proxy path.
+  it('edit (mask + non-mask-capable model) falls back to gpt-image-2 llm-proxy', async () => {
+    const fd = new FormData()
+    fd.append('image', new Blob([Buffer.from('png')], { type: 'image/png' }), 'i.png')
+    fd.append('mask', new Blob([Buffer.from('mask')], { type: 'image/png' }), 'm.png')
+    fd.append('prompt', 'edit this')
+    fd.append('model', 'doubao-seedance-2-0-260128')
+    const r = await req('/api/mivo/edit', { method: 'POST', body: fd })
+    expect(r.status).toBe(200)
     expect(mockState.editCalls).toBe(1)
     expect(mockState.uploadCalls).toBe(0)
     expect(mockState.lastEditBodyText).toMatch(/name="model"[\s\S]*gpt-image-2/)
-    expect(mockState.lastEditBodyText).not.toMatch(/name="model"[\s\S]*gemini-3-pro-image/)
   })
 })
 
@@ -551,6 +568,62 @@ describe('method / validation / 413 (D1 clean)', () => {
     const r2 = await req('/api/mivo/enhance', jsonReq({}))
     expect(r2.status).toBe(400)
     expect((r2.body as { error: string }).error).toBe('prompt is required')
+  })
+})
+
+describe('compose-mask-edit — 结构化整理逐条编辑要求', () => {
+  it('条数与红圈一致时返回 requirements', async () => {
+    mockState.enhanceBody = {
+      choices: [
+        {
+          message: {
+            content:
+              '{"requirements":["1.务必只去除图2中1号红圈（最左侧）范围内的蓝色烟雾。画面中其他蓝色烟雾一律保留，不要误删其他蓝色烟雾。","2.将图2中2号红圈范围内的左眼改成红色。红圈范围内除左眼以外的内容保持不变，其他相似内容不要误改。"]}',
+          },
+        },
+      ],
+    }
+    const r = await req(
+      '/api/mivo/compose-mask-edit',
+      jsonReq({
+        instruction: '去除蓝色烟雾，左眼改成红色',
+        anchors: [
+          { n: 1, label: '蓝色烟雾', position: '最左侧' },
+          { n: 2, label: '左眼' },
+        ],
+      }),
+    )
+    expect(r.status).toBe(200)
+    const body = r.body as { requirements: string[] }
+    expect(body.requirements).toHaveLength(2)
+    expect(body.requirements[0]).toContain('1号红圈（最左侧）范围内的蓝色烟雾')
+    expect(body.requirements[1]).toContain('左眼改成红色')
+  })
+
+  it('条数与红圈不符 → 判定映射不可靠，requirements 空（前端回退）', async () => {
+    mockState.enhanceBody = {
+      choices: [{ message: { content: '{"requirements":["1.只有一条但有两个圈"]}' } }],
+    }
+    const r = await req(
+      '/api/mivo/compose-mask-edit',
+      jsonReq({
+        instruction: '随便改',
+        anchors: [
+          { n: 1, label: 'a' },
+          { n: 2, label: 'b' },
+        ],
+      }),
+    )
+    expect(r.status).toBe(200)
+    const body = r.body as { requirements: string[]; degradedReason?: string }
+    expect(body.requirements).toHaveLength(0)
+    expect(body.degradedReason).toBe('upstream')
+  })
+
+  it('空 instruction 或无 anchors → noop', async () => {
+    const r = await req('/api/mivo/compose-mask-edit', jsonReq({ instruction: '', anchors: [] }))
+    expect(r.status).toBe(200)
+    expect((r.body as { requirements: string[] }).requirements).toHaveLength(0)
   })
 })
 
