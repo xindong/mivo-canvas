@@ -352,6 +352,11 @@ export const createSmokePage = async ({
     if (message.type() === 'error' && !message.text().includes('__MIVO_E2E_EXPECTED_ERROR__')) errors.push(message.text())
   })
 
+  // 浏览器未捕获异常转 stdout(只诊断,不进 errors 数组不阻断 run),便于 e2e 失败时定位。
+  page.on('pageerror', (error) => {
+    console.log(`[browser pageerror] ${error.message}`)
+  })
+
   return {
     browser,
     context,

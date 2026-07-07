@@ -110,6 +110,19 @@ export const runMaskScenario = async (context) => {
     await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: '点选', exact: true }).click()
   }
 
+  // 2026-07-07 决策:局部重绘不做提示词增强。新实现里 /enhance 不应被调用;注册计数
+  // route 钉住契约,SC-01 末尾断言计数 === 0。后续 SC-W2②/SC-19 会 unroute 重注册自己
+  // 的 /enhance(那些场景故意走 enhance 路径,不在此契约范围)。
+  let enhanceCallCount = 0
+  await page.route('**/api/mivo/enhance', async (route) => {
+    enhanceCallCount += 1
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ mode: 'generate', scene: 'general', reasoning: 'e2e', richPrompt: 'e2e derived concept image', imgRatio: '1:1', quality: 'medium', enhanced: true }),
+    })
+  })
+
   // ── SC-01/02/03/04/10: 主覆盖 —— enhance generate mode 全链路断言 ──
   // 重置场景让 ref-hero 回来。
   await page.evaluate(async (moduleSpec) => {
@@ -158,7 +171,7 @@ export const runMaskScenario = async (context) => {
   await page.locator('.image-mask-edit-prompt').getByRole('button', { name: '局部重绘' }).click()
   await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
   await ensureChatPanelOpen(page)
-  await page.waitForSelector('.chat-message-assistant .chat-param-card', { timeout: 5000 })
+  await page.waitForSelector('.chat-message-assistant .chat-generating-indicator', { timeout: 5000 })
 
   // SC-02 提交链路改写合并到此(新实现不做 enhance,gating 从「enhance 完成后提交」改为
   // 「直接提交」;断言 /tasks/edit prompt 逐字等于用户输入;提交→轮询→出图主链路原样保留)。
@@ -211,6 +224,11 @@ export const runMaskScenario = async (context) => {
   }
   if (mainResultArea < 320 * 320 * 0.9 || mainResultArea > 320 * 320 * 1.1) {
     throw new Error(`SC-10: result should be equal-area with 320x320 placeholder, got ${mainResultNode.width}x${mainResultNode.height}`)
+  }
+
+  // 2026-07-07 决策:局部重绘不做提示词增强。新实现 /enhance 不被调用,计数应 === 0。
+  if (enhanceCallCount !== 0) {
+    throw new Error(`SC-01: /enhance should not be called for mask edit (2026-07-07 decision: no prompt enhancement), got ${enhanceCallCount} calls`)
   }
 
   // ── SC-13: 黑盘自愈重试 ──
