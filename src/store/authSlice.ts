@@ -50,8 +50,11 @@ export const useAuthStore = create<AuthState>()((set, get) => ({
       debugLogger.log('Auth', `会话已恢复:${user.name} (${user.id})`)
     } catch (err) {
       set({ user: null, status: 'unauthenticated' })
-      if (err instanceof AuthError && err.status === 401) {
-        debugLogger.log('Auth', '未登录(无有效会话)')
+      // 401 = 有鉴权但无有效会话;503 = BFF 未配鉴权(本地/未启用,GET /me 返
+      // auth_not_configured)。两者都是预期的「未登录」,打 info,不当异常告警 ——
+      // 否则本地/dev 环境每次启动都会刷一条 warn(e2e init-warning 断言也会误挂)。
+      if (err instanceof AuthError && (err.status === 401 || err.status === 503)) {
+        debugLogger.log('Auth', err.status === 503 ? '鉴权未配置(本地/未启用),按未登录处理' : '未登录(无有效会话)')
       } else {
         const msg = err instanceof Error ? err.message : String(err)
         debugLogger.warn('Auth', `会话恢复失败,按未登录处理:${msg}`)

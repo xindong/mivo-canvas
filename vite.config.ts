@@ -26,6 +26,14 @@ export default defineConfig(({ mode }) => {
           changeOrigin: false,
           secure: false,
         },
+        // Auth endpoints (login-url / callback / me / logout / dev-login) live on
+        // the BFF too — without this the browser hits Vite/SPA and authClient gets
+        // HTML instead of JSON (hydrate then logs a spurious parse failure).
+        '/api/auth': {
+          target: resolveDevBffTarget(env),
+          changeOrigin: false,
+          secure: false,
+        },
       },
     },
   }
