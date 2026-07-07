@@ -80,6 +80,12 @@ export type MivoEditRequest = MivoGenerateRequest & {
   // `mask` in practice (brush mask vs bounds-derived mask).
   maskBounds?: NormalizedMaskBounds
   sourceSize?: { width: number; height: number }
+  /** Anchor semantics: recognizer label for what the selection contains (single-anchor legacy). */
+  subjectLabel?: string
+  /** Multi-anchor: per-marked-object label + bounds (natural px) + 该圈的编辑动作。 */
+  subjects?: Array<{ label: string; bounds: { x: number; y: number; width: number; height: number }; action?: string }>
+  /** Dual-image Set-of-Mark: full source copy with numbered red rings (platform image 2). */
+  markedImage?: Blob
 }
 
 export type MivoImageResponse = {

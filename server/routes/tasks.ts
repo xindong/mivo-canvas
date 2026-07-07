@@ -154,6 +154,13 @@ tasksRoute.post('/edit', async (c) => {
       model: modelField,
       mask,
       references,
+      // Spatial context for the instruction-based (gemini) mask path; harmless
+      // extras on the llm-proxy path.
+      maskBoundsJson: firstMultipartField(fields, 'maskBounds'),
+      sourceSizeJson: firstMultipartField(fields, 'sourceSize'),
+      subjectLabel: firstMultipartField(fields, 'subjectLabel'),
+      subjectsJson: firstMultipartField(fields, 'subjects'),
+      markedImage: multipartFiles(files, 'markedImage')[0],
     }).catch((err) => {
       failTask(record.id, err instanceof Error ? err.message : 'runner crashed')
     })

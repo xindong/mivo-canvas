@@ -160,13 +160,22 @@ export const submitEditTask = async (
   const formData = new FormData()
   formData.append('image', request.image, fileNameForBlob(request.image, 'source.png'))
   if (request.mask) formData.append('mask', request.mask, fileNameForBlob(request.mask, 'mask.png'))
-  // P2-C2: annotation area-edit — send normalized maskBounds (+ sourceSize) so the
-  // BFF synthesizes the area mask PNG. Only when no brush mask blob is present
-  // (mutually exclusive: brush mask vs bounds-derived mask).
-  if (request.maskBounds && !request.mask) {
+  // P2-C2: annotation area-edit — maskBounds (+ sourceSize) let the BFF synthesize
+  // the area mask PNG when no brush mask blob is present. Mask-edit dual-model:
+  // bounds are ALSO sent alongside a brush mask now — the gemini (instruction-based)
+  // path folds them into the prompt as a spatial clause; the BFF only synthesizes
+  // a mask from bounds when no mask file exists, so this cannot double-mask.
+  if (request.maskBounds) {
     formData.set('maskBounds', JSON.stringify(request.maskBounds))
     if (request.sourceSize) formData.set('sourceSize', JSON.stringify(request.sourceSize))
   }
+  // Anchor semantics: what the recognizer says the selection contains — feeds
+  // the gemini instruction clause ("only modify the {label} ...").
+  if (request.subjectLabel?.trim()) formData.set('subjectLabel', request.subjectLabel.trim())
+  // Multi-anchor: per-marked-object label + bounds; preferred over subjectLabel.
+  if (request.subjects?.length) formData.set('subjects', JSON.stringify(request.subjects))
+  // Dual-image Set-of-Mark: numbered-ring copy → platform image 2 (visual pointing).
+  if (request.markedImage) formData.append('markedImage', request.markedImage, 'marked.jpg')
   request.reference?.forEach((blob, index) => {
     formData.append('reference[]', blob, fileNameForBlob(blob, `reference-${index + 1}.png`))
   })

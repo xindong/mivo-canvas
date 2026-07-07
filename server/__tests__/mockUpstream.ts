@@ -19,6 +19,7 @@ export type MockState = {
   enhanceCalls: number
   lastEditBodyText: string
   lastEnhanceBodyText: string
+  lastSubmitBodyText: string
   // configurable responses
   tokenStatus: number
   chatStatus: number
@@ -65,6 +66,7 @@ export const defaultMockState = (): MockState => ({
   enhanceCalls: 0,
   lastEditBodyText: '',
   lastEnhanceBodyText: '',
+  lastSubmitBodyText: '',
   tokenStatus: 200,
   chatStatus: 200,
   chat401Once: false,
@@ -151,6 +153,7 @@ async function handle(state: MockState, req: IncomingMessage, res: ServerRespons
   }
   if (path === '/api/v1/message' && method === 'POST') {
     state.submitCalls += 1
+    state.lastSubmitBodyText = (await readBody(req)).toString('utf8')
     const submitStatus = state.submitStatusSequence[state.submitCalls - 1] ?? state.submitStatus
     if (submitStatus !== 200) {
       send(res, submitStatus, {})

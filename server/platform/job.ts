@@ -12,6 +12,10 @@ export const MIVO_PLATFORM_CHANNELS: Record<string, { modelType: string; version
   'gpt-image-2': { modelType: 'GPT', version: 'gpt-image-2' },
 }
 
+// Mask-edit dual-model: the nano-banana channel does instruction-based editing
+// (no mask file); region semantics travel inside the prompt instead.
+export const nanoBananaImageModel = 'gemini-3-pro-image'
+
 const mivoPlatformRatioSet = new Set(['1:1', '16:9', '9:16', '4:3', '3:4', '2:3', '3:2', '4:5', '5:4'])
 const mivoResolutionMap: Record<string, string> = { low: '1K', medium: '1K', high: '2K' }
 

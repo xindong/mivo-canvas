@@ -16,10 +16,12 @@ import { logMaskModelOverride, logTaskTerminal } from '../lib/request'
 import {
   MIVO_PLATFORM_CHANNELS,
   mivoPlatformUploadOne,
+  nanoBananaImageModel,
   resolveMivoPlatformPayload,
   runMivoPlatformImageJob,
   type OnProgress,
 } from '../platform/job'
+import { withMaskRegionClause } from '../lib/maskRegion'
 import {
   completePartialTask,
   completeTask,
@@ -62,6 +64,9 @@ type TaskLogContext = {
   promptLength?: number
   /** edit-timeout-batch: 分档后的上游超时（ms），terminal 日志据此定位撞线 case。 */
   timeoutMs?: number
+  /** 双图指认排查（平台 mask 路径）。 */
+  imagesUploaded?: number
+  maskClause?: 'marked' | 'region'
 }
 
 const errorClassFor = (error: unknown): string =>
@@ -96,6 +101,8 @@ const logTerminal = (
     errorClass: details.errorClass,
     httpStatus: details.httpStatus,
     timeoutMs: context.timeoutMs,
+    imagesUploaded: context.imagesUploaded,
+    maskClause: context.maskClause,
   })
 }
 
@@ -129,17 +136,21 @@ const failTaskLogged = (
   if (getTask(taskId)?.status === 'failed') logTerminal(context, 'failed', details)
 }
 
+// Mask-edit dual-model: gemini-3-pro-image (platform, instruction-based, no mask
+// file) and gpt-image-2 (llm-proxy, alpha-mask inpainting) are both allowed.
+// Anything else falls back to gpt-image-2 (the historical mask model) with a log.
+const maskCapableModels = new Set([nanoBananaImageModel, defaultMivoImageModel])
+
 const effectiveModelForMask = (requestedModel: string, hasMask: boolean, record: TaskRecord): string => {
   if (!hasMask) return requestedModel
-  if (requestedModel !== defaultMivoImageModel) {
-    logMaskModelOverride({
-      requestId: record.requestId,
-      taskId: record.id,
-      path: '/api/mivo/tasks/edit',
-      fromModel: requestedModel,
-      toModel: defaultMivoImageModel,
-    })
-  }
+  if (maskCapableModels.has(requestedModel)) return requestedModel
+  logMaskModelOverride({
+    requestId: record.requestId,
+    taskId: record.id,
+    path: '/api/mivo/tasks/edit',
+    fromModel: requestedModel,
+    toModel: defaultMivoImageModel,
+  })
   return defaultMivoImageModel
 }
 
@@ -159,6 +170,19 @@ export type EditParams = {
   model?: unknown
   mask?: File
   references: File[]
+  // Raw multipart fields; used to build the spatial prompt clause on the
+  // instruction-based (gemini) mask path. Optional — old clients omit them.
+  maskBoundsJson?: string
+  sourceSizeJson?: string
+  // Anchor semantics: what the recognizer says the selection contains.
+  subjectLabel?: string
+  // Multi-anchor: JSON array [{label, bounds}] — one per marked region. Preferred
+  // over subjectLabel/maskBounds when present.
+  subjectsJson?: string
+  // Dual-image Set-of-Mark: same picture with numbered red rings at the anchors.
+  // When present (gemini path), uploaded as image 2 and the prompt switches to
+  // visual pointing ("the objects marked by the circles in image 2").
+  markedImage?: File
 }
 
 // Generate task. Dispatch: platform channel → runMivoPlatformImageJob (real
@@ -242,9 +266,11 @@ export const runGenerateTask = async (taskId: string, params: GenerateParams): P
   }
 }
 
-// Edit task. Dispatch invariant (matches sync edit handler): no mask + platform
-// model → platform (upload images, main first, then run job); mask → llm-proxy
-// gpt-image-2; non-platform no-mask edits use their requested llm-proxy model.
+// Edit task. Dispatch invariant (matches sync edit handler): platform models
+// without mask → platform; mask + gemini-3-pro-image → platform instruction-based
+// edit (mask file dropped, region semantics injected into the prompt); mask +
+// gpt-image-2 → llm-proxy alpha-mask inpainting; non-platform no-mask edits use
+// their requested llm-proxy model.
 export const runEditTask = async (taskId: string, params: EditParams): Promise<void> => {
   const record = getTask(taskId)
   if (!record) return
@@ -255,7 +281,7 @@ export const runEditTask = async (taskId: string, params: EditParams): Promise<v
   const mask = params.mask
   const requestedModel = typeof params.model === 'string' && params.model.trim() ? params.model.trim() : defaultMivoImageModel
   const model = effectiveModelForMask(requestedModel, Boolean(mask), record)
-  const usePlatform = !mask && Boolean(MIVO_PLATFORM_CHANNELS[model])
+  const usePlatform = (!mask || model === nanoBananaImageModel) && Boolean(MIVO_PLATFORM_CHANNELS[model])
   const logContext: TaskLogContext = {
     record,
     model,
@@ -276,7 +302,11 @@ export const runEditTask = async (taskId: string, params: EditParams): Promise<v
         return
       }
       updateProgress(taskId, 'upload', 5)
-      const allImages = [params.image, ...params.references] // main first, do not drop
+      // 双图 Set-of-Mark（用户实测结构定型 2026-07-07）：图1=干净原图（编辑基底），
+      // 图2=红圈标注副本（仅定位参考）。输出基于图1，红圈从结构上进不了成图——
+      // 此前单图方案（圈画在底图上）实测 gemini-3-pro 无视「别显示红圈」指令。
+      const markedImage = mask ? params.markedImage : undefined
+      const allImages = [params.image, ...(markedImage ? [markedImage] : []), ...params.references]
       const fileIds: string[] = []
       try {
         for (const f of allImages) {
@@ -290,7 +320,21 @@ export const runEditTask = async (taskId: string, params: EditParams): Promise<v
         return
       }
       if (canceledInFlight(taskId)) return
-      const { modelType, modelFormat, payload } = resolveMivoPlatformPayload(model, params.imgRatio, quality, params.prompt, fileIds)
+      logContext.imagesUploaded = fileIds.length
+      if (mask) logContext.maskClause = markedImage ? 'dual' : 'region'
+      // 双图路径：最终提示词由前端 buildDualImagePrompt 拼好（逐圈动作只有前端知道，
+      // 且聊天卡片展示逐字原文），BFF 透传。无 markedImage 时回退纯文字方位描述。
+      const platformPrompt =
+        mask && !markedImage
+          ? withMaskRegionClause(
+              params.prompt,
+              params.maskBoundsJson,
+              params.sourceSizeJson,
+              params.subjectLabel,
+              params.subjectsJson,
+            )
+          : params.prompt
+      const { modelType, modelFormat, payload } = resolveMivoPlatformPayload(model, params.imgRatio, quality, platformPrompt, fileIds)
       logContext.imgRatio = typeof payload.imgRatio === 'string' ? payload.imgRatio : undefined
       logContext.resolution = typeof payload.resolution === 'string' ? payload.resolution : undefined
       const result = await runMivoPlatformImageJob(platformCtx, { modelType, modelFormat, payload }, record.controller.signal, progressSink(taskId))

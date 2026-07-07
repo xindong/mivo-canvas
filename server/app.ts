@@ -14,6 +14,8 @@ import type { AppEnv } from './lib/types'
 import { generateHandler } from './routes/generate'
 import { editHandler } from './routes/edit'
 import { enhanceHandler } from './routes/enhance'
+import { describeRegionHandler } from './routes/describeRegion'
+import { composeMaskEditHandler } from './routes/composeMaskEdit'
 import { debugLogsRoute } from './routes/debug-logs'
 import { createLocalAssetsRoutes } from './routes/local-assets'
 import { createEagleRoutes } from './routes/eagle'
@@ -96,6 +98,8 @@ app.use('*', async (c, next) => {
 app.all('/api/mivo/generate', generateHandler)
 app.all('/api/mivo/edit', editHandler)
 app.all('/api/mivo/enhance', enhanceHandler)
+app.all('/api/mivo/describe-region', describeRegionHandler)
+app.all('/api/mivo/compose-mask-edit', composeMaskEditHandler)
 app.route('/api/mivo', debugLogsRoute)
 app.route('/api/mivo', createLocalAssetsRoutes({ enabled: featureFlags.localAssetsEnabled }))
 app.route('/api/mivo', createEagleRoutes({ enabled: featureFlags.eagleProxyEnabled }))

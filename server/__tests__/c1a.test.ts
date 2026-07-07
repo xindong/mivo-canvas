@@ -368,12 +368,66 @@ describe('C1a — edit task (platform, no mask)', () => {
     expect(mockState.uploadCalls).toBe(1)
   })
 
-  it('mask edit task overrides platform model to gpt-image-2 before llm-proxy dispatch', async () => {
+  // Mask-edit dual-model: gemini + mask → platform instruction-based edit (mask
+  // file dropped, region semantics folded into the prompt as a spatial clause).
+  it('mask edit task with gemini dispatches to platform with region clause in prompt', async () => {
+    const form = new FormData()
+    form.append('image', new File([Buffer.from('png-bytes')], 'image.png', { type: 'image/png' }))
+    form.append('mask', new File([Buffer.from('mask-bytes')], 'mask.png', { type: 'image/png' }))
+    form.append('maskBounds', JSON.stringify({ x: 100, y: 50, width: 200, height: 100 }))
+    form.append('sourceSize', JSON.stringify({ width: 400, height: 200 }))
+    form.append('subjectLabel', '蓝色云朵')
+    form.append('prompt', 'edit this')
+    form.append('model', 'gemini-3-pro-image')
+    const create = await req('/api/mivo/tasks/edit', { method: 'POST', body: form })
+    expect(create.status).toBe(202)
+    const done = await pollTask(field(create.body, 'taskId') as string, (b) => b.status === 'done' || b.status === 'failed', 2000)
+    expect(done).not.toBeNull()
+    expect(done!.status).toBe('done')
+    expect(mockState.editCalls).toBe(0)
+    expect(mockState.uploadCalls).toBe(1) // main image only — the mask file is NOT uploaded
+    expect(mockState.lastSubmitBodyText).toContain('edit this')
+    // Anchor semantics: subjectLabel leads the (Chinese) clause ("...的蓝色云朵").
+    expect(mockState.lastSubmitBodyText).toContain('的蓝色云朵')
+    // Anti-literalism guard: the clause must forbid drawing the described bounds.
+    expect(mockState.lastSubmitBodyText).toContain('不要在图上画出任何矩形')
+  })
+
+  // 双图 Set-of-Mark：图1=干净原图、图2=红圈标注副本，两张都上传；最终提示词由
+  // 前端拼好（双图结构化模板），BFF 透传不再追加任何 clause。
+  it('mask edit with markedImage uploads clean base + ringed copy and passes the prompt through', async () => {
+    const structuredPrompt =
+      '帮我对图1进行优化修改。我在图2上圈出了编辑的具体位置，请分析图2的红圈内容，在图1的画面中做针对性修改。\n编辑要求：\n1.将图2中1号红圈范围内的头发改成紫色，红圈范围内除头发以外的内容保持不变。画面中其他相似的内容保持原样，不要误改。\n务必每一条都严格执行并复查。'
+    const form = new FormData()
+    form.append('image', new File([Buffer.from('png-bytes')], 'image.png', { type: 'image/png' }))
+    form.append('mask', new File([Buffer.from('mask-bytes')], 'mask.png', { type: 'image/png' }))
+    form.append('markedImage', new File([Buffer.from('marked-bytes')], 'marked.jpg', { type: 'image/jpeg' }))
+    form.append('sourceSize', JSON.stringify({ width: 400, height: 200 }))
+    form.append(
+      'subjects',
+      JSON.stringify([{ label: '头发', bounds: { x: 10, y: 5, width: 40, height: 30 }, action: '改成紫色' }]),
+    )
+    form.append('prompt', structuredPrompt)
+    form.append('model', 'gemini-3-pro-image')
+    const create = await req('/api/mivo/tasks/edit', { method: 'POST', body: form })
+    expect(create.status).toBe(202)
+    const done = await pollTask(field(create.body, 'taskId') as string, (b) => b.status === 'done' || b.status === 'failed', 2000)
+    expect(done).not.toBeNull()
+    expect(done!.status).toBe('done')
+    expect(mockState.uploadCalls).toBe(2) // 图1 干净原图 + 图2 红圈副本；mask 文件仍不上传
+    expect(mockState.lastSubmitBodyText).toContain('帮我对图1进行优化修改')
+    expect(mockState.lastSubmitBodyText).toContain('1号红圈范围内的头发改成紫色')
+    // 透传：BFF 不追加旧单图 clause。
+    expect(mockState.lastSubmitBodyText).not.toContain('绝不能出现任何红色圆圈')
+  })
+
+  // Non-mask-capable models still fall back to gpt-image-2 on the llm-proxy path.
+  it('mask edit task with a non-mask-capable model falls back to gpt-image-2 llm-proxy', async () => {
     const form = new FormData()
     form.append('image', new File([Buffer.from('png-bytes')], 'image.png', { type: 'image/png' }))
     form.append('mask', new File([Buffer.from('mask-bytes')], 'mask.png', { type: 'image/png' }))
     form.append('prompt', 'edit this')
-    form.append('model', 'gemini-3-pro-image')
+    form.append('model', 'doubao-seedance-2-0-260128')
     const create = await req('/api/mivo/tasks/edit', { method: 'POST', body: form })
     expect(create.status).toBe(202)
     const done = await pollTask(field(create.body, 'taskId') as string, (b) => b.status === 'done' || b.status === 'failed', 2000)
@@ -382,6 +436,5 @@ describe('C1a — edit task (platform, no mask)', () => {
     expect(mockState.editCalls).toBe(1)
     expect(mockState.uploadCalls).toBe(0)
     expect(mockState.lastEditBodyText).toMatch(/name="model"[\s\S]*gpt-image-2/)
-    expect(mockState.lastEditBodyText).not.toMatch(/name="model"[\s\S]*gemini-3-pro-image/)
   })
 })
