@@ -93,3 +93,16 @@ Project MivoCanvas/
 - **默认渲染器**:2026-07-06 起默认 `leafer`(Leafer 正式化最终验收通过后切换);`?renderer=dom` 为应急回退通道,DomRenderer 与双轨代码保留,观察窗后另行决策。
 
 （在此追加项目的具体决策、踩坑、TODO）
+
+## 部署规则(2026-07-07 团队统一)
+
+- **禁止直接连服务器改代码**:任何人不得 SSH 登录生产服务器直接编辑或构建源码。
+- **一律走 PR**:所有代码改动必须提 Pull Request,经审查 + CI 通过后合并进 `main`。
+- **服务器只做 pull 部署**:代码合并进 `main` 后,在服务器上跑部署脚本拉取更新,服务器工作区不得产生任何本地改动。
+- **部署脚本**:`/AIGC_Group/mivo-canvas/deploy.sh`(只在服务器上,不提交进本仓库),内容为四步:
+  1. `git checkout main && git pull origin main`
+  2. `npm ci`
+  3. `npm run build`
+  4. `pm2 restart mivo-canvas`
+- **pm2 以 yanjian 为主**:服务进程跑在 `yanjian` 的 pm2 实例下,部署以 `yanjian` 身份执行(`sudo -u yanjian /AIGC_Group/mivo-canvas/deploy.sh`);不要用其他用户的 pm2 起重复实例。
+- **自动化部署**:maker 定时任务每日 9:00 / 17:00 自动拉取最新 `main` 部署(9:00 那次排在每日更新日志任务 8:00 之后)。
