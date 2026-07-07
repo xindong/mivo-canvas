@@ -36,7 +36,9 @@ export const formatSidebarTime = (iso: string, now?: number): string => {
   const months = Math.floor(days / 30)
   if (months < 12) return `${months} 个月`
 
-  const years = Math.floor(days / 365)
+  // months(days/30)可在 days 360–364 时达到 12 而 days/365 仍为 0;
+  // 已落入年分支就至少显示 1 年,避免出现「0 年」。
+  const years = Math.max(1, Math.floor(days / 365))
   return `${years} 年`
 }
 

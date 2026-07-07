@@ -64,8 +64,7 @@ export const createProjectsSlice: SliceCreator = (set, get) => ({
     logCanvas(`Renamed project "${existing.name}" to "${trimmed}" (${projectId})`)
   },
   deleteProject: (projectId) => {
-    const state = get()
-    const project = state.projects.find((p) => p.id === projectId)
+    const project = get().projects.find((p) => p.id === projectId)
     if (!project) {
       warnCanvas(`Delete project skipped: missing project ${projectId}`)
       return
@@ -74,20 +73,25 @@ export const createProjectsSlice: SliceCreator = (set, get) => ({
     // Cascade: canvases whose projectId matches fall back to standalone
     // (projectId → undefined). The canvas body is NOT deleted and updatedAt is
     // NOT bumped — 归属回落 is a reclassification, not a content change.
+    // 函数式 set:与 createProject/renameProject 一致,不用外层 snapshot,
+    // 避免并发 set 之间丢更新(Greptile P2)。
     let returnedToStandalone = 0
-    const canvases = Object.fromEntries(
-      Object.entries(state.canvases).map(([canvasId, document]) => {
-        if (document.projectId === projectId) {
-          returnedToStandalone += 1
-          return [canvasId, { ...document, projectId: undefined }]
-        }
-        return [canvasId, document]
-      }),
-    )
+    set((state) => {
+      returnedToStandalone = 0
+      const canvases = Object.fromEntries(
+        Object.entries(state.canvases).map(([canvasId, document]) => {
+          if (document.projectId === projectId) {
+            returnedToStandalone += 1
+            return [canvasId, { ...document, projectId: undefined }]
+          }
+          return [canvasId, document]
+        }),
+      )
 
-    set({
-      projects: state.projects.filter((p) => p.id !== projectId),
-      canvases,
+      return {
+        projects: state.projects.filter((p) => p.id !== projectId),
+        canvases,
+      }
     })
 
     logCanvas(

@@ -20,7 +20,8 @@ export function CanvasRow(props: {
   onExpandProject: (projectId: string) => void
 }) {
   const { canvasId, onOpenCanvas, onExpandProject } = props
-  const canvases = useCanvasStore((s) => s.canvases)
+  // 只订阅本行的 document,避免任一画板变更触发所有行重渲(Greptile P2)。
+  const document = useCanvasStore((s) => s.canvases[canvasId])
   const sceneId = useCanvasStore((s) => s.sceneId)
   const projects = useCanvasStore((s) => s.projects)
   const loadScene = useCanvasStore((s) => s.loadScene)
@@ -33,7 +34,6 @@ export function CanvasRow(props: {
   const [confirmOpen, setConfirmOpen] = useState(false)
   const [renaming, setRenaming] = useState(false)
 
-  const document = canvases[canvasId]
   if (!document) return null
   const title = document.title
   const updatedAt = document.updatedAt

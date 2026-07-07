@@ -32,6 +32,12 @@ describe('formatSidebarTime — relative labels (maker rules)', () => {
     expect(formatSidebarTime(ago(86400 * 6), NOW_MS)).toBe('6 天')
   })
 
+  it('never renders 0 年 in the 360–364 day gap (months=12 but days<365)', () => {
+    expect(formatSidebarTime(ago(86400 * 362), NOW_MS)).toBe('1 年')
+    expect(formatSidebarTime(ago(86400 * 365), NOW_MS)).toBe('1 年')
+    expect(formatSidebarTime(ago(86400 * 800), NOW_MS)).toBe('2 年')
+  })
+
   it('labels < 5w as N 周', () => {
     expect(formatSidebarTime(ago(86400 * 7), NOW_MS)).toBe('1 周')
     expect(formatSidebarTime(ago(86400 * 14), NOW_MS)).toBe('2 周')

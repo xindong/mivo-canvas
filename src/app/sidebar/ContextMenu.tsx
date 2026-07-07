@@ -39,12 +39,18 @@ export function ContextMenu(props: {
   const ref = useRef<HTMLDivElement>(null)
   const [openSubmenu, setOpenSubmenu] = useState<{ id: string; flipX: boolean; flipY: boolean } | null>(null)
 
+  // 调用方内联传 onClose(每次渲染新引用);经 ref 转发让全局监听器只注册一次,
+  // 避免每次重渲都卸载/重挂 document 级监听(Greptile P2)。
+  const onCloseRef = useRef(onClose)
+  useEffect(() => {
+    onCloseRef.current = onClose
+  })
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose()
+      if (event.key === 'Escape') onCloseRef.current()
     }
     const onPointer = (event: PointerEvent) => {
-      if (ref.current && !ref.current.contains(event.target as Node)) onClose()
+      if (ref.current && !ref.current.contains(event.target as Node)) onCloseRef.current()
     }
     document.addEventListener('keydown', onKey)
     document.addEventListener('pointerdown', onPointer)
@@ -52,7 +58,7 @@ export function ContextMenu(props: {
       document.removeEventListener('keydown', onKey)
       document.removeEventListener('pointerdown', onPointer)
     }
-  }, [onClose])
+  }, [])
 
   // Viewport clamp: flip right→left and bottom→up when the menu would overflow.
   const style = useMemo(() => {
