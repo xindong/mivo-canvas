@@ -66,7 +66,7 @@ type TaskLogContext = {
   timeoutMs?: number
   /** 双图指认排查（平台 mask 路径）。 */
   imagesUploaded?: number
-  maskClause?: 'marked' | 'region'
+  maskClause?: 'region' | 'dual'
 }
 
 const errorClassFor = (error: unknown): string =>
