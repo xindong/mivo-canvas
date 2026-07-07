@@ -1,0 +1,174 @@
+# PR 卫生哨兵
+#
+# 背景:PR #146 因与 main 冲突进入 CONFLICTING 状态,GitHub 对冲突态 PR 不构建
+# merge ref → 所有 pull_request CI 静默跳过,作者零感知,问题埋了数天。本 workflow
+# 补两条机器提醒:
+#   1. conflict-sentinel:PR opened/synchronize/reopened 时检测 mergeable_state,
+#      dirty 则评论提醒"CI 被静默跳过",冲突解决后自动把评论更新为已恢复。
+#   2. stale-branch-reminder:每日 09:30(UTC+8)扫所有 open PR,落后 main >10
+#      commit 的分支评论提醒 rebase,降低未来冲突概率。
+#
+# ⚠️ 安全红线:全程不 checkout 任何代码(pull_request_target 带写 token,checkout
+# PR 代码是经典 RCE 脚洞)。两个 job 都纯走 REST API(actions/github-script)。
+#
+# 已知坑:pull_request_target 与 schedule 都跑 main 上的 workflow 定义,本 PR 合入
+# main 前不会对任何 PR 生效,PR 内无法端到端自测。合并后请用 workflow_dispatch
+# 手动首测(stale-branch-reminder 会扫所有 open PR;conflict-sentinel 在手动
+# dispatch 时无 PR 上下文会安全跳过,首次真实触发靠下一条 PR 事件)。
+#
+# 评论正文用 [\n].join() 拼接而非多行模板字符串:模板字符串内的行若顶格写会
+# 破坏 YAML literal block 缩进,顶格行会被 yaml 当成脱离 block 的新键导致 parse
+# 失败。数组每行元素保持 14 空格缩进,YAML 与评论正文都干净。
+
+name: PR Hygiene Sentinel
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  schedule:
+    # 30 1 * * * = UTC 01:30 = UTC+8 09:30
+    - cron: '30 1 * * *'
+  workflow_dispatch:
+
+# 最小权限:仅写 PR 评论,不给 contents/admin 等。无 checkout,无 RCE 面。
+permissions:
+  pull-requests: write
+
+jobs:
+  conflict-sentinel:
+    name: conflict sentinel (CI silent-skip guard)
+    if: github.event_name == 'pull_request_target' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Detect merge conflict & comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const MARKER = '<!-- pr-hygiene:conflict -->';
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            // pull_request_target 事件自带 PR;workflow_dispatch 无 PR 上下文,安全跳过。
+            const prNumber = context.payload.pull_request?.number;
+            if (!prNumber) {
+              core.info('workflow_dispatch 无 PR 上下文,conflict-sentinel 跳过(首次真实触发靠下一条 PR 事件)。');
+              return;
+            }
+
+            // mergeable 是异步计算的,事件 payload 里的值可能为 null,需重试拉取 fresh 状态。
+            let pr = null;
+            for (let i = 0; i < 5; i++) {
+              pr = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+              if (pr.data.mergeable !== null) break;
+              core.info('mergeable 仍为 null(第 ' + (i + 1) + '/5 次),等 10s 重试...');
+              await new Promise(r => setTimeout(r, 10000));
+            }
+
+            const mergeable = pr.data.mergeable;            // true/false/null
+            const mergeableState = pr.data.mergeable_state;  // 'clean'/'blocked'/'unstable'/'dirty'/...
+            core.info('PR #' + prNumber + ': mergeable=' + mergeable + ', mergeable_state=' + mergeableState);
+
+            // 查既有标记评论(有则更新,无则新建,避免刷屏)
+            const comments = await github.rest.issues.listComments({
+              owner, repo, issue_number: prNumber,
+            });
+            const markerComment = comments.data.find(c => c.body && c.body.includes(MARKER));
+
+            if (mergeableState === 'dirty') {
+              const body = [
+                MARKER,
+                '⚠️ 本 PR 当前与 main 存在合并冲突。',
+                '',
+                '注意:GitHub 不会为冲突状态的 PR 触发任何 `pull_request` CI——**所有检查都被静默跳过,绿灯缺席 ≠ 通过**。请先在本地 rebase/merge main 解决冲突后重新推送。',
+                '',
+                '```bash',
+                'git fetch origin',
+                'git rebase origin/main',
+                '# 解决冲突后',
+                'git push --force-with-lease origin <your-branch>',
+                '```',
+              ].join('\n');
+              if (markerComment) {
+                await github.rest.issues.updateComment({
+                  owner, repo, comment_id: markerComment.id, body,
+                });
+                core.info('已更新既有冲突提醒评论。');
+              } else {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: prNumber, body,
+                });
+                core.info('已新建冲突提醒评论。');
+              }
+            } else if (markerComment) {
+              // 非 dirty 且存在标记评论 → 之前提醒过冲突,现已恢复,更新为已解决。
+              const date = new Date().toISOString().slice(0, 10);
+              const body = MARKER + '\n✅ 冲突已解决(' + date + '),CI 应已恢复触发。\n';
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: markerComment.id, body,
+              });
+              core.info('已把标记评论更新为"冲突已解决"。');
+            } else {
+              core.info('无冲突、无既有标记评论,不发评论。');
+            }
+
+  stale-branch-reminder:
+    name: stale branch reminder (daily 09:30 UTC+8)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remind stale branches
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const MARKER = '<!-- pr-hygiene:stale -->';
+            const BEHIND_THRESHOLD = 10;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            // 列所有 open PR(draft 跳过)
+            const prs = await github.paginate(github.rest.pulls.list, {
+              owner, repo, state: 'open', per_page: 100,
+            });
+
+            core.info('共 ' + prs.length + ' 个 open PR,开始检查 behind_by(阈值 >' + BEHIND_THRESHOLD + ')。');
+
+            for (const pr of prs) {
+              if (pr.draft) {
+                core.info('PR #' + pr.number + ' 是 draft,跳过。');
+                continue;
+              }
+              // compare API:base=main, head=PR head ref。behind_by = head 落后 base 的 commit 数。
+              const compare = await github.rest.repos.compareCommits({
+                owner, repo, base: 'main', head: pr.head.ref,
+              });
+              const behindBy = compare.data.behind_by;
+              core.info('PR #' + pr.number + ': behind_by=' + behindBy);
+              if (behindBy <= BEHIND_THRESHOLD) continue;
+
+              const body = [
+                MARKER,
+                'ℹ️ 本分支已落后 main ' + behindBy + ' 个 commit,冲突风险随落后量增长(冲突态会令 CI 静默跳过)。建议尽快 rebase:',
+                '',
+                '```bash',
+                'git fetch origin',
+                'git rebase origin/main',
+                '```',
+              ].join('\n');
+              // 查既有标记评论(有则更新,无则新建)
+              const comments = await github.rest.issues.listComments({
+                owner, repo, issue_number: pr.number,
+              });
+              const markerComment = comments.data.find(c => c.body && c.body.includes(MARKER));
+              if (markerComment) {
+                await github.rest.issues.updateComment({
+                  owner, repo, comment_id: markerComment.id, body,
+                });
+                core.info('PR #' + pr.number + ': 已更新 stale 提醒(behind_by=' + behindBy + ')。');
+              } else {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: pr.number, body,
+                });
+                core.info('PR #' + pr.number + ': 已新建 stale 提醒(behind_by=' + behindBy + ')。');
+              }
+            }
+            core.info('stale-branch-reminder 完成。');
