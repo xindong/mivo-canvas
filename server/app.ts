@@ -28,6 +28,36 @@ const tokenEquals = (a: string, b: string): boolean => {
   return timingSafeEqual(aBuf, bBuf)
 }
 
+// Extract a candidate token from the Authorization header. Supports two schemes:
+//   - `Bearer <token>`            → returns the raw token
+//   - `Basic <base64("user:pw")>` → returns the password (everything after the
+//     first colon; the username is ignored, so a team member can type any name
+//     plus the BFF token as the password)
+// Returns '' for an absent header, an unrecognized scheme, malformed base64, or
+// a decoded value with no colon — the gate then treats the request as unauthorized.
+// Splits on the FIRST colon only so a token containing colons still compares equal.
+const extractBearerToken = (authHeader: string | undefined): string => {
+  const raw = authHeader?.trim() ?? ''
+  if (!raw) return ''
+  if (/^Basic\s+/i.test(raw)) {
+    const encoded = raw.replace(/^Basic\s+/i, '').trim()
+    if (!encoded) return ''
+    try {
+      const decoded = Buffer.from(encoded, 'base64').toString('utf8')
+      const colonIdx = decoded.indexOf(':')
+      if (colonIdx === -1) return ''
+      return decoded.slice(colonIdx + 1)
+    } catch {
+      return ''
+    }
+  }
+  if (/^Bearer\s+/i.test(raw)) {
+    return raw.replace(/^Bearer\s+/i, '').trim()
+  }
+  // Unknown / unsupported scheme — ignore the header entirely.
+  return ''
+}
+
 const featureFlags = resolveFeatureFlags()
 
 export const app = new Hono<AppEnv>()
@@ -36,16 +66,25 @@ export const app = new Hono<AppEnv>()
 app.get('/healthz', (c) => c.json({ status: 'ok' }))
 
 // Access gate. No-op when MIVO_BFF_TOKEN is unset; otherwise every non-/healthz
-// request must carry Authorization: Bearer <token> or X-Mivo-Bff-Token: <token>.
-// 401 responses are sanitized (no token echo / stack).
+// request must carry one of three credentials, any of which matches the token:
+//   - Authorization: Bearer <token>           (programmatic clients)
+//   - Authorization: Basic <base64("user:token")>  (browser address bar / native login prompt — issue #136)
+//   - X-Mivo-Bff-Token: <token>               (programmatic clients)
+// Browsers cannot attach custom headers to a plain GET /, so without the Basic
+// branch the gate 401s the very first page load. On 401 we emit
+// WWW-Authenticate: Basic so the browser pops its native login dialog. 401
+// responses are sanitized (no token echo / stack).
 app.use('*', async (c, next) => {
   const bffToken = process.env.MIVO_BFF_TOKEN?.trim() ?? ''
   if (!bffToken) return next()
   if (c.req.path === '/healthz') return next()
-  const bearer = c.req.header('authorization')?.replace(/^Bearer\s+/i, '').trim() ?? ''
+  const bearer = extractBearerToken(c.req.header('authorization'))
   const custom = c.req.header('x-mivo-bff-token')?.trim() ?? ''
-  const presented = bearer || custom
-  if (!presented || !tokenEquals(presented, bffToken)) {
+  const authorized =
+    (bearer.length > 0 && tokenEquals(bearer, bffToken)) ||
+    (custom.length > 0 && tokenEquals(custom, bffToken))
+  if (!authorized) {
+    c.header('WWW-Authenticate', 'Basic realm="mivo-canvas"')
     return c.json({ error: 'unauthorized' }, 401)
   }
   return next()
