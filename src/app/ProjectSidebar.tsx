@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useState } from 'react'
+import { Fragment, useEffect, useMemo, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
   Bug,
@@ -7,12 +7,10 @@ import {
   ChevronUp,
   Copy,
   CircleHelp,
-  Folder,
-  FolderOpen,
   Image,
   Keyboard,
-  Moon,
   MonitorUp,
+  Moon,
   PanelLeftClose,
   PanelLeftOpen,
   Palette,
@@ -24,12 +22,16 @@ import {
   Sparkles,
   X,
 } from 'lucide-react'
-import { scenes, useCanvasStore } from '../store/canvasStore'
+import { useCanvasStore } from '../store/canvasStore'
 import { selectHasUnreadChangelog, useChangelogStore } from '../store/changelogStore'
 import { debugLogger, useDebugLogStore, type DebugLogEntry, type DebugLogLevel } from '../store/debugLogStore'
 import { toastFeedback } from '../store/toastStore'
 import type { CanvasId } from '../types/mivoCanvas'
 import { ChangelogPanel } from './ChangelogPanel'
+import { buildSidebarModel } from './sidebar/projectSidebarModel'
+import { useCollapsedProjects } from './sidebar/useCollapsedProjects'
+import { ProjectRow } from './sidebar/ProjectRow'
+import { CanvasRow } from './sidebar/CanvasRow'
 
 export type WorkspaceView = 'canvas' | 'assets' | 'plugins' | 'skills'
 
@@ -47,32 +49,6 @@ type ProjectSidebarProps = {
   onPeek: () => void
   onPeekEnd: () => void
 }
-
-type ProjectGroup = {
-  id: string
-  label: string
-  canvasIds: CanvasId[]
-}
-
-const sceneOptions = scenes()
-const sceneMap = new Map<CanvasId, (typeof sceneOptions)[number]>(
-  sceneOptions.map((scene) => [scene.id, scene]),
-)
-
-const starterCanvasIds: CanvasId[] = ['task-states', 'empty']
-
-const projectGroups: ProjectGroup[] = [
-  {
-    id: 'concept-battlepass',
-    label: 'Concept Battlepass',
-    canvasIds: ['character-flow', 'variants', 'asset-handoff'],
-  },
-  {
-    id: 'product-direction',
-    label: '商品图方向',
-    canvasIds: ['stress-test'],
-  },
-]
 
 const settingsMenuItems = [
   {
@@ -123,8 +99,10 @@ export function ProjectSidebar({
 }: ProjectSidebarProps) {
   const sceneId = useCanvasStore((state) => state.sceneId)
   const canvases = useCanvasStore((state) => state.canvases)
+  const projects = useCanvasStore((state) => state.projects)
   const loadScene = useCanvasStore((state) => state.loadScene)
   const createCanvas = useCanvasStore((state) => state.createCanvas)
+  const createProject = useCanvasStore((state) => state.createProject)
   const debugEntries = useDebugLogStore((state) => state.entries)
   const clearDebugLog = useDebugLogStore((state) => state.clear)
   const [projectsOpen, setProjectsOpen] = useState(true)
@@ -132,9 +110,11 @@ export function ProjectSidebar({
   const [debugLogOpen, setDebugLogOpen] = useState(false)
   const [debugLogFilter, setDebugLogFilter] = useState<DebugLogLevel | 'all'>('all')
   const [settingsOpen, setSettingsOpen] = useState(false)
-  const [expandedProjects, setExpandedProjects] = useState<Record<string, boolean>>({
-    'concept-battlepass': true,
-  })
+  // Track which project is in inline-rename mode. Lifted (not per-ProjectRow) so a
+  // freshly-created project can enter rename mode immediately (B7: 段头 + → create
+  // → rename).
+  const [renamingProjectId, setRenamingProjectId] = useState<string | null>(null)
+  const { collapsed, toggle: toggleProjectCollapsed, setCollapsed: setProjectCollapsed } = useCollapsedProjects()
   const hasUnreadChangelog = useChangelogStore(selectHasUnreadChangelog)
   const loadChangelog = useChangelogStore((state) => state.loadChangelog)
 
@@ -142,12 +122,16 @@ export function ProjectSidebar({
     void loadChangelog()
   }, [loadChangelog])
 
+  // Derived sidebar model: project groups (sorted by latest activity) + standalone
+  // canvas ids. Replaces the hardcoded demo projectGroups/starterCanvasIds.
+  const sidebarModel = useMemo(() => buildSidebarModel(projects, canvases), [projects, canvases])
+
   const openChangelog = () => {
     setChangelogOpenedAt(Date.now())
     debugLogger.log('Changelog', 'Changelog panel opened')
   }
 
-  const openCanvas = (canvasId: CanvasId) => {
+  const openCanvasById = (canvasId: CanvasId) => {
     loadScene(canvasId)
     onOpenCanvas(canvasId)
   }
@@ -155,35 +139,18 @@ export function ProjectSidebar({
   const createStandaloneCanvas = () => {
     const canvasId = createCanvas('Untitled Canvas')
     onOpenCanvas(canvasId)
+    toastFeedback.success('已新建画板')
+  }
+
+  const newProject = () => {
+    const id = createProject()
+    setRenamingProjectId(id)
   }
 
   const handleSettingsMenuItem = (label: string) => {
     debugLogger.warn('Settings', `${label} is not implemented yet`)
   }
 
-  const renderCanvasRow = (canvasId: CanvasId) => {
-    const scene = sceneMap.get(canvasId)
-    const active = activeView === 'canvas' && sceneId === canvasId
-
-    return (
-      <button
-        key={canvasId}
-        type="button"
-        className={active ? 'canvas-row active' : 'canvas-row'}
-        onClick={() => openCanvas(canvasId)}
-      >
-        <MonitorUp size={14} />
-        <span>{canvases[canvasId]?.title || scene?.label || canvasId}</span>
-        <ChevronRight className="row-hover-arrow" size={14} />
-      </button>
-    )
-  }
-
-  const projectCanvasIds = new Set(projectGroups.flatMap((project) => project.canvasIds))
-  const dynamicStandaloneCanvasIds = Object.keys(canvases).filter(
-    (canvasId) => !projectCanvasIds.has(canvasId) && !starterCanvasIds.includes(canvasId),
-  )
-  const standaloneCanvasIds = [...dynamicStandaloneCanvasIds, ...starterCanvasIds]
   const visibleDebugEntries =
     debugLogFilter === 'all' ? debugEntries : debugEntries.filter((entry) => entry.level === debugLogFilter)
   const debugLogCounts = {
@@ -329,43 +296,32 @@ export function ProjectSidebar({
                 <ChevronRight className="row-hover-arrow" size={15} />
               )}
             </button>
-            <button type="button" aria-label="New project" title="New project">
+            <button
+              type="button"
+              aria-label="New project"
+              title="New project"
+              onClick={newProject}
+            >
               <Plus size={15} />
             </button>
           </div>
           {projectsOpen ? (
             <div className="project-tree" aria-label="Project canvas tree">
-              {projectGroups.map((project) => {
-                const projectOpen = expandedProjects[project.id]
-
-                return (
-                  <div key={project.id} className="project-branch">
-                    <button
-                      type="button"
-                      className="project-row tree-row"
-                      aria-expanded={projectOpen}
-                      onClick={() =>
-                        setExpandedProjects((current) => ({
-                          ...current,
-                          [project.id]: !current[project.id],
-                        }))
-                      }
-                    >
-                      {projectOpen ? <FolderOpen size={15} /> : <Folder size={15} />}
-                      <span>{project.label}</span>
-                      {projectOpen ? (
-                        <ChevronDown className="row-hover-arrow" size={14} />
-                      ) : (
-                        <ChevronRight className="row-hover-arrow" size={14} />
-                      )}
-                    </button>
-
-                    {projectOpen ? (
-                      <div className="canvas-tree project-canvas-tree">{project.canvasIds.map(renderCanvasRow)}</div>
-                    ) : null}
-                  </div>
-                )
-              })}
+              {sidebarModel.projectGroups.map((group) => (
+                <ProjectRow
+                  key={group.project.id}
+                  project={group.project}
+                  canvasIds={group.canvasIds}
+                  collapsed={collapsed.has(group.project.id)}
+                  onToggle={() => toggleProjectCollapsed(group.project.id)}
+                  onExpandProject={(projectId) => setProjectCollapsed(projectId, false)}
+                  onOpenCanvas={openCanvasById}
+                  renaming={renamingProjectId === group.project.id}
+                  onRenameStart={() => setRenamingProjectId(group.project.id)}
+                  onRenameSubmit={() => setRenamingProjectId(null)}
+                  onRenameCancel={() => setRenamingProjectId(null)}
+                />
+              ))}
             </div>
           ) : null}
         </section>
@@ -383,7 +339,14 @@ export function ProjectSidebar({
             </button>
           </div>
           <div className="canvas-tree standalone-tree" aria-label="Standalone canvases">
-            {standaloneCanvasIds.map(renderCanvasRow)}
+            {sidebarModel.standaloneCanvasIds.map((canvasId) => (
+              <CanvasRow
+                key={canvasId}
+                canvasId={canvasId}
+                onOpenCanvas={openCanvasById}
+                onExpandProject={(projectId) => setProjectCollapsed(projectId, false)}
+              />
+            ))}
           </div>
         </section>
       </div>

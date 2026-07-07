@@ -422,10 +422,21 @@ export type MivoCanvasSnapshot = {
   selectedNodeIds?: string[]
 }
 
+export type CanvasProject = {
+  id: string
+  name: string
+  /** ISO timestamp; set once at createProject time. */
+  createdAt: string
+}
+
 export type CanvasDocument = {
   title: string
   sourceTemplateId?: DemoSceneId
   projectId?: string
+  /** ISO timestamp; set once when the canvas is created (normalizeDocument backfills for legacy snapshots). */
+  createdAt: string
+  /** ISO timestamp; bumped on user-visible content changes (nodes/edges/tasks/title), not on selection-only patches. */
+  updatedAt: string
   nodes: MivoCanvasNode[]
   edges: CanvasEdge[]
   tasks: CanvasTask[]

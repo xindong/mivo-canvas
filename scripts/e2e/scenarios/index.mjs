@@ -18,6 +18,7 @@ import { runMaskSourceDeleteScenario } from './mask-source-delete.mjs'
 import { runMarkupTextOverlayScenario } from './markup-text-overlay.mjs'
 import { runMaskTimeoutRetryScenario } from './mask-timeout-retry.mjs'
 import { runMigrationScenario } from './migration.mjs'
+import { runProjectSidebarScenario } from './project-sidebar.mjs'
 import { runShellSidebarScenario } from './shell-sidebar.mjs'
 import { runStampOverlapScenario } from './stamp-overlap.mjs'
 import { runVariationsAnnotationScenario } from './variations-annotation.mjs'
@@ -48,6 +49,7 @@ export const scenarioOrder = [
   'mask-hydration',
   'coordinate-probe',
   'stamp-overlap',
+  'project-sidebar',
 ]
 
 // leafer 模式显式 skip 名单(带理由,e2e-smoke 读取)。原则:只有当场景的断言
@@ -87,6 +89,7 @@ export const scenarioRunners = {
   'mask-hydration': runMaskHydrationScenario,
   'markup-text-overlay': runMarkupTextOverlayScenario,
   migration: runMigrationScenario,
+  'project-sidebar': runProjectSidebarScenario,
   'shell-sidebar': runShellSidebarScenario,
   'stamp-overlap': runStampOverlapScenario,
   'variations-annotation': runVariationsAnnotationScenario,

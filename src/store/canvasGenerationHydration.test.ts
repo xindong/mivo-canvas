@@ -38,6 +38,8 @@ const slotNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
 
 const document = (overrides: Partial<CanvasDocument> = {}): CanvasDocument => ({
   title: 'demo',
+  createdAt: '2026-07-01T00:00:00.000Z',
+  updatedAt: '2026-07-01T00:00:00.000Z',
   nodes: [],
   edges: [],
   tasks: [],

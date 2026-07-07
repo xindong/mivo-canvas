@@ -1,4 +1,4 @@
-import type { AiWorkflowStatus, CanvasId, CanvasTask } from '../types/mivoCanvas'
+import type { AiWorkflowStatus, CanvasDocument, CanvasId, CanvasTask, DemoSceneId } from '../types/mivoCanvas'
 import { defaultStampKind } from '../canvas/stampDefs'
 import { debugLogger } from './debugLogStore'
 import {
@@ -10,6 +10,7 @@ import {
   patchCanvasDocument,
   selectionFrom,
 } from './canvasDocumentModel'
+import { DEMO_PROJECTS, DEMO_SCENE_PROJECT_MAP } from './demoScenes'
 import type { CanvasState } from './canvasStore'
 
 // Local mirror of canvasStore.logCanvas so this module can log migration
@@ -18,11 +19,19 @@ import type { CanvasState } from './canvasStore'
 const logCanvas = (message: string) => debugLogger.log('Canvas Store', message)
 const warnCanvas = (message: string) => debugLogger.warn('Canvas Store', message)
 
+// Single source of truth for the persist version. Shared by canvasPersistConfig
+// (the persist `version` field) and mergeCanvasPersistedState (the migrate call
+// inside merge) so the merge always re-runs migration at the current version
+// rather than a stale hardcoded number — otherwise every hydration would re-run
+// the v9 branches (duplicate warns / duplicate orphan cleanup).
+export const CANVAS_PERSIST_VERSION = 10
+
 // Persisted-state shape (subset of CanvasState that survives compactCanvasesForPersist).
 type PersistedCanvasState = Partial<
   Pick<
     CanvasState,
     | 'canvases'
+    | 'projects'
     | 'nodes'
     | 'edges'
     | 'tasks'
@@ -158,9 +167,59 @@ export const migratePersistedState = (persistedState: unknown, persistedVersion 
   const activeDocument = documentFor(canvases, sceneId)
   const selection = selectionFrom(activeDocument.selectedNodeIds, activeDocument.selectedNodeId, activeDocument.nodes)
 
+  // v10: projects field + orphan projectId cleanup. At v<10 the field didn't
+  // exist, so projects defaults to [] and EVERY canvas with a projectId is an
+  // orphan (cleared). 后续版本同规则: at v10+ only projectIds pointing to a
+  // project missing from the projects list are cleared. normalizeDocument
+  // already backfilled createdAt/updatedAt per-canvas above; orphan cleanup is
+  // a separate concern (reclassification, not a content change — no bump).
+  const baseProjects = Array.isArray(persisted.projects) ? persisted.projects : []
+  // v9→v10 one-time relink: when demo scene canvases are present without a
+  // projectId (v9 had no projects field, so demo scenes migrated up ungrouped),
+  // seed the two demo projects and re-attach them. Gated STRICTLY on
+  // persistedVersion < 10 — the every-hydration re-migrate (merge calls migrate
+  // with version=CANVAS_PERSIST_VERSION=10) must NOT re-run this, otherwise a
+  // user who deleted the Concept Battlepass project would see it revive on
+  // refresh. Seeding is conditional on demo canvases existing (per spec: 若 demo
+  // 场景画板存在且 projectId 为空 → 补种并挂回) so a custom v9 workspace without
+  // demo scenes does not gain empty demo projects. Relink runs before orphan
+  // cleanup so the seeded projects are in the known set when orphans are checked.
+  let projects = baseProjects
+  if (persistedVersion < 10) {
+    const targets: Array<{ canvasId: CanvasId; document: CanvasDocument; projectId: string }> = []
+    for (const [canvasId, document] of Object.entries(canvases)) {
+      const demoProjectId = DEMO_SCENE_PROJECT_MAP[canvasId as DemoSceneId]
+      if (demoProjectId && !document.projectId) {
+        targets.push({ canvasId: canvasId as CanvasId, document, projectId: demoProjectId })
+      }
+    }
+    if (targets.length > 0) {
+      const existingIds = new Set(baseProjects.map((p) => p.id))
+      projects = baseProjects.concat(DEMO_PROJECTS.filter((p) => !existingIds.has(p.id)))
+      for (const { canvasId, document, projectId } of targets) {
+        canvases[canvasId] = { ...document, projectId }
+      }
+      logCanvas(
+        `Hydration seeded ${projects.length - baseProjects.length} demo project(s) and relinked ${targets.length} demo canvas(es) (migrated v${persistedVersion} → v10)`,
+      )
+    }
+  }
+  const knownProjectIds = new Set(projects.map((p) => p.id))
+  let orphanCount = 0
+  for (const [canvasId, document] of Object.entries(canvases)) {
+    if (document.projectId && !knownProjectIds.has(document.projectId)) {
+      orphanCount += 1
+      canvases[canvasId] = { ...document, projectId: undefined }
+    }
+  }
+  if (orphanCount > 0) {
+    warnCanvas(`Hydration cleared ${orphanCount} orphan projectId(s) (not in projects list)`)
+  }
+
   return {
     ...persisted,
     canvases,
+    projects,
     sceneId,
     nodes: activeDocument.nodes,
     edges: activeDocument.edges || [],
@@ -227,7 +286,21 @@ export const mergeCanvasPersistedState = (
   migrate: (persistedState: unknown, persistedVersion?: number) => unknown,
   warn: (message: string) => void,
 ): CanvasState => {
-  const merged = { ...currentState, ...(migrate(persistedState, 9) as Partial<CanvasState>) }
+  // Fresh install (no persisted IDB state — getItem returned null): keep the
+  // initial default state, which already seeds the demo projects + demo-scene
+  // projectIds (createProjectsSlice / canvasDocumentFromScene). Re-running
+  // migrate(null, 10) here would reset projects to [] and clobber that fresh
+  // default, hiding the demo project grouping in the sidebar. There are no
+  // persisted generations to settle either, so return currentState as-is.
+  if (persistedState == null) {
+    return currentState
+  }
+  // Re-run migrate at the CURRENT persist version (not a stale hardcoded 9) so
+  // the v10 orphan-cleanup / timestamp-backfill branches apply on every
+  // hydration. migrate is idempotent for already-v10 state (normalizeDocument
+  // preserves existing timestamps; orphan cleanup is a no-op when projectIds
+  // are all valid).
+  const merged = { ...currentState, ...(migrate(persistedState, CANVAS_PERSIST_VERSION) as Partial<CanvasState>) }
   const result = settleExpiredCanvasGenerations(merged)
   if (result.counts.settledTasks > 0 || result.counts.settledSlots > 0) {
     warn(`Hydration settled expired canvas generations: slots=${result.counts.settledSlots}; tasks=${result.counts.settledTasks}`)

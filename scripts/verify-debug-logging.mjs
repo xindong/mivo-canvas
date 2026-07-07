@@ -87,6 +87,41 @@ checks.push(async () => {
   }
 })
 
+// Phase 5 (B12·C14): pin specific operation strings for the sidebar management
+// flows. Do NOT require a mechanical log/warn/error triple on projectsSlice —
+// delete/rename have no failure path, only success log + skip warn. The UI rows
+// pin toastFeedback for user-acknowledged outcomes; no fake catch branches are
+// fabricated (the store actions are synchronous and don't throw).
+checks.push(async () => {
+  const slice = await read('src/store/projectsSlice.ts')
+  requireIncludes(slice, 'Created project', 'projectsSlice create success log')
+  requireIncludes(slice, 'Renamed project', 'projectsSlice rename success log')
+  requireIncludes(slice, 'Rename project skipped: empty name', 'projectsSlice rename skip warn')
+  requireIncludes(slice, 'Rename project skipped: missing project', 'projectsSlice rename skip warn')
+  requireIncludes(slice, 'Deleted project', 'projectsSlice delete success log')
+  requireIncludes(slice, 'Delete project skipped: missing project', 'projectsSlice delete skip warn')
+  requireIncludes(slice, 'canvas(es) returned to standalone', 'projectsSlice delete cascade log')
+})
+
+checks.push(async () => {
+  const move = await read('src/store/documentSlice.ts')
+  requireIncludes(move, 'Moved canvas', 'documentSlice move success log')
+  requireIncludes(move, 'Move canvas skipped: missing canvas', 'documentSlice move skip warn')
+  requireIncludes(move, 'Move canvas skipped: target project', 'documentSlice move skip warn')
+})
+
+checks.push(async () => {
+  const canvasRow = await read('src/app/sidebar/CanvasRow.tsx')
+  requireIncludes(canvasRow, 'toastFeedback.success', 'CanvasRow success toast (duplicate/delete/move)')
+  requireIncludes(canvasRow, 'toastFeedback.error', 'CanvasRow error toast (move failure)')
+  requireIncludes(canvasRow, 'toastFeedback.warn', 'CanvasRow warn toast (delete guard)')
+})
+
+checks.push(async () => {
+  const projectRow = await read('src/app/sidebar/ProjectRow.tsx')
+  requireIncludes(projectRow, 'toastFeedback.success', 'ProjectRow success toast (new canvas/delete)')
+})
+
 for (const check of checks) {
   await check()
 }

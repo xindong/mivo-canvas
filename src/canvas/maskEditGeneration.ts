@@ -8,7 +8,7 @@ import { useCanvasStore } from '../store/canvasStore'
 import { useCameraFocusStore } from '../store/cameraFocusStore'
 import { AI_SLOT_GAP, reflowRightObstacles } from '../store/aiCanvasWorkflow'
 import { defaultSizeForNodeType } from './nodeTypes/canvasNodeRegistry'
-import { rollbackLatestHistoryBaseline } from '../store/canvasDocumentModel'
+import { rollbackLatestHistoryBaseline, patchCanvasDocument } from '../store/canvasDocumentModel'
 import { debugLogger } from '../store/debugLogStore'
 import { readCanvasImageBlob } from '../lib/canvasImageSource'
 import { MivoImageRequestError } from '../lib/mivoImageClient'
@@ -77,12 +77,13 @@ const patchMaskEditSlotStatus = (
     )
     const slot = nodes.find((node) => node.id === slotId)
     const nextNodes = status === 'generating' && slot ? reflowRightObstacles(nodes, slot, AI_SLOT_GAP) : nodes
-    const nextDocument = { ...document, nodes: nextNodes }
 
-    return {
-      ...(sceneId === current.sceneId ? { nodes: nextNodes } : {}),
-      canvases: { ...current.canvases, [sceneId]: nextDocument },
-    }
+    // Route through patchCanvasDocument so updatedAt bumps on this content
+    // change (placeholder placement / status flip are user-visible). The
+    // non-active-scene branch writes canvases only; the active branch also
+    // surfaces nodes at the top level — both equivalent to the prior direct
+    // spread, but now consistent with the updatedAt hub.
+    return patchCanvasDocument(current, sceneId, { nodes: nextNodes })
   })
 }
 
@@ -155,10 +156,9 @@ export const removeMaskEditPlaceholder = (
     if (!document) return {}
     const nodes = document.nodes.filter((node) => node.id !== slotId)
     const edges = (document.edges || []).filter((edge) => edge.from !== slotId && edge.to !== slotId)
-    return {
-      ...(sceneId === current.sceneId ? { nodes, edges } : {}),
-      canvases: { ...current.canvases, [sceneId]: { ...document, nodes, edges } },
-    }
+    // Filter-removal fallback (rollback didn't apply): route through
+    // patchCanvasDocument so updatedAt bumps on the node/edge removal.
+    return patchCanvasDocument(current, sceneId, { nodes, edges })
   })
 
   const title = context.sourceTitle || slotId
@@ -210,7 +210,6 @@ const patchMaskEditProgress = (
   useCanvasStore.setState((current) => {
     const document = current.canvases[sceneId]
     if (!document) return {}
-    const now = Date.now()
     const nodes = document.nodes.map((node) =>
       node.id === slotId && node.type === 'ai-slot' && node.aiWorkflow
         ? {
@@ -221,16 +220,15 @@ const patchMaskEditProgress = (
               progress,
               stage,
               elapsedSec: node.aiWorkflow.startedAt
-                ? Math.max(0, Math.round((now - node.aiWorkflow.startedAt) / 1000))
+                ? Math.max(0, Math.round((Date.now() - node.aiWorkflow.startedAt) / 1000))
                 : undefined,
             },
           }
         : node,
     )
-    return {
-      ...(sceneId === current.sceneId ? { nodes } : {}),
-      canvases: { ...current.canvases, [sceneId]: { ...document, nodes } },
-    }
+    // High-frequency machine update (poll progress) — explicitly opt out of the
+    // updatedAt bump so progress polling doesn't churn the recent-activity ordering.
+    return patchCanvasDocument(current, sceneId, { nodes }, { bumpUpdatedAt: false })
   })
 }
 
