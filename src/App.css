@@ -34,6 +34,10 @@
   --layer-frame: 0;
   --layer-content: 10;
   --layer-selected-elevated: 20;
+  /* V2 stamp: above every content node incl. a selected image (D2). 21–29 band —
+     above --layer-selected-elevated (20), below --layer-preview (30) so drag
+     preview / marquee still float above a stamp. */
+  --layer-stamp: 25;
   --layer-preview: 30;
   --layer-handles: 40;
   --layer-floating-ui: 50;
@@ -4084,6 +4088,16 @@ button:disabled {
   box-shadow:
     0 0 0 4px rgba(105, 87, 232, 0.18),
     0 18px 44px rgba(35, 35, 35, 0.22);
+}
+
+/* V2 stamp (D2): a stamp always paints above every content node, including a
+   selected image (--layer-selected-elevated=20). The compound .stamp-node.selected
+   selector (specificity 0,3,0) outranks .dom-node.selected (0,2,0) so a selected
+   stamp does NOT drop back to 20. Mirrors the Leafer renderOrder=1 policy
+   (zRank.renderZRankForNode) + hitTest defaultZOrderCompare precedence. */
+.dom-node.stamp-node,
+.dom-node.stamp-node.selected {
+  z-index: var(--layer-stamp);
 }
 
 .dom-node.markup-node {

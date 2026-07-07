@@ -58,6 +58,29 @@ describe('resizeNodeTransform', () => {
     expect(result.x + result.width / 2).toBe(node.x + node.width / 2)
     expect(result.y + result.height / 2).toBe(node.y + node.height / 2)
   })
+
+  it('keeps stamp resize square from a corner and anchors the opposite corner', () => {
+    const node = baseNode({ type: 'markup', markupKind: 'stamp', x: 100, y: 100, width: 44, height: 44 })
+    const state = createNodeResizeState(node, 1, 'nw', 100, 100)
+
+    const result = resizeNodeTransform(state, node, [node], 70, 90, 1)
+
+    expect(result).toMatchObject({ x: 70, y: 70, width: 74, height: 74 })
+    expect(result.x + result.width).toBe(node.x + node.width)
+    expect(result.y + result.height).toBe(node.y + node.height)
+  })
+
+  it('keeps stamp resize square for centered (Alt) corner resize', () => {
+    const node = baseNode({ type: 'markup', markupKind: 'stamp', x: 100, y: 100, width: 44, height: 44 })
+    const state = createNodeResizeState(node, 1, 'se', 0, 0)
+
+    const result = resizeNodeTransform(state, node, [node], 20, 10, 1, { centered: true })
+
+    expect(result).toMatchObject({ x: 80, y: 80, width: 84, height: 84 })
+    expect(result.x + result.width / 2).toBe(node.x + node.width / 2)
+    expect(result.y + result.height / 2).toBe(node.y + node.height / 2)
+    expect(result.guides).toEqual([])
+  })
 })
 
 describe('resizeGroupSelection', () => {

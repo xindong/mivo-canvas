@@ -42,13 +42,13 @@ import type { MivoCanvasNode } from '../types/mivoCanvas'
 import { acquireAssetUrl } from '../lib/assetUrlLease'
 import { debugLogger } from '../store/debugLogStore'
 import { Layer } from './layers'
+import { paintSignatureFor } from './leaferPaintSignature'
 import {
   diffReconcilePlan,
   type RendererReconcileCounts,
   type RendererSyncContext,
 } from './rendererAdapter'
 import { engineLodFillFor, shouldUseEngineLod } from './engineSpikeLod'
-import type { ViewportState } from './useLeaferSpikeRenderer'
 
 type ImageObject = Image | Group | Rect
 type ImageEntryKind = 'image' | 'image-crop' | 'lod-rect'
@@ -57,6 +57,8 @@ type ImageEntry = {
   nodeId: string
   object: ImageObject
   kind: ImageEntryKind
+  /** PR-R2 per-node 签名：未变 → 跳过 updateGeometry(set) + assetUrl re-acquire。 */
+  signature: string
   /** Inner Image for 'image-crop' (url is set on this, not the Group). For
    *  'image' the `object` itself is the Image. 'lod-rect' has none. */
   innerImage?: Image
@@ -129,8 +131,10 @@ export const cropChildLocal = (
  *  spike sort image objects by the same layer value the DOM zIndex reads. */
 export const imageLayer = (): Layer => Layer.Content
 
-const desiredKindFor = (node: MivoCanvasNode, viewport: ViewportState): ImageEntryKind => {
-  if (shouldUseEngineLod(node, viewport)) return 'lod-rect'
+/** Greptile P2: 改为接收预计算的 lod（调用方在循环里算一次 shouldUseEngineLod，
+ *  kind 判定 + 签名复用，避免每节点每帧算两次）。 */
+const desiredKindFor = (node: MivoCanvasNode, lod: boolean): ImageEntryKind => {
+  if (lod) return 'lod-rect'
   return node.imageCrop ? 'image-crop' : 'image'
 }
 
@@ -293,14 +297,17 @@ export const createLeaferImagePaint = (leafer: Leafer): LeaferImagePaint => {
     }
 
     for (const node of nodes) {
+      // Greptile P2: shouldUseEngineLod 每节点每帧只算一次，desiredKind + 签名复用。
+      const lod = shouldUseEngineLod(node, ctx.viewport)
       const existing = entries.get(node.id)
-      const desired = desiredKindFor(node, ctx.viewport)
+      const desired = desiredKindFor(node, lod)
       const isNew = plan.created.has(node.id)
       const zIndex = ctx.layerOf?.(node.id)
+      const sig = paintSignatureFor(node, ctx, lod)
 
       if (isNew || !existing) {
         const { object, innerImage } = createObject(node, desired, zIndex)
-        const entry: ImageEntry = { nodeId: node.id, object, kind: desired, innerImage }
+        const entry: ImageEntry = { nodeId: node.id, object, kind: desired, innerImage, signature: sig }
         entries.set(node.id, entry)
         leafer.add(object)
         created += 1
@@ -314,17 +321,25 @@ export const createLeaferImagePaint = (leafer: Leafer): LeaferImagePaint => {
         // new entry acquires fresh if it's a bitmap kind.
         destroyEntry(existing)
         const { object, innerImage } = createObject(node, desired, zIndex)
-        const fresh: ImageEntry = { nodeId: node.id, object, kind: desired, innerImage }
+        const fresh: ImageEntry = { nodeId: node.id, object, kind: desired, innerImage, signature: sig }
         entries.set(node.id, fresh)
         leafer.add(object)
         if (desired !== 'lod-rect') acquireLease(fresh, node.assetUrl)
-      } else {
+        updated += 1
+        continue
+      }
+
+      if (existing.signature !== sig) {
+        // signature 变了 → updateGeometry（set）+ 视 assetUrl 变化决定 re-acquire。
+        // assetUrl 在签名里，签名变但 assetUrl 未变 → 仅几何 set；都变 → re-acquire。
         updateGeometry(existing, node, zIndex)
         if (desired !== 'lod-rect' && existing.assetUrl !== node.assetUrl) {
           releaseLease(existing)
           acquireLease(existing, node.assetUrl)
         }
+        existing.signature = sig
       }
+      // signature 未变 → 跳过 updateGeometry + set（R-03b）
       updated += 1
     }
 

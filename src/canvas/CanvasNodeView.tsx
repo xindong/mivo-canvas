@@ -436,7 +436,9 @@ export const CanvasNodeView = memo(function CanvasNodeView({
   // FU-11/12: leafer 模式下被 Leafer 真画的节点,DOM 侧只保留"纯文字壳"——
   // markup 的 MarkupTextLayer / frame 的 dom-frame-title。能走到这里说明
   // leaferSpikeFilter 已判定该节点需要文字层(有文字或编辑中/标题可见)。
-  const markupTextOverlayOnly = markupNode && rendererMode === 'leafer' && isLeaferSpikePainted(node)
+  const leaferPaintedNode = rendererMode === 'leafer' && isLeaferSpikePainted(node)
+  const markupTextOverlayOnly = markupNode && node.markupKind !== 'stamp' && leaferPaintedNode
+  const stampSelectionShellOnly = markupNode && node.markupKind === 'stamp' && leaferPaintedNode
   const frameTitleOverlayOnly = frameNode && rendererMode === 'leafer' && isLeaferSpikePainted(node)
   const markdownNode = renderKind === 'markdown'
   const markdownDisplayMode = markdownNode ? node.markdownDisplayMode || 'full' : undefined
@@ -479,6 +481,7 @@ export const CanvasNodeView = memo(function CanvasNodeView({
     aiSlotNode && 'ai-slot-node',
     annotationNode && 'annotation-node',
     markupNode && 'markup-node',
+    markupNode && node.markupKind === 'stamp' && 'stamp-node',
     fileNode && 'file-node',
     markdownNode && 'markdown-node',
     pdfNode && 'pdf-node',
@@ -610,6 +613,10 @@ export const CanvasNodeView = memo(function CanvasNodeView({
             </>
           )}
         </div>
+      ) : stampSelectionShellOnly ? (
+        // leafer 模式下 stamp 本体由 leaferBrushStampPaint 的 Group/sticker 真画。
+        // filter 仅在选中 stamp 时放行到这里,DOM 壳只承载 selected 外框和 4 角 handle。
+        null
       ) : markupNode ? (
         <MarkupNodeView
           node={node}

@@ -605,15 +605,31 @@ describe('RenderNode type has no MivoCanvasNode dependency (SC6.1)', () => {
 })
 
 describe('projectNode — z-order defaults (2b-2: layer / renderOrder / surface)', () => {
-  it('frame → Layer.Frame; non-frame → Layer.Content', () => {
+  it('frame → Layer.Frame; non-frame → Layer.Content (stamp 留在 Content，靠 renderOrder 胜出)', () => {
     expect(projectNode(v2ImageNode({ type: 'frame' })).layer).toBe(Layer.Frame)
     expect(projectNode(v2ImageNode()).layer).toBe(Layer.Content)
     expect(projectNode(v2ImageNode({ type: 'text' })).layer).toBe(Layer.Content)
     expect(projectNode(v2ImageNode({ type: 'markup' })).layer).toBe(Layer.Content)
+    expect(projectNode(v2ImageNode({ type: 'markup', markupKind: 'stamp' })).layer).toBe(Layer.Content)
   })
 
-  it('renderOrder defaults to 0', () => {
+  it('renderOrder: stamp → 1 (paints + hit-tests above every other Content node incl. a selected image); 其余 → 0', () => {
+    // 非 stamp 全部 0（image / text / markup-rect / markup-brush / frame）
     expect(projectNode(v2ImageNode()).renderOrder).toBe(0)
+    expect(projectNode(v2ImageNode({ type: 'text' })).renderOrder).toBe(0)
+    expect(projectNode(v2ImageNode({ type: 'markup', markupKind: 'rect' })).renderOrder).toBe(0)
+    expect(projectNode(v2ImageNode({ type: 'markup', markupKind: 'brush' })).renderOrder).toBe(0)
+    expect(projectNode(v2ImageNode({ type: 'frame' })).renderOrder).toBe(0)
+    // stamp 留在 Layer.Content（不抬档），靠 renderOrder=1 胜出
+    const stamp = projectNode(v2ImageNode({ type: 'markup', markupKind: 'stamp' }))
+    expect(stamp.layer).toBe(Layer.Content)
+    expect(stamp.renderOrder).toBe(1)
+    // 关键语义：renderOrder 先于 selected 比较（defaultZOrderCompare），故 stamp
+    // (renderOrder 1, 未选) 仍高于 selected image (renderOrder 0, 已选) —— 三轨一致
+    const selectedImage = projectNode(v2ImageNode({ id: 'img' }), { selectedNodeIds: new Set(['img']) })
+    expect(selectedImage.selected).toBe(true)
+    expect(selectedImage.renderOrder).toBe(0)
+    expect(stamp.renderOrder).toBeGreaterThan(selectedImage.renderOrder)
   })
 
   it('surface defaults to "canvas"', () => {

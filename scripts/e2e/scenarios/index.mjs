@@ -19,6 +19,7 @@ import { runMarkupTextOverlayScenario } from './markup-text-overlay.mjs'
 import { runMaskTimeoutRetryScenario } from './mask-timeout-retry.mjs'
 import { runMigrationScenario } from './migration.mjs'
 import { runShellSidebarScenario } from './shell-sidebar.mjs'
+import { runStampOverlapScenario } from './stamp-overlap.mjs'
 import { runVariationsAnnotationScenario } from './variations-annotation.mjs'
 import { runZoomToolScenario } from './zoom-tool.mjs'
 
@@ -46,6 +47,7 @@ export const scenarioOrder = [
   'mask-timeout-retry',
   'mask-hydration',
   'coordinate-probe',
+  'stamp-overlap',
 ]
 
 // leafer 模式显式 skip 名单(带理由,e2e-smoke 读取)。原则:只有当场景的断言
@@ -86,6 +88,7 @@ export const scenarioRunners = {
   'markup-text-overlay': runMarkupTextOverlayScenario,
   migration: runMigrationScenario,
   'shell-sidebar': runShellSidebarScenario,
+  'stamp-overlap': runStampOverlapScenario,
   'variations-annotation': runVariationsAnnotationScenario,
   'zoom-tool': runZoomToolScenario,
 }

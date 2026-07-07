@@ -24,10 +24,19 @@ const VALID_MODES: ReadonlySet<string> = new Set(['dom', 'leafer', 'pixi'])
 const normalize = (raw: string): string => raw.trim().toLowerCase()
 
 const parseRendererModeFromUrl = (): RendererMode => {
-  if (typeof window === 'undefined' || typeof window.location === 'undefined') return DEFAULT_MODE
+  if (typeof window === 'undefined' || typeof window.location === 'undefined') {
+    // 非浏览器环境（SSR/单测/Node）→ 默认 leafer，不打身份 log（Greptile P2）：
+    // 此路径在 module-load 时执行，Node/SSR 无渲染场景无需 renderer 身份日志，
+    // 且避免污染未 mock debugLogger 的测试。
+    return DEFAULT_MODE
+  }
 
   const raw = new URLSearchParams(window.location.search).get('renderer')
-  if (!raw) return DEFAULT_MODE
+  if (!raw) {
+    // R-14: 缺省（无 ?renderer=）启动记一条渲染器身份 Debug Log，便于运行时确认默认轨。
+    debugLogger.log('Renderer', `renderer identity: ${DEFAULT_MODE} (default)`)
+    return DEFAULT_MODE
+  }
 
   const normalized = normalize(raw)
   if (!VALID_MODES.has(normalized)) {
@@ -44,6 +53,8 @@ const parseRendererModeFromUrl = (): RendererMode => {
     return 'pixi'
   }
 
+  // R-14: 显式 ?renderer=leafer 与缺省等价，同记一条渲染器身份。
+  debugLogger.log('Renderer', 'renderer identity: leafer (?renderer=leafer explicit)')
   return 'leafer'
 }
 

@@ -121,9 +121,15 @@ export function getSnappedResize(
   aspectRatio: number,
   fixedX: number,
   fixedY: number,
+  options?: {
+    minWidth?: number
+    maxWidth?: number
+  },
 ) {
   const east = corner.endsWith('e')
   const south = corner.startsWith('s')
+  const minWidth = options?.minWidth ?? 96
+  const maxWidth = options?.maxWidth ?? 6000
   const matches = getSnapMatches(node.id, rect, nodes, {
     verticalRatios: east ? [0.5, 1] : [0, 0.5],
     horizontalRatios: south ? [0.5, 1] : [0, 0.5],
@@ -138,7 +144,7 @@ export function getSnappedResize(
       : matches.bestVertical.ratio === 1
         ? 0
         : (fixedX - matches.bestVertical.target) / (1 - matches.bestVertical.ratio)
-    if (targetWidth >= 96 && targetWidth <= 6000) {
+    if (targetWidth >= minWidth && targetWidth <= maxWidth) {
       const targetHeight = targetWidth / aspectRatio
       candidates.push({
         rect: {
@@ -161,7 +167,7 @@ export function getSnappedResize(
         ? 0
         : (fixedY - matches.bestHorizontal.target) / (1 - matches.bestHorizontal.ratio)
     const targetWidth = targetHeight * aspectRatio
-    if (targetWidth >= 96 && targetWidth <= 6000) {
+    if (targetWidth >= minWidth && targetWidth <= maxWidth) {
       candidates.push({
         rect: {
           x: east ? fixedX : fixedX - targetWidth,

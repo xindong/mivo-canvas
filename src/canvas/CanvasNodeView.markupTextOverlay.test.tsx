@@ -102,6 +102,23 @@ describe('CanvasNodeView markup 纯文字壳（leafer 模式，FU-11）', () => 
     expect(html).not.toContain('markup-point-handle')
   })
 
+  it('stamp：选中时渲染纯选中壳，保留 selected 外框和 4 个角 handle，不渲染 DOM 贴纸本体', () => {
+    const html = renderNodeView(
+      markupNode({ id: 'stamp-1', markupKind: 'stamp', width: 60, height: 60 }),
+      { selected: true, primarySelected: true },
+    )
+    expect(html).toContain('dom-node markup-node stamp-node selected')
+    expect(html).not.toContain('markup-text-overlay')
+    expect(html).not.toContain('dom-markup-stamp')
+    expect(html).not.toContain('<img')
+    expect(html.match(/class="node-handle /g)).toHaveLength(4)
+    for (const corner of ['nw', 'ne', 'sw', 'se']) {
+      expect(html).toContain(`node-handle ${corner}`)
+    }
+    expect(html).not.toContain('text-resize-handle')
+    expect(html).not.toContain('markup-point-handle')
+  })
+
   it('frame：纯标题壳只含 dom-frame-title——盒体（底色/虚线框）由 Leafer 真画不出现在 DOM（FU-12）', () => {
     const html = renderNodeView(
       markupNode({ type: 'frame', markupKind: undefined, title: 'Section 1', width: 560, height: 320 }),
