@@ -2,19 +2,17 @@
 // 富文本编辑器:contentEditable DOM 的命令式 chip 维护 + 序列化 + 输入/粘贴/
 // 键盘/点击处理 + chip 同步/选中态 effect。ref/闭包依赖通过参数进,函数体
 // 逐字搬移;effect 依赖数组逐字保留。
-import { useCallback, useEffect } from 'react'
+import { useCallback, useEffect, useRef } from 'react'
 import type {
   ClipboardEvent as ReactClipboardEvent,
   Dispatch,
   KeyboardEvent as ReactKeyboardEvent,
   MouseEvent as ReactMouseEvent,
-  RefObject,
   SetStateAction,
 } from 'react'
 import type { ImageMaskRegion, PointAnchor } from './imageMaskGeometry'
 import { recognitionLabel, type AnchorRecognition } from './useMaskAnchorRecognition'
 
-type EditorRef = RefObject<HTMLDivElement | null>
 type RegionsRef = { current: ImageMaskRegion[] }
 type PointAnchorsRef = { current: PointAnchor[] }
 type RecognitionsRef = { current: Record<string, AnchorRecognition> }
@@ -23,7 +21,6 @@ type WriteRecognitions = (updater: (current: Record<string, AnchorRecognition>) 
 const anchorKeyAttr = 'data-anchor-key'
 
 export function useMaskRichEditor({
-  editorRef,
   regionsRef,
   pointAnchorsRef,
   regions,
@@ -36,7 +33,6 @@ export function useMaskRichEditor({
   onCancel,
   commitMaskState,
 }: {
-  editorRef: EditorRef
   regionsRef: RegionsRef
   pointAnchorsRef: PointAnchorsRef
   regions: ImageMaskRegion[]
@@ -49,6 +45,8 @@ export function useMaskRichEditor({
   onCancel: () => void
   commitMaskState: (nextRegions: ImageMaskRegion[], nextPointAnchors: PointAnchor[]) => void
 }) {
+  const editorRef = useRef<HTMLDivElement | null>(null)
+  const fieldRef = useRef<HTMLDivElement | null>(null)
   // 富文本编辑器序列化：走一遍 childNodes，chip → 当前标签、文本 → 原文，合起来
   // 即「编辑要求」正文（标签也是正文的一部分）；hasText 用于占位符显隐。
   const readEditor = useCallback((): { prompt: string; hasText: boolean } => {
@@ -297,6 +295,8 @@ export function useMaskRichEditor({
   }, [normalizeEditorDom, syncEditorChips, readEditor, editorRef])
 
   return {
+    editorRef,
+    fieldRef,
     readEditor,
     buildChipNode,
     syncEditorChips,

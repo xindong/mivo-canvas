@@ -109,9 +109,6 @@ export function ImageMaskEditOverlay({
   onSubmit,
   onInitialClientPointHandled,
 }: ImageMaskEditOverlayProps) {
-  // 3b: viewport replaces the old viewportScale prop. Alias kept so the rest of
-  // the component (deps arrays, MaskPointMarker, strokeWidth) reads viewportScale
-  // unchanged — only the positioning container + Props changed.
   const { scale: viewportScale } = viewport
   const stageRef = useRef<HTMLDivElement | null>(null)
   // 浮层实际高度随内容变化（模型行、识别标签、错误提示会增高）。用真实测量值
@@ -119,11 +116,6 @@ export function ImageMaskEditOverlay({
   const toolbarRef = useRef<HTMLDivElement | null>(null)
   const promptRef = useRef<HTMLDivElement | null>(null)
   const [tool, setTool] = useState<ImageMaskTool>('ellipse')
-  // 局部重绘固定用 Gemini（nano-banana，2K 指令式局部重绘）——不再提供 GPT 选项。
-  // 质量由模型固定映射（maskEditQualityFor(maskEditDefaultModel) = high）。
-  const fieldRef = useRef<HTMLDivElement | null>(null)
-  // 富文本编辑器 DOM（chip token + 文字混排，命令式维护 chip，不受 React 重渲染影响）。
-  const editorRef = useRef<HTMLDivElement | null>(null)
   const [regions, setRegions] = useState<ImageMaskRegion[]>([])
   const [pointAnchors, setPointAnchors] = useState<PointAnchor[]>([])
   const [past, setPast] = useState<MaskEditSnapshot[]>([])
@@ -497,13 +489,14 @@ export function ImageMaskEditOverlay({
 
   // 富文本编辑器已抽离到 ./useMaskRichEditor(机械抽离,行为不变)。
   const {
+    editorRef,
+    fieldRef,
     readEditor,
     handleEditorInput,
     handleEditorKeyDown,
     handleEditorClick,
     handleEditorPaste,
   } = useMaskRichEditor({
-    editorRef,
     regionsRef,
     pointAnchorsRef,
     regions,
@@ -527,7 +520,7 @@ export function ImageMaskEditOverlay({
     }
     window.addEventListener('pointerdown', handlePointerDown, true)
     return () => window.removeEventListener('pointerdown', handlePointerDown, true)
-  }, [openChipKey, setOpenChipKey])
+  }, [openChipKey, setOpenChipKey, fieldRef])
 
   // Cmd/Ctrl+Z 撤销锚点、Cmd/Ctrl+Shift+Z 重做(Mac 用 Cmd,Win/Linux 用 Ctrl)。
   // 焦点在文本框/输入框内时交给浏览器原生撤销,不劫持打字撤销。
