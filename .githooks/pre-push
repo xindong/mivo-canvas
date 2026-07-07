@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# pre-push hook: 推送前强制本地五道验证(tsc / lint / verify:logging / structure-guard / test:unit)
+# 逃生口:PREFLIGHT_SKIP=1 git push
+set -u
+
+# 逃生口
+if [ "${PREFLIGHT_SKIP:-0}" = "1" ]; then
+  echo "[preflight] skipped (PREFLIGHT_SKIP=1)"
+  exit 0
+fi
+
+# 轻量警示(不阻断):列出未跟踪的源码文件,提示确认是否漏 git add
+# 背景:PR #146 事故正是整个模块漏提交,push 时 tsc 都没过却被静默掩盖
+untracked_src=$(git status --porcelain --untracked-files=all | grep -E '^\?\?.*src/.*\.(ts|tsx)$' || true)
+if [ -n "$untracked_src" ]; then
+  # 黄色警告
+  printf '\033[33m[preflight] 警告:存在未跟踪的源码文件,确认是否漏 git add:\033[0m\n'
+  printf '%s\n' "$untracked_src"
+fi
+
+# 推送前跑 preflight(快→慢)
+echo "[preflight] 开始本地五道验证(tsc -b && lint && verify:logging && structure-guard && test:unit)..."
+if ! npm run preflight; then
+  echo ""
+  echo "------------------------------------------------------------"
+  echo "[preflight] ❌ preflight 未通过,已阻止 push"
+  echo "[preflight] 紧急跳过(仅在确认非代码问题时使用):"
+  echo "    PREFLIGHT_SKIP=1 git push"
+  echo "------------------------------------------------------------"
+  exit 1
+fi
+
+echo "[preflight] ✅ 本地验证通过,允许 push"
+exit 0
