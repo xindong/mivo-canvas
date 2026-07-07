@@ -40,13 +40,8 @@ import {
   type ImageMaskRegion,
   type ImageMaskSubmitPayload,
 } from './imageMaskGeometry'
-import {
-  buildAnchorMarkedImage,
-  type MarkedShape,
-} from '../lib/regionDescribe'
-import { anchorPositions, buildDualImagePrompt } from '../lib/maskPromptBuilder'
-import { composeMaskEditBody } from '../lib/maskEditCompose'
 import type { MaskInitialClientPoint } from './maskPointPending'
+import { buildMaskEditPromptBundle } from './maskEditSubmit'
 import {
   pointAnchorPath,
   regionPath,
@@ -575,42 +570,16 @@ export function ImageMaskEditOverlay({
           return label && bounds ? { label, bounds } : undefined
         })
         .filter((subject): subject is { label: string; bounds: ImageMaskBounds } => Boolean(subject))
-      // 结构化整理：把用户大意按红圈①②③（标签+方位）拆成逐条编辑要求（LLM，
-      // gpt-5.4-mini）。方位由 bounds 算好喂给整理器。失败/降级 → 静默回退到直接
-      // 用原文当正文，绝不阻塞出图。整理结果 + 外壳 = 最终提示词，聊天卡片逐字展示。
-      const anchorBounds = regions.map((region) => boundsForRegions([region], naturalSize) as ImageMaskBounds)
-      const positions = anchorPositions(anchorBounds)
-      const composeAnchors = regions.map((region, index) => ({
-        n: index + 1,
-        label: recognitionLabel(recognitionsRef.current[regionKey(region)]) || `目标${index + 1}`,
-        position: positions[index],
-      }))
-      const composedBody = await composeMaskEditBody(body, composeAnchors)
-      const finalPrompt = buildDualImagePrompt(composedBody ?? body)
-      // 单图指认（Set-of-Mark）：把用户画的选区所见即所得地用红色画到全图副本上
-      //（点选=自动红圈、矩形/椭圆=红框/红椭圆、圈选=手绘闭合红圈,序号与画布/
-      // 标签一致），这张副本就是发给 nano-banana 的编辑图。生成失败则静默退回
-      // 纯文字定位，不阻塞提交。
-      const markShapes = regions
-        .map((region, index): MarkedShape | undefined => {
-          const n = index + 1
-          if (region.type === 'brush' && region.points.length === 1) {
-            return { kind: 'point', x: region.points[0].x, y: region.points[0].y, n }
-          }
-          if (region.type === 'box') {
-            return { kind: 'rect', bounds: { x: region.x, y: region.y, width: region.width, height: region.height }, n }
-          }
-          if (region.type === 'ellipse') {
-            return { kind: 'ellipse', bounds: { x: region.x, y: region.y, width: region.width, height: region.height }, n }
-          }
-          if (region.type === 'loop') return { kind: 'loop', points: region.points, n }
-          return undefined
-        })
-        .filter((shape): shape is MarkedShape => Boolean(shape))
-      const markedImage =
-        markShapes.length && resolvedAssetUrl
-          ? await buildAnchorMarkedImage(resolvedAssetUrl, naturalSize, markShapes)
-          : null
+      // 提交装配(锚点方位编排 + 结构化提示词组装 + 红圈标注图)已抽离到
+      // ./maskEditSubmit (structure guard >900,机械抽离,行为不变)。
+      const { finalPrompt, markedImage } = await buildMaskEditPromptBundle({
+        body,
+        regions,
+        naturalSize,
+        resolvedAssetUrl,
+        recognitionsRef,
+        regionKey,
+      })
       await onSubmit({
         prompt: finalPrompt,
         mask,
