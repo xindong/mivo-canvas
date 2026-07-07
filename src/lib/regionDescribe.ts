@@ -128,6 +128,11 @@ export const cropRegionBlob = async (
       drawRing(ctx, marker.x - sx, marker.y - sy, r, lw)
     }
     return await toBlobPng(canvas)
+  } catch (error) {
+    // 降级契约:绘制/导出主体任意异常(解码后 drawImage 失败、toBlob 失败等)静默回退
+    // null,不阻塞提交(调用方退回纯文字定位)。bitmap.close() 仍在 finally 执行。
+    debugLogger.warn('Mask Edit', `cropRegionBlob 绘制/导出失败: ${error instanceof Error ? error.message : String(error)}`)
+    return null
   } finally {
     bitmap.close()
   }
@@ -162,6 +167,9 @@ export const anchorContextBlob = async (
     const r = ringRadiusFor({ width: dw, height: dh })
     drawRing(ctx, marker.x * scale, marker.y * scale, r, lw)
     return await toBlobPng(canvas)
+  } catch (error) {
+    debugLogger.warn('Mask Edit', `anchorContextBlob 绘制/导出失败: ${error instanceof Error ? error.message : String(error)}`)
+    return null
   } finally {
     bitmap.close()
   }
@@ -226,6 +234,9 @@ export const buildAnchorMarkedImage = async (
       }
     }
     return await toBlobPng(canvas)
+  } catch (error) {
+    debugLogger.warn('Mask Edit', `buildAnchorMarkedImage 绘制/导出失败: ${error instanceof Error ? error.message : String(error)}`)
+    return null
   } finally {
     bitmap.close()
   }

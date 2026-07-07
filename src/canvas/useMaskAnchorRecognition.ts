@@ -7,6 +7,7 @@ import {
   describeRegionCrop,
   type RegionCandidate,
 } from '../lib/regionDescribe'
+import { debugLogger } from '../store/debugLogStore'
 
 // Per-anchor recognition state (Lovart-style multi-anchor). selectedIndex -1 =
 // the custom-text option; otherwise an index into candidates.
@@ -88,31 +89,39 @@ export function useMaskAnchorRecognition({
         const controller = new AbortController()
         controllers.set(key, controller)
         void (async () => {
-          const bounds = boundsForRegions([region], naturalSize)
-          if (!bounds) return
-          const marker =
-            region.type === 'brush' && region.points.length === 1
-              ? { x: region.points[0].x, y: region.points[0].y }
-              : undefined
-          // 双图识别:全图缩略(红圈标锚点位置)给全局归属,放大特写给细节 —— 修
-          // 「点在衣服花纹上只认出图案、候选里没有衣服」的裁剪视野问题。
-          const [crop, contextImage] = await Promise.all([
-            cropRegionBlob(resolvedAssetUrl, naturalSize, bounds, controller.signal, marker),
-            marker ? anchorContextBlob(resolvedAssetUrl, naturalSize, marker, controller.signal) : Promise.resolve(null),
-          ])
-          const list = crop ? await describeRegionCrop(crop, controller.signal, contextImage) : []
-          controllers.delete(key)
-          if (controller.signal.aborted) return
-          writeRecognitions((current) => ({
-            ...current,
-            // 默认选最具体的部位（列表末位）；列表为空则留在自定义。
-            [key]: {
-              candidates: list,
-              selectedIndex: list.length ? list.length - 1 : -1,
-              customLabel: '',
-              recognizing: false,
-            },
-          }))
+          try {
+            const bounds = boundsForRegions([region], naturalSize)
+            if (!bounds) return
+            const marker =
+              region.type === 'brush' && region.points.length === 1
+                ? { x: region.points[0].x, y: region.points[0].y }
+                : undefined
+            // 双图识别:全图缩略(红圈标锚点位置)给全局归属,放大特写给细节 —— 修
+            // 「点在衣服花纹上只认出图案、候选里没有衣服」的裁剪视野问题。
+            const [crop, contextImage] = await Promise.all([
+              cropRegionBlob(resolvedAssetUrl, naturalSize, bounds, controller.signal, marker),
+              marker ? anchorContextBlob(resolvedAssetUrl, naturalSize, marker, controller.signal) : Promise.resolve(null),
+            ])
+            const list = crop ? await describeRegionCrop(crop, controller.signal, contextImage) : []
+            controllers.delete(key)
+            if (controller.signal.aborted) return
+            writeRecognitions((current) => ({
+              ...current,
+              // 默认选最具体的部位（列表末位）；列表为空则留在自定义。
+              [key]: {
+                candidates: list,
+                selectedIndex: list.length ? list.length - 1 : -1,
+                customLabel: '',
+                recognizing: false,
+              },
+            }))
+          } catch (error) {
+            // 兜底:识别链路任意异常(解码/绘制/网络/JSON 解析)都不该让该锚点永远停在
+            // 「识别中」(recognizing 永真)。置 false 释放 UI,用户仍可手填标签。
+            controllers.delete(key)
+            debugLogger.warn('Mask Edit', `锚点识别失败(${key}): ${error instanceof Error ? error.message : String(error)}`)
+            writeRecognitions((current) => current[key] ? { ...current, [key]: { ...current[key], recognizing: false } } : current)
+          }
         })()
       }
     }, 600)
