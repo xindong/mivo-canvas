@@ -1,0 +1,35 @@
+// E2E scenario: UserChip (sidebar bottom) — the settings entry.
+// SSO scheme: production forces login (gateway), so a user reaching the app is
+// already authenticated. In dev e2e the BFF's /api/auth/me stub returns a fake
+// logged-in user (P1-b opt-in: harness sets MIVO_DEV_AUTH_STUB=1) → UserChip shows
+// the chip (initial-avatar + display_name).
+// Clicking it opens the settings panel (which has the account/logout section).
+// The unauthenticated "Log In" path (→ SSO gateway redirect) can't be exercised
+// in local e2e (redirect leaves the app), so we assert the logged-in chip flow.
+export const runUserChipScenario = async (context) => {
+  const { baseUrl, page } = context
+  // AutoPrompt suppression is the harness default (createSmokePage); this scenario
+  // tests the chip, not the prompt, so no opt-in needed.
+  await page.goto(baseUrl, { waitUntil: 'networkidle' })
+  await page.waitForSelector('.project-sidebar')
+
+  // F2 regression: old settings entry must be gone.
+  const oldSettingsRow = await page.locator('.settings-row[aria-label="Settings"]').count()
+  if (oldSettingsRow) throw new Error('old .settings-row Settings button should be deleted (F2)')
+  const oldSettingsMenu = await page.locator('.settings-menu').count()
+  if (oldSettingsMenu) throw new Error('old .settings-menu should be deleted (F2)')
+
+  // Dev stub /me → authenticated → UserChip renders (.user-chip, not the Log In row).
+  const chip = page.locator('.user-chip').first()
+  await chip.waitFor()
+  // The chip shows the dev stub user's display_name ("朱赞（本地）").
+  await page.getByText('朱赞（本地）', { exact: false }).first().waitFor()
+
+  // Click the chip → opens the settings panel.
+  await chip.click()
+  await page.waitForSelector('.settings-panel', { state: 'visible' })
+
+  // Close the panel.
+  await page.getByRole('button', { name: '关闭设置' }).click()
+  await page.waitForSelector('.settings-panel', { state: 'detached' })
+}

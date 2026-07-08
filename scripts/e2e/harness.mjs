@@ -250,7 +250,6 @@ export const startSmokeBffServer = ({
   localAssetFixtureDir,
   eagleMockPort,
   upstreamBaseUrl,
-  bffToken,
   debugViewToken,
   enableLocalAssets,
   enableEagleProxy,
@@ -261,7 +260,12 @@ export const startSmokeBffServer = ({
     env: {
       ...process.env,
       MIVO_PORT: String(port),
-      ...(isPublic ? { MIVO_PUBLIC: '1', MIVO_BFF_TOKEN: bffToken } : {}),
+      // P1-b: dev stub is now opt-in (MIVO_DEV_AUTH_STUB=1 && non-prod && non-public).
+      // e2e local topology (isPublic=false) needs the stub ON so /api/auth/me returns
+      // the fake logged-in user for auto-prompt/userchip scenarios. Under isPublic=true
+      // (MIVO_PUBLIC=1) the stub is force-off regardless — harmless there.
+      MIVO_DEV_AUTH_STUB: '1',
+      ...(isPublic ? { MIVO_PUBLIC: '1' } : {}),
       MIVO_ASSET_DIR: localAssetFixtureDir,
       MIVO_EAGLE_API_URL: `http://127.0.0.1:${eagleMockPort}`,
       MIVO_DEBUG_LOG_DIR: path.resolve('test-artifacts/debug-logs'),
@@ -327,6 +331,7 @@ export const createSmokePage = async ({
   extraHTTPHeaders,
   enableStoreBridgeModules = false,
   enableApiRouteMocks = true,
+  mockAuthMe = false,
 }) => {
   const browser = await chromium.launch({ headless: true })
   const context = await browser.newContext({
@@ -337,6 +342,13 @@ export const createSmokePage = async ({
   if (enableStoreBridgeModules) {
     await installE2EStoreBridge(context)
   }
+  // feat/auth-sso: dev stub returns logged-in + fresh IDB has no keys → AutoPrompt
+  // would auto-open the settings panel on every scenario's first load, intercepting
+  // clicks. Default-suppress here (all scenarios). The auto-prompt-settings scenario
+  // opts back in by setting the flag false via its own addInitScript (runs after, wins).
+  await context.addInitScript(() => {
+    window.__MIVO_E2E_DISABLE_AUTO_PROMPT__ = true
+  })
   const page = await context.newPage()
 
   await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: baseUrl })
@@ -346,6 +358,22 @@ export const createSmokePage = async ({
 
   if (enableApiRouteMocks) {
     await attachDefaultMivoApiMocks(page, { generatedImageB64, mivoEditRequests })
+  }
+
+  // feat/auth-sso: prod 拓扑 MIVO_PUBLIC=1 → dev 桩硬关 → BFF /api/auth/me 返 401。
+  // 浏览器 console 会把 401 当 "Failed to load resource" 错误报出,触发 console-error
+  // guard。prod e2e 代表"无 SSO 会话的未登录态",mock /api/auth/me → 200
+  // {authenticated:false}(对齐 auto-prompt-settings Flow 2 既有做法)避免 401 console
+  // 污染;fetchMe 见 200+authenticated=false → 未登录(不抛)。dev 拓扑用真 dev 桩 200,
+  // 不 mock。assertPublicModeSecurity 走 Node fetch 不经浏览器 route,仍验真 401。
+  if (mockAuthMe) {
+    await page.route('**/api/auth/me', (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ authenticated: false, detail: 'Not authenticated' }),
+      }),
+    )
   }
 
   page.on('console', (message) => {

@@ -76,15 +76,31 @@ checks.push(async () => {
   requireLoggerLevels(await read('src/app/LibraryWorkspace.tsx'), 'Library workspace')
 })
 
+// E2: settings UI = UserChip (sidebar bottom) + SettingsPanel / GatewayKeyDialog /
+// MivoKeySection. The old settingsMenuItems stub menu + handleSettingsMenuItem
+// warn-only handler were deleted (replaced by the user chip). Each new user-
+// triggered action is logged through debugLogger: login / open-settings / logout /
+// disconnect / gateway test(fail warn, ok log, error) / mivo+gateway save (in slice).
 checks.push(async () => {
   const sidebar = await read('src/app/ProjectSidebar.tsx')
-  requireIncludes(sidebar, 'settingsMenuItems', 'Project sidebar settings menu')
-  requireIncludes(sidebar, 'handleSettingsMenuItem', 'Project sidebar settings menu')
-  requireIncludes(sidebar, "debugLogger.warn('Settings'", 'Project sidebar settings menu')
+  requireIncludes(sidebar, 'UserChip', 'Project sidebar user chip mount')
 
-  for (const label of ['Preferences', 'Appearance', 'Keyboard shortcuts', 'Theme', 'Help and feedback']) {
-    requireIncludes(sidebar, `label: '${label}'`, 'Project sidebar settings menu')
-  }
+  const userChip = await read('src/app/settings/UserChip.tsx')
+  requireIncludes(userChip, "debugLogger.log('Auth'", 'UserChip login action log')
+  requireIncludes(userChip, "debugLogger.log('Settings'", 'UserChip open-settings action log')
+
+  const panel = await read('src/app/settings/SettingsPanel.tsx')
+  requireIncludes(panel, "debugLogger.log('Auth'", 'SettingsPanel logout action log')
+  requireIncludes(panel, "debugLogger.log('Settings'", 'SettingsPanel disconnect action log')
+
+  const gateway = await read('src/app/settings/GatewayKeyDialog.tsx')
+  requireIncludes(gateway, "debugLogger.warn('Settings'", 'GatewayKeyDialog test-failed warn')
+  requireIncludes(gateway, "debugLogger.log('Settings'", 'GatewayKeyDialog saved log')
+  requireIncludes(gateway, "debugLogger.error('Settings'", 'GatewayKeyDialog probe error log')
+
+  const slice = await read('src/store/settingsSlice.ts')
+  requireIncludes(slice, 'mivo key saved', 'settingsSlice mivo save log')
+  requireIncludes(slice, 'gateway key saved', 'settingsSlice gateway save log')
 })
 
 // Phase 5 (B12·C14): pin specific operation strings for the sidebar management

@@ -18,6 +18,7 @@ import {
 } from '../lib/config'
 import { fetchUpstreamWithTimeout, RequestBodyTooLargeError } from '../lib/upstream'
 import { logRequest, multipartFiles, newRequestId, parseMultipartBody } from '../lib/request'
+import { rejectInvalidGatewayKey, resolveGatewayKey } from '../lib/keys'
 
 // Lovart-style anchor picker: instead of betting one label (which we got wrong —
 // hair→cape), return a nested candidate list from coarse to fine so the user can
@@ -141,7 +142,14 @@ export const describeRegionHandler: Handler<{ Bindings: HttpBindings }> = async 
       log(405)
       return c.json({ error: 'Method not allowed' }, 405)
     }
-    if (!env.llmApiKey.trim()) {
+    // Gateway key (sk-): X-Gateway-Key → fallback env MIVO_LLM_API_KEY;present-but-invalid → 400。
+    const badGatewayKey = rejectInvalidGatewayKey(c)
+    if (badGatewayKey) {
+      log(400, 'bad-gateway-key')
+      return badGatewayKey
+    }
+    const gatewayKey = resolveGatewayKey(c).trim()
+    if (!gatewayKey) {
       log(200, 'no-key')
       return c.json({ candidates: [], label: '', description: '', degradedReason: 'no-key' }, 200)
     }
@@ -166,7 +174,7 @@ export const describeRegionHandler: Handler<{ Bindings: HttpBindings }> = async 
     let result = await callDescribeLlm(
       mivoDescribePrimaryModel,
       dataUrl,
-      env.llmApiKey.trim(),
+      gatewayKey,
       env.enhancePrimaryTimeoutMs,
       env.llmApiBase,
       contextDataUrl,
@@ -175,7 +183,7 @@ export const describeRegionHandler: Handler<{ Bindings: HttpBindings }> = async 
       result = await callDescribeLlm(
         mivoDescribeFallbackModel,
         dataUrl,
-        env.llmApiKey.trim(),
+        gatewayKey,
         env.enhanceFallbackTimeoutMs,
         env.llmApiBase,
         contextDataUrl,

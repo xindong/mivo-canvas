@@ -1,6 +1,7 @@
 // src/lib/maskEditCompose.ts
 // 前端客户端：把用户一句话大意 + 已编号红圈（标签+方位）发给 BFF 结构化整理端点，
 // 拿到逐条「编辑要求」。失败/降级返回 null，调用方静默回退到直接套壳（不阻塞出图）。
+import { authHeaders } from './authHeaders'
 
 export type ComposeAnchor = { n: number; label: string; position?: string }
 
@@ -17,7 +18,7 @@ export const composeMaskEditBody = async (
   try {
     const response = await fetch('/api/mivo/compose-mask-edit', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({ instruction, anchors }),
       signal,
     })

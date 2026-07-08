@@ -23,19 +23,19 @@
 
 | 变量 | 默认 | 必填性 | 生效 | 备注 |
 |------|------|--------|------|------|
-| `MIVO_BFF_TOKEN` | `''` | 公网必填 | 访问门(全部端点) | 缺省=dev/prod 全兼容;设了则裸请求 401。`Authorization: Bearer <token>` 或 `X-Mivo-Bff-Token: <token>` header 携带(实现见 `server/app.ts:40-51`);**禁止进前端 bundle** |
 | `MIVO_ENABLE_LOCAL_ASSETS` | `false`(prod) | 可选 | local-assets | 生产默认关(读服务器本机文件=泄露面);启用需 localhost 绑定或管理 token |
 | `MIVO_ENABLE_EAGLE_PROXY` | `false`(prod) | 可选 | eagle/* | 同上;生产默认关 |
 | `VITE_MIVO_DEBUG_ENDPOINT` | — | 客户端 | (前端 remoteDebugReporter) | `VITE_` 前缀=进 bundle;仅前端用,非 middleware env |
 
-> V08 契约漂移修正:① 删除已不存在的 `MIVO_API_MODE` 行(P1-d 回滚阀已下线,BFF 不再读);② token 携带方式修正为 header(`server/app.ts` 读 `Authorization`/`X-Mivo-Bff-Token`,不经 cookie);③ 以下 env 在 `server/lib/config.ts`(`getEnvConfig()`)或 `server/index.ts`/`server/lib/env.ts` 集中读取,原矩阵遗漏,补遗如下。
+> V08 契约漂移修正:① 删除已不存在的 `MIVO_API_MODE` 行(P1-d 回滚阀已下线,BFF 不再读);② SSO 网关方案切换后删除 `MIVO_BFF_TOKEN` 行(app 无 auth gate,身份由 `auth.dsworks.cn` 网关提供,旧 token gate / JWT / 飞书 OAuth / maker server 全部移除);③ 以下 env 在 `server/lib/config.ts`(`getEnvConfig()`)或 `server/index.ts`/`server/lib/env.ts` 集中读取,原矩阵遗漏,补遗如下。
 
 ## BFF config.ts / 启动期 env(矩阵补遗)
 
 | 变量 | 默认 | 读取位置 | 用途 |
 |------|------|----------|------|
-| `MIVO_PORT` | `8080` | `server/index.ts:9` | BFF 监听端口 |
-| `MIVO_PUBLIC` | 未设=`''` | `server/index.ts:10`/`server/lib/env.ts:26`/`server/routes/debug-logs.ts:37` | `=1` 监听 `0.0.0.0`(公网)并强制 `MIVO_BFF_TOKEN`,否则 `127.0.0.1`;同时收紧 debug-logs GET(无 view token → 403) |
+| `MIVO_PORT` | `8080` | `server/index.ts` | BFF 监听端口 |
+| `MIVO_PUBLIC` | 未设=`''` | `server/index.ts`/`server/lib/env.ts`/`server/routes/debug-logs.ts:37`/`server/lib/auth-stub.ts` | `=1` 监听 `0.0.0.0`(public/生产部署)并收紧 feature flag(local-assets/eagle 默认关)+ debug-logs GET fail-closed(无 view token → 403)+ 强制关 dev 桩;未设=监听 `127.0.0.1`(本地 dev) |
+| `MIVO_DEV_AUTH_STUB` | 未设=`''` | `server/lib/auth-stub.ts`/`server/routes/auth.ts`/`server/index.ts` | dev 桩 `/api/auth/me` opt-in;仅 `=1 && NODE_ENV !== 'production' && MIVO_PUBLIC !== '1'` 时开。P1-b:默认关防生产忘设 NODE_ENV 返假登录 |
 | `MIVO_DEBUG_ALLOWED_ORIGINS` | localhost | `server/routes/debug-logs.ts:47` | debug-logs POST origin allowlist(CORS);逗号分隔 |
 | `MIVO_DEBUG_POST_RATE_LIMIT` | `60` | `server/routes/debug-logs.ts:40` | debug-logs POST 每 IP 每分钟上限 |
 | `MIVO_EAGLE_TIMEOUT_MS` | 内置 | `server/lib/eagle.ts:13` | eagle 代理请求超时 |
@@ -63,4 +63,6 @@
 - `local-assets` / `eagle/*`:生产默认 404/403(`MIVO_ENABLE_*` 默认 false)。e2e 断言"prod 默认不可用,显式启用后才可用"。
 - `debug-logs` GET:生产必须配 `MIVO_DEBUG_VIEW_TOKEN`(dev 默认开放是 gap,见 debug-logs.json discrepancy)。
 - `debug-logs` POST:生产限 origin/rate/body(dev 无 origin 限制,见 debug-logs.json discrepancy)。
-- BFF 默认 bind `127.0.0.1`;`MIVO_PUBLIC=1` 才监听公网且强制 `MIVO_BFF_TOKEN`。
+- BFF 默认 bind `127.0.0.1`(本地 dev);`MIVO_PUBLIC=1` 监听 `0.0.0.0`(public/生产部署,置于 SSO 网关后)并收紧 feature flag + 关 dev 桩。"BFF 端口不被绕过直连"由 ops / 网络层保证(网关前置 + 网络隔离),**不在本仓代码层处理**。
+- dev 桩 `/api/auth/me`(P1-b):默认关;`MIVO_DEV_AUTH_STUB=1 && 非 production && 非 public` 才开。生产/public/未 opt-in → `/api/auth/me` 返 401(对齐网关未登录语义)。
+- 旧 `MIVO_BFF_TOKEN` / JWT gate / 飞书 OAuth / maker server 路径已随 SSO 网关方案切换删除,**env 矩阵不再保留**(app 无 auth gate,身份由 `auth.dsworks.cn` 网关提供)。

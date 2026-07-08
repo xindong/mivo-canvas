@@ -8,15 +8,21 @@
 # 1. 先构建前端产物(server/ 同源托管 dist/)
 npm run build
 
-# 2. 启动 BFF(默认 127.0.0.1:8080)
+# 2. 启动 BFF(默认监听 127.0.0.1:8080;MIVO_PUBLIC=1 监听 0.0.0.0)
 npm run start:server
 ```
 
 启动后日志形如:
 
 ```
-[mivo-bff] listening on http://127.0.0.1:8080 [local 127.0.0.1, open (no MIVO_BFF_TOKEN)]
+[mivo-bff] listening on http://127.0.0.1:8080 [local 127.0.0.1] auth-dev-stub=off local-assets=on eagle=on
 ```
+
+> **鉴权真相(SSO 网关方案)**:BFF 无自身 auth gate,唯一用户认证边界 = 公司统一
+> SSO 网关 `auth.dsworks.cn`(支持飞书登录,**公司 SSO 标配,不在本仓改动范围**)。
+> BFF 部署在网关之后,"不被绕过直连 BFF 端口"由 ops / 网络层保证(网关前置 + 网络
+> 隔离),**本仓代码层不处理**。`/api/auth/me` 生产由网关提供;dev 桩默认关(opt-in,
+> 见 `server/lib/auth-stub.ts`)。
 
 ### dev 接线(P1-d)
 
@@ -53,17 +59,18 @@ MIVO_API_MODE=dev-middleware npm run dev
 
 ## 环境变量
 
-### 启动 / 访问门
+### 启动 / 绑定 / 鉴权
 
 | 变量 | 默认 | 作用 |
 |------|------|------|
 | `MIVO_PORT` | `8080` | 监听端口 |
-| `MIVO_PUBLIC` | 未设置 | 设为 `1` 时监听 `0.0.0.0`(公网);**此时强制要求 `MIVO_BFF_TOKEN`,否则启动即退出** |
-| `MIVO_BFF_TOKEN` | 未设置 | 访问门 token。未设置=门禁关闭(本地开放);设置后除 `/healthz` 外所有请求必须携带 token |
+| `MIVO_PUBLIC` | 未设置 | 设为 `1` 时监听 `0.0.0.0`(public/生产部署)并收紧 feature flag(local-assets/eagle 默认关、debug-logs GET fail-closed)+ 强制关 dev 桩;未设=监听 `127.0.0.1`(本地 dev) |
+| `MIVO_DEV_AUTH_STUB` | 未设置 | dev 桩 `/api/auth/me` opt-in。仅 `=1 && NODE_ENV !== 'production' && MIVO_PUBLIC !== '1'` 时开;生产/public 硬关。见 `server/lib/auth-stub.ts` |
 
-Token 携带二选一:`Authorization: Bearer <token>` 或 `X-Mivo-Bff-Token: <token>`。`/healthz` 始终免鉴权。未授权 → `401 {"error":"unauthorized"}`(脱敏,不回显 token)。
-
-> 访问门=内部门禁/防滥用,非用户鉴权(真实鉴权 P4 对接 mivoserver)。
+> SSO 网关方案:app 无 auth gate,身份(`/api/auth/me`)由公司统一 SSO 网关
+> (`auth.dsworks.cn`)提供。"BFF 端口不被绕过直连"由 ops / 网络层保证(网关前置 +
+> 网络隔离),**不在本仓代码层处理**。旧的 `MIVO_BFF_TOKEN` / JWT / 飞书 OAuth /
+> maker server 路径已随 SSO 切换删除,**勿用**。
 
 ### 上游密钥(dev middleware 同款)
 
@@ -112,8 +119,8 @@ Token 携带二选一:`Authorization: Bearer <token>` 或 `X-Mivo-Bff-Token: <to
 
 ```
 server/
-├── app.ts              # Hono app:healthz + 访问门 + 全量 /api/mivo 路由 + serveStatic + SPA fallback
-├── index.ts            # 入口:bind + 公网守卫 + serve()(app 在 app.ts,测试可单独 import)
+├── app.ts              # Hono app:healthz + 全量 /api/mivo 路由 + serveStatic + SPA fallback(无 auth gate,SSO 网关方案)
+├── index.ts            # 入口:bind(MIVO_PUBLIC=1→0.0.0.0,否则 127.0.0.1)+ serve()(app 在 app.ts,测试可单独 import)
 ├── routes/
 │   ├── generate.ts     # POST /api/mivo/generate
 │   ├── edit.ts         # POST /api/mivo/edit

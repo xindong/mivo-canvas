@@ -1,7 +1,8 @@
 # MivoCanvas CI — P1-f phase 2
 #
 # PR 基线: lint + tsc + 单元测试 + 日志规则守卫 + 结构守卫(防回潮)
-# + prod 真拓扑 e2e(mock upstream) + MIVO_BFF_TOKEN gated matrix。
+# + prod 真拓扑 e2e(mock upstream) + e2e token gate matrix(authorized/unauthorized,
+# SSO 新模型语义,job 名固定以匹配 main 分支保护 required checks)。
 # 对应 productization-roadmap.md §6.2 P1-f 与 §13 SC5.2。
 #
 # secret-scan 已移至独立 workflow .github/workflows/secret-scan.yml(直推 main,
@@ -127,13 +128,19 @@ jobs:
     name: e2e token gate (${{ matrix.mode }})
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     strategy:
       fail-fast: false
       matrix:
+        # mode 名必须保持 authorized/unauthorized —— main 分支保护的 required status
+        # checks 写死为 `e2e token gate (authorized)` / `e2e token gate (unauthorized)`
+        # (enforce_admins=true),改名会让这两个必需 check 永不上报,PR 合不了。
+        # 逻辑用 SSO 新模型(非旧 app-gate/BFF-token),mode 名映射:
+        #   unauthorized → MIVO_PUBLIC=1(dev 桩关)→ /api/auth/me 401(SSO 下"未登录")
+        #   authorized   → dev 桩开(local)→ /api/auth/me 200 + 网关契约 shape
         mode:
-          - unauthorized
           - authorized
+          - unauthorized
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -147,19 +154,8 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Cache Playwright Chromium
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-chromium-${{ hashFiles('package-lock.json') }}
-
-      - name: Install Playwright Chromium
-        run: npx playwright install --with-deps chromium
-
-      - name: Build production bundle
-        run: npm run build
-
-      - name: Run gated auth matrix
+      # SSO 模型下 HTTP-可验安全属性(纯 fetch,无需 Playwright / 构建产物)。
+      - name: Run gated check
         run: |
           set -o pipefail
           mkdir -p test-artifacts

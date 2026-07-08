@@ -1,24 +1,17 @@
-import { Fragment, useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
   Bug,
   ChevronDown,
   ChevronRight,
-  ChevronUp,
   Copy,
-  CircleHelp,
   Image,
-  Keyboard,
   MonitorUp,
-  Moon,
   PanelLeftClose,
   PanelLeftOpen,
-  Palette,
   Plug,
   Plus,
   Search,
-  Settings,
-  SlidersHorizontal,
   Sparkles,
   X,
 } from 'lucide-react'
@@ -28,6 +21,7 @@ import { debugLogger, useDebugLogStore, type DebugLogEntry, type DebugLogLevel }
 import { toastFeedback } from '../store/toastStore'
 import type { CanvasId } from '../types/mivoCanvas'
 import { ChangelogPanel } from './ChangelogPanel'
+import { UserChip } from './settings/UserChip'
 import { buildSidebarModel } from './sidebar/projectSidebarModel'
 import { useCollapsedProjects } from './sidebar/useCollapsedProjects'
 import { ProjectRow } from './sidebar/ProjectRow'
@@ -49,39 +43,6 @@ type ProjectSidebarProps = {
   onPeek: () => void
   onPeekEnd: () => void
 }
-
-const settingsMenuItems = [
-  {
-    id: 'preferences',
-    label: 'Preferences',
-    meta: undefined,
-    Icon: SlidersHorizontal,
-  },
-  {
-    id: 'appearance',
-    label: 'Appearance',
-    meta: 'System',
-    Icon: Palette,
-  },
-  {
-    id: 'keyboard-shortcuts',
-    label: 'Keyboard shortcuts',
-    meta: undefined,
-    Icon: Keyboard,
-  },
-  {
-    id: 'theme',
-    label: 'Theme',
-    meta: 'Auto',
-    Icon: Moon,
-  },
-  {
-    id: 'help-feedback',
-    label: 'Help and feedback',
-    meta: undefined,
-    Icon: CircleHelp,
-  },
-]
 
 export function ProjectSidebar({
   activeView,
@@ -109,7 +70,6 @@ export function ProjectSidebar({
   const [changelogOpenedAt, setChangelogOpenedAt] = useState<number | null>(null)
   const [debugLogOpen, setDebugLogOpen] = useState(false)
   const [debugLogFilter, setDebugLogFilter] = useState<DebugLogLevel | 'all'>('all')
-  const [settingsOpen, setSettingsOpen] = useState(false)
   // Track which project is in inline-rename mode. Lifted (not per-ProjectRow) so a
   // freshly-created project can enter rename mode immediately (B7: 段头 + → create
   // → rename).
@@ -145,10 +105,6 @@ export function ProjectSidebar({
   const newProject = () => {
     const id = createProject()
     setRenamingProjectId(id)
-  }
-
-  const handleSettingsMenuItem = (label: string) => {
-    debugLogger.warn('Settings', `${label} is not implemented yet`)
   }
 
   const visibleDebugEntries =
@@ -351,7 +307,7 @@ export function ProjectSidebar({
         </section>
       </div>
 
-      <div className={settingsOpen ? 'settings-area open' : 'settings-area'}>
+      <div className="settings-area">
         <div className="changelog-area">
           {changelogOpenedAt !== null ? (
             <ChangelogPanel openedAt={changelogOpenedAt} onClose={() => setChangelogOpenedAt(null)} />
@@ -453,31 +409,7 @@ export function ProjectSidebar({
             </span>
           </button>
         </div>
-        {settingsOpen ? (
-          <div className="settings-menu" role="menu" aria-label="Settings menu">
-            {settingsMenuItems.map(({ id, label, meta, Icon }, index) => (
-              <Fragment key={id}>
-                {index === settingsMenuItems.length - 1 ? <span className="settings-menu-separator" /> : null}
-                <button type="button" role="menuitem" onClick={() => handleSettingsMenuItem(label)}>
-                  <Icon size={15} />
-                  <span>{label}</span>
-                  {meta ? <em>{meta}</em> : null}
-                </button>
-              </Fragment>
-            ))}
-          </div>
-        ) : null}
-        <button
-          type="button"
-          className="settings-row"
-          aria-label="Settings"
-          aria-expanded={settingsOpen}
-          onClick={() => setSettingsOpen((current) => !current)}
-        >
-          <Settings size={17} />
-          <span>Settings</span>
-          {settingsOpen ? <ChevronDown size={15} /> : <ChevronUp className="row-hover-arrow" size={15} />}
-        </button>
+        <UserChip />
       </div>
     </aside>
   )

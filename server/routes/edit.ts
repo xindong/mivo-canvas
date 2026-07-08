@@ -5,7 +5,8 @@
 import type { Handler } from 'hono'
 import type { ContentfulStatusCode } from 'hono/utils/http-status'
 import type { HttpBindings } from '@hono/node-server'
-import { defaultMivoImageModel, getEnvConfig, type PlatformCtx } from '../lib/config'
+import { defaultMivoImageModel, getEnvConfig } from '../lib/config'
+import { rejectInvalidMivoApiKey, resolvePlatformCtx } from '../lib/keys'
 import {
   fetchUpstreamWithTimeout,
   readUpstreamError,
@@ -53,11 +54,18 @@ export const editHandler: Handler<{ Bindings: HttpBindings }> = async (c) => {
     })
   }
   const env = getEnvConfig()
-  const platformCtx: PlatformCtx = { platformKey: env.platformKey, platformEndpoint: env.platformEndpoint }
+  const platformCtx = resolvePlatformCtx(c)
   try {
     if (c.req.method !== 'POST') {
       log(405)
       return c.json({ error: 'Method not allowed' }, 405)
+    }
+
+    // F4: reject malformed X-Mivo-Api-Key at the boundary (no env fallback).
+    const badMivoKey = rejectInvalidMivoApiKey(c)
+    if (badMivoKey) {
+      log(400, undefined, 'bad-mivo-key')
+      return badMivoKey
     }
 
     const { fields, files } = await parseMultipartBody(c)

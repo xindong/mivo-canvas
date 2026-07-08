@@ -11,6 +11,8 @@ import { canReadLocalAssetDrag } from './lib/canvasAssetDrag'
 import { ProjectSidebar } from './app/ProjectSidebar'
 import { ProjectSidebarControls } from './app/ProjectSidebarControls'
 import { ToastViewport } from './app/ToastViewport'
+import { AutoPromptSettings } from './app/settings/AutoPromptSettings'
+import { SettingsPanel } from './app/settings/SettingsPanel'
 import { useCanvasStore } from './store/canvasStore'
 import { debugLogger, installConsoleCapture } from './store/debugLogStore'
 import { installRemoteDebugReporter } from './store/remoteDebugReporter'
@@ -307,6 +309,8 @@ function App() {
         </div>
       ) : null}
       <ToastViewport />
+      <AutoPromptSettings />
+      <SettingsPanel />
     </main>
   )
 }
