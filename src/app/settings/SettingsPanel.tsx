@@ -1,27 +1,28 @@
 // src/app/settings/SettingsPanel.tsx
-// Modal settings panel (two sections: Account + API Keys). Uses the same
-// createPortal + backdrop + panel pattern as ChangelogPanel/DebugLog so it stays
-// inside the project's existing panel vocabulary — no Tailwind, no new CSS framework.
-//
-// Account section consumes the E1 auth contract (user / logout). API Keys section
-// owns the gateway key row inline (masked key + replace/disconnect) and renders
-// MivoKeySection below it; the gateway key editor is GatewayKeyDialog (opened on
-// "replace"/"configure").
-import { useState } from 'react'
+// Modal settings panel (two sections: Account + API Keys). Store-driven: reads
+// panelOpen / panelSection / closeSettings from useSettingsStore so both UserChip
+// (manual click) and AutoPromptSettings (first-login missing-key) can open it
+// programmatically. When opened with section='api-keys', scrolls that section
+// into view (the auto-prompt's "定位到 API Keys 区" requirement).
+import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { LogOut, X } from 'lucide-react'
 import { useAuthStore } from '../../store/authSlice'
-import { useSettingsStore, selectGatewayKeyMasked, selectHasGatewayKey } from '../../store/settingsSlice'
+import {
+  selectGatewayKeyMasked,
+  selectHasGatewayKey,
+  useSettingsStore,
+} from '../../store/settingsSlice'
 import { debugLogger } from '../../store/debugLogStore'
 import { toastFeedback } from '../../store/toastStore'
 import { GatewayKeyDialog } from './GatewayKeyDialog'
 import { MivoKeySection } from './MivoKeySection'
 
-type SettingsPanelProps = {
-  onClose: () => void
-}
+export function SettingsPanel() {
+  const open = useSettingsStore((state) => state.panelOpen)
+  const section = useSettingsStore((state) => state.panelSection)
+  const closeSettings = useSettingsStore((state) => state.closeSettings)
 
-export function SettingsPanel({ onClose }: SettingsPanelProps) {
   const user = useAuthStore((state) => state.user)
   const logout = useAuthStore((state) => state.logout)
 
@@ -30,12 +31,24 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
   const clearGatewayKey = useSettingsStore((state) => state.clearGatewayKey)
 
   const [gatewayDialogOpen, setGatewayDialogOpen] = useState(false)
+  const apiKeysRef = useRef<HTMLElement>(null)
+
+  useEffect(() => {
+    if (!open || section !== 'api-keys') return
+    // Defer to next frame so the section is laid out before scrolling.
+    const id = window.requestAnimationFrame(() => {
+      apiKeysRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' })
+    })
+    return () => window.cancelAnimationFrame(id)
+  }, [open, section])
+
+  if (!open) return null
 
   const handleLogout = () => {
     debugLogger.log('Auth', 'Logout requested from settings panel')
     logout()
     toastFeedback.info('已登出')
-    onClose()
+    closeSettings()
   }
 
   const handleDisconnectGateway = () => {
@@ -48,13 +61,13 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
       className="settings-backdrop"
       role="presentation"
       onPointerDown={(event) => {
-        if (event.target === event.currentTarget) onClose()
+        if (event.target === event.currentTarget) closeSettings()
       }}
     >
       <section className="settings-panel" role="dialog" aria-modal="true" aria-label="设置" tabIndex={-1}>
         <header className="settings-panel-header">
           <strong>设置</strong>
-          <button type="button" aria-label="关闭设置" onClick={onClose}>
+          <button type="button" aria-label="关闭设置" onClick={closeSettings}>
             <X size={16} />
           </button>
         </header>
@@ -79,7 +92,7 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
             </div>
           </section>
 
-          <section className="settings-section">
+          <section ref={apiKeysRef} className="settings-section" data-section="api-keys">
             <h4>API Keys</h4>
             <div className="gateway-key-row">
               <div className="gateway-key-row-info">

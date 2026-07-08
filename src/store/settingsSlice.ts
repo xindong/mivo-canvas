@@ -1,18 +1,12 @@
 // src/store/settingsSlice.ts
 // B1: two keys (sk- gateway + mivo_ MCP) live browser-side. Zustand persist →
-// IndexedDB (idbStateStorage) so the raw key survives reloads but never touches
-// the BFF/DB. The BFF is stateless; it only probes (POST /api/keys/test) and reads
-// the key back per-request via the X-Mivo-Api-Key header.
+// IndexedDB (strictIdbStateStorage) so the raw key survives reloads but never
+// touches the BFF/DB / localStorage. The BFF is stateless; it only probes
+// (POST /api/keys/test) and reads the key back per-request via X-Mivo-Api-Key.
 //
-// State surface (UI consumes):
-//   gatewayKey / mivoKey           — raw key strings ('' = not configured)
-//   setGatewayKey / setMivoKey     — persist a new key (gateway: only after the
-//                                     /api/keys/test probe passes — caller enforces)
-//   clearGatewayKey / clearMivoKey — wipe
-//   selectGatewayKeyMasked / ...   — derived for UI (sk-••••••<last4>)
-//
-// Logging invariant: debugLogger only ever sees keyTail (last 4). The raw key
-// never enters debugLogger or remote debug reports.
+// Plus session-level UI state for the settings panel (panelOpen / panelSection /
+// autoPromptedThisSession) — NOT persisted (partialize only persists the two keys)
+// so a reload always starts with the panel closed and the auto-prompt armed.
 import { create } from 'zustand'
 import { persist, createJSONStorage } from 'zustand/middleware'
 import { strictIdbStateStorage } from '../lib/persistIdbStorage'
@@ -20,13 +14,31 @@ import { debugLogger } from './debugLogStore'
 import { toastFeedback } from './toastStore'
 import { isGatewayKey, isMivoKey, keyTail, maskKey } from '../lib/keyFormat'
 
+export type SettingsPanelSection = 'account' | 'api-keys'
+
 export type SettingsState = {
   gatewayKey: string
   mivoKey: string
+  // Session-level UI state (NOT persisted — partialize below only keeps the keys).
+  panelOpen: boolean
+  panelSection: SettingsPanelSection | null
+  // Once the auto-prompt has fired (or been suppressed) this session, don't fire
+  // again — stops the "user closes the panel → effect re-runs → re-opens" loop.
+  autoPromptedThisSession: boolean
+  // True once the persist middleware has finished rehydrating from IDB. AutoPrompt
+  // gates on this so it doesn't read keys as '' (default) before the persisted blob
+  // loads. NOT persisted (partialize only keeps the keys).
+  _hydrated: boolean
   setGatewayKey: (key: string) => void
   setMivoKey: (key: string) => void
   clearGatewayKey: () => void
   clearMivoKey: () => void
+  /** Programmatic open (used by UserChip click + the auto-prompt effect). Pass a
+   * section to scroll/focus it; omit for a plain open (defaults to account/top). */
+  openSettings: (section?: SettingsPanelSection) => void
+  closeSettings: () => void
+  /** Mark that the auto-prompt has fired this session so it won't fire again. */
+  markAutoPrompted: () => void
 }
 
 const SETTINGS_PERSIST_VERSION = 1
@@ -37,6 +49,10 @@ export const useSettingsStore = create<SettingsState>()(
     (set) => ({
       gatewayKey: '',
       mivoKey: '',
+      panelOpen: false,
+      panelSection: null,
+      autoPromptedThisSession: false,
+      _hydrated: false,
       setGatewayKey: (key) => {
         const trimmed = key.trim()
         debugLogger.log('Settings', `gateway key saved: tail=${keyTail(trimmed)}`)
@@ -58,16 +74,31 @@ export const useSettingsStore = create<SettingsState>()(
         set({ mivoKey: '' })
         toastFeedback.info('Mivo Key 已清除')
       },
+      openSettings: (section) => {
+        set({ panelOpen: true, panelSection: section ?? null })
+      },
+      closeSettings: () => {
+        set({ panelOpen: false })
+      },
+      markAutoPrompted: () => {
+        set({ autoPromptedThisSession: true })
+      },
     }),
     {
       name: SETTINGS_PERSIST_NAME,
       version: SETTINGS_PERSIST_VERSION,
       // F1: strict IDB-only — NEVER falls back to localStorage (keys are secrets).
-      // IDB unavailable / write failure → fail-closed (in-memory only + toast).
       storage: createJSONStorage(() => strictIdbStateStorage),
-      // Only the two key strings persist — actions are rehydrated from the store
-      // factory, never serialized.
+      // Only the two key strings persist — UI state (panelOpen/section/autoPrompted/
+      // _hydrated) is session-level and must NOT survive reload (a reload re-arms
+      // the prompt and starts with the panel closed).
       partialize: (state) => ({ gatewayKey: state.gatewayKey, mivoKey: state.mivoKey }),
+      // Flip _hydrated after rehydration so AutoPromptSettings can gate on it via a
+      // reactive selector (not a set-state-in-effect subscription, which the lint
+      // rule forbids). Called after set(merge(persisted)) completes.
+      onRehydrateStorage: () => () => {
+        useSettingsStore.setState({ _hydrated: true })
+      },
     },
   ),
 )
@@ -78,3 +109,23 @@ export const selectGatewayKeyMasked = (state: SettingsState): string => maskKey(
 export const selectMivoKeyMasked = (state: SettingsState): string => maskKey(state.mivoKey)
 export const selectHasGatewayKey = (state: SettingsState): boolean => isGatewayKey(state.gatewayKey)
 export const selectHasMivoKey = (state: SettingsState): boolean => isMivoKey(state.mivoKey)
+export const selectKeysComplete = (state: SettingsState): boolean =>
+  isGatewayKey(state.gatewayKey) && isMivoKey(state.mivoKey)
+
+// Pure predicate for the "first-login missing-key auto-prompt". Extracted so it
+// can be unit-tested without rendering the component. The component wires this to
+// the auth + settings stores' live state. `settingsHydrated` gates the check so
+// the prompt doesn't fire on a false-positive empty-key read before IDB
+// rehydration finishes (keys default to '' until the persisted blob loads).
+export type AutoPromptInput = {
+  authStatus: string
+  keysComplete: boolean
+  autoPrompted: boolean
+  settingsHydrated: boolean
+}
+
+export const shouldAutoPromptSettings = (input: AutoPromptInput): boolean =>
+  input.settingsHydrated &&
+  input.authStatus === 'authenticated' &&
+  !input.keysComplete &&
+  !input.autoPrompted

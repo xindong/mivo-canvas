@@ -1,14 +1,13 @@
 // src/app/settings/UserChip.tsx
-// Sidebar bottom user chip (maker-paradigm). Replaces the old settings-row button:
-//   - not authenticated → "Log In" row (same grid as sidebar bottom rows)
-//   - authenticated     → avatar + name + "XD.Inc · v<version>" subline, opens SettingsPanel
-// Auth state comes from useAuthStore (E1 owns the real implementation; E2 ships a
-// stub so this branch builds in isolation — see src/store/authSlice.ts).
-import { useState } from 'react'
+// Sidebar bottom user chip. Not authenticated → "Log In" row (login() → Feishu
+// OAuth redirect); authenticated → avatar + name + "XD.Inc · v<version>", opens
+// the settings panel via the store's openSettings action (so AutoPromptSettings
+// can also open it programmatically). The panel itself renders at the App root,
+// so this chip only triggers openSettings — it does not host the panel.
 import { LogIn } from 'lucide-react'
 import { useAuthStore } from '../../store/authSlice'
+import { useSettingsStore } from '../../store/settingsSlice'
 import { debugLogger } from '../../store/debugLogStore'
-import { SettingsPanel } from './SettingsPanel'
 
 // First-version hardcode. TODO: wire to build-time version injection (VERSIONING.md
 // / package.json) once a release pipeline owns the value — avoids a json import
@@ -19,7 +18,7 @@ export function UserChip() {
   const user = useAuthStore((state) => state.user)
   const status = useAuthStore((state) => state.status)
   const login = useAuthStore((state) => state.login)
-  const [settingsOpen, setSettingsOpen] = useState(false)
+  const openSettings = useSettingsStore((state) => state.openSettings)
 
   const isAuthenticated = status === 'authenticated' && user !== null
 
@@ -42,25 +41,22 @@ export function UserChip() {
 
   const initial = (user.name || '?').slice(0, 1).toUpperCase()
   return (
-    <>
-      <button
-        type="button"
-        className="user-chip"
-        aria-label="Open settings"
-        onClick={() => {
-          debugLogger.log('Settings', 'User chip clicked — opening settings panel')
-          setSettingsOpen(true)
-        }}
-      >
-        <span className="user-chip-avatar" aria-hidden="true">
-          {user.avatar ? <img src={user.avatar} alt="" /> : <span className="user-chip-avatar-fallback">{initial}</span>}
-        </span>
-        <span className="user-chip-text">
-          <span className="user-chip-name">{user.name}</span>
-          <span className="user-chip-sub">XD.Inc · v{APP_VERSION}</span>
-        </span>
-      </button>
-      {settingsOpen ? <SettingsPanel onClose={() => setSettingsOpen(false)} /> : null}
-    </>
+    <button
+      type="button"
+      className="user-chip"
+      aria-label="Open settings"
+      onClick={() => {
+        debugLogger.log('Settings', 'User chip clicked — opening settings panel')
+        openSettings()
+      }}
+    >
+      <span className="user-chip-avatar" aria-hidden="true">
+        {user.avatar ? <img src={user.avatar} alt="" /> : <span className="user-chip-avatar-fallback">{initial}</span>}
+      </span>
+      <span className="user-chip-text">
+        <span className="user-chip-name">{user.name}</span>
+        <span className="user-chip-sub">XD.Inc · v{APP_VERSION}</span>
+      </span>
+    </button>
   )
 }

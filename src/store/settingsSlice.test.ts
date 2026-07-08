@@ -4,7 +4,9 @@ import {
   selectGatewayKeyMasked,
   selectHasGatewayKey,
   selectHasMivoKey,
+  selectKeysComplete,
   selectMivoKeyMasked,
+  shouldAutoPromptSettings,
   useSettingsStore,
 } from './settingsSlice'
 import { strictIdbStateStorage } from '../lib/persistIdbStorage'
@@ -14,7 +16,13 @@ import { toastFeedback } from './toastStore'
 // cases and drop any persisted blob so a prior case's key never bleeds into the
 // next (the same invariant this slice enforces for real users across reloads).
 beforeEach(async () => {
-  useSettingsStore.setState({ gatewayKey: '', mivoKey: '' })
+  useSettingsStore.setState({
+    gatewayKey: '',
+    mivoKey: '',
+    panelOpen: false,
+    panelSection: null,
+    autoPromptedThisSession: false,
+  })
   await strictIdbStateStorage.removeItem('mivo-canvas-settings')
 })
 
@@ -121,5 +129,85 @@ describe('settingsSlice — strict IDB-only (F1: no localStorage fallback for se
     setItemSpy.mockRestore()
     toastSpy.mockRestore()
     vi.unstubAllGlobals()
+  })
+})
+
+describe('settingsSlice — panel UI actions (openSettings / closeSettings / markAutoPrompted)', () => {
+  it('openSettings(section) sets panelOpen + panelSection', () => {
+    useSettingsStore.getState().openSettings('api-keys')
+    const s = useSettingsStore.getState()
+    expect(s.panelOpen).toBe(true)
+    expect(s.panelSection).toBe('api-keys')
+  })
+
+  it('openSettings() without section sets panelOpen + null section', () => {
+    useSettingsStore.getState().openSettings()
+    const s = useSettingsStore.getState()
+    expect(s.panelOpen).toBe(true)
+    expect(s.panelSection).toBeNull()
+  })
+
+  it('closeSettings closes the panel (section retained for re-open focus restore)', () => {
+    useSettingsStore.getState().openSettings('api-keys')
+    useSettingsStore.getState().closeSettings()
+    const s = useSettingsStore.getState()
+    expect(s.panelOpen).toBe(false)
+    expect(s.panelSection).toBe('api-keys')
+  })
+
+  it('markAutoPrompted sets the session flag', () => {
+    useSettingsStore.getState().markAutoPrompted()
+    expect(useSettingsStore.getState().autoPromptedThisSession).toBe(true)
+  })
+})
+
+describe('settingsSlice — selectKeysComplete', () => {
+  it('complete when both keys are valid', () => {
+    useSettingsStore.getState().setGatewayKey('sk-abcdef0123')
+    useSettingsStore.getState().setMivoKey('mivo_abcdef0123')
+    expect(selectKeysComplete(useSettingsStore.getState())).toBe(true)
+  })
+  it('incomplete when gateway missing', () => {
+    useSettingsStore.getState().setMivoKey('mivo_abcdef0123')
+    expect(selectKeysComplete(useSettingsStore.getState())).toBe(false)
+  })
+  it('incomplete when mivo missing', () => {
+    useSettingsStore.getState().setGatewayKey('sk-abcdef0123')
+    expect(selectKeysComplete(useSettingsStore.getState())).toBe(false)
+  })
+  it('incomplete when both missing', () => {
+    expect(selectKeysComplete(useSettingsStore.getState())).toBe(false)
+  })
+})
+
+// shouldAutoPromptSettings is the pure predicate AutoPromptSettings wires to the
+// live auth + settings state. Three required states + edge guards.
+describe('settingsSlice — shouldAutoPromptSettings (first-login missing-key predicate)', () => {
+  const base = {
+    authStatus: 'authenticated',
+    keysComplete: false,
+    autoPrompted: false,
+    settingsHydrated: true,
+  }
+
+  it('authenticated + missing key + not prompted + hydrated → prompt', () => {
+    expect(shouldAutoPromptSettings(base)).toBe(true)
+  })
+
+  it('keys complete → do NOT prompt (even if authenticated + not prompted)', () => {
+    expect(shouldAutoPromptSettings({ ...base, keysComplete: true })).toBe(false)
+  })
+
+  it('already prompted this session → do NOT prompt (anti-loop after user closes)', () => {
+    expect(shouldAutoPromptSettings({ ...base, autoPrompted: true })).toBe(false)
+  })
+
+  it('not authenticated → do NOT prompt', () => {
+    expect(shouldAutoPromptSettings({ ...base, authStatus: 'unauthenticated' })).toBe(false)
+    expect(shouldAutoPromptSettings({ ...base, authStatus: 'unknown' })).toBe(false)
+  })
+
+  it('settings not yet hydrated → do NOT prompt (avoid false-positive empty keys)', () => {
+    expect(shouldAutoPromptSettings({ ...base, settingsHydrated: false })).toBe(false)
   })
 })
