@@ -331,6 +331,7 @@ export const createSmokePage = async ({
   extraHTTPHeaders,
   enableStoreBridgeModules = false,
   enableApiRouteMocks = true,
+  mockAuthMe = false,
 }) => {
   const browser = await chromium.launch({ headless: true })
   const context = await browser.newContext({
@@ -357,6 +358,22 @@ export const createSmokePage = async ({
 
   if (enableApiRouteMocks) {
     await attachDefaultMivoApiMocks(page, { generatedImageB64, mivoEditRequests })
+  }
+
+  // feat/auth-sso: prod 拓扑 MIVO_PUBLIC=1 → dev 桩硬关 → BFF /api/auth/me 返 401。
+  // 浏览器 console 会把 401 当 "Failed to load resource" 错误报出,触发 console-error
+  // guard。prod e2e 代表"无 SSO 会话的未登录态",mock /api/auth/me → 200
+  // {authenticated:false}(对齐 auto-prompt-settings Flow 2 既有做法)避免 401 console
+  // 污染;fetchMe 见 200+authenticated=false → 未登录(不抛)。dev 拓扑用真 dev 桩 200,
+  // 不 mock。assertPublicModeSecurity 走 Node fetch 不经浏览器 route,仍验真 401。
+  if (mockAuthMe) {
+    await page.route('**/api/auth/me', (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ authenticated: false, detail: 'Not authenticated' }),
+      }),
+    )
   }
 
   page.on('console', (message) => {

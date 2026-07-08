@@ -26,6 +26,12 @@ regexes = [
   #    / future e2e fixture). CI fixture, not a real secret; the real
   #    MIVO_BFF_TOKEN is injected via GitHub secret at run time.
   '''e2e-token''',
+  # 4. Test stub keys in server/lib/keys.review-probe.test.ts +
+  #    server/routes/keys.test.ts (sk-FAKEKEY-* / mivo_FAKEKEY_*). Unified fixture
+  #    marker "FAKEKEY" — obviously fake, grants no access, only exercises key
+  #    format validation. NOT a blanket sk-/mivo_ exemption (real key shapes still
+  #    scanned); only strings containing the literal FAKEKEY marker are allowed.
+  '''FAKEKEY''',
 ]
 
 # 4. .env.example documents env var names with placeholder values for local

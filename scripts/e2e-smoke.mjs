@@ -11,11 +11,7 @@ import {
 import { attachDefaultMivoApiMocks } from './e2e/api-mocks.mjs'
 import { startEagleMockServer } from './e2e/eagle-mock-server.mjs'
 import { prepareSmokeFixtures } from './e2e/fixtures.mjs'
-import {
-  assertProdAuthorizedChain,
-  assertProdPublicRestrictions,
-  assertProdUnauthorizedGate,
-} from './e2e/prod-auth-assertions.mjs'
+import { assertPublicModeSecurity } from './e2e/prod-auth-assertions.mjs'
 import { startUpstreamMockServer } from './e2e/upstream-mock-server.mjs'
 import { leaferSkippedScenarios, scenarioOrder, scenarioRunners } from './e2e/scenarios/index.mjs'
 import {
@@ -78,7 +74,6 @@ const securityBaseUrl = createBaseUrl(securityPort)
 const baseUrl = createBaseUrl(runtimePort)
 const canvasUrl = `${baseUrl}?renderer=${rendererMode}`
 const devBffBaseUrl = createBaseUrl(requestedPort + 1)
-const bffToken = 'e2e-token'
 const debugViewToken = 'test-token'
 const {
   eagleMockDir,
@@ -98,7 +93,6 @@ const startTopologyServer = ({ activePort, debugViewToken: serverDebugViewToken,
         localAssetFixtureDir,
         eagleMockPort: eagleMockHandle.port,
         upstreamBaseUrl: upstreamMockHandle?.url,
-        bffToken,
         debugViewToken: serverDebugViewToken,
         enableLocalAssets,
         enableEagleProxy,
@@ -110,7 +104,6 @@ const startTopologyServer = ({ activePort, debugViewToken: serverDebugViewToken,
           localAssetFixtureDir,
           eagleMockPort: eagleMockHandle.port,
           upstreamBaseUrl: upstreamMockHandle?.url,
-          bffToken: '',
           debugViewToken: serverDebugViewToken,
           enableLocalAssets,
           enableEagleProxy,
@@ -159,26 +152,12 @@ try {
   }
 
   if (isProdTopology) {
-    const authedFetch = async (input, init = {}) =>
-      fetch(input, {
-        ...init,
-        headers: {
-          'x-mivo-bff-token': bffToken,
-          ...(init.headers || {}),
-        },
-      })
-    await assertProdPublicRestrictions({ baseUrl: securityBaseUrl, authedFetch })
-
-    const nakedRequestPage = await createSmokePage({
-      baseUrl: securityBaseUrl,
-      generatedImageB64,
-      enableApiRouteMocks: false,
-    })
-    try {
-      await assertProdUnauthorizedGate({ requestContext: nakedRequestPage.page.request, baseUrl: securityBaseUrl })
-    } finally {
-      await nakedRequestPage.browser.close()
-    }
+    // SSO 模型:app 无 auth gate。public 模式(MIVO_PUBLIC=1)下验 dev 桩硬关
+    // (/api/auth/me 401)+ feature flag 收紧(local-assets/eagle 404、debug-logs 403)。
+    // 旧 BFF token gate / unauthorized-gate 断言已删(app gate 按设计删,裸请求本就
+    // 该到 handler)。authedFetch=普通 fetch(无鉴权 header;debug-logs 不带 view
+    // token → 403,正是要验的 fail-closed)。
+    await assertPublicModeSecurity({ baseUrl: securityBaseUrl, authedFetch: fetch })
 
     await stopSmokeDevServer(server)
     server = startTopologyServer({
@@ -266,9 +245,9 @@ try {
     generatedImageB64,
     enableApiRouteMocks: !(isProdTopology && disableApiRouteMocks),
     enableStoreBridgeModules: isProdTopology,
+    mockAuthMe: isProdTopology,
     extraHTTPHeaders: isProdTopology
       ? {
-          'x-mivo-bff-token': bffToken,
           'x-mivo-debug-token': debugViewToken,
         }
       : undefined,
@@ -278,18 +257,9 @@ try {
   let { readFloatingChrome, readLibraryLayout, readLibrarySurfaceColors } = createPageReaders(page)
   const prodExtraHTTPHeaders = isProdTopology
     ? {
-        'x-mivo-bff-token': bffToken,
         'x-mivo-debug-token': debugViewToken,
       }
     : undefined
-
-  if (isProdTopology) {
-    await assertProdAuthorizedChain({
-      requestContext: context.request,
-      baseUrl,
-      localAssetFixtureSvg,
-    })
-  }
 
 
   const canvasStoreSpec = async () =>
