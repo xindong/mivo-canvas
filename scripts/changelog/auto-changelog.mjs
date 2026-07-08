@@ -317,6 +317,13 @@ const cmdPublish = async (args) => {
   if (!scanAnchor) {
     fail('scan 产物缺 anchor(无法回填 lastGithash)')
   }
+  // scan pr → day / author 反查表(P1-1/P1-2:date、by 不信 LLM,回查 scan)
+  const scanPrToDay = new Map()
+  const scanPrToAuthor = new Map()
+  for (const it of scan.items) {
+    scanPrToDay.set(it.pr, it.day)
+    scanPrToAuthor.set(it.pr, it.author)
+  }
 
   // ---- 2. 读改写产物 + 结构校验(写死,不信任 LLM)----
   let rewriteRaw
@@ -366,6 +373,33 @@ const cmdPublish = async (args) => {
             fail(`${iw}: prs 含非正整数 ${JSON.stringify(p)}`)
           }
           rewritePrSet.add(p)
+        }
+        // P1-1: date 不信 LLM——该条 prs 在 scan 里的归天日必须全一致,且 = entry.date
+        const itemDays = new Set()
+        for (const p of item.prs) {
+          const d = scanPrToDay.get(p)
+          if (d === undefined) {
+            fail(`${iw}: prs 含 scan 里没有的 PR ${p}(将在 PR 集合校验兜底,先行拦截)`)
+          }
+          itemDays.add(d)
+        }
+        if (itemDays.size > 1) {
+          fail(`${iw}: prs 跨结算日 [${[...itemDays].join(',')}] — 一个条目不能合并不同日的 PR,请按日拆条`)
+        }
+        const itemDay = [...itemDays][0]
+        if (itemDay !== e.date) {
+          fail(`${iw}: date=${e.date} 与 scan 里这些 PR 的归天日 ${itemDay} 不一致(日期由 scan 决定,LLM 不得篡改)`)
+        }
+        // P1-2: by 不信 LLM——单 PR 条目 by 必须精确等于该 PR 的 scan author;
+        //   多 PR 合并条目 by 必须等于 prs 中至少一个 PR 的 scan author(允许选主 PR,但不能凭空写)
+        const itemAuthors = new Set(item.prs.map((p) => scanPrToAuthor.get(p)))
+        if (item.prs.length === 1) {
+          const expected = scanPrToAuthor.get(item.prs[0])
+          if (item.by !== expected) {
+            fail(`${iw}: by="${item.by}" 与 PR ${item.prs[0]} 的 scan author "${expected}" 不一致(单 PR 条目 by 必须精确等于 scan author)`)
+          }
+        } else if (!itemAuthors.has(item.by)) {
+          fail(`${iw}: by="${item.by}" 不在该条 prs 的 scan author 集合 [${[...itemAuthors].join(',')}] 内(合并条目 by 必须是其中某个 PR 的作者,不能凭空写)`)
         }
         // 代码术语黑名单
         const hits = scanBlacklist(item.text)
@@ -504,21 +538,40 @@ ${newItemsSummary}
   let worktreeCreated = false
   let prNumber = null
 
+  // 失败路径也要清 worktree + 本地分支(trap 语义)。allowFail 兜底"没建成/已删"。
+  // 注意:fail() 是 process.exit,在 try 里调用不会触发 catch → 漏清。故 try 内
+  // 一律用 abort()(throw),落进 catch → cleanup;catch 再 fail 退出。
+  let cleanedUp = false
   const cleanup = () => {
-    // 失败路径也要清 worktree(trap 语义)
+    if (cleanedUp) return
+    cleanedUp = true
     if (worktreeCreated) {
-      try {
-        runGit(['worktree', 'remove', '--force', wtPath], { allowFail: true })
-      } catch {
-        /* ignore */
-      }
+      runGit(['worktree', 'remove', '--force', wtPath], { allowFail: true })
     }
+    // 本地分支可能没建成(allowFail 兜底),同日重试不被残留分支卡死
+    runGit(['branch', '-D', branch], { allowFail: true })
+  }
+  const abort = (msg, code = 1) => {
+    const err = new Error(msg)
+    err.exitCode = code
+    throw err
   }
 
   try {
     runGit(['fetch', 'origin', 'main'])
     if (existsSync(wtPath)) {
-      fail(`worktree 路径已存在: ${wtPath}(可能是上次失败残留,请手动清理)`)
+      // 上次失败残留:先自愈(worktree remove + branch -D + rmSync 兜底)再重建,
+      // 不让人手动清。worktree remove 拒不掉(被占用/非注册)时 rmSync 删目录。
+      process.stderr.write(`[auto-changelog] worktree 路径已存在(${wtPath}),自愈清理...\n`)
+      runGit(['worktree', 'remove', '--force', wtPath], { allowFail: true })
+      runGit(['branch', '-D', branch], { allowFail: true })
+      if (existsSync(wtPath)) {
+        try {
+          rmSync(wtPath, { recursive: true, force: true })
+        } catch {
+          /* ignore */
+        }
+      }
     }
     runGit(['worktree', 'add', '-b', branch, wtPath, 'origin/main'])
     worktreeCreated = true
@@ -526,7 +579,7 @@ ${newItemsSummary}
     // 读 worktree 里的 changelog.json,合并写回
     const wtChangelogPath = join(wtPath, CHANGELOG_REL)
     if (!existsSync(wtChangelogPath)) {
-      fail(`worktree 里找不到 ${CHANGELOG_REL}`)
+      abort(`worktree 里找不到 ${CHANGELOG_REL}`)
     }
     const wtChangelog = JSON.parse(readFileSync(wtChangelogPath, 'utf8'))
     const finalMerged = mergeEntries(wtChangelog)
@@ -551,7 +604,7 @@ ${newItemsSummary}
     ], { cwd: wtPath })
     const prMatch = prCreateOut.match(/pull\/(\d+)/)
     if (!prMatch) {
-      fail(`gh pr create 未返回 PR 编号: ${prCreateOut}`)
+      abort(`gh pr create 未返回 PR 编号: ${prCreateOut}`)
     }
     prNumber = Number(prMatch[1])
     process.stderr.write(`[auto-changelog] PR #${prNumber} 已创建,轮询 CI...\n`)
@@ -592,8 +645,7 @@ ${newItemsSummary}
             break
           }
           if (anyFail) {
-            cleanup()
-            fail(`CI 有失败项(${states}),中止不 merge。PR: https://github.com/xindong/mivo-canvas/pull/${prNumber}`, 2)
+            abort(`CI 有失败项(${states}),中止不 merge。PR: https://github.com/xindong/mivo-canvas/pull/${prNumber}`, 2)
           }
           if (states !== lastStates) {
             process.stderr.write(`[auto-changelog] CI 进行中(${states})\n`)
@@ -613,8 +665,7 @@ ${newItemsSummary}
         } catch { /* ignore parse error,继续轮询 */ }
       }
       if (Date.now() - pollStart > POLL_MAX_MS) {
-        cleanup()
-        fail(`CI 轮询超过 ${POLL_MAX_MS / 60_000} 分钟上限,中止不 merge。PR: https://github.com/xindong/mivo-canvas/pull/${prNumber}`, 3)
+        abort(`CI 轮询超过 ${POLL_MAX_MS / 60_000} 分钟上限,中止不 merge。PR: https://github.com/xindong/mivo-canvas/pull/${prNumber}`, 3)
       }
       // sleep 30s(异步,不阻塞事件循环;真实 publish 才会走到这里)
       await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS))
@@ -627,24 +678,20 @@ ${newItemsSummary}
     try {
       mv = JSON.parse(mergeView)
     } catch (err) {
-      cleanup()
-      fail(`merge 前校验:gh pr view --json 解析失败: ${err.message}`)
+      abort(`merge 前校验:gh pr view --json 解析失败: ${err.message}`)
     }
     // ① 分支名匹配 ^chore/changelog-
     if (!mv.headRefName || !/^chore\/changelog-/.test(mv.headRefName)) {
-      cleanup()
-      fail(`铁律违反:headRefName=${mv.headRefName} 不匹配 ^chore/changelog-`)
+      abort(`铁律违反:headRefName=${mv.headRefName} 不匹配 ^chore/changelog-`)
     }
     // ② files 仅含 public/changelog.json
     const files = (mv.files || []).map((f) => f.path)
     const illegal = files.filter((f) => f !== CHANGELOG_REL)
     if (illegal.length > 0) {
-      cleanup()
-      fail(`铁律违反:PR 改动了非 ${CHANGELOG_REL} 的文件: [${illegal.join(', ')}]`)
+      abort(`铁律违反:PR 改动了非 ${CHANGELOG_REL} 的文件: [${illegal.join(', ')}]`)
     }
     if (files.length === 0) {
-      cleanup()
-      fail('铁律违反:PR 无文件改动(预期含 public/changelog.json)')
+      abort('铁律违反:PR 无文件改动(预期含 public/changelog.json)')
     }
     // ③ mergeable=MERGEABLE;刚算完 CI 时该字段常短暂为 UNKNOWN(GitHub 异步),
     //   重试最多 6 次/间隔 10s;CONFLICTING 等其他非 MERGEABLE 值立即 fail 不重试
@@ -662,8 +709,7 @@ ${newItemsSummary}
       }
     }
     if (mergeable !== 'MERGEABLE') {
-      cleanup()
-      fail(`铁律违反:mergeable=${mergeable}(需 MERGEABLE;${mergeable === 'UNKNOWN' ? '已重试 6 次仍 UNKNOWN' : '非 MERGEABLE 立即拒绝'})`)
+      abort(`铁律违反:mergeable=${mergeable}(需 MERGEABLE;${mergeable === 'UNKNOWN' ? '已重试 6 次仍 UNKNOWN' : '非 MERGEABLE 立即拒绝'})`)
     }
     // ④ checks 全 pass(再确认一次)
     const finalChecksJson = runGh(['pr', 'checks', String(prNumber), '--json', 'name,state'], { cwd: wtPath })
@@ -671,15 +717,13 @@ ${newItemsSummary}
     try {
       finalChecks = JSON.parse(finalChecksJson)
     } catch (err) {
-      cleanup()
-      fail(`merge 前校验:checks 解析失败: ${err.message}`)
+      abort(`merge 前校验:checks 解析失败: ${err.message}`)
     }
     const notPass = (finalChecks || []).filter(
       (c) => !(c.state === 'SUCCESS' || c.state === 'NEUTRAL' || c.state === 'SKIPPED'),
     )
     if (notPass.length > 0) {
-      cleanup()
-      fail(`铁律违反:checks 未全绿: [${notPass.map((c) => `${c.name}=${c.state}`).join(', ')}]`)
+      abort(`铁律违反:checks 未全绿: [${notPass.map((c) => `${c.name}=${c.state}`).join(', ')}]`)
     }
 
     // 全过 → squash merge
@@ -697,8 +741,9 @@ ${newItemsSummary}
     process.stdout.write(`${JSON.stringify({ status: 'merged', pr: prNumber, branch, day: maxDay })}\n`)
     process.stderr.write(`[auto-changelog] PR #${prNumber} 已 squash merge 进 main\n`)
   } catch (err) {
+    // 任何失败(operational throw 或 abort)都走这里 → 清 worktree + 本地分支后退出
     cleanup()
-    throw err
+    fail(err.message, err.exitCode ?? 1)
   }
 }
 

@@ -42,6 +42,8 @@ node scripts/changelog/auto-changelog.mjs publish --rewrite /tmp/mivo-changelog-
 **输入校验(写死,不信任 LLM)**:
 - 合法 JSON;每条有非空 `text`/`by`/`prs`;
 - 改写产物的 PR 集合必须与 scan 产物的 PR 集合**完全一致**(多/漏都拒绝);
+- **date 不信 LLM**:每条 `prs` 在 scan 里的归天日必须全一致,且 = entry 的 `date`(LLM 不得篡改日期);
+- **by 不信 LLM**:单 PR 条目 `by` 必须精确 = 该 PR 的 scan author;多 PR 合并条目 `by` 必须是 `prs` 中某 PR 的 scan author(不能凭空写);
 - `text` 命中代码术语黑名单 → 拒绝。
 - 任一不过 → 非零退出 + stderr 原因,**绝不静默放行**。
 
