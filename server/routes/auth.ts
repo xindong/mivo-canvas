@@ -33,8 +33,10 @@ authRoute.get('/me', (c) => {
   return c.json({
     authenticated: true,
     username: 'dev@local',
-    display_name: '本地开发',
+    display_name: '朱赞（本地）',
     is_admin: false,
     services: ['mivo_canvas'],
+    // 预留:同事将来给 /me 加 avatar_url 时前端自动用 <img>;留 null 测首字母兜底。
+    avatar_url: null,
   })
 })

@@ -63,6 +63,7 @@ export const useSettingsStore = create<SettingsState>()(
         const trimmed = key.trim()
         debugLogger.log('Settings', `mivo key saved: tail=${keyTail(trimmed)}`)
         set({ mivoKey: trimmed })
+        toastFeedback.success('Mivo Key 已保存')
       },
       clearGatewayKey: () => {
         debugLogger.log('Settings', 'gateway key cleared')
@@ -112,11 +113,13 @@ export const selectHasMivoKey = (state: SettingsState): boolean => isMivoKey(sta
 export const selectKeysComplete = (state: SettingsState): boolean =>
   isGatewayKey(state.gatewayKey) && isMivoKey(state.mivoKey)
 
-// Pure predicate for the "first-login missing-key auto-prompt". Extracted so it
-// can be unit-tested without rendering the component. The component wires this to
-// the auth + settings stores' live state. `settingsHydrated` gates the check so
-// the prompt doesn't fire on a false-positive empty-key read before IDB
-// rehydration finishes (keys default to '' until the persisted blob loads).
+// Pure predicate for the "auto-open settings panel" trigger. Returns the section
+// to open (or null = don't open). Extracted so it can be unit-tested without
+// rendering the component. Two fire conditions (用户实测 2026-07-08):
+//   - 未登录 → 'account'(账号区显示「登录」按钮,用户主动点才跳 SSO,不强制跳)
+//   - 已登录 + 缺 key → 'api-keys'(首登缺 key 引导配置)
+// `settingsHydrated` gates the check so the prompt doesn't fire on a false-positive
+// empty-key read before IDB rehydration finishes. `autoPrompted` 防循环(用户关面板后不重弹)。
 export type AutoPromptInput = {
   authStatus: string
   keysComplete: boolean
@@ -124,8 +127,9 @@ export type AutoPromptInput = {
   settingsHydrated: boolean
 }
 
-export const shouldAutoPromptSettings = (input: AutoPromptInput): boolean =>
-  input.settingsHydrated &&
-  input.authStatus === 'authenticated' &&
-  !input.keysComplete &&
-  !input.autoPrompted
+export const shouldAutoPromptSettings = (input: AutoPromptInput): SettingsPanelSection | null => {
+  if (!input.settingsHydrated || input.autoPrompted) return null
+  if (input.authStatus === 'unauthenticated') return 'account'
+  if (input.authStatus === 'authenticated' && !input.keysComplete) return 'api-keys'
+  return null
+}

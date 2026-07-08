@@ -33,14 +33,17 @@ export function AutoPromptSettings() {
     if (typeof window !== 'undefined' && window.__MIVO_E2E_DISABLE_AUTO_PROMPT__ === true) {
       return
     }
-    if (
-      !shouldAutoPromptSettings({ authStatus, keysComplete, autoPrompted, settingsHydrated })
-    ) {
+    // 用户实测 2026-07-08:未登录也自动弹(停在账号区,用户主动点登录);已登录+缺 key 弹 API Keys 区。
+    const section = shouldAutoPromptSettings({ authStatus, keysComplete, autoPrompted, settingsHydrated })
+    if (!section) {
       return
     }
-    openSettings('api-keys')
+    openSettings(section)
     markAutoPrompted()
-    debugLogger.log('Settings', '首登缺 key,自动打开 API Keys 区')
+    debugLogger.log(
+      'Settings',
+      section === 'account' ? '未登录,自动打开账号区(用户主动点登录)' : '首登缺 key,自动打开 API Keys 区',
+    )
   }, [authStatus, keysComplete, autoPrompted, settingsHydrated, openSettings, markAutoPrompted])
 
   return null

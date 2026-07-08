@@ -35,6 +35,17 @@ describe('fetchMe (SSO gateway contract)', () => {
     expect(me.user?.avatar).toBeNull()
   })
 
+  it('200 with avatar_url → user.avatar = avatar_url (img; future SSO field)', async () => {
+    mockFetch(200, {
+      authenticated: true,
+      username: 'zhuzan@xd.com',
+      display_name: '朱赞',
+      avatar_url: 'https://example.com/zhu.png',
+    })
+    const me = await fetchMe()
+    expect(me.user?.avatar).toBe('https://example.com/zhu.png')
+  })
+
   it('401 → {authenticated:false, user:null} (not a throw; gateway not-logged-in)', async () => {
     mockFetch(401, { detail: 'Not authenticated' })
     const me = await fetchMe()

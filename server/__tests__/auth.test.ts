@@ -39,9 +39,10 @@ describe('SSO dev stub /api/auth/me', () => {
     expect(await res.json()).toEqual({
       authenticated: true,
       username: 'dev@local',
-      display_name: '本地开发',
+      display_name: '朱赞（本地）',
       is_admin: false,
       services: ['mivo_canvas'],
+      avatar_url: null,
     })
   })
 

@@ -22,8 +22,8 @@ export const runUserChipScenario = async (context) => {
   // Dev stub /me → authenticated → UserChip renders (.user-chip, not the Log In row).
   const chip = page.locator('.user-chip').first()
   await chip.waitFor()
-  // The chip shows the dev stub user's display_name ("本地开发").
-  await page.getByText('本地开发', { exact: false }).first().waitFor()
+  // The chip shows the dev stub user's display_name ("朱赞（本地）").
+  await page.getByText('朱赞（本地）', { exact: false }).first().waitFor()
 
   // Click the chip → opens the settings panel.
   await chip.click()

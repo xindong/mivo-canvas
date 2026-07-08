@@ -21,15 +21,12 @@ export default defineConfig(({ mode }) => {
     plugins: [react()],
     server: {
       proxy: {
-        '/api/mivo': {
-          target: resolveDevBffTarget(env),
-          changeOrigin: false,
-          secure: false,
-        },
-        // Auth endpoints (login-url / callback / me / logout / dev-login) live on
-        // the BFF too — without this the browser hits Vite/SPA and authClient gets
-        // HTML instead of JSON (hydrate then logs a spurious parse failure).
-        '/api/auth': {
+        // ALL /api/* traffic goes to the BFF. Use a single catch-all rather than
+        // per-prefix entries: enumerating (/api/mivo, /api/auth, /api/keys, …) has
+        // twice silently dropped a route to the Vite SPA fallback (browser gets
+        // HTML, res.json() throws, misreported as "网络连接失败"). The SPA serves
+        // no /api paths itself, so proxying all of /api is correct.
+        '/api': {
           target: resolveDevBffTarget(env),
           changeOrigin: false,
           secure: false,

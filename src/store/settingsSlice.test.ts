@@ -181,8 +181,9 @@ describe('settingsSlice — selectKeysComplete', () => {
 })
 
 // shouldAutoPromptSettings is the pure predicate AutoPromptSettings wires to the
-// live auth + settings state. Three required states + edge guards.
-describe('settingsSlice — shouldAutoPromptSettings (first-login missing-key predicate)', () => {
+// live auth + settings state. Returns the section to open (or null = don't).
+// 用户实测 2026-07-08:未登录也弹(账号区);已登录+缺 key 弹 API Keys 区。
+describe('settingsSlice — shouldAutoPromptSettings (auto-open panel predicate)', () => {
   const base = {
     authStatus: 'authenticated',
     keysComplete: false,
@@ -190,24 +191,27 @@ describe('settingsSlice — shouldAutoPromptSettings (first-login missing-key pr
     settingsHydrated: true,
   }
 
-  it('authenticated + missing key + not prompted + hydrated → prompt', () => {
-    expect(shouldAutoPromptSettings(base)).toBe(true)
+  it('authenticated + missing key + not prompted + hydrated → "api-keys"', () => {
+    expect(shouldAutoPromptSettings(base)).toBe('api-keys')
   })
 
-  it('keys complete → do NOT prompt (even if authenticated + not prompted)', () => {
-    expect(shouldAutoPromptSettings({ ...base, keysComplete: true })).toBe(false)
+  it('keys complete → null (do NOT prompt, even if authenticated + not prompted)', () => {
+    expect(shouldAutoPromptSettings({ ...base, keysComplete: true })).toBe(null)
   })
 
-  it('already prompted this session → do NOT prompt (anti-loop after user closes)', () => {
-    expect(shouldAutoPromptSettings({ ...base, autoPrompted: true })).toBe(false)
+  it('already prompted this session → null (anti-loop after user closes)', () => {
+    expect(shouldAutoPromptSettings({ ...base, autoPrompted: true })).toBe(null)
   })
 
-  it('not authenticated → do NOT prompt', () => {
-    expect(shouldAutoPromptSettings({ ...base, authStatus: 'unauthenticated' })).toBe(false)
-    expect(shouldAutoPromptSettings({ ...base, authStatus: 'unknown' })).toBe(false)
+  it('unauthenticated → "account" (open account section so user can click login)', () => {
+    expect(shouldAutoPromptSettings({ ...base, authStatus: 'unauthenticated' })).toBe('account')
   })
 
-  it('settings not yet hydrated → do NOT prompt (avoid false-positive empty keys)', () => {
-    expect(shouldAutoPromptSettings({ ...base, settingsHydrated: false })).toBe(false)
+  it('unknown (hydrate not done) → null', () => {
+    expect(shouldAutoPromptSettings({ ...base, authStatus: 'unknown' })).toBe(null)
+  })
+
+  it('settings not yet hydrated → null (avoid false-positive empty keys)', () => {
+    expect(shouldAutoPromptSettings({ ...base, settingsHydrated: false })).toBe(null)
   })
 })

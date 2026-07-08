@@ -35,7 +35,8 @@ export class AuthError extends Error {
 // GET /api/auth/me → { authenticated, user }。
 // 401(网关未登录 / dev 桩生产 fallback)→ 未登录(不抛,hydrate 按 info 处理;
 //   浏览器 console 的 401 网络错是网关行为,app 不可控,dev 桩返 200 无此问题)。
-// 200 + authenticated=true + username → user(id=username, name=display_name, avatar=null)。
+// 200 + authenticated=true + username → user(id=username, name=display_name, avatar=avatar_url??null)。
+//   avatar_url 是可选字段(当前 SSO 无;同事将来给 /me 加时自动 <img>,否则首字母兜底)。
 // non-2xx(非 401 真错误)→ 抛 AuthError。
 export const fetchMe = async (): Promise<MeResponse> => {
   const res = await fetch('/api/auth/me')
@@ -45,11 +46,16 @@ export const fetchMe = async (): Promise<MeResponse> => {
     authenticated?: boolean
     username?: string
     display_name?: string
+    avatar_url?: string | null
   }
   if (body.authenticated && body.username) {
     return {
       authenticated: true,
-      user: { id: body.username, name: body.display_name ?? body.username, avatar: null },
+      user: {
+        id: body.username,
+        name: body.display_name ?? body.username,
+        avatar: body.avatar_url ?? null,
+      },
     }
   }
   return { authenticated: false, user: null }

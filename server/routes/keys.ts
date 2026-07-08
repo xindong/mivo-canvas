@@ -35,6 +35,12 @@ keysRoute.post('/test', async (c): Promise<Response> => {
   if (!key.startsWith('sk-')) {
     return c.json({ success: false, error: 'Key 格式无效，需以 sk- 开头' } satisfies TestResult, 400)
   }
+  // Guard non-header-safe chars (non-ASCII / space / control) BEFORE building the
+  // Bearer header — otherwise fetch throws a ByteString error that the catch below
+  // mislabels as "网络连接失败", confusing the user into thinking it's a network issue.
+  if (!/^[\x21-\x7e]+$/.test(key)) {
+    return c.json({ success: false, error: 'Key 格式无效（含非法字符，请勿包含空格或中文）' } satisfies TestResult, 400)
+  }
 
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS)

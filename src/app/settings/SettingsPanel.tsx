@@ -6,7 +6,7 @@
 // into view (the auto-prompt's "定位到 API Keys 区" requirement).
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { LogOut, X } from 'lucide-react'
+import { LogIn, LogOut, X } from 'lucide-react'
 import { useAuthStore } from '../../store/authSlice'
 import {
   selectGatewayKeyMasked,
@@ -23,7 +23,10 @@ export function SettingsPanel() {
   const closeSettings = useSettingsStore((state) => state.closeSettings)
 
   const user = useAuthStore((state) => state.user)
+  const authStatus = useAuthStore((state) => state.status)
+  const login = useAuthStore((state) => state.login)
   const logout = useAuthStore((state) => state.logout)
+  const isAuthenticated = authStatus === 'authenticated' && user !== null
 
   const hasGatewayKey = useSettingsStore(selectHasGatewayKey)
   const gatewayMasked = useSettingsStore(selectGatewayKeyMasked)
@@ -47,6 +50,12 @@ export function SettingsPanel() {
     debugLogger.log('Auth', 'Logout requested from settings panel')
     logout() // logout() does the toast (SSO scheme: local clear + gateway-session TODO note)
     closeSettings()
+  }
+
+  const handleLogin = () => {
+    // login() 整页跳 SSO 网关登录页;不关面板(页面即将跳走)。
+    debugLogger.log('Auth', 'Login requested from settings panel account section')
+    login()
   }
 
   const handleDisconnectGateway = () => {
@@ -74,19 +83,27 @@ export function SettingsPanel() {
             <h4>账号</h4>
             <div className="settings-account-row">
               <span className="user-chip-avatar" aria-hidden="true">
-                {user?.avatar ? (
+                {isAuthenticated && user?.avatar ? (
                   <img src={user.avatar} alt="" />
                 ) : (
-                  <span className="user-chip-avatar-fallback">{(user?.name || '?').slice(0, 1).toUpperCase()}</span>
+                  <span className="user-chip-avatar-fallback">
+                    {(isAuthenticated ? (user?.name || '?') : '?').slice(0, 1).toUpperCase()}
+                  </span>
                 )}
               </span>
               <div className="settings-account-info">
-                <span className="settings-account-name">{user?.name || '未登录'}</span>
+                <span className="settings-account-name">{isAuthenticated ? user?.name : '未登录'}</span>
                 <span className="settings-account-sub">XD.Inc · SSO</span>
               </div>
-              <button type="button" className="settings-logout-btn" onClick={handleLogout}>
-                <LogOut size={15} /> 登出
-              </button>
+              {isAuthenticated ? (
+                <button type="button" className="settings-logout-btn" onClick={handleLogout}>
+                  <LogOut size={15} /> 登出
+                </button>
+              ) : (
+                <button type="button" className="settings-login-btn" onClick={handleLogin}>
+                  <LogIn size={15} /> 登录
+                </button>
+              )}
             </div>
           </section>
 
