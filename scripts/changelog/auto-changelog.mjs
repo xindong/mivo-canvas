@@ -1,0 +1,713 @@
+#!/usr/bin/env node
+// auto-changelog.mjs — 更新日志补扫确定性脚本(零 LLM)
+//
+// 把 generate-changelog skill「自动模式」里所有机械步骤下沉为确定性脚本,
+// 只留"口语化改写"一步给外部轻量 LLM 会话。三步编排:
+//   1. scan    — fetch + git log 差集 + 归天,产出 /tmp/mivo-changelog-scan.json
+//   2. rewrite — 外部 LLM 会话按 REWRITE_PROMPT.md 把 scan 产物改写成口语化条目
+//   3. publish — 校验改写产物 + 建临时 worktree + 合并写回 changelog.json + 开 PR + 轮询 CI + squash merge
+//
+// 语义规格见 .claude/skills/generate-changelog/SKILL.md(机械步骤已由本脚本承载,
+// skill 仅保留 SOP 作为语义说明)。运行手册见 ./RUNBOOK.md。
+//
+// 零 npm 依赖,只用 node 内置 + child_process 调 git/gh。Node ≥18。
+// 退出码:0=成功(含空跑);非 0=失败(stderr 打印原因,调度 agent 据此决定通知)。
+
+import { readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { join, resolve, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
+const REPO_ROOT = resolve(__dirname, '..', '..')
+const CHANGELOG_REL = 'public/changelog.json'
+const SCAN_OUTPUT_DEFAULT = '/tmp/mivo-changelog-scan.json'
+const REWRITE_OUTPUT_DEFAULT = '/tmp/mivo-changelog-rewrite.json'
+
+// ---- 归天:与 src/lib/changelogDate.ts 的 toChangelogDay 语义一致 ----
+// 8:00 本地时区为界:07:59 归前一天,08:00 起归当天。禁用 toISOString(UTC 日会错移边界)。
+const DAY_BOUNDARY_HOUR = 8
+const HOUR_MS = 3_600_000
+
+const pad2 = (n) => String(n).padStart(2, '0')
+
+const formatLocalDay = (date) =>
+  `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`
+
+// 入参是 git %cI 的 ISO 串(带偏移,如 2026-07-05T07:59:00+08:00)。
+const toChangelogDay = (isoTs) => {
+  const t = new Date(isoTs).getTime() - DAY_BOUNDARY_HOUR * HOUR_MS
+  return formatLocalDay(new Date(t))
+}
+
+// 本地时间戳(+08:00 冒号形态),供 updatedAt。等价 `date +%Y-%m-%dT%H:%M:%S%z` 加冒号。
+const localNowIso = () => {
+  const now = new Date()
+  const off = -now.getTimezoneOffset() // 东为正
+  const sign = off >= 0 ? '+' : '-'
+  const abs = Math.abs(off)
+  const oh = pad2(Math.floor(abs / 60))
+  const om = pad2(abs % 60)
+  return (
+    `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())}` +
+    `T${pad2(now.getHours())}:${pad2(now.getMinutes())}:${pad2(now.getSeconds())}` +
+    `${sign}${oh}:${om}`
+  )
+}
+
+// ---- PR 识别双模式 ----
+// squash 形态(当前主流):subject 以 (#N) 结尾
+const SQUASH_PR_RE = /\(#(\d+)\)\s*$/
+// merge 形态(历史遗留):subject 匹配 Merge pull request #N
+const MERGE_PR_RE = /^Merge pull request #(\d+)/
+// 自身 meta-PR(更新日志补扫自身)不收录——既有惯例
+const META_PR_SUBJECT_RE = /^chore: 更新日志补扫/
+
+// ---- 改写文本代码术语黑名单(写死,不信任 LLM) ----
+// 命中即拒绝。整词匹配(大小写不敏感)。代码词汇 = 函数名/文件名/组件名/工具链名等。
+// 列表可调,但要维持"宁可误伤也不放行代码词"的取向。中文口语化文本不应出现这些英文词。
+const BLACKLIST = [
+  'preflight', 'ci', 'tsc', 'lint', 'eslint', 'hook', 'store', 'ipc',
+  'crud', 'bff', 'basic auth', 'api', 'prompt', 'token', 'refactor',
+  'commit', 'merge', 'pm2', 'github', 'gitlab', 'npm', 'vite', 'react',
+  'zustand', 'leafer', 'tsx', 'oauth', 'secret', 'config', 'deploy',
+  'proxy', 'selector', 'e2e', 'playwright', 'vitest', 'typecheck',
+  'squash', 'workflow', 'sha', 'hash', 'diff', 'cache', 'async', 'await',
+  'promise', 'slice', 'memo', 'component', 'props', 'callback', 'dispatch',
+  'reducer', 'plugin', 'schema', 'http', 'url', 'cors', 'auth', 'session',
+  'cookie', 'endpoint', 'route', 'handler', 'node', 'env',
+]
+
+const BLACKLIST_RES = BLACKLIST.map((term) => ({
+  term,
+  re: new RegExp(`\\b${term.replace(/\s+/g, '\\s+')}\\b`, 'i'),
+}))
+
+const scanBlacklist = (text) => {
+  const hits = []
+  for (const { term, re } of BLACKLIST_RES) {
+    if (re.test(text)) hits.push(term)
+  }
+  return hits
+}
+
+// ---- 子进程封装 ----
+// opts.allowFail:出错返回 null 而非抛异常(供降级路径)
+// opts.cwd:默认 REPO_ROOT;worktree 内操作用 git -C <path> 切换更可靠
+// opts.env:额外环境变量(如 PREFLIGHT_SKIP)
+const runGit = (args, opts = {}) => {
+  try {
+    return execFileSync('git', args, {
+      cwd: opts.cwd ?? REPO_ROOT,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: opts.env ? { ...process.env, ...opts.env } : process.env,
+    }).trimEnd()
+  } catch (err) {
+    if (opts.allowFail) return null
+    const stderr = err.stderr ? err.stderr.toString().trim() : ''
+    const msg = `git ${args.join(' ')} 失败(退出码 ${err.status ?? '?'}): ${err.message}${stderr ? ` | stderr: ${stderr}` : ''}`
+    throw new Error(msg)
+  }
+}
+
+const runGh = (args, opts = {}) => {
+  try {
+    return execFileSync('gh', args, {
+      cwd: opts.cwd ?? REPO_ROOT,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: opts.env,
+    }).trimEnd()
+  } catch (err) {
+    if (opts.allowFail) return null
+    const stderr = err.stderr ? err.stderr.toString().trim() : ''
+    const msg = `gh ${args.join(' ')} 失败(退出码 ${err.status ?? '?'}): ${err.message}${stderr ? ` | stderr: ${stderr}` : ''}`
+    throw new Error(msg)
+  }
+}
+
+// ---- argv 解析(支持 --flag value 与 --flag=value) ----
+const parseArgs = (argv) => {
+  const out = { _: [] }
+  for (let i = 0; i < argv.length; i += 1) {
+    const a = argv[i]
+    if (a.startsWith('--')) {
+      const eq = a.indexOf('=')
+      if (eq !== -1) {
+        out[a.slice(2, eq)] = a.slice(eq + 1)
+      } else {
+        // 布尔 flag 或下一个值
+        const next = argv[i + 1]
+        if (next === undefined || next.startsWith('--')) {
+          out[a.slice(2)] = true
+        } else {
+          out[a.slice(2)] = next
+          i += 1
+        }
+      }
+    } else {
+      out._.push(a)
+    }
+  }
+  return out
+}
+
+const fail = (msg, code = 1) => {
+  process.stderr.write(`[auto-changelog] 错误: ${msg}\n`)
+  process.exit(code)
+}
+
+// ====================== scan ======================
+const cmdScan = (args) => {
+  const anchorOverride = args.anchor
+  const output = args.output || SCAN_OUTPUT_DEFAULT
+  const doFetch = args.fetch !== false && args['no-fetch'] !== true
+
+  if (doFetch) {
+    process.stderr.write('[auto-changelog] git fetch origin main...\n')
+    runGit(['fetch', 'origin', 'main'])
+  }
+
+  const changelogPath = join(REPO_ROOT, CHANGELOG_REL)
+  if (!existsSync(changelogPath)) {
+    fail(`找不到 ${changelogPath}(请在仓库内运行)`)
+  }
+  const changelog = JSON.parse(readFileSync(changelogPath, 'utf8'))
+
+  // 锚点:默认读 lastGithash;--anchor 覆盖(历史重扫模式,跳过去重)
+  const historical = Boolean(anchorOverride)
+  const anchor = anchorOverride || changelog.lastGithash
+  if (!anchor) {
+    fail('changelog.json 缺少 lastGithash,且未传 --anchor')
+  }
+
+  const originMain = runGit(['rev-parse', 'origin/main'])
+
+  // 必须用 NUL 切分防 subject 含竖线/换行被截断。
+  // 格式:%H%x00%cI%x00%an%x00%s%x00%x00 (每条记录以双 NUL 结尾)
+  const raw = runGit([
+    'log', '--first-parent',
+    '--format=%H%x00%cI%x00%an%x00%s%x00%x00',
+    `${anchor}..origin/main`,
+  ])
+
+  // git log 每条 entry 后会追加一个 \n,按 \x00\x00 切分时,第二条及之后的 record
+  // 会带一个前导 \n(\x00\x00\n<H1>...),污染 hash(parts[0])。trimStart 去掉它,
+  // 否则 hash='\n56a8be8...' 会让后续 `<hash>^2` 解析失败(实测踩过)。
+  const records = raw
+    ? raw
+        .split('\x00\x00')
+        .filter(Boolean)
+        .map((r) => r.replace(/^[\r\n]+/, ''))
+    : []
+
+  // 现有全部 entries 的 prs 并集(去重依据)
+  const recordedPrs = new Set()
+  for (const e of changelog.entries || []) {
+    for (const p of e.prs || []) recordedPrs.add(p)
+  }
+
+  const items = []
+  const seenPrs = new Set() // 范围内同号去重(双模式按号归并)
+
+  for (const rec of records) {
+    const parts = rec.split('\x00')
+    if (parts.length < 4) continue
+    const hash = parts[0]
+    const cI = parts[1]
+    let author = parts[2]
+    const subject = parts.slice(3).join('\x00') // subject 自身理论不含 NUL,兜底拼回
+
+    // meta-PR 自身不收录
+    if (META_PR_SUBJECT_RE.test(subject)) continue
+
+    // PR 识别双模式
+    let pr = null
+    const squash = subject.match(SQUASH_PR_RE)
+    const merge = subject.match(MERGE_PR_RE)
+    if (squash) {
+      pr = Number(squash[1])
+    } else if (merge) {
+      pr = Number(merge[1])
+      // merge 形态作者另取被合并分支作者(<merge>^2);取不到则回退 %an
+      const branchAuthor = runGit(['log', '-1', '--format=%an', `${hash}^2`], { allowFail: true })
+      if (branchAuthor) author = branchAuthor
+    } else {
+      // 非 PR 落地(直推/其他),跳过
+      continue
+    }
+
+    if (seenPrs.has(pr)) continue
+    seenPrs.add(pr)
+
+    // 去重:与现有 entries 的 prs 求差集(历史重扫模式跳过)
+    if (!historical && recordedPrs.has(pr)) continue
+
+    const day = toChangelogDay(cI)
+
+    // PR body:gh pr view N --json body,失败降级空串不阻断
+    let body = ''
+    const bodyJson = runGh(['pr', 'view', String(pr), '--json', 'body'], { allowFail: true })
+    if (bodyJson) {
+      try {
+        body = JSON.parse(bodyJson).body || ''
+      } catch {
+        body = ''
+      }
+    }
+
+    items.push({ pr, day, author, subject, body })
+  }
+
+  if (items.length === 0) {
+    // 空跑:不开 PR、不写 scan 产物。打印 empty,退出 0。
+    process.stdout.write(`${JSON.stringify({ status: 'empty' })}\n`)
+    return
+  }
+
+  const payload = {
+    status: 'pending',
+    anchor: originMain,
+    historical,
+    items: items
+      .slice()
+      .sort((a, b) => a.pr - b.pr)
+      .map((it) => ({ pr: it.pr, day: it.day, author: it.author, subject: it.subject, body: it.body })),
+  }
+  writeFileSync(output, `${JSON.stringify(payload, null, 2)}\n`)
+  process.stdout.write(`${JSON.stringify(payload)}\n`)
+  process.stderr.write(`[auto-changelog] 扫出 ${items.length} 个新 PR,产物写入 ${output}\n`)
+}
+
+// ====================== publish ======================
+const cmdPublish = async (args) => {
+  const dryRun = args['dry-run'] === true
+  const rewritePath = args.rewrite
+  const scanPath = args.scan || SCAN_OUTPUT_DEFAULT
+
+  if (!rewritePath) {
+    fail('publish 需要 --rewrite <path>(LLM 改写产物 JSON)')
+  }
+  if (!existsSync(rewritePath)) {
+    fail(`改写产物不存在: ${rewritePath}`)
+  }
+  if (!existsSync(scanPath)) {
+    fail(`scan 产物不存在: ${scanPath}(请先跑 scan)`)
+  }
+
+  // ---- 1. 读 scan 产物(提供 PR 集合基准)----
+  let scan
+  try {
+    scan = JSON.parse(readFileSync(scanPath, 'utf8'))
+  } catch (err) {
+    fail(`scan 产物 JSON 解析失败: ${err.message}`)
+  }
+  if (!Array.isArray(scan.items) || scan.items.length === 0) {
+    fail('scan 产物无 items(scan 时为空跑?改写无意义)')
+  }
+  const scanPrSet = new Set(scan.items.map((it) => it.pr))
+  const scanAnchor = scan.anchor
+  if (!scanAnchor) {
+    fail('scan 产物缺 anchor(无法回填 lastGithash)')
+  }
+
+  // ---- 2. 读改写产物 + 结构校验(写死,不信任 LLM)----
+  let rewriteRaw
+  try {
+    rewriteRaw = readFileSync(rewritePath, 'utf8')
+  } catch (err) {
+    fail(`读改写产物失败: ${err.message}`)
+  }
+  let rewrite
+  try {
+    rewrite = JSON.parse(rewriteRaw)
+  } catch (err) {
+    fail(`改写产物不是合法 JSON: ${err.message}`)
+  }
+  if (!rewrite || !Array.isArray(rewrite.entries)) {
+    fail('改写产物缺少 entries 数组')
+  }
+
+  const rewritePrSet = new Set()
+  const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
+
+  for (let ei = 0; ei < rewrite.entries.length; ei += 1) {
+    const e = rewrite.entries[ei]
+    const where = `entries[${ei}]`
+    if (!e || typeof e !== 'object') fail(`${where}: 不是对象`)
+    if (typeof e.date !== 'string' || !DATE_RE.test(e.date)) {
+      fail(`${where}: date 非法(需 YYYY-MM-DD),实际 ${JSON.stringify(e.date)}`)
+    }
+    for (const key of ['features', 'fixes']) {
+      const arr = e[key]
+      if (!Array.isArray(arr)) fail(`${where}: ${key} 非数组`)
+      for (let ii = 0; ii < arr.length; ii += 1) {
+        const item = arr[ii]
+        const iw = `${where}.${key}[${ii}]`
+        if (!item || typeof item !== 'object') fail(`${iw}: 不是对象`)
+        if (typeof item.text !== 'string' || item.text.trim() === '') {
+          fail(`${iw}: text 为空`)
+        }
+        if (typeof item.by !== 'string' || item.by.trim() === '') {
+          fail(`${iw}: by 为空`)
+        }
+        if (!Array.isArray(item.prs) || item.prs.length === 0) {
+          fail(`${iw}: prs 为空数组(合并条目必须列出全部来源 PR 号)`)
+        }
+        for (const p of item.prs) {
+          if (typeof p !== 'number' || !Number.isInteger(p) || p <= 0) {
+            fail(`${iw}: prs 含非正整数 ${JSON.stringify(p)}`)
+          }
+          rewritePrSet.add(p)
+        }
+        // 代码术语黑名单
+        const hits = scanBlacklist(item.text)
+        if (hits.length > 0) {
+          fail(`${iw}: text 命中代码术语黑名单 [${hits.join(', ')}] — 改写必须用使用者视角,禁出现代码词汇。text: "${item.text}"`)
+        }
+      }
+    }
+  }
+
+  // ---- 3. PR 集合必须与 scan 产物完全一致(多、漏都拒绝)----
+  const missing = [...scanPrSet].filter((p) => !rewritePrSet.has(p))
+  const extra = [...rewritePrSet].filter((p) => !scanPrSet.has(p))
+  if (missing.length > 0 || extra.length > 0) {
+    const parts = []
+    if (missing.length) parts.push(`漏 ${missing.length} 个: [${missing.join(',')}]`)
+    if (extra.length) parts.push(`多 ${extra.length} 个: [${extra.join(',')}]`)
+    fail(`改写产物的 PR 集合与 scan 不一致(${parts.join('; ')});scan PRs=[${[...scanPrSet].sort((a, b) => a - b).join(',')}], rewrite PRs=[${[...rewritePrSet].sort((a, b) => a - b).join(',')}]`)
+  }
+
+  // ---- 4. 计算合并后的 changelog(纯逻辑,安全)----
+  // 从最新 origin/main 建临时 worktree,在其上读 changelog.json 再合并写回。
+  // dry-run 时只算合并结果 + 打印计划命令,不执行 git/gh 写操作。
+  const maxDay = rewrite.entries
+    .map((e) => e.date)
+    .sort()
+    .at(-1)
+  const branch = `chore/changelog-${maxDay}`
+  const wtPath = `/tmp/mivo-changelog-wt-${process.pid}`
+
+  // 合并逻辑(与现有 changelog.json 合并;dry-run 时用本工作树的 changelog.json 作样本)
+  const mergeEntries = (existingChangelog) => {
+    const byDate = new Map()
+    for (const e of existingChangelog.entries || []) {
+      byDate.set(e.date, {
+        date: e.date,
+        prs: new Set(e.prs || []),
+        features: [...(e.features || [])],
+        fixes: [...(e.fixes || [])],
+      })
+    }
+    for (const re of rewrite.entries) {
+      let entry = byDate.get(re.date)
+      if (!entry) {
+        entry = { date: re.date, prs: new Set(), features: [], fixes: [] }
+        byDate.set(re.date, entry)
+      }
+      for (const key of ['features', 'fixes']) {
+        for (const item of re[key] || []) {
+          // 存储形态只保留 {text, by}(prs 仅用于回填 entry.prs)
+          entry[key].push({ text: item.text, by: item.by })
+          for (const p of item.prs) entry.prs.add(p)
+        }
+      }
+    }
+    const entries = [...byDate.values()]
+      .map((e) => ({
+        date: e.date,
+        prs: [...e.prs].sort((a, b) => a - b),
+        features: e.features,
+        fixes: e.fixes,
+      }))
+      .sort((a, b) => (a.date < b.date ? 1 : -1))
+    return {
+      lastGithash: scanAnchor,
+      updatedAt: localNowIso(),
+      entries,
+    }
+  }
+
+  // 用于 dry-run 的合并样本:读本工作树(脚本所在 repo)的 changelog.json
+  const sampleChangelogPath = join(REPO_ROOT, CHANGELOG_REL)
+  const sampleChangelog = JSON.parse(readFileSync(sampleChangelogPath, 'utf8'))
+  const merged = mergeEntries(sampleChangelog)
+
+  // 新增条目清单(PR body 用)
+  const newItemsSummary = scan.items
+    .slice()
+    .sort((a, b) => a.pr - b.pr)
+    .map((it) => `- #${it.pr} @${it.author} [${it.day}] ${it.subject}`)
+    .join('\n')
+  const prTitle = `chore: 更新日志补扫 ${maxDay}`
+  const prBody = `每日 8:00 自动补扫已合入 main 的 PR(确定性脚本,零 LLM)。
+
+新增 PR 清单:
+${newItemsSummary}
+
+归天(8:00 结算边界)与去重均由 scripts/changelog/auto-changelog.mjs 确定。`
+
+  if (dryRun) {
+    process.stdout.write(
+      `${JSON.stringify(
+        {
+          dryRun: true,
+          scanPath,
+          rewritePath,
+          scanAnchor,
+          maxDay,
+          branch,
+          worktree: wtPath,
+          prTitle,
+          mergedChangelogBytes: JSON.stringify(merged, null, 2).length,
+        },
+        null,
+        2,
+      )}\n`,
+    )
+    process.stdout.write('\n---- 将执行的命令(dry-run,不实际执行)----\n')
+    const planned = [
+      `git fetch origin main`,
+      `git worktree add -b ${branch} ${wtPath} origin/main`,
+      `# 在 ${wtPath}/public/changelog.json 写入合并后的内容(lastGithash=${scanAnchor}, updatedAt=${merged.updatedAt})`,
+      `git -C ${wtPath} add public/changelog.json`,
+      `git -C ${wtPath} commit -m "${prTitle}"`,
+      `# PREFLIGHT_SKIP=1:changelog-only 非代码改动,无 deps 的临时 worktree 跑不了 pre-push 五道校验;CI 会跑真校验`,
+      `PREFLIGHT_SKIP=1 git -C ${wtPath} push -u origin ${branch}`,
+      `gh pr create --title "${prTitle}" --body "<新增条目清单>"`,
+      `# 轮询 CI:gh pr checks <N> --json name,state,每 30s,上限 30 分钟;fail 中止,head 落后先 gh pr update-branch <N>`,
+      `# merge 前铁律:分支名 ^chore/changelog-;files 仅 public/changelog.json;checks 全 pass;mergeable=MERGEABLE`,
+      `gh pr merge <N> --squash`,
+      `git push origin --delete ${branch}`,
+      `git worktree remove --force ${wtPath}`,
+    ]
+    for (const c of planned) process.stdout.write(`${c}\n`)
+    process.stdout.write('\n---- PR body 预览 ----\n')
+    process.stdout.write(`${prBody}\n`)
+    process.stdout.write('\n---- 合并后 changelog.json(前 60 行)----\n')
+    const mergedStr = JSON.stringify(merged, null, 2)
+    process.stdout.write(`${mergedStr.split('\n').slice(0, 60).join('\n')}\n`)
+    process.stderr.write('[auto-changelog] dry-run 完成(未执行任何写操作)\n')
+    return
+  }
+
+  // ---- 5. 真实执行:建临时 worktree → 合并写回 → commit → push → PR → 轮询 → merge → 清理 ----
+  process.stderr.write(`[auto-changelog] 真实 publish:branch=${branch} worktree=${wtPath}\n`)
+  let worktreeCreated = false
+  let prNumber = null
+
+  const cleanup = () => {
+    // 失败路径也要清 worktree(trap 语义)
+    if (worktreeCreated) {
+      try {
+        runGit(['worktree', 'remove', '--force', wtPath], { allowFail: true })
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  try {
+    runGit(['fetch', 'origin', 'main'])
+    if (existsSync(wtPath)) {
+      fail(`worktree 路径已存在: ${wtPath}(可能是上次失败残留,请手动清理)`)
+    }
+    runGit(['worktree', 'add', '-b', branch, wtPath, 'origin/main'])
+    worktreeCreated = true
+
+    // 读 worktree 里的 changelog.json,合并写回
+    const wtChangelogPath = join(wtPath, CHANGELOG_REL)
+    if (!existsSync(wtChangelogPath)) {
+      fail(`worktree 里找不到 ${CHANGELOG_REL}`)
+    }
+    const wtChangelog = JSON.parse(readFileSync(wtChangelogPath, 'utf8'))
+    const finalMerged = mergeEntries(wtChangelog)
+    writeFileSync(wtChangelogPath, `${JSON.stringify(finalMerged, null, 2)}\n`)
+
+    runGit(['-C', wtPath, 'add', CHANGELOG_REL])
+    runGit(['-C', wtPath, 'commit', '-m', prTitle])
+
+    // PREFLIGHT_SKIP=1:changelog-only 非代码改动,无 deps 的临时 worktree 跑不了 pre-push
+    // 五道校验(typecheck/lint/build/...);CI 会跑真校验。既定决策,见 RUNBOOK.md。
+    runGit(['-C', wtPath, 'push', '-u', 'origin', branch], {
+      env: { PREFLIGHT_SKIP: '1' },
+    })
+
+    // 开 PR
+    const prCreateOut = runGh([
+      'pr', 'create',
+      '--title', prTitle,
+      '--body', prBody,
+      '--base', 'main',
+      '--head', branch,
+    ], { cwd: wtPath })
+    const prMatch = prCreateOut.match(/pull\/(\d+)/)
+    if (!prMatch) {
+      fail(`gh pr create 未返回 PR 编号: ${prCreateOut}`)
+    }
+    prNumber = Number(prMatch[1])
+    process.stderr.write(`[auto-changelog] PR #${prNumber} 已创建,轮询 CI...\n`)
+
+    // 轮询 CI:每 30s,上限 30 分钟
+    const POLL_INTERVAL_MS = 30_000
+    const POLL_MAX_MS = 30 * 60_000
+    const pollStart = Date.now()
+    let lastStates = ''
+    // 注:Date.now() 在本脚本(非 workflow)里可用
+    for (;;) {
+      const checksJson = runGh(['pr', 'checks', String(prNumber), '--json', 'name,state'], { cwd: wtPath, allowFail: true })
+      if (checksJson) {
+        let checks
+        try {
+          checks = JSON.parse(checksJson)
+        } catch {
+          checks = null
+        }
+        if (Array.isArray(checks) && checks.length > 0) {
+          const states = checks.map((c) => `${c.name}=${c.state}`).join(',')
+          // gh pr checks --json 的 state 取值(GitHub Actions):
+          //   终态-过:SUCCESS / NEUTRAL / SKIPPED
+          //   终态-挂:FAILURE / ERROR / CANCELLED / TIMED_OUT / ACTION_REQUIRED
+          //   进行中(继续等):PENDING / QUEUED / IN_PROGRESS / WAITING / STALE / 空
+          const allPass = checks.every((c) =>
+            c.state === 'SUCCESS' || c.state === 'NEUTRAL' || c.state === 'SKIPPED',
+          )
+          const anyFail = checks.some((c) =>
+            c.state === 'FAILURE' ||
+            c.state === 'ERROR' ||
+            c.state === 'CANCELLED' ||
+            c.state === 'TIMED_OUT' ||
+            c.state === 'ACTION_REQUIRED',
+          )
+          if (allPass) {
+            process.stderr.write(`[auto-changelog] CI 全绿(${states})\n`)
+            break
+          }
+          if (anyFail) {
+            cleanup()
+            fail(`CI 有失败项(${states}),中止不 merge。PR: https://github.com/xindong/mivo-canvas/pull/${prNumber}`, 2)
+          }
+          if (states !== lastStates) {
+            process.stderr.write(`[auto-changelog] CI 进行中(${states})\n`)
+            lastStates = states
+          }
+        }
+      }
+      // head 落后基线 → update-branch 后继续等
+      const prView = runGh(['pr', 'view', String(prNumber), '--json', 'mergeable', 'statusCheckRollup'], { cwd: wtPath, allowFail: true })
+      if (prView) {
+        try {
+          const pv = JSON.parse(prView)
+          if (pv.mergeable === 'BEHIND') {
+            process.stderr.write('[auto-changelog] head 落后基线,gh pr update-branch...\n')
+            runGh(['pr', 'update-branch', String(prNumber)], { cwd: wtPath, allowFail: true })
+          }
+        } catch { /* ignore parse error,继续轮询 */ }
+      }
+      if (Date.now() - pollStart > POLL_MAX_MS) {
+        cleanup()
+        fail(`CI 轮询超过 ${POLL_MAX_MS / 60_000} 分钟上限,中止不 merge。PR: https://github.com/xindong/mivo-canvas/pull/${prNumber}`, 3)
+      }
+      // sleep 30s(异步,不阻塞事件循环;真实 publish 才会走到这里)
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS))
+    }
+
+    // ---- merge 前铁律校验(全部写死为 if)----
+    const mergeView = runGh(['pr', 'view', String(prNumber), '--json', 'files', 'mergeable', 'headRefName'], { cwd: wtPath })
+    let mv
+    try {
+      mv = JSON.parse(mergeView)
+    } catch (err) {
+      cleanup()
+      fail(`merge 前校验:gh pr view --json 解析失败: ${err.message}`)
+    }
+    // ① 分支名匹配 ^chore/changelog-
+    if (!mv.headRefName || !/^chore\/changelog-/.test(mv.headRefName)) {
+      cleanup()
+      fail(`铁律违反:headRefName=${mv.headRefName} 不匹配 ^chore/changelog-`)
+    }
+    // ② files 仅含 public/changelog.json
+    const files = (mv.files || []).map((f) => f.path)
+    const illegal = files.filter((f) => f !== CHANGELOG_REL)
+    if (illegal.length > 0) {
+      cleanup()
+      fail(`铁律违反:PR 改动了非 ${CHANGELOG_REL} 的文件: [${illegal.join(', ')}]`)
+    }
+    if (files.length === 0) {
+      cleanup()
+      fail('铁律违反:PR 无文件改动(预期含 public/changelog.json)')
+    }
+    // ③ mergeable=MERGEABLE
+    if (mv.mergeable !== 'MERGEABLE') {
+      cleanup()
+      fail(`铁律违反:mergeable=${mv.mergeable}(需 MERGEABLE)`)
+    }
+    // ④ checks 全 pass(再确认一次)
+    const finalChecksJson = runGh(['pr', 'checks', String(prNumber), '--json', 'name,state'], { cwd: wtPath })
+    let finalChecks
+    try {
+      finalChecks = JSON.parse(finalChecksJson)
+    } catch (err) {
+      cleanup()
+      fail(`merge 前校验:checks 解析失败: ${err.message}`)
+    }
+    const notPass = (finalChecks || []).filter(
+      (c) => !(c.state === 'SUCCESS' || c.state === 'NEUTRAL' || c.state === 'SKIPPED'),
+    )
+    if (notPass.length > 0) {
+      cleanup()
+      fail(`铁律违反:checks 未全绿: [${notPass.map((c) => `${c.name}=${c.state}`).join(', ')}]`)
+    }
+
+    // 全过 → squash merge
+    process.stderr.write(`[auto-changelog] 铁律校验全过,squash merge PR #${prNumber}\n`)
+    runGh(['pr', 'merge', String(prNumber), '--squash'], { cwd: wtPath })
+
+    // ---- 收尾:删远程分支(分开删,gh --delete-branch 会被 worktree 占用卡住)----
+    try {
+      runGit(['push', 'origin', '--delete', branch])
+    } catch (err) {
+      // 删分支失败不阻断主流程(merge 已成功),仅告警
+      process.stderr.write(`[auto-changelog] 警告:删远程分支 ${branch} 失败: ${err.message}(merge 已成功,请手动删分支)\n`)
+    }
+    cleanup()
+    process.stdout.write(`${JSON.stringify({ status: 'merged', pr: prNumber, branch, day: maxDay })}\n`)
+    process.stderr.write(`[auto-changelog] PR #${prNumber} 已 squash merge 进 main\n`)
+  } catch (err) {
+    cleanup()
+    throw err
+  }
+}
+
+// ====================== 入口 ======================
+const main = async () => {
+  const argv = process.argv.slice(2)
+  if (argv.length === 0) {
+    process.stderr.write('用法:\n')
+    process.stderr.write('  node scripts/changelog/auto-changelog.mjs scan [--anchor <hash>] [--output <path>] [--no-fetch]\n')
+    process.stderr.write('  node scripts/changelog/auto-changelog.mjs publish --rewrite <path> [--scan <path>] [--dry-run] [--no-fetch]\n')
+    process.exit(2)
+  }
+  const sub = argv[0]
+  const rest = parseArgs(argv.slice(1))
+
+  if (sub === 'scan') {
+    try {
+      cmdScan(rest)
+    } catch (err) {
+      fail(err.message)
+    }
+  } else if (sub === 'publish') {
+    try {
+      await cmdPublish(rest)
+    } catch (err) {
+      fail(err.message)
+    }
+  } else {
+    fail(`未知子命令: ${sub}(可用: scan | publish)`)
+  }
+}
+
+main()
