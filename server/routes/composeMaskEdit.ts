@@ -14,23 +14,28 @@ import { fetchUpstreamWithTimeout } from '../lib/upstream'
 import { logRequest, newRequestId, readJsonBody } from '../lib/request'
 import { rejectInvalidGatewayKey, resolveGatewayKey } from '../lib/keys'
 
-type ComposeAnchor = { n: number; label: string; position?: string }
+type ComposeAnchor = { n: number; label: string; position?: string; hasDuplicate?: boolean }
 
 const composeSystemPrompt = [
-  '你是局部重绘指令整理器。用户在图2上圈了 N 个已编号红圈（附标签和方位），并用一句话表达修改意图。',
+  '你是局部重绘指令整理器。用户在图2上圈了 N 个已编号红圈（附标签、方位、以及「画面别处是否有同类」标记），并用一句话表达修改意图。',
   '把用户意图拆成逐条编辑要求，每个红圈一条，严格按规则：',
   '- 以「N.」开头，N=红圈编号，顺序与给定红圈完全一致，共输出 N 条，不多不少。',
-  '- 消除类动作（去除/去掉/消除/删除/移除/清除等）：务必只{动作}图2中{N}号红圈（{方位}）范围内的{标签}。画面中其他{标签}一律保留，不要误删其他{标签}。',
-  '- 修改类动作（改色/替换/调整等）：将图2中{N}号红圈（{方位}）范围内的{标签}{动作}。红圈范围内除{标签}以外的内容保持不变，其他相似内容不要误改。',
+  '- 消除类动作（去除/去掉/消除/删除/移除/清除等）：务必只{动作}图2中{N}号红圈（{方位}）范围内的{标签}。',
+  '- 修改类动作（改色/替换/调整等）：将图2中{N}号红圈（{方位}）范围内的{标签}{动作}。',
+  '- 【保护句按需添加】仅当该红圈标记为「画面别处有同类」时，才在该条末尾补一句防误伤：消除类补「画面中其他{标签}一律保留，不要误删其他{标签}」，修改类补「红圈范围内除{标签}以外的内容保持不变，其他相似内容不要误改」。若标记为「画面中独一无二」，则不要加任何保护句，只写动作句，保持简洁。',
   '- 只整理用户已表达的意图，严禁新增、删减或改变语义；用户没提到的红圈，按其标签默认「保持不变」。',
   '- 方位若为空则省略括号部分。',
   '只返回一个 JSON 对象，不要任何其他文字、解释、开场白，也不要输出图1/图2 的框架句：',
-  '{"requirements":["1.务必只去除图2中1号红圈（最左侧）范围内的蓝色烟雾。画面中其他蓝色烟雾一律保留，不要误删其他蓝色烟雾。","2.将图2中2号红圈范围内的左眼改成红色。红圈范围内除左眼以外的内容保持不变，其他相似内容不要误改。"]}',
+  '{"requirements":["1.务必只去除图2中1号红圈（最左侧）范围内的蓝色烟雾。画面中其他蓝色烟雾一律保留，不要误删其他蓝色烟雾。","2.将图2中2号红圈范围内的左眼改成红色。"]}',
 ].join('\n')
 
 const buildUserMessage = (instruction: string, anchors: ComposeAnchor[]): string => {
   const list = anchors
-    .map((anchor) => `圈${anchor.n}=${anchor.label || `目标${anchor.n}`}${anchor.position ? `（${anchor.position}）` : ''}`)
+    .map(
+      (anchor) =>
+        `圈${anchor.n}=${anchor.label || `目标${anchor.n}`}${anchor.position ? `（${anchor.position}）` : ''}` +
+        `[${anchor.hasDuplicate === false ? '画面中独一无二' : '画面别处有同类'}]`,
+    )
     .join('；')
   return `红圈：${list}。\n用户意图：${instruction}\n请按要求返回 JSON，requirements 数组恰好 ${anchors.length} 条。`
 }
@@ -89,11 +94,13 @@ const sanitizeAnchors = (raw: unknown): ComposeAnchor[] => {
   if (!Array.isArray(raw)) return []
   return raw
     .map((item, index) => {
-      const record = item as { n?: unknown; label?: unknown; position?: unknown }
+      const record = item as { n?: unknown; label?: unknown; position?: unknown; hasDuplicate?: unknown }
       const n = typeof record.n === 'number' && Number.isFinite(record.n) ? Math.round(record.n) : index + 1
       const label = typeof record.label === 'string' ? record.label.replace(/[\r\n]/g, ' ').trim().slice(0, 40) : ''
       const position = typeof record.position === 'string' ? record.position.trim().slice(0, 12) : undefined
-      return { n, label, position }
+      // 缺省/非 false 一律按 true（保守：带保护句）。
+      const hasDuplicate = record.hasDuplicate === false ? false : true
+      return { n, label, position, hasDuplicate }
     })
     .slice(0, 12)
 }

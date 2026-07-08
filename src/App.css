@@ -519,7 +519,9 @@ button:disabled {
 .toast-viewport {
   position: fixed;
   right: auto;
-  bottom: 44px;
+  /* 抬到主工具条(.canvas-tool-dock, bottom=--ai-panel-offset, 高约 52px)上方,
+     不再遮住工具按钮(2026-07-08 用户:mask armed 提示条挡住主工具条)。 */
+  bottom: calc(var(--ai-panel-offset, 14px) + 72px);
   left: 50%;
   z-index: 220;
   display: grid;
@@ -5749,9 +5751,39 @@ button:disabled {
   border-radius: 999px;
 }
 
+/* compose(GPT 整理提示词)/重绘中的按钮 busy 态：icon 呼吸,明示后台在干活。 */
+.image-mask-edit-submit.is-busy {
+  cursor: progress;
+  opacity: 0.75;
+}
+
+.image-mask-edit-submit.is-busy svg {
+  animation: mask-submit-busy-pulse 1s ease-in-out infinite;
+}
+
+@keyframes mask-submit-busy-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+
+  50% {
+    opacity: 0.35;
+    transform: scale(0.85);
+  }
+}
+
 .image-mask-edit-chip-caret {
+  /* 与标签文字垂直居中：压 line-height 到 1 并 flex 居中,「⌄」字形基线偏移不再顶高
+     (2026-07-08 用户:下拉箭头没对齐)。整个 chip 已是热区,箭头仅作视觉提示。 */
+  display: inline-flex;
+  align-items: center;
+  align-self: center;
   color: rgba(124, 92, 214, 0.7);
   font-size: 11px;
+  line-height: 1;
+  transform: translateY(-1px);
   cursor: pointer;
 }
 

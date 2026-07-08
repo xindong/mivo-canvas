@@ -13,6 +13,7 @@ import { runMaskBlackblockScenario } from './mask-blackblock.mjs'
 import { runMaskConcurrentScenario } from './mask-concurrent.mjs'
 import { runMaskCrossSceneScenario } from './mask-cross-scene.mjs'
 import { runMaskHydrationScenario } from './mask-hydration.mjs'
+import { runMaskMultiEditScenario } from './mask-multi-edit.mjs'
 import { runMaskPointScenario } from './mask-point.mjs'
 import { runMaskSourceDeleteScenario } from './mask-source-delete.mjs'
 import { runMarkupTextOverlayScenario } from './markup-text-overlay.mjs'
@@ -37,6 +38,7 @@ export const scenarioOrder = [
   'chat-generation',
   'chat-copy',
   'mask',
+  'mask-multi-edit',
   'migration',
   'anchor-mvp',
   'variations-annotation',
@@ -84,6 +86,7 @@ export const scenarioRunners = {
   'coordinate-probe': runCoordinateProbeScenario,
   debug: runDebugScenario,
   mask: runMaskScenario,
+  'mask-multi-edit': runMaskMultiEditScenario,
   'mask-blackblock': runMaskBlackblockScenario,
   'mask-concurrent': runMaskConcurrentScenario,
   'mask-cross-scene': runMaskCrossSceneScenario,

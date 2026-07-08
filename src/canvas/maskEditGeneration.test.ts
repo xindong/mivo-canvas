@@ -232,6 +232,7 @@ describe('runMaskEditGeneration cancel (FIX-1: DELETE the in-flight task)', () =
     sourceSize: { width: 200, height: 200 },
     maskBounds: { x: 10, y: 10, width: 50, height: 50 },
     quality: 'medium' as const,
+    model: 'gpt-image-2' as const, // 黑块自愈只对 gpt-image-2 挖洞路生效（2026-07-08）
   }
 
   it('abort during first-attempt poll → cancelTask DELETEs task-1 (not undefined/no-op)', async () => {
@@ -450,6 +451,7 @@ describe('runMaskEditGeneration callbacks + return value (SC-13)', () => {
         prompt: 'p',
         sourceSize: { width: 200, height: 200 },
         maskBounds: { x: 10, y: 10, width: 50, height: 50 },
+        model: 'gpt-image-2',
       } as never,
       imgRatio: '1:1' as never,
       signal: new AbortController().signal,
@@ -545,6 +547,7 @@ describe('runMaskEditGeneration onSelfHealRetry 时机 (F2)', () => {
         prompt: 'p',
         sourceSize: { width: 200, height: 200 },
         maskBounds: { x: 10, y: 10, width: 50, height: 50 },
+        model: 'gpt-image-2',
       } as never,
       imgRatio: '1:1' as never,
       signal: new AbortController().signal,
@@ -603,6 +606,8 @@ describe('runMaskEditGeneration 黑块自愈失败不 commit（黑块修复）',
     prompt: 'p',
     sourceSize: { width: 200, height: 200 },
     maskBounds: { x: 10, y: 10, width: 50, height: 50 },
+    // 黑块自愈只对 gpt-image-2 alpha-mask 挖洞路生效（2026-07-08）；gemini 双图路跳过。
+    model: 'gpt-image-2' as const,
   }
 
   it('① 第一次区域外黑 → 重试；第二次干净 → commit，且 commit payload 带 maskSourceSize', async () => {

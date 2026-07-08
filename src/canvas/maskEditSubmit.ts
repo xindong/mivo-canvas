@@ -49,11 +49,16 @@ export async function buildMaskEditSubmission({
   // 用原文当正文，绝不阻塞出图。整理结果 + 外壳 = 最终提示词，聊天卡片逐字展示。
   const anchorBounds = regions.map((region) => boundsForRegions([region], naturalSize) as ImageMaskBounds)
   const positions = anchorPositions(anchorBounds)
-  const composeAnchors = regions.map((region, index) => ({
-    n: index + 1,
-    label: recognitionLabel(recognitionsRef.current[regionKey(region)]) || `目标${index + 1}`,
-    position: positions[index],
-  }))
+  const composeAnchors = regions.map((region, index) => {
+    const rec = recognitionsRef.current[regionKey(region)]
+    return {
+      n: index + 1,
+      label: recognitionLabel(rec) || `目标${index + 1}`,
+      position: positions[index],
+      // 画面别处有无同类（识别步判定，缺省 true 保守）→ compose 据此决定加不加保护句。
+      hasDuplicate: rec?.hasDuplicate !== false,
+    }
+  })
   const composedBody = await composeMaskEditBody(body, composeAnchors)
   const finalPrompt = buildDualImagePrompt(composedBody ?? body)
   // 单图指认（Set-of-Mark）：把用户画的选区所见即所得地用红色画到全图副本上

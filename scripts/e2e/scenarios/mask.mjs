@@ -7,7 +7,7 @@
 //  SC-01 提交后 chat panel 立即出现 user prompt + assistant 卡片(enhancing→generating)
 //  SC-04 /tasks/edit prompt 内逐字嵌着用户原文(双图模板外壳内,无 LLM 增强)
 //  SC-10 成功后 chat 落 .chat-result-image（resultNodeIds[0]）；同场景不再只落 notice；画布 placeholder 原位替换
-//  SC-13 黑盘自愈：两次 /tasks/edit 不同 Idempotency-Key；期间 assistant 不出现 error；最终 done
+//  SC-13 gemini 深色/黑结果直落,不做黑块自愈(canInspect 仅 gpt-image-2);只一次 /tasks/edit,最终 done
 //  SC-19 chat×mask 并行取消隔离：点 mask 卡取消只 DELETE edit task，chat 卡仍 generating
 //
 // #90 IDB harness: 用 waitForPersistedKv 读 persisted chat state，禁止 localStorage 断言。
@@ -239,9 +239,13 @@ export const runMaskScenario = async (context) => {
     throw new Error(`SC-01: /enhance should not be called for mask edit (2026-07-07 decision: no prompt enhancement), got ${enhanceCallCount} calls`)
   }
 
-  // ── SC-13: 黑盘自愈重试 ──
-  // mock 第一次 done 返黑盘，第二次返正常图。断言两次 /tasks/edit 不同 Idempotency-Key，
-  // 期间 assistant 不出现 error，DOM 仍 generating；最终 done。
+  // ── SC-13: gemini 深色/黑结果直落，不做黑块自愈（不误报重试循环） ──
+  // 2026-07-08 用户实测「深色图出不了图」根因:近黑连通块检测在 gemini 整图重生成的深色
+  // 内容上纯误报,触发本不该有的 self-heal 循环。修复:黑块自愈只对 gpt-image-2 的
+  // alpha-mask 挖洞路生效(maskEditGeneration.ts canInspect gate),gemini 路跳过检测、
+  // 结果照常 commit。gpt-image-2 的自愈重试逻辑由 maskEditGeneration.test.ts 单测覆盖。
+  // 本 SC 守护「gemini 返黑不触发第二次 /tasks/edit」——即那个 bug 不回归。UI 无模型选择
+  // 器,mask edit 只能提交 gemini(maskEditDefaultModel),故此路无法从 UI 触发 gpt 自愈。
   const blackPlateB64 = await page.evaluate(() => {
     const canvas = document.createElement('canvas')
     canvas.width = 8
@@ -255,16 +259,13 @@ export const runMaskScenario = async (context) => {
   if (!blackPlateB64) throw new Error('Unable to synthesize black-plate b64 for SC-13')
 
   const blackPlateEditTaskIds = []
-  const blackPlateIdempotencyKeys = []
   await page.unroute('**/api/mivo/tasks/edit')
   await page.route('**/api/mivo/tasks/edit', async (route) => {
     const taskId = `task-black-${blackPlateEditTaskIds.length + 1}`
     blackPlateEditTaskIds.push(taskId)
-    blackPlateIdempotencyKeys.push(route.request().headers()['idempotency-key'] || '')
     await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ taskId }) })
   })
 
-  let blackPlateGetCall = 0
   await page.unroute('**/api/mivo/tasks/*')
   await page.route('**/api/mivo/tasks/*', async (route) => {
     const method = route.request().method()
@@ -273,14 +274,11 @@ export const runMaskScenario = async (context) => {
       return
     }
     if (method !== 'GET') { await route.fallback(); return }
-    blackPlateGetCall += 1
-    const view = blackPlateGetCall === 1
-      ? doneTaskView([{ b64: blackPlateB64 }])
-      : doneTaskView([{ b64: generatedImageB64 }])
-    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(view) })
+    // 每次 GET 都返黑盘 done。gemini 不检测黑块 → 应原样 commit,不触发第二次 edit。
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(doneTaskView([{ b64: blackPlateB64 }])) })
   })
 
-  // 重置场景，触发黑盘 self-heal。
+  // 重置场景，提交一张会返回黑盘结果的 gemini 局部重绘。
   await page.evaluate(async (moduleSpec) => {
     const { useCanvasStore } = await import(moduleSpec)
     useCanvasStore.getState().loadScene('character-flow')
@@ -290,38 +288,23 @@ export const runMaskScenario = async (context) => {
   await openMaskEditorOn('ref-hero')
   await drawPointRegion()
   await page.waitForFunction(() => Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0') > 0)
-  await fillMaskPrompt(page, 'E2E black-plate self-heal')
+  await fillMaskPrompt(page, 'E2E gemini dark-result no-selfheal')
   await page.locator('.image-mask-edit-prompt').getByRole('button', { name: '局部重绘' }).click()
   await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
   await ensureChatPanelOpen(page)
 
-  // SC-13: 两次 /tasks/edit POST，不同 Idempotency-Key，不同 taskId。
-  await waitForCondition(() => blackPlateEditTaskIds.length >= 2, { timeout: 8000 })
-  if (blackPlateEditTaskIds[0] === blackPlateEditTaskIds[1]) {
-    throw new Error(`SC-13: retry should produce a different taskId, got ${JSON.stringify(blackPlateEditTaskIds)}`)
-  }
-  if (!blackPlateIdempotencyKeys[0] || !blackPlateIdempotencyKeys[1]) {
-    throw new Error(`SC-13: each /tasks/edit must carry an Idempotency-Key header, got ${JSON.stringify(blackPlateIdempotencyKeys)}`)
-  }
-  if (blackPlateIdempotencyKeys[0] === blackPlateIdempotencyKeys[1]) {
-    throw new Error(`SC-13: self-heal retry must use a different Idempotency-Key (dedupe), got duplicate ${JSON.stringify(blackPlateIdempotencyKeys)}`)
-  }
-
-  // SC-13: self-heal 期间 assistant 不出现 status:'error'，DOM 仍 generating/cancel。
-  // 在第一次黑盘 done 之后、第二次重试期间取样 chat state。
-  // 等 first done 已经被消费、重试已经开始（blackPlateGetCall >= 1 之后）。
-  await waitForCondition(() => blackPlateGetCall >= 1, { timeout: 5000 })
-  // 重试期间取样：assistant 不应为 error。
-  const retryState = await readLastAssistantState(page, chatStoreSpec)
-  if (!retryState || retryState.status === 'error') {
-    throw new Error(`SC-13: assistant should stay in-flight during self-heal retry, got: ${JSON.stringify(retryState)}`)
-  }
-
-  // 最终 done。
+  // 至少一次 /tasks/edit POST 落地。
+  await waitForCondition(() => blackPlateEditTaskIds.length >= 1, { timeout: 8000 })
+  // gemini 路应原样 commit → assistant done，结果图落地（不因黑块误报卡在 in-flight）。
   await page.waitForSelector('.chat-message-assistant .chat-result-image', { timeout: 10000 })
   const blackDoneState = await readLastAssistantState(page, chatStoreSpec)
   if (!blackDoneState || blackDoneState.status !== 'done') {
-    throw new Error(`SC-13: assistant should be done after self-heal, got: ${JSON.stringify(blackDoneState)}`)
+    throw new Error(`SC-13: gemini dark result should commit as done (no self-heal), got: ${JSON.stringify(blackDoneState)}`)
+  }
+  // 关键回归守护:gemini 不做黑块自愈 → 只应有一次 /tasks/edit,绝不因误报触发重试循环。
+  await new Promise((r) => setTimeout(r, 300))
+  if (blackPlateEditTaskIds.length !== 1) {
+    throw new Error(`SC-13: gemini must NOT self-heal-retry on dark result (expected exactly 1 /tasks/edit), got ${JSON.stringify(blackPlateEditTaskIds)}`)
   }
 
   // ── SC-W2②: cancel/failed 三态 —— placeholder 回滚，无新 image node ──

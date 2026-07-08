@@ -197,27 +197,19 @@ export function useMaskRichEditor({
     onCancel()
   }
 
-  // 点 chip 切换箭头 → 展开/收起该锚点的候选卡；点 chip 主体 → 整体选中（可复制/删除/粘贴调序）。
+  // 2026-07-08 用户：整个 chip 都是候选卡热区（不只右侧箭头）——点 chip 任意处
+  // 展开/收起该锚点的卡；点另一个 chip 直接切换到它的卡；点正文/空白则收起卡
+  // （不拦截光标定位，正常打字）。chip 的整体选中改由拖选覆盖（is-selected 逻辑不变）。
   const handleEditorClick = (event: ReactMouseEvent<HTMLDivElement>) => {
     const target = event.target as HTMLElement | null
-    const caret = target?.closest('[data-caret-key]') as HTMLElement | null
-    if (caret) {
-      event.preventDefault()
-      const key = caret.getAttribute('data-caret-key') as string
-      setOpenChipKey((current) => (current === key ? null : key))
-      return
-    }
     const chip = target?.closest(`[${anchorKeyAttr}]`) as HTMLElement | null
     if (chip && editorRef.current?.contains(chip)) {
       event.preventDefault()
-      const selection = window.getSelection()
-      if (selection) {
-        const range = document.createRange()
-        range.selectNode(chip)
-        selection.removeAllRanges()
-        selection.addRange(range)
-      }
+      const key = chip.getAttribute(anchorKeyAttr) as string
+      setOpenChipKey((current) => (current === key ? null : key))
+      return
     }
+    setOpenChipKey(null)
   }
 
   // chip 选中态：原生选区盖到 chip 上时打 is-selected。

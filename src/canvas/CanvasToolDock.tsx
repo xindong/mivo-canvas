@@ -107,7 +107,7 @@ export function CanvasToolDock({ previewTool, onStartMaskEdit, maskArmed = false
                 }}
                 disabled={!onStartMaskEdit}
                 aria-label="局部重绘"
-                title={selectedImageNodeId ? '局部重绘' : '点击图片上要修改的位置'}
+                title={selectedImageNodeId ? '局部重绘' : '点击图片，标出要修改的位置'}
               >
                 <MaskPointIcon size={20} />
               </button>
