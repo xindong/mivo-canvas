@@ -3,9 +3,12 @@
 // app 不做 OAuth。本文件仅提供 **dev 桩** /api/auth/me:无网关时让本地 dev / e2e 进
 // 已登录态,测"缺 key 自动弹面板"等已登录流程。
 //
-// 生产环境桩不生效(双保险,参考 A-3 思路):
-//   1. NODE_ENV=production → 硬关(即便误设 MIVO_DEV_AUTH_STUB=1 也仍关,NODE_ENV 优先);
-//   2. 生产由网关盖过 /api/auth/me(nginx 拦截),本路由根本走不到。
+// 桩默认关(opt-in):MIVO_DEV_AUTH_STUB=1 && NODE_ENV !== 'production' && MIVO_PUBLIC !== '1'
+// 才开(纯函数见 server/lib/auth-stub.ts,启动日志共用同一函数)。生产环境桩不生效
+// (三重保险):
+//   1. MIVO_DEV_AUTH_STUB 默认不设 → 关(防"生产忘设 NODE_ENV 就返假登录 dev@local");
+//   2. NODE_ENV=production → 硬关(即便误设 stub=1 也仍关);
+//   3. MIVO_PUBLIC=1 → 关(public 部署身份只由网关提供)。
 // 走到本路由且桩关 = 无网关 misconfig → 返 401 {detail:"Not authenticated"}(对齐网关
 // 未登录语义),前端按未登录处理。
 //
@@ -15,17 +18,12 @@
 //               "is_admin":false,"services":[...,"mivo_canvas"]}
 import { Hono } from 'hono'
 import type { AppEnv } from '../lib/types'
+import { isDevStubActive } from '../lib/auth-stub'
 
 export const authRoute = new Hono<AppEnv>()
 
-// dev 桩门控:生产(NODE_ENV=production)硬关;dev/test 默认开,可 MIVO_DEV_AUTH_STUB=0 显式关。
-const isDevStubActive = (): boolean => {
-  if (process.env.NODE_ENV === 'production') return false
-  if (process.env.MIVO_DEV_AUTH_STUB === '0') return false
-  return true
-}
-
 // GET /api/auth/me — 生产由网关提供;dev 桩返假已登录用户(字段对齐网关契约)。
+// 桩门控纯函数见 server/lib/auth-stub.ts(server/index.ts 启动日志共用)。
 authRoute.get('/me', (c) => {
   if (!isDevStubActive()) {
     return c.json({ detail: 'Not authenticated' }, 401)

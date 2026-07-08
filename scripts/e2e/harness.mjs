@@ -250,7 +250,6 @@ export const startSmokeBffServer = ({
   localAssetFixtureDir,
   eagleMockPort,
   upstreamBaseUrl,
-  bffToken,
   debugViewToken,
   enableLocalAssets,
   enableEagleProxy,
@@ -261,7 +260,12 @@ export const startSmokeBffServer = ({
     env: {
       ...process.env,
       MIVO_PORT: String(port),
-      ...(isPublic ? { MIVO_PUBLIC: '1', MIVO_BFF_TOKEN: bffToken } : {}),
+      // P1-b: dev stub is now opt-in (MIVO_DEV_AUTH_STUB=1 && non-prod && non-public).
+      // e2e local topology (isPublic=false) needs the stub ON so /api/auth/me returns
+      // the fake logged-in user for auto-prompt/userchip scenarios. Under isPublic=true
+      // (MIVO_PUBLIC=1) the stub is force-off regardless — harmless there.
+      MIVO_DEV_AUTH_STUB: '1',
+      ...(isPublic ? { MIVO_PUBLIC: '1' } : {}),
       MIVO_ASSET_DIR: localAssetFixtureDir,
       MIVO_EAGLE_API_URL: `http://127.0.0.1:${eagleMockPort}`,
       MIVO_DEBUG_LOG_DIR: path.resolve('test-artifacts/debug-logs'),

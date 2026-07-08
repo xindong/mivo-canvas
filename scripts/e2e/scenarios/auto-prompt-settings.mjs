@@ -1,8 +1,9 @@
 // E2E scenario: first-login missing-key auto-prompt (logged-in) + unauthenticated prompt.
 //
 // Flow 1 (logged-in): dev BFF's /api/auth/me stub returns a fake logged-in user
-// (NODE_ENV != production → stub active) + fresh IDB has no keys → AutoPrompt
-// opens the panel to the API Keys section; closing it suppresses re-prompt.
+// (P1-b opt-in: harness sets MIVO_DEV_AUTH_STUB=1 + non-prod + non-public → stub
+// active) + fresh IDB has no keys → AutoPrompt opens the panel to the API Keys
+// section; closing it suppresses re-prompt.
 //
 // Flow 2 (unauthenticated): mock /api/auth/me → 401 → AutoPrompt opens the panel
 // to the ACCOUNT section (which shows a 「登录」 button — user clicks it to go to SSO,

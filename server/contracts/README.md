@@ -63,7 +63,7 @@ npm run contract:diff -- --target=http://127.0.0.1:8080 --group=debug-logs
 ### P1-c 工作流(以 debug-logs 组为例)
 
 ```bash
-# 1. 起 BFF(本地模式,无 MIVO_BFF_TOKEN;配 debug view token 与基线一致)
+# 1. 起 BFF(本地模式,只听 127.0.0.1;配 debug view token 与基线一致)
 MIVO_DEBUG_VIEW_TOKEN=test-token MIVO_DEBUG_LOG_DIR=/tmp/mivo-logs \
   MIVO_PORT=8080 npm run start:server &
 

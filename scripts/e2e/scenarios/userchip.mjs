@@ -1,7 +1,8 @@
 // E2E scenario: UserChip (sidebar bottom) — the settings entry.
 // SSO scheme: production forces login (gateway), so a user reaching the app is
 // already authenticated. In dev e2e the BFF's /api/auth/me stub returns a fake
-// logged-in user → UserChip shows the chip (initial-avatar + display_name).
+// logged-in user (P1-b opt-in: harness sets MIVO_DEV_AUTH_STUB=1) → UserChip shows
+// the chip (initial-avatar + display_name).
 // Clicking it opens the settings panel (which has the account/logout section).
 // The unauthenticated "Log In" path (→ SSO gateway redirect) can't be exercised
 // in local e2e (redirect leaves the app), so we assert the logged-in chip flow.
