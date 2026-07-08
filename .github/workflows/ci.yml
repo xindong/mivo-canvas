@@ -1,7 +1,8 @@
 # MivoCanvas CI — P1-f phase 2
 #
 # PR 基线: lint + tsc + 单元测试 + 日志规则守卫 + 结构守卫(防回潮)
-# + prod 真拓扑 e2e(mock upstream) + SSO 模型 auth-gated matrix(public/local)。
+# + prod 真拓扑 e2e(mock upstream) + e2e token gate matrix(authorized/unauthorized,
+# SSO 新模型语义,job 名固定以匹配 main 分支保护 required checks)。
 # 对应 productization-roadmap.md §6.2 P1-f 与 §13 SC5.2。
 #
 # secret-scan 已移至独立 workflow .github/workflows/secret-scan.yml(直推 main,
@@ -123,17 +124,23 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  e2e-auth-gated:
-    name: e2e auth-gated (${{ matrix.mode }})
+  e2e-token-gated:
+    name: e2e token gate (${{ matrix.mode }})
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     strategy:
       fail-fast: false
       matrix:
+        # mode 名必须保持 authorized/unauthorized —— main 分支保护的 required status
+        # checks 写死为 `e2e token gate (authorized)` / `e2e token gate (unauthorized)`
+        # (enforce_admins=true),改名会让这两个必需 check 永不上报,PR 合不了。
+        # 逻辑用 SSO 新模型(非旧 app-gate/BFF-token),mode 名映射:
+        #   unauthorized → MIVO_PUBLIC=1(dev 桩关)→ /api/auth/me 401(SSO 下"未登录")
+        #   authorized   → dev 桩开(local)→ /api/auth/me 200 + 网关契约 shape
         mode:
-          - public
-          - local
+          - authorized
+          - unauthorized
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -147,20 +154,18 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # SSO 模型下 HTTP-可验安全属性(纯 fetch,无需 Playwright / 构建产物):
-      #   public — MIVO_PUBLIC=1 → dev 桩硬关(/api/auth/me 401)+ feature flag 收紧(404/403)
-      #   local  — 非 public + MIVO_DEV_AUTH_STUB=1 → dev 桩开(/api/auth/me 200 + 网关契约 shape)
-      - name: Run auth-gated check
+      # SSO 模型下 HTTP-可验安全属性(纯 fetch,无需 Playwright / 构建产物)。
+      - name: Run gated check
         run: |
           set -o pipefail
           mkdir -p test-artifacts
-          node scripts/e2e-gated-check.mjs --mode=${{ matrix.mode }} 2>&1 | tee test-artifacts/e2e-auth-gated-${{ matrix.mode }}.log
+          node scripts/e2e-gated-check.mjs --mode=${{ matrix.mode }} 2>&1 | tee test-artifacts/e2e-token-gated-${{ matrix.mode }}.log
 
       - name: Upload failing gated artifacts
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-auth-gated-${{ matrix.mode }}-artifacts
+          name: e2e-token-gated-${{ matrix.mode }}-artifacts
           path: test-artifacts
           if-no-files-found: warn
           retention-days: 14
