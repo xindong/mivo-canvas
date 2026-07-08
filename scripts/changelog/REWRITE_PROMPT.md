@@ -16,7 +16,7 @@
 2. **禁代码词**:禁止出现函数名、文件名、组件名、hook、store、IPC、渲染引擎名、工具链名等**一切代码词汇**。脚本有一份代码术语黑名单(preflight / CI / tsc / lint / hook / CRUD / BFF / Basic Auth / API / prompt / token / refactor / commit / merge / npm / vite / react / zustand / leafer / tsx / oauth / proxy / e2e / playwright / vitest / typecheck / squash / workflow / sha / hash / cache / async / component / props / dispatch / schema / http / url / cors / auth / session / cookie / endpoint / route / handler / node / env …),命中即整份拒绝。中文口语化文本不应出现这些英文词。
 3. **一条一变化**:一条只写一个用户可感知的变化。一个 PR 可拆成多条,多个 PR 也可合并成一条。
 4. **写感知不写实现**:写"画布上的坐标钉图标统一了样式",**不写**"统一 pin icon 渲染组件";写"局部重绘能在图上圈选区域改图",**不写**"mask edit overlay 接入"。
-5. **`by` 字段**:每条填该 PR 落地 commit 的 git 作者名(即 `<scan>` 里每条的 `author`)。一个 PR 拆出的多条 `by` 相同;多个 PR 合并成的一条,`by` 取**主 PR**(贡献该条变化最多的那个)的 `author`。
+5. **`by` 字段**:每条填该 PR 的作者(即 `<scan>` 里每条 `item.author`,由 scan 从 `gh pr view --json author` 的 PR opener 取;gh 取不到时 scan 已降级到 `^2`/`%an`)。一个 PR 拆出的多条 `by` 相同;多个 PR 合并成的一条,`by` 取**主 PR**(贡献该条变化最多的那个)的 `author`。不要自己编作者名,直接用 scan 给的。
 
 ## 必须满足的硬约束(脚本会校验)
 

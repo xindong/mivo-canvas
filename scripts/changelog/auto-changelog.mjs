@@ -230,7 +230,8 @@ const cmdScan = (args) => {
       pr = Number(squash[1])
     } else if (merge) {
       pr = Number(merge[1])
-      // merge 形态作者另取被合并分支作者(<merge>^2);取不到则回退 %an
+      // merge 形态:git 侧回退作者取被合并分支 tip 作者(<merge>^2),作为
+      // PR opener(gh)取不到时的降级值(squash 形态无 ^2,直接用 %an)
       const branchAuthor = runGit(['log', '-1', '--format=%an', `${hash}^2`], { allowFail: true })
       if (branchAuthor) author = branchAuthor
     } else {
@@ -246,12 +247,17 @@ const cmdScan = (args) => {
 
     const day = toChangelogDay(cI)
 
-    // PR body:gh pr view N --json body,失败降级空串不阻断
+    // by 字段降级链:PR opener(gh author.login,最贴合"这个功能谁做的") →
+    //   ^2 作者(merge 形态分支 tip) / %an(squash)。gh 一次取 body+author,
+    //   零额外网络开销;gh 失败则沿用上面算好的 git 作者。
     let body = ''
-    const bodyJson = runGh(['pr', 'view', String(pr), '--json', 'body'], { allowFail: true })
-    if (bodyJson) {
+    const prJson = runGh(['pr', 'view', String(pr), '--json', 'body,author'], { allowFail: true })
+    if (prJson) {
       try {
-        body = JSON.parse(bodyJson).body || ''
+        const pv = JSON.parse(prJson)
+        body = pv.body || ''
+        const opener = pv.author && pv.author.login
+        if (opener) author = opener
       } catch {
         body = ''
       }
@@ -478,7 +484,7 @@ ${newItemsSummary}
       `PREFLIGHT_SKIP=1 git -C ${wtPath} push -u origin ${branch}`,
       `gh pr create --title "${prTitle}" --body "<新增条目清单>"`,
       `# 轮询 CI:gh pr checks <N> --json name,state,每 30s,上限 30 分钟;fail 中止,head 落后先 gh pr update-branch <N>`,
-      `# merge 前铁律:分支名 ^chore/changelog-;files 仅 public/changelog.json;checks 全 pass;mergeable=MERGEABLE`,
+      `# merge 前铁律:分支名 ^chore/changelog-;files 仅 public/changelog.json;checks 全 pass;mergeable=MERGEABLE(UNKNOWN 重试 6×10s)`,
       `gh pr merge <N> --squash`,
       `git push origin --delete ${branch}`,
       `git worktree remove --force ${wtPath}`,
@@ -595,8 +601,8 @@ ${newItemsSummary}
           }
         }
       }
-      // head 落后基线 → update-branch 后继续等
-      const prView = runGh(['pr', 'view', String(prNumber), '--json', 'mergeable', 'statusCheckRollup'], { cwd: wtPath, allowFail: true })
+      // head 落后基线 → update-branch 后继续等(只取 mergeable 一个字段)
+      const prView = runGh(['pr', 'view', String(prNumber), '--json', 'mergeable'], { cwd: wtPath, allowFail: true })
       if (prView) {
         try {
           const pv = JSON.parse(prView)
@@ -615,7 +621,8 @@ ${newItemsSummary}
     }
 
     // ---- merge 前铁律校验(全部写死为 if)----
-    const mergeView = runGh(['pr', 'view', String(prNumber), '--json', 'files', 'mergeable', 'headRefName'], { cwd: wtPath })
+    // gh --json 只接受一个逗号连接的参数(多 arg 会报 "accepts at most 1 arg")
+    const mergeView = runGh(['pr', 'view', String(prNumber), '--json', 'files,mergeable,headRefName'], { cwd: wtPath })
     let mv
     try {
       mv = JSON.parse(mergeView)
@@ -639,10 +646,24 @@ ${newItemsSummary}
       cleanup()
       fail('铁律违反:PR 无文件改动(预期含 public/changelog.json)')
     }
-    // ③ mergeable=MERGEABLE
-    if (mv.mergeable !== 'MERGEABLE') {
+    // ③ mergeable=MERGEABLE;刚算完 CI 时该字段常短暂为 UNKNOWN(GitHub 异步),
+    //   重试最多 6 次/间隔 10s;CONFLICTING 等其他非 MERGEABLE 值立即 fail 不重试
+    let mergeable = mv.mergeable
+    for (let attempt = 0; attempt < 6 && mergeable === 'UNKNOWN'; attempt += 1) {
+      process.stderr.write(`[auto-changelog] mergeable=UNKNOWN,等 10s 重试(${attempt + 1}/6)...\n`)
+      await new Promise((r) => setTimeout(r, 10_000))
+      const retryJson = runGh(['pr', 'view', String(prNumber), '--json', 'mergeable'], { cwd: wtPath, allowFail: true })
+      if (retryJson) {
+        try {
+          mergeable = JSON.parse(retryJson).mergeable
+        } catch {
+          /* 保持 UNKNOWN,继续重试 */
+        }
+      }
+    }
+    if (mergeable !== 'MERGEABLE') {
       cleanup()
-      fail(`铁律违反:mergeable=${mv.mergeable}(需 MERGEABLE)`)
+      fail(`铁律违反:mergeable=${mergeable}(需 MERGEABLE;${mergeable === 'UNKNOWN' ? '已重试 6 次仍 UNKNOWN' : '非 MERGEABLE 立即拒绝'})`)
     }
     // ④ checks 全 pass(再确认一次)
     const finalChecksJson = runGh(['pr', 'checks', String(prNumber), '--json', 'name,state'], { cwd: wtPath })

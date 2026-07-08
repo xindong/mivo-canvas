@@ -51,7 +51,7 @@ node scripts/changelog/auto-changelog.mjs publish --rewrite /tmp/mivo-changelog-
 3. `git checkout -b chore/changelog-<最大结算日>` → commit(`chore: 更新日志补扫 <日期>`)→ `PREFLIGHT_SKIP=1 git push -u origin <branch>`;
 4. `gh pr create`;
 5. 轮询 CI(`gh pr checks <N> --json name,state`,每 30s,上限 30 分钟);head 落后先 `gh pr update-branch`;
-6. **merge 前铁律**(全写死):分支名匹配 `^chore/changelog-`;PR files 仅含 `public/changelog.json`;checks 全 pass;`mergeable=MERGEABLE`。全过才 `gh pr merge --squash`;
+6. **merge 前铁律**(全写死):分支名匹配 `^chore/changelog-`;PR files 仅含 `public/changelog.json`;checks 全 pass;`mergeable=MERGEABLE`(刚算完 CI 时该字段常短暂为 `UNKNOWN`,重试 6 次/10s 仍非 MERGEABLE 才 fail;`CONFLICTING` 等立即 fail)。全过才 `gh pr merge --squash`;
 7. 收尾:`git push origin --delete <branch>` + `git worktree remove --force`(失败路径也清,trap)。
 
 **退出码**:
