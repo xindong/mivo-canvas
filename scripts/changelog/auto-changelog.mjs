@@ -117,7 +117,7 @@ const runGh = (args, opts = {}) => {
       cwd: opts.cwd ?? REPO_ROOT,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: opts.env,
+      env: opts.env ? { ...process.env, ...opts.env } : process.env,
     }).trimEnd()
   } catch (err) {
     if (opts.allowFail) return null
@@ -753,7 +753,7 @@ const main = async () => {
   if (argv.length === 0) {
     process.stderr.write('用法:\n')
     process.stderr.write('  node scripts/changelog/auto-changelog.mjs scan [--anchor <hash>] [--output <path>] [--no-fetch]\n')
-    process.stderr.write('  node scripts/changelog/auto-changelog.mjs publish --rewrite <path> [--scan <path>] [--dry-run] [--no-fetch]\n')
+    process.stderr.write('  node scripts/changelog/auto-changelog.mjs publish --rewrite <path> [--scan <path>] [--dry-run]\n')
     process.exit(2)
   }
   const sub = argv[0]
