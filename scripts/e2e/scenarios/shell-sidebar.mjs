@@ -212,23 +212,25 @@ export const runShellSidebarScenario = async (context) => {
 
   const debugLogButton = page.getByRole('button', { name: 'Debug Log', exact: true })
   if ((await debugLogButton.count()) !== 1) {
-    throw new Error('Project sidebar should expose one Debug Log button above Settings')
+    throw new Error('Project sidebar should expose one Debug Log button above the user chip')
   }
   const debugLogPlacement = await page.evaluate(() => {
     const debugLog = document.querySelector('[aria-label="Debug Log"]')?.getBoundingClientRect()
-    const settings = document.querySelector('[aria-label="Settings"]')?.getBoundingClientRect()
+    // F2: old Settings button deleted; the sidebar bottom entry is now UserChip
+    // (stub auth → "Log In" row). Pin placement against the user chip, not Settings.
+    const userChip = document.querySelector('[aria-label="Log in"]')?.getBoundingClientRect()
 
     return {
       debugBottom: debugLog?.bottom,
-      settingsTop: settings?.top,
+      userChipTop: userChip?.top,
     }
   })
   if (
     typeof debugLogPlacement.debugBottom !== 'number' ||
-    typeof debugLogPlacement.settingsTop !== 'number' ||
-    debugLogPlacement.debugBottom > debugLogPlacement.settingsTop
+    typeof debugLogPlacement.userChipTop !== 'number' ||
+    debugLogPlacement.debugBottom > debugLogPlacement.userChipTop
   ) {
-    throw new Error(`Debug Log should sit directly above Settings: ${JSON.stringify(debugLogPlacement)}`)
+    throw new Error(`Debug Log should sit directly above the user chip: ${JSON.stringify(debugLogPlacement)}`)
   }
   const initialDebugBadges = await debugLogButton.evaluate((button) => ({
     warnings: button.querySelectorAll('.debug-log-badge.warning').length,
@@ -462,23 +464,16 @@ export const runShellSidebarScenario = async (context) => {
     throw new Error('Debug Log modal should close from its close button')
   }
 
-  await page.getByRole('button', { name: 'Settings' }).click()
-  if ((await page.getByRole('menu', { name: 'Settings menu' }).count()) !== 1) {
-    throw new Error('Settings should expand into an inline menu')
-  }
-  for (const item of ['Preferences', 'Appearance', 'Keyboard shortcuts', 'Theme', 'Help and feedback']) {
-    if ((await page.getByRole('menuitem', { name: item }).count()) !== 1) {
-      throw new Error(`Settings menu should include: ${item}`)
-    }
-  }
-  await page.getByRole('menuitem', { name: 'Preferences' }).click()
-  await page.waitForFunction(() => document.querySelector('[aria-label="Debug Log"] .debug-log-badge.warning')?.textContent?.trim() === '1')
-  const settingsRowDisplay = await page.getByRole('button', { name: 'Settings' }).evaluate((row) => ({
+  // F2: old Settings menu + its 5 menuitems were deleted (replaced by UserChip).
+  // The menu-interaction assertions (expand / Preferences / warn-on-click) are
+  // covered by userchip.mjs; here we only pin the user-chip row's grid layout so
+  // the sidebar bottom row keeps its icon/text horizontal arrangement.
+  const loginRowDisplay = await page.getByRole('button', { name: 'Log in' }).evaluate((row) => ({
     display: window.getComputedStyle(row).display,
     columns: window.getComputedStyle(row).gridTemplateColumns,
   }))
-  if (settingsRowDisplay.display !== 'grid' || settingsRowDisplay.columns.split(' ').length < 3) {
-    throw new Error(`Settings row should keep icon/text in a horizontal layout: ${JSON.stringify(settingsRowDisplay)}`)
+  if (loginRowDisplay.display !== 'grid' || loginRowDisplay.columns.split(' ').length < 3) {
+    throw new Error(`User chip Log In row should keep icon/text in a horizontal grid layout: ${JSON.stringify(loginRowDisplay)}`)
   }
   const sidebarTypeScale = await page.evaluate(() => {
     const navRow = document.querySelector('.project-sidebar .nav-row')
@@ -492,7 +487,6 @@ export const runShellSidebarScenario = async (context) => {
   if (sidebarTypeScale.navRowFontSize !== '13px' || sidebarTypeScale.canvasRowFontSize !== '13px') {
     throw new Error(`Sidebar rows should use the compact tool typography scale: ${JSON.stringify(sidebarTypeScale)}`)
   }
-  await page.getByRole('button', { name: 'Settings' }).click()
 
   // 画布 "..." 选项菜单(Rename/Duplicate/Delete/Copy·Export·Import JSON)随药丸一并移除,
   // 原 canvas options 菜单断言块删除(功能损失已在交付报告中显式列出)。

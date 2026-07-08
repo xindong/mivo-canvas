@@ -15,6 +15,7 @@
 import { Hono } from 'hono'
 import type { HttpBindings } from '@hono/node-server'
 import { defaultMivoImageModel } from '../lib/config'
+import { rejectInvalidMivoApiKey } from '../lib/keys'
 import { generateAreaMaskPng, type MaskSize, type NormalizedMaskBounds } from '../lib/maskPng'
 import {
   firstMultipartField,
@@ -41,6 +42,12 @@ tasksRoute.post('/generate', async (c) => {
   const requestId = newRequestId()
   c.header('X-Request-Id', requestId)
   const t0 = Date.now()
+  // F4: reject malformed X-Mivo-Api-Key at the boundary (no env fallback).
+  const badMivoKey = rejectInvalidMivoApiKey(c)
+  if (badMivoKey) {
+    logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'bad-mivo-key' })
+    return badMivoKey
+  }
   let body: GenerateBody
   try {
     body = await readJsonBody<GenerateBody>(c)
@@ -56,6 +63,7 @@ tasksRoute.post('/generate', async (c) => {
   }
   const model = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : defaultMivoImageModel
   const idempotencyKey = c.req.header('idempotency-key') || undefined
+  const platformKey = c.req.header('x-mivo-api-key')?.trim() || undefined
   const { record, created } = createTask('generate', model, requestId, idempotencyKey)
   // P1 fix (rev-behavior): only launch the runner on first creation. A repeat
   // submission with the same Idempotency-Key returns the existing task
@@ -64,7 +72,7 @@ tasksRoute.post('/generate', async (c) => {
   if (created) {
     // Fire-and-forget: the runner records progress/result into the registry. The
     // .catch is a safety net only — the runner catches internally.
-    void runGenerateTask(record.id, { prompt, imgRatio: body.imgRatio, quality: body.quality, model: body.model, n: body.n }).catch((err) => {
+    void runGenerateTask(record.id, { prompt, imgRatio: body.imgRatio, quality: body.quality, model: body.model, n: body.n, platformKey }).catch((err) => {
       failTask(record.id, err instanceof Error ? err.message : 'runner crashed')
     })
   }
@@ -76,6 +84,12 @@ tasksRoute.post('/edit', async (c) => {
   const requestId = newRequestId()
   c.header('X-Request-Id', requestId)
   const t0 = Date.now()
+  // F4: reject malformed X-Mivo-Api-Key at the boundary (no env fallback).
+  const badMivoKey = rejectInvalidMivoApiKey(c)
+  if (badMivoKey) {
+    logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'bad-mivo-key' })
+    return badMivoKey
+  }
   let parsed: { fields: Map<string, string[]>; files: Map<string, File[]> }
   try {
     parsed = await parseMultipartBody(c)
@@ -143,6 +157,7 @@ tasksRoute.post('/edit', async (c) => {
     }
   }
 
+  const platformKey = c.req.header('x-mivo-api-key')?.trim() || undefined
   const { record, created } = createTask('edit', modelField, requestId, idempotencyKey)
   // P1 fix: only launch the runner on first creation (see /generate).
   if (created) {
@@ -161,6 +176,7 @@ tasksRoute.post('/edit', async (c) => {
       subjectLabel: firstMultipartField(fields, 'subjectLabel'),
       subjectsJson: firstMultipartField(fields, 'subjects'),
       markedImage: multipartFiles(files, 'markedImage')[0],
+      platformKey,
     }).catch((err) => {
       failTask(record.id, err instanceof Error ? err.message : 'runner crashed')
     })

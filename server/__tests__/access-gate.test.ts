@@ -1,14 +1,15 @@
 // @vitest-environment node
 // server/__tests__/access-gate.test.ts
-// Access gate (issue #136): when MIVO_BFF_TOKEN is set, the gate must accept
-// HTTP Basic Auth (browser-native login prompt) in addition to the existing
-// Bearer + X-Mivo-Bff-Token header paths, and return WWW-Authenticate: Basic on
-// 401 so browsers pop the native login dialog for GET / (which cannot attach
-// custom headers). Drives the real BFF (app + @hono/node-server); no mock
-// upstream is needed because the gate runs before any route handler — for the
-// "allowed" cases we only assert the gate did NOT return 401 (the downstream
-// serveStatic/SPA-fallback response is irrelevant to the gate contract).
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest'
+// feat/auth-feishu-login (F7): gate scope narrowed to AI/生图/资产-class APIs.
+//   - public  : GET /, /healthz, /api/auth/* (whitelist), canvas-local/static/SPA
+//   - guarded : /api/mivo/{generate,edit,enhance,tasks}/* + /api/keys/* (E2)
+//   - accept  : mivo_auth JWT cookie (primary) OR MIVO_BFF_TOKEN schemes (compat)
+//   - no-op   : neither JWT_SECRET nor MIVO_BFF_TOKEN set (local dev default)
+//
+// Drives the real BFF (app + @hono/node-server). For "allowed" cases we only
+// assert the gate did NOT return 401 (downstream handler status is irrelevant
+// to the gate contract — e.g. GET /api/mivo/generate → 405 from generateHandler).
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest'
 import { serve } from '@hono/node-server'
 import type { Server } from 'node:http'
 import { Buffer } from 'node:buffer'
@@ -19,6 +20,7 @@ const TOKEN = 'test-bff-token-xyz'
 let bffServer: Server
 let bffBase = ''
 let savedToken: string | undefined
+let savedJwtSecret: string | undefined
 
 const startServer = (): Promise<void> =>
   new Promise((resolve) => {
@@ -50,71 +52,116 @@ const basicAuth = (username: string, password: string): string =>
 
 beforeAll(async () => {
   savedToken = process.env.MIVO_BFF_TOKEN
-  process.env.MIVO_BFF_TOKEN = TOKEN
+  savedJwtSecret = process.env.JWT_SECRET
   await startServer()
 })
 
 afterAll(async () => {
   if (savedToken === undefined) delete process.env.MIVO_BFF_TOKEN
   else process.env.MIVO_BFF_TOKEN = savedToken
+  if (savedJwtSecret === undefined) delete process.env.JWT_SECRET
+  else process.env.JWT_SECRET = savedJwtSecret
   await new Promise<void>((r) => bffServer.close(() => r()))
 })
 
-// The gate reads MIVO_BFF_TOKEN fresh on every request; pin it per test so
-// ordering against other suites sharing the worker cannot drift the value.
+// Gate reads env fresh per request; pin per test so ordering stays deterministic.
 beforeEach(() => {
   process.env.MIVO_BFF_TOKEN = TOKEN
+  delete process.env.JWT_SECRET
+})
+afterEach(() => {
+  delete process.env.MIVO_BFF_TOKEN
+  delete process.env.JWT_SECRET
 })
 
-describe('Access gate — Basic Auth branch (issue #136)', () => {
-  it('Basic Auth with correct password (=token) is allowed (not 401)', async () => {
-    const r = await req('/', { headers: { authorization: basicAuth('anyuser', TOKEN) } })
+describe('Access gate — public paths (F7 scope narrowing)', () => {
+  it('GET / (SPA shell) is public — no creds, not 401', async () => {
+    const r = await req('/')
     expect(r.status).not.toBe(401)
-    expect(r.body).not.toEqual({ error: 'unauthorized' })
   })
 
-  it('Basic Auth with wrong password → 401 with WWW-Authenticate: Basic header', async () => {
-    const r = await req('/', { headers: { authorization: basicAuth('anyuser', 'wrong-pass') } })
+  it('/healthz is whitelisted — no creds, not 401', async () => {
+    const r = await req('/healthz')
+    expect(r.status).toBe(200)
+    expect(r.body).toEqual({ status: 'ok' })
+  })
+
+  it('/api/auth/* is whitelisted (gate passes through; route owns its own 401/503)', async () => {
+    // /api/auth/login-url with no JWT_SECRET → route returns 503, NOT gate 401.
+    const r = await req('/api/auth/login-url')
+    expect(r.status).not.toBe(401)
+  })
+})
+
+describe('Access gate — protected paths (MIVO_BFF_TOKEN compat channel)', () => {
+  // A representative protected path. generateHandler enforces POST-only, so GET
+  // with valid creds → 405 (gate passed); without creds → 401 (gate rejected).
+  const PROTECTED = '/api/mivo/generate'
+
+  it('no credentials → 401 with WWW-Authenticate: Basic header', async () => {
+    const r = await req(PROTECTED)
     expect(r.status).toBe(401)
     expect(r.body).toEqual({ error: 'unauthorized' })
     expect(r.headers.get('www-authenticate')).toMatch(/^Basic\b/i)
   })
 
-  it('malformed / no-colon / empty Basic value → 401, never 500', async () => {
-    // Invalid base64 characters — Node decodes leniently (never throws), no
-    // colon in the result → 401.
-    const r1 = await req('/', { headers: { authorization: 'Basic !!!notbase64!!!' } })
+  it('Authorization: Bearer <token> is allowed (not 401)', async () => {
+    const r = await req(PROTECTED, { headers: { authorization: `Bearer ${TOKEN}` } })
+    expect(r.status).not.toBe(401)
+    expect(r.body).not.toEqual({ error: 'unauthorized' })
+  })
+
+  it('Authorization: Basic <anyuser:token> is allowed (issue #136 branch)', async () => {
+    const r = await req(PROTECTED, { headers: { authorization: basicAuth('anyuser', TOKEN) } })
+    expect(r.status).not.toBe(401)
+    expect(r.body).not.toEqual({ error: 'unauthorized' })
+  })
+
+  it('X-Mivo-Bff-Token: <token> is allowed', async () => {
+    const r = await req(PROTECTED, { headers: { 'x-mivo-bff-token': TOKEN } })
+    expect(r.status).not.toBe(401)
+  })
+
+  it('Basic Auth with wrong password → 401', async () => {
+    const r = await req(PROTECTED, { headers: { authorization: basicAuth('anyuser', 'wrong') } })
+    expect(r.status).toBe(401)
+    expect(r.headers.get('www-authenticate')).toMatch(/^Basic\b/i)
+  })
+
+  it('Bearer with wrong token → 401', async () => {
+    const r = await req(PROTECTED, { headers: { authorization: 'Bearer wrong-token' } })
+    expect(r.status).toBe(401)
+  })
+
+  it('malformed Basic (no colon / bad base64) → 401, never 500', async () => {
+    const r1 = await req(PROTECTED, { headers: { authorization: 'Basic !!!notbase64!!!' } })
     expect(r1.status).toBe(401)
-    // Decodes to bytes without a colon → 401.
-    const r2 = await req('/', {
+    const r2 = await req(PROTECTED, {
       headers: { authorization: 'Basic ' + Buffer.from('nocolonhere').toString('base64') },
     })
     expect(r2.status).toBe(401)
-    // Empty Basic payload → 401.
-    const r3 = await req('/', { headers: { authorization: 'Basic ' } })
-    expect(r3.status).toBe(401)
-    // Garbage that is technically valid base64 but decodes to non-UTF8 with no
-    // colon → still 401, not 500.
-    const r4 = await req('/', { headers: { authorization: 'Basic %%%' } })
-    expect(r4.status).toBe(401)
   })
 
-  it('Authorization: Bearer <token> still allowed (regression guard)', async () => {
-    const r = await req('/', { headers: { authorization: `Bearer ${TOKEN}` } })
-    expect(r.status).not.toBe(401)
-    expect(r.body).not.toEqual({ error: 'unauthorized' })
-  })
-
-  it('X-Mivo-Bff-Token: <token> still allowed (regression guard)', async () => {
-    const r = await req('/', { headers: { 'x-mivo-bff-token': TOKEN } })
-    expect(r.status).not.toBe(401)
-    expect(r.body).not.toEqual({ error: 'unauthorized' })
-  })
-
-  it('no credentials → 401 with WWW-Authenticate: Basic header', async () => {
-    const r = await req('/')
+  it('/api/mivo/tasks/* is protected (prefix match)', async () => {
+    const r = await req('/api/mivo/tasks/some-id')
     expect(r.status).toBe(401)
-    expect(r.body).toEqual({ error: 'unauthorized' })
-    expect(r.headers.get('www-authenticate')).toMatch(/^Basic\b/i)
+  })
+
+  it('/api/keys/* is protected (E2 seam)', async () => {
+    const r = await req('/api/keys/test')
+    expect(r.status).toBe(401)
+  })
+})
+
+describe('Access gate — no-op when unconfigured (local dev parity)', () => {
+  const PROTECTED = '/api/mivo/generate'
+  beforeEach(() => {
+    delete process.env.MIVO_BFF_TOKEN
+    delete process.env.JWT_SECRET
+  })
+
+  it('no MIVO_BFF_TOKEN and no JWT_SECRET → protected path not 401 (no-op)', async () => {
+    const r = await req(PROTECTED)
+    expect(r.status).not.toBe(401)
   })
 })

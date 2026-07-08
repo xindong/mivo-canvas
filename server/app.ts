@@ -4,23 +4,29 @@
 // Tests import `app` and drive it through a real @hono/node-server serve() so
 // c.env.incoming/outgoing (HttpBindings) are populated exactly as in production.
 import { Hono } from 'hono'
+import { getCookie } from 'hono/cookie'
 import { serveStatic } from '@hono/node-server/serve-static'
 import { Buffer } from 'node:buffer'
 import { timingSafeEqual } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { resolveFeatureFlags } from './lib/env'
+import { getAuthConfig } from './lib/authConfig'
+import { verifyAccessToken } from './lib/jwt'
+import { isProtectedPath, isGateWhitelisted, AUTH_COOKIE_NAME } from './lib/authGate'
 import type { AppEnv } from './lib/types'
 import { generateHandler } from './routes/generate'
 import { editHandler } from './routes/edit'
 import { enhanceHandler } from './routes/enhance'
 import { describeRegionHandler } from './routes/describeRegion'
 import { composeMaskEditHandler } from './routes/composeMaskEdit'
+import { authRoute } from './routes/auth'
 import { debugLogsRoute } from './routes/debug-logs'
 import { createLocalAssetsRoutes } from './routes/local-assets'
 import { createEagleRoutes } from './routes/eagle'
 import { createPinterestRoutes } from './routes/pinterest'
 import { createProxyImageRoutes } from './routes/proxy-image'
+import { keysRoute } from './routes/keys'
 import { tasksRoute } from './routes/tasks'
 
 const tokenEquals = (a: string, b: string): boolean => {
@@ -67,30 +73,71 @@ export const app = new Hono<AppEnv>()
 // Liveness probe — exempt from the access gate.
 app.get('/healthz', (c) => c.json({ status: 'ok' }))
 
-// Access gate. No-op when MIVO_BFF_TOKEN is unset; otherwise every non-/healthz
-// request must carry one of three credentials, any of which matches the token:
-//   - Authorization: Bearer <token>           (programmatic clients)
-//   - Authorization: Basic <base64("user:token")>  (browser address bar / native login prompt — issue #136)
-//   - X-Mivo-Bff-Token: <token>               (programmatic clients)
-// Browsers cannot attach custom headers to a plain GET /, so without the Basic
-// branch the gate 401s the very first page load. On 401 we emit
-// WWW-Authenticate: Basic so the browser pops its native login dialog. 401
-// responses are sanitized (no token echo / stack).
+// Access gate (F7 · feat/auth-feishu-login, A-1/A-2 hardening). JWT cookie is
+// the first-class credential; the original MIVO_BFF_TOKEN three schemes (Bearer
+// / Basic / X-Mivo-Bff-Token) are retained as a compat / emergency channel.
+//
+//   - allow  : /healthz, /api/auth/* (whitelist), and any non-protected path
+//   - guard  : default-deny /api/mivo/* + /api/keys/* (A-2: covers local-assets
+//              / eagle / proxy-image too); exception /api/mivo/debug-logs (own auth)
+//   - accept : valid mivo_auth cookie JWT (primary) OR MIVO_BFF_TOKEN scheme
+//   - reject : 401 (frontend toasts "请登录" via mivoTaskClient 401 handler)
+//   - A-1    : JWT_SECRET set but invalid base64 / decodes empty → fail-closed
+//              401 on protected paths (startup also exits; this is defense-in-depth
+//              for env mutated after start, e.g. tests). 一律 401, 不 fallback BFF token.
+//   - no-op  : neither JWT_SECRET nor MIVO_BFF_TOKEN configured (local dev default)
 app.use('*', async (c, next) => {
+  const path = c.req.path
+  if (isGateWhitelisted(path)) return next()
+
   const bffToken = process.env.MIVO_BFF_TOKEN?.trim() ?? ''
-  if (!bffToken) return next()
-  if (c.req.path === '/healthz') return next()
-  const bearer = extractBearerToken(c.req.header('authorization'))
-  const custom = c.req.header('x-mivo-bff-token')?.trim() ?? ''
-  const authorized =
-    (bearer.length > 0 && tokenEquals(bearer, bffToken)) ||
-    (custom.length > 0 && tokenEquals(custom, bffToken))
-  if (!authorized) {
+  const authCfg = getAuthConfig()
+  const jwtSecret = authCfg.jwtSecretBytes
+
+  // Public paths (canvas shell / static / SPA / debug-logs exception) always pass,
+  // regardless of auth config state — app is usable without login.
+  if (!isProtectedPath(path)) return next()
+
+  // A-1: misconfigured JWT_SECRET (raw set but invalid) → fail-closed 401.
+  // Supersedes the no-op + BFF-token fallback: a broken secret must never silently
+  // open the gate. (Startup also aborts on this; gate is defense-in-depth.)
+  if (authCfg.jwtSecretMisconfigured) {
+    return c.json({ error: 'unauthorized' }, 401)
+  }
+
+  // Neither configured (raw empty AND no BFF token) → no-op (local-dev parity).
+  if (!jwtSecret && !bffToken) return next()
+
+  // 1) JWT cookie — first-class citizen (A2: maker-issued HS256, shared JWT_SECRET).
+  if (jwtSecret) {
+    const token = getCookie(c, AUTH_COOKIE_NAME)
+    if (token) {
+      const payload = await verifyAccessToken(token, jwtSecret)
+      if (payload) return next()
+    }
+  }
+
+  // 2) MIVO_BFF_TOKEN compat/emergency channel (Bearer / Basic / X-Mivo-Bff-Token).
+  if (bffToken) {
+    const bearer = extractBearerToken(c.req.header('authorization'))
+    const custom = c.req.header('x-mivo-bff-token')?.trim() ?? ''
+    if ((bearer.length > 0 && tokenEquals(bearer, bffToken)) ||
+        (custom.length > 0 && tokenEquals(custom, bffToken))) {
+      return next()
+    }
     c.header('WWW-Authenticate', 'Basic realm="mivo-canvas"')
     return c.json({ error: 'unauthorized' }, 401)
   }
-  return next()
+
+  // JWT-only mode, no valid cookie → 401 (frontend shows login prompt).
+  return c.json({ error: 'unauthorized' }, 401)
 })
+
+// Auth routes (login-url / callback / me / logout / dev-login). Whitelisted by
+// the gate above (isGateWhitelisted matches /api/auth/*). E2 will mount
+// /api/keys separately near the mivo routes — keep this mount isolated to
+// minimise the app.ts route-mount merge seam.
+app.route('/api/auth', authRoute)
 
 // P1-c generate/edit/enhance routes. app.all lets each handler enforce POST-only
 // (non-POST → 405 {error:'Method not allowed'}), matching dev middleware semantics
@@ -110,6 +157,11 @@ app.route('/api/mivo', createProxyImageRoutes())
 // P2-C1a: async task endpoints (additive — not in dev diff baseline).
 // POST /tasks/generate|edit → 202 {taskId}; GET/DELETE /tasks/:id.
 app.route('/api/mivo/tasks', tasksRoute)
+
+// E2: gateway key probe — BFF proxies GET llm-proxy /v1/models so the browser
+// never exposes the sk- key to CORS or upstream logs. Stateless (no DB); still
+// protected by the access gate above (not in the /api/auth/* whitelist).
+app.route('/api/keys', keysRoute)
 
 // Same-origin static hosting of dist/ (Vite build output). serveStatic only
 // accepts a root relative to cwd and calls next() on miss, letting the SPA
