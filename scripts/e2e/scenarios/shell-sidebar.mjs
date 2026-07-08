@@ -32,9 +32,8 @@ export const runShellSidebarScenario = async (context) => {
   await page.addInitScript(() => {
     try { window.localStorage.clear() } catch { /* opaque origin */ }
     try { window.sessionStorage.clear() } catch { /* opaque origin */ }
-    // SSO dev stub → logged-in + no keys → AutoPromptSettings would auto-open the
-    // panel + intercept clicks. Suppress it here (this scenario doesn't test the prompt).
-    window.__MIVO_E2E_DISABLE_AUTO_PROMPT__ = true
+    // AutoPrompt suppression is now the harness default (createSmokePage sets
+    // __MIVO_E2E_DISABLE_AUTO_PROMPT__=true); no per-scenario opt-out needed here.
   })
   await page.goto(canvasUrl || baseUrl, { waitUntil: 'networkidle' })
   await waitForCanvasReady(page, rendererMode)

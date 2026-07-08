@@ -7,9 +7,8 @@
 // in local e2e (redirect leaves the app), so we assert the logged-in chip flow.
 export const runUserChipScenario = async (context) => {
   const { baseUrl, page } = context
-  // SSO dev stub → logged-in + no keys → AutoPromptSettings would auto-open the
-  // panel + intercept the chip click. Suppress it (this scenario tests the chip, not the prompt).
-  await page.addInitScript(() => { window.__MIVO_E2E_DISABLE_AUTO_PROMPT__ = true })
+  // AutoPrompt suppression is the harness default (createSmokePage); this scenario
+  // tests the chip, not the prompt, so no opt-in needed.
   await page.goto(baseUrl, { waitUntil: 'networkidle' })
   await page.waitForSelector('.project-sidebar')
 

@@ -337,6 +337,13 @@ export const createSmokePage = async ({
   if (enableStoreBridgeModules) {
     await installE2EStoreBridge(context)
   }
+  // feat/auth-sso: dev stub returns logged-in + fresh IDB has no keys → AutoPrompt
+  // would auto-open the settings panel on every scenario's first load, intercepting
+  // clicks. Default-suppress here (all scenarios). The auto-prompt-settings scenario
+  // opts back in by setting the flag false via its own addInitScript (runs after, wins).
+  await context.addInitScript(() => {
+    window.__MIVO_E2E_DISABLE_AUTO_PROMPT__ = true
+  })
   const page = await context.newPage()
 
   await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: baseUrl })

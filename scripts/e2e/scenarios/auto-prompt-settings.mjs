@@ -10,6 +10,11 @@
 export const runAutoPromptSettingsScenario = async (context) => {
   const { baseUrl, page } = context
 
+  // Harness default suppresses AutoPrompt (window.__MIVO_E2E_DISABLE_AUTO_PROMPT__=true).
+  // This scenario tests AutoPrompt → opt back in (our addInitScript runs after the
+  // harness's, so false wins). Persists across both flows' reloads.
+  await page.addInitScript(() => { window.__MIVO_E2E_DISABLE_AUTO_PROMPT__ = false })
+
   // ── Flow 1: logged-in + no keys → API Keys section ───────────────────────
   await page.goto(baseUrl, { waitUntil: 'networkidle' })
   await page.waitForSelector('.project-sidebar')

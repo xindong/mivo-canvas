@@ -16,6 +16,10 @@ export const runMigrationScenario = async (context) => {
     if (isProdTopology) {
       await installE2EStoreBridge(migrationContext)
     }
+    // feat/auth-sso: this custom context bypasses createSmokePage, so the harness's
+    // default AutoPrompt suppression doesn't apply. Dev stub → logged-in + no keys →
+    // AutoPrompt would auto-open the settings panel + intercept clicks. Suppress here.
+    await migrationContext.addInitScript(() => { window.__MIVO_E2E_DISABLE_AUTO_PROMPT__ = true })
     const migrationPage = await migrationContext.newPage()
     try {
       await migrationPage.route('**/api/mivo/tasks/**', async (route) => {
