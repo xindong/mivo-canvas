@@ -15,9 +15,9 @@ node scripts/changelog/auto-changelog.mjs scan
 - 读 `public/changelog.json` 的 `lastGithash` 作锚点,`git fetch origin main`,`git log --first-parent <锚点>..origin/main`。
 - PR 识别双模式(squash `(#N)` / merge `Merge pull request #N`),与现有 entries 的 `prs` 求差集去重,跳过 `chore: 更新日志补扫` 自身 meta-PR。
 - 归天:落地 commit 的 committer 时间左移 8 小时取本地日历日(与 `src/lib/changelogDate.ts` 一致)。
-- 每条 PR 的 `body` 用 `gh pr view N --json body` 取(失败降级空串)。
+- 每条 PR 的 `body` + `by`(PR opener)用 `gh pr view N --json body,author` 一次取双(失败降级:`by` 走 `^2`/`%an`,body 走空串)。
 - **退出码 0**:
-  - 无新 PR → stdout `{"status":"empty"}`。**直接结束本轮**(静默,不开 PR)。
+  - 无新 PR → stdout `{"status":"empty"}`。**直接结束本轮**(静默,不开 PR,不前移 `lastGithash`——下次非空 `publish` 时 `lastGithash` 跳到当时 `origin/main` HEAD 自然追平;详见 SKILL 第 7 步既定决策)。
   - 有新 PR → 把 `{"status":"pending","anchor":...,"items":[...]}` 写入 `/tmp/mivo-changelog-scan.json` 并打印。
 - **退出码非 0** → stderr 有原因,走 `schedule_notify_current_run`。
 
