@@ -71,6 +71,12 @@ describe('POST /api/keys/test — gateway key probe', () => {
     expect(fetchSpy).not.toHaveBeenCalled()
   })
 
+  it('bare sk- prefix (no content) → 400 format error (no upstream call)', async () => {
+    const res = await probe('sk-')
+    expect(res.status).toBe(400)
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
   it('invalid JSON body → 400', async () => {
     const res = await keysRoute.request('/test', {
       method: 'POST',

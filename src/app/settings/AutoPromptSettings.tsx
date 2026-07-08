@@ -30,7 +30,7 @@ export function AutoPromptSettings() {
     // (via addInitScript) so the dev stub's logged-in state doesn't auto-open the
     // panel + intercept their clicks. The auto-prompt-settings scenario leaves it
     // unset so this effect fires normally.
-    if (typeof window !== 'undefined' && window.__MIVO_E2E_DISABLE_AUTO_PROMPT__ === true) {
+    if (typeof window !== 'undefined' && (window as unknown as { __MIVO_E2E_DISABLE_AUTO_PROMPT__?: boolean }).__MIVO_E2E_DISABLE_AUTO_PROMPT__ === true) {
       return
     }
     // 用户实测 2026-07-08:未登录也自动弹(停在账号区,用户主动点登录);已登录+缺 key 弹 API Keys 区。
