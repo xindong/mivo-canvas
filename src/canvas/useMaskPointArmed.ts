@@ -88,11 +88,8 @@ export function useMaskPointArmed({
     setInitialClientPoint(next)
   }, [])
 
-  const recordPendingInitialPoint = useCallback((point: MaskInitialClientPoint) => {
-    pendingInitialClientPointRef.current = point
-    setInitialClientPoint(reduceMaskPointPending(undefined, { type: 'set', point }))
-    debugLogger.log('Mask Edit', `Pending initial point recorded for ${point.nodeId}`)
-  }, [])
+  // （2026-07-08）armed 首击不再落 initial point，record 函数随之移除；
+  // pending 机制其余部分（clear/discard-stale）保留供防串扰逻辑使用。
 
   const clearPendingInitialPoint = useCallback((reason: string) => {
     updatePendingInitialPoint({ type: 'clear' }, (point) => (
@@ -229,7 +226,8 @@ export function useMaskPointArmed({
     closeContextMenu()
     clearPendingInitialPoint('new point selection arm')
     setMaskArmed(true, 'toolbar')
-    toastFeedback.info('点击图片上要修改的位置')
+    // 文案覆盖四种选区工具（不止点选）；toast 定位已抬到主工具条上方（App.css .toast-viewport）。
+    toastFeedback.info('点击图片，用椭圆/矩形/圈选/点选标出要修改的位置')
   }, [clearCropNode, clearPendingInitialPoint, closeContextMenu, setActiveTool, setMaskArmed])
 
   const handleInitialClientPointHandled = useCallback((
@@ -262,6 +260,7 @@ export function useMaskPointArmed({
       // DOM-first(同 ctx/dbl):pending 窗口 resolveCanvasHit 因 activeEditState 激活返回
       // edit-overlay-cancel 而非 node,hitNodeId 恒 undefined → shouldCancelPendingMaskEdit
       // 误判 blank 误取消同节点 re-engage(Greptile P1)。改 nodeIdFromDomTarget 绕开短路。
+      // 点外即关维持;锚点由 maskEditDraftStore 在卸载时保存,不丢(2026-07-08 用户)。
       const pendingMaskNodeId = maskEditNodeIdRef.current
       const hitNodeId = nodeIdFromDomTarget(event.target) ?? undefined
       if (shouldCancelPendingMaskEdit(pendingMaskNodeId, hitNodeId)) {
@@ -286,17 +285,19 @@ export function useMaskPointArmed({
     if (node?.type === 'image' && !node.hidden) {
       event.preventDefault()
       event.stopPropagation()
-      recordPendingInitialPoint({ nodeId: node.id, clientX: event.clientX, clientY: event.clientY })
+      // 2026-07-08 用户：armed 后的首击只负责「打开浮层」（工具条立现，默认椭圆），
+      // 不再把这一击当成 point 锚点落下——否则用户的第一个动作永远被强制成点选。
+      // 故不 recordPendingInitialPoint；用户在浮层里自选工具画选区。
       beginMaskEdit(node.id)
       setMaskArmed(false, 'image hit')
-      debugLogger.log('Mask Edit', `Armed image hit: ${node.id}`)
+      debugLogger.log('Mask Edit', `Armed image hit: ${node.id} (open overlay only, no initial point)`)
       return
     }
 
     setMaskArmed(false, node ? 'node miss' : 'canvas miss')
     debugLogger.log('Mask Edit', node ? `Armed node miss: ${node.id}` : 'Armed canvas miss')
     handleCanvasPointerDown(event)
-  }, [beginMaskEdit, cancelMaskEdit, interactionRef, recordPendingInitialPoint, setMaskArmed])
+  }, [beginMaskEdit, cancelMaskEdit, interactionRef, setMaskArmed])
 
   useEffect(() => {
     const unsubscribe = useCanvasStore.subscribe((state, previous) => {

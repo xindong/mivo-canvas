@@ -3,7 +3,7 @@
 // 拿到逐条「编辑要求」。失败/降级返回 null，调用方静默回退到直接套壳（不阻塞出图）。
 import { authHeaders } from './authHeaders'
 
-export type ComposeAnchor = { n: number; label: string; position?: string }
+export type ComposeAnchor = { n: number; label: string; position?: string; hasDuplicate?: boolean }
 
 /**
  * 调 /api/mivo/compose-mask-edit。成功返回逐条要求拼成的正文（换行连接）；

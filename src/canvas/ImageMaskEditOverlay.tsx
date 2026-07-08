@@ -35,6 +35,8 @@ import {
 } from './imageMaskGeometry'
 import type { MaskInitialClientPoint } from './maskPointPending'
 import { buildMaskEditSubmission } from './maskEditSubmit'
+import { clearMaskEditDraft, getMaskEditDraft, saveMaskEditDraft } from './maskEditDraftStore'
+import { useCanvasStore } from '../store/canvasStore'
 import { useMaskRichEditor } from './useMaskRichEditor'
 import { computeFloatingControls, type FloatingControlsLayout } from './maskEditFloatingControls'
 import {
@@ -116,16 +118,21 @@ export function ImageMaskEditOverlay({
   const toolbarRef = useRef<HTMLDivElement | null>(null)
   const promptRef = useRef<HTMLDivElement | null>(null)
   const [tool, setTool] = useState<ImageMaskTool>('ellipse')
-  const [regions, setRegions] = useState<ImageMaskRegion[]>([])
-  const [pointAnchors, setPointAnchors] = useState<PointAnchor[]>([])
+  // 锚点草稿·恢复（2026-07-08 用户）：同一张图重进局部重绘时，锚点/识别/输入框内容
+  // 直接作为初始状态惰性还原（不走 effect setState，无闪帧）；仅挂载时取一次。
+  const [initialSavedDraft] = useState(() => getMaskEditDraft(node.id))
+  const [regions, setRegions] = useState<ImageMaskRegion[]>(() => initialSavedDraft?.regions ?? [])
+  const [pointAnchors, setPointAnchors] = useState<PointAnchor[]>(() => initialSavedDraft?.pointAnchors ?? [])
   const [past, setPast] = useState<MaskEditSnapshot[]>([])
   const [future, setFuture] = useState<MaskEditSnapshot[]>([])
   const [draft, setDraft] = useState<DraftRegion>()
   const [floatingHost, setFloatingHost] = useState<HTMLElement | null>(null)
   const [floatingLayout, setFloatingLayout] = useState<FloatingControlsLayout>()
   const [statusError, setStatusError] = useState('')
-  const regionsRef = useRef<ImageMaskRegion[]>([])
-  const pointAnchorsRef = useRef<PointAnchor[]>([])
+  // compose(GPT 结构化整理)进行中的本地 loading（父层 submitting 之前的窗口）。
+  const [composing, setComposing] = useState(false)
+  const regionsRef = useRef<ImageMaskRegion[]>(initialSavedDraft?.regions ?? [])
+  const pointAnchorsRef = useRef<PointAnchor[]>(initialSavedDraft?.pointAnchors ?? [])
   const draftRef = useRef<DraftRegion | undefined>(undefined)
   const removeWindowDragListenersRef = useRef<() => void>(() => undefined)
   const handledInitialClientPointKeyRef = useRef<string | undefined>(undefined)
@@ -133,6 +140,9 @@ export function ImageMaskEditOverlay({
   // F1 (审 P2): 同步 in-flight guard，防快速双击/大图 toBlob 慢导致双提交。
   // 进入 submit 即置位；成功后 overlay 卸载（hook 清 maskEditNodeId）自然解除；失败 catch 清回。
   const submitInFlightRef = useRef(false)
+  // 锚点草稿（2026-07-08 用户）：待回填的编辑器 HTML；提交成功后卸载时清草稿而非保存。
+  const pendingEditorHtmlRef = useRef<string | undefined>(initialSavedDraft?.editorHtml)
+  const clearDraftOnUnmountRef = useRef(false)
   const hasAnyAnchor = regions.length > 0 || pointAnchors.length > 0
 
   const displayRect = useMemo(
@@ -154,7 +164,12 @@ export function ImageMaskEditOverlay({
     openChipKey,
     setOpenChipKey,
     regionKey,
-  } = useMaskAnchorRecognition({ regions, naturalSize, resolvedAssetUrl })
+  } = useMaskAnchorRecognition({
+    regions,
+    naturalSize,
+    resolvedAssetUrl,
+    initialRecognitions: initialSavedDraft?.recognitions,
+  })
 
   const updateDraft = (nextDraft?: DraftRegion) => {
     draftRef.current = nextDraft
@@ -195,6 +210,7 @@ export function ImageMaskEditOverlay({
   const commitRegions = (nextRegions: ImageMaskRegion[]) => {
     commitMaskState(nextRegions, pointAnchorsRef.current)
   }
+
 
   useEffect(() => {
     if (!initialClientPoint) return
@@ -461,6 +477,10 @@ export function ImageMaskEditOverlay({
     // 只能在 submitMaskEdit 入口置位，覆盖不了 toBlob 慢的这段）。双击/大图 toBlob 慢时只产生一个 chat card + 一次 edit POST。
     if (submitInFlightRef.current) return
     submitInFlightRef.current = true
+    // compose(GPT 结构化整理)窗口的本地 loading：父层 submitting 在 onSubmit 回调内才置位，
+    // 覆盖不了 buildMaskEditSubmission 里 await composeMaskEditBody 的几秒——期间按钮必须
+    // 有可见反馈（2026-07-08 用户）。失败清回；成功后由父层 submitting 接管。
+    setComposing(true)
 
     try {
       setStatusError('')
@@ -481,8 +501,11 @@ export function ImageMaskEditOverlay({
         }),
       )
       // 成功：overlay 由 hook 清 maskEditNodeId 卸载，submitInFlightRef 随卸载解除，不主动清。
+      // 本轮编辑已完成 → 卸载时清掉该图的锚点草稿（而非保存）。
+      clearDraftOnUnmountRef.current = true
     } catch (error) {
       submitInFlightRef.current = false // 调度失败清回，允许重试
+      setComposing(false)
       setStatusError(error instanceof Error ? error.message : '局部重绘失败。')
     }
   }
@@ -509,6 +532,45 @@ export function ImageMaskEditOverlay({
     onCancel,
     commitMaskState,
   })
+
+  // 锚点草稿·编辑器回填：prompt 面板在有锚点后才挂载，等 editor DOM 出现再整体写回
+  // innerHTML（chip + 自由文本混排快照），随后走一次 input 流程刷占位符/清洗。
+  useEffect(() => {
+    const html = pendingEditorHtmlRef.current
+    if (!html || !editorRef.current) return
+    pendingEditorHtmlRef.current = undefined
+    editorRef.current.innerHTML = html
+    handleEditorInput()
+  })
+
+  // 锚点草稿·卸载即存：点外/切走/Esc/X 关闭浮层时保存当前锚点态；提交成功或目标图
+  // 已被删除则清除草稿（空锚点由 saveMaskEditDraft 内部等价清除）。
+  useEffect(() => {
+    return () => {
+      if (clearDraftOnUnmountRef.current) {
+        clearMaskEditDraft(node.id)
+        return
+      }
+      const stillExists = useCanvasStore
+        .getState()
+        .nodes.some((item) => item.id === node.id && item.type === 'image' && !item.hidden)
+      if (!stillExists) {
+        clearMaskEditDraft(node.id)
+        return
+      }
+      // 此处就是要读【卸载瞬间的最新】ref 值（保存离开前的锚点态），
+      // ref-in-cleanup 告警的「值可能已变」正是本意，禁用之。
+      saveMaskEditDraft(node.id, {
+        regions: regionsRef.current,
+        pointAnchors: pointAnchorsRef.current,
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        recognitions: recognitionsRef.current,
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        editorHtml: editorRef.current?.innerHTML ?? '',
+      })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [node.id])
 
   // 卡片展开时，点字段外部（含在图片上放新锚点）即收起。
   useEffect(() => {
@@ -708,12 +770,12 @@ export function ImageMaskEditOverlay({
           {statusError ? <div className="image-mask-edit-error">{statusError}</div> : null}
           <button
             type="button"
-            className="image-mask-edit-submit"
+            className={submitting || composing ? 'image-mask-edit-submit is-busy' : 'image-mask-edit-submit'}
             onClick={() => void submit()}
-            disabled={submitting || !hasAnyAnchor}
+            disabled={submitting || composing || !hasAnyAnchor}
           >
             <Sparkles size={15} />
-            {submitting ? '重绘中...' : '局部重绘'}
+            {submitting ? '重绘中...' : composing ? '处理中...' : '局部重绘'}
           </button>
         </div>
         ) : null}
@@ -769,6 +831,9 @@ export function ImageMaskEditOverlay({
                 return renderPointMarker({ x: shape.cx, y: shape.cy }, index, viewportScale, index + 1)
               }
               if (shape.kind === 'rect' || shape.kind === 'ellipse') {
+                // 徽标贴描边(2026-07-08 用户「连在一起」):矩形=左上角(在描边转角上),
+                // 椭圆=顶点(x+w/2, y)(在曲线上),徽标圆心落在线上→天然相切重叠。
+                const badgeX = shape.kind === 'ellipse' ? shape.x + shape.width / 2 : shape.x
                 return (
                   <g key={index}>
                     {shape.kind === 'rect' ? (
@@ -788,20 +853,21 @@ export function ImageMaskEditOverlay({
                         ry={Math.max(1, shape.height / 2)}
                       />
                     )}
-                    {renderRegionBadge(shape.x, shape.y, index + 1, index, viewportScale)}
+                    {renderRegionBadge(badgeX, shape.y, index + 1, index, viewportScale)}
                   </g>
                 )
               }
               if (shape.kind === 'loop') {
                 if (!shape.points.length) return null
-                const xs = shape.points.map((point) => point.x)
-                const ys = shape.points.map((point) => point.y)
                 // path 不带 Z：描边不画首尾闭合连线（用户反馈），fill 仍按闭合区域填充。
                 const d = `M ${shape.points.map((point) => `${point.x} ${point.y}`).join(' L ')}`
+                // 徽标贴描边:取套索路径上 y 最小的实际点(最高点),徽标坐在线上,而非
+                // 飘在 bbox 角(minX/minY 通常不在路径上)。
+                const topPoint = shape.points.reduce((top, p) => (p.y < top.y ? p : top), shape.points[0])
                 return (
                   <g key={index}>
                     <path className="image-mask-edit-region loop" d={d} />
-                    {renderRegionBadge(Math.min(...xs), Math.min(...ys), index + 1, index, viewportScale)}
+                    {renderRegionBadge(topPoint.x, topPoint.y, index + 1, index, viewportScale)}
                   </g>
                 )
               }

@@ -200,16 +200,18 @@ export const buildAnchorMarkedImage = async (
     ctx.drawImage(bitmap, 0, 0, natW, natH)
     const lw = markerStrokeFor(naturalSize)
     const r = ringRadiusFor(naturalSize)
+    // 徽标贴描边(2026-07-08 用户「连在一起」):徽标圆心落在实际红线上→相切重叠,
+    // 与画布 renderRegionBadge 的锚点规则一致。
     for (const shape of shapes) {
       if (shape.kind === 'point') {
         drawRing(ctx, shape.x, shape.y, r, lw)
-        drawBadge(ctx, shape.x, shape.y - r - lw, shape.n, r)
+        drawBadge(ctx, shape.x, shape.y - r, shape.n, r) // 环正上方顶点(去掉原 -lw 间隙,贴住环顶)
       } else if (shape.kind === 'rect') {
         const { x, y, width, height } = shape.bounds
         ctx.strokeStyle = ANCHOR_RED
         ctx.lineWidth = lw
         ctx.strokeRect(x, y, width, height)
-        drawBadge(ctx, x, y, shape.n, r)
+        drawBadge(ctx, x, y, shape.n, r) // 左上角(在描边转角上)
       } else if (shape.kind === 'ellipse') {
         const { x, y, width, height } = shape.bounds
         ctx.beginPath()
@@ -217,7 +219,7 @@ export const buildAnchorMarkedImage = async (
         ctx.lineWidth = lw
         ctx.ellipse(x + width / 2, y + height / 2, Math.max(1, width / 2), Math.max(1, height / 2), 0, 0, Math.PI * 2)
         ctx.stroke()
-        drawBadge(ctx, x, y, shape.n, r)
+        drawBadge(ctx, x + width / 2, y, shape.n, r) // 椭圆顶点(在曲线上)
       } else {
         // loop:闭合红色折线(首尾自动闭合)。
         const pts = shape.points
@@ -229,9 +231,9 @@ export const buildAnchorMarkedImage = async (
         for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y)
         ctx.closePath()
         ctx.stroke()
-        const minX = Math.min(...pts.map((p) => p.x))
-        const minY = Math.min(...pts.map((p) => p.y))
-        drawBadge(ctx, minX, minY, shape.n, r)
+        // 套索最高点(y 最小的实际路径点),徽标坐在线上而非 bbox 角。
+        const topPoint = pts.reduce((top, p) => (p.y < top.y ? p : top), pts[0])
+        drawBadge(ctx, topPoint.x, topPoint.y, shape.n, r)
       }
     }
     return await toBlobPng(canvas)
@@ -244,15 +246,15 @@ export const buildAnchorMarkedImage = async (
 }
 
 /**
- * 调 /api/mivo/describe-region:POST multipart(crop 必、context 可选)→ 候选标签数组。
- * 成功解析返回 candidates;非 2xx / 响应无 candidates / 解析失败 / 网络异常 / 中止
- * 一律返回 [] 不 throw(识别只是提示,永不阻塞出图)。
+ * 调 /api/mivo/describe-region:POST multipart(crop 必、context 可选)→ { 候选标签数组,
+ * hasDuplicate:画面别处是否有同类 }。非 2xx / 无 candidates / 解析失败 / 网络异常 / 中止
+ * 一律返回空候选 + hasDuplicate:true(保守带保护句),不 throw(识别只是提示,永不阻塞出图)。
  */
 export const describeRegionCrop = async (
   crop: Blob,
   signal: AbortSignal,
   contextImage?: Blob | null,
-): Promise<RegionCandidate[]> => {
+): Promise<{ candidates: RegionCandidate[]; hasDuplicate: boolean }> => {
   try {
     const form = new FormData()
     form.append('crop', crop, 'crop.png')
@@ -260,12 +262,12 @@ export const describeRegionCrop = async (
     const response = await fetch('/api/mivo/describe-region', { method: 'POST', headers: authHeaders(), body: form, signal })
     if (!response.ok) {
       debugLogger.warn('Mask Edit', `describe-region 非 2xx(${response.status}),识别回退 []`)
-      return []
+      return { candidates: [], hasDuplicate: true }
     }
-    const payload = (await response.json()) as { candidates?: unknown }
+    const payload = (await response.json()) as { candidates?: unknown; hasDuplicate?: unknown }
     if (!Array.isArray(payload.candidates)) {
       debugLogger.warn('Mask Edit', 'describe-region 响应无 candidates 数组,识别回退 []')
-      return []
+      return { candidates: [], hasDuplicate: true }
     }
     const list = payload.candidates
       .map((item): RegionCandidate | null => {
@@ -277,10 +279,12 @@ export const describeRegionCrop = async (
         return { label, scope }
       })
       .filter((c): c is RegionCandidate => Boolean(c))
-    debugLogger.log('Mask Edit', `describe-region 识别到 ${list.length} 个候选`)
-    return list
+    // 缺省/非 false 一律按 true（保守：拿不准时带保护句）。
+    const hasDuplicate = payload.hasDuplicate === false ? false : true
+    debugLogger.log('Mask Edit', `describe-region 识别到 ${list.length} 个候选 (hasDuplicate=${hasDuplicate})`)
+    return { candidates: list, hasDuplicate }
   } catch {
     debugLogger.warn('Mask Edit', 'describe-region 请求失败/中止,识别回退 []')
-    return []
+    return { candidates: [], hasDuplicate: true }
   }
 }

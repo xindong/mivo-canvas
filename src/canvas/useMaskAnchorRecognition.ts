@@ -16,6 +16,9 @@ export type AnchorRecognition = {
   selectedIndex: number
   customLabel: string
   recognizing: boolean
+  /** 画面别处是否有同类物体（识别步判定）；决定 compose 是否加"其他XX保留"保护句。
+   *  缺省视为 true（保守带保护句）。 */
+  hasDuplicate?: boolean
 }
 
 // Selected label for one anchor's recognition ('' when none / not yet resolved).
@@ -28,17 +31,22 @@ export function useMaskAnchorRecognition({
   regions,
   naturalSize,
   resolvedAssetUrl,
+  initialRecognitions,
 }: {
   regions: ImageMaskRegion[]
   naturalSize: { width: number; height: number }
   resolvedAssetUrl: string
+  /** 锚点草稿恢复：挂载时的初始识别态（同图重进局部重绘，已识别的锚点不重跑）。 */
+  initialRecognitions?: Record<string, AnchorRecognition>
 }) {
   // Anchor semantics（Lovart 式多锚点）：每个锚点各自识别，返回「由粗到细」的候选
   // 列表（整体主体 … 具体部位）。每个锚点一个标签块内嵌进输入框（富文本式），点
   // 箭头展开自己的「已标记对象」卡切换/自定义。识别只是辅助，失败静默。
   // recognitions 按 regionKey 存每个锚点的识别态；ref 镜像供 effect 读取不触发重跑。
-  const [recognitions, setRecognitions] = useState<Record<string, AnchorRecognition>>({})
-  const recognitionsRef = useRef<Record<string, AnchorRecognition>>({})
+  const [recognitions, setRecognitions] = useState<Record<string, AnchorRecognition>>(
+    () => initialRecognitions ?? {},
+  )
+  const recognitionsRef = useRef<Record<string, AnchorRecognition>>(initialRecognitions ?? {})
   const writeRecognitions = useCallback(
     (updater: (current: Record<string, AnchorRecognition>) => Record<string, AnchorRecognition>) => {
       const next = updater(recognitionsRef.current)
@@ -92,17 +100,22 @@ export function useMaskAnchorRecognition({
           try {
             const bounds = boundsForRegions([region], naturalSize)
             if (!bounds) return
-            const marker =
+            // 点选(brush 单点)才在裁剪特写上叠红环;框/椭圆/圈选的裁剪就是选区本身。
+            const cropMarker =
               region.type === 'brush' && region.points.length === 1
                 ? { x: region.points[0].x, y: region.points[0].y }
                 : undefined
-            // 双图识别:全图缩略(红圈标锚点位置)给全局归属,放大特写给细节 —— 修
-            // 「点在衣服花纹上只认出图案、候选里没有衣服」的裁剪视野问题。
+            // 双图识别:全图缩略(红环标锚点位置)给全局归属 + 判断画面别处有无同类
+            //（hasDuplicate,决定 compose 加不加保护句,2026-07-08 用户）;放大特写给细节。
+            // contextMarker 对【所有】锚点类型都取选区中心,保证识别始终能看到整图。
+            const contextMarker = cropMarker ?? { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2 }
             const [crop, contextImage] = await Promise.all([
-              cropRegionBlob(resolvedAssetUrl, naturalSize, bounds, controller.signal, marker),
-              marker ? anchorContextBlob(resolvedAssetUrl, naturalSize, marker, controller.signal) : Promise.resolve(null),
+              cropRegionBlob(resolvedAssetUrl, naturalSize, bounds, controller.signal, cropMarker),
+              anchorContextBlob(resolvedAssetUrl, naturalSize, contextMarker, controller.signal),
             ])
-            const list = crop ? await describeRegionCrop(crop, controller.signal, contextImage) : []
+            const { candidates: list, hasDuplicate } = crop
+              ? await describeRegionCrop(crop, controller.signal, contextImage)
+              : { candidates: [], hasDuplicate: true }
             controllers.delete(key)
             if (controller.signal.aborted) return
             writeRecognitions((current) => ({
@@ -113,6 +126,7 @@ export function useMaskAnchorRecognition({
                 selectedIndex: list.length ? list.length - 1 : -1,
                 customLabel: '',
                 recognizing: false,
+                hasDuplicate,
               },
             }))
           } catch (error) {

@@ -16,7 +16,7 @@ describe('buildDualImagePrompt — 图1/图2 结构外壳', () => {
     expect(prompt).toContain('编辑要求：')
     expect(prompt).toContain('1.务必只去除图2中1号红圈（最左侧）范围内的蓝色烟雾')
     expect(prompt).toContain('2.将图2中2号红圈范围内的左眼改成红色')
-    expect(prompt).toContain('务必每一条都严格执行并复查。')
+    expect(prompt).toContain('修改后务必去除全部红圈和红圈对应的数字标记。')
   })
 
   it('去除正文首尾空白', () => {

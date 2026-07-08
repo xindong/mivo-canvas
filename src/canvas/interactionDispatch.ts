@@ -80,6 +80,8 @@ export function useCanvasHitDispatch({
 
   const cancelEditTarget = useCallback(
     (target: EditOverlayCancelTarget) => {
+      // mask 点外即关(与 crop/text-edit 一致);锚点不丢——关闭前由 overlay 卸载
+      // 钩子存入 maskEditDraftStore,同图重进时恢复(2026-07-08 用户)。
       if (target.editKind === 'mask') onCancelMaskEdit?.()
       else if (target.editKind === 'crop') onCancelCropEdit?.()
       else if (target.editKind === 'text-edit') exitTextEdit()

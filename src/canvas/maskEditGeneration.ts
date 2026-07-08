@@ -353,7 +353,11 @@ export const runMaskEditGeneration = async (args: {
     // 上次编辑洞区（source.generation.maskBounds+maskSourceSize 映射）、全图近黑
     // 连通组件（区域外黑块）。仅当有 maskBounds（annotation area-edit 模式）且有
     // 结果 b64 时检测；brush mask 模式无 bounds，跳过检测（保守不重试，行为不变）。
-    const canInspect = Boolean(payload.maskBounds && images[0]?.b64)
+    // 2026-07-08 修复：黑块自愈只针对 gpt-image-2 的 alpha-mask「挖洞」路——只有挖洞才
+    // 会把选区渲染成纯黑。gemini 双图路是基于干净图1【整图重生成】，没有洞→黑的失败
+    // 模式，这套近黑连通块检测在深色图内容上纯误报（用户实测:图出来了却被判「结果
+    // 异常」）。故 gemini 路直接跳过黑块检测，结果照常 commit。
+    const canInspect = model === 'gpt-image-2' && Boolean(payload.maskBounds && images[0]?.b64)
     if (canInspect) {
       // 历史洞区：source 若是上次局部重绘的结果（generation.maskBounds + maskSourceSize），
       // 把上次洞区从"上次源图空间"等比映射到"当前源图空间"作为高优先检测区。

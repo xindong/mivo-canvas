@@ -33,15 +33,16 @@ const describeSystemPrompt = [
   '返回一个由粗到细的候选列表：从整体主体（如 动漫女孩/机甲/建筑）到红圈中心指向的具体部位（如 白色头发/左眼/衣领），共 2-4 个，顺序必须「整体在前、红圈中心指向的最具体部位在最后」。',
   '例：红圈压在头发上，最后一项就是「头发」，即使旁边有脸；红圈套在眼睛上，最后一项就是「眼睛」。若红圈圈住的整体就是一个完整物件（如一朵云、一个图标），不要硬拆出子部位，直接给这个物件即可。',
   '消歧（重要）：如果画面中存在多个相似物件（如两把刀/两个刀柄/多朵云），红圈指向那个的 label 必须带上可区分的方位或特征前缀（如「左侧刀柄」「背后那把刀的刀柄」「右上方的云」），绝不能只给「刀柄」这种分不清是哪一个的名字。方位以完整原图为准。',
+  'hasDuplicate 字段（重要）：结合完整原图判断——红圈指向的这个物体，画面【别处】是否还存在同类或高度相似的物体（如另一把刀、另一朵云、成对的耳朵/眼睛）。有则 true，是画面中独一无二的则 false。只看整体原图判断，拿不准时填 true 更安全。',
   'scope 字段：整体主体填 "whole"，具体部位/物件填 "part"。label 为不超过10个字的中文名。',
   '只返回一个 JSON 对象，不要任何其他文字：',
-  '{"candidates":[{"label":"动漫女孩","scope":"whole"},{"label":"白色头发","scope":"part"}],"description":"一句话描述(不超过40字，同样不要提红圈)"}',
+  '{"candidates":[{"label":"动漫女孩","scope":"whole"},{"label":"白色头发","scope":"part"}],"hasDuplicate":false,"description":"一句话描述(不超过40字，同样不要提红圈)"}',
   '如果完全无法辨认，candidates 返回空数组。',
 ].join('\n')
 
 type DescribeScope = 'whole' | 'part'
 type DescribeCandidate = { label: string; scope: DescribeScope }
-type DescribeParsed = { candidates: DescribeCandidate[]; description: string }
+type DescribeParsed = { candidates: DescribeCandidate[]; description: string; hasDuplicate: boolean }
 
 const toScope = (value: unknown): DescribeScope => (value === 'whole' ? 'whole' : 'part')
 
@@ -54,6 +55,7 @@ const parseDescribeJson = (content: string): DescribeParsed | null => {
       // 兼容旧的单 label 返回：老模型/降级路径可能仍吐 {label,description}。
       label?: unknown
       description?: unknown
+      hasDuplicate?: unknown
     }
     const rawList = Array.isArray(parsed.candidates)
       ? parsed.candidates
@@ -71,6 +73,8 @@ const parseDescribeJson = (content: string): DescribeParsed | null => {
     return {
       candidates,
       description: typeof parsed.description === 'string' ? parsed.description.trim().slice(0, 120) : '',
+      // 缺省/非布尔 → true（保守：拿不准时带上保护句，宁可多防不误删）。
+      hasDuplicate: parsed.hasDuplicate === false ? false : true,
     }
   } catch {
     return null
@@ -151,7 +155,7 @@ export const describeRegionHandler: Handler<{ Bindings: HttpBindings }> = async 
     const gatewayKey = resolveGatewayKey(c).trim()
     if (!gatewayKey) {
       log(200, 'no-key')
-      return c.json({ candidates: [], label: '', description: '', degradedReason: 'no-key' }, 200)
+      return c.json({ candidates: [], label: '', description: '', hasDuplicate: true, degradedReason: 'no-key' }, 200)
     }
 
     const { files } = await parseMultipartBody(c)
@@ -192,12 +196,15 @@ export const describeRegionHandler: Handler<{ Bindings: HttpBindings }> = async 
 
     if (!result) {
       log(200, 'degraded')
-      return c.json({ candidates: [], label: '', description: '', degradedReason: 'upstream' }, 200)
+      return c.json({ candidates: [], label: '', description: '', hasDuplicate: true, degradedReason: 'upstream' }, 200)
     }
     // label = 默认选中项（最具体的部位，即列表最后一项）——兼容旧的单 label 调用方。
     const defaultLabel = result.candidates.at(-1)?.label ?? ''
     log(200, result.candidates.length ? 'ok' : 'empty')
-    return c.json({ candidates: result.candidates, label: defaultLabel, description: result.description }, 200)
+    return c.json(
+      { candidates: result.candidates, label: defaultLabel, description: result.description, hasDuplicate: result.hasDuplicate },
+      200,
+    )
   } catch (error) {
     const status = error instanceof RequestBodyTooLargeError ? 413 : 500
     log(status, 'error')
