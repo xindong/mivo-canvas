@@ -30,21 +30,7 @@ import type { MivoEditRequest, MivoGenerateRequest, VariationParam } from '../ty
 import { MivoImageRequestError, formatMivoClientError } from './mivoImageClient'
 import { useAuthStore } from '../store/authSlice'
 import { toastFeedback } from '../store/toastStore'
-import { useSettingsStore } from '../store/settingsSlice'
-
-// Per-request key headers (B1: keys live browser-side). X-Mivo-Api-Key is wired
-// into the BFF platform ctx + per-key token bucketing (server/lib/keys.ts +
-// server/platform/state.ts); X-Gateway-Key is a reserved passthrough slot the BFF
-// does not read yet (env MIVO_IMAGE_API_KEY stays SSoT for llm-proxy). Reading
-// getState() per call (not a hook) keeps this module usable from non-component
-// call sites and always reflects the latest persisted key.
-const authHeaders = (): Record<string, string> => {
-  const { mivoKey, gatewayKey } = useSettingsStore.getState()
-  const headers: Record<string, string> = {}
-  if (mivoKey) headers['X-Mivo-Api-Key'] = mivoKey
-  if (gatewayKey) headers['X-Gateway-Key'] = gatewayKey
-  return headers
-}
+import { authHeaders } from './authHeaders'
 
 const defaultModel = 'gpt-image-2'
 const submitTimeoutMs = 30_000 // POST must return 202 quickly

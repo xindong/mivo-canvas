@@ -6,11 +6,9 @@
 // Header contract (E2 ↔ E1):
 //   X-Mivo-Api-Key  — mivo_ MCP key. WIRED: drives platform ctx + per-key token
 //                     bucketing in server/platform/state.ts.
-//   X-Gateway-Key   — sk- gateway key. RESERVED passthrough slot only; NOT wired
-//                     into business logic yet (env MIVO_IMAGE_API_KEY stays SSoT
-//                     for llm-proxy imageApiKey/llmApiKey until the gateway-key
-//                     workstream lands). Frontend already injects it so server
-//                     adoption is a one-line change later.
+//   X-Gateway-Key   — sk- gateway key. WIRED: drives llm-proxy calls (enhance /
+//                     describe-region / compose-mask-edit via resolveGatewayKey).
+//                     Falls back to env MIVO_LLM_API_KEY when absent.
 import type { Context } from 'hono'
 import { getEnvConfig, type PlatformCtx } from './config'
 
@@ -84,4 +82,57 @@ export const rejectInvalidMivoApiKey = (c: Context): Response | null => {
   const validation = validateMivoApiKeyHeader(c)
   if (validation.ok) return null
   return c.json({ error: validation.error }, validation.status)
+}
+
+// Gateway key (sk-) header resolution + validation. Used by the LLM routes
+// (enhance / describe-region / compose-mask-edit) that call llm-proxy. Reads
+// X-Gateway-Key → falls back to env MIVO_LLM_API_KEY (= MIVO_IMAGE_API_KEY fallback
+// in getEnvConfig) for programmatic / single-deployment callers.
+// present-but-invalid (non-sk- / non-ASCII / too long) → 400, NO fallback to env
+// (防脏 header 构造 Bearer 时 ByteString 异常被误报"网络连接失败";对齐 keys.ts
+// /test 路由的非 ASCII 校验)。missing/blank → ok(fallback env via resolveGatewayKey)。
+const GATEWAY_KEY_MAX_LENGTH = 128
+// sk- 前缀 + 可打印 ASCII(无空格/控制/非 ASCII)—— 严到能防 ByteString 异常,宽到
+// 不误拒真实 sk- key(其字符集是 ASCII 子集)。
+const GATEWAY_KEY_REGEX = /^sk-[\x21-\x7e]+$/
+
+export type GatewayKeyHeaderValidation =
+  | { ok: true }
+  | { ok: false; status: 400; error: string }
+
+export const validateGatewayKeyHeader = (c: Context): GatewayKeyHeaderValidation => {
+  const raw = c.req.header(GATEWAY_KEY_HEADER)
+  if (raw === undefined) return { ok: true }
+  const trimmed = raw.trim()
+  if (trimmed === '') return { ok: true }
+  if (trimmed.length > GATEWAY_KEY_MAX_LENGTH) {
+    return { ok: false, status: 400, error: 'X-Gateway-Key 过长（上限 128 字符）' }
+  }
+  if (!GATEWAY_KEY_REGEX.test(trimmed)) {
+    return { ok: false, status: 400, error: 'X-Gateway-Key 格式无效（需 sk- 前缀 + 不含空格/中文）' }
+  }
+  return { ok: true }
+}
+
+/**
+ * Reject a malformed X-Gateway-Key at the route boundary. Returns the 400 Response
+ * to send immediately, or null when the header is absent/blank/well-formed (caller
+ * proceeds; resolveGatewayKey picks up the header or falls back to env).
+ */
+export const rejectInvalidGatewayKey = (c: Context): Response | null => {
+  const validation = validateGatewayKeyHeader(c)
+  if (validation.ok) return null
+  return c.json({ error: validation.error }, validation.status)
+}
+
+/**
+ * Resolve the gateway key (sk-) for a Hono route handler. Prefer the browser-
+ * injected X-Gateway-Key, fall back to env MIVO_LLM_API_KEY. Caller should call
+ * rejectInvalidGatewayKey(c) first so a present-but-invalid header is rejected
+ * (this function assumes the header is absent or already validated).
+ */
+export const resolveGatewayKey = (c: Context): string => {
+  const env = getEnvConfig()
+  const headerKey = c.req.header(GATEWAY_KEY_HEADER)?.trim() ?? ''
+  return headerKey || env.llmApiKey
 }

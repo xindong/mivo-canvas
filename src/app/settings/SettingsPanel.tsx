@@ -96,11 +96,11 @@ export function SettingsPanel() {
                 <span className="settings-account-sub">XD.Inc · SSO</span>
               </div>
               {isAuthenticated ? (
-                <button type="button" className="settings-logout-btn" onClick={handleLogout}>
+                <button type="button" className="settings-auth-btn" onClick={handleLogout}>
                   <LogOut size={15} /> 登出
                 </button>
               ) : (
-                <button type="button" className="settings-login-btn" onClick={handleLogin}>
+                <button type="button" className="settings-auth-btn" onClick={handleLogin}>
                   <LogIn size={15} /> 登录
                 </button>
               )}

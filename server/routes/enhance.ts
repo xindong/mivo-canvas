@@ -14,6 +14,7 @@ import {
 } from '../lib/config'
 import { RequestBodyTooLargeError, UpstreamRequestTimeoutError, fetchUpstreamWithTimeout } from '../lib/upstream'
 import { logRequest, newRequestId, readJsonBody } from '../lib/request'
+import { rejectInvalidGatewayKey, resolveGatewayKey } from '../lib/keys'
 
 // intent='edit' → edit-specific system prompt (partial-modification guidance).
 // intent omitted / 'generate' / anything else → existing generate prompt, byte-for-byte unchanged.
@@ -243,7 +244,16 @@ export const enhanceHandler: Handler<{ Bindings: HttpBindings }> = async (c) => 
       return c.json({ error: 'Method not allowed' }, 405)
     }
 
-    if (!env.llmApiKey.trim()) {
+    // Gateway key (sk-): X-Gateway-Key header → fallback env MIVO_LLM_API_KEY.
+    // present-but-invalid → 400(不 fallback env,防脏 header 构造 Bearer 异常被误报网络失败)。
+    const badGatewayKey = rejectInvalidGatewayKey(c)
+    if (badGatewayKey) {
+      log(400, 'bad-gateway-key')
+      return badGatewayKey
+    }
+    const gatewayKey = resolveGatewayKey(c).trim()
+
+    if (!gatewayKey) {
       log(200, 'no-key')
       return c.json({ enhanced: false, degradedReason: 'no-key' }, 200)
     }
@@ -294,7 +304,7 @@ export const enhanceHandler: Handler<{ Bindings: HttpBindings }> = async (c) => 
     let { result, reason: degradedReason } = await callEnhanceLlm(
       mivoEnhancePrimaryModel,
       llmMessages,
-      env.llmApiKey.trim(),
+      gatewayKey,
       env.enhancePrimaryTimeoutMs,
       env.llmApiBase,
     )
@@ -306,7 +316,7 @@ export const enhanceHandler: Handler<{ Bindings: HttpBindings }> = async (c) => 
       const fallback = await callEnhanceLlm(
         mivoEnhanceFallbackModel,
         llmMessages,
-        env.llmApiKey.trim(),
+        gatewayKey,
         env.enhanceFallbackTimeoutMs,
         env.llmApiBase,
       )

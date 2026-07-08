@@ -2,6 +2,7 @@ import type { MivoCanvasNode } from '../types/mivoCanvas'
 import type { EnhanceRequest, EnhanceResponse, MivoEditRequest, MivoGenerateRequest, MivoImageQuality, MivoImageResponse } from '../types/generation'
 import { debugLogger } from '../store/debugLogStore'
 import { readImportedAssetFile } from './assetStorage'
+import { authHeaders } from './authHeaders'
 
 const defaultModel = 'gpt-image-2'
 const mivoRequestTimeoutMs = 310_000
@@ -195,7 +196,7 @@ export const enhanceMivoPrompt = async (request: EnhanceRequest): Promise<Enhanc
       '/api/mivo/enhance',
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         signal,
         body: JSON.stringify(body),
       },

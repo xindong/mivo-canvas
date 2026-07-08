@@ -12,6 +12,7 @@ import type { HttpBindings } from '@hono/node-server'
 import { getEnvConfig, mivoDescribeFallbackModel, mivoDescribePrimaryModel } from '../lib/config'
 import { fetchUpstreamWithTimeout } from '../lib/upstream'
 import { logRequest, newRequestId, readJsonBody } from '../lib/request'
+import { rejectInvalidGatewayKey, resolveGatewayKey } from '../lib/keys'
 
 type ComposeAnchor = { n: number; label: string; position?: string }
 
@@ -110,6 +111,13 @@ export const composeMaskEditHandler: Handler<{ Bindings: HttpBindings }> = async
       log(405)
       return c.json({ error: 'Method not allowed' }, 405)
     }
+    // Gateway key (sk-): X-Gateway-Key → fallback env MIVO_LLM_API_KEY;present-but-invalid → 400。
+    const badGatewayKey = rejectInvalidGatewayKey(c)
+    if (badGatewayKey) {
+      log(400, 'bad-gateway-key')
+      return badGatewayKey
+    }
+    const gatewayKey = resolveGatewayKey(c).trim()
     const body = await readJsonBody<{ instruction?: unknown; anchors?: unknown }>(c)
     const instruction = typeof body.instruction === 'string' ? body.instruction.trim().slice(0, 1000) : ''
     const anchors = sanitizeAnchors(body.anchors)
@@ -117,7 +125,7 @@ export const composeMaskEditHandler: Handler<{ Bindings: HttpBindings }> = async
       log(200, 'noop')
       return c.json({ requirements: [], degradedReason: 'noop' }, 200)
     }
-    if (!env.llmApiKey.trim()) {
+    if (!gatewayKey) {
       log(200, 'no-key')
       return c.json({ requirements: [], degradedReason: 'no-key' }, 200)
     }
@@ -126,7 +134,7 @@ export const composeMaskEditHandler: Handler<{ Bindings: HttpBindings }> = async
       mivoDescribePrimaryModel,
       instruction,
       anchors,
-      env.llmApiKey.trim(),
+      gatewayKey,
       env.enhancePrimaryTimeoutMs,
       env.llmApiBase,
     )
@@ -135,7 +143,7 @@ export const composeMaskEditHandler: Handler<{ Bindings: HttpBindings }> = async
         mivoDescribeFallbackModel,
         instruction,
         anchors,
-        env.llmApiKey.trim(),
+        gatewayKey,
         env.enhanceFallbackTimeoutMs,
         env.llmApiBase,
       )

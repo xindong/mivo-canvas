@@ -8474,7 +8474,9 @@ button:disabled {
   font-size: 12px;
   color: var(--muted);
 }
-.settings-logout-btn {
+/* Reusable pill for the account-section auth action (login when unauthenticated,
+   logout when authenticated) — same size/roundness/icon-gap, only text/icon/onClick differ. */
+.settings-auth-btn {
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -8486,7 +8488,7 @@ button:disabled {
   border-radius: 999px;
   cursor: pointer;
 }
-.settings-logout-btn:hover {
+.settings-auth-btn:hover {
   background: rgba(35, 35, 35, 0.05);
 }
 

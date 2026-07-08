@@ -10,6 +10,7 @@
 // 红色取 overlay 标记红(#ff2d2d,见 App.css .image-mask-edit-region)保持一致;
 // 线宽/圆环半径随图像尺寸按比例缩放,大图上不写死小像素(否则看不见)。
 import { debugLogger } from '../store/debugLogStore'
+import { authHeaders } from './authHeaders'
 import type { ImageMaskBounds, ImageMaskPoint } from '../canvas/imageMaskGeometry'
 
 /** 端点返回的候选标签(由粗到细,末位为最具体部位)。scope: whole=整体主体 / part=具体部位。 */
@@ -256,7 +257,7 @@ export const describeRegionCrop = async (
     const form = new FormData()
     form.append('crop', crop, 'crop.png')
     if (contextImage) form.append('context', contextImage, 'context.png')
-    const response = await fetch('/api/mivo/describe-region', { method: 'POST', body: form, signal })
+    const response = await fetch('/api/mivo/describe-region', { method: 'POST', headers: authHeaders(), body: form, signal })
     if (!response.ok) {
       debugLogger.warn('Mask Edit', `describe-region 非 2xx(${response.status}),识别回退 []`)
       return []
