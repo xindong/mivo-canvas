@@ -14,7 +14,6 @@ import {
   useSettingsStore,
 } from '../../store/settingsSlice'
 import { debugLogger } from '../../store/debugLogStore'
-import { toastFeedback } from '../../store/toastStore'
 import { GatewayKeyDialog } from './GatewayKeyDialog'
 import { MivoKeySection } from './MivoKeySection'
 
@@ -46,8 +45,7 @@ export function SettingsPanel() {
 
   const handleLogout = () => {
     debugLogger.log('Auth', 'Logout requested from settings panel')
-    logout()
-    toastFeedback.info('已登出')
+    logout() // logout() does the toast (SSO scheme: local clear + gateway-session TODO note)
     closeSettings()
   }
 
@@ -84,7 +82,7 @@ export function SettingsPanel() {
               </span>
               <div className="settings-account-info">
                 <span className="settings-account-name">{user?.name || '未登录'}</span>
-                <span className="settings-account-sub">XD.Inc · 飞书身份</span>
+                <span className="settings-account-sub">XD.Inc · SSO</span>
               </div>
               <button type="button" className="settings-logout-btn" onClick={handleLogout}>
                 <LogOut size={15} /> 登出

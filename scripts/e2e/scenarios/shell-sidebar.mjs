@@ -32,6 +32,9 @@ export const runShellSidebarScenario = async (context) => {
   await page.addInitScript(() => {
     try { window.localStorage.clear() } catch { /* opaque origin */ }
     try { window.sessionStorage.clear() } catch { /* opaque origin */ }
+    // SSO dev stub → logged-in + no keys → AutoPromptSettings would auto-open the
+    // panel + intercept clicks. Suppress it here (this scenario doesn't test the prompt).
+    window.__MIVO_E2E_DISABLE_AUTO_PROMPT__ = true
   })
   await page.goto(canvasUrl || baseUrl, { waitUntil: 'networkidle' })
   await waitForCanvasReady(page, rendererMode)
@@ -216,9 +219,13 @@ export const runShellSidebarScenario = async (context) => {
   }
   const debugLogPlacement = await page.evaluate(() => {
     const debugLog = document.querySelector('[aria-label="Debug Log"]')?.getBoundingClientRect()
-    // F2: old Settings button deleted; the sidebar bottom entry is now UserChip
-    // (stub auth → "Log In" row). Pin placement against the user chip, not Settings.
-    const userChip = document.querySelector('[aria-label="Log in"]')?.getBoundingClientRect()
+    // F2: old Settings button deleted; the sidebar bottom entry is now UserChip.
+    // SSO dev stub → logged-in → UserChip is .user-chip (aria-label="Open settings").
+    // Fallback to [aria-label="Log in"] for the unauthenticated row (stub off / 401).
+    const userChip =
+      document.querySelector('.user-chip')?.getBoundingClientRect() ||
+      document.querySelector('[aria-label="Open settings"]')?.getBoundingClientRect() ||
+      document.querySelector('[aria-label="Log in"]')?.getBoundingClientRect()
 
     return {
       debugBottom: debugLog?.bottom,
@@ -468,12 +475,14 @@ export const runShellSidebarScenario = async (context) => {
   // The menu-interaction assertions (expand / Preferences / warn-on-click) are
   // covered by userchip.mjs; here we only pin the user-chip row's grid layout so
   // the sidebar bottom row keeps its icon/text horizontal arrangement.
-  const loginRowDisplay = await page.getByRole('button', { name: 'Log in' }).evaluate((row) => ({
+  // SSO dev stub → logged-in → .user-chip; fallback [aria-label="Log in"] if stub off.
+  const chipRow = page.locator('.user-chip, [aria-label="Log in"]').first()
+  const chipRowDisplay = await chipRow.evaluate((row) => ({
     display: window.getComputedStyle(row).display,
     columns: window.getComputedStyle(row).gridTemplateColumns,
   }))
-  if (loginRowDisplay.display !== 'grid' || loginRowDisplay.columns.split(' ').length < 3) {
-    throw new Error(`User chip Log In row should keep icon/text in a horizontal grid layout: ${JSON.stringify(loginRowDisplay)}`)
+  if (chipRowDisplay.display !== 'grid' || chipRowDisplay.columns.split(' ').length < 2) {
+    throw new Error(`User chip row should keep icon/text in a horizontal grid layout: ${JSON.stringify(chipRowDisplay)}`)
   }
   const sidebarTypeScale = await page.evaluate(() => {
     const navRow = document.querySelector('.project-sidebar .nav-row')

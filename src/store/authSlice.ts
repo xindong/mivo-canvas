@@ -1,24 +1,12 @@
 // src/store/authSlice.ts
-// feat/auth-feishu-login (E1 · 鉴权骨干)
+// SSO 网关方案(feat/auth-sso):身份由 nginx 网关(auth.dsworks.cn)提供 /api/auth/me,
+// app 不做 OAuth。登录 = 整页跳转网关登录页;登出 = 本地清 + TODO(网关登出端点待 ops 提供)。
+// 无 persist —— 每次 hydrate 读 /me,避免本地态与网关 session 不同步。
 //
-// A2 身份依赖 maker server:前端不持有 JWT(httpOnly cookie,JS 读不到),
-// 登录态由 GET /api/auth/me 水合。无 persist —— 会话在 BFF cookie(服务端),
-// 每次页面加载重新水合,避免本地态与 cookie 不同步。
-//
-// 不做硬登录墙(用户需求 2026-07-07):应用未登录可用,入口在侧栏用户 chip(E2)。
-// 受保护 AI/生图 API 401 → mivoTaskClient 调 markUnauthenticated() + toast 提示登录。
-//
-// 接口契约(与 E2 汇合点):useAuthStore 暴露 { user:{id,name,avatar}|null, status, login(), logout() }。
-// hydrate/devLogin/markUnauthenticated 为 E1 内部 + 供 E2 dev 模式可选调用。
+// 接口契约:useAuthStore { user:{id,name,avatar}|null, status, login(), logout() }。
+// markUnauthenticated 供 mivoTaskClient 在受保护 API 401(网关 session 过期)时调。
 import { create } from 'zustand'
-import {
-  fetchLoginUrl,
-  fetchMe,
-  fetchLogout,
-  fetchDevLogin,
-  AuthError,
-  type AuthUser,
-} from '../lib/authClient'
+import { fetchMe, type AuthUser } from '../lib/authClient'
 import { debugLogger } from './debugLogStore'
 import { toastFeedback } from './toastStore'
 
@@ -27,18 +15,18 @@ export type AuthStatus = 'unknown' | 'authenticated' | 'unauthenticated'
 type AuthState = {
   user: AuthUser | null
   status: AuthStatus
-  // 启动时调:GET /api/auth/me 水合登录态。200 {authenticated:false} → 未登录(info);
-  // non-2xx(502 maker 不可达)→ 未登录 + 警告日志。
+  // 启动时调:GET /api/auth/me 水合登录态(网关 200 已登录 / 401 未登录)。
   hydrate: () => Promise<void>
-  // 未登录入口:GET /api/auth/login-url → 整页跳转飞书 authorize。
+  // 未登录入口:整页跳转 SSO 网关登录页(service=mivo_canvas,redirect=当前页)。
   login: () => Promise<void>
-  // 登出:POST /api/auth/logout(清 BFF cookie)+ 本地置未登录。
+  // 登出:TODO 网关登出端点待 ops 提供;先本地清状态 + 提示(网关 session 未清,刷新会重新登录)。
   logout: () => Promise<void>
-  // DEV-only:POST /api/auth/dev-login(镜像 maker dev-login)。生产 404 → toast 提示未启用。
-  devLogin: () => Promise<void>
   // 受保护 API 401 时由 mivoTaskClient 调:置未登录(幂等,不重复刷)。
   markUnauthenticated: () => void
 }
+
+// SSO 网关登录页。redirect=当前页绝对 URL(网关登录后回跳回应用)。
+const SSO_LOGIN_URL = 'https://auth.dsworks.cn/login'
 
 export const useAuthStore = create<AuthState>()((set, get) => ({
   user: null,
@@ -51,14 +39,12 @@ export const useAuthStore = create<AuthState>()((set, get) => ({
         set({ user: me.user, status: 'authenticated' })
         debugLogger.log('Auth', `会话已恢复:${me.user.name} (${me.user.id})`)
       } else {
-        // /me 200 探测语义:authenticated=false = 未登录(含未配置鉴权 / 无 cookie /
-        // 无效过期 cookie)。这是预期态,打 info 不告警 —— 避免本地/dev 环境每次启动
-        // 刷 warn(e2e init-warning 断言也会误挂),且浏览器 console 零网络错(200)。
+        // 网关 401 / dev 桩未开 → 未登录。预期态,打 info 不告警。
         set({ user: null, status: 'unauthenticated' })
-        debugLogger.log('Auth', '未登录(无有效会话)')
+        debugLogger.log('Auth', '未登录(网关 401 / dev 桩未开)')
       }
     } catch (err) {
-      // non-2xx 真错误(maker 不可达 502 等)→ 未登录 + 警告日志。
+      // non-2xx 真错误(非 401)→ 未登录 + 警告日志。
       set({ user: null, status: 'unauthenticated' })
       const msg = err instanceof Error ? err.message : String(err)
       debugLogger.warn('Auth', `会话恢复失败,按未登录处理:${msg}`)
@@ -66,46 +52,19 @@ export const useAuthStore = create<AuthState>()((set, get) => ({
   },
 
   login: async () => {
-    // 回调后 302 回当前路径(含 query),保持上下文。
-    const returnTo = window.location.pathname + window.location.search
-    try {
-      const authorizeUrl = await fetchLoginUrl(returnTo)
-      debugLogger.log('Auth', '跳转飞书授权页')
-      window.location.href = authorizeUrl
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      debugLogger.error('Auth', `登录启动失败:${msg}`)
-      toastFeedback.error('登录启动失败,请稍后重试。')
-    }
+    // 整页跳转 SSO 网关登录页;service=mivo_canvas,redirect=当前页绝对 URL。
+    const redirect = window.location.href
+    const loginUrl = `${SSO_LOGIN_URL}?service=mivo_canvas&redirect=${encodeURIComponent(redirect)}`
+    debugLogger.log('Auth', `跳转 SSO 网关登录:${loginUrl}`)
+    window.location.href = loginUrl
   },
 
   logout: async () => {
-    try {
-      await fetchLogout()
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      debugLogger.warn('Auth', `登出请求失败(本地仍清登出态):${msg}`)
-    }
+    // TODO: SSO 网关登出端点待 ops 提供;先本地清状态 + 提示。
+    // 注意:网关 session 未清,刷新会重新登录态(本地清仅影响内存,无 persist)。
     set({ user: null, status: 'unauthenticated' })
-    debugLogger.log('Auth', '已登出')
-    toastFeedback.success('已登出')
-  },
-
-  devLogin: async () => {
-    try {
-      const user = await fetchDevLogin()
-      set({ user, status: 'authenticated' })
-      debugLogger.log('Auth', `Dev 登录成功:${user.name} (${user.id})`)
-      toastFeedback.success(`Dev 登录:${user.name}`)
-    } catch (err) {
-      if (err instanceof AuthError && err.status === 404) {
-        toastFeedback.warn('Dev 登录未启用(需 MIVO_DEV_AUTH_ENABLED=1)。')
-      } else {
-        const msg = err instanceof Error ? err.message : String(err)
-        debugLogger.error('Auth', `Dev 登录失败:${msg}`)
-        toastFeedback.error('Dev 登录失败。')
-      }
-    }
+    debugLogger.warn('Auth', '本地登出:网关 session 未清,刷新会重新登录;待 ops 提供网关登出端点后补跳转')
+    toastFeedback.info('已本地登出。完整登出请通过 SSO 网关(端点待补)。')
   },
 
   markUnauthenticated: () => {

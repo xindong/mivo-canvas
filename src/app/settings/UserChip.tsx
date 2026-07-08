@@ -1,7 +1,9 @@
 // src/app/settings/UserChip.tsx
-// Sidebar bottom user chip. Not authenticated → "Log In" row (login() → Feishu
-// OAuth redirect); authenticated → avatar + name + "XD.Inc · v<version>", opens
-// the settings panel via the store's openSettings action (so AutoPromptSettings
+// Sidebar bottom user chip. SSO gateway scheme: production forces login (gateway),
+// so a user reaching the app is already authenticated → chip shows display_name +
+// initial-avatar (SSO has no avatar image). Not authenticated (rare, session
+// expired) → "Log In" row (login() → SSO gateway redirect). Clicking the chip
+// opens the settings panel via the store's openSettings action (so AutoPromptSettings
 // can also open it programmatically). The panel itself renders at the App root,
 // so this chip only triggers openSettings — it does not host the panel.
 import { LogIn } from 'lucide-react'

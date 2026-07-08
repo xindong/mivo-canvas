@@ -1,16 +1,15 @@
-// E2E scenario: UserChip (sidebar bottom) — the new settings entry.
-// F2 regression guard: the old .settings-row Settings button + .settings-menu
-// were deleted and replaced by UserChip. Unauthenticated state shows a "Log In"
-// row; clicking it triggers the REAL login() flow (GET /api/auth/login-url).
-// In the dev e2e env the BFF has no JWT_SECRET, so login-url returns 200 with
-// {authorizeUrl:null, error:'auth_not_configured'} (200-probe semantics — a 503
-// would pollute the browser console and trip the harness console-error guard).
-// login() sees no authorizeUrl → throws → surfaces an observable "登录启动失败"
-// error log (per docs/development-logging.md). We assert that failure path is
-// observable, not a crash — the logged-in success path (302 to Feishu) needs a
-// configured auth env + ops callback allowlist and is out of scope for local e2e.
+// E2E scenario: UserChip (sidebar bottom) — the settings entry.
+// SSO scheme: production forces login (gateway), so a user reaching the app is
+// already authenticated. In dev e2e the BFF's /api/auth/me stub returns a fake
+// logged-in user → UserChip shows the chip (initial-avatar + display_name).
+// Clicking it opens the settings panel (which has the account/logout section).
+// The unauthenticated "Log In" path (→ SSO gateway redirect) can't be exercised
+// in local e2e (redirect leaves the app), so we assert the logged-in chip flow.
 export const runUserChipScenario = async (context) => {
   const { baseUrl, page } = context
+  // SSO dev stub → logged-in + no keys → AutoPromptSettings would auto-open the
+  // panel + intercept the chip click. Suppress it (this scenario tests the chip, not the prompt).
+  await page.addInitScript(() => { window.__MIVO_E2E_DISABLE_AUTO_PROMPT__ = true })
   await page.goto(baseUrl, { waitUntil: 'networkidle' })
   await page.waitForSelector('.project-sidebar')
 
@@ -20,18 +19,17 @@ export const runUserChipScenario = async (context) => {
   const oldSettingsMenu = await page.locator('.settings-menu').count()
   if (oldSettingsMenu) throw new Error('old .settings-menu should be deleted (F2)')
 
-  // Unauthenticated → "Log In" row (reuses .settings-row, aria-label="Log in").
-  const loginRow = page.getByRole('button', { name: 'Log in', exact: true })
-  await loginRow.waitFor()
-  await loginRow.click()
+  // Dev stub /me → authenticated → UserChip renders (.user-chip, not the Log In row).
+  const chip = page.locator('.user-chip').first()
+  await chip.waitFor()
+  // The chip shows the dev stub user's display_name ("本地开发").
+  await page.getByText('本地开发', { exact: false }).first().waitFor()
 
-  // Real login() calls /api/auth/login-url; dev BFF (no JWT_SECRET) → 200 with
-  // authorizeUrl:null, so login() throws + logs a debugLogger.error. Verify it
-  // landed in the Debug Log so the failure path is observable (getByText retries,
-  // tolerating the async fetch).
-  await page.getByRole('button', { name: 'Debug Log', exact: true }).click()
-  await page.locator('.debug-log-panel').waitFor()
-  await page.getByText('登录启动失败', { exact: false }).first().waitFor()
-  await page.getByRole('button', { name: 'Close debug log' }).click()
-  await page.waitForSelector('.debug-log-panel', { state: 'detached' })
+  // Click the chip → opens the settings panel.
+  await chip.click()
+  await page.waitForSelector('.settings-panel', { state: 'visible' })
+
+  // Close the panel.
+  await page.getByRole('button', { name: '关闭设置' }).click()
+  await page.waitForSelector('.settings-panel', { state: 'detached' })
 }

@@ -26,6 +26,13 @@ export function AutoPromptSettings() {
   const settingsHydrated = useSettingsStore((state) => state._hydrated)
 
   useEffect(() => {
+    // e2e opt-out: non-auto-prompt scenarios set window.__MIVO_E2E_DISABLE_AUTO_PROMPT__
+    // (via addInitScript) so the dev stub's logged-in state doesn't auto-open the
+    // panel + intercept their clicks. The auto-prompt-settings scenario leaves it
+    // unset so this effect fires normally.
+    if (typeof window !== 'undefined' && window.__MIVO_E2E_DISABLE_AUTO_PROMPT__ === true) {
+      return
+    }
     if (
       !shouldAutoPromptSettings({ authStatus, keysComplete, autoPrompted, settingsHydrated })
     ) {
