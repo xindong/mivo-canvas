@@ -8,7 +8,7 @@
 // finally block before the next starts.
 //
 // Usage:
-//   node scripts/visual-shell-baselines.mjs              # run all 11 shell fixtures
+//   node scripts/visual-shell-baselines.mjs              # run all 12 shell fixtures
 //   node scripts/visual-shell-baselines.mjs --only=sidebar   # run just shell-sidebar
 import { spawn } from 'node:child_process'
 import process from 'node:process'
@@ -17,8 +17,9 @@ import { projectRoot } from './bench/fixture-lib.mjs'
 const FIXTURES = [
   'shell-sidebar',
   'shell-sidebar-collapsed',
-  'shell-canvas-context-menu',
-  'shell-canvas-context-submenu',
+  'shell-sidebar-canvas-menu',
+  'shell-sidebar-canvas-submenu',
+  'shell-node-context-menu',
   'shell-confirm-dialog',
   'shell-canvas-rename',
   'shell-chat-empty',

@@ -541,9 +541,9 @@ const SHELL_FIXTURES = {
     screenshotKind: 'element',
     screenshotSelector: 'nav.top-navigation',
   },
-  'shell-canvas-context-menu': {
+  'shell-sidebar-canvas-menu': {
     kind: 'shell',
-    description: '画板行右键菜单:重命名 / 移动到项目 ▸ / 复制画板 / ─ / 删除',
+    description: '侧栏画板行右键菜单(非画布 NodeActionMenu):重命名 / 移动到项目 ▸ / 复制画板 / ─ / 删除',
     async setup(page) {
       await injectSidebarSeed(page)
       await page.locator('.canvas-row').first().click({ button: 'right', force: true })
@@ -552,9 +552,9 @@ const SHELL_FIXTURES = {
     screenshotKind: 'viewport',
     screenshotSelector: null,
   },
-  'shell-canvas-context-submenu': {
+  'shell-sidebar-canvas-submenu': {
     kind: 'shell',
-    description: '右键菜单「移动到项目」子菜单展开(2 项目 + 移到 Canvas)',
+    description: '侧栏画板行菜单「移动到项目」子菜单展开(2 项目 + 移到 Canvas)',
     async setup(page) {
       await injectSidebarSeed(page)
       await page.locator('.canvas-row').first().click({ button: 'right', force: true })
@@ -567,6 +567,72 @@ const SHELL_FIXTURES = {
     readySelector: '.sidebar-context-menu-submenu',
     screenshotKind: 'viewport',
     screenshotSelector: null,
+  },
+  'shell-node-context-menu': {
+    kind: 'shell',
+    description: '画布 NodeActionMenu(右键 image 节点):View details / Copy image / Duplicate image / Fit selection … — canvasActionModel.contextMenuGroupsFor(单 image),区别于侧栏画板行菜单',
+    async setup(page) {
+      // Seed a single ready image node, then right-click it. The right-click lands
+      // on .dom-node (pointer-events:auto) → handleCanvasContextMenu →
+      // nodeIdFromDomTarget resolves data-node-id → openNodeContextMenu →
+      // NodeActionMenu renders contextMenuGroupsFor(single image). This is the
+      // T2.3 command-migration UI face; the postReady guard proves it is the real
+      // canvas node menu (English "View details"), not the sidebar canvas-row menu.
+      const node = {
+        id: 'img-context-1',
+        type: 'image',
+        title: '勇气 01',
+        status: 'ready',
+        x: 300,
+        y: 200,
+        width: 320,
+        height: 320,
+        assetUrl: '/demo-assets/courage-1.jpg',
+      }
+      await page.evaluate(async (n) => {
+        const { useCanvasStore } = await import('/src/store/canvasStore.ts')
+        useCanvasStore.setState({
+          sceneId: 'canvas-active',
+          projects: [],
+          canvases: {
+            'canvas-active': {
+              title: '当前画板',
+              createdAt: '2026-06-25T09:00:00+08:00',
+              updatedAt: '2026-07-08T11:00:00+08:00',
+              nodes: [n],
+              edges: [],
+              tasks: [],
+            },
+          },
+          nodes: [n],
+          edges: [],
+          tasks: [],
+          selectedNodeId: undefined,
+          selectedNodeIds: [],
+        })
+      }, node)
+      await page.locator('.dom-node[data-node-type="image"]').first().click({ button: 'right' })
+    },
+    readySelector: '.node-action-menu',
+    screenshotKind: 'viewport',
+    screenshotSelector: null,
+    postReady: async (page) => {
+      // Hard guard (F2): prove this is the real canvas NodeActionMenu
+      // (contextMenuGroupsFor single image), not the sidebar canvas-row menu
+      // (which is Chinese 重命名/移动到项目/复制画板/删除). Single image →
+      // "View details" + "Duplicate image" items must be present.
+      const items = await page.locator('.node-action-item').allTextContents()
+      const joined = items.join('|')
+      if (!joined.includes('View details') || !joined.includes('Duplicate')) {
+        throw new Error(
+          `shell-node-context-menu: expected canvas NodeActionMenu (View details / Duplicate …), got items: ${joined}`,
+        )
+      }
+      // Wait for the seeded image to decode so the baseline is pixel-stable.
+      await page
+        .waitForFunction(allImagesComplete, '.dom-node[data-node-type="image"]', { timeout: 10000 })
+        .catch(() => {})
+    },
   },
   'shell-confirm-dialog': {
     kind: 'shell',
@@ -636,6 +702,11 @@ const SHELL_FIXTURES = {
   'shell-settings-panel': {
     kind: 'shell',
     description: '设置面板未登录态:账号区显示「登录」+ API Keys 锁定行',
+    // This fixture deliberately opens the Settings panel itself: the global
+    // __MIVO_E2E_DISABLE_AUTO_PROMPT__ flag suppresses the auto-prompt effect,
+    // so setup calls openSettings('account') directly to render .settings-panel.
+    // Opts out of the hard "settings-panel absent" guard in captureScreenshot.
+    expectSettingsPanel: true,
     async setup(page) {
       await page.evaluate(async () => {
         const { useAuthStore } = await import('/src/store/authSlice.ts')
@@ -703,6 +774,15 @@ const fixtureDescriptor = (fixture) => {
 const buildPageInitScript = (freeze) => {
   const lines = ['globalThis.__MIVO_BENCH_PERSIST_SKIP__ = true;']
   if (!freeze) return lines.join('\n')
+  // Shell fixtures opt out of the AutoPromptSettings effect (the existing
+  // window.__MIVO_E2E_DISABLE_AUTO_PROMPT__ opt-out in AutoPromptSettings.tsx):
+  // the BFF dev auth stub returns 401, which would otherwise auto-open the
+  // Settings overlay (account section) on every shell load and contaminate
+  // non-settings baselines — the shell-changelog-panel regression captured the
+  // overlay sitting over the changelog. shell-settings-panel opens the panel
+  // itself in its setup, so it isn't affected. Canvas fixtures keep the original
+  // init script (no settings UI in canvas view) — only shell (freeze=true) sets this.
+  lines.push('globalThis.__MIVO_E2E_DISABLE_AUTO_PROMPT__ = true;')
   lines.push(`
     const FROZEN = Date.parse(${JSON.stringify(FROZEN_NOW_ISO)});
     const RealDate = Date;
@@ -750,6 +830,19 @@ const captureScreenshot = async ({ browser, port, renderer, dpr, label, descript
     await page.waitForSelector(descriptor.readySelector, { state: 'visible', timeout: 15000 })
     if (descriptor.postReady) await descriptor.postReady(page, descriptor.screenshotSelector)
     await page.waitForTimeout(300)
+    // Hard guard (F1): non-settings shell fixtures must NOT show the Settings
+    // overlay. __MIVO_E2E_DISABLE_AUTO_PROMPT__ suppresses AutoPromptSettings, so
+    // a .settings-panel here means the overlay leaked into the baseline — the
+    // regression that contaminated shell-changelog-panel (settings overlay sat
+    // over the changelog). shell-settings-panel opts out via expectSettingsPanel.
+    if (!descriptor.expectSettingsPanel) {
+      const leaked = await page.locator('.settings-panel').count()
+      if (leaked > 0) {
+        throw new Error(
+          `shell fixture "${descriptor.name}" leaked .settings-panel (count=${leaked}); auto-prompt opt-out failed to suppress the Settings overlay`,
+        )
+      }
+    }
   } else if (fixtureNodes) {
     // 注入固定文档（replaceSnapshot 内部跑 normalizeCanvasGraph → connector
     // markupPoints 归一化，DOM/Leafer 消费同一输出）。
