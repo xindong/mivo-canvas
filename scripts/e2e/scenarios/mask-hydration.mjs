@@ -7,6 +7,15 @@
 
 import { clickCanvasNode, waitForNodeRendered } from '../renderer-evidence.mjs'
 
+// contentEditable 富文本编辑器输入(对齐 mask.mjs fillMaskPrompt):prompt 输入区自
+// 253bd42 起从 <textarea> 改为 contentEditable .image-mask-edit-editor,旧的
+// '.image-mask-edit-prompt textarea' 选择器失效(fill 必 30s 超时)。内联避免改共享文件。
+const fillMaskPrompt = async (page, text) => {
+  const editor = page.locator('.image-mask-edit-prompt .image-mask-edit-editor')
+  await editor.click()
+  await page.evaluate((t) => { document.execCommand('insertText', false, t) }, text)
+}
+
 const ensureChatPanelOpen = async (page) => {
   if (await page.locator('.ai-panel.collapsed').isVisible()) {
     await page.getByRole('button', { name: 'Open AI panel' }).click()
@@ -103,7 +112,7 @@ export const runMaskHydrationScenario = async (context) => {
   await openMaskEditorOn(page, rendererMode, 'ref-hero')
   await drawPointRegion(page)
   await page.waitForFunction(() => Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0') > 0)
-  await page.locator('.image-mask-edit-prompt textarea').fill('E2E hydration seed')
+  await fillMaskPrompt(page, 'E2E hydration seed')
   await page.locator('.image-mask-edit-prompt').getByRole('button', { name: '局部重绘' }).click()
   await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
 

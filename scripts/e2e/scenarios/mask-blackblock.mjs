@@ -20,6 +20,15 @@ const { PNG } = pngjs
 
 const REJECT_MESSAGE = '局部重绘结果异常，请重新选择区域或换源图后重试。'
 
+// contentEditable 富文本编辑器输入(对齐 mask.mjs fillMaskPrompt):prompt 输入区自
+// 253bd42 起从 <textarea> 改为 contentEditable .image-mask-edit-editor,旧的
+// '.image-mask-edit-prompt textarea' 选择器失效(fill 必 30s 超时)。内联避免改共享文件。
+const fillMaskPrompt = async (page, text) => {
+  const editor = page.locator('.image-mask-edit-prompt .image-mask-edit-editor')
+  await editor.click()
+  await page.evaluate((t) => { document.execCommand('insertText', false, t) }, text)
+}
+
 // ── 通用小工具 ──────────────────────────────────────────────────────────────
 
 const waitForCondition = async (fn, { timeout = 10000, interval = 50, label = 'condition' } = {}) => {
@@ -234,7 +243,7 @@ export const runMaskBlackblockScenario = async (context) => {
     if (!stage) throw new Error('Mask edit stage should be visible')
     await page.mouse.click(stage.x + stage.width * 0.52, stage.y + stage.height * 0.5)
     await page.waitForFunction(() => Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0') > 0)
-    await page.locator('.image-mask-edit-prompt textarea').fill(prompt)
+    await fillMaskPrompt(page, prompt)
     await page.locator('.image-mask-edit-prompt').getByRole('button', { name: '局部重绘' }).click()
     await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
     await ensureChatPanelOpen(page)
