@@ -31,6 +31,7 @@ const REWRITE_TIMEOUT_MS_DEFAULT = 120_000
 const CHANGELOG_TIME_ZONE = 'Asia/Shanghai'
 const REPO_SLUG = process.env.GITHUB_REPOSITORY || 'xindong/mivo-canvas'
 const [REPO_OWNER, REPO_NAME] = REPO_SLUG.split('/')
+const AUTO_RESOLVE_MARKER = 'changelog 自动补扫线程自清'
 
 // ---- 归天:与 src/lib/changelogDate.ts 的 toChangelogDay 语义一致 ----
 // 8:00 本地时区为界:07:59 归前一天,08:00 起归当天。禁用 toISOString(UTC 日会错移边界)。
@@ -160,7 +161,7 @@ query($owner: String!, $name: String!, $number: Int!, $after: String) {
           isResolved
           viewerCanReply
           viewerCanResolve
-          comments(first: 20) {
+          comments(first: 50) {
             nodes {
               author {
                 login
@@ -249,6 +250,7 @@ const stripReviewCommentForSummary = (body) =>
     .replace(/<[^>]+>/g, '')
     .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
     .replace(/`([^`]+)`/g, '$1')
+    .replace(/[<>]/g, '')
     .replace(/\s+/g, ' ')
     .trim()
 
@@ -261,7 +263,11 @@ const summarizeReviewThread = (thread) => {
   return `${author}${summary}`
 }
 
+const hasAutoResolveReply = (thread) =>
+  (thread?.comments?.nodes || []).some((comment) => String(comment?.body || '').includes(AUTO_RESOLVE_MARKER))
+
 const buildAutoResolveReply = (summary) => (
+  `${AUTO_RESOLVE_MARKER}\n\n` +
   `此 PR 为每日更新日志自动补扫产物，仅含 ${CHANGELOG_REL}。` +
   '内容经脚本硬校验（PR 覆盖/日期/作者由 scan 确定性生成，文案过黑名单）。' +
   '意见已记录；如需调整规则，请修改 scripts/changelog/。\n\n' +
@@ -285,21 +291,26 @@ const resolveChangelogReviewThreads = ({ prNumber, headRefName, files, cwd }) =>
 
   process.stderr.write(`[auto-changelog] PR #${prNumber} 有 ${unresolved.length} 条 unresolved review thread,自动回复并 resolve...\n`)
   for (const thread of unresolved) {
-    if (!thread.viewerCanReply || !thread.viewerCanResolve) {
+    const alreadyReplied = hasAutoResolveReply(thread)
+    if (!thread.viewerCanResolve || (!alreadyReplied && !thread.viewerCanReply)) {
       throw new Error(
         `线程清理失败:当前 token 无法 reply/resolve thread ${thread.id}` +
           `(viewerCanReply=${thread.viewerCanReply},viewerCanResolve=${thread.viewerCanResolve})`,
       )
     }
-    const replyBody = buildAutoResolveReply(summarizeReviewThread(thread))
-    runGhGraphql(
-      ADD_REVIEW_THREAD_REPLY_MUTATION,
-      {
-        threadId: thread.id,
-        body: replyBody,
-      },
-      { cwd },
-    )
+    if (alreadyReplied) {
+      process.stderr.write(`[auto-changelog] review thread ${thread.id} 已有自动回复标识,跳过 reply 直接 resolve\n`)
+    } else {
+      const replyBody = buildAutoResolveReply(summarizeReviewThread(thread))
+      runGhGraphql(
+        ADD_REVIEW_THREAD_REPLY_MUTATION,
+        {
+          threadId: thread.id,
+          body: replyBody,
+        },
+        { cwd },
+      )
+    }
     runGhGraphql(
       RESOLVE_REVIEW_THREAD_MUTATION,
       {
@@ -362,7 +373,7 @@ const fail = (msg, code = 1) => {
 const assertChangelogTimeZone = () => {
   const resolved = Intl.DateTimeFormat().resolvedOptions().timeZone
   const envTz = process.env.TZ || ''
-  if (resolved === CHANGELOG_TIME_ZONE || envTz === CHANGELOG_TIME_ZONE) return
+  if (resolved === CHANGELOG_TIME_ZONE) return
   fail(
     `更新日志归天必须在 ${CHANGELOG_TIME_ZONE} 时区运行;当前 Intl timeZone=${resolved || '(unknown)'},TZ=${envTz || '(unset)'}。` +
       `请设置 TZ=${CHANGELOG_TIME_ZONE} 后再运行。`,
