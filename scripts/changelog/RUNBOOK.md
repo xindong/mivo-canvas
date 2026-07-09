@@ -49,17 +49,18 @@ node scripts/changelog/auto-changelog.mjs rewrite
 
 - 读 `/tmp/mivo-changelog-scan.json`。
 - 按 `scripts/changelog/REWRITE_PROMPT.md` 组 prompt。
+- prompt 输入不是原始 scan，而是脚本确定性骨架：每个 PR 已带 `date`、`by`、`kind`（`feat`→`features`，`fix`→`fixes`，其他前缀低调归入 `fixes`）。
 - 直调公司网关 OpenAI-compatible chat completions：
   - base 默认 `https://llm-proxy.tapsvc.com/v1`
   - model 默认 `claude-haiku-4-5`
   - key 从 `MIVO_CHANGELOG_LLM_KEY` 读取（本地调试也兼容 `MIVO_LLM_API_KEY` / `MIVO_IMAGE_API_KEY`）
-- 输出 `/tmp/mivo-changelog-rewrite.json`：
+- LLM 只输出 PR→文案映射；脚本校验通过后写入 `/tmp/mivo-changelog-rewrite.json`：
 
 ```json
-{ "entries": [{ "date": "YYYY-MM-DD", "features": [{"text": "...", "by": "...", "prs": [123]}], "fixes": [] }] }
+{ "items": [{ "pr": 123, "text": "使用者视角的一句话" }] }
 ```
 
-rewrite 写文件前会先跑 publish 同款校验。校验失败时，会把错误带回下一次 LLM 请求，最多重试 2 次；仍失败则非零退出。
+允许同日同类 PR 合并为 `{ "prs": [123, 124], "text": "..." }`。`date` / `by` / `kind` / 最终 `prs` 全部由脚本从 scan 骨架回填。rewrite 写文件前会校验覆盖、合并合法性、text 黑名单；失败时把错误带回下一次 LLM 请求，最多重试 2 次，仍失败则非零退出。
 
 可选参数：`--scan <path>`、`--output <path>`、`--model <name>`、`--base <url>`。也可用 env `MIVO_CHANGELOG_LLM_MODEL`、`MIVO_CHANGELOG_LLM_BASE`、`MIVO_CHANGELOG_LLM_TIMEOUT_MS` 覆盖。
 
@@ -69,13 +70,13 @@ rewrite 写文件前会先跑 publish 同款校验。校验失败时，会把错
 node scripts/changelog/auto-changelog.mjs publish --rewrite /tmp/mivo-changelog-rewrite.json
 ```
 
-输入校验（写死，不信任 LLM）：
+输入校验与组装（写死，不信任 LLM）：
 
-- 合法 JSON；每条有非空 `text` / `by` / `prs`。
-- 改写产物的 PR 集合必须与 scan 产物的 PR 集合完全一致（多/漏都拒绝）。
-- date 不信 LLM：每条 `prs` 在 scan 里的归天日必须全一致，且等于 entry 的 `date`。
-- by 不信 LLM：单 PR 条目 `by` 必须精确等于该 PR 的 scan author；多 PR 合并条目 `by` 必须是 `prs` 中某 PR 的 scan author。
-- `text` 命中代码术语黑名单 → 拒绝。
+- 合法 JSON；每条只有 `pr` 或 `prs` + 非空 `text`。
+- 覆盖集合必须与 scan PR 集合完全一致，且每个 PR 只能出现一次。
+- 合并条目只能合并 scan 里同日、同 kind 的 PR。
+- `date` / `by` / `kind` 不读 LLM：最终 entries 由脚本从 scan 骨架确定性回填。
+- `text` 命中代码术语黑名单 → 拒绝；白名单短语 `API 密钥` 会先剔除再扫描，裸 `api` / `API` 仍拒绝。
 
 写回流程：
 

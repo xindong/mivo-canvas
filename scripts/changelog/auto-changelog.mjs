@@ -4,8 +4,8 @@
 // 把 generate-changelog skill「自动模式」里所有机械步骤下沉为确定性脚本,
 // 只留"口语化改写"一步直调 OpenAI-compatible LLM 网关。三步编排:
 //   1. scan    — fetch + git log 差集 + 归天,产出 /tmp/mivo-changelog-scan.json
-//   2. rewrite — 按 REWRITE_PROMPT.md 调 LLM 把 scan 产物改写成口语化条目
-//   3. publish — 校验改写产物 + 建临时 worktree + 合并写回 changelog.json + 开 PR + 轮询 CI + squash merge
+//   2. rewrite — 按 REWRITE_PROMPT.md 调 LLM 只产出 PR→文案映射
+//   3. publish — 确定性组装 date/by/kind/prs + 建临时 worktree + 合并写回 changelog.json + 开 PR + 轮询 CI + squash merge
 //
 // 语义规格见 .claude/skills/generate-changelog/SKILL.md(机械步骤已由本脚本承载,
 // skill 仅保留 SOP 作为语义说明)。运行手册见 ./RUNBOOK.md。
@@ -83,17 +83,32 @@ const BLACKLIST = [
   'cookie', 'endpoint', 'route', 'handler', 'node', 'env',
 ]
 
+// UI 文案里的合法用户词。黑名单扫描前先剔除这些短语;裸 api/API 仍会被拦。
+const BLACKLIST_ALLOW_PHRASES = [
+  /API\s*密钥/g,
+]
+
 const BLACKLIST_RES = BLACKLIST.map((term) => ({
   term,
   re: new RegExp(`\\b${term.replace(/\s+/g, '\\s+')}\\b`, 'i'),
 }))
 
 const scanBlacklist = (text) => {
+  const textForScan = BLACKLIST_ALLOW_PHRASES.reduce((out, re) => out.replace(re, ''), text)
   const hits = []
   for (const { term, re } of BLACKLIST_RES) {
-    if (re.test(text)) hits.push(term)
+    if (re.test(textForScan)) hits.push(term)
   }
   return hits
+}
+
+const classifyKind = (subject) => {
+  const prefix = String(subject).match(/^([a-z]+)(?:\([^)]+\))?!?:/i)?.[1]?.toLowerCase()
+  if (prefix === 'feat') return 'features'
+  if (prefix === 'fix') return 'fixes'
+  // generate-changelog skill: other prefixes are included and described低调.
+  // In unattended mode we keep that deterministic by placing non-feat changes in fixes.
+  return 'fixes'
 }
 
 // ---- 子进程封装 ----
@@ -185,6 +200,8 @@ const buildScanBaseline = (scan) => {
   const scanPrSet = new Set()
   const scanPrToDay = new Map()
   const scanPrToAuthor = new Map()
+  const scanPrToKind = new Map()
+  const skeleton = []
   for (const [index, it] of scan.items.entries()) {
     const where = `scan.items[${index}]`
     if (!it || typeof it !== 'object') throw new Error(`${where}: 不是对象`)
@@ -200,95 +217,130 @@ const buildScanBaseline = (scan) => {
     scanPrSet.add(it.pr)
     scanPrToDay.set(it.pr, it.day)
     scanPrToAuthor.set(it.pr, it.author)
+    const kind = classifyKind(it.subject)
+    scanPrToKind.set(it.pr, kind)
+    skeleton.push({
+      pr: it.pr,
+      date: it.day,
+      by: it.author,
+      kind,
+      subject: it.subject || '',
+      body: it.body || '',
+    })
   }
-  return { scanAnchor, scanPrSet, scanPrToDay, scanPrToAuthor }
+  skeleton.sort((a, b) => a.pr - b.pr)
+  return { scanAnchor, scanPrSet, scanPrToDay, scanPrToAuthor, scanPrToKind, skeleton }
 }
 
-const validateRewriteAgainstScan = (scan, rewrite) => {
+const buildRewritePromptPayload = (scan) => {
   const baseline = buildScanBaseline(scan)
-  const { scanPrSet, scanPrToDay, scanPrToAuthor } = baseline
-  if (!rewrite || !Array.isArray(rewrite.entries)) {
-    throw new Error('改写产物缺少 entries 数组')
+  return {
+    status: scan.status,
+    anchor: scan.anchor,
+    items: baseline.skeleton,
   }
+}
 
-  const rewritePrSet = new Set()
-  const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
+const extractRewriteTextItems = (rewrite) => {
+  if (!rewrite || typeof rewrite !== 'object') {
+    throw new Error('改写产物不是对象')
+  }
+  if (!Array.isArray(rewrite.items)) {
+    throw new Error('改写产物缺少 items 数组(新契约只允许 {items:[{pr,text}|{prs,text}]})')
+  }
+  return rewrite.items
+}
 
-  for (let ei = 0; ei < rewrite.entries.length; ei += 1) {
-    const e = rewrite.entries[ei]
-    const where = `entries[${ei}]`
-    if (!e || typeof e !== 'object') throw new Error(`${where}: 不是对象`)
-    if (typeof e.date !== 'string' || !DATE_RE.test(e.date)) {
-      throw new Error(`${where}: date 非法(需 YYYY-MM-DD),实际 ${JSON.stringify(e.date)}`)
+const normalizeRewriteTextItems = (scan, rewrite) => {
+  const baseline = buildScanBaseline(scan)
+  const { scanPrSet, scanPrToDay, scanPrToKind } = baseline
+  const rawItems = extractRewriteTextItems(rewrite)
+  const covered = new Set()
+  const normalized = []
+
+  for (let index = 0; index < rawItems.length; index += 1) {
+    const item = rawItems[index]
+    const where = `items[${index}]`
+    if (!item || typeof item !== 'object') throw new Error(`${where}: 不是对象`)
+    const hasPr = Object.prototype.hasOwnProperty.call(item, 'pr')
+    const hasPrs = Object.prototype.hasOwnProperty.call(item, 'prs')
+    if (hasPr === hasPrs) {
+      throw new Error(`${where}: 必须且只能提供 pr 或 prs`)
     }
-    for (const key of ['features', 'fixes']) {
-      const arr = e[key]
-      if (!Array.isArray(arr)) throw new Error(`${where}: ${key} 非数组`)
-      for (let ii = 0; ii < arr.length; ii += 1) {
-        const item = arr[ii]
-        const iw = `${where}.${key}[${ii}]`
-        if (!item || typeof item !== 'object') throw new Error(`${iw}: 不是对象`)
-        if (typeof item.text !== 'string' || item.text.trim() === '') {
-          throw new Error(`${iw}: text 为空`)
-        }
-        if (typeof item.by !== 'string' || item.by.trim() === '') {
-          throw new Error(`${iw}: by 为空`)
-        }
-        if (!Array.isArray(item.prs) || item.prs.length === 0) {
-          throw new Error(`${iw}: prs 为空数组(合并条目必须列出全部来源 PR 号)`)
-        }
-        for (const p of item.prs) {
-          if (typeof p !== 'number' || !Number.isInteger(p) || p <= 0) {
-            throw new Error(`${iw}: prs 含非正整数 ${JSON.stringify(p)}`)
-          }
-          rewritePrSet.add(p)
-        }
-        // P1-1: date 不信 LLM——该条 prs 在 scan 里的归天日必须全一致,且 = entry.date
-        const itemDays = new Set()
-        for (const p of item.prs) {
-          const d = scanPrToDay.get(p)
-          if (d === undefined) {
-            throw new Error(`${iw}: prs 含 scan 里没有的 PR ${p}(将在 PR 集合校验兜底,先行拦截)`)
-          }
-          itemDays.add(d)
-        }
-        if (itemDays.size > 1) {
-          throw new Error(`${iw}: prs 跨结算日 [${[...itemDays].join(',')}] — 一个条目不能合并不同日的 PR,请按日拆条`)
-        }
-        const itemDay = [...itemDays][0]
-        if (itemDay !== e.date) {
-          throw new Error(`${iw}: date=${e.date} 与 scan 里这些 PR 的归天日 ${itemDay} 不一致(日期由 scan 决定,LLM 不得篡改)`)
-        }
-        // P1-2: by 不信 LLM——单 PR 条目 by 必须精确等于该 PR 的 scan author;
-        //   多 PR 合并条目 by 必须等于 prs 中至少一个 PR 的 scan author(允许选主 PR,但不能凭空写)
-        const itemAuthors = new Set(item.prs.map((p) => scanPrToAuthor.get(p)))
-        if (item.prs.length === 1) {
-          const expected = scanPrToAuthor.get(item.prs[0])
-          if (item.by !== expected) {
-            throw new Error(`${iw}: by="${item.by}" 与 PR ${item.prs[0]} 的 scan author "${expected}" 不一致(单 PR 条目 by 必须精确等于 scan author)`)
-          }
-        } else if (!itemAuthors.has(item.by)) {
-          throw new Error(`${iw}: by="${item.by}" 不在该条 prs 的 scan author 集合 [${[...itemAuthors].join(',')}] 内(合并条目 by 必须是其中某个 PR 的作者,不能凭空写)`)
-        }
-        // 代码术语黑名单
-        const hits = scanBlacklist(item.text)
-        if (hits.length > 0) {
-          throw new Error(`${iw}: text 命中代码术语黑名单 [${hits.join(', ')}] — 改写必须用使用者视角,禁出现代码词汇。text: "${item.text}"`)
-        }
+    const prs = hasPr ? [item.pr] : item.prs
+    if (!Array.isArray(prs) || prs.length === 0) {
+      throw new Error(`${where}: prs 为空数组`)
+    }
+    const seenInItem = new Set()
+    for (const p of prs) {
+      if (typeof p !== 'number' || !Number.isInteger(p) || p <= 0) {
+        throw new Error(`${where}: prs 含非正整数 ${JSON.stringify(p)}`)
       }
+      if (!scanPrSet.has(p)) {
+        throw new Error(`${where}: prs 含 scan 里没有的 PR ${p}`)
+      }
+      if (seenInItem.has(p)) {
+        throw new Error(`${where}: prs 内重复 PR ${p}`)
+      }
+      if (covered.has(p)) {
+        throw new Error(`${where}: PR ${p} 被多个改写条目覆盖`)
+      }
+      seenInItem.add(p)
     }
+    const dates = new Set(prs.map((p) => scanPrToDay.get(p)))
+    const kinds = new Set(prs.map((p) => scanPrToKind.get(p)))
+    if (dates.size > 1 || kinds.size > 1) {
+      throw new Error(`${where}: 合并条目只能合并同日同类 PR,实际 dates=[${[...dates].join(',')}], kinds=[${[...kinds].join(',')}]`)
+    }
+    if (typeof item.text !== 'string' || item.text.trim() === '') {
+      throw new Error(`${where}: text 为空`)
+    }
+    const text = item.text.trim()
+    const hits = scanBlacklist(text)
+    if (hits.length > 0) {
+      throw new Error(`${where}: text 命中代码术语黑名单 [${hits.join(', ')}] — 改写必须用使用者视角,禁出现代码词汇。text: "${text}"`)
+    }
+    for (const p of prs) covered.add(p)
+    normalized.push({ prs: prs.slice().sort((a, b) => a - b), text })
   }
 
-  // PR 集合必须与 scan 产物完全一致(多、漏都拒绝)
-  const missing = [...scanPrSet].filter((p) => !rewritePrSet.has(p))
-  const extra = [...rewritePrSet].filter((p) => !scanPrSet.has(p))
-  if (missing.length > 0 || extra.length > 0) {
+  const missing = [...scanPrSet].filter((p) => !covered.has(p))
+  if (missing.length > 0) {
     const parts = []
     if (missing.length) parts.push(`漏 ${missing.length} 个: [${missing.join(',')}]`)
-    if (extra.length) parts.push(`多 ${extra.length} 个: [${extra.join(',')}]`)
-    throw new Error(`改写产物的 PR 集合与 scan 不一致(${parts.join('; ')});scan PRs=[${[...scanPrSet].sort((a, b) => a - b).join(',')}], rewrite PRs=[${[...rewritePrSet].sort((a, b) => a - b).join(',')}]`)
+    throw new Error(`改写产物的 PR 覆盖与 scan 不一致(${parts.join('; ')});scan PRs=[${[...scanPrSet].sort((a, b) => a - b).join(',')}], rewrite PRs=[${[...covered].sort((a, b) => a - b).join(',')}]`)
   }
-  return baseline
+  return { baseline, items: normalized }
+}
+
+const assembleRewriteEntries = (scan, rewrite) => {
+  const { baseline, items } = normalizeRewriteTextItems(scan, rewrite)
+  const { scanPrToDay, scanPrToAuthor, scanPrToKind } = baseline
+  const byDate = new Map()
+
+  for (const item of items) {
+    const primaryPr = item.prs[0]
+    const date = scanPrToDay.get(primaryPr)
+    const kind = scanPrToKind.get(primaryPr)
+    const by = scanPrToAuthor.get(primaryPr)
+    let entry = byDate.get(date)
+    if (!entry) {
+      entry = { date, prs: new Set(), features: [], fixes: [] }
+      byDate.set(date, entry)
+    }
+    entry[kind].push({ text: item.text, by, prs: item.prs })
+    for (const p of item.prs) entry.prs.add(p)
+  }
+
+  const entries = [...byDate.values()]
+    .map((entry) => ({
+      date: entry.date,
+      prs: [...entry.prs].sort((a, b) => a - b),
+      features: entry.features,
+      fixes: entry.fixes,
+    }))
+    .sort((a, b) => (a.date < b.date ? 1 : -1))
+  return { entries }
 }
 
 const getStringContent = (content) => {
@@ -543,7 +595,8 @@ const cmdRewrite = async (args) => {
     fail(`找不到改写 prompt:${promptTemplatePath}`)
   }
   const promptTemplate = readFileSync(promptTemplatePath, 'utf8')
-  const prompt = promptTemplate.replace('{{SCAN_JSON}}', JSON.stringify(scan, null, 2))
+  const rewritePayload = buildRewritePromptPayload(scan)
+  const prompt = promptTemplate.replace('{{REWRITE_INPUT_JSON}}', JSON.stringify(rewritePayload, null, 2))
 
   let lastValidationError = ''
   const totalAttempts = REWRITE_MAX_RETRIES + 1
@@ -576,8 +629,13 @@ const cmdRewrite = async (args) => {
     }
 
     try {
-      validateRewriteAgainstScan(scan, rewrite)
-      writeFileSync(output, `${JSON.stringify(rewrite, null, 2)}\n`)
+      const normalized = { items: normalizeRewriteTextItems(scan, rewrite).items }
+      const rewriteOutput = {
+        items: normalized.items.map((item) =>
+          item.prs.length === 1 ? { pr: item.prs[0], text: item.text } : { prs: item.prs, text: item.text },
+        ),
+      }
+      writeFileSync(output, `${JSON.stringify(rewriteOutput, null, 2)}\n`)
       process.stdout.write(`${JSON.stringify({ status: 'rewritten', output, model, attempts: attempt })}\n`)
       process.stderr.write(`[auto-changelog] rewrite 产物已通过校验并写入 ${output}\n`)
       return
@@ -618,11 +676,12 @@ const cmdPublish = async (args) => {
   }
   const { scanAnchor } = baseline
 
-  // ---- 2. 读改写产物 + 结构校验(写死,不信任 LLM)----
+  // ---- 2. 读 text-only 改写产物 + 确定性组装 entries ----
   let rewrite
+  let assembled
   try {
     rewrite = readJsonFile(rewritePath, '改写产物')
-    validateRewriteAgainstScan(scan, rewrite)
+    assembled = assembleRewriteEntries(scan, rewrite)
   } catch (err) {
     fail(err.message)
   }
@@ -630,7 +689,7 @@ const cmdPublish = async (args) => {
   // ---- 3. 计算合并后的 changelog(纯逻辑,安全)----
   // 从最新 origin/main 建临时 worktree,在其上读 changelog.json 再合并写回。
   // dry-run 时只算合并结果 + 打印计划命令,不执行 git/gh 写操作。
-  const maxDay = rewrite.entries
+  const maxDay = assembled.entries
     .map((e) => e.date)
     .sort()
     .at(-1)
@@ -648,7 +707,7 @@ const cmdPublish = async (args) => {
         fixes: [...(e.fixes || [])],
       })
     }
-    for (const re of rewrite.entries) {
+    for (const re of assembled.entries) {
       let entry = byDate.get(re.date)
       if (!entry) {
         entry = { date: re.date, prs: new Set(), features: [], fixes: [] }
