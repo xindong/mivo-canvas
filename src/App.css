@@ -8359,7 +8359,7 @@ button:disabled {
 
 /* ===== E2: settings UI — user chip, settings panel, gateway key dialog, mivo key ===== */
 /* User chip (sidebar bottom, authenticated state). Not-authenticated state reuses
-   the existing .settings-row grid so "Log In" matches the sidebar bottom rows. */
+   the existing .settings-row grid so "Settings" matches the sidebar bottom rows. */
 .user-chip {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);

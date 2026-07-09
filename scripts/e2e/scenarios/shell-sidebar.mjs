@@ -220,11 +220,11 @@ export const runShellSidebarScenario = async (context) => {
     const debugLog = document.querySelector('[aria-label="Debug Log"]')?.getBoundingClientRect()
     // F2: old Settings button deleted; the sidebar bottom entry is now UserChip.
     // SSO dev stub → logged-in → UserChip is .user-chip (aria-label="Open settings").
-    // Fallback to [aria-label="Log in"] for the unauthenticated row (stub off / 401).
+    // Fallback to [aria-label="Settings"] for the unauthenticated row (stub off / 401).
     const userChip =
       document.querySelector('.user-chip')?.getBoundingClientRect() ||
       document.querySelector('[aria-label="Open settings"]')?.getBoundingClientRect() ||
-      document.querySelector('[aria-label="Log in"]')?.getBoundingClientRect()
+      document.querySelector('[aria-label="Settings"]')?.getBoundingClientRect()
 
     return {
       debugBottom: debugLog?.bottom,
@@ -474,8 +474,8 @@ export const runShellSidebarScenario = async (context) => {
   // The menu-interaction assertions (expand / Preferences / warn-on-click) are
   // covered by userchip.mjs; here we only pin the user-chip row's grid layout so
   // the sidebar bottom row keeps its icon/text horizontal arrangement.
-  // SSO dev stub → logged-in → .user-chip; fallback [aria-label="Log in"] if stub off.
-  const chipRow = page.locator('.user-chip, [aria-label="Log in"]').first()
+  // SSO dev stub → logged-in → .user-chip; fallback [aria-label="Settings"] if stub off.
+  const chipRow = page.locator('.user-chip, [aria-label="Settings"]').first()
   const chipRowDisplay = await chipRow.evaluate((row) => ({
     display: window.getComputedStyle(row).display,
     columns: window.getComputedStyle(row).gridTemplateColumns,
