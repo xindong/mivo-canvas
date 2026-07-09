@@ -1,6 +1,6 @@
 // src/store/authSlice.ts
 // SSO 网关方案(feat/auth-sso):身份由 nginx 网关(auth.dsworks.cn)提供 /api/auth/me,
-// app 不做 OAuth。登录 = 整页跳转网关登录页;登出 = 本地清 + TODO(网关登出端点待 ops 提供)。
+// app 不做 OAuth。登录 = 整页跳转网关登录页;登出 = 先本地清态再跳网关登出端点。
 // 无 persist —— 每次 hydrate 读 /me,避免本地态与网关 session 不同步。
 //
 // 接口契约:useAuthStore { user:{id,name,avatar}|null, status, login(), logout() }。
@@ -8,7 +8,6 @@
 import { create } from 'zustand'
 import { fetchMe, type AuthUser } from '../lib/authClient'
 import { debugLogger } from './debugLogStore'
-import { toastFeedback } from './toastStore'
 
 export type AuthStatus = 'unknown' | 'authenticated' | 'unauthenticated'
 
@@ -19,7 +18,7 @@ type AuthState = {
   hydrate: () => Promise<void>
   // 未登录入口:整页跳转 SSO 网关登录页(service=mivo_canvas,redirect=当前页)。
   login: () => Promise<void>
-  // 登出:TODO 网关登出端点待 ops 提供;先本地清状态 + 提示(网关 session 未清,刷新会重新登录)。
+  // 登出:先乐观清本地态,再整页跳 SSO 网关登出端点清 .dsworks.cn session cookie。
   logout: () => Promise<void>
   // 受保护 API 401 时由 mivoTaskClient 调:置未登录(幂等,不重复刷)。
   markUnauthenticated: () => void
@@ -27,6 +26,7 @@ type AuthState = {
 
 // SSO 网关登录页。redirect=当前页绝对 URL(网关登录后回跳回应用)。
 const SSO_LOGIN_URL = 'https://auth.dsworks.cn/login'
+const SSO_LOGOUT_URL = 'https://auth.dsworks.cn/api/auth/logout'
 
 export const useAuthStore = create<AuthState>()((set, get) => ({
   user: null,
@@ -60,11 +60,11 @@ export const useAuthStore = create<AuthState>()((set, get) => ({
   },
 
   logout: async () => {
-    // TODO: SSO 网关登出端点待 ops 提供;先本地清状态 + 提示。
-    // 注意:网关 session 未清,刷新会重新登录态(本地清仅影响内存,无 persist)。
     set({ user: null, status: 'unauthenticated' })
-    debugLogger.warn('Auth', '本地登出:网关 session 未清,刷新会重新登录;待 ops 提供网关登出端点后补跳转')
-    toastFeedback.info('已本地登出。完整登出请通过 SSO 网关(端点待补)。')
+    const redirect = `${window.location.origin}/`
+    const logoutUrl = `${SSO_LOGOUT_URL}?service=mivo_canvas&redirect=${encodeURIComponent(redirect)}`
+    debugLogger.log('Auth', `登出:本地态已清,跳转 SSO 网关登出:${logoutUrl}`)
+    window.location.href = logoutUrl
   },
 
   markUnauthenticated: () => {

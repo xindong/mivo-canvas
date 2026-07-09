@@ -44,17 +44,27 @@ export function SettingsPanel() {
     return () => window.cancelAnimationFrame(id)
   }, [open, section])
 
+  useEffect(() => {
+    if (!open || isAuthenticated) return
+    debugLogger.warn('Settings', '未登录,API Keys 配置已锁定:需要先登录 SSO')
+  }, [open, isAuthenticated])
+
   if (!open) return null
 
   const handleLogout = () => {
     debugLogger.log('Auth', 'Logout requested from settings panel')
-    logout() // logout() does the toast (SSO scheme: local clear + gateway-session TODO note)
+    logout()
     closeSettings()
   }
 
   const handleLogin = () => {
     // login() 整页跳 SSO 网关登录页;不关面板(页面即将跳走)。
     debugLogger.log('Auth', 'Login requested from settings panel account section')
+    login()
+  }
+
+  const handleLockedApiKeysLogin = () => {
+    debugLogger.warn('Settings', '未登录,跳过 API Keys 配置:跳转 SSO 登录')
     login()
   }
 
@@ -109,29 +119,43 @@ export function SettingsPanel() {
 
           <section ref={apiKeysRef} className="settings-section" data-section="api-keys">
             <h4>API Keys</h4>
-            <div className="gateway-key-row">
-              <div className="gateway-key-row-info">
-                <span className="gateway-key-row-title">XD 网关 Key</span>
-                <span className="gateway-key-row-meta">
-                  {hasGatewayKey ? `当前: ${gatewayMasked}` : '未配置 — 用于 AI 生图与增强'}
-                </span>
-              </div>
-              <div className="gateway-key-row-actions">
-                <button type="button" className="btn-pill btn-pill-secondary" onClick={() => setGatewayDialogOpen(true)}>
-                  {hasGatewayKey ? '更换' : '配置'}
+            {isAuthenticated ? (
+              <>
+                <div className="gateway-key-row">
+                  <div className="gateway-key-row-info">
+                    <span className="gateway-key-row-title">XD 网关 Key</span>
+                    <span className="gateway-key-row-meta">
+                      {hasGatewayKey ? `当前: ${gatewayMasked}` : '未配置 — 用于 AI 生图与增强'}
+                    </span>
+                  </div>
+                  <div className="gateway-key-row-actions">
+                    <button type="button" className="btn-pill btn-pill-secondary" onClick={() => setGatewayDialogOpen(true)}>
+                      {hasGatewayKey ? '更换' : '配置'}
+                    </button>
+                    {hasGatewayKey ? (
+                      <button type="button" className="gateway-key-disconnect" onClick={handleDisconnectGateway}>
+                        断开
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+                <MivoKeySection />
+              </>
+            ) : (
+              <div className="settings-locked-row" role="note">
+                <div className="settings-locked-info">
+                  <span className="settings-locked-title">请先登录 SSO 后再配置 API Keys</span>
+                  <span className="settings-locked-meta">完成飞书登录后可配置 XD 网关 Key 和 Mivo Key。</span>
+                </div>
+                <button type="button" className="settings-auth-btn" onClick={handleLockedApiKeysLogin}>
+                  <LogIn size={15} /> 去登录
                 </button>
-                {hasGatewayKey ? (
-                  <button type="button" className="gateway-key-disconnect" onClick={handleDisconnectGateway}>
-                    断开
-                  </button>
-                ) : null}
               </div>
-            </div>
-            <MivoKeySection />
+            )}
           </section>
         </div>
       </section>
-      {gatewayDialogOpen ? <GatewayKeyDialog onClose={() => setGatewayDialogOpen(false)} /> : null}
+      {isAuthenticated && gatewayDialogOpen ? <GatewayKeyDialog onClose={() => setGatewayDialogOpen(false)} /> : null}
     </div>,
     document.body,
   )
