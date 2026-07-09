@@ -80,10 +80,18 @@ jobs:
         run: node scripts/ci/structure-guard.mjs
 
   e2e-prod-subset:
+    # 迁移 gate:T0.7 —— PR e2e 必须在 dom + leafer 双渲染器下都通过,堵死"legacy/dom
+    # 绿灯下混进 main"的漏洞(leafer 自 2026-07-06 起为默认渲染器,见 CLAUDE.md)。
+    # --renderer=both 透传给 e2e-runner(npm run ... -- --renderer=both),runner 依次跑
+    # dom / leafer 两个阶段;canvas-interactions 在 leafer 阶段被显式 skip(已知引擎
+    # 限制:该场景是 DOM 结构契约,见下方 skip 清单步骤,非静默)。
+    # TODO(T0.3, feat/kernel-flag 分支):kernel 双轨开关合入 main 后,e2e-runner 将支持
+    # --kernel=<v1|v2>。届时在此追加 --kernel=both(或扩成 dom×{v1,v2} 矩阵)使迁移 PR
+    # 也必须在双 kernel 下通过。当前 kernel 参数未实现,仅预留参数位,不启用。
     name: e2e prod subset (mock upstream)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -109,11 +117,32 @@ jobs:
       - name: Build production bundle
         run: npm run build
 
-      - name: Run prod subset e2e
+      - name: Run prod subset e2e (dom + leafer)
         run: |
           set -o pipefail
           mkdir -p test-artifacts
-          npm run test:e2e:prod:subset 2>&1 | tee test-artifacts/e2e-prod-subset.log
+          # --renderer=both 经 npm 的 -- 透传到 e2e-runner.mjs 的 parseRenderer。
+          # 子集 5 场景 × 2 渲染器;若实际时长逼近 20min 上限,改为 dom/leafer 矩阵并行。
+          npm run test:e2e:prod:subset -- --renderer=both 2>&1 | tee test-artifacts/e2e-prod-subset.log
+
+      # leafer 阶段 skip 清单汇总进 job summary —— 不许静默。
+      # skip 名单+理由权威源:scripts/e2e/scenarios/index.mjs 的 leaferSkippedScenarios。
+      # e2e-smoke.mjs 逐场景打印 [e2e-smoke] SKIP 行,此处从日志提取汇总。
+      - name: Surface leafer skip list in job summary
+        if: always()
+        run: |
+          {
+            echo '## Leafer e2e skip 清单 (--renderer=both)'
+            echo ''
+            echo 'dom 阶段全场景必跑;leafer 阶段下列场景被显式 skip(已知引擎限制,非静默)。'
+            echo 'e2e-smoke.mjs 逐场景打印 SKIP 行,此处从日志提取汇总进 job summary。'
+            echo '权威源:`scripts/e2e/scenarios/index.mjs` 的 `leaferSkippedScenarios`。'
+            echo ''
+            echo '```'
+            grep -E '\[e2e-smoke\] SKIP scenario=' test-artifacts/e2e-prod-subset.log 2>/dev/null \
+              || echo '(本运行无 leafer skip —— dom-only 或 leafer 下全场景跑通)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload failing e2e artifacts
         if: failure()
@@ -121,6 +150,81 @@ jobs:
         with:
           name: e2e-prod-subset-artifacts
           path: test-artifacts
+          if-no-files-found: warn
+          retention-days: 14
+
+  # 迁移 gate:T0.7 —— visual-diff job。DOM baseline vs Leafer candidate 像素对照,
+  # diff% 超阈值(DIFF_THRESHOLD_PERCENT,默认 5%)即 fail,挡住 leafer 渲染回归混进 main。
+  # 用现有 scripts/visual-diff.mjs harness(自起 vite dev server,无需 prod build)。
+  # TODO(T0.3, feat/kernel-flag 分支):kernel 双轨合入后,可扩为按 --kernel 矩阵分别
+  # 采集 DOM/Leafer baseline 对照;当前 kernel 参数未实现,仅预留参数位,不启用。
+  visual-diff:
+    name: visual diff (dom vs leafer)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node (LTS)
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Cache Playwright Chromium
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-chromium-${{ hashFiles('package-lock.json') }}
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      # 三个 fixture 是 visual-diff.mjs 显式支持 dom-vs-leafer 对照的(头部 docstring 列出):
+      # rotation(FU-8 旋转)/ brush-stamp(Phase 4c 笔迹+贴纸)/ markup-text(FU-11 文字层)。
+      # text fixture 不在此列:文本节点"永久留 DOM"(Phase 5 判决),leafer 模式下无 leafer
+      # 绘制子节点 → harness 的 expected>0 等待会超时,非回归,故不纳入 gate。
+      - name: Run visual diff (dom baseline vs leafer candidate)
+        run: |
+          set -o pipefail
+          mkdir -p test-artifacts/visual-diff
+          # 累积失败:任一 fixture diff% 超阈值(脚本 exit 1)即令本 step 失败,
+          # 但仍跑完全部 fixture 以便 job summary 汇总所有结果(诊断优先于 fail-fast)。
+          fail=0
+          for fixture in rotation brush-stamp markup-text; do
+            echo "::group::visual-diff fixture=$fixture"
+            node scripts/visual-diff.mjs --baseline=dom --candidate=leafer --fixture="$fixture" --output=test-artifacts/visual-diff || fail=1
+            echo "::endgroup::"
+          done
+          exit "$fail"
+
+      - name: Surface visual-diff report in job summary
+        if: always()
+        run: |
+          {
+            echo '## visual-diff 报告 (dom baseline vs leafer candidate)'
+            echo ''
+            echo '| fixture | diff% | threshold | result |'
+            echo '|---------|-------|-----------|--------|'
+            for f in test-artifacts/visual-diff/diff-report*.json; do
+              [ -e "$f" ] || continue
+              node -e "const r=require('./$f'); console.log('| '+(r.fixture||'-')+' | '+r.diff.diffPercent+'% | '+r.diff.thresholdPercent+'% | '+(r.diff.passed?'PASS':'FAIL')+' |')"
+            done
+            echo ''
+            echo '> 阈值权威源:scripts/visual-diff.mjs DIFF_THRESHOLD_PERCENT(默认 5%)。'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload visual-diff artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-diff-artifacts
+          path: test-artifacts/visual-diff
           if-no-files-found: warn
           retention-days: 14
 
