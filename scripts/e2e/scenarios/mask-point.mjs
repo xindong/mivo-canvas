@@ -9,6 +9,10 @@
 
 import { clickCanvasNode, nodeScreenRect } from '../renderer-evidence.mjs'
 
+// #154 四工具(toolItems,ImageMaskEditOverlay.tsx:93-98),顺序对齐 UI 渲染顺序。
+// SC6.1 两处精确集合断言共用:矩形/圈选被删或改名必须红(只查 length+includes 会漏报)。
+const EXPECTED_MASK_TOOLS = ['椭圆', '矩形', '圈选', '点选']
+
 const regionCounts = async (page) =>
   page.evaluate(() => {
     const overlay = document.querySelector('.image-mask-edit-overlay')
@@ -168,12 +172,14 @@ export const runMaskPointScenario = async (context) => {
   if (p3Overlay.markers !== 0 || p3Overlay.pins !== 0) {
     throw new Error(`P3(#154): armed 首击不应渲染 marker/pin, got ${JSON.stringify(p3Overlay)}`)
   }
-  // SC6.1(#154 重写,原"只点选"被 #154 四工具推翻):工具条四工具 + 默认椭圆
-  if (p3Overlay.tools.length !== 4 || !p3Overlay.tools.includes('点选') || !p3Overlay.tools.includes('椭圆')) {
-    throw new Error(`SC6.1(#154): 工具条应有四工具(椭圆/矩形/圈选/点选), got ${JSON.stringify(p3Overlay.tools)}`)
+  // SC6.1(#154 重写,原"只点选"被 #154 四工具推翻):工具条精确四工具(椭圆/矩形/圈选/点选,
+  // 顺序对齐 ImageMaskEditOverlay.tsx:93-98 toolItems)+ 默认椭圆。矩形/圈选被删或改名必红。
+  if (p3Overlay.tools.length !== EXPECTED_MASK_TOOLS.length ||
+      !p3Overlay.tools.every((label, i) => label === EXPECTED_MASK_TOOLS[i])) {
+    throw new Error(`SC6.1(#154): 工具条应精确为 ${JSON.stringify(EXPECTED_MASK_TOOLS)}, got ${JSON.stringify(p3Overlay.tools)}`)
   }
-  if (p3Overlay.activeTool[0] !== '椭圆') {
-    throw new Error(`SC6.1(#154): 默认工具应为椭圆, got ${JSON.stringify(p3Overlay.activeTool)}`)
+  if (p3Overlay.activeTool.length !== 1 || p3Overlay.activeTool[0] !== '椭圆') {
+    throw new Error(`SC6.1(#154): 默认工具应唯一为椭圆, got ${JSON.stringify(p3Overlay.activeTool)}`)
   }
   // 切点选 + clickStage 落首 point(验证点选工具落 point + marker/pin;#154 后首击不落,
   // 改为手动切点选 + clickStage,等价原 P3 的"落首 point + marker"断言)
@@ -413,8 +419,12 @@ export const runMaskPointScenario = async (context) => {
   await page.mouse.click(deleteSourceBox.x + deleteSourceBox.width * 0.5, deleteSourceBox.y + deleteSourceBox.height * 0.5)
   await page.waitForSelector('.image-mask-edit-stage')
   // #154: armed 首击只开浮层不落 point(deleteCase.sourceId 新图,draft 空,region=0)。
-  // FIX-2 测"删目标图清 mask edit state",不依赖 region=1;原 waitForRegionCount(1) 前提
-  // (armed 首击落 point)被 #154 移除,改为验证 overlay 开(stage 出现即可)。
+  // FIX-2 测"删目标图清 mask edit state",须先构造一个可清理的 region 再删——否则空仓
+  // 删除时若清理路径回归成 saveMaskEditDraft 残留 region,断言仍绿(漏报)。原
+  // waitForRegionCount(1) 前提(armed 首击落 point)被 #154 移除,这里手动切点选补 region。
+  await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: '点选', exact: true }).click()
+  await addPointRegion(page, 0.5, 0.5)
+  await waitForRegionCount(page, 1)
   await page.waitForFunction(() => document.querySelector('.mivo-app')?.classList.contains('ai-collapsed'))
   await page.keyboard.press('Delete')
   await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
@@ -429,6 +439,25 @@ export const runMaskPointScenario = async (context) => {
     { sourceId: deleteCase.sourceId, leaferMode, moduleSpec: spec },
   )
   await page.waitForFunction(() => !document.querySelector('.mivo-app')?.classList.contains('ai-collapsed'))
+  // 回归守卫:目标图删除后草稿仓应清空(getMaskEditDraft===undefined)。overlay 卸载
+  // cleanup(ImageMaskEditOverlay.tsx:548-573)在 !stillExists 时 clearMaskEditDraft;若该
+  // 清理路径回归成 saveMaskEditDraft 残留上方构造的 region,本断言会红。手动 poll 等被动
+  // effect cleanup(useEffect cleanup 在 DOM detach 后异步执行)跑完,再断言空仓。
+  {
+    const deadline = Date.now() + 2000
+    let draft = null
+    while (Date.now() < deadline) {
+      draft = await page.evaluate(async (id) => {
+        const { getMaskEditDraft } = await import('/src/canvas/maskEditDraftStore.ts')
+        return getMaskEditDraft(id) ?? null
+      }, deleteCase.sourceId)
+      if (draft === null) break
+      await new Promise((r) => setTimeout(r, 50))
+    }
+    if (draft !== null) {
+      throw new Error(`FIX-2: 删除目标图后草稿应清空(getMaskEditDraft===undefined), got ${JSON.stringify(draft)}`)
+    }
+  }
   await clickCanvasNode(page, rendererMode, deleteCase.survivorId)
   await page.waitForSelector('.selection-quick-toolbar')
 
@@ -444,12 +473,14 @@ export const runMaskPointScenario = async (context) => {
       activeLabels: tools.filter((b) => b.classList.contains('active')).map((b) => (b.getAttribute('aria-label') || '').trim()),
     }
   })
-  // SC6.1(#154 重写,原"只点选"被四工具推翻):工具条四工具(椭圆/矩形/圈选/点选)+ 默认椭圆
-  if (toolInfo.labels.length !== 4 || !toolInfo.labels.includes('点选') || !toolInfo.labels.includes('椭圆')) {
-    throw new Error(`SC6.1(#154): 工具条应有四工具(椭圆/矩形/圈选/点选), got ${JSON.stringify(toolInfo.labels)}`)
+  // SC6.1(#154 重写,原"只点选"被四工具推翻):工具条精确四工具(椭圆/矩形/圈选/点选,
+  // 顺序对齐 ImageMaskEditOverlay.tsx:93-98 toolItems)+ 默认椭圆。矩形/圈选被删或改名必红。
+  if (toolInfo.labels.length !== EXPECTED_MASK_TOOLS.length ||
+      !toolInfo.labels.every((label, i) => label === EXPECTED_MASK_TOOLS[i])) {
+    throw new Error(`SC6.1(#154): 工具条应精确为 ${JSON.stringify(EXPECTED_MASK_TOOLS)}, got ${JSON.stringify(toolInfo.labels)}`)
   }
-  if (toolInfo.activeLabels[0] !== '椭圆') {
-    throw new Error(`SC6.1(#154): 默认工具应为椭圆, got ${JSON.stringify(toolInfo.activeLabels)}`)
+  if (toolInfo.activeLabels.length !== 1 || toolInfo.activeLabels[0] !== '椭圆') {
+    throw new Error(`SC6.1(#154): 默认工具应唯一为椭圆, got ${JSON.stringify(toolInfo.activeLabels)}`)
   }
 
   // ── SC6.2 — one click → circular region, no block, submit enabled ──

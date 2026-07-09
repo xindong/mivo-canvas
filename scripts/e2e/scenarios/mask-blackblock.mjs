@@ -293,9 +293,11 @@ export const runMaskBlackblockScenario = async (context) => {
   // → 黑块自愈不触发。#154 commit message 明确「mask edit UI 只能提交 gemini,原两次
   // /tasks/edit 自愈路径从 UI 无法触发」。BB-1/BB-2 测的自愈路径被 #154 移除,显式 skip
   // (不删断言代码,若恢复自愈则置 false 解除本 skip)。BB-3(迭代重绘,不依赖自愈)继续。
+  // 决策记录(为何不修自愈、维持 #154 现状=A 案,lead/owner 已确认):
+  // history/plan-review/blackblock-heal-archaeology.md
   const SKIP_BB_SELF_HEAL = true
   if (SKIP_BB_SELF_HEAL) {
-    console.log('[mask-blackblock] SKIP BB-1/BB-2 自愈段: #154 canInspect gate(UI 只能提交 gemini,自愈限 gpt-image-2 路径 UI 不可达)。若恢复自愈则置 SKIP_BB_SELF_HEAL=false 解除。')
+    console.log('[mask-blackblock] SKIP BB-1/BB-2 自愈段: #154 canInspect gate(UI 只能提交 gemini,自愈限 gpt-image-2 路径 UI 不可达)。若恢复自愈则置 SKIP_BB_SELF_HEAL=false 解除。决策记录: history/plan-review/blackblock-heal-archaeology.md')
   } else {
   // ═══ BB-1 自愈成功：区域外黑块检出 → 换 key 重试 → done ═══════════════════
   {
