@@ -16,17 +16,19 @@
 //   - useAuthStore 是单例，用 setState 在 beforeEach 复位到初始态。
 //
 // ── 断言数 baseline ──────────────────────────────────────────────────────────
-//  expect() 调用总数：42
-//  分块：fetchMe 6 场景(11) · hydrate 5 场景(20) · login 1 场景(2)
-//        · logout 1 场景(3) · markUnauthenticated 2 场景(4) · 门控初始态(2)
+//  expect() 调用总数：51
+//  分块：fetchMe 7 场景(13) · hydrate 6 场景(24) · login 1 场景(2)
+//        · logout 1 场景(6) · markUnauthenticated 2 场景(4) · 门控初始态(2)
 //  迁移后重跑本文件，断言总数与分块不应回退；新增可加，不可静默删减。
 // ────────────────────────────────────────────────────────────────────────────
 // 现状疑点（仅记录，不修改）：
 //   A. fetchMe：网关 200 + authenticated=true 但缺 username → 静默退化为未登录，
 //      无任何日志/告警。迁移若引入 username 兜底须保持等价或显式改契约。
-//   B. fetchMe / hydrate：网络错误（fetch reject）与 401、500 同样关态
-//      （status=unauthenticated），仅日志级别区分（warn vs info）。用户侧
-//      无法区分 "session 过期" 与 "网络断开"，均为登出体验。
+//   B. fetchMe 与 hydrate 对错误行为不同（不可写"同样关态"）：
+//      fetchMe 自身对 fetch reject / res.json() reject 原样 reject（不吞不
+//      转成 AuthError），仅 401 返回未登录、non-2xx 非 401 抛 AuthError；
+//      hydrate 才 catch fetch/json/500 reject 后置 status=unauthenticated +
+//      warn。用户侧无法区分 "session 过期" 与 "网络断开"，均为登出体验。
 //   C. login 的 redirect 基 = window.location.href（含 query/hash，回当前页）；
 //      logout 的 redirect 基 = window.location.origin + '/'（回站点根）。非对称，
 //      迁移须保持该差异或显式统一。
@@ -130,6 +132,26 @@ describe('authClient.fetchMe — /api/auth/me 响应映射（可测缝隙）', (
     expect((caught as AuthError).status).toBe(500)
     expect((caught as AuthError).name).toBe('AuthError')
   })
+
+  it('200 OK 但 body 非 JSON / res.json() reject → fetchMe 原样 reject，不吞不转成 AuthError（疑点 B）', async () => {
+    // fetchMe 在 res.ok 后直接 await res.json()，无 catch —— json() reject 会原样冒泡。
+    const jsonErr = new SyntaxError('Unexpected token < in JSON at position 0')
+    fetchMock.mockResolvedValueOnce({
+      status: 200,
+      ok: true,
+      json: async () => {
+        throw jsonErr
+      },
+    })
+    let caught: unknown
+    try {
+      await fetchMe()
+    } catch (err) {
+      caught = err
+    }
+    expect(caught).toBe(jsonErr) // 原样 reject —— 同一引用，未被吞/转义
+    expect(caught).not.toBeInstanceOf(AuthError) // 不被转成 AuthError
+  })
 })
 
 describe('useAuthStore.hydrate — /me 各响应下的状态迁移', () => {
@@ -198,6 +220,23 @@ describe('useAuthStore.hydrate — /me 各响应下的状态迁移', () => {
     expect(warnSpy).toHaveBeenCalledWith('Auth', expect.stringContaining('会话恢复失败'))
     expect(warnSpy).toHaveBeenCalledWith('Auth', expect.stringContaining('Failed to fetch'))
   })
+
+  it('200 OK 但 body 非 JSON / res.json() reject → hydrate catch 后关态 + warn 含错误消息（疑点 B）', async () => {
+    // fetchMe 对 res.json() reject 原样 reject（见上一 describe），hydrate catch 后关态 + warn。
+    const jsonErr = new SyntaxError('Unexpected token < in JSON at position 0')
+    fetchMock.mockResolvedValueOnce({
+      status: 200,
+      ok: true,
+      json: async () => {
+        throw jsonErr
+      },
+    })
+    await useAuthStore.getState().hydrate()
+    expect(useAuthStore.getState().status).toBe('unauthenticated')
+    expect(useAuthStore.getState().user).toBeNull()
+    expect(warnSpy).toHaveBeenCalledWith('Auth', expect.stringContaining('会话恢复失败'))
+    expect(warnSpy).toHaveBeenCalledWith('Auth', expect.stringContaining('Unexpected token <'))
+  })
 })
 
 describe('useAuthStore.login — SSO 网关整页跳转意图', () => {
@@ -220,12 +259,37 @@ describe('useAuthStore.logout — 乐观清态 + SSO 登出跳转意图', () => 
   afterEach(() => vi.unstubAllGlobals())
 
   it('先清本地态(user=null,status=unauthenticated)再用 origin+/ 跳网关登出（疑点 C）', async () => {
-    const w = freshWindow('http://localhost:5173/app', 'https://mivo.example.cn')
+    // href 用 Object.defineProperty setter：赋值瞬间采样 store，钉"set 清态在 href 跳转之前"的时序。
+    // 若迁移把 redirect 赋值提前到 set 之前，setter 触发时 status 仍是 authenticated，本用例会失败。
+    let assignedHref = ''
+    let setterSnapshot: { user: unknown; status: string } | null = null
+    const w = {
+      location: {
+        href: 'http://localhost:5173/app',
+        origin: 'https://mivo.example.cn',
+        pathname: '/app',
+        search: '',
+      },
+    }
+    Object.defineProperty(w.location, 'href', {
+      enumerable: true,
+      configurable: true,
+      get: () => assignedHref,
+      set: (v: string) => {
+        // 赋值瞬间采样 store —— 钉 logout 实现"先 set 清态再 href 跳转"的顺序
+        setterSnapshot = { ...useAuthStore.getState() }
+        assignedHref = v
+      },
+    })
     vi.stubGlobal('window', w)
     useAuthStore.setState({ user: { id: 'u', name: 'U', avatar: null }, status: 'authenticated' })
     logSpy.mockClear()
     await useAuthStore.getState().logout()
-    // 乐观清态：跳转赋值前本地态已关
+    // 时序断言：href setter 触发瞬间，本地态已被清成未登录（钉"先清态后跳转"）
+    expect(setterSnapshot).not.toBeNull()
+    expect(setterSnapshot!.user).toBeNull()
+    expect(setterSnapshot!.status).toBe('unauthenticated')
+    // 事后断言：跳转完成后本地态仍保持未登录
     expect(useAuthStore.getState().user).toBeNull()
     expect(useAuthStore.getState().status).toBe('unauthenticated')
     // logout redirect 基 = origin + '/'（区别于 login 的 href）
