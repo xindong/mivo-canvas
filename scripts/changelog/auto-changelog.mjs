@@ -243,16 +243,34 @@ const fetchReviewThreads = (prNumber, opts = {}) => {
   return threads
 }
 
-const stripReviewCommentForSummary = (body) =>
-  String(body || '')
+const stripHtmlTags = (s) => {
+  let out = ''
+  let depth = 0
+  for (const ch of s) {
+    if (ch === '<') {
+      depth += 1
+      continue
+    }
+    if (ch === '>') {
+      if (depth > 0) depth -= 1
+      continue
+    }
+    if (depth === 0) out += ch
+  }
+  return out
+}
+
+const stripReviewCommentForSummary = (body) => {
+  const withoutBlocks = String(body || '')
     .replace(/<details[\s\S]*?<\/details>/gi, '')
     .replace(/```[\s\S]*?```/g, '')
-    .replace(/<[^>]+>/g, '')
+
+  return stripHtmlTags(withoutBlocks)
     .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
     .replace(/`([^`]+)`/g, '$1')
-    .replace(/[<>]/g, '')
     .replace(/\s+/g, ' ')
     .trim()
+}
 
 const summarizeReviewThread = (thread) => {
   const comment = thread?.comments?.nodes?.[0]
