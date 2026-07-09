@@ -105,4 +105,4 @@ Project MivoCanvas/
   3. `npm run build`
   4. `pm2 restart mivo-canvas`
 - **pm2 以 yanjian 为主**:服务进程跑在 `yanjian` 的 pm2 实例下,部署以 `yanjian` 身份执行(`sudo -u yanjian /AIGC_Group/mivo-canvas/deploy.sh`);不要用其他用户的 pm2 起重复实例。
-- **自动化部署**:maker 定时任务每日 9:00 / 17:00 自动拉取最新 `main` 部署(9:00 那次排在每日更新日志任务 8:00 之后)。
+- **自动化部署**:maker 定时任务每日 9:00 / 17:00 自动拉取最新 `main` 部署(9:00 那次排在 GitHub Actions 每日更新日志任务 8:00 之后)。

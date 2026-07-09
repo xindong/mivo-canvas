@@ -1,6 +1,6 @@
 # REWRITE_PROMPT — 更新日志口语化改写指令
 
-> 供每日 8:00 调度器拉起的**轻量 LLM 会话**使用。输入 = `auto-changelog.mjs scan` 的产物(`/tmp/mivo-changelog-scan.json`),输出 = 改写后的 JSON(交给 `auto-changelog.mjs publish --rewrite`)。
+> 供 `auto-changelog.mjs rewrite` 直调 LLM 网关使用。输入 = `auto-changelog.mjs scan` 的产物(`/tmp/mivo-changelog-scan.json`),输出 = 改写后的 JSON(交给 `auto-changelog.mjs publish --rewrite`)。
 >
 > 这是整个补扫闭环里**唯一**用到 LLM 的环节。脚本会**写死校验**你的输出,不合规一律拒绝,所以请严格按本指令来。
 
@@ -95,7 +95,7 @@
 
 ## 输入(<scan>)
 
-把 `/tmp/mivo-changelog-scan.json` 的内容粘贴到这里(调度器自动注入):
+`auto-changelog.mjs rewrite` 会把 `/tmp/mivo-changelog-scan.json` 的内容注入这里:
 
 ```json
 {{SCAN_JSON}}
@@ -103,4 +103,4 @@
 
 ## 输出
 
-把改写好的 JSON 写到 `/tmp/mivo-changelog-rewrite.json`,然后调度器会跑 `node scripts/changelog/auto-changelog.mjs publish --rewrite /tmp/mivo-changelog-rewrite.json`。
+只输出改写好的 JSON。脚本会校验通过后写到 `/tmp/mivo-changelog-rewrite.json`,然后 GitHub Actions 跑 `node scripts/changelog/auto-changelog.mjs publish --rewrite /tmp/mivo-changelog-rewrite.json`。
