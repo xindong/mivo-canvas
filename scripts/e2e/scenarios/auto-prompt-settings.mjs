@@ -24,6 +24,11 @@ export const runAutoPromptSettingsScenario = async (context) => {
   // hydrate (empty keys) → openSettings('api-keys').
   await page.waitForSelector('.settings-panel', { state: 'visible' })
   await page.waitForSelector('[data-section="api-keys"]')
+  await page.getByText('XD 网关 Key', { exact: true }).waitFor()
+  await page.getByText('Mivo Key', { exact: true }).waitFor()
+  if ((await page.getByText('请先登录 SSO 后再配置 API Keys').count()) !== 0) {
+    throw new Error('authenticated API Keys section should render key rows, not the SSO login gate')
+  }
 
   // Close the panel; the session-level autoPrompted flag must suppress re-prompt.
   await page.getByRole('button', { name: '关闭设置' }).click()
@@ -52,7 +57,15 @@ export const runAutoPromptSettingsScenario = async (context) => {
   // AutoPrompt fires (unauthenticated) → openSettings('account').
   await page.waitForSelector('.settings-panel', { state: 'visible' })
   // Account section shows the 「登录」 button (not 登出) — user clicks to go to SSO.
-  await page.getByRole('button', { name: '登录' }).waitFor()
+  await page.getByRole('button', { name: /^登录$/ }).waitFor()
+  await page.getByText('请先登录 SSO 后再配置 API Keys').waitFor()
+  await page.getByRole('button', { name: '去登录' }).waitFor()
+  if ((await page.getByText('XD 网关 Key', { exact: true }).count()) !== 0) {
+    throw new Error('unauthenticated auto-prompt should hide the XD gateway key row')
+  }
+  if ((await page.getByText('Mivo Key', { exact: true }).count()) !== 0) {
+    throw new Error('unauthenticated auto-prompt should hide the Mivo key row')
+  }
 
   // Close the panel.
   await page.getByRole('button', { name: '关闭设置' }).click()

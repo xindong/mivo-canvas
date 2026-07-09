@@ -2,11 +2,13 @@
 // Sidebar bottom user chip. SSO gateway scheme: production forces login (gateway),
 // so a user reaching the app is already authenticated → chip shows display_name +
 // initial-avatar (SSO has no avatar image). Not authenticated (rare, session
-// expired) → "Log In" row (login() → SSO gateway redirect). Clicking the chip
-// opens the settings panel via the store's openSettings action (so AutoPromptSettings
-// can also open it programmatically). The panel itself renders at the App root,
-// so this chip only triggers openSettings — it does not host the panel.
-import { LogIn } from 'lucide-react'
+// expired) → "Settings" row that opens the account settings section; the settings
+// panel's account button is the only place that jumps to the SSO gateway. Clicking
+// the authenticated chip opens the settings panel via the store's openSettings
+// action (so AutoPromptSettings can also open it programmatically). The panel
+// itself renders at the App root, so this chip only triggers openSettings — it
+// does not host the panel.
+import { Settings as SettingsIcon } from 'lucide-react'
 import { useAuthStore } from '../../store/authSlice'
 import { useSettingsStore } from '../../store/settingsSlice'
 import { debugLogger } from '../../store/debugLogStore'
@@ -19,7 +21,6 @@ const APP_VERSION = '0.1.0'
 export function UserChip() {
   const user = useAuthStore((state) => state.user)
   const status = useAuthStore((state) => state.status)
-  const login = useAuthStore((state) => state.login)
   const openSettings = useSettingsStore((state) => state.openSettings)
 
   const isAuthenticated = status === 'authenticated' && user !== null
@@ -29,14 +30,14 @@ export function UserChip() {
       <button
         type="button"
         className="settings-row"
-        aria-label="Log in"
+        aria-label="Settings"
         onClick={() => {
-          debugLogger.log('Auth', 'Login chip clicked — initiating login')
-          login()
+          debugLogger.log('Auth', 'Settings entry clicked — opening account settings')
+          openSettings('account')
         }}
       >
-        <LogIn size={17} />
-        <span>Log In</span>
+        <SettingsIcon size={17} />
+        <span>Settings</span>
       </button>
     )
   }
