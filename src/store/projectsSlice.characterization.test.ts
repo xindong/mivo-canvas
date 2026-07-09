@@ -7,24 +7,38 @@ import { describe, expect, it, vi, beforeEach } from 'vitest'
 // 迁移的回归基线。硬约束：只录现状不改行为；疑似 bug 钉现状 + 进 PR"现状疑点"
 // 段，不修。
 //
-// Baseline 断言数: 80  （`grep -c 'expect('` 计；迁移回归基线，勿降）
+// Baseline 断言数: 83  （`grep -c 'expect('` 计；迁移回归基线，勿降）
+//   分块断言分布（每 describe 块的 expect 断言行数；helper 与文件头单列）：
+//     ① createCanvas                          : 28
+//     ③ deleteCanvas（first-survivor 钉规则）  : 18
+//     ④ renameCanvas                          :  7
+//     ④ duplicateCanvas                       : 11
+//     createProject shape invariant           :  3
+//     ⑥ 跨切片一致性不变量                     :  6
+//     ⑤ 折叠状态解耦（现状疑点）               :  3
+//     expectActiveSceneMirror 定义             :  6
+//     文件头 grep 行                           :  1
+//                                             合计 83
 //
-// 与现有测试的分工（不重复，先读后排）：
-//   - projectsSlice.test.ts         → createProject / renameProject / deleteProject
-//                                       cascade / moveCanvasToProject 的单点行为
-//                                       （已覆盖 happy + edge，本文件不重复）
-//   - canvasStore.contract.test.ts  → persist shape / selectNode / undo·redo /
-//                                       commitGenerationResult（已覆盖）
-//   - useCollapsedProjects.test.ts  → 折叠纯 helper（key / round-trip / silent）
-//                                       （已覆盖，本文件不重复）
-//   - projectSidebarModel.test.ts   → buildSidebarModel 派生（已覆盖）
-// 本文件只补上述都没盖住的 CRUD 语义：
+// 与现有测试的分工（先读后排，避免同构重复）：
+//   - projectsSlice.test.ts  → createProject / renameProject / deleteProject
+//                                cascade（含 no-dangling 回落不变量）/
+//                                moveCanvasToProject 的单点行为（已覆盖 happy + edge）
+//   - canvasStore.contract.test.ts → persist shape / selectNode / undo·redo /
+//                                commitGenerationResult（已覆盖）
+//   - useCollapsedProjects.test.ts → 折叠纯 helper（key / round-trip / silent）
+//                                （已覆盖）
+//   - projectSidebarModel.test.ts  → buildSidebarModel 派生（已覆盖）
+// 本文件定位为跨切片 CRUD 表征基线（非完全零重复：createCanvas / duplicateCanvas
+// 的时间戳语义与 canvasDocumentModel.test.ts 有轻量重叠，作为迁移回归基线在此再钉
+// 一次）。本文件只补上述都没盖住的语义：
 //   ① createCanvas 同步返 id + 初始结构 + active 切换（含 templateId 路径）
-//   ③ deleteCanvas（active 切换 / inactive 不切 / 最后一块阻断 / 不存在 no-op）
+//   ③ deleteCanvas（active 切换 + 钉 first-survivor 回落规则 / inactive 不切 /
+//      最后一块阻断 / 不存在 no-op）
 //   ④ renameCanvas（bump updatedAt / active·inactive 分支）+ duplicateCanvas
 //      （同步返 id / projectId 继承 / 全新时间戳）+ createProject 初始结构不变量
-//   ⑥ 跨切片一致性不变量（active-scene 镜像 / deleteProject 无悬垂引用 /
-//      canvases 非空 / 时间戳回填）
+//   ⑥ 跨切片一致性不变量（active-scene 镜像 / canvases 非空 / 时间戳回填；
+//      deleteProject no-dangling 回落已由 projectsSlice.test.ts 覆盖，本文件不重复）
 //   ⑤ 折叠状态与 project 生命周期的解耦（orphan 残留 — 现状疑点）
 // =============================================================================
 
@@ -219,6 +233,63 @@ describe('characterization: deleteCanvas', () => {
     expect(s.canvases['c-active']).toBeUndefined()
     expect(s.sceneId).not.toBe('c-active')
     expect(s.canvases[s.sceneId]).toBeDefined()
+    expectActiveSceneMirror()
+  })
+
+  it('picks the first survivor in map insertion order as next active (first-survivor rule, ≥3 canvases)', () => {
+    // deleteCanvas picks the next active via Object.keys(canvases).find(id => id
+    // !== targetId) — the first non-target key in MAP INSERTION ORDER
+    // (documentSlice.ts:145). With canvases inserted as [c-first, c-active,
+    // c-last] and deleting the active, the next active MUST be c-first (not
+    // c-last). Asserting a precise id pins first-survivor; a loose "some
+    // survivor" assertion would let last-survivor or random implementations
+    // pass undetected.
+    seed({
+      canvases: {
+        'c-first': blankDocument({ title: 'First' }),
+        'c-active': blankDocument({ title: 'Active' }),
+        'c-last': blankDocument({ title: 'Last' }),
+      },
+      sceneId: 'c-active',
+      nodes: [],
+      edges: [],
+      tasks: [],
+      selectedNodeId: undefined,
+      selectedNodeIds: [],
+    })
+    useCanvasStore.getState().deleteCanvas('c-active')
+    const s = useCanvasStore.getState()
+    expect(s.canvases['c-active']).toBeUndefined()
+    expect(s.sceneId).toBe('c-first')
+    expect(s.canvases['c-first']).toBeDefined()
+    expectActiveSceneMirror()
+  })
+
+  it('first-survivor tracks insertion order (same survivor set, reversed order → different next active)', () => {
+    // Same three canvas ids as the case above, but insertion order reversed so
+    // c-last is now first. The next active MUST be c-last — the rule varies
+    // with map insertion order, not a fixed id or alphabetical order.
+    // (Alphabetical 'c-first' < 'c-last' would still pick c-first; last-survivor
+    // would also pick c-first. Only first-survivor-in-insertion-order yields
+    // c-last, so this case alone distinguishes first-survivor from both.)
+    seed({
+      canvases: {
+        'c-last': blankDocument({ title: 'Last' }),
+        'c-active': blankDocument({ title: 'Active' }),
+        'c-first': blankDocument({ title: 'First' }),
+      },
+      sceneId: 'c-active',
+      nodes: [],
+      edges: [],
+      tasks: [],
+      selectedNodeId: undefined,
+      selectedNodeIds: [],
+    })
+    useCanvasStore.getState().deleteCanvas('c-active')
+    const s = useCanvasStore.getState()
+    expect(s.canvases['c-active']).toBeUndefined()
+    expect(s.sceneId).toBe('c-last')
+    expect(s.canvases['c-last']).toBeDefined()
     expectActiveSceneMirror()
   })
 
@@ -468,26 +539,6 @@ describe('characterization: cross-slice consistency invariants', () => {
     useCanvasStore.getState().loadScene('character-flow')
     expect(useCanvasStore.getState().sceneId).toBe('character-flow')
     expectActiveSceneMirror()
-  })
-
-  it('deleteProject leaves no dangling projectId (all matching canvases回落 standalone)', () => {
-    const projectId = useCanvasStore.getState().createProject('P')
-    seed({
-      canvases: {
-        'c-in': blankDocument({ title: 'in', projectId }),
-        'c-out': blankDocument({ title: 'out', projectId: 'project-other' }),
-        'c-standalone': blankDocument({ title: 'standalone', projectId: undefined }),
-      },
-      projects: [
-        ...useCanvasStore.getState().projects,
-        { id: 'project-other', name: 'Other', createdAt: '2026-07-06T10:00:00.000Z' },
-      ],
-    })
-    useCanvasStore.getState().deleteProject(projectId)
-    const canvases = useCanvasStore.getState().canvases
-    expect(Object.values(canvases).every((d) => d.projectId !== projectId)).toBe(true)
-    expect(canvases['c-in']!.projectId).toBeUndefined()
-    expect(canvases['c-out']!.projectId).toBe('project-other')
   })
 
   it('deleteCanvas can never empty the canvases map (≥1 always survives)', () => {
