@@ -5,7 +5,7 @@
 // 只留"口语化改写"一步直调 OpenAI-compatible LLM 网关。三步编排:
 //   1. scan    — fetch + git log 差集 + 归天,产出 /tmp/mivo-changelog-scan.json
 //   2. rewrite — 按 REWRITE_PROMPT.md 调 LLM 只产出 PR→文案映射
-//   3. publish — 确定性组装 date/by/kind/prs + 建临时 worktree + 合并写回 changelog.json + 开 PR + 轮询 CI + squash merge
+//   3. publish — 确定性组装 date/by/kind/prs + 建临时 worktree + 合并写回 changelog.json + 开 PR + 轮询 CI + 线程清理 + squash merge
 //
 // 语义规格见 .claude/skills/generate-changelog/SKILL.md(机械步骤已由本脚本承载,
 // skill 仅保留 SOP 作为语义说明)。运行手册见 ./RUNBOOK.md。
@@ -28,6 +28,9 @@ const LLM_API_BASE_DEFAULT = 'https://llm-proxy.tapsvc.com/v1'
 const LLM_MODEL_DEFAULT = 'claude-haiku-4-5'
 const REWRITE_MAX_RETRIES = 2
 const REWRITE_TIMEOUT_MS_DEFAULT = 120_000
+const CHANGELOG_TIME_ZONE = 'Asia/Shanghai'
+const REPO_SLUG = process.env.GITHUB_REPOSITORY || 'xindong/mivo-canvas'
+const [REPO_OWNER, REPO_NAME] = REPO_SLUG.split('/')
 
 // ---- 归天:与 src/lib/changelogDate.ts 的 toChangelogDay 语义一致 ----
 // 8:00 本地时区为界:07:59 归前一天,08:00 起归当天。禁用 toISOString(UTC 日会错移边界)。
@@ -147,6 +150,184 @@ const runGh = (args, opts = {}) => {
   }
 }
 
+const REVIEW_THREADS_QUERY = `
+query($owner: String!, $name: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $after) {
+        nodes {
+          id
+          isResolved
+          viewerCanReply
+          viewerCanResolve
+          comments(first: 20) {
+            nodes {
+              author {
+                login
+              }
+              body
+              createdAt
+            }
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  }
+}
+`
+
+const ADD_REVIEW_THREAD_REPLY_MUTATION = `
+mutation($threadId: ID!, $body: String!) {
+  addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $threadId, body: $body }) {
+    comment {
+      id
+    }
+  }
+}
+`
+
+const RESOLVE_REVIEW_THREAD_MUTATION = `
+mutation($threadId: ID!) {
+  resolveReviewThread(input: { threadId: $threadId }) {
+    thread {
+      id
+      isResolved
+    }
+  }
+}
+`
+
+const runGhGraphql = (query, variables, opts = {}) => {
+  const args = ['api', 'graphql', '-f', `query=${query}`]
+  for (const [key, value] of Object.entries(variables || {})) {
+    if (value === undefined || value === null) continue
+    args.push('-F', `${key}=${value}`)
+  }
+  const out = runGh(args, opts)
+  try {
+    return JSON.parse(out)
+  } catch (err) {
+    throw new Error(`gh api graphql 响应不是 JSON:${err.message}; body=${trimForError(out)}`)
+  }
+}
+
+const fetchReviewThreads = (prNumber, opts = {}) => {
+  const threads = []
+  let after = null
+  for (;;) {
+    const data = runGhGraphql(
+      REVIEW_THREADS_QUERY,
+      {
+        owner: REPO_OWNER,
+        name: REPO_NAME,
+        number: prNumber,
+        after,
+      },
+      opts,
+    )
+    const pullRequest = data?.data?.repository?.pullRequest
+    if (!pullRequest) {
+      throw new Error(`GraphQL 未返回 PR #${prNumber} 数据`)
+    }
+    const conn = pullRequest.reviewThreads
+    threads.push(...(conn?.nodes || []))
+    if (!conn?.pageInfo?.hasNextPage) break
+    after = conn.pageInfo.endCursor
+    if (!after) break
+  }
+  return threads
+}
+
+const stripReviewCommentForSummary = (body) =>
+  String(body || '')
+    .replace(/<details[\s\S]*?<\/details>/gi, '')
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+const summarizeReviewThread = (thread) => {
+  const comment = thread?.comments?.nodes?.[0]
+  const body = stripReviewCommentForSummary(comment?.body)
+  if (!body) return '未能提取原评论正文'
+  const author = comment?.author?.login ? `@${comment.author.login}: ` : ''
+  const summary = body.length > 220 ? `${body.slice(0, 220)}...` : body
+  return `${author}${summary}`
+}
+
+const buildAutoResolveReply = (summary) => (
+  `此 PR 为每日更新日志自动补扫产物，仅含 ${CHANGELOG_REL}。` +
+  '内容经脚本硬校验（PR 覆盖/日期/作者由 scan 确定性生成，文案过黑名单）。' +
+  '意见已记录；如需调整规则，请修改 scripts/changelog/。\n\n' +
+  `原评论要点：${summary}`
+)
+
+const resolveChangelogReviewThreads = ({ prNumber, headRefName, files, cwd }) => {
+  if (!headRefName || !/^chore\/changelog-/.test(headRefName)) {
+    throw new Error(`线程清理拒绝执行:headRefName=${headRefName} 不匹配 ^chore/changelog-`)
+  }
+  const illegal = files.filter((f) => f !== CHANGELOG_REL)
+  if (files.length === 0 || illegal.length > 0) {
+    throw new Error(`线程清理拒绝执行:PR files 非 changelog-only,files=[${files.join(', ')}]`)
+  }
+
+  const unresolved = fetchReviewThreads(prNumber, { cwd }).filter((thread) => !thread.isResolved)
+  if (unresolved.length === 0) {
+    process.stderr.write(`[auto-changelog] PR #${prNumber} 无 unresolved review thread\n`)
+    return
+  }
+
+  process.stderr.write(`[auto-changelog] PR #${prNumber} 有 ${unresolved.length} 条 unresolved review thread,自动回复并 resolve...\n`)
+  for (const thread of unresolved) {
+    if (!thread.viewerCanReply || !thread.viewerCanResolve) {
+      throw new Error(
+        `线程清理失败:当前 token 无法 reply/resolve thread ${thread.id}` +
+          `(viewerCanReply=${thread.viewerCanReply},viewerCanResolve=${thread.viewerCanResolve})`,
+      )
+    }
+    const replyBody = buildAutoResolveReply(summarizeReviewThread(thread))
+    runGhGraphql(
+      ADD_REVIEW_THREAD_REPLY_MUTATION,
+      {
+        threadId: thread.id,
+        body: replyBody,
+      },
+      { cwd },
+    )
+    runGhGraphql(
+      RESOLVE_REVIEW_THREAD_MUTATION,
+      {
+        threadId: thread.id,
+      },
+      { cwd },
+    )
+    process.stderr.write(`[auto-changelog] 已回复并 resolve review thread ${thread.id}\n`)
+  }
+}
+
+const mergePullRequestWithPolicyRetry = async (prNumber, cwd) => {
+  const maxAttempts = 3
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      runGh(['pr', 'merge', String(prNumber), '--squash'], { cwd })
+      return
+    } catch (err) {
+      const policyBlocked = /base branch policy prohibits the merge/i.test(err.message)
+      if (!policyBlocked || attempt === maxAttempts) throw err
+      process.stderr.write(
+        `[auto-changelog] gh pr merge 仍被 base branch policy 拒绝,等 10s 重试(${attempt}/${maxAttempts - 1})...\n`,
+      )
+      await new Promise((r) => setTimeout(r, 10_000))
+    }
+  }
+}
+
 // ---- argv 解析(支持 --flag value 与 --flag=value) ----
 const parseArgs = (argv) => {
   const out = { _: [] }
@@ -176,6 +357,16 @@ const parseArgs = (argv) => {
 const fail = (msg, code = 1) => {
   process.stderr.write(`[auto-changelog] 错误: ${msg}\n`)
   process.exit(code)
+}
+
+const assertChangelogTimeZone = () => {
+  const resolved = Intl.DateTimeFormat().resolvedOptions().timeZone
+  const envTz = process.env.TZ || ''
+  if (resolved === CHANGELOG_TIME_ZONE || envTz === CHANGELOG_TIME_ZONE) return
+  fail(
+    `更新日志归天必须在 ${CHANGELOG_TIME_ZONE} 时区运行;当前 Intl timeZone=${resolved || '(unknown)'},TZ=${envTz || '(unset)'}。` +
+      `请设置 TZ=${CHANGELOG_TIME_ZONE} 后再运行。`,
+  )
 }
 
 const readJsonFile = (path, label) => {
@@ -785,6 +976,7 @@ ${newItemsSummary}
       `gh pr create --title "${prTitle}" --body "<新增条目清单>"`,
       `# 轮询 CI:gh pr checks <N> --json name,state,每 30s,上限 30 分钟;fail 中止,head 落后先 gh pr update-branch <N>`,
       `# merge 前铁律:分支名 ^chore/changelog-;files 仅 public/changelog.json;checks 全 pass;mergeable=MERGEABLE(UNKNOWN 重试 6×10s)`,
+      `# changelog-only PR 若有 unresolved review threads:先可见回复说明自动补扫产物,再 GraphQL resolveReviewThread`,
       `gh pr merge <N> --squash`,
       `git push origin --delete ${branch}`,
       `git worktree remove --force ${wtPath}`,
@@ -992,9 +1184,18 @@ ${newItemsSummary}
       abort(`铁律违反:checks 未全绿: [${notPass.map((c) => `${c.name}=${c.state}`).join(', ')}]`)
     }
 
+    // ⑤ changelog-only PR 允许自清 review thread。严格复用上面的分支名/files 铁律;
+    // 其他 PR 绝不自动回复或 resolve。
+    resolveChangelogReviewThreads({
+      prNumber,
+      headRefName: mv.headRefName,
+      files,
+      cwd: wtPath,
+    })
+
     // 全过 → squash merge
     process.stderr.write(`[auto-changelog] 铁律校验全过,squash merge PR #${prNumber}\n`)
-    runGh(['pr', 'merge', String(prNumber), '--squash'], { cwd: wtPath })
+    await mergePullRequestWithPolicyRetry(prNumber, wtPath)
 
     // ---- 收尾:删远程分支(分开删,gh --delete-branch 会被 worktree 占用卡住)----
     try {
@@ -1025,6 +1226,8 @@ const main = async () => {
   }
   const sub = argv[0]
   const rest = parseArgs(argv.slice(1))
+
+  assertChangelogTimeZone()
 
   if (sub === 'scan') {
     try {

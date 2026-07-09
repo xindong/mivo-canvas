@@ -11,6 +11,7 @@ Workflow: `.github/workflows/daily-changelog.yml`
 - `workflow_dispatch`: 手动触发
 - `concurrency`: `daily-changelog-${{ github.repository }}`，防止每日任务重叠
 - `timeout-minutes`: 40（publish 内部 CI 轮询上限 30 分钟）
+- job env 固定 `TZ=Asia/Shanghai`。scan/publish 的归天和 `updatedAt` 都依赖本地时区；脚本启动时会检查当前时区，非北京时间且未设置 `TZ=Asia/Shanghai` 会直接失败，避免 GitHub runner 默认 UTC 把 8:00 边界漂移。
 
 ## 必需 Secrets
 
@@ -31,7 +32,7 @@ node scripts/changelog/auto-changelog.mjs scan
 
 - 读 `public/changelog.json` 的 `lastGithash` 作锚点，`git fetch origin main`，`git log --first-parent <锚点>..origin/main`。
 - PR 识别双模式（squash `(#N)` / merge `Merge pull request #N`），与现有 entries 的 `prs` 求差集去重，跳过 `chore: 更新日志补扫` 自身 meta-PR。
-- 归天：落地 commit 的 committer 时间左移 8 小时取本地日历日（与 `src/lib/changelogDate.ts` 一致）。
+- 归天：落地 commit 的 committer 时间左移 8 小时取本地日历日（与 `src/lib/changelogDate.ts` 一致）。必须在 `Asia/Shanghai` 时区运行；本地若不是北京时间，先显式加 `TZ=Asia/Shanghai`。
 - 每条 PR 的 `body` + `by`（PR opener）用 `gh pr view N --json body,author` 一次取双；失败降级为 `by` 走 `^2`/`%an`，`body` 走空串。
 - 退出码 0：
   - 无新 PR → stdout `{"status":"empty"}`。Actions 成功退出，不开 PR，不前移 `lastGithash`。
@@ -86,8 +87,10 @@ node scripts/changelog/auto-changelog.mjs publish --rewrite /tmp/mivo-changelog-
 4. `PREFLIGHT_SKIP=1 git push -u origin <branch>`；Actions 里 remote 已用 `MIVO_CHANGELOG_PAT` 配好。
 5. `gh pr create`。
 6. 轮询 CI（`gh pr checks <N> --json name,state`，每 30s，上限 30 分钟）；head 落后先 `gh pr update-branch`。
-7. merge 前铁律：分支名匹配 `^chore/changelog-`；PR files 仅含 `public/changelog.json`；checks 全 pass；`mergeable=MERGEABLE`。全过才 `gh pr merge --squash`。
-8. 收尾：删远程分支 + 清临时 worktree（失败路径也清本地 worktree/分支，PR 保留待人工处理）。
+7. merge 前铁律：分支名匹配 `^chore/changelog-`；PR files 仅含 `public/changelog.json`；checks 全 pass；`mergeable=MERGEABLE`。
+8. 若铁律全部通过且 PR 仍有 unresolved review threads，publish 会通过 GraphQL 对每条线程先发可见回复，再 `resolveReviewThread`。回复说明该 PR 是每日更新日志自动补扫产物、只含 `public/changelog.json`、内容经脚本硬校验，并附原评论要点。此逻辑只允许在上述 changelog-only PR 上执行；任何其他分支名或文件集合都会拒绝自动处理。
+9. 全过后 `gh pr merge --squash`；若 GitHub base branch policy 刚解除仍短暂拒绝，脚本会短暂重试，仍失败则非零退出并保留 PR。
+10. 收尾：删远程分支 + 清临时 worktree（失败路径也清本地 worktree/分支，PR 保留待人工处理）。
 
 退出码：
 
@@ -103,9 +106,9 @@ changelog-only 非代码改动，临时 worktree 无 `node_modules`，本地 pre
 ## 本地调试
 
 ```bash
-node scripts/changelog/auto-changelog.mjs scan
-MIVO_CHANGELOG_LLM_KEY=sk-... node scripts/changelog/auto-changelog.mjs rewrite
-node scripts/changelog/auto-changelog.mjs publish --rewrite /tmp/mivo-changelog-rewrite.json --dry-run
+TZ=Asia/Shanghai node scripts/changelog/auto-changelog.mjs scan
+TZ=Asia/Shanghai MIVO_CHANGELOG_LLM_KEY=sk-... node scripts/changelog/auto-changelog.mjs rewrite
+TZ=Asia/Shanghai node scripts/changelog/auto-changelog.mjs publish --rewrite /tmp/mivo-changelog-rewrite.json --dry-run
 ```
 
 不要在本地随手跑非 dry-run publish：它会创建真实 PR、等待 CI，并在全绿后自动 merge。

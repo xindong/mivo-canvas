@@ -19,6 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
+      TZ: Asia/Shanghai
       CHANGELOG_SCAN_STATUS: /tmp/mivo-changelog-scan-status.json
       CHANGELOG_SCAN_JSON: /tmp/mivo-changelog-scan.json
       CHANGELOG_REWRITE_JSON: /tmp/mivo-changelog-rewrite.json
