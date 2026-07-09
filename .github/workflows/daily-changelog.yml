@@ -1,0 +1,104 @@
+name: Daily Changelog
+
+on:
+  schedule:
+    # UTC 00:00 = Beijing 08:00
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: daily-changelog-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  daily-changelog:
+    name: scan + rewrite + publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      CHANGELOG_SCAN_STATUS: /tmp/mivo-changelog-scan-status.json
+      CHANGELOG_SCAN_JSON: /tmp/mivo-changelog-scan.json
+      CHANGELOG_REWRITE_JSON: /tmp/mivo-changelog-rewrite.json
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node (LTS)
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Check required secrets
+        env:
+          MIVO_CHANGELOG_PAT: ${{ secrets.MIVO_CHANGELOG_PAT }}
+          MIVO_CHANGELOG_LLM_KEY: ${{ secrets.MIVO_CHANGELOG_LLM_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$MIVO_CHANGELOG_PAT" ]; then
+            echo "Missing required secret: MIVO_CHANGELOG_PAT" >&2
+            exit 1
+          fi
+          if [ -z "$MIVO_CHANGELOG_LLM_KEY" ]; then
+            echo "Missing required secret: MIVO_CHANGELOG_LLM_KEY" >&2
+            exit 1
+          fi
+
+      - name: Configure Git and GitHub CLI auth
+        env:
+          MIVO_CHANGELOG_PAT: ${{ secrets.MIVO_CHANGELOG_PAT }}
+        run: |
+          set -euo pipefail
+          git config user.name "mivo-changelog-bot"
+          git config user.email "mivo-changelog-bot@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${MIVO_CHANGELOG_PAT}@github.com/${GITHUB_REPOSITORY}.git"
+
+      - name: Scan merged PRs
+        id: scan
+        env:
+          GH_TOKEN: ${{ secrets.MIVO_CHANGELOG_PAT }}
+          GITHUB_TOKEN: ${{ secrets.MIVO_CHANGELOG_PAT }}
+        run: |
+          set -euo pipefail
+          node scripts/changelog/auto-changelog.mjs scan --output "$CHANGELOG_SCAN_JSON" > "$CHANGELOG_SCAN_STATUS"
+          cat "$CHANGELOG_SCAN_STATUS"
+          node <<'NODE'
+          const fs = require('node:fs')
+          const status = JSON.parse(fs.readFileSync(process.env.CHANGELOG_SCAN_STATUS, 'utf8'))
+          const empty = status.status === 'empty'
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `empty=${empty ? 'true' : 'false'}\n`)
+          if (!empty && status.status !== 'pending') {
+            throw new Error(`Unexpected scan status: ${status.status}`)
+          }
+          NODE
+
+      - name: Stop when no changelog entries are pending
+        if: steps.scan.outputs.empty == 'true'
+        run: echo "No new PRs to publish; daily changelog run exits cleanly."
+
+      - name: Rewrite changelog entries
+        if: steps.scan.outputs.empty != 'true'
+        env:
+          MIVO_CHANGELOG_LLM_KEY: ${{ secrets.MIVO_CHANGELOG_LLM_KEY }}
+        run: |
+          set -euo pipefail
+          node scripts/changelog/auto-changelog.mjs rewrite \
+            --scan "$CHANGELOG_SCAN_JSON" \
+            --output "$CHANGELOG_REWRITE_JSON"
+
+      - name: Publish changelog PR and merge after CI
+        if: steps.scan.outputs.empty != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.MIVO_CHANGELOG_PAT }}
+          GITHUB_TOKEN: ${{ secrets.MIVO_CHANGELOG_PAT }}
+          PREFLIGHT_SKIP: '1'
+        run: |
+          set -euo pipefail
+          node scripts/changelog/auto-changelog.mjs publish \
+            --scan "$CHANGELOG_SCAN_JSON" \
+            --rewrite "$CHANGELOG_REWRITE_JSON"
