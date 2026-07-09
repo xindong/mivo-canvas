@@ -1,7 +1,7 @@
 # Kernel 双轨契约（`?kernel=new|legacy`）
 
 日期：2026-07-09
-来源任务：架构迁移执行计划 v3 — T0.3（`docs/plan/arch-migration-execution-plan.md`）
+来源任务：T0.3 — 内核双轨藏身开关 + 契约（`--kernel` runner/CI 透传唯一出口是 T0.7 / PR #166；本 PR 只钉模式解析与契约，不实现 new 路径）
 开关实现：`src/app/kernelMode.ts`
 
 ## 1. 背景与范围
@@ -55,39 +55,84 @@ ESM 静态 import 图天然保证 `kernelMode` 在消费者模块体执行前完
 
 ## 4. shadow 读 / 单写策略（防 split-brain）
 
-迁移任意时刻，**有且仅有一个 kernel 拥有写入权**；另一个只读 shadow 用于比对。禁止双写。
+迁移任意时刻，**有且仅有一个 kernel 拥有 canonical 写入权**；另一个只读 shadow 用于比对。禁止双写。
+canonical key 是 kernel 无关的唯一真相（见 §5），shadow 永远读 canonical，**禁止读自己 kernel 的空派生缓存**。
 
-| 阶段 | 写入方 | 读取方 | new 路径状态 |
-|---|---|---|---|
-| A 默认 legacy（当前 T0.3） | legacy | legacy | 未实现；`isNewKernel` 分支不得出现在生产代码 |
-| B shadow 读 | legacy | legacy + new（shadow 比对，结果不一致仅 warn/log，不改行为） | new 实现接缝，契约测试比对 legacy 输出 |
-| C 单写切换 | new | new + legacy（legacy 降为 shadow 读） | new 契约测试全绿后切单写 |
-| D 删 legacy | new | new | legacy 代码与开关一起删 |
+| 阶段 | canonical 写入方 | canonical 读取方 | new 派生缓存 | 状态 |
+|---|---|---|---|---|
+| A 默认 legacy（当前 T0.3） | legacy | legacy | 不存在 | `isNewKernel` 分支不得出现在生产代码 |
+| B shadow 读 | legacy | legacy + new（new 从 legacy 的 canonical key 读，内存比对，不写） | 可选；仅热读缓存，绝不当真相 | new 实现接缝；契约测试比对 legacy 输出 |
+| C 单写切换 | new（canonical version bump） | new + legacy（legacy 经 down-migrate 读 canonical） | new 可填热读缓存 | new 契约测试全绿后切；切前必须完成一次性 legacy→new checkpoint |
+| D 删 legacy | new | new | 可删 | legacy 代码与开关一起删 |
 
-- **shadow 读**：new 轨读 legacy 写出的同一份数据（同 persist blob / 同服务端 record），在内存里跑 new
-  内核逻辑，把结果与 legacy 比对；不一致只走 `debugLogger.warn`，**不**回写到 UI / store / 服务端。
-- **单写**：任一时刻只有一个 kernel 的 PersistAdapter 接 syncToServer。双写 = 两个 adapter 都 sync =
-  revision 冲突 / 重复请求 / 缓存撕裂，明令禁止。
-- **切轨**：从 B→C（shadow→单写 new）是一次性 PR，配 full e2e `--kernel=both` + visual-diff + 性能 gate，
-  不得与其它迁移步骤混提。
+### 4.1 B 阶段：new shadow 从哪里读
 
-**T0.3 落点**：阶段 A。`isNewKernel` 已导出但无生产消费方；任何迁移 PR 引入 new 路径必须从阶段 B
-shadow 读起步，不得直接进 C。
+new shadow **必须从 legacy writer 的 canonical key 读**（`${BASE}:${userId}`，B 阶段即 legacy 格式），
+在内存里跑 new 内核逻辑，把结果与 legacy 比对；不一致只走 `debugLogger.warn`，**不**回写到 UI / store / 服务端。
+**禁止 new shadow 读自己的派生缓存 key（`${BASE}:${userId}:new`）当数据源**——那是空 namespace，
+shadow 比对会得到假阴性/空数据，split-brain 即由此产生。
 
-## 5. 缓存命名空间
+### 4.2 C 阶段：new 写后 legacy shadow 从哪里读
 
-IDB / localStorage 的 key 必须按 kernel 命名空间隔离，防止 new 轨跑过的缓存污染 legacy
-（或反向）。与 FX-6（缓存 per-user 化）合成最终 key：
+切轨 PR（B→C）必须含**一次性 legacy→new checkpoint**：把 canonical blob 从 legacy 格式迁移为 new 记录格式
+（扁平化 / 三域拆分），`version` bump。此后 new 原生读 canonical。legacy 降为 shadow reader，经
+**down-migrate**（zustand persist `migrate(persistedState, version)` hook，把 new 格式降级为 legacy 期望形态；
+`canvasPersistConfig` 已有 migrate 机制，new 格式落地时扩展 down-migrate 分支）读同一 canonical，比对 new 输出。
+**canonical key 全程不变**，分叉的是 blob 格式 + 版本号，由 migrate hook 桥接。
 
-```
-key = `${BASE}:${userId}:${kernelMode}`
-```
+### 4.3 回退路径（C→legacy，写死：兼容读桥，禁止静默读旧 key）
 
-- **legacy 命名空间 = 现有 key（不加 kernel 后缀）**：保证默认 legacy 下既有数据不被孤立、
-  迁移回滚也能读回老数据。即 legacy 的 `kernelMode` 段省略（等价当前 `mivo-canvas-demo` 等）。
-- **new 命名空间 = 带 kernel 后缀的新 key**：new 轨首次激活时用新 key，绝不复用 legacy 的 blob，
-  避免结构不兼容（record 扁平化、三域拆分）写坏老数据。
-- **logout / 账号切换清理**（FX-6）：清理只清当前 `kernelMode` 命名空间，不清另一轨，方便切回比对。
+灰度回退 `?kernel=legacy`（C 阶段已 new 写过 canonical 之后）时，**唯一合法回退路径 = 兼容读桥**：
+legacy hydrate 读到 canonical（new 格式、version 已 bump）→ 经 `migrate` hook down-migrate 为 legacy 格式 →
+legacy 看到 C 阶段 new 写入后的画布/聊天/资产引用变化，**无数据丢失**。legacy 随后的 persist 会以 legacy
+格式覆写 canonical（version 降回），这是显式 in-place down-migration，不是“读旧 key”。
+
+**硬禁止**：回退时**不得静默读 C 之前的旧 legacy key**（即把 canonical 当成没被 new 写过、跳过 down-migrate
+直接按 legacy 格式读）——这会丢失 C 阶段全部写入，正是灰度回退一致性命门要堵的口子。
+（显式 new→legacy in-place down-migration 可作为未来优化，但本契约钉死兼容读桥为唯一回退路径。）
+
+### 4.4 切轨不变量
+
+从 B→C（shadow→单写 new）是一次性 PR，配 full e2e `--kernel=both` + visual-diff + 性能 gate，不得与其它迁移步骤混提。
+
+### 4.5 契约测试要求（本 PR 不写，阶段 B/C 实施 PR 必须补）
+
+下列三场景必须由实施 new 路径的后续 PR（FX-6 / T1.2a / 阶段 B）补契约测试覆盖，本 PR 只在契约层钉死语义：
+1. **B 阶段 new shadow 从哪里读**：new shadow 读 legacy canonical，断言不读空派生缓存、shadow 比对走内存。
+2. **C 阶段 new 写后 legacy shadow 从哪里读**：new 写 canonical（version bump）后，legacy 经 down-migrate 读到 C 写入。
+3. **灰度回退 `?kernel=legacy` 后如何处理 new 写入**：回退走兼容读桥（down-migrate），断言不静默读旧 key、C 阶段数据不丢。
+
+**T0.3 落点**：阶段 A。`isNewKernel` 已导出但无生产消费方；任何迁移 PR 引入 new 路径必须从阶段 B shadow 读起步，不得直接进 C。
+
+## 5. 缓存命名空间（canonical / 派生缓存 两层 key）
+
+为防 split-brain，IDB / localStorage 的 key 分两层：**canonical 唯一真相 + kernel 派生缓存可丢弃**。
+
+### 5.1 canonical source-of-truth key（kernel 无关，唯一真相）
+
+- 格式：`${BASE}:${userId}`（FX-6 per-user 化前 = 现有扁平 key）。
+- 用户数据的唯一真相源。**kernel 切换不改变 canonical key**——legacy 与 new 读写同一个 canonical，
+  分叉的是 blob 格式 + `version`，由 persist `migrate` hook 桥接（见 §4.2/4.3）。
+- 三个 canonical 面：canvas（`mivo-canvas-demo` → `mivo-canvas:${userId}`）/ chat（`mivo-chat-demo` →
+  `mivo-chat:${userId}`）/ assets（`mivo-canvas-assets` IDB，blob 按 asset id 存，引用记录在 canonical canvas/chat 里）。
+
+### 5.2 kernel 派生缓存 key（可丢弃，new 专属）
+
+- 格式：`${BASE}:${userId}:${kernelMode}`，实际仅 new 填 `${BASE}:${userId}:new`（legacy 不用）。
+- new kernel 专属的热读缓存（new 记录格式的派生投影，如 CRDT 预算结构）。
+- **可丢弃**：丢失时从 canonical 重建。**绝不被任何 kernel 当作真相源读取**——new shadow 读 legacy
+  canonical（§4.1），不读自己的派生缓存；canonical 才是真相。
+
+### 5.3 与 FX-6 合成
+
+FX-6（缓存 per-user 化）把扁平 key 升级为 `${BASE}:${userId}`；本契约把 `${BASE}:${userId}` 钉为 canonical、
+`${BASE}:${userId}:new` 钉为 new 派生缓存。两者同 PR 落地；FX-6 是切默认 new 的硬前置
+（账号切换不经 logout 会撞 canonical 命名空间）。
+
+### 5.4 logout / 账号切换清理
+
+清理 = 清当前 user 的 canonical + 当前 kernel 的派生缓存；不清另一轨的派生缓存（方便切回比对）。
+logout 时 canonical 随账号回收，派生缓存一并清。**不得清另一 user 的 canonical**。
 
 当前静态 key（待 FX-6 + 本契约一起改）：`mivo-canvas-demo` / `mivo-chat-demo` / `mivo-canvas-assets`。
 
@@ -115,8 +160,9 @@ kernel 决定 command 走哪个出口：
   注入（prod 是静态产物，URL 注入仍可，但 env 注入保证不依赖 URL rewrite）。
 - `--kernel=new` 与 `--renderer=both` 正交组合：e2e 矩阵按 `(renderer, kernel)` 笛卡尔积跑（T0.7 CI 门禁）。
 
-**T0.3 落点**：本 PR 不改 `e2e-runner.mjs`（只建开关 + 契约 + 单测）。`--kernel` 透传与 CI 门禁在
-T0.7 落地；在此之前，单测已覆盖 URL/env/默认三情形分流，e2e 透传接缝已在此契约钉死。
+**T0.3 落点**：本 PR 不改 `e2e-runner.mjs`（只建开关 + 模式解析 + 契约 + 单测）。`--kernel` 的 runner/CI
+透传**唯一出口是 T0.7（PR #166）**；本 PR 只钉模式解析与契约接缝，e2e 透传不在本 PR 落地。在此之前，
+单测已覆盖 URL/env/默认三情形分流，e2e 透传接缝已在此契约钉死，T0.7 按本节约定接线。
 
 ## 8. 默认 legacy 生产无感约束（硬约束）
 
@@ -135,4 +181,4 @@ T0.7 落地；在此之前，单测已覆盖 URL/env/默认三情形分流，e2e
 - [x] 开关生效路径打 `debugLogger`（身份 log / new 通道 log / 非法 warn），遵守 `docs/development-logging.md`。
 - [x] 默认 legacy 下行为与 main 一致（本 PR 纯新增，零现有代码改动）。
 - [x] `npm run lint` + `npx tsc -b --noEmit` + `npm run test:unit` 全绿。
-- [ ] e2e `--kernel=` 透传与 CI 门禁（T0.7 落地，本 PR 只钉契约接缝）。
+- [ ] e2e `--kernel=` 透传与 CI 门禁（T0.7 / PR #166 唯一出口，本 PR 只钉模式解析 + 契约接缝）。
