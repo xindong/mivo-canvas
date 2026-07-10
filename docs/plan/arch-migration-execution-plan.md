@@ -33,13 +33,15 @@
 **已拍板(issue #153 owner 评论 2026-07-09)**:D9 PG / D10 Kysely / D11 本地FS内容寻址 / D13 docker 同机 / D16 投 C+授权 spike / D12 起步 PG 表 / D7 修正(存量降级,表征不降级)。
 
 **DP 决策(评审后更新)**:
-- **DP-1 选择态单一真相源**:归 session、不双写(迁移前实施)。
-- **DP-2 anchorModel**:formal 化或删,T1.2a schema 定稿时一并拍。
+- **DP-1 选择态单一真相源** ✅ 已拍(T1.2a 2026-07-10):归 session、不双写(迁移前实施);**迁移窗口不冻结 selection 读写**,迁移瞬间选区清空可接受,v10 迁移后首次加载 selection 为空属预期降级行为(非 bug)。详见 docs/decisions/record-schema.md §4.1。
+- **DP-2 anchorModel/annotationBounds** ✅ 已拍(T1.2a 2026-07-10):**收编**——experimentalAnchors 收编为顶层 `Anchor` record(document 域,独立 id+revision;锚点对话是产品范式核心,删除与愿景矛盾);annotationBounds 收编为 annotation 节点 formal 子字段。详见 docs/decisions/record-schema.md §4.2。
 - **DP-3 删画布级联对话**:服务端定级联软删语义(并入 FX-7 语义表)。
 - **DP-4 身份模型对齐**:T1.4 前确认 SSO 身份载体 == 权限层假设。
 - **DP-5 节点 payload 存法 ✅ 已定(采纳 review-plan-a)**:**信封列 + payload jsonb**——只拆 `id/canvas_id/type/revision/scope/is_deleted/created_at/updated_at` 及少量索引字段,其余整存 jsonb;不全量拆列,不把 jsonb 当字段级 CRDT。
 - **DP-6 chat 消息 API 归属(新)**:chat 随文档域走 `/api/canvas` 子资源(messagesByScene 键随 canvas 生命周期),独立集合存储(D6),级联语义见 FX-7。
 - **DP-7 两把 key 显式不迁(新)**:gatewayKey/mivoKey 留前端 strictIdb,**永不进 /api/user-state**;服务端只承接 mivo key 懒验证。
+- **DP-8 tasks 归属(新,T1.2a 2026-07-10 拍)**:迁服务端 tasks registry(FX-2 per-user)+ preset demo 任务留 demo seed;document record 无 tasks 字段。详见 docs/decisions/record-schema.md §4.3。
+- **DP-9 status 字段(新,T1.2a 2026-07-10 拍)**:降级 session 派生,record 不存;派生规则:task 存在→随 task 状态,task 不存在→有 asset→ready、无 asset→failed;last-known 缓存=第二真相源 split-brain 风险。详见 docs/decisions/record-schema.md §2.1。
 
 **待 lead 输入**:D14 mivoserver 访问 + board schema(已认领,不阻塞 P1)。
 
