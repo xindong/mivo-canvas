@@ -17,6 +17,17 @@
 import { doneTaskView, failedTaskView } from '../api-mocks.mjs'
 import { clickCanvasNode, waitForNodeRendered } from '../renderer-evidence.mjs'
 
+// contentEditable 富文本编辑器输入(对齐 mask.mjs fillMaskPrompt):click 聚焦 +
+// execCommand insertText 触发 input 事件,让 overlay 的 hasText/占位符逻辑生效。
+// prompt 输入区自 253bd42 起从 <textarea> 改为 contentEditable .image-mask-edit-editor;
+// 本场景旧的 '.image-mask-edit-prompt textarea' 选择器随之失效(fill 必 30s 超时),
+// 16fe8d2 只对齐了 mask.mjs,漏改本场景。内联而非 import 是为避免改共享文件误伤其他 e2e。
+const fillMaskPrompt = async (page, text) => {
+  const editor = page.locator('.image-mask-edit-prompt .image-mask-edit-editor')
+  await editor.click()
+  await page.evaluate((t) => { document.execCommand('insertText', false, t) }, text)
+}
+
 // 恢复默认 progressive /tasks/* GET mock（SC4.5 beside 生成依赖它 poll 到 done）。
 // 与 api-mocks.attachDefaultMivoApiMocks 的 /tasks/* 路由同形；mask-reflow 在 gated
 // 段 unroute 后调用本函数重建。内联而非 import 是为避免改共享文件误伤其他 e2e。
@@ -189,7 +200,7 @@ export const runMaskReflowScenario = async (context) => {
 
   let slotId
   try {
-    await page.locator('.image-mask-edit-prompt textarea').fill('E2E reflow local repaint')
+    await fillMaskPrompt(page, 'E2E reflow local repaint')
     await page.locator('.image-mask-edit-prompt').getByRole('button', { name: '局部重绘' }).click()
 
     // Prebuilt generating slot appears at A.right + 56 (SC4.1). Held by editGate.
@@ -323,7 +334,7 @@ export const runMaskReflowScenario = async (context) => {
   await page.unroute('**/api/mivo/tasks/*')
   const releaseFail = await attachGatedTasksGetMock(page, failedTaskView('mask edit e2e failure', { status: 'failed', progress: 50 }))
   try {
-    await page.locator('.image-mask-edit-prompt textarea').fill('E2E mask edit failure cleanup')
+    await fillMaskPrompt(page, 'E2E mask edit failure cleanup')
     await page.locator('.image-mask-edit-prompt').getByRole('button', { name: '局部重绘' }).click()
 
     // While held: generating slot prebuilt + B pushed right (reflow applied).
