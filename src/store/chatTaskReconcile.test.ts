@@ -5,7 +5,7 @@
 // errors / gone tasks / non-targets alone. settleChatTasks is mocked (no network);
 // useChatStore is a minimal in-memory stand-in (the reconcile only uses
 // getState/setState — no IDB, no heavy store deps).
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const settleChatTasksMock = vi.fn()
 vi.mock('../lib/mivoTaskClient', () => ({
@@ -30,7 +30,8 @@ vi.mock('./chatStore', () => ({
 }))
 
 import { reconcileExpiredChatTasks } from './chatTaskReconcile'
-import { expiredGenerationMessage } from './chatGenerationHydration'
+import { expiredGenerationMessage, recoveredTaskDoneMessage } from './chatGenerationHydration'
+import { useDebugLogStore } from './debugLogStore'
 import type { ChatMessage } from './chatStore'
 
 const ctx = (serverTaskId: string) => ({
@@ -176,5 +177,93 @@ describe('FX-3 reconcileExpiredChatTasks', () => {
     // retried card alone (did not clobber 'generating' back to 'done').
     const msg = storeState.messagesByScene['s1'][0]
     expect(msg.status).toBe('generating')
+  })
+
+  it('P1-1: 空 text 的 mask-edit 卡 recover 后兜底 text(done 分支必有可渲染内容)', async () => {
+    setScene('s1', [blanketSettledCard('m1', 't-done')]) // text: '' (helper 默认)
+    settleChatTasksMock.mockResolvedValue({
+      't-done': { id: 't-done', kind: 'edit', status: 'done', progress: 100, stage: 'done', requestId: 'r', model: 'gpt-image-2', result: { images: [{ b64: 'x' }] } },
+    })
+
+    await reconcileExpiredChatTasks()
+
+    const msg = storeState.messagesByScene['s1'][0]
+    expect(msg.status).toBe('done')
+    // 原 text 空 → 兜底文案;done 分支必有可渲染内容(text 或 resultNodeIds 至少其一)
+    expect(msg.text).toBe(recoveredTaskDoneMessage)
+    expect(msg.text.length).toBeGreaterThan(0)
+  })
+
+  it('P1-1: recover 保留既有 text(非空不覆盖)', async () => {
+    setScene('s1', [blanketSettledCard('m1', 't-done', { text: '把背景换成蓝色' })])
+    settleChatTasksMock.mockResolvedValue({
+      't-done': { id: 't-done', kind: 'edit', status: 'done', progress: 100, stage: 'done', requestId: 'r', model: 'gpt-image-2' },
+    })
+
+    await reconcileExpiredChatTasks()
+
+    const msg = storeState.messagesByScene['s1'][0]
+    expect(msg.status).toBe('done')
+    expect(msg.text).toBe('把背景换成蓝色') // 原 text 保留,不被兜底覆盖
+  })
+
+  it('P1-1: recover 保留既有 resultNodeIds(done 分支 result 可渲染)', async () => {
+    setScene('s1', [blanketSettledCard('m1', 't-done', { resultNodeIds: ['node-1'] })])
+    settleChatTasksMock.mockResolvedValue({
+      't-done': { id: 't-done', kind: 'edit', status: 'done', progress: 100, stage: 'done', requestId: 'r', model: 'gpt-image-2' },
+    })
+
+    await reconcileExpiredChatTasks()
+
+    const msg = storeState.messagesByScene['s1'][0]
+    expect(msg.status).toBe('done')
+    expect(msg.resultNodeIds).toEqual(['node-1']) // 既有 resultNodeIds 保留,done 分支定位链接可渲染
+  })
+})
+
+// P1-2: settle 有限重试(指数退避 3 次)。fake timers 避免真实 200/400ms 等待。
+describe('FX-3 reconcileExpiredChatTasks — P1-2 settle retry', () => {
+  beforeEach(() => {
+    storeState = { messagesByScene: {} }
+    settleChatTasksMock.mockReset()
+    useDebugLogStore.getState().clear()
+    vi.useFakeTimers()
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('瞬态失败 → 重试成功 → 恢复卡(settleChatTasks 调用 2 次)', async () => {
+    setScene('s1', [blanketSettledCard('m1', 't-done')])
+    settleChatTasksMock
+      .mockRejectedValueOnce(new Error('503'))
+      .mockResolvedValueOnce({ 't-done': { id: 't-done', kind: 'edit', status: 'done', progress: 100, stage: 'done', requestId: 'r', model: 'gpt-image-2' } })
+
+    const promise = reconcileExpiredChatTasks()
+    await vi.advanceTimersByTimeAsync(1000) // flush 200ms 退避 + microtasks
+    await promise
+
+    const msg = storeState.messagesByScene['s1'][0]
+    expect(msg.status).toBe('done')
+    expect(msg.text).toBe(recoveredTaskDoneMessage)
+    expect(settleChatTasksMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('全部失败 → 不抛、warn 留痕、卡片维持 error(settleChatTasks 调用 3 次)', async () => {
+    setScene('s1', [blanketSettledCard('m1', 't-net')])
+    settleChatTasksMock.mockRejectedValue(new Error('network'))
+
+    const promise = reconcileExpiredChatTasks()
+    await vi.advanceTimersByTimeAsync(10000) // flush 200+400ms 退避 + microtasks
+    await promise
+
+    const msg = storeState.messagesByScene['s1'][0]
+    expect(msg.status).toBe('error')
+    expect(msg.error).toBe(expiredGenerationMessage)
+    expect(settleChatTasksMock).toHaveBeenCalledTimes(3)
+    const warn = useDebugLogStore
+      .getState()
+      .entries.find((e) => /Settle failed after 3 attempt/.test(e.message))
+    expect(warn).toBeDefined()
   })
 })

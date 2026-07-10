@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { useCanvasStore } from '../store/canvasStore'
 import { useChatStore } from '../store/chatStore'
 import { useAuthStore } from '../store/authSlice'
+import { useSettingsStore } from '../store/settingsSlice'
 import { reconcileExpiredChatTasks } from '../store/chatTaskReconcile'
 import { debugLogger } from '../store/debugLogStore'
 import { toastFeedback } from '../store/toastStore'
@@ -41,6 +42,14 @@ export function useStoreHydration(): boolean {
         await Promise.all([
           useCanvasStore.persist.rehydrate(),
           useChatStore.persist.rehydrate(),
+          // P1-2 (FX-3): 显式 await settings rehydrate,保证 reconcile 跑前 mivoKey/
+          // gatewayKey 已从 IDB 恢复。settings 虽不用 skipHydration(模块加载即自动
+          // rehydrate),但自动 rehydrate 与本 effect 的 auth /me + canvas/chat IDB
+          // 并发竞态——auth 网络往返快或 settings IDB 冷启时,reconcile 的 settle
+          // fetch(authHeaders 读 mivoKey 做 FX-2 owner fingerprint)可能在 key 未恢复
+          // 时发出 → 401。此处显式 await 消除该竞态(401-because-ordering 靠时序修,
+          // 非靠 reconcile 内重试硬扛);reconcile 内重试只兜其余瞬态(5xx/网络)。
+          useSettingsStore.persist.rehydrate(),
         ])
         // FX-3: server-truth reconciliation of wrongly-expired mask-edit chat cards.
         // The blanket settleExpiredChatMessages already ran in the chat merge (so no

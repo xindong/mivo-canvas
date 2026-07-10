@@ -31,11 +31,20 @@
 // card stays as the blanket 'expired' so the user can retry — not a stuck card.
 
 import { useChatStore, type ChatMessage } from './chatStore'
-import { expiredGenerationMessage } from './chatGenerationHydration'
+import { expiredGenerationMessage, recoveredTaskDoneMessage } from './chatGenerationHydration'
 import { settleChatTasks, type TaskView } from '../lib/mivoTaskClient'
 import { debugLogger } from './debugLogStore'
 
 const SOURCE = 'Chat Task Reconcile'
+
+// P1-2: settle 有限重试(指数退避)。瞬态失败(settle 5xx/网络)原本 fire-and-forget
+// 一次失败本会话永久停"已过期";重试给瞬态故障恢复窗口。纯确定性(固定 3 次、固定退避)。
+// 401-because-ordering 由 useStoreHydration 在 reconcile 前 await settings rehydrate 修
+// (保证 mivoKey 已恢复),不靠重试硬扛;重试只兜其余瞬态。耗尽 → warn 留痕,卡片维持
+// blanket settle(下次 hydrate 天然再试)。
+const SETTLE_MAX_ATTEMPTS = 3
+const SETTLE_BASE_BACKOFF_MS = 200
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
 // A mask-edit card that the blanket settle just killed: 'error' + the exact
 // expired text + 'unknown' kind (settleExpiredChatMessages always sets these three
@@ -57,13 +66,23 @@ const recoverPatchedMessage = (message: ChatMessage): ChatMessage => ({
   timeoutRetryKey: undefined,
   timeoutRetryCount: undefined,
   retryDisabledReason: undefined,
+  // P1-1: 兜底 text。mask-edit 卡原 text 常为空(编辑靠 mask 选择,非文本 prompt);blanket
+  // settle 已 ...message 保留既有 resultNodeIds(hydrate 前结果若已提交 canvas,节点引用仍在
+  // → done 分支定位链接可渲染)。无 resultNodeIds 时(结果未提交)done 分支无图无文 → 空白卡,
+  // 故兜底文案保证必有可渲染内容(text 或 result 至少其一)。保留原 text(非空不覆盖)。
+  // result 图像 b64 不在此恢复:ChatMessage 无 inline b64 字段,done 分支靠 text 或
+  // resultNodeIds 渲染;b64→canvas 节点恢复需 source/mask 数据,post-hydrate 不可得(见
+  // 顶部 residual 注释),属 FX-3 既有 out-of-scope。
+  text: message.text || recoveredTaskDoneMessage,
 })
 
 /**
  * Ask the server (per-user task registry) for the truth behind blanket-settled
  * mask-edit cards and recover the ones that actually succeeded. Safe to call any
  * time after hydrate; no-op when there are no candidate cards or the settle fetch
- * fails (the blanket settle stays in place). Never throws to the caller.
+ * fails after retries (the blanket settle stays in place). Never throws to the
+ * caller. P1-2: settle 有限重试(指数退避 3 次)兜瞬态失败;P1-1: recovered 卡兜底
+ * text 保证 done 分支必有可渲染内容(text 或既有 resultNodeIds)。
  */
 export const reconcileExpiredChatTasks = async (): Promise<void> => {
   const { messagesByScene } = useChatStore.getState()
@@ -78,13 +97,29 @@ export const reconcileExpiredChatTasks = async (): Promise<void> => {
   }
   if (taskIds.length === 0) return
 
-  let results: Record<string, TaskView>
-  try {
-    results = await settleChatTasks(taskIds)
-  } catch (error) {
+  // P1-2: 有限重试(指数退避)。瞬态失败(settle 5xx/网络)原本 fire-and-forget 一次
+  // 失败本会话永久停"已过期";重试给瞬态故障恢复窗口。纯确定性(固定 3 次、固定退避)。
+  // 401-because-ordering 由 useStoreHydration 在 reconcile 前 await settings rehydrate 修
+  // (保证 mivoKey 已恢复),不靠重试硬扛;重试只兜其余瞬态。耗尽 → warn 留痕,卡片维持
+  // blanket settle(下次 hydrate 天然再试)。
+  let results: Record<string, TaskView> = {}
+  let settled = false
+  let lastError: unknown
+  for (let attempt = 0; attempt < SETTLE_MAX_ATTEMPTS && !settled; attempt += 1) {
+    try {
+      results = await settleChatTasks(taskIds)
+      settled = true
+    } catch (error) {
+      lastError = error
+      if (attempt < SETTLE_MAX_ATTEMPTS - 1) {
+        await sleep(SETTLE_BASE_BACKOFF_MS * 2 ** attempt)
+      }
+    }
+  }
+  if (!settled) {
     debugLogger.warn(
       SOURCE,
-      `Settle fetch failed for ${taskIds.length} card(s); leaving blanket settle: ${error instanceof Error ? error.message : String(error)}`,
+      `Settle failed after ${SETTLE_MAX_ATTEMPTS} attempt(s) for ${taskIds.length} card(s); leaving blanket settle: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
     )
     return
   }
