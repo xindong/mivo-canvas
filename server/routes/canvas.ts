@@ -197,6 +197,17 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 422, latencyMs: Date.now() - t0, note: 'reuse-conflict' })
       return c.json(err, 422)
     }
+    // F4:canvas 跨 owner 同 id → 409 canvas-exists(全局唯一,与 project 同模式)。
+    if (result.kind === 'exists-other-owner') {
+      const err = { error: 'canvas-exists' as const, id }
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 409, latencyMs: Date.now() - t0, note: 'canvas-exists' })
+      return c.json(err, 409)
+    }
+    // F1:父 project 软删/不存在 → 404 unknown-project(软删 parent 下禁独立 child create/restore,只许 POST project 整树恢复)。
+    if (result.kind === 'parent-not-live') {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'parent-not-live' })
+      return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
+    }
     // 返修 #2/N2:canvas 创建时一并建 chat-collection record;restored 路径由 ensureCreate→restoreCanvasTree 原子恢复 collection。
     if (result.kind === 'created') {
       await backend.ensureCreate(actor, 'chat-collection', id, {}, {
@@ -281,6 +292,11 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 422, latencyMs: Date.now() - t0, note: 'reuse-conflict' })
       return c.json(err, 422)
     }
+    // F1:move 目标 project 软删/不存在 → 404 unknown-project(防 move 到软删 project)。
+    if (result.kind === 'parent-not-live') {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'parent-not-live' })
+      return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
+    }
     if (result.kind === 'precondition-required') {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 428, latencyMs: Date.now() - t0, note: 'precondition-required' })
       return c.json(preconditionRequired(id), 428)
@@ -354,13 +370,17 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
       return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
     }
-    // N5:If-Match(contentVersion base)——invalid → 400;stale → 409(N8 两并发一成一 409)。
+    // N5/F5:If-Match(contentVersion base)**必填**——invalid → 400;missing → 428(precondition-required);stale → 409(N8 两并发一成一 409)。
     const parsed = parseIfMatch(c.req.header('if-match'))
     if (parsed.kind === 'invalid') {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'bad-if-match' })
       return c.json(badIfMatch(id), 400)
     }
-    const base = parsed.kind === 'value' ? parsed.revision : undefined
+    if (parsed.kind === 'missing') {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 428, latencyMs: Date.now() - t0, note: 'precondition-required' })
+      return c.json(preconditionRequired(id), 428)
+    }
+    const base = parsed.revision
     const result = await backend.reorderChildren(owner.ownerId, id, type, orderedIds, { base })
     if (result.kind === 'bad') {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: `reorder-${result.reason}` })

@@ -23,6 +23,7 @@ import {
   readJsonBodyWithFingerprint,
   reuseConflict,
   scanForSensitiveFields,
+  scanUserStateKeyForCredential,
   isUserStateKeyNamespaceAllowed,
   userStateNamespaceKind,
 } from '../lib/persistHttp'
@@ -57,6 +58,9 @@ const valueMatchesKind = (value: unknown, kind: string): boolean => {
   switch (kind) {
     case 'array':
       return Array.isArray(value)
+    case 'string-array':
+      // F7:canvas:<id>:selection 只收 string[](与 SessionStore 对齐)。
+      return Array.isArray(value) && value.every((item) => typeof item === 'string')
     case 'object':
       return typeof value === 'object' && value !== null && !Array.isArray(value)
     case 'string':
@@ -141,6 +145,12 @@ export const createUserStateRoutes = ({ backend }: { backend: PersistBackend }):
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'forbidden-key' })
       return c.json(err, 400)
     }
+    // F3:完整 user-state key(含 free-form canvasId/panelId 段)credential 扫描——key 按 `:` 切段,任一段规范化后 mivo_/sk- 前缀 → forbidden-key(防 key 里藏凭据)。
+    if (scanUserStateKeyForCredential(key)) {
+      const err: ForbiddenKeyBody = { error: 'forbidden-key', key }
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'forbidden-key-credential' })
+      return c.json(err, 400)
+    }
     let decoded
     try {
       const { body: raw, fingerprint } = await readJsonBodyWithFingerprint<unknown>(c)
@@ -200,6 +210,11 @@ export const createUserStateRoutes = ({ backend }: { backend: PersistBackend }):
       const err: ConflictBody = { error: 'revision-conflict', id: key, currentRevision: result.currentRevision }
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 409, latencyMs: Date.now() - t0, note: 'rev-conflict' })
       return c.json(err, 409)
+    }
+    // F1 防御:user-state 无父 project,parent-not-live 不可达;类型收窄。
+    if (result.kind === 'parent-not-live') {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'parent-not-live' })
+      return c.json({ error: 'unknown-key' } satisfies UnknownResourceBody, 404)
     }
     const res: UpsertResponse = { id: result.record.id, revision: result.record.revision }
     logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0 })

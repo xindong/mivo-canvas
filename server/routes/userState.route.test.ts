@@ -174,4 +174,30 @@ describe('/api/user-state routes (T1.3 返修二 N1-N10)', () => {
     expect(ok.status).toBe(200)
     expect((ok.body as { revision: number }).revision).toBe(1)
   })
+
+  it('F3: URL 编码 field name 绕过 → 400 forbidden-value;key 含 mivo_ 段 → 400 forbidden-key', async () => {
+    // F3 part1:object key URL 编码(%61piKey → decode apiKey)→ 命中 forbidden-value(camera=object kind 承载)
+    const f1 = await put('canvas:c1:camera', { '%61piKey': 'stolen' })
+    expect(f1.status).toBe(400)
+    expect((f1.body as { error: string }).error).toBe('forbidden-value')
+    // F3 part2:key 含 mivo_ 段(canvas:mivo_xxx:selection;namespace 允许但 credential 段扫描拒)→ forbidden-key
+    const f2 = await put('canvas:mivo_xxx:selection', ['n1'])
+    expect(f2.status).toBe(400)
+    expect((f2.body as { error: string }).error).toBe('forbidden-key')
+    // F3 part2:key 含大写 MIVO_ 段(规范化后命中)→ forbidden-key
+    expect((await put('canvas:MIVO_upper:selection', ['n1'])).status).toBe(400)
+    // 干净 key 正常
+    expect((await put('canvas:c1:selection', ['n1'])).status).toBe(200)
+  })
+
+  it('F7: canvas:<id>:selection 只收 string[](与 SessionStore 对齐)', async () => {
+    // string[] → 200
+    expect((await put('canvas:c1:selection', ['n1', 'n2'])).status).toBe(200)
+    // 非 string[](含 number item)→ 400 bad-request
+    const f = await put('canvas:c2:selection', ['n1', 123])
+    expect(f.status).toBe(400)
+    expect((f.body as { error: string }).error).toBe('bad-request')
+    // 非 array(object)→ 400
+    expect((await put('canvas:c3:selection', { x: 1 })).status).toBe(400)
+  })
 })

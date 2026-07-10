@@ -51,8 +51,17 @@ export interface ServerPersistAdapter {
   deleteNode(canvasId: string, nodeId: string): Promise<void>
   deleteEdge(canvasId: string, edgeId: string): Promise<void>
   deleteAnchor(canvasId: string, anchorId: string): Promise<void>
-  /** 返修 #6:重排子资源顺序(持久化 orderKey)。 */
-  reorderChildren(canvasId: string, type: 'node' | 'edge' | 'anchor' | 'chat-message', orderedIds: string[]): Promise<void>
+  /**
+   * 返修 #6/F5:重排子资源顺序(持久化 orderKey)。**If-Match(contentVersion base)必填**——
+   * baseContentVersion = client 最近读到的 canvas contentVersion(若-Match);并发同 base 一成一 409。
+   * 响应返新 contentVersion(client 据此作下次 reorder 的 If-Match base)。
+   */
+  reorderChildren(
+    canvasId: string,
+    type: 'node' | 'edge' | 'anchor' | 'chat-message',
+    orderedIds: string[],
+    baseContentVersion?: Revision,
+  ): Promise<{ reordered: number; contentVersion: Revision }>
 
   // ── document scope → /api/canvas/:id/chat(DP-6)──
   appendChatMessage(canvasId: string, message: unknown): Promise<UpsertResponse>

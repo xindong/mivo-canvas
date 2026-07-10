@@ -130,6 +130,11 @@ export const createProjectsRoutes = ({ backend }: { backend: PersistBackend }): 
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 409, latencyMs: Date.now() - t0, note: 'project-exists' })
       return c.json(err, 409)
     }
+    // F1 防御:project 无父 project,parent-not-live 不可达;类型收窄(不返 200 假成功)。
+    if (result.kind === 'parent-not-live') {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'parent-not-live' })
+      return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
+    }
     const status = result.kind === 'created' ? 201 : 200
     logRequest({ method: c.req.method, path: c.req.path, requestId, status, latencyMs: Date.now() - t0 })
     return c.json(toProject(result.record), status)
@@ -181,8 +186,12 @@ export const createProjectsRoutes = ({ backend }: { backend: PersistBackend }): 
       return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
     }
     let raw: unknown
+    let fingerprint: string
     try {
-      raw = await readJsonBodyWithFingerprint<{ name?: unknown }>(c).then((r) => r.body)
+      // F2:捕获 fingerprint 传入 upsert(防同 idem key 不同 body 返 200——N4 reuse-conflict 依赖 bodyFingerprint)。
+      const r = await readJsonBodyWithFingerprint<{ name?: unknown }>(c)
+      raw = r.body
+      fingerprint = r.fingerprint
     } catch (error) {
       const { status, body } = bodyError(error)
       logRequest({ method: c.req.method, path: c.req.path, requestId, status, latencyMs: Date.now() - t0, note: 'bad-body' })
@@ -209,6 +218,7 @@ export const createProjectsRoutes = ({ backend }: { backend: PersistBackend }): 
       method: 'PATCH',
       resourceKind: 'project',
       idempotencyKey: c.req.header('idempotency-key') || undefined,
+      bodyFingerprint: fingerprint, // F2:同 idem key 同 body 200 不 bump / 不同 body 422
     })
     if (result.kind === 'reuse-conflict') {
       const err: ReuseConflictBody = reuseConflict(c.req.header('idempotency-key') ?? '')
@@ -223,6 +233,11 @@ export const createProjectsRoutes = ({ backend }: { backend: PersistBackend }): 
       const err: ConflictBody = { error: 'revision-conflict', id, currentRevision: result.currentRevision }
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 409, latencyMs: Date.now() - t0, note: 'rev-conflict' })
       return c.json(err, 409)
+    }
+    // F1 防御:project PATCH 无父 project,parent-not-live 不可达;类型收窄。
+    if (result.kind === 'parent-not-live') {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'parent-not-live' })
+      return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
     }
     logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0 })
     return c.json(toProject(result.record), 200)

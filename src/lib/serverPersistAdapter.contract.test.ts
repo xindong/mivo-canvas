@@ -33,8 +33,10 @@ import {
   parseIfMatch,
   resolveBaseRevision,
   scanForSensitiveFields,
+  scanUserStateKeyForCredential,
   userStateNamespaceKind,
   USER_STATE_KEY_NAMESPACES,
+  validateChildPayload,
 } from '../../shared/persist-contract.ts'
 import { unwiredServerPersistAdapter, type ServerPersistAdapter } from './serverPersistAdapter'
 import type { NodeRecord } from '../kernel/records'
@@ -146,7 +148,7 @@ describe('T1.3 ServerPersistAdapter ↔ server contract 类型共享互锁(返�
     expect(isUserStateKeyNamespaceAllowed('random:stuff')).toBe(false)
     expect(userStateNamespaceKind('recent:projects')).toBe('array')
     expect(userStateNamespaceKind('pref:tool')).toBe('string')
-    expect(userStateNamespaceKind('canvas:c1:selection')).toBe('array')
+    expect(userStateNamespaceKind('canvas:c1:selection')).toBe('string-array') // F7:只收 string[]
     expect(userStateNamespaceKind('canvas:c1:camera')).toBe('object')
     expect(userStateNamespaceKind('canvas:c1:chat-draft')).toBe('string')
     // 递归敏感扫描:字段名(大小写/连字符/camelCase 变体)
@@ -205,5 +207,78 @@ describe('T1.3 ServerPersistAdapter ↔ server contract 类型共享互锁(返�
     await expect(unwiredServerPersistAdapter.deleteNode('c1', 'n1')).rejects.toThrow(/not wired/)
     await expect(unwiredServerPersistAdapter.deleteEdge('c1', 'e1')).rejects.toThrow(/not wired/)
     await expect(unwiredServerPersistAdapter.uploadAsset(new Uint8Array(), { mimeType: 'image/png', originalName: 'x.png' })).rejects.toThrow(/not wired/)
+  })
+
+  // ── 返修三 F1-F7 shared-level 互锁/单元(逐字复现场景)──
+
+  it('F4:canvas id 全局唯一——跨 owner 同 canvas id → 409 canvas-exists body', () => {
+    const err = { error: 'canvas-exists' as const, id: 'c1' }
+    expect(err.error).toBe('canvas-exists')
+    expectTypeOf(err).toMatchTypeOf<{ error: 'canvas-exists'; id: string }>()
+  })
+
+  it('F5:adapter.reorderChildren 带 baseContentVersion(第 4 参)+ 返 contentVersion(并发 seam;unwired fail visibly)', async () => {
+    // 返 {reordered, contentVersion}(非 void,client 据此作下次 If-Match base)
+    expectTypeOf<ServerPersistAdapter['reorderChildren']>().returns.toMatchTypeOf<
+      Promise<{ reordered: number; contentVersion: Revision }>
+    >()
+    // 第 4 参 baseContentVersion?: Revision 传入(编译期签名互锁);unwired 仍 fail visibly。
+    await expect(unwiredServerPersistAdapter.reorderChildren('c1', 'node', ['n1'], 0)).rejects.toThrow(/not wired/)
+  })
+
+  it('F3:scanForSensitiveFields 对 object key best-effort decode+lower 再匹配;scanUserStateKeyForCredential 扫 key 段', () => {
+    // F3:URL 编码 field name(%61piKey → decode apiKey → 命中 forbidden-value),path 返 raw key
+    expect(scanForSensitiveFields({ '%61piKey': 'stolen' })).toBe('%61piKey')
+    expect(scanForSensitiveFields({ '%41pi-key': 'x' })).toBe('%41pi-key') // %41=A → Api-key → match
+    // 完整 user-state key credential 段扫描(按 `:` 切段,任一段 mivo_/sk- 前缀)
+    expect(scanUserStateKeyForCredential('canvas:mivo_xxx:selection')).toBe('mivo_xxx')
+    expect(scanUserStateKeyForCredential('canvas:%6divo_xxx:selection')).toBe('%6divo_xxx') // decode → mivo_xxx
+    expect(scanUserStateKeyForCredential('panel:sk-leaked')).toBe('sk-leaked')
+    expect(scanUserStateKeyForCredential('canvas:MIVO_upper:selection')).toBe('MIVO_upper') // 大小写不敏感
+    expect(scanUserStateKeyForCredential('canvas:c1:selection')).toBeNull() // 干净 key
+    expect(scanUserStateKeyForCredential('recent:projects')).toBeNull()
+    // 既有 case 不回归(raw key path 返回,match 用 normalized)
+    expect(scanForSensitiveFields({ 'api-key': 'x' })).toBe('api-key')
+    expect(scanForSensitiveFields({ userApiKey: 'x' })).toBe('userApiKey')
+    expect(scanForSensitiveFields({ data: '%6divo_encoded' })).toBe('data') // value 仍走 isCredentialValue
+  })
+
+  it('F6:validateChildPayload 递归 schema——status/tasks 任意层拒;optional 类型;transform nested exact key/type', () => {
+    const base = {
+      type: 'image', title: 't',
+      transform: { x: 0, y: 0, width: 100, height: 100, rotation: 0 },
+      fills: [] as unknown[], strokes: [] as unknown[], effects: [] as unknown[], relations: {} as Record<string, unknown>,
+    }
+    // 干净 canonical → ok
+    expect(validateChildPayload('node', { ...base }, 'n1').ok).toBe(true)
+    // status/tasks 任意层递归拒:relations 内藏 status → forbidden-field path=relations.status
+    const f1 = validateChildPayload('node', { ...base, relations: { status: 'ready' } }, 'n1')
+    expect(f1.ok).toBe(false)
+    if (!f1.ok) expect(f1.body).toMatchObject({ reason: 'forbidden-field', field: 'relations.status' })
+    // tasks 嵌套在 fills item → forbidden-field(fills[0].tasks)
+    const f2 = validateChildPayload('node', { ...base, fills: [{ tasks: [] }] }, 'n1')
+    if (!f2.ok) expect(f2.body.reason).toBe('forbidden-field')
+    // optional 类型校验:fontSize:'x' → bad-type
+    const f3 = validateChildPayload('node', { ...base, fontSize: 'x' }, 'n1')
+    if (!f3.ok) expect(f3.body).toMatchObject({ reason: 'bad-type', field: 'fontSize' })
+    // optional 类型校验:textAutoWidth:'yes'(非 bool)→ bad-type
+    const f4 = validateChildPayload('node', { ...base, textAutoWidth: 'yes' }, 'n1')
+    if (!f4.ok) expect(f4.body).toMatchObject({ reason: 'bad-type', field: 'textAutoWidth' })
+    // transform 内坏类型 → bad-type field=transform.x
+    const f5 = validateChildPayload('node', { ...base, transform: { x: 'bad', y: 0, width: 100, height: 100, rotation: 0 } }, 'n1')
+    if (!f5.ok) expect(f5.body).toMatchObject({ reason: 'bad-type', field: 'transform.x' })
+    // transform nested unknown key → unknown-field field=transform.bogus
+    const f6 = validateChildPayload('node', { ...base, transform: { x: 0, y: 0, width: 100, height: 100, rotation: 0, bogus: 1 } }, 'n1')
+    if (!f6.ok) expect(f6.body).toMatchObject({ reason: 'unknown-field', field: 'transform.bogus' })
+    // 既有顶层 forbidden 不回归:status 顶层 → forbidden-field field=status
+    const f7 = validateChildPayload('node', { ...base, status: 'ready' }, 'n1')
+    if (!f7.ok) expect(f7.body).toMatchObject({ reason: 'forbidden-field', field: 'status' })
+  })
+
+  it('F7:userStateNamespaceKind selection → string-array(与 SessionStore 对齐)', () => {
+    expect(userStateNamespaceKind('canvas:c1:selection')).toBe('string-array')
+    expect(userStateNamespaceKind('canvas:c1:camera')).toBe('object')
+    expect(userStateNamespaceKind('canvas:c1:chat-draft')).toBe('string')
+    expect(userStateNamespaceKind('recent:projects')).toBe('array') // recent 仍收任意 array
   })
 })

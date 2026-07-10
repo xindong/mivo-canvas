@@ -171,6 +171,8 @@ export type ApiErrorBody =
   | PayloadRejectedBody
   | UnknownResourceBody
   | { error: 'project-exists'; id: string }
+  // F4:canvas id 全局唯一(与 project 同模式)——跨 owner 同 canvas id → 409 canvas-exists。
+  | { error: 'canvas-exists'; id: string }
 
 // ── Project(record-schema §4.1)─────────────────────────────────────────────────
 
@@ -283,12 +285,14 @@ export const isUserStateKeyNamespaceAllowed = (key: string): boolean =>
   USER_STATE_KEY_FROZEN.some((re) => re.test(key))
 
 /**
- * 返修 N6:每 namespace/suffix 的 runtime value kind schema(不符 → 400 bad-request)。
+ * 返修 N6/F7:每 namespace/suffix 的 runtime value kind schema(不符 → 400 bad-request)。
+ * F7:`canvas:<id>:selection` 只收 **string[]**(与 SessionStore 对齐),kind='string-array'
+ * (array 且 every item 是 string);`recent:*` 仍收任意 array。
  */
-export type UserStateValueKind = 'array' | 'object' | 'string' | 'number' | 'boolean' | 'any'
+export type UserStateValueKind = 'array' | 'string-array' | 'object' | 'string' | 'number' | 'boolean' | 'any'
 
 export const userStateNamespaceKind = (key: string): UserStateValueKind => {
-  if (/^canvas:[^:]+:selection$/.test(key)) return 'array'
+  if (/^canvas:[^:]+:selection$/.test(key)) return 'string-array'
   if (/^canvas:[^:]+:camera$/.test(key)) return 'object'
   if (/^canvas:[^:]+:chat-draft$/.test(key)) return 'string'
   if (/^recent:/.test(key)) return 'array'
@@ -325,8 +329,10 @@ const isCredentialValue = (v: unknown): boolean =>
 
 /**
  * 递归扫描 value,返回首个敏感路径(无则 null)。
- * 返修 N6:覆盖 object key(含 camelCase/连字符/前缀变体)+ 嵌套对象/数组 + 字符串值格式
- * (规范后大小写/URL 编码变体均命中)。
+ * 返修 N6/F3:覆盖 object key(含 camelCase/连字符/前缀变体 + **URL 编码变体**——每层 object key
+ * 先 best-effort decodeURIComponent+lower 再匹配,故 `{"%61piKey":...}` decode → `apiKey` → 命中)
+ * + 嵌套对象/数组 + 字符串值格式(规范后大小写/URL 编码变体均命中)。返回的 path 是 **raw key**(未 decode),
+ * 与既有契约测试('api-key'/'userApiKey' path)一致。
  */
 export const scanForSensitiveFields = (value: unknown, prefix = ''): string | null => {
   if (value === null || typeof value !== 'object') {
@@ -344,9 +350,24 @@ export const scanForSensitiveFields = (value: unknown, prefix = ''): string | nu
     return null
   }
   for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-    if (SENSITIVE_FIELD_PATTERN.test(k)) return prefix ? `${prefix}.${k}` : k
+    // F3:object key 先 best-effort decode+lower 再匹配(防 %61piKey → apiKey 编码绕过)。
+    if (SENSITIVE_FIELD_PATTERN.test(normalizeForScan(k))) return prefix ? `${prefix}.${k}` : k
     const hit = scanForSensitiveFields(v, prefix ? `${prefix}.${k}` : k)
     if (hit) return hit
+  }
+  return null
+}
+
+/**
+ * F3:完整 user-state key(含 free-form canvasId/panelId 段)做同一 credential 扫描。
+ * key 按 `:` 切段,每段 best-effort decode+lower 后查 mivo_/sk- 前缀;任一段命中 → 返该段(非 null)。
+ * 例:`canvas:mivo_xxx:selection` → 'mivo_xxx';`canvas:%6divo_xxx:selection` → decode → 'mivo_xxx';
+ * `canvas:c1:selection` → null(c1/selection 非 credential)。frozen namespace allowlist 通过的 key
+ * 仍可能 embed credential 段,此函数在 namespace 通过后补刀(防 key 里藏凭据)。
+ */
+export const scanUserStateKeyForCredential = (key: string): string | null => {
+  for (const seg of key.split(':')) {
+    if (isCredentialValue(seg)) return seg
   }
   return null
 }
@@ -464,6 +485,8 @@ const isNum = (v: unknown): v is number => typeof v === 'number'
 const isObj = (v: unknown): v is Record<string, unknown> =>
   typeof v === 'object' && v !== null && !Array.isArray(v)
 const isArr = (v: unknown): v is unknown[] => Array.isArray(v)
+const isBool = (v: unknown): v is boolean => typeof v === 'boolean'
+const isStrEnum = (values: Set<string>) => (v: unknown): v is string => isStr(v) && values.has(v)
 
 const NODE_TYPE_VALUES = new Set([
   'image', 'task-placeholder', 'text', 'frame', 'ai-slot', 'annotation', 'markup', 'markdown', 'pdf', 'video',
@@ -471,43 +494,81 @@ const NODE_TYPE_VALUES = new Set([
 const EDGE_TYPE_VALUES = new Set(['generate', 'edit'])
 const ANCHOR_TYPE_VALUES = new Set(['point', 'box'])
 
-/** 必填字段 + 类型校验谓词(逐 type)。 */
-type PayloadSpec = { allowed: ReadonlySet<string>; required: ReadonlyArray<[string, (v: unknown) => boolean]> }
+// F6:编译期 exhaustiveness——NodeRecord/EdgeRecord/AnchorRecord 加字段必须同步 *_PAYLOAD_KEYS,
+// 否则下一行类型 = never,赋值 true 编译失败(Exclude<keyof Payload, KEYS[number]> extends never 模式:
+// 加字段不进 KEYS 数组 → Exclude 非 never → 条件类型 = never → true 不可赋值 → 编译报错)。
+export const NODE_PAYLOAD_EXHAUSTIVE: [Exclude<keyof NodePayload, (typeof NODE_PAYLOAD_KEYS)[number]>] extends [never]
+  ? true
+  : never = true
+export const EDGE_PAYLOAD_EXHAUSTIVE: [Exclude<keyof EdgePayload, (typeof EDGE_PAYLOAD_KEYS)[number]>] extends [never]
+  ? true
+  : never = true
+export const ANCHOR_PAYLOAD_EXHAUSTIVE: [Exclude<keyof AnchorPayload, (typeof ANCHOR_PAYLOAD_KEYS)[number]>] extends [never]
+  ? true
+  : never = true
+
+// F6:fixed-shape nested object 字段的 exact-key + type schema(transform / assetSourceDimensions)。
+// variadic nested(relations=Record / fills[] / strokes[] / effects[])不在 exact-key 范围(形状随语义变),
+// 由 findForbiddenDeep 递归扫 status/tasks 兜底;transform 等固定形状字段做 exact key+type 校验。
+const NESTED_SCHEMAS: Record<string, Record<string, (v: unknown) => boolean>> = {
+  transform: { x: isNum, y: isNum, width: isNum, height: isNum, rotation: isNum },
+  assetSourceDimensions: { width: isNum, height: isNum },
+}
+
+/**
+ * F6 payload schema(逐 type):fields = 所有 allowed key(required + optional)→ 类型谓词;
+ * required = 有序必填字段(缺 → missing-field)。F6 vs N10:N10 只校验 required 类型;
+ * F6 把 optional 也纳入类型校验(fontSize:'x' → bad-type)+ nested exact key/type + 递归 forbidden。
+ */
+type PayloadSpec = { fields: Record<string, (v: unknown) => boolean>; required: string[] }
 
 const PAYLOAD_SPECS: Record<'node' | 'edge' | 'anchor', PayloadSpec> = {
   node: {
-    allowed: new Set<string>(NODE_PAYLOAD_KEYS),
-    required: [
-      ['type', (v) => isStr(v) && NODE_TYPE_VALUES.has(v)],
-      ['title', isStr],
-      ['transform', isObj],
-      ['fills', isArr],
-      ['strokes', isArr],
-      ['effects', isArr],
-      ['relations', isObj],
-    ],
+    fields: {
+      type: isStrEnum(NODE_TYPE_VALUES), title: isStr, transform: isObj, fills: isArr, strokes: isArr,
+      effects: isArr, layout: isObj, constraints: isObj, asset: isObj, relations: isObj, text: isStr,
+      fontSize: isNum, textColor: isStr, fontWeight: isNum,
+      textAlign: (v) => isStr(v) && (v === 'left' || v === 'center' || v === 'right'), textAutoWidth: isBool,
+      markupKind: isStr, markupBrushKind: isStr, markupStampKind: isStr, markupPoints: isArr,
+      markupStartArrow: isBool, markupEndArrow: isBool, markupCornerRadius: isNum,
+      sectionTitleVisible: isBool, sectionLockMode: isStr, sectionTemplateId: isStr,
+      markdownDisplayMode: isStr, imageHasTransparency: isBool, assetSourceDimensions: isObj,
+      imageCrop: isObj, sourceNodeId: isStr, groupId: isStr, locked: isBool, hidden: isBool,
+      favorited: isBool, generation: isObj, aiWorkflow: isObj, experimentalAnchors: isArr,
+      annotationBounds: isObj,
+    },
+    required: ['type', 'title', 'transform', 'fills', 'strokes', 'effects', 'relations'],
   },
   edge: {
-    allowed: new Set<string>(EDGE_PAYLOAD_KEYS),
-    required: [
-      ['from', isStr],
-      ['to', isStr],
-      ['type', (v) => isStr(v) && EDGE_TYPE_VALUES.has(v)],
-      ['prompt', isStr],
-      ['createdAt', isNum],
-    ],
+    fields: { from: isStr, to: isStr, type: isStrEnum(EDGE_TYPE_VALUES), prompt: isStr, createdAt: isNum },
+    required: ['from', 'to', 'type', 'prompt', 'createdAt'],
   },
   anchor: {
-    allowed: new Set<string>(ANCHOR_PAYLOAD_KEYS),
-    required: [
-      ['type', (v) => isStr(v) && ANCHOR_TYPE_VALUES.has(v)],
-      ['targetNodeId', isStr],
-      ['x', isNum],
-      ['y', isNum],
-      ['instruction', isStr],
-      ['createdAt', isNum],
-    ],
+    fields: {
+      type: isStrEnum(ANCHOR_TYPE_VALUES), targetNodeId: isStr, x: isNum, y: isNum, instruction: isStr,
+      createdAt: isNum, width: isNum, height: isNum, resultNodeIds: isArr,
+    },
+    required: ['type', 'targetNodeId', 'x', 'y', 'instruction', 'createdAt'],
   },
+}
+
+/** F6:递归扫 status/tasks(任意层)——返回首个命中 path(无则 null)。top-level 与 nested(relations 内藏)一视同仁。 */
+const findForbiddenDeep = (value: unknown, prefix: string): string | null => {
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      const hit = findForbiddenDeep(value[i], `${prefix}[${i}]`)
+      if (hit) return hit
+    }
+    return null
+  }
+  if (value !== null && typeof value === 'object') {
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (PAYLOAD_FORBIDDEN_FIELDS.has(k)) return prefix ? `${prefix}.${k}` : k
+      const hit = findForbiddenDeep(v, prefix ? `${prefix}.${k}` : k)
+      if (hit) return hit
+    }
+  }
+  return null
 }
 
 export type PayloadCheck =
@@ -515,16 +576,19 @@ export type PayloadCheck =
   | { ok: false; body: PayloadRejectedBody }
 
 /**
- * 返修 N1/N10:真实 decoder——逐 type payload 白名单 runtime 校验。
+ * 返修 N1/N10/F6:真实 decoder——逐 type payload 递归白名单 runtime 校验。
  * - 必须是 object(非 null/array)。
  * - `id`(若有)必须 string 且 === path(N10:非 string id → bad-id-type;不一致 → id-mismatch #5)。
  * - `revision`(若有)→ mirror-field(envelope 唯一真相,防双真相)。
  * - envelope 镜像字段(ownerId/canvasId/scope/revision/isDeleted/updatedAt/orderKey)→ mirror-field。
  *   注:`createdAt` 不在 mirror 拒收收集——Edge/Anchor 的 createdAt 是 canonical 域字段(allowed-keys
  *   放行);Node 无此域字段,Node payload 带 createdAt 由 unknown-field 拒(allowed 不含之)。
- * - status/tasks → forbidden-field(DP-8/9)。
+ * - F6:**status/tasks 任意层递归拒**(findForbiddenDeep;top-level 与 nested relations 内藏均命中,
+ *   在 unknown/missing 之前,与 N10 #13 测试一致)。
  * - 非 allowed key → unknown-field(N10:拒 unknown)。
- * - 缺必填 → missing-field;类型不符 → bad-type(N10:必填/类型校验)。
+ * - 缺必填 → missing-field;F6:**optional 也校验类型**(present 但类型不符 → bad-type,如 fontSize:'x')。
+ * - F6:**nested exact key/type**——transform 等固定形状字段走 NESTED_SCHEMAS(unknown nested key →
+ *   unknown-field;坏类型 → bad-type,如 transform.x 非 number)。
  */
 export const validateChildPayload = (
   type: 'node' | 'edge' | 'anchor',
@@ -548,25 +612,45 @@ export const validateChildPayload = (
   for (const f of PAYLOAD_MIRROR_FIELDS) {
     if (f in obj) return { ok: false, body: { error: 'payload-rejected', reason: 'mirror-field', field: f } }
   }
-  // DP-8/9 显式拒收
-  for (const f of PAYLOAD_FORBIDDEN_FIELDS) {
-    if (f in obj) return { ok: false, body: { error: 'payload-rejected', reason: 'forbidden-field', field: f } }
+  // F6:status/tasks 任意层递归拒(findForbiddenDeep;top-level 与 nested relations 内藏均命中)。
+  const forbiddenPath = findForbiddenDeep(obj, '')
+  if (forbiddenPath) {
+    return { ok: false, body: { error: 'payload-rejected', reason: 'forbidden-field', field: forbiddenPath } }
   }
   const spec = PAYLOAD_SPECS[type]
   // 拒 unknown(N10)
   for (const key of Object.keys(obj)) {
     if (key === 'id') continue // id 特殊(已校验)
-    if (!spec.allowed.has(key)) {
+    if (!(key in spec.fields)) {
       return { ok: false, body: { error: 'payload-rejected', reason: 'unknown-field', field: key } }
     }
   }
-  // 必填 + 类型校验(N10)
-  for (const [field, check] of spec.required) {
+  // 必填(N10:缺 → missing-field)
+  for (const field of spec.required) {
     if (!(field in obj)) {
       return { ok: false, body: { error: 'payload-rejected', reason: 'missing-field', field } }
     }
-    if (!check(obj[field])) {
+  }
+  // F6:类型校验(required + optional,present 才校验)——fontSize:'x' 等 optional 坏类型 → bad-type。
+  for (const [field, predicate] of Object.entries(spec.fields)) {
+    if (field in obj && !predicate(obj[field])) {
       return { ok: false, body: { error: 'payload-rejected', reason: 'bad-type', field } }
+    }
+  }
+  // F6:nested exact key/type(transform 等固定形状字段)。non-object 由上层 fields[field]=isObj 已拒(bad-type)。
+  for (const [field, schema] of Object.entries(NESTED_SCHEMAS)) {
+    if (!(field in obj)) continue
+    const inner = obj[field]
+    if (!isObj(inner)) continue
+    for (const nk of Object.keys(inner)) {
+      if (!(nk in schema)) {
+        return { ok: false, body: { error: 'payload-rejected', reason: 'unknown-field', field: `${field}.${nk}` } }
+      }
+    }
+    for (const [nk, np] of Object.entries(schema)) {
+      if (nk in inner && !np(inner[nk])) {
+        return { ok: false, body: { error: 'payload-rejected', reason: 'bad-type', field: `${field}.${nk}` } }
+      }
     }
   }
   return { ok: true, payload: obj }

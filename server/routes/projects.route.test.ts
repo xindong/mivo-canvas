@@ -144,4 +144,20 @@ describe('/api/projects routes (T1.3 返修)', () => {
     expect(ok.status).toBe(200)
     expect((ok.body as { revision: number }).revision).toBe(1)
   })
+
+  it('F2: project PATCH 同 idem key 同 body → 200 不 bump;不同 body → 422(fingerprint 传入 upsert)', async () => {
+    await create(KEY_A, 'p-f2', 'n0')
+    // first PATCH(idem k1,name=n1,If-Match:0)→ 200 bump rev 1
+    const r1 = await req(app, '/api/projects/p-f2', { method: 'PATCH', headers: { ...hdr(KEY_A), 'idempotency-key': 'k1', 'if-match': '0' }, body: JSON.stringify({ name: 'n1' }) })
+    expect(r1.status).toBe(200)
+    expect((r1.body as { revision: number }).revision).toBe(1)
+    // same idem key same body(name=n1)→ 200 不 bump(返既有 rev 1;idem-replay 短路,免 If-Match)
+    const r2 = await req(app, '/api/projects/p-f2', { method: 'PATCH', headers: { ...hdr(KEY_A), 'idempotency-key': 'k1' }, body: JSON.stringify({ name: 'n1' }) })
+    expect(r2.status).toBe(200)
+    expect((r2.body as { revision: number }).revision).toBe(1)
+    // same idem key different body(name=DIFF)→ 422 reuse-conflict(fingerprint mismatch)
+    const r3 = await req(app, '/api/projects/p-f2', { method: 'PATCH', headers: { ...hdr(KEY_A), 'idempotency-key': 'k1' }, body: JSON.stringify({ name: 'DIFF' }) })
+    expect(r3.status).toBe(422)
+    expect((r3.body as { error: string }).error).toBe('idempotency-key-reuse')
+  })
 })

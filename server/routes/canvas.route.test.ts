@@ -203,15 +203,19 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
     expect((await req(app, '/api/canvas/c1', { method: 'DELETE', headers: hdr(KEY_A) })).status).toBe(204)
   })
 
-  it('返修 #6:POST /api/canvas/:id/reorder 持久化 orderKey', async () => {
+  it('返修 #6/F5:POST /api/canvas/:id/reorder 持久化 orderKey(If-Match contentVersion 必填;响应返 contentVersion)', async () => {
     await seedProject()
     await seedCanvas()
     await patchChildWithFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
     await patchChildWithFixture(app, 'c1', 'node', 'n2', wirePayload(canonicalNode('n2')))
     await patchChildWithFixture(app, 'c1', 'node', 'n3', wirePayload(canonicalNode('n3')))
-    const reorder = await req(app, '/api/canvas/c1/reorder', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ type: 'node', orderedIds: ['n3', 'n1', 'n2'] }) })
+    // F5:读当前 contentVersion(3 次 child 写入 bump → 3)作 If-Match base
+    const before = await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })
+    const cv = (before.body as { contentVersion: number }).contentVersion
+    const reorder = await req(app, '/api/canvas/c1/reorder', { method: 'POST', headers: { ...hdr(KEY_A), 'if-match': String(cv) }, body: JSON.stringify({ type: 'node', orderedIds: ['n3', 'n1', 'n2'] }) })
     expect(reorder.status).toBe(200)
-    expect((reorder.body as { reordered: number }).reordered).toBe(3)
+    expect((reorder.body as { reordered: number; contentVersion: number }).reordered).toBe(3)
+    expect((reorder.body as { contentVersion: number }).contentVersion).toBeGreaterThan(cv) // F5:响应返新 contentVersion
     const got = await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })
     expect((got.body as { nodes: { id: string }[] }).nodes.map((n) => n.id)).toEqual(['n3', 'n1', 'n2'])
   })
@@ -397,27 +401,34 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
     expect(backend.getCanvasOwner('c1')?.ownerId).toBe(ownerA)
   })
 
-  it('N8: reorder orderedIds 全等+唯一;stale If-Match contentVersion → 409;bump contentVersion', async () => {
+  it('N8/F5: reorder orderedIds 全等+唯一;If-Match contentVersion 必填(缺→428);stale→409;bump contentVersion', async () => {
     await seedProject()
     await seedCanvas()
     await patchChildWithFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
     await patchChildWithFixture(app, 'c1', 'node', 'n2', wirePayload(canonicalNode('n2')))
     await patchChildWithFixture(app, 'c1', 'node', 'n3', wirePayload(canonicalNode('n3')))
-    // duplicate → 400
-    const dup = await req(app, '/api/canvas/c1/reorder', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ type: 'node', orderedIds: ['n1', 'n1', 'n2'] }) })
+    // 读当前 contentVersion(3 次 child 写入 bump → 3)作 If-Match base
+    const before = await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })
+    const cv = (before.body as { contentVersion: number }).contentVersion
+    // F5:缺 If-Match → 428(precondition-required)
+    const missing = await req(app, '/api/canvas/c1/reorder', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ type: 'node', orderedIds: ['n3', 'n1', 'n2'] }) })
+    expect(missing.status).toBe(428)
+    expect((missing.body as { error: string }).error).toBe('precondition-required')
+    // duplicate(带 If-Match)→ 400(backend duplicate check 在 contentVersion 冲突之前)
+    const dup = await req(app, '/api/canvas/c1/reorder', { method: 'POST', headers: { ...hdr(KEY_A), 'if-match': String(cv) }, body: JSON.stringify({ type: 'node', orderedIds: ['n1', 'n1', 'n2'] }) })
     expect(dup.status).toBe(400)
-    // mismatch(多 nX)→ 400
-    const mis = await req(app, '/api/canvas/c1/reorder', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ type: 'node', orderedIds: ['n3', 'n1', 'n2', 'nX'] }) })
+    // mismatch(带 If-Match)→ 400
+    const mis = await req(app, '/api/canvas/c1/reorder', { method: 'POST', headers: { ...hdr(KEY_A), 'if-match': String(cv) }, body: JSON.stringify({ type: 'node', orderedIds: ['n3', 'n1', 'n2', 'nX'] }) })
     expect(mis.status).toBe(400)
-    // reorder ok(no If-Match)→ 200 + contentVersion
-    const r1 = await req(app, '/api/canvas/c1/reorder', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ type: 'node', orderedIds: ['n3', 'n1', 'n2'] }) })
+    // reorder ok(If-Match=cv)→ 200 + contentVersion bump
+    const r1 = await req(app, '/api/canvas/c1/reorder', { method: 'POST', headers: { ...hdr(KEY_A), 'if-match': String(cv) }, body: JSON.stringify({ type: 'node', orderedIds: ['n3', 'n1', 'n2'] }) })
     expect(r1.status).toBe(200)
     const cv1 = (r1.body as { contentVersion: number }).contentVersion
-    expect(cv1).toBeGreaterThan(0)
-    // stale If-Match(old contentVersion)→ 409(两并发一成一 409)
-    const stale = await req(app, '/api/canvas/c1/reorder', { method: 'POST', headers: { ...hdr(KEY_A), 'if-match': String(cv1 - 1) }, body: JSON.stringify({ type: 'node', orderedIds: ['n1', 'n2', 'n3'] }) })
+    expect(cv1).toBeGreaterThan(cv)
+    // stale If-Match(cv,已被 r1 bump)→ 409(两并发一成一 409)
+    const stale = await req(app, '/api/canvas/c1/reorder', { method: 'POST', headers: { ...hdr(KEY_A), 'if-match': String(cv) }, body: JSON.stringify({ type: 'node', orderedIds: ['n1', 'n2', 'n3'] }) })
     expect(stale.status).toBe(409)
-    // correct If-Match → 200
+    // correct If-Match(cv1)→ 200
     const ok = await req(app, '/api/canvas/c1/reorder', { method: 'POST', headers: { ...hdr(KEY_A), 'if-match': String(cv1) }, body: JSON.stringify({ type: 'node', orderedIds: ['n1', 'n2', 'n3'] }) })
     expect(ok.status).toBe(200)
   })
@@ -447,5 +458,96 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
     // edge bad type(createdAt 非 number)→ bad-type
     const r5 = await patchChildWithFixture(app, 'c1', 'edge', 'e1', { ...eBase, createdAt: 'not-a-num' })
     expect((r5.body as { reason: string }).reason).toBe('bad-type')
+  })
+
+  // ── 返修三 F1-F7 路由级回归(逐字复现场景,真实 app.request 全链路)──
+
+  it('F1: 软删 project 后 POST 旧 c1/新 c2 → 404;restoreProjectTree 后整树 live(禁独立 child restore)', async () => {
+    await req(app, '/api/projects', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ id: 'p1', name: 'P' }) })
+    await req(app, '/api/canvas', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ id: 'c1', projectId: 'p1' }) })
+    await req(app, '/api/canvas/c1/chat', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ message: { id: 'm1' } }) })
+    // 软删 project → softDeleteProjectTree(project + canvas meta + chat-collection)
+    await req(app, '/api/projects/p1', { method: 'DELETE', headers: hdr(KEY_A) })
+    expect((await req(app, '/api/projects/p1', { headers: hdr(KEY_A) })).status).toBe(404)
+    expect((await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })).status).toBe(404)
+    // F1:软删 parent 下禁独立 child restore——POST 旧 c1(projectId=p1 deleted)→ 404(不独立 restore)
+    const postOld = await req(app, '/api/canvas', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ id: 'c1', projectId: 'p1' }) })
+    expect(postOld.status).toBe(404)
+    expect((postOld.body as { error: string }).error).toBe('unknown-project')
+    // F1:POST 新 c2 under deleted project → 404
+    const postNew = await req(app, '/api/canvas', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ id: 'c2', projectId: 'p1' }) })
+    expect(postNew.status).toBe(404)
+    expect((postNew.body as { error: string }).error).toBe('unknown-project')
+    // restoreProjectTree(POST project p1)→ 整树 live(project + canvas c1 + chat-collection)
+    const restored = await req(app, '/api/projects', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ id: 'p1', name: 'P' }) })
+    expect(restored.status).toBe(200)
+    expect((await req(app, '/api/projects/p1', { headers: hdr(KEY_A) })).status).toBe(200)
+    expect((await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })).status).toBe(200)
+    expect((await req(app, '/api/canvas/c1/chat', { headers: hdr(KEY_A) })).status).toBe(200)
+  })
+
+  it('F4: canvas id 全局唯一——A 创建 c1,B 同 id → 409 canvas-exists;A 资源不失联;软删/restore 交互', async () => {
+    await req(app, '/api/projects', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ id: 'p1', name: 'P' }) })
+    await req(app, '/api/projects', { method: 'POST', headers: hdr(KEY_B), body: JSON.stringify({ id: 'p2', name: 'PB' }) })
+    // A 创建 canvas c1
+    const aCreate = await req(app, '/api/canvas', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ id: 'c1', projectId: 'p1' }) })
+    expect(aCreate.status).toBe(201)
+    // B 创建同 id c1 → 409 canvas-exists(全局唯一,与 project 同模式)
+    const bCreate = await req(app, '/api/canvas', { method: 'POST', headers: hdr(KEY_B), body: JSON.stringify({ id: 'c1', projectId: 'p2' }) })
+    expect(bCreate.status).toBe(409)
+    expect((bCreate.body as { error: string; id: string })).toMatchObject({ error: 'canvas-exists', id: 'c1' })
+    // A 资源不失联:GET c1 仍 200(A 拥有);B GET c1 → 404(跨 owner 同 unknown)
+    expect((await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })).status).toBe(200)
+    expect((await req(app, '/api/canvas/c1', { headers: hdr(KEY_B) })).status).toBe(404)
+    // 软删/restore 交互:A 软删 c1 → globalCanvasOwners 保留占位 → B POST c1 仍 409
+    await req(app, '/api/canvas/c1', { method: 'DELETE', headers: hdr(KEY_A) })
+    const bAfterSoftDelete = await req(app, '/api/canvas', { method: 'POST', headers: hdr(KEY_B), body: JSON.stringify({ id: 'c1', projectId: 'p2' }) })
+    expect(bAfterSoftDelete.status).toBe(409)
+    // A restore c1(POST c1,project p1 live)→ restoreCanvasTree
+    const aRestore = await req(app, '/api/canvas', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ id: 'c1', projectId: 'p1' }) })
+    expect(aRestore.status).toBe(200)
+    expect((await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })).status).toBe(200)
+  })
+
+  it('F5: reorder 并发同 base 一 200 一 409(从 adapter seam 驱动;reorderChildren 带 baseContentVersion)', async () => {
+    await seedProject()
+    await seedCanvas()
+    await patchChildWithFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
+    await patchChildWithFixture(app, 'c1', 'node', 'n2', wirePayload(canonicalNode('n2')))
+    const before = await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })
+    const cv = (before.body as { contentVersion: number }).contentVersion
+    // adapter seam:薄 wrapper 镜像 ServerPersistAdapter.reorderChildren(canvasId, type, orderedIds, baseContentVersion)
+    const adapterReorder = (orderedIds: string[], baseContentVersion: number) =>
+      req(app, '/api/canvas/c1/reorder', {
+        method: 'POST',
+        headers: { ...hdr(KEY_A), 'if-match': String(baseContentVersion) },
+        body: JSON.stringify({ type: 'node', orderedIds }),
+      })
+    // 两个并发 reorder 同 base(cv)——一 200(bump contentVersion)一 409(contentVersion 冲突)
+    const [r1, r2] = await Promise.all([adapterReorder(['n2', 'n1'], cv), adapterReorder(['n2', 'n1'], cv)])
+    const statuses = [r1.status, r2.status].sort()
+    expect(statuses).toEqual([200, 409])
+  })
+
+  it('F6: PATCH payload 递归 schema——relations 内藏 status/tasks 400;fontSize 坏类型 400;transform 内坏类型 400', async () => {
+    await seedProject()
+    await seedCanvas()
+    const base = wirePayload(canonicalNode('n1')) as Record<string, unknown>
+    // relations 内藏 status → forbidden-field(relations.status)
+    const f1 = await patchChildWithFixture(app, 'c1', 'node', 'n1', { ...base, relations: { status: 'ready' } })
+    expect(f1.status).toBe(400)
+    expect((f1.body as { reason: string; field?: string })).toMatchObject({ reason: 'forbidden-field', field: 'relations.status' })
+    // relations 内藏 tasks → forbidden-field
+    const f2 = await patchChildWithFixture(app, 'c1', 'node', 'n1', { ...base, relations: { tasks: [] } })
+    expect((f2.body as { reason: string }).reason).toBe('forbidden-field')
+    // optional fontSize 坏类型('x')→ bad-type
+    const f3 = await patchChildWithFixture(app, 'c1', 'node', 'n1', { ...base, fontSize: 'x' })
+    expect((f3.body as { reason: string; field?: string })).toMatchObject({ reason: 'bad-type', field: 'fontSize' })
+    // transform 内坏类型(x 非 number)→ bad-type field=transform.x
+    const f4 = await patchChildWithFixture(app, 'c1', 'node', 'n1', { ...base, transform: { x: 'bad', y: 0, width: 100, height: 100, rotation: 0 } })
+    expect((f4.body as { reason: string; field?: string })).toMatchObject({ reason: 'bad-type', field: 'transform.x' })
+    // 干净 canonical → 200 create
+    const ok = await patchChildWithFixture(app, 'c1', 'node', 'n1', base)
+    expect(ok.status).toBe(200)
   })
 })

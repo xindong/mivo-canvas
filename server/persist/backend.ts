@@ -44,13 +44,14 @@ export type GetChildResult =
   | { kind: 'missing' }
   | { kind: 'cross-canvas' } // record 存在但 canvas_id 不匹配(返修 #3,route → 404)
 
-/** ensureCreate 结果(POST 幂等创建)。返修 #1:跨 owner 同 id → project-exists(全局唯一)。N4:同 key 不同 body → reuse-conflict。 */
+/** ensureCreate 结果(POST 幂等创建)。返修 #1:跨 owner 同 id → project-exists(全局唯一)。N4:同 key 不同 body → reuse-conflict。F4:canvas 跨 owner 同 id → exists-other-owner(409 canvas-exists)。F1:父 project 软删 → parent-not-live(route → 404,禁独立 child restore)。 */
 export type EnsureCreateResult =
   | { kind: 'created'; record: PersistRecord }
   | { kind: 'existing'; record: PersistRecord } // 幂等回放(未删)→ 返既有,不 bump
   | { kind: 'restored'; record: PersistRecord } // 软删后重建(undelete + bump + restore tree,N2)
-  | { kind: 'exists-other-owner'; record: PersistRecord } // 全局唯一 id 撞(跨 owner),route → 409 project-exists
+  | { kind: 'exists-other-owner'; record: PersistRecord } // 全局唯一 id 撞(跨 owner),route → 409 project-exists/canvas-exists
   | { kind: 'reuse-conflict' } // N4:同 idem key 不同 fingerprint(不同 body)→ route 422
+  | { kind: 'parent-not-live' } // F1:canvas 父 project 软删/不存在 → route 404 unknown-project(禁独立 child restore)
 
 /**
  * 子资源 ensureCreate 结果(chat-message POST)。N3:canvas_id 校验(cross-canvas);
@@ -63,13 +64,14 @@ export type EnsureChildResult =
   | { kind: 'cross-canvas' } // N3:同 id 存在但属于另一 canvas → route 404(canvas_id 不可变)
   | { kind: 'reuse-conflict' } // N4:同 idem key 不同 fingerprint → route 422
 
-/** meta upsert 结果(PUT canvas/project/user-state:revision-check-then-bump;返修 #4 428)。N4:reuse-conflict。 */
+/** meta upsert 结果(PUT canvas/project/user-state:revision-check-then-bump;返修 #4 428)。N4:reuse-conflict。F1:canvas PUT move 目标 project 软删 → parent-not-live(route → 404)。 */
 export type UpsertResult =
   | { kind: 'created'; record: PersistRecord }
   | { kind: 'updated'; record: PersistRecord }
   | { kind: 'conflict'; currentRevision: Revision; record: PersistRecord }
   | { kind: 'precondition-required'; record: PersistRecord } // 返修 #4:existing 缺 base → 428
   | { kind: 'reuse-conflict' } // N4:同 idem key 不同 fingerprint → route 422
+  | { kind: 'parent-not-live' } // F1:canvas PUT move 目标 project 软删/不存在 → route 404 unknown-project
 
 /** 子资源 upsert 结果(PATCH node/edge/anchor/chat-message:返修 #3 cross-canvas + #4 428 + #5 max(0,base)+N4 reuse-conflict)。 */
 export type UpsertChildResult =
@@ -107,6 +109,11 @@ export interface PersistBackend {
   getProjectOwner(id: string): { ownerId: string } | undefined
   /** 返修 N7:canvas id 全局归属(授权 seam canAccessCanvas 用;跨 owner → 404)。 */
   getCanvasOwner(id: string): { ownerId: string } | undefined
+  /**
+   * F1:project 存在且 !isDeleted(live)。canvas POST/PUT(move)前验 parent project live;
+   * 软删 parent 下禁独立 child create/restore(只许 POST project 走 restoreProjectTree 整树恢复)。
+   */
+  projectLive(ownerId: string, projectId: string): boolean
   ensureCreate(
     ownerId: string,
     type: PersistType,
@@ -322,6 +329,12 @@ export class InMemoryPersistBackend implements PersistBackend {
     return ownerId !== undefined ? { ownerId } : undefined
   }
 
+  /** F1:project 存在且 !isDeleted。canvas POST/PUT(move)验 parent live;软删 parent 禁独立 child restore。 */
+  projectLive(ownerId: string, projectId: string): boolean {
+    const r = this.find(ownerId, 'project', projectId)
+    return !!r && !r.isDeleted
+  }
+
   async ensureCreate(
     ownerId: string,
     type: PersistType,
@@ -336,6 +349,21 @@ export class InMemoryPersistBackend implements PersistBackend {
       bodyFingerprint?: string
     },
   ): Promise<EnsureCreateResult> {
+    // F4:canvas id 全局唯一(与 project 同模式)——跨 owner 同 canvas id → exists-other-owner(route → 409 canvas-exists)。
+    // 在 idem-replay 之前:任何 owner 拿他人 canvas id 创建/回放 → 409,不覆盖 globalCanvasOwners,不独立 restore。
+    if (type === 'canvas') {
+      const globalOwner = this.globalCanvasOwners.get(id)
+      if (globalOwner && globalOwner !== ownerId) {
+        const r = this.find(globalOwner, 'canvas', id)
+        if (r) return { kind: 'exists-other-owner', record: clone(r) }
+      }
+    }
+    // F1:canvas 父 project 须 live——软删 parent 下禁独立 child create/restore(只许 POST project 走 restoreProjectTree 整树恢复)。
+    // 在 idem-replay 之前:parent 不 live → parent-not-live(route → 404),阻断 idem-replay-deleted→restoreCanvasTree 独立复活。
+    if (type === 'canvas') {
+      const pid = asCanvasMeta(payload)?.projectId
+      if (pid && !this.projectLive(ownerId, pid)) return { kind: 'parent-not-live' }
+    }
     // 返修 #10/N4:幂等 header 复用(owner+method+resourceKind+key 复合 + fingerprint)。
     if (opts.idempotencyKey) {
       const entry = this.idempotencyIndex.get(idemIndexKey(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey))
@@ -558,6 +586,11 @@ export class InMemoryPersistBackend implements PersistBackend {
         }
         this.idempotencyIndex.delete(idemIndexKey(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey))
       }
+    }
+    // F1:canvas PUT move 目标 project 须 live(防 move 到软删 project)。idem-replay 之后、existing 之前。
+    if (type === 'canvas') {
+      const pid = asCanvasMeta(payload)?.projectId
+      if (pid && !this.projectLive(ownerId, pid)) return { kind: 'parent-not-live' }
     }
     const existing = this.find(ownerId, type, id)
     const scope: PersistScope = opts.scope ?? 'document'

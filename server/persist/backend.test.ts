@@ -187,3 +187,47 @@ describe('InMemoryPersistBackend — 返修 #10 幂等复合 key + fingerprint',
     if (r.kind === 'created') expect(r.record.fingerprint).toBe(fp)
   })
 })
+
+describe('InMemoryPersistBackend — 返修三 F1 canvas parent live + F4 canvas 全局唯一', () => {
+  let b: PersistBackend
+  beforeEach(() => {
+    b = new InMemoryPersistBackend()
+  })
+
+  it('F4:canvas 跨 owner 同 id → exists-other-owner(与 project 同模式);同 owner 幂等 existing;globalCanvasOwners 不覆盖', async () => {
+    await b.ensureCreate('oA', 'project', 'pA', { name: 'PA' }, { method: 'POST', resourceKind: 'project' })
+    await b.ensureCreate('oB', 'project', 'pB', { name: 'PB' }, { method: 'POST', resourceKind: 'project' })
+    // A 创建 canvas c1(under pA,live)
+    const a1 = await b.ensureCreate('oA', 'canvas', 'c1', { projectId: 'pA' }, { method: 'POST', resourceKind: 'canvas' })
+    expect(a1.kind).toBe('created')
+    // 同 owner 同 id → existing(幂等,不 bump)
+    const a2 = await b.ensureCreate('oA', 'canvas', 'c1', { projectId: 'pA' }, { method: 'POST', resourceKind: 'canvas' })
+    expect(a2.kind).toBe('existing')
+    // B 同 id c1(under pB)→ exists-other-owner(全局唯一)
+    const b1 = await b.ensureCreate('oB', 'canvas', 'c1', { projectId: 'pB' }, { method: 'POST', resourceKind: 'canvas' })
+    expect(b1.kind).toBe('exists-other-owner')
+    if (b1.kind === 'exists-other-owner') expect(b1.record.ownerId).toBe('oA')
+    // globalCanvasOwners 不覆盖:getCanvasOwner('c1') 仍 oA
+    expect(b.getCanvasOwner('c1')?.ownerId).toBe('oA')
+  })
+
+  it('F1:canvas 父 project 软删 → parent-not-live(禁独立 child create/restore);restoreProjectTree 后 live', async () => {
+    await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+    await b.ensureCreate('o', 'canvas', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+    expect(b.projectLive('o', 'p1')).toBe(true)
+    // 软删 project p1(cascade 软删 canvas c1)
+    await b.softDeleteProjectTree('o', 'p1')
+    expect(b.projectLive('o', 'p1')).toBe(false)
+    // F1:POST canvas c1(under deleted p1)→ parent-not-live(不独立 restore)
+    const r1 = await b.ensureCreate('o', 'canvas', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+    expect(r1.kind).toBe('parent-not-live')
+    // F1:POST 新 canvas c2(under deleted p1)→ parent-not-live
+    const r2 = await b.ensureCreate('o', 'canvas', 'c2', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+    expect(r2.kind).toBe('parent-not-live')
+    // restoreProjectTree 后 project live → c1 已被整树恢复 → ensureCreate c1 → existing(不再 parent-not-live)
+    await b.restoreProjectTree('o', 'p1')
+    expect(b.projectLive('o', 'p1')).toBe(true)
+    const r3 = await b.ensureCreate('o', 'canvas', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+    expect(r3.kind).toBe('existing')
+  })
+})

@@ -115,10 +115,12 @@ export { validateChildPayload, encodeChildPayload, parseIfMatch } from '../../sh
 export type { PayloadCheck } from '../../shared/persist-contract.ts'
 
 /**
- * 返修 #9/N6:user-state value 递归敏感扫描 + namespace frozen key 校验。
+ * 返修 #9/N6/F3:user-state value 递归敏感扫描(object key 先 best-effort decode+lower 再匹配,防 %61piKey 绕过)
+ * + namespace frozen key 校验 + F3 完整 key credential 段扫描(防 key 含 mivo_ 段)。
  */
 export {
   scanForSensitiveFields,
+  scanUserStateKeyForCredential,
   isUserStateKeyNamespaceAllowed,
   userStateNamespaceKind,
 } from '../../shared/persist-contract.ts'
