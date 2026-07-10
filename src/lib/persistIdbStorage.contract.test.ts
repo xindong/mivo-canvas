@@ -40,4 +40,11 @@ describe('S6a rawIdbStorage 源码契约 — raw IDB(Lead ③:命名 + cast 集�
     expect(rawSection).toMatch(/isQuotaError/)
     expect(rawSection).toMatch(/toastFeedback/)
   })
+
+  it('rawIdbStorage.setItem 失败 throw(Lead ①:不 swallow,migrateV10ToV11 rollback 触发)', () => {
+    // catch 块 throw error(quota/非 quota 均 throw,不 return swallow)。
+    // migrateV10ToV11 依赖 setItem 抛错触发 rollbackFromV11;swallow 会让迁移假成功不落盘。
+    // rollback 仪式实测见 persistMigration.test "migrate 失败→rollback"(makeStorage throw → rollback)。
+    expect(rawSection).toMatch(/throw error/)
+  })
 })

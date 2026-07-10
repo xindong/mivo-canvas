@@ -313,6 +313,8 @@ export const rawIdbStorage = {
       return
     }
     if (!isIdbAvailable()) {
+      // IDB 不可用 → localStorage fallback(失败 propagate throw;成功 return)。migrate 在极端
+      // 环境回退 localStorage,getItem 也走 localStorage fallback,读写一致(非假成功)。
       debugLogger.warn(SOURCE, 'IndexedDB unavailable; raw storage writing to localStorage')
       if (typeof localStorage !== 'undefined') localStorage.setItem(name, value)
       return
@@ -322,12 +324,16 @@ export const rawIdbStorage = {
         store.put({ key: name, value } as unknown as KvRecord),
       )
     } catch (error) {
+      // Lead ①(S6b wiring 义务):setItem 失败必须 throw(quota/非 quota),不 swallow。
+      // migrateV10ToV11 依赖 setItem 抛错触发 rollbackFromV11;swallow 会让迁移假成功不落盘。
+      // (rollback 仪式实测见 persistMigration.test "migrate 失败→rollback")
       if (isQuotaError(error)) {
         debugLogger.error(SOURCE, `quota exceeded writing raw ${name}; state not persisted`)
         toastFeedback.error('存储已满，无法保存画布。')
-        return
+      } else {
+        debugLogger.warn(SOURCE, `raw setItem failed for ${name}: ${errMessage(error)}`)
       }
-      debugLogger.warn(SOURCE, `raw setItem failed for ${name}: ${errMessage(error)}`)
+      throw error
     }
   },
 
