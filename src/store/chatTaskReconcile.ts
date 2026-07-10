@@ -214,6 +214,11 @@ export const reconcileExpiredChatTasks = async (): Promise<void> => {
       }
     }
 
+    // FX-3b P2 fix (Greptile): key 按 `${sceneId}:${message.id}` 而非裸 message.id。
+    // createMessageId() = `msg-${Date.now()}-${Math.random 6hex}` 非密码学唯一；跨场景
+    // 同毫秒+随机后 6 位碰撞(~1/16M)时,裸 id 作 key 会让后 commit 的场景覆盖前者,
+    // setState 阶段先 commit 的卡取到后者的 nodeIds → 指向不存在于本场景 canvas 的节点。
+    // 加 sceneId 前缀彻底消解:message id 本身在场景内唯一,加场景维度后全局唯一。
     const commitResults = new Map<
       string,
       { nodeIds: string[]; sourceDeleted: boolean }
@@ -235,7 +240,7 @@ export const reconcileExpiredChatTasks = async (): Promise<void> => {
         const sourceStillExists = sourceNodeId
           ? canvasNodes.some((n) => n.id === sourceNodeId && n.type === 'image' && !n.hidden)
           : false
-        commitResults.set(message.id, {
+        commitResults.set(`${sceneId}:${message.id}`, {
           nodeIds: [pendingSlotId!],
           sourceDeleted: !sourceStillExists,
         })
@@ -249,7 +254,7 @@ export const reconcileExpiredChatTasks = async (): Promise<void> => {
       // P1-3 / SC-1(b): slot 不存在,或既非 ai-slot 也非 image(用户主动删槽不复活占位)
       // → 不 commit,仅翻 status。
       if (!slotNode || slotNode.type !== 'ai-slot' || slotNode.hidden) {
-        commitResults.set(message.id, { nodeIds: [], sourceDeleted: false })
+        commitResults.set(`${sceneId}:${message.id}`, { nodeIds: [], sourceDeleted: false })
         debugLogger.warn(
           SOURCE,
           `Recover mask-edit card ${message.id}: slot ${pendingSlotId ?? '(none)'} not an active ai-slot; skipping commit, status-only recover.`,
@@ -290,7 +295,7 @@ export const reconcileExpiredChatTasks = async (): Promise<void> => {
 
       try {
         const nodeIds = await useCanvasStore.getState().commitGenerationResult(commitPayload)
-        commitResults.set(message.id, {
+        commitResults.set(`${sceneId}:${message.id}`, {
           nodeIds,
           sourceDeleted: !sourceStillExists,
         })
@@ -301,7 +306,7 @@ export const reconcileExpiredChatTasks = async (): Promise<void> => {
       } catch (error) {
         // P1-3: commit 抛错(画布已删/槽位已删/资产落盘失败等)→ 降级为现行「仅翻
         // status」行为,绝不向调用方抛出。
-        commitResults.set(message.id, { nodeIds: [], sourceDeleted: false })
+        commitResults.set(`${sceneId}:${message.id}`, { nodeIds: [], sourceDeleted: false })
         debugLogger.warn(
           SOURCE,
           `Recover mask-edit card ${message.id}: commit failed → status-only recover. ${error instanceof Error ? error.message : String(error)}`,
@@ -319,7 +324,7 @@ export const reconcileExpiredChatTasks = async (): Promise<void> => {
           if (!isBlanketSettledMaskEditCard(message)) return message
           const view = results[message.generationContext!.maskEdit!.serverTaskId!]
           if (!(view && (view.status === 'done' || view.status === 'partial'))) return message
-          const cr = commitResults.get(message.id)
+          const cr = commitResults.get(`${sceneId}:${message.id}`)
           if (cr && cr.nodeIds.length > 0) {
             didChange = true
             return recoverCommittedMessage(message, cr.nodeIds, cr.sourceDeleted)
