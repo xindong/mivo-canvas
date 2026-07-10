@@ -139,9 +139,10 @@ jobs:
     # --renderer=both 透传给 e2e-runner(npm run ... -- --renderer=both),runner 依次跑
     # dom / leafer 两个阶段;canvas-interactions 在 leafer 阶段被显式 skip(已知引擎
     # 限制:该场景是 DOM 结构契约,见下方 skip 清单步骤,非静默)。
-    # TODO(T0.3, feat/kernel-flag 分支):kernel 双轨开关合入 main 后,e2e-runner 将支持
-    # --kernel=<v1|v2>。届时在此追加 --kernel=both(或扩成 dom×{v1,v2} 矩阵)使迁移 PR
-    # 也必须在双 kernel 下通过。当前 kernel 参数未实现,仅预留参数位,不启用。
+    # T0.7 已落地:e2e-runner 支持 --kernel=new|legacy|both(透传为页面 ?kernel=)。
+    # 本 job 仍跑默认 legacy(--renderer=both);kernel=new 由独立 e2e-kernel-gate job
+    # (非阻断)覆盖,两 job 合起来覆盖 (renderer × kernel) 笛卡尔积(contract §7)。
+    # kernel=new 路径接活后(T1.2-S6),lead 把 e2e-kernel-gate 翻 required 即堵死 new 回归。
     name: e2e prod subset (mock upstream)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -207,11 +208,85 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  # 迁移 gate:T0.7 —— kernel gate job(非阻断观察窗)。跑 prod subset 在 --kernel=new
+  # 下(× --renderer=both → dom+new / leafer+new)。与 e2e-prod-subset(默认 legacy +
+  # --renderer=both)互补,两 job 合起来覆盖 (renderer × kernel) 笛卡尔积(contract §7)。
+  # 非阻断(continue-on-error):lead 在观察窗稳定绿后翻 required;本 job 不入分支保护
+  # required checks(kernel=new 路径尚未接活,目前等价 legacy,预期绿)。
+  e2e-kernel-gate:
+    name: e2e kernel gate (new, non-blocking)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node (LTS)
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Cache Playwright Chromium
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-chromium-${{ hashFiles('package-lock.json') }}
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Build production bundle
+        run: npm run build
+
+      # continue-on-error:kernel gate 失败不阻断本 job(对齐 bench job 的非阻断模式)。
+      # outcome 记 'failure' 供下方 warn/summary/upload step 判断,job 仍绿。
+      - name: Run prod subset e2e (kernel=new)
+        id: kernel-gate
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          mkdir -p test-artifacts
+          npm run test:e2e:prod:subset -- --renderer=both --kernel=new 2>&1 | tee test-artifacts/e2e-kernel-gate.log
+
+      - name: Surface kernel-gate result in job summary
+        if: always()
+        run: |
+          {
+            echo '## e2e kernel gate (--kernel=new, non-blocking)'
+            echo ''
+            echo '观察窗:prod subset 在 kernel=new 下(dom+leafer)跑通即绿。本 job 非阻断,'
+            echo 'lead 在观察窗稳定绿后翻 required。与 e2e-prod-subset(legacy)互补覆盖 (renderer×kernel) 笛卡尔积。'
+            echo ''
+            echo '```'
+            tail -n 20 test-artifacts/e2e-kernel-gate.log 2>/dev/null || echo '(无日志:可能在 setup 阶段异常,见上方 step 日志)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Warn on kernel-gate failure (non-blocking)
+        if: always() && steps.kernel-gate.outcome == 'failure'
+        run: |
+          echo "::warning::e2e kernel gate (--kernel=new) 失败或异常(非阻断,仅报告,不挡合并)。详见 job summary 与上方 e2e step 日志;沿革见 T0.7。"
+
+      - name: Upload failing e2e artifacts
+        if: always() && steps.kernel-gate.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-kernel-gate-artifacts
+          path: test-artifacts
+          if-no-files-found: warn
+          retention-days: 14
+
   # 迁移 gate:T0.7 —— visual-diff job。DOM baseline vs Leafer candidate 像素对照,
   # diff% 超阈值(DIFF_THRESHOLD_PERCENT,默认 5%)即 fail,挡住 leafer 渲染回归混进 main。
   # 用现有 scripts/visual-diff.mjs harness(自起 vite dev server,无需 prod build)。
-  # TODO(T0.3, feat/kernel-flag 分支):kernel 双轨合入后,可扩为按 --kernel 矩阵分别
-  # 采集 DOM/Leafer baseline 对照;当前 kernel 参数未实现,仅预留参数位,不启用。
+  # T0.7 已落地:e2e-runner 支持 --kernel= 透传。visual-diff 暂未接 --kernel(当前
+  # 只对照 renderer 维度);kernel=new 路径接活后,可扩为按 --kernel 矩阵分别采集
+  # DOM/Leafer baseline 对照 —— 留待 kernel=new 有可视差异时再做,本 PR 不扩。
   visual-diff:
     name: visual diff (dom vs leafer)
     if: github.event_name == 'pull_request'

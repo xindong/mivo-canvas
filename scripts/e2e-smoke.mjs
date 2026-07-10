@@ -66,13 +66,33 @@ const resolveRenderer = (argv) => {
   return 'dom'
 }
 const rendererMode = resolveRenderer(cliArgs)
+// T0.7: --kernel passthrough (mirrors --renderer; contract §7). Smoke is single-mode —
+// the runner expands --kernel=both into two sequential smoke invocations (legacy then
+// new), so smoke only ever sees new|legacy. Default legacy = zero behaviour change.
+const resolveKernel = (argv) => {
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index]
+    if (arg === '--kernel') {
+      const value = argv[index + 1]
+      if (value === 'new' || value === 'legacy') return value
+      throw new Error('--kernel requires new or legacy (use --kernel=both at the runner level)')
+    }
+    if (arg.startsWith('--kernel=')) {
+      const value = arg.slice('--kernel='.length)
+      if (value === 'new' || value === 'legacy') return value
+      throw new Error(`Unknown --kernel value: ${value} (smoke is single-mode; use --kernel=both at the runner level)`)
+    }
+  }
+  return 'legacy'
+}
+const kernelMode = resolveKernel(cliArgs)
 const useRealUpstream = process.env.MIVO_E2E_USE_REAL_UPSTREAM === '1'
 const disableApiRouteMocks = process.env.MIVO_E2E_DISABLE_API_ROUTE_MOCKS === '1'
 const securityPort = requestedPort
 const runtimePort = isProdTopology ? requestedPort + 1 : requestedPort
 const securityBaseUrl = createBaseUrl(securityPort)
 const baseUrl = createBaseUrl(runtimePort)
-const canvasUrl = `${baseUrl}?renderer=${rendererMode}`
+const canvasUrl = `${baseUrl}?renderer=${rendererMode}&kernel=${kernelMode}`
 const devBffBaseUrl = createBaseUrl(requestedPort + 1)
 const debugViewToken = 'test-token'
 const {
@@ -469,6 +489,15 @@ try {
     if (actualRenderer !== rendererMode) {
       throw new Error(`Renderer mode mismatch: requested ${rendererMode} but shell reports ${actualRenderer}`)
     }
+    // T0.7: verify --kernel passthrough landed in the page URL. kernelMode.ts has no
+    // DOM attribute to read (and src/ is out of scope for this task), so assert the
+    // URL carries ?kernel=<mode> — confirms the runner→smoke→URL seam didn't drop it.
+    // (kernelMode.ts's own parsing is covered by its unit test; this is the e2e seam.)
+    const navigatedUrl = page.url()
+    if (!navigatedUrl.includes(`kernel=${kernelMode}`)) {
+      throw new Error(`Kernel passthrough mismatch: requested kernel=${kernelMode} but page URL lacks ?kernel=${kernelMode} (url=${navigatedUrl})`)
+    }
+    console.log(`[e2e-smoke] bootstrapped scenario context kernel=${kernelMode} renderer=${rendererMode}`)
   }
 
   // leafer 模式显式 skip(名单+理由见 scenarios/index.mjs leaferSkippedScenarios)。
@@ -486,6 +515,7 @@ try {
     baseUrl,
     canvasUrl,
     rendererMode,
+    kernelMode,
     browser,
     canvasStoreSpec,
     chatStoreSpec,
