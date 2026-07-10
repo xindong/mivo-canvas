@@ -26,6 +26,7 @@ import { debugLogger } from '../store/debugLogStore'
 import { toastFeedback } from '../store/toastStore'
 import { ANONYMOUS_USER_ID, getPersistUserId, namespacedKey } from './persistUserId'
 import { clearAssetsForUser } from './assetStorage'
+import type { RawStorage } from '../kernel/persistMigration'
 
 // FX-6 per-user cache namespacing. The canvas + chat persist NAMES stay static
 // (`mivo-canvas-demo` / `mivo-chat-demo`) so the zustand persist contract and the
@@ -276,17 +277,18 @@ export const idbStateStorage = {
 }
 
 /**
- * rawStateStorage:raw IDB StateStorage(无 FX-6 namespacedKey)——S6 切主给
+ * rawIdbStorage:raw IDB StateStorage(无 FX-6 namespacedKey)——S6 切主给
  * migrateV10ToV11/dryRun/rollback 用(它们内部走 namespacedKey 拼 document/session/ckpt
  * key;传 idbStateStorage namespaced adapter 会 double-namespace,Greptile 义务 1)。
  * 复用 runTransaction + localStorage fallback(同 idbStateStorage 但 key 不经 namespacedKey)。
- * 调用方传给 migrateV10ToV11 时 cast as RawStorage(brand 意图明确,类型层已拦 namespaced adapter)。
  *
- * 与 strictIdbStateStorage 的区别:后者给 secrets(无 localStorage fallback,不留 legacy 痕迹);
- * rawStateStorage 给 canvas 迁移(同 idbStateStorage 的 localStorage fallback 语义,因迁移对象是
- * 用户画布,不是 secret——IDB 不可用时回退 localStorage 不丢数据)。
+ * cast as RawStorage 集中在此导出点(Lead 裁决 ③:别散落)——调用方(S6b useStoreHydration)
+ * 直接传 rawIdbStorage(已是 RawStorage 类型),无需再 cast;RawStorage brand 类型层拦 namespaced adapter。
+ *
+ * 命名 rawIdbStorage(直白,含 IDB;不复用 strictIdbStateStorage——后者是 DP-7 两把 key 专用
+ * 语义边界,混用会让"哪些 key 永不进 user-state"审计线变糊)。
  */
-export const rawStateStorage = {
+export const rawIdbStorage = {
   getItem: async (name: string): Promise<string | null> => {
     if (!isIdbAvailable()) {
       debugLogger.warn(SOURCE, 'IndexedDB unavailable; raw storage falling back to localStorage')
@@ -340,7 +342,7 @@ export const rawStateStorage = {
       debugLogger.warn(SOURCE, `raw removeItem failed for ${name}: ${errMessage(error)}`)
     }
   },
-}
+} as unknown as RawStorage
 
 /**
  * FX-6 clear the CURRENT user's cache namespace — called by authSlice.logout
