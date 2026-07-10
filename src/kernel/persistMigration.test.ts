@@ -6,7 +6,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { __resetPersistUserId } from '../lib/persistUserId'
 import { dryRunMigration, migrateV10ToV11, projectToThreeDomain, rollbackFromV11 } from './persistMigration'
-import type { PersistedV10Blob } from './persistMigration'
+import type { PersistedV10Blob, RawStorage } from './persistMigration'
 
 const v10Blob: PersistedV10Blob = {
   canvases: {
@@ -21,16 +21,27 @@ const v10Blob: PersistedV10Blob = {
   activeStampKind: 'star',
 }
 
-// mock zustand StateStorage(getItem/setItem/removeItem,async;_db 暴露供断言)。
+// mock raw IDB storage(getItem/setItem/removeItem,async;_db 暴露供断言)。
+// 义务 1:cast as RawStorage(brand)——模拟 raw IDB storage(未命名空间化)。migrate/dryRun 内部走
+// namespacedKey;FX-6 namespaced adapter 不带 brand 不能传(防 double-namespacing,见防误用测试)。
 const makeStorage = (initial: Record<string, string> = {}) => {
   const db = new Map<string, string>(Object.entries(initial))
-  return {
+  const store = {
     getItem: vi.fn((k: string) => Promise.resolve(db.has(k) ? db.get(k)! : null)),
     setItem: vi.fn((k: string, v: string) => { db.set(k, v); return Promise.resolve() }),
     removeItem: vi.fn((k: string) => { db.delete(k); return Promise.resolve() }),
     _db: db,
   }
+  // cast as RawStorage(brand,义务 1)同时保留 Mock 类型(typeof store)供 mockImplementation 断言。
+  return store as unknown as RawStorage & typeof store
 }
+
+// mock FX-6 namespaced adapter(无 __rawIdbStorage brand)——义务 1 防误用测试:验证类型层拦住。
+const makeNamespacedAdapter = () => ({
+  getItem: () => Promise.resolve(null),
+  setItem: () => Promise.resolve(),
+  removeItem: () => Promise.resolve(),
+})
 
 beforeEach(() => __resetPersistUserId()) // anonymous → namespacedKey returns raw name
 
@@ -187,5 +198,33 @@ describe('T1.2 S4 persistMigration — #164 seed 适配(migrate v10→v11 透明
     expect(sessEnv.state.selectedNodeId).toBe('n1')
     expect(sessEnv.state.selectedNodeIds).toEqual(['n1'])
     expect(sessEnv.state.activeTool).toBe('select')
+  })
+})
+
+describe('T1.2 S5 Greptile 义务 — dry-run 坏 blob 诊断 + raw storage 防误用', () => {
+  it('义务 2:dry-run corrupt JSON → ok:false failed 报告(不炸,诊断坏状态)', async () => {
+    const storage = makeStorage({ k: '{not valid json' })
+    const report = await dryRunMigration(storage, 'k')
+    expect(report.ok).toBe(false)
+    expect(report.error).toMatch(/corrupt blob/i)
+    expect(report.document.canvasCount).toBe(0)
+    expect(report.session.selectionCount).toBe(0)
+    expect(storage.setItem).not.toHaveBeenCalled() // 仍零 setItem(dry-run 不写)
+  })
+
+  it('义务 2:dry-run 空 blob → ok:false 无 error(与 corrupt 区分,不回归)', async () => {
+    const storage = makeStorage()
+    const report = await dryRunMigration(storage, 'k')
+    expect(report.ok).toBe(false)
+    expect(report.error).toBeUndefined() // 空 blob 非 corrupt
+    expect(report.document.canvasCount).toBe(0)
+  })
+
+  it('义务 1:防误用 — FX-6 namespaced adapter 不能传给 migrate/dryRun(类型层拦住 double-namespacing)', async () => {
+    // namespaced adapter 无 __rawIdbStorage brand → TS 拒绝(brand 不匹配),拦住 double-namespacing。
+    // @ts-expect-error — namespaced adapter 缺 __rawIdbStorage brand,RawStorage 类型层拦住
+    await migrateV10ToV11(makeNamespacedAdapter(), 'mivo-canvas-demo')
+    // @ts-expect-error — 同上,dryRun 也拦
+    await dryRunMigration(makeNamespacedAdapter(), 'k')
   })
 })

@@ -32,7 +32,7 @@ export type ThreeDomainProjection = {
   asset: { ready: false; note: 'T1.5' }
 }
 
-/** dry-run 报告(各域 record 数 + 来源 version + readKey)。 */
+/** dry-run 报告(各域 record 数 + 来源 version + readKey;error 仅 corrupt blob 诊断)。 */
 export type DryRunReport = {
   ok: boolean
   sourceVersion: number
@@ -40,6 +40,7 @@ export type DryRunReport = {
   document: { canvasCount: number; projectCount: number; hasSceneId: boolean }
   session: { selectionCount: number; hasToolPrefs: boolean }
   asset: { ready: false; note: 'T1.5' }
+  error?: string // 义务 2:corrupt blob 诊断(dry-run 不炸,返回 ok:false + error)
 }
 
 // ─── 纯函数:project v10 单 blob → 三域形状 ─────────────────────────────────
@@ -59,34 +60,56 @@ export const projectToThreeDomain = (blob: PersistedV10Blob): ThreeDomainProject
   asset: { ready: false, note: 'T1.5' },
 })
 
+// ─── raw storage brand(Greptile 义务 1:防 double-namespacing)─────────────────
+// migrateV10ToV11/dryRun/rollback 的 storage 参数必须传 raw IDB storage(未命名空间化)。
+// 函数内部走 namespacedKey(拼 ${BASE}:${userId});传 FX-6 namespaced adapter 会 double-namespace
+// (读空/写错位)。brand 在类型层拦住 namespaced adapter 误传——FX-6 adapter 不带 __rawIdbStorage
+// brand,赋值给 RawStorage 时 TS 拒绝。调用方需显式 cast raw IDB storage as RawStorage(意图明确)。
+declare const __rawIdbStorage: unique symbol
+export type RawStorage = Pick<import('zustand/middleware').StateStorage, 'getItem' | 'setItem' | 'removeItem'> & {
+  readonly [__rawIdbStorage]: true
+}
+
 // ─── dry-run(读 + project + 报告;零 setItem)─────────────────────────────────
 // storage 只用 getItem(读);setItem 不调用——lead 硬要求"dry-run 不写",显式测试断言 setItem 调用 0。
 // readKey:FX-6 合入前用占位 'mivo-canvas-demo'(pre-FX-6 客户端的旧 key);FX-6 后改 ${BASE}:${userId}。
-type ReadStorage = Pick<import('zustand/middleware').StateStorage, 'getItem' | 'setItem'>
-
-export const dryRunMigration = async (storage: ReadStorage, readKey: string): Promise<DryRunReport> => {
+// 义务 2:corrupt JSON 不抛(dry-run 职责是诊断坏状态,返回 ok:false failed 报告,不该炸)。
+export const dryRunMigration = async (storage: RawStorage, readKey: string): Promise<DryRunReport> => {
   const raw = await storage.getItem(readKey) // 唯一 storage 调用;无 setItem
   if (raw == null || (typeof raw === 'string' && raw.length === 0)) {
     return { ok: false, sourceVersion: 0, readKey, document: { canvasCount: 0, projectCount: 0, hasSceneId: false }, session: { selectionCount: 0, hasToolPrefs: false }, asset: { ready: false, note: 'T1.5' } }
   }
-  const parsed = JSON.parse(raw as string) as PersistedEnvelope
-  const blob = parsed.state ?? (parsed as unknown as PersistedV10Blob) // 兼容 wrapped{state} 与裸 blob
-  const proj = projectToThreeDomain(blob)
-  const selectionCount = proj.session.selectedNodeIds?.length ?? (proj.session.selectedNodeId ? 1 : 0)
-  return {
-    ok: true,
-    sourceVersion: parsed.version ?? 10,
-    readKey,
-    document: {
-      canvasCount: Object.keys(proj.document.canvases).length,
-      projectCount: proj.document.projects.length,
-      hasSceneId: proj.document.sceneId != null,
-    },
-    session: {
-      selectionCount,
-      hasToolPrefs: proj.session.activeTool != null || proj.session.activeStampKind != null,
-    },
-    asset: { ready: false, note: 'T1.5' },
+  // 义务 2:corrupt JSON → ok:false failed 报告(dry-run 诊断坏状态,不炸)
+  try {
+    const parsed = JSON.parse(raw as string) as PersistedEnvelope
+    const blob = parsed.state ?? (parsed as unknown as PersistedV10Blob) // 兼容 wrapped{state} 与裸 blob
+    const proj = projectToThreeDomain(blob)
+    const selectionCount = proj.session.selectedNodeIds?.length ?? (proj.session.selectedNodeId ? 1 : 0)
+    return {
+      ok: true,
+      sourceVersion: parsed.version ?? 10,
+      readKey,
+      document: {
+        canvasCount: Object.keys(proj.document.canvases).length,
+        projectCount: proj.document.projects.length,
+        hasSceneId: proj.document.sceneId != null,
+      },
+      session: {
+        selectionCount,
+        hasToolPrefs: proj.session.activeTool != null || proj.session.activeStampKind != null,
+      },
+      asset: { ready: false, note: 'T1.5' },
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      sourceVersion: 0,
+      readKey,
+      error: `corrupt blob: ${error instanceof Error ? error.message : String(error)}`,
+      document: { canvasCount: 0, projectCount: 0, hasSceneId: false },
+      session: { selectionCount: 0, hasToolPrefs: false },
+      asset: { ready: false, note: 'T1.5' },
+    }
   }
 }
 
@@ -99,7 +122,7 @@ export const dryRunMigration = async (storage: ReadStorage, readKey: string): Pr
 // #164 表征 seed 适配:优先"migrate v10→v11 透明跑"(seed 保持 v10 单 blob,断言迁移后语义)。
 import { namespacedKey } from '../lib/persistUserId'
 
-type MigrationStorage = Pick<import('zustand/middleware').StateStorage, 'getItem' | 'setItem' | 'removeItem'>
+// migrate/rollback 复用 RawStorage brand(义务 1:防 double-namespacing,见上 RawStorage 注释)。
 
 export type MigrationResult = {
   ok: boolean
@@ -117,7 +140,7 @@ export type MigrationResult = {
  * 失败自动 rollback(从 ckpt 恢复 + 删 domain key)。不删 v10 单 blob(rollback 兜底;S5/S6 稳态后清)。
  */
 export const migrateV10ToV11 = async (
-  storage: MigrationStorage,
+  storage: RawStorage,
   baseName = 'mivo-canvas-demo',
 ): Promise<MigrationResult> => {
   const baseKey = namespacedKey(baseName)
@@ -158,7 +181,7 @@ export const migrateV10ToV11 = async (
  * ckpt 保留(极端 forensic;稳态后 S5/S6 清)。
  */
 export const rollbackFromV11 = async (
-  storage: MigrationStorage,
+  storage: RawStorage,
   baseName = 'mivo-canvas-demo',
 ): Promise<void> => {
   const baseKey = namespacedKey(baseName)
