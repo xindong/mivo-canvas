@@ -96,7 +96,7 @@ const parseArgs = (argv) => {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
-const waitForServer = async (url, timeoutMs = 60000) => {
+const waitForServer = async (url, timeoutMs = 60000, expectedStatus) => {
   const startedAt = Date.now()
   let lastError = new Error('Timed out waiting for dev server')
   while (Date.now() - startedAt < timeoutMs) {
@@ -104,7 +104,14 @@ const waitForServer = async (url, timeoutMs = 60000) => {
       await new Promise((resolve, reject) => {
         const request = http.get(url, (response) => {
           response.resume()
-          response.statusCode && response.statusCode < 500 ? resolve() : reject(new Error(`HTTP ${response.statusCode}`))
+          // P1-2: 原 statusCode < 500 把 404/401 残留错误进程当健康(端口起来但路由错/鉴权挂),
+          // gate 误判通过。收紧到 2xx(BFF /api/mivo/local-assets 与 Vite 根都返回 200);
+          // expectedStatus 传具体状态码时改为精确匹配,留例外口子。
+          const code = response.statusCode
+          const ok = typeof expectedStatus === 'number'
+            ? code === expectedStatus
+            : code >= 200 && code < 300
+          ok ? resolve() : reject(new Error(`HTTP ${code}`))
         })
         request.on('error', reject)
       })
@@ -958,9 +965,11 @@ const main = async () => {
     throw error
   }
 
-  const browser = await chromium.launch({ headless: options.headless, args: DEFAULT_BROWSER_FLAGS })
-
+  // P1-1: browser 声明为 let + launch 挪进主 try——launch 抛错(无浏览器二进制/sandbox 失败)
+  // 时 finally 才会跑并 stop devServer/bffServer;原 launch 在 try 外,失败时两 server 泄漏端口。
+  let browser
   try {
+    browser = await chromium.launch({ headless: options.headless, args: DEFAULT_BROWSER_FLAGS })
     const baseline = await captureScreenshot({
       browser,
       port: options.port,
@@ -1018,9 +1027,23 @@ const main = async () => {
       process.exitCode = 1
     }
   } finally {
-    await browser.close()
-    await devServer.stop()
-    if (bffServer) await bffServer.stop()
+    // P1-1: 每个资源独立 try/catch + 判空——原串行裸 await 前一个抛错会跳过后面的,
+    // 导致 devServer/bffServer 不被 stop → 端口 4179/8089 泄漏挂死 CI。保证三个都被尝试停掉。
+    try {
+      if (browser) await browser.close()
+    } catch (error) {
+      console.error('[visual-diff] browser.close failed:', error instanceof Error ? error.message : error)
+    }
+    try {
+      await devServer.stop()
+    } catch (error) {
+      console.error('[visual-diff] devServer.stop failed:', error instanceof Error ? error.message : error)
+    }
+    try {
+      if (bffServer) await bffServer.stop()
+    } catch (error) {
+      console.error('[visual-diff] bffServer.stop failed:', error instanceof Error ? error.message : error)
+    }
   }
 }
 
