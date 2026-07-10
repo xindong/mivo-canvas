@@ -36,8 +36,8 @@ export interface DocKernel {
   deleteAnchor(id: string): boolean
   listAnchors(): readonly AnchorRecord[]
 
-  // ── 画布元(tasks 不在此 DP-8;selection 不在此 DP-1)──
-  readonly documentMeta: { title: string; createdAt: string; updatedAt: string; revision: Revision }
+  // ── 画布元(tasks 不在此 DP-8;selection 不在此 DP-1;S3 扩 sourceTemplateId/projectId)──
+  readonly documentMeta: { title: string; sourceTemplateId?: string; projectId?: string; createdAt: string; updatedAt: string; revision: Revision }
 }
 
 /** 深拷贝(防外部 mutate 内部状态;records 是纯 JSON 值,structuredClone 适用)。 */
@@ -56,12 +56,14 @@ export class MemoryDocKernel implements DocKernel {
   private readonly nodes = new Map<string, NodeRecord>()
   private readonly edges = new Map<string, EdgeRecord>()
   private readonly anchors = new Map<string, AnchorRecord>()
-  private _meta: { title: string; createdAt: string; updatedAt: string; revision: Revision }
+  private _meta: { title: string; sourceTemplateId?: string; projectId?: string; createdAt: string; updatedAt: string; revision: Revision }
 
   constructor(meta?: Partial<DocKernel['documentMeta']>) {
     const now = new Date().toISOString()
     this._meta = {
       title: meta?.title ?? 'untitled',
+      ...(meta?.sourceTemplateId != null ? { sourceTemplateId: meta.sourceTemplateId } : {}),
+      ...(meta?.projectId != null ? { projectId: meta.projectId } : {}),
       createdAt: meta?.createdAt ?? now,
       updatedAt: meta?.updatedAt ?? now,
       revision: meta?.revision ?? 0,
