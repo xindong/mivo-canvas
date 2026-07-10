@@ -23,6 +23,21 @@ export const GATEWAY_KEY_HEADER = 'x-gateway-key'
 // state.ts) and the task-registry owner scope (server/tasks/registry.ts) so a
 // user's platform session and their tasks partition identically: a user's tasks
 // are only visible to requests carrying the same mivo_ key.
+//
+// CodeQL note (NOT a password hash): the input is a high-entropy mivo_ bearer
+// token — a per-user platform API key (`mivo_` prefix + random string) — used
+// purely as a deterministic per-user partition/routing key (which platform
+// session bucket, which task-registry owner scope). It is never stored, never
+// used for auth comparison, and is not a user-chosen password. A fast unsalted
+// hash (sha256) is intentional and correct here: this runs on every BFF request
+// that touches the platform ctx or the task registry, so a slow KDF
+// (bcrypt/argon2) would add per-request latency for no security gain — the
+// threat model is collision-free sharding of a high-entropy input, not offline
+// cracking of a low-entropy secret. sha256 / 16-hex (64-bit) truncation gives
+// ample collision resistance for a per-key shard id. CodeQL's "insufficient
+// computational effort" rule targets password hashing and is a false positive
+// here — dismissed on PR #180; future re-scans should re-dismiss with this
+// rationale.
 export const fingerprintOfPlatformKey = (platformKey: string): string =>
   createHash('sha256').update(platformKey).digest('hex').slice(0, 16)
 
