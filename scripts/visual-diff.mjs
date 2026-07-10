@@ -91,11 +91,31 @@ const waitForServer = async (url, timeoutMs = 60000) => {
   throw lastError
 }
 
+/**
+ * 把信号发给 child 所在的整个 process group(detached:true 时 child.pid == pgid),
+ * 一次性杀掉 npm + vite + 所有后代。仅 server.kill() 只杀 npm 直系子进程,vite 作为
+ * 孙进程会被 reparent 到 init 继续存活,且它继承了 stdio pipe 的 write 端 → node 的
+ * stdout/stderr 读流永远拿不到 EOF → 事件循环不退出 → CI job 挂死到 timeout 被取消。
+ */
+const killProcessGroup = (child, signal = 'SIGTERM') => {
+  // child.pid 为 null(spawn 失败)时 -pid 退化为 0,会向当前进程组发信号杀自己,故先守卫。
+  if (child.pid == null) return
+  try {
+    process.kill(-child.pid, signal)
+  } catch {
+    // 组已退出 / pid 非组长 → 退回单杀 child,避免误伤父进程所在组。
+    try { child.kill(signal) } catch { /* already gone */ }
+  }
+}
+
 const startDevServer = async (port) => {
   const server = spawn('npm', ['run', 'dev', '--', '--host', '127.0.0.1', '--port', String(port), '--strictPort'], {
     cwd: projectRoot,
     env: { ...process.env, CI: '1' },
     stdio: ['ignore', 'pipe', 'pipe'],
+    // 独立 process group:stop() 用 process.kill(-pid) 杀整组(npm+vite),vite 退出后
+    // stdio pipe 的 write 端关闭,node 读流拿 EOF 后事件循环才能退出。详见 killProcessGroup。
+    detached: true,
   })
   const serverLog = []
   const remember = (chunk) => {
@@ -109,7 +129,9 @@ const startDevServer = async (port) => {
   try {
     await waitForServer(`http://127.0.0.1:${port}`, 60000)
   } catch (error) {
-    server.kill('SIGTERM')
+    killProcessGroup(server)
+    server.stdout.destroy()
+    server.stderr.destroy()
     const detail = serverLog.join('').trim()
     throw new Error(`${error instanceof Error ? error.message : String(error)}\n${detail}`)
   }
@@ -117,10 +139,17 @@ const startDevServer = async (port) => {
   return {
     server,
     async stop() {
-      if (server.exitCode != null) return
-      server.kill('SIGTERM')
+      if (server.exitCode != null) {
+        server.stdout.destroy()
+        server.stderr.destroy()
+        return
+      }
+      killProcessGroup(server)
       await Promise.race([new Promise((resolve) => server.once('exit', resolve)), sleep(5000)])
-      if (server.exitCode == null) server.kill('SIGKILL')
+      if (server.exitCode == null) killProcessGroup(server, 'SIGKILL')
+      // 显式销毁 stdio 读流,释放可能被逃逸孙进程持有的 pipe handle,确保 node 事件循环可退出。
+      server.stdout.destroy()
+      server.stderr.destroy()
     },
   }
 }

@@ -20,6 +20,15 @@ const { PNG } = pngjs
 
 const REJECT_MESSAGE = '局部重绘结果异常，请重新选择区域或换源图后重试。'
 
+// contentEditable 富文本编辑器输入(对齐 mask.mjs fillMaskPrompt):prompt 输入区自
+// 253bd42 起从 <textarea> 改为 contentEditable .image-mask-edit-editor,旧的
+// '.image-mask-edit-prompt textarea' 选择器失效(fill 必 30s 超时)。内联避免改共享文件。
+const fillMaskPrompt = async (page, text) => {
+  const editor = page.locator('.image-mask-edit-prompt .image-mask-edit-editor')
+  await editor.click()
+  await page.evaluate((t) => { document.execCommand('insertText', false, t) }, text)
+}
+
 // ── 通用小工具 ──────────────────────────────────────────────────────────────
 
 const waitForCondition = async (fn, { timeout = 10000, interval = 50, label = 'condition' } = {}) => {
@@ -234,7 +243,7 @@ export const runMaskBlackblockScenario = async (context) => {
     if (!stage) throw new Error('Mask edit stage should be visible')
     await page.mouse.click(stage.x + stage.width * 0.52, stage.y + stage.height * 0.5)
     await page.waitForFunction(() => Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0') > 0)
-    await page.locator('.image-mask-edit-prompt textarea').fill(prompt)
+    await fillMaskPrompt(page, prompt)
     await page.locator('.image-mask-edit-prompt').getByRole('button', { name: '局部重绘' }).click()
     await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
     await ensureChatPanelOpen(page)
@@ -279,6 +288,17 @@ export const runMaskBlackblockScenario = async (context) => {
     return verdict
   }
 
+  // #154 canInspect gate(maskEditGeneration.ts:360 限 model==='gpt-image-2')但 mask edit
+  // 默认 model=gemini(L263-265 payload.model ?? maskEditDefaultModel)→ canInspect=false
+  // → 黑块自愈不触发。#154 commit message 明确「mask edit UI 只能提交 gemini,原两次
+  // /tasks/edit 自愈路径从 UI 无法触发」。BB-1/BB-2 测的自愈路径被 #154 移除,显式 skip
+  // (不删断言代码,若恢复自愈则置 false 解除本 skip)。BB-3(迭代重绘,不依赖自愈)继续。
+  // 决策记录(为何不修自愈、维持 #154 现状=A 案,lead/owner 已确认):
+  // history/plan-review/blackblock-heal-archaeology.md
+  const SKIP_BB_SELF_HEAL = true
+  if (SKIP_BB_SELF_HEAL) {
+    console.log('[mask-blackblock] SKIP BB-1/BB-2 自愈段: #154 canInspect gate(UI 只能提交 gemini,自愈限 gpt-image-2 路径 UI 不可达)。若恢复自愈则置 SKIP_BB_SELF_HEAL=false 解除。决策记录: history/plan-review/blackblock-heal-archaeology.md')
+  } else {
   // ═══ BB-1 自愈成功：区域外黑块检出 → 换 key 重试 → done ═══════════════════
   {
     await resetScene()
@@ -400,6 +420,8 @@ export const runMaskBlackblockScenario = async (context) => {
   }
 
   console.log('[mask-blackblock] BB-2 passed (double-black rejected, no bad image committed)')
+
+  } // end else (SKIP_BB_SELF_HEAL=false 时跑 BB-1/BB-2 自愈断言)
 
   // ═══ BB-3 迭代重绘（N=5）：连续编辑 result 节点，submit 源恒不透明 + 结果恒无黑块 ═══
   {
