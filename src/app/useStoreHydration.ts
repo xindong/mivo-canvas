@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { useCanvasStore } from '../store/canvasStore'
 import { useChatStore } from '../store/chatStore'
 import { useAuthStore } from '../store/authSlice'
+import { reconcileExpiredChatTasks } from '../store/chatTaskReconcile'
 import { debugLogger } from '../store/debugLogStore'
 import { toastFeedback } from '../store/toastStore'
 
@@ -41,7 +42,23 @@ export function useStoreHydration(): boolean {
           useCanvasStore.persist.rehydrate(),
           useChatStore.persist.rehydrate(),
         ])
-        if (!cancelled) setHydrated(true)
+        // FX-3: server-truth reconciliation of wrongly-expired mask-edit chat cards.
+        // The blanket settleExpiredChatMessages already ran in the chat merge (so no
+        // first-paint flash); this async pass asks the per-user task registry (FX-2)
+        // for the truth and recovers cards whose tasks actually succeeded on the
+        // server. Fire-and-forget: never blocks first paint; patches the store when
+        // done (Zustand setState re-renders). The chatHydration characterization
+        // (#167) calls useChatStore.persist.rehydrate() directly, NOT this hook, so
+        // it never triggers this pass — its blanket-settle assertions are untouched.
+        if (!cancelled) {
+          setHydrated(true)
+          void reconcileExpiredChatTasks().catch((error) => {
+            debugLogger.error(
+              SOURCE,
+              `reconcileExpiredChatTasks failed: ${error instanceof Error ? error.message : String(error)}`,
+            )
+          })
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         debugLogger.error(SOURCE, `rehydrate failed: ${message}`)

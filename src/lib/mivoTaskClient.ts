@@ -301,6 +301,39 @@ export const pollTask = async (taskId: string, signal?: AbortSignal): Promise<Ta
   return view
 }
 
+export type SettleChatTasksResult = Record<string, TaskView>
+
+// FX-3: POST /api/mivo/tasks/settle → 200 {results: Record<taskId, TaskView>}.
+// Batch per-user task status query for hydrate-time reconciliation: for each
+// taskId the caller owns and that still exists in the registry, the server returns
+// its TaskView; omitted = gone/expired (the client treats as expired — a server-
+// confirmed settle, replacing the blanket client-side assumption in
+// settleExpiredChatMessages). Mirrors pollTask's auth + 401 handling. Used by
+// reconcileExpiredChatTasks to recover wrongly-expired mask-edit chat cards whose
+// blanket client-side settle was wrong (the task actually succeeded on the server).
+// Unlike pollTask, a 404 is impossible here — the endpoint always 200s with a
+// possibly-empty results map; an absent taskId in `results` IS the "gone" signal.
+export const settleChatTasks = async (taskIds: string[]): Promise<SettleChatTasksResult> => {
+  if (taskIds.length === 0) return {}
+  const response = await fetchWithTimeout(
+    '/api/mivo/tasks/settle',
+    {
+      method: 'POST',
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ taskIds }),
+    },
+    submitTimeoutMs,
+  )
+  if (!response.ok) {
+    throw new MivoImageRequestError(
+      await readSubmitError(response),
+      response.status === 504 ? 'upstream-timeout' : 'upstream-error',
+    )
+  }
+  const body = (await response.json()) as { results?: SettleChatTasksResult }
+  return body.results ?? {}
+}
+
 // DELETE /api/mivo/tasks/:id → 200 {id,status:'canceled'} | 404 (already gone).
 // Best-effort: a 404 or network error during DELETE must not mask the original
 // abort. All errors are swallowed — the poll loop will observe the terminal state

@@ -1,6 +1,6 @@
 import type { ChatMessage, ChatMessageStatus } from './chatStore'
 
-const expiredGenerationMessage = '任务已过期,请重试。'
+export const expiredGenerationMessage = '任务已过期,请重试。'
 // mask-chat-card: 局部重绘刷新后无 runtime controller 可恢复轮询，chat card settle 为
 // error 且第一版不支持 card Retry，引导用户重新选择区域。保留 pendingSlotId 让 canvas
 // hydration 的 failed slot 与卡片对应（SC-15）。
