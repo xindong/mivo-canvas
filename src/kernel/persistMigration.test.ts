@@ -170,6 +170,19 @@ describe('T1.2 S4 persistMigration — migrate v10→v11 ckpt 仪式(§4.3)', ()
     // ckpt 保留(forensic)
     expect(storage._db.has('mivo-canvas-demo:ckpt-v10')).toBe(true)
   })
+
+  it('migrate 幂等:document key 已存在 → skipped(Lead ① S6b-2,防重复迁移覆盖)', async () => {
+    const v10Envelope = JSON.stringify({ state: v10Blob, version: 10 })
+    const storage = makeStorage({
+      'mivo-canvas-demo': v10Envelope,
+      'mivo-canvas-demo:document': JSON.stringify({ state: { canvases: {}, projects: [] }, version: 11 }),
+    })
+    const result = await migrateV10ToV11(storage, 'mivo-canvas-demo')
+    expect(result.ok).toBe(true)
+    expect(result.skipped).toBe(true) // document 已存在 → 跳过(不重写)
+    // 幂等:setItem 不调用(只 getItem documentKey 检查,不写 document/session/ckpt)
+    expect(storage.setItem).not.toHaveBeenCalled()
+  })
 })
 
 describe('T1.2 S4 persistMigration — #164 seed 适配(migrate v10→v11 透明跑)', () => {

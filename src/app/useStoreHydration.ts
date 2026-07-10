@@ -6,6 +6,9 @@ import { useSettingsStore } from '../store/settingsSlice'
 import { reconcileExpiredChatTasks } from '../store/chatTaskReconcile'
 import { debugLogger } from '../store/debugLogStore'
 import { toastFeedback } from '../store/toastStore'
+import { isLegacyKernel } from './kernelMode'
+import { migrateV10ToV11 } from '../kernel/persistMigration'
+import { rawIdbStorage } from '../lib/persistIdbStorage'
 
 const SOURCE = 'Store Hydration'
 
@@ -39,6 +42,24 @@ export function useStoreHydration(): boolean {
         // FX-6: resolve the auth userId namespace BEFORE rehydrating persisted
         // stores, so canvas/chat hydrate from mivo-*:<userId> (not anonymous).
         await useAuthStore.getState().hydrate()
+        // S6b-2:?kernel=new 时 auth 后 rehydrate 前调 migrate 仪式(幂等,Lead ①)。
+        // ?kernel=legacy(默认)不调,legacy 零变化(§8)。migrate 把 v10 单 blob 迁 v11
+        // document+session 三域(DocKernel canonical);幂等:document key 已存在则跳过(防重复迁移)。
+        // 失败:rollback 已在 migrateV10ToV11 内跑(§4.3);useStoreHydration 不阻塞 rehydrate(降级默认)。
+        if (!isLegacyKernel) {
+          try {
+            const result = await migrateV10ToV11(rawIdbStorage, 'mivo-canvas-demo')
+            if (result.skipped) {
+              debugLogger.log(SOURCE, `kernel migrate skipped (already migrated / no v10 blob)`)
+            } else if (!result.ok) {
+              debugLogger.warn(SOURCE, `kernel migrate failed: ${result.error ?? 'unknown'} (rollback ran)`)
+            } else {
+              debugLogger.log(SOURCE, `kernel migrate ok (v10 → v11 document+session)`)
+            }
+          } catch (error) {
+            debugLogger.error(SOURCE, `kernel migrate threw: ${error instanceof Error ? error.message : String(error)}`)
+          }
+        }
         await Promise.all([
           useCanvasStore.persist.rehydrate(),
           useChatStore.persist.rehydrate(),
