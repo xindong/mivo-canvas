@@ -24,6 +24,21 @@
 
 import { debugLogger } from '../store/debugLogStore'
 import { toastFeedback } from '../store/toastStore'
+import { ANONYMOUS_USER_ID, getPersistUserId, namespacedKey } from './persistUserId'
+import { clearAssetsForUser } from './assetStorage'
+
+// FX-6 per-user cache namespacing. The canvas + chat persist NAMES stay static
+// (`mivo-canvas-demo` / `mivo-chat-demo`) so the zustand persist contract and the
+// characterization/contract tests that pin them are untouched; the adapter routes
+// the physical IDB key through `namespacedKey(name)`, which appends `:<userId>` for
+// an authenticated user and returns the raw name for the anonymous namespace
+// (legacy compatibility — pre-auth and test sessions keep using the un-suffixed
+// key they always used, so existing tests pass byte-for-byte). The settings
+// store's `strictIdbStateStorage` (gatewayKey / mivoKey, DP-7) is deliberately NOT
+// namespaced — those keys are device-local API keys that never enter
+// /api/user-state and are shared across accounts on the same device by design.
+const CANVAS_PERSIST_NAME = 'mivo-canvas-demo'
+const CHAT_PERSIST_NAME = 'mivo-chat-demo'
 
 const DB_NAME = 'mivo-canvas-persist'
 const DB_VERSION = 1
@@ -122,6 +137,61 @@ const migrateFromLocalStorage = async (name: string): Promise<void> => {
   sessionStorage.setItem(migratedMarker(name), '1')
 }
 
+const nsMigratedMarker = (name: string, uid: string) => `mivo-ns-migrated:${name}:${uid}`
+
+/**
+ * FX-6 one-shot legacy → namespaced migration. Pre-FX-6 sessions wrote the canvas
+ * / chat state under the raw static name (no `:userId` suffix); once a user
+ * authenticates their cache must live under `name:<userId>`. On the first
+ * authenticated getItem, if the namespaced key is absent but the legacy raw key
+ * exists in IDB, copy it across and delete the legacy key — preventing data loss.
+ * Idempotent: the legacy key is deleted after a successful copy, so the next call
+ * finds the namespaced key present and short-circuits. A per-(name, user)
+ * sessionStorage marker skips the two extra IDB reads after the first boot per tab.
+ *
+ * Skipped entirely for the anonymous namespace — anonymous IS the raw key, so
+ * there is nothing to migrate and no namespaced target to migrate into. This also
+ * keeps the legacy/contract test paths (which never authenticate) on the raw key.
+ */
+const migrateToNamespaced = async (name: string): Promise<void> => {
+  const uid = getPersistUserId()
+  if (uid === ANONYMOUS_USER_ID) return
+  if (typeof sessionStorage === 'undefined') return
+  const marker = nsMigratedMarker(name, uid)
+  if (sessionStorage.getItem(marker)) return
+
+  const physical = namespacedKey(name)
+  try {
+    const existing = await runTransaction<KvRecord | undefined>('readonly', (store) =>
+      store.get(physical) as IDBRequest<KvRecord | undefined>,
+    )
+    if (existing) {
+      // Namespaced key already has data — nothing to migrate. Mark and done.
+      sessionStorage.setItem(marker, '1')
+      return
+    }
+    const legacy = await runTransaction<KvRecord | undefined>('readonly', (store) =>
+      store.get(name) as IDBRequest<KvRecord | undefined>,
+    )
+    if (legacy) {
+      await runTransaction('readwrite', (store) =>
+        store.put({ key: physical, value: legacy.value } as unknown as KvRecord),
+      )
+      await runTransaction('readwrite', (store) => store.delete(name))
+      debugLogger.log(
+        SOURCE,
+        `migrated legacy cache key ${name} → ${physical} for user ${uid} (one-time)`,
+      )
+    }
+    // Whether we copied or found nothing, the legacy key is now either moved or
+    // absent — mark so subsequent getItems skip the two extra reads this boot.
+    sessionStorage.setItem(marker, '1')
+  } catch (error) {
+    // Marker NOT set → next boot retries. Never silently lose the chance to migrate.
+    debugLogger.warn(SOURCE, `namespace migration failed for ${name}: ${errMessage(error)}`)
+  }
+}
+
 const isQuotaError = (error: unknown): boolean =>
   error instanceof DOMException &&
   (error.name === 'QuotaExceededError' || error.name === 'QuotaExceeded')
@@ -142,12 +212,13 @@ export const idbStateStorage = {
   getItem: async (name: string): Promise<string | null> => {
     if (!isIdbAvailable()) {
       debugLogger.warn(SOURCE, 'IndexedDB unavailable; falling back to localStorage')
-      return typeof localStorage !== 'undefined' ? localStorage.getItem(name) : null
+      return typeof localStorage !== 'undefined' ? localStorage.getItem(namespacedKey(name)) : null
     }
     try {
       await migrateFromLocalStorage(name)
+      await migrateToNamespaced(name)
       const record = await runTransaction<KvRecord | undefined>('readonly', (store) =>
-        store.get(name) as IDBRequest<KvRecord | undefined>,
+        store.get(namespacedKey(name)) as IDBRequest<KvRecord | undefined>,
       )
       return record?.value ?? null
     } catch (error) {
@@ -155,7 +226,7 @@ export const idbStateStorage = {
         SOURCE,
         `getItem failed for ${name}; falling back to localStorage: ${errMessage(error)}`,
       )
-      return typeof localStorage !== 'undefined' ? localStorage.getItem(name) : null
+      return typeof localStorage !== 'undefined' ? localStorage.getItem(namespacedKey(name)) : null
     }
   },
 
@@ -172,12 +243,12 @@ export const idbStateStorage = {
     }
     if (!isIdbAvailable()) {
       debugLogger.warn(SOURCE, 'IndexedDB unavailable; writing to localStorage')
-      if (typeof localStorage !== 'undefined') localStorage.setItem(name, value)
+      if (typeof localStorage !== 'undefined') localStorage.setItem(namespacedKey(name), value)
       return
     }
     try {
       await runTransaction('readwrite', (store) =>
-        store.put({ key: name, value } as unknown as KvRecord),
+        store.put({ key: namespacedKey(name), value } as unknown as KvRecord),
       )
       // P4c: fire-and-forget server sync — void syncToServer(name, value)
     } catch (error) {
@@ -193,15 +264,48 @@ export const idbStateStorage = {
 
   removeItem: async (name: string): Promise<void> => {
     if (!isIdbAvailable()) {
-      if (typeof localStorage !== 'undefined') localStorage.removeItem(name)
+      if (typeof localStorage !== 'undefined') localStorage.removeItem(namespacedKey(name))
       return
     }
     try {
-      await runTransaction('readwrite', (store) => store.delete(name))
+      await runTransaction('readwrite', (store) => store.delete(namespacedKey(name)))
     } catch (error) {
       debugLogger.warn(SOURCE, `removeItem failed for ${name}: ${errMessage(error)}`)
     }
   },
+}
+
+/**
+ * FX-6 clear the CURRENT user's cache namespace — called by authSlice.logout
+ * BEFORE the optimistic state clear + SSO redirect (the redirect unloads the
+ * page, so any IDB work queued after it would never land). Clears the canvas +
+ * chat namespaced keys for the user being logged out and the asset blobs tagged
+ * for them; it never touches another user's namespace (the physical keys are
+ * per-user). The anonymous namespace is never cleared here — there is no
+ * "anonymous logout", and clearing the shared raw key would nuke data other
+ * tabs / the next anonymous session might still read. Node-test-safe: when IDB
+ * is unavailable every step degrades to a no-op (removeItem no-ops, the asset
+ * clear returns early), so the auth characterization tests that run without an
+ * IDB global don't throw or emit unexpected toasts.
+ */
+export const clearCurrentUserCache = async (): Promise<void> => {
+  const uid = getPersistUserId()
+  if (uid === ANONYMOUS_USER_ID) return
+  try {
+    await idbStateStorage.removeItem(CANVAS_PERSIST_NAME)
+    await idbStateStorage.removeItem(CHAT_PERSIST_NAME)
+    debugLogger.log(SOURCE, `cleared cache namespace for user ${uid} on logout`)
+  } catch (error) {
+    // Never let a cache-clear failure block logout — the SSO redirect still runs,
+    // and the next login re-hydrates from a possibly-stale namespace (acceptable;
+    // the user-initiated logout still cleared the in-memory auth state).
+    debugLogger.warn(SOURCE, `cache clear failed for user ${uid}: ${errMessage(error)}`)
+  }
+  try {
+    await clearAssetsForUser(uid)
+  } catch (error) {
+    debugLogger.warn(SOURCE, `asset clear failed for user ${uid}: ${errMessage(error)}`)
+  }
 }
 
 /**
