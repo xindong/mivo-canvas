@@ -29,6 +29,21 @@ vi.mock('./chatStore', () => ({
   },
 }))
 
+// FX-3b: minimal in-memory canvasStore stand-in. The reconcile reads
+// canvases[sceneId].nodes (to check slot/source existence) and calls
+// commitGenerationResult (async, IDB in prod). Both are isolated here.
+type CanvasNodeStub = { id: string; type: 'image' | 'ai-slot' | string; hidden?: boolean }
+let canvasState: { canvases: Record<string, { nodes: CanvasNodeStub[] }> } = { canvases: {} }
+const commitGenerationResultMock = vi.fn()
+vi.mock('./canvasStore', () => ({
+  useCanvasStore: {
+    getState: () => ({
+      canvases: canvasState.canvases,
+      commitGenerationResult: (...args: unknown[]) => commitGenerationResultMock(...args),
+    }),
+  },
+}))
+
 import { reconcileExpiredChatTasks } from './chatTaskReconcile'
 import { expiredGenerationMessage, recoveredTaskDoneMessage } from './chatGenerationHydration'
 import { useDebugLogStore } from './debugLogStore'
@@ -60,10 +75,42 @@ const setScene = (sceneId: string, messages: ChatMessage[]): void => {
   storeState = { messagesByScene: { [sceneId]: messages } }
 }
 
+// FX-3b: canvas node stubs + a generationContext that carries pendingSlotId (the
+// persisted slot id the recover path backfills into) + sourceNodeId + finalPrompt.
+const setCanvas = (sceneId: string, nodes: CanvasNodeStub[]): void => {
+  canvasState = { canvases: { [sceneId]: { nodes } } }
+}
+
+const ctxWithSlot = (
+  serverTaskId: string,
+  pendingSlotId: string,
+  extra: Partial<import('./chatStore').ChatGenerationContext> = {},
+): import('./chatStore').ChatGenerationContext => ({
+  model: 'gpt-image-2',
+  requestedImgRatio: 'auto' as const,
+  requestedQuality: 'auto' as const,
+  maskEdit: { serverTaskId },
+  pendingSlotId,
+  ...extra,
+})
+
+const doneView = (taskId: string, withImages = true) => ({
+  id: taskId,
+  kind: 'edit' as const,
+  status: 'done' as const,
+  progress: 100,
+  stage: 'done',
+  requestId: 'r',
+  model: 'gpt-image-2',
+  ...(withImages ? { result: { images: [{ b64: 'abc' }] } } : {}),
+})
+
 describe('FX-3 reconcileExpiredChatTasks', () => {
   beforeEach(() => {
     storeState = { messagesByScene: {} }
+    canvasState = { canvases: {} }
     settleChatTasksMock.mockReset()
+    commitGenerationResultMock.mockReset()
   })
 
   it('recovers a blanket-settled card when the server says done', async () => {
@@ -301,5 +348,163 @@ describe('FX-3 reconcileExpiredChatTasks — P1-2 settle retry', () => {
       .getState()
       .entries.find((e) => /Settle failed after 3 attempt/.test(e.message))
     expect(warn).toBeDefined()
+  })
+})
+
+// FX-3b: recovered 分支从「只翻 status」升级为「先回灌结果图到 canvas 槽,再翻卡」。
+// settleChatTasks 已在上面覆盖;这里聚焦 commitGenerationResult 调度 + payload + 降级 + race-safe。
+describe('FX-3b reconcileExpiredChatTasks — result-image backfill', () => {
+  beforeEach(() => {
+    storeState = { messagesByScene: {} }
+    canvasState = { canvases: {} }
+    settleChatTasksMock.mockReset()
+    commitGenerationResultMock.mockReset()
+    useDebugLogStore.getState().clear()
+  })
+
+  it('(a) done+images+slot 存活(ai-slot) → commit 被调(payload: replaceSlotId/resultImages/kind=edit/不含 maskBounds) 且卡片 done + resultNodeIds = commit 返回值', async () => {
+    setScene('s1', [
+      blanketSettledCard('m1', 't-done', {
+        generationContext: ctxWithSlot('t-done', 'slot-1', { sourceNodeId: 'src-1', finalPrompt: '把背景换蓝' }),
+      }),
+    ])
+    setCanvas('s1', [
+      { id: 'slot-1', type: 'ai-slot', hidden: false },
+      { id: 'src-1', type: 'image', hidden: false },
+    ])
+    settleChatTasksMock.mockResolvedValue({ 't-done': doneView('t-done') })
+    commitGenerationResultMock.mockResolvedValue(['node-result-1'])
+
+    await reconcileExpiredChatTasks()
+
+    expect(commitGenerationResultMock).toHaveBeenCalledTimes(1)
+    const payload = commitGenerationResultMock.mock.calls[0][0]
+    expect(payload.replaceSlotId).toBe('slot-1')
+    expect(payload.resultImages).toEqual([{ b64: 'abc' }])
+    expect(payload.kind).toBe('edit')
+    expect(payload.sourceNodeId).toBe('src-1') // source 仍存在 → 传
+    expect(payload.lineageSourceId).toBe('src-1')
+    expect(payload.createDerivationEdge).toBe(true)
+    expect(payload.reflow).toBe(true)
+    expect(payload.model).toBe('gpt-image-2')
+    expect(payload.taskId).toBe('t-done')
+    expect(payload.placement).toBe('right')
+    expect(payload.prompt).toBe('把背景换蓝')
+    expect(payload.maskBounds).toBeUndefined() // P2-4: 未持久化,不传
+    expect(payload.maskSourceSize).toBeUndefined()
+    const msg = storeState.messagesByScene['s1'][0]
+    expect(msg.status).toBe('done')
+    expect(msg.resultNodeIds).toEqual(['node-result-1'])
+    expect(msg.error).toBeUndefined()
+    expect(msg.errorKind).toBeUndefined()
+    expect(msg.retryDisabledReason).toBeUndefined()
+    expect(msg.generationContext?.maskEdit?.sourceDeleted).toBe(false)
+    expect(msg.generationContext?.maskEdit?.phase).toBeUndefined()
+    // 成功路径有 log(debugLogger.log)
+    const log = useDebugLogStore.getState().entries.find((e) => /commit succeeded/.test(e.message))
+    expect(log).toBeDefined()
+  })
+
+  it('(b) slot 已删 → 不调 commit,仅翻 done', async () => {
+    setScene('s1', [
+      blanketSettledCard('m1', 't-done', {
+        generationContext: ctxWithSlot('t-done', 'slot-gone', { sourceNodeId: 'src-1' }),
+      }),
+    ])
+    setCanvas('s1', [{ id: 'src-1', type: 'image', hidden: false }]) // slot 不在
+    settleChatTasksMock.mockResolvedValue({ 't-done': doneView('t-done') })
+    commitGenerationResultMock.mockResolvedValue(['should-not-be-called'])
+
+    await reconcileExpiredChatTasks()
+
+    expect(commitGenerationResultMock).not.toHaveBeenCalled()
+    const msg = storeState.messagesByScene['s1'][0]
+    expect(msg.status).toBe('done')
+    expect(msg.resultNodeIds).toBeUndefined() // 仅翻 status,不回灌
+    // 跳过路径有 warn(debugLogger.warn)
+    const warn = useDebugLogStore.getState().entries.find((e) => /not an active ai-slot/.test(e.message))
+    expect(warn).toBeDefined()
+  })
+
+  it('(c) done 但 result.images 空/缺 → 不调 commit,仅翻 done', async () => {
+    setScene('s1', [
+      blanketSettledCard('m1', 't-done', { generationContext: ctxWithSlot('t-done', 'slot-1') }),
+    ])
+    setCanvas('s1', [{ id: 'slot-1', type: 'ai-slot', hidden: false }])
+    settleChatTasksMock.mockResolvedValue({ 't-done': doneView('t-done', false) }) // 无 result
+    commitGenerationResultMock.mockResolvedValue(['should-not-be-called'])
+
+    await reconcileExpiredChatTasks()
+
+    expect(commitGenerationResultMock).not.toHaveBeenCalled()
+    const msg = storeState.messagesByScene['s1'][0]
+    expect(msg.status).toBe('done')
+    expect(msg.resultNodeIds).toBeUndefined()
+  })
+
+  it('(d) pendingSlotId 节点已是 type=image → 不调 commit,resultNodeIds=[slotId] 翻 done', async () => {
+    setScene('s1', [
+      blanketSettledCard('m1', 't-done', { generationContext: ctxWithSlot('t-done', 'slot-1') }),
+    ])
+    // slot 已被原位替换为 image(commitGenerationResult 复用 slot id)→ 上次会话死于 commit 后翻卡前
+    setCanvas('s1', [{ id: 'slot-1', type: 'image', hidden: false }])
+    settleChatTasksMock.mockResolvedValue({ 't-done': doneView('t-done') })
+    commitGenerationResultMock.mockResolvedValue(['should-not-be-called'])
+
+    await reconcileExpiredChatTasks()
+
+    expect(commitGenerationResultMock).not.toHaveBeenCalled()
+    const msg = storeState.messagesByScene['s1'][0]
+    expect(msg.status).toBe('done')
+    expect(msg.resultNodeIds).toEqual(['slot-1']) // 复用 slot id
+    // pre-flip 复用路径有 log
+    const log = useDebugLogStore.getState().entries.find((e) => /already committed as image/.test(e.message))
+    expect(log).toBeDefined()
+  })
+
+  it('(e) commit 抛错 → 降级仅翻 done,reconcileExpiredChatTasks 不抛', async () => {
+    setScene('s1', [
+      blanketSettledCard('m1', 't-done', { generationContext: ctxWithSlot('t-done', 'slot-1', { finalPrompt: 'p' }) }),
+    ])
+    setCanvas('s1', [{ id: 'slot-1', type: 'ai-slot', hidden: false }])
+    settleChatTasksMock.mockResolvedValue({ 't-done': doneView('t-done') })
+    commitGenerationResultMock.mockRejectedValue(new Error('asset save failed'))
+
+    await expect(reconcileExpiredChatTasks()).resolves.toBeUndefined()
+
+    expect(commitGenerationResultMock).toHaveBeenCalledTimes(1)
+    const msg = storeState.messagesByScene['s1'][0]
+    expect(msg.status).toBe('done') // 降级仅翻 status
+    expect(msg.resultNodeIds).toBeUndefined() // commit 失败,无结果图
+    // 失败路径有 warn(debugLogger.warn)
+    const warn = useDebugLogStore.getState().entries.find((e) => /commit failed/.test(e.message))
+    expect(warn).toBeDefined()
+  })
+
+  it('(SC-6) commit 期间用户 retry 卡(签名已变)→ setState 不覆盖,卡保持 generating', async () => {
+    setScene('s1', [
+      blanketSettledCard('m1', 't-done', { generationContext: ctxWithSlot('t-done', 'slot-1', { finalPrompt: 'p' }) }),
+    ])
+    setCanvas('s1', [{ id: 'slot-1', type: 'ai-slot', hidden: false }])
+    settleChatTasksMock.mockResolvedValue({ 't-done': doneView('t-done') })
+    // commit 执行期间用户 retry:卡离开 blanket-settle 签名(status=generating,清 error/errorKind)
+    commitGenerationResultMock.mockImplementation(async () => {
+      storeState.messagesByScene['s1'][0] = {
+        ...storeState.messagesByScene['s1'][0],
+        status: 'generating',
+        error: undefined,
+        errorKind: undefined,
+      }
+      return ['node-result-1']
+    })
+
+    await reconcileExpiredChatTasks()
+
+    // commit 已执行(canvas 侧效:结果图落地但成为孤儿;可接受的残余)
+    expect(commitGenerationResultMock).toHaveBeenCalledTimes(1)
+    // 但卡状态未被翻回 done(setState 内复查 blanket 签名失败 → 不覆盖)
+    const msg = storeState.messagesByScene['s1'][0]
+    expect(msg.status).toBe('generating')
+    expect(msg.resultNodeIds).toBeUndefined()
   })
 })
