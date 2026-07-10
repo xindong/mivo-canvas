@@ -1,9 +1,12 @@
 import type { ImageDimensions } from './imageSizing'
+import { debugLogger } from '../store/debugLogStore'
+import { ANONYMOUS_USER_ID, getPersistUserId } from './persistUserId'
 
 const DB_NAME = 'mivo-canvas-assets'
 const DB_VERSION = 1
 const STORE_NAME = 'assets'
 const IMPORTED_ASSET_PREFIX = 'mivo-asset:'
+const SOURCE = 'Assets'
 const transparentAlphaThreshold = 2
 const transparentTrimPadding = 2
 const maxAlphaScanPixels = 12_000_000
@@ -46,6 +49,10 @@ type StoredAsset = {
   type: string
   blob: Blob
   createdAt: number
+  // FX-6: the user whose cache namespace owns this blob. Pre-FX-6 records lack
+  // this field (undefined) and are claimed by the first authenticated user via
+  // migrateUntaggedAssets. Anonymous-mode assets stay userId === 'anonymous'.
+  userId?: string
 }
 
 export type SerializedCanvasAsset = {
@@ -261,6 +268,7 @@ export const saveImportedAsset = async (file: File) => {
     type: prepared.type,
     blob: prepared.blob,
     createdAt: Date.now(),
+    userId: getPersistUserId(),
   }
 
   await withAssetStore('readwrite', (store) => store.put(asset))
@@ -343,7 +351,101 @@ export const restoreSerializedAsset = async (asset: SerializedCanvasAsset) => {
     type: asset.type || blob.type || 'application/octet-stream',
     blob,
     createdAt: asset.createdAt || Date.now(),
+    userId: getPersistUserId(),
   }
 
   await withAssetStore('readwrite', (store) => store.put(storedAsset))
+}
+
+/**
+ * FX-6 clear asset blobs owned by the given user — called from
+ * clearCurrentUserCache on logout. Iterates the assets store and deletes every
+ * record whose `userId` matches; other users' blobs are never touched. Node-test-
+ * safe: no-op when IndexedDB is undefined (the auth characterization tests run
+ * with no IDB global). Asset ids are globally unique (crypto.randomUUID), so
+ * resolveAssetUrl stays by-id only — cross-user isolation comes from the
+ * namespaced canvas that owns the references, not from filtering reads.
+ */
+export const clearAssetsForUser = async (userId: string): Promise<void> => {
+  if (typeof indexedDB === 'undefined' || indexedDB === null) return
+  if (!userId) return
+  let cleared = 0
+  try {
+    const db = await openAssetDb()
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite')
+      const store = tx.objectStore(STORE_NAME)
+      const req = store.openCursor()
+      req.onsuccess = () => {
+        const cursor = req.result as IDBCursorWithValue | null
+        if (cursor) {
+          const rec = cursor.value as StoredAsset
+          if (rec.userId === userId) {
+            cursor.delete()
+            cleared += 1
+          }
+          cursor.continue()
+        }
+      }
+      tx.oncomplete = () => resolve()
+      tx.onerror = () => reject(tx.error)
+      tx.onabort = () => reject(tx.error ?? new Error('asset clear aborted'))
+    })
+    db.close()
+    if (cleared > 0) {
+      debugLogger.log(SOURCE, `cleared ${cleared} asset(s) for user ${userId} on logout`)
+    }
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error)
+    debugLogger.warn(SOURCE, `clearAssetsForUser failed for ${userId}: ${msg}`)
+  }
+}
+
+/**
+ * FX-6 one-shot migration: claim pre-FX-6 asset blobs (no `userId` field) for the
+ * current authenticated user so a later logout actually clears them. Idempotent
+ * via a per-user sessionStorage marker and via cursor state (no untagged records
+ * remain after a run). Skipped for the anonymous namespace — anonymous assets stay
+ * shared, and there is no authenticated owner to claim them. Fire-and-forget from
+ * authSlice.hydrate; never blocks canvas hydration (assets resolve on demand).
+ */
+export const migrateUntaggedAssets = async (userId: string): Promise<void> => {
+  if (typeof indexedDB === 'undefined' || indexedDB === null) return
+  if (!userId || userId === ANONYMOUS_USER_ID) return
+  if (typeof sessionStorage === 'undefined') return
+  const marker = `mivo-assets-ns-migrated:${userId}`
+  if (sessionStorage.getItem(marker)) return
+  let tagged = 0
+  try {
+    const db = await openAssetDb()
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite')
+      const store = tx.objectStore(STORE_NAME)
+      const req = store.openCursor()
+      req.onsuccess = () => {
+        const cursor = req.result as IDBCursorWithValue | null
+        if (cursor) {
+          const rec = cursor.value as StoredAsset
+          if (rec.userId === undefined || rec.userId === null || rec.userId === '') {
+            rec.userId = userId
+            cursor.update(rec)
+            tagged += 1
+          }
+          cursor.continue()
+        }
+      }
+      tx.oncomplete = () => resolve()
+      tx.onerror = () => reject(tx.error)
+      tx.onabort = () => reject(tx.error ?? new Error('asset migration aborted'))
+    })
+    db.close()
+    sessionStorage.setItem(marker, '1')
+    if (tagged > 0) {
+      debugLogger.log(SOURCE, `migrated ${tagged} untagged asset(s) → user ${userId}`)
+    }
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error)
+    // Marker NOT set → next boot retries. Never silently lose the migration chance.
+    debugLogger.warn(SOURCE, `migrateUntaggedAssets failed for ${userId}: ${msg}`)
+  }
 }
