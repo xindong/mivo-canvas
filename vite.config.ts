@@ -1,5 +1,6 @@
-import { defineConfig, loadEnv } from 'vite'
+import { defineConfig, loadEnv, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
+import type { IncomingMessage, ServerResponse } from 'node:http'
 
 // SC1.3 (P1-d 收尾): the mivo dev middleware is RETIRED. All mivo API traffic
 // is proxied to the standalone BFF (`npm run start:server`, see server/)
@@ -14,11 +15,28 @@ const resolveDevBffTarget = (env: Record<string, string>): string => {
   return `http://127.0.0.1:${port}`
 }
 
+// visual-diff token probe (env-gated): only when MIVO_VD_TOKEN is set, register a
+// middleware at /__vd_probe returning the token. Lets scripts/visual-diff.mjs's
+// waitForServer confirm THIS vite instance is responding (not a stale process holding
+// the port — strictPort makes the new vite exit on EADDRINUSE, but an old process could
+// still serve 200 on `/`). Normal dev/prod has no MIVO_VD_TOKEN → no middleware → 404.
+const visualDiffProbePlugin: Plugin = {
+  name: 'mivo-visual-diff-probe',
+  configureServer(server) {
+    const token = process.env.MIVO_VD_TOKEN
+    if (!token) return
+    server.middlewares.use('/__vd_probe', (_req: IncomingMessage, res: ServerResponse) => {
+      res.setHeader('content-type', 'text/plain; charset=utf-8')
+      res.end(token)
+    })
+  },
+}
+
 // https://vite.dev/config/
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
   return {
-    plugins: [react()],
+    plugins: [react(), visualDiffProbePlugin],
     server: {
       proxy: {
         // ALL /api/* traffic goes to the BFF. Use a single catch-all rather than

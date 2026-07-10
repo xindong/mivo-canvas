@@ -1,0 +1,57 @@
+# ops/postgres/docker-compose.yml
+# MivoCanvas P1 后端底座 PG(provisioning)。lead/owner 确认后才在服务器实操(见
+# docs/runbook/t1.1-pg-provisioning.md)。严禁本地 docker compose up,只做 config 校验。
+#
+# 要点:PG 16-alpine;数据卷 bind /AIGC_Group/mivo-canvas-data/pg;仅绑 127.0.0.1:5432
+# (不对外);密码走 .env(.env.example 是模板,真实 .env 不入库);healthcheck + restart
+# policy + 资源限制 + 日志轮转。
+# 语法校验:docker compose --env-file ops/postgres/.env.example -f ops/postgres/docker-compose.yml config
+#
+# 认证:不设 POSTGRES_HOST_AUTH_METHOD → 用镜像默认(local socket=trust,docker exec 脚本
+# 免密;TCP=scram-sha-256,BFF 走 127.0.0.1 带密码)。仅绑 127.0.0.1 + 服务器受控访问,
+# local trust 可接受;若需更严,设 POSTGRES_HOST_AUTH_METHOD=scram-sha-256 并给 backup/
+# restore 脚本加 PGPASSWORD(见 runbook §认证取舍)。
+
+services:
+  mivo-postgres:
+    image: postgres:16-alpine
+    container_name: mivo-postgres
+    restart: unless-stopped
+    # 仅绑 127.0.0.1:不对外,只能本机/BFF 访问(生产如需远程走 ssh tunnel 或网关,不在本文件)。
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-mivo}
+      # :? 强制 .env 必填(空/缺即拒起),避免裸密码入库。
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required — set in ops/postgres/.env}
+      POSTGRES_DB: ${POSTGRES_DB:-mivocanvas}
+      # 容器内时区与服务器对齐(备份时间戳/日志可读)。
+      TZ: Asia/Shanghai
+    # 数据卷:bind 主机 /AIGC_Group/mivo-canvas-data/pg → 容器 PGDATA(默认 /var/lib/postgresql/data)。
+    # 首次 up 前须确保该目录存在且为空(否则 PG 初始化可能拒跑,见 runbook 前置检查)。
+    volumes:
+      - /AIGC_Group/mivo-canvas-data/pg:/var/lib/postgresql/data
+    # 共享内存(PG 并行查询/临时表用,默认 64m 偏小)。
+    shm_size: 256m
+    # 资源限制(Compose V2 的 docker compose up 落实 deploy.resources.limits)。
+    # 可按服务器实际调;runbook §需 owner 确认 里提示若服务器规格不同则改。
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2g
+        reservations:
+          cpus: "0.5"
+          memory: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mivo} -d ${POSTGRES_DB:-mivocanvas}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    # 日志轮转(防 pg 日志撑爆磁盘)。
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
