@@ -58,7 +58,6 @@ vi.mock('./remoteDebugReporter', () => ({
 }))
 
 import { useCanvasStore, migratePersistedState } from './canvasStore'
-import { CANVAS_PERSIST_VERSION } from './canvasGenerationHydration'
 import { useChatStore } from './chatStore'
 import type { ChatMessage } from './chatStore'
 import type { CanvasTask, MivoCanvasNode } from '../types/mivoCanvas'
@@ -153,7 +152,8 @@ describe('contract: canvas persist v10 shape (partialize field set)', () => {
   it('pins the persist name and version', () => {
     const opts = useCanvasStore.persist.getOptions()
     expect(opts.name).toBe('mivo-canvas-demo')
-    expect(opts.version).toBe(CANVAS_PERSIST_VERSION)
+    // 钉字面量 11(不引用 CANVAS_PERSIST_VERSION 常量):契约职责是钉现状,引用常量后"误改常量没写迁移"事故此契约不再报警 → 恒真断言无守卫价值。v12 bump 时须连同迁移一起有意更新此处。
+    expect(opts.version).toBe(11)
   })
 
   it('pins the migrate function reference (A2 must not silently swap migrators)', () => {
@@ -182,7 +182,8 @@ describe('contract: canvas persist v10 shape (partialize field set)', () => {
     const raw = (globalThis as { localStorage: { getItem: (k: string) => string | null } }).localStorage.getItem('mivo-canvas-demo')
     expect(raw).not.toBeNull()
     const parsed = JSON.parse(raw!) as { state: Record<string, unknown>; version: number }
-    expect(parsed.version).toBe(CANVAS_PERSIST_VERSION)
+    // 钉字面量 11(同上:契约不引用常量,守住"误改常量没写迁移"事故)。v12 bump 时连同迁移一起有意更新。
+    expect(parsed.version).toBe(11)
     expect(Object.keys(parsed.state).sort()).toEqual(expectedFields)
     expect(parsed.state.activeTool).toBe('brush')
   })
