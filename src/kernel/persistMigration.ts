@@ -90,26 +90,89 @@ export const dryRunMigration = async (storage: ReadStorage, readKey: string): Pr
   }
 }
 
-// ─── migrate / rollback(FX-6 合入后实现)───────────────────────────────────────
-// 照 kernel-dualtrack-contract §4.3 checkpointed rollback 仪式:
-// 1. 先快照 ckpt:raw read 单 blob(v10)→ 写 ${BASE}:${userId}:ckpt-v10(带 timestamp)。
-// 2. 放行 v10→v11:写 ${BASE}:${userId}:document / :session key,bump version。
-// 3. 失败/corrupt:从 ckpt-v10 恢复单 blob,删三域 key,回退 version。
-// 4. 恢复(legacy→new up-migrate):v10 单 blob → v11 三域重算(ckpt 仅极端 forensic)。
-//
-// 硬约束(§4.5):v11 new-only 字段须可从 legacy 重建。S4 persist blob 只拆形状,不加 new-only
-// 字段(revision 是 DocKernel 内存概念,不持久化进 blob)→ 满足可重建性。
-// #164 表征 seed 适配:优先"让 migrate v10→v11 透明跑"(seed 保持 v10 单 blob,断言迁移后语义);
-// 只有该路不通才改 seed 到 v11 形状 + PR 说明。
+// ─── migrate / rollback(实装,照 kernel-dualtrack-contract §4.3 checkpointed rollback 仪式)──
+// key 拼法(lead 裁决 + FX-6 namespacedKey):baseKey=namespacedKey(baseName)(anon→raw name,
+// auth→${baseName}:${userId});document/session/ckpt 后缀接在 baseKey 上。
+// 仪式:1. 读 v10 单 blob;2. 快照 ckpt-v10(BEFORE 写 domain key);3. 拆写 document/session;
+// 4. 失败→rollbackFromV11(从 ckpt 恢复 + 删 domain key)。
+// 硬约束(§4.5):S4 只拆形状不加 new-only 字段(revision 是 DocKernel 内存概念,不入 blob)→ 可重建。
+// #164 表征 seed 适配:优先"migrate v10→v11 透明跑"(seed 保持 v10 单 blob,断言迁移后语义)。
+import { namespacedKey } from '../lib/persistUserId'
 
-// TODO(FX-6): 实参形状待 FX-6 key 结构落地后定(storage + ${BASE}:${userId} + ckpt 仪式)。
-export const migrateV10ToV11 = async (): Promise<void> => {
-  throw new Error(
-    'migrateV10ToV11: FX-6 合入后实现。key 结构 ${BASE}:${userId}:document/session(以含 FX-6 的 main 为准);ckpt ${BASE}:${userId}:ckpt-v10;仪式照 kernel-dualtrack-contract §4.3。',
-  )
+type MigrationStorage = Pick<import('zustand/middleware').StateStorage, 'getItem' | 'setItem' | 'removeItem'>
+
+export type MigrationResult = {
+  ok: boolean
+  baseKey: string
+  ckptKey: string
+  documentKey: string
+  sessionKey: string
+  skipped?: boolean // true = no v10 blob (fresh / already migrated)
+  error?: string
 }
 
-// TODO(FX-6): 从 ckpt-v10 恢复单 blob(rollback 仪式第 3 步)。
-export const rollbackFromV11 = async (): Promise<void> => {
-  throw new Error('rollbackFromV11: FX-6 合入后实现(从 ${BASE}:${userId}:ckpt-v10 恢复单 blob,删三域 key)。')
+/**
+ * migrateV10ToV11:v10 单 blob → v11 document+session 两域(ckpt 仪式照 §4.3)。
+ * 读 baseKey(namespacedKey)的 v10 单 blob → 快照 ckpt-v10 → 拆写 document/session key。
+ * 失败自动 rollback(从 ckpt 恢复 + 删 domain key)。不删 v10 单 blob(rollback 兜底;S5/S6 稳态后清)。
+ */
+export const migrateV10ToV11 = async (
+  storage: MigrationStorage,
+  baseName = 'mivo-canvas-demo',
+): Promise<MigrationResult> => {
+  const baseKey = namespacedKey(baseName)
+  const ckptKey = `${baseKey}:ckpt-v10`
+  const documentKey = `${baseKey}:document`
+  const sessionKey = `${baseKey}:session`
+
+  // 1. 读 v10 单 blob。
+  const raw = await storage.getItem(baseKey)
+  if (raw == null || (typeof raw === 'string' && (raw as string).length === 0)) {
+    return { ok: true, baseKey, ckptKey, documentKey, sessionKey, skipped: true }
+  }
+  const rawStr = raw as string
+  const parsed = JSON.parse(rawStr) as { state?: PersistedV10Blob; version?: number }
+  const blob = parsed.state ?? (parsed as unknown as PersistedV10Blob)
+
+  // 2. 快照 ckpt-v10(BEFORE 写 domain key——§4.3 仪式)。
+  await storage.setItem(ckptKey, rawStr)
+
+  // 3. 拆写 document/session(v11 envelope {state, version:11})。
+  try {
+    const { document, session } = projectToThreeDomain(blob)
+    await storage.setItem(documentKey, JSON.stringify({ state: document, version: 11 }))
+    await storage.setItem(sessionKey, JSON.stringify({ state: session, version: 11 }))
+    return { ok: true, baseKey, ckptKey, documentKey, sessionKey }
+  } catch (error) {
+    // 4. 失败:rollback(从 ckpt 恢复 + 删 domain key)。
+    await rollbackFromV11(storage, baseName)
+    return {
+      ok: false, baseKey, ckptKey, documentKey, sessionKey,
+      error: error instanceof Error ? error.message : String(error),
+    }
+  }
+}
+
+/**
+ * rollbackFromV11:从 ckpt-v10 恢复 v10 单 blob + 删 document/session key(§4.3 第 3 步)。
+ * ckpt 保留(极端 forensic;稳态后 S5/S6 清)。
+ */
+export const rollbackFromV11 = async (
+  storage: MigrationStorage,
+  baseName = 'mivo-canvas-demo',
+): Promise<void> => {
+  const baseKey = namespacedKey(baseName)
+  const ckptKey = `${baseKey}:ckpt-v10`
+  const documentKey = `${baseKey}:document`
+  const sessionKey = `${baseKey}:session`
+
+  // 恢复 v10 单 blob 从 ckpt。
+  const ckptRaw = await storage.getItem(ckptKey)
+  if (ckptRaw != null) {
+    await storage.setItem(baseKey, ckptRaw as string)
+  }
+  // 删 domain key(清失败的 split)。
+  await storage.removeItem(documentKey)
+  await storage.removeItem(sessionKey)
+  // ckpt 保留(forensic)。
 }

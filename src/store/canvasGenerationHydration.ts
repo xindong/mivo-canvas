@@ -24,7 +24,11 @@ const warnCanvas = (message: string) => debugLogger.warn('Canvas Store', message
 // inside merge) so the merge always re-runs migration at the current version
 // rather than a stale hardcoded number — otherwise every hydration would re-run
 // the v9 branches (duplicate warns / duplicate orphan cleanup).
-export const CANVAS_PERSIST_VERSION = 10
+// v11 (T1.2 S4):marks the persist split major(canonical blob → document/session
+// domain keys via src/kernel/persistMigration.ts migrateV10ToV11 ceremony,照
+// kernel-dualtrack-contract §4.3)。对 zustand migrate 是 no-op shape-wise(v<10
+// 分支不变,v10→v11 单 blob 形状保留);split 仪式由 S5/S6 在 ?kernel=new 下调用。
+export const CANVAS_PERSIST_VERSION = 11
 
 // Persisted-state shape (subset of CanvasState that survives compactCanvasesForPersist).
 type PersistedCanvasState = Partial<
