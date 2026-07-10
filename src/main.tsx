@@ -6,6 +6,7 @@ import { DebugReportsPage } from './app/DebugReportsPage.tsx'
 import { useCanvasStore } from './store/canvasStore'
 import { useChatStore } from './store/chatStore'
 import { useAuthStore } from './store/authSlice'
+import { installRollbackTrigger } from './kernel/rollbackTrigger'
 
 declare global {
   interface Window {
@@ -29,6 +30,11 @@ const rootElement = debugReportsRequested ? <DebugReportsPage /> : <App />
 if (window.__MIVO_E2E_ENABLED__ === true) {
   window.__MIVO_E2E__ = { useCanvasStore, useChatStore }
 }
+
+// T1.2 S6c:rollbackFromV11 诊断口子(仅 DEV——installRollbackTrigger 内 import.meta.env.DEV
+// 正向门控,生产 if(false) tree-shake,零 window 写)。console 用:
+// window.__MIVO_KERNEL_ROLLBACK__.run({ confirm: true })
+installRollbackTrigger()
 
 // SSO 网关方案:启动水合登录态(GET /api/auth/me,网关提供 / dev 桩)。
 // 不阻塞渲染 —— 用户 chip 在 status='unknown' 时显示占位,水合完成后更新。
