@@ -141,8 +141,9 @@ jobs:
     # 限制:该场景是 DOM 结构契约,见下方 skip 清单步骤,非静默)。
     # T0.7 已落地:e2e-runner 支持 --kernel=new|legacy|both(透传为页面 ?kernel=)。
     # 本 job 仍跑默认 legacy(--renderer=both);kernel=new 由独立 e2e-kernel-gate job
-    # (非阻断)覆盖,两 job 合起来覆盖 (renderer × kernel) 笛卡尔积(contract §7)。
-    # kernel=new 路径接活后(T1.2-S6),lead 把 e2e-kernel-gate 翻 required 即堵死 new 回归。
+    # (required)覆盖,两 job 合起来覆盖 (renderer × kernel) 笛卡尔积(contract §7)。
+    # T1.2 S1-S6d 已合入 main,kernel=new 路径已接活;e2e-kernel-gate 自 2026-07-10
+    # 起翻 required,堵死 kernel=new 回归混进 main。
     name: e2e prod subset (mock upstream)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -208,13 +209,13 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  # 迁移 gate:T0.7 —— kernel gate job(非阻断观察窗)。跑 prod subset 在 --kernel=new
-  # 下(× --renderer=both → dom+new / leafer+new)。与 e2e-prod-subset(默认 legacy +
+  # 迁移 gate:T0.7 —— kernel gate job。跑 prod subset 在 --kernel=new 下
+  # (× --renderer=both → dom+new / leafer+new)。与 e2e-prod-subset(默认 legacy +
   # --renderer=both)互补,两 job 合起来覆盖 (renderer × kernel) 笛卡尔积(contract §7)。
-  # 非阻断(continue-on-error):lead 在观察窗稳定绿后翻 required;本 job 不入分支保护
-  # required checks(kernel=new 路径尚未接活,目前等价 legacy,预期绿)。
+  # 观察窗已结束(自 #186 起多 PR 全绿),2026-07-10 翻 required,T1.2 S1-S6d 已合入 main。
+  # 失败即阻断(job 正常红);lead 把本 check 加进 main 分支保护 required checks。
   e2e-kernel-gate:
-    name: e2e kernel gate (new, non-blocking)
+    name: e2e kernel gate (new)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -243,11 +244,8 @@ jobs:
       - name: Build production bundle
         run: npm run build
 
-      # continue-on-error:kernel gate 失败不阻断本 job(对齐 bench job 的非阻断模式)。
-      # outcome 记 'failure' 供下方 warn/summary/upload step 判断,job 仍绿。
+      # 阻断:kernel gate 失败即令本 step 红 → job 红 → 挡 PR 合并(required check)。
       - name: Run prod subset e2e (kernel=new)
-        id: kernel-gate
-        continue-on-error: true
         run: |
           set -o pipefail
           mkdir -p test-artifacts
@@ -257,23 +255,18 @@ jobs:
         if: always()
         run: |
           {
-            echo '## e2e kernel gate (--kernel=new, non-blocking)'
+            echo '## e2e kernel gate (--kernel=new, required)'
             echo ''
-            echo '观察窗:prod subset 在 kernel=new 下(dom+leafer)跑通即绿。本 job 非阻断,'
-            echo 'lead 在观察窗稳定绿后翻 required。与 e2e-prod-subset(legacy)互补覆盖 (renderer×kernel) 笛卡尔积。'
+            echo '阻断:prod subset 在 kernel=new 下(dom+leafer)跑通即绿,失败即挡 PR 合并。'
+            echo '观察窗已于 2026-07-10 结束并翻 required(T1.2 S1-S6d 已合入 main)。与 e2e-prod-subset(legacy)互补覆盖 (renderer×kernel) 笛卡尔积。'
             echo ''
             echo '```'
             tail -n 20 test-artifacts/e2e-kernel-gate.log 2>/dev/null || echo '(无日志:可能在 setup 阶段异常,见上方 step 日志)'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Warn on kernel-gate failure (non-blocking)
-        if: always() && steps.kernel-gate.outcome == 'failure'
-        run: |
-          echo "::warning::e2e kernel gate (--kernel=new) 失败或异常(非阻断,仅报告,不挡合并)。详见 job summary 与上方 e2e step 日志;沿革见 T0.7。"
-
       - name: Upload failing e2e artifacts
-        if: always() && steps.kernel-gate.outcome == 'failure'
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: e2e-kernel-gate-artifacts
