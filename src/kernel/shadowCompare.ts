@@ -160,10 +160,19 @@ export const compareDocuments = (expected: CanvasDocument, actual: CanvasDocumen
 /**
  * ShadowScheduler:去抖比对器(纯函数 factory,不依赖 React——可 fake-timer 单测)。
  * schedule(expected, actual, sceneId):连续调用只在 settle(debounceMs 无新调用)后比对一次;
+ *   调用方已 project 好 actual——只省 compare 不省 round-trip,保留供既有调用方/单测。
+ * scheduleProjected(expected, project, sceneId)(S6d):整个 round-trip(project+compare)延后到
+ *   settle 后跑一次。hook 用本方法——project 闭包在 timeout 内才调,N 次连续 schedule 只跑一次
+ *   round-trip,避免 ?kernel=new 下 20k 连续编辑在 render 期同步跑 hydrate+project 卡交互(P2)。
  * cancel():清未触发的比对(effect cleanup 用)。比对调 compareDocuments,不一致 → onDiff(finding, sceneId)。
  */
 export type ShadowScheduler = {
   schedule: (expected: CanvasDocument, actual: CanvasDocument, sceneId: string) => void
+  scheduleProjected: (
+    expected: CanvasDocument,
+    project: (doc: CanvasDocument) => CanvasDocument,
+    sceneId: string,
+  ) => void
   cancel: () => void
 }
 
@@ -172,14 +181,31 @@ export const createShadowScheduler = (
   debounceMs: number = SHADOW_DEBOUNCE_MS,
 ): ShadowScheduler => {
   let handle: ReturnType<typeof setTimeout> | undefined
+  // arm:去抖 arm——连续调用 reset timer,settle(debounceMs 无新调用)后跑一次 run。
+  const arm = (run: () => void) => {
+    if (handle !== undefined) clearTimeout(handle)
+    handle = setTimeout(() => {
+      handle = undefined
+      run()
+    }, debounceMs)
+  }
   return {
+    // 调用方已 project 好 actual——arm 只去抖 compareDocuments。注意:此路径不省 project
+    // round-trip;hook 路径(需省 round-trip)用 scheduleProjected。
     schedule(expected, actual, sceneId) {
-      if (handle !== undefined) clearTimeout(handle)
-      handle = setTimeout(() => {
-        handle = undefined
+      arm(() => {
         const finding = compareDocuments(expected, actual)
         if (finding) onDiff(finding, sceneId)
-      }, debounceMs)
+      })
+    },
+    // S6d:整个 round-trip(project+compare)延后到 settle 后。project 闭包在 timeout 内才调,
+    // N 次连续 schedule 只跑一次 round-trip(P2 修复:render 期不再同步跑 hydrate+project)。
+    scheduleProjected(expected, project, sceneId) {
+      arm(() => {
+        const actual = project(expected)
+        const finding = compareDocuments(expected, actual)
+        if (finding) onDiff(finding, sceneId)
+      })
     },
     cancel() {
       if (handle !== undefined) {
