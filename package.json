@@ -16,7 +16,7 @@
     "verify:logging": "node scripts/verify-debug-logging.mjs",
     "test:e2e": "npm run test:e2e:dev",
     "test:e2e:dev": "node scripts/e2e-runner.mjs --topology=dev",
-    "test:e2e:prod:subset": "node scripts/e2e-runner.mjs --topology=prod --scenario=debug,canvas-interactions,chat-generation,mask,variations-annotation",
+    "test:e2e:prod:subset": "node scripts/e2e-runner.mjs --topology=prod --scenario=debug,canvas-interactions,chat-generation,mask,mask-reflow,variations-annotation",
     "test:e2e:gated:unauthorized": "node scripts/e2e-gated-check.mjs --mode=unauthorized",
     "test:e2e:gated:authorized": "node scripts/e2e-gated-check.mjs --mode=authorized",
     "test:e2e:prod:full": "node scripts/e2e-runner.mjs --topology=prod",
