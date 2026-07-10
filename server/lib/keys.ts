@@ -9,11 +9,22 @@
 //   X-Gateway-Key   — sk- gateway key. WIRED: drives llm-proxy calls (enhance /
 //                     describe-region / compose-mask-edit via resolveGatewayKey).
 //                     Falls back to env MIVO_LLM_API_KEY when absent.
+import { createHash } from 'node:crypto'
 import type { Context } from 'hono'
 import { getEnvConfig, type PlatformCtx } from './config'
 
 export const MIVO_API_KEY_HEADER = 'x-mivo-api-key'
 export const GATEWAY_KEY_HEADER = 'x-gateway-key'
+
+// Per-user fingerprint of a mivo_ platform key. sha256 first 16 hex chars — enough
+// collision resistance for per-key sharding without ever surfacing the raw key in
+// memory snapshots or logs. Two distinct mivo_ keys map to two distinct
+// fingerprints. SHARED by the platform session-token bucket (server/platform/
+// state.ts) and the task-registry owner scope (server/tasks/registry.ts) so a
+// user's platform session and their tasks partition identically: a user's tasks
+// are only visible to requests carrying the same mivo_ key.
+export const fingerprintOfPlatformKey = (platformKey: string): string =>
+  createHash('sha256').update(platformKey).digest('hex').slice(0, 16)
 
 /**
  * Resolve a per-request platform ctx for a Hono route handler. Prefer the
