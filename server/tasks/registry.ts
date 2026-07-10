@@ -11,6 +11,12 @@
 // an unknown taskId returns 404 {error:'unknown-task'} — clients must NOT commit
 // results for tasks they can no longer see (per §7 C1).
 //
+// Owner scope (FX-2): the registry is partitioned per user by a fingerprint of the
+// caller's mivo_ platform key (see server/lib/keys.ts). A task is only visible to
+// requests carrying the same fingerprint — a cross-user GET/DELETE returns the
+// same 404 'unknown-task' as a swept/restarted task, so existence is not leaked.
+// Idempotency keys are scoped per owner too (no cross-user collision).
+//
 // TTL semantics (V02): terminal tasks (done/partial/failed/canceled) are stamped
 // with `terminalAt` and evicted by a module-level sweeper once they are older
 // than TERMINAL_TTL_MS (10 min); their idempotencyIndex entries are dropped in
@@ -19,6 +25,7 @@
 // SWEEP_INTERVAL_MS (60s) and is .unref()'d so it never blocks process exit.
 
 import { randomUUID } from 'node:crypto'
+import { fingerprintOfPlatformKey } from '../lib/keys'
 
 export type TaskStatus = 'pending' | 'running' | 'done' | 'partial' | 'failed' | 'canceled'
 // P2-C2: 'variations' is a batch of N parallel edits sharing one source image;
@@ -31,6 +38,10 @@ export type TaskResult = { images: TaskResultImage[] }
 
 export type TaskRecord = {
   id: string
+  // FX-2: per-user owner fingerprint (sha256 of the caller's mivo_ key). A task is
+  // only visible to requests with the same fingerprint (getTaskForOwner); a
+  // cross-user GET/DELETE returns 404 'unknown-task' (no existence leak).
+  ownerFp: string
   kind: TaskKind
   status: TaskStatus
   progress: number // 0-100, monotonic (never decreases)
@@ -74,6 +85,11 @@ export type TaskView = {
 const tasks = new Map<string, TaskRecord>()
 const idempotencyIndex = new Map<string, string>()
 
+// Composite idempotency index key: scoped per owner so user B reusing user A's
+// Idempotency-Key does NOT resolve to A's task (cross-user collision → wrong
+// taskId / billing leak). Paired with the sweeper's symmetric drop below.
+const idemIndexKey = (ownerFp: string, idempotencyKey: string): string => `${ownerFp}:${idempotencyKey}`
+
 const isTerminal = (s: TaskStatus): boolean => s === 'done' || s === 'partial' || s === 'failed' || s === 'canceled'
 
 // V02: terminal-task TTL + sweeper. Terminal records hold result.images base64
@@ -94,8 +110,8 @@ export const __sweepTerminalTasks = (): void => {
     tasks.delete(id)
     // Defensive: only drop the index entry if it still points at this task
     // (symmetric with createTask's "index entry without a record" lazy-cleanup).
-    if (record.idempotencyKey && idempotencyIndex.get(record.idempotencyKey) === id) {
-      idempotencyIndex.delete(record.idempotencyKey)
+    if (record.idempotencyKey && idempotencyIndex.get(idemIndexKey(record.ownerFp, record.idempotencyKey)) === id) {
+      idempotencyIndex.delete(idemIndexKey(record.ownerFp, record.idempotencyKey))
     }
   }
 }
@@ -126,25 +142,36 @@ export type CreateTaskResult = { record: TaskRecord; created: boolean }
 // has no entry → a repeat submission creates a new task (created=true).
 // P2-C2: `meta` carries variations-only fields (batchId, count) that the runner
 // and toView surface to the client. Other kinds ignore it.
+// FX-2: `ownerKey` is the resolved mivo_ platform key for the caller (header
+// X-Mivo-Api-Key, or the env fallback when absent — resolved by the route via
+// resolvePlatformCtx). It is fingerprinted (sha256, first 16 hex — see
+// server/lib/keys.ts) so the raw key never lands in the registry, memory
+// snapshots, or logs. Cross-user access GETs the same 404 'unknown-task' as a
+// swept/restarted task (getTaskForOwner) — existence is not leaked. Idempotency
+// is scoped per owner: two users reusing the same Idempotency-Key create two
+// distinct tasks (no cross-user collision).
 export const createTask = (
   kind: TaskKind,
   model: string,
   requestId: string,
+  ownerKey: string,
   idempotencyKey?: string,
   meta?: { batchId?: string; count?: number },
 ): CreateTaskResult => {
+  const ownerFp = fingerprintOfPlatformKey(ownerKey)
   if (idempotencyKey) {
-    const existingId = idempotencyIndex.get(idempotencyKey)
+    const existingId = idempotencyIndex.get(idemIndexKey(ownerFp, idempotencyKey))
     if (existingId) {
       const existing = tasks.get(existingId)
       if (existing) return { record: existing, created: false }
       // Index entry without a record (shouldn't happen in-process); fall through to create.
-      idempotencyIndex.delete(idempotencyKey)
+      idempotencyIndex.delete(idemIndexKey(ownerFp, idempotencyKey))
     }
   }
   const id = newTaskId()
   const record: TaskRecord = {
     id,
+    ownerFp,
     kind,
     status: 'pending',
     progress: 0,
@@ -158,12 +185,24 @@ export const createTask = (
   if (meta?.batchId) record.batchId = meta.batchId
   if (meta?.count !== undefined) record.count = meta.count
   tasks.set(id, record)
-  if (idempotencyKey) idempotencyIndex.set(idempotencyKey, id)
+  if (idempotencyKey) idempotencyIndex.set(idemIndexKey(ownerFp, idempotencyKey), id)
   ensureSweeper()
   return { record, created: true }
 }
 
 export const getTask = (id: string): TaskRecord | undefined => tasks.get(id)
+
+// FX-2: owner-scoped read for the route boundary (GET/DELETE /tasks/:id). Returns
+// undefined when the task does not exist OR is owned by a different user — the
+// route maps both to the same 404 'unknown-task', so a cross-user probe cannot
+// tell "exists, not yours" from "never existed". The runner uses the unscoped
+// getTask() above (server-internal, already past the auth boundary).
+export const getTaskForOwner = (id: string, ownerKey: string): TaskRecord | undefined => {
+  const r = tasks.get(id)
+  if (!r) return undefined
+  if (r.ownerFp !== fingerprintOfPlatformKey(ownerKey)) return undefined
+  return r
+}
 
 // Cancel: set canceled + abort upstream. No-op if already terminal. Cancel wins
 // over a concurrent complete/fail (those check 'canceled' before committing).

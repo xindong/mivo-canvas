@@ -10,9 +10,9 @@
 //
 // Module-level Map state (single-instance) preserves single-flight semantics within
 // a key; P4 horizontal scaling needs a shared store.
-import { createHash } from 'node:crypto'
 import type { PlatformCtx } from '../lib/config'
 import { fetchUpstreamWithTimeout } from '../lib/upstream'
+import { fingerprintOfPlatformKey } from '../lib/keys'
 
 // V05: per-request timeout for every platform-channel fetch. Without this, a
 // single hung request (token/submit/poll/signUrl/upload) blocks its caller
@@ -38,8 +38,10 @@ const buckets = new Map<string, PlatformBucket>()
 // without ever surfacing the raw key in memory snapshots / logs. Two distinct
 // mivo_ keys map to two distinct fingerprints, so their session tokens never
 // share a bucket.
-export const fingerprintOf = (ctx: PlatformCtx): string =>
-  createHash('sha256').update(ctx.platformKey).digest('hex').slice(0, 16)
+// Delegate to the shared per-key fingerprint (server/lib/keys.ts) so the platform
+// session-token bucket and the task-registry owner scope use ONE strategy — a
+// user's platform session and their tasks partition identically.
+export const fingerprintOf = (ctx: PlatformCtx): string => fingerprintOfPlatformKey(ctx.platformKey)
 
 const MAX_BUCKETS = 256
 

@@ -15,7 +15,7 @@
 import { Hono } from 'hono'
 import type { HttpBindings } from '@hono/node-server'
 import { defaultMivoImageModel } from '../lib/config'
-import { rejectInvalidMivoApiKey } from '../lib/keys'
+import { rejectInvalidMivoApiKey, resolvePlatformCtx } from '../lib/keys'
 import { generateAreaMaskPng, type MaskSize, type NormalizedMaskBounds } from '../lib/maskPng'
 import {
   firstMultipartField,
@@ -26,7 +26,7 @@ import {
   readJsonBody,
 } from '../lib/request'
 import { RequestBodyTooLargeError } from '../lib/upstream'
-import { cancelTask, createTask, failTask, getTask, toView } from '../tasks/registry'
+import { cancelTask, createTask, failTask, getTaskForOwner, toView } from '../tasks/registry'
 import { runEditTask, runGenerateTask, runVariationsTask, type VariationParam } from '../tasks/runner'
 
 export const tasksRoute = new Hono<{ Bindings: HttpBindings }>()
@@ -64,7 +64,12 @@ tasksRoute.post('/generate', async (c) => {
   const model = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : defaultMivoImageModel
   const idempotencyKey = c.req.header('idempotency-key') || undefined
   const platformKey = c.req.header('x-mivo-api-key')?.trim() || undefined
-  const { record, created } = createTask('generate', model, requestId, idempotencyKey)
+  // FX-2: owner fingerprint from the resolved mivo_ key (header || env) — the
+  // task is only visible to later GET/DELETE carrying the same key.
+  // resolvePlatformCtx mirrors the runner's platformCtxFromKey so the create-scope
+  // and read-scope agree on the owner.
+  const ownerKey = resolvePlatformCtx(c).platformKey
+  const { record, created } = createTask('generate', model, requestId, ownerKey, idempotencyKey)
   // P1 fix (rev-behavior): only launch the runner on first creation. A repeat
   // submission with the same Idempotency-Key returns the existing task
   // (created=false) — re-running would duplicate upstream calls (billing) + race
@@ -158,7 +163,8 @@ tasksRoute.post('/edit', async (c) => {
   }
 
   const platformKey = c.req.header('x-mivo-api-key')?.trim() || undefined
-  const { record, created } = createTask('edit', modelField, requestId, idempotencyKey)
+  const ownerKey = resolvePlatformCtx(c).platformKey
+  const { record, created } = createTask('edit', modelField, requestId, ownerKey, idempotencyKey)
   // P1 fix: only launch the runner on first creation (see /generate).
   if (created) {
     void runEditTask(record.id, {
@@ -233,7 +239,8 @@ tasksRoute.post('/variations', async (c) => {
   // batchId groups this batch's N edits for client-side display (variant grid).
   // Not the taskId — the taskId is the registry id returned to the client.
   const batchId = `batch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
-  const { record, created } = createTask('variations', modelField, requestId, idempotencyKey, { batchId, count: variations.length })
+  const ownerKey = resolvePlatformCtx(c).platformKey
+  const { record, created } = createTask('variations', modelField, requestId, ownerKey, idempotencyKey, { batchId, count: variations.length })
   // P1 fix: only launch the runner on first creation (see /generate). On a repeat
   // submission the existing batchId/count are returned from the record, so the
   // client still sees the original batch grouping.
@@ -247,15 +254,25 @@ tasksRoute.post('/variations', async (c) => {
 })
 
 tasksRoute.get('/:id', (c) => {
+  // FX-2: reject malformed X-Mivo-Api-Key at the boundary (no env fallback), then
+  // owner-scope the read — a cross-user GET returns the same 404 'unknown-task'
+  // as a swept/unknown task (no existence leak).
+  const badMivoKey = rejectInvalidMivoApiKey(c)
+  if (badMivoKey) return badMivoKey
   const id = c.req.param('id')
-  const record = getTask(id)
+  const ownerKey = resolvePlatformCtx(c).platformKey
+  const record = getTaskForOwner(id, ownerKey)
   if (!record) return c.json({ error: 'unknown-task' }, 404)
   return c.json(toView(record), 200)
 })
 
 tasksRoute.delete('/:id', (c) => {
+  // FX-2: same owner-scope as GET — a cross-user DELETE returns 404 (no leak).
+  const badMivoKey = rejectInvalidMivoApiKey(c)
+  if (badMivoKey) return badMivoKey
   const id = c.req.param('id')
-  const record = getTask(id)
+  const ownerKey = resolvePlatformCtx(c).platformKey
+  const record = getTaskForOwner(id, ownerKey)
   if (!record) return c.json({ error: 'unknown-task' }, 404)
   cancelTask(id)
   return c.json({ id, status: 'canceled' }, 200)
