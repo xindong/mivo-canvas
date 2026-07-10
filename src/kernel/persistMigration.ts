@@ -148,6 +148,12 @@ export const migrateV10ToV11 = async (
   const documentKey = `${baseKey}:document`
   const sessionKey = `${baseKey}:session`
 
+  // 0. 幂等(Lead ① S6b-2):document key 已存在 → 已迁移,跳过(防重复迁移覆盖)。
+  //    S6 wiring 每次启动调 migrateV10ToV11;document 已存在意味着上次迁移已落盘,不重写。
+  const existingDoc = await storage.getItem(documentKey)
+  if (existingDoc != null) {
+    return { ok: true, baseKey, ckptKey, documentKey, sessionKey, skipped: true }
+  }
   // 1. 读 v10 单 blob。
   const raw = await storage.getItem(baseKey)
   if (raw == null || (typeof raw === 'string' && (raw as string).length === 0)) {
