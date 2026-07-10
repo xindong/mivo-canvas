@@ -8,7 +8,7 @@
 // app 无 auth gate。/api/auth/me 由网关提供(生产)或 dev 桩(本地,见 routes/auth.ts)。
 // per-user key(X-Mivo-Api-Key)注入在各 route 内(rejectInvalidMivoApiKey/resolvePlatformCtx),
 // 与 auth gate 无关,保留。
-import { Hono } from 'hono'
+import { Hono, type Context } from 'hono'
 import { serveStatic } from '@hono/node-server/serve-static'
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
@@ -22,6 +22,7 @@ import { composeMaskEditHandler } from './routes/composeMaskEdit'
 import { authRoute } from './routes/auth'
 import { debugLogsRoute } from './routes/debug-logs'
 import { createLocalAssetsRoutes } from './routes/local-assets'
+import { createAssetRoutes } from './routes/assets'
 import { createEagleRoutes } from './routes/eagle'
 import { createPinterestRoutes } from './routes/pinterest'
 import { createProxyImageRoutes } from './routes/proxy-image'
@@ -59,6 +60,24 @@ app.all('/api/mivo/describe-region', describeRegionHandler)
 app.all('/api/mivo/compose-mask-edit', composeMaskEditHandler)
 app.route('/api/mivo', debugLogsRoute)
 app.route('/api/mivo', createLocalAssetsRoutes({ enabled: featureFlags.localAssetsEnabled }))
+// T1.5: content-addressed asset store (POST /api/assets, GET /api/assets/:id).
+// P1.4: mounted ONLY when MIVO_ENABLE_ASSET_SERVICE=1 (default off). The asset
+// store writes user blobs to disk (root via MIVO_ASSET_STORE_DIR, default
+// ~/.mivo-canvas/assets — outside the repo), so it requires explicit opt-in even
+// on a local bind. Flag off → /api/assets 404 (both POST and GET; the explicit
+// 404 stubs below keep a GET to the API path from falling through to the SPA
+// fallback, which would otherwise serve index.html). Client gate ?assets=server
+// controls usage; this flag controls whether the BFF serves at all. Storage
+// backend is swappable for PG (T1.1); MIME allowlist (P1.3) + per-owner quota
+// (P1.4) + owner-scoped GET (P2.5) live in the route.
+if (featureFlags.assetServiceEnabled) {
+  app.route('/api', createAssetRoutes())
+} else {
+  // Flag off → 404 for the asset endpoints (no SPA index.html for an API path).
+  const assetDisabled = (c: Context<AppEnv>) => c.notFound()
+  app.all('/api/assets', assetDisabled)
+  app.all('/api/assets/*', assetDisabled)
+}
 app.route('/api/mivo', createEagleRoutes({ enabled: featureFlags.eagleProxyEnabled }))
 app.route('/api/mivo', createPinterestRoutes())
 // W3: CORS proxy for external images (readCanvasImageBlob fallback). SSRF-hardened.

@@ -1,6 +1,11 @@
 import type { ImageDimensions } from './imageSizing'
 import { debugLogger } from '../store/debugLogStore'
 import { ANONYMOUS_USER_ID, getPersistUserId } from './persistUserId'
+// Pure prefix + gate helpers (light module — no auth/settings-store chain). The
+// IO side (uploadAssetToServer / fetchServerAssetBlob, which import authHeaders)
+// is dynamically imported from ./assetService only when a server path is hit,
+// so importing assetStorage never pulls settingsSlice/persistIdbStorage.
+import { isAssetsServerMode, isServerAssetUrl, isServerUploadableImage, serverAssetId, serverAssetUrl } from './assetServiceMode'
 
 const DB_NAME = 'mivo-canvas-assets'
 const DB_VERSION = 1
@@ -110,8 +115,13 @@ const createAssetId = () => {
 
 export const importedAssetUrl = (assetId: string) => `${IMPORTED_ASSET_PREFIX}${assetId}`
 
+// A "mivo-asset:" url points into local IDB; a "mivo-sasset:" url points at the
+// server content-addressed store (T1.5). Both are imported-asset references that
+// the lease + useResolvedAssetUrl must resolve — so the predicate accepts both.
+// This keeps assetUrlLease.ts unchanged: it calls resolveAssetUrl, which routes
+// by prefix, and isLeaseable uses this predicate.
 export const isImportedAssetUrl = (assetUrl?: string) =>
-  Boolean(assetUrl?.startsWith(IMPORTED_ASSET_PREFIX))
+  Boolean(assetUrl && (assetUrl.startsWith(IMPORTED_ASSET_PREFIX) || isServerAssetUrl(assetUrl)))
 
 const importedAssetId = (assetUrl: string) => assetUrl.slice(IMPORTED_ASSET_PREFIX.length)
 
@@ -253,8 +263,33 @@ const prepareImportedImage = async (file: File): Promise<PreparedImportedImage> 
   }
 }
 
-export const saveImportedAsset = async (file: File) => {
-  const id = createAssetId()
+type AssetRef = {
+  assetUrl: string
+  name: string
+  type: string
+  sizeBytes: number
+  title: string
+  size: string
+  dimensions?: ImageDimensions
+  sourceDimensions?: ImageDimensions
+  hasTransparency?: boolean
+}
+
+const buildAssetRef = (assetUrl: string, file: File, prepared: PreparedImportedImage): AssetRef => ({
+  assetUrl,
+  name: file.name,
+  type: prepared.type,
+  sizeBytes: file.size,
+  title: file.name.replace(/\.[^.]+$/, ''),
+  size: prepared.sourceDimensions
+    ? `${prepared.sourceDimensions.width}x${prepared.sourceDimensions.height}`
+    : 'source',
+  dimensions: prepared.dimensions,
+  sourceDimensions: prepared.sourceDimensions,
+  hasTransparency: prepared.hasTransparency,
+})
+
+export const saveImportedAsset = async (file: File): Promise<AssetRef> => {
   const prepared = await prepareImportedImage(file).catch(() => ({
     blob: file,
     type: file.type || mimeFromFilename(file.name),
@@ -262,6 +297,22 @@ export const saveImportedAsset = async (file: File) => {
     sourceDimensions: undefined,
     hasTransparency: undefined,
   }))
+
+  // T1.5 server mode: POST ONLY server-uploadable static images to the server
+  // (png/jpeg/webp/gif/avif — the server's MIME allowlist). Non-image kinds
+  // (markdown / PDF / video) and svg (script-carrying, rejected by the server gate)
+  // stay on local IDB even in server mode — T1.5's scope is vetted static images,
+  // and only that subset is server-storable. assetUrl encodes where the bytes live
+  // (mivo-sasset:<id> for server, mivo-asset:<uuid> for IDB), so resolve/serialize
+  // route by prefix regardless of the current gate.
+  if (isAssetsServerMode() && isServerUploadableImage(prepared.type)) {
+    const { uploadAssetToServer } = await import('./assetService')
+    const uploaded = await uploadAssetToServer(prepared.blob, file.name, prepared.type)
+    return buildAssetRef(serverAssetUrl(uploaded.assetId), file, prepared)
+  }
+
+  // Local IDB path (default, gate off — zero behavior change vs pre-T1.5).
+  const id = createAssetId()
   const asset: StoredAsset = {
     id,
     name: file.name,
@@ -270,22 +321,8 @@ export const saveImportedAsset = async (file: File) => {
     createdAt: Date.now(),
     userId: getPersistUserId(),
   }
-
   await withAssetStore('readwrite', (store) => store.put(asset))
-
-  return {
-    assetUrl: importedAssetUrl(id),
-    name: file.name,
-    type: prepared.type,
-    sizeBytes: file.size,
-    title: file.name.replace(/\.[^.]+$/, ''),
-    size: prepared.sourceDimensions
-      ? `${prepared.sourceDimensions.width}x${prepared.sourceDimensions.height}`
-      : 'source',
-    dimensions: prepared.dimensions,
-    sourceDimensions: prepared.sourceDimensions,
-    hasTransparency: prepared.hasTransparency,
-  }
+  return buildAssetRef(importedAssetUrl(id), file, prepared)
 }
 
 export const saveGeneratedAsset = async (blob: Blob, name: string, type = blob.type || 'image/png') => {
@@ -296,6 +333,15 @@ export const saveGeneratedAsset = async (blob: Blob, name: string, type = blob.t
 
 export const resolveAssetUrl = async (assetUrl?: string) => {
   if (!assetUrl) return ''
+  // T1.5: a mivo-sasset: url resolves via GET /api/assets/:id → blob URL.
+  // Routing by PREFIX (not the current gate) means a node created in server mode
+  // keeps resolving via GET even after the user switches back to local — the
+  // assetUrl encodes where its bytes live.
+  if (isServerAssetUrl(assetUrl)) {
+    const { fetchServerAssetBlob } = await import('./assetService')
+    const fetched = await fetchServerAssetBlob(serverAssetId(assetUrl))
+    return fetched ? URL.createObjectURL(fetched.blob) : ''
+  }
   if (!isImportedAssetUrl(assetUrl)) return assetUrl
 
   const asset = await withAssetStore<StoredAsset | undefined>('readonly', (store) =>
@@ -306,7 +352,17 @@ export const resolveAssetUrl = async (assetUrl?: string) => {
 }
 
 export const readImportedAssetFile = async (assetUrl?: string): Promise<ImportedAssetFile | undefined> => {
-  if (!assetUrl || !isImportedAssetUrl(assetUrl)) return undefined
+  if (!assetUrl) return undefined
+  if (isServerAssetUrl(assetUrl)) {
+    // T1.5: server read path. name / createdAt are unknown on GET (the server
+    // returns bytes + mimeType only); callers fall back to node.assetOriginalName
+    // for the filename (assetDownload.ts filenameFor) — metrics only needs blob.
+    const { fetchServerAssetBlob } = await import('./assetService')
+    const fetched = await fetchServerAssetBlob(serverAssetId(assetUrl))
+    if (!fetched) return undefined
+    return { name: '', type: fetched.mimeType, blob: fetched.blob, createdAt: 0 }
+  }
+  if (!isImportedAssetUrl(assetUrl)) return undefined
 
   const asset = await withAssetStore<StoredAsset | undefined>('readonly', (store) =>
     store.get(importedAssetId(assetUrl)),
@@ -324,6 +380,42 @@ export const readImportedAssetFile = async (assetUrl?: string): Promise<Imported
 
 export const serializeImportedAsset = async (assetUrl?: string): Promise<SerializedCanvasAsset | undefined> => {
   if (!assetUrl || !isImportedAssetUrl(assetUrl)) return undefined
+  // T1.5: server asset → fetch bytes + embed dataUrl so the archive stays
+  // self-contained (same shape as the IDB path; only the bytes source differs).
+  // A fetch failure (server down / asset purged) → omit from archive + warn,
+  // rather than embedding a broken entry.
+  if (isServerAssetUrl(assetUrl)) {
+    // T1.5: server asset → fetch bytes + embed dataUrl so the archive stays
+    // self-contained (same shape as the IDB path; only the bytes source differs).
+    // P2.7: any fetch / blob failure (server down / asset purged / network error /
+    // AbortError) → omit from archive + warn, never throw — archive serialization
+    // is best-effort and must not abort the whole export on one unavailable asset.
+    try {
+      const { fetchServerAssetBlob } = await import('./assetService')
+      const fetched = await fetchServerAssetBlob(serverAssetId(assetUrl))
+      if (!fetched) {
+        debugLogger.warn(
+          SOURCE,
+          `serialize: server asset ${serverAssetId(assetUrl).slice(0, 12)}… unavailable, omitted from archive`,
+        )
+        return undefined
+      }
+      return {
+        assetUrl,
+        name: '',
+        type: fetched.mimeType,
+        dataUrl: await blobToDataUrl(fetched.blob),
+        createdAt: 0,
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error)
+      debugLogger.warn(
+        SOURCE,
+        `serialize: server asset ${serverAssetId(assetUrl).slice(0, 12)}… failed: ${msg}, omitted from archive`,
+      )
+      return undefined
+    }
+  }
 
   const asset = await withAssetStore<StoredAsset | undefined>('readonly', (store) =>
     store.get(importedAssetId(assetUrl)),
@@ -341,7 +433,28 @@ export const serializeImportedAsset = async (assetUrl?: string): Promise<Seriali
 }
 
 export const restoreSerializedAsset = async (asset: SerializedCanvasAsset) => {
-  if (!isImportedAssetUrl(asset.assetUrl) || !asset.dataUrl.startsWith('data:')) return
+  if (!asset || !isImportedAssetUrl(asset.assetUrl)) return
+  // T1.5: server asset → re-POST the embedded bytes. Content-addressed dedup
+  // means the server returns the SAME assetId (= content hash) — so the node's
+  // mivo-sasset:<assetId> ref stays valid on a target server that didn't have
+  // it yet. Bytes stay server-side; NEVER IDB-write (would shadow the server ref).
+  if (isServerAssetUrl(asset.assetUrl)) {
+    if (!asset.dataUrl.startsWith('data:')) return
+    const blob = await dataUrlToBlob(asset.dataUrl)
+    try {
+      const { uploadAssetToServer } = await import('./assetService')
+      await uploadAssetToServer(blob, asset.name || 'restored-asset', asset.type || blob.type)
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error)
+      debugLogger.warn(
+        SOURCE,
+        `restore server asset ${serverAssetId(asset.assetUrl).slice(0, 12)}… failed: ${msg}`,
+      )
+    }
+    return
+  }
+
+  if (!asset.dataUrl.startsWith('data:')) return
 
   const id = importedAssetId(asset.assetUrl)
   const blob = await dataUrlToBlob(asset.dataUrl)

@@ -63,6 +63,10 @@ export type MivoEnvConfig = {
   // >4 batches in groups of this size. Env-tunable so e2e can pin it to 1 to force
   // serial partial-failure ordering.
   variationsConcurrency: number
+  // P1.4: per-owner asset byte quota (sum of sizeBytes for assets first-uploaded by
+  // this owner). Over-quota uploads return 413 with code=quota_exceeded. Default is
+  // conservative (100 MB ≈ 20–100 images); env-tunable via MIVO_ASSET_OWNER_QUOTA_BYTES.
+  assetOwnerQuotaBytes: number
 }
 
 const num = (value: string | undefined, fallback: number): number => {
@@ -105,6 +109,8 @@ export const getEnvConfig = (): MivoEnvConfig => {
     imageRequestMaxBytes: num(process.env.MIVO_IMAGE_REQUEST_MAX_BYTES, imageRequestMaxBytes),
     // P2-C2: variations concurrency cap (default 4; e2e may lower to 1).
     variationsConcurrency: num(process.env.MIVO_VARIATIONS_CONCURRENCY, 4),
+    // P1.4: per-owner asset quota (default 100 MB — conservative; env-tunable).
+    assetOwnerQuotaBytes: num(process.env.MIVO_ASSET_OWNER_QUOTA_BYTES, 100 * 1024 * 1024),
   }
 }
 
