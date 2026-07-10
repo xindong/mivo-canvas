@@ -1,3 +1,6 @@
+// 本文件已移出 test:unit（required gate），由 test:bench / CI bench job 单独运行——
+// 毫秒级阈值在共享 runner 上 flake 会挡住与被测 PR 无关的合并队列，沿革见 issue #172。
+// 断言与阈值不动，仅配置归属调整。
 import { describe, expect, it, vi } from 'vitest'
 
 // PR-R2 §12.1 性能替代度量。本仓无 store-to-renderer-sync trace 采集手段

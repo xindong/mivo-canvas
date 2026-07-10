@@ -11,6 +11,9 @@
 #
 # nightly 全量 prod e2e 与真上游占位链路见独立 workflow:
 # .github/workflows/nightly-e2e.yml
+#
+# bench job（非阻断）见下方 `bench`：微基准 *.bench.test.ts 移出 required gate，
+# 单列 job 只报告不阻断合并——毫秒级阈值在共享 runner flake，沿革见 issue #172。
 
 name: CI
 
@@ -55,6 +58,57 @@ jobs:
 
       - name: Verify logging rules
         run: npm run verify:logging
+
+  # bench job（非阻断）—— issue #172 方向 1：微基准 *.bench.test.ts 移出 required gate
+  # （build-and-test 的 test:unit），单列非阻断 job 只报告不阻断。毫秒级阈值在共享 runner
+  # 上 flake 会挡住与被测 PR 无关的合并队列；性能回归监控与功能正确性闸门不同生死线。
+  # step continue-on-error=true + outcome 读取：无论成败都把 /tmp/pr-r2-bench-result.json
+  # 的关键数字写入 $GITHUB_STEP_SUMMARY，仅在失败时发 ::warning:: 注解（不阻断 PR 合并）。
+  bench:
+    name: bench (perf report, non-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node (LTS)
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # continue-on-error：bench 失败不阻断本 job（job 仍绿），只发 warning 注解 + summary。
+      - name: Run bench micro-tests
+        id: bench
+        continue-on-error: true
+        run: npm run test:bench
+
+      # 无论 bench 成败都汇总关键数字进 summary（diagnostics-first）。结果文件由测试在
+      # assert 前写 /tmp/pr-r2-bench-result.json（故即使断言失败也有数据）。两条降级路径
+      # 都不令 summary step 翻红（Greptile #173 P2）：文件不存在 → else 分支提示；文件存在
+      # 但字段缺失/损坏 → node -e try/catch + Number.isFinite 降级输出解析错误。
+      - name: Surface bench numbers in job summary
+        if: always()
+        run: |
+          {
+            echo '## bench 微基准报告 (leaferPaintSignature, non-blocking)'
+            echo ''
+            if [ -f /tmp/pr-r2-bench-result.json ]; then
+              node -e "try { const fs=require('fs'); const r=JSON.parse(fs.readFileSync('/tmp/pr-r2-bench-result.json','utf8')); if(!r||typeof r!=='object') throw new Error('结果非 JSON 对象'); const d=Number(r.dragOneP95Ms); const a=Number(r.allChangedP95Ms); if(!Number.isFinite(d)||!Number.isFinite(a)) throw new Error('dragOneP95Ms/allChangedP95Ms 缺失或非有限数'); const ratio=(a/Math.max(d,0.001)).toFixed(2); console.log('| metric | value |'); console.log('|--------|-------|'); console.log('| dragOneP95Ms | '+d.toFixed(3)+' ms |'); console.log('| allChangedP95Ms | '+a.toFixed(3)+' ms |'); console.log('| ratio (all/drag p95) | '+ratio+'x |'); } catch(e) { console.log('_(bench 结果文件存在但无法解析：'+((e&&e.message)||String(e))+'，见上方 bench step 日志)_'); }"
+              echo ''
+              echo '> 阈值契约: dragP95 < 8ms 且 dragP95 < allP95（见 leaferPaintSignature.bench.test.ts）；本 job 非阻断，仅报告。'
+            else
+              echo '_(bench 结果文件未生成：测试可能在 setup 阶段异常，见上方 bench step 日志)_'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Warn on bench breach (non-blocking)
+        if: always() && steps.bench.outcome == 'failure'
+        run: |
+          echo "::warning::微基准 leaferPaintSignature 超阈值或异常（非阻断，仅报告，不挡合并）。详见 job summary 与上方 bench step 日志；沿革见 issue #172。"
 
   structure-guard:
     name: structure guard (anti-regression)
