@@ -1,21 +1,30 @@
 // server/routes/projects.ts
-// T1.3 前置:/api/projects — 项目 CRUD(document 域)+ deleteProject 级联软删画布(DP-3)。
-// 权威:docs/decisions/api-surface.md §4.1。
-// 契约:additive(不属 dev middleware 平移面),同 tasks-async.md 定位;不进 __captures__ 基线,
-// 验收由 routes/projects.route.test.ts(内存 backend)覆盖。
+// T1.3 前置:/api/projects — 项目 CRUD(document 域)+ deleteProject 原子级联软删(返修 #2/#7)。
+// 权威:docs/decisions/api-surface.md §4.1(返修版)。
+// 契约:additive;验收由 routes/projects.route.test.ts(内存 backend)覆盖。
 //
-// 鉴权:resolveOwner(c)(FX-2 指纹;§13.5 目标 maker user id)+ rejectInvalidMivoApiKey(F4 边界)。
-// payload 透明:Project 信封 payload = {name};id/ownerId/timestamps/revision/isDeleted 在信封列。
-//
-// PG swap:backend 注入点(createPersistBackend → PgPersistBackend),路由 handler 零改动(§6)。
+// 返修要点:
+//  - #1 owner/resourceOwner:resolveActor + authz seam(canAccessProject);project id 全局唯一
+//    (跨 owner 同 id → 409 project-exists);未授权统一 404。
+//  - #2/#7 DELETE 改 softDeleteProjectTree(backend 单原子:project + 其 canvas meta + chat-collection)。
+//  - #4 If-Match 严格优先,existing 缺 base → 428;#5 wire 不带 revision。
+//  - #10 幂等 key 作用域 owner+method+resourceKind+key + fingerprint。
+//  - #11 request codec;#12 统一 413;#13 N/A(project payload={name},无镜像字段)。
 
 import { Hono } from 'hono'
 import { randomUUID } from 'node:crypto'
 import type { AppEnv } from '../lib/types'
 import { rejectInvalidMivoApiKey } from '../lib/keys'
-import { resolveOwner } from '../lib/owner'
-import { newRequestId, logRequest, readJsonBody } from '../lib/request'
-import { RequestBodyTooLargeError } from '../lib/upstream'
+import { resolveActor } from '../lib/owner'
+import { canAccessProject } from '../lib/authz'
+import { newRequestId, logRequest } from '../lib/request'
+import {
+  baseFromIfMatch,
+  bodyError,
+  decodeCreateProject,
+  preconditionRequired,
+  readJsonBodyWithFingerprint,
+} from '../lib/persistHttp'
 import type {
   ConflictBody,
   CreateProjectRequest,
@@ -28,12 +37,10 @@ import type { PersistBackend, PersistRecord } from '../persist/backend'
 /** Project 信封 payload(DP-5:name 是唯一域字段;其余在信封列)。 */
 type ProjectPayload = { name: string }
 
-/** Canvas 信封 payload(级联查询用:projectId 在 payload)。 */
-type CanvasPayload = { projectId: string; title?: string }
-
 const isProjectPayload = (p: unknown): p is ProjectPayload =>
   typeof p === 'object' && p !== null && typeof (p as { name?: unknown }).name === 'string'
 
+/** 返修 #11:response encoder(satisfies shared Project 类型,compile-time interlock)。 */
 const toProject = (r: PersistRecord): Project => ({
   id: r.id,
   name: isProjectPayload(r.payload) ? r.payload.name : '',
@@ -47,7 +54,14 @@ const toProject = (r: PersistRecord): Project => ({
 export const createProjectsRoutes = ({ backend }: { backend: PersistBackend }): Hono<AppEnv> => {
   const route = new Hono<AppEnv>()
 
-  // GET /api/projects — owner 全部未软删项目。
+  /** 返修 #1:授权 seam——project id 全局唯一,未授权/不存在统一 404(无泄漏)。 */
+  const authzProject = (actor: string, id: string): { ownerId: string } | null => {
+    const owner = backend.getProjectOwner(id)
+    if (!owner || canAccessProject(actor, owner.ownerId) === 'deny') return null
+    return owner
+  }
+
+  // GET /api/projects — owner 全部未软删项目(T1.3 seam:owner===actor)。
   route.get('/', async (c) => {
     const requestId = newRequestId()
     c.header('X-Request-Id', requestId)
@@ -57,14 +71,14 @@ export const createProjectsRoutes = ({ backend }: { backend: PersistBackend }): 
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'bad-mivo-key' })
       return bad
     }
-    const owner = resolveOwner(c)
-    const { records } = await backend.listByOwner(owner, 'project')
+    const actor = resolveActor(c)
+    const { records } = await backend.listByOwner(actor, 'project')
     const body: ListProjectsResponse = { projects: records.map(toProject) }
     logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0 })
     return c.json(body, 200)
   })
 
-  // POST /api/projects — 幂等创建(同 id+owner 已存在→200 既有;id 缺失→服务端生成 UUID)。
+  // POST /api/projects — 幂等创建(返修 #1:全局唯一 id;返修 #10 幂等复合 key)。
   route.post('/', async (c) => {
     const requestId = newRequestId()
     c.header('X-Request-Id', requestId)
@@ -74,35 +88,42 @@ export const createProjectsRoutes = ({ backend }: { backend: PersistBackend }): 
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'bad-mivo-key' })
       return bad
     }
-    let body: CreateProjectRequest
+    let decoded
     try {
-      body = await readJsonBody<CreateProjectRequest>(c)
+      const { body: raw, fingerprint } = await readJsonBodyWithFingerprint<unknown>(c)
+      decoded = decodeCreateProject(raw, fingerprint)
     } catch (error) {
-      const status = error instanceof RequestBodyTooLargeError ? 413 : 400
+      const { status, body } = bodyError(error)
       logRequest({ method: c.req.method, path: c.req.path, requestId, status, latencyMs: Date.now() - t0, note: 'bad-body' })
-      return c.json({ error: error instanceof Error ? error.message : 'invalid body' }, status as 413 | 400)
+      return c.json(body, status as 400 | 413)
     }
-    const name = typeof body.name === 'string' ? body.name.trim() : ''
-    if (!name) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'name is required' }, 400)
+    if (!decoded.ok) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: decoded.status, latencyMs: Date.now() - t0, note: 'bad-body' })
+      return c.json(decoded.body, decoded.status as 400 | 413)
     }
-    const id = typeof body.id === 'string' && body.id.trim() ? body.id.trim() : randomUUID()
-    const owner = resolveOwner(c)
+    const reqBody: CreateProjectRequest = decoded.value
+    const id = reqBody.id && reqBody.id.trim() ? reqBody.id.trim() : randomUUID()
+    const actor = resolveActor(c)
     const idempotencyKey = c.req.header('idempotency-key') || undefined
-    const result = await backend.ensureCreate(owner, 'project', id, { name } satisfies ProjectPayload, {
+    const result = await backend.ensureCreate(actor, 'project', id, { name: reqBody.name } satisfies ProjectPayload, {
       scope: 'document',
+      method: 'POST',
+      resourceKind: 'project',
       idempotencyKey,
+      bodyFingerprint: decoded.fingerprint,
     })
-    // project-exists(跨 owner 同 id 冲突):owner 分片下 id 唯一;同 owner 的同 id 走 existing/restored。
-    // 跨 owner 同 id 在分片表里是不同主键(附录 A PK=owner_id+type+id),不冲突——但内存实现
-    // bucket 隔离也如此。故此处无 project-exists 分支(id owner-scoped 唯一)。
+    // 返修 #1:跨 owner 同 id → 409 project-exists(全局唯一)。
+    if (result.kind === 'exists-other-owner') {
+      const err = { error: 'project-exists' as const, id }
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 409, latencyMs: Date.now() - t0, note: 'project-exists' })
+      return c.json(err, 409)
+    }
     const status = result.kind === 'created' ? 201 : 200
     logRequest({ method: c.req.method, path: c.req.path, requestId, status, latencyMs: Date.now() - t0 })
     return c.json(toProject(result.record), status)
   })
 
-  // GET /api/projects/:id — owner-scoped;跨 owner/不存在/已软删 → 404(无存在泄漏,§1)。
+  // GET /api/projects/:id — 返修 #1 授权 seam;跨 owner/不存在/已软删 → 404(无泄漏)。
   route.get('/:id', async (c) => {
     const requestId = newRequestId()
     c.header('X-Request-Id', requestId)
@@ -113,8 +134,14 @@ export const createProjectsRoutes = ({ backend }: { backend: PersistBackend }): 
       return bad
     }
     const id = c.req.param('id')
-    const owner = resolveOwner(c)
-    const got = await backend.get(owner, 'project', id)
+    const actor = resolveActor(c)
+    const owner = authzProject(actor, id)
+    if (!owner) {
+      const err: UnknownResourceBody = { error: 'unknown-project' }
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
+      return c.json(err, 404)
+    }
+    const got = await backend.get(actor, 'project', id)
     if (got.kind === 'missing' || got.record.isDeleted) {
       const err: UnknownResourceBody = { error: 'unknown-project' }
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
@@ -124,7 +151,7 @@ export const createProjectsRoutes = ({ backend }: { backend: PersistBackend }): 
     return c.json(toProject(got.record), 200)
   })
 
-  // PATCH /api/projects/:id — rename(revision-checked)。不存在/已软删 → 404;stale → 409。
+  // PATCH /api/projects/:id — rename(revision-checked)。返修 #4:缺 base → 428。
   route.patch('/:id', async (c) => {
     const requestId = newRequestId()
     c.header('X-Request-Id', requestId)
@@ -134,30 +161,41 @@ export const createProjectsRoutes = ({ backend }: { backend: PersistBackend }): 
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'bad-mivo-key' })
       return bad
     }
-    let body: { name?: unknown; revision?: number }
-    try {
-      body = await readJsonBody<{ name?: unknown; revision?: number }>(c)
-    } catch (error) {
-      const status = error instanceof RequestBodyTooLargeError ? 413 : 400
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status, latencyMs: Date.now() - t0, note: 'bad-body' })
-      return c.json({ error: error instanceof Error ? error.message : 'invalid body' }, status as 413 | 400)
-    }
     const id = c.req.param('id')
-    const owner = resolveOwner(c)
-    const got = await backend.get(owner, 'project', id)
+    const actor = resolveActor(c)
+    const owner = authzProject(actor, id)
+    if (!owner) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
+      return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
+    }
+    let raw: unknown
+    try {
+      raw = await readJsonBodyWithFingerprint<{ name?: unknown }>(c).then((r) => r.body)
+    } catch (error) {
+      const { status, body } = bodyError(error)
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status, latencyMs: Date.now() - t0, note: 'bad-body' })
+      return c.json(body, status as 400 | 413)
+    }
+    const b = (raw ?? {}) as { name?: unknown }
+    const got = await backend.get(actor, 'project', id)
     if (got.kind === 'missing' || got.record.isDeleted) {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
       return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
     }
     const existingName = isProjectPayload(got.record.payload) ? got.record.payload.name : ''
-    const name = typeof body.name === 'string' && body.name.trim() ? body.name.trim() : existingName
-    const ifMatch = c.req.header('if-match')
-    const revision = body.revision !== undefined ? body.revision : ifMatch !== undefined ? Number(ifMatch) : undefined
-    const result = await backend.upsert(owner, 'project', id, { name } satisfies ProjectPayload, {
-      revision,
+    const name = typeof b.name === 'string' && b.name.trim() ? b.name.trim() : existingName
+    const base = baseFromIfMatch(c.req.header('if-match'))
+    const result = await backend.upsert(actor, 'project', id, { name } satisfies ProjectPayload, {
+      base,
       scope: 'document',
+      method: 'PATCH',
+      resourceKind: 'project',
       idempotencyKey: c.req.header('idempotency-key') || undefined,
     })
+    if (result.kind === 'precondition-required') {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 428, latencyMs: Date.now() - t0, note: 'precondition-required' })
+      return c.json(preconditionRequired(id), 428)
+    }
     if (result.kind === 'conflict') {
       const err: ConflictBody = { error: 'revision-conflict', id, currentRevision: result.currentRevision }
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 409, latencyMs: Date.now() - t0, note: 'rev-conflict' })
@@ -167,7 +205,7 @@ export const createProjectsRoutes = ({ backend }: { backend: PersistBackend }): 
     return c.json(toProject(result.record), 200)
   })
 
-  // DELETE /api/projects/:id — 软删 project + 级联软删其画布(DP-3,含画布的 chat 子树)。
+  // DELETE /api/projects/:id — 返修 #2/#7:softDeleteProjectTree 原子级联(project + canvas meta + chat-collection)。
   // idempotent:删已软删 → 204;不存在 → 404。
   route.delete('/:id', async (c) => {
     const requestId = newRequestId()
@@ -179,22 +217,20 @@ export const createProjectsRoutes = ({ backend }: { backend: PersistBackend }): 
       return bad
     }
     const id = c.req.param('id')
-    const owner = resolveOwner(c)
-    const got = await backend.get(owner, 'project', id)
+    const actor = resolveActor(c)
+    const owner = authzProject(actor, id)
+    if (!owner) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
+      return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
+    }
+    const got = await backend.get(actor, 'project', id)
     if (got.kind === 'missing') {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
       return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
     }
-    // 级联:owner 的所有 canvas,filter payload.projectId === id(DP-5 projectId 在 payload,
-    // 内存实现 list+filter;PG 实现可加 jsonb 表达式索引,impl 细节非契约变更)。
-    const { records: canvases } = await backend.listByOwner(owner, 'canvas', { includeDeleted: false })
-    for (const cv of canvases) {
-      const cp = cv.payload as CanvasPayload
-      if (cp.projectId !== id) continue
-      await backend.cascadeSoftDeleteByCanvas(owner, cv.id) // nodes/edges/anchors/chat by canvas_id
-      await backend.softDelete(owner, 'canvas', cv.id)      // canvas meta(canvas_id=null)
+    if (!got.record.isDeleted) {
+      await backend.softDeleteProjectTree(actor, id)
     }
-    await backend.softDelete(owner, 'project', id)
     logRequest({ method: c.req.method, path: c.req.path, requestId, status: 204, latencyMs: Date.now() - t0 })
     return c.body(null, 204)
   })

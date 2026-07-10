@@ -1,56 +1,74 @@
 // server/routes/canvas.ts
 // T1.3 前置:/api/canvas — 画布 record(document 域:canvas meta + node/edge/anchor 子 record)
-// + 节点级 PATCH(FX-4,1MB/413,revision 409)+ chat 子资源(DP-6,per-canvas collection)。
-// 权威:docs/decisions/api-surface.md §4.2。
-// 契约:additive(不属 dev middleware 平移面);验收由 routes/canvas.route.test.ts(内存 backend)覆盖。
+// + 节点级 PATCH(FX-4,1MB/413,revision 409)+ chat 子资源(DP-6)+ 返修 13 条。
+// 权威:docs/decisions/api-surface.md §4.2(返修版)。
 //
-// 信封 payload 透明:CanvasMeta payload = {projectId, title};node/edge/anchor/chat-message
-// payload = 不透明 record 体(服务端不解析,DP-5)。per-record revision 在信封列(canonical)。
-//
-// 鉴权:resolveOwner(c) + rejectInvalidMivoApiKey(F4 边界);跨 owner/不存在 → 404(无泄漏)。
-// PG swap:backend 注入点,handler 零改动(§6)。
+// 返修要点(逐条):
+//  - #1 owner seam:resolveActor + per-owner get(=owner===actor;T1.4 扩 member/share);未授权 404。
+//  - #2 软删粒度:DELETE canvas → softDeleteCanvasTree(标 canvas meta + chat-collection);node/edge/anchor/chat-message
+//    DELETE → hardDeleteChild(物理移除,不软删单条)。
+//  - #3 子资源归属:upsertChild/hardDeleteChild WHERE owner+canvasId+type+id;canvas_id 不可变;跨 canvas → 404。
+//  - #4 If-Match 严格优先,existing 缺 base → 428;#5 wire 不带 revision;fresh create max(0,base)。
+//  - #5 metaRevision(envelope.revision)与 contentVersion(meta payload.contentVersion)分名;payload.id 与 path 一致。
+//  - #6 orderKey:listByCanvas ORDER BY orderKey;POST /:id/reorder 持久化重排。
+//  - #7 softDeleteCanvasTree/restoreCanvasTree 原子(backend 单函数)。
+//  - #8 GET /(枚举 by project);edge/anchor DELETE;CanvasMeta 补 sourceTemplateId/createdAt/move(projectId 可改)。
+//  - #10 幂等 owner+method+resourceKind+key+fingerprint。
+//  - #11 request codec;#12 统一 413;#13 validateChildPayload(node/edge/anchor 白名单)。
 
 import { Hono } from 'hono'
 import type { Context } from 'hono'
 import { randomUUID } from 'node:crypto'
 import type { AppEnv } from '../lib/types'
 import { rejectInvalidMivoApiKey } from '../lib/keys'
-import { resolveOwner } from '../lib/owner'
-import { newRequestId, logRequest, readJsonBody } from '../lib/request'
-import { RequestBodyTooLargeError } from '../lib/upstream'
+import { resolveActor } from '../lib/owner'
+import { newRequestId, logRequest } from '../lib/request'
+import {
+  baseFromIfMatch,
+  bodyError,
+  decodeCreateCanvas,
+  decodeUpsertRequest,
+  preconditionRequired,
+  readJsonBodyWithFingerprint,
+  validateChildPayload,
+} from '../lib/persistHttp'
 import type {
   CanvasMeta,
   ConflictBody,
   CreateCanvasRequest,
   GetCanvasResponse,
+  ListCanvasResponse,
   RecordEntry,
   UnknownResourceBody,
-  UpsertRequest,
   UpsertResponse,
 } from '../../shared/persist-contract.ts'
 import type { PersistBackend, PersistRecord } from '../persist/backend'
 
-/** CanvasMeta 信封 payload(DP-5:projectId/title 是域字段;id/ownerId/timestamps/revision 在信封列)。 */
-type CanvasPayload = { projectId: string; title?: string }
+/** CanvasMeta 信封 payload(DP-5 + 返修 #5:contentVersion backend 维护;#8 sourceTemplateId/projectId 域字段)。 */
+type CanvasPayload = { projectId: string; title?: string; sourceTemplateId?: string; contentVersion?: number }
 
 const isCanvasPayload = (p: unknown): p is CanvasPayload =>
   typeof p === 'object' && p !== null && typeof (p as { projectId?: unknown }).projectId === 'string'
 
+/** 返修 #5/#8/#11:response encoder(satisfies CanvasMeta,metaRevision/contentVersion 分名)。 */
 const toCanvasMeta = (r: PersistRecord): CanvasMeta => {
   const cp = isCanvasPayload(r.payload) ? r.payload : { projectId: '' }
   return {
     id: r.id,
     projectId: cp.projectId,
     title: cp.title ?? '',
+    sourceTemplateId: cp.sourceTemplateId,
     createdAt: r.createdAt,
     updatedAt: r.updatedAt,
-    revision: r.revision,
+    metaRevision: r.revision,
+    contentVersion: cp.contentVersion ?? 0,
   }
 }
 
 const toEntry = (r: PersistRecord): RecordEntry => ({
   id: r.id,
   revision: r.revision,
+  orderKey: r.orderKey,
   payload: r.payload,
 })
 
@@ -62,7 +80,22 @@ const badMivo = (c: Context<AppEnv>, requestId: string, t0: number): Response =>
 export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Hono<AppEnv> => {
   const route = new Hono<AppEnv>()
 
-  // ── 画布 record 级 ──
+  // ── 返修 #8:canvas 枚举(按 project/owner)──
+  route.get('/', async (c) => {
+    const requestId = newRequestId()
+    c.header('X-Request-Id', requestId)
+    const t0 = Date.now()
+    const bad = rejectInvalidMivoApiKey(c)
+    if (bad) return badMivo(c, requestId, t0)
+    const actor = resolveActor(c)
+    const projectId = c.req.query('projectId')
+    const { records } = projectId
+      ? await backend.listCanvasByProject(actor, projectId)
+      : await backend.listByOwner(actor, 'canvas')
+    const body: ListCanvasResponse = { canvases: records.map(toCanvasMeta) }
+    logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0 })
+    return c.json(body, 200)
+  })
 
   // GET /api/canvas/:id — 全量(meta + nodes/edges/anchors,跨设备原样在)。
   route.get('/:id', async (c) => {
@@ -72,16 +105,16 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
     const bad = rejectInvalidMivoApiKey(c)
     if (bad) return badMivo(c, requestId, t0)
     const id = c.req.param('id')
-    const owner = resolveOwner(c)
-    const got = await backend.get(owner, 'canvas', id)
+    const actor = resolveActor(c)
+    const got = await backend.get(actor, 'canvas', id)
     if (got.kind === 'missing' || got.record.isDeleted) {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
       return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
     }
     const [nodes, edges, anchors] = await Promise.all([
-      backend.listByCanvas(owner, id, 'node'),
-      backend.listByCanvas(owner, id, 'edge'),
-      backend.listByCanvas(owner, id, 'anchor'),
+      backend.listByCanvas(actor, id, 'node'),
+      backend.listByCanvas(actor, id, 'edge'),
+      backend.listByCanvas(actor, id, 'anchor'),
     ])
     const body: GetCanvasResponse = {
       ...toCanvasMeta(got.record),
@@ -93,74 +126,115 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
     return c.json(body, 200)
   })
 
-  // POST /api/canvas — 幂等创建(projectId 须属本 owner,否则 404 unknown-project)。
+  // POST /api/canvas — 幂等创建(projectId 须属本 owner,否则 404 unknown-project)+ 建 chat-collection record。
   route.post('/', async (c) => {
     const requestId = newRequestId()
     c.header('X-Request-Id', requestId)
     const t0 = Date.now()
     const bad = rejectInvalidMivoApiKey(c)
     if (bad) return badMivo(c, requestId, t0)
-    let body: CreateCanvasRequest
+    let decoded
     try {
-      body = await readJsonBody<CreateCanvasRequest>(c)
+      const { body: raw, fingerprint } = await readJsonBodyWithFingerprint<unknown>(c)
+      decoded = decodeCreateCanvas(raw, fingerprint)
     } catch (error) {
-      const status = error instanceof RequestBodyTooLargeError ? 413 : 400
+      const { status, body } = bodyError(error)
       logRequest({ method: c.req.method, path: c.req.path, requestId, status, latencyMs: Date.now() - t0, note: 'bad-body' })
-      return c.json({ error: error instanceof Error ? error.message : 'invalid body' }, status as 413 | 400)
+      return c.json(body, status as 400 | 413)
     }
-    const projectId = typeof body.projectId === 'string' ? body.projectId.trim() : ''
-    if (!projectId) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'projectId is required' }, 400)
+    if (!decoded.ok) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: decoded.status, latencyMs: Date.now() - t0, note: 'bad-body' })
+      return c.json(decoded.body, decoded.status as 400 | 413)
     }
-    const owner = resolveOwner(c)
-    const project = await backend.get(owner, 'project', projectId)
+    const reqBody: CreateCanvasRequest = decoded.value
+    const actor = resolveActor(c)
+    const project = await backend.get(actor, 'project', reqBody.projectId)
     if (project.kind === 'missing' || project.record.isDeleted) {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
       return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
     }
-    const id = typeof body.id === 'string' && body.id.trim() ? body.id.trim() : randomUUID()
-    const title = typeof body.title === 'string' ? body.title : ''
-    const result = await backend.ensureCreate(owner, 'canvas', id, { projectId, title } satisfies CanvasPayload, {
+    const id = reqBody.id && reqBody.id.trim() ? reqBody.id.trim() : randomUUID()
+    const cp: CanvasPayload = { projectId: reqBody.projectId, title: reqBody.title, sourceTemplateId: reqBody.sourceTemplateId }
+    const idempotencyKey = c.req.header('idempotency-key') || undefined
+    const result = await backend.ensureCreate(actor, 'canvas', id, cp, {
       scope: 'document',
-      idempotencyKey: c.req.header('idempotency-key') || undefined,
+      method: 'POST',
+      resourceKind: 'canvas',
+      idempotencyKey,
+      bodyFingerprint: decoded.fingerprint,
     })
+    // 返修 #2:canvas 创建时一并建 chat-collection record(collection 级软删标记点)。
+    if (result.kind === 'created') {
+      await backend.ensureCreate(actor, 'chat-collection', id, {}, {
+        canvasId: id,
+        scope: 'document',
+        method: 'POST',
+        resourceKind: 'chat-collection',
+        bodyFingerprint: decoded.fingerprint,
+      })
+    }
     const status = result.kind === 'created' ? 201 : 200
     logRequest({ method: c.req.method, path: c.req.path, requestId, status, latencyMs: Date.now() - t0 })
     return c.json(toCanvasMeta(result.record), status)
   })
 
-  // PUT /api/canvas/:id — doc-level meta 更新(revision-checked)。
+  // PUT /api/canvas/:id — doc-level meta 更新(revision-checked,#4 428;#8 move=projectId 可改)。
   route.put('/:id', async (c) => {
     const requestId = newRequestId()
     c.header('X-Request-Id', requestId)
     const t0 = Date.now()
     const bad = rejectInvalidMivoApiKey(c)
     if (bad) return badMivo(c, requestId, t0)
-    let body: { title?: unknown; revision?: number }
+    let decoded
     try {
-      body = await readJsonBody<{ title?: unknown; revision?: number }>(c)
+      const { body: raw, fingerprint } = await readJsonBodyWithFingerprint<unknown>(c)
+      decoded = decodeUpsertRequest(raw, fingerprint)
     } catch (error) {
-      const status = error instanceof RequestBodyTooLargeError ? 413 : 400
+      const { status, body } = bodyError(error)
       logRequest({ method: c.req.method, path: c.req.path, requestId, status, latencyMs: Date.now() - t0, note: 'bad-body' })
-      return c.json({ error: error instanceof Error ? error.message : 'invalid body' }, status as 413 | 400)
+      return c.json(body, status as 400 | 413)
+    }
+    if (!decoded.ok) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: decoded.status, latencyMs: Date.now() - t0, note: 'bad-body' })
+      return c.json(decoded.body, decoded.status as 400 | 413)
     }
     const id = c.req.param('id')
-    const owner = resolveOwner(c)
-    const got = await backend.get(owner, 'canvas', id)
+    const actor = resolveActor(c)
+    const got = await backend.get(actor, 'canvas', id)
     if (got.kind === 'missing' || got.record.isDeleted) {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
       return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
     }
     const existing = isCanvasPayload(got.record.payload) ? got.record.payload : { projectId: '' }
-    const title = typeof body.title === 'string' ? body.title : existing.title ?? ''
-    const ifMatch = c.req.header('if-match')
-    const revision = body.revision !== undefined ? body.revision : ifMatch !== undefined ? Number(ifMatch) : undefined
-    const result = await backend.upsert(owner, 'canvas', id, { projectId: existing.projectId, title } satisfies CanvasPayload, {
-      revision,
+    const incoming = (decoded.value.payload ?? {}) as Partial<CanvasPayload>
+    // 返修 #8 move:projectId 可改(若提供且属本 owner);title/sourceTemplateId 可改。
+    let projectId = existing.projectId ?? ''
+    if (typeof incoming.projectId === 'string' && incoming.projectId && incoming.projectId !== projectId) {
+      const p = await backend.get(actor, 'project', incoming.projectId)
+      if (p.kind === 'missing' || p.record.isDeleted) {
+        logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
+        return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
+      }
+      projectId = incoming.projectId
+    }
+    const cp: CanvasPayload = {
+      projectId,
+      title: typeof incoming.title === 'string' ? incoming.title : existing.title,
+      sourceTemplateId: typeof incoming.sourceTemplateId === 'string' ? incoming.sourceTemplateId : existing.sourceTemplateId,
+    }
+    const base = baseFromIfMatch(c.req.header('if-match'))
+    const result = await backend.upsert(actor, 'canvas', id, cp, {
+      base,
       scope: 'document',
+      method: 'PUT',
+      resourceKind: 'canvas',
       idempotencyKey: c.req.header('idempotency-key') || undefined,
+      bodyFingerprint: decoded.fingerprint,
     })
+    if (result.kind === 'precondition-required') {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 428, latencyMs: Date.now() - t0, note: 'precondition-required' })
+      return c.json(preconditionRequired(id), 428)
+    }
     if (result.kind === 'conflict') {
       const err: ConflictBody = { error: 'revision-conflict', id, currentRevision: result.currentRevision }
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 409, latencyMs: Date.now() - t0, note: 'rev-conflict' })
@@ -170,7 +244,7 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
     return c.json(toCanvasMeta(result.record), 200)
   })
 
-  // DELETE /api/canvas/:id — 软删 canvas + 级联软删其 chat collection(DP-3/DP-6)+ nodes/edges/anchors。
+  // DELETE /api/canvas/:id — 返修 #2/#7:softDeleteCanvasTree 原子(标 canvas meta + chat-collection;children 保持活记录)。
   route.delete('/:id', async (c) => {
     const requestId = newRequestId()
     c.header('X-Request-Id', requestId)
@@ -178,22 +252,53 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
     const bad = rejectInvalidMivoApiKey(c)
     if (bad) return badMivo(c, requestId, t0)
     const id = c.req.param('id')
-    const owner = resolveOwner(c)
-    const got = await backend.get(owner, 'canvas', id)
+    const actor = resolveActor(c)
+    const got = await backend.get(actor, 'canvas', id)
     if (got.kind === 'missing') {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
       return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
     }
     if (!got.record.isDeleted) {
-      await backend.cascadeSoftDeleteByCanvas(owner, id) // nodes/edges/anchors/chat by canvas_id
-      await backend.softDelete(owner, 'canvas', id)      // canvas meta
+      await backend.softDeleteCanvasTree(actor, id)
     }
     logRequest({ method: c.req.method, path: c.req.path, requestId, status: 204, latencyMs: Date.now() - t0 })
     return c.body(null, 204)
   })
 
-  // ── 节点级 PATCH(FX-4):node/edge/anchor ──
-  // 通用:canvas 须存在未删(else 404);record upsert(missing→create,existing→rev-check)。
+  // ── 返修 #6:重排子资源顺序(持久化 orderKey)──
+  route.post('/:id/reorder', async (c) => {
+    const requestId = newRequestId()
+    c.header('X-Request-Id', requestId)
+    const t0 = Date.now()
+    const bad = rejectInvalidMivoApiKey(c)
+    if (bad) return badMivo(c, requestId, t0)
+    let body: { type?: unknown; orderedIds?: unknown }
+    try {
+      body = await readJsonBodyWithFingerprint<{ type?: unknown; orderedIds?: unknown }>(c).then((r) => r.body)
+    } catch (error) {
+      const { status, body: errBody } = bodyError(error)
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status, latencyMs: Date.now() - t0, note: 'bad-body' })
+      return c.json(errBody, status as 400 | 413)
+    }
+    const type = body.type
+    const orderedIds = Array.isArray(body.orderedIds) ? (body.orderedIds as unknown[]).filter((x): x is string => typeof x === 'string') : null
+    if (type !== 'node' && type !== 'edge' && type !== 'anchor' && type !== 'chat-message' || !orderedIds) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0 })
+      return c.json({ error: 'bad-request', message: 'type and orderedIds are required' }, 400)
+    }
+    const id = c.req.param('id')
+    const actor = resolveActor(c)
+    const canvas = await backend.get(actor, 'canvas', id)
+    if (canvas.kind === 'missing' || canvas.record.isDeleted) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
+      return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
+    }
+    const { reordered } = await backend.reorderChildren(actor, id, type, orderedIds)
+    logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0 })
+    return c.json({ reordered }, 200)
+  })
+
+  // ── 节点级 PATCH(FX-4 + 返修 #3/#4/#5/#13):node/edge/anchor ──
   const patchChild = async (
     c: Context<AppEnv>,
     type: 'node' | 'edge' | 'anchor',
@@ -204,40 +309,53 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
     const t0 = Date.now()
     const bad = rejectInvalidMivoApiKey(c)
     if (bad) return badMivo(c, requestId, t0)
-    let body: UpsertRequest<unknown>
+    let decoded
     try {
-      body = await readJsonBody<UpsertRequest<unknown>>(c)
+      const { body: raw, fingerprint } = await readJsonBodyWithFingerprint<unknown>(c)
+      decoded = decodeUpsertRequest(raw, fingerprint)
     } catch (error) {
-      const status = error instanceof RequestBodyTooLargeError ? 413 : 400
+      const { status, body } = bodyError(error)
       logRequest({ method: c.req.method, path: c.req.path, requestId, status, latencyMs: Date.now() - t0, note: 'bad-body' })
-      return c.json({ error: error instanceof Error ? error.message : 'invalid body' }, status as 413 | 400)
+      return c.json(body, status as 400 | 413)
     }
-    if (body.payload == null || typeof body.payload !== 'object') {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'payload is required' }, 400)
+    if (!decoded.ok) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: decoded.status, latencyMs: Date.now() - t0, note: 'bad-body' })
+      return c.json(decoded.body, decoded.status as 400 | 413)
+    }
+    // 返修 #13:node/edge/anchor payload 白名单 runtime 校验(拒 mirror/status/tasks + id 一致性 #5)。
+    const check = validateChildPayload(decoded.value.payload, childId)
+    if (!check.ok) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'payload-rejected' })
+      return c.json(check.body, 400)
     }
     const canvasId = c.req.param('id') ?? ''
-    const owner = resolveOwner(c)
-    const canvas = await backend.get(owner, 'canvas', canvasId)
+    const actor = resolveActor(c)
+    const canvas = await backend.get(actor, 'canvas', canvasId)
     if (canvas.kind === 'missing' || canvas.record.isDeleted) {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
       return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
     }
-    const ifMatch = c.req.header('if-match')
-    const revision = body.revision !== undefined ? body.revision : ifMatch !== undefined ? Number(ifMatch) : undefined
-    const result = await backend.upsert(owner, type, childId, body.payload, {
-      revision,
-      canvasId,
-      scope: 'document',
+    const base = baseFromIfMatch(c.req.header('if-match'))
+    const result = await backend.upsertChild(actor, canvasId, type, childId, check.payload, {
+      base,
+      method: 'PATCH',
+      resourceKind: type,
       idempotencyKey: c.req.header('idempotency-key') || undefined,
+      bodyFingerprint: decoded.fingerprint,
     })
+    if (result.kind === 'cross-canvas') {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'cross-canvas' })
+      return c.json({ error: `unknown-${type}` } satisfies UnknownResourceBody, 404)
+    }
+    if (result.kind === 'precondition-required') {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 428, latencyMs: Date.now() - t0, note: 'precondition-required' })
+      return c.json(preconditionRequired(childId), 428)
+    }
     if (result.kind === 'conflict') {
       const err: ConflictBody = { error: 'revision-conflict', id: childId, currentRevision: result.currentRevision }
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 409, latencyMs: Date.now() - t0, note: 'rev-conflict' })
       return c.json(err, 409)
     }
-    // 用 result.record.id(非 URL childId):idempotency 回放时 index 指向首条 record,返既有 id+revision
-    // 才是"既有结果"(同 key 同 owner → 同 result);非回放时 record.id === childId,无差异。
     const res: UpsertResponse = { id: result.record.id, revision: result.record.revision }
     logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0 })
     return c.json(res, 200)
@@ -247,33 +365,37 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
   route.patch('/:id/edges/:edgeId', (c) => patchChild(c, 'edge', c.req.param('edgeId') ?? ''))
   route.patch('/:id/anchors/:anchorId', (c) => patchChild(c, 'anchor', c.req.param('anchorId') ?? ''))
 
-  // DELETE child record(软删单 node/edge/anchor)。canvas 须存在未删。
-  route.delete('/:id/nodes/:nodeId', async (c) => {
+  // 返修 #2/#8:DELETE child record(node/edge/anchor 真硬删)。canvas 须存在未删。
+  const deleteChild = async (c: Context<AppEnv>, type: 'node' | 'edge' | 'anchor'): Promise<Response> => {
     const requestId = newRequestId()
     c.header('X-Request-Id', requestId)
     const t0 = Date.now()
     const bad = rejectInvalidMivoApiKey(c)
     if (bad) return badMivo(c, requestId, t0)
-    const canvasId = c.req.param('id')
-    const childId = c.req.param('nodeId')
-    const owner = resolveOwner(c)
-    const canvas = await backend.get(owner, 'canvas', canvasId)
+    const canvasId = c.req.param('id') ?? ''
+    const childId = c.req.param('nodeId') ?? c.req.param('edgeId') ?? c.req.param('anchorId') ?? ''
+    const actor = resolveActor(c)
+    const canvas = await backend.get(actor, 'canvas', canvasId)
     if (canvas.kind === 'missing' || canvas.record.isDeleted) {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
       return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
     }
-    const { deleted } = await backend.softDelete(owner, 'node', childId)
+    const { deleted } = await backend.hardDeleteChild(actor, canvasId, type, childId)
     if (!deleted) {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'unknown-node' } satisfies UnknownResourceBody, 404)
+      return c.json({ error: `unknown-${type}` } satisfies UnknownResourceBody, 404)
     }
     logRequest({ method: c.req.method, path: c.req.path, requestId, status: 204, latencyMs: Date.now() - t0 })
     return c.body(null, 204)
-  })
+  }
+
+  route.delete('/:id/nodes/:nodeId', (c) => deleteChild(c, 'node'))
+  route.delete('/:id/edges/:edgeId', (c) => deleteChild(c, 'edge'))
+  route.delete('/:id/anchors/:anchorId', (c) => deleteChild(c, 'anchor'))
 
   // ── chat 子资源(DP-6)──
 
-  // GET /api/canvas/:id/chat — per-canvas messages collection(跨设备原样在)。
+  // GET /api/canvas/:id/chat — per-canvas messages collection(跨设备原样在;ORDER BY orderKey #6)。
   route.get('/:id/chat', async (c) => {
     const requestId = newRequestId()
     c.header('X-Request-Id', requestId)
@@ -281,50 +403,55 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
     const bad = rejectInvalidMivoApiKey(c)
     if (bad) return badMivo(c, requestId, t0)
     const canvasId = c.req.param('id') ?? ''
-    const owner = resolveOwner(c)
-    const canvas = await backend.get(owner, 'canvas', canvasId)
+    const actor = resolveActor(c)
+    const canvas = await backend.get(actor, 'canvas', canvasId)
     if (canvas.kind === 'missing' || canvas.record.isDeleted) {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
       return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
     }
-    const { records } = await backend.listByCanvas(owner, canvasId, 'chat-message')
+    const { records } = await backend.listByCanvas(actor, canvasId, 'chat-message')
     logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0 })
     return c.json({ messages: records.map(toEntry) }, 200)
   })
 
-  // POST /api/canvas/:id/chat — append message(idempotent on message.id)。
+  // POST /api/canvas/:id/chat — append message(idempotent on message.id;返修 #10 幂等复合 key)。
   route.post('/:id/chat', async (c) => {
     const requestId = newRequestId()
     c.header('X-Request-Id', requestId)
     const t0 = Date.now()
     const bad = rejectInvalidMivoApiKey(c)
     if (bad) return badMivo(c, requestId, t0)
-    let body: { message?: unknown; id?: string }
+    let body: { message?: unknown }
+    let fingerprint: string
     try {
-      body = await readJsonBody<{ message?: unknown; id?: string }>(c)
+      const r = await readJsonBodyWithFingerprint<{ message?: unknown }>(c)
+      body = r.body
+      fingerprint = r.fingerprint
     } catch (error) {
-      const status = error instanceof RequestBodyTooLargeError ? 413 : 400
+      const { status, body: errBody } = bodyError(error)
       logRequest({ method: c.req.method, path: c.req.path, requestId, status, latencyMs: Date.now() - t0, note: 'bad-body' })
-      return c.json({ error: error instanceof Error ? error.message : 'invalid body' }, status as 413 | 400)
+      return c.json(errBody, status as 400 | 413)
     }
     if (body.message == null) {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'message is required' }, 400)
+      return c.json({ error: 'bad-request', message: 'message is required' }, 400)
     }
     const canvasId = c.req.param('id') ?? ''
-    const owner = resolveOwner(c)
-    const canvas = await backend.get(owner, 'canvas', canvasId)
+    const actor = resolveActor(c)
+    const canvas = await backend.get(actor, 'canvas', canvasId)
     if (canvas.kind === 'missing' || canvas.record.isDeleted) {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
       return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
     }
-    // message id:客户端 ChatMessage.id 优先,缺失→服务端生成(对齐 POST projects/canvas 幂等)。
     const msg = body.message as { id?: string } | null
-    const id = (msg && typeof msg.id === 'string' && msg.id) ? msg.id : randomUUID()
-    const result = await backend.ensureCreate(owner, 'chat-message', id, body.message, {
+    const id = msg && typeof msg.id === 'string' && msg.id ? msg.id : randomUUID()
+    const result = await backend.ensureCreate(actor, 'chat-message', id, body.message, {
       canvasId,
       scope: 'document',
+      method: 'POST',
+      resourceKind: 'chat-message',
       idempotencyKey: c.req.header('idempotency-key') || undefined,
+      bodyFingerprint: fingerprint,
     })
     const status = result.kind === 'created' ? 201 : 200
     const res: UpsertResponse = { id: result.record.id, revision: result.record.revision }
@@ -332,41 +459,50 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
     return c.json(res, status)
   })
 
-  // PATCH /api/canvas/:id/chat/:msgId — message update(revision-checked)。
+  // PATCH /api/canvas/:id/chat/:msgId — message update(revision-checked;返修 #3/#4)。
   route.patch('/:id/chat/:msgId', async (c) => {
     const requestId = newRequestId()
     c.header('X-Request-Id', requestId)
     const t0 = Date.now()
     const bad = rejectInvalidMivoApiKey(c)
     if (bad) return badMivo(c, requestId, t0)
-    let body: UpsertRequest<unknown>
+    let decoded
     try {
-      body = await readJsonBody<UpsertRequest<unknown>>(c)
+      const { body: raw, fingerprint } = await readJsonBodyWithFingerprint<unknown>(c)
+      decoded = decodeUpsertRequest(raw, fingerprint)
     } catch (error) {
-      const status = error instanceof RequestBodyTooLargeError ? 413 : 400
+      const { status, body } = bodyError(error)
       logRequest({ method: c.req.method, path: c.req.path, requestId, status, latencyMs: Date.now() - t0, note: 'bad-body' })
-      return c.json({ error: error instanceof Error ? error.message : 'invalid body' }, status as 413 | 400)
+      return c.json(body, status as 400 | 413)
     }
-    if (body.payload == null) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'payload is required' }, 400)
+    if (!decoded.ok) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: decoded.status, latencyMs: Date.now() - t0, note: 'bad-body' })
+      return c.json(decoded.body, decoded.status as 400 | 413)
     }
     const canvasId = c.req.param('id')
     const msgId = c.req.param('msgId')
-    const owner = resolveOwner(c)
-    const canvas = await backend.get(owner, 'canvas', canvasId)
+    const actor = resolveActor(c)
+    const canvas = await backend.get(actor, 'canvas', canvasId)
     if (canvas.kind === 'missing' || canvas.record.isDeleted) {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
       return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
     }
-    const ifMatch = c.req.header('if-match')
-    const revision = body.revision !== undefined ? body.revision : ifMatch !== undefined ? Number(ifMatch) : undefined
-    const result = await backend.upsert(owner, 'chat-message', msgId, body.payload, {
-      revision,
-      canvasId,
-      scope: 'document',
+    const base = baseFromIfMatch(c.req.header('if-match'))
+    const result = await backend.upsertChild(actor, canvasId, 'chat-message', msgId, decoded.value.payload, {
+      base,
+      method: 'PATCH',
+      resourceKind: 'chat-message',
       idempotencyKey: c.req.header('idempotency-key') || undefined,
+      bodyFingerprint: decoded.fingerprint,
     })
+    if (result.kind === 'cross-canvas') {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
+      return c.json({ error: 'unknown-message' } satisfies UnknownResourceBody, 404)
+    }
+    if (result.kind === 'precondition-required') {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 428, latencyMs: Date.now() - t0, note: 'precondition-required' })
+      return c.json(preconditionRequired(msgId), 428)
+    }
     if (result.kind === 'conflict') {
       const err: ConflictBody = { error: 'revision-conflict', id: msgId, currentRevision: result.currentRevision }
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 409, latencyMs: Date.now() - t0, note: 'rev-conflict' })
@@ -377,7 +513,7 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
     return c.json(res, 200)
   })
 
-  // DELETE /api/canvas/:id/chat/:msgId — 软删 message。
+  // DELETE /api/canvas/:id/chat/:msgId — 返修 #2:硬删 message(物理移除,不软删)。
   route.delete('/:id/chat/:msgId', async (c) => {
     const requestId = newRequestId()
     c.header('X-Request-Id', requestId)
@@ -386,13 +522,13 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
     if (bad) return badMivo(c, requestId, t0)
     const canvasId = c.req.param('id')
     const msgId = c.req.param('msgId')
-    const owner = resolveOwner(c)
-    const canvas = await backend.get(owner, 'canvas', canvasId)
+    const actor = resolveActor(c)
+    const canvas = await backend.get(actor, 'canvas', canvasId)
     if (canvas.kind === 'missing' || canvas.record.isDeleted) {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
       return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
     }
-    const { deleted } = await backend.softDelete(owner, 'chat-message', msgId)
+    const { deleted } = await backend.hardDeleteChild(actor, canvasId, 'chat-message', msgId)
     if (!deleted) {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
       return c.json({ error: 'unknown-message' } satisfies UnknownResourceBody, 404)

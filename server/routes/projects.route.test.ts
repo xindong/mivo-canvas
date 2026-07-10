@@ -1,17 +1,22 @@
 // server/routes/projects.route.test.ts
-// T1.3 /api/projects 路由级契约测试(内存 backend)。覆盖 api-surface §4.1:
-// owner 隔离(404 无泄漏)、幂等创建(同 id→200 existing)、revision 409、DP-3 级联软删。
+// T1.3 /api/projects 路由级契约测试(返修版)。覆盖 13 条回归:
+// #1 project id 全局唯一(跨 owner → 409 project-exists)+ 授权 seam(跨 owner → 404)、
+// #2/#7 DELETE softDeleteProjectTree 原子级联(canvas meta + chat-collection 软删;children 活)、
+// #4 428/If-Match、#10 幂等跨 type 不串、#12 413 完整 body。
 import { describe, it, expect, beforeEach } from 'vitest'
 import { buildPersistApp, hdr, KEY_A, KEY_B, req } from './persistTestApp'
 import { fingerprintOfPlatformKey } from '../lib/keys'
 
-describe('/api/projects routes (T1.3)', () => {
+describe('/api/projects routes (T1.3 返修)', () => {
   let app: ReturnType<typeof buildPersistApp>['app']
   let backend: ReturnType<typeof buildPersistApp>['backend']
 
   beforeEach(() => {
     ;({ app, backend } = buildPersistApp())
   })
+
+  const create = async (key: string, id: string, name = 'P') =>
+    req(app, '/api/projects', { method: 'POST', headers: hdr(key), body: JSON.stringify({ id, name }) })
 
   it('POST 无 id → 201 服务端生成 UUID;GET / 含之', async () => {
     const created = await req(app, '/api/projects', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ name: 'p1' }) })
@@ -20,107 +25,93 @@ describe('/api/projects routes (T1.3)', () => {
     expect(proj.name).toBe('p1')
     expect(proj.id).toBeTruthy()
     expect(proj.revision).toBe(0)
-
     const list = await req(app, '/api/projects', { headers: hdr(KEY_A) })
-    expect(list.status).toBe(200)
     expect((list.body as { projects: unknown[] }).projects).toHaveLength(1)
   })
 
-  it('POST 同 id 第二次 → 200 existing(幂等,不重建,revision 不 bump)', async () => {
-    const body = JSON.stringify({ id: 'p-fix', name: 'p1' })
-    const first = await req(app, '/api/projects', { method: 'POST', headers: hdr(KEY_A), body })
-    expect(first.status).toBe(201)
-    expect((first.body as { revision: number }).revision).toBe(0)
-    const second = await req(app, '/api/projects', { method: 'POST', headers: hdr(KEY_A), body })
-    expect(second.status).toBe(200) // idempotent existing
-    expect((second.body as { revision: number }).revision).toBe(0) // 不 bump
+  it('返修 #1:project id 全局唯一——跨 owner 同 id → 409 project-exists;同 owner → 幂等 200', async () => {
+    const a = await create(KEY_A, 'p1')
+    expect(a.status).toBe(201)
+    const a2 = await create(KEY_A, 'p1')
+    expect(a2.status).toBe(200) // 同 owner 幂等
+    const b = await create(KEY_B, 'p1')
+    expect(b.status).toBe(409) // 跨 owner 全局唯一
+    expect((b.body as { error: string; id: string })).toMatchObject({ error: 'project-exists', id: 'p1' })
   })
 
-  it('Idempotency-Key header:同 key 第二次返既有(不重建)', async () => {
-    const init = { method: 'POST', headers: { ...hdr(KEY_A), 'idempotency-key': 'k-1' }, body: JSON.stringify({ name: 'p1' }) }
-    const first = await req(app, '/api/projects', init)
-    expect(first.status).toBe(201)
-    const firstId = (first.body as { id: string }).id
-    const second = await req(app, '/api/projects', { ...init, body: JSON.stringify({ name: 'different' }) })
-    expect(second.status).toBe(200) // idempotent replay
-    expect((second.body as { id: string }).id).toBe(firstId) // 同一 record,不重建
-  })
-
-  it('owner 隔离:A 的项目 B 看不到(B GET A 的 id → 404 unknown-project,同 unknown id body,无泄漏)', async () => {
-    const created = await req(app, '/api/projects', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ id: 'p-a', name: 'A' }) })
-    expect(created.status).toBe(201)
-
+  it('返修 #1:授权 seam——B GET A 的 project → 404(同 unknown,无泄漏);B list 为空', async () => {
+    await create(KEY_A, 'p-a')
     const crossOwner = await req(app, '/api/projects/p-a', { headers: hdr(KEY_B) })
     const unknown = await req(app, '/api/projects/never-existed', { headers: hdr(KEY_B) })
     expect(crossOwner.status).toBe(404)
     expect(unknown.status).toBe(404)
-    expect(crossOwner.body).toEqual(unknown.body) // 同 body,无存在泄漏
+    expect(crossOwner.body).toEqual(unknown.body)
     expect((crossOwner.body as { error: string }).error).toBe('unknown-project')
-
-    // B 的列表为空(A 的项目不在 B 列表)
     const bList = await req(app, '/api/projects', { headers: hdr(KEY_B) })
     expect((bList.body as { projects: unknown[] }).projects).toHaveLength(0)
   })
 
-  it('PATCH 正确 revision → 200 bumped;stale revision → 409 conflict', async () => {
-    const created = await req(app, '/api/projects', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ id: 'p1', name: 'n0' }) })
-    const rev = (created.body as { revision: number }).revision
-    expect(rev).toBe(0)
-
-    const ok = await req(app, '/api/projects/p1', {
-      method: 'PATCH', headers: { ...hdr(KEY_A), 'if-match': String(rev) }, body: JSON.stringify({ name: 'n1' }),
-    })
+  it('返修 #4:PATCH existing 缺 If-Match → 428;stale → 409;正确 → 200 bump', async () => {
+    await create(KEY_A, 'p1', 'n0')
+    // existing 缺 If-Match → 428
+    const noBase = await req(app, '/api/projects/p1', { method: 'PATCH', headers: hdr(KEY_A), body: JSON.stringify({ name: 'n1' }) })
+    expect(noBase.status).toBe(428)
+    expect((noBase.body as { error: string; id: string }).error).toBe('precondition-required')
+    // If-Match:0 → bump
+    const ok = await req(app, '/api/projects/p1', { method: 'PATCH', headers: { ...hdr(KEY_A), 'if-match': '0' }, body: JSON.stringify({ name: 'n1' }) })
     expect(ok.status).toBe(200)
-    expect((ok.body as { name: string; revision: number }).name).toBe('n1')
-    expect((ok.body as { revision: number }).revision).toBe(1)
-
-    const stale = await req(app, '/api/projects/p1', {
-      method: 'PATCH', headers: { ...hdr(KEY_A), 'if-match': String(rev) }, body: JSON.stringify({ name: 'stale' }),
-    })
+    expect((ok.body as { name: string; revision: number }).revision).toBe(1)
+    // stale 0 → 409
+    const stale = await req(app, '/api/projects/p1', { method: 'PATCH', headers: { ...hdr(KEY_A), 'if-match': '0' }, body: JSON.stringify({ name: 'stale' }) })
     expect(stale.status).toBe(409)
-    expect((stale.body as { error: string; currentRevision: number }).error).toBe('revision-conflict')
     expect((stale.body as { currentRevision: number }).currentRevision).toBe(1)
+    // PATCH missing → 404
+    const missing = await req(app, '/api/projects/missing', { method: 'PATCH', headers: { ...hdr(KEY_A), 'if-match': '0' }, body: JSON.stringify({ name: 'x' }) })
+    expect(missing.status).toBe(404)
   })
 
-  it('PATCH missing id → 404', async () => {
-    const res = await req(app, '/api/projects/missing', {
-      method: 'PATCH', headers: { ...hdr(KEY_A), 'if-match': '0' }, body: JSON.stringify({ name: 'x' }),
-    })
-    expect(res.status).toBe(404)
-    expect((res.body as { error: string }).error).toBe('unknown-project')
-  })
-
-  it('DELETE 级联软删:删 project → 其下 canvas + chat 一并软删(DP-3)', async () => {
-    // 建项目 + canvas + 一条 chat message + 一个 node
-    await req(app, '/api/projects', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ id: 'p1', name: 'P' }) })
+  it('返修 #2/#7:DELETE → softDeleteProjectTree 原子级联(canvas meta + chat-collection 软删;children 保持活记录)', async () => {
+    await create(KEY_A, 'p1')
     await req(app, '/api/canvas', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ id: 'c1', projectId: 'p1', title: 'C' }) })
     await req(app, '/api/canvas/c1/chat', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ message: { id: 'm1', text: 'hi' } }) })
-    await req(app, '/api/canvas/c1/nodes/n1', {
-      method: 'PATCH', headers: hdr(KEY_A), body: JSON.stringify({ payload: { id: 'n1', type: 'image' }, revision: 0 }),
-    })
+    await req(app, '/api/canvas/c1/nodes/n1', { method: 'PATCH', headers: hdr(KEY_A), body: JSON.stringify({ payload: { id: 'n1', type: 'image' } }) })
 
     const del = await req(app, '/api/projects/p1', { method: 'DELETE', headers: hdr(KEY_A) })
     expect(del.status).toBe(204)
-
-    // 级联:canvas + node + chat 都软删 → GET 各 404
+    // 级联软删:project + canvas meta + chat-collection → isDeleted=true
+    const owner = fingerprintOfPlatformKey(KEY_A)
+    const isDel = async (type: 'project' | 'canvas' | 'chat-collection' | 'node' | 'chat-message', id: string): Promise<boolean | undefined> => {
+      const r = await backend.get(owner, type, id)
+      return r.kind === 'found' ? r.record.isDeleted : undefined
+    }
+    expect(await isDel('project', 'p1')).toBe(true)
+    expect(await isDel('canvas', 'c1')).toBe(true)
+    expect(await isDel('chat-collection', 'c1')).toBe(true)
+    // 返修 #2:children(node/chat-message)保持活记录(不软删,随父级不可见)
+    expect(await isDel('node', 'n1')).toBe(false)
+    expect(await isDel('chat-message', 'm1')).toBe(false)
+    // GET 层:canvas/chat → 404(父级不可见)
     expect((await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })).status).toBe(404)
     expect((await req(app, '/api/canvas/c1/chat', { headers: hdr(KEY_A) })).status).toBe(404)
-    // backend 层直接验软删标记(DP-3 一起软删,非物理删)
-    const owner = fingerprintOfPlatformKey(KEY_A)
-    const canvasRec = await backend.get(owner, 'canvas', 'c1')
-    expect(canvasRec.kind).toBe('found')
-    expect(canvasRec.kind === 'found' && canvasRec.record.isDeleted).toBe(true)
-    const nodeRec = await backend.get(owner, 'node', 'n1')
-    expect(nodeRec.kind === 'found' && nodeRec.record.isDeleted).toBe(true)
-    const msgRec = await backend.get(owner, 'chat-message', 'm1')
-    expect(msgRec.kind === 'found' && msgRec.record.isDeleted).toBe(true)
+    // idempotent:删已软删 → 204;missing → 404
+    expect((await req(app, '/api/projects/p1', { method: 'DELETE', headers: hdr(KEY_A) })).status).toBe(204)
+    expect((await req(app, '/api/projects/never', { method: 'DELETE', headers: hdr(KEY_A) })).status).toBe(404)
+  })
 
-    // DELETE 幂等:再删一次 → 204(已删)
-    const del2 = await req(app, '/api/projects/p1', { method: 'DELETE', headers: hdr(KEY_A) })
-    expect(del2.status).toBe(204)
-    // DELETE missing → 404
-    const del3 = await req(app, '/api/projects/never', { method: 'DELETE', headers: hdr(KEY_A) })
-    expect(del3.status).toBe(404)
+  it('返修 #10:幂等跨 type 不串(POST project + POST canvas 同 idempotency-key → 两条独立)', async () => {
+    const a = await req(app, '/api/projects', { method: 'POST', headers: { ...hdr(KEY_A), 'idempotency-key': 'k1' }, body: JSON.stringify({ id: 'p1', name: 'P' }) })
+    expect(a.status).toBe(201)
+    const c = await req(app, '/api/canvas', { method: 'POST', headers: { ...hdr(KEY_A), 'idempotency-key': 'k1' }, body: JSON.stringify({ id: 'c1', projectId: 'p1' }) })
+    expect(c.status).toBe(201) // 跨 type 不串
+    // 同 type 同 key → 幂等回放 200
+    const a2 = await req(app, '/api/projects', { method: 'POST', headers: { ...hdr(KEY_A), 'idempotency-key': 'k1' }, body: JSON.stringify({ id: 'p1', name: 'P' }) })
+    expect(a2.status).toBe(200)
+  })
+
+  it('返修 #12:413 body 完整 TooLargeBody', async () => {
+    const big = await req(app, '/api/projects', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ id: 'p-big', name: 'x'.repeat(1_100_000) }) })
+    expect(big.status).toBe(413)
+    expect(big.body).toEqual({ error: 'request-body-too-large', limit: 1048576 })
   })
 
   it('malformed X-Mivo-Api-Key → 400(无 env 回退,F4 边界)', async () => {
