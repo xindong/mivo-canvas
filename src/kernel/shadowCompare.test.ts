@@ -257,3 +257,111 @@ describe('S5 createShadowScheduler — 去抖护栏(Lead 补充要求 1)', () =>
     }
   })
 })
+
+// ─── createShadowScheduler.scheduleProjected(S6d round-trip 去抖)──────────
+// S6d P2 修复:整个 round-trip(project+compare)延后到 settle 后跑一次。本组验证
+// project 闭包在 timeout 内才调 + N 次连续 schedule 只跑一次 round-trip(原 schedule
+// 只省 compare 不省 round-trip;scheduleProjected 省 round-trip)。
+describe('S6d createShadowScheduler.scheduleProjected — round-trip 延后去抖', () => {
+  it('连续 schedule N 次只调一次 project(round-trip 去抖,render 期零 hydrate)', () => {
+    vi.useFakeTimers()
+    try {
+      const onDiff = vi.fn()
+      let projectCalls = 0
+      const project = (doc: CanvasDocument) => {
+        projectCalls += 1
+        return roundTrip(doc)
+      }
+      const sched = createShadowScheduler(onDiff, 300)
+      const doc = makeDoc({ nodes: [makeNode({ id: 'n1', title: 'a' })] })
+      // 模拟 20k 连续编辑:debounce 期内连 5 次 scheduleProjected。project 应零次(render 期不跑)
+      for (let i = 0; i < 5; i += 1) sched.scheduleProjected(doc, project, 'scene1')
+      expect(projectCalls).toBe(0) // round-trip 延后,未到 settle
+      vi.advanceTimersByTime(299)
+      expect(projectCalls).toBe(0) // 299ms 仍未到 300
+      vi.advanceTimersByTime(2) // 总 301ms → settle
+      expect(projectCalls).toBe(1) // 5 次 schedule 只跑一次 round-trip
+      expect(onDiff).not.toHaveBeenCalled() // round-trip 无损 → 一致(shadow 静默)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('cancel 清未触发的 round-trip(project 不调)', () => {
+    vi.useFakeTimers()
+    try {
+      const onDiff = vi.fn()
+      const project = vi.fn((doc: CanvasDocument) => roundTrip(doc))
+      const sched = createShadowScheduler(onDiff, 300)
+      const doc = makeDoc({ nodes: [makeNode({ id: 'n1' })] })
+      sched.scheduleProjected(doc, project, 's')
+      sched.cancel()
+      vi.advanceTimersByTime(1000)
+      expect(project).not.toHaveBeenCalled()
+      expect(onDiff).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('分歧(project 输出篡改)→ onDiff 收到 finding(record id + field path + sceneId)', () => {
+    vi.useFakeTimers()
+    try {
+      const onDiff = vi.fn()
+      const project = (doc: CanvasDocument) => {
+        const p = roundTrip(doc)
+        p.nodes[0].title = 'TAMPERED'
+        return p
+      }
+      const sched = createShadowScheduler(onDiff, 300)
+      const doc = makeDoc({ nodes: [makeNode({ id: 'n1', title: 'orig' })] })
+      sched.scheduleProjected(doc, project, 'sceneX')
+      vi.advanceTimersByTime(300)
+      expect(onDiff).toHaveBeenCalledTimes(1)
+      const [finding, sid] = onDiff.mock.calls[0]
+      expect(finding.recordId).toBe('n1')
+      expect(finding.fieldPath).toBe('nodes[0].title')
+      expect(finding.expected).toBe('orig')
+      expect(finding.actual).toBe('TAMPERED')
+      expect(sid).toBe('sceneX')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('一致(project round-trip 无损)→ onDiff 不调(shadow 静默)', () => {
+    vi.useFakeTimers()
+    try {
+      const onDiff = vi.fn()
+      const sched = createShadowScheduler(onDiff, 300)
+      const doc = makeDoc({ nodes: [makeNode({ id: 'n1' })] })
+      sched.scheduleProjected(doc, (d) => roundTrip(d), 's')
+      vi.advanceTimersByTime(300)
+      expect(onDiff).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('最新 document 胜出(连续 schedule 不同 doc,settle 后只比对最后一次)', () => {
+    vi.useFakeTimers()
+    try {
+      const onDiff = vi.fn()
+      const seen: string[] = []
+      const project = (doc: CanvasDocument) => {
+        seen.push(doc.nodes[0].id)
+        return roundTrip(doc)
+      }
+      const sched = createShadowScheduler(onDiff, 300)
+      // 连续 3 个不同 document(模拟编辑改 node id):只有最后一个进入比对
+      sched.scheduleProjected(makeDoc({ nodes: [makeNode({ id: 'a' })] }), project, 's')
+      sched.scheduleProjected(makeDoc({ nodes: [makeNode({ id: 'b' })] }), project, 's')
+      sched.scheduleProjected(makeDoc({ nodes: [makeNode({ id: 'c' })] }), project, 's')
+      vi.advanceTimersByTime(300)
+      expect(seen).toEqual(['c']) // 只 project 最后一个
+      expect(onDiff).not.toHaveBeenCalled() // round-trip 无损 → 一致
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
