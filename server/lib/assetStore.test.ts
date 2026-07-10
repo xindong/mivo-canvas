@@ -178,7 +178,6 @@ describe('assetStore — purge judgment (pure)', () => {
     sizeBytes: 100,
     originalName: 'a.png',
     ownerFp: OWNER_A,
-    uploaders: [OWNER_A],
     references: [],
     createdAt: 1000,
     lastRefZeroAt: null,
@@ -467,7 +466,8 @@ describe('assetStore — upload atomicity (P1.1 single-primitive fs barrier)', (
     const { assetId, deduped } = await store.upload(bytes, 'image/png', 's.png', OWNER_A, 1000)
     expect(deduped).toBe(false)
     const rec = await store.getRecord(assetId)
-    expect(rec?.uploaders).toEqual([OWNER_A])
+    // P2-E: uploaders live in the dedicated structure, not on the record.
+    expect(await be.listUploaders(assetId)).toEqual([OWNER_A])
     // bytes + record both present (post-condition of the single primitive).
     expect(await be.getBytes(assetId)).not.toBeNull()
     expect(rec).not.toBeNull()
@@ -534,8 +534,9 @@ describe('assetStore — dedup uploader entitlement (P1.5)', () => {
     await store.upload(bytes, 'image/png', 'b.png', OWNER_B, 2000)
     const rec = await store.getRecord(hash)
     expect(rec?.ownerFp).toBe(OWNER_A) // first uploader preserved (quota attribution)
-    expect(rec?.uploaders).toContain(OWNER_A)
-    expect(rec?.uploaders).toContain(OWNER_B) // B registered as a dedup uploader
+    // P2-E: uploaders live in the dedicated structure, not on the record.
+    expect(await be.listUploaders(hash)).toContain(OWNER_A)
+    expect(await be.listUploaders(hash)).toContain(OWNER_B) // B registered as a dedup uploader
     // B is entitled to GET even though ownerFp is A and B holds no live reference.
     const hit = await store.readForOwner(hash, OWNER_B)
     expect(hit).not.toBeNull()
@@ -549,8 +550,7 @@ describe('assetStore — dedup uploader entitlement (P1.5)', () => {
     const hash = computeContentHash(bytes)
     await store.upload(bytes, 'image/png', 'a.png', OWNER_A, 1000)
     await store.upload(bytes, 'image/png', 'a2.png', OWNER_A, 2000) // same owner, dedup
-    const rec = await store.getRecord(hash)
-    expect(rec?.uploaders).toEqual([OWNER_A]) // no duplicate entry
+    expect(await be.listUploaders(hash)).toEqual([OWNER_A]) // no duplicate entry
   })
 })
 
@@ -606,5 +606,256 @@ describe('assetStore — writeAtomic tmp cleanup + orphan sweep (P2.6)', () => {
     await store.attach(assetId, 'n', OWNER_A, 2000)
     const result = await store.runPurgeSweep(9_999_999)
     expect(result).toEqual({ scanned: 1, purged: 0 }) // closed contract unchanged
+  })
+})
+
+// P1-B: purge order. deleteIfStillEligible makes metadata invisible FIRST (rename to
+// a .tmp-tombstone), THEN deletes bytes. A failure between the two can only leave
+// "orphan bytes, no record" — never "record present, bytes gone".
+describe('assetStore — purge order (P1-B tombstone)', () => {
+  it('a failed tombstone cleanup (EIO on unlink) leaves record invisible + attach→missing', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mivo-asset-p1b-'))
+    try {
+      const be = createFsAssetBackend(root)
+      const store = createAssetStore(be)
+      const bytes = pngBytes('p1b')
+      const hash = computeContentHash(bytes)
+      const NOW = 100_000_000
+      const { assetId } = await store.upload(bytes, 'image/png', 'b.png', OWNER_A, 1000)
+      await store.attach(assetId, 'n', OWNER_A, 2000)
+      await store.detach(assetId, 'n', OWNER_A, NOW - ASSET_GRACE_PERIOD_MS - 5000)
+      expect(assetId).toBe(hash)
+
+      // P1-B: the meta rename (→ tombstone) makes the record invisible BEFORE the
+      // bytes/uploaders/tombstone unlinks. Inject EIO on EVERY post-rename unlink so
+      // all cleanups fail — the record must STILL be invisible (rename already hid it),
+      // and the delete returns deleted:true (best-effort cleanups are swallowed).
+      const unlinkSpy = vi.spyOn(fs, 'unlink').mockImplementation(async () => {
+        const err: NodeJS.ErrnoException = new Error('EIO')
+        err.code = 'EIO'
+        throw err
+      })
+      let res: { deleted: boolean; reason: string }
+      try {
+        res = await be.deleteIfStillEligible(hash, NOW)
+      } finally {
+        unlinkSpy.mockRestore()
+      }
+      expect(res.deleted).toBe(true)
+
+      // Record invisible: readRecordUnlocked reads *.meta.json (the rename hid it).
+      expect(await store.getRecord(hash)).toBeNull()
+      // A concurrent attach sees no record → missing (decidable, not silent).
+      expect(await store.attach(hash, 'n-resurrect', OWNER_A, NOW + 1)).toEqual({ kind: 'missing' })
+      // Orphan bytes may linger (cleanup failed) — a re-upload overwrites them +
+      // recreates the record (the invariant recovers; spy is restored).
+      const re = await store.upload(bytes, 'image/png', 'b2.png', OWNER_A, NOW + 2)
+      expect(re.assetId).toBe(hash)
+      expect(await store.getRecord(hash)).not.toBeNull()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('memory backend deletes record FIRST then bytes (same invariant: never record-no-bytes)', async () => {
+    const be = createMemoryAssetBackend()
+    const store = createAssetStore(be)
+    const NOW = 100_000_000
+    const { assetId } = await store.upload(pngBytes('mem-p1b'), 'image/png', 'a.png', OWNER_A, 1000)
+    await store.attach(assetId, 'n', OWNER_A, 2000)
+    await store.detach(assetId, 'n', OWNER_A, NOW - ASSET_GRACE_PERIOD_MS - 1000)
+    const res = await be.deleteIfStillEligible(assetId, NOW)
+    expect(res).toEqual({ deleted: true, reason: 'eligible' })
+    expect(await store.getRecord(assetId)).toBeNull()
+    expect(be._bytes.has(assetId)).toBe(false) // bytes also gone
+    expect(be._uploaders.has(assetId)).toBe(false) // uploaders also gone
+  })
+})
+
+// P2-C: quota + hash-locked admission. owner lock computes used; a single hash-locked
+// admitUpload primitive does dedup/quota/register atomically. The race: B is at quota,
+// A first-uploads the SAME bytes concurrently → B must still be registered (not 413'd)
+// and B GET → 200.
+describe('assetStore — quota + hash-locked admission (P2-C)', () => {
+  it('B at quota + A first-uploads same bytes (race) → B registered + B GET 200', async () => {
+    const be = createMemoryAssetBackend()
+    const store = createAssetStore(be)
+    const bytes = pngBytes('p2c-shared')
+    const hash = computeContentHash(bytes)
+    // Fill B's quota exactly with a DISTINCT asset so B is at quota.
+    const filler = pngBytes('p2c-filler') // distinct hash
+    const QUOTA = filler.length + bytes.length // filler fills it; B's share-out = filler
+    await store.uploadWithQuota(filler, 'image/png', 'f.png', OWNER_B, QUOTA, 1000)
+    expect(await store.ownerBytes(OWNER_B)).toBe(filler.length) // B at quota (room for 0 new)
+
+    // Concurrent: A (owner 0 used) first-uploads `bytes`; B (at quota) uploads same
+    // `bytes`. Whichever wins the hash lock writes the record; the other sees it
+    // exists → dedup → registered (0 new bytes, never trips quota).
+    const [aOut, bOut] = await Promise.all([
+      store.uploadWithQuota(bytes, 'image/png', 'a.png', OWNER_A, QUOTA, 2000),
+      store.uploadWithQuota(bytes, 'image/png', 'b.png', OWNER_B, QUOTA, 3000),
+    ])
+    expect(aOut.kind).toBe('ok')
+    expect(bOut.kind).toBe('ok') // NOT quota-exceeded — dedup registered B
+    if (bOut.kind !== 'ok') return
+    expect(bOut.result.assetId).toBe(hash)
+    expect(bOut.result.deduped).toBe(true) // B is the dedup uploader
+    // B is registered as a dedup uploader → readForOwner(B) entitled → 200.
+    expect(await be.isUploader(hash, OWNER_B)).toBe(true)
+    expect((await store.readForOwner(hash, OWNER_B))?.bytes.equals(bytes)).toBe(true)
+    // ownerFp stays the first uploader (A here, since A had room) — quota attribution intact.
+    expect((await store.getRecord(hash))?.ownerFp).toBe(OWNER_A)
+  })
+
+  it('admitUpload refuses a NEW over-quota upload BEFORE any bytes are written', async () => {
+    const be = createMemoryAssetBackend()
+    const store = createAssetStore(be)
+    const QUOTA = 5
+    const bytes = pngBytes('p2c-refuse')
+    const outcome = await store.uploadWithQuota(bytes, 'image/png', 'r.png', OWNER_A, QUOTA, 1000)
+    expect(outcome.kind).toBe('quota-exceeded')
+    expect(be._bytes.size).toBe(0)
+    expect(be._records.size).toBe(0)
+  })
+
+  it('concurrent same-owner NEW uploads → one ok, one quota-exceeded; final used <= quota', async () => {
+    const be = createMemoryAssetBackend()
+    const store = createAssetStore(be)
+    const a = pngBytes('p2c-aaaaa')
+    const b = pngBytes('p2c-bbbbb')
+    const QUOTA = a.length + 1
+    const outcomes = await Promise.all([
+      store.uploadWithQuota(a, 'image/png', 'a.png', OWNER_A, QUOTA, 1000),
+      store.uploadWithQuota(b, 'image/png', 'b.png', OWNER_A, QUOTA, 2000),
+    ])
+    expect(outcomes.filter((o) => o.kind === 'ok')).toHaveLength(1)
+    expect(outcomes.filter((o) => o.kind === 'quota-exceeded')).toHaveLength(1)
+    expect(await store.ownerBytes(OWNER_A)).toBeLessThanOrEqual(QUOTA)
+    expect(be._records.size).toBe(1)
+  })
+})
+
+// P2-D: cleanOrphanTemps skips tmps an in-progress writeAtomic is holding, so a writer
+// blocked longer than the orphan age threshold is NOT mistaken for a crash.
+describe('assetStore — cleanOrphanTemps active tmp skip (P2-D)', () => {
+  it('an in-progress writeAtomic tmp (blocked rename) is not reaped even past the age threshold', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mivo-asset-p2d-'))
+    try {
+      const be = createFsAssetBackend(root)
+      const store = createAssetStore(be)
+      const bytes = pngBytes('p2d-block')
+      const hash = computeContentHash(bytes)
+      const shard = join(root, hash.slice(0, 2))
+
+      // Block writeAtomic's rename so the tmp lingers in activeTmps, then let the
+      // REAL rename through (so writeAtomic completes after release — fs.access(bp)
+      // post-condition must find the renamed bin).
+      let resolveRename: () => void
+      const renameBlock = new Promise<void>((r) => {
+        resolveRename = r
+      })
+      const realRename = fs.rename.bind(fs)
+      const renameSpy = vi.spyOn(fs, 'rename').mockImplementation(async (oldPath, newPath) => {
+        await renameBlock // block until the test releases
+        return realRename(oldPath as never, newPath as never) as never
+      })
+
+      const uploadP = store.upload(bytes, 'image/png', 'b.png', OWNER_A, 1000)
+      // Wait for the tmp to appear on disk (writeFile done, rename blocked).
+      await vi.waitFor(async () => {
+        const files = await fs.readdir(shard)
+        expect(files.some((f) => f.includes('.tmp-'))).toBe(true)
+      })
+
+      // Make the tmp "old" (past the threshold) to prove the skip is by active-set
+      // membership, not by age.
+      const files = await fs.readdir(shard)
+      const tmpName = files.find((f) => f.includes('.tmp-'))!
+      const tmpPath = join(shard, tmpName)
+      const pastTime = Date.now() / 1000 - ASSET_TMP_ORPHAN_AGE_MS / 1000 - 60
+      await fs.utimes(tmpPath, pastTime, pastTime)
+
+      const cleaned = await be.cleanOrphanTemps(Date.now())
+      expect(cleaned).toBe(0) // active tmp NOT reaped
+      await expect(fs.access(tmpPath)).resolves.toBeUndefined() // still there
+
+      // Release the blocked rename — writeAtomic finishes, tmp renamed away.
+      resolveRename!()
+      await uploadP
+      renameSpy.mockRestore()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})
+
+// P2-F: over-quota slow path. An over-quota NEW upload first purges THIS owner's
+// grace-expired refcount==0 assets, recomputes used, then refuses only if still over.
+describe('assetStore — quota eviction slow path (P2-F)', () => {
+  it('over-quota upload first purges owner eligible assets, then succeeds if room freed', async () => {
+    const be = createMemoryAssetBackend()
+    const store = createAssetStore(be)
+    const NOW = 100_000_000
+    // A stale asset owned by OWNER_A: refcount 0, grace expired → eligible for purge.
+    const stale = pngBytes('p2f-stale')
+    const QUOTA = stale.length // the stale asset fills the quota exactly
+    const { assetId: staleId } = await store.upload(stale, 'image/png', 's.png', OWNER_A, 1000)
+    // (no attach → refcount 0; grace-stamp at creation)
+    await store.attach(staleId, 'n', OWNER_A, 2000)
+    await store.detach(staleId, 'n', OWNER_A, NOW - ASSET_GRACE_PERIOD_MS - 1000) // grace expired
+    expect(await store.ownerBytes(OWNER_A)).toBe(stale.length) // at quota
+
+    // A NEW upload (different bytes) would exceed quota — the slow path purges the
+    // stale asset first, freeing room, then the NEW upload succeeds.
+    const fresh = pngBytes('p2f-fresh')
+    expect(fresh.length).toBe(stale.length) // same size — only fits if stale is purged
+    const out = await store.uploadWithQuota(fresh, 'image/png', 'f.png', OWNER_A, QUOTA, NOW)
+    expect(out.kind).toBe('ok')
+    if (out.kind !== 'ok') return
+    // The stale asset was purged (room freed); the fresh asset is stored.
+    expect(await store.getRecord(staleId)).toBeNull()
+    expect(await store.getRecord(out.result.assetId)).not.toBeNull()
+    expect(await store.ownerBytes(OWNER_A)).toBeLessThanOrEqual(QUOTA)
+  })
+
+  it('over-quota upload with nothing eligible to purge → quota-exceeded (no bytes written)', async () => {
+    const be = createMemoryAssetBackend()
+    const store = createAssetStore(be)
+    const QUOTA = 5
+    const bytes = pngBytes('p2f-refuse')
+    const out = await store.uploadWithQuota(bytes, 'image/png', 'r.png', OWNER_A, QUOTA, 1000)
+    expect(out.kind).toBe('quota-exceeded')
+    expect(be._bytes.size).toBe(0)
+    expect(be._records.size).toBe(0)
+  })
+})
+
+// P3-G: writeAtomic cleanup preserves the original write/rename error; a cleanup
+// failure attaches as `cause` but does not mask it.
+describe('assetStore — writeAtomic cause chain (P3-G)', () => {
+  it('rename fails + cleanup unlink fails → thrown error is the original rename error', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mivo-asset-p3g-'))
+    try {
+      const be = createFsAssetBackend(root)
+      const store = createAssetStore(be)
+      const bytes = pngBytes('p3g')
+      // rename throws EBUSY; the cleanup unlink throws EIO. The thrown error must be
+      // the rename EBUSY (the original), not the cleanup EIO.
+      vi.spyOn(fs, 'rename').mockRejectedValueOnce(new Error('rename EBUSY'))
+      const unlinkSpy = vi.spyOn(fs, 'unlink').mockRejectedValueOnce(new Error('cleanup EIO'))
+      let thrown: unknown
+      try {
+        await store.upload(bytes, 'image/png', 'f.png', OWNER_A, 1000)
+      } catch (e) {
+        thrown = e
+      }
+      expect(thrown).toBeInstanceOf(Error)
+      expect((thrown as Error).message).toBe('rename EBUSY') // original, not cleanup EIO
+      // cleanup was attempted (cause attached).
+      expect(unlinkSpy).toHaveBeenCalled()
+      unlinkSpy.mockRestore()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 })

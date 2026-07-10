@@ -67,6 +67,13 @@ export type MivoEnvConfig = {
   // this owner). Over-quota uploads return 413 with code=quota_exceeded. Default is
   // conservative (100 MB ≈ 20–100 images); env-tunable via MIVO_ASSET_OWNER_QUOTA_BYTES.
   assetOwnerQuotaBytes: number
+  // P1-A: decode-bomb guards applied by canonicalizeImage BEFORE the full decode is
+  // committed. A small compressed payload can expand to a huge uncompressed buffer,
+  // so both the per-frame dimension and the total decoded pixel count (across all
+  // frames of an animation) are bounded. Defaults: 12000×12000 frame, 144M pixels.
+  // Env-tunable via MIVO_ASSET_MAX_DIMENSION / MIVO_ASSET_MAX_PIXELS.
+  assetMaxDimension: number
+  assetMaxPixels: number
 }
 
 const num = (value: string | undefined, fallback: number): number => {
@@ -111,6 +118,9 @@ export const getEnvConfig = (): MivoEnvConfig => {
     variationsConcurrency: num(process.env.MIVO_VARIATIONS_CONCURRENCY, 4),
     // P1.4: per-owner asset quota (default 100 MB — conservative; env-tunable).
     assetOwnerQuotaBytes: num(process.env.MIVO_ASSET_OWNER_QUOTA_BYTES, 100 * 1024 * 1024),
+    // P1-A: decode-bomb guards (defaults: 12000×12000 frame, 144M total pixels).
+    assetMaxDimension: num(process.env.MIVO_ASSET_MAX_DIMENSION, 12000),
+    assetMaxPixels: num(process.env.MIVO_ASSET_MAX_PIXELS, 144_000_000),
   }
 }
 

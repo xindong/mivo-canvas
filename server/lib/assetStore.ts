@@ -1,6 +1,8 @@
 // server/lib/assetStore.ts
-// T1.5 content-addressed asset store. assetId = sha256(bytes) full hex (64) —
-// content-addressed: identical bytes → identical id → shared storage (dedup).
+// T1.5 content-addressed asset store. assetId = sha256(canonical bytes) full hex (64) —
+// content-addressed: identical canonical bytes → identical id → shared storage (dedup).
+// The ROUTE (server/routes/assets.ts) hands sharp's canonical re-encode to upload(); the
+// store is bytes-agnostic (it stores whatever Buffer + mimeType it's given).
 //
 // Refcount model (P1.2 — reference table, NOT a stored counter):
 // - The asset record holds a REFERENCE TABLE: references = [{ nodeId, ownerFp }].
@@ -18,16 +20,26 @@
 //   detach returns { kind: 'owner-mismatch' } (decidable, not silent). A missing
 //   asset returns { kind: 'missing' } (decidable).
 //
-// Uploader entitlement (P1.5): record.uploaders is the SET of owners who have
-// successfully POSTed these bytes (idempotent on dedup). readForOwner serves the
-// uploader OR any owner holding a live reference. A dedup uploader can always GET
-// their own upload even though ownerFp (first uploader, used for quota) is someone
-// else — content-addressed dedup must not strand the second uploader's read access.
+// Uploader entitlement (P1.5) + separate uploader structure (P2-E): uploaders live in
+// a DEDICATED structure (fs: <hash>.uploaders file, one ownerFp per line; memory: a
+// Map<hash,Set>) — NOT on the record JSON, so a hot asset dedup'd by many owners can't
+// bloat the record. readForOwner serves the uploader (first-uploader ownerFp is on the
+// record; dedup uploaders are looked up via isUploader) OR any owner holding a live
+// reference. A dedup uploader can always GET their own upload even though ownerFp
+// (first uploader, used for quota) is someone else — content-addressed dedup must not
+// strand the second uploader's read access.
 //
 // Grace + purge (docs/decisions/soft-delete-semantics.md §4):
 // - refcount == 0 → stamp lastRefZeroAt (grace start). 7-day window covers single-
 //   node undo + canvas restore. If refcount rises during grace → cancel delete.
-// - Grace expired + still 0 → physically delete bytes + record (irreversible).
+// - Grace expired + still 0 → physically delete bytes + record + uploaders.
+//
+// Purge order (P1-B): within the hash lock, deleteIfStillEligible makes metadata
+// invisible FIRST (atomic rename of <hash>.meta.json → a .tmp-tombstone), THEN unlinks
+// bytes + uploaders + the tombstone. Any failure between can only leave "orphan bytes
+// / orphan uploaders, NO record" — never "record present, bytes gone" (the half-state
+// that would make a later GET find a record but read null bytes). The tombstone is a
+// .tmp-* file so cleanOrphanTemps reaps it if its own cleanup unlink fails.
 //
 // Atomicity (P1.1): the backend contract is per-hash atomic primitives (no
 // read-modify-write across the public boundary). The fs impl serializes per-hash
@@ -35,6 +47,19 @@
 // atomic rename (a crash mid-write never leaves a partial file). deleteIfStill-
 // Eligible re-checks eligibility UNDER the lock, so a concurrent attach that
 // resurrects the asset causes the sweep to abort the delete.
+//
+// Quota + hash-locked admission (P2-C): uploadWithQuota computes `used` under the
+// per-OWNER lock, then calls a single hash-locked admitUpload primitive. Inside the
+// hash lock: if the record already exists → register the uploader unconditionally
+// (dedup, 0 new bytes, never trips quota — the race where B is at quota and A first-
+// uploads the same bytes must still register B); if NEW → the quota gate runs BEFORE
+// any bytes are written. Lock ordering is owner→hash (no path acquires hash then
+// owner), so there is no deadlock.
+//
+// Quota eviction slow path (P2-F): when an over-quota NEW upload would be refused,
+// first purge THIS owner's grace-expired refcount==0 assets (runPurgeSweep targeted),
+// recompute `used`, then refuse only if still over. runPurgeSweep is also a callable
+// entry for a periodic cron (recommended; see docs/decisions/soft-delete-semantics.md).
 //
 // Path traversal (P2.6): every public AssetStore method AND every fs backend
 // method validates lowercase sha256 hex64 and throws InvalidAssetIdError — a
@@ -44,6 +69,11 @@
 // once at write time (contentHash IS the hash of the bytes); the read path does a
 // cheap size check (bytes.length === record.sizeBytes). scrubAssetIntegrity() is an
 // offline callable that recomputes sha256 for every record and reports mismatches.
+//
+// Orphan tmp reaping (P2.6 + P2-D): cleanOrphanTemps reaps stale .tmp-* files left
+// by a crashed writeAtomic, but SKIPS tmps that an in-progress writeAtomic is holding
+// (the activeTmp set) — so a writer blocked longer than the age threshold is NOT
+// mistaken for a crash. Only tmps both stale AND inactive are unlinked.
 //
 // Storage backend is swappable via AssetStoreBackend. The fs impl is the dev /
 // pre-PG backend. T1.1 lands PG → swap createFsAssetBackend for a PG backend; the
@@ -81,13 +111,10 @@ export type AssetRecord = {
   sizeBytes: number
   originalName: string
   /** First uploader's ownerFp (FX-2 fingerprintOfPlatformKey) — 归属打标 + quota
-   *  attribution (ownerBytes sums records whose ownerFp matches). metadata only. */
+   *  attribution (ownerBytes sums records whose ownerFp matches). metadata only.
+   *  The full uploader SET lives in a dedicated structure (P2-E) — not on the record
+   *  JSON — so a many-uploader asset can't bloat the record. */
   ownerFp: string
-  /** Uploader owner set (P1.5 — read entitlement). Every owner who has successfully
-   *  POSTed these bytes is idempotently registered here, so a dedup uploader can GET
-   *  their upload even though ownerFp (first uploader) is someone else. Initialized
-   *  [ownerFp] on create; ownerFp is always uploaders[0]. */
-  uploaders: string[]
   /** The reference table. refcount = references.length (derived, not a stored counter). */
   references: AssetReference[]
   createdAt: number
@@ -151,10 +178,26 @@ export type AssetStoreBackend = {
     init: AssetRecordInit,
     now: number,
   ): Promise<{ record: AssetRecord; newlyWritten: boolean; newlyCreated: boolean }>
+  /** Atomic hash-locked quota admission (P2-C). Under the per-hash lock: if the record
+   *  already exists → idempotently register the uploader (dedup, 0 new bytes, never
+   *  trips quota — the B-at-quota + A-first-uploads-same-bytes race must still register
+   *  B); if NEW → the quota gate runs BEFORE any bytes are written (refuse → return
+   *  quota-exceeded without writing). */
+  admitUpload(
+    bytes: Buffer,
+    init: AssetRecordInit,
+    ownerFp: string,
+    quotaBytes: number,
+    used: number,
+    now: number,
+  ): Promise<
+    | { kind: 'ok'; record: AssetRecord; newlyWritten: boolean; newlyCreated: boolean }
+    | { kind: 'quota-exceeded'; used: number; quota: number; size: number }
+  >
   getBytes(contentHash: string): Promise<Buffer | null>
   getRecord(contentHash: string): Promise<AssetRecord | null>
-  /** Atomic: ensure a record exists (create with references=[] + uploaders=[ownerFp]
-   *  + lastRefZeroAt=now if absent). Returns the record + newlyCreated. */
+  /** Atomic: ensure a record exists (create with references=[] + lastRefZeroAt=now
+   *  if absent). Returns the record + newlyCreated. */
   ensureRecord(init: AssetRecordInit, now: number): Promise<{ record: AssetRecord; newlyCreated: boolean }>
   /** Atomic: attach (assetId, nodeId, ownerFp) if a record exists. Idempotent.
    *  Returns the resulting record (or null if no record) + newlyAttached. */
@@ -162,15 +205,26 @@ export type AssetStoreBackend = {
   /** Atomic: detach (assetId, nodeId) if ownerFp matches. Idempotent + owner-checked.
    *  Stamps lastRefZeroAt on the >0→0 transition. Returns the detach result + record. */
   detachRef(contentHash: string, nodeId: string, ownerFp: string, now: number): Promise<{ result: DetachResult; record: AssetRecord | null }>
-  /** Atomic: re-check eligibility at `now` UNDER the lock; delete bytes+record if still
-   *  eligible. Aborts if a concurrent op resurrected the asset. */
+  /** Atomic (P1-B): re-check eligibility at `now` UNDER the lock; make metadata
+   *  invisible FIRST (rename to tombstone), then delete bytes + uploaders + tombstone.
+   *  Any failure leaves "orphan bytes/uploaders, no record" — never "record, no bytes". */
   deleteIfStillEligible(contentHash: string, now: number): Promise<{ deleted: boolean; reason: 'eligible' | 'not-eligible' | 'missing' }>
   listRecords(): Promise<AssetRecord[]>
-  /** Sweep helper (P2.6): reap orphan `.tmp-*` files left by a crashed writeAtomic
-   *  (rename/write threw before the tmp was cleaned). Only files older than the
-   *  threshold are removed — a writeAtomic in progress holds a fresh tmp. Returns
-   *  the count of temps unlinked. No-op for backends without a tmp layer. */
+  /** Sweep helper (P2.6 + P2-D): reap orphan `.tmp-*` files left by a crashed
+   *  writeAtomic (rename/write threw before the tmp was cleaned). Skips tmps an
+   *  in-progress writeAtomic is holding (the activeTmp set). Only files older than
+   *  the threshold AND inactive are removed. Returns the count unlinked. No-op for
+   *  backends without a tmp layer. */
   cleanOrphanTemps(now: number): Promise<number>
+  /** Idempotently register an uploader for read entitlement (P1.5). Dedicated
+   *  structure (P2-E — not the record JSON). Public entry; takes the per-hash lock. */
+  registerUploader(contentHash: string, ownerFp: string): Promise<void>
+  /** True iff ownerFp has been registered as an uploader of this asset (P1.5).
+   *  Lock-free read (the .uploaders file is append-only + atomically renamed; a GET
+   *  after a completed upload always sees the appended line). */
+  isUploader(contentHash: string, ownerFp: string): Promise<boolean>
+  /** Test/diagnostic: the uploader set for an asset (P2-E). */
+  listUploaders(contentHash: string): Promise<string[]>
 }
 
 // sha256 full hex — content-addressed id. Full 256-bit (unlike ownerFp's 16-hex
@@ -200,11 +254,13 @@ export const resolveAssetStoreDir = (env: NodeJS.ProcessEnv = process.env): stri
 
 // ─── fs backend ──────────────────────────────────────────────────────────────
 // Layout: <root>/<hash[0:2]>/<hash>.bin + <root>/<hash[0:2]>/<hash>.meta.json
+//          + <root>/<hash[0:2]>/<hash>.uploaders (one ownerFp per line — P2-E)
 // 2-char sharding avoids a single flat dir of thousands of files.
 
 const shardDir = (root: string, hash: string): string => path.join(root, hash.slice(0, 2))
 const bytesPath = (root: string, hash: string): string => path.join(shardDir(root, hash), `${hash}.bin`)
 const metaPath = (root: string, hash: string): string => path.join(shardDir(root, hash), `${hash}.meta.json`)
+const uploadersPath = (root: string, hash: string): string => path.join(shardDir(root, hash), `${hash}.uploaders`)
 
 const ensureDir = async (dir: string): Promise<void> => {
   await fs.mkdir(dir, { recursive: true })
@@ -219,9 +275,9 @@ const ignoreMissing = async (p: string): Promise<void> => {
 }
 
 // Per-hash in-process mutex (P1.1). Serializes mutating ops on the same hash so
-// the read-modify-write on the meta JSON is race-free. Chained on the previous
-// tail promise; the map entry is cleaned when the last op settles. Single BFF
-// process — the PG backend (T1.1) must make these DB transactions instead.
+// the read-modify-write on the meta JSON + uploaders file is race-free. Chained on
+// the previous tail promise; the map entry is cleaned when the last op settles.
+// Single BFF process — the PG backend (T1.1) must make these DB transactions instead.
 const locks = new Map<string, Promise<void>>()
 const withHashLock = <T>(hash: string, fn: () => Promise<T>): Promise<T> => {
   const prev = locks.get(hash) ?? Promise.resolve()
@@ -237,34 +293,52 @@ const withHashLock = <T>(hash: string, fn: () => Promise<T>): Promise<T> => {
   return next
 }
 
+// In-progress writeAtomic tmp set (P2-D). cleanOrphanTemps skips these so a writer
+// blocked longer than the orphan age threshold is NOT mistaken for a crash. Module-
+// scoped: tmp paths are absolute + pid+counter-suffixed → unique across backends.
+const activeTmps = new Set<string>()
+
 // temp-write + atomic rename (P1.1). The temp suffix is process-stable + monotonic
 // so concurrent temps for the same hash can't collide (the mutex serializes them
 // anyway; this is defense in depth). rename() is atomic on POSIX → a crash
 // mid-write never publishes a partial file.
 //
-// P2.6: if writeFile/rename throws, the tmp is best-effort unlinked before rethrow
-// so a crashed write never leaves a stale .tmp-* (cleanOrphanTemps is the sweep
-// backstop for the case where even this cleanup is skipped by a hard process crash).
+// P3-G: if writeFile/rename throws, the tmp is best-effort unlinked — but a cleanup
+// FAILURE must not mask the original write/rename error. The cleanup is wrapped in
+// its own try/catch; on cleanup failure the original error is rethrown with the
+// cleanup error attached as `cause` (Node 16+ Error.cause), so diagnostics retain
+// both. cleanOrphanTemps is the sweep backstop for a tmp this cleanup also can't
+// reach (hard process crash).
 let tempCounter = 0
 const tempSuffix = (): string => `${process.pid}-${tempCounter++}`
 const writeAtomic = async (finalPath: string, data: Buffer | string, encoding?: BufferEncoding): Promise<void> => {
   await ensureDir(path.dirname(finalPath))
   const tmp = `${finalPath}.tmp-${tempSuffix()}`
+  activeTmps.add(tmp)
   try {
     if (encoding === undefined) await fs.writeFile(tmp, data as Buffer)
     else await fs.writeFile(tmp, data as string, encoding)
     await fs.rename(tmp, finalPath)
   } catch (error) {
-    await ignoreMissing(tmp)
+    // P3-G: cleanup is best-effort; a cleanup failure must not mask the original.
+    try {
+      await ignoreMissing(tmp)
+    } catch (cleanupError) {
+      const enriched = error as Error & { cause?: unknown }
+      if (!('cause' in enriched)) enriched.cause = cleanupError
+    }
     throw error
+  } finally {
+    activeTmps.delete(tmp)
   }
 }
 
-/** Orphan tmp age threshold (P2.6). A writeAtomic in progress holds a fresh tmp;
- *  any tmp older than this is from a crashed write and is reaped by cleanOrphanTemps. */
+/** Orphan tmp age threshold (P2.6). A writeAtomic in progress holds a fresh tmp +
+ *  is in activeTmps; any tmp older than this AND inactive is from a crashed write and
+ *  is reaped by cleanOrphanTemps. */
 export const ASSET_TMP_ORPHAN_AGE_MS = 5 * 60 * 1000 // 5 min
 
-/** True iff `name` is a writeAtomic tmp sibling (P2.6 sweep reap target). */
+/** True iff `name` is a writeAtomic tmp sibling OR a delete tombstone (P2.6 sweep). */
 const isOrphanTmpName = (name: string): boolean => name.includes('.tmp-')
 
 // Read a record without the lock (callers hold the lock already + have validated).
@@ -276,6 +350,30 @@ const readRecordUnlocked = async (root: string, contentHash: string): Promise<As
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
     throw error
   }
+}
+
+// Read the uploader set from the dedicated .uploaders file (P2-E). Lock-free for
+// isUploader/listUploaders (append-only + atomic rename → consistent reads); called
+// under the hash lock by registerUploaderLocked.
+const readUploadersUnlocked = async (root: string, contentHash: string): Promise<string[]> => {
+  try {
+    const raw = await fs.readFile(uploadersPath(root, contentHash), 'utf8')
+    return raw.split('\n').filter(Boolean)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+    throw error
+  }
+}
+
+// Idempotently append ownerFp to the .uploaders file (P1.5 + P2-E). Caller holds the
+// per-hash lock (no concurrent register for the same hash). appendFile is atomic for
+// the line on POSIX (O_APPEND) → a lock-free concurrent isUploader read sees either
+// the old or the new complete file, never a partial line.
+const registerUploaderLocked = async (root: string, contentHash: string, ownerFp: string): Promise<void> => {
+  const existing = await readUploadersUnlocked(root, contentHash)
+  if (existing.includes(ownerFp)) return // idempotent — no duplicate line
+  await ensureDir(shardDir(root, contentHash))
+  await fs.appendFile(uploadersPath(root, contentHash), `${ownerFp}\n`, 'utf8')
 }
 
 export const createFsAssetBackend = (root: string): AssetStoreBackend => ({
@@ -307,22 +405,14 @@ export const createFsAssetBackend = (root: string): AssetStoreBackend => ({
       }
       let record = await readRecordUnlocked(root, init.contentHash)
       let newlyCreated = false
-      let dirty = false
       if (!record) {
-        record = { ...init, references: [], uploaders: [init.ownerFp], lastRefZeroAt: now }
+        record = { ...init, references: [], lastRefZeroAt: now }
         newlyCreated = true
-        dirty = true
-      } else if (!record.uploaders?.includes(init.ownerFp)) {
-        // P1.5: idempotently register this uploader for read entitlement (a dedup
-        // uploader must be able to GET their own upload even though ownerFp — the
-        // first uploader — is someone else). Seed with [ownerFp] if the set is
-        // missing (pre-P1.5 record migrated on first dedup).
-        record = { ...record, uploaders: [...(record.uploaders ?? [record.ownerFp]), init.ownerFp] }
-        dirty = true
-      }
-      if (dirty) {
         await writeAtomic(metaPath(root, init.contentHash), JSON.stringify(record, null, 2), 'utf8')
       }
+      // P1.5 + P2-E: register the uploader in the dedicated .uploaders file (not on
+      // the record). Idempotent.
+      await registerUploaderLocked(root, init.contentHash, init.ownerFp)
       // P1.1 post-condition: bytes + record co-exist. We hold the per-hash lock, so
       // a concurrent sweep (same lock) can't have removed the bytes between the write
       // and this assert — the old two-stage design's metadata-without-bytes race is
@@ -330,6 +420,40 @@ export const createFsAssetBackend = (root: string): AssetStoreBackend => ({
       // fails loudly rather than returning a half-state record.
       await fs.access(bp)
       return { record, newlyWritten, newlyCreated }
+    })
+  },
+
+  async admitUpload(bytes, init, ownerFp, quotaBytes, used, now) {
+    assertValidAssetId(init.contentHash)
+    return withHashLock(init.contentHash, async () => {
+      const existing = await readRecordUnlocked(root, init.contentHash)
+      if (existing) {
+        // P2-C: record already exists → dedup. Register the uploader unconditionally
+        // (0 new bytes — never trips quota). This is the race winner's entitlement:
+        // B at quota + A first-uploads the same bytes → B is still registered and can
+        // GET, rather than being 413'd for bytes that already exist.
+        await registerUploaderLocked(root, init.contentHash, ownerFp)
+        return { kind: 'ok' as const, record: existing, newlyWritten: false, newlyCreated: false }
+      }
+      // NEW asset → quota gate BEFORE any bytes are written (P2-C). `used` was
+      // computed under the owner lock (held by the caller), so it is stable across
+      // this hash-locked admission.
+      if (used + bytes.length > quotaBytes) {
+        return { kind: 'quota-exceeded' as const, used, quota: quotaBytes, size: bytes.length }
+      }
+      const bp = bytesPath(root, init.contentHash)
+      let newlyWritten = false
+      try {
+        await fs.access(bp)
+      } catch {
+        await writeAtomic(bp, bytes)
+        newlyWritten = true
+      }
+      const record: AssetRecord = { ...init, references: [], lastRefZeroAt: now }
+      await writeAtomic(metaPath(root, init.contentHash), JSON.stringify(record, null, 2), 'utf8')
+      await registerUploaderLocked(root, init.contentHash, ownerFp)
+      await fs.access(bp) // post-condition: bytes + record co-exist
+      return { kind: 'ok' as const, record, newlyWritten, newlyCreated: true }
     })
   },
 
@@ -353,8 +477,9 @@ export const createFsAssetBackend = (root: string): AssetStoreBackend => ({
     return withHashLock(init.contentHash, async () => {
       const existing = await readRecordUnlocked(root, init.contentHash)
       if (existing) return { record: existing, newlyCreated: false }
-      const record: AssetRecord = { ...init, references: [], uploaders: [init.ownerFp], lastRefZeroAt: now }
+      const record: AssetRecord = { ...init, references: [], lastRefZeroAt: now }
       await writeAtomic(metaPath(root, init.contentHash), JSON.stringify(record, null, 2), 'utf8')
+      await registerUploaderLocked(root, init.contentHash, init.ownerFp)
       return { record, newlyCreated: true }
     })
   },
@@ -403,8 +528,40 @@ export const createFsAssetBackend = (root: string): AssetStoreBackend => ({
       // resurrected the asset would have taken the mutex first and flipped
       // lastRefZeroAt to null / raised refs. If still eligible here, delete.
       if (!isPurgeEligible(record, now)) return { deleted: false, reason: 'not-eligible' as const }
-      await ignoreMissing(bytesPath(root, contentHash))
-      await ignoreMissing(metaPath(root, contentHash))
+      // P1-B: make metadata invisible FIRST (atomic rename of meta.json → a
+      // .tmp-tombstone). A reader (readRecordUnlocked reads *.meta.json only) now sees
+      // no record → attach→missing, GET→404. If the rename throws non-ENOENT, the
+      // record is still visible + bytes still present — consistent; a later sweep retries.
+      const meta = metaPath(root, contentHash)
+      const tomb = `${meta}.tmp-tombstone-${tempSuffix()}`
+      try {
+        await fs.rename(meta, tomb)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+          return { deleted: false, reason: 'missing' as const } // raced away
+        }
+        throw error
+      }
+      // Bytes + uploaders + tombstone: best-effort, in that order. A failure here
+      // leaves orphan bytes/uploaders + NO record — the acceptable half-state (a
+      // future re-upload overwrites the bytes; cleanOrphanTemps reaps an old tomb).
+      // It never leaves "record present, bytes gone" (the record is already invisible).
+      try {
+        await ignoreMissing(bytesPath(root, contentHash))
+      } catch {
+        // orphan bytes linger — no record points to them
+      }
+      try {
+        await ignoreMissing(uploadersPath(root, contentHash))
+      } catch {
+        // orphan uploaders linger — readForOwner checks getRecord first, so this is
+        // never consulted without a record
+      }
+      try {
+        await ignoreMissing(tomb)
+      } catch {
+        // tombstone lingers — cleanOrphanTemps reaps it after the age threshold
+      }
       return { deleted: true, reason: 'eligible' as const }
     })
   },
@@ -448,16 +605,19 @@ export const createFsAssetBackend = (root: string): AssetStoreBackend => ({
     }
     let cleaned = 0
     for (const shard of shards) {
-      const shardDir = path.join(root, shard)
+      const dir = path.join(root, shard)
       let files: string[]
       try {
-        files = await fs.readdir(shardDir)
+        files = await fs.readdir(dir)
       } catch {
         continue
       }
       for (const file of files) {
         if (!isOrphanTmpName(file)) continue
-        const p = path.join(shardDir, file)
+        const p = path.join(dir, file)
+        // P2-D: skip tmps an in-progress writeAtomic (or tombstone phase) is holding
+        // — a writer blocked longer than the age threshold is NOT a crash.
+        if (activeTmps.has(p)) continue
         try {
           const st = await fs.stat(p)
           if (now - st.mtimeMs > ASSET_TMP_ORPHAN_AGE_MS) {
@@ -471,6 +631,23 @@ export const createFsAssetBackend = (root: string): AssetStoreBackend => ({
     }
     return cleaned
   },
+
+  async registerUploader(contentHash, ownerFp) {
+    assertValidAssetId(contentHash)
+    return withHashLock(contentHash, () => registerUploaderLocked(root, contentHash, ownerFp))
+  },
+
+  async isUploader(contentHash, ownerFp) {
+    assertValidAssetId(contentHash)
+    // Lock-free: the .uploaders file is append-only + atomically renamed on write;
+    // a GET after a completed upload always observes the appended line.
+    return (await readUploadersUnlocked(root, contentHash)).includes(ownerFp)
+  },
+
+  async listUploaders(contentHash) {
+    assertValidAssetId(contentHash)
+    return readUploadersUnlocked(root, contentHash)
+  },
 })
 
 // ─── In-memory backend (deterministic tests; no fs) ──────────────────────────
@@ -479,11 +656,22 @@ export const createFsAssetBackend = (root: string): AssetStoreBackend => ({
 export type MemoryAssetBackend = AssetStoreBackend & {
   _records: Map<string, AssetRecord>
   _bytes: Map<string, Buffer>
+  _uploaders: Map<string, Set<string>>
 }
 
 export const createMemoryAssetBackend = (): MemoryAssetBackend => {
   const _records = new Map<string, AssetRecord>()
   const _bytes = new Map<string, Buffer>()
+  const _uploaders = new Map<string, Set<string>>()
+
+  const registerUploaderSync = (contentHash: string, ownerFp: string): void => {
+    const set = _uploaders.get(contentHash) ?? new Set<string>()
+    if (!set.has(ownerFp)) {
+      set.add(ownerFp)
+      _uploaders.set(contentHash, set)
+    }
+  }
+
   const backend: AssetStoreBackend = {
     async ensureBytes(contentHash, bytes) {
       assertValidAssetId(contentHash)
@@ -491,6 +679,7 @@ export const createMemoryAssetBackend = (): MemoryAssetBackend => {
       _bytes.set(contentHash, bytes)
       return true
     },
+
     async uploadIfAbsent(bytes, init, now) {
       assertValidAssetId(init.contentHash)
       // Map ops are synchronous under the node event loop → atomic per-hash with no
@@ -503,31 +692,56 @@ export const createMemoryAssetBackend = (): MemoryAssetBackend => {
       let record = _records.get(init.contentHash)
       let newlyCreated = false
       if (!record) {
-        record = { ...init, references: [], uploaders: [init.ownerFp], lastRefZeroAt: now }
+        record = { ...init, references: [], lastRefZeroAt: now }
         _records.set(init.contentHash, record)
         newlyCreated = true
-      } else if (!record.uploaders?.includes(init.ownerFp)) {
-        record = { ...record, uploaders: [...(record.uploaders ?? [record.ownerFp]), init.ownerFp] }
-        _records.set(init.contentHash, record)
       }
+      registerUploaderSync(init.contentHash, init.ownerFp)
       return { record, newlyWritten, newlyCreated }
     },
+
+    async admitUpload(bytes, init, ownerFp, quotaBytes, used, now) {
+      assertValidAssetId(init.contentHash)
+      const existing = _records.get(init.contentHash)
+      if (existing) {
+        // P2-C: dedup → register uploader unconditionally (no charge).
+        registerUploaderSync(init.contentHash, ownerFp)
+        return { kind: 'ok' as const, record: existing, newlyWritten: false, newlyCreated: false }
+      }
+      if (used + bytes.length > quotaBytes) {
+        return { kind: 'quota-exceeded' as const, used, quota: quotaBytes, size: bytes.length }
+      }
+      let newlyWritten = false
+      if (!_bytes.has(init.contentHash)) {
+        _bytes.set(init.contentHash, bytes)
+        newlyWritten = true
+      }
+      const record: AssetRecord = { ...init, references: [], lastRefZeroAt: now }
+      _records.set(init.contentHash, record)
+      registerUploaderSync(init.contentHash, ownerFp)
+      return { kind: 'ok' as const, record, newlyWritten, newlyCreated: true }
+    },
+
     async getBytes(contentHash) {
       assertValidAssetId(contentHash)
       return _bytes.get(contentHash) ?? null
     },
+
     async getRecord(contentHash) {
       assertValidAssetId(contentHash)
       return _records.get(contentHash) ?? null
     },
+
     async ensureRecord(init, now) {
       assertValidAssetId(init.contentHash)
       const existing = _records.get(init.contentHash)
       if (existing) return { record: existing, newlyCreated: false }
-      const record: AssetRecord = { ...init, references: [], uploaders: [init.ownerFp], lastRefZeroAt: now }
+      const record: AssetRecord = { ...init, references: [], lastRefZeroAt: now }
       _records.set(init.contentHash, record)
+      registerUploaderSync(init.contentHash, init.ownerFp)
       return { record, newlyCreated: true }
     },
+
     async attachRef(contentHash, ref) {
       assertValidAssetId(contentHash)
       const record = _records.get(contentHash)
@@ -540,6 +754,7 @@ export const createMemoryAssetBackend = (): MemoryAssetBackend => {
       }
       return { record, newlyAttached: !exists }
     },
+
     async detachRef(contentHash, nodeId, ownerFp, now) {
       assertValidAssetId(contentHash)
       const record = _records.get(contentHash)
@@ -556,24 +771,44 @@ export const createMemoryAssetBackend = (): MemoryAssetBackend => {
       _records.set(contentHash, record)
       return { result: { kind: 'detached' }, record }
     },
+
     async deleteIfStillEligible(contentHash, now) {
       assertValidAssetId(contentHash)
       const record = _records.get(contentHash)
       if (!record) return { deleted: false, reason: 'missing' }
       if (!isPurgeEligible(record, now)) return { deleted: false, reason: 'not-eligible' }
-      _bytes.delete(contentHash)
+      // P1-B: record invisible FIRST, then bytes, then uploaders — never the reverse.
       _records.delete(contentHash)
+      _bytes.delete(contentHash)
+      _uploaders.delete(contentHash)
       return { deleted: true, reason: 'eligible' }
     },
+
     async listRecords() {
       return [..._records.values()]
     },
+
     async cleanOrphanTemps() {
       // No tmp layer in the memory backend — nothing to reap.
       return 0
     },
+
+    async registerUploader(contentHash, ownerFp) {
+      assertValidAssetId(contentHash)
+      registerUploaderSync(contentHash, ownerFp)
+    },
+
+    async isUploader(contentHash, ownerFp) {
+      assertValidAssetId(contentHash)
+      return _uploaders.get(contentHash)?.has(ownerFp) ?? false
+    },
+
+    async listUploaders(contentHash) {
+      assertValidAssetId(contentHash)
+      return [...(_uploaders.get(contentHash) ?? [])]
+    },
   }
-  return { ...backend, _records, _bytes }
+  return { ...backend, _records, _bytes, _uploaders }
 }
 
 // ─── Service layer (reference logic, backend-agnostic) ──────────────────────
@@ -588,8 +823,10 @@ export type AssetStore = {
     ownerFp: string,
     now?: number,
   ): Promise<UploadedAsset>
-  /** Atomic quota-reserved upload (P1.3): per-owner lock serializes the quota check
-   *  + upsert. Dedup (existing record) charges 0 new bytes → never trips quota. */
+  /** Atomic quota-reserved upload (P1.3 + P2-C + P2-F): per-owner lock serializes the
+   *  used computation, a hash-locked admission primitive does dedup/quota/register
+   *  atomically, and an over-quota NEW upload first purges THIS owner's grace-expired
+   *  assets (slow path) before refusing. Dedup charges 0 new bytes → never trips. */
   uploadWithQuota(
     bytes: Buffer,
     mimeType: string,
@@ -612,7 +849,8 @@ export type AssetStore = {
   /** Idempotent owner-checked detach (P1.2): remove (assetId, nodeId). */
   detach(assetId: string, nodeId: string, ownerFp: string, now?: number): Promise<DetachResult>
   /** Delete records + bytes whose grace has expired. Re-checks eligibility atomically
-   *  per hash (P1.1): a concurrent attach during sweep aborts that asset's delete. */
+   *  per hash (P1.1): a concurrent attach during sweep aborts that asset's delete.
+   *  Callable sweep entry — recommended cron (see docs/decisions/soft-delete-semantics.md). */
   runPurgeSweep(now?: number): Promise<{ purged: number; scanned: number }>
   /** Test/diagnostic: read a record (no IO side effect). */
   getRecord(assetId: string): Promise<AssetRecord | null>
@@ -627,8 +865,8 @@ export type AssetStore = {
 
 const nowOrDefault = (now: number | undefined): number => now ?? Date.now()
 
-// Per-owner in-process mutex (P1.3). Serializes the quota-check + upload so two
-// concurrent uploads from the same owner can't both pass the quota gate. Chained
+// Per-owner in-process mutex (P1.3). Serializes the used computation + admission so
+// two concurrent uploads from the same owner can't both pass the quota gate. Chained
 // on the previous tail promise; cleaned when the last op settles. Single BFF
 // process — the PG backend (T1.1) must make this a DB-level row lock instead.
 const ownerLocks = new Map<string, Promise<void>>()
@@ -667,6 +905,20 @@ export const createAssetStore = (backend: AssetStoreBackend): AssetStore => {
     }
   }
 
+  // P2-F: targeted purge of ONE owner's grace-expired refcount==0 assets. Frees
+  // quota room before an over-quota NEW upload is refused. (runPurgeSweep sweeps
+  // all owners; this is the owner-scoped slow-path equivalent.)
+  const purgeOwnerEligible = async (ownerFp: string, at: number): Promise<void> => {
+    const records = await backend.listRecords()
+    for (const record of records) {
+      if (record.ownerFp !== ownerFp) continue
+      if (!isPurgeEligible(record, at)) continue
+      // deleteIfStillEligible re-checks eligibility UNDER the hash lock (a concurrent
+      // attach that resurrected the asset aborts the delete).
+      await backend.deleteIfStillEligible(record.contentHash, at)
+    }
+  }
+
   const uploadWithQuota: AssetStore['uploadWithQuota'] = async (
     bytes,
     mimeType,
@@ -676,18 +928,45 @@ export const createAssetStore = (backend: AssetStoreBackend): AssetStore => {
     now,
   ) => {
     return withOwnerLock(ownerFp, async () => {
-      const used = await ownerBytes(ownerFp)
+      const at = nowOrDefault(now)
+      let used = await ownerBytes(ownerFp)
       if (used + bytes.length > quotaBytes) {
-        // Dedup (record already exists) adds 0 new bytes — must not trip quota on a
-        // re-upload. Only refuse when this would actually store NEW bytes.
-        const existing = await backend.getRecord(computeContentHash(bytes))
-        if (!existing) {
-          return { kind: 'quota-exceeded' as const, used, quota: quotaBytes, size: bytes.length }
-        }
+        // P2-F slow path: an over-quota NEW upload first frees room by purging THIS
+        // owner's grace-expired refcount==0 assets, then recomputes used. If still
+        // over, admitUpload's hash-locked gate refuses (no bytes written).
+        await purgeOwnerEligible(ownerFp, at)
+        used = await ownerBytes(ownerFp)
       }
-      const result = await upload(bytes, mimeType, originalName, ownerFp, now)
-      return { kind: 'ok' as const, result }
+      const contentHash = computeContentHash(bytes)
+      const outcome = await backend.admitUpload(
+        bytes,
+        { contentHash, mimeType, sizeBytes: bytes.length, originalName, ownerFp, createdAt: at },
+        ownerFp,
+        quotaBytes,
+        used,
+        at,
+      )
+      if (outcome.kind === 'quota-exceeded') return outcome
+      const { record, newlyWritten } = outcome
+      return {
+        kind: 'ok' as const,
+        result: {
+          assetId: contentHash,
+          mimeType: record.mimeType,
+          originalName: record.originalName,
+          sizeBytes: record.sizeBytes,
+          deduped: !newlyWritten,
+          refcount: record.references.length,
+        },
+      }
     })
+  }
+
+  const ownerBytes: AssetStore['ownerBytes'] = async (ownerFp) => {
+    const records = await backend.listRecords()
+    return records
+      .filter((r) => r.ownerFp === ownerFp)
+      .reduce((sum, r) => sum + r.sizeBytes, 0)
   }
 
   const read: AssetStore['read'] = async (assetId) => {
@@ -706,14 +985,14 @@ export const createAssetStore = (backend: AssetStoreBackend): AssetStore => {
     assertValidAssetId(assetId)
     const record = await backend.getRecord(assetId)
     if (!record) return null
-    // P1.5: a dedup uploader is entitled to GET their own upload. ownerFp (first
-    // uploader) is always in uploaders, so this subsumes the first-uploader check;
-    // the ownerFp fallback covers a pre-P1.5 record whose uploaders set is missing.
+    // P1.5 + P2-E: ownerFp (first uploader) is on the record; dedup uploaders are in
+    // the dedicated structure (isUploader); a referenced owner is in references. Any
+    // of these → entitled. Else null (→ 404 — never leak existence, P2.5).
     const ownerAllowed =
-      record.uploaders?.includes(ownerFp) ||
       record.ownerFp === ownerFp ||
+      (await backend.isUploader(assetId, ownerFp)) ||
       record.references.some((r) => r.ownerFp === ownerFp)
-    if (!ownerAllowed) return null // → 404 (don't leak existence — P2.5)
+    if (!ownerAllowed) return null
     const bytes = await backend.getBytes(assetId)
     if (!bytes) return null
     if (bytes.length !== record.sizeBytes) return null // P1.9
@@ -758,13 +1037,6 @@ export const createAssetStore = (backend: AssetStoreBackend): AssetStore => {
     assertValidAssetId(assetId)
     const r = await backend.getRecord(assetId)
     return r?.references.length ?? 0
-  }
-
-  const ownerBytes: AssetStore['ownerBytes'] = async (ownerFp) => {
-    const records = await backend.listRecords()
-    return records
-      .filter((r) => r.ownerFp === ownerFp)
-      .reduce((sum, r) => sum + r.sizeBytes, 0)
   }
 
   const scrubAssetIntegrity: AssetStore['scrubAssetIntegrity'] = async () => {
