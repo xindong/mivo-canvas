@@ -17,6 +17,7 @@ import { useCanvasStore } from './store/canvasStore'
 import { debugLogger, installConsoleCapture } from './store/debugLogStore'
 import { installRemoteDebugReporter } from './store/remoteDebugReporter'
 import { useStoreHydration } from './app/useStoreHydration'
+import { useKernelRead } from './kernel/useKernelRead'
 import type { WorkspaceView } from './app/ProjectSidebar'
 
 const SIDEBAR_PINNING_MS = 300
@@ -31,6 +32,11 @@ function App() {
   // flash the demo-seed default state. The placeholder is intentionally bare (no
   // selectors e2e waits for) so scenarios stall on the real content appearing.
   const hydrated = useStoreHydration()
+  // T1.2 S5:kernel=new shadow compare(?kernel=new 时内存 hydrate DocKernel from legacy
+  // canonical → project → 比对,不一致仅 debugLogger.warn,不回写 UI/store/服务端;legacy 默认
+  // no-op)。UI 读仍走下方 canvasStore selectors(sceneId/canvases/nodes/activeTool/selectedNodeIds
+  // 不变)——shadow 是副作用,不服务 UI 读(§4.1 B 阶段)。权威:docs/decisions/kernel-dualtrack-contract.md §4.1。
+  useKernelRead()
   const sceneId = useCanvasStore((state) => state.sceneId)
   const canvases = useCanvasStore((state) => state.canvases)
   const nodes = useCanvasStore((state) => state.nodes)
