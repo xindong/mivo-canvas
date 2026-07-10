@@ -219,6 +219,42 @@ describe('FX-3 reconcileExpiredChatTasks', () => {
     expect(msg.status).toBe('done')
     expect(msg.resultNodeIds).toEqual(['node-1']) // 既有 resultNodeIds 保留,done 分支定位链接可渲染
   })
+
+  it('P1-1 补: 带 enhance.richPrompt 且无 resultNodeIds 的卡 recover 后剥离 enhance + 兜底 text', async () => {
+    setScene('s1', [blanketSettledCard('m1', 't-done', {
+      enhance: { richPrompt: '原 richPrompt' },
+    })])
+    settleChatTasksMock.mockResolvedValue({
+      't-done': { id: 't-done', kind: 'edit', status: 'done', progress: 100, stage: 'done', requestId: 'r', model: 'gpt-image-2' },
+    })
+
+    await reconcileExpiredChatTasks()
+
+    const msg = storeState.messagesByScene['s1'][0]
+    expect(msg.status).toBe('done')
+    // 无 resultNodeIds → 剥离 enhance,否则 ChatMessageList done 文本分支门控
+    // enhance?.richPrompt === undefined 会跳过 text 渲染,兜底 text 被屏蔽 → 空白卡
+    expect(msg.enhance).toBeUndefined()
+    expect(msg.text).toBe(recoveredTaskDoneMessage) // 兜底 text 接管 done 文本分支
+  })
+
+  it('P1-1 补: 带 resultNodeIds 的卡 recover 后 enhance 保留(卡片走图渲染,richPrompt 无害)', async () => {
+    setScene('s1', [blanketSettledCard('m1', 't-done', {
+      resultNodeIds: ['node-1'],
+      enhance: { richPrompt: '原 richPrompt' },
+    })])
+    settleChatTasksMock.mockResolvedValue({
+      't-done': { id: 't-done', kind: 'edit', status: 'done', progress: 100, stage: 'done', requestId: 'r', model: 'gpt-image-2' },
+    })
+
+    await reconcileExpiredChatTasks()
+
+    const msg = storeState.messagesByScene['s1'][0]
+    expect(msg.status).toBe('done')
+    expect(msg.resultNodeIds).toEqual(['node-1'])
+    // 有 resultNodeIds → enhance 保留(卡片走 resultNodeId 图渲染,richPrompt 不影响)
+    expect(msg.enhance).toEqual({ richPrompt: '原 richPrompt' })
+  })
 })
 
 // P1-2: settle 有限重试(指数退避 3 次)。fake timers 避免真实 200/400ms 等待。

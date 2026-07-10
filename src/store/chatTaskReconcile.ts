@@ -74,6 +74,11 @@ const recoverPatchedMessage = (message: ChatMessage): ChatMessage => ({
   // resultNodeIds 渲染;b64→canvas 节点恢复需 source/mask 数据,post-hydrate 不可得(见
   // 顶部 residual 注释),属 FX-3 既有 out-of-scope。
   text: message.text || recoveredTaskDoneMessage,
+  // P1-1 补(Greptile 复扫 6198b49):...message 保留 enhance.richPrompt 时,done 文本分支
+  // 因 ChatMessageList 门控 `enhance?.richPrompt === undefined` 跳过 text 渲染 → 兜底 text 被
+  // 屏蔽,无 resultNodeIds 的恢复卡仍空白。无 resultNodeIds 时剥离 enhance,让兜底 text 接管
+  // done 文本分支;有 resultNodeIds 时保留 enhance(卡片走 resultNodeId 图渲染,richPrompt 无害)。
+  enhance: message.resultNodeIds?.length ? message.enhance : undefined,
 })
 
 /**
