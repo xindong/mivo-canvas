@@ -12,6 +12,7 @@
 | POST /api/mivo/tasks/generate | 同 /generate(JSON:prompt/imgRatio/quality/model/n) | 202 `{taskId}`;400 缺 prompt;413 body>1MB |
 | POST /api/mivo/tasks/edit | 同 /edit(multipart:image/prompt/quality/model/mask/reference[]) + 可选 `maskBounds`+`sourceSize`(P2-C2) | 202 `{taskId}`;400 缺 image/prompt;413 body>40MB |
 | POST /api/mivo/tasks/variations | multipart:`image`(源图)+`variations`(JSON `Array<{prompt?,imgRatio?,quality?,model?}>`,1..4)+可选 `model`+Idempotency-Key | 202 `{taskId,batchId,count}`;400 缺 image/variations 或超 4;413 body>40MB |
+| POST /api/mivo/tasks/settle | JSON `{taskIds:string[]}`(上限 64,FX-3) | 200 `{results:Record<taskId,TaskView>}`——仅本 owner 仍存在的任务;gone/非 owner/不存在=省略(客户端视为过期,server-confirmed settle);400 坏 key/body;413 body>1MB |
 | GET /api/mivo/tasks/:id | — | 200 `{id,kind,status,progress,stage,requestId,model,result?,failures?,batchId?,count?,error?}`;404 `{error:'unknown-task'}` |
 | DELETE /api/mivo/tasks/:id | — | 200 `{id,status:'canceled'}`;404 `{error:'unknown-task'}` |
 

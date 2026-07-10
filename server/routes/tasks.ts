@@ -26,7 +26,7 @@ import {
   readJsonBody,
 } from '../lib/request'
 import { RequestBodyTooLargeError } from '../lib/upstream'
-import { cancelTask, createTask, failTask, getTaskForOwner, toView } from '../tasks/registry'
+import { cancelTask, createTask, failTask, getTaskForOwner, toView, type TaskView } from '../tasks/registry'
 import { runEditTask, runGenerateTask, runVariationsTask, type VariationParam } from '../tasks/runner'
 
 export const tasksRoute = new Hono<{ Bindings: HttpBindings }>()
@@ -251,6 +251,51 @@ tasksRoute.post('/variations', async (c) => {
   }
   logRequest({ method: c.req.method, path: c.req.path, requestId, status: 202, latencyMs: Date.now() - t0, upstream: 'task' })
   return c.json({ taskId: record.id, batchId: record.batchId ?? batchId, count: record.count ?? variations.length }, 202)
+})
+
+// FX-3: batch per-user task settle (hydrate-time reconciliation). The client uses
+// this to recover wrongly-expired mask-edit chat cards: settleExpiredChatMessages
+// (chatStore merge) blanket-marks every in-flight message as 'error' on hydrate —
+// correct when the task is gone, WRONG when it actually succeeded on the server.
+// This returns the TaskView for each taskId the caller owns and that still exists;
+// omitted = gone/non-owner/never-existed (the client treats as expired — the
+// server-confirmed settle, replacing the blanket client-side assumption). Reuses
+// FX-2's getTaskForOwner so a cross-user probe learns nothing (omitted = same as
+// gone). 404 semantics unchanged.
+tasksRoute.post('/settle', async (c) => {
+  const requestId = newRequestId()
+  c.header('X-Request-Id', requestId)
+  const t0 = Date.now()
+  // FX-2: reject malformed X-Mivo-Api-Key at the boundary (no env fallback).
+  const badMivoKey = rejectInvalidMivoApiKey(c)
+  if (badMivoKey) {
+    logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'bad-mivo-key' })
+    return badMivoKey
+  }
+  let body: { taskIds?: unknown }
+  try {
+    body = await readJsonBody<{ taskIds?: unknown }>(c)
+  } catch (error) {
+    const status = error instanceof RequestBodyTooLargeError ? 413 : 400
+    logRequest({ method: c.req.method, path: c.req.path, requestId, status, latencyMs: Date.now() - t0, note: 'bad-body' })
+    return c.json({ error: error instanceof Error ? error.message : 'invalid body' }, status as 413 | 400)
+  }
+  // Cap the batch so a hostile/buggy caller can't enumerate unboundedly; 64 is
+  // generous for any real chat scene's in-flight mask-edit cards (the body is
+  // also capped at jsonRequestMaxBytes by readJsonBody).
+  const taskIds = (Array.isArray(body.taskIds) ? body.taskIds : [])
+    .map((x) => String(x))
+    .filter((x) => x.length > 0)
+    .slice(0, 64)
+  const ownerKey = resolvePlatformCtx(c).platformKey
+  const results: Record<string, TaskView> = {}
+  for (const id of taskIds) {
+    const record = getTaskForOwner(id, ownerKey)
+    if (record) results[id] = toView(record)
+    // omitted = gone/non-owner/never-existed → client treats as expired
+  }
+  logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0, upstream: 'task' })
+  return c.json({ results }, 200)
 })
 
 tasksRoute.get('/:id', (c) => {
