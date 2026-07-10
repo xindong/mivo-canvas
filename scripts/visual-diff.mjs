@@ -1,5 +1,6 @@
 import http from 'node:http'
 import { spawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { mkdir, writeFile } from 'node:fs/promises'
 import process from 'node:process'
 import { chromium } from 'playwright'
@@ -96,17 +97,34 @@ const parseArgs = (argv) => {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
-const waitForServer = async (url, timeoutMs = 60000, expectedStatus) => {
+const waitForServer = async (url, timeoutMs = 60000, options = {}) => {
+  const { expectedStatus, handle, probeToken } = options
   const startedAt = Date.now()
   let lastError = new Error('Timed out waiting for dev server')
   while (Date.now() - startedAt < timeoutMs) {
+    // P1-3: 每轮先探本次 spawn 的 child 是否还活着。strictPort 端口被旧进程占用时 child 会早退,
+    // 但旧进程仍在端口返 200 → 仅靠 HTTP 会误判健康 → 截图跑在旧服务。死了立即 fail fast 附 joinLog。
+    if (handle && !handle.isAlive()) {
+      throw new Error(`server exited (${handle.exitDetail()}) before becoming healthy — 端口可能被旧进程占用?\n${handle.joinLog()}`)
+    }
     try {
       await new Promise((resolve, reject) => {
         const request = http.get(url, (response) => {
+          // P1-3 token 硬探针:读 body 精确匹配本次 run 的 MIVO_VD_TOKEN。端口被旧进程占用时
+          // 新 child 起不来(strictPort 退出)→ 永远拿不到 token → 超时 fail,不把旧进程的 200 当健康。
+          // 只有本次启动的 child 才有这个 env token(随机 UUID,每跑一版不同)。
+          if (probeToken) {
+            let body = ''
+            response.setEncoding('utf8')
+            response.on('data', (chunk) => { body += chunk })
+            response.on('end', () => {
+              body.trim() === probeToken ? resolve() : reject(new Error(`probe token mismatch (status=${response.statusCode})`))
+            })
+            return
+          }
+          // P1-2: 默认 2xx 健康检查(expectedStatus 可精确匹配)。原 statusCode < 500 把 404/401
+          // 残留错误进程当健康,收紧到 2xx。
           response.resume()
-          // P1-2: 原 statusCode < 500 把 404/401 残留错误进程当健康(端口起来但路由错/鉴权挂),
-          // gate 误判通过。收紧到 2xx(BFF /api/mivo/local-assets 与 Vite 根都返回 200);
-          // expectedStatus 传具体状态码时改为精确匹配,留例外口子。
           const code = response.statusCode
           const ok = typeof expectedStatus === 'number'
             ? code === expectedStatus
@@ -115,11 +133,12 @@ const waitForServer = async (url, timeoutMs = 60000, expectedStatus) => {
         })
         request.on('error', reject)
       })
-      return
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error))
       await sleep(500)
+      continue
     }
+    return
   }
   throw lastError
 }
@@ -158,9 +177,21 @@ const spawnServer = (cmd, args, cwd, env, label) => {
   }
   server.stdout.on('data', remember)
   server.stderr.on('data', remember)
+  // P1-3: 记录 child 退出事件,供 waitForServer 每轮探活。strictPort 端口被旧进程占用时
+  // npm/vite 会立即退出,但旧进程仍在端口返 200 → 仅靠 HTTP 轮询会误判健康 → 截图跑在旧服务上。
+  let exited = false
+  let exitCode = null
+  let exitSignal = null
+  server.on('exit', (code, signal) => {
+    exited = true
+    exitCode = code
+    exitSignal = signal
+  })
   return {
     server,
     serverLog,
+    isAlive: () => !exited,
+    exitDetail: () => `code=${exitCode} signal=${exitSignal}`,
     async stop() {
       if (server.exitCode != null) {
         server.stdout.destroy()
@@ -180,9 +211,12 @@ const spawnServer = (cmd, args, cwd, env, label) => {
   }
 }
 
-const startDevServer = async (port, bffUrl) => {
+const startDevServer = async (port, bffUrl, vdToken) => {
   const env = { ...process.env, CI: '1' }
   if (bffUrl) env.MIVO_BFF_DEV_URL = bffUrl
+  // P1-3: 传随机 token 给 vite,vite.config.ts 的 env-gated probe middleware 在 /__vd_probe 返回它,
+  // waitForServer 校验精确匹配,确认是本次启动的 vite(端口被旧进程占用→新 vite 起不来→拿不到 token→fail)。
+  if (vdToken) env.MIVO_VD_TOKEN = vdToken
   const handle = spawnServer(
     'npm',
     ['run', 'dev', '--', '--host', '127.0.0.1', '--port', String(port), '--strictPort'],
@@ -191,7 +225,7 @@ const startDevServer = async (port, bffUrl) => {
     'dev',
   )
   try {
-    await waitForServer(`http://127.0.0.1:${port}`, 60000)
+    await waitForServer(`http://127.0.0.1:${port}/__vd_probe`, 60000, { handle, probeToken: vdToken })
   } catch (error) {
     await handle.stop()
     throw new Error(`${error instanceof Error ? error.message : String(error)}\n${handle.joinLog()}`)
@@ -199,7 +233,7 @@ const startDevServer = async (port, bffUrl) => {
   return handle
 }
 
-const startBffServer = async (port, assetDir) => {
+const startBffServer = async (port, assetDir, vdToken) => {
   const env = {
     ...process.env,
     MIVO_PORT: String(port),
@@ -210,10 +244,13 @@ const startBffServer = async (port, assetDir) => {
     MIVO_ENABLE_EAGLE_PROXY: '0',
     CI: '1',
   }
+  // P1-3: 传 token 给 BFF,server/app.ts 的 env-gated /__vd_probe 路由返回它,waitForServer 校验。
+  if (vdToken) env.MIVO_VD_TOKEN = vdToken
   const handle = spawnServer('npm', ['run', 'start:server'], projectRoot, env, 'bff')
   try {
-    // Poll the local-assets endpoint: 200 means BFF bound + local-assets feature on.
-    await waitForServer(`http://127.0.0.1:${port}/api/mivo/local-assets`, 60000)
+    // P1-3 token 探针:校验 /__vd_probe 返回本次 token,确认是本次启动的 BFF(非旧进程占端口)。
+    // 原 /api/mivo/local-assets 200 检查被更强的身份探针取代(BFF 起来 + local-assets env 已配)。
+    await waitForServer(`http://127.0.0.1:${port}/__vd_probe`, 60000, { handle, probeToken: vdToken })
   } catch (error) {
     await handle.stop()
     throw new Error(
@@ -956,10 +993,14 @@ const main = async () => {
   const descriptor = fixtureDescriptor(options.fixture)
   const isShell = descriptor?.kind === 'shell'
   const bffUrl = isShell ? `http://127.0.0.1:${BFF_PORT}` : null
-  const bffServer = isShell ? await startBffServer(BFF_PORT, BFF_ASSET_DIR) : null
+  // P1-3: 本次 run 的随机探针 token,经 env 传给 vite/BFF,各自 /__vd_probe 返回它,waitForServer
+  // 校验精确匹配。硬保证是本次启动的进程——端口被旧进程占用→新 child 起不来→永远拿不到 token→fail,
+  // 不把旧进程的 200 当健康(证伪了原 isAlive-only 方案:vite 0.35s 退出、旧 200 ~10ms 先到)。
+  const vdToken = randomUUID()
+  const bffServer = isShell ? await startBffServer(BFF_PORT, BFF_ASSET_DIR, vdToken) : null
   let devServer
   try {
-    devServer = await startDevServer(options.port, bffUrl)
+    devServer = await startDevServer(options.port, bffUrl, vdToken)
   } catch (error) {
     if (bffServer) await bffServer.stop()
     throw error
