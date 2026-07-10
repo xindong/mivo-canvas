@@ -1,6 +1,6 @@
 # 软删语义定稿（FX-7）
 
-> 状态：**草案 / 待 lead 确认 DP-3**（DP-3 = 删画布是否级联软删对话；本文件给推荐，标"待 lead 确认"）。
+> 状态：**已裁决（2026-07-10 lead 拍板）**：DP-3 选 (a) 删画布级联软删其 chat collection（一起 restore）；矛盾 2 deleteProject 选 (a) 级联软删其画布（standalone 回落是硬删时代防丢补偿，软删落地后理由消失，且避免孤儿 UI）。软删粒度（不到单 node）、asset 7 天宽限 vs canvas 30 天保留顺序约束维持写法。裁决回填本文件 §3/§7/§8 + plan §3 DP-3 行。
 > 日期：2026-07-10。
 > 定位：架构迁移 P1 的语义权威——T1.3（4 API）/ T1.4（权限）/ FX-7 实施前，"project delete vs canvas delete"的级联范围、恢复行为、保留期、purge 与 asset refcount 回收全部在此一张表定死。没有这张表，后端删除路径会各写各的语义。
 > 上游真相源：`docs/decisions/platform-architecture-2026-07-07.md`（§6/§13.1/§13.5）、`docs/decisions/record-schema.md`（#174，DP-5/DP-6/DP-8/§5/§6 矛盾 3）、`docs/plan/arch-migration-execution-plan.md`（§3 DP-3、§4 FX-7 行）。
@@ -14,8 +14,8 @@
 
 - **现状一句话**：当前仓库删除语义 = **全硬删 + 级联回落混合**，**零软删基础设施**（0 个 `deleted`/`deletedAt`/`trashed`/`purge`/`tombstone`/`softDelete` 字段或函数，全仓 grep 已证）。asset 仅客户端有 blob URL 的 refcount lease（管内存不管存储），服务端无 asset 删除路由、无内容寻址。
 - **目标一句话**：record 级 `is_deleted` 信封列（DP-5 已定）做软删基础设施；本表定**哪些实体软删、级联到谁、保留期、purge 判定**。粒度原则：**软删只到 canvas/project/chat-collection 粒度，不到单 node**（单 node 删仍硬删 + undo 栈恢复，避免 CRDT tombstone 膨胀）。
-- **DP-3 推荐结论（待 lead 确认）**：**删画布级联软删对话**（chat collection 随 canvas 一起 `is_deleted=true`，可一起 restore）。理由见 §3。**与 `chatHydration.characterization.test.ts:380` 现状表征直接冲突**（该测试自标"现状（DP-3）"钉死"deleteCanvas 不级联清 chat"）→ 迁移时**须同步迁移表征**。
-- **最大现状冲突**：`deleteProject` 现状是"硬删 project + canvas 回落 standalone"（`projectsSlice.ts:66-100`，#164 钉死）；若目标改为"级联软删 canvases"，#164 的 standalone 回落断言须改。见 §6/§7。
+- **DP-3 已裁决（2026-07-10，选 (a)）**：**删画布级联软删对话**（chat collection 随 canvas 一起 `is_deleted=true`，可一起 restore）。理由见 §3。**与 `chatHydration.characterization.test.ts:380` 现状表征直接冲突**（该测试自标"现状（DP-3）"钉死"deleteCanvas 不级联清 chat"）→ 属**有意产品行为变更**，实施 PR 须显式更新表征基线 + 引用本裁决（见 §7 澄清条），非静默改。
+- **最大现状冲突（已裁决）**：`deleteProject` 现状是"硬删 project + canvas 回落 standalone"（`projectsSlice.ts:66-100`，#164 钉死）；**裁决（2026-07-10，选 (a)）：改为级联软删其画布**（standalone 回落是硬删时代防丢补偿，软删落地后理由消失，且避免孤儿 UI）→ #164 standalone 回落断言须改，属有意行为变更（§7 澄清条）。见 §6/§7。
 
 ---
 
@@ -42,7 +42,7 @@
 | 实体 | soft delete | restore | purge（物理删） |
 |---|---|---|---|
 | **project** | **级联**：`is_deleted=true` 作用于 project + 其下所有 canvas（含其 chat collection）+ share_links（项目级链接）。**不级联**到其他 project 的 canvas。可恢复。保留期 **30 天**。UI：侧栏项目列表隐藏，进"已删除"区可见。 | project 及级联实体一并 `is_deleted=false` 复活。**原子**：要么全恢复要么全不恢复。 | 30 天保留期满 / 用户手动"永久删除"。purge project → 级联 purge 其 canvas（→ node 硬删 → asset refcount 减，见 §4）+ chat collection + share_links。不可恢复。 |
-| **canvas** | **级联（DP-3 推荐，待 lead 确认）**：`is_deleted=true` 作用于 canvas + 其 **chat collection**（DP-6 随 canvas 生命周期）+ 其下 node 的 UI 可见性（node record 不单独软删，canvas 软删即整画布不可见）。**不级联**到 project（project 保留）。可恢复。保留期 30 天。UI：画布切换器/侧栏隐藏，"已删除"区可见。 | canvas + 其 chat collection 一并复活。原子。 | purge canvas → 其下 node 全部硬删（asset refcount 减）+ chat collection 物理删 + canvas record 物理删。不可恢复。 |
+| **canvas** | **级联（DP-3 已裁决，选 (a)）**：`is_deleted=true` 作用于 canvas + 其 **chat collection**（DP-6 随 canvas 生命周期）+ 其下 node 的 UI 可见性（node record 不单独软删，canvas 软删即整画布不可见）。**不级联**到 project（project 保留）。可恢复。保留期 30 天。UI：画布切换器/侧栏隐藏，"已删除"区可见。 | canvas + 其 chat collection 一并复活。原子。 | purge canvas → 其下 node 全部硬删（asset refcount 减）+ chat collection 物理删 + canvas record 物理删。不可恢复。 |
 | **node（单节点删）** | **不软删**（保持硬删 + undo 栈恢复）。理由：单 node 软删会在 CRDT 产生 tombstone，千节点画布膨胀；undo 栈已是单节点误删的恢复路径。UI：删即不可见，undo 可恢复（session 级，跨设备不同步，platform §13.1 session 域）。 | 走 undo 栈（`historyPast`/`historyFuture`，`documentSlice.ts`），非软删 restore。 | undo 栈耗尽即不可恢复（已是现状，`nodeMutationSlice.ts:300` 硬删）。**注意**：被硬删 node 引用的 asset → refcount 减（见 §4）。 |
 | **chat collection**（整 canvas 对话） | **被动级联**：不单独软删，随 canvas soft delete 一起 `is_deleted=true`（DP-3）。单独"清空对话"动作（`clearScene`）= 硬清空消息内容，**不**软删 collection（见 §6）。UI：随 canvas 隐藏。 | 随 canvas restore。 | 随 canvas purge 物理删。 |
 | **chat message（单条）** | **不软删**（硬删/编辑替换）。`serverTaskId`/`sourceDeleted` 已持久化（`chatStore.ts:41/61`）供归因，非软删标志。UI：删即移除。 | 无（undo 栈或重新生成）。 | 删即终态。 |
@@ -60,7 +60,7 @@
 
 ## 3. DP-3 拍板建议（需求 2：删画布是否级联软删对话）
 
-**待 lead 确认。** 本节给推荐 + 选项 + 理由 + 影响面。
+**已裁决（2026-07-10 lead 拍板）：选 (a) 删画布级联软删其 chat collection，一起 restore。** 下表保留选项/推荐/理由/影响面供追溯，结论即推荐 (a)。
 
 | 决策点 | 选项 | 推荐 | 理由 | 影响面 |
 |---|---|---|---|---|
@@ -126,7 +126,7 @@
 |---|---|---|---|
 | **project delete** | `projectsSlice.ts:66-100`：硬删 project 记录（`projects.filter(p=>p.id!==id)`），所属 canvas **回落 standalone**（`projectId→undefined`，canvas body 不删，`updatedAt` 不动）。#164 钉死（`projectsSlice.test.ts:142-197`："cascades: fall back to standalone"、"does not delete the canvases themselves"）。 | soft delete project + **级联 soft delete 其 canvas**（不再回落 standalone）+ 级联 share_links。 | **行为变**：从"回落 standalone"→"级联软删 canvas"。**冲突 #164**（standalone 回落断言须改）。迁移：`deleteProject` 改 `is_deleted=true` 级联，不再 `projectId→undefined`。 |
 | **canvas delete** | `documentSlice.ts:123-161`：硬删 canvas（`delete remainingCanvases[targetId]`），guard ≥1 canvas，active→first-survivor 回落（`canvasIds.find(id=>id!==targetId)`）。 | soft delete canvas + 级联 soft delete 其 chat collection（DP-3）。guard ≥1 canvas 保留。 | **行为变**：硬删→软删；**新增 chat 级联**（现状无）。first-survivor 回落逻辑可保留（active canvas 软删后切下一个活 canvas）。 |
-| **canvas delete → chat** | **无级联**：`chatHydration.characterization.test.ts:380` 钉死"deleteCanvas 不级联清 chatStore.messagesByScene（跨 store 无订阅）"，`messagesByScene['doomed']` 保留。 | 级联 soft delete chat collection（DP-3 推荐）。 | **行为变 + 表征冲突**（§7 #C2）。迁移：canvas 软删时同步 `is_deleted=true` chat collection。 |
+| **canvas delete → chat** | **无级联**：`chatHydration.characterization.test.ts:380` 钉死"deleteCanvas 不级联清 chatStore.messagesByScene（跨 store 无订阅）"，`messagesByScene['doomed']` 保留。 | 级联 soft delete chat collection（DP-3 已裁决选 (a)）。 | **行为变 + 表征冲突**（§7 #C2）。迁移：canvas 软删时同步 `is_deleted=true` chat collection。 |
 | **node delete** | `nodeMutationSlice.ts:300-317`：硬删 node + 级联 section children + 级联 edges（`from/to` 涉及被删 node）。`deleteSelectedNodes` :318-344 同。undo 栈可恢复。 | **保持硬删 + undo**（不软删单 node）。asset refcount 减。 | **行为不变**（删法不变），**新增**：硬删时其 asset refcount -= 1（T1.5 后）。 |
 | **chat clearScene** | `chatStore.ts:105`（类型签名）`clearScene(sceneId)`：`messagesByScene[sceneId]=[]`（key 残留，内容硬清空；行为由 #167 `chatHydration.characterization.test.ts:370` 表征钉死）。 | "清空对话"= 硬清空消息内容，**不**软删 collection（collection 软删只随 canvas 级联）。 | **行为不变**：clearScene 语义保留（硬清空内容，非软删）。collection 软删是另一条路径（随 canvas）。 |
 | **chat message 单条** | 硬删/编辑替换，无 `deletedAt`。`serverTaskId`/`sourceDeleted` 持久化（`chatStore.ts:41/61`，`sourceDeleted` 是 mask-edit 归因 `maskEditGeneration.ts:260/441`，非软删标志）。 | 不软删（保持）。 | **不变**。 |
@@ -141,24 +141,26 @@
 
 > 硬约束（plan §2/§7 + record-schema §7）：**表征测试先行、迁移后一字不改**——但"一字不改"指断言语义不改；**数据来源/触发行为变了**的，须同步迁移表征（断言数不减、内容语义不改，只改数据来源/级联行为）。下表凡标 ⚠️ 的点，迁移 PR 须在说明里列"表征同步迁移"并附前后跑通证据。
 
+> **⚠️ 澄清条（lead 2026-07-10 裁决，防未来误用）**：上述"表征一字不改"铁律约束的是**迁移类 PR**（换数据来源不换行为，如 IDB→服务端、selection 迁 session）。本节 **C1/C2/C5 不属此类**——它们是**有意的产品行为变更**（deleteProject 从 standalone 回落改级联软删；deleteCanvas 从不级联 chat 改级联软删）。处理方式 = **实施该行为变更的 PR 里显式更新表征基线 + PR 说明引用本裁决**，非静默改、非"迁移时顺手改"。迁移类 PR 仍不许动这些表征。
+
 | # | 表征测试 | file:line | 现状断言（钉死） | 目标语义冲突 | 迁移动作 |
 |---|---|---|---|---|---|
 | **C1** | #164 `projectsSlice.characterization.test.ts` + `projectsSlice.test.ts` | `projectsSlice.test.ts:149-166,180-190` | "deleteProject cascades: canvases fall back to standalone (projectId undefined)" + "does not delete the canvases themselves" | 目标：deleteProject 级联 soft delete canvases（不再回落 standalone） | ⚠️ **迁移时须同步迁移表征**：断言从"canvases projectId→undefined 且 body 保留"改为"canvases `is_deleted=true`（随 project 软删）"；断言数不减。`updatedAt` 不 bump 的断言保留（软删不改 content，仍不 bump `updated_at`，但可写 `deleted_at`）。 |
-| **C2** | #167 `chatHydration.characterization.test.ts` | `:380` "canvasStore.deleteCanvas 不级联清 chatStore.messagesByScene（跨 store 无订阅）"，`:399-400` 断言 `messagesByScene['doomed'].toHaveLength(1)`，注释自标"现状（DP-3）" | 目标（DP-3 推荐）：deleteCanvas 级联 soft delete chat collection | ⚠️ **迁移时须同步迁移表征**：断言从"对话仍在（length 1）"改为"chat collection `is_deleted=true`（软删隐藏，purge 前可 restore）"。注释"现状（DP-3）"改为"DP-3 已定：级联软删"。**依赖 lead 确认 DP-3 选 (a)**。 |
+| **C2** | #167 `chatHydration.characterization.test.ts` | `:380` "canvasStore.deleteCanvas 不级联清 chatStore.messagesByScene（跨 store 无订阅）"，`:399-400` 断言 `messagesByScene['doomed'].toHaveLength(1)`，注释自标"现状（DP-3）" | 目标（DP-3 已裁决选 (a)）：deleteCanvas 级联 soft delete chat collection | ⚠️ **迁移时须同步迁移表征**：断言从"对话仍在（length 1）"改为"chat collection `is_deleted=true`（软删隐藏，purge 前可 restore）"。注释"现状（DP-3）"改为"DP-3 已定：级联软删"（已裁决，见 §3）。 |
 | **C3** | #167 `chatHydration.characterization.test.ts` | `:370` "clearScene 之后 sceneId key 仍存在于 messagesByScene（残留）" | clearScene 硬清空内容，key 残留 | **不冲突**：clearScene 语义保留（硬清空，非软删 collection） | 无须迁移。但实施时须区分 clearScene（硬清空）vs canvas soft delete（collection 软删）两条路径，不要把 clearScene 改成软删。 |
 | **C4** | #168 `canvasActionModel.characterization.test.ts` | record-schema §7 标 baseline 315 expect/203 tests | deleteNode 走硬删 + undo；status/anchor 相关 | deleteNode 保持硬删（不软删单 node）→ **不冲突** | 无须迁移（node 删法不变）。asset refcount 减是新增副作用，表征不覆盖 refcount，不触发断言变化。 |
 | **C5** | #164 deleteProject no-dangling 回落 | `projectsSlice.test.ts:142-197` 全段 | deleteProject 硬删 project + standalone 回落 + updatedAt 不 bump + 不删 canvas body + no-op on missing | 同 C1 | ⚠️ 同 C1，须同步迁移。 |
 
-> **总结**：⚠️ 碰撞点 = **C1/C5（deleteProject 回落→级联软删）+ C2（deleteCanvas 不级联 chat→级联软删，依赖 DP-3）**。C3/C4 不冲突。迁移这些表征的前提是 lead 确认 DP-3 选 (a) 且 deleteProject 改级联软删。
+> **总结**：⚠️ 碰撞点 = **C1/C5（deleteProject 回落→级联软删）+ C2（deleteCanvas 不级联 chat→级联软删）**。C3/C4 不冲突。DP-3 与 deleteProject 均已裁决选 (a)（2026-07-10，见 §3/§8）；实施这些**有意行为变更**的 PR 须按 §7 澄清条显式更新表征基线 + 引用本裁决，非静默改。
 
 ---
 
 ## 8. 发现的矛盾与遗留问题（计划 vs 源码；本文件记录，不改源码/计划）
 
-> 边界：只记录，不自行改。需 lead 裁决的标"待 lead 裁决"。
+> 边界：只记录，不自行改源码/计划。裁决已回填（2026-07-10 lead 拍板），下标"已裁决"；未裁决项标"待 lead 裁决"。
 
-1. **DP-3 现状表征 vs 目标级联软删**（§7 C2）：`chatHydration.characterization.test.ts:380` 钉死"deleteCanvas 不级联 chat"且注释自标"现状（DP-3）"——即测试作者知道这是 DP-3 待定点，先钉了现状。本文件推荐选 (a) 级联软删，**与该表征冲突**。→ **待 lead 确认 DP-3**；确认 (a) 后 C2 迁移才动。
-2. **deleteProject 回落 standalone vs 目标级联软删**（§7 C1/C5）：#164 钉死"回落 standalone"语义。目标若改"级联软删 canvas"，与 #164 冲突。→ **待 lead 裁决**：deleteProject 是 (a) 级联软删其 canvas（本文件推荐，UX 一致 + 整项目可恢复），还是 (b) 保留 standalone 回落（canvas 不随 project 软删，独立存活）。选 (b) 则不冲突 #164，但会产生"项目软删了、画布还在 standalone 列表"的孤儿 UI。本文件**推荐 (a)**，但标为待确认——因为它改 #164 钉死行为。
+1. **DP-3 现状表征 vs 目标级联软删**（§7 C2）—— **已裁决（2026-07-10，选 (a)）**：`chatHydration.characterization.test.ts:380` 钉死"deleteCanvas 不级联 chat"且注释自标"现状（DP-3）"——测试作者知道这是 DP-3 待定点先钉了现状。lead 拍板选 (a) 级联软删，**与该表征冲突**，属有意行为变更（§7 澄清条）：实施 PR 显式更新基线 + 引用本裁决，非静默改。
+2. **deleteProject 回落 standalone vs 目标级联软删**（§7 C1/C5）—— **已裁决（2026-07-10，选 (a)）**：#164 钉死"回落 standalone"语义。lead 拍板改 (a) 级联软删其画布——理由：standalone 回落是硬删时代的防丢补偿，软删落地后理由消失，且避免"项目软删了、画布还在 standalone 列表"的孤儿 UI。与 #164 冲突，属有意行为变更（§7 澄清条）：实施 PR 显式更新基线 + 引用本裁决。
 3. **软删粒度到不到单 node**：record-schema DP-5 信封列 `is_deleted` 是 record 级，理论上每个 node record 都能软删。但本文件定"单 node 不软删（硬删+undo）"。→ **不冲突**（设计选择，非源码矛盾）：理由是 CRDT tombstone 膨胀 + undo 栈已够。实施时若发现 undo 栈跨设备不同步导致用户误删无法恢复，可重审"单 node 软删"——但那会牵动 CRDT 映射（record-schema §1/§3），不在 FX-7 范围。**记录备查**。
 4. **task 软删 vs document record 无 tasks 字段**：DP-8 拍 document record 无 tasks 字段（迁服务端 registry）。本文件定 task 不软删（registry TTL）。→ **不冲突**，但实施时注意：当前 `CanvasDocument.tasks[]` 删除路径（无 slice，靠 compactDocumentForPersist `cloneTasks` record-schema §4.3）在 document record 删 tasks 字段后消失，task 生命周期完全归 registry，FX-2/FX-3 承接。
 5. **share_link 软删与 revoke 术语**：本文件把 share_link 的"软删"叫 revoke（`revoked_at`）。→ **不冲突**，术语对齐 T1.4 表设计时统一。
@@ -174,4 +176,4 @@
 - **FX-7 实施 PR**：本表落代码 + 同步迁移表征 C1/C2/C5（DP-3 确认后）。
 - **FX-2/FX-3**：tasks registry TTL GC + 僵尸卡回落（不软删）。
 
-> 本文件不改源码、不改 plan/record-schema/platform-architecture；矛盾记录在 §8，待 lead 裁决。
+> 本文件不改源码、不改 record-schema/platform-architecture（plan §3 DP-3 行除外，lead 2026-07-10 授权回填）；矛盾记录在 §8，DP-3 + deleteProject 均已裁决选 (a)。

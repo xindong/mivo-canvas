@@ -35,7 +35,7 @@
 **DP 决策(评审后更新)**:
 - **DP-1 选择态单一真相源** ✅ 已拍(T1.2a 2026-07-10):归 session、不双写(迁移前实施);**迁移窗口不冻结 selection 读写**,迁移瞬间选区清空可接受,v10 迁移后首次加载 selection 为空属预期降级行为(非 bug)。详见 docs/decisions/record-schema.md §4.1。
 - **DP-2 anchorModel/annotationBounds** ✅ 已拍(T1.2a 2026-07-10):**收编**——experimentalAnchors 收编为顶层 `Anchor` record(document 域,独立 id+revision;锚点对话是产品范式核心,删除与愿景矛盾);annotationBounds 收编为 annotation 节点 formal 子字段。详见 docs/decisions/record-schema.md §4.2。
-- **DP-3 删画布级联对话**:服务端定级联软删语义(并入 FX-7 语义表)。
+- **DP-3 删画布级联对话** ✅ 已拍(2026-07-10):选 (a) 删画布级联软删其 chat collection(一起 restore);deleteProject 同裁决级联软删其画布(standalone 回落是硬删时代防丢补偿,软删落地后理由消失,且避免孤儿 UI)。详见 docs/decisions/soft-delete-semantics.md §3/§8。
 - **DP-4 身份模型对齐**:T1.4 前确认 SSO 身份载体 == 权限层假设。
 - **DP-5 节点 payload 存法 ✅ 已定(采纳 review-plan-a)**:**信封列 + payload jsonb**——只拆 `id/canvas_id/type/revision/scope/is_deleted/created_at/updated_at` 及少量索引字段,其余整存 jsonb;不全量拆列,不把 jsonb 当字段级 CRDT。
 - **DP-6 chat 消息 API 归属(新)**:chat 随文档域走 `/api/canvas` 子资源(messagesByScene 键随 canvas 生命周期),独立集合存储(D6),级联语义见 FX-7。
