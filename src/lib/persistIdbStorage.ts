@@ -276,6 +276,73 @@ export const idbStateStorage = {
 }
 
 /**
+ * rawStateStorage:raw IDB StateStorage(无 FX-6 namespacedKey)——S6 切主给
+ * migrateV10ToV11/dryRun/rollback 用(它们内部走 namespacedKey 拼 document/session/ckpt
+ * key;传 idbStateStorage namespaced adapter 会 double-namespace,Greptile 义务 1)。
+ * 复用 runTransaction + localStorage fallback(同 idbStateStorage 但 key 不经 namespacedKey)。
+ * 调用方传给 migrateV10ToV11 时 cast as RawStorage(brand 意图明确,类型层已拦 namespaced adapter)。
+ *
+ * 与 strictIdbStateStorage 的区别:后者给 secrets(无 localStorage fallback,不留 legacy 痕迹);
+ * rawStateStorage 给 canvas 迁移(同 idbStateStorage 的 localStorage fallback 语义,因迁移对象是
+ * 用户画布,不是 secret——IDB 不可用时回退 localStorage 不丢数据)。
+ */
+export const rawStateStorage = {
+  getItem: async (name: string): Promise<string | null> => {
+    if (!isIdbAvailable()) {
+      debugLogger.warn(SOURCE, 'IndexedDB unavailable; raw storage falling back to localStorage')
+      return typeof localStorage !== 'undefined' ? localStorage.getItem(name) : null
+    }
+    try {
+      const record = await runTransaction<KvRecord | undefined>('readonly', (store) =>
+        store.get(name) as IDBRequest<KvRecord | undefined>,
+      )
+      return record?.value ?? null
+    } catch (error) {
+      debugLogger.warn(SOURCE, `raw getItem failed for ${name}: ${errMessage(error)}`)
+      return typeof localStorage !== 'undefined' ? localStorage.getItem(name) : null
+    }
+  },
+
+  setItem: async (name: string, value: string): Promise<void> => {
+    if (
+      typeof globalThis !== 'undefined' &&
+      (globalThis as unknown as { __MIVO_BENCH_PERSIST_SKIP__?: boolean }).__MIVO_BENCH_PERSIST_SKIP__
+    ) {
+      return
+    }
+    if (!isIdbAvailable()) {
+      debugLogger.warn(SOURCE, 'IndexedDB unavailable; raw storage writing to localStorage')
+      if (typeof localStorage !== 'undefined') localStorage.setItem(name, value)
+      return
+    }
+    try {
+      await runTransaction('readwrite', (store) =>
+        store.put({ key: name, value } as unknown as KvRecord),
+      )
+    } catch (error) {
+      if (isQuotaError(error)) {
+        debugLogger.error(SOURCE, `quota exceeded writing raw ${name}; state not persisted`)
+        toastFeedback.error('存储已满，无法保存画布。')
+        return
+      }
+      debugLogger.warn(SOURCE, `raw setItem failed for ${name}: ${errMessage(error)}`)
+    }
+  },
+
+  removeItem: async (name: string): Promise<void> => {
+    if (!isIdbAvailable()) {
+      if (typeof localStorage !== 'undefined') localStorage.removeItem(name)
+      return
+    }
+    try {
+      await runTransaction('readwrite', (store) => store.delete(name))
+    } catch (error) {
+      debugLogger.warn(SOURCE, `raw removeItem failed for ${name}: ${errMessage(error)}`)
+    }
+  },
+}
+
+/**
  * FX-6 clear the CURRENT user's cache namespace — called by authSlice.logout
  * BEFORE the optimistic state clear + SSO redirect (the redirect unloads the
  * page, so any IDB work queued after it would never land). Clears the canvas +
