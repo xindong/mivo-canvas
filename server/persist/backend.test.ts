@@ -79,10 +79,34 @@ describe('InMemoryPersistBackend — 返修 #6 orderKey + reorder', () => {
     await b.upsertChild('o', 'c1', 'node', 'n1', { id: 'n1' }, { method: 'PATCH', resourceKind: 'node' })
     await b.upsertChild('o', 'c1', 'node', 'n2', { id: 'n2' }, { method: 'PATCH', resourceKind: 'node' })
     await b.upsertChild('o', 'c1', 'node', 'n3', { id: 'n3' }, { method: 'PATCH', resourceKind: 'node' })
-    await b.reorderChildren('o', 'c1', 'node', ['n3', 'n1', 'n2'])
+    // F5:base 必填——3 次 child 写入 bump contentVersion → 3;reorder 带 base=3(无冲突)。
+    await b.reorderChildren('o', 'c1', 'node', ['n3', 'n1', 'n2'], { base: 3 })
     const list = await b.listByCanvas('o', 'c1', 'node')
     expect(list.records.map((r) => r.id)).toEqual(['n3', 'n1', 'n2'])
     expect(list.records.map((r) => r.orderKey)).toEqual([0, 1, 2])
+  })
+
+  it('F5:reorderChildren base 必填——不传 base 编译失败(@ts-expect-error 负向类型互锁;纯类型层,不实际运行)', () => {
+    // F5 seam 必填:不传 opts(缺 base)或传空 opts(缺 base key)→ TS 编译错误;@ts-expect-error 钉住
+    // (若有人改回 optional,此 directive 失效 → "Unused @ts-expect-error" 编译报错)。用箭头包裹仅类型层触发,不实际调用(runtime opts undefined 会崩)。
+    // @ts-expect-error base is required (F5 seam mandatory — missing opts)
+    const _noOpts = (b2: PersistBackend) => b2.reorderChildren('o', 'c1', 'node', ['n1'])
+    // @ts-expect-error base is required (F5 seam mandatory — empty opts missing base)
+    const _emptyOpts = (b2: PersistBackend) => b2.reorderChildren('o', 'c1', 'node', ['n1'], {})
+    void _noOpts
+    void _emptyOpts
+  })
+
+  it('F5:reorderChildren stale base → conflict;base 匹配 → ok', async () => {
+    await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+    await b.ensureCreate('o', 'canvas', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+    await b.upsertChild('o', 'c1', 'node', 'n1', { id: 'n1' }, { method: 'PATCH', resourceKind: 'node' }) // cv → 1
+    // stale base(0 ≠ current 1)→ conflict(两并发一成一 409 语义保留)
+    const stale = await b.reorderChildren('o', 'c1', 'node', ['n1'], { base: 0 })
+    expect(stale.kind).toBe('conflict')
+    // correct base(1 = current)→ ok
+    const ok = await b.reorderChildren('o', 'c1', 'node', ['n1'], { base: 1 })
+    expect(ok.kind).toBe('ok')
   })
 })
 
@@ -229,5 +253,77 @@ describe('InMemoryPersistBackend — 返修三 F1 canvas parent live + F4 canvas
     expect(b.projectLive('o', 'p1')).toBe(true)
     const r3 = await b.ensureCreate('o', 'canvas', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
     expect(r3.kind).toBe('existing')
+  })
+})
+
+describe('InMemoryPersistBackend — 返修四 F1 createCanvasWithCollection 原子 + barrier(TOCTOU orphan)', () => {
+  let b: InMemoryPersistBackend
+  const rec = async (type: PersistType, id: string) => {
+    const r = await b.get('o', type, id)
+    if (r.kind !== 'found') throw new Error(`${type}:${id} ${r.kind}`)
+    return r.record
+  }
+  beforeEach(() => {
+    b = new InMemoryPersistBackend()
+  })
+
+  it('F1 barrier:canvas meta 已建+collection 未建+project 软删 → primitive parent-not-live,树内零 live orphan', async () => {
+    await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+    // 模拟 OLD 两段流程的中间态:canvas meta 已建,collection 未建(直接 ensureCreate canvas,无 collection)
+    await b.ensureCreate('o', 'canvas', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+    // 并发 DELETE project:cascade 软删 canvas c1(collection 不存在,未触)
+    await b.softDeleteProjectTree('o', 'p1')
+    // NEW primitive:parent not live → 拒绝(不创建 live orphan collection)
+    const r = await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+    expect(r.kind).toBe('parent-not-live')
+    // 不变量:树内零 live orphan——chat-collection 不存在(missing),canvas c1 仍 soft-deleted(非 live)
+    expect((await b.get('o', 'chat-collection', 'c1')).kind).toBe('missing')
+    const canvas = await b.get('o', 'canvas', 'c1')
+    expect(canvas.kind).toBe('found')
+    if (canvas.kind === 'found') expect(canvas.record.isDeleted).toBe(true)
+  })
+
+  it('F1:parent live → createCanvasWithCollection 原子建 canvas+collection(both live);idempotent existing/restored', async () => {
+    await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+    const r1 = await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+    expect(r1.kind).toBe('created')
+    // canvas + collection both live(原子同建)
+    expect((await b.get('o', 'canvas', 'c1')).kind).toBe('found')
+    const coll1 = await b.get('o', 'chat-collection', 'c1')
+    expect(coll1.kind).toBe('found')
+    if (coll1.kind === 'found') expect(coll1.record.isDeleted).toBe(false)
+    // idempotent same call → existing(collection 仍 live,不重建)
+    const r2 = await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+    expect(r2.kind).toBe('existing')
+    // softDeleteCanvasTree → POST c1 → restored(canvas+collection restored together,无 orphan)
+    await b.softDeleteCanvasTree('o', 'c1')
+    expect((await rec('canvas', 'c1')).isDeleted).toBe(true)
+    expect((await rec('chat-collection', 'c1')).isDeleted).toBe(true)
+    const r3 = await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+    expect(r3.kind).toBe('restored')
+    expect((await rec('canvas', 'c1')).isDeleted).toBe(false)
+    expect((await rec('chat-collection', 'c1')).isDeleted).toBe(false)
+  })
+
+  it('F1 原子性:fault on collection-create → rollback canvas meta(无 partial,无 live orphan)', async () => {
+    await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+    // 注入:bucket.set 第 2 次调用(collection create)throw,并立即恢复 origSet(让 catch 回滚能成功)
+    const bucket = (b as unknown as { bucket: (o: string) => Map<string, unknown> }).bucket('o')
+    const origSet = bucket.set
+    let calls = 0
+    bucket.set = function (k: string, v: unknown) {
+      calls++
+      if (calls === 2) {
+        bucket.set = origSet
+        throw new Error('injected fault')
+      }
+      return origSet.call(this, k, v)
+    }
+    await expect(b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })).rejects.toThrow('injected fault')
+    bucket.set = origSet
+    // 回滚:canvas meta 未建 + collection 未建 + globalCanvasOwners 未设(无 partial,无 live orphan)
+    expect((await b.get('o', 'canvas', 'c1')).kind).toBe('missing')
+    expect((await b.get('o', 'chat-collection', 'c1')).kind).toBe('missing')
+    expect(b.getCanvasOwner('c1')).toBeUndefined()
   })
 })

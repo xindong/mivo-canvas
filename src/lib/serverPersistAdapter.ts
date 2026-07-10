@@ -54,13 +54,14 @@ export interface ServerPersistAdapter {
   /**
    * 返修 #6/F5:重排子资源顺序(持久化 orderKey)。**If-Match(contentVersion base)必填**——
    * baseContentVersion = client 最近读到的 canvas contentVersion(若-Match);并发同 base 一成一 409。
+   * F5 seam 必填:不传 baseContentVersion 编译失败(见 contract test @ts-expect-error 互锁)。
    * 响应返新 contentVersion(client 据此作下次 reorder 的 If-Match base)。
    */
   reorderChildren(
     canvasId: string,
     type: 'node' | 'edge' | 'anchor' | 'chat-message',
     orderedIds: string[],
-    baseContentVersion?: Revision,
+    baseContentVersion: Revision,
   ): Promise<{ reordered: number; contentVersion: Revision }>
 
   // ── document scope → /api/canvas/:id/chat(DP-6)──

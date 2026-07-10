@@ -184,8 +184,9 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
     const id = reqBody.id && reqBody.id.trim() ? reqBody.id.trim() : randomUUID()
     const cp: CanvasPayload = { projectId: reqBody.projectId, title: reqBody.title, sourceTemplateId: reqBody.sourceTemplateId }
     const idempotencyKey = c.req.header('idempotency-key') || undefined
-    const result = await backend.ensureCreate(actor, 'canvas', id, cp, {
-      scope: 'document',
+    // F1:单一原子原语 createCanvasWithCollection(canvas meta + chat-collection 同一操作,防 ensureCreate(canvas)→
+    // 独立 ensureCreate(chat-collection) 两段间的 TOCTOU——中间并发 DELETE project 会产生软删树下 live orphan collection)。
+    const result = await backend.createCanvasWithCollection(actor, id, cp, {
       method: 'POST',
       resourceKind: 'canvas',
       idempotencyKey,
@@ -208,16 +209,7 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'parent-not-live' })
       return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
     }
-    // 返修 #2/N2:canvas 创建时一并建 chat-collection record;restored 路径由 ensureCreate→restoreCanvasTree 原子恢复 collection。
-    if (result.kind === 'created') {
-      await backend.ensureCreate(actor, 'chat-collection', id, {}, {
-        canvasId: id,
-        scope: 'document',
-        method: 'POST',
-        resourceKind: 'chat-collection',
-        bodyFingerprint: decoded.fingerprint,
-      })
-    }
+    // created(canvas+collection 原子建)/restored(restoreCanvasTree 原子恢复 collection)/existing —— collection 全 live。
     const status = result.kind === 'created' ? 201 : 200
     logRequest({ method: c.req.method, path: c.req.path, requestId, status, latencyMs: Date.now() - t0 })
     return c.json(toCanvasMeta(result.record), status)

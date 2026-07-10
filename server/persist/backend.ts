@@ -90,10 +90,10 @@ export type IdempotentReplay =
 export type ListResult = { records: PersistRecord[] }
 
 /**
- * 返修 N8:重排结果。
+ * 返修 N8/F5:重排结果。
  * - `ok`:orderedIds 与 live set 全等且唯一,重分配 orderKey,bump contentVersion+updatedAt。
  * - `conflict`:If-Match(contentVersion base)stale → 409(两并发一成一 409)。
- * - `precondition-required`:reserved(reorder If-Match 可选,目前不触发 428)。
+ * - `precondition-required`:reserved(F5 base 必填,route 已对 missing If-Match 返 428;backend 不再触发此 variant,保留为防御型)。
  * - `bad`:orderedIds 与 live set 不全等(mismatch)或含重复(duplicate)→ 400。
  */
 export type ReorderResult =
@@ -127,6 +127,19 @@ export interface PersistBackend {
       resourceKind: string
       bodyFingerprint?: string
     },
+  ): Promise<EnsureCreateResult>
+  /**
+   * F1:canvas + chat-collection 单一原子创建原语(route POST /api/canvas 只调这一个,防 ensureCreate(canvas)→
+   * 独立 ensureCreate(chat-collection) 两段间的 TOCTOU——中间插入 DELETE project 会产生软删树下的 live orphan
+   * collection)。内含 F4(canvas id 全局唯一)+ F1(parent project live)+ 幂等 replay(reuse-conflict/restored/existing)
+   * + fresh create 时 canvas meta + chat-collection 同一原子操作(快照回滚);restored 走 restoreCanvasTree(原子恢复
+   * canvas meta + chat-collection)+ ensureCollectionLive(防旧数据遗漏)。返 EnsureCreateResult(与 ensureCreate 同形)。
+   */
+  createCanvasWithCollection(
+    ownerId: string,
+    canvasId: string,
+    canvasPayload: unknown,
+    opts: { idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string },
   ): Promise<EnsureCreateResult>
   /**
    * 返修 N3:子资源(chat-message)幂等创建——canvas_id 校验(existing/idem-replay/cross-canvas 全验)。
@@ -184,16 +197,16 @@ export interface PersistBackend {
   /** 硬删子资源(物理移除,返修 #2:node/edge/anchor/chat-message 不软删)。canvas_id 校验。 */
   hardDeleteChild(ownerId: string, canvasId: string, type: PersistType, id: string): Promise<{ deleted: boolean }>
   /**
-   * 返修 N8:重排 canvas 下某 type 子资源顺序。
-   * orderedIds 须与 live set 全等且唯一;If-Match(contentVersion base)stale → conflict;
-   * 成功重分配 orderKey + bump contentVersion+updatedAt。
+   * 返修 N8/F5:重排 canvas 下某 type 子资源顺序。
+   * orderedIds 须与 live set 全等且唯一;**If-Match(contentVersion base)必填**(F5 seam 必填——
+   * 不传 base 编译失败,见 contract test @ts-expect-error 互锁);stale → conflict;成功重分配 orderKey + bump contentVersion+updatedAt。
    */
   reorderChildren(
     ownerId: string,
     canvasId: string,
     type: PersistType,
     orderedIds: string[],
-    opts?: { base?: Revision },
+    opts: { base: Revision },
   ): Promise<ReorderResult>
 
   // ── 列表(返修 #6 ORDER BY orderKey;#8 枚举)──
@@ -430,6 +443,120 @@ export class InMemoryPersistBackend implements PersistBackend {
     if (type === 'canvas') this.globalCanvasOwners.set(id, ownerId) // 返修 N7:canvas 全局归属
     this.setIdemIndex(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, recordKey(ownerId, type, id), opts.bodyFingerprint ?? '')
     return { kind: 'created', record: clone(created) }
+  }
+
+  /**
+   * F1:canvas live 时确保 chat-collection 也 live(create-or-restore idempotent;防旧数据/恢复遗漏产生 orphan)。
+   * 不存在 → create;soft-deleted → undelete+bump+清 payload;live → no-op。不 bump canvas contentVersion(meta 配对创建)。
+   */
+  private ensureCollectionLive(ownerId: string, canvasId: string): void {
+    const existing = this.find(ownerId, 'chat-collection', canvasId)
+    if (existing && !existing.isDeleted) return // 已 live
+    const ts = nowIso()
+    const key = recordKey(ownerId, 'chat-collection', canvasId)
+    if (existing && existing.isDeleted) {
+      const restored: PersistRecord = {
+        ...clone(existing), payload: {}, revision: existing.revision + 1, isDeleted: false, updatedAt: ts,
+      }
+      this.bucket(ownerId).set(key, restored)
+      return
+    }
+    const created: PersistRecord = {
+      id: canvasId, ownerId, canvasId, type: 'chat-collection', scope: 'document', revision: 0, orderKey: 0,
+      isDeleted: false, createdAt: ts, updatedAt: ts, payload: {},
+    }
+    this.bucket(ownerId).set(key, created)
+  }
+
+  /**
+   * F1:canvas + chat-collection 单一原子创建原语。route POST /api/canvas 只调这一个(防两段 TOCTOU orphan)。
+   * 顺序:F4(全局唯一)→ F1(parent live)→ 幂等 replay(reuse-conflict/restored/existing)→ existing/restored/fresh。
+   * - restored/existing:restoreCanvasTree(原子恢复 canvas+collection)+ ensureCollectionLive(防遗漏)。
+   * - created(fresh):canvas meta + chat-collection 同一原子操作(快照回滚;失败回到 pre-state,不部分建 → 无 orphan)。
+   */
+  async createCanvasWithCollection(
+    ownerId: string,
+    canvasId: string,
+    canvasPayload: unknown,
+    opts: { idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string },
+  ): Promise<EnsureCreateResult> {
+    // F4:canvas id 全局唯一(跨 owner 同 id → exists-other-owner;在 idem-replay 之前,不覆盖 globalCanvasOwners)。
+    const globalOwner = this.globalCanvasOwners.get(canvasId)
+    if (globalOwner && globalOwner !== ownerId) {
+      const r = this.find(globalOwner, 'canvas', canvasId)
+      if (r) return { kind: 'exists-other-owner', record: clone(r) }
+    }
+    // F1:父 project 须 live(软删 parent 下禁独立 child create/restore;阻断 orphan)。
+    const pid = asCanvasMeta(canvasPayload)?.projectId
+    if (pid && !this.projectLive(ownerId, pid)) return { kind: 'parent-not-live' }
+    // 幂等 replay(owner+method+resourceKind+key + fingerprint)。
+    if (opts.idempotencyKey) {
+      const entry = this.idempotencyIndex.get(idemIndexKey(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey))
+      if (entry) {
+        const r = this.bucket(ownerId).get(entry.envelopeKey)
+        if (r) {
+          // N4:同 key 不同 fingerprint(不同 body)→ reuse-conflict(route 422)。
+          if (opts.bodyFingerprint && entry.fingerprint !== opts.bodyFingerprint) return { kind: 'reuse-conflict' }
+          // N2:幂等命中 deleted → 真恢复(restoreCanvasTree 原子恢复 canvas meta + chat-collection)+ ensureCollectionLive。
+          if (r.isDeleted) {
+            await this.restoreCanvasTree(ownerId, canvasId, { payload: canvasPayload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint })
+            this.ensureCollectionLive(ownerId, canvasId)
+            const restored = this.find(ownerId, 'canvas', canvasId)!
+            this.setIdemIndex(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, recordKey(ownerId, 'canvas', canvasId), opts.bodyFingerprint ?? '')
+            return { kind: 'restored', record: clone(restored) }
+          }
+          // existing live:collection 已随 canvas 原子创建;ensureCollectionLive 防御旧数据。
+          this.ensureCollectionLive(ownerId, canvasId)
+          return { kind: 'existing', record: clone(r) }
+        }
+        this.idempotencyIndex.delete(idemIndexKey(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey))
+      }
+    }
+    const existing = this.find(ownerId, 'canvas', canvasId)
+    if (existing && !existing.isDeleted) {
+      this.ensureCollectionLive(ownerId, canvasId)
+      this.setIdemIndex(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, recordKey(ownerId, 'canvas', canvasId), opts.bodyFingerprint ?? '')
+      return { kind: 'existing', record: clone(existing) }
+    }
+    if (existing && existing.isDeleted) {
+      // N2:parent live(已验 F1)→ restoreCanvasTree(canvas meta + chat-collection)+ ensureCollectionLive。
+      await this.restoreCanvasTree(ownerId, canvasId, { payload: canvasPayload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint })
+      this.ensureCollectionLive(ownerId, canvasId)
+      const restored = this.find(ownerId, 'canvas', canvasId)!
+      this.setIdemIndex(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, recordKey(ownerId, 'canvas', canvasId), opts.bodyFingerprint ?? '')
+      return { kind: 'restored', record: clone(restored) }
+    }
+    // 不存在 → 原子 created(canvas meta + chat-collection 同一操作;快照回滚;无 TOCTOU 窗口)。
+    const b = this.bucket(ownerId)
+    const canvasKey = recordKey(ownerId, 'canvas', canvasId)
+    const collKey = recordKey(ownerId, 'chat-collection', canvasId)
+    const hadCanvas = b.get(canvasKey)
+    const hadColl = b.get(collKey)
+    const ts = nowIso()
+    const canvasRec: PersistRecord = {
+      id: canvasId, ownerId, canvasId: null, type: 'canvas', scope: 'document', revision: 0, orderKey: 0,
+      isDeleted: false, createdAt: ts, updatedAt: ts, payload: clone(canvasPayload),
+      idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint,
+    }
+    const collRec: PersistRecord = {
+      id: canvasId, ownerId, canvasId, type: 'chat-collection', scope: 'document', revision: 0, orderKey: 0,
+      isDeleted: false, createdAt: ts, updatedAt: ts, payload: {},
+      idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint,
+    }
+    try {
+      b.set(canvasKey, canvasRec)
+      b.set(collKey, collRec)
+      this.globalCanvasOwners.set(canvasId, ownerId)
+      this.setIdemIndex(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, canvasKey, opts.bodyFingerprint ?? '')
+    } catch (err) {
+      // 回滚:canvas meta + chat-collection 回到 pre-state(不部分建 → 树内零 live orphan)。
+      if (hadCanvas === undefined) b.delete(canvasKey)
+      else b.set(canvasKey, hadCanvas)
+      if (hadColl === undefined) b.delete(collKey)
+      else b.set(collKey, hadColl)
+      throw err
+    }
+    return { kind: 'created', record: clone(canvasRec) }
   }
 
   /**
@@ -769,7 +896,7 @@ export class InMemoryPersistBackend implements PersistBackend {
     canvasId: string,
     type: PersistType,
     orderedIds: string[],
-    opts: { base?: Revision } = {},
+    opts: { base: Revision },
   ): Promise<ReorderResult> {
     const b = this.bucket(ownerId)
     // live set(type + canvasId + !deleted)
@@ -788,9 +915,9 @@ export class InMemoryPersistBackend implements PersistBackend {
     for (const id of orderedIds) {
       if (!liveIds.has(id)) return { kind: 'bad', reason: 'mismatch' }
     }
-    // N8:If-Match(contentVersion base)冲突——stale → 409(两并发一成一 409)
+    // N8/F5:If-Match(contentVersion base)必填——stale → 409(两并发一成一 409)。F5 删无 base 分支(base 必填,route 已 428 missing)。
     const currentCv = this.canvasContentVersion(ownerId, canvasId)
-    if (opts.base !== undefined && opts.base !== currentCv) {
+    if (opts.base !== currentCv) {
       return { kind: 'conflict', currentContentVersion: currentCv }
     }
     // 原子:快照(children + canvas meta)→ 重分配 orderKey + bump contentVersion+updatedAt;失败回滚。

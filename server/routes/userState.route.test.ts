@@ -190,6 +190,23 @@ describe('/api/user-state routes (T1.3 返修二 N1-N10)', () => {
     expect((await put('canvas:c1:selection', ['n1'])).status).toBe(200)
   })
 
+  it('P1-2/F3:双重编码绕过(normalizeForScan fixed-point decode)→ 全 400;干净 → 200', async () => {
+    // 双重编码 field name(%2561piKey → %61piKey → apiKey;camera=object 承载)→ forbidden-value
+    expect((await put('canvas:c1:camera', { '%2561piKey': 'stolen' })).status).toBe(400)
+    // 双重编码凭据格式值(%256divo_xxx → mivo_xxx)→ forbidden-value
+    expect((await put('canvas:c1:camera', { data: '%256divo_xxx' })).status).toBe(400)
+    // 双重编码 sk- 值(%2553k-test → sk-test)→ forbidden-value
+    expect((await put('canvas:c1:camera', { data: '%2553k-test' })).status).toBe(400)
+    // 双重编码 key 段(canvas:%256divo_xxx:selection → mivo_xxx;canvas:%2553k-test:selection → sk-test)→ forbidden-key
+    expect((await put('canvas:%256divo_xxx:selection', ['n1'])).status).toBe(400)
+    expect((await put('canvas:%2553k-test:selection', ['n1'])).status).toBe(400)
+    // 三重编码(%252561piKey → %2561piKey → %61piKey → apiKey)仍命中(5 次上限内)→ forbidden-value
+    expect((await put('canvas:c1:camera', { '%252561piKey': 'x' })).status).toBe(400)
+    // 干净 → 200
+    expect((await put('canvas:c1:selection', ['n1'])).status).toBe(200)
+    expect((await put('canvas:c1:camera', { x: 1, y: 2 })).status).toBe(200)
+  })
+
   it('F7: canvas:<id>:selection 只收 string[](与 SessionStore 对齐)', async () => {
     // string[] → 200
     expect((await put('canvas:c1:selection', ['n1', 'n2'])).status).toBe(200)

@@ -550,4 +550,47 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
     const ok = await patchChildWithFixture(app, 'c1', 'node', 'n1', base)
     expect(ok.status).toBe(200)
   })
+
+  // ── 返修四 P1-1/P1-3 路由级回归(真实 app.request 全链路)──
+
+  it('P1-3/F6:走私有 payload 全 400(markupPoints 走私/fills 坏类型/maskBounds 坏值+extra);canonical 全 200', async () => {
+    await seedProject()
+    await seedCanvas()
+    const base = wirePayload(canonicalNode('n1')) as Record<string, unknown>
+    // markupPoints 元素走私字段 → 400 unknown-field path=markupPoints[0].smuggled
+    const s1 = await patchChildWithFixture(app, 'c1', 'node', 'n1', { ...base, markupPoints: [{ x: 0, y: 0, smuggled: 1 }] })
+    expect(s1.status).toBe(400)
+    expect((s1.body as { reason: string; field?: string })).toMatchObject({ reason: 'unknown-field', field: 'markupPoints[0].smuggled' })
+    // fills 元素坏类型(id 非 string)→ 400 bad-type path=fills[0].id
+    const s2 = await patchChildWithFixture(app, 'c1', 'node', 'n1', { ...base, fills: [{ id: 1, kind: 'solid', color: '#fff', opacity: 1, visible: true }] })
+    expect(s2.status).toBe(400)
+    expect((s2.body as { reason: string; field?: string })).toMatchObject({ reason: 'bad-type', field: 'fills[0].id' })
+    // generation.maskBounds 坏值 + extra → 400 unknown-field path=generation.maskBounds.extra
+    const s3 = await patchChildWithFixture(app, 'c1', 'node', 'n1', { ...base, generation: { prompt: 'p', model: 'm', maskBounds: { x: 'bad', y: 0, width: 1, height: 1, extra: 1 } } })
+    expect(s3.status).toBe(400)
+    expect((s3.body as { reason: string; field?: string })).toMatchObject({ reason: 'unknown-field', field: 'generation.maskBounds.extra' })
+    // 合法 canonical → 200
+    const okR = await patchChildWithFixture(app, 'c1', 'node', 'n1', base)
+    expect(okR.status).toBe(200)
+  })
+
+  it('P1-1/F1 barrier:POST canvas 原子建 canvas+collection;DELETE project cascade both → 树内零 live orphan', async () => {
+    await seedProject()
+    await seedCanvas('c1', 'p1')
+    // 原子 create 后:canvas + chat-collection both live(直接 backend 断言)
+    const ownerA = fingerprintOfPlatformKey(KEY_A)
+    const collBefore = await backend.get(ownerA, 'chat-collection', 'c1')
+    expect(collBefore.kind).toBe('found')
+    if (collBefore.kind === 'found') expect(collBefore.record.isDeleted).toBe(false)
+    // 并发 DELETE project → softDeleteProjectTree cascade canvas meta + chat-collection
+    await req(app, '/api/projects/p1', { method: 'DELETE', headers: hdr(KEY_A) })
+    // 不变量:树内零 live orphan——canvas 软删 + chat-collection 软删(NOT live)
+    expect((await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })).status).toBe(404)
+    // POST chat under soft-deleted canvas → 404(canvas soft-deleted → unknown-canvas,无 live orphan 可写)
+    expect((await req(app, '/api/canvas/c1/chat', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ message: { id: 'm1' } }) })).status).toBe(404)
+    // 直接 backend:chat-collection soft-deleted(非 live orphan)
+    const collAfter = await backend.get(ownerA, 'chat-collection', 'c1')
+    expect(collAfter.kind).toBe('found')
+    if (collAfter.kind === 'found') expect(collAfter.record.isDeleted).toBe(true)
+  })
 })

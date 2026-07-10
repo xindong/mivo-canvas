@@ -314,13 +314,26 @@ export const SENSITIVE_FIELD_PATTERN =
  */
 const CREDENTIAL_VALUE_PREFIX = /^(mivo_|sk-)/
 
-/** 规范化字符串:URL-decode + lower-case(best-effort,decode 失败则仅 lower-case)。N6 credential 扫描用。 */
+/**
+ * 规范化字符串:URL-decode-to-fixed-point(最多 5 次,异常即停)+ lower-case。N6/F3 credential 扫描用。
+ * F3 双重编码:单次 decode 不够——`%2561piKey`→`%61piKey`→`apiKey`;`%256divo_xxx`→`%6divo_xxx`→`mivo_xxx`;
+ * `%2553k-test`→`%53k-test`→`Sk-test`。循环 decode 至不再变化或达上限 5 次,异常即停(用最后一次成功值,
+ * 含原始值)。**保留 raw 扫描**:无 `%` 的字符串 fixed-point 立即返回(raw 形态直接被后续 regex 命中,如
+ * `apiKey`/`mivo_xxx`/`sk-test`),decode 只会**增加**匹配(把编码变体还原成 credential),不会丢 raw 命中。
+ */
 const normalizeForScan = (s: string): string => {
-  try {
-    return decodeURIComponent(s).toLowerCase()
-  } catch {
-    return s.toLowerCase()
+  let cur = s
+  for (let i = 0; i < 5; i++) {
+    let next: string
+    try {
+      next = decodeURIComponent(cur)
+    } catch {
+      return cur.toLowerCase() // 异常即停:用最后一次成功值(或原始值,含 raw credential)
+    }
+    if (next === cur) return cur.toLowerCase() // fixed point(无 % 或已收敛)
+    cur = next
   }
+  return cur.toLowerCase()
 }
 
 /** 凭据格式值命中(规范后 mivo_/sk- 前缀)。N6:大小写/URL 编码变体均命中。 */
@@ -329,9 +342,9 @@ const isCredentialValue = (v: unknown): boolean =>
 
 /**
  * 递归扫描 value,返回首个敏感路径(无则 null)。
- * 返修 N6/F3:覆盖 object key(含 camelCase/连字符/前缀变体 + **URL 编码变体**——每层 object key
- * 先 best-effort decodeURIComponent+lower 再匹配,故 `{"%61piKey":...}` decode → `apiKey` → 命中)
- * + 嵌套对象/数组 + 字符串值格式(规范后大小写/URL 编码变体均命中)。返回的 path 是 **raw key**(未 decode),
+ * 返修 N6/F3:覆盖 object key(含 camelCase/连字符/前缀变体 + **URL 编码变体(含双重编码)**——每层 object key
+ * 先 fixed-point decode+lower 再匹配,故 `{"%61piKey":...}` → `apiKey`、`{"%2561piKey":...}` → `%61piKey`→`apiKey`
+ * 均命中)+ 嵌套对象/数组 + 字符串值格式(规范后大小写/URL 编码变体均命中)。返回的 path 是 **raw key**(未 decode),
  * 与既有契约测试('api-key'/'userApiKey' path)一致。
  */
 export const scanForSensitiveFields = (value: unknown, prefix = ''): string | null => {
@@ -360,8 +373,9 @@ export const scanForSensitiveFields = (value: unknown, prefix = ''): string | nu
 
 /**
  * F3:完整 user-state key(含 free-form canvasId/panelId 段)做同一 credential 扫描。
- * key 按 `:` 切段,每段 best-effort decode+lower 后查 mivo_/sk- 前缀;任一段命中 → 返该段(非 null)。
+ * key 按 `:` 切段,每段 fixed-point decode+lower 后查 mivo_/sk- 前缀;任一段命中 → 返该段(非 null)。
  * 例:`canvas:mivo_xxx:selection` → 'mivo_xxx';`canvas:%6divo_xxx:selection` → decode → 'mivo_xxx';
+ * `canvas:%256divo_xxx:selection` → 双重 decode → 'mivo_xxx';`canvas:%2553k-test:selection` → 'sk-test';
  * `canvas:c1:selection` → null(c1/selection 非 credential)。frozen namespace allowlist 通过的 key
  * 仍可能 embed credential 段,此函数在 namespace 通过后补刀(防 key 里藏凭据)。
  */
@@ -507,52 +521,182 @@ export const ANCHOR_PAYLOAD_EXHAUSTIVE: [Exclude<keyof AnchorPayload, (typeof AN
   ? true
   : never = true
 
-// F6:fixed-shape nested object 字段的 exact-key + type schema(transform / assetSourceDimensions)。
-// variadic nested(relations=Record / fills[] / strokes[] / effects[])不在 exact-key 范围(形状随语义变),
-// 由 findForbiddenDeep 递归扫 status/tasks 兜底;transform 等固定形状字段做 exact key+type 校验。
-const NESTED_SCHEMAS: Record<string, Record<string, (v: unknown) => boolean>> = {
-  transform: { x: isNum, y: isNum, width: isNum, height: isNum, rotation: isNum },
-  assetSourceDimensions: { width: isNum, height: isNum },
+// F6:递归 exact schema DSL——scalar(叶类型)/object(固定 key,exact 拒 unknown)/array(逐元素)/
+// union(kind|type 判别联合)。validateCheck 递归遍历,返首个 {reason,field}(path 点号 + 数组下标)。
+// 覆盖 record-schema §3 全部固定对象/判别 union/数组:transform/fills(strokes/effects 判别)/layout/
+// constraints/asset/relations/generation.maskBounds+maskSourceSize/aiWorkflow/markupPoints/experimentalAnchors/
+// annotationBounds/imageCrop/assetSourceDimensions ——逐层 unknown 拒、required nested、元素类型全覆盖。
+type Check =
+  | { readonly t: 'scalar'; readonly test: (v: unknown) => boolean }
+  | { readonly t: 'object'; readonly fields: Readonly<Record<string, Check>>; readonly required?: readonly string[] }
+  | { readonly t: 'array'; readonly element: Check }
+  | { readonly t: 'union'; readonly tag: string; readonly variants: Readonly<Record<string, Check>> }
+
+const scalar = (test: (v: unknown) => boolean): Check => ({ t: 'scalar', test })
+const obj = (fields: Record<string, Check>, required?: readonly string[]): Check => ({ t: 'object', fields, required })
+const arr = (element: Check): Check => ({ t: 'array', element })
+const union = (tag: string, variants: Record<string, Check>): Check => ({ t: 'union', tag, variants })
+
+const MARKUP_STROKE_STYLE_VALUES = new Set(['solid', 'dashed'])
+const CONNECTOR_ANCHOR_VALUES = new Set(['center', 'top', 'right', 'bottom', 'left'])
+const LAYOUT_MODE_VALUES = new Set(['none', 'auto'])
+const LAYOUT_DIRECTION_VALUES = new Set(['horizontal', 'vertical'])
+const CONSTRAINT_HORIZONTAL_VALUES = new Set(['left', 'right', 'left-right', 'center', 'scale'])
+const CONSTRAINT_VERTICAL_VALUES = new Set(['top', 'bottom', 'top-bottom', 'center', 'scale'])
+const FILL_SCALE_MODE_VALUES = new Set(['fill', 'fit', 'crop', 'tile'])
+const AI_WORKFLOW_KIND_VALUES = new Set(['slot', 'annotation', 'result'])
+const AI_WORKFLOW_STATUS_VALUES = new Set(['empty', 'queued', 'generating', 'ready', 'failed', 'canceled'])
+const AI_WORKFLOW_OPERATION_VALUES = new Set([
+  'slot-generation', 'beside-generation', 'annotation-edit', 'variation', 'prompt-edit',
+  'area-edit', 'remove-background', 'outpaint', 'upscale',
+])
+const AI_WORKFLOW_PLACEMENT_VALUES = new Set(['slot', 'right', 'left', 'below'])
+
+// §3.1 transform {x,y,width,height,rotation} / §3.10 annotationBounds + imageCrop + maskBounds {x,y,width,height}
+const TRANSFORM: Check = obj(
+  { x: scalar(isNum), y: scalar(isNum), width: scalar(isNum), height: scalar(isNum), rotation: scalar(isNum) },
+  ['x', 'y', 'width', 'height', 'rotation'],
+)
+const RECT: Check = obj(
+  { x: scalar(isNum), y: scalar(isNum), width: scalar(isNum), height: scalar(isNum) },
+  ['x', 'y', 'width', 'height'],
+)
+// §3.5 assetSourceDimensions / §3.7 generation.maskSourceSize {width,height}
+const DIMENSIONS: Check = obj({ width: scalar(isNum), height: scalar(isNum) }, ['width', 'height'])
+// §3.6 ConnectorBinding {nodeId, anchor, offset?}
+const CONNECTOR_BINDING: Check = obj(
+  { nodeId: scalar(isStr), anchor: scalar(isStrEnum(CONNECTOR_ANCHOR_VALUES)), offset: scalar(isNum) },
+  ['nodeId', 'anchor'],
+)
+// §3.2 fills = solid | image(kind 判别不可变)
+const FILL_ELEMENT: Check = union('kind', {
+  solid: obj(
+    { id: scalar(isStr), kind: scalar(isStrEnum(new Set(['solid']))), color: scalar(isStr), opacity: scalar(isNum), visible: scalar(isBool) },
+    ['id', 'kind', 'color', 'opacity', 'visible'],
+  ),
+  image: obj(
+    {
+      id: scalar(isStr), kind: scalar(isStrEnum(new Set(['image']))), assetUrl: scalar(isStr),
+      opacity: scalar(isNum), visible: scalar(isBool), scaleMode: scalar(isStrEnum(FILL_SCALE_MODE_VALUES)),
+    },
+    ['id', 'kind', 'assetUrl', 'opacity', 'visible', 'scaleMode'],
+  ),
+})
+// §3.3 strokes {id,color,width,style,opacity,visible}
+const STROKE_ELEMENT: Check = obj(
+  {
+    id: scalar(isStr), color: scalar(isStr), width: scalar(isNum),
+    style: scalar(isStrEnum(MARKUP_STROKE_STYLE_VALUES)), opacity: scalar(isNum), visible: scalar(isBool),
+  },
+  ['id', 'color', 'width', 'style', 'opacity', 'visible'],
+)
+// §3.4 effects = shadow | blur(kind 判别不可变)
+const EFFECT_ELEMENT: Check = union('kind', {
+  shadow: obj(
+    {
+      id: scalar(isStr), kind: scalar(isStrEnum(new Set(['shadow']))), color: scalar(isStr),
+      x: scalar(isNum), y: scalar(isNum), blur: scalar(isNum), spread: scalar(isNum),
+      opacity: scalar(isNum), visible: scalar(isBool),
+    },
+    ['id', 'kind', 'color', 'x', 'y', 'blur', 'spread', 'opacity', 'visible'],
+  ),
+  blur: obj(
+    { id: scalar(isStr), kind: scalar(isStrEnum(new Set(['blur']))), radius: scalar(isNum), visible: scalar(isBool) },
+    ['id', 'kind', 'radius', 'visible'],
+  ),
+})
+// §2.7 markupPoints {x,y,pressure?}
+const MARKUP_POINT: Check = obj({ x: scalar(isNum), y: scalar(isNum), pressure: scalar(isNum) }, ['x', 'y'])
+// §3.9 experimentalAnchors element(ExperimentalAnchor;node-embedded 带 id;box 强制 width/height——record-schema §3.9)
+const ANCHOR_ELEMENT: Check = obj(
+  {
+    id: scalar(isStr), type: scalar(isStrEnum(ANCHOR_TYPE_VALUES)), targetNodeId: scalar(isStr),
+    x: scalar(isNum), y: scalar(isNum), instruction: scalar(isStr), createdAt: scalar(isNum),
+    width: scalar(isNum), height: scalar(isNum), resultNodeIds: arr(scalar(isStr)),
+  },
+  ['id', 'type', 'targetNodeId', 'x', 'y', 'instruction', 'createdAt'],
+)
+// §3.5 asset {url, mimeType?, originalName?, sizeBytes?}
+const ASSET_REF: Check = obj(
+  { url: scalar(isStr), mimeType: scalar(isStr), originalName: scalar(isStr), sizeBytes: scalar(isNum) },
+  ['url'],
+)
+// §3.6 relations = NodeRelations Omit aiWorkflow {parentIds?, sectionId?, targetNodeId?, connectorStart?, connectorEnd?}
+const RELATIONS: Check = obj({
+  parentIds: arr(scalar(isStr)), sectionId: scalar(isStr), targetNodeId: scalar(isStr),
+  connectorStart: CONNECTOR_BINDING, connectorEnd: CONNECTOR_BINDING,
+})
+// §2.8 layout {mode, direction?, gap?, padding?{top,right,bottom,left}}
+const LAYOUT: Check = obj(
+  {
+    mode: scalar(isStrEnum(LAYOUT_MODE_VALUES)), direction: scalar(isStrEnum(LAYOUT_DIRECTION_VALUES)),
+    gap: scalar(isNum),
+    padding: obj(
+      { top: scalar(isNum), right: scalar(isNum), bottom: scalar(isNum), left: scalar(isNum) },
+      ['top', 'right', 'bottom', 'left'],
+    ),
+  },
+  ['mode'],
+)
+// §2.3 constraints {horizontal?, vertical?}
+const CONSTRAINTS: Check = obj({
+  horizontal: scalar(isStrEnum(CONSTRAINT_HORIZONTAL_VALUES)),
+  vertical: scalar(isStrEnum(CONSTRAINT_VERTICAL_VALUES)),
+})
+// §3.7 generation {prompt, model, size?, seed?, strength?, taskId?, createdAt?, maskBounds?, maskSourceSize?}
+const GENERATION: Check = obj(
+  {
+    prompt: scalar(isStr), model: scalar(isStr), size: scalar(isStr), seed: scalar(isNum),
+    strength: scalar(isNum), taskId: scalar(isStr), createdAt: scalar(isNum),
+    maskBounds: RECT, maskSourceSize: DIMENSIONS,
+  },
+  ['prompt', 'model'],
+)
+// §3.8 aiWorkflow {kind, status?, operation?, prompt?, sourceNodeIds?, anchorNodeId?, annotationNodeId?, slotId?, placement?, createdAt?, progress?, stage?, startedAt?, elapsedSec?}
+const AI_WORKFLOW: Check = obj(
+  {
+    kind: scalar(isStrEnum(AI_WORKFLOW_KIND_VALUES)), status: scalar(isStrEnum(AI_WORKFLOW_STATUS_VALUES)),
+    operation: scalar(isStrEnum(AI_WORKFLOW_OPERATION_VALUES)), prompt: scalar(isStr),
+    sourceNodeIds: arr(scalar(isStr)), anchorNodeId: scalar(isStr), annotationNodeId: scalar(isStr),
+    slotId: scalar(isStr), placement: scalar(isStrEnum(AI_WORKFLOW_PLACEMENT_VALUES)),
+    createdAt: scalar(isNum), progress: scalar(isNum), stage: scalar(isStr),
+    startedAt: scalar(isNum), elapsedSec: scalar(isNum),
+  },
+  ['kind'],
+)
+
+// F6 逐 type 顶层 spec(object Check;id 允许但由 validateChildPayload 预校验 path 一致 → spec 放行 scalar(isStr))。
+const PAYLOAD_SPECS: Record<'node' | 'edge' | 'anchor', Check> = {
+  node: obj({
+    id: scalar(isStr), type: scalar(isStrEnum(NODE_TYPE_VALUES)), title: scalar(isStr), transform: TRANSFORM,
+    fills: arr(FILL_ELEMENT), strokes: arr(STROKE_ELEMENT), effects: arr(EFFECT_ELEMENT),
+    layout: LAYOUT, constraints: CONSTRAINTS, asset: ASSET_REF, relations: RELATIONS, text: scalar(isStr),
+    fontSize: scalar(isNum), textColor: scalar(isStr), fontWeight: scalar(isNum),
+    textAlign: scalar((v) => isStr(v) && (v === 'left' || v === 'center' || v === 'right')),
+    textAutoWidth: scalar(isBool), markupKind: scalar(isStr), markupBrushKind: scalar(isStr),
+    markupStampKind: scalar(isStr), markupPoints: arr(MARKUP_POINT), markupStartArrow: scalar(isBool),
+    markupEndArrow: scalar(isBool), markupCornerRadius: scalar(isNum), sectionTitleVisible: scalar(isBool),
+    sectionLockMode: scalar(isStr), sectionTemplateId: scalar(isStr), markdownDisplayMode: scalar(isStr),
+    imageHasTransparency: scalar(isBool), assetSourceDimensions: DIMENSIONS, imageCrop: RECT,
+    sourceNodeId: scalar(isStr), groupId: scalar(isStr), locked: scalar(isBool), hidden: scalar(isBool),
+    favorited: scalar(isBool), generation: GENERATION, aiWorkflow: AI_WORKFLOW,
+    experimentalAnchors: arr(ANCHOR_ELEMENT), annotationBounds: RECT,
+  }, ['type', 'title', 'transform', 'fills', 'strokes', 'effects', 'relations']),
+  edge: obj(
+    { id: scalar(isStr), from: scalar(isStr), to: scalar(isStr), type: scalar(isStrEnum(EDGE_TYPE_VALUES)), prompt: scalar(isStr), createdAt: scalar(isNum) },
+    ['from', 'to', 'type', 'prompt', 'createdAt'],
+  ),
+  anchor: obj(
+    {
+      id: scalar(isStr), type: scalar(isStrEnum(ANCHOR_TYPE_VALUES)), targetNodeId: scalar(isStr),
+      x: scalar(isNum), y: scalar(isNum), instruction: scalar(isStr), createdAt: scalar(isNum),
+      width: scalar(isNum), height: scalar(isNum), resultNodeIds: arr(scalar(isStr)),
+    },
+    ['type', 'targetNodeId', 'x', 'y', 'instruction', 'createdAt'],
+  ),
 }
 
-/**
- * F6 payload schema(逐 type):fields = 所有 allowed key(required + optional)→ 类型谓词;
- * required = 有序必填字段(缺 → missing-field)。F6 vs N10:N10 只校验 required 类型;
- * F6 把 optional 也纳入类型校验(fontSize:'x' → bad-type)+ nested exact key/type + 递归 forbidden。
- */
-type PayloadSpec = { fields: Record<string, (v: unknown) => boolean>; required: string[] }
-
-const PAYLOAD_SPECS: Record<'node' | 'edge' | 'anchor', PayloadSpec> = {
-  node: {
-    fields: {
-      type: isStrEnum(NODE_TYPE_VALUES), title: isStr, transform: isObj, fills: isArr, strokes: isArr,
-      effects: isArr, layout: isObj, constraints: isObj, asset: isObj, relations: isObj, text: isStr,
-      fontSize: isNum, textColor: isStr, fontWeight: isNum,
-      textAlign: (v) => isStr(v) && (v === 'left' || v === 'center' || v === 'right'), textAutoWidth: isBool,
-      markupKind: isStr, markupBrushKind: isStr, markupStampKind: isStr, markupPoints: isArr,
-      markupStartArrow: isBool, markupEndArrow: isBool, markupCornerRadius: isNum,
-      sectionTitleVisible: isBool, sectionLockMode: isStr, sectionTemplateId: isStr,
-      markdownDisplayMode: isStr, imageHasTransparency: isBool, assetSourceDimensions: isObj,
-      imageCrop: isObj, sourceNodeId: isStr, groupId: isStr, locked: isBool, hidden: isBool,
-      favorited: isBool, generation: isObj, aiWorkflow: isObj, experimentalAnchors: isArr,
-      annotationBounds: isObj,
-    },
-    required: ['type', 'title', 'transform', 'fills', 'strokes', 'effects', 'relations'],
-  },
-  edge: {
-    fields: { from: isStr, to: isStr, type: isStrEnum(EDGE_TYPE_VALUES), prompt: isStr, createdAt: isNum },
-    required: ['from', 'to', 'type', 'prompt', 'createdAt'],
-  },
-  anchor: {
-    fields: {
-      type: isStrEnum(ANCHOR_TYPE_VALUES), targetNodeId: isStr, x: isNum, y: isNum, instruction: isStr,
-      createdAt: isNum, width: isNum, height: isNum, resultNodeIds: isArr,
-    },
-    required: ['type', 'targetNodeId', 'x', 'y', 'instruction', 'createdAt'],
-  },
-}
-
-/** F6:递归扫 status/tasks(任意层)——返回首个命中 path(无则 null)。top-level 与 nested(relations 内藏)一视同仁。 */
+/** F6:递归扫 status/tasks(任意层)——返回首个命中 path(无则 null)。top-level 与 nested(relations/fills 内藏)一视同仁。 */
 const findForbiddenDeep = (value: unknown, prefix: string): string | null => {
   if (Array.isArray(value)) {
     for (let i = 0; i < value.length; i++) {
@@ -571,24 +715,71 @@ const findForbiddenDeep = (value: unknown, prefix: string): string | null => {
   return null
 }
 
+/** F6 递归校验结果(首个错;无则 null)。path 用点号 + 数组下标(如 fills[0].kind / generation.maskBounds.x)。 */
+type FieldError = { reason: PayloadRejectedReason; field: string }
+
+const assertNeverCheck = (x: never): never => {
+  throw new Error(`validateCheck: unhandled Check variant ${JSON.stringify((x as { t: string }).t)}`)
+}
+
+const validateCheck = (check: Check, value: unknown, path: string): FieldError | null => {
+  switch (check.t) {
+    case 'scalar':
+      return check.test(value) ? null : { reason: 'bad-type', field: path || '<root>' }
+    case 'object': {
+      if (!isObj(value)) return { reason: 'bad-type', field: path || '<root>' }
+      // unknown nested key → unknown-field(§3 exact;先于 required/type,与 transform.bogus 测试一致)
+      for (const k of Object.keys(value)) {
+        if (!(k in check.fields)) return { reason: 'unknown-field', field: path ? `${path}.${k}` : k }
+      }
+      for (const req of check.required ?? []) {
+        if (!(req in value)) return { reason: 'missing-field', field: path ? `${path}.${req}` : req }
+      }
+      for (const [k, sub] of Object.entries(check.fields)) {
+        if (k in value) {
+          const err = validateCheck(sub, value[k], path ? `${path}.${k}` : k)
+          if (err) return err
+        }
+      }
+      return null
+    }
+    case 'array': {
+      if (!isArr(value)) return { reason: 'bad-type', field: path || '<root>' }
+      for (let i = 0; i < value.length; i++) {
+        const err = validateCheck(check.element, value[i], `${path}[${i}]`)
+        if (err) return err
+      }
+      return null
+    }
+    case 'union': {
+      if (!isObj(value)) return { reason: 'bad-type', field: path || '<root>' }
+      if (!(check.tag in value)) return { reason: 'missing-field', field: path ? `${path}.${check.tag}` : check.tag }
+      const tag = value[check.tag]
+      if (!isStr(tag)) return { reason: 'bad-type', field: path ? `${path}.${check.tag}` : check.tag }
+      const variant = check.variants[tag]
+      if (!variant) return { reason: 'unknown-field', field: path ? `${path}.${check.tag}` : check.tag }
+      return validateCheck(variant, value, path)
+    }
+    default:
+      return assertNeverCheck(check)
+  }
+}
+
 export type PayloadCheck =
   | { ok: true; payload: Record<string, unknown> }
   | { ok: false; body: PayloadRejectedBody }
 
 /**
- * 返修 N1/N10/F6:真实 decoder——逐 type payload 递归白名单 runtime 校验。
- * - 必须是 object(非 null/array)。
+ * 返修 N1/N10/F6:真实 decoder——逐 type payload 递归 exact 白名单 runtime 校验。
+ * - 必须是 object(非 null/array)→ not-object。
  * - `id`(若有)必须 string 且 === path(N10:非 string id → bad-id-type;不一致 → id-mismatch #5)。
- * - `revision`(若有)→ mirror-field(envelope 唯一真相,防双真相)。
  * - envelope 镜像字段(ownerId/canvasId/scope/revision/isDeleted/updatedAt/orderKey)→ mirror-field。
- *   注:`createdAt` 不在 mirror 拒收收集——Edge/Anchor 的 createdAt 是 canonical 域字段(allowed-keys
- *   放行);Node 无此域字段,Node payload 带 createdAt 由 unknown-field 拒(allowed 不含之)。
- * - F6:**status/tasks 任意层递归拒**(findForbiddenDeep;top-level 与 nested relations 内藏均命中,
- *   在 unknown/missing 之前,与 N10 #13 测试一致)。
- * - 非 allowed key → unknown-field(N10:拒 unknown)。
- * - 缺必填 → missing-field;F6:**optional 也校验类型**(present 但类型不符 → bad-type,如 fontSize:'x')。
- * - F6:**nested exact key/type**——transform 等固定形状字段走 NESTED_SCHEMAS(unknown nested key →
- *   unknown-field;坏类型 → bad-type,如 transform.x 非 number)。
+ *   注:`createdAt` 不在 mirror 拒收收集——Edge/Anchor 的 createdAt 是 canonical 域字段(spec 放行)。
+ * - F6:**status/tasks 任意层递归拒**(findForbiddenDeep;在 schema 之前,与 N10 #13 测试一致)。
+ * - F6 递归 exact schema(validateCheck):unknown nested key → unknown-field;缺必填 → missing-field;
+ *   类型不符 → bad-type;数组逐元素(fills/strokes/effects/markupPoints/experimentalAnchors)、判别 union
+ *   (fills solid|image / effects shadow|blur)、固定对象(generation.maskBounds/maskSourceSize/relations/
+ *   aiWorkflow/transform/layout/constraints/asset/annotationBounds/imageCrop/assetSourceDimensions)全 exact。
  */
 export const validateChildPayload = (
   type: 'node' | 'edge' | 'anchor',
@@ -612,46 +803,15 @@ export const validateChildPayload = (
   for (const f of PAYLOAD_MIRROR_FIELDS) {
     if (f in obj) return { ok: false, body: { error: 'payload-rejected', reason: 'mirror-field', field: f } }
   }
-  // F6:status/tasks 任意层递归拒(findForbiddenDeep;top-level 与 nested relations 内藏均命中)。
+  // F6:status/tasks 任意层递归拒(findForbiddenDeep 在 schema 之前;top-level 与 nested relations/fills 内藏均命中)。
   const forbiddenPath = findForbiddenDeep(obj, '')
   if (forbiddenPath) {
     return { ok: false, body: { error: 'payload-rejected', reason: 'forbidden-field', field: forbiddenPath } }
   }
-  const spec = PAYLOAD_SPECS[type]
-  // 拒 unknown(N10)
-  for (const key of Object.keys(obj)) {
-    if (key === 'id') continue // id 特殊(已校验)
-    if (!(key in spec.fields)) {
-      return { ok: false, body: { error: 'payload-rejected', reason: 'unknown-field', field: key } }
-    }
-  }
-  // 必填(N10:缺 → missing-field)
-  for (const field of spec.required) {
-    if (!(field in obj)) {
-      return { ok: false, body: { error: 'payload-rejected', reason: 'missing-field', field } }
-    }
-  }
-  // F6:类型校验(required + optional,present 才校验)——fontSize:'x' 等 optional 坏类型 → bad-type。
-  for (const [field, predicate] of Object.entries(spec.fields)) {
-    if (field in obj && !predicate(obj[field])) {
-      return { ok: false, body: { error: 'payload-rejected', reason: 'bad-type', field } }
-    }
-  }
-  // F6:nested exact key/type(transform 等固定形状字段)。non-object 由上层 fields[field]=isObj 已拒(bad-type)。
-  for (const [field, schema] of Object.entries(NESTED_SCHEMAS)) {
-    if (!(field in obj)) continue
-    const inner = obj[field]
-    if (!isObj(inner)) continue
-    for (const nk of Object.keys(inner)) {
-      if (!(nk in schema)) {
-        return { ok: false, body: { error: 'payload-rejected', reason: 'unknown-field', field: `${field}.${nk}` } }
-      }
-    }
-    for (const [nk, np] of Object.entries(schema)) {
-      if (nk in inner && !np(inner[nk])) {
-        return { ok: false, body: { error: 'payload-rejected', reason: 'bad-type', field: `${field}.${nk}` } }
-      }
-    }
+  // F6 递归 exact schema(顶层 id 已预校验;spec 含 id:scalar(isStr) 放行,其余逐层 unknown/missing/type/元素)。
+  const err = validateCheck(PAYLOAD_SPECS[type], obj, '')
+  if (err) {
+    return { ok: false, body: { error: 'payload-rejected', reason: err.reason, field: err.field } }
   }
   return { ok: true, payload: obj }
 }
