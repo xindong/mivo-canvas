@@ -134,6 +134,7 @@ export const generateMivoImage = async (request: MivoGenerateRequest) => {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        ...authHeaders(),
       },
       signal: request.signal,
       body: JSON.stringify({
@@ -173,6 +174,7 @@ export const editMivoImage = async (request: MivoEditRequest) => {
     '/api/mivo/edit',
     {
       method: 'POST',
+      headers: { ...authHeaders() },
       signal: request.signal,
       body: formData,
     },
