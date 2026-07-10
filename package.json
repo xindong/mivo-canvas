@@ -11,6 +11,7 @@
     "bench:fixtures": "node scripts/bench/generate-fixtures.mjs",
     "bench:collect": "node scripts/bench/collect.mjs",
     "visual:diff": "node scripts/visual-diff.mjs",
+    "visual:diff:shell": "node scripts/visual-shell-baselines.mjs",
     "debug:server": "node scripts/debug-log-server.mjs",
     "test:unit": "vitest run",
     "verify:logging": "node scripts/verify-debug-logging.mjs",

@@ -35,6 +35,16 @@ export const app = new Hono<AppEnv>()
 // Liveness probe.
 app.get('/healthz', (c) => c.json({ status: 'ok' }))
 
+// visual-diff token probe (env-gated): only when MIVO_VD_TOKEN is set, return it at
+// /__vd_probe so scripts/visual-diff.mjs can confirm THIS BFF process is responding
+// (not a stale one holding the port — strictPort makes the new BFF exit on EADDRINUSE,
+// but an old process could still serve 200). Normal dev/prod has no token → falls through
+// to serveStatic/SPA. Mounted before /api routes & SPA fallback so it matches first.
+const vdProbeToken = process.env.MIVO_VD_TOKEN
+if (vdProbeToken) {
+  app.get('/__vd_probe', (c) => c.text(vdProbeToken))
+}
+
 // Auth routes — dev stub /api/auth/me only. Production /api/auth/me is provided by
 // the SSO gateway (nginx intercepts); this mount is for local dev / e2e.
 app.route('/api/auth', authRoute)
