@@ -1,5 +1,5 @@
 // shared/persist-contract.ts
-// T1.3 前置:四端点 + PersistAdapter 的 wire 契约(客户端 ↔ 服务端互锁)—— 返修版。
+// T1.3 前置:四端点 + PersistAdapter 的 wire 契约(客户端 ↔ 服务端互锁)—— 返修版二(N1-N10)。
 // 权威:docs/decisions/api-surface.md。本文件是唯一让 server/ 与 src/ 共享的 seam——
 // server 路由按这些类型 parse/返回,client PersistAdapter 按这些类型 (de)serialize,
 // 任一侧改 shape → 编译期 break(类型共享互锁,lead §3 任务选项一)。
@@ -10,7 +10,13 @@
 //  - revision 唯一真相在 envelope 信封列(platform §13.5);wire payload 不携带 id/revision
 //    (返修 finding #5:envelope 唯一真相)。id 来自 URL path,revision base 来自 If-Match header
 //    (返修 finding #4:existing 强制 base,缺失 428;If-Match 严格优先;create 免 base)。
-//  - payload 域类型(NodeRecord 等)在 src/kernel/records.ts,client 侧参数化,不进本共享层。
+//  - 返修 N1:transport payload = 逐 type Omit<Record,'id'|'revision'>(id 取路径,revision 取
+//    envelope/If-Match;payload 内 domain createdAt 保留不镜像校验——Edge/Anchor 的 createdAt
+//    是 canonical 域字段,不在 mirror 拒收集)。本共享层 import type 引用 src/kernel/records
+//    (单向,无环:src/kernel 不 import shared;src/types/mivoCanvas + src/lib/imageSizing 均 DOM-free,
+//    服务端 tsconfig 含 ES2023 可类型检查)。
+
+import type { AnchorRecord, EdgeRecord, NodeRecord } from '../src/kernel/records'
 
 /** per-record revision(envelope 唯一真相,节点级合并 LWW tie-break,platform §13.5)。 */
 export type Revision = number
@@ -55,10 +61,18 @@ export type Envelope<Payload = unknown> = {
   payload: Payload
 }
 
+// ── 返修 N1:transport payload = 逐 type Omit<Record,'id'|'revision'> ──────────────────
+// id 来自 path,revision 来自 envelope/If-Match;payload 不携带 id/revision(防双真相)。
+// Edge/Anchor 的 `createdAt` 是 canonical 域字段(保留,不镜像校验);Node 无 createdAt 域字段。
+export type NodePayload = Omit<NodeRecord, 'id' | 'revision'>
+export type EdgePayload = Omit<EdgeRecord, 'id' | 'revision'>
+export type AnchorPayload = Omit<AnchorRecord, 'id' | 'revision'>
+
 /**
  * 写请求(POST idempotent / PATCH 节点级 / PUT meta)。
- * 返修 #5:wire body 不携带 id/revision——id 来自 path,revision base 来自 If-Match header。
- * payload 不透明(NodeRecord 等),服务端对 node/edge/anchor 做 runtime 白名单 codec(返修 #11/#13)。
+ * 返修 #5/N1:wire body 不携带 id/revision——id 来自 path,revision base 来自 If-Match header。
+ * payload = 逐 type transport(NodePayload/EdgePayload/AnchorPayload);服务端对 node/edge/anchor 做
+ * runtime 白名单 codec(N10:必填/类型校验/拒 unknown/非 string id 400)。
  */
 export type UpsertRequest<Payload = unknown> = {
   payload: Payload
@@ -94,7 +108,7 @@ export type BadMivoKeyBody = {
   error: 'bad-mivo-key'
 }
 
-/** 400 forbidden-key / forbidden-value(DP-7 user-state 排除清单服务端兜底,返修 #9)。 */
+/** 400 forbidden-key / forbidden-value(DP-7 user-state 排除清单服务端兜底,返修 #9/N6)。 */
 export type ForbiddenKeyBody = {
   error: 'forbidden-key'
   key: string
@@ -105,10 +119,28 @@ export type ForbiddenValueBody = {
   path: string
 }
 
-/** 400 payload-rejected(返修 #13:NodeRecord payload 白名单 runtime 校验拒镜像/status/tasks 字段)。 */
+/**
+ * 返修 N4:422 幂等 key 复用冲突(同 key 不同 fingerprint=不同 body)。
+ * 同 key + 同 body(同 fingerprint)→ 200 既有(不 bump);同 key + 不同 body → 422。
+ */
+export type ReuseConflictBody = {
+  error: 'idempotency-key-reuse'
+  key: string
+}
+
+/** 400 payload-rejected(返修 #13/N10:NodeRecord payload 白名单 runtime 校验)。 */
+export type PayloadRejectedReason =
+  | 'mirror-field'
+  | 'forbidden-field'
+  | 'id-mismatch'
+  | 'bad-id-type'
+  | 'not-object'
+  | 'unknown-field'
+  | 'missing-field'
+  | 'bad-type'
 export type PayloadRejectedBody = {
   error: 'payload-rejected'
-  reason: 'mirror-field' | 'forbidden-field' | 'id-mismatch' | 'not-object'
+  reason: PayloadRejectedReason
   field?: string
 }
 
@@ -135,6 +167,7 @@ export type ApiErrorBody =
   | BadMivoKeyBody
   | ForbiddenKeyBody
   | ForbiddenValueBody
+  | ReuseConflictBody
   | PayloadRejectedBody
   | UnknownResourceBody
   | { error: 'project-exists'; id: string }
@@ -220,56 +253,85 @@ export type ListUserStateResponse = { entries: Record<string, UserStateEntry> }
 /** 返修 #5:wire body 不携带 revision(rev base 走 If-Match)。 */
 export type PutUserStateRequest = { value: unknown }
 
-// ── DP-7 user-state 防御(返修 #9:namespace allowlist + 每 namespace schema + 递归敏感扫描)──
+// ── DP-7 user-state 防御(返修 #9/N6:namespace allowlist + 每 namespace schema + 递归敏感扫描)──
 
 /**
- * key namespace allowlist(返修 #9)。非 allowlist 前缀的 key → 400 forbidden-key。
- * 两把 key(gateway-key/mivo-key)不在 allowlist(天然拒);敏感凭据子串仍由 value 递归扫描兜底。
+ * 返修 N6:frozen key 逐项 exact regex(含 canvas suffix)。每个 namespace 的合法 key 形式冻结,
+ * 拒未知 suffix(如 `canvas:<id>:bogus` → forbidden-key)。canvasId/panelId 是 free-form(非冒号非空)。
+ * - `canvas:<id>:selection`(array)/`canvas:<id>:camera`(object)/`canvas:<id>:chat-draft`(string)
+ * - `recent:projects` / `recent:canvases`(array)
+ * - `pref:tool` / `pref:brush` / `pref:stamp`(string)
+ * - `panel:<panelId>`(boolean)
+ * 两把 key(gateway-key/mivo-key)不在 frozen 集(天然拒);随机非 allowlist 前缀也拒。
  */
+export const USER_STATE_KEY_FROZEN = [
+  /^canvas:[^:]+:selection$/,
+  /^canvas:[^:]+:camera$/,
+  /^canvas:[^:]+:chat-draft$/,
+  /^recent:projects$/,
+  /^recent:canvases$/,
+  /^pref:tool$/,
+  /^pref:brush$/,
+  /^pref:stamp$/,
+  /^panel:[^:]+$/,
+] as const
+
+/** 兼容旧 API:namespace allowlist 前缀(粗粒度,route 仍可用;N6 frozen regex 是真校验)。 */
 export const USER_STATE_KEY_NAMESPACES = ['canvas:', 'recent:', 'pref:', 'panel:'] as const
 
 export const isUserStateKeyNamespaceAllowed = (key: string): boolean =>
-  USER_STATE_KEY_NAMESPACES.some((ns) => key.startsWith(ns))
+  USER_STATE_KEY_FROZEN.some((re) => re.test(key))
 
 /**
- * 每 namespace 的 runtime value kind schema(返修 #9)。宽松 shape 校验:值必须满足该 namespace 期望 kind,
- * 否则 400 bad-request(forbidden-value 路径用于敏感字段,value-shape 不符走 bad-request)。
- * `true` 表示任意 value 兼容(未来可收紧)。
+ * 返修 N6:每 namespace/suffix 的 runtime value kind schema(不符 → 400 bad-request)。
  */
 export type UserStateValueKind = 'array' | 'object' | 'string' | 'number' | 'boolean' | 'any'
 
-export const USER_STATE_NAMESPACE_KINDS: Record<string, UserStateValueKind> = {
-  'canvas:': 'any', // selection(array)/camera(object)/chat-draft(string) 按 suffix 区分,宽松
-  'recent:': 'array',
-  'pref:': 'string',
-  'panel:': 'boolean',
-}
-
 export const userStateNamespaceKind = (key: string): UserStateValueKind => {
-  for (const ns of USER_STATE_KEY_NAMESPACES) {
-    if (key.startsWith(ns)) return USER_STATE_NAMESPACE_KINDS[ns] ?? 'any'
-  }
+  if (/^canvas:[^:]+:selection$/.test(key)) return 'array'
+  if (/^canvas:[^:]+:camera$/.test(key)) return 'object'
+  if (/^canvas:[^:]+:chat-draft$/.test(key)) return 'string'
+  if (/^recent:/.test(key)) return 'array'
+  if (/^pref:/.test(key)) return 'string'
+  if (/^panel:/.test(key)) return 'boolean'
   return 'any'
 }
 
 /**
- * 敏感字段名/值模式(返修 #9:递归扫 value 拒敏感)。
- * - 字段名命中(大小写/连字符/camelCase 变体全覆盖):secret/token/password/apiKey/gatewayKey/mivoKey/accessToken/auth 等。
- * - 值为字符串且形如 mivo_ / sk- 前缀(凭据格式值)→ 拒。
+ * 敏感字段名模式(返修 #9/N6:递归扫 value 拒敏感;大小写/连字符/camelCase 变体全覆盖)。
+ * 命中字段名:secret/token/password/apiKey/gatewayKey/mivoKey/accessToken/auth/credential/privateKey 等。
  */
 export const SENSITIVE_FIELD_PATTERN =
   /(secret|token|password|api[-_]?key|gateway[-_]?key|mivo[-_]?key|access[-_]?token|authorization|credential|private[-_]?key)/i
 
-export const SENSITIVE_VALUE_PATTERN = /^(mivo_|sk-)/
+/**
+ * 返修 N6:凭据格式值模式(mivo_ / sk- 前缀)。匹配在 normalize 后(URL-decode + lower-case),
+ * 故 `MIVO_xxx` / `Sk-xxx` / URL 编码变体(`%6divo_xxx` → decode → `mivo_xxx`)均命中。
+ */
+const CREDENTIAL_VALUE_PREFIX = /^(mivo_|sk-)/
+
+/** 规范化字符串:URL-decode + lower-case(best-effort,decode 失败则仅 lower-case)。N6 credential 扫描用。 */
+const normalizeForScan = (s: string): string => {
+  try {
+    return decodeURIComponent(s).toLowerCase()
+  } catch {
+    return s.toLowerCase()
+  }
+}
+
+/** 凭据格式值命中(规范后 mivo_/sk- 前缀)。N6:大小写/URL 编码变体均命中。 */
+const isCredentialValue = (v: unknown): boolean =>
+  typeof v === 'string' && CREDENTIAL_VALUE_PREFIX.test(normalizeForScan(v))
 
 /**
- * 递归扫描 value,返回首个敏感字段路径(无则 null)。
- * 覆盖:object key(含 camelCase/连字符/前缀变体)+ 嵌套对象/数组 + 字符串值格式。
+ * 递归扫描 value,返回首个敏感路径(无则 null)。
+ * 返修 N6:覆盖 object key(含 camelCase/连字符/前缀变体)+ 嵌套对象/数组 + 字符串值格式
+ * (规范后大小写/URL 编码变体均命中)。
  */
 export const scanForSensitiveFields = (value: unknown, prefix = ''): string | null => {
   if (value === null || typeof value !== 'object') {
-    // 字符串值:形如 mivo_/sk- 前缀 → 拒(凭据格式值)
-    if (typeof value === 'string' && SENSITIVE_VALUE_PATTERN.test(value)) {
+    // 字符串值:规范后形如 mivo_/sk- 前缀 → 拒(凭据格式值,大小写/URL 编码变体均命中)
+    if (isCredentialValue(value)) {
       return prefix || '<value>'
     }
     return null
@@ -296,8 +358,12 @@ export const isUserStateKeyForbidden = (key: string): boolean =>
   USER_STATE_FORBIDDEN_KEY_NAMES.has(key.toLowerCase()) ||
   USER_STATE_FORBIDDEN_KEY_PATTERN.test(key)
 
-// ── 返修 #8:asset seam(引用 T1.5 PR #195 已实现的真实 wire shape,不重复实现)──
-/** POST /api/assets → 200(shape 引自 server/routes/assets.ts,#195)。 */
+// ── 返修 #8/N9:asset seam(引用 T1.5 PR #195 已实现的真实 wire shape,不重复实现)──
+/**
+ * POST /api/assets → 200(shape 引自 server/routes/assets.ts,#195)。
+ * refcount = references.length(内容寻址:同 content hash → 同 assetId,bytes 复用,引用计数 = 该 asset
+ * 被多少 record 引用)。
+ */
 export type CreateAssetResponse = {
   assetId: string
   mimeType: string
@@ -306,18 +372,23 @@ export type CreateAssetResponse = {
   refcount: number
   deduped: boolean
 }
-/** GET /api/assets/:id → content bytes(内容寻址,immutable,长缓存)。 */
-export type AssetRef = {
-  assetId: string
-  mimeType?: string
-  originalName?: string
-  sizeBytes?: number
+/**
+ * 返修 N9:resolve seam 返回 bytes+mime(内容寻址 GET /api/assets/:id → 200 content bytes,
+ * immutable, Cache-Control: private,owner-scoped;跨 owner GET → 404),**不返 AssetRef 元数据**。
+ * env gate(MIVO_ENABLE_ASSET_SERVICE=1,默认关 → 404);owner 404;private cache;refcount=references.length。
+ */
+export type ResolvedAsset = {
+  bytes: Uint8Array
+  mimeType: string
 }
 
-// ── 返修 #13:NodeRecord payload 白名单(envelope 镜像字段 + status/tasks 拒收)──
+// ── 返修 #13/N10:NodeRecord payload 白名单(envelope 镜像字段 + status/tasks 拒收 + 逐 type schema)──
 /**
  * envelope 镜像字段(payload 不该携带,防双真相/绕过)。出现 → 400 payload-rejected(mirror-field)。
- * id/type 不在此列(NodeRecord 身份字段,payload.id 用于与 path 一致性校验,返修 #5)。
+ * **N1 修订**:`createdAt` **不在此列**——Edge/Anchor 的 createdAt 是 canonical 域字段(保留,走 allowed-keys
+ * 放行;Node 无此域字段,Node payload 带 createdAt 由 unknown-field 拒)。
+ * `revision` 在此列(envelope 唯一真相,wire payload 不携带;出现 → mirror-field)。
+ * id/type 不在此列(NodeRecord 身份字段;payload.id 用于与 path 一致性校验 #5/N10)。
  */
 export const PAYLOAD_MIRROR_FIELDS = new Set([
   'ownerId',
@@ -325,7 +396,6 @@ export const PAYLOAD_MIRROR_FIELDS = new Set([
   'scope',
   'revision',
   'isDeleted',
-  'createdAt',
   'updatedAt',
   'orderKey',
 ])
@@ -338,10 +408,181 @@ export const IF_MATCH_HEADER = 'if-match'
 export const IDEMPOTENCY_KEY_HEADER = 'idempotency-key'
 export const MIVO_API_KEY_HEADER = 'x-mivo-api-key'
 
-/** 返修 #4:统一 base revision 解析 helper(If-Match 严格优先,缺失返 undefined 由 route 决 428)。 */
-export const resolveBaseRevision = (ifMatch: string | undefined): Revision | undefined => {
-  if (ifMatch === undefined || ifMatch === '') return undefined
-  // 严格整数 parse(非整数 → 视为缺失/无效,route 决 400/428;此处 NaN→undefined)
+// ── 返修 N5:If-Match 严格十进制非负 safe integer parse ───────────────────────────
+/**
+ * 返修 N5:If-Match = 十进制非负 safe integer(正则 ^(0|[1-9][0-9]*)$ + Number.isSafeInteger)。
+ * 1.5 / 1e2 / 0x10 / NaN / 负数 / 超界(Number.MAX_SAFE_INTEGER 之上)/ 前导空格等全拒。
+ * 区分 missing(无 header → route 决 428)vs invalid(有 header 但格式错 → route 决 400 bad-request)。
+ */
+const IF_MATCH_DECIMAL_RE = /^(0|[1-9][0-9]*)$/
+
+export type IfMatchParse =
+  | { kind: 'missing' }
+  | { kind: 'invalid' }
+  | { kind: 'value'; revision: Revision }
+
+export const parseIfMatch = (ifMatch: string | undefined): IfMatchParse => {
+  if (ifMatch === undefined || ifMatch === '') return { kind: 'missing' }
+  if (!IF_MATCH_DECIMAL_RE.test(ifMatch)) return { kind: 'invalid' }
   const n = Number(ifMatch)
-  return Number.isFinite(n) && n >= 0 ? n : undefined
+  if (!Number.isSafeInteger(n) || n < 0) return { kind: 'invalid' }
+  return { kind: 'value', revision: n }
+}
+
+/**
+ * 返修 #4/N5:base revision 解析(向后兼容别名)。missing/invalid 均 → undefined(由 route 用
+ * `parseIfMatch` 区分 428 vs 400;此 helper 仅给旧调用方,不区分)。严格十进制 + safe integer。
+ */
+export const resolveBaseRevision = (ifMatch: string | undefined): Revision | undefined => {
+  const parsed = parseIfMatch(ifMatch)
+  return parsed.kind === 'value' ? parsed.revision : undefined
+}
+
+// ── 返修 N1/N10:逐 type payload schema(allowed keys + required + 类型校验)+ encoder/decoder ──
+
+/** NodePayload 合法 key 集(keyof Omit<NodeRecord,'id'|'revision'>;编译期 exhaustiveness 检查保无漂移)。 */
+export const NODE_PAYLOAD_KEYS = [
+  'type', 'title', 'transform', 'fills', 'strokes', 'effects', 'layout', 'constraints', 'asset',
+  'relations', 'text', 'fontSize', 'textColor', 'fontWeight', 'textAlign', 'textAutoWidth',
+  'markupKind', 'markupBrushKind', 'markupStampKind', 'markupPoints', 'markupStartArrow',
+  'markupEndArrow', 'markupCornerRadius', 'sectionTitleVisible', 'sectionLockMode', 'sectionTemplateId',
+  'markdownDisplayMode', 'imageHasTransparency', 'assetSourceDimensions', 'imageCrop', 'sourceNodeId',
+  'groupId', 'locked', 'hidden', 'favorited', 'generation', 'aiWorkflow', 'experimentalAnchors',
+  'annotationBounds',
+] as const satisfies ReadonlyArray<keyof NodePayload>
+
+/** EdgePayload 合法 key 集。createdAt 是 canonical 域字段(保留)。 */
+export const EDGE_PAYLOAD_KEYS = ['from', 'to', 'type', 'prompt', 'createdAt'] as const satisfies ReadonlyArray<keyof EdgePayload>
+
+/** AnchorPayload 合法 key 集。createdAt 是 canonical 域字段(保留)。 */
+export const ANCHOR_PAYLOAD_KEYS = [
+  'type', 'targetNodeId', 'x', 'y', 'instruction', 'createdAt', 'width', 'height', 'resultNodeIds',
+] as const satisfies ReadonlyArray<keyof AnchorPayload>
+
+const isStr = (v: unknown): v is string => typeof v === 'string'
+const isNum = (v: unknown): v is number => typeof v === 'number'
+const isObj = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v)
+const isArr = (v: unknown): v is unknown[] => Array.isArray(v)
+
+const NODE_TYPE_VALUES = new Set([
+  'image', 'task-placeholder', 'text', 'frame', 'ai-slot', 'annotation', 'markup', 'markdown', 'pdf', 'video',
+])
+const EDGE_TYPE_VALUES = new Set(['generate', 'edit'])
+const ANCHOR_TYPE_VALUES = new Set(['point', 'box'])
+
+/** 必填字段 + 类型校验谓词(逐 type)。 */
+type PayloadSpec = { allowed: ReadonlySet<string>; required: ReadonlyArray<[string, (v: unknown) => boolean]> }
+
+const PAYLOAD_SPECS: Record<'node' | 'edge' | 'anchor', PayloadSpec> = {
+  node: {
+    allowed: new Set<string>(NODE_PAYLOAD_KEYS),
+    required: [
+      ['type', (v) => isStr(v) && NODE_TYPE_VALUES.has(v)],
+      ['title', isStr],
+      ['transform', isObj],
+      ['fills', isArr],
+      ['strokes', isArr],
+      ['effects', isArr],
+      ['relations', isObj],
+    ],
+  },
+  edge: {
+    allowed: new Set<string>(EDGE_PAYLOAD_KEYS),
+    required: [
+      ['from', isStr],
+      ['to', isStr],
+      ['type', (v) => isStr(v) && EDGE_TYPE_VALUES.has(v)],
+      ['prompt', isStr],
+      ['createdAt', isNum],
+    ],
+  },
+  anchor: {
+    allowed: new Set<string>(ANCHOR_PAYLOAD_KEYS),
+    required: [
+      ['type', (v) => isStr(v) && ANCHOR_TYPE_VALUES.has(v)],
+      ['targetNodeId', isStr],
+      ['x', isNum],
+      ['y', isNum],
+      ['instruction', isStr],
+      ['createdAt', isNum],
+    ],
+  },
+}
+
+export type PayloadCheck =
+  | { ok: true; payload: Record<string, unknown> }
+  | { ok: false; body: PayloadRejectedBody }
+
+/**
+ * 返修 N1/N10:真实 decoder——逐 type payload 白名单 runtime 校验。
+ * - 必须是 object(非 null/array)。
+ * - `id`(若有)必须 string 且 === path(N10:非 string id → bad-id-type;不一致 → id-mismatch #5)。
+ * - `revision`(若有)→ mirror-field(envelope 唯一真相,防双真相)。
+ * - envelope 镜像字段(ownerId/canvasId/scope/revision/isDeleted/updatedAt/orderKey)→ mirror-field。
+ *   注:`createdAt` 不在 mirror 拒收收集——Edge/Anchor 的 createdAt 是 canonical 域字段(allowed-keys
+ *   放行);Node 无此域字段,Node payload 带 createdAt 由 unknown-field 拒(allowed 不含之)。
+ * - status/tasks → forbidden-field(DP-8/9)。
+ * - 非 allowed key → unknown-field(N10:拒 unknown)。
+ * - 缺必填 → missing-field;类型不符 → bad-type(N10:必填/类型校验)。
+ */
+export const validateChildPayload = (
+  type: 'node' | 'edge' | 'anchor',
+  payload: unknown,
+  pathId: string,
+): PayloadCheck => {
+  if (!isObj(payload)) {
+    return { ok: false, body: { error: 'payload-rejected', reason: 'not-object' } }
+  }
+  const obj = payload
+  // id 特殊(允许但须匹配 path;N10 非 string id → bad-id-type)
+  if ('id' in obj) {
+    if (!isStr(obj.id)) {
+      return { ok: false, body: { error: 'payload-rejected', reason: 'bad-id-type', field: 'id' } }
+    }
+    if (obj.id !== pathId) {
+      return { ok: false, body: { error: 'payload-rejected', reason: 'id-mismatch', field: 'id' } }
+    }
+  }
+  // envelope 镜像字段(含 revision)→ mirror-field
+  for (const f of PAYLOAD_MIRROR_FIELDS) {
+    if (f in obj) return { ok: false, body: { error: 'payload-rejected', reason: 'mirror-field', field: f } }
+  }
+  // DP-8/9 显式拒收
+  for (const f of PAYLOAD_FORBIDDEN_FIELDS) {
+    if (f in obj) return { ok: false, body: { error: 'payload-rejected', reason: 'forbidden-field', field: f } }
+  }
+  const spec = PAYLOAD_SPECS[type]
+  // 拒 unknown(N10)
+  for (const key of Object.keys(obj)) {
+    if (key === 'id') continue // id 特殊(已校验)
+    if (!spec.allowed.has(key)) {
+      return { ok: false, body: { error: 'payload-rejected', reason: 'unknown-field', field: key } }
+    }
+  }
+  // 必填 + 类型校验(N10)
+  for (const [field, check] of spec.required) {
+    if (!(field in obj)) {
+      return { ok: false, body: { error: 'payload-rejected', reason: 'missing-field', field } }
+    }
+    if (!check(obj[field])) {
+      return { ok: false, body: { error: 'payload-rejected', reason: 'bad-type', field } }
+    }
+  }
+  return { ok: true, payload: obj }
+}
+
+/**
+ * 返修 N1:真实 encoder(client)——canonical Record → wire payload(剥离 id + revision)。
+ * 与 decoder(validateChildPayload)对称:wire payload 不携带 id/revision(id 取路径,revision 取 envelope)。
+ * client 据此构造 PATCH body `{payload: encodeChildPayload(node)}`。
+ */
+export const encodeChildPayload = <T extends { id?: unknown; revision?: unknown }>(
+  record: T,
+): Omit<T, 'id' | 'revision'> => {
+  // 浅拷贝 + delete id/revision(避免 destructure rest-sibling lint;wire payload 不携带 id/revision)。
+  const rest = { ...record } as Record<string, unknown>
+  delete rest.id
+  delete rest.revision
+  return rest as Omit<T, 'id' | 'revision'>
 }

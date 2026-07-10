@@ -1,26 +1,23 @@
 // server/lib/persistHttp.ts
-// T1.3 persist 路由共用 HTTP helper(返修 #4/#10/#11/#12/#13)。
+// T1.3 persist 路由共用 HTTP helper(返修 #4/#5/#10/#11/#12/#13 + N1/N4/N5/N10)。
 // 权威:docs/decisions/api-surface.md(返修版)§2/§3/§5。
 //
-// - #4:If-Match 严格优先,existing 缺 base → 428 Precondition Required。
-// - #10:请求 fingerprint(sha256 body),幂等 key 复合 owner+method+resourceKind+key+fingerprint。
+// - #4/N5:If-Match 严格优先,existing 缺 base → 428;malformed(非十进制非负 safe integer)→ 400 bad-request。
+// - #10/N4:请求 fingerprint(sha256 body),幂等 key 复合 owner+method+resourceKind+key+fingerprint;同 key 不同 body → 422 reuse-conflict。
 // - #11:最小 runtime codec(不接生产开关,always-on 校验 wire shape satisfies shared 类型)。
 // - #12:统一 413 TooLargeBody 契约体。
-// - #13:NodeRecord payload 白名单 runtime 校验(拒 envelope 镜像字段 + status/tasks)。
+// - #13/N1/N10:NodeRecord/EdgeRecord/AnchorRecord payload 逐 type 白名单 runtime 校验(shared validateChildPayload)。
 
 import type { Context } from 'hono'
 import { readJsonBody } from './request'
 import { RequestBodyTooLargeError } from './upstream'
 import { fingerprintOfBody } from '../persist/backend'
 import {
-  PAYLOAD_FORBIDDEN_FIELDS,
-  PAYLOAD_MIRROR_FIELDS,
   resolveBaseRevision,
   type CreateCanvasRequest,
   type CreateProjectRequest,
-  type PayloadRejectedBody,
-  type PreconditionRequiredBody,
   type PutUserStateRequest,
+  type ReuseConflictBody,
   type Revision,
   type TooLargeBody,
   type UpsertRequest,
@@ -32,14 +29,17 @@ export const BODY_LIMIT = 1_048_576
 export const tooLargeBody = (): TooLargeBody => ({ error: 'request-body-too-large', limit: BODY_LIMIT })
 
 /** 返修 #4:428 契约体(existing 写端点缺 If-Match base)。 */
-export const preconditionRequired = (id: string): PreconditionRequiredBody => ({
+export const preconditionRequired = (id: string): { error: 'precondition-required'; id: string } => ({
   error: 'precondition-required',
   id,
 })
 
+/** 返修 N4:422 契约体(同 idem key 不同 fingerprint=不同 body)。 */
+export const reuseConflict = (key: string): ReuseConflictBody => ({ error: 'idempotency-key-reuse', key })
+
 /**
- * 返修 #4:base revision 解析。If-Match 严格优先;wire body 不携带 revision(返修 #5 已删)。
- * 返回 undefined = 缺 base(backend 对 existing 返 precondition-required,route → 428)。
+ * 返修 #4/N5:base revision 解析(向后兼容别名;missing/invalid 均 → undefined)。
+ * route 需区分 428(missing)vs 400(invalid)时用 `parseIfMatch`(下方 re-export)。
  */
 export const baseFromIfMatch = (ifMatch: string | undefined): Revision | undefined =>
   resolveBaseRevision(ifMatch)
@@ -109,36 +109,16 @@ export const bodyError = (error: unknown): { status: 400 | 413; body: unknown } 
   return { status: 400, body: { error: 'bad-request', message: error instanceof Error ? error.message : 'invalid body' } }
 }
 
-// ── 返修 #13:NodeRecord payload 白名单 runtime 校验(envelope 镜像字段 + status/tasks 拒收)──
-
-export type PayloadCheck = { ok: true; payload: Record<string, unknown> } | { ok: false; body: PayloadRejectedBody }
-
-/**
- * 校验 child payload(node/edge/anchor/chat-message):
- * - 必须是 object(返修 #11/#13)。
- * - payload.id(若有)必须 === path :id(返修 #5 一致性)。
- * - 拒 envelope 镜像字段:ownerId/canvasId/scope/revision/isDeleted/createdAt/updatedAt/orderKey(返修 #13)。
- * - 拒 status/tasks(返修 #13 DP-8/9:record 不存运行态/编排态)。
- */
-export const validateChildPayload = (payload: unknown, pathId: string): PayloadCheck => {
-  if (payload == null || typeof payload !== 'object' || Array.isArray(payload)) {
-    return { ok: false, body: { error: 'payload-rejected', reason: 'not-object' } }
-  }
-  const obj = payload as Record<string, unknown>
-  if ('id' in obj && typeof obj.id === 'string' && obj.id !== pathId) {
-    return { ok: false, body: { error: 'payload-rejected', reason: 'id-mismatch', field: 'id' } }
-  }
-  for (const f of PAYLOAD_MIRROR_FIELDS) {
-    if (f in obj) return { ok: false, body: { error: 'payload-rejected', reason: 'mirror-field', field: f } }
-  }
-  for (const f of PAYLOAD_FORBIDDEN_FIELDS) {
-    if (f in obj) return { ok: false, body: { error: 'payload-rejected', reason: 'forbidden-field', field: f } }
-  }
-  return { ok: true, payload: obj }
-}
+// ── 返修 #13/N1/N10:NodeRecord/EdgeRecord/AnchorRecord payload 逐 type 白名单(shared 实现)──
+// validateChildPayload(type, payload, pathId):per-type schema(必填/类型/拒 unknown/非 string id 400/mirror/forbidden)。
+export { validateChildPayload, encodeChildPayload, parseIfMatch } from '../../shared/persist-contract.ts'
+export type { PayloadCheck } from '../../shared/persist-contract.ts'
 
 /**
- * 返修 #9:user-state value 递归敏感扫描。
- * @returns 首个敏感字段路径(无则 null)。route 命中 → 400 forbidden-value。
+ * 返修 #9/N6:user-state value 递归敏感扫描 + namespace frozen key 校验。
  */
-export { scanForSensitiveFields, isUserStateKeyNamespaceAllowed, userStateNamespaceKind } from '../../shared/persist-contract.ts'
+export {
+  scanForSensitiveFields,
+  isUserStateKeyNamespaceAllowed,
+  userStateNamespaceKind,
+} from '../../shared/persist-contract.ts'

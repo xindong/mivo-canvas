@@ -43,7 +43,8 @@ describe('InMemoryPersistBackend — 返修 #5 contentVersion bump', () => {
   it('子资源 upsert/hardDelete bump canvas meta contentVersion(不动 metaRevision)', async () => {
     await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
     const cv = await b.ensureCreate('o', 'canvas', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
-    expect(cv.record.revision).toBe(0)
+    expect(cv.kind).toBe('created')
+    if (cv.kind === 'created') expect(cv.record.revision).toBe(0)
     await b.upsertChild('o', 'c1', 'node', 'n1', { id: 'n1', type: 'image' }, { method: 'PATCH', resourceKind: 'node' })
     const after1 = await rec(b, 'canvas', 'c1')
     expect((after1.payload as { contentVersion: number }).contentVersion).toBe(1)

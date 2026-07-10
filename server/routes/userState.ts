@@ -1,26 +1,27 @@
 // server/routes/userState.ts
 // T1.3 前置:/api/user-state — per-user KV(user 域:selection/相机/偏好/草稿,DP-1)。
-// 权威:docs/decisions/api-surface.md §4.3(返修版)。
-// 契约:additive;验收由 routes/userState.route.test.ts(内存 backend)覆盖。
+// 权威:docs/decisions/api-surface.md §4.3(返修版二)。
 //
-// 返修要点:
-//  - #1 owner seam:resolveActor + per-owner(=owner===actor);未授权 404。
-//  - #4 If-Match 严格优先,existing 缺 base → 428;#5 wire 不带 revision。
-//  - #9 DP-7 namespace allowlist(canvas:/recent:/pref:/panel:)+ 每 namespace runtime kind schema
-//    + 递归扫 value 拒敏感字段名/凭据格式值(大小写/连字符/camelCase/前缀/嵌套全覆盖)。
-//  - #10 幂等 owner+method+resourceKind+key+fingerprint;#11 request codec;#12 统一 413。
+// 返修要点(N1-N10):
+//  - #1/N7 owner seam:resolveActor + canAccessUserState(action-aware,per-owner KV 永不 share;T1.3 trivial allow);未授权 404。
+//  - #4/N5 If-Match 严格(parseIfMatch;invalid → 400,missing → 428,value → base);#5 wire 不带 revision。
+//  - #9/N6 DP-7 namespace frozen key(逐项 exact regex,含 canvas suffix;拒未知 suffix)+ 每 namespace runtime kind schema
+//    + 递归扫 value 拒敏感字段名/凭据格式值(大小写/连字符/camelCase/前缀/嵌套/URL 编码变体全覆盖)。
+//  - #10/N4 幂等 owner+method+resourceKind+key+fingerprint;同 key 不同 body → 422 reuse-conflict;#11 request codec;#12 统一 413。
 
 import { Hono } from 'hono'
 import type { AppEnv } from '../lib/types'
 import { rejectInvalidMivoApiKey } from '../lib/keys'
 import { resolveActor } from '../lib/owner'
+import { canAccessUserState } from '../lib/authz'
 import { newRequestId, logRequest } from '../lib/request'
 import {
-  baseFromIfMatch,
   bodyError,
   decodePutUserState,
+  parseIfMatch,
   preconditionRequired,
   readJsonBodyWithFingerprint,
+  reuseConflict,
   scanForSensitiveFields,
   isUserStateKeyNamespaceAllowed,
   userStateNamespaceKind,
@@ -30,6 +31,7 @@ import type {
   ForbiddenKeyBody,
   ForbiddenValueBody,
   ListUserStateResponse,
+  ReuseConflictBody,
   UnknownResourceBody,
   UserStateEntry,
   UpsertResponse,
@@ -68,8 +70,15 @@ const valueMatchesKind = (value: unknown, kind: string): boolean => {
   }
 }
 
+/** N5:malformed If-Match → 400 bad-request body。 */
+const badIfMatch = (id: string) => ({ error: 'bad-request' as const, message: 'If-Match must be a non-negative decimal safe integer', id })
+
 export const createUserStateRoutes = ({ backend }: { backend: PersistBackend }): Hono<AppEnv> => {
   const route = new Hono<AppEnv>()
+
+  /** N7:user-state 授权 seam(per-owner KV,owner===actor;T1.3 trivial allow,T1.4 不扩永不 share)。 */
+  const authzUserState = (actor: string, action: 'read' | 'write'): boolean =>
+    canAccessUserState(actor, actor, action) === 'allow'
 
   // GET /api/user-state — owner 全部 KV(未软删)。
   route.get('/', async (c) => {
@@ -102,6 +111,10 @@ export const createUserStateRoutes = ({ backend }: { backend: PersistBackend }):
     }
     const key = c.req.param('key')
     const actor = resolveActor(c)
+    if (!authzUserState(actor, 'read')) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
+      return c.json({ error: 'unknown-key' } satisfies UnknownResourceBody, 404)
+    }
     const got = await backend.get(actor, 'user-state', key)
     if (got.kind === 'missing' || got.record.isDeleted) {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
@@ -111,7 +124,7 @@ export const createUserStateRoutes = ({ backend }: { backend: PersistBackend }):
     return c.json(toEntry(got.record, key), 200)
   })
 
-  // PUT /api/user-state/:key — LWW upsert(revision-checked);返修 #9 DP-7 namespace allowlist + 敏感扫描。
+  // PUT /api/user-state/:key — LWW upsert(revision-checked);返修 #9/N6 DP-7 frozen namespace + 敏感扫描;N5/N4。
   route.put('/:key', async (c) => {
     const requestId = newRequestId()
     c.header('X-Request-Id', requestId)
@@ -122,7 +135,7 @@ export const createUserStateRoutes = ({ backend }: { backend: PersistBackend }):
       return bad
     }
     const key = c.req.param('key')
-    // 返修 #9:namespace allowlist(非 allowlist 前缀 → 400 forbidden-key;gateway-key/mivo-key 天然不在 allowlist)。
+    // 返修 #9/N6:frozen namespace(逐项 exact regex;非 allowlist/未知 suffix → 400 forbidden-key;gateway-key/mivo-key 天然不在 frozen 集)。
     if (!isUserStateKeyNamespaceAllowed(key)) {
       const err: ForbiddenKeyBody = { error: 'forbidden-key', key }
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'forbidden-key' })
@@ -141,13 +154,13 @@ export const createUserStateRoutes = ({ backend }: { backend: PersistBackend }):
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: decoded.status, latencyMs: Date.now() - t0, note: 'bad-body' })
       return c.json(decoded.body, decoded.status as 400 | 413)
     }
-    // 返修 #9:每 namespace runtime kind schema(不符 → 400 bad-request)。
+    // 返修 #9/N6:每 namespace/suffix runtime kind schema(不符 → 400 bad-request)。
     const kind = userStateNamespaceKind(key)
     if (!valueMatchesKind(decoded.value.value, kind)) {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'bad-value-kind' })
       return c.json({ error: 'bad-request', message: `value must be ${kind} for namespace` }, 400)
     }
-    // 返修 #9:递归敏感扫描(字段名 + 凭据格式值;大小写/连字符/camelCase/嵌套全覆盖)。
+    // 返修 #9/N6:递归敏感扫描(字段名 + 规范化后凭据格式值;大小写/连字符/camelCase/嵌套/URL 编码变体全覆盖)。
     const sensitivePath = scanForSensitiveFields(decoded.value.value)
     if (sensitivePath !== null) {
       const err: ForbiddenValueBody = { error: 'forbidden-value', key, path: sensitivePath }
@@ -155,7 +168,17 @@ export const createUserStateRoutes = ({ backend }: { backend: PersistBackend }):
       return c.json(err, 400)
     }
     const actor = resolveActor(c)
-    const base = baseFromIfMatch(c.req.header('if-match'))
+    if (!authzUserState(actor, 'write')) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
+      return c.json({ error: 'unknown-key' } satisfies UnknownResourceBody, 404)
+    }
+    // N5:If-Match 严格(parseIfMatch;invalid → 400,missing → 428 via backend,value → base)。
+    const parsed = parseIfMatch(c.req.header('if-match'))
+    if (parsed.kind === 'invalid') {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'bad-if-match' })
+      return c.json(badIfMatch(key), 400)
+    }
+    const base = parsed.kind === 'value' ? parsed.revision : undefined
     const result = await backend.upsert(actor, 'user-state', key, { value: decoded.value.value } satisfies UserStatePayload, {
       base,
       scope: 'user',
@@ -164,6 +187,11 @@ export const createUserStateRoutes = ({ backend }: { backend: PersistBackend }):
       idempotencyKey: c.req.header('idempotency-key') || undefined,
       bodyFingerprint: decoded.fingerprint,
     })
+    if (result.kind === 'reuse-conflict') {
+      const err: ReuseConflictBody = reuseConflict(c.req.header('idempotency-key') ?? '')
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 422, latencyMs: Date.now() - t0, note: 'reuse-conflict' })
+      return c.json(err, 422)
+    }
     if (result.kind === 'precondition-required') {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 428, latencyMs: Date.now() - t0, note: 'precondition-required' })
       return c.json(preconditionRequired(key), 428)
@@ -190,6 +218,10 @@ export const createUserStateRoutes = ({ backend }: { backend: PersistBackend }):
     }
     const key = c.req.param('key')
     const actor = resolveActor(c)
+    if (!authzUserState(actor, 'write')) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
+      return c.json({ error: 'unknown-key' } satisfies UnknownResourceBody, 404)
+    }
     const { deleted } = await backend.softDelete(actor, 'user-state', key)
     if (!deleted) {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })

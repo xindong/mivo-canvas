@@ -22,10 +22,10 @@ import type {
   ListCanvasResponse,
   ListProjectsResponse,
   Project,
+  ResolvedAsset,
   Revision,
   UpsertResponse,
   UserStateEntry,
-  AssetRef,
 } from '../../shared/persist-contract.ts'
 import type { AnchorRecord, EdgeRecord, NodeRecord } from '../kernel/records'
 
@@ -62,11 +62,18 @@ export interface ServerPersistAdapter {
   getUserState(key: string): Promise<UserStateEntry | null>
   deleteUserState(key: string): Promise<void>
 
-  // ── asset scope → /api/assets(T1.5 #195,返修 #8 seam 引用真实 shape,不重复实现)──
-  /** POST /api/assets → CreateAssetResponse(#195 已实现真实 shape)。 */
+  // ── asset scope → /api/assets(T1.5 #195,返修 #8/N9 seam 引用真实 shape,不重复实现)──
+  /**
+   * POST /api/assets → CreateAssetResponse(#195 已实现真实 shape;内容寻址:同 content hash → 同 assetId,
+   * refcount=references.length,bytes 复用)。
+   */
   uploadAsset(bytes: Uint8Array, meta: { mimeType: string; originalName: string }): Promise<CreateAssetResponse>
-  /** GET /api/assets/:id → AssetRef + 内容寻址 url(#195)。null=404。 */
-  resolveAsset(assetId: string): Promise<AssetRef | null>
+  /**
+   * 返修 N9:GET /api/assets/:id → 内容寻址 bytes + mime(**不返 AssetRef 元数据**)。
+   * #195 head(0b945f4)真相:env gate(MIVO_ENABLE_ASSET_SERVICE=1,默认关 → 404)、owner 404(跨 owner GET → 404
+   * 无泄漏)、Cache-Control: private、refcount=references.length。null=404(env off / 不存在 / 跨 owner)。
+   */
+  resolveAsset(assetId: string): Promise<ResolvedAsset | null>
 }
 
 /**

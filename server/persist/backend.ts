@@ -44,27 +44,41 @@ export type GetChildResult =
   | { kind: 'missing' }
   | { kind: 'cross-canvas' } // record 存在但 canvas_id 不匹配(返修 #3,route → 404)
 
-/** ensureCreate 结果(POST 幂等创建)。返修 #1:跨 owner 同 id → project-exists(全局唯一)。 */
+/** ensureCreate 结果(POST 幂等创建)。返修 #1:跨 owner 同 id → project-exists(全局唯一)。N4:同 key 不同 body → reuse-conflict。 */
 export type EnsureCreateResult =
   | { kind: 'created'; record: PersistRecord }
   | { kind: 'existing'; record: PersistRecord } // 幂等回放(未删)→ 返既有,不 bump
-  | { kind: 'restored'; record: PersistRecord } // 软删后重建(undelete + bump)
+  | { kind: 'restored'; record: PersistRecord } // 软删后重建(undelete + bump + restore tree,N2)
   | { kind: 'exists-other-owner'; record: PersistRecord } // 全局唯一 id 撞(跨 owner),route → 409 project-exists
+  | { kind: 'reuse-conflict' } // N4:同 idem key 不同 fingerprint(不同 body)→ route 422
 
-/** meta upsert 结果(PUT canvas/project/user-state:revision-check-then-bump;返修 #4 428)。 */
+/**
+ * 子资源 ensureCreate 结果(chat-message POST)。N3:canvas_id 校验(cross-canvas);
+ * N4:同 key 不同 body → reuse-conflict;N2:软删命中真恢复。
+ */
+export type EnsureChildResult =
+  | { kind: 'created'; record: PersistRecord }
+  | { kind: 'existing'; record: PersistRecord }
+  | { kind: 'restored'; record: PersistRecord }
+  | { kind: 'cross-canvas' } // N3:同 id 存在但属于另一 canvas → route 404(canvas_id 不可变)
+  | { kind: 'reuse-conflict' } // N4:同 idem key 不同 fingerprint → route 422
+
+/** meta upsert 结果(PUT canvas/project/user-state:revision-check-then-bump;返修 #4 428)。N4:reuse-conflict。 */
 export type UpsertResult =
   | { kind: 'created'; record: PersistRecord }
   | { kind: 'updated'; record: PersistRecord }
   | { kind: 'conflict'; currentRevision: Revision; record: PersistRecord }
   | { kind: 'precondition-required'; record: PersistRecord } // 返修 #4:existing 缺 base → 428
+  | { kind: 'reuse-conflict' } // N4:同 idem key 不同 fingerprint → route 422
 
-/** 子资源 upsert 结果(PATCH node/edge/anchor/chat-message:返修 #3 cross-canvas + #4 428 + #5 max(0,base))。 */
+/** 子资源 upsert 结果(PATCH node/edge/anchor/chat-message:返修 #3 cross-canvas + #4 428 + #5 max(0,base)+N4 reuse-conflict)。 */
 export type UpsertChildResult =
   | { kind: 'created'; record: PersistRecord }
   | { kind: 'updated'; record: PersistRecord }
   | { kind: 'conflict'; currentRevision: Revision; record: PersistRecord }
   | { kind: 'precondition-required'; record: PersistRecord }
   | { kind: 'cross-canvas' } // 返修 #3:同 id 存在但属于另一 canvas → route 404(不 create,canvas_id 不可变)
+  | { kind: 'reuse-conflict' } // N4:同 idem key 不同 fingerprint → route 422
 
 /** 幂等回放结果(返修 #10:fingerprint 校验)。 */
 export type IdempotentReplay =
@@ -73,14 +87,26 @@ export type IdempotentReplay =
 
 export type ListResult = { records: PersistRecord[] }
 
-/** 返修 #6:重排请求结果。 */
-export type ReorderResult = { reordered: number }
+/**
+ * 返修 N8:重排结果。
+ * - `ok`:orderedIds 与 live set 全等且唯一,重分配 orderKey,bump contentVersion+updatedAt。
+ * - `conflict`:If-Match(contentVersion base)stale → 409(两并发一成一 409)。
+ * - `precondition-required`:reserved(reorder If-Match 可选,目前不触发 428)。
+ * - `bad`:orderedIds 与 live set 不全等(mismatch)或含重复(duplicate)→ 400。
+ */
+export type ReorderResult =
+  | { kind: 'ok'; reordered: number; contentVersion: Revision }
+  | { kind: 'conflict'; currentContentVersion: Revision }
+  | { kind: 'precondition-required' }
+  | { kind: 'bad'; reason: 'mismatch' | 'duplicate' }
 
 export interface PersistBackend {
   // ── meta record CRUD(project/canvas/user-state/chat-collection)──
   get(ownerId: string, type: PersistType, id: string): Promise<GetResult>
   /** 返修 #1:project id 全局唯一——跨 owner 查 project 归属(授权 seam 用);软删保留占位,purge 才释放。 */
   getProjectOwner(id: string): { ownerId: string } | undefined
+  /** 返修 N7:canvas id 全局归属(授权 seam canAccessCanvas 用;跨 owner → 404)。 */
+  getCanvasOwner(id: string): { ownerId: string } | undefined
   ensureCreate(
     ownerId: string,
     type: PersistType,
@@ -95,6 +121,23 @@ export interface PersistBackend {
       bodyFingerprint?: string
     },
   ): Promise<EnsureCreateResult>
+  /**
+   * 返修 N3:子资源(chat-message)幂等创建——canvas_id 校验(existing/idem-replay/cross-canvas 全验)。
+   * N4:同 idem key 不同 fingerprint → reuse-conflict;N2:软删命中真恢复。
+   */
+  ensureCreateChild(
+    ownerId: string,
+    canvasId: string,
+    type: PersistType,
+    id: string,
+    payload: unknown,
+    opts: {
+      idempotencyKey?: string
+      method: string
+      resourceKind: string
+      bodyFingerprint?: string
+    },
+  ): Promise<EnsureChildResult>
   /** PUT meta:existing→rev-check(返修 #4:缺 base → precondition-required);missing→create(max(0,base))。 */
   upsert(
     ownerId: string,
@@ -133,21 +176,44 @@ export interface PersistBackend {
   ): Promise<UpsertChildResult>
   /** 硬删子资源(物理移除,返修 #2:node/edge/anchor/chat-message 不软删)。canvas_id 校验。 */
   hardDeleteChild(ownerId: string, canvasId: string, type: PersistType, id: string): Promise<{ deleted: boolean }>
-  /** 返修 #6:重排 canvas 下某 type 的子资源顺序(orderedIds 全量,重分配 orderKey)。 */
-  reorderChildren(ownerId: string, canvasId: string, type: PersistType, orderedIds: string[]): Promise<ReorderResult>
+  /**
+   * 返修 N8:重排 canvas 下某 type 子资源顺序。
+   * orderedIds 须与 live set 全等且唯一;If-Match(contentVersion base)stale → conflict;
+   * 成功重分配 orderKey + bump contentVersion+updatedAt。
+   */
+  reorderChildren(
+    ownerId: string,
+    canvasId: string,
+    type: PersistType,
+    orderedIds: string[],
+    opts?: { base?: Revision },
+  ): Promise<ReorderResult>
 
   // ── 列表(返修 #6 ORDER BY orderKey;#8 枚举)──
   listByOwner(ownerId: string, type: PersistType, opts?: { includeDeleted?: boolean }): Promise<ListResult>
   listByCanvas(ownerId: string, canvasId: string, type: PersistType, opts?: { includeDeleted?: boolean }): Promise<ListResult>
   listCanvasByProject(ownerId: string, projectId: string, opts?: { includeDeleted?: boolean }): Promise<ListResult>
 
-  // ── 返修 #7:原子 tree 软删/恢复(单函数原子,故障全回滚)──
+  // ── 返修 #7/N2:原子 tree 软删/恢复(单函数原子,故障全回滚)──
   /** 软删 canvas 子树:标 canvas meta + chat-collection record(原子;children 保持活记录)。 */
   softDeleteCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number }>
   /** 软删 project 子树:标 project + 其所有 canvas meta + 所有 chat-collection(原子)。 */
   softDeleteProjectTree(ownerId: string, projectId: string): Promise<{ count: number }>
-  restoreCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number }>
-  restoreProjectTree(ownerId: string, projectId: string): Promise<{ count: number }>
+  /**
+   * 恢复 canvas 子树:canvas meta + chat-collection(原子,N2)。
+   * opts.payload(若有)更新 canvas meta 域字段(restore-via-POST 带 new payload);opts.idempotencyKey/fingerprint 落 meta record。
+   */
+  restoreCanvasTree(
+    ownerId: string,
+    canvasId: string,
+    opts?: { payload?: unknown; idempotencyKey?: string; fingerprint?: string },
+  ): Promise<{ count: number }>
+  /** 恢复 project 子树:project + 其 canvas meta + chat-collection(原子,N2)。opts 同上(project meta payload)。 */
+  restoreProjectTree(
+    ownerId: string,
+    projectId: string,
+    opts?: { payload?: unknown; idempotencyKey?: string; fingerprint?: string },
+  ): Promise<{ count: number }>
 
   /** Test-only:清空 owner 全部 records + idempotency index。 */
   __reset(): void
@@ -186,6 +252,8 @@ export class InMemoryPersistBackend implements PersistBackend {
   private readonly idempotencyIndex = new Map<string, { envelopeKey: string; fingerprint: string }>()
   /** 返修 #1:project id 全局唯一索引(id → ownerId)。授权 seam 跨 owner 查 project 归属;跨 owner 同 id → 409 project-exists。 */
   private readonly globalProjectOwners = new Map<string, string>()
+  /** 返修 N7:canvas id 全局归属索引(id → ownerId)。授权 seam canAccessCanvas 跨 owner 查归属;跨 owner → 404。 */
+  private readonly globalCanvasOwners = new Map<string, string>()
 
   private bucket(ownerId: string): Map<string, PersistRecord> {
     let b = this.byOwner.get(ownerId)
@@ -220,14 +288,23 @@ export class InMemoryPersistBackend implements PersistBackend {
     return max + 1
   }
 
-  /** 返修 #5:bump canvas meta contentVersion(子资源写入后调用;不动 metaRevision)。 */
-  private bumpCanvasContentVersion(ownerId: string, canvasId: string): void {
+  /** 返修 #5:bump canvas meta contentVersion(子资源写入后调用;不动 metaRevision)。返新 contentVersion。 */
+  private bumpCanvasContentVersion(ownerId: string, canvasId: string): number {
     const meta = this.find(ownerId, 'canvas', canvasId)
-    if (!meta) return
+    if (!meta) return 0
     const p = asCanvasMeta(meta.payload) ?? {}
-    p.contentVersion = (p.contentVersion ?? 0) + 1
+    const next = (p.contentVersion ?? 0) + 1
+    p.contentVersion = next
     const updated: PersistRecord = { ...meta, payload: p, updatedAt: nowIso() }
     this.bucket(ownerId).set(recordKey(ownerId, 'canvas', canvasId), updated)
+    return next
+  }
+
+  /** 读 canvas meta contentVersion(contentVersion 缺省 0)。 */
+  private canvasContentVersion(ownerId: string, canvasId: string): Revision {
+    const meta = this.find(ownerId, 'canvas', canvasId)
+    if (!meta) return 0
+    return asCanvasMeta(meta.payload)?.contentVersion ?? 0
   }
 
   async get(ownerId: string, type: PersistType, id: string): Promise<GetResult> {
@@ -237,6 +314,11 @@ export class InMemoryPersistBackend implements PersistBackend {
 
   getProjectOwner(id: string): { ownerId: string } | undefined {
     const ownerId = this.globalProjectOwners.get(id)
+    return ownerId !== undefined ? { ownerId } : undefined
+  }
+
+  getCanvasOwner(id: string): { ownerId: string } | undefined {
+    const ownerId = this.globalCanvasOwners.get(id)
     return ownerId !== undefined ? { ownerId } : undefined
   }
 
@@ -254,16 +336,24 @@ export class InMemoryPersistBackend implements PersistBackend {
       bodyFingerprint?: string
     },
   ): Promise<EnsureCreateResult> {
-    // 返修 #10:幂等 header 复用(owner+method+resourceKind+key 复合)。
+    // 返修 #10/N4:幂等 header 复用(owner+method+resourceKind+key 复合 + fingerprint)。
     if (opts.idempotencyKey) {
       const entry = this.idempotencyIndex.get(idemIndexKey(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey))
       if (entry) {
         const r = this.bucket(ownerId).get(entry.envelopeKey)
         if (r) {
+          // N4:同 key 不同 fingerprint(不同 body)→ reuse-conflict(route 422)。
           if (opts.bodyFingerprint && entry.fingerprint !== opts.bodyFingerprint) {
-            // reuse-conflict 由 route 决 422;此处返既有让 route 判(简化:返 existing/restored)。
+            return { kind: 'reuse-conflict' }
           }
-          return { kind: r.isDeleted ? 'restored' : 'existing', record: clone(r) }
+          // N2:幂等命中 deleted → 真恢复(undelete + bump + restore tree);非 deleted → 返既有不 bump。
+          if (r.isDeleted) {
+            await this.restoreMeta(ownerId, type, id, payload, opts)
+            const restored = this.find(ownerId, type, id)!
+            this.setIdemIndex(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, recordKey(ownerId, type, id), opts.bodyFingerprint ?? '')
+            return { kind: 'restored', record: clone(restored) }
+          }
+          return { kind: 'existing', record: clone(r) }
         }
         this.idempotencyIndex.delete(idemIndexKey(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey))
       }
@@ -284,21 +374,11 @@ export class InMemoryPersistBackend implements PersistBackend {
       return { kind: 'existing', record: clone(existing) }
     }
     if (existing && existing.isDeleted) {
-      const rev = existing.revision + 1
-      const updated: PersistRecord = {
-        ...clone(existing),
-        payload: clone(payload),
-        revision: rev,
-        isDeleted: false,
-        updatedAt: nowIso(),
-        canvasId,
-        scope,
-        idempotencyKey: opts.idempotencyKey,
-        fingerprint: opts.bodyFingerprint,
-      }
-      this.bucket(ownerId).set(recordKey(ownerId, type, id), updated)
+      // N2:backend 原子 create-or-restore-tree(project→restoreProjectTree;canvas→restoreCanvasTree)。
+      await this.restoreMeta(ownerId, type, id, payload, opts)
+      const restored = this.find(ownerId, type, id)!
       this.setIdemIndex(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, recordKey(ownerId, type, id), opts.bodyFingerprint ?? '')
-      return { kind: 'restored', record: clone(updated) }
+      return { kind: 'restored', record: clone(restored) }
     }
     // 不存在 → created(revision 0;orderKey 0 for meta;createdAt/updatedAt = now)。
     const ts = nowIso()
@@ -319,7 +399,136 @@ export class InMemoryPersistBackend implements PersistBackend {
     }
     this.bucket(ownerId).set(recordKey(ownerId, type, id), created)
     if (type === 'project') this.globalProjectOwners.set(id, ownerId) // 返修 #1:全局唯一索引
+    if (type === 'canvas') this.globalCanvasOwners.set(id, ownerId) // 返修 N7:canvas 全局归属
     this.setIdemIndex(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, recordKey(ownerId, type, id), opts.bodyFingerprint ?? '')
+    return { kind: 'created', record: clone(created) }
+  }
+
+  /**
+   * N2 私有 helper:meta record(project/canvas/chat-collection)恢复。
+   * project/canvas → 原子 restore*Tree(单 record + 子树;快照回滚);chat-collection → 单 record undelete+bump+update payload。
+   */
+  private async restoreMeta(
+    ownerId: string,
+    type: PersistType,
+    id: string,
+    payload: unknown,
+    opts: { canvasId?: string | null; scope?: PersistScope; idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string },
+  ): Promise<void> {
+    if (type === 'project') {
+      await this.restoreProjectTree(ownerId, id, { payload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint })
+      return
+    }
+    if (type === 'canvas') {
+      await this.restoreCanvasTree(ownerId, id, { payload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint })
+      return
+    }
+    // chat-collection(leaf meta):单 record undelete + bump + update payload(无子树)。
+    const existing = this.find(ownerId, type, id)
+    if (!existing) return
+    const ts = nowIso()
+    const restored: PersistRecord = {
+      ...clone(existing),
+      payload: clone(payload),
+      revision: existing.revision + 1,
+      isDeleted: false,
+      updatedAt: ts,
+      canvasId: opts.canvasId ?? existing.canvasId,
+      scope: opts.scope ?? existing.scope,
+      idempotencyKey: opts.idempotencyKey,
+      fingerprint: opts.bodyFingerprint,
+    }
+    this.bucket(ownerId).set(recordKey(ownerId, type, id), restored)
+  }
+
+  /**
+   * 返修 N3:子资源(chat-message)幂等创建——canvas_id 校验(existing/idem-replay/cross-canvas 全验)。
+   * N4:同 idem key 不同 fingerprint → reuse-conflict;N2:软删命中真恢复;bump canvas contentVersion。
+   */
+  async ensureCreateChild(
+    ownerId: string,
+    canvasId: string,
+    type: PersistType,
+    id: string,
+    payload: unknown,
+    opts: { idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string },
+  ): Promise<EnsureChildResult> {
+    if (opts.idempotencyKey) {
+      const entry = this.idempotencyIndex.get(idemIndexKey(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey))
+      if (entry) {
+        const r = this.bucket(ownerId).get(entry.envelopeKey)
+        if (r) {
+          // N3:replay 时 canvas_id 不可变——同 id 属另一 canvas → cross-canvas(route 404)。
+          if (r.canvasId !== canvasId) return { kind: 'cross-canvas' }
+          // N4:fingerprint mismatch → reuse-conflict(route 422)。
+          if (opts.bodyFingerprint && entry.fingerprint !== opts.bodyFingerprint) return { kind: 'reuse-conflict' }
+          // N2:幂等命中 deleted → 真恢复(undelete + bump + update payload)。
+          if (r.isDeleted) {
+            const ts = nowIso()
+            const restored: PersistRecord = {
+              ...clone(r),
+              payload: clone(payload),
+              revision: r.revision + 1,
+              isDeleted: false,
+              updatedAt: ts,
+              canvasId,
+              idempotencyKey: opts.idempotencyKey,
+              fingerprint: opts.bodyFingerprint,
+            }
+            this.bucket(ownerId).set(entry.envelopeKey, restored)
+            this.bumpCanvasContentVersion(ownerId, canvasId)
+            return { kind: 'restored', record: clone(restored) }
+          }
+          return { kind: 'existing', record: clone(r) }
+        }
+        this.idempotencyIndex.delete(idemIndexKey(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey))
+      }
+    }
+    const existing = this.find(ownerId, type, id)
+    // N3:同 id 存在但属于另一 canvas → cross-canvas(canvas_id 不可变,不 create)。
+    if (existing && existing.canvasId !== canvasId) return { kind: 'cross-canvas' }
+    if (existing && !existing.isDeleted) {
+      this.setIdemIndex(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, recordKey(ownerId, type, id), opts.bodyFingerprint ?? '')
+      return { kind: 'existing', record: clone(existing) }
+    }
+    if (existing && existing.isDeleted) {
+      // N2:真恢复(undelete + bump + update payload)。
+      const ts = nowIso()
+      const restored: PersistRecord = {
+        ...clone(existing),
+        payload: clone(payload),
+        revision: existing.revision + 1,
+        isDeleted: false,
+        updatedAt: ts,
+        canvasId,
+        idempotencyKey: opts.idempotencyKey,
+        fingerprint: opts.bodyFingerprint,
+      }
+      this.bucket(ownerId).set(recordKey(ownerId, type, id), restored)
+      this.setIdemIndex(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, recordKey(ownerId, type, id), opts.bodyFingerprint ?? '')
+      this.bumpCanvasContentVersion(ownerId, canvasId)
+      return { kind: 'restored', record: clone(restored) }
+    }
+    // 不存在 → created(orderKey 分配,返修 #6)。
+    const ts = nowIso()
+    const created: PersistRecord = {
+      id,
+      ownerId,
+      canvasId,
+      type,
+      scope: 'document',
+      revision: 0,
+      orderKey: this.nextOrderKey(ownerId, canvasId, type),
+      isDeleted: false,
+      createdAt: ts,
+      updatedAt: ts,
+      payload: clone(payload),
+      idempotencyKey: opts.idempotencyKey,
+      fingerprint: opts.bodyFingerprint,
+    }
+    this.bucket(ownerId).set(recordKey(ownerId, type, id), created)
+    this.setIdemIndex(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, recordKey(ownerId, type, id), opts.bodyFingerprint ?? '')
+    this.bumpCanvasContentVersion(ownerId, canvasId)
     return { kind: 'created', record: clone(created) }
   }
 
@@ -342,7 +551,11 @@ export class InMemoryPersistBackend implements PersistBackend {
       const entry = this.idempotencyIndex.get(idemIndexKey(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey))
       if (entry) {
         const r = this.bucket(ownerId).get(entry.envelopeKey)
-        if (r) return { kind: r.isDeleted ? 'created' : 'updated', record: clone(r) }
+        if (r) {
+          // N4:同 idem key 不同 fingerprint(不同 body)→ reuse-conflict(route 422)。
+          if (opts.bodyFingerprint && entry.fingerprint !== opts.bodyFingerprint) return { kind: 'reuse-conflict' }
+          return { kind: r.isDeleted ? 'created' : 'updated', record: clone(r) }
+        }
         this.idempotencyIndex.delete(idemIndexKey(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey))
       }
     }
@@ -446,7 +659,13 @@ export class InMemoryPersistBackend implements PersistBackend {
       const entry = this.idempotencyIndex.get(idemIndexKey(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey))
       if (entry) {
         const r = this.bucket(ownerId).get(entry.envelopeKey)
-        if (r) return { kind: 'updated', record: clone(r) }
+        if (r) {
+          // N3:replay 时 canvas_id 不可变——同 id 属另一 canvas → cross-canvas(route 404)。
+          if (r.canvasId !== canvasId) return { kind: 'cross-canvas' }
+          // N4:同 idem key 不同 fingerprint → reuse-conflict(route 422)。
+          if (opts.bodyFingerprint && entry.fingerprint !== opts.bodyFingerprint) return { kind: 'reuse-conflict' }
+          return { kind: 'updated', record: clone(r) }
+        }
         this.idempotencyIndex.delete(idemIndexKey(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey))
       }
     }
@@ -512,22 +731,66 @@ export class InMemoryPersistBackend implements PersistBackend {
     return { deleted: true }
   }
 
-  async reorderChildren(ownerId: string, canvasId: string, type: PersistType, orderedIds: string[]): Promise<ReorderResult> {
+  async reorderChildren(
+    ownerId: string,
+    canvasId: string,
+    type: PersistType,
+    orderedIds: string[],
+    opts: { base?: Revision } = {},
+  ): Promise<ReorderResult> {
     const b = this.bucket(ownerId)
-    // 快照回滚(返修 #7 原子语义)
+    // live set(type + canvasId + !deleted)
+    const liveIds = new Set<string>()
+    for (const r of b.values()) {
+      if (r.type === type && r.canvasId === canvasId && !r.isDeleted) liveIds.add(r.id)
+    }
+    // N8:唯一性(含重复 → bad duplicate)
+    const seen = new Set<string>()
+    for (const id of orderedIds) {
+      if (seen.has(id)) return { kind: 'bad', reason: 'duplicate' }
+      seen.add(id)
+    }
+    // N8:全等(orderedIds 须 === live set;缺/多 → bad mismatch)
+    if (orderedIds.length !== liveIds.size) return { kind: 'bad', reason: 'mismatch' }
+    for (const id of orderedIds) {
+      if (!liveIds.has(id)) return { kind: 'bad', reason: 'mismatch' }
+    }
+    // N8:If-Match(contentVersion base)冲突——stale → 409(两并发一成一 409)
+    const currentCv = this.canvasContentVersion(ownerId, canvasId)
+    if (opts.base !== undefined && opts.base !== currentCv) {
+      return { kind: 'conflict', currentContentVersion: currentCv }
+    }
+    // 原子:快照(children + canvas meta)→ 重分配 orderKey + bump contentVersion+updatedAt;失败回滚。
     const snapshot: Array<[string, PersistRecord]> = []
-    let n = 0
     for (const id of orderedIds) {
       const key = recordKey(ownerId, type, id)
       const r = b.get(key)
-      if (!r || r.canvasId !== canvasId) continue
-      snapshot.push([key, clone(r)])
-      const updated: PersistRecord = { ...clone(r), orderKey: n }
-      b.set(key, updated)
-      n++
+      if (r) snapshot.push([key, clone(r)])
     }
-    this.bumpCanvasContentVersion(ownerId, canvasId)
-    return { reordered: n }
+    const metaKey = recordKey(ownerId, 'canvas', canvasId)
+    const meta = this.find(ownerId, 'canvas', canvasId)
+    if (meta) snapshot.push([metaKey, clone(meta)])
+    try {
+      let n = 0
+      for (const id of orderedIds) {
+        const key = recordKey(ownerId, type, id)
+        const r = b.get(key)
+        if (!r) continue
+        b.set(key, { ...clone(r), orderKey: n, updatedAt: nowIso() })
+        n++
+      }
+      let newCv = currentCv
+      if (meta) {
+        const p = asCanvasMeta(meta.payload) ?? {}
+        newCv = (p.contentVersion ?? 0) + 1
+        p.contentVersion = newCv
+        b.set(metaKey, { ...meta, payload: p, updatedAt: nowIso() })
+      }
+      return { kind: 'ok', reordered: n, contentVersion: newCv }
+    } catch (err) {
+      for (const [key, rec] of snapshot) b.set(key, rec)
+      throw err
+    }
   }
 
   async listByOwner(ownerId: string, type: PersistType, opts: { includeDeleted?: boolean } = {}): Promise<ListResult> {
@@ -592,7 +855,11 @@ export class InMemoryPersistBackend implements PersistBackend {
     }
   }
 
-  async restoreCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number }> {
+  async restoreCanvasTree(
+    ownerId: string,
+    canvasId: string,
+    opts: { payload?: unknown; idempotencyKey?: string; fingerprint?: string } = {},
+  ): Promise<{ count: number }> {
     const b = this.bucket(ownerId)
     const ts = nowIso()
     const targets: string[] = []
@@ -604,7 +871,15 @@ export class InMemoryPersistBackend implements PersistBackend {
     try {
       for (const key of targets) {
         const r = b.get(key)!
-        b.set(key, { ...clone(r), isDeleted: false, revision: r.revision + 1, updatedAt: ts })
+        const isMeta = r.type === 'canvas' && r.id === canvasId
+        let newPayload = clone(r.payload)
+        if (isMeta && opts.payload !== undefined) {
+          // N2:restore-via-POST 带 new payload——保留 contentVersion(backend 维护),合并 incoming 域字段。
+          const oldCv = asCanvasMeta(r.payload)?.contentVersion ?? 0
+          newPayload = { ...(opts.payload as object), contentVersion: oldCv }
+        }
+        const extra = isMeta ? { idempotencyKey: opts.idempotencyKey, fingerprint: opts.fingerprint } : {}
+        b.set(key, { ...clone(r), payload: newPayload, isDeleted: false, revision: r.revision + 1, updatedAt: ts, ...extra })
       }
       return { count: targets.length }
     } catch (err) {
@@ -647,7 +922,11 @@ export class InMemoryPersistBackend implements PersistBackend {
     }
   }
 
-  async restoreProjectTree(ownerId: string, projectId: string): Promise<{ count: number }> {
+  async restoreProjectTree(
+    ownerId: string,
+    projectId: string,
+    opts: { payload?: unknown; idempotencyKey?: string; fingerprint?: string } = {},
+  ): Promise<{ count: number }> {
     const b = this.bucket(ownerId)
     const ts = nowIso()
     const targets: string[] = []
@@ -660,6 +939,7 @@ export class InMemoryPersistBackend implements PersistBackend {
         const p = asCanvasMeta(r.payload)
         if (p?.projectId === projectId) targets.push(key)
       } else {
+        // chat-collection:canvas_id 属 project 的 canvas
         const parentMeta = this.find(ownerId, 'canvas', r.canvasId ?? '')
         const pp = parentMeta && asCanvasMeta(parentMeta.payload)
         if (pp?.projectId === projectId) targets.push(key)
@@ -669,7 +949,11 @@ export class InMemoryPersistBackend implements PersistBackend {
     try {
       for (const key of targets) {
         const r = b.get(key)!
-        b.set(key, { ...clone(r), isDeleted: false, revision: r.revision + 1, updatedAt: ts })
+        const isProj = r.type === 'project' && r.id === projectId
+        // N2:project meta payload 更新(若提供);canvas targets 保留 contentVersion(clone r.payload)。
+        const newPayload = isProj && opts.payload !== undefined ? clone(opts.payload) : clone(r.payload)
+        const extra = isProj ? { idempotencyKey: opts.idempotencyKey, fingerprint: opts.fingerprint } : {}
+        b.set(key, { ...clone(r), payload: newPayload, isDeleted: false, revision: r.revision + 1, updatedAt: ts, ...extra })
       }
       return { count: targets.length }
     } catch (err) {
@@ -682,6 +966,7 @@ export class InMemoryPersistBackend implements PersistBackend {
     this.byOwner.clear()
     this.idempotencyIndex.clear()
     this.globalProjectOwners.clear()
+    this.globalCanvasOwners.clear()
   }
 }
 

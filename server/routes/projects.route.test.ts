@@ -4,7 +4,7 @@
 // #2/#7 DELETE softDeleteProjectTree 原子级联(canvas meta + chat-collection 软删;children 活)、
 // #4 428/If-Match、#10 幂等跨 type 不串、#12 413 完整 body。
 import { describe, it, expect, beforeEach } from 'vitest'
-import { buildPersistApp, hdr, KEY_A, KEY_B, req } from './persistTestApp'
+import { buildPersistApp, hdr, KEY_A, KEY_B, req, canonicalNode, wirePayload } from './persistTestApp'
 import { fingerprintOfPlatformKey } from '../lib/keys'
 
 describe('/api/projects routes (T1.3 返修)', () => {
@@ -74,7 +74,7 @@ describe('/api/projects routes (T1.3 返修)', () => {
     await create(KEY_A, 'p1')
     await req(app, '/api/canvas', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ id: 'c1', projectId: 'p1', title: 'C' }) })
     await req(app, '/api/canvas/c1/chat', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ message: { id: 'm1', text: 'hi' } }) })
-    await req(app, '/api/canvas/c1/nodes/n1', { method: 'PATCH', headers: hdr(KEY_A), body: JSON.stringify({ payload: { id: 'n1', type: 'image' } }) })
+    await req(app, '/api/canvas/c1/nodes/n1', { method: 'PATCH', headers: hdr(KEY_A), body: JSON.stringify({ payload: wirePayload(canonicalNode('n1')) }) })
 
     const del = await req(app, '/api/projects/p1', { method: 'DELETE', headers: hdr(KEY_A) })
     expect(del.status).toBe(204)
@@ -117,5 +117,31 @@ describe('/api/projects routes (T1.3 返修)', () => {
   it('malformed X-Mivo-Api-Key → 400(无 env 回退,F4 边界)', async () => {
     const res = await req(app, '/api/projects', { headers: { 'x-mivo-api-key': 'not-a-mivo-key' } })
     expect(res.status).toBe(400)
+  })
+
+  it('N4: project POST 同 idem key 同 body → 200 不 bump;不同 body → 422', async () => {
+    const r1 = await req(app, '/api/projects', { method: 'POST', headers: { ...hdr(KEY_A), 'idempotency-key': 'kp1' }, body: JSON.stringify({ id: 'p-n4', name: 'P' }) })
+    expect(r1.status).toBe(201)
+    const r2 = await req(app, '/api/projects', { method: 'POST', headers: { ...hdr(KEY_A), 'idempotency-key': 'kp1' }, body: JSON.stringify({ id: 'p-n4', name: 'P' }) })
+    expect(r2.status).toBe(200) // 幂等回放,不 bump
+    expect((r2.body as { revision: number }).revision).toBe(0)
+    const r3 = await req(app, '/api/projects', { method: 'POST', headers: { ...hdr(KEY_A), 'idempotency-key': 'kp1' }, body: JSON.stringify({ id: 'p-n4', name: 'DIFF' }) })
+    expect(r3.status).toBe(422)
+    expect((r3.body as { error: string }).error).toBe('idempotency-key-reuse')
+  })
+
+  it('N5: project PATCH If-Match 1.5/0x10/-1/abc → 400;缺失 → 428;正确 → bump', async () => {
+    await create(KEY_A, 'p-n5', 'n0')
+    for (const bad of ['1.5', '0x10', '-1', 'abc']) {
+      const r = await req(app, '/api/projects/p-n5', { method: 'PATCH', headers: { ...hdr(KEY_A), 'if-match': bad }, body: JSON.stringify({ name: 'n1' }) })
+      expect(r.status).toBe(400)
+      expect((r.body as { error: string }).error).toBe('bad-request')
+    }
+    // missing If-Match(existing)→ 428
+    expect((await req(app, '/api/projects/p-n5', { method: 'PATCH', headers: hdr(KEY_A), body: JSON.stringify({ name: 'n1' }) })).status).toBe(428)
+    // correct → bump
+    const ok = await req(app, '/api/projects/p-n5', { method: 'PATCH', headers: { ...hdr(KEY_A), 'if-match': '0' }, body: JSON.stringify({ name: 'n1' }) })
+    expect(ok.status).toBe(200)
+    expect((ok.body as { revision: number }).revision).toBe(1)
   })
 })

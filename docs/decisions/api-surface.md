@@ -197,16 +197,19 @@ type RecordEntry = { id, revision, orderKey, payload }  // 返修 #6 orderKey
 
 ---
 
-### 4.4 `/api/assets`(asset 域,返修 #8 引用 T1.5 #195 真实 shape)
+### 4.4 `/api/assets`(asset 域,返修 #8/N9 引用 T1.5 #195 真实 shape)
 
-> T1.5(#195)已实现 `server/routes/assets.ts`,本契约只钉 wire shape(不再"留待"):
+> T1.5(#195)已实现 `server/routes/assets.ts`,本契约只钉 wire shape(不再"留待")。
+> **N9:真相源 = #195 返修后 head `0b945f4`**(env gate / owner 404 / private cache / refcount=references.length);本契约 §4.4 + `shared/persist-contract.ts` asset 类型 + `ServerPersistAdapter` asset seam 以其为真相对齐,不重复实现(asset 路由/store 归 #195,本 PR 不重叠)。
 >
 > | 方法+路径 | 请求 | 响应 |
 > |---|---|---|
-> | `POST /api/assets` | multipart `image` 文件 OR JSON `{image: base64}` | 200 `CreateAssetResponse = {assetId, mimeType, originalName, sizeBytes, refcount, deduped}`(内容寻址:同 content hash → 同 assetId,refcount+1,bytes 复用) |
-> | `GET /api/assets/:id` | —(id = sha256 hex 64) | 200 content bytes(immutable,长缓存) |
+> | `POST /api/assets` | multipart `image` 文件 OR JSON `{image: base64}` | 200 `CreateAssetResponse = {assetId, mimeType, originalName, sizeBytes, refcount, deduped}`(内容寻址:同 content hash → 同 assetId,**refcount=references.length**,bytes 复用) |
+> | `GET /api/assets/:id` | —(id = sha256 hex 64) | 200 content **bytes** + `Content-Type: <sniffedMime>` + `Cache-Control: private`(immutable;owner-scoped:跨 owner GET → 404 无泄漏;env gate `MIVO_ENABLE_ASSET_SERVICE=1`,默认关 → /api/assets 404) |
 >
-> document record 的 `asset` 字段当前是 url 字符串,T1.5 后改 `assetId`(内容寻址,record-schema §2.4/§6 矛盾 3)。`ServerPersistAdapter` 已补 asset seam(`uploadAsset`/`resolveAsset`,引 `CreateAssetResponse`/`AssetRef` 类型,不重复实现)。
+> **N9:resolve seam 返回 bytes+mime,不返 AssetRef 元数据**——`ServerPersistAdapter.resolveAsset(assetId): Promise<ResolvedAsset | null>`,`ResolvedAsset = {bytes: Uint8Array; mimeType: string}`(GET 内容寻址 bytes,长缓存 private;null=404 env off/不存在/跨 owner)。`uploadAsset` 返 `CreateAssetResponse` 不变。
+>
+> document record 的 `asset` 字段当前是 url 字符串,T1.5 后改 `assetId`(内容寻址,record-schema §2.4/§6 矛盾 3)。`ServerPersistAdapter` asset seam(`uploadAsset`/`resolveAsset`)引 #195 真实 shape,不重复实现。
 
 ---
 
@@ -225,6 +228,8 @@ type RecordEntry = { id, revision, orderKey, payload }  // 返修 #6 orderKey
 | 409 | `project-exists` | **跨 owner 同 project id**(全局唯一 #1) | POST /api/projects |
 | **428** | `precondition-required` | existing 写端点缺 If-Match base(#4) | PATCH/PUT 节点 + meta + user-state |
 | 413 | `request-body-too-large` | body > 1MB(返修 #12 统一 `TooLargeBody`) | 全部 JSON 写端点 |
+| 422 | `idempotency-key-reuse` | 同 Idempotency-Key 不同请求 fingerprint(不同 body,N4) | 全部带 Idempotency-Key 写端点 |
+| 400 | `payload-rejected` reason=`unknown-field`/`missing-field`/`bad-type`/`bad-id-type` | N1/N10:逐 type payload schema(必填/类型/拒 unknown/非 string id);原有 mirror-field/forbidden-field/id-mismatch/not-object 不变 | PATCH node/edge/anchor |
 
 ---
 
@@ -332,3 +337,24 @@ CREATE TABLE idempotency_index (
 | FX-4 节点级 PATCH 1MB/413 + 428 | §3 + §4.2.2(#4/#12) | plan §4 FX-4 |
 | §13.5 节点级合并 revision + 归属模型 | §2 409/428 语义 + §1 actor/owner(#1) | platform §13.5 |
 | §13.1 scope 分层 | §0/§4 端点分组 | platform §13.1 |
+
+---
+
+## 附录 D:返修二(N1-N10)闭环对照(实现落点 + 全链路验收)
+
+> 本轮铁律:每条修复的验收测试**用真实 canonical fixture 驱动真实 Hono route**(`app.request` 全链路),禁止 `expectTypeOf`/手写 JSON 当"往返测试"。复审报告里每个独立复现场景逐字变成回归测试。
+
+| N | 优先级 | finding | 实现落点 | 全链路验收(route-driving) |
+|---|---|---|---|---|
+| N1 | P1 | canonical↔wire 自相矛盾(transport payload = 逐 type Omit<Record,'id'|'revision'>;真实 encoder+decoder;payload 内 domain createdAt 保留不镜像校验) | shared `NodePayload`/`EdgePayload`/`AnchorPayload` + `encodeChildPayload`/`validateChildPayload`(逐 type schema);Edge/Anchor 的 createdAt 是 allowed 域字段(Node 无 → unknown 拒) | canonical node/edge/anchor fixture 经 encoder PATCH 真实 route 200;GET 回读 envelope revision 回填;invalid mirror/unknown 400 |
+| N2 | P1 | restore 生命周期(backend 原子 create-or-restore-tree;project restore 调 restoreProjectTree;幂等命中 deleted 必真 mutation;chat route 校验 collection live) | backend `ensureCreate` 命中 deleted → `restoreMeta`→`restoreProjectTree`/`restoreCanvasTree`(原子,快照回滚);idem-replay-deleted 真恢复;chat route `collectionLive` 校验 | create→delete→restore(有/无 idem key)后 parent/collection 全 live;硬删 child 不复活;注入故障全回滚 |
+| N3 | P1 | chat POST 绕过 canvas_id(ensureCreateChild 校验 envelope.canvasId;existing/idem replay 都验;跨 canvas 统一 404) | backend `ensureCreateChild`(canvas_id 校验 on existing/idem-replay/cross-canvas);canvas.ts chat POST 用之;upsertChild idem-replay 加 cross-canvas | message id 属 canvas A,POST 到 canvas B → 404;replay 跨 canvas → 404 |
+| N4 | P1 | fingerprint 冲突(mismatch 返回 reuse-conflict,shared 增 422 body,全 route 映射;同 key 同 body 200 不 bump/不同 body 422) | shared `ReuseConflictBody`;backend `ensureCreate`/`upsert`/`upsertChild`/`ensureCreateChild` idem-replay fingerprint mismatch → `reuse-conflict`;routes 422 | 同 key 同 body 200 不 bump;同 key 不同 body 422 `idempotency-key-reuse` |
+| N5 | P1 | If-Match 校验(规范十进制非负 safe integer;正则+Number.isSafeInteger;1.5/1e2/0x10/NaN/负数/超界全拒;区分 missing→428 vs invalid→400) | shared `parseIfMatch`(`IF_MATCH_DECIMAL_RE` + `Number.isSafeInteger`);persistHttp re-export;routes invalid→400 bad-request,missing→428 via backend,value→base | `If-Match: 1.5`/`1e2`/`0x10`/`-1`/超界 → 400;缺失(existing)→ 428;正确 → base |
+| N6 | P1 | DP-7 补洞(冻结 key 逐项 exact regex 含 canvas suffix;完整 key+所有 string value 规范化、大小写不敏感 credential 扫描;拒未知 suffix;URL 编码变体也拒) | shared `USER_STATE_KEY_FROZEN`(逐项 regex)+ `normalizeForScan`(URL-decode+lower)+ credential prefix scan;`userStateNamespaceKind` suffix-aware | `canvas:c1:bogus` → forbidden-key;`MIVO_xxx`/`Sk-xxx`/`%6divo_xxx` value → forbidden-value;未知 suffix → 400 |
+| N7 | P1 | authz seam 真接线(backend 先 resolve resourceOwner,action-aware authz(read/write/move)判 source+target,授权后以 resourceOwner 查询;canvas 全部 route + move 双端接 seam;list 返授权集;canAccess* 不许有定义无调用) | `authz.ts` action-aware(`canAccessProject`/`canAccessCanvas`/`canAccessUserState` 带 action);backend `getCanvasOwner`(全局索引);canvas routes `authzCanvas` + move 双端(project source+target);projects `authzProject`;userState `authzUserState` | B 跨 owner GET/写 canvas → 404(同 unknown);move projectId 到他人 project → 404;list 仅返自己 |
+| N8 | P2 | reorder(orderedIds 必须与 live set 全等且唯一;单原子;冲突语义 If-Match contentVersion;bump timestamps/version;两并发一成一 409) | backend `reorderChildren`(full-set+unique+contentVersion conflict+atomic bump);route `parseIfMatch` + 409/400 | orderedIds 缺/多/重复 → 400;stale If-Match → 409;两并发(同 base)一 409;成功 bump contentVersion |
+| N9 | P1 | 与 #195 对齐(api-surface §4.4 + shared/adapter 以 #195 head 0b945f4 为真相;env gate/owner 404/private cache/refcount=references.length;resolve seam 返回 bytes+mime) | §4.4 doc + shared `ResolvedAsset`{bytes,mimeType} + `ServerPersistAdapter.resolveAsset` 返 bytes+mime(不返 AssetRef);#195 文件不重叠 | (类型互锁契约;#195 落地后 route-driving 由 #195 覆盖) |
+| N10 | P2 | payload 真 allowlist(逐 type schema 必填/类型校验,拒 unknown,非 string id 400) | shared `PAYLOAD_SPECS`(node/edge/anchor allowed-keys+required+type-checks)+ `NODE/EDGE/ANCHOR_PAYLOAD_KEYS`(编译期 exhaustiveness);`validateChildPayload` 拒 unknown/missing/bad-type/bad-id-type | canonical fixture 200;缺必填 → missing-field;unknown field → unknown-field;非 string id → bad-id-type |
+
+> 原 13 条 partial/not-fixed 项闭环:#1→N7、#2→N2、#3→N3、#4→N5、#5→N1、#6→N8、#8→N7(move)+N9(assets)、#9→N6、#10→N4+N2(假恢复)、#11→N1(铁律)+N10、#13→N10。#7(四条 tree 原子)+#12(413)上轮已 closed,本轮保持绿。
