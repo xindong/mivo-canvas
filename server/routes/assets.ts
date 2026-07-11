@@ -24,8 +24,10 @@
 //
 // Auth (对齐现有模式): rejectInvalidMivoApiKey rejects a present-but-malformed
 // X-Mivo-Api-Key (400, no env fallback for bogus headers). A missing/blank key
-// falls back to env via resolvePlatformCtx. The resolved platform key is
-// fingerprinted (fingerprintOfPlatformKey, FX-2) → ownerFp.
+// falls back to env via resolvePlatformCtx (legacy). Owner is resolved via
+// resolveAssetOwner (G2.1: strict mode MIVO_SSO_STRICT=1 → SSO actor, 401 on
+// missing/wrong gateway proof, NO fingerprint fallback; legacy → mivo-key
+// fingerprint → ownerFp, current behavior unchanged).
 //
 // Path traversal (P2.6): ASSET_ID_RE (lowercase hex64) at the route boundary; the
 // store + fs backend re-validate and throw InvalidAssetIdError — a non-hash id
@@ -34,11 +36,8 @@
 // Registered under /api via app.route('/api', createAssetRoutes()) in app.ts.
 import { Hono } from 'hono'
 import { Buffer } from 'node:buffer'
-import {
-  rejectInvalidMivoApiKey,
-  resolvePlatformCtx,
-  fingerprintOfPlatformKey,
-} from '../lib/keys'
+import { rejectInvalidMivoApiKey } from '../lib/keys'
+import { resolveAssetOwner } from '../lib/owner'
 import {
   parseMultipartBody,
   readJsonBody,
@@ -106,7 +105,7 @@ export const createAssetRoutes = (options: AssetRouteOptions = {}): App => {
       log(400, 'bad-mivo-key')
       return badKey
     }
-    const ownerFp = fingerprintOfPlatformKey(resolvePlatformCtx(c).platformKey)
+    const ownerFp = resolveAssetOwner(c)
 
     // P1 decode concurrency gate: acquire a global sharp-decode permit BEFORE reading
     // the body. A sharp decode expands a small compressed upload to a huge uncompressed
@@ -258,7 +257,7 @@ export const createAssetRoutes = (options: AssetRouteOptions = {}): App => {
       return plainTextNoContentType(c, 'Asset not found', 404)
     }
     // P2.5: owner-scoped read — must be uploader or hold a live reference.
-    const ownerFp = fingerprintOfPlatformKey(resolvePlatformCtx(c).platformKey)
+    const ownerFp = resolveAssetOwner(c)
     const hit = await store.readForOwner(assetId, ownerFp)
     if (!hit) {
       log(404, 'missing-or-forbidden')

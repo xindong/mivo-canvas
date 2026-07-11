@@ -22,9 +22,33 @@
 // DP-7 合规:raw mivo key 永不作为 user-state 数据落库(DP-7);fallback 路径只用其指纹作 owner
 // 分片键(keys.ts 注释明示"per-user partition/routing key,never stored")。T1.4 生产路径 actor=username,
 // 指纹仅 dev/legacy fallback。两把 key 原文仍在前端 strictIdbStateStorage(DP-7 专用语义边界)。
+//
+// ── G2.1 严格 SSO(cutover 计划 §5;2026-07-12)──────────────────────────────────
+// 痛点:legacy resolveActor 在 SSO 信任失败时**静默回退 mivo-key 指纹**——生产仅 warning。
+// 若 MIVO_PLATFORM_KEY 是共享/缺失,多用户解析到同一指纹 → 同一 actor → 跨用户数据互访(共享分片)。
+// 严格模式开关 `MIVO_SSO_STRICT=1`(默认关,生产零变化);切换日翻开。
+//
+// 开关语义:
+// - `MIVO_SSO_STRICT=1`(默认关):严格模式。缺/错 secret·header → **401,不回退指纹**。
+//   SSO header `x-mivo-auth-user` 仅网关注入;client 不得携带——服务端靠网关共享密钥
+//   `x-mivo-gateway-secret` 证明网关注入(无密钥/不匹配 → 401,即"拒绝 client 侧同名 header")。
+//   严格模式下 resolveActor **无任何指纹回退路径**(见下方 strict 分支:仅返回 SSO user / dev actor /
+//   抛 SsoAuthError;fingerprintOfPlatformKey 仅在 legacy 分支出现)。
+// - `MIVO_DEV_MODE=1`(显式 dev mode;且 NODE_ENV≠production 才生效):严格模式下的本地开发通道。
+//   信任 `x-mivo-auth-user` 而无需网关密钥(本地无网关);缺失则用稳定 dev actor。**不是靠 fallback**——
+//   是显式 env 开关,生产下 isDevMode 恒 false(防误开 → 走严格生产路径 → 401,绝不冒充)。
+// - 默认关(MIVO_SSO_STRICT 未设):legacy 行为完全不变(isSsoHeaderTrusted + ssoHeaderSecretOk → SSO user;
+//   否则指纹 fallback)。现有测试零红。
+//
+// 持久化路由(projects/canvas/userState/assets/tasks/members/shareLinks)在严格模式下全部走 SSO actor:
+// - projects/canvas/userState/members/shareLinks 直接调 resolveActor(c) → strict 分支自动生效。
+// - tasks/assets 历史上绕过 resolveActor 直接用指纹;G2.1 改走 resolveTaskOwner/resolveAssetOwner
+//   (mode-aware:strict 走 resolveActor,non-strict 保持原 raw-key/指纹 行为零变化)。
+// 401 由 ssoAuthBoundary 中间件捕获 SsoAuthError 统一返回(app.ts + persistTestApp 挂载)。
 
-import type { Context } from 'hono'
+import type { Context, ErrorHandler } from 'hono'
 import { fingerprintOfPlatformKey, resolvePlatformCtx } from './keys'
+import type { AppEnv } from './types'
 
 /**
  * 网关注入的可信身份 header(DP-4 §4)。值 = SSO `username`(maker user id)。
@@ -43,7 +67,34 @@ import { fingerprintOfPlatformKey, resolvePlatformCtx } from './keys'
 export const SSO_TRUSTED_USER_HEADER = 'x-mivo-auth-user'
 export const GATEWAY_SECRET_HEADER = 'x-mivo-gateway-secret'
 
-/** x-mivo-auth-user 是否可信(opt-in,默认关防伪造)。 */
+/** 严格 SSO 模式开关(cutover §5 G2.1;默认关,生产零变化)。 */
+export const isSsoStrict = (env: NodeJS.ProcessEnv = process.env): boolean =>
+  env.MIVO_SSO_STRICT === '1'
+
+/**
+ * 显式 dev mode(G2.1)。仅 `MIVO_DEV_MODE=1` **且 NODE_ENV≠production** 时为 true。
+ * 生产下恒 false(防误开 → 严格生产路径 → 401,绝不冒充)。dev mode 是显式 env 开关,不是 fallback。
+ */
+export const isDevMode = (env: NodeJS.ProcessEnv = process.env): boolean =>
+  env.MIVO_DEV_MODE === '1' && env.NODE_ENV !== 'production'
+
+/** dev mode 下无 `x-mivo-auth-user` header 时使用的稳定 actor(本地 dev parity)。 */
+export const DEV_ACTOR_ID = 'mivo-dev-actor'
+
+/**
+ * 严格模式下 SSO 鉴权失败(缺/错 secret·header)时抛出;由 ssoAuthBoundary 中间件捕获 → 401。
+ * legacy(non-strict)模式下 resolveActor 永不抛此错(回退指纹)。
+ */
+export class SsoAuthError extends Error {
+  readonly reason: string
+  constructor(reason: string) {
+    super(`SSO auth required: ${reason}`)
+    this.name = 'SsoAuthError'
+    this.reason = reason
+  }
+}
+
+/** x-mivo-auth-user 是否可信(opt-in,默认关防伪造;legacy 路径用)。 */
 export const isSsoHeaderTrusted = (env: NodeJS.ProcessEnv = process.env): boolean =>
   env.MIVO_TRUST_SSO_HEADER === '1'
 
@@ -52,16 +103,28 @@ export const isSsoHeaderTrusted = (env: NodeJS.ProcessEnv = process.env): boolea
  * 生产(NODE_ENV=production)下:SSO 开但缺网关密钥 → 警告(可伪造);SSO 未开 → 警告
  * (persist 走指纹,若 MIVO_PLATFORM_KEY 共享则多用户同 actor,不安全)。仅警告不硬失败
  * (保单用户/合法指纹模式部署可用);ops 据警告修正。返回告警列表(供 index.ts 启动日志)。
+ *
+ * G2.1:增严格模式告警——生产下 MIVO_SSO_STRICT=1 但缺 MIVO_GATEWAY_SECRET → 所有持久化
+ * 请求 401(运行时 fail-closed);MIVO_DEV_MODE=1 在生产 → 告警(isDevMode 已恒 false,但仍提示 ops 误配)。
  */
 export const validateSsoConfig = (env: NodeJS.ProcessEnv = process.env): string[] => {
   const warnings: string[] = []
   if (env.NODE_ENV !== 'production') return warnings
+  if (env.MIVO_DEV_MODE === '1') {
+    warnings.push('MIVO_DEV_MODE=1 in production: dev mode is force-disabled in production (isDevMode=false); remove this flag to avoid confusion. Strict path will 401 on missing gateway proof.')
+  }
+  if (isSsoStrict(env)) {
+    if (!env.MIVO_GATEWAY_SECRET) {
+      warnings.push('MIVO_SSO_STRICT=1 but MIVO_GATEWAY_SECRET unset: every persistence request will 401 (fail-closed). Set MIVO_GATEWAY_SECRET + have the gateway inject x-mivo-gateway-secret.')
+    }
+    return warnings
+  }
   if (isSsoHeaderTrusted(env)) {
     if (!env.MIVO_GATEWAY_SECRET) {
       warnings.push('MIVO_TRUST_SSO_HEADER=1 but MIVO_GATEWAY_SECRET unset: x-mivo-auth-user is forgeable (no gateway proof). Set MIVO_GATEWAY_SECRET + have the gateway inject x-mivo-gateway-secret.')
     }
   } else {
-    warnings.push('MIVO_TRUST_SSO_HEADER!=1 in production: /api/{projects,canvas,user-state} resolve identity via mivo-key fingerprint; if MIVO_PLATFORM_KEY is shared/absent, all users resolve to the same actor (data cross-access). Enable SSO + MIVO_GATEWAY_SECRET behind the gateway.')
+    warnings.push('MIVO_SSO_STRICT!=1 and MIVO_TRUST_SSO_HEADER!=1 in production: /api/{projects,canvas,user-state} resolve identity via mivo-key fingerprint; if MIVO_PLATFORM_KEY is shared/absent, all users resolve to the same actor (data cross-access). Enable MIVO_SSO_STRICT=1 + MIVO_GATEWAY_SECRET behind the gateway.')
   }
   return warnings
 }
@@ -82,19 +145,40 @@ export const ssoHeaderSecretOk = (env: NodeJS.ProcessEnv, headerSecret: string |
 }
 
 /**
- * Actor user id for the /api/{canvas,projects,user-state} endpoints (返修 #1 + T1.4 DP-4).
- * T1.4:仅当 `MIVO_TRUST_SSO_HEADER=1`(网关后 opt-in)且网关密钥通过时读 `x-mivo-auth-user`。
- * 生产缺 MIVO_GATEWAY_SECRET → 密钥不通过 → 不信任 SSO header(防伪造,Greptile 第三轮)。
- * 否则(默认关 / dev / legacy / 无网关)→ fallback mivo_ 平台 key 指纹(T1.3 owner===actor 自归属 parity)。
+ * Actor user id for the /api/{canvas,projects,user-state} endpoints (返修 #1 + T1.4 DP-4 + G2.1 严格 SSO)。
+ *
+ * **严格模式(MIVO_SSO_STRICT=1)**:
+ * - dev mode(MIVO_DEV_MODE=1 且非生产):信任 `x-mivo-auth-user`(本地无网关,无需密钥);
+ *   缺失 → DEV_ACTOR_ID 稳定 dev actor。显式 env 开关,非 fallback。
+ * - 生产严格:要求网关密钥通过(ssoHeaderSecretOk)且 `x-mivo-auth-user` 存在;缺/错任一 → 抛 SsoAuthError
+ *   (→ ssoAuthBoundary 401)。**无指纹回退**(strict 分支不调用 fingerprintOfPlatformKey)。
+ *
+ * **legacy(默认关 → 生产零变化)**:仅当 `MIVO_TRUST_SSO_HEADER=1`(网关后 opt-in)且网关密钥通过时
+ * 读 `x-mivo-auth-user`;否则 fallback mivo_ 平台 key 指纹(T1.3 owner===actor 自归属 parity)。
  * 空 key(无 header + 无 env)→ 稳定 fallback 指纹(dev/legacy parity,同 tasks-per-user.test)。
  */
 export const resolveActor = (c: Context): string => {
-  if (isSsoHeaderTrusted() && ssoHeaderSecretOk(process.env, c.req.header(GATEWAY_SECRET_HEADER))) {
+  const env = process.env
+  if (isSsoStrict(env)) {
+    if (isDevMode(env)) {
+      // 显式 dev mode:本地无网关,信任 x-mivo-auth-user(无需密钥);缺失 → 稳定 dev actor
+      return c.req.header(SSO_TRUSTED_USER_HEADER)?.trim() || DEV_ACTOR_ID
+    }
+    // 严格生产:网关密钥必须通过(防 client 伪造 x-mivo-auth-user);不通过 → 401,不回退指纹
+    if (!ssoHeaderSecretOk(env, c.req.header(GATEWAY_SECRET_HEADER))) {
+      throw new SsoAuthError('missing or mismatched gateway secret (x-mivo-gateway-secret)')
+    }
+    const ssoUser = c.req.header(SSO_TRUSTED_USER_HEADER)?.trim()
+    if (!ssoUser) throw new SsoAuthError('missing trusted SSO user header (x-mivo-auth-user)')
+    return ssoUser // 严格模式 carrier = SSO username(maker user id,DP-4 一致)
+  }
+  // legacy(默认关):SSO opt-in + 密钥通过 → SSO user;否则指纹 fallback(零变化)
+  if (isSsoHeaderTrusted(env) && ssoHeaderSecretOk(env, c.req.header(GATEWAY_SECRET_HEADER))) {
     const ssoUser = c.req.header(SSO_TRUSTED_USER_HEADER)?.trim()
     if (ssoUser) return ssoUser // T1.4 carrier = maker user id (username,DP-4 一致)
     // secret 通过但无 SSO header → fallback 指纹(网关未注入身份)
   }
-  return fingerprintOfPlatformKey(resolvePlatformCtx(c).platformKey) // T1.3 fallback
+  return fingerprintOfPlatformKey(resolvePlatformCtx(c).platformKey) // T1.3 fallback(仅 legacy 分支)
 }
 
 /**
@@ -102,3 +186,35 @@ export const resolveActor = (c: Context): string => {
  * T1.4 member/share 落地后,route 改用 resolveActor + authz seam,此别名仅过渡。
  */
 export const resolveOwner = resolveActor
+
+/**
+ * Task registry 的 owner key(FX-2 per-user 隔离;registry 内部 fingerprint 入库)。
+ * - 严格模式:resolveActor(c)——SSO user(缺/错 proof 抛 SsoAuthError → 401);registry 对其再指纹
+ *   得稳定 per-user 分片(非密 actor 被哈希无安全损害)。无 mivo-key 指纹回退 → 无共享分片。
+ * - legacy(默认关):raw mivo 平台 key(registry 指纹 → ownerFp;**当前行为零变化**,tasks 测试全绿)。
+ *   注:runner 的 platformKey(LLM 调用用)仍由 route 直接读 header/route 传入,与此 owner 解耦。
+ */
+export const resolveTaskOwner = (c: Context): string =>
+  isSsoStrict() ? resolveActor(c) : resolvePlatformCtx(c).platformKey
+
+/**
+ * Asset store 的 owner(P2.5 owner-scoped;值直接作 store key,不再二次指纹)。
+ * - 严格模式:resolveActor(c)——SSO user(缺/错 proof 抛 SsoAuthError → 401)。
+ * - legacy(默认关):mivo-key 指纹(**当前行为零变化**)。
+ */
+export const resolveAssetOwner = (c: Context): string =>
+  isSsoStrict() ? resolveActor(c) : fingerprintOfPlatformKey(resolvePlatformCtx(c).platformKey)
+
+/**
+ * 顶层 onError 处理器:严格模式下 SsoAuthError(由 sub-app 内 resolveActor 等抛出)→ 401。
+ * 这是可靠 catch 点——`app.route(path, subApp)` 下 sub-app handler 抛错由顶层 onError 统一处理
+ * (父级 `app.use` 的 try/catch 跨 sub-app 不可靠)。非 SsoAuthError 回退 Hono 默认 500(行为不变)。
+ * 挂载于 `app.onError(ssoAuthErrorHandler)`(app.ts + persistTestApp)。
+ */
+export const ssoAuthErrorHandler: ErrorHandler<AppEnv> = (err, c) => {
+  if (err instanceof SsoAuthError) {
+    return c.json({ error: 'unauthorized', message: err.reason }, 401)
+  }
+  // 非 SSO 错误:回退 Hono 默认 500(不改变现有非严格模式行为)
+  return c.text('Internal Server Error', 500)
+}

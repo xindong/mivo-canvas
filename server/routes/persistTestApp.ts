@@ -5,6 +5,7 @@
 // T1.4:同时挂 members / share-links / share-access 路由 + fresh 内存 permission backend;返回 permissions 供测试 reset。
 import { Hono } from 'hono'
 import type { AppEnv } from '../lib/types'
+import { ssoAuthErrorHandler } from '../lib/owner'
 import { createProjectsRoutes } from './projects'
 import { createCanvasRoutes } from './canvas'
 import { createUserStateRoutes } from './userState'
@@ -23,6 +24,9 @@ export const buildPersistApp = (): {
   const backend = new InMemoryPersistBackend()
   const permissions = new InMemoryPermissionBackend()
   const app = new Hono<AppEnv>()
+  // G2.1: mirror app.ts — top-level onError catches strict-mode SsoAuthError → 401.
+  // Inert in non-strict mode (default; existing route tests unaffected).
+  app.onError(ssoAuthErrorHandler)
   app.route('/api/projects', createProjectsRoutes({ backend, permissions }))
   app.route('/api/projects', createMembersRoutes({ backend, permissions }))
   app.route('/api/projects', createShareLinksRoutes({ backend, permissions }))

@@ -14,6 +14,7 @@ import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { resolveFeatureFlags } from './lib/env'
 import type { AppEnv } from './lib/types'
+import { ssoAuthErrorHandler } from './lib/owner'
 import { generateHandler } from './routes/generate'
 import { editHandler } from './routes/edit'
 import { enhanceHandler } from './routes/enhance'
@@ -87,6 +88,16 @@ if (vdProbeToken) {
 // Auth routes — dev stub /api/auth/me only. Production /api/auth/me is provided by
 // the SSO gateway (nginx intercepts); this mount is for local dev / e2e.
 app.route('/api/auth', authRoute)
+
+// G2.1 (cutover §5): SSO auth error boundary (top-level onError). Catches
+// SsoAuthError thrown by resolveActor / resolveTaskOwner / resolveAssetOwner inside
+// any sub-app handler in strict mode (MIVO_SSO_STRICT=1: missing/wrong gateway
+// secret·header → 401, NO fingerprint fallback) and returns 401. Inert in non-strict
+// mode (default off → resolveActor never throws SsoAuthError → falls through to the
+// default 500 path unchanged → production zero change). Covers all /api persistence
+// routes (projects/canvas/userState/assets/tasks/members/shareLinks); stateless /api
+// routes (generate/edit/keys) don't call resolveActor → never throw → unaffected.
+app.onError(ssoAuthErrorHandler)
 
 // P1-c generate/edit/enhance routes. app.all lets each handler enforce POST-only
 // (non-POST → 405 {error:'Method not allowed'}), matching dev middleware semantics
