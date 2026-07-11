@@ -2,8 +2,9 @@
 # MivoCanvas P1 后端底座 PG(provisioning)。lead/owner 确认后才在服务器实操(见
 # docs/runbook/t1.1-pg-provisioning.md)。严禁本地 docker compose up,只做 config 校验。
 #
-# 要点:PG 16-alpine;数据卷 bind /AIGC_Group/mivo-canvas-data/pg;仅绑 127.0.0.1:5432
-# (不对外);密码走 .env(.env.example 是模板,真实 .env 不入库);healthcheck + restart
+# 要点:PG 16-alpine;数据卷 bind /AIGC_Group/mivo-canvas-data/pg;仅绑 127.0.0.1:宿主端口走
+# MIVO_PG_HOST_PORT(默认 5432,共享机端口冲突时改;容器内恒 5432,healthcheck 不变);
+# 密码走 .env(.env.example 是模板,真实 .env 不入库);healthcheck + restart
 # policy + 资源限制 + 日志轮转。
 # 语法校验:docker compose --env-file ops/postgres/.env.example -f ops/postgres/docker-compose.yml config
 #
@@ -18,8 +19,9 @@ services:
     container_name: mivo-postgres
     restart: unless-stopped
     # 仅绑 127.0.0.1:不对外,只能本机/BFF 访问(生产如需远程走 ssh tunnel 或网关,不在本文件)。
+    # 宿主端口走 MIVO_PG_HOST_PORT(默认 5432;共享机 5432 被占时改 .env,容器内恒 5432)。
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:${MIVO_PG_HOST_PORT:-5432}:5432"
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-mivo}
       # :? 强制 .env 必填(空/缺即拒起),避免裸密码入库。
