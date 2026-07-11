@@ -486,6 +486,7 @@ jobs:
           npx vitest run --no-fileParallelism --passWithNoTests \
             server/persist/backend.contract.dual.test.ts \
             server/persist/backend.pg.test.ts \
+            server/persist/permissionBackend.contract.dual.test.ts \
             server/routes/persist.route.dual.test.ts 2>&1 | tee test-artifacts/pg-suite.log
 
       # 汇总:本轮 0 个 PG 文件(infra-only)还是真跑了 N 个(#202 合入后)。不许静默。

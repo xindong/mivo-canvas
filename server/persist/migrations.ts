@@ -79,6 +79,46 @@ DROP TABLE IF EXISTS projects;
 DROP TABLE IF EXISTS persist_records;
 `
 
+// T1.4 权限层 schema(project_members + share_links)。独立第二个 migration,排在 initial 之后(字典序 002)。
+// 权威:docs/decisions/permission-schema.md + server/persist/migrations/001_permissions.sql(vanilla DDL 草案)。
+// 设计:权限表不带 revision(成员资格/分享是 owner 权威写,非 CRDT LWW);share_links 软删用 revoked_at(FX-7)。
+// FK:project_id REFERENCES projects(id) ON DELETE CASCADE(project purge → members/links 清;projects 表由 001 建,
+// 本迁移在 001 之后 apply,FK 目标存在)。IF NOT EXISTS + migrator kysely_migration 追踪表 → 已建库重放安全。
+const PERMISSIONS_SCHEMA = sql`
+-- 成员资格(owner/editor/viewer)。一个 user 在一个 project 恰一 role(UNIQUE(project_id,user_id))。
+CREATE TABLE IF NOT EXISTS project_members (
+  id           TEXT        PRIMARY KEY,                      -- surrogate uuid(应用层生成)
+  project_id   TEXT        NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  user_id      TEXT        NOT NULL,                         -- maker user id(= SSO username,DP-4)
+  role         TEXT        NOT NULL CHECK (role IN ('owner', 'editor', 'viewer')),
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT project_members_project_user_unique UNIQUE (project_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_project_members_user_id ON project_members (user_id);
+CREATE INDEX IF NOT EXISTS idx_project_members_project_id ON project_members (project_id);
+
+-- 分享链接(token 驱动,permission ≤ edit,不授 owner)。revoked_at = FX-7 revoke 软删标记(30 天后 purge)。
+CREATE TABLE IF NOT EXISTS share_links (
+  id           TEXT        PRIMARY KEY,                      -- surrogate uuid
+  token        TEXT        NOT NULL UNIQUE,                  -- 密码学随机,不可枚举
+  project_id   TEXT        NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  permission   TEXT        NOT NULL CHECK (permission IN ('view', 'edit')),
+  created_by   TEXT        NOT NULL,                         -- 创建者 user id(须为 project owner)
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  revoked_at   TIMESTAMPTZ,                                   -- NULL=活;非空=revoke(FX-7 软删)
+  expires_at   TIMESTAMPTZ                                    -- 可选过期(NULL=不过期)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_share_links_token ON share_links (token);
+CREATE INDEX IF NOT EXISTS idx_share_links_project_id ON share_links (project_id);
+`
+
+const DROP_PERMISSIONS_SCHEMA = sql`
+DROP TABLE IF EXISTS share_links;
+DROP TABLE IF EXISTS project_members;
+`
+
 /** migrations 以 ISO 日期前缀排序;migrator 按 key 字典序应用。 */
 export const migrations: Record<string, Migration> = {
   '2026_07_11_001_initial_persist_schema': {
@@ -87,6 +127,14 @@ export const migrations: Record<string, Migration> = {
     },
     async down(db): Promise<void> {
       await DROP_SCHEMA.execute(db)
+    },
+  },
+  '2026_07_11_002_permissions_schema': {
+    async up(db): Promise<void> {
+      await PERMISSIONS_SCHEMA.execute(db)
+    },
+    async down(db): Promise<void> {
+      await DROP_PERMISSIONS_SCHEMA.execute(db)
     },
   },
 }

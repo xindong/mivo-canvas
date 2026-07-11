@@ -12,16 +12,20 @@ import { createProjectsRoutes } from './projects'
 import { createCanvasRoutes } from './canvas'
 import { createUserStateRoutes } from './userState'
 import { PgPersistBackend } from '../persist/pgBackend'
+import { InMemoryPermissionBackend } from '../lib/permissions'
 import { hdr, KEY_A, req, canonicalNode, wirePayload } from './persistTestApp'
 
 const PG_TEST_ENABLED = process.env.MIVO_PG_TEST === '1'
 let pgBackend: PgPersistBackend | undefined
+// T1.4: persist route smoke 不验权限逻辑(只钉 PG persist swap 等价性);permission backend 用内存即可
+// (authz 派生 owner 判定在内存下成立;permission 表无状态注入)。PG 权限契约由 permissionBackend.contract.dual.test.ts 覆盖。
+const pgPermissions = new InMemoryPermissionBackend()
 
 const buildPgApp = (): Hono<AppEnv> => {
   if (!pgBackend) throw new Error('pg backend not initialized')
   const app = new Hono<AppEnv>()
-  app.route('/api/projects', createProjectsRoutes({ backend: pgBackend }))
-  app.route('/api/canvas', createCanvasRoutes({ backend: pgBackend }))
+  app.route('/api/projects', createProjectsRoutes({ backend: pgBackend, permissions: pgPermissions }))
+  app.route('/api/canvas', createCanvasRoutes({ backend: pgBackend, permissions: pgPermissions }))
   app.route('/api/user-state', createUserStateRoutes({ backend: pgBackend }))
   return app
 }

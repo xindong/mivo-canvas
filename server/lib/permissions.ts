@@ -104,8 +104,14 @@ export interface PermissionBackend {
   /** un-revoke 某 project 全部分享链接(FX-7 project 恢复级联用;30 天窗内才恢复)。 */
   unRevokeAllForProject(projectId: string): Promise<{ count: number }>
 
-  /** Test-only:清空。 */
-  __reset(): void
+  /** Test-only:清空。memory 同步 void;PG 异步 TRUNCATE(Promise<void>)。返回类型放宽,两类 backend 共用接口。 */
+  __reset(): void | Promise<void>
+
+  /**
+   * backend 就绪 promise(memory 立即 resolve;PG 跑 migrations 建表)。app 启动(server/index.ts serve 前)
+   * await 之,确保权限表已建。additive 字段——内存实现 Promise.resolve(),PG 落地后新增,路由/契约零改动。
+   */
+  readonly ready: Promise<void>
 }
 
 const nowIso = (): string => new Date().toISOString()
@@ -132,6 +138,8 @@ export class InMemoryPermissionBackend implements PermissionBackend {
   private readonly links = new Map<string, ShareLink>()
   private readonly linksByToken = new Map<string, string>()
   private readonly linksByProject = new Map<string, string[]>()
+  /** additive(PG 落地后接口新增):内存 backend 立即就绪。 */
+  readonly ready: Promise<void> = Promise.resolve()
 
   private memberBucket(projectId: string): Map<string, ProjectMember> {
     let b = this.members.get(projectId)
