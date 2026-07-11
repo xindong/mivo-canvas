@@ -13,6 +13,7 @@ import { describe, it, expect, beforeEach, beforeAll, afterAll } from 'vitest'
 import {
   InMemoryPermissionBackend,
   type PermissionBackend,
+  type CompensationOp,
 } from '../lib/permissions'
 import { PgPermissionBackend } from './pgPermissionBackend'
 
@@ -23,6 +24,7 @@ const runPermissionBackendContractSuite = (
   resetBackend: (b: PermissionBackend) => void | Promise<void>,
   seedProject: (b: PermissionBackend, projectId: string, ownerId: string) => void | Promise<void>,
   setLinkRevokedAt: (b: PermissionBackend, linkId: string, revokedAtIso: string) => boolean | Promise<boolean>,
+  setCompensationFault: (b: PermissionBackend, op: CompensationOp, throwCount: number) => void,
 ): void => {
   describe(`${label} — 成员资格:角色派生 + CRUD + 反查`, () => {
     let b: PermissionBackend
@@ -223,6 +225,106 @@ const runPermissionBackendContractSuite = (
       expect(byId[l3.id]).toBeTruthy() // 超 30 天,仍 revoked
     })
   })
+
+  describe(`${label} — P-6 saga 补偿:restore/delete 两步写第二步失败可重试收敛`, () => {
+    let b: PermissionBackend
+    beforeEach(async () => {
+      b = makeBackend()
+      await resetBackend(b)
+      await seedProject(b, 'p1', 'ownerA')
+    })
+
+    it('attemptCompensation 无 pending → nothing-pending(不建意图,不跑 step)', async () => {
+      const r = await b.attemptCompensation('p1', 'restore')
+      expect(r).toEqual({ kind: 'nothing-pending', op: 'restore' })
+      expect(await b.listCompensations('p1')).toEqual([])
+    })
+
+    it('recordCompensation 建 pending 意图;再 record 同 op 幂等返同一 pending(不重复)', async () => {
+      const a = await b.recordCompensation('p1', 'restore')
+      expect(a.status).toBe('pending')
+      expect(a.attemptCount).toBe(0)
+      expect(a.lastError).toBeNull()
+      expect(a.lastAttemptedAt).toBeNull()
+      const a2 = await b.recordCompensation('p1', 'restore')
+      expect(a2.id).toBe(a.id) // 幂等:同 pending 不重复建
+      expect(await b.listCompensations('p1')).toHaveLength(1)
+    })
+
+    it('restore:record + attempt → completed(unRevoke 级联跑);意图 done,attemptCount=1,链接恢复 active', async () => {
+      const link = await b.createShareLink('p1', 'view', 'ownerA')
+      await b.revokeShareLink(link.id, 'p1') // 模拟 project 曾软删(链接 revoked)
+      expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('revoked')
+      await b.recordCompensation('p1', 'restore')
+      const r = await b.attemptCompensation('p1', 'restore')
+      expect(r.kind).toBe('completed')
+      if (r.kind === 'completed') { expect(r.attempts).toBe(1); expect(r.count).toBe(1) }
+      expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('active')
+      const ints = await b.listCompensations('p1')
+      expect(ints[0].status).toBe('done')
+      expect(ints[0].attemptCount).toBe(1)
+      expect(ints[0].lastError).toBeNull()
+      expect(ints[0].lastAttemptedAt).toBeTruthy()
+    })
+
+    it('restore:故障注入 unRevoke 抛错 → failed(意图 pending,链接仍 revoked);重试 → completed 收敛(无"永久 revoked"终态)', async () => {
+      const link = await b.createShareLink('p1', 'view', 'ownerA')
+      await b.revokeShareLink(link.id, 'p1')
+      await b.recordCompensation('p1', 'restore')
+      setCompensationFault(b, 'restore', 1) // 下次 attempt 的 step 强制失败 1 次(自减)
+      const r1 = await b.attemptCompensation('p1', 'restore')
+      expect(r1.kind).toBe('failed')
+      if (r1.kind === 'failed') { expect(r1.attempts).toBe(1); expect(r1.error).toBeTruthy() }
+      // 第二步失败 → 链接仍 revoked(未 unRevoke);意图 pending,可观察字段已更新
+      expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('revoked')
+      let ints = await b.listCompensations('p1')
+      expect(ints[0].status).toBe('pending')
+      expect(ints[0].attemptCount).toBe(1)
+      expect(ints[0].lastError).toBeTruthy()
+      expect(ints[0].lastAttemptedAt).toBeTruthy()
+      // 幂等重入 attempt:故障已自减为 0 → step 跑通 → 收敛
+      const r2 = await b.attemptCompensation('p1', 'restore')
+      expect(r2.kind).toBe('completed')
+      if (r2.kind === 'completed') expect(r2.attempts).toBe(2)
+      expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('active') // 链接最终恢复
+      ints = await b.listCompensations('p1')
+      expect(ints[0].status).toBe('done')
+      expect(ints[0].attemptCount).toBe(2)
+      expect(ints[0].lastError).toBeNull()
+    })
+
+    it('restore:done 后再 attempt → nothing-pending(不重复跑,无 spurious)', async () => {
+      await b.recordCompensation('p1', 'restore')
+      await b.attemptCompensation('p1', 'restore') // completed
+      const r = await b.attemptCompensation('p1', 'restore') // 已 done → 无 pending
+      expect(r).toEqual({ kind: 'nothing-pending', op: 'restore' })
+    })
+
+    it('delete:故障注入 revoke 抛错 → failed(链接仍 active);重试 → completed 收敛(链接最终 revoked)', async () => {
+      const link = await b.createShareLink('p1', 'view', 'ownerA')
+      expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('active')
+      await b.recordCompensation('p1', 'delete')
+      setCompensationFault(b, 'delete', 1)
+      const r1 = await b.attemptCompensation('p1', 'delete')
+      expect(r1.kind).toBe('failed')
+      expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('active') // revoke 失败 → 仍 active
+      const r2 = await b.attemptCompensation('p1', 'delete')
+      expect(r2.kind).toBe('completed')
+      if (r2.kind === 'completed') expect(r2.count).toBe(1)
+      expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('revoked') // 最终 revoked
+      const ints = await b.listCompensations('p1')
+      expect(ints[0].status).toBe('done')
+    })
+
+    it('listCompensations:newest first;restore + delete 多 op 共存', async () => {
+      await b.recordCompensation('p1', 'restore')
+      await b.recordCompensation('p1', 'delete')
+      const ints = await b.listCompensations('p1')
+      expect(ints).toHaveLength(2)
+      expect(ints[0].op).toBe('delete') // 后建的 delete 排前(newest first)
+      expect(ints[1].op).toBe('restore')
+    })
+  })
 }
 
 // ── memory 后端(永远跑)──────────────────────────────────────────────────────────────
@@ -233,6 +335,7 @@ runPermissionBackendContractSuite(
   // memory 无 FK → seedProject no-op
   () => {},
   (b, id, iso) => (b as InMemoryPermissionBackend).__setLinkRevokedAtForTest(id, iso),
+  (b, op, n) => (b as InMemoryPermissionBackend).__setCompensationFaultForTest(op, n),
 )
 
 // ── PG 后端(gate:MIVO_PG_TEST=1;本地 brew PG port 55443)─────────────────────────────────
@@ -265,5 +368,6 @@ let pgPermBackend: PgPermissionBackend | undefined
     (b) => b.__reset(),
     (b, pid, owner) => (b as PgPermissionBackend).__seedProjectForTest(pid, owner),
     (b, id, iso) => (b as PgPermissionBackend).__setLinkRevokedAtForTest(id, iso),
+    (b, op, n) => (b as PgPermissionBackend).__setCompensationFaultForTest(op, n),
   )
 })

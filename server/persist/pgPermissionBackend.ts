@@ -28,6 +28,9 @@ import type {
   RemoveMemberResult,
   RevokeResult,
   UnRevokeResult,
+  CompensationOp,
+  CompensationIntent,
+  CompensationOutcome,
 } from '../lib/permissions'
 import { UNREVOKE_WINDOW_MS } from '../lib/permissions'
 import type { ProjectRole, SharePermission } from '../lib/authz'
@@ -52,9 +55,22 @@ interface ShareLinksTable {
   revoked_at: Date | null
   expires_at: Date | null
 }
+// P-6 saga 补偿意图表(003 migration 建)。无 revision(owner 权威写);attempt_count/last_error/last_attempted_at=可观察。
+interface ShareLinkCompensationsTable {
+  id: string
+  project_id: string
+  op: string // 'restore'|'delete'(DB CHECK 强制;读出后 cast)
+  status: string // 'pending'|'done'(DB CHECK 强制;读出后 cast)
+  attempt_count: number
+  last_error: string | null
+  last_attempted_at: Date | null
+  created_at: Generated<Date>
+  updated_at: Generated<Date>
+}
 interface PermissionDatabase {
   project_members: ProjectMembersTable
   share_links: ShareLinksTable
+  share_link_compensations: ShareLinkCompensationsTable
 }
 
 /** 密码学随机 token(256-bit,base64url ≈ 43 chars;不可枚举,§1.2)。与内存实现同算法,route 测试断言一致。 */
@@ -81,6 +97,19 @@ const rowToShareLink = (row: Selectable<ShareLinksTable>): ShareLink => ({
   updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : String(row.updated_at),
   revokedAt: row.revoked_at ? (row.revoked_at instanceof Date ? row.revoked_at.toISOString() : String(row.revoked_at)) : null,
   expiresAt: row.expires_at ? (row.expires_at instanceof Date ? row.expires_at.toISOString() : String(row.expires_at)) : null,
+})
+
+/** DB 行 → P-6 CompensationIntent。 */
+const rowToCompensation = (row: Selectable<ShareLinkCompensationsTable>): CompensationIntent => ({
+  id: row.id,
+  projectId: row.project_id,
+  op: row.op as CompensationOp,
+  status: row.status as 'pending' | 'done',
+  attemptCount: row.attempt_count,
+  lastError: row.last_error,
+  lastAttemptedAt: row.last_attempted_at instanceof Date ? row.last_attempted_at.toISOString() : (row.last_attempted_at ? String(row.last_attempted_at) : null),
+  createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at),
+  updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : String(row.updated_at),
 })
 
 // ── Migration provider(静态列表,免 FileMigrationProvider 路径解析;与 PgPersistBackend 同模式)──────────
@@ -118,6 +147,8 @@ export class PgPermissionBackend implements PermissionBackend {
   private readonly db: Kysely<PermissionDatabase>
   /** ready:migrations 完成建表(无 warm cache——权限无同步 seam)。app 启动 await 后再 serve。 */
   readonly ready: Promise<void>
+  /** P-6 Test-only 故障注入:op → 剩余强制失败次数(attemptCompensation 内消费,不污染 unRevoke/revoke 本身)。 */
+  private readonly compensationFault: Partial<Record<CompensationOp, number>> = {}
 
   constructor(conn: PgConnectionConfig) {
     this.db = new Kysely<PermissionDatabase>({
@@ -345,14 +376,100 @@ export class PgPermissionBackend implements PermissionBackend {
     return { count: rows.length }
   }
 
+  // ── P-6 saga 补偿(restore/delete 第二步失败可重试收敛)──
+  // step(unRevoke/revoke)是幂等单语句;故 SELECT-then-step-then-UPDATE 非原子也安全:
+  //   step 成功但 UPDATE done 崩 → 链接已恢复/吊销,意图留 pending → 重入重试(幂等,count=0)→ done。收敛。
+
+  async recordCompensation(projectId: string, op: CompensationOp): Promise<CompensationIntent> {
+    await this.ready
+    return this.db.transaction().execute(async (trx) => {
+      // 幂等:已有 pending → 返之(不重复)。FOR UPDATE 锁行防并发重复建意图。
+      const existing = await trx.selectFrom('share_link_compensations').selectAll()
+        .where('project_id', '=', projectId)
+        .where('op', '=', op)
+        .where('status', '=', 'pending')
+        .orderBy('created_at', 'desc')
+        .forUpdate()
+        .executeTakeFirst()
+      if (existing) return rowToCompensation(existing)
+      const row = await trx.insertInto('share_link_compensations')
+        .values({
+          id: randomUUID(),
+          project_id: projectId,
+          op,
+          status: 'pending',
+          attempt_count: 0,
+          last_error: null,
+          last_attempted_at: null,
+        })
+        .returningAll()
+        .executeTakeFirst()
+      if (!row) throw new Error('recordCompensation: insert failed (FK violation — project missing?)')
+      return rowToCompensation(row)
+    })
+  }
+
+  async attemptCompensation(projectId: string, op: CompensationOp): Promise<CompensationOutcome> {
+    await this.ready
+    // SELECT pending(无锁:step 幂等;并发两 attempt 安全,WHERE status='pending' 的 UPDATE 防覆盖)。
+    const row = await this.db.selectFrom('share_link_compensations').selectAll()
+      .where('project_id', '=', projectId)
+      .where('op', '=', op)
+      .where('status', '=', 'pending')
+      .orderBy('created_at', 'desc')
+      .executeTakeFirst()
+    if (!row) return { kind: 'nothing-pending', op }
+    const intent = rowToCompensation(row)
+    const attempts = intent.attemptCount + 1
+    // Test-only 故障注入:decrement 后 throw(语义等价"第二步抛错");不污染 unRevoke/revoke 本身。
+    const fault = this.compensationFault[op] ?? 0
+    try {
+      if (fault > 0) {
+        this.compensationFault[op] = fault - 1
+        throw new Error(`[compensation-fault] ${op} step forced failure (was ${fault})`)
+      }
+      const r = op === 'restore'
+        ? await this.unRevokeAllForProject(projectId)
+        : await this.revokeAllForProject(projectId)
+      // mark done(WHERE status='pending' 防并发覆盖;0 行=并发已 done,幂等)。
+      await this.db.updateTable('share_link_compensations')
+        .set({ status: 'done', attempt_count: attempts, last_error: null, last_attempted_at: new Date(), updated_at: new Date() })
+        .where('id', '=', intent.id)
+        .where('status', '=', 'pending')
+        .execute()
+      return { kind: 'completed', op, count: r.count, attempts, intentId: intent.id }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      await this.db.updateTable('share_link_compensations')
+        .set({ attempt_count: attempts, last_error: msg, last_attempted_at: new Date(), updated_at: new Date() })
+        .where('id', '=', intent.id)
+        .where('status', '=', 'pending')
+        .execute()
+      return { kind: 'failed', op, error: msg, attempts, intentId: intent.id }
+    }
+  }
+
+  async listCompensations(projectId: string): Promise<CompensationIntent[]> {
+    await this.ready
+    const rows = await this.db.selectFrom('share_link_compensations').selectAll()
+      .where('project_id', '=', projectId)
+      .orderBy('created_at', 'desc')
+      .execute()
+    return rows.map(rowToCompensation)
+  }
+
   // ── Test-only helpers(与 InMemoryPermissionBackend 对偶;双后端契约测试用)──────────────
 
-  /** Test-only:清空权限两表(projects 表归 persist backend,不动;TRUNCATE 等效 DELETE,异步)。 */
+  /** Test-only:清空权限三表(projects 表归 persist backend,不动;TRUNCATE 等效 DELETE,异步)。 */
   async __reset(): Promise<void> {
     await this.db.transaction().execute(async (trx) => {
+      await trx.deleteFrom('share_link_compensations').execute()
       await trx.deleteFrom('share_links').execute()
       await trx.deleteFrom('project_members').execute()
     })
+    // 故障注入计数也清(防跨用例泄漏)。
+    delete this.compensationFault.restore
+    delete this.compensationFault.delete
   }
 
   /** Test-only:把某 link 的 revoked_at 设为指定 ISO(测 30 天 un-revoke 窗;FX-7 §5.9;与内存实现对偶)。 */
@@ -367,5 +484,14 @@ export class PgPermissionBackend implements PermissionBackend {
    */
   async __seedProjectForTest(projectId: string, ownerId: string): Promise<void> {
     await sql`INSERT INTO projects (id, owner_id, is_deleted) VALUES (${projectId}, ${ownerId}, false) ON CONFLICT (id) DO NOTHING`.execute(this.db)
+  }
+
+  /** Test-only:注入 op 补偿步骤强制失败 N 次(消费在 attemptCompensation;不污染 unRevoke/revoke 本身;与内存对偶)。 */
+  __setCompensationFaultForTest(op: CompensationOp, throwCount: number): void {
+    this.compensationFault[op] = throwCount
+  }
+  /** Test-only:清除 op 补偿故障注入。 */
+  __clearCompensationFaultForTest(op: CompensationOp): void {
+    delete this.compensationFault[op]
   }
 }

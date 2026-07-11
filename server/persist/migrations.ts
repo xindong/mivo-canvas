@@ -119,6 +119,28 @@ DROP TABLE IF EXISTS share_links;
 DROP TABLE IF EXISTS project_members;
 `
 
+// P-6 saga 补偿意图表(share_link_compensations)。独立第三个 migration:已建库 001/002 已被 kysely_migration
+// 追踪表标记 applied,改既有 migration 不会重跑——必须新 migration 才能在已迁移 DB 建表。FK 同权限两表:
+// project_id → projects(id) ON DELETE CASCADE(project purge → 补偿意图清)。无 revision(owner 权威写,非 CRDT LWW)。
+// attempt_count/last_error/last_attempted_at 是"可观察状态"(saga 非黑盒,可查可调试)。
+const COMPENSATIONS_SCHEMA = sql`
+CREATE TABLE IF NOT EXISTS share_link_compensations (
+  id                TEXT        PRIMARY KEY,                     -- surrogate uuid(应用层生成)
+  project_id        TEXT        NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  op                TEXT        NOT NULL CHECK (op IN ('restore', 'delete')),
+  status            TEXT        NOT NULL CHECK (status IN ('pending', 'done')),
+  attempt_count     INTEGER     NOT NULL DEFAULT 0,
+  last_error        TEXT,
+  last_attempted_at TIMESTAMPTZ,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_compensations_project_op ON share_link_compensations (project_id, op);
+`
+const DROP_COMPENSATIONS_SCHEMA = sql`
+DROP TABLE IF EXISTS share_link_compensations;
+`
+
 /** migrations 以 ISO 日期前缀排序;migrator 按 key 字典序应用。 */
 export const migrations: Record<string, Migration> = {
   '2026_07_11_001_initial_persist_schema': {
@@ -135,6 +157,14 @@ export const migrations: Record<string, Migration> = {
     },
     async down(db): Promise<void> {
       await DROP_PERMISSIONS_SCHEMA.execute(db)
+    },
+  },
+  '2026_07_12_003_share_link_compensations': {
+    async up(db): Promise<void> {
+      await COMPENSATIONS_SCHEMA.execute(db)
+    },
+    async down(db): Promise<void> {
+      await DROP_COMPENSATIONS_SCHEMA.execute(db)
     },
   },
 }

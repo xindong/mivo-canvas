@@ -55,6 +55,35 @@ export type UnRevokeResult =
   | { ok: true; link: ShareLink }
   | { ok: false; reason: 'not-found' | 'window-closed' } // window-closed:revoke 超 30 天,不可恢复(FX-7 §5.9)
 
+// ── P-6 saga 补偿(restore/delete 两步写:persist 恢复/软删 + permission unRevoke/revoke)──
+// 问题:第二步失败留永久 revoked(delete 方向是 active)链接;且 POST/DELETE 幂等成功后不再重试第二步。
+// 解:补偿意图落持久层(非内存变量),第二步失败可重试收敛;幂等重入补跑而非跳过。从简:无任务框架/通用队列。
+
+/** 补偿 op:restore → unRevokeAllForProject 级联;delete → revokeAllForProject 级联。 */
+export type CompensationOp = 'restore' | 'delete'
+
+/**
+ * 可观察补偿意图(持久层:跨请求存活;InMemory 重启清空同其它权限数据,PG 跨重启)。
+ * attemptCount / lastError / lastAttemptedAt 是"可观察状态"——saga 不是黑盒,可查可调试。
+ */
+export type CompensationIntent = {
+  id: string
+  projectId: string
+  op: CompensationOp
+  status: 'pending' | 'done'
+  attemptCount: number
+  lastError: string | null
+  lastAttemptedAt: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+/** attemptCompensation 结果(可观察;route 用于日志)。 */
+export type CompensationOutcome =
+  | { kind: 'nothing-pending'; op: CompensationOp }
+  | { kind: 'completed'; op: CompensationOp; count: number; attempts: number; intentId: string }
+  | { kind: 'failed'; op: CompensationOp; error: string; attempts: number; intentId: string }
+
 /** FX-7 §5.9 un-revoke 30 天保留窗(超期不可恢复,purge 由 FX-7 定时落地)。 */
 export const UNREVOKE_WINDOW_MS = 30 * 24 * 60 * 60 * 1000
 
@@ -104,6 +133,21 @@ export interface PermissionBackend {
   /** un-revoke 某 project 全部分享链接(FX-7 project 恢复级联用;30 天窗内才恢复)。 */
   unRevokeAllForProject(projectId: string): Promise<{ count: number }>
 
+  // ── P-6 saga 补偿(restore/delete 第二步失败可重试收敛)──
+  /**
+   * 记录一条 pending 补偿意图。幂等:(projectId, op) 已有 pending → 返之(不重复);否则新建。
+   * route 命中"刚发生真实级联"(POST restored / DELETE 软删成功)时调。
+   */
+  recordCompensation(projectId: string, op: CompensationOp): Promise<CompensationIntent>
+  /**
+   * 尝试收敛 (projectId, op) 的 pending 意图:无 pending → nothing-pending;有 pending → 跑 step
+   * (restore=unRevokeAllForProject,delete=revokeAllForProject),成功标记 done,失败 bump 可观察字段保持 pending。
+   * 幂等重入调用它收敛(route 在 restored/existing + DELETE 两路径都调)。
+   */
+  attemptCompensation(projectId: string, op: CompensationOp): Promise<CompensationOutcome>
+  /** 可观察:列 project 全部补偿意图(newest first;调试/检查/验收用)。 */
+  listCompensations(projectId: string): Promise<CompensationIntent[]>
+
   /** Test-only:清空。memory 同步 void;PG 异步 TRUNCATE(Promise<void>)。返回类型放宽,两类 backend 共用接口。 */
   __reset(): void | Promise<void>
 
@@ -138,6 +182,11 @@ export class InMemoryPermissionBackend implements PermissionBackend {
   private readonly links = new Map<string, ShareLink>()
   private readonly linksByToken = new Map<string, string>()
   private readonly linksByProject = new Map<string, string[]>()
+  // P-6 saga 补偿意图存储(持久层:跨请求存活;重启清空同其它权限数据)。
+  private readonly compensations = new Map<string, CompensationIntent>()
+  private readonly compensationsByProject = new Map<string, string[]>() // newest first
+  /** Test-only 故障注入:op → 剩余强制失败次数(attemptCompensation 内消费,不污染 unRevoke/revoke 本身)。 */
+  private readonly compensationFault: Partial<Record<CompensationOp, number>> = {}
   /** additive(PG 落地后接口新增):内存 backend 立即就绪。 */
   readonly ready: Promise<void> = Promise.resolve()
 
@@ -325,12 +374,89 @@ export class InMemoryPermissionBackend implements PermissionBackend {
     return { count }
   }
 
+  // ── P-6 saga 补偿(实现)──
+
+  /** 找 (projectId, op) 最近一条 pending 意图(无 → undefined)。 */
+  private findPendingCompensation(projectId: string, op: CompensationOp): CompensationIntent | undefined {
+    const ids = this.compensationsByProject.get(projectId) ?? []
+    for (const id of ids) {
+      const it = this.compensations.get(id)
+      if (it && it.op === op && it.status === 'pending') return it
+    }
+    return undefined
+  }
+
+  async recordCompensation(projectId: string, op: CompensationOp): Promise<CompensationIntent> {
+    // 幂等:已有 pending → 返之(不重复),防重入 POST restored 重复建意图。
+    const pending = this.findPendingCompensation(projectId, op)
+    if (pending) return pending
+    const now = nowIso()
+    const intent: CompensationIntent = {
+      id: randomUUID(),
+      projectId,
+      op,
+      status: 'pending',
+      attemptCount: 0,
+      lastError: null,
+      lastAttemptedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    }
+    this.compensations.set(intent.id, intent)
+    const arr = this.compensationsByProject.get(projectId) ?? []
+    arr.unshift(intent.id) // newest first
+    this.compensationsByProject.set(projectId, arr)
+    return intent
+  }
+
+  async attemptCompensation(projectId: string, op: CompensationOp): Promise<CompensationOutcome> {
+    const intent = this.findPendingCompensation(projectId, op)
+    if (!intent) return { kind: 'nothing-pending', op }
+    const now = nowIso()
+    // Test-only 故障注入:在 attempt 内消费,不污染 unRevokeAllForProject / revokeAllForProject 本身。
+    // 语义等价于"第二步抛错":decrement 后 throw,被本方法 catch → 记 failCompensationAttempt 可观察字段。
+    const fault = this.compensationFault[op] ?? 0
+    try {
+      if (fault > 0) {
+        this.compensationFault[op] = fault - 1
+        throw new Error(`[compensation-fault] ${op} step forced failure (was ${fault})`)
+      }
+      const r = op === 'restore'
+        ? await this.unRevokeAllForProject(projectId)
+        : await this.revokeAllForProject(projectId)
+      const done: CompensationIntent = {
+        ...intent, status: 'done', attemptCount: intent.attemptCount + 1,
+        lastError: null, lastAttemptedAt: now, updatedAt: now,
+      }
+      this.compensations.set(intent.id, done)
+      return { kind: 'completed', op, count: r.count, attempts: done.attemptCount, intentId: intent.id }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      const failed: CompensationIntent = {
+        ...intent, attemptCount: intent.attemptCount + 1,
+        lastError: msg, lastAttemptedAt: now, updatedAt: now,
+      }
+      this.compensations.set(intent.id, failed)
+      return { kind: 'failed', op, error: msg, attempts: failed.attemptCount, intentId: intent.id }
+    }
+  }
+
+  async listCompensations(projectId: string): Promise<CompensationIntent[]> {
+    const ids = this.compensationsByProject.get(projectId) ?? []
+    return ids.map((id) => this.compensations.get(id)).filter((x): x is CompensationIntent => x !== undefined)
+  }
+
   __reset(): void {
     this.members.clear()
     this.sharedByUser.clear()
     this.links.clear()
     this.linksByToken.clear()
     this.linksByProject.clear()
+    this.compensations.clear()
+    this.compensationsByProject.clear()
+    // 故障注入计数也清(防跨用例泄漏)。
+    delete this.compensationFault.restore
+    delete this.compensationFault.delete
   }
 
   /** Test-only:把某 link 的 revokedAt 设为指定 ISO(测 30 天 un-revoke 窗;FX-7 §5.9)。 */
@@ -339,6 +465,15 @@ export class InMemoryPermissionBackend implements PermissionBackend {
     if (!link) return false
     this.links.set(linkId, { ...link, revokedAt: revokedAtIso })
     return true
+  }
+
+  /** Test-only:注入 op 补偿步骤强制失败 N 次(消费在 attemptCompensation;不污染 unRevoke/revoke 本身)。 */
+  __setCompensationFaultForTest(op: CompensationOp, throwCount: number): void {
+    this.compensationFault[op] = throwCount
+  }
+  /** Test-only:清除 op 补偿故障注入。 */
+  __clearCompensationFaultForTest(op: CompensationOp): void {
+    delete this.compensationFault[op]
   }
 }
 
