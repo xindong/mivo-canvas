@@ -400,12 +400,15 @@ jobs:
   # PG 后端测试(双后端契约 32 场景 + 并发回归)原在 CI 无 PG 全部 describe.skip。
   # 本 job 起 postgres:16 service container(与生产一致 PG16),跑 MIVO_PG_TEST=1 套件。
   # 观察窗已收口(#201/#202/#205/#206/#207/#208/#209 七 PR 全真跑全绿,仅一次 setup-node
-  # infra flake rerun 即绿):本 job 自本 PR 起为 required 阻断 job,已注册进 main 分支保护
-  # 必需 check(check 名 `CI / pg suite (PG16)`,仿 #186→#193 e2e-kernel-gate 先例)。
+  # infra flake rerun 即绿):本 job 自本 PR 起为 required 阻断 job(无 continue-on-error、
+  # 无 outcome-based warn,失败即 job 红)。
+  # lead 需把 check 名 `pg suite (PG16)` 加进 main 分支保护必需 check——本 PR 不动分支
+  # 保护配置(照 #186→#193 e2e-kernel-gate 先例:分支保护为 PR 外 lead 动作,与 workflow
+  # 改动分离)。分支保护加进后,PG 测试失败即阻断 PR 合并。
   #
   # 时序:#202 已于 2026-07-11 合入 main,四个 PG-gated 测试文件已在 main:
   #   backend.contract.dual / backend.pg / permissionBackend.contract.dual / persist.route.dual
-  # 故本 job 在每个 PR 上实跑真 PG 用例(契约 32 场景 + 并发回归),失败即阻断合并。
+  # 故本 job 在每个 PR 上实跑真 PG 用例(契约 32 场景 + 并发回归),失败即红。
   pg-suite:
     name: pg suite (PG16)
     if: github.event_name == 'pull_request'
