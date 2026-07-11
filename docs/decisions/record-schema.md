@@ -251,7 +251,7 @@ CanvasTask(mivoCanvas.ts:397-413:id/label/status/progress/stage?/nodeIds/preset?
 
 plan §3 DP-6:**chat 随文档域走 `/api/canvas` 子资源(messagesByScene 键随 canvas 生命周期),独立集合存储(D6),级联语义见 FX-7**。
 
-- scope:**document 域,per-canvas 独立 collection**(platform §13.1 明列 chat 消息在 document 域;§13.2 chatStore 消息 → document 域独立 collection 走同一 PersistAdapter)。
+- scope:**document 域,per-actor 私有 collection**(platform §13.1 明列 chat 消息在 document 域;§13.2 chatStore 消息 → document 域独立 collection 走同一 PersistAdapter)。**DP-6R(2026-07-12)**:chat-message envelope.ownerId=**actor**(写入者本人,per-actor 私有),PK=(actor,'chat-message',msgId)——两 actor 可在同 canvas 拥同 msgId;~~per-canvas 独立 collection(随画布分享)~~ 已订正为不随画布分享、成员互不可见。chat-collection 仍 per-canvas under canvas owner(仅 liveness,随 canvas 生命周期级联 FX-7),不含 per-actor 状态。chat 写入/reorder 不 bump 共享 canvas contentVersion;reorder 走 per-actor×canvas 独立 orderRevision(api-surface §4.2.3)。
 - 键:`messagesByScene: Record<string, ChatMessage[]>`(chatStore.ts:86),键 = sceneId(= canvasId)。迁移:每 canvas 一条 messages collection,随 canvas 生命周期级联(FX-7 软删语义)。
 - ChatMessage(chatStore.ts:65-83)17 字段:id/role/kind?/text/createdAt/status/enhance?/resultNodeIds?/origin?/error?/errorKind?/timeoutRetryKey?/timeoutRetryCount?/selectedNodeId?/selectedNodeType?/generationContext?/retryDisabledReason?/maskEdit?(runtime 不持久化,但 serverTaskId/sourceDeleted 持久化)。
 - **不在本文件展开到字段级 CRDT 映射**——chat 是独立 collection,字段级 schema 随 T1.3(4 API + PersistAdapter)定稿;本处只钉归属(document 域)+ 键语义(messagesByScene/canvasId)+ 级联随 FX-7。
