@@ -13,9 +13,17 @@
 // CanvasCommandDeferredError so the PR1/PR2 boundary is visible in test output.
 
 import { describe, expect, it, vi } from 'vitest'
-import { applyCanvasCommand, CanvasCommandDeferredError } from './canvasCommandExecutor'
+import {
+  applyCanvasCommand,
+  CanvasCommandDeferredError,
+  CanvasCommandInvalidPayloadError,
+} from './canvasCommandExecutor'
 import type { CanvasActionRuntime } from './canvasActionTypes'
-import { CANVAS_COMMAND_DEFERRED_KINDS } from './canvasCommand'
+import {
+  CANVAS_COMMAND_DEFERRED_KINDS,
+  deserializeCanvasCommand,
+  serializeCanvasCommand,
+} from './canvasCommand'
 
 /**
  * Build a fully-mocked CanvasActionRuntime. Only the method spies are exercised
@@ -377,6 +385,99 @@ describe('applyCanvasCommand — deferred (PR2 boundary)', () => {
       expect((error as CanvasCommandDeferredError).reason).toMatch(/asset|PR2|referenceAssetIds/)
     }
   })
+
+  it('mask-edit deferred throw carries the correct kind + reason (F1 apply seam)', () => {
+    const rt = createMockRuntime()
+    try {
+      applyCanvasCommand(
+        {
+          kind: 'mask-edit',
+          sourceNodeId: 'img',
+          prompt: 'p',
+          sourceSize: { width: 1, height: 1 },
+        },
+        rt,
+      )
+      throw new Error('expected throw')
+    } catch (error) {
+      expect(error).toBeInstanceOf(CanvasCommandDeferredError)
+      const deferred = error as CanvasCommandDeferredError
+      expect(deferred.commandKind).toBe('mask-edit')
+      expect(deferred.reason).toMatch(/asset|PR2|maskAssetId|markedImageAssetId/)
+    }
+  })
+})
+
+describe('applyCanvasCommand — invalid payload gating (F2)', () => {
+  // Malformed payloads pass deserializeCanvasCommand (kind-only, by design — deep
+  // validation is a T2.2+ collaboration-replay concern) but must NOT reach the
+  // runtime as a bare TypeError. validateCanvasCommandPayload runs before the
+  // switch and throws a tagged CanvasCommandInvalidPayloadError; the runtime spy
+  // must record zero calls. Payloads are constructed via deserialize to mirror the
+  // real attack path (untrusted JSON → deserialize → apply).
+  it('throws on missing required field (add-text-node missing position)', () => {
+    const rt = createMockRuntime()
+    const cmd = deserializeCanvasCommand(JSON.stringify({ kind: 'add-text-node' }))
+    expect(() => applyCanvasCommand(cmd, rt)).toThrow(CanvasCommandInvalidPayloadError)
+    expect(vi.mocked(rt.addTextNode)).not.toHaveBeenCalled()
+  })
+
+  it('throws on missing nodeId (delete-node)', () => {
+    const rt = createMockRuntime()
+    const cmd = deserializeCanvasCommand(JSON.stringify({ kind: 'delete-node' }))
+    expect(() => applyCanvasCommand(cmd, rt)).toThrow(CanvasCommandInvalidPayloadError)
+    expect(vi.mocked(rt.deleteNode)).not.toHaveBeenCalled()
+  })
+
+  it('throws on wrong-type array field (select-nodes nodeIds is a string)', () => {
+    const rt = createMockRuntime()
+    const cmd = deserializeCanvasCommand(
+      JSON.stringify({ kind: 'select-nodes', nodeIds: 'not-an-array' }),
+    )
+    expect(() => applyCanvasCommand(cmd, rt)).toThrow(CanvasCommandInvalidPayloadError)
+    expect(vi.mocked(rt.selectNodes)).not.toHaveBeenCalled()
+  })
+
+  it('throws on nested field missing (add-text-node position missing x/y)', () => {
+    const rt = createMockRuntime()
+    const cmd = deserializeCanvasCommand(JSON.stringify({ kind: 'add-text-node', position: {} }))
+    expect(() => applyCanvasCommand(cmd, rt)).toThrow(CanvasCommandInvalidPayloadError)
+    expect(vi.mocked(rt.addTextNode)).not.toHaveBeenCalled()
+  })
+
+  it('throws on non-finite numeric value after JSON (NaN → null; fail-closed)', () => {
+    // 顺带 (F2): JSON.stringify turns NaN / ±Infinity into null. A null where a
+    // finite number is required is caught by the minimal shape check — the command
+    // does not silently reach the runtime. -0 serializes to 0 (a valid coordinate)
+    // and is intentionally allowed.
+    const rt = createMockRuntime()
+    const json = serializeCanvasCommand({ kind: 'add-text-node', position: { x: NaN, y: 1 } })
+    expect(json).toContain('"x":null') // proves NaN serialized to null
+    const cmd = deserializeCanvasCommand(json)
+    expect(() => applyCanvasCommand(cmd, rt)).toThrow(CanvasCommandInvalidPayloadError)
+    expect(vi.mocked(rt.addTextNode)).not.toHaveBeenCalled()
+  })
+
+  it('tagged error carries commandKind + field + reason', () => {
+    const rt = createMockRuntime()
+    const cmd = deserializeCanvasCommand(JSON.stringify({ kind: 'delete-node' }))
+    let thrown: CanvasCommandInvalidPayloadError | undefined
+    try {
+      applyCanvasCommand(cmd, rt)
+    } catch (error) {
+      thrown = error as CanvasCommandInvalidPayloadError
+    }
+    expect(thrown).toBeInstanceOf(CanvasCommandInvalidPayloadError)
+    expect(thrown?.commandKind).toBe('delete-node')
+    expect(thrown?.field).toBe('nodeId')
+    expect(thrown?.reason).toContain('string')
+  })
+
+  it('does not regress: well-formed command still dispatches (negative control)', () => {
+    const rt = createMockRuntime()
+    applyCanvasCommand({ kind: 'delete-node', nodeId: 'a' }, rt)
+    expect(vi.mocked(rt.deleteNode)).toHaveBeenCalledWith('a')
+  })
 })
 
 /**
@@ -397,6 +498,13 @@ function buildDeferredCommand(kind: string): CanvasCommandForTest {
       return { kind } as CanvasCommandForTest
     case 'generate-from-annotation':
       return { kind } as CanvasCommandForTest
+    case 'mask-edit':
+      return {
+        kind,
+        sourceNodeId: 'n',
+        prompt: 'p',
+        sourceSize: { width: 1, height: 1 },
+      } as CanvasCommandForTest
     default:
       throw new Error(`buildDeferredCommand: ${kind} is not a deferred kind`)
   }

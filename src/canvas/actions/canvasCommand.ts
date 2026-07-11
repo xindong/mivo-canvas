@@ -48,6 +48,10 @@ import type {
   SelectionArrangeMode,
 } from '../../store/canvasStateTypes'
 import type { LayerMove } from './canvasActionTypes'
+// Type-only (verbatimModuleSyntax): erased at runtime, so canvasCommand stays free
+// of the overlay's DOM-canvas runtime while keeping mask shape 1:1 with the real
+// submit surface (ImageMaskSubmitPayload in imageMaskGeometry.ts).
+import type { ImageMaskBounds, MaskEditModelId, MaskEditSubject } from '../imageMaskGeometry'
 
 // ─── shared primitive shapes ───────────────────────────────────────────────────
 
@@ -190,12 +194,13 @@ export type CanvasCommand =
       position: CanvasCommandPoint
     }
   // ── Generation (PR1: type + round-trip only; apply deferred to PR2) ───────────
-  // The three "hard pieces" converge here: generation/edit reference images and
-  // mask-edit inputs are Blobs that must be two-stage uploaded to assetIds before
-  // the command is emitted. mask-edit (brush mask Blob → maskAssetId, or area
-  // maskBounds) is expressed as fields on generate-image-edit in PR2; this PR keeps
-  // the shape aligned with the runtime signature (sourceNodeId/operation/prompt/
-  // options) and defers apply because referenceAssetIds → File[] needs /api/assets.
+  // The three "hard pieces" (review-plan-a.md:43-48): import-asset, mask-edit, and
+  // generation/edit reference images. All carry Blobs that must be two-stage
+  // uploaded to assetIds before the command is emitted. generate-image-edit is the
+  // NON-mask edit path (operation + prompt + referenceAssetIds); the mask-edit hard
+  // piece has its OWN kind below (brush mask Blob + Set-of-Mark marked image Blob +
+  // geometry), 1:1 with the overlay's submit surface. Apply is deferred because
+  // referenceAssetIds / assetId → File[] needs /api/assets resolution (PR2).
   | {
       kind: 'generate-variations'
       sourceNodeId?: string
@@ -225,6 +230,40 @@ export type CanvasCommand =
       kind: 'generate-from-annotation'
       annotationNodeId?: string
       options?: CanvasCommandGenerationOptions
+    }
+  // ── Mask edit (PR1: type + round-trip only; apply deferred to PR2) ────────────
+  // The mask-edit hard piece (review-plan-a.md:45): serializable counterpart of
+  // ImageMaskSubmitPayload (src/canvas/imageMaskGeometry.ts). Two-stage asset rule:
+  // the two Blobs the overlay carries (brush mask PNG + Set-of-Mark marked image)
+  // are uploaded to /api/assets first, so this command references them by assetId;
+  // geometry (maskBounds + sourceSize) and scalars (quality/model/subjects) ride
+  // directly in the payload. canvasActionModel dispatches mask edit as its own menu
+  // item (onStartImageMaskEdit, :167-173) — 1:1 with a dedicated kind, not folded
+  // into generate-image-edit. Apply (PR2) resolves maskAssetId/markedImageAssetId →
+  // Blobs via /api/assets. brush fixture (mask from brush/point regions) and area
+  // fixture (mask from box/ellipse/loop regions) are both exercised in round-trip.
+  | {
+      kind: 'mask-edit'
+      /** Image node being locally repainted — mirrors ImageMaskEditOverlay's node.id. */
+      sourceNodeId: string
+      /** Composed final prompt (recognizer chips + user text) sent to the edit model. */
+      prompt: string
+      /** Two-stage: brush mask Blob (PNG) uploaded → assetId. Present when regions drew a mask. */
+      maskAssetId?: string
+      /** Two-stage: Set-of-Mark marked image Blob (full source copy + red anchor rings) → assetId. */
+      markedImageAssetId?: string
+      /** Geometry (direct): bbox of all mask regions in natural image pixels. */
+      maskBounds?: ImageMaskBounds
+      /** Geometry (direct): natural source image size (px) — drives mask canvas sizing. Required. */
+      sourceSize: CanvasCommandSize
+      /** Scalar: quality preset (model-dependent default; maskEditQualityFor). */
+      quality?: MivoImageQuality
+      /** Scalar: mask-edit model selector (gemini platform edit vs gpt alpha-mask inpainting). */
+      model?: MaskEditModelId
+      /** Scalar: single-anchor legacy recognizer label for what the selection contains. */
+      subjectLabel?: string
+      /** Geometry+labels (direct): per-marked-object label + bounds + edit action. */
+      subjects?: MaskEditSubject[]
     }
 
 // ─── kind registry (exhaustive with the union) ────────────────────────────────
@@ -264,14 +303,17 @@ export const CANVAS_COMMAND_KINDS = [
   'generate-beside-node',
   'generate-into-ai-slot',
   'generate-from-annotation',
+  'mask-edit',
 ] as const
 
 export type CanvasCommandKind = (typeof CANVAS_COMMAND_KINDS)[number]
 
 const CANVAS_COMMAND_KIND_SET: ReadonlySet<string> = new Set(CANVAS_COMMAND_KINDS)
 
-/** Kinds whose apply is implemented in THIS PR (sync document mutations). */
-export const CANVAS_COMMAND_APPLIED_KINDS: readonly string[] = [
+/** Kinds whose apply is implemented in THIS PR (sync document mutations).
+ * `as const` preserves the literal subset so the partition type guards below can
+ * check it against CanvasCommandKind; consumers treat it as a readonly kind list. */
+export const CANVAS_COMMAND_APPLIED_KINDS = [
   'add-text-node',
   'add-frame-node',
   'add-ai-slot-node',
@@ -299,17 +341,19 @@ export const CANVAS_COMMAND_APPLIED_KINDS: readonly string[] = [
   'show-all-hidden-nodes',
   'delete-node',
   'delete-selected-nodes',
-]
+] as const
 
-/** Deferred to the T2.3 second slice (PR2): two-stage asset + generation apply. */
-export const CANVAS_COMMAND_DEFERRED_KINDS: readonly string[] = [
+/** Deferred to the T2.3 second slice (PR2): two-stage asset + generation apply.
+ * `as const` preserves the literal subset for the partition type guards below. */
+export const CANVAS_COMMAND_DEFERRED_KINDS = [
   'import-asset',
   'generate-variations',
   'generate-image-edit',
   'generate-beside-node',
   'generate-into-ai-slot',
   'generate-from-annotation',
-]
+  'mask-edit',
+] as const
 
 // Compile-time drift guard: every CanvasCommand variant's `kind` must appear in
 // CANVAS_COMMAND_KINDS, and vice versa. If either side drifts this fails to
@@ -321,6 +365,30 @@ const _assertExhaustiveKinds: _UnionKind extends CanvasCommandKind
     : 'array-has-kind-not-in-union'
   : 'union-has-kind-not-in-array' = true
 void _assertExhaustiveKinds
+
+// Compile-time partition guard (F3②): APPLIED ∪ DEFERRED must exactly cover
+// CANVAS_KINDS with no missing/extra/typo'd kind. Disjointness (a kind listed in
+// BOTH) is NOT caught by union arithmetic — the disjoint + exact-count assertion
+// lives in canvasCommand.serialize.test.ts as a runtime check. Together they make
+// the partition a real gate: a new kind lands in the union only if it is also in
+// CANVAS_COMMAND_KINDS, and in exactly one of APPLIED / DEFERRED.
+type _AppliedKind = (typeof CANVAS_COMMAND_APPLIED_KINDS)[number]
+type _DeferredKind = (typeof CANVAS_COMMAND_DEFERRED_KINDS)[number]
+const _assertAppliedAreKinds: _AppliedKind extends CanvasCommandKind
+  ? true
+  : 'applied-list-has-non-kind' = true
+const _assertDeferredAreKinds: _DeferredKind extends CanvasCommandKind
+  ? true
+  : 'deferred-list-has-non-kind' = true
+type _Partition = _AppliedKind | _DeferredKind
+const _assertPartitionCoversAllKinds: CanvasCommandKind extends _Partition
+  ? _Partition extends CanvasCommandKind
+    ? true
+    : 'partition-has-extra-non-kind'
+  : 'partition-missing-a-kind' = true
+void _assertAppliedAreKinds
+void _assertDeferredAreKinds
+void _assertPartitionCoversAllKinds
 
 // ─── serialize / deserialize ───────────────────────────────────────────────────
 

@@ -13,11 +13,14 @@
 
 import { describe, expect, it } from 'vitest'
 import {
+  CANVAS_COMMAND_APPLIED_KINDS,
+  CANVAS_COMMAND_DEFERRED_KINDS,
   CANVAS_COMMAND_KINDS,
   CanvasCommandSerializeError,
   deserializeCanvasCommand,
   serializeCanvasCommand,
   type CanvasCommand,
+  type CanvasCommandKind,
 } from './canvasCommand'
 
 const roundTrip = (command: CanvasCommand): CanvasCommand => {
@@ -325,53 +328,157 @@ describe('CanvasCommand serialize round-trip', () => {
     })
   })
 
-  // ── Coverage: every kind has at least one round-trip fixture ───────────────────
-  it('covers every CanvasCommand kind (no kind left untested)', () => {
-    // This test is a static guarantee that the suite above is exhaustive. We
-    // re-derive the kinds touched by the roundTrip calls via the CANVAS_COMMAND_KINDS
-    // registry; if a new kind is added to the union without a fixture above, this
-    // assertion fails as a forcing function.
-    const covered = new Set<string>()
-    const collect = (...cmds: CanvasCommand[]) => cmds.forEach((c) => covered.add(c.kind))
+  // ── Mask edit (PR1: round-trip only, apply deferred) ─────────────────────────
+  // The mask-edit hard piece (review-plan-a.md:45). Two fixture families per F1:
+  // brush (mask from brush/point regions) + area (mask from box/ellipse/loop). The
+  // two Blobs the overlay carries (brush mask PNG, Set-of-Mark marked image) are
+  // two-stage uploaded → assetId references here; geometry (maskBounds/sourceSize)
+  // and subjects ride directly. Mirrors ImageMaskSubmitPayload 1:1.
+  it('mask-edit (brush mask: maskAssetId + brush maskBounds + point subject)', () => {
+    roundTrip({
+      kind: 'mask-edit',
+      sourceNodeId: 'img-1',
+      prompt: '把背景换成蓝色',
+      maskAssetId: 'mask-sha256-brush',
+      maskBounds: { x: 120, y: 80, width: 240, height: 180 },
+      sourceSize: { width: 1024, height: 768 },
+      quality: 'high',
+      model: 'gemini-3-pro-image',
+      subjectLabel: '背景',
+      subjects: [
+        { label: '红圈①', bounds: { x: 120, y: 80, width: 60, height: 60 }, action: '换色' },
+      ],
+    })
+  })
+  it('mask-edit (area mask: maskAssetId + markedImageAssetId + area subjects)', () => {
+    roundTrip({
+      kind: 'mask-edit',
+      sourceNodeId: 'img-2',
+      prompt: '选中区域生成新内容',
+      maskAssetId: 'mask-sha256-area',
+      markedImageAssetId: 'marked-sha256-area',
+      maskBounds: { x: 0, y: 0, width: 400, height: 400 },
+      sourceSize: { width: 800, height: 800 },
+      model: 'gpt-image-2',
+      quality: 'medium',
+      subjects: [
+        { label: '矩形区域', bounds: { x: 0, y: 0, width: 400, height: 200 } },
+        { label: '椭圆区域', bounds: { x: 50, y: 50, width: 300, height: 300 }, action: '保留' },
+      ],
+    })
+  })
+  it('mask-edit (bare: only required fields)', () => {
+    roundTrip({
+      kind: 'mask-edit',
+      sourceNodeId: 'img-3',
+      prompt: 'p',
+      sourceSize: { width: 512, height: 512 },
+    })
+  })
 
-    collect(
-      { kind: 'add-text-node', position: { x: 0, y: 0 } },
-      { kind: 'add-frame-node', position: { x: 0, y: 0 } },
-      { kind: 'add-ai-slot-node', position: { x: 0, y: 0 } },
-      { kind: 'add-annotation-node' },
-      { kind: 'add-markup-node', markupKind: 'rect', position: { x: 0, y: 0 } },
-      { kind: 'update-markup-style', nodeId: 'm', style: {} },
-      { kind: 'update-section-style', nodeId: 'f', style: {} },
-      { kind: 'set-section-lock-mode', nodeId: 'f', mode: 'all' },
-      { kind: 'remove-section-only', nodeId: 'f' },
-      { kind: 'select-nodes', nodeIds: [] },
-      { kind: 'set-active-tool', toolId: 'select' },
-      { kind: 'duplicate-node', nodeId: 'a' },
-      { kind: 'duplicate-selected-nodes' },
-      { kind: 'group-selected-nodes' },
-      { kind: 'ungroup-selected-nodes' },
-      { kind: 'copy-selected-nodes' },
-      { kind: 'paste-clipboard-nodes' },
-      { kind: 'move-node-layer', nodeId: 'a', move: 'front' },
-      { kind: 'move-selected-layer', move: 'back' },
-      { kind: 'align-selected-nodes', alignment: 'center' },
-      { kind: 'distribute-selected-nodes', axis: 'horizontal' },
-      { kind: 'arrange-selected-nodes', mode: 'grid' },
-      { kind: 'toggle-selected-nodes-locked' },
-      { kind: 'hide-selected-nodes' },
-      { kind: 'show-all-hidden-nodes' },
-      { kind: 'delete-node', nodeId: 'a' },
-      { kind: 'delete-selected-nodes' },
-      { kind: 'import-asset', assetId: 'id', mimeType: 'image/png', position: { x: 0, y: 0 } },
-      { kind: 'generate-variations' },
-      { kind: 'generate-image-edit', operation: 'upscale', prompt: 'p' },
-      { kind: 'generate-beside-node' },
-      { kind: 'generate-into-ai-slot' },
-      { kind: 'generate-from-annotation' },
+  // ── Coverage: forcing-function fixture map (F3①) ────────────────────────────────
+  // A single `Record<CanvasCommandKind, CanvasCommand>` fixture map. The Record
+  // annotation is the forcing function: adding a kind to the union without an
+  // entry here fails to type-check (missing property). `it.each` ACTUALLY runs
+  // roundTrip on each fixture — coverage is exercised, not merely collected into
+  // a Set like the old hand-maintained list. The rich per-kind `it(...)` cases
+  // above remain as a behavioral superset (multiple shapes per kind).
+  const ROUND_TRIP_FIXTURES: Record<CanvasCommandKind, CanvasCommand> = {
+    'add-text-node': { kind: 'add-text-node', position: { x: 0, y: 0 } },
+    'add-frame-node': { kind: 'add-frame-node', position: { x: 0, y: 0 } },
+    'add-ai-slot-node': { kind: 'add-ai-slot-node', position: { x: 0, y: 0 } },
+    'add-annotation-node': { kind: 'add-annotation-node' },
+    'add-markup-node': { kind: 'add-markup-node', markupKind: 'rect', position: { x: 0, y: 0 } },
+    'update-markup-style': { kind: 'update-markup-style', nodeId: 'm', style: {} },
+    'update-section-style': { kind: 'update-section-style', nodeId: 'f', style: {} },
+    'set-section-lock-mode': { kind: 'set-section-lock-mode', nodeId: 'f', mode: 'all' },
+    'remove-section-only': { kind: 'remove-section-only', nodeId: 'f' },
+    'select-nodes': { kind: 'select-nodes', nodeIds: [] },
+    'set-active-tool': { kind: 'set-active-tool', toolId: 'select' },
+    'duplicate-node': { kind: 'duplicate-node', nodeId: 'a' },
+    'duplicate-selected-nodes': { kind: 'duplicate-selected-nodes' },
+    'group-selected-nodes': { kind: 'group-selected-nodes' },
+    'ungroup-selected-nodes': { kind: 'ungroup-selected-nodes' },
+    'copy-selected-nodes': { kind: 'copy-selected-nodes' },
+    'paste-clipboard-nodes': { kind: 'paste-clipboard-nodes' },
+    'move-node-layer': { kind: 'move-node-layer', nodeId: 'a', move: 'front' },
+    'move-selected-layer': { kind: 'move-selected-layer', move: 'back' },
+    'align-selected-nodes': { kind: 'align-selected-nodes', alignment: 'center' },
+    'distribute-selected-nodes': { kind: 'distribute-selected-nodes', axis: 'horizontal' },
+    'arrange-selected-nodes': { kind: 'arrange-selected-nodes', mode: 'grid' },
+    'toggle-selected-nodes-locked': { kind: 'toggle-selected-nodes-locked' },
+    'hide-selected-nodes': { kind: 'hide-selected-nodes' },
+    'show-all-hidden-nodes': { kind: 'show-all-hidden-nodes' },
+    'delete-node': { kind: 'delete-node', nodeId: 'a' },
+    'delete-selected-nodes': { kind: 'delete-selected-nodes' },
+    'import-asset': {
+      kind: 'import-asset',
+      assetId: 'id',
+      mimeType: 'image/png',
+      position: { x: 0, y: 0 },
+    },
+    'generate-variations': { kind: 'generate-variations' },
+    'generate-image-edit': { kind: 'generate-image-edit', operation: 'upscale', prompt: 'p' },
+    'generate-beside-node': { kind: 'generate-beside-node' },
+    'generate-into-ai-slot': { kind: 'generate-into-ai-slot' },
+    'generate-from-annotation': { kind: 'generate-from-annotation' },
+    'mask-edit': {
+      kind: 'mask-edit',
+      sourceNodeId: 'img',
+      prompt: 'p',
+      sourceSize: { width: 1, height: 1 },
+    },
+  }
+
+  it('ROUND_TRIP_FIXTURES keys exactly match CANVAS_COMMAND_KINDS (no kind missing/extra)', () => {
+    expect(new Set(Object.keys(ROUND_TRIP_FIXTURES))).toEqual(new Set(CANVAS_COMMAND_KINDS))
+  })
+
+  it.each(Object.keys(ROUND_TRIP_FIXTURES) as CanvasCommandKind[])(
+    'round-trip fixture map: %s',
+    (kind) => {
+      roundTrip(ROUND_TRIP_FIXTURES[kind])
+    },
+  )
+})
+
+describe('CanvasCommand kind partition (F3②: APPLIED ∪ DEFERRED = KINDS, disjoint)', () => {
+  // The type guards in canvasCommand.ts catch missing/extra/typo at compile time;
+  // disjointness (a kind in BOTH lists) cannot be caught by union arithmetic, so
+  // it is asserted here at runtime, together with the exact-partition + count.
+  it('APPLIED and DEFERRED are disjoint (no kind appears in both)', () => {
+    const deferred = new Set<string>(CANVAS_COMMAND_DEFERRED_KINDS)
+    const overlap = (CANVAS_COMMAND_APPLIED_KINDS as readonly string[]).filter((k) =>
+      deferred.has(k),
     )
+    expect(overlap).toEqual([])
+  })
 
-    const all = new Set<string>(CANVAS_COMMAND_KINDS)
-    expect(covered).toEqual(all)
+  it('APPLIED ∪ DEFERRED exactly equals CANVAS_COMMAND_KINDS (no missing, no extra)', () => {
+    const union = new Set<string>([
+      ...CANVAS_COMMAND_APPLIED_KINDS,
+      ...CANVAS_COMMAND_DEFERRED_KINDS,
+    ])
+    expect(union).toEqual(new Set(CANVAS_COMMAND_KINDS))
+  })
+
+  it('|APPLIED| + |DEFERRED| === |KINDS| (partition is exact by count)', () => {
+    expect(CANVAS_COMMAND_APPLIED_KINDS.length + CANVAS_COMMAND_DEFERRED_KINDS.length).toBe(
+      CANVAS_COMMAND_KINDS.length,
+    )
+  })
+
+  it('CANVAS_COMMAND_KINDS has 34 kinds', () => {
+    expect(CANVAS_COMMAND_KINDS.length).toBe(34)
+  })
+
+  it('CANVAS_COMMAND_APPLIED_KINDS has 27 kinds', () => {
+    expect(CANVAS_COMMAND_APPLIED_KINDS.length).toBe(27)
+  })
+
+  it('CANVAS_COMMAND_DEFERRED_KINDS has 7 kinds (incl. mask-edit)', () => {
+    expect(CANVAS_COMMAND_DEFERRED_KINDS.length).toBe(7)
+    expect(CANVAS_COMMAND_DEFERRED_KINDS).toContain('mask-edit')
   })
 })
 
