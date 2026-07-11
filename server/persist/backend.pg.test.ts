@@ -1,9 +1,14 @@
 // server/persist/backend.pg.test.ts
-// T1.3 PG 后端专用测试:冷启动预热(服务器重启无损证据)+ 事务原子性 + 跨实例缓存一致性。
+// T1.3 PG 后端专用测试:冷启动预热(服务器重启无损证据)+ 事务原子性 + 跨实例缓存一致性 + P1/P2 并发回归。
 // PG gate:MIVO_PG_TEST=1(本地 brew PG port 55443);CI 无 PG 跳过。
 // 契约等价性由 backend.contract.dual.test.ts 覆盖(32 场景 memory+PG 同形);本测钉 PG 专有性质。
+//
+// DB 隔离:本套件用独立 DB `mivocanvas_unit`(默认;env MIVO_PG_UNIT_DB 覆盖),与 backend.contract.dual.test.ts
+// 用的 `mivocanvas` 分离——vitest 文件并行下两套件共享 DB + 同 id('p1'/'c1'/'o')会行级污染;独立 DB 根治。
+// beforeAll 自动 createdb(若缺);mivo 超级用户(rolcreatedb)本地 brew PG 满足。CI 无 PG 不触发。
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest'
+import { Pool } from 'pg'
 import { PgPersistBackend } from './pgBackend'
 
 const PG_TEST_ENABLED = process.env.MIVO_PG_TEST === '1'
@@ -11,16 +16,40 @@ const PG_TEST_ENABLED = process.env.MIVO_PG_TEST === '1'
 const pgConn = () => ({
   host: process.env.MIVO_PG_HOST || '127.0.0.1',
   port: Number(process.env.MIVO_PG_PORT || 55443),
-  database: process.env.MIVO_PG_DB || 'mivocanvas',
+  database: process.env.MIVO_PG_UNIT_DB || 'mivocanvas_unit',
   user: process.env.MIVO_PG_USER || 'mivo',
   password: process.env.MIVO_PG_PASSWORD || 'mivo-test-no-password',
   maxConnections: 5,
   idleTimeoutMs: 5000,
 })
 
+/** 确保独立 DB 存在(并行隔离用);连到 postgres 库 CREATE DATABASE IF MISSING。 */
+async function ensureUnitDb(): Promise<void> {
+  const cfg = pgConn()
+  const admin = new Pool({
+    host: cfg.host,
+    port: cfg.port,
+    database: 'postgres',
+    user: cfg.user,
+    password: cfg.password,
+    max: 1,
+  })
+  try {
+    const res = await admin.query('SELECT 1 FROM pg_database WHERE datname = $1', [cfg.database])
+    if (res.rowCount === 0) {
+      // CREATE DATABASE 不支持参数化;db 名来自常量/env,非用户输入,字符串拼接安全(已转义双引号防注入)。
+      const dbName = String(cfg.database).replace(/"/g, '')
+      await admin.query(`CREATE DATABASE "${dbName}"`)
+    }
+  } finally {
+    await admin.end()
+  }
+}
+
 ;(PG_TEST_ENABLED ? describe : describe.skip)('PgPersistBackend — PG 专有性质', () => {
   let pg: PgPersistBackend
   beforeAll(async () => {
+    await ensureUnitDb()
     pg = new PgPersistBackend(pgConn())
     await pg.migrate()
     await pg.ready
@@ -121,5 +150,125 @@ const pgConn = () => ({
     if (cv.kind === 'found') expect((cv.record.payload as { contentVersion: number }).contentVersion).toBe(3)
     // metaRevision 不动(子资源写入不 bump metaRevision)
     if (cv.kind === 'found') expect(cv.record.revision).toBe(0)
+  })
+
+  // ── 返修 P1+P2 并发回归(真实 Promise.all,审阅者复现脚本翻绿)──────────────────────
+
+  it('P1-1 并发 reorder 同 base:一 ok 一 conflict(SELECT FOR UPDATE 序列化)', async () => {
+    await pg.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+    await pg.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+    await pg.upsertChild('o', 'c1', 'node', 'n1', { id: 'n1' }, { method: 'PATCH', resourceKind: 'node' })
+    await pg.upsertChild('o', 'c1', 'node', 'n2', { id: 'n2' }, { method: 'PATCH', resourceKind: 'node' })
+    // 2 次子资源写 → contentVersion=2(createCanvasWithCollection 不 bump;upsertChild 各 bump 一次)
+    const cvBefore = await pg.get('o', 'canvas', 'c1')
+    if (cvBefore.kind === 'found') expect((cvBefore.record.payload as { contentVersion: number }).contentVersion).toBe(2)
+    // 两个并发 reorder,base=2(当前 cv)。契约(api-surface.md L154/L386 F5):一 ok(cv 3),一 409 conflict。
+    const [a, b] = await Promise.all([
+      pg.reorderChildren('o', 'c1', 'node', ['n2', 'n1'], { base: 2 }),
+      pg.reorderChildren('o', 'c1', 'node', ['n1', 'n2'], { base: 2 }),
+    ])
+    const okResult = [a, b].find((r) => r.kind === 'ok')
+    const conflictResult = [a, b].find((r) => r.kind === 'conflict')
+    expect(okResult).toBeDefined()
+    expect(conflictResult).toBeDefined()
+    if (okResult && okResult.kind === 'ok') expect(okResult.contentVersion).toBe(3)
+    // 输家读到的当前 cv 是赢家 bump 后的 3(FOR UPDATE 阻塞至赢家提交后读)
+    if (conflictResult && conflictResult.kind === 'conflict') expect(conflictResult.currentContentVersion).toBe(3)
+    // orderKey 唯一无重叠(赢家重排生效)
+    const list = await pg.listByCanvas('o', 'c1', 'node')
+    expect(list.records.map((r) => r.orderKey).sort((x, y) => x - y)).toEqual([0, 1])
+  })
+
+  it('P1-2 并发幂等同 key 不同 body:一 created 一 reuse-conflict(输家同事务回滚)', async () => {
+    await pg.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+    await pg.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+    // 两个并发 ensureCreateChild,同 idem key,不同 body(不同 fingerprint),不同 child id。
+    const [a, b] = await Promise.all([
+      pg.ensureCreateChild('o', 'c1', 'node', 'nA', { v: 1 }, { method: 'POST', resourceKind: 'node', idempotencyKey: 'k1', bodyFingerprint: 'fpA' }),
+      pg.ensureCreateChild('o', 'c1', 'node', 'nB', { v: 2 }, { method: 'POST', resourceKind: 'node', idempotencyKey: 'k1', bodyFingerprint: 'fpB' }),
+    ])
+    // 契约(N4):一 created,一 reuse-conflict(422 idempotency-key-reuse)
+    const kinds = [a.kind, b.kind].sort()
+    expect(kinds).toEqual(['created', 'reuse-conflict'])
+    // 输家同事务回滚:DB 只剩赢家的一个 node(无 partial 资源泄漏)
+    const list = await pg.listByCanvas('o', 'c1', 'node')
+    expect(list.records.length).toBe(1)
+    expect(['nA', 'nB']).toContain(list.records[0].id)
+  })
+
+  it('P1-3 并发同 owner 同 id ensureCreate:一 created 一 existing(无 500 泄漏)', async () => {
+    // 两个并发同 owner 同 id 同 body(无 idem key)ensureCreate project。
+    const [a, b] = await Promise.all([
+      pg.ensureCreate('o', 'project', 'p3', { name: 'P' }, { method: 'POST', resourceKind: 'project' }),
+      pg.ensureCreate('o', 'project', 'p3', { name: 'P' }, { method: 'POST', resourceKind: 'project' }),
+    ])
+    // 契约:一 created(200),一 existing(200)——输家 persist_records INSERT ON CONFLICT DO NOTHING + 重读转 existing,
+    // 不再 23505 duplicate key 泄漏成 500。
+    const kinds = [a.kind, b.kind].sort()
+    expect(kinds).toEqual(['created', 'existing'])
+    // 全局索引 + record 一致:只有一个 p3,owner=o,live
+    expect(pg.getProjectOwner('p3')?.ownerId).toBe('o')
+    expect(pg.projectLive('o', 'p3')).toBe(true)
+    const got = await pg.get('o', 'project', 'p3')
+    expect(got.kind).toBe('found')
+  })
+
+  it('P1-4 fresh DB 启动:migrate-before-warm(删表后 new instance await ready 自迁移,无 42P01)', async () => {
+    // 模拟 fresh DB:删全部表(含 kysely_migration 追踪表)
+    await pg.__dropAllTables()
+    // new instance,只 await ready(不显式 migrate)—— ready 内部 migrate-before-warm
+    const pgFresh = new PgPersistBackend(pgConn())
+    // 旧实现:warm() 先 SELECT projects → 空库 42P01 → ready reject。新实现:ready 先 migrate 再 warm。
+    await expect(pgFresh.ready).resolves.toBeUndefined()
+    // 表已重建,warm 成功:可写可读 + owner 索引正确
+    await pgFresh.ensureCreate('o', 'project', 'p-fresh', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+    expect(pgFresh.getProjectOwner('p-fresh')?.ownerId).toBe('o')
+    const got = await pgFresh.get('o', 'project', 'p-fresh')
+    expect(got.kind).toBe('found')
+    await pgFresh.destroy()
+    // 表已由 pgFresh 重建,后续测试的 beforeEach __reset 可正常 DELETE
+  })
+
+  it('P1-5 post-commit 定点 cache mutation:warm 抛错后 get 可读 + owner 索引正确(不可失败)', async () => {
+    // 注入 warm 故障(模拟 DB blip)。post-commit 不再调 warm,改用定点内存 mutation(纯 Map.set,不可失败)。
+    const pgAny = pg as unknown as { warm: () => Promise<void> }
+    const originalWarm = pgAny.warm.bind(pg)
+    pgAny.warm = async () => { throw new Error('warm-blip') }
+    try {
+      // create project:post-commit 定点 mutation,不调 warm → warm 抛错不影响
+      const r = await pg.ensureCreate('o', 'project', 'p-fix', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+      expect(r.kind).toBe('created')
+      expect(pg.getProjectOwner('p-fix')?.ownerId).toBe('o')
+      expect(pg.projectLive('o', 'p-fix')).toBe(true)
+      const got = await pg.get('o', 'project', 'p-fix')
+      expect(got.kind).toBe('found')
+      // canvas create 同型
+      const c = await pg.createCanvasWithCollection('o', 'c-fix', { projectId: 'p-fix' }, { method: 'POST', resourceKind: 'canvas' })
+      expect(c.kind).toBe('created')
+      expect(pg.getCanvasOwner('c-fix')?.ownerId).toBe('o')
+      // upsert created(project)同型
+      const u = await pg.upsert('o', 'project', 'p-upsert', { name: 'U' }, { method: 'PUT', resourceKind: 'project' })
+      expect(u.kind).toBe('created')
+      expect(pg.getProjectOwner('p-upsert')?.ownerId).toBe('o')
+    } finally {
+      pgAny.warm = originalWarm
+    }
+  })
+
+  it('P2-1 并发 append orderKey:3 并发 upsertChild,orderKey 严格递增无撞号', async () => {
+    await pg.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+    await pg.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+    // 3 并发 upsertChild(不同 id,无 idem key)—— nextOrderKeyInTrx 先锁 canvas meta 行,序列化。
+    const results = await Promise.all([
+      pg.upsertChild('o', 'c1', 'node', 'n1', { id: 'n1' }, { method: 'PATCH', resourceKind: 'node' }),
+      pg.upsertChild('o', 'c1', 'node', 'n2', { id: 'n2' }, { method: 'PATCH', resourceKind: 'node' }),
+      pg.upsertChild('o', 'c1', 'node', 'n3', { id: 'n3' }, { method: 'PATCH', resourceKind: 'node' }),
+    ])
+    expect(results.every((r) => r.kind === 'created')).toBe(true)
+    // orderKey 严格递增(0,1,2,无撞号;旧实现 MAX+1 无锁 → 两个 orderKey=0)
+    const orderKeys = results.map((r) => (r.kind === 'created' ? r.record.orderKey : -1)).sort((a, b) => a - b)
+    expect(orderKeys).toEqual([0, 1, 2])
+    const list = await pg.listByCanvas('o', 'c1', 'node')
+    expect(list.records.map((r) => r.orderKey)).toEqual([0, 1, 2])
   })
 })
