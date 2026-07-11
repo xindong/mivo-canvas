@@ -739,8 +739,9 @@ export class PgPersistBackend implements PersistBackend {
                 if (r.is_deleted) {
                   // F1:replay 命中 deleted → 真恢复。idem 条目已存在(:728 读到),不重插(否则误判 race loser→回滚恢复)。
                   // F4:WHERE is_deleted=true + rowCount 定输赢——0 行(并发赢家已恢复)→ existing,非 0 → restored(并 bump contentVersion)。
+                  // DP-6R:chat-message per-actor 私有,不 bump 共享 canvas contentVersion。
                   const upd = await trx.updateTable('persist_records').set({ payload: JSON.stringify(payload), is_deleted: false, revision: sql`revision + 1`, updated_at: new Date(), canvas_id: canvasId }).where('owner_id', '=', ownerId).where('type', '=', type).where('id', '=', id).where('is_deleted', '=', true).executeTakeFirst()
-                  if ((upd?.numUpdatedRows ?? 0n) > 0n) await this.bumpCanvasContentVersionInTrx(trx, ownerId, canvasId)
+                  if ((upd?.numUpdatedRows ?? 0n) > 0n && type !== 'chat-message') await this.bumpCanvasContentVersionInTrx(trx, ownerId, canvasId)
                   const rec = await trx.selectFrom('persist_records').selectAll().where('owner_id', '=', ownerId).where('type', '=', type).where('id', '=', id).executeTakeFirst()
                   if (!rec) throw new Error('ensureCreateChild: post-restore missing')
                   return { kind: (upd?.numUpdatedRows ?? 0n) > 0n ? 'restored' : 'existing', record: this.withIdem(rowToRecord(rec), opts) }
@@ -758,9 +759,10 @@ export class PgPersistBackend implements PersistBackend {
           }
           if (existing && existing.is_deleted) {
             // F4:WHERE is_deleted=true + rowCount 定输赢(并发赢家已恢复→existing;赢家 bump,输家不 bump)。
+            // DP-6R:chat-message per-actor 私有,不 bump 共享 canvas contentVersion。
             const upd = await trx.updateTable('persist_records').set({ payload: JSON.stringify(payload), is_deleted: false, revision: sql`revision + 1`, updated_at: new Date(), canvas_id: canvasId }).where('owner_id', '=', ownerId).where('type', '=', type).where('id', '=', id).where('is_deleted', '=', true).executeTakeFirst()
             await this.setIdempotencyEntryInTrx(trx, ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, opts.bodyFingerprint ?? '', ownerId, type, id)
-            if ((upd?.numUpdatedRows ?? 0n) > 0n) await this.bumpCanvasContentVersionInTrx(trx, ownerId, canvasId)
+            if ((upd?.numUpdatedRows ?? 0n) > 0n && type !== 'chat-message') await this.bumpCanvasContentVersionInTrx(trx, ownerId, canvasId)
             const rec = await trx.selectFrom('persist_records').selectAll().where('owner_id', '=', ownerId).where('type', '=', type).where('id', '=', id).executeTakeFirst()
             if (!rec) throw new Error('ensureCreateChild: post-restore missing')
             return { kind: (upd?.numUpdatedRows ?? 0n) > 0n ? 'restored' : 'existing', record: this.withIdem(rowToRecord(rec), opts) }
@@ -769,7 +771,8 @@ export class PgPersistBackend implements PersistBackend {
           const orderKey = await this.nextOrderKeyInTrx(trx, ownerId, canvasId, type)
           await trx.insertInto('persist_records').values({ id, owner_id: ownerId, canvas_id: canvasId, type, scope: 'document', revision: 0, order_key: orderKey, is_deleted: false, payload: JSON.stringify(payload) }).execute()
           await this.setIdempotencyEntryInTrx(trx, ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, opts.bodyFingerprint ?? '', ownerId, type, id)
-          await this.bumpCanvasContentVersionInTrx(trx, ownerId, canvasId)
+          // DP-6R:chat-message per-actor 私有,不 bump 共享 canvas contentVersion。
+          if (type !== 'chat-message') await this.bumpCanvasContentVersionInTrx(trx, ownerId, canvasId)
           const rec = await trx.selectFrom('persist_records').selectAll().where('owner_id', '=', ownerId).where('type', '=', type).where('id', '=', id).executeTakeFirst()
           if (!rec) throw new Error('ensureCreateChild: post-create missing')
           return { kind: 'created', record: this.withIdem(rowToRecord(rec), opts) }
@@ -985,7 +988,8 @@ export class PgPersistBackend implements PersistBackend {
               .executeTakeFirst()
             if (!created) throw new Error(`upsertChild: upsert failed for ${type}:${id}`)
             await this.setIdempotencyEntryInTrx(trx, ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, opts.bodyFingerprint ?? '', ownerId, type, id)
-            await this.bumpCanvasContentVersionInTrx(trx, ownerId, canvasId)
+            // DP-6R:chat-message per-actor 私有,不 bump 共享 canvas contentVersion(node/edge/anchor 仍 bump)。
+            if (type !== 'chat-message') await this.bumpCanvasContentVersionInTrx(trx, ownerId, canvasId)
             return { kind: 'created', record: this.withIdem(rowToRecord(created), opts) }
           }
           if (opts.base === undefined) return { kind: 'precondition-required', record: this.withIdem(rowToRecord(existing), opts) }
@@ -1004,7 +1008,8 @@ export class PgPersistBackend implements PersistBackend {
             return { kind: 'conflict', currentRevision: cur ? Number(cur.revision) : opts.base, record: this.withIdem(cur ? rowToRecord(cur) : rowToRecord(existing), opts) }
           }
           await this.setIdempotencyEntryInTrx(trx, ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, opts.bodyFingerprint ?? '', ownerId, type, id)
-          await this.bumpCanvasContentVersionInTrx(trx, ownerId, canvasId)
+          // DP-6R:chat-message per-actor 私有,不 bump 共享 canvas contentVersion。
+          if (type !== 'chat-message') await this.bumpCanvasContentVersionInTrx(trx, ownerId, canvasId)
           return { kind: 'updated', record: this.withIdem(rowToRecord(result), opts) }
         })
       },
@@ -1020,7 +1025,8 @@ export class PgPersistBackend implements PersistBackend {
       if (!r || r.canvas_id !== canvasId) return { deleted: false }
       await trx.deleteFrom('persist_records').where('owner_id', '=', ownerId).where('type', '=', type).where('id', '=', id).execute()
       await trx.deleteFrom('idempotency_index').where('envelope_owner', '=', ownerId).where('envelope_type', '=', type).where('envelope_id', '=', id).execute()
-      await this.bumpCanvasContentVersionInTrx(trx, ownerId, canvasId)
+      // DP-6R:chat-message per-actor 私有,不 bump 共享 canvas contentVersion(node/edge/anchor 硬删仍 bump)。
+      if (type !== 'chat-message') await this.bumpCanvasContentVersionInTrx(trx, ownerId, canvasId)
       return { deleted: true }
     })
   }
@@ -1050,7 +1056,10 @@ export class PgPersistBackend implements PersistBackend {
       }
       // N8/F5:If-Match(contentVersion base)必填——stale → 409(两并发一成一 409)。P1-1:FOR UPDATE 锁 canvas meta 行
       // 序列化并发(赢家 bump 提交后输家才读到新 cv → base≠cv → conflict;旧实现无锁,两并发都读到旧 cv → 双 ok)。
-      const currentCv = await this.canvasContentVersionInTrx(trx, ownerId, canvasId)
+      // DP-6R:chat-message per-actor(ownerId=actor from route)。canvas meta(contentVersion 持有者)在 canvas owner
+      // 名下,不在 actor bucket——chat reorder 的 cv base 读 canvas owner;chat 不 bump 共享 cv(node/edge/anchor 不变)。
+      const cvOwnerId = type === 'chat-message' ? (this.getCanvasOwner(canvasId)?.ownerId ?? ownerId) : ownerId
+      const currentCv = await this.canvasContentVersionInTrx(trx, cvOwnerId, canvasId)
       if (opts.base !== currentCv) return { kind: 'conflict', currentContentVersion: currentCv }
       // 原子:事务内逐行重分配 orderKey(parameterized UPDATE,防 SQL 注入;事务失败全回滚)+ bump contentVersion。
       for (let i = 0; i < orderedIds.length; i++) {
@@ -1063,7 +1072,8 @@ export class PgPersistBackend implements PersistBackend {
           .where('id', '=', orderedIds[i])
           .execute()
       }
-      const newCv = await this.bumpCanvasContentVersionInTrx(trx, ownerId, canvasId)
+      // DP-6R:chat-message per-actor 私有,不 bump 共享 canvas contentVersion(reorder 只重排 actor 自己的 orderKey)。
+      const newCv = type === 'chat-message' ? currentCv : await this.bumpCanvasContentVersionInTrx(trx, cvOwnerId, canvasId)
       return { kind: 'ok', reordered: orderedIds.length, contentVersion: newCv }
     })
   }

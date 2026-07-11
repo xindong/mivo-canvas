@@ -705,7 +705,8 @@ export class InMemoryPersistBackend implements PersistBackend {
               fingerprint: opts.bodyFingerprint,
             }
             this.bucket(ownerId).set(entry.envelopeKey, restored)
-            this.bumpCanvasContentVersion(ownerId, canvasId)
+            // DP-6R:chat-message 是 per-actor 私有,不 bump 共享 canvas contentVersion。
+            if (type !== 'chat-message') this.bumpCanvasContentVersion(ownerId, canvasId)
             return { kind: 'restored', record: clone(restored) }
           }
           return { kind: 'existing', record: clone(r) }
@@ -735,7 +736,8 @@ export class InMemoryPersistBackend implements PersistBackend {
       }
       this.bucket(ownerId).set(recordKey(ownerId, type, id), restored)
       this.setIdemIndex(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, recordKey(ownerId, type, id), opts.bodyFingerprint ?? '')
-      this.bumpCanvasContentVersion(ownerId, canvasId)
+      // DP-6R:chat-message per-actor 私有,不 bump 共享 canvas contentVersion。
+      if (type !== 'chat-message') this.bumpCanvasContentVersion(ownerId, canvasId)
       return { kind: 'restored', record: clone(restored) }
     }
     // 不存在 → created(orderKey 分配,返修 #6)。
@@ -757,7 +759,8 @@ export class InMemoryPersistBackend implements PersistBackend {
     }
     this.bucket(ownerId).set(recordKey(ownerId, type, id), created)
     this.setIdemIndex(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, recordKey(ownerId, type, id), opts.bodyFingerprint ?? '')
-    this.bumpCanvasContentVersion(ownerId, canvasId)
+    // DP-6R:chat-message per-actor 私有,不 bump 共享 canvas contentVersion。
+    if (type !== 'chat-message') this.bumpCanvasContentVersion(ownerId, canvasId)
     return { kind: 'created', record: clone(created) }
   }
 
@@ -930,7 +933,8 @@ export class InMemoryPersistBackend implements PersistBackend {
       }
       this.bucket(ownerId).set(recordKey(ownerId, type, id), created)
       this.setIdemIndex(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, recordKey(ownerId, type, id), opts.bodyFingerprint ?? '')
-      this.bumpCanvasContentVersion(ownerId, canvasId) // 返修 #5:content bump
+      // DP-6R:chat-message per-actor 私有,不 bump 共享 canvas contentVersion(node/edge/anchor 仍 bump)。
+      if (type !== 'chat-message') this.bumpCanvasContentVersion(ownerId, canvasId)
       return { kind: 'created', record: clone(created) }
     }
     // existing & !deleted & canvas_id 匹配 → 返修 #4:缺 base → precondition-required(428)。
@@ -953,7 +957,8 @@ export class InMemoryPersistBackend implements PersistBackend {
     }
     this.bucket(ownerId).set(recordKey(ownerId, type, id), updated)
     this.setIdemIndex(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, recordKey(ownerId, type, id), opts.bodyFingerprint ?? '')
-    this.bumpCanvasContentVersion(ownerId, canvasId)
+    // DP-6R:chat-message per-actor 私有,不 bump 共享 canvas contentVersion。
+    if (type !== 'chat-message') this.bumpCanvasContentVersion(ownerId, canvasId)
     return { kind: 'updated', record: clone(updated) }
   }
 
@@ -961,7 +966,8 @@ export class InMemoryPersistBackend implements PersistBackend {
     const r = this.find(ownerId, type, id)
     if (!r || r.canvasId !== canvasId) return { deleted: false } // 返修 #3:cross-canvas/missing → 404
     this.bucket(ownerId).delete(recordKey(ownerId, type, id))
-    this.bumpCanvasContentVersion(ownerId, canvasId) // 返修 #5:content bump
+    // DP-6R:chat-message per-actor 私有,不 bump 共享 canvas contentVersion(node/edge/anchor 硬删仍 bump)。
+    if (type !== 'chat-message') this.bumpCanvasContentVersion(ownerId, canvasId)
     return { deleted: true }
   }
 
@@ -990,7 +996,10 @@ export class InMemoryPersistBackend implements PersistBackend {
       if (!liveIds.has(id)) return { kind: 'bad', reason: 'mismatch' }
     }
     // N8/F5:If-Match(contentVersion base)必填——stale → 409(两并发一成一 409)。F5 删无 base 分支(base 必填,route 已 428 missing)。
-    const currentCv = this.canvasContentVersion(ownerId, canvasId)
+    // DP-6R:chat-message per-actor(ownerId=actor from route)。canvas meta(contentVersion 持有者)在 canvas owner
+    // 名下,不在 actor bucket——chat reorder 的 cv base 读 canvas owner;chat 不 bump 共享 cv(node/edge/anchor 不变)。
+    const cvOwnerId = type === 'chat-message' ? (this.getCanvasOwner(canvasId)?.ownerId ?? ownerId) : ownerId
+    const currentCv = this.canvasContentVersion(cvOwnerId, canvasId)
     if (opts.base !== currentCv) {
       return { kind: 'conflict', currentContentVersion: currentCv }
     }
@@ -1014,7 +1023,8 @@ export class InMemoryPersistBackend implements PersistBackend {
         n++
       }
       let newCv = currentCv
-      if (meta) {
+      // DP-6R:chat-message per-actor 私有,不 bump 共享 canvas contentVersion(reorder 只重排 actor 自己的 orderKey)。
+      if (type !== 'chat-message' && meta) {
         const p = asCanvasMeta(meta.payload) ?? {}
         newCv = (p.contentVersion ?? 0) + 1
         p.contentVersion = newCv
