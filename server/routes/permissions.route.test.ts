@@ -4,8 +4,19 @@
 //
 // 身份注入:x-mivo-auth-user(SSO username = maker user id,DP-4 §3);resolveActor 优先读之。
 // 分享写访问:x-mivo-share-token header(§4 token 信任)。
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, beforeAll, afterAll } from 'vitest'
 import { buildPersistApp, req, canonicalNode, wirePayload } from './persistTestApp'
+
+// T1.4 身份注入需 opt-in flag(Greptile security 修复:默认关防伪造)。test 开启之。
+let prevTrustFlag: string | undefined
+beforeAll(() => {
+  prevTrustFlag = process.env.MIVO_TRUST_SSO_HEADER
+  process.env.MIVO_TRUST_SSO_HEADER = '1'
+})
+afterAll(() => {
+  if (prevTrustFlag === undefined) delete process.env.MIVO_TRUST_SSO_HEADER
+  else process.env.MIVO_TRUST_SSO_HEADER = prevTrustFlag
+})
 
 describe('T1.4 权限层 — 角色矩阵 + 分享链接全链路', () => {
   let app: ReturnType<typeof buildPersistApp>['app']
@@ -268,5 +279,53 @@ describe('T1.4 权限层 — 角色矩阵 + 分享链接全链路', () => {
       expect(cross.status).toBe(404)
       expect((cross.body as { error: string }).error).toBe('unknown-canvas')
     })
+  })
+})
+
+describe('T1.4 Greptile 修复 — 跨项目吊销/恢复防越权 + 身份头防伪造 + 分享建画布', () => {
+  let app: ReturnType<typeof buildPersistApp>['app']
+
+  beforeEach(() => {
+    ;({ app } = buildPersistApp())
+  })
+  const u = (username: string): Record<string, string> => ({ 'x-mivo-auth-user': username })
+  const shareHdr = (token: string) => ({ 'x-mivo-share-token': token })
+
+  it('跨项目吊销 linkId → 404(防 A 吊销 B 的链接)', async () => {
+    // alice 建 p1 + p2,p2 建一个 link
+    await req(app, '/api/projects', { method: 'POST', headers: u('alice'), body: JSON.stringify({ id: 'p1', name: 'P1' }) })
+    await req(app, '/api/projects', { method: 'POST', headers: u('alice'), body: JSON.stringify({ id: 'p2', name: 'P2' }) })
+    const create = await req(app, '/api/projects/p2/share-links', { method: 'POST', headers: u('alice'), body: JSON.stringify({ permission: 'view' }) })
+    const p2LinkId = (create.body as { id: string }).id
+    // alice 试图用 p1 的 URL 吊销 p2 的 link → 404(后端校验 link 属 p1?否 → not-found)
+    const cross = await req(app, `/api/projects/p1/share-links/${p2LinkId}`, { method: 'DELETE', headers: u('alice') })
+    expect(cross.status).toBe(404)
+    // 原 p2 link 仍活(GET /api/share/:token → 200)
+    const token = (create.body as { token: string }).token
+    expect((await req(app, `/api/share/${token}`)).status).toBe(200)
+  })
+
+  it('跨项目恢复 linkId → 404(防 A 恢复 B 的链接)', async () => {
+    await req(app, '/api/projects', { method: 'POST', headers: u('alice'), body: JSON.stringify({ id: 'p1', name: 'P1' }) })
+    await req(app, '/api/projects', { method: 'POST', headers: u('alice'), body: JSON.stringify({ id: 'p2', name: 'P2' }) })
+    const create = await req(app, '/api/projects/p2/share-links', { method: 'POST', headers: u('alice'), body: JSON.stringify({ permission: 'view' }) })
+    const p2LinkId = (create.body as { id: string }).id
+    // 用 p1 的 URL 恢复 p2 的 link → 404
+    const cross = await req(app, `/api/projects/p1/share-links/${p2LinkId}/restore`, { method: 'POST', headers: u('alice') })
+    expect(cross.status).toBe(404)
+  })
+
+  it('分享 edit 链接可建 canvas(复用 project write 授权路径;Greptile 修复)', async () => {
+    await req(app, '/api/projects', { method: 'POST', headers: u('alice'), body: JSON.stringify({ id: 'p1', name: 'P1' }) })
+    const create = await req(app, '/api/projects/p1/share-links', { method: 'POST', headers: u('alice'), body: JSON.stringify({ permission: 'edit' }) })
+    const token = (create.body as { token: string }).token
+    // 未认证 + edit token 建 canvas → 201
+    const r = await req(app, '/api/canvas', { method: 'POST', headers: shareHdr(token), body: JSON.stringify({ id: 'c1', projectId: 'p1' }) })
+    expect(r.status).toBe(201)
+    // view token 建 canvas → 403(write deny)
+    const viewCreate = await req(app, '/api/projects/p1/share-links', { method: 'POST', headers: u('alice'), body: JSON.stringify({ permission: 'view' }) })
+    const viewToken = (viewCreate.body as { token: string }).token
+    const r2 = await req(app, '/api/canvas', { method: 'POST', headers: shareHdr(viewToken), body: JSON.stringify({ id: 'c2', projectId: 'p1' }) })
+    expect(r2.status).toBe(403)
   })
 })

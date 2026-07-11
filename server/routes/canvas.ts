@@ -21,6 +21,7 @@ import type { AppEnv } from '../lib/types'
 import { rejectInvalidMivoApiKey } from '../lib/keys'
 import { resolveActor } from '../lib/owner'
 import { canAccessCanvas, canAccessProject, denyStatus, type AuthzAction, type AuthzInfo } from '../lib/authz'
+import { resolveProjectAccess, denyProjectResponse, shareTokenOf } from '../lib/projectAuthz'
 import type { PermissionBackend } from '../lib/permissions'
 import { newRequestId, logRequest } from '../lib/request'
 import {
@@ -84,10 +85,6 @@ const badIfMatch = (id: string) => ({ error: 'bad-request' as const, message: 'I
 
 export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistBackend; permissions: PermissionBackend }): Hono<AppEnv> => {
   const route = new Hono<AppEnv>()
-
-  /** 分享 token header / query(§4 token 信任)。 */
-  const shareTokenOf = (c: Context<AppEnv>): string | undefined =>
-    c.req.header('x-mivo-share-token')?.trim() || c.req.query('share')?.toString() || undefined
 
   /**
    * T1.4 授权 seam——canvas 先 getCanvasOwner 全局归属,再 fetch meta 取 projectId(成员资格按 project 查),
@@ -244,27 +241,17 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
       return c.json(decoded.body, decoded.status as 400 | 413)
     }
     const reqBody: CreateCanvasRequest = decoded.value
-    const actor = resolveActor(c)
-    // T1.4:N7 project authz(write;editor+ 可建 canvas,viewer → 403,非成员 → 404 unknown-project)。
-    const projectOwner = backend.getProjectOwner(reqBody.projectId)
-    if (!projectOwner) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'unknown-project' })
-      return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
-    }
-    const memberRole = await permissions.resolveMemberRole(reqBody.projectId, actor, projectOwner.ownerId)
-    const projectInfo: AuthzInfo = { actor, ownerId: projectOwner.ownerId, memberRole }
-    if (canAccessProject(projectInfo, 'write') === 'deny') {
-      const status = denyStatus(projectInfo) === 403 ? 403 : 404
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status, latencyMs: Date.now() - t0, note: status === 403 ? 'forbidden' : 'unknown-project' })
-      return c.json(status === 403 ? { error: 'forbidden' } : { error: 'unknown-project' } satisfies UnknownResourceBody, status as 403 | 404)
-    }
+    // T1.4:project write-authz(委托 resolveProjectAccess,统一 actor + share-token 路径;editor+/share-edit 可建 canvas,
+    // viewer → 403,非成员 → 404 unknown-project)。Greptile 修复:分享链接 edit 也能建 canvas(复用同一授权路径)。
+    const projectAuthz = await resolveProjectAccess(c, backend, permissions, reqBody.projectId, 'write')
+    if (!projectAuthz.ok) return denyProjectResponse(c, requestId, t0, projectAuthz)
     const id = reqBody.id && reqBody.id.trim() ? reqBody.id.trim() : randomUUID()
     const cp: CanvasPayload = { projectId: reqBody.projectId, title: reqBody.title, sourceTemplateId: reqBody.sourceTemplateId }
     const idempotencyKey = c.req.header('idempotency-key') || undefined
     // F1:单一原子原语 createCanvasWithCollection(canvas meta + chat-collection 同一操作,防 ensureCreate(canvas)→
     // 独立 ensureCreate(chat-collection) 两段间的 TOCTOU——中间并发 DELETE project 会产生软删树下 live orphan collection)。
-    // T1.4:canvas ownerId = projectOwner(非 actor);成员建的画布仍属 project owner,owner 派生统一。
-    const result = await backend.createCanvasWithCollection(projectOwner.ownerId, id, cp, {
+    // T1.4:canvas ownerId = projectOwner(非 actor);成员/分享链接建的画布仍属 project owner,owner 派生统一。
+    const result = await backend.createCanvasWithCollection(projectAuthz.ownerId, id, cp, {
       method: 'POST',
       resourceKind: 'canvas',
       idempotencyKey,

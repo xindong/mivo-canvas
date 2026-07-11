@@ -151,7 +151,8 @@ export const createShareLinksRoutes = ({ backend, permissions }: { backend: Pers
     const authz = await resolveProjectAccess(c, backend, permissions, id, 'manage')
     if (!authz.ok) return denyProjectResponse(c, requestId, t0, authz)
     const linkId = c.req.param('linkId')
-    const result = await permissions.revokeShareLink(linkId)
+    // Greptile 修复:linkId 须属 :id 项目(防跨项目吊销;后端再校验 projectId)。
+    const result = await permissions.revokeShareLink(linkId, id)
     if (!result.ok) {
       const status = result.reason === 'already-revoked' ? 409 : 404
       logRequest({ method: c.req.method, path: c.req.path, requestId, status, latencyMs: Date.now() - t0, note: result.reason })
@@ -175,7 +176,8 @@ export const createShareLinksRoutes = ({ backend, permissions }: { backend: Pers
     const authz = await resolveProjectAccess(c, backend, permissions, id, 'manage')
     if (!authz.ok) return denyProjectResponse(c, requestId, t0, authz)
     const linkId = c.req.param('linkId')
-    const result = await permissions.unRevokeShareLink(linkId)
+    // Greptile 修复:linkId 须属 :id 项目(防跨项目恢复)。
+    const result = await permissions.unRevokeShareLink(linkId, id)
     if (!result.ok) {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'unknown-share-link' })
       return c.json({ error: 'unknown-share-link' }, 404)

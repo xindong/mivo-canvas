@@ -88,10 +88,10 @@ export interface PermissionBackend {
   resolveShareLinkByToken(token: string): Promise<(ShareResolution & { projectId: string }) | undefined>
   /** 列 project 全部分享链接(owner 管理用;含 revoked)。 */
   listShareLinks(projectId: string): Promise<ShareLink[]>
-  /** revoke(置 revoked_at;FX-7 §5.9:revoke 后 GET /share/:token → 410)。 */
-  revokeShareLink(linkId: string): Promise<RevokeResult>
-  /** un-revoke(清 revoked_at;30 天保留期内,FX-7 §5.9)。 */
-  unRevokeShareLink(linkId: string): Promise<UnRevokeResult>
+  /** revoke(置 revoked_at;FX-7 §5.9:revoke 后 GET /share/:token → 410)。projectId 校验:link 须属该 project(防跨项目吊销,Greptile)。 */
+  revokeShareLink(linkId: string, projectId: string): Promise<RevokeResult>
+  /** un-revoke(清 revoked_at;30 天保留期内,FX-7 §5.9)。projectId 校验:link 须属该 project(防跨项目恢复,Greptile)。 */
+  unRevokeShareLink(linkId: string, projectId: string): Promise<UnRevokeResult>
 
   // ── FX-7 接缝(供 persist backend softDeleteProjectTree 级联调用;本 PR 不在 persist 路径调用)──
   /** revoke 某 project 全部分享链接(FX-7 project 软删级联用;本 PR 实现,FX-7 PR 调用)。 */
@@ -260,18 +260,18 @@ export class InMemoryPermissionBackend implements PermissionBackend {
     return ids.map((id) => this.links.get(id)).filter((l): l is ShareLink => l !== undefined)
   }
 
-  async revokeShareLink(linkId: string): Promise<RevokeResult> {
+  async revokeShareLink(linkId: string, projectId: string): Promise<RevokeResult> {
     const link = this.links.get(linkId)
-    if (!link) return { ok: false, reason: 'not-found' }
+    if (!link || link.projectId !== projectId) return { ok: false, reason: 'not-found' } // 跨项目 → not-found(无泄漏)
     if (link.revokedAt) return { ok: false, reason: 'already-revoked' }
     const revoked: ShareLink = { ...link, revokedAt: nowIso(), updatedAt: nowIso() }
     this.links.set(linkId, revoked)
     return { ok: true, link: revoked }
   }
 
-  async unRevokeShareLink(linkId: string): Promise<UnRevokeResult> {
+  async unRevokeShareLink(linkId: string, projectId: string): Promise<UnRevokeResult> {
     const link = this.links.get(linkId)
-    if (!link) return { ok: false, reason: 'not-found' }
+    if (!link || link.projectId !== projectId) return { ok: false, reason: 'not-found' } // 跨项目 → not-found
     const unrevoked: ShareLink = { ...link, revokedAt: null, updatedAt: nowIso() }
     this.links.set(linkId, unrevoked)
     return { ok: true, link: unrevoked }

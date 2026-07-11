@@ -29,18 +29,29 @@ import { fingerprintOfPlatformKey, resolvePlatformCtx } from './keys'
 /**
  * 网关注入的可信身份 header(DP-4 §4)。值 = SSO `username`(maker user id)。
  * 生产 nginx `auth_request` 通过后注入 + strip 客户端自带(防伪造);缺失 → fingerprint fallback。
+ *
+ * **服务器侧防伪造(Greptile security 修复)**:此 header **仅在显式 opt-in**
+ * (`MIVO_TRUST_SSO_HEADER=1`)时才信任。默认关 → fallback 指纹(若 BFF 被绕过网关直连,
+ * 攻击者无法靠伪造 `x-mivo-auth-user` 冒充他人 owner)。生产部署:ops 在网关之后设此 flag +
+ * 网关 strip 客户端同名 header(对齐 auth-stub.ts 三重保险模式)。见 DP-4 §4/R-1。
  */
 export const SSO_TRUSTED_USER_HEADER = 'x-mivo-auth-user'
 
+/** x-mivo-auth-user 是否可信(opt-in,默认关防伪造)。 */
+export const isSsoHeaderTrusted = (env: NodeJS.ProcessEnv = process.env): boolean =>
+  env.MIVO_TRUST_SSO_HEADER === '1'
+
 /**
  * Actor user id for the /api/{canvas,projects,user-state} endpoints (返修 #1 + T1.4 DP-4).
- * T1.4:优先读网关注入的可信身份 `x-mivo-auth-user`(= SSO username = maker user id,§13.5 载体)。
- * 缺失(dev/legacy/无网关)→ fallback mivo_ 平台 key 指纹(FX-2;T1.3 owner===actor 自归属 parity)。
+ * T1.4:仅当 `MIVO_TRUST_SSO_HEADER=1`(网关后 opt-in)时读 `x-mivo-auth-user`(= SSO username = maker user id)。
+ * 否则(默认关 / dev / legacy / 无网关)→ fallback mivo_ 平台 key 指纹(T1.3 owner===actor 自归属 parity)。
  * 空 key(无 header + 无 env)→ 稳定 fallback 指纹(dev/legacy parity,同 tasks-per-user.test)。
  */
 export const resolveActor = (c: Context): string => {
-  const ssoUser = c.req.header(SSO_TRUSTED_USER_HEADER)?.trim()
-  if (ssoUser) return ssoUser // T1.4 carrier = maker user id (username,DP-4 一致)
+  if (isSsoHeaderTrusted()) {
+    const ssoUser = c.req.header(SSO_TRUSTED_USER_HEADER)?.trim()
+    if (ssoUser) return ssoUser // T1.4 carrier = maker user id (username,DP-4 一致)
+  }
   return fingerprintOfPlatformKey(resolvePlatformCtx(c).platformKey) // T1.3 fallback
 }
 
