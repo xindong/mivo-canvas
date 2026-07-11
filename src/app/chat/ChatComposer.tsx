@@ -16,6 +16,7 @@ import { useCanvasStore } from '../../store/canvasStore'
 import { ModelSelectorPopover } from './ModelSelectorPopover'
 import { RatioIcon, RatioPopover } from './RatioPopover'
 import { modelShortLabel } from './chatDisplayLabels'
+import { shouldSendOnEnter } from './composerEnterKey'
 
 type ReferenceFile = {
   id: string
@@ -138,7 +139,9 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
         onEsc?.()
         return
       }
-      if (e.key === 'Enter' && !e.shiftKey) {
+      // IME 合成态(输入法选候选词)下的 Enter 用于确认候选,不发送;
+      // 候选确认后再次按 Enter 才发送。Shift+Enter 仍为换行。
+      if (shouldSendOnEnter(e)) {
         e.preventDefault()
         void handleSend()
       }
