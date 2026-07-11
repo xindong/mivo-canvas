@@ -113,14 +113,15 @@ GET /api/share/:token   (公开入口,无需鉴权)
 | P-3 | **邀请接受流程未实现** | 本 PR `POST /api/projects/:id/members` 由 owner 直接添加成员(无需被邀请人接受);§13.5 第一版"仅 owner 可邀请"语义。邀请链接/接受 UI(boundary 4)另派。 |
 | P-4 | **member 上限未设** | 未限单 project member 数(DoS 面:owner 脚本批量加成员);第一版单用户 owner 信任,暂不设上限。生产前 review 再评估 rate-limit。 |
 | P-5 | **403 body 未进 shared 契约** | 见 DP-4 R-4;客户端 PersistAdapter 当前不触发 403(owner-only),editor/viewer UI 未建。 |
+| P-6 | **跨后端级联非原子 + 重试不收敛(已知 tradeoff)** | DELETE project 的 `softDeleteProjectTree`(PersistBackend)+ `revokeAllForProject`(PermissionBackend)非同一事务(详见 §7);第二步失败 → 500,project 已软删但 share_links 未 revoke(部分提交)。**重试不补齐第二步**:DELETE 重试命中 `!got.record.isDeleted` 短路返 204、POST 重试命中 `result.kind !== 'restored'` 返 200,均跳过级联。DELETE 侧靠 410 兜底 + restore 自愈(revoke 未落地则 un-revoke 无事可做);RESTORE 侧有缺口(链接残留 revoked,须人工 un-revoke/对账)。生产前 review saga/补偿事务让两侧幂等收敛。 |
 
 ## 7. 与 FX-7 软删语义的对齐
 
 | FX-7 实体 | T1.4 处理 |
 |---|---|
-| project soft delete 级联 share_links | T1.4 **未实现 project 软删级联到 share_links**(soft delete project 是 #194 persist backend 的 `softDeleteProjectTree`,本 PR 不改);**本 PR 在 revoke share-link 路由 + 列 share-link 时,不级联 project 软删**。FX-7 落地时由 FX-7 PR 在 `softDeleteProjectTree` 加 share_links 级联 + `restoreProjectTree` 恢复。本 PR 提供的 `PermissionBackend` 接口预留 `revokeAllForProject(projectId)` 供 FX-7 调用。 |
+| project soft delete 级联 share_links | ✅ **已实现(route 层,非 backend 内)**:`DELETE /api/projects/:id` 在 `backend.softDeleteProjectTree(...)` 成功后 `await permissions.revokeAllForProject(id)`(`server/routes/projects.ts:282-284`);`POST` 命中 deleted → `ensureCreate` 返 `restored` 后 `await permissions.unRevokeAllForProject(id)`(`projects.ts:153-155`)。**未改 `softDeleteProjectTree` 本身**(boundary 2/3 仍守);级联在 route handler 串两步,非 persist backend 内,故跨后端非原子(见下方 tradeoff,P-6)。 |
 | share_link revoke(`revoked_at`) | ✅ 本 PR 实现(revoke + un-revoke + 410)。 |
 | share_link purge 30 天 | ❌ FX-7 落地(P-1)。 |
 | 权限矩阵(§5.12) | ✅ 本 PR 实现(§2 矩阵)。 |
 
-→ 本 PR 与 FX-7 的接缝:`PermissionBackend.revokeAllForProject(projectId)`(供 FX-7 project 软删级联调用);FX-7 PR 负责在 persist backend 的 tree-soft-delete 里调它。**本 PR 不实现 project→share_links 级联软删**(那是 persist backend `softDeleteProjectTree` 的职责,属 #194/FX-7,boundary 2/3 不改)。
+→ **级联已实现(本 PR route 层),tradeoff 如下(P-6)**:`softDeleteProjectTree`(PersistBackend)与 `revokeAllForProject`/`unRevokeAllForProject`(PermissionBackend)是**两个后端、非同一事务**。route handler 串行 `await`,无 try/catch:第一步 project 软删/restore 提交后,第二步若抛错,route 返 **500(fail-visibly,Hono 默认 onError)**,此时 project 状态已落、share_links 级联未完成(**部分提交**)。**重试不补齐第二步**(Greptile 审查亦指出):DELETE 重试命中 `if (!got.record.isDeleted)` 短路(project 已软删)→ 跳过 `revokeAllForProject`,返 204;POST 重试命中 `result.kind !== 'restored'`(project 已 live)→ 跳过 `unRevokeAllForProject`,返 200。故 500 后状态可能**持久不收敛**,非"重发即补齐"。**对外安全性分两侧**:① **DELETE 侧**(revoke 失败)——project 软删后 `GET /api/share/:token` 在 token 仍活时还过 `backend.get(project).isDeleted` 检查 → **410 gone reason:project-deleted**(`server/routes/shareLinks.ts:227-230`)兜底,持 token 者读不到 project;且若 project 后被 restore,因 revoke 从未落地,un-revoke 无事可做,链接随 restore 自然回到活态(**自愈**)。② **RESTORE 侧**(un-revoke 失败)——**有收敛缺口**:share_links 残留 revoked,project 已 live 但链接仍返 410(reason:revoked),重试 POST 不触发 un-revoke;须 owner 手动 `POST /:id/share-links/:linkId/restore` 逐条 un-revoke,或跑对账补偿流(list share_links → 对齐 revoked 状态与 project liveness)。**不美化**:跨后端级联非原子,500 后 DELETE 侧靠 410 + restore 自愈兜底,RESTORE 侧靠人工/对账补偿,均非单事务回滚;以 #201 终审实测行为为准。P-6 建议生产前 review 是否上 saga/补偿事务使两侧幂等收敛。
