@@ -19,9 +19,11 @@ BEGIN;
 -- 一个 user 在一个 project 里恰有一个 role(UNIQUE(project_id, user_id))。
 -- owner 可由 projects.ownerId 派生(actor===ownerId → owner),也可显式存 'owner' 行(冗余但便于
 -- 统一查询);实施取"派生优先 + 显式行兜底"(见 permission-schema.md §3)。
+-- P1-4:project_id FK REFERENCES projects(id)(ON DELETE CASCADE:project purge → members 清);
+--   projects 表名 per T1.3 PG schema,本迁移在 projects 表迁移之后 apply;rebase 时确认/调整表名。
 CREATE TABLE IF NOT EXISTS project_members (
   id           text        PRIMARY KEY,                      -- surrogate uuid(应用层生成)
-  project_id   text        NOT NULL,                         -- FK → projects.id(T1.3 落地后)
+  project_id   text        NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   user_id      text        NOT NULL,                         -- maker user id(= SSO username,DP-4)
   role         text        NOT NULL CHECK (role IN ('owner', 'editor', 'viewer')),
   created_at   timestamptz NOT NULL DEFAULT now(),
@@ -39,10 +41,11 @@ CREATE INDEX IF NOT EXISTS idx_project_members_project_id ON project_members (pr
 
 -- ── share_links:分享链接(token 驱动,permission ≤ edit,不授 owner)──────────────
 -- token 密码学随机(不可枚举,32 bytes base64url ≈ 43 chars);revoked_at = FX-7 revoke 软删标记。
+-- P1-4:project_id FK REFERENCES projects(id) ON DELETE CASCADE(project purge → links 清);rebase 确认表名。
 CREATE TABLE IF NOT EXISTS share_links (
   id           text        PRIMARY KEY,                      -- surrogate uuid
   token        text        NOT NULL UNIQUE,                  -- 密码学随机,不可枚举
-  project_id   text        NOT NULL,                         -- FK → projects.id
+  project_id   text        NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   permission   text        NOT NULL CHECK (permission IN ('view', 'edit')),  -- ≤ editor,永不 owner
   created_by   text        NOT NULL,                         -- 创建者 user id(须为 project owner)
   created_at   timestamptz NOT NULL DEFAULT now(),

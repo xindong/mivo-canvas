@@ -41,18 +41,16 @@ describe('T1.4 header 常量', () => {
   })
 })
 
-describe('T1.4 ssoHeaderSecretOk(Greptile 第三轮:生产缺密钥不得信任 SSO header)', () => {
+describe('T1.4 ssoHeaderSecretOk(P1-2 fail-closed:无密钥任何模式都不信任 SSO header)', () => {
   it('配置了密钥 → 须匹配', () => {
     expect(ssoHeaderSecretOk({ MIVO_GATEWAY_SECRET: 's3cr3t' }, 's3cr3t')).toBe(true)
     expect(ssoHeaderSecretOk({ MIVO_GATEWAY_SECRET: 's3cr3t' }, 'wrong')).toBe(false)
     expect(ssoHeaderSecretOk({ MIVO_GATEWAY_SECRET: 's3cr3t' }, undefined)).toBe(false)
   })
-  it('未配置密钥 + 非生产(dev/test)→ 放行(本地无网关)', () => {
-    expect(ssoHeaderSecretOk({}, undefined)).toBe(true)
-    expect(ssoHeaderSecretOk({ NODE_ENV: 'development' }, undefined)).toBe(true)
-  })
-  it('未配置密钥 + 生产 → 不放行(防伪造,Greptile 第三轮)', () => {
+  it('未配置密钥 → 任何模式都 false(防伪造;dev/test 须显式设密钥)', () => {
+    expect(ssoHeaderSecretOk({}, undefined)).toBe(false)
+    expect(ssoHeaderSecretOk({ NODE_ENV: 'development' }, undefined)).toBe(false)
     expect(ssoHeaderSecretOk({ NODE_ENV: 'production' }, undefined)).toBe(false)
-    expect(ssoHeaderSecretOk({ NODE_ENV: 'production' }, 'anything')).toBe(false) // 无密钥配置,生产一律不信任
+    expect(ssoHeaderSecretOk({ NODE_ENV: 'production' }, 'anything')).toBe(false)
   })
 })

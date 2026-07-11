@@ -51,7 +51,12 @@ export type UpsertMemberResult =
 
 export type RemoveMemberResult = { ok: true; removed: ProjectMember } | { ok: false; reason: 'not-found' }
 export type RevokeResult = { ok: true; link: ShareLink } | { ok: false; reason: 'not-found' | 'already-revoked' }
-export type UnRevokeResult = { ok: true; link: ShareLink } | { ok: false; reason: 'not-found' }
+export type UnRevokeResult =
+  | { ok: true; link: ShareLink }
+  | { ok: false; reason: 'not-found' | 'window-closed' } // window-closed:revoke 超 30 天,不可恢复(FX-7 §5.9)
+
+/** FX-7 §5.9 un-revoke 30 天保留窗(超期不可恢复,purge 由 FX-7 定时落地)。 */
+export const UNREVOKE_WINDOW_MS = 30 * 24 * 60 * 60 * 1000
 
 /**
  * 权限层后端接口(成员 + 分享链接)。
@@ -90,12 +95,14 @@ export interface PermissionBackend {
   listShareLinks(projectId: string): Promise<ShareLink[]>
   /** revoke(置 revoked_at;FX-7 §5.9:revoke 后 GET /share/:token → 410)。projectId 校验:link 须属该 project(防跨项目吊销,Greptile)。 */
   revokeShareLink(linkId: string, projectId: string): Promise<RevokeResult>
-  /** un-revoke(清 revoked_at;30 天保留期内,FX-7 §5.9)。projectId 校验:link 须属该 project(防跨项目恢复,Greptile)。 */
+  /** un-revoke(清 revoked_at;FX-7 §5.9 30 天保留窗内)。projectId 校验 + 窗校验:超 30 天 → window-closed。 */
   unRevokeShareLink(linkId: string, projectId: string): Promise<UnRevokeResult>
 
-  // ── FX-7 接缝(供 persist backend softDeleteProjectTree 级联调用;本 PR 不在 persist 路径调用)──
-  /** revoke 某 project 全部分享链接(FX-7 project 软删级联用;本 PR 实现,FX-7 PR 调用)。 */
+  // ── FX-7 接缝(供 persist backend softDeleteProjectTree / restoreProjectTree 级联调用;本 PR 在 projects 路由调用)──
+  /** revoke 某 project 全部分享链接(FX-7 project 软删级联用)。 */
   revokeAllForProject(projectId: string): Promise<{ count: number }>
+  /** un-revoke 某 project 全部分享链接(FX-7 project 恢复级联用;30 天窗内才恢复)。 */
+  unRevokeAllForProject(projectId: string): Promise<{ count: number }>
 
   /** Test-only:清空。 */
   __reset(): void
@@ -272,6 +279,10 @@ export class InMemoryPermissionBackend implements PermissionBackend {
   async unRevokeShareLink(linkId: string, projectId: string): Promise<UnRevokeResult> {
     const link = this.links.get(linkId)
     if (!link || link.projectId !== projectId) return { ok: false, reason: 'not-found' } // 跨项目 → not-found
+    // FX-7 §5.9:un-revoke 30 天窗;超期不可恢复(purge 由 FX-7 定时)
+    if (link.revokedAt && Date.now() - Date.parse(link.revokedAt) > UNREVOKE_WINDOW_MS) {
+      return { ok: false, reason: 'window-closed' }
+    }
     const unrevoked: ShareLink = { ...link, revokedAt: null, updatedAt: nowIso() }
     this.links.set(linkId, unrevoked)
     return { ok: true, link: unrevoked }
@@ -291,12 +302,35 @@ export class InMemoryPermissionBackend implements PermissionBackend {
     return { count }
   }
 
+  async unRevokeAllForProject(projectId: string): Promise<{ count: number }> {
+    const ids = this.linksByProject.get(projectId) ?? []
+    let count = 0
+    const now = nowIso()
+    for (const id of ids) {
+      const link = this.links.get(id)
+      // 仅恢复 30 天窗内的 revoked link(FX-7 §5.9);超期保持 revoked(purge 由 FX-7 定时)
+      if (link && link.revokedAt && Date.now() - Date.parse(link.revokedAt) <= UNREVOKE_WINDOW_MS) {
+        this.links.set(id, { ...link, revokedAt: null, updatedAt: now })
+        count++
+      }
+    }
+    return { count }
+  }
+
   __reset(): void {
     this.members.clear()
     this.sharedByUser.clear()
     this.links.clear()
     this.linksByToken.clear()
     this.linksByProject.clear()
+  }
+
+  /** Test-only:把某 link 的 revokedAt 设为指定 ISO(测 30 天 un-revoke 窗;FX-7 §5.9)。 */
+  __setLinkRevokedAtForTest(linkId: string, revokedAtIso: string): boolean {
+    const link = this.links.get(linkId)
+    if (!link) return false
+    this.links.set(linkId, { ...link, revokedAt: revokedAtIso })
+    return true
   }
 }
 

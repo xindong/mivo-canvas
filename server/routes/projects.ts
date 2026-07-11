@@ -67,9 +67,9 @@ const badIfMatch = (id: string) => ({ error: 'bad-request' as const, message: 'I
 export const createProjectsRoutes = ({ backend, permissions }: { backend: PersistBackend; permissions: PermissionBackend }): Hono<AppEnv> => {
   const route = new Hono<AppEnv>()
 
-  /** T1.4 授权 seam(委托 lib/projectAuthz;非成员 → 404,成员越权 → 403,revoked share → 410)。 */
-  const authzProject = (c: Context<AppEnv>, id: string, action: AuthzAction) =>
-    resolveProjectAccess(c, backend, permissions, id, action)
+  /** T1.4 授权 seam(委托 lib/projectAuthz;非成员 → 404,成员越权 → 403,revoked share → 410,deleted project → 404 除 allowDeleted)。 */
+  const authzProject = (c: Context<AppEnv>, id: string, action: AuthzAction, opts?: { allowDeleted?: boolean }) =>
+    resolveProjectAccess(c, backend, permissions, id, action, opts)
   const denyProject = (c: Context<AppEnv>, requestId: string, t0: number, r: { ok: false; status: number; body: unknown }): Response =>
     denyProjectResponse(c, requestId, t0, r)
 
@@ -149,6 +149,10 @@ export const createProjectsRoutes = ({ backend, permissions }: { backend: Persis
     if (result.kind === 'parent-not-live') {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'parent-not-live' })
       return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
+    }
+    // FX-7 §7:project 软删后重建(restore)→ un-revoke 其 share_links(30 天窗内;链接随 project 恢复而恢复)。
+    if (result.kind === 'restored') {
+      await permissions.unRevokeAllForProject(id)
     }
     const status = result.kind === 'created' ? 201 : 200
     logRequest({ method: c.req.method, path: c.req.path, requestId, status, latencyMs: Date.now() - t0 })
@@ -266,7 +270,8 @@ export const createProjectsRoutes = ({ backend, permissions }: { backend: Persis
       return bad
     }
     const id = c.req.param('id')
-    const authz = await authzProject(c, id, 'manage')
+    // P1-3:DELETE 幂等(删已删 → 204)须访问已删 project → allowDeleted=true;其他子资源用默认(不允许)。
+    const authz = await authzProject(c, id, 'manage', { allowDeleted: true })
     if (!authz.ok) return denyProject(c, requestId, t0, authz)
     const got = await backend.get(authz.ownerId, 'project', id)
     if (got.kind === 'missing') {
@@ -275,6 +280,8 @@ export const createProjectsRoutes = ({ backend, permissions }: { backend: Persis
     }
     if (!got.record.isDeleted) {
       await backend.softDeleteProjectTree(authz.ownerId, id)
+      // FX-7 §7:project 软删 → 级联 revoke 其 share_links(project 不可见则分享链接失效)。
+      await permissions.revokeAllForProject(id)
     }
     logRequest({ method: c.req.method, path: c.req.path, requestId, status: 204, latencyMs: Date.now() - t0 })
     return c.body(null, 204)

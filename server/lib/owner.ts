@@ -67,16 +67,18 @@ export const validateSsoConfig = (env: NodeJS.ProcessEnv = process.env): string[
 }
 
 /**
- * 网关共享密钥是否通过(Greptile security 第三轮修复:生产缺密钥不得信任 SSO header)。
+ * 网关共享密钥是否通过(T1.4 终审 P1-2 fail-closed:无密钥 → 任何模式都不得信任 SSO header)。
  * - 配置了 MIVO_GATEWAY_SECRET → 要求 x-mivo-gateway-secret 匹配(网关注入,客户端不可构造)。
- * - 未配置密钥 → 仅非生产(dev/test)放行(无网关本地 dev);**生产缺密钥 → 不通过**(防伪造)。
- * @param env env(MIVO_GATEWAY_SECRET / NODE_ENV)
+ * - **未配置密钥 → 一律 false(含 dev/test)**:不靠部署约定堵伪造,服务器侧 fail-closed。
+ *   dev/test 测成员角色:显式设 MIVO_GATEWAY_SECRET + 请求带 x-mivo-gateway-secret(见测试)。
+ *   生产:网关注入密钥 + strip 客户端同名 header(部署依赖 R-1;本 PR 服务器侧 fail-closed)。
+ * @param env env(MIVO_GATEWAY_SECRET)
  * @param headerSecret 请求 x-mivo-gateway-secret header 值
  */
 export const ssoHeaderSecretOk = (env: NodeJS.ProcessEnv, headerSecret: string | undefined): boolean => {
   const gatewaySecret = env.MIVO_GATEWAY_SECRET
-  if (gatewaySecret) return headerSecret?.trim() === gatewaySecret // 配置:须匹配
-  return env.NODE_ENV !== 'production' // 未配置:仅非生产放行;生产缺密钥 → false(不信任 SSO header)
+  if (!gatewaySecret) return false // fail-closed:无密钥 → 永不信任(防伪造身份头,任何模式)
+  return headerSecret?.trim() === gatewaySecret // 配置:须匹配
 }
 
 /**

@@ -26,7 +26,8 @@ export type ProjectAccessResult =
 
 /**
  * 解析 actor 对 project 的访问(action-aware 角色矩阵)。
- * 先 getProjectOwner(全局归属);再 share-token 或 actor+member 解析 AuthzInfo;canAccessProject 判。
+ * 先 getProjectOwner(全局归属);**P1-3:再 fetch project record 判 live(deleted → 404,子资源不可见)**,
+ * 除 allowDeleted 例外(DELETE project 幂等:删已删 → 204,不拒);再 share-token 或 actor+member 解析 AuthzInfo;canAccessProject 判。
  */
 export const resolveProjectAccess = async (
   c: Context<AppEnv>,
@@ -34,9 +35,18 @@ export const resolveProjectAccess = async (
   permissions: PermissionBackend,
   id: string,
   action: AuthzAction,
+  opts: { allowDeleted?: boolean } = {},
 ): Promise<ProjectAccessResult> => {
   const owner = backend.getProjectOwner(id)
   if (!owner) return { ok: false, status: 404, body: { error: 'unknown-project' } satisfies UnknownResourceBody }
+  // P1-3:deleted/missing project → 子资源(members/share-links)不可见 → 404(无泄漏);
+  // allowDeleted 例外:DELETE project 幂等(删已删 → 204)需访问已删 project,故不拒。
+  if (!opts.allowDeleted) {
+    const proj = await backend.get(owner.ownerId, 'project', id)
+    if (proj.kind === 'missing' || proj.record.isDeleted) {
+      return { ok: false, status: 404, body: { error: 'unknown-project' } satisfies UnknownResourceBody }
+    }
+  }
   const shareToken = shareTokenOf(c)
   if (shareToken) {
     const share = await permissions.resolveShareLink(shareToken, id)

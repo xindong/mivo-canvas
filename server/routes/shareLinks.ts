@@ -179,8 +179,10 @@ export const createShareLinksRoutes = ({ backend, permissions }: { backend: Pers
     // Greptile 修复:linkId 须属 :id 项目(防跨项目恢复)。
     const result = await permissions.unRevokeShareLink(linkId, id)
     if (!result.ok) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'unknown-share-link' })
-      return c.json({ error: 'unknown-share-link' }, 404)
+      // window-closed:revoke 超 30 天不可恢复(FX-7 §5.9)→ 410;not-found → 404。
+      const status = result.reason === 'window-closed' ? 410 : 404
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status, latencyMs: Date.now() - t0, note: result.reason })
+      return c.json({ error: result.reason === 'window-closed' ? 'gone' : 'unknown-share-link' }, status)
     }
     logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0, note: 'restored' })
     return c.json(toShareLinkResponse(result.link), 200)
@@ -192,6 +194,8 @@ export const createShareLinksRoutes = ({ backend, permissions }: { backend: Pers
 // ── 公开访问路由(挂 /api/share;无鉴权,token 驱动)──
 export const createShareAccessRoutes = ({ backend, permissions }: { backend: PersistBackend; permissions: PermissionBackend }): Hono<AppEnv> => {
   const route = new Hono<AppEnv>()
+  // P2-2:日志不泄漏完整 token;c.req.path 含 /api/share/<token>,统一脱敏。
+  const MASKED_SHARE_PATH = '/api/share/<masked>'
 
   // GET /api/share/:token — 公开入口;resolve token → project + canvases(read);revoked→410,unknown→404。
   route.get('/:token', async (c) => {
@@ -201,31 +205,31 @@ export const createShareAccessRoutes = ({ backend, permissions }: { backend: Per
     const token = c.req.param('token') ?? ''
     const link = await permissions.resolveShareLinkByToken(token)
     if (!link) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'unknown-share-token' })
+      logRequest({ method: c.req.method, path: MASKED_SHARE_PATH, requestId, status: 404, latencyMs: Date.now() - t0, note: 'unknown-share-token' })
       return c.json({ error: 'unknown-share-token' }, 404) // 无存在泄漏
     }
     if (link.kind === 'revoked') {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 410, latencyMs: Date.now() - t0, note: 'gone' })
+      logRequest({ method: c.req.method, path: MASKED_SHARE_PATH, requestId, status: 410, latencyMs: Date.now() - t0, note: 'gone' })
       return c.json({ error: 'gone', reason: 'revoked' }, 410) // FX-7 §5.9
     }
     if (link.kind === 'expired') {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 410, latencyMs: Date.now() - t0, note: 'gone' })
+      logRequest({ method: c.req.method, path: MASKED_SHARE_PATH, requestId, status: 410, latencyMs: Date.now() - t0, note: 'gone' })
       return c.json({ error: 'gone', reason: 'expired' }, 410)
     }
     // active:返 project + canvases(read)
     const projectOwner = backend.getProjectOwner(link.projectId)
     if (!projectOwner) {
       // project 已 purge/不存在 → 410(链接活但资源没了)
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 410, latencyMs: Date.now() - t0, note: 'gone' })
+      logRequest({ method: c.req.method, path: MASKED_SHARE_PATH, requestId, status: 410, latencyMs: Date.now() - t0, note: 'gone' })
       return c.json({ error: 'gone', reason: 'project-deleted' }, 410)
     }
     const got = await backend.get(projectOwner.ownerId, 'project', link.projectId)
     if (got.kind === 'missing' || got.record.isDeleted) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 410, latencyMs: Date.now() - t0, note: 'gone' })
+      logRequest({ method: c.req.method, path: MASKED_SHARE_PATH, requestId, status: 410, latencyMs: Date.now() - t0, note: 'gone' })
       return c.json({ error: 'gone', reason: 'project-deleted' }, 410)
     }
     const canvases = (await backend.listCanvasByProject(projectOwner.ownerId, link.projectId)).records
-    logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0 })
+    logRequest({ method: c.req.method, path: MASKED_SHARE_PATH, requestId, status: 200, latencyMs: Date.now() - t0 })
     return c.json({
       project: toProjectMeta(got.record),
       canvases: canvases.map(toCanvasMeta),
