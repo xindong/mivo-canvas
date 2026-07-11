@@ -469,9 +469,67 @@ export class InMemoryPersistBackend implements PersistBackend {
   }
 
   /**
+   * F1 返修五:restored 同步临界区(无 await 缝)——createCanvasWithCollection 的 restored/replay-deleted 路径
+   * 把 parent-live 复验 + restoreCanvasTreeInPlace + ensureCollectionLive + globalCanvasOwners + idempotencyIndex
+   * 全部纳入同一不可让渡临界区。JS 单线程下同步块不可被 microtask 打断(queueMicrotask(softDeleteProjectTree)
+   * 无法在临界区中间插入),根除 TOCTOU live orphan。内存实现=同步临界区 + 快照覆盖全部索引(canvas meta +
+   * chat-collection + globalCanvasOwners + idempotencyIndex);fault 注入 throw 时全索引回滚到 pre-state。
+   */
+  private restoreCanvasWithCollectionCritical(
+    ownerId: string,
+    canvasId: string,
+    canvasPayload: unknown,
+    opts: { idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string },
+  ): EnsureCreateResult {
+    // 复验 parent live(临界区入口;同步块不可中断,进入即定 live,整块执行不可让渡)。
+    const pid = asCanvasMeta(canvasPayload)?.projectId
+    if (pid && !this.projectLive(ownerId, pid)) return { kind: 'parent-not-live' }
+
+    const b = this.bucket(ownerId)
+    const canvasKey = recordKey(ownerId, 'canvas', canvasId)
+    const collKey = recordKey(ownerId, 'chat-collection', canvasId)
+    const idemKey = opts.idempotencyKey
+      ? idemIndexKey(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey)
+      : undefined
+
+    // 快照覆盖全部索引(canvas meta + collection + globalCanvasOwners + idempotencyIndex)。
+    const hadCanvas = b.get(canvasKey)
+    const hadColl = b.get(collKey)
+    const hadGlobalCanvasOwner = this.globalCanvasOwners.get(canvasId)
+    const hadIdem = idemKey ? this.idempotencyIndex.get(idemKey) : undefined
+
+    try {
+      // restore canvas meta + chat-collection(同步:undelete+bump+payload merge;内部自快照回滚)。
+      this.restoreCanvasTreeInPlace(ownerId, canvasId, { payload: canvasPayload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint })
+      // ensureCollectionLive(同步:防旧数据/恢复遗漏产生 orphan)。
+      this.ensureCollectionLive(ownerId, canvasId)
+      // globalCanvasOwners:canvas 之前已注册;确保指向 ownerId(防 orphan 归属错)。
+      this.globalCanvasOwners.set(canvasId, ownerId)
+      // idempotencyIndex:更新 envelopeKey + fingerprint(restored 路径定入)。
+      this.setIdemIndex(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, canvasKey, opts.bodyFingerprint ?? '')
+      const restored = this.find(ownerId, 'canvas', canvasId)
+      if (!restored) throw new Error('restoreCanvasWithCollectionCritical: post-restore canvas missing')
+      return { kind: 'restored', record: clone(restored) }
+    } catch (err) {
+      // 全索引回滚(零 live orphan + 全索引一致;fault 注入 throw 含 globalCanvasOwners/idemIndex)。
+      if (hadCanvas === undefined) b.delete(canvasKey)
+      else b.set(canvasKey, hadCanvas)
+      if (hadColl === undefined) b.delete(collKey)
+      else b.set(collKey, hadColl)
+      if (hadGlobalCanvasOwner === undefined) this.globalCanvasOwners.delete(canvasId)
+      else this.globalCanvasOwners.set(canvasId, hadGlobalCanvasOwner)
+      if (idemKey) {
+        if (hadIdem === undefined) this.idempotencyIndex.delete(idemKey)
+        else this.idempotencyIndex.set(idemKey, hadIdem)
+      }
+      throw err
+    }
+  }
+
+  /**
    * F1:canvas + chat-collection 单一原子创建原语。route POST /api/canvas 只调这一个(防两段 TOCTOU orphan)。
    * 顺序:F4(全局唯一)→ F1(parent live)→ 幂等 replay(reuse-conflict/restored/existing)→ existing/restored/fresh。
-   * - restored/existing:restoreCanvasTree(原子恢复 canvas+collection)+ ensureCollectionLive(防遗漏)。
+   * - restored/replay-deleted:restoreCanvasWithCollectionCritical(同步临界区,无 await 缝;全索引快照回滚)。
    * - created(fresh):canvas meta + chat-collection 同一原子操作(快照回滚;失败回到 pre-state,不部分建 → 无 orphan)。
    */
   async createCanvasWithCollection(
@@ -497,13 +555,9 @@ export class InMemoryPersistBackend implements PersistBackend {
         if (r) {
           // N4:同 key 不同 fingerprint(不同 body)→ reuse-conflict(route 422)。
           if (opts.bodyFingerprint && entry.fingerprint !== opts.bodyFingerprint) return { kind: 'reuse-conflict' }
-          // N2:幂等命中 deleted → 真恢复(restoreCanvasTree 原子恢复 canvas meta + chat-collection)+ ensureCollectionLive。
+          // N2/F1 返修五:幂等命中 deleted → 真恢复(同步临界区:复验 parent live + restore + ensureCollectionLive + 全索引更新/回滚,无 await 缝)。
           if (r.isDeleted) {
-            await this.restoreCanvasTree(ownerId, canvasId, { payload: canvasPayload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint })
-            this.ensureCollectionLive(ownerId, canvasId)
-            const restored = this.find(ownerId, 'canvas', canvasId)!
-            this.setIdemIndex(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, recordKey(ownerId, 'canvas', canvasId), opts.bodyFingerprint ?? '')
-            return { kind: 'restored', record: clone(restored) }
+            return this.restoreCanvasWithCollectionCritical(ownerId, canvasId, canvasPayload, opts)
           }
           // existing live:collection 已随 canvas 原子创建;ensureCollectionLive 防御旧数据。
           this.ensureCollectionLive(ownerId, canvasId)
@@ -519,19 +573,20 @@ export class InMemoryPersistBackend implements PersistBackend {
       return { kind: 'existing', record: clone(existing) }
     }
     if (existing && existing.isDeleted) {
-      // N2:parent live(已验 F1)→ restoreCanvasTree(canvas meta + chat-collection)+ ensureCollectionLive。
-      await this.restoreCanvasTree(ownerId, canvasId, { payload: canvasPayload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint })
-      this.ensureCollectionLive(ownerId, canvasId)
-      const restored = this.find(ownerId, 'canvas', canvasId)!
-      this.setIdemIndex(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, recordKey(ownerId, 'canvas', canvasId), opts.bodyFingerprint ?? '')
-      return { kind: 'restored', record: clone(restored) }
+      // N2/F1 返修五:parent live(已验 F1)→ restored 同步临界区(复验 + restore + ensureCollectionLive + 全索引更新/回滚,无 await 缝)。
+      return this.restoreCanvasWithCollectionCritical(ownerId, canvasId, canvasPayload, opts)
     }
-    // 不存在 → 原子 created(canvas meta + chat-collection 同一操作;快照回滚;无 TOCTOU 窗口)。
+    // 不存在 → 原子 created(canvas meta + chat-collection 同一操作;快照回滚覆盖全部索引;无 TOCTOU 窗口)。
     const b = this.bucket(ownerId)
     const canvasKey = recordKey(ownerId, 'canvas', canvasId)
     const collKey = recordKey(ownerId, 'chat-collection', canvasId)
     const hadCanvas = b.get(canvasKey)
     const hadColl = b.get(collKey)
+    const hadGlobalCanvasOwner = this.globalCanvasOwners.get(canvasId)
+    const idemKey = opts.idempotencyKey
+      ? idemIndexKey(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey)
+      : undefined
+    const hadIdem = idemKey ? this.idempotencyIndex.get(idemKey) : undefined
     const ts = nowIso()
     const canvasRec: PersistRecord = {
       id: canvasId, ownerId, canvasId: null, type: 'canvas', scope: 'document', revision: 0, orderKey: 0,
@@ -549,11 +604,17 @@ export class InMemoryPersistBackend implements PersistBackend {
       this.globalCanvasOwners.set(canvasId, ownerId)
       this.setIdemIndex(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, canvasKey, opts.bodyFingerprint ?? '')
     } catch (err) {
-      // 回滚:canvas meta + chat-collection 回到 pre-state(不部分建 → 树内零 live orphan)。
+      // 全索引回滚:canvas meta + chat-collection + globalCanvasOwners + idempotencyIndex 回到 pre-state(不部分建 → 树内零 live orphan)。
       if (hadCanvas === undefined) b.delete(canvasKey)
       else b.set(canvasKey, hadCanvas)
       if (hadColl === undefined) b.delete(collKey)
       else b.set(collKey, hadColl)
+      if (hadGlobalCanvasOwner === undefined) this.globalCanvasOwners.delete(canvasId)
+      else this.globalCanvasOwners.set(canvasId, hadGlobalCanvasOwner)
+      if (idemKey) {
+        if (hadIdem === undefined) this.idempotencyIndex.delete(idemKey)
+        else this.idempotencyIndex.set(idemKey, hadIdem)
+      }
       throw err
     }
     return { kind: 'created', record: clone(canvasRec) }
@@ -1015,11 +1076,17 @@ export class InMemoryPersistBackend implements PersistBackend {
     }
   }
 
-  async restoreCanvasTree(
+  /**
+   * N2 同步临界区:canvas meta + chat-collection undelete+bump+payload merge(单原子,快照回滚)。
+   * F1 返修五:createCanvasWithCollection restored 路径直接调此同步版——无 await 让出点,JS 单线程下
+   * microtask(queueMicrotask(softDeleteProjectTree))无法在临界区中间插入,根除 TOCTOU live orphan。
+   * public restoreCanvasTree(async)保留 interface 契约,内部委托此同步实现(route/测试调用面不变)。
+   */
+  private restoreCanvasTreeInPlace(
     ownerId: string,
     canvasId: string,
     opts: { payload?: unknown; idempotencyKey?: string; fingerprint?: string } = {},
-  ): Promise<{ count: number }> {
+  ): number {
     const b = this.bucket(ownerId)
     const ts = nowIso()
     const targets: string[] = []
@@ -1041,11 +1108,19 @@ export class InMemoryPersistBackend implements PersistBackend {
         const extra = isMeta ? { idempotencyKey: opts.idempotencyKey, fingerprint: opts.fingerprint } : {}
         b.set(key, { ...clone(r), payload: newPayload, isDeleted: false, revision: r.revision + 1, updatedAt: ts, ...extra })
       }
-      return { count: targets.length }
+      return targets.length
     } catch (err) {
       for (const [key, rec] of snapshot) b.set(key, rec)
       throw err
     }
+  }
+
+  async restoreCanvasTree(
+    ownerId: string,
+    canvasId: string,
+    opts: { payload?: unknown; idempotencyKey?: string; fingerprint?: string } = {},
+  ): Promise<{ count: number }> {
+    return { count: this.restoreCanvasTreeInPlace(ownerId, canvasId, opts) }
   }
 
   async softDeleteProjectTree(ownerId: string, projectId: string): Promise<{ count: number }> {

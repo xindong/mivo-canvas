@@ -17,6 +17,15 @@
 //    服务端 tsconfig 含 ES2023 可类型检查)。
 
 import type { AnchorRecord, EdgeRecord, NodeRecord } from '../src/kernel/records'
+import {
+  MARKUP_KIND_VALUES,
+  MARKUP_BRUSH_KIND_VALUES,
+  CANVAS_STAMP_KIND_VALUES,
+  SECTION_LOCK_MODE_VALUES,
+  MARKDOWN_DISPLAY_MODE_VALUES,
+  MARKUP_STROKE_STYLE_VALUES as MARKUP_STROKE_STYLE_CONST,
+  EXPERIMENTAL_ANCHOR_TYPE_VALUES,
+} from '../src/types/mivoCanvas'
 
 /** per-record revision(envelope 唯一真相,节点级合并 LWW tie-break,platform §13.5)。 */
 export type Revision = number
@@ -315,15 +324,21 @@ export const SENSITIVE_FIELD_PATTERN =
 const CREDENTIAL_VALUE_PREFIX = /^(mivo_|sk-)/
 
 /**
- * 规范化字符串:URL-decode-to-fixed-point(最多 5 次,异常即停)+ lower-case。N6/F3 credential 扫描用。
- * F3 双重编码:单次 decode 不够——`%2561piKey`→`%61piKey`→`apiKey`;`%256divo_xxx`→`%6divo_xxx`→`mivo_xxx`;
- * `%2553k-test`→`%53k-test`→`Sk-test`。循环 decode 至不再变化或达上限 5 次,异常即停(用最后一次成功值,
- * 含原始值)。**保留 raw 扫描**:无 `%` 的字符串 fixed-point 立即返回(raw 形态直接被后续 regex 命中,如
- * `apiKey`/`mivo_xxx`/`sk-test`),decode 只会**增加**匹配(把编码变体还原成 credential),不会丢 raw 命中。
+ * 规范化字符串:URL-decode-to-fixed-point(循环至不再变化)+ lower-case。N6/F3 credential 扫描用。
+ * F3 返修五(真不动点):不再用固定层数上限——循环 decode 至不再变化(fixed point),防 DoS 用**累计解码
+ * 输出长度阈值**(MAX_DECODE_TOTAL)而非固定层数。单次 decode 不会让字符串变长(%XX 3 字符→1 字符,其余 1:1),
+ * 故正常输入单调缩短至无 `%` 即收敛;累计输出长度阈值兜底恶意超长/构造输入(超阈即停,用最后一次成功值)。
+ * F3 多层编码:单次 decode 不够——`%2561piKey`→`%61piKey`→`apiKey`(2 层);`%252561piKey`→3 层;
+ * `%252525252561piKey`→6 层→`apiKey`;`%256divo_xxx`→`%6divo_xxx`→`mivo_xxx`;`%2553k-test`→`%53k-test`→`Sk-test`。
+ * 异常即停(尾部 malformed `%`,用最后一次成功值,含原始值)。**保留 raw 扫描**:无 `%` 的字符串 fixed-point
+ * 立即返回(raw 形态直接被后续 regex 命中,如 `apiKey`/`mivo_xxx`/`sk-test`),decode 只会**增加**匹配
+ * (把编码变体还原成 credential),不会丢 raw 命中。6 层 `%252525252561piKey` 命中(旧 5 次上限阻断第 6 次 → 漏)。
  */
+const MAX_DECODE_TOTAL = 1_048_576 // 累计解码输出长度阈值(DoS 上限);decode 单调缩短,正常多层远不达
 const normalizeForScan = (s: string): string => {
   let cur = s
-  for (let i = 0; i < 5; i++) {
+  let total = s.length
+  for (;;) {
     let next: string
     try {
       next = decodeURIComponent(cur)
@@ -331,9 +346,10 @@ const normalizeForScan = (s: string): string => {
       return cur.toLowerCase() // 异常即停:用最后一次成功值(或原始值,含 raw credential)
     }
     if (next === cur) return cur.toLowerCase() // fixed point(无 % 或已收敛)
+    total += next.length
+    if (total > MAX_DECODE_TOTAL) return next.toLowerCase() // 累计输出长度阈值防 DoS(超长输入不卡死)
     cur = next
   }
-  return cur.toLowerCase()
 }
 
 /** 凭据格式值命中(规范后 mivo_/sk- 前缀)。N6:大小写/URL 编码变体均命中。 */
@@ -506,7 +522,13 @@ const NODE_TYPE_VALUES = new Set([
   'image', 'task-placeholder', 'text', 'frame', 'ai-slot', 'annotation', 'markup', 'markdown', 'pdf', 'video',
 ])
 const EDGE_TYPE_VALUES = new Set(['generate', 'edit'])
-const ANCHOR_TYPE_VALUES = new Set(['point', 'box'])
+// F6 返修五:anchor type + markup/stamp/section/markdown 枚举从 src/types 单一来源导出(别手抄字符串表)。
+const ANCHOR_TYPE_VALUES = new Set(EXPERIMENTAL_ANCHOR_TYPE_VALUES)
+const MARKUP_KIND_SET = new Set(MARKUP_KIND_VALUES)
+const MARKUP_BRUSH_KIND_SET = new Set(MARKUP_BRUSH_KIND_VALUES)
+const CANVAS_STAMP_KIND_SET = new Set(CANVAS_STAMP_KIND_VALUES)
+const SECTION_LOCK_MODE_SET = new Set(SECTION_LOCK_MODE_VALUES)
+const MARKDOWN_DISPLAY_MODE_SET = new Set(MARKDOWN_DISPLAY_MODE_VALUES)
 
 // F6:编译期 exhaustiveness——NodeRecord/EdgeRecord/AnchorRecord 加字段必须同步 *_PAYLOAD_KEYS,
 // 否则下一行类型 = never,赋值 true 编译失败(Exclude<keyof Payload, KEYS[number]> extends never 模式:
@@ -537,7 +559,7 @@ const obj = (fields: Record<string, Check>, required?: readonly string[]): Check
 const arr = (element: Check): Check => ({ t: 'array', element })
 const union = (tag: string, variants: Record<string, Check>): Check => ({ t: 'union', tag, variants })
 
-const MARKUP_STROKE_STYLE_VALUES = new Set(['solid', 'dashed'])
+const MARKUP_STROKE_STYLE_VALUES = new Set(MARKUP_STROKE_STYLE_CONST)
 const CONNECTOR_ANCHOR_VALUES = new Set(['center', 'top', 'right', 'bottom', 'left'])
 const LAYOUT_MODE_VALUES = new Set(['none', 'auto'])
 const LAYOUT_DIRECTION_VALUES = new Set(['horizontal', 'vertical'])
@@ -607,15 +629,30 @@ const EFFECT_ELEMENT: Check = union('kind', {
 })
 // §2.7 markupPoints {x,y,pressure?}
 const MARKUP_POINT: Check = obj({ x: scalar(isNum), y: scalar(isNum), pressure: scalar(isNum) }, ['x', 'y'])
-// §3.9 experimentalAnchors element(ExperimentalAnchor;node-embedded 带 id;box 强制 width/height——record-schema §3.9)
-const ANCHOR_ELEMENT: Check = obj(
-  {
-    id: scalar(isStr), type: scalar(isStrEnum(ANCHOR_TYPE_VALUES)), targetNodeId: scalar(isStr),
-    x: scalar(isNum), y: scalar(isNum), instruction: scalar(isStr), createdAt: scalar(isNum),
-    width: scalar(isNum), height: scalar(isNum), resultNodeIds: arr(scalar(isStr)),
-  },
-  ['id', 'type', 'targetNodeId', 'x', 'y', 'instruction', 'createdAt'],
-)
+// §3.9 anchor variant(ExperimentalAnchor / AnchorRecord;type 判别 union——F6 返修五:
+// box 必填 width+height,point 拒 box 专属字段 width/height。point anchor 带 width → unknown-field 400;
+// box anchor 缺 width/height → missing-field 400;type 不在 variants → unknown-field 400。
+// experimentalAnchors 元素(带 id)与顶层 anchor wire payload(Omit id)共用 fields,仅 id required 差异。)
+const ANCHOR_POINT_FIELDS: Record<string, Check> = {
+  id: scalar(isStr), type: scalar(isStrEnum(ANCHOR_TYPE_VALUES)), targetNodeId: scalar(isStr),
+  x: scalar(isNum), y: scalar(isNum), instruction: scalar(isStr), createdAt: scalar(isNum),
+  resultNodeIds: arr(scalar(isStr)),
+}
+const ANCHOR_BOX_FIELDS: Record<string, Check> = {
+  id: scalar(isStr), type: scalar(isStrEnum(ANCHOR_TYPE_VALUES)), targetNodeId: scalar(isStr),
+  x: scalar(isNum), y: scalar(isNum), instruction: scalar(isStr), createdAt: scalar(isNum),
+  width: scalar(isNum), height: scalar(isNum), resultNodeIds: arr(scalar(isStr)),
+}
+// ANCHOR_ELEMENT:node 内嵌 experimentalAnchors 元素(id 必填,ExperimentalAnchor.id)。
+const ANCHOR_ELEMENT: Check = union('type', {
+  point: obj(ANCHOR_POINT_FIELDS, ['id', 'type', 'targetNodeId', 'x', 'y', 'instruction', 'createdAt']),
+  box: obj(ANCHOR_BOX_FIELDS, ['id', 'type', 'targetNodeId', 'x', 'y', 'instruction', 'createdAt', 'width', 'height']),
+})
+// ANCHOR_WIRE_ELEMENT:顶层 anchor wire payload(id 来自 path,Omit;variant required 不含 id,spec 放行 id optional)。
+const ANCHOR_WIRE_ELEMENT: Check = union('type', {
+  point: obj(ANCHOR_POINT_FIELDS, ['type', 'targetNodeId', 'x', 'y', 'instruction', 'createdAt']),
+  box: obj(ANCHOR_BOX_FIELDS, ['type', 'targetNodeId', 'x', 'y', 'instruction', 'createdAt', 'width', 'height']),
+})
 // §3.5 asset {url, mimeType?, originalName?, sizeBytes?}
 const ASSET_REF: Check = obj(
   { url: scalar(isStr), mimeType: scalar(isStr), originalName: scalar(isStr), sizeBytes: scalar(isNum) },
@@ -673,10 +710,10 @@ const PAYLOAD_SPECS: Record<'node' | 'edge' | 'anchor', Check> = {
     layout: LAYOUT, constraints: CONSTRAINTS, asset: ASSET_REF, relations: RELATIONS, text: scalar(isStr),
     fontSize: scalar(isNum), textColor: scalar(isStr), fontWeight: scalar(isNum),
     textAlign: scalar((v) => isStr(v) && (v === 'left' || v === 'center' || v === 'right')),
-    textAutoWidth: scalar(isBool), markupKind: scalar(isStr), markupBrushKind: scalar(isStr),
-    markupStampKind: scalar(isStr), markupPoints: arr(MARKUP_POINT), markupStartArrow: scalar(isBool),
+    textAutoWidth: scalar(isBool), markupKind: scalar(isStrEnum(MARKUP_KIND_SET)), markupBrushKind: scalar(isStrEnum(MARKUP_BRUSH_KIND_SET)),
+    markupStampKind: scalar(isStrEnum(CANVAS_STAMP_KIND_SET)), markupPoints: arr(MARKUP_POINT), markupStartArrow: scalar(isBool),
     markupEndArrow: scalar(isBool), markupCornerRadius: scalar(isNum), sectionTitleVisible: scalar(isBool),
-    sectionLockMode: scalar(isStr), sectionTemplateId: scalar(isStr), markdownDisplayMode: scalar(isStr),
+    sectionLockMode: scalar(isStrEnum(SECTION_LOCK_MODE_SET)), sectionTemplateId: scalar(isStr), markdownDisplayMode: scalar(isStrEnum(MARKDOWN_DISPLAY_MODE_SET)),
     imageHasTransparency: scalar(isBool), assetSourceDimensions: DIMENSIONS, imageCrop: RECT,
     sourceNodeId: scalar(isStr), groupId: scalar(isStr), locked: scalar(isBool), hidden: scalar(isBool),
     favorited: scalar(isBool), generation: GENERATION, aiWorkflow: AI_WORKFLOW,
@@ -686,14 +723,7 @@ const PAYLOAD_SPECS: Record<'node' | 'edge' | 'anchor', Check> = {
     { id: scalar(isStr), from: scalar(isStr), to: scalar(isStr), type: scalar(isStrEnum(EDGE_TYPE_VALUES)), prompt: scalar(isStr), createdAt: scalar(isNum) },
     ['from', 'to', 'type', 'prompt', 'createdAt'],
   ),
-  anchor: obj(
-    {
-      id: scalar(isStr), type: scalar(isStrEnum(ANCHOR_TYPE_VALUES)), targetNodeId: scalar(isStr),
-      x: scalar(isNum), y: scalar(isNum), instruction: scalar(isStr), createdAt: scalar(isNum),
-      width: scalar(isNum), height: scalar(isNum), resultNodeIds: arr(scalar(isStr)),
-    },
-    ['type', 'targetNodeId', 'x', 'y', 'instruction', 'createdAt'],
-  ),
+  anchor: ANCHOR_WIRE_ELEMENT,
 }
 
 /** F6:递归扫 status/tasks(任意层)——返回首个命中 path(无则 null)。top-level 与 nested(relations/fills 内藏)一视同仁。 */

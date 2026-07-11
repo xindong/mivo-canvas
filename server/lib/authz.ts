@@ -2,9 +2,11 @@
 // T1.3 授权 seam(返修 #1 + N7 真接线)。
 // 权威:docs/decisions/api-surface.md §1(返修版)+ platform §13.5(归属模型)。
 //
-// 返修 #1/N7:拆 actorUserId 与 resourceOwnerId;get/list 经 owner/member/share 授权 seam 后取资源。
+// 返修 #1/N7:拆 actorUserId 与 resourceOwnerId;单资源 route(GET/PUT/PATCH/DELETE/child/move/reorder/chat)
+// 经 canAccess* 授权 seam 后以 resourceOwner 查询;list 暂保 actor-scoped(listByOwner(actor),T1.4 需新增
+// authorized-list 查询面——owner/member/share 过滤后再返,不改单资源 route 的 resourceOwner 语义)。
 // N7:action-aware(read/write/move)authz,判 source + target(move 时)。T1.3 owner===actor → 所有 action allow
-// (接口/查询路径按授权模型建,T1.4 只扩不改:加 member/share + per-action 差异)。
+// (单资源 route 已 resourceOwner 化;权限扩展仅改 canAccess*:加 member/share + per-action 差异,route/契约不变)。
 // 未授权统一 404(无存在泄漏,§1);授权 seam 进契约测试(cross-owner 404、actor===resourceOwner allow)。
 // canAccess* 必须 route 真调用(不许有定义无调用,N7)。
 //

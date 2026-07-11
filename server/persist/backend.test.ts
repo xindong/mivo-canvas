@@ -326,4 +326,67 @@ describe('InMemoryPersistBackend — 返修四 F1 createCanvasWithCollection 原
     expect((await b.get('o', 'chat-collection', 'c1')).kind).toBe('missing')
     expect(b.getCanvasOwner('c1')).toBeUndefined()
   })
+
+  it('F1 返修五 restored 同步临界区:queueMicrotask(softDeleteProjectTree) 无法在临界区中间插入 → 零 live orphan', async () => {
+    // 预置:c1 live + collection live,然后 softDeleteCanvasTree(c1 + collection isDeleted),parent project p1 仍 live。
+    await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+    await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+    await b.softDeleteCanvasTree('o', 'c1')
+    expect((await rec('canvas', 'c1')).isDeleted).toBe(true)
+    expect((await rec('chat-collection', 'c1')).isDeleted).toBe(true)
+
+    // 塞 microtask:模拟并发 DELETE project(softDeleteProjectTree cascade 软删 project + 其 canvas + chat-collection)。
+    let microRan = false
+    queueMicrotask(() => { b.softDeleteProjectTree('o', 'p1'); microRan = true })
+
+    // 调 restored:返修五同步临界区(restoreCanvasWithCollectionCritical,无 await 缝)→ microtask 无法在临界区
+    // 中间插入;临界区同步完成时 c1+collection live、parent 仍 live。await 让 microtask 在函数返回后执行:
+    // softDeleteProjectTree cascade 软删 c1+collection。零 live orphan(c1+collection 最终 isDeleted,非 live orphan)。
+    // 旧实现(restored 路径有 await restoreCanvasTree)会让 microtask 在 restore 中间执行 → cascade 后 ensureCollectionLive
+    // 又恢复 collection live under deleted project = live orphan(本测试断言 collection isDeleted===true 钉死该回归)。
+    const r = await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+    expect(r.kind).toBe('restored')
+    await Promise.resolve() // 确保 queueMicrotask 已 drain
+    expect(microRan).toBe(true)
+    expect(b.projectLive('o', 'p1')).toBe(false)
+    const c1 = await b.get('o', 'canvas', 'c1')
+    if (c1.kind === 'found') expect(c1.record.isDeleted).toBe(true)
+    const coll = await b.get('o', 'chat-collection', 'c1')
+    if (coll.kind === 'found') expect(coll.record.isDeleted).toBe(true) // 零 live orphan(非 ensureCollectionLive 恢复的 live)
+  })
+
+  it('F1 返修五 restored 临界区 fault 注入(globalCanvasOwners.set 后 throw)→ 全索引回滚(canvas meta + collection + globalCanvasOwners + idempotencyIndex)', async () => {
+    await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+    await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas', idempotencyKey: 'k1', bodyFingerprint: 'fp1' })
+    await b.softDeleteCanvasTree('o', 'c1') // c1 + collection isDeleted;globalCanvasOwners('c1')='o' 保留;idemIndex('k1') 指向 canvas record
+    const beforeCanvas = await rec('canvas', 'c1')
+    const beforeColl = await rec('chat-collection', 'c1')
+    const idemIdx = (b as unknown as { idempotencyIndex: Map<string, { envelopeKey: string; fingerprint: string }> }).idempotencyIndex
+    const beforeIdem = idemIdx.get('o:POST:canvas:k1')
+    expect(beforeIdem).toBeDefined()
+    expect(b.getCanvasOwner('c1')?.ownerId).toBe('o')
+
+    // 注入:globalCanvasOwners.set throw(在 restoreCanvasTreeInPlace + ensureCollectionLive 之后,setIdemIndex 之前)。
+    const gco = (b as unknown as { globalCanvasOwners: Map<string, string> }).globalCanvasOwners
+    const origSet = gco.set.bind(gco)
+    gco.set = function () {
+      gco.set = origSet // 恢复,让 catch 内回滚 set 不被拦截
+      throw new Error('injected fault')
+    } as Map<string, string>['set']
+
+    // replay-deleted 命中 → restored 临界区;globalCanvasOwners.set throw → 全索引回滚。
+    await expect(b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas', idempotencyKey: 'k1', bodyFingerprint: 'fp1' })).rejects.toThrow('injected fault')
+    gco.set = origSet
+
+    // 全索引回滚:canvas meta + collection 恢复 isDeleted(无 live orphan);globalCanvasOwners 回滚(仍 'o');idemIndex 回滚(envelopeKey + fingerprint 不变)。
+    const afterCanvas = await rec('canvas', 'c1')
+    expect(afterCanvas.isDeleted).toBe(true)
+    expect(afterCanvas.revision).toBe(beforeCanvas.revision) // 未 bump(回滚到 pre-state)
+    const afterColl = await rec('chat-collection', 'c1')
+    expect(afterColl.isDeleted).toBe(true)
+    expect(afterColl.revision).toBe(beforeColl.revision)
+    expect(b.getCanvasOwner('c1')?.ownerId).toBe('o') // globalCanvasOwners 回滚
+    const afterIdem = idemIdx.get('o:POST:canvas:k1')
+    expect(afterIdem).toEqual(beforeIdem) // idempotencyIndex 回滚(envelopeKey + fingerprint 不变)
+  })
 })

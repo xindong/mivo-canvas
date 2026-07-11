@@ -593,4 +593,47 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
     expect(collAfter.kind).toBe('found')
     if (collAfter.kind === 'found') expect(collAfter.record.isDeleted).toBe(true)
   })
+
+  it('P2-3/F6 返修五 route 级:PATCH node markupKind=bogus → 400;anchor box 缺 width → 400;point 带 width → 400', async () => {
+    await seedProject()
+    await seedCanvas()
+    const baseNode = {
+      id: 'n1', type: 'markup' as const, title: 't', revision: 0,
+      transform: { x: 0, y: 0, width: 100, height: 100, rotation: 0 },
+      fills: [] as unknown[], strokes: [] as unknown[], effects: [] as unknown[], relations: {} as Record<string, unknown>,
+    }
+    // markupKind=bogus → 400 bad-type markupKind(enum predicate,从 src/types 单一来源导出;旧 scalar(isStr) 放行)
+    const bogus = await patchChildWithFixture(app, 'c1', 'node', 'n1', wirePayload({ ...baseNode, markupKind: 'bogus' }))
+    expect(bogus.status).toBe(400)
+    expect(bogus.body).toMatchObject({ error: 'payload-rejected', reason: 'bad-type', field: 'markupKind' })
+    // 合法 markupKind → 200(控制组:枚举合法值通过)
+    const ok = await patchChildWithFixture(app, 'c1', 'node', 'n1', wirePayload({ ...baseNode, markupKind: 'arrow' }))
+    expect(ok.status).toBe(200)
+
+    // anchor box 缺 width → 400 missing-field width(type 判别 union:box 必填 width+height)
+    const boxMissing = await patchChildWithFixture(app, 'c1', 'anchor', 'a1', wirePayload({ id: 'a1', type: 'box', targetNodeId: 'n2', x: 0, y: 0, instruction: 'i', createdAt: 1, revision: 0, height: 10 }))
+    expect(boxMissing.status).toBe(400)
+    expect(boxMissing.body).toMatchObject({ error: 'payload-rejected', reason: 'missing-field', field: 'width' })
+    // anchor point 带 width → 400 unknown-field width(point 拒 box 专属字段)
+    const pointWidth = await patchChildWithFixture(app, 'c1', 'anchor', 'a2', wirePayload({ id: 'a2', type: 'point', targetNodeId: 'n2', x: 0, y: 0, instruction: 'i', createdAt: 1, revision: 0, width: 10 }))
+    expect(pointWidth.status).toBe(400)
+    expect(pointWidth.body).toMatchObject({ error: 'payload-rejected', reason: 'unknown-field', field: 'width' })
+  })
+
+  it('P2-4 返修五 route 级:owner-only 语义不变——A 访问自己资源全通(GET/PATCH);B 跨 owner 404(无存在泄漏)', async () => {
+    await seedProject() // owner A 的 p1
+    await seedCanvas()  // owner A 的 c1
+    // A 自己 GET canvas → 200(owner===resourceOwner seam)
+    const aGet = await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })
+    expect(aGet.status).toBe(200)
+    // B 跨 owner GET canvas → 404
+    const bGet = await req(app, '/api/canvas/c1', { headers: hdr(KEY_B) })
+    expect(bGet.status).toBe(404)
+    // A 自己 PATCH node → 200
+    const aPatch = await patchChildWithFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
+    expect(aPatch.status).toBe(200)
+    // B 跨 owner PATCH node → 404(单资源 route 已 resourceOwner 化,canAccessCanvas 拒跨 owner)
+    const bPatch = await req(app, '/api/canvas/c1/nodes/n1', { method: 'PATCH', headers: hdr(KEY_B), body: JSON.stringify({ payload: wirePayload(canonicalNode('n1')) }) })
+    expect(bPatch.status).toBe(404)
+  })
 })

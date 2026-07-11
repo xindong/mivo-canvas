@@ -453,3 +453,16 @@ export type SceneDefinition = {
   selectedNodeId?: string
   selectedNodeIds?: string[]
 }
+
+// ── F6 返修五:runtime enum 值数组(单一来源,shared/persist-contract.ts enum predicate 用)──
+// 用 `as const satisfies readonly T[]` 让编译期保证数组元素穷尽 type 且不漂移;改枚举必须同步此处,
+// 否则 satisfies 报错。服务端 tsconfig ES2023 可编译(纯数据数组,无 DOM/Node API;type import 已 erase)。
+export const MARKUP_KIND_VALUES = ['arrow', 'line', 'rect', 'ellipse', 'brush', 'note', 'stamp'] as const satisfies readonly MarkupKind[]
+export const MARKUP_BRUSH_KIND_VALUES = ['marker', 'highlighter'] as const satisfies readonly MarkupBrushKind[]
+export const CANVAS_STAMP_KIND_VALUES = [
+  'plus-one', 'heart', 'star', 'check', 'question', 'thumbs-down', 'down-2', 'face', 'smile', 'eyes',
+] as const satisfies readonly CanvasStampKind[]
+export const SECTION_LOCK_MODE_VALUES = ['all', 'background'] as const satisfies readonly SectionLockMode[]
+export const MARKDOWN_DISPLAY_MODE_VALUES = ['full', 'preview'] as const satisfies readonly MarkdownDisplayMode[]
+export const MARKUP_STROKE_STYLE_VALUES = ['solid', 'dashed'] as const satisfies readonly MarkupStrokeStyle[]
+export const EXPERIMENTAL_ANCHOR_TYPE_VALUES = ['point', 'box'] as const satisfies readonly ExperimentalAnchorType[]
