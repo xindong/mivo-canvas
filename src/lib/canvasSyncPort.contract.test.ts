@@ -1,5 +1,5 @@
 // src/lib/canvasSyncPort.contract.test.ts
-// G1-b port 形状编译期 + 运行期约束(transport-neutral 自证 + 返修 F1/F3 契约测试)。
+// G1-b port 形状编译期 + 运行期约束(transport-neutral 自证 + 返修 F1/F3 契约测试 + R2-P1-1/2/3)。
 //
 // 自证逻辑(对应计划 §4 G1-b 验收"N2-0 前生产代码无某候选独占的画布 transport DTO"):
 // 用 @ts-expect-error 证明 CanvasChange/FieldIntent/SnapshotCursor/RejectionReason 不收候选独占形状
@@ -7,10 +7,18 @@
 // 负向类型互锁惯例同 serverPersistAdapter.contract.test.ts(F5 baseContentVersion 必填互锁)。
 // 运行时也验占位实现 fail visibly(与 unwiredServerPersistAdapter 同型,防误以为已同步)。
 //
-// 返修(G1-b 双审 REQUIRES_CHANGES,2026-07-12):
+// 返修 R1(G1-b 双审 REQUIRES_CHANGES,2026-07-12):
 //  - F1 契约:field-intent 无损——同 record 不同字段并发两边都留、未编辑字段不被提交、嵌套叶子不整树替换、reorder 有意图。
 //  - F3 契约:终态拒绝 outcome 映射(401/403/revoke/400/413/422→rejected;409→conflict;5xx/408/429→retryable;200→accepted),
 //    无终态误重试、无假成功(accepted 必携服务端 cursor)。
+//
+// 返修 R2(G1-b 第二轮 REQUIRES_CHANGES,2026-07-12,见 REVIEW-FINDINGS-G1B-R2.md):
+//  - R2-P1-1 封死 clobber:FieldPath 非空 tuple(空路径编译期拒)+ validateFieldIntent 拒非原子 set(整对象/整数组 clobber 封死)
+//    + A→B/B→A 双向对称。真实 Y.Doc 验证放 spike 侧(yjs-mapping.spike.test.ts,保 yjs 不进生产 bundle)。
+//  - R2-P1-2 create→edit 因果:per-record FIFO hold 契约——pending create ack 前 hold 同 record edit/delete,
+//    edit 不独立 404;create 终态失败→依赖 edit rejected(dependency-failed,非 not-found);真·不存在 record edit→not-found(边界分开)。
+//  - R2-P1-3 404-delete cursor:204/404 缺 cursor 不构造 accepted(防常量冒充);经 loadSnapshot authoritative load 取真实 cursor 后才 accepted;
+//    load 返 null(canvas 不存在/无权)→ rejected(forbidden),不误报成功。
 
 import { describe, it, expect, expectTypeOf } from 'vitest'
 import type {
@@ -18,10 +26,15 @@ import type {
   CanvasSyncPort,
   ChangeOutcome,
   FieldIntent,
+  FieldPath,
   RejectionReason,
   SnapshotCursor,
 } from './canvasSyncPort'
-import { unwiredCanvasSyncPort } from './canvasSyncPort'
+import {
+  FieldIntentError,
+  unwiredCanvasSyncPort,
+  validateFieldIntent,
+} from './canvasSyncPort'
 
 // ── 接口面存在且签名稳定(正向编译期断言)──────────────────────────────────
 describe('CanvasSyncPort interface surface (G1-b transport-neutral)', () => {
@@ -55,6 +68,26 @@ describe('CanvasSyncPort interface surface (G1-b transport-neutral)', () => {
     expectTypeOf<SnapshotCursor>().not.toEqualTypeOf<number>()
     expectTypeOf<SnapshotCursor>().not.toEqualTypeOf<number[]>()
     void cursor
+  })
+
+  // 返修 R2-P1-1:FieldPath 是非空 tuple——空路径 [] 编译期即拒(空路径无定位叶子 = 整 record clobber 的合法重表达,封死)。
+  it('R2-P1-1: FieldPath is a NON-EMPTY tuple (empty path rejected at compile time)', () => {
+    expectTypeOf<FieldPath>().toEqualTypeOf<readonly [string | number, ...(string | number)[]]>()
+    // 多段合法
+    const multi: FieldPath = ['fills', 0, 'color']
+    expect(multi).toHaveLength(3)
+    // 空 [] 编译期拒(下面 @ts-expect-error 钉死)
+    // @ts-expect-error 空 fieldPath 不满足非空 tuple 至少 1 段——封死空路径 clobber 表达
+    const _empty: FieldPath = []
+    void _empty
+  })
+
+  it('R2-P1-1: validateFieldIntent + FieldIntentError are exported (domain rule frozen at port)', () => {
+    expectTypeOf<typeof validateFieldIntent>().toBeFunction()
+    expectTypeOf<FieldIntentError>().toHaveProperty('violation')
+    expectTypeOf<FieldIntentError['violation']>().toEqualTypeOf<'empty-field-path' | 'non-atomic-parent-set'>()
+    // runtime smoke:非原子 set 抛 FieldIntentError(封死 clobber 表达)
+    expect(() => validateFieldIntent({ op: 'set', fieldPath: ['transform'], value: { x: 1 } })).toThrow(FieldIntentError)
   })
 })
 
@@ -103,7 +136,9 @@ describe('red-line: candidate-monopolized shapes are rejected by the port type',
 describe('F1: field-level edit intent is lossless under concurrency', () => {
   // 测试内参考 apply:证明 FieldIntent[] 语义在「按 fieldPath 定点 set」下无损。
   // 这是 port 冻结的域语义的参考实现(adapter 各自实现,但语义须与此一致)。
+  // 返修 R2-P1-1:apply 前先逐条过 validateFieldIntent(封死 clobber——非原子 set 在此即抛,不进 wire)。
   const applyFieldIntents = <R extends Record<string, unknown>>(base: R, intents: FieldIntent[]): R => {
+    for (const intent of intents) validateFieldIntent(intent) // 域级 validator 先校验(封死 clobber)
     const out: Record<string, unknown> = JSON.parse(JSON.stringify(base))
     for (const intent of intents) {
       const path = [...intent.fieldPath]
@@ -175,6 +210,77 @@ describe('F1: field-level edit intent is lossless under concurrency', () => {
     expect(after.fills[0].color).toBe('#f00')
     expect(after.fills[1].color).toBe('#fff') // 兄弟元素不受影响
   })
+
+  // ── 返修 R2-P1-1:封死 clobber 负例 + A→B/B→A 双向对称 ──────────────────
+  it('R2-P1-1 NEGATIVE: validator rejects empty fieldPath (runtime defense for as-cast bypass)', () => {
+    // tuple 编译期已拒空路径;validator 再兜运行时 as 旁路(防 as unknown as FieldIntent 强构造空路径)。
+    const empty = { op: 'set', fieldPath: [] as unknown as FieldPath, value: 1 } as FieldIntent
+    expect(() => validateFieldIntent(empty)).toThrow(FieldIntentError)
+    expect(() => validateFieldIntent(empty)).toThrow(/empty-field-path/)
+  })
+
+  it('R2-P1-1 NEGATIVE: set whole OBJECT at parent path is rejected (clobber sealed)', () => {
+    // 首审 clobber 可经 {set,['transform'],整对象} 合法重表达——validator 拒非原子 set 封死。
+    // 这是 spike 坑7(A 整 record/transform 重写吞 B 的 transform.y=999)在 field-intent 层的等价攻击面。
+    const wholeObject: FieldIntent = {
+      op: 'set',
+      fieldPath: ['transform'],
+      value: { x: 1, y: 2, width: 3, height: 4, rotation: 0 },
+    }
+    expect(() => validateFieldIntent(wholeObject)).toThrow(FieldIntentError)
+    expect(() => validateFieldIntent(wholeObject)).toThrow(/non-atomic-parent-set/)
+  })
+
+  it('R2-P1-1 NEGATIVE: set whole ARRAY at parent path is rejected (Y.Array clobber sealed)', () => {
+    // 整 fills 数组替换 = Y.Array 整树替换,并发下吞 peer 的 insert——与整对象 clobber 同质,一并封死。
+    // 数组结构编辑(增/删元素)非 FieldIntent 表达,deferred to N2-0 §10.1;数组叶子编辑(['fills',0,'color'])仍支持。
+    const wholeArray: FieldIntent = {
+      op: 'set',
+      fieldPath: ['fills'],
+      value: [{ id: 'f1', color: '#000' }],
+    }
+    expect(() => validateFieldIntent(wholeArray)).toThrow(FieldIntentError)
+    expect(() => validateFieldIntent(wholeArray)).toThrow(/non-atomic-parent-set/)
+  })
+
+  it('R2-P1-1 NEGATIVE: set whole array ELEMENT (object) is rejected — must decompose to leaf sets', () => {
+    // set ['fills',0] 整对象 = 整元素替换 = 整子树 clobber;须分解为 ['fills',0,'color'] 等原子叶子 set。
+    const wholeElement: FieldIntent = {
+      op: 'set',
+      fieldPath: ['fills', 0],
+      value: { id: 'f1', color: '#f00' },
+    }
+    expect(() => validateFieldIntent(wholeElement)).toThrow(/non-atomic-parent-set/)
+  })
+
+  it('R2-P1-1 POSITIVE: atomic leaf sets + delete-field pass validator', () => {
+    expect(() => validateFieldIntent({ op: 'set', fieldPath: ['transform', 'x'], value: 100 })).not.toThrow()
+    expect(() => validateFieldIntent({ op: 'set', fieldPath: ['title'], value: 'n' })).not.toThrow()
+    expect(() => validateFieldIntent({ op: 'set', fieldPath: ['fills', 0, 'color'], value: '#f00' })).not.toThrow()
+    expect(() => validateFieldIntent({ op: 'set', fieldPath: ['locked'], value: false })).not.toThrow()
+    expect(() => validateFieldIntent({ op: 'set', fieldPath: ['meta', 'x'], value: null })).not.toThrow() // null 是原子叶子
+    expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['title'] })).not.toThrow()
+  })
+
+  it('R2-P1-1 SYMMETRY: A→B and B→A converge to same merged state for non-overlapping fields', () => {
+    // 并发无交叠字段时,合并结果与 apply 顺序无关(交换律)——CRDT 收敛性的域语义投影。
+    const base = { transform: { x: 0, y: 0 }, title: 'orig', locked: false }
+    const a: FieldIntent[] = [
+      { op: 'set', fieldPath: ['transform', 'x'], value: 100 },
+      { op: 'set', fieldPath: ['title'], value: 'A' },
+    ]
+    const b: FieldIntent[] = [
+      { op: 'set', fieldPath: ['transform', 'y'], value: 200 },
+      { op: 'delete-field', fieldPath: ['locked'] },
+    ]
+    const ab = applyFieldIntents(applyFieldIntents(base, a), b) // A→B
+    const ba = applyFieldIntents(applyFieldIntents(base, b), a) // B→A
+    expect(ab).toEqual(ba) // 双向对称收敛
+    expect(ab.transform.x).toBe(100) // A 的字段留
+    expect(ab.transform.y).toBe(200) // B 的字段留
+    expect(ab.title).toBe('A')
+    expect('locked' in ab).toBe(false) // B 的 delete 生效
+  })
 })
 
 // ── 返修 F3:终态拒绝 + 权威 accepted(契约证明)─────────────────────────
@@ -213,13 +319,11 @@ describe('F3: terminal rejections + authoritative accepted (no mis-retry, no fal
     expect(o.kind).not.toBe('accepted')
   })
 
-  it('404 non-delete → rejected(not-found); 404 delete → accepted (delete-vs-update: delete wins)', () => {
-    // N2-0 §10.4:delete-vs-update → delete wins;删除后再 delete 返 404 → 幂等 accepted(已删=目标态)。
+  it('404 non-delete → rejected(not-found) (truly-unknown record edit/patch)', () => {
+    // 真·不存在 record 的 edit → 404 → rejected(not-found)(与 pending-local-create 的 edit 区分,见 R2-P1-2 段)。
     const nonDel = mapHttpStatusToOutcome(404)
     expect(nonDel.kind).toBe('rejected')
     if (nonDel.kind === 'rejected') expect(nonDel.reason).toBe('not-found')
-    const del = mapHttpStatusToOutcome(404, { isDelete: true })
-    expect(del.kind).toBe('accepted')
   })
 
   it('409 → conflict (concurrent write); returns currentCursor + diverging for rebase', () => {
@@ -267,6 +371,7 @@ describe('F3: terminal rejections + authoritative accepted (no mis-retry, no fal
   })
 
   it('RejectionReason is a closed domain enum (no HTTP number / Yjs frame in the port type)', () => {
+    // 返修 R2-P1-2:加 'dependency-failed'(create 终态失败时依赖 edit 的 surface,非 not-found)。
     expectTypeOf<RejectionReason>().toEqualTypeOf<
       | 'unauthorized'
       | 'forbidden'
@@ -274,8 +379,232 @@ describe('F3: terminal rejections + authoritative accepted (no mis-retry, no fal
       | 'too-large'
       | 'reuse-conflict'
       | 'bad-request'
+      | 'dependency-failed'
       | 'terminal'
     >()
+  })
+
+  // ── 返修 R2-P1-3:404-delete cursor 不冒充(authoritative load 方案)────────
+  // 真实 DELETE 204(null body)/已删 404 均不带 cursor/seq(server/routes/canvas.ts deleteChild lead 核证);
+  // 404 还可能是 canvas 不存在/无权(authz.denyStatus 404 隐藏存在性,server/lib/authz.ts)。
+  // 故 delete-* accepted 必经 loadSnapshot authoritative load 取真实 cursor;缺 cursor 的 204/404 不构造 accepted。
+  const SERVER_SEQ_42 = 'server-seq-42' as unknown as SnapshotCursor
+  const SERVER_SEQ_43 = 'server-seq-43' as unknown as SnapshotCursor
+
+  type LoadResult = { cursor: SnapshotCursor; recordPresent: boolean } | null
+
+  // delete 流程:delete(status) → 若无 cursor,adapter 须做 loadSnapshot authoritative load → 据 load 结果构造 outcome。
+  const mapDeleteOutcome = (status: number, load: LoadResult): ChangeOutcome => {
+    if (load === null) {
+      // 无 authoritative cursor:404+null-load = canvas 不存在/无权(authz.denyStatus 404)→ rejected(forbidden);
+      // 204+null-load = delete 已成功但 cursor 暂不可得 → retryable(re-load 取 cursor)。**两者皆非 accepted**(无法冒充 cursor)。
+      if (status === 404) return { kind: 'rejected', reason: 'forbidden' }
+      return { kind: 'retryable', reason: 'cursor-pending-authoritative-load' }
+    }
+    if (status === 404 && load.recordPresent) {
+      // 404 但 load 见 record 仍在 → race(record 被并发重建);conflict,非 accepted。
+      return { kind: 'conflict', currentCursor: load.cursor, diverging: [] }
+    }
+    // 204(已删)或 404(已删,load 确认 record 不在)→ accepted,携**真实 load 来的 cursor**(非常量冒充)。
+    return { kind: 'accepted', cursor: load.cursor }
+  }
+
+  it('R2-P1-3: 204/404 delete WITHOUT authoritative cursor → NOT accepted (cannot fabricate cursor)', () => {
+    // 缺 cursor 的 204/404 无法构造 accepted——防测试 helper 用常量 cursor 冒充权威(首审 bug)。
+    const del204NoCursor = mapDeleteOutcome(204, null)
+    const del404NoCursor = mapDeleteOutcome(404, null)
+    expect(del204NoCursor.kind).not.toBe('accepted')
+    expect(del404NoCursor.kind).not.toBe('accepted')
+  })
+
+  it('R2-P1-3: 204 delete + authoritative load → accepted with REAL server cursor (not a constant)', () => {
+    const del = mapDeleteOutcome(204, { cursor: SERVER_SEQ_42, recordPresent: false })
+    expect(del.kind).toBe('accepted')
+    if (del.kind === 'accepted') expect(del.cursor).toBe(SERVER_SEQ_42) // 真实 load 的 cursor,非常量
+  })
+
+  it('R2-P1-3: idempotent delete — 404 + load confirms record gone → accepted with real cursor (delete-vs-update: delete wins)', () => {
+    // N2-0 §10.4:delete-vs-update → delete wins;已删再 delete 返 404 → 经 load 确认 record 不在 → accepted(幂等,目标态达成)。
+    const del = mapDeleteOutcome(404, { cursor: SERVER_SEQ_43, recordPresent: false })
+    expect(del.kind).toBe('accepted')
+    if (del.kind === 'accepted') expect(del.cursor).toBe(SERVER_SEQ_43) // 真实 cursor,非冒充
+  })
+
+  it('R2-P1-3: unknown canvas / no permission (404 + load returns null) → rejected(forbidden), NOT false success', () => {
+    // 404 可能是 canvas 不存在/无权(authz.denyStatus 404 隐藏存在性)——load 返 null 证 canvas 不可达 → 不误报 accepted。
+    const del = mapDeleteOutcome(404, null)
+    expect(del.kind).toBe('rejected')
+    if (del.kind === 'rejected') expect(del.reason).toBe('forbidden')
+    expect(del.kind).not.toBe('accepted') // 不误报成功
+  })
+
+  it('R2-P1-3: 404 + load sees record still present → conflict (race: record reappeared concurrently)', () => {
+    // 404 但 authoritative load 见 record 仍在 → 并发 race(record 被他端重建)→ conflict,非假 accepted。
+    const del = mapDeleteOutcome(404, { cursor: SERVER_SEQ_42, recordPresent: true })
+    expect(del.kind).toBe('conflict')
+    if (del.kind === 'conflict') expect(del.currentCursor).toBe(SERVER_SEQ_42)
+  })
+})
+
+// ── 返修 R2-P1-2:create→edit 同 record 因果(per-record FIFO hold 契约)──────────
+describe('R2-P1-2: per-record FIFO causality (pending create holds same-record edit/delete)', () => {
+  // 参考 impl(port 冻结的因果契约的可实现性证明,同 applyFieldIntents 的参考性质):
+  // submitChange(create-*) pending 期间,同 recordId 的 edit-*/delete-* 被 hold(不独立提交 → 不独立 404)。
+  // create ack 后按序 flush;create 终态失败 → 依赖 edit/delete surface rejected(dependency-failed,非 not-found)。
+  // 真·不存在 record(无 pending create)的 edit → 直接提交 → rejected(not-found)(与 pending-create 边界分开)。
+
+  const recordIdOf = (c: CanvasChange): string | null => {
+    if ('nodeId' in c) return c.nodeId
+    if ('edgeId' in c) return c.edgeId
+    if ('anchorId' in c) return c.anchorId
+    if ('node' in c) return c.node.id
+    if ('edge' in c) return c.edge.id
+    if ('anchor' in c) return c.anchor.id
+    return null
+  }
+  const isCreateKind = (c: CanvasChange): boolean => c.kind.startsWith('create-')
+
+  // transport: 记录提交序;create(默认)把 rid 加入 known 并 accepted;rejectCreates 时 create→rejected(bad-request)且 rid 不入 known;
+  // edit/delete 命中 known→accepted,未知→404 not-found。
+  const makeTransport = (opts: { rejectCreates?: boolean } = {}) => {
+    const known = new Set<string>()
+    const log: CanvasChange[] = []
+    const transport = (c: CanvasChange): ChangeOutcome => {
+      log.push(c)
+      const rid = recordIdOf(c)
+      if (rid && isCreateKind(c)) {
+        if (opts.rejectCreates) return { kind: 'rejected', reason: 'bad-request' }
+        known.add(rid)
+        return { kind: 'accepted', cursor: 'create-seq' as unknown as SnapshotCursor }
+      }
+      if (rid && known.has(rid)) return { kind: 'accepted', cursor: 'edit-seq' as unknown as SnapshotCursor }
+      return { kind: 'rejected', reason: 'not-found' }
+    }
+    return { transport, log }
+  }
+
+  // port: per-record FIFO hold。create 期间 pendingRid=rid;同 rid 的 edit/delete 入 held(不提交 transport);
+  // ackCreate 由 transport 决定 create outcome,再 flush held(accepted→提交,record 已 known 不 404;rejected→dependency-failed)。
+  class FifoRecordPort {
+    private readonly transport: (c: CanvasChange) => ChangeOutcome
+    private pendingCreate: CanvasChange | null = null
+    private pendingRid: string | null = null
+    private readonly held: CanvasChange[] = []
+    constructor(transport: (c: CanvasChange) => ChangeOutcome) {
+      this.transport = transport
+    }
+    submit(c: CanvasChange): ChangeOutcome | 'held' {
+      const rid = recordIdOf(c)
+      if (rid && isCreateKind(c)) {
+        this.pendingCreate = c
+        this.pendingRid = rid
+        return 'held' // create in-flight;outcome at ackCreate(transport 决定)
+      }
+      if (rid && this.pendingRid === rid) {
+        this.held.push(c) // held——**不**独立提交 transport(故不独立 404)
+        return 'held'
+      }
+      return this.transport(c) // 无 pending create → 直送(truly-unknown → 404)
+    }
+    ackCreate(): { create: ChangeOutcome; held: ChangeOutcome[] } {
+      const create = this.pendingCreate!
+      const createOutcome = this.transport(create) // transport 决定 create outcome(accepted→rid known / rejected→rid 未 known)
+      const heldOutcomes = this.held.map((c) =>
+        createOutcome.kind === 'accepted'
+          ? this.transport(c) // create 成功 → rid 已 known → edit accepted(非 404)
+          : ({
+              kind: 'rejected',
+              reason: 'dependency-failed',
+              detail: `create ${createOutcome.kind}`,
+            } as ChangeOutcome),
+      )
+      this.pendingCreate = null
+      this.pendingRid = null
+      this.held.length = 0
+      return { create: createOutcome, held: heldOutcomes }
+    }
+  }
+
+  // unwrap: submit 返回 'held'|ChangeOutcome;直送场景(无 pending create)断言非 held 并拿到 ChangeOutcome。
+  const unwrap = (r: ChangeOutcome | 'held'): ChangeOutcome => {
+    if (r === 'held') throw new Error('expected direct outcome, got held')
+    return r
+  }
+
+  // 测试 mock changes:node 是部分对象,用 `as unknown as CanvasChange` 旁路 record schema(port 契约测试只验调度,不验 record 字段)。
+  const mockCreate = (rid: string): CanvasChange =>
+    ({ kind: 'create-node', node: { id: rid } }) as unknown as CanvasChange
+  const mockEdit = (rid: string): CanvasChange =>
+    ({ kind: 'edit-node', nodeId: rid, intents: [{ op: 'set', fieldPath: ['title'], value: 'edited' }] }) as unknown as CanvasChange
+
+  it('edit submitted while create pending is HELD; transport sees create FIRST, edit never 404', () => {
+    // 验收:mock 让 edit 可"先发"(submit 调用序 edit 在 create 后但 create 未 ack),adapter 仍先 create 后 edit,
+    // 最终 record=初值+编辑,edit 不因"record 尚未落库"独立 404。
+    const t = makeTransport()
+    const port = new FifoRecordPort(t.transport)
+    expect(port.submit(mockCreate('n1'))).toBe('held') // create pending
+    expect(port.submit(mockEdit('n1'))).toBe('held') // edit held——transport 此刻未见 edit
+    expect(t.log).toEqual([]) // transport 未见任何(create 在 ackCreate 才提交)
+    const { create: createOut, held: [editOut] } = port.ackCreate()
+    expect(t.log).toEqual([mockCreate('n1'), mockEdit('n1')]) // create 先、edit 后(transport 提交序)
+    expect(createOut.kind).toBe('accepted')
+    expect(editOut.kind).toBe('accepted') // edit 提交时 rid 已 known → accepted(非 not-found)
+    expect(editOut.kind).not.toBe('rejected') // 绝不因 pending-create 走 not-found
+  })
+
+  it('create terminally fails → dependent edit rejected(dependency-failed), NOT not-found', () => {
+    // create 失败(如 bad-request)→ 依赖 edit 不能进行;surface 为 dependency-failed(非 not-found)。
+    const t = makeTransport({ rejectCreates: true })
+    const port = new FifoRecordPort(t.transport)
+    expect(port.submit(mockCreate('n2'))).toBe('held')
+    expect(port.submit(mockEdit('n2'))).toBe('held')
+    const { create: createOut, held: [editOut] } = port.ackCreate()
+    expect(createOut.kind).toBe('rejected') // create 自身 bad-request
+    if (createOut.kind === 'rejected') expect(createOut.reason).toBe('bad-request')
+    expect(editOut.kind).toBe('rejected')
+    if (editOut.kind === 'rejected') {
+      expect(editOut.reason).toBe('dependency-failed') // 非 not-found
+      expect(editOut.reason).not.toBe('not-found')
+      expect(editOut.detail).toContain('create')
+    }
+    expect(t.log).toEqual([mockCreate('n2')]) // edit 未进 transport(依赖失败,未提交)
+  })
+
+  it('truly-unknown record edit (no pending create) → rejected(not-found) — boundary distinct from pending-create', () => {
+    // 验收:从未存在 vs pending-create 两种 404 边界分开断言。此为"从未存在"——直接 404 not-found。
+    const t = makeTransport()
+    const port = new FifoRecordPort(t.transport)
+    const out = unwrap(port.submit(mockEdit('ghost')))
+    expect(out.kind).toBe('rejected')
+    if (out.kind === 'rejected') expect(out.reason).toBe('not-found')
+    expect(t.log).toEqual([mockEdit('ghost')]) // 直送 transport,record 未知 → 404
+  })
+
+  it('multiple held edits flush in FIFO call order after create accepted', () => {
+    // FIFO:同 record 多条 edit 按 submit 序 flush(create ack 后顺序保持)。
+    const t = makeTransport()
+    const port = new FifoRecordPort(t.transport)
+    const e1 = mockEdit('n3')
+    const edit2 = { kind: 'edit-node', nodeId: 'n3', intents: [{ op: 'set', fieldPath: ['title'], value: '2' }] } as unknown as CanvasChange
+    expect(port.submit(mockCreate('n3'))).toBe('held')
+    expect(port.submit(e1)).toBe('held')
+    expect(port.submit(edit2)).toBe('held')
+    port.ackCreate()
+    // transport 提交序:create 先,然后 e1、edit2 按 submit 序(同引用——toBe Object.is 证 FIFO 序保持)
+    expect(t.log.map((c) => (c.kind === 'create-node' ? 'create' : 'edit'))).toEqual(['create', 'edit', 'edit'])
+    expect(t.log[1]).toBe(e1) // 第一条 flush 的 edit 是先 submit 的(同对象引用)
+    expect(t.log[2]).toBe(edit2) // 第二条 flush 的是后 submit 的(FIFO 序保持)
+  })
+
+  it('different recordId edit is NOT held by an unrelated pending create', () => {
+    // pending create for n4 不 hold n5 的 edit(因果是 per-record,非全局阻塞)。
+    const t = makeTransport()
+    const port = new FifoRecordPort(t.transport)
+    expect(port.submit(mockCreate('n4'))).toBe('held')
+    const other = unwrap(port.submit(mockEdit('n5'))) // 异 record → 直送(但 n5 未知 → 404)
+    expect(other.kind).toBe('rejected')
+    if (other.kind === 'rejected') expect(other.reason).toBe('not-found') // n5 从未存在 → not-found(非 held)
+    expect(t.log).toEqual([mockEdit('n5')]) // n5 edit 直送 transport
   })
 })
 

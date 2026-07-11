@@ -9,7 +9,7 @@
 //   两案 adapter 各自翻译:Figma 案 edit→field-path PATCH body + If-Match;Yjs 案 edit→嵌套 Y.Map.set(永不 clear 整 record)。
 // 中性游标 SnapshotCursor = branded unknown(port 永不读其内部;adapter 解释为 revision bundle 或 state-vector)。
 //
-// 返修(G1-b 双审 REQUIRES_CHANGES,2026-07-12,3 条 finding 全部 lead 独立核证):
+// 返修 R1(G1-b 双审 REQUIRES_CHANGES,2026-07-12,3 条 finding 全部 lead 独立核证):
 //   - F1:CanvasChange 由「全量 record upsert」改为「create 全量 + edit 字段级意图」。全量 upsert 在并发下会把
 //     远端字段更新误判为本地回滚(base 可选更放大此风险),且 Yjs 案 clear+rebuild 整 record 会吞并发子字段
 //     (spike yjs-mapping.spike.test.ts:376-398 坑7 实证:B 改 transform.y=999,A 整 record 重写 → B 的 999 丢失)。
@@ -18,7 +18,18 @@
 //   - F3:ChangeOutcome 加 terminal rejection(RejectionReason 域枚举,不漏 HTTP 码/Yjs frame);冻结 accepted=权威 ack。
 //     先例:writeRetryQueue.WriteOutcome 8 态(src/lib/writeRetryQueue.ts:108-116)用域 status 名而非裸 HTTP 码。
 //
-// 不接线(N2-0 决议前 G1-c 不落地实现):本文件只冻结接口 + 类型,无 runtime 实现。
+// 返修 R2(G1-b 第二轮 REQUIRES_CHANGES,2026-07-12,3 条 P1 全部 lead 逐条核证,见 REVIEW-FINDINGS-G1B-R2.md):
+//   - R2-P1-1 封死 clobber:FieldPath 改非空 tuple(拒空路径);新增 validateFieldIntent 运行时 validator
+//     拒「非原子父对象 set」(set 整对象/整数组值 = 整子树替换 = clobber 坑7 的合法重表达,封死)。数组结构编辑
+//     (增/删元素)非 FieldIntent 表达,deferred to N2-0 §10.1(本 freeze 不扩 op 面,保 @ts-expect-error 6 互锁)。
+//   - R2-P1-2 create→edit 因果:冻结 submitChange per-(canvasId,recordId) FIFO hold 契约(pending create ack 前
+//     hold 同 record 后续 edit/delete);pending-local-create 的 edit 不走 rejected(not-found);create 终态失败时
+//     依赖 edit/delete surface 为 rejected(dependency-failed)——新增 RejectionReason。
+//   - R2-P1-3 404-delete cursor:真实 DELETE 204(null body)/已删 404 均不带 cursor(server/routes/canvas.ts
+//     deleteChild lead 核证);delete-* accepted 必经 loadSnapshot authoritative load 取真实 cursor,缺 cursor
+//     的 204/404 不构造 accepted(防常量 cursor 冒充权威)。不碰 route/N2-0 §10(n20-fix worker 管)。
+//
+// 不接线(N2-0 决议前 G1-c 不落地实现):本文件只冻结接口 + 类型 + 域级 validator(非 transport impl),无 runtime transport。
 // unwiredCanvasSyncPort 占位即失败(Karpathy 规则 12:fail visibly, not silently)——防误以为已同步。
 //
 // 命名/互锁惯例同 src/lib/serverPersistAdapter.ts(T1.3 契约冻结面);本接口是它之上的 transport-neutral 抽象,
@@ -68,9 +79,13 @@ export type CanvasSnapshot = {
  * - 与 N2-0 §10.1 `FieldOp.fieldPath` 同形,但本类型是**域语义**不是 wire DTO:两案 adapter 都能消费——
  *   Figma 案把它翻成 field-path PATCH body 的路径段;Yjs 案按路径逐层 Y.Map.set 嵌套叶子(永不 clear 整子树)。
  * - 故意非 RFC 6902 JSON-Pointer 字符串(`/transform/x`):那是 wire 形状,不出现在 port 面(见 contract test 负向断言)。
- * - ReadonlyArray:意图不可在 adapter 侧原地改(port 冻结后路径不可变)。
+ * - `readonly` tuple:意图不可在 adapter 侧原地改(port 冻结后路径不可变)。
+ *
+ * 返修 R2-P1-1(封死 clobber):改**非空 tuple** `readonly [string|number, ...(string|number)[]]`——空路径 `[]`
+ *   在编译期即拒(tuple 至少 1 段)。空路径无定位叶子,等价"整 record 操作",是 upsert clobber 的合法重表达,
+ *   必须封死。运行时 validator(validateFieldIntent)再兜一次 `as` cast 旁路(见下)。
  */
-export type FieldPath = ReadonlyArray<string | number>
+export type FieldPath = readonly [string | number, ...(string | number)[]]
 
 /**
  * 单条字段级编辑意图(对**已存在** record 的叶子操作)。
@@ -78,10 +93,51 @@ export type FieldPath = ReadonlyArray<string | number>
  * - `delete-field`:移除 fieldPath 处的叶子(**非** record 删除——record 删走 delete-* kind)。
  * - 故意非 RFC 6902 op(`replace`/`add`/`remove`/`copy`/`move`/`test`):那是 wire DTO;此处是域动词。
  *   `value` 用 `unknown` 因 port 对 record schema 不透明(校验在 adapter/server,N10 白名单)。
+ *
+ * 返修 R2-P1-1(封死 clobber):`set` 的 value **不得是非原子(对象/数组)**——set 整对象/整数组值是
+ *   "整子树替换",正是首审 clobber(spike 坑7:A 整 record 重写吞 B 的 transform.y=999)的合法重表达,
+ *   必须封死。validateFieldIntent 运行时拒非原子 set;合法编辑须分解为原子叶子 set(如 `['transform','x']`
+ *   而非 `['transform']` 整对象)。数组**结构**编辑(增/删元素)不在 FieldIntent 表达——deferred to
+ *   N2-0 §10.1 FieldOp(本 freeze 不扩 op 面,保 6 处 @ts-expect-error 红线互锁不变);数组**叶子**编辑
+ *   (`['fills',0,'color']` 原子 set)仍支持。`delete-field` 删任意非空路径字段(显式移除,非静默 clobber)。
  */
 export type FieldIntent =
   | { op: 'set'; fieldPath: FieldPath; value: unknown }
   | { op: 'delete-field'; fieldPath: FieldPath }
+
+/**
+ * FieldIntent 校验违规(域枚举,validator 抛出此类型,供调用方 catch 精确分支)。
+ * 返修 R2-P1-1:validator 是 port 冻结的**域级**规则(transport-neutral),非 transport impl——
+ * adapter/调用方在 submit edit-* 前须过此校验,防 clobber 表达进 wire。
+ */
+export type FieldIntentViolation = 'empty-field-path' | 'non-atomic-parent-set'
+
+export class FieldIntentError extends Error {
+  readonly violation: FieldIntentViolation
+  constructor(violation: FieldIntentViolation) {
+    super(`FieldIntent violation: ${violation}`)
+    this.violation = violation
+    this.name = 'FieldIntentError'
+  }
+}
+
+/** 原子叶子值:null / string / number / boolean。对象与数组是非原子(容器),作 set 值即整子树替换。 */
+const isAtomicLeaf = (v: unknown): boolean =>
+  v === null || typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean'
+
+/**
+ * 校验单条 FieldIntent 封死 clobber 规则(返修 R2-P1-1,port 冻结域级 validator):
+ * - 拒空 fieldPath(编译期 tuple 已拒,运行时兜 `as` cast 旁路)。
+ * - `set` 拒非原子 value(对象/数组 = 整子树替换 = clobber,封死);原子叶子 set 放行。
+ * - `delete-field` 放行任意非空路径(显式删字段,非静默 clobber)。
+ * 调用方:adapter 在翻译 edit-* intents 前逐条校验;port 占位实现不走此路(N2-0 决议后 G1-c adapter 接入)。
+ */
+export const validateFieldIntent = (intent: FieldIntent): void | never => {
+  if (intent.fieldPath.length === 0) throw new FieldIntentError('empty-field-path')
+  if (intent.op === 'set' && !isAtomicLeaf(intent.value)) {
+    throw new FieldIntentError('non-atomic-parent-set')
+  }
+}
 
 /**
  * 画布变更(port 表**域语义**,不表 wire)。
@@ -128,9 +184,14 @@ export type ChangeOrigin = 'self' | 'remote'
  *  - `unauthorized`:认证过期/无效(401)——调用方重登,非重试同 op。
  *  - `forbidden`:鉴权拒绝/成员被移除/share 撤销(403 / revoke)——非重试。
  *  - `not-found`:目标 record/canvas 已删(404;delete-vs-update → delete wins,见 N2-0 §10.4)。
+ *    **返修 R2-P1-2 边界**:仅「真·不存在 record」(从未创建 / 已被他端删)走此态;
+ *    pending-local-create 的 edit **不**走此态(经 FIFO hold,见 submitChange doc)。
  *  - `too-large`:payload 超限(413)——非重试同 payload。
  *  - `reuse-conflict`:幂等 key 复用但 body 不同(422)——非重试同 op。
  *  - `bad-request`:校验/schema 失败(400/422 payload)——非重试同 payload。
+ *  - `dependency-failed`:**返修 R2-P1-2**——本 change 依赖的同 record create-* 终态失败(如 create
+ *    被拒/超限/坏请求),依赖 edit/delete 因此无法进行。**非 not-found**(record 不是"不存在"而是"创建失败"),
+ *    非重试(重试须先修 create;非"record 不在"的瞬态)。
  *  - `terminal`:其他不可重试(catch-all,detail 描述)。
  */
 export type RejectionReason =
@@ -140,6 +201,7 @@ export type RejectionReason =
   | 'too-large'
   | 'reuse-conflict'
   | 'bad-request'
+  | 'dependency-failed'
   | 'terminal'
 
 /**
@@ -196,6 +258,24 @@ export interface CanvasSyncPort {
    * 注意:base 是**游标**不是 revision number——revision 是 Figma 案独占,不在 port 面。
    * edit-* 的 intents 携带字段级意图(已 diff 好);adapter 翻译为 field-path PATCH(Figma)或嵌套 Y.Map.set(Yjs)——
    * adapter 不再对全量 record 做 shadow diff(F1:diff 已在 producer 侧完成,intents 即 diff 结果)。
+   *
+   * 返修 R2-P1-2(因果保证冻结):同 (canvasId, recordId) 的 submitChange 按调用序 FIFO 处理——
+   *   pending create-* ack 前,后续同 recordId 的 edit-* 与 delete-* 被 **hold**(不提前提交,故不会因
+   *   "record 尚未落库"独立 404)。create ack 后按序 flush held edits;create 终态拒绝时,依赖 edit/delete
+   *   surface 为 rejected(dependency-failed)(**不**走 not-found——pending-local-create 的 edit 永不因
+   *   "自身未提交"而 not-found);create conflict/retryable 时 held edits 继续等 create 收敛。
+   *   真·不存在 record(从未创建/已被他端删)的 edit 仍 rejected(not-found)——与 pending-create 区分。
+   *   选 per-record FIFO hold 而非 batch/dependency-id:前者不扩 API 面(无新参数/无 batch id 暴露给调用方),
+   *   匹配"中性"——两案 adapter 都可实现(Figma 案同 record 串行 PATCH + hold;Yjs 案 Y.Doc 本地因果序天然保,
+   *   create 的 Y.Map.set 与后续叶子 set 同事务/同因果链,无 404 概念)。此为 port 契约,adapter 须守。
+   *
+   * 返修 R2-P1-3(accepted cursor 不冒充):真实 DELETE 成功 204(null body)/已删 404 均不携带 cursor/seq
+   *   (server/routes/canvas.ts deleteChild lead 核证);404 还可能是 canvas 不存在/无权(authz.denyStatus 404
+   *   隐藏存在性,server/lib/authz.ts)。故 delete-* 的 accepted **必须**经 loadSnapshot 做一次 authoritative
+   *   load 取真实 cursor + 确认目标态后构造——缺 cursor 的 204/404 **不**构造 accepted(防常量 cursor 冒充权威)。
+   *   load 返 null(canvas 不存在/无权)→ rejected(forbidden 或 not-found),不误报成功;load 确认 record 已不存在
+   *   → accepted(幂等 delete,携真实 cursor)。未来若 G1-c/N2-1 让 DELETE 返回 seq,adapter 可省去此次 load
+   *   (优化项,非本 freeze 范围;此处不向 n20-fix worker 的 §10 文档提要求)。
    */
   submitChange(canvasId: string, change: CanvasChange, base?: SnapshotCursor): Promise<ChangeOutcome>
   /**

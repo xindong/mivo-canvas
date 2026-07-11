@@ -24,6 +24,7 @@ import type { MivoCanvasNode } from '../../types/mivoCanvas'
 import { fromRecord } from '../mapping'
 import { MemoryDocKernel } from '../docKernel'
 import type { NodeRecord } from '../records'
+import { validateFieldIntent, type FieldIntent } from '../../lib/canvasSyncPort'
 
 // ─── 通用递归 codec(spike 核心 helper)─────────────────────────────────
 // record-schema §1 映射规则:node=Y.Map;有序集合=Y.Array;标量=叶子;子结构=嵌套 Y.Map。
@@ -595,5 +596,121 @@ describe('N1-D: LeaferJS 渲染面静态分析(Yjs→record→node→renderer �
     expect(rendererInput).toHaveLength(1)
     expect(rendererInput[0].id).toBe(fullRecord.id)
     expect(rendererInput[0].transform).toEqual(fullRecord.transform)
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// R2-P1-1: FieldIntent 语义对真 Y.Doc 的无损验证(G1-b 第二轮返修)
+// ────────────────────────────────────────────────────────────────────────────
+// 用真 yjs 验证 port 冻结的 FieldIntent 域语义:原子叶子 set 在并发下无损(对比 §B 坑7 整 record/子树
+// clear+rebuild 丢 transform.y=999);A→B 与 B→A 双向对称收敛;嵌套叶子 + 数组叶子最终态正确。
+// **测试在 spike 侧 → yjs 仅 devDependency,不进生产 bundle**(生产代码 canvasSyncPort.ts 不 import yjs)。
+// 参考 adapter 语义实现:按 fieldPath 逐层导航 Y.Map/Y.Array,叶子处 set/delete(永不 clear 整子树)。
+describe('R2-P1-1: FieldIntent semantics against real Y.Doc (nested leaf + array, A↔B symmetry)', () => {
+  // applyFieldIntentToYjs:把单条 FieldIntent 应用到 record 的 Y.Map 上(域语义参考实现)。
+  // 逐层导航:string→Y.Map.get、number→Y.Array.get;叶子处 set/delete。先过 validateFieldIntent(封死非原子 set)。
+  const applyFieldIntentToYjs = (ymap: Y.Map<unknown>, intent: FieldIntent): void => {
+    validateFieldIntent(intent) // 域级 validator 先校验(封死非原子 set = 整子树 clobber,坑7 的合法重表达)
+    const path = [...intent.fieldPath]
+    let cur: unknown = ymap
+    for (let i = 0; i < path.length - 1; i++) {
+      const seg = path[i]
+      cur = typeof seg === 'number' ? (cur as Y.Array<unknown>).get(seg) : (cur as Y.Map<unknown>).get(seg)
+    }
+    const last = path[path.length - 1]
+    if (intent.op === 'set') {
+      if (typeof last === 'number') {
+        // 数组标量元素替换:Y.Array 无 set(index,val),用 delete+insert(scalar 无子字段,无 clobber 风险;value 须原子,validator 已保)
+        const arr = cur as Y.Array<unknown>
+        arr.delete(last)
+        arr.insert(last, [encode(intent.value)])
+      } else {
+        ;(cur as Y.Map<unknown>).set(last, encode(intent.value))
+      }
+    } else {
+      // delete-field:删叶子(非 record 删——record 删走 delete-* kind)
+      if (typeof last === 'number') (cur as Y.Array<unknown>).delete(last)
+      else (cur as Y.Map<unknown>).delete(last)
+    }
+  }
+
+  const cloneFromBase = (base: Y.Doc): Y.Doc => {
+    const d = new Y.Doc()
+    Y.applyUpdate(d, Y.encodeStateAsUpdate(base))
+    return d
+  }
+
+  // fills 是判别联合(solid 有 color / image 无);取 color 须经判别 narrowing,测试用窄化 helper(非 cast)。
+  const solidColor = (f: NodeRecord['fills'][number]): string | undefined =>
+    f.kind === 'solid' ? f.color : undefined
+
+  it('嵌套叶子 set:transform.x 改后 transform.y 存活(对比坑7 整 transform 重写丢 y=999)', () => {
+    const doc = new Y.Doc()
+    writeRecord(doc, fullRecord) // transform = {x:10.5, y:-20, width:100, height:50, rotation:0}
+    const ymap = doc.getMap('nodes').get(fullRecord.id) as Y.Map<unknown>
+    applyFieldIntentToYjs(ymap, { op: 'set', fieldPath: ['transform', 'x'], value: 100 })
+    const rec = readRecord(doc, fullRecord.id)!
+    expect(rec.transform!.x).toBe(100) // set 生效
+    expect(rec.transform!.y).toBe(-20) // 兄弟叶子存活(非整 transform 子树 clobber)
+    expect(rec.transform!.width).toBe(100) // 其他叶子不变
+    expect(rec.transform!.height).toBe(50)
+  })
+
+  it('数组叶子 set:fills[0].color 改后 fills[1] 存活 + 长度不变(非整 fills 替换)', () => {
+    const doc = new Y.Doc()
+    writeRecord(doc, fullRecord) // fills = [{f-solid,color:'#ff0000',...},{f-image,...}]
+    const ymap = doc.getMap('nodes').get(fullRecord.id) as Y.Map<unknown>
+    applyFieldIntentToYjs(ymap, { op: 'set', fieldPath: ['fills', 0, 'color'], value: '#f00' })
+    const rec = readRecord(doc, fullRecord.id)!
+    expect(solidColor(rec.fills[0])).toBe('#f00') // set 生效(fills[0] 是 solid)
+    expect(rec.fills[1]).toEqual(fullRecord.fills[1]) // 兄弟元素存活(非整 fills clobber)
+    expect(rec.fills).toHaveLength(2) // 数组长度不变
+  })
+
+  it('A↔B 双向对称:不同字段并发叶子 set 两端收敛 + 两边都留 + 兄弟叶子存活', () => {
+    // 公共 base → 两 clone,A 改 transform.x,B 改 fills[0].color;交换 update 后两端收敛且两边都留。
+    const base = new Y.Doc()
+    writeRecord(base, fullRecord)
+    const docA = cloneFromBase(base)
+    const docB = cloneFromBase(base)
+    const aMap = docA.getMap('nodes').get(fullRecord.id) as Y.Map<unknown>
+    const bMap = docB.getMap('nodes').get(fullRecord.id) as Y.Map<unknown>
+    applyFieldIntentToYjs(aMap, { op: 'set', fieldPath: ['transform', 'x'], value: 1111 })
+    applyFieldIntentToYjs(bMap, { op: 'set', fieldPath: ['fills', 0, 'color'], value: '#00ff00' })
+    Y.applyUpdate(docA, Y.encodeStateAsUpdate(docB))
+    Y.applyUpdate(docB, Y.encodeStateAsUpdate(docA))
+    const aRec = readRecord(docA, fullRecord.id)!
+    const bRec = readRecord(docB, fullRecord.id)!
+    // 收敛 + 两边都留(非重叠叶子,CRDT 字段级无损合并)
+    expect(aRec.transform!.x).toBe(1111)
+    expect(solidColor(aRec.fills[0])).toBe('#00ff00')
+    expect(bRec.transform!.x).toBe(1111)
+    expect(solidColor(bRec.fills[0])).toBe('#00ff00')
+    expect(aRec).toEqual(bRec) // 双向对称收敛(A→B 与 B→A 同态)
+    // 兄弟叶子存活(非整子树 clobber)
+    expect(aRec.transform!.y).toBe(-20)
+    expect(aRec.fills[1]).toEqual(fullRecord.fills[1])
+  })
+
+  it('NEGATIVE(封死 clobber):整对象 set 被 validateFieldIntent 拒(防坑7 合法重表达)', () => {
+    // 整 transform 对象 set = 整子树替换 = 坑7 clobber 的合法重表达;port validator 封死(非原子-parent-set)。
+    const emptyMap = new Y.Doc().getMap('nodes') as Y.Map<unknown>
+    const wholeObjectSet = {
+      op: 'set',
+      fieldPath: ['transform'],
+      value: { x: 1, y: 2, width: 3, height: 4, rotation: 0 },
+    } as FieldIntent
+    expect(() => applyFieldIntentToYjs(emptyMap, wholeObjectSet)).toThrow(/non-atomic-parent-set/)
+  })
+
+  it('NEGATIVE(封死 clobber):整数组 set 被 validateFieldIntent 拒(防 Y.Array 整树替换吞并发 insert)', () => {
+    // 整 fills 数组替换 = Y.Array 整树替换,并发下吞 peer insert;validator 封死。
+    const emptyMap = new Y.Doc().getMap('nodes') as Y.Map<unknown>
+    const wholeArraySet = {
+      op: 'set',
+      fieldPath: ['fills'],
+      value: [{ id: 'f1', color: '#000' }],
+    } as FieldIntent
+    expect(() => applyFieldIntentToYjs(emptyMap, wholeArraySet)).toThrow(/non-atomic-parent-set/)
   })
 })
