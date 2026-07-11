@@ -8,24 +8,44 @@
 // CanvasCommand and drives the runtime. Together they let canvas effects round-trip
 // through a JSON representation (replay / collaboration groundwork).
 //
-// This PR (first slice) implements apply for the **sync document-mutation**
-// commands — every command whose effect is a synchronous runtime call returning
-// void or a created node id. The two-stage-asset + generation commands throw
-// CanvasCommandDeferredError: their apply needs to resolve `referenceAssetIds` /
-// `assetId` back to Blobs via /api/assets (T1.5), which lands in the T2.3 second
-// slice (PR2). The throw is explicit and tagged so callers (and tests) can tell
-// "not yet wired" apart from a real failure.
+// This module implements apply for the **sync document-mutation** commands (PR1)
+// AND the **two-stage-asset** commands (PR2 — this slice). The sync commands
+// drive a synchronous runtime call returning void or a created node id. The
+// two-stage-asset commands (import-asset, 5 generation kinds, mask-edit) need a
+// CanvasCommandAssetBridge to resolve `referenceAssetIds` / `assetId` /
+// `maskAssetId` / `markedImageAssetId` back to File/Blob via /api/assets (T1.5
+// #195), then dispatch. With NO bridge the apply is still "not wired for this
+// caller" → CanvasCommandDeferredError (the PR1 boundary stays visible so the
+// PR1/PR2 boundary is still testable). With a bridge the apply is async.
 //
 // RETURN CONTRACT
-// - Node-creation commands return the newly created node id (string), mirroring
-//   runtime.addTextNode / addFrameNode / addAiSlotNode / addMarkupNode (→ string)
-//   and addAnnotationNode (→ string | undefined).
-// - Non-creating commands return undefined.
-// - Deferred commands throw rather than return — PR2 will widen the return type
-//   to include Promise<string[]> for generation.
+// - Sync node-creation commands return the newly created node id (string),
+//   mirroring runtime.addTextNode / addFrameNode / addAiSlotNode / addMarkupNode
+//   (→ string) and addAnnotationNode (→ string | undefined).
+// - Sync non-creating commands return undefined.
+// - Two-stage-asset commands return a Promise: import-asset → Promise<string>
+//   (new node id), generation → Promise<string[]> (created node ids, mirroring
+//   runtime.generate* → Promise<string[]>), mask-edit → Promise<string[]> (the
+//   bridge's submit surface returns the edited/new node ids).
+// - applyCanvasCommand itself stays NON-async so payload validation (F2) and the
+//   no-bridge deferral throw synchronously — the sync-command contract and the
+//   PR1 tests are unchanged. The widened return type (CanvasCommandApplyReturn)
+//   accommodates both sync results and Promise results. Production wiring of the
+//   deferred apply (passing a real bridge from the UI shell) is T2.2's job; this
+//   slice's new apply paths are exercised only by tests.
 
 import type { CanvasActionRuntime } from './canvasActionTypes'
-import type { CanvasCommand, CanvasCommandKind } from './canvasCommand'
+import type {
+  CanvasCommand,
+  CanvasCommandGenerationOptions,
+  CanvasCommandKind,
+} from './canvasCommand'
+// Type-only (verbatimModuleSyntax): erased at runtime so the executor stays free
+// of the store's runtime graph while mapping the serializable command options
+// (referenceAssetIds) onto the runtime options (referenceFiles: File[]) and
+// assembling the mask-edit submit payload 1:1 with the overlay's surface.
+import type { CanvasGenerationOptions } from '../../store/canvasStateTypes'
+import type { ImageMaskSubmitPayload } from '../imageMaskGeometry'
 
 /** Thrown when a CanvasCommand's apply is not implemented in the current slice. */
 export class CanvasCommandDeferredError extends Error {
@@ -40,7 +60,7 @@ export class CanvasCommandDeferredError extends Error {
 }
 
 const DEFERRED_REASON =
-  'two-stage asset / generation apply lands in T2.3 second slice (PR2) — assetId / maskAssetId / markedImageAssetId / referenceAssetIds → Blob resolution via /api/assets'
+  'two-stage asset apply needs a CanvasCommandAssetBridge (PR2): assetId / maskAssetId / markedImageAssetId / referenceAssetIds → Blob via /api/assets — no bridge means apply not wired for this caller'
 
 /**
  * Thrown when a CanvasCommand's payload fails the minimal required-shape check
@@ -61,6 +81,97 @@ export class CanvasCommandInvalidPayloadError extends Error {
     this.field = field
     this.reason = reason
   }
+}
+
+// ─── two-stage asset bridge (PR2) ──────────────────────────────────────────────
+// Dependency-injected seam for resolving assetIds → File/Blob and driving the
+// app-layer import + mask-edit submit surfaces. The executor calls this
+// interface ONLY (it does NOT import the app/server asset layer — dependency
+// direction is app → executor, never reversed). The UI shell provides the impl
+// at the assembly point (T2.2 wiring); tests mock it. Each deferred kind's
+// apply is only reached when a bridge is passed, so production behavior is
+// unchanged until T2.2 wires the bridge (the no-bridge path still throws
+// CanvasCommandDeferredError, preserving the PR1 boundary + tests).
+
+/**
+ * Result of applying a CanvasCommand: a created node id (string), the created
+ * node ids for a multi-output generation (string[]), or undefined for
+ * non-creating commands.
+ */
+export type CanvasCommandApplyResult = string | string[] | undefined
+
+/**
+ * applyCanvasCommand return type. Sync commands return CanvasCommandApplyResult
+ * directly; two-stage-asset commands (import-asset / generation / mask-edit)
+ * return a Promise of it (asset resolution + generation/submit are async).
+ * Callers that pass a bridge MUST await; callers using only sync commands (or
+ * no bridge) get a sync result.
+ */
+export type CanvasCommandApplyReturn = CanvasCommandApplyResult | Promise<CanvasCommandApplyResult>
+
+/**
+ * Thrown when a two-stage assetId cannot be resolved (404 / network failure /
+ * purged asset). Tagged so callers can tell a missing-asset failure apart from
+ * a deferral (no bridge) or a real generation/import/runtime failure. The bridge
+ * impl MUST throw this (or re-reject) on resolve failure — never return null
+ * silently (fail-closed on the asset path, mirroring F2's posture).
+ */
+export class CanvasCommandAssetResolveError extends Error {
+  readonly assetId: string
+  readonly reason: string
+  constructor(assetId: string, reason: string) {
+    super(`CanvasCommand asset "${assetId}" could not be resolved: ${reason}`)
+    this.name = 'CanvasCommandAssetResolveError'
+    this.assetId = assetId
+    this.reason = reason
+  }
+}
+
+/**
+ * Dependency-injected seam for two-stage asset resolution + the app-layer
+ * import/mask surfaces. The executor defines this interface; the UI shell
+ * (T2.2) provides the impl; tests mock it. None of the methods are called by
+ * the executor until a bridge is passed to applyCanvasCommand.
+ *
+ * Contract: resolveAssetFile MUST throw on 404 / resolve failure (tagged —
+ * CanvasCommandAssetResolveError) and never return null/undefined silently, so
+ * the apply caller surfaces a real failure path instead of feeding an empty
+ * File[] / undefined Blob into a runtime call.
+ */
+export type CanvasCommandAssetBridge = {
+  /**
+   * Resolve a two-stage assetId (sha256 content hash, uploaded to /api/assets in
+   * T1.5 #195) → File. Used to re-feed generation referenceFiles, mask-edit mask
+   * + markedImage Blobs, and the import file. File extends Blob, so the same
+   * resolution feeds both the File[] (generation) and Blob (mask) surfaces.
+   * Throws CanvasCommandAssetResolveError on 404 / network failure — never
+   * returns null silently.
+   */
+  resolveAssetFile: (assetId: string) => Promise<File>
+  /**
+   * Add an imported asset node to the canvas at position. The bridge impl wraps
+   * the app-layer addImportedFileNode seam (src/lib/canvasAssetImport.ts); the
+   * resolved File lets the impl reuse prepareCanvasFileImport (dimensions /
+   * displaySize / markdown text). Returns the newly created node id.
+   */
+  addImportedAssetNode: (input: {
+    assetId: string
+    file: File
+    mimeType: string
+    originalName?: string
+    position: { x: number; y: number }
+  }) => Promise<string>
+  /**
+   * Submit a mask edit for sourceNodeId with the assembled ImageMaskSubmitPayload
+   * (mask + markedImage Blobs already resolved from their assetIds; geometry +
+   * scalars ride directly in the payload). The bridge impl wraps the real
+   * mask-edit submit surface (chatMaskEditFlow / maskEditTaskRuntime). Returns
+   * the new/edited node ids.
+   */
+  submitImageMaskEdit: (
+    sourceNodeId: string,
+    payload: ImageMaskSubmitPayload,
+  ) => Promise<string[]>
 }
 
 // ─── minimal required-shape gate (F2) ───────────────────────────────────────────
@@ -207,16 +318,27 @@ const assertNeverCommand = (value: never): never => {
 }
 
 /**
- * Apply a CanvasCommand to a CanvasActionRuntime. Returns the created node id for
- * node-creation commands, undefined otherwise. Throws CanvasCommandDeferredError
- * for asset + generation commands (see file header). Throws
- * CanvasCommandInvalidPayloadError before any runtime call if the payload fails
- * the minimal required-shape gate (F2).
+ * Apply a CanvasCommand to a CanvasActionRuntime (+ optional asset bridge for
+ * the two-stage-asset kinds). Returns the created node id for sync node-creation
+ * commands, undefined for sync non-creating commands, or a Promise of the same
+ * for two-stage-asset commands (import-asset → Promise<string>, generation →
+ * Promise<string[]>, mask-edit → Promise<string[]>).
+ *
+ * Throws CanvasCommandInvalidPayloadError (sync, before any runtime call) if the
+ * payload fails the minimal required-shape gate (F2). Throws
+ * CanvasCommandDeferredError (sync) for two-stage-asset kinds when no bridge is
+ * passed — the apply is "not wired for this caller" (T2.2 wires production). With
+ * a bridge, the asset path runs; resolve failures surface as
+ * CanvasCommandAssetResolveError (tagged, never silent).
+ *
+ * The function is intentionally NON-async: sync commands + the F2 + no-bridge
+ * throws stay synchronous so the PR1 contract + tests are unchanged.
  */
 export const applyCanvasCommand = (
   command: CanvasCommand,
   runtime: CanvasActionRuntime,
-): string | undefined => {
+  bridge?: CanvasCommandAssetBridge,
+): CanvasCommandApplyReturn => {
   validateCanvasCommandPayload(command)
   switch (command.kind) {
     // ── Node creation ───────────────────────────────────────────────────────────
@@ -321,18 +443,184 @@ export const applyCanvasCommand = (
       runtime.deleteSelectedNodes()
       return undefined
 
-    // ── Deferred (PR2) ──────────────────────────────────────────────────────────
+    // ── Two-stage asset apply (PR2) ─────────────────────────────────────────────
+    // These seven kinds need a CanvasCommandAssetBridge to resolve assetIds →
+    // File/Blob via /api/assets (T1.5). With no bridge the apply is still "not
+    // wired for this caller" → CanvasCommandDeferredError (the PR1 boundary +
+    // tests stay green). With a bridge each kind dispatches to an async helper
+    // and returns a Promise of the created node id(s). Each kind has its OWN case
+    // (no shared fall-through) so the F3③ forcing function still catches a new
+    // kind added without a case.
     case 'import-asset':
+      if (!bridge) throw new CanvasCommandDeferredError(command.kind, DEFERRED_REASON)
+      return applyImportAsset(command, bridge)
     case 'generate-variations':
+      if (!bridge) throw new CanvasCommandDeferredError(command.kind, DEFERRED_REASON)
+      return applyGenerateVariations(command, runtime, bridge)
     case 'generate-image-edit':
+      if (!bridge) throw new CanvasCommandDeferredError(command.kind, DEFERRED_REASON)
+      return applyGenerateImageEdit(command, runtime, bridge)
     case 'generate-beside-node':
+      if (!bridge) throw new CanvasCommandDeferredError(command.kind, DEFERRED_REASON)
+      return applyGenerateBesideNode(command, runtime, bridge)
     case 'generate-into-ai-slot':
+      if (!bridge) throw new CanvasCommandDeferredError(command.kind, DEFERRED_REASON)
+      return applyGenerateIntoAiSlot(command, runtime, bridge)
     case 'generate-from-annotation':
+      if (!bridge) throw new CanvasCommandDeferredError(command.kind, DEFERRED_REASON)
+      return applyGenerateFromAnnotation(command, runtime, bridge)
     case 'mask-edit':
-      throw new CanvasCommandDeferredError(command.kind, DEFERRED_REASON)
+      if (!bridge) throw new CanvasCommandDeferredError(command.kind, DEFERRED_REASON)
+      return applyMaskEdit(command, bridge)
     default:
       // F3③ forcing function: a new CanvasCommandKind added to the union without a
       // case above makes `command` non-`never` here, failing type-check.
       return assertNeverCommand(command)
   }
+}
+
+// ─── two-stage asset apply helpers (PR2) ──────────────────────────────────────
+// Async helpers — applyCanvasCommand returns their Promise WITHOUT awaiting,
+// keeping itself non-async so the sync contract (sync returns + F2 + no-bridge
+// throws all synchronous) holds. Each helper resolves the two-stage assetIds it
+// needs via the bridge, then dispatches to the runtime method (generation) or
+// back through the bridge (import / mask-edit submit).
+
+/**
+ * Resolve two-stage referenceAssetIds → File[] for generation options. The
+ * bridge throws CanvasCommandAssetResolveError on 404 / resolve failure; Promise.all
+ * propagates the first failure as a rejection so the apply caller sees a tagged
+ * error, not a silent empty array. Empty/absent referenceAssetIds → [].
+ */
+const resolveReferenceFiles = async (
+  assetIds: string[] | undefined,
+  bridge: CanvasCommandAssetBridge,
+): Promise<File[]> => {
+  if (!assetIds || assetIds.length === 0) return []
+  return Promise.all(assetIds.map((id) => bridge.resolveAssetFile(id)))
+}
+
+/**
+ * Map the serializable CanvasCommandGenerationOptions (referenceAssetIds) onto
+ * the runtime CanvasGenerationOptions (referenceFiles: File[]). Shared scalar
+ * fields (sceneId / createDerivationEdge / imgRatio / quality / model) pass
+ * through; referenceAssetIds is stripped (command-only); signal is a runtime
+ * concern and is never carried by the command. Returns undefined when the
+ * command carries no options AND no reference files, so the runtime sees the
+ * same "no options" shape it always has.
+ */
+const mapGenerationOptions = async (
+  options: CanvasCommandGenerationOptions | undefined,
+  bridge: CanvasCommandAssetBridge,
+): Promise<CanvasGenerationOptions | undefined> => {
+  const referenceFiles = await resolveReferenceFiles(options?.referenceAssetIds, bridge)
+  if (!options) return referenceFiles.length ? { referenceFiles } : undefined
+  // Strip referenceAssetIds (command-only); pass through the shared fields.
+  const { referenceAssetIds: _referenceAssetIds, ...shared } = options
+  void _referenceAssetIds
+  return referenceFiles.length ? { ...shared, referenceFiles } : shared
+}
+
+const applyImportAsset = async (
+  command: Extract<CanvasCommand, { kind: 'import-asset' }>,
+  bridge: CanvasCommandAssetBridge,
+): Promise<string> => {
+  const file = await bridge.resolveAssetFile(command.assetId)
+  return bridge.addImportedAssetNode({
+    assetId: command.assetId,
+    file,
+    mimeType: command.mimeType,
+    originalName: command.originalName,
+    position: command.position,
+  })
+}
+
+const applyGenerateVariations = async (
+  command: Extract<CanvasCommand, { kind: 'generate-variations' }>,
+  runtime: CanvasActionRuntime,
+  bridge: CanvasCommandAssetBridge,
+): Promise<string[]> => {
+  const options = await mapGenerationOptions(command.options, bridge)
+  return runtime.generateVariations(command.sourceNodeId, command.variations, options)
+}
+
+const applyGenerateImageEdit = async (
+  command: Extract<CanvasCommand, { kind: 'generate-image-edit' }>,
+  runtime: CanvasActionRuntime,
+  bridge: CanvasCommandAssetBridge,
+): Promise<string[]> => {
+  const options = await mapGenerationOptions(command.options, bridge)
+  return runtime.generateImageEdit(
+    command.sourceNodeId,
+    command.operation,
+    command.prompt,
+    options,
+  )
+}
+
+const applyGenerateBesideNode = async (
+  command: Extract<CanvasCommand, { kind: 'generate-beside-node' }>,
+  runtime: CanvasActionRuntime,
+  bridge: CanvasCommandAssetBridge,
+): Promise<string[]> => {
+  const options = await mapGenerationOptions(command.options, bridge)
+  return runtime.generateBesideNode(command.sourceNodeId, command.prompt, options)
+}
+
+const applyGenerateIntoAiSlot = async (
+  command: Extract<CanvasCommand, { kind: 'generate-into-ai-slot' }>,
+  runtime: CanvasActionRuntime,
+  bridge: CanvasCommandAssetBridge,
+): Promise<string[]> => {
+  const options = await mapGenerationOptions(command.options, bridge)
+  return runtime.generateIntoAiSlot(command.slotId, command.prompt, options)
+}
+
+const applyGenerateFromAnnotation = async (
+  command: Extract<CanvasCommand, { kind: 'generate-from-annotation' }>,
+  runtime: CanvasActionRuntime,
+  bridge: CanvasCommandAssetBridge,
+): Promise<string[]> => {
+  const options = await mapGenerationOptions(command.options, bridge)
+  return runtime.generateFromAnnotation(command.annotationNodeId, options)
+}
+
+/**
+ * Assemble the ImageMaskSubmitPayload from the serializable mask-edit command:
+ * resolve maskAssetId → mask Blob (if present) and markedImageAssetId →
+ * markedImage Blob (if present); geometry (maskBounds + sourceSize) + scalars
+ * (quality / model / subjectLabel / subjects) + the composed prompt ride
+ * directly in the command. Mirrors the overlay's ImageMaskSubmitPayload shape
+ * 1:1 (src/canvas/imageMaskGeometry.ts). File extends Blob, so the resolved
+ * File is a valid Blob for mask / markedImage.
+ */
+const buildMaskEditPayload = async (
+  command: Extract<CanvasCommand, { kind: 'mask-edit' }>,
+  bridge: CanvasCommandAssetBridge,
+): Promise<ImageMaskSubmitPayload> => {
+  const mask = command.maskAssetId
+    ? await bridge.resolveAssetFile(command.maskAssetId)
+    : undefined
+  const markedImage = command.markedImageAssetId
+    ? await bridge.resolveAssetFile(command.markedImageAssetId)
+    : undefined
+  return {
+    prompt: command.prompt,
+    mask,
+    maskBounds: command.maskBounds,
+    sourceSize: command.sourceSize,
+    quality: command.quality,
+    model: command.model,
+    subjectLabel: command.subjectLabel,
+    subjects: command.subjects,
+    markedImage,
+  }
+}
+
+const applyMaskEdit = async (
+  command: Extract<CanvasCommand, { kind: 'mask-edit' }>,
+  bridge: CanvasCommandAssetBridge,
+): Promise<string[]> => {
+  const payload = await buildMaskEditPayload(command, bridge)
+  return bridge.submitImageMaskEdit(command.sourceNodeId, payload)
 }

@@ -343,8 +343,13 @@ export const CANVAS_COMMAND_APPLIED_KINDS = [
   'delete-selected-nodes',
 ] as const
 
-/** Deferred to the T2.3 second slice (PR2): two-stage asset + generation apply.
- * `as const` preserves the literal subset for the partition type guards below. */
+/** Two-stage-asset kinds: apply is async (PR2 landed it) and needs a
+ * CanvasCommandAssetBridge to resolve assetIds → File/Blob via /api/assets
+ * (T1.5 #195). applyCanvasCommand throws CanvasCommandDeferredError for these
+ * kinds when no bridge is passed (the apply is "not wired for this caller" —
+ * T2.2 wires production). `as const` preserves the literal subset for the
+ * partition type guards below; it is also the structural sync-vs-async-asset
+ * partition (sync kinds are in CANVAS_COMMAND_APPLIED_KINDS). */
 export const CANVAS_COMMAND_DEFERRED_KINDS = [
   'import-asset',
   'generate-variations',
