@@ -309,6 +309,9 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
     // 返修 #8/N7 move:projectId 可改(若提供且属本 owner;move 双端 authz:source canvas + target project)。
     let projectId = existing.projectId ?? ''
     if (typeof incoming.projectId === 'string' && incoming.projectId && incoming.projectId !== projectId) {
+      // Greptile 第三轮修复:move 在 source 端须 'move'(owner-only),不能降级为 'write'(否则 editor/share-edit 可把他人画布移到自己项目)。
+      const sourceMove = await authzCanvas(c, id, 'move')
+      if (!sourceMove.ok) return denyCanvas(c, requestId, t0, sourceMove)
       const targetOwner = backend.getProjectOwner(incoming.projectId)
       // T1.4:move target project authz('move';仅 owner,§2 矩阵);非成员 → 404,成员越权 → 403。
       if (!targetOwner) {

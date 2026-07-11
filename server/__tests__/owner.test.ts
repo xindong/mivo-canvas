@@ -1,7 +1,7 @@
 // server/__tests__/owner.test.ts
 // T1.4 owner.ts 纯函数 + 配置校验单测(SSO trust flag + 网关密钥 + 生产告警)。
 import { describe, it, expect } from 'vitest'
-import { isSsoHeaderTrusted, validateSsoConfig, SSO_TRUSTED_USER_HEADER, GATEWAY_SECRET_HEADER } from '../lib/owner'
+import { isSsoHeaderTrusted, validateSsoConfig, ssoHeaderSecretOk, SSO_TRUSTED_USER_HEADER, GATEWAY_SECRET_HEADER } from '../lib/owner'
 
 describe('T1.4 isSsoHeaderTrusted(opt-in,默认关)', () => {
   it('默认关(未设 flag)', () => {
@@ -38,5 +38,21 @@ describe('T1.4 header 常量', () => {
   it('SSO + 网关密钥 header 名', () => {
     expect(SSO_TRUSTED_USER_HEADER).toBe('x-mivo-auth-user')
     expect(GATEWAY_SECRET_HEADER).toBe('x-mivo-gateway-secret')
+  })
+})
+
+describe('T1.4 ssoHeaderSecretOk(Greptile 第三轮:生产缺密钥不得信任 SSO header)', () => {
+  it('配置了密钥 → 须匹配', () => {
+    expect(ssoHeaderSecretOk({ MIVO_GATEWAY_SECRET: 's3cr3t' }, 's3cr3t')).toBe(true)
+    expect(ssoHeaderSecretOk({ MIVO_GATEWAY_SECRET: 's3cr3t' }, 'wrong')).toBe(false)
+    expect(ssoHeaderSecretOk({ MIVO_GATEWAY_SECRET: 's3cr3t' }, undefined)).toBe(false)
+  })
+  it('未配置密钥 + 非生产(dev/test)→ 放行(本地无网关)', () => {
+    expect(ssoHeaderSecretOk({}, undefined)).toBe(true)
+    expect(ssoHeaderSecretOk({ NODE_ENV: 'development' }, undefined)).toBe(true)
+  })
+  it('未配置密钥 + 生产 → 不放行(防伪造,Greptile 第三轮)', () => {
+    expect(ssoHeaderSecretOk({ NODE_ENV: 'production' }, undefined)).toBe(false)
+    expect(ssoHeaderSecretOk({ NODE_ENV: 'production' }, 'anything')).toBe(false) // 无密钥配置,生产一律不信任
   })
 })
