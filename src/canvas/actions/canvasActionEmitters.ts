@@ -104,7 +104,11 @@ const beginImageEditPrompt = (
   if (!noteId) return
 
   applyCanvasCommand({ kind: 'set-active-tool', toolId: 'select' }, runtime)
-  runtime.onEditText?.(noteId)
+  // add-annotation-node is a sync kind (no bridge) — runtime returns string|undefined.
+  // #208 widened applyCanvasCommand's return to a broad union (string|string[]|Promise)
+  // to cover async generation; narrow to string before handing to onEditText.
+  // Behavior == pre-rewiring (`runtime.addAnnotationNode` returned string|undefined).
+  if (typeof noteId === 'string') runtime.onEditText?.(noteId)
 }
 
 const generateImageEditForPrimary = (
