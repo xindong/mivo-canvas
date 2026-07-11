@@ -20,6 +20,7 @@ const toastError = vi.spyOn(toastFeedback, 'error')
 const toastInfo = vi.spyOn(toastFeedback, 'info')
 const warnLog = vi.spyOn(debugLogger, 'warn')
 const errorLog = vi.spyOn(debugLogger, 'error')
+const logLog = vi.spyOn(debugLogger, 'log')
 
 // ---- controllable deterministic clock ----
 let clockMs = 1_000
@@ -184,6 +185,15 @@ describe('FX-5 enqueue + drain', () => {
     expect(r.successes).toBe(1)
     expect(calls).toHaveLength(2)
   })
+
+  it('logs the success path via debugLogger (development-logging invariant, P2-1)', async () => {
+    const { fn } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue(minimalNode('c1', 'n1', 5))
+    await q.drain()
+    // success branch must emit a debugLogger.log entry (not just silently delete the record)
+    expect(logLog).toHaveBeenCalledWith(expect.any(String), expect.stringContaining('succeeded'))
+  })
 })
 
 // ── replay idempotency ──
@@ -198,6 +208,42 @@ describe('FX-5 replay idempotency', () => {
     await q.drain() // success
     expect(calls).toHaveLength(2)
     // The same persisted key is reused on replay → no duplicate server side-effect.
+    expect(calls[0].key).toBe(calls[1].key)
+    expect(calls[0].key).toMatch(/^mivo-/)
+  })
+
+  it('a lost response after the side effect is not re-applied on replay (queue→executor→backend idempotent, P2-2)', async () => {
+    // Stateful fake backend simulating server-side idempotency-key dedup. First call applies
+    // the side effect (bumps revision), records the key, then "loses the response" (transient)
+    // → the queue replays with the SAME idempotency key → the backend dedupes (key already
+    // seen) → returns success WITHOUT re-applying the side effect. Proves the
+    // queue→executor→backend combo is idempotent, not merely that the key string is stable.
+    const appliedKeys = new Set<string>()
+    const calls: { op: WriteOp; key: string }[] = []
+    let sideEffects = 0
+    let revisionBumps = 0
+    const fn = vi.fn(async (op: WriteOp, key: string): Promise<WriteOutcome> => {
+      calls.push({ op, key })
+      if (appliedKeys.has(key)) return { status: 'success' } // dedup: no re-apply
+      appliedKeys.add(key)
+      sideEffects++
+      revisionBumps++
+      return { status: 'transient', message: 'response lost after apply' }
+    })
+    const q = makeQueue(fn, { baseDelayMs: 1000, maxDelayMs: 60_000 })
+    await q.enqueue(minimalNode('c1', 'n1'))
+    // attempt 1: side effect applied, response lost → transient → backoff
+    expect((await q.drain()).failures).toBe(1)
+    expect(sideEffects).toBe(1)
+    expect(revisionBumps).toBe(1)
+    tick(1000) // past backoff
+    const r = await q.drain()
+    expect(r.successes).toBe(1)
+    // executor called twice, but the side effect was applied ONCE (backend deduped via key)
+    expect(fn).toHaveBeenCalledTimes(2)
+    expect(sideEffects).toBe(1)
+    expect(revisionBumps).toBe(1)
+    // same idempotency key reused across both calls (queue never minted a new one on retry)
     expect(calls[0].key).toBe(calls[1].key)
     expect(calls[0].key).toMatch(/^mivo-/)
   })
@@ -667,5 +713,168 @@ describe('FX-5 crash/reload recovery', () => {
     expect(r.successes).toBe(1) // migrated + executed (not orphaned)
     expect(exec.calls).toHaveLength(1)
     expect(await q.pendingCount()).toBe(0)
+  })
+})
+
+// ── DP-7 adversarial: camelCase field names, nested value, key-segment + encoding variants ──
+// Each case asserts the op was REJECTED at the gate AND nothing landed in IDB/memStore —
+// not merely that enqueue threw. The original bypass (P1-1) let the two keys serialize into
+// IDB as plaintext because isUserStateKeyForbidden alone missed camelCase field names,
+// nested value credential fields, and key-segment/encoding variants.
+
+describe('FX-5 DP-7 adversarial (camelCase / nested / encoded — never persisted)', () => {
+  it('refuses key= gatewayKey (camelCase) and leaves IDB empty', async () => {
+    const { fn } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await expect(q.enqueue(putUserStateOp('gatewayKey', 'SENTINEL'))).rejects.toThrow('DP-7')
+    expect(toastError).toHaveBeenCalledTimes(1)
+    expect(errorLog).toHaveBeenCalled()
+    expect(await __dumpWritesForTest()).toHaveLength(0)
+  })
+
+  it('refuses key= mivoKey (camelCase) and leaves IDB empty', async () => {
+    const { fn } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await expect(q.enqueue(putUserStateOp('mivoKey', 'SENTINEL'))).rejects.toThrow('DP-7')
+    expect(await __dumpWritesForTest()).toHaveLength(0)
+  })
+
+  it('refuses a nested credential field in the value (mivoKey deep in op.value)', async () => {
+    const { fn } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await expect(
+      q.enqueue(putUserStateOp('settings', { profile: { mivoKey: 'SENTINEL' } })),
+    ).rejects.toThrow('DP-7')
+    expect(await __dumpWritesForTest()).toHaveLength(0)
+  })
+
+  it('refuses a nested gatewayKey field in the value', async () => {
+    const { fn } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await expect(
+      q.enqueue(putUserStateOp('settings', { gatewayKey: 'SENTINEL' })),
+    ).rejects.toThrow('DP-7')
+    expect(await __dumpWritesForTest()).toHaveLength(0)
+  })
+
+  it('refuses a credential-value segment inside a colon key (mivo_ prefix, no sensitive substring)', async () => {
+    // mivo_abc123 is a credential-format value (mivo_ prefix) but contains no
+    // secret/token/password/apikey substring → the old isUserStateKeyForbidden missed it;
+    // scanUserStateKeyForCredential catches it via the mivo_/sk- prefix.
+    const { fn } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await expect(q.enqueue(putUserStateOp('canvas:mivo_abc123:selection', {}))).rejects.toThrow('DP-7')
+    expect(await __dumpWritesForTest()).toHaveLength(0)
+  })
+
+  it('refuses a URL-encoded credential segment in the key (%6divo_abc123 → mivo_abc123)', async () => {
+    const { fn } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await expect(q.enqueue(putUserStateOp('canvas:%6divo_abc123:selection', {}))).rejects.toThrow('DP-7')
+    expect(await __dumpWritesForTest()).toHaveLength(0)
+  })
+
+  it('refuses a double-URL-encoded credential segment (%256divo_abc123 → mivo_abc123)', async () => {
+    const { fn } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await expect(q.enqueue(putUserStateOp('canvas:%256divo_abc123:selection', {}))).rejects.toThrow('DP-7')
+    expect(await __dumpWritesForTest()).toHaveLength(0)
+  })
+
+  it('refuses a URL-encoded sensitive field name in the value (%61piKey → apiKey)', async () => {
+    const { fn } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await expect(q.enqueue(putUserStateOp('settings', { '%61piKey': 'SENTINEL' }))).rejects.toThrow('DP-7')
+    expect(await __dumpWritesForTest()).toHaveLength(0)
+  })
+
+  it('still allows a benign nested value under a benign key (no false positive)', async () => {
+    const { fn } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue(putUserStateOp('settings', { theme: 'dark', layout: { mode: 'grid' } }))
+    expect((await __dumpWritesForTest()).length).toBe(1)
+    await q.drain()
+    expect(fn).toHaveBeenCalled()
+  })
+})
+
+// ── IDB open/transaction failure → debounced degradation toast + memStore retention (P1-2) ──
+
+describe('FX-5 IDB-failure degradation (toast + memStore fallback)', () => {
+  // Each test stubs its own failing indexedDB; afterEach restores + resets.
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    return __resetWriteQueueDb()
+  })
+
+  // indexedDB present but open() throws synchronously → openDb rejects → get/put fall back
+  const stubIdbOpenThrows = () => {
+    vi.stubGlobal('indexedDB', {
+      open: () => {
+        throw new Error('idb open boom')
+      },
+    })
+  }
+
+  // indexedDB opens OK but db.transaction() throws → runTx rejects → get/put fall back
+  const stubIdbTxThrows = () => {
+    const fakeDb = {
+      objectStoreNames: { contains: () => true },
+      transaction: () => {
+        throw new Error('idb tx boom')
+      },
+      close: () => {},
+    }
+    vi.stubGlobal('indexedDB', {
+      open: () => {
+        const req: {
+          onupgradeneeded: ((e: { target: unknown }) => void) | null
+          onsuccess: ((e: { target: unknown }) => void) | null
+          onerror: ((e: { target: unknown }) => void) | null
+          result: unknown
+        } = { onupgradeneeded: null, onsuccess: null, onerror: null, result: undefined }
+        queueMicrotask(() => {
+          req.result = fakeDb
+          req.onsuccess?.({ target: req })
+        })
+        return req
+      },
+    })
+  }
+
+  it('IDB open() failure → one warn toast + record retained in memStore', async () => {
+    stubIdbOpenThrows()
+    await __resetWriteQueueDb() // drop the real-db dbPromise cached by the outer beforeEach so openDb reopens against the throwing stub
+    const { fn } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue(minimalNode('c1', 'n1')) // getAll + put both hit IDB failure → memStore
+    expect(toastWarn).toHaveBeenCalledTimes(1)
+    expect(toastWarn).toHaveBeenCalledWith('本地保存仅内存暂存,刷新页面可能丢失未保存的改动。')
+    expect(warnLog).toHaveBeenCalled()
+    expect(await q.pendingCount()).toBe(1) // record survived in memStore
+    expect((await __dumpWritesForTest()).length).toBe(1)
+  })
+
+  it('IDB transaction failure → one warn toast + record retained in memStore', async () => {
+    stubIdbTxThrows()
+    await __resetWriteQueueDb() // drop cached real-db dbPromise so runTx reopens against the tx-throwing stub
+    const { fn } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue(minimalNode('c1', 'n1'))
+    expect(toastWarn).toHaveBeenCalledTimes(1)
+    expect(warnLog).toHaveBeenCalled()
+    expect(await q.pendingCount()).toBe(1)
+    expect((await __dumpWritesForTest()).length).toBe(1)
+  })
+
+  it('debounces the toast across multiple failing writes (no spam)', async () => {
+    stubIdbOpenThrows()
+    await __resetWriteQueueDb()
+    const { fn } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue(minimalNode('c1', 'n1'))
+    await q.enqueue(minimalNode('c1', 'n2')) // different resourceKey → not coalesced
+    expect(toastWarn).toHaveBeenCalledTimes(1) // second failure did not re-toast
+    expect(await q.pendingCount()).toBe(2) // both records retained in memStore
   })
 })

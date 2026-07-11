@@ -95,11 +95,19 @@ pending → in-flight ─┬─ success              → 删
 
 ## DP-7(两把 key 永不进队列 payload)
 
-入队 `putUserState`/`deleteUserState` 时,若 `key` 命中 `isUserStateKeyForbidden`(`gateway-key`/`mivo-key`/`secret|token|password|apikey` 模式,契约已导出)→ **拒入队** + `toastFeedback.error` "该设置项不能同步,已阻止" + `debugLogger.error`,永不进 IDB。两把 key 永不进队列。node/edge/anchor payload 不含 user-state key,服务端 `scanForSensitiveFields` 是 payload 权威,队列不二次校验(文档化)。
+入队 `putUserState`/`deleteUserState` 时,在持久化前复用 #194 契约的 **三** 个扫描器(不另写)做 gate 检查,任一命中即 **拒入队** + `toastFeedback.error` "该设置项含敏感信息,不能同步,已阻止" + `debugLogger.error`,永不进 IDB:
+
+- `isUserStateKeyForbidden(key)` —— 旧 denylist(`gateway-key`/`mivo-key`)+ `secret|token|password|apikey` 模式。单独不够:camelCase `gatewayKey`/`mivoKey`(无连字符)不命中 denylist 也不命中模式;`mivo_/sk-` 前缀的 credential 值段不含敏感词。
+- `scanUserStateKeyForCredential(key)` —— 按 `:` 切段,每段 fixed-point URL-decode + lower 后查 `mivo_`/`sk-` 前缀。catch key 段内嵌凭据(如 `canvas:mivo_abc123:selection`)及 URL 编码/双重编码变体(`canvas:%6divo_abc123:selection` → decode → `mivo_abc123`)。
+- `scanForSensitiveFields({ [key]: value })` —— 把 user-state key 当 field 名 + 递归扫 `value`。catch camelCase key 名(`gatewayKey`/`mivoKey`→ 命中 `SENSITIVE_FIELD_PATTERN` 的 `gateway[-_]?key`/`mivo[-_]?key`,连字符可选)+ 嵌套 value 内凭据字段(`{profile:{mivoKey:'...'}}`)+ 编码变体(`%61piKey`→`apiKey`),返首个敏感路径。
+
+三器并集闭合了 `isUserStateKeyForbidden` 单独漏掉的 camelCase 字段名 / 嵌套 value 凭据字段 / key 段 + 编码变体(原 bypass:两把 key 会以明文序列化进 IDB)。node/edge/anchor payload 不含 user-state key,服务端 `scanForSensitiveFields` 是 payload 权威,队列不二次校验(文档化)。
 
 ## 用户可见降级(按 `docs/development-logging.md`)
 
-所有终态/溢出/401/dead-letter 都走 `debugLogger`(warn/error)+ `toastFeedback`(info/warn/error)。终态 record 在 toast+log 后 **删除**(`debugLogStore` 是审计轨迹 + Debug Log 面板可查;IDB 不留垃圾、不无限膨胀)。401 record 不删(待 resume 重试)。
+所有终态/溢出/401/dead-letter 都走 `debugLogger`(warn/error)+ `toastFeedback`(info/warn/error);**成功**路径也走 `debugLogger.log`("write … succeeded after N attempt(s); removed from queue",P2-1 — 成功状态变更不静默)。终态 record 在 toast+log 后 **删除**(`debugLogStore` 是审计轨迹 + Debug Log 面板可查;IDB 不留垃圾、不无限膨胀)。401 record 不删(待 resume 重试)。
+
+IDB open/transaction 失败 → 降级 memStore 保留 record(刷新即丢,但本 session 仍 drain)。首次失败 `toastFeedback.warn` "本地保存仅内存暂存,刷新页面可能丢失未保存的改动" + `debugLogger.warn`(P1-2);同类后续失败 `debugLogger.warn` only、`toast` 去抖不刷屏(`idbDegradationWarned` 单次闸门;get/put 数据保留路径才 toast,delete/clear 不保留数据、warn-only)。IDB 完全不可用(`undefined`/隐私模式)走 early-return memStore、不 toast。
 
 ## 执行器 seam(T1.3 接线点)
 
@@ -109,18 +117,18 @@ pending → in-flight ─┬─ success              → 删
 - T1.3 接线示意:`createWriteQueue({ executor: realExecutor, onConflict }).start()`;`realExecutor` 按 `op.kind` dispatch 到真 `ServerPersistAdapter` 方法 + 设 `idempotency-key` header + `classifyHttpStatus`。
 - `start()` 注册:`setInterval(drain, 5s)` + `online` 事件 + `visibilitychange`;`stop()` 清理。未调 `start()` → 零副作用。
 
-## 测试(`fake-indexeddb/auto`,36 用例全绿)
+## 测试(`fake-indexeddb/auto`,54 用例全绿)
 
 - `classifyHttpStatus` 各错误码(11 用例,纯函数)
-- enqueue + drain 成功 / 未来 nextAttemptAt 不 drain
-- 重放幂等(同 op 重放 → executor 收到**同一 idempotencyKey**)
+- enqueue + drain 成功 / 未来 nextAttemptAt 不 drain / 成功路径 `debugLogger.log`(P2-1)
+- 重放幂等(同 op 重放 → executor 收到**同一 idempotencyKey**)+ **组合幂等**:带状态 fake backend(首请求已产生副作用但响应丢失→重放,同 key 服务端 dedup→副作用只发生一次,证明 queue→executor→backend 组合幂等,不只 key 稳定)(P2-2)
 - 各错误码分支(mock executor 返对应 outcome,断言**队列真实状态 + 副作用**):409 conflict + onConflict、413 too-large 不重试、422 reuse-conflict、400 rejected、404 delete=success/non-delete=rejected、terminal、5xx 退避重试后成功、dead-letter(maxAttempts)、401 暂停 + resume
 - coalesce:同 resourceKey pending 合并(新 key)、appendChatMessage 不合并、delete 取代 upsert、in-flight 不合并
 - 溢出:超限驱逐最老 pending + toast;全 in-flight 拒入队
 - per-userId 分区(A 的 op 不为 B drain)
 - 跨 session durable(enqueue → 新队列实例 → drain 落库)
-- DP-7 拒入队(`gateway-key`/`mivo-key` → throw,不进 IDB;allowed key 正常入队)
-- IDB 不可用 → 内存降级
+- DP-7 拒入队(`gateway-key`/`mivo-key` → throw,不进 IDB;allowed key 正常入队)+ **对抗用例**(camelCase key 名 `gatewayKey`/`mivoKey`、嵌套 value 凭据字段、key 段 `mivo_abc123`、URL 编码/双重编码段与字段名 `%6divo_abc123`/`%61piKey` → 全部拒入队 + 断言"未写入 IDB"不只"返回 rejected";benign 嵌套值不误杀)(P1-1)
+- IDB 不可用 → 内存降级 + **IDB open/transaction 失败**(注入 `indexedDB.open` 抛错 / `db.transaction` 抛错两类)→ 首次 warn toast + record 留 memStore + 同类失败去抖不刷屏(P1-2)
 - start/stop 生命周期(start 即时 drain、stop 停周期)
 
 测试用 `__dumpWritesForTest`(复用模块自身 IDB 连接,避免独立连接竞态)+ `__resetWriteQueueDb`(`store.clear()` 而非 `deleteDatabase`,后者在 fake-indexeddb 下 open/close/delete 竞争会留 blocked versionchange 毒化后续 beforeEach)。

@@ -23,7 +23,11 @@
 // (debugLogStore is the audit trail; IDB must not grow unbounded).
 
 import type { AnchorPayload, EdgePayload, NodePayload, Revision } from '../../shared/persist-contract.ts'
-import { isUserStateKeyForbidden } from '../../shared/persist-contract.ts'
+import {
+  isUserStateKeyForbidden,
+  scanForSensitiveFields,
+  scanUserStateKeyForCredential,
+} from '../../shared/persist-contract.ts'
 import { ANONYMOUS_USER_ID, getPersistUserId } from './persistUserId'
 import { debugLogger } from '../store/debugLogStore'
 import { toastFeedback } from '../store/toastStore'
@@ -205,6 +209,20 @@ const memStore = new Map<string, QueuedWrite>()
 
 const isIdbAvailable = (): boolean => typeof indexedDB !== 'undefined' && indexedDB !== null
 
+// IDB open/transaction failure → fall back to memStore (survives a pm2-restart window, not a
+// reload). The FIRST such failure surfaces one user-visible warning toast so the user knows a
+// refresh may lose unsaved writes; subsequent same-kind failures stay debugLogger-only
+// (debounced via idbDegradationWarned) so the toast never spams (P1-2). Only the data-preserving
+// get/put paths fire this — delete/clear failures don't retain data in memory and stay warn-only.
+let idbDegradationWarned = false
+const warnIdbDegradation = (context: string, error: unknown): void => {
+  debugLogger.warn(SOURCE, `${context}; using in-memory fallback: ${msg(error)}`)
+  if (!idbDegradationWarned) {
+    idbDegradationWarned = true
+    toastFeedback.warn('本地保存仅内存暂存,刷新页面可能丢失未保存的改动。')
+  }
+}
+
 const openDb = (): Promise<IDBDatabase> => {
   if (dbPromise) return dbPromise
   dbPromise = new Promise<IDBDatabase>((resolve, reject) => {
@@ -256,7 +274,7 @@ const getAllWrites = async (): Promise<QueuedWrite[]> => {
     const memOnly = Array.from(memStore.values()).filter((r) => !idbIds.has(r.id))
     return [...idbRecords, ...memOnly]
   } catch (error) {
-    debugLogger.warn(SOURCE, `getAll failed; using in-memory fallback: ${msg(error)}`)
+    warnIdbDegradation('getAll failed', error)
     return Array.from(memStore.values())
   }
 }
@@ -273,9 +291,10 @@ const putWrite = async (record: QueuedWrite): Promise<void> => {
     memStore.delete(record.id)
   } catch (error) {
     // Never silently lose a queued write — fall back to memory so it still drains this
-    // session. The warn makes the degradation visible (logging invariant). getAllWrites
-    // unions memStore so the record stays visible to drain even after IDB recovers.
-    debugLogger.warn(SOURCE, `put failed for ${record.id}; using in-memory fallback: ${msg(error)}`)
+    // session. warnIdbDegradation makes the degradation visible + toasts once (logging
+    // invariant, P1-2). getAllWrites unions memStore so the record stays visible to
+    // drain even after IDB recovers.
+    warnIdbDegradation(`put failed for ${record.id}`, error)
     memStore.set(record.id, record)
   }
 }
@@ -351,15 +370,35 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
 
   const enqueue = async (op: WriteOp): Promise<string> => {
     // DP-7: the two device-local API keys (gateway-key/mivo-key) and secret-like
-    // user-state keys must NEVER enter the queue payload. Reject at the gate — never
-    // persist, never send. The contract exports isUserStateKeyForbidden for exactly this.
-    if (
-      (op.kind === 'putUserState' || op.kind === 'deleteUserState') &&
-      isUserStateKeyForbidden(op.key)
-    ) {
-      debugLogger.error(SOURCE, `refused to queue ${op.kind} with forbidden key (DP-7): ${op.key}`)
-      toastFeedback.error('该设置项不能同步,已阻止。')
-      throw new Error(`DP-7 forbidden user-state key: ${op.key}`)
+    // user-state keys/values must NEVER enter the queue payload. Reject at the gate —
+    // never persist, never send. Reuse ALL three #194 contract scanners (no bespoke
+    // scanner) so the prior isUserStateKeyForbidden-alone gaps are closed:
+    //  - camelCase field names (gatewayKey/mivoKey) as the user-state key or nested in the
+    //    value — isUserStateKeyForbidden only knew hyphenated gateway-key/mivo-key + the
+    //    secret/token/password/apikey substrings, so key='gatewayKey' / value={mivoKey:...}
+    //    both bypassed it (P1-1).
+    //  - credential-value segments inside a colon-separated key (mivo_xxx / sk-xxx),
+    //    including URL-encoded / double-encoded variants — scanUserStateKeyForCredential.
+    //  - any sensitive field path nested arbitrarily deep in the value (camelCase,
+    //    hyphenated, prefixed, encoded) — scanForSensitiveFields, invoked with the key
+    //    wrapped as a synthetic field name so the key itself is matched against
+    //    SENSITIVE_FIELD_PATTERN (catches gatewayKey/mivoKey/secret/...) and op.value is
+    //    recursed in the same pass.
+    if (op.kind === 'putUserState' || op.kind === 'deleteUserState') {
+      const value = op.kind === 'putUserState' ? op.value : undefined
+      const keySegHit = scanUserStateKeyForCredential(op.key)
+      const fieldHit = scanForSensitiveFields({ [op.key]: value })
+      if (isUserStateKeyForbidden(op.key) || keySegHit !== null || fieldHit !== null) {
+        const reason =
+          keySegHit !== null
+            ? `forbidden credential segment in key: ${keySegHit}`
+            : fieldHit !== null
+              ? `forbidden field path: ${fieldHit}`
+              : `forbidden user-state key: ${op.key}`
+        debugLogger.error(SOURCE, `refused to queue ${op.kind} (DP-7): ${reason}`)
+        toastFeedback.error('该设置项含敏感信息,不能同步,已阻止。')
+        throw new Error(`DP-7 forbidden user-state payload: ${reason}`)
+      }
     }
 
     const userId = getPersistUserId()
@@ -513,6 +552,14 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
 
         switch (outcome.status) {
           case 'success':
+            // P2-1: success path must surface via debugLogger (development-logging
+            // invariant — successful state changes are log-level, never silent). The
+            // record is removed from the queue only after the executor confirms the write
+            // landed; rec.attempts counts prior transient failures (0 on a clean send).
+            debugLogger.log(
+              SOURCE,
+              `write ${rec.id} (${rec.resourceKey ?? rec.op.kind}) succeeded after ${rec.attempts + 1} attempt(s); removed from queue`,
+            )
             await deleteWrite(rec.id)
             successes++
             break
@@ -708,4 +755,8 @@ export const __resetWriteQueueDb = async (): Promise<void> => {
   // Drop the cached connection so the next op reopens against the (now-cleared) store.
   dbPromise = undefined
   await clearIdbStore()
+  // Reset the IDB-degradation toast debounce so each test starts with a fresh first-failure
+  // toast window (P1-2). clearIdbStore is test-internal and uses plain debugLogger.warn (not
+  // warnIdbDegradation), so it never sets the flag — a prior test's data-path failure may have.
+  idbDegradationWarned = false
 }
