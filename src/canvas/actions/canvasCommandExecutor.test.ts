@@ -18,74 +18,12 @@ import {
   CanvasCommandDeferredError,
   CanvasCommandInvalidPayloadError,
 } from './canvasCommandExecutor'
-import type { CanvasActionRuntime } from './canvasActionTypes'
+import { createMockRuntime } from './canvasCommandExecutorTestFactories'
 import {
   CANVAS_COMMAND_DEFERRED_KINDS,
   deserializeCanvasCommand,
   serializeCanvasCommand,
 } from './canvasCommand'
-
-/**
- * Build a fully-mocked CanvasActionRuntime. Only the method spies are exercised
- * by applyCanvasCommand; the data fields (context / counts) are filler so the
- * type is satisfied. Returns the runtime typed as CanvasActionRuntime with each
- * method a vi.fn so tests can assert dispatch intent + args.
- */
-const createMockRuntime = (): CanvasActionRuntime => {
-  const methods = {
-    setActiveTool: vi.fn(),
-    addTextNode: vi.fn(() => 'text-id'),
-    addFrameNode: vi.fn(() => 'frame-id'),
-    addAiSlotNode: vi.fn(() => 'slot-id'),
-    addAnnotationNode: vi.fn(() => 'note-id'),
-    addMarkupNode: vi.fn(() => 'markup-id'),
-    updateMarkupStyle: vi.fn(),
-    updateSectionStyle: vi.fn(),
-    setSectionLockMode: vi.fn(),
-    removeSectionOnly: vi.fn(),
-    selectNodes: vi.fn(),
-    generateVariations: vi.fn(async () => []),
-    generateImageEdit: vi.fn(async () => []),
-    generateBesideNode: vi.fn(async () => []),
-    generateIntoAiSlot: vi.fn(async () => []),
-    generateFromAnnotation: vi.fn(async () => []),
-    duplicateNode: vi.fn(),
-    duplicateSelectedNodes: vi.fn(),
-    groupSelectedNodes: vi.fn(),
-    ungroupSelectedNodes: vi.fn(),
-    copySelectedNodes: vi.fn(),
-    pasteClipboardNodes: vi.fn(),
-    moveNodeLayer: vi.fn(),
-    moveSelectedLayer: vi.fn(),
-    alignSelectedNodes: vi.fn(),
-    distributeSelectedNodes: vi.fn(),
-    arrangeSelectedNodes: vi.fn(),
-    toggleSelectedNodesLocked: vi.fn(),
-    hideSelectedNodes: vi.fn(),
-    showAllHiddenNodes: vi.fn(),
-    deleteNode: vi.fn(),
-    deleteSelectedNodes: vi.fn(),
-  }
-  return {
-    context: {} as CanvasActionRuntime['context'],
-    clipboardCount: 0,
-    hiddenCount: 0,
-    allNodeIds: [],
-    canvasPosition: undefined,
-    onOpenDetails: undefined,
-    onFitAll: undefined,
-    onFitSelection: undefined,
-    onCreateTextAt: undefined,
-    onCreateFrameAt: undefined,
-    onEditText: undefined,
-    onRenameNode: undefined,
-    onImportAssetAt: undefined,
-    onCropNode: undefined,
-    onStartImageMaskEdit: undefined,
-    onDownloadOriginal: undefined,
-    ...methods,
-  } as unknown as CanvasActionRuntime & typeof methods
-}
 
 describe('applyCanvasCommand — node creation dispatch', () => {
   it('add-text-node → addTextNode(position, text); returns new id', () => {
