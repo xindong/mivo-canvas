@@ -395,3 +395,137 @@ jobs:
           path: test-artifacts
           if-no-files-found: warn
           retention-days: 14
+
+  # T1.3 PG backend CI 闸门(#202 复审遗留增强)。
+  # PG 后端测试(双后端契约 32 场景 + 并发回归)原在 CI 无 PG 全部 describe.skip。
+  # 本 job 起 postgres:16 service container(与生产一致 PG16),跑 MIVO_PG_TEST=1 套件。
+  # **先非 required(观察窗)**,稳定后另 PR 翻 required + 注册 main 分支保护必需 check
+  # (check 名 `CI / pg suite (PG16)`,仿 #186→#193 e2e-kernel-gate 先例)。
+  #
+  # 衔接 #202 时序(关键):
+  #   - main 当前无 server/persist PG 测试文件(在 #202 分支返修中):backend.contract.dual /
+  #     backend.pg / persist.route.dual 三个 PG-gated 文件在 origin/main 上均不存在。
+  #   - 故本 PR 里 vitest 跑 0 个 PG 用例(--passWithNoTests → 绿);证明的是 PG infra 可用:
+  #     service container 起 + psql 可连 + CREATEDB 可用 + vitest 命令正确。
+  #   - #202 合入 main 后,三个文件出现,本 job 自动跑真 PG 用例(契约 32 场景 + 并发回归),
+  #     无需改 workflow——观察窗即此生效。
+  pg-suite:
+    name: pg suite (PG16)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        # PG16(与生产一致)。service container + healthcheck。
+        image: postgres:16
+        env:
+          # 测试专用 superuser + DB;无生产凭据。POSTGRES_USER 创建为 superuser(满足
+          # backend.pg.test.ts ensureUnitDb 的 CREATEDB 需求)。密码 = #202 测试默认,非生产。
+          POSTGRES_USER: mivo
+          POSTGRES_PASSWORD: mivo-test-no-password
+          # 初始化即建 mivocanvas DB(contract.dual / route.dual 用;mivocanvas_unit 由测试
+          # ensureUnitDb 自建,下方 psql 步预建以加速 + 验证 CREATEDB)。
+          POSTGRES_DB: mivocanvas
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mivo -d mivocanvas"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      MIVO_PG_TEST: '1'
+      MIVO_PG_HOST: 127.0.0.1
+      MIVO_PG_PORT: '5432'
+      MIVO_PG_USER: mivo
+      MIVO_PG_PASSWORD: mivo-test-no-password
+      MIVO_PG_DB: mivocanvas
+      MIVO_PG_UNIT_DB: mivocanvas_unit
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node (LTS)
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # 安装 psql client 跑连通验证(lead 验证铁律:service container 起得来 + psql 可连)。
+      # ubuntu-latest 默认无 psql;postgresql-client 任意版本可连 PG16(协议兼容)。
+      - name: Install psql client
+        run: sudo apt-get install -y postgresql-client
+
+      # 显式 psql 连通 + 建库验证:本 PR(main 无 PG 测试文件)里这是 PG infra 的核心证据;
+      # #202 合入后该步是 PG 套件的可用性前置(两 DB 均就绪)。
+      - name: Verify PG connectivity & DB provisioning
+        run: |
+          set -e
+          echo "::group::pg_isready (service container health)"
+          pg_isready -h 127.0.0.1 -p 5432 -U mivo -d mivocanvas
+          echo "::endgroup::"
+          echo "::group::psql connect as mivo + list DBs (auth proof)"
+          PGPASSWORD=mivo-test-no-password psql -h 127.0.0.1 -p 5432 -U mivo -d mivocanvas -c "\l"
+          echo "::endgroup::"
+          echo "::group::Ensure mivocanvas_unit DB exists (backend.pg.test isolation DB)"
+          PGPASSWORD=mivo-test-no-password psql -h 127.0.0.1 -p 5432 -U mivo -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='mivocanvas_unit'" | grep -q 1 \
+            || PGPASSWORD=mivo-test-no-password psql -h 127.0.0.1 -p 5432 -U mivo -d postgres -c "CREATE DATABASE mivocanvas_unit"
+          echo "mivocanvas_unit ready (CREATEDB confirmed)"
+          echo "::endgroup::"
+
+      # 跑 PG-gated 套件。--no-fileParallelism:两 DB 隔离设计下更稳(lead 指定)。
+      # --passWithNoTests:main 无 PG 测试文件时 0 匹配不算失败(本 PR 即此态);
+      # #202 合入后三个文件出现,实跑真 PG 用例(失败即红;观察窗内非阻断,翻 required 后阻断)。
+      - name: Run PG-gated vitest suite
+        run: |
+          set -o pipefail
+          mkdir -p test-artifacts
+          npx vitest run --no-fileParallelism --passWithNoTests \
+            server/persist/backend.contract.dual.test.ts \
+            server/persist/backend.pg.test.ts \
+            server/routes/persist.route.dual.test.ts 2>&1 | tee test-artifacts/pg-suite.log
+
+      # 汇总:本轮 0 个 PG 文件(infra-only)还是真跑了 N 个(#202 合入后)。不许静默。
+      - name: Surface pg-suite result in job summary
+        if: always()
+        run: |
+          {
+            echo '## pg suite (PG16, 非阻断观察窗)'
+            echo ''
+            echo 'PG 后端测试闸门:postgres:16 service container + `MIVO_PG_TEST=1` vitest 套件。'
+            echo '**先非 required**(观察窗),稳定后另 PR 翻 required + 注册 `CI / pg suite (PG16)` 进 main 必需 check(仿 #186→#193 e2e-kernel-gate 先例)。'
+            echo ''
+            echo '### 衔接 #202 时序'
+            echo '- main 当前无 `server/persist` PG 测试文件(在 #202 分支返修中)。'
+            echo '- 本 PR 里 job 跑 0 个 PG 用例(`--passWithNoTests` → 绿),证明 PG infra 可用:service container 起 + psql 可连 + CREATEDB 可用 + vitest 命令正确(见上方 psql 步与 vitest 步日志)。'
+            echo '- #202 合入 main 后,三个 PG-gated 文件出现,本 job 自动跑真 PG 用例(双后端契约 32 场景 + 并发回归),无需改 workflow。'
+            echo ''
+            echo '### 本轮 vitest 匹配文件数(不许静默:0 vs N 可见)'
+            nFound=0
+            for f in server/persist/backend.contract.dual.test.ts server/persist/backend.pg.test.ts server/routes/persist.route.dual.test.ts; do
+              if [ -f "$f" ]; then echo "- \`$f\` ✅ 存在"; nFound=$((nFound+1)); else echo "- \`$f\` ⏳ main 上尚不存在(#202 合入后出现)"; fi
+            done
+            echo ''
+            if [ "$nFound" -eq 0 ]; then
+              echo '> **infra-only 模式**:0 个 PG 测试文件 → vitest `--passWithNoTests` 空跑绿。PG infra 由上方 psql 连通步验证。#202 合入后自动切真跑。'
+            else
+              echo "> **真 PG 测试模式**:$nFound 个文件匹配,vitest 实跑(见下方日志)。"
+            fi
+            echo ''
+            echo '### vitest 日志(末 30 行)'
+            echo '```'
+            tail -n 30 test-artifacts/pg-suite.log 2>/dev/null || echo '(无日志:可能在 setup 阶段异常,见上方 step 日志)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload pg-suite artifacts
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pg-suite-artifacts
+          path: test-artifacts
+          if-no-files-found: warn
+          retention-days: 14
