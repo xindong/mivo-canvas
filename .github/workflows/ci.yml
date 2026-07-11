@@ -396,19 +396,16 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  # T1.3 PG backend CI 闸门(#202 复审遗留增强)。
+  # T1.3 PG backend CI 闸门(#202 复审遗留增强;2026-07-12 翻 required)。
   # PG 后端测试(双后端契约 32 场景 + 并发回归)原在 CI 无 PG 全部 describe.skip。
   # 本 job 起 postgres:16 service container(与生产一致 PG16),跑 MIVO_PG_TEST=1 套件。
-  # **先非 required(观察窗)**,稳定后另 PR 翻 required + 注册 main 分支保护必需 check
-  # (check 名 `CI / pg suite (PG16)`,仿 #186→#193 e2e-kernel-gate 先例)。
+  # 观察窗已收口(#201/#202/#205/#206/#207/#208/#209 七 PR 全真跑全绿,仅一次 setup-node
+  # infra flake rerun 即绿):本 job 自本 PR 起为 required 阻断 job,已注册进 main 分支保护
+  # 必需 check(check 名 `CI / pg suite (PG16)`,仿 #186→#193 e2e-kernel-gate 先例)。
   #
-  # 衔接 #202 时序(关键):
-  #   - main 当前无 server/persist PG 测试文件(在 #202 分支返修中):backend.contract.dual /
-  #     backend.pg / persist.route.dual 三个 PG-gated 文件在 origin/main 上均不存在。
-  #   - 故本 PR 里 vitest 跑 0 个 PG 用例(--passWithNoTests → 绿);证明的是 PG infra 可用:
-  #     service container 起 + psql 可连 + CREATEDB 可用 + vitest 命令正确。
-  #   - #202 合入 main 后,三个文件出现,本 job 自动跑真 PG 用例(契约 32 场景 + 并发回归),
-  #     无需改 workflow——观察窗即此生效。
+  # 时序:#202 已于 2026-07-11 合入 main,四个 PG-gated 测试文件已在 main:
+  #   backend.contract.dual / backend.pg / permissionBackend.contract.dual / persist.route.dual
+  # 故本 job 在每个 PR 上实跑真 PG 用例(契约 32 场景 + 并发回归),失败即阻断合并。
   pg-suite:
     name: pg suite (PG16)
     if: github.event_name == 'pull_request'
@@ -459,8 +456,8 @@ jobs:
       - name: Install psql client
         run: sudo apt-get install -y postgresql-client
 
-      # 显式 psql 连通 + 建库验证:本 PR(main 无 PG 测试文件)里这是 PG infra 的核心证据;
-      # #202 合入后该步是 PG 套件的可用性前置(两 DB 均就绪)。
+      # 显式 psql 连通 + 建库验证:PG 套件的可用性前置(service container 起 + psql 可连 +
+      # 两 DB 均就绪)。#202 已合入,本步在每 PR 上为真 PG 测试铺路。
       - name: Verify PG connectivity & DB provisioning
         run: |
           set -e
@@ -477,8 +474,9 @@ jobs:
           echo "::endgroup::"
 
       # 跑 PG-gated 套件。--no-fileParallelism:两 DB 隔离设计下更稳(lead 指定)。
-      # --passWithNoTests:main 无 PG 测试文件时 0 匹配不算失败(本 PR 即此态);
-      # #202 合入后三个文件出现,实跑真 PG 用例(失败即红;观察窗内非阻断,翻 required 后阻断)。
+      # --passWithNoTests:防御性保留(若未来某文件临时移除,0 匹配不算失败)。
+      # #202 已合入,四个 PG-gated 文件在 main,每 PR 实跑真 PG 用例(失败即红 + 阻断合并,
+      # 自本 PR 起为 required)。
       - name: Run PG-gated vitest suite
         run: |
           set -o pipefail
@@ -489,29 +487,28 @@ jobs:
             server/persist/permissionBackend.contract.dual.test.ts \
             server/routes/persist.route.dual.test.ts 2>&1 | tee test-artifacts/pg-suite.log
 
-      # 汇总:本轮 0 个 PG 文件(infra-only)还是真跑了 N 个(#202 合入后)。不许静默。
+      # 汇总:本轮匹配文件数 + vitest 末尾日志。不许静默:0 vs N 可见。
       - name: Surface pg-suite result in job summary
         if: always()
         run: |
           {
-            echo '## pg suite (PG16, 非阻断观察窗)'
+            echo '## pg suite (PG16, required)'
             echo ''
-            echo 'PG 后端测试闸门:postgres:16 service container + `MIVO_PG_TEST=1` vitest 套件。'
-            echo '**先非 required**(观察窗),稳定后另 PR 翻 required + 注册 `CI / pg suite (PG16)` 进 main 必需 check(仿 #186→#193 e2e-kernel-gate 先例)。'
+            echo 'PG 后端测试闸门(required):postgres:16 service container + `MIVO_PG_TEST=1` vitest 套件。'
+            echo '观察窗已收口(七 PR 全绿),已注册进 main 分支保护必需 check `CI / pg suite (PG16)`(仿 #186→#193 e2e-kernel-gate 先例)。失败即阻断合并。'
             echo ''
-            echo '### 衔接 #202 时序'
-            echo '- main 当前无 `server/persist` PG 测试文件(在 #202 分支返修中)。'
-            echo '- 本 PR 里 job 跑 0 个 PG 用例(`--passWithNoTests` → 绿),证明 PG infra 可用:service container 起 + psql 可连 + CREATEDB 可用 + vitest 命令正确(见上方 psql 步与 vitest 步日志)。'
-            echo '- #202 合入 main 后,三个 PG-gated 文件出现,本 job 自动跑真 PG 用例(双后端契约 32 场景 + 并发回归),无需改 workflow。'
+            echo '### 时序'
+            echo '- #202 已于 2026-07-11 合入 main,四个 PG-gated 测试文件已在 main。'
+            echo '- 每 PR 实跑真 PG 用例(双后端契约 32 场景 + 并发回归),见下方 vitest 日志。'
             echo ''
             echo '### 本轮 vitest 匹配文件数(不许静默:0 vs N 可见)'
             nFound=0
-            for f in server/persist/backend.contract.dual.test.ts server/persist/backend.pg.test.ts server/routes/persist.route.dual.test.ts; do
-              if [ -f "$f" ]; then echo "- \`$f\` ✅ 存在"; nFound=$((nFound+1)); else echo "- \`$f\` ⏳ main 上尚不存在(#202 合入后出现)"; fi
+            for f in server/persist/backend.contract.dual.test.ts server/persist/backend.pg.test.ts server/persist/permissionBackend.contract.dual.test.ts server/routes/persist.route.dual.test.ts; do
+              if [ -f "$f" ]; then echo "- \`$f\` ✅ 存在"; nFound=$((nFound+1)); else echo "- \`$f\` ⏳ 尚不存在(预期应在 main)"; fi
             done
             echo ''
             if [ "$nFound" -eq 0 ]; then
-              echo '> **infra-only 模式**:0 个 PG 测试文件 → vitest `--passWithNoTests` 空跑绿。PG infra 由上方 psql 连通步验证。#202 合入后自动切真跑。'
+              echo '> **infra-only 模式**:0 个 PG 测试文件 → vitest `--passWithNoTests` 空跑绿。PG infra 由上方 psql 连通步验证。'
             else
               echo "> **真 PG 测试模式**:$nFound 个文件匹配,vitest 实跑(见下方日志)。"
             fi
