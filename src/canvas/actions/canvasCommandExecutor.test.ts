@@ -843,6 +843,38 @@ describe('applyCanvasCommand — two-stage asset failure paths (tagged, not sile
     // A resolve failure is NOT a deferral — they must be distinguishable.
     expect(thrown).not.toBeInstanceOf(CanvasCommandDeferredError)
   })
+
+  it('bridge rejecting a plain Error → executor re-wraps to CanvasCommandAssetResolveError with assetId', async () => {
+    // Greptile P2: the executor enforces the tagged-error contract at its OWN
+    // boundary — it does not rely on the bridge impl to self-tag. A naive bridge
+    // that rejects a plain Error is re-wrapped carrying the failed assetId, so a
+    // downstream caller can always tell "asset resolve failed" (tagged) apart
+    // from a real generation/import failure, regardless of how the bridge throws.
+    const bridge = createMockAssetBridge()
+    vi.mocked(bridge.resolveAssetFile).mockRejectedValueOnce(new Error('network timeout'))
+    const rt = createMockRuntime()
+    let thrown: unknown
+    try {
+      await applyCanvasCommand(
+        {
+          kind: 'generate-image-edit',
+          sourceNodeId: 'i',
+          operation: 'upscale',
+          prompt: 'p',
+          options: { referenceAssetIds: ['plain-err-id'] },
+        },
+        rt,
+        bridge,
+      )
+    } catch (error) {
+      thrown = error
+    }
+    expect(thrown).toBeInstanceOf(CanvasCommandAssetResolveError)
+    const resolveErr = thrown as CanvasCommandAssetResolveError
+    expect(resolveErr.assetId).toBe('plain-err-id')
+    expect(resolveErr.reason).toContain('network timeout')
+    expect(vi.mocked(rt.generateImageEdit)).not.toHaveBeenCalled()
+  })
 })
 
 /**

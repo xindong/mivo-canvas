@@ -487,8 +487,30 @@ export const applyCanvasCommand = (
 // back through the bridge (import / mask-edit submit).
 
 /**
- * Resolve two-stage referenceAssetIds → File[] for generation options. The
- * bridge throws CanvasCommandAssetResolveError on 404 / resolve failure; Promise.all
+ * Resolve a single two-stage assetId → File via the bridge, ENFORCING the tagged
+ * CanvasCommandAssetResolveError contract at the executor boundary. If the bridge
+ * impl rejects with a plain Error (naive impl / network throw / response parse
+ * error), it is re-wrapped here carrying the failed assetId — so the apply caller
+ * ALWAYS sees a tagged resolve failure and can tell "asset invalid" apart from a
+ * real generation/import failure, regardless of how the bridge impl throws. An
+ * already-tagged CanvasCommandAssetResolveError passes through unchanged.
+ */
+const resolveAssetFileTagged = async (
+  assetId: string,
+  bridge: CanvasCommandAssetBridge,
+): Promise<File> => {
+  try {
+    return await bridge.resolveAssetFile(assetId)
+  } catch (error) {
+    if (error instanceof CanvasCommandAssetResolveError) throw error
+    const reason = error instanceof Error ? error.message : String(error)
+    throw new CanvasCommandAssetResolveError(assetId, reason)
+  }
+}
+
+/**
+ * Resolve two-stage referenceAssetIds → File[] for generation options. Each id is
+ * resolved via resolveAssetFileTagged so a failure is always tagged; Promise.all
  * propagates the first failure as a rejection so the apply caller sees a tagged
  * error, not a silent empty array. Empty/absent referenceAssetIds → [].
  */
@@ -497,7 +519,7 @@ const resolveReferenceFiles = async (
   bridge: CanvasCommandAssetBridge,
 ): Promise<File[]> => {
   if (!assetIds || assetIds.length === 0) return []
-  return Promise.all(assetIds.map((id) => bridge.resolveAssetFile(id)))
+  return Promise.all(assetIds.map((id) => resolveAssetFileTagged(id, bridge)))
 }
 
 /**
@@ -525,7 +547,7 @@ const applyImportAsset = async (
   command: Extract<CanvasCommand, { kind: 'import-asset' }>,
   bridge: CanvasCommandAssetBridge,
 ): Promise<string> => {
-  const file = await bridge.resolveAssetFile(command.assetId)
+  const file = await resolveAssetFileTagged(command.assetId, bridge)
   return bridge.addImportedAssetNode({
     assetId: command.assetId,
     file,
@@ -599,10 +621,10 @@ const buildMaskEditPayload = async (
   bridge: CanvasCommandAssetBridge,
 ): Promise<ImageMaskSubmitPayload> => {
   const mask = command.maskAssetId
-    ? await bridge.resolveAssetFile(command.maskAssetId)
+    ? await resolveAssetFileTagged(command.maskAssetId, bridge)
     : undefined
   const markedImage = command.markedImageAssetId
-    ? await bridge.resolveAssetFile(command.markedImageAssetId)
+    ? await resolveAssetFileTagged(command.markedImageAssetId, bridge)
     : undefined
   return {
     prompt: command.prompt,
