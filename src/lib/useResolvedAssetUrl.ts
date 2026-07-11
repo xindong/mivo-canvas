@@ -17,16 +17,23 @@ export function useResolvedAssetUrl(assetUrl?: string) {
     // - If .then fires first: localRelease=release → cleanup releases on unmount.
     let localRelease: (() => void) | undefined
 
-    void acquireAssetUrl(assetUrl).then(({ url, release }) => {
-      if (!active) {
-        // Unmounted while the lease was in flight. The acquire already counted
-        // our reference, so we must release it exactly once here.
-        release()
-        return
-      }
-      localRelease = release
-      setResolvedAsset({ source: assetUrl, url })
-    })
+    void acquireAssetUrl(assetUrl)
+      .then(({ url, release }) => {
+        if (!active) {
+          // Unmounted while the lease was in flight. The acquire already counted
+          // our reference, so we must release it exactly once here.
+          release()
+          return
+        }
+        localRelease = release
+        setResolvedAsset({ source: assetUrl, url })
+      })
+      .catch(() => {
+        // P2.7: defensive — the fetch + lease layers already swallow network errors
+        // (→ null → ''), so this catch should never fire in practice. But a stray
+        // throw must never surface as an unhandled rejection in the effect.
+        if (active) setResolvedAsset({ source: undefined, url: '' })
+      })
 
     return () => {
       active = false

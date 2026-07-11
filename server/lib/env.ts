@@ -14,6 +14,13 @@ export type FeatureFlags = {
   isPublic: boolean
   localAssetsEnabled: boolean
   eagleProxyEnabled: boolean
+  // P1.4: the content-addressed asset service (POST/GET /api/assets) is DEFAULT
+  // OFF — it only mounts when MIVO_ENABLE_ASSET_SERVICE=1. Unlike local-assets /
+  // eagle (which auto-enable in local mode), the asset store writes user blobs to
+  // disk, so it requires an explicit opt-in even on a local dev bind. The client
+  // gate (?assets=server) controls usage; this flag controls whether the BFF serves
+  // the routes at all. Flag off → /api/assets 404.
+  assetServiceEnabled: boolean
 }
 
 const resolveFlag = (explicit: string | undefined, isPublic: boolean): boolean => {
@@ -28,5 +35,7 @@ export const resolveFeatureFlags = (env: NodeJS.ProcessEnv = process.env): Featu
     isPublic,
     localAssetsEnabled: resolveFlag(env.MIVO_ENABLE_LOCAL_ASSETS, isPublic),
     eagleProxyEnabled: resolveFlag(env.MIVO_ENABLE_EAGLE_PROXY, isPublic),
+    // P1.4: default OFF regardless of bind mode; only '1' enables.
+    assetServiceEnabled: env.MIVO_ENABLE_ASSET_SERVICE === '1',
   }
 }

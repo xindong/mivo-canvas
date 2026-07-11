@@ -38,6 +38,10 @@ secrets/
 
 # ECC session data — not tracked
 data/debug-logs/
+# P1.4: asset store bytes fallback. Default store root is ~/.mivo-canvas/assets
+# (outside the repo); this pins data/assets/ too so a worktree pointed there stays
+# `git status` clean (acceptance: repo worktree clean).
+data/assets/
 history/checkpoints/
 history/daily/
 # .claude/ 整体不入库，仅放行项目级 settings.json（SessionStart hook 仓库地图）
