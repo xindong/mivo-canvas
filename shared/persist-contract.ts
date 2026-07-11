@@ -37,6 +37,20 @@ export type PersistScope = 'document' | 'user'
  * record 类型(信封 `type` 列,api-surface §0)。
  * `chat-collection`:per-canvas 的对话集合 envelope(返修 finding #2);collection 级软删标记,
  * message 不软删(硬删/编辑)。`chat-message` 是单条消息(活记录,不软删)。
+ *
+ * DP-6R(chat per-user 重拆,2026-07-12):
+ * - `chat-collection` **per-canvas 共享**,存在 **canvas owner** 名下(随 canvas 原子创建/软删/恢复),
+ *   只钉 canvas 级"对话集合在"标记;不含 per-actor 状态。
+ * - `chat-message` **per-actor 私有**:envelope.ownerId = **actor**(写入者稳定 identity,DP-4 SSO username
+ *   或 dev/legacy 指纹)。PK = (actor, 'chat-message', messageId)——两 actor 可在同 canvas 拥同 messageId
+ *   (per-actor namespace)。画布 authz 只证 actor 可访问画布;chat CRUD 强制**只读写 actor 自己的 collection**
+ *   (listByCanvas / ensureCreateChild / upsertChild / hardDeleteChild / reorderChildren 对 chat-message 一律
+ *   按 actor 分区)。匿名 share-link 访客(actor=null / 无稳定 identity)chat 读写一律 401 require-login。
+ * - chat-message 写入(PATCH/POST/DELETE/reorder)**不 bump 共享 canvas contentVersion**(chat 是 per-user
+ *   私有,非共享画布内容;client fetchCanvas 只返 nodes/edges/anchors,不含 chat)。
+ * - 旧 owner chat(ownerId=canvasOwner)无需搬迁:owner 的 actor === canvasOwner,故 owner GET 仍见旧数据;
+ *   成员不获复制(Gate2 生产未启用前无成员 chat)。删/恢复画布只触 canvas meta + chat-collection
+ *   (均 under canvasOwner),per-actor chat-message 活记录不动 → 不串 actor collection。
  */
 export type PersistType =
   | 'project'
@@ -55,6 +69,8 @@ export type PersistType =
  * - `orderKey`(fractional rank,返修 #6):node/chat-message 等有序子资源用其稳定排序;
  *   无序资源(project/canvas meta/user-state)orderKey=0。listByCanvas 按 orderKey 升序返回。
  * - `ownerId`(返修 #1 resourceOwnerId):资源归属 owner。鉴权 seam 校验 actor 是否可访问该 owner 的资源。
+ *   **DP-6R**:`chat-message` 的 ownerId = **actor**(写入者本人,per-actor 私有),非 canvas owner;
+ *   其余 type(node/edge/anchor/canvas/chat-collection/project/user-state)ownerId = canvas/project owner。
  */
 export type Envelope<Payload = unknown> = {
   id: string
@@ -166,6 +182,15 @@ export type UnknownResourceBody = {
     | 'unknown-key'
 }
 
+/**
+ * DP-6R:401 require-login(匿名 share-link 访客 chat 读写)。
+ * 匿名访客按链接角色可访问画布,但 chat per-user 需稳定 identity;无 identity 的 chat 读写一律 401,
+ * 引导客户端登录(actor=null 路径不可写 chat collection)。
+ */
+export type RequireLoginBody = {
+  error: 'require-login'
+}
+
 /** 统一错误体(任一 4xx)。 */
 export type ApiErrorBody =
   | { error: 'bad-request'; message?: string }
@@ -179,6 +204,7 @@ export type ApiErrorBody =
   | ReuseConflictBody
   | PayloadRejectedBody
   | UnknownResourceBody
+  | RequireLoginBody
   | { error: 'project-exists'; id: string }
   // F4:canvas id 全局唯一(与 project 同模式)——跨 owner 同 canvas id → 409 canvas-exists。
   | { error: 'canvas-exists'; id: string }
