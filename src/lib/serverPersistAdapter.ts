@@ -28,6 +28,9 @@ import type {
   UserStateEntry,
 } from '../../shared/persist-contract.ts'
 import type { AnchorRecord, EdgeRecord, NodeRecord } from '../kernel/records'
+// G1-a:wire 期需要的 runtime 常量(纯数据,无副作用)。IF_MATCH/IDEMPOTENCY_KEY 用于构造请求头;
+// 不改契约语义,只按 shared 既有常量拼 wire shape(防字符串漂移,与 server/lib/persistHttp 同源)。
+import { IF_MATCH_HEADER, IDEMPOTENCY_KEY_HEADER } from '../../shared/persist-contract.ts'
 
 /**
  * ServerPersistAdapter:client → server sync 接口,按 scope 路由(lead §3 任务 #3)。
@@ -112,4 +115,281 @@ export const unwiredServerPersistAdapter: ServerPersistAdapter = {
   deleteUserState: () => notWired('deleteUserState'),
   uploadAsset: () => notWired('uploadAsset'),
   resolveAsset: () => notWired('resolveAsset'),
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// G1-a 非画布域接线(v6 §4):真 fetch adapter + fetch 底座。默认 mode=local 时
+// getServerPersistAdapter() 返回 unwiredServerPersistAdapter(上面),生产零变化;
+// ?persist=server|shadow 切到下面的 createFetchServerPersistAdapter。
+//
+// 接线范围(G1-a 非画布域,不受合并模型影响):
+//   project     → listProjects / createProject          (POST/GET /api/projects)
+//   canvas-meta → fetchCanvas / listCanvas              (GET /api/canvas[:id],hydrate 读路径)
+//   user-state  → putUserState / getUserState / deleteUserState (PUT/GET/DELETE /api/user-state/:key)
+//   asset       → uploadAsset / resolveAsset            (POST/GET /api/assets,G1.6 seam 为 N2-3 铺底)
+//
+// 不接线(留 seam 注释,见 notWiredG1c / notWiredDP6R):
+//   画布域写 upsertNode/Edge/Anchor + deleteNode/Edge/Anchor + reorderChildren → G1-c 挂 N2-0 决议
+//   chat appendChatMessage → DP-6R(另一 worker)
+// 不改契约语义:wire body 不带 id/revision;revision base 走 If-Match header(shared 常量);
+// 幂等 key 走 Idempotency-Key header。HttpError 供 writeRetryQueue executor 用 classifyHttpStatus 分类。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * HttpError:非 2xx 响应抛出,携带 status + parsed body。writeRetryQueue 的 executor
+ * catch 后用 classifyHttpStatus(status, body, {isDelete}) 分类成 WriteOutcome
+ * (409→conflict / 422→reuse-conflict / 413→too-large / 401→unauthorized /
+ * 5xx·408·429→transient 重试 / 4xx→rejected terminal / 404-on-delete→success)。
+ * 直接(非队列)调用方据 status 自行处理(如 404→null 已在方法内吃掉)。
+ */
+export class HttpError extends Error {
+  readonly status: number
+  readonly body: unknown
+  constructor(status: number, body: unknown, message?: string) {
+    super(message ?? `HTTP ${status}`)
+    this.name = 'HttpError'
+    this.status = status
+    this.body = body
+  }
+}
+
+/** fetch 底座用的 fetch 形态(同全局 fetch 签名;测试可注入 app.request 驱动真实 Hono route)。 */
+export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>
+
+/** getAuthHeaders 可 sync 或 async(生产走 lazy dynamic import authHeaders,避免把 settingsSlice 拉进每个 importer)。 */
+export type GetAuthHeaders = () => Record<string, string> | Promise<Record<string, string>>
+
+export type FetchAdapterOptions = {
+  /** fetch 实现;默认全局 fetch。测试注入 Hono app.request 驱动真实 route。 */
+  fetch?: FetchLike
+  /** BFF base URL;默认 ''(同源 /api/...)。 */
+  baseUrl?: string
+  /** 鉴权头(X-Mivo-Api-Key 等);生产 lazy import authHeaders,测试注入 {x-mivo-api-key: KEY_A}。 */
+  getAuthHeaders: GetAuthHeaders
+}
+
+const defaultFetch: FetchLike = (input, init) => fetch(input, init)
+
+const isJsonResponse = (res: Response): boolean => {
+  const ct = res.headers.get('content-type') || ''
+  return ct.includes('application/json')
+}
+
+/** 解析响应体:JSON 响应 → JSON.parse;否则返文本。空体 → null。永不抛(供 HttpError.body 用)。 */
+const readResponseBody = async (res: Response): Promise<unknown> => {
+  const text = await res.text()
+  if (!text) return null
+  if (isJsonResponse(res)) {
+    try {
+      return JSON.parse(text)
+    } catch {
+      return text
+    }
+  }
+  return text
+}
+
+/**
+ * fetch 底座(G1.1):构造 JSON 请求(auth + Content-Type + If-Match + Idempotency-Key 头)、
+ * 调 fetch、非 2xx 抛 HttpError(status + body)、2xx 返 parsed JSON(204 → undefined)。
+ * 不改契约语义:revision base 经 If-Match(shared IF_MATCH_HEADER),幂等 key 经
+ * IDEMPOTENCY_KEY_HEADER。与 server/lib/persistHttp 同源常量,防字符串漂移。
+ *
+ * 导出供 persistWriteExecutor 复用 —— 队列重试路径走同一 fetch 底座(不重复实现 fetch),
+ * executor 仅在 catch HttpError 后用 classifyHttpStatus 映射成 WriteOutcome。
+ */
+export const requestJson = async <T>(args: {
+  fetch: FetchLike
+  baseUrl: string
+  getAuthHeaders: GetAuthHeaders
+  method: string
+  path: string
+  body?: unknown
+  ifMatch?: Revision
+  idempotencyKey?: string
+  signal?: AbortSignal
+}): Promise<T> => {
+  const headers: Record<string, string> = { ...(await args.getAuthHeaders()) }
+  if (args.body !== undefined) headers['Content-Type'] = 'application/json'
+  if (args.ifMatch !== undefined) headers[IF_MATCH_HEADER] = String(args.ifMatch)
+  if (args.idempotencyKey) headers[IDEMPOTENCY_KEY_HEADER] = args.idempotencyKey
+  const res = await args.fetch(args.baseUrl + args.path, {
+    method: args.method,
+    headers,
+    body: args.body !== undefined ? JSON.stringify(args.body) : undefined,
+    signal: args.signal,
+  })
+  if (res.status === 204) return undefined as T
+  const body = await readResponseBody(res)
+  if (res.status < 200 || res.status >= 300) {
+    throw new HttpError(res.status, body, `ServerPersistAdapter HTTP ${res.status} ${args.method} ${args.path}`)
+  }
+  return body as T
+}
+
+/** 画布域写方法 seam reject(G1-c 挂 N2-0 决议;不在 G1-a 非画布域范围)。 */
+const notWiredG1c = (method: string): Promise<never> =>
+  Promise.reject(
+    new Error(
+      `ServerPersistAdapter.${method} not wired — canvas domain (node/edge/anchor) waits on N2-0 decision (G1-c); G1-a only wires non-canvas domains`,
+    ),
+  )
+
+/** chat seam reject(DP-6R per-user 重拆,另一 worker;不在 G1-a 范围)。 */
+const notWiredDP6R = (method: string): Promise<never> =>
+  Promise.reject(
+    new Error(`ServerPersistAdapter.${method} not wired — chat per-user rearchitecture is DP-6R (another worker); not in G1-a scope`),
+  )
+
+/**
+ * 真 fetch ServerPersistAdapter(G1-a 非画布域接线)。工厂式:测试注入 fetch=getAppRequest +
+ * getAuthHeaders=()=>({x-mivo-api-key:KEY_A}) 驱动 buildPersistApp 的真实 Hono route;生产由
+ * serverPersistAdapterSelector 提供(默认全局 fetch + '' baseUrl + lazy authHeaders)。
+ *
+ * 409/422/428/413 等以 HttpError 抛出(契约 ApiErrorBody 体);404 在 fetchCanvas/getUserState/
+ * resolveAsset 内吃掉返 null,deleteUserState 内吃掉返 void(幂等删)。401 等鉴权态由 executor
+ * 分类,这里原样抛 HttpError(401)。
+ */
+export const createFetchServerPersistAdapter = (opts: FetchAdapterOptions): ServerPersistAdapter => {
+  const doFetch = opts.fetch ?? defaultFetch
+  const baseUrl = opts.baseUrl ?? ''
+  const getAuthHeaders = opts.getAuthHeaders
+
+  return {
+    // ── project(document scope)──
+    listProjects: () =>
+      requestJson<ListProjectsResponse>({
+        fetch: doFetch,
+        baseUrl,
+        getAuthHeaders,
+        method: 'GET',
+        path: '/api/projects',
+      }),
+    createProject: (name, id) =>
+      requestJson<Project>({
+        fetch: doFetch,
+        baseUrl,
+        getAuthHeaders,
+        method: 'POST',
+        path: '/api/projects',
+        body: { name, ...(id ? { id } : {}) },
+      }),
+
+    // ── canvas-meta(hydrate 读路径;写路径 node/edge/anchor 走 G1-c seam)──
+    fetchCanvas: async (canvasId) => {
+      try {
+        return await requestJson<GetCanvasResponse>({
+          fetch: doFetch,
+          baseUrl,
+          getAuthHeaders,
+          method: 'GET',
+          path: `/api/canvas/${encodeURIComponent(canvasId)}`,
+        })
+      } catch (error) {
+        if (error instanceof HttpError && error.status === 404) return null
+        throw error
+      }
+    },
+    listCanvas: (projectId) => {
+      const qs = projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''
+      return requestJson<ListCanvasResponse>({
+        fetch: doFetch,
+        baseUrl,
+        getAuthHeaders,
+        method: 'GET',
+        path: `/api/canvas${qs}`,
+      })
+    },
+
+    // ── canvas-domain 写(G1-c 挂 N2-0;seam reject,不接)──
+    upsertNode: () => notWiredG1c('upsertNode'),
+    upsertEdge: () => notWiredG1c('upsertEdge'),
+    upsertAnchor: () => notWiredG1c('upsertAnchor'),
+    deleteNode: () => notWiredG1c('deleteNode'),
+    deleteEdge: () => notWiredG1c('deleteEdge'),
+    deleteAnchor: () => notWiredG1c('deleteAnchor'),
+    reorderChildren: () => notWiredG1c('reorderChildren'),
+
+    // ── chat(DP-6R 另一 worker;seam reject,不接)──
+    appendChatMessage: () => notWiredDP6R('appendChatMessage'),
+
+    // ── user-state(user scope)──
+    putUserState: (key, value, baseRevision) =>
+      requestJson<UpsertResponse>({
+        fetch: doFetch,
+        baseUrl,
+        getAuthHeaders,
+        method: 'PUT',
+        path: `/api/user-state/${encodeURIComponent(key)}`,
+        body: { value },
+        ...(baseRevision !== undefined ? { ifMatch: baseRevision } : {}),
+      }),
+    getUserState: async (key) => {
+      try {
+        return await requestJson<UserStateEntry>({
+          fetch: doFetch,
+          baseUrl,
+          getAuthHeaders,
+          method: 'GET',
+          path: `/api/user-state/${encodeURIComponent(key)}`,
+        })
+      } catch (error) {
+        if (error instanceof HttpError && error.status === 404) return null
+        throw error
+      }
+    },
+    deleteUserState: async (key) => {
+      try {
+        await requestJson<void>({
+          fetch: doFetch,
+          baseUrl,
+          getAuthHeaders,
+          method: 'DELETE',
+          path: `/api/user-state/${encodeURIComponent(key)}`,
+        })
+      } catch (error) {
+        // 幂等删:404(已删 / 不存在)视为成功,不抛(对齐 server DELETE 已删→204 语义;
+        // 跨 owner/不存在 server 统一 404 unknown-key,此处吃掉免误报)。
+        if (error instanceof HttpError && error.status === 404) return
+        throw error
+      }
+    },
+
+    // ── asset(G1.6 seam,T1.5 #195 真实 wire shape;为 N2-3 协作生图铺底)──
+    uploadAsset: async (bytes, meta) => {
+      // multipart/form-data 'image' file(对齐 server/routes/assets.ts POST)。
+      // 不设 Content-Type —— fetch/FormData 自带 boundary;手设会缺 boundary 致解析失败。
+      // Uint8Array → Blob:TS lib 5.7+ 的 Uint8Array<ArrayBufferLike> 与 BlobPart 的 ArrayBuffer
+      // 收窄有类型摩擦(runtimes 均接受 Uint8Array 作 BlobPart),此处 cast 跨过类型层。
+      const blob = new Blob([bytes as unknown as BlobPart], { type: meta.mimeType })
+      const form = new FormData()
+      form.append('image', blob, meta.originalName)
+      const headers = { ...(await getAuthHeaders()) }
+      const res = await doFetch(`${baseUrl}/api/assets`, {
+        method: 'POST',
+        headers,
+        body: form,
+      })
+      const body = await readResponseBody(res)
+      if (res.status < 200 || res.status >= 300) {
+        throw new HttpError(res.status, body, `ServerPersistAdapter HTTP ${res.status} POST /api/assets`)
+      }
+      return body as CreateAssetResponse
+    },
+    resolveAsset: async (assetId) => {
+      const res = await doFetch(`${baseUrl}/api/assets/${encodeURIComponent(assetId)}`, {
+        method: 'GET',
+        headers: { ...(await getAuthHeaders()) },
+      })
+      if (res.status === 404) return null
+      if (res.status < 200 || res.status >= 300) {
+        throw new HttpError(res.status, await readResponseBody(res), `ServerPersistAdapter HTTP ${res.status} GET /api/assets/:id`)
+      }
+      const ab = await res.arrayBuffer()
+      return {
+        bytes: new Uint8Array(ab),
+        mimeType: res.headers.get('content-type') || 'application/octet-stream',
+      }
+    },
+  }
 }
