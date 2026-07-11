@@ -31,14 +31,27 @@ import { tasksRoute } from './routes/tasks'
 import { createProjectsRoutes } from './routes/projects'
 import { createCanvasRoutes } from './routes/canvas'
 import { createUserStateRoutes } from './routes/userState'
-import { createPersistBackend } from './persist/backend'
+import { createPersistBackend, type PersistBackend } from './persist/backend'
+import { resolvePersistBackendConfig } from './persist/pgConfig'
 
 const featureFlags = resolveFeatureFlags()
 
-// T1.3: shared data-persistence backend. In-memory now (contract tests pass against it);
-// PG(T1.1 批复后)swap here — createPersistBackend → PgPersistBackend, routes unchanged (§6).
+// T1.3: shared data-persistence backend. 默认 memory(生产零变化);MIVO_PERSIST_BACKEND=pg →
+// PgPersistBackend(灰度启用,Kysely+PG16,信封列+jsonb;swap 不改路由/契约,见 docs/decisions/pg-backend-schema.md)。
+// PG 启用但缺 MIVO_PG_PASSWORD → resolvePersistBackendConfig 抛错(fail visibly,不静默降级)。
+// **动态 import PgPersistBackend**(Greptile P1:默认 memory 路径不加载 kysely——kysely engines node>=22,
+// 动态加载使 memory 路径不依赖 kysely,部署 node<22 不影响默认路径)。
 // Exported so tests driving the real `app` can __reset() between cases (同 __resetTaskRegistry)。
-export const sharedPersistBackend = createPersistBackend()
+const persistBackendConfig = resolvePersistBackendConfig()
+let sharedPersistBackend: PersistBackend
+if (persistBackendConfig.kind === 'pg' && persistBackendConfig.pg) {
+  // 仅 PG 启用时动态加载(避免 memory 路径加载 kysely)。
+  const { PgPersistBackend } = await import('./persist/pgBackend')
+  sharedPersistBackend = new PgPersistBackend(persistBackendConfig.pg)
+} else {
+  sharedPersistBackend = createPersistBackend()
+}
+export { sharedPersistBackend }
 
 export const app = new Hono<AppEnv>()
 

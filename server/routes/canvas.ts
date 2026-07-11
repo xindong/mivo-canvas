@@ -289,6 +289,12 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'parent-not-live' })
       return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
     }
+    // F3 防御:upsert missing 跨 owner 同 id → 409 canvas-exists(route 层 authz+预检已阻,backend 防御性)。
+    if (result.kind === 'exists-other-owner') {
+      const err = { error: 'canvas-exists' as const, id }
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 409, latencyMs: Date.now() - t0, note: 'canvas-exists' })
+      return c.json(err, 409)
+    }
     if (result.kind === 'precondition-required') {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 428, latencyMs: Date.now() - t0, note: 'precondition-required' })
       return c.json(preconditionRequired(id), 428)
