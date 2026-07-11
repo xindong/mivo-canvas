@@ -455,8 +455,11 @@ export type SceneDefinition = {
 }
 
 // ── F6 返修五:runtime enum 值数组(单一来源,shared/persist-contract.ts enum predicate 用)──
-// 用 `as const satisfies readonly T[]` 让编译期保证数组元素穷尽 type 且不漂移;改枚举必须同步此处,
-// 否则 satisfies 报错。服务端 tsconfig ES2023 可编译(纯数据数组,无 DOM/Node API;type import 已 erase)。
+// `as const satisfies readonly T[]` 只保证**子集**:数组每个元素都是合法 T(不漂移、不手抄错),**不**保证
+// **穷尽**(数组覆盖 union 全部成员)。故下方 _EXHAUSTIVE 反向断言用 `Exclude<T, typeof VALUES[number]>`
+// 补全 union ⊆ array 校验:给 union T 加成员却不进 VALUES 数组 → Exclude 非 never → 条件类型 = never →
+// `= true` 赋值编译失败(镜像 NODE_PAYLOAD_EXHAUSTIVE 模式)。服务端 tsconfig ES2023 可编译(纯数据/类型,
+// 无 DOM/Node API;type import 已 erase)。
 export const MARKUP_KIND_VALUES = ['arrow', 'line', 'rect', 'ellipse', 'brush', 'note', 'stamp'] as const satisfies readonly MarkupKind[]
 export const MARKUP_BRUSH_KIND_VALUES = ['marker', 'highlighter'] as const satisfies readonly MarkupBrushKind[]
 export const CANVAS_STAMP_KIND_VALUES = [
@@ -466,3 +469,29 @@ export const SECTION_LOCK_MODE_VALUES = ['all', 'background'] as const satisfies
 export const MARKDOWN_DISPLAY_MODE_VALUES = ['full', 'preview'] as const satisfies readonly MarkdownDisplayMode[]
 export const MARKUP_STROKE_STYLE_VALUES = ['solid', 'dashed'] as const satisfies readonly MarkupStrokeStyle[]
 export const EXPERIMENTAL_ANCHOR_TYPE_VALUES = ['point', 'box'] as const satisfies readonly ExperimentalAnchorType[]
+
+// F6/P2 返修六:enum VALUES 反向穷尽断言(union ⊆ array)。satisfies readonly T[] 只保证 array ⊆ union
+// (元素合法),**不**保证 union 全覆盖;加 union 成员不进 VALUES 数组时,Exclude<T, VALUES[number]> 非 never
+// → 条件类型 = never → `= true` 编译失败(钉死"改 union 必同步改 VALUES"。"各枚举同型"全列于此)。
+export const MARKUP_KIND_EXHAUSTIVE: Exclude<MarkupKind, (typeof MARKUP_KIND_VALUES)[number]> extends never ? true : never = true
+export const MARKUP_BRUSH_KIND_EXHAUSTIVE: Exclude<MarkupBrushKind, (typeof MARKUP_BRUSH_KIND_VALUES)[number]> extends never
+  ? true
+  : never = true
+export const CANVAS_STAMP_KIND_EXHAUSTIVE: Exclude<CanvasStampKind, (typeof CANVAS_STAMP_KIND_VALUES)[number]> extends never
+  ? true
+  : never = true
+export const SECTION_LOCK_MODE_EXHAUSTIVE: Exclude<SectionLockMode, (typeof SECTION_LOCK_MODE_VALUES)[number]> extends never
+  ? true
+  : never = true
+export const MARKDOWN_DISPLAY_MODE_EXHAUSTIVE: Exclude<MarkdownDisplayMode, (typeof MARKDOWN_DISPLAY_MODE_VALUES)[number]> extends
+  never
+  ? true
+  : never = true
+export const MARKUP_STROKE_STYLE_EXHAUSTIVE: Exclude<MarkupStrokeStyle, (typeof MARKUP_STROKE_STYLE_VALUES)[number]> extends
+  never
+  ? true
+  : never = true
+export const EXPERIMENTAL_ANCHOR_TYPE_EXHAUSTIVE: Exclude<ExperimentalAnchorType, (typeof EXPERIMENTAL_ANCHOR_TYPE_VALUES)[number]> extends
+  never
+  ? true
+  : never = true

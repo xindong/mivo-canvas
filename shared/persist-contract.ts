@@ -325,36 +325,92 @@ const CREDENTIAL_VALUE_PREFIX = /^(mivo_|sk-)/
 
 /**
  * 规范化字符串:URL-decode-to-fixed-point(循环至不再变化)+ lower-case。N6/F3 credential 扫描用。
- * F3 返修五(真不动点):不再用固定层数上限——循环 decode 至不再变化(fixed point),防 DoS 用**累计解码
- * 输出长度阈值**(MAX_DECODE_TOTAL)而非固定层数。单次 decode 不会让字符串变长(%XX 3 字符→1 字符,其余 1:1),
- * 故正常输入单调缩短至无 `%` 即收敛;累计输出长度阈值兜底恶意超长/构造输入(超阈即停,用最后一次成功值)。
- * F3 多层编码:单次 decode 不够——`%2561piKey`→`%61piKey`→`apiKey`(2 层);`%252561piKey`→3 层;
- * `%252525252561piKey`→6 层→`apiKey`;`%256divo_xxx`→`%6divo_xxx`→`mivo_xxx`;`%2553k-test`→`%53k-test`→`Sk-test`。
- * 异常即停(尾部 malformed `%`,用最后一次成功值,含原始值)。**保留 raw 扫描**:无 `%` 的字符串 fixed-point
- * 立即返回(raw 形态直接被后续 regex 命中,如 `apiKey`/`mivo_xxx`/`sk-test`),decode 只会**增加**匹配
- * (把编码变体还原成 credential),不会丢 raw 命中。6 层 `%252525252561piKey` 命中(旧 5 次上限阻断第 6 次 → 漏)。
+ *
+ * F3 返修六(fail-closed):六审两处 fail-open → fail-closed——
+ *  1. 累计解码输出长度超 MAX_DECODE_TOTAL → 不返回部分结果。部分结果可能恰停在 credential 还原前一步:
+ *     如 `%256divo_secret`+超长填充:pass1 → `%6divo_secret<pad>` 仍无 `mivo_` 前缀,旧实现返回该部分值
+ *     → `isCredentialValue` 假阴性 → 漏报 200。改:超阈即视作命中(suspicious=true),调用方 route 400。
+ *  2. malformed '%'(decodeURIComponent 抛 URIError,如尾部孤立 `%`):旧实现 catch 返 cur.toLowerCase()
+ *     (raw/部分值),`%6divo_secret%` 停在 `%6divo_secret%`(无 `mivo_` 前缀)→ 漏报。改分段安全解码——
+ *     逐 `%XX` 解析,合法 `%XX`(2 hex)照解,坏序列(孤立 `%`、`%` 后非 2 hex)原样保留 `%`,其余 1:1。
+ *     故 `%6divo_secret%` → `mivo_secret%`(命中 `mivo_` 前缀);`%61piKey%` → `apiKey%`(命中敏感名 `apiKey`)。
+ *
+ * 取舍(两法选一,本实现选分段安全解码):分段解码坏 `%` 原样保留 + 合法 `%XX` 照解 → 能还原真实 credential
+ * (合法 `%6d`→`m` 段仍被解)且不误伤干净的孤立 `%`(如 `"50% off"` 中的 `%` 保留 → 非 credential → 不拒)。
+ * 反例整体 fail-closed(遇 malformed `%` 即视作可疑拒)更激进,但任何含孤立 `%` 的良性值(`"50%"`)都会被拒
+ * → 误杀。分段解码只在超预算(suspicious)或真 credential 命中时拒,语义更精确,故选之。
+ *
+ * F3 多层编码:单次 decode 不够——`%2561piKey`→`%61piKey`→`apiKey`(2 层);`%252525252561piKey`→6 层→`apiKey`。
+ * fixed-point 循环至不再变化收敛;decode 单调缩短(`%XX` 3→1,其余 1:1,孤立 `%` 1:1 保留),故正常输入
+ * 收敛至无合法 `%XX` 即停;累计输出长度阈值(MAX_DECODE_TOTAL)兜底恶意超长/构造输入(超阈 suspicious)。
  */
 const MAX_DECODE_TOTAL = 1_048_576 // 累计解码输出长度阈值(DoS 上限);decode 单调缩短,正常多层远不达
-const normalizeForScan = (s: string): string => {
+
+/** NormalizedScan:suspicious=true 表示累计解码超 MAX_DECODE_TOTAL(fail-closed,调用方视作命中)。 */
+type NormalizedScan = { suspicious: boolean; value: string }
+
+// 0-9 a-f A-F → 0-15;非 hex → -1
+const hexValue = (cc: number): number => {
+  if (cc >= 0x30 && cc <= 0x39) return cc - 0x30 // '0'-'9'
+  if (cc >= 0x41 && cc <= 0x46) return cc - 0x41 + 10 // 'A'-'F'
+  if (cc >= 0x61 && cc <= 0x66) return cc - 0x61 + 10 // 'a'-'f'
+  return -1
+}
+
+/**
+ * 分段安全 URL-decode:**永不抛**。逐 `%XX` 解析,合法 `%XX`(2 hex)→ 对应字节,坏序列(孤立 `%`、
+ * `%` 后非 2 hex)→ 原样保留 `%`,其余字符 1:1。decodeURIComponent 遇 malformed `%` 抛 URIError,本函数兜底。
+ * credential 扫描只关心 ASCII 前缀(`mivo_`/`sk-`/`apiKey`/`secret`/...),逐字节解码不影响 ASCII 模式匹配;
+ * 合法输入(含多字节 UTF-8)走 decodeURIComponent(safeDecodeOnce 内,精确,与既有契约一致)。
+ */
+const decodeSegmented = (s: string): string => {
+  let out = ''
+  for (let i = 0; i < s.length; ) {
+    if (s.charCodeAt(i) === 0x25 /* '%' */ && i + 2 < s.length) {
+      const h1 = hexValue(s.charCodeAt(i + 1))
+      const h2 = hexValue(s.charCodeAt(i + 2))
+      if (h1 >= 0 && h2 >= 0) {
+        out += String.fromCharCode(h1 * 16 + h2)
+        i += 3
+        continue
+      }
+    }
+    out += s[i]
+    i += 1
+  }
+  return out
+}
+
+/**
+ * 单次安全 decode:合法输入走 decodeURIComponent(精确,含多字节 UTF-8,与既有契约一致);
+ * malformed `%` 抛 URIError 时兜底分段解码(不抛,坏 `%` 保留 + 合法 `%XX` 照解)。
+ */
+const safeDecodeOnce = (s: string): string => {
+  try {
+    return decodeURIComponent(s)
+  } catch {
+    return decodeSegmented(s)
+  }
+}
+
+const normalizeForScan = (s: string): NormalizedScan => {
   let cur = s
   let total = s.length
   for (;;) {
-    let next: string
-    try {
-      next = decodeURIComponent(cur)
-    } catch {
-      return cur.toLowerCase() // 异常即停:用最后一次成功值(或原始值,含 raw credential)
-    }
-    if (next === cur) return cur.toLowerCase() // fixed point(无 % 或已收敛)
+    const next = safeDecodeOnce(cur)
+    if (next === cur) return { suspicious: false, value: cur.toLowerCase() } // fixed point(无合法 %XX 或已收敛)
     total += next.length
-    if (total > MAX_DECODE_TOTAL) return next.toLowerCase() // 累计输出长度阈值防 DoS(超长输入不卡死)
+    if (total > MAX_DECODE_TOTAL) return { suspicious: true, value: '' } // fail-closed:超预算视作命中(不返回部分结果漏报)
     cur = next
   }
 }
 
-/** 凭据格式值命中(规范后 mivo_/sk- 前缀)。N6:大小写/URL 编码变体均命中。 */
-const isCredentialValue = (v: unknown): boolean =>
-  typeof v === 'string' && CREDENTIAL_VALUE_PREFIX.test(normalizeForScan(v))
+/** 凭据格式值命中(规范后 mivo_/sk- 前缀)或 fail-closed suspicious(超预算)。N6:大小写/URL 编码变体均命中。 */
+const isCredentialValue = (v: unknown): boolean => {
+  if (typeof v !== 'string') return false
+  const n = normalizeForScan(v)
+  return n.suspicious || CREDENTIAL_VALUE_PREFIX.test(n.value)
+}
 
 /**
  * 递归扫描 value,返回首个敏感路径(无则 null)。
@@ -379,8 +435,10 @@ export const scanForSensitiveFields = (value: unknown, prefix = ''): string | nu
     return null
   }
   for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-    // F3:object key 先 best-effort decode+lower 再匹配(防 %61piKey → apiKey 编码绕过)。
-    if (SENSITIVE_FIELD_PATTERN.test(normalizeForScan(k))) return prefix ? `${prefix}.${k}` : k
+    // F3:object key 先 best-effort decode+lower 再匹配(防 %61piKey → apiKey 编码绕过);
+    // fail-closed:suspicious(超预算)key 视作命中(防深度编码藏敏感名,超预算即拒,不返回部分结果漏报)。
+    const nk = normalizeForScan(k)
+    if (nk.suspicious || SENSITIVE_FIELD_PATTERN.test(nk.value)) return prefix ? `${prefix}.${k}` : k
     const hit = scanForSensitiveFields(v, prefix ? `${prefix}.${k}` : k)
     if (hit) return hit
   }

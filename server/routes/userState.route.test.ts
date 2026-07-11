@@ -207,6 +207,24 @@ describe('/api/user-state routes (T1.3 返修二 N1-N10)', () => {
     expect((await put('canvas:c1:camera', { x: 1, y: 2 })).status).toBe(200)
   })
 
+  it('P1-2/F3 返修六:fail-closed 超预算 + malformed % 不漏报;干净 600KB 不误杀', async () => {
+    // 1) 超长编码 + 真凭据 + 超预算 → fail-closed 400(旧 fail-open 返部分值漏报 200)
+    //    %256divo_secret + 600KB 填充:pass1 → %6divo_secret<pad>(无 mivo_ 前缀),累计输出超 MAX_DECODE_TOTAL
+    //    → suspicious → forbidden-value(不返回部分结果)
+    const f1 = await put('canvas:c1:camera', { data: '%256divo_secret' + 'x'.repeat(600_000) })
+    expect(f1.status).toBe(400)
+    expect((f1.body as { error: string }).error).toBe('forbidden-value')
+    // 2) malformed %(尾部孤立 %)→ 分段安全解码还原真凭据 → 400(旧 catch 返 raw 漏报 200)
+    expect((await put('canvas:c1:camera', { data: '%6divo_secret%' })).status).toBe(400) // → mivo_secret% 命中 mivo_
+    expect((await put('canvas:c1:camera', { '%61piKey%': 'x' })).status).toBe(400) // → apiKey% 命中敏感名
+    // 3) 坏尾 user-state key 段 → forbidden-key(canvas:%6divo_secret%:selection;段 → mivo_secret%)
+    const f2 = await put('canvas:%6divo_secret%:selection', ['n1'])
+    expect(f2.status).toBe(400)
+    expect((f2.body as { error: string }).error).toBe('forbidden-key')
+    // 4) 干净超长值(无敏感串 600KB)不误杀 → 200
+    expect((await put('canvas:c1:camera', { data: 'x'.repeat(600_000) })).status).toBe(200)
+  })
+
   it('F7: canvas:<id>:selection 只收 string[](与 SessionStore 对齐)', async () => {
     // string[] → 200
     expect((await put('canvas:c1:selection', ['n1', 'n2'])).status).toBe(200)
