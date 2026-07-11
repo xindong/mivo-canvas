@@ -677,33 +677,66 @@ describe('assetStore — purge order (P1-B tombstone)', () => {
 // A first-uploads the SAME bytes concurrently → B must still be registered (not 413'd)
 // and B GET → 200.
 describe('assetStore — quota + hash-locked admission (P2-C)', () => {
-  it('B at quota + A first-uploads same bytes (race) → B registered + B GET 200', async () => {
+  it('B truly at quota + A first creates the record (admission barrier) → B dedup + registered + GET 200', async () => {
     const be = createMemoryAssetBackend()
-    const store = createAssetStore(be)
     const bytes = pngBytes('p2c-shared')
     const hash = computeContentHash(bytes)
-    // Fill B's quota exactly with a DISTINCT asset so B is at quota.
+    // B's filler fills B's quota EXACTLY: quota = filler.length → B has 0 bytes of room;
+    // any NEW upload (bytes.length > 0) would exceed → 413. A has its OWN independent,
+    // ample quota (room for one NEW `bytes` upload).
+    // The OLD version used QUOTA = filler.length + bytes.length, which left B exactly
+    // bytes.length of room — so B-NEW fit too and the assertion passed WITHOUT ever
+    // exercising dedup (false coverage: the 4th-round review flagged this as a sham
+    // barrier — both race outcomes succeeded for different reasons).
     const filler = pngBytes('p2c-filler') // distinct hash
-    const QUOTA = filler.length + bytes.length // filler fills it; B's share-out = filler
-    await store.uploadWithQuota(filler, 'image/png', 'f.png', OWNER_B, QUOTA, 1000)
-    expect(await store.ownerBytes(OWNER_B)).toBe(filler.length) // B at quota (room for 0 new)
+    const B_QUOTA = filler.length
+    const A_QUOTA = 4 * bytes.length
 
-    // Concurrent: A (owner 0 used) first-uploads `bytes`; B (at quota) uploads same
-    // `bytes`. Whichever wins the hash lock writes the record; the other sees it
-    // exists → dedup → registered (0 new bytes, never trips quota).
+    // Inject a barrier into admitUpload: B (at quota, uploading the shared `bytes`) WAITS
+    // until A first creates the record, so B's admission provably hits the DEDUP path
+    // (existing record → register, 0 new bytes) rather than a B-NEW that would 413.
+    // Only the shared-`bytes` hash is gated; the distinct-hash filler upload is not.
+    let releaseBBarrier!: () => void
+    const bBarrier = new Promise<void>((resolve) => {
+      releaseBBarrier = resolve
+    })
+    const wrappedBe: AssetStoreBackend = {
+      ...be,
+      async admitUpload(b, init, ownerFp, quotaBytes, used, now) {
+        const shared = init.contentHash === hash
+        if (ownerFp === OWNER_B && shared) {
+          await bBarrier // B waits for A to create the `bytes` record first
+        }
+        const result = await be.admitUpload(b, init, ownerFp, quotaBytes, used, now)
+        if (ownerFp === OWNER_A && shared) {
+          releaseBBarrier() // A's admission settled → release B (deadlock-proof even if A failed)
+        }
+        return result
+      },
+    }
+    const store = createAssetStore(wrappedBe)
+
+    // Fill B to EXACTLY its quota (room for 0 new bytes). Not gated (filler hash ≠ bytes hash).
+    await store.uploadWithQuota(filler, 'image/png', 'f.png', OWNER_B, B_QUOTA, 1000)
+    expect(await store.ownerBytes(OWNER_B)).toBe(filler.length) // B truly at quota
+
+    // Race: A (room) + B (at quota, barrier'd) upload the SAME `bytes`. The barrier
+    // forces A-first-record, so B provably dedups (not a B-NEW that happens to fit).
     const [aOut, bOut] = await Promise.all([
-      store.uploadWithQuota(bytes, 'image/png', 'a.png', OWNER_A, QUOTA, 2000),
-      store.uploadWithQuota(bytes, 'image/png', 'b.png', OWNER_B, QUOTA, 3000),
+      store.uploadWithQuota(bytes, 'image/png', 'a.png', OWNER_A, A_QUOTA, 2000),
+      store.uploadWithQuota(bytes, 'image/png', 'b.png', OWNER_B, B_QUOTA, 3000),
     ])
     expect(aOut.kind).toBe('ok')
-    expect(bOut.kind).toBe('ok') // NOT quota-exceeded — dedup registered B
+    expect(bOut.kind).toBe('ok') // NOT quota-exceeded — B dedup'd
     if (bOut.kind !== 'ok') return
     expect(bOut.result.assetId).toBe(hash)
-    expect(bOut.result.deduped).toBe(true) // B is the dedup uploader
-    // B is registered as a dedup uploader → readForOwner(B) entitled → 200.
+    expect(bOut.result.deduped).toBe(true) // B is the dedup uploader (record already existed)
+    // B registered as a dedup uploader → readForOwner(B) entitled → GET 200.
     expect(await be.isUploader(hash, OWNER_B)).toBe(true)
     expect((await store.readForOwner(hash, OWNER_B))?.bytes.equals(bytes)).toBe(true)
-    // ownerFp stays the first uploader (A here, since A had room) — quota attribution intact.
+    // Dedup charged 0 new bytes → B's ownerBytes is STILL at quota (proves no NEW write).
+    expect(await store.ownerBytes(OWNER_B)).toBe(filler.length)
+    // A is the first uploader (quota attribution) — ownerFp unchanged by B's dedup.
     expect((await store.getRecord(hash))?.ownerFp).toBe(OWNER_A)
   })
 

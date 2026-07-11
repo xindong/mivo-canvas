@@ -59,6 +59,7 @@ import {
   type AssetStoreBackend,
 } from '../lib/assetStore'
 import { canonicalizeImage } from '../lib/canonicalize'
+import { acquireDecodePermit, DecodeBusyError, type DecodePermit } from '../lib/decodeGate'
 import type { App, AppEnv } from '../lib/types'
 
 // sha256 hex (64). Validated on GET so a non-hash :id never reaches the store /
@@ -106,6 +107,29 @@ export const createAssetRoutes = (options: AssetRouteOptions = {}): App => {
       return badKey
     }
     const ownerFp = fingerprintOfPlatformKey(resolvePlatformCtx(c).platformKey)
+
+    // P1 decode concurrency gate: acquire a global sharp-decode permit BEFORE reading
+    // the body. A sharp decode expands a small compressed upload to a huge uncompressed
+    // buffer; N concurrent decodes can exhaust process RSS. The permit bounds the whole
+    // body-read + decode pipeline (released in finally). A bounded wait queue sheds
+    // overflow with 429 (Retry-After) so a slow decode can't pile up an unbounded
+    // queue of bodies each holding memory. Auth runs first so an unauthenticated flood
+    // never consumes a permit.
+    let permit: DecodePermit
+    try {
+      permit = await acquireDecodePermit()
+    } catch (error) {
+      if (error instanceof DecodeBusyError) {
+        log(429, 'decode-busy')
+        c.header('Retry-After', '1')
+        return c.json(
+          { error: 'asset decode concurrency limit reached; retry later', code: 'decode_busy' },
+          429,
+        )
+      }
+      log(500, 'decode-gate-error')
+      return c.json({ error: 'unable to acquire decode permit' }, 500)
+    }
 
     try {
       let bytes: Buffer
@@ -160,10 +184,18 @@ export const createAssetRoutes = (options: AssetRouteOptions = {}): App => {
       }
       if (canon.kind === 'too-large') {
         log(413, 'image-too-large')
-        return c.json(
-          { error: 'image dimensions or pixel count exceeds the limit', code: 'image_too_large', width: canon.width, height: canon.height },
-          413,
-        )
+        // width/height are present when our own maxDimension/maxPixels guard trips
+        // (we read metadata first); absent when sharp's pixel-limit guard throws
+        // before metadata returns (a pixel bomb above sharp's internal limit).
+        const body: Record<string, unknown> = {
+          error: 'image dimensions or pixel count exceeds the limit',
+          code: 'image_too_large',
+        }
+        if (canon.width !== undefined && canon.height !== undefined) {
+          body.width = canon.width
+          body.height = canon.height
+        }
+        return c.json(body, 413)
       }
 
       // P2-C: atomic quota-reserved upload of the CANONICAL bytes — per-owner lock
@@ -200,6 +232,8 @@ export const createAssetRoutes = (options: AssetRouteOptions = {}): App => {
       const status = error instanceof RequestBodyTooLargeError ? 413 : 500
       log(status, error instanceof RequestBodyTooLargeError ? 'too-large' : 'error')
       return c.json({ error: error instanceof Error ? error.message : 'Unable to store asset' }, status)
+    } finally {
+      permit.release()
     }
   })
 

@@ -28,6 +28,34 @@ const realAnimatedGif = async (): Promise<Buffer> => {
     .toBuffer()
 }
 
+// A 2-frame animated GIF declaring 12000×12000 PER FRAME (288M pixels stacked) — above
+// BOTH the default maxPixels guard (144M) and sharp's internal ~268M-pixel limit. Built
+// by overwriting the LSD + image-descriptor width/height bytes of a real tiny 2-frame GIF
+// (the GIF structure stays valid; only the declared dimensions are inflated). sharp
+// refuses with "Input image exceeds pixel limit" — the P2 pixel-bomb fixture.
+const bigAnimatedGif288m = async (): Promise<Buffer> => {
+  const raw = Buffer.from([255, 0, 0, 0, 255, 0])
+  const gif = await sharp(raw, { raw: { width: 1, height: 2, channels: 3, pageHeight: 1 } })
+    .gif({ loop: 0, delay: [100, 100] })
+    .toBuffer()
+  const lo = 12000 & 0xff // 0xe0
+  const hi = (12000 >> 8) & 0xff // 0x2e
+  gif[6] = lo; gif[7] = hi // LSD width (LE)
+  gif[8] = lo; gif[9] = hi // LSD height (LE)
+  // overwrite each image descriptor's width/height (bytes 4..7 after the 0x2C tag)
+  let i = 10
+  while (i < gif.length - 9) {
+    if (gif[i] === 0x2c) {
+      gif[i + 4] = lo; gif[i + 5] = hi
+      gif[i + 6] = lo; gif[i + 7] = hi
+      i += 10
+    } else {
+      i++
+    }
+  }
+  return gif
+}
+
 describe('canonicalizeImage — real images accepted (P1-A allowlist)', () => {
   it('real PNG → ok, image/png, canonical is a valid PNG', async () => {
     const bytes = await realPng()
@@ -211,5 +239,34 @@ describe('canonicalizeImage — canonical determinism + dedup-by-content (P1-A)'
     const outB = await canonicalizeImage(await realPng({ r: 0, g: 0, b: 255 }), LIMITS)
     if (outA.kind !== 'ok' || outB.kind !== 'ok') throw new Error('expected ok')
     expect(outA.canonicalBytes.equals(outB.canonicalBytes)).toBe(false)
+  })
+})
+
+describe('canonicalizeImage — sharp pixel-limit throw → too-large (413, not 415)', () => {
+  // Default config thresholds (server/lib/config.ts): maxDimension 12000, maxPixels 144M.
+  // A 2-frame 12000×12000 GIF declares 288M pixels — above maxPixels (144M) AND above
+  // sharp's internal ~268M-pixel limit. sharp's metadata() throws "Input image exceeds
+  // pixel limit" BEFORE our maxPixels check can read the dims; without the pixel-limit
+  // mapping this fell to decode-failed → 415. The fix maps it to too-large → 413.
+  it('2-frame 12000×12000 GIF (288M px, above sharp limit) → too-large (413)', async () => {
+    const big = await bigAnimatedGif288m()
+    // sanity: sharp itself refuses the declared pixel count before returning metadata
+    await expect(sharp(big, { animated: true }).metadata()).rejects.toThrow(/exceeds pixel limit/i)
+    // LIMITS matches the config defaults (maxDimension 12000, maxPixels 144M) — the
+    // fixture is above BOTH, so this is the "above the default threshold" case.
+    const out = await canonicalizeImage(big, LIMITS)
+    expect(out.kind).toBe('too-large') // NOT unsupported/decode-failed (415)
+    if (out.kind !== 'too-large') return
+    expect(out.reason).toBe('pixels')
+    // sharp threw before returning dims → width/height are absent (413 omits them)
+    expect(out.width).toBeUndefined()
+    expect(out.height).toBeUndefined()
+  })
+
+  it('a real small animated GIF still canonicalizes ok (pixel-limit fix did not regress happy path)', async () => {
+    const out = await canonicalizeImage(await realAnimatedGif(), LIMITS)
+    expect(out.kind).toBe('ok')
+    if (out.kind !== 'ok') return
+    expect(out.pages).toBe(2)
   })
 })

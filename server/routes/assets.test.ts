@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { createHash } from 'node:crypto'
 import { Buffer } from 'node:buffer'
 import { mkdtemp, rm } from 'node:fs/promises'
@@ -9,6 +9,7 @@ import { Hono } from 'hono'
 import { createAssetRoutes } from './assets'
 import { fingerprintOfPlatformKey } from '../lib/keys'
 import { createFsAssetBackend, createMemoryAssetBackend, type AssetStoreBackend } from '../lib/assetStore'
+import { resetDecodeGate, decodeGateStats, acquireDecodePermit } from '../lib/decodeGate'
 import type { AppEnv } from '../lib/types'
 
 // Mirrors how server/app.ts mounts the sub-app: app.route('/api', createAssetRoutes()).
@@ -57,6 +58,11 @@ const pdfBytes = Buffer.from('%PDF-1.4\n%\xe2\xe3\xcf\xd3\n1 0 obj<<>>endobj')
 // blanket mivo_ exemption. Real key shapes are still scanned.
 const MIVO_KEY = 'mivo_FAKEKEY_test'
 const fp = () => fingerprintOfPlatformKey(MIVO_KEY)
+
+// P1 decode concurrency gate: the route acquires a process-global sharp-decode permit
+// before reading the body. The gate is module-global, so reset it between tests to keep
+// them independent (a prior test's in-flight permit can't bleed into the next).
+beforeEach(() => resetDecodeGate())
 
 describe('POST /api/assets', () => {
   it('multipart upload → 200 {assetId, mimeType, ...}; assetId = sha256(canonical) hex64; refcount=0', async () => {
@@ -571,5 +577,68 @@ describe('POST/GET /api/assets — dedup uploader entitlement (P1.5)', () => {
     const rec = be._records.get(assetId)
     expect(rec?.ownerFp).toBe(fp())
     expect(await be.isUploader(assetId, fingerprintOfPlatformKey('mivo_FAKEKEY_other'))).toBe(true)
+  })
+})
+
+// P1: the route acquires a global sharp-decode permit BEFORE reading the body and
+// releases it in finally. Under concurrency overflow the POST is shed with 429
+// decode_busy + Retry-After (not queued, not 500); a successful POST must release its
+// permit so the gate can't leak.
+describe('POST /api/assets — P1 decode concurrency gate', () => {
+  let savedConcurrency: string | undefined
+  let savedQueueCap: string | undefined
+
+  beforeEach(() => {
+    savedConcurrency = process.env.MIVO_ASSET_DECODE_CONCURRENCY
+    savedQueueCap = process.env.MIVO_ASSET_DECODE_QUEUE_CAP
+    resetDecodeGate()
+  })
+
+  afterEach(() => {
+    resetDecodeGate()
+    if (savedConcurrency === undefined) delete process.env.MIVO_ASSET_DECODE_CONCURRENCY
+    else process.env.MIVO_ASSET_DECODE_CONCURRENCY = savedConcurrency
+    if (savedQueueCap === undefined) delete process.env.MIVO_ASSET_DECODE_QUEUE_CAP
+    else process.env.MIVO_ASSET_DECODE_QUEUE_CAP = savedQueueCap
+  })
+
+  it('gate saturated (permit held) → POST 429 decode_busy + Retry-After, no body read', async () => {
+    // concurrency=1, queueCap=0 → a single held permit saturates the gate. Deterministic:
+    // the TEST holds the permit, so the route's acquire provably finds active==1 and the
+    // queue full (cap 0) → 429. No timing / Hono-scheduling / sharp-timing dependence.
+    process.env.MIVO_ASSET_DECODE_CONCURRENCY = '1'
+    process.env.MIVO_ASSET_DECODE_QUEUE_CAP = '0'
+    const app = buildApp(createMemoryAssetBackend())
+    const held = await acquireDecodePermit() // saturate: active=1
+    expect(decodeGateStats().active).toBe(1)
+    try {
+      const bytes = await realPng({ r: 70, g: 71, b: 72 })
+      const form = new FormData()
+      form.append('image', new File([bytes], 'x.png', { type: 'image/png' }), 'x.png')
+      const res = await app.request('/api/assets', { method: 'POST', body: form })
+      expect(res.status).toBe(429)
+      expect(res.headers.get('retry-after')).toBe('1')
+      const body = (await res.json()) as { code: string; error: string }
+      expect(body.code).toBe('decode_busy')
+      // the route acquired NO permit of its own → release is a no-op; held is still 1
+      expect(decodeGateStats().active).toBe(1)
+    } finally {
+      held.release()
+    }
+    expect(decodeGateStats().active).toBe(0)
+  })
+
+  it('a successful POST releases its permit in finally (gate returns to idle)', async () => {
+    // concurrency=2 default; one POST acquires, decodes, uploads, releases. The permit
+    // must be released even on the 200 happy path (finally), so a subsequent request is
+    // never blocked by a leaked permit.
+    const app = buildApp(createMemoryAssetBackend())
+    const bytes = await realPng({ r: 80, g: 81, b: 82 })
+    const form = new FormData()
+    form.append('image', new File([bytes], 'x.png', { type: 'image/png' }), 'x.png')
+    const res = await app.request('/api/assets', { method: 'POST', body: form })
+    expect(res.status).toBe(200)
+    expect(decodeGateStats().active).toBe(0) // permit released in finally
+    expect(decodeGateStats().waiting).toBe(0)
   })
 })

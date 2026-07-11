@@ -68,6 +68,17 @@ const SHARP_FORMAT_TO_ENCODER: Readonly<Record<string, string>> = {
 /** Formats sharp may report that we accept (the static-image allowlist). */
 const ALLOWED_FORMATS: ReadonlySet<string> = new Set(Object.keys(SHARP_FORMAT_TO_MIME))
 
+// sharp's own pixel-limit guard throws "Input image exceeds pixel limit" when the decoded
+// pixel count (width × stackedHeight for animations) exceeds sharp's internal limit
+// (default ~268M). That fires BEFORE our maxPixels check can read metadata for images
+// above the sharp limit (e.g. a 2-frame 12000×12000 GIF = 288M pixels), so without this
+// mapping such a pixel bomb would fall to decode-failed → 415. A pixel bomb is a size
+// rejection, not a decode failure → mapped to too-large → 413. (If maxPixels is env-
+// raised above sharp's limit, the toBuffer catch below re-maps the same throw too.)
+const PIXEL_LIMIT_RE = /exceeds pixel limit/i
+const isSharpPixelLimitError = (error: unknown): boolean =>
+  error instanceof Error && PIXEL_LIMIT_RE.test(error.message)
+
 export type CanonicalizeOutcome =
   | {
       kind: 'ok'
@@ -80,7 +91,7 @@ export type CanonicalizeOutcome =
       pages: number
     }
   | { kind: 'unsupported'; reason: 'decode-failed' | 'format-not-allowed' | 'no-dimensions' }
-  | { kind: 'too-large'; reason: 'dimensions' | 'pixels'; width: number; height: number }
+  | { kind: 'too-large'; reason: 'dimensions' | 'pixels'; width?: number; height?: number }
 
 export type CanonicalizeLimits = {
   /** Max per-frame width OR height (decode-bomb guard). */
@@ -106,14 +117,23 @@ export const canonicalizeImage = async (
 ): Promise<CanonicalizeOutcome> => {
   // Read with animated:true so multi-frame GIF/WebP/AVIF load ALL frames. Without it,
   // sharp reads only the first page and the subsequent re-encode collapses the
-  // animation to a single frame (verified empirically).
+  // animation to a single frame (verified empirically). A pixel-limit throw (image
+  // above sharp's internal ~268M-pixel limit) is mapped to too-large (413), NOT
+  // decode-failed (415) — a pixel bomb is a size rejection, not a decode failure.
+  let pixelLimitHit = false
   const metaResult = await (async () => {
     try {
       return await sharp(bytes, { animated: true }).metadata()
-    } catch {
+    } catch (error) {
+      if (isSharpPixelLimitError(error)) pixelLimitHit = true
       return null
     }
   })()
+  if (pixelLimitHit) {
+    // sharp refused before returning metadata → dimensions unavailable. The rejection
+    // is unambiguously "too many pixels" (sharp's own guard), so this is 413 not 415.
+    return { kind: 'too-large', reason: 'pixels' }
+  }
   if (!metaResult) {
     return { kind: 'unsupported', reason: 'decode-failed' }
   }
@@ -156,7 +176,12 @@ export const canonicalizeImage = async (
       .toFormat(encoder as 'png' | 'jpeg' | 'webp' | 'gif' | 'avif')
       .toBuffer()
     return { kind: 'ok', canonicalBytes, mimeType, width, height: pageHeight, pages }
-  } catch {
+  } catch (error) {
+    // Defensive: if maxPixels was env-raised above sharp's limit, a >sharp-limit image
+    // could reach toBuffer and hit the same pixel-limit throw — map it to too-large.
+    if (isSharpPixelLimitError(error)) {
+      return { kind: 'too-large', reason: 'pixels', width, height: pageHeight }
+    }
     return { kind: 'unsupported', reason: 'decode-failed' }
   }
 }
