@@ -55,6 +55,18 @@ describe('pgConfig: resolvePersistBackendConfig (F9 idle=0 + defaults)', () => {
     expect(() => resolvePersistBackendConfig(pgEnv({ MIVO_PG_IDLE_TIMEOUT_MS: 'abc' }))).toThrow(/MIVO_PG_IDLE_TIMEOUT_MS/)
   })
 
+  it('R2-7: idle 小数 0.5 → 抛错(不静默 Math.trunc 截断为 0 = 意外禁用超时)', () => {
+    expect(() => resolvePersistBackendConfig(pgEnv({ MIVO_PG_IDLE_TIMEOUT_MS: '0.5' }))).toThrow(/MIVO_PG_IDLE_TIMEOUT_MS/)
+  })
+
+  it('R2-7: idle 小数 1.9 → 抛错(不静默截断为 1)', () => {
+    expect(() => resolvePersistBackendConfig(pgEnv({ MIVO_PG_IDLE_TIMEOUT_MS: '1.9' }))).toThrow(/MIVO_PG_IDLE_TIMEOUT_MS/)
+  })
+
+  it('R2-7: idle 整数字符串 "1" honored(回归:整数不被误拒)', () => {
+    expect(resolvePersistBackendConfig(pgEnv({ MIVO_PG_IDLE_TIMEOUT_MS: '1' })).pg!.idleTimeoutMs).toBe(1)
+  })
+
   it('defaults: host/port/db/user/maxConnections/connectionTimeout 兜底值正确', () => {
     const cfg = resolvePersistBackendConfig(pgEnv())
     expect(cfg.pg).toMatchObject({

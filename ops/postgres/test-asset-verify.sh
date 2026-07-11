@@ -30,7 +30,9 @@ make_blob() {
   local shard="${hex:0:2}"
   mkdir -p "$root/$shard"
   printf '%s' "$content" > "$root/$shard/$hex.bin"
-  printf '{"contentHash":"%s","mimeType":"image/png"}' "$hex" > "$root/$shard/$hex.meta.json"
+  local size=${#content}
+  # R2-3:metadata 含 sizeBytes(新内容校验要求 contentHash+mimeType+sizeBytes 全对)。
+  printf '{"contentHash":"%s","mimeType":"image/png","sizeBytes":%d}' "$hex" "$size" > "$root/$shard/$hex.meta.json"
 }
 
 echo "=== F4 asset-verify unit tests ==="
@@ -116,6 +118,46 @@ echo "=== F4 asset-verify unit tests ==="
     ok "case7 no snapshot file → exit 1"
   else
     bad "case7 missing snapshot should fail"; cat /tmp/av7.out
+  fi
+}
+
+# Case 8: corrupt meta (non-JSON content; hash 对但 .meta.json 是垃圾) → exit 1
+# R2-3 对抗负例:旧实现只查 -f → sol3 造"hash 对但 .meta.json 内容为垃圾"tar → rc=0。
+{
+  root="$WORK/case8/assets"; mkdir -p "$root"
+  H="$(sha 'corrupt-meta-content')"; make_blob "$root" "$H" 'corrupt-meta-content'
+  printf 'this is not json garbage' > "$root/${H:0:2}/$H.meta.json"
+  snap="$WORK/case8.tar.gz"; tar -czf "$snap" -C "$WORK/case8" assets
+  if ! verify_asset_snapshot "$snap" "" >/tmp/av8.out 2>&1; then
+    ok "case8 corrupt meta (non-JSON content) → exit 1"
+  else
+    bad "case8 corrupt meta should fail"; cat /tmp/av8.out
+  fi
+}
+
+# Case 9: meta contentHash mismatch (JSON 合法但 contentHash 写错) → exit 1
+{
+  root="$WORK/case9/assets"; mkdir -p "$root"
+  H="$(sha 'wrong-meta-hash')"; make_blob "$root" "$H" 'wrong-meta-hash'
+  printf '{"contentHash":"deadbeefdeadbeef","mimeType":"image/png","sizeBytes":15}' > "$root/${H:0:2}/$H.meta.json"
+  snap="$WORK/case9.tar.gz"; tar -czf "$snap" -C "$WORK/case9" assets
+  if ! verify_asset_snapshot "$snap" "" >/tmp/av9.out 2>&1; then
+    ok "case9 meta contentHash mismatch → exit 1"
+  else
+    bad "case9 wrong meta hash should fail"; cat /tmp/av9.out
+  fi
+}
+
+# Case 10: meta sizeBytes mismatch (contentHash 对但 sizeBytes 写错) → exit 1
+{
+  root="$WORK/case10/assets"; mkdir -p "$root"
+  H="$(sha 'wrong-meta-size')"; make_blob "$root" "$H" 'wrong-meta-size'
+  printf '{"contentHash":"%s","mimeType":"image/png","sizeBytes":999}' "$H" > "$root/${H:0:2}/$H.meta.json"
+  snap="$WORK/case10.tar.gz"; tar -czf "$snap" -C "$WORK/case10" assets
+  if ! verify_asset_snapshot "$snap" "" >/tmp/av10.out 2>&1; then
+    ok "case10 meta sizeBytes mismatch → exit 1"
+  else
+    bad "case10 wrong meta size should fail"; cat /tmp/av10.out
   fi
 }
 

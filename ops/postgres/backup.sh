@@ -26,27 +26,38 @@ ASSET_STORE_DIR="${MIVO_ASSET_STORE_DIR:-/AIGC_Group/mivo-canvas-data/assets}"
 
 log() { echo "[$(date -Is)] $*" | tee -a "$LOG_FILE" >&2; }
 
-# F3 返修:查 live DB 三核心表行数(写进 manifest,供 restore-drill 比对)。表不在/查询失败 → -1。
-# dump 是一致快照,restore 后行数应等;不等 = restore 损失数据(restore-drill 据此 FAIL)。
-row_count() {
+# F4/R2-2:source asset-verify.sh(无 set 副作用的函数 lib;count_copy_rows 用于 dump-consistent 计数)。
+# shellcheck disable=SC1091  # 动态路径 $(dirname "$0")/asset-verify.sh;shellcheck 不跟随,已显式 source
+. "$(dirname "$0")/asset-verify.sh"
+
+# R2-2:dump-consistent 行数(从 dump 快照导出,非 live DB 查 → 杜绝 dump/计数分时取的并发写 race)。
+# backup 时 pg_dump 是 MVCC 一致快照;旧实现 live count(*) 在 dump 完成后才查,并发写会让 live ≠ dump
+# → restore-drill 把好恢复判 mismatch。改从 dump 自身导出:pg_restore --data-only --table 重取 COPY 数据计行。
+# 表在 dump TOC 中缺(pre-schema 未建表)→ dump_row_count 返 -1(非 0;区分"空表"与"表不存在" → 供 preSchema 矩阵)。
+# DUMP_FILE 在 pg_dump 后(set 见下);write_manifest 调用时已就绪。
+dump_has_table() {
   local tbl="$1"
-  local exists
-  exists="$(docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -t -A -c "SELECT to_regclass('public.$tbl') IS NOT NULL;" 2>/dev/null || echo f)"
-  if [ "$exists" = "t" ]; then
-    docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -t -A -c "SELECT count(*) FROM public.$tbl;" 2>/dev/null || echo -1
-  else
-    echo -1
-  fi
+  docker exec -i "$PG_CONTAINER" pg_restore -l < "$DUMP_FILE" 2>/dev/null | grep -q "TABLE DATA public $tbl "
+}
+dump_row_count() {
+  local tbl="$1"
+  if ! dump_has_table "$tbl"; then echo -1; return; fi
+  docker exec -i "$PG_CONTAINER" pg_restore -U "$PG_USER" --data-only --table="public.$tbl" < "$DUMP_FILE" 2>/dev/null | count_copy_rows
 }
 
-# F3:写同批 manifest sidecar(<dump-basename>.manifest.json;restore-drill 按此名找)。
-# 含 dump 名 + 三核心表行数 + assetSnap + assetBlobCount(同批 dump/snapshot 配对凭证)。
+# F3+R2-2:写同批 manifest sidecar(<dump-basename>.manifest.json;restore-drill 按此名找)。
+# 含 dump 名 + 三核心表行数(dump-consistent)+ preSchema + assetSnap + assetBlobCount(同批 dump/snapshot 配对凭证)。
+# preSchema=true ⇔ 三核心表全缺(dump TOC 无任一)→ restore-drill 据此 + ALLOW_EMPTY_SCHEMA 放行 pre-schema。
 write_manifest() {
   local manifest="$BACKUP_DIR/$PG_DB-$TIMESTAMP.manifest.json"
   local pr_rows pj_rows cv_rows
-  pr_rows="$(row_count persist_records)"
-  pj_rows="$(row_count projects)"
-  cv_rows="$(row_count canvases)"
+  pr_rows="$(dump_row_count persist_records)"
+  pj_rows="$(dump_row_count projects)"
+  cv_rows="$(dump_row_count canvases)"
+  local preschema="false"
+  if [ "$pr_rows" = "-1" ] && [ "$pj_rows" = "-1" ] && [ "$cv_rows" = "-1" ]; then
+    preschema="true"
+  fi
   local asset_snap_field="null" asset_blob_field="null"
   if [ -n "${ASSET_SNAP:-}" ] && [ -f "${ASSET_SNAP:-}" ]; then
     asset_snap_field="\"$(basename "$ASSET_SNAP")\""
@@ -57,6 +68,7 @@ write_manifest() {
   "timestamp": "$TIMESTAMP",
   "pgDb": "$PG_DB",
   "dump": "$(basename "$DUMP_FILE")",
+  "preSchema": $preschema,
   "tables": {
     "persist_records": $pr_rows,
     "projects": $pj_rows,
@@ -66,13 +78,24 @@ write_manifest() {
   "assetBlobCount": $asset_blob_field
 }
 EOF
-  log "ok: manifest → $manifest (persist_records=$pr_rows projects=$pj_rows canvases=$cv_rows assetSnap=${ASSET_SNAP:-none})"
+  log "ok: manifest → $manifest (persist_records=$pr_rows projects=$pj_rows canvases=$cv_rows preSchema=$preschema assetSnap=${ASSET_SNAP:-none})"
 }
 
 # ─── 前置 ────────────────────────────────────────────────────────────────
 mkdir -p "$BACKUP_DIR"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 DAY_OF_WEEK="$(date +%u)"   # 1=Mon … 7=Sun
+
+# R2-3:asset 服务开启(MIVO_ENABLE_ASSET_SERVICE=1)⇒ 备份必须配置(ASSET_BACKUP_DIR 非空)。
+# 生产 ecosystem 固定 MIVO_ENABLE_ASSET_SERVICE=1;若 cron 裸跑 backup.sh 不设 ASSET_BACKUP_DIR,
+# 旧实现产出"只含 PG dump 不含 asset 快照"的备份还报成功 = 部署假闭环(灾备恢复时 asset dir 缺失)。
+# 现改 hard gate:服务开⇒备份必配;不配则 fail visibly exit 1(fail-fast 在 docker 之前,不 ship 不完整的备份)。
+if [ "${MIVO_ENABLE_ASSET_SERVICE:-0}" = "1" ] && [ -z "$ASSET_BACKUP_DIR" ]; then
+  log "FAIL: MIVO_ENABLE_ASSET_SERVICE=1(asset 服务开)但 ASSET_BACKUP_DIR 未设置 — 备份链假闭环(asset 快照必缺)。"
+  log "      解法:ASSET_BACKUP_DIR=/AIGC_Group/mivo-canvas-data/asset-backups ./ops/postgres/backup.sh"
+  log "      (或在 cron 环境导出 ASSET_BACKUP_DIR;见 docs/runbook/p0.3-runtime-hardening.md §5.1 + t1.1 runbook §cron)"
+  exit 1
+fi
 
 # 容器存活检查(不盲目 docker exec,先确认在跑)。
 if ! docker inspect -f '{{.State.Running}}' "$PG_CONTAINER" 2>/dev/null | grep -q true; then

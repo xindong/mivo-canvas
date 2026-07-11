@@ -37,7 +37,10 @@ log() { echo "[$(date -Is)] $*" | tee -a "$LOG_FILE" >&2; }
 
 # 取最新 .dump(按 mtime 降序)。ls -t 跨 GNU/BSD 可用;find -printf 仅 GNU 服务器端亦可用但不可移植。
 # shellcheck disable=SC2012  # ls -t 用于按 mtime 取最新,dump 文件名无特殊字符(timestamp)。
-latest_dump() { ls -t "$BACKUP_DIR"/*.dump 2>/dev/null | head -1; }
+# R2-6:无匹配时 ls 非零,在 `set -euo pipefail` 下经 `LATEST_DUMP="$(latest_dump)"` 命令替换直接杀脚本,
+#       导致 :87-90(dry-run)/ :114-117(主路径)的"无 dump → FAIL exit 1"显式诊断分支永不执行。
+#       `|| true` 把空结果正常化为空串(函数恒 exit 0),让调用方 -z 检查走显式 FAIL 分支(fail visibly,非静默退)。
+latest_dump() { ls -t "$BACKUP_DIR"/*.dump 2>/dev/null | head -1 || true; }
 
 # F8:跑 pg_restore -l 校验 TOC。容器在跑→docker exec;否则本地 pg_restore;都没有→无法校验(非零,不许假绿)。
 run_pg_restore_list() {
@@ -125,14 +128,29 @@ fi
 log "ok: dump TOC readable (pg_restore -l exit 0)"
 
 # F3/F4 manifest:同批 sidecar(<dump-basename>.manifest.json;backup.sh 写)。
+# R2-2:manifest 解析失败(no-jq / 坏 JSON)→ hard fail,不再当 -1 跳过(防部分缺表放行 / 假绿)。
 MANIFEST="${LATEST_DUMP%.dump}.manifest.json"
-MANIFEST_STATUS="absent"
-if [ -f "$MANIFEST" ]; then
-  MANIFEST_STATUS="present"
-  log "manifest found: $MANIFEST"
-else
-  log "WARN: no manifest for $LATEST_DUMP (旧备份无 manifest,F3 行数比对跳过;新 backup.sh 会产 manifest)"
-fi
+MANIFEST_STATUS="$(manifest_parse_status "$MANIFEST")"
+MANIFEST_PRESCHEMA=""
+case "$MANIFEST_STATUS" in
+  absent)
+    log "WARN: no manifest for $LATEST_DUMP (旧备份无 manifest,F3 行数比对跳过;新 backup.sh 会产 manifest)"
+    ;;
+  present)
+    log "manifest found: $MANIFEST"
+    MANIFEST_PRESCHEMA="$(manifest_field "$MANIFEST" '.preSchema')"
+    # manifest_field 返 -1 表示字段缺(preSchema 未声明);规整为空串便于 decide_core_missing 判定。
+    [ "$MANIFEST_PRESCHEMA" = "-1" ] && MANIFEST_PRESCHEMA=""
+    ;;
+  no-jq)
+    log "FAIL: manifest $MANIFEST present but no jq to parse — 无法校验内容,hard fail(不假绿跳过)"
+    ERR_MANIFEST=1
+    ;;
+  malformed)
+    log "FAIL: manifest $MANIFEST present but malformed JSON — hard fail(不假绿跳过)"
+    ERR_MANIFEST=1
+    ;;
+esac
 
 # ─── 1. 重建临时库(确保干净,不污染生产)──────────────────────────────────
 docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_ADMIN_DB" -c "DROP DATABASE IF EXISTS \"$DRILL_DB\";" >>"$LOG_FILE" 2>&1
@@ -148,6 +166,7 @@ log "ok: pg_restore → $DRILL_DB"
 
 # ─── 3. F3:三核心表存在性 hard gate + manifest 逐表行数比对 ──────────────────
 ERR=0
+ERR_MANIFEST=0  # R2-2:manifest 解析失败(no-jq/malformed)→ 后续并入 ERR hard fail
 CORE_MISSING=0
 # 3a. SELECT 1(证明库可读)
 docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$DRILL_DB" -t -A -c "SELECT 1;" >>"$LOG_FILE" 2>&1 || ERR=1
@@ -158,6 +177,7 @@ log "public base tables: $TABLE_COUNT"
 # 3c. 估算行数 top5(证明数据可读,空库则无行)
 docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$DRILL_DB" -c "SELECT relname, n_live_tup AS approx_rows FROM pg_stat_user_tables ORDER BY n_live_tup DESC LIMIT 5;" >>"$LOG_FILE" 2>&1 || log "WARN: pg_stat_user_tables empty (ok for fresh db)"
 # 3d. F3 核心:三表存在性 hard gate + manifest 行数比对。
+# R2-2:manifest 解析失败已 hard fail(manifest_parse_status);此处只在 present 时比对(字段缺→-1 跳过)。
 for tbl in $CORE_TABLES; do
   EXISTS="$(docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$DRILL_DB" -t -A -c "SELECT to_regclass('public.$tbl') IS NOT NULL;" 2>>"$LOG_FILE" || echo f)"
   if [ "$EXISTS" != "t" ]; then
@@ -167,26 +187,33 @@ for tbl in $CORE_TABLES; do
   fi
   RESTORED="$(docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$DRILL_DB" -t -A -c "SELECT count(*) FROM public.$tbl;" 2>>"$LOG_FILE" || echo ERR)"
   [ "$RESTORED" = "ERR" ] && ERR=1
-  MANIFEST_V="$(manifest_field "$MANIFEST" ".tables.$tbl")"
-  if [ "$MANIFEST_V" != "-1" ]; then
-    if [ "$RESTORED" != "$MANIFEST_V" ]; then
-      log "FAIL: public.$tbl row count mismatch (manifest=$MANIFEST_V vs restored=$RESTORED) — restore 损失数据"
+  if [ "$MANIFEST_STATUS" = "present" ]; then
+    MANIFEST_V="$(manifest_field "$MANIFEST" ".tables.$tbl")"
+    if [ "$MANIFEST_V" = "-1" ]; then
+      log "public.$tbl rows=$RESTORED (manifest dump-counts 无此字段:表在 dump 中缺 → pre-schema?见 decide_core_missing)"
+    elif [ "$RESTORED" != "$MANIFEST_V" ]; then
+      log "FAIL: public.$tbl row count mismatch (manifest=$MANIFEST_V vs restored=$RESTORED) — restore 损失数据 / dump-counts race"
       ERR=1
     else
       log "ok: public.$tbl rows match (manifest=$MANIFEST_V restored=$RESTORED)"
     fi
   else
-    log "public.$tbl rows=$RESTORED (manifest 无此字段或无 jq,跳过比对)"
+    log "public.$tbl rows=$RESTORED (manifest $MANIFEST_STATUS,跳过比对)"
   fi
 done
-if [ "$CORE_MISSING" -gt 0 ]; then
-  if [ "$ALLOW_EMPTY_SCHEMA" = "1" ]; then
-    log "WARN: ALLOW_EMPTY_SCHEMA=1 — $CORE_MISSING 核心表缺失不阻断(pre-schema 模式;生产禁用此开关)"
-  else
-    log "FAIL: $CORE_MISSING 核心表缺失且 ALLOW_EMPTY_SCHEMA!=1 — drill FAIL"
+# R2-2 矩阵:三核心表缺失处置(allow0/1 × 全缺/部分缺 + manifest preSchema 声明)。
+# ALLOW_EMPTY_SCHEMA=1 只许"三核心表全缺 + manifest 明示 pre-schema";部分缺 / 全缺未声明 → FAIL。
+CORE_OUTCOME="$(decide_core_missing "$CORE_MISSING" "$ALLOW_EMPTY_SCHEMA" "$MANIFEST_PRESCHEMA")"
+case "$CORE_OUTCOME" in
+  pass) log "ok: 三核心表全在(coreMissing=0)" ;;
+  warn) log "WARN: ALLOW_EMPTY_SCHEMA=1 + 三核心表全缺 + manifest 明示 pre-schema — pre-schema 模式通过(生产禁用此开关)" ;;
+  fail)
+    log "FAIL: $CORE_MISSING 核心表缺失,处置=fail(部分缺 / 全缺但 manifest 未明示 pre-schema / ALLOW_EMPTY≠1)"
     ERR=1
-  fi
-fi
+    ;;
+esac
+# R2-2:manifest 解析失败并入 ERR(no-jq / malformed hard fail)。
+if [ "${ERR_MANIFEST:-0}" = "1" ]; then ERR=1; fi
 
 # ─── 4. F4:asset snapshot 真解压 + sha256 + metadata + manifest blob 数比对 ──────
 # asset backup 开启(ASSET_BACKUP_DIR 设且存在)→ hard gate;关 → skipped(不阻断)。
@@ -231,13 +258,14 @@ fi
 docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_ADMIN_DB" -c "DROP DATABASE IF EXISTS \"$DRILL_DB\";" >>"$LOG_FILE" 2>&1 || true
 
 # ─── 6. 成功判定(F3/F4 硬闸门)─────────────────────────────────────────────
-# PASS = ERR=0 AND (核心表全在 OR ALLOW_EMPTY_SCHEMA=1)。asset check 已并入 ERR(开启时)。
-if [ "$ERR" = "0" ] && { [ "$CORE_MISSING" = "0" ] || [ "$ALLOW_EMPTY_SCHEMA" = "1" ]; }; then
-  log "PASS: restore drill ok (coreTables=$([ "$CORE_MISSING" = "0" ] && echo all-present || echo "missing-$CORE_MISSING-allowed"), manifest=$MANIFEST_STATUS, backup=$LATEST_DUMP, asset=$ASSET_CHECK)"
+# R2-2 矩阵:PASS = ERR=0 AND CORE_OUTCOME ∈ {pass, warn}(全在 / 全缺+preSchema+ALLOW_EMPTY)。
+# asset check + manifest 解析失败 已并入 ERR(开启时 / no-jq / malformed)。
+if [ "$ERR" = "0" ] && { [ "$CORE_OUTCOME" = "pass" ] || [ "$CORE_OUTCOME" = "warn" ]; }; then
+  log "PASS: restore drill ok (core=$CORE_OUTCOME coreMissing=$CORE_MISSING, manifest=$MANIFEST_STATUS, preSchema=$MANIFEST_PRESCHEMA, backup=$LATEST_DUMP, asset=$ASSET_CHECK)"
   log "=== restore drill done: PASS ==="
   exit 0
 else
-  log "FAIL: restore drill (err=$ERR coreMissing=$CORE_MISSING asset=$ASSET_CHECK manifest=$MANIFEST_STATUS)"
+  log "FAIL: restore drill (err=$ERR coreOutcome=$CORE_OUTCOME coreMissing=$CORE_MISSING asset=$ASSET_CHECK manifest=$MANIFEST_STATUS preSchema=$MANIFEST_PRESCHEMA)"
   log "=== restore drill done: FAIL ==="
   exit 1
 fi

@@ -1,8 +1,11 @@
 // ecosystem.config.cjs — MivoCanvas BFF pm2 进程看护配置(P0.3 运行加固)。
 //
-// 生产部署:服务器 `/AIGC_Group/mivo-canvas/` 下,以 yanjian 身份 `pm2 start
-// ecosystem.config.cjs`(首次)/`pm2 restart mivo-canvas`(更新)。CLAUDE.md 部署规则:
-// 一律走 PR + CI 合 main;服务器只做 pull 部署;pm2 以 yanjian 为主。
+// 生产部署:服务器 `/AIGC_Group/mivo-canvas/` 下,以 yanjian 身份跑 deploy.sh,后者
+// `pm2 startOrRestart ecosystem.config.cjs --update-env`(首启=start,已存=startOrRestart;
+// --update-env 重载 env 块 + 新 ecosystem)。**禁用裸 `pm2 restart mivo-canvas`**(按名 restart
+// 不重载 ecosystem env——改名/改 MIVO_PG_MAX_CONNECTIONS/MIVO_ASSET_STORE_DIR 后旧值不生效,
+// 9:00/17:00 自动部署有中断风险;见 runbook §1.3 F6)。CLAUDE.md 部署规则:一律走 PR + CI 合 main;
+// 服务器只做 pull 部署;pm2 以 yanjian 为主。
 //
 // 为什么 .cjs:package.json `"type":"module"` → .js 会被当 ESM,`module.exports` 失效;
 // .cjs 显式 CommonJS,pm2 稳定加载。
