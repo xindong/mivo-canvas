@@ -2,23 +2,36 @@
 // T1.3 测试 helper:构建挂载 projects+canvas+userState 三路由的最小 app + fresh 内存 backend。
 // 镜像 local-assets.test.ts buildApp 模式;route 级契约测试用它(不驱动主 app,避免 singleton 状态)。
 // 主 app wiring 烟测见 server/__tests__/t1.3-wiring.test.ts(驱动主 app + reset sharedPersistBackend)。
+// T1.4:同时挂 members / share-links / share-access 路由 + fresh 内存 permission backend;返回 permissions 供测试 reset。
 import { Hono } from 'hono'
 import type { AppEnv } from '../lib/types'
 import { createProjectsRoutes } from './projects'
 import { createCanvasRoutes } from './canvas'
 import { createUserStateRoutes } from './userState'
+import { createMembersRoutes } from './members'
+import { createShareLinksRoutes, createShareAccessRoutes } from './shareLinks'
 import { InMemoryPersistBackend } from '../persist/backend'
+import { InMemoryPermissionBackend } from '../lib/permissions'
 import { encodeChildPayload } from '../../shared/persist-contract.ts'
 import type { AnchorRecord, EdgeRecord, NodeRecord } from '../../src/kernel/records'
 
-export const buildPersistApp = (): { app: Hono<AppEnv>; backend: InMemoryPersistBackend } => {
+export const buildPersistApp = (): {
+  app: Hono<AppEnv>
+  backend: InMemoryPersistBackend
+  permissions: InMemoryPermissionBackend
+} => {
   const backend = new InMemoryPersistBackend()
+  const permissions = new InMemoryPermissionBackend()
   const app = new Hono<AppEnv>()
-  app.route('/api/projects', createProjectsRoutes({ backend }))
-  app.route('/api/canvas', createCanvasRoutes({ backend }))
+  app.route('/api/projects', createProjectsRoutes({ backend, permissions }))
+  app.route('/api/projects', createMembersRoutes({ backend, permissions }))
+  app.route('/api/projects', createShareLinksRoutes({ backend, permissions }))
+  app.route('/api/canvas', createCanvasRoutes({ backend, permissions }))
   app.route('/api/user-state', createUserStateRoutes({ backend }))
-  return { app, backend }
+  app.route('/api/share', createShareAccessRoutes({ backend, permissions }))
+  return { app, backend, permissions }
 }
+
 
 // 两个不同 owner(同 FX-2 tasks-per-user.test:不同 X-Mivo-Api-Key → 不同指纹)。
 export const KEY_A = 'mivo_aaa_user_a'

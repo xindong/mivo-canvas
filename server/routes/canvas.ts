@@ -1,7 +1,9 @@
 // server/routes/canvas.ts
 // T1.3 前置:/api/canvas — 画布 record(document 域:canvas meta + node/edge/anchor 子 record)
 // + 节点级 PATCH(FX-4,1MB/413,revision 409)+ chat 子资源(DP-6)+ 返修 N1-N10。
-// 权威:docs/decisions/api-surface.md §4.2(返修版二)。
+// T1.4 扩展:authzCanvas 接 PermissionBackend(按 canvas 的 project 查 memberRole + sharePermission +
+// per-action 矩阵);DELETE 改 manage(owner-only);GET / 合并 owned + shared-project canvases。
+// 权威:docs/decisions/api-surface.md §4.2(返修版二)+ docs/decisions/permission-schema.md §2(矩阵)。
 //
 // 返修要点(N1-N10):
 //  - N1:PATCH child payload 经 shared validateChildPayload(逐 type 白名单)+ GET 回读 envelope revision 回填。
@@ -18,7 +20,9 @@ import { randomUUID } from 'node:crypto'
 import type { AppEnv } from '../lib/types'
 import { rejectInvalidMivoApiKey } from '../lib/keys'
 import { resolveActor } from '../lib/owner'
-import { canAccessCanvas, canAccessProject } from '../lib/authz'
+import { canAccessCanvas, canAccessProject, denyStatus, type AuthzAction, type AuthzInfo } from '../lib/authz'
+import { resolveProjectAccess, denyProjectResponse, shareTokenOf } from '../lib/projectAuthz'
+import type { PermissionBackend } from '../lib/permissions'
 import { newRequestId, logRequest } from '../lib/request'
 import {
   bodyError,
@@ -79,21 +83,60 @@ const badMivo = (c: Context<AppEnv>, requestId: string, t0: number): Response =>
 /** N5:malformed If-Match → 400 bad-request body。 */
 const badIfMatch = (id: string) => ({ error: 'bad-request' as const, message: 'If-Match must be a non-negative decimal safe integer', id })
 
-export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Hono<AppEnv> => {
+export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistBackend; permissions: PermissionBackend }): Hono<AppEnv> => {
   const route = new Hono<AppEnv>()
 
   /**
-   * 返修 N7:canvas 授权 seam——backend 先 resolve resourceOwner(getCanvasOwner 全局),action-aware
-   * canAccessCanvas 判;授权后以 resourceOwner 查询。未授权/不存在统一 404(无存在泄漏)。
+   * T1.4 授权 seam——canvas 先 getCanvasOwner 全局归属,再 fetch meta 取 projectId(成员资格按 project 查),
+   * 按 share-token 或 actor+member 解析 AuthzInfo;canAccessCanvas(角色矩阵)判。
+   * 派生 owner:canvas.ownerId === project.ownerId,actor===ownerId → owner(§3;T1.3 owner===actor 自归属)。
+   * 非成员/无分享 → 404 unknown-canvas(无泄漏);成员/分享越权 → 403;revoked share → 410。
+   * 授权后返 record(route 免二次 get)。
    */
-  const authzCanvas = (
-    actor: string,
+  const authzCanvas = async (
+    c: Context<AppEnv>,
     canvasId: string,
-    action: 'read' | 'write' | 'move' = 'read',
-  ): { ownerId: string } | null => {
+    action: AuthzAction,
+  ): Promise<
+    | { ok: true; ownerId: string; projectId: string; record: PersistRecord }
+    | { ok: false; status: number; body: unknown }
+  > => {
     const owner = backend.getCanvasOwner(canvasId)
-    if (!owner || canAccessCanvas(actor, owner.ownerId, action) === 'deny') return null
-    return owner
+    if (!owner) return { ok: false, status: 404, body: { error: 'unknown-canvas' } satisfies UnknownResourceBody }
+    const got = await backend.get(owner.ownerId, 'canvas', canvasId)
+    if (got.kind === 'missing') {
+      return { ok: false, status: 404, body: { error: 'unknown-canvas' } satisfies UnknownResourceBody }
+    }
+    // soft-deleted canvas:read/write/move → 404(已不可见);manage(delete)→ 放行(idempotent delete 已删→204,§2)
+    if (got.record.isDeleted && action !== 'manage') {
+      return { ok: false, status: 404, body: { error: 'unknown-canvas' } satisfies UnknownResourceBody }
+    }
+    const projectId = isCanvasPayload(got.record.payload) ? got.record.payload.projectId : ''
+    const shareToken = shareTokenOf(c)
+    let info: AuthzInfo
+    if (shareToken) {
+      const share = projectId ? await permissions.resolveShareLink(shareToken, projectId) : undefined
+      if (!share) return { ok: false, status: 404, body: { error: 'unknown-canvas' } satisfies UnknownResourceBody }
+      if (share.kind === 'revoked') return { ok: false, status: 410, body: { error: 'gone' } }
+      if (share.kind === 'expired') return { ok: false, status: 410, body: { error: 'gone', reason: 'expired' } }
+      info = { actor: null, ownerId: owner.ownerId, sharePermission: share.permission }
+    } else {
+      const actor = resolveActor(c)
+      const memberRole = projectId ? await permissions.resolveMemberRole(projectId, actor, owner.ownerId) : undefined
+      info = { actor, ownerId: owner.ownerId, memberRole }
+    }
+    if (canAccessCanvas(info, action) === 'deny') {
+      const status = denyStatus(info) === 403 ? 403 : 404
+      const body = status === 403 ? { error: 'forbidden' } : { error: 'unknown-canvas' } satisfies UnknownResourceBody
+      return { ok: false, status, body }
+    }
+    return { ok: true, ownerId: owner.ownerId, projectId, record: got.record }
+  }
+
+  /** authzCanvas deny → Response(统一日志)。 */
+  const denyCanvas = (c: Context<AppEnv>, requestId: string, t0: number, r: { ok: false; status: number; body: unknown }): Response => {
+    logRequest({ method: c.req.method, path: c.req.path, requestId, status: r.status, latencyMs: Date.now() - t0, note: r.status === 403 ? 'forbidden' : r.status === 410 ? 'gone' : 'unknown-canvas' })
+    return c.json(r.body as Record<string, unknown>, r.status as 400 | 403 | 404 | 410)
   }
 
   /** 返修 N2:chat route 校验 collection live(canvas 未软删 + chat-collection record 未软删)。 */
@@ -109,17 +152,50 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
     const t0 = Date.now()
     const bad = rejectInvalidMivoApiKey(c)
     if (bad) return badMivo(c, requestId, t0)
-    const actor = resolveActor(c)
-    const projectId = c.req.query('projectId')
-    const { records } = projectId
-      ? await backend.listCanvasByProject(actor, projectId)
-      : await backend.listByOwner(actor, 'canvas')
+    const projectId = c.req.query('projectId')?.toString()
+    let records: PersistRecord[]
+    if (projectId) {
+      // T1.4:projectId 给定 → project read-authz(owner/member/share);授权后以 projectOwner 查 canvas。
+      const projectOwner = backend.getProjectOwner(projectId)
+      if (!projectOwner) {
+        records = []
+      } else {
+        const shareToken = shareTokenOf(c)
+        let info: AuthzInfo
+        if (shareToken) {
+          const share = await permissions.resolveShareLink(shareToken, projectId)
+          // 未知/不属此 project 的 token → 当无访问(空 list,无泄漏);revoked/expired 也空
+          info = share && share.kind === 'active'
+            ? { actor: null, ownerId: projectOwner.ownerId, sharePermission: share.permission }
+            : { actor: null, ownerId: projectOwner.ownerId }
+        } else {
+          const actor = resolveActor(c)
+          const memberRole = await permissions.resolveMemberRole(projectId, actor, projectOwner.ownerId)
+          info = { actor, ownerId: projectOwner.ownerId, memberRole }
+        }
+        records = canAccessProject(info, 'read') === 'allow'
+          ? (await backend.listCanvasByProject(projectOwner.ownerId, projectId)).records
+          : []
+      }
+    } else {
+      // T1.4:无 projectId → owned canvases + shared-project canvases(§13.5 被分享后可见)
+      const actor = resolveActor(c)
+      const owned = await backend.listByOwner(actor, 'canvas')
+      records = owned.records
+      const shared = await permissions.listSharedProjects(actor)
+      for (const { projectId: pid } of shared) {
+        const po = backend.getProjectOwner(pid)
+        if (!po) continue
+        const r = await backend.listCanvasByProject(po.ownerId, pid)
+        records = records.concat(r.records)
+      }
+    }
     const body: ListCanvasResponse = { canvases: records.map(toCanvasMeta) }
     logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0 })
     return c.json(body, 200)
   })
 
-  // GET /api/canvas/:id — 全量(meta + nodes/edges/anchors,跨设备原样在)。
+  // GET /api/canvas/:id — 全量(meta + nodes/edges/anchors,跨设备原样在)。T1.4 authz(member/share read)。
   route.get('/:id', async (c) => {
     const requestId = newRequestId()
     c.header('X-Request-Id', requestId)
@@ -127,24 +203,15 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
     const bad = rejectInvalidMivoApiKey(c)
     if (bad) return badMivo(c, requestId, t0)
     const id = c.req.param('id')
-    const actor = resolveActor(c)
-    const owner = authzCanvas(actor, id, 'read')
-    if (!owner) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
-    }
-    const got = await backend.get(owner.ownerId, 'canvas', id)
-    if (got.kind === 'missing' || got.record.isDeleted) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
-    }
+    const authz = await authzCanvas(c, id, 'read')
+    if (!authz.ok) return denyCanvas(c, requestId, t0, authz)
     const [nodes, edges, anchors] = await Promise.all([
-      backend.listByCanvas(owner.ownerId, id, 'node'),
-      backend.listByCanvas(owner.ownerId, id, 'edge'),
-      backend.listByCanvas(owner.ownerId, id, 'anchor'),
+      backend.listByCanvas(authz.ownerId, id, 'node'),
+      backend.listByCanvas(authz.ownerId, id, 'edge'),
+      backend.listByCanvas(authz.ownerId, id, 'anchor'),
     ])
     const body: GetCanvasResponse = {
-      ...toCanvasMeta(got.record),
+      ...toCanvasMeta(authz.record),
       nodes: nodes.records.map(toEntry),
       edges: edges.records.map(toEntry),
       anchors: anchors.records.map(toEntry),
@@ -174,19 +241,17 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
       return c.json(decoded.body, decoded.status as 400 | 413)
     }
     const reqBody: CreateCanvasRequest = decoded.value
-    const actor = resolveActor(c)
-    // N7:project authz(getProjectOwner + canAccessProject;未授权/不存在 → 404 unknown-project)。
-    const projectOwner = backend.getProjectOwner(reqBody.projectId)
-    if (!projectOwner || canAccessProject(actor, projectOwner.ownerId, 'write') === 'deny') {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
-    }
+    // T1.4:project write-authz(委托 resolveProjectAccess,统一 actor + share-token 路径;editor+/share-edit 可建 canvas,
+    // viewer → 403,非成员 → 404 unknown-project)。Greptile 修复:分享链接 edit 也能建 canvas(复用同一授权路径)。
+    const projectAuthz = await resolveProjectAccess(c, backend, permissions, reqBody.projectId, 'write')
+    if (!projectAuthz.ok) return denyProjectResponse(c, requestId, t0, projectAuthz)
     const id = reqBody.id && reqBody.id.trim() ? reqBody.id.trim() : randomUUID()
     const cp: CanvasPayload = { projectId: reqBody.projectId, title: reqBody.title, sourceTemplateId: reqBody.sourceTemplateId }
     const idempotencyKey = c.req.header('idempotency-key') || undefined
     // F1:单一原子原语 createCanvasWithCollection(canvas meta + chat-collection 同一操作,防 ensureCreate(canvas)→
     // 独立 ensureCreate(chat-collection) 两段间的 TOCTOU——中间并发 DELETE project 会产生软删树下 live orphan collection)。
-    const result = await backend.createCanvasWithCollection(actor, id, cp, {
+    // T1.4:canvas ownerId = projectOwner(非 actor);成员/分享链接建的画布仍属 project owner,owner 派生统一。
+    const result = await backend.createCanvasWithCollection(projectAuthz.ownerId, id, cp, {
       method: 'POST',
       resourceKind: 'canvas',
       idempotencyKey,
@@ -237,25 +302,28 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
     }
     const id = c.req.param('id')
     const actor = resolveActor(c)
-    const owner = authzCanvas(actor, id, 'write')
-    if (!owner) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
-    }
-    const got = await backend.get(owner.ownerId, 'canvas', id)
-    if (got.kind === 'missing' || got.record.isDeleted) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
-    }
-    const existing = isCanvasPayload(got.record.payload) ? got.record.payload : { projectId: '' }
+    const authz = await authzCanvas(c, id, 'write')
+    if (!authz.ok) return denyCanvas(c, requestId, t0, authz)
+    const existing = isCanvasPayload(authz.record.payload) ? authz.record.payload : { projectId: '' }
     const incoming = (decoded.value.payload ?? {}) as Partial<CanvasPayload>
     // 返修 #8/N7 move:projectId 可改(若提供且属本 owner;move 双端 authz:source canvas + target project)。
     let projectId = existing.projectId ?? ''
     if (typeof incoming.projectId === 'string' && incoming.projectId && incoming.projectId !== projectId) {
+      // Greptile 第三轮修复:move 在 source 端须 'move'(owner-only),不能降级为 'write'(否则 editor/share-edit 可把他人画布移到自己项目)。
+      const sourceMove = await authzCanvas(c, id, 'move')
+      if (!sourceMove.ok) return denyCanvas(c, requestId, t0, sourceMove)
       const targetOwner = backend.getProjectOwner(incoming.projectId)
-      if (!targetOwner || canAccessProject(actor, targetOwner.ownerId, 'move') === 'deny') {
-        logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
+      // T1.4:move target project authz('move';仅 owner,§2 矩阵);非成员 → 404,成员越权 → 403。
+      if (!targetOwner) {
+        logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'unknown-project' })
         return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
+      }
+      const targetMemberRole = await permissions.resolveMemberRole(incoming.projectId, actor, targetOwner.ownerId)
+      const targetInfo: AuthzInfo = { actor, ownerId: targetOwner.ownerId, memberRole: targetMemberRole }
+      if (canAccessProject(targetInfo, 'move') === 'deny') {
+        const status = denyStatus(targetInfo) === 403 ? 403 : 404
+        logRequest({ method: c.req.method, path: c.req.path, requestId, status, latencyMs: Date.now() - t0, note: status === 403 ? 'forbidden' : 'unknown-project' })
+        return c.json(status === 403 ? { error: 'forbidden' } : { error: 'unknown-project' } satisfies UnknownResourceBody, status as 403 | 404)
       }
       projectId = incoming.projectId
     }
@@ -271,7 +339,7 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
       return c.json(badIfMatch(id), 400)
     }
     const base = parsed.kind === 'value' ? parsed.revision : undefined
-    const result = await backend.upsert(owner.ownerId, 'canvas', id, cp, {
+    const result = await backend.upsert(authz.ownerId, 'canvas', id, cp, {
       base,
       scope: 'document',
       method: 'PUT',
@@ -308,7 +376,7 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
     return c.json(toCanvasMeta(result.record), 200)
   })
 
-  // DELETE /api/canvas/:id — 返修 #2/#7:softDeleteCanvasTree 原子(标 canvas meta + chat-collection;children 保持活记录)。
+  // DELETE /api/canvas/:id — T1.4:action=manage(owner-only,FX-7 §5.12);softDeleteCanvasTree 原子。
   route.delete('/:id', async (c) => {
     const requestId = newRequestId()
     c.header('X-Request-Id', requestId)
@@ -316,19 +384,10 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
     const bad = rejectInvalidMivoApiKey(c)
     if (bad) return badMivo(c, requestId, t0)
     const id = c.req.param('id')
-    const actor = resolveActor(c)
-    const owner = authzCanvas(actor, id, 'write')
-    if (!owner) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
-    }
-    const got = await backend.get(owner.ownerId, 'canvas', id)
-    if (got.kind === 'missing') {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
-    }
-    if (!got.record.isDeleted) {
-      await backend.softDeleteCanvasTree(owner.ownerId, id)
+    const authz = await authzCanvas(c, id, 'manage')
+    if (!authz.ok) return denyCanvas(c, requestId, t0, authz)
+    if (!authz.record.isDeleted) {
+      await backend.softDeleteCanvasTree(authz.ownerId, id)
     }
     logRequest({ method: c.req.method, path: c.req.path, requestId, status: 204, latencyMs: Date.now() - t0 })
     return c.body(null, 204)
@@ -357,17 +416,8 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
       return c.json({ error: 'bad-request', message: 'type and orderedIds are required' }, 400)
     }
     const id = c.req.param('id')
-    const actor = resolveActor(c)
-    const owner = authzCanvas(actor, id, 'write')
-    if (!owner) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
-    }
-    const canvas = await backend.get(owner.ownerId, 'canvas', id)
-    if (canvas.kind === 'missing' || canvas.record.isDeleted) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
-    }
+    const authz = await authzCanvas(c, id, 'write')
+    if (!authz.ok) return denyCanvas(c, requestId, t0, authz)
     // N5/F5:If-Match(contentVersion base)**必填**——invalid → 400;missing → 428(precondition-required);stale → 409(N8 两并发一成一 409)。
     const parsed = parseIfMatch(c.req.header('if-match'))
     if (parsed.kind === 'invalid') {
@@ -379,7 +429,7 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
       return c.json(preconditionRequired(id), 428)
     }
     const base = parsed.revision
-    const result = await backend.reorderChildren(owner.ownerId, id, type, orderedIds, { base })
+    const result = await backend.reorderChildren(authz.ownerId, id, type, orderedIds, { base })
     if (result.kind === 'bad') {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: `reorder-${result.reason}` })
       return c.json({ error: 'bad-request', message: `orderedIds ${result.reason}` }, 400)
@@ -428,17 +478,8 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
       return c.json(check.body, 400)
     }
     const canvasId = c.req.param('id') ?? ''
-    const actor = resolveActor(c)
-    const owner = authzCanvas(actor, canvasId, 'write')
-    if (!owner) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
-    }
-    const canvas = await backend.get(owner.ownerId, 'canvas', canvasId)
-    if (canvas.kind === 'missing' || canvas.record.isDeleted) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
-    }
+    const authz = await authzCanvas(c, canvasId, 'write')
+    if (!authz.ok) return denyCanvas(c, requestId, t0, authz)
     // N5:If-Match 严格(parseIfMatch;invalid → 400,missing → 428 via backend,value → base)。
     const parsed = parseIfMatch(c.req.header('if-match'))
     if (parsed.kind === 'invalid') {
@@ -446,7 +487,7 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
       return c.json(badIfMatch(childId), 400)
     }
     const base = parsed.kind === 'value' ? parsed.revision : undefined
-    const result = await backend.upsertChild(owner.ownerId, canvasId, type, childId, check.payload, {
+    const result = await backend.upsertChild(authz.ownerId, canvasId, type, childId, check.payload, {
       base,
       method: 'PATCH',
       resourceKind: type,
@@ -489,18 +530,9 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
     if (bad) return badMivo(c, requestId, t0)
     const canvasId = c.req.param('id') ?? ''
     const childId = c.req.param('nodeId') ?? c.req.param('edgeId') ?? c.req.param('anchorId') ?? ''
-    const actor = resolveActor(c)
-    const owner = authzCanvas(actor, canvasId, 'write')
-    if (!owner) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
-    }
-    const canvas = await backend.get(owner.ownerId, 'canvas', canvasId)
-    if (canvas.kind === 'missing' || canvas.record.isDeleted) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
-    }
-    const { deleted } = await backend.hardDeleteChild(owner.ownerId, canvasId, type, childId)
+    const authz = await authzCanvas(c, canvasId, 'write')
+    if (!authz.ok) return denyCanvas(c, requestId, t0, authz)
+    const { deleted } = await backend.hardDeleteChild(authz.ownerId, canvasId, type, childId)
     if (!deleted) {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
       return c.json({ error: `unknown-${type}` } satisfies UnknownResourceBody, 404)
@@ -523,18 +555,9 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
     const bad = rejectInvalidMivoApiKey(c)
     if (bad) return badMivo(c, requestId, t0)
     const canvasId = c.req.param('id') ?? ''
-    const actor = resolveActor(c)
-    const owner = authzCanvas(actor, canvasId, 'read')
-    if (!owner) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
-    }
-    const canvas = await backend.get(owner.ownerId, 'canvas', canvasId)
-    if (canvas.kind === 'missing' || canvas.record.isDeleted) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
-    }
-    const { records } = await backend.listByCanvas(owner.ownerId, canvasId, 'chat-message')
+    const authz = await authzCanvas(c, canvasId, 'read')
+    if (!authz.ok) return denyCanvas(c, requestId, t0, authz)
+    const { records } = await backend.listByCanvas(authz.ownerId, canvasId, 'chat-message')
     logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0 })
     return c.json({ messages: records.map(toEntry) }, 200)
   })
@@ -562,19 +585,10 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
       return c.json({ error: 'bad-request', message: 'message is required' }, 400)
     }
     const canvasId = c.req.param('id') ?? ''
-    const actor = resolveActor(c)
-    const owner = authzCanvas(actor, canvasId, 'write')
-    if (!owner) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
-    }
-    const canvas = await backend.get(owner.ownerId, 'canvas', canvasId)
-    if (canvas.kind === 'missing' || canvas.record.isDeleted) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
-    }
+    const authz = await authzCanvas(c, canvasId, 'write')
+    if (!authz.ok) return denyCanvas(c, requestId, t0, authz)
     // N2:chat route 校验 collection live(未软删)——collection 软删 → unknown-collection 404。
-    if (!(await collectionLive(owner.ownerId, canvasId))) {
+    if (!(await collectionLive(authz.ownerId, canvasId))) {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'unknown-collection' })
       return c.json({ error: 'unknown-collection' } satisfies UnknownResourceBody, 404)
     }
@@ -582,7 +596,7 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
     const id = msg && typeof msg.id === 'string' && msg.id ? msg.id : randomUUID()
     const idempotencyKey = c.req.header('idempotency-key') || undefined
     // N3:ensureCreateChild(canvas_id 校验 existing/idem-replay/cross-canvas 全验)。
-    const result = await backend.ensureCreateChild(owner.ownerId, canvasId, 'chat-message', id, body.message, {
+    const result = await backend.ensureCreateChild(authz.ownerId, canvasId, 'chat-message', id, body.message, {
       method: 'POST',
       resourceKind: 'chat-message',
       idempotencyKey,
@@ -625,17 +639,8 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
     }
     const canvasId = c.req.param('id')
     const msgId = c.req.param('msgId')
-    const actor = resolveActor(c)
-    const owner = authzCanvas(actor, canvasId, 'write')
-    if (!owner) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
-    }
-    const canvas = await backend.get(owner.ownerId, 'canvas', canvasId)
-    if (canvas.kind === 'missing' || canvas.record.isDeleted) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
-    }
+    const authz = await authzCanvas(c, canvasId, 'write')
+    if (!authz.ok) return denyCanvas(c, requestId, t0, authz)
     // N5:If-Match 严格(invalid → 400,missing → 428,value → base)。
     const parsed = parseIfMatch(c.req.header('if-match'))
     if (parsed.kind === 'invalid') {
@@ -643,7 +648,7 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
       return c.json(badIfMatch(msgId), 400)
     }
     const base = parsed.kind === 'value' ? parsed.revision : undefined
-    const result = await backend.upsertChild(owner.ownerId, canvasId, 'chat-message', msgId, decoded.value.payload, {
+    const result = await backend.upsertChild(authz.ownerId, canvasId, 'chat-message', msgId, decoded.value.payload, {
       base,
       method: 'PATCH',
       resourceKind: 'chat-message',
@@ -656,7 +661,7 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
       return c.json(err, 422)
     }
     if (result.kind === 'cross-canvas') {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'cross-canvas' })
       return c.json({ error: 'unknown-message' } satisfies UnknownResourceBody, 404)
     }
     if (result.kind === 'precondition-required') {
@@ -682,18 +687,9 @@ export const createCanvasRoutes = ({ backend }: { backend: PersistBackend }): Ho
     if (bad) return badMivo(c, requestId, t0)
     const canvasId = c.req.param('id')
     const msgId = c.req.param('msgId')
-    const actor = resolveActor(c)
-    const owner = authzCanvas(actor, canvasId, 'write')
-    if (!owner) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
-    }
-    const canvas = await backend.get(owner.ownerId, 'canvas', canvasId)
-    if (canvas.kind === 'missing' || canvas.record.isDeleted) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
-    }
-    const { deleted } = await backend.hardDeleteChild(owner.ownerId, canvasId, 'chat-message', msgId)
+    const authz = await authzCanvas(c, canvasId, 'write')
+    if (!authz.ok) return denyCanvas(c, requestId, t0, authz)
+    const { deleted } = await backend.hardDeleteChild(authz.ownerId, canvasId, 'chat-message', msgId)
     if (!deleted) {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
       return c.json({ error: 'unknown-message' } satisfies UnknownResourceBody, 404)

@@ -31,8 +31,11 @@ import { tasksRoute } from './routes/tasks'
 import { createProjectsRoutes } from './routes/projects'
 import { createCanvasRoutes } from './routes/canvas'
 import { createUserStateRoutes } from './routes/userState'
+import { createMembersRoutes } from './routes/members'
+import { createShareLinksRoutes, createShareAccessRoutes } from './routes/shareLinks'
 import { createPersistBackend, type PersistBackend } from './persist/backend'
 import { resolvePersistBackendConfig } from './persist/pgConfig'
+import { createPermissionBackend, type PermissionBackend } from './lib/permissions'
 
 const featureFlags = resolveFeatureFlags()
 
@@ -52,6 +55,19 @@ if (persistBackendConfig.kind === 'pg' && persistBackendConfig.pg) {
   sharedPersistBackend = createPersistBackend()
 }
 export { sharedPersistBackend }
+
+// T1.4: shared permission backend (project_members + share_links)。组合注入:权限后端选择随
+// MIVO_PERSIST_BACKEND 同开关(pg → PgPermissionBackend 动态加载;默认 memory 生产零变化)。
+// PG 启用时与 PgPersistBackend 共存(两者连同一 DB;各自跑 migrations,kysely_migration 追踪表幂等)。
+// Exported so tests can __reset() between cases (同 sharedPersistBackend)。
+let sharedPermissionBackend: PermissionBackend
+if (persistBackendConfig.kind === 'pg' && persistBackendConfig.pg) {
+  const { PgPermissionBackend } = await import('./persist/pgPermissionBackend')
+  sharedPermissionBackend = new PgPermissionBackend(persistBackendConfig.pg)
+} else {
+  sharedPermissionBackend = createPermissionBackend()
+}
+export { sharedPermissionBackend }
 
 export const app = new Hono<AppEnv>()
 
@@ -119,9 +135,15 @@ app.route('/api/keys', keysRoute)
 // fallback so /api/* matches before the SPA history fallback. Owner scope via
 // resolveOwner (FX-2 mivo-key fingerprint; §13.5 target = maker user id). Contract:
 // docs/decisions/api-surface.md.
-app.route('/api/projects', createProjectsRoutes({ backend: sharedPersistBackend }))
-app.route('/api/canvas', createCanvasRoutes({ backend: sharedPersistBackend }))
+// T1.4: routes 接 sharedPermissionBackend(memberRole + sharePermission + per-action 矩阵);
+// members / share-links 子资源同挂 /api/projects;公开分享入口挂 /api/share(无鉴权,token 驱动)。
+app.route('/api/projects', createProjectsRoutes({ backend: sharedPersistBackend, permissions: sharedPermissionBackend }))
+app.route('/api/projects', createMembersRoutes({ backend: sharedPersistBackend, permissions: sharedPermissionBackend }))
+app.route('/api/projects', createShareLinksRoutes({ backend: sharedPersistBackend, permissions: sharedPermissionBackend }))
+app.route('/api/canvas', createCanvasRoutes({ backend: sharedPersistBackend, permissions: sharedPermissionBackend }))
 app.route('/api/user-state', createUserStateRoutes({ backend: sharedPersistBackend }))
+// T1.4: 公开分享访问入口(GET /api/share/:token;无鉴权,token 驱动;revoked→410,unknown→404)。
+app.route('/api/share', createShareAccessRoutes({ backend: sharedPersistBackend, permissions: sharedPermissionBackend }))
 
 // Same-origin static hosting of dist/ (Vite build output). serveStatic only
 // accepts a root relative to cwd and calls next() on miss, letting the SPA

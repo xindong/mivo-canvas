@@ -1225,6 +1225,10 @@ export class PgPersistBackend implements PersistBackend {
     this.projectIndex.clear()
     this.canvasIndex.clear()
     return this.db.transaction().execute(async (trx) => {
+      // T1.4:permission 两表(project_members/share_links)FK→projects(id);须先 drop,否则 DROP projects 被 FK 引用阻。
+      // permission 表不在本 backend Database 类型内,但 schema.dropTable 按表名操作,无需类型登记(同 kysely_migration)。
+      await trx.schema.dropTable('share_links').ifExists().execute()
+      await trx.schema.dropTable('project_members').ifExists().execute()
       await trx.schema.dropTable('idempotency_index').ifExists().execute()
       await trx.schema.dropTable('canvases').ifExists().execute()
       await trx.schema.dropTable('projects').ifExists().execute()
