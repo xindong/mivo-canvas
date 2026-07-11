@@ -46,6 +46,18 @@ async function ensureUnitDb(): Promise<void> {
   }
 }
 
+/** F5 断言用:直接查 canvases 瘦索引表的 is_deleted(绕过缓存,验 DB 事实)。null=行不存在。 */
+async function canvasTableIsDeleted(id: string): Promise<boolean | null> {
+  const cfg = pgConn()
+  const pool = new Pool({ host: cfg.host, port: cfg.port, database: cfg.database, user: cfg.user, password: cfg.password, max: 1 })
+  try {
+    const r = await pool.query('SELECT is_deleted FROM canvases WHERE id = $1', [id])
+    return r.rowCount === 0 ? null : Boolean(r.rows[0].is_deleted)
+  } finally {
+    await pool.end()
+  }
+}
+
 ;(PG_TEST_ENABLED ? describe : describe.skip)('PgPersistBackend — PG 专有性质', () => {
   let pg: PgPersistBackend
   beforeAll(async () => {
@@ -270,5 +282,134 @@ async function ensureUnitDb(): Promise<void> {
     expect(orderKeys).toEqual([0, 1, 2])
     const list = await pg.listByCanvas('o', 'c1', 'node')
     expect(list.records.map((r) => r.orderKey)).toEqual([0, 1, 2])
+  })
+
+  // ── 返修三 F1-F5(第三轮复审:race guard / 幽灵授权索引 / 跨 owner upsert / 并发重建 / 级联瘦索引)──
+
+  it('F1 软删后幂等 replay 真恢复(project + canvas;race guard 不误杀 replay-deleted)', async () => {
+    // project:replay-deleted 不再重插 idem key(否则 INSERT DO NOTHING→null→IdempotencyRaceLost→回滚恢复→外层映射 existing,但 DB 仍 is_deleted=true)。
+    const oP = { method: 'POST', resourceKind: 'project', idempotencyKey: 'k-p', bodyFingerprint: 'fp-p' }
+    expect((await pg.ensureCreate('o', 'project', 'p1', { name: 'P' }, oP)).kind).toBe('created')
+    await pg.softDeleteProjectTree('o', 'p1')
+    // 修复前:返 existing 但 get().isDeleted=true;修复后:restored + isDeleted=false。
+    const rp = await pg.ensureCreate('o', 'project', 'p1', { name: 'P' }, oP)
+    expect(rp.kind).toBe('restored')
+    const gp = await pg.get('o', 'project', 'p1')
+    expect(gp.kind).toBe('found')
+    if (gp.kind === 'found') expect(gp.record.isDeleted).toBe(false)
+    // canvas(createCanvasWithCollection replay-deleted;project p2 独立保持 live)
+    await pg.ensureCreate('o', 'project', 'p2', { name: 'P2' }, { method: 'POST', resourceKind: 'project' })
+    const oC = { method: 'POST', resourceKind: 'canvas', idempotencyKey: 'k-c', bodyFingerprint: 'fpc' }
+    expect((await pg.createCanvasWithCollection('o', 'c1', { projectId: 'p2' }, oC)).kind).toBe('created')
+    await pg.softDeleteCanvasTree('o', 'c1')
+    const rc = await pg.createCanvasWithCollection('o', 'c1', { projectId: 'p2' }, oC)
+    expect(rc.kind).toBe('restored')
+    const gc = await pg.get('o', 'canvas', 'c1')
+    expect(gc.kind).toBe('found')
+    if (gc.kind === 'found') expect(gc.record.isDeleted).toBe(false)
+  })
+
+  it('F2 tree 方法 no-op/错 owner 不产生幽灵授权索引(缓存信 DB 不信入参)', async () => {
+    // missing id → count=0,无幽灵(修复前:getProjectOwner('missing')={ownerId:'ghost'})
+    const sp = await pg.softDeleteProjectTree('ghost', 'missing')
+    expect(sp.count).toBe(0)
+    expect(pg.getProjectOwner('missing')).toBeUndefined()
+    expect(pg.__projectCacheEntry('missing')).toBeUndefined()
+    const sc = await pg.softDeleteCanvasTree('ghost', 'missing')
+    expect(sc.count).toBe(0)
+    expect(pg.getCanvasOwner('missing')).toBeUndefined()
+    expect(pg.__canvasCacheEntry('missing')).toBeUndefined()
+    await pg.restoreProjectTree('ghost', 'missing')
+    expect(pg.getProjectOwner('missing')).toBeUndefined()
+    await pg.restoreCanvasTree('ghost', 'missing')
+    expect(pg.getCanvasOwner('missing')).toBeUndefined()
+    // 错 owner 不污染他人索引(alice 的 project/canvas 不被 bob 触动;缓存归属 + live 状态不变)
+    await pg.ensureCreate('alice', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+    await pg.createCanvasWithCollection('alice', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+    const spb = await pg.softDeleteProjectTree('bob', 'p1') // 错 owner,count=0
+    expect(spb.count).toBe(0)
+    expect(pg.getProjectOwner('p1')?.ownerId).toBe('alice')
+    expect(pg.projectLive('alice', 'p1')).toBe(true)
+    const scb = await pg.softDeleteCanvasTree('bob', 'c1') // 错 owner,count=0
+    expect(scb.count).toBe(0)
+    expect(pg.getCanvasOwner('c1')?.ownerId).toBe('alice')
+    expect(pg.__canvasCacheEntry('c1')?.isDeleted).toBe(false)
+    // 错 owner restore 也不产生幽灵
+    await pg.restoreProjectTree('bob', 'p1')
+    expect(pg.getProjectOwner('p1')?.ownerId).toBe('alice')
+    await pg.restoreCanvasTree('bob', 'c1')
+    expect(pg.getCanvasOwner('c1')?.ownerId).toBe('alice')
+    expect(pg.__canvasCacheEntry('c1')?.isDeleted).toBe(false)
+  })
+
+  it('F3 跨 owner upsert 同 id → exists-other-owner(不跨 owner insert、不覆盖缓存/DB;重启 warm 一致)', async () => {
+    await pg.ensureCreate('ownerA', 'project', 'shared', { name: 'A' }, { method: 'POST', resourceKind: 'project' })
+    // B upsert 同 id(missing for B)→ exists-other-owner(修复前:返 created + 缓存覆盖成 B + persist_records 进 B 的行,重启 warm 分叉成 A)
+    const b = await pg.upsert('ownerB', 'project', 'shared', { name: 'B' }, { method: 'PUT', resourceKind: 'project' })
+    expect(b.kind).toBe('exists-other-owner')
+    if (b.kind === 'exists-other-owner') expect(b.record.ownerId).toBe('ownerA')
+    // 缓存不变
+    expect(pg.getProjectOwner('shared')?.ownerId).toBe('ownerA')
+    // DB 不变:B 无 record,A record 完好 live
+    expect((await pg.get('ownerB', 'project', 'shared')).kind).toBe('missing')
+    const a = await pg.get('ownerA', 'project', 'shared')
+    expect(a.kind).toBe('found')
+    if (a.kind === 'found') expect(a.record.isDeleted).toBe(false)
+    // 重启 warm 一致(owner 仍 A)
+    const pgB = new PgPersistBackend(pgConn())
+    await pgB.migrate()
+    await pgB.ready
+    expect(pgB.getProjectOwner('shared')?.ownerId).toBe('ownerA')
+    await pgB.destroy()
+    // canvas 同型(B 用自己 live 的 pB 作父 project,过 F1 parent 检查 → 触达 F3 全局 owner 检查)
+    await pg.ensureCreate('ownerA', 'project', 'pA', { name: 'PA' }, { method: 'POST', resourceKind: 'project' })
+    await pg.createCanvasWithCollection('ownerA', 'c-shared', { projectId: 'pA' }, { method: 'POST', resourceKind: 'canvas' })
+    await pg.ensureCreate('ownerB', 'project', 'pB', { name: 'PB' }, { method: 'POST', resourceKind: 'project' })
+    const bc = await pg.upsert('ownerB', 'canvas', 'c-shared', { projectId: 'pB' }, { method: 'PUT', resourceKind: 'canvas' })
+    expect(bc.kind).toBe('exists-other-owner')
+    if (bc.kind === 'exists-other-owner') expect(bc.record.ownerId).toBe('ownerA')
+    expect(pg.getCanvasOwner('c-shared')?.ownerId).toBe('ownerA')
+  })
+
+  it('F4 软删态同 ID 并发重建:稳定一 restored 一 existing(rowCount 定输赢)', async () => {
+    await pg.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+    await pg.softDeleteProjectTree('o', 'p1')
+    // 修复前:UPDATE 命中一次却双双报 restored(restoreMetaInTrx affected=0 仍返 restored);修复后:rowCount 0 → existing,稳定一 restored 一 existing。
+    const [a, b] = await Promise.all([
+      pg.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' }),
+      pg.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' }),
+    ])
+    expect([a.kind, b.kind].sort()).toEqual(['existing', 'restored'])
+    expect(pg.projectLive('o', 'p1')).toBe(true)
+    // canvas 同型(createCanvasWithCollection 并发重建软删 canvas;project p2 保持 live)
+    await pg.ensureCreate('o', 'project', 'p2', { name: 'P2' }, { method: 'POST', resourceKind: 'project' })
+    await pg.createCanvasWithCollection('o', 'c2', { projectId: 'p2' }, { method: 'POST', resourceKind: 'canvas' })
+    await pg.softDeleteCanvasTree('o', 'c2')
+    const [ca, cb] = await Promise.all([
+      pg.createCanvasWithCollection('o', 'c2', { projectId: 'p2' }, { method: 'POST', resourceKind: 'canvas' }),
+      pg.createCanvasWithCollection('o', 'c2', { projectId: 'p2' }, { method: 'POST', resourceKind: 'canvas' }),
+    ])
+    expect([ca.kind, cb.kind].sort()).toEqual(['existing', 'restored'])
+  })
+
+  it('F5 project 级联删/恢复后 canvas 瘦索引(表+缓存)与 DB 一致', async () => {
+    await pg.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+    await pg.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+    expect(await canvasTableIsDeleted('c1')).toBe(false)
+    // 级联软删:canvas meta(persist_records)+ canvases 瘦索引表 + 缓存 全部 is_deleted=true
+    // (修复前:只 set project 缓存,canvases 表/缓存不动 → canvases 表 is_deleted 仍 false、canvasIndex[c1] 仍 false,与 DB persist_records 分叉)
+    await pg.softDeleteProjectTree('o', 'p1')
+    expect(await canvasTableIsDeleted('c1')).toBe(true)
+    expect(pg.__canvasCacheEntry('c1')?.isDeleted).toBe(true)
+    const cv = await pg.get('o', 'canvas', 'c1')
+    expect(cv.kind).toBe('found')
+    if (cv.kind === 'found') expect(cv.record.isDeleted).toBe(true)
+    // 级联恢复:全部 is_deleted=false(表+缓存+persist_records 一致)
+    await pg.restoreProjectTree('o', 'p1')
+    expect(await canvasTableIsDeleted('c1')).toBe(false)
+    expect(pg.__canvasCacheEntry('c1')?.isDeleted).toBe(false)
+    const cv2 = await pg.get('o', 'canvas', 'c1')
+    expect(cv2.kind).toBe('found')
+    if (cv2.kind === 'found') expect(cv2.record.isDeleted).toBe(false)
   })
 })

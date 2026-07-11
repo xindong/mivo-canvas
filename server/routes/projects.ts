@@ -234,6 +234,12 @@ export const createProjectsRoutes = ({ backend }: { backend: PersistBackend }): 
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 409, latencyMs: Date.now() - t0, note: 'rev-conflict' })
       return c.json(err, 409)
     }
+    // F3 防御:upsert missing 跨 owner 同 id → 409 project-exists(route 层 authz+预检已阻,backend 防御性)。
+    if (result.kind === 'exists-other-owner') {
+      const err = { error: 'project-exists' as const, id }
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 409, latencyMs: Date.now() - t0, note: 'project-exists' })
+      return c.json(err, 409)
+    }
     // F1 防御:project PATCH 无父 project,parent-not-live 不可达;类型收窄。
     if (result.kind === 'parent-not-live') {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'parent-not-live' })

@@ -441,9 +441,11 @@ export class PgPersistBackend implements PersistBackend {
                 if (opts.bodyFingerprint && entry.fingerprint !== opts.bodyFingerprint) return { kind: 'reuse-conflict' }
                 // N2:幂等命中 deleted → 真恢复(undelete + bump + restore tree);非 deleted → 返既有不 bump。
                 if (r.is_deleted) {
-                  const restored = await this.restoreMetaInTrx(trx, ownerId, type, id, payload, opts)
-                  await this.setIdempotencyEntryInTrx(trx, ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, opts.bodyFingerprint ?? '', ownerId, type, id)
-                  return { kind: 'restored', record: this.withIdem(restored, opts) }
+                  // F1:replay 命中 deleted → 真恢复。idem 条目已存在(:436 读到),不重插(INSERT DO NOTHING→null→误判
+                  //   race loser→回滚恢复,外层映射 existing → 返成功但资源仍删除态)。entry fingerprint 已验(:441),无需更新。
+                  // F4:按 restoreMetaInTrx 的 rowCount 定输赢——0 行(并发赢家已恢复)→ existing,非 0 → restored。
+                  const { record: restoredRec, restored } = await this.restoreMetaInTrx(trx, ownerId, type, id, payload, opts)
+                  return { kind: restored ? 'restored' : 'existing', record: this.withIdem(restoredRec, opts) }
                 }
                 return { kind: 'existing', record: this.withIdem(rowToRecord(r), opts) }
               }
@@ -467,10 +469,10 @@ export class PgPersistBackend implements PersistBackend {
             return { kind: 'existing', record: this.withIdem(rowToRecord(existing), opts) }
           }
           if (existing && existing.is_deleted) {
-            // N2:backend 原子 create-or-restore-tree。
-            const restored = await this.restoreMetaInTrx(trx, ownerId, type, id, payload, opts)
+            // N2:backend 原子 create-or-restore-tree。F4:rowCount 定输赢(并发赢家已恢复→existing)。
+            const { record: restoredRec, restored } = await this.restoreMetaInTrx(trx, ownerId, type, id, payload, opts)
             await this.setIdempotencyEntryInTrx(trx, ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, opts.bodyFingerprint ?? '', ownerId, type, id)
-            return { kind: 'restored', record: this.withIdem(restored, opts) }
+            return { kind: restored ? 'restored' : 'existing', record: this.withIdem(restoredRec, opts) }
           }
           // 不存在 → created(revision 0;orderKey 0 for meta;createdAt/updatedAt = now)。
           // Greptile P1(全局索引竞争):project/canvas 全局唯一索引先建(doNothing+returning);若 returning 空(跨事务
@@ -517,9 +519,9 @@ export class PgPersistBackend implements PersistBackend {
             const r = await trx.selectFrom('persist_records').selectAll().where('owner_id', '=', ownerId).where('type', '=', type).where('id', '=', id).executeTakeFirst()
             if (r) {
               if (r.is_deleted) {
-                const restored = await this.restoreMetaInTrx(trx, ownerId, type, id, payload, opts)
+                const { record: restoredRec, restored } = await this.restoreMetaInTrx(trx, ownerId, type, id, payload, opts)
                 await this.setIdempotencyEntryInTrx(trx, ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, opts.bodyFingerprint ?? '', ownerId, type, id)
-                return { kind: 'restored', record: this.withIdem(restored, opts) }
+                return { kind: restored ? 'restored' : 'existing', record: this.withIdem(restoredRec, opts) }
               }
               await this.setIdempotencyEntryInTrx(trx, ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, opts.bodyFingerprint ?? '', ownerId, type, id)
               return { kind: 'existing', record: this.withIdem(rowToRecord(r), opts) }
@@ -548,6 +550,7 @@ export class PgPersistBackend implements PersistBackend {
   /**
    * N2 私有 helper(事务内):meta record(project/canvas/chat-collection)恢复。
    * project/canvas → restoreProjectTree/restoreCanvasTreeInTrx(单 record + 子树);chat-collection → 单 record undelete+bump+payload。
+   * F4:返 { record, restored }——restored = meta UPDATE rowCount>0(并发赢家已恢复→0 行→调用方返 existing,不再误报 restored)。
    */
   private async restoreMetaInTrx(
     trx: Kysely<Database>,
@@ -556,26 +559,29 @@ export class PgPersistBackend implements PersistBackend {
     id: string,
     payload: unknown,
     opts: { canvasId?: string | null; scope?: PersistScope; idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string },
-  ): Promise<PersistRecord> {
+  ): Promise<{ record: PersistRecord; restored: boolean }> {
+    let restored: boolean
     if (type === 'project') {
-      const { count } = await this.restoreProjectTreeInTrx(trx, ownerId, id, { payload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint })
-      void count
+      const { metaRestored } = await this.restoreProjectTreeInTrx(trx, ownerId, id, { payload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint })
+      restored = metaRestored
     } else if (type === 'canvas') {
-      const { count } = await this.restoreCanvasTreeInTrx(trx, ownerId, id, { payload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint })
-      void count
+      const { metaRestored } = await this.restoreCanvasTreeInTrx(trx, ownerId, id, { payload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint })
+      restored = metaRestored
     } else {
-      // chat-collection / leaf meta:单 record undelete + bump + payload。
-      await trx
+      // chat-collection / leaf meta:单 record undelete + bump + payload。F4:WHERE is_deleted=true + rowCount 定输赢(0 行=并发赢家已恢复)。
+      const upd = await trx
         .updateTable('persist_records')
         .set({ payload: JSON.stringify(payload), is_deleted: false, revision: sql`revision + 1`, updated_at: new Date(), canvas_id: opts.canvasId ?? sql`canvas_id`, scope: opts.scope ?? sql`scope` })
         .where('owner_id', '=', ownerId)
         .where('type', '=', type)
         .where('id', '=', id)
-        .execute()
+        .where('is_deleted', '=', true)
+        .executeTakeFirst()
+      restored = (upd?.numUpdatedRows ?? 0n) > 0n
     }
     const r = await trx.selectFrom('persist_records').selectAll().where('owner_id', '=', ownerId).where('type', '=', type).where('id', '=', id).executeTakeFirst()
     if (!r) throw new Error(`restoreMetaInTrx: ${type}:${id} missing post-restore`)
-    return rowToRecord(r)
+    return { record: rowToRecord(r), restored }
   }
 
   async createCanvasWithCollection(
@@ -608,13 +614,13 @@ export class PgPersistBackend implements PersistBackend {
                 if (r.is_deleted) {
                   const pid2 = asCanvasMeta(canvasPayload)?.projectId
                   if (pid2 && !(await this.projectLiveInTrx(trx, ownerId, pid2))) return { kind: 'parent-not-live' }
-                  const restored = await this.restoreCanvasTreeInTrx(trx, ownerId, canvasId, { payload: canvasPayload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint })
+                  // F1:replay 命中 deleted → 真恢复。idem 条目已存在(:602 读到),不重插(否则误判 race loser→回滚恢复)。
+                  // F4:按 restoreCanvasTreeInTrx 的 rowCount 定输赢——0 行(并发赢家已恢复)→ existing。
+                  const { metaRestored } = await this.restoreCanvasTreeInTrx(trx, ownerId, canvasId, { payload: canvasPayload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint })
                   await this.ensureCollectionLiveInTrx(trx, ownerId, canvasId)
-                  await this.setIdempotencyEntryInTrx(trx, ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, opts.bodyFingerprint ?? '', ownerId, 'canvas', canvasId)
                   const rec = await trx.selectFrom('persist_records').selectAll().where('owner_id', '=', ownerId).where('type', '=', 'canvas').where('id', '=', canvasId).executeTakeFirst()
                   if (!rec) throw new Error('createCanvasWithCollection: post-restore canvas missing')
-                  void restored
-                  return { kind: 'restored', record: this.withIdem(rowToRecord(rec), opts) }
+                  return { kind: metaRestored ? 'restored' : 'existing', record: this.withIdem(rowToRecord(rec), opts) }
                 }
                 // existing live:collection 已随 canvas 原子创建;ensureCollectionLive 防御旧数据。
                 await this.ensureCollectionLiveInTrx(trx, ownerId, canvasId)
@@ -630,14 +636,13 @@ export class PgPersistBackend implements PersistBackend {
             return { kind: 'existing', record: this.withIdem(rowToRecord(existing), opts) }
           }
           if (existing && existing.is_deleted) {
-            // N2/F1:parent live(已验 F1)→ restored(事务内 restore + ensureCollectionLive)。
-            const restored = await this.restoreCanvasTreeInTrx(trx, ownerId, canvasId, { payload: canvasPayload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint })
+            // N2/F1:parent live(已验 F1)→ restored(事务内 restore + ensureCollectionLive)。F4:rowCount 定输赢(并发赢家已恢复→existing)。
+            const { metaRestored } = await this.restoreCanvasTreeInTrx(trx, ownerId, canvasId, { payload: canvasPayload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint })
             await this.ensureCollectionLiveInTrx(trx, ownerId, canvasId)
             await this.setIdempotencyEntryInTrx(trx, ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, opts.bodyFingerprint ?? '', ownerId, 'canvas', canvasId)
-            void restored
             const rec = await trx.selectFrom('persist_records').selectAll().where('owner_id', '=', ownerId).where('type', '=', 'canvas').where('id', '=', canvasId).executeTakeFirst()
             if (!rec) throw new Error('createCanvasWithCollection: post-restore canvas missing')
-            return { kind: 'restored', record: this.withIdem(rowToRecord(rec), opts) }
+            return { kind: metaRestored ? 'restored' : 'existing', record: this.withIdem(rowToRecord(rec), opts) }
           }
           // 不存在 → 原子 created(canvas meta + chat-collection + canvases 全局索引 同一事务;失败全回滚,无 partial,无 orphan)。
           // Greptile P1(全局索引竞争):canvases 全局索引先建(doNothing+returning);若 returning 空(跨事务 race 被吞)
@@ -663,13 +668,13 @@ export class PgPersistBackend implements PersistBackend {
             if (r) {
               await this.ensureCollectionLiveInTrx(trx, ownerId, canvasId)
               if (r.is_deleted) {
-                const restored = await this.restoreCanvasTreeInTrx(trx, ownerId, canvasId, { payload: canvasPayload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint })
+                // F4:rowCount 定输赢(并发赢家已恢复→existing)。
+                const { metaRestored } = await this.restoreCanvasTreeInTrx(trx, ownerId, canvasId, { payload: canvasPayload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint })
                 await this.ensureCollectionLiveInTrx(trx, ownerId, canvasId)
                 await this.setIdempotencyEntryInTrx(trx, ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, opts.bodyFingerprint ?? '', ownerId, 'canvas', canvasId)
-                void restored
                 const rec = await trx.selectFrom('persist_records').selectAll().where('owner_id', '=', ownerId).where('type', '=', 'canvas').where('id', '=', canvasId).executeTakeFirst()
                 if (!rec) throw new Error('createCanvasWithCollection: post-restore canvas missing')
-                return { kind: 'restored', record: this.withIdem(rowToRecord(rec), opts) }
+                return { kind: metaRestored ? 'restored' : 'existing', record: this.withIdem(rowToRecord(rec), opts) }
               }
               await this.setIdempotencyEntryInTrx(trx, ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, opts.bodyFingerprint ?? '', ownerId, 'canvas', canvasId)
               return { kind: 'existing', record: this.withIdem(rowToRecord(r), opts) }
@@ -732,12 +737,13 @@ export class PgPersistBackend implements PersistBackend {
                 if (r.canvas_id !== canvasId) return { kind: 'cross-canvas' }
                 if (opts.bodyFingerprint && entry.fingerprint !== opts.bodyFingerprint) return { kind: 'reuse-conflict' }
                 if (r.is_deleted) {
-                  await trx.updateTable('persist_records').set({ payload: JSON.stringify(payload), is_deleted: false, revision: sql`revision + 1`, updated_at: new Date(), canvas_id: canvasId }).where('owner_id', '=', ownerId).where('type', '=', type).where('id', '=', id).execute()
-                  await this.bumpCanvasContentVersionInTrx(trx, ownerId, canvasId)
-                  await this.setIdempotencyEntryInTrx(trx, ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, opts.bodyFingerprint ?? '', ownerId, type, id)
+                  // F1:replay 命中 deleted → 真恢复。idem 条目已存在(:728 读到),不重插(否则误判 race loser→回滚恢复)。
+                  // F4:WHERE is_deleted=true + rowCount 定输赢——0 行(并发赢家已恢复)→ existing,非 0 → restored(并 bump contentVersion)。
+                  const upd = await trx.updateTable('persist_records').set({ payload: JSON.stringify(payload), is_deleted: false, revision: sql`revision + 1`, updated_at: new Date(), canvas_id: canvasId }).where('owner_id', '=', ownerId).where('type', '=', type).where('id', '=', id).where('is_deleted', '=', true).executeTakeFirst()
+                  if ((upd?.numUpdatedRows ?? 0n) > 0n) await this.bumpCanvasContentVersionInTrx(trx, ownerId, canvasId)
                   const rec = await trx.selectFrom('persist_records').selectAll().where('owner_id', '=', ownerId).where('type', '=', type).where('id', '=', id).executeTakeFirst()
                   if (!rec) throw new Error('ensureCreateChild: post-restore missing')
-                  return { kind: 'restored', record: this.withIdem(rowToRecord(rec), opts) }
+                  return { kind: (upd?.numUpdatedRows ?? 0n) > 0n ? 'restored' : 'existing', record: this.withIdem(rowToRecord(rec), opts) }
                 }
                 return { kind: 'existing', record: this.withIdem(rowToRecord(r), opts) }
               }
@@ -751,12 +757,13 @@ export class PgPersistBackend implements PersistBackend {
             return { kind: 'existing', record: this.withIdem(rowToRecord(existing), opts) }
           }
           if (existing && existing.is_deleted) {
-            await trx.updateTable('persist_records').set({ payload: JSON.stringify(payload), is_deleted: false, revision: sql`revision + 1`, updated_at: new Date(), canvas_id: canvasId }).where('owner_id', '=', ownerId).where('type', '=', type).where('id', '=', id).execute()
+            // F4:WHERE is_deleted=true + rowCount 定输赢(并发赢家已恢复→existing;赢家 bump,输家不 bump)。
+            const upd = await trx.updateTable('persist_records').set({ payload: JSON.stringify(payload), is_deleted: false, revision: sql`revision + 1`, updated_at: new Date(), canvas_id: canvasId }).where('owner_id', '=', ownerId).where('type', '=', type).where('id', '=', id).where('is_deleted', '=', true).executeTakeFirst()
             await this.setIdempotencyEntryInTrx(trx, ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, opts.bodyFingerprint ?? '', ownerId, type, id)
-            await this.bumpCanvasContentVersionInTrx(trx, ownerId, canvasId)
+            if ((upd?.numUpdatedRows ?? 0n) > 0n) await this.bumpCanvasContentVersionInTrx(trx, ownerId, canvasId)
             const rec = await trx.selectFrom('persist_records').selectAll().where('owner_id', '=', ownerId).where('type', '=', type).where('id', '=', id).executeTakeFirst()
             if (!rec) throw new Error('ensureCreateChild: post-restore missing')
-            return { kind: 'restored', record: this.withIdem(rowToRecord(rec), opts) }
+            return { kind: (upd?.numUpdatedRows ?? 0n) > 0n ? 'restored' : 'existing', record: this.withIdem(rowToRecord(rec), opts) }
           }
           // 不存在 → created(orderKey 分配,#6)。
           const orderKey = await this.nextOrderKeyInTrx(trx, ownerId, canvasId, type)
@@ -811,6 +818,21 @@ export class PgPersistBackend implements PersistBackend {
           const existing = await trx.selectFrom('persist_records').selectAll().where('owner_id', '=', ownerId).where('type', '=', type).where('id', '=', id).executeTakeFirst()
           const scope: PersistScope = opts.scope ?? 'document'
           const canvasId = opts.canvasId ?? null
+          // F3:upsert missing 路径全局 owner 检查——id 已属他人 → exists-other-owner(不跨 owner insert、不覆盖缓存;
+          //   route → 409 project-exists/canvas-exists,与 ensureCreate 同语义;route 层 authz+预检已阻,backend 防御性拒绝)。
+          if (!existing && type === 'project') {
+            const g = await trx.selectFrom('projects').select('owner_id').where('id', '=', id).executeTakeFirst()
+            if (g && g.owner_id !== ownerId) {
+              const r = await trx.selectFrom('persist_records').selectAll().where('owner_id', '=', g.owner_id).where('type', '=', 'project').where('id', '=', id).executeTakeFirst()
+              if (r) return { kind: 'exists-other-owner', record: rowToRecord(r) }
+            }
+          } else if (!existing && type === 'canvas') {
+            const g = await trx.selectFrom('canvases').select('owner_id').where('id', '=', id).executeTakeFirst()
+            if (g && g.owner_id !== ownerId) {
+              const r = await trx.selectFrom('persist_records').selectAll().where('owner_id', '=', g.owner_id).where('type', '=', 'canvas').where('id', '=', id).executeTakeFirst()
+              if (r) return { kind: 'exists-other-owner', record: rowToRecord(r) }
+            }
+          }
           // missing 或软删 → create(revision max(0,base),返修 #5;canvas 保留 contentVersion)。
           if (!existing || existing.is_deleted) {
             const base = opts.base ?? 0
@@ -876,9 +898,9 @@ export class PgPersistBackend implements PersistBackend {
           await this.setIdempotencyEntryInTrx(trx, ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, opts.bodyFingerprint ?? '', ownerId, type, id)
           return { kind: 'updated', record: this.withIdem(rowToRecord(updated), opts) }
         })
-        // P1-5:post-commit 定点 cache mutation(project/canvas create → isDeleted=false)。
+        // P1-5/F3:post-commit 定点 cache mutation(project/canvas create → isDeleted=false);用 DB 返回的 ownerId(非入参),F3 跨 owner 检查已确保 create 仅为本 owner。
         if (result.kind === 'created' && (type === 'project' || type === 'canvas')) {
-          this.setIndexEntry(type, id, ownerId, false)
+          this.setIndexEntry(type, id, result.record.ownerId, false)
         }
         return result
       },
@@ -1078,40 +1100,50 @@ export class PgPersistBackend implements PersistBackend {
   // ── 返修 #7/N2:原子 tree 软删/恢复(单事务,失败全回滚)──────────────────────────────
 
   async softDeleteCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number }> {
+    await this.ready
     const res = await this.db.transaction().execute(async (trx) => {
       const r = await trx.updateTable('persist_records').set({ is_deleted: true, revision: sql`revision + 1`, updated_at: new Date() }).where('owner_id', '=', ownerId).where('type', '=', 'canvas').where('id', '=', canvasId).where('is_deleted', '=', false).executeTakeFirst()
       const c = await trx.updateTable('persist_records').set({ is_deleted: true, revision: sql`revision + 1`, updated_at: new Date() }).where('owner_id', '=', ownerId).where('type', '=', 'chat-collection').where('canvas_id', '=', canvasId).where('is_deleted', '=', false).executeTakeFirst()
-      // canvases 全局索引表软删;缓存同步由 post-commit 定点 mutation(P1-5)。
-      await trx.updateTable('canvases').set({ is_deleted: true, updated_at: new Date() }).where('id', '=', canvasId).where('is_deleted', '=', false).execute()
+      // F2:canvases 瘦索引 owner-scoped + is_deleted=false + returning;0 行(不存在/已删/错 owner)→ undefined(调用方不碰缓存,无幽灵授权索引)。
+      const idx = await trx.updateTable('canvases').set({ is_deleted: true, updated_at: new Date() }).where('id', '=', canvasId).where('owner_id', '=', ownerId).where('is_deleted', '=', false).returning('owner_id').executeTakeFirst()
       const count = Number((r?.numUpdatedRows ?? 0n) > 0n ? 1n : 0n) + Number((c?.numUpdatedRows ?? 0n) > 0n ? 1n : 0n)
-      return { count }
+      return { count, canvasIdxOwner: idx?.owner_id }
     })
-    // P1-5:post-commit 定点 cache mutation(canvas 软删 → isDeleted=true;纯内存,不可失败)。
-    this.setIndexEntry('canvas', canvasId, ownerId, true)
-    return res
+    // F2/P1-5:post-commit 仅当事务实际命中 durable 行(用 DB owner_id);0 行 → 不碰缓存(无幽灵)。
+    if (res.canvasIdxOwner !== undefined) this.setIndexEntry('canvas', canvasId, res.canvasIdxOwner, true)
+    return { count: res.count }
   }
 
   async softDeleteProjectTree(ownerId: string, projectId: string): Promise<{ count: number }> {
+    await this.ready
     const res = await this.db.transaction().execute(async (trx) => {
+      // F5:先选定本 project 下 live child canvas 集合(级联软删前),供 canvases 瘦索引同步(与 persist_records canvas meta 软删同集)。
+      const childCv = await trx.selectFrom('persist_records').select(['id']).where('owner_id', '=', ownerId).where('type', '=', 'canvas').where(sql`payload->>'projectId'`, '=', projectId).where('is_deleted', '=', false).execute()
+      const childIds = childCv.map((r) => r.id)
       // project meta
       const p = await trx.updateTable('persist_records').set({ is_deleted: true, revision: sql`revision + 1`, updated_at: new Date() }).where('owner_id', '=', ownerId).where('type', '=', 'project').where('id', '=', projectId).where('is_deleted', '=', false).executeTakeFirst()
       // 其所有 canvas meta + chat-collection(canvas meta payload->>projectId = projectId)
       const cv = await trx.updateTable('persist_records').set({ is_deleted: true, revision: sql`revision + 1`, updated_at: new Date() }).where('owner_id', '=', ownerId).where('type', '=', 'canvas').where(sql`payload->>'projectId'`, '=', projectId).where('is_deleted', '=', false).executeTakeFirst()
       // chat-collection:canvas_id 属 project 的 canvas(子查询)
       const cc = await trx.updateTable('persist_records').set({ is_deleted: true, revision: sql`revision + 1`, updated_at: new Date() }).where('owner_id', '=', ownerId).where('type', '=', 'chat-collection').where('canvas_id', 'in', (qb) => qb.selectFrom('persist_records').select('id').where('owner_id', '=', ownerId).where('type', '=', 'canvas').where(sql`payload->>'projectId'`, '=', projectId)).where('is_deleted', '=', false).executeTakeFirst()
-      // projects 全局索引表软删;缓存同步由 post-commit 定点 mutation(P1-5)。
-      await trx.updateTable('projects').set({ is_deleted: true, updated_at: new Date() }).where('id', '=', projectId).where('is_deleted', '=', false).execute()
+      // F2:projects 瘦索引 owner-scoped + is_deleted=false + returning;0 行(不存在/已删/错 owner)→ undefined(调用方不碰缓存,无幽灵)。
+      const projIdx = await trx.updateTable('projects').set({ is_deleted: true, updated_at: new Date() }).where('id', '=', projectId).where('owner_id', '=', ownerId).where('is_deleted', '=', false).returning('owner_id').executeTakeFirst()
+      // F5:child canvases 瘦索引同步(实际受影响集 owner-scoped + is_deleted=false + returning;未命中不进结果)。
+      const childIdx = childIds.length > 0
+        ? await trx.updateTable('canvases').set({ is_deleted: true, updated_at: new Date() }).where('id', 'in', childIds).where('owner_id', '=', ownerId).where('is_deleted', '=', false).returning(['id', 'owner_id']).execute()
+        : []
       // 注:project tree cascade 软删只标 project + 其 canvas meta + chat-collection;children 保持活记录(#2)。
       const count = Number((p?.numUpdatedRows ?? 0n) > 0n ? 1n : 0n) + Number((cv?.numUpdatedRows ?? 0n) > 0n ? 1n : 0n) + Number((cc?.numUpdatedRows ?? 0n) > 0n ? 1n : 0n)
-      return { count }
+      return { count, projIdxOwner: projIdx?.owner_id, childIdxOwners: childIdx.map((x) => ({ id: x.id, ownerId: x.owner_id })) }
     })
-    // P1-5:post-commit 定点 cache mutation(project 软删 → isDeleted=true;纯内存,不可失败)。
-    this.setIndexEntry('project', projectId, ownerId, true)
-    return res
+    // F2/F5:post-commit 仅当事务实际命中 durable 行(用 DB owner_id);child canvases 同步。0 行 → 不碰缓存(无幽灵)。
+    if (res.projIdxOwner !== undefined) this.setIndexEntry('project', projectId, res.projIdxOwner, true)
+    for (const c of res.childIdxOwners) this.setIndexEntry('canvas', c.id, c.ownerId, true)
+    return { count: res.count }
   }
 
-  /** 事务内:恢复 canvas 子树(canvas meta + chat-collection;原子,N2)。opts.payload 更新 canvas meta 域字段(保留 contentVersion)。缓存同步由调用方 top-level 方法在事务提交后定点 mutation(P1-5)。 */
-  private async restoreCanvasTreeInTrx(trx: Kysely<Database>, ownerId: string, canvasId: string, opts: { payload?: unknown; idempotencyKey?: string; fingerprint?: string } = {}): Promise<{ count: number }> {
+  /** 事务内:恢复 canvas 子树(canvas meta + chat-collection;原子,N2)。opts.payload 更新 canvas meta 域字段(保留 contentVersion)。返 { count, metaRestored, canvasIdxOwner }——metaRestored=F4 输赢判定;canvasIdxOwner=F2 post-commit cache 数据源(DB owner_id,未命中→undefined 调用方不碰缓存)。 */
+  private async restoreCanvasTreeInTrx(trx: Kysely<Database>, ownerId: string, canvasId: string, opts: { payload?: unknown; idempotencyKey?: string; fingerprint?: string } = {}): Promise<{ count: number; metaRestored: boolean; canvasIdxOwner?: string }> {
     const r = await trx.updateTable('persist_records').set({
       payload: opts.payload !== undefined ? sql`jsonb_set(${JSON.stringify(opts.payload)}::jsonb, '{contentVersion}', COALESCE(payload->'contentVersion', '0'::jsonb), true)` : sql`payload`,
       is_deleted: false,
@@ -1119,13 +1151,17 @@ export class PgPersistBackend implements PersistBackend {
       updated_at: new Date(),
     }).where('owner_id', '=', ownerId).where('type', '=', 'canvas').where('id', '=', canvasId).where('is_deleted', '=', true).executeTakeFirst()
     const c = await trx.updateTable('persist_records').set({ is_deleted: false, revision: sql`revision + 1`, updated_at: new Date() }).where('owner_id', '=', ownerId).where('type', '=', 'chat-collection').where('canvas_id', '=', canvasId).where('is_deleted', '=', true).executeTakeFirst()
-    await trx.updateTable('canvases').set({ is_deleted: false, updated_at: new Date() }).where('id', '=', canvasId).execute()
+    // F2:canvases 瘦索引 owner-scoped + is_deleted=true + returning;0 行(不存在/未删/错 owner)→ undefined(调用方不碰缓存,无幽灵)。
+    const idx = await trx.updateTable('canvases').set({ is_deleted: false, updated_at: new Date() }).where('id', '=', canvasId).where('owner_id', '=', ownerId).where('is_deleted', '=', true).returning('owner_id').executeTakeFirst()
     const count = Number((r?.numUpdatedRows ?? 0n) > 0n ? 1n : 0n) + Number((c?.numUpdatedRows ?? 0n) > 0n ? 1n : 0n)
-    return { count }
+    return { count, metaRestored: (r?.numUpdatedRows ?? 0n) > 0n, canvasIdxOwner: idx?.owner_id }
   }
 
-  /** 事务内:恢复 project 子树(project + 其 canvas meta + chat-collection;原子,N2)。缓存同步由调用方定点 mutation(P1-5)。 */
-  private async restoreProjectTreeInTrx(trx: Kysely<Database>, ownerId: string, projectId: string, opts: { payload?: unknown; idempotencyKey?: string; fingerprint?: string } = {}): Promise<{ count: number }> {
+  /** 事务内:恢复 project 子树(project + 其 canvas meta + chat-collection;原子,N2)。返 { count, metaRestored, projIdxOwner, childIdxOwners }——F4 输赢 + F2/F5 cache 数据源(全 DB owner_id,未命中不进结果→调用方不碰缓存,无幽灵)。 */
+  private async restoreProjectTreeInTrx(trx: Kysely<Database>, ownerId: string, projectId: string, opts: { payload?: unknown; idempotencyKey?: string; fingerprint?: string } = {}): Promise<{ count: number; metaRestored: boolean; projIdxOwner?: string; childIdxOwners: { id: string; ownerId: string }[] }> {
+    // F5:先选定本 project 下 soft-deleted child canvas 集合(级联恢复前),供 canvases 瘦索引同步(与 persist_records canvas meta 恢复同集)。
+    const childCv = await trx.selectFrom('persist_records').select(['id']).where('owner_id', '=', ownerId).where('type', '=', 'canvas').where(sql`payload->>'projectId'`, '=', projectId).where('is_deleted', '=', true).execute()
+    const childIds = childCv.map((r) => r.id)
     const p = await trx.updateTable('persist_records').set({
       payload: opts.payload !== undefined ? JSON.stringify(opts.payload) : sql`payload`,
       is_deleted: false,
@@ -1134,26 +1170,32 @@ export class PgPersistBackend implements PersistBackend {
     }).where('owner_id', '=', ownerId).where('type', '=', 'project').where('id', '=', projectId).where('is_deleted', '=', true).executeTakeFirst()
     const cv = await trx.updateTable('persist_records').set({ is_deleted: false, revision: sql`revision + 1`, updated_at: new Date() }).where('owner_id', '=', ownerId).where('type', '=', 'canvas').where(sql`payload->>'projectId'`, '=', projectId).where('is_deleted', '=', true).executeTakeFirst()
     const cc = await trx.updateTable('persist_records').set({ is_deleted: false, revision: sql`revision + 1`, updated_at: new Date() }).where('owner_id', '=', ownerId).where('type', '=', 'chat-collection').where('canvas_id', 'in', (qb) => qb.selectFrom('persist_records').select('id').where('owner_id', '=', ownerId).where('type', '=', 'canvas').where(sql`payload->>'projectId'`, '=', projectId)).where('is_deleted', '=', true).executeTakeFirst()
-    await trx.updateTable('projects').set({ is_deleted: false, updated_at: new Date() }).where('id', '=', projectId).execute()
+    // F2:projects 瘦索引 owner-scoped + is_deleted=true + returning;0 行 → undefined(调用方不碰缓存)。
+    const projIdx = await trx.updateTable('projects').set({ is_deleted: false, updated_at: new Date() }).where('id', '=', projectId).where('owner_id', '=', ownerId).where('is_deleted', '=', true).returning('owner_id').executeTakeFirst()
+    // F5:child canvases 瘦索引同步(实际受影响集 owner-scoped + is_deleted=true + returning;未命中不进结果)。
+    const childIdx = childIds.length > 0
+      ? await trx.updateTable('canvases').set({ is_deleted: false, updated_at: new Date() }).where('id', 'in', childIds).where('owner_id', '=', ownerId).where('is_deleted', '=', true).returning(['id', 'owner_id']).execute()
+      : []
     void opts.idempotencyKey; void opts.fingerprint
     const count = Number((p?.numUpdatedRows ?? 0n) > 0n ? 1n : 0n) + Number((cv?.numUpdatedRows ?? 0n) > 0n ? 1n : 0n) + Number((cc?.numUpdatedRows ?? 0n) > 0n ? 1n : 0n)
-    return { count }
+    return { count, metaRestored: (p?.numUpdatedRows ?? 0n) > 0n, projIdxOwner: projIdx?.owner_id, childIdxOwners: childIdx.map((x) => ({ id: x.id, ownerId: x.owner_id })) }
   }
 
   async restoreCanvasTree(ownerId: string, canvasId: string, opts: { payload?: unknown; idempotencyKey?: string; fingerprint?: string } = {}): Promise<{ count: number }> {
     await this.ready
     const res = await this.db.transaction().execute(async (trx) => this.restoreCanvasTreeInTrx(trx, ownerId, canvasId, opts))
-    // P1-5:post-commit 定点 cache mutation(canvas 恢复 → isDeleted=false;纯内存,不可失败)。
-    this.setIndexEntry('canvas', canvasId, ownerId, false)
-    return res
+    // F2/P1-5:post-commit 定点 cache mutation 仅当事务实际命中 durable 行(用 DB owner_id,不信用入参);0 行(no-op/错 owner/不存在)→ 不碰缓存(无幽灵)。
+    if (res.canvasIdxOwner !== undefined) this.setIndexEntry('canvas', canvasId, res.canvasIdxOwner, false)
+    return { count: res.count }
   }
 
   async restoreProjectTree(ownerId: string, projectId: string, opts: { payload?: unknown; idempotencyKey?: string; fingerprint?: string } = {}): Promise<{ count: number }> {
     await this.ready
     const res = await this.db.transaction().execute(async (trx) => this.restoreProjectTreeInTrx(trx, ownerId, projectId, opts))
-    // P1-5:post-commit 定点 cache mutation(project 恢复 → isDeleted=false;纯内存,不可失败)。
-    this.setIndexEntry('project', projectId, ownerId, false)
-    return res
+    // F2/F5:post-commit 仅当事务实际命中 durable 行(用 DB owner_id);child canvases 同步(与 persist_records 恢复同集)。0 行 → 不碰缓存(无幽灵)。
+    if (res.projIdxOwner !== undefined) this.setIndexEntry('project', projectId, res.projIdxOwner, false)
+    for (const c of res.childIdxOwners) this.setIndexEntry('canvas', c.id, c.ownerId, false)
+    return { count: res.count }
   }
 
   /** Test-only:清空全部 records + idempotency index + 全局索引缓存。PG:TRUNCATE(异步)。 */
@@ -1166,6 +1208,16 @@ export class PgPersistBackend implements PersistBackend {
       await trx.deleteFrom('projects').execute()
       await trx.deleteFrom('canvases').execute()
     })
+  }
+
+  /** Test-only:读 project 全局索引缓存条目(F2 幽灵索引/F5 级联同步断言用;生产不用)。 */
+  __projectCacheEntry(id: string): { ownerId: string; isDeleted: boolean } | undefined {
+    return this.projectIndex.get(id)
+  }
+
+  /** Test-only:读 canvas 全局索引缓存条目(F2 幽灵索引/F5 级联同步断言用;生产不用)。 */
+  __canvasCacheEntry(id: string): { ownerId: string; isDeleted: boolean } | undefined {
+    return this.canvasIndex.get(id)
   }
 
   /** Test-only:DROP 全部表(含 kysely_migration 追踪表)模拟 fresh DB,验证 ready 的 migrate-before-warm 编排(P1-4)。生产不用。 */

@@ -64,7 +64,7 @@ export type EnsureChildResult =
   | { kind: 'cross-canvas' } // N3:同 id 存在但属于另一 canvas → route 404(canvas_id 不可变)
   | { kind: 'reuse-conflict' } // N4:同 idem key 不同 fingerprint → route 422
 
-/** meta upsert 结果(PUT canvas/project/user-state:revision-check-then-bump;返修 #4 428)。N4:reuse-conflict。F1:canvas PUT move 目标 project 软删 → parent-not-live(route → 404)。 */
+/** meta upsert 结果(PUT canvas/project/user-state:revision-check-then-bump;返修 #4 428)。N4:reuse-conflict。F1:canvas PUT move 目标 project 软删 → parent-not-live(route → 404)。F3:upsert missing 路径跨 owner 同 id → exists-other-owner(route → 409 project-exists/canvas-exists,与 ensureCreate 同语义;route 层 authz+预检已阻,backend 防御性拒绝,不跨 owner insert/不覆盖缓存)。 */
 export type UpsertResult =
   | { kind: 'created'; record: PersistRecord }
   | { kind: 'updated'; record: PersistRecord }
@@ -72,6 +72,7 @@ export type UpsertResult =
   | { kind: 'precondition-required'; record: PersistRecord } // 返修 #4:existing 缺 base → 428
   | { kind: 'reuse-conflict' } // N4:同 idem key 不同 fingerprint → route 422
   | { kind: 'parent-not-live' } // F1:canvas PUT move 目标 project 软删/不存在 → route 404 unknown-project
+  | { kind: 'exists-other-owner'; record: PersistRecord } // F3:upsert missing 跨 owner 同 id(全局唯一),route → 409 project-exists/canvas-exists(与 ensureCreate 同语义)
 
 /** 子资源 upsert 结果(PATCH node/edge/anchor/chat-message:返修 #3 cross-canvas + #4 428 + #5 max(0,base)+N4 reuse-conflict)。 */
 export type UpsertChildResult =
