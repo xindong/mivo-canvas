@@ -27,8 +27,17 @@ import { createPinterestRoutes } from './routes/pinterest'
 import { createProxyImageRoutes } from './routes/proxy-image'
 import { keysRoute } from './routes/keys'
 import { tasksRoute } from './routes/tasks'
+import { createProjectsRoutes } from './routes/projects'
+import { createCanvasRoutes } from './routes/canvas'
+import { createUserStateRoutes } from './routes/userState'
+import { createPersistBackend } from './persist/backend'
 
 const featureFlags = resolveFeatureFlags()
+
+// T1.3: shared data-persistence backend. In-memory now (contract tests pass against it);
+// PG(T1.1 批复后)swap here — createPersistBackend → PgPersistBackend, routes unchanged (§6).
+// Exported so tests driving the real `app` can __reset() between cases (同 __resetTaskRegistry)。
+export const sharedPersistBackend = createPersistBackend()
 
 export const app = new Hono<AppEnv>()
 
@@ -72,6 +81,15 @@ app.route('/api/mivo/tasks', tasksRoute)
 // never exposes the sk- key to CORS or upstream logs. Stateless (no DB).
 // (SSO scheme: no app-level gate; production protected by the gateway.)
 app.route('/api/keys', keysRoute)
+
+// T1.3: data-persistence endpoints (stateful, owner-scoped). NOT under /api/mivo/*
+// (those are stateless image-capability proxies). Mounted before serveStatic + SPA
+// fallback so /api/* matches before the SPA history fallback. Owner scope via
+// resolveOwner (FX-2 mivo-key fingerprint; §13.5 target = maker user id). Contract:
+// docs/decisions/api-surface.md.
+app.route('/api/projects', createProjectsRoutes({ backend: sharedPersistBackend }))
+app.route('/api/canvas', createCanvasRoutes({ backend: sharedPersistBackend }))
+app.route('/api/user-state', createUserStateRoutes({ backend: sharedPersistBackend }))
 
 // Same-origin static hosting of dist/ (Vite build output). serveStatic only
 // accepts a root relative to cwd and calls next() on miss, letting the SPA
