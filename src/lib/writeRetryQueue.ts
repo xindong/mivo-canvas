@@ -24,7 +24,7 @@
 
 import type { AnchorPayload, EdgePayload, NodePayload, Revision } from '../../shared/persist-contract.ts'
 import { isUserStateKeyForbidden } from '../../shared/persist-contract.ts'
-import { getPersistUserId } from './persistUserId'
+import { ANONYMOUS_USER_ID, getPersistUserId } from './persistUserId'
 import { debugLogger } from '../store/debugLogStore'
 import { toastFeedback } from '../store/toastStore'
 
@@ -248,7 +248,13 @@ const runTx = <T>(
 const getAllWrites = async (): Promise<QueuedWrite[]> => {
   if (!isIdbAvailable()) return Array.from(memStore.values())
   try {
-    return await runTx<QueuedWrite[]>('readonly', (store) => store.getAll() as IDBRequest<QueuedWrite[]>)
+    const idbRecords = await runTx<QueuedWrite[]>('readonly', (store) => store.getAll() as IDBRequest<QueuedWrite[]>)
+    // Union with memStore: a record that fell back to memStore when an IDB tx failed is
+    // invisible to a plain IDB read otherwise — that would lose the write the moment IDB
+    // recovers (Greptile P1 #3). memStore records not in IDB are appended (dedup by id).
+    const idbIds = new Set(idbRecords.map((r) => r.id))
+    const memOnly = Array.from(memStore.values()).filter((r) => !idbIds.has(r.id))
+    return [...idbRecords, ...memOnly]
   } catch (error) {
     debugLogger.warn(SOURCE, `getAll failed; using in-memory fallback: ${msg(error)}`)
     return Array.from(memStore.values())
@@ -262,24 +268,26 @@ const putWrite = async (record: QueuedWrite): Promise<void> => {
   }
   try {
     await runTx<IDBValidKey>('readwrite', (store) => store.put(record))
+    // IDB now has it — drop any stale memStore fallback so the next getAll sees one copy
+    // in IDB (the record has migrated back to durable storage).
+    memStore.delete(record.id)
   } catch (error) {
     // Never silently lose a queued write — fall back to memory so it still drains this
-    // session. The warn makes the degradation visible (logging invariant).
+    // session. The warn makes the degradation visible (logging invariant). getAllWrites
+    // unions memStore so the record stays visible to drain even after IDB recovers.
     debugLogger.warn(SOURCE, `put failed for ${record.id}; using in-memory fallback: ${msg(error)}`)
     memStore.set(record.id, record)
   }
 }
 
 const deleteWrite = async (id: string): Promise<void> => {
-  if (!isIdbAvailable()) {
-    memStore.delete(id)
-    return
-  }
+  // Always clean the memStore fallback (the record may live there if a prior put failed).
+  memStore.delete(id)
+  if (!isIdbAvailable()) return
   try {
     await runTx<undefined>('readwrite', (store) => store.delete(id) as IDBRequest<undefined>)
   } catch (error) {
     debugLogger.warn(SOURCE, `delete failed for ${id}: ${msg(error)}`)
-    memStore.delete(id)
   }
 }
 
@@ -446,6 +454,38 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
       const userId = getPersistUserId()
       const ts = now()
       const all = await getAllWrites()
+
+      // Recovery pass — runs on a fresh drain (draining was false, so no other drain in
+      // this session is mid-flight). Two crash-recovery concerns (Greptile P1 #1 + #4):
+      //  (a) in-flight records left by a prior session that died during `await executor`
+      //      would be orphaned forever (drain only picks pending/paused-401). Reset them
+      //      to pending so they replay — the idempotency key is preserved, so the server
+      //      dedupes if the crashed write actually landed (200 existing).
+      //  (b) anonymous-tagged records from a pre-auth session: after login, drain filters
+      //      by the real userId so anonymous records would orphan. Claim them for the now-
+      //      authenticated user (mirrors FX-6 first-user-claims-legacy). Idempotent: after
+      //      re-tag they're the user's, not anonymous, so the next drain finds none.
+      let recovered = 0
+      for (const r of all) {
+        let changed = false
+        if (r.userId === ANONYMOUS_USER_ID && userId !== ANONYMOUS_USER_ID) {
+          r.userId = userId
+          changed = true
+        }
+        if (r.status === 'in-flight' && r.userId === userId) {
+          r.status = 'pending'
+          r.nextAttemptAt = ts
+          r.lastError = 'recovered in-flight'
+          changed = true
+        }
+        if (changed) {
+          await putWrite(r)
+          recovered++
+        }
+      }
+      if (recovered > 0)
+        debugLogger.log(SOURCE, `recovered ${recovered} record(s) from a prior session`)
+
       const due = all
         .filter(
           (r) =>
@@ -599,8 +639,21 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
       }
       document.addEventListener('visibilitychange', visibilityHandler)
     }
+    // Restore the paused state if leftover paused-401 records exist from a prior session
+    // (Greptile P1 #2). `paused` is in-memory and resets to false on each new instance, so
+    // without this a reload would replay paused-401 records (each getting 401 again) before
+    // the auth layer calls resume(). Restore the pause; resume() (after successful re-auth)
+    // clears it and drains. The auth layer MUST call resume() once /api/auth/me confirms
+    // the session is valid (documented in the design doc).
+    const userId = getPersistUserId()
+    const all = await getAllWrites()
+    if (all.some((r) => r.userId === userId && r.status === 'paused-401')) {
+      paused = true
+      debugLogger.log(SOURCE, 'restored paused state (leftover 401 records from prior session)')
+    }
     // Drain immediately — records may have persisted from a prior session (cross-session
     // durable recovery: page reloaded, IDB still holds the queue, this session picks up).
+    // If paused was restored above, drain returns early (paused-401 not re-sent).
     await drain()
   }
 

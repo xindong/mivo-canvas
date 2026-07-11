@@ -586,3 +586,86 @@ describe('FX-5 start/stop lifecycle', () => {
     expect(calls).toHaveLength(1)
   })
 })
+
+// ── crash/reload recovery (Greptile P1 fixes) ──
+
+describe('FX-5 crash/reload recovery', () => {
+  it('recovers an in-flight record left by a crashed prior session (replays it)', async () => {
+    // session 1: enqueue op1, drain with a hanging executor → op1 stuck in-flight, then
+    // the session "crashes" (the executor is never resolved, the drain is abandoned).
+    let resolve1: ((o: WriteOutcome) => void) | undefined
+    let called1 = false
+    const exec1 = vi.fn(async (): Promise<WriteOutcome> => {
+      called1 = true
+      return new Promise<WriteOutcome>((r) => {
+        resolve1 = r
+      })
+    })
+    const q1 = makeQueue(exec1)
+    await q1.enqueue(minimalNode('c1', 'n1'))
+    const d1 = q1.drain() // op1 → in-flight, hangs at the executor
+    await vi.waitFor(() => expect(called1).toBe(true))
+    // session 2: fresh instance + success executor → drain recovers the in-flight record
+    const exec2 = seqExecutor([{ status: 'success' }])
+    const q2 = makeQueue(exec2.fn)
+    const r = await q2.drain()
+    expect(r.successes).toBe(1) // recovered in-flight → re-executed → success
+    expect(exec2.calls).toHaveLength(1)
+    expect(await q2.pendingCount()).toBe(0)
+    // settle the abandoned session-1 drain (its deleteWrite is now a no-op since q2 deleted)
+    resolve1?.({ status: 'success' })
+    await d1.catch(() => undefined)
+  })
+
+  it('restores paused state on start() when leftover paused-401 records exist', async () => {
+    // session 1: op1 → 401 → paused-401 + paused=true. Instance dropped (reload).
+    const exec1 = seqExecutor([{ status: 'unauthorized' }, { status: 'success' }])
+    const q1 = makeQueue(exec1.fn)
+    await q1.enqueue(minimalNode('c1', 'n1'))
+    await q1.drain()
+    expect(q1.isPaused()).toBe(true)
+    // session 2: fresh instance → start() must restore paused (paused-401 record exists),
+    // NOT replay it into another 401.
+    const exec2 = seqExecutor([{ status: 'success' }])
+    const q2 = makeQueue(exec2.fn)
+    await q2.start()
+    expect(q2.isPaused()).toBe(true)
+    expect(exec2.calls).toHaveLength(0) // paused → no drain (no redundant 401)
+    // resume() (auth layer, after re-login) → drains
+    await q2.resume()
+    expect(q2.isPaused()).toBe(false)
+    expect(exec2.calls).toHaveLength(1)
+    expect(await q2.pendingCount()).toBe(0)
+  })
+
+  it('a memStore-fallback record stays visible after IDB recovers (no silent loss)', async () => {
+    // IDB unavailable → enqueue falls back to memStore
+    vi.stubGlobal('indexedDB', undefined)
+    const exec = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(exec.fn)
+    await q.enqueue(minimalNode('c1', 'n1'))
+    expect(await q.pendingCount()).toBe(1)
+    // IDB "recovers" — getAllWrites unions memStore, so the record is still visible
+    vi.unstubAllGlobals()
+    expect(await q.pendingCount()).toBe(1)
+    const r = await q.drain()
+    expect(r.successes).toBe(1) // drain saw the memStore record → executed → success
+    expect(exec.calls).toHaveLength(1)
+    expect(await q.pendingCount()).toBe(0)
+  })
+
+  it('claims anonymous-tagged records for the authenticated user on drain (no orphans)', async () => {
+    // pre-auth: enqueue as anonymous
+    setPersistUserId('anonymous')
+    const exec = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(exec.fn)
+    await q.enqueue(minimalNode('c1', 'n1')) // tagged 'anonymous'
+    expect((await __dumpWritesForTest())[0].userId).toBe('anonymous')
+    // login → drain migrates anonymous → real user + processes
+    setPersistUserId('userA')
+    const r = await q.drain()
+    expect(r.successes).toBe(1) // migrated + executed (not orphaned)
+    expect(exec.calls).toHaveLength(1)
+    expect(await q.pendingCount()).toBe(0)
+  })
+})
