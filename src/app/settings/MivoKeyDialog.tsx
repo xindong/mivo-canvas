@@ -12,6 +12,7 @@ import { createPortal } from 'react-dom'
 import { CircleAlert, Eye, EyeOff, ExternalLink, X } from 'lucide-react'
 import { useSettingsStore } from '../../store/settingsSlice'
 import { debugLogger } from '../../store/debugLogStore'
+import { isImeComposing } from '../../lib/imeSafeEnter'
 import { isMivoKey, keyTail } from '../../lib/keyFormat'
 
 const MIVO_CONSOLE_URL = 'https://aigc.xindong.com'
@@ -52,6 +53,7 @@ export function MivoKeyDialog({ onClose }: MivoKeyDialogProps) {
   }
 
   const onKeyDown = (event: KeyboardEvent<HTMLInputElement>): void => {
+    if (isImeComposing(event)) return
     if (event.key === 'Enter' && canSave) {
       event.preventDefault()
       save()

@@ -12,6 +12,7 @@ import { createPortal } from 'react-dom'
 import { CircleAlert, Eye, EyeOff, ExternalLink, Loader2, X } from 'lucide-react'
 import { useSettingsStore } from '../../store/settingsSlice'
 import { debugLogger } from '../../store/debugLogStore'
+import { isImeComposing } from '../../lib/imeSafeEnter'
 import { keyTail } from '../../lib/keyFormat'
 
 const XD_GATEWAY_CONSOLE_URL = 'https://console.tapsvc.com/nova/#/ai-gateway?tab=keys'
@@ -68,6 +69,7 @@ export function GatewayKeyDialog({ onClose }: GatewayKeyDialogProps) {
   }
 
   const onKeyDown = (event: KeyboardEvent<HTMLInputElement>): void => {
+    if (isImeComposing(event)) return
     if (event.key === 'Enter' && canSave) {
       event.preventDefault()
       void save()

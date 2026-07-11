@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type CSSProperties } from 'react'
 import { useCanvasStore } from '../store/canvasStore'
+import { isImeComposing } from '../lib/imeSafeEnter'
 import { Layer, layerZIndex } from '../render/layers'
 import type { ExperimentalAnchor, MivoCanvasNode } from '../types/mivoCanvas'
 
@@ -283,6 +284,7 @@ export const AnchorOverlay = ({ viewport }: Props) => {
             onChange={(e) => setInstruction(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === 'Enter') {
+                if (isImeComposing(e)) return
                 e.preventDefault()
                 generate()
               }
