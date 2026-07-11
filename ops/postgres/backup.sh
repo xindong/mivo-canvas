@@ -36,13 +36,23 @@ log "=== backup start (db=$PG_DB user=$PG_USER container=$PG_CONTAINER) ==="
 
 # ─── 1. pg_dump(自定义格式 -Fc:支持并行恢复 + 选择性恢复 + 压缩)────────────
 DUMP_FILE="$BACKUP_DIR/$PG_DB-$TIMESTAMP.dump"
-# docker exec 走 local socket,镜像默认 trust(免密,见 compose 注释);--file=- 输出 stdout。
-if ! docker exec "$PG_CONTAINER" pg_dump -U "$PG_USER" -d "$PG_DB" -Fc --file=- >"$DUMP_FILE" 2>>"$LOG_FILE"; then
+# docker exec 走 local socket,镜像默认 trust(免密,见 compose 注释)。
+# 不用 --file=-:`-Fc --file=-` + docker exec stdout 重定向组合下落地 0 字节(服务器实测);
+# pg_dump -Fc 默认写 stdout,直接重定向即可(服务器实测空库 schema 头 825 字节,pg_restore -l 15 条 TOC)。
+if ! docker exec "$PG_CONTAINER" pg_dump -U "$PG_USER" -d "$PG_DB" -Fc >"$DUMP_FILE" 2>>"$LOG_FILE"; then
   log "FAIL: pg_dump → $DUMP_FILE"
   rm -f "$DUMP_FILE"
   exit 1
 fi
 DUMP_SIZE="$(stat -c%s "$DUMP_FILE" 2>/dev/null || stat -f%z "$DUMP_FILE" 2>/dev/null || echo 0)"
+# 非空校验(fail visibly):pg_dump -Fc 空库 schema 头都有 800+ 字节,≤ 阈值 = 损坏/空壳 → FAIL + 删 + 非零退出。
+# 修此前的静默失败 bug:只报 size 当成功,0 字节 dump 被当 ok。
+DUMP_MIN_BYTES="${DUMP_MIN_BYTES:-100}"
+if [ "$DUMP_SIZE" -le "$DUMP_MIN_BYTES" ]; then
+  log "FAIL: pg_dump produced $DUMP_SIZE bytes (≤ ${DUMP_MIN_BYTES} threshold) — dump corrupt/empty, removing $DUMP_FILE"
+  rm -f "$DUMP_FILE"
+  exit 1
+fi
 log "ok: pg_dump → $DUMP_FILE ($DUMP_SIZE bytes)"
 
 # 周备(每周日复制一份到 weekly/,独立保留 RETENTION_WEEKLY 份)
@@ -56,9 +66,11 @@ fi
 # 先 CHECKPOINT 让 PG 把脏页刷盘(降低 crash-consistent 风险;非 PITR 替代品)。
 docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -c "CHECKPOINT;" >>"$LOG_FILE" 2>&1 || log "WARN: CHECKPOINT failed (continuing)"
 SNAPSHOT_FILE="$BACKUP_DIR/pg-data-$TIMESTAMP.tar.gz"
-# 快照失败不阻断主流程(pg_dump 已是主备份),记 WARN。
+# 快照失败不阻断主流程(pg_dump 已是主备份),记 WARN,如实不假成功。
+# 典型原因:PG 数据目录由容器内 postgres 用户持有(mode 0700),宿主侧 tar 以 yanjian 身份读不了;
+# 快照为可选/需 root(见 runbook §8),不阻断主备份。
 if ! tar -czf "$SNAPSHOT_FILE" -C "$DATA_DIR" pg 2>>"$LOG_FILE"; then
-  log "WARN: pg-data snapshot failed (non-blocking; pg_dump is primary)"
+  log "WARN: pg-data snapshot failed (non-blocking; pg_dump is primary). Likely host tar cannot read PG data dir (owned by container postgres uid, mode 0700) — needs sudo or run as postgres; see runbook §8"
   rm -f "$SNAPSHOT_FILE"
 else
   SNAP_SIZE="$(stat -c%s "$SNAPSHOT_FILE" 2>/dev/null || stat -f%z "$SNAPSHOT_FILE" 2>/dev/null || echo 0)"
