@@ -13,6 +13,8 @@ import { serveStatic } from '@hono/node-server/serve-static'
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { resolveFeatureFlags } from './lib/env'
+import { resolveAssetStoreDir } from './lib/assetStore'
+import { computeReadiness } from './lib/readiness'
 import type { AppEnv } from './lib/types'
 import { generateHandler } from './routes/generate'
 import { editHandler } from './routes/edit'
@@ -73,6 +75,21 @@ export const app = new Hono<AppEnv>()
 
 // Liveness probe.
 app.get('/healthz', (c) => c.json({ status: 'ok' }))
+
+// P0.3 Readiness probe(区别于 /healthz 的 liveness):/healthz 只表"进程活",
+// /readyz 表"依赖此刻可用"——PG 连接(SELECT 1)+ asset dir 可写。任一 fail → 503
+// (部署/网关据此摘流量,不把请求打到半挂的 BFF)。pm2/deploy 可探测;响应体带各 check
+// 诊断 reason,运维从 body 直接看哪个依赖挂了。persist 用 sharedPersistBackend.ping()
+// (memory 恒 ok;PG SELECT 1);assetDir 仅 asset service 启用时探写(service 关=skipped)。
+app.get('/readyz', async (c) => {
+  const report = await computeReadiness(
+    sharedPersistBackend,
+    persistBackendConfig.kind === 'pg' ? 'pg' : 'memory',
+    resolveAssetStoreDir(),
+    featureFlags.assetServiceEnabled,
+  )
+  return c.json(report, report.status === 'ok' ? 200 : 503)
+})
 
 // visual-diff token probe (env-gated): only when MIVO_VD_TOKEN is set, return it at
 // /__vd_probe so scripts/visual-diff.mjs can confirm THIS BFF process is responding

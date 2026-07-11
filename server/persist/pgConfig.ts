@@ -16,10 +16,16 @@ export type PgConnectionConfig = {
   database: string
   user: string
   password: string
-  // 连接池上限(单实例 BFF;灰度保守值,env 可调)。
+  // 连接池上限(单实例 BFF;灰度保守值,env 可调)。P0.3 连接预算:与 PG compose 的
+  // resources.limits.memory=2g 配套,单实例保守 10;多实例协作时按实例数 × max ≤ PG
+  // max_connections 的 70%(留余量给备份/运维查询,见 runbook §容量预算)。
   maxConnections: number
-  // 连接 idle 超时(ms),0=不超时。
+  // 连接 idle 超时(ms),0=不超时。空闲连接在池内停留多久后关闭。
   idleTimeoutMs: number
+  // P0.3 连接预算:从池里获取一条连接的排队等待超时(ms)。池满时新请求等该时长仍拿不到连接
+  // → 抛错(而非无限排队把 BFF 拖死)。可选——resolvePersistBackendConfig 从 env 总填(生产取
+  // MIVO_PG_CONNECTION_TIMEOUT_MS,默认 5000);测试构造 config 字面量可省(pgBackend 构造兜底 5000)。
+  connectionTimeoutMs?: number
 }
 
 export type PersistBackendConfig = {
@@ -56,6 +62,8 @@ export const resolvePersistBackendConfig = (env: NodeJS.ProcessEnv = process.env
       password,
       maxConnections: num(env.MIVO_PG_MAX_CONNECTIONS, 10),
       idleTimeoutMs: num(env.MIVO_PG_IDLE_TIMEOUT_MS, 30_000),
+      // P0.3:默认 5000ms(fail fast,池满不无限排队)。env MIVO_PG_CONNECTION_TIMEOUT_MS 可调。
+      connectionTimeoutMs: num(env.MIVO_PG_CONNECTION_TIMEOUT_MS, 5_000),
     },
   }
 }

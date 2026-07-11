@@ -167,6 +167,9 @@ export class PgPersistBackend implements PersistBackend {
           password: conn.password,
           max: conn.maxConnections,
           idleTimeoutMillis: conn.idleTimeoutMs,
+          // P0.3 连接预算:池满时排队等待上限,超时即抛错(fail fast,不无限排队拖垮 BFF)。
+          // config 未给(测试字面量)时兜底 5000ms;生产 env 总经 resolvePersistBackendConfig 填。
+          connectionTimeoutMillis: conn.connectionTimeoutMs ?? 5000,
         }),
       }),
     })
@@ -198,6 +201,22 @@ export class PgPersistBackend implements PersistBackend {
   /** 对本 backend 的 db 跑 migrateToLatest(可重放)。测试 beforeAll + 生产 runbook 用。 */
   async migrate(): Promise<void> {
     await runMigrations(this.db)
+  }
+
+  /**
+   * P0.3 readiness probe:`SELECT 1` 探活连接池(捕 PG 挂/连接耗尽/网络断)。
+   * /readyz 用:不同于 ready(启动预热一次性),ping 是"此刻依赖可用"的 live 探测。
+   * 不抛错——返 ok=false + reason,让 /readyz 回 503 而非 500(诊断体含 reason)。
+   * 用 Kysely `sql\`SELECT 1\`` 走池里取一条连接(受 connectionTimeoutMillis 排队超时保护)。
+   */
+  async ping(): Promise<{ ok: true } | { ok: false; reason: string }> {
+    try {
+      await sql`SELECT 1`.execute(this.db)
+      return { ok: true }
+    } catch (error) {
+      const reason = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
+      return { ok: false, reason }
+    }
   }
 
   // ── 同步全局唯一索引读(route authz seam 同步调用)────────────────────────────────────
