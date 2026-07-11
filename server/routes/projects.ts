@@ -1,6 +1,8 @@
 // server/routes/projects.ts
 // T1.3 前置:/api/projects — 项目 CRUD(document 域)+ deleteProject 原子级联软删(返修 #2/#7 + N1-N10)。
-// 权威:docs/decisions/api-surface.md §4.1(返修版二)。
+// T1.4 扩展:authz seam 接 PermissionBackend(memberRole + sharePermission + per-action 角色矩阵);
+//   GET / 合并 owned + shared(§13.5"被分享后项目出现在对方列表");DELETE 改 manage(owner-only,FX-7 §5.12)。
+// 权威:docs/decisions/api-surface.md §4.1(返修版二)+ docs/decisions/permission-schema.md §2(矩阵)。
 //
 // 返修要点(N1-N10):
 //  - #1/N7 owner/resourceOwner:resolveActor + authz seam(canAccessProject,action-aware);project id 全局唯一
@@ -10,14 +12,19 @@
 //  - #4/N5 If-Match 严格(parseIfMatch;invalid → 400,missing → 428,value → base);#5 wire 不带 revision。
 //  - #10/N4 幂等 key 作用域 owner+method+resourceKind+key + fingerprint;同 key 不同 body → 422 reuse-conflict。
 //  - #11/N1 request codec;#12 统一 413;#13 N/A(project payload={name},无镜像字段)。
+//
+// T1.4 越权语义(boundary 3:不改 #194 wire 契约):非成员/无分享 → 404 unknown-project(无泄漏,与 #194 一致);
+// 成员/分享越权 → 403 forbidden(server-local body,不入 shared 契约,DP-4 R-4);revoked share → 410 gone(FX-7 §5.9)。
 
 import { Hono } from 'hono'
+import type { Context } from 'hono'
 import { randomUUID } from 'node:crypto'
 import type { AppEnv } from '../lib/types'
 import { rejectInvalidMivoApiKey } from '../lib/keys'
 import { resolveActor } from '../lib/owner'
-import { canAccessProject } from '../lib/authz'
 import type { AuthzAction } from '../lib/authz'
+import { resolveProjectAccess, denyProjectResponse } from '../lib/projectAuthz'
+import type { PermissionBackend } from '../lib/permissions'
 import { newRequestId, logRequest } from '../lib/request'
 import {
   bodyError,
@@ -57,17 +64,16 @@ const toProject = (r: PersistRecord): Project => ({
 /** N5:malformed If-Match → 400 bad-request body。 */
 const badIfMatch = (id: string) => ({ error: 'bad-request' as const, message: 'If-Match must be a non-negative decimal safe integer', id })
 
-export const createProjectsRoutes = ({ backend }: { backend: PersistBackend }): Hono<AppEnv> => {
+export const createProjectsRoutes = ({ backend, permissions }: { backend: PersistBackend; permissions: PermissionBackend }): Hono<AppEnv> => {
   const route = new Hono<AppEnv>()
 
-  /** 返修 #1/N7:授权 seam——project id 全局唯一,未授权/不存在统一 404(无泄漏);授权后以 resourceOwner 查询。 */
-  const authzProject = (actor: string, id: string, action: AuthzAction): { ownerId: string } | null => {
-    const owner = backend.getProjectOwner(id)
-    if (!owner || canAccessProject(actor, owner.ownerId, action) === 'deny') return null
-    return owner
-  }
+  /** T1.4 授权 seam(委托 lib/projectAuthz;非成员 → 404,成员越权 → 403,revoked share → 410)。 */
+  const authzProject = (c: Context<AppEnv>, id: string, action: AuthzAction) =>
+    resolveProjectAccess(c, backend, permissions, id, action)
+  const denyProject = (c: Context<AppEnv>, requestId: string, t0: number, r: { ok: false; status: number; body: unknown }): Response =>
+    denyProjectResponse(c, requestId, t0, r)
 
-  // GET /api/projects — owner 全部未软删项目(T1.3 seam:owner===actor)。
+  // GET /api/projects — owned + shared(§13.5"被分享后项目出现在对方列表")。share-token 不适用 list(list 是 actor-scoped)。
   route.get('/', async (c) => {
     const requestId = newRequestId()
     c.header('X-Request-Id', requestId)
@@ -78,8 +84,17 @@ export const createProjectsRoutes = ({ backend }: { backend: PersistBackend }): 
       return bad
     }
     const actor = resolveActor(c)
-    const { records } = await backend.listByOwner(actor, 'project')
-    const body: ListProjectsResponse = { projects: records.map(toProject) }
+    const owned = await backend.listByOwner(actor, 'project')
+    const projects: Project[] = owned.records.map(toProject)
+    // T1.4:合并 shared(editor/viewer 成员资格可见的项目;§13.5)
+    const shared = await permissions.listSharedProjects(actor)
+    for (const { projectId } of shared) {
+      const owner = backend.getProjectOwner(projectId)
+      if (!owner) continue
+      const got = await backend.get(owner.ownerId, 'project', projectId)
+      if (got.kind === 'found' && !got.record.isDeleted) projects.push(toProject(got.record))
+    }
+    const body: ListProjectsResponse = { projects }
     logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0 })
     return c.json(body, 200)
   })
@@ -140,7 +155,7 @@ export const createProjectsRoutes = ({ backend }: { backend: PersistBackend }): 
     return c.json(toProject(result.record), status)
   })
 
-  // GET /api/projects/:id — 返修 #1/N7 授权 seam;跨 owner/不存在/已软删 → 404(无泄漏)。
+  // GET /api/projects/:id — T1.4 authz seam(read;share-token view/edit 读;跨 owner/不存在/已软删 → 404 无泄漏)。
   route.get('/:id', async (c) => {
     const requestId = newRequestId()
     c.header('X-Request-Id', requestId)
@@ -151,18 +166,12 @@ export const createProjectsRoutes = ({ backend }: { backend: PersistBackend }): 
       return bad
     }
     const id = c.req.param('id')
-    const actor = resolveActor(c)
-    const owner = authzProject(actor, id, 'read')
-    if (!owner) {
-      const err: UnknownResourceBody = { error: 'unknown-project' }
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
-      return c.json(err, 404)
-    }
-    const got = await backend.get(owner.ownerId, 'project', id)
+    const authz = await authzProject(c, id, 'read')
+    if (!authz.ok) return denyProject(c, requestId, t0, authz)
+    const got = await backend.get(authz.ownerId, 'project', id)
     if (got.kind === 'missing' || got.record.isDeleted) {
-      const err: UnknownResourceBody = { error: 'unknown-project' }
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
-      return c.json(err, 404)
+      return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
     }
     logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0 })
     return c.json(toProject(got.record), 200)
@@ -179,12 +188,8 @@ export const createProjectsRoutes = ({ backend }: { backend: PersistBackend }): 
       return bad
     }
     const id = c.req.param('id')
-    const actor = resolveActor(c)
-    const owner = authzProject(actor, id, 'write')
-    if (!owner) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
-    }
+    const authz = await authzProject(c, id, 'write')
+    if (!authz.ok) return denyProject(c, requestId, t0, authz)
     let raw: unknown
     let fingerprint: string
     try {
@@ -198,7 +203,7 @@ export const createProjectsRoutes = ({ backend }: { backend: PersistBackend }): 
       return c.json(body, status as 400 | 413)
     }
     const b = (raw ?? {}) as { name?: unknown }
-    const got = await backend.get(owner.ownerId, 'project', id)
+    const got = await backend.get(authz.ownerId, 'project', id)
     if (got.kind === 'missing' || got.record.isDeleted) {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
       return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
@@ -212,7 +217,7 @@ export const createProjectsRoutes = ({ backend }: { backend: PersistBackend }): 
       return c.json(badIfMatch(id), 400)
     }
     const base = parsed.kind === 'value' ? parsed.revision : undefined
-    const result = await backend.upsert(owner.ownerId, 'project', id, { name } satisfies ProjectPayload, {
+    const result = await backend.upsert(authz.ownerId, 'project', id, { name } satisfies ProjectPayload, {
       base,
       scope: 'document',
       method: 'PATCH',
@@ -250,7 +255,7 @@ export const createProjectsRoutes = ({ backend }: { backend: PersistBackend }): 
   })
 
   // DELETE /api/projects/:id — 返修 #2/#7:softDeleteProjectTree 原子级联(project + canvas meta + chat-collection)。
-  // idempotent:删已软删 → 204;不存在 → 404。N7 authz(write)。
+  // T1.4:action=manage(owner-only,FX-7 §5.12:editor deleteProject → 403)。idempotent:删已软删 → 204;不存在 → 404。
   route.delete('/:id', async (c) => {
     const requestId = newRequestId()
     c.header('X-Request-Id', requestId)
@@ -261,19 +266,15 @@ export const createProjectsRoutes = ({ backend }: { backend: PersistBackend }): 
       return bad
     }
     const id = c.req.param('id')
-    const actor = resolveActor(c)
-    const owner = authzProject(actor, id, 'write')
-    if (!owner) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
-      return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
-    }
-    const got = await backend.get(owner.ownerId, 'project', id)
+    const authz = await authzProject(c, id, 'manage')
+    if (!authz.ok) return denyProject(c, requestId, t0, authz)
+    const got = await backend.get(authz.ownerId, 'project', id)
     if (got.kind === 'missing') {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
       return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
     }
     if (!got.record.isDeleted) {
-      await backend.softDeleteProjectTree(owner.ownerId, id)
+      await backend.softDeleteProjectTree(authz.ownerId, id)
     }
     logRequest({ method: c.req.method, path: c.req.path, requestId, status: 204, latencyMs: Date.now() - t0 })
     return c.body(null, 204)
