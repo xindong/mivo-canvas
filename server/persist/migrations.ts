@@ -119,6 +119,23 @@ DROP TABLE IF EXISTS share_links;
 DROP TABLE IF EXISTS project_members;
 `
 
+// DP-6R chat per-user 重拆(2026-07-12):无 schema 变更,无数据搬迁——cutover checkpoint + 文档语义。
+// 现状(重拆前):chat-message.owner_id = canvas owner(共享 collection),成员 GET 读全部 → Gate2 启用即隐私违约。
+// 重拆后:chat-message.owner_id = actor(写入者本人,per-actor 私有),PK=(actor,'chat-message',messageId)。
+//   - chat-collection 仍 per-canvas under canvas owner(随 canvas 原子创建/软删/恢复),不含 per-actor 状态。
+//   - chat-message 写入不 bump 共享 canvas contentVersion(chat per-user,非共享画布内容)。
+//   - 旧 owner chat(owner_id=canvasOwner)无需搬迁:owner 的 actor === canvasOwner → owner GET 仍见;成员不获复制。
+//     Gate2 生产未启用前无成员 chat,故无数据移动;dev/staging 若有成员 chat under canvasOwner,重拆后归 owner。
+//   - 匿名 share-link 访客(actor=null)chat 读写一律 401 require-login。
+// 本 migration 仅落 COMMENT 标注语义(可重放);G3 export/ingest/verify 的 chat per-actor 校验脚本待 cutover 实现。
+const CHAT_PER_ACTOR_COMMENT = sql`
+COMMENT ON TABLE persist_records IS 'DP-5 信封列 + payload jsonb. DP-6R(2026-07-12): chat-message.owner_id = actor(写入者本人, per-actor 私有, PK=(actor,chat-message,messageId)); chat-collection 仍 per-canvas under canvas owner. 匿名访客 chat 读写 401 require-login.';
+`
+
+const CHAT_PER_ACTOR_COMMENT_DROP = sql`
+COMMENT ON TABLE persist_records IS NULL;
+`
+
 /** migrations 以 ISO 日期前缀排序;migrator 按 key 字典序应用。 */
 export const migrations: Record<string, Migration> = {
   '2026_07_11_001_initial_persist_schema': {
@@ -135,6 +152,14 @@ export const migrations: Record<string, Migration> = {
     },
     async down(db): Promise<void> {
       await DROP_PERMISSIONS_SCHEMA.execute(db)
+    },
+  },
+  '2026_07_12_003_chat_per_actor': {
+    async up(db): Promise<void> {
+      await CHAT_PER_ACTOR_COMMENT.execute(db)
+    },
+    async down(db): Promise<void> {
+      await CHAT_PER_ACTOR_COMMENT_DROP.execute(db)
     },
   },
 }
