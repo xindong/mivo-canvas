@@ -1,21 +1,41 @@
 // src/canvas/actions/canvasActionEmitters.ts
-// T2.2 — effect-emission helpers extracted from canvasActionModel.ts (move-only commit).
+// T2.2 — effect-emission helpers (intent/emission layer split).
 //
-// LAYERING (arch-migration-execution-plan.md §4 P2 T2.2 — intent/emission split):
+// LAYERING (arch-migration-execution-plan.md §4 P2 T2.2):
 //   UI intent layer  = canvasActionModel.ts — menu/toolbar structure, enable conditions,
 //                     closures wired to the emitters below.  [stays]
 //   Emission layer   = this file — helpers that drive CanvasActionRuntime (the effect
-//                     exits). T2.2 rewires these to emit CanvasCommand via
-//                     applyCanvasCommand in a SEPARATE rewiring commit (not this one).
+//                     exits).
 //
-// This commit is a pure verbatim move: function bodies are byte-identical to their
-// origin in canvasActionModel.ts; verify with `git diff --color-moved`. The separate
-// `export { … }` block below is the only addition (makes the moved helpers importable
-// by the intent layer); it does not modify any function body.
+// HISTORY: commit 1 moved these verbatim from canvasActionModel.ts (byte-identical,
+// `git diff --color-moved` verifiable). commit 2 rewires the 22 sync applied-kind exits
+// to emit CanvasCommand via applyCanvasCommand; the 7 deferred (import-asset /
+// generate-* / mask-edit) stay as direct calls (applyCanvasCommand would throw
+// CanvasCommandDeferredError — exec-t23s2 lane handles their two-stage-asset apply).
+//
+// UNSWITCHED EXITS (5 kinds, 5 sites — direct runtime calls retained, per boundary 5
+// "无法等价切 command → 列入未切清单+原因,不许硬切改行为"):
+//   add-text-node / add-frame-node / add-ai-slot-node (createTextAt/Frame/AiSlot
+//   helpers), select-nodes (selectAll), 1-arg add-annotation-node
+//   (addAnnotationForPrimary).
+// ROOT CAUSE: the #205 executor contract (locked by canvasCommandExecutor.test.ts)
+// unpacks EVERY command field as a runtime arg including undefined optionals — so
+// `add-text-node` always calls `runtime.addTextNode(pos, undefined)` (2-arity). The
+// characterization tests (do-not-modify) assert the ORIGINAL omitted-arity call
+// `addTextNode(pos)` (1-arity); vitest toHaveBeenCalledWith rejects the extra
+// undefined arg. Real runtime behavior is identical, but the characterization
+// strict-arity matcher makes the rewiring non-equivalent at the gate. Resolving
+// requires a #205 contract decision (executor conditionally omits undefined
+// optionals + its tests relaxed) — tracked as follow-up after #208 (exec-t23s2
+// deferred-apply) lands; this lane does not touch the executor. The 4-arg
+// add-annotation-node site (beginImageEditPrompt) IS rewired: its original call
+// already passes explicit undefined for position, matching the executor's
+// full-arity unpack, so it is characterization-compatible.
 
 import type { CanvasActionRuntime, LayerMove } from './canvasActionTypes'
 import type { MarkupKind, SectionLockMode, ToolId } from '../../types/mivoCanvas'
 import type { DistributionAxis, SelectionAlignment, SelectionArrangeMode } from '../../store/canvasStore'
+import { applyCanvasCommand } from './canvasCommandExecutor'
 
 const primaryNodeId = (runtime: CanvasActionRuntime) => runtime.context.primaryNode?.id
 
@@ -23,24 +43,24 @@ const duplicateAction = (runtime: CanvasActionRuntime) => {
   const nodeId = primaryNodeId(runtime)
   if (!nodeId) return
 
-  if (runtime.context.kind === 'multi') runtime.duplicateSelectedNodes()
-  else runtime.duplicateNode(nodeId)
+  if (runtime.context.kind === 'multi') applyCanvasCommand({ kind: 'duplicate-selected-nodes' }, runtime)
+  else applyCanvasCommand({ kind: 'duplicate-node', nodeId }, runtime)
 }
 
 const deleteAction = (runtime: CanvasActionRuntime) => {
   const nodeId = primaryNodeId(runtime)
   if (!nodeId) return
 
-  if (runtime.context.kind === 'multi') runtime.deleteSelectedNodes()
-  else runtime.deleteNode(nodeId)
+  if (runtime.context.kind === 'multi') applyCanvasCommand({ kind: 'delete-selected-nodes' }, runtime)
+  else applyCanvasCommand({ kind: 'delete-node', nodeId }, runtime)
 }
 
 const moveLayerAction = (runtime: CanvasActionRuntime, move: LayerMove) => {
   const nodeId = primaryNodeId(runtime)
   if (!nodeId) return
 
-  if (runtime.context.kind === 'multi') runtime.moveSelectedLayer(move)
-  else runtime.moveNodeLayer(nodeId, move)
+  if (runtime.context.kind === 'multi') applyCanvasCommand({ kind: 'move-selected-layer', move }, runtime)
+  else applyCanvasCommand({ kind: 'move-node-layer', nodeId, move }, runtime)
 }
 
 const makeVariations = (runtime: CanvasActionRuntime) => {
@@ -56,6 +76,7 @@ const generateIntoPrimarySlot = (runtime: CanvasActionRuntime) => {
 }
 
 const addAnnotationForPrimary = (runtime: CanvasActionRuntime) => {
+  // T2.2 unswitched: 1-arg call; executor full-arity (4 args w/ undefined) ≠ characterization 1-arity. See top note.
   runtime.addAnnotationNode(primaryNodeId(runtime))
 }
 
@@ -68,13 +89,21 @@ const beginImageEditPrompt = (
   const nodeId = primaryNodeId(runtime)
   if (!nodeId) return
 
-  const noteId = runtime.addAnnotationNode(nodeId, undefined, instruction, {
-    operation,
-    title: `${titlePrefix} for ${runtime.context.primaryNode?.title || 'image'}`,
-  })
+  const noteId = applyCanvasCommand(
+    {
+      kind: 'add-annotation-node',
+      sourceNodeId: nodeId,
+      instruction,
+      options: {
+        operation,
+        title: `${titlePrefix} for ${runtime.context.primaryNode?.title || 'image'}`,
+      },
+    },
+    runtime,
+  )
   if (!noteId) return
 
-  runtime.setActiveTool('select')
+  applyCanvasCommand({ kind: 'set-active-tool', toolId: 'select' }, runtime)
   runtime.onEditText?.(noteId)
 }
 
@@ -115,7 +144,7 @@ const setSectionStyle = (
   const nodeId = primaryNodeId(runtime)
   if (!nodeId) return
 
-  runtime.updateSectionStyle(nodeId, style)
+  applyCanvasCommand({ kind: 'update-section-style', nodeId, style }, runtime)
 }
 
 const setMarkupStyle = (
@@ -125,21 +154,21 @@ const setMarkupStyle = (
   const nodeId = primaryNodeId(runtime)
   if (!nodeId) return
 
-  runtime.updateMarkupStyle(nodeId, style)
+  applyCanvasCommand({ kind: 'update-markup-style', nodeId, style }, runtime)
 }
 
 const setSectionLockMode = (runtime: CanvasActionRuntime, mode?: SectionLockMode) => {
   const nodeId = primaryNodeId(runtime)
   if (!nodeId) return
 
-  runtime.setSectionLockMode(nodeId, mode)
+  applyCanvasCommand({ kind: 'set-section-lock-mode', nodeId, mode }, runtime)
 }
 
 const removeSectionOnly = (runtime: CanvasActionRuntime) => {
   const nodeId = primaryNodeId(runtime)
   if (!nodeId) return
 
-  runtime.removeSectionOnly(nodeId)
+  applyCanvasCommand({ kind: 'remove-section-only', nodeId }, runtime)
 }
 
 const sectionStyleStateFor = (runtime: CanvasActionRuntime) => {
@@ -154,7 +183,7 @@ const sectionStyleStateFor = (runtime: CanvasActionRuntime) => {
 }
 
 const setTool = (runtime: CanvasActionRuntime, toolId: ToolId) => {
-  runtime.setActiveTool(toolId)
+  applyCanvasCommand({ kind: 'set-active-tool', toolId }, runtime)
 }
 
 const createTextAtContext = (runtime: CanvasActionRuntime) => {
@@ -168,6 +197,7 @@ const createTextAtContext = (runtime: CanvasActionRuntime) => {
     return
   }
 
+  // T2.2 unswitched: executor addTextNode(pos, undefined) ≠ characterization addTextNode(pos). See top note.
   runtime.addTextNode(runtime.canvasPosition)
 }
 
@@ -182,32 +212,43 @@ const createFrameAtContext = (runtime: CanvasActionRuntime) => {
     return
   }
 
+  // T2.2 unswitched: executor addFrameNode(pos, undefined, undefined) ≠ characterization addFrameNode(pos). See top note.
   runtime.addFrameNode(runtime.canvasPosition)
 }
 
 const createAiSlotAtContext = (runtime: CanvasActionRuntime) => {
   const position = runtime.canvasPosition || { x: 0, y: 0 }
+  // T2.2 unswitched: executor addAiSlotNode(pos, undefined, undefined) ≠ characterization addAiSlotNode(pos). See top note.
   runtime.addAiSlotNode({ x: position.x - 160, y: position.y - 160 })
 }
 
 const createMarkupAtContext = (runtime: CanvasActionRuntime, kind: MarkupKind) => {
   const position = runtime.canvasPosition || { x: 0, y: 0 }
-  runtime.addMarkupNode(kind, { x: position.x - 80, y: position.y - 48 }, { width: 160, height: 96 }, {
-    points:
-      kind === 'arrow' || kind === 'line'
-        ? [
-            { x: 8, y: 88 },
-            { x: 152, y: 8 },
-          ]
-        : kind === 'brush'
-          ? [
-              { x: 12, y: 62 },
-              { x: 44, y: 24 },
-              { x: 82, y: 64 },
-              { x: 132, y: 26 },
-            ]
-          : undefined,
-  })
+  applyCanvasCommand(
+    {
+      kind: 'add-markup-node',
+      markupKind: kind,
+      position: { x: position.x - 80, y: position.y - 48 },
+      geometry: { width: 160, height: 96 },
+      options: {
+        points:
+          kind === 'arrow' || kind === 'line'
+            ? [
+                { x: 8, y: 88 },
+                { x: 152, y: 8 },
+              ]
+            : kind === 'brush'
+              ? [
+                  { x: 12, y: 62 },
+                  { x: 44, y: 24 },
+                  { x: 82, y: 64 },
+                  { x: 132, y: 26 },
+                ]
+              : undefined,
+      },
+    },
+    runtime,
+  )
 }
 
 const importAssetAtContext = (runtime: CanvasActionRuntime) => {
@@ -220,20 +261,39 @@ const importAssetAtContext = (runtime: CanvasActionRuntime) => {
 }
 
 const selectAll = (runtime: CanvasActionRuntime) => {
+  // T2.2 unswitched: executor selectNodes(ids, undefined) ≠ characterization selectNodes(ids). See top note.
   runtime.selectNodes(runtime.allNodeIds)
 }
 
 const align = (runtime: CanvasActionRuntime, alignment: SelectionAlignment) => {
-  runtime.alignSelectedNodes(alignment)
+  applyCanvasCommand({ kind: 'align-selected-nodes', alignment }, runtime)
 }
 
 const distribute = (runtime: CanvasActionRuntime, axis: DistributionAxis) => {
-  runtime.distributeSelectedNodes(axis)
+  applyCanvasCommand({ kind: 'distribute-selected-nodes', axis }, runtime)
 }
 
 const arrange = (runtime: CanvasActionRuntime, mode: SelectionArrangeMode) => {
-  runtime.arrangeSelectedNodes(mode)
+  applyCanvasCommand({ kind: 'arrange-selected-nodes', mode }, runtime)
 }
+
+// T2.2 — zero-arg emitters for the quickbar/context-menu method-ref exits (copy/paste/
+// group/ungroup/toggle/hide/show). The UI-intent layer wires these as onClick handlers
+// instead of passing runtime.X directly, so command emission stays in this layer.
+const copySelectedNodes = (runtime: CanvasActionRuntime) =>
+  applyCanvasCommand({ kind: 'copy-selected-nodes' }, runtime)
+const pasteClipboardNodes = (runtime: CanvasActionRuntime) =>
+  applyCanvasCommand({ kind: 'paste-clipboard-nodes' }, runtime)
+const groupSelectedNodes = (runtime: CanvasActionRuntime) =>
+  applyCanvasCommand({ kind: 'group-selected-nodes' }, runtime)
+const ungroupSelectedNodes = (runtime: CanvasActionRuntime) =>
+  applyCanvasCommand({ kind: 'ungroup-selected-nodes' }, runtime)
+const toggleSelectedNodesLocked = (runtime: CanvasActionRuntime) =>
+  applyCanvasCommand({ kind: 'toggle-selected-nodes-locked' }, runtime)
+const hideSelectedNodes = (runtime: CanvasActionRuntime) =>
+  applyCanvasCommand({ kind: 'hide-selected-nodes' }, runtime)
+const showAllHiddenNodes = (runtime: CanvasActionRuntime) =>
+  applyCanvasCommand({ kind: 'show-all-hidden-nodes' }, runtime)
 
 
 // Exported for the UI-intent layer (canvasActionModel.ts). `setTool` is internal to
@@ -267,4 +327,11 @@ export {
   align,
   distribute,
   arrange,
+  copySelectedNodes,
+  pasteClipboardNodes,
+  groupSelectedNodes,
+  ungroupSelectedNodes,
+  toggleSelectedNodesLocked,
+  hideSelectedNodes,
+  showAllHiddenNodes,
 }

@@ -89,6 +89,13 @@ import {
   align,
   distribute,
   arrange,
+  copySelectedNodes,
+  pasteClipboardNodes,
+  groupSelectedNodes,
+  ungroupSelectedNodes,
+  toggleSelectedNodesLocked,
+  hideSelectedNodes,
+  showAllHiddenNodes,
 } from './canvasActionEmitters'
 
 const objectLabelFor = (context: CanvasSelectionContext) => {
@@ -628,7 +635,7 @@ export const contextMenuGroupsFor = (runtime: CanvasActionRuntime): CanvasAction
                   id: 'paste',
                   label: `Paste ${runtime.clipboardCount} item${runtime.clipboardCount > 1 ? 's' : ''}`,
                   icon: Clipboard,
-                  onClick: runtime.pasteClipboardNodes,
+                  onClick: () => pasteClipboardNodes(runtime),
                 },
               ]
             : []),
@@ -669,7 +676,7 @@ export const contextMenuGroupsFor = (runtime: CanvasActionRuntime): CanvasAction
                   id: 'show-hidden',
                   label: `Show ${runtime.hiddenCount} hidden object${runtime.hiddenCount > 1 ? 's' : ''}`,
                   icon: Eye,
-                  onClick: runtime.showAllHiddenNodes,
+                  onClick: () => showAllHiddenNodes(runtime),
                 },
               ]
             : []),
@@ -724,7 +731,7 @@ export const contextMenuGroupsFor = (runtime: CanvasActionRuntime): CanvasAction
           id: 'copy',
           label: context.kind === 'multi' ? `Copy ${selectedCount} ${objectLabel}` : `Copy ${objectLabel}`,
           icon: Copy,
-          onClick: runtime.copySelectedNodes,
+          onClick: () => copySelectedNodes(runtime),
         },
         {
           id: 'duplicate',
@@ -748,7 +755,7 @@ export const contextMenuGroupsFor = (runtime: CanvasActionRuntime): CanvasAction
                 id: 'paste',
                 label: `Paste ${runtime.clipboardCount} item${runtime.clipboardCount > 1 ? 's' : ''}`,
                 icon: Clipboard,
-                onClick: runtime.pasteClipboardNodes,
+                onClick: () => pasteClipboardNodes(runtime),
               },
             ]
           : []),
@@ -766,7 +773,7 @@ export const contextMenuGroupsFor = (runtime: CanvasActionRuntime): CanvasAction
                       id: 'group',
                       label: `Group ${selectedCount} objects`,
                       icon: Group,
-                      onClick: runtime.groupSelectedNodes,
+                      onClick: () => groupSelectedNodes(runtime),
                     },
                   ]
                 : []),
@@ -776,7 +783,7 @@ export const contextMenuGroupsFor = (runtime: CanvasActionRuntime): CanvasAction
                       id: 'ungroup',
                       label: 'Ungroup',
                       icon: Ungroup,
-                      onClick: runtime.ungroupSelectedNodes,
+                      onClick: () => ungroupSelectedNodes(runtime),
                     },
                   ]
                 : []),
@@ -786,7 +793,7 @@ export const contextMenuGroupsFor = (runtime: CanvasActionRuntime): CanvasAction
                       id: 'toggle-lock',
                       label: `${lockLabelFor(runtime)} ${objectLabel}`,
                       icon: runtime.context.nodes.some((node) => !node.locked) ? Lock : Unlock,
-                      onClick: runtime.toggleSelectedNodesLocked,
+                      onClick: () => toggleSelectedNodesLocked(runtime),
                     },
                   ]
                 : []),
@@ -796,7 +803,7 @@ export const contextMenuGroupsFor = (runtime: CanvasActionRuntime): CanvasAction
                       id: 'hide',
                       label: `Hide ${objectLabel}`,
                       icon: EyeOff,
-                      onClick: runtime.hideSelectedNodes,
+                      onClick: () => hideSelectedNodes(runtime),
                     },
                   ]
                 : []),
@@ -1096,9 +1103,9 @@ export const quickToolbarGroupsFor = (runtime: CanvasActionRuntime): CanvasActio
         actions: [
           { id: 'duplicate', label: 'Duplicate', icon: Copy, onClick: () => duplicateAction(runtime) },
           ...(hasGroupedNodes(runtime)
-            ? [{ id: 'ungroup', label: 'Ungroup', icon: Ungroup, onClick: runtime.ungroupSelectedNodes }]
+            ? [{ id: 'ungroup', label: 'Ungroup', icon: Ungroup, onClick: () => ungroupSelectedNodes(runtime) }]
             : hasCommonCapability(context, 'groupable')
-              ? [{ id: 'group', label: 'Group', icon: Group, onClick: runtime.groupSelectedNodes }]
+              ? [{ id: 'group', label: 'Group', icon: Group, onClick: () => groupSelectedNodes(runtime) }]
               : []),
           {
             id: 'align-menu',
@@ -1120,7 +1127,7 @@ export const quickToolbarGroupsFor = (runtime: CanvasActionRuntime): CanvasActio
             id: 'toggle-lock',
             label: lockLabelFor(runtime),
             icon: context.nodes.some((node) => !node.locked) ? Lock : Unlock,
-            onClick: runtime.toggleSelectedNodesLocked,
+            onClick: () => toggleSelectedNodesLocked(runtime),
           },
           ...(hasCommonCapability(context, 'layerable')
             ? [{ id: 'bring-front', label: 'Front', icon: ChevronsUp, onClick: () => moveLayerAction(runtime, 'front') }]
