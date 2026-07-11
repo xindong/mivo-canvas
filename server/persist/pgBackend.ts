@@ -71,11 +71,22 @@ interface IdempotencyTable {
   envelope_id: string
   created_at: Generated<Date>
 }
+/**
+ * DP-6R P1-2:per-actor×canvas chat collection 独立乐观锁 cursor(orderRevision)。
+ * PK=(actor_id, canvas_id);reorder 事务内 compare+bump。与共享 canvas contentVersion 解耦。
+ */
+interface ChatOrderRevisionsTable {
+  actor_id: string
+  canvas_id: string
+  revision: Generated<number>
+  updated_at: Generated<Date>
+}
 interface Database {
   persist_records: PersistRecordsTable
   projects: GlobalIndexTable
   canvases: GlobalIndexTable
   idempotency_index: IdempotencyTable
+  chat_order_revisions: ChatOrderRevisionsTable
 }
 
 const clone = <T>(value: T): T => structuredClone(value)
@@ -285,6 +296,61 @@ export class PgPersistBackend implements PersistBackend {
       .forUpdate()
       .executeTakeFirst()
     return r ? Number(r.content_version ?? 0) : 0
+  }
+
+  /**
+   * DP-6R P1-2:GET /chat 用——读 per-actor×canvas chat collection orderRevision(缺省 0;行不存在即 0)。
+   * 非事务读(反映已提交状态);供 route 返 ListChatMessagesResponse.orderRevision。
+   */
+  async getChatOrderRevision(ownerId: string, canvasId: string): Promise<Revision> {
+    await this.ready
+    const r = await this.db
+      .selectFrom('chat_order_revisions')
+      .select('revision')
+      .where('actor_id', '=', ownerId)
+      .where('canvas_id', '=', canvasId)
+      .executeTakeFirst()
+    return r ? Number(r.revision) : 0
+  }
+
+  /**
+   * DP-6R P1-2:事务内原子 compare+bump chat orderRevision(单语句,无 get-then-upsert TOCTOU)。
+   *
+   * `INSERT (revision=1) ON CONFLICT (actor,canvas) DO UPDATE SET revision=revision+1 WHERE revision=base RETURNING revision`:
+   *   - 行不存在(base=0 隐式匹配)→ INSERT revision=1 → 返 ok(1);
+   *   - 行存在且 base===current → ON CONFLICT UPDATE 命中 → revision+1 → 返 ok(newRev);
+   *   - 行存在且 base!==current(stale)→ ON CONFLICT UPDATE WHERE revision=base 不命中 → 0 rows → 返 conflict(current)。
+   *
+   * 并发:两同 base reorder——赢家 INSERT/UPDATE 成功提交;输家的 INSERT/UPDATE 阻塞至赢家提交后,
+   * revision 已 bump,WHERE revision=base 不命中 → 0 rows → conflict。即"同 base 两并发一成一败"。
+   * 不需要 FOR UPDATE 预锁:PK INSERT + WHERE revision=base 已原子串行,无 get-then-upsert 间隙。
+   */
+  private async bumpChatOrderRevisionInTrx(
+    trx: Kysely<Database>,
+    ownerId: string,
+    canvasId: string,
+    base: Revision,
+  ): Promise<{ kind: 'ok'; newRevision: number } | { kind: 'conflict'; current: number }> {
+    const row = await trx
+      .insertInto('chat_order_revisions')
+      .values({ actor_id: ownerId, canvas_id: canvasId, revision: 1 })
+      .onConflict((oc) =>
+        oc
+          .columns(['actor_id', 'canvas_id'])
+          .doUpdateSet({ revision: sql`chat_order_revisions.revision + 1`, updated_at: new Date() })
+          .where('chat_order_revisions.revision', '=', base),
+      )
+      .returning('revision')
+      .executeTakeFirst()
+    if (row) return { kind: 'ok', newRevision: Number(row.revision) }
+    // 0 rows:行存在但 revision !== base(stale)→ 读 current 供 client rebase。
+    const cur = await trx
+      .selectFrom('chat_order_revisions')
+      .select('revision')
+      .where('actor_id', '=', ownerId)
+      .where('canvas_id', '=', canvasId)
+      .executeTakeFirst()
+    return { kind: 'conflict', current: cur ? Number(cur.revision) : 0 }
   }
 
   /**
@@ -956,7 +1022,7 @@ export class PgPersistBackend implements PersistBackend {
     type: PersistType,
     id: string,
     payload: unknown,
-    opts: { base?: Revision; idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string },
+    opts: { base?: Revision; idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string; strictUpdate?: boolean },
   ): Promise<UpsertChildResult> {
     await this.ready
     return this.withIdempotencyGuard(
@@ -976,6 +1042,10 @@ export class PgPersistBackend implements PersistBackend {
           }
           const existing = await trx.selectFrom('persist_records').selectAll().where('owner_id', '=', ownerId).where('type', '=', type).where('id', '=', id).executeTakeFirst()
           if (existing && existing.canvas_id !== canvasId) return { kind: 'cross-canvas' }
+          // DP-6R P2-1:strict-update(chat PATCH)——actor bucket 无此 id/已删 → not-found(route 404 unknown-message),
+          // 不许借 PATCH create 己方副本(POST 是唯一 create 入口)。事务内 SELECT + 拒绝,不走 create 的 INSERT ON
+          // CONFLICT,无 get-then-upsert TOCTOU(create-on-missing 是旧 bug;strict-update 只拒绝,不 create)。
+          if (opts.strictUpdate && (!existing || existing.is_deleted)) return { kind: 'not-found' }
           if (!existing || existing.is_deleted) {
             const base = opts.base ?? 0
             const rev = existing ? Number(existing.revision) + 1 : Math.max(0, base)
@@ -1054,12 +1124,28 @@ export class PgPersistBackend implements PersistBackend {
       for (const id of orderedIds) {
         if (!liveIds.has(id)) return { kind: 'bad', reason: 'mismatch' }
       }
-      // N8/F5:If-Match(contentVersion base)必填——stale → 409(两并发一成一 409)。P1-1:FOR UPDATE 锁 canvas meta 行
+      // DP-6R P1-2:chat-message 走 per-actor×canvas **独立 orderRevision** compare+bump(非共享 cv)。
+      // 单语句原子(INSERT ON CONFLICT WHERE revision=base;无 get-then-upsert TOCTOU):同 base 两并发一成一败;
+      // node 写 bump 共享 cv 不触此 cursor → node 写不使 chat reorder 误 409;A/B 不同 actor 各自独立行互不冲突。
+      if (type === 'chat-message') {
+        const bump = await this.bumpChatOrderRevisionInTrx(trx, ownerId, canvasId, opts.base)
+        if (bump.kind === 'conflict') return { kind: 'conflict', currentContentVersion: bump.current }
+        // 原子:事务内逐行重分配 orderKey(actor 自己的 collection);事务失败全回滚(含 bump 回滚)。chat 不 bump 共享 cv。
+        for (let i = 0; i < orderedIds.length; i++) {
+          await trx
+            .updateTable('persist_records')
+            .set({ order_key: i, updated_at: new Date() })
+            .where('owner_id', '=', ownerId)
+            .where('canvas_id', '=', canvasId)
+            .where('type', '=', type)
+            .where('id', '=', orderedIds[i])
+            .execute()
+        }
+        return { kind: 'ok', reordered: orderedIds.length, contentVersion: bump.newRevision }
+      }
+      // N8/F5:node/edge/anchor——If-Match base = 共享 canvas contentVersion;FOR UPDATE 锁 canvas meta 行
       // 序列化并发(赢家 bump 提交后输家才读到新 cv → base≠cv → conflict;旧实现无锁,两并发都读到旧 cv → 双 ok)。
-      // DP-6R:chat-message per-actor(ownerId=actor from route)。canvas meta(contentVersion 持有者)在 canvas owner
-      // 名下,不在 actor bucket——chat reorder 的 cv base 读 canvas owner;chat 不 bump 共享 cv(node/edge/anchor 不变)。
-      const cvOwnerId = type === 'chat-message' ? (this.getCanvasOwner(canvasId)?.ownerId ?? ownerId) : ownerId
-      const currentCv = await this.canvasContentVersionInTrx(trx, cvOwnerId, canvasId)
+      const currentCv = await this.canvasContentVersionInTrx(trx, ownerId, canvasId)
       if (opts.base !== currentCv) return { kind: 'conflict', currentContentVersion: currentCv }
       // 原子:事务内逐行重分配 orderKey(parameterized UPDATE,防 SQL 注入;事务失败全回滚)+ bump contentVersion。
       for (let i = 0; i < orderedIds.length; i++) {
@@ -1072,8 +1158,7 @@ export class PgPersistBackend implements PersistBackend {
           .where('id', '=', orderedIds[i])
           .execute()
       }
-      // DP-6R:chat-message per-actor 私有,不 bump 共享 canvas contentVersion(reorder 只重排 actor 自己的 orderKey)。
-      const newCv = type === 'chat-message' ? currentCv : await this.bumpCanvasContentVersionInTrx(trx, cvOwnerId, canvasId)
+      const newCv = await this.bumpCanvasContentVersionInTrx(trx, ownerId, canvasId)
       return { kind: 'ok', reordered: orderedIds.length, contentVersion: newCv }
     })
   }
@@ -1217,6 +1302,7 @@ export class PgPersistBackend implements PersistBackend {
       await trx.deleteFrom('persist_records').execute()
       await trx.deleteFrom('projects').execute()
       await trx.deleteFrom('canvases').execute()
+      await trx.deleteFrom('chat_order_revisions').execute()
     })
   }
 

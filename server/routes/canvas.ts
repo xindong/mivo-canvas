@@ -40,6 +40,7 @@ import type {
   CreateCanvasRequest,
   GetCanvasResponse,
   ListCanvasResponse,
+  ListChatMessagesResponse,
   RecordEntry,
   RequireLoginBody,
   ReuseConflictBody,
@@ -439,7 +440,8 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
     } else {
       reorderOwner = authz.ownerId
     }
-    // N5/F5:If-Match(contentVersion base)**必填**——invalid → 400;missing → 428(precondition-required);stale → 409(N8 两并发一成一 409)。
+    // N5/F5:If-Match base 必填——invalid → 400;missing → 428(precondition-required);stale → 409(两并发一成一 409)。
+    // DP-6R P1-2:type=chat-message 时 base = per-actor×canvas orderRevision(非共享 cv);node/edge/anchor base = 共享 contentVersion。
     const parsed = parseIfMatch(c.req.header('if-match'))
     if (parsed.kind === 'invalid') {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'bad-if-match' })
@@ -524,6 +526,11 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'cross-canvas' })
       return c.json({ error: `unknown-${type}` } satisfies UnknownResourceBody, 404)
     }
+    // not-found 仅 chat PATCH(strictUpdate)可触发;node/edge/anchor 非 strict 不走此分支,防御性 404。
+    if (result.kind === 'not-found') {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'unknown' })
+      return c.json({ error: `unknown-${type}` } satisfies UnknownResourceBody, 404)
+    }
     if (result.kind === 'precondition-required') {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 428, latencyMs: Date.now() - t0, note: 'precondition-required' })
       return c.json(preconditionRequired(childId), 428)
@@ -581,8 +588,10 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
     // DP-6R:chat per-user。匿名 share-link 访客(actor=null)→ 401 require-login;否则只读 actor 自己的 collection。
     if (authz.actor === null) return requireLogin(c, requestId, t0)
     const { records } = await backend.listByCanvas(authz.actor, canvasId, 'chat-message')
+    // DP-6R P1-2:返 per-actor×canvas chat collection orderRevision(client 作下次 chat reorder 的 If-Match base)。
+    const orderRevision = await backend.getChatOrderRevision(authz.actor, canvasId)
     logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0 })
-    return c.json({ messages: records.map(toEntry) }, 200)
+    return c.json({ messages: records.map(toEntry), orderRevision } satisfies ListChatMessagesResponse, 200)
   })
 
   // POST /api/canvas/:id/chat — append message(N3 ensureCreateChild canvas_id 校验;返修 #10 幂等复合 key + N4 reuse-conflict + N2 collection live)。
@@ -666,7 +675,8 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
     const msgId = c.req.param('msgId')
     const authz = await authzCanvas(c, canvasId, 'write')
     if (!authz.ok) return denyCanvas(c, requestId, t0, authz)
-    // DP-6R:chat per-user。匿名访客 → 401 require-login;PATCH upsert 到 actor 自己的 collection(非己 msgId → create 己方副本,不触他人)。
+    // DP-6R:chat per-user。匿名访客 → 401 require-login;P2-1:PATCH strict-update——actor bucket 无此 msgId/已删 → 404 unknown-message,
+    // 不借 PATCH create 己方副本(POST 是唯一 create 入口);非己 msgId 不触他人。
     if (authz.actor === null) return requireLogin(c, requestId, t0)
     // N5:If-Match 严格(invalid → 400,missing → 428,value → base)。
     const parsed = parseIfMatch(c.req.header('if-match'))
@@ -675,21 +685,23 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
       return c.json(badIfMatch(msgId), 400)
     }
     const base = parsed.kind === 'value' ? parsed.revision : undefined
-    // DP-6R:存储 owner=actor(per-actor 私有)。
+    // DP-6R:存储 owner=actor(per-actor 私有);strictUpdate:true → 不许借 PATCH create。
     const result = await backend.upsertChild(authz.actor, canvasId, 'chat-message', msgId, decoded.value.payload, {
       base,
       method: 'PATCH',
       resourceKind: 'chat-message',
       idempotencyKey: c.req.header('idempotency-key') || undefined,
       bodyFingerprint: decoded.fingerprint,
+      strictUpdate: true,
     })
     if (result.kind === 'reuse-conflict') {
       const err: ReuseConflictBody = reuseConflict(c.req.header('idempotency-key') ?? '')
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 422, latencyMs: Date.now() - t0, note: 'reuse-conflict' })
       return c.json(err, 422)
     }
-    if (result.kind === 'cross-canvas') {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'cross-canvas' })
+    if (result.kind === 'cross-canvas' || result.kind === 'not-found') {
+      // P2-1:非己/不存在 msgId(strict-update not-found)或跨 canvas(cross-canvas)→ 404 unknown-message,不新增 actor 副本。
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: result.kind === 'not-found' ? 'unknown-message' : 'cross-canvas' })
       return c.json({ error: 'unknown-message' } satisfies UnknownResourceBody, 404)
     }
     if (result.kind === 'precondition-required') {

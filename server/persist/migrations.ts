@@ -187,6 +187,14 @@ export const migrations: Record<string, Migration> = {
       await CHAT_PER_ACTOR_COMMENT_DROP.execute(db)
     },
   },
+  '2026_07_12_004_chat_order_revisions': {
+    async up(db): Promise<void> {
+      await CHAT_ORDER_REVISIONS_SCHEMA.execute(db)
+    },
+    async down(db): Promise<void> {
+      await CHAT_ORDER_REVISIONS_SCHEMA_DROP.execute(db)
+    },
+  },
 }
 
 export const MIGRATION_NAMES = Object.keys(migrations).sort()

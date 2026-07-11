@@ -47,7 +47,8 @@ export type PersistScope = 'document' | 'user'
  *   (listByCanvas / ensureCreateChild / upsertChild / hardDeleteChild / reorderChildren 对 chat-message 一律
  *   按 actor 分区)。匿名 share-link 访客(actor=null / 无稳定 identity)chat 读写一律 401 require-login。
  * - chat-message 写入(PATCH/POST/DELETE/reorder)**不 bump 共享 canvas contentVersion**(chat 是 per-user
- *   私有,非共享画布内容;client fetchCanvas 只返 nodes/edges/anchors,不含 chat)。
+ *   私有,非共享画布内容;client fetchCanvas 只返 nodes/edges/anchors,不含 chat)。reorder 的乐观锁走
+ *   **独立的 per-actor×canvas orderRevision**(见 ListChatMessagesResponse),与共享 cv 解耦。
  * - 旧 owner chat(ownerId=canvasOwner)无需搬迁:owner 的 actor === canvasOwner,故 owner GET 仍见旧数据;
  *   成员不获复制(Gate2 生产未启用前无成员 chat)。删/恢复画布只触 canvas meta + chat-collection
  *   (均 under canvasOwner),per-actor chat-message 活记录不动 → 不串 actor collection。
@@ -236,8 +237,11 @@ export type CreateCanvasRequest = {
 /**
  * Canvas meta wire shape(返修 #5 + #8)。
  * - `metaRevision`:canvas meta record 的 envelope revision(PUT /api/canvas/:id 的 If-Match base)。
- * - `contentVersion`:content(children)版本号——每次子资源(node/edge/anchor/chat)写入 backend bump,
+ * - `contentVersion`:content(children)版本号——每次**共享**子资源(node/edge/anchor)写入 backend bump,
  *   客户端据此探测 content 是否变化(与 metaRevision 独立,防止 meta 与 content 双真相混淆)。
+ *   **DP-6R(P1-2)**:`chat-message` 是 per-actor 私有,写入/reorder **不 bump** 此 contentVersion
+ *   (chat 非共享画布内容);chat reorder 的乐观锁走独立的 per-actor×canvas `orderRevision`
+ *   (见 ListChatMessagesResponse),与共享 contentVersion 解耦——node 写不使 chat reorder 误 409。
  * - `sourceTemplateId`/`createdAt`/`move`(返修 #8 API 面补全,对齐 documentMeta)。
  */
 export type CanvasMeta = {
@@ -273,7 +277,19 @@ export type ListCanvasResponse = { canvases: CanvasMeta[] }
 /** POST /api/canvas/:id/chat。ChatMessage 17 字段不在此展开(payload 不透明)。 */
 export type CreateChatMessageRequest = { message: unknown }
 
-export type ListChatMessagesResponse = { messages: RecordEntry[] }
+/**
+ * GET /api/canvas/:id/chat 响应(DP-6R:per-actor collection)。
+ *
+ * `orderRevision`:**per-actor×canvas chat collection 的独立乐观锁 cursor**(DP-6R P1-2 真乐观锁)。
+ *   - 客户端读此值作为下次 `POST /api/canvas/:id/reorder`(type=chat-message)的 **If-Match base**;
+ *   - reorder 成功后,响应 `contentVersion` 字段携带 bump 后的新 orderRevision(client 据此更新本地 cursor);
+ *   - reorder 同事务 compare(base !== current → 409 revision-conflict)+ bump → 同 base 两并发一成一败;
+ *   - 与 canvas 共享 contentVersion **完全解耦**:node/edge/anchor 写入 bump 共享 cv 但**不**影响
+ *     chat orderRevision → node 写不使 chat reorder 误 409;A/B(不同 actor)各自独立 cursor,互不冲突。
+ *   - chat POST/PATCH/DELETE **不 bump** orderRevision(消息集合变化由 reorder 的 orderedIds 全等校验兜底,
+ *     非 reorder 竞争);仅 chat reorder 自身 bump。
+ */
+export type ListChatMessagesResponse = { messages: RecordEntry[]; orderRevision: Revision }
 
 // ── user-state(api-surface §4.3)────────────────────────────────────────────────
 
