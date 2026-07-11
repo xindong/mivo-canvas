@@ -74,6 +74,10 @@ function decode(value: unknown): unknown {
 // 空 ymap 触发 observeDeep(同步),resyncAll 读到 revision=undefined 的空 record → upsertNode
 // max(0,undefined)=NaN,且 NaN 一旦进 kernel(existing.revision+1=NaN)就再洗不掉(见 §C 修订
 // 双真相源测试)。transact 把 attach+全量 set 合成单事务,observer 只在末尾带完整 record 触发一次。
+//
+// ⚠️ 本 helper 是 **seeding 用**(把整 record 一次性灌进空 Y.Doc),非 CRDT 写路径——它 clear()+重建
+// 整 record 是"record 级替换"语义,并发时吞掉同节点的子字段更新(见 §B clear+rebuild 坑测试)。
+// N2 的真 CRDT 写路径必须**增量字段级 set**(只 set 改动的 key,永不 clear 整 record),方能保字段级 CRDT。
 function writeRecord(doc: Y.Doc, record: NodeRecord): void {
   const nodesMap: Y.Map<unknown> = doc.getMap('nodes')
   doc.transact(() => {
@@ -368,6 +372,31 @@ describe('N1-B: CRDT 并发合并', () => {
     // 保序——这对 order_key/z-order 类业务字段是 N2 必须正面处理的设计点(候选:
     // 显式 order_key 标量叶子 + LWW,或外部 y-protocols 之外的 order CRDT)。
   })
+
+  it('PITFALL(writeRecord clear+rebuild):整 record 替换语义吞掉并发子字段更新(N2 须增量字段级 set)', () => {
+    // Greptile P1:writeRecord 的 clear()+重建是"record 级替换",非字段级 CRDT。演示其吞字段:
+    // A 用 writeRecord 重写 node1(整 record),B 并发改 node1 旧 transform 子树的 y 叶子。
+    // 合并后 B 的 transform.y 更新丢失——A 的 clear 删了指向旧 transform 子树的 key,A 用
+    // 旧值建了新 transform 子树;B 对"已删旧子树"的 set 进不了新子树(孤儿,无 key 指向)。
+    const base = makeBase() // node1.transform = fullRecord.transform {x:10.5,y:-20,...}
+    const docA = cloneFrom(base)
+    const docB = cloneFrom(base)
+    // A:writeRecord 整 record 重写 node1(改 title,transform 用 fullRecord 旧值重建)
+    writeRecord(docA, { ...fullRecord, id: 'node1', title: 'A-rewritten' })
+    // B:并发改 node1 旧 transform 子树的 y 叶子
+    const bT = (docB.getMap('nodes').get('node1') as Y.Map<unknown>).get('transform') as Y.Map<unknown>
+    bT.set('y', 999)
+    // 双向交换
+    Y.applyUpdate(docA, Y.encodeStateAsUpdate(docB))
+    Y.applyUpdate(docB, Y.encodeStateAsUpdate(docA))
+    const merged = readRecord(docA, 'node1')!
+    // A 的 title 留(record 级替换的部分保留)
+    expect(merged.title).toBe('A-rewritten')
+    // B 的 transform.y=999 丢失!被 A 的 clear+重建整 transform 子树覆盖(y 回到 fullRecord 的 -20)
+    expect(merged.transform!.y).toBe(-20)
+    // 结论(给 N2):CRDT 写路径绝不能 clear 整 record;必须增量 set 改动的 key(如 §B
+    // 同 record 不同字段测试那样直接 aNode.set('transform', ...))。writeRecord 仅限非并发 seeding。
+  })
 })
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -396,10 +425,32 @@ class YDocKernelSync {
 
   constructor(kernel: MemoryDocKernel) {
     this.kernel = kernel
-    // observeDeep 回调不消费 events(只触发 resyncAll),故用零参箭头——既满足
-    // observeDeep 的 (events, transaction) => void 签名(少参可赋值),又不在 spike 源码里
-    // 引入 yjs d.ts 自带的 any(避开 no-explicit-any)。spike 原型只关心"节点 Y.Map 变了→重读投影"。
-    ;(this.yDoc.getMap('nodes') as Y.Map<unknown>).observeDeep(() => this.resyncAll())
+    // 增量投影(非全量 resyncAll):observeDeep 事件按 event.target/event.path 定位改动节点。
+    // 修掉 Greptile P1 两条:① 删除不投影(zombie)→ 顶层 nodesMap 的 delete key 调 kernel.deleteNode;
+    // ② 无关节点 revision 被递增(全量 forEach → 改成只动改动节点)。
+    // events 类型由 yjs d.ts 推断为 YEvent<any>(any 在 yjs d.ts,非本文件显式 any,不触 no-explicit-any)。
+    ;(this.yDoc.getMap('nodes') as Y.Map<unknown>).observeDeep((events) => {
+      const nodesMap = this.yDoc.getMap('nodes') as Y.Map<unknown>
+      for (const event of events) {
+        if (event.target === nodesMap) {
+          // 顶层 nodesMap 键增删:add/update→读+upsert;delete→kernel.deleteNode
+          for (const [id, change] of (event as Y.YMapEvent<unknown>).keys.entries()) {
+            if (change.action === 'delete') this.kernel.deleteNode(id)
+            else {
+              const ym = nodesMap.get(id)
+              if (ym instanceof Y.Map) this.upsertFromCrdt(ym)
+            }
+          }
+        } else {
+          // 嵌套改动(某节点 Y.Map 子字段变;含 Y.Array 变):event.path[0] = 节点 id,只 upsert 该节点
+          const id = event.path[0]
+          if (typeof id === 'string') {
+            const ym = nodesMap.get(id)
+            if (ym instanceof Y.Map) this.upsertFromCrdt(ym)
+          }
+        }
+      }
+    })
   }
 
   /** 写一条 record 进 Y.Doc(并触发 observer → kernel 反映)。 */
@@ -421,19 +472,12 @@ class YDocKernelSync {
     return this.kernel
   }
 
-  // spike 原型为简洁起见,observeDeep 触发时全量重读所有 node → upsertNode(非增量;
-  // N2 实装须按 Y.YMapEvent.path 增量读改动节点,避免 O(n) per change)。
-  private resyncAll(): void {
-    const nodesMap: Y.Map<unknown> = this.yDoc.getMap('nodes')
-    nodesMap.forEach((ymap) => {
-      if (!(ymap instanceof Y.Map)) return
-      const record = decode(ymap) as NodeRecord
-      // ⚠️ PITFALL(双真相源):此处走 kernel.upsertNode,它会 bump revision(existing.revision+1)。
-      // 即 Yjs 路径的 record.revision(=7)进 kernel 后变 8,与 Y.Map 里仍存的 7 **背离**。
-      // N2 实装必须 bypass 这条 LWW bump(改 kernel 加 setNodeFromCrdt,或 kernel 降级为
-      // Y.Doc 的只读投影)。本 spike 用此暴露坑,不绕过——见下方 'revision 双真相源坑' 测试。
-      this.kernel.upsertNode(record)
-    })
+  // ⚠️ PITFALL(双真相源,坑5/§3):仍走 kernel.upsertNode → bump revision(existing.revision+1)。
+  // 改动节点的 kernel revision 会与 Yjs record.revision 背离(见 §C 测试)。增量投影已让"无关节点
+  // 不再被递增"(Greptile P1 ③),但"改动节点自身 revision 背离 Yjs"这条 N2 根本坑仍在——
+  // 须加 setNodeFromCrdt bypass LWW,或 kernel 降级为 Y.Doc 只读投影。本 spike 暴露坑,不绕过。
+  private upsertFromCrdt(ymap: Y.Map<unknown>): void {
+    this.kernel.upsertNode(decode(ymap) as NodeRecord)
   }
 }
 
@@ -494,6 +538,36 @@ describe('N1-C: DocKernel 同步器接缝 + revision 双真相源坑', () => {
     expect(sync.getKernel().getNode(fullRecord.id)!.revision).toBe(8)
     // 结论:N2 不能让 kernel 自行 bump revision 与 Yjs 并存;立场见文件头注释 +
     // docs/spike/n1-yjs-mapping.md §3(revision 必须是 Yjs 派生值,且 CRDT 路径 bypass LWW 拒写)。
+  })
+
+  it('删除投影(Greptile P1 ②):Y.Doc 删 node → kernel.deleteNode,无 zombie', () => {
+    const sync = new YDocKernelSync(new MemoryDocKernel())
+    sync.write({ ...fullRecord, id: 'n-del-1', revision: 0 })
+    sync.write({ ...minimalRecord, id: 'n-del-2', revision: 0 })
+    expect(sync.getKernel().listNodes()).toHaveLength(2)
+    // 删 Y.Doc 里的 n-del-1 → observer 顶层 keys-changed delete → kernel.deleteNode
+    sync.yDoc.getMap('nodes').delete('n-del-1')
+    expect(sync.getKernel().getNode('n-del-1')).toBeUndefined()
+    expect(sync.getKernel().listNodes()).toHaveLength(1)
+    expect(sync.getKernel().listNodes()[0].id).toBe('n-del-2')
+  })
+
+  it('无关节点 revision 不再被递增(Greptile P1 ③):增量投影只动改动节点', () => {
+    // 两节点同灌入(均 revision=0);改 node A → kernel A revision bump,kernel B 不动。
+    // (全量 resyncAll 的旧设计会同时 bump B——增量投影修掉此放大。但 A 自身的 kernel
+    // revision 仍与 Yjs 背离,那是 §3 的根本坑,此测试只验"无关节点不被牵连"。)
+    const base = new Y.Doc()
+    writeRecord(base, { ...fullRecord, id: 'nA', revision: 0 })
+    writeRecord(base, { ...minimalRecord, id: 'nB', revision: 0 })
+    const baseUpdate = Y.encodeStateAsUpdate(base)
+    const sync = new YDocKernelSync(new MemoryDocKernel())
+    sync.applyRemoteUpdate(baseUpdate) // 灌两节点 → kernel 各 rev=0
+    expect(sync.getKernel().getNode('nA')!.revision).toBe(0)
+    expect(sync.getKernel().getNode('nB')!.revision).toBe(0)
+    // 改 nA 的 title → 增量 observer 只 upsert nA;kernel B 不动
+    ;(sync.yDoc.getMap('nodes').get('nA') as Y.Map<unknown>).set('title', 'A-changed')
+    expect(sync.getKernel().getNode('nA')!.revision).toBe(1) // A bump 0→1
+    expect(sync.getKernel().getNode('nB')!.revision).toBe(0) // B 未被牵连
   })
 })
 

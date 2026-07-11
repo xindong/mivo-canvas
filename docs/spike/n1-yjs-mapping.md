@@ -4,15 +4,16 @@
 > 日期:2026-07-11。
 > 任务来源:`docs/plan/arch-migration-execution-plan.md` §4「下一批·协作」N1(已授权)+ §0 成功定义 6。
 > 权威上游:`docs/decisions/record-schema.md`(§1 CRDT 映射规则 + §3 嵌套细化 + §8 裁决)、`docs/decisions/platform-architecture-2026-07-07.md`(§6 spike 直接对 Yjs 语义,不自研 LWW;§13.5 revision per-record 硬约束)。
-> 验证产物:`src/kernel/__spike__/yjs-mapping.spike.test.ts`(**15 tests 全绿,test body 合计 ~50ms,远低于 2s gate**)。
+> 验证产物:`src/kernel/__spike__/yjs-mapping.spike.test.ts`(**18 tests 全绿,test body 合计 ~60ms,远低于 2s gate**)。
 > 依赖变更:`yjs@^13.6.31` 入 devDependencies(不进生产 bundle,见 §5 核验)。
+> Greptile review:3 条 P1 全量吸收(增量投影修 zombie+revision 放大;clear+rebuild 坑补测;见 §2.2 坑5/坑7)。
 
 ---
 
 ## 0. TL;DR(结论先行)
 
 1. **record-schema.md 的纸面映射用真 yjs 跑通了**——代表性 NodeRecord(全嵌套 + unicode + 判别联合)无损往返 Y.Map/Y.Array;CRDT 字段级合并成立(不同节点 / 同 record 不同字段 / 嵌套叶子级并发都留;同字段并发 LWW 收敛)。**成功定义 6(CRDT-ready)通过。**
-2. **纸面没写、真跑暴露的 6 条坑**(§2):通用递归 codec 可行(因 schema 本就扁平无大 JSON blob);`Y.Map.toJSON()` 深安全但有 caveat;**`Y.Array` 无 move 原语 → order_key/z-order 须 delete+insert,并发 reorder 语义需 N2 正面处理**;detached YType 不持留 op;**revision↔Yjs 因果序是双真相源,CRDT 路径必须 bypass kernel 的 LWW bump,否则必丢数据**;两端独立建 base 合并会产生怪异并集(必须共享公共祖先)。
+2. **纸面没写、真跑暴露的 7 条坑**(§2):通用递归 codec 可行(因 schema 本就扁平无大 JSON blob);`Y.Map.toJSON()` 深安全但有 caveat;**`Y.Array` 无 move 原语 → order_key/z-order 须 delete+insert,并发 reorder 语义需 N2 正面处理**;detached YType 不持留 op;**revision↔Yjs 因果序是双真相源,CRDT 路径必须 bypass kernel 的 LWW bump,否则必丢数据**;两端独立建 base 合并会产生怪异并集(必须共享公共祖先);**`writeRecord` 的 clear+rebuild 是 record 级替换,并发时吞同节点子字段更新(Greptile P1 ①,N2 写路径必须增量字段级 set,永不 clear 整 record)**。
 3. **revision 调和立场(§3)**:CRDT doc 的 `revision` 必须是 Yjs 状态的**派生值**,不是独立 LWW 计数器;一个 record 要么走 CRDT 路径(Y.Update,交换即合并不拒写),要么走 legacy 路径(record 级 PATCH + revision LWW),**不能双仲裁**。
 4. **渲染面(§4)**:Yjs → record → node → projection → `useLeaferSpikeRenderer` 链路**无结构性阻碍**;N2 的 wiring 点在 store 层(把数据源从 canvasStore 换成 Yjs 观测投影),渲染层零改。
 5. **没有发现 record-schema.md 映射的真错误**——纸面映射正确,spike 只是补了"纸面没说但实跑会踩"的实现细节坑。无需改决策文档。
@@ -28,8 +29,8 @@ spike 不接线任何生产 store/渲染/服务端,只在本测试文件内 `imp
 | 组 | 验证项 | 结果 |
 |---|---|---|
 | A | 代表性 record 无损往返(full 全嵌套 + minimal 空数组/optional 缺省 + 边界数值 + unicode/emoji + 多节点共存 + toJSON 探针) | 6/6 ✅ |
-| B | CRDT 并发合并(不同节点 / 同 record 不同字段 / 嵌套叶子级 / 同字段 LWW / Y.Array 无 move) | 5/5 ✅ |
-| C | DocKernel 同步器接缝(Y.Doc→kernel 投影 + 远端 update 合并 + revision 双真相源坑暴露) | 3/3 ✅ |
+| B | CRDT 并发合并(不同节点 / 同 record 不同字段 / 嵌套叶子级 / 同字段 LWW / Y.Array 无 move / **writeRecord clear+rebuild 吞字段**) | 6/6 ✅ |
+| C | DocKernel 同步器接缝(Y.Doc→kernel 投影 + 远端 update 合并 + revision 双真相源坑暴露 + **删除投影 + 增量投影无 revision 放大**) | 5/5 ✅ |
 | D | LeaferJS 渲染面静态分析(链路类型对齐) | 1/1 ✅ |
 
 ---
@@ -63,9 +64,11 @@ spike 不接线任何生产 store/渲染/服务端,只在本测试文件内 `imp
 
 **坑4:detached `Y.Array`/`Y.Map` 不持留 op。** `new Y.Array()` 未挂进 `Y.Doc` 时,`push`/`set` 的 op 不会持久(spike 实测 `toArray()` 返回 `[]`)。所有 Y.Type 必须 `doc.getMap()/doc.getArray()` 或经 `nodesMap.set(key, ytype)` 挂进 Doc 才有效。N2 实装注意:不要"先 new 再 populate 再 attach",要在 `doc.transact` 内 attach+populate 原子完成。
 
-**坑5(leader 点名,N2 最大坑):revision ↔ Yjs 因果序 = 双真相源。** 详见 §3。
+**坑5(leader 点名,N2 最大坑):revision ↔ Yjs 因果序 = 双真相源。** 详见 §3。spike 原型已从"全量 resyncAll"升级为"增量投影(按 `event.path` 只动改动节点)",修掉 Greptile P1 ③——**无关节点的 kernel revision 不再被牵连递增**(测试 `无关节点 revision 不再被递增` 断言:改 nA 只 bump kernel nA,nB 不动)。但**改动节点自身的 kernel revision 仍与 Yjs 背离**(kernel `upsertNode` bump vs Y.Map record.revision 不变——测试 `revision 双真相源坑` 仍实证 7→8 背离),这条**根本坑不在 spike 修**,须 N2 加 `setNodeFromCrdt` bypass LWW 或 kernel 降级为 Y.Doc 只读投影。
 
 **坑6:两端独立建 base 合并会产生怪异并集。** 若两端各自 `writeRecord(fullRecord)`(各用自己的 yjs clientID 创建 base op),合并时两条独立 base 的 `fills` `Y.Array` 会被当并发新建 → 合并成 `[f-solid, b-fill]` 之类并集(spike 实测踩到)。正确做法:写一次公共 base,`encodeStateAsUpdate`,两端 `applyUpdate` 灌入(共享同一 clientID 的 base op),分叉后再改。N2 sync 协议必须保证"公共祖先"语义(initial sync 拉服务端全量 state,后续交换 diff)。
+
+**坑7(Greptile P1 ①):`writeRecord` 的 clear+rebuild 是 record 级替换,并发时吞同节点子字段更新。** `writeRecord` 的 `ymap.clear()` 删掉指向旧子树(transform Y.Map)的 key,再用旧值建新子树;若 B 并发改旧 transform 子树的叶子,该 set 作用在"已删孤儿旧子树"上,合不进 A 建的新子树 → B 的子字段更新丢失。spike 实测:A 用 writeRecord 重写 node1、B 并发改 `transform.y=999`,合并后 `transform.y` 回到 fullRecord 的 -20(B 的 999 丢失)。**结论**:`writeRecord` 仅限**非并发 seeding**(往空 Y.Doc 一次性灌 record);**N2 真 CRDT 写路径必须增量字段级 `set`(只 set 改动 key,永不 `clear` 整 record)**——§B 同 record 不同字段测试直接 `aNode.set('transform', ...)` 那样。注:Y.Doc 节点删除的 kernel 投影已补(增量 observer 顶层 `delete` key→`kernel.deleteNode`,Greptile P1 ②,zombie 修复,测试 `删除投影` 覆盖)。
 
 ---
 
@@ -160,7 +163,7 @@ N1 的产出(spike 测试 + 本文档 + yjs devDep)为 N2 立项提供:映射可
 ## 附:spike 测试文件结构索引
 
 `src/kernel/__spike__/yjs-mapping.spike.test.ts`:
-- 通用递归 codec:`encode`/`decode`/`writeRecord`/`readRecord`(attach+populate 须在 `doc.transact` 内原子,见坑4/坑5)
+- 通用递归 codec:`encode`/`decode`/`writeRecord`(seeding 用,clear+rebuild 非 CRDT 写路径,见坑7)/`readRecord`(attach+populate 须在 `doc.transact` 内原子,见坑4/坑5)
 - `fullRecord`(全嵌套 + unicode + 判别联合)/`minimalRecord`(空数组 + optional 全缺省)fixtures
-- §A 6 tests / §B 5 tests / §C 3 tests(YDocKernelSync 原型 + revision 双真相源坑)/ §D 1 test
-- 15 tests 全绿;tsc -b + eslint 全绿;test body ~50ms。
+- §A 6 tests / §B 6 tests(+writeRecord clear+rebuild 吞字段)/ §C 5 tests(YDocKernelSync 增量投影原型 + revision 双真相源坑 + 删除投影 + 无 revision 放大)/ §D 1 test
+- **18 tests 全绿**;tsc -b + eslint 全绿;test body ~60ms。
