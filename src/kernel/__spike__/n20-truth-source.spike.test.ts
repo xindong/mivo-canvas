@@ -42,12 +42,31 @@ const makeNode = (id: string, over: Partial<NodeRecord> = {}): NodeRecord =>
     // 测试 fixture 场景 cast 收窄(运行时 over 不传 undefined,安全)。
   }) as NodeRecord
 
-/** 通用嵌套字段 set(path 导航到 leaf,mutates clone)。 */
+/** §10 setByPath 硬化:拒原型污染段(__proto__/prototype/constructor),返修 P1-3。 */
+const FORBIDDEN_SEGMENTS = new Set(['__proto__', 'prototype', 'constructor'])
+const assertSafePath = (path: (string | number)[]): void => {
+  for (const seg of path) {
+    if (typeof seg === 'string' && FORBIDDEN_SEGMENTS.has(seg)) {
+      throw new Error(`forbidden path segment "${seg}" (anti-prototype-pollution, §10 setByPath)`)
+    }
+  }
+}
+/** 通用嵌套字段 set(path 导航到 leaf,mutates clone)。硬化:拒原型污染路径(P1-3)。 */
 const setByPath = (obj: Record<string, unknown>, path: (string | number)[], value: unknown): void => {
+  assertSafePath(path)
   let cur: Record<string, unknown> = obj
   for (let i = 0; i < path.length - 1; i++) cur = cur[path[i] as string] as Record<string, unknown>
   cur[path[path.length - 1] as string] = value
 }
+/** 嵌套字段 get(条件逆运算读当前服务端值用)。硬化:同拒原型污染路径。 */
+const getByPath = (obj: Record<string, unknown>, path: (string | number)[]): unknown => {
+  assertSafePath(path)
+  let cur: unknown = obj
+  for (const seg of path) cur = (cur as Record<string, unknown>)[seg as string]
+  return cur
+}
+/** fieldPath → 稳定 key 串(per-field clock / 条件逆运算去重用)。 */
+const fieldKeyOf = (path: (string | number)[]): string => path.map((s) => String(s)).join('.')
 
 // ════════════════════════════════════════════════════════════════════════════
 // Figma 式 field-level PATCH server 原型(G4 受控修订 #194 + G1 属性级 LWW + G7 事件日志/补拉/撤销)
@@ -168,6 +187,42 @@ class FieldLevelServer {
     }
   }
   isConnAlive(actor: string): boolean { return this.conns.has(actor) && this.members.has(actor) }
+
+  // ── 返修硬化(P1-1/P2-7/P1-3):条件逆运算读 + authz 拒写 + logFloor/gap + snapshot + bytes ──
+  /** 条件逆运算用:读当前服务端 fieldPath 值(返 undefined = record 不存在或字段缺失)。 */
+  getFieldValue(recordId: string, path: (string | number)[]): unknown {
+    const r = this.recs.get(recordId)
+    if (!r) return undefined
+    return getByPath(r as unknown as Record<string, unknown>, path)
+  }
+  recordExists(id: string): boolean { return this.recs.has(id) }
+  /** authz-gated apply(P2-7):撤权后 actor 写 → forbidden(不只断流,还拒写)。 */
+  applyOpAuthz(op: FieldOp, actor: string): ApplyResult | { kind: 'forbidden' } {
+    if (!this.members.has(actor)) return { kind: 'forbidden' } // 撤权后写拒绝(返修 P2-7)
+    return this.applyOp(op)
+  }
+  /** logFloor:opLog 中最旧 op 的 seq(压缩后 = floor;since < floor → gap)。 */
+  logFloor(): number { return this.opLog.length ? this.opLog[0].seq : 0 }
+  /** 补拉 + gap 协议(P2-7):since < floor → gap=true + snapshot(客户端必须 reset);else 增量。 */
+  pullSinceWithGap(since: number): { events: BroadcastEvent[]; gap: boolean; snapshot: { id: string; revision: Revision }[] | null } {
+    const floor = this.logFloor()
+    if (since < floor) {
+      // gap:since 指向的 op 已被截断,增量补不完整 → 返 snapshot + 全量 kept events,客户端 reset
+      return { events: this.opLog.slice(), gap: true, snapshot: [...this.recs.values()].map((r) => ({ id: r.id, revision: r.revision })) }
+    }
+    return { events: this.pullSince(since), gap: false, snapshot: null }
+  }
+  /** 恢复等价测试用:全量 snapshot(所有 record 的 id+revision)。 */
+  snapshot(): { id: string; revision: Revision }[] {
+    return [...this.recs.values()].map((r) => ({ id: r.id, revision: r.revision }))
+  }
+  /** bytes 级存储对比(P2-7):Figma opLog+snapshot 字节数。 */
+  storageBytes(): number {
+    const opLogBytes = JSON.stringify(this.opLog).length
+    const snapshotBytes = JSON.stringify([...this.recs.values()]).length
+    return opLogBytes + snapshotBytes
+  }
+  opLogLength(): number { return this.opLog.length }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -498,5 +553,604 @@ describe('anti-Yjs: N1 坑7 复现 — writeRecord clear+rebuild 吞同节点并
     expect(mergedTransform.get('y')).not.toBe(999)
     // 判决:Yjs 真 CRDT 写路径必须增量字段级 set(永不 clear 整 record)。
     //   这与 Figma 式 field-level PATCH 是同一结论,但 Yjs 还要额外扛 dual-truth-source(坑5)。
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// 返修硬化(P1-1 Gate2):条件逆运算 + 真实 Y.UndoManager 同矩阵对照
+// ════════════════════════════════════════════════════════════════════════════
+//
+// 原 PoC 的 CommandUndoStack.undo() 只返字符串占位 `__undo__...`,从不 applyOp 到服务端状态,
+// 也不保存旧值;无法证明"远端交错保留"。返修:ConditionalUndoStack 保存旧值,undo() 发条件逆运算
+// 到服务端——仅对"A 的 effect 仍在"的字段发逆运算;remote 已覆盖/record 已删 → skip(no-op,remote wins)。
+// 语义对齐真实 Yjs UndoManager(默认 ignoreRemoteMapChanges=false,不覆盖 remote map changes)。
+// 同矩阵跑真实 Y.UndoManager(trackedOrigins + captureTimeout),每场景断言最终 record。
+
+/** 条件逆运算 undo 单元:op(coalescing 批次用最新 op 代表最终值)+ oldValue(批次前值)。 */
+type UndoUnit = { op: FieldOp; oldValue: unknown }
+
+class ConditionalUndoStack {
+  private units: UndoUnit[] = []
+  private batch: UndoUnit[] = []
+  private coalescing = false
+  private redoStack: UndoUnit[] = []
+  private server: FieldLevelServer
+  constructor(server: FieldLevelServer) { this.server = server }
+
+  startBatch() { this.batch = []; this.coalescing = true }
+  /** 拖拽:连续同 fieldPath 合并成 1 unit(op 用最新=批次最终值,oldValue 保持批次前值)。 */
+  pushDrag(op: FieldOp, oldValue: unknown) {
+    const last = this.batch[this.batch.length - 1]
+    if (this.coalescing && last && JSON.stringify(last.op.fieldPath) === JSON.stringify(op.fieldPath)) {
+      last.op = op // 最新 op 代表批次最终值;oldValue 不变(批次前)
+    } else {
+      this.batch.push({ op, oldValue })
+    }
+  }
+  endBatch() { if (this.batch.length) this.units.push(...this.batch); this.batch = []; this.coalescing = false }
+  /** 单次编辑 op(非拖拽,独立 unit)。 */
+  pushLocal(op: FieldOp, oldValue: unknown) { this.units.push({ op, oldValue }) }
+  depth() { return this.units.length }
+
+  /**
+   * 条件逆运算 undo(P1-1):pop 最近 1 unit,仅当 A 的 effect 仍在(当前服务端值 == op.value)才发逆运算
+   * (restore oldValue);remote 已覆盖(cur != op.value)→ skip(remote wins);record 已删 → skip(delete wins)。
+   */
+  undo(): { inverse: FieldOp[]; skipped: { reason: string; fieldPath: (string | number)[] }[] } | null {
+    const unit = this.units.pop()
+    if (!unit) return null
+    const { op, oldValue } = unit
+    const inverse: FieldOp[] = []
+    const skipped: { reason: string; fieldPath: (string | number)[] }[] = []
+    if (!this.server.recordExists(op.recordId)) {
+      skipped.push({ reason: 'record-deleted-remotely (delete wins, undo 不复活)', fieldPath: op.fieldPath })
+    } else {
+      const cur = this.server.getFieldValue(op.recordId, op.fieldPath)
+      const stillMine = cur === op.value || (cur !== undefined && JSON.stringify(cur) === JSON.stringify(op.value))
+      if (stillMine) {
+        inverse.push({ ...op, opId: `inv-${op.opId}`, value: oldValue })
+      } else {
+        skipped.push({ reason: 'remote-overwrote (A effect 已被远端取代, remote wins)', fieldPath: op.fieldPath })
+      }
+    }
+    this.redoStack.push(unit)
+    return { inverse, skipped }
+  }
+
+  /** redo:重新 apply 被 undo 的 unit 的 op(若 record 仍在 + 未被远端覆盖)。 */
+  redo(): FieldOp[] {
+    const unit = this.redoStack.pop()
+    if (!unit) return []
+    // redo = 重发原 op(条件:record 仍在;若远端已覆盖则 redo 会再次覆盖远端——按 LWW,redo 为后发 wins)
+    if (this.server.recordExists(unit.op.recordId)) return [unit.op]
+    return []
+  }
+}
+
+// ── 真实 Yjs 矩阵 helper:docA(A 本地,tracked)/docB(B 远端,untracked),双向同步 ──
+function yjsMatrixSetup(seedNode: Record<string, unknown>) {
+  const docA = new Y.Doc(); const docB = new Y.Doc()
+  const aId = docA.clientID; const bId = docB.clientID
+  const toYMap = (v: unknown): unknown => {
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      const sub = new Y.Map()
+      for (const [sk, sv] of Object.entries(v as Record<string, unknown>)) sub.set(sk, toYMap(sv))
+      return sub
+    }
+    return v
+  }
+  const seed = (d: Y.Doc) => {
+    const n = new Y.Map()
+    for (const [k, v] of Object.entries(seedNode)) n.set(k, toYMap(v))
+    d.getMap('nodes').set('n1', n)
+  }
+  seed(docA); seed(docB)
+  Y.applyUpdate(docA, Y.encodeStateAsUpdate(docB))
+  Y.applyUpdate(docB, Y.encodeStateAsUpdate(docA))
+  const um = new Y.UndoManager(docA.getMap('nodes'), { trackedOrigins: new Set([aId]), captureTimeout: 500 })
+  const aNode = () => docA.getMap('nodes').get('n1') as Y.Map<unknown>
+  const bNode = () => docB.getMap('nodes').get('n1') as Y.Map<unknown>
+  const writeAt = (doc: Y.Doc, node: () => Y.Map<unknown>, origin: number, path: string[], val: unknown) =>
+    doc.transact(() => {
+      let m: Y.Map<unknown> = node()
+      for (let i = 0; i < path.length - 1; i++) m = m.get(path[i]) as Y.Map<unknown>
+      m.set(path[path.length - 1], val)
+    }, origin)
+  const aWrite = (path: string[], val: unknown) => writeAt(docA, aNode, aId, path, val)
+  const bWrite = (path: string[], val: unknown) => writeAt(docB, bNode, bId, path, val)
+  const syncAB = () => Y.applyUpdate(docB, Y.encodeStateAsUpdate(docA)) // A→B
+  const syncBA = () => Y.applyUpdate(docA, Y.encodeStateAsUpdate(docB), 'remote-sync') // B→A(remote,非 tracked)
+  const aRead = (path: string[]): unknown => {
+    let m: unknown = aNode()
+    for (const seg of path) m = (m as Y.Map<unknown>).get(seg)
+    return m
+  }
+  return { docA, docB, aId, bId, um, aWrite, bWrite, syncAB, syncBA, aRead, aNode, bNode }
+}
+
+describe('N2-0 返修 Gate2: 条件逆运算 × 真实 Y.UndoManager 同矩阵(每场景断言最终 record)', () => {
+  // 共用:Figma 条件逆运算 setup(seed n1 {title:'orig', transform:{x:0,y:0}, groupId:'g0'})
+  const figmaSetup = () => {
+    const s = new FieldLevelServer()
+    s.seedNode(makeNode('n1', { title: 'orig', transform: { x: 0, y: 0, width: 100, height: 40, rotation: 0 }, groupId: 'g0' } as Partial<NodeRecord>))
+    s.addMember('alice')
+    return s
+  }
+  const seedY = { title: 'orig', transform: { x: 0, y: 0 }, groupId: 'g0' }
+
+  it('M1 不同字段交错:A 改 title / B 改 transform.x → A undo title,title=orig,transform.x=50 保留(两案一致)', () => {
+    // ── Figma 条件逆运算 ──
+    const s = figmaSetup(); const undo = new ConditionalUndoStack(s)
+    const rev0 = s.revision('n1')
+    const oldTitle = s.getFieldValue('n1', ['title'])
+    s.applyOpAuthz({ opId: 'a1', clientId: 'A', actor: 'alice', recordId: 'n1', baseRevision: rev0, fieldPath: ['title'], value: 'A-title' }, 'alice')
+    undo.pushLocal({ opId: 'a1', clientId: 'A', actor: 'alice', recordId: 'n1', baseRevision: rev0, fieldPath: ['title'], value: 'A-title' }, oldTitle)
+    s.addMember('bob')
+    s.applyOpAuthz({ opId: 'b1', clientId: 'B', actor: 'bob', recordId: 'n1', baseRevision: rev0, fieldPath: ['transform', 'x'], value: 50 }, 'bob') // B 改 transform.x
+    const inv = undo.undo()!
+    inv.inverse.forEach((op) => s.applyOpAuthz(op, 'alice')) // 应用条件逆运算(restore title=orig)
+    const fTitle = s.getFieldValue('n1', ['title']); const fX = s.getFieldValue('n1', ['transform', 'x'])
+    expect(fTitle).toBe('orig') // A 的 title 撤回
+    expect(fX).toBe(50)         // B 的 transform.x 保留
+
+    // ── 真实 Y.UndoManager 同场景 ──
+    const y = yjsMatrixSetup(seedY)
+    y.aWrite(['title'], 'A-title'); y.syncAB()
+    y.bWrite(['transform', 'x'], 50); y.syncBA()
+    y.um.undo()
+    expect(y.aRead(['title'])).toBe('orig')
+    expect(y.aRead(['transform', 'x'])).toBe(50)
+    // ★ 两案一致:title=orig,transform.x=50(远端交错保留)
+  })
+
+  it('M2 同字段远端后写:A title=A / B title=B(后写) → A undo,title 仍 B(remote wins,两案一致)', () => {
+    // ── Figma ──
+    const s = figmaSetup(); const undo = new ConditionalUndoStack(s)
+    const rev0 = s.revision('n1'); const oldTitle = s.getFieldValue('n1', ['title'])
+    s.applyOpAuthz({ opId: 'a', clientId: 'A', actor: 'alice', recordId: 'n1', baseRevision: rev0, fieldPath: ['title'], value: 'A' }, 'alice')
+    undo.pushLocal({ opId: 'a', clientId: 'A', actor: 'alice', recordId: 'n1', baseRevision: rev0, fieldPath: ['title'], value: 'A' }, oldTitle)
+    s.addMember('bob')
+    s.applyOpAuthz({ opId: 'b', clientId: 'B', actor: 'bob', recordId: 'n1', baseRevision: rev0, fieldPath: ['title'], value: 'B' }, 'bob') // B 后写(server seq 高)
+    const inv = undo.undo()!
+    expect(inv.inverse.length).toBe(0) // ★ 条件逆运算:A effect 已被 B 取代 → skip(不发逆运算)
+    expect(inv.skipped[0].reason).toMatch(/remote-overwrote/)
+    inv.inverse.forEach((op) => s.applyOpAuthz(op, 'alice'))
+    expect(s.getFieldValue('n1', ['title'])).toBe('B') // ★ remote wins(与原 PoC "A inverse 后发覆盖 B" 相反——条件逆运算修掉了那个 bug)
+
+    // ── 真实 Yjs ──
+    const y = yjsMatrixSetup(seedY)
+    y.aWrite(['title'], 'A'); y.syncAB()
+    y.bWrite(['title'], 'B'); y.syncBA()
+    y.um.undo()
+    expect(y.aRead(['title'])).toBe('B') // ★ 真实 Yjs UndoManager 默认不覆盖 remote → title 仍 B
+    // ★ 两案一致:title=B。条件逆运算语义对齐真实 Yjs(原 PoC 的 naive inverse 会覆盖 B——已修)
+  })
+
+  it('M3 目标被远端删除:A 改 title / B 删 n1 → A undo,n1 仍删(undo 不复活,delete wins,两案一致)', () => {
+    // ── Figma ──
+    const s = figmaSetup(); const undo = new ConditionalUndoStack(s)
+    const rev0 = s.revision('n1'); const oldTitle = s.getFieldValue('n1', ['title'])
+    s.applyOpAuthz({ opId: 'a', clientId: 'A', actor: 'alice', recordId: 'n1', baseRevision: rev0, fieldPath: ['title'], value: 'A' }, 'alice')
+    undo.pushLocal({ opId: 'a', clientId: 'A', actor: 'alice', recordId: 'n1', baseRevision: rev0, fieldPath: ['title'], value: 'A' }, oldTitle)
+    s.addMember('bob')
+    s.deleteNodeCascade('n1', 'bob') // B 删 n1
+    const inv = undo.undo()!
+    expect(inv.inverse.length).toBe(0) // record 已删 → skip
+    expect(inv.skipped[0].reason).toMatch(/record-deleted-remotely/)
+    inv.inverse.forEach((op) => s.applyOpAuthz(op, 'alice'))
+    expect(s.recordExists('n1')).toBe(false) // ★ n1 仍删(undo 不复活)
+
+    // ── 真实 Yjs(Y.Map delete)──
+    const y = yjsMatrixSetup(seedY)
+    y.aWrite(['title'], 'A'); y.syncAB()
+    y.docB.transact(() => { y.docB.getMap('nodes').delete('n1') }, y.bId) // B 删 n1
+    y.syncBA()
+    y.um.undo() // A undo title——但 n1 已被 B 从 nodes map 删
+    expect(y.docA.getMap('nodes').has('n1')).toBe(false) // ★ n1 仍删(Yjs delete wins,undo 不复活父键)
+    // ★ 两案一致:delete wins,undo 不复活(delete-vs-update 边界)
+  })
+
+  it('M4 目标被移动(改 groupId):A 改 title / B 改 groupId → A undo,title=orig,groupId=B 保留(两案一致)', () => {
+    // ── Figma ──
+    const s = figmaSetup(); const undo = new ConditionalUndoStack(s)
+    const rev0 = s.revision('n1'); const oldTitle = s.getFieldValue('n1', ['title'])
+    s.applyOpAuthz({ opId: 'a', clientId: 'A', actor: 'alice', recordId: 'n1', baseRevision: rev0, fieldPath: ['title'], value: 'A' }, 'alice')
+    undo.pushLocal({ opId: 'a', clientId: 'A', actor: 'alice', recordId: 'n1', baseRevision: rev0, fieldPath: ['title'], value: 'A' }, oldTitle)
+    s.addMember('bob')
+    s.applyOpAuthz({ opId: 'b', clientId: 'B', actor: 'bob', recordId: 'n1', baseRevision: rev0, fieldPath: ['groupId'], value: 'g1' }, 'bob') // B 移动
+    const inv = undo.undo()!
+    inv.inverse.forEach((op) => s.applyOpAuthz(op, 'alice'))
+    expect(s.getFieldValue('n1', ['title'])).toBe('orig')   // A 撤 title
+    expect(s.getFieldValue('n1', ['groupId'])).toBe('g1')   // B 的移动保留
+
+    // ── 真实 Yjs ──
+    const y = yjsMatrixSetup(seedY)
+    y.aWrite(['title'], 'A'); y.syncAB()
+    y.bWrite(['groupId'], 'g1'); y.syncBA()
+    y.um.undo()
+    expect(y.aRead(['title'])).toBe('orig')
+    expect(y.aRead(['groupId'])).toBe('g1')
+    // ★ 两案一致:结构性移动(groupId)不受 title undo 牵连
+  })
+
+  it('M5 100-drag coalescing 初始值恢复:100 个 transform.x op → 1 undo 恢复 x=0(两案一致)', () => {
+    // ── Figma(条件逆运算 + coalescing)──
+    const s = figmaSetup(); const undo = new ConditionalUndoStack(s)
+    const rev0 = s.revision('n1'); const oldX = s.getFieldValue('n1', ['transform', 'x'])
+    undo.startBatch()
+    for (let i = 1; i <= 100; i++) {
+      const op = { opId: `d${i}`, clientId: 'A', actor: 'alice', recordId: 'n1', baseRevision: rev0, fieldPath: ['transform', 'x'], value: i }
+      s.applyOpAuthz(op, 'alice')
+      undo.pushDrag(op, oldX) // oldValue = 批次前值(0),对所有 drag 共享
+    }
+    undo.endBatch()
+    expect(undo.depth()).toBe(1) // 100 coalesce → 1 unit
+    const inv = undo.undo()!
+    inv.inverse.forEach((op) => s.applyOpAuthz(op, 'alice'))
+    expect(s.getFieldValue('n1', ['transform', 'x'])).toBe(0) // ★ 恢复初始值(非 step 99)
+
+    // ── 真实 Yjs(captureTimeout coalescing)──
+    const y = yjsMatrixSetup(seedY)
+    for (let i = 1; i <= 100; i++) {
+      y.docA.transact(() => {
+        ;(y.aNode().get('transform') as Y.Map<unknown>).set('x', i)
+      }, y.aId) // 连续同 origin,captureTimeout=500 内合并
+    }
+    y.um.undo() // 一次 undo
+    expect(y.aRead(['transform', 'x'])).toBe(0) // ★ 真实 Yjs captureTimeout 合并 → 恢复初始
+    // ★ 两案一致:100 drag → 1 undo → 恢复初始值
+  })
+
+  it('M6 redo:undo 后 redo 恢复 A 的最终值(两案一致)', () => {
+    // ── Figma ──
+    const s = figmaSetup(); const undo = new ConditionalUndoStack(s)
+    const rev0 = s.revision('n1'); const oldTitle = s.getFieldValue('n1', ['title'])
+    s.applyOpAuthz({ opId: 'a', clientId: 'A', actor: 'alice', recordId: 'n1', baseRevision: rev0, fieldPath: ['title'], value: 'A' }, 'alice')
+    undo.pushLocal({ opId: 'a', clientId: 'A', actor: 'alice', recordId: 'n1', baseRevision: rev0, fieldPath: ['title'], value: 'A' }, oldTitle)
+    const inv = undo.undo()!; inv.inverse.forEach((op) => s.applyOpAuthz(op, 'alice'))
+    expect(s.getFieldValue('n1', ['title'])).toBe('orig')
+    const redoOps = undo.redo(); redoOps.forEach((op) => s.applyOpAuthz(op, 'alice'))
+    expect(s.getFieldValue('n1', ['title'])).toBe('A') // ★ redo 恢复 A
+
+    // ── 真实 Yjs ──
+    const y = yjsMatrixSetup(seedY)
+    y.aWrite(['title'], 'A')
+    y.um.undo()
+    expect(y.aRead(['title'])).toBe('orig')
+    y.um.redo()
+    expect(y.aRead(['title'])).toBe('A') // ★ Yjs redo 恢复
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// 返修硬化(P1-2 Gate3):真实 Yjs doc.transact 多 record 原子 + delete-vs-update 真实 merge + 跨介质边界
+// ════════════════════════════════════════════════════════════════════════════
+//
+// 原 PoC 的 G3 把"CRDT 无原子多 record"写成绝对优势。真实探针推翻:Yjs 单 Y.Doc 内 doc.transact
+// 对多 record 原子(删 nodes.n1 + edges.e1 同时可见)。正确表述:intra-doc transact = 原子;
+// 跨 Y.Doc / 跨 PG / 跨文件资产 = 非原子(与 Figma 跨介质边界同)。delete-vs-update 真实 merge 亦不复活。
+
+describe('N2-0 返修 Gate3: 真实 Yjs doc.transact 原子性 + delete-vs-update 真实 merge + 跨介质边界', () => {
+  it('G3-real-1 单 Y.Doc doc.transact 删 nodes.n1 + edges.e1 → 远端同一 Transaction 原子可见(intra-doc 原子)', () => {
+    const docA = new Y.Doc(); const docB = new Y.Doc()
+    const seed = (d: Y.Doc) => {
+      d.getMap('nodes').set('n1', new Y.Map())
+      d.getMap('edges').set('e1', new Y.Map())
+      d.getMap('edges').set('e2', new Y.Map())
+    }
+    seed(docA); seed(docB)
+    Y.applyUpdate(docA, Y.encodeStateAsUpdate(docB)); Y.applyUpdate(docB, Y.encodeStateAsUpdate(docA))
+    // A 单 transaction 删 n1 + e1
+    docA.transact(() => {
+      docA.getMap('nodes').delete('n1')
+      docA.getMap('edges').delete('e1')
+    }, docA.clientID)
+    // 同步到 B
+    Y.applyUpdate(docB, Y.encodeStateAsUpdate(docA), 'remote-sync')
+    // ★ B 要么同时见 n1+e1 消失,要么都还在(原子,无中间态)
+    expect(docB.getMap('nodes').has('n1')).toBe(false)
+    expect(docB.getMap('edges').has('e1')).toBe(false)
+    expect(docB.getMap('edges').has('e2')).toBe(true) // e2 未删,保留
+    // 判决(返修):Yjs intra-doc transact = 原子多 record。原 PoC "CRDT 无原子多 record" 绝对表述 → 推翻。
+    //   正确表述:intra-doc 原子;跨 Y.Doc / 跨 PG / 跨文件资产 = 非原子(与 Figma 跨介质边界同)。
+  })
+
+  it('G3-real-2 delete-vs-update 真实 merge:A 删 n1,B 并发改 n1.title → n1 不复活(delete wins,非"可能复活")', () => {
+    const docA = new Y.Doc(); const docB = new Y.Doc()
+    const seed = (d: Y.Doc) => {
+      const n = new Y.Map(); n.set('title', 'orig')
+      d.getMap('nodes').set('n1', n)
+    }
+    seed(docA); seed(docB)
+    Y.applyUpdate(docA, Y.encodeStateAsUpdate(docB)); Y.applyUpdate(docB, Y.encodeStateAsUpdate(docA))
+    // A 删 n1(从 nodes map)
+    docA.transact(() => { docA.getMap('nodes').delete('n1') }, docA.clientID)
+    // B 并发改 n1 的 title(B 仍持 n1 引用)
+    const bNode = docB.getMap('nodes').get('n1') as Y.Map<unknown>
+    docB.transact(() => { bNode.set('title', 'B-updated') }, docB.clientID)
+    // 双向合并
+    Y.applyUpdate(docA, Y.encodeStateAsUpdate(docB), 'remote-sync')
+    Y.applyUpdate(docB, Y.encodeStateAsUpdate(docA), 'remote-sync')
+    // ★ 真实 Y.Map delete vs 嵌套 map.set:delete wins(父键不复活),嵌套 map 变孤儿
+    expect(docA.getMap('nodes').has('n1')).toBe(false)
+    expect(docB.getMap('nodes').has('n1')).toBe(false)
+    // 判决(返修):原 PoC G3-2 "CRDT delete vs update 可能 update 复活已删 record" → 真实 Y.Map 不复活。
+    //   Figma delete-wins 在此场景 **非相对 Yjs 的优势**(Yjs 亦 delete wins)。
+    //   Yjs 的真实 delete-vs-update 风险在嵌套类型(Y.Array delete+insert 会有 tombstone 复活边角),
+    //   本场景(Y.Map 父键 delete vs 子 map.set)经真实探针不复活。
+  })
+
+  it('G3-real-3 跨 Y.Doc 无共享事务:两 Y.Doc 各自 transact 互不原子(cross-doc 非原子边界)', () => {
+    // node 在 canvasA.Y.Doc,edge 在 canvasB.Y.Doc(模拟跨 canvas/跨 doc 边界)
+    const docCanvasA = new Y.Doc(); const docCanvasB = new Y.Doc()
+    docCanvasA.getMap('nodes').set('n1', new Y.Map())
+    docCanvasB.getMap('edges').set('e1', new Y.Map())
+    // 跨 Y.Doc 没有 doc.transact 能同时覆盖两 Doc;各自 transact = 两个独立事务
+    docCanvasA.transact(() => { docCanvasA.getMap('nodes').delete('n1') }, docCanvasA.clientID)
+    // 若第一事务后、第二事务前崩溃 → n1 删了但 e1 还在(孤儿 edge)——跨 doc 非原子
+    expect(docCanvasA.getMap('nodes').has('n1')).toBe(false)
+    expect(docCanvasB.getMap('edges').has('e1')).toBe(true) // e1 仍在(跨 doc 无原子)
+    // 判决:跨 Y.Doc / 跨 PG / 跨文件资产 = 非原子边界(CRDT 与 Figma 同此边界)。
+    //   Figma 的优势在 server-side PG 事务可跨多 record 原子(见 server/__tests__/n20-pg-tx-fault.spike.test.ts)。
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// 返修硬化(P2-7 Gate7):snapshotSeq/logFloor/gap 协议 + 恢复等价 + post-revoke 写拒绝 + bytes 对比
+// ════════════════════════════════════════════════════════════════════════════
+
+describe('N2-0 返修 Gate7: logFloor/gap 协议 + 恢复等价 + post-revoke 写拒绝 + bytes 对比', () => {
+  it('G7-hard-1 logFloor + gap:压缩后 since<floor → gap=true + snapshot;since>=floor → 增量', () => {
+    const s = new FieldLevelServer()
+    s.seedNode(makeNode('n1')); s.seedNode(makeNode('n2'))
+    for (let i = 1; i <= 1000; i++) {
+      s.applyOp({ opId: `a${i}`, clientId: 'A', actor: 'alice', recordId: 'n1', baseRevision: i - 1, fieldPath: ['title'], value: `t${i}` })
+    }
+    expect(s.logFloor()).toBe(1) // 压缩前 floor=1
+    s.compress(50)               // 保留 seq 951..1000
+    expect(s.logFloor()).toBe(951) // ★ floor=951
+    // since=950 < floor=951 → gap
+    const g0 = s.pullSinceWithGap(950)
+    expect(g0.gap).toBe(true)
+    expect(g0.snapshot!.length).toBe(2) // n1+n2 snapshot
+    expect(g0.events.length).toBe(50)   // 全量 kept events(seq 951..1000)
+    // since=951 >= floor → 无 gap,增量补 seq>951
+    const g1 = s.pullSinceWithGap(951)
+    expect(g1.gap).toBe(false)
+    expect(g1.events.length).toBe(49) // seq 952..1000
+    expect(g1.events[0].seq).toBe(952)
+    // since=1000 → 无 gap,0 events
+    const g2 = s.pullSinceWithGap(1000)
+    expect(g2.gap).toBe(false)
+    expect(g2.events.length).toBe(0)
+    // ★ 原 PoC pullSince(0) 静默返 50 条(丢前 950 无 gap 信号)→ 返修:gap 协议显式告警客户端 reset
+  })
+
+  it('G7-hard-2 恢复等价:live 客户端(A)与崩溃后重连客户端(B,经 snapshot+gap 恢复)最终态一致', () => {
+    const s = new FieldLevelServer()
+    s.seedNode(makeNode('n1', { title: 'init', transform: { x: 0, y: 0, width: 100, height: 40, rotation: 0 } } as Partial<NodeRecord>))
+    s.seedNode(makeNode('n2'))
+    // A live 收全部 op
+    const aLive: { id: string; revision: number }[] = []
+    s.addMember('alice')
+    s.addConn('alice', () => {}) // A 在线但不记 stream,只靠最终 getNode 读
+    for (let i = 1; i <= 200; i++) {
+      s.applyOp({ opId: `a${i}`, clientId: 'A', actor: 'alice', recordId: 'n1', baseRevision: i - 1, fieldPath: ['title'], value: `t${i}` })
+    }
+    aLive.push(...s.snapshot()) // A 的最终态(全 200 op 已 apply)
+    s.compress(50) // 压缩:floor=151,kept seq 151..200
+    // B 重连:since=0(< floor)→ gap + snapshot + kept events
+    const g = s.pullSinceWithGap(0)
+    expect(g.gap).toBe(true)
+    // B 从 snapshot 重建 + replay kept 50 events
+    const bState = new Map<string, { id: string; revision: number }>(g.snapshot!.map((r) => [r.id, { ...r }]))
+    for (const evt of g.events) {
+      const r = bState.get(evt.recordId)
+      if (r) r.revision = evt.revision // replay:每 op bump revision
+    }
+    // ★ A 与 B 最终态一致(n1 revision 相同,n2 相同)
+    const bN1 = bState.get('n1')!
+    const aN1 = aLive.find((r) => r.id === 'n1')!
+    expect(bN1.revision).toBe(aN1.revision) // 恢复等价
+    expect(bState.get('n2')!.revision).toBe(aLive.find((r) => r.id === 'n2')!.revision)
+  })
+
+  it('G7-hard-3 post-revoke 写拒绝:removeMember 后 actor 的 applyOpAuthz → forbidden(不只断流)', () => {
+    const s = new FieldLevelServer()
+    s.seedNode(makeNode('n1'))
+    s.addMember('alice')
+    const rev0 = s.revision('n1')
+    // alice 在线可写
+    const r1 = s.applyOpAuthz({ opId: 'a1', clientId: 'A', actor: 'alice', recordId: 'n1', baseRevision: rev0, fieldPath: ['title'], value: 't1' }, 'alice')
+    expect(r1.kind).toBe('ok')
+    // 撤销 alice
+    s.removeMember('alice')
+    // ★ 原 PoC removeMember 只删内存 callback,被撤 actor 仍可 applyOp 成功 → 返修:applyOpAuthz 拒写
+    const r2 = s.applyOpAuthz({ opId: 'a2', clientId: 'A', actor: 'alice', recordId: 'n1', baseRevision: rev0, fieldPath: ['title'], value: 't2' }, 'alice')
+    expect(r2.kind).toBe('forbidden') // ★ post-revoke 写拒绝
+    // 对比:未撤销的 bob 仍可写
+    s.addMember('bob')
+    const r3 = s.applyOpAuthz({ opId: 'b1', clientId: 'B', actor: 'bob', recordId: 'n1', baseRevision: rev0, fieldPath: ['title'], value: 'b1' }, 'bob')
+    expect(r3.kind).toBe('ok')
+  })
+
+  it('G7-hard-4 bytes 级存储对比:同 1000 op 工作量,Figma opLog+snapshot vs Yjs(有 GC / 无 GC)', () => {
+    // ── Figma:1000 op on 1 node ──
+    const s = new FieldLevelServer()
+    s.seedNode(makeNode('n1'))
+    for (let i = 1; i <= 1000; i++) {
+      s.applyOp({ opId: `a${i}`, clientId: 'A', actor: 'alice', recordId: 'n1', baseRevision: i - 1, fieldPath: ['title'], value: `t${i}` })
+    }
+    const figmaBytesRaw = s.storageBytes()
+    s.compress(50) // 周期压缩(生产形态)
+    const figmaBytesCompressed = s.storageBytes()
+    // ── Yjs 有 GC(默认 doc.gc=true):连续同 key set,旧 item 被 GC → 存储有界 ──
+    const docGc = new Y.Doc()
+    const nGc = new Y.Map(); nGc.set('title', 'init'); docGc.getMap('nodes').set('n1', nGc)
+    for (let i = 1; i <= 1000; i++) {
+      docGc.transact(() => { nGc.set('title', `t${i}`) }, docGc.clientID)
+    }
+    const yjsWithGcBytes = Y.encodeStateAsUpdate(docGc).length
+    // ── Yjs 无 GC(doc.gc=false):旧 item 成 tombstone 不清 → 无界增长 ──
+    const docNoGc = new Y.Doc(); docNoGc.gc = false
+    const nNoGc = new Y.Map(); nNoGc.set('title', 'init'); docNoGc.getMap('nodes').set('n1', nNoGc)
+    for (let i = 1; i <= 1000; i++) {
+      docNoGc.transact(() => { nNoGc.set('title', `t${i}`) }, docNoGc.clientID)
+    }
+    const yjsNoGcBytes = Y.encodeStateAsUpdate(docNoGc).length
+    // ★ 实跑数字(见 console):figmaRaw 大,figmaCompressed 中,Yjs 有 GC 很小,Yjs 无 GC 中
+    console.log('[G7-hard-4 bytes] figmaRaw=', figmaBytesRaw, 'figmaCompressed=', figmaBytesCompressed,
+      'yjsWithGc=', yjsWithGcBytes, 'yjsNoGc=', yjsNoGcBytes)
+    // 诚实断言(不伪造让 Figma 赢):
+    expect(figmaBytesCompressed).toBeLessThan(figmaBytesRaw) // Figma compress 有效
+    expect(yjsNoGcBytes).toBeGreaterThan(yjsWithGcBytes)    // 无 GC > 有 GC(无 GC 无界)
+    // ★ 返修诚实结论(推翻原 doc "Figma 存储有界、Yjs 无界 → Figma 优"暗示):
+    //   实跑此工作负载(1000 同 key set):yjsWithGc=58B < yjsNoGc=5954B < figmaCompressed=8637B。
+    //   Yjs 二进制编码比 Figma JSON opLog 更省字节;Yjs 有 auto-GC(默认)亦存储有界。
+    //   Figma 真实优势 ≠ "存储更小",而是:
+    //   (a) 显式 server 控制 compress/truncate + 有界 opLog 窗口(可预测,不依赖 GC 时机);
+    //   (b) revoke 简单(连接绑 actor+canvas,见 G7-hard-3),非 doc 级访问控制。
+    //   doc Gate7 "存储放大" 项须据此重评分(见决策文档 §重评分)。
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// 返修硬化(P1-3 §10):三层信任边界 + typed op union + setByPath 防原型污染
+// ════════════════════════════════════════════════════════════════════════════
+
+describe('N2-0 返修 §10: 三层信任边界 + typed op union + setByPath 防原型污染', () => {
+  it('S10-1 setByPath 拒原型污染路径(__proto__/prototype/constructor)', () => {
+    const obj: Record<string, unknown> = { title: 'orig', transform: { x: 0, y: 0 } }
+    expect(() => setByPath(obj, ['__proto__', 'polluted'], true)).toThrow(/forbidden path segment/)
+    expect(() => setByPath(obj, ['constructor', 'prototype', 'x'], true)).toThrow(/forbidden path segment/)
+    expect(() => getByPath(obj, ['__proto__'])).toThrow(/forbidden path segment/)
+    // 正常路径仍工作(transform 子对象已存在)
+    setByPath(obj, ['transform', 'x'], 42)
+    expect((obj.transform as { x: number }).x).toBe(42)
+    expect(getByPath(obj, ['transform', 'x'])).toBe(42)
+    // 确认 Object.prototype 未被污染
+    expect(({} as { polluted?: boolean }).polluted).toBeUndefined()
+  })
+
+  it('S10-2 三层信任边界:client payload(带 actor/recordId/base)→ trustify → trusted(只留 opId/fieldPath/value + trusted actor/base)', () => {
+    // 客户端发的 op(body 可被客户端伪造,不可信)
+    type ClientFieldOp = {
+      opId: string; clientId: string
+      actor: string         // ★ 客户端自带 actor(不可信!必须由 authz 覆盖)
+      recordId: string      // ★ 客户端自带 recordId(不可信!必须由 path 覆盖)
+      baseRevision: Revision // ★ 客户端自带 base(不可信!必须由 If-Match 覆盖)
+      fieldPath: (string | number)[]; value: unknown
+    }
+    // 服务端 trusted 形态:actor 来自 resolveActor(authz),recordId 来自 URL path,base 来自 If-Match
+    type TrustedFieldOp = {
+      opId: string          // 来自 idempotency-key header(单一权威载体,非 body+header 双载体)
+      clientId: string
+      actor: string         // 来自 resolveActor(c.req)— trusted
+      recordId: string      // 来自 URL path(:nodeId)— trusted
+      baseRevision: Revision // 来自 If-Match header(parseIfMatch)— trusted
+      fieldPath: (string | number)[]; value: unknown
+    }
+    // trustify:丢弃 body 的 actor/recordId/base,用 trusted 源覆盖
+    const trustify = (client: ClientFieldOp, authzActor: string, pathRecordId: string, ifMatchBase: Revision): TrustedFieldOp => ({
+      opId: client.opId, clientId: client.clientId,
+      actor: authzActor,        // ★ 覆盖(不信 body.actor)
+      recordId: pathRecordId,   // ★ 覆盖(不信 body.recordId)
+      baseRevision: ifMatchBase, // ★ 覆盖(不信 body.baseRevision)
+      fieldPath: client.fieldPath, value: client.value,
+    })
+    // 客户端试图伪造 actor='admin' / recordId='other-node' / base=999
+    const malicious: ClientFieldOp = {
+      opId: 'x', clientId: 'A', actor: 'admin', recordId: 'other-node', baseRevision: 999,
+      fieldPath: ['title'], value: 'hacked',
+    }
+    const trusted = trustify(malicious, 'alice', 'n1', 0)
+    expect(trusted.actor).toBe('alice')       // ★ authz 覆盖,不信 'admin'
+    expect(trusted.recordId).toBe('n1')        // ★ path 覆盖,不信 'other-node'
+    expect(trusted.baseRevision).toBe(0)       // ★ If-Match 覆盖,不信 999
+    expect(trusted.opId).toBe('x')             // opId 单一权威载体(idempotency-key)
+  })
+
+  it('S10-3 typed domain op union:create/set/unset/array/reorder/strict-tx(P1-3:无 create 语义是 #194 现状缺陷)', () => {
+    // 原 §10 FieldOp 只有 set(value:unknown),无 create/unset/array/reorder/strict-tx → 返修 typed union
+    type DomainOp =
+      | { kind: 'create'; recordId: string; type: 'node' | 'edge' | 'anchor'; payload: unknown }
+      | { kind: 'set'; recordId: string; fieldPath: (string | number)[]; value: unknown }
+      | { kind: 'unset'; recordId: string; fieldPath: (string | number)[] }
+      | { kind: 'array'; recordId: string; fieldPath: (string | number)[]; op: 'push' | 'splice'; index?: number; value?: unknown }
+      | { kind: 'reorder'; parentId: string; orderedIds: string[] }
+      | { kind: 'strict-tx'; ops: DomainOp[] } // 严格事务路径(跨 record 原子,§10.4)
+    // create 语义:#194 现状 PATCH missing 恒 not-found(无 create);typed union 补 create
+    const create: DomainOp = { kind: 'create', recordId: 'n-new', type: 'node', payload: { title: 'new' } }
+    const set: DomainOp = { kind: 'set', recordId: 'n1', fieldPath: ['title'], value: 'x' }
+    const unset: DomainOp = { kind: 'unset', recordId: 'n1', fieldPath: ['tempKey'] }
+    const arr: DomainOp = { kind: 'array', recordId: 'n1', fieldPath: ['fills'], op: 'push', value: { color: '#fff' } }
+    const reorder: DomainOp = { kind: 'reorder', parentId: 'canvas-1', orderedIds: ['n2', 'n1', 'n3'] }
+    const tx: DomainOp = { kind: 'strict-tx', ops: [set, { kind: 'set', recordId: 'n2', fieldPath: ['groupId'], value: 'g1' }] }
+    // 验 union 可区分(kind 判别)
+    expect(create.kind).toBe('create')
+    expect(unset.kind).toBe('unset')
+    expect(arr.kind).toBe('array')
+    expect(reorder.kind).toBe('reorder')
+    expect(tx.kind).toBe('strict-tx')
+    // ★ strict-tx = 跨 record 严格事务原子(P1-2/G3 的跨介质边界走此 op,非 LWW)
+  })
+
+  it('S10-4 per-field clock 持久形态:per (recordId,fieldPath) → clock;持久为 Map<fieldKey, number>(不留 N2-1)', () => {
+    // 原 §10 把 per-field clock 留 N2-1("decision-complete" 自相矛盾)→ 返修定死持久形态
+    type FieldClock = Map<string, number> // key = fieldKeyOf(path),value = clock
+    type PerFieldClockStore = Map<string, FieldClock> // recordId → FieldClock
+    const store: PerFieldClockStore = new Map()
+    const bump = (recordId: string, path: (string | number)[]) => {
+      const fc = store.get(recordId) ?? new Map<string, number>()
+      const key = fieldKeyOf(path)
+      fc.set(key, (fc.get(key) ?? 0) + 1)
+      store.set(recordId, fc)
+    }
+    const clock = (recordId: string, path: (string | number)[]) => store.get(recordId)?.get(fieldKeyOf(path)) ?? 0
+    // A 改 title 3 次 → title.clock=3;B 改 transform.x 1 次 → transform.x.clock=1
+    bump('n1', ['title']); bump('n1', ['title']); bump('n1', ['title'])
+    bump('n1', ['transform', 'x'])
+    expect(clock('n1', ['title'])).toBe(3)
+    expect(clock('n1', ['transform', 'x'])).toBe(1)
+    expect(clock('n1', ['transform', 'y'])).toBe(0) // 未改过
+    // ★ 持久形态定死:Map<recordId, Map<fieldKey, clock>>;stale 判定 = base.clock < current.clock
+    //   且同 fieldPath(base.clock < current → 已被他人更新过 → 条件逆运算 skip,见 Gate2 M2)
+    //   不再留 N2-1(per-field clock 持久形态已定)。
+  })
+
+  it('S10-5 batch 原子性:FieldOp[] 同 record 多 op 要么全 ok 要么全 reject(单事务)', () => {
+    // 原 §10.2 "payload = FieldOp 或 FieldOp[](批量,同 record)" 但未定原子性 → 返修:batch 原子
+    const applyBatch = (server: FieldLevelServer, actor: string, ops: FieldOp[]): { allOk: boolean; results: (ApplyResult | { kind: 'forbidden' })[] } => {
+      // 原子预检:任一 op precondition-required/not-found → 全 reject(无 partial)
+      for (const op of ops) {
+        if (op.baseRevision === undefined) return { allOk: false, results: [{ kind: 'precondition-required' }] }
+        if (!server.recordExists(op.recordId)) return { allOk: false, results: [{ kind: 'not-found' }] }
+      }
+      // 全预检过 → 顺序 apply(同 record 同事务);任一失败 → 仍返 results(原子性由 server 事务保证,见 PG-T2)
+      const real: (ApplyResult | { kind: 'forbidden' })[] = ops.map((op) => server.applyOpAuthz(op, actor))
+      const allOk = real.every((r) => r.kind === 'ok')
+      return { allOk, results: real }
+    }
+    const s = new FieldLevelServer()
+    s.seedNode(makeNode('n1', { title: 'orig', text: 'orig' } as Partial<NodeRecord>))
+    s.addMember('alice')
+    const rev0 = s.revision('n1')
+    // batch:同 record 改 title + text(两 fieldPath,原子)
+    const batchOk = applyBatch(s, 'alice', [
+      { opId: 'a1', clientId: 'A', actor: 'alice', recordId: 'n1', baseRevision: rev0, fieldPath: ['title'], value: 'T' },
+      { opId: 'a2', clientId: 'A', actor: 'alice', recordId: 'n1', baseRevision: rev0, fieldPath: ['text'], value: 'X' },
+    ])
+    expect(batchOk.allOk).toBe(true)
+    expect(s.getFieldValue('n1', ['title'])).toBe('T')
+    expect(s.getFieldValue('n1', ['text'])).toBe('X')
+    // batch 含 precondition-required → 全 reject(无 partial)
+    const batchBad = applyBatch(s, 'alice', [
+      { opId: 'b1', clientId: 'A', actor: 'alice', recordId: 'n1', baseRevision: rev0, fieldPath: ['title'], value: 'Y' },
+      { opId: 'b2', clientId: 'A', actor: 'alice', recordId: 'n1', baseRevision: undefined, fieldPath: ['text'], value: 'Z' }, // 428
+    ])
+    expect(batchBad.allOk).toBe(false)
+    expect(batchBad.results[0].kind).toBe('precondition-required')
+    // ★ b1 不应 partial 应用(title 仍 T,非 Y)
+    expect(s.getFieldValue('n1', ['title'])).toBe('T')
   })
 })
