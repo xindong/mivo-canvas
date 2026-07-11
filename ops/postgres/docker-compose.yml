@@ -6,6 +6,11 @@
 # MIVO_PG_HOST_PORT(默认 5432,共享机端口冲突时改;容器内恒 5432,healthcheck 不变);
 # 密码走 .env(.env.example 是模板,真实 .env 不入库);healthcheck + restart
 # policy + 资源限制 + 日志轮转。
+# 网络:显式声明 default 网络 + 固定 ipam 网段(192.168.228.0/24,network name 固定
+# mivo-pg-net)。compose 默认会自动建 <project>_default 网络并从 docker 池随机选段
+# (典型 172.16-31/16),可抢占企业内网 → 2026-07-11 事故:postgres_default 抢占
+# 172.26.0.0/16 与公司边缘网关冲突 → 已登录用户 502 近 11h(见 runbook §9)。固定
+# ipam 后 compose down/up 网络名/网段均不变,杜绝自动选段冲突;选段依据见 runbook §0.2。
 # 语法校验:docker compose --env-file ops/postgres/.env.example -f ops/postgres/docker-compose.yml config
 #
 # 认证:不设 POSTGRES_HOST_AUTH_METHOD → 用镜像默认(local socket=trust,docker exec 脚本
@@ -57,3 +62,21 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+# ── 网络(固定 ipam,防自动选段抢占企业内网;见文件头注释 + runbook §0.2/§9)──
+# 选段依据(192.168.228.0/24):
+#   * 避开 172.16.0.0/12(172.16-31.x):公司在用 172.26.x(边缘网关 172.26.164.81),
+#     docker 默认用户桥池也从该 /12 分配(postgres_default 正是抢到 172.26.0.0/16);
+#   * 避开 10.0.0.0/8:服务器网段 10.102.x(见 runbook §0.1 共享机 10.102.80.15);
+#   * 避开 172.17.0.0/16:docker0 默认桥;
+#   * 选 192.168.228.0/24:/24(254 可用地址)足够单容器;228 段冷门,远离常见
+#     192.168.0/1 办公/家庭段,进一步降冲突概率。
+# owner 上服务器前必须先 `ip route` + `docker network ls` 对照本网段无冲突(见 runbook §0 表 0.8 行 + §9)。
+networks:
+  default:
+    name: mivo-pg-net
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: "192.168.228.0/24"
