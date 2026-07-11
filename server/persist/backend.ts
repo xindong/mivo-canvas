@@ -248,6 +248,17 @@ export interface PersistBackend {
    * additive 字段——内存实现 Promise.resolve(),PG 落地后新增,路由/契约零改动。
    */
   readonly ready: Promise<void>
+
+  /**
+   * G2.1 F1:owner-migration-complete gate 的机械检测——统计 ownerId 为 legacy 形态(mivo-key 指纹,
+   * sha256[:16] hex;权威定义见 keys.ts `fingerprintOfPlatformKey` + owner.ts `isLegacyFormOwner`)的
+   * owner 数。strict 模式启动时若 >0 → 拒启动(见 owner.ts `assertStrictOwnerMigrationComplete`)。
+   * **可选**:memory 实扫(可测);PG detector 随 G2.2 迁移落地,未实现时 strict 启动 fail-closed
+   * (owner.ts gate 显式拒绝,见其判定)。覆盖 persist backend 管辖的 owner-scoped 数据
+   * (projects/canvas/userState/chat-collection/children + idempotency index);
+   * share_links(permissions)+ assets(asset store)的 gate 随 G2.2 补。
+   */
+  countLegacyFormOwners?(): Promise<number>
 }
 
 // ─── 内存实现(同 docKernel.ts 单文件 interface+impl 模式)──────────────────────────
@@ -257,6 +268,12 @@ const nowIso = (): string => new Date().toISOString()
 const recordKey = (ownerId: string, type: PersistType, id: string): string => `${ownerId}:${type}:${id}`
 const idemIndexKey = (ownerId: string, method: string, resourceKind: string, idempotencyKey: string): string =>
   `${ownerId}:${method}:${resourceKind}:${idempotencyKey}`
+
+// G2.1 F1:legacy owner 形态 = mivo-key 指纹(sha256[:16] hex,见 keys.ts `fingerprintOfPlatformKey`)。
+// 内联于此(不 import owner.ts)以保 persist 层 framework-agnostic(不耦合 hono)。owner.ts 同样定义
+// `isLegacyFormOwner`(供 gate 测试用);同一形态定义,权威在 keys.ts `fingerprintOfPlatformKey`。
+const LEGACY_OWNER_FINGERPRINT_RE = /^[0-9a-f]{16}$/
+const isLegacyFormOwnerId = (ownerId: string): boolean => LEGACY_OWNER_FINGERPRINT_RE.test(ownerId)
 
 /** 返修 #10:请求 fingerprint(sha256 body)。bodyFingerprint 由 route 算传入;backend 校验一致。 */
 export const fingerprintOfBody = (body: unknown): string => {
@@ -1215,6 +1232,20 @@ export class InMemoryPersistBackend implements PersistBackend {
     this.idempotencyIndex.clear()
     this.globalProjectOwners.clear()
     this.globalCanvasOwners.clear()
+  }
+
+  /**
+   * G2.1 F1:扫描 byOwner 外层 key(ownerId),统计 legacy 指纹形态(16-hex)owner 数。
+   * byOwner 外层 key 即 ownerId;legacy 形态数据其 ownerId=指纹,故扫 key 集合即可机械判定。
+   * soft-deleted records 仍在 byOwner 内(占位),故软删未迁移的 owner 也计入(迁移未完成)。
+   * 导出供 owner.ts `assertStrictOwnerMigrationComplete` 启动 gate 调用。
+   */
+  async countLegacyFormOwners(): Promise<number> {
+    let count = 0
+    for (const ownerId of this.byOwner.keys()) {
+      if (isLegacyFormOwnerId(ownerId)) count += 1
+    }
+    return count
   }
 }
 

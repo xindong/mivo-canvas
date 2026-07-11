@@ -11,7 +11,7 @@ import { serve } from '@hono/node-server'
 import { app, sharedPersistBackend, sharedPermissionBackend } from './app'
 import { resolveFeatureFlags } from './lib/env'
 import { isDevStubActive } from './lib/auth-stub'
-import { validateSsoConfig } from './lib/owner'
+import { validateSsoConfig, assertStrictOwnerMigrationComplete } from './lib/owner'
 
 const PORT = Number(process.env.MIVO_PORT) || 8080
 const PUBLIC_MODE = process.env.MIVO_PUBLIC === '1'
@@ -39,6 +39,12 @@ for (const w of validateSsoConfig()) {
 // memory backend 的 ready 立即 resolve(no-op,生产零变化)。PG 连接失败 → 启动停(fail visibly)。
 const start = async (): Promise<void> => {
   await Promise.all([sharedPersistBackend.ready, sharedPermissionBackend.ready])
+  // G2.1 F1:strict 启动 owner-migration gate——MIVO_SSO_STRICT=1 但 persist backend 仍存在 legacy 形态
+  // owner 数据(ownerId=指纹,sha256[:16] hex)→ 拒绝启动(fail fast,exit 1)。机器判定,非文字约定:
+  // ops 翻 strict 前必须先跑 G2.2 迁移(指纹→username),否则 legacy 数据对 SSO 用户不可见。
+  // 非 strict → no-op(生产零变化)。memory backend 实扫(可测);PG 未实现 countLegacyFormOwners →
+  // fail-closed 拒启动(G2.2 落地 detector,见 owner.ts assertStrictOwnerMigrationComplete)。
+  await assertStrictOwnerMigrationComplete(process.env, sharedPersistBackend)
   serve({ fetch: app.fetch, hostname: HOSTNAME, port: PORT }, (info) => {
     const bound = `${info.address}:${info.port}`
     const mode = PUBLIC_MODE ? 'public 0.0.0.0 (behind SSO gateway)' : 'local 127.0.0.1'

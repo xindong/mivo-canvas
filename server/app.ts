@@ -94,9 +94,16 @@ app.route('/api/auth', authRoute)
 // any sub-app handler in strict mode (MIVO_SSO_STRICT=1: missing/wrong gateway
 // secret·header → 401, NO fingerprint fallback) and returns 401. Inert in non-strict
 // mode (default off → resolveActor never throws SsoAuthError → falls through to the
-// default 500 path unchanged → production zero change). Covers all /api persistence
-// routes (projects/canvas/userState/assets/tasks/members/shareLinks); stateless /api
-// routes (generate/edit/keys) don't call resolveActor → never throw → unaffected.
+// default 500 path unchanged → production zero change). F5 返修:non-SsoAuthError 分支
+// 精确复刻 Hono 默认(HTTPException.getResponse + console.error + 500 文本),不吞普通错误。
+//
+// 覆盖面(F6 返修,见 docs/runbook/g21-strict-sso-runbook.md §route security matrix):
+// - owner-scoped 持久化路由(projects/canvas/userState/assets/tasks/members/shareLinks)
+//   → 走 resolveActor,strict 下缺 proof → 401;
+// - debug-logs(POST 写 JSONL / GET 读报表)是 **system-scoped 遥测**,不经 resolveActor,
+//   不被本 boundary 门控——独立防护(origin allowlist + per-IP rate limit + body cap +
+//   GET view-token / public fail-closed)在 strict 下继续生效;debugLogsRoute 不抛 SsoAuthError;
+// - stateless /api 路由(generate/edit/keys)不调 resolveActor → 不抛 → 不受影响。
 app.onError(ssoAuthErrorHandler)
 
 // P1-c generate/edit/enhance routes. app.all lets each handler enforce POST-only

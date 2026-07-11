@@ -3,7 +3,10 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import process from 'node:process'
+import { Hono } from 'hono'
 import { debugLogsRoute, __resetDebugLogsRateLimit } from './debug-logs'
+import { ssoAuthErrorHandler } from '../lib/owner'
+import type { AppEnv } from '../lib/types'
 
 // In-process route tests via Hono's app.request() (no server, no ECONNRESET).
 // Covers the migrated shapes + the D1/D7/D8 intended changes.
@@ -182,5 +185,66 @@ describe('debug-logs route — D8: fail-closed in public mode', () => {
     expect(noToken.status).toBe(403)
     const withToken = await request('GET', undefined, { 'x-mivo-debug-token': TOKEN })
     expect(withToken.status).toBe(200)
+  })
+})
+
+describe('debug-logs route — G2.1 F6: strict SSO 下 system-scoped(不被 SSO 门控,独立防护仍生效)', () => {
+  // F6:debug-logs 是 system-scoped 遥测,不经 resolveActor,不被 ssoAuthBoundary 门控。
+  // 镜像 app.ts(顶层 onError(ssoAuthErrorHandler) + 挂 debugLogsRoute under /api/mivo)+ strict env:
+  // POST 无 gateway proof 仍 200(非 401)→ 证明它不在 owner-scoped SSO 门内;独立防护(origin/rate/public)
+  // strict 下继续生效(403,非 401)。选型 + matrix 见 docs/runbook/g21-strict-sso-runbook.md §route security matrix。
+  const SSO_ENV = ['MIVO_SSO_STRICT', 'MIVO_GATEWAY_SECRET']
+  let strictApp: Hono<AppEnv>
+  beforeEach(() => {
+    saveEnv(SSO_ENV)
+    strictApp = new Hono<AppEnv>()
+    strictApp.onError(ssoAuthErrorHandler)
+    strictApp.route('/api/mivo', debugLogsRoute)
+    process.env.MIVO_SSO_STRICT = '1'
+    process.env.MIVO_GATEWAY_SECRET = 'gw-strict-secret'
+    __resetDebugLogsRateLimit()
+  })
+  afterEach(() => {
+    restoreEnv(SSO_ENV)
+    __resetDebugLogsRateLimit()
+  })
+
+  it('strict + 无 gateway proof + POST debug-logs → 200(非 401;system-scoped,不经 resolveActor)', async () => {
+    const res = await strictApp.request('/api/mivo/debug-logs', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: jsonBody({ entries: [{ level: 'warning', source: 'S', message: 'm', timestamp: 1 }] }),
+    })
+    expect(res.status).toBe(200)
+    expect((await json(res)).accepted).toBe(1)
+  })
+
+  it('strict + 无 gateway proof + GET debug-logs(local 无 token)→ 200(system-scoped,非 401)', async () => {
+    await strictApp.request('/api/mivo/debug-logs', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: jsonBody({ entries: [{ level: 'error', source: 'S', message: 'm', timestamp: 1 }] }),
+    })
+    const res = await strictApp.request('/api/mivo/debug-logs', { method: 'GET' })
+    expect(res.status).toBe(200)
+    const body = await json(res)
+    expect(body.ok).toBe(true)
+  })
+
+  it('strict + 独立防护仍生效:disallowed Origin → 403(非 401;system-scoped 独立防护)', async () => {
+    const res = await strictApp.request('/api/mivo/debug-logs', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'https://evil.example' },
+      body: jsonBody({ entries: [{ level: 'warning', source: 'S', message: 'm', timestamp: 1 }] }),
+    })
+    expect(res.status).toBe(403)
+    expect((await json(res)).error).toBe('Origin not allowed')
+  })
+
+  it('strict + public + 无 view token → GET 403(D8 public fail-closed,非 SSO 401)', async () => {
+    process.env.MIVO_PUBLIC = '1'
+    const res = await strictApp.request('/api/mivo/debug-logs', { method: 'GET' })
+    expect(res.status).toBe(403)
+    expect((await json(res)).error).toBe('Debug report token required')
   })
 })

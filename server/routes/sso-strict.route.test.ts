@@ -2,7 +2,11 @@
 // G2.1 (cutover §5) 严格 SSO —— 四边界路由级验收 + tasks/assets 走 SSO actor 证明。
 //
 // 开关 MIVO_SSO_STRICT=1(默认关,生产零变化):缺/错 secret·header → 401,不回退指纹。
-// 四边界:①真实网关注入 ②伪造 header ③绕网关直连 ④dev mode;各写预期行为。
+// 四边界:①(进程内模拟)网关注入 ②伪造 header ③绕网关直连 ④dev mode;各写预期行为。
+//
+// F3 返修:① 原名"真实网关注入"误导——本用例是**进程内模拟**(client 带正确 secret+任意 username
+// 即被当网关,服务端无法区分),非真实网关实测。真实网关四项集成验收清单见
+// docs/runbook/g21-strict-sso-runbook.md §真实网关验收(待 lead 生产实测,翻 strict 硬前置)。
 // + tasks/assets:严格模式下走 resolveTaskOwner/resolveAssetOwner → resolveActor,
 //   缺 proof → 401(不回退指纹),证明"持久化路由全部走 SSO actor"。
 //
@@ -16,7 +20,14 @@ import { __resetTaskRegistry } from '../tasks/registry'
 import { createAssetRoutes } from './assets'
 import { createMemoryAssetBackend } from '../lib/assetStore'
 import { resetDecodeGate } from '../lib/decodeGate'
-import { ssoAuthErrorHandler } from '../lib/owner'
+import {
+  ssoAuthErrorHandler,
+  isDevMode,
+  validateSsoConfig,
+  isLegacyFormOwner,
+  assertStrictOwnerMigrationComplete,
+} from '../lib/owner'
+import type { PersistBackend } from '../persist/backend'
 import type { AppEnv } from '../lib/types'
 
 const GW = 'gw-secret-xyz'
@@ -39,7 +50,7 @@ describe('G2.1 严格 SSO —— 四边界(projects 路由,persistTestApp + ssoA
     vi.unstubAllEnvs()
   })
 
-  it('① 真实网关注入:严格模式 + 正确网关密钥 + SSO header → 200(actor = SSO user)', async () => {
+  it('① (进程内模拟)网关注入:严格模式 + 正确网关密钥 + SSO header → 200(actor = SSO user)——非真实网关实测,部署假设见 runbook §真实网关验收', async () => {
     vi.stubEnv('MIVO_SSO_STRICT', '1')
     vi.stubEnv('MIVO_GATEWAY_SECRET', GW)
     const res = await req(app, '/api/projects', {
@@ -151,5 +162,189 @@ describe('G2.1 —— assets 路由严格模式走 SSO actor(resolveAssetOwner)'
     expect(res.status).toBe(200)
     const body = await res.json()
     expect((body as { assetId: string }).assetId).toBeTruthy()
+  })
+})
+
+// ── G2.1 返修 F2:isDevMode 三重保险(纯函数,负向全补)──────────────────────────────
+// F2 复现洞:原 isDevMode = `MIVO_DEV_MODE==='1' && NODE_ENV!=='production'` →
+// strict+dev+MIVO_PUBLIC=1+NODE_ENV=staging → true → 任意 x-mivo-auth-user 冒充(200)。
+// 修法:mirror auth-stub.ts:21-25 三重(opt-in + MIVO_PUBLIC=1 恒 false + NODE_ENV 正向枚举)。
+describe('G2.1 返修 F2 — isDevMode 三重保险(纯函数,负向全补)', () => {
+  it('opt-in 缺失(MIVO_DEV_MODE 未设)→ false(默认关)', () => {
+    expect(isDevMode({ NODE_ENV: 'development' })).toBe(false)
+    expect(isDevMode({ NODE_ENV: 'test' })).toBe(false)
+    expect(isDevMode({ NODE_ENV: 'production' })).toBe(false)
+  })
+
+  it('MIVO_PUBLIC=1 + dev + 任意 NODE_ENV → false(public 恒关,堵 F2 冒充洞)', () => {
+    // 原 bug:staging+dev+public → true(冒充)。三重保险后全 false。
+    for (const nodeEnv of ['development', 'test', 'production', 'staging', 'qa', '', undefined]) {
+      const env: NodeJS.ProcessEnv = { MIVO_DEV_MODE: '1', MIVO_PUBLIC: '1' }
+      if (nodeEnv !== undefined) env.NODE_ENV = nodeEnv
+      expect(isDevMode(env)).toBe(false)
+    }
+  })
+
+  it('production/staging/qa/空 NODE_ENV + dev(非 public)→ false(正向枚举仅 dev/test 放行)', () => {
+    for (const nodeEnv of ['production', 'staging', 'qa', '', undefined]) {
+      const env: NodeJS.ProcessEnv = { MIVO_DEV_MODE: '1' }
+      if (nodeEnv !== undefined) env.NODE_ENV = nodeEnv
+      expect(isDevMode(env)).toBe(false)
+    }
+  })
+
+  it('development/test + dev(非 public)→ true(唯一放行路径)', () => {
+    expect(isDevMode({ MIVO_DEV_MODE: '1', NODE_ENV: 'development' })).toBe(true)
+    expect(isDevMode({ MIVO_DEV_MODE: '1', NODE_ENV: 'test' })).toBe(true)
+  })
+
+  it('legacy 字面量验证:原 `NODE_ENV!==production` 在 staging 放行,新实现不放行', () => {
+    // 旧实现:staging !== 'production' → true(漏洞)。新实现:staging ∉ {development,test} → false。
+    expect(isDevMode({ MIVO_DEV_MODE: '1', NODE_ENV: 'staging' })).toBe(false)
+  })
+})
+
+describe('G2.1 返修 F2 — validateSsoConfig 把 MIVO_PUBLIC=1 当生产边界告警', () => {
+  it('public + dev mode → 告警(public 即生产边界;isDevMode 已恒 false)', () => {
+    const w = validateSsoConfig({ MIVO_PUBLIC: '1', MIVO_DEV_MODE: '1', NODE_ENV: 'development' })
+    expect(w.some((s) => s.includes('MIVO_DEV_MODE=1') && s.includes('production boundary'))).toBe(true)
+  })
+
+  it('非 public + 非 production NODE_ENV → 无告警(非生产边界,no-op)', () => {
+    expect(validateSsoConfig({ NODE_ENV: 'development' })).toEqual([])
+    expect(validateSsoConfig({ MIVO_DEV_MODE: '1', NODE_ENV: 'development' })).toEqual([])
+  })
+
+  it('public + strict + 无 gateway secret → fail-closed 告警', () => {
+    const w = validateSsoConfig({ MIVO_PUBLIC: '1', MIVO_SSO_STRICT: '1' })
+    expect(w.some((s) => s.includes('MIVO_SSO_STRICT=1') && s.includes('MIVO_GATEWAY_SECRET unset'))).toBe(true)
+  })
+})
+
+// ── G2.1 返修 F2:isDevMode 双保险路由级负向(public+dev 不冒充)──────────────────────
+describe('G2.1 返修 F2 — isDevMode 路由级负向(strict+dev 各绕过组合 → 401)', () => {
+  let app: ReturnType<typeof buildPersistApp>['app']
+  beforeEach(() => {
+    ;({ app } = buildPersistApp())
+  })
+  afterEach(() => vi.unstubAllEnvs())
+
+  it('strict + MIVO_PUBLIC=1 + dev + development + 无 proof → 401(public 恒关 dev)', async () => {
+    vi.stubEnv('MIVO_SSO_STRICT', '1')
+    vi.stubEnv('MIVO_DEV_MODE', '1')
+    vi.stubEnv('MIVO_PUBLIC', '1')
+    vi.stubEnv('NODE_ENV', 'development')
+    const res = await req(app, '/api/projects', { headers: { 'x-mivo-auth-user': 'alice' } })
+    expect(res.status).toBe(401) // isDevMode=false(public 恒关)→ 严格生产 → 无 proof → 401,不冒充
+  })
+
+  it('strict + dev + staging(非 public)→ 401(正向枚举不放行 staging)', async () => {
+    vi.stubEnv('MIVO_SSO_STRICT', '1')
+    vi.stubEnv('MIVO_DEV_MODE', '1')
+    vi.stubEnv('NODE_ENV', 'staging')
+    const res = await req(app, '/api/projects', { headers: { 'x-mivo-auth-user': 'alice' } })
+    expect(res.status).toBe(401) // isDevMode=false(staging 非枚举)→ 严格生产 → 401
+  })
+
+  it('strict + dev + 空 NODE_ENV(非 public)→ 401(正向枚举不放行空值)', async () => {
+    vi.stubEnv('MIVO_SSO_STRICT', '1')
+    vi.stubEnv('MIVO_DEV_MODE', '1')
+    vi.stubEnv('NODE_ENV', '')
+    const res = await req(app, '/api/projects', { headers: { 'x-mivo-auth-user': 'alice' } })
+    expect(res.status).toBe(401) // isDevMode=false(空值非枚举)→ 严格生产 → 401
+  })
+
+  it('strict + dev + production(非 public)→ 401(production 恒关 dev)', async () => {
+    vi.stubEnv('MIVO_SSO_STRICT', '1')
+    vi.stubEnv('MIVO_DEV_MODE', '1')
+    vi.stubEnv('NODE_ENV', 'production')
+    const res = await req(app, '/api/projects', { headers: { 'x-mivo-auth-user': 'alice' } })
+    expect(res.status).toBe(401)
+  })
+})
+
+// ── G2.1 返修 F1:owner-migration 启动 gate(机器判定,非文字约定)──────────────────
+describe('G2.1 返修 F1 — assertStrictOwnerMigrationComplete 启动 gate', () => {
+  it('非 strict + legacy 数据 → no-op 通过(生产零变化)', async () => {
+    const { backend } = buildPersistApp()
+    await backend.ensureCreate('abcd1234ef567890', 'project', 'p1', {}, { method: 'POST', resourceKind: 'project' })
+    expect(isLegacyFormOwner('abcd1234ef567890')).toBe(true)
+    expect(await backend.countLegacyFormOwners()).toBe(1)
+    // 非 strict → gate no-op(不检测 legacy)
+    await expect(assertStrictOwnerMigrationComplete({}, backend)).resolves.toBeUndefined()
+  })
+
+  it('strict + legacy 形态 owner 数据>0 → 拒启动(throws,报具体计数)', async () => {
+    const { backend } = buildPersistApp()
+    await backend.ensureCreate('abcd1234ef567890', 'project', 'p1', {}, { method: 'POST', resourceKind: 'project' })
+    await backend.ensureCreate('0123456789abcdef', 'project', 'p2', {}, { method: 'POST', resourceKind: 'project' })
+    expect(await backend.countLegacyFormOwners()).toBe(2)
+    await expect(assertStrictOwnerMigrationComplete({ MIVO_SSO_STRICT: '1' }, backend)).rejects.toThrow(
+      /legacy-form owner record/,
+    )
+  })
+
+  it('strict + 迁移后(username 形态)→ 通过(模拟迁移:re-seed 为 username owner)', async () => {
+    const { backend } = buildPersistApp()
+    // 模拟 G2.2 迁移完成:数据以 username ownerId 落库(email-style,非 16-hex)
+    await backend.ensureCreate('alice@xd.com', 'project', 'p1', {}, { method: 'POST', resourceKind: 'project' })
+    expect(isLegacyFormOwner('alice@xd.com')).toBe(false)
+    expect(await backend.countLegacyFormOwners()).toBe(0)
+    await expect(assertStrictOwnerMigrationComplete({ MIVO_SSO_STRICT: '1' }, backend)).resolves.toBeUndefined()
+  })
+
+  it('strict + backend 无 countLegacyFormOwners(PG G2.2 前未实现)→ fail-closed throws', async () => {
+    // PG backend(G2.2 前)未实现 countLegacyFormOwners → strict 启动 fail-closed 拒启动(安全)。
+    const stubBackend = { ready: Promise.resolve() } as unknown as PersistBackend
+    await expect(assertStrictOwnerMigrationComplete({ MIVO_SSO_STRICT: '1' }, stubBackend)).rejects.toThrow(
+      /countLegacyFormOwners/,
+    )
+  })
+
+  it('strict + 混合(legacy + username)→ 拒启动(只要有 legacy 形态即 no-go)', async () => {
+    const { backend } = buildPersistApp()
+    await backend.ensureCreate('alice@xd.com', 'project', 'p1', {}, { method: 'POST', resourceKind: 'project' })
+    await backend.ensureCreate('abcd1234ef567890', 'project', 'p2', {}, { method: 'POST', resourceKind: 'project' })
+    expect(await backend.countLegacyFormOwners()).toBe(1)
+    await expect(assertStrictOwnerMigrationComplete({ MIVO_SSO_STRICT: '1' }, backend)).rejects.toThrow(
+      /legacy-form owner record/,
+    )
+  })
+})
+
+// ── G2.1 返修 F4:secret 恒时比较(SHA-256 + timingSafeEqual)────────────────────────
+describe('G2.1 返修 F4 — ssoHeaderSecretOk 恒时比较(纯函数)', () => {
+  // 间接经 resolveActor 验证:strict + 正确/错误/异长 secret 的 401/200 行为。
+  let app: ReturnType<typeof buildPersistApp>['app']
+  beforeEach(() => {
+    ;({ app } = buildPersistApp())
+  })
+  afterEach(() => vi.unstubAllEnvs())
+
+  it('strict + 等长错 secret → 401(恒时,不泄漏)', async () => {
+    vi.stubEnv('MIVO_SSO_STRICT', '1')
+    vi.stubEnv('MIVO_GATEWAY_SECRET', GW) // 'gw-secret-xyz'
+    const res = await req(app, '/api/projects', {
+      headers: { 'x-mivo-gateway-secret': 'gw-secret-aaa', 'x-mivo-auth-user': 'alice' }, // 等长 13 chars,错
+    })
+    expect(res.status).toBe(401)
+  })
+
+  it('strict + 异长错 secret → 401(SHA-256 digest 等长,无长度泄漏)', async () => {
+    vi.stubEnv('MIVO_SSO_STRICT', '1')
+    vi.stubEnv('MIVO_GATEWAY_SECRET', GW)
+    const res = await req(app, '/api/projects', {
+      headers: { 'x-mivo-gateway-secret': 'short', 'x-mivo-auth-user': 'alice' }, // 异长
+    })
+    expect(res.status).toBe(401)
+  })
+
+  it('strict + 正确 secret → 200(通过门)', async () => {
+    vi.stubEnv('MIVO_SSO_STRICT', '1')
+    vi.stubEnv('MIVO_GATEWAY_SECRET', GW)
+    const res = await req(app, '/api/projects', {
+      headers: { 'x-mivo-gateway-secret': GW, 'x-mivo-auth-user': 'alice' },
+    })
+    expect(res.status).toBe(200)
   })
 })
