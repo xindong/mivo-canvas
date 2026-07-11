@@ -32,8 +32,10 @@ module.exports = {
       instances: 1,
 
       // ── 内存看护:超限即重启(防内存泄漏把进程拖垮)──────────────────────────────
-      // BFF + Leafer/Kysely/pg 保守 1G;PG compose 限 2G,BFF 独立于此。
-      // 触即 restart(pm2 max_memory_restart);过载重启后 /readyz 自会重新探活。
+      // BFF(Node + Kysely/pg + Hono)保守 1G;PG compose 限 2G,BFF 独立于此。
+      // ⚠ 剩余风险(双审):1G 无 RSS 基线(尚未实测生产峰值 RSS);"BFF+Leafer" 旧表述不实——
+      //   Leafer 跑在浏览器(客户端),不在 pm2 BFF 进程内,不计入此 RSS。生产上线后采一轮峰值
+      //   再据实调(见 runbook §剩余风险)。触即 restart(pm2 max_memory_restart);过载重启后 /readyz 自会重新探活。
       max_memory_restart: '1G',
 
       // ── 重启风暴保护(防 crash-loop 反复重启打满 CPU/日志)──────────────────────
@@ -42,12 +44,14 @@ module.exports = {
       // max_restarts:在 `restart_delay × max_restarts` 时间窗内重启超该数 → pm2 停止
       // 重启(标 errored),避免无限 crash-loop。人工 `pm2 restart` 可解除。
       max_restarts: 10,
-      // 两次重启间的固定退避;叠加下方 exp_backoff 进一步拉长。
+      // 两次重启间的固定退避(非 crash-loop 的常规重启用此固定值)。
       restart_delay: 3000,
-      // 指数退避:crash-loop 时重启间隔逐次翻倍至上限,给依赖(PG/网关)恢复时间。
-      exp_backoff_restart: {
-        max_delay: 60000, // 单次退避上限 60s
-      },
+      // P0.3 返修 F5:指数退避必须用**数值**字段 `exp_backoff_restart_delay`(ms)。
+      // PM2 不认对象形式 `exp_backoff_restart: { max_delay }`——该写法会被忽略,
+      // 实际只剩固定 restart_delay=3000,指数退避从未启用(双审定为 P1 假绿)。
+      // 公式:delay = exp_backoff_restart_delay * 2^(连续崩溃次数),PM2 自动上限 15000ms。
+      // 100ms 起步,逐次翻倍(100→200→400→...→15000 封顶),给依赖(PG/网关)恢复时间。
+      exp_backoff_restart_delay: 100,
 
       // ── 生产 env(非密;密码由 deploy.sh 注入,见顶部说明)──────────────────────
       env: {

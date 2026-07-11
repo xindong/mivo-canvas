@@ -48,27 +48,39 @@ const featureFlags = resolveFeatureFlags()
 // 动态加载使 memory 路径不依赖 kysely,部署 node<22 不影响默认路径)。
 // Exported so tests driving the real `app` can __reset() between cases (同 __resetTaskRegistry)。
 const persistBackendConfig = resolvePersistBackendConfig()
-let sharedPersistBackend: PersistBackend
-if (persistBackendConfig.kind === 'pg' && persistBackendConfig.pg) {
-  // 仅 PG 启用时动态加载(避免 memory 路径加载 kysely)。
-  const { PgPersistBackend } = await import('./persist/pgBackend')
-  sharedPersistBackend = new PgPersistBackend(persistBackendConfig.pg)
-} else {
-  sharedPersistBackend = createPersistBackend()
-}
-export { sharedPersistBackend }
 
-// T1.4: shared permission backend (project_members + share_links)。组合注入:权限后端选择随
-// MIVO_PERSIST_BACKEND 同开关(pg → PgPermissionBackend 动态加载;默认 memory 生产零变化)。
-// PG 启用时与 PgPersistBackend 共存(两者连同一 DB;各自跑 migrations,kysely_migration 追踪表幂等)。
-// Exported so tests can __reset() between cases (同 sharedPersistBackend)。
+// T1.3 + T1.4: shared persist/permission backends。默认 memory(生产零变化);MIVO_PERSIST_BACKEND=pg →
+// PgPersistBackend + PgPermissionBackend(动态加载,避免 memory 路径加载 kysely)。
+// **F2 返修**:persist + permission **共享同一个 pg Pool**(单预算 = maxConnections,非各自 max 叠加;
+// 旧实现两 backend 各 max=10 → 实际预算 20,超 PG 配额风险 + permission pool 无 connectionTimeoutMillis)。
+// 两 backend 连同一 DB;migrations 各自跑(kysely_migration 追踪表幂等)。Pool 生命周期归 app——
+// backends 的 destroy() 在 shared 时不销毁 pool(app 退出即释放)。
+// PG 启用但缺 MIVO_PG_PASSWORD → resolvePersistBackendConfig 抛错(fail visibly,不静默降级 memory)。
+let sharedPersistBackend: PersistBackend
 let sharedPermissionBackend: PermissionBackend
 if (persistBackendConfig.kind === 'pg' && persistBackendConfig.pg) {
+  const { PgPersistBackend } = await import('./persist/pgBackend')
   const { PgPermissionBackend } = await import('./persist/pgPermissionBackend')
-  sharedPermissionBackend = new PgPermissionBackend(persistBackendConfig.pg)
+  const { Pool } = await import('pg')
+  const conn = persistBackendConfig.pg
+  // F2:共享 Pool——单预算 + connectionTimeoutMillis(两 backend 都受排队超时保护)。
+  const sharedPool = new Pool({
+    host: conn.host,
+    port: conn.port,
+    database: conn.database,
+    user: conn.user,
+    password: conn.password,
+    max: conn.maxConnections,
+    idleTimeoutMillis: conn.idleTimeoutMs,
+    connectionTimeoutMillis: conn.connectionTimeoutMs ?? 5000,
+  })
+  sharedPersistBackend = new PgPersistBackend(conn, sharedPool)
+  sharedPermissionBackend = new PgPermissionBackend(conn, sharedPool)
 } else {
+  sharedPersistBackend = createPersistBackend()
   sharedPermissionBackend = createPermissionBackend()
 }
+export { sharedPersistBackend }
 export { sharedPermissionBackend }
 
 export const app = new Hono<AppEnv>()
@@ -77,17 +89,20 @@ export const app = new Hono<AppEnv>()
 app.get('/healthz', (c) => c.json({ status: 'ok' }))
 
 // P0.3 Readiness probe(区别于 /healthz 的 liveness):/healthz 只表"进程活",
-// /readyz 表"依赖此刻可用"——PG 连接(SELECT 1)+ asset dir 可写。任一 fail → 503
-// (部署/网关据此摘流量,不把请求打到半挂的 BFF)。pm2/deploy 可探测;响应体带各 check
-// 诊断 reason,运维从 body 直接看哪个依赖挂了。persist 用 sharedPersistBackend.ping()
-// (memory 恒 ok;PG SELECT 1);assetDir 仅 asset service 启用时探写(service 关=skipped)。
+// /readyz 表"依赖此刻可用"——PG persist + permission 连接(SELECT 1)+ asset dir 可写。任一 fail → 503
+// (部署/网关据此摘流量,不把请求打到半挂的 BFF)。pm2/deploy 可探测;响应体带各 check 诊断 reason。
+// F2 返修:同时探活 permission DB(此前只 ping persist,permission pool 耗尽/DB 挂不被发现)。
+// persist + permission 共享同一 pg Pool(F2);memory 恒 ok。assetDir 仅 asset service 启用时探写(service 关=skipped)。
+// F7 返修:503 响应体只回稳定 reason code(不暴露绝对路径/原始 Error);细节进 pm2 err.log(见 readiness.ts)。
 app.get('/readyz', async (c) => {
-  const report = await computeReadiness(
-    sharedPersistBackend,
-    persistBackendConfig.kind === 'pg' ? 'pg' : 'memory',
-    resolveAssetStoreDir(),
-    featureFlags.assetServiceEnabled,
-  )
+  const report = await computeReadiness({
+    persist: sharedPersistBackend,
+    persistKind: persistBackendConfig.kind === 'pg' ? 'pg' : 'memory',
+    permission: sharedPermissionBackend,
+    permissionKind: persistBackendConfig.kind === 'pg' ? 'pg' : 'memory',
+    assetDir: resolveAssetStoreDir(),
+    assetEnabled: featureFlags.assetServiceEnabled,
+  })
   return c.json(report, report.status === 'ok' ? 200 : 503)
 })
 

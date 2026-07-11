@@ -39,6 +39,30 @@ const num = (value: string | undefined, fallback: number): number => {
 }
 
 /**
+ * F9 返修:idle 超时专用解析器。
+ * `.env.example` 文档声明 `MIVO_PG_IDLE_TIMEOUT_MS=0` = 不超时(匹配 pg Pool
+ * `idleTimeoutMillis: 0` 语义:空闲连接永不关闭),但旧实现复用 `num()`(只收 >0),
+ * `0` 被静默回落到 30000 → 文档与实现冲突,配置写 0 无人察觉。
+ *
+ * 本解析器:
+ *  - 未设 / 空串 → fallback(默认 30000,向后兼容)。
+ *  - `0` → 0(不超时,与文档一致)。
+ *  - 正数 → 该值(ms)。
+ *  - 负数 / 非数字 / NaN → **抛错 fail visibly**(不静默回落;否则配置写错无人察觉,
+ *    与"fail visibly,不静默降级"一致,见 resolvePersistBackendConfig 缺密码抛错)。
+ */
+const parseIdleTimeout = (value: string | undefined, fallback: number): number => {
+  if (value === undefined || value.trim() === '') return fallback
+  const n = Number(value)
+  if (!Number.isFinite(n) || n < 0) {
+    throw new Error(
+      `MIVO_PG_IDLE_TIMEOUT_MS 非法值 "${value}":须为 ≥ 0 的整数(0=不超时;正数=ms)。已 fail visibly 不静默回落。`,
+    )
+  }
+  return Math.trunc(n)
+}
+
+/**
  * resolvePersistBackendConfig:读 env 决定 backend kind + PG 连接参数。
  * kind=pg 但缺 MIVO_PG_PASSWORD → 抛错(不静默回退 memory;PG 启用即承诺真持久)。
  */
@@ -61,7 +85,7 @@ export const resolvePersistBackendConfig = (env: NodeJS.ProcessEnv = process.env
       user: env.MIVO_PG_USER || 'mivo',
       password,
       maxConnections: num(env.MIVO_PG_MAX_CONNECTIONS, 10),
-      idleTimeoutMs: num(env.MIVO_PG_IDLE_TIMEOUT_MS, 30_000),
+      idleTimeoutMs: parseIdleTimeout(env.MIVO_PG_IDLE_TIMEOUT_MS, 30_000),
       // P0.3:默认 5000ms(fail fast,池满不无限排队)。env MIVO_PG_CONNECTION_TIMEOUT_MS 可调。
       connectionTimeoutMs: num(env.MIVO_PG_CONNECTION_TIMEOUT_MS, 5_000),
     },

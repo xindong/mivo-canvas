@@ -26,6 +26,49 @@ ASSET_STORE_DIR="${MIVO_ASSET_STORE_DIR:-/AIGC_Group/mivo-canvas-data/assets}"
 
 log() { echo "[$(date -Is)] $*" | tee -a "$LOG_FILE" >&2; }
 
+# F3 返修:查 live DB 三核心表行数(写进 manifest,供 restore-drill 比对)。表不在/查询失败 → -1。
+# dump 是一致快照,restore 后行数应等;不等 = restore 损失数据(restore-drill 据此 FAIL)。
+row_count() {
+  local tbl="$1"
+  local exists
+  exists="$(docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -t -A -c "SELECT to_regclass('public.$tbl') IS NOT NULL;" 2>/dev/null || echo f)"
+  if [ "$exists" = "t" ]; then
+    docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -t -A -c "SELECT count(*) FROM public.$tbl;" 2>/dev/null || echo -1
+  else
+    echo -1
+  fi
+}
+
+# F3:写同批 manifest sidecar(<dump-basename>.manifest.json;restore-drill 按此名找)。
+# 含 dump 名 + 三核心表行数 + assetSnap + assetBlobCount(同批 dump/snapshot 配对凭证)。
+write_manifest() {
+  local manifest="$BACKUP_DIR/$PG_DB-$TIMESTAMP.manifest.json"
+  local pr_rows pj_rows cv_rows
+  pr_rows="$(row_count persist_records)"
+  pj_rows="$(row_count projects)"
+  cv_rows="$(row_count canvases)"
+  local asset_snap_field="null" asset_blob_field="null"
+  if [ -n "${ASSET_SNAP:-}" ] && [ -f "${ASSET_SNAP:-}" ]; then
+    asset_snap_field="\"$(basename "$ASSET_SNAP")\""
+    asset_blob_field="${ASSET_BLOB_COUNT:-0}"
+  fi
+  cat > "$manifest" <<EOF
+{
+  "timestamp": "$TIMESTAMP",
+  "pgDb": "$PG_DB",
+  "dump": "$(basename "$DUMP_FILE")",
+  "tables": {
+    "persist_records": $pr_rows,
+    "projects": $pj_rows,
+    "canvases": $cv_rows
+  },
+  "assetSnap": $asset_snap_field,
+  "assetBlobCount": $asset_blob_field
+}
+EOF
+  log "ok: manifest → $manifest (persist_records=$pr_rows projects=$pj_rows canvases=$cv_rows assetSnap=${ASSET_SNAP:-none})"
+}
+
 # ─── 前置 ────────────────────────────────────────────────────────────────
 mkdir -p "$BACKUP_DIR"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
@@ -82,32 +125,40 @@ else
   log "ok: pg-data snapshot → $SNAPSHOT_FILE ($SNAP_SIZE bytes)"
 fi
 
-# ─── 2.5 asset dir 快照(可选;P0.3 restore 含 asset)──────────────────────────
+# ─── 2.5 asset dir 快照(F4 返修:asset backup 开启时为 hard gate)──────────────────
 # asset 是 fs 内容寻址存储(不进 PG dump);PG dump 不含 blob。灾备恢复时 asset dir 须单独
-# 从本快照解压(见 runbook §5.3)。ASSET_BACKUP_DIR 设了才产;失败不阻断主备份(pg_dump 是主)。
+# 从本快照解压(见 runbook §5.3)。ASSET_BACKUP_DIR 设了才产;**F4:开启时 snapshot 必须成功**
+# (旧实现失败仅 WARN 非阻断 → 灾备不完整,ship 一个 asset 侧缺失的 dump;现改 hard gate)。
+ASSET_SNAP=""
+ASSET_BLOB_COUNT=""
 if [ -n "$ASSET_BACKUP_DIR" ]; then
   mkdir -p "$ASSET_BACKUP_DIR"
   if [ ! -d "$ASSET_STORE_DIR" ]; then
-    log "WARN: asset snapshot skipped — ASSET_STORE_DIR=$ASSET_STORE_DIR 不存在(非阻断)"
-  else
-    ASSET_SNAP="$ASSET_BACKUP_DIR/asset-snap-$TIMESTAMP.tar.gz"
-    # tar 整个 asset 目录(basename 作内部路径,解压时 --strip-components=1 还原)。
-    ASSET_PARENT="$(dirname "$ASSET_STORE_DIR")"
-    ASSET_BASE="$(basename "$ASSET_STORE_DIR")"
-    if ! tar -czf "$ASSET_SNAP" -C "$ASSET_PARENT" "$ASSET_BASE" 2>>"$LOG_FILE"; then
-      log "WARN: asset snapshot failed (non-blocking); pg_dump is primary"
-      rm -f "$ASSET_SNAP"
-    else
-      ASSET_SNAP_SIZE="$(stat -c%s "$ASSET_SNAP" 2>/dev/null || stat -f%z "$ASSET_SNAP" 2>/dev/null || echo 0)"
-      ASSET_BLOB_COUNT="$(find "$ASSET_STORE_DIR" -type f -name '*.bin' 2>/dev/null | wc -l | tr -d ' ')"
-      log "ok: asset snapshot → $ASSET_SNAP ($ASSET_SNAP_SIZE bytes, $ASSET_BLOB_COUNT blobs)"
-    fi
+    log "FAIL: asset backup enabled (ASSET_BACKUP_DIR set) but ASSET_STORE_DIR=$ASSET_STORE_DIR 不存在 — 配置错误(asset service 应有此目录)"
+    exit 1
   fi
+  ASSET_SNAP="$ASSET_BACKUP_DIR/asset-snap-$TIMESTAMP.tar.gz"
+  ASSET_PARENT="$(dirname "$ASSET_STORE_DIR")"
+  ASSET_BASE="$(basename "$ASSET_STORE_DIR")"
+  if ! tar -czf "$ASSET_SNAP" -C "$ASSET_PARENT" "$ASSET_BASE" 2>>"$LOG_FILE"; then
+    log "FAIL: asset snapshot failed (F4 hard gate — asset backup enabled ⇒ snapshot must succeed)"
+    rm -f "$ASSET_SNAP"
+    ASSET_SNAP=""
+    exit 1
+  fi
+  ASSET_SNAP_SIZE="$(stat -c%s "$ASSET_SNAP" 2>/dev/null || stat -f%z "$ASSET_SNAP" 2>/dev/null || echo 0)"
+  ASSET_BLOB_COUNT="$(find "$ASSET_STORE_DIR" -type f -name '*.bin' 2>/dev/null | wc -l | tr -d ' ')"
+  log "ok: asset snapshot → $ASSET_SNAP ($ASSET_SNAP_SIZE bytes, $ASSET_BLOB_COUNT blobs)"
 fi
+
+# F3:写 manifest sidecar(dump + 三核心表行数 + assetSnap/blobCount 同批配对凭证)。
+write_manifest
 
 # ─── 3. 滚动清理(日备/快照按天,周备按份数)────────────────────────────────
 # 日备 .dump:删早于 RETENTION_DAILY 天的
 find "$BACKUP_DIR" -maxdepth 1 -type f -name "$PG_DB-*.dump" -mtime +"$RETENTION_DAILY" -delete 2>>"$LOG_FILE" || true
+# F3:manifest sidecar 同步滚动(与 .dump 同生命周期)
+find "$BACKUP_DIR" -maxdepth 1 -type f -name "$PG_DB-*.manifest.json" -mtime +"$RETENTION_DAILY" -delete 2>>"$LOG_FILE" || true
 # 快照 .tar.gz:同样按 RETENTION_DAILY 滚
 find "$BACKUP_DIR" -maxdepth 1 -type f -name "pg-data-*.tar.gz" -mtime +"$RETENTION_DAILY" -delete 2>>"$LOG_FILE" || true
 # 周备:按 RETENTION_WEEKLY × 7 天滚
