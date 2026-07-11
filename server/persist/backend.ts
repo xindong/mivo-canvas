@@ -235,8 +235,18 @@ export interface PersistBackend {
     opts?: { payload?: unknown; idempotencyKey?: string; fingerprint?: string },
   ): Promise<{ count: number }>
 
-  /** Test-only:清空 owner 全部 records + idempotency index。 */
-  __reset(): void
+  /**
+   * Test-only:清空 owner 全部 records + idempotency index。
+   * memory:同步 void;PG:TRUNCATE(async)→ Promise<void>。返回类型放宽,两类 backend 共用接口。
+   */
+  __reset(): void | Promise<void>
+
+  /**
+   * backend 就绪 promise(memory 立即 resolve;PG 从 DB 预热全局唯一索引缓存)。
+   * app 启动(server/index.ts serve 前)await 之,确保同步 seam(getProjectOwner/getCanvasOwner)缓存已 warm。
+   * additive 字段——内存实现 Promise.resolve(),PG 落地后新增,路由/契约零改动。
+   */
+  readonly ready: Promise<void>
 }
 
 // ─── 内存实现(同 docKernel.ts 单文件 interface+impl 模式)──────────────────────────
@@ -274,6 +284,8 @@ export class InMemoryPersistBackend implements PersistBackend {
   private readonly globalProjectOwners = new Map<string, string>()
   /** 返修 N7:canvas id 全局归属索引(id → ownerId)。授权 seam canAccessCanvas 跨 owner 查归属;跨 owner → 404。 */
   private readonly globalCanvasOwners = new Map<string, string>()
+  /** additive(PG 落地后接口新增):内存 backend 立即就绪。 */
+  readonly ready: Promise<void> = Promise.resolve()
 
   private bucket(ownerId: string): Map<string, PersistRecord> {
     let b = this.byOwner.get(ownerId)
