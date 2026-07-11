@@ -20,9 +20,12 @@
 // file itself are NOT carried by the command. Instead the UI stage uploads them to
 // /api/assets (T1.5 #195, content-addressed: assetId = sha256) and the command only
 // carries the resulting `assetId` / `referenceAssetIds`. The executor's apply seam
-// resolves assetId → Blob at apply time. That resolution (and therefore the apply
-// for asset + generation commands) lands in the T2.3 *second* slice (PR2); this PR
-// ships the type + serialize round-trip + the sync-command apply seam only.
+// resolves assetId → Blob at apply time. That apply (for import-asset + the 5
+// generation kinds + mask-edit) landed in #208 (the T2.3 second slice, PR2) via
+// the CanvasCommandAssetBridge (see canvasCommandExecutor.ts); with no bridge the
+// apply throws CanvasCommandDeferredError so the PR1 boundary stays testable. This
+// file ships the type + serialize round-trip; the sync-command apply seam lives in
+// canvasCommandExecutor.ts.
 //
 // INVARIANTS
 // - Every CanvasCommand is JSON-serializable (no File/Blob/AbortSignal/functions).
@@ -181,11 +184,12 @@ export type CanvasCommand =
   // ── Delete ─────────────────────────────────────────────────────────────────────
   | { kind: 'delete-node'; nodeId: string }
   | { kind: 'delete-selected-nodes' }
-  // ── Two-stage asset (PR1: type + round-trip only; apply deferred to PR2) ───────
+  // ── Two-stage asset (PR1: type + round-trip; apply landed in #208 / PR2) ──────
   // import-asset: UI picks a File → POST /api/assets → assetId; command carries
-  // assetId (NOT the Blob). Apply (PR2) resolves assetId → assetUrl and adds the
-  // node. NOTE: the import path goes through the app-layer addImportedFileNode seam,
-  // not CanvasActionRuntime directly — see PR2 for the bridge.
+  // assetId (NOT the Blob). Apply (#208) resolves assetId → File via the
+  // CanvasCommandAssetBridge and adds the node through the app-layer
+  // addImportedFileNode seam (bridge.addImportedAssetNode), not CanvasActionRuntime
+  // directly. No bridge → CanvasCommandDeferredError (PR1 boundary stays testable).
   | {
       kind: 'import-asset'
       assetId: string
@@ -193,14 +197,15 @@ export type CanvasCommand =
       originalName?: string
       position: CanvasCommandPoint
     }
-  // ── Generation (PR1: type + round-trip only; apply deferred to PR2) ───────────
+  // ── Generation (PR1: type + round-trip; apply landed in #208 / PR2) ───────────
   // The three "hard pieces" (review-plan-a.md:43-48): import-asset, mask-edit, and
   // generation/edit reference images. All carry Blobs that must be two-stage
   // uploaded to assetIds before the command is emitted. generate-image-edit is the
   // NON-mask edit path (operation + prompt + referenceAssetIds); the mask-edit hard
   // piece has its OWN kind below (brush mask Blob + Set-of-Mark marked image Blob +
-  // geometry), 1:1 with the overlay's submit surface. Apply is deferred because
-  // referenceAssetIds / assetId → File[] needs /api/assets resolution (PR2).
+  // geometry), 1:1 with the overlay's submit surface. Apply (#208) resolves
+  // referenceAssetIds → File[] via the CanvasCommandAssetBridge (/api/assets); no
+  // bridge → CanvasCommandDeferredError.
   | {
       kind: 'generate-variations'
       sourceNodeId?: string
@@ -231,7 +236,7 @@ export type CanvasCommand =
       annotationNodeId?: string
       options?: CanvasCommandGenerationOptions
     }
-  // ── Mask edit (PR1: type + round-trip only; apply deferred to PR2) ────────────
+  // ── Mask edit (PR1: type + round-trip; apply landed in #208 / PR2) ────────────
   // The mask-edit hard piece (review-plan-a.md:45): serializable counterpart of
   // ImageMaskSubmitPayload (src/canvas/imageMaskGeometry.ts). Two-stage asset rule:
   // the two Blobs the overlay carries (brush mask PNG + Set-of-Mark marked image)
@@ -239,9 +244,11 @@ export type CanvasCommand =
   // geometry (maskBounds + sourceSize) and scalars (quality/model/subjects) ride
   // directly in the payload. canvasActionModel dispatches mask edit as its own menu
   // item (onStartImageMaskEdit, :167-173) — 1:1 with a dedicated kind, not folded
-  // into generate-image-edit. Apply (PR2) resolves maskAssetId/markedImageAssetId →
-  // Blobs via /api/assets. brush fixture (mask from brush/point regions) and area
-  // fixture (mask from box/ellipse/loop regions) are both exercised in round-trip.
+  // into generate-image-edit. Apply (#208) resolves maskAssetId/markedImageAssetId
+  // → Blobs via the CanvasCommandAssetBridge (/api/assets) and submits through
+  // bridge.submitImageMaskEdit; no bridge → CanvasCommandDeferredError. brush
+  // fixture (mask from brush/point regions) and area fixture (mask from
+  // box/ellipse/loop regions) are both exercised in round-trip.
   | {
       kind: 'mask-edit'
       /** Image node being locally repainted — mirrors ImageMaskEditOverlay's node.id. */
