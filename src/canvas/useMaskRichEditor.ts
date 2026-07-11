@@ -12,6 +12,7 @@ import type {
 } from 'react'
 import type { ImageMaskRegion, PointAnchor } from './imageMaskGeometry'
 import { recognitionLabel, type AnchorRecognition } from './useMaskAnchorRecognition'
+import { isImeComposing } from '../lib/imeSafeEnter'
 
 type RegionsRef = { current: ImageMaskRegion[] }
 type PointAnchorsRef = { current: PointAnchor[] }
@@ -181,8 +182,10 @@ export function useMaskRichEditor({
 
   const handleEditorKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
     // Enter 拦掉：contenteditable 回车会插 <div>/<br> 块级包装，产生诡异换行且破坏
-    // 序列化；正文不需要手动换行，长了自动折行。
+    // 序列化；正文不需要手动换行，长了自动折行。但 IME 合成态（选候选词期间）的
+    // Enter 用于确认候选，不拦——否则候选确认被吞、输入法卡住。
     if (event.key === 'Enter') {
+      if (isImeComposing(event)) return
       event.preventDefault()
       return
     }

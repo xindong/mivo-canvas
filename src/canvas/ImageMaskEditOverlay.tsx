@@ -21,6 +21,7 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from 'react'
 import { createPortal } from 'react-dom'
+import { isImeComposing } from '../lib/imeSafeEnter'
 import { debugLogger } from '../store/debugLogStore'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 import {
@@ -682,9 +683,11 @@ export function ImageMaskEditOverlay({
                 className="image-mask-edit-object"
                 data-canvas-ui="true"
                 // 容器级兜底：无论焦点在自定义输入框、还是行内图标/空白，Enter/Escape
-                // 都能关卡片（修「自定义打完回车菜单不消失」）。
+                // 都能关卡片（修「自定义打完回车菜单不消失」）。但 IME 合成态（选候选词
+                // 期间）的 Enter 用于确认候选，不关卡片——候选确认后再按 Enter 才关。
                 onKeyDown={(event) => {
                   if (event.key !== 'Enter' && event.key !== 'Escape') return
+                  if (event.key === 'Enter' && isImeComposing(event)) return
                   event.preventDefault()
                   event.stopPropagation()
                   setOpenChipKey(null)
