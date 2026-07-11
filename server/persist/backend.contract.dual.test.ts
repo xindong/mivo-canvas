@@ -282,6 +282,114 @@ const runPersistBackendContractSuite = (
       expect((await rec('chat-collection', 'c1')).isDeleted).toBe(false)
     })
   })
+
+  describe(`${label} — DP-6R chat per-actor(私有 + 不 bump 共享 cv + 删/恢复不串)`, () => {
+    let b: PersistBackend
+    const canvasRec = async () => {
+      const r = await b.get('o', 'canvas', 'c1')
+      if (r.kind !== 'found') throw new Error('canvas c1 missing')
+      return r.record
+    }
+    beforeEach(async () => {
+      b = makeBackend()
+      await resetBackend(b)
+    })
+
+    it('两 actor 同 canvas 拥同 messageId 各自独立(per-actor namespace);listByCanvas 只见自己', async () => {
+      await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+      await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      // 两 actor 各 POST 同 id 'm1'(per-actor namespace:PK=(actor,'chat-message','m1'))
+      const aA = await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm1', { text: 'A' }, { method: 'POST', resourceKind: 'chat-message' })
+      expect(aA.kind).toBe('created')
+      const aB = await b.ensureCreateChild('actorB', 'c1', 'chat-message', 'm1', { text: 'B' }, { method: 'POST', resourceKind: 'chat-message' })
+      expect(aB.kind).toBe('created') // 同 id 不撞(per-actor)
+      // 各自 GET 只见自己 + payload 不串
+      const listA = await b.listByCanvas('actorA', 'c1', 'chat-message')
+      const listB = await b.listByCanvas('actorB', 'c1', 'chat-message')
+      expect(listA.records.map((r) => r.id)).toEqual(['m1'])
+      expect(listB.records.map((r) => r.id)).toEqual(['m1'])
+      expect((listA.records[0].payload as { text: string }).text).toBe('A')
+      expect((listB.records[0].payload as { text: string }).text).toBe('B')
+      // canvas owner('o')GET chat → 空(owner 自己没写过 chat;旧 owner chat 才在 'o' 名下,见下条)
+      expect((await b.listByCanvas('o', 'c1', 'chat-message')).records).toHaveLength(0)
+    })
+
+    it('chat 写入不 bump 共享 canvas contentVersion(node 写入仍 bump)', async () => {
+      await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+      await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      const cv0 = (await canvasRec()).payload as { contentVersion?: number }
+      expect(cv0.contentVersion ?? 0).toBe(0)
+      // chat 写入(actor)→ 不 bump 共享 cv
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm1', { text: 'hi' }, { method: 'POST', resourceKind: 'chat-message' })
+      const cv1 = (await canvasRec()).payload as { contentVersion?: number }
+      expect(cv1.contentVersion ?? 0).toBe(0) // chat 不 bump
+      // node 写入(canvas owner)→ bump 共享 cv
+      await b.upsertChild('o', 'c1', 'node', 'n1', { id: 'n1' }, { method: 'PATCH', resourceKind: 'node' })
+      const cv2 = (await canvasRec()).payload as { contentVersion?: number }
+      expect(cv2.contentVersion ?? 0).toBe(1) // node bump
+      // PATCH/DELETE chat 也不 bump
+      await b.upsertChild('actorA', 'c1', 'chat-message', 'm1', { text: 'edit' }, { method: 'PATCH', resourceKind: 'chat-message', base: 0 })
+      await b.hardDeleteChild('actorA', 'c1', 'chat-message', 'm1')
+      const cv3 = (await canvasRec()).payload as { contentVersion?: number }
+      expect(cv3.contentVersion ?? 0).toBe(1) // chat edit/delete 不 bump,node 的 cv 保留
+    })
+
+    it('hardDeleteChild 只删 actor 自己的(非己 msgId → deleted=false,不触他人)', async () => {
+      await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+      await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm1', { text: 'A' }, { method: 'POST', resourceKind: 'chat-message' })
+      await b.ensureCreateChild('actorB', 'c1', 'chat-message', 'm1', { text: 'B' }, { method: 'POST', resourceKind: 'chat-message' })
+      // actorB 删 'm1'(actorB 的)→ deleted=true;actorA 的 m1 不受影响
+      const delB = await b.hardDeleteChild('actorB', 'c1', 'chat-message', 'm1')
+      expect(delB.deleted).toBe(true)
+      expect((await b.listByCanvas('actorA', 'c1', 'chat-message')).records).toHaveLength(1) // A 的 m1 在
+      expect((await b.listByCanvas('actorB', 'c1', 'chat-message')).records).toHaveLength(0) // B 的删了
+      // actorA 删 'mX'(不存在于 A)→ deleted=false
+      const delMiss = await b.hardDeleteChild('actorA', 'c1', 'chat-message', 'mX')
+      expect(delMiss.deleted).toBe(false)
+    })
+
+    it('reorderChildren chat per-actor:cv base 读 canvas owner,不 bump 共享 cv,只重排 actor 自己', async () => {
+      await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+      await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm1', { text: '1' }, { method: 'POST', resourceKind: 'chat-message' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm2', { text: '2' }, { method: 'POST', resourceKind: 'chat-message' })
+      await b.ensureCreateChild('actorB', 'c1', 'chat-message', 'm1', { text: 'B1' }, { method: 'POST', resourceKind: 'chat-message' })
+      // node 写一次 bump cv → 1(chat 不 bump);chat reorder base 读 canvas owner('o')的 cv=1
+      await b.upsertChild('o', 'c1', 'node', 'n1', { id: 'n1' }, { method: 'PATCH', resourceKind: 'node' })
+      const cvBefore = (((await canvasRec()).payload) as { contentVersion?: number }).contentVersion ?? 0
+      expect(cvBefore).toBe(1)
+      // actorA reorder 自己的 [m1,m2](base=1=canvas owner cv)→ ok,不 bump 共享 cv
+      const r = await b.reorderChildren('actorA', 'c1', 'chat-message', ['m2', 'm1'], { base: cvBefore })
+      expect(r.kind).toBe('ok')
+      if (r.kind === 'ok') expect(r.contentVersion).toBe(cvBefore) // 不 bump,response cv=currentCv
+      const cvAfter = (((await canvasRec()).payload) as { contentVersion?: number }).contentVersion ?? 0
+      expect(cvAfter).toBe(cvBefore) // 共享 cv 未被 chat reorder 改
+      // actorA 顺序变了;actorB 不受影响(仍 [m1])
+      expect((await b.listByCanvas('actorA', 'c1', 'chat-message')).records.map((r) => r.id)).toEqual(['m2', 'm1'])
+      expect((await b.listByCanvas('actorB', 'c1', 'chat-message')).records.map((r) => r.id)).toEqual(['m1'])
+      // actorB reorder 用 actorA 已不存在的 orderedIds → bad mismatch(actorA 的顺序与 actorB 的 live set 不符)
+      const rB = await b.reorderChildren('actorB', 'c1', 'chat-message', ['m2', 'm1'], { base: cvBefore })
+      expect(rB.kind).toBe('bad') // actorB 只有 m1,[m2,m1] 不全等 → mismatch
+    })
+
+    it('删/恢复画布不串 actor collection:per-actor chat-message 活记录不动,restore 后各见自己', async () => {
+      await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+      await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'mA', { text: 'A' }, { method: 'POST', resourceKind: 'chat-message' })
+      await b.ensureCreateChild('actorB', 'c1', 'chat-message', 'mB', { text: 'B' }, { method: 'POST', resourceKind: 'chat-message' })
+      // 软删 canvas → canvas meta + chat-collection(under 'o')标删;per-actor chat-message 活记录不动
+      await b.softDeleteCanvasTree('o', 'c1')
+      expect((await canvasRec()).isDeleted).toBe(true)
+      // per-actor chat 仍在(活记录,随父级不可见靠 canvas 软删 + route authz)
+      expect((await b.listByCanvas('actorA', 'c1', 'chat-message', { includeDeleted: true })).records.map((r) => r.id)).toEqual(['mA'])
+      expect((await b.listByCanvas('actorB', 'c1', 'chat-message', { includeDeleted: true })).records.map((r) => r.id)).toEqual(['mB'])
+      // restore canvas → 各 actor chat 仍各自在,不串
+      await b.restoreCanvasTree('o', 'c1')
+      expect((await b.listByCanvas('actorA', 'c1', 'chat-message')).records.map((r) => r.id)).toEqual(['mA'])
+      expect((await b.listByCanvas('actorB', 'c1', 'chat-message')).records.map((r) => r.id)).toEqual(['mB'])
+    })
+  })
 }
 
 // ── memory 后端(永远跑)──────────────────────────────────────────────────────────────
