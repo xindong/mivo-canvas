@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ops/postgres/restore-drill.sh — 从最近一份 pg_dump 恢复到临时库 + 跑验证查询,输出 drill 结果。
 # 不触碰生产库:恢复到 ${PG_DRILL_DB:-mivocanvas_drill},跑完即 DROP。
-# 成功标准:pg_restore 退出 0 + 临时库可 SELECT(连接 + 元查询通过)+ 表计数为数字。
+# 成功标准:dump TOC 可读预校验(pg_restore -l)+ pg_restore 退出 0 + 临时库可 SELECT(连接 + 元查询通过)+ 表计数为数字。
 # 由 owner/lead 定期跑(见 docs/runbook/t1.1-pg-provisioning.md §restore drill),留证到 drill log。
 #
 # 注:空库(BFF schema 未迁移前)表计数=0 仍判 PASS(恢复链路本身通);schema 落地后,
@@ -36,6 +36,14 @@ if [ -z "$LATEST_DUMP" ]; then
   exit 1
 fi
 log "using backup: $LATEST_DUMP ($(stat -c%s "$LATEST_DUMP" 2>/dev/null || stat -f%z "$LATEST_DUMP" 2>/dev/null) bytes)"
+
+# ─── 预校验:dump TOC 可读(0 字节/损坏 → pg_restore -l 非零退出,FAIL 早退,不空跑报 PASS)──
+# pg_restore -l 列 TOC;空库 schema 头也有 15 条 TOC(服务器实测),损坏/0 字节则非零退出。
+if ! docker exec -i "$PG_CONTAINER" pg_restore -l <"$LATEST_DUMP" >>"$LOG_FILE" 2>&1; then
+  log "FAIL: dump TOC unreadable — $LATEST_DUMP corrupt/empty (likely 0-byte dump), abort drill"
+  exit 1
+fi
+log "ok: dump TOC readable (pg_restore -l exit 0)"
 
 # ─── 1. 重建临时库(确保干净,不污染生产)──────────────────────────────────
 docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_ADMIN_DB" -c "DROP DATABASE IF EXISTS \"$DRILL_DB\";" >>"$LOG_FILE" 2>&1
