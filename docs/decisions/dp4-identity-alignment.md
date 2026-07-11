@@ -100,7 +100,7 @@ export const resolveActor = (c: Context): string => {
 
 **载体一致性不因 fallback 受损**:fallback 仅是 dev/测试过渡;生产网关注入后 carrier = username = §13.5 maker user id,与本 §2 判定一致。
 
-## 4. 可信 header 契约(deployment 依赖,ops/lead 落地)
+## 4. 可信 header 契约(deployment 依赖,ops/lead 落地)+ 服务器侧防伪造
 
 | 项 | 约定 |
 |---|---|
@@ -108,17 +108,25 @@ export const resolveActor = (c: Context): string => {
 | 值 | SSO `username`(maker user id,如 `zhuzan@xd.com`),非 display_name |
 | 注入方 | nginx 网关(auth.dsworks.cn)`auth_request` 通过后 `proxy_set_header X-Auth-User $remote_user`(或等价) |
 | 信任边界 | BFF 仅在网关之后信任此 header;网关**必须**无条件覆盖(strip)客户端自带的 `X-Auth-User`,防身份伪造 |
-| 缺失语义 | header 缺失 = 未经网关(内网直连 BFF)或网关未配 → fallback 指纹(dev/legacy);**生产不得缺失**(缺失则权限层降级为指纹自归属,分享/邀请失效,见 §5 风险 R-1) |
+| **opt-in 开关** | `MIVO_TRUST_SSO_HEADER=1` 才信任此 header(**默认关**;关 → fallback 指纹,防 BFF 被绕网关直连时伪造身份) |
+| **网关共享密钥** | `MIVO_GATEWAY_SECRET`(生产必设):BFF 额外要求 `x-mivo-gateway-secret` header 匹配(网关注入,客户端不可构造)才信任 `x-mivo-auth-user`。密钥不匹配 → 不信任 SSO header(回退指纹,但**不冒充 victim**)。dev/test 不设 secret → 信任 header(本地无网关) |
+| 缺失语义 | header 缺失 = 未经网关 或 未 opt-in → fallback 指纹(dev/legacy);**生产不得缺失**(缺失则权限层降级为指纹自归属,分享/邀请失效,见 §5 R-1) |
 | 与 mivo key 正交 | `X-Mivo-Api-Key`(mivo_ 平台 key)仍管 platform ctx(图像生成 token 桶),与身份 header 正交;persist 路由 `rejectInvalidMivoApiKey` 边界保留(F4),但 owner 归属不再用指纹,改用 username |
 
-> 注:具体 nginx 注入配置(header 名最终值、`auth_request` setup)是部署步骤,由 ops/lead 在生产网关落地;本 PR 实现 BFF 侧读取 + 文档化契约,不在本 PR 改 nginx 配置(无仓库可改)。
+**服务器侧防伪造(本 PR 实现,Greptile security 二轮修复)**:
+1. **opt-in 开关**(`MIVO_TRUST_SSO_HEADER=1`,默认关):BFF 被绕网关直连时,攻击者发 `x-mivo-auth-user: victim` 也不被信任(flag 关 → 指纹 fallback,不冒充)。
+2. **网关共享密钥**(`MIVO_GATEWAY_SECRET`):即便 opt-in 开,客户端仍可发同名 header 冒充;故配置密钥后 BFF 要求 `x-mivo-gateway-secret` 匹配(网关注入,客户端不可构造)才信任。攻击者不知密钥 → 无法冒充。
+3. **启动配置校验**(`server/lib/owner.ts validateSsoConfig` + `server/index.ts` 启动告警):生产下 SSO 开但缺密钥 → 警告(可伪造);SSO 未开 → 警告(指纹共享风险)。防静默 misconfig(Greptile finding 2)。
+
+> 注:具体 nginx 注入配置(header 名最终值、`auth_request` setup、共享密钥注入)是部署步骤,由 ops/lead 在生产网关落地;本 PR 实现 BFF 侧读取 + opt-in + 密钥校验 + 启动告警,不在本 PR 改 nginx 配置(无仓库可改)。
 
 ## 5. 未验证项 + 风险
 
 | ID | 项 | 说明 |
 |---|---|---|
-| R-1 | **生产网关注入未验证** | `x-mivo-auth-user` 的 nginx 注入未在本 PR 实测(无生产网关访问)。生产部署前 ops 必须确认网关注入 + strip 客户端伪造。**缺失则分享/邀请失效**(降级为指纹自归属)。 |
+| R-1 | **生产网关注入未验证** | `x-mivo-auth-user` + `x-mivo-gateway-secret` 的 nginx 注入未在本 PR 实测(无生产网关访问)。本 PR 已加服务器侧防伪造(opt-in + 共享密钥 + 启动告警);生产部署前 ops 仍须确认网关注入 + strip 客户端伪造 + 设 `MIVO_GATEWAY_SECRET`。缺失密钥则分享/邀请失效(降级指纹自归属)。 |
 | R-2 | **username ↔ mivo key 指纹的映射** | T1.3 已建数据(project_ownerId = 指纹)与 T1.4 新建数据(ownerId = username)在迁移窗口共存。**T1.6 存量搬迁** runbook 须规定:迁移动作把 ownerId 从指纹映射回 username(或重建归属)。本 PR 内存后端无存量数据,不涉及;PG 落地 + 搬迁由 T1.3 worker + T1.6 runbook 处理。 |
+| R-5 | **指纹 fallback 残留共享身份风险** | 即便有共享密钥(opt-in),若攻击者绕网关直连(无密钥)→ fallback 指纹;若生产 `MIVO_PLATFORM_KEY` 共享/缺失,该指纹 actor 名下数据可被访问(Greptile finding 2 残留)。**完整修复**(SSO 模式下缺身份 → 401 拒绝而非 fallback)需改 `resolveActor` 返回 `string|null` + 全路由处理,本 PR 未做(改契约面大),列为 follow-up;本 PR 用启动告警让 misconfig 可见。生产纯 SSO(无指纹数据)下该残留不暴露数据。 |
 | R-3 | **SSO username 变更(改名)罕见** | `username` 是 email-style 账号,改名极罕见;若发生,`project_members.userId` 旧值失效——按 §13.5 "零 maker 跨仓改动",username 变更属 maker 账号管理范畴,本层不处理(需 owner 重新邀请)。 |
 | R-4 | **403 body 未进 shared 契约** | T1.4 引入成员越权 403(`{error:'forbidden'}`,server-local),**不**加进 `shared/persist-contract.ts` 的 `ApiErrorBody`(保 #194 契约不变,boundary 3)。非成员/无分享 → 404 unknown-* 与 #194 一致;成员越权(editor manage / viewer write)→ 403。客户端 PersistAdapter 当前仅以 owner 身份操作,不触发 403;editor/viewer UI 未建(boundary 4)。 |
 

@@ -8,9 +8,10 @@
 // 网络隔离),不在本仓代码层处理。本地 dev 用 routes/auth.ts 的 dev 桩 /api/auth/me
 // 进已登录态(opt-in,见 lib/auth-stub.ts)。
 import { serve } from '@hono/node-server'
-import { app, sharedPersistBackend } from './app'
+import { app, sharedPersistBackend, sharedPermissionBackend } from './app'
 import { resolveFeatureFlags } from './lib/env'
 import { isDevStubActive } from './lib/auth-stub'
+import { validateSsoConfig } from './lib/owner'
 
 const PORT = Number(process.env.MIVO_PORT) || 8080
 const PUBLIC_MODE = process.env.MIVO_PUBLIC === '1'
@@ -29,10 +30,15 @@ if (PUBLIC_MODE) {
   )
 }
 
-// T1.3: PG backend 启用时,serve 前预热全局唯一索引缓存(getProjectOwner/getCanvasOwner 同步 seam 用);
+// T1.4: SSO 身份配置校验(Greptile security:防静默回退共享指纹 / 可伪造身份头)。仅生产告警。
+for (const w of validateSsoConfig()) {
+  console.warn(`[mivo-bff] WARN: ${w}`)
+}
+
+// T1.3: PG backend 启用时,serve 前预热 persist 全局唯一索引缓存 + 权限层 migrations;
 // memory backend 的 ready 立即 resolve(no-op,生产零变化)。PG 连接失败 → 启动停(fail visibly)。
 const start = async (): Promise<void> => {
-  await sharedPersistBackend.ready
+  await Promise.all([sharedPersistBackend.ready, sharedPermissionBackend.ready])
   serve({ fetch: app.fetch, hostname: HOSTNAME, port: PORT }, (info) => {
     const bound = `${info.address}:${info.port}`
     const mode = PUBLIC_MODE ? 'public 0.0.0.0 (behind SSO gateway)' : 'local 127.0.0.1'
