@@ -6,7 +6,7 @@
 import { createJSONStorage } from 'zustand/middleware'
 import { idbStateStorage } from '../lib/persistIdbStorage'
 import { compactCanvasesForPersist } from './canvasDocumentModel'
-import { CANVAS_PERSIST_VERSION, mergeCanvasPersistedState, migratePersistedState } from './canvasGenerationHydration'
+import { CANVAS_PERSIST_VERSION, consumeCanvasHydrationSettleCount, mergeCanvasPersistedState, migratePersistedState } from './canvasGenerationHydration'
 import { debugLogger } from './debugLogStore'
 import { isLegacyKernel } from '../app/kernelMode'
 import { docKernelPersistStorage } from '../kernel/docKernelPersistAdapter'
@@ -41,4 +41,22 @@ export const canvasPersistOptions = {
     brushStyle: state.brushStyle,
     activeStampKind: state.activeStampKind,
   }),
+  // SC-15 R2: hydrate wrote the merge-settled canvas state via the *vanilla* set (no
+  // setItem without a version migrate — see canvasGenerationHydration.ts
+  // pendingCanvasHydrationSettleCount). If merge settled ≥1 slot/task, fire ONE
+  // controlled writeback through the wrapped api.setState (which triggers setItem) so
+  // the persisted blob lands settled, not generating. Gated by the settle count so
+  // reload-2+ (durable already settled) doesn't rewrite the 10k-node blob. Dynamic
+  // import of useCanvasStore breaks the canvasStore ⇄ canvasPersistConfig static cycle
+  // (canvasStore statically imports this module for the options); the store is loaded
+  // by the time rehydrate runs, so the dynamic import resolves synchronously.
+  onRehydrateStorage: () => async () => {
+    const settled = consumeCanvasHydrationSettleCount()
+    if (settled <= 0) return
+    const { useCanvasStore } = await import('./canvasStore')
+    // New canvases ref guarantees persist's setItem subscriber fires (v5 doesn't promise
+    // to write when the partialized slice ref is unchanged). setItem writes
+    // partialize(getState()) = compacted canvases with the settled (failed) slots.
+    useCanvasStore.setState((s) => ({ canvases: { ...s.canvases } }))
+  },
 }
