@@ -275,70 +275,161 @@ export const isDeleteKind = (kind: WriteOpKind): boolean =>
   kind === 'deleteChatMessage' // 404(已删 / 跨 actor)→ 幂等 success
 
 /**
- * G1-a R5 F1(R4 tie-breaker 三层化):drain 排序的依赖感知 tie-breaker。
+ * G1-a R7-1:drain 排序的稳定拓扑排序(替换 R6-1 的标量 dependencyRank)。
  *
- * 跨 resource-key、同毫秒入队的写按"父资源先建"分层,防子资源 op 在父资源 create 前 drain
- * → 服务端 FK 404 → classifyHttpStatus(404, isDelete=false) → rejected terminal → durable record 被删
- * → 刷新后永久丢失。三层依赖顺序:
- *  - rank 0:project 类(createProject/updateProject/deleteProject)+ user-state + asset-attach/detach。
- *    无跨资源 FK 会在 G1-a executor 范围内因 404 terminal 丢失(attachAsset 依赖 node 生命周期,但当前
- *    无生产 enqueue caller,见下 G1-c 提醒)。
- *  - rank 1:canvas 类 createCanvas/updateCanvas —— 携带 projectId 外键,服务端要求 project 先建好
- *    (POST /api/canvas 缺 project → 404 unknown-project;见 server/routes/canvas.ts + canvas.route.test.ts
- *    unknown-project 404)。R4 F2 已覆盖 project→canvas 同毫秒 FK 链。
- *  - rank 2:canvas-dependent child —— appendChatMessage / updateChatMessage / deleteChatMessage。依赖
+ * 背景:R6-1 的条件 dependencyRank 虽只在批内存在 FK parent 时给 child 升 rank,但仍用单一标量 rank
+ * 对整批分层排序。混合批中一旦 chat 因批内 canvas 升到 rank 2,所有 rank 0 的无关记录(如 unrelated
+ * createProject)都会跨过 chat——即使前两条真实 FK 边已天然有序、第三条与两者无 FK,正确的 surgical
+ * 序应完全不变。返修声明"只重排实际 FK 边"不成立。R7 verdict 用 fresh 真 Hono 反例证:IDB 原序
+ * canvas→chat→unrelated project 被改成 canvas→unrelated project→chat。
+ *
+ * 修法(lead 指定):以原 IDB 序(主键 nextAttemptAt/createdAt + stable sort 保留入队序)为优先级的稳定
+ * 拓扑排序。先按主键稳定排序得"原序",再在原序上建批内真实 FK 边,Kahn 算法就绪集(入度 0)每次取原序
+ * 最靠前者(最小堆按 ordered index 升序)。无边记录入度 0 → 完全保持原序;有边记录只在 parent 必须
+ * 先 drain 时后置。O((n+e) log n),n 为单用户同毫秒 due 批规模(个位到几十),性能无虞。
+ *
+ * 批内真实 FK 边(G1-a 已接线的非画布域 FK 链,project→canvas→chat):
+ *  - createProject(id) → createCanvas/updateCanvas(projectId=id):canvas 写携带 projectId 外键,服务端
+ *    要求 project 先建好(POST /api/canvas 缺 project → 404 unknown-project;见 server/routes/canvas.ts
+ *    + canvas.route.test.ts unknown-project 404)。R4 F2 覆盖 project→canvas 同毫秒 FK 链。
+ *  - createCanvas(id) → appendChatMessage/updateChatMessage/deleteChatMessage(canvasId=id):chat 写依赖
  *    canvas 已建(POST /api/canvas/:id/chat → authzCanvas → canvas 未建 → 404 unknown-canvas → terminal;
  *    见 canvas.ts authzCanvas + canvas.route.test.ts POST chat 404)。R5-1:同毫秒 createCanvas +
- *    appendChatMessage(用户新建画布后立即发消息,chatStore.sendMessage → enqueueChatAppend)若 chat 先
- *    drain → 404 unknown-canvas → terminal 删 chat record → 消息永久丢失。rank 2 保证 chat 在 createCanvas
- *    之后 drain。
+ *    appendChatMessage(用户新建画布后立即发消息)若 chat 先 drain → 404 unknown-canvas → terminal
+ *    删 chat record → 消息永久丢失。拓扑边强制 canvas 先 drain。
+ *  传递成链:真实三链 project→canvas→chat(parent 均在批内)因边传递约束 → 拓扑序强制 project→canvas→chat。
+ *
+ * 性质对比(为何拓扑排序 surgical,而标量 rank 不是):
+ *  - 无 FK 竞争对(chat 依赖的 canvas 已 preseed + 无关 createProject):无边 → 入度 0 → 原序保持
+ *    (R6-1 两记录守卫:chat→project 保持原序)。
+ *  - 混合批(canvas→chat 真实边已天然有序 + 无关 project 在后):canvas→chat 边存在但原序已 canvas
+ *    在 chat 前,边不改变其相对位置;无关 project 无边不跨过 chat(R7-1 修:canvas→chat→unrelated project)。
+ *  - backoff 跨桶:若 parent.nextAttemptAt > child.nextAttemptAt(parent 失败 backoff 推迟),拓扑边仍
+ *    强制 parent 先 drain——FK 边优先于时间主键,防 child 先 drain 撞未建 parent 404 terminal。
  *
  * 第四层依赖面(future seam,当前不加码,书面确认):
  *  - updateChatMessage / deleteChatMessage 语义上依赖 appendChatMessage 已先成功(否则 PATCH/DELETE 一个
  *    未建 msgId → 404 unknown-message;delete 404 幂等 success 无险,update 404 → terminal)。**当前
  *    chatPersistSync 只导出 enqueueChatAppend,无生产 enqueueChatUpdate/Delete caller**(独立 grep 已核验),
- *    故 append→update 同毫秒风险是 future seam,G1-a 范围书面确认即可,不另立 rank 层。
+ *    故 append→update 同毫秒风险是 future seam,G1-a 范围书面确认即可,不另建边。
  *  - node/edge/anchor/reorder/attachAsset 依赖 canvas 与 node 生命周期,但当前 executor 对 canvas 域写返
  *    unsupported-retained(deferred 留存,不发请求不删,无 404 terminal 险)。**G1-c 接线升级 executor 时
- *    必须重审依赖排序/恢复策略**(node→edge/anchor、asset-attach 依赖 live node 等),不要继续靠枚举层;
+ *    必须重审依赖排序/恢复策略**(node→edge/anchor、asset-attach 依赖 live node 等),不要继续靠枚举边;
  *    本函数只覆盖 G1-a 已接线的非画布域 FK 链(project→canvas→chat),G1-c 扩展时另行升级。
  *
- * 跨毫秒时父资源同步先于子资源入队,timestamp 主键已保证顺序 —— tie-breaker 仅在 same-ms tie 时生效。
- *
- * R6-1(条件 rank,非全局 kind 映射):上述 0/1/2 层不再是 op kind 的固定映射,而是"仅当本批 due 内
- * 真实存在其 FK parent 的 pending create 时才赋予高 rank,否则 rank 0"。批内 parent-id 索引由 drain
- * 排序前扫一遍 due 建立(O(n),见 drain 内 pendingProjectCreateIds/pendingCanvasCreateIds)。效果:
- * 真实三链(project→canvas→chat,parent 均在批内)仍按 0/1/2 后置;无 FK 竞争对(chat 依赖的 canvas 已
- * 在先前 drain 建好 + 一个无关 createProject)两者 rank 均 0 → 保持 IDB 入队原序,不被全局 kind 改序。
+ * 跨毫秒时父资源同步先于子资源入队,timestamp 主键已保证顺序 —— 拓扑边仅在 same-ms tie 或 backoff
+ * 跨桶(parent 被 backoff 推迟到 child 之后)时生效;主键不同且无 backoff 跨桶时 stable sort 已分桶,
+ * 拓扑边不跨桶。
  */
-const dependencyRank = (
-  op: WriteOp,
-  pendingProjectCreateIds: Set<string>,
-  pendingCanvasCreateIds: Set<string>,
-): number => {
-  // R6-1:rank 是条件的,不是全局 kind→层映射。只有当本批 due 内真实存在其 FK parent 的 pending create
-  // 时才赋高 rank 后置;否则 rank 0,与无 FK 记录同层,保持 IDB getAll 入队原序(nextAttemptAt/createdAt
-  // 相同时 stable sort 不改序)。这样同毫秒"无 FK 竞争对"(如 chat 依赖的 canvas 已 preseed + 一个无关
-  // createProject)不再被全局 kind rank 误改序;而真实三链 project→canvas→chat 因 parent 在批内仍按
-  // 0/1/2 传递后置(canvas 依赖批内 createProject → rank 1;chat 依赖批内 createCanvas → rank 2)。
-  switch (op.kind) {
-    // rank 2:canvas-dependent child —— chat 写依赖 canvas 已建(404 unknown-canvas → terminal 会丢消息)。
-    // 仅当 chat.canvasId 的 createCanvas 也在本批 due 内时才后置;否则 canvas 已在先前 drain 建好
-    // (或与本批无关)→ rank 0 保持原序,不误伤无 FK 竞争的同毫秒 op。
-    case 'appendChatMessage':
-    case 'updateChatMessage':
-    case 'deleteChatMessage':
-      return pendingCanvasCreateIds.has(op.canvasId) ? 2 : 0
-    // rank 1:canvas 类 createCanvas/updateCanvas —— 携带 projectId 外键,project 先建。
-    // 仅当 canvas.projectId 的 createProject 也在本批 due 内时才后置;否则 rank 0。
-    // (deleteCanvas 不带 projectId,落 default rank 0;create+delete 同 id 已被 combineOps 抵消,批内不并存。)
-    case 'createCanvas':
-    case 'updateCanvas':
-      return pendingProjectCreateIds.has(op.projectId) ? 1 : 0
-    // rank 0:project 类 + user-state + asset-attach/detach(无跨资源 FK 在 G1-a 范围内 terminal 404 丢失)。
-    default:
-      return 0
+const stableTopologicalSort = (due: QueuedWrite[]): QueuedWrite[] => {
+  // 原序:主键 nextAttemptAt(退避到期先发)+ 次键 createdAt(同 nextAttemptAt 时先入队先发)。
+  // stable sort 保留 IDB getAll 入队序作隐式第三 tie-break(同主键时不动相对位置)。
+  const ordered = due
+    .slice()
+    .sort((a, b) => a.nextAttemptAt - b.nextAttemptAt || a.createdAt - b.createdAt)
+
+  // 建批内 parent-create 索引:project id / canvas id → 该 create 在 ordered 中的 index(首个)。
+  // 同 id 取首个保证确定性(create+create 同 id 生产流不发生;combineOps 已把 create+update 合并保留
+  // create kind,批内不并存同 id 的 createProject/createCanvas)。
+  const projectCreateIndex = new Map<string, number>()
+  const canvasCreateIndex = new Map<string, number>()
+  for (let i = 0; i < ordered.length; i++) {
+    const op = ordered[i]!.op
+    if (op.kind === 'createProject' && op.id !== undefined) {
+      if (!projectCreateIndex.has(op.id)) projectCreateIndex.set(op.id, i)
+    } else if (op.kind === 'createCanvas') {
+      if (!canvasCreateIndex.has(op.canvasId)) canvasCreateIndex.set(op.canvasId, i)
+    }
   }
+
+  // 建边(parent create → child op 引用该 parent id 且 parent 在批内)。边方向:parent 先 → child 后。
+  // adj[parentIdx] = [childIdx, ...]; indegree[childIdx]++。
+  const n = ordered.length
+  const adj: number[][] = Array.from({ length: n }, () => [])
+  const indegree = new Array<number>(n).fill(0)
+  for (let i = 0; i < n; i++) {
+    const op = ordered[i]!.op
+    // canvas 写引用 project id(createCanvas/updateCanvas 依赖批内 createProject(id=op.projectId))。
+    // deleteCanvas 不带 projectId(create+delete 同 id 已被 combineOps 抵消,批内不并存)。
+    if (op.kind === 'createCanvas' || op.kind === 'updateCanvas') {
+      const pIdx = projectCreateIndex.get(op.projectId)
+      if (pIdx !== undefined && pIdx !== i) {
+        adj[pIdx]!.push(i)
+        indegree[i]!++
+      }
+    }
+    // chat 写引用 canvas id(append/update/deleteChatMessage 依赖批内 createCanvas(id=op.canvasId))。
+    if (
+      op.kind === 'appendChatMessage' ||
+      op.kind === 'updateChatMessage' ||
+      op.kind === 'deleteChatMessage'
+    ) {
+      const cIdx = canvasCreateIndex.get(op.canvasId)
+      if (cIdx !== undefined && cIdx !== i) {
+        adj[cIdx]!.push(i)
+        indegree[i]!++
+      }
+    }
+  }
+
+  // Kahn 拓扑排序:就绪集(入度 0)用最小堆按原序(ordered index 升序)做 tie-break —— 每次取原序最靠前者。
+  // 无边记录入度 0 一开始就在堆里,按原序逐个弹出 → 完全保持原序;有边记录等 parent 弹出后入度归零才入堆。
+  const heap: number[] = []
+  const heapPush = (idx: number): void => {
+    heap.push(idx)
+    let c = heap.length - 1
+    while (c > 0) {
+      const p = (c - 1) >> 1
+      if (heap[p]! <= heap[c]!) break
+      ;[heap[p]!, heap[c]!] = [heap[c]!, heap[p]!]
+      c = p
+    }
+  }
+  const heapPop = (): number => {
+    const top = heap[0]!
+    const last = heap.pop()!
+    if (heap.length > 0) {
+      heap[0] = last
+      let p = 0
+      const len = heap.length
+      for (;;) {
+        const l = 2 * p + 1
+        const r = l + 1
+        let smallest = p
+        if (l < len && heap[l]! < heap[smallest]!) smallest = l
+        if (r < len && heap[r]! < heap[smallest]!) smallest = r
+        if (smallest === p) break
+        ;[heap[smallest]!, heap[p]!] = [heap[p]!, heap[smallest]!]
+        p = smallest
+      }
+    }
+    return top
+  }
+  for (let i = 0; i < n; i++) if (indegree[i] === 0) heapPush(i)
+
+  const sorted: QueuedWrite[] = []
+  const placed = new Array<boolean>(n).fill(false)
+  while (heap.length > 0) {
+    const idx = heapPop()
+    if (placed[idx]) continue
+    placed[idx] = true
+    sorted.push(ordered[idx]!)
+    for (const childIdx of adj[idx]!) {
+      if (--indegree[childIdx]! === 0) heapPush(childIdx)
+    }
+  }
+  // 环保护:FK 边 create→child 单调,不应成环。若因异常数据成环(理论不应发生),剩余按原序追加,
+  // 防 Kahn 死锁导致记录永不 drain(永驻 IDB)。debugLogger.warn 可见,不静默(fail visibly)。
+  if (sorted.length < n) {
+    debugLogger.warn(
+      SOURCE,
+      `topo sort detected possible cycle (${n - sorted.length} records unplaced); appending remainder in original order`,
+    )
+    for (let i = 0; i < n; i++) {
+      if (!placed[i]) sorted.push(ordered[i]!)
+    }
+  }
+  return sorted
 }
 
 /**
@@ -788,34 +879,11 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
             r.nextAttemptAt <= ts,
         )
 
-      // R6-1:tie-breaker 改为依赖感知——同毫秒时只对批次内真实存在的 FK 父子边重排,无 FK 关系的记录
-      // 保持 IDB getAll 入队原序。先扫一遍 due 建批内 parent-id 索引(O(n)):哪些 project id / canvas id
-      // 在本批 due 内有 pending create。canvas 写当其 projectId 的 createProject 在批内 → 后置;
-      // chat 写当其 canvasId 的 createCanvas 在批内 → 后置;project→canvas→chat 因 parent 均在批内
-      // 传递成 0/1/2 序。无 parent 在批内 → rank 0,与无关记录同层保持原序(见 dependencyRank 注释)。
-      const pendingProjectCreateIds = new Set<string>()
-      const pendingCanvasCreateIds = new Set<string>()
-      for (const r of due) {
-        if (r.op.kind === 'createProject' && r.op.id !== undefined) {
-          pendingProjectCreateIds.add(r.op.id)
-        } else if (r.op.kind === 'createCanvas') {
-          pendingCanvasCreateIds.add(r.op.canvasId)
-        }
-      }
+      // R7-1:稳定拓扑排序(替换 R6-1 的标量 dependencyRank)。只沿真实 FK 边约束顺序,其余一律保持
+      // 原序——防混合批中无关记录跨过有 FK 边的记录(见 stableTopologicalSort 注释)。
+      const sortedDue = stableTopologicalSort(due)
 
-      // 主键 nextAttemptAt(退避到期先发)+ 次键 createdAt(同 nextAttemptAt 时先入队先发)
-      // + tie-breaker dependencyRank:同毫秒时按依赖感知 rank 排序——仅在批内存在真实 FK parent 时
-      // 才后置子资源 op,防 404 terminal 丢失(R4 project→canvas / R5-1 canvas→chat);无 FK 对保持原序。
-      // (stable sort:rank 相同时保留 due 的 IDB 入队序,不误改无关同毫秒写的顺序。)
-      due.sort(
-        (a, b) =>
-          a.nextAttemptAt - b.nextAttemptAt ||
-          a.createdAt - b.createdAt ||
-          dependencyRank(a.op, pendingProjectCreateIds, pendingCanvasCreateIds) -
-            dependencyRank(b.op, pendingProjectCreateIds, pendingCanvasCreateIds),
-      )
-
-      for (const rec of due) {
+      for (const rec of sortedDue) {
         if (paused) break // a prior op in this cycle got 401 → stop
         rec.status = 'in-flight'
         rec.lastAttemptAt = ts

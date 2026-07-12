@@ -1310,3 +1310,177 @@ describe('G1-a R5 F1 — 同毫秒 createCanvas/appendChatMessage 的 drain 依�
     expect(await q.pendingCount()).toBe(0)
   })
 })
+
+// ── G1-a R7-1:稳定拓扑排序——只沿真实 FK 边约束顺序,其余一律保持原序 ──
+//
+// 复现 R7-1 P2 阻断项:R6-1 的条件 dependencyRank 虽只在批内存在 FK parent 时给 child 升 rank,但仍用
+// 单一标量 rank 对整批分层排序。混合批中一旦 chat 因批内 canvas 升到 rank 2,所有 rank 0 的无关记录
+// (如 unrelated createProject)都会跨过 chat——即使前两条真实 FK 边已天然有序、第三条与两者无 FK,
+// 正确的 surgical 序应完全不变。返修声明"只重排实际 FK 边"不成立。
+//
+// 修法(lead 指定):稳定拓扑排序——以原 IDB 序(主键 nextAttemptAt/createdAt/入队序)为优先级,Kahn 算法
+// 就绪集(入度 0)每次取原序最靠前者。只建批内真实 FK 边:
+//  - createProject(id) → createCanvas/updateCanvas(projectId=id)(批内)
+//  - createCanvas(id) → appendChatMessage/updateChatMessage/deleteChatMessage(canvasId=id)(批内)
+//  传递成链。无边记录入度 0 → 完全保持原序;有边记录只在 parent 必须先 drain 时后置。
+//
+// 红→绿:10143c2 的条件 rank 对混合批守卫红(canvas→unrelated project→chat)、对双链守卫红(精确序不同);
+// 拓扑排序两者皆绿。
+describe('G1-a R7-1 — 稳定拓扑排序(Kahn + 原序 tie-break,只沿真实 FK 边)', () => {
+  // 复用 R5 的 fkChatExecutor(建模三层 FK 链 + preseed 选项;此处块内重定义,与 R5 隔离)。
+  const fkChatExecutor = (opts: { preseedProjects?: string[]; preseedCanvases?: string[] } = {}) => {
+    const calls: { op: WriteOp; key: string }[] = []
+    const createdProjects = new Set<string>(opts.preseedProjects ?? [])
+    const createdCanvases = new Set<string>(opts.preseedCanvases ?? [])
+    const fn = vi.fn(async (op: WriteOp, key: string): Promise<WriteOutcome> => {
+      calls.push({ op, key })
+      if (op.kind === 'createProject') {
+        createdProjects.add(op.id ?? '')
+        return { status: 'success', revision: 0 }
+      }
+      if (op.kind === 'createCanvas') {
+        if (createdProjects.has(op.projectId)) {
+          createdCanvases.add(op.canvasId)
+          return { status: 'success', revision: 0 }
+        }
+        return { status: 'rejected', body: { error: 'unknown-project' } }
+      }
+      if (op.kind === 'appendChatMessage') {
+        if (createdCanvases.has(op.canvasId)) return { status: 'success' }
+        return { status: 'rejected', body: { error: 'unknown-canvas' } }
+      }
+      return { status: 'success' }
+    })
+    return { fn, calls, createdProjects, createdCanvases }
+  }
+
+  it('混合批守卫:canvas→chat 真实边已天然有序 + 无关 project 在后 → 保持 canvas→chat→unrelated project 3/0', async () => {
+    // R7-1 反例:project p-mixed 已 preseed(canvas 的 project 在先前 drain 建好);同毫秒 IDB 原序严格为
+    // createCanvas(aa,c-mixed) → appendChatMessage(bb,c-mixed) → unrelated createProject(zz,p-unrelated-mixed)。
+    // 前两条真实 FK 边(canvas→chat)已天然有序,第三条与两者无 FK。正确 surgical 稳定序应完全不变。
+    // 10143c2 条件 rank:chat 升 rank 2 → 无关 project(rank 0)跨过 chat → canvas→project→chat(RED);
+    // 拓扑排序:canvas→chat 边存在但原序已 canvas 在 chat 前不改变其相对位置;无关 project 无边不跨过 →
+    // canvas→chat→project(GREEN)。精确断言禁 .sort() 抹序。
+    const { fn, calls } = fkChatExecutor({ preseedProjects: ['p-mixed'] })
+    const q = makeQueue(fn)
+    const canvas: QueuedWrite = {
+      id: 'aa-canvas-mixed',
+      idempotencyKey: 'mivo-canvas-mixed',
+      userId: 'userA',
+      op: { kind: 'createCanvas', canvasId: 'c-mixed', projectId: 'p-mixed', title: 'Mixed Canvas' },
+      resourceKey: 'canvas:c-mixed',
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    }
+    const chat: QueuedWrite = {
+      id: 'mm-chat-mixed',
+      idempotencyKey: 'mivo-chat-mixed',
+      userId: 'userA',
+      op: { kind: 'appendChatMessage', canvasId: 'c-mixed', message: { id: 'm1', role: 'user', text: 'hi' } },
+      resourceKey: null,
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    }
+    const unrelatedProject: QueuedWrite = {
+      id: 'zz-project-mixed',
+      idempotencyKey: 'mivo-proj-mixed',
+      userId: 'userA',
+      op: { kind: 'createProject', name: 'Unrelated Project', id: 'p-unrelated-mixed' },
+      resourceKey: 'project:p-unrelated-mixed',
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    }
+    await __seedWritesForTest([canvas, chat, unrelatedProject])
+    // 确认 setup:IDB getAll 按 key(id)序返回 canvas→chat→project(aa < mm < zz)。
+    const dumped = await __dumpWritesForTest()
+    expect(dumped.map((r) => r.id)).toEqual(['aa-canvas-mixed', 'mm-chat-mixed', 'zz-project-mixed'])
+
+    const r = await q.drain()
+    // R7-1 修复断言:无关 project 不跨过 chat,保持原序 canvas→chat→unrelated project。
+    // 10143c2 此处为 canvas→unrelated project→chat(RED:calls[1] 是 createProject 而非 appendChatMessage)。
+    expect(calls).toHaveLength(3)
+    expect(calls[0]!.op.kind).toBe('createCanvas')
+    expect(calls[1]!.op.kind).toBe('appendChatMessage')
+    expect(calls[2]!.op.kind).toBe('createProject')
+    expect(r).toEqual({ processed: 3, successes: 3, failures: 0, terminals: 0, paused: false })
+    expect(await q.pendingCount()).toBe(0)
+  })
+
+  it('双链交错守卫:c-a→p-a、c-b→p-b 交叉 → 拓扑 tie-break 给 p-a→c-a→p-b→c-b 4/0(不是 rank 分层序)', async () => {
+    // 双链交错:同毫秒 IDB 原序 c-a, c-b, p-a, p-b(canvas 在前 project 在后),c-a→p-a、c-b→p-b 顺序映射。
+    // 10143c2 条件 rank:两 canvas 均 rank 1、两 project 均 rank 0 → rank 内保持原序 → p-a→p-b→c-a→c-b
+    //   (RED:精确序与拓扑 tie-break 不同;两者都合法拓扑,但 rank 分层把所有 project 前置、所有 canvas 后置)。
+    // 拓扑排序:就绪集{p-a,p-b}取原序最小 p-a(idx2) → c-a 就绪(idx0<3)取 c-a → p-b → c-b →
+    //   p-a→c-a→p-b→c-b(GREEN)。断言精确序锁定"就绪即取原序最小"的 tie-break 语义,防退回 rank 分层。
+    const { fn, calls } = fkChatExecutor()
+    const q = makeQueue(fn)
+    const canvasA: QueuedWrite = {
+      id: 'aa-canvas-a',
+      idempotencyKey: 'mivo-canvas-a',
+      userId: 'userA',
+      op: { kind: 'createCanvas', canvasId: 'c-a', projectId: 'p-a', title: 'Canvas A' },
+      resourceKey: 'canvas:c-a',
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    }
+    const canvasB: QueuedWrite = {
+      id: 'bb-canvas-b',
+      idempotencyKey: 'mivo-canvas-b',
+      userId: 'userA',
+      op: { kind: 'createCanvas', canvasId: 'c-b', projectId: 'p-b', title: 'Canvas B' },
+      resourceKey: 'canvas:c-b',
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    }
+    const projectA: QueuedWrite = {
+      id: 'cc-project-a',
+      idempotencyKey: 'mivo-proj-a',
+      userId: 'userA',
+      op: { kind: 'createProject', name: 'Project A', id: 'p-a' },
+      resourceKey: 'project:p-a',
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    }
+    const projectB: QueuedWrite = {
+      id: 'dd-project-b',
+      idempotencyKey: 'mivo-proj-b',
+      userId: 'userA',
+      op: { kind: 'createProject', name: 'Project B', id: 'p-b' },
+      resourceKey: 'project:p-b',
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    }
+    await __seedWritesForTest([canvasA, canvasB, projectA, projectB])
+    const dumped = await __dumpWritesForTest()
+    expect(dumped.map((r) => r.id)).toEqual(['aa-canvas-a', 'bb-canvas-b', 'cc-project-a', 'dd-project-b'])
+
+    const r = await q.drain()
+    // 拓扑 tie-break 断言:每个 project 先于其 canvas,且原序 tie-break 给 p-a→c-a→p-b→c-b。
+    // 10143c2 条件 rank 给 p-a→p-b→c-a→c-b(RED:calls[1] 是 createProject 而非 createCanvas)。
+    expect(calls).toHaveLength(4)
+    expect(calls[0]!.op.kind).toBe('createProject')
+    expect((calls[0]!.op as { id?: string }).id).toBe('p-a')
+    expect(calls[1]!.op.kind).toBe('createCanvas')
+    expect((calls[1]!.op as { canvasId: string }).canvasId).toBe('c-a')
+    expect(calls[2]!.op.kind).toBe('createProject')
+    expect((calls[2]!.op as { id?: string }).id).toBe('p-b')
+    expect(calls[3]!.op.kind).toBe('createCanvas')
+    expect((calls[3]!.op as { canvasId: string }).canvasId).toBe('c-b')
+    expect(r).toEqual({ processed: 4, successes: 4, failures: 0, terminals: 0, paused: false })
+    expect(await q.pendingCount()).toBe(0)
+  })
+})
