@@ -186,6 +186,17 @@ ALTER TABLE share_link_compensations ADD CONSTRAINT share_link_compensations_sta
   CHECK (status IN ('pending', 'done', 'superseded'));
 `
 
+// R3-F4 migration 007:claim fencing token。lease 过期后第二 worker 可重新 claim,若 done UPDATE 无 ownership
+// 校验,两者都会 completed + attemptCount 失真。claim_token(random UUID)随 claim 写入;side effect 前预校验
+// 仍为当前 owner;done UPDATE WHERE claim_token=ours → 仅当前 owner 能 mark done,loser 返 stale-claim。
+// 005 字节不变,新加 007;字典序 007 > 006 > 005,与 DP-6R 003/004 无冲突。
+const COMPENSATIONS_CLAIM_TOKEN = sql`
+ALTER TABLE share_link_compensations ADD COLUMN IF NOT EXISTS claim_token TEXT;
+`
+const DROP_COMPENSATIONS_CLAIM_TOKEN = sql`
+ALTER TABLE share_link_compensations DROP COLUMN IF EXISTS claim_token;
+`
+
 /** migrations 以 ISO 日期前缀排序;migrator 按 key 字典序应用。 */
 export const migrations: Record<string, Migration> = {
   '2026_07_11_001_initial_persist_schema': {
@@ -218,6 +229,14 @@ export const migrations: Record<string, Migration> = {
     },
     async down(db): Promise<void> {
       await DROP_COMPENSATIONS_FAILED_STATUS.execute(db)
+    },
+  },
+  '2026_07_12_007_compensation_claim_token': {
+    async up(db): Promise<void> {
+      await COMPENSATIONS_CLAIM_TOKEN.execute(db)
+    },
+    async down(db): Promise<void> {
+      await DROP_COMPENSATIONS_CLAIM_TOKEN.execute(db)
     },
   },
 }

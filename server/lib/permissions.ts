@@ -93,6 +93,9 @@ export type CompensationIntent = {
   lastAttemptedAt: string | null
   claimedAt: string | null
   claimedUntil: string | null
+  /** R3-F4: claim fencing token(random UUID,随 claim 写入;done/failed 清空)。lease 过期后另一 worker 可重新
+   * claim,done UPDATE WHERE claim_token=ours → 仅当前 owner 能 mark done,loser 返 stale-claim(attemptCount 不失真)。 */
+  claimToken: string | null
   createdAt: string
   updatedAt: string
 }
@@ -102,8 +105,9 @@ export type CompensationOutcome =
   | { kind: 'nothing-pending'; op: CompensationOp }
   | { kind: 'completed'; op: CompensationOp; count: number; attempts: number; intentId: string }
   | { kind: 'failed'; op: CompensationOp; error: string; attempts: number; intentId: string }
-  | { kind: 'already-claimed'; op: CompensationOp; intentId: string } // P2-1:并发 attempt 输家
+  | { kind: 'already-claimed'; op: CompensationOp; intentId: string } // P2-1:并发 attempt 输家(lease 未过期)
   | { kind: 'superseded'; op: CompensationOp; intentId?: string } // R3-F1:晚到 stale op（被更新代际/is_deleted 否决）→ 不重建、不执行副作用
+  | { kind: 'stale-claim'; op: CompensationOp; intentId: string } // R3-F4:claim 在执行中被新 worker 抢走(lease 过期)→ 不 mark done、不报 completed
 
 /** FX-7 §5.9 un-revoke 30 天保留窗(超期不可恢复,purge 由 FX-7 定时落地)。 */
 export const UNREVOKE_WINDOW_MS = 30 * 24 * 60 * 60 * 1000
@@ -497,6 +501,7 @@ export class InMemoryPermissionBackend implements PermissionBackend {
       lastError: `superseded by ${op} generation`,
       claimedAt: null,
       claimedUntil: null,
+      claimToken: null,
       updatedAt: now,
     })
   }
@@ -515,6 +520,7 @@ export class InMemoryPermissionBackend implements PermissionBackend {
       lastAttemptedAt: null,
       claimedAt: null,
       claimedUntil: null,
+      claimToken: null,
       createdAt: now,
       updatedAt: now,
     }
@@ -580,8 +586,10 @@ export class InMemoryPermissionBackend implements PermissionBackend {
     if (intent.claimedUntil && Date.parse(intent.claimedUntil) > Date.now()) {
       return { kind: 'already-claimed', op, intentId: intent.id }
     }
+    // R3-F4: claim fencing token(单线程 JS 无 lease 过期竞态,token 仅类型对称 + done 校验占位;真竞态 fencing 在 PG)。
+    const claimToken = randomUUID()
     const leaseUntil = new Date(Date.now() + COMPENSATION_CLAIM_LEASE_MS).toISOString()
-    const claimed: CompensationIntent = { ...intent, claimedAt: now, claimedUntil: leaseUntil, updatedAt: now }
+    const claimed: CompensationIntent = { ...intent, claimedAt: now, claimedUntil: leaseUntil, claimToken, updatedAt: now }
     this.compensations.set(intent.id, claimed)
     const attempts = claimed.attemptCount + 1
     // Test-only 故障注入:在 attempt 内消费,不污染 unRevokeAllForProject / revokeAllForProject 本身。
@@ -596,7 +604,7 @@ export class InMemoryPermissionBackend implements PermissionBackend {
         : await this.revokeAllForProject(projectId)
       const done: CompensationIntent = {
         ...claimed, status: 'done', attemptCount: attempts,
-        lastError: null, lastAttemptedAt: now, claimedAt: null, claimedUntil: null, updatedAt: now,
+        lastError: null, lastAttemptedAt: now, claimedAt: null, claimedUntil: null, claimToken: null, updatedAt: now,
       }
       this.compensations.set(intent.id, done)
       return { kind: 'completed', op, count: r.count, attempts: done.attemptCount, intentId: intent.id }
@@ -604,7 +612,7 @@ export class InMemoryPermissionBackend implements PermissionBackend {
       const msg = err instanceof Error ? err.message : String(err)
       const failed: CompensationIntent = {
         ...claimed, attemptCount: attempts,
-        lastError: msg, lastAttemptedAt: now, claimedAt: null, claimedUntil: null, updatedAt: now,
+        lastError: msg, lastAttemptedAt: now, claimedAt: null, claimedUntil: null, claimToken: null, updatedAt: now,
       }
       this.compensations.set(intent.id, failed)
       return { kind: 'failed', op, error: msg, attempts: failed.attemptCount, intentId: intent.id }

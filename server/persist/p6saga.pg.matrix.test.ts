@@ -176,4 +176,53 @@ const mChatOrder004 = {
       expect(again.generation).toBe(2) // 代际递增
     })
   })
+
+  describe('R3-F4 claim fencing(PgPermissionBackend)', () => {
+    let backend: PgPermissionBackend
+    beforeAll(async () => {
+      const admin = makeKysely()
+      await resetSchema(admin)
+      await admin.destroy()
+      backend = new PgPermissionBackend(cfg)
+      await backend.ready
+    })
+    afterAll(async () => { if (backend) await backend.destroy() })
+
+    it('赢家超过 lease → 第二 worker 重 claim+done;旧 worker pre-check/done 失败 → stale-claim(至多一个 completed,attemptCount 一致)', async () => {
+      await backend.__reset()
+      await backend.__seedProjectForTest('p-fence', 'ownerA')
+      await backend.__setProjectDeletedForTest('p-fence', false) // restore desired
+      const link = await backend.createShareLink('p-fence', 'view', 'ownerA')
+      await backend.revokeAllForProject('p-fence') // cascade marker,link revoked
+      await backend.recordCompensation('p-fence', 'restore') // gen1 pending
+      // A: claim(token_A)→ 暂停在 side effect 前(await pausePromise,模拟赢家超过 15s lease 暂停)
+      let resolvePause!: () => void
+      const pausePromise = new Promise<void>((r) => { resolvePause = r })
+      backend.__setClaimPauseForTest('restore', () => pausePromise)
+      const aPromise = backend.attemptCompensation('p-fence', 'restore')
+      // 等 A 完成 claim(claim_token 落库)再继续——claim 是 DB 异步,需轮询到 token 非空
+      for (let i = 0; i < 200; i++) {
+        const r = await backend.listCompensations('p-fence')
+        if (r.find((x) => x.op === 'restore')?.claimToken) break
+        await new Promise((rr) => setTimeout(rr, 5))
+      }
+      // 清 pause(防 B 也暂停)+ 过期 A 的 lease(模拟 >15s,允许 B 重新 claim)
+      backend.__clearClaimPauseForTest('restore')
+      await backend.__expireClaimLeaseForTest('p-fence', 'restore')
+      // B: claim(token_B,A lease 过期)→ pre-check 过 → side effect + done WHERE token_B → completed
+      const b = await backend.attemptCompensation('p-fence', 'restore')
+      expect(b.kind).toBe('completed')
+      expect((await backend.resolveShareLink(link.token, 'p-fence'))?.kind).toBe('active') // B 收敛
+      // 释放 A 的 pause;A 恢复 → pre-check(token_A 不再当前/status 已 done)→ stale-claim(不执行副作用、不 mark done)
+      resolvePause()
+      const a = await aPromise
+      expect(a.kind).toBe('stale-claim')
+      // 至多一个 completed(B);attemptCount 与真实有效 claim 一致(=1,B bump;A 不 bump)
+      const ints = await backend.listCompensations('p-fence')
+      const restore = ints.find((i) => i.op === 'restore')!
+      expect(restore.attemptCount).toBe(1)
+      expect(restore.status).toBe('done')
+      expect(restore.claimToken).toBeNull() // done 清 token
+    })
+  })
 })

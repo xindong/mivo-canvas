@@ -75,6 +75,8 @@ interface ShareLinkCompensationsTable {
   last_attempted_at: Date | null
   claimed_at: Date | null
   claimed_until: Date | null
+  // R3-F4: claim fencing token(007 migration 加列)。claim 写入;done/failed/supersede 清空。
+  claim_token: string | null
   created_at: Generated<Date>
   updated_at: Generated<Date>
 }
@@ -123,6 +125,7 @@ const rowToCompensation = (row: Selectable<ShareLinkCompensationsTable>): Compen
   lastAttemptedAt: row.last_attempted_at instanceof Date ? row.last_attempted_at.toISOString() : (row.last_attempted_at ? String(row.last_attempted_at) : null),
   claimedAt: row.claimed_at instanceof Date ? row.claimed_at.toISOString() : (row.claimed_at ? String(row.claimed_at) : null),
   claimedUntil: row.claimed_until instanceof Date ? row.claimed_until.toISOString() : (row.claimed_until ? String(row.claimed_until) : null),
+  claimToken: row.claim_token ?? null,
   createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at),
   updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : String(row.updated_at),
 })
@@ -164,6 +167,8 @@ export class PgPermissionBackend implements PermissionBackend {
   readonly ready: Promise<void>
   /** P-6 Test-only 故障注入:op → 剩余强制失败次数(attemptCompensation 内消费,不污染 unRevoke/revoke 本身)。 */
   private readonly compensationFault: Partial<Record<CompensationOp, number>> = {}
+  /** R3-F4 Test-only:op → claim 后 side effect 前的 await 暂停点(模拟赢家超过 lease 暂停,供 race 验收)。 */
+  private readonly compensationClaimPauseForTest: Partial<Record<CompensationOp, () => Promise<void>>> = {}
 
   constructor(conn: PgConnectionConfig) {
     this.db = new Kysely<PermissionDatabase>({
@@ -427,7 +432,7 @@ export class PgPermissionBackend implements PermissionBackend {
       // P1-2 supersede:把 pending 对立 op mark superseded(保留行做历史;不再被 sweep/attempt 处理)。
       const opposite: CompensationOp = op === 'restore' ? 'delete' : 'restore'
       await trx.updateTable('share_link_compensations')
-        .set({ status: 'superseded', last_error: `superseded by ${op} generation`, claimed_at: null, claimed_until: null, updated_at: new Date() })
+        .set({ status: 'superseded', last_error: `superseded by ${op} generation`, claimed_at: null, claimed_until: null, claim_token: null, updated_at: new Date() })
         .where('project_id', '=', projectId)
         .where('op', '=', opposite)
         .where('status', '=', 'pending')
@@ -452,6 +457,7 @@ export class PgPermissionBackend implements PermissionBackend {
           last_attempted_at: null,
           claimed_at: null,
           claimed_until: null,
+          claim_token: null,
         })
         .returningAll()
         .executeTakeFirst()
@@ -540,11 +546,15 @@ export class PgPermissionBackend implements PermissionBackend {
     const need = await this.compensationNeedPg(projectId, op)
     if (!intent && !need) return { kind: 'nothing-pending', op }
     if (!intent) intent = await this.recordCompensation(projectId, op)
-    // 2. P2-1 atomic claim:UPDATE WHERE status='pending' AND lease-free RETURNING;0 行 → already-claimed。
-    //   UPDATE 行锁天然串行化并发 claim:赢家 set lease 返行;输家等锁后重检 WHERE(lease 已占)→ 0 行。
+    // 2. P2-1 atomic claim + R3-F4 fencing token:UPDATE WHERE status='pending' AND lease-free
+    //   SET claim_token=randomUUID(), claimed_until RETURNING;0 行 → already-claimed。
+    //   UPDATE 行锁串行化并发 claim:赢家 set token+lease 返行;输家等锁后重检 WHERE(lease 已占)→ 0 行。
+    //   token 用于 side-effect 前预校验 + done/failed UPDATE 的 ownership 校验:lease 过期被新 worker 抢走后,
+    //   旧 owner 的 pre-check 失败/done UPDATE 0 行 → stale-claim(不执行副作用、不 mark done、不 bump attemptCount)。
+    const claimToken = randomUUID()
     const leaseUntil = new Date(Date.now() + COMPENSATION_CLAIM_LEASE_MS)
     const claimed = await this.db.updateTable('share_link_compensations')
-      .set({ claimed_at: new Date(), claimed_until: leaseUntil, updated_at: new Date() })
+      .set({ claim_token: claimToken, claimed_at: new Date(), claimed_until: leaseUntil, updated_at: new Date() })
       .where('id', '=', intent.id)
       .where('status', '=', 'pending')
       .where((eb) => eb.or([eb('claimed_until', 'is', null), eb('claimed_until', '<', new Date())]))
@@ -553,6 +563,9 @@ export class PgPermissionBackend implements PermissionBackend {
     if (!claimed) return { kind: 'already-claimed', op, intentId: intent.id }
     const cl = rowToCompensation(claimed)
     const attempts = cl.attemptCount + 1
+    // Test-only pause(F4 race 验收):claim 后、side effect 前注入 await,模拟赢家超过 lease 暂停。
+    const pauseFn = this.compensationClaimPauseForTest[op]
+    if (pauseFn) await pauseFn()
     // Test-only 故障注入:decrement 后 throw(语义等价"第二步抛错");不污染 unRevoke/revoke 本身。
     const fault = this.compensationFault[op] ?? 0
     try {
@@ -560,23 +573,40 @@ export class PgPermissionBackend implements PermissionBackend {
         this.compensationFault[op] = fault - 1
         throw new Error(`[compensation-fault] ${op} step forced failure (was ${fault})`)
       }
+      // R3-F4 pre-check:side effect 前校验仍为当前 claim owner(lease 未被新 worker 抢)。防 lease 过期后
+      //   仍执行副作用(双执行);revoke/unRevoke 虽幂等,但 attemptCount/双 completed 失真需挡。
+      const stillOurs = await this.db.selectFrom('share_link_compensations').select('id')
+        .where('id', '=', intent.id)
+        .where('claim_token', '=', claimToken)
+        .where('status', '=', 'pending')
+        .executeTakeFirst()
+      if (!stillOurs) {
+        // lease 过期被新 worker 抢走(token 已变)→ 不执行副作用、不 mark done、不报 completed
+        return { kind: 'stale-claim', op, intentId: intent.id }
+      }
       const r = op === 'restore'
         ? await this.unRevokeAllForProject(projectId)
         : await this.revokeAllForProject(projectId)
-      // mark done(WHERE status='pending' 防并发覆盖;0 行=并发已 done,幂等)。清 lease。
-      await this.db.updateTable('share_link_compensations')
-        .set({ status: 'done', attempt_count: attempts, last_error: null, last_attempted_at: new Date(), claimed_at: null, claimed_until: null, updated_at: new Date() })
+      // R3-F4 mark done WHERE claim_token=ours:仅当前 owner 能 mark done。0 行 → 执行中被新 worker 抢
+      //   (lease 过期重 claim)→ stale-claim(不报 completed、不 bump attemptCount;副作用幂等无残留)。
+      const doneRow = await this.db.updateTable('share_link_compensations')
+        .set({ status: 'done', attempt_count: attempts, last_error: null, last_attempted_at: new Date(), claimed_at: null, claimed_until: null, claim_token: null, updated_at: new Date() })
         .where('id', '=', intent.id)
         .where('status', '=', 'pending')
-        .execute()
+        .where('claim_token', '=', claimToken)
+        .returning('id')
+        .executeTakeFirst()
+      if (!doneRow) return { kind: 'stale-claim', op, intentId: intent.id }
       return { kind: 'completed', op, count: r.count, attempts, intentId: intent.id }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      // 失败:保持 pending,bump 可观察字段,清 lease(允许重试/sweep 再 claim)。
+      // 失败:保持 pending,bump 可观察字段,清 lease+token。WHERE claim_token=ours 防止 clobber 新 owner
+      //   (若执行中 lease 过期被抢,本 UPDATE 0 行 → 不影响新 owner;本 worker 仍报 failed,attemptCount 不 bump)。
       await this.db.updateTable('share_link_compensations')
-        .set({ attempt_count: attempts, last_error: msg, last_attempted_at: new Date(), claimed_at: null, claimed_until: null, updated_at: new Date() })
+        .set({ attempt_count: attempts, last_error: msg, last_attempted_at: new Date(), claimed_at: null, claimed_until: null, claim_token: null, updated_at: new Date() })
         .where('id', '=', intent.id)
         .where('status', '=', 'pending')
+        .where('claim_token', '=', claimToken)
         .execute()
       return { kind: 'failed', op, error: msg, attempts, intentId: intent.id }
     }
@@ -695,6 +725,8 @@ export class PgPermissionBackend implements PermissionBackend {
     // 故障注入计数也清(防跨用例泄漏)。
     delete this.compensationFault.restore
     delete this.compensationFault.delete
+    delete this.compensationClaimPauseForTest.restore
+    delete this.compensationClaimPauseForTest.delete
   }
 
   /** Test-only:把某 link 的 revoked_at 设为指定 ISO(测 30 天 un-revoke 窗;FX-7 §5.9;与内存实现对偶)。 */
@@ -734,5 +766,23 @@ export class PgPermissionBackend implements PermissionBackend {
   /** Test-only:清除 op 补偿故障注入。 */
   __clearCompensationFaultForTest(op: CompensationOp): void {
     delete this.compensationFault[op]
+  }
+  /**
+   * R3-F4 Test-only:注入 op 在 claim 后、side effect 前的 await 暂停点。模拟赢家超过 lease 暂停(供 race 验收:
+   * A 暂停期间手动过期 A 的 lease,B 重新 claim 并 done;A 恢复后 pre-check/done WHERE token 失败 → stale-claim)。
+   */
+  __setClaimPauseForTest(op: CompensationOp, pauseFn: () => Promise<void>): void {
+    this.compensationClaimPauseForTest[op] = pauseFn
+  }
+  /** Test-only:清除 claim 暂停点。 */
+  __clearClaimPauseForTest(op: CompensationOp): void {
+    delete this.compensationClaimPauseForTest[op]
+  }
+  /** R3-F4 Test-only:手动过期 (projectId,op) pending 意图的 lease(claimed_until 置过去),模拟赢家超过 lease。 */
+  async __expireClaimLeaseForTest(projectId: string, op: CompensationOp): Promise<void> {
+    await this.db.updateTable('share_link_compensations')
+      .set({ claimed_until: new Date(Date.now() - 1000) })
+      .where('project_id', '=', projectId).where('op', '=', op).where('status', '=', 'pending')
+      .execute()
   }
 }
