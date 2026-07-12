@@ -59,13 +59,13 @@ user 域现有承载：platform §13.1 user 域 = 「跨设备同步、按人隔
 ### 1.4 与 chat collection（DP-6）的关系
 
 DP-6（plan §3、record-schema §5）：**chat 随文档域走 `/api/canvas` 子资源（messagesByScene 键随 canvas 生命周期），独立集合存储，级联语义见 FX-7**。落地形态（已实证）：
-- 服务端：`server/routes/canvas.ts:510-513`（GET .../chat per-canvas messages collection）+ `:537`（POST append）+ `:100` collectionLive 校验；chat-collection record + chat-message record 走 PersistBackend（`server/routes/canvas.ts:348` validType 含 'chat-message'）。
+- 服务端：`server/routes/canvas.ts:510-513`（GET .../chat 返 per-actor messages collection，DP-6R：actor 私有、不随画布分享、成员互不可见）+ `:537`（POST append）+ `:100` collectionLive 校验；chat-collection record（per-canvas liveness under canvas owner，仅级联 FX-7）+ chat-message record（per-actor 私有，ownerId=actor）走 PersistBackend（`server/routes/canvas.ts:348` validType 含 'chat-message'）。
 - 客户端：`src/store/chatStore.ts:86` messagesByScene 键 = sceneId = canvasId。
 
 **记忆层与 chat 的关系**：
 1. chat 是记忆的**原料**（提示词 + 生成结果 + 负反馈 rerun 信号 D1）。记忆层读 chat collection 派生记忆，**单向只读**，不回写 chat。
 2. chat 在 **document 域**（~~per-canvas 共享，随画布分享对成员可见~~ → **DP-6R：per-actor 私有**（ownerId=actor），不随画布分享、成员互不可见；chat-collection 仅 per-canvas liveness under canvas owner；platform §13.5 已订正）；记忆在 **user 域**（per-user 独享，D4 owner-独享）。**两者不同域**——chat 是 per-actor 对话流，记忆是个人派生缓存。
-3. **不混淆**：chat 消息本身不是记忆；记忆是对 chat + document 的派生摘要。unknowns-map D5 已倾向「mivo 简报为唯一权威、桥接注入 maker 会话，maker 侧只作工作缓存不回流」——同理，记忆是 mivo 侧派生的个人缓存，不污染共享 chat。
+3. **不混淆**：chat 消息本身不是记忆；记忆是对 chat + document 的派生摘要。unknowns-map D5 已倾向「mivo 简报为唯一权威、桥接注入 maker 会话，maker 侧只作工作缓存不回流」——同理，记忆是 mivo 侧派生的个人缓存，不污染 per-actor 私有 chat（各 actor 独立、非共享）。
 
 ---
 

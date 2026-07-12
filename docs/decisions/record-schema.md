@@ -33,7 +33,7 @@
 
 | scope | 内容 | 同步策略 | CRDT? |
 |---|---|---|---|
-| **document** | nodes/edges/anchors/画布与项目结构;chat 消息(per-canvas collection) | 服务端真相 + **节点级合并**(每 record 带 revision,同节点才冲突) | ✅ 字段级改造与此同向 |
+| **document** | nodes/edges/anchors/画布与项目结构;chat 消息(per-actor×canvas 私有 collection) | 服务端真相 + **节点级合并**(每 record 带 revision,同节点才冲突) | ✅ 字段级改造与此同向 |
 | **user**(session) | 相机 per 画布、最近打开、工具偏好、面板开合、**选择态**(DP-1)、聊天草稿 | 跨设备同步、按人隔离:简单 KV + LWW | ❌ 不进 CRDT |
 | **asset** | 图片内容(内容寻址) | 服务端化(T1.5) | ❌ |
 | **编排/session** | 运行时:正在跑的 tasks、generation 进度、focus/编辑态 | 不过网(服务端只接 records + assetId + user-state KV) | ❌ |
@@ -252,7 +252,7 @@ CanvasTask(mivoCanvas.ts:397-413:id/label/status/progress/stage?/nodeIds/preset?
 plan §3 DP-6:**chat 随文档域走 `/api/canvas` 子资源(messagesByScene 键随 canvas 生命周期),独立集合存储(D6),级联语义见 FX-7**。
 
 - scope:**document 域,per-actor 私有 collection**(platform §13.1 明列 chat 消息在 document 域;§13.2 chatStore 消息 → document 域独立 collection 走同一 PersistAdapter)。**DP-6R(2026-07-12)**:chat-message envelope.ownerId=**actor**(写入者本人,per-actor 私有),PK=(actor,'chat-message',msgId)——两 actor 可在同 canvas 拥同 msgId;~~per-canvas 独立 collection(随画布分享)~~ 已订正为不随画布分享、成员互不可见。chat-collection 仍 per-canvas under canvas owner(仅 liveness,随 canvas 生命周期级联 FX-7),不含 per-actor 状态。chat 写入/reorder 不 bump 共享 canvas contentVersion;reorder 走 per-actor×canvas 独立 orderRevision(api-surface §4.2.3)。
-- 键:`messagesByScene: Record<string, ChatMessage[]>`(chatStore.ts:86),键 = sceneId(= canvasId)。迁移:每 canvas 一条 messages collection,随 canvas 生命周期级联(FX-7 软删语义)。
+- 键:`messagesByScene: Record<string, ChatMessage[]>`(chatStore.ts:86),键 = sceneId(= canvasId)。迁移:每 actor×canvas 一条 messages collection(actor 隔离,同 canvas 各 actor 各自独立、互不可见;chat-collection record 随 canvas 生命周期级联 FX-7 软删语义,不含 per-actor 状态)。
 - ChatMessage(chatStore.ts:65-83)17 字段:id/role/kind?/text/createdAt/status/enhance?/resultNodeIds?/origin?/error?/errorKind?/timeoutRetryKey?/timeoutRetryCount?/selectedNodeId?/selectedNodeType?/generationContext?/retryDisabledReason?/maskEdit?(runtime 不持久化,但 serverTaskId/sourceDeleted 持久化)。
 - **不在本文件展开到字段级 CRDT 映射**——chat 是独立 collection,字段级 schema 随 T1.3(4 API + PersistAdapter)定稿;本处只钉归属(document 域)+ 键语义(messagesByScene/canvasId)+ 级联随 FX-7。
 - 表征对照:chatHydration #167(chatStore.ts hydrate/settleExpiredChatMessages 回落 + messagesByScene 键语义,baseline 114 expect/30 it/6 describe)——DP-6 落地时该表征断言不许改。
@@ -276,7 +276,7 @@ plan §3 DP-6:**chat 随文档域走 `/api/canvas` 子资源(messagesByScene 键
 |---|---|---|---|
 | #163 | src/store/authSlice.characterization.test.ts | SSO 网关身份链路(authSlice+authClient)钉现状 | **无直接影响**(auth 不在 document record 范围);身份模型对齐见 DP-4/T1.4 |
 | #164 | src/store/projectsSlice.characterization.test.ts | 项目/画布 CRUD 现状语义 | **selection 迁 session(§4.1)、tasks 迁服务端(§4.3)、nodes/edges 扁平 record**——画布 CRUD 返 id + selection 来源变;断言语义不改,数据来源改 |
-| #167 | src/store/chatHydration.characterization.test.ts | 114 expect/30 it/6 describe | **DP-6 chat per-canvas collection(§5)**——messagesByScene 键语义、settleExpiredChatMessages 回落;hydrate 来源从 IDB → /api/canvas 子资源,断言不改 |
+| #167 | src/store/chatHydration.characterization.test.ts | 114 expect/30 it/6 describe | **DP-6 chat per-actor×canvas 私有 collection(§5)**——messagesByScene 键语义、settleExpiredChatMessages 回落;hydrate 来源从 IDB → /api/canvas 子资源,断言不改 |
 | #168 | src/canvas/actions/canvasActionModel.characterization.test.ts(+ quickbar) | 315 expect/203 tests(part1/2+quickbar) | **anchor 收编为 record(§4.2)、status 派生(§2.1)、selection 迁出(§4.1)**——anchor action 分发、status 读取、选区 action 须同步迁移;command 形式化(T2.3)亦影响 |
 
 > **落地清单**:T1.2 实施时,凡触及上表"受影响"项的 PR,须在 PR 说明"表征断言数不减、内容不改、仅改数据来源",并在该 PR 附迁移前后表征跑通证据。
