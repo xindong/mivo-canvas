@@ -23,6 +23,7 @@ import { describeRegionHandler } from './routes/describeRegion'
 import { composeMaskEditHandler } from './routes/composeMaskEdit'
 import { authRoute } from './routes/auth'
 import { debugLogsRoute } from './routes/debug-logs'
+import { sseProbeRoute } from './routes/sse-probe'
 import { createLocalAssetsRoutes } from './routes/local-assets'
 import { createAssetRoutes } from './routes/assets'
 import { createAssetStore, createFsAssetBackend, resolveAssetStoreDir, type AssetStore } from './lib/assetStore'
@@ -257,6 +258,23 @@ app.route('/api/canvas', createCanvasRoutes({ backend: sharedPersistBackend, per
 app.route('/api/user-state', createUserStateRoutes({ backend: sharedPersistBackend }))
 // T1.4: 公开分享访问入口(GET /api/share/:token;无鉴权,token 驱动;revoked→410,unknown→404)。
 app.route('/api/share', createShareAccessRoutes({ backend: sharedPersistBackend, permissions: sharedPermissionBackend }))
+
+// B3: SSE 透传诊断 probe (GET /api/diag/sse-probe). DEFAULT OFF — only mounts when
+// MIVO_ENABLE_SSE_PROBE=1 (env.ts sseProbeEnabled). 用途:lead 生产实测公司网关对
+// text/event-stream 的 buffering/超时/Streaming 透传 (N2-0 Gate5 "条件式 GO" 留测项,
+// docs/decisions/n20-truth-source-decision.md §12 未验证项 2/3)。纯 heartbeat,无业务数据;
+// 鉴权复用 resolveActor (strict → SsoAuthError → app.onError 401,对齐 G2.1)。
+// **不在 createSsoStrictProofGate 中间件下**(该中间件是 owner-scoped 持久化路由前置;
+// 本 route 自己调 resolveActor 作 auth gate)。Flag off → 路由不挂载 + 404 stub
+// (防 SPA fallback,mirror asset-disabled stub),SSE 代码路径完全不可达(默认构建零暴露)。
+// 生产实测时才开 MIVO_ENABLE_SSE_PROBE=1,测完即关。
+if (featureFlags.sseProbeEnabled) {
+  app.route('/api/diag', sseProbeRoute)
+} else {
+  // Flag off → 404 for the probe path (no SPA index.html for an API path).
+  const sseProbeDisabled = (c: Context<AppEnv>) => c.notFound()
+  app.all('/api/diag/sse-probe', sseProbeDisabled)
+}
 
 // Same-origin static hosting of dist/ (Vite build output). serveStatic only
 // accepts a root relative to cwd and calls next() on miss, letting the SPA
