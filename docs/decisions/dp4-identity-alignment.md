@@ -129,10 +129,12 @@ export const resolveActor = (c: Context): string => {
 | R-5 | **指纹 fallback 残留共享身份风险** | 即便有共享密钥(opt-in),若攻击者绕网关直连(无密钥)→ fallback 指纹;若生产 `MIVO_PLATFORM_KEY` 共享/缺失,该指纹 actor 名下数据可被访问(Greptile finding 2 残留)。**完整修复**(SSO 模式下缺身份 → 401 拒绝而非 fallback)需改 `resolveActor` 返回 `string|null` + 全路由处理,本 PR 未做(改契约面大),列为 follow-up;本 PR 用启动告警让 misconfig 可见。生产纯 SSO(无指纹数据)下该残留不暴露数据。 |
 | R-3 | **SSO username 变更(改名)罕见** | `username` 是 email-style 账号,改名极罕见;若发生,`project_members.userId` 旧值失效——按 §13.5 "零 maker 跨仓改动",username 变更属 maker 账号管理范畴,本层不处理(需 owner 重新邀请)。 |
 | R-4 | **403 body 未进 shared 契约** | T1.4 引入成员越权 403(`{error:'forbidden'}`,server-local),**不**加进 `shared/persist-contract.ts` 的 `ApiErrorBody`(保 #194 契约不变,boundary 3)。非成员/无分享 → 404 unknown-* 与 #194 一致;成员越权(editor manage / viewer write)→ 403。客户端 PersistAdapter 当前仅以 owner 身份操作,不触发 403;editor/viewer UI 未建(boundary 4)。 |
+| R-6 | **asset attach owner-gate 延 G2.2(硬前置)** | G1-a P1-2 暴露 `/api/assets/:id/attach` HTTP 入口(节点生命周期 attach 调用方属 G1-c,本轮冻结 wire)。`assetStore.attach` **不 owner-check**(AttachResult 无 owner-mismatch kind),故 attach 路由**不 owner-gate**:任何持有 assetId(sha256 hex64)的请求方可 attach 自己 ref → ref 即 live reference → 可 GET 该 asset。这是内容寻址 ref 模型既有 backend 设计(attachRef 一直如此),非 G1-a 新引入;**detach 已 owner-gate**(跨 owner → 403 decidable)。**硬前置**:多用户生产前(route 层加 `record.ownerFp === attacher` 检查,service 层暴露 isUploader,或并入 T1.4 share-grant 统一授权)为 G2.2 硬前置;当前单用户 demo + 节点同 owner(cross-owner attach 生产不发生)下暴露可控。暴露面详注:`server/routes/assets.ts` §EXPOSURE TRACE(2026-07-12 lead 批准延 G2.2,需 documented exposure)。 |
 
 ## 6. 决议
 
 - **DP-4 = 一致**。SSO 载体(`username` = maker user id)与权限层 `userId` 假设一致;T1.4 按 §13.5 以 username 为 `project_members.userId` 键、share_links 以 token 驱动(不绑 userId)。
 - **carrier 切换**:`resolveActor` 切到读 `x-mivo-auth-user` 可信 header,保留指纹 fallback 保 #194 契约测试绿。
 - **部署依赖 R-1** 报 lead,生产网关注入由 ops 落地(本 PR 不阻塞)。
+- **asset attach owner-gate(R-6)延 G2.2**:暴露面已注于 `server/routes/assets.ts` §EXPOSURE TRACE;多用户生产前为硬前置(与 R-1 同级报 lead)。
 - 本文件为 T1.4 实施的前置核验结论,落 `docs/decisions/`,供 T1.4 PR 引用。
