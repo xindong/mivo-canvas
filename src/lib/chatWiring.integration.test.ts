@@ -48,6 +48,7 @@ import {
   stopPersistWriteQueue,
   drainPersistQueue,
   hydrateFromServer,
+  getChatOrderRevision,
   __resetPersistBoot,
 } from './persistBoot'
 import { __resetWriteQueueDb } from './writeRetryQueue'
@@ -71,7 +72,7 @@ beforeEach(async () => {
 })
 
 describe('G1-a chat — server hydrate 拉 per-actor chat collection', () => {
-  it('hydrateFromServer(fakeAdapter) → active canvas 的 chat 灌入 useChatStore.messagesByScene', async () => {
+  it('hydrateFromServer(fakeAdapter) → active canvas 的 chat 灌入 useChatStore.messagesByScene + orderRevision 落点', async () => {
     // active sceneId
     useCanvasStore.setState({ sceneId: 'c-active' })
     const serverMsgs = [makeChatMessage('m1', 'hello'), makeChatMessage('m2', 'world')]
@@ -80,7 +81,10 @@ describe('G1-a chat — server hydrate 拉 per-actor chat collection', () => {
       listCanvas: async () => ({ canvases: [] }),
       listChatMessages: async (canvasId: string) => {
         expect(canvasId).toBe('c-active')
-        return { messages: serverMsgs.map((m, i) => ({ id: m.id, revision: i, orderKey: i, payload: m })) }
+        return {
+          messages: serverMsgs.map((m, i) => ({ id: m.id, revision: i, orderKey: i, payload: m })),
+          orderRevision: 7, // R2 F4:DP-6R 契约 orderRevision(per-actor×canvas reorder cursor)
+        }
       },
     } as unknown as ServerPersistAdapter
     const fakeOpts = {
@@ -93,6 +97,8 @@ describe('G1-a chat — server hydrate 拉 per-actor chat collection', () => {
     expect(msgs?.length).toBe(2)
     expect(msgs?.[0].id).toBe('m1')
     expect(msgs?.[1].text).toBe('world')
+    // R2 F4:orderRevision 落点(persistBoot module 级 map,供未来 reorder If-Match 用;非只 log)
+    expect(getChatOrderRevision('c-active')).toBe(7)
   })
 })
 
@@ -133,7 +139,7 @@ describe('G1-a chat — adapter per-actor wire(dp6r 语义 stub:隔离 + 匿名 
       if (!key) return new Response(JSON.stringify({ error: 'require-login' }), { status: 401, headers: { 'content-type': 'application/json' } })
       if (method === 'GET' && path.startsWith('/api/canvas/') && path.endsWith('/chat')) {
         const msgs = byOwner[key] ?? []
-        return new Response(JSON.stringify({ messages: msgs.map((m, i) => ({ id: m.id, revision: i, orderKey: i, payload: m })) }), { status: 200, headers: { 'content-type': 'application/json' } })
+        return new Response(JSON.stringify({ messages: msgs.map((m, i) => ({ id: m.id, revision: i, orderKey: i, payload: m })), orderRevision: 0 }), { status: 200, headers: { 'content-type': 'application/json' } })
       }
       if (method === 'POST' && path.startsWith('/api/canvas/') && path.endsWith('/chat')) {
         const b = JSON.parse((init?.body as string) ?? '{}') as { message: ChatMessage }
@@ -145,13 +151,15 @@ describe('G1-a chat — adapter per-actor wire(dp6r 语义 stub:隔离 + 匿名 
     return { fetch, byOwner }
   }
 
-  it('KEY_A listChatMessages 返 A 的 chat;KEY_B 返空(per-actor 隔离)', async () => {
+  it('KEY_A listChatMessages 返 A 的 chat;KEY_B 返空(per-actor 隔离)+ orderRevision 返回', async () => {
     const { fetch } = makeDp6rStub()
     const adapterA = createFetchServerPersistAdapter({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders(KEY_A) })
     const adapterB = createFetchServerPersistAdapter({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders(KEY_B) })
     const aMsgs = await adapterA.listChatMessages('c1')
     expect(aMsgs.messages.length).toBe(1)
     expect((aMsgs.messages[0].payload as ChatMessage).text).toBe('A-chat')
+    // R2 F4:契约对齐 DP-6R —— ListChatMessagesResponse 携带 orderRevision(reorder cursor 真相源)
+    expect(aMsgs.orderRevision).toBe(0)
     const bMsgs = await adapterB.listChatMessages('c1')
     expect(bMsgs.messages.length).toBe(0) // B 看不到 A 的 chat
   })

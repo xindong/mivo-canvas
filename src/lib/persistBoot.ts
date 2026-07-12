@@ -39,6 +39,19 @@ const getProductionFetchOptions = (): FetchAdapterOptions => ({ getAuthHeaders: 
 // ── 队列单例(仅 server/shadow 启动;local 永不启动 → enqueuePersistWrite no-op)──
 let writeQueue: WriteQueue | undefined
 
+// G1-a R2 F4:per-canvas chat orderRevision(DP-6R 契约)落点。hydrate 从 listChatMessages 读出后存此,
+// 供未来 reorder If-Match 用(reorder cursor 真相源;消费方属 DP-6R/G1-c defer 域,此处只存不消费,
+// 非"只 log"——是可观测的应用点 + accessor)。local 模式永不写入(hydrate 不跑)。
+const orderRevisionByCanvas = new Map<string, Revision>()
+
+/**
+ * G1-a R2 F4:取某 canvas 的 chat orderRevision(DP-6R per-actor×canvas reorder cursor)。
+ * 由 hydrateFromServer 在 server 模式 listChatMessages 后写入;未 hydrate / local → undefined。
+ * DP-6R/G1-c reorder 接线时读此作 If-Match base(非陈旧)。
+ */
+export const getChatOrderRevision = (canvasId: string): Revision | undefined =>
+  orderRevisionByCanvas.get(canvasId)
+
 /**
  * G1-a P1-1:非画布域 mutation enqueue 出口。store mutation(set 后)调此。
  * - local(默认):writeQueue undefined → 立即 return(零副作用,表征测试不红)。
@@ -68,6 +81,7 @@ export const isPersistWriteActive = (): boolean => writeQueue !== undefined
 export const __resetPersistBoot = (): void => {
   writeQueue?.stop()
   writeQueue = undefined
+  orderRevisionByCanvas.clear()
 }
 
 // ── server 模式 boot:hydrate 非画布域(从 BFF 恢复)──
@@ -125,7 +139,7 @@ export const hydrateFromServer = async (
     const { useChatStore } = await import('../store/chatStore')
     const sceneId = useCanvasStore.getState().sceneId
     if (sceneId) {
-      const { messages } = await adapter.listChatMessages(sceneId)
+      const { messages, orderRevision } = await adapter.listChatMessages(sceneId)
       const chatMessages = messages.map((r) => r.payload as ChatMessage)
       useChatStore.setState({
         messagesByScene: {
@@ -133,9 +147,11 @@ export const hydrateFromServer = async (
           [sceneId]: chatMessages,
         },
       })
+      // R2 F4:orderRevision 落点(DP-6R 契约;供 reorder If-Match,非只 log)。
+      orderRevisionByCanvas.set(sceneId, orderRevision)
       debugLogger.log(
         SOURCE,
-        `server hydrate: ${chatMessages.length} chat message(s) for active canvas ${sceneId} from BFF (per-actor DP-6R)`,
+        `server hydrate: ${chatMessages.length} chat message(s) for active canvas ${sceneId} from BFF (per-actor DP-6R; orderRevision=${orderRevision})`,
       )
     }
   } catch (error) {

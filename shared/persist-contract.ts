@@ -273,7 +273,7 @@ export type CreateChatMessageRequest = { message: unknown }
 /** G1-a chat 接线(DP-6R P1-1):PATCH /api/canvas/:id/chat/:msgId body(与 node/edge/anchor PATCH 同 UpsertRequest<{payload}> 形状)。If-Match = msg envelope revision。 */
 export type UpdateChatMessageRequest = { payload: unknown }
 
-export type ListChatMessagesResponse = { messages: RecordEntry[] }
+export type ListChatMessagesResponse = { messages: RecordEntry[]; orderRevision: Revision }
 
 // ── user-state(api-surface §4.3)────────────────────────────────────────────────
 
