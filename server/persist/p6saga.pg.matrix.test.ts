@@ -45,97 +45,66 @@ const migrateWith = async (
   if (r.error) throw r.error
 }
 
-// 模拟 DP-6R 的两条 migration(本分支 registry 无它们;矩阵证明 003→004→005 字典序无冲突):
-//  003_chat_per_user / 004_chat_order_revisions —— 占位表,等价形态让 migrator tracked 进 kysely_migration。
-const mChat003 = {
-  async up(d: Kysely<Record<string, never>>): Promise<void> {
-    await sql`CREATE TABLE IF NOT EXISTS chat_per_user_messages (id text primary key, project_id text)`.execute(d)
-  },
-  async down(): Promise<void> {},
-}
-const mChatOrder004 = {
-  async up(d: Kysely<Record<string, never>>): Promise<void> {
-    await sql`CREATE TABLE IF NOT EXISTS chat_order_revisions (id text primary key, project_id text, revision integer)`.execute(d)
-  },
-  async down(): Promise<void> {},
-}
+// R3-F3 矩阵去伪造(2026-07-12 R2 finding 3):原矩阵自造 mChat003/mChatOrder004 并登记为
+// 2026_07_12_003_chat_per_user(错名),实际 DP-6R 8aa1f2b 的 registry 名是 2026_07_12_003_chat_per_actor;
+// 测试内伪 registry 自洽但未验证实际 combined registry(假阳性)。现改用真实生产 `migrations` registry,
+// 禁测试内占位 migration。saga 分支真实 registry = {001,002,005,006,007}(无 003/004——DP-6R 占)。
+//
+// DP-6R combined 路径(真实 003_chat_per_actor + 004_chat_order_revisions + 005/006/007)受任务"禁 PR/merge/main"
+// 约束无法在本分支验证:003/004 不在 saga registry → 启动到已应用 DP-6R 的库会 "missing migration" 报错。
+// 此为 merge-time 缺口(合并 DP-6R 后 combined registry 自然覆盖),本测试跳过 combined 用例并文档化。
+// 真实 DP-6R 已应用测试库(mivocanvas_unit)的 saga backend.ready 失败同样 merge-time 消除。
 
 ;(PG_TEST_ENABLED ? describe : describe.skip)('P-6 saga PG:迁移矩阵(P1-4)+ 并发(P1-3)', () => {
-  it('P1-4 fresh combined:001+002+003+004+005 migrateToLatest 绿,表/列/索引齐,kysely_migration 单调', async () => {
+  it('R3-F3 fresh 真实 saga registry:001+002+005+006+007 migrateToLatest 绿,表/列/索引齐,kysely_migration 单调', async () => {
     const db = makeKysely()
     await resetSchema(db)
-    // fresh combined:本分支 001+002+005 + 模拟 DP-6R 003+004,全量 migrateToLatest(证明 005 在 003+004 之后无冲突)。
-    const combined = {
-      '2026_07_11_001_initial_persist_schema': migrations['2026_07_11_001_initial_persist_schema'],
-      '2026_07_11_002_permissions_schema': migrations['2026_07_11_002_permissions_schema'],
-      '2026_07_12_003_chat_per_user': mChat003,
-      '2026_07_12_004_chat_order_revisions': mChatOrder004,
-      '2026_07_12_005_share_link_compensations': migrations['2026_07_12_005_share_link_compensations'],
-    }
-    await migrateWith(db, combined)
-    // compensations 表新列
+    // 真实生产 registry(无伪造 003/004):saga 分支 001+002+005+006+007。禁测试内占位 migration。
+    await migrateWith(db, migrations)
+    // compensations 表 R3 列(P1-2 generation/claimed + R3-F4 claim_token)
     const cols = (await sql`SELECT column_name FROM information_schema.columns WHERE table_name='share_link_compensations' ORDER BY column_name`.execute(db)).rows as { column_name: string }[]
     const names = cols.map((r) => r.column_name)
     expect(names).toContain('generation')
     expect(names).toContain('claimed_at')
     expect(names).toContain('claimed_until')
-    // status CHECK 含 'superseded'(返修 P1-2 新增;PG12+ 用 pg_get_constraintdef,consrc 已移除)
+    expect(names).toContain('claim_token') // R3-F4(007 加列)
+    // status CHECK 含 'superseded'(P1-2:005)+ 'failed'(R3-F2:006)
     const chk = (await sql`SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conrelid='share_link_compensations'::regclass AND contype='c'`.execute(db)).rows as { def: string }[]
     expect(chk.some((r) => r.def.includes('superseded'))).toBe(true)
-    // share_links.cascade_revoked_at(P-6 marker)
+    expect(chk.some((r) => r.def.includes('failed'))).toBe(true)
+    // share_links.cascade_revoked_at(P-6 marker,005 ALTER 加)
     const sl = (await sql`SELECT column_name FROM information_schema.columns WHERE table_name='share_links' AND column_name='cascade_revoked_at'`.execute(db)).rows as { column_name: string }[]
     expect(sl).toHaveLength(1)
     // partial unique index
     const idx = (await sql`SELECT indexname FROM pg_indexes WHERE tablename='share_link_compensations'`.execute(db)).rows as { indexname: string }[]
     expect(idx.map((r) => r.indexname)).toContain('uq_compensations_pending_project_op')
-    // kysely_migration 单调:001<002<003<004<005(share-先路径不存在)
+    // kysely_migration 精确单调:saga 真实 registry(无 003/004,DP-6R 占位)
     const applied = (await sql`SELECT name FROM kysely_migration ORDER BY name`.execute(db)).rows as { name: string }[]
     expect(applied.map((r) => r.name)).toEqual([
       '2026_07_11_001_initial_persist_schema',
       '2026_07_11_002_permissions_schema',
-      '2026_07_12_003_chat_per_user',
-      '2026_07_12_004_chat_order_revisions',
       '2026_07_12_005_share_link_compensations',
+      '2026_07_12_006_compensation_failed_status',
+      '2026_07_12_007_compensation_claim_token',
     ])
-    // 三表共存(005 在 003+004 之后 apply,无顺序冲突)
-    const coexist = (await sql`SELECT table_name FROM information_schema.tables WHERE table_name IN ('chat_per_user_messages','chat_order_revisions','share_link_compensations') ORDER BY table_name`.execute(db)).rows as { table_name: string }[]
-    expect(coexist.map((r) => r.table_name)).toEqual(['chat_order_revisions', 'chat_per_user_messages', 'share_link_compensations'])
+    // saga registry 确无 003/004(文档化 DP-6R 归属)
+    expect(Object.keys(migrations).sort()).toEqual([
+      '2026_07_11_001_initial_persist_schema',
+      '2026_07_11_002_permissions_schema',
+      '2026_07_12_005_share_link_compensations',
+      '2026_07_12_006_compensation_failed_status',
+      '2026_07_12_007_compensation_claim_token',
+    ])
     await db.destroy()
   })
 
-  it('P1-4 chat-applied→combined:模拟 003+004 已 tracked,migrateToLatest 追加 005,kysely_migration 单调', async () => {
-    const db = makeKysely()
-    await resetSchema(db)
-    const m1 = migrations['2026_07_11_001_initial_persist_schema']
-    const m2 = migrations['2026_07_11_002_permissions_schema']
-    // 模拟 DP-6R 已合 main 的状态:001+002+003+004 已 tracked。
-    const regDp6r = {
-      '2026_07_11_001_initial_persist_schema': m1,
-      '2026_07_11_002_permissions_schema': m2,
-      '2026_07_12_003_chat_per_user': mChat003,
-      '2026_07_12_004_chat_order_revisions': mChatOrder004,
-    }
-    await migrateWith(db, regDp6r)
-    // 再 migrateToLatest(全 registry 含 003+004+005)→ 005 应用(003+004 已 tracked 不重跑)。
-    //   注:003+004 不在本分支 registry 里 → Kysely "missing migration" 检查会拒绝;故路径用 regWithChatOrderAnd005。
-    const regWithChatOrderAnd005 = {
-      ...regDp6r,
-      '2026_07_12_005_share_link_compensations': migrations['2026_07_12_005_share_link_compensations'],
-    }
-    await migrateWith(db, regWithChatOrderAnd005)
-    const applied = (await sql`SELECT name FROM kysely_migration ORDER BY name`.execute(db)).rows as { name: string }[]
-    // registry 单调:001 < 002 < 003-chat < 004-chat-order < 005-share(share-先路径不存在,无需支持)
-    expect(applied.map((r) => r.name)).toEqual([
-      '2026_07_11_001_initial_persist_schema',
-      '2026_07_11_002_permissions_schema',
-      '2026_07_12_003_chat_per_user',
-      '2026_07_12_004_chat_order_revisions',
-      '2026_07_12_005_share_link_compensations',
-    ])
-    // 占位 chat 两表与 compensations 表共存(005 在 003+004 之后 apply,无顺序冲突)
-    const coexist = (await sql`SELECT table_name FROM information_schema.tables WHERE table_name IN ('chat_per_user_messages','chat_order_revisions','share_link_compensations') ORDER BY table_name`.execute(db)).rows as { table_name: string }[]
-    expect(coexist.map((r) => r.table_name)).toEqual(['chat_order_revisions', 'chat_per_user_messages', 'share_link_compensations'])
-    await db.destroy()
+  // R3-F3 combined DP-6R 路径(真实 003+004 tracked → 追加 005/006/007)受"禁 merge"约束阻塞:
+  //   003/004 不在 saga registry(真实名 2026_07_12_003_chat_per_actor / 2026_07_12_004_chat_order_revisions,
+  //   属 DP-6R 8aa1f2b)。合并 DP-6R 后 combined registry 自然含 003/004,届时本测改为跑真实 combined
+  //   (验证 001→004 tracked → 追加 005/006/007,kysely_migration 单调 001<002<003<004<005<006<007)。现跳过。
+  it.skip('R3-F3 combined DP-6R 路径(003+004 tracked → 005/006/007)——禁 merge 约束,merge-time 验证', async () => {
+    // 占位:合并 DP-6R 后,用真实 combined registry(含 003_chat_per_actor + 004_chat_order_revisions)
+    // 验证:001→004 已 tracked → migrateToLatest 追加 005/006/007,kysely_migration 精确单调。
   })
 
   describe('P1-3 并发 record(PgPermissionBackend)', () => {
