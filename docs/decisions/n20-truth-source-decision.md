@@ -10,7 +10,7 @@
 > - `server/__tests__/n20-sse-route.spike.test.ts`(9 tests,真实 Hono SSE route 集成 + R2-2 live push 5-7 + desiredSize backpressure + **R3 F3:真实 resolveActor/canAccessCanvas authz seam(替代 fake secret,错 proof → 404 no-leak 非 401)+ 5-8 slow-reader response body 恢复**;**R5 F3:5-9 post-revoke write 拒绝(同 Hono harness 加真实 authz seam PATCH write route,bob 撤权 → SSE revoke/close + write 404 no-leak + owner write 200)**)
 > - `server/__tests__/n20-pg-tx-fault.spike.test.ts`(8 tests,真实 PG transaction fault injection + R2-1 同一 client pool.connect+finally release;PG-T3 改名同库资产元数据;**R3 F2:PG-T5 field_clock 持久 / PG-T7 strict-tx 跨 record**;**R5 F2:PG-T6 真实领域 replay path(单事务原子写 record+seq+event+idem row → destroy pool → 重连 replay 同 key 不二次 bump revision/seq/event)+ PG-T6b 首次事务 fault/rollback(领域写+idem row 同事务原子)**)
 >
-> **65 pass / 0 skip / 0 fail**(spike 48 + SSE 9 + PG 8;本地 PG port 55443 实跑,PG-T1~T8 同 client 真 pass;PG-T5/T6/T6b/T7 真 PG 持久/跨 record/真实 replay);`tsc -b` 0 errors;`eslint` 干净;`npm run build` exit 0;`grep -roE 'yjs|lib0|YEvent|applyUpdate|AbstractType|encodeStateAsUpdate' dist/` **零命中**(yjs 不进生产 bundle)。
+> **65 pass / 0 skip / 0 fail**(spike 48 + SSE 9 + PG 8;本地 PG port 55443 实跑,PG-T1~T7(含 T6b) 同 client 真 pass;PG-T5/T6/T6b/T7 真 PG 持久/跨 record/真实 replay);`tsc -b` 0 errors;`eslint` 干净;`npm run build` exit 0;`grep -roE 'yjs|lib0|YEvent|applyUpdate|AbstractType|encodeStateAsUpdate' dist/` **零命中**(yjs 不进生产 bundle)。
 >
 > **倾向 Figma 式,但措辞降级为"基于现有底座与迁移成本的推荐"(R2 纲)** — 非"七 gate 全 GO 的充分判据";Gate3/7 平局、Gate5 条件式。v1→v3 优势缩窄但不反转。结论见 §0,被推翻/修正表述见 §3。
 
@@ -46,7 +46,7 @@
 | 标记 | 含义 | 本决策的此类证据 |
 |---|---|---|
 | ★ | 真实库对照 | 真实 `yjs` / `Y.UndoManager` / `Y.Doc.transact` / `encodeStateAsUpdate` 跑同矩阵(M1-M6 / G3-real / G7-hard-4 / antiYjs) |
-| ● | 集成测试 | 真实 Hono SSE route(5-1~9)/ 真实 PG transaction fault injection(PG-T1~T8)/ FieldLevelServer 集成(G4/G7/S10/T1/C-1~C-4) |
+| ● | 集成测试 | 真实 Hono SSE route(5-1~9)/ 真实 PG transaction fault injection(PG-T1~T7(含 T6b))/ FieldLevelServer 集成(G4/G7/S10/T1/C-1~C-4) |
 | ▲ | lead 核证生产调用 | lead 已 spot-check 生产代码引用(canvas.ts:450-522 / shared/persist-contract.ts:76 / writeRetryQueue.ts:16-19) |
 | ○ | 仍属分析 | 未跑生产网关 / 未压测 20k 渲染;条件式标注,非"无需验证" |
 
@@ -107,7 +107,7 @@ npm run test:unit -- src/lib/serverPersistAdapter.contract.test.ts server/persis
 
 > 注:**"无双协议窗口"仍成立**(原子 cutover + #194 unwired → 原地演进,无双 endpoint 并存);但"零破坏"不成立(逐文件 12 项 + FX-5 迁移 + 118 项回归)。Gate6 判决据此(§2 Gate6)。
 
-**cutover 状态表(R3 唯一可执行协议;契约测试命令 = §1.2 定向回归 + grep 调用面审计,dry-run:grep 149 匹配 / 5 测试文件全在 / `npm run test:unit` 118 pass 32 skip)**:
+**cutover 状态表(R3 唯一可执行协议;契约测试命令 = §1.2 定向回归 + grep 调用面审计,dry-run:grep 调用面审计实跑通过(匹配数以实跑为准,不硬编码) / 5 测试文件全在 / `npm run test:unit` 118 pass 32 skip)**:
 
 | 场景 | flag / 时机 | 客户端发 | 服务端行为 | 状态码 | 客户端动作 |
 |---|---|---|---|---|---|
@@ -121,7 +121,7 @@ npm run test:unit -- src/lib/serverPersistAdapter.contract.test.ts server/persis
 >
 > 全文不再有 "versioned payload 或原子 cutover" / "versioned/原子" 二选一残句;cutover = **原子**(§1.2 拍死)。stale-client(旧 body schema 不匹配)唯一状态码 = **400 `payload-rejected`**;409 revision-conflict 是 #194 envelope 复用码(`parseIfMatch`),新 field-level 协议 G4-4 明确 base 落后不拒写(200),故 stale-client 场景无 409(§1.2 状态表 / §10.2 / §10.9 / §2 Gate6 一致)。
 >
-> **R5 F4 cutover contract harness**:状态表 5 行逐行参数化探针在 `src/kernel/__spike__/n20-truth-source.spike.test.ts` C-1~C-4:flag on/off decoder(C-1,row 1/3)、old-queue migration-on-read(C-2,row 2)、new-op+stale-base 200 非 409(C-3,row 4,对齐 G4-4/T1-1)、rollback=snapshot materialize(C-4,row 5)。冻结命令已 dry-run:grep 149 匹配 / 5 测试文件全在;命令修正 `npm test` → `npm run test:unit`(V16/V17 验)。
+> **R5 F4 cutover contract harness**:状态表 5 行逐行参数化探针在 `src/kernel/__spike__/n20-truth-source.spike.test.ts` C-1~C-4:flag on/off decoder(C-1,row 1/3)、old-queue migration-on-read(C-2,row 2)、new-op+stale-base 200 非 409(C-3,row 4,对齐 G4-4/T1-1)、rollback=snapshot materialize(C-4,row 5)。冻结命令已 dry-run:grep 调用面审计实跑通过(匹配数以实跑为准,不硬编码) / 5 测试文件全在;命令修正 `npm test` → `npm run test:unit`(V16/V17 验)。
 
 ---
 
@@ -332,7 +332,7 @@ npm run test:unit -- src/lib/serverPersistAdapter.contract.test.ts server/persis
 
 ## 4-9. PoC 清单与实跑结果(65 tests 全绿)
 
-**文件**:`src/kernel/__spike__/n20-truth-source.spike.test.ts`(44)+ `server/__tests__/n20-sse-route.spike.test.ts`(8)+ `server/__tests__/n20-pg-tx-fault.spike.test.ts`(7)。
+**文件**:`src/kernel/__spike__/n20-truth-source.spike.test.ts`(48)+ `server/__tests__/n20-sse-route.spike.test.ts`(9)+ `server/__tests__/n20-pg-tx-fault.spike.test.ts`(8)。
 
 ### 4.1 原 PoC(15 tests,v1 已有)
 
@@ -409,7 +409,7 @@ npm run test:unit -- src/lib/serverPersistAdapter.contract.test.ts server/persis
 | 5-8 slow-reader 恢复(R3 F3) | R3 F3 | 5 | `resumedMax-resumedMin+1 > resumed.length`(response body 观察 seq gap)+ `?since=0 补拉 seq 1..51 全 51 无缺口` | ● |
 | 5-9 post-revoke write 拒绝(R5 F3) | R5 F3 | 5 | bob 撤权后 SSE `event: revoke`/close + bob PATCH write 返真实 `404 unknown-canvas` no-leak(非 401/403)+ owner alice write `200`(真实 seam:resolveActor+canAccessCanvas('write')+denyStatus) | ● |
 
-**实跑汇总**:`65 pass / 0 skip / 0 fail`(spike 48 + SSE 9 + PG 8,本地 PG port 55443 实跑 MIVO_PG_TEST=1,PG-T1~T8 同一 client 真 pass;PG-T5/T6/T6b/T7 真 PG 持久/跨 record/真实 replay;SSE 5-8 slow-reader 恢复 + 5-9 post-revoke write 拒绝)。`tsc -b` 0 errors;`eslint` 干净;`npm run build` exit 0;`grep -roE 'yjs|lib0|YEvent|applyUpdate|AbstractType|encodeStateAsUpdate' dist/` 零命中(yjs 不进生产 bundle)。
+**实跑汇总**:`65 pass / 0 skip / 0 fail`(spike 48 + SSE 9 + PG 8,本地 PG port 55443 实跑 MIVO_PG_TEST=1,PG-T1~T7(含 T6b) 同一 client 真 pass;PG-T5/T6/T6b/T7 真 PG 持久/跨 record/真实 replay;SSE 5-8 slow-reader 恢复 + 5-9 post-revoke write 拒绝)。`tsc -b` 0 errors;`eslint` 干净;`npm run build` exit 0;`grep -roE 'yjs|lib0|YEvent|applyUpdate|AbstractType|encodeStateAsUpdate' dist/` 零命中(yjs 不进生产 bundle)。
 
 ---
 
