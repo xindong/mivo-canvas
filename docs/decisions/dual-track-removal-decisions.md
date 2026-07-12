@@ -714,17 +714,30 @@ pg-suite 翻 required（2026-07-12，今天）。cutover 未执行。
    }
    ```
 
-   guard 用 `jq -e` 校验全字段必填（任一缺 / 类型错 / `verdict≠pass` 必红）：
+   guard 用 `jq -e` 逐字段断言 boolean 类型 + 顶层/`checks` 双 exact-key + `executedAt` 可解析 RFC3339（r6 修 D4-R6-3：原 guard 只 truthy 组合——四项 `checks` 改字符串 `"yes"` / 数字 `1` / `null` 全 truthy 假绿，文案承诺"类型错必红"却不兑现；现逐项 `type=="boolean" and .==true`，双 exact-key 拒额外/缺字段，`fromdateiso8601` 拒非法时间——任一缺字段 / 类型错 / 额外 key / `verdict≠pass` / 非法时间 必红）：
 
    ```bash
-   jq -e '.schemaVersion==1 and (.executedAt|type=="string") and (.executor|type=="string") and .roundtripVerdict=="pass" and (.checks.businessRowsRestored and .checks.assetRowsRestored and .checks.permissionsRestored and .checks.rowCountMatch)' <persist-drill-report.json>
+   jq -e '
+     (keys|sort) == ["checks","executedAt","executor","roundtripVerdict","schemaVersion"]
+     and (.checks|type) == "object"
+     and (.checks|keys|sort) == ["assetRowsRestored","businessRowsRestored","permissionsRestored","rowCountMatch"]
+     and .schemaVersion == 1
+     and (.executedAt|type) == "string"
+     and (.executedAt | (try fromdateiso8601 catch null) | type == "number")
+     and (.executor|type) == "string"
+     and .roundtripVerdict == "pass"
+     and (.checks.businessRowsRestored|type) == "boolean" and .checks.businessRowsRestored == true
+     and (.checks.assetRowsRestored|type) == "boolean" and .checks.assetRowsRestored == true
+     and (.checks.permissionsRestored|type) == "boolean" and .checks.permissionsRestored == true
+     and (.checks.rowCountMatch|type) == "boolean" and .checks.rowCountMatch == true
+   ' <persist-drill-report.json>
    ```
 
    D PR 的 `scripts/ci/structure-guard.mjs` 加 persist 段机械检查（每条对应一外部事实，所有 post-merge 事实从 GitHub API 派生，不信 event 内填的 SHA/日期/计数）：
 
    1. `gh api repos/xindong/mivo-canvas/pulls/<cutoverPrNumber>` → `.merged==true`（**伪造 PR 号 / 未合并必红**）；从同一响应读 `.merged_at` = S7 不可逆点（**不与 event 内字段比对——event 不存日期**）；
    2. 从上步 `.merged_at` 算距 D PR 开工日 ≥ 30 天（**伪造日期必红——日期来自 API 非人工填**）；
-   3. `gh api repos/xindong/mivo-canvas/contents/<drillReportPath>` 存在 + 内容符上 JSON schema（`schemaVersion==1` / `roundtripVerdict=="pass"` / `executedAt` / `executor` / 四项 `checks` 全 true）（**缺报告 / 不符 schema 必红**）；报告由独立 closeout PR 落 main，D PR 改不动它；
+   3. `gh api repos/xindong/mivo-canvas/contents/<drillReportPath>` 存在 + 内容符上 JSON schema（顶层与 `checks` 双 exact-key / `schemaVersion==1` / `roundtripVerdict=="pass"` / `executedAt` 为可解析 RFC3339 / `executor` 字符串 / 四项 `checks` 全 `type=="boolean" and .==true`，r6 修 D4-R6-3 防 truthy 假绿）（**缺报告 / 不符 schema / 类型错 / 额外或缺字段 / 非法时间 必红**）；报告由独立 closeout PR 落 main，D PR 改不动它；
    4. drill `executedAt` ≥ cutover `merged_at` 且 ≤ D PR 开工日（**窗口外 drill 必红——drill 须在 S7 后观察窗内执行**）。
 
    任一不满足 → structure-guard 红 → D PR 挡合并。
