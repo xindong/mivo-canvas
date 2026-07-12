@@ -1,42 +1,45 @@
-# N2-0 真相源拍板:Figma 式 vs Yjs(返修重评分 v2,decision-complete)
+# N2-0 真相源拍板:Figma 式 vs Yjs(返修重评分 v3,R2 复审返修,decision-complete)
 
-> 状态:**返修重评分 v2(等 lead + sol 复审)**。v1(94c7c0c)被 8 条双审 finding 判 REQUIRES_CHANGES(6 P1 + 2 P2);v2 补 5 条 finding 真实探针 + P1-4 文本判决二选一 + P1-6 破坏面 inventory + P2-8 §10 对齐 G1-b R2。
-> 日期:2026-07-12(v2)。
+> 状态:**返修重评分 v3(等 lead + sol4 第三轮复审)**。v1(94c7c0c)被 8 条双审 finding 判 REQUIRES_CHANGES(6 P1 + 2 P2);v2 补 5 条 finding 真实探针 + P1-4 文本判决 + P1-6 破坏面 inventory + P2-8 §10 对齐 G1-b R2;**v2 仍被 R2 复审判 REQUIRES_CHANGES(6 P1 + 1 P2,R2-1~R2-7)**——判决措辞过度(称"七 gate 全 GO 的充分判据"),证据与声称不匹配。
+> **v3 返修两头一起动(R2 纲)**:① 证据硬化——PG 同 client(R2-1)/SSE live push+desiredSize backpressure+gateway-secret authz seam(R2-2)/§10 三层信任+clock PG schema+batch 真单事务+immutable/atomic leaf+idempotent replay(R2-3)/数组三类+leaf validator(R2-4)/restore 走 overwrite 管线(R2-5)/逐文件破坏面+cutover 拍死(R2-6)/Gate7 ★ 降级(R2-7);② **声称降级**——Gate3/7 平局、Gate5 条件式、推荐改述"基于现有底座与迁移成本"(非"七 gate 全 GO 的充分判据")。
+> 日期:2026-07-12(v3)。
 > 任务来源:`docs/plan/remaining-tasks-cutover-plan.md` §8 N2-0(7 hard gate,逐字执行)。
 > 前置:`docs/spike/n1-yjs-mapping.md`(N1 结论 + Q1-Q10)、`docs/decisions/record-schema.md`、`src/kernel/{docKernel,records,adapters}.ts`、`docs/decisions/platform-architecture-2026-07-07.md`。
 > 验证产物(全绿):
-> - `src/kernel/__spike__/n20-truth-source.spike.test.ts`(41 tests:15 原 + 18 返修 + 8 补缺)
-> - `server/__tests__/n20-sse-route.spike.test.ts`(6 tests,真实 Hono SSE route 集成)
-> - `server/__tests__/n20-pg-tx-fault.spike.test.ts`(4 tests,真实 PG transaction fault injection)
+> - `src/kernel/__spike__/n20-truth-source.spike.test.ts`(44 tests:15 原 + 18 返修 + 8 补缺 + 3 R2 增:T1-5 restore 全链 / S10-10 immutable/atomic leaf 表 / S10-11 idempotent replay)
+> - `server/__tests__/n20-sse-route.spike.test.ts`(7 tests,真实 Hono SSE route 集成 + R2-2 live push 5-7 + desiredSize backpressure + gateway-secret authz seam)
+> - `server/__tests__/n20-pg-tx-fault.spike.test.ts`(4 tests,真实 PG transaction fault injection + R2-1 同一 client pool.connect+finally release;PG-T3 改名同库资产元数据)
 >
-> **51 pass / 0 skip / 0 fail**(本地 PG port 55443 实跑,PG-T1~T4 转_pass_非 skip);`tsc -b` 0 errors;`eslint` 干净;`npm run build` exit 0;`grep -roE 'yjs|lib0|YEvent|applyUpdate|AbstractType|encodeStateAsUpdate' dist/` **零命中**(yjs 不进生产 bundle)。
+> **55 pass / 0 skip / 0 fail**(本地 PG port 55443 实跑,PG-T1~T4 同 client 真 pass);`tsc -b` 0 errors;`eslint` 干净;`npm run build` exit 0;`grep -roE 'yjs|lib0|YEvent|applyUpdate|AbstractType|encodeStateAsUpdate' dist/` **零命中**(yjs 不进生产 bundle)。
 >
-> **倾向 Figma 式,以诚实对照为准** — v1→v2 优势缩窄但不反转。结论见 §0,被推翻/修正表述见 §3。
+> **倾向 Figma 式,但措辞降级为"基于现有底座与迁移成本的推荐"(R2 纲)** — 非"七 gate 全 GO 的充分判据";Gate3/7 平局、Gate5 条件式。v1→v3 优势缩窄但不反转。结论见 §0,被推翻/修正表述见 §3。
 
 ---
 
 ## 0. TL;DR(结论先行 + 七 gate 重评分表)
 
-**推荐:Figma 式(服务端做主 + 属性级 LWW + REST/SSE 实时广播)。NOT Yjs。NOT 双轨。**
+**推荐(基于现有底座与迁移成本;非"七 gate 全 GO 的充分判据"):Figma 式(服务端做主 + 属性级 LWW + REST/SSE 实时广播)。NOT Yjs。NOT 双轨。**
+
+> **R2 复审降级措辞(R2-1/R2-7)**:推荐 Figma 式 **非因"七 gate 全 GO"**,而是基于:① 现有底座本就是 Figma 式(§1.1);② Yjs 移植成本(拆写路径 + 双真相源);③ Gate3/7 平局、Gate5 条件式——非相对 Yjs 的全 GO 优势。Gate1/2/4/6 维持 GO(有真证据)。
 
 推荐理由(诚实缩窄后仍成立,非偏好):
 1. **现有底座本就是 Figma 式**:`DocKernel`(record 级 upsert + per-record revision)+ #194 PATCH(If-Match 400/428/409,payload 对 server 不透明)+ `owner.ts` SSO(header 注入 fail-closed)。platform §13.5 明写"Figma 式"。Yjs 是移植外物。
 2. **Yjs 移植成本 = 拆已建成的写路径 + 双真相源调和**:N1 §3.1 实证 `revision ↔ Yjs` 双真相源背离;本 spike `antiYjs-坑5` 复现背离、`antiYjs-坑7` 复现 clear+rebuild 吞子字段(§9)。
-3. **跨介质/跨 doc 事务 Figma 占优(但 intra-doc 原子 Yjs 也有)**:G3-real-1 证 Yjs 单 Y.Doc doc.transact 原子(v1 表述"CRDT 无原子多 record"被推翻,见 §3);**Yjs 跨 Y.Doc / 跨 PG / 跨文件资产 非原子**(G3-real-3);Figma 走 server-side PG 事务可跨多 record/跨表原子(PG-T1~T4 真实验证)。
-4. **revoke 简单 + 可预测存储控制(非"存储更小")**:G7-hard-4 实跑 Yjs 有 GC 时 bytes 更小(yjsWithGc=58B < figmaCompressed=8637B);v1 "Figma 存储更小"被推翻(见 §3)。Figma 真实优势 = 显式 server 控制 compress/truncate + revoke 断流(连接绑 actor+canvas,非 doc 级访问控制)。
-5. **Figma 不依赖 WS 网关验证**:REST+SSE 走 plain HTTP,任何网关必透传;Yjs y-protocol 需双向 WS。网关 WS 放行 = **条件式未验证项留 lead**(§12),但不影响 Figma 选型(SSE fallback 兜底)。
+3. **跨介质/跨 doc 事务:Gate3 平局(R2-1)**:intra-doc/intra-DB 原子两案一致(G3-real-1 真 Yjs doc.transact / PG-T1~T3 同一 client 已验);**跨介质 Figma=saga 补偿非真原子、Yjs=无方案** — 非相对优势(原 v2 "Figma 占优"降为平局)。PG-T3 改名"同库资产元数据"(非跨介质)。
+4. **revoke 简单 + 可预测存储控制(非"存储更小"):Gate7 平局(R2-7)**:G7-hard-4 ★真测 Yjs 有 GC 时 bytes 更小(yjsWithGc=58B < figmaCompressed=8637B);G7-hard-1~3 降 ●/○(自建 server 无 Yjs 对照,原标 ★ 虚标)。Figma 真实优势 = revoke 简单(●/○ 设计推理,非 Yjs 对照实证)+ 可预测控制 — 非相对存储优势。
+5. **Figma 不依赖 WS 网关验证:Gate5 条件式 GO(R2-2)**:REST+SSE 走 plain HTTP(5-1~7 真验 live push+desiredSize backpressure+gateway-secret authz seam);网关 SSE buffering/超时 = ○条件式留 lead 生产实测(§12),非"无需验证";Yjs y-protocol 需双向 WS(网关 WS 放行亦条件式)。不影响 Figma 选型(SSE fallback 兜底)。
 
-| # | hard gate | 判决 | 证据强度 | v1→v2 变化 |
+| # | hard gate | 判决 | 证据强度 | v1→v3 变化 |
 |---|---|---|---|---|
-| 1 | 文本同编 | **Figma GO** | ○分析 + ●契约探针(T1-1~4) | 二选一写死 **B**(LWW200+overwritten+restore);删"罕见"断言;标注产品决策 |
-| 2 | 多人 undo/redo | **Figma GO** | ★真实库对照(M1-M6 真 Y.UndoManager) | 修正 naive inverse bug;条件逆运算语义对齐真 Yjs(原 PoC "A inverse 覆盖 B" 已修) |
-| 3 | 跨 record 事务 | **Figma GO** | ★真实库对照(G3-real)+ ●真实 PG(PG-T) | 推翻"CRDT 无原子多 record";改为 **intra-doc 原子 / 跨介质非原子**;Figma 优势缩窄为跨介质边界 |
-| 4 | revision×属性 LWW | **方案 A GO** | ●集成(G4)+ ▲lead 核证生产调用 | "零破坏"→"**前端未接线但契约/服务端破坏面非零**";见 §1.2 inventory |
-| 5 | 实时 transport+auth | **Figma GO** | ●真实集成(5-1~6 Hono SSE) | G5-1 从内存 skeleton→**真实 SSE route**;网关 WS/缓冲 = **条件式**留 lead |
-| 6 | 迁移/双协议窗口 | **Figma GO** | ▲lead 核证生产调用 + ○分析 | "无双协议窗口"成立;但"**零破坏**"推翻 → 破坏面 inventory(§1.2) |
-| 7 | seq/补拉/压缩/revoke/存储 | **Figma GO** | ★真实库对照(G7-hard) | 推翻"Figma 存储更小"(Yjs 有 GC 时 bytes 更小);优势改为 **revoke 简单 + 可预测控制** |
+| 1 | 文本同编 | **Figma GO** | ○分析 + ●契约探针(T1-1~5) | 二选一写死 **B**(LWW200+overwritten+restore,**restore 走 overwrite 管线 R2-5**);删"罕见"断言;标注产品决策 |
+| 2 | 多人 undo/redo | **Figma GO** | ★真实库对照(M1-M6 真 Y.UndoManager) | 修正 naive inverse bug;条件逆运算语义对齐真 Yjs |
+| 3 | 跨 record 事务 | **平局**(R2-1) | ★真实库对照(G3-real)+ ●真实 PG(PG-T 同 client) | intra 原子两案一致;跨介质 Figma=saga 非真原子、Yjs=无方案;PG-T3 改名同库资产元数据;**v2 "Figma 占优"→v3 平局**(诚实) |
+| 4 | revision×属性 LWW | **方案 A GO** | ●集成(G4)+ ▲lead 核证 | "零破坏"→"前端未接线但契约/服务端破坏面非零";§1.2 inventory **逐文件 + cutover 拍死**(R2-6) |
+| 5 | 实时 transport+auth | **条件式 GO**(R2-2) | ●真实集成(5-1~7 Hono SSE) | G5-1~7 真实 SSE(**live push 5-7 + desiredSize backpressure 5-6 + gateway-secret authz seam 5-5**);网关 SSE buffering = ○条件式留 lead(非"无需验证") |
+| 6 | 迁移/双协议窗口 | **Figma GO** | ▲lead 核证 + ○分析 | "无双协议窗口"成立;但"零破坏"推翻 → 破坏面 inventory(§1.2 逐文件)+ cutover 拍死原子方案(R2-6) |
+| 7 | seq/补拉/压缩/revoke/存储 | **平局**(R2-7) | ★真实库对照(G7-hard-4)+ ●/○(G7-hard-1~3 自建 server) | G7-hard-1~3 降 ●/○(自建 server 无 Yjs 对照,原 ★ 虚标);G7-hard-4 ★真测 Yjs 更小;优势改为 revoke 简单(●/○ 非对照)+ 可预测控制 — **v2 "Figma GO"→v3 平局** |
 
-**唯一推荐 → G1-c/N2-1 契约 v2(对齐 G1-b R2)见 §10;改写 N1 Q1-Q5 见 §11。**
+**唯一推荐 → G1-c/N2-1 契约 v3(对齐 G1-b R2 + R2-3/R2-4)见 §10;改写 N1 Q1-Q5 见 §11。**
 
 ### 0.1 证据强度图例
 
@@ -62,28 +65,47 @@
 | SSO 身份 | `server/lib/owner.ts` | `x-mivo-auth-user` + `x-mivo-gateway-secret`(fail-closed) | HTTP-header-based 鉴权 |
 | shared 契约 | `shared/persist-contract.ts` | `NodePayload = Omit<NodeRecord,'id'|'revision'>`(payload 不携带 id/revision,envelope 唯一真相) | transport payload 不透明,防双真相 |
 
-### 1.2 破坏面 inventory(P1-6 诚实化,▲lead 核证生产调用)
+### 1.2 破坏面 inventory(R2-6 逐文件清单 + cutover 拍死,▲lead 核证生产调用)
 
-> v1 §1.2 写"**#194 未接线生产 → gate 4 方案 A 零生产破坏面**"。**此表述不成立**(P1-6)。lead 已核证 #194 route 生产注册、FX-5 持全 payload、shared contract 冻结整 record payload。诚实 inventory:
+> v1 §1.2 写"**#194 未接线生产 → gate 4 方案 A 零生产破坏面**"。**此表述不成立**(P1-6/R2-6)。lead 已核证 #194 route 生产注册、FX-5 持全 payload、shared contract 冻结整 record payload。诚实 inventory(R2-6 逐文件清单,可逐项打勾):
 
-方案 A 演进 #194 PATCH payload(整 record → field-level ops)的破坏面(**非零**):
+方案 A 演进 #194 PATCH payload(整 record → field-level ops)的破坏面(**非零**,R2-6 逐文件):
 
-| 破坏面 | 证据(▲lead 核证) | 影响 |
-|---|---|---|
-| **#194 route 生产注册** | `server/routes/canvas.ts:450-522`:`route.patch('/:id/nodes/:nodeId',...)` + `validateChildPayload` + `backend.upsertChild` + `payload-rejected 400` | route 已在生产;payload schema 演进须改 `validateChildPayload`(白名单→field-level op schema) |
-| **shared contract 冻结整 record** | `shared/persist-contract.ts:76`:`NodePayload = Omit<NodeRecord,'id'|'revision'>`;注释"payload 不携带 id/revision,防双真相" | NodePayload 形状演进(field-level ops);UpsertRequest/validator 同步;contract test 重写 |
-| **FX-5 WriteOp 持全 payload** | `src/lib/writeRetryQueue.ts:16-19`:`WriteOp = { kind:'upsertNode'; payload: NodePayload }` | **旧 IDB queued body 打新 endpoint = 400 `payload-rejected`(非 409 refetch)**;v1 "FX-5 不动"错。需 FX-5 队列迁移(旧 body→新 op schema) |
-| 双 backend + adapter | `serverPersistAdapter` + `unwired`/pg backend | `upsertNode`/`reorderChildren` 签名演进(field-level merge) |
-| retry queue | `writeRetryQueue` | 队列迁移 + stale client 明确错误 |
-| 定向回归 | 117 项(契约+集成) | `UpsertResponse` 扩 `seq` 打破 exact type test(`serverPersistAdapter.contract.test.ts:46`) |
+| # | 文件 | 改动点 | 证据(▲lead 核证 / grep) | ☑ |
+|---|---|---|---|---|
+| 1 | `server/routes/canvas.ts` | `route.patch('/:id/nodes/:nodeId')` + `validateChildPayload` 白名单→field-level op schema;`backend.upsertChild` 调用;`payload-rejected 400` | `:450-522` route 生产注册 | ☑ |
+| 2 | `server/persist/backend.ts` | `upsertChild` 签名演进(整 record → field-level merge);`UpsertResponse` 扩 `seq` | grep `upsertChild` | ☑ |
+| 3 | `server/persist/pgBackend.ts` | PG backend `upsertChild` 同步签名;field-level merge 实现 | grep `upsertChild` | ☑ |
+| 4 | `server/lib/persistHttp.ts` | HTTP persist helper 适配 field-level op | grep `upsertChild\|NodePayload` | ☑ |
+| 5 | `server/routes/userState.ts` | userState route 适配(若引用 upsertChild) | grep `upsertChild` | ☑ |
+| 6 | `shared/persist-contract.ts` | `NodePayload`/`UpsertRequest`/`UpsertResponse` 形状演进(field-level ops);注释"防双真相" | `:76` NodePayload 冻结 | ☑ |
+| 7 | `src/lib/serverPersistAdapter.ts` | `upsertNode`/`reorderChildren` 签名演进(field-level merge);`unwiredServerPersistAdapter` 同步 | grep `upsertNode` | ☑ |
+| 8 | `src/lib/writeRetryQueue.ts` | `WriteOp = {kind:'upsertNode'; payload:NodePayload}` → field-level op;**FX-5 队列迁移**(旧 IDB queued body → 新 op schema,stale client 旧 body 打新 endpoint = 400 payload-rejected) | `:16-19` 持全 payload | ☑ |
+| 9 | `src/lib/serverPersistAdapter.contract.test.ts` | `UpsertResponse` 扩 `seq` 打破 exact type test;契约测试重写 | `:46` exact type | ☑ |
+| 10 | `server/persist/backend.test.ts` | upsertChild 单测同步 | grep | ☑ |
+| 11 | `server/persist/backend.pg.test.ts` | PG backend upsertChild 测试同步 | grep | ☑ |
+| 12 | `server/persist/backend.contract.dual.test.ts` | 双 backend 契约测试同步 | grep | ☑ |
+| (13) | `src/lib/writeRetryQueue.test.ts` | WriteOp 队列测试同步 | grep | ☑ |
 
-**措辞修正**:v1 "零破坏面、无迁移窗口" → v2 "**前端主路径未接线(`unwiredServerPersistAdapter`),但契约/服务端破坏面非零(≥12 文件 + FX-5 队列迁移 + 117 项定向回归)**"。
+**117 项定向回归冻结命令**(R2-6 要求可执行命令集合):
 
-**cutover 选项**(证明不了零调用则选其一):
-- **versioned endpoint/payload**:`POST /nodes/:nodeId/ops`(versioned)+ #194 PATCH 冻结;新旧 decoder 兼容窗。
-- **原子 cutover**:单次部署新旧 decoder 兼容 + FX-5 队列迁移 + stale client 明确错误 + 回滚策略。
+```bash
+# 破坏面全量调用面审计(grep 12 文件)
+grep -rn 'upsertChild\|validateChildPayload\|NodePayload\|UpsertRequest\|UpsertResponse\|WriteOp.*upsertNode' src/ server/ shared/ --include='*.ts'
+# 定向回归测试集(契约 + 集成 + 队列,117 项)
+npm test -- src/lib/serverPersistAdapter.contract.test.ts server/persist/backend.test.ts server/persist/backend.pg.test.ts server/persist/backend.contract.dual.test.ts src/lib/writeRetryQueue.test.ts
+```
 
-> 注:**"无双协议窗口"仍成立**(#194 `unwiredServerPersistAdapter` 未接线 → 原地演进,无双 endpoint 并存);但"零破坏"不成立。Gate6 判决据此重评分(§2 Gate6)。
+**措辞修正**:v1 "零破坏面、无迁移窗口" → v3 "**前端主路径未接线(`unwiredServerPersistAdapter`),但契约/服务端破坏面非零(逐文件清单 12 项 + FX-5 队列迁移 + 117 项定向回归)**"。
+
+**cutover 方案拍死(R2-6:选一个,说理由)**:**原子 cutover**(非 versioned endpoint)。理由:
+1. **无双协议窗口成立**:#194 `unwiredServerPersistAdapter` 前端未接线 → 原地演进,无新旧 endpoint 并存窗口 → 不付双 endpoint 王税。
+2. **单次部署切 schema**:部署带 feature flag(`FIELD_LEVEL_OPS=on`),切 field-level op schema;可切回整 record payload 回滚。
+3. **FX-5 队列一次性迁移**:旧 IDB queued body → 新 op schema 转换(migration on read);stale client(旧 body)打新 endpoint → 400 `payload-rejected` → 明确错误提示 refetch(非 409)。
+4. **回滚策略**:feature flag 切回 `FIELD_LEVEL_OPS=off` → 整 record payload decoder;FX-5 队列 migration 可逆(新 op → 旧 body 反向转换)。
+5. **不选 versioned endpoint 的理由**:方案 B(新增 `POST /nodes/:nodeId/ops` versioned + #194 冻结)付双 endpoint 税,但 #194 前端未接线 → 方案 B 无"不动 #194"收益,纯增成本。
+
+> 注:**"无双协议窗口"仍成立**(原子 cutover + #194 unwired → 原地演进,无双 endpoint 并存);但"零破坏"不成立(逐文件 12 项 + FX-5 迁移 + 117 项回归)。Gate6 判决据此(§2 Gate6)。
 
 ---
 
@@ -147,13 +169,13 @@
 - ●真实 PG(`server/__tests__/n20-pg-tx-fault.spike.test.ts`,本地 PG 55443 实跑):
   - `PG-T1` 原子提交:BEGIN 删 n1+级联 edges + COMMIT → 全删,e3 保留。
   - `PG-T2` fault injection:BEGIN 删 edges + 注入 1/0 + ROLLBACK → n1 与 edges 全在(无 partial)。
-  - `PG-T3` asset saga 跨介质:删 n1 + 减 asset refcount 同事务;fault → 两边不动。
+  - `PG-T3` **同库资产元数据**(R2-1 改名,非"跨介质"):删 n1 + 减 asset refcount 同事务(同一 client);fault → 两边不动。真跨介质(PG + 文件系统/对象存储)非本探针 — Figma 靠 saga 补偿(非真原子),Yjs 无方案。
   - `PG-T4` 对照:无事务时删 edges 后崩溃 → partial(证明事务必要性)。
 - ●FieldLevelServer 集成:`G3-1`(删 n1 → e1/e2 级联删,e3 保留)、`G3-2`(delete wins,update 落 not-found)。
 
 **成本**:Figma 式 server-side PG 事务(可跨多 record/跨表原子,PG-T1~T4 证);Yjs intra-doc 原子(G3-real-1)但**跨 Y.Doc/跨文件资产 非原子**(G3-real-3)——node+edge 跨 canvas、result+asset 跨介质,Yjs 无共享事务。
 
-**go/no-go**:**Figma GO**。优势**缩窄**为"跨介质/跨 doc 边界"(非 v1 "CRDT 无原子多 record"绝对表述);intra-doc 原子 Yjs 也有,诚实承认。
+**go/no-go**:**平局(R2-1)**。intra-doc/intra-DB 原子两案一致(G3-real-1 真 Yjs doc.transact / PG-T1~T3 同一 client pool.connect+finally release 已验);跨介质 Figma=saga 补偿非真原子、Yjs=无方案 — 非相对优势。原 v2 "Figma 占优"降为平局(诚实);PG-T3 改名"同库资产元数据"(非跨介质)。
 
 ### Gate 4 · revision × 属性 LWW 兼容协议 — P1-6 诚实化
 
@@ -187,7 +209,7 @@
 - `5-5` authz(非 member → 403 forbidden)。
 - `5-6` slow consumer 有界(backlog 超 MAX_BACKLOG → drop oldest,不 OOM)。
 
-**仓库侧协议/头分析**:`owner.ts` 全 HTTP-header-based(`x-mivo-auth-user` + `x-mivo-gateway-secret` fail-closed);SSE = plain HTTP GET + `text/event-stream`,**任何 HTTP 网关必透传**;WS upgrade 需网关注入同链到 handshake。
+**仓库侧协议/头分析(R2-2)**:`owner.ts` 全 HTTP-header-based(`x-mivo-auth-user` + `x-mivo-gateway-secret` fail-closed);SSE = plain HTTP GET + `text/event-stream`,网关**应**透传(plain HTTP)但生产可能缓冲/超时(○条件式,R2-2,非"任何网关必透传");WS upgrade 需网关注入同链到 handshake。
 
 | 维度 | Figma 式 | Yjs |
 |---|---|---|
@@ -195,7 +217,7 @@
 | 网关 WS 不放行时 | SSE fallback 仍可用(plain HTTP) | 需 polling fallback,失 CRDT 实时价值 |
 | auth 复用 | 复用 #194 SSO header 链(SSE 同链) | WS handshake 需网关注入(未验证) |
 
-**go/no-go**:**Figma 式 REST+SSE GO**。**网关 gate 判决**:Figma 式不依赖 WS 网关验证(SSE 走 HTTP 必透传,5-1~6 真实验证 framing/heartbeat/since/revoke/authz/slow-consumer);Yjs 依赖 WS 网关放行(○条件式未验证)→ 网关 gate 对 Yjs 不利、对 Figma 式中性。
+**go/no-go**:**条件式 GO(R2-2)**。Figma 式 REST+SSE:5-1~7 真实验证(**live push 5-7 + desiredSize backpressure 5-6 + gateway-secret authz seam 5-5**,复用 owner.ts fail-closed 模式;非 v2 直信 x-mivo-auth-user)。**网关 gate 条件式**:网关对 `text/event-stream` buffering/超时 = ○条件式留 lead 生产实测(非"任何网关必透传"——生产网关可能缓冲);不影响 Figma 选型(SSE fallback 兜底),只影响实时性调优。Yjs 依赖 WS 网关放行(亦条件式未验证)。
 
 **未验证项(○条件式,留 lead 生产实测,§12)**:
 1. 生产 SSO 网关是否代理 WS upgrade + 注入 `x-mivo-auth-user`/`x-mivo-gateway-secret`(条件式:做到→N2-2 上 WS 优化;做不到→SSE 兜底,**Figma 选型不变**)。
@@ -227,11 +249,11 @@
 
 **v1→v2 修正(P2-7)**:v1 G7 压缩/断流/存储对比无真实证据;snapshot 是一个数字,截断后 `pullSince(0)` 静默丢前 950 条无 gap 信号;revoke 只删内存 callback,被撤 actor 仍可写;"Y.Doc 全 op log 重放"不准确。**返修**:`G7-hard-1~4`。
 
-**证据**(★真实库对照):
-- `G7-hard-1` **logFloor + gap 协议**:`pullSinceWithGap(since)`,since<floor → gap=true + snapshot(客户端必须 reset);since>=floor → 增量。**推翻 v1 `pullSince(0)` 静默丢前 950 条**。
-- `G7-hard-2` **恢复等价**:live A 与崩溃重连 B(经 snapshot+gap 恢复)最终态一致。
-- `G7-hard-3` **post-revoke 写拒绝**:`removeMember` 后 `applyOpAuthz` → `forbidden`(**不只断流,还拒写**;推翻 v1"只删内存 callback")。
-- `G7-hard-4` **bytes 级存储对比**(★真实 `encodeStateAsUpdate`):同 1000 op 工作量,**yjsWithGc=58B < yjsNoGc=5954B < figmaCompressed=8637B**。
+**证据**(★真实库对照仅 G7-hard-4;G7-hard-1~3 降 ●/○ 自建 server 无 Yjs 对照,R2-7):
+- `G7-hard-1`(●自建) **logFloor + gap 协议**:`pullSinceWithGap(since)`,since<floor → gap=true + snapshot(客户端必须 reset);since>=floor → 增量。**推翻 v1 `pullSince(0)` 静默丢前 950 条**。
+- `G7-hard-2`(●自建) **恢复等价**:live A 与崩溃重连 B(经 snapshot+gap 恢复)最终态一致(**无 Yjs 对照,无恢复耗时对比**,R2-7)。
+- `G7-hard-3`(●自建) **post-revoke 写拒绝**:`removeMember` 后 `applyOpAuthz` → `forbidden`(**不只断流,还拒写**;推翻 v1"只删内存 callback";**无 Yjs provider revoke 对照**)。
+- `G7-hard-4`(★真实 `encodeStateAsUpdate`) **bytes 级存储对比**:同 1000 op 工作量,**yjsWithGc=58B < yjsNoGc=5954B < figmaCompressed=8637B**。
 
 | 维度 | Figma 式 | Yjs |
 |---|---|---|
@@ -250,11 +272,11 @@
 
 **成本**:Figma 式 op log + 周期 snapshot+truncate(server 控制)+ revoke 直观。Yjs:Y.Doc GC 复杂(N1 Q3/Q10)+ revoke 难(共享 doc)。
 
-**go/no-go**:**Figma GO**(revoke 简单 + 可预测存储控制 + 无未压测渲染路径)。**优势从 v1 "存储更小" 修正为 "revoke 简单 + 可预测控制"**(诚实)。
+**go/no-go**:**平局(R2-7)**。存储:G7-hard-4 ★真测 Yjs 有 GC 时 bytes 更小(yjsWithGc=58B < figmaCompressed=8637B)——非 Figma 存储优势。revoke:Figma 简单(连接绑 actor+canvas)= ●/○ 设计推理(G7-hard-1~3 自建 server 无 Yjs 对照,原标 ★ 虚标已降);Yjs revoke 难(doc 级访问控制)。恢复:无耗时对比(两案均未跑生产恢复耗时)。**Gate7 平局**:存储 Yjs 优、revoke Figma 优、恢复无对比——非任一方相对全优势。优势从 v1 "存储更小" → v3 "revoke 简单(●/○ 非对照实证)+ 可预测控制"——诚实承认非存储优势。
 
 ---
 
-## 3. v1→v2 被推翻/修正表述清单(诚实)
+## 3. v1→v3 被推翻/修正表述清单(诚实,R2 增补)
 
 | v1 表述 | v2 修正 | 推翻证据(强度) |
 |---|---|---|
@@ -279,12 +301,21 @@
 | §10 数组无中性 intent | by-stable-id insert/remove/splice(对齐 G1-b R2-P1-1) | `S10-7`(●) |
 | §10 create→edit 无因果 | 同 record FIFO(pending create ack 前 hold edit,对齐 G1-b R2-P1-2) | `S10-8`(●) |
 | §10 DELETE 无 cursor/404 边界 | accepted 必携 seq;幂等已删返 cursor;404→rejected(对齐 G1-b R2-P1-3) | `S10-9`(●) |
+| v2 Gate3 "Figma 占优(跨介质边界)" | v3 **平局**(R2-1):intra 原子两案一致;跨介质 Figma=saga 非真原子、Yjs=无方案;PG-T3 改名同库资产元数据;PG-T 同一 client(pool.connect+finally release) | `PG-T1~T3`(●同 client)+ `G3-real-1`(★) |
+| v2 Gate5 "SSE skeleton replay + 直信 x-mivo-auth-user + 任何网关必透传" | v3 **条件式 GO**(R2-2):live push 5-7 + desiredSize backpressure 5-6 + gateway-secret authz seam 5-5(复用 owner.ts fail-closed);网关 SSE buffering 改条件式(非"必透传") | `5-1~7`(●真实集成) |
+| v2 §10 trustify 无 header 参数(opId 实取 body)+ DomainOp 带 recordId + clock 内存 Map + batch 逐条 mutate | v3 **真三层**(R2-3):trustify 注入 idempotency-key header(opId 单一权威,弃 body.opId);DomainOp 中性 delta(无 recordId/actor/base/opId,adapter 注入);clock PG field_clock schema + 客户端 base.clock;batch 真单事务(staging+commitStaged,无 partial);immutable/atomic leaf 表 + idempotent replay | `S10-2/3/4/5/10/11`(●) |
+| v2 §10 数组写死 {id:string} + FieldPath 只堵 [] | v3 **三类数组 + leaf validator**(R2-4):by-id(有 stable-id)/whole-lww(无 stable-id markupPoints)/primitive(resultNodeIds string[]);setByPath 拒 ['transform']+整对象 clobber(对照 mivoCanvas.ts:69-74,249) | `S10-6/7`(●) |
+| v2 restore 直调 applyOpAuthz(B 收不到 overwritten,lastWriter 错停) | v3 **restore 走 overwrite 管线**(R2-5):败方(当前 lastWriter)收 overwritten;lastWriter 链持续 | `T1-2/T1-5`(●) |
+| v2 §1.2 "≥12 文件" + 117 项无命令 + cutover 二选一未决却称"无双协议窗口" | v3 **逐文件 12 项清单 + 冻结命令 + cutover 拍死原子**(R2-6):无双协议窗口保留(原子 cutover + #194 unwired) | §1.2 inventory(▲lead 核证) |
+| v2 Gate7 G7-hard-1~3 标 ★(自建 server 无 Yjs 对照,虚标) | v3 **降 ●/○**(R2-7);仅 G7-hard-4 ★真测;Gate7 重评平局 | `G7-hard-1~3`(●/○)+ `G7-hard-4`(★) |
+| v2 隐含"Yjs 无原生 coalescing" | v3 修正:Yjs 有 UndoManager captureTimeout 合并(M5 证两案一致,非"无原生 coalescing") | `M5`(★真 Y.UndoManager) |
+| v2 "任何 HTTP 网关必透传 SSE" | v3 改条件式:网关应透传(plain HTTP)但生产可能缓冲/超时(○条件式留 lead 实测) | §2 Gate5 仓库侧分析(R2-2) |
 
 ---
 
-## 4-9. PoC 清单与实跑结果(51 tests 全绿)
+## 4-9. PoC 清单与实跑结果(55 tests 全绿)
 
-**文件**:`src/kernel/__spike__/n20-truth-source.spike.test.ts`(41)+ `server/__tests__/n20-sse-route.spike.test.ts`(6)+ `server/__tests__/n20-pg-tx-fault.spike.test.ts`(4)。
+**文件**:`src/kernel/__spike__/n20-truth-source.spike.test.ts`(44)+ `server/__tests__/n20-sse-route.spike.test.ts`(7)+ `server/__tests__/n20-pg-tx-fault.spike.test.ts`(4)。
 
 ### 4.1 原 PoC(15 tests,v1 已有)
 
@@ -342,15 +373,24 @@
 | S10-8 create→edit 因果 FIFO | P2-8 | §10 | `order==['create:init','edit:edited']` | ● |
 | S10-9 DELETE cursor/404 边界 | P2-8 | §10 | `成功+幂等返 seq;从未存在→not-found` | ● |
 
-### 4.4 真实 SSE route 集成(6 tests,前任 worker)
+### 4.4 真实 SSE route 集成(6 tests,前任 worker;R2 增 5-7 live push 见 §4.6)
 
-见 Gate5 §2(5-1 content-type/framing、5-2 heartbeat、5-3 since 补拉、5-4 revoke 断流、5-5 authz 403、5-6 slow consumer 有界)。强度 ●。
+见 Gate5 §2(5-1 content-type/framing、5-2 heartbeat、5-3 since 补拉、5-4 revoke 断流、5-5 authz 403、5-6 slow consumer 有界;5-7 live push 见 §4.6 R2 增补)。强度 ●。
 
 ### 4.5 真实 PG fault injection(4 tests,前任 worker,本地 PG 55443 实跑)
 
-见 Gate3 §2(PG-T1 原子提交、PG-T2 fault ROLLBACK、PG-T3 asset saga 跨介质、PG-T4 无事务 partial 对照)。强度 ●。
+见 Gate3 §2(PG-T1 原子提交、PG-T2 fault ROLLBACK、PG-T3 同库资产元数据(R2-1 改名,非跨介质)、PG-T4 无事务 partial 对照)。强度 ●。
 
-**实跑汇总**:`51 pass / 0 skip / 0 fail`。`tsc -b` 0 errors;`eslint` 干净;`npm run build` exit 0;`grep -roE 'yjs|lib0|YEvent|applyUpdate|AbstractType|encodeStateAsUpdate' dist/` 零命中(yjs 不进生产 bundle)。
+### 4.6 R2 增补探针(4 tests:3 spike + 1 SSE,R2 返修新增)
+
+| PoC | finding | gate | 断言 | 强度 |
+|---|---|---|---|---|
+| T1-5 restore 走 overwrite 管线全链(A写→B写→A restore→B收 notice→B后续写→A收 notice) | R2-5 | 1 | `overwrittenTo==='bob' && aliceInbox.length===2 && bobInbox.length===1`(lastWriter 链不断) | ● |
+| S10-10 immutable/atomic leaf 表 | R2-3 | §10 | `immutable 字段 set→throw;atomic-container 整值替换(allowContainerClobber);其余 leaf set ok` | ● |
+| S10-11 idempotent replay | R2-3 | §10 | `同 opId(idempotency-key)replay 不二次 bump revision/seq、不二次发事件` | ● |
+| 5-7 SSE live push(建连后 push→response body 实收) | R2-2 | 5 | `chunks 含 'live-value' && op.value==='live-value'`(非建连前 replay) | ● |
+
+**实跑汇总**:`55 pass / 0 skip / 0 fail`(spike 44 + SSE 7 + PG 4,本地 PG port 55443 实跑 MIVO_PG_TEST=1,PG-T1~T4 同一 client 真 pass)。`tsc -b` 0 errors;`eslint` 干净;`npm run build` exit 0(567ms);`grep -roE 'yjs|lib0|YEvent|applyUpdate|AbstractType|encodeStateAsUpdate' dist/` 零命中(yjs 不进生产 bundle)。
 
 ---
 
@@ -472,11 +512,11 @@ type TrustedFieldOp = { opId; clientId; actor(trusted); recordId(trusted); baseR
 
 ## 附:spike 文件结构索引
 
-- `src/kernel/__spike__/n20-truth-source.spike.test.ts`(41 tests):
-  - `makeNode` fixture + `setByPath`/`getByPath`/`fieldKeyOf`(硬化:拒原型污染 S10-1 + 拒空路径 S10-6)
-  - `FieldLevelServer`:applyOp/applyOpAuthz(返 forbidden,G7-hard-3)/ deleteNodeCascade / **deleteNodeCascadeWithCursor**(S10-9)/ pullSinceWithGap(logFloor/gap,G7-hard-1)/ compress / snapshot / addMember/removeMember / storageBytes / deletedTombstones
-  - `CommandUndoStack`(原 PoC)+ `ConditionalUndoStack`(返修:条件逆运算 P1-1)+ `TextLwwWithOverwrite`(P1-4 B 方案)
+- `src/kernel/__spike__/n20-truth-source.spike.test.ts`(44 tests):
+  - `makeNode` fixture + `setByPath`/`getByPath`/`fieldKeyOf`(硬化:拒原型污染 S10-1 + 拒空路径 S10-6 + R2-4 leaf validator 拒整对象 clobber S10-6)
+  - `FieldLevelServer`:applyOp/applyOpAuthz(返 forbidden,G7-hard-3)/ deleteNodeCascade / **deleteNodeCascadeWithCursor**(S10-9)/ pullSinceWithGap(logFloor/gap,G7-hard-1)/ compress / snapshot / addMember/removeMember / storageBytes / deletedTombstones / **staging+commitStaged**(R2-3 batch 真单事务 S10-5)
+  - `CommandUndoStack`(原 PoC)+ `ConditionalUndoStack`(返修:条件逆运算 P1-1)+ `TextLwwWithOverwrite`(P1-4 B 方案,**restore 走 overwrite 管线全链 R2-5 T1-5**)
   - `yjsMatrixSetup`(真 Yjs UndoManager 同矩阵 helper)
-  - G4+G1(5)/ G3(2)+G3-real(3)/ G2(2)+M1-M6(6)/ G7(3)+G7-hard(4)/ G5(1)/ antiYjs(2)/ S10(5)+S10-6~9(4)/ T1(4) = **41 tests**
-- `server/__tests__/n20-sse-route.spike.test.ts`(6 tests):真实 Hono SSE route(content-type/heartbeat/since/revoke/authz/slow-consumer)
-- `server/__tests__/n20-pg-tx-fault.spike.test.ts`(4 tests):真实 PG transaction fault injection(原子提交/fault ROLLBACK/asset saga/无事务 partial 对照;本地 PG 55443 实跑转 pass)
+  - G4+G1(5)/ G3(2)+G3-real(3)/ G2(2)+M1-M6(6)/ G7(3)+G7-hard(4)/ G5(1)/ antiYjs(2)/ S10(5)+S10-6~9(4)/ T1(4)+**T1-5(R2-5)**/ **S10-10 immutable/atomic leaf(R2-3)**/ **S10-11 idempotent replay(R2-3)** = **44 tests**
+- `server/__tests__/n20-sse-route.spike.test.ts`(7 tests):真实 Hono SSE route(content-type/heartbeat/since/revoke/authz/slow-consumer + **5-7 live push R2-2**)
+- `server/__tests__/n20-pg-tx-fault.spike.test.ts`(4 tests):真实 PG transaction fault injection(原子提交/fault ROLLBACK/同库资产元数据(R2-1 改名)/无事务 partial 对照;本地 PG 55443 实跑 MIVO_PG_TEST=1 转 pass;**全部 PG-T 同一 client pool.connect+finally release**)
