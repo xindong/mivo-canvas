@@ -190,7 +190,7 @@ try {
   }
 
   const [nodeRegistrySource, actionModelSource, bffConfigSource, modelCapabilitiesSource] = await Promise.all([
-    readFile('src/canvas/nodeTypes/canvasNodeRegistry.ts', 'utf8'),
+    readFile('src/model/canvasNodeRegistry.ts', 'utf8'),
     readFile('src/canvas/actions/canvasActionModel.ts', 'utf8'),
     readFile('server/lib/config.ts', 'utf8'),
     readFile('src/lib/modelCapabilities.ts', 'utf8'),

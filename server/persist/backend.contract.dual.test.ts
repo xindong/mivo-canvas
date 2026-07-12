@@ -9,7 +9,7 @@
 //
 // PG gate:`MIVO_PG_TEST=1`(本地 brew PG,见 docs/decisions/pg-backend-schema.md §7);CI 无 PG → 跳过 PG describe,内存套件仍必跑。
 
-import { describe, it, expect, beforeEach, beforeAll, afterAll } from 'vitest'
+import { describe, it, expect, beforeEach, beforeAll, afterAll, afterEach } from 'vitest'
 import { InMemoryPersistBackend, fingerprintOfBody, type PersistBackend, type PersistType } from './backend'
 import { PgPersistBackend } from './pgBackend'
 
@@ -282,6 +282,228 @@ const runPersistBackendContractSuite = (
       expect((await rec('chat-collection', 'c1')).isDeleted).toBe(false)
     })
   })
+
+  describe(`${label} — DP-6R chat per-actor(私有 + 不 bump 共享 cv + 删/恢复不串)`, () => {
+    let b: PersistBackend
+    const canvasRec = async () => {
+      const r = await b.get('o', 'canvas', 'c1')
+      if (r.kind !== 'found') throw new Error('canvas c1 missing')
+      return r.record
+    }
+    beforeEach(async () => {
+      b = makeBackend()
+      await resetBackend(b)
+    })
+
+    it('两 actor 同 canvas 拥同 messageId 各自独立(per-actor namespace);listByCanvas 只见自己', async () => {
+      await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+      await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      // 两 actor 各 POST 同 id 'm1'(per-actor namespace:PK=(actor,'chat-message','m1'))
+      const aA = await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm1', { text: 'A' }, { method: 'POST', resourceKind: 'chat-message' })
+      expect(aA.kind).toBe('created')
+      const aB = await b.ensureCreateChild('actorB', 'c1', 'chat-message', 'm1', { text: 'B' }, { method: 'POST', resourceKind: 'chat-message' })
+      expect(aB.kind).toBe('created') // 同 id 不撞(per-actor)
+      // 各自 GET 只见自己 + payload 不串
+      const listA = await b.listByCanvas('actorA', 'c1', 'chat-message')
+      const listB = await b.listByCanvas('actorB', 'c1', 'chat-message')
+      expect(listA.records.map((r) => r.id)).toEqual(['m1'])
+      expect(listB.records.map((r) => r.id)).toEqual(['m1'])
+      expect((listA.records[0].payload as { text: string }).text).toBe('A')
+      expect((listB.records[0].payload as { text: string }).text).toBe('B')
+      // canvas owner('o')GET chat → 空(owner 自己没写过 chat;旧 owner chat 才在 'o' 名下,见下条)
+      expect((await b.listByCanvas('o', 'c1', 'chat-message')).records).toHaveLength(0)
+    })
+
+    it('chat 写入不 bump 共享 canvas contentVersion(node 写入仍 bump)', async () => {
+      await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+      await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      const cv0 = (await canvasRec()).payload as { contentVersion?: number }
+      expect(cv0.contentVersion ?? 0).toBe(0)
+      // chat 写入(actor)→ 不 bump 共享 cv
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm1', { text: 'hi' }, { method: 'POST', resourceKind: 'chat-message' })
+      const cv1 = (await canvasRec()).payload as { contentVersion?: number }
+      expect(cv1.contentVersion ?? 0).toBe(0) // chat 不 bump
+      // node 写入(canvas owner)→ bump 共享 cv
+      await b.upsertChild('o', 'c1', 'node', 'n1', { id: 'n1' }, { method: 'PATCH', resourceKind: 'node' })
+      const cv2 = (await canvasRec()).payload as { contentVersion?: number }
+      expect(cv2.contentVersion ?? 0).toBe(1) // node bump
+      // PATCH/DELETE chat 也不 bump
+      await b.upsertChild('actorA', 'c1', 'chat-message', 'm1', { text: 'edit' }, { method: 'PATCH', resourceKind: 'chat-message', base: 0 })
+      await b.hardDeleteChild('actorA', 'c1', 'chat-message', 'm1')
+      const cv3 = (await canvasRec()).payload as { contentVersion?: number }
+      expect(cv3.contentVersion ?? 0).toBe(1) // chat edit/delete 不 bump,node 的 cv 保留
+    })
+
+    it('hardDeleteChild 只删 actor 自己的(非己 msgId → deleted=false,不触他人)', async () => {
+      await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+      await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm1', { text: 'A' }, { method: 'POST', resourceKind: 'chat-message' })
+      await b.ensureCreateChild('actorB', 'c1', 'chat-message', 'm1', { text: 'B' }, { method: 'POST', resourceKind: 'chat-message' })
+      // actorB 删 'm1'(actorB 的)→ deleted=true;actorA 的 m1 不受影响
+      const delB = await b.hardDeleteChild('actorB', 'c1', 'chat-message', 'm1')
+      expect(delB.deleted).toBe(true)
+      expect((await b.listByCanvas('actorA', 'c1', 'chat-message')).records).toHaveLength(1) // A 的 m1 在
+      expect((await b.listByCanvas('actorB', 'c1', 'chat-message')).records).toHaveLength(0) // B 的删了
+      // actorA 删 'mX'(不存在于 A)→ deleted=false
+      const delMiss = await b.hardDeleteChild('actorA', 'c1', 'chat-message', 'mX')
+      expect(delMiss.deleted).toBe(false)
+    })
+
+    it('P1-2:reorderChildren chat per-actor 独立 orderRevision compare+bump;不 bump 共享 cv;A/B 互不冲突', async () => {
+      await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+      await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm1', { text: '1' }, { method: 'POST', resourceKind: 'chat-message' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm2', { text: '2' }, { method: 'POST', resourceKind: 'chat-message' })
+      await b.ensureCreateChild('actorB', 'c1', 'chat-message', 'm1', { text: 'B1' }, { method: 'POST', resourceKind: 'chat-message' })
+      // node 写一次 bump 共享 cv → 1(chat 不 bump cv);chat orderRevision 仍 0(初始,与共享 cv 解耦)。
+      await b.upsertChild('o', 'c1', 'node', 'n1', { id: 'n1' }, { method: 'PATCH', resourceKind: 'node' })
+      const cvBefore = (((await canvasRec()).payload) as { contentVersion?: number }).contentVersion ?? 0
+      expect(cvBefore).toBe(1)
+      expect(await b.getChatOrderRevision('actorA', 'c1')).toBe(0) // chat orderRevision 初始 0,非共享 cv
+      // actorA reorder 自己的 [m1,m2]→[m2,m1](base=0=chat orderRevision,**非**共享 cv=1)→ ok,bump orderRevision→1
+      const r = await b.reorderChildren('actorA', 'c1', 'chat-message', ['m2', 'm1'], { base: 0 })
+      expect(r.kind).toBe('ok')
+      if (r.kind === 'ok') expect(r.contentVersion).toBe(1) // bump 后 chat orderRevision=1
+      expect(await b.getChatOrderRevision('actorA', 'c1')).toBe(1)
+      // 共享 cv 未被 chat reorder 改(仍 1)
+      const cvAfter = (((await canvasRec()).payload) as { contentVersion?: number }).contentVersion ?? 0
+      expect(cvAfter).toBe(cvBefore)
+      // actorA 顺序变了;actorB 不受影响(仍 [m1])
+      expect((await b.listByCanvas('actorA', 'c1', 'chat-message')).records.map((r) => r.id)).toEqual(['m2', 'm1'])
+      expect((await b.listByCanvas('actorB', 'c1', 'chat-message')).records.map((r) => r.id)).toEqual(['m1'])
+      // actorB reorder 自己的 [m1](base=0=actorB 的 orderRevision,A 的 bump 不影响 B 独立 cursor)→ ok
+      expect(await b.getChatOrderRevision('actorB', 'c1')).toBe(0)
+      const rB = await b.reorderChildren('actorB', 'c1', 'chat-message', ['m1'], { base: 0 })
+      expect(rB.kind).toBe('ok')
+      if (rB.kind === 'ok') expect(rB.contentVersion).toBe(1) // B 独立 cursor bump→1
+    })
+
+    it('R2-P1-1:同 actor 同 base 真 Promise.all 并发 reorder——kinds 恰为 {ok, conflict}(双后端一致)', async () => {
+      await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+      await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm1', { text: '1' }, { method: 'POST', resourceKind: 'chat-message' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm2', { text: '2' }, { method: 'POST', resourceKind: 'chat-message' })
+      // R2-P1-1:真并发(Promise.all,非顺序 await)。两同 base=0:赢家 CAS 抢中(rev→1);输家 CAS 见 rev=1≠0 → conflict。
+      // PG 单语句 INSERT...ON CONFLICT WHERE revision=base 经 PK arbiter 串行;memory 同步临界区。kinds 恰 {ok, conflict}。
+      const [r1, r2] = await Promise.all([
+        b.reorderChildren('actorA', 'c1', 'chat-message', ['m2', 'm1'], { base: 0 }),
+        b.reorderChildren('actorA', 'c1', 'chat-message', ['m2', 'm1'], { base: 0 }),
+      ])
+      expect([r1.kind, r2.kind].sort()).toEqual(['conflict', 'ok'])
+      const loser = r1.kind === 'conflict' ? r1 : r2
+      if (loser.kind === 'conflict') expect(loser.currentContentVersion).toBe(1) // 当前 orderRevision=1 供 client rebase
+    })
+
+    it('R2-P1-1:缺行(stale base≠0)→ conflict,不 INSERT(双后端一致;防 PG 缺行 INSERT 无条件成功)', async () => {
+      await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+      await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm1', { text: '1' }, { method: 'POST', resourceKind: 'chat-message' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm2', { text: '2' }, { method: 'POST', resourceKind: 'chat-message' })
+      // 无前置 reorder → chat_order_revisions 缺行,equiv current=0。client 持 stale base=7(误以为有人 reorder 过)。
+      // 双后端契约:缺行 + base≠0 → conflict(current=0),绝不 INSERT——否则 PG 缺行无条件 INSERT→ok,与 memory 分歧。
+      const r = await b.reorderChildren('actorA', 'c1', 'chat-message', ['m2', 'm1'], { base: 7 })
+      expect(r.kind).toBe('conflict')
+      if (r.kind === 'conflict') expect(r.currentContentVersion).toBe(0)
+      // orderRevision 仍 0(未 INSERT 未 bump)
+      expect(await b.getChatOrderRevision('actorA', 'c1')).toBe(0)
+    })
+
+    it('R2-P1-1 附带:orderRevision 软删/恢复 保留不复位(防 ABA);restore 后 stale base 仍 conflict,base=current 仍 ok', async () => {
+      await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+      await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm1', { text: '1' }, { method: 'POST', resourceKind: 'chat-message' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm2', { text: '2' }, { method: 'POST', resourceKind: 'chat-message' })
+      // reorder → rev=1
+      const r1 = await b.reorderChildren('actorA', 'c1', 'chat-message', ['m2', 'm1'], { base: 0 })
+      expect(r1.kind).toBe('ok')
+      expect(await b.getChatOrderRevision('actorA', 'c1')).toBe(1)
+      // 软删 canvas(meta + chat-collection 标删;chat-message 活记录不动;chat_order_revisions **保留不复位**)
+      await b.softDeleteCanvasTree('o', 'c1')
+      expect(await b.getChatOrderRevision('actorA', 'c1')).toBe(1) // 不复位(防 ABA:不回 0)
+      // 恢复 canvas → orderRevision 仍 1
+      await b.restoreCanvasTree('o', 'c1')
+      expect(await b.getChatOrderRevision('actorA', 'c1')).toBe(1)
+      // 防 ABA:stale base=0(来自软删前)不复活 → conflict(current=1≠0)
+      const rStale = await b.reorderChildren('actorA', 'c1', 'chat-message', ['m2', 'm1'], { base: 0 })
+      expect(rStale.kind).toBe('conflict')
+      // 正确 base=1 → ok(bump→2)
+      const rOk = await b.reorderChildren('actorA', 'c1', 'chat-message', ['m1', 'm2'], { base: 1 })
+      expect(rOk.kind).toBe('ok')
+      if (rOk.kind === 'ok') expect(rOk.contentVersion).toBe(2)
+    })
+
+    it('R2-P1-2:listChatWithOrderRevision 返回自洽 (rev, messages) 对——reorder 前后各自自洽(双后端契约)', async () => {
+      await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+      await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm1', { text: '1' }, { method: 'POST', resourceKind: 'chat-message' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm2', { text: '2' }, { method: 'POST', resourceKind: 'chat-message' })
+      // 初始:自洽对 (rev=0, [m1,m2])
+      const before = await b.listChatWithOrderRevision('actorA', 'c1')
+      expect(before.orderRevision).toBe(0)
+      expect(before.records.map((r) => r.id)).toEqual(['m1', 'm2'])
+      // reorder → rev=1, [m2,m1]
+      const r1 = await b.reorderChildren('actorA', 'c1', 'chat-message', ['m2', 'm1'], { base: 0 })
+      expect(r1.kind).toBe('ok')
+      // reorder 后:自洽对 (rev=1, [m2,m1])——不出现 torn(rev 配错序)。
+      // memory 同步临界区(两读间无 await 让出)与 PG 单事务 REPEATABLE READ 快照均保证自洽;
+      // 真并发 barrier(在两读之间确定性暂停并提交 reorder)见 PG 专有套件——不在此用普通 Promise.all 冒充。
+      const after = await b.listChatWithOrderRevision('actorA', 'c1')
+      expect(after.orderRevision).toBe(1)
+      expect(after.records.map((r) => r.id)).toEqual(['m2', 'm1'])
+    })
+
+    it('P1-2:node 写 bump 共享 cv 不使 chat reorder 误 409(解耦);chat reorder 不 bump 共享 cv', async () => {
+      await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+      await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm1', { text: '1' }, { method: 'POST', resourceKind: 'chat-message' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm2', { text: '2' }, { method: 'POST', resourceKind: 'chat-message' })
+      // client A 读到 chat orderRevision=0;期间 node 写多次 bump 共享 cv(1,2,3)。
+      expect(await b.getChatOrderRevision('actorA', 'c1')).toBe(0)
+      await b.upsertChild('o', 'c1', 'node', 'n1', { id: 'n1' }, { method: 'PATCH', resourceKind: 'node' })
+      await b.upsertChild('o', 'c1', 'node', 'n2', { id: 'n2' }, { method: 'PATCH', resourceKind: 'node' })
+      await b.upsertChild('o', 'c1', 'node', 'n3', { id: 'n3' }, { method: 'PATCH', resourceKind: 'node' })
+      expect((((await canvasRec()).payload) as { contentVersion?: number }).contentVersion ?? 0).toBe(3)
+      // chat reorder base=0(orderRevision)仍 ok——node 写 bump 共享 cv 不触 chat orderRevision → 不误 409。
+      const r = await b.reorderChildren('actorA', 'c1', 'chat-message', ['m2', 'm1'], { base: 0 })
+      expect(r.kind).toBe('ok')
+      // 反向:chat reorder 不 bump 共享 cv(仍 3,非 4)
+      expect((((await canvasRec()).payload) as { contentVersion?: number }).contentVersion ?? 0).toBe(3)
+    })
+
+    it('P2-1:chat PATCH strict-update——非己/不存在 msgId → not-found(不 create 己方副本);带 If-Match 也不借 PATCH create', async () => {
+      await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+      await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm1', { text: 'A' }, { method: 'POST', resourceKind: 'chat-message' })
+      // actorB strict-update PATCH 'mX'(B 名下不存在)→ not-found,B collection 不新增副本
+      const bPatch = await b.upsertChild('actorB', 'c1', 'chat-message', 'mX', { text: 'B-copy' }, { method: 'PATCH', resourceKind: 'chat-message', strictUpdate: true })
+      expect(bPatch.kind).toBe('not-found')
+      expect((await b.listByCanvas('actorB', 'c1', 'chat-message')).records).toHaveLength(0)
+      // actorA strict-update PATCH 自己的 m1 base=0 → updated(正确 revision)
+      const aPatch = await b.upsertChild('actorA', 'c1', 'chat-message', 'm1', { text: 'A-edit' }, { method: 'PATCH', resourceKind: 'chat-message', base: 0, strictUpdate: true })
+      expect(aPatch.kind).toBe('updated')
+      // 带 If-Match(base=0)也不能借 PATCH create——strictUpdate 优先,不存在的 mY 仍 not-found
+      const withBase = await b.upsertChild('actorB', 'c1', 'chat-message', 'mY', { text: 'B-copy2' }, { method: 'PATCH', resourceKind: 'chat-message', base: 0, strictUpdate: true })
+      expect(withBase.kind).toBe('not-found')
+      expect((await b.listByCanvas('actorB', 'c1', 'chat-message')).records).toHaveLength(0)
+    })
+
+    it('删/恢复画布不串 actor collection:per-actor chat-message 活记录不动,restore 后各见自己', async () => {
+      await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+      await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'mA', { text: 'A' }, { method: 'POST', resourceKind: 'chat-message' })
+      await b.ensureCreateChild('actorB', 'c1', 'chat-message', 'mB', { text: 'B' }, { method: 'POST', resourceKind: 'chat-message' })
+      // 软删 canvas → canvas meta + chat-collection(under 'o')标删;per-actor chat-message 活记录不动
+      await b.softDeleteCanvasTree('o', 'c1')
+      expect((await canvasRec()).isDeleted).toBe(true)
+      // per-actor chat 仍在(活记录,随父级不可见靠 canvas 软删 + route authz)
+      expect((await b.listByCanvas('actorA', 'c1', 'chat-message', { includeDeleted: true })).records.map((r) => r.id)).toEqual(['mA'])
+      expect((await b.listByCanvas('actorB', 'c1', 'chat-message', { includeDeleted: true })).records.map((r) => r.id)).toEqual(['mB'])
+      // restore canvas → 各 actor chat 仍各自在,不串
+      await b.restoreCanvasTree('o', 'c1')
+      expect((await b.listByCanvas('actorA', 'c1', 'chat-message')).records.map((r) => r.id)).toEqual(['mA'])
+      expect((await b.listByCanvas('actorB', 'c1', 'chat-message')).records.map((r) => r.id)).toEqual(['mB'])
+    })
+  })
 }
 
 // ── memory 后端(永远跑)──────────────────────────────────────────────────────────────
@@ -316,4 +538,106 @@ let pgBackend: PgPersistBackend | undefined
     },
     (b) => b.__reset(),
   )
+
+  // R2-P1-2 真并发 barrier:torn pair 回归的确定性证据(PG 专有;memory 同步临界区无 await 让出点,barrier 无意义)。
+  // barrier 在 listChatWithOrderRevision 的 messages SELECT 完成、orderRevision SELECT 开始之间暂停,
+  // 期间提交 reorder,确定性命中 READ COMMITTED 的撕裂窗口;REPEATABLE READ snapshot 自洽不撕裂。
+  describe('R2-P1-2 真并发 barrier(torn pair 回归;PG 专有)', () => {
+    let b: PgPersistBackend
+    beforeEach(async () => {
+      b = pgBackend!
+      await b.__reset()
+      // 清空 barrier 旋钮防同实例其他用例泄漏(共享 pgBackend 单例)。
+      b.__listChatTornPairTestHooks.afterMessages = undefined
+      b.__listChatTornPairTestHooks.isolationLevel = undefined
+    })
+    afterEach(() => {
+      b.__listChatTornPairTestHooks.afterMessages = undefined
+      b.__listChatTornPairTestHooks.isolationLevel = undefined
+    })
+
+    /** 两读之间确定性暂停的 latch:afterMessages 信号 reached 后等 release;test 在窗口内提交 reorder。 */
+    const makeBarrier = () => {
+      let release = () => {}
+      let signalReached = () => {}
+      const reached = new Promise<void>((r) => {
+        signalReached = r
+      })
+      const releaseP = new Promise<void>((r) => {
+        release = r
+      })
+      return {
+        afterMessages: async () => {
+          signalReached() // messages SELECT 已完成,list 在 orderRevision SELECT 前暂停
+          await releaseP // 等 test 在窗口内提交 reorder 后释放
+        },
+        reached,
+        release: () => release(),
+      }
+    }
+
+    /** 公共 setup:[m1,m2] rev=0 → 首次 reorder → rev=1 [m2,m1](barrier 期间将提交第二次 reorder → rev=2, [m1,m2])。 */
+    const setupReordered = async () => {
+      await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+      await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm1', { text: '1' }, { method: 'POST', resourceKind: 'chat-message' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm2', { text: '2' }, { method: 'POST', resourceKind: 'chat-message' })
+      const r1 = await b.reorderChildren('actorA', 'c1', 'chat-message', ['m2', 'm1'], { base: 0 })
+      expect(r1.kind).toBe('ok')
+    }
+
+    it('green:REPEATABLE READ + barrier——list 自洽(snapshot 冻结于 messages SELECT,见 pre-reorder)', async () => {
+      await setupReordered()
+      const barrier = makeBarrier()
+      b.__listChatTornPairTestHooks.afterMessages = barrier.afterMessages
+      // 启动 list:messages SELECT 完成(=[m2,m1],snapshot 冻结)→ barrier 暂停于 orderRevision SELECT 前。
+      const listP = b.listChatWithOrderRevision('actorA', 'c1')
+      await barrier.reached
+      // 窗口内提交第二次 reorder(base=1 → rev=2, [m1,m2])——独立事务,不阻塞 list 的 ACCESS SHARE。
+      const r2 = await b.reorderChildren('actorA', 'c1', 'chat-message', ['m1', 'm2'], { base: 1 })
+      expect(r2.kind).toBe('ok')
+      if (r2.kind === 'ok') expect(r2.contentVersion).toBe(2)
+      // 释放 list → orderRevision SELECT 见 snapshot 冻结值 rev=1(pre-reorder)。
+      barrier.release()
+      const list = await listP
+      // 自洽 pre-state:(rev=1, [m2,m1])。不出现 torn (rev=2, [m2,m1])(旧 messages 配新 rev 会绕过乐观锁)。
+      expect(list.orderRevision).toBe(1)
+      expect(list.records.map((r) => r.id).join(',')).toBe('m2,m1')
+    })
+
+    it('red-detector:READ COMMITTED + barrier——list 出现 torn pair(旧 messages + 新 rev;barrier 非空转)', async () => {
+      await setupReordered()
+      const barrier = makeBarrier()
+      b.__listChatTornPairTestHooks.afterMessages = barrier.afterMessages
+      b.__listChatTornPairTestHooks.isolationLevel = 'read committed' // 强制回归态(production 永不设)
+      const listP = b.listChatWithOrderRevision('actorA', 'c1')
+      await barrier.reached
+      // 窗口内提交第二次 reorder → rev=2, [m1,m2]。
+      const r2 = await b.reorderChildren('actorA', 'c1', 'chat-message', ['m1', 'm2'], { base: 1 })
+      expect(r2.kind).toBe('ok')
+      barrier.release()
+      const list = await listP
+      const ids = list.records.map((r) => r.id).join(',')
+      // READ COMMITTED:messages SELECT 见 pre([m2,m1]),orderRevision SELECT 见 post(rev=2)→ torn pair。
+      // 此断言通过 = barrier 真在两读之间暂停并让 reorder 提交介入;若 barrier 空转则必得 (1,[m2,m1]) 或 (2,[m1,m2])。
+      expect(list.orderRevision).toBe(2)
+      expect(ids).toBe('m2,m1')
+    })
+
+    it('稳定性:REPEATABLE READ + barrier 连续 20 次零波动(自洽 pre-state)', async () => {
+      for (let i = 0; i < 20; i++) {
+        await b.__reset()
+        await setupReordered()
+        const barrier = makeBarrier()
+        b.__listChatTornPairTestHooks.afterMessages = barrier.afterMessages
+        const listP = b.listChatWithOrderRevision('actorA', 'c1')
+        await barrier.reached
+        await b.reorderChildren('actorA', 'c1', 'chat-message', ['m1', 'm2'], { base: 1 })
+        barrier.release()
+        const list = await listP
+        expect(list.orderRevision).toBe(1)
+        expect(list.records.map((r) => r.id).join(',')).toBe('m2,m1')
+      }
+    })
+  })
 })

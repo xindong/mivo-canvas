@@ -46,7 +46,7 @@
 //   ORGANIZATION_CAPABILITIES 字面量(故意不 import,防自动跟随掩盖漂移)。
 
 import { describe, expect, it } from 'vitest'
-import type { CanvasNodeType, MivoCanvasNode } from '../../types/mivoCanvas'
+import type { CanvasNodeType, MivoCanvasNode } from '../types/mivoCanvas'
 import {
   canvasNodeRegistry,
   nodeTypeDefinitionFor,
