@@ -272,6 +272,12 @@ export class InMemoryPermissionBackend implements PermissionBackend {
   /** Test-only:op → 剩余 recordCompensation 强制失败次数(P1-1 验收:record 崩溃后 attempt 据 marker 收敛)。 */
   private readonly compensationRecordFault: Partial<Record<CompensationOp, number>> = {}
   /**
+   * R7 Test-only:注入 getCompensationCounts 强制抛错(对偶 PG 侧 share_link_compensations 表缺失/列不匹配/
+   * 权限错 → Kysely SELECT 抛)。用于 /readyz 负例:getCompensationCounts 抛 + computeReadiness 健康 →
+   * 必 503 degraded + unknown 明示(不许 catch 吞成 {0,0} 假绿)。null=不注入(默认)。
+   */
+  private compensationCountsErrorForTest: Error | null = null
+  /**
    * R5-F1: project → is_deleted durable desired state(memory 对偶 PG projects.is_deleted)。
    * memory 不持有 projects 表,但为 TOCTOU 双后端契约对称,经 __setProjectDeletedForTest 注入;
    * attemptCompensation 的 stale gate 与 claim 后重读均据此(与 PG SELECT...FOR UPDATE critical trx 对偶)。
@@ -747,6 +753,8 @@ export class InMemoryPermissionBackend implements PermissionBackend {
 
   /** R3-F2:全局未收敛计数(供 /readyz + 响应 header)。 */
   async getCompensationCounts(): Promise<{ pending: number; failed: number }> {
+    // R7 Test-only:注入强制抛错(对偶 PG 表缺失/列不匹配/权限错)。生产 memory 路径不注入 → 不抛。
+    if (this.compensationCountsErrorForTest) throw this.compensationCountsErrorForTest
     let pending = 0
     let failed = 0
     for (const it of this.compensations.values()) {
@@ -817,6 +825,8 @@ export class InMemoryPermissionBackend implements PermissionBackend {
     delete this.compensationRecordFault.delete
     delete this.compensationClaimPauseForTest.restore
     delete this.compensationClaimPauseForTest.delete
+    // R7:counts 抛错注入也清(防跨用例泄漏致后续 readyz 用例假 503)。
+    this.compensationCountsErrorForTest = null
   }
 
   /** Test-only:把某 link 的 revokedAt 设为指定 ISO(测 30 天 un-revoke 窗;FX-7 §5.9)。 */
@@ -869,6 +879,13 @@ export class InMemoryPermissionBackend implements PermissionBackend {
   /** Test-only:清除 op record 故障注入。 */
   __clearRecordFaultForTest(op: CompensationOp): void {
     delete this.compensationRecordFault[op]
+  }
+  /**
+   * R7 Test-only:注入 getCompensationCounts 强制抛错(模拟 PG share_link_compensations 表缺失/列不匹配/权限错)。
+   * 传 null 清除(默认 __reset 也清,防跨用例泄漏)。用于 /readyz 负例验证 catch 不再吞成 {0,0} 假绿。
+   */
+  __setCompensationCountsErrorForTest(err: Error | null): void {
+    this.compensationCountsErrorForTest = err
   }
 }
 

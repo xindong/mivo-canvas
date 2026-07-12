@@ -99,4 +99,29 @@ describe('/readyz readiness 探针(R3-F2 pending/failed 外部可见)', () => {
     expect(res.status).toBe(503) // gen2 failed → 又非绿
     expect(res.headers.get('X-Compensation-Failed')).toBe('1') // 仅 gen2(最新 failed),gen1 已 superseded
   })
+
+  // R7(合并前 merger 核证 P1 返修):getCompensationCounts 抛(补偿子系统结构性不可用——表缺失/列不匹配/
+  //   权限错)不得被 catch 吞成 {0,0} 假绿。computeReadiness 健康(ping ok)但 counts 读不出 → 必 503 degraded
+  //   + X-Compensation-Counts:unknown 明示,不再报 0/0 假数(网关/运维据此摘流量,而非误判 200 ok 放行)。
+  //   红→绿:旧代码吞错返 200 {0,0}(此用例红);修后返 503 unknown(绿)。
+  it('R7:getCompensationCounts 抛 + computeReadiness 健康 → 503 degraded + X-Compensation-Counts:unknown(不报 0/0 假数)', async () => {
+    // 模拟 PG share_link_compensations 表缺失/列不匹配/权限错 → getCompensationCounts 抛
+    //   (PG 侧 Kysely SELECT 抛;memory 经 __setCompensationCountsErrorForTest 注入对偶)。
+    mem().__setCompensationCountsErrorForTest(new Error('relation "share_link_compensations" does not exist'))
+    const res = await app.request('/readyz')
+    // 不许再吞成 200 假绿:counts 读不出即摘流量(fail-visible,违反 saga 摘流量承诺)。
+    expect(res.status).toBe(503)
+    // 明示不可读(独立 header),不再报 X-Compensation-Pending/Failed:0 假数。
+    expect(res.headers.get('X-Compensation-Counts')).toBe('unknown')
+    expect(res.headers.get('X-Compensation-Pending')).toBeNull()
+    expect(res.headers.get('X-Compensation-Failed')).toBeNull()
+    const body = await res.json()
+    // status='degraded'(counts 不可读;非 unconverged——后者要求 counts 可读且 failed>0)。
+    expect((body as { status: string }).status).toBe('degraded')
+    // body.compensations 同步 unknown 语义(消费方可区分"0 pending"与"读不出来",不再混作 {0,0})。
+    expect((body as { compensations: unknown }).compensations).toBe('unknown')
+    // 503 纯因 counts 不可读,非依赖挂:persist/permission 仍 ok(证明 computeReadiness 健康,即被掩盖的场景)。
+    expect((body as { persist: { status: string } }).persist.status).toBe('ok')
+    expect((body as { permission: { status: string } }).permission.status).toBe('ok')
+  })
 })
