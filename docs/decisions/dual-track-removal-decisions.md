@@ -324,7 +324,7 @@ CREATE INDEX mode_hits_track_mode_ts ON mode_hits (track, mode, ts);
 
 #### ④ 回滚终止日
 - **回滚通道**：`?renderer=dom`（应急回退，生产可即时切回——渲染层无状态投影，flag 切回不丢数据，真相源在 IDB canonical / PG persist）。
-- **终止日**：删轨 PR 合并日（= telemetry 上线日 + 30 天观察窗 6 指标全绿后，**不倒算日历日 2026-08-06**——telemetry 未上线则窗口不起算）。
+- **终止日**：删轨 PR 合并日（= telemetry 上线日 + 30 天观察窗 5 硬门控全绿后，**不倒算日历日 2026-08-06**——telemetry 未上线则窗口不起算）。
 - 终止后回滚 = git revert 删轨 PR + 重新部署（依赖 9:00/17:00 cron 或手动 `deploy.sh`）。
 
 #### ⑤ owner
@@ -332,11 +332,13 @@ CREATE INDEX mode_hits_track_mode_ts ON mode_hits (track, mode, ts);
 **待 lead 指派具体人选**。
 
 #### 推荐 / 备选
-- **推荐**：telemetry 上线后 + 30 天观察窗 + 6 指标全绿 → 开删轨 PR。**不倒算日历日**
+- **推荐**：telemetry 上线后 + 30 天观察窗 + 5 硬门控全绿 → 开删轨 PR。**不倒算日历日**
   （telemetry 未上线则窗口不起算）。平衡稳妥性与成本——dom 轨每天在 CI 里跑两份 e2e +
   一份 visual-diff，30 天 ≥ 20 PR 验证密度足够。
-- **备选**：14 天短窗，仅当 14 天时 6 指标已全绿且 leaferPaintSignature bench 连续 10 PR
-  dragP95<8ms（中位数）。风险：周末/特定用户工作流未覆盖；且 telemetry 上线日 + 14 天
+- **备选**：14 天短窗，仅当 14 天时 **5 硬门控全绿且 leaferPaintSignature bench 连续 10 PR
+  dragP95<8ms（中位数）——bench 升格为备选策略额外门槛**（r4 改 R3-4：r3 泛称"6 指标"含非门控
+  bench，与"5 硬门控 + 1 监控项"自相矛盾；推荐路径 bench 只监控不阻塞，§2.1②；备选才把 bench
+  升格为额外条件，非同一 6 指标）。风险：周末/特定用户工作流未覆盖；且 telemetry 上线日 + 14 天
   仍需满足。
 
 ---
