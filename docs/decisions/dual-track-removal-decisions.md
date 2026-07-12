@@ -617,27 +617,32 @@ pg-suite 翻 required（2026-07-12，今天）。cutover 未执行。
 
 **硬门控指标（6 项，每条命令已 dry-run；prod-side 命令 form 经本地 PG16/sample log 验证，owner 在生产执行）**：
 
-1. **生产 persist 后端身份 = pg，无 memory 回退（全 30 天；r4 改 R3-2）**
+1. **生产 persist 后端身份 = pg，无 memory 回退（观察窗内；r5 改 D4-R5-2：S7 前不污染 + 新鲜度断言）**
    ```bash
-   ssh "$MIVO_PROD_HOST" 'psql "$DATABASE_URL" -tA -f -' <<'SQL' | grep -qx GREEN   # rc=0 绿，rc=1 红
+   OBS_START="<cutover S7 日 YYYY-MM-DD>"   # owner 填观察起点（S7 不可逆点，参数化传入防 S7 前 memory 行污染）
+   ssh "$MIVO_PROD_HOST" "psql \"\$DATABASE_URL\" -tA -v OBS_START=\"$OBS_START\" -f -" <<'SQL' | grep -qx GREEN   # rc=0 绿，rc=1 红
    SELECT CASE WHEN count(*) >= 10
                 AND max(observed_at) - min(observed_at) >= interval '30 days'
                 AND bool_and(backend = 'pg')
+                AND max(observed_at) >= now() - interval '4 days'
                THEN 'GREEN' ELSE 'RED' END
-   FROM persist_observations;
+   FROM persist_observations
+   WHERE observed_at >= :'OBS_START'::timestamptz;
    SQL
    ```
-   样例（fixture dry-run PG16）：正例 10 点全 pg / 跨度 31 天 → `GREEN`；9 点 / 中间 1 点 memory / 跨度 20 天 → `RED`。
-   `backend` 列由每 3 天采样 job 读 `MIVO_PERSIST_BACKEND` env 填，验"全 30 天身份=pg"取代 r3 单次 `printenv`（只证当下，R3-2）。`$MIVO_PROD_HOST` 为部署目标机（deploy runbook `/AIGC_Group/mivo-canvas/deploy.sh` 所在 host，owner 填）；`$DATABASE_URL` 从生产 env 读（`PGPASSWORD` 不内联，走 env 避免密钥入命令历史）。
+   样例（fixture dry-run PG16）：正例 S7 后 11 点全 pg / 跨度≥30 天 / 最新样本≤4 天 → `GREEN`；S7 前含 memory 行（被 `WHERE` 过滤）不影响判绿（旧版全表扫描会因 `bool_and(backend='pg')` 永久假红）；S7 后任一 memory 行 / 9 点 / 跨度<30 天 / 最新样本>4 天陈旧 分别 `RED`。
+   `WHERE observed_at >= OBS_START` 把 S7 不可逆点前的 memory 采样行排除——表是删轨前硬前置且当前默认 memory（§2.3①），S7 前合法 `backend='memory'` 行会让旧版 `bool_and(backend='pg')` 永久假红（D4-R5-2）。`max(observed_at) >= now()-interval '4 days'` 断言采样 job 仍在跑（每 3 天周期 + 1 天容差），防 cron 停采后拿陈旧 10 点/31 天数据假装观测中。`OBS_START` 经 `psql -v` 参数化、`:'OBS_START'::timestamptz` 引用（`$OBS_START` 本地展开、`$DATABASE_URL` 远端展开，`<<'SQL'` 引用 heredoc 让 psql 而非 shell 做变量替换）；`$MIVO_PROD_HOST` 为部署目标机（`/AIGC_Group/mivo-canvas/deploy.sh` 所在 host，owner 填）。
 
-2. **生产 PG 累计行数 30 天单调非递减（无"重启清空"假象；r4 改 R3-2）**
+2. **生产 PG 累计行数单调非递减（观察窗内，无"重启清空"假象；r5 改 D4-R5-2：S7 前不污染）**
    ```bash
-   ssh "$MIVO_PROD_HOST" 'psql "$DATABASE_URL" -tA -f -' <<'SQL' | grep -qx GREEN   # rc=0 绿，rc=1 红
+   OBS_START="<cutover S7 日 YYYY-MM-DD>"   # owner 填观察起点（与指标 1 同 S7）
+   ssh "$MIVO_PROD_HOST" "psql \"\$DATABASE_URL\" -tA -v OBS_START=\"$OBS_START\" -f -" <<'SQL' | grep -qx GREEN   # rc=0 绿，rc=1 红
    WITH o AS (
      SELECT canvas_rows, chat_rows,
             lag(canvas_rows) OVER (ORDER BY observed_at) AS prev_canvas,
             lag(chat_rows)   OVER (ORDER BY observed_at) AS prev_chat
        FROM persist_observations
+       WHERE observed_at >= :'OBS_START'::timestamptz
    )
    SELECT CASE WHEN bool_and(canvas_rows >= prev_canvas OR prev_canvas IS NULL)
                 AND bool_and(chat_rows >= prev_chat OR prev_chat IS NULL)
@@ -646,8 +651,8 @@ pg-suite 翻 required（2026-07-12，今天）。cutover 未执行。
    FROM o;
    SQL
    ```
-   样例（fixture dry-run PG16）：正例 canvas 10→14 + chat 50→75 单调 → `GREEN`；canvas 12→9 下降 → `RED`；canvas/chat 全 0 单调（无业务数据）→ `RED`（`max>0` 防 0 行假绿，保留 r3 "读写命中>0" 语义）。
-   `lag()` 验累计无下降取代 r3 `created_at` 每日新增（每日新增非历史累计采样，检不出重启切回 memory 或累计下降，R3-2）。
+   样例（fixture dry-run PG16）：正例 S7 后 canvas/chat 单调非递减 + `max>0` → `GREEN`；canvas 12→9 下降 → `RED`；canvas/chat 全 0 单调（无业务数据）→ `RED`（`max>0` 防 0 行假绿，保留 r3 "读写命中>0" 语义）；S7 前 memory 高计数 + S7 后 pg 低计数（memory→pg 切换不是真下降）→ 旧版全表 `lag()` 假红，新版 `WHERE` 仅算 S7 后 pg 段判绿（D4-R5-2）。
+   `lag()` 在 `WHERE observed_at >= OBS_START` 之后计算（窗口函数在 WHERE 之后求值），首行 `prev_*` 为 NULL 由 `OR prev_* IS NULL` 兼容；验累计无下降取代 r3 `created_at` 每日新增（每日新增非历史累计采样，检不出重启切回 memory 或累计下降，R3-2）。
 
 3. **PG 连接池稳定（30 天 0 次 `ECONNRESET`/pool exhaust/idle timeout）**（扫持久日志，**非** `--lines 1000`）
    ```bash
