@@ -157,6 +157,119 @@ if printf '%s\n' "$DRY_OUT" | grep -q "dry-run done: FAIL"; then
 else
   bad "dry-run 输出缺 'dry-run done: FAIL'(实际:$(printf '%s' "$DRY_OUT" | tr '\n' '|'))"
 fi
+echo "=== P03-R4-1 manifest wiring 整脚本回归(stub docker/pg_restore → 最终判定;防 ERR_MANIFEST 清零回潮) ==="
+
+# 本段不重测 decide_drill_outcome 纯函数(上方已覆盖),而是真跑整脚本 restore-drill.sh,
+# 覆盖 MANIFEST_STATUS → ERR_MANIFEST → decide_drill_outcome 的状态传播 wiring。
+# stub docker:容器"running" + pg_restore 成功 + psql 返三核心表全在(to_regclass=t)→ ERR=0、CORE=pass;
+# asset 用空 snapshot(无 .bin → verify_asset_snapshot 不调 validate_meta,从而不依赖 jq)→ ASSET_CHECK=ok、ERR=0。
+# malformed / no-jq manifest → ERR_MANIFEST=1 → decide_drill_outcome(0,1,pass)=fail → exit 1 + FAIL 诊断。
+# 关键不变量(本段唯一目的):若在 restore 后回植旧 `ERR_MANIFEST=0` 清零行(P03-R3-1 原假绿 bug),
+#   ERR_MANIFEST 被清零 → decide_drill_outcome(0,0,pass)=pass → exit 0(假绿)→ rc=1 断言失败 → 红测,
+#   阻止同一 P1 fail-open 无声回潮。负例(回植清零行)红测证据见 commit message。
+
+: "${BASH:=bash}"   # 用本机 bash 启动 restore-drill.sh 子进程(注入 PATH 不影响 launcher 查找)
+
+# ── stub bin:docker(响应 inspect / exec 的 psql·pg_restore 子命令;无 docker/PG 依赖走到最终判定)──
+STUB_BIN="$WORK/stub-bin"; mkdir -p "$STUB_BIN"
+cat > "$STUB_BIN/docker" <<'STUB'
+#!/bin/bash
+# docker stub:让 restore-drill.sh 在无 docker/PG 环境走到最终判定(仅 P03-R4-1 wiring 测试用)。
+# - inspect -f '{{.State.Running}}' <c> → "true"(容器存活,grep -q true 通过)
+# - exec [-i] <c> pg_restore ... → exit 0(TOC -l 可读 + --clean restore 成功)
+# - exec [-i] <c> psql -U .. -d .. -t -A -c "SQL" → 按 SQL 返"三核心表全在"固定值(使 ERR=0、CORE=pass)
+if [ "${1:-}" = "inspect" ]; then echo "true"; exit 0; fi
+if [ "${1:-}" = "exec" ]; then
+  shift                          # exec
+  if [ "${1:-}" = "-i" ]; then shift; fi   # 可选 -i(stdin 重定向由内核处理,stub 不必读)
+  shift                          # container
+  case "${1:-}" in
+    pg_restore) exit 0 ;;         # -l(TOC) / --no-owner --clean(restore)均成功
+    psql)
+      shift                       # psql
+      sql=""
+      while [ $# -gt 0 ]; do
+        if [ "$1" = "-c" ]; then sql="$2"; shift 2; else shift; fi
+      done
+      # 按 SQL 内容返固定值,模拟"三核心表全在 + 库可读",使最终判定唯一由 ERR_MANIFEST 决定。
+      case "$sql" in
+        *to_regclass*)           echo "t" ;;   # 表存在(IS NOT NULL → t)
+        *information_schema*)     echo "3" ;;   # public base table 计数
+        *"SELECT 1"*)           echo "1" ;;   # SELECT 1 库可读
+        *"FROM public."*)       echo "5" ;;   # 核心表行数(manifest 非 present,不参与比对)
+        *)                        : ;;          # DROP/CREATE DATABASE / pg_stat_user_tables → 静默 exit 0
+      esac
+      ;;
+  esac
+fi
+exit 0
+STUB
+chmod +x "$STUB_BIN/docker"
+
+# ── 空 asset snapshot(无 .bin → verify_asset_snapshot 不调 validate_meta,不依赖 jq)→ ASSET_CHECK=ok ──
+# 使 malformed/no-jq 两 case 的最终判定唯一由 ERR_MANIFEST 决定(asset 不污染 ERR=0)。
+make_empty_snapshot() {
+  local snap="$1" root; root="$(mktemp -d)"
+  mkdir -p "$root/assets"
+  tar -czf "$snap" -C "$root" assets
+  rm -rf "$root"
+}
+
+DUMP_TS="20260712-050000"
+DUMP_NAME="mivocanvas-$DUMP_TS.dump"
+ASSET_DIR="$WORK/asset-backups"; mkdir -p "$ASSET_DIR"
+make_empty_snapshot "$ASSET_DIR/asset-snap-$DUMP_TS.tar.gz"
+LOG_FILE="$WORK/restore-drill-wiring.log"
+: > "$LOG_FILE"
+
+# ── runner:PATH 注入 stub 跑整脚本,断言 rc=1 + 两条 FAIL 诊断(manifest 解析失败 hard fail 可见)──
+# $1=PATH(注入 stub + 控制 jq 可用性) $2=BACKUP_DIR(含 dump + manifest)
+run_wiring_case() {
+  local wire_path="$1" dump_dir="$2" out_file rc out
+  out_file="$WORK/wiring-out.txt"
+  set +e
+  PATH="$wire_path" PG_BACKUP_DIR="$dump_dir" PG_DRILL_LOG="$LOG_FILE" \
+    ASSET_BACKUP_DIR="$ASSET_DIR" "$BASH" "$dir/restore-drill.sh" >"$out_file" 2>&1
+  rc=$?
+  set -e
+  out="$(cat "$out_file")"
+  expect "wiring rc=1(manifest 解析失败 → hard fail,即使核心表全在)" "$rc" 1
+  if printf '%s\n' "$out" | grep -q "FAIL: manifest"; then
+    ok "wiring 输出含 'FAIL: manifest'(manifest 解析失败诊断)"
+  else
+    bad "wiring 缺 'FAIL: manifest'(实际:$(printf '%s' "$out" | tr '\n' '|'))"
+  fi
+  if printf '%s\n' "$out" | grep -q "restore drill done: FAIL"; then
+    ok "wiring 输出含 'restore drill done: FAIL'(最终判定 fail-visible)"
+  else
+    bad "wiring 缺 'restore drill done: FAIL'(实际:$(printf '%s' "$out" | tr '\n' '|'))"
+  fi
+}
+
+# ── Case A:malformed manifest(jq 在 → manifest_parse_status=malformed → ERR_MANIFEST=1)──
+CASEA_DIR="$WORK/case-malformed"; mkdir -p "$CASEA_DIR"
+: > "$CASEA_DIR/$DUMP_NAME"                                   # dump 内容无关(stub 不读)
+printf '{this is not json,,,missing quotes}' > "$CASEA_DIR/${DUMP_NAME%.dump}.manifest.json"
+run_wiring_case "$STUB_BIN:$PATH" "$CASEA_DIR"
+
+# ── Case B:no-jq manifest(jq 不可用 → manifest_parse_status=no-jq → ERR_MANIFEST=1)──
+# jq 在 /usr/bin;构造"含 essentials 但不含 jq"的 PATH:符号链接 /usr/bin 工具(显式跳过 jq)+ /bin。
+# docker stub shebang 用 #!/bin/bash(绝对路径,免 env 查找 — env 在 /usr/bin 会带 jq)。
+NOJQ_BIN="$WORK/nojq-bin"; mkdir -p "$NOJQ_BIN"
+for c in head tail grep stat tee dirname basename awk mktemp find tar; do
+  src="$(command -v "$c" 2>/dev/null || echo "/usr/bin/$c")"
+  if [ -e "$src" ]; then ln -sf "$src" "$NOJQ_BIN/$c"; fi
+done
+NOJQ_PATH="$STUB_BIN:$NOJQ_BIN:/bin"
+if PATH="$NOJQ_PATH" command -v jq >/dev/null 2>&1; then
+  ok "no-jq: 本机 jq 无法从 PATH 隐藏(可能在 /bin),跳过 no-jq 整脚本用例;wiring 不变量由 Case A(malformed)覆盖"
+else
+  ok "no-jq: 受限 PATH 下 jq 不可用(符合预期)"
+  CASEB_DIR="$WORK/case-nojq"; mkdir -p "$CASEB_DIR"
+  : > "$CASEB_DIR/$DUMP_NAME"
+  printf '{"preSchema":true,"tables":{"persist_records":5},"assetBlobCount":0}' > "$CASEB_DIR/${DUMP_NAME%.dump}.manifest.json"
+  run_wiring_case "$NOJQ_PATH" "$CASEB_DIR"
+fi
 
 echo "----------------"
 echo "PASS=$PASS FAIL=$FAIL"
