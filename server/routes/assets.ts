@@ -281,10 +281,31 @@ export const createAssetRoutes = (options: AssetRouteOptions): App => {
       log(404, 'invalid-id')
       return plainTextNoContentType(c, 'Asset not found', 404)
     }
-    // P2.5: owner-scoped read — must be uploader or hold a live reference.
-    const hit = await store.readForOwner(assetId, ownerFp)
-    if (!hit) {
+    // G2.2/P1-1:read entitlement = uploader OR 己方 live ref OR 对任一引用画布有 view(read)权
+    //   (remaining-tasks-cutover-plan.md:97 "资产随画布可见")。resolveCanvasAccess 处理 member + share-token
+    //   两路:owner/editor/viewer member + share-view/share-edit 均可 read 引用画布的 asset。uploader/own-ref
+    //   保留(own upload 即使无引用画布仍可读)。missing/forbidden 一律 404(无存在性泄漏,与 P2.5 一致)。
+    const record = await store.getRecord(assetId)
+    if (!record) {
       log(404, 'missing-or-forbidden')
+      return plainTextNoContentType(c, 'Asset not found', 404)
+    }
+    let canRead = await store.isUploader(assetId, ownerFp) || record.references.some((r) => r.ownerFp === ownerFp)
+    if (!canRead) {
+      for (const r of record.references) {
+        if (!r.canvasId) continue
+        const access = await resolveCanvasAccess(c, persist, permissions, r.canvasId, 'read')
+        if (access.ok) { canRead = true; break }
+      }
+    }
+    if (!canRead) {
+      log(404, 'missing-or-forbidden')
+      return plainTextNoContentType(c, 'Asset not found', 404)
+    }
+    // read entitlement 通过 → 取 bytes(read 无 authz,仅 bytes + size 守卫;entitlement 已在上方判过)。
+    const hit = await store.read(assetId)
+    if (!hit) {
+      log(404, 'missing-or-corrupt')
       return plainTextNoContentType(c, 'Asset not found', 404)
     }
     // P1.3: nosniff on every GET so a stored type can never be re-interpreted inline.
@@ -448,7 +469,12 @@ export const createAssetRoutes = (options: AssetRouteOptions): App => {
       log(404, 'missing')
       return c.json({ kind: 'missing' } satisfies { kind: 'missing' }, 404)
     }
-    const ref = record.references.find((r) => r.nodeId === nodeId)
+    // P1-4:按 (canvasId, nodeId) 复合键 find ref。bodyCanvasId 提供时优先匹配该 canvas 的 ref;
+    // 无 bodyCanvasId(legacy 路径)按裸 nodeId find。找不到 → already-detached(幂等)。
+    const ref = bodyCanvasId
+      ? (record.references.find((r) => r.nodeId === nodeId && r.canvasId === bodyCanvasId)
+        ?? record.references.find((r) => r.nodeId === nodeId && !r.canvasId)) // legacy 兜底
+      : record.references.find((r) => r.nodeId === nodeId)
     if (!ref) {
       // ref 已不在 → already-detached(幂等 intent 已满足)。
       log(200, 'already-detached')
@@ -468,8 +494,8 @@ export const createAssetRoutes = (options: AssetRouteOptions): App => {
         return c.json(access.body as Record<string, unknown>, access.status as 400 | 403 | 404 | 410)
       }
     }
-    // authz 过(新 ref canvas-edit / legacy ref 走 service ownerFp)→ detach。
-    const result = await store.detach(assetId, nodeId, ownerFp)
+    // authz 过(新 ref canvas-edit / legacy ref 走 service ownerFp)→ detach(P1-4:传 refCanvasId 复合键删除)。
+    const result = await store.detach(assetId, nodeId, ownerFp, undefined, ref.canvasId ?? bodyCanvasId)
     switch (result.kind) {
       case 'detached':
         log(200, 'detached')

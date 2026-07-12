@@ -1408,6 +1408,27 @@ export class PgPersistBackend implements PersistBackend {
     resolveFingerprintToUsername: (fingerprint: string) => string | undefined,
   ): Promise<{ migrated: number; unmapped: number }> {
     await this.ready
+    // P1-2:dp4 §3.1 fail-closed 预审——零 mutation 前断言所有 legacy chat-message.owner_id === canvas owner
+    //   (migration 003 "零搬迁"论证前提)。异常行(owner_id ≠ canvas owner / 孤儿 canvas)→ no-go 抛错,不静默
+    //   carry over(防换键后数据孤儿 + 隐私边界破损)。memory(backend.ts)parity。
+    const auditRows = await sql<{ id: string; ownerId: string; canvasId: string | null; canvasOwner: string | null }>`
+      SELECT cm.id, cm.owner_id AS "ownerId", cm.canvas_id AS "canvasId", c.owner_id AS "canvasOwner"
+      FROM persist_records cm
+      LEFT JOIN canvases c ON c.id = cm.canvas_id
+      WHERE cm.type = 'chat-message' AND cm.owner_id ~ '^[0-9a-f]{16}$'
+    `.execute(this.db)
+    for (const r of auditRows.rows) {
+      if (r.canvasOwner === null) {
+        throw new Error(
+          `G2.2 dp4 §3.1 no-go: legacy chat-message ${r.id} (owner ${r.ownerId}) references canvas ${r.canvasId} which has no global canvas owner (orphan/canvas deleted); refusing to rekey — resolve or quarantine before migration.`,
+        )
+      }
+      if (r.ownerId !== r.canvasOwner) {
+        throw new Error(
+          `G2.2 dp4 §3.1 no-go: legacy chat-message ${r.id} owner_id ${r.ownerId} !== canvas ${r.canvasId} owner ${r.canvasOwner} (member chat under non-canvas-owner fingerprint is anomalous in legacy form); refusing to rekey — migration 003 "no-move" invariant violated.`,
+        )
+      }
+    }
     // Phase 1:收集 DISTINCT legacy owner(跨 persist 域全表)+ resolve(resolver 可能抛 → 此时未 mutation)。
     const rows = await sql<{ owner: string | null }>`
     SELECT DISTINCT owner_id AS owner FROM persist_records WHERE owner_id ~ '^[0-9a-f]{16}$'

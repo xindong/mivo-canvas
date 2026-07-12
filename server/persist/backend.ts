@@ -1415,6 +1415,27 @@ export class InMemoryPersistBackend implements PersistBackend {
   async migrateLegacyOwnersToUsernameForm(
     resolveFingerprintToUsername: (fingerprint: string) => string | undefined,
   ): Promise<{ migrated: number; unmapped: number }> {
+    // P1-2:dp4 §3.1 fail-closed 预审——零 mutation 前断言所有 legacy chat-message.owner_id === canvas owner
+    //   (migration 003 "零搬迁"论证的前提:legacy chat owner === canvas owner → owner GET /chat 仍见)。
+    //   异常行(owner_id ≠ canvas owner,即成员名下不应有的 legacy fingerprint chat / 孤儿 chat)→ no-go 抛错,
+    //   不静默 carry over(否则换键后 owner_id 既非 canvasOwner 又非真实 username → 数据孤儿 + 隐私边界破损)。
+    for (const [, bucket] of this.byOwner) {
+      for (const r of bucket.values()) {
+        if (r.type !== 'chat-message') continue
+        if (!isLegacyFormOwnerId(r.ownerId)) continue
+        const canvasOwner = r.canvasId ? this.globalCanvasOwners.get(r.canvasId) : undefined
+        if (canvasOwner === undefined) {
+          throw new Error(
+            `G2.2 dp4 §3.1 no-go: legacy chat-message ${r.id} (owner ${r.ownerId}) references canvas ${r.canvasId} which has no global canvas owner (orphan/canvas deleted); refusing to rekey — resolve or quarantine before migration.`,
+          )
+        }
+        if (r.ownerId !== canvasOwner) {
+          throw new Error(
+            `G2.2 dp4 §3.1 no-go: legacy chat-message ${r.id} owner_id ${r.ownerId} !== canvas ${r.canvasId} owner ${canvasOwner} (member chat under non-canvas-owner fingerprint is anomalous in legacy form); refusing to rekey — migration 003 "no-move" invariant violated.`,
+          )
+        }
+      }
+    }
     // Phase 1: 收集 legacy ownerId + 目标 username(resolver 可能抛 → 此时未 mutation)。
     const legacyOwners: string[] = []
     for (const ownerId of this.byOwner.keys()) {

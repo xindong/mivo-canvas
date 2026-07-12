@@ -126,6 +126,10 @@ const uploadReq = async (app: Hono<AppEnv>, key: string) => {
   return app.request('/api/assets', { method: 'POST', headers: hdr(key), body: form })
 }
 
+/** GET /api/assets/:id with optional share token. P1-1: read entitlement via referencing canvas. */
+const getReq = (app: Hono<AppEnv>, f: Fixture, key: string, shareToken?: string) =>
+  app.request(`/api/assets/${f.assetId}`, { method: 'GET', headers: hdr(key, shareToken) })
+
 /**
  * 矩阵断言(双后端共用;makeBackends 构造 persist+permissions+assetStore+app)。
  */
@@ -176,6 +180,44 @@ const runMatrix = (
     expect((await uploadReq(app, MIVO_KEY_SHARE_EDIT)).status).toBe(200)
     expect((await attachReq(app, f, MIVO_KEY_SHARE_EDIT, f.tokens.edit)).status).toBe(403)
     expect((await detachReq(app, f, MIVO_KEY_SHARE_EDIT, f.tokens.edit)).status).toBe(200)
+  })
+
+  it(`${label} P1-1 GET 矩阵:owner/editor/viewer/share-view/share-edit 对引用画布有 read → 200;outsider → 404`, async () => {
+    const { persist, permissions, assetStore, app } = await makeBackends()
+    const f = await seedFixture(persist, permissions, assetStore, app, `get-${counter}`)
+    // asset A 已 attach 到 N/C(owner ref,canvasId=C);各角色对 C 有 read → view-via-referencing-canvas → 200。
+    expect((await getReq(app, f, MIVO_KEY_OWNER)).status).toBe(200) // uploader
+    expect((await getReq(app, f, MIVO_KEY_EDITOR)).status).toBe(200) // editor member,read on C
+    expect((await getReq(app, f, MIVO_KEY_VIEWER)).status).toBe(200) // viewer member,read on C
+    expect((await getReq(app, f, MIVO_KEY_SHARE_EDIT, f.tokens.view)).status).toBe(200) // share-view,read on C
+    expect((await getReq(app, f, MIVO_KEY_SHARE_EDIT, f.tokens.edit)).status).toBe(200) // share-edit,read on C
+    // outsider(非 member,无 share token,非 uploader)→ 无 read entitlement → 404(无存在性泄漏)。
+    expect((await getReq(app, f, MIVO_KEY_OUTSIDER)).status).toBe(404)
+  })
+
+  it(`${label} P1-4 复合键:两 canvas 同 nodeId attach(service 级)→ 两条独立 ref;detach 一方不影响他方`, async () => {
+    const { persist, permissions, assetStore, app } = await makeBackends()
+    const f = await seedFixture(persist, permissions, assetStore, app, `p14-${counter}`)
+    // service 级直接 attach(bypass route gate①)——复合键是 service 层 defense-in-depth:route gate① 已按
+    //   persist (owner,type,id) 全局键阻同 nodeId 跨 canvas,但未来 G1-c 节点生命周期调用方若不走路由 gate①,
+    //   service 仍须按 (canvasId,nodeId) 复合键防同 nodeId 跨 canvas 串引用(sol 实测:裸 nodeId dedup →
+    //   canvas-b attach 返 already-attached 只留 canvas-a 的 ref)。canvas-a/canvas-b 是任意字符串(service 不验存在)。
+    const rA = await assetStore.attach(f.assetId, f.ids.node, FP_OWNER, undefined, 'canvas-a')
+    expect(rA).toEqual({ kind: 'attached' }) // seed ref canvasId=f.ids.canvas;新复合键 (canvas-a,node) → attached
+    const rB = await assetStore.attach(f.assetId, f.ids.node, FP_OWNER, undefined, 'canvas-b')
+    expect(rB).toEqual({ kind: 'attached' }) // (canvas-b,node) 与 (canvas-a,node)/(f.ids.canvas,node) 均不同
+    // 幂等:同 (canvas-a, node) 再 attach → already-attached。
+    const rA2 = await assetStore.attach(f.assetId, f.ids.node, FP_OWNER, undefined, 'canvas-a')
+    expect(rA2).toEqual({ kind: 'already-attached' })
+    const rec = await assetStore.getRecord(f.assetId)
+    expect(rec!.references.length).toBe(3) // seed + canvas-a + canvas-b
+    // detach (canvas-a, node) 只删该复合键;canvas-b + seed ref 保留。
+    const dA = await assetStore.detach(f.assetId, f.ids.node, FP_OWNER, undefined, 'canvas-a')
+    expect(dA).toEqual({ kind: 'detached' })
+    const rec2 = await assetStore.getRecord(f.assetId)
+    expect(rec2!.references.length).toBe(2)
+    expect(rec2!.references.some((r) => r.canvasId === 'canvas-a')).toBe(false)
+    expect(rec2!.references.some((r) => r.canvasId === 'canvas-b')).toBe(true)
   })
 
   it(`${label} SC1:无关系攻击者(outsider,非 member 非 uploader 无 share token)+ 他人 asset hash → attach 403`, async () => {

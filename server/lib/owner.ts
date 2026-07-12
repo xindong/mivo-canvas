@@ -508,10 +508,13 @@ export const migrateAllDomainsLegacyOwnersToUsernameForm = async (
   } catch (err) {
     failed.push({ domain: 'permissions', reason: err instanceof Error ? err.message : String(err) })
   }
-  // assets 域(assetStore null = service off;detector 仍实扫磁盘,见 buildStartupDetectors R3-F1)
+  // assets 域。P2-5:assetStore null(service off)时按 resolveAssetStoreDir() 构造 FS store 执行迁移
+  //   (对齐 buildStartupDetectors R3-F1:detector 仍实扫磁盘,不伪造 0;迁移同理——磁盘上 legacy assets
+  //   须迁,否则 strict gate 假绿 0 通过)。不静默跳。
   try {
-    if (backends.assetStore && typeof backends.assetStore.migrateLegacyFormOwners === 'function') {
-      const r = await backends.assetStore.migrateLegacyFormOwners(resolveFingerprintToUsername)
+    const assetStore = backends.assetStore ?? createAssetStore(createFsAssetBackend(resolveAssetStoreDir()))
+    if (typeof assetStore.migrateLegacyFormOwners === 'function') {
+      const r = await assetStore.migrateLegacyFormOwners(resolveFingerprintToUsername)
       migrated += r.migrated
       unmapped += r.unmapped
     }

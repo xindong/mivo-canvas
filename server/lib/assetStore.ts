@@ -215,17 +215,27 @@ export type AssetStoreBackend = {
   /** Atomic: ensure a record exists (create with references=[] + lastRefZeroAt=now
    *  if absent). Returns the record + newlyCreated. */
   ensureRecord(init: AssetRecordInit, now: number): Promise<{ record: AssetRecord; newlyCreated: boolean }>
-  /** Atomic: attach (assetId, nodeId, ownerFp) if a record exists. Idempotent.
-   *  Returns the resulting record (or null if no record) + newlyAttached. */
+  /** Atomic: attach (assetId, nodeId, ownerFp[, canvasId]) if a record exists. Idempotent by
+   *  P1-4 composite key (canvasId, nodeId) — two refs with same nodeId but different canvasId
+   *  are distinct. Returns the resulting record (or null if no record) + newlyAttached. */
   attachRef(contentHash: string, ref: AssetReference): Promise<{ record: AssetRecord | null; newlyAttached: boolean }>
-  /** Atomic: detach (assetId, nodeId) if ownerFp matches. Idempotent + owner-checked.
-   *  Stamps lastRefZeroAt on the >0→0 transition. Returns the detach result + record. */
-  detachRef(contentHash: string, nodeId: string, ownerFp: string, now: number): Promise<{ result: DetachResult; record: AssetRecord | null }>
+  /** Atomic: detach the ref matching (canvasId, nodeId) composite key. P1-4: canvasId scopes the
+   *  delete to the single matching ref (preserves same-nodeId refs in other canvases). Idempotent +
+   *  owner-checked for legacy refs (no canvasId). Stamps lastRefZeroAt on the >0→0 transition. */
+  detachRef(contentHash: string, nodeId: string, canvasId: string | undefined, ownerFp: string, now: number): Promise<{ result: DetachResult; record: AssetRecord | null }>
   /** Atomic (P1-B): re-check eligibility at `now` UNDER the lock; make metadata
    *  invisible FIRST (rename to tombstone), then delete bytes + uploaders + tombstone.
    *  Any failure leaves "orphan bytes/uploaders, no record" — never "record, no bytes". */
   deleteIfStillEligible(contentHash: string, now: number): Promise<{ deleted: boolean; reason: 'eligible' | 'not-eligible' | 'missing' }>
   listRecords(): Promise<AssetRecord[]>
+  /**
+   * G2.2/P1-3:**strict** scan for owner-migration detector + rekey——同 listRecords 但对坏 shard/meta
+   * fail-closed:除根目录 ENOENT(合法空 store→返 [])外,shard readdir 失败 / meta read 失败 / JSON parse
+   * 错 / schema 错必须**抛错带路径**(不静默 continue)。防坏文件不迁不计数 → strict gate 假绿 0 通过。
+   * sweep/ownerBytes/scrub 等非安全路径仍用 listRecords(不崩 sweep)。memory backend 无 fs → 同 listRecords。
+   * **可选**:fs 实装(可测);memory = listRecords 透传。
+   */
+  listRecordsStrict?(): Promise<AssetRecord[]>
   /** Sweep helper (P2.6 + P2-D): reap orphan `.tmp-*` files left by a crashed
    *  writeAtomic (rename/write threw before the tmp was cleaned). Skips tmps an
    *  in-progress writeAtomic is holding (the activeTmp set). Only files older than
@@ -402,6 +412,54 @@ const registerUploaderLocked = async (root: string, contentHash: string, ownerFp
   await fs.appendFile(uploadersPath(root, contentHash), `${ownerFp}\n`, 'utf8')
 }
 
+/**
+ * P1-3:strict scan for owner-migration detector + rekey——读全 records,坏 shard/meta **fail-closed 抛错带路径**
+ * (除根目录 ENOENT=合法空 store→返 [])。防坏文件不迁不计数 → strict gate 假绿 0 通过。sweep/ownerBytes/
+ * scrub 等非安全路径仍用 lenient listRecords(不崩 sweep)。fs listRecordsStrict + rekeyLegacyFormOwners 共用。
+ */
+const readAllRecordsStrict = async (root: string): Promise<AssetRecord[]> => {
+  let shards: string[]
+  try {
+    shards = await fs.readdir(root)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [] // 合法空 store
+    throw error
+  }
+  const records: AssetRecord[] = []
+  for (const shard of shards) {
+    const shardDir = path.join(root, shard)
+    let files: string[]
+    try {
+      files = await fs.readdir(shardDir)
+    } catch (error) {
+      throw new Error(`asset store strict scan: cannot readdir shard ${shardDir}: ${(error as Error).message}`, { cause: error })
+    }
+    for (const file of files) {
+      if (!file.endsWith('.meta.json')) continue
+      const p = path.join(shardDir, file)
+      let raw: string
+      try {
+        raw = await fs.readFile(p, 'utf8')
+      } catch (error) {
+        throw new Error(`asset store strict scan: cannot read meta ${p}: ${(error as Error).message}`, { cause: error })
+      }
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(raw)
+      } catch (error) {
+        throw new Error(`asset store strict scan: malformed meta JSON at ${p}: ${(error as Error).message}`, { cause: error })
+      }
+      if (typeof parsed !== 'object' || parsed === null
+        || typeof (parsed as AssetRecord).contentHash !== 'string'
+        || !Array.isArray((parsed as AssetRecord).references)) {
+        throw new Error(`asset store strict scan: meta schema invalid at ${p} (missing contentHash/references)`)
+      }
+      records.push(parsed as AssetRecord)
+    }
+  }
+  return records
+}
+
 export const createFsAssetBackend = (root: string): AssetStoreBackend => ({
   async ensureBytes(contentHash, bytes) {
     assertValidAssetId(contentHash)
@@ -515,7 +573,11 @@ export const createFsAssetBackend = (root: string): AssetStoreBackend => ({
     return withHashLock(contentHash, async () => {
       const record = await readRecordUnlocked(root, contentHash)
       if (!record) return { record: null, newlyAttached: false }
-      const exists = record.references.some((r) => r.nodeId === ref.nodeId)
+      // P1-4:ref 身份 = (canvasId, nodeId) 复合键(防异 canvas 同 nodeId 串引用——canvas-b attach 同 nodeId
+      // 不再误判 already-attached 只留 canvas-a 的 ref)。legacy ref(无 canvasId)键为 (null, nodeId)。
+      const exists = record.references.some(
+        (r) => r.nodeId === ref.nodeId && (r.canvasId ?? null) === (ref.canvasId ?? null),
+      )
       if (exists) return { record, newlyAttached: false }
       record.references = [...record.references, ref]
       record.lastRefZeroAt = null // any ref → cancel a pending grace window
@@ -524,12 +586,16 @@ export const createFsAssetBackend = (root: string): AssetStoreBackend => ({
     })
   },
 
-  async detachRef(contentHash, nodeId, ownerFp, now) {
+  async detachRef(contentHash, nodeId, canvasId, ownerFp, now) {
     assertValidAssetId(contentHash)
     return withHashLock(contentHash, async () => {
       const record = await readRecordUnlocked(root, contentHash)
       if (!record) return { result: { kind: 'missing' as const }, record: null }
-      const idx = record.references.findIndex((r) => r.nodeId === nodeId)
+      // P1-4:按 (canvasId, nodeId) 复合键 find(legacy ref canvasId=undefined → (null, nodeId))。route 传
+      // refCanvasId;只删匹配该复合键的单条 ref(不再按裸 nodeId 删全部,防误删异 canvas 的同名 ref)。
+      const idx = record.references.findIndex(
+        (r) => r.nodeId === nodeId && (r.canvasId ?? null) === (canvasId ?? null),
+      )
       if (idx === -1) return { result: { kind: 'already-detached' as const }, record }
       // G2.2(decision 2):带 canvasId 的 ref 由 route 做 canvas-edit authz 授权后移除(service 信任 route
       // 授权,不做 ownerFp 校验——使 editor 能 detach owner 的 ref);无 canvasId 的 legacy ref 回退到
@@ -538,7 +604,10 @@ export const createFsAssetBackend = (root: string): AssetStoreBackend => ({
       if (!ref.canvasId && ref.ownerFp !== ownerFp) {
         return { result: { kind: 'owner-mismatch' as const }, record }
       }
-      const refs = record.references.filter((r) => r.nodeId !== nodeId)
+      // 只移除该复合键的单条 ref(保留异 canvas 同 nodeId 的其他 ref)。
+      const refs = record.references.filter(
+        (r) => !(r.nodeId === nodeId && (r.canvasId ?? null) === (canvasId ?? null)),
+      )
       const atZero = refs.length === 0
       record.references = refs
       // Stamp grace start only on the >0→0 transition; preserve an existing start
@@ -625,6 +694,12 @@ export const createFsAssetBackend = (root: string): AssetStoreBackend => ({
     return records
   },
 
+  // P1-3:strict scan for owner-migration detector + rekey。坏 shard/meta fail-closed 抛错带路径
+  //   (防 strict gate 假绿:sweep 用 lenient listRecords 不崩,但 detector/rekey 须 fail-closed)。
+  async listRecordsStrict() {
+    return readAllRecordsStrict(root)
+  },
+
   async cleanOrphanTemps(now) {
     let shards: string[]
     try {
@@ -680,32 +755,9 @@ export const createFsAssetBackend = (root: string): AssetStoreBackend => ({
   },
 
   async rekeyLegacyFormOwners(resolver) {
-    // Phase 1:扫全 records + uploaders,收集 legacy owner 集合并 resolve(resolver 可能抛 → 此时未 mutation)。
-    const records: AssetRecord[] = []
-    let shards: string[]
-    try {
-      shards = await fs.readdir(root)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { migrated: 0, unmapped: 0 }
-      throw error
-    }
-    for (const shard of shards) {
-      let files: string[]
-      try {
-        files = await fs.readdir(path.join(root, shard))
-      } catch {
-        continue
-      }
-      for (const file of files) {
-        if (!file.endsWith('.meta.json')) continue
-        try {
-          const raw = await fs.readFile(path.join(root, shard, file), 'utf8')
-          records.push(JSON.parse(raw) as AssetRecord)
-        } catch {
-          // skip malformed meta(同 listRecords,不崩 sweep)
-        }
-      }
-    }
+    // Phase 1:strict 扫全 records(P1-3:坏 meta fail-closed 抛错带路径,不静默跳)+ uploaders,收集 legacy
+    //   owner 集合并 resolve(resolver 可能抛 → 此时未 mutation)。根目录 ENOENT → 合法空 store,返 0。
+    const records = await readAllRecordsStrict(root)
     const legacySet = new Set<string>()
     for (const r of records) {
       if (ASSET_LEGACY_FINGERPRINT_RE.test(r.ownerFp)) legacySet.add(r.ownerFp)
@@ -859,7 +911,10 @@ export const createMemoryAssetBackend = (): MemoryAssetBackend => {
       assertValidAssetId(contentHash)
       const record = _records.get(contentHash)
       if (!record) return { record: null, newlyAttached: false }
-      const exists = record.references.some((r) => r.nodeId === ref.nodeId)
+      // P1-4:ref 身份 = (canvasId, nodeId) 复合键(防异 canvas 同 nodeId 串引用)。
+      const exists = record.references.some(
+        (r) => r.nodeId === ref.nodeId && (r.canvasId ?? null) === (ref.canvasId ?? null),
+      )
       if (!exists) {
         record.references = [...record.references, ref]
         record.lastRefZeroAt = null
@@ -868,11 +923,14 @@ export const createMemoryAssetBackend = (): MemoryAssetBackend => {
       return { record, newlyAttached: !exists }
     },
 
-    async detachRef(contentHash, nodeId, ownerFp, now) {
+    async detachRef(contentHash, nodeId, canvasId, ownerFp, now) {
       assertValidAssetId(contentHash)
       const record = _records.get(contentHash)
       if (!record) return { result: { kind: 'missing' }, record: null }
-      const idx = record.references.findIndex((r) => r.nodeId === nodeId)
+      // P1-4:按 (canvasId, nodeId) 复合键 find + 只删该单条 ref(保留异 canvas 同 nodeId 的其他 ref)。
+      const idx = record.references.findIndex(
+        (r) => r.nodeId === nodeId && (r.canvasId ?? null) === (canvasId ?? null),
+      )
       if (idx === -1) return { result: { kind: 'already-detached' }, record }
       // G2.2(decision 2):带 canvasId 的 ref 由 route 做 canvas-edit authz 后移除;legacy ref(无 canvasId)
       // 回退 ownerFp 校验(owner-mismatch,decidable)。与 fs backend 同语义。
@@ -880,7 +938,9 @@ export const createMemoryAssetBackend = (): MemoryAssetBackend => {
       if (!ref.canvasId && ref.ownerFp !== ownerFp) {
         return { result: { kind: 'owner-mismatch' }, record }
       }
-      const refs = record.references.filter((r) => r.nodeId !== nodeId)
+      const refs = record.references.filter(
+        (r) => !(r.nodeId === nodeId && (r.canvasId ?? null) === (canvasId ?? null)),
+      )
       const atZero = refs.length === 0
       record.references = refs
       record.lastRefZeroAt = atZero ? record.lastRefZeroAt ?? now : null
@@ -901,6 +961,11 @@ export const createMemoryAssetBackend = (): MemoryAssetBackend => {
     },
 
     async listRecords() {
+      return [..._records.values()]
+    },
+
+    // P1-3:memory 无 fs,strict scan = listRecords(无 read/parse 错,不抛)。
+    async listRecordsStrict() {
       return [..._records.values()]
     },
 
@@ -1006,9 +1071,11 @@ export type AssetStore = {
    *  `now` retained as 4th param for backward-compat with existing service tests (vestigial —
    *  attachRef does not stamp time); canvasId is the new 5th param. */
   attach(assetId: string, nodeId: string, ownerFp: string, now?: number, canvasId?: string): Promise<AttachResult>
-  /** Idempotent detach (P1.2): remove (assetId, nodeId). G2.2: route pre-authorizes canvas-edit
-   *  on the reference's canvas; service removes by nodeId (legacy refs w/o canvasId keep ownerFp check). */
-  detach(assetId: string, nodeId: string, ownerFp: string, now?: number): Promise<DetachResult>
+  /** Idempotent detach (P1.2): remove the ref matching (canvasId, nodeId) composite key. G2.2: route
+   *  pre-authorizes canvas-edit on the reference's canvas; service removes by composite key (P1-4:
+   *  preserves same-nodeId refs in other canvases). Legacy refs w/o canvasId keep ownerFp check.
+   *  `now` 4th param retained for backward-compat with existing service tests; canvasId is the new 5th. */
+  detach(assetId: string, nodeId: string, ownerFp: string, now?: number, canvasId?: string): Promise<DetachResult>
   /** Delete records + bytes whose grace has expired. Re-checks eligibility atomically
    *  per hash (P1.1): a concurrent attach during sweep aborts that asset's delete.
    *  Callable sweep entry — recommended cron (see docs/decisions/soft-delete-semantics.md). */
@@ -1187,9 +1254,9 @@ export const createAssetStore = (backend: AssetStoreBackend): AssetStore => {
     return newlyAttached ? { kind: 'attached' } : { kind: 'already-attached' }
   }
 
-  const detach: AssetStore['detach'] = async (assetId, nodeId, ownerFp, now) => {
+  const detach: AssetStore['detach'] = async (assetId, nodeId, ownerFp, now, canvasId) => {
     assertValidAssetId(assetId)
-    const { result } = await backend.detachRef(assetId, nodeId, ownerFp, nowOrDefault(now))
+    const { result } = await backend.detachRef(assetId, nodeId, canvasId, ownerFp, nowOrDefault(now))
     return result
   }
 
@@ -1247,8 +1314,9 @@ export const createAssetStore = (backend: AssetStoreBackend): AssetStore => {
   const countLegacyFormOwners: AssetStore['countLegacyFormOwners'] = async () => {
     // 扫 AssetRecord.ownerFp(first uploader 归属打标)+ references[].ownerFp(attach 方)+ .uploaders
     // (dedup uploader 注册表)三处 legacy 指纹;去重(同一 legacy ownerFp 多处计 1)。
+    // P1-3:用 strict scan(listRecordsStrict)——坏 meta fail-closed 抛错带路径,防 strict gate 假绿 0 通过。
     const legacy = new Set<string>()
-    const records = await backend.listRecords()
+    const records = await (backend.listRecordsStrict ?? backend.listRecords)()
     for (const record of records) {
       if (ASSET_LEGACY_FINGERPRINT_RE.test(record.ownerFp)) legacy.add(record.ownerFp)
       for (const ref of record.references) {
