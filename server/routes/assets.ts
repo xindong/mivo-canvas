@@ -469,14 +469,15 @@ export const createAssetRoutes = (options: AssetRouteOptions): App => {
       log(404, 'missing')
       return c.json({ kind: 'missing' } satisfies { kind: 'missing' }, 404)
     }
-    // P1-4:按 (canvasId, nodeId) 复合键 find ref。bodyCanvasId 提供时优先匹配该 canvas 的 ref;
-    // 无 bodyCanvasId(legacy 路径)按裸 nodeId find。找不到 → already-detached(幂等)。
+    // P1-4 残留2:复合键选择。bodyCanvasId 存在→精确 (bodyCanvasId, nodeId);未找到则 legacy 兜底
+    //   (r.nodeId===nodeId && !r.canvasId);bodyCanvasId 缺失→只匹配 legacy(canvasId===undefined)ref,
+    //   新 ref(canvasId 存在)一律要求显式 canvasId(裸 nodeId 不任取第一条,防复合键语义破坏 + 误删他 canvas ref)。
     const ref = bodyCanvasId
       ? (record.references.find((r) => r.nodeId === nodeId && r.canvasId === bodyCanvasId)
         ?? record.references.find((r) => r.nodeId === nodeId && !r.canvasId)) // legacy 兜底
-      : record.references.find((r) => r.nodeId === nodeId)
+      : record.references.find((r) => r.nodeId === nodeId && !r.canvasId) // 无 bodyCanvasId → 只匹配 legacy ref
     if (!ref) {
-      // ref 已不在 → already-detached(幂等 intent 已满足)。
+      // ref 已不在(或新 ref 需显式 canvasId 但 body 未提供)→ already-detached(幂等 intent 已满足)。
       log(200, 'already-detached')
       return c.json({ kind: 'already-detached' } as { kind: 'already-detached' }, 200)
     }
@@ -494,8 +495,10 @@ export const createAssetRoutes = (options: AssetRouteOptions): App => {
         return c.json(access.body as Record<string, unknown>, access.status as 400 | 403 | 404 | 410)
       }
     }
-    // authz 过(新 ref canvas-edit / legacy ref 走 service ownerFp)→ detach(P1-4:传 refCanvasId 复合键删除)。
-    const result = await store.detach(assetId, nodeId, ownerFp, undefined, ref.canvasId ?? bodyCanvasId)
+    // authz 过(新 ref canvas-edit / legacy ref 走 service ownerFp)→ detach(P1-4 残留2:传 ref.canvasId
+    //   本身;legacy ref → undefined,**禁回填 bodyCanvasId**——否则 backend 按 (bodyCanvasId, nodeId)
+    //   复合键查 legacy ref (null, nodeId) → 匹配不到 → 假 already-detached)。
+    const result = await store.detach(assetId, nodeId, ownerFp, undefined, ref.canvasId)
     switch (result.kind) {
       case 'detached':
         log(200, 'detached')

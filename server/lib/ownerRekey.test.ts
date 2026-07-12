@@ -133,14 +133,66 @@ describe('G2.2/P1-3 — fs detector/rekey strict scan(坏 meta fail-closed,防 s
     }
   })
 
-  it('meta schema invalid(缺 contentHash/references)→ 抛错带路径', async () => {
+  // P1-3 残留1:完整 AssetRecord runtime 校验——3 类负例(detector + rekey 都抛带 meta 路径)。
+  /** 写一个 valid-shape record(可 overrides 局部破坏某一字段验 schema 校验)。 */
+  const writeMeta = (dir: string, hash: string, overrides: Record<string, unknown> = {}): void => {
+    const rec = {
+      contentHash: hash,
+      mimeType: 'image/png',
+      sizeBytes: 4,
+      originalName: 'a.png',
+      ownerFp: FP_ALICE,
+      references: [],
+      createdAt: 1,
+      lastRefZeroAt: null,
+      ...overrides,
+    }
+    mkdirSync(join(dir, hash.slice(0, 2)), { recursive: true })
+    writeFileSync(join(dir, hash.slice(0, 2), `${hash}.meta.json`), JSON.stringify(rec))
+  }
+
+  it('缺 ownerFp → 抛错(ownerFp must be a non-empty string)', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'mivo-strict-'))
     try {
-      mkdirSync(join(dir, 'ab'), { recursive: true })
-      // valid JSON 但缺 contentHash/references → schema invalid。
-      writeFileSync(join(dir, 'ab', `${BAD_HASH}.meta.json`), JSON.stringify({ foo: 'bar' }))
+      writeMeta(dir, BAD_HASH, { ownerFp: undefined })
       const store = createAssetStore(createFsAssetBackend(dir))
-      await expect(store.countLegacyFormOwners!()).rejects.toThrow(/strict scan: meta schema invalid/)
+      await expect(store.countLegacyFormOwners!()).rejects.toThrow(/ownerFp must be a non-empty string/)
+      await expect(store.migrateLegacyFormOwners!(() => USERNAME_ALICE)).rejects.toThrow(/ownerFp must be a non-empty string/)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('坏 reference(references[].nodeId 缺失)→ 抛错', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mivo-strict-'))
+    try {
+      writeMeta(dir, BAD_HASH, { references: [{ ownerFp: FP_ALICE }] }) // 缺 nodeId
+      const store = createAssetStore(createFsAssetBackend(dir))
+      await expect(store.countLegacyFormOwners!()).rejects.toThrow(/references\[0\]\.nodeId must be a non-empty string/)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('contentHash 非 hash64(路径越界串)→ 抛错', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mivo-strict-'))
+    try {
+      // 文件名用 BAD_HASH(合法 hex64),但 contentHash 写 '../../x'(防拿未校验 contentHash 拼 path)。
+      writeMeta(dir, BAD_HASH, { contentHash: '../../x' })
+      const store = createAssetStore(createFsAssetBackend(dir))
+      await expect(store.countLegacyFormOwners!()).rejects.toThrow(/contentHash must be lowercase sha256 hex64/)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('contentHash 与文件名不一致 → 抛错(防 hash 不匹配)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mivo-strict-'))
+    try {
+      const otherHash = 'cd' + '1'.repeat(62) // 合法 hex64,但 ≠ BAD_HASH(文件名)
+      writeMeta(dir, BAD_HASH, { contentHash: otherHash })
+      const store = createAssetStore(createFsAssetBackend(dir))
+      await expect(store.countLegacyFormOwners!()).rejects.toThrow(/contentHash .* ≠ filename hash/)
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

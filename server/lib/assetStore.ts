@@ -449,10 +449,47 @@ const readAllRecordsStrict = async (root: string): Promise<AssetRecord[]> => {
       } catch (error) {
         throw new Error(`asset store strict scan: malformed meta JSON at ${p}: ${(error as Error).message}`, { cause: error })
       }
-      if (typeof parsed !== 'object' || parsed === null
-        || typeof (parsed as AssetRecord).contentHash !== 'string'
-        || !Array.isArray((parsed as AssetRecord).references)) {
-        throw new Error(`asset store strict scan: meta schema invalid at ${p} (missing contentHash/references)`)
+      // P1-3 残留1:完整 AssetRecord runtime 校验(防 `{contentHash:'../../x'}` / 缺 ownerFp 等过 shallow 检查
+      //   → detector 把 undefined 当非 legacy 假绿 + rekey 拿未校验 contentHash 拼 uploader path 路径越界)。
+      //   contentHash 必须 hash64 **且与文件名一致**;ownerFp/mimeType/originalName/sizeBytes/createdAt 类型合法;
+      //   lastRefZeroAt number|null;references 每项 nodeId/ownerFp 必填 string、canvasId 可选 string。
+      const expectedHash = file.replace(/\.meta\.json$/, '')
+      const schemaErr = (msg: string): string =>
+        `asset store strict scan: meta schema invalid at ${p}: ${msg}`
+      if (typeof parsed !== 'object' || parsed === null) throw new Error(schemaErr('not an object'))
+      const rec = parsed as Partial<AssetRecord>
+      if (typeof rec.contentHash !== 'string' || !ASSET_ID_RE.test(rec.contentHash)) {
+        throw new Error(schemaErr(`contentHash must be lowercase sha256 hex64, got ${JSON.stringify(rec.contentHash)}`))
+      }
+      if (rec.contentHash !== expectedHash) {
+        throw new Error(schemaErr(`contentHash ${rec.contentHash} ≠ filename hash ${expectedHash} (path traversal / mismatch)`))
+      }
+      if (typeof rec.ownerFp !== 'string' || rec.ownerFp.length === 0) {
+        throw new Error(schemaErr(`ownerFp must be a non-empty string, got ${JSON.stringify(rec.ownerFp)}`))
+      }
+      if (typeof rec.mimeType !== 'string') throw new Error(schemaErr('mimeType must be string'))
+      if (typeof rec.originalName !== 'string') throw new Error(schemaErr('originalName must be string'))
+      if (typeof rec.sizeBytes !== 'number' || !Number.isFinite(rec.sizeBytes)) {
+        throw new Error(schemaErr(`sizeBytes must be a finite number, got ${JSON.stringify(rec.sizeBytes)}`))
+      }
+      if (typeof rec.createdAt !== 'number' || !Number.isFinite(rec.createdAt)) {
+        throw new Error(schemaErr(`createdAt must be a finite number, got ${JSON.stringify(rec.createdAt)}`))
+      }
+      if (rec.lastRefZeroAt !== null && (typeof rec.lastRefZeroAt !== 'number' || !Number.isFinite(rec.lastRefZeroAt))) {
+        throw new Error(schemaErr(`lastRefZeroAt must be number|null, got ${JSON.stringify(rec.lastRefZeroAt)}`))
+      }
+      if (!Array.isArray(rec.references)) throw new Error(schemaErr('references must be an array'))
+      for (let i = 0; i < rec.references.length; i++) {
+        const ref = rec.references[i] as Partial<AssetReference> | undefined
+        if (typeof ref?.nodeId !== 'string' || ref.nodeId.length === 0) {
+          throw new Error(schemaErr(`references[${i}].nodeId must be a non-empty string`))
+        }
+        if (typeof ref.ownerFp !== 'string' || ref.ownerFp.length === 0) {
+          throw new Error(schemaErr(`references[${i}].ownerFp must be a non-empty string`))
+        }
+        if (ref.canvasId !== undefined && typeof ref.canvasId !== 'string') {
+          throw new Error(schemaErr(`references[${i}].canvasId must be string|undefined, got ${JSON.stringify(ref.canvasId)}`))
+        }
       }
       records.push(parsed as AssetRecord)
     }

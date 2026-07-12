@@ -253,6 +253,122 @@ describe('G2.2 D4 — attach/detach/upload 权限矩阵 (InMemory)', () => {
   })
 })
 
+// G2.2 P1-4 残留2:route detach 键选择(exact / legacy fallback 不回填 / 无 body canvasId+新 ref / 双 canvas 不同 owner 同 nodeId)。
+describe('G2.2 P1-4 残留2 — route detach 复合键选择(InMemory route 级)', () => {
+  const seedOwnerCanvas = async (persist: PersistBackend, ownerKey: string, ids: { project: string; canvas: string; node: string }) => {
+    const fp = fingerprintOfPlatformKey(ownerKey)
+    await persist.ensureCreate(fp, 'project', ids.project, { title: 'p' }, { method: 'POST', resourceKind: 'project' })
+    await persist.createCanvasWithCollection(fp, ids.canvas, { projectId: ids.project }, { method: 'POST', resourceKind: 'canvas' })
+    await persist.ensureCreateChild(fp, ids.canvas, 'node', ids.node, { type: 'image' }, { method: 'POST', resourceKind: 'node' })
+    return fp
+  }
+
+  it('exact:body 带 canvasId 命中精确 (canvasId,nodeId) 复合键 → detached', async () => {
+    const persist = createPersistBackend()
+    const permissions = new InMemoryPermissionBackend()
+    const assetStore = createAssetStore(createMemoryAssetBackend())
+    const app = buildApp(persist, permissions, assetStore)
+    const f = await seedFixture(persist, permissions, assetStore, app, 'exact') // owner ref (node, canvas)
+    const r = await detachReq(app, f, MIVO_KEY_OWNER, undefined) // body {nodeId, canvasId=f.ids.canvas}
+    expect(r.status).toBe(200)
+    expect(await r.json()).toEqual({ kind: 'detached' })
+  })
+
+  it('legacy fallback:body 带 canvasId 但只有 legacy ref(无 canvasId)→ 命中 legacy ref + 传 undefined(禁回填)→ detached(非 already-detached)', async () => {
+    const persist = createPersistBackend()
+    const permissions = new InMemoryPermissionBackend()
+    const assetStore = createAssetStore(createMemoryAssetBackend())
+    const app = buildApp(persist, permissions, assetStore)
+    // service 级 attach 一个 legacy ref(无 canvasId)——模拟 G2.2 前写入的 ref。
+    const bytes = await realPng()
+    const form = new FormData()
+    form.append('image', new File([bytes], 'a.png', { type: 'image/png' }), 'a.png')
+    const upRes = await app.request('/api/assets', { method: 'POST', headers: hdr(MIVO_KEY_OWNER), body: form })
+    const assetId = ((await upRes.json()) as { assetId: string }).assetId
+    const fpOwner = fingerprintOfPlatformKey(MIVO_KEY_OWNER)
+    await assetStore.attach(assetId, 'legacy-node', fpOwner) // legacy ref(无 canvasId)
+    // route detach 带 canvasId(精确 (canvasId, 'legacy-node') 不存在)→ legacy fallback 命中 (null, 'legacy-node')
+    //   + 传 ref.canvasId=undefined(禁回填 bodyCanvasId)→ backend 按 (null, nodeId) 命中 → detached。
+    const r = await app.request(`/api/assets/${assetId}/detach`, {
+      method: 'POST',
+      headers: { ...hdr(MIVO_KEY_OWNER), 'content-type': 'application/json' },
+      body: JSON.stringify({ nodeId: 'legacy-node', canvasId: 'c-not-the-legacy-ref' }),
+    })
+    expect(r.status).toBe(200)
+    expect(await r.json()).toEqual({ kind: 'detached' })
+  })
+
+  it('无 body canvasId + 新 ref(有 canvasId)→ 只匹配 legacy(无)→ already-detached(新 ref 须显式 canvasId)', async () => {
+    const persist = createPersistBackend()
+    const permissions = new InMemoryPermissionBackend()
+    const assetStore = createAssetStore(createMemoryAssetBackend())
+    const app = buildApp(persist, permissions, assetStore)
+    const f = await seedFixture(persist, permissions, assetStore, app, 'nobody') // owner ref (node, canvas) 有 canvasId
+    // route detach 只带 nodeId(无 canvasId)→ 只匹配 legacy ref(无,因 owner ref 有 canvasId)→ already-detached。
+    const r = await app.request(`/api/assets/${f.assetId}/detach`, {
+      method: 'POST',
+      headers: { ...hdr(MIVO_KEY_OWNER), 'content-type': 'application/json' },
+      body: JSON.stringify({ nodeId: f.ids.node }), // 无 canvasId
+    })
+    expect(r.status).toBe(200)
+    expect(await r.json()).toEqual({ kind: 'already-detached' })
+    // ref 仍在(未误删):带 canvasId 仍可 detach。
+    const r2 = await detachReq(app, f, MIVO_KEY_OWNER, undefined)
+    expect(r2.status).toBe(200)
+    expect(await r2.json()).toEqual({ kind: 'detached' })
+  })
+
+  it('双 canvas 不同 owner 同 nodeId:两 ref 独立;detach 一方不影响他方(route 级,sol 指出不同 owner 可构造)', async () => {
+    const persist = createPersistBackend()
+    const permissions = new InMemoryPermissionBackend()
+    const assetStore = createAssetStore(createMemoryAssetBackend())
+    const app = buildApp(persist, permissions, assetStore)
+    // A 的 canvas-a + node 'n-shared';B 的 canvas-b + node 'n-shared'(不同 persist owner → 两 node record)。
+    const aIds = { project: 'pA', canvas: 'cA', node: 'n-shared' }
+    const bIds = { project: 'pB', canvas: 'cB', node: 'n-shared' }
+    await seedOwnerCanvas(persist, MIVO_KEY_OWNER, aIds)
+    await seedOwnerCanvas(persist, MIVO_KEY_EDITOR, bIds)
+    // B 加为 A 的 project viewer(使 B 对 canvas-a 有 read → gate② view-via-canvas-a 可 attach A 的 asset)。
+    await permissions.upsertMember(aIds.project, FP_EDITOR, 'viewer')
+    // A 上传 + attach 到 (n-shared, cA)。
+    const bytes = await realPng()
+    const form = new FormData()
+    form.append('image', new File([bytes], 'a.png', { type: 'image/png' }), 'a.png')
+    const upRes = await app.request('/api/assets', { method: 'POST', headers: hdr(MIVO_KEY_OWNER), body: form })
+    const assetId = ((await upRes.json()) as { assetId: string }).assetId
+    const attA = await app.request(`/api/assets/${assetId}/attach`, {
+      method: 'POST',
+      headers: { ...hdr(MIVO_KEY_OWNER), 'content-type': 'application/json' },
+      body: JSON.stringify({ nodeId: 'n-shared', canvasId: 'cA' }),
+    })
+    expect(attA.status).toBe(200)
+    // B attach 同 asset 到 (n-shared, cB):gate① B write on cB ✓ + node n-shared in cB ✓;gate② B 对 cA 有 read(viewer member)→ view-via-cA ✓。
+    const attB = await app.request(`/api/assets/${assetId}/attach`, {
+      method: 'POST',
+      headers: { ...hdr(MIVO_KEY_EDITOR), 'content-type': 'application/json' },
+      body: JSON.stringify({ nodeId: 'n-shared', canvasId: 'cB' }),
+    })
+    expect(attB.status).toBe(200)
+    expect(await attB.json()).toEqual({ kind: 'attached' }) // 非已存在附加——复合键 (cB, n-shared) ≠ (cA, n-shared)
+    // A detach (n-shared, cA):只删 (cA, n-shared);(cB, n-shared) 保留。
+    const detA = await app.request(`/api/assets/${assetId}/detach`, {
+      method: 'POST',
+      headers: { ...hdr(MIVO_KEY_OWNER), 'content-type': 'application/json' },
+      body: JSON.stringify({ nodeId: 'n-shared', canvasId: 'cA' }),
+    })
+    expect(detA.status).toBe(200)
+    expect(await detA.json()).toEqual({ kind: 'detached' })
+    // B 仍可 detach (n-shared, cB)——证明 cA detach 没误删 cB 的 ref。
+    const detB = await app.request(`/api/assets/${assetId}/detach`, {
+      method: 'POST',
+      headers: { ...hdr(MIVO_KEY_EDITOR), 'content-type': 'application/json' },
+      body: JSON.stringify({ nodeId: 'n-shared', canvasId: 'cB' }),
+    })
+    expect(detB.status).toBe(200)
+    expect(await detB.json()).toEqual({ kind: 'detached' })
+  })
+})
+
 // ── PG 矩阵(MIVO_PG_TEST=1 时跑;镜像同矩阵,SC2 PG 组合双绿)──
 const pgConn = () => ({
   host: process.env.MIVO_PG_HOST || '127.0.0.1',
