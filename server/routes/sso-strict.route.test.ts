@@ -24,7 +24,6 @@ import {
   ssoAuthErrorHandler,
   isDevMode,
   validateSsoConfig,
-  isLegacyFormOwner,
   assertStrictOwnerMigrationComplete,
   legacyOwnerDetector,
   type LegacyOwnerDetector,
@@ -394,7 +393,7 @@ describe('G2.1 R2-1 — assertStrictOwnerMigrationComplete 三域 gate(persist +
   })
 
   it('strict + 混合(persist legacy + username)→ 拒启动(只要有 legacy 形态即 no-go)', async () => {
-    const { persist, permissions, assets, detectors } = buildDetectors()
+    const { persist, detectors } = buildDetectors()
     await persist.ensureCreate('alice@xd.com', 'project', 'p1', {}, { method: 'POST', resourceKind: 'project' })
     await persist.ensureCreate('abcd1234ef567890', 'project', 'p2', {}, { method: 'POST', resourceKind: 'project' })
     expect(await persist.countLegacyFormOwners!()).toBe(1)
