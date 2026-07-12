@@ -689,13 +689,23 @@ pg-suite 翻 required（2026-07-12，今天）。cutover 未执行。
      # 先验 error log（base 或任一 rotated）存在且非空，观测缺失即红。
      NE=0; for f in "$BASE" "$BASE".*; do [ -f "$f" ] && [ -s "$f" ] && NE=1; done
      [ "$NE" -eq 1 ] || { echo "RED: pm2 error log 全缺失或全空（观测缺失）"; exit 1; }
-     cat "$BASE" "$BASE".* 2>/dev/null \
-       | grep -ciE "ECONNRESET|pool.*exhaust|idle.*timeout" \
-       | { read -r n; [ "$n" = "0" ]; }
+     # r8 Greptile：logrotate compress 出的 .gz 被 cat 当二进制喂 grep→计数 0 假绿；
+     # .gz 先验可解压（不可读即红，在 pipe 之前判定以免被末段 read/[ 吞 rc），
+     # 再普通文件 cat + .gz 走 gunzip -c 合流 grep 计数断言 ==0。
+     for g in "$BASE".*.gz; do [ -f "$g" ] || continue; gunzip -t "$g" 2>/dev/null || { echo "RED: gz 不可读: $g"; exit 1; }; done
+     { cat "$BASE" 2>/dev/null
+       for f in "$BASE".*; do
+         [ -f "$f" ] || continue
+         case "$f" in
+           *.gz) gunzip -c "$f" 2>/dev/null ;;
+           *)    cat "$f" 2>/dev/null ;;
+         esac
+       done
+     } | grep -ciE "ECONNRESET|pool.*exhaust|idle.*timeout" | { read -r n; [ "$n" = "0" ]; }
    '
    ```
    样例：0 命中 → rc=0 绿；≥1 命中 → rc=1 红。dry-run sample log（5 case）：① 含 `ECONNRESET`+`pool exhausted`+`idle timeout` 各 1（count=3）→ rc=1 红；② 全 clean 但文件非空（有其他非致命 error）→ count=0 → rc=0 绿；③ error log 文件缺失（pm2 未起/log 目录被删）→ rc=1 红（D4-R7b F4 修复点）；④ error log 存在但全空 → rc=1 红（观测缺失）；⑤ base 空（刚重启）但 rotated clean 非空 → rc=0 绿。
-   r5 已修 rc 反相（`{ read n; [ "${n:-0}" -eq 0 ]; }`）；r7b F4 再修剩余假绿：`${n:-0}` 空默认 0 仍假绿，改 `[ "$n" = "0" ]`（空→红）+ 前置 `[ -s "$f" ]` 日志源存在性断言（对齐 persist"观测缺失即红"）。`maxConnections=10`（`pgConfig.ts:57-58`）；r2 原命令 `pm2 logs --lines 1000` 只取近若干小时，**证不了 30 天**，r3 改扫全部保留的 error log 文件（前置表 logrotate ≥30 天保证覆盖）。
+   r5 已修 rc 反相（`{ read n; [ "${n:-0}" -eq 0 ]; }`）；r7b F4 再修剩余假绿：`${n:-0}` 空默认 0 仍假绿，改 `[ "$n" = "0" ]`（空→红）+ 前置 `[ -s "$f" ]` 日志源存在性断言（对齐 persist"观测缺失即红"）。r8 Greptile 再修：logrotate `compress` 出的 `.gz` 归档被 `cat` 当二进制喂 grep→计数 0 假绿（错误仅在 .gz 内时旧命令假绿），改 `.gz` 走 `gunzip -c`（pipe 前先验可解压、不可读即红，rc 不被末段 read/[ 吞）+ 普通文件走 `cat` + `case` 路由，存在性/非空断言不回退。dry-run 5 例（fixture 真跑，证据见 commit）：① 错误仅在 .gz 内→红（旧 `cat` 命令假绿精确复现：old GREEN rc=0 vs new RED rc=1）；② .gz 损坏→红；③ base+gz 全 clean→绿；④ 只有 base 有错→红（既有语义不回退）；⑤ 文件全缺失→红（8c6638e 存在性断言不回退）。`maxConnections=10`（`pgConfig.ts:57-58`）；r2 原命令 `pm2 logs --lines 1000` 只取近若干小时，**证不了 30 天**，r3 改扫全部保留的 error log 文件（前置表 logrotate ≥30 天保证覆盖）。
 
 4. **backup+restore drill 窗口内 ≥ 1 次成功（业务行 + asset 可恢复）**——persist **不复用** kernel C-switch event（persist 无 C-switch PR；kernel event 核心身份字段 `cSwitchPrNumber` 对 persist 无意义，r5 改 D4-R5-7）。persist 单独定义 machine-readable 事件 `docs/decisions/persist-cutover-event.json` + 独立 closeout PR 合入 main 的 drill 报告 JSON。P0.2 drill 已验业务行 + asset 可恢复；此 event/schema/guard 把它机器可核验化。
 
