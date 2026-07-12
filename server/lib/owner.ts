@@ -307,8 +307,9 @@ export const createSsoStrictProofGate = ({
 // 痛点(F1 复现):strict 切换让 resolveActor 返回 SSO username(无指纹回退),所有 legacy 形态
 // (ownerId=指纹,sha256[:16] hex)的存量数据对 SSO 用户不可见(alice 列表空)。翻 strict 前必须先跑
 // G2.2 迁移(指纹→username),否则数据"消失"。本 gate 是**机器判定**(非文字约定):启动时检测
-// legacy 形态 owner 数据>0 且 strict=1 → 拒绝启动(exit 1)。G2.2 未实装:迁移函数打桩(throw);
-// gate 机制本身真实(三域 memory backend 实扫,可测)。
+// legacy 形态 owner 数据>0 且 strict=1 → 拒绝启动(exit 1)。迁移函数 memory backend 已实装
+// (09ef7af InMemoryPersistBackend 真实 rekey,可测);PG 三域迁移随 G2.2 落地,未实现时抛
+// `not implemented (G2.2)`(fail-closed,与启动 gate 一致)。gate 机制本身真实(三域 memory backend 实扫,可测)。
 //
 // R2-1(第二轮返修,P1):返修前 gate 只收 PersistBackend → persist=0 但 permission/asset 全 legacy
 // 时放行(share_links.created_by + AssetRecord.ownerFp/references/uploaders 漏检)。G2.2 若只补 PG persist
@@ -321,8 +322,8 @@ export const createSsoStrictProofGate = ({
 //    byOwner 外层 key;PG detector 随 G2.2);
 //  - permissions(PermissionBackend):share_links.created_by(InMemory 扫 links;PG 随 G2.2);
 //  - assets(AssetStore):AssetRecord.ownerFp + references[].ownerFp + .uploaders(InMemory/fs 扫 listRecords
-//    + listUploaders;PG 随 G2.2)。asset service 未启用(MIVO_ENABLE_ASSET_SERVICE=0)时 index.ts 传
-//    countLegacyFormOwners=()=>0 的占位 detector(service off → BFF 不管理 asset 数据 → 0 legacy)。
+//    + listUploaders;PG 随 G2.2)。asset service 未启用(MIVO_ENABLE_ASSET_SERVICE=0)时 buildStartupDetectors
+//    回退构造只读 fs detector off 配置资产根(R3-F1),实扫磁盘 legacy,**不伪造 0**(见下方 buildStartupDetectors)。
 
 /**
  * legacy owner 形态 = mivo-key 指纹(sha256[:16] hex,见 keys.ts `fingerprintOfPlatformKey`)。

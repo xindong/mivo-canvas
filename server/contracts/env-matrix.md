@@ -38,6 +38,11 @@
 | `MIVO_DEV_AUTH_STUB` | 未设=`''` | `server/lib/auth-stub.ts`/`server/routes/auth.ts`/`server/index.ts` | dev 桩 `/api/auth/me` opt-in;仅 `=1 && NODE_ENV !== 'production' && MIVO_PUBLIC !== '1'` 时开。P1-b:默认关防生产忘设 NODE_ENV 返假登录 |
 | `MIVO_DEBUG_ALLOWED_ORIGINS` | localhost | `server/routes/debug-logs.ts:47` | debug-logs POST origin allowlist(CORS);逗号分隔 |
 | `MIVO_DEBUG_POST_RATE_LIMIT` | `60` | `server/routes/debug-logs.ts:40` | debug-logs POST 每 IP 每分钟上限 |
+| `MIVO_PUBLIC_ORIGIN` | 未设 | `server/routes/debug-logs.ts:93` | **生产同源放行必配**(034b46c):debug-logs POST 同源判定的最高优先级可信外部 origin(完整 `scheme://host[:port]`,如 `https://app.example`)。非空但畸形(非 http(s)/含 path/query/userinfo)→ fail-closed 返回 null,**不降级读 XFF**。与 `MIVO_DEBUG_TRUST_XFF` 互斥,优先级最高 |
+| `MIVO_DEBUG_TRUST_XFF` | 未设(关) | `server/routes/debug-logs.ts:95` | **生产同源放行必配其一**(034b46c):仅当 `MIVO_PUBLIC_ORIGIN` 为空时才看;`=1` 才从受信 `X-Forwarded-Proto` 取 scheme + Host 头取 host:port。XFP 必须**单值** `http`/`https`(多值如 `https,http` → fail-closed);`!=1` 时完全不读 XFP。两变量都未设 → 同源 fail-closed(全 403)。仅在网关 strip 客户端 XFF/XFP 且网络隔离 BFF 时开启 |
+| `MIVO_DEBUG_RETENTION_DAYS` | `7` | `server/lib/debug-records.ts:193` | debug-logs 过期 .jsonl 保留天数;append 前惰性 sweep(日期早于 today-N) |
+| `MIVO_DEBUG_DISK_QUOTA_MB` | `512` | `server/lib/debug-records.ts:200` | debug-logs 目录总字节数上限;超限(used+incoming>quota)→ 413;`0`=禁用 quota |
+| `MIVO_DEBUG_RATE_MAX_BUCKETS` | `4096` | `server/routes/debug-logs.ts:248` | per-IP rate bucket 数上限(防内存无界增长);达上限淘汰 oldest |
 | `MIVO_EAGLE_TIMEOUT_MS` | 内置 | `server/lib/eagle.ts:13` | eagle 代理请求超时 |
 | `MIVO_IMAGE_API_BASE` | `https://llm-proxy.tapsvc.com/v1/images` | `server/lib/config.ts:83` | llm-proxy 图片生成/编辑 endpoint |
 | `MIVO_LLM_API_BASE` | `https://llm-proxy.tapsvc.com/v1` | `server/lib/config.ts:84` | llm-proxy enhance endpoint |

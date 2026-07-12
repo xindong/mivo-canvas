@@ -36,7 +36,7 @@ legacy owner 形态 = mivo-key 指纹(`sha256[:16]` hex,见 `server/lib/keys.ts#
 
 ### 1.3 G2.2 迁移函数(打桩 seam)
 
-`server/lib/owner.ts#migrateLegacyOwnersToUsernameForm(backend, resolveFingerprintToUsername)` —— **G2.1 不实装**(G2.2 scope),抛 `not implemented (G2.2 scope)`。具名 seam 供 gate 测试打桩 + G2.2 固定调用点。真实 G2.2 实现需 fingerprint→username 映射(需原 `mivo_` key 或预建映射表)+ 跨三 backend 重键 owner。
+`server/lib/owner.ts#migrateLegacyOwnersToUsernameForm(backend, resolveFingerprintToUsername)` —— **memory backend 已实装**(09ef7af `InMemoryPersistBackend` 真实 rekey,供 seed→打桩迁移→strict 可见 / unmapped no-go 测试);PG 三域(persist/permissions/assets)跨 backend 迁移仍属 G2.2 scope,未实现时抛 `not implemented (G2.2)`(fail-closed,与启动 gate 一致)。具名 seam 供 gate 测试打桩 + G2.2 固定调用点。真实 G2.2 实现需 fingerprint→username 映射(需原 `mivo_` key 或预建映射表)+ 跨三 backend 重键 owner。
 
 ### 1.4 gate 测试(打桩迁移)
 
@@ -153,6 +153,8 @@ strict 模式下每条 stateful route 的鉴权域 + 测试引用:
 - [ ] **真实网关四项验收**(§3)由 lead/ops 在生产网关实测签字:① client 伪造 header 被剥离 ② 已登录注入真实 username ③ 绕网关被挡 ④ BFF 非网关不可达。〔待 lead 生产实测〕
 - [ ] **`MIVO_GATEWAY_SECRET` 已设**(≥32 字节高熵,已轮换,不入日志/git)。
 - [ ] **静态 secret 信任根评估**(§4)已确认 §4.2 前提满足,或已立 G2.1b 升级项(mTLS/时效签名)。
+- [ ] **`MIVO_PUBLIC_ORIGIN` 已设**(034b46c 起生产必配,推荐方案):固定 canonical origin(如 `https://<canonical-host>`),debug-logs POST 同源放行靠它判定。非空但畸形 → fail-closed 不降级 XFF。详见 `docs/bff-deployment.md` + `server/contracts/env-matrix.md`。
+- [ ] **或 `MIVO_DEBUG_TRUST_XFF=1`(备选方案,仅网关 strip 客户端 XFF/XFP + 网络隔离 BFF 时)**:X-Forwarded-Proto 必须单值 `http`/`https`(多值 fail-closed)。与 `MIVO_PUBLIC_ORIGIN` 互斥,优先级更低。两者皆缺 → 同源 POST 全 403(客户端 debugLogger 写入失败)。
 - [ ] **route security matrix**(§5)每路由鉴权域已测试覆盖。
 
 > 未满足前翻 strict → 启动 gate 拒启动(persist legacy 数据>0)或运行时 401(缺 gateway secret)。G2.2 未实装前,strict 不得翻开。
