@@ -38,6 +38,23 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
     expect(body.sourceTemplateId).toBe('tpl-1')
   })
 
+  it('R3 F2-B: POST /api/canvas 空 projectId → 400 bad-body(零项目账号修复前客户端 enqueue 此 → 终态删记录 → 画布消失)', async () => {
+    // 真 Hono 刻画修复所规避的失败模式:server 模式零项目账号此前 fallback projectId='' →
+    // POST 返 400 bad-body → 队列 classifyHttpStatus → rejected terminal → deleteWrite → 刷新画布消失。
+    // 客户端修(documentSlice 零项目时自动建 project)后不再 enqueue 空 projectId,本测试刻画服务端
+    // 为什么空 projectId 必然失败(契约守门,非静默 200)。
+    await seedProject()
+    const empty = await req(app, '/api/canvas', {
+      method: 'POST',
+      headers: { ...hdr(KEY_A), 'content-type': 'application/json' },
+      body: JSON.stringify({ id: 'c1', projectId: '', title: 'C' }),
+    })
+    expect(empty.status).toBe(400)
+    const errBody = empty.body as { error: string; message: string }
+    expect(errBody.error).toBe('bad-request')
+    expect(errBody.message).toMatch(/projectId/i)
+  })
+
   it('R3 F1: sourceTemplateId 真路由存活契约 —— rename PUT(不带 sourceTemplateId)后 GET 仍存活', async () => {
     // 客户端 coalesce(createCanvas+updateCanvas before drain)依赖服务端这条契约:
     // 生产 rename/move 的 PUT payload 不带 sourceTemplateId,服务端必须按字段级合并保留既有值,

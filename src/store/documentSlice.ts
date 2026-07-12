@@ -47,12 +47,25 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
   historyFuture: [],
   createCanvas: (title = 'Untitled Canvas', options) => {
     const id = createCanvasId()
-    // R2 F2:server 模式 standalone canvas 强制归 project(防 POST /api/canvas projectId='' → 404 unknown-project
-    // 被队列当 rejected 删)。local 模式保持 options?.projectId(undefined = standalone,零变化)。
+    // R2 F2 / R3 F2-B:server 模式 canvas 必须归 project(防 POST /api/canvas projectId='' → 400
+    // bad-body / 404 unknown-project 被队列当 rejected terminal 删 → 刷新画布消失)。
+    //   - R2 F2:有 project 时强制归 project(原本 fallback '' 致 standalone canvas 终态失败)。
+    //   - R3 F2-B:零项目账号此前 fallback '' → 真 Hono 400 → 终态删记录 → 画布消失。修:零项目时
+    //     先自动建默认 project(createProject 同步 mint id + enqueue createProject),canvas 归它;
+    //     createProject 先于 createCanvas enqueue(drain 顺序保证 projectId 先服务端建好)。
+    // local 模式保持 options?.projectId(undefined = standalone,零变化)。
     // docProjectId 用于本地 doc(local standalone=undefined);opProjectId 用于 enqueue op(string 要求,'' 兜底)。
-    const docProjectId = isServerPersist
-      ? (options?.projectId ?? get().projects[0]?.id ?? '')
-      : options?.projectId
+    let docProjectId: string | undefined
+    if (isServerPersist) {
+      if (options?.projectId) {
+        docProjectId = options.projectId
+      } else {
+        const firstExisting = get().projects[0]?.id
+        docProjectId = firstExisting ?? get().createProject('Default Project')
+      }
+    } else {
+      docProjectId = options?.projectId
+    }
     const opProjectId = docProjectId ?? ''
 
     set((state) => {
