@@ -723,6 +723,7 @@ export class InMemoryPermissionBackend implements PermissionBackend {
    * memory 的 stale-op 判定走 hasSuperseded(见 attemptCompensation)。PG 对偶实现真正改 projects.is_deleted。
    * 双后端契约套件对两后端同形调用,保证对称性(memory 忽略、PG 生效,结果一致)。
    */
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- memory backend 无 projects 表;参数(下划线前缀=故意不用)仅满足双后端契约套件对称调用,PG 对偶实现真改 projects.is_deleted
   __setProjectDeletedForTest(_projectId: string, _isDeleted: boolean): void {
     /* no-op: memory 无 projects 表 */
   }
