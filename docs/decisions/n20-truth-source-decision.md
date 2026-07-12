@@ -413,24 +413,33 @@ npm test -- src/lib/serverPersistAdapter.contract.test.ts server/persist/backend
 ### 10.1 op schema(field-level,走 #194 PATCH envelope;v2 对齐 G1-b R2)
 
 ```ts
-type FieldPath = readonly [string | number, ...(string | number)[]]  // ★ 非空 tuple(G1-b R2-P1-1)
+// DomainOp = 中性 delta(transport-neutral):set/unset/array/reorder 无 recordId/actor/base/opId
+//   (recordId ← URL path;actor ← resolveActor;base ← If-Match;opId ← idempotency-key header,全 adapter 注入)。
+//   create 例外:recordId = client-proposed 新 record id(独立 create body,非 path 注入)。
+type FieldPath = readonly [string | number, ...(string | number)[]]  // 非空 tuple(G1-b R2-P1-1,S10-6 运行时拒空)
 
 type DomainOp =
-  | { kind: 'create'; recordId: string; type: 'node'|'edge'|'anchor'; payload: unknown }  // 补 create 语义(#194 现状 PATCH missing 恒 not-found 的缺陷)
-  | { kind: 'set'; recordId: string; fieldPath: FieldPath; value: unknown }
-  | { kind: 'unset'; recordId: string; fieldPath: FieldPath }
-  | { kind: 'array'; recordId: string; fieldPath: FieldPath; intent: 'insert'|'remove'|'splice'; afterId: string|null; removeId?: string; removeCount?: number; values?: {id:string}[] }  // ★ by-stable-id(G1-b R2-P1-1),非 index
-  | { kind: 'reorder'; parentId: string; orderedIds: string[] }
-  | { kind: 'strict-tx'; ops: DomainOp[] }  // 严格事务路径(跨 record 原子,§10.4)
+  | { kind: 'create'; recordId: string; type: 'node'|'edge'|'anchor'; payload: unknown }  // create 例外:新 id(client-proposed,非 path 注入)
+  | { kind: 'set'; fieldPath: FieldPath; value: unknown }                                   // 无 recordId(path 注入)
+  | { kind: 'unset'; fieldPath: FieldPath }                                                 // 无 recordId
+  | { kind: 'array'; fieldPath: FieldPath; class: 'by-id'; intent: 'insert'; afterId: string|null; value: {id:string} }  // ① by-stable-id(fills/strokes/effects)
+  | { kind: 'array'; fieldPath: FieldPath; class: 'by-id'; intent: 'remove'; removeId: string }
+  | { kind: 'array'; fieldPath: FieldPath; class: 'by-id'; intent: 'splice'; afterId: string; removeCount: number; values: {id:string}[] }
+  | { kind: 'array'; fieldPath: FieldPath; class: 'whole-lww'; intent: 'replace'; value: unknown[] }  // ② 无 stable-id(markupPoints)整值 LWW
+  | { kind: 'array'; fieldPath: FieldPath; class: 'primitive'; intent: 'insert'|'remove'; value: string }  // ③ primitive(resultNodeIds)by value
+  | { kind: 'reorder'; orderedIds: string[] }                                              // parentId 从 path 注入
+  | { kind: 'strict-tx'; ops: DomainOp[] }                                                 // 严格事务路径(跨 record 原子,§10.4)
 ```
 
-**三层信任边界(P1-3)**:
+**三层信任边界(R3 F1:对齐 spike S10-2/S10-3 权威类型,body 零 privileged 载体)**:
 ```ts
-// 客户端 payload(不可信:actor/recordId/baseRevision 可伪造)
-type ClientFieldOp = { opId; clientId; actor?; recordId?; baseRevision?; fieldPath; value }
-// 服务端 trusted(actor 来自 resolveActor(authz);recordId 来自 URL path;base 来自 If-Match;opId 来自 idempotency-key header 单一权威载体)
-type TrustedFieldOp = { opId; clientId; actor(trusted); recordId(trusted); baseRevision(trusted); fieldPath; value }
-// trustify:丢弃 body 的 actor/recordId/base,用 trusted 源覆盖(S10-2)
+// 客户端 payload(不可信):零 privileged 载体 — 无 opId/actor/recordId/baseRevision(全 adapter 注入)
+type ClientFieldOp = { clientId: string; domain: DomainOp }
+// 服务端 trusted(actor ← resolveActor(authz);recordId ← URL path;base ← If-Match;opId ← idempotency-key header 单一权威载体)
+type TrustedCtx = { opId: string; clientId: string; actor: string; recordId: string; baseRevision: Revision }
+type WireOp = TrustedCtx & { domain: DomainOp }
+// trustify:ClientFieldOp.domain + TrustedCtx → WireOp(body 无 privileged 字段可伪造,S10-2 类型级断言)
+const trustify = (client: ClientFieldOp, ctx: TrustedCtx): WireOp => ({ ...ctx, domain: client.domain })
 ```
 
 ### 10.2 wire(#194 envelope 不变,payload 演进;cutover 策略见 §1.2)
