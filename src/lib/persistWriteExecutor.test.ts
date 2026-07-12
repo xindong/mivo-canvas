@@ -60,7 +60,8 @@ describe('G1-a persistWriteExecutor — 非画布域写 dispatch(stub BFF)', () 
   it('createProject op → success', async () => {
     const exec = stubExecutor(makeStubBff())
     const op: WriteOp = { kind: 'createProject', name: 'p', id: 'p1' }
-    expect(await exec(op, 'idem-1')).toEqual({ status: 'success' })
+    // R2 F1:成功响应携带服务端 revision(drain 经 onSuccess 回灌 store)。
+    expect(await exec(op, 'idem-1')).toEqual({ status: 'success', revision: 0 })
   })
 
   it('putUserState op → success;既存缺 base → 428 → rejected(非 transient,不重试)', async () => {
@@ -186,7 +187,8 @@ describe('G1-a persistWriteExecutor — 非画布域新 op dispatch(stub BFF)', 
   it('updateProject → PATCH /api/projects/:id,body {name},带 if-match', async () => {
     const { fetch, calls } = captureCalls()
     const exec = createAdapterWriteExecutor({ fetch, baseUrl: '', getAuthHeaders: () => ah() })
-    expect(await exec({ kind: 'updateProject', projectId: 'p1', name: 'renamed', baseRevision: 3 }, 'u1')).toEqual({ status: 'success' })
+    // R2 F1:成功响应携带服务端 revision(captureCalls 默认 body {id:'x',revision:0})。
+    expect(await exec({ kind: 'updateProject', projectId: 'p1', name: 'renamed', baseRevision: 3 }, 'u1')).toEqual({ status: 'success', revision: 0 })
     expect(calls[0]).toMatchObject({ method: 'PATCH', path: '/api/projects/p1', body: { name: 'renamed' } })
     expect(calls[0].headers['if-match']).toBe('3')
   })
@@ -197,15 +199,16 @@ describe('G1-a persistWriteExecutor — 非画布域新 op dispatch(stub BFF)', 
     expect(calls[0]).toMatchObject({ method: 'DELETE', path: '/api/projects/p-gone' })
   })
   it('createCanvas → POST /api/canvas,body {projectId,id,title}', async () => {
-    const { fetch, calls } = captureCalls()
+    const { fetch, calls } = captureCalls(200, { id: 'c1', metaRevision: 5 })
     const exec = createAdapterWriteExecutor({ fetch, baseUrl: '', getAuthHeaders: () => ah() })
-    expect(await exec({ kind: 'createCanvas', canvasId: 'c1', projectId: 'p1', title: 't' }, 'cc1')).toEqual({ status: 'success' })
+    // R2 F1:成功响应携带 CanvasMeta.metaRevision(drain 经 onSuccess 回灌 store.canvases[id].metaRevision)。
+    expect(await exec({ kind: 'createCanvas', canvasId: 'c1', projectId: 'p1', title: 't' }, 'cc1')).toEqual({ status: 'success', revision: 5 })
     expect(calls[0]).toMatchObject({ method: 'POST', path: '/api/canvas', body: { projectId: 'p1', id: 'c1', title: 't' } })
   })
   it('updateCanvas → PUT /api/canvas/:id,body {payload:{projectId,title}},带 if-match', async () => {
-    const { fetch, calls } = captureCalls()
+    const { fetch, calls } = captureCalls(200, { id: 'c1', metaRevision: 7 })
     const exec = createAdapterWriteExecutor({ fetch, baseUrl: '', getAuthHeaders: () => ah() })
-    expect(await exec({ kind: 'updateCanvas', canvasId: 'c1', projectId: 'p1', title: 'new', baseRevision: 2 }, 'uc1')).toEqual({ status: 'success' })
+    expect(await exec({ kind: 'updateCanvas', canvasId: 'c1', projectId: 'p1', title: 'new', baseRevision: 2 }, 'uc1')).toEqual({ status: 'success', revision: 7 })
     expect(calls[0]).toMatchObject({ method: 'PUT', path: '/api/canvas/c1' })
     expect(calls[0].body).toEqual({ payload: { projectId: 'p1', title: 'new' } })
     expect(calls[0].headers['if-match']).toBe('2')

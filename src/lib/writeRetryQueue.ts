@@ -174,7 +174,7 @@ export type QueuedWrite = {
 // ── Executor seam (T1.3 plugs the real fetch here) + outcome classification ──
 
 export type WriteOutcome =
-  | { status: 'success' }
+  | { status: 'success'; revision?: Revision }
   | { status: 'conflict'; currentRevision: Revision }
   | { status: 'too-large'; limit: number }
   | { status: 'unauthorized' }
@@ -273,6 +273,42 @@ export const isDeleteKind = (kind: WriteOpKind): boolean =>
   kind === 'deleteCanvas' ||
   kind === 'detachAsset' || // 404(missing asset/ref)→ 幂等 success(detach intent 已满足);403 owner-mismatch → rejected
   kind === 'deleteChatMessage' // 404(已删 / 跨 actor)→ 幂等 success
+
+/**
+ * G1-a R2 F1:同资源 op 组合规则(在 drain 前的 enqueue coalesce 用)。返回合并后的 op,
+ * 或 'cancel' 表示净消(删 pending 记录,不发任何请求)。
+ *
+ * 旧实现 `existing.op = op` 无差别替换 kind:pending create 被随后的 update 原地替换成 update,
+ * drain 只发 PATCH/PUT,服务端从未收到 POST(create 丢失)——新建后快速重命名会 404。
+ *
+ * 组合规则:
+ *  - create+update → 合并为 create 的最终 body(保留 create kind;drop baseRevision,create 无 base)。
+ *  - create+delete → 净消(资源从未服务端创建,delete 无意义)。
+ *  - 其余(update+update / update+delete / delete+delete / delete+update)→ last-wins(incoming)。
+ *    create+create 同 id 正常 store 流不会发生(createProject 每次新 mint id);若发生也 last-wins。
+ */
+const combineOps = (existing: WriteOp, incoming: WriteOp): WriteOp | 'cancel' => {
+  const ek = existing.kind
+  const ik = incoming.kind
+  // create+update → 保留 create kind,合并到最终 body(防 create 被 update 替换致服务端从未 POST)
+  if (ek === 'createProject' && ik === 'updateProject') {
+    return { kind: 'createProject', name: incoming.name, id: existing.id ?? incoming.projectId }
+  }
+  if (ek === 'createCanvas' && ik === 'updateCanvas') {
+    return {
+      kind: 'createCanvas',
+      canvasId: existing.canvasId,
+      projectId: incoming.projectId,
+      ...(incoming.title !== undefined ? { title: incoming.title } : {}),
+      ...(incoming.sourceTemplateId !== undefined ? { sourceTemplateId: incoming.sourceTemplateId } : {}),
+    }
+  }
+  // create+delete → 净消(资源从未服务端创建,delete 无意义)
+  if (ek === 'createProject' && ik === 'deleteProject') return 'cancel'
+  if (ek === 'createCanvas' && ik === 'deleteCanvas') return 'cancel'
+  // 其余组合:last-wins(update+update / update+delete / delete+delete / delete+update / create+create)
+  return incoming
+}
 
 /** Exponential backoff with jitter: min(base * 2^(attempts-1), max) * (0.5..1.0). */
 const backoffDelay = (attempts: number, base: number, max: number, rand: () => number): number => {
@@ -420,6 +456,15 @@ export type WriteQueueOptions = {
   maxDelayMs?: number
   drainIntervalMs?: number
   onConflict?: (op: WriteOp, currentRevision: Revision) => void
+  /**
+   * G1-a R2 F1:成功写回灌。drain 收到 success outcome 时调用,让调用方把服务端返回的新
+   * revision/metaRevision 写回 store,下一次 strict update(PATCH/PUT 带 If-Match)用 fresh base
+   * 而非陈旧值(否则 create 成功后 rename 仍带旧/缺 base → 428,或第二次 rename → 409)。
+   * outcome.revision 为服务端响应携带的 revision(Project.revision / CanvasMeta.metaRevision);
+   * 无 revision 的 op(delete/user-state/asset/chat envelope)revision 为 undefined,调用方据此跳过。
+   * 返回 Promise 时 drain 会 await(确保回灌在 drain 返回前落地,测试/后续 strict update 可见)。
+   */
+  onSuccess?: (op: WriteOp, outcome: { revision?: Revision }) => void | Promise<void>
   /** Inject for deterministic tests. Default: Date.now. */
   clock?: () => number
   /** Inject for deterministic jitter. Default: Math.random. */
@@ -451,6 +496,7 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
   const maxDelay = opts.maxDelayMs ?? DEFAULT_MAX_DELAY
   const drainInterval = opts.drainIntervalMs ?? DEFAULT_DRAIN_INTERVAL
   const onConflict = opts.onConflict
+  const onSuccess = opts.onSuccess
   const now = opts.clock ?? (() => Date.now())
   const rand = opts.random ?? (() => Math.random())
 
@@ -460,41 +506,15 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
   let onlineHandler: (() => void) | undefined
   let visibilityHandler: (() => void) | undefined
 
-  const enqueue = async (op: WriteOp): Promise<string> => {
-    // DP-7: the two device-local API keys (gateway-key/mivo-key) and secret-like
-    // user-state keys/values must NEVER enter the queue payload. Reject at the gate —
-    // never persist, never send. Reuse ALL three #194 contract scanners (no bespoke
-    // scanner) so the prior isUserStateKeyForbidden-alone gaps are closed:
-    //  - camelCase field names (gatewayKey/mivoKey) as the user-state key or nested in the
-    //    value — isUserStateKeyForbidden only knew hyphenated gateway-key/mivo-key + the
-    //    secret/token/password/apikey substrings, so key='gatewayKey' / value={mivoKey:...}
-    //    both bypassed it (P1-1).
-    //  - credential-value segments inside a colon-separated key (mivo_xxx / sk-xxx),
-    //    including URL-encoded / double-encoded variants — scanUserStateKeyForCredential.
-    //  - any sensitive field path nested arbitrarily deep in the value (camelCase,
-    //    hyphenated, prefixed, encoded) — scanForSensitiveFields, invoked with the key
-    //    wrapped as a synthetic field name so the key itself is matched against
-    //    SENSITIVE_FIELD_PATTERN (catches gatewayKey/mivoKey/secret/...) and op.value is
-    //    recursed in the same pass.
-    if (op.kind === 'putUserState' || op.kind === 'deleteUserState') {
-      const value = op.kind === 'putUserState' ? op.value : undefined
-      const keySegHit = scanUserStateKeyForCredential(op.key)
-      const fieldHit = scanForSensitiveFields({ [op.key]: value })
-      if (isUserStateKeyForbidden(op.key) || keySegHit !== null || fieldHit !== null) {
-        const reason =
-          keySegHit !== null
-            ? `forbidden credential segment in key: ${keySegHit}`
-            : fieldHit !== null
-              ? `forbidden field path: ${fieldHit}`
-              : `forbidden user-state key: ${op.key}`
-        debugLogger.error(SOURCE, `refused to queue ${op.kind} (DP-7): ${reason}`)
-        toastFeedback.error('该设置项含敏感信息,不能同步,已阻止。')
-        throw new Error(`DP-7 forbidden user-state payload: ${reason}`)
-      }
-    }
+  // G1-a R2 F1:per-resourceKey 串行链。back-to-back enqueue 到同 key 必须看到彼此的 putWrite
+  // 才能 coalesce;否则两个同步 fire 的 enqueue 竞态(第一个 IDB put 未落,第二个 getAllWrites
+  // 看不到 → 各建独立记录 → create 被当作独立 PATCH/PUT 发出,create 丢失)。链串行化同 key 入队;
+  // 跨 key 仍并发。slot 用 always-resolved 包装防 rejected 污染链 / unhandled rejection;settled 后
+  // 若无更新 enqueue 接管则 prune(Map 不随 distinct key 无界增长)。
+  const enqueueChain = new Map<string, Promise<unknown>>()
 
+  const doEnqueue = async (op: WriteOp, resourceKey: string | null): Promise<string> => {
     const userId = getPersistUserId()
-    const resourceKey = computeResourceKey(op)
     const ts = now()
     const all = await getAllWrites()
 
@@ -511,7 +531,18 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
           (r.status === 'pending' || r.status === 'paused-401'),
       )
       if (existing) {
-        existing.op = op
+        // G1-a R2 F1:kind-aware 组合(create+update 合并保留 create / create+delete 净消),
+        // 不再无差别 `existing.op = op`(会把 pending create 替换成 update 致服务端从未 POST)。
+        const combined = combineOps(existing.op, op)
+        if (combined === 'cancel') {
+          await deleteWrite(existing.id)
+          debugLogger.log(
+            SOURCE,
+            `coalesced write ${resourceKey} (create+delete net-cancel; removed pending ${existing.id})`,
+          )
+          return existing.id
+        }
+        existing.op = combined
         existing.idempotencyKey = newKey()
         existing.attempts = 0
         existing.nextAttemptAt = ts
@@ -571,6 +602,59 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
     // right after enqueue for eager send when the server is up; start()'s immediate
     // drain + periodic timer cover the pm2-restart recovery window.
     return record.id
+  }
+
+  const enqueue = (op: WriteOp): Promise<string> => {
+    // DP-7: the two device-local API keys (gateway-key/mivo-key) and secret-like
+    // user-state keys/values must NEVER enter the queue payload. Reject at the gate —
+    // never persist, never send. Reuse ALL three #194 contract scanners (no bespoke
+    // scanner) so the prior isUserStateKeyForbidden-alone gaps are closed:
+    //  - camelCase field names (gatewayKey/mivoKey) as the user-state key or nested in the
+    //    value — isUserStateKeyForbidden only knew hyphenated gateway-key/mivo-key + the
+    //    secret/token/password/apikey substrings, so key='gatewayKey' / value={mivoKey:...}
+    //    both bypassed it (P1-1).
+    //  - credential-value segments inside a colon-separated key (mivo_xxx / sk-xxx),
+    //    including URL-encoded / double-encoded variants — scanUserStateKeyForCredential.
+    //  - any sensitive field path nested arbitrarily deep in the value (camelCase,
+    //    hyphenated, prefixed, encoded) — scanForSensitiveFields, invoked with the key
+    //    wrapped as a synthetic field name so the key itself is matched against
+    //    SENSITIVE_FIELD_PATTERN (catches gatewayKey/mivoKey/secret/...) and op.value is
+    //    recursed in the same pass.
+    if (op.kind === 'putUserState' || op.kind === 'deleteUserState') {
+      const value = op.kind === 'putUserState' ? op.value : undefined
+      const keySegHit = scanUserStateKeyForCredential(op.key)
+      const fieldHit = scanForSensitiveFields({ [op.key]: value })
+      if (isUserStateKeyForbidden(op.key) || keySegHit !== null || fieldHit !== null) {
+        const reason =
+          keySegHit !== null
+            ? `forbidden credential segment in key: ${keySegHit}`
+            : fieldHit !== null
+              ? `forbidden field path: ${fieldHit}`
+              : `forbidden user-state key: ${op.key}`
+        debugLogger.error(SOURCE, `refused to queue ${op.kind} (DP-7): ${reason}`)
+        toastFeedback.error('该设置项含敏感信息,不能同步,已阻止。')
+        return Promise.reject(new Error(`DP-7 forbidden user-state payload: ${reason}`))
+      }
+    }
+
+    const resourceKey = computeResourceKey(op)
+    const run = (): Promise<string> => doEnqueue(op, resourceKey)
+    // chat messages(resourceKey=null)不串行(每条独立 op,不 coalesce),直接 run。
+    if (resourceKey === null) return run()
+    // G1-a R2 F1:同 key 串行 —— 后一个 enqueue 等前一个 putWrite 完成再 getAllWrites,保证 coalesce。
+    const prev = enqueueChain.get(resourceKey) ?? Promise.resolve()
+    const real = prev.then(run, run)
+    // slot 用 always-resolved 包装:real 若 reject(DP-7 / queue full)不污染后续链、不触发 unhandled rejection。
+    const slot: Promise<unknown> = real.then(
+      () => undefined,
+      () => undefined,
+    )
+    enqueueChain.set(resourceKey, slot)
+    // settled 后若本 slot 仍是最新(无更新 enqueue 接管)则 prune,防 Map 随 distinct key 无界增长。
+    slot.then(() => {
+      if (enqueueChain.get(resourceKey) === slot) enqueueChain.delete(resourceKey)
+    })
+    return real
   }
 
   const drain = async (): Promise<DrainResult> => {
@@ -652,6 +736,14 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
               SOURCE,
               `write ${rec.id} (${rec.resourceKey ?? rec.op.kind}) succeeded after ${rec.attempts + 1} attempt(s); removed from queue`,
             )
+            // G1-a R2 F1:把服务端返回的新 revision 回灌调用方(store),下一次 strict update 用 fresh base。
+            if (outcome.revision !== undefined) {
+              try {
+                await onSuccess?.(rec.op, { revision: outcome.revision })
+              } catch (cbErr) {
+                debugLogger.warn(SOURCE, `onSuccess callback threw: ${msg(cbErr)}`)
+              }
+            }
             await deleteWrite(rec.id)
             successes++
             break

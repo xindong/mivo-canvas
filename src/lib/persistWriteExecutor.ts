@@ -59,19 +59,20 @@ export const createAdapterWriteExecutor = (opts: FetchAdapterOptions): WriteExec
     try {
       switch (op.kind) {
         case 'createProject': {
-          await requestJson({
+          // G1-a R2 F1:回捕服务端 Project.revision,drain 经 onSuccess 回灌 store,下一次 rename 用 fresh base。
+          const result = await requestJson<Project>({
             ...base,
             method: 'POST',
             path: '/api/projects',
             body: { name: op.name, ...(op.id ? { id: op.id } : {}) },
             idempotencyKey,
           })
-          return { status: 'success' }
+          return { status: 'success', revision: result.revision }
         }
 
         case 'updateProject': {
           // PATCH /api/projects/:id,body { name },If-Match = Project.revision base。
-          await requestJson<Project>({
+          const result = await requestJson<Project>({
             ...base,
             method: 'PATCH',
             path: `/api/projects/${encodeURIComponent(op.projectId)}`,
@@ -79,7 +80,7 @@ export const createAdapterWriteExecutor = (opts: FetchAdapterOptions): WriteExec
             ...(op.baseRevision !== undefined ? { ifMatch: op.baseRevision } : {}),
             idempotencyKey,
           })
-          return { status: 'success' }
+          return { status: 'success', revision: result.revision }
         }
 
         case 'deleteProject': {
@@ -128,7 +129,8 @@ export const createAdapterWriteExecutor = (opts: FetchAdapterOptions): WriteExec
 
         case 'createCanvas': {
           // POST /api/canvas,body CreateCanvasRequest → 201/200 CanvasMeta。
-          await requestJson<CanvasMeta>({
+          // G1-a R2 F1:回捕 CanvasMeta.metaRevision,drain 经 onSuccess 回灌 store.canvases[id].metaRevision。
+          const result = await requestJson<CanvasMeta>({
             ...base,
             method: 'POST',
             path: '/api/canvas',
@@ -140,12 +142,12 @@ export const createAdapterWriteExecutor = (opts: FetchAdapterOptions): WriteExec
             },
             idempotencyKey,
           })
-          return { status: 'success' }
+          return { status: 'success', revision: result.metaRevision }
         }
 
         case 'updateCanvas': {
           // PUT /api/canvas/:id,body { payload: CanvasPayload },If-Match = metaRevision base。
-          await requestJson<CanvasMeta>({
+          const result = await requestJson<CanvasMeta>({
             ...base,
             method: 'PUT',
             path: `/api/canvas/${encodeURIComponent(op.canvasId)}`,
@@ -159,7 +161,7 @@ export const createAdapterWriteExecutor = (opts: FetchAdapterOptions): WriteExec
             ...(op.baseRevision !== undefined ? { ifMatch: op.baseRevision } : {}),
             idempotencyKey,
           })
-          return { status: 'success' }
+          return { status: 'success', revision: result.metaRevision }
         }
 
         case 'deleteCanvas': {

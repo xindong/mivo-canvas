@@ -207,3 +207,158 @@ describe('G1-a P1-1 — shadow 模式:差异可观测 + 双写(mutation 同样�
     expect(calls[0]).toMatchObject({ method: 'POST', path: '/api/projects' })
   })
 })
+
+// ── G1-a R2 Finding 1 负例:create/update coalesce 不丢 create + revision 回灌 ──────
+// 验收(对齐 finding F1):
+//  - create→rename(未 drain)只发单个 POST(不丢 create、不替换为 PATCH),body 为最终 name。
+//  - create→drain→rename→drain:rename 的 PATCH 用回灌的新 revision(不陈旧),不 409/428。
+//  - rename→drain→rename→drain:第二次 rename 用回灌的新 revision(不陈旧)。
+//  - create→delete(未 drain)净消:0 请求(资源从未服务端创建,delete 无意义)。
+//  - canvas 同模式:create→rename 合并为 POST;create→drain→rename→drain 用回灌 metaRevision。
+// 严格 stub fetch:POST 返带 revision 的 Project/CanvasMeta;PATCH/PUT 缺/陈旧 if-match → 409(对齐真实
+// server routes 的 revision-conflict 契约,非恒 200 假阳性);DELETE 204。revision 单调递增证明回灌后下次用新 base。
+const makeRevisioningFetch = () => {
+  const calls: { method: string; path: string; body: unknown; headers: Record<string, string> }[] = []
+  const projRev: Record<string, number> = {}
+  const canvasRev: Record<string, number> = {}
+  const fetch = async (input: string, init?: RequestInit): Promise<Response> => {
+    const method = (init?.method ?? 'GET').toUpperCase()
+    const path = new URL(input, 'http://stub').pathname
+    const body = init?.body ? JSON.parse(init.body as string) : null
+    const headers = (init?.headers as Record<string, string>) ?? {}
+    calls.push({ method, path, body, headers })
+    const json = (obj: unknown, status: number) =>
+      new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json' } })
+    if (method === 'DELETE') return new Response(null, { status: 204 })
+    if (method === 'POST' && path === '/api/projects') {
+      const id = (body?.id as string) ?? 'srv'
+      const rev = (projRev[id] ?? -1) + 1
+      projRev[id] = rev
+      return json({ id, name: body?.name, ownerId: KEY_A, createdAt: 't', updatedAt: 't', revision: rev, isDeleted: false }, 201)
+    }
+    if (method === 'PATCH' && path.startsWith('/api/projects/')) {
+      const id = decodeURIComponent(path.split('/').pop() as string)
+      const ifMatch = headers['if-match']
+      if (ifMatch === undefined || projRev[id] === undefined || Number(ifMatch) !== projRev[id]) {
+        return json({ error: 'revision-conflict', currentRevision: projRev[id] ?? 0 }, 409)
+      }
+      const rev = projRev[id] + 1
+      projRev[id] = rev
+      return json({ id, name: body?.name, ownerId: KEY_A, createdAt: 't', updatedAt: 't', revision: rev, isDeleted: false }, 200)
+    }
+    if (method === 'POST' && path === '/api/canvas') {
+      const id = (body?.id as string) ?? 'srv-c'
+      const rev = (canvasRev[id] ?? -1) + 1
+      canvasRev[id] = rev
+      return json({ id, projectId: body?.projectId, title: body?.title, createdAt: 't', updatedAt: 't', metaRevision: rev, contentVersion: 0 }, 201)
+    }
+    if (method === 'PUT' && path.startsWith('/api/canvas/')) {
+      const id = decodeURIComponent(path.split('/').pop() as string)
+      const ifMatch = headers['if-match']
+      if (ifMatch === undefined || canvasRev[id] === undefined || Number(ifMatch) !== canvasRev[id]) {
+        return json({ error: 'revision-conflict', currentRevision: canvasRev[id] ?? 0 }, 409)
+      }
+      const rev = canvasRev[id] + 1
+      canvasRev[id] = rev
+      return json({ id, projectId: body?.payload?.projectId, title: body?.payload?.title, createdAt: 't', updatedAt: 't', metaRevision: rev, contentVersion: 0 }, 200)
+    }
+    return new Response(null, { status: 404 })
+  }
+  return { fetch, calls }
+}
+
+describe('G1-a R2 F1 — project create+update coalesce 不丢 create + revision 回灌', () => {
+  it('create→rename(未 drain)合并为单个 POST,body 为最终 name(不丢 create)', async () => {
+    const { fetch, calls } = makeRevisioningFetch()
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    const id = useCanvasStore.getState().createProject('orig')
+    useCanvasStore.getState().renameProject(id, 'final')
+    await flush()
+    await drainPersistQueue()
+    expect(calls.length).toBe(1)
+    expect(calls[0].method).toBe('POST')
+    expect(calls[0].body).toMatchObject({ name: 'final', id })
+  })
+
+  it('create→drain→rename→drain:rename 用回灌的新 revision(不 409/428),revision 二次回灌', async () => {
+    const { fetch, calls } = makeRevisioningFetch()
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    const id = useCanvasStore.getState().createProject('p')
+    await flush()
+    await drainPersistQueue()
+    expect(calls[0].method).toBe('POST')
+    expect(useCanvasStore.getState().projects.find((p) => p.id === id)?.revision).toBe(0)
+    calls.length = 0
+    useCanvasStore.getState().renameProject(id, 'p2')
+    await flush()
+    await drainPersistQueue()
+    expect(calls.length).toBe(1)
+    expect(calls[0].method).toBe('PATCH')
+    expect(calls[0].headers['if-match']).toBe('0')
+    expect(calls[0].path).toBe(`/api/projects/${encodeURIComponent(id)}`)
+    expect(useCanvasStore.getState().projects.find((p) => p.id === id)?.revision).toBe(1)
+    expect(useCanvasStore.getState().projects.find((p) => p.id === id)?.name).toBe('p2')
+  })
+
+  it('rename→drain→rename→drain:第二次 rename 用回灌的新 revision(不陈旧 409)', async () => {
+    const { fetch, calls } = makeRevisioningFetch()
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    const id = useCanvasStore.getState().createProject('p')
+    await flush()
+    await drainPersistQueue() // POST → rev0 回灌
+    useCanvasStore.getState().renameProject(id, 'r1')
+    await flush()
+    await drainPersistQueue() // PATCH if-match=0 → rev1 回灌
+    expect(useCanvasStore.getState().projects.find((p) => p.id === id)?.revision).toBe(1)
+    useCanvasStore.getState().renameProject(id, 'r2')
+    await flush()
+    await drainPersistQueue() // PATCH if-match=1 → rev2(若用陈旧 0 → 409,记录被 terminal 删)
+    expect(useCanvasStore.getState().projects.find((p) => p.id === id)?.revision).toBe(2)
+    expect(useCanvasStore.getState().projects.find((p) => p.id === id)?.name).toBe('r2')
+    const patchCalls = calls.filter((c) => c.method === 'PATCH')
+    expect(patchCalls[0].headers['if-match']).toBe('0')
+    expect(patchCalls[1].headers['if-match']).toBe('1')
+  })
+
+  it('create→delete(未 drain)净消:0 请求(资源从未服务端创建)', async () => {
+    const { fetch, calls } = makeRevisioningFetch()
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    const id = useCanvasStore.getState().createProject('doomed')
+    useCanvasStore.getState().deleteProject(id)
+    await flush()
+    await drainPersistQueue()
+    expect(calls.length).toBe(0)
+  })
+})
+
+describe('G1-a R2 F1 — canvas create+update coalesce 不丢 create + metaRevision 回灌', () => {
+  it('create→rename(未 drain)合并为单个 POST,body 为最终 title', async () => {
+    const { fetch, calls } = makeRevisioningFetch()
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    const id = useCanvasStore.getState().createCanvas('orig', { projectId: 'p1' })
+    useCanvasStore.getState().renameCanvas(id, 'final')
+    await flush()
+    await drainPersistQueue()
+    expect(calls.length).toBe(1)
+    expect(calls[0].method).toBe('POST')
+    expect(calls[0].body).toMatchObject({ id, projectId: 'p1', title: 'final' })
+  })
+
+  it('create→drain→rename→drain:rename 用回灌的新 metaRevision(不 409)', async () => {
+    const { fetch, calls } = makeRevisioningFetch()
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    const id = useCanvasStore.getState().createCanvas('c', { projectId: 'p1' })
+    await flush()
+    await drainPersistQueue()
+    expect(useCanvasStore.getState().canvases[id]?.metaRevision).toBe(0)
+    calls.length = 0
+    useCanvasStore.getState().renameCanvas(id, 'c2')
+    await flush()
+    await drainPersistQueue()
+    expect(calls.length).toBe(1)
+    expect(calls[0].method).toBe('PUT')
+    expect(calls[0].headers['if-match']).toBe('0')
+    expect(useCanvasStore.getState().canvases[id]?.metaRevision).toBe(1)
+    expect(useCanvasStore.getState().canvases[id]?.title).toBe('c2')
+  })
+})

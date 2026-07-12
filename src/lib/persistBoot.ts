@@ -24,6 +24,7 @@ import { hydrateUserStateMap } from './serverPersistHydrate'
 import { debugLogger } from '../store/debugLogStore'
 import type { FetchAdapterOptions, GetAuthHeaders } from './serverPersistAdapter'
 import type { ChatMessage } from '../store/chatStore'
+import type { Revision } from '../../shared/persist-contract.ts'
 
 const SOURCE = 'Persist Boot'
 
@@ -171,9 +172,36 @@ export const shadowCompareWithServer = async (
 
 // ── 队列启停(server/shadow 启动;local inert)──
 /**
+ * G1-a R2 F1:成功写回灌——把服务端返回的新 revision/metaRevision 写回 store,下一次 strict
+ * update(PATCH/PUT 带 If-Match)用 fresh base,否则 create 成功后 rename 仍带缺省/陈旧 base → 428,
+ * 或第二次 rename → 409(revision 永久陈旧)。local 模式不调(队列未启动)。dynamic import 防静态环。
+ * drain 会 await 本函数,保证回灌在 drain 返回前落地。
+ */
+const applyServerRevision = async (op: WriteOp, outcome: { revision?: Revision }): Promise<void> => {
+  if (outcome.revision === undefined) return
+  const rev = outcome.revision
+  const { useCanvasStore } = await import('../store/canvasStore')
+  const state = useCanvasStore.getState()
+  if (op.kind === 'createProject' || op.kind === 'updateProject') {
+    const id = op.kind === 'createProject' ? (op.id ?? null) : op.projectId
+    if (!id) return
+    if (!state.projects.some((p) => p.id === id)) return
+    useCanvasStore.setState((s) => ({
+      projects: s.projects.map((p) => (p.id === id ? { ...p, revision: rev } : p)),
+    }))
+  } else if (op.kind === 'createCanvas' || op.kind === 'updateCanvas') {
+    if (!state.canvases[op.canvasId]) return
+    useCanvasStore.setState((s) => ({
+      canvases: { ...s.canvases, [op.canvasId]: { ...s.canvases[op.canvasId]!, metaRevision: rev } },
+    }))
+  }
+}
+
+/**
  * G1-a P1-1:启动 writeRetryQueue。server/shadow 在 boot 调此。local 永不调(生产零变化)。
  * executor 复用 createAdapterWriteExecutor(与 adapter 同源 fetch opts);onConflict 触发 re-hydrate
  * 作可恢复处理(P1-3:conflict 不静默删——re-hydrate 让本地从服务端真值刷新,用户可基于新 revision 重放)。
+ * onConflict 回灌:F1 —— create/update 成功后把服务端新 revision 写回 store,防下一次 strict update 陈旧。
  * @param opts 注入 fetch opts(测试用 Hono app.request / fetch 计数 stub);production 默认 getProductionFetchOptions()。
  */
 export const startPersistWriteQueue = (opts: FetchAdapterOptions = getProductionFetchOptions()): void => {
@@ -191,6 +219,8 @@ export const startPersistWriteQueue = (opts: FetchAdapterOptions = getProduction
         debugLogger.warn(SOURCE, `conflict re-hydrate failed: ${msg(error)}`)
       })
     },
+    // R2 F1:成功写回灌 revision/metaRevision,防 strict update 陈旧。
+    onSuccess: applyServerRevision,
   })
   void writeQueue.start().catch((error) => {
     debugLogger.error(SOURCE, `queue start failed: ${msg(error)}`)
