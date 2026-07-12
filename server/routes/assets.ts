@@ -307,6 +307,11 @@ export const createAssetRoutes = (options: AssetRouteOptions = {}): App => {
     const log = (status: number, note?: string): void => {
       logRequest({ method: 'POST', path: `/api/assets/${shortHash(assetId)}/attach`, requestId, status, latencyMs: Date.now() - t0, note })
     }
+    // R3-F2: resolveAssetOwner (strict proof) before ALL validation (bad-key/assetId shape),对齐 POST/GET
+    // proof-gate 语义——strict + 无 proof → 401 在 bad-key/assetId 校验前(无存在性泄漏)。合并时 G1-a attach
+    // 漏同步 G2.1(7743a1d)前置语义,沿用裸 fingerprintOfPlatformKey → strict 下绕过 proof-gate(安全回归);
+    // 改用 resolveAssetOwner 对齐 POST/GET:legacy(non-strict)下 ≡ fingerprintOfPlatformKey(resolvePlatformCtx(c).platformKey),零变化。
+    const ownerFp = resolveAssetOwner(c)
     const badKey = rejectInvalidMivoApiKey(c)
     if (badKey) {
       log(400, 'bad-mivo-key')
@@ -316,7 +321,6 @@ export const createAssetRoutes = (options: AssetRouteOptions = {}): App => {
       log(404, 'invalid-id')
       return plainTextNoContentType(c, 'Asset not found', 404)
     }
-    const ownerFp = fingerprintOfPlatformKey(resolvePlatformCtx(c).platformKey)
     let body: { nodeId?: string }
     try {
       body = await readJsonBody<{ nodeId?: string }>(c, ATTACH_BODY_MAX)
@@ -353,6 +357,11 @@ export const createAssetRoutes = (options: AssetRouteOptions = {}): App => {
     const log = (status: number, note?: string): void => {
       logRequest({ method: 'POST', path: `/api/assets/${shortHash(assetId)}/detach`, requestId, status, latencyMs: Date.now() - t0, note })
     }
+    // R3-F2: resolveAssetOwner (strict proof) before ALL validation (bad-key/assetId shape),对齐 POST/GET
+    // proof-gate 语义——strict + 无 proof → 401 在 bad-key/assetId 校验前(无存在性泄漏)。合并时 G1-a detach
+    // 漏同步 G2.1(7743a1d)前置语义,沿用裸 fingerprintOfPlatformKey → strict 下绕过 proof-gate(安全回归);
+    // 改用 resolveAssetOwner 对齐 POST/GET:legacy(non-strict)下 ≡ fingerprintOfPlatformKey(resolvePlatformCtx(c).platformKey),零变化。
+    const ownerFp = resolveAssetOwner(c)
     const badKey = rejectInvalidMivoApiKey(c)
     if (badKey) {
       log(400, 'bad-mivo-key')
@@ -362,7 +371,6 @@ export const createAssetRoutes = (options: AssetRouteOptions = {}): App => {
       log(404, 'invalid-id')
       return plainTextNoContentType(c, 'Asset not found', 404)
     }
-    const ownerFp = fingerprintOfPlatformKey(resolvePlatformCtx(c).platformKey)
     let body: { nodeId?: string }
     try {
       body = await readJsonBody<{ nodeId?: string }>(c, ATTACH_BODY_MAX)

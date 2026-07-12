@@ -120,7 +120,7 @@ describe('P0.3 /readyz readiness probe', () => {
     expect(body.assetDir.reason).not.toContain(tmpRoot) // F7:reason 不泄露绝对路径
   })
 
-  it('/healthz 仍恒 200(不随 readyz degraded 变)', async () => {
+  it('/healthz 仍恒 200(不随 readyz degraded 变) + G1-a F3 persist readiness 回显', async () => {
     const blocker = join(tmpRoot, 'blocker2')
     writeFileSync(blocker, 'x', 'utf8')
     process.env.MIVO_ENABLE_ASSET_SERVICE = '1'
@@ -128,6 +128,10 @@ describe('P0.3 /readyz readiness probe', () => {
     const app = await loadFreshApp()
     const res = await app.request('/healthz')
     expect(res.status).toBe(200)
-    expect(await res.json()).toEqual({ status: 'ok' })
+    // G1-a R2 F3:/healthz 扩展了 persist readiness(backend kind + durable 标志),不随 /readyz degraded 变。
+    // 用子集断言(toMatchObject)保留 G1-a F3 扩展 + 不锁死将来可能新增的字段;status ok + persist 形状正确。
+    const body = (await res.json()) as { status: string; persist: { backend: string; durable: boolean } }
+    expect(body.status).toBe('ok')
+    expect(body.persist).toMatchObject({ backend: expect.any(String), durable: expect.any(Boolean) })
   })
 })
