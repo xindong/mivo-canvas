@@ -26,6 +26,7 @@ const runPermissionBackendContractSuite = (
   setLinkRevokedAt: (b: PermissionBackend, linkId: string, revokedAtIso: string) => boolean | Promise<boolean>,
   setLinkCascadeRevokedAt: (b: PermissionBackend, linkId: string, iso: string) => boolean | Promise<boolean>,
   setCompensationFault: (b: PermissionBackend, op: CompensationOp, throwCount: number) => void,
+  setProjectDeleted: (b: PermissionBackend, projectId: string, isDeleted: boolean) => void | Promise<void>,
 ): void => {
   describe(`${label} — 成员资格:角色派生 + CRUD + 反查`, () => {
     let b: PermissionBackend
@@ -314,6 +315,9 @@ const runPermissionBackendContractSuite = (
     it('delete:故障注入 revoke 抛错 → failed(链接仍 active);重试 → completed 收敛(链接最终 revoked)', async () => {
       const link = await b.createShareLink('p1', 'view', 'ownerA')
       expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('active')
+      // R3-F1: delete primary(softDelete)已提交 → is_deleted=true(delete 是 durable desired state)。
+      //   无此步 PG is_deleted 仍 false → gate 判 delete stale(矛盾 restore)→ 误拦。memory no-op(走 hasSuperseded)。
+      await setProjectDeleted(b, 'p1', true)
       await b.recordCompensation('p1', 'delete')
       setCompensationFault(b, 'delete', 1)
       const r1 = await b.attemptCompensation('p1', 'delete')
@@ -383,6 +387,60 @@ const runPermissionBackendContractSuite = (
       expect(ints[0].status).toBe('done')
       expect(await b.listPendingCompensations('p1')).toHaveLength(0)
     })
+
+    // R3-F1 双向晚到 retry 验收(R2 finding 1 核心):晚到的 attemptCompensation(op) 不得仅凭 compensationNeed
+    // 重建旧 op intent——那会把更新代际对立 op 的终态翻转回来(已删项目重开链接 / 已恢复项目再吊销)。
+    // stale op 必须返回 superseded,不执行副作用;最终链接状态跟随最新代际(primary desired state)。
+    // PG: setProjectDeleted 模拟 primary(is_deleted ground truth);memory: no-op(走 hasSuperseded,gen1 被 gen2 supersede)。
+    it('R3-F1① restore-fail→delete→晚 restore retry:终态跟随 delete(revoked),不翻转回 active', async () => {
+      const link = await b.createShareLink('p1', 'view', 'ownerA')
+      await b.revokeAllForProject('p1') // 模拟 project 曾软删(级联 revoke,置 cascade marker;link revoked)
+      expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('revoked')
+      // restore 首次失败(primary 已 restore → is_deleted=false)
+      await setProjectDeleted(b, 'p1', false)
+      await b.recordCompensation('p1', 'restore') // gen1 restore pending
+      setCompensationFault(b, 'restore', 1)
+      const r1 = await b.attemptCompensation('p1', 'restore') // failed(step 故障)
+      expect(r1.kind).toBe('failed')
+      expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('revoked') // 仍 revoked(未 unRevoke)
+      // delete 新代际完成(primary softDelete → is_deleted=true);gen2 supersede gen1
+      await setProjectDeleted(b, 'p1', true)
+      await b.recordCompensation('p1', 'delete')
+      const r2 = await b.attemptCompensation('p1', 'delete') // completed(link 已 revoked,count=0)
+      expect(r2.kind).toBe('completed')
+      expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('revoked') // before: revoked(最新代际 delete)
+      // 晚到 restore retry —— 必须 NOT 翻转回 active(跟随最新代际 delete)
+      const r3 = await b.attemptCompensation('p1', 'restore')
+      expect(r3.kind).toBe('superseded') // FIX:不再 completed
+      expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('revoked') // after: 仍 revoked
+      // 无副作用:未新建 stale restore 意图(intent 数仍是 delete gen2 + 历史 gen1)
+      const ints = await b.listCompensations('p1')
+      expect(ints.filter((i) => i.op === 'restore' && i.status === 'pending')).toHaveLength(0)
+    })
+
+    it('R3-F1② delete-fail→restore→晚 delete retry:终态跟随 restore(active),不翻转回 revoked', async () => {
+      const link = await b.createShareLink('p1', 'view', 'ownerA') // active
+      expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('active')
+      // delete 首次失败(primary softDelete → is_deleted=true)
+      await setProjectDeleted(b, 'p1', true)
+      await b.recordCompensation('p1', 'delete') // gen1 delete pending
+      setCompensationFault(b, 'delete', 1)
+      const r1 = await b.attemptCompensation('p1', 'delete') // failed(revoke 故障)
+      expect(r1.kind).toBe('failed')
+      expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('active') // 仍 active(revoke 未跑)
+      // restore 新代际完成(primary restore → is_deleted=false);gen2 supersede gen1
+      await setProjectDeleted(b, 'p1', false)
+      await b.recordCompensation('p1', 'restore')
+      const r2 = await b.attemptCompensation('p1', 'restore') // completed(link active,无 cascade marker,count=0)
+      expect(r2.kind).toBe('completed')
+      expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('active') // before: active(最新代际 restore)
+      // 晚到 delete retry —— 必须 NOT 翻转回 revoked(跟随最新代际 restore)
+      const r3 = await b.attemptCompensation('p1', 'delete')
+      expect(r3.kind).toBe('superseded') // FIX:不再 completed
+      expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('active') // after: 仍 active
+      const ints = await b.listCompensations('p1')
+      expect(ints.filter((i) => i.op === 'delete' && i.status === 'pending')).toHaveLength(0)
+    })
   })
 }
 
@@ -396,6 +454,8 @@ runPermissionBackendContractSuite(
   (b, id, iso) => (b as InMemoryPermissionBackend).__setLinkRevokedAtForTest(id, iso),
   (b, id, iso) => (b as InMemoryPermissionBackend).__setLinkCascadeRevokedAtForTest(id, iso),
   (b, op, n) => (b as InMemoryPermissionBackend).__setCompensationFaultForTest(op, n),
+  // memory 无 projects 表 → no-op(memory 走 hasSuperseded 判 stale)
+  (b, pid, d) => (b as InMemoryPermissionBackend).__setProjectDeletedForTest(pid, d),
 )
 
 // ── PG 后端(gate:MIVO_PG_TEST=1;本地 brew PG port 55443)─────────────────────────────────
@@ -430,5 +490,6 @@ let pgPermBackend: PgPermissionBackend | undefined
     (b, id, iso) => (b as PgPermissionBackend).__setLinkRevokedAtForTest(id, iso),
     (b, id, iso) => (b as PgPermissionBackend).__setLinkCascadeRevokedAtForTest(id, iso),
     (b, op, n) => (b as PgPermissionBackend).__setCompensationFaultForTest(op, n),
+    (b, pid, d) => (b as PgPermissionBackend).__setProjectDeletedForTest(pid, d),
   )
 })

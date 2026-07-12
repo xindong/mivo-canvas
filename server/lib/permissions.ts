@@ -93,12 +93,13 @@ export type CompensationIntent = {
   updatedAt: string
 }
 
-/** attemptCompensation 结果(可观察;route 用于日志)。 */
+/** attemptCompensation 的结果（可观察；route 用于日志）。 */
 export type CompensationOutcome =
   | { kind: 'nothing-pending'; op: CompensationOp }
   | { kind: 'completed'; op: CompensationOp; count: number; attempts: number; intentId: string }
   | { kind: 'failed'; op: CompensationOp; error: string; attempts: number; intentId: string }
   | { kind: 'already-claimed'; op: CompensationOp; intentId: string } // P2-1:并发 attempt 输家
+  | { kind: 'superseded'; op: CompensationOp; intentId?: string } // R3-F1:晚到 stale op（被更新代际/is_deleted 否决）→ 不重建、不执行副作用
 
 /** FX-7 §5.9 un-revoke 30 天保留窗(超期不可恢复,purge 由 FX-7 定时落地)。 */
 export const UNREVOKE_WINDOW_MS = 30 * 24 * 60 * 60 * 1000
@@ -441,6 +442,21 @@ export class InMemoryPermissionBackend implements PermissionBackend {
     return undefined
   }
 
+  /**
+   * R3-F1: (projectId, op) 是否存在被显式 supersede 的意图(对立 op 的新代际曾 record 并 supersede 它)。
+   * 用于晚到 attemptCompensation 的 stale-op 判定:若 op 已被对立 op 取代,晚到重试不得仅凭 marker 重建
+   * 旧 op intent(会把更新代际的 revoked/active 终态翻转回来)。memory 无 projects.is_deleted,以此信号
+   * 替代——它精确区分"被显式 supersede 的 stale 重试(F1)"与"record 崩溃后的 marker 自恢复(P1-1,无 supersede 行)"。
+   */
+  private hasSupersededCompensation(projectId: string, op: CompensationOp): boolean {
+    const ids = this.compensationsByProject.get(projectId) ?? []
+    for (const id of ids) {
+      const it = this.compensations.get(id)
+      if (it && it.op === op && it.status === 'superseded') return true
+    }
+    return false
+  }
+
   /** project 级下一代际 = 现存全部意图(任意状态)max(generation)+1。单调递增,保证新 transition 代际 > 旧。 */
   private nextGeneration(projectId: string): number {
     const ids = this.compensationsByProject.get(projectId) ?? []
@@ -531,6 +547,14 @@ export class InMemoryPermissionBackend implements PermissionBackend {
   async attemptCompensation(projectId: string, op: CompensationOp): Promise<CompensationOutcome> {
     const now = nowIso()
     let intent = this.findPendingCompensation(projectId, op)
+    // R3-F1: stale-op gate。晚到的 attemptCompensation 不得仅凭 compensationNeed 重建旧 op intent——
+    // 那会把更新代际对立 op 的 revoked/active 终态翻转回来(权限边界破坏)。durable desired state 决断:
+    //   memory 无 projects.is_deleted → 用"op 是否被对立 op 的新代际显式 supersede"(hasSuperseded)。
+    //   仅在无 fresh pending intent 时判 stale(pending intent 存在 = op 是当前代际,非 stale)。
+    //   P1-1 marker 自恢复(无 supersede 行)不受影响:hasSuperseded=false → 继续据 marker derive。
+    if (!intent && this.hasSupersededCompensation(projectId, op)) {
+      return { kind: 'superseded', op }
+    }
     // P1-1 crash-recovery:record 崩溃未建意图,但 marker 表明补偿未完成 → 自建 pending 收敛。
     const need = this.compensationNeed(projectId, op)
     if (!intent && !need) return { kind: 'nothing-pending', op }
@@ -640,6 +664,16 @@ export class InMemoryPermissionBackend implements PermissionBackend {
     if (!link) return false
     this.links.set(linkId, { ...link, cascadeRevokedAt: iso })
     return true
+  }
+
+  /**
+   * Test-only:设置 project 的 is_deleted durable desired state。
+   * memory backend 不持有 projects 表(is_deleted 不归权限层),此 helper 为 no-op——
+   * memory 的 stale-op 判定走 hasSuperseded(见 attemptCompensation)。PG 对偶实现真正改 projects.is_deleted。
+   * 双后端契约套件对两后端同形调用,保证对称性(memory 忽略、PG 生效,结果一致)。
+   */
+  __setProjectDeletedForTest(_projectId: string, _isDeleted: boolean): void {
+    /* no-op: memory 无 projects 表 */
   }
 
   /** Test-only:注入 op 补偿步骤强制失败 N 次(消费在 attemptCompensation;不污染 unRevoke/revoke 本身)。 */

@@ -490,10 +490,52 @@ export class PgPermissionBackend implements PermissionBackend {
     return !!row
   }
 
+  /**
+   * R3-F1: 查 project 的 durable desired state(projects.is_deleted)。primary ensureCreate(restore→false)/
+   * softDeleteProjectTree(delete→true)先于 recordCompensation 提交 → is_deleted 即最新 desired state 的 ground truth。
+   * project 行不存在 → undefined(权限层 fallback 到 hasSupersededCompensationPg,与 memory 对偶)。
+   */
+  private async getProjectIsDeleted(projectId: string): Promise<boolean | undefined> {
+    const result = await sql`SELECT is_deleted FROM projects WHERE id = ${projectId}`.execute(this.db)
+    const row = (result.rows as { is_deleted?: boolean }[])[0]
+    return row === undefined ? undefined : !!row.is_deleted
+  }
+
+  /** R3-F1: (projectId, op) 是否存在被显式 supersede 的意图(对立 op 新代际曾 record 并 supersede 它)。 */
+  private async hasSupersededCompensationPg(projectId: string, op: CompensationOp): Promise<boolean> {
+    const row = await this.db.selectFrom('share_link_compensations').select('id')
+      .where('project_id', '=', projectId).where('op', '=', op).where('status', '=', 'superseded')
+      .limit(1).executeTakeFirst()
+    return !!row
+  }
+
   async attemptCompensation(projectId: string, op: CompensationOp): Promise<CompensationOutcome> {
     await this.ready
     // 1. find or create pending intent(P1-1 crash-recovery:record 崩溃后无 pending,marker 表明需补偿 → 自建)。
     let intent = await this.findPendingCompensationPg(projectId, op)
+    // R3-F1: stale-op gate。晚到的 attemptCompensation 不得仅凭 compensationNeed 重建旧 op intent——
+    // 那会把更新代际对立 op 的 revoked/active 终态翻转回来(权限边界破坏:已删项目重开链接/已恢复项目再吊销)。
+    // durable desired state 决断:PG 的 projects.is_deleted 是 ground truth(primary ensureCreate/softDelete
+    //   先于 recordCompensation 提交,is_deleted 即最新 desired state)。is_deleted 已知且与 op 矛盾 → stale。
+    //   is_deleted 未知(project 行不存在)→ 退化到 hasSuperseded(仅 !intent 时,与 memory 对偶)。
+    // stale → 标 superseded 返回,不重建、不执行副作用(含 intent 仍 pending 的 sweep 残留也挡)。
+    const isDeleted = await this.getProjectIsDeleted(projectId)
+    let stale = false
+    let staleReason = ''
+    if (isDeleted !== undefined) {
+      const desiredByState: CompensationOp = isDeleted ? 'delete' : 'restore'
+      if (desiredByState !== op) { stale = true; staleReason = `durable desired state (is_deleted=${isDeleted})` }
+    } else if (!intent && await this.hasSupersededCompensationPg(projectId, op)) {
+      stale = true; staleReason = 'superseded by newer opposing generation'
+    }
+    if (stale) {
+      if (intent) {
+        await this.db.updateTable('share_link_compensations')
+          .set({ status: 'superseded', last_error: `superseded by ${staleReason}`, claimed_at: null, claimed_until: null, updated_at: new Date() })
+          .where('id', '=', intent.id).where('status', '=', 'pending').execute()
+      }
+      return { kind: 'superseded', op, intentId: intent?.id }
+    }
     const need = await this.compensationNeedPg(projectId, op)
     if (!intent && !need) return { kind: 'nothing-pending', op }
     if (!intent) intent = await this.recordCompensation(projectId, op)
@@ -639,10 +681,21 @@ export class PgPermissionBackend implements PermissionBackend {
 
   /**
    * Test-only:seed project 行(projects 表)供 FK 用。PG 契约测试 beforeEach 调之(权限表 project_id FK→projects.id)。
-   * 用 raw SQL(projects 表不属 PermissionDatabase 类型;但同 DB,sql 模板直执行)。ON CONFLICT DO NOTHING 幂等。
+   * 用 raw SQL(projects 表不属 PermissionDatabase 类型;但同 DB,sql 模板直执行)。ON CONFLICT DO UPDATE
+   * 重置 is_deleted=false(R3-F1:测试间隔离——前一用例可能 setProjectDeleted(true),beforeEach 须还原)。
    */
   async __seedProjectForTest(projectId: string, ownerId: string): Promise<void> {
-    await sql`INSERT INTO projects (id, owner_id, is_deleted) VALUES (${projectId}, ${ownerId}, false) ON CONFLICT (id) DO NOTHING`.execute(this.db)
+    await sql`INSERT INTO projects (id, owner_id, is_deleted) VALUES (${projectId}, ${ownerId}, false)
+      ON CONFLICT (id) DO UPDATE SET is_deleted = false, updated_at = now()`.execute(this.db)
+  }
+
+  /**
+   * Test-only:设置 project 的 is_deleted durable desired state(R3-F1 真 PG 双向晚到 retry 验收用)。
+   * 模拟 primary ensureCreate/softDeleteProjectTree 已提交(is_deleted 先于 recordCompensation)。
+   * 与 memory 对偶(memory __setProjectDeletedForTest 为 no-op,memory 走 hasSuperseded)。
+   */
+  async __setProjectDeletedForTest(projectId: string, isDeleted: boolean): Promise<void> {
+    await sql`UPDATE projects SET is_deleted = ${isDeleted}, updated_at = now() WHERE id = ${projectId}`.execute(this.db)
   }
 
   /** Test-only:注入 op 补偿步骤强制失败 N 次(消费在 attemptCompensation;不污染 unRevoke/revoke 本身;与内存对偶)。 */
