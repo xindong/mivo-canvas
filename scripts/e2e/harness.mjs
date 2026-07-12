@@ -55,8 +55,51 @@ export const clearAllStorage = async (page) => {
   })
 }
 
+// FX-6 (#183): the app namespaces its IDB persist keys by the current auth
+// userId — anonymous → raw `name`; authenticated → `name:<userId>`. The e2e dev
+// topology turns the auth dev stub ON (harness.startSmokeBffServer sets
+// MIVO_DEV_AUTH_STUB=1, dev stub /api/auth/me returns username `dev@local`),
+// so canvasStore/chatStore persist under `mivo-canvas-demo:dev@local` /
+// `mivo-chat-demo:dev@local`, NOT the raw names the scenarios pass in. Before
+// this fix the harness read the raw key and found nothing (chat-generation,
+// mask-cross-scene, mask-hydration all timed out on persist assertions) even
+// though the app had written the data — under the namespaced key.
+//
+// Resolve the logical name through the app's OWN persist user id so the harness
+// reads/writes the same physical key the app uses (single source of truth:
+// anonymous → raw, authenticated → namespaced, no hard-coded userId). The user
+// id is read from the `__MIVO_E2E__` bridge (populated by main.tsx in BOTH dev
+// and prod topologies); the namespacing rule is replicated here on the Node
+// side. mainfix R3: the previous browser-side `import('/src/lib/persistUserId.ts')`
+// worked in dev (vite serves /src) but under prod's static dist server /src has
+// no file → 404 fallback returned index.html → the browser logged "Failed to
+// load module script: MIME text/html" — the try/catch DID catch the promise
+// rejection and fell back to the raw name, but the browser had ALREADY emitted
+// the MIME console error before the catch ran, which the e2e-smoke console-error
+// guard collected → gated chat-generation red in prod (dev served /src so no
+// error). Reading the bridge global involves NO /src module fetch, so no MIME
+// error in either topology. Falls back to the raw name when the bridge isn't
+// reachable — a fresh page before the app hydrates, or a non-app context — in
+// which case the app's `migrateToNamespaced` claims the legacy raw key on its
+// first authenticated read (the migration scenario's v1-inject path still works).
+const resolvePersistKey = async (page, name) => {
+  try {
+    const uid = await page.evaluate(() => {
+      const bridge = globalThis.__MIVO_E2E__
+      if (bridge && typeof bridge.getPersistUserId === 'function') {
+        return bridge.getPersistUserId()
+      }
+      return null
+    })
+    return uid && uid !== 'anonymous' ? `${name}:${uid}` : name
+  } catch {
+    return name
+  }
+}
+
 /** Read a persisted KV value (the raw JSON string zustand persist stored). */
 export const readPersistedKv = async (page, key) => {
+  const physical = await resolvePersistKey(page, key)
   return page.evaluate(async (k) => {
     return new Promise((resolve) => {
       const req = indexedDB.open('mivo-canvas-persist', 1)
@@ -81,11 +124,15 @@ export const readPersistedKv = async (page, key) => {
       }
       req.onerror = () => resolve(null)
     })
-  }, key)
+  }, physical)
 }
 
 /** Write a persisted KV value (put upsert). Used by the migration scenario to inject
- *  legacy v1 state before the app rehydrates from IDB. */
+ *  legacy v1 state before the app rehydrates from IDB. Writes the RAW logical name
+ *  (NOT namespaced) on purpose: legacy injection simulates a pre-FX-6 session whose
+ *  state lived under the un-suffixed key, and the app's `migrateToNamespaced` claims
+ *  it on first authenticated read. Resolving through `namespacedKey` here would race
+ *  with the chat store's own async write to the namespaced key and clobber v1. */
 export const writePersistedKv = async (page, key, value) => {
   await page.evaluate(async ({ k, v }) => {
     return new Promise((resolve) => {
@@ -115,7 +162,13 @@ export const writePersistedKv = async (page, key, value) => {
 
 /** Poll readPersistedKv until predicate(rawString) returns true or timeout. Used for
  *  persist checks where the IDB write is async (zustand persist fire-and-forgets the
- *  setItem promise, so the read might lag the state change). */
+ *  setItem promise, so the read might lag the state change).
+ *
+ *  Returns the raw string once predicate(raw) is true, or `null` on timeout. NEVER
+ *  returns a non-null blob whose content failed the predicate — that was the SC-15
+ *  false-green (a `generating` blob passed an `error`/`failed` predicate check because
+ *  callers only did `if (!raw) throw`). Callers must assert predicate semantics, not
+ *  just key existence; the honest `null` return forces that. */
 export const waitForPersistedKv = async (page, key, predicate, { timeout = 2000, interval = 50 } = {}) => {
   const deadline = Date.now() + timeout
   while (Date.now() < deadline) {
@@ -123,7 +176,14 @@ export const waitForPersistedKv = async (page, key, predicate, { timeout = 2000,
     if (raw !== null && predicate(raw)) return raw
     await new Promise((r) => setTimeout(r, interval))
   }
-  return readPersistedKv(page, key)
+  // SC-15 R2 (probe honesty): predicate never satisfied within timeout → return null.
+  // The previous `return readPersistedKv(page, key)` returned whatever non-null blob
+  // lived under the key even when its content failed the predicate — so callers that
+  // only checked truthiness passed on a non-empty but semantically WRONG blob. That
+  // was exactly the SC-15 false-green that masked the durable-settle bug (a generating
+  // blob passed the error/failed assertion). Returning null forces callers to fail
+  // loudly when the predicate is never met, instead of silently passing.
+  return null
 }
 
 // killStaleDevServer: detect and kill leftover dev/bff servers from a prior failed
@@ -170,9 +230,11 @@ const e2eBridgeModules = {
 }
 
 export const installE2EStoreBridge = async (context) => {
-  await context.addInitScript(() => {
-    window.__MIVO_E2E_ENABLED__ = true
-  })
+  // mainfix R3: the __MIVO_E2E_ENABLED__ flag now lives in createSmokePage (set
+  // unconditionally so the bridge populates in dev too, letting resolvePersistKey
+  // read getPersistUserId without a /src import). Here we only install the route
+  // interception that serves canvasStore/chatStore bridge modules under prod's
+  // static dist server (where /src/store/*.ts would otherwise 404).
   await context.route('**/src/store/canvasStore.ts*', async (route) => {
     await route.fulfill({
       status: 200,
@@ -266,6 +328,12 @@ export const startSmokeBffServer = ({
       // (MIVO_PUBLIC=1) the stub is force-off regardless — harmless there.
       MIVO_DEV_AUTH_STUB: '1',
       ...(isPublic ? { MIVO_PUBLIC: '1' } : {}),
+      // R5(G2.1 同源三元组安全硬化):生产同源判定需"可信外部 scheme"——直连 prod 拓扑下
+      // app 与 BFF 同监听 securityPort,浏览器同源 POST Origin=http://127.0.0.1:port;显式配
+      // MIVO_PUBLIC_ORIGIN 让同源 POST 放行(无此配置 → 无法可信判定外部 scheme → fail-closed →
+      // debug/canvas-interactions/mask/mask-reflow 4 场景浏览器同源 debugLogger POST 全 403 红回归)。
+      // 真实生产部署:网关后由 ops 配 https 的 PUBLIC_ORIGIN(或受信 X-Forwarded-Proto);e2e 直连用 http。
+      ...(isPublic ? { MIVO_PUBLIC_ORIGIN: `http://127.0.0.1:${port}` } : {}),
       MIVO_ASSET_DIR: localAssetFixtureDir,
       MIVO_EAGLE_API_URL: `http://127.0.0.1:${eagleMockPort}`,
       MIVO_DEBUG_LOG_DIR: path.resolve('test-artifacts/debug-logs'),
@@ -338,6 +406,15 @@ export const createSmokePage = async ({
     viewport: { width: 1512, height: 900 },
     deviceScaleFactor: 1,
     extraHTTPHeaders,
+  })
+  // mainfix R3: flip the e2e bridge flag in BOTH topologies so main.tsx populates
+  // `__MIVO_E2E__` (incl. getPersistUserId) everywhere. Previously only
+  // installE2EStoreBridge (prod-only) set it, so dev never had the bridge and
+  // resolvePersistKey had to browser-import /src/lib/persistUserId.ts — which
+  // 404s under prod's static dist server. The route interception itself stays
+  // prod-only (installE2EStoreBridge below); only the flag is universal.
+  await context.addInitScript(() => {
+    window.__MIVO_E2E_ENABLED__ = true
   })
   if (enableStoreBridgeModules) {
     await installE2EStoreBridge(context)

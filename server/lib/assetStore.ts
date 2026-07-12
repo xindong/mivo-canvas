@@ -861,6 +861,16 @@ export type AssetStore = {
   /** Offline integrity scrub (P1.9): recompute sha256 for every record's bytes,
    *  report mismatches. Callable entry; no auto-fix. */
   scrubAssetIntegrity(): Promise<{ checked: number; mismatches: Array<{ contentHash: string; sizeBytes: number }> }>
+  /**
+   * G2.1 R2-1 三域 gate 的 assets 域 detector:统计 AssetRecord.ownerFp + references[].ownerFp +
+   * .uploaders 中为 legacy 形态(mivo-key 指纹,sha256[:16] hex;权威 owner.ts `isLegacyFormOwner`/
+   * keys.ts `fingerprintOfPlatformKey`)的 owner 数(去重)。strict 启动 gate
+   * `assertStrictOwnerMigrationComplete` 调用:>0 → 拒启动(assets 域迁移未完成)。**可选**:
+   * InMemory/fs 实扫(listRecords + listUploaders,可测);PG detector 随 G2.2 迁移落地,未实现时
+   * strict 启动 fail-closed(owner.ts gate 显式拒绝)。覆盖 AssetRecord.ownerFp(first uploader 归属
+   * 打标)+ references[].ownerFp(attach 方)+ .uploaders(dedup uploader 注册表)三处 legacy 指纹。
+   */
+  countLegacyFormOwners?(): Promise<number>
 }
 
 const nowOrDefault = (now: number | undefined): number => now ?? Date.now()
@@ -1056,6 +1066,29 @@ export const createAssetStore = (backend: AssetStoreBackend): AssetStore => {
     return { checked: records.length, mismatches }
   }
 
+  // G2.1 R2-1:legacy owner 形态 = mivo-key 指纹(sha256[:16] hex;权威 keys.ts
+  // `fingerprintOfPlatformKey` + owner.ts `isLegacyFormOwner`/persist/backend.ts 内联正则,同一形态定义)。
+  // 内联于此以保 asset 层 framework-agnostic(不耦合 hono/owner.ts);SSO username 为 email-style(含 @)。
+  const ASSET_LEGACY_FINGERPRINT_RE = /^[0-9a-f]{16}$/
+  const countLegacyFormOwners: AssetStore['countLegacyFormOwners'] = async () => {
+    // 扫 AssetRecord.ownerFp(first uploader 归属打标)+ references[].ownerFp(attach 方)+ .uploaders
+    // (dedup uploader 注册表)三处 legacy 指纹;去重(同一 legacy ownerFp 多处计 1)。
+    const legacy = new Set<string>()
+    const records = await backend.listRecords()
+    for (const record of records) {
+      if (ASSET_LEGACY_FINGERPRINT_RE.test(record.ownerFp)) legacy.add(record.ownerFp)
+      for (const ref of record.references) {
+        if (ASSET_LEGACY_FINGERPRINT_RE.test(ref.ownerFp)) legacy.add(ref.ownerFp)
+      }
+      // uploader 注册表(可能含 dedup uploader 的 legacy 指纹;first uploader 已在 record.ownerFp 覆盖)
+      const uploaders = await backend.listUploaders(record.contentHash)
+      for (const up of uploaders) {
+        if (ASSET_LEGACY_FINGERPRINT_RE.test(up)) legacy.add(up)
+      }
+    }
+    return legacy.size
+  }
+
   return {
     upload,
     uploadWithQuota,
@@ -1068,6 +1101,7 @@ export const createAssetStore = (backend: AssetStoreBackend): AssetStore => {
     refcount,
     ownerBytes,
     scrubAssetIntegrity,
+    countLegacyFormOwners,
   }
 }
 

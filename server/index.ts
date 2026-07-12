@@ -8,10 +8,10 @@
 // 网络隔离),不在本仓代码层处理。本地 dev 用 routes/auth.ts 的 dev 桩 /api/auth/me
 // 进已登录态(opt-in,见 lib/auth-stub.ts)。
 import { serve } from '@hono/node-server'
-import { app, sharedPersistBackend, sharedPermissionBackend } from './app'
+import { app, sharedPersistBackend, sharedPermissionBackend, sharedAssetStore } from './app'
 import { resolveFeatureFlags } from './lib/env'
 import { isDevStubActive } from './lib/auth-stub'
-import { validateSsoConfig } from './lib/owner'
+import { validateSsoConfig, assertStrictOwnerMigrationComplete, buildStartupDetectors } from './lib/owner'
 
 const PORT = Number(process.env.MIVO_PORT) || 8080
 const PUBLIC_MODE = process.env.MIVO_PUBLIC === '1'
@@ -64,6 +64,24 @@ const startCompensationSweep = async (): Promise<void> => {
 
 const start = async (): Promise<void> => {
   await Promise.all([sharedPersistBackend.ready, sharedPermissionBackend.ready])
+  // 顺序:G2.1 strict 三域 gate(fail-closed 拒启动)必须先于 P-6 saga sweep 启动——
+  // legacy owner 数据未迁移时若先跑 sweep 会用错身份收敛补偿;gate 拒启动优先,通过后再启动 sweep。
+  // G2.1 F1/R2-1:strict 启动 owner-migration 三域 gate——MIVO_SSO_STRICT=1 但 persist/permissions/
+  // assets 任一域仍存在 legacy 形态 owner 数据(ownerId=指纹,sha256[:16] hex)→ 拒绝启动(fail fast,
+  // exit 1)。机器判定,非文字约定:ops 翻 strict 前必须先跑 G2.2 迁移(跨三域指纹→username),否则
+  // legacy 数据对 SSO 用户不可见。返修前 gate 只收 persist → persist=0 但 permission/asset 全 legacy
+  // 时放行(R2-1 漏检洞);现三域同判,任一 detector 缺失(PG G2.2 前未实现)→ fail-closed 拒启动。
+  // 非 strict → no-op(生产零变化)。R3-F1:asset domain detector 由 buildStartupDetectors 单点构造
+  // (service off 时仍实扫配置资产根,不伪造 0——见 owner.ts 注释)。
+  await assertStrictOwnerMigrationComplete(
+    process.env,
+    buildStartupDetectors({
+      persist: sharedPersistBackend,
+      permissions: sharedPermissionBackend,
+      assetStore: sharedAssetStore,
+    }),
+  )
+  // P-6 saga sweep:gate 通过后启动恢复(reconcile)+ 周期有界 sweep(60s);仅 PG 后端有跨重启语义,memory no-op。
   void startCompensationSweep()
   serve({ fetch: app.fetch, hostname: HOSTNAME, port: PORT }, (info) => {
     const bound = `${info.address}:${info.port}`

@@ -1,9 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile, readdir, mkdir, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { request as httpRequest } from 'node:http'
 import process from 'node:process'
-import { debugLogsRoute, __resetDebugLogsRateLimit } from './debug-logs'
+import { Hono } from 'hono'
+import { serve } from '@hono/node-server'
+import { debugLogsRoute, __resetDebugLogsRateLimit, __debugLogsBucketCount, __debugLogsBucketKeys, __seedDebugLogsBucket } from './debug-logs'
+import { remoteDebugLogDir, remoteDebugFilePath } from '../lib/debug-records'
+import { ssoAuthErrorHandler } from '../lib/owner'
+import type { AppEnv } from '../lib/types'
 
 // In-process route tests via Hono's app.request() (no server, no ECONNRESET).
 // Covers the migrated shapes + the D1/D7/D8 intended changes.
@@ -182,5 +188,669 @@ describe('debug-logs route — D8: fail-closed in public mode', () => {
     expect(noToken.status).toBe(403)
     const withToken = await request('GET', undefined, { 'x-mivo-debug-token': TOKEN })
     expect(withToken.status).toBe(200)
+  })
+})
+
+describe('debug-logs route — G2.1 F6: strict SSO 下 system-scoped(不被 SSO 门控,独立防护仍生效)', () => {
+  // F6:debug-logs 是 system-scoped 遥测,不经 resolveActor,不被 ssoAuthBoundary 门控。
+  // 镜像 app.ts(顶层 onError(ssoAuthErrorHandler) + 挂 debugLogsRoute under /api/mivo)+ strict env:
+  // POST 无 gateway proof 仍 200(非 401)→ 证明它不在 owner-scoped SSO 门内;独立防护(origin/rate/public)
+  // strict 下继续生效(403,非 401)。选型 + matrix 见 docs/runbook/g21-strict-sso-runbook.md §route security matrix。
+  const SSO_ENV = ['MIVO_SSO_STRICT', 'MIVO_GATEWAY_SECRET']
+  let strictApp: Hono<AppEnv>
+  beforeEach(() => {
+    saveEnv(SSO_ENV)
+    strictApp = new Hono<AppEnv>()
+    strictApp.onError(ssoAuthErrorHandler)
+    strictApp.route('/api/mivo', debugLogsRoute)
+    process.env.MIVO_SSO_STRICT = '1'
+    process.env.MIVO_GATEWAY_SECRET = 'gw-strict-secret'
+    __resetDebugLogsRateLimit()
+  })
+  afterEach(() => {
+    restoreEnv(SSO_ENV)
+    __resetDebugLogsRateLimit()
+  })
+
+  it('strict + 无 gateway proof + POST debug-logs → 200(非 401;system-scoped,不经 resolveActor)', async () => {
+    const res = await strictApp.request('/api/mivo/debug-logs', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: jsonBody({ entries: [{ level: 'warning', source: 'S', message: 'm', timestamp: 1 }] }),
+    })
+    expect(res.status).toBe(200)
+    expect((await json(res)).accepted).toBe(1)
+  })
+
+  it('strict + 无 gateway proof + GET debug-logs(local 无 token)→ 200(system-scoped,非 401)', async () => {
+    await strictApp.request('/api/mivo/debug-logs', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: jsonBody({ entries: [{ level: 'error', source: 'S', message: 'm', timestamp: 1 }] }),
+    })
+    const res = await strictApp.request('/api/mivo/debug-logs', { method: 'GET' })
+    expect(res.status).toBe(200)
+    const body = await json(res)
+    expect(body.ok).toBe(true)
+  })
+
+  it('strict + 独立防护仍生效:disallowed Origin → 403(非 401;system-scoped 独立防护)', async () => {
+    const res = await strictApp.request('/api/mivo/debug-logs', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'https://evil.example' },
+      body: jsonBody({ entries: [{ level: 'warning', source: 'S', message: 'm', timestamp: 1 }] }),
+    })
+    expect(res.status).toBe(403)
+    expect((await json(res)).error).toBe('Origin not allowed')
+  })
+
+  it('strict + public + 无 view token → GET 403(D8 public fail-closed,非 SSO 401)', async () => {
+    process.env.MIVO_PUBLIC = '1'
+    const res = await strictApp.request('/api/mivo/debug-logs', { method: 'GET' })
+    expect(res.status).toBe(403)
+    expect((await json(res)).error).toBe('Debug report token required')
+  })
+})
+
+// ── G2.1 R2-4:debug-logs 防滥用(rate key 可信来源 + bucket 淘汰 + quota/retention + 生产 Origin 硬前置)──
+// 返修前漏洞(F6 第二轮):rate key 取客户端可控 XFF 首项(rate=1 时轮换 XFF 三连 200 绕过);无 Origin
+// 无条件放行 + localhost 兜底(生产未配 allowlist 时任意 Origin/无 Origin 放行);rateBuckets 无淘汰
+// (内存无限增长);JSONL 无 quota/retention(磁盘耗尽)。R2-4 修复 + 负例锁定防回归。
+describe('debug-logs route — R2-4: rate key 可信来源 + bucket 淘汰 + quota/retention + 生产 Origin 硬前置', () => {
+  const R24_ENV = [
+    'MIVO_DEBUG_TRUST_XFF', 'MIVO_DEBUG_DISK_QUOTA_MB', 'MIVO_DEBUG_RETENTION_DAYS',
+    'MIVO_DEBUG_RATE_MAX_BUCKETS', 'NODE_ENV', 'MIVO_PUBLIC',
+    'MIVO_DEBUG_ALLOWED_ORIGINS', 'MIVO_DEBUG_POST_RATE_LIMIT',
+  ]
+  const saved: Record<string, string | undefined> = {}
+  beforeEach(() => {
+    for (const n of R24_ENV) saved[n] = process.env[n]
+    delete process.env.MIVO_DEBUG_TRUST_XFF
+    delete process.env.MIVO_DEBUG_DISK_QUOTA_MB
+    delete process.env.MIVO_DEBUG_RETENTION_DAYS
+    delete process.env.MIVO_DEBUG_RATE_MAX_BUCKETS
+    delete process.env.NODE_ENV
+    delete process.env.MIVO_PUBLIC
+    delete process.env.MIVO_DEBUG_ALLOWED_ORIGINS
+    delete process.env.MIVO_DEBUG_POST_RATE_LIMIT
+    __resetDebugLogsRateLimit()
+  })
+  afterEach(() => {
+    for (const n of R24_ENV) {
+      if (saved[n] === undefined) delete process.env[n]
+      else process.env[n] = saved[n]
+    }
+    __resetDebugLogsRateLimit()
+  })
+
+  // ── R2-4-1:rate key 默认不信任 XFF(用 socket remote addr;in-process 无 socket → 'unknown' 同 bucket)──
+  it('默认不信任 XFF:rate=1 + 轮换 XFF 三连 → r1=200, r2/r3=429(XFF 轮换不绕过;remote addr 同 bucket)', async () => {
+    process.env.MIVO_DEBUG_POST_RATE_LIMIT = '1'
+    const r1 = await postEntry({ 'x-forwarded-for': '1.1.1.1' })
+    const r2 = await postEntry({ 'x-forwarded-for': '2.2.2.2' })
+    const r3 = await postEntry({ 'x-forwarded-for': '3.3.3.3' })
+    expect(r1.status).toBe(200)
+    expect(r2.status).toBe(429) // 返修前三连 200(XFF 轮换绕过 rate);修复后同 'unknown' bucket → 429
+    expect(r3.status).toBe(429)
+  })
+
+  it('MIVO_DEBUG_TRUST_XFF=1(opt-in):rate=1 + 不同 XFF → 各 200(网关已清洗 XFF,信任首项 → 不同 bucket)', async () => {
+    process.env.MIVO_DEBUG_POST_RATE_LIMIT = '1'
+    process.env.MIVO_DEBUG_TRUST_XFF = '1'
+    const r1 = await postEntry({ 'x-forwarded-for': '1.1.1.1' })
+    const r2 = await postEntry({ 'x-forwarded-for': '2.2.2.2' })
+    expect(r1.status).toBe(200)
+    expect(r2.status).toBe(200) // opt-in 信任 XFF 首项 → 不同 bucket → 各 200(网关清洗后可接受)
+  })
+
+  // ── R2-4-2:bucket 淘汰(防内存无限增长;返修前无淘汰)──
+  it('bucket 淘汰:超 MAX_BUCKETS 时 lazy sweep 窗外 stale 项(bounded memory)', async () => {
+    process.env.MIVO_DEBUG_RATE_MAX_BUCKETS = '3'
+    const stale = Date.now() - 120_000 // 2 分钟前(RATE_LIMIT_WINDOW_MS=60s,窗外)
+    for (let i = 0; i < 4; i++) __seedDebugLogsBucket(`stale-${i}`, stale)
+    expect(__debugLogsBucketCount()).toBe(4)
+    await postEntry() // 触发 rateLimitExceeded → size>MAX → sweep stale
+    expect(__debugLogsBucketCount()).toBe(1) // 4 stale 全窗外被删;新增 'unknown' bucket
+  })
+
+  it('bucket 淘汰只删窗外 stale,保留窗内项(未过期不淘汰)', async () => {
+    process.env.MIVO_DEBUG_RATE_MAX_BUCKETS = '3'
+    __seedDebugLogsBucket('fresh-1', Date.now()) // 窗内
+    const stale = Date.now() - 120_000
+    __seedDebugLogsBucket('stale-1', stale)
+    __seedDebugLogsBucket('stale-2', stale)
+    __seedDebugLogsBucket('stale-3', stale)
+    await postEntry() // size=4>3 → sweep:删 3 stale,保留 fresh-1;set 'unknown' → 2
+    expect(__debugLogsBucketCount()).toBe(2) // fresh-1(窗内保留)+ unknown(新)
+  })
+
+  // ── R2-4-3:磁盘 quota 超限 → 413(返修前无 quota,磁盘可被耗尽)──
+  it('磁盘 quota 超限(append 前 size>=quota)→ 413 DebugLogQuotaExceededError', async () => {
+    process.env.MIVO_DEBUG_DISK_QUOTA_MB = '1' // quota=1MB
+    await mkdir(remoteDebugLogDir(), { recursive: true })
+    await writeFile(remoteDebugFilePath(), Buffer.alloc(2 * 1024 * 1024, 0x61)) // 2MB > 1MB quota
+    const res = await postEntry()
+    expect(res.status).toBe(413)
+    expect((await json(res)).error).toBe('Debug log disk quota exceeded')
+  })
+
+  it('磁盘 quota 未超 → 200(quota 不阻断正常 append)', async () => {
+    process.env.MIVO_DEBUG_DISK_QUOTA_MB = '100' // 100MB,远大于单次 append
+    const res = await postEntry()
+    expect(res.status).toBe(200)
+  })
+
+  // ── R2-4-4:retention sweep 过期 .jsonl(返修前无 retention,JSONL 无限堆积)──
+  it('retention sweep:append 前删除过期 .jsonl(早于 today - retentionDays)', async () => {
+    process.env.MIVO_DEBUG_RETENTION_DAYS = '7'
+    await mkdir(remoteDebugLogDir(), { recursive: true })
+    const oldDateStr = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+    await writeFile(remoteDebugFilePath(oldDateStr), 'old-data')
+    const res = await postEntry() // append 触发 sweep
+    expect(res.status).toBe(200)
+    const files = await readdir(remoteDebugLogDir())
+    expect(files).not.toContain(`${oldDateStr}.jsonl`) // 过期文件被删
+  })
+
+  it('retention 不删窗内文件(retentionDays 内保留)', async () => {
+    process.env.MIVO_DEBUG_RETENTION_DAYS = '7'
+    await mkdir(remoteDebugLogDir(), { recursive: true })
+    const recentDateStr = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+    await writeFile(remoteDebugFilePath(recentDateStr), 'recent-data')
+    await postEntry()
+    const files = await readdir(remoteDebugLogDir())
+    expect(files).toContain(`${recentDateStr}.jsonl`) // 窗内保留
+  })
+
+  // ── R2-4-5:生产 Origin 硬前置(返修前"无 Origin 无条件放行"+"localhost 兜底"让生产放行)──
+  it('生产(MIVO_PUBLIC=1)+ 无 allowlist → POST 拒(无 localhost 兜底;返修前 localhost 兜底放行)', async () => {
+    process.env.MIVO_PUBLIC = '1'
+    const res = await postEntry() // 无 allowlist,无 Origin
+    expect(res.status).toBe(403)
+    expect((await json(res)).error).toBe('Origin not allowed')
+  })
+
+  it('生产 + 有 allowlist + 无 Origin → 拒(浏览器必带 Origin;返修前无 Origin 无条件放行)', async () => {
+    process.env.MIVO_PUBLIC = '1'
+    process.env.MIVO_DEBUG_ALLOWED_ORIGINS = 'https://app.example'
+    const res = await postEntry() // 无 Origin
+    expect(res.status).toBe(403)
+  })
+
+  it('生产 + 有 allowlist + 匹配 Origin → 200', async () => {
+    process.env.MIVO_PUBLIC = '1'
+    process.env.MIVO_DEBUG_ALLOWED_ORIGINS = 'https://app.example'
+    const res = await postEntry({ origin: 'https://app.example' })
+    expect(res.status).toBe(200)
+  })
+
+  it('生产 + 有 allowlist + 不匹配 Origin → 拒', async () => {
+    process.env.MIVO_PUBLIC = '1'
+    process.env.MIVO_DEBUG_ALLOWED_ORIGINS = 'https://app.example'
+    const res = await postEntry({ origin: 'https://evil.example' })
+    expect(res.status).toBe(403)
+  })
+
+  it('生产(NODE_ENV=production)+ 跨域 Origin + 无 allowlist → 拒(isProdBoundary 另一分支;同源放行另测 R3-F4)', async () => {
+    process.env.NODE_ENV = 'production'
+    // Origin 跨域(不匹配 Host),无 allowlist → 拒;证 NODE_ENV=production 也走生产硬前置(同源放行见 R3-F4 块)
+    const res = await postEntry({ origin: 'https://evil.example', host: '127.0.0.1:6276' })
+    expect(res.status).toBe(403)
+  })
+
+  // 非生产 dev compat 保留(零变化硬约束)
+  it('非生产 + 无 Origin → 200(dev compat,零变化)', async () => {
+    const res = await postEntry()
+    expect(res.status).toBe(200)
+  })
+
+  it('非生产 + localhost Origin(无 allowlist)→ 200(localhost 兜底保留)', async () => {
+    const res = await postEntry({ origin: 'http://localhost:5173' })
+    expect(res.status).toBe(200)
+  })
+})
+
+// ── G2.1 R3-F4:生产同源默认放行(lead 裁定;e2e 红修复)──────────────────────────────────
+// 返修前(R2-4)生产硬前置"无 allowlist 一律拒(含同源)"把同源浏览器 POST 也拒了 → 客户端 debugLogger
+// (remoteDebugReporter POST /api/mivo/debug-logs)写入全 403 → prod e2e debug/canvas-interactions/mask/
+// mask-reflow 四场景红(浏览器 console "Failed to load resource: 403 (Forbidden)")。lead 裁定:同源
+// (Origin 与 Host 同源)默认放行;跨域才需显式 MIVO_DEBUG_ALLOWED_ORIGINS;无 Origin 维持 fail-closed。
+// 本块锁三条新行为(同源放行)+ 跨域/fail-closed parity,防回归。
+describe('debug-logs route — R3-F4: 生产同源默认放行(lead 裁定 e2e 红修复)', () => {
+  const F4_ENV = ['MIVO_PUBLIC', 'NODE_ENV', 'MIVO_DEBUG_ALLOWED_ORIGINS', 'MIVO_DEBUG_POST_RATE_LIMIT', 'MIVO_PUBLIC_ORIGIN', 'MIVO_DEBUG_TRUST_XFF']
+  const saved: Record<string, string | undefined> = {}
+  beforeEach(() => {
+    for (const n of F4_ENV) saved[n] = process.env[n]
+    delete process.env.MIVO_PUBLIC
+    delete process.env.NODE_ENV
+    delete process.env.MIVO_DEBUG_ALLOWED_ORIGINS
+    delete process.env.MIVO_DEBUG_POST_RATE_LIMIT
+    delete process.env.MIVO_PUBLIC_ORIGIN
+    delete process.env.MIVO_DEBUG_TRUST_XFF
+    __resetDebugLogsRateLimit()
+  })
+  afterEach(() => {
+    for (const n of F4_ENV) {
+      if (saved[n] === undefined) delete process.env[n]
+      else process.env[n] = saved[n]
+    }
+    __resetDebugLogsRateLimit()
+  })
+
+  it('生产(MIVO_PUBLIC=1)+ 同源 Origin(Origin 与 Host 同源)+ 无 allowlist → 200(R5:需 PUBLIC_ORIGIN 可信外部 scheme)', async () => {
+    process.env.MIVO_PUBLIC = '1'
+    process.env.MIVO_PUBLIC_ORIGIN = 'http://127.0.0.1:6276'
+    const res = await postEntry({ origin: 'http://127.0.0.1:6276', host: '127.0.0.1:6276' })
+    expect(res.status).toBe(200)
+  })
+
+  it('生产(NODE_ENV=production)+ 同源 Origin → 200(isProdBoundary 两分支都同源放行;R5:需 PUBLIC_ORIGIN)', async () => {
+    process.env.NODE_ENV = 'production'
+    process.env.MIVO_PUBLIC_ORIGIN = 'http://127.0.0.1:6276'
+    const res = await postEntry({ origin: 'http://127.0.0.1:6276', host: '127.0.0.1:6276' })
+    expect(res.status).toBe(200)
+  })
+
+  it('生产 + 同源 https 默认端口(Origin=https://app.example,Host=app.example)→ 200(默认端口归一;R5:需 PUBLIC_ORIGIN=https)', async () => {
+    process.env.MIVO_PUBLIC = '1'
+    process.env.MIVO_PUBLIC_ORIGIN = 'https://app.example'
+    const res = await postEntry({ origin: 'https://app.example', host: 'app.example' })
+    expect(res.status).toBe(200)
+  })
+
+  it('生产 + Origin 与 Host 端口差异(localhost:5173 vs localhost:5174)→ 403(非同源,跨域处理;R5:PUBLIC_ORIGIN 推导后端口不匹配)', async () => {
+    process.env.MIVO_PUBLIC = '1'
+    process.env.MIVO_PUBLIC_ORIGIN = 'http://localhost:5173'
+    const res = await postEntry({ origin: 'http://localhost:5173', host: 'localhost:5174' })
+    expect(res.status).toBe(403)
+  })
+
+  it('生产 + 跨域 Origin(域名差异)+ 无 allowlist → 403(跨域仍需 allowlist)', async () => {
+    process.env.MIVO_PUBLIC = '1'
+    const res = await postEntry({ origin: 'https://evil.example', host: '127.0.0.1:6276' })
+    expect(res.status).toBe(403)
+  })
+
+  it('生产 + 跨域 Origin + allowlist 匹配 → 200(跨域显式放行)', async () => {
+    process.env.MIVO_PUBLIC = '1'
+    process.env.MIVO_DEBUG_ALLOWED_ORIGINS = 'https://app.example'
+    const res = await postEntry({ origin: 'https://app.example', host: '127.0.0.1:6276' })
+    expect(res.status).toBe(200)
+  })
+
+  it('生产 + 无 Origin → 403(fail-closed 维持;lead 裁定无 Origin 仍拒)', async () => {
+    process.env.MIVO_PUBLIC = '1'
+    const res = await postEntry()
+    expect(res.status).toBe(403)
+  })
+
+  it('非生产 + 无 Origin → 200(dev compat 零变化)', async () => {
+    const res = await postEntry()
+    expect(res.status).toBe(200)
+  })
+})
+
+// ── G2.1 R3-F3:rate key 读 socket.remoteAddress + 确定性淘汰 + quota 纳入本次 byteLength ──────────
+// R3-F3[P2]:返修前 (1) getRateKey 读 incoming.remoteAddress(@hono/node-server HttpBindings 无此属性,生产恒
+// undefined → 全落 'unknown' 同 bucket → 60/min 全局误限流);(2) bucket 仅 size>max 时删 stale,全 fresh 时
+// 无界增长,且 size==max 仍插入 → max+1;(3) quota 只判 used>=quota(used=quota-1 加近 1MB 越界)+ 无串行 → 并发双过。
+describe('debug-logs route — R3-F3: rate key socket.remoteAddress + 确定性淘汰 + quota byteLength', () => {
+  const F3_ENV = [
+    'MIVO_DEBUG_TRUST_XFF', 'MIVO_DEBUG_DISK_QUOTA_MB', 'MIVO_DEBUG_RATE_MAX_BUCKETS',
+    'NODE_ENV', 'MIVO_PUBLIC', 'MIVO_DEBUG_ALLOWED_ORIGINS', 'MIVO_DEBUG_POST_RATE_LIMIT',
+  ]
+  const saved: Record<string, string | undefined> = {}
+  beforeEach(() => {
+    for (const n of F3_ENV) saved[n] = process.env[n]
+    delete process.env.MIVO_DEBUG_TRUST_XFF
+    delete process.env.MIVO_DEBUG_DISK_QUOTA_MB
+    delete process.env.MIVO_DEBUG_RATE_MAX_BUCKETS
+    delete process.env.NODE_ENV
+    delete process.env.MIVO_PUBLIC
+    delete process.env.MIVO_DEBUG_ALLOWED_ORIGINS
+    delete process.env.MIVO_DEBUG_POST_RATE_LIMIT
+    __resetDebugLogsRateLimit()
+  })
+  afterEach(() => {
+    for (const n of F3_ENV) {
+      if (saved[n] === undefined) delete process.env[n]
+      else process.env[n] = saved[n]
+    }
+    __resetDebugLogsRateLimit()
+  })
+
+  // ── R3-F3-1:rate key 读真实 socket remoteAddress(非 incoming.remoteAddress)──
+  // 真实 node server:client 源 IP=127.0.0.1 → rate bucket key 应为 '127.0.0.1'(真实 socket.remoteAddress),
+  // 非 'unknown'(返修前读 incoming.remoteAddress,@hono/node-server HttpBindings 无此属性 → 恒 undefined →
+  // 'unknown' → 生产所有用户共享一只 bucket → 60/min 全局误限流)。
+  // 注:127.0.0.2 在本机 macOS 不可绑(EADDRNOTAVAIL,lo0 仅 127.0.0.1),故用 key 直查证伪(非"两源"行为对比):
+  // bucket key = 真实 remoteAddress('127.0.0.1')即证 getRateKey 读对了路径;in-process 无 socket → 'unknown'(对照组)。
+  const startRealServer = (app: Hono<AppEnv>): Promise<{ port: number; stop: () => Promise<void> }> =>
+    new Promise((resolve) => {
+      const server = serve({ fetch: app.fetch, hostname: '127.0.0.1', port: 0 }, (info) => {
+        resolve({ port: info.port, stop: () => new Promise((r) => server.close(() => r())) })
+      })
+    })
+  const postFromAddr = (port: number, localAddress: string, body: string) =>
+    new Promise<{ status: number; body: string }>((resolve) => {
+      const req = httpRequest(
+        {
+          host: '127.0.0.1',
+          port,
+          method: 'POST',
+          path: '/api/mivo/debug-logs',
+          headers: { 'content-type': 'application/json' },
+          localAddress,
+        },
+        (res) => {
+          let chunks = ''
+          res.on('data', (c) => (chunks += c.toString()))
+          res.on('end', () => resolve({ status: res.statusCode ?? 0, body: chunks }))
+        },
+      )
+      req.on('error', (err) => resolve({ status: 0, body: String(err) }))
+      req.write(body)
+      req.end()
+    })
+
+  it('真实 socket:rate bucket key = "127.0.0.1"(socket.remoteAddress;非 "unknown"——证 getRateKey 读对路径)', async () => {
+    process.env.MIVO_DEBUG_POST_RATE_LIMIT = '60' // 不限流,只验 key
+    const app = new Hono<AppEnv>()
+    app.route('/api/mivo', debugLogsRoute)
+    const { port, stop } = await startRealServer(app)
+    try {
+      const body = jsonBody({ entries: [{ level: 'warning', source: 'S', message: 'm', timestamp: 1 }] })
+      const r1 = await postFromAddr(port, '127.0.0.1', body)
+      expect(r1.status).toBe(200)
+      // bucket key 应是真实 socket remoteAddress('127.0.0.1'),不是 'unknown'
+      // 返修前(读 incoming.remoteAddress)→ undefined → 'unknown' → keys=['unknown'](RED);修复后 keys=['127.0.0.1'](GREEN)
+      expect(__debugLogsBucketKeys()).toContain('127.0.0.1')
+      expect(__debugLogsBucketKeys()).not.toContain('unknown')
+    } finally {
+      await stop()
+    }
+  })
+
+  it('真实 socket:rate=1 + 同源两连 → r1=200, r2=429(同 bucket count 累积;key 真实,限流生效)', async () => {
+    process.env.MIVO_DEBUG_POST_RATE_LIMIT = '1' // rate=1:同 bucket 第二连 429
+    const app = new Hono<AppEnv>()
+    app.route('/api/mivo', debugLogsRoute)
+    const { port, stop } = await startRealServer(app)
+    try {
+      const body = jsonBody({ entries: [{ level: 'warning', source: 'S', message: 'm', timestamp: 1 }] })
+      const r1 = await postFromAddr(port, '127.0.0.1', body)
+      expect(r1.status).toBe(200)
+      const r2 = await postFromAddr(port, '127.0.0.1', body) // 同源 → 同 bucket → count=2 > rate=1 → 429
+      expect(r2.status).toBe(429)
+      expect(__debugLogsBucketKeys()).toContain('127.0.0.1') // 仍真实 key
+    } finally {
+      await stop()
+    }
+  })
+
+  // ── R3-F3-2:bucket 达上限全 fresh → 确定性淘汰 oldest(保证 size<=max)──
+  it('max=2 连续 4 fresh key(XFF)→ size<=2(确定性淘汰 oldest;返修前 size>max 无界 → size=4 RED)', async () => {
+    process.env.MIVO_DEBUG_RATE_MAX_BUCKETS = '2'
+    process.env.MIVO_DEBUG_TRUST_XFF = '1' // in-process 无 socket,用 XFF 制造不同 key
+    process.env.MIVO_DEBUG_POST_RATE_LIMIT = '60' // 不限流,只测淘汰
+    for (let i = 0; i < 4; i++) {
+      await postEntry({ 'x-forwarded-for': `10.0.0.${i}` })
+    }
+    expect(__debugLogsBucketCount()).toBeLessThanOrEqual(2) // 返修前 size=4 > 2(RED);修复后 size<=2(GREEN)
+  })
+
+  it('max=2 + size==max(边界)→ 插入新 key 仍淘汰(返修前 size==max 用 > 判定 → 不淘汰 → size=max+1)', async () => {
+    process.env.MIVO_DEBUG_RATE_MAX_BUCKETS = '2'
+    process.env.MIVO_DEBUG_TRUST_XFF = '1'
+    process.env.MIVO_DEBUG_POST_RATE_LIMIT = '60'
+    await postEntry({ 'x-forwarded-for': '10.0.0.1' }) // size 0→1
+    await postEntry({ 'x-forwarded-for': '10.0.0.2' }) // size 1→2(==max)
+    await postEntry({ 'x-forwarded-for': '10.0.0.3' }) // size==max → 淘汰 oldest → 插入 → size 2(返修前 3)
+    expect(__debugLogsBucketCount()).toBe(2)
+  })
+
+  // ── R3-F3-3:quota 纳入本次 append byteLength(返修前只判 used>=quota → 越界)──
+  // 注:message 用带空格词句(非 'x'.repeat —— sanitizeRemoteDebugText 的 `[A-Za-z0-9+/=_-]{48,}` base64
+  // 正则会把 48+ 连续字符 redact 成 [redacted-base64],压成 ~18 字节 → 无法凑大 append)。
+  const largePayload = (): string =>
+    jsonBody({
+      entries: Array.from({ length: 40 }, (_, i) => ({
+        level: 'warning',
+        source: 'S',
+        message: ('the quick brown fox ').repeat(200).trim(), // ~3999 chars,无 48+ 连续串 → 不被 redact
+        timestamp: i,
+      })),
+    })
+  const dirSizeBytes = async (): Promise<number> => {
+    let total = 0
+    for (const f of await readdir(remoteDebugLogDir())) {
+      try {
+        total += (await stat(join(remoteDebugLogDir(), f))).size
+      } catch {
+        // 并发删除 → 忽略
+      }
+    }
+    return total
+  }
+
+  it('quota-1 场景:used=900KB + ~180KB append → 413(纳入本次 byteLength;返修前 900<1000 放行越界 RED)', async () => {
+    process.env.MIVO_DEBUG_DISK_QUOTA_MB = '1' // 1MB
+    await mkdir(remoteDebugLogDir(), { recursive: true })
+    await writeFile(remoteDebugFilePath(), Buffer.alloc(900 * 1024, 0x61)) // 900KB 预置
+    const res = await request('POST', largePayload(), { 'content-type': 'application/json' })
+    expect(res.status).toBe(413) // 900+180=1080 > 1000 → 拒(返修前 used<quota 放行 → 200 + 越界 RED)
+    expect((await json(res)).error).toBe('Debug log disk quota exceeded')
+    expect(await dirSizeBytes()).toBeLessThanOrEqual(1 * 1024 * 1024) // dir 不越界(返修前 > 1MB)
+  })
+
+  it('两并发 append 不越界 quota(串行 mutex;返修前 TOCTOU 双过 → 1118KB>1MB RED)', async () => {
+    process.env.MIVO_DEBUG_DISK_QUOTA_MB = '1' // 1MB
+    await mkdir(remoteDebugLogDir(), { recursive: true })
+    // 预置 750KB;line~171KB:串行后 A 见 750→921<1MB 过,B 见 921→1096>1MB 拒;
+    // 返修前(无 mutex + used>=quota)两并发各读 750(<quota)→ 各 append → 750+342=1092KB 越界(RED)
+    await writeFile(remoteDebugFilePath(), Buffer.alloc(750 * 1024, 0x61)) // 750KB 预置
+    const payload = largePayload()
+    const [a, b] = await Promise.all([
+      request('POST', payload, { 'content-type': 'application/json' }),
+      request('POST', payload, { 'content-type': 'application/json' }),
+    ])
+    // 串行后至少一个 413(B 越界);返修前两并发双 200(越界 RED)
+    expect([a.status, b.status]).toContain(413)
+    expect(await dirSizeBytes()).toBeLessThanOrEqual(1 * 1024 * 1024) // quota 不破(返修前 1092KB > 1MB)
+  })
+
+  it('quota 未越界:used+incoming<=quota → 200(正常 append 不被误拒)', async () => {
+    process.env.MIVO_DEBUG_DISK_QUOTA_MB = '100' // 100MB,远大于单次 append
+    const res = await request('POST', largePayload(), { 'content-type': 'application/json' })
+    expect(res.status).toBe(200)
+  })
+})
+
+// ── G2.1 R5:同源判定安全硬化(Web Origin 三元组 + 严格 Origin 语法 + 大小写/默认端口对称)──
+// R5 复审攻破 b5b6e4b 的 isSameOrigin(仅比 new URL(origin).host === Host):
+//   (1) 畸形 Origin(含 path/query/userinfo)被误放行 200——new URL().host 丢 path/query/userinfo 后比 Host;
+//   (2) scheme 不参与同源判定(http Origin 对 https 部署当同源)——TLS 终止后 http Origin 冒充 https 同源;
+//   (3) Host 大小写/显式默认端口不对称(合法同源被误拒)——APP.EXAMPLE / app.example:443 被 403;
+//   (4) 跨 scheme + text/plain JSON POST 可写入(simple/no-cors 旁路)。
+// 裁定语义不变:同源放行 + 跨域 allowlist + 无 Origin fail-closed;但同源判定的"可信外部 scheme"必须
+// 显式配置(MIVO_PUBLIC_ORIGIN 或受信 X-Forwarded-Proto),否则生产 fail-closed(防 TLS 终止后 http Origin
+// 冒充 https 同源)。本块锁全部攻击矩阵正反例,防回归。
+describe('debug-logs route — R5: 同源三元组 + 严格 Origin 语法(攻击矩阵)', () => {
+  const R5_ENV = [
+    'MIVO_PUBLIC', 'NODE_ENV', 'MIVO_DEBUG_ALLOWED_ORIGINS', 'MIVO_DEBUG_POST_RATE_LIMIT',
+    'MIVO_PUBLIC_ORIGIN', 'MIVO_DEBUG_TRUST_XFF',
+  ]
+  const saved: Record<string, string | undefined> = {}
+  beforeEach(() => {
+    for (const n of R5_ENV) saved[n] = process.env[n]
+    delete process.env.MIVO_PUBLIC
+    delete process.env.NODE_ENV
+    delete process.env.MIVO_DEBUG_ALLOWED_ORIGINS
+    delete process.env.MIVO_DEBUG_POST_RATE_LIMIT
+    delete process.env.MIVO_PUBLIC_ORIGIN
+    delete process.env.MIVO_DEBUG_TRUST_XFF
+    __resetDebugLogsRateLimit()
+  })
+  afterEach(() => {
+    for (const n of R5_ENV) {
+      if (saved[n] === undefined) delete process.env[n]
+      else process.env[n] = saved[n]
+    }
+    __resetDebugLogsRateLimit()
+  })
+
+  // 生产边界 + 可信外部 scheme=https(默认 PUBLIC_ORIGIN=https://app.example)。
+  const prodWithHttps = (extra: Record<string, string> = {}) => {
+    process.env.MIVO_PUBLIC = '1'
+    process.env.MIVO_PUBLIC_ORIGIN = 'https://app.example'
+    for (const [k, v] of Object.entries(extra)) process.env[k] = v
+  }
+
+  // ── R5-A:畸形 Origin(含 path/query/userinfo/null/非法序列化)一律 403(不冒充同源)──
+  it('生产 + Origin 含 path(https://app.example/path)+ 同源 Host → 403(畸形 Origin 拒)', async () => {
+    prodWithHttps()
+    const res = await postEntry({ origin: 'https://app.example/path', host: 'app.example' })
+    expect(res.status).toBe(403)
+  })
+  it('生产 + Origin 含 query(https://app.example?q=1)+ 同源 Host → 403', async () => {
+    prodWithHttps()
+    const res = await postEntry({ origin: 'https://app.example?q=1', host: 'app.example' })
+    expect(res.status).toBe(403)
+  })
+  it('生产 + Origin 含 userinfo(https://user@app.example)+ 同源 Host → 403', async () => {
+    prodWithHttps()
+    const res = await postEntry({ origin: 'https://user@app.example', host: 'app.example' })
+    expect(res.status).toBe(403)
+  })
+  it('生产 + Origin: null(字符串)→ 403', async () => {
+    prodWithHttps()
+    const res = await postEntry({ origin: 'null', host: 'app.example' })
+    expect(res.status).toBe(403)
+  })
+  it('生产 + Origin 非法序列化(//app.example 无 scheme)→ 403', async () => {
+    prodWithHttps()
+    const res = await postEntry({ origin: '//app.example', host: 'app.example' })
+    expect(res.status).toBe(403)
+  })
+
+  // ── R5-B:scheme 必须参与同源判定(跨 scheme 拒;防 TLS 终止后 http Origin 冒充 https 同源)──
+  it('生产(外部 https)+ http Origin + 同 host → 403(跨 scheme 不当同源;返修前 200)', async () => {
+    prodWithHttps()
+    const res = await postEntry({ origin: 'http://app.example', host: 'app.example' })
+    expect(res.status).toBe(403)
+  })
+  it('生产(外部 https)+ http Origin 带默认端口 → 403(跨 scheme)', async () => {
+    prodWithHttps()
+    const res = await postEntry({ origin: 'http://app.example:443', host: 'app.example:443' })
+    expect(res.status).toBe(403)
+  })
+  it('生产 + ws Origin(非 http/https scheme)→ 403', async () => {
+    prodWithHttps()
+    const res = await postEntry({ origin: 'ws://app.example', host: 'app.example' })
+    expect(res.status).toBe(403)
+  })
+
+  // ── R5-C:大小写/默认端口对称(合法同源不误拒)──
+  it('生产 + Host 大写(APP.EXAMPLE)+ Origin=https://app.example → 200(大小写归一;返修前 403)', async () => {
+    prodWithHttps()
+    const res = await postEntry({ origin: 'https://app.example', host: 'APP.EXAMPLE' })
+    expect(res.status).toBe(200)
+  })
+  it('生产 + Host 显式默认端口(app.example:443)+ Origin=https://app.example → 200(端口归一对称;返修前 403)', async () => {
+    prodWithHttps()
+    const res = await postEntry({ origin: 'https://app.example', host: 'app.example:443' })
+    expect(res.status).toBe(200)
+  })
+  it('生产 + Origin 显式默认端口(https://app.example:443)+ Host=app.example → 200(反向对称)', async () => {
+    prodWithHttps()
+    const res = await postEntry({ origin: 'https://app.example:443', host: 'app.example' })
+    expect(res.status).toBe(200)
+  })
+  it('生产 + Origin=http://127.0.0.1:6276 + Host=127.0.0.1:6276(PUBLIC_ORIGIN=http)→ 200(直连 http 同源)', async () => {
+    prodWithHttps({ MIVO_PUBLIC_ORIGIN: 'http://127.0.0.1:6276' })
+    const res = await postEntry({ origin: 'http://127.0.0.1:6276', host: '127.0.0.1:6276' })
+    expect(res.status).toBe(200)
+  })
+
+  // ── R5-D:可信外部 scheme来源(PUBLIC_ORIGIN / 受信 X-Forwarded-Proto);无则 fail-closed ──
+  it('生产 + 无 PUBLIC_ORIGIN + 无 TRUST_XFF + 同源 Origin → 403(无法可信判定外部 scheme → fail-closed;返修前 200)', async () => {
+    process.env.MIVO_PUBLIC = '1'
+    // 不设 PUBLIC_ORIGIN,不设 TRUST_XFF → 无法可信判定外部 scheme → 同源不成立 → 落跨域 allowlist(无 → 403)
+    const res = await postEntry({ origin: 'http://127.0.0.1:6276', host: '127.0.0.1:6276' })
+    expect(res.status).toBe(403)
+  })
+  it('生产 + TRUST_XFF=1 + X-Forwarded-Proto=https + 同源 https Origin → 200(受信 proto 推导外部 scheme)', async () => {
+    process.env.MIVO_PUBLIC = '1'
+    process.env.MIVO_DEBUG_TRUST_XFF = '1'
+    const res = await postEntry({
+      origin: 'https://app.example',
+      host: 'app.example',
+      'x-forwarded-proto': 'https',
+    })
+    expect(res.status).toBe(200)
+  })
+  it('生产 + TRUST_XFF=1 + X-Forwarded-Proto=http + https Origin → 403(受信 proto=http,跨 scheme 拒)', async () => {
+    process.env.MIVO_PUBLIC = '1'
+    process.env.MIVO_DEBUG_TRUST_XFF = '1'
+    const res = await postEntry({
+      origin: 'https://app.example',
+      host: 'app.example',
+      'x-forwarded-proto': 'http',
+    })
+    expect(res.status).toBe(403)
+  })
+
+  // ── R5-E:跨域 allowlist 归一匹配(大小写/默认端口对称;畸形 Origin 不进 allowlist)──
+  it('生产 + 跨域 allowlist 精确匹配 → 200', async () => {
+    prodWithHttps()
+    process.env.MIVO_DEBUG_ALLOWED_ORIGINS = 'https://other.example'
+    const res = await postEntry({ origin: 'https://other.example', host: 'app.example' })
+    expect(res.status).toBe(200)
+  })
+  it('生产 + 跨域 Origin 显式默认端口 + allowlist 无端口 → 200(allowlist 默认端口归一匹配)', async () => {
+    prodWithHttps()
+    process.env.MIVO_DEBUG_ALLOWED_ORIGINS = 'https://other.example'
+    const res = await postEntry({ origin: 'https://other.example:443', host: 'app.example' })
+    expect(res.status).toBe(200)
+  })
+  it('生产 + 跨域 Origin 大写 host + allowlist 小写 → 200(allowlist host 归一)', async () => {
+    prodWithHttps()
+    process.env.MIVO_DEBUG_ALLOWED_ORIGINS = 'https://other.example'
+    const res = await postEntry({ origin: 'https://OTHER.EXAMPLE', host: 'app.example' })
+    expect(res.status).toBe(200)
+  })
+  it('生产 + 跨域畸形 Origin(含 path)+ allowlist → 403(畸形 Origin 不进 allowlist)', async () => {
+    prodWithHttps()
+    process.env.MIVO_DEBUG_ALLOWED_ORIGINS = 'https://other.example'
+    const res = await postEntry({ origin: 'https://other.example/path', host: 'app.example' })
+    expect(res.status).toBe(403)
+  })
+
+  // ── R5-F:Content-Type 旁路堵(生产拒非 application/json;simple/no-cors text/plain 不能写入)──
+  it('生产 + 同源 + Content-Type=text/plain + JSON body → 415(生产拒非 JSON Content-Type;返修前 200 accepted)', async () => {
+    prodWithHttps()
+    const res = await request('POST', jsonBody({ entries: [{ level: 'warning', source: 'S', message: 'm', timestamp: 1 }] }), { 'content-type': 'text/plain', origin: 'https://app.example', host: 'app.example' })
+    expect(res.status).toBe(415)
+  })
+  it('生产 + 同源 + Content-Type=application/json; charset=utf-8 → 200(charset 变体接受)', async () => {
+    prodWithHttps()
+    const res = await request('POST', jsonBody({ entries: [{ level: 'warning', source: 'S', message: 'm', timestamp: 1 }] }), { 'content-type': 'application/json; charset=utf-8', origin: 'https://app.example', host: 'app.example' })
+    expect(res.status).toBe(200)
+  })
+  it('非生产 + Content-Type=text/plain + JSON body → 200(dev compat,不校验 Content-Type;零变化)', async () => {
+    const res = await request('POST', jsonBody({ entries: [{ level: 'warning', source: 'S', message: 'm', timestamp: 1 }] }), { 'content-type': 'text/plain' })
+    expect(res.status).toBe(200)
+  })
+
+  // ── R5-G:fail-closed parity(无 Origin / 跨域 evil 无 allowlist)──
+  it('生产 + 无 Origin → 403(fail-closed 维持)', async () => {
+    prodWithHttps()
+    const res = await postEntry()
+    expect(res.status).toBe(403)
+  })
+  it('生产 + 跨域 evil.example + 无 allowlist → 403', async () => {
+    prodWithHttps()
+    const res = await postEntry({ origin: 'https://evil.example', host: 'app.example' })
+    expect(res.status).toBe(403)
   })
 })

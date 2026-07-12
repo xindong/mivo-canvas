@@ -59,6 +59,19 @@ jobs:
       - name: Verify logging rules
         run: npm run verify:logging
 
+      # R2-8:ops/postgres shell 回归 + shellcheck 进入 CI 自动验收(此前 test-asset-verify.sh 等无任何
+      # package script/CI/preflight 引用 → F3 矩阵/F6/F7 singleflight/F2 预算断言无自动闸门)。
+      # 依赖 bash + jq(ubuntu-latest 预装);无 docker/PG(纯函数 + 合成 tar/COPY 块)。
+      - name: Shell regression (ops/postgres asset-verify + R2-2 matrix)
+        run: npm run test:shell
+
+      - name: Shellcheck (ops/postgres)
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          fi
+          shellcheck ops/postgres/*.sh
+
   # bench job（非阻断）—— issue #172 方向 1：微基准 *.bench.test.ts 移出 required gate
   # （build-and-test 的 test:unit），单列非阻断 job 只报告不阻断。毫秒级阈值在共享 runner
   # 上 flake 会挡住与被测 PR 无关的合并队列；性能回归监控与功能正确性闸门不同生死线。

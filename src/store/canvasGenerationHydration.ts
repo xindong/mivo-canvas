@@ -56,6 +56,27 @@ export type CanvasGenerationSettleCounts = {
   settledSlots: number
 }
 
+// SC-15 R2: hydration durable-writeback bridge (canvas side). mergeCanvasPersistedState
+// settles stale generating ai-slots/tasks for first-paint, but zustand persist v5 hydrate
+// writes the merged state via the *vanilla* set (middleware.mjs:421 `set(stateFromStorage,
+// true)`) and only calls setItem on a version *migrate* (line 422-424 `if (migrated) return
+// setItem()`). When persisted version == options.version (v11==v11, no migrate), setItem
+// never fires → the settled canvas state lived only in memory while IDB kept the generating
+// blob (reload-2 re-settles from stale durable state every time). This counter records how
+// many slots+tasks merge settled; canvasStore's onRehydrateStorage uses it to gate ONE
+// controlled writeback via the wrapped api.setState. Gated so reload-2+ (durable already
+// settled → count 0) doesn't rewrite the 10k-node canvas blob on every reload.
+let pendingCanvasHydrationSettleCount = 0
+
+/** SC-15 R2: read + reset the canvas hydration settle count. Called by canvasStore's
+ *  onRehydrateStorage to gate the durable writeback. Returns how many slots+tasks merge
+ *  just settled this rehydrate (0 when nothing settled). */
+export const consumeCanvasHydrationSettleCount = (): number => {
+  const n = pendingCanvasHydrationSettleCount
+  pendingCanvasHydrationSettleCount = 0
+  return n
+}
+
 const expiredTaskLabel = (label: string) =>
   label.includes('任务已过期') ? label : `${label}（任务已过期，请重试）`
 
@@ -290,6 +311,11 @@ export const mergeCanvasPersistedState = (
   migrate: (persistedState: unknown, persistedVersion?: number) => unknown,
   warn: (message: string) => void,
 ): CanvasState => {
+  // SC-15 R2: reset the settle counter on every merge call so the early-return
+  // (no persisted state) and a no-settle merge both leave 0 — onRehydrateStorage
+  // gates the writeback on this, so a stale counter from a prior merge must not
+  // leak through. Set to the real count below after settle runs.
+  pendingCanvasHydrationSettleCount = 0
   // Fresh install (no persisted IDB state — getItem returned null): keep the
   // initial default state, which already seeds the demo projects + demo-scene
   // projectIds (createProjectsSlice / canvasDocumentFromScene). Re-running
@@ -309,6 +335,8 @@ export const mergeCanvasPersistedState = (
   if (result.counts.settledTasks > 0 || result.counts.settledSlots > 0) {
     warn(`Hydration settled expired canvas generations: slots=${result.counts.settledSlots}; tasks=${result.counts.settledTasks}`)
   }
+  // SC-15 R2: record settle count for canvasStore's onRehydrateStorage gated writeback.
+  pendingCanvasHydrationSettleCount = result.counts.settledSlots + result.counts.settledTasks
   return { ...merged, ...result.state }
 }
 

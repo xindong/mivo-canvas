@@ -15,13 +15,14 @@ describe('/readyz readiness 探针(R3-F2 pending/failed 外部可见)', () => {
     await sharedPermissionBackend.__reset()
   })
 
-  it('无补偿 → 200 ready,X-Compensation-Failed:0', async () => {
+  it('无补偿 → 200 ok,X-Compensation-Failed:0', async () => {
     const res = await app.request('/readyz')
     expect(res.status).toBe(200)
     expect(res.headers.get('X-Compensation-Failed')).toBe('0')
     expect(res.headers.get('X-Compensation-Pending')).toBe('0')
     const body = await res.json()
-    expect((body as { status: string }).status).toBe('ready')
+    // 健康态 status='ok'(与 P0.3 readyz.test.ts 的 ok/degraded 方案统一;saga merge 时 P0.3 为底座)。
+    expect((body as { status: string }).status).toBe('ok')
   })
 
   it('sweep 超限放弃 → failed>0 → 503 unconverged + X-Compensation-Failed:1(外部可见非绿)', async () => {
@@ -75,7 +76,7 @@ describe('/readyz readiness 探针(R3-F2 pending/failed 外部可见)', () => {
     expect(after.headers.get('X-Compensation-Failed')).toBe('0')
     expect(after.headers.get('X-Compensation-Pending')).toBe('0')
     const afterBody = await after.json()
-    expect((afterBody as { status: string }).status).toBe('ready')
+    expect((afterBody as { status: string }).status).toBe('ok')
   })
 
   it('R5-F2 重开再失败仍 503:gen2 重开→再 dead-letter → /readyz 仍非绿(仅最新 failed 计数)', async () => {
