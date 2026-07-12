@@ -391,9 +391,10 @@ describe('debug-logs route — R2-4: rate key 可信来源 + bucket 淘汰 + quo
     expect(res.status).toBe(403)
   })
 
-  it('生产(NODE_ENV=production)+ localhost Origin + 无 allowlist → 拒(isProdBoundary 另一分支)', async () => {
+  it('生产(NODE_ENV=production)+ 跨域 Origin + 无 allowlist → 拒(isProdBoundary 另一分支;同源放行另测 R3-F4)', async () => {
     process.env.NODE_ENV = 'production'
-    const res = await postEntry({ origin: 'http://localhost:5173' }) // localhost 非生产放行,生产无 allowlist 拒
+    // Origin 跨域(不匹配 Host),无 allowlist → 拒;证 NODE_ENV=production 也走生产硬前置(同源放行见 R3-F4 块)
+    const res = await postEntry({ origin: 'https://evil.example', host: '127.0.0.1:6276' })
     expect(res.status).toBe(403)
   })
 
@@ -405,6 +406,80 @@ describe('debug-logs route — R2-4: rate key 可信来源 + bucket 淘汰 + quo
 
   it('非生产 + localhost Origin(无 allowlist)→ 200(localhost 兜底保留)', async () => {
     const res = await postEntry({ origin: 'http://localhost:5173' })
+    expect(res.status).toBe(200)
+  })
+})
+
+// ── G2.1 R3-F4:生产同源默认放行(lead 裁定;e2e 红修复)──────────────────────────────────
+// 返修前(R2-4)生产硬前置"无 allowlist 一律拒(含同源)"把同源浏览器 POST 也拒了 → 客户端 debugLogger
+// (remoteDebugReporter POST /api/mivo/debug-logs)写入全 403 → prod e2e debug/canvas-interactions/mask/
+// mask-reflow 四场景红(浏览器 console "Failed to load resource: 403 (Forbidden)")。lead 裁定:同源
+// (Origin 与 Host 同源)默认放行;跨域才需显式 MIVO_DEBUG_ALLOWED_ORIGINS;无 Origin 维持 fail-closed。
+// 本块锁三条新行为(同源放行)+ 跨域/fail-closed parity,防回归。
+describe('debug-logs route — R3-F4: 生产同源默认放行(lead 裁定 e2e 红修复)', () => {
+  const F4_ENV = ['MIVO_PUBLIC', 'NODE_ENV', 'MIVO_DEBUG_ALLOWED_ORIGINS', 'MIVO_DEBUG_POST_RATE_LIMIT']
+  const saved: Record<string, string | undefined> = {}
+  beforeEach(() => {
+    for (const n of F4_ENV) saved[n] = process.env[n]
+    delete process.env.MIVO_PUBLIC
+    delete process.env.NODE_ENV
+    delete process.env.MIVO_DEBUG_ALLOWED_ORIGINS
+    delete process.env.MIVO_DEBUG_POST_RATE_LIMIT
+    __resetDebugLogsRateLimit()
+  })
+  afterEach(() => {
+    for (const n of F4_ENV) {
+      if (saved[n] === undefined) delete process.env[n]
+      else process.env[n] = saved[n]
+    }
+    __resetDebugLogsRateLimit()
+  })
+
+  it('生产(MIVO_PUBLIC=1)+ 同源 Origin(Origin 与 Host 同源)+ 无 allowlist → 200', async () => {
+    process.env.MIVO_PUBLIC = '1'
+    const res = await postEntry({ origin: 'http://127.0.0.1:6276', host: '127.0.0.1:6276' })
+    expect(res.status).toBe(200)
+  })
+
+  it('生产(NODE_ENV=production)+ 同源 Origin → 200(isProdBoundary 两分支都同源放行)', async () => {
+    process.env.NODE_ENV = 'production'
+    const res = await postEntry({ origin: 'http://127.0.0.1:6276', host: '127.0.0.1:6276' })
+    expect(res.status).toBe(200)
+  })
+
+  it('生产 + 同源 https 默认端口(Origin=https://app.example,Host=app.example)→ 200(默认端口归一)', async () => {
+    process.env.MIVO_PUBLIC = '1'
+    const res = await postEntry({ origin: 'https://app.example', host: 'app.example' })
+    expect(res.status).toBe(200)
+  })
+
+  it('生产 + Origin 与 Host 端口差异(localhost:5173 vs localhost:5174)→ 403(非同源,跨域处理)', async () => {
+    process.env.MIVO_PUBLIC = '1'
+    const res = await postEntry({ origin: 'http://localhost:5173', host: 'localhost:5174' })
+    expect(res.status).toBe(403)
+  })
+
+  it('生产 + 跨域 Origin(域名差异)+ 无 allowlist → 403(跨域仍需 allowlist)', async () => {
+    process.env.MIVO_PUBLIC = '1'
+    const res = await postEntry({ origin: 'https://evil.example', host: '127.0.0.1:6276' })
+    expect(res.status).toBe(403)
+  })
+
+  it('生产 + 跨域 Origin + allowlist 匹配 → 200(跨域显式放行)', async () => {
+    process.env.MIVO_PUBLIC = '1'
+    process.env.MIVO_DEBUG_ALLOWED_ORIGINS = 'https://app.example'
+    const res = await postEntry({ origin: 'https://app.example', host: '127.0.0.1:6276' })
+    expect(res.status).toBe(200)
+  })
+
+  it('生产 + 无 Origin → 403(fail-closed 维持;lead 裁定无 Origin 仍拒)', async () => {
+    process.env.MIVO_PUBLIC = '1'
+    const res = await postEntry()
+    expect(res.status).toBe(403)
+  })
+
+  it('非生产 + 无 Origin → 200(dev compat 零变化)', async () => {
+    const res = await postEntry()
     expect(res.status).toBe(200)
   })
 })

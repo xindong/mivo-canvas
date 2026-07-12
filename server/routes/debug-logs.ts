@@ -69,18 +69,35 @@ const tokenEquals = (a: string, b: string): boolean => {
   return timingSafeEqual(aBuf, bBuf)
 }
 
+// R3-F4(lead 裁定 e2e 红修复):同源判定 — Origin 的 host:port 与请求 Host 头一致即同源。
+// 用 new URL(origin).host(默认端口 80/443 省略,与 Host 头约定一致)对比 c.req 的 Host 头。
+// TLS 终止于网关时:浏览器 Origin=https://host,网关注入 Host=host(无端口)→ 仍匹配(默认端口归一)。
+// 缺 Host 头(in-process 无 socket 等)→ 非同源 → 落跨域 allowlist(不冒充同源)。
+const isSameOrigin = (origin: string, hostHeader: string | undefined): boolean => {
+  if (!hostHeader) return false
+  try {
+    return new URL(origin).host === hostHeader
+  } catch {
+    return false
+  }
+}
+
 const isOriginAllowed = (
   origin: string | undefined,
   allowed: { explicit: boolean; set: Set<string> },
+  hostHeader: string | undefined,
 ): boolean => {
-  // R2-4:生产硬前置 — 生产边界(MIVO_PUBLIC=1 或 NODE_ENV=production)下必须显式配
-  // MIVO_DEBUG_ALLOWED_ORIGINS;无显式 allowlist → 一律拒(无 localhost 兜底);无 Origin 也拒
-  // (浏览器必带 Origin;非浏览器生产不应打 debug POST)。返修前"无 Origin 无条件放行"+"localhost 兜底"
-  // 让生产未配 allowlist 时任意 Origin/无 Origin 放行。
+  // R2-4:生产硬前置 — 生产边界(MIVO_PUBLIC=1 或 NODE_ENV=production)。
+  // R3-F4(lead 裁定):同源(Origin 与 Host 同源)默认放行(浏览器同源 POST 不需显式 allowlist);
+  //   跨域才需 MIVO_DEBUG_ALLOWED_ORIGINS 显式配置;无 Origin 维持 fail-closed(浏览器 POST 必带 Origin;
+  //   非浏览器生产不应打 debug POST)。返修前(R2-4)"无 allowlist 一律拒(含同源)"把同源浏览器 POST 也拒了
+  //   → 客户端 debugLogger(remoteDebugReporter POST /api/mivo/debug-logs)写入全 403 → prod e2e
+  //   debug/canvas-interactions/mask/mask-reflow 四场景红(console "Failed to load resource: 403")。
   if (isProdBoundary()) {
-    if (!allowed.explicit) return false
-    if (!origin) return false
-    return allowed.set.has(origin)
+    if (!origin) return false // fail-closed:无 Origin 拒(浏览器 POST 必带 Origin;非浏览器生产不应打 debug POST)
+    if (isSameOrigin(origin, hostHeader)) return true // 同源:默认放行(lead 裁定)
+    if (allowed.explicit) return allowed.set.has(origin) // 跨域:需显式 allowlist
+    return false // 跨域无 allowlist:拒
   }
   // 非生产:dev compat(无 Origin 放行 + localhost 兜底,原行为不变)
   if (!origin) return true // non-browser / same-origin request carries no Origin
@@ -219,8 +236,8 @@ const readJsonBody = async (req: Request): Promise<unknown> => {
 export const debugLogsRoute = new Hono()
 
 debugLogsRoute.post('/debug-logs', async (c) => {
-  // D7: origin allowlist
-  if (!isOriginAllowed(c.req.header('origin'), getAllowedOrigins())) {
+  // D7: origin allowlist (R3-F4: 同源默认放行, 跨域需 allowlist)
+  if (!isOriginAllowed(c.req.header('origin'), getAllowedOrigins(), c.req.header('host'))) {
     return c.json({ ok: false, error: 'Origin not allowed' }, 403)
   }
   // D7: rate limit (R2-4: rate key 用可信来源 — 默认 socket remote addr,不取客户端可控 XFF)
