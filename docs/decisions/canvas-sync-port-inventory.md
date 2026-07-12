@@ -203,7 +203,7 @@ grep -cE '^\s*//\s*@ts-expect-error' src/lib/canvasSyncPort.contract.test.ts
 2. **多人 undo/redo**:Figma 本地 undo × 远端交错未定 vs Yjs UndoManager spike 未决。
 3. **跨 record invariant/事务**:Figma 严格事务路径(record-schema / §10.4)vs Yjs 需 wrapper(CRDT 无原子多 record,spike `:408-420` 实证)。
 4. **revision × 属性 LWW 兼容协议**:Figma (A) 改 #194 / (B) versioned ops endpoint;Yjs 不适用(CRDT)。
-5. **实时 transport + auth spike**:真实 SSO 网关下 WS upgrade 是否放行。**Figma 式 REST+SSE 走 plain HTTP,网关必透传,不需 WS**(§2.1 + N2-0 §2 gate 5);**Yjs 需双向 WS y-protocol**(网关 WS 放行=未验证项,留 lead 生产实测)。~~原句"两案都需 WS"与 §2.1 Figma 式 REST+SSE 矛盾,已纠。~~
+5. **实时 transport + auth spike**:真实 SSO 网关下 WS upgrade 是否放行。**Figma 式 REST+SSE 走 plain HTTP,网关应透传(条件式,非"必透传";生产可能缓冲/超时 → v4 N2-0 §14.5 失败树 + short-poll fallback),不需 WS**(§2.1 + N2-0 §2 gate 5 + §14.5);**Yjs 需双向 WS y-protocol**(网关 WS 放行=未验证项,留 lead 生产实测)。~~原句"网关必透传"与 N2-0 Gate5 条件式矛盾,已纠(v4 Blocker 6 对齐)。~~
 6. **迁移/双协议窗口**:#194 / PG JSONB / FX-5 / stale-client。
 7. **事件序号/补拉日志/压缩、权限撤销、性能/存储放大**。
 
@@ -520,3 +520,37 @@ port 的中性设计保证 N2-0 任一决议后,G1-c 只需落一个 adapter,另
 - 红线 grep §4.1-§4.4:非注释代码行零命中候选独占 DTO;`@ts-expect-error` directive 恰 **7**(6 红线候选独占形状互锁 + 1 R2-P1-1 空路径 tuple 互锁,R4 不新增互锁)。
 - 独立对抗实测(R5 步骤 5):`vite-node` 直调公开 validator,四 clobber 形态全抛 `FieldIntentError`;传 `undefined` 绕过 classifier 显式抛错;合法 leaf(`delete ['title']` / `set ['fills',0,'color']`)放行。
 - inventory 同步(本轮文档 commit):§1 签名改 classifier 必填 + 新增 `validateFieldIntentStructural` 低层;§8.2/§9.1/§9.2 旧 sync `submit`/`ackCreate` 或可选 classifier 段标 R4 supersede;本 §10 逐项映射两条 R4 finding → 契约变化。`rg -n "ackCreate" docs/decisions/canvas-sync-port-inventory.md` 命中均在明确标注的 R2/R3 历史/已废弃说明里(§8.2/§9.2,均带 supersede 标注)。
+
+---
+
+## 11. v4 决议收口(对齐 N2-0 §14;sol 第三轮 6 阻断交叉影响)
+
+> N2-0 v4 决议(§14)对 port 契约的交叉影响 + 两文档同规则对齐。
+
+### 11.1 Blocker 2 — container 整替换白名单(两文档同规则,提案供再审)
+
+- **统一规则**:container set 一般禁止(G1-b port `validateFieldIntent` 拒 `non-atomic-parent-set`);**显式原子容器白名单 `['transform', 'relations']` 允许整替换**(原子容器 = 整对象作单位,非逐字段 merge)。
+- **N2-0 侧**:DomainOp `set ['transform'] = {x,y}` 允许(白名单);server `validateChildPayload` 用 `RecordKindSchema` classifier 判 container + 查白名单放行。
+- **port 侧(G1-b)**:当前 `validateFieldIntent` 拒所有 container set(R4,无白名单);**v4 提案**:classifier 返回 `'atomic-container'`(白名单 transform/relations)时放行 set 整对象。**这是 A2 实装时的 port validator 演进项,提案供 lead 再审**(本 freeze 不改 validator 行为,保 `@ts-expect-error`=7 + seam reject 现状;spike `ATOMIC_CONTAINER_WHITELIST` + S10-14 已演示提案方向)。
+- **不许两套并存**:N2-0 决议 §10.1 + 本 inventory §1 同规则(transform/relations 白名单),见 `src/kernel/__spike__/n20-truth-source.spike.test.ts` `ATOMIC_CONTAINER_WHITELIST` + S10-14。
+
+### 11.2 Blocker 6 — 两文档交叉契约(port CanvasChange ↔ N20 CreateBody/DomainOp 无损映射)
+
+- **交叉契约测试**:`src/kernel/__spike__/n20-truth-source.spike.test.ts` X-1~X-4(import port `CanvasChange`/`FieldIntent` ↔ N20 `CreateBody`/`DomainOp`/`ServerInvariantCommand`):
+  - X-1 `create-node`(NodeRecord 含 id)→ N20 `CreateBody`(payload=NodePayload 无 id;id → adapter path;Blocker 2 client-id)
+  - X-2 `edit-node` FieldIntent[] → N20 DomainOp set/unset[](fieldPath + value 透传无损)
+  - X-3 `delete-node` → N20 `ServerInvariantCommand` node-delete-cascade(Blocker 3 server-named)
+  - X-4 `reorder-children` → N20 DomainOp reorder(orderedIds 透传)
+- **两文档形状一致**:port CanvasChange 与 N20 wire 无损可映射,adapter 翻译零丢失。
+
+### 11.3 Blocker 6 — 网关条件式对齐(§5 item 5 已纠)
+
+- §5 item 5 "网关必透传" → "网关应透传(条件式,非必透传;生产可能缓冲/超时 → N2-0 §14.5 失败树 + short-poll fallback)"。与 N2-0 §2 Gate5 + §14.5 一致。
+
+### 11.4 Blocker 2 — create client-id 对齐(canvasSyncPort create-node 已携 id)
+
+- port `CanvasChange.create-node` 携 `NodeRecord`(含 id);N2-0 v4 `CreateBody` id = client `NodeRecord.id`(废除 server-mint)。两文档一致:create id 来自 client(adapter 提取进 path),非 server-mint。见 X-1 交叉契约。
+
+### 11.5 Blocker 2 — 对齐 G1-b R4(决议原写 R2 已纠)
+
+- N2-0 §13 改 "G1-b R2" → "G1-b R4"(冻结源已到 R4:classifier 必填 + structural 拆分 + async submitChange caller-owned retry/rebase 状态机)。port 当前态 = R4(§10 已述),两文档对齐 R4。

@@ -380,3 +380,130 @@ describe('N2-0 返修 Gate5(R3 F3): 真实 Hono SSE route + resolveActor/canAcce
     //   证据是 sawDone + bobConn.closed + conns 移除(非测试主动 cancel 代替服务端关闭)。
   })
 })
+
+// ════════════════════════════════════════════════════════════════════════════
+// v4 Blocker 5:Gate5 网关失败树(可执行失败树 + short-poll fallback;删除"SSE 失败由 SSE fallback"循环)
+// ════════════════════════════════════════════════════════════════════════════
+// sol 第三轮阻断 5:SSE 网关 buffering/超时未给可执行失败树;原 §12 "SSE 失败 → SSE fallback" 循环表述。
+// 冻结失败树:① 真实网关测首帧/连续帧延迟 + heartbeat + 空闲超时 + header 注入/strip 阈值;
+//   ② 失败先调 proxy buffering/read-timeout/flush 复测;③ 仍失败 → ?since=seq short-poll fallback(含延迟 SLO)或判 N2-2 blocked。
+//   非 "SSE 失败由 SSE fallback"(循环);fallback = ?since=seq short-poll(plain HTTP GET,无 SSE 长流)。
+describe('N2-0 v4 Gate5 网关失败树(Blocker 5:first-frame/continuous latency + header strip + short-poll fallback SLO)', () => {
+  let harness: ReturnType<typeof createSpikeSseApp>
+  const savedEnv: Record<string, string | undefined> = {}
+  beforeEach(() => {
+    savedEnv.MIVO_TRUST_SSO_HEADER = process.env.MIVO_TRUST_SSO_HEADER
+    savedEnv.MIVO_GATEWAY_SECRET = process.env.MIVO_GATEWAY_SECRET
+    process.env.MIVO_TRUST_SSO_HEADER = '1'
+    process.env.MIVO_GATEWAY_SECRET = GATEWAY_SECRET
+    harness = createSpikeSseApp()
+  })
+  afterEach(() => {
+    for (const k of ['MIVO_TRUST_SSO_HEADER', 'MIVO_GATEWAY_SECRET'] as const) {
+      if (savedEnv[k] === undefined) delete process.env[k]
+      else process.env[k] = savedEnv[k]!
+    }
+  })
+
+  // 失败树冻结(决策 §12 引用):SSE 降级 → 调 proxy → 仍失败 → short-poll fallback OR N2-2 blocked
+  const GATE5_FAILURE_TREE = {
+    sseSloMs: 200,            // SSE 首帧延迟 SLO(生产实测阈值;超此 = 降级信号)
+    shortPollSloMs: 500,      // short-poll ?since=seq 延迟 SLO(fallback 可接受延迟)
+    steps: ['measure-sse-latency', 'tune-proxy-buffering-read-timeout-flush', 'short-poll-fallback-or-n2-2-blocked'] as const,
+    fallback: 'since-seq-short-poll' as const,  // ★ 非 "SSE fallback"(循环);fallback = ?since=seq plain HTTP GET
+  }
+
+  // 读首个 data 帧 + 测首帧延迟(时间到首 data 帧)
+  const firstDataFrameLatency = async (res: Response, timeoutMs = 800): Promise<{ latencyMs: number; frame: string | null }> => {
+    const reader = res.body!.getReader()
+    const decoder = new TextDecoder()
+    const start = Date.now()
+    let buf = ''
+    try {
+      while (Date.now() - start < timeoutMs) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+        const idx = buf.indexOf('\n\n')
+        if (idx >= 0) {
+          const frame = buf.slice(0, idx)
+          if (frame.startsWith('data: ')) return { latencyMs: Date.now() - start, frame }
+        }
+      }
+    } finally { reader.cancel().catch(() => {}) }
+    return { latencyMs: Date.now() - start, frame: null }
+  }
+
+  it('5-10 SSE 首帧/连续帧延迟在 SLO 内(正常路径;gateway 透传 plain HTTP)', async () => {
+    harness.state.members.add('alice')
+    harness.pushEvent({ recordId: 'n1', op: { fieldPath: ['title'], value: 'first' } })
+    const res = await harness.app.request('/api/canvas/c1/events', { headers: { 'x-mivo-auth-user': 'alice', 'x-mivo-gateway-secret': harness.GATEWAY_SECRET } })
+    expect(res.status).toBe(200)
+    const { latencyMs, frame } = await firstDataFrameLatency(res)
+    expect(frame).not.toBeNull()                              // ★ 首 data 帧收到
+    expect(latencyMs).toBeLessThan(GATE5_FAILURE_TREE.sseSloMs) // ★ 首帧延迟 < SLO(gateway 透传正常)
+    expect(frame).toContain('"seq":1')
+    // ★ 连续帧:pushEvent 后 live push 到 conn(经 backlog+drain);连续帧延迟同经 SLO(heartbeat 20ms 保活)
+    expect(GATE5_FAILURE_TREE.steps[0]).toBe('measure-sse-latency')
+  })
+
+  it('5-11 header strip → authz fail-closed(404 no-leak;网关未注入 x-mivo-auth-user/gateway-secret → deny)', async () => {
+    // 网关 strip 注入头:无 x-mivo-auth-user + 无 x-mivo-gateway-secret → resolveActor fallback 指纹,
+    //   canAccessCanvas deny(memberRole undefined)→ denyStatus 404 no-leak(fail-closed,非 401)
+    harness.state.members.add('alice')
+    const res = await harness.app.request('/api/canvas/c1/events', { headers: {} }) // ★ 无 auth 头(网关 strip)
+    // resolveActor fallback 指纹;指纹非 member → canAccessCanvas deny → 404 no-leak(fail-closed)
+    expect(res.status).toBe(404)
+    expect((await res.json() as { error: string }).error).toBe('unknown-canvas')
+    // ★ header 注入/strip 阈值:网关未注入 trusted header → fail-closed(非静默放行);SSE 不建流(deny 在建流前)
+  })
+
+  it('5-12 short-poll ?since=seq fallback(SSE 降级时的 fallback;plain HTTP GET 返回当前 backlog,无长流;延迟 SLO)', async () => {
+    // ★ 失败树 fallback = ?since=seq short-poll(非 "SSE fallback" 循环):客户端 GET ?since=seq,
+    //   读当前可用事件(seq>since)后关闭(不持长流),周期性 poll。plain HTTP,无 SSE 长流依赖。
+    harness.state.members.add('alice')
+    harness.pushEvent({ recordId: 'n1', op: { fieldPath: ['title'], value: 'e1' } })
+    harness.pushEvent({ recordId: 'n1', op: { fieldPath: ['title'], value: 'e2' } })
+    harness.pushEvent({ recordId: 'n1', op: { fieldPath: ['title'], value: 'e3' } })
+    const start = Date.now()
+    // short-poll:GET ?since=1 → 读 seq>1 事件(seq 2,3),读毕关闭(非长流订阅)
+    const res = await harness.app.request('/api/canvas/c1/events?since=1', { headers: { 'x-mivo-auth-user': 'alice', 'x-mivo-gateway-secret': harness.GATEWAY_SECRET } })
+    expect(res.status).toBe(200)
+    // 读 2 个 data 帧(seq 2,3)后关闭 — short-poll 语义(读当前 backlog,不持流)
+    const reader = res.body!.getReader()
+    const decoder = new TextDecoder()
+    const seqs: number[] = []
+    let buf = ''
+    const pollStart = Date.now()
+    try {
+      while (Date.now() - pollStart < 600 && seqs.length < 2) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+        let idx: number
+        while ((idx = buf.indexOf('\n\n')) >= 0) {
+          const frame = buf.slice(0, idx)
+          buf = buf.slice(idx + 2)
+          if (frame.startsWith('data: ')) {
+            const evt = JSON.parse(frame.slice('data: '.length)) as SseEvent
+            seqs.push(evt.seq)
+          }
+        }
+      }
+    } finally { await reader.cancel().catch(() => {}) }
+    const latencyMs = Date.now() - start
+    expect(seqs).toEqual([2, 3])                                       // ★ short-poll 返回 seq>1 事件
+    expect(latencyMs).toBeLessThan(GATE5_FAILURE_TREE.shortPollSloMs)   // ★ short-poll 延迟 < SLO
+    expect(GATE5_FAILURE_TREE.fallback).toBe('since-seq-short-poll')    // ★ 非 "SSE fallback"(循环);fallback = ?since=seq
+  })
+
+  it('5-13 失败树步骤冻结(SSE 降级 → 调 proxy → short-poll fallback OR N2-2 blocked;非 SSE-fallback 循环)', () => {
+    // 冻结失败树步骤(决策 §12 引用):SSE 首帧超 SLO / header strip → 降级信号
+    expect(GATE5_FAILURE_TREE.steps).toEqual(['measure-sse-latency', 'tune-proxy-buffering-read-timeout-flush', 'short-poll-fallback-or-n2-2-blocked'])
+    // ★ fallback = ?since=seq short-poll(plain HTTP),非 "SSE 失败由 SSE fallback"(循环表述已删,见决策 §12)
+    expect(GATE5_FAILURE_TREE.fallback).not.toBe('sse-fallback')  // ★ 非 SSE fallback(循环)
+    expect(GATE5_FAILURE_TREE.fallback).toBe('since-seq-short-poll')
+    // ★ 仍失败(短轮询也不可达)→ 判 N2-2 blocked(实时性降级,非 Figma 选型阻断)
+    expect(GATE5_FAILURE_TREE.steps[2]).toContain('n2-2-blocked')
+  })
+})
