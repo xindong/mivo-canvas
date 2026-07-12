@@ -106,30 +106,60 @@ export const clearAllStorage = async (page) => {
 //    idbStateStorage = single-blob under both kernels, correctly resolved by the
 //    no-domain path).
 //
-//  Falls back to the legacy name:uid resolution when the bridge is absent (a fresh
-//  page before the app hydrates, or a non-app context) — the app's migrateToNamespaced
-//  claims the legacy raw key on its first authenticated read in that case.
-const resolvePersistKey = async (page, name, { domain } = {}) => {
+//  Failure semantics (SC-15 R2 P2): the NO-domain path keeps the broad-catch legacy
+//  fallback to the raw name (chat/settings/anonymous/pre-hydrate — these callers passed
+//  no domain, so degrading to the raw name IS the documented legacy behaviour, not a
+//  silent split-key mismatch). The DOMAIN path is FAIL-CLOSED: it validates the domain
+//  enum, requires the bridge + matching getter, and propagates any evaluate exception
+//  with cause. A split-key probe must never silently read a stale blob off the wrong
+//  physical key (false green) or mask a product persistence bug as a probe timeout
+//  (misleading red) — the silent-failure family this round eliminates. The app's
+//  migrateToNamespaced still claims the legacy raw key on its first authenticated read
+//  in the no-domain fallback case.
+export const resolvePersistKey = async (page, name, { domain } = {}) => {
+  // No `domain` (default): chat / settings / legacy canvas single-blob. This compat
+  // path is UNCHANGED from mainfix R3 — the broad catch stays here on purpose. These
+  // callers passed no domain, so a resolver failure degrading to the raw name is the
+  // documented legacy semantics (the app's migrateToNamespaced then claims the legacy
+  // raw key on its first authenticated read), NOT a silent split-key mismatch.
+  if (domain === undefined) {
+    try {
+      return await page.evaluate(({ n }) => {
+        const bridge = globalThis.__MIVO_E2E__
+        const uid = bridge && typeof bridge.getPersistUserId === 'function' ? bridge.getPersistUserId() : null
+        return uid && uid !== 'anonymous' ? `${n}:${uid}` : n
+      }, { n: name })
+    } catch {
+      return name
+    }
+  }
+
+  // domain-explicit path — FAIL-CLOSED (SC-15 R2 P2). page.evaluate takes EXACTLY ONE
+  // arg, so name + domain are wrapped in an object; Playwright throws "Too many
+  // arguments" on >1 trailing arg, which the old broad catch would have swallowed into
+  // a raw-name fallback reading the WRONG IDB key. A probe that asked for a canvas split
+  // key must NOT silently degrade to a legacy/raw key when the resolver itself is broken:
+  // that reads a stale blob on the wrong physical key (false green) or masks a product
+  // persistence bug as a probe timeout (misleading red). Validate the domain enum,
+  // require the bridge + the matching getter, and propagate any exception with cause.
+  if (domain !== 'document' && domain !== 'session') {
+    throw new Error(`resolvePersistKey: invalid domain '${String(domain)}' (expected 'document' | 'session')`)
+  }
   try {
-    // page.evaluate takes EXACTLY ONE arg — wrap name + domain in an object (Playwright
-    // throws "Too many arguments" on >1 trailing arg, which the catch below would swallow
-    // into a raw-name fallback that reads the wrong IDB key → silent red).
     return await page.evaluate(({ n, d }) => {
       const bridge = globalThis.__MIVO_E2E__
-      if (bridge) {
-        if (d === 'document' && typeof bridge.getCanvasPersistDocumentKey === 'function') {
-          return bridge.getCanvasPersistDocumentKey(n)
-        }
-        if (d === 'session' && typeof bridge.getCanvasPersistSessionKey === 'function') {
-          return bridge.getCanvasPersistSessionKey(n)
-        }
+      if (!bridge) {
+        throw new Error(`resolvePersistKey: __MIVO_E2E__ bridge absent (domain='${d}')`)
       }
-      // legacy single-blob namespacing (chat, settings, anonymous, or pre-hydrate page)
-      const uid = bridge && typeof bridge.getPersistUserId === 'function' ? bridge.getPersistUserId() : null
-      return uid && uid !== 'anonymous' ? `${n}:${uid}` : n
+      const getter = d === 'document' ? bridge.getCanvasPersistDocumentKey : bridge.getCanvasPersistSessionKey
+      if (typeof getter !== 'function') {
+        const which = d === 'document' ? 'Document' : 'Session'
+        throw new Error(`resolvePersistKey: bridge missing getCanvasPersist${which}Key (domain='${d}')`)
+      }
+      return getter(n)
     }, { n: name, d: domain })
-  } catch {
-    return name
+  } catch (err) {
+    throw new Error(`resolvePersistKey: domain='${domain}' resolve failed for '${name}'`, { cause: err })
   }
 }
 

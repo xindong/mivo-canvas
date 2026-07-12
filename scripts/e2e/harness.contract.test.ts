@@ -12,8 +12,8 @@
 // 不启真浏览器：用 fake page 的 evaluate 按 call 奇偶区分 resolvePersistKey（返回
 // logical key）与 readPersistedKv 的 IDB 读（返回注入 blob），对轮询循环稳健。
 
-import { describe, expect, it } from 'vitest'
-import { waitForPersistedKv } from './harness.mjs'
+import { describe, expect, it, beforeEach, afterEach } from 'vitest'
+import { waitForPersistedKv, resolvePersistKey } from './harness.mjs'
 
 // 每次 readPersistedKv = 2 次 page.evaluate（resolvePersistKey + IDB 读）。奇数次调用
 // = resolvePersistKey（返回 logical key = arg）；偶数次 = IDB 读（返回注入 blob）。
@@ -76,5 +76,92 @@ describe('waitForPersistedKv probe honesty (SC-15 R2)', () => {
       { timeout: 80, interval: 10 },
     )
     expect(result).toBeNull()
+  })
+})
+
+// SC-15 R2 P2 (domain-aware probe honesty) — resolvePersistKey fail-closed 契约测试。
+//
+// 根因（R2 复审 P2）：domain-aware resolvePersistKey 对整个 page.evaluate 用无条件
+// try/catch + 静默 `return name`（legacy 裸键），且 domain 已指定但 bridge/getter 缺失
+// 时也静默落入 legacy name:uid 分支。探针自身出错会读错误物理键的 stale blob（假绿）
+// 或把产品持久化 bug 伪装成探针超时红（误导性红）——本次误诊的同根 silent-failure
+// 家族。本契约锁住修复后行为：
+//   ① domain 合法 + bridge 正常 → 正确分裂键。
+//   ② domain 指定 + bridge 缺失 / getter 缺失 → reject 携 cause（不降级 legacy/raw）。
+//   ③ domain 非法 enum → reject。
+//   ④ 无 domain → FX-6 name:uid 兼容路径不变（含 bridge 缺失回退 raw name）。
+//
+// 不启真浏览器：fake page 的 evaluate 直接在 Node 跑 callback（fn(arg)），按测试需要
+// 在 globalThis.__MIVO_E2E__ 注入/移除 bridge，验证 browser-side 分支逻辑。每个 it
+// 用 beforeEach 清空 bridge 基线、afterEach 还原，避免跨用例污染。
+
+describe('resolvePersistKey domain-aware fail-closed (SC-15 R2 P2)', () => {
+  let hadBridge: boolean
+  let prevBridge: unknown
+
+  beforeEach(() => {
+    hadBridge = '__MIVO_E2E__' in globalThis
+    prevBridge = (globalThis as Record<string, unknown>).__MIVO_E2E__
+    delete (globalThis as Record<string, unknown>).__MIVO_E2E__
+  })
+
+  afterEach(() => {
+    const g = globalThis as Record<string, unknown>
+    if (hadBridge) g.__MIVO_E2E__ = prevBridge
+    else delete g.__MIVO_E2E__
+  })
+
+  // fake page: 跑真实 browser-side callback（fn(arg)）在 Node 进程。bridge 由各用例
+  // 预先注入 globalThis.__MIVO_E2E__（或保持删除模拟 bridge 缺失）。
+  const plainPage = {
+    evaluate: async (fn: (arg: unknown) => unknown, arg: unknown) => fn(arg),
+  } as unknown as Parameters<typeof resolvePersistKey>[0]
+
+  it('① domain 合法 + bridge 正常 → 正确分裂键', async () => {
+    const g = globalThis as Record<string, unknown>
+    g.__MIVO_E2E__ = {
+      getCanvasPersistDocumentKey: (n: string) => `${n}:dev@local:document`,
+      getCanvasPersistSessionKey: (n: string) => `${n}:dev@local:session`,
+    }
+    const doc = await resolvePersistKey(plainPage, 'mivo-canvas-demo', { domain: 'document' })
+    expect(doc).toBe('mivo-canvas-demo:dev@local:document')
+    const sess = await resolvePersistKey(plainPage, 'mivo-canvas-demo', { domain: 'session' })
+    expect(sess).toBe('mivo-canvas-demo:dev@local:session')
+  })
+
+  it('② domain 指定 + bridge 缺失 → reject 携 cause（不降级 legacy/raw key）', async () => {
+    // bridge entirely absent — fresh page / 非 app context。修复前静默回退 legacy 裸键。
+    const g = globalThis as Record<string, unknown>
+    delete g.__MIVO_E2E__
+    await expect(
+      resolvePersistKey(plainPage, 'mivo-canvas-demo', { domain: 'document' }),
+    ).rejects.toThrow(/domain='document'/)
+  })
+
+  it('②b domain 指定 + getter 缺失 → reject 携 cause（不降级 legacy/raw key）', async () => {
+    // bridge 存在但 document getter 未接线。修复前静默落入 legacy name:uid 分支。
+    const g = globalThis as Record<string, unknown>
+    g.__MIVO_E2E__ = { getCanvasPersistSessionKey: (n: string) => `${n}:session` }
+    await expect(
+      resolvePersistKey(plainPage, 'mivo-canvas-demo', { domain: 'document' }),
+    ).rejects.toThrow(/domain='document'/)
+  })
+
+  it('③ domain 非法 enum → reject', async () => {
+    const g = globalThis as Record<string, unknown>
+    g.__MIVO_E2E__ = { getCanvasPersistDocumentKey: () => 'x' }
+    await expect(
+      resolvePersistKey(plainPage, 'mivo-canvas-demo', { domain: 'canvas' as unknown as 'document' }),
+    ).rejects.toThrow(/invalid domain/)
+  })
+
+  it('④ 无 domain → FX-6 name:uid 兼容路径不变（含 bridge 缺失回退 raw name）', async () => {
+    const g = globalThis as Record<string, unknown>
+    // authenticated → namespaced key（FX-6 语义保留）
+    g.__MIVO_E2E__ = { getPersistUserId: () => 'dev@local' }
+    expect(await resolvePersistKey(plainPage, 'mivo-chat-demo')).toBe('mivo-chat-demo:dev@local')
+    // bridge absent / anonymous → raw name（legacy fallback 保留，不变）
+    delete g.__MIVO_E2E__
+    expect(await resolvePersistKey(plainPage, 'mivo-chat-demo')).toBe('mivo-chat-demo')
   })
 })
