@@ -10,11 +10,11 @@ import type {
   SectionBorderStyle,
   ToolId,
 } from '../types/mivoCanvas'
-import type { BrushStyle, CanvasState, SelectionArrangeMode } from './canvasStore'
+import type { BrushStyle, CanvasState, SelectionArrangeMode } from './canvasStateTypes'
 import type { CanvasAssetClipboardItem } from '../app/assetLibraryModel'
-import { connectorBindingPointFor, isConnectorNode } from '../canvas/connectorGeometry'
-import { defaultBrushWidth } from '../canvas/brushGeometry'
-import { defaultSizeForNodeType } from '../canvas/nodeTypes/canvasNodeRegistry'
+import { connectorBindingPointFor, isConnectorNode } from '../model/connectorGeometry'
+import { defaultBrushWidth } from '../model/brushGeometry'
+import { defaultSizeForNodeType } from '../model/canvasNodeRegistry'
 import {
   markdownDocumentWidth,
   markdownDocumentSizeFor,

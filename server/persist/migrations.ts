@@ -118,6 +118,47 @@ const DROP_PERMISSIONS_SCHEMA = sql`
 DROP TABLE IF EXISTS share_links;
 DROP TABLE IF EXISTS project_members;
 `
+// DP-6R chat per-user 重拆(2026-07-12):无 schema 变更,无数据搬迁——cutover checkpoint + 文档语义。
+// 现状(重拆前):chat-message.owner_id = canvas owner(共享 collection),成员 GET 读全部 → Gate2 启用即隐私违约。
+// 重拆后:chat-message.owner_id = actor(写入者本人,per-actor 私有),PK=(actor,'chat-message',messageId)。
+//   - chat-collection 仍 per-canvas under canvas owner(随 canvas 原子创建/软删/恢复),不含 per-actor 状态。
+//   - chat-message 写入不 bump 共享 canvas contentVersion(chat per-user,非共享画布内容)。
+//   - 旧 owner chat(owner_id=canvasOwner)无需搬迁:owner 的 actor === canvasOwner → owner GET 仍见;成员不获复制。
+//     Gate2 生产未启用前无成员 chat,故无数据移动;dev/staging 若有成员 chat under canvasOwner,重拆后归 owner。
+//   - 匿名 share-link 访客(actor=null)chat 读写一律 401 require-login。
+// 本 migration 仅落 COMMENT 标注语义(可重放);G3 export/ingest/verify 的 chat per-actor 校验脚本待 cutover 实现。
+//
+// P1-3 fail-closed audit 要求(lead+sol 共识,2026-07-12):migration 003 "零搬迁"论证只在 **legacy chat owner
+// === 当时 canvas owner** 时成立。cutover 前(及 G2.2 fingerprint→SSO username 换键前)必须跑 fail-closed 审计:
+//   遍历所有 legacy chat-message 行,断言 row.owner_id === 该 row.canvas_id 在当时的 canvas owner(由 canvases 表
+//   owner_id 给出)。**任何不一致行 = no-go**(不得静默 carry over;要么归属正确(归 owner),要么隔离人工裁决),
+//   否则重拆后该行的 owner_id 既非 canvasOwner 又非真实 actor → owner 自己看不到、actor 也看不到 → 数据孤儿 +
+//   隐私边界破损。审计脚本与 G2.2 换键迁移同批实现(见 docs/runbook/t1.6-cutover-runbook.md §G2.2)。
+const CHAT_PER_ACTOR_COMMENT = sql`
+COMMENT ON TABLE persist_records IS 'DP-5 信封列 + payload jsonb. DP-6R(2026-07-12): chat-message.owner_id = actor(写入者本人, per-actor 私有, PK=(actor,chat-message,messageId)); chat-collection 仍 per-canvas under canvas owner. 匿名访客 chat 读写 401 require-login. P1-3 fail-closed audit: cutover/G2.2 换键前必须断言所有 legacy chat-message.owner_id === 当时 canvas owner, 异常行 no-go(不得静默 carry over, 防数据孤儿 + 隐私边界破损).';
+`
+
+const CHAT_PER_ACTOR_COMMENT_DROP = sql`
+COMMENT ON TABLE persist_records IS NULL;
+`
+
+// DP-6R P1-2(2026-07-12):per-actor×canvas chat collection 独立乐观锁 cursor(orderRevision)。
+// chat reorder 同事务 compare(base !== current → 409)+ bump;与共享 canvas contentVersion 解耦
+// (node 写 bump 共享 cv 不触此 cursor → node 写不使 chat reorder 误 409)。A/B 不同 actor 各自独立行,互不冲突。
+// PK=(actor_id, canvas_id);revision 缺省 0(行不存在即视作 0,首条 reorder INSERT)。可重放(IF NOT EXISTS)。
+const CHAT_ORDER_REVISIONS_SCHEMA = sql`
+CREATE TABLE IF NOT EXISTS chat_order_revisions (
+  actor_id   TEXT        NOT NULL,
+  canvas_id  TEXT        NOT NULL,
+  revision   BIGINT      NOT NULL DEFAULT 0,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (actor_id, canvas_id)
+);
+`
+
+const CHAT_ORDER_REVISIONS_SCHEMA_DROP = sql`
+DROP TABLE IF EXISTS chat_order_revisions;
+`
 
 // P-6 saga 补偿意图表(share_link_compensations)。migration key 排在 DP-6R chat 之后(字典序 005):
 // lead 拍板(2026-07-12 更新)——DP-6R 占 003_chat_per_user + 004_chat_order_revisions,本分支 005(key+registry
@@ -213,6 +254,22 @@ export const migrations: Record<string, Migration> = {
     },
     async down(db): Promise<void> {
       await DROP_PERMISSIONS_SCHEMA.execute(db)
+    },
+  },
+  '2026_07_12_003_chat_per_actor': {
+    async up(db): Promise<void> {
+      await CHAT_PER_ACTOR_COMMENT.execute(db)
+    },
+    async down(db): Promise<void> {
+      await CHAT_PER_ACTOR_COMMENT_DROP.execute(db)
+    },
+  },
+  '2026_07_12_004_chat_order_revisions': {
+    async up(db): Promise<void> {
+      await CHAT_ORDER_REVISIONS_SCHEMA.execute(db)
+    },
+    async down(db): Promise<void> {
+      await CHAT_ORDER_REVISIONS_SCHEMA_DROP.execute(db)
     },
   },
   '2026_07_12_005_share_link_compensations': {

@@ -31,7 +31,7 @@
 | **share_link** | document（派生） | `share_links(token, projectId, permission, ...)`（platform §13.5，T1.4 新建） | **未实现**（T1.4 待建） | `revoked_at`（语义≈软删，见 §2） |
 | **task** | session/编排 | 服务端 tasks registry（DP-8/FX-2 per-user），**document record 无 tasks 字段** | `CanvasDocument.tasks[]`（过渡，迁后删字段） | **不软删**（运行态，过期/取消即终态，见 §2） |
 
-> scope 来源：platform §13.1（document/user/session/presence 四层 + asset 独立域）。归属模型（§13.5）：`projects(ownerId)` + `project_members(role)` + `share_links(token, permission)`，owner/editor/viewer 三角色，chat per-canvas 随画布分享对成员可见。task 归属见 record-schema §4.3（DP-8 已拍：迁服务端 registry，document record 无 tasks 字段）。
+> scope 来源：platform §13.1（document/user/session/presence 四层 + asset 独立域）。归属模型（§13.5）：`projects(ownerId)` + `project_members(role)` + `share_links(token, permission)`，owner/editor/viewer 三角色。**DP-6R：chat-message per-actor 私有**（ownerId=actor），~~chat per-canvas 随画布分享对成员可见~~ 已订正为不随画布分享、成员互不可见；chat-collection 仍 per-canvas under canvas owner（仅 liveness）。task 归属见 record-schema §4.3（DP-8 已拍：迁服务端 registry，document record 无 tasks 字段）。
 
 ---
 
@@ -64,7 +64,7 @@
 
 | 决策点 | 选项 | 推荐 | 理由 | 影响面 |
 |---|---|---|---|---|
-| 删画布是否级联软删对话（DP-3） | (a) 级联软删：canvas `is_deleted=true` → 其 chat collection 同 `is_deleted=true`，一起可 restore **(b) 不级联：canvas 软删但对话独立存活（现状语义） (c) 级联硬删：canvas 软删 + 对话直接物理删 | **(a) 级联软删** | ① DP-6（record-schema §5）已定方向："chat 随文档域走 `/api/canvas` 子资源，messagesByScene 键随 canvas 生命周期"——chat 生命周期**已绑死 canvas**，canvas 软删时 chat 不级联 = 对话悬空成孤儿。② platform §13.5："chat per-canvas，随画布分享对成员可见"——canvas 软删但对话仍 live，成员会看到无画布对应的孤儿对话，UI/权限语义错乱。③ FX-7 本就是"误删可恢复"语义，对话是画布语境的核心组成，分开恢复会造成"画布回来了但对话没了"的半残态。④ (c) 硬删违背软删可恢复目标，排除。 | **与 `chatHydration.characterization.test.ts:380` 直接冲突**（该测试钉死"deleteCanvas 不级联清 chatStore.messagesByScene"，断言 `messagesByScene['doomed'].toHaveLength(1)`，注释自标"现状（DP-3）"）。落地 (a) **须同步迁移该表征**：断言从"对话仍在"改为"对话 collection `is_deleted=true`（软删隐藏，purge 前可 restore）"。属 §7 碰撞点 #C2。 |
+| 删画布是否级联软删对话（DP-3） | (a) 级联软删：canvas `is_deleted=true` → 其 chat collection 同 `is_deleted=true`，一起可 restore **(b) 不级联：canvas 软删但对话独立存活（现状语义） (c) 级联硬删：canvas 软删 + 对话直接物理删 | **(a) 级联软删** | ① DP-6（record-schema §5）已定方向："chat 随文档域走 `/api/canvas` 子资源，messagesByScene 键随 canvas 生命周期"——chat 生命周期**已绑死 canvas**，canvas 软删时 chat 不级联 = 对话悬空成孤儿。② platform §13.5："chat per-canvas，随画布分享对成员可见"——canvas 软删但对话仍 live，成员会看到无画布对应的孤儿对话，UI/权限语义错乱。（**DP-6R 订正**：chat-message 已改 per-actor 私有，成员互不可见，此"成员看到孤儿对话"premise obsolete；但 DP-3 决策仍成立——chat-collection 仍 per-canvas under canvas owner，canvas 软删须级联标 collection liveness，否则 owner 自己的 collection 悬空成孤儿。）③ FX-7 本就是"误删可恢复"语义，对话是画布语境的核心组成，分开恢复会造成"画布回来了但对话没了"的半残态。④ (c) 硬删违背软删可恢复目标，排除。 | **与 `chatHydration.characterization.test.ts:380` 直接冲突**（该测试钉死"deleteCanvas 不级联清 chatStore.messagesByScene"，断言 `messagesByScene['doomed'].toHaveLength(1)`，注释自标"现状（DP-3）"）。落地 (a) **须同步迁移该表征**：断言从"对话仍在"改为"对话 collection `is_deleted=true`（软删隐藏，purge 前可 restore）"。属 §7 碰撞点 #C2。 |
 
 > **旁注（单 node / 单 chat message 不软删的决策）**：软删粒度到 canvas/project/chat-collection，**不到单 node、不到单 chat message**。理由：① 单 node 软删在 CRDT（Yjs）产生 tombstone，千节点画布 tombstone 膨胀拖垮合并；② 单 node 误删的恢复路径已是 undo 栈（`historyPast`/`historyFuture`，session 域，platform §13.1 明列 session 不同步），够用；③ 单 chat message 删即编辑语义，不需要 trash bin。这条与 DP-3 正交（DP-3 是 collection 级，不是 message 级），记录在此避免实施时把软删下沉到 node/message 粒度。
 
