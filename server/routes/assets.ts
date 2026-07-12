@@ -38,6 +38,7 @@ import { Hono } from 'hono'
 import { Buffer } from 'node:buffer'
 import { rejectInvalidMivoApiKey } from '../lib/keys'
 import { resolveAssetOwner } from '../lib/owner'
+import { resolveCanvasAccess, actorHasCanvasAccess } from '../lib/projectAuthz'
 import {
   parseMultipartBody,
   readJsonBody,
@@ -59,6 +60,8 @@ import {
 } from '../lib/assetStore'
 import { canonicalizeImage } from '../lib/canonicalize'
 import { acquireDecodePermit, DecodeBusyError, type DecodePermit } from '../lib/decodeGate'
+import type { PersistBackend } from '../persist/backend'
+import type { PermissionBackend } from '../lib/permissions'
 import type { App, AppEnv } from '../lib/types'
 
 // sha256 hex (64). Validated on GET so a non-hash :id never reaches the store /
@@ -83,12 +86,24 @@ export type AssetRouteOptions = {
   store?: AssetStore
   /** Injected backend (mutually exclusive with `store`; convenience for tests). */
   backend?: AssetStoreBackend
+  /**
+   * G2.2(decision 1/2):persist backend for canvas/node authoritative lookup——attach gate ①
+   * 验 node 属目标 canvas(不信裸 nodeId)+ detach 验引用画布 edit 权。required(attach/detach authz 依赖)。
+   */
+  persist: PersistBackend
+  /**
+   * G2.2(decision 1/2):permission backend for canvas edit/view authz(member role + share-link resolution)。
+   * required(attach gate ① write + gate ② transitive view + detach edit authz 依赖)。
+   */
+  permissions: PermissionBackend
 }
 
-export const createAssetRoutes = (options: AssetRouteOptions = {}): App => {
+export const createAssetRoutes = (options: AssetRouteOptions): App => {
   const app: App = new Hono<AppEnv>()
   const store =
     options.store ?? (options.backend ? createAssetStore(options.backend) : createAssetStore(createFsBackendFromEnv()))
+  const persist = options.persist
+  const permissions = options.permissions
 
   // POST /api/assets — multipart/form-data ('image' file) OR JSON {image: base64}.
   app.post('/assets', async (c) => {
@@ -281,23 +296,24 @@ export const createAssetRoutes = (options: AssetRouteOptions = {}): App => {
     return c.body(hit.bytes as never)
   })
 
-  // ── G1-a P1-2 seam:asset attach/detach HTTP 入口(节点生命周期调用方属 G1-c,本轮冻结 wire)──
-  // assetStore.attach/detach 已实现(内容寻址 + refcount = references.length + owner-checked),
-  // 但此前无 HTTP 入口 → refcount 恒 0。本路由暴露 attach/detach:ownerFp 服务端从 key 派生
-  // (client 不可指定,防越权 attach 他人 asset);nodeId 在 body。返回 wire AttachAssetResult/DetachAssetResult。
-  // 语义:attach 0→1 幂等(already-attached no-op);detach 1→0 幂等;跨 owner detach → 403(decidable,不静默)。
-  // 节点 mutation 调用方(createImageNode/deleteNode)属 G1-c(N2-0),本轮只冻结 route + 不接调用方。
+  // ── G2.2(decision 1/2):asset attach/detach canvas-authz 双门谓词——堵"知 hash 即可跨用户 attach"安全洞 ──
+  // 决议(lead 定,A1 节):attach 须同时过两道门(detach 验引用画布 edit 权):
+  //   ① actor 对目标 canvas 有 edit(write)权:body 带 canvasId(不信裸 nodeId),服务端从权威 node 数据
+  //      反查 node 属该 canvas(persist.getChild;missing/cross-canvas → 404 unknown-node)。
+  //   ② actor 是该 asset 的 uploader,或经某个已引用该 asset 的画布获得 view(read)entitlement:
+  //      isUploader(assetId, ownerFp) OR references[].ownerFp === ownerFp(己方 ref)OR
+  //      references[].canvasId 任一画布 actor 有 view 权(actorHasCanvasAccess)。
+  // detach(decision 2):验目标引用所在 canvas 的 edit 权(ref.canvasId;新 ref)。legacy ref(无 canvasId)
+  //   回退 ownerFp 校验(owner-mismatch 403,保既有 service 契约 + assetsAttachDetach 测试)。
   //
-  // ── EXPOSURE TRACE(lead 2026-07-12 批准:owner-gate 延 G2.2,需 documented exposure)──
-  // attach 路由 **不 owner-gate**(assetStore.attach 不 owner-check;AttachResult 无 owner-mismatch kind)。
-  // 含义:任何持有 assetId(sha256 hex64)的请求方可 attach 自己的 ref → ref 即 live reference → 可 GET 该
-  // asset。这是内容寻址 ref 模型的既有 backend 设计(attachRef 一直如此),非 G1-a 新引入。生产暴露面:
-  //   - 知 hash 即可 attach+读(理论上绕过 T1.4 share-grant 的显式授权流)。
-  // 缓解(G1-a 阶段):assetId 仅返给 uploader(POST /api/assets 响应);不列举、不猜测(sha256 不可枚举)。
-  // 节点生命周期 attach 同 owner(用户上传 + attach 自己画布的节点),cross-owner attach 生产不发生。
-  // 待办(G2.2):route 层加 `record.ownerFp === attacher` 检查(service 层暴露 isUploader),或并入 T1.4
-  // share-grant 设计统一授权。在此之前的暴露:attach 不阻止 cross-owner(知 hash 即可),detattach 已 owner-gate。
-  const ATTACH_BODY_MAX = 8192 // nodeId 小体量;8KB 上限防滥用
+  // 403/404 语义(防存在性泄漏 + G2.1 proof-gate 语义保持):
+  //   - gate ① canvas authz fail:非成员/无分享 → 404 unknown-canvas(无泄漏);成员/分享越权 → 403 forbidden。
+  //   - gate ① node-not-in-canvas:404 unknown-node(actor 对 canvas 有 edit,node 不在属 client 错,不泄漏)。
+  //   - asset record missing:404 {kind:'missing'}(无 record)。
+  //   - gate ② fail(actor 已 canvas-write 授权但与 asset 无关系):403 forbidden(decidable,不静默;SC1:
+  //     攻击者自建可编辑 canvas + 他人 hash attach → 403。sha256 不可枚举,存在性泄漏可接受)。
+  //   - detach:新 ref canvas-edit authz fail → 404/403(同 gate ① 语义);legacy ref owner-mismatch → 403。
+  const ATTACH_BODY_MAX = 8192 // nodeId + canvasId 小体量;8KB 上限防滥用
 
   app.post('/assets/:id/attach', async (c) => {
     const requestId = newRequestId()
@@ -321,20 +337,62 @@ export const createAssetRoutes = (options: AssetRouteOptions = {}): App => {
       log(404, 'invalid-id')
       return plainTextNoContentType(c, 'Asset not found', 404)
     }
-    let body: { nodeId?: string }
+    let body: { nodeId?: string; canvasId?: string }
     try {
-      body = await readJsonBody<{ nodeId?: string }>(c, ATTACH_BODY_MAX)
+      body = await readJsonBody<{ nodeId?: string; canvasId?: string }>(c, ATTACH_BODY_MAX)
     } catch {
       log(400, 'bad-body')
-      return c.json({ error: 'invalid body; expected { nodeId: string }' }, 400)
+      return c.json({ error: 'invalid body; expected { nodeId: string, canvasId: string }' }, 400)
     }
     const nodeId = body?.nodeId?.trim()
+    const canvasId = body?.canvasId?.trim()
     if (!nodeId) {
       log(400, 'missing-node-id')
       return c.json({ error: 'nodeId is required' }, 400)
     }
-    // service 层 attach 直接返 AttachResult union(attached/already-attached/missing);ownerFp 服务端派生。
-    const result = await store.attach(assetId, nodeId, ownerFp)
+    if (!canvasId) {
+      log(400, 'missing-canvas-id')
+      return c.json({ error: 'canvasId is required' }, 400)
+    }
+
+    // Gate ①:actor 对目标 canvas 有 edit(write)权 + node 属该 canvas(权威反查,不信裸 nodeId)。
+    const access = await resolveCanvasAccess(c, persist, permissions, canvasId, 'write')
+    if (!access.ok) {
+      log(access.status, access.status === 403 ? 'forbidden' : 'unknown-canvas')
+      return c.json(access.body as Record<string, unknown>, access.status as 400 | 403 | 404 | 410)
+    }
+    const node = await persist.getChild(access.ownerId, canvasId, 'node', nodeId)
+    if (node.kind === 'missing' || node.kind === 'cross-canvas') {
+      // node 不属该 canvas → 404 unknown-node(不泄漏;actor 对 canvas 有 edit,node 不在属 client 错)。
+      log(404, 'unknown-node')
+      return c.json({ error: 'unknown-node' }, 404)
+    }
+
+    // Gate ②:actor 与 asset 的关系(uploader OR 己方 ref OR 经引用画布获 view entitlement)。
+    const record = await store.getRecord(assetId)
+    if (!record) {
+      log(404, 'missing')
+      return c.json({ kind: 'missing' } satisfies { kind: 'missing' }, 404)
+    }
+    let entitled = await store.isUploader(assetId, ownerFp)
+    if (!entitled) entitled = record.references.some((r) => r.ownerFp === ownerFp)
+    if (!entitled) {
+      for (const r of record.references) {
+        if (!r.canvasId) continue
+        if (await actorHasCanvasAccess(persist, permissions, r.canvasId, 'read', ownerFp)) {
+          entitled = true
+          break
+        }
+      }
+    }
+    if (!entitled) {
+      // actor 已对目标 canvas 有 edit 权(gate ① 过)但与 asset 无关系 → 403(decidable,不静默;SC1)。
+      log(403, 'forbidden-no-asset-entitlement')
+      return c.json({ error: 'forbidden' }, 403)
+    }
+
+    // 双门过 → attach(record ref canvasId 供后续 detach canvas-edit authz + gate ② 传递性 view)。
+    const result = await store.attach(assetId, nodeId, ownerFp, undefined, canvasId)
     switch (result.kind) {
       case 'attached':
         log(200, 'attached')
@@ -371,19 +429,46 @@ export const createAssetRoutes = (options: AssetRouteOptions = {}): App => {
       log(404, 'invalid-id')
       return plainTextNoContentType(c, 'Asset not found', 404)
     }
-    let body: { nodeId?: string }
+    let body: { nodeId?: string; canvasId?: string }
     try {
-      body = await readJsonBody<{ nodeId?: string }>(c, ATTACH_BODY_MAX)
+      body = await readJsonBody<{ nodeId?: string; canvasId?: string }>(c, ATTACH_BODY_MAX)
     } catch {
       log(400, 'bad-body')
-      return c.json({ error: 'invalid body; expected { nodeId: string }' }, 400)
+      return c.json({ error: 'invalid body; expected { nodeId: string, canvasId?: string }' }, 400)
     }
     const nodeId = body?.nodeId?.trim()
     if (!nodeId) {
       log(400, 'missing-node-id')
       return c.json({ error: 'nodeId is required' }, 400)
     }
-    // service 层 detach 直接返 DetachResult union(detached/already-detached/missing/owner-mismatch)。
+    const bodyCanvasId = body?.canvasId?.trim() || undefined
+
+    const record = await store.getRecord(assetId)
+    if (!record) {
+      log(404, 'missing')
+      return c.json({ kind: 'missing' } satisfies { kind: 'missing' }, 404)
+    }
+    const ref = record.references.find((r) => r.nodeId === nodeId)
+    if (!ref) {
+      // ref 已不在 → already-detached(幂等 intent 已满足)。
+      log(200, 'already-detached')
+      return c.json({ kind: 'already-detached' } as { kind: 'already-detached' }, 200)
+    }
+    // decision 2:验目标引用所在 canvas 的 edit 权。新 ref(ref.canvasId)走 canvas-edit authz;
+    // legacy ref(无 canvasId)回退 ownerFp 校验(service 层 owner-mismatch,保既有契约)。
+    if (ref.canvasId) {
+      if (bodyCanvasId && bodyCanvasId !== ref.canvasId) {
+        // body 声称的 canvas 与 ref 实际 canvas 不符 → cross-canvas,不 detach 他 canvas 的 ref。
+        log(404, 'cross-canvas')
+        return c.json({ error: 'unknown-canvas' }, 404)
+      }
+      const access = await resolveCanvasAccess(c, persist, permissions, ref.canvasId, 'write')
+      if (!access.ok) {
+        log(access.status, access.status === 403 ? 'forbidden' : 'unknown-canvas')
+        return c.json(access.body as Record<string, unknown>, access.status as 400 | 403 | 404 | 410)
+      }
+    }
+    // authz 过(新 ref canvas-edit / legacy ref 走 service ownerFp)→ detach。
     const result = await store.detach(assetId, nodeId, ownerFp)
     switch (result.kind) {
       case 'detached':

@@ -238,6 +238,35 @@ const DROP_COMPENSATIONS_CLAIM_TOKEN = sql`
 ALTER TABLE share_link_compensations DROP COLUMN IF EXISTS claim_token;
 `
 
+// G2.2 migration 008:三域 owner rekey(fingerprint→SSO username)文档 + fail-closed 审计标记。
+// 决议(lead 定,docs/plan/...A1 D3 节 + docs/decisions/dp4-identity-alignment.md §3.1 + docs/runbook/
+// g21-strict-sso-runbook.md §owner inventory + §owner-migration gate)。受影响持久键(三域全清单):
+//   - persist 域:persist_records.owner_id(含 chat-message,DP-6R per-actor)+ projects/canvases.owner_id(瘦全局
+//     索引表)+ idempotency_index.owner_id + envelope_owner(#10 幂等表)+ chat_order_revisions.actor_id(DP-6R P1-2)。
+//   - permissions 域:share_links.created_by(project_members.user_id 不在 rekey 范围——DP-4 是真实 username)。
+//   - assets 域:AssetRecord.ownerFp + references[].ownerFp + .uploaders(fs,MIVO_ASSET_STORE_DIR)。
+//
+// 映射来源(dp4 R-2):fingerprint→username 需原 mivo_ key 或预建映射表(部署特定);**不可唯一映射 → no-go 拒迁**
+// (resolver 返 undefined/空 → unmapped,留 legacy,strict gate 仍 no-go)。事务边界:每域内两阶段(先收集+resolve,
+// 再原地改;防 resolver 中途抛留半迁移态);三域之间非同一 DB 事务(跨 backend),但每域内原子;失败返 failed 域名
+// 供 ops 重跑(幂等:已 username 形态不再匹配 16-hex 正则,重跑只处理剩余 legacy)。
+//
+// 本 migration 是 fail-closed 审计标记(COMMENT,对齐 003 DP-6R 模式)——rekey 本身是部署特定的 JS callable
+// (owner.ts `migrateAllDomainsLegacyOwnersToUsernameForm` 编排三域;PG persist/permissions + fs/memory assets
+// 各域 migrateLegacyOwnersToUsernameForm / rekeyLegacyFormOwners,resolver 由 ops 提供),不能在 SQL migration 内
+// 硬编码映射(需原 mivo_ key)。**启动 fail-closed**(对齐 R8 shape guard):strict 模式启动时
+// `assertStrictOwnerMigrationComplete`(server/lib/owner.ts)调三域 detector(persist + permissions + assets 的
+// countLegacyFormOwners,机器判定 legacy 形态 ownerId 计数),legacy>0 → 拒启动 exit 1(非文字约定)。
+// ops 翻 MIVO_SSO_STRICT=1 前必须先跑 G2.2 迁移 callable → 三域 detector=0 → 真实网关四项验收 → 翻 strict。
+// 可重放(COMMENT 幂等);detector + migrate callable 在 G2.2 PR(server/lib/owner.ts + persist/pgBackend.ts +
+// persist/pgPermissionBackend.ts + lib/assetStore.ts + lib/permissions.ts)落地。
+const G22_OWNER_REKEY_AUDIT_COMMENT = sql`
+COMMENT ON TABLE persist_records IS 'DP-5 信封列 + payload jsonb. DP-6R(2026-07-12): chat-message.owner_id = actor(per-actor 私有). G2.2(2026-07-13): 三域 owner rekey(fingerprint→SSO username)覆盖 persist_records.owner_id + idempotency_index.owner_id/envelope_owner + chat_order_revisions.actor_id + projects/canvases.owner_id(persist 域) + share_links.created_by(permissions 域) + AssetRecord.ownerFp/references/uploaders(assets 域,fs). 映射来源=原 mivo_ key 或预建映射表(部署特定);不可唯一映射→no-go. rekey 是 JS callable(owner.ts migrateAllDomainsLegacyOwnersToUsernameForm + 各域 migrate),非 SQL. 启动 fail-closed: assertStrictOwnerMigrationComplete 三域 detector legacy>0→拒启动. strict 翻开前必须先跑 rekey callable→三域 detector=0.';
+`
+const G22_OWNER_REKEY_AUDIT_COMMENT_DROP = sql`
+COMMENT ON TABLE persist_records IS 'DP-5 信封列 + payload jsonb. DP-6R(2026-07-12): chat-message.owner_id = actor(per-actor 私有).';
+`
+
 /** migrations 以 ISO 日期前缀排序;migrator 按 key 字典序应用。 */
 export const migrations: Record<string, Migration> = {
   '2026_07_11_001_initial_persist_schema': {
@@ -294,6 +323,14 @@ export const migrations: Record<string, Migration> = {
     },
     async down(db): Promise<void> {
       await DROP_COMPENSATIONS_CLAIM_TOKEN.execute(db)
+    },
+  },
+  '2026_07_12_008_g22_owner_rekey_audit': {
+    async up(db): Promise<void> {
+      await G22_OWNER_REKEY_AUDIT_COMMENT.execute(db)
+    },
+    async down(db): Promise<void> {
+      await G22_OWNER_REKEY_AUDIT_COMMENT_DROP.execute(db)
     },
   },
 }

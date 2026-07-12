@@ -91,6 +91,14 @@ export const ASSET_GRACE_PERIOD_MS = 7 * 24 * 60 * 60 * 1000 // 7 days
 /** sha256 full hex (64 lowercase). Asset ids are validated against this everywhere. */
 export const ASSET_ID_RE = /^[0-9a-f]{64}$/
 
+/**
+ * G2.2:legacy owner 形态 = mivo-key 指纹(sha256[:16] hex;权威 keys.ts `fingerprintOfPlatformKey`
+ * + owner.ts `isLegacyFormOwner` + persist/backend.ts `isLegacyFormOwnerId`,同一形态定义)。模块级常量,
+ * 供 fs/memory backend 的 rekeyLegacyFormOwners + AssetStore service 的 countLegacyFormOwners 共用。
+ * SSO username 为 email-style(含 @);DEV_ACTOR_ID=`mivo-dev-actor`——均不匹配 16-hex,故可机械区分。
+ */
+const ASSET_LEGACY_FINGERPRINT_RE = /^[0-9a-f]{16}$/
+
 /** Typed error for an asset id that isn't lowercase sha256 hex64 (P2.6). */
 export class InvalidAssetIdError extends Error {
   readonly assetId: string
@@ -101,8 +109,16 @@ export class InvalidAssetIdError extends Error {
   }
 }
 
-/** A single reference keeping an asset alive. refcount = count of these. */
-export type AssetReference = { nodeId: string; ownerFp: string }
+/**
+ * A single reference keeping an asset alive. refcount = count of these.
+ * - `ownerFp`: the attacher's owner fingerprint (FX-2) — who created THIS reference.
+ * - `canvasId`: G2.2 — the canvas the attached node belongs to. Lets detach verify
+ *   edit permission on the referencing canvas (decision 2) + lets attach gate ② check
+ *   transitive view entitlement via a referencing canvas (decision 1). Optional: legacy
+ *   references written before G2.2 carry no canvasId; readers MUST tolerate undefined
+ *   (fall back to ownerFp / body-supplied canvasId).
+ */
+export type AssetReference = { nodeId: string; ownerFp: string; canvasId?: string }
 
 export type AssetRecord = {
   /** content-addressed id = sha256(bytes) hex. */
@@ -225,6 +241,16 @@ export type AssetStoreBackend = {
   isUploader(contentHash: string, ownerFp: string): Promise<boolean>
   /** Test/diagnostic: the uploader set for an asset (P2-E). */
   listUploaders(contentHash: string): Promise<string[]>
+  /**
+   * G2.2:asset 域 owner rekey——把 AssetRecord.ownerFp + references[].ownerFp + .uploaders 中为
+   * legacy 指纹形态(16-hex)的 owner 重键为 SSO username(`resolver` 返回值)。两阶段(防 resolver
+   * 中途抛留半迁移态):① 扫全 records+uploaders 收集 legacy owner 集合并 resolve;② 逐 record 在 hash
+   * 锁内原地改 + 重写 .meta.json/.uploaders。resolver 返 undefined/空 → unmapped(留 legacy)。**可选**:
+   * fs/memory 实装;返回 {migrated, unmapped}(owner 维度计数,非 record 维度)。
+   */
+  rekeyLegacyFormOwners?(
+    resolver: (fingerprint: string) => string | undefined,
+  ): Promise<{ migrated: number; unmapped: number }>
 }
 
 // sha256 full hex — content-addressed id. Full 256-bit (unlike ownerFp's 16-hex
@@ -505,7 +531,11 @@ export const createFsAssetBackend = (root: string): AssetStoreBackend => ({
       if (!record) return { result: { kind: 'missing' as const }, record: null }
       const idx = record.references.findIndex((r) => r.nodeId === nodeId)
       if (idx === -1) return { result: { kind: 'already-detached' as const }, record }
-      if (record.references[idx].ownerFp !== ownerFp) {
+      // G2.2(decision 2):带 canvasId 的 ref 由 route 做 canvas-edit authz 授权后移除(service 信任 route
+      // 授权,不做 ownerFp 校验——使 editor 能 detach owner 的 ref);无 canvasId 的 legacy ref 回退到
+      // ownerFp 校验(decidable owner-mismatch,不静默,保既有 service 测试 + assetsAttachDetach 契约)。
+      const ref = record.references[idx]
+      if (!ref.canvasId && ref.ownerFp !== ownerFp) {
         return { result: { kind: 'owner-mismatch' as const }, record }
       }
       const refs = record.references.filter((r) => r.nodeId !== nodeId)
@@ -648,6 +678,89 @@ export const createFsAssetBackend = (root: string): AssetStoreBackend => ({
     assertValidAssetId(contentHash)
     return readUploadersUnlocked(root, contentHash)
   },
+
+  async rekeyLegacyFormOwners(resolver) {
+    // Phase 1:扫全 records + uploaders,收集 legacy owner 集合并 resolve(resolver 可能抛 → 此时未 mutation)。
+    const records: AssetRecord[] = []
+    let shards: string[]
+    try {
+      shards = await fs.readdir(root)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { migrated: 0, unmapped: 0 }
+      throw error
+    }
+    for (const shard of shards) {
+      let files: string[]
+      try {
+        files = await fs.readdir(path.join(root, shard))
+      } catch {
+        continue
+      }
+      for (const file of files) {
+        if (!file.endsWith('.meta.json')) continue
+        try {
+          const raw = await fs.readFile(path.join(root, shard, file), 'utf8')
+          records.push(JSON.parse(raw) as AssetRecord)
+        } catch {
+          // skip malformed meta(同 listRecords,不崩 sweep)
+        }
+      }
+    }
+    const legacySet = new Set<string>()
+    for (const r of records) {
+      if (ASSET_LEGACY_FINGERPRINT_RE.test(r.ownerFp)) legacySet.add(r.ownerFp)
+      for (const ref of r.references) {
+        if (ASSET_LEGACY_FINGERPRINT_RE.test(ref.ownerFp)) legacySet.add(ref.ownerFp)
+      }
+      const uploaders = await readUploadersUnlocked(root, r.contentHash)
+      for (const up of uploaders) {
+        if (ASSET_LEGACY_FINGERPRINT_RE.test(up)) legacySet.add(up)
+      }
+    }
+    const mapping = new Map<string, string>()
+    let unmapped = 0
+    for (const fp of legacySet) {
+      const u = resolver(fp)
+      if (u && u.length > 0) mapping.set(fp, u)
+      else unmapped += 1
+    }
+    // Phase 2:逐 record 在 hash 锁内原地改 ownerFp + refs[].ownerFp + 重写 .uploaders(Map ops 同步,无 resolver 调用)。
+    for (const r of records) {
+      const hash = r.contentHash
+      await withHashLock(hash, async () => {
+        const record = await readRecordUnlocked(root, hash)
+        if (!record) return
+        let recChanged = false
+        if (mapping.has(record.ownerFp)) {
+          record.ownerFp = mapping.get(record.ownerFp)!
+          recChanged = true
+        }
+        for (const ref of record.references) {
+          if (mapping.has(ref.ownerFp)) {
+            ref.ownerFp = mapping.get(ref.ownerFp)!
+            recChanged = true
+          }
+        }
+        if (recChanged) {
+          await writeAtomic(metaPath(root, hash), JSON.stringify(record, null, 2), 'utf8')
+        }
+        const uploaders = await readUploadersUnlocked(root, hash)
+        let upChanged = false
+        const mapped = uploaders.map((up) => {
+          if (mapping.has(up)) {
+            upChanged = true
+            return mapping.get(up)!
+          }
+          return up
+        })
+        if (upChanged) {
+          const dedup = [...new Set(mapped)]
+          await writeAtomic(uploadersPath(root, hash), dedup.join('\n') + '\n', 'utf8')
+        }
+      })
+    }
+    return { migrated: mapping.size, unmapped }
+  },
 })
 
 // ─── In-memory backend (deterministic tests; no fs) ──────────────────────────
@@ -761,7 +874,10 @@ export const createMemoryAssetBackend = (): MemoryAssetBackend => {
       if (!record) return { result: { kind: 'missing' }, record: null }
       const idx = record.references.findIndex((r) => r.nodeId === nodeId)
       if (idx === -1) return { result: { kind: 'already-detached' }, record }
-      if (record.references[idx].ownerFp !== ownerFp) {
+      // G2.2(decision 2):带 canvasId 的 ref 由 route 做 canvas-edit authz 后移除;legacy ref(无 canvasId)
+      // 回退 ownerFp 校验(owner-mismatch,decidable)。与 fs backend 同语义。
+      const ref = record.references[idx]
+      if (!ref.canvasId && ref.ownerFp !== ownerFp) {
         return { result: { kind: 'owner-mismatch' }, record }
       }
       const refs = record.references.filter((r) => r.nodeId !== nodeId)
@@ -807,6 +923,45 @@ export const createMemoryAssetBackend = (): MemoryAssetBackend => {
       assertValidAssetId(contentHash)
       return [...(_uploaders.get(contentHash) ?? [])]
     },
+
+    async rekeyLegacyFormOwners(resolver) {
+      // Phase 1:收集 legacy owner 集合并 resolve(resolver 可能抛 → 此时未 mutation)。
+      const legacySet = new Set<string>()
+      for (const r of _records.values()) {
+        if (ASSET_LEGACY_FINGERPRINT_RE.test(r.ownerFp)) legacySet.add(r.ownerFp)
+        for (const ref of r.references) {
+          if (ASSET_LEGACY_FINGERPRINT_RE.test(ref.ownerFp)) legacySet.add(ref.ownerFp)
+        }
+        const uploaders = _uploaders.get(r.contentHash) ?? new Set<string>()
+        for (const up of uploaders) {
+          if (ASSET_LEGACY_FINGERPRINT_RE.test(up)) legacySet.add(up)
+        }
+      }
+      const mapping = new Map<string, string>()
+      let unmapped = 0
+      for (const fp of legacySet) {
+        const u = resolver(fp)
+        if (u && u.length > 0) mapping.set(fp, u)
+        else unmapped += 1
+      }
+      // Phase 2:原地改 record.ownerFp + refs[].ownerFp + _uploaders(Map ops 同步,无 resolver 调用)。
+      for (const r of _records.values()) {
+        if (mapping.has(r.ownerFp)) r.ownerFp = mapping.get(r.ownerFp)!
+        for (const ref of r.references) {
+          if (mapping.has(ref.ownerFp)) ref.ownerFp = mapping.get(ref.ownerFp)!
+        }
+      }
+      for (const [hash, set] of _uploaders) {
+        const mapped = new Set<string>()
+        let changed = false
+        for (const up of set) {
+          if (mapping.has(up)) { mapped.add(mapping.get(up)!); changed = true }
+          else mapped.add(up)
+        }
+        if (changed) _uploaders.set(hash, mapped)
+      }
+      return { migrated: mapping.size, unmapped }
+    },
   }
   return { ...backend, _records, _bytes, _uploaders }
 }
@@ -844,9 +999,15 @@ export type AssetStore = {
     assetId: string,
     ownerFp: string,
   ): Promise<{ bytes: Buffer; mimeType: string } | null>
-  /** Idempotent attach (P1.2): add (assetId, nodeId, ownerFp) reference. */
-  attach(assetId: string, nodeId: string, ownerFp: string, now?: number): Promise<AttachResult>
-  /** Idempotent owner-checked detach (P1.2): remove (assetId, nodeId). */
+  /** Idempotent attach (P1.2): add (assetId, nodeId, ownerFp[, canvasId]) reference.
+   *  G2.2: canvasId recorded on the reference so detach can verify edit on the referencing
+   *  canvas (decision 2) + attach gate ② can check transitive view via a referencing canvas
+   *  (decision 1). The route MUST pre-authorize canvas-edit before calling (service trusts route).
+   *  `now` retained as 4th param for backward-compat with existing service tests (vestigial —
+   *  attachRef does not stamp time); canvasId is the new 5th param. */
+  attach(assetId: string, nodeId: string, ownerFp: string, now?: number, canvasId?: string): Promise<AttachResult>
+  /** Idempotent detach (P1.2): remove (assetId, nodeId). G2.2: route pre-authorizes canvas-edit
+   *  on the reference's canvas; service removes by nodeId (legacy refs w/o canvasId keep ownerFp check). */
   detach(assetId: string, nodeId: string, ownerFp: string, now?: number): Promise<DetachResult>
   /** Delete records + bytes whose grace has expired. Re-checks eligibility atomically
    *  per hash (P1.1): a concurrent attach during sweep aborts that asset's delete.
@@ -854,6 +1015,8 @@ export type AssetStore = {
   runPurgeSweep(now?: number): Promise<{ purged: number; scanned: number }>
   /** Test/diagnostic: read a record (no IO side effect). */
   getRecord(assetId: string): Promise<AssetRecord | null>
+  /** G2.2 gate ②:ownerFp 是该 asset 的 uploader 吗(dedup uploader 注册表,.uploaders)?转发 backend.isUploader。 */
+  isUploader(assetId: string, ownerFp: string): Promise<boolean>
   /** Current reference count = references.length. */
   refcount(assetId: string): Promise<number>
   /** Per-owner total bytes (first-uploader attribution) — for the quota check (P1.4). */
@@ -871,6 +1034,14 @@ export type AssetStore = {
    * 打标)+ references[].ownerFp(attach 方)+ .uploaders(dedup uploader 注册表)三处 legacy 指纹。
    */
   countLegacyFormOwners?(): Promise<number>
+  /**
+   * G2.2:asset 域 owner rekey——把 AssetRecord.ownerFp + references[].ownerFp + .uploaders 中为
+   * legacy 指纹形态(16-hex)的 owner 重键为 SSO username。转发 backend.rekeyLegacyFormOwners。
+   * unmapped>0 → strict gate 仍 no-go(明确拒迁)。返回 {migrated, unmapped}(owner 维度计数)。
+   */
+  migrateLegacyFormOwners?(
+    resolver: (fingerprint: string) => string | undefined,
+  ): Promise<{ migrated: number; unmapped: number }>
 }
 
 const nowOrDefault = (now: number | undefined): number => now ?? Date.now()
@@ -1009,9 +1180,9 @@ export const createAssetStore = (backend: AssetStoreBackend): AssetStore => {
     return { bytes, mimeType: record.mimeType }
   }
 
-  const attach: AssetStore['attach'] = async (assetId, nodeId, ownerFp) => {
+  const attach: AssetStore['attach'] = async (assetId, nodeId, ownerFp, _now, canvasId) => {
     assertValidAssetId(assetId)
-    const { record, newlyAttached } = await backend.attachRef(assetId, { nodeId, ownerFp })
+    const { record, newlyAttached } = await backend.attachRef(assetId, { nodeId, ownerFp, canvasId })
     if (!record) return { kind: 'missing' }
     return newlyAttached ? { kind: 'attached' } : { kind: 'already-attached' }
   }
@@ -1043,6 +1214,11 @@ export const createAssetStore = (backend: AssetStoreBackend): AssetStore => {
     return backend.getRecord(assetId)
   }
 
+  const isUploader: AssetStore['isUploader'] = async (assetId, ownerFp) => {
+    assertValidAssetId(assetId)
+    return backend.isUploader(assetId, ownerFp)
+  }
+
   const refcount: AssetStore['refcount'] = async (assetId) => {
     assertValidAssetId(assetId)
     const r = await backend.getRecord(assetId)
@@ -1066,10 +1242,8 @@ export const createAssetStore = (backend: AssetStoreBackend): AssetStore => {
     return { checked: records.length, mismatches }
   }
 
-  // G2.1 R2-1:legacy owner 形态 = mivo-key 指纹(sha256[:16] hex;权威 keys.ts
-  // `fingerprintOfPlatformKey` + owner.ts `isLegacyFormOwner`/persist/backend.ts 内联正则,同一形态定义)。
-  // 内联于此以保 asset 层 framework-agnostic(不耦合 hono/owner.ts);SSO username 为 email-style(含 @)。
-  const ASSET_LEGACY_FINGERPRINT_RE = /^[0-9a-f]{16}$/
+  // G2.1 R2-1:legacy owner 形态 = mivo-key 指纹(sha256[:16] hex;模块级 ASSET_LEGACY_FINGERPRINT_RE,
+  // 供 fs/memory backend rekeyLegacyFormOwners + 本 service countLegacyFormOwners 共用)。
   const countLegacyFormOwners: AssetStore['countLegacyFormOwners'] = async () => {
     // 扫 AssetRecord.ownerFp(first uploader 归属打标)+ references[].ownerFp(attach 方)+ .uploaders
     // (dedup uploader 注册表)三处 legacy 指纹;去重(同一 legacy ownerFp 多处计 1)。
@@ -1089,6 +1263,15 @@ export const createAssetStore = (backend: AssetStoreBackend): AssetStore => {
     return legacy.size
   }
 
+  // G2.2:asset 域 owner rekey——转发 backend.rekeyLegacyFormOwners(fs/memory 实装)。backend 未实现
+  // (PG asset backend,G2.2 后)→ 返回 not implemented(fail-closed,与启动 gate 一致)。
+  const migrateLegacyFormOwners: AssetStore['migrateLegacyFormOwners'] = async (resolver) => {
+    if (typeof backend.rekeyLegacyFormOwners !== 'function') {
+      throw new Error('migrateLegacyFormOwners: backend does not implement rekeyLegacyFormOwners (PG asset backend lands after G2.2). The startup gate (assertStrictOwnerMigrationComplete) is real and enforced; strict cannot be flipped until all three domain detectors + migrations land.')
+    }
+    return backend.rekeyLegacyFormOwners(resolver)
+  }
+
   return {
     upload,
     uploadWithQuota,
@@ -1098,10 +1281,12 @@ export const createAssetStore = (backend: AssetStoreBackend): AssetStore => {
     detach,
     runPurgeSweep,
     getRecord,
+    isUploader,
     refcount,
     ownerBytes,
     scrubAssetIntegrity,
     countLegacyFormOwners,
+    migrateLegacyFormOwners,
   }
 }
 

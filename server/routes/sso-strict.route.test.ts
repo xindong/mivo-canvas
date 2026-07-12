@@ -34,7 +34,7 @@ import {
   isLegacyFormOwner,
   type LegacyOwnerDetector,
 } from '../lib/owner'
-import type { PersistBackend } from '../persist/backend'
+import { createPersistBackend, type PersistBackend } from '../persist/backend'
 import { InMemoryPermissionBackend } from '../lib/permissions'
 import {
   createAssetStore,
@@ -47,10 +47,11 @@ const GW = 'gw-secret-xyz'
 const UNKNOWN_TASK = '00000000-0000-0000-0000-000000000000'
 
 // 最小 assets app(mirror app.ts:top-level onError + createAssetRoutes + memory backend)。
+// G2.2: attach/detach routes need persist+permissions for canvas-edit authz;注入 InMemory。
 const buildAssetsApp = (): Hono<AppEnv> => {
   const app = new Hono<AppEnv>()
   app.onError(ssoAuthErrorHandler)
-  app.route('/api', createAssetRoutes({ backend: createMemoryAssetBackend() }))
+  app.route('/api', createAssetRoutes({ backend: createMemoryAssetBackend(), persist: createPersistBackend(), permissions: new InMemoryPermissionBackend() }))
   return app
 }
 
