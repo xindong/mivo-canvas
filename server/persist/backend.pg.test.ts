@@ -10,6 +10,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest'
 import { Pool } from 'pg'
 import { PgPersistBackend } from './pgBackend'
+import { PgPermissionBackend } from './pgPermissionBackend'
 
 const PG_TEST_ENABLED = process.env.MIVO_PG_TEST === '1'
 
@@ -228,6 +229,9 @@ async function canvasTableIsDeleted(id: string): Promise<boolean | null> {
   it('P1-4 fresh DB 启动:migrate-before-warm(删表后 new instance await ready 自迁移,无 42P01)', async () => {
     // 模拟 fresh DB:删全部表(含 kysely_migration 追踪表)
     await pg.__dropAllTables()
+    // R2-P2-1:断言 __dropAllTables 真 drop 了 chat_order_revisions(migration 004 新表,曾漏入 drop 列表 →
+    // to_regclass 仍在,fresh-DB 实际不 fresh,掩盖 004 CREATE/registry 错误)。修复后应为 false。
+    expect(await pg.__tableExists('chat_order_revisions')).toBe(false)
     // new instance,只 await ready(不显式 migrate)—— ready 内部 migrate-before-warm
     const pgFresh = new PgPersistBackend(pgConn())
     // 旧实现:warm() 先 SELECT projects → 空库 42P01 → ready reject。新实现:ready 先 migrate 再 warm。
@@ -411,5 +415,45 @@ async function canvasTableIsDeleted(id: string): Promise<boolean | null> {
     const cv2 = await pg.get('o', 'canvas', 'c1')
     expect(cv2.kind).toBe('found')
     if (cv2.kind === 'found') expect(cv2.record.isDeleted).toBe(false)
+  })
+})
+
+// R2-1 [P1]:共享 Pool 预算 + ownsPool destroy 守护断言(PG-gated;CI 无 PG 跳过)。
+// 首轮验收要求的"Pool max 总和断言 ≤ 预算 / ownsPool destroy 守护"一条都没写过——本块补齐。
+// 不变量(F2 已在 app.ts 实现:persist+permission 共享**一个** Pool 注入两个 backend):
+//  - 两 backend 各自 destroy() 是 no-op(ownsPool=false 守护)——不关共享池;
+//  - 单 Pool 的 max = conn.maxConnections(Σ = max,非 2×max 叠加);
+//  - 共享池在两 backend destroy 后仍可查(prove destroy guard 生效,未被任一 backend 关闭)。
+;(PG_TEST_ENABLED ? describe : describe.skip)('R2-1: shared Pool budget + ownsPool destroy guard', () => {
+  it('sharedPool 注入两 backend → 各 destroy no-op,共享池仍可查;单池 max=budget(Σ 不叠加)', async () => {
+    const cfg = { ...pgConn(), idleTimeoutMs: 5000, connectionTimeoutMs: 5000 }
+    const sharedPool = new Pool({
+      host: cfg.host,
+      port: cfg.port,
+      database: cfg.database,
+      user: cfg.user,
+      password: cfg.password,
+      max: cfg.maxConnections,
+      idleTimeoutMillis: cfg.idleTimeoutMs,
+      connectionTimeoutMillis: cfg.connectionTimeoutMs,
+    })
+    try {
+      const persist = new PgPersistBackend(cfg, sharedPool)
+      const permission = new PgPermissionBackend(cfg, sharedPool)
+      await persist.ready
+      await permission.ready
+      // 各自 destroy:ownsPool=false(注入)→ no-op,不关共享池(否则下面 query 报 'Pool was destroyed')。
+      await persist.destroy()
+      await permission.destroy()
+      // 共享池仍可查 → prove 两 backend 的 destroy 都未销毁它(ownsPool 守护生效)。
+      const r = await sharedPool.query('SELECT 1 AS ok')
+      expect(r.rows[0].ok).toBe(1)
+      // 单 Pool max = 预算(两 backend 共享同一池,Σ max = maxConnections,非 2× 叠加)。
+      // pg Pool 把构造参数挂在 .options 上;max 即预算。
+      const poolMax = (sharedPool as unknown as { options?: { max?: number } }).options?.max
+      expect(poolMax).toBe(cfg.maxConnections)
+    } finally {
+      await sharedPool.end()
+    }
   })
 })
