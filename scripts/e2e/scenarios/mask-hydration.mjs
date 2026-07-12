@@ -149,6 +149,16 @@ export const runMaskHydrationScenario = async (context) => {
     throw new Error('SC-15: chat generating state should be persisted to IDB before reload')
   }
 
+  // SC-15 canvas: read the DOCUMENT persist domain. Under kernel=new the app
+  // (docKernelPersistAdapter) writes canvases to the split key `:document`, NOT the
+  // legacy single-blob `mivo-canvas-demo:<uid>` key the harness used to read — so the
+  // pre-fix probe read a non-existent key and timed out even though the generating
+  // slot WAS durably persisted. domain:'document' routes through the app's own
+  // __MIVO_E2E__ bridge (getCanvasPersistDocumentKey), resolving to the :document
+  // split key under kernel=new and the single-blob key under kernel=legacy —
+  // kernel-agnostic, field-level assertion (canvases → ai-slot → aiWorkflow.status)
+  // strength unchanged. Chat (above) keeps the no-domain path: chatStore uses
+  // idbStateStorage = single-blob under both kernels.
   const canvasPersisted = await waitForPersistedKv(
     page,
     'mivo-canvas-demo',
@@ -161,7 +171,7 @@ export const runMaskHydrationScenario = async (context) => {
         )
       } catch { return false }
     },
-    { timeout: 8000 },
+    { timeout: 8000, domain: 'document' },
   )
   if (!canvasPersisted) {
     throw new Error('SC-15: canvas generating slot should be persisted to IDB before reload')
@@ -196,7 +206,8 @@ export const runMaskHydrationScenario = async (context) => {
     throw new Error('SC-15: chat card should be settled to error+retryDisabledReason in IDB after reload')
   }
 
-  // SC-15: canvas slot failed（用 IDB 断言）
+  // SC-15: canvas slot failed（用 IDB 断言，读 document 域 — 同 pre-reload，kernel=new
+  // 下 settled 状态由 onRehydrateStorage writeback 写回 :document 分裂键）。
   const settledCanvasRaw = await waitForPersistedKv(
     page,
     'mivo-canvas-demo',
@@ -209,7 +220,7 @@ export const runMaskHydrationScenario = async (context) => {
         )
       } catch { return false }
     },
-    { timeout: 12000 },
+    { timeout: 12000, domain: 'document' },
   )
   if (!settledCanvasRaw) {
     throw new Error('SC-15: canvas slot should be settled to failed in IDB after reload')
