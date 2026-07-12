@@ -139,8 +139,13 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: lts/*
+          cache: npm
 
-      # 守卫脚本是纯 node(无第三方依赖),无需 npm ci
+      # A7a 第三轮返修:守卫 rule④ import 提取改走 TS compiler API(ts.createSourceFile),
+      # 需 typescript(devDep);原「纯 node 零依赖」前提不再成立,补 npm ci(带 cache)。
+      - name: Install dependencies
+        run: npm ci
+
       - name: Run structure guard
         env:
           MIVO_GUARD_BASE_SHA: ${{ github.event.pull_request.base.sha }}
