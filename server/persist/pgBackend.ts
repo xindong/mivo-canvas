@@ -314,16 +314,22 @@ export class PgPersistBackend implements PersistBackend {
   }
 
   /**
-   * DP-6R P1-2:事务内原子 compare+bump chat orderRevision(单语句,无 get-then-upsert TOCTOU)。
+   * DP-6R P1-2:事务内原子 compare+bump chat orderRevision(单语句条件 INSERT,无 get-then-upsert TOCTOU)。
    *
-   * `INSERT (revision=1) ON CONFLICT (actor,canvas) DO UPDATE SET revision=revision+1 WHERE revision=base RETURNING revision`:
-   *   - 行不存在(base=0 隐式匹配)→ INSERT revision=1 → 返 ok(1);
-   *   - 行存在且 base===current → ON CONFLICT UPDATE 命中 → revision+1 → 返 ok(newRev);
-   *   - 行存在且 base!==current(stale)→ ON CONFLICT UPDATE WHERE revision=base 不命中 → 0 rows → 返 conflict(current)。
+   * R2-P1-1(返修):原 `INSERT (rev=1) ON CONFLICT DO UPDATE WHERE revision=base` 在缺行时 INSERT 无条件成功
+   * (base guard 仅在 DO UPDATE 分支)→ 缺行+base=7 也 ok,与 memory(current=0、base≠0→conflict)分歧。
+   * 改条件 INSERT:`INSERT ... SELECT 1 WHERE base=0 OR EXISTS(...) ON CONFLICT DO UPDATE WHERE revision=base RETURNING`:
+   *   - 缺行 + base===0 → SELECT 出 1 行 → INSERT 成功(rev=1)→ ok(1);
+   *   - 缺行 + base≠0  → SELECT 出 0 行(base≠0 且 EXISTS=false)→ 不 INSERT → 0 rows → conflict(0);【防分歧,与 memory 一致】
+   *   - 行存在 + base===current → INSERT attempt → ON CONFLICT UPDATE WHERE revision=base 命中 → rev+1 → ok(newRev);
+   *   - 行存在 + base!==current(stale)→ ON CONFLICT UPDATE WHERE revision=base 不命中 → 0 rows → conflict(current)。
    *
-   * 并发:两同 base reorder——赢家 INSERT/UPDATE 成功提交;输家的 INSERT/UPDATE 阻塞至赢家提交后,
-   * revision 已 bump,WHERE revision=base 不命中 → 0 rows → conflict。即"同 base 两并发一成一败"。
-   * 不需要 FOR UPDATE 预锁:PK INSERT + WHERE revision=base 已原子串行,无 get-then-upsert 间隙。
+   * `WHERE base=0 OR EXISTS` 的意义:缺行+base≠0 不 INSERT(返 conflict);行存在时 INSERT 仍 attempt 以触发
+   * ON CONFLICT 走 UPDATE 分支(合法 base 匹配→bump,不破坏)。EXISTS 读 statement snapshot;PK arbiter + ON CONFLICT
+   * 串行化并发:两同 base reorder——赢家 INSERT/UPDATE 提交;输家阻塞至赢家提交后,WHERE revision=base 不命中 → conflict。
+   *
+   * 软删/恢复不动 chat_order_revisions(独立于 persist_records 软删状态)→ orderRevision 保留不复位(防 ABA,
+   * 见 backend.ts chatOrderRevision 契约注释 + 双后端契约测试)。不需要 FOR UPDATE 预锁。
    */
   private async bumpChatOrderRevisionInTrx(
     trx: Kysely<Database>,
@@ -331,19 +337,19 @@ export class PgPersistBackend implements PersistBackend {
     canvasId: string,
     base: Revision,
   ): Promise<{ kind: 'ok'; newRevision: number } | { kind: 'conflict'; current: number }> {
-    const row = await trx
-      .insertInto('chat_order_revisions')
-      .values({ actor_id: ownerId, canvas_id: canvasId, revision: 1 })
-      .onConflict((oc) =>
-        oc
-          .columns(['actor_id', 'canvas_id'])
-          .doUpdateSet({ revision: sql`chat_order_revisions.revision + 1`, updated_at: new Date() })
-          .where('chat_order_revisions.revision', '=', base),
-      )
-      .returning('revision')
-      .executeTakeFirst()
+    const result = await sql<{ revision: bigint | number | string }>`
+      INSERT INTO chat_order_revisions (actor_id, canvas_id, revision)
+      SELECT ${ownerId}, ${canvasId}, 1
+      WHERE ${base} = 0
+         OR EXISTS (SELECT 1 FROM chat_order_revisions WHERE actor_id = ${ownerId} AND canvas_id = ${canvasId})
+      ON CONFLICT (actor_id, canvas_id)
+      DO UPDATE SET revision = chat_order_revisions.revision + 1, updated_at = NOW()
+      WHERE chat_order_revisions.revision = ${base}
+      RETURNING chat_order_revisions.revision
+    `.execute(trx)
+    const row = result.rows[0]
     if (row) return { kind: 'ok', newRevision: Number(row.revision) }
-    // 0 rows:行存在但 revision !== base(stale)→ 读 current 供 client rebase。
+    // 0 rows:缺行+base≠0(不 INSERT)或 行存在但 stale(base≠current)→ 读 current 供 client rebase。
     const cur = await trx
       .selectFrom('chat_order_revisions')
       .select('revision')

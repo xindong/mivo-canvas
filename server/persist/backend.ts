@@ -365,6 +365,11 @@ export class InMemoryPersistBackend implements PersistBackend {
   /**
    * DP-6R P1-2:读 per-actor×canvas chat collection orderRevision(缺省 0)。
    * chat reorder 的 If-Match base = 此值(非共享 cv);GET /chat 返此值供 client 下次 reorder。
+   *
+   * R2-P1-1 契约:orderRevision 独立于 persist_records 软删状态——softDeleteCanvasTree/restoreCanvasTree
+   * 只标 canvas meta + chat-collection,**不动 chatOrderRevisions**(memory) / chat_order_revisions(PG)。
+   * 故软删/恢复 orderRevision 保留不复位(防 ABA:不回 0,使软删前的 stale base=0 在 restore 后仍 conflict,
+   * 不复活)。仅 __reset(测试清理)清零。双后端契约测试钉死此行为(见 backend.contract.dual.test.ts)。
    */
   private chatOrderRevision(ownerId: string, canvasId: string): Revision {
     return this.chatOrderRevisions.get(`${ownerId}::${canvasId}`) ?? 0

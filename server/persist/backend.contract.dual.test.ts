@@ -378,17 +378,58 @@ const runPersistBackendContractSuite = (
       if (rB.kind === 'ok') expect(rB.contentVersion).toBe(1) // B 独立 cursor bump→1
     })
 
-    it('P1-2:同 actor 同 base 两并发 reorder 一成一败(stale base → conflict,返当前 orderRevision)', async () => {
+    it('R2-P1-1:同 actor 同 base 真 Promise.all 并发 reorder——kinds 恰为 {ok, conflict}(双后端一致)', async () => {
       await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
       await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
       await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm1', { text: '1' }, { method: 'POST', resourceKind: 'chat-message' })
       await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm2', { text: '2' }, { method: 'POST', resourceKind: 'chat-message' })
-      // 两"并发"都 base=0:赢家 ok(rev→1);输家 base=0 !== 1 → conflict(内存同步串行,等价两并发一成一败)。
-      const win = await b.reorderChildren('actorA', 'c1', 'chat-message', ['m2', 'm1'], { base: 0 })
-      expect(win.kind).toBe('ok')
-      const lose = await b.reorderChildren('actorA', 'c1', 'chat-message', ['m2', 'm1'], { base: 0 })
-      expect(lose.kind).toBe('conflict')
-      if (lose.kind === 'conflict') expect(lose.currentContentVersion).toBe(1) // 当前 orderRevision=1 供 client rebase
+      // R2-P1-1:真并发(Promise.all,非顺序 await)。两同 base=0:赢家 CAS 抢中(rev→1);输家 CAS 见 rev=1≠0 → conflict。
+      // PG 单语句 INSERT...ON CONFLICT WHERE revision=base 经 PK arbiter 串行;memory 同步临界区。kinds 恰 {ok, conflict}。
+      const [r1, r2] = await Promise.all([
+        b.reorderChildren('actorA', 'c1', 'chat-message', ['m2', 'm1'], { base: 0 }),
+        b.reorderChildren('actorA', 'c1', 'chat-message', ['m2', 'm1'], { base: 0 }),
+      ])
+      expect([r1.kind, r2.kind].sort()).toEqual(['conflict', 'ok'])
+      const loser = r1.kind === 'conflict' ? r1 : r2
+      if (loser.kind === 'conflict') expect(loser.currentContentVersion).toBe(1) // 当前 orderRevision=1 供 client rebase
+    })
+
+    it('R2-P1-1:缺行(stale base≠0)→ conflict,不 INSERT(双后端一致;防 PG 缺行 INSERT 无条件成功)', async () => {
+      await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+      await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm1', { text: '1' }, { method: 'POST', resourceKind: 'chat-message' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm2', { text: '2' }, { method: 'POST', resourceKind: 'chat-message' })
+      // 无前置 reorder → chat_order_revisions 缺行,equiv current=0。client 持 stale base=7(误以为有人 reorder 过)。
+      // 双后端契约:缺行 + base≠0 → conflict(current=0),绝不 INSERT——否则 PG 缺行无条件 INSERT→ok,与 memory 分歧。
+      const r = await b.reorderChildren('actorA', 'c1', 'chat-message', ['m2', 'm1'], { base: 7 })
+      expect(r.kind).toBe('conflict')
+      if (r.kind === 'conflict') expect(r.currentContentVersion).toBe(0)
+      // orderRevision 仍 0(未 INSERT 未 bump)
+      expect(await b.getChatOrderRevision('actorA', 'c1')).toBe(0)
+    })
+
+    it('R2-P1-1 附带:orderRevision 软删/恢复 保留不复位(防 ABA);restore 后 stale base 仍 conflict,base=current 仍 ok', async () => {
+      await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+      await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm1', { text: '1' }, { method: 'POST', resourceKind: 'chat-message' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm2', { text: '2' }, { method: 'POST', resourceKind: 'chat-message' })
+      // reorder → rev=1
+      const r1 = await b.reorderChildren('actorA', 'c1', 'chat-message', ['m2', 'm1'], { base: 0 })
+      expect(r1.kind).toBe('ok')
+      expect(await b.getChatOrderRevision('actorA', 'c1')).toBe(1)
+      // 软删 canvas(meta + chat-collection 标删;chat-message 活记录不动;chat_order_revisions **保留不复位**)
+      await b.softDeleteCanvasTree('o', 'c1')
+      expect(await b.getChatOrderRevision('actorA', 'c1')).toBe(1) // 不复位(防 ABA:不回 0)
+      // 恢复 canvas → orderRevision 仍 1
+      await b.restoreCanvasTree('o', 'c1')
+      expect(await b.getChatOrderRevision('actorA', 'c1')).toBe(1)
+      // 防 ABA:stale base=0(来自软删前)不复活 → conflict(current=1≠0)
+      const rStale = await b.reorderChildren('actorA', 'c1', 'chat-message', ['m2', 'm1'], { base: 0 })
+      expect(rStale.kind).toBe('conflict')
+      // 正确 base=1 → ok(bump→2)
+      const rOk = await b.reorderChildren('actorA', 'c1', 'chat-message', ['m1', 'm2'], { base: 1 })
+      expect(rOk.kind).toBe('ok')
+      if (rOk.kind === 'ok') expect(rOk.contentVersion).toBe(2)
     })
 
     it('P1-2:node 写 bump 共享 cv 不使 chat reorder 误 409(解耦);chat reorder 不 bump 共享 cv', async () => {
