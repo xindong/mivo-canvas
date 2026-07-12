@@ -1,43 +1,6 @@
-export type CanvasObjectCapability =
-  | 'selectable'
-  | 'movable'
-  | 'resizable'
-  | 'layerable'
-  | 'groupable'
-  | 'lockable'
-  | 'hideable'
-  | 'exportable'
-  | 'downloadOriginal'
-  | 'asset'
-  | 'imageAsset'
-  | 'text'
-  | 'frame'
-  | 'promptSource'
-  | 'aiReference'
-  | 'aiEditable'
-  | 'videoAsset'
-  | 'pdfAsset'
-  | 'markdownDoc'
-  | 'annotatable'
-  | 'markup'
-  | 'task'
-  | 'aiSlot'
-  | 'annotation'
-  | 'aiResult'
-
-export const baseObjectCapabilities: CanvasObjectCapability[] = [
-  'selectable',
-  'movable',
-  'resizable',
-  'layerable',
-  'groupable',
-  'lockable',
-  'hideable',
-  'exportable',
-]
-
-export const organizationCapabilities: CanvasObjectCapability[] = [
-  'selectable',
-  'lockable',
-  'hideable',
-]
+// Re-export shim — the implementation moved to src/model/nodeCapabilities.ts
+// (D-3: break canvasDocumentModel → canvas-UI value-import cycle, moved alongside
+// canvasNodeRegistry). This file keeps the historical import path stable so
+// existing src/canvas/nodeTypes consumers resolve unchanged. Prefer importing
+// from src/model directly for new code.
+export * from '../../model/nodeCapabilities'
