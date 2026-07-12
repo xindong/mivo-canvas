@@ -674,9 +674,9 @@ pg-suite 翻 required（2026-07-12，今天）。cutover 未执行。
 
 3. **PG 连接池稳定（30 天 0 次 `ECONNRESET`/pool exhaust/idle timeout）**（扫持久日志，**非** `--lines 1000`）
    ```bash
-   ssh "$MIVO_PROD_HOST" 'cat ~/.pm2/logs/mivo-canvas-error.log ~/.pm2/logs/mivo-canvas-error.log.* 2>/dev/null | grep -ciE "ECONNRESET|pool.*exhaust|idle.*timeout"'
+   ssh "$MIVO_PROD_HOST" 'cat ~/.pm2/logs/mivo-canvas-error.log ~/.pm2/logs/mivo-canvas-error.log.* 2>/dev/null | grep -ciE "ECONNRESET|pool.*exhaust|idle.*timeout" | { read n; [ "${n:-0}" -eq 0 ]; }'
    ```
-   样例（green）：`0`（sample log dry-run：含 `ECONNRESET` + `pool exhausted` 各 1 → 计数 `2`，证 grep 模式可判）。
+   样例：0 命中 → rc=0 绿；≥1 命中 → rc=1 红（r5 修剩余风险：原 `grep -ciE` 在 0 命中时 rc=1、有命中时 rc=0，rc 与健康度反相不能直接作 shell gate；改 `| { read n; [ "${n:-0}" -eq 0 ]; }` 捕获 count 显式断言 `==0`，rc 与门控语义一致）。dry-run sample log：含 `ECONNRESET`+`pool exhausted`+`idle timeout` 各 1（count=3）→ rc=1 红；全 clean / 空文件 → rc=0 绿。
    `maxConnections=10`（`pgConfig.ts:57-58`）；r2 原命令 `pm2 logs --lines 1000` 只取近若干小时，**证不了 30 天**，r3 改扫全部保留的 error log 文件（前置表 logrotate ≥30 天保证覆盖）。
 
 4. **backup+restore drill 窗口内 ≥ 1 次成功（业务行 + asset 可恢复）**——persist **不复用** kernel C-switch event（persist 无 C-switch PR；kernel event 核心身份字段 `cSwitchPrNumber` 对 persist 无意义，r5 改 D4-R5-7）。persist 单独定义 machine-readable 事件 `docs/decisions/persist-cutover-event.json` + 独立 closeout PR 合入 main 的 drill 报告 JSON。P0.2 drill 已验业务行 + asset 可恢复；此 event/schema/guard 把它机器可核验化。
