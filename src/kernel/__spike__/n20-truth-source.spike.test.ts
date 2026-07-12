@@ -1879,8 +1879,8 @@ describe('N2-0 返修 §1.2 cutover contract harness(R5 F4): flag on/off decoder
       const r = this.recs.get(nodeId)
       if (!r) return null
       // authoritative 全 record → 旧 shape body 直出(剥 revision/lastWriter 元数据,非从单个 delta 反演)
-      const { revision: _rev, lastWriter: _lw, ...legacy } = r
-      return structuredClone(legacy)
+      // 显式构造(非 rest 解构):eslint no-unused-vars 的 ignoreRestSiblings 默认 false,rest 前缀 _rev/_lw 会被报 unused
+      return structuredClone({ id: r.id, title: r.title, transform: r.transform })
     }
     get(nodeId: string): (LegacyBody & { revision: number; lastWriter: string }) | undefined {
       const r = this.recs.get(nodeId)
