@@ -82,6 +82,7 @@ export type UpsertChildResult =
   | { kind: 'precondition-required'; record: PersistRecord }
   | { kind: 'cross-canvas' } // 返修 #3:同 id 存在但属于另一 canvas → route 404(不 create,canvas_id 不可变)
   | { kind: 'reuse-conflict' } // N4:同 idem key 不同 fingerprint → route 422
+  | { kind: 'not-found' } // DP-6R P2-1:strict-update(chat PATCH)——actor bucket 无此 msgId/已删 → route 404 unknown-message(不许借 PATCH create)
 
 /** 幂等回放结果(返修 #10:fingerprint 校验)。 */
 export type IdempotentReplay =
@@ -93,7 +94,10 @@ export type ListResult = { records: PersistRecord[] }
 /**
  * 返修 N8/F5:重排结果。
  * - `ok`:orderedIds 与 live set 全等且唯一,重分配 orderKey,bump contentVersion+updatedAt。
- * - `conflict`:If-Match(contentVersion base)stale → 409(两并发一成一 409)。
+ *   **DP-6R P1-2**:type=chat-message 时,`contentVersion` 携带 per-actor×canvas **orderRevision**
+ *   (bump 后值),与共享 canvas contentVersion 解耦。
+ * - `conflict`:If-Match base stale → 409(两并发一成一 409)。chat-message 时 `currentContentVersion`
+ *   = chat orderRevision(非共享 cv);其余 type = canvas contentVersion。
  * - `precondition-required`:reserved(F5 base 必填,route 已对 missing If-Match 返 428;backend 不再触发此 variant,保留为防御型)。
  * - `bad`:orderedIds 与 live set 不全等(mismatch)或含重复(duplicate)→ 400。
  */
@@ -193,6 +197,8 @@ export interface PersistBackend {
       method: string
       resourceKind: string
       bodyFingerprint?: string
+      /** DP-6R P2-1:true → strict-update 原语:actor bucket 无此 id/已删 → not-found(不许借 PATCH create)。单原子实现,不许先 get 再 upsert(TOCTOU)。chat PATCH 路由置 true。 */
+      strictUpdate?: boolean
     },
   ): Promise<UpsertChildResult>
   /** 硬删子资源(物理移除,返修 #2:node/edge/anchor/chat-message 不软删)。canvas_id 校验。 */
@@ -201,6 +207,10 @@ export interface PersistBackend {
    * 返修 N8/F5:重排 canvas 下某 type 子资源顺序。
    * orderedIds 须与 live set 全等且唯一;**If-Match(contentVersion base)必填**(F5 seam 必填——
    * 不传 base 编译失败,见 contract test @ts-expect-error 互锁);stale → conflict;成功重分配 orderKey + bump contentVersion+updatedAt。
+   *
+   * **DP-6R P1-2**:type=chat-message 时,base = per-actor×canvas **orderRevision**(非共享 cv);
+   * 同事务 compare+bump——同 base 两并发一成一败;A/B(不同 actor)各自独立 cursor 互不冲突;
+   * node 写 bump 共享 cv 但不触 chat orderRevision → node 写不使 chat reorder 误 409。
    */
   reorderChildren(
     ownerId: string,
@@ -209,6 +219,24 @@ export interface PersistBackend {
     orderedIds: string[],
     opts: { base: Revision },
   ): Promise<ReorderResult>
+  /**
+   * DP-6R P1-2:读 per-actor×canvas chat collection 的 orderRevision(GET /api/canvas/:id/chat 用,
+   * 返 ListChatMessagesResponse.orderRevision;client 据此作 chat reorder 的 If-Match base)。缺省 0。
+   * 仅对 chat-message collection 有意义(ownerId=actor);其余 type 不调用。
+   */
+  getChatOrderRevision(ownerId: string, canvasId: string): Promise<Revision>
+
+  /**
+   * DP-6R P1-2(返修 R2-P1-2):原子读 per-actor×canvas chat collection 的 (messages, orderRevision) **对**。
+   * GET /api/canvas/:id/chat 用——messages 与 orderRevision 同一快照(memory 同步临界区无 await;PG 单事务
+   * REPEATABLE READ 一致 snapshot),消除 listByCanvas + getChatOrderRevision 两 await 间隙的 torn pair
+   * (旧 messages + 新 rev → client 下次 reorder 用新 base 配旧顺序被误接受,绕过乐观锁)。仅 chat-message 用。
+   */
+  listChatWithOrderRevision(
+    ownerId: string,
+    canvasId: string,
+    opts?: { includeDeleted?: boolean },
+  ): Promise<{ records: PersistRecord[]; orderRevision: Revision }>
 
   // ── 列表(返修 #6 ORDER BY orderKey;#8 枚举)──
   listByOwner(ownerId: string, type: PersistType, opts?: { includeDeleted?: boolean }): Promise<ListResult>
@@ -319,6 +347,12 @@ export class InMemoryPersistBackend implements PersistBackend {
   private readonly globalProjectOwners = new Map<string, string>()
   /** 返修 N7:canvas id 全局归属索引(id → ownerId)。授权 seam canAccessCanvas 跨 owner 查归属;跨 owner → 404。 */
   private readonly globalCanvasOwners = new Map<string, string>()
+  /**
+   * DP-6R P1-2:per-actor×canvas chat collection 独立乐观锁 cursor(orderRevision)。
+   * key = `${actor}::${canvasId}`;reorder 同事务 compare+bump;与共享 canvas contentVersion 解耦。
+   * 内存实现易失(与 InMemoryPersistBackend 整体一致);PG 实现持久化(chat_order_revisions 表)。
+   */
+  private readonly chatOrderRevisions = new Map<string, Revision>()
   /** additive(PG 落地后接口新增):内存 backend 立即就绪。 */
   readonly ready: Promise<void> = Promise.resolve()
 
@@ -372,6 +406,56 @@ export class InMemoryPersistBackend implements PersistBackend {
     const meta = this.find(ownerId, 'canvas', canvasId)
     if (!meta) return 0
     return asCanvasMeta(meta.payload)?.contentVersion ?? 0
+  }
+
+  /**
+   * DP-6R P1-2:读 per-actor×canvas chat collection orderRevision(缺省 0)。
+   * chat reorder 的 If-Match base = 此值(非共享 cv);GET /chat 返此值供 client 下次 reorder。
+   *
+   * R2-P1-1 契约:orderRevision 独立于 persist_records 软删状态——softDeleteCanvasTree/restoreCanvasTree
+   * 只标 canvas meta + chat-collection,**不动 chatOrderRevisions**(memory) / chat_order_revisions(PG)。
+   * 故软删/恢复 orderRevision 保留不复位(防 ABA:不回 0,使软删前的 stale base=0 在 restore 后仍 conflict,
+   * 不复活)。仅 __reset(测试清理)清零。双后端契约测试钉死此行为(见 backend.contract.dual.test.ts)。
+   */
+  private chatOrderRevision(ownerId: string, canvasId: string): Revision {
+    return this.chatOrderRevisions.get(`${ownerId}::${canvasId}`) ?? 0
+  }
+
+  /** DP-6R P1-2:bump per-actor×canvas chat orderRevision(+1);返新值。reorder 成功后调用。 */
+  private bumpChatOrderRevision(ownerId: string, canvasId: string): Revision {
+    const key = `${ownerId}::${canvasId}`
+    const next = (this.chatOrderRevisions.get(key) ?? 0) + 1
+    this.chatOrderRevisions.set(key, next)
+    return next
+  }
+
+  /** DP-6R P1-2:GET /chat 用——读 actor×canvas chat collection orderRevision。 */
+  async getChatOrderRevision(ownerId: string, canvasId: string): Promise<Revision> {
+    return this.chatOrderRevision(ownerId, canvasId)
+  }
+
+  /**
+   * DP-6R P1-2(返修 R2-P1-2):原子读 (messages, orderRevision) 对。
+   * 同步临界区——collect chat-message records 与读 orderRevision 之间无 await:JS 单线程下 microtask
+   * (并发 reorder)无法在两读之间插入,torn pair(旧 messages + 新 rev)不可能。与 PG 单事务 REPEATABLE READ 等价。
+   */
+  async listChatWithOrderRevision(
+    ownerId: string,
+    canvasId: string,
+    opts: { includeDeleted?: boolean } = {},
+  ): Promise<{ records: PersistRecord[]; orderRevision: Revision }> {
+    const include = opts.includeDeleted ?? false
+    const out: PersistRecord[] = []
+    for (const r of this.bucket(ownerId).values()) {
+      if (r.type !== 'chat-message') continue
+      if (r.canvasId !== canvasId) continue
+      if (!include && r.isDeleted) continue
+      out.push(clone(r))
+    }
+    out.sort((a, b) => a.orderKey - b.orderKey || (a.createdAt < b.createdAt ? -1 : 1))
+    // 同 snapshot:无 await 让出点,rev 与 messages 必自洽。
+    const orderRevision = this.chatOrderRevision(ownerId, canvasId)
+    return { records: out, orderRevision }
   }
 
   async get(ownerId: string, type: PersistType, id: string): Promise<GetResult> {
@@ -739,7 +823,8 @@ export class InMemoryPersistBackend implements PersistBackend {
               fingerprint: opts.bodyFingerprint,
             }
             this.bucket(ownerId).set(entry.envelopeKey, restored)
-            this.bumpCanvasContentVersion(ownerId, canvasId)
+            // DP-6R:chat-message 是 per-actor 私有,不 bump 共享 canvas contentVersion。
+            if (type !== 'chat-message') this.bumpCanvasContentVersion(ownerId, canvasId)
             return { kind: 'restored', record: clone(restored) }
           }
           return { kind: 'existing', record: clone(r) }
@@ -769,7 +854,8 @@ export class InMemoryPersistBackend implements PersistBackend {
       }
       this.bucket(ownerId).set(recordKey(ownerId, type, id), restored)
       this.setIdemIndex(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, recordKey(ownerId, type, id), opts.bodyFingerprint ?? '')
-      this.bumpCanvasContentVersion(ownerId, canvasId)
+      // DP-6R:chat-message per-actor 私有,不 bump 共享 canvas contentVersion。
+      if (type !== 'chat-message') this.bumpCanvasContentVersion(ownerId, canvasId)
       return { kind: 'restored', record: clone(restored) }
     }
     // 不存在 → created(orderKey 分配,返修 #6)。
@@ -791,7 +877,8 @@ export class InMemoryPersistBackend implements PersistBackend {
     }
     this.bucket(ownerId).set(recordKey(ownerId, type, id), created)
     this.setIdemIndex(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, recordKey(ownerId, type, id), opts.bodyFingerprint ?? '')
-    this.bumpCanvasContentVersion(ownerId, canvasId)
+    // DP-6R:chat-message per-actor 私有,不 bump 共享 canvas contentVersion。
+    if (type !== 'chat-message') this.bumpCanvasContentVersion(ownerId, canvasId)
     return { kind: 'created', record: clone(created) }
   }
 
@@ -921,6 +1008,7 @@ export class InMemoryPersistBackend implements PersistBackend {
       method: string
       resourceKind: string
       bodyFingerprint?: string
+      strictUpdate?: boolean
     },
   ): Promise<UpsertChildResult> {
     if (opts.idempotencyKey) {
@@ -941,6 +1029,12 @@ export class InMemoryPersistBackend implements PersistBackend {
     if (existing && existing.canvasId !== canvasId) {
       // 返修 #3:同 id 存在但属于另一 canvas → cross-canvas(canvas_id 不可变,不 create)。
       return { kind: 'cross-canvas' }
+    }
+    // DP-6R P2-1:strict-update(chat PATCH)——actor bucket 无此 id/已删 → not-found(route 404 unknown-message),
+    // 不许借 PATCH create 己方副本(POST 是唯一 create 入口)。find + 判定在同一同步流程,无 get-then-upsert TOCTOU;
+    // PG 侧事务内 SELECT + 拒绝(不走 create 的 INSERT ON CONFLICT),同样无 TOCTOU。
+    if (opts.strictUpdate && (!existing || existing.isDeleted)) {
+      return { kind: 'not-found' }
     }
     // !existing → create(revision max(0,base),返修 #5;orderKey 分配,返修 #6)。
     if (!existing || existing.isDeleted) {
@@ -964,7 +1058,8 @@ export class InMemoryPersistBackend implements PersistBackend {
       }
       this.bucket(ownerId).set(recordKey(ownerId, type, id), created)
       this.setIdemIndex(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, recordKey(ownerId, type, id), opts.bodyFingerprint ?? '')
-      this.bumpCanvasContentVersion(ownerId, canvasId) // 返修 #5:content bump
+      // DP-6R:chat-message per-actor 私有,不 bump 共享 canvas contentVersion(node/edge/anchor 仍 bump)。
+      if (type !== 'chat-message') this.bumpCanvasContentVersion(ownerId, canvasId)
       return { kind: 'created', record: clone(created) }
     }
     // existing & !deleted & canvas_id 匹配 → 返修 #4:缺 base → precondition-required(428)。
@@ -987,7 +1082,8 @@ export class InMemoryPersistBackend implements PersistBackend {
     }
     this.bucket(ownerId).set(recordKey(ownerId, type, id), updated)
     this.setIdemIndex(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, recordKey(ownerId, type, id), opts.bodyFingerprint ?? '')
-    this.bumpCanvasContentVersion(ownerId, canvasId)
+    // DP-6R:chat-message per-actor 私有,不 bump 共享 canvas contentVersion。
+    if (type !== 'chat-message') this.bumpCanvasContentVersion(ownerId, canvasId)
     return { kind: 'updated', record: clone(updated) }
   }
 
@@ -995,7 +1091,8 @@ export class InMemoryPersistBackend implements PersistBackend {
     const r = this.find(ownerId, type, id)
     if (!r || r.canvasId !== canvasId) return { deleted: false } // 返修 #3:cross-canvas/missing → 404
     this.bucket(ownerId).delete(recordKey(ownerId, type, id))
-    this.bumpCanvasContentVersion(ownerId, canvasId) // 返修 #5:content bump
+    // DP-6R:chat-message per-actor 私有,不 bump 共享 canvas contentVersion(node/edge/anchor 硬删仍 bump)。
+    if (type !== 'chat-message') this.bumpCanvasContentVersion(ownerId, canvasId)
     return { deleted: true }
   }
 
@@ -1023,7 +1120,38 @@ export class InMemoryPersistBackend implements PersistBackend {
     for (const id of orderedIds) {
       if (!liveIds.has(id)) return { kind: 'bad', reason: 'mismatch' }
     }
-    // N8/F5:If-Match(contentVersion base)必填——stale → 409(两并发一成一 409)。F5 删无 base 分支(base 必填,route 已 428 missing)。
+    // DP-6R P1-2:chat-message 用 per-actor×canvas **独立 orderRevision** 做 If-Match base(非共享 cv)。
+    // 同事务 compare+bump——同 base 两并发一成一败;A/B 不同 actor 各自独立 cursor 互不冲突;
+    // node 写 bump 共享 cv 但不触 chat orderRevision → node 写不使 chat reorder 误 409。chat 不 bump 共享 cv。
+    if (type === 'chat-message') {
+      const current = this.chatOrderRevision(ownerId, canvasId)
+      if (opts.base !== current) {
+        return { kind: 'conflict', currentContentVersion: current }
+      }
+      // 原子:快照 children → 重分配 orderKey;失败回滚。chat 不 bump 共享 cv,只 bump orderRevision。
+      const chatSnapshot: Array<[string, PersistRecord]> = []
+      for (const id of orderedIds) {
+        const key = recordKey(ownerId, type, id)
+        const r = b.get(key)
+        if (r) chatSnapshot.push([key, clone(r)])
+      }
+      try {
+        let n = 0
+        for (const id of orderedIds) {
+          const key = recordKey(ownerId, type, id)
+          const r = b.get(key)
+          if (!r) continue
+          b.set(key, { ...clone(r), orderKey: n, updatedAt: nowIso() })
+          n++
+        }
+        const newRev = this.bumpChatOrderRevision(ownerId, canvasId)
+        return { kind: 'ok', reordered: n, contentVersion: newRev }
+      } catch (err) {
+        for (const [key, rec] of chatSnapshot) b.set(key, rec)
+        throw err
+      }
+    }
+    // N8/F5:node/edge/anchor——If-Match base = 共享 canvas contentVersion;stale → 409(两并发一成一 409)。
     const currentCv = this.canvasContentVersion(ownerId, canvasId)
     if (opts.base !== currentCv) {
       return { kind: 'conflict', currentContentVersion: currentCv }
@@ -1249,6 +1377,7 @@ export class InMemoryPersistBackend implements PersistBackend {
     this.idempotencyIndex.clear()
     this.globalProjectOwners.clear()
     this.globalCanvasOwners.clear()
+    this.chatOrderRevisions.clear()
   }
 
   /**

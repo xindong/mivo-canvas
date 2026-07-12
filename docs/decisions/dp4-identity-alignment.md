@@ -100,6 +100,22 @@ export const resolveActor = (c: Context): string => {
 
 **载体一致性不因 fallback 受损**:fallback 仅是 dev/测试过渡;生产网关注入后 carrier = username = §13.5 maker user id,与本 §2 判定一致。
 
+### 3.1 G2.2 换键迁移必须显式覆盖 legacy chat rows(DP-6R P1-3 要求)
+
+G2.2(fingerprint→SSO username 换键)迁移 `persist_records.owner_id` 从指纹→username 时,**事务映射必须显式覆盖 legacy chat-message rows**,不得只迁 node/edge/anchor/canvas/project。
+
+**理由(DP-6R per-actor 私有后)**:chat-message envelope.ownerId = **actor**(写入者本人),PK=(actor,'chat-message',msgId)。若换键只迁共享子资源(node/edge/anchor under canvas owner)而漏 chat-message:
+- owner 的 actor key 从指纹变 username 后,owner_id 仍是旧指纹的 chat-message rows **不在新 actor key 名下** → owner GET /chat 读不到自己历史对话(数据孤儿);
+- 成员侧无影响(per-actor 私有,成员本就只有自己的),但 owner 自身丢失历史 chat。
+
+**事务映射要求(实现属 G2.2,本处只钉要求)**:
+1. 同事务 `UPDATE persist_records SET owner_id=<username> WHERE owner_id=<fingerprint> AND type='chat-message'`(连同 node/edge/anchor/canvas/project/chat-collection 的 owner_id 同事务改);
+2. `chat_order_revisions.actor_id` 同步改(migration 004 表,actor_id=actor;换键须覆盖,否则 owner 的 chat orderRevision cursor 留在旧 actor_id 下);
+3. **fail-closed audit**(与 migration 003 注释一致,见 t1.6-cutover-runbook §G2.2):换键前断言所有 legacy chat-message.owner_id === 当时 canvas owner(即 owner 自己的指纹),异常行(成员名下不应有的 chat)no-go——不得静默 carry over,否则换键后归属错乱。
+4. `idempotency_index.envelope_owner` 同步改(幂等 replay 指向新 owner)。
+
+验收:换键后 owner GET /chat 仍见全部历史 chat;`chat_order_revisions` 按 username 查得;幂等 replay 不串。
+
 ## 4. 可信 header 契约(deployment 依赖,ops/lead 落地)+ 服务器侧防伪造
 
 | 项 | 约定 |

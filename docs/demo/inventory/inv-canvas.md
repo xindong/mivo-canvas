@@ -59,7 +59,7 @@
 - 依赖数据流：`useResolvedAssetUrl(node.assetUrl)`；`renderKindForNode`；`ImageMaskEditOverlay`；`MarkdownPreview`；文本几何默认值。
 - 相关功能闭环状态：主渲染闭环完成；mask overlay 生命周期条件明确；markdown auto-measure 和 video/pdf 展示本次未验证。
 
-### `src/canvas/nodeTypes/canvasNodeRegistry.ts`
+### `src/model/canvasNodeRegistry.ts`
 
 - 职责：节点类型注册表，定义 node type 到 render kind、默认尺寸、import behavior、capabilities 的映射。
 - 关键导出/props/事件：导出 `canvasNodeRegistry`、`nodeTypeDefinitionFor`、`nodeDefinitionFor`、`capabilitiesForNode`、`renderKindForNode`、`defaultSizeForNodeType`、`importBehaviorForNodeType`、`isCanvasTextNode`、`isCanvasSectionNode`。
@@ -179,7 +179,7 @@
 - 依赖数据流：被 `canvasInteraction.ts` 使用，再由 controller 渲染 snap guides。
 - 相关功能闭环状态：吸附基础完成；未单测验证极端重叠/大尺寸边界。
 
-### `src/canvas/connectorGeometry.ts`
+### `src/model/connectorGeometry.ts`
 
 - 职责：markup arrow/line 和节点之间的 connector snap/binding 几何。
 - 关键导出/props/事件：导出 connector anchor 列表、阈值、`isConnectorNode`、`isConnectableNode`、`connectorAnchorPointFor`、`connectorBindingPointFor`、`nearestConnectorBindingForPoint`。
