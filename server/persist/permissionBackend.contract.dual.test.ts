@@ -17,6 +17,30 @@ import {
   COMPENSATION_MAX_SWEEP_ATTEMPTS,
 } from '../lib/permissions'
 import { PgPermissionBackend } from './pgPermissionBackend'
+import { Pool } from 'pg'
+
+// A8②-3 独立隔离库(与 backend.pg 的 mivocanvas_unit 分离)。ensurePermDb 镜像 backend.pg.test.ts
+// 的 ensureUnitDb:本地跑 MIVO_PG_TEST=1 单文件时 auto-create 库(防"库不存在"连接失败);CI 由 psql 步预建。
+const permDbName = () => process.env.MIVO_PG_UNIT_DB_PERM || 'mivocanvas_unit_perm'
+async function ensurePermDb(): Promise<void> {
+  const cfg = {
+    host: process.env.MIVO_PG_HOST || '127.0.0.1',
+    port: Number(process.env.MIVO_PG_PORT || 55443),
+    user: process.env.MIVO_PG_USER || 'mivo',
+    password: process.env.MIVO_PG_PASSWORD || 'mivo-test-no-password',
+  }
+  const admin = new Pool({ ...cfg, database: 'postgres', max: 1 })
+  try {
+    const res = await admin.query('SELECT 1 FROM pg_database WHERE datname = $1', [permDbName()])
+    if (res.rowCount === 0) {
+      const dbName = String(permDbName()).replace(/"/g, '')
+      await admin.query(`CREATE DATABASE "${dbName}"`)
+    }
+  } finally {
+    await admin.end()
+  }
+}
+
 
 // ── 共享纯契约套件(makeBackend 返 fresh/singleton;resetBackend 清状态;seedProject 供 PG FK;setLinkRevokedAt 测 30 天窗)──
 const runPermissionBackendContractSuite = (
@@ -665,10 +689,15 @@ let pgPermBackend: PgPermissionBackend | undefined
 
 ;(PG_TEST_ENABLED ? describe : describe.skip)('PG PermissionBackend(双后端等价性)', () => {
   beforeAll(async () => {
+    await ensurePermDb() // A8②-3:auto-create mivocanvas_unit_perm(本地单文件跑;CI 已预建,幂等)
     pgPermBackend = new PgPermissionBackend({
       host: process.env.MIVO_PG_HOST || '127.0.0.1',
       port: Number(process.env.MIVO_PG_PORT || 55443),
-      database: process.env.MIVO_PG_UNIT_DB || 'mivocanvas_unit',
+      // A8②-3 独立隔离库 mivocanvas_unit_perm(与 backend.pg 的 mivocanvas_unit 分离)。
+      // backend.pg.test.ts:1706 调 __dropAllTables() —— 因 permission 表 FK→projects,drop 须先
+      // 清 share_links/project_members/share_link_compensations + kysely_migration 追踪表,共库会核爆
+      // permission 套件;独立库免疫(本套件 migrate() 自带全量 shared migrations,可 fresh 起库)。
+      database: permDbName(),
       user: process.env.MIVO_PG_USER || 'mivo',
       password: process.env.MIVO_PG_PASSWORD || 'mivo-test-no-password',
       maxConnections: 5,
