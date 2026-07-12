@@ -128,7 +128,7 @@ npm test -- src/lib/serverPersistAdapter.contract.test.ts server/persist/backend
 **v1→v2 修正(P1-4)**:v1 同时写"整串 LWW 后写 wins/revision 不拒写"与"409 surfacing",**矛盾**;且仅凭"canvas 文本非 Google Docs"断言同刻并发"罕见"——**markdown 是正式节点类型**(`CanvasNodeView.tsx:443-531` 全文渲染),不能仅凭"罕见"断言。**二选一写死**:
 
 - **A) same-field stale → 409/field-conflict + 用户选 reload/force**:**否决**。与 gate4 `G4-4` "revision 不参与 LWW 拒写"(base 落后不同字段仍接受)矛盾——同字段就 409、不同字段就接受,语义分裂;且 markdown 同编会频繁 409 阻断,反画布交互直觉。
-- **B) 始终 LWW 200 + SSE `overwritten` 事件 + 短期历史恢复**:**推荐 ★**。与 `G4-4` 自洽(revision 从不拒写,只 surfacing);后写者不阻断、前写者知情(`overwritten` 含 historicalValue/byActor/currentRevision)+ 可一键 `restore`(发 historicalValue,新 seq,后写 wins);Figma 本身亦 LWW + 不阻断。
+- **B) 始终 LWW 200 + SSE `overwritten` 事件 + 短期历史恢复**:**推荐 ●**(T1-1~5 契约探针,自建 `TextLwwWithOverwrite`,非真实库对照;与真实 Yjs 同矩阵对照未做,R2-7 诚实化)。与 `G4-4` 自洽(revision 从不拒写,只 surfacing);后写者不阻断、前写者知情(`overwritten` 含 historicalValue/byActor/currentRevision)+ 可一键 `restore`(发 historicalValue,新 seq,后写 wins);Figma 本身亦 LWW + 不阻断。
 
 **T1 探针实证**(●集成):
 - `T1-1`:B 后写 LWW 200 wins + A 收 `overwritten`(historicalValue=A, byActor=bob, currentRevision=rev0+2)——**败方知情,非 v1 静默覆盖**。
@@ -289,8 +289,8 @@ npm test -- src/lib/serverPersistAdapter.contract.test.ts server/persist/backend
 | Gate2 PoC naive undo "A inverse 后发覆盖 B" | 条件逆运算:A effect 被 B 取代时 skip(remote wins),对齐真 Yjs | `M2`(★真 Y.UndoManager 对照) |
 | Gate2 PoC "undo 返回字符串占位,从不 applyOp" | ConditionalUndoStack 保存 oldValue,undo() 发条件逆运算到服务端 | `M1-M6`(★真 Yjs 同矩阵) |
 | Gate5 G5-1 "SSE skeleton(内存 callback)" | 真实 Hono SSE route 集成(content-type/heartbeat/since/revoke/authz/slow-consumer) | `5-1~6`(●真实集成) |
-| Gate7 "pullSince(0) 静默返 50 条(丢前 950)" | logFloor + gap 协议显式告警客户端 reset | `G7-hard-1`(★) |
-| Gate7 "removeMember 只删内存 callback" | post-revoke applyOpAuthz → forbidden(不只断流) | `G7-hard-3`(★) |
+| Gate7 "pullSince(0) 静默返 50 条(丢前 950)" | logFloor + gap 协议显式告警客户端 reset | `G7-hard-1`(●) |
+| Gate7 "removeMember 只删内存 callback" | post-revoke applyOpAuthz → forbidden(不只断流) | `G7-hard-3`(●) |
 | Gate7 "Y.Doc 全 op log 重放" | 增量 update 不重放全史(Yjs 有 GC) | `G7-hard-4`(★真 encodeStateAsUpdate) |
 | §10 FieldOp body 携 actor/recordId/baseRevision | 三层信任边界:body 不信,authz/path/If-Match 覆盖 | `S10-2`(●) |
 | §10 opId body+header 双载体 | opId 单一权威载体(idempotency-key header) | `S10-2`(●) |
@@ -350,9 +350,9 @@ npm test -- src/lib/serverPersistAdapter.contract.test.ts server/persist/backend
 | G3-real-1 单 Y.Doc doc.transact 原子(intra-doc) | P1-2 | 3 | `!has('n1') && !has('e1') && has('e2')` | ★ |
 | G3-real-2 delete-vs-update 真实 merge(不复活) | P1-2 | 3 | `!has('n1')`(两 doc) | ★ |
 | G3-real-3 跨 Y.Doc 无共享事务(非原子) | P1-2 | 3 | `!has(n1,A) && has(e1,B)` | ★ |
-| G7-hard-1 logFloor + gap 协议 | P2-7 | 7 | `gap===true(since<floor) && gap===false(since>=floor)` | ★ |
-| G7-hard-2 恢复等价(live vs 崩溃重连) | P2-7 | 7 | `bN1.revision===aN1.revision` | ★ |
-| G7-hard-3 post-revoke 写拒绝 | P2-7 | 7 | `kind==='forbidden'` | ★ |
+| G7-hard-1 logFloor + gap 协议 | P2-7 | 7 | `gap===true(since<floor) && gap===false(since>=floor)` | ● |
+| G7-hard-2 恢复等价(live vs 崩溃重连) | P2-7 | 7 | `bN1.revision===aN1.revision` | ● |
+| G7-hard-3 post-revoke 写拒绝 | P2-7 | 7 | `kind==='forbidden'` | ● |
 | G7-hard-4 bytes 对比(Yjs 有 GC 更小) | P2-7 | 7 | `figmaCompressed<figmaRaw && yjsNoGc>yjsWithGc` | ★ |
 | S10-1 setByPath 拒原型污染 | P1-3 | §10 | `toThrow(/forbidden path segment/)` | ● |
 | S10-2 三层信任边界 trustify | P1-3 | §10 | `actor==='alice' && recordId==='n1' && base===0`(不信 body) | ● |
