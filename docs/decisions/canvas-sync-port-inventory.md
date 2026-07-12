@@ -1,7 +1,7 @@
 # 画布 transport-neutral port + 两案契约 inventory(G1-b)
 
 > 状态:**契约冻结 + inventory,不实现 transport**(G1-b,N2-0 决议前)。
-> 日期:2026-07-12(R1 返修:纠 Yjs 五维事实 + F1 字段级意图 + F3 终态拒绝;R2 返修:封死 clobber + create→edit 因果 + 404-delete authoritative-load cursor,见 §8;R3 返修:schema-aware 容器/数组封死 + retryable/conflict 所有权 + per-key 状态机 + delete race 全封,见 §9)。
+> 日期:2026-07-12(R1 返修:纠 Yjs 五维事实 + F1 字段级意图 + F3 终态拒绝;R2 返修:封死 clobber + create→edit 因果 + 404-delete authoritative-load cursor,见 §8;R3 返修:schema-aware 容器/数组封死 + retryable/conflict 所有权 + per-key 状态机 + delete race 全封,见 §9;R4 返修:classifier 必填(安全入口不静默降级)+ async submitChange 状态机(删 ackCreate,caller-owned retry/rebase 经公开入口闭环),见 §10;旧 R2/R3 sync submit/ackCreate 与可选 classifier 段已被 R4 supersede)。
 > 范围:计划 `docs/plan/remaining-tasks-cutover-plan.md` §4 Gate1 G1-b + §10 风险表「画布 port 泄漏候选协议细节」。
 > 上游真相源:`docs/plan/remaining-tasks-cutover-plan.md` §4/§8(N2-0 决策龙头)、`docs/decisions/platform-architecture-2026-07-07.md`(§6 CRDT-ready、§13.5 per-record revision)、`docs/decisions/record-schema.md`(K40 canonical)、`shared/persist-contract.ts`(现有 Figma-case wire 契约)、`src/lib/serverPersistAdapter.ts`(现有 Figma-case adapter 占位)、`node_modules/yjs/dist/src/utils/encoding.d.ts`(Yjs state-vector 真实签名)、`src/kernel/__spike__/yjs-mapping.spike.test.ts`(Yjs 映射 spike 实证)、`src/lib/writeRetryQueue.ts`(WriteOutcome 8 态先例)。
 > 源码产物(本批):`src/lib/canvasSyncPort.ts`(port 接口 + 中性游标 + 字段级意图)、`src/lib/canvasSyncPort.contract.test.ts`(红线自证 + F1/F3 契约)。
@@ -33,16 +33,20 @@ type SnapshotCursor = unknown & { readonly __brand: 'SnapshotCursor' } // brande
 
 // 返修 F1:全量 upsert → create(全量)+ edit(字段级意图)
 // 返修 R2-P1-1:FieldPath 改非空 tuple(封死空路径 clobber)+ validateFieldIntent 拒非原子 set(封死整子树 clobber)
-// 返修 R3-P1-1:加 schema-aware 分类(可选 FieldSchemaClassifier),拒 delete-field 到 container / set 原子值到容器路径
+// 返修 R3-P1-1:加 schema-aware 分类(FieldSchemaClassifier),拒 delete-field 到 container / set 原子值到容器路径
+// 返修 R4-P1-1(当前态,见 §10.1):classifier 从可选改**必填**(安全入口不可静默降级);结构性校验拆到显式命名的低层 validateFieldIntentStructural
 type FieldPath = readonly [string | number, ...(string | number)[]]   // 非空 tuple,域语义路径,非 RFC6902 JSON-Pointer
 type FieldPathTarget = 'leaf' | 'container' | 'array-element'           // R3-P1-1:路径终点类别(标量/对象容器/数组元素)
-type FieldSchemaClassifier = (fieldPath: FieldPath) => FieldPathTarget   // R3-P1-1:可选,调用方/adapter 提供(port 对 schema 不透明)
+type FieldSchemaClassifier = (fieldPath: FieldPath) => FieldPathTarget   // R4-P1-1:必填(安全入口),调用方/adapter 提供(port 对 schema 不透明)
 type FieldIntent =
   | { op: 'set'; fieldPath: FieldPath; value: unknown }
   | { op: 'delete-field'; fieldPath: FieldPath }
-// validateFieldIntent(intent, classify?):域级 validator(port 冻结,非 transport impl)——
+// validateFieldIntentStructural(intent):低层结构性 validator(**非安全入口**)——
 //   拒空路径 / 拒非原子 set(整对象·整数组 clobber 封死)/ 拒数组元素 delete-field(last segment number,by-stable-id deferred)。
-//   有 classifier 时再拒:delete-field 到 container(整子树删)、set 原子值到 container/array-element 路径(整子树替换)。
+//   不依赖 schema,故**不拒** schema-aware clobber(container/array-element 路径上 leaf op)——调用方明示用 structural 即知无 schema 防线。
+// validateFieldIntent(intent, classify: FieldSchemaClassifier):**安全入口**域级 validator(port 冻结,非 transport impl)——
+//   先过 validateFieldIntentStructural,再以**必填** classifier 拒:delete-field 到 container(整子树删)、set 原子值到 container/array-element 路径(整子树替换)。
+//   classifier 省略或传非函数 = 编译期 tsc error + 运行时显式抛错(双重不可绕过);安全入口永不静默降级到无 schema 校验。
 //   FieldIntentViolation 枚举:empty-field-path / non-atomic-parent-set / array-element-structure-delete /
 //   container-delete-field / atomic-value-to-container-path(R3-P1-1 扩 2→5 key)。
 //   数组结构编辑(增/删元素)不在 FieldIntent,deferred to N2-0 §10.1(与 n20 R2-4 三类数组方向对齐);数组叶子编辑(['fills',0,'color'])仍支持。
@@ -212,7 +216,7 @@ port 的中性设计保证 N2-0 任一决议后,G1-c 只需落一个 adapter,另
 - [x] `src/lib/canvasSyncPort.ts` — port 接口 + 中性游标 + **返修 F1 字段级意图**(create/edit 拆分 + FieldPath/FieldIntent)+ **返修 F3 终态拒绝**(RejectionReason + accepted 权威 ack)+ 占位 fail-visible impl(不接线 transport)。**返修 R2**:FieldPath 非空 tuple + `validateFieldIntent` 域级 validator(封死非原子 set clobber)+ `dependency-failed` reason + submitChange 因果/authoritative-load 契约 doc。
 - [x] `src/lib/canvasSyncPort.contract.test.ts` — **7 处 `@ts-expect-error`** 红线自证(6 候选独占形状互锁 + 1 R2-P1-1 空路径 tuple 互锁)+ 接口面正向断言 + **F1 field-intent 无损并发契约**(同 record 不同字段双留 / 未编辑字段不提交 / 嵌套叶子不整树替换 / reorder 有意图 / 数组下标定点)+ **F3 终态拒绝 outcome 映射契约**(401/403/revoke/400/413/422→rejected;409→conflict;5xx/408/429→retryable;200→accepted;无终态误重试/无假成功)+ **R2-P1-1 负例**(空路径/整对象/整数组 set 被拒)+ **A→B/B→A 双向对称** + **R2-P1-2 per-record FIFO 因果参考 impl**(pending create hold edit / create-fail→dependency-failed / 真·unknown→not-found 边界分开)+ **R2-P1-3 delete authoritative-load**(204/404 缺 cursor 不构造 accepted / 经 load 取真实 cursor / load null→rejected) + 占位 reject 运行时验。
 - [x] `src/kernel/__spike__/yjs-mapping.spike.test.ts` — **R2-P1-1 真 Y.Doc 验证**(嵌套叶子 set / 数组叶子 set / A↔B 双向对称收敛 / 整对象·整数组 set 被 validator 拒)——复用 spike encode/decode codec,测试在 spike 侧保 yjs 不进生产 bundle。
-- [x] 本 inventory 文档(**返修 F2 纠 Yjs 五维事实** + 反映 F1/F3 类型 + **返修 R2**:Y.Map/Y.Array 分开 / 因果契约 / authoritative-load cursor / @ts-expect-error=7)。
+- [x] 本 inventory 文档(**返修 F2 纠 Yjs 五维事实** + 反映 F1/F3 类型 + **返修 R2**:Y.Map/Y.Array 分开 / 因果契约 / authoritative-load cursor / @ts-expect-error=7 + **返修 R4**:§1 classifier 必填 + structural 低层分层 / §8.2·§9.2 sync submit·ackCreate 段标 R4 supersede / §10 R4 变更段逐项映射两条 finding)。
 - [ ] G1-c 实现(N2-0 决议后):落**唯一** adapter,Figma 或 Yjs,另一模型零代码。
 - 红线 grep 自证结果:见 §7.5 + §8.4 回报。
 
@@ -334,9 +338,11 @@ port 的中性设计保证 N2-0 任一决议后,G1-c 只需落一个 adapter,另
 3. 边界分开:pending-local-create 的 edit **不**走 rejected(not-found)——经 FIFO hold,create ack 后 flush;真·不存在 record(从未创建/已被他端删)的 edit 仍 rejected(not-found)——两边界分开断言。
 4. create 终态失败(create rejected/conflict/retryable 中的 rejected)→ 依赖 edit surface 为 rejected(**dependency-failed**,新增 RejectionReason)——非 not-found(record 不是"不存在"而是"创建失败"),非重试(重试须先修 create)。
 
-**落地**:submitChange doc 冻结 FIFO 契约;`RejectionReason` 加 `dependency-failed`;contract test 加 `FifoRecordPort` 参考 impl(transport 决定 create outcome,port hold 同 record edit/delete,ackCreate flush)。
+> **⚠ 已被 R4-P1-2 supersede(2026-07-12,见 §10.2)**:以下「落地」+「验收」段使用的 sync `ackCreate flush` / `ackCreate 后 transport 见 [create, edit]` 参考 impl 已被 R4-P1-2 改写为 async `submitChange(canvasId, change, base?)` 状态机(in-flight duplicate 直送 transport / awaiting-retry 经公开入口 retry / 终态才 settle held;删 `ackCreate` 不再重发旧 create)。本段保留作 R2-P1-2 历史回报,不再作为可执行契约;当前态见 §10.2 + §1 submitChange 签名。
 
-**验收**(contract 参考 impl):
+**落地**(已被 R4-P1-2 supersede):submitChange doc 冻结 FIFO 契约;`RejectionReason` 加 `dependency-failed`;contract test 加 `FifoRecordPort` 参考 impl(transport 决定 create outcome,port hold 同 record edit/delete,ackCreate flush)。
+
+**验收**(已被 R4-P1-2 supersede,contract 参考 impl):
 - edit 在 create pending 时被 HELD(transport 未见 edit);ackCreate 后 transport 见 [create, edit](create 先,edit 后);edit outcome accepted(非 not-found)。
 - create rejectCreates → 依赖 edit rejected(dependency-failed),非 not-found;edit 未进 transport。
 - 真·unknown record edit(无 pending create)→ rejected(not-found) 直送 transport(边界分开)。
@@ -383,7 +389,9 @@ port 的中性设计保证 N2-0 任一决议后,G1-c 只需落一个 adapter,另
 
 **问题核证**:R2 validator 只拦 `set` 非原子 value;delete-field 全放行——`delete ['transform']`(删整个 transform Y.Map = 吞并发 transform.y,clobber 换名重表达)、`delete ['fills']`(删整个 Y.Array)、`delete ['fills',0]`(用不稳定 index 表达声称 deferred 的数组 remove,与 n20 §10.1 by-stable-id 方向岔开)均放行;`set ['transform']=7`(原子值覆盖整个容器路径 = 整子树替换,坑7 的另一换名面)也放行。spike helper 数值末段直 `Y.Array.delete(index)`。
 
-**修法选择**:**schema-aware leaf/container/array-element 分类**(可选 `FieldSchemaClassifier`,port 对 schema 不透明故 classifier 由调用方/adapter 提供;不传时只结构性拒)。理由:
+> **⚠ 部分已被 R4-P1-1 supersede(2026-07-12,见 §10.1)**:本「修法选择」把 `FieldSchemaClassifier` 设为**可选**("不传时只结构性拒"),导致省略 classifier 时 `delete ['transform']`/`['fills']`/`set ['transform']=7` 等四负例原漏洞原样通过(安全入口静默降级)。R4-P1-1 已把 classifier 改为**必填**(安全入口不可静默降级:省略即 tsc error + 运行时防御兜 as-cast 旁路)+ 结构性校验拆到显式命名的低层 `validateFieldIntentStructural`(非安全入口)。本段保留作 R3-P1-1 历史回报;当前态见 §10.1 + §1 签名。下方理由 1/2 的结构性拒与 schema-aware 拒语义仍有效,仅 classifier 从可选变必填。
+
+**修法选择**(可选 classifier 已被 R4-P1-1 改必填 supersede):**schema-aware leaf/container/array-element 分类**(可选 `FieldSchemaClassifier`,port 对 schema 不透明故 classifier 由调用方/adapter 提供;不传时只结构性拒)。理由:
 1. 结构性拒(无需 schema):数组元素 delete-field(last segment 是 number)→ 拒 `array-element-structure-delete`(by-stable-id deferred to N2-0 §10.1,无需 schema 判)。
 2. schema-aware 拒(有 classifier):container 路径上的 `delete-field` → 拒 `container-delete-field`(整子树删 = clobber 重表达);container/array-element 路径上的 `set`(原子值)→ 拒 `atomic-value-to-container-path`(整子树替换)。
 3. 合法 optional leaf delete 放行(`delete ['title']`/`['locked']`——删叶子不吞兄弟字段);原子叶子 set 在 leaf 路径放行(`['transform','x']`/`['fills',0,'color']`)。
@@ -391,7 +399,7 @@ port 的中性设计保证 N2-0 任一决议后,G1-c 只需落一个 adapter,另
 
 **与 n20 §10.1 对齐点**(inventory §2.1 已注明 + 本 §9.1 再钉):数组结构编辑(增/删元素)非 FieldIntent 表达,deferred to N2-0 §10.1 by-stable-id(与 n20 R2-4「数组按 有 stable-id / 无 stable-id / primitive 三类冻结意图」方向对齐);G1-b 只拒(封死 clobber 换名面),不扩 op 面,N2-0 决议后由真 schema 驱动 classifier。
 
-**落地**:`validateFieldIntent` 加可选 `classify` 参数;新增 `FieldPathTarget`/`FieldSchemaClassifier` 类型;`FieldIntentViolation` 枚举扩 5 key;contract test +7 负例/正例(无 classifier 结构性拒 + 有 classifier schema-aware 拒 + 合法 leaf 放行);spike +3 真 Y.Doc 并发危害证(delete 整 transform 吞 transform.y=999 / delete fills[0] 按 index 删错元素 / validator 拒之有据)。
+**落地**(可选 classify 参数已被 R4-P1-1 改必填 + 拆 structural 低层 supersede,见 §10.1):`validateFieldIntent` 加可选 `classify` 参数;新增 `FieldPathTarget`/`FieldSchemaClassifier` 类型;`FieldIntentViolation` 枚举扩 5 key;contract test +7 负例/正例(无 classifier 结构性拒 + 有 classifier schema-aware 拒 + 合法 leaf 放行);spike +3 真 Y.Doc 并发危害证(delete 整 transform 吞 transform.y=999 / delete fills[0] 按 index 删错元素 / validator 拒之有据)。
 
 **验收**(contract + spike):
 - NEGATIVE:`delete ['transform']`/`['fills']`(container)被拒 `container-delete-field`;`delete ['fills',0]`(array-element)被拒 `array-element-structure-delete`;`set ['transform']=7`/`['fills',0]=7`(原子值-to-容器)被拒 `atomic-value-to-container-path`。
@@ -401,17 +409,21 @@ port 的中性设计保证 N2-0 任一决议后,G1-c 只需落一个 adapter,另
 
 ### 9.2 R3-P1-2 retryable/conflict 所有权 + per-key 状态机(FifoRecordPort 参考 impl)
 
-**问题核证**:doc(canvasSyncPort.ts submitChange doc)说 create conflict/retryable 时 held edits 继续等收敛;参考 impl `FifoRecordPort.ackCreate` 把所有 non-accepted(含 conflict/retryable)统一 dependency-failed + 清队列——与 doc 矛盾(conflict/retryable 时 held 被错误清空,edit 丢)。单槽 `pendingCreate`/`pendingRid`(非 per-(canvasId,recordId) Map),并发第二 create 覆盖第一(第一的 held 丢或被直送 404)。`submit(c)` 无 canvasId,异 canvas 同 recordId 碰撞。缺测试:retryable/conflict、同 ID 双 create、异 canvas 同 recordId、多 pending、最终 record state 断言。
+> **⚠ 以下「问题核证」描述的 R3 旧 sync `submit`/`ackCreate` 参考 impl bug(`FifoRecordPort.ackCreate` 把 conflict/retryable 统一 dependency-failed、单槽覆盖、`submit(c)` 无 canvasId)已被 R4-P1-2 改 async `submitChange` 状态机解决(删 `ackCreate`、per-key Map、caller 经公开入口 retry/rebase)。本段保留作 R3-P1-2 历史问题回报;当前态见 §10.2。**
 
-**修法选择**:**per-(canvasId,recordId) Map 状态机 + 仅终态 rejected 才 dependency-failed**(conflict/retryable 非终态 → held 继续等,不清队列)。理由:
+**问题核证**(描述的是 R3 时 sync ackCreate 参考 impl 的 bug,已被 R4-P1-2 解决,见 §10.2):doc(canvasSyncPort.ts submitChange doc)说 create conflict/retryable 时 held edits 继续等收敛;参考 impl `FifoRecordPort.ackCreate` 把所有 non-accepted(含 conflict/retryable)统一 dependency-failed + 清队列——与 doc 矛盾(conflict/retryable 时 held 被错误清空,edit 丢)。单槽 `pendingCreate`/`pendingRid`(非 per-(canvasId,recordId) Map),并发第二 create 覆盖第一(第一的 held 丢或被直送 404)。`submit(c)` 无 canvasId,异 canvas 同 recordId 碰撞。缺测试:retryable/conflict、同 ID 双 create、异 canvas 同 recordId、多 pending、最终 record state 断言。
+
+> **⚠ 部分已被 R4-P1-2 supersede(2026-07-12,见 §10.2)**:本「修法选择」+「落地」+「验收」段使用的 sync `submit(canvasId, c)` / `ackCreate(canvasId, rid)` 参考 impl 接口已被 R4-P1-2 改写为 async `submitChange(canvasId, change, base?)` 状态机(删 `ackCreate` 不再重发旧 create;caller 经公开入口交新 change/base 推进 pending entry;in-flight duplicate 直送 transport;awaiting-retry retry 经公开入口;终态才 settle held)。本段保留作 R3-P1-2 历史回报,不再作为可执行契约。下方理由 1(所有权冻结)、2(per-key Map)、3(create race 直送)的语义仍有效,仅 sync submit/ackCreate 接口签名被 async submitChange 取代;当前态见 §10.2 + §1 submitChange 签名。
+
+**修法选择**(sync submit/ackCreate 接口已被 R4-P1-2 改 async submitChange supersede):**per-(canvasId,recordId) Map 状态机 + 仅终态 rejected 才 dependency-failed**(conflict/retryable 非终态 → held 继续等,不清队列)。理由:
 1. 所有权冻结:caller 拿到 create 的 conflict/retryable outcome 后 **owns** retry/rebase——adapter **不**自动重试 create(自动重试会与 caller rebase 意图冲突);held edits 的 outcome 在 create 终态收敛后才 settle(accepted→flush / rejected→dependency-failed)。这是 doc 已有语义("create conflict/retryable 时 held edits 继续等 create 收敛")的 impl 补齐。
 2. per-key Map:`pending = Map<key, {create, held[]}>`,`key = ${canvasId}::${rid}`——并发第二 create(不同 rid)各自 pending 不 clobber;异 canvas 同 recordId 不碰撞。`submit(canvasId, c)`/`ackCreate(canvasId, rid)` 带 canvasId。
 3. 同 (canvas,rid) 待定 create 期间再来 create = create race:port 直送 transport(likely reuse-conflict 422),**不** clobber 第一个 pending 的 held。
 4. 仅终态 rejected → dependency-failed + 清 key(非 not-found);conflict/retryable → `held: []`(尚未 settle),key 保留,caller 可再次 ackCreate(create 经重试终态收敛后 held 才 settle)。
 
-**落地**:`FifoRecordPort` 改 per-key Map;`makeTransport` 加 `createOutcomes` 序列(建模 conflict→accept / retryable→accept 收敛);`submit`/`ackCreate` 带 canvasId;contract test 5 原 R2 测试签名更新 + 8 新矩阵测试。submitChange doc 加 R3-P1-2 所有权冻结段。
+**落地**(sync submit/ackCreate 接口已被 R4-P1-2 改 async submitChange supersede,见 §10.2):`FifoRecordPort` 改 per-key Map;`makeTransport` 加 `createOutcomes` 序列(建模 conflict→accept / retryable→accept 收敛);`submit`/`ackCreate` 带 canvasId;contract test 5 原 R2 测试签名更新 + 8 新矩阵测试。submitChange doc 加 R3-P1-2 所有权冻结段。
 
-**验收**(contract 矩阵):
+**验收**(sync submit/ackCreate 矩阵已被 R4-P1-2 async submitChange 矩阵 supersede,见 §10.2;contract 矩阵):
 - NEGATIVE:create conflict → held **不**清(`held: []`,非 dependency-failed);caller rebase 后再次 ackCreate → accepted → held flush(非丢)。
 - NEGATIVE:create retryable 跨多次重试 held 持续等(不清队列、不 dependency-fail);收敛 accepted 后 held flush;retryable→终态 rejected 时 held 才 dependency-failed(所有权:caller 放弃重试)。
 - NEGATIVE:并发第二 create(不同 rid)不 clobber 第一 pending 的 held(edit-n20 在 n21 create 后仍 held,n20 ack 后 flush accepted)。
@@ -443,3 +455,68 @@ port 的中性设计保证 N2-0 任一决议后,G1-c 只需落一个 adapter,另
 - `npx vitest run src/lib/canvasSyncPort.contract.test.ts src/kernel/__spike__/yjs-mapping.spike.test.ts` → PASS (95) FAIL (0)(含 R3 新增:R3-P1-1 +7 contract + 3 spike / R3-P1-2 +8 矩阵 / R3-P1-3 +2)。
 - 红线 grep §4.1-§4.4:非注释代码行零命中候选独占 DTO;`@ts-expect-error` directive 计数 = **7**(6 红线候选独占形状互锁不变 + 1 R2-P1-1 空路径 tuple 互锁,R3 不新增互锁)。
 - 通过项不回退:FieldPath 非空 tuple / 整对象·整数组 set 负例 / A↔B 真 Y.Doc 收敛 / 红线 0 候选独占 DTO / directive=7——R3 一字未动。
+
+---
+
+## 10. 第四轮返修回报(G1-b R4 REQUIRES_CHANGES,2026-07-12,见 REVIEW-FINDINGS-G1B-R4.md;R5 复审代码通过,仅 inventory 同步阻断)
+
+> 两条 P1(lead 复审判决)。R1/R2/R3 闭合项不动:FieldPath 非空 tuple / 整对象·整数组 set 负例 / A↔B 真 Y.Doc 收敛 / 红线 0 候选独占 DTO / `@ts-expect-error`=7——一字不回退。
+> **R4 supersede 范围**:R3-P1-1 的「可选 classifier」契约(§9.1 修法/落地)与 R3-P1-2 / R2-P1-2 的 sync `submit`/`ackCreate` 参考 impl(§9.2 / §8.2 落地/验收)已被 R4 改写——当前态以本 §10 + §1 签名为准;旧 R2/R3 段保留作历史回报,不再作为可执行契约。
+> **本轮提交**:`a4da409`(R4-P1-1 classifier 必填 + structural 拆分)+ `8789903`(R4-P1-2 async submitChange 状态机 + 删 ackCreate),均在 `src/lib/canvasSyncPort.ts` 及契约测试内;inventory 同步在本文件 §1 + 本 §10(本轮文档 commit)。
+
+### 10.1 R4-P1-1 schema classifier 必填(安全入口不可静默降级)
+
+**问题核证**:R3 把 `FieldSchemaClassifier` 设为可选("不传时只结构性拒"),导致省略 classifier 时 `delete ['transform']`/`['fills']`/`['fills',0]`/`set ['transform']=7` 四负例原漏洞原样通过(旧测试甚至钉死 `not.toThrow`)。安全入口静默降级到无 schema 校验,是 R3-P1-1 的核心残留洞。
+
+**修法选择**:**classifier 必填 + structural 拆到低层显式命名函数**(非保留可选 + 文档警告)。理由:
+1. 必填 = 编译期省略即 tsc error(类型签名 `classify: FieldSchemaClassifier` 非可选)+ 运行时防御兜 `as` cast 旁路(非函数 classifier → 显式抛 `validateFieldIntent: schema classifier is required`)。双重不可绕过,安全入口永不静默降级。
+2. 结构性校验(空路径 / 非原子 set / 数组元素 delete-field——均无需 schema)拆到显式命名的低层 `validateFieldIntentStructural`,供调用方明示"只要结构性校验"时使用;此函数**非安全入口**,不拒 schema-aware clobber(container/array-element 路径上 leaf op)。
+3. 安全入口 `validateFieldIntent(intent, classify)` = 先过 `validateFieldIntentStructural`,再以必填 classifier 拒 container/array-element 路径上的 leaf op(`set` 原子值 → `atomic-value-to-container-path`;`delete-field` 到 container → `container-delete-field`)。四负例经安全入口(任何合法公开调用 = 带 classifier)必拒。
+4. 不扩 op 面、不违红线:`FieldSchemaClassifier`/`FieldPathTarget` 仍是域类型(非候选独占 DTO);`FieldIntentViolation` 枚举 5 key 不变;`@ts-expect-error` directive 仍恰 7(未增减)。
+
+**契约变化映射**(R3-P1-1 → R4-P1-1,对应提交 `a4da409`):
+- §1 `FieldSchemaClassifier` 注释:"可选"→"必填(安全入口)"。
+- §1 `validateFieldIntent(intent, classify?)` → `validateFieldIntent(intent, classify: FieldSchemaClassifier)`(classifier 必填)。
+- §1 新增 `validateFieldIntentStructural(intent)` 低层函数(结构性校验,**非安全入口**,不拒 schema-aware clobber)。
+- §9.1 修法选择/落地里的"可选 classifier"表述:已被本节 supersede,当前态 classifier 必填。
+
+**验收**(contract test R4-P1-1 段 + 独立对抗实测,R5 步骤 5-6):
+- NEGATIVE:四负例(`delete ['transform']`/`['fills']`/`['fills',0]`/`set ['transform']=7`)经安全入口(带 classifier)全拒;传 `undefined` 绕过 classifier 显式抛错。
+- POSITIVE:optional leaf delete(`delete ['title']`)、array leaf set(`set ['fills',0,'color']`)放行。
+- structural 低层:拒空路径/非原子 set/数组元素 delete-field,但**不拒** schema-aware clobber(明示非安全入口)。
+- 红线:`@ts-expect-error` directive 仍恰 7(未增减)。
+- 独立对抗实测:`vite-node` 直调公开 validator(不复用 Vitest 断言),四 clobber 形态全抛 `FieldIntentError`;合法 leaf 放行。
+
+### 10.2 R4-P1-2 caller-owned retry/rebase 经公开 async submitChange 闭环
+
+**问题核证**:R3 的 `FifoRecordPort` sync `submit`/`ackCreate` 重发**旧** entry.create(adapter 自动重试 stale create),无 caller 提交 rebased create/new base 接管 pending entry 的路径;conflict→accepted 测试靠预编排 `createOutcomes` 队列假收敛。caller-owned retry/rebase 语义未真正闭环。
+
+**修法选择**:**改 FifoRecordPort 为 async `submitChange(canvasId, change, base?)` 同形参考**(非保留 sync submit/ackCreate + 文档警告)。理由:
+1. 公开入口同形:参考 port 与 `CanvasSyncPort.submitChange` 同形为 async `submitChange(canvasId, change, base?)`,caller 经此**唯一**入口推进 pending entry(retry)或并发提交(duplicate)——不再有 sync `ackCreate` 重发旧 create 的旁路。
+2. phase 区分:`in-flight`(create 已交 transport 待 outcome)期间,同 key 并发 create = **duplicate**,直送 transport(likely reuse-conflict),**不** clobber 第一 pending 的 held;`awaiting-retry`(create 拿到 conflict/retryable,caller owns retry/rebase)期间,caller 再次经公开 `submitChange` 交**新** change/base 推进原 pending entry(retry,非新 pending)。
+3. base 透传 transport 区分 old/new base:旧 base 仍 conflict、新 base 才 accepted——caller 提交 rebased create/new base 经同一 `change` 参数接管 pending entry(`base` 参数表并发判定锚点;即任务口径 `submitChange(canvasId, retriedOrRebasedCreate, base?)`,`retriedOrRebasedCreate` 是 caller retry/rebase 时 `change` 参数的语义角色)。
+4. held edit settle 时机:held edit 在 create **终态**(accepted→flush / rejected→dependency-failed)才 settle;conflict/retryable(非终态)held 继续等,不清队列(adapter 不自动重试 create,与 R3-P1-2 所有权冻结一致)。
+5. 删 `ackCreate`:不再重发旧 create;caller-owned retry/rebase 经公开 `submitChange` 闭环。
+
+**契约变化映射**(R3-P1-2 / R2-P1-2 → R4-P1-2,对应提交 `8789903`):
+- §1 `submitChange` 签名:本就 async(`Promise<ChangeOutcome>`),R4 让参考 impl 与之同形,删 sync `ackCreate` 旁路。
+- §8.2 落地/验收里的 `ackCreate flush` / `ackCreate 后 transport 见 [create, edit]` / `rejectCreates` 表述:已被本节 supersede,当前态为 async `submitChange` 状态机(in-flight duplicate / awaiting-retry retry / 终态 settle held)。
+- §9.2 修法选择/落地/验收里的 `submit(canvasId, c)` / `ackCreate(canvasId, rid)` / `再次 ackCreate` 表述:已被本节 supersede,同上。
+
+**验收**(contract test R4-P1-2 段,13 项矩阵,R5 步骤 7):
+- NEGATIVE:in-flight 期间同 key duplicate create 直送 transport(likely reuse-conflict),不 clobber 第一 pending 的 held。
+- NEGATIVE:awaiting-retry 期间 caller 经公开 `submitChange` 交新 change/base 推进原 pending entry(非新 pending);旧 base 仍 conflict、新 base 才 accepted。
+- NEGATIVE:create retryable 跨多次重试 held 持续等(不清队列、不 dependency-fail);收敛 accepted 后 held flush;retryable→终态 rejected 时 held 才 dependency-failed(所有权:caller 放弃重试)。
+- POSITIVE:多 pending(不同 rid)独立 FIFO flush;终态 record state 断言(create + edit 叠加,非仅 transport log)。
+- 公开入口同形:参考 port `submitChange(canvasId, change, base?)` 与 `CanvasSyncPort.submitChange` 签名一致。
+
+### 10.3 实跑结果(R4 + R5 复审)
+
+(lead 复审可在此 worktree 复跑:`cd _tmp/worktrees/g1b-port && <cmd>`)
+
+- `npx vitest run src/lib/canvasSyncPort.contract.test.ts src/kernel/__spike__/yjs-mapping.spike.test.ts` → 2 files passed;**100 tests passed、0 failed**(R4-P1-1 段 5 tests + R4-P1-2 段 13 tests,含 R1/R2/R3 全部不回退)。
+- `npx tsc -b` / `npm run build` → exit 0(2925 modules transformed;classifier 必填签名 + FieldPath 非空 tuple + 全部类型红线通过 TS 校验)。
+- `npx eslint src/lib/canvasSyncPort.ts src/lib/canvasSyncPort.contract.test.ts` / `npm run lint` → exit 0(无 lint 回退)。
+- 红线 grep §4.1-§4.4:非注释代码行零命中候选独占 DTO;`@ts-expect-error` directive 恰 **7**(6 红线候选独占形状互锁 + 1 R2-P1-1 空路径 tuple 互锁,R4 不新增互锁)。
+- 独立对抗实测(R5 步骤 5):`vite-node` 直调公开 validator,四 clobber 形态全抛 `FieldIntentError`;传 `undefined` 绕过 classifier 显式抛错;合法 leaf(`delete ['title']` / `set ['fills',0,'color']`)放行。
+- inventory 同步(本轮文档 commit):§1 签名改 classifier 必填 + 新增 `validateFieldIntentStructural` 低层;§8.2/§9.1/§9.2 旧 sync `submit`/`ackCreate` 或可选 classifier 段标 R4 supersede;本 §10 逐项映射两条 R4 finding → 契约变化。`rg -n "ackCreate" docs/decisions/canvas-sync-port-inventory.md` 命中均在明确标注的 R2/R3 历史/已废弃说明里(§8.2/§9.2,均带 supersede 标注)。
