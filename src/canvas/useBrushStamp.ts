@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState, type PointerEvent as ReactPointerEvent, type RefObject } from 'react'
 import { useCanvasStore } from '../store/canvasStore'
-import { eraserHitStrokeIds, eraserScreenRadius } from './brushGeometry'
+import { eraserHitStrokeIds, eraserScreenRadius } from '../model/brushGeometry'
 import { stampGrowthIntervalMs, stampGrowthSizes } from './stampDefs'
 import { isNodeEffectivelyLocked } from './useNodeTransform'
 import type { SnapGuide } from './canvasGeometry'

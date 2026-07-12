@@ -46,7 +46,7 @@ import {
 import type { LeaferBrushStampPaint } from './leaferBrushStampPaint'
 import { isLeaferBrushStampPaintedNode, isLeaferSpikePainted } from './leaferSpikeFilter'
 import { projectNode } from './projection'
-import { brushOutlinePathFor } from '../canvas/brushGeometry'
+import { brushOutlinePathFor } from '../model/brushGeometry'
 import { stampSrcFor } from '../canvas/stampDefs'
 import { debugLogger } from '../store/debugLogStore'
 import type { MarkupPoint, MivoCanvasNode } from '../types/mivoCanvas'

@@ -1,7 +1,7 @@
 import { useCallback, useRef, useState, type Dispatch, type PointerEvent as ReactPointerEvent, type RefObject, type SetStateAction } from 'react'
 import { useCanvasStore } from '../store/canvasStore'
 import type { MivoCanvasNode, MarkupKind, MarkupPoint, ToolId } from '../types/mivoCanvas'
-import { nearestConnectorBindingForPoint } from './connectorGeometry'
+import { nearestConnectorBindingForPoint } from '../model/connectorGeometry'
 import { markupKindForTool } from './canvasToolRegistry'
 import { defaultTextFontSize, defaultTextWeight, textGeometryFor } from './textGeometry'
 import { isAutoDeletedEmptyTextNode, isNodeEffectivelyLocked } from './useNodeTransform'

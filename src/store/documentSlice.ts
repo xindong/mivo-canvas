@@ -6,7 +6,7 @@ import type {
 } from '../types/mivoCanvas'
 import type { SliceCreator } from './canvasStateTypes'
 import { saveGeneratedAsset } from '../lib/assetStorage'
-import { defaultSizeForNodeType } from '../canvas/nodeTypes/canvasNodeRegistry'
+import { defaultSizeForNodeType } from '../model/canvasNodeRegistry'
 import { AI_SLOT_GAP, buildAiContextSnapshot, chooseAdjacentPlacement, equalAreaSizeForDimensions, reflowRightObstacles } from './aiCanvasWorkflow'
 import { blobFromCommittedGenerationImage, displaySizeForGeneratedAsset, logCanvas, warnCanvas, errorCanvas } from './canvasStoreLog'
 import { redoHistory, undoHistory } from './historyManager'
