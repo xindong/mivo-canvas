@@ -129,6 +129,35 @@ second
 \.'
 expect "数据含\\. 子串不误结束 → 2" "$(printf '%s\n' "$block_tricky" | count_copy_rows)" 2
 
+echo "=== R2-6/F8 latest_dump 无 dump dry-run(fail-visible 回归;P03-R3-3) ==="
+
+# 空临时目录(存在但无 .dump)→ --dry-run 必须 FAIL visibly(rc=1 + 两条诊断)。
+# 旧实现 latest_dump 无 `|| true`:ls 无匹配非零,在 `set -euo pipefail` 下经命令替换
+# 直接杀脚本(:85 abort),:90-93 的 "FAIL: no .dump" 分支永不执行 → rc=1 但缺诊断(静默退,非 fail-visible)。
+# 当前 `|| true` 实现:空结果正常化为空串,走到 :90 显式 FAIL 分支 → rc=1 + 诊断齐全。
+# 本 case 真跑整脚本子进程(无 docker/PG:空 dump 在 :90-93 早退,不触 docker)。
+DRILL_EMPTY="$WORK/drill-empty"; mkdir -p "$DRILL_EMPTY"
+DRILL_LOG="$WORK/restore-drill.log"
+DRY_OUT_FILE="$WORK/dry-out.txt"
+set +e
+PG_BACKUP_DIR="$DRILL_EMPTY" PG_DRILL_LOG="$DRILL_LOG" \
+  bash "$dir/restore-drill.sh" --dry-run >"$DRY_OUT_FILE" 2>&1
+DRY_RC=$?
+set -e
+expect "空 dump dir --dry-run rc=1" "$DRY_RC" 1
+DRY_OUT="$(cat "$DRY_OUT_FILE")"
+# 两条 FAIL 诊断必须出现(fail-visible,非静默退)
+if printf '%s\n' "$DRY_OUT" | grep -q "FAIL: no .dump"; then
+  ok "dry-run 输出含 'FAIL: no .dump'"
+else
+  bad "dry-run 输出缺 'FAIL: no .dump'(实际:$(printf '%s' "$DRY_OUT" | tr '\n' '|'))"
+fi
+if printf '%s\n' "$DRY_OUT" | grep -q "dry-run done: FAIL"; then
+  ok "dry-run 输出含 'dry-run done: FAIL'"
+else
+  bad "dry-run 输出缺 'dry-run done: FAIL'(实际:$(printf '%s' "$DRY_OUT" | tr '\n' '|'))"
+fi
+
 echo "----------------"
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]
