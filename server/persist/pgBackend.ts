@@ -161,25 +161,34 @@ class IdempotencyRaceLost extends Error {
  */
 export class PgPersistBackend implements PersistBackend {
   private readonly db: Kysely<Database>
+  /** F2:是否拥有(并应在 destroy 时释放)底层 Pool。sharedPool 注入时由拥有者(app)释放,本 backend 不销毁。 */
+  private readonly ownsPool: boolean
   /** 全局唯一索引内存缓存(同步读;启动预热;写操作事务提交后定点同步)。 */
   private readonly projectIndex = new Map<string, GlobalIndexEntry>()
   private readonly canvasIndex = new Map<string, GlobalIndexEntry>()
   /** ready:全局索引预热完成(memory backend 立即 resolve;PG 从 PG load projects/canvases)。app 启动 await 后再 serve。 */
   readonly ready: Promise<void>
 
-  constructor(conn: PgConnectionConfig) {
+  /**
+   * F2 返修:支持共享 Pool。`sharedPool` 注入则复用(单预算 + permission backend 同 pool,见 app.ts);
+   * 不注入(测试/独立实例)则自建(含 connectionTimeoutMillis)。destroy 仅在 ownsPool 时销毁 pool。
+   */
+  constructor(conn: PgConnectionConfig, sharedPool?: Pool) {
+    const pool = sharedPool ?? new Pool({
+      host: conn.host,
+      port: conn.port,
+      database: conn.database,
+      user: conn.user,
+      password: conn.password,
+      max: conn.maxConnections,
+      idleTimeoutMillis: conn.idleTimeoutMs,
+      // P0.3 连接预算:池满时排队等待上限,超时即抛错(fail fast,不无限排队拖垮 BFF)。
+      // config 未给(测试字面量)时兜底 5000ms;生产 env 总经 resolvePersistBackendConfig 填。
+      connectionTimeoutMillis: conn.connectionTimeoutMs ?? 5000,
+    })
+    this.ownsPool = sharedPool === undefined
     this.db = new Kysely<Database>({
-      dialect: new PostgresDialect({
-        pool: new Pool({
-          host: conn.host,
-          port: conn.port,
-          database: conn.database,
-          user: conn.user,
-          password: conn.password,
-          max: conn.maxConnections,
-          idleTimeoutMillis: conn.idleTimeoutMs,
-        }),
-      }),
+      dialect: new PostgresDialect({ pool }),
     })
     // P1-4:migrate-before-warm。app.ts/index.ts 只 await ready 从不调 migrate;旧编排 ready=warm() 在 fresh DB
     // (migrate 还没建表)上 warm() 先 SELECT projects → 42P01 → unhandled rejection。ready 内部先 migrate(建表,
@@ -201,14 +210,30 @@ export class PgPersistBackend implements PersistBackend {
     for (const c of canvases) this.canvasIndex.set(c.id, { ownerId: c.owner_id, isDeleted: Boolean(c.is_deleted) })
   }
 
-  /** 优雅关闭连接池(app shutdown 用)。 */
+  /** 优雅关闭连接池(app shutdown 用)。F2:shared pool 时不销毁(由拥有者释放),own pool 时 db.destroy 连带销毁。 */
   async destroy(): Promise<void> {
-    await this.db.destroy()
+    if (this.ownsPool) await this.db.destroy()
   }
 
   /** 对本 backend 的 db 跑 migrateToLatest(可重放)。测试 beforeAll + 生产 runbook 用。 */
   async migrate(): Promise<void> {
     await runMigrations(this.db)
+  }
+
+  /**
+   * P0.3 readiness probe:`SELECT 1` 探活连接池(捕 PG 挂/连接耗尽/网络断)。
+   * /readyz 用:不同于 ready(启动预热一次性),ping 是"此刻依赖可用"的 live 探测。
+   * 不抛错——返 ok=false + reason,让 /readyz 回 503 而非 500(诊断体含 reason)。
+   * 用 Kysely `sql\`SELECT 1\`` 走池里取一条连接(受 connectionTimeoutMillis 排队超时保护)。
+   */
+  async ping(): Promise<{ ok: true } | { ok: false; reason: string }> {
+    try {
+      await sql`SELECT 1`.execute(this.db)
+      return { ok: true }
+    } catch (error) {
+      const reason = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
+      return { ok: false, reason }
+    }
   }
 
   // ── 同步全局唯一索引读(route authz seam 同步调用)────────────────────────────────────
