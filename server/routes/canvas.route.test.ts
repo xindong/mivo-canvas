@@ -38,6 +38,78 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
     expect(body.sourceTemplateId).toBe('tpl-1')
   })
 
+  it('R3 F2-B: POST /api/canvas 空 projectId → 400 bad-body(零项目账号修复前客户端 enqueue 此 → 终态删记录 → 画布消失)', async () => {
+    // 真 Hono 刻画修复所规避的失败模式:server 模式零项目账号此前 fallback projectId='' →
+    // POST 返 400 bad-body → 队列 classifyHttpStatus → rejected terminal → deleteWrite → 刷新画布消失。
+    // 客户端修(documentSlice 零项目时自动建 project)后不再 enqueue 空 projectId,本测试刻画服务端
+    // 为什么空 projectId 必然失败(契约守门,非静默 200)。
+    await seedProject()
+    const empty = await req(app, '/api/canvas', {
+      method: 'POST',
+      headers: { ...hdr(KEY_A), 'content-type': 'application/json' },
+      body: JSON.stringify({ id: 'c1', projectId: '', title: 'C' }),
+    })
+    expect(empty.status).toBe(400)
+    const errBody = empty.body as { error: string; message: string }
+    expect(errBody.error).toBe('bad-request')
+    expect(errBody.message).toMatch(/projectId/i)
+  })
+
+  it('R3 F1: sourceTemplateId 真路由存活契约 —— rename PUT(不带 sourceTemplateId)后 GET 仍存活', async () => {
+    // 客户端 coalesce(createCanvas+updateCanvas before drain)依赖服务端这条契约:
+    // 生产 rename/move 的 PUT payload 不带 sourceTemplateId,服务端必须按字段级合并保留既有值,
+    // 否则即便客户端 combineOps 修好了、POST 带上 sourceTemplateId,rename 后也会被服务端擦除。
+    await seedProject()
+    const created = await req(app, '/api/canvas', {
+      method: 'POST',
+      headers: { ...hdr(KEY_A), 'content-type': 'application/json' },
+      body: JSON.stringify({ id: 'c1', projectId: 'p1', title: 'orig', sourceTemplateId: 'tpl-keep' }),
+    })
+    expect(created.status).toBe(201)
+    // GET → 服务端已存 sourceTemplateId
+    const get1 = await req(app, '/api/canvas/c1', { method: 'GET', headers: hdr(KEY_A) })
+    expect(get1.status).toBe(200)
+    expect((get1.body as { sourceTemplateId?: string }).sourceTemplateId).toBe('tpl-keep')
+    // 生产 rename:PUT payload 只带新 title,不带 sourceTemplateId
+    const rename = await req(app, '/api/canvas/c1', {
+      method: 'PUT',
+      headers: { ...hdr(KEY_A), 'content-type': 'application/json', 'if-match': '0' },
+      body: JSON.stringify({ payload: { projectId: 'p1', title: 'renamed' } }),
+    })
+    expect(rename.status).toBe(200)
+    // GET → sourceTemplateId 穿过 rename 存活(字段级合并保留了既有值)
+    const get2 = await req(app, '/api/canvas/c1', { method: 'GET', headers: hdr(KEY_A) })
+    expect(get2.status).toBe(200)
+    const body2 = get2.body as { title: string; sourceTemplateId?: string; metaRevision: number }
+    expect(body2.title).toBe('renamed')
+    expect(body2.sourceTemplateId).toBe('tpl-keep')
+    expect(body2.metaRevision).toBe(1)
+  })
+
+  it('R3 F1: sourceTemplateId 真路由存活契约 —— move PUT(换 projectId,不带 sourceTemplateId)后仍存活', async () => {
+    await seedProject('p1')
+    await seedProject('p2')
+    const created = await req(app, '/api/canvas', {
+      method: 'POST',
+      headers: { ...hdr(KEY_A), 'content-type': 'application/json' },
+      body: JSON.stringify({ id: 'c1', projectId: 'p1', title: 'orig', sourceTemplateId: 'tpl-keep' }),
+    })
+    expect(created.status).toBe(201)
+    // 生产 move:PUT payload 换 projectId,不带 title 也不带 sourceTemplateId
+    const move = await req(app, '/api/canvas/c1', {
+      method: 'PUT',
+      headers: { ...hdr(KEY_A), 'content-type': 'application/json', 'if-match': '0' },
+      body: JSON.stringify({ payload: { projectId: 'p2' } }),
+    })
+    expect(move.status).toBe(200)
+    const get = await req(app, '/api/canvas/c1', { method: 'GET', headers: hdr(KEY_A) })
+    expect(get.status).toBe(200)
+    const body = get.body as { title: string; projectId: string; sourceTemplateId?: string }
+    expect(body.projectId).toBe('p2') // move 生效
+    expect(body.title).toBe('orig') // 未带 title → 保留既有
+    expect(body.sourceTemplateId).toBe('tpl-keep') // 未带 → 保留既有(存活)
+  })
+
   it('GET /api/canvas/:id 全量(metaRevision/contentVersion + nodes 带 orderKey #6);子资源 upsert bump contentVersion #5', async () => {
     await seedProject()
     await seedCanvas()
@@ -246,6 +318,22 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
     expect(del.status).toBe(204)
     const listAfter = await req(app, '/api/canvas/c1/chat', { headers: hdr(KEY_A) })
     expect((listAfter.body as { messages: unknown[] }).messages).toHaveLength(0)
+  })
+
+  it('R5-1: POST chat 到从未创建的 canvas → 404 unknown-canvas(createCanvas 未 drain 前 appendChat 先发 → terminal 丢消息的 FK 源头)', async () => {
+    // 镜像 line 26-29(POST canvas 缺 project → 404 unknown-project)。client writeRetryQueue 三层 rank
+    // (project 0 → canvas 1 → chat 2)就是为防 appendChatMessage 在 createCanvas 前 drain 命中此 404
+    // → classifyHttpStatus(404,isDelete=false) → rejected terminal → durable record 删 → 消息永久丢失。
+    // 本测试锚定服务端 FK 行为(canvas.ts authzCanvas !owner → 404 unknown-canvas),client 排序由
+    // writeRetryQueue.test.ts 'G1-a R5 F1' 用 FK-mock executor 覆盖;两端合证。
+    const noCanvas = await req(app, '/api/canvas/c-never-created/chat', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ message: { id: 'm1', role: 'user', text: 'hi' } }) })
+    expect(noCanvas.status).toBe(404)
+    expect((noCanvas.body as { error: string }).error).toBe('unknown-canvas')
+    // 建好 canvas 后 POST chat → 201(FK 满足)
+    await seedProject()
+    await seedCanvas('c-created', 'p1')
+    const ok = await req(app, '/api/canvas/c-created/chat', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ message: { id: 'm1', role: 'user', text: 'hi' } }) })
+    expect(ok.status).toBe(201)
   })
 
   it('owner 隔离:B GET A 的 canvas → 404(同 unknown,无泄漏 #1)', async () => {

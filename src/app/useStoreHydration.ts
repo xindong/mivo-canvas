@@ -9,6 +9,8 @@ import { toastFeedback } from '../store/toastStore'
 import { isLegacyKernel } from './kernelMode'
 import { migrateV10ToV11 } from '../kernel/persistMigration'
 import { rawIdbStorage } from '../lib/persistIdbStorage'
+import { isLocalPersist } from '../lib/persistMode'
+import { bootPersistWiring } from '../lib/persistBoot'
 
 const SOURCE = 'Store Hydration'
 
@@ -72,6 +74,23 @@ export function useStoreHydration(): boolean {
           // 非靠 reconcile 内重试硬扛);reconcile 内重试只兜其余瞬态(5xx/网络)。
           useSettingsStore.persist.rehydrate(),
         ])
+        // G1-a P1-1 真接线:非 local 模式(?persist=server|shadow)在 IDB rehydrate 后
+        // 分派——server: 从 BFF hydrate 非画布域(project 全量替换 + canvas meta list +
+        // user-state map)+ start writeRetryQueue;shadow: 读服务端做差异 debugLogger +
+        // start queue(双写)。local(默认)isLocalPersist=true → bootPersistWiring 内部
+        // no-op,零变化(IDB rehydrate 仍为 canvas content 读源,全量 content hydrate 属 G1-c)。
+        // canvas content 仍来自 IDB(全量 fetchCanvas + RecordEntry→NodeRecord 转换属 G1-c 本轮不做,
+        // 如实声明);project 由 server 真值替换,可观测地不同于 local。
+        if (!isLocalPersist) {
+          try {
+            await bootPersistWiring()
+          } catch (error) {
+            debugLogger.error(
+              SOURCE,
+              `persist wiring failed: ${error instanceof Error ? error.message : String(error)} (degrade to local IDB state)`,
+            )
+          }
+        }
         // FX-3: server-truth reconciliation of wrongly-expired mask-edit chat cards.
         // The blanket settleExpiredChatMessages already ran in the chat merge (so no
         // first-paint flash); this async pass asks the per-user task registry (FX-2)

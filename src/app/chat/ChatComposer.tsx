@@ -13,6 +13,8 @@ import { ImagePlus, Send, Sparkles, X } from 'lucide-react'
 import { getModelCapabilities } from '../../lib/modelCapabilities'
 import { useChatStore } from '../../store/chatStore'
 import { useCanvasStore } from '../../store/canvasStore'
+import { useAuthStore } from '../../store/authSlice'
+import { isLocalPersist } from '../../lib/persistMode'
 import { ModelSelectorPopover } from './ModelSelectorPopover'
 import { RatioIcon, RatioPopover } from './RatioPopover'
 import { modelShortLabel } from './chatDisplayLabels'
@@ -56,6 +58,12 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
     const selectedNodeId = useCanvasStore((s) => s.selectedNodeId)
     const nodes = useCanvasStore((s) => s.nodes)
     const selectedNode = selectedNodeId ? nodes.find((n) => n.id === selectedNodeId) : undefined
+
+    // G1-a chat 接线(DP-6R P1-1):server/shadow 模式未登录 → ChatComposer 禁用 + 登录 CTA。
+    // local 模式无 auth 概念,chatLocked=false(local demo 零变化,表征/e2e 不红)。
+    const authStatus = useAuthStore((s) => s.status)
+    const login = useAuthStore((s) => s.login)
+    const chatLocked = !isLocalPersist && authStatus !== 'authenticated'
 
     useImperativeHandle(ref, () => ({
       focus: () => textareaRef.current?.focus(),
@@ -119,7 +127,7 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
 
     const handleSend = useCallback(async () => {
       const trimmed = text.trim()
-      if (!trimmed || isBusy) return
+      if (!trimmed || isBusy || chatLocked) return
       const filesToSend = referenceFiles.map((f) => f.file)
       referenceFiles.forEach((f) => URL.revokeObjectURL(f.previewUrl))
       setText('')
@@ -132,7 +140,7 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
         selectedNodeType: selectedNode?.type,
         referenceFiles: filesToSend,
       })
-    }, [text, isBusy, sendMessage, sceneId, selectedNode, referenceFiles])
+    }, [text, isBusy, chatLocked, sendMessage, sceneId, selectedNode, referenceFiles])
 
     const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
       if (e.key === 'Escape') {
@@ -163,20 +171,30 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
       ? getModelCapabilities(selectedModel).defaultRatio
       : paramOverrides.imgRatio
     const hasOverride = paramOverrides.imgRatio !== 'auto' || paramOverrides.quality !== 'auto'
-    const canSend = Boolean(text.trim()) && !isBusy
+    const canSend = Boolean(text.trim()) && !isBusy && !chatLocked
     const busyReason = '正在生成，完成或取消后可继续编辑'
-    const sendTitle = isBusy ? busyReason : text.trim() ? '发送' : '先输入描述'
-    const referenceTitle = isBusy ? '生成中，完成或取消后再上传参考图' : '上传参考图'
+    const lockedReason = '登录后可对话(server 模式需登录,匿名不可提交)'
+    const sendTitle = chatLocked ? lockedReason : isBusy ? busyReason : text.trim() ? '发送' : '先输入描述'
+    const referenceTitle = chatLocked ? lockedReason : isBusy ? '生成中，完成或取消后再上传参考图' : '上传参考图'
 
     return (
       <div
         ref={composerRef}
-        className={`chat-composer ${isBusy ? 'is-busy' : ''}`}
+        className={`chat-composer ${isBusy ? 'is-busy' : ''} ${chatLocked ? 'is-locked' : ''}`}
         onDrop={handleDrop}
         onDragOver={(e) => e.preventDefault()}
         onPaste={handlePaste}
         aria-busy={isBusy}
+        aria-disabled={chatLocked}
       >
+        {chatLocked && (
+          <div className="chat-locked-cta" role="alert">
+            <span>{lockedReason}</span>
+            <button type="button" className="chat-locked-login-btn" onClick={() => void login()}>
+              登录
+            </button>
+          </div>
+        )}
         {referenceFiles.length > 0 && (
           <div className="chat-ref-chips">
             {referenceFiles.map((f) => (
@@ -204,11 +222,11 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
             value={text}
             onChange={(e) => setText(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder="描述画面、风格、内容… (Enter 发送)"
+            placeholder={chatLocked ? '登录后可对话…' : '描述画面、风格、内容… (Enter 发送)'}
             rows={7}
-            disabled={isBusy}
+            disabled={isBusy || chatLocked}
             aria-label="Chat input"
-            title={isBusy ? busyReason : undefined}
+            title={chatLocked ? lockedReason : isBusy ? busyReason : undefined}
           />
 
           <div className="chat-composer-actions">
@@ -289,7 +307,7 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
           type="file"
           accept="image/png,image/jpeg,image/webp"
           multiple
-          disabled={isBusy}
+          disabled={isBusy || chatLocked}
           onChange={(e) => {
             addFiles(e.target.files)
             e.target.value = ''

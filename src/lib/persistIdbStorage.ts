@@ -197,12 +197,22 @@ const isQuotaError = (error: unknown): boolean =>
   error instanceof DOMException &&
   (error.name === 'QuotaExceededError' || error.name === 'QuotaExceeded')
 
-// P4c 接线点（服务端持久化）：当前空实现。P4c 上线后改成
-// `syncToServer(name, value)` —— 在 setItem 写 IDB 后把 (name, value) 推到服务端，
-// IDB 退为离线缓存层（offline-first）。本 PR 不做服务端调用。
+// G1-a seam:服务端持久化接线点。**有意保持空实现**——整 blob 推服务端的 P4c 旧设计已被
+// G1-a 的"按 record 增量写"路径取代:非画布域(project/canvas-meta/user-state/asset)的增量写
+// 经 ServerPersistAdapter(createFetchServerPersistAdapter)→ BFF → PG,网络失败重试经
+// writeRetryQueue(persistWriteExecutor),hydrate 经 adapter 读方法 + serverPersistHydrate。
+// 这些 per-record 路径才是 G1-a 的真实接线,不是这里的整 zustand-persist blob 同步。
+//
+// 保留空实现的理由:① zustand persist setItem 拿到的是整序列化 blob,做"增量"需要 store 层
+// diff(非本存储层职责);② 画布域写(node/edge/anchor)挂 G1-c/N2-0,server 模式下画布 blob
+// 暂无服务端可同步目标;③ **默认 mode=local → 生产零变化**:空实现保证 local 模式绝不发
+// 网络请求。server/shadow 模式的真实增量写走 adapter + queue,不经此 blob 路径。
+//
+// setItem 内的 `// P4c: fire-and-forget server sync` 注释(下方 setItem)仅指未来 shadow 模式
+// 的整 blob 双写比对,当前不启用;G1-a 真实写路径见 src/lib/serverPersistAdapter.ts。
 export const syncToServer = async (): Promise<void> => {
-  // P4c: await fetch('/api/persist', { method: 'POST', body: value }) — fire-and-forget
-  // from setItem's perspective, with a server-authoritative merge on rehydrate.
+  // G1-a:有意空实现(见上注释)。整 blob 同步被 per-record adapter 路径取代;
+  // local 模式(默认)绝不发网络请求 → 生产零变化。
 }
 
 /**

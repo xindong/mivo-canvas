@@ -3,8 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   __dumpWritesForTest,
   __resetWriteQueueDb,
+  __seedWritesForTest,
   classifyHttpStatus,
   createWriteQueue,
+  type QueuedWrite,
   type WriteExecutor,
   type WriteOp,
   type WriteOutcome,
@@ -470,6 +472,84 @@ describe('FX-5 coalescing', () => {
   })
 })
 
+// ── G1-a R3 F1: createCanvas+updateCanvas coalesce must preserve create-only fields ──
+// R3 verdict: combineOps(createCanvas, updateCanvas) rebuilt the create from incoming
+// update fields only, dropping existing.sourceTemplateId when the production rename/move
+// update does not carry it. Production renameCanvas/moveCanvasToProject updates omit
+// sourceTemplateId, so a template-backed create followed by a pre-drain rename lost the
+// template id silently. These tests pin the field-wise merge contract.
+
+describe('G1-a R3 F1: createCanvas+updateCanvas coalesce preserves sourceTemplateId', () => {
+  const createCanvasOp = (canvasId: string, projectId: string, title: string, sourceTemplateId: string): WriteOp => ({
+    kind: 'createCanvas',
+    canvasId,
+    projectId,
+    title,
+    sourceTemplateId,
+  })
+  // Production rename: carries new title + required projectId, omits sourceTemplateId.
+  const renameCanvasOp = (canvasId: string, projectId: string, title: string): WriteOp => ({
+    kind: 'updateCanvas',
+    canvasId,
+    projectId,
+    title,
+  })
+  // Production move: carries new projectId, omits title + sourceTemplateId.
+  const moveCanvasOp = (canvasId: string, projectId: string): WriteOp => ({
+    kind: 'updateCanvas',
+    canvasId,
+    projectId,
+  })
+
+  it('rename before drain preserves existing sourceTemplateId (not dropped by coalesce)', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue(createCanvasOp('c1', 'p1', 'orig', 'template-keep-me'))
+    await q.enqueue(renameCanvasOp('c1', 'p1', 'renamed')) // same canvas → coalesce
+    expect((await __dumpWritesForTest()).length).toBe(1) // coalesced to one record
+    await q.drain()
+    expect(calls).toHaveLength(1)
+    expect(calls[0].op.kind).toBe('createCanvas')
+    // RED assertion: sourceTemplateId must survive the coalesce (current code drops it).
+    expect((calls[0].op as { sourceTemplateId?: string }).sourceTemplateId).toBe('template-keep-me')
+    // the rename took effect on title
+    expect((calls[0].op as { title?: string }).title).toBe('renamed')
+    expect((calls[0].op as { projectId: string }).projectId).toBe('p1')
+  })
+
+  it('move before drain preserves existing sourceTemplateId and title', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue(createCanvasOp('c2', 'p1', 'orig', 'template-keep-me'))
+    await q.enqueue(moveCanvasOp('c2', 'p2')) // move to p2, no title, no sourceTemplateId
+    expect((await __dumpWritesForTest()).length).toBe(1)
+    await q.drain()
+    expect(calls).toHaveLength(1)
+    expect(calls[0].op.kind).toBe('createCanvas')
+    expect((calls[0].op as { sourceTemplateId?: string }).sourceTemplateId).toBe('template-keep-me')
+    expect((calls[0].op as { title?: string }).title).toBe('orig') // preserved (move carried no title)
+    expect((calls[0].op as { projectId: string }).projectId).toBe('p2') // move took effect
+  })
+
+  it('explicit sourceTemplateId in update still overrides existing (not sticky)', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue(createCanvasOp('c3', 'p1', 'orig', 'template-old'))
+    await q.enqueue({
+      kind: 'updateCanvas',
+      canvasId: 'c3',
+      projectId: 'p1',
+      title: 'renamed',
+      sourceTemplateId: 'template-new',
+    })
+    await q.drain()
+    expect(calls).toHaveLength(1)
+    expect(calls[0].op.kind).toBe('createCanvas')
+    // incoming sourceTemplateId wins over existing (field-wise merge, not sticky-keep)
+    expect((calls[0].op as { sourceTemplateId?: string }).sourceTemplateId).toBe('template-new')
+  })
+})
+
 // ── overflow ──
 
 describe('FX-5 overflow', () => {
@@ -876,5 +956,531 @@ describe('FX-5 IDB-failure degradation (toast + memStore fallback)', () => {
     await q.enqueue(minimalNode('c1', 'n2')) // different resourceKey → not coalesced
     expect(toastWarn).toHaveBeenCalledTimes(1) // second failure did not re-toast
     expect(await q.pendingCount()).toBe(2) // both records retained in memStore
+  })
+})
+
+// ── G1-a R4 F2:零项目 New Canvas 同毫秒 project/canvas FK 排序(drain tie-breaker)──
+//
+// 复现 R4 P1 阻断项:零项目账号 New Canvas 同步路径(createCanvas → createProject → 两次 enqueue
+// 到不同 resource-key 链)把 createProject 与 createCanvas 在**同一毫秒**入队。IDB getAll() 按 key(id)
+// 序返回——非确定,可能 canvas 在前。drain 纯 timestamp 排序对同毫秒返回 0,顺序退化为 IDB key 序;
+// 若 canvas 先 drain,真 Hono POST /api/canvas 缺 parent project → 404 unknown-project(见
+// server/routes/canvas.ts:286-289 + server/routes/canvas.route.test.ts:26-29)→ classifyHttpStatus(404,
+// isDelete=false) → rejected terminal → 记录被删 → 刷新后画布永久丢失。
+//
+// 修:drain 排序补 dependencyRank tie-breaker(同毫秒 project 类 rank0 先于 canvas 类 rank1)。
+// 本测试用 __seedWritesForTest 直接构造受控 id 的记录精确复现"逆境 IDB key 顺序"(canvas id 字典序
+// 在前),用 FK-enforcing mock executor 忠实建模真 Hono 404→rejected-terminal 分类(parent 未建则
+// canvas rejected),断言 drain 重排后 project 先发、双 success、零 terminal。
+//
+// 注:src/lib ↔ server 跨 tsconfig 项目边界(TS2591,有意为之——见 chatWiring.integration.test.ts:13-14),
+// 故 client 侧 drain 排序修复的 committed 红→绿测试在此文件用 FK-mock executor 覆盖;真 Hono 的
+// 404 unknown-project → terminal 行为由 server/routes/canvas.route.test.ts:26-29 独立覆盖,真 Hono
+// project+canvas 成功落库由 persistWiring.integration.test.ts 覆盖——两端合起来证 client 排序 + 真 route
+// FK 行为。
+describe('G1-a R4 F2 — 同毫秒 createProject/createCanvas 的 drain 依赖排序(tie-breaker)', () => {
+  // FK-enforcing mock executor:忠实建模真 Hono(project 未建则 canvas POST → 404 unknown-project →
+  // classifyHttpStatus(404,isDelete=false) → rejected terminal)。createProject 先建 parent → success;
+  // createCanvas 若 parent 已建 → success,否则 → rejected(terminal,记录被删,复现画布丢失)。
+  const fkExecutor = () => {
+    const calls: { op: WriteOp; key: string }[] = []
+    const createdProjects = new Set<string>()
+    const fn = vi.fn(async (op: WriteOp, key: string): Promise<WriteOutcome> => {
+      calls.push({ op, key })
+      if (op.kind === 'createProject') {
+        createdProjects.add(op.id ?? '')
+        return { status: 'success', revision: 0 }
+      }
+      if (op.kind === 'createCanvas') {
+        if (createdProjects.has(op.projectId)) return { status: 'success', revision: 0 }
+        return { status: 'rejected', body: { error: 'unknown-project' } }
+      }
+      return { status: 'success' }
+    })
+    return { fn, calls, createdProjects }
+  }
+
+  // 同毫秒(createdAt=nextAttemptAt=1000,= makeQueue clockMs)的 project/canvas 记录,canvas 归 p1。
+  const makeRecords = (projectRecordId: string, canvasRecordId: string): { project: QueuedWrite; canvas: QueuedWrite } => ({
+    project: {
+      id: projectRecordId,
+      idempotencyKey: 'mivo-proj-test',
+      userId: 'userA',
+      op: { kind: 'createProject', name: 'Default Project', id: 'p1' },
+      resourceKey: 'project:p1',
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    },
+    canvas: {
+      id: canvasRecordId,
+      idempotencyKey: 'mivo-canvas-test',
+      userId: 'userA',
+      op: { kind: 'createCanvas', canvasId: 'c1', projectId: 'p1', title: 'Untitled Canvas' },
+      resourceKey: 'canvas:c1',
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    },
+  })
+
+  it('逆境 IDB key 序(canvas id 字典序在前)+ 同毫秒 → drain 重排 project 先发,双 success 零 terminal', async () => {
+    const { fn, calls, createdProjects } = fkExecutor()
+    const q = makeQueue(fn)
+    const { project, canvas } = makeRecords('zz-project-record', 'aa-canvas-record')
+    await __seedWritesForTest([project, canvas])
+
+    // 确认逆境 setup:IDB getAll 按 key(id)序返回 canvas 在前(字典序 aa < zz)。
+    const dumped = await __dumpWritesForTest()
+    expect(dumped.map((r) => r.id)).toEqual(['aa-canvas-record', 'zz-project-record'])
+
+    const r = await q.drain()
+    // R4 修复断言:project 必须先 drain(tie-breaker 重排),canvas 归属的 p1 已建 → canvas success。
+    expect(calls).toHaveLength(2)
+    expect(calls[0]!.op.kind).toBe('createProject') // 修复前此处为 'createCanvas'(canvas 先发 → 404 terminal)
+    expect(calls[1]!.op.kind).toBe('createCanvas')
+    expect(calls[1]!.op.kind === 'createCanvas' && (calls[1]!.op as { projectId: string }).projectId).toBe('p1')
+    expect(r).toEqual({ processed: 2, successes: 2, failures: 0, terminals: 0, paused: false })
+    expect(createdProjects.has('p1')).toBe(true) // project 真落"库"(mock)
+    expect(await q.pendingCount()).toBe(0) // 双 success 后队列清空
+  })
+
+  it('非逆境 IDB key 序(project id 在前)→ 仍 project 先发、双 success 零 terminal(回归守卫)', async () => {
+    const { fn, calls } = fkExecutor()
+    const q = makeQueue(fn)
+    const { project, canvas } = makeRecords('aa-project-record', 'zz-canvas-record')
+    await __seedWritesForTest([project, canvas])
+
+    // 非逆境:IDB getAll 返回 project 在前(字典序 aa < zz)。此顺序即使无 tie-breaker 也 project 先发,
+    // 修复不应改变它——回归守卫,确保 tie-breaker 只在 tie 时生效、不误伤非逆境路径。
+    const dumped = await __dumpWritesForTest()
+    expect(dumped.map((r) => r.id)).toEqual(['aa-project-record', 'zz-canvas-record'])
+
+    const r = await q.drain()
+    expect(calls).toHaveLength(2)
+    expect(calls[0]!.op.kind).toBe('createProject')
+    expect(calls[1]!.op.kind).toBe('createCanvas')
+    expect(r).toEqual({ processed: 2, successes: 2, failures: 0, terminals: 0, paused: false })
+    expect(await q.pendingCount()).toBe(0)
+  })
+
+  it('updateCanvas(move 到同毫秒新建的 project)也排在该 createProject 之后(rank1 vs rank0)', async () => {
+    // 覆盖"同毫秒多资源链 project→canvas FK"一类的另一形态:updateCanvas(move)改 projectId 指向同批
+    // 新建的 project。move PUT 的 payload.projectId 同样要求 parent project 先建好,否则 404 terminal。
+    // tie-breaker 把 createProject(rank0)排到 updateCanvas(rank1)前。
+    const { fn, calls } = fkExecutor()
+    const q = makeQueue(fn)
+    const project: QueuedWrite = {
+      id: 'zz-move-project',
+      idempotencyKey: 'mivo-proj-move',
+      userId: 'userA',
+      op: { kind: 'createProject', name: 'Target Project', id: 'p-target' },
+      resourceKey: 'project:p-target',
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    }
+    const move: QueuedWrite = {
+      id: 'aa-move-canvas',
+      idempotencyKey: 'mivo-move-test',
+      userId: 'userA',
+      op: { kind: 'updateCanvas', canvasId: 'c-existing', projectId: 'p-target', title: 'Moved' },
+      resourceKey: 'canvas:c-existing',
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    }
+    await __seedWritesForTest([project, move])
+    const dumped = await __dumpWritesForTest()
+    expect(dumped.map((r) => r.id)).toEqual(['aa-move-canvas', 'zz-move-project']) // 逆境:update 在前
+
+    const r = await q.drain()
+    expect(calls[0]!.op.kind).toBe('createProject') // 修复前:update 先发 → 移到未建 project → 404 terminal
+    expect(calls[1]!.op.kind).toBe('updateCanvas')
+    expect(r).toEqual({ processed: 2, successes: 2, failures: 0, terminals: 0, paused: false })
+  })
+})
+
+// ── G1-a R5 F1:同毫秒 createCanvas/appendChatMessage 的 drain 依赖排序(三层 rank)──
+//
+// 复现 R5-1 P1 阻断项:用户新建画布后立即发消息(chatStore.sendMessage → enqueueChatAppend)把
+// createCanvas 与 appendChatMessage 在**同一毫秒**入队到不同 resource-key 链(canvas:<id> vs chat
+// resourceKey=null)。IDB getAll() 按 key(id)序返回——非确定,可能 chat 在前。R4 修前 rank 只有
+// project(0)/canvas(1) 两层,appendChatMessage 落 rank 0,同毫秒 tie 时 rank 0 的 chat 排在 rank 1 的
+// canvas **之前** drain → 真 Hono POST /api/canvas/:id/chat 经 authzCanvas(canvas.ts:107)发现 canvas 未建
+// → 404 unknown-canvas → classifyHttpStatus(404,isDelete=false) → rejected terminal → chat record 被删
+// → 随后 canvas 创建成功也不重放 → 消息永久丢失(R5-1 复现:1 success / 1 terminal,GET chat 空)。
+//
+// 修:dependencyRank 三层化(project 0 → canvas 1 → canvas-dependent chat 写 2)。tie-breaker 同毫秒时把
+// chat(rank 2)排到 canvas(rank 1)之后,保证 canvas prerequisite 先 drain。
+// 本测试用 __seedWritesForTest 构造受控 id 的记录精确复现"逆境 IDB key 顺序"(chat id 字典序在前),
+// 用 FK-enforcing mock executor 忠实建模真 Hono 三层 FK 链(project 未建 canvas 404 unknown-project;
+// canvas 未建 chat 404 unknown-canvas → rejected terminal),断言 drain 重排后 project→canvas→chat、
+// 3 success / 0 terminal。
+//
+// 注:src/lib ↔ server 跨 tsconfig 项目边界(TS2591,有意为之——见 chatWiring.integration.test.ts:13-14)
+// 使 client drain 直连真 Hono 的一体化闭环测试不可行;故 client 排序修复的 committed 红→绿测试在此文件
+// 用 FK-mock executor 覆盖,真 Hono 的 404 unknown-canvas → terminal 行为由 server/routes/canvas.route.test.ts
+// POST chat 404 覆盖,真 Hono project+canvas+chat 成功落库 + reload hydrate 由 persistWiring /
+// chatWiring integration 覆盖——两端合起来证 client 排序 + 真 route FK 行为。一体化真 Hono 闭环由
+// 临时 probe(不 commit)在本轮独立验证(见 REPORT-G1A-FIX-R5-DONE.md)。
+describe('G1-a R5 F1 — 同毫秒 createCanvas/appendChatMessage 的 drain 依赖排序(三层 rank)', () => {
+  // FK-enforcing mock executor:忠实建模真 Hono 三层 FK 链。
+  //  - createProject → success(记 createdProjects)。
+  //  - createCanvas → parent project 已建 → success(记 createdCanvases);否则 404 unknown-project → rejected terminal。
+  //  - appendChatMessage → canvas 已建 → success;否则 404 unknown-canvas → rejected terminal(复现 R5-1 消息丢失)。
+  // preseed 选项模拟"父资源在先前 drain/hydrate 已建好"的场景(二链最小对用)。
+  const fkChatExecutor = (opts: { preseedProjects?: string[]; preseedCanvases?: string[] } = {}) => {
+    const calls: { op: WriteOp; key: string }[] = []
+    const createdProjects = new Set<string>(opts.preseedProjects ?? [])
+    const createdCanvases = new Set<string>(opts.preseedCanvases ?? [])
+    const fn = vi.fn(async (op: WriteOp, key: string): Promise<WriteOutcome> => {
+      calls.push({ op, key })
+      if (op.kind === 'createProject') {
+        createdProjects.add(op.id ?? '')
+        return { status: 'success', revision: 0 }
+      }
+      if (op.kind === 'createCanvas') {
+        if (createdProjects.has(op.projectId)) {
+          createdCanvases.add(op.canvasId)
+          return { status: 'success', revision: 0 }
+        }
+        return { status: 'rejected', body: { error: 'unknown-project' } }
+      }
+      if (op.kind === 'appendChatMessage') {
+        if (createdCanvases.has(op.canvasId)) return { status: 'success' }
+        return { status: 'rejected', body: { error: 'unknown-canvas' } }
+      }
+      return { status: 'success' }
+    })
+    return { fn, calls, createdProjects, createdCanvases }
+  }
+
+  // 同毫秒(createdAt=nextAttemptAt=1000 = makeQueue clockMs)的 project/canvas/chat 三链记录,canvas 归 p1,
+  // chat 归 c1。chat 的 resourceKey=null(每条消息独立 op,不 coalesce)。
+  const makeTripleRecords = (
+    projectRecordId: string,
+    canvasRecordId: string,
+    chatRecordId: string,
+  ): { project: QueuedWrite; canvas: QueuedWrite; chat: QueuedWrite } => ({
+    project: {
+      id: projectRecordId,
+      idempotencyKey: 'mivo-proj-r5',
+      userId: 'userA',
+      op: { kind: 'createProject', name: 'Default Project', id: 'p1' },
+      resourceKey: 'project:p1',
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    },
+    canvas: {
+      id: canvasRecordId,
+      idempotencyKey: 'mivo-canvas-r5',
+      userId: 'userA',
+      op: { kind: 'createCanvas', canvasId: 'c1', projectId: 'p1', title: 'Untitled Canvas' },
+      resourceKey: 'canvas:c1',
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    },
+    chat: {
+      id: chatRecordId,
+      idempotencyKey: 'mivo-chat-r5',
+      userId: 'userA',
+      op: { kind: 'appendChatMessage', canvasId: 'c1', message: { id: 'm1', role: 'user', text: 'first' } },
+      resourceKey: null,
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    },
+  })
+
+  it('逆境 IDB key 序(chat id 在前)+ 同毫秒三链 → drain 重排 project→canvas→chat,3 success 零 terminal', async () => {
+    const { fn, calls, createdCanvases } = fkChatExecutor()
+    const q = makeQueue(fn)
+    const { project, canvas, chat } = makeTripleRecords('zz-project-record', 'mm-canvas-record', 'aa-chat-record')
+    await __seedWritesForTest([project, canvas, chat])
+
+    // 确认逆境 setup:IDB getAll 按 key(id)序返回 chat 在前(aa < mm < zz)。
+    const dumped = await __dumpWritesForTest()
+    expect(dumped.map((r) => r.id)).toEqual(['aa-chat-record', 'mm-canvas-record', 'zz-project-record'])
+
+    const r = await q.drain()
+    // R5-1 修复断言:三层 rank 重排 project(0)→canvas(1)→chat(2),chat 不先 drain。
+    // 修复前(两层 rank,chat=0):chat 先 drain → 404 unknown-canvas → terminal,消息永久丢失。
+    expect(calls).toHaveLength(3)
+    expect(calls[0]!.op.kind).toBe('createProject')
+    expect(calls[1]!.op.kind).toBe('createCanvas')
+    expect(calls[2]!.op.kind).toBe('appendChatMessage')
+    expect(r).toEqual({ processed: 3, successes: 3, failures: 0, terminals: 0, paused: false })
+    expect(createdCanvases.has('c1')).toBe(true) // canvas 真落"库"(mock)→ chat 才 success
+    expect(await q.pendingCount()).toBe(0) // 三 success 后队列清空
+  })
+
+  it('逆境 IDB key 序(chat 在前)+ 同毫秒 canvas→chat 二链(R5-1 最小对)→ drain 重排 canvas→chat,2 success 零 terminal', async () => {
+    // R5-1 复现的最小对:parent project 已在先前 drain/hydrate 建好(mock preseed p1),本轮同毫秒
+    // createCanvas + appendChatMessage 跨 resource-key(chat resourceKey=null)。逆境 chat id 在前 →
+    // 修复前(两层 rank,chat=0)chat 先 drain → 404 unknown-canvas → terminal 删 chat(消息永久丢失);
+    // 修复后(三层 rank,chat=2)canvas 先建 → chat success。
+    const { fn, calls } = fkChatExecutor({ preseedProjects: ['p1'] })
+    const q = makeQueue(fn)
+    const canvas: QueuedWrite = {
+      id: 'zz-canvas-pair',
+      idempotencyKey: 'mivo-canvas-pair',
+      userId: 'userA',
+      op: { kind: 'createCanvas', canvasId: 'c-chat', projectId: 'p1', title: 'Untitled Canvas' },
+      resourceKey: 'canvas:c-chat',
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    }
+    const chat: QueuedWrite = {
+      id: 'aa-chat-pair',
+      idempotencyKey: 'mivo-chat-pair',
+      userId: 'userA',
+      op: { kind: 'appendChatMessage', canvasId: 'c-chat', message: { id: 'm1', role: 'user', text: 'first' } },
+      resourceKey: null,
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    }
+    await __seedWritesForTest([canvas, chat])
+    const dumped = await __dumpWritesForTest()
+    expect(dumped.map((r) => r.id)).toEqual(['aa-chat-pair', 'zz-canvas-pair']) // 逆境:chat 在前
+
+    const r = await q.drain()
+    expect(calls).toHaveLength(2)
+    expect(calls[0]!.op.kind).toBe('createCanvas') // 修复前:chat 先发 → 404 unknown-canvas → terminal
+    expect(calls[1]!.op.kind).toBe('appendChatMessage')
+    expect(r).toEqual({ processed: 2, successes: 2, failures: 0, terminals: 0, paused: false })
+    expect(await q.pendingCount()).toBe(0)
+  })
+
+  it('手术刀守卫(R6-1):无 FK 竞争保持 IDB 原序 chat→project,依赖感知 rank 不改序', async () => {
+    // 回归守卫(R6-1):同毫秒 createProject(p-guard) + appendChatMessage(canvasId=c-pre),但 chat 依赖的
+    // canvas c-pre 已在先前 drain 建好(mock preseed)——chat 与 createProject 无 FK 竞争(chat 不引用
+    // p-guard,project 不是 chat 的批内 parent)。依赖感知 rank 下两者 rank 均 0 → 保持 IDB 原序
+    // chat→project。旧全局 kind rank(chat=2)无条件把 project 排前改序(红);新实现只在批内存在真实
+    // FK parent 时才后置,无 FK 对保持原序(绿)。精确断言 calls 顺序,禁止 .sort() 抹序。
+    const { fn, calls } = fkChatExecutor({ preseedCanvases: ['c-pre'] })
+    const q = makeQueue(fn)
+    const project: QueuedWrite = {
+      id: 'zz-proj-guard',
+      idempotencyKey: 'mivo-proj-guard',
+      userId: 'userA',
+      op: { kind: 'createProject', name: 'Guard Project', id: 'p-guard' },
+      resourceKey: 'project:p-guard',
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    }
+    const chat: QueuedWrite = {
+      id: 'aa-chat-guard',
+      idempotencyKey: 'mivo-chat-guard',
+      userId: 'userA',
+      op: { kind: 'appendChatMessage', canvasId: 'c-pre', message: { id: 'm1', role: 'user', text: 'hi' } },
+      resourceKey: null,
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    }
+    await __seedWritesForTest([project, chat])
+    const dumped = await __dumpWritesForTest()
+    expect(dumped.map((r) => r.id)).toEqual(['aa-chat-guard', 'zz-proj-guard']) // IDB 序 chat 在前
+
+    const r = await q.drain()
+    // R6-1:无 FK 竞争——chat 依赖的 canvas c-pre 已 preseed(不在批内 pendingCanvasCreateIds),
+    // chat 与同毫秒 createProject(p-guard)互不引用 → 两者 rank 均 0,stable sort 保持 IDB 入队原序
+    // chat→project。旧全局 kind rank 会把 project(0) 排到 chat(2) 前改序(红);依赖感知 rank 不改序(绿)。
+    expect(calls).toHaveLength(2)
+    expect(calls[0]!.op.kind).toBe('appendChatMessage') // 保持 IDB 原序:chat 在前
+    expect(calls[1]!.op.kind).toBe('createProject')
+    expect(r).toEqual({ processed: 2, successes: 2, failures: 0, terminals: 0, paused: false })
+    expect(await q.pendingCount()).toBe(0)
+  })
+})
+
+// ── G1-a R7-1:稳定拓扑排序——只沿真实 FK 边约束顺序,其余一律保持原序 ──
+//
+// 复现 R7-1 P2 阻断项:R6-1 的条件 dependencyRank 虽只在批内存在 FK parent 时给 child 升 rank,但仍用
+// 单一标量 rank 对整批分层排序。混合批中一旦 chat 因批内 canvas 升到 rank 2,所有 rank 0 的无关记录
+// (如 unrelated createProject)都会跨过 chat——即使前两条真实 FK 边已天然有序、第三条与两者无 FK,
+// 正确的 surgical 序应完全不变。返修声明"只重排实际 FK 边"不成立。
+//
+// 修法(lead 指定):稳定拓扑排序——以原 IDB 序(主键 nextAttemptAt/createdAt/入队序)为优先级,Kahn 算法
+// 就绪集(入度 0)每次取原序最靠前者。只建批内真实 FK 边:
+//  - createProject(id) → createCanvas/updateCanvas(projectId=id)(批内)
+//  - createCanvas(id) → appendChatMessage/updateChatMessage/deleteChatMessage(canvasId=id)(批内)
+//  传递成链。无边记录入度 0 → 完全保持原序;有边记录只在 parent 必须先 drain 时后置。
+//
+// 红→绿:10143c2 的条件 rank 对混合批守卫红(canvas→unrelated project→chat)、对双链守卫红(精确序不同);
+// 拓扑排序两者皆绿。
+describe('G1-a R7-1 — 稳定拓扑排序(Kahn + 原序 tie-break,只沿真实 FK 边)', () => {
+  // 复用 R5 的 fkChatExecutor(建模三层 FK 链 + preseed 选项;此处块内重定义,与 R5 隔离)。
+  const fkChatExecutor = (opts: { preseedProjects?: string[]; preseedCanvases?: string[] } = {}) => {
+    const calls: { op: WriteOp; key: string }[] = []
+    const createdProjects = new Set<string>(opts.preseedProjects ?? [])
+    const createdCanvases = new Set<string>(opts.preseedCanvases ?? [])
+    const fn = vi.fn(async (op: WriteOp, key: string): Promise<WriteOutcome> => {
+      calls.push({ op, key })
+      if (op.kind === 'createProject') {
+        createdProjects.add(op.id ?? '')
+        return { status: 'success', revision: 0 }
+      }
+      if (op.kind === 'createCanvas') {
+        if (createdProjects.has(op.projectId)) {
+          createdCanvases.add(op.canvasId)
+          return { status: 'success', revision: 0 }
+        }
+        return { status: 'rejected', body: { error: 'unknown-project' } }
+      }
+      if (op.kind === 'appendChatMessage') {
+        if (createdCanvases.has(op.canvasId)) return { status: 'success' }
+        return { status: 'rejected', body: { error: 'unknown-canvas' } }
+      }
+      return { status: 'success' }
+    })
+    return { fn, calls, createdProjects, createdCanvases }
+  }
+
+  it('混合批守卫:canvas→chat 真实边已天然有序 + 无关 project 在后 → 保持 canvas→chat→unrelated project 3/0', async () => {
+    // R7-1 反例:project p-mixed 已 preseed(canvas 的 project 在先前 drain 建好);同毫秒 IDB 原序严格为
+    // createCanvas(aa,c-mixed) → appendChatMessage(bb,c-mixed) → unrelated createProject(zz,p-unrelated-mixed)。
+    // 前两条真实 FK 边(canvas→chat)已天然有序,第三条与两者无 FK。正确 surgical 稳定序应完全不变。
+    // 10143c2 条件 rank:chat 升 rank 2 → 无关 project(rank 0)跨过 chat → canvas→project→chat(RED);
+    // 拓扑排序:canvas→chat 边存在但原序已 canvas 在 chat 前不改变其相对位置;无关 project 无边不跨过 →
+    // canvas→chat→project(GREEN)。精确断言禁 .sort() 抹序。
+    const { fn, calls } = fkChatExecutor({ preseedProjects: ['p-mixed'] })
+    const q = makeQueue(fn)
+    const canvas: QueuedWrite = {
+      id: 'aa-canvas-mixed',
+      idempotencyKey: 'mivo-canvas-mixed',
+      userId: 'userA',
+      op: { kind: 'createCanvas', canvasId: 'c-mixed', projectId: 'p-mixed', title: 'Mixed Canvas' },
+      resourceKey: 'canvas:c-mixed',
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    }
+    const chat: QueuedWrite = {
+      id: 'mm-chat-mixed',
+      idempotencyKey: 'mivo-chat-mixed',
+      userId: 'userA',
+      op: { kind: 'appendChatMessage', canvasId: 'c-mixed', message: { id: 'm1', role: 'user', text: 'hi' } },
+      resourceKey: null,
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    }
+    const unrelatedProject: QueuedWrite = {
+      id: 'zz-project-mixed',
+      idempotencyKey: 'mivo-proj-mixed',
+      userId: 'userA',
+      op: { kind: 'createProject', name: 'Unrelated Project', id: 'p-unrelated-mixed' },
+      resourceKey: 'project:p-unrelated-mixed',
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    }
+    await __seedWritesForTest([canvas, chat, unrelatedProject])
+    // 确认 setup:IDB getAll 按 key(id)序返回 canvas→chat→project(aa < mm < zz)。
+    const dumped = await __dumpWritesForTest()
+    expect(dumped.map((r) => r.id)).toEqual(['aa-canvas-mixed', 'mm-chat-mixed', 'zz-project-mixed'])
+
+    const r = await q.drain()
+    // R7-1 修复断言:无关 project 不跨过 chat,保持原序 canvas→chat→unrelated project。
+    // 10143c2 此处为 canvas→unrelated project→chat(RED:calls[1] 是 createProject 而非 appendChatMessage)。
+    expect(calls).toHaveLength(3)
+    expect(calls[0]!.op.kind).toBe('createCanvas')
+    expect(calls[1]!.op.kind).toBe('appendChatMessage')
+    expect(calls[2]!.op.kind).toBe('createProject')
+    expect(r).toEqual({ processed: 3, successes: 3, failures: 0, terminals: 0, paused: false })
+    expect(await q.pendingCount()).toBe(0)
+  })
+
+  it('双链交错守卫:c-a→p-a、c-b→p-b 交叉 → 拓扑 tie-break 给 p-a→c-a→p-b→c-b 4/0(不是 rank 分层序)', async () => {
+    // 双链交错:同毫秒 IDB 原序 c-a, c-b, p-a, p-b(canvas 在前 project 在后),c-a→p-a、c-b→p-b 顺序映射。
+    // 10143c2 条件 rank:两 canvas 均 rank 1、两 project 均 rank 0 → rank 内保持原序 → p-a→p-b→c-a→c-b
+    //   (RED:精确序与拓扑 tie-break 不同;两者都合法拓扑,但 rank 分层把所有 project 前置、所有 canvas 后置)。
+    // 拓扑排序:就绪集{p-a,p-b}取原序最小 p-a(idx2) → c-a 就绪(idx0<3)取 c-a → p-b → c-b →
+    //   p-a→c-a→p-b→c-b(GREEN)。断言精确序锁定"就绪即取原序最小"的 tie-break 语义,防退回 rank 分层。
+    const { fn, calls } = fkChatExecutor()
+    const q = makeQueue(fn)
+    const canvasA: QueuedWrite = {
+      id: 'aa-canvas-a',
+      idempotencyKey: 'mivo-canvas-a',
+      userId: 'userA',
+      op: { kind: 'createCanvas', canvasId: 'c-a', projectId: 'p-a', title: 'Canvas A' },
+      resourceKey: 'canvas:c-a',
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    }
+    const canvasB: QueuedWrite = {
+      id: 'bb-canvas-b',
+      idempotencyKey: 'mivo-canvas-b',
+      userId: 'userA',
+      op: { kind: 'createCanvas', canvasId: 'c-b', projectId: 'p-b', title: 'Canvas B' },
+      resourceKey: 'canvas:c-b',
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    }
+    const projectA: QueuedWrite = {
+      id: 'cc-project-a',
+      idempotencyKey: 'mivo-proj-a',
+      userId: 'userA',
+      op: { kind: 'createProject', name: 'Project A', id: 'p-a' },
+      resourceKey: 'project:p-a',
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    }
+    const projectB: QueuedWrite = {
+      id: 'dd-project-b',
+      idempotencyKey: 'mivo-proj-b',
+      userId: 'userA',
+      op: { kind: 'createProject', name: 'Project B', id: 'p-b' },
+      resourceKey: 'project:p-b',
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    }
+    await __seedWritesForTest([canvasA, canvasB, projectA, projectB])
+    const dumped = await __dumpWritesForTest()
+    expect(dumped.map((r) => r.id)).toEqual(['aa-canvas-a', 'bb-canvas-b', 'cc-project-a', 'dd-project-b'])
+
+    const r = await q.drain()
+    // 拓扑 tie-break 断言:每个 project 先于其 canvas,且原序 tie-break 给 p-a→c-a→p-b→c-b。
+    // 10143c2 条件 rank 给 p-a→p-b→c-a→c-b(RED:calls[1] 是 createProject 而非 createCanvas)。
+    expect(calls).toHaveLength(4)
+    expect(calls[0]!.op.kind).toBe('createProject')
+    expect((calls[0]!.op as { id?: string }).id).toBe('p-a')
+    expect(calls[1]!.op.kind).toBe('createCanvas')
+    expect((calls[1]!.op as { canvasId: string }).canvasId).toBe('c-a')
+    expect(calls[2]!.op.kind).toBe('createProject')
+    expect((calls[2]!.op as { id?: string }).id).toBe('p-b')
+    expect(calls[3]!.op.kind).toBe('createCanvas')
+    expect((calls[3]!.op as { canvasId: string }).canvasId).toBe('c-b')
+    expect(r).toEqual({ processed: 4, successes: 4, failures: 0, terminals: 0, paused: false })
+    expect(await q.pendingCount()).toBe(0)
   })
 })

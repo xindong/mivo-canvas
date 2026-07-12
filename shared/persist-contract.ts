@@ -224,6 +224,11 @@ export type Project = {
 
 export type ListProjectsResponse = { projects: Project[] }
 export type CreateProjectRequest = { id?: string; name: string }
+/**
+ * G1-a P1-2:PATCH /api/projects/:id body(projects.ts:185)。rename 走此;If-Match = Project.revision base
+ * (missing → 428 / invalid → 400 / stale → 409 revision-conflict)。wire body 不携带 revision。
+ */
+export type UpdateProjectRequest = { name?: string }
 
 // ── Canvas(api-surface §4.2)─────────────────────────────────────────────────────
 
@@ -272,10 +277,31 @@ export type GetCanvasResponse = CanvasMeta & {
 /** 返修 #8:canvas 枚举(按 project/owner)。 */
 export type ListCanvasResponse = { canvases: CanvasMeta[] }
 
+/**
+ * G1-a P1-2:canvas meta wire payload(PUT /api/canvas/:id body = { payload: CanvasPayload },canvas.ts:284)。
+ * - `projectId` 可改(move;move 双端 owner-only authz,canvas.ts:311-329)。
+ * - `title`/`sourceTemplateId` 可改;`contentVersion` 由 backend bump(wire body 不携带,与 metaRevision 同走 If-Match)。
+ * wire body 不携带 metaRevision/metaRevision base 走 If-Match(missing → 428 / stale → 409)。
+ */
+export type CanvasPayload = {
+  projectId: string
+  title?: string
+  sourceTemplateId?: string
+}
+
+/** PUT /api/canvas/:id body(与 node/edge/anchor PATCH 同 UpsertRequest<{payload}> 形状)。 */
+export type UpdateCanvasRequest = { payload: CanvasPayload }
+
+/** POST /api/canvas → 201/200 CanvasMeta(createCanvas 返回类型与 listCanvas 元素同 shape)。 */
+export type CreateCanvasResponse = CanvasMeta
+
 // ── chat 子资源(DP-6,api-surface §4.2.3)──────────────────────────────────────
 
 /** POST /api/canvas/:id/chat。ChatMessage 17 字段不在此展开(payload 不透明)。 */
 export type CreateChatMessageRequest = { message: unknown }
+
+/** G1-a chat 接线(DP-6R P1-1):PATCH /api/canvas/:id/chat/:msgId body(与 node/edge/anchor PATCH 同 UpsertRequest<{payload}> 形状)。If-Match = msg envelope revision。 */
+export type UpdateChatMessageRequest = { payload: unknown }
 
 /**
  * GET /api/canvas/:id/chat 响应(DP-6R:per-actor collection)。
@@ -532,6 +558,34 @@ export type ResolvedAsset = {
   bytes: Uint8Array
   mimeType: string
 }
+
+// ── G1-a P1-2:asset attach/detach wire seam(冻结契约 + route + defer 边界)──
+// assetStore.ts 的 attachRef/detachRef 已实现(内容寻址 + refcount = references.length + owner-checked),
+// 但无 HTTP 入口。G1-a 冻结 client↔route wire 契约:ownerFp 由服务端从 key 派生(client 不传);
+// contentHash/assetId 在 URL path;nodeId 在 body。节点生命周期 attach/detach 调用方属 G1-c(node mutation),
+// 本轮只冻结 wire shape + route + adapter 方法 + executor op,不接 node 生命周期写(defer 边界)。
+/**
+ * POST /api/assets/:assetId/attach body。ownerFp 服务端派生(client 不可指定,防越权 attach 他人 asset)。
+ * 幂等:同 (assetId, nodeId) 已存在 → 'already-attached'(assetStore attachRef 语义)。
+ */
+export type AttachAssetRequest = { nodeId: string }
+
+/**
+ * POST /api/assets/:assetId/detach body。ownerFp 服务端派生;跨 owner detach → 'owner-mismatch'(decidable,不静默)。
+ * 幂等:ref 不存在 → 'already-detached'。
+ */
+export type DetachAssetRequest = { nodeId: string }
+
+export type AttachAssetResult =
+  | { kind: 'attached' } // 新引用插入
+  | { kind: 'already-attached' } // 幂等:(assetId, nodeId) 已存在
+  | { kind: 'missing' } // 无 record/bytes — attach 拒(decidable,不静默)
+
+export type DetachAssetResult =
+  | { kind: 'detached' } // 引用移除
+  | { kind: 'already-detached' } // 幂等:引用本不存在
+  | { kind: 'missing' } // 无 record
+  | { kind: 'owner-mismatch' } // 跨 owner 非法 detach(decidable)
 
 // ── 返修 #13/N10:NodeRecord payload 白名单(envelope 镜像字段 + status/tasks 拒收 + 逐 type schema)──
 /**
