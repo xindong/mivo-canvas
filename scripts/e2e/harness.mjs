@@ -65,25 +65,33 @@ export const clearAllStorage = async (page) => {
 // mask-cross-scene, mask-hydration all timed out on persist assertions) even
 // though the app had written the data — under the namespaced key.
 //
-// Resolve the logical name through the app's OWN `namespacedKey` so the harness
+// Resolve the logical name through the app's OWN persist user id so the harness
 // reads/writes the same physical key the app uses (single source of truth:
-// anonymous → raw, authenticated → namespaced, no hard-coded userId). Falls back
-// to the raw name when the module isn't reachable — a fresh page before the app
-// hydrates, or a non-app context — in which case the app's
-// `migrateToNamespaced` claims the legacy raw key on its first authenticated
-// read (the migration scenario's v1-inject path still works).
+// anonymous → raw, authenticated → namespaced, no hard-coded userId). The user
+// id is read from the `__MIVO_E2E__` bridge (populated by main.tsx in BOTH dev
+// and prod topologies); the namespacing rule is replicated here on the Node
+// side. mainfix R3: the previous browser-side `import('/src/lib/persistUserId.ts')`
+// worked in dev (vite serves /src) but under prod's static dist server /src has
+// no file → 404 fallback returned index.html → the browser logged "Failed to
+// load module script: MIME text/html" — the try/catch DID catch the promise
+// rejection and fell back to the raw name, but the browser had ALREADY emitted
+// the MIME console error before the catch ran, which the e2e-smoke console-error
+// guard collected → gated chat-generation red in prod (dev served /src so no
+// error). Reading the bridge global involves NO /src module fetch, so no MIME
+// error in either topology. Falls back to the raw name when the bridge isn't
+// reachable — a fresh page before the app hydrates, or a non-app context — in
+// which case the app's `migrateToNamespaced` claims the legacy raw key on its
+// first authenticated read (the migration scenario's v1-inject path still works).
 const resolvePersistKey = async (page, name) => {
   try {
-    return await page.evaluate(async (logical) => {
-      try {
-        const mod = await import('/src/lib/persistUserId.ts')
-        if (mod && typeof mod.namespacedKey === 'function') return mod.namespacedKey(logical)
-      } catch {
-        // module not yet served (pre-hydration) or page is not the app — caller
-        // falls back to the raw name; migrateToNamespaced handles legacy claims.
+    const uid = await page.evaluate(() => {
+      const bridge = globalThis.__MIVO_E2E__
+      if (bridge && typeof bridge.getPersistUserId === 'function') {
+        return bridge.getPersistUserId()
       }
-      return logical
-    }, name)
+      return null
+    })
+    return uid && uid !== 'anonymous' ? `${name}:${uid}` : name
   } catch {
     return name
   }
@@ -222,9 +230,11 @@ const e2eBridgeModules = {
 }
 
 export const installE2EStoreBridge = async (context) => {
-  await context.addInitScript(() => {
-    window.__MIVO_E2E_ENABLED__ = true
-  })
+  // mainfix R3: the __MIVO_E2E_ENABLED__ flag now lives in createSmokePage (set
+  // unconditionally so the bridge populates in dev too, letting resolvePersistKey
+  // read getPersistUserId without a /src import). Here we only install the route
+  // interception that serves canvasStore/chatStore bridge modules under prod's
+  // static dist server (where /src/store/*.ts would otherwise 404).
   await context.route('**/src/store/canvasStore.ts*', async (route) => {
     await route.fulfill({
       status: 200,
@@ -390,6 +400,15 @@ export const createSmokePage = async ({
     viewport: { width: 1512, height: 900 },
     deviceScaleFactor: 1,
     extraHTTPHeaders,
+  })
+  // mainfix R3: flip the e2e bridge flag in BOTH topologies so main.tsx populates
+  // `__MIVO_E2E__` (incl. getPersistUserId) everywhere. Previously only
+  // installE2EStoreBridge (prod-only) set it, so dev never had the bridge and
+  // resolvePersistKey had to browser-import /src/lib/persistUserId.ts — which
+  // 404s under prod's static dist server. The route interception itself stays
+  // prod-only (installE2EStoreBridge below); only the flag is universal.
+  await context.addInitScript(() => {
+    window.__MIVO_E2E_ENABLED__ = true
   })
   if (enableStoreBridgeModules) {
     await installE2EStoreBridge(context)
