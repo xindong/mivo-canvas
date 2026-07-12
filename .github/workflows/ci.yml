@@ -419,8 +419,8 @@ jobs:
   # 保护配置(照 #186→#193 e2e-kernel-gate 先例:分支保护为 PR 外 lead 动作,与 workflow
   # 改动分离)。分支保护加进后,PG 测试失败即阻断 PR 合并。
   #
-  # 时序:#202 已于 2026-07-11 合入 main,四个 PG-gated 测试文件已在 main:
-  #   backend.contract.dual / backend.pg / permissionBackend.contract.dual / persist.route.dual
+  # 时序:#202 已于 2026-07-11 合入 main,本 PR(2026-07-12)接入 p6saga 矩阵,五个 PG-gated 测试文件已在 main:
+  #   backend.contract.dual / backend.pg / permissionBackend.contract.dual / persist.route.dual / p6saga.pg.matrix
   # 故本 job 在每个 PR 上实跑真 PG 用例(契约 32 场景 + 并发回归),失败即红。
   pg-suite:
     name: pg suite (PG16)
@@ -454,6 +454,9 @@ jobs:
       MIVO_PG_PASSWORD: mivo-test-no-password
       MIVO_PG_DB: mivocanvas
       MIVO_PG_UNIT_DB: mivocanvas_unit
+      # p6saga 迁移矩阵 + 并发回归套件隔离库(p6saga.pg.matrix.test.ts 用;与 mivocanvas_unit
+      # 分离,防 DROP SCHEMA 重置污染 backend.pg 套件)。库由下方 psql 步预建。
+      MIVO_PG_UNIT_DB_P6SAGA: mivocanvas_unit_p6saga
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -488,10 +491,15 @@ jobs:
             || PGPASSWORD=mivo-test-no-password psql -h 127.0.0.1 -p 5432 -U mivo -d postgres -c "CREATE DATABASE mivocanvas_unit"
           echo "mivocanvas_unit ready (CREATEDB confirmed)"
           echo "::endgroup::"
+          echo "::group::Ensure mivocanvas_unit_p6saga DB exists (p6saga.pg.matrix.test.ts isolation DB)"
+          PGPASSWORD=mivo-test-no-password psql -h 127.0.0.1 -p 5432 -U mivo -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='mivocanvas_unit_p6saga'" | grep -q 1 \
+            || PGPASSWORD=mivo-test-no-password psql -h 127.0.0.1 -p 5432 -U mivo -d postgres -c "CREATE DATABASE mivocanvas_unit_p6saga"
+          echo "mivocanvas_unit_p6saga ready (p6saga matrix + concurrency isolation DB)"
+          echo "::endgroup::"
 
       # 跑 PG-gated 套件。--no-fileParallelism:两 DB 隔离设计下更稳(lead 指定)。
       # --passWithNoTests:防御性保留(若未来某文件临时移除,0 匹配不算失败)。
-      # #202 已合入,四个 PG-gated 文件在 main,每 PR 实跑真 PG 用例(失败即红 + 阻断合并,
+      # #202 已合入 + 本 PR 接入 p6saga 矩阵,五个 PG-gated 文件在 main,每 PR 实跑真 PG 用例(失败即红 + 阻断合并,
       # 自本 PR 起为 required)。
       - name: Run PG-gated vitest suite
         run: |
@@ -501,7 +509,8 @@ jobs:
             server/persist/backend.contract.dual.test.ts \
             server/persist/backend.pg.test.ts \
             server/persist/permissionBackend.contract.dual.test.ts \
-            server/routes/persist.route.dual.test.ts 2>&1 | tee test-artifacts/pg-suite.log
+            server/routes/persist.route.dual.test.ts \
+            server/persist/p6saga.pg.matrix.test.ts 2>&1 | tee test-artifacts/pg-suite.log
 
       # 汇总:本轮匹配文件数 + vitest 末尾日志。不许静默:0 vs N 可见。
       - name: Surface pg-suite result in job summary
@@ -514,12 +523,12 @@ jobs:
             echo '观察窗已收口(七 PR 全绿),已注册进 main 分支保护必需 check `CI / pg suite (PG16)`(仿 #186→#193 e2e-kernel-gate 先例)。失败即阻断合并。'
             echo ''
             echo '### 时序'
-            echo '- #202 已于 2026-07-11 合入 main,四个 PG-gated 测试文件已在 main。'
-            echo '- 每 PR 实跑真 PG 用例(双后端契约 32 场景 + 并发回归),见下方 vitest 日志。'
+            echo '- #202 已于 2026-07-11 合入 main,本 PR 接入 p6saga 矩阵,五个 PG-gated 测试文件已在 main。'
+            echo '- 每 PR 实跑真 PG 用例(双后端契约 32 场景 + saga 迁移矩阵 + 并发回归),见下方 vitest 日志。'
             echo ''
             echo '### 本轮 vitest 匹配文件数(不许静默:0 vs N 可见)'
             nFound=0
-            for f in server/persist/backend.contract.dual.test.ts server/persist/backend.pg.test.ts server/persist/permissionBackend.contract.dual.test.ts server/routes/persist.route.dual.test.ts; do
+            for f in server/persist/backend.contract.dual.test.ts server/persist/backend.pg.test.ts server/persist/permissionBackend.contract.dual.test.ts server/routes/persist.route.dual.test.ts server/persist/p6saga.pg.matrix.test.ts; do
               if [ -f "$f" ]; then echo "- \`$f\` ✅ 存在"; nFound=$((nFound+1)); else echo "- \`$f\` ⏳ 尚不存在(预期应在 main)"; fi
             done
             echo ''
