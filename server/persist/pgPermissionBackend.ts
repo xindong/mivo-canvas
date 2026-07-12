@@ -116,22 +116,31 @@ export const runPermissionMigrations = async (db: Kysely<PermissionDatabase>): P
  */
 export class PgPermissionBackend implements PermissionBackend {
   private readonly db: Kysely<PermissionDatabase>
+  /** F2:是否拥有(并应在 destroy 时释放)底层 Pool。sharedPool 注入时由拥有者(app)释放,本 backend 不销毁。 */
+  private readonly ownsPool: boolean
   /** ready:migrations 完成建表(无 warm cache——权限无同步 seam)。app 启动 await 后再 serve。 */
   readonly ready: Promise<void>
 
-  constructor(conn: PgConnectionConfig) {
+  /**
+   * F2 返修:支持共享 Pool。`sharedPool` 注入则与 PgPersistBackend 复用同一 Pool(单预算 + 共享
+   * connectionTimeoutMillis);不注入(测试/独立实例)则自建——**含 connectionTimeoutMillis**
+   * (F2 修:旧实现 permission pool 无此参数,池满可无界等)。destroy 仅在 ownsPool 时销毁 pool。
+   */
+  constructor(conn: PgConnectionConfig, sharedPool?: Pool) {
+    const pool = sharedPool ?? new Pool({
+      host: conn.host,
+      port: conn.port,
+      database: conn.database,
+      user: conn.user,
+      password: conn.password,
+      max: conn.maxConnections,
+      idleTimeoutMillis: conn.idleTimeoutMs,
+      // F2 返修:own pool 也设 connectionTimeoutMillis(池满排队超时即抛,fail fast);shared pool 从拥有者继承。
+      connectionTimeoutMillis: conn.connectionTimeoutMs ?? 5000,
+    })
+    this.ownsPool = sharedPool === undefined
     this.db = new Kysely<PermissionDatabase>({
-      dialect: new PostgresDialect({
-        pool: new Pool({
-          host: conn.host,
-          port: conn.port,
-          database: conn.database,
-          user: conn.user,
-          password: conn.password,
-          max: conn.maxConnections,
-          idleTimeoutMillis: conn.idleTimeoutMs,
-        }),
-      }),
+      dialect: new PostgresDialect({ pool }),
     })
     this.ready = this.init()
   }
@@ -141,9 +150,24 @@ export class PgPermissionBackend implements PermissionBackend {
     await this.migrate()
   }
 
-  /** 优雅关闭连接池(app shutdown 用)。 */
+  /** 优雅关闭连接池(app shutdown 用)。F2:shared pool 时不销毁(由拥有者释放),own pool 时 db.destroy 连带销毁。 */
   async destroy(): Promise<void> {
-    await this.db.destroy()
+    if (this.ownsPool) await this.db.destroy()
+  }
+
+  /**
+   * P0.3 readiness probe:`SELECT 1` 探活连接池(捕 PG 挂/连接耗尽/网络断)。与 PgPersistBackend.ping 同模式;
+   * F2 返修:/readyz 现也探活 permission DB(此前只 ping persist,permission pool 耗尽/DB 挂不被发现)。
+   * 不抛错——返 ok=false + reason,让 /readyz 回 503 而非 500(readyz 层把 reason 收敛为稳定 code,不回显)。
+   */
+  async ping(): Promise<{ ok: true } | { ok: false; reason: string }> {
+    try {
+      await sql`SELECT 1`.execute(this.db)
+      return { ok: true }
+    } catch (error) {
+      const reason = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
+      return { ok: false, reason }
+    }
   }
 
   /** 对本 backend 的 db 跑 migrateToLatest(可重放)。测试 beforeAll + 生产 runbook 用。 */
