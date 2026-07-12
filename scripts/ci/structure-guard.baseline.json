@@ -7,13 +7,15 @@
   "_baselineCommit": "22e2e4c (origin/main, 2026-07-03)",
   "_a2Update": "2026-07-04 P2-A2 重做:canvasStore.ts 由 3168 行单体拆为 420 行门面 + 5 slice(documentSlice 377 / nodeMutationSlice 469 / nodeCreationSlice 554 / generationSlice 485 / selectionSlice 375)+ canvasDocumentModel 635。新 slice 文件保持非白名单(由 >900 绝对红线兜底),不上调白名单以免新文件 merge-base=0 触发增量 FAIL。",
   "_a3Update": "2026-07-04 P2-A3:chatStore 经 generationFacade 解耦,useCanvasStore.getState() 计数 6→0(chatStore 不再 import useCanvasStore)。白名单=空。",
+  "_a7aUpdate": "2026-07-13 A7a-3:structure-guard 扩面 — 加 server 分层方向规则(rule ④:非 routes 层禁 import server/routes,基线 0)+ src/app 入扫描(白名单加 LibraryWorkspace.tsx 1316,PR 增量语义)。",
   "_threshold": 900,
-  "_scannedDirs": ["src/store", "src/canvas"],
+  "_scannedDirs": ["src/store", "src/canvas", "src/app"],
   "fileLines": {
     "src/store/canvasStore.ts": 420,
     "src/canvas/useCanvasInteractionController.ts": 1775,
     "src/canvas/actions/canvasActionModel.ts": 1320,
-    "src/canvas/MivoCanvas.tsx": 965
+    "src/canvas/MivoCanvas.tsx": 965,
+    "src/app/LibraryWorkspace.tsx": 1316
   },
   "chatStoreGetStateCount": 0
 }

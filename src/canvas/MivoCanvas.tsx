@@ -17,7 +17,7 @@ import { canImportCanvasFile, importFilesToCanvas, importImageUrlToCanvas } from
 import { useCanvasStore } from '../store/canvasStore'
 import { handleImportError, useOpenNodeDetails } from './canvasImportHandlers'
 import { brushCursorCssFor } from './brushCursors'
-import { brushOutlinePathFor, highlighterOpacity } from './brushGeometry'
+import { brushOutlinePathFor, highlighterOpacity } from '../model/brushGeometry'
 import { BrushOptionsBar } from './BrushOptionsBar'
 import { CanvasContextMenu } from './CanvasContextMenu'
 import { DomRenderer } from '../render/DomRenderer'

@@ -8,7 +8,7 @@ import {
   brushWidthPresets,
   eraserHitStrokeIds,
   highlighterWidthMultiplier,
-} from './brushGeometry'
+} from '../model/brushGeometry'
 
 const strokePoints = [
   { x: 0, y: 0 },

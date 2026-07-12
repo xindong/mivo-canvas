@@ -2,7 +2,7 @@ import { Eraser, Highlighter, Pencil } from 'lucide-react'
 import { useCanvasStore } from '../store/canvasStore'
 import type { BrushToolMode } from '../types/mivoCanvas'
 import { markupColorPresets } from './actions/canvasActionModel'
-import { brushWidthPresets } from './brushGeometry'
+import { brushWidthPresets } from '../model/brushGeometry'
 
 const brushKinds: Array<{ kind: BrushToolMode; label: string; icon: typeof Pencil }> = [
   { kind: 'marker', label: 'Marker', icon: Pencil },

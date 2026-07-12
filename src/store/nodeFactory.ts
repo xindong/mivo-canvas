@@ -9,7 +9,7 @@ import type {
 } from '../types/mivoCanvas'
 import { cloneCanvasNodeV2 } from '../model/documentModelV2'
 import { normalizeAnchors } from '../model/anchorModel'
-import { connectorAnchorPointFor, derivationConnectorBindingsFor } from '../canvas/connectorGeometry'
+import { connectorAnchorPointFor, derivationConnectorBindingsFor } from '../model/connectorGeometry'
 import { makeNode } from './demoScenes'
 import type { ImageDimensions } from '../lib/imageSizing'
 

@@ -4,7 +4,7 @@ import { useResolvedAssetUrl } from '../lib/useResolvedAssetUrl'
 import { useImageNaturalSize } from '../lib/useImageNaturalSize'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 import { useCanvasStore } from '../store/canvasStore'
-import { brushOutlinePathFor } from './brushGeometry'
+import { brushOutlinePathFor } from '../model/brushGeometry'
 import {
   frameRenderStyleFor,
   markupRenderStyleFor,
@@ -19,7 +19,7 @@ import {
   lineSegmentsWithLabelGap,
   markupTextAlignFor,
 } from './markupTextGeometry'
-import { renderKindForNode } from './nodeTypes/canvasNodeRegistry'
+import { renderKindForNode } from '../model/canvasNodeRegistry'
 import { stampSrcFor } from './stampDefs'
 import { defaultTextAlign, defaultTextColor, defaultTextFontSize, defaultTextWeight } from './textGeometry'
 import type { TextResizeEdge } from './useCanvasInteractionController'

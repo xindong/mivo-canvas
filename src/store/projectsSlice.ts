@@ -6,8 +6,8 @@
 // invariant: every user-visible outcome hits debugLogger (log on success, warn
 // on skip); the UI layer adds toastFeedback for create/rename/delete where the
 // user benefits from immediate acknowledgement (see Phase 5).
-import type { SliceCreator } from './canvasStore'
-import { logCanvas, warnCanvas } from './canvasStore'
+import type { SliceCreator } from './canvasStateTypes'
+import { logCanvas, warnCanvas } from './canvasStoreLog'
 import { DEMO_PROJECTS } from './demoScenes'
 import { enqueuePersistWrite } from '../lib/persistBoot'
 

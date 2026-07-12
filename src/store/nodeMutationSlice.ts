@@ -1,6 +1,6 @@
-import type { SliceCreator } from './canvasStore'
+import type { SliceCreator } from './canvasStateTypes'
 import { setNodeTransform } from '../model/documentModelV2'
-import { warnCanvas } from './canvasStore'
+import { warnCanvas } from './canvasStoreLog'
 import { createGroupId, createNodeCopy } from './nodeFactory'
 import {
   childIdsForSections,

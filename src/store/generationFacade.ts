@@ -16,7 +16,7 @@ import { useCanvasStore } from './canvasStore'
 import { useCameraFocusStore } from './cameraFocusStore'
 import type { CanvasGenerationOptions, CanvasState } from './canvasStore'
 import type { CanvasId } from '../types/mivoCanvas'
-import { defaultSizeForNodeType } from '../canvas/nodeTypes/canvasNodeRegistry'
+import { defaultSizeForNodeType } from '../model/canvasNodeRegistry'
 import { AI_SLOT_GAP, chooseAdjacentPlacement } from './aiCanvasWorkflow'
 import { firstAnchorImageFor } from './canvasDocumentModel'
 
