@@ -1246,6 +1246,8 @@ describe('N2-0 返修 §10: 三层信任边界 + typed op union + setByPath 防�
     type ArrayByIdRemove = Extract<DomainOp, { kind: 'array'; class: 'by-id'; intent: 'remove' }>
     type ArrayWholeLww = Extract<DomainOp, { kind: 'array'; class: 'whole-lww' }>
     type ArrayPrimitive = Extract<DomainOp, { kind: 'array'; class: 'primitive' }>
+    // ★ R6 F1 补 by-id splice variant exact-key gate(判决 V3:原 S10-2 漏 splice,给 splice 加 privileged key 不使 build fail)
+    type ArrayByIdSplice = Extract<DomainOp, { kind: 'array'; class: 'by-id'; intent: 'splice' }>
     expectTypeOf<keyof SetOp>().toEqualTypeOf<'kind' | 'fieldPath' | 'value'>()            // set 无 recordId/actor/base/opId
     expectTypeOf<keyof UnsetOp>().toEqualTypeOf<'kind' | 'fieldPath'>()                    // unset 无 recordId/actor/base/opId
     expectTypeOf<keyof ReorderOp>().toEqualTypeOf<'kind' | 'orderedIds'>()                 // reorder 无 recordId(parentId 从 path 注入)
@@ -1254,6 +1256,8 @@ describe('N2-0 返修 §10: 三层信任边界 + typed op union + setByPath 防�
     expectTypeOf<keyof ArrayByIdRemove>().toEqualTypeOf<'kind' | 'fieldPath' | 'class' | 'intent' | 'removeId'>()
     expectTypeOf<keyof ArrayWholeLww>().toEqualTypeOf<'kind' | 'fieldPath' | 'class' | 'intent' | 'value'>()
     expectTypeOf<keyof ArrayPrimitive>().toEqualTypeOf<'kind' | 'fieldPath' | 'class' | 'intent' | 'value'>()
+    // ★ R6 F1:by-id splice variant exact-key gate — splice 亦无 recordId/actor/base/opId(与 insert/remove 同 gate)
+    expectTypeOf<keyof ArrayByIdSplice>().toEqualTypeOf<'kind' | 'fieldPath' | 'class' | 'intent' | 'afterId' | 'removeCount' | 'values'>()
     // @ts-expect-error R5 F1:ClientFieldOp body 零 privileged(无 actor)— 若加回则下行非 error → directive 失效 → build fail
     const _badActor: ClientFieldOp = { clientId: 'A', domain: { kind: 'set', fieldPath: ['title'], value: 'x' }, actor: 'admin' }
     // @ts-expect-error R5 F1:create 不再是 PATCH DomainOp member — 若 create 塞回 DomainOp 则下行非 error → build fail
@@ -1262,10 +1266,13 @@ describe('N2-0 返修 §10: 三层信任边界 + typed op union + setByPath 防�
     const _badCreateNested: DomainOp = { kind: 'strict-tx', ops: [{ kind: 'create', recordId: 'forged', type: 'node', payload: {} }] }
     // @ts-expect-error R5 F1:Array variant 零 privileged(无 recordId)— 若加回则 build fail
     const _badArrayRec: DomainOp = { kind: 'array', fieldPath: ['fills'], class: 'by-id', intent: 'insert', afterId: null, value: { id: 'fA' }, recordId: 'forged' }
+    // ★ R6 F1:by-id splice variant 同样零 privileged(无 recordId)— 判决 V3 验收:给 splice 加 recordId/actor/baseRevision/opId 任一 → tsc -b 失败
+    // @ts-expect-error R6 F1:ArrayByIdSplice 零 privileged(无 recordId)— 若加回则下行非 error → directive 失效 → build fail
+    const _badSpliceRec: DomainOp = { kind: 'array', fieldPath: ['fills'], class: 'by-id', intent: 'splice', afterId: 'f1', removeCount: 1, values: [{ id: 'fB' }], recordId: 'forged' }
     // @ts-expect-error R5 F1:CreateBody 零 privileged(无 recordId)— 若加回则 build fail
     const _badCreateBody: CreateBody = { clientId: 'A', type: 'node', payload: {}, recordId: 'forged' }
     expect(_badActor).toBeDefined(); expect(_badCreateInDomain).toBeDefined(); expect(_badCreateNested).toBeDefined()
-    expect(_badArrayRec).toBeDefined(); expect(_badCreateBody).toBeDefined()  // 标记已用(noUnusedLocals)+ 证明 body/DomainOp 无法携 privileged
+    expect(_badArrayRec).toBeDefined(); expect(_badCreateBody).toBeDefined(); expect(_badSpliceRec).toBeDefined()  // 标记已用(noUnusedLocals)+ 证明 body/DomainOp 无法携 privileged(含 by-id splice,R6 F1)
     // trustify:ClientFieldOp.domain + TrustedCtx → WireOp(body 无 privileged 可伪造;forge 无处可藏)
     const set: DomainOp = { kind: 'set', fieldPath: ['title'], value: 'hacked' }
     const trusted = trustify(
@@ -1307,6 +1314,8 @@ describe('N2-0 返修 §10: 三层信任边界 + typed op union + setByPath 防�
     // ① by-stable-id(fills/strokes/effects):insert/remove by id(并发不漂移)
     const fillsInsert: DomainOp = { kind: 'array', fieldPath: ['fills'], class: 'by-id', intent: 'insert', afterId: 'f1', value: { id: 'fA' } }
     const fillsRemove: DomainOp = { kind: 'array', fieldPath: ['fills'], class: 'by-id', intent: 'remove', removeId: 'fA' }
+    // ★ R6 F1:by-id splice variant(判决 V3:原 S10-3 不构造 splice,补全三类 by-id intent:insert/remove/splice)
+    const fillsSplice: DomainOp = { kind: 'array', fieldPath: ['fills'], class: 'by-id', intent: 'splice', afterId: 'f1', removeCount: 1, values: [{ id: 'fB' }] }
     // ② whole-lww(markupPoints,无 stable-id,mivoCanvas.ts MarkupPoint {x,y,pressure?}):整值 LWW 替换(限制:并发丢前写者,上层 coalesce 或转 by-id)
     const markupReplace: DomainOp = { kind: 'array', fieldPath: ['markupPoints'], class: 'whole-lww', intent: 'replace', value: [{ x: 3, y: 3 }] }
     // ③ primitive(resultNodeIds,string[],mivoCanvas.ts:249):by value(元素是 string 无 id,不能 by-id)
@@ -1324,6 +1333,7 @@ describe('N2-0 返修 §10: 三层信任边界 + typed op union + setByPath 防�
     // ★ 三类 array 同一 adaptToWire 覆盖(对齐 §10 三类 union,无另造冲突局部类型):
     const wireFills = adaptToWire(fillsInsert, ctx); expect(wireFills.domain).toBe(fillsInsert)              // ① fills by-id insert
     const wireFillsRm = adaptToWire(fillsRemove, ctx); expect(wireFillsRm.domain).toBe(fillsRemove)        // ① fills by-id remove
+    const wireFillsSp = adaptToWire(fillsSplice, ctx); expect(wireFillsSp.domain).toBe(fillsSplice)        // ① fills by-id splice(R6 F1 补:正常 splice 经 adapter trusted ctx 唯一生效)
     const wireMarkup = adaptToWire(markupReplace, ctx); expect(wireMarkup.domain).toBe(markupReplace)      // ② markupPoints whole-lww
     const wireResult = adaptToWire(resultInsert, ctx); expect(wireResult.domain).toBe(resultInsert)        // ③ resultNodeIds primitive
     // ★ §10 验收:三类 array 均可构造 fills/markupPoints/resultNodeIds;strict-tx = 跨 record 严格事务原子(P1-2/G3 跨介质边界,非 LWW)
