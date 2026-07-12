@@ -1,11 +1,28 @@
 import 'fake-indexeddb/auto'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  __bumpPendingCountersForTest,
+  __dumpIdbTerminalsForTest,
+  __dumpTerminalsForTest,
   __dumpWritesForTest,
+  __enforceTerminalCapForTest,
+  __isWriteQueueBlockedForTest,
+  __onErrorBlockedClearCountForTest,
+  __readIdbTerminalCountersForTest,
+  __recordTerminalForTest,
   __resetWriteQueueDb,
   __seedWritesForTest,
+  __setIdbBlockTimeoutForTest,
+  __setMaxTerminalsForTest,
+  __setClaimBarrierHookForTest,
+  __setOpenDbUpgradeAbortHookForTest,
+  __setTerminalFaultInjectorForTest,
+  __setWriteQueueDbNameForTest,
   classifyHttpStatus,
   createWriteQueue,
+  getWriteQueueTerminalCounters,
+  resetTerminalCountersBaseline,
+  type TerminalCounterShape,
   type QueuedWrite,
   type WriteExecutor,
   type WriteOp,
@@ -55,6 +72,20 @@ const putUserStateOp = (key: string, value: unknown, baseRevision?: Revision): W
 })
 const deleteUserStateOp = (key: string): WriteOp => ({ kind: 'deleteUserState', key })
 const appendChatOp = (canvasId: string, message: unknown): WriteOp => ({ kind: 'appendChatMessage', canvasId, message })
+
+// P1-4 r2: construct a controlled QueuedWrite for __recordTerminalForTest (the enqueue
+// path mints random UUIDs; the concurrency test needs deterministic, distinct records).
+const makeMinimalQueuedWrite = (id: string, nodeId: string): QueuedWrite => ({
+  id,
+  idempotencyKey: `mivo-${id}`,
+  userId: 'userA',
+  op: minimalNode('c1', nodeId),
+  resourceKey: `node:c1:${nodeId}`,
+  createdAt: 1000,
+  attempts: 1,
+  nextAttemptAt: 1000,
+  status: 'pending',
+})
 
 // ---- executor that serves a sequence of outcomes (clamped to last) ----
 const seqExecutor = (outcomes: WriteOutcome[]) => {
@@ -1482,5 +1513,767 @@ describe('G1-a R7-1 — 稳定拓扑排序(Kahn + 原序 tie-break,只沿真实 
     expect((calls[3]!.op as { canvasId: string }).canvasId).toBe('c-b')
     expect(r).toEqual({ processed: 4, successes: 4, failures: 0, terminals: 0, paused: false })
     expect(await q.pendingCount()).toBe(0)
+  })
+})
+
+// ── FX-7 / A6: durable terminal ledger (dead-letter / conflict / rejected outcomes) ──
+//
+// 决策 3(lead A6 task pack):writeRetryQueue 的 dead-letter/conflict 终态处理(现状"记录后立即
+// 删除")增加持久化终态账本(IDB,含 op 摘要/错误码/时间),供 A3 灰度观察窗定量统计
+// "dead-letter=0" / "不可解释 conflict=0"。**只加账本不改重试语义** —— 账本是 append-only,
+// 与现有 delete-after-surface 并行;retry/backoff/terminal-decision 逻辑不动。
+//
+// 账本查询入口(生产/A3 观察):
+//   import { getWriteQueueTerminals } from './writeRetryQueue'
+//   const terminals = await getWriteQueueTerminals()   // [{status, opKind, resourceKey, message, attempts, timestamp, ...}]
+// 测试入口:__dumpTerminalsForTest()(同数据,test-only 镜像)。
+
+describe('FX-7 / A6 — durable terminal ledger (append-only; retry semantics unchanged)', () => {
+  it('SC3: a dead-letter outcome is recorded in the durable ledger with its error code + op summary', async () => {
+    const { fn } = seqExecutor([{ status: 'transient', message: 'http_503' }])
+    const q = makeQueue(fn, { maxAttempts: 2, baseDelayMs: 1000, maxDelayMs: 60_000 })
+    await q.enqueue(minimalNode('c1', 'n1'))
+    // attempt 1: attempts 0→1 (<2) → backoff
+    expect((await q.drain()).failures).toBe(1)
+    tick(800) // past backoff
+    // attempt 2: attempts 1→2 (>=2) → dead-letter (terminal)
+    const r = await q.drain()
+    expect(r.terminals).toBe(1)
+
+    // The durable terminal ledger has the dead-letter entry, queryable with the error code.
+    const ledger = await __dumpTerminalsForTest()
+    expect(ledger).toHaveLength(1)
+    const entry = ledger[0]!
+    expect(entry.status).toBe('dead-letter') // error code
+    expect(entry.opKind).toBe('upsertNode') // op summary
+    expect(entry.message).toContain('http_503') // error detail
+    expect(entry.message).toContain('after 2 attempts')
+    expect(entry.attempts).toBe(2) // attempts at termination
+    expect(entry.resourceKey).toBe('node:c1:n1') // resource summary
+  })
+
+  it('conflict + rejected + terminal outcomes are all ledgered (A3 audit coverage)', async () => {
+    // conflict (409 revision-conflict)
+    const cq = makeQueue(seqExecutor([{ status: 'conflict', currentRevision: 9 }]).fn, { onConflict: vi.fn() })
+    await cq.enqueue(minimalNode('c1', 'n1', 5))
+    await cq.drain()
+    // rejected (4xx)
+    const rq = makeQueue(seqExecutor([{ status: 'rejected', body: { error: 'bad-request' } }]).fn)
+    await rq.enqueue(minimalNode('c2', 'n2'))
+    await rq.drain()
+    // plain terminal (non-classifiable HTTP)
+    const tq = makeQueue(seqExecutor([{ status: 'terminal', message: 'http_418' }]).fn)
+    await tq.enqueue(minimalNode('c3', 'n3'))
+    await tq.drain()
+
+    const ledger = await __dumpTerminalsForTest()
+    const statuses = ledger.map((e) => e.status).sort()
+    expect(statuses).toEqual(['conflict', 'rejected', 'terminal'])
+    // each entry carries its error-code detail in `message`
+    const byStatus = new Map(ledger.map((e) => [e.status, e]))
+    expect(byStatus.get('conflict')!.message).toContain('9')
+    expect(byStatus.get('rejected')!.message).toContain('bad-request')
+    expect(byStatus.get('terminal')!.message).toContain('http_418')
+  })
+
+  it('success outcomes are NOT ledgered (success is not a failure terminal)', async () => {
+    const { fn } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue(minimalNode('c1', 'n1'))
+    await q.drain()
+    expect((await __dumpTerminalsForTest()).length).toBe(0)
+  })
+
+  it('ledger does not change retry semantics: a transient op still retries with backoff then succeeds', async () => {
+    // The ledger is append-only alongside delete-after-surface; it must not alter the
+    // retry/backoff/terminal-decision flow. A transient op retries and succeeds on the
+    // second attempt — the ledger stays empty until a real terminal outcome.
+    const { fn, calls } = seqExecutor([
+      { status: 'transient', message: 'http_503' },
+      { status: 'success' },
+    ])
+    const q = makeQueue(fn, { baseDelayMs: 1000, maxDelayMs: 60_000 })
+    await q.enqueue(minimalNode('c1', 'n1'))
+    expect((await q.drain()).failures).toBe(1)
+    tick(1000) // past backoff
+    expect((await q.drain()).successes).toBe(1)
+    expect(calls).toHaveLength(2)
+    // No terminal ledger entry — success is not a failure terminal.
+    expect((await __dumpTerminalsForTest()).length).toBe(0)
+  })
+})
+
+// ── P1-3: writeRetryQueue openDb upgrade blocking + cooperative close ──
+//
+// 复现 P1-3 阻断项:openDb v1→v2 无 onblocked 处理 + 已开连接无 versionchange 协作关闭。
+// 旧 tab 持 v1 连接(无 onversionchange)时新 tab open(2) 永久 pending,所有 IDB 操作卡死,
+// 且不触发降级 catch → 全部静默挂死。
+//
+// 修(lead 指定):openDb 加 onblocked → 定时超时降级内存 + onsuccess 后 db.onversionchange 主动 close。
+// 测试用 stub 控制 onblocked/versionchange 事件(确定性,避免跨测试 DB 版本号交叉污染)。
+
+// ── P1-3 (second-round): openDb upgrade blocking + cooperative close ──
+//
+// sol 实测证伪了第一轮的 stub 测试(只 fire 事件,没建真实 v1 连接 → 假绿):blocked 后
+// 第二个 open 排在第一个 pending upgrade 后面,不收 onblocked、无自己的 timeout → 永久挂。
+// 修:blocked timeout 后进模块级 blocked 状态,后续 openDb 立即 reject→memStore,不再新建 open;
+// 晚到 onsuccess → close+清状态恢复。同一 blocker 下绝不排队第二个 open。
+//
+// 验收测试**必须真实连接,不许事件 stub**(lead 红线):fake-indexeddb 真实建 v1 连接持有。
+
+describe('FX-7 / A6 P1-3 (r2) — real-connection upgrade blocking + cooperative close', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    return __resetWriteQueueDb()
+  })
+
+  it('① a real held v1 connection blocks the v2 upgrade → enqueue/pendingCount degrade to mem WITHOUT hanging (Promise.race 1s)', async () => {
+    const testDb = 'mivo-write-queue-p13-blocked'
+    __setWriteQueueDbNameForTest(testDb)
+    __setIdbBlockTimeoutForTest(30)
+    // Open a real v1 connection and HOLD it (no onversionchange handler → won't cooperate-close).
+    const v1Open = indexedDB.open(testDb, 1)
+    v1Open.onupgradeneeded = () => {
+      const db = v1Open.result
+      if (!db.objectStoreNames.contains('writes')) db.createObjectStore('writes', { keyPath: 'id' })
+    }
+    const v1Db = await new Promise<IDBDatabase>((resolve, reject) => {
+      v1Open.onsuccess = () => resolve(v1Open.result)
+      v1Open.onerror = () => reject(v1Open.error)
+    })
+    // NOTE: no v1Db.onversionchange → this connection won't close → blocks the module's open(v2).
+
+    const { fn } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    // enqueue must NOT hang — it degrades to memStore via the blocked-timeout → blocked-state path.
+    // The second openDb (putWrite) immediately rejects (blockedState='blocked') — no second open queued.
+    const HUNG = Symbol('hung')
+    const outcome = await Promise.race([
+      q.enqueue(minimalNode('c1', 'n1')).then(
+        () => 'ok' as const,
+        () => 'rejected' as const,
+      ),
+      new Promise<typeof HUNG>((r) => setTimeout(() => r(HUNG), 1000)),
+    ])
+    expect(outcome).toBe('ok') // did NOT hang (would be HUNG if the second open queued behind the stuck upgrade)
+    expect(await q.pendingCount()).toBe(1) // memStore has the record (IDB blocked → degraded)
+    expect(warnLog).toHaveBeenCalledWith('Write Retry Queue', expect.stringContaining('using in-memory fallback'))
+    v1Db.close() // cleanup: release the blocker so afterEach/afterAll can reopen
+  })
+
+  it('② after closing the v1 blocker, the late onsuccess does not leak + subsequent ops recover IDB', async () => {
+    const testDb = 'mivo-write-queue-p13-recover'
+    __setWriteQueueDbNameForTest(testDb)
+    __setIdbBlockTimeoutForTest(30)
+    const v1Open = indexedDB.open(testDb, 1)
+    v1Open.onupgradeneeded = () => {
+      const db = v1Open.result
+      if (!db.objectStoreNames.contains('writes')) db.createObjectStore('writes', { keyPath: 'id' })
+    }
+    const v1Db = await new Promise<IDBDatabase>((resolve, reject) => {
+      v1Open.onsuccess = () => resolve(v1Open.result)
+      v1Open.onerror = () => reject(v1Open.error)
+    })
+
+    const { fn } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue(minimalNode('c1', 'n1')) // blocked → memStore (blockedState='blocked')
+    expect(await q.pendingCount()).toBe(1)
+    expect(warnLog).toHaveBeenCalledWith('Write Retry Queue', expect.stringContaining('using in-memory fallback'))
+
+    // Close the blocker → the stuck v2 request resumes → late onsuccess fires → handler
+    // closes the connection + clears blockedState (no leak). Wait for the DB to reach v2.
+    v1Db.close()
+    await vi.waitFor(
+      async () => {
+        // A fresh open(v2) should succeed (not block) once the late onsuccess completed.
+        const probe = indexedDB.open(testDb, 2)
+        await new Promise<void>((resolve, reject) => {
+          probe.onsuccess = () => {
+            probe.result.close()
+            resolve()
+          }
+          probe.onblocked = () => reject(new Error('still blocked — late onsuccess did not fire'))
+          probe.onerror = () => reject(probe.error)
+        })
+      },
+      { timeout: 1000, interval: 10 },
+    )
+
+    // Subsequent module op recovers IDB (fresh open succeeds; no degradation warn).
+    warnLog.mockClear()
+    await q.enqueue(minimalNode('c1', 'n2'))
+    expect(warnLog).not.toHaveBeenCalledWith(
+      'Write Retry Queue',
+      expect.stringContaining('using in-memory fallback'),
+    )
+    expect((await __dumpWritesForTest()).length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('③ a real v2 connection cooperatively closes on a v3 upgrade (onversionchange)', async () => {
+    const testDb = 'mivo-write-queue-p13-coop'
+    __setWriteQueueDbNameForTest(testDb)
+    __setIdbBlockTimeoutForTest(30)
+    const { fn } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    // Module opens v2 (fresh DB → onupgradeneeded creates writes/terminals/meta) + caches the
+    // connection with db.onversionchange → close.
+    await q.pendingCount()
+
+    // Another "tab" requests a v3 upgrade. The module's v2 connection should get versionchange
+    // → close (cooperative) so the v3 upgrade proceeds (not blocked).
+    const v3Open = indexedDB.open(testDb, 3)
+    let v3Result: 'success' | 'blocked' | null = null
+    await new Promise<void>((resolve) => {
+      v3Open.onsuccess = () => {
+        v3Result = 'success'
+        v3Open.result.close()
+        resolve()
+      }
+      v3Open.onblocked = () => {
+        v3Result = 'blocked' // module's v2 did NOT cooperate-close
+        resolve()
+      }
+      v3Open.onerror = () => {
+        v3Result = 'blocked'
+        resolve()
+      }
+    })
+    expect(v3Result).toBe('success') // cooperative close → v3 succeeded, not blocked
+  })
+
+  it('④ (P1-A) a stuck upgrade that errors/aborts clears the blocked state → next fresh open recovers IDB', async () => {
+    const testDb = 'mivo-write-queue-p13-abort'
+    __setWriteQueueDbNameForTest(testDb)
+    __setIdbBlockTimeoutForTest(30)
+    // Hold a real v1 connection (no onversionchange → blocks the module's open(v2)).
+    const v1Open = indexedDB.open(testDb, 1)
+    v1Open.onupgradeneeded = () => {
+      const db = v1Open.result
+      if (!db.objectStoreNames.contains('writes')) db.createObjectStore('writes', { keyPath: 'id' })
+    }
+    const v1Db = await new Promise<IDBDatabase>((resolve, reject) => {
+      v1Open.onsuccess = () => resolve(v1Open.result)
+      v1Open.onerror = () => reject(v1Open.error)
+    })
+
+    const { fn } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    // Module open(v2) → blocked → timeout → blockedState='blocked' (enqueue degrades to mem).
+    await q.enqueue(minimalNode('c1', 'n1'))
+    expect(await q.pendingCount()).toBe(1) // memStore
+    expect(__isWriteQueueBlockedForTest()).toBe(true)
+
+    // Set the upgrade to abort when it resumes (after v1 closes) → version-change tx aborts
+    // → the open request errors (onerror). P1-A: onerror clears blockedState.
+    __setOpenDbUpgradeAbortHookForTest((tx) => {
+      tx.abort()
+    })
+    v1Db.close() // release the blocker → stuck v2 resumes → onupgradeneeded → abort → onerror
+    await vi.waitFor(() => expect(__isWriteQueueBlockedForTest()).toBe(false), {
+      timeout: 1000,
+      interval: 10,
+    })
+    // P1-A: the onerror branch fired + cleared the blocked state (not the late-onsuccess
+    // path). This is the specific fix for the "late error permanently locks blocked" bug.
+    expect(__onErrorBlockedClearCountForTest()).toBeGreaterThan(0)
+    // blockedState cleared by P1-A (onerror). Clear the hook so the recovery open is NOT aborted.
+    __setOpenDbUpgradeAbortHookForTest(undefined)
+    // Next module op recovers IDB (fresh open succeeds; no degradation warn).
+    warnLog.mockClear()
+    await q.enqueue(minimalNode('c1', 'n2'))
+    expect(warnLog).not.toHaveBeenCalledWith(
+      'Write Retry Queue',
+      expect.stringContaining('using in-memory fallback'),
+    )
+  })
+})
+
+// ── P1-4: non-retreatable per-status cumulative terminal counters (A3 false-green) ──
+//
+// 复现 P1-4 阻断项:getWriteQueueTerminals 只本机 256 条快照,cap 静默 evict 最老 → 真实
+// dead-letter 可被淘汰后 filter 得 0,A3 硬 SC 假绿。
+//
+// 修(lead 指定):持久化不可回退的 per-status 累计计数器(IDB meta,recordTerminal 时递增,
+// evict 不减)+ ledger-eviction 计数;查询面 getWriteQueueTerminalCounters()(含 baseline 语义,
+// resetTerminalCountersBaseline())。A3 判定以 counters(不可回退)为准而非快照 filter。
+
+describe('FX-7 / A6 P1-4 — non-retreatable terminal counters (A3 uses counters, not snapshot)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    clockMs = 1_000
+    setPersistUserId('userA')
+    return __resetWriteQueueDb()
+  })
+  afterEach(async () => {
+    await __resetWriteQueueDb()
+    __resetPersistUserId()
+  })
+
+  it('per-status counters are cumulative + non-retreatable (survive ledger eviction)', async () => {
+    // Shrink the cap so we record 7 dead-letters with 2 evictions (fast, no 256-record run).
+    __setMaxTerminalsForTest(5)
+    const { fn } = seqExecutor([{ status: 'transient', message: 'http_503' }])
+    const q = makeQueue(fn, { maxAttempts: 2, baseDelayMs: 1000, maxDelayMs: 60_000 })
+    for (let i = 0; i < 7; i++) {
+      await q.enqueue(minimalNode('c1', `n${i}`))
+      await q.drain() // attempt 1: transient → backoff
+      tick(10_000) // past backoff
+      await q.drain() // attempt 2: dead-letter
+    }
+
+    // Snapshot is capped (5) — 2 entries were evicted.
+    const ledger = await __dumpTerminalsForTest()
+    expect(ledger.length).toBeLessThanOrEqual(5)
+
+    // The non-retreatable counter reflects ALL 7 dead-letters (evict does NOT decrement).
+    const { counters } = await getWriteQueueTerminalCounters()
+    expect(counters['dead-letter']).toBe(7)
+    expect(counters.evicted).toBeGreaterThanOrEqual(2) // eviction count tracked
+
+    // The snapshot filter would FALSELY read 0 for an evicted dead-letter — counters do not.
+    const ledgerDeadLetters = ledger.filter((e) => e.status === 'dead-letter').length
+    expect(counters['dead-letter']).toBeGreaterThan(ledgerDeadLetters) // counters > snapshot
+  })
+
+  it('baseline semantics: A3 delta = counters - baseline (not snapshot filter)', async () => {
+    __setMaxTerminalsForTest(5)
+    const { fn } = seqExecutor([{ status: 'transient', message: 'http_503' }])
+    const q = makeQueue(fn, { maxAttempts: 2, baseDelayMs: 1000, maxDelayMs: 60_000 })
+    // Pre-baseline: 3 dead-letters.
+    for (let i = 0; i < 3; i++) {
+      await q.enqueue(minimalNode('c1', `n${i}`))
+      await q.drain()
+      tick(10_000)
+      await q.drain()
+    }
+    // A3 observation window opens — snapshot the baseline.
+    await resetTerminalCountersBaseline()
+    const before = await getWriteQueueTerminalCounters()
+    expect(before.baseline).not.toBeNull()
+    expect(before.baseline?.['dead-letter']).toBe(3)
+    expect(before.baselineTs).not.toBeNull()
+
+    // During the window: 1 new dead-letter.
+    await q.enqueue(minimalNode('c1', 'window'))
+    await q.drain()
+    tick(10_000)
+    await q.drain()
+
+    const after = await getWriteQueueTerminalCounters()
+    expect(after.counters['dead-letter']).toBe(4) // cumulative
+    // A3 green/red judgment = delta (counters - baseline), NOT snapshot filter.
+    const deadLetterSince = after.counters['dead-letter'] - (after.baseline?.['dead-letter'] ?? 0)
+    expect(deadLetterSince).toBe(1) // 1 new dead-letter in the window → NOT green (would be 0 for green)
+  })
+
+  it('conflict + rejected outcomes bump their respective counters (per-status, not just dead-letter)', async () => {
+    const cq = makeQueue(seqExecutor([{ status: 'conflict', currentRevision: 9 }]).fn, { onConflict: vi.fn() })
+    await cq.enqueue(minimalNode('c1', 'n1', 5))
+    await cq.drain()
+    const rq = makeQueue(seqExecutor([{ status: 'rejected', body: { error: 'bad' } }]).fn)
+    await rq.enqueue(minimalNode('c2', 'n2'))
+    await rq.drain()
+    const { counters } = await getWriteQueueTerminalCounters()
+    expect(counters.conflict).toBe(1)
+    expect(counters.rejected).toBe(1)
+    expect(counters['dead-letter']).toBe(0)
+  })
+
+  // ── P1-4 (second-round): atomic terminal tx (entry + counter in ONE tx) ──
+  // sol 实测证伪了第一轮(三个独立 tx → 崩溃窗口 + 跨 tab lost update)。
+
+  it('① fault-inject tx abort → NEITHER ledger entry NOR counter lands in IDB (atomic; no partial commit)', async () => {
+    __setMaxTerminalsForTest(256) // no cap eviction — isolate the entry+counter atomicity
+    // Fault-inject: abort the recordTerminal atomic tx (phase 'record') so neither the
+    // entry put nor the counter RMW commits (tx rolls back atomically).
+    __setTerminalFaultInjectorForTest((phase, tx) => {
+      if (phase === 'record') tx.abort()
+    })
+
+    const { fn } = seqExecutor([{ status: 'terminal', message: 'http_418' }])
+    const q = makeQueue(fn)
+    await q.enqueue(minimalNode('c1', 'n1'))
+    await q.drain() // terminal outcome → recordTerminal → tx aborts → mem fallback
+
+    // IDB ledger does NOT contain the aborted entry (atomic rollback). The union with mem
+    // would show the mem-fallback entry — so assert on the IDB-only view.
+    const idbLedger = await __dumpIdbTerminalsForTest()
+    expect(idbLedger.find((e) => e.status === 'terminal')).toBeUndefined()
+    // IDB counter is UNCHANGED (no increment — the tx that would bump it aborted).
+    const idbCounters = await __readIdbTerminalCountersForTest()
+    expect(idbCounters.terminal).toBe(0)
+    // No "ledger committed / counter unchanged" partial state can exist (both or neither).
+  })
+
+  it('② two concurrent recordTerminal calls → ledger=2 + counter delta=2 (no cross-tab lost update)', async () => {
+    __setMaxTerminalsForTest(256)
+    const baseCounters = await getWriteQueueTerminalCounters()
+    const baselineDeadLetter = baseCounters.counters['dead-letter']
+
+    // Fire two recordTerminal calls in parallel (simulates cross-tab concurrent terminals).
+    // With atomic txs, IDB serializes the two TERMINALS+META txs → both land + counter=+2
+    // (no RMW lost update; the non-atomic version would read 0/put 1 twice → counter=+1).
+    const rec1 = makeMinimalQueuedWrite('rec1', 'n1')
+    const rec2 = makeMinimalQueuedWrite('rec2', 'n2')
+    await Promise.all([
+      __recordTerminalForTest(rec1, 'dead-letter', 'm1'),
+      __recordTerminalForTest(rec2, 'dead-letter', 'm2'),
+    ])
+
+    const ledger = await __dumpTerminalsForTest()
+    expect(ledger.filter((e) => e.status === 'dead-letter').length).toBe(2)
+    const after = await getWriteQueueTerminalCounters()
+    expect(after.counters['dead-letter'] - baselineDeadLetter).toBe(2)
+  })
+
+  it('③ 7 terminals with cap=5 → ledger caps at 5 (evicted=2) but cumulative counter stays 7 (non-retreatable)', async () => {
+    __setMaxTerminalsForTest(5)
+    const { fn } = seqExecutor([{ status: 'transient', message: 'http_503' }])
+    const q = makeQueue(fn, { maxAttempts: 2, baseDelayMs: 1000, maxDelayMs: 60_000 })
+    for (let i = 0; i < 7; i++) {
+      await q.enqueue(minimalNode('c1', `n${i}`))
+      await q.drain()
+      tick(10_000)
+      await q.drain()
+    }
+    // Atomic cap tx: delete + evicted increment in one tx → evicted=2, no partial state.
+    const { counters } = await getWriteQueueTerminalCounters()
+    expect(counters['dead-letter']).toBe(7) // cumulative, non-retreatable (evict does NOT decrement)
+    expect(counters.evicted).toBe(2)
+    const ledger = await __dumpTerminalsForTest()
+    expect(ledger.length).toBeLessThanOrEqual(5) // snapshot capped
+  })
+
+  // ── P1-B (third-round): delta model — durable IDB total + local pending delta ──
+  // sol 反例:round-2 的 mergeCounters(max) 不守恒——tab1 mem=3(IDB 失败)+ tab2 IDB=2 → max=3,
+  // 真值 5 永久少计,矛盾于"A3 MUST-use 这些 counter 防假绿"。delta 模型:mem 只记 pending delta,
+  // IDB 恢复时在原子 tx 内 idbCurrent + capturedPending + currentIncrement,commit 后扣 captured delta。
+
+  it('④ (P1-B) IDB=2 + mem pending delta=3 → recover → 6 (delta model; NOT max=3 or 4)', async () => {
+    __setMaxTerminalsForTest(256) // no cap — isolate the counter delta model
+    // 2 successful recordTerminals → IDB counter = 2 (dead-letter), pending delta = 0.
+    await __recordTerminalForTest(makeMinimalQueuedWrite('r1', 'n1'), 'dead-letter', 'm1')
+    await __recordTerminalForTest(makeMinimalQueuedWrite('r2', 'n2'), 'dead-letter', 'm2')
+    let idb = await __readIdbTerminalCountersForTest()
+    expect(idb['dead-letter']).toBe(2)
+
+    // 3 fault-aborted recordTerminals → pending delta = 3 (mem fallback), IDB stays 2.
+    __setTerminalFaultInjectorForTest((phase, tx) => {
+      if (phase === 'record') tx.abort()
+    })
+    await __recordTerminalForTest(makeMinimalQueuedWrite('r3', 'n3'), 'dead-letter', 'm3')
+    await __recordTerminalForTest(makeMinimalQueuedWrite('r4', 'n4'), 'dead-letter', 'm4')
+    await __recordTerminalForTest(makeMinimalQueuedWrite('r5', 'n5'), 'dead-letter', 'm5')
+    __setTerminalFaultInjectorForTest(undefined)
+    idb = await __readIdbTerminalCountersForTest()
+    expect(idb['dead-letter']).toBe(2) // IDB unchanged (aborts rolled back)
+    // read = idbCurrent(2) + pendingDelta(3) = 5 (delta model; max model would give max(2,3)=3).
+    const before = await getWriteQueueTerminalCounters()
+    expect(before.counters['dead-letter']).toBe(5)
+
+    // Recovery: 1 successful recordTerminal → flushes pending delta into IDB.
+    // next = idbCurrent(2) + capturedPending(3) + currentIncrement(1) = 6; pending delta → 0.
+    await __recordTerminalForTest(makeMinimalQueuedWrite('r6', 'n6'), 'dead-letter', 'm6')
+    const after = await getWriteQueueTerminalCounters()
+    expect(after.counters['dead-letter']).toBe(6) // NOT 3 (max) or 4 — delta model is conservative
+    idb = await __readIdbTerminalCountersForTest()
+    expect(idb['dead-letter']).toBe(6) // durable IDB total now 6
+  })
+
+  // ── P2-C (third-round): cap tx fault injection (round-2 only injected the record tx) ──
+
+  it('⑤ (P2-C) cap tx abort → ledger NOT deleted + evicted NOT incremented; clear fault → re-run lands both', async () => {
+    __setMaxTerminalsForTest(3)
+    // Seed 3 terminals (at cap, no eviction yet).
+    await __recordTerminalForTest(makeMinimalQueuedWrite('c1', 'n1'), 'dead-letter', 'm1')
+    await __recordTerminalForTest(makeMinimalQueuedWrite('c2', 'n2'), 'dead-letter', 'm2')
+    await __recordTerminalForTest(makeMinimalQueuedWrite('c3', 'n3'), 'dead-letter', 'm3')
+    expect((await __dumpIdbTerminalsForTest()).length).toBe(3)
+    expect((await __readIdbTerminalCountersForTest()).evicted).toBe(0)
+
+    // Inject: abort the cap tx (phase 'cap') AFTER deletes + counter put are scheduled.
+    __setTerminalFaultInjectorForTest((phase, tx) => {
+      if (phase === 'cap') tx.abort()
+    })
+    // A 4th recordTerminal: entry+counter tx commits (4th entry), THEN enforceTerminalCap
+    // runs → cap tx (4 > 3, excess=1, schedules delete + evicted++) → abort → rolls back.
+    await __recordTerminalForTest(makeMinimalQueuedWrite('c4', 'n4'), 'dead-letter', 'm4')
+    // Atomic rollback: ledger still has 4 (no delete), evicted still 0 (no increment).
+    expect((await __dumpIdbTerminalsForTest()).length).toBe(4) // NOT deleted
+    expect((await __readIdbTerminalCountersForTest()).evicted).toBe(0) // NOT incremented
+
+    // Clear the fault → re-run cap (via another recordTerminal) → deletes + evicted land.
+    __setTerminalFaultInjectorForTest(undefined)
+    await __recordTerminalForTest(makeMinimalQueuedWrite('c5', 'n5'), 'dead-letter', 'm5')
+    // Now 5 entries, cap=3 → evicted=2 (oldest 2 deleted), ledger caps at 3.
+    expect((await __dumpIdbTerminalsForTest()).length).toBe(3)
+    expect((await __readIdbTerminalCountersForTest()).evicted).toBe(2)
+  })
+
+  // ── P1-B (fourth-round): claim model — pending delta split into pending + inFlight ──
+  // sol 反例:capture 发生在 IDB tx 排队之前 → 两并发 record capture 同一份 pending=3,各自 tx
+  // 都加进 durable → 重复(durable=8,期望 5)。claim 模型:tx 开始时同步(JS 单线程原子)把
+  // pendingDelta 移入 inFlightDelta;commit 清 claim;abort 退回;read = idbCurrent + pending + inFlight。
+
+  it('⑥ (P1-B r4) pending=3 + two concurrent successful record → durable + read = 5 (NOT 8; no double-flush)', async () => {
+    __setMaxTerminalsForTest(256) // no cap — isolate the claim-model concurrency
+    // Seed pending=3 via 3 fault-aborted recordTerminals (each aborts → refund + bump → pending grows).
+    __setTerminalFaultInjectorForTest((phase, tx) => {
+      if (phase === 'record') tx.abort()
+    })
+    await __recordTerminalForTest(makeMinimalQueuedWrite('p1', 'p1'), 'dead-letter', 'm1')
+    await __recordTerminalForTest(makeMinimalQueuedWrite('p2', 'p2'), 'dead-letter', 'm2')
+    await __recordTerminalForTest(makeMinimalQueuedWrite('p3', 'p3'), 'dead-letter', 'm3')
+    __setTerminalFaultInjectorForTest(undefined)
+    // 3 aborts → pending delta = 3, IDB durable = 0.
+    expect((await __readIdbTerminalCountersForTest())['dead-letter']).toBe(0)
+    expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(3) // read = idbCurrent(0) + pending(3)
+
+    // Two CONCURRENT successful recordTerminals. Without the claim model, both capture
+    // pending=3 → each tx adds 3+1 → durable=8 (sol-verified bug). With the claim model:
+    // tx1 claims pending(3) synchronously → tx2 claims pending(0) (only what's left).
+    await Promise.all([
+      __recordTerminalForTest(makeMinimalQueuedWrite('r1', 'r1'), 'dead-letter', 'm4'),
+      __recordTerminalForTest(makeMinimalQueuedWrite('r2', 'r2'), 'dead-letter', 'm5'),
+    ])
+    // Durable = 3 (pending) + 2 (one increment per record) = 5. Order-independent: each tx
+    // adds its OWN claim + increment, so IDB tx interleaving cannot inflate the total.
+    expect((await __readIdbTerminalCountersForTest())['dead-letter']).toBe(5) // NOT 8
+    expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(5) // read = 5
+  })
+
+  it('⑦ (P1-B r4) two concurrent records with no pre-existing pending → durable + read = 2 (record+cap txs do not double-flush)', async () => {
+    __setMaxTerminalsForTest(256) // no eviction — isolate record+cap counter concurrency
+    // Two concurrent records (each runs a record tx THEN a cap tx). The 2 record txs + 2
+    // cap txs interleave; the claim model ensures each claims only its own portion.
+    await Promise.all([
+      __recordTerminalForTest(makeMinimalQueuedWrite('a1', 'a1'), 'conflict', 'm1'),
+      __recordTerminalForTest(makeMinimalQueuedWrite('a2', 'a2'), 'conflict', 'm2'),
+    ])
+    expect((await __readIdbTerminalCountersForTest()).conflict).toBe(2) // NOT inflated
+    expect((await getWriteQueueTerminalCounters()).counters.conflict).toBe(2)
+  })
+
+  it("⑧ (P1-B r4) a new pending increment arriving AFTER a tx claim is NOT mis-subtracted by releaseClaim", async () => {
+    __setMaxTerminalsForTest(256)
+    // Seed pending=2 (2 fault-aborts).
+    __setTerminalFaultInjectorForTest((phase, tx) => {
+      if (phase === 'record') tx.abort()
+    })
+    await __recordTerminalForTest(makeMinimalQueuedWrite('q1', 'q1'), 'dead-letter', 'm1')
+    await __recordTerminalForTest(makeMinimalQueuedWrite('q2', 'q2'), 'dead-letter', 'm2')
+    // pending=2, IDB=0.
+    // A successful record claims pending=2 → its releaseClaim will subtract ONLY 2.
+    __setTerminalFaultInjectorForTest(undefined)
+    await __recordTerminalForTest(makeMinimalQueuedWrite('s1', 's1'), 'dead-letter', 'm3')
+    // IDB = 0 + 2 (claim) + 1 (increment) = 3; pending → 0 (releaseClaim subtracted 2).
+    expect((await __readIdbTerminalCountersForTest())['dead-letter']).toBe(3)
+    expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(3)
+    // NOW a new pending increment arrives (a fault-abort) AFTER the success committed.
+    // Its +1 goes to pending; the prior success's releaseClaim already ran (subtracted 2)
+    // and must NOT touch this new +1.
+    __setTerminalFaultInjectorForTest((phase, tx) => {
+      if (phase === 'record') tx.abort()
+    })
+    await __recordTerminalForTest(makeMinimalQueuedWrite('a1', 'a1'), 'dead-letter', 'm4')
+    __setTerminalFaultInjectorForTest(undefined)
+    // IDB still 3; pending=1 (the abort's +1). read = 3 + 1 = 4 (the new delta preserved).
+    expect((await __readIdbTerminalCountersForTest())['dead-letter']).toBe(3)
+    expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(4)
+  })
+
+  it('⑨ (P1-B r4) an aborted tx refunds its claim → pending is restored (no lost delta)', async () => {
+    __setMaxTerminalsForTest(256)
+    // Seed pending=2 (2 fault-aborts).
+    __setTerminalFaultInjectorForTest((phase, tx) => {
+      if (phase === 'record') tx.abort()
+    })
+    await __recordTerminalForTest(makeMinimalQueuedWrite('r1', 'r1'), 'dead-letter', 'm1')
+    await __recordTerminalForTest(makeMinimalQueuedWrite('r2', 'r2'), 'dead-letter', 'm2')
+    // pending=2, IDB=0.
+    // A 3rd fault-abort: claims pending=2 → aborts → refundClaim(2) + bump(1) → pending=3.
+    // The claim is refunded (pending restored + the abort's own +1 added).
+    await __recordTerminalForTest(makeMinimalQueuedWrite('r3', 'r3'), 'dead-letter', 'm3')
+    __setTerminalFaultInjectorForTest(undefined)
+    expect((await __readIdbTerminalCountersForTest())['dead-letter']).toBe(0) // IDB unchanged (3 aborts)
+    expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(3) // pending=3 (refunded)
+    // A subsequent success flushes ALL 3 pending into IDB (+1) → durable=4.
+    await __recordTerminalForTest(makeMinimalQueuedWrite('ok', 'ok'), 'dead-letter', 'm4')
+    expect((await __readIdbTerminalCountersForTest())['dead-letter']).toBe(4) // 3 (refunded pending) + 1
+    expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(4)
+  })
+
+  // ── Round-5 (P1-B r4 residual): after-claim / before-tx-complete barrier ──
+  // sol 五审 residual: test ⑧ injects the new pending AFTER releaseClaim already ran, so a
+  // "releaseClaim subtracts captured from pending" regression floors at 0 (pending was 0 by
+  // then) and only the inFlight leak signals it. This group holds the FIRST tx mid-claim
+  // (after claimPendingDelta, before the IDB tx queues) via an injectable barrier promise,
+  // injects a new pending delta WHILE the claim is in flight, then releases the first tx +
+  // starts a second. The second must claim ONLY the new delta (1); a wrong releaseClaim
+  // would subtract the first claim's captured(3) from the live pending(1) → floor to 0 →
+  // the second claims 0 → durable LOSES the injected delta (idb=5 not 6) AND read INFLATES
+  // via the inFlight leak (8 not 6). Both the durable-loss and read-inflation assertions
+  // go red under the wrong model (correctness-gate verified: see send_to_lead report).
+
+  it('⑩ (P1-B r4) mid-flight pending injected after claim / before commit → second tx claims only the new delta (no loss, no dup)', async () => {
+    __setMaxTerminalsForTest(256) // no eviction — isolate the claim-barrier concurrency
+    // Seed pending=3 via 3 fault-aborted recordTerminals (each aborts → refund + bump →
+    // pending grows by 1). Barrier hook is NOT installed yet → seeding claims do not block.
+    __setTerminalFaultInjectorForTest((phase, tx) => {
+      if (phase === 'record') tx.abort()
+    })
+    await __recordTerminalForTest(makeMinimalQueuedWrite('p1', 'p1'), 'dead-letter', 'm1')
+    await __recordTerminalForTest(makeMinimalQueuedWrite('p2', 'p2'), 'dead-letter', 'm2')
+    await __recordTerminalForTest(makeMinimalQueuedWrite('p3', 'p3'), 'dead-letter', 'm3')
+    __setTerminalFaultInjectorForTest(undefined)
+    // 3 aborts → pending delta = 3, IDB durable = 0.
+    expect((await __readIdbTerminalCountersForTest())['dead-letter']).toBe(0)
+    expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(3) // read = idbCurrent(0) + pending(3)
+
+    // Barrier hook: block the FIRST record-phase claim; log every record-phase claim so the
+    // test can assert the two claims are exactly 3 and 1. Cap-phase claims (no eviction under
+    // cap=256) are ignored. The first call awaits an injectable promise; later calls no-op.
+    const recordClaims: TerminalCounterShape[] = []
+    let resolveBarrier!: () => void
+    const barrierPromise = new Promise<void>((resolve) => {
+      resolveBarrier = resolve
+    })
+    let firstRecordClaim = true
+    __setClaimBarrierHookForTest(async (phase, captured) => {
+      if (phase !== 'record') return
+      recordClaims.push({ ...captured })
+      if (firstRecordClaim) {
+        firstRecordClaim = false
+        await barrierPromise // hold the first tx mid-claim (after-claim / before-tx)
+      }
+    })
+
+    // Fire the FIRST successful recordTerminal (do not await). It claims pending=3
+    // synchronously (captured={dl:3} → pending 3→0, inFlight 0→3), then hits the barrier and
+    // parks — the IDB tx is NOT yet queued, the claim is in flight.
+    const firstP = __recordTerminalForTest(
+      makeMinimalQueuedWrite('r1', 'r1'),
+      'dead-letter',
+      'm4',
+    )
+    // The claim is synchronous → recordClaims already holds {dl:3}; read = 0 + 0 + 3 (inFlight).
+    expect(recordClaims).toHaveLength(1)
+    expect(recordClaims[0]?.['dead-letter']).toBe(3)
+    expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(3)
+
+    // INJECT a new pending=1 WHILE the first tx is parked mid-claim (before its tx queues).
+    // Simulates a concurrent tab's mem-fallback increment; does NOT itself fire a claim.
+    __bumpPendingCountersForTest('dead-letter', 1)
+    // read = idbCurrent(0) + pending(1) + inFlight(3) = 4.
+    expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(4)
+
+    // Release the first tx AND start the second. The second claims ONLY the new delta(1) —
+    // the first's claim(3) already moved to inFlight, so pending held only the injected 1.
+    resolveBarrier()
+    const secondP = __recordTerminalForTest(
+      makeMinimalQueuedWrite('r2', 'r2'),
+      'dead-letter',
+      'm5',
+    )
+    await Promise.all([firstP, secondP])
+
+    // Two record-phase claims observed: first=3 (seeded pending), second=1 (injected delta).
+    // A wrong releaseClaim (subtract from pending) would zero the live pending(1) before the
+    // second claim → second claims 0, not 1.
+    expect(recordClaims).toHaveLength(2)
+    expect(recordClaims[0]?.['dead-letter']).toBe(3)
+    expect(recordClaims[1]?.['dead-letter']).toBe(1)
+
+    // Durable = 3 (first claim) + 1 (second claim) + 2 (each record's own increment) = 6.
+    // A wrong releaseClaim → durable=5 (lost the injected delta) AND read=8 (inFlight leak).
+    expect((await __readIdbTerminalCountersForTest())['dead-letter']).toBe(6)
+    expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(6)
+  })
+
+  // ── Round-5 (P1-B r4 residual): cap tx claims a NON-zero pending delta ──
+  // sol 五审 residual: tests ⑤/⑦ only exercise the cap tx when pending=0 (claim=0), so a
+  // cap-commit that leaks the non-zero claim via a wrong releaseClaim, or a cap-abort that
+  // fails to refund the non-zero claim, would not surface. ⑪ seeds a non-zero pending delta
+  // + an over-cap ledger so the cap tx claims the pending delta and lands it in the SAME
+  // atomic tx as the evicted increment (each exactly once); ⑫ aborts that cap tx and asserts
+  // the non-zero claim refunds to pending, then a re-run lands each exactly once (no re-flush,
+  // no loss).
+
+  it('⑪ (P1-B r4) cap tx with non-zero pending → pending delta + evicted land in ONE atomic tx, each exactly once', async () => {
+    __setMaxTerminalsForTest(256) // no eviction while seeding — build the over-cap ledger cleanly
+    // Seed 5 dead-letter terminals → IDB dl=5, evicted=0, ledger=5.
+    for (let i = 1; i <= 5; i++) {
+      await __recordTerminalForTest(makeMinimalQueuedWrite(`k${i}`, `k${i}`), 'dead-letter', `m${i}`)
+    }
+    expect((await __readIdbTerminalCountersForTest())['dead-letter']).toBe(5)
+    expect((await __readIdbTerminalCountersForTest()).evicted).toBe(0)
+    expect((await __dumpIdbTerminalsForTest()).length).toBe(5)
+
+    // Pre-create a non-zero pending delta (2) WITHOUT going through claim/tx (simulates a
+    // concurrent tab's mem-fallback increments not yet claimed into an IDB tx).
+    __bumpPendingCountersForTest('dead-letter', 2)
+    expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(7) // read = idb(5) + pending(2)
+
+    // NOW drop the cap below the ledger size (5 > 3) so enforceTerminalCap evicts.
+    __setMaxTerminalsForTest(3)
+    // Cap tx: claim=2 (pending 2→0, inFlight 0→2); getAll → 5, excess=2, delete 2 oldest;
+    // counter put = idbCurrent(5) + capturedPending(2) + evicted(+2) → dl=7, evicted=2.
+    // Commit → releaseClaim(2): inFlight 2→0. BOTH the pending delta and the evicted
+    // increment land in the SAME atomic tx, each exactly once.
+    await __enforceTerminalCapForTest()
+
+    const idb = await __readIdbTerminalCountersForTest()
+    expect(idb['dead-letter']).toBe(7) // 5 (durable) + 2 (pending delta landed once)
+    expect(idb.evicted).toBe(2) // excess=2, landed once
+    expect((await __dumpIdbTerminalsForTest()).length).toBe(3) // ledger capped at 3
+    expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(7) // read = 7 + 0 + 0
+    expect((await getWriteQueueTerminalCounters()).counters.evicted).toBe(2)
+
+    // Idempotency: a SECOND cap call (no new pending, ledger already at cap) is a no-op —
+    // claim=0, getAll=3 <= 3 → no eviction → flushed=false → refund(0). Nothing re-flushes.
+    await __enforceTerminalCapForTest()
+    const idb2 = await __readIdbTerminalCountersForTest()
+    expect(idb2['dead-letter']).toBe(7) // unchanged — pending delta did NOT land a second time
+    expect(idb2.evicted).toBe(2) // unchanged — evicted did NOT increment a second time
+  })
+
+  it('⑫ (P1-B r4) cap tx abort with non-zero claim → refund to pending; subsequent success lands each exactly once (no loss, no dup)', async () => {
+    __setMaxTerminalsForTest(256) // no eviction while seeding
+    for (let i = 1; i <= 5; i++) {
+      await __recordTerminalForTest(makeMinimalQueuedWrite(`a${i}`, `a${i}`), 'dead-letter', `m${i}`)
+    }
+    expect((await __readIdbTerminalCountersForTest())['dead-letter']).toBe(5)
+    // Pre-create a non-zero pending delta (2) + drop the cap below the ledger (5 > 3).
+    __bumpPendingCountersForTest('dead-letter', 2)
+    __setMaxTerminalsForTest(3)
+
+    // Inject: abort the cap tx (phase 'cap') AFTER deletes + counter put are scheduled. The
+    // cap claim(2) → inFlight; the tx aborts → atomic rollback (neither deletes nor the
+    // counter put land) AND refundClaim(2) restores the pending delta.
+    __setTerminalFaultInjectorForTest((phase, tx) => {
+      if (phase === 'cap') tx.abort()
+    })
+    await __enforceTerminalCapForTest()
+    // Atomic rollback: ledger still 5 (no delete), idb dl still 5 (counter put rolled back),
+    // evicted still 0. BUT the non-zero claim(2) was refunded → pending restored to 2.
+    expect((await __dumpIdbTerminalsForTest()).length).toBe(5) // NOT deleted
+    expect((await __readIdbTerminalCountersForTest())['dead-letter']).toBe(5) // NOT incremented
+    expect((await __readIdbTerminalCountersForTest()).evicted).toBe(0) // NOT incremented
+    expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(7) // read = idb(5) + pending(2) refunded
+    expect((await getWriteQueueTerminalCounters()).counters.evicted).toBe(0) // inFlight=0 (refunded)
+
+    // Clear the fault → re-run cap. The refunded pending(2) is re-claimed and lands ONCE.
+    __setTerminalFaultInjectorForTest(undefined)
+    await __enforceTerminalCapForTest()
+    // excess=2 (5 > 3) → delete 2 oldest + counter put = idbCurrent(5) + capturedPending(2) +
+    // evicted(+2) → dl=7, evicted=2. The pending delta landed exactly once (NOT twice — the
+    // abort rolled back the first attempt; only the success flushed it).
+    const idb = await __readIdbTerminalCountersForTest()
+    expect(idb['dead-letter']).toBe(7) // 5 + 2 (pending landed once, not twice)
+    expect(idb.evicted).toBe(2) // landed once
+    expect((await __dumpIdbTerminalsForTest()).length).toBe(3) // ledger capped at 3
+    expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(7) // read = 7 + 0 + 0
+    expect((await getWriteQueueTerminalCounters()).counters.evicted).toBe(2)
   })
 })

@@ -1586,6 +1586,23 @@ button:disabled {
   font-size: var(--text-xs);
 }
 
+/* FX-7 / A6: remote-debug drop-count indicator (batches lost after retry exhaustion). */
+.debug-log-dropcount {
+  display: flex !important;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--chip-bg, rgba(0, 0, 0, 0.04));
+  font-size: var(--text-xs);
+  color: var(--quiet);
+}
+
+.debug-log-dropcount-warn {
+  color: var(--danger, #d33);
+  font-weight: 600;
+}
+
 .debug-log-header button {
   display: grid;
   place-items: center;
