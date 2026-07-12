@@ -7,7 +7,7 @@
 > 前置:`docs/spike/n1-yjs-mapping.md`(N1 结论 + Q1-Q10)、`docs/decisions/record-schema.md`、`src/kernel/{docKernel,records,adapters}.ts`、`docs/decisions/platform-architecture-2026-07-07.md`。
 > 验证产物(全绿):
 > - `src/kernel/__spike__/n20-truth-source.spike.test.ts`(44 tests:15 原 + 18 返修 + 8 补缺 + 3 R2 增:T1-5 restore 全链 / S10-10 immutable/atomic leaf 表 / S10-11 idempotent replay)
-> - `server/__tests__/n20-sse-route.spike.test.ts`(7 tests,真实 Hono SSE route 集成 + R2-2 live push 5-7 + desiredSize backpressure + gateway-secret authz seam)
+> - `server/__tests__/n20-sse-route.spike.test.ts`(8 tests,真实 Hono SSE route 集成 + R2-2 live push 5-7 + desiredSize backpressure + **R3 F3:真实 resolveActor/canAccessCanvas authz seam(替代 fake secret,错 proof → 404 no-leak 非 401)+ 5-8 slow-reader response body 恢复**)
 > - `server/__tests__/n20-pg-tx-fault.spike.test.ts`(7 tests,真实 PG transaction fault injection + R2-1 同一 client pool.connect+finally release;PG-T3 改名同库资产元数据;**R3 F2:PG-T5 field_clock 持久 / PG-T6 idempotency 持久 / PG-T7 strict-tx 跨 record**)
 >
 > **58 pass / 0 skip / 0 fail**(本地 PG port 55443 实跑,PG-T1~T7 同 client 真 pass;PG-T5/T6/T7 真 PG 持久/跨 record);`tsc -b` 0 errors;`eslint` 干净;`npm run build` exit 0;`grep -roE 'yjs|lib0|YEvent|applyUpdate|AbstractType|encodeStateAsUpdate' dist/` **零命中**(yjs 不进生产 bundle)。
@@ -35,7 +35,7 @@
 | 2 | 多人 undo/redo | **Figma GO** | ★真实库对照(M1-M6 真 Y.UndoManager) | 修正 naive inverse bug;条件逆运算语义对齐真 Yjs |
 | 3 | 跨 record 事务 | **平局**(R2-1) | ★真实库对照(G3-real)+ ●真实 PG(PG-T 同 client) | intra 原子两案一致;跨介质 Figma=saga 非真原子、Yjs=无方案;PG-T3 改名同库资产元数据;**v2 "Figma 占优"→v3 平局**(诚实) |
 | 4 | revision×属性 LWW | **方案 A GO** | ●集成(G4)+ ▲lead 核证 | "零破坏"→"前端未接线但契约/服务端破坏面非零";§1.2 inventory **逐文件 + cutover 拍死**(R2-6) |
-| 5 | 实时 transport+auth | **条件式 GO**(R2-2) | ●真实集成(5-1~7 Hono SSE) | G5-1~7 真实 SSE(**live push 5-7 + desiredSize backpressure 5-6 + gateway-secret authz seam 5-5**);网关 SSE buffering = ○条件式留 lead(非"无需验证") |
+| 5 | 实时 transport+auth | **条件式 GO**(R2-2) | ●真实集成(5-1~8 Hono SSE) | G5-1~8 真实 SSE(**live push 5-7 + desiredSize backpressure 5-6 + R3 F3 真实 resolveActor/canAccessCanvas authz seam 5-5(404 no-leak)+ slow-reader 恢复 5-8**);网关 SSE buffering = ○条件式留 lead(非"无需验证") |
 | 6 | 迁移/双协议窗口 | **Figma GO** | ▲lead 核证 + ○分析 | "无双协议窗口"成立;但"零破坏"推翻 → 破坏面 inventory(§1.2 逐文件)+ cutover 拍死原子方案(R2-6) |
 | 7 | seq/补拉/压缩/revoke/存储 | **平局**(R2-7) | ★真实库对照(G7-hard-4)+ ●/○(G7-hard-1~3 自建 server) | G7-hard-1~3 降 ●/○(自建 server 无 Yjs 对照,原 ★ 虚标);G7-hard-4 ★真测 Yjs 更小;优势改为 revoke 简单(●/○ 非对照)+ 可预测控制 — **v2 "Figma GO"→v3 平局** |
 
@@ -218,7 +218,7 @@ npm test -- src/lib/serverPersistAdapter.contract.test.ts server/persist/backend
 - `5-2` heartbeat(`: keepalive\n\n` 保活)。
 - `5-3` `?since=seq` 补拉(只 replay seq>since)。
 - `5-4` revoke 断流(`event: revoke` + 流关闭)。
-- `5-5` authz(非 member → 403 forbidden)。
+- `5-5` authz(R3 F3:真实 resolveActor+canAccessCanvas;非 member/错 proof → **404 no-leak**,非 401/403;本仓 SSE seam 无 401)。
 - `5-6` slow consumer 有界(backlog 超 MAX_BACKLOG → drop oldest,不 OOM)。
 
 **仓库侧协议/头分析(R2-2)**:`owner.ts` 全 HTTP-header-based(`x-mivo-auth-user` + `x-mivo-gateway-secret` fail-closed);SSE = plain HTTP GET + `text/event-stream`,网关**应**透传(plain HTTP)但生产可能缓冲/超时(○条件式,R2-2,非"任何网关必透传");WS upgrade 需网关注入同链到 handshake。
@@ -229,7 +229,7 @@ npm test -- src/lib/serverPersistAdapter.contract.test.ts server/persist/backend
 | 网关 WS 不放行时 | SSE fallback 仍可用(plain HTTP) | 需 polling fallback,失 CRDT 实时价值 |
 | auth 复用 | 复用 #194 SSO header 链(SSE 同链) | WS handshake 需网关注入(未验证) |
 
-**go/no-go**:**条件式 GO(R2-2)**。Figma 式 REST+SSE:5-1~7 真实验证(**live push 5-7 + desiredSize backpressure 5-6 + gateway-secret authz seam 5-5**,复用 owner.ts fail-closed 模式;非 v2 直信 x-mivo-auth-user)。**网关 gate 条件式**:网关对 `text/event-stream` buffering/超时 = ○条件式留 lead 生产实测(非"任何网关必透传"——生产网关可能缓冲);不影响 Figma 选型(SSE fallback 兜底),只影响实时性调优。Yjs 依赖 WS 网关放行(亦条件式未验证)。
+**go/no-go**:**条件式 GO(R2-2)**。Figma 式 REST+SSE:5-1~8 真实验证(**live push 5-7 + desiredSize backpressure 5-6 + R3 F3 真实 resolveActor/canAccessCanvas authz seam 5-5(404 no-leak,替代 fake secret)+ slow-reader response body 恢复 5-8**,复用 owner.ts fail-closed 模式;非 v2 直信 x-mivo-auth-user)。**网关 gate 条件式**:网关对 `text/event-stream` buffering/超时 = ○条件式留 lead 生产实测(非"任何网关必透传"——生产网关可能缓冲);不影响 Figma 选型(SSE fallback 兜底),只影响实时性调优。Yjs 依赖 WS 网关放行(亦条件式未验证)。
 
 **未验证项(○条件式,留 lead 生产实测,§12)**:
 1. 生产 SSO 网关是否代理 WS upgrade + 注入 `x-mivo-auth-user`/`x-mivo-gateway-secret`(条件式:做到→N2-2 上 WS 优化;做不到→SSE 兜底,**Figma 选型不变**)。
@@ -327,7 +327,7 @@ npm test -- src/lib/serverPersistAdapter.contract.test.ts server/persist/backend
 
 ## 4-9. PoC 清单与实跑结果(55 tests 全绿)
 
-**文件**:`src/kernel/__spike__/n20-truth-source.spike.test.ts`(44)+ `server/__tests__/n20-sse-route.spike.test.ts`(7)+ `server/__tests__/n20-pg-tx-fault.spike.test.ts`(4)。
+**文件**:`src/kernel/__spike__/n20-truth-source.spike.test.ts`(44)+ `server/__tests__/n20-sse-route.spike.test.ts`(8)+ `server/__tests__/n20-pg-tx-fault.spike.test.ts`(7)。
 
 ### 4.1 原 PoC(15 tests,v1 已有)
 
@@ -385,9 +385,9 @@ npm test -- src/lib/serverPersistAdapter.contract.test.ts server/persist/backend
 | S10-8 create→edit 因果 FIFO | P2-8 | §10 | `order==['create:init','edit:edited']` | ● |
 | S10-9 DELETE cursor/404 边界 | P2-8 | §10 | `成功+幂等返 seq;从未存在→not-found` | ● |
 
-### 4.4 真实 SSE route 集成(6 tests,前任 worker;R2 增 5-7 live push 见 §4.6)
+### 4.4 真实 SSE route 集成(8 tests:5-1~6 R2 + 5-7 R2-2 live push + **5-8 R3 F3 slow-reader 恢复**;5-5 R3 F3 改真实 authz seam)
 
-见 Gate5 §2(5-1 content-type/framing、5-2 heartbeat、5-3 since 补拉、5-4 revoke 断流、5-5 authz 403、5-6 slow consumer 有界;5-7 live push 见 §4.6 R2 增补)。强度 ●。
+见 Gate5 §2(5-1 content-type/framing、5-2 heartbeat、5-3 since 补拉、5-4 revoke 断流、5-5 authz **404 no-leak**(R3 F3 真实 seam,原 403 系 fake secret)、5-6 slow consumer 有界 + response body 实收(R3 F3);5-7 live push、5-8 slow-reader 恢复见 §4.6)。强度 ●。
 
 ### 4.5 真实 PG fault injection(7 tests:PG-T1~T4 R2-1 同 client + **PG-T5/T6/T7 R3 F2 持久/跨 record**,本地 PG 55443 实跑)
 
@@ -401,8 +401,9 @@ npm test -- src/lib/serverPersistAdapter.contract.test.ts server/persist/backend
 | S10-10 immutable/atomic leaf 表 | R2-3 | §10 | `immutable 字段 set→throw;atomic-container 整值替换(allowContainerClobber);其余 leaf set ok` | ● |
 | S10-11 idempotent replay | R2-3 | §10 | replay 逻辑(内存 Map)+ **PG-T6 真持久**(write→destroy→重连 replay 不二次 bump) | ● |
 | 5-7 SSE live push(建连后 push→response body 实收) | R2-2 | 5 | `chunks 含 'live-value' && op.value==='live-value'`(非建连前 replay) | ● |
+| 5-8 slow-reader 恢复(R3 F3) | R3 F3 | 5 | `resumedMax-resumedMin+1 > resumed.length`(response body 观察 seq gap)+ `?since=0 补拉 seq 1..51 全 51 无缺口` | ● |
 
-**实跑汇总**:`58 pass / 0 skip / 0 fail`(spike 44 + SSE 7 + PG 7,本地 PG port 55443 实跑 MIVO_PG_TEST=1,PG-T1~T7 同一 client 真 pass;PG-T5/T6/T7 真 PG 持久/跨 record)。`tsc -b` 0 errors;`eslint` 干净;`npm run build` exit 0(567ms);`grep -roE 'yjs|lib0|YEvent|applyUpdate|AbstractType|encodeStateAsUpdate' dist/` 零命中(yjs 不进生产 bundle)。
+**实跑汇总**:`59 pass / 0 skip / 0 fail`(spike 44 + SSE 8 + PG 7,本地 PG port 55443 实跑 MIVO_PG_TEST=1,PG-T1~T7 同一 client 真 pass;PG-T5/T6/T7 真 PG 持久/跨 record;SSE 5-8 slow-reader 恢复)。`tsc -b` 0 errors;`eslint` 干净;`npm run build` exit 0(567ms);`grep -roE 'yjs|lib0|YEvent|applyUpdate|AbstractType|encodeStateAsUpdate' dist/` 零命中(yjs 不进生产 bundle)。
 
 ---
 
@@ -539,5 +540,5 @@ const trustify = (client: ClientFieldOp, ctx: TrustedCtx): WireOp => ({ ...ctx, 
   - `CommandUndoStack`(原 PoC)+ `ConditionalUndoStack`(返修:条件逆运算 P1-1)+ `TextLwwWithOverwrite`(P1-4 B 方案,**restore 走 overwrite 管线全链 R2-5 T1-5**)
   - `yjsMatrixSetup`(真 Yjs UndoManager 同矩阵 helper)
   - G4+G1(5)/ G3(2)+G3-real(3)/ G2(2)+M1-M6(6)/ G7(3)+G7-hard(4)/ G5(1)/ antiYjs(2)/ S10(5)+S10-6~9(4)/ T1(4)+**T1-5(R2-5)**/ **S10-10 immutable/atomic leaf(R2-3)**/ **S10-11 idempotent replay(R2-3)** = **44 tests**
-- `server/__tests__/n20-sse-route.spike.test.ts`(7 tests):真实 Hono SSE route(content-type/heartbeat/since/revoke/authz/slow-consumer + **5-7 live push R2-2**)
+- `server/__tests__/n20-sse-route.spike.test.ts`(8 tests):真实 Hono SSE route(content-type/heartbeat/since/revoke/authz/slow-consumer + **5-7 live push R2-2** + **5-8 slow-reader 恢复 R3 F3**;5-5 真实 resolveActor/canAccessCanvas authz seam)
 - `server/__tests__/n20-pg-tx-fault.spike.test.ts`(4 tests):真实 PG transaction fault injection(原子提交/fault ROLLBACK/同库资产元数据(R2-1 改名)/无事务 partial 对照;本地 PG 55443 实跑 MIVO_PG_TEST=1 转 pass;**全部 PG-T 同一 client pool.connect+finally release**)
