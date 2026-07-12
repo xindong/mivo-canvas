@@ -4,12 +4,15 @@ import {
   __dumpIdbTerminalsForTest,
   __dumpTerminalsForTest,
   __dumpWritesForTest,
+  __isWriteQueueBlockedForTest,
+  __onErrorBlockedClearCountForTest,
   __readIdbTerminalCountersForTest,
   __recordTerminalForTest,
   __resetWriteQueueDb,
   __seedWritesForTest,
   __setIdbBlockTimeoutForTest,
   __setMaxTerminalsForTest,
+  __setOpenDbUpgradeAbortHookForTest,
   __setTerminalFaultInjectorForTest,
   __setWriteQueueDbNameForTest,
   classifyHttpStatus,
@@ -1734,6 +1737,52 @@ describe('FX-7 / A6 P1-3 (r2) — real-connection upgrade blocking + cooperative
     })
     expect(v3Result).toBe('success') // cooperative close → v3 succeeded, not blocked
   })
+
+  it('④ (P1-A) a stuck upgrade that errors/aborts clears the blocked state → next fresh open recovers IDB', async () => {
+    const testDb = 'mivo-write-queue-p13-abort'
+    __setWriteQueueDbNameForTest(testDb)
+    __setIdbBlockTimeoutForTest(30)
+    // Hold a real v1 connection (no onversionchange → blocks the module's open(v2)).
+    const v1Open = indexedDB.open(testDb, 1)
+    v1Open.onupgradeneeded = () => {
+      const db = v1Open.result
+      if (!db.objectStoreNames.contains('writes')) db.createObjectStore('writes', { keyPath: 'id' })
+    }
+    const v1Db = await new Promise<IDBDatabase>((resolve, reject) => {
+      v1Open.onsuccess = () => resolve(v1Open.result)
+      v1Open.onerror = () => reject(v1Open.error)
+    })
+
+    const { fn } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    // Module open(v2) → blocked → timeout → blockedState='blocked' (enqueue degrades to mem).
+    await q.enqueue(minimalNode('c1', 'n1'))
+    expect(await q.pendingCount()).toBe(1) // memStore
+    expect(__isWriteQueueBlockedForTest()).toBe(true)
+
+    // Set the upgrade to abort when it resumes (after v1 closes) → version-change tx aborts
+    // → the open request errors (onerror). P1-A: onerror clears blockedState.
+    __setOpenDbUpgradeAbortHookForTest((tx) => {
+      tx.abort()
+    })
+    v1Db.close() // release the blocker → stuck v2 resumes → onupgradeneeded → abort → onerror
+    await vi.waitFor(() => expect(__isWriteQueueBlockedForTest()).toBe(false), {
+      timeout: 1000,
+      interval: 10,
+    })
+    // P1-A: the onerror branch fired + cleared the blocked state (not the late-onsuccess
+    // path). This is the specific fix for the "late error permanently locks blocked" bug.
+    expect(__onErrorBlockedClearCountForTest()).toBeGreaterThan(0)
+    // blockedState cleared by P1-A (onerror). Clear the hook so the recovery open is NOT aborted.
+    __setOpenDbUpgradeAbortHookForTest(undefined)
+    // Next module op recovers IDB (fresh open succeeds; no degradation warn).
+    warnLog.mockClear()
+    await q.enqueue(minimalNode('c1', 'n2'))
+    expect(warnLog).not.toHaveBeenCalledWith(
+      'Write Retry Queue',
+      expect.stringContaining('using in-memory fallback'),
+    )
+  })
 })
 
 // ── P1-4: non-retreatable per-status cumulative terminal counters (A3 false-green) ──
@@ -1832,10 +1881,10 @@ describe('FX-7 / A6 P1-4 — non-retreatable terminal counters (A3 uses counters
 
   it('① fault-inject tx abort → NEITHER ledger entry NOR counter lands in IDB (atomic; no partial commit)', async () => {
     __setMaxTerminalsForTest(256) // no cap eviction — isolate the entry+counter atomicity
-    // Fault-inject: abort the recordTerminal atomic tx so neither the entry put nor the
-    // counter RMW commits (tx rolls back atomically).
-    __setTerminalFaultInjectorForTest((tx) => {
-      tx.abort()
+    // Fault-inject: abort the recordTerminal atomic tx (phase 'record') so neither the
+    // entry put nor the counter RMW commits (tx rolls back atomically).
+    __setTerminalFaultInjectorForTest((phase, tx) => {
+      if (phase === 'record') tx.abort()
     })
 
     const { fn } = seqExecutor([{ status: 'terminal', message: 'http_418' }])
@@ -1890,5 +1939,71 @@ describe('FX-7 / A6 P1-4 — non-retreatable terminal counters (A3 uses counters
     expect(counters.evicted).toBe(2)
     const ledger = await __dumpTerminalsForTest()
     expect(ledger.length).toBeLessThanOrEqual(5) // snapshot capped
+  })
+
+  // ── P1-B (third-round): delta model — durable IDB total + local pending delta ──
+  // sol 反例:round-2 的 mergeCounters(max) 不守恒——tab1 mem=3(IDB 失败)+ tab2 IDB=2 → max=3,
+  // 真值 5 永久少计,矛盾于"A3 MUST-use 这些 counter 防假绿"。delta 模型:mem 只记 pending delta,
+  // IDB 恢复时在原子 tx 内 idbCurrent + capturedPending + currentIncrement,commit 后扣 captured delta。
+
+  it('④ (P1-B) IDB=2 + mem pending delta=3 → recover → 6 (delta model; NOT max=3 or 4)', async () => {
+    __setMaxTerminalsForTest(256) // no cap — isolate the counter delta model
+    // 2 successful recordTerminals → IDB counter = 2 (dead-letter), pending delta = 0.
+    await __recordTerminalForTest(makeMinimalQueuedWrite('r1', 'n1'), 'dead-letter', 'm1')
+    await __recordTerminalForTest(makeMinimalQueuedWrite('r2', 'n2'), 'dead-letter', 'm2')
+    let idb = await __readIdbTerminalCountersForTest()
+    expect(idb['dead-letter']).toBe(2)
+
+    // 3 fault-aborted recordTerminals → pending delta = 3 (mem fallback), IDB stays 2.
+    __setTerminalFaultInjectorForTest((phase, tx) => {
+      if (phase === 'record') tx.abort()
+    })
+    await __recordTerminalForTest(makeMinimalQueuedWrite('r3', 'n3'), 'dead-letter', 'm3')
+    await __recordTerminalForTest(makeMinimalQueuedWrite('r4', 'n4'), 'dead-letter', 'm4')
+    await __recordTerminalForTest(makeMinimalQueuedWrite('r5', 'n5'), 'dead-letter', 'm5')
+    __setTerminalFaultInjectorForTest(undefined)
+    idb = await __readIdbTerminalCountersForTest()
+    expect(idb['dead-letter']).toBe(2) // IDB unchanged (aborts rolled back)
+    // read = idbCurrent(2) + pendingDelta(3) = 5 (delta model; max model would give max(2,3)=3).
+    const before = await getWriteQueueTerminalCounters()
+    expect(before.counters['dead-letter']).toBe(5)
+
+    // Recovery: 1 successful recordTerminal → flushes pending delta into IDB.
+    // next = idbCurrent(2) + capturedPending(3) + currentIncrement(1) = 6; pending delta → 0.
+    await __recordTerminalForTest(makeMinimalQueuedWrite('r6', 'n6'), 'dead-letter', 'm6')
+    const after = await getWriteQueueTerminalCounters()
+    expect(after.counters['dead-letter']).toBe(6) // NOT 3 (max) or 4 — delta model is conservative
+    idb = await __readIdbTerminalCountersForTest()
+    expect(idb['dead-letter']).toBe(6) // durable IDB total now 6
+  })
+
+  // ── P2-C (third-round): cap tx fault injection (round-2 only injected the record tx) ──
+
+  it('⑤ (P2-C) cap tx abort → ledger NOT deleted + evicted NOT incremented; clear fault → re-run lands both', async () => {
+    __setMaxTerminalsForTest(3)
+    // Seed 3 terminals (at cap, no eviction yet).
+    await __recordTerminalForTest(makeMinimalQueuedWrite('c1', 'n1'), 'dead-letter', 'm1')
+    await __recordTerminalForTest(makeMinimalQueuedWrite('c2', 'n2'), 'dead-letter', 'm2')
+    await __recordTerminalForTest(makeMinimalQueuedWrite('c3', 'n3'), 'dead-letter', 'm3')
+    expect((await __dumpIdbTerminalsForTest()).length).toBe(3)
+    expect((await __readIdbTerminalCountersForTest()).evicted).toBe(0)
+
+    // Inject: abort the cap tx (phase 'cap') AFTER deletes + counter put are scheduled.
+    __setTerminalFaultInjectorForTest((phase, tx) => {
+      if (phase === 'cap') tx.abort()
+    })
+    // A 4th recordTerminal: entry+counter tx commits (4th entry), THEN enforceTerminalCap
+    // runs → cap tx (4 > 3, excess=1, schedules delete + evicted++) → abort → rolls back.
+    await __recordTerminalForTest(makeMinimalQueuedWrite('c4', 'n4'), 'dead-letter', 'm4')
+    // Atomic rollback: ledger still has 4 (no delete), evicted still 0 (no increment).
+    expect((await __dumpIdbTerminalsForTest()).length).toBe(4) // NOT deleted
+    expect((await __readIdbTerminalCountersForTest()).evicted).toBe(0) // NOT incremented
+
+    // Clear the fault → re-run cap (via another recordTerminal) → deletes + evicted land.
+    __setTerminalFaultInjectorForTest(undefined)
+    await __recordTerminalForTest(makeMinimalQueuedWrite('c5', 'n5'), 'dead-letter', 'm5')
+    // Now 5 entries, cap=3 → evicted=2 (oldest 2 deleted), ledger caps at 3.
+    expect((await __dumpIdbTerminalsForTest()).length).toBe(3)
+    expect((await __readIdbTerminalCountersForTest()).evicted).toBe(2)
   })
 })
