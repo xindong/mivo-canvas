@@ -14,6 +14,7 @@ import {
   InMemoryPermissionBackend,
   type PermissionBackend,
   type CompensationOp,
+  COMPENSATION_MAX_SWEEP_ATTEMPTS,
 } from '../lib/permissions'
 import { PgPermissionBackend } from './pgPermissionBackend'
 
@@ -440,6 +441,46 @@ const runPermissionBackendContractSuite = (
       expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('active') // after: 仍 active
       const ints = await b.listCompensations('p1')
       expect(ints.filter((i) => i.op === 'delete' && i.status === 'pending')).toHaveLength(0)
+    })
+
+    // R3-F2 验收:sweep 超限放弃 → 'failed' dead-letter(不再伪装 done);listFailedCompensations 可见;
+    //   getCompensationCounts 暴露 pending+failed;failed 不占 partial unique 槽 → 新 primary record 可重开收敛。
+    it('R3-F2: sweep 超限放弃 → failed dead-letter(非 done);counts 暴露;重开路径收敛', async () => {
+      const link = await b.createShareLink('p1', 'view', 'ownerA')
+      await b.revokeAllForProject('p1') // cascade marker,link revoked(模拟 project 曾软删)
+      expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('revoked')
+      // restore primary(is_deleted=false;memory no-op)
+      await setProjectDeleted(b, 'p1', false)
+      await b.recordCompensation('p1', 'restore') // gen1 pending
+      // 注入 10 次故障,逐次 attempt 凑满 MAX_SWEEP_ATTEMPTS(每次失败 bump attemptCount,保持 pending,link 仍 revoked)
+      setCompensationFault(b, 'restore', COMPENSATION_MAX_SWEEP_ATTEMPTS)
+      for (let i = 0; i < COMPENSATION_MAX_SWEEP_ATTEMPTS; i++) {
+        const r = await b.attemptCompensation('p1', 'restore')
+        expect(r.kind).toBe('failed')
+      }
+      expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('revoked') // 仍错误(未收敛)
+      // sweep:attemptCount(10) >= MAX → 放弃标 failed(R3-F2:不再 done)
+      const sw = await b.sweepCompensations()
+      expect(sw.failed).toBe(1)
+      const ints = await b.listCompensations('p1')
+      expect(ints[0].status).toBe('failed')
+      expect(ints[0].lastError).toBeTruthy()
+      expect(ints.filter((i) => i.status === 'done')).toHaveLength(0) // 关键:无假 done
+      // listFailedCompensations 可见(可告警的未收敛事实)
+      expect(await b.listFailedCompensations('p1')).toHaveLength(1)
+      const counts = await b.getCompensationCounts()
+      expect(counts.failed).toBe(1)
+      expect(counts.pending).toBe(0)
+      // 重开路径:故障已自减为 0(failed 行不占 partial unique 槽)→ 新 primary record 新 pending → attempt 收敛
+      const again = await b.recordCompensation('p1', 'restore') // gen2 新 pending(failed gen1 不阻塞)
+      expect(again.status).toBe('pending')
+      expect(again.generation).toBe(2)
+      const r = await b.attemptCompensation('p1', 'restore') // 故障已清 → completed
+      expect(r.kind).toBe('completed')
+      expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('active') // 收敛
+      // failed 历史行保留(可观察),counts.failed 仍 1(历史),pending 0
+      const counts2 = await b.getCompensationCounts()
+      expect(counts2.pending).toBe(0)
     })
   })
 }

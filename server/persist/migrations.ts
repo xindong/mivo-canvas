@@ -169,6 +169,23 @@ DROP TABLE IF EXISTS share_link_compensations;
 -- 不 DROP cascade_revoked_at 列:share_links 表归 002 拥有,down 只清本 migration 加的索引/表,列随表 DROP 自然消失。
 `
 
+// R3-F2 migration 006:sweep 超限放弃不再伪装成 done——新增 'failed' 终态(dead-letter,可告警的未收敛事实)。
+// 005 的 CHECK 只允许 pending/done/superseded;006 ALTER CONSTRAINT 加 'failed'(005 字节不变,新加 006)。
+// 'failed' 不占 partial unique index 槽(WHERE status='pending'),下一生命周期 primary 仍可 record 新 pending →
+// 故障解除后存在自动重开路径(新 POST/DELETE → record → sweep done)。
+// 字典序 006 > 005,与 DP-6R 003/004 无冲突(合并后 001<002<003<004<005<006 单调)。
+const COMPENSATIONS_FAILED_STATUS = sql`
+ALTER TABLE share_link_compensations DROP CONSTRAINT IF EXISTS share_link_compensations_status_check;
+ALTER TABLE share_link_compensations ADD CONSTRAINT share_link_compensations_status_check
+  CHECK (status IN ('pending', 'done', 'superseded', 'failed'));
+`
+const DROP_COMPENSATIONS_FAILED_STATUS = sql`
+-- down:回滚 CHECK 到 005 原态(不含 'failed')。前提:无 'failed' 行(否则 ALTER 失败,提示先清理 dead-letter)。
+ALTER TABLE share_link_compensations DROP CONSTRAINT IF EXISTS share_link_compensations_status_check;
+ALTER TABLE share_link_compensations ADD CONSTRAINT share_link_compensations_status_check
+  CHECK (status IN ('pending', 'done', 'superseded'));
+`
+
 /** migrations 以 ISO 日期前缀排序;migrator 按 key 字典序应用。 */
 export const migrations: Record<string, Migration> = {
   '2026_07_11_001_initial_persist_schema': {
@@ -193,6 +210,14 @@ export const migrations: Record<string, Migration> = {
     },
     async down(db): Promise<void> {
       await DROP_COMPENSATIONS_SCHEMA.execute(db)
+    },
+  },
+  '2026_07_12_006_compensation_failed_status': {
+    async up(db): Promise<void> {
+      await COMPENSATIONS_FAILED_STATUS.execute(db)
+    },
+    async down(db): Promise<void> {
+      await DROP_COMPENSATIONS_FAILED_STATUS.execute(db)
     },
   },
 }

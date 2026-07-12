@@ -61,13 +61,14 @@ interface ShareLinksTable {
   // P-6 marker(005 migration ALTER 加列):级联 revoke 标记。区分 project 软删级联 vs 手工吊销。
   cascade_revoked_at: Date | null
 }
-// P-6 saga 补偿意图表(005 migration 建)。无 revision(owner 权威写);attempt_count/last_error/last_attempted_at=可观察。
+// P-6 saga 补偿意图表(005 migration 建 + 006 加 'failed' 终态)。无 revision(owner 权威写);attempt_count/last_error/last_attempted_at=可观察。
 // 返修 P1-2/P1-3/P2-1:generation(代际 supersede)+ claimed_at/claimed_until(租约)+ status 'superseded' + partial unique index。
+// 返修 R3-F2:status 'failed'(sweep 超限 dead-letter,不占 partial unique 槽,006 ALTER CHECK 加)。
 interface ShareLinkCompensationsTable {
   id: string
   project_id: string
   op: string // 'restore'|'delete'(DB CHECK 强制;读出后 cast)
-  status: string // 'pending'|'done'|'superseded'(DB CHECK 强制;读出后 cast)
+  status: string // 'pending'|'done'|'superseded'|'failed'(DB CHECK 强制;006 加 'failed';读出后 cast)
   generation: number
   attempt_count: number
   last_error: string | null
@@ -115,7 +116,7 @@ const rowToCompensation = (row: Selectable<ShareLinkCompensationsTable>): Compen
   id: row.id,
   projectId: row.project_id,
   op: row.op as CompensationOp,
-  status: row.status as 'pending' | 'done' | 'superseded',
+  status: row.status as 'pending' | 'done' | 'superseded' | 'failed',
   generation: row.generation,
   attemptCount: row.attempt_count,
   lastError: row.last_error,
@@ -598,6 +599,33 @@ export class PgPermissionBackend implements PermissionBackend {
     return rows.map(rowToCompensation)
   }
 
+  /** R3-F2:列 failed/dead-letter 意图(超限放弃;可告警的未收敛事实)。 */
+  async listFailedCompensations(projectId?: string): Promise<CompensationIntent[]> {
+    await this.ready
+    let q = this.db.selectFrom('share_link_compensations').selectAll().where('status', '=', 'failed')
+    if (projectId) q = q.where('project_id', '=', projectId)
+    const rows = await q.orderBy('generation', 'desc').execute()
+    return rows.map(rowToCompensation)
+  }
+
+  /** R3-F2:全局未收敛计数(供 /readyz + 响应 header;轻量聚合不计列详情)。 */
+  async getCompensationCounts(): Promise<{ pending: number; failed: number }> {
+    await this.ready
+    const rows = await this.db.selectFrom('share_link_compensations')
+      .select(['status', (eb) => eb.fn.count('id').as('n')])
+      .where('status', 'in', ['pending', 'failed'])
+      .groupBy('status')
+      .execute() as { status: string; n: string | number | bigint }[]
+    let pending = 0
+    let failed = 0
+    for (const r of rows) {
+      const n = Number(r.n)
+      if (r.status === 'pending') pending = n
+      else if (r.status === 'failed') failed = n
+    }
+    return { pending, failed }
+  }
+
   /**
    * P1-2 启动恢复 derive:从 projects.is_deleted + share_links.cascade_revoked_at 派生 pending
    * (record 崩溃未建意图的兜底——marker durable,重启据此补建 pending 供 sweep 收敛)。
@@ -639,9 +667,10 @@ export class PgPermissionBackend implements PermissionBackend {
     for (const row of rows) {
       const it = rowToCompensation(row)
       if (it.attemptCount >= COMPENSATION_MAX_SWEEP_ATTEMPTS) {
-        // 超限放弃:mark done 留 last_error(防永久 pending 黑洞;运维据 lastError 定位)。
+        // R3-F2:超限放弃 → 'failed' dead-letter(不再伪装 done);保留可告警的未收敛事实,运维据 lastError 定因。
+        //   不占 partial unique 槽(WHERE status='pending'),下一生命周期 primary record 新 pending 自动重开。
         await this.db.updateTable('share_link_compensations')
-          .set({ status: 'done', last_error: it.lastError ?? 'sweep max attempts exceeded', last_attempted_at: new Date(), updated_at: new Date() })
+          .set({ status: 'failed', last_error: it.lastError ?? 'sweep max attempts exceeded', last_attempted_at: new Date(), updated_at: new Date() })
           .where('id', '=', it.id).where('status', '=', 'pending').execute()
         failed++
         continue

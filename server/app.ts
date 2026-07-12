@@ -74,6 +74,17 @@ export const app = new Hono<AppEnv>()
 // Liveness probe.
 app.get('/healthz', (c) => c.json({ status: 'ok' }))
 
+// R3-F2: Readiness probe — 暴露 saga 补偿 pending/failed 计数。failed>0(超限 dead-letter 未收敛)→ 503 非绿
+// 且外部可见(运维可告警);pending 仅 informational(在途将收敛)。计数来自 sharedPermissionBackend 轻量聚合。
+// 与 /healthz 分离:liveness=进程活,readiness=无未收敛补偿事实。
+app.get('/readyz', async (c) => {
+  const counts = await sharedPermissionBackend.getCompensationCounts()
+  const ready = counts.failed === 0
+  c.header('X-Compensation-Pending', String(counts.pending))
+  c.header('X-Compensation-Failed', String(counts.failed))
+  return c.json({ status: ready ? 'ready' : 'unconverged', compensations: counts }, ready ? 200 : 503)
+})
+
 // visual-diff token probe (env-gated): only when MIVO_VD_TOKEN is set, return it at
 // /__vd_probe so scripts/visual-diff.mjs can confirm THIS BFF process is responding
 // (not a stale one holding the port — strictPort makes the new BFF exit on EADDRINUSE,

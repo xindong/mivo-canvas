@@ -77,12 +77,16 @@ export type CompensationOp = 'restore' | 'delete'
  *    被 markSuperseded——sweep/attempt 据最新代际决断(防 restore-fail→delete 后旧 restore 晚到重开链接)。
  *  - status 'superseded':被对立 op 的新代际取代;保留行做可观察历史,不再被 sweep/attempt 处理。
  *  - claimedAt/claimedUntil:attempt 租约(P2-1);并发 attempt 原子 claim,loser 返 already-claimed。
+ *
+ * 返修 R3-F2(2026-07-12):
+ *  - status 'failed':sweep 超限放弃的 dead-letter 终态(不再伪装成 done);不占 partial unique 槽
+ *    (WHERE status='pending'),下一生命周期 primary 仍可 record 新 pending → 自动重开路径。可告警的未收敛事实。
  */
 export type CompensationIntent = {
   id: string
   projectId: string
   op: CompensationOp
-  status: 'pending' | 'done' | 'superseded'
+  status: 'pending' | 'done' | 'superseded' | 'failed'
   generation: number
   attemptCount: number
   lastError: string | null
@@ -183,6 +187,19 @@ export interface PermissionBackend {
    * 供 /readyz 类指标 / sweep driver 调度用;形态你定(memory: 同步过滤;PG: SELECT status='pending')。
    */
   listPendingCompensations(projectId?: string): Promise<CompensationIntent[]>
+
+  /**
+   * 返修 R3-F2:可观察 failed/dead-letter 信号——列全局(或某 project)超限放弃的补偿意图。
+   * 与 listPendingCompensations 分离:pending=在途(将收敛),failed=放弃(可告警的未收敛事实)。
+   * 供运维排查 / /readyz 非绿定因。形态同 listPending(memory: 过滤;PG: SELECT status='failed')。
+   */
+  listFailedCompensations(projectId?: string): Promise<CompensationIntent[]>
+
+  /**
+   * 返修 R3-F2:全局未收敛计数 {pending, failed}。供 /readyz readiness 探针 + POST/DELETE 响应 header
+   * 暴露(failed>0 → /readyz 503 非绿且外部可见;pending 仅 informational)。轻量聚合(不计列详情)。
+   */
+  getCompensationCounts(): Promise<{ pending: number; failed: number }>
 
   /**
    * 返修 P1-2:有界后台 sweep driver——启动恢复 + 周期退避重试的收敛入口。遍历 pending 意图(跳过
@@ -612,6 +629,31 @@ export class InMemoryPermissionBackend implements PermissionBackend {
     return out
   }
 
+  /** R3-F2:列 failed/dead-letter 意图(超限放弃;可告警的未收敛事实)。 */
+  async listFailedCompensations(projectId?: string): Promise<CompensationIntent[]> {
+    const out: CompensationIntent[] = []
+    const projects = projectId ? [projectId] : [...this.compensationsByProject.keys()]
+    for (const pid of projects) {
+      const ids = this.compensationsByProject.get(pid) ?? []
+      for (const id of ids) {
+        const it = this.compensations.get(id)
+        if (it && it.status === 'failed') out.push(it)
+      }
+    }
+    return out
+  }
+
+  /** R3-F2:全局未收敛计数(供 /readyz + 响应 header)。 */
+  async getCompensationCounts(): Promise<{ pending: number; failed: number }> {
+    let pending = 0
+    let failed = 0
+    for (const it of this.compensations.values()) {
+      if (it.status === 'pending') pending++
+      else if (it.status === 'failed') failed++
+    }
+    return { pending, failed }
+  }
+
   async sweepCompensations(): Promise<{ processed: number; converged: number; failed: number }> {
     let processed = 0
     let converged = 0
@@ -621,9 +663,10 @@ export class InMemoryPermissionBackend implements PermissionBackend {
     for (const it of pending) {
       if (it.claimedUntil && Date.parse(it.claimedUntil) > Date.now()) continue // 租约未到期,跳过
       if (it.attemptCount >= COMPENSATION_MAX_SWEEP_ATTEMPTS) {
-        // 超限放弃:mark done 留 last_error(防永久 pending 黑洞;运维据 lastError 定位)。
+        // R3-F2:超限放弃 → 'failed' dead-letter(不再伪装 done);保留可告警的未收敛事实,运维可定因。
+        //   不占 partial unique 槽(WHERE status='pending'),下一生命周期 primary record 新 pending 自动重开。
         const now = nowIso()
-        this.compensations.set(it.id, { ...it, status: 'done', lastError: it.lastError ?? 'sweep max attempts exceeded', lastAttemptedAt: now, updatedAt: now })
+        this.compensations.set(it.id, { ...it, status: 'failed', lastError: it.lastError ?? 'sweep max attempts exceeded', lastAttemptedAt: now, updatedAt: now })
         failed++
         continue
       }
@@ -631,7 +674,7 @@ export class InMemoryPermissionBackend implements PermissionBackend {
       processed++
       if (r.kind === 'completed') converged++
       else if (r.kind === 'failed') failed++
-      // already-claimed / nothing-pending:不计入 processed 的收敛/失败(sweep 视角非错误)
+      // already-claimed / nothing-pending / superseded:不计入 processed 的收敛/失败(sweep 视角非错误)
     }
     return { processed, converged, failed }
   }
