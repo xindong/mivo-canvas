@@ -362,6 +362,19 @@ describe('debug-logs route — R2-4: rate key 可信来源 + bucket 淘汰 + quo
     expect(files).toContain(`${recentDateStr}.jsonl`) // 窗内保留
   })
 
+  // ── R2-4-4b:retention=0 语义澄清(0=禁用 sweep=无限保留,与 quota 0=禁用 同义)──
+  // 返修前 0 → Math.floor(0)=0 → cutoffMs=now → 删全部 .jsonl(误设 0 想关 retention 反清空日志,footgun)。
+  it('retention=0 = 禁用 sweep(无限保留):过期 .jsonl 不删(与 MIVO_DEBUG_DISK_QUOTA_MB 0=禁用 语义一致)', async () => {
+    process.env.MIVO_DEBUG_RETENTION_DAYS = '0'
+    await mkdir(remoteDebugLogDir(), { recursive: true })
+    const oldDateStr = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+    await writeFile(remoteDebugFilePath(oldDateStr), 'old-data-should-survive-when-retention-0')
+    const res = await postEntry() // append 触发 sweep,但 retention=0=禁用 → 短路不删
+    expect(res.status).toBe(200)
+    const files = await readdir(remoteDebugLogDir())
+    expect(files).toContain(`${oldDateStr}.jsonl`) // 0=禁用 sweep → 过期文件保留
+  })
+
   // ── R2-4-5:生产 Origin 硬前置(返修前"无 Origin 无条件放行"+"localhost 兜底"让生产放行)──
   it('生产(MIVO_PUBLIC=1)+ 无 allowlist → POST 拒(无 localhost 兜底;返修前 localhost 兜底放行)', async () => {
     process.env.MIVO_PUBLIC = '1'

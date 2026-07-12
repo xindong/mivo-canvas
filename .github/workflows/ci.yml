@@ -458,7 +458,11 @@ jobs:
       #   重置污染 + 并发 worktree 污染)。p6saga 矩阵 + 并发回归用 mivocanvas_unit_p6saga;authz 矩阵
       #   (owner/editor/viewer/share × attach/detach/upload)用 mivocanvas_unit_authz。库由下方 psql 步预建。
       MIVO_PG_UNIT_DB_P6SAGA: mivocanvas_unit_p6saga
+      # G2.2(A1 P1-7):authz 矩阵(owner/editor/viewer/share × attach/detach/upload)隔离库。库由下方 psql 步预建。
       MIVO_PG_UNIT_DB_AUTHZ: mivocanvas_unit_authz
+      # A8②-3 permission 套件隔离库(permissionBackend.contract.dual 用;与 backend.pg 的
+      # mivocanvas_unit 分离,防 backend.pg __dropAllTables() 核爆 permission 表 + 追踪表)。库由下方 psql 步预建。
+      MIVO_PG_UNIT_DB_PERM: mivocanvas_unit_perm
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -502,8 +506,16 @@ jobs:
             echo "$db ready"
           done
           echo "::endgroup::"
+          echo "::group::Ensure mivocanvas_unit_perm DB exists (permissionBackend.contract.dual isolation DB; A8②-3)"
+          PGPASSWORD=mivo-test-no-password psql -h 127.0.0.1 -p 5432 -U mivo -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='mivocanvas_unit_perm'" | grep -q 1 \
+            || PGPASSWORD=mivo-test-no-password psql -h 127.0.0.1 -p 5432 -U mivo -d postgres -c "CREATE DATABASE mivocanvas_unit_perm"
+          echo "mivocanvas_unit_perm ready (permission suite isolation DB; survives backend.pg __dropAllTables)"
+          echo "::endgroup::"
 
       # 跑 PG-gated 套件。--no-fileParallelism:多 DB 隔离设计下更稳(lead 指定)。
+      # 隔离库:mivocanvas(contract.dual/route.dual)+ mivocanvas_unit(backend.pg)
+      #       + mivocanvas_unit_p6saga(p6saga)+ mivocanvas_unit_perm(permissionBackend.contract.dual,A8②-3)
+      #       + mivocanvas_unit_authz(assetsAuthzMatrix,G2.2 A1)。
       # 机器不变量(#229 硬门禁):六文件必须全部存在,任一缺失(删/改名/typo)在 vitest 之前即红,
       # 杜绝"--passWithNoTests + 缺文件 → 其余文件绿"的静默少跑(#229 要消灭的病)。
       # 六文件已全在 main(p6saga 自 #229 入;authz matrix 自 G2.2 A1 加入),infra-only/0-file 兼容期已过,不保留 --passWithNoTests。

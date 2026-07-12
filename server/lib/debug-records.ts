@@ -193,7 +193,11 @@ const getRetentionDays = (): number => {
   const raw = process.env.MIVO_DEBUG_RETENTION_DAYS
   if (raw === undefined || raw === '') return 7
   const n = Number(raw)
-  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 7
+  // 0 = 禁用 sweep(无限保留),与 MIVO_DEBUG_DISK_QUOTA_MB 的「0=禁用」语义一致。
+  // 返修前:0 走 Math.floor(0)=0 → cutoffMs=now → sweep 删全部 .jsonl —— 误设 0 想关 retention
+  // 反而清空全部历史日志,破坏性 footgun。现 0 显式返 Infinity → sweep 短路不删任何文件。
+  if (n === 0) return Number.POSITIVE_INFINITY
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 7
 }
 const getDiskQuotaBytes = (): number => {
   // 0 = 禁用(无 quota);默认 512MB;>0 = N MB。
@@ -207,6 +211,8 @@ const getDiskQuotaBytes = (): number => {
 /** R2-4:append 前 sweep 过期 .jsonl(日期早于 today - retentionDays);返回删除数。惰性 retention。 */
 export const sweepExpiredDebugLogs = async (now: Date = new Date()): Promise<number> => {
   const retentionDays = getRetentionDays()
+  // 0=禁用 sweep(无限保留):短路返 0,不删任何文件(与 quota 0=禁用 同义;见 getRetentionDays 注释)。
+  if (retentionDays === Number.POSITIVE_INFINITY) return 0
   const cutoffMs = now.getTime() - retentionDays * 24 * 60 * 60 * 1000
   try {
     const entries = await readdir(remoteDebugLogDir(), { withFileTypes: true })
