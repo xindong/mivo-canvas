@@ -438,3 +438,70 @@ describe('A8②-2 P1 — rekey 后点查 readback(防 listByOwner=1 但 get=miss
     expect((await b.get(fp, 'project', 'p1')).kind).toBe('missing')
   })
 })
+
+// A8②-2 P1 第二轮返修:chatOrderRev 迁移碰撞不回退(max+1)+ owner 含 ':' / 文本前缀对抗。
+// 返修前无条件 set(chatOrderRevKey(U,c), legacyRev) → target=5 被 legacy=3 覆盖 → revision 回退,
+// 旧 base 重新变 fresh(正是要消的 ABA)。策略(lead 拍板):碰撞 → max(target,legacy)+1;目标不存在 → 直迁;legacy 两种情况都删。
+describe('A8②-2 P1 第二轮 — chatOrderRev 碰撞不回退(max+1)+ NUL 分隔符对抗场景', () => {
+  const seedChatRev = (b: PersistBackend, owner: string, canvasId: string, rev: number): void => {
+    ;(b as unknown as { chatOrderRevisions: Map<string, number> }).chatOrderRevisions.set(chatOrderRevKey(owner, canvasId), rev)
+  }
+
+  it('碰撞 target=5、legacy=3 → 迁移后=6(max+1,永不回退;旧 base 5/3 都 stale)', async () => {
+    const b = new InMemoryPersistBackend()
+    const fp = 'abcd1234ef567890'
+    await b.ensureCreate(fp, 'project', 'p1', { name: 'P1' }, { method: 'POST', resourceKind: 'project' }) // byOwner 让 migrate 收集 L
+    seedChatRev(b, fp, 'c1', 3)              // legacy
+    seedChatRev(b, 'alice@xd.com', 'c1', 5)   // target(G2.1 窗口:username 新数据与 fp 旧数据共存)
+
+    const r = await b.migrateLegacyOwnersToUsernameForm!((f) => (f === fp ? 'alice@xd.com' : undefined))
+    expect(r.migrated).toBe(1)
+    expect(await b.getChatOrderRevision('alice@xd.com', 'c1')).toBe(6) // max(5,3)+1=6(返修前无条件 set 覆盖成 3 → 回退)
+    expect(await b.getChatOrderRevision(fp, 'c1')).toBe(0)             // legacy key 删
+  })
+
+  it('碰撞 target=3、legacy=5(legacy 更高)→ =6;target==legacy=4 → =5', async () => {
+    // 子 case A:legacy 更高(target=3 < legacy=5)
+    const bA = new InMemoryPersistBackend()
+    const fpA = 'abcd1234ef567890'
+    await bA.ensureCreate(fpA, 'project', 'p1', { name: 'P1' }, { method: 'POST', resourceKind: 'project' })
+    seedChatRev(bA, fpA, 'c1', 5)
+    seedChatRev(bA, 'alice@xd.com', 'c1', 3)
+    await bA.migrateLegacyOwnersToUsernameForm!((f) => (f === fpA ? 'alice@xd.com' : undefined))
+    expect(await bA.getChatOrderRevision('alice@xd.com', 'c1')).toBe(6) // max(3,5)+1=6
+
+    // 子 case B:target==legacy=4
+    const bB = new InMemoryPersistBackend()
+    const fpB = '0123456789abcdef'
+    await bB.ensureCreate(fpB, 'project', 'p1', { name: 'P1' }, { method: 'POST', resourceKind: 'project' })
+    seedChatRev(bB, fpB, 'c1', 4)
+    seedChatRev(bB, 'bob@xd.com', 'c1', 4)
+    await bB.migrateLegacyOwnersToUsernameForm!((f) => (f === fpB ? 'bob@xd.com' : undefined))
+    expect(await bB.getChatOrderRevision('bob@xd.com', 'c1')).toBe(5) // max(4,4)+1=5
+  })
+
+  it('【sol 指定固化】owner 含 ":"(alice:team 为 target)+ 文本前缀对抗(fp vs fp:shadow)→ NUL 分隔符精确隔离,shadow 不被误迁', async () => {
+    const b = new InMemoryPersistBackend()
+    const fp = 'abcd1234ef567890'            // legacy 16-hex
+    const shadow = 'abcd1234ef567890:shadow' // 文本前缀对抗:shadow = fp + ':shadow',fp 是 shadow 的文本前缀
+    const U = 'alice:team'                   // target owner 含 ':'
+    // byOwner:fp(被 migrate 收集)+ shadow(非 16-hex,不被收集,应原样保留)
+    await b.ensureCreate(fp, 'project', 'p1', { name: 'P1' }, { method: 'POST', resourceKind: 'project' })
+    await b.ensureCreate(shadow, 'project', 'p2', { name: 'P2' }, { method: 'POST', resourceKind: 'project' })
+    // chatOrderRevisions:legacy(fp)+ 对抗(shadow)+ target 碰撞(U)
+    seedChatRev(b, fp, 'c1', 3)
+    seedChatRev(b, shadow, 'c1', 7) // 对抗:shadow key = fp+':shadow'+NUL+c1;旧 ':' 分隔会误以 fp 前缀匹配并误迁;NUL 不误匹配
+    seedChatRev(b, U, 'c1', 5)       // target 碰撞
+
+    const r = await b.migrateLegacyOwnersToUsernameForm!((f) => (f === fp ? U : undefined))
+    expect(r.migrated).toBe(1)
+    // target U(alice:team,owner 含 ':')碰撞 → max(5,3)+1=6(证明 owner 含 ':' 的 target 正确处理)
+    expect(await b.getChatOrderRevision(U, 'c1')).toBe(6)
+    // shadow 不被误迁:NUL 紧随 fp,shadow key 第 16 位是 ':' 非 NUL → startsWith(fp+NUL) 不命中 → 保留原值 7
+    expect(await b.getChatOrderRevision(shadow, 'c1')).toBe(7)
+    // legacy fp 删
+    expect(await b.getChatOrderRevision(fp, 'c1')).toBe(0)
+    // shadow 的 byOwner 也不被误迁(原样保留 p2)
+    expect((await b.get(shadow, 'project', 'p2')).kind).toBe('found')
+  })
+})

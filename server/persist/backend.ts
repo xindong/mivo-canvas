@@ -1479,15 +1479,24 @@ export class InMemoryPersistBackend implements PersistBackend {
       }
       // chatOrderRevisions:chatOrderRevKey(L,canvasId) → chatOrderRevKey(U,canvasId)(per-actor×canvas cursor 随 owner 迁移,
       // 否则 rekey 后 U 的 reorder 见 revision=0 → 乐观锁 stale base=0 ABA 风险)。旧 rekey 漏此步,A8②-2 P1 顺手补。
+      // P1 第二轮返修:G2.1 窗口内 username 新数据与 fp 旧数据共存合法 → 目标 key 可能已存在 revision。
+      //   无条件 set 会把 targetRev=5 覆盖成 legacyRev=3 → revision 回退,旧 base 重新变 fresh(正是要消的 ABA)。
+      //   策略(lead 拍板):碰撞(target key 已存在)→ max(targetRev, legacyRev) + 1(永不回退 + +1 使新旧两侧
+      //   已发出的 stale base 全失效);目标不存在 → 直迁 legacyRev。legacy key 两种情况都删。
       const chatKeysToMove: string[] = []
       for (const revKey of this.chatOrderRevisions.keys()) {
         if (revKey.startsWith(legacyOwnerPrefix)) chatKeysToMove.push(revKey)
       }
       for (const revKey of chatKeysToMove) {
-        const rev = this.chatOrderRevisions.get(revKey)!
-        this.chatOrderRevisions.delete(revKey)
+        const legacyRev = this.chatOrderRevisions.get(revKey)!
+        this.chatOrderRevisions.delete(revKey) // legacy key 两种情况都删
         const canvasId = revKey.slice(legacyOwnerPrefix.length)
-        this.chatOrderRevisions.set(chatOrderRevKey(U, canvasId), rev)
+        const targetKey = chatOrderRevKey(U, canvasId)
+        const targetRev = this.chatOrderRevisions.get(targetKey) // 目标 key 已存在?(G2.1 窗口共存)
+        const migratedRev = targetRev === undefined
+          ? legacyRev // 目标不存在 → 直迁
+          : Math.max(targetRev, legacyRev) + 1 // 碰撞 → max+1,永不回退 + 两侧 stale base 全失效
+        this.chatOrderRevisions.set(targetKey, migratedRev)
       }
       // globalProjectOwners / globalCanvasOwners:value === L → U(派生 owner 指向同步)。
       for (const [pid, owner] of this.globalProjectOwners) {
