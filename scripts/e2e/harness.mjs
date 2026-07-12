@@ -328,6 +328,12 @@ export const startSmokeBffServer = ({
       // (MIVO_PUBLIC=1) the stub is force-off regardless — harmless there.
       MIVO_DEV_AUTH_STUB: '1',
       ...(isPublic ? { MIVO_PUBLIC: '1' } : {}),
+      // R5(G2.1 同源三元组安全硬化):生产同源判定需"可信外部 scheme"——直连 prod 拓扑下
+      // app 与 BFF 同监听 securityPort,浏览器同源 POST Origin=http://127.0.0.1:port;显式配
+      // MIVO_PUBLIC_ORIGIN 让同源 POST 放行(无此配置 → 无法可信判定外部 scheme → fail-closed →
+      // debug/canvas-interactions/mask/mask-reflow 4 场景浏览器同源 debugLogger POST 全 403 红回归)。
+      // 真实生产部署:网关后由 ops 配 https 的 PUBLIC_ORIGIN(或受信 X-Forwarded-Proto);e2e 直连用 http。
+      ...(isPublic ? { MIVO_PUBLIC_ORIGIN: `http://127.0.0.1:${port}` } : {}),
       MIVO_ASSET_DIR: localAssetFixtureDir,
       MIVO_EAGLE_API_URL: `http://127.0.0.1:${eagleMockPort}`,
       MIVO_DEBUG_LOG_DIR: path.resolve('test-artifacts/debug-logs'),

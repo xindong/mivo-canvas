@@ -5,6 +5,10 @@ export const runDebugScenario = async (context) => {
   const remoteErrorText = `e2e-remote error ${runId}`
 
   const remoteDebugResponse = await page.request.post(`${baseUrl}/api/mivo/debug-logs`, {
+    // R3-F4:生产 debug-logs Origin 硬前置(同源放行/跨域 allowlist/无 Origin fail-closed)。
+    // page.request 是 Node 侧 APIRequestContext(不自动带 Origin,非浏览器);真实客户端 remoteDebugReporter
+    // 用浏览器 fetch(同源 POST 自带 Origin=baseUrl origin)。此处显式带同源 Origin,忠实代表浏览器同源 POST。
+    headers: { origin: baseUrl },
     data: {
       clientId,
       sessionId: 'e2e-session',

@@ -13,9 +13,9 @@ import { serveStatic } from '@hono/node-server/serve-static'
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { resolveFeatureFlags } from './lib/env'
-import { resolveAssetStoreDir } from './lib/assetStore'
 import { computeReadiness } from './lib/readiness'
 import type { AppEnv } from './lib/types'
+import { ssoAuthErrorHandler, createSsoStrictProofGate, hasSubresourceId } from './lib/owner'
 import { generateHandler } from './routes/generate'
 import { editHandler } from './routes/edit'
 import { enhanceHandler } from './routes/enhance'
@@ -25,6 +25,7 @@ import { authRoute } from './routes/auth'
 import { debugLogsRoute } from './routes/debug-logs'
 import { createLocalAssetsRoutes } from './routes/local-assets'
 import { createAssetRoutes } from './routes/assets'
+import { createAssetStore, createFsAssetBackend, resolveAssetStoreDir, type AssetStore } from './lib/assetStore'
 import { createEagleRoutes } from './routes/eagle'
 import { createPinterestRoutes } from './routes/pinterest'
 import { createProxyImageRoutes } from './routes/proxy-image'
@@ -120,6 +121,36 @@ if (vdProbeToken) {
 // the SSO gateway (nginx intercepts); this mount is for local dev / e2e.
 app.route('/api/auth', authRoute)
 
+// G2.1 (cutover §5): SSO auth error boundary (top-level onError). Catches
+// SsoAuthError thrown by resolveActor / resolveTaskOwner / resolveAssetOwner inside
+// any sub-app handler in strict mode (MIVO_SSO_STRICT=1: missing/wrong gateway
+// secret·header → 401, NO fingerprint fallback) and returns 401. Inert in non-strict
+// mode (default off → resolveActor never throws SsoAuthError → falls through to the
+// default 500 path unchanged → production zero change). F5 返修:non-SsoAuthError 分支
+// 精确复刻 Hono 默认(HTTPException.getResponse + console.error + 500 文本),不吞普通错误。
+//
+// 覆盖面(F6 返修,见 docs/runbook/g21-strict-sso-runbook.md §route security matrix):
+// - owner-scoped 持久化路由(projects/canvas/userState/assets/tasks/members/shareLinks)
+//   → 走 resolveActor,strict 下缺 proof → 401;
+// - debug-logs(POST 写 JSONL / GET 读报表)是 **system-scoped 遥测**,不经 resolveActor,
+//   不被本 boundary 门控——独立防护(origin allowlist + per-IP rate limit + body cap +
+//   GET view-token / public fail-closed)在 strict 下继续生效;debugLogsRoute 不抛 SsoAuthError;
+// - stateless /api 路由(generate/edit/keys)不调 resolveActor → 不抛 → 不受影响。
+app.onError(ssoAuthErrorHandler)
+
+// G2.1 R2-2/R3-F2:strict proof 前置中间件(工厂)。owner-scoped 路由(projects/canvas/userState/tasks/members/
+// shareLinks 子资源)在 strict + 无有效 share token 时,于任何 body 解析/DB lookup 前统一验 proof → 401。
+// R3-F2:token presence 不再豁免——按 route 能力收窄(shareCapable)+ token 经 resolveShareLinkByToken
+// 全局验有效性(active 才豁免;garbage/revoked/expired 不豁免,存在≠proof)。tasks/user-state 永不豁免;
+// projects root(无 :id)永不豁免(hasSubresourceId=false);projects/canvas :id 子资源 + canvas 全部支持
+// (canvas POST / 的 projectId 在 body,gate 全局验 token,route authz 验 token↔project)。
+// dev mode 豁免;legacy(non-strict)no-op(生产零变化)。assets 路由 R3-F2 在 route 内 resolveAssetOwner
+// 移到所有 validation 前(无需本中间件)。详见 owner.ts createSsoStrictProofGate。
+app.use('/api/projects/*', createSsoStrictProofGate({ permissions: sharedPermissionBackend, shareCapable: hasSubresourceId }))
+app.use('/api/canvas/*', createSsoStrictProofGate({ permissions: sharedPermissionBackend, shareCapable: true }))
+app.use('/api/user-state/*', createSsoStrictProofGate({ permissions: sharedPermissionBackend, shareCapable: false }))
+app.use('/api/mivo/tasks/*', createSsoStrictProofGate({ permissions: sharedPermissionBackend, shareCapable: false }))
+
 // P1-c generate/edit/enhance routes. app.all lets each handler enforce POST-only
 // (non-POST → 405 {error:'Method not allowed'}), matching dev middleware semantics
 // exactly (dev checks request.method !== 'POST' inside each handler).
@@ -140,14 +171,21 @@ app.route('/api/mivo', createLocalAssetsRoutes({ enabled: featureFlags.localAsse
 // controls usage; this flag controls whether the BFF serves at all. Storage
 // backend is swappable for PG (T1.1); MIME allowlist (P1.3) + per-owner quota
 // (P1.4) + owner-scoped GET (P2.5) live in the route.
+// G2.1 R2-1:sharedAssetStore built once here (when service enabled) so the startup
+// owner-migration gate (index.ts) can scan the assets domain for legacy-form ownerFp
+// (AssetRecord.ownerFp + references[].ownerFp + .uploaders). Service off → null →
+// index.ts passes a no-op detector (0 legacy; BFF manages no asset data).
+let sharedAssetStore: AssetStore | null = null
 if (featureFlags.assetServiceEnabled) {
-  app.route('/api', createAssetRoutes())
+  sharedAssetStore = createAssetStore(createFsAssetBackend(resolveAssetStoreDir()))
+  app.route('/api', createAssetRoutes({ store: sharedAssetStore }))
 } else {
   // Flag off → 404 for the asset endpoints (no SPA index.html for an API path).
   const assetDisabled = (c: Context<AppEnv>) => c.notFound()
   app.all('/api/assets', assetDisabled)
   app.all('/api/assets/*', assetDisabled)
 }
+export { sharedAssetStore }
 app.route('/api/mivo', createEagleRoutes({ enabled: featureFlags.eagleProxyEnabled }))
 app.route('/api/mivo', createPinterestRoutes())
 // W3: CORS proxy for external images (readCanvasImageBlob fallback). SSRF-hardened.
