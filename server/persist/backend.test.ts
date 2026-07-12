@@ -4,7 +4,7 @@
 // 原子 tree 软删回滚(#7)、幂等 fingerprint(#10)。
 
 import { describe, it, expect, beforeEach } from 'vitest'
-import { InMemoryPersistBackend, fingerprintOfBody, type PersistBackend, type PersistType } from './backend'
+import { InMemoryPersistBackend, fingerprintOfBody, idemIndexKey, chatOrderRevKey, type PersistBackend, type PersistType } from './backend'
 
 describe('InMemoryPersistBackend — 返修 #1 project 全局唯一', () => {
   let b: PersistBackend
@@ -362,7 +362,7 @@ describe('InMemoryPersistBackend — 返修四 F1 createCanvasWithCollection 原
     const beforeCanvas = await rec('canvas', 'c1')
     const beforeColl = await rec('chat-collection', 'c1')
     const idemIdx = (b as unknown as { idempotencyIndex: Map<string, { envelopeKey: string; fingerprint: string }> }).idempotencyIndex
-    const beforeIdem = idemIdx.get('o:POST:canvas:k1')
+    const beforeIdem = idemIdx.get(idemIndexKey('o', 'POST', 'canvas', 'k1'))
     expect(beforeIdem).toBeDefined()
     expect(b.getCanvasOwner('c1')?.ownerId).toBe('o')
 
@@ -386,7 +386,122 @@ describe('InMemoryPersistBackend — 返修四 F1 createCanvasWithCollection 原
     expect(afterColl.isDeleted).toBe(true)
     expect(afterColl.revision).toBe(beforeColl.revision)
     expect(b.getCanvasOwner('c1')?.ownerId).toBe('o') // globalCanvasOwners 回滚
-    const afterIdem = idemIdx.get('o:POST:canvas:k1')
+    const afterIdem = idemIdx.get(idemIndexKey('o', 'POST', 'canvas', 'k1'))
     expect(afterIdem).toEqual(beforeIdem) // idempotencyIndex 回滚(envelopeKey + fingerprint 不变)
+  })
+})
+
+// A8②-2 P1 回归:rekey 后点查 readback(防 listByOwner=1 但 get=missing 假迁移)。
+// 返修前 rekey(byOwner + idempotencyIndex)手拼 ':' 与 recordKey/idemIndexKey NUL 不一致 →
+//   byOwner bucket 有 entry(因 rekey dstBucket.set 用 ':')但 get(alice,project,p1) 用 NUL key
+//   查不到 → missing;idemKey startsWith('L:') 也永不命中 NUL key → idempotency index 未迁。
+// rekey 全改 KEY_SEP 前缀替换 + 补 chatOrderRevisions 迁移后,点查 found + idem 命中 alice + chatOrderRevision 随迁。
+describe('A8②-2 P1 — rekey 后点查 readback(防 listByOwner=1 但 get=missing 假迁移)', () => {
+  it('rekey fp→alice 后 get=found + getProjectOwner/getCanvasOwner 可见 + idempotency replay 命中 alice + chatOrderRevision 随迁', async () => {
+    const b = new InMemoryPersistBackend()
+    const fp = 'abcd1234ef567890'
+    // seed legacy fp:project p1(带 idempotencyKey 'idk1')+ canvas c1 + chat-collection
+    await b.ensureCreate(fp, 'project', 'p1', { name: 'P1' }, { method: 'POST', resourceKind: 'project', idempotencyKey: 'idk1', bodyFingerprint: 'fp1' })
+    await b.createCanvasWithCollection(fp, 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+    // seed chatOrderRevision(fp,c1)=3 via 直接 Map(私有 bumpChatOrderRevision 不公开)
+    const chatRevMap = (b as unknown as { chatOrderRevisions: Map<string, number> }).chatOrderRevisions
+    chatRevMap.set(chatOrderRevKey(fp, 'c1'), 3)
+
+    // migrate fp → alice@xd.com
+    const result = await b.migrateLegacyOwnersToUsernameForm!((f) => (f === fp ? 'alice@xd.com' : undefined))
+    expect(result.migrated).toBe(1)
+    expect(result.unmapped).toBe(0)
+    expect(await b.countLegacyFormOwners!()).toBe(0)
+
+    // P1 核心:点查 get=found(返修前 listByOwner=1 但 get=missing,因 rekey 手拼 ':' 与 NUL key 不一致)
+    expect((await b.get('alice@xd.com', 'project', 'p1')).kind).toBe('found')
+    expect((await b.get('alice@xd.com', 'canvas', 'c1')).kind).toBe('found')
+    expect((await b.get('alice@xd.com', 'chat-collection', 'c1')).kind).toBe('found')
+
+    // getProjectOwner/getCanvasOwner 点查可见(globalProject/CanvasOwners value L→U)
+    expect(b.getProjectOwner('p1')?.ownerId).toBe('alice@xd.com')
+    expect(b.getCanvasOwner('c1')?.ownerId).toBe('alice@xd.com')
+
+    // idempotency index rekey:entry 现 under alice(返修前 startsWith('L:') 永不命中 NUL idemKey → 未迁,仍 under fp)
+    const idemMap = (b as unknown as { idempotencyIndex: Map<string, unknown> }).idempotencyIndex
+    expect(idemMap.has(idemIndexKey('alice@xd.com', 'POST', 'project', 'idk1'))).toBe(true)
+    expect(idemMap.has(idemIndexKey(fp, 'POST', 'project', 'idk1'))).toBe(false)
+    // replay 同 idempotencyKey 在 alice 下 → 不重复创建(命中 → existing,非 created)
+    const replay = await b.ensureCreate('alice@xd.com', 'project', 'p1', { name: 'P1' }, { method: 'POST', resourceKind: 'project', idempotencyKey: 'idk1', bodyFingerprint: 'fp1' })
+    expect(replay.kind).not.toBe('created')
+
+    // chatOrderRevision 随迁:alice 下读 c1 = 3(返修前 rekey 漏 chatOrderRevisions → alice 见 0,乐观锁 stale base=0 ABA 风险)
+    expect(await b.getChatOrderRevision('alice@xd.com', 'c1')).toBe(3)
+    expect(await b.getChatOrderRevision(fp, 'c1')).toBe(0) // 旧 fp 下已无
+
+    // 旧 fp 点查全 missing(byOwner 已迁走)
+    expect((await b.get(fp, 'project', 'p1')).kind).toBe('missing')
+  })
+})
+
+// A8②-2 P1 第二轮返修:chatOrderRev 迁移碰撞不回退(max+1)+ owner 含 ':' / 文本前缀对抗。
+// 返修前无条件 set(chatOrderRevKey(U,c), legacyRev) → target=5 被 legacy=3 覆盖 → revision 回退,
+// 旧 base 重新变 fresh(正是要消的 ABA)。策略(lead 拍板):碰撞 → max(target,legacy)+1;目标不存在 → 直迁;legacy 两种情况都删。
+describe('A8②-2 P1 第二轮 — chatOrderRev 碰撞不回退(max+1)+ NUL 分隔符对抗场景', () => {
+  const seedChatRev = (b: PersistBackend, owner: string, canvasId: string, rev: number): void => {
+    ;(b as unknown as { chatOrderRevisions: Map<string, number> }).chatOrderRevisions.set(chatOrderRevKey(owner, canvasId), rev)
+  }
+
+  it('碰撞 target=5、legacy=3 → 迁移后=6(max+1,永不回退;旧 base 5/3 都 stale)', async () => {
+    const b = new InMemoryPersistBackend()
+    const fp = 'abcd1234ef567890'
+    await b.ensureCreate(fp, 'project', 'p1', { name: 'P1' }, { method: 'POST', resourceKind: 'project' }) // byOwner 让 migrate 收集 L
+    seedChatRev(b, fp, 'c1', 3)              // legacy
+    seedChatRev(b, 'alice@xd.com', 'c1', 5)   // target(G2.1 窗口:username 新数据与 fp 旧数据共存)
+
+    const r = await b.migrateLegacyOwnersToUsernameForm!((f) => (f === fp ? 'alice@xd.com' : undefined))
+    expect(r.migrated).toBe(1)
+    expect(await b.getChatOrderRevision('alice@xd.com', 'c1')).toBe(6) // max(5,3)+1=6(返修前无条件 set 覆盖成 3 → 回退)
+    expect(await b.getChatOrderRevision(fp, 'c1')).toBe(0)             // legacy key 删
+  })
+
+  it('碰撞 target=3、legacy=5(legacy 更高)→ =6;target==legacy=4 → =5', async () => {
+    // 子 case A:legacy 更高(target=3 < legacy=5)
+    const bA = new InMemoryPersistBackend()
+    const fpA = 'abcd1234ef567890'
+    await bA.ensureCreate(fpA, 'project', 'p1', { name: 'P1' }, { method: 'POST', resourceKind: 'project' })
+    seedChatRev(bA, fpA, 'c1', 5)
+    seedChatRev(bA, 'alice@xd.com', 'c1', 3)
+    await bA.migrateLegacyOwnersToUsernameForm!((f) => (f === fpA ? 'alice@xd.com' : undefined))
+    expect(await bA.getChatOrderRevision('alice@xd.com', 'c1')).toBe(6) // max(3,5)+1=6
+
+    // 子 case B:target==legacy=4
+    const bB = new InMemoryPersistBackend()
+    const fpB = '0123456789abcdef'
+    await bB.ensureCreate(fpB, 'project', 'p1', { name: 'P1' }, { method: 'POST', resourceKind: 'project' })
+    seedChatRev(bB, fpB, 'c1', 4)
+    seedChatRev(bB, 'bob@xd.com', 'c1', 4)
+    await bB.migrateLegacyOwnersToUsernameForm!((f) => (f === fpB ? 'bob@xd.com' : undefined))
+    expect(await bB.getChatOrderRevision('bob@xd.com', 'c1')).toBe(5) // max(4,4)+1=5
+  })
+
+  it('【sol 指定固化】owner 含 ":"(alice:team 为 target)+ 文本前缀对抗(fp vs fp:shadow)→ NUL 分隔符精确隔离,shadow 不被误迁', async () => {
+    const b = new InMemoryPersistBackend()
+    const fp = 'abcd1234ef567890'            // legacy 16-hex
+    const shadow = 'abcd1234ef567890:shadow' // 文本前缀对抗:shadow = fp + ':shadow',fp 是 shadow 的文本前缀
+    const U = 'alice:team'                   // target owner 含 ':'
+    // byOwner:fp(被 migrate 收集)+ shadow(非 16-hex,不被收集,应原样保留)
+    await b.ensureCreate(fp, 'project', 'p1', { name: 'P1' }, { method: 'POST', resourceKind: 'project' })
+    await b.ensureCreate(shadow, 'project', 'p2', { name: 'P2' }, { method: 'POST', resourceKind: 'project' })
+    // chatOrderRevisions:legacy(fp)+ 对抗(shadow)+ target 碰撞(U)
+    seedChatRev(b, fp, 'c1', 3)
+    seedChatRev(b, shadow, 'c1', 7) // 对抗:shadow key = fp+':shadow'+NUL+c1;旧 ':' 分隔会误以 fp 前缀匹配并误迁;NUL 不误匹配
+    seedChatRev(b, U, 'c1', 5)       // target 碰撞
+
+    const r = await b.migrateLegacyOwnersToUsernameForm!((f) => (f === fp ? U : undefined))
+    expect(r.migrated).toBe(1)
+    // target U(alice:team,owner 含 ':')碰撞 → max(5,3)+1=6(证明 owner 含 ':' 的 target 正确处理)
+    expect(await b.getChatOrderRevision(U, 'c1')).toBe(6)
+    // shadow 不被误迁:NUL 紧随 fp,shadow key 第 16 位是 ':' 非 NUL → startsWith(fp+NUL) 不命中 → 保留原值 7
+    expect(await b.getChatOrderRevision(shadow, 'c1')).toBe(7)
+    // legacy fp 删
+    expect(await b.getChatOrderRevision(fp, 'c1')).toBe(0)
+    // shadow 的 byOwner 也不被误迁(原样保留 p2)
+    expect((await b.get(shadow, 'project', 'p2')).kind).toBe('found')
   })
 })
