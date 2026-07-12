@@ -28,6 +28,7 @@ const runPermissionBackendContractSuite = (
   setLinkCascadeRevokedAt: (b: PermissionBackend, linkId: string, iso: string) => boolean | Promise<boolean>,
   setCompensationFault: (b: PermissionBackend, op: CompensationOp, throwCount: number) => void,
   setProjectDeleted: (b: PermissionBackend, projectId: string, isDeleted: boolean) => void | Promise<void>,
+  setClaimPause: (b: PermissionBackend, op: CompensationOp, pauseFn: () => Promise<void>) => void,
 ): void => {
   describe(`${label} — 成员资格:角色派生 + CRUD + 反查`, () => {
     let b: PermissionBackend
@@ -482,6 +483,72 @@ const runPermissionBackendContractSuite = (
       const counts2 = await b.getCompensationCounts()
       expect(counts2.pending).toBe(0)
     })
+
+    // R5-F1 TOCTOU(R4 加压暴露的 P1 阻断):durable desired state 在 claim 后、side effect 前翻转
+    //   (primary ensureCreate/softDelete 先于 recordCompensation 提交 → 两步写固有窗口:primary 提交后、
+    //    record 前崩溃/延迟)→ 旧 op 不得执行副作用;须 superseded 返回,终态跟随最新 durable desired state。
+    //   复现:claim(token_A)→ 暂停 → 翻转 is_deleted(primary 已提交、record 前崩溃)→ 释放 → 旧 worker 须不执行副作用。
+    //   PG:claim 是已提交 UPDATE,暂停后用 __setProjectDeletedForTest 翻 projects.is_deleted(另一连接提交);
+    //     修复后 critical trx SELECT...FOR UPDATE 重读 is_deleted → stale → 不执行副作用。
+    //   memory:claim 同步置 token 后暂停(__setClaimPauseForTest);__setProjectDeletedForTest 翻 memory is_deleted map;
+    //     修复后 claim 后重读 is_deleted → stale → 不执行副作用。双向(restore/delete)对偶。
+    it('R5-F1① restore TOCTOU:claim 后 is_deleted 翻 true → superseded,不 unRevoke,link 仍 revoked', async () => {
+      const link = await b.createShareLink('p1', 'view', 'ownerA')
+      await b.revokeAllForProject('p1') // 级联 revoke(置 cascade marker),link revoked
+      expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('revoked')
+      // restore primary 已提交(is_deleted=false;memory 注入,PG 翻 projects.is_deleted)
+      await setProjectDeleted(b, 'p1', false)
+      await b.recordCompensation('p1', 'restore') // gen1 pending restore
+      // A: claim(token_A)→ 暂停在 side effect 前(模拟 primary 在 record 前崩溃的 TOCTOU 窗口)
+      let resolvePause!: () => void
+      const pausePromise = new Promise<void>((r) => { resolvePause = r })
+      setClaimPause(b, 'restore', () => pausePromise)
+      const aPromise = b.attemptCompensation('p1', 'restore')
+      // 等 claim_token 落库(memory 同步即有;PG claim 是异步 UPDATE,需轮询)
+      for (let i = 0; i < 200; i++) {
+        const r = await b.listCompensations('p1')
+        if (r.find((x) => x.op === 'restore')?.claimToken) break
+        await new Promise((rr) => setTimeout(rr, 5))
+      }
+      // 翻转 durable desired state:primary delete 已提交(is_deleted=true),但 record 前崩溃 → 无 delete intent
+      await setProjectDeleted(b, 'p1', true)
+      // 释放 pause;A 恢复 —— 修复后须 superseded(不执行 unRevoke);未修复则 completed(把已删项目 link 翻 active)
+      resolvePause()
+      const a = await aPromise
+      expect(a.kind).toBe('superseded') // FIX:不再 completed
+      expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('revoked') // link 仍 revoked(未 unRevoke)
+      const ints = await b.listCompensations('p1')
+      const restore = ints.find((i) => i.op === 'restore')!
+      expect(restore.status).toBe('superseded')
+      expect(restore.attemptCount).toBe(0) // 不 bump(未执行副作用)
+    })
+
+    it('R5-F1② delete TOCTOU:claim 后 is_deleted 翻 false → superseded,不 revoke,link 仍 active', async () => {
+      const link = await b.createShareLink('p1', 'view', 'ownerA')
+      expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('active')
+      // delete primary 已提交(is_deleted=true)
+      await setProjectDeleted(b, 'p1', true)
+      await b.recordCompensation('p1', 'delete') // gen1 pending delete
+      let resolvePause!: () => void
+      const pausePromise = new Promise<void>((r) => { resolvePause = r })
+      setClaimPause(b, 'delete', () => pausePromise)
+      const aPromise = b.attemptCompensation('p1', 'delete')
+      for (let i = 0; i < 200; i++) {
+        const r = await b.listCompensations('p1')
+        if (r.find((x) => x.op === 'delete')?.claimToken) break
+        await new Promise((rr) => setTimeout(rr, 5))
+      }
+      // primary restore 已提交(is_deleted=false),record 前崩溃 → 无 restore intent;旧 delete 不得把 link 翻 revoked
+      await setProjectDeleted(b, 'p1', false)
+      resolvePause()
+      const a = await aPromise
+      expect(a.kind).toBe('superseded') // FIX:不再 completed
+      expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('active') // link 仍 active(未 revoke)
+      const ints = await b.listCompensations('p1')
+      const del = ints.find((i) => i.op === 'delete')!
+      expect(del.status).toBe('superseded')
+      expect(del.attemptCount).toBe(0)
+    })
   })
 }
 
@@ -495,8 +562,9 @@ runPermissionBackendContractSuite(
   (b, id, iso) => (b as InMemoryPermissionBackend).__setLinkRevokedAtForTest(id, iso),
   (b, id, iso) => (b as InMemoryPermissionBackend).__setLinkCascadeRevokedAtForTest(id, iso),
   (b, op, n) => (b as InMemoryPermissionBackend).__setCompensationFaultForTest(op, n),
-  // memory 无 projects 表 → no-op(memory 走 hasSuperseded 判 stale)
+  // memory 无 projects 表 → R5-F1:__setProjectDeletedForTest 现已实(memory projectDeleted map),与 PG 对偶
   (b, pid, d) => (b as InMemoryPermissionBackend).__setProjectDeletedForTest(pid, d),
+  (b, op, fn) => (b as InMemoryPermissionBackend).__setClaimPauseForTest(op, fn),
 )
 
 // ── PG 后端(gate:MIVO_PG_TEST=1;本地 brew PG port 55443)─────────────────────────────────
@@ -532,5 +600,6 @@ let pgPermBackend: PgPermissionBackend | undefined
     (b, id, iso) => (b as PgPermissionBackend).__setLinkCascadeRevokedAtForTest(id, iso),
     (b, op, n) => (b as PgPermissionBackend).__setCompensationFaultForTest(op, n),
     (b, pid, d) => (b as PgPermissionBackend).__setProjectDeletedForTest(pid, d),
+    (b, op, fn) => (b as PgPermissionBackend).__setClaimPauseForTest(op, fn),
   )
 })

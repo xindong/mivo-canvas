@@ -298,4 +298,93 @@ const migrateWith = async (
       await backend.destroy()
     })
   })
+
+  // R5-F1 TOCTOU 加压(R4 verdict Step 7 复现):两个独立真 PG backend(各自独立连接池)barrier 复现
+  //   "primary durable desired state 已提交、new intent 尚未 record"的真实 saga 窗口,并发 N 轮零翻转。
+  //   A(backend A)claim restore 后暂停在 side effect 前;B(backend B,独立 pool)提交 primary delete
+  //   (is_deleted=true)但不 record(模拟 record 前崩溃);释放 A → 修复后 critical trx SELECT...FOR UPDATE
+  //   重读 is_deleted=true → stale → superseded,不执行 unRevoke,link 保持 revoked。双向(restore/delete)N 轮。
+  describe('R5-F1 TOCTOU 加压(两独立真 PG backend,N 轮零翻转)', () => {
+    let backendA: PgPermissionBackend
+    let backendB: PgPermissionBackend
+    beforeAll(async () => {
+      const admin = makeKysely()
+      await resetSchema(admin)
+      await admin.destroy()
+      backendA = new PgPermissionBackend(cfg)
+      backendB = new PgPermissionBackend(cfg)
+      await Promise.all([backendA.ready, backendB.ready])
+    })
+    afterAll(async () => {
+      await Promise.all([backendA.destroy(), backendB.destroy()])
+    })
+
+    it('restore 方向 N 轮:A claim→B 翻 is_deleted=true→A 须 superseded,link 仍 revoked(零翻转)', async () => {
+      const N = 5
+      for (let round = 0; round < N; round++) {
+        const pid = `p-toctou-res-${round}`
+        await backendA.__reset()
+        await backendA.__seedProjectForTest(pid, 'ownerA')
+        const link = await backendA.createShareLink(pid, 'view', 'ownerA')
+        await backendA.revokeAllForProject(pid) // cascade marker,link revoked
+        await backendA.__setProjectDeletedForTest(pid, false) // restore desired
+        await backendA.recordCompensation(pid, 'restore') // gen1 pending
+        // A: claim(token_A)→ 暂停在 side effect 前
+        let resolvePause!: () => void
+        const pausePromise = new Promise<void>((r) => { resolvePause = r })
+        backendA.__setClaimPauseForTest('restore', () => pausePromise)
+        const aPromise = backendA.attemptCompensation(pid, 'restore')
+        // 等 A 的 claim_token 落库(claim 是异步 UPDATE)
+        for (let i = 0; i < 200; i++) {
+          const r = await backendA.listCompensations(pid)
+          if (r.find((x) => x.op === 'restore')?.claimToken) break
+          await new Promise((rr) => setTimeout(rr, 5))
+        }
+        // B(独立 pool)提交 primary delete(is_deleted=true),不 record(模拟 record 前崩溃)
+        await backendB.__setProjectDeletedForTest(pid, true)
+        // 释放 A;A 恢复 → 修复后 critical trx 重读 is_deleted=true → superseded
+        resolvePause()
+        const a = await aPromise
+        expect(a.kind).toBe('superseded') // 不执行副作用,不报 completed
+        expect((await backendA.resolveShareLink(link.token, pid))?.kind).toBe('revoked') // link 仍 revoked(零翻转)
+        const ints = await backendA.listCompensations(pid)
+        const restore = ints.find((i) => i.op === 'restore')!
+        expect(restore.status).toBe('superseded')
+        expect(restore.attemptCount).toBe(0) // 不 bump
+        backendA.__clearClaimPauseForTest('restore')
+      }
+    })
+
+    it('delete 方向 N 轮:A claim→B 翻 is_deleted=false→A 须 superseded,link 仍 active(零翻转)', async () => {
+      const N = 5
+      for (let round = 0; round < N; round++) {
+        const pid = `p-toctou-del-${round}`
+        await backendA.__reset()
+        await backendA.__seedProjectForTest(pid, 'ownerA')
+        const link = await backendA.createShareLink(pid, 'view', 'ownerA') // active
+        await backendA.__setProjectDeletedForTest(pid, true) // delete desired
+        await backendA.recordCompensation(pid, 'delete') // gen1 pending
+        let resolvePause!: () => void
+        const pausePromise = new Promise<void>((r) => { resolvePause = r })
+        backendA.__setClaimPauseForTest('delete', () => pausePromise)
+        const aPromise = backendA.attemptCompensation(pid, 'delete')
+        for (let i = 0; i < 200; i++) {
+          const r = await backendA.listCompensations(pid)
+          if (r.find((x) => x.op === 'delete')?.claimToken) break
+          await new Promise((rr) => setTimeout(rr, 5))
+        }
+        // B 提交 primary restore(is_deleted=false),不 record
+        await backendB.__setProjectDeletedForTest(pid, false)
+        resolvePause()
+        const a = await aPromise
+        expect(a.kind).toBe('superseded')
+        expect((await backendA.resolveShareLink(link.token, pid))?.kind).toBe('active') // link 仍 active(零翻转)
+        const ints = await backendA.listCompensations(pid)
+        const del = ints.find((i) => i.op === 'delete')!
+        expect(del.status).toBe('superseded')
+        expect(del.attemptCount).toBe(0)
+        backendA.__clearClaimPauseForTest('delete')
+      }
+    })
+  })
 })

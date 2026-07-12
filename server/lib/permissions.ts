@@ -254,6 +254,15 @@ export class InMemoryPermissionBackend implements PermissionBackend {
   private readonly compensationFault: Partial<Record<CompensationOp, number>> = {}
   /** Test-only:op → 剩余 recordCompensation 强制失败次数(P1-1 验收:record 崩溃后 attempt 据 marker 收敛)。 */
   private readonly compensationRecordFault: Partial<Record<CompensationOp, number>> = {}
+  /**
+   * R5-F1: project → is_deleted durable desired state(memory 对偶 PG projects.is_deleted)。
+   * memory 不持有 projects 表,但为 TOCTOU 双后端契约对称,经 __setProjectDeletedForTest 注入;
+   * attemptCompensation 的 stale gate 与 claim 后重读均据此(与 PG SELECT...FOR UPDATE critical trx 对偶)。
+   * 未注入(undefined)→ 退化到 hasSuperseded fallback(保留原 R3-F1 行为,不破坏未设 is_deleted 的既有测试)。
+   */
+  private readonly projectDeleted = new Map<string, boolean>()
+  /** R5-F1 Test-only:op → claim 后、side effect 前的 await 暂停点(模拟 primary 在 record 前崩溃的 TOCTOU 窗口)。 */
+  private readonly compensationClaimPauseForTest: Partial<Record<CompensationOp, () => Promise<void>>> = {}
   /** additive(PG 落地后接口新增):内存 backend 立即就绪。 */
   readonly ready: Promise<void> = Promise.resolve()
 
@@ -570,13 +579,26 @@ export class InMemoryPermissionBackend implements PermissionBackend {
   async attemptCompensation(projectId: string, op: CompensationOp): Promise<CompensationOutcome> {
     const now = nowIso()
     let intent = this.findPendingCompensation(projectId, op)
-    // R3-F1: stale-op gate。晚到的 attemptCompensation 不得仅凭 compensationNeed 重建旧 op intent——
+    // R3-F1/R5-F1: stale-op gate。晚到的 attemptCompensation 不得仅凭 compensationNeed 重建旧 op intent——
     // 那会把更新代际对立 op 的 revoked/active 终态翻转回来(权限边界破坏)。durable desired state 决断:
-    //   memory 无 projects.is_deleted → 用"op 是否被对立 op 的新代际显式 supersede"(hasSuperseded)。
-    //   仅在无 fresh pending intent 时判 stale(pending intent 存在 = op 是当前代际,非 stale)。
-    //   P1-1 marker 自恢复(无 supersede 行)不受影响:hasSuperseded=false → 继续据 marker derive。
-    if (!intent && this.hasSupersededCompensation(projectId, op)) {
-      return { kind: 'superseded', op }
+    //   memory 经 __setProjectDeletedForTest 注入 is_deleted(对偶 PG projects.is_deleted ground truth);is_deleted
+    //   已知且与 op 矛盾 → stale。is_deleted 未注入(undefined)→ 退化到 hasSuperseded(仅 !intent 时,与 PG 对偶)。
+    //   P1-1 marker 自恢复(无 supersede 行、is_deleted 未注入)不受影响:继续据 marker derive。
+    // stale → 标 superseded 返回,不重建、不执行副作用(含 intent 仍 pending 的 sweep 残留也挡)。
+    const isDeleted = this.projectDeleted.get(projectId)
+    let stale = false
+    let staleReason = ''
+    if (isDeleted !== undefined) {
+      const desiredByState: CompensationOp = isDeleted ? 'delete' : 'restore'
+      if (desiredByState !== op) { stale = true; staleReason = `durable desired state (is_deleted=${isDeleted})` }
+    } else if (!intent && this.hasSupersededCompensation(projectId, op)) {
+      stale = true; staleReason = 'superseded by newer opposing generation'
+    }
+    if (stale) {
+      if (intent) {
+        this.compensations.set(intent.id, { ...intent, status: 'superseded', lastError: `superseded by ${staleReason}`, claimedAt: null, claimedUntil: null, claimToken: null, updatedAt: now })
+      }
+      return { kind: 'superseded', op, intentId: intent?.id }
     }
     // P1-1 crash-recovery:record 崩溃未建意图,但 marker 表明补偿未完成 → 自建 pending 收敛。
     const need = this.compensationNeed(projectId, op)
@@ -592,6 +614,31 @@ export class InMemoryPermissionBackend implements PermissionBackend {
     const claimed: CompensationIntent = { ...intent, claimedAt: now, claimedUntil: leaseUntil, claimToken, updatedAt: now }
     this.compensations.set(intent.id, claimed)
     const attempts = claimed.attemptCount + 1
+    // R5-F1 Test-only pause:claim 后、side effect 前注入 await(模拟 primary 在 record 前崩溃、durable state
+    //   在 claim 后翻转的真实 TOCTOU 窗口)。与 PG __setClaimPauseForTest 对偶。
+    const pauseFn = this.compensationClaimPauseForTest[op]
+    if (pauseFn) await pauseFn()
+    // R5-F1 FIX:critical section —— claim 后、side effect 前重读 durable desired state(与 PG critical 事务对偶)。
+    //   P-6 两步写固有窗口:primary ensureCreate/softDelete 先于 recordCompensation 提交,claim 后 is_deleted
+    //   可能已被 primary 翻转(record 前崩溃/延迟)。memory 单线程:pause 期间测试经 __setProjectDeletedForTest
+    //   翻转 is_deleted;此处重读捕获之。stale → supersede WHERE token=ours,不执行副作用(不重开已删/吊销已恢复)。
+    const isDeletedAfter = this.projectDeleted.get(projectId)
+    if (isDeletedAfter !== undefined) {
+      const desiredAfter: CompensationOp = isDeletedAfter ? 'delete' : 'restore'
+      if (desiredAfter !== op) {
+        const cur0 = this.compensations.get(intent.id)
+        if (cur0 && cur0.claimToken === claimToken && cur0.status === 'pending') {
+          this.compensations.set(intent.id, { ...cur0, status: 'superseded', lastError: `superseded by durable desired state (is_deleted=${isDeletedAfter}) after claim`, claimedAt: null, claimedUntil: null, claimToken: null, updatedAt: now })
+        }
+        return { kind: 'superseded', op, intentId: intent.id }
+      }
+    }
+    // R3-F4 ownership re-fetch:pause 期间 lease 可能过期被另一 worker 重 claim(token 变)→ stale-claim
+    //   (不执行副作用、不 mark done、不 bump attemptCount)。单线程下仅 Promise.all 交错可达。
+    const cur = this.compensations.get(intent.id)
+    if (!cur || cur.claimToken !== claimToken || cur.status !== 'pending') {
+      return { kind: 'stale-claim', op, intentId: intent.id }
+    }
     // Test-only 故障注入:在 attempt 内消费,不污染 unRevokeAllForProject / revokeAllForProject 本身。
     const fault = this.compensationFault[op] ?? 0
     try {
@@ -603,7 +650,7 @@ export class InMemoryPermissionBackend implements PermissionBackend {
         ? await this.unRevokeAllForProject(projectId)
         : await this.revokeAllForProject(projectId)
       const done: CompensationIntent = {
-        ...claimed, status: 'done', attemptCount: attempts,
+        ...cur, status: 'done', attemptCount: attempts,
         lastError: null, lastAttemptedAt: now, claimedAt: null, claimedUntil: null, claimToken: null, updatedAt: now,
       }
       this.compensations.set(intent.id, done)
@@ -611,7 +658,7 @@ export class InMemoryPermissionBackend implements PermissionBackend {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       const failed: CompensationIntent = {
-        ...claimed, attemptCount: attempts,
+        ...cur, attemptCount: attempts,
         lastError: msg, lastAttemptedAt: now, claimedAt: null, claimedUntil: null, claimToken: null, updatedAt: now,
       }
       this.compensations.set(intent.id, failed)
@@ -695,11 +742,14 @@ export class InMemoryPermissionBackend implements PermissionBackend {
     this.linksByProject.clear()
     this.compensations.clear()
     this.compensationsByProject.clear()
+    this.projectDeleted.clear()
     // 故障注入计数也清(防跨用例泄漏)。
     delete this.compensationFault.restore
     delete this.compensationFault.delete
     delete this.compensationRecordFault.restore
     delete this.compensationRecordFault.delete
+    delete this.compensationClaimPauseForTest.restore
+    delete this.compensationClaimPauseForTest.delete
   }
 
   /** Test-only:把某 link 的 revokedAt 设为指定 ISO(测 30 天 un-revoke 窗;FX-7 §5.9)。 */
@@ -718,14 +768,23 @@ export class InMemoryPermissionBackend implements PermissionBackend {
   }
 
   /**
-   * Test-only:设置 project 的 is_deleted durable desired state。
-   * memory backend 不持有 projects 表(is_deleted 不归权限层),此 helper 为 no-op——
-   * memory 的 stale-op 判定走 hasSuperseded(见 attemptCompensation)。PG 对偶实现真正改 projects.is_deleted。
-   * 双后端契约套件对两后端同形调用,保证对称性(memory 忽略、PG 生效,结果一致)。
+   * R5-F1 Test-only:设置 project 的 is_deleted durable desired state(memory 对偶 PG __setProjectDeletedForTest)。
+   * memory 不持有 projects 表,但 R5-F1 TOCTOU 双后端契约要求 memory 与 PG 对称:attemptCompensation 的
+   * stale gate(first + claim 后重读)均据此判 stale。未注入(undefined)→ 退化到 hasSuperseded fallback。
+   * R3-F1 既有 memory 用例调此 helper(is_deleted 与 hasSuperseded 信号一致)→ 行为不变。
    */
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- memory backend 无 projects 表;参数(下划线前缀=故意不用)仅满足双后端契约套件对称调用,PG 对偶实现真改 projects.is_deleted
-  __setProjectDeletedForTest(_projectId: string, _isDeleted: boolean): void {
-    /* no-op: memory 无 projects 表 */
+  __setProjectDeletedForTest(projectId: string, isDeleted: boolean): void {
+    this.projectDeleted.set(projectId, isDeleted)
+  }
+
+  /** R5-F1 Test-only:注入 op 在 claim 后、side effect 前的 await 暂停点(模拟 primary 在 record 前崩溃、
+   * durable state 在 claim 后翻转的真实 TOCTOU 窗口)。与 PG __setClaimPauseForTest 对偶。 */
+  __setClaimPauseForTest(op: CompensationOp, pauseFn: () => Promise<void>): void {
+    this.compensationClaimPauseForTest[op] = pauseFn
+  }
+  /** Test-only:清除 claim 暂停点。 */
+  __clearClaimPauseForTest(op: CompensationOp): void {
+    delete this.compensationClaimPauseForTest[op]
   }
 
   /** Test-only:注入 op 补偿步骤强制失败 N 次(消费在 attemptCompensation;不污染 unRevoke/revoke 本身)。 */
