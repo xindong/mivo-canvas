@@ -260,16 +260,36 @@ export class DebugLogQuotaExceededError extends Error {
   }
 }
 
+// R3-F3:per-process append mutex(串行)——防 TOCTOU:两并发 append 各读 used(均 < quota)→ 各 append → 越界。
+// 串行后 B 等 A 落盘完成再读 used,quota 判定纳入本次 append byteLength。chained-promise 模式
+// (同 assetStore withOwnerLock/withHashLock);single BFF process —— PG/多进程需 DB 行锁,非本层。
+let appendTail: Promise<void> = Promise.resolve()
+const withAppendLock = <T>(fn: () => Promise<T>): Promise<T> => {
+  const next = appendTail.then(() => fn(), () => fn())
+  const swallowed = next.then(
+    () => undefined,
+    () => undefined,
+  )
+  appendTail = swallowed
+  return next
+}
+
 export const appendRemoteDebugRecords = async (records: RemoteDebugRecord[]) => {
   if (!records.length) return
   await mkdir(remoteDebugLogDir(), { recursive: true })
   // R2-4:惰性 retention(过期 .jsonl 删除)+ quota(超 disk quota 拒写,防磁盘耗尽)。
   await sweepExpiredDebugLogs()
-  const usedBytes = await debugLogDirSizeBytes()
-  if (usedBytes >= getDiskQuotaBytes()) {
-    throw new DebugLogQuotaExceededError()
-  }
-  await appendFile(remoteDebugFilePath(), `${records.map((record) => JSON.stringify(record)).join('\n')}\n`)
+  // R3-F3:line 一次计算(byteLength 与实际 append 一致,避免重复序列化);quota 判定纳入本次 append bytes。
+  const line = `${records.map((record) => JSON.stringify(record)).join('\n')}\n`
+  const incomingBytes = Buffer.byteLength(line, 'utf8')
+  return withAppendLock(async () => {
+    const usedBytes = await debugLogDirSizeBytes()
+    // R3-F3:返修前只判 used>=quota(used=quota-1 加近 1MB payload 越界);现 used+incoming>quota 才拒。
+    if (usedBytes + incomingBytes > getDiskQuotaBytes()) {
+      throw new DebugLogQuotaExceededError()
+    }
+    await appendFile(remoteDebugFilePath(), line)
+  })
 }
 
 const DATE_FILE_PATTERN = /^[0-9]{4}-[0-9]{2}-[0-9]{2}[.]jsonl$/

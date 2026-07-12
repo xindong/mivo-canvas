@@ -91,15 +91,21 @@ const isOriginAllowed = (
 /**
  * R2-4:rate key 用可信来源(非客户端可控)。返修前取 XFF 首项 → 攻击者轮换 XFF 三连 200(rate=1 时绕过)。
  * - MIVO_DEBUG_TRUST_XFF=1 opt-in(网关清洗 XFF 后 ops 开 + 写入网关验收清单 §真实网关验收)→ 信任 XFF 首项;
- * - 默认关 → 用 socket remote addr(@hono/node-server c.env.incoming.remoteAddress,非客户端可控),
+ * - 默认关 → 用 socket remote addr(@hono/node-server c.env.incoming.socket.remoteAddress,非客户端可控),
  *   测试无 socket → 'unknown'。直连攻击者无法轮换 remote addr → rate 真实受限(网关后共享网关 IP,可接受)。
+ *
+ * R3-F3:返修前读 `incoming.remoteAddress`(@hono/node-server HttpBindings 无此属性,生产恒 undefined →
+ * 全落 'unknown' 同 bucket → 60/min 后全局误限流)。正确路径是 `incoming.socket.remoteAddress`
+ * (IncomingMessage.socket 是 net.Socket,remoteAddress 即客户端源 IP)。
  */
 const getRateKey = (c: { req: { header: (n: string) => string | undefined } }, env: unknown): string => {
   if (process.env.MIVO_DEBUG_TRUST_XFF === '1') {
     const xff = c.req.header('x-forwarded-for') ?? 'unknown'
     return xff.split(',')[0].trim() || 'unknown'
   }
-  const remote = (env as { incoming?: { remoteAddress?: string } } | null | undefined)?.incoming?.remoteAddress
+  const remote = (
+    env as { incoming?: { socket?: { remoteAddress?: string } } } | null | undefined
+  )?.incoming?.socket?.remoteAddress
   return remote || 'unknown'
 }
 
@@ -120,7 +126,9 @@ const hasViewAccess = (
 
 // In-memory per-IP rate limit (D7). Single-process; resets if the BFF restarts.
 // Acceptable for an internal anti-abuse gate; real rate limiting is P4.
-// R2-4: bucket 淘汰(返修前无淘汰 → 内存无限增长)。size 超 MAX_BUCKETS 时 lazy sweep 窗外 stale 项。
+// R2-4/R3-F3: bucket 淘汰。返修前 `size > max` 时扫窗外 stale(全 fresh 时无界增长;且 size==max 仍插入
+// → max+1)。R3-F3 改:达上限且将插新 bucket → 先 lazy sweep 窗外 stale,仍超 → 确定性淘汰 oldest,
+// 保证 size<=max。仅"插新 bucket"时淘汰(避免误删既有 ip 的 fresh bucket)。
 const getMaxBuckets = (): number => {
   const raw = process.env.MIVO_DEBUG_RATE_MAX_BUCKETS
   if (raw === undefined || raw === '') return 4096
@@ -131,19 +139,34 @@ const rateBuckets = new Map<string, { count: number; windowStart: number }>()
 const rateLimitExceeded = (ip: string, perMin: number): boolean => {
   if (perMin <= 0) return false
   const now = Date.now()
-  // R2-4: lazy eviction — 超额时扫 stale 窗外 bucket 删除(bounded memory)。
-  if (rateBuckets.size > getMaxBuckets()) {
+  const max = getMaxBuckets()
+  const existing = rateBuckets.get(ip)
+  const windowExpired = !existing || now - existing.windowStart >= RATE_LIMIT_WINDOW_MS
+  // R3-F3:将插新 bucket(window 过期/不存在)且达上限 → 确定性淘汰(保证 size<=max,无界增长堵住)。
+  if (windowExpired && rateBuckets.size >= max) {
+    // 先 lazy sweep 窗外 stale(bounded memory;合法回收过期 bucket)。
     for (const [k, b] of rateBuckets) {
       if (now - b.windowStart >= RATE_LIMIT_WINDOW_MS) rateBuckets.delete(k)
     }
+    // 仍超(stale 不够删 / 全 fresh)→ 确定性淘汰 oldest(windowStart 最小),LRU-ish 保 size<=max。
+    if (rateBuckets.size >= max) {
+      let oldestKey: string | null = null
+      let oldestStart = Number.POSITIVE_INFINITY
+      for (const [k, b] of rateBuckets) {
+        if (b.windowStart < oldestStart) {
+          oldestStart = b.windowStart
+          oldestKey = k
+        }
+      }
+      if (oldestKey !== null) rateBuckets.delete(oldestKey)
+    }
   }
-  const bucket = rateBuckets.get(ip)
-  if (!bucket || now - bucket.windowStart >= RATE_LIMIT_WINDOW_MS) {
+  if (!existing || windowExpired) {
     rateBuckets.set(ip, { count: 1, windowStart: now })
     return false
   }
-  bucket.count += 1
-  return bucket.count > perMin
+  existing.count += 1
+  return existing.count > perMin
 }
 
 // Test hook: clear the rate-limit state between tests.
@@ -152,6 +175,8 @@ export const __resetDebugLogsRateLimit = (): void => {
 }
 // R2-4 test hook: bucket 数(测 lazy eviction bounded memory)。
 export const __debugLogsBucketCount = (): number => rateBuckets.size
+// R3-F3 test hook:bucket keys(测真实 socket remoteAddress → key='127.0.0.1' 非 'unknown')。
+export const __debugLogsBucketKeys = (): string[] => [...rateBuckets.keys()]
 // R2-4 test hook: 直接 seed 一个 bucket(测 eviction sweep 前的 stale 状态)。
 export const __seedDebugLogsBucket = (key: string, windowStart: number, count = 1): void => {
   rateBuckets.set(key, { count, windowStart })

@@ -1,10 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtemp, rm, writeFile, readdir, mkdir } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile, readdir, mkdir, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { request as httpRequest } from 'node:http'
 import process from 'node:process'
 import { Hono } from 'hono'
-import { debugLogsRoute, __resetDebugLogsRateLimit, __debugLogsBucketCount, __seedDebugLogsBucket } from './debug-logs'
+import { serve } from '@hono/node-server'
+import { debugLogsRoute, __resetDebugLogsRateLimit, __debugLogsBucketCount, __debugLogsBucketKeys, __seedDebugLogsBucket } from './debug-logs'
 import { remoteDebugLogDir, remoteDebugFilePath } from '../lib/debug-records'
 import { ssoAuthErrorHandler } from '../lib/owner'
 import type { AppEnv } from '../lib/types'
@@ -403,6 +405,182 @@ describe('debug-logs route — R2-4: rate key 可信来源 + bucket 淘汰 + quo
 
   it('非生产 + localhost Origin(无 allowlist)→ 200(localhost 兜底保留)', async () => {
     const res = await postEntry({ origin: 'http://localhost:5173' })
+    expect(res.status).toBe(200)
+  })
+})
+
+// ── G2.1 R3-F3:rate key 读 socket.remoteAddress + 确定性淘汰 + quota 纳入本次 byteLength ──────────
+// R3-F3[P2]:返修前 (1) getRateKey 读 incoming.remoteAddress(@hono/node-server HttpBindings 无此属性,生产恒
+// undefined → 全落 'unknown' 同 bucket → 60/min 全局误限流);(2) bucket 仅 size>max 时删 stale,全 fresh 时
+// 无界增长,且 size==max 仍插入 → max+1;(3) quota 只判 used>=quota(used=quota-1 加近 1MB 越界)+ 无串行 → 并发双过。
+describe('debug-logs route — R3-F3: rate key socket.remoteAddress + 确定性淘汰 + quota byteLength', () => {
+  const F3_ENV = [
+    'MIVO_DEBUG_TRUST_XFF', 'MIVO_DEBUG_DISK_QUOTA_MB', 'MIVO_DEBUG_RATE_MAX_BUCKETS',
+    'NODE_ENV', 'MIVO_PUBLIC', 'MIVO_DEBUG_ALLOWED_ORIGINS', 'MIVO_DEBUG_POST_RATE_LIMIT',
+  ]
+  const saved: Record<string, string | undefined> = {}
+  beforeEach(() => {
+    for (const n of F3_ENV) saved[n] = process.env[n]
+    delete process.env.MIVO_DEBUG_TRUST_XFF
+    delete process.env.MIVO_DEBUG_DISK_QUOTA_MB
+    delete process.env.MIVO_DEBUG_RATE_MAX_BUCKETS
+    delete process.env.NODE_ENV
+    delete process.env.MIVO_PUBLIC
+    delete process.env.MIVO_DEBUG_ALLOWED_ORIGINS
+    delete process.env.MIVO_DEBUG_POST_RATE_LIMIT
+    __resetDebugLogsRateLimit()
+  })
+  afterEach(() => {
+    for (const n of F3_ENV) {
+      if (saved[n] === undefined) delete process.env[n]
+      else process.env[n] = saved[n]
+    }
+    __resetDebugLogsRateLimit()
+  })
+
+  // ── R3-F3-1:rate key 读真实 socket remoteAddress(非 incoming.remoteAddress)──
+  // 真实 node server:client 源 IP=127.0.0.1 → rate bucket key 应为 '127.0.0.1'(真实 socket.remoteAddress),
+  // 非 'unknown'(返修前读 incoming.remoteAddress,@hono/node-server HttpBindings 无此属性 → 恒 undefined →
+  // 'unknown' → 生产所有用户共享一只 bucket → 60/min 全局误限流)。
+  // 注:127.0.0.2 在本机 macOS 不可绑(EADDRNOTAVAIL,lo0 仅 127.0.0.1),故用 key 直查证伪(非"两源"行为对比):
+  // bucket key = 真实 remoteAddress('127.0.0.1')即证 getRateKey 读对了路径;in-process 无 socket → 'unknown'(对照组)。
+  const startRealServer = (app: Hono<AppEnv>): Promise<{ port: number; stop: () => Promise<void> }> =>
+    new Promise((resolve) => {
+      const server = serve({ fetch: app.fetch, hostname: '127.0.0.1', port: 0 }, (info) => {
+        resolve({ port: info.port, stop: () => new Promise((r) => server.close(() => r())) })
+      })
+    })
+  const postFromAddr = (port: number, localAddress: string, body: string) =>
+    new Promise<{ status: number; body: string }>((resolve) => {
+      const req = httpRequest(
+        {
+          host: '127.0.0.1',
+          port,
+          method: 'POST',
+          path: '/api/mivo/debug-logs',
+          headers: { 'content-type': 'application/json' },
+          localAddress,
+        },
+        (res) => {
+          let chunks = ''
+          res.on('data', (c) => (chunks += c.toString()))
+          res.on('end', () => resolve({ status: res.statusCode ?? 0, body: chunks }))
+        },
+      )
+      req.on('error', (err) => resolve({ status: 0, body: String(err) }))
+      req.write(body)
+      req.end()
+    })
+
+  it('真实 socket:rate bucket key = "127.0.0.1"(socket.remoteAddress;非 "unknown"——证 getRateKey 读对路径)', async () => {
+    process.env.MIVO_DEBUG_POST_RATE_LIMIT = '60' // 不限流,只验 key
+    const app = new Hono<AppEnv>()
+    app.route('/api/mivo', debugLogsRoute)
+    const { port, stop } = await startRealServer(app)
+    try {
+      const body = jsonBody({ entries: [{ level: 'warning', source: 'S', message: 'm', timestamp: 1 }] })
+      const r1 = await postFromAddr(port, '127.0.0.1', body)
+      expect(r1.status).toBe(200)
+      // bucket key 应是真实 socket remoteAddress('127.0.0.1'),不是 'unknown'
+      // 返修前(读 incoming.remoteAddress)→ undefined → 'unknown' → keys=['unknown'](RED);修复后 keys=['127.0.0.1'](GREEN)
+      expect(__debugLogsBucketKeys()).toContain('127.0.0.1')
+      expect(__debugLogsBucketKeys()).not.toContain('unknown')
+    } finally {
+      await stop()
+    }
+  })
+
+  it('真实 socket:rate=1 + 同源两连 → r1=200, r2=429(同 bucket count 累积;key 真实,限流生效)', async () => {
+    process.env.MIVO_DEBUG_POST_RATE_LIMIT = '1' // rate=1:同 bucket 第二连 429
+    const app = new Hono<AppEnv>()
+    app.route('/api/mivo', debugLogsRoute)
+    const { port, stop } = await startRealServer(app)
+    try {
+      const body = jsonBody({ entries: [{ level: 'warning', source: 'S', message: 'm', timestamp: 1 }] })
+      const r1 = await postFromAddr(port, '127.0.0.1', body)
+      expect(r1.status).toBe(200)
+      const r2 = await postFromAddr(port, '127.0.0.1', body) // 同源 → 同 bucket → count=2 > rate=1 → 429
+      expect(r2.status).toBe(429)
+      expect(__debugLogsBucketKeys()).toContain('127.0.0.1') // 仍真实 key
+    } finally {
+      await stop()
+    }
+  })
+
+  // ── R3-F3-2:bucket 达上限全 fresh → 确定性淘汰 oldest(保证 size<=max)──
+  it('max=2 连续 4 fresh key(XFF)→ size<=2(确定性淘汰 oldest;返修前 size>max 无界 → size=4 RED)', async () => {
+    process.env.MIVO_DEBUG_RATE_MAX_BUCKETS = '2'
+    process.env.MIVO_DEBUG_TRUST_XFF = '1' // in-process 无 socket,用 XFF 制造不同 key
+    process.env.MIVO_DEBUG_POST_RATE_LIMIT = '60' // 不限流,只测淘汰
+    for (let i = 0; i < 4; i++) {
+      await postEntry({ 'x-forwarded-for': `10.0.0.${i}` })
+    }
+    expect(__debugLogsBucketCount()).toBeLessThanOrEqual(2) // 返修前 size=4 > 2(RED);修复后 size<=2(GREEN)
+  })
+
+  it('max=2 + size==max(边界)→ 插入新 key 仍淘汰(返修前 size==max 用 > 判定 → 不淘汰 → size=max+1)', async () => {
+    process.env.MIVO_DEBUG_RATE_MAX_BUCKETS = '2'
+    process.env.MIVO_DEBUG_TRUST_XFF = '1'
+    process.env.MIVO_DEBUG_POST_RATE_LIMIT = '60'
+    await postEntry({ 'x-forwarded-for': '10.0.0.1' }) // size 0→1
+    await postEntry({ 'x-forwarded-for': '10.0.0.2' }) // size 1→2(==max)
+    await postEntry({ 'x-forwarded-for': '10.0.0.3' }) // size==max → 淘汰 oldest → 插入 → size 2(返修前 3)
+    expect(__debugLogsBucketCount()).toBe(2)
+  })
+
+  // ── R3-F3-3:quota 纳入本次 append byteLength(返修前只判 used>=quota → 越界)──
+  // 注:message 用带空格词句(非 'x'.repeat —— sanitizeRemoteDebugText 的 `[A-Za-z0-9+/=_-]{48,}` base64
+  // 正则会把 48+ 连续字符 redact 成 [redacted-base64],压成 ~18 字节 → 无法凑大 append)。
+  const largePayload = (): string =>
+    jsonBody({
+      entries: Array.from({ length: 40 }, (_, i) => ({
+        level: 'warning',
+        source: 'S',
+        message: ('the quick brown fox ').repeat(200).trim(), // ~3999 chars,无 48+ 连续串 → 不被 redact
+        timestamp: i,
+      })),
+    })
+  const dirSizeBytes = async (): Promise<number> => {
+    let total = 0
+    for (const f of await readdir(remoteDebugLogDir())) {
+      try {
+        total += (await stat(join(remoteDebugLogDir(), f))).size
+      } catch {
+        // 并发删除 → 忽略
+      }
+    }
+    return total
+  }
+
+  it('quota-1 场景:used=900KB + ~180KB append → 413(纳入本次 byteLength;返修前 900<1000 放行越界 RED)', async () => {
+    process.env.MIVO_DEBUG_DISK_QUOTA_MB = '1' // 1MB
+    await mkdir(remoteDebugLogDir(), { recursive: true })
+    await writeFile(remoteDebugFilePath(), Buffer.alloc(900 * 1024, 0x61)) // 900KB 预置
+    const res = await request('POST', largePayload(), { 'content-type': 'application/json' })
+    expect(res.status).toBe(413) // 900+180=1080 > 1000 → 拒(返修前 used<quota 放行 → 200 + 越界 RED)
+    expect((await json(res)).error).toBe('Debug log disk quota exceeded')
+    expect(await dirSizeBytes()).toBeLessThanOrEqual(1 * 1024 * 1024) // dir 不越界(返修前 > 1MB)
+  })
+
+  it('两并发 append 不越界 quota(串行 mutex;返修前 TOCTOU 双过 → 1118KB>1MB RED)', async () => {
+    process.env.MIVO_DEBUG_DISK_QUOTA_MB = '1' // 1MB
+    await mkdir(remoteDebugLogDir(), { recursive: true })
+    // 预置 750KB;line~171KB:串行后 A 见 750→921<1MB 过,B 见 921→1096>1MB 拒;
+    // 返修前(无 mutex + used>=quota)两并发各读 750(<quota)→ 各 append → 750+342=1092KB 越界(RED)
+    await writeFile(remoteDebugFilePath(), Buffer.alloc(750 * 1024, 0x61)) // 750KB 预置
+    const payload = largePayload()
+    const [a, b] = await Promise.all([
+      request('POST', payload, { 'content-type': 'application/json' }),
+      request('POST', payload, { 'content-type': 'application/json' }),
+    ])
+    // 串行后至少一个 413(B 越界);返修前两并发双 200(越界 RED)
+    expect([a.status, b.status]).toContain(413)
+    expect(await dirSizeBytes()).toBeLessThanOrEqual(1 * 1024 * 1024) // quota 不破(返修前 1092KB > 1MB)
+  })
+
+  it('quota 未越界:used+incoming<=quota → 200(正常 append 不被误拒)', async () => {
+    process.env.MIVO_DEBUG_DISK_QUOTA_MB = '100' // 100MB,远大于单次 append
+    const res = await request('POST', largePayload(), { 'content-type': 'application/json' })
     expect(res.status).toBe(200)
   })
 })
