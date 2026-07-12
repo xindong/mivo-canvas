@@ -602,10 +602,18 @@ const memStore = new Map<string, QueuedWrite>()
 // FX-7 / A6: terminal ledger in-memory fallback (mirrors memStore discipline — used
 // only when IDB is unavailable; survives a pm2-restart window, not a reload).
 const terminalMem = new Map<string, TerminalLedgerEntry>()
-// P1-4: non-retreatable per-status cumulative counters + baseline, in-memory
-// fallback (IDB unavailable). Mirrors the union discipline: readCounters takes
-// max(IDB, mem) per field so a mem-fallback increment is not lost when IDB recovers.
+// P1-B (third+fourth-round): per-status cumulative counters split into two in-memory
+// buckets. `terminalCountersMem` = PENDING delta (increments not yet claimed by an
+// in-flight tx, not yet in IDB). `inFlightCountersMem` = claimed by an in-flight tx (the
+// tx will write idbCurrent + capturedPending + increment; on commit the claim clears, on
+// abort it refunds to pending). read = idbCurrent + pending + inFlight (conservative add,
+// no max). The two-bucket claim model (round 4) fixes the concurrent-capture bug: a tx
+// claims its portion SYNCHRONOUSLY (JS single-threaded → atomic claim) before the IDB tx
+// queues, so a second concurrent tx claims only what's left — no double-flush of the
+// same pending delta (sol: pending=3 + 2 concurrent record → durable=8 with the
+// snapshot model; expected 5).
 let terminalCountersMem: TerminalCounterShape = { ...ZERO_COUNTERS }
+let inFlightCountersMem: TerminalCounterShape = { ...ZERO_COUNTERS }
 let terminalCountersBaselineMem: { counters: TerminalCounterShape; ts: number } | null = null
 
 const isIdbAvailable = (): boolean => typeof indexedDB !== 'undefined' && indexedDB !== null
@@ -886,9 +894,9 @@ const readAllTerminals = async (): Promise<TerminalLedgerEntry[]> => {
   }
 }
 
-// P1-4 mem-path counter helpers (IDB unavailable OR atomic-tx-abort fallback). These
-// mutate terminalCountersMem directly; readTerminalCounters unions IDB + mem (per-field
-// max) so a mem-fallback increment is reflected even after IDB recovers.
+// P1-B mem-path counter helpers (IDB unavailable OR atomic-tx-abort fallback). These
+// mutate terminalCountersMem (the PENDING delta bucket) directly; readTerminalCounters
+// returns idbCurrent + pending + inFlight (conservative add).
 const bumpTerminalCounterMem = (status: TerminalLedgerStatus, by = 1): TerminalCounterShape => {
   const next = {
     ...terminalCountersMem,
@@ -902,6 +910,29 @@ const bumpEvictedMem = (by: number): TerminalCounterShape => {
   const next = { ...terminalCountersMem, evicted: terminalCountersMem.evicted + by }
   terminalCountersMem = next
   return next
+}
+
+// P1-B (fourth-round) claim model: claim/release/refund the pending delta around an
+// atomic tx. The claim is SYNCHRONOUS (JS single-threaded → atomic) + happens BEFORE the
+// IDB tx queues, so two concurrent txs cannot capture the same pending delta. The second
+// concurrent tx claims only what's left (0 or new increments that arrived after the first
+// claim) — no double-flush.
+//
+// claim: move the entire pending delta into inFlight (returns the claimed snapshot).
+// release (commit): the claim landed in IDB → drop it from inFlight (do NOT refund).
+// refund (abort / no-op): the claim did NOT land → move it back to pending.
+const claimPendingDelta = (): TerminalCounterShape => {
+  const captured = { ...terminalCountersMem }
+  terminalCountersMem = { ...ZERO_COUNTERS }
+  inFlightCountersMem = addCounters(inFlightCountersMem, captured)
+  return captured
+}
+const releaseClaim = (captured: TerminalCounterShape): void => {
+  inFlightCountersMem = subtractCounters(inFlightCountersMem, captured)
+}
+const refundClaim = (captured: TerminalCounterShape): void => {
+  terminalCountersMem = addCounters(terminalCountersMem, captured)
+  inFlightCountersMem = subtractCounters(inFlightCountersMem, captured)
 }
 
 // P1-4 (second-round): enforceTerminalCap is now ATOMIC — the cap deletes + the evicted-
@@ -925,9 +956,11 @@ const enforceTerminalCap = async (): Promise<void> => {
     if (evictedMem > 0) bumpEvictedMem(evictedMem)
     return
   }
-  // P1-B: snapshot the pending delta BEFORE the tx so concurrent increments during the
-  // tx are preserved (only the captured portion is flushed into IDB + subtracted from mem).
-  const capturedPending = { ...terminalCountersMem }
+  // P1-B (fourth-round): CLAIM the pending delta synchronously (JS single-threaded →
+  // atomic) BEFORE the IDB tx queues. A concurrent tx that runs while this one is in
+  // flight claims only what's left (0 or new increments) — no double-flush of the same
+  // pending delta. Commit → release the claim; abort/no-eviction → refund it.
+  const capturedPending = claimPendingDelta()
   try {
     let nextCounters: TerminalCounterShape | undefined
     let flushed = false
@@ -959,10 +992,16 @@ const enforceTerminalCap = async (): Promise<void> => {
         }
       }
     })
-    // Delta flush: the captured pending delta landed in IDB → subtract it from mem pending
-    // (preserves concurrent new increments that arrived during the tx).
-    if (flushed) terminalCountersMem = subtractCounters(terminalCountersMem, capturedPending)
+    if (flushed) {
+      // Commit → the claim landed in IDB → drop it from inFlight (do NOT refund).
+      releaseClaim(capturedPending)
+    } else {
+      // No eviction (early return) → the claim did not land → refund to pending.
+      refundClaim(capturedPending)
+    }
   } catch (error) {
+    // Abort → the claim did not land → refund to pending.
+    refundClaim(capturedPending)
     debugLogger.warn(SOURCE, `terminal cap enforcement failed: ${msg(error)}`)
     // Mem fallback: leave the ledger over-cap (best-effort); the next enforceTerminalCap
     // retries. Do NOT bump evicted here — nothing was durably evicted (tx aborted).
@@ -1000,9 +1039,11 @@ const recordTerminal = async (
     await enforceTerminalCap() // mem cap + mem evicted
     return
   }
-  // P1-B: snapshot the pending delta BEFORE the tx so concurrent increments during the
-  // tx are preserved (only the captured portion is flushed into IDB + subtracted from mem).
-  const capturedPending = { ...terminalCountersMem }
+  // P1-B (fourth-round): CLAIM the pending delta synchronously (JS single-threaded →
+  // atomic) BEFORE the IDB tx queues. A concurrent recordTerminal that runs while this
+  // one is in flight claims only what's left — no double-flush of the same pending delta
+  // (sol: pending=3 + 2 concurrent record → durable=8 with the snapshot model; expected 5).
+  const capturedPending = claimPendingDelta()
   try {
     let flushed = false
     await runMultiStoreTx([TERMINALS_STORE, META_STORE], 'readwrite', (stores, tx) => {
@@ -1012,7 +1053,7 @@ const recordTerminal = async (
       >
       counterReq.onsuccess = () => {
         const idbCurrent = counterReq.result?.value ?? { ...ZERO_COUNTERS }
-        // Delta model: idbCurrent + capturedPending (pending delta) + this increment.
+        // Delta model: idbCurrent + capturedPending (this tx's claim) + this increment.
         // Conservative — no max undercount (the round-2 max model lost updates across tabs).
         const base = addCounters(idbCurrent, capturedPending)
         const next = { ...base, [status]: base[status] + 1 } as TerminalCounterShape
@@ -1024,17 +1065,21 @@ const recordTerminal = async (
       terminalFaultInjector?.('record', tx)
     })
     terminalMem.delete(entry.id)
-    // Delta flush: the captured pending delta + this increment landed in IDB → subtract
-    // the captured pending delta from mem (this increment was never in mem pending). This
-    // preserves any concurrent new increments that arrived during the tx.
-    if (flushed) terminalCountersMem = subtractCounters(terminalCountersMem, capturedPending)
+    if (flushed) {
+      // Commit → the claim + this increment landed in IDB → drop the claim from inFlight.
+      // (This increment was never in mem pending — it went directly into the tx's put.)
+      releaseClaim(capturedPending)
+    } else {
+      // No counter put scheduled (shouldn't happen for recordTerminal, but be safe) → refund.
+      refundClaim(capturedPending)
+    }
     // ATOMIC cap (delete excess + evicted increment) after the entry+counter commit.
     await enforceTerminalCap()
   } catch (error) {
-    // Explicit mem degradation (lead P1-4 ③): never block the terminal outcome. The
-    // atomic tx aborted → nothing durable landed; the increment goes to the mem pending
-    // delta (readTerminalCounters = idbCurrent + pendingDelta) so the count stays right
-    // for this session + is flushed into IDB when a later tx succeeds.
+    // Abort → the claim did NOT land → refund it to pending, then add this increment to
+    // pending (it didn't land either). Explicit mem degradation (lead P1-4 ③): never block
+    // the terminal outcome; readTerminalCounters = idbCurrent + pending + inFlight.
+    refundClaim(capturedPending)
     warnIdbDegradation(`terminal atomic put failed for ${rec.id}`, error)
     terminalMem.set(entry.id, entry)
     bumpTerminalCounterMem(status)
@@ -1085,7 +1130,11 @@ const subtractCounters = (a: TerminalCounterShape, b: TerminalCounterShape): Ter
 })
 
 const readTerminalCounters = async (): Promise<TerminalCounterShape> => {
-  if (!isIdbAvailable()) return { ...terminalCountersMem }
+  if (!isIdbAvailable()) {
+    // IDB unreadable: pending + inFlight (inFlight is still un-landed since the tx that
+    // claimed it has not committed — readable as a degraded absolute count).
+    return addCounters(terminalCountersMem, inFlightCountersMem)
+  }
   try {
     const entry = await runTx<{ key: string; value: TerminalCounterShape } | undefined>(
       'readonly',
@@ -1093,11 +1142,12 @@ const readTerminalCounters = async (): Promise<TerminalCounterShape> => {
       META_STORE,
     )
     const idbCounters = entry?.value ?? { ...ZERO_COUNTERS }
-    // Delta model: durable IDB total + local pending delta (increments not yet in IDB).
-    return addCounters(idbCounters, terminalCountersMem)
+    // Delta model (claim): durable IDB total + pending (unclaimed) + inFlight (claimed,
+    // not yet committed). Conservative add — no max undercount.
+    return addCounters(addCounters(idbCounters, terminalCountersMem), inFlightCountersMem)
   } catch (error) {
     warnIdbDegradation('terminal counters read failed', error)
-    return { ...terminalCountersMem }
+    return addCounters(terminalCountersMem, inFlightCountersMem)
   }
 }
 
@@ -1888,6 +1938,7 @@ export const __resetWriteQueueDb = async (): Promise<void> => {
   terminalMem.clear()
   // P1-4: clear the counter mem fallbacks + restore defaults.
   terminalCountersMem = { ...ZERO_COUNTERS }
+  inFlightCountersMem = { ...ZERO_COUNTERS }
   terminalCountersBaselineMem = null
   maxTerminals = DEFAULT_MAX_TERMINALS
   idbBlockTimeoutMs = 3000

@@ -2006,4 +2006,97 @@ describe('FX-7 / A6 P1-4 — non-retreatable terminal counters (A3 uses counters
     expect((await __dumpIdbTerminalsForTest()).length).toBe(3)
     expect((await __readIdbTerminalCountersForTest()).evicted).toBe(2)
   })
+
+  // ── P1-B (fourth-round): claim model — pending delta split into pending + inFlight ──
+  // sol 反例:capture 发生在 IDB tx 排队之前 → 两并发 record capture 同一份 pending=3,各自 tx
+  // 都加进 durable → 重复(durable=8,期望 5)。claim 模型:tx 开始时同步(JS 单线程原子)把
+  // pendingDelta 移入 inFlightDelta;commit 清 claim;abort 退回;read = idbCurrent + pending + inFlight。
+
+  it('⑥ (P1-B r4) pending=3 + two concurrent successful record → durable + read = 5 (NOT 8; no double-flush)', async () => {
+    __setMaxTerminalsForTest(256) // no cap — isolate the claim-model concurrency
+    // Seed pending=3 via 3 fault-aborted recordTerminals (each aborts → refund + bump → pending grows).
+    __setTerminalFaultInjectorForTest((phase, tx) => {
+      if (phase === 'record') tx.abort()
+    })
+    await __recordTerminalForTest(makeMinimalQueuedWrite('p1', 'p1'), 'dead-letter', 'm1')
+    await __recordTerminalForTest(makeMinimalQueuedWrite('p2', 'p2'), 'dead-letter', 'm2')
+    await __recordTerminalForTest(makeMinimalQueuedWrite('p3', 'p3'), 'dead-letter', 'm3')
+    __setTerminalFaultInjectorForTest(undefined)
+    // 3 aborts → pending delta = 3, IDB durable = 0.
+    expect((await __readIdbTerminalCountersForTest())['dead-letter']).toBe(0)
+    expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(3) // read = idbCurrent(0) + pending(3)
+
+    // Two CONCURRENT successful recordTerminals. Without the claim model, both capture
+    // pending=3 → each tx adds 3+1 → durable=8 (sol-verified bug). With the claim model:
+    // tx1 claims pending(3) synchronously → tx2 claims pending(0) (only what's left).
+    await Promise.all([
+      __recordTerminalForTest(makeMinimalQueuedWrite('r1', 'r1'), 'dead-letter', 'm4'),
+      __recordTerminalForTest(makeMinimalQueuedWrite('r2', 'r2'), 'dead-letter', 'm5'),
+    ])
+    // Durable = 3 (pending) + 2 (one increment per record) = 5. Order-independent: each tx
+    // adds its OWN claim + increment, so IDB tx interleaving cannot inflate the total.
+    expect((await __readIdbTerminalCountersForTest())['dead-letter']).toBe(5) // NOT 8
+    expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(5) // read = 5
+  })
+
+  it('⑦ (P1-B r4) two concurrent records with no pre-existing pending → durable + read = 2 (record+cap txs do not double-flush)', async () => {
+    __setMaxTerminalsForTest(256) // no eviction — isolate record+cap counter concurrency
+    // Two concurrent records (each runs a record tx THEN a cap tx). The 2 record txs + 2
+    // cap txs interleave; the claim model ensures each claims only its own portion.
+    await Promise.all([
+      __recordTerminalForTest(makeMinimalQueuedWrite('a1', 'a1'), 'conflict', 'm1'),
+      __recordTerminalForTest(makeMinimalQueuedWrite('a2', 'a2'), 'conflict', 'm2'),
+    ])
+    expect((await __readIdbTerminalCountersForTest()).conflict).toBe(2) // NOT inflated
+    expect((await getWriteQueueTerminalCounters()).counters.conflict).toBe(2)
+  })
+
+  it("⑧ (P1-B r4) a new pending increment arriving AFTER a tx claim is NOT mis-subtracted by releaseClaim", async () => {
+    __setMaxTerminalsForTest(256)
+    // Seed pending=2 (2 fault-aborts).
+    __setTerminalFaultInjectorForTest((phase, tx) => {
+      if (phase === 'record') tx.abort()
+    })
+    await __recordTerminalForTest(makeMinimalQueuedWrite('q1', 'q1'), 'dead-letter', 'm1')
+    await __recordTerminalForTest(makeMinimalQueuedWrite('q2', 'q2'), 'dead-letter', 'm2')
+    // pending=2, IDB=0.
+    // A successful record claims pending=2 → its releaseClaim will subtract ONLY 2.
+    __setTerminalFaultInjectorForTest(undefined)
+    await __recordTerminalForTest(makeMinimalQueuedWrite('s1', 's1'), 'dead-letter', 'm3')
+    // IDB = 0 + 2 (claim) + 1 (increment) = 3; pending → 0 (releaseClaim subtracted 2).
+    expect((await __readIdbTerminalCountersForTest())['dead-letter']).toBe(3)
+    expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(3)
+    // NOW a new pending increment arrives (a fault-abort) AFTER the success committed.
+    // Its +1 goes to pending; the prior success's releaseClaim already ran (subtracted 2)
+    // and must NOT touch this new +1.
+    __setTerminalFaultInjectorForTest((phase, tx) => {
+      if (phase === 'record') tx.abort()
+    })
+    await __recordTerminalForTest(makeMinimalQueuedWrite('a1', 'a1'), 'dead-letter', 'm4')
+    __setTerminalFaultInjectorForTest(undefined)
+    // IDB still 3; pending=1 (the abort's +1). read = 3 + 1 = 4 (the new delta preserved).
+    expect((await __readIdbTerminalCountersForTest())['dead-letter']).toBe(3)
+    expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(4)
+  })
+
+  it('⑨ (P1-B r4) an aborted tx refunds its claim → pending is restored (no lost delta)', async () => {
+    __setMaxTerminalsForTest(256)
+    // Seed pending=2 (2 fault-aborts).
+    __setTerminalFaultInjectorForTest((phase, tx) => {
+      if (phase === 'record') tx.abort()
+    })
+    await __recordTerminalForTest(makeMinimalQueuedWrite('r1', 'r1'), 'dead-letter', 'm1')
+    await __recordTerminalForTest(makeMinimalQueuedWrite('r2', 'r2'), 'dead-letter', 'm2')
+    // pending=2, IDB=0.
+    // A 3rd fault-abort: claims pending=2 → aborts → refundClaim(2) + bump(1) → pending=3.
+    // The claim is refunded (pending restored + the abort's own +1 added).
+    await __recordTerminalForTest(makeMinimalQueuedWrite('r3', 'r3'), 'dead-letter', 'm3')
+    __setTerminalFaultInjectorForTest(undefined)
+    expect((await __readIdbTerminalCountersForTest())['dead-letter']).toBe(0) // IDB unchanged (3 aborts)
+    expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(3) // pending=3 (refunded)
+    // A subsequent success flushes ALL 3 pending into IDB (+1) → durable=4.
+    await __recordTerminalForTest(makeMinimalQueuedWrite('ok', 'ok'), 'dead-letter', 'm4')
+    expect((await __readIdbTerminalCountersForTest())['dead-letter']).toBe(4) // 3 (refunded pending) + 1
+    expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(4)
+  })
 })
