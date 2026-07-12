@@ -164,25 +164,45 @@ echo '{"strict":false,"checks":[{"app_id":15368,"context":"lint + tsc + unit + l
 **阶段 2（代码 PR 删 job）**：context 移出 required 后，开 PR 删除 ci.yml 中对应 job 段。
 此时 PR 不再被旧 context 卡（已非 required）→ CI 绿 → 合并。
 
-**验收命令**（PUT 后即时验 context 迁移 + 阶段 2 合并后验 job 删除）：
+**验收命令**（PUT 后即时验 context 迁移 + 阶段 2 合并后验 job 删除；r4 改 R3-7：加 jq 集合 diff 机械证明 7 项逐字不变）
+
+PUT 后先存 after JSON，再用 jq 与 before snapshot 做集合 diff（r3 原命令只查目标=0/另一=1/总数=8/app_id unique，没与 before 比对，不能证明"其余 7 项逐字不变"——改 context 拼写或 app_id 仍过 r3 四条；r4 加 4 条集合断言，renderer/kernel 各一套，TARGET/OTHER 对调）：
 
 ```bash
-# ── PUT 后即时验收（以 renderer 删轨为例；kernel 删轨把两 context 名对调，断言随之对调）
+# ── renderer 删轨（TARGET=visual diff, OTHER=e2e kernel gate）──
+TARGET='visual diff (dom vs leafer)'; OTHER='e2e kernel gate (new)'
 gh api repos/xindong/mivo-canvas/branches/main/protection \
-  --jq '.required_status_checks.contexts | map(select(. == "visual diff (dom vs leafer)")) | length'  # 期望 0：目标已移除
+  --jq '.required_status_checks' > /tmp/d4-required-after.json
+# 1. after.checks == before.checks - 目标（按 context 排序，含 app_id 逐字不变）
+diff <(jq -S --arg t "$TARGET" '.checks | map(select(.context != $t)) | sort_by(.context)' /tmp/d4-required-before.json) \
+     <(jq -S '.checks | sort_by(.context)' /tmp/d4-required-after.json) && echo "1.set-diff-ok" || echo "1.FAIL"
+# 2. strict 不变
+[ "$(jq -r '.strict' /tmp/d4-required-before.json)" = "$(jq -r '.strict' /tmp/d4-required-after.json)" ]
+# 3. 另一 gate 仍在 after
+jq -e --arg g "$OTHER" '.checks | map(select(.context == $g)) | length == 1' /tmp/d4-required-after.json
+# 4. 无 added checks（after contexts ⊆ before contexts）
+[ -z "$(comm -13 <(jq -r '.checks[].context' /tmp/d4-required-before.json | sort) <(jq -r '.checks[].context' /tmp/d4-required-after.json | sort))" ]
+```
+
+```bash
+# ── kernel 删轨（TARGET=e2e kernel gate, OTHER=visual diff；两 context 名对调）──
+TARGET='e2e kernel gate (new)'; OTHER='visual diff (dom vs leafer)'
 gh api repos/xindong/mivo-canvas/branches/main/protection \
-  --jq '.required_status_checks.contexts | map(select(. == "e2e kernel gate (new)")) | length'       # 期望 1：另一双轨 gate 仍在
-gh api repos/xindong/mivo-canvas/branches/main/protection \
-  --jq '.required_status_checks.contexts | length'                                                   # 期望 8：9-1
-gh api repos/xindong/mivo-canvas/branches/main/protection \
-  --jq '.required_status_checks.checks | map(.app_id) | unique'                                      # 期望 [15368]：app 绑定未丢
+  --jq '.required_status_checks' > /tmp/d4-required-after.json
+diff <(jq -S --arg t "$TARGET" '.checks | map(select(.context != $t)) | sort_by(.context)' /tmp/d4-required-before.json) \
+     <(jq -S '.checks | sort_by(.context)' /tmp/d4-required-after.json) && echo "1.set-diff-ok" || echo "1.FAIL"
+[ "$(jq -r '.strict' /tmp/d4-required-before.json)" = "$(jq -r '.strict' /tmp/d4-required-after.json)" ]
+jq -e --arg g "$OTHER" '.checks | map(select(.context == $g)) | length == 1' /tmp/d4-required-after.json
+[ -z "$(comm -13 <(jq -r '.checks[].context' /tmp/d4-required-before.json | sort) <(jq -r '.checks[].context' /tmp/d4-required-after.json | sort))" ]
+```
+
+```bash
 # ── 阶段 2 合并后：job 也已从 ci.yml 删除
 grep -c '^  visual-diff:' .github/workflows/ci.yml       # 期望 0（renderer 删轨）
 grep -c '^  e2e-kernel-gate:' .github/workflows/ci.yml    # 期望 0（kernel 删轨）
 ```
 
-> 上述验收命令已对**当前未改动**状态 dry-run：`visual diff`/`e2e kernel gate` 均 `1`、
-> `contexts|length`=`9`、ci.yml 两 job 均 `1`——证 jq filter 与 grep 模式可判定；PUT 后数字按上表翻转。
+> r4 dry-run 证据（本地 mock before/after fixture，复核人可重跑）：正例 after 去 `visual diff`、其余 7 项逐字不变（含 app_id）→ 4 条全 OK；负例误删另一 gate → 3 红、改 `strict=true` → 2 红、新增 `BOGUS NEW CONTEXT` → 4 红、改 `app_id=99999` → 1 红（证逐字不变检测含 app_id 绑定，非仅 context 名）。r3 原 4 条快速验收仍可作概览，但**不能替代集合 diff**——目标=0 + 总数=8 不保证"其余 7 项 context 拼写 / app_id 逐字不变"。
 
 **trunk-guard org ruleset（id `18006872`，member 无权改）边界**：该 org 级 ruleset 实测只管
 `deletion` / `non_fast_forward` / `pull_request`（`required_review_thread_resolution=true`）
