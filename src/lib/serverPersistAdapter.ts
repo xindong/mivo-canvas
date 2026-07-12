@@ -228,6 +228,7 @@ export type FetchAdapterOptions = {
 }
 
 const defaultFetch: FetchLike = (input, init) => fetch(input, init)
+export { defaultFetch }
 
 const isJsonResponse = (res: Response): boolean => {
   const ct = res.headers.get('content-type') || ''

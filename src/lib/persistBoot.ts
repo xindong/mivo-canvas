@@ -22,7 +22,8 @@ import { createAdapterWriteExecutor } from './persistWriteExecutor'
 import { createWriteQueue, type WriteOp, type WriteQueue } from './writeRetryQueue'
 import { hydrateUserStateMap } from './serverPersistHydrate'
 import { debugLogger } from '../store/debugLogStore'
-import type { FetchAdapterOptions, GetAuthHeaders } from './serverPersistAdapter'
+import { toastFeedback } from '../store/toastStore'
+import { defaultFetch, type FetchAdapterOptions, type FetchLike, type GetAuthHeaders } from './serverPersistAdapter'
 import type { ChatMessage } from '../store/chatStore'
 import type { Revision } from '../../shared/persist-contract.ts'
 
@@ -236,20 +237,61 @@ export const stopPersistWriteQueue = (): void => {
   debugLogger.log(SOURCE, 'write queue stopped')
 }
 
+// ── G1-a R2 F3:persist readiness 门控(fail-closed 防 memory 假持久)──────────────
+export type PersistReadiness = { backend: string; durable: boolean }
+
+/**
+ * G1-a R2 F3:GET /healthz 解析 persist readiness。返 {backend,durable} 或 null(任何失败 →
+ * fail-closed 哨兵,调用方据此不发业务写)。/healthz 免鉴权,但走同一 fetch+getAuthHeaders 无害
+ * (服务端忽略);失败:网络 reject / 非 2xx / 无 persist 字段 / durable 非 boolean → null。
+ * 不泄密:backend kind('pg'/'memory')非敏感;不暴露连接串/密码。
+ */
+export const fetchPersistReadiness = async (opts: FetchAdapterOptions): Promise<PersistReadiness | null> => {
+  try {
+    const doFetch: FetchLike = opts.fetch ?? defaultFetch
+    const baseUrl = opts.baseUrl ?? ''
+    const res = await doFetch(`${baseUrl}/healthz`, { method: 'GET', headers: { ...(await opts.getAuthHeaders()) } })
+    if (res.status < 200 || res.status >= 300) return null
+    const text = await res.text()
+    if (!text) return null
+    const body = JSON.parse(text) as { persist?: { backend?: unknown; durable?: unknown } }
+    const p = body.persist
+    if (!p || typeof p.durable !== 'boolean' || typeof p.backend !== 'string') return null
+    return { backend: p.backend, durable: p.durable }
+  } catch (error) {
+    debugLogger.warn(SOURCE, `fetchPersistReadiness failed (fail-closed): ${msg(error)}`)
+    return null
+  }
+}
+
 /**
  * G1-a P1-1 boot 单点:useStoreHydration 在 auth hydrate 后调此,按 persistMode 分派。
  * - local(默认):no-op(零变化,IDB rehydrate 由调用方现有逻辑跑)。
- * - server:hydrateFromServer + startPersistWriteQueue。
- * - shadow:shadowCompareWithServer + startPersistWriteQueue(IDB rehydrate 由调用方跑,读源不变)。
+ * - server:R2 F3 先 fetchPersistReadiness;durable(pg ready)才 hydrate + start queue,否则 fail-closed
+ *   (不发业务写、不删 durable 记录、不覆盖本地态,toast 告知降级本地)。readiness 失败同样 fail-closed。
+ * - shadow:同门控(durable 才 compare + start;否则 fail-closed)。
+ * @param opts 注入 fetch opts(测试用);production 默认 getProductionFetchOptions()。
  */
-export const bootPersistWiring = async (): Promise<void> => {
+export const bootPersistWiring = async (opts: FetchAdapterOptions = getProductionFetchOptions()): Promise<void> => {
   if (isLocalPersist) return // 默认零变化
+  // R2 F3:durable-backend readiness 门控。memory 后端 + ?persist=server 会收到写成功并删 durable 记录,
+  // pm2 重启后服务端清空 → 不可恢复的“成功保存”假象。fail-closed:durable 不达标不发业务写、
+  // 不 hydrate(不覆盖本地 IDB 真值)、不 start queue(durable 记录若已存在也保留不被 drain 删)。
+  const readiness = await fetchPersistReadiness(opts)
+  if (!readiness?.durable) {
+    debugLogger.warn(
+      SOURCE,
+      `persist backend not durable (backend=${readiness?.backend ?? 'unreachable'}); ${getPersistMode()} mode disabled — writes stay local IDB, no false-success (fail-closed)`,
+    )
+    toastFeedback.warn('服务端持久存储未就绪,已保持本地模式,改动不会同步到服务器。')
+    return
+  }
   if (getPersistMode() === 'server') {
-    await hydrateFromServer()
-    startPersistWriteQueue()
+    await hydrateFromServer(undefined, opts)
+    startPersistWriteQueue(opts)
   } else {
     // shadow:IDB 已 rehydrate(读源),此处 compare + 双写队列(mutation enqueue 同时写 BFF)
     await shadowCompareWithServer()
-    startPersistWriteQueue()
+    startPersistWriteQueue(opts)
   }
 }

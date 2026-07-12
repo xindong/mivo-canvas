@@ -72,7 +72,13 @@ export { sharedPermissionBackend }
 export const app = new Hono<AppEnv>()
 
 // Liveness probe.
-app.get('/healthz', (c) => c.json({ status: 'ok' }))
+// G1-a R2 F3:暴露 persist readiness(backend kind + durable 标志)。不泄密(backend kind 非敏感)。
+// 客户端 bootPersistWiring 在 server 模式据此 fail-closed:memory 后端不发业务写、不删 durable 记录
+// (防 pm2 重启后“成功保存”假象);pg ready 才 hydrate + start queue;readiness 失败同样 fail-closed。
+const persistDurable = persistBackendConfig.kind === 'pg'
+app.get('/healthz', (c) =>
+  c.json({ status: 'ok', persist: { backend: persistBackendConfig.kind, durable: persistDurable } }),
+)
 
 // visual-diff token probe (env-gated): only when MIVO_VD_TOKEN is set, return it at
 // /__vd_probe so scripts/visual-diff.mjs can confirm THIS BFF process is responding
