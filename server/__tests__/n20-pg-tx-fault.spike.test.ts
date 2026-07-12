@@ -39,26 +39,34 @@ beforeAll(async () => {
   if (!PG_TEST_ENABLED) return
   const cfg = pgConn()
   pool = new Pool(cfg)
-  // 建专用临时表(不依赖 mivo schema);R3 F2 加 field_clock/idempotency/records(PG-T5/T6/T7)
+  // 建专用临时表(不依赖 mivo schema);R3 F2 加 field_clock/idempotency/records(PG-T5/T6/T7);
+  //   R5 F2:n20_records 加 revision 列 + 新增 n20_canvas_seq/n20_events(PG-T6 真实领域 replay path 用)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS n20_nodes (id text PRIMARY KEY, title text, asset_id text);
     CREATE TABLE IF NOT EXISTS n20_edges (id text PRIMARY KEY, from_id text NOT NULL, to_id text NOT NULL);
     CREATE TABLE IF NOT EXISTS n20_assets (id text PRIMARY KEY, refcount integer NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS n20_field_clock (canvas_id text NOT NULL, record_id text NOT NULL, field_key text NOT NULL, clock bigint NOT NULL DEFAULT 0, PRIMARY KEY (canvas_id, record_id, field_key));
     CREATE TABLE IF NOT EXISTS n20_idempotency (key text PRIMARY KEY, result_kind text NOT NULL, revision bigint NOT NULL, seq bigint NOT NULL);
-    CREATE TABLE IF NOT EXISTS n20_records (id text PRIMARY KEY, title text NOT NULL);
+    CREATE TABLE IF NOT EXISTS n20_records (id text PRIMARY KEY, title text NOT NULL, revision bigint NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS n20_canvas_seq (canvas_id text PRIMARY KEY, seq bigint NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS n20_events (seq bigint PRIMARY KEY, record_id text NOT NULL, op_id text NOT NULL);
   `)
 })
 
 afterAll(async () => {
   if (!pool) return
-  await pool.query('DROP TABLE IF EXISTS n20_nodes; DROP TABLE IF EXISTS n20_edges; DROP TABLE IF EXISTS n20_assets; DROP TABLE IF EXISTS n20_field_clock; DROP TABLE IF EXISTS n20_idempotency; DROP TABLE IF EXISTS n20_records;')
+  await pool.query('DROP TABLE IF EXISTS n20_nodes; DROP TABLE IF EXISTS n20_edges; DROP TABLE IF EXISTS n20_assets; DROP TABLE IF EXISTS n20_field_clock; DROP TABLE IF EXISTS n20_idempotency; DROP TABLE IF EXISTS n20_records; DROP TABLE IF EXISTS n20_canvas_seq; DROP TABLE IF EXISTS n20_events;')
   await pool.end()
 })
 
 /** R2-1:借专用 client + finally release,保证 BEGIN/DELETE/COMMIT 在同一连接上执行(事务性)。 */
 async function withClient<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
   const client = await pool!.connect()
+  try { return await fn(client) } finally { client.release() }
+}
+/** R5 F2:在指定 pool(非全局 pool)上借专用 client + finally release(PG-T6 跨 pool 重连 replay 用)。 */
+async function withClientOn<T>(target: Pool, fn: (client: PoolClient) => Promise<T>): Promise<T> {
+  const client = await target.connect()
   try { return await fn(client) } finally { client.release() }
 }
 
@@ -165,22 +173,64 @@ describe.skipIf(!PG_TEST_ENABLED)('N2-0 返修 Gate3 PG 侧(R2-1 同一 client):
     ]) // ★ 重启后 clock 仍在(非内存,PG 持久;S10-4 内存模拟不证此)
   })
 
-  it('PG-T6 idempotency 持久(R3 F2):write idem key+result → 销毁 pool → 重连 replay 同 key → 不二次 bump(非 S10-11 内存 Map)', async () => {
-    // R3 F2 红证:S10-11 idempotencyCache 是进程内 Map,重启后同 key 会二次 bump revision/seq;
-    //   绿证:本探针真 PG — write via poolA → end → replay same key via fresh poolB → ON CONFLICT DO NOTHING + cached,不二次 bump。
-    await pool!.query('TRUNCATE n20_idempotency')
+  it('PG-T6 idempotent replay 真实领域 path(R5 F2):单事务原子写领域 record+seq+event+idem row → 销毁 pool → 重连 replay 同 key → 不二次 bump revision/seq/event(非只测 ON CONFLICT)', async () => {
+    // R5 F2 红证:原 PG-T6 只向 n20_idempotency 插字面量 (revision=2,seq=5)+ ON CONFLICT DO NOTHING,
+    //   未执行领域写、authoritative revision/seq bump 或 event append;只能证 idem row 持久 + 唯一键冲突,
+    //   不能证"同 key replay 不二次应用领域写 / 不二次 bump revision/seq / 不二次发事件"(文档声称强于实测)。
+    // 绿证(补探针把声称测实):本探针单 PG 事务原子写(领域 record title+revision / canvas seq / event / idem result row),
+    //   销毁 pool 模拟进程重启 → 重连走真实 replay path(SELECT idem → 命中 cached → 不二次 apply)→
+    //   断言 authoritative record revision / canvas seq / event count 与首次结果均不变。
+    await pool!.query('TRUNCATE n20_records, n20_canvas_seq, n20_events, n20_idempotency')
+    await pool!.query("INSERT INTO n20_records(id,title,revision) VALUES ('n1','orig',0)")
+    await pool!.query("INSERT INTO n20_canvas_seq(canvas_id,seq) VALUES ('c1',0)")
     const cfg = pgConn()
+    // ── 首次事务(poolA):单事务原子写领域 record + bump revision + bump canvas seq + append event + insert idem row ──
     const poolA = new Pool(cfg)
-    await poolA.query("INSERT INTO n20_idempotency(key,result_kind,revision,seq) VALUES ('idem-1','ok',2,5) ON CONFLICT DO NOTHING")
-    await poolA.end() // ★ 销毁 poolA(内存 Map 会丢,PG 表保留)
-    const poolB = new Pool(cfg) // ★ 重连
-    // replay 同 key → ON CONFLICT DO NOTHING(不覆盖,不二次 bump revision/seq)
-    const replay = await poolB.query("INSERT INTO n20_idempotency(key,result_kind,revision,seq) VALUES ('idem-1','ok',3,6) ON CONFLICT DO NOTHING")
-    expect(replay.rowCount).toBe(0) // ★ 已存在,不插入(不二次 bump)
-    const cached = await poolB.query("SELECT revision::text AS revision, seq::text AS seq FROM n20_idempotency WHERE key='idem-1'")
+    await withClientOn(poolA, async (client) => {
+      await client.query('BEGIN')
+      await client.query("UPDATE n20_records SET title='T1', revision=revision+1 WHERE id='n1'") // 领域写 + revision bump 0→1
+      await client.query("INSERT INTO n20_canvas_seq(canvas_id,seq) VALUES ('c1',1) ON CONFLICT (canvas_id) DO UPDATE SET seq = n20_canvas_seq.seq + 1") // canvas seq 0→1
+      await client.query("INSERT INTO n20_events(seq,record_id,op_id) VALUES (1,'n1','idem-1')") // append event(count=1)
+      await client.query("INSERT INTO n20_idempotency(key,result_kind,revision,seq) VALUES ('idem-1','ok',1,1) ON CONFLICT DO NOTHING") // idem result row
+      await client.query('COMMIT')
+    })
+    await poolA.end() // ★ 销毁 poolA(模拟进程重启;内存 Map 会丢,PG 表保留)
+    // ── 重连(poolB)走真实 replay path:同 key 'idem-1' → SELECT idem → 命中 cached → 不二次 apply ──
+    const poolB = new Pool(cfg)
+    const cached = await poolB.query("SELECT result_kind, revision::text AS revision, seq::text AS seq FROM n20_idempotency WHERE key='idem-1'")
+    expect(cached.rows.length).toBe(1) // ★ 命中缓存(replay 返首次结果,不二次 apply 领域写)
+    expect(cached.rows[0].result_kind).toBe('ok'); expect(cached.rows[0].revision).toBe('1'); expect(cached.rows[0].seq).toBe('1')
+    // ★ replay 不再执行领域写 / bump seq / append event(返 cached result 即止)— 断言权威领域 state 不变:
+    const rec = await poolB.query("SELECT title, revision::text AS revision FROM n20_records WHERE id='n1'")
+    expect(rec.rows[0].title).toBe('T1')     // ★ 领域写值不变(replay 未二次 apply 改写)
+    expect(rec.rows[0].revision).toBe('1')   // ★ authoritative revision 不变(未二次 bump 到 2)
+    const seqRow = await poolB.query("SELECT seq::text AS seq FROM n20_canvas_seq WHERE canvas_id='c1'")
+    expect(seqRow.rows[0].seq).toBe('1')     // ★ canvas seq 不变(未二次 bump 到 2)
+    const evtCount = await poolB.query('SELECT count(*)::int AS c FROM n20_events')
+    expect(evtCount.rows[0].c).toBe(1)       // ★ event count 不变(replay 未二次 append event)
     await poolB.end()
-    expect(cached.rows[0].revision).toBe('2') // ★ 仍 2(未 bump 到 3)
-    expect(cached.rows[0].seq).toBe('5')      // ★ 仍 5(未 bump 到 6)
+    // ★ R5 F2 验收:replay 前后 authoritative record revision / canvas seq / event count 全不变(真实领域 replay 幂等,非只 ON CONFLICT)。
+  })
+
+  it('PG-T6b idempotent 首次事务 fault(R5 F2):领域写 + idem row 同事务 fault → 一起 ROLLBACK(无 partial;idem row 不落地 → 重试可重做)', async () => {
+    // R5 F2:replay 幂等的前提是"首次事务 fault 时领域写与 idem row 一起 rollback";否则 idem row 落了但领域写没成
+    //   → 重试被误判 dedup → 永久丢领域写。本探针证同事务 fault → 两边一起 ROLLBACK(idem row 不落地,重试可重做)。
+    await pool!.query('TRUNCATE n20_records, n20_canvas_seq, n20_events, n20_idempotency')
+    await pool!.query("INSERT INTO n20_records(id,title,revision) VALUES ('n1','orig',0)")
+    await pool!.query("INSERT INTO n20_canvas_seq(canvas_id,seq) VALUES ('c1',0)")
+    await withClient(async (client) => {
+      await client.query('BEGIN')
+      await client.query("UPDATE n20_records SET title='broken', revision=revision+1 WHERE id='n1'") // 领域写
+      await client.query("INSERT INTO n20_idempotency(key,result_kind,revision,seq) VALUES ('idem-fault','ok',1,1) ON CONFLICT DO NOTHING") // idem row
+      await expect(client.query('SELECT 1/0')).rejects.toThrow() // fault(division_by_zero)→ 事务 abort
+      await client.query('ROLLBACK')
+    })
+    // ★ 领域写回滚(title 仍 orig,revision 仍 0)+ idem row 回滚(未落地 → 重试不被误判 dedup)
+    const rec = await pool!.query("SELECT title, revision::text AS revision FROM n20_records WHERE id='n1'")
+    expect(rec.rows[0].title).toBe('orig')
+    expect(rec.rows[0].revision).toBe('0') // ★ 领域写未落地(rollback)
+    const idem = await pool!.query("SELECT count(*)::int AS c FROM n20_idempotency WHERE key='idem-fault'")
+    expect(idem.rows[0].c).toBe(0) // ★ idem row 未落地 → 重试可重做领域写(非误判 dedup 永久丢)
   })
 
   it('PG-T7 strict-tx 跨 record 单事务(R3 F2):BEGIN 两不同 record + fault + ROLLBACK → 两 record 均不变(非 S10-5 单 record)', async () => {

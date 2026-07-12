@@ -8,7 +8,7 @@
 > 验证产物(全绿):
 > - `src/kernel/__spike__/n20-truth-source.spike.test.ts`(44 tests:15 原 + 18 返修 + 8 补缺 + 3 R2 增:T1-5 restore 全链 / S10-10 immutable/atomic leaf 表 / S10-11 idempotent replay)
 > - `server/__tests__/n20-sse-route.spike.test.ts`(8 tests,真实 Hono SSE route 集成 + R2-2 live push 5-7 + desiredSize backpressure + **R3 F3:真实 resolveActor/canAccessCanvas authz seam(替代 fake secret,错 proof → 404 no-leak 非 401)+ 5-8 slow-reader response body 恢复**)
-> - `server/__tests__/n20-pg-tx-fault.spike.test.ts`(7 tests,真实 PG transaction fault injection + R2-1 同一 client pool.connect+finally release;PG-T3 改名同库资产元数据;**R3 F2:PG-T5 field_clock 持久 / PG-T6 idempotency 持久 / PG-T7 strict-tx 跨 record**)
+> - `server/__tests__/n20-pg-tx-fault.spike.test.ts`(8 tests,真实 PG transaction fault injection + R2-1 同一 client pool.connect+finally release;PG-T3 改名同库资产元数据;**R3 F2:PG-T5 field_clock 持久 / PG-T7 strict-tx 跨 record**;**R5 F2:PG-T6 真实领域 replay path(单事务原子写 record+seq+event+idem row → destroy pool → 重连 replay 同 key 不二次 bump revision/seq/event)+ PG-T6b 首次事务 fault/rollback(领域写+idem row 同事务原子)**)
 >
 > **58 pass / 0 skip / 0 fail**(本地 PG port 55443 实跑,PG-T1~T7 同 client 真 pass;PG-T5/T6/T7 真 PG 持久/跨 record);`tsc -b` 0 errors;`eslint` 干净;`npm run build` exit 0;`grep -roE 'yjs|lib0|YEvent|applyUpdate|AbstractType|encodeStateAsUpdate' dist/` **零命中**(yjs 不进生产 bundle)。
 >
@@ -389,9 +389,9 @@ npm test -- src/lib/serverPersistAdapter.contract.test.ts server/persist/backend
 
 见 Gate5 §2(5-1 content-type/framing、5-2 heartbeat、5-3 since 补拉、5-4 revoke 断流、5-5 authz **404 no-leak**(R3 F3 真实 seam,原 403 系 fake secret)、5-6 slow consumer 有界 + response body 实收(R3 F3);5-7 live push、5-8 slow-reader 恢复见 §4.6)。强度 ●。
 
-### 4.5 真实 PG fault injection(7 tests:PG-T1~T4 R2-1 同 client + **PG-T5/T6/T7 R3 F2 持久/跨 record**,本地 PG 55443 实跑)
+### 4.5 真实 PG fault injection(8 tests:PG-T1~T4 R2-1 同 client + **PG-T5/T6/T6b/T7 R3/R5 F2 持久/跨 record/真实 replay**,本地 PG 55443 实跑)
 
-见 Gate3 §2(PG-T1 原子提交、PG-T2 fault ROLLBACK、PG-T3 同库资产元数据(R2-1 改名,非跨介质)、PG-T4 无事务 partial 对照)。强度 ●。
+见 Gate3 §2(PG-T1 原子提交、PG-T2 fault ROLLBACK、PG-T3 同库资产元数据(R2-1 改名,非跨介质)、PG-T4 无事务 partial 对照;**R5 F2:PG-T6 单事务原子写领域 record+seq+event+idem row → destroy pool → 重连走真实 replay path → SELECT idem 命中 cached,不二次 apply 领域写 / 不二次 bump revision/seq / 不二次 append event;PG-T6b 首次事务 fault → 领域写+idem row 同事务 ROLLBACK(idem row 不落地,重试可重做非误判 dedup)**)。强度 ●。
 
 ### 4.6 R2 增补探针(4 tests:3 spike + 1 SSE,R2 返修新增)
 
@@ -399,7 +399,7 @@ npm test -- src/lib/serverPersistAdapter.contract.test.ts server/persist/backend
 |---|---|---|---|---|
 | T1-5 restore 走 overwrite 管线全链(A写→B写→A restore→B收 notice→B后续写→A收 notice) | R2-5 | 1 | `overwrittenTo==='bob' && aliceInbox.length===2 && bobInbox.length===1`(lastWriter 链不断) | ● |
 | S10-10 immutable/atomic leaf 表 | R2-3 | §10 | `immutable 字段 set→throw;atomic-container 整值替换(allowContainerClobber);其余 leaf set ok` | ● |
-| S10-11 idempotent replay | R2-3 | §10 | replay 逻辑(内存 Map)+ **PG-T6 真持久**(write→destroy→重连 replay 不二次 bump) | ● |
+| S10-11 idempotent replay | R2-3 | §10 | replay 逻辑(内存 Map)+ **R5 F2:PG-T6 真实领域 replay**(单事务写 record+seq+event+idem row → destroy pool → 重连 replay 同 key 不二次 bump revision/seq/event)+ **PG-T6b fault/rollback**(领域写+idem row 同事务原子) | ● |
 | 5-7 SSE live push(建连后 push→response body 实收) | R2-2 | 5 | `chunks 含 'live-value' && op.value==='live-value'`(非建连前 replay) | ● |
 | 5-8 slow-reader 恢复(R3 F3) | R3 F3 | 5 | `resumedMax-resumedMin+1 > resumed.length`(response body 观察 seq gap)+ `?since=0 补拉 seq 1..51 全 51 无缺口` | ● |
 

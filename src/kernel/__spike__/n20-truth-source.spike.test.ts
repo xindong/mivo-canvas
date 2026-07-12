@@ -1734,9 +1734,10 @@ describe('N2-0 返修 §10 G1-b 衔接(P2-8): FieldPath 非空 + 数组中性 in
   })
 
   it('S10-11 idempotent replay(R2-3):同 opId(idempotency-key)replay 不二次 bump revision/seq、不二次发事件', () => {
-    // R3 F2 诚实化:持久证明由 PG-T6 真测(write→destroy pool→重连 replay 同 key → ON CONFLICT DO NOTHING +
-    //   cached result,不二次 bump revision/seq,见 n20-pg-tx-fault.spike.test.ts);本测试 idempotencyCache 是进程内
-    //   Map(重启丢),仅演示 replay 逻辑,非持久证明(原 R2-3 "不二次 bump" 系内存,重启失效已纠)。
+    // R5 F2 诚实化:持久证明由 PG-T6 真测(单事务原子写领域 record+seq+event+idem row → destroy pool →
+    //   重连走真实 replay path → SELECT idem 命中 cached,不二次 apply 领域写 / 不二次 bump revision/seq /
+    //   不二次 append event,见 n20-pg-tx-fault.spike.test.ts PG-T6;fault/rollback 同事务原子见 PG-T6b);
+    //   本测试 idempotencyCache 是进程内 Map(重启丢),仅演示 replay 逻辑,非持久证明(原 R2-3 "不二次 bump" 系内存,重启失效已纠)。
     const s = new FieldLevelServer()
     s.seedNode(makeNode('n1'))
     s.addMember('alice')
