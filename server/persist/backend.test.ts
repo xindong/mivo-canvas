@@ -4,7 +4,7 @@
 // 原子 tree 软删回滚(#7)、幂等 fingerprint(#10)。
 
 import { describe, it, expect, beforeEach } from 'vitest'
-import { InMemoryPersistBackend, fingerprintOfBody, idemIndexKey, type PersistBackend, type PersistType } from './backend'
+import { InMemoryPersistBackend, fingerprintOfBody, idemIndexKey, chatOrderRevKey, type PersistBackend, type PersistType } from './backend'
 
 describe('InMemoryPersistBackend — 返修 #1 project 全局唯一', () => {
   let b: PersistBackend
@@ -388,5 +388,53 @@ describe('InMemoryPersistBackend — 返修四 F1 createCanvasWithCollection 原
     expect(b.getCanvasOwner('c1')?.ownerId).toBe('o') // globalCanvasOwners 回滚
     const afterIdem = idemIdx.get(idemIndexKey('o', 'POST', 'canvas', 'k1'))
     expect(afterIdem).toEqual(beforeIdem) // idempotencyIndex 回滚(envelopeKey + fingerprint 不变)
+  })
+})
+
+// A8②-2 P1 回归:rekey 后点查 readback(防 listByOwner=1 但 get=missing 假迁移)。
+// 返修前 rekey(byOwner + idempotencyIndex)手拼 ':' 与 recordKey/idemIndexKey NUL 不一致 →
+//   byOwner bucket 有 entry(因 rekey dstBucket.set 用 ':')但 get(alice,project,p1) 用 NUL key
+//   查不到 → missing;idemKey startsWith('L:') 也永不命中 NUL key → idempotency index 未迁。
+// rekey 全改 KEY_SEP 前缀替换 + 补 chatOrderRevisions 迁移后,点查 found + idem 命中 alice + chatOrderRevision 随迁。
+describe('A8②-2 P1 — rekey 后点查 readback(防 listByOwner=1 但 get=missing 假迁移)', () => {
+  it('rekey fp→alice 后 get=found + getProjectOwner/getCanvasOwner 可见 + idempotency replay 命中 alice + chatOrderRevision 随迁', async () => {
+    const b = new InMemoryPersistBackend()
+    const fp = 'abcd1234ef567890'
+    // seed legacy fp:project p1(带 idempotencyKey 'idk1')+ canvas c1 + chat-collection
+    await b.ensureCreate(fp, 'project', 'p1', { name: 'P1' }, { method: 'POST', resourceKind: 'project', idempotencyKey: 'idk1', bodyFingerprint: 'fp1' })
+    await b.createCanvasWithCollection(fp, 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+    // seed chatOrderRevision(fp,c1)=3 via 直接 Map(私有 bumpChatOrderRevision 不公开)
+    const chatRevMap = (b as unknown as { chatOrderRevisions: Map<string, number> }).chatOrderRevisions
+    chatRevMap.set(chatOrderRevKey(fp, 'c1'), 3)
+
+    // migrate fp → alice@xd.com
+    const result = await b.migrateLegacyOwnersToUsernameForm!((f) => (f === fp ? 'alice@xd.com' : undefined))
+    expect(result.migrated).toBe(1)
+    expect(result.unmapped).toBe(0)
+    expect(await b.countLegacyFormOwners!()).toBe(0)
+
+    // P1 核心:点查 get=found(返修前 listByOwner=1 但 get=missing,因 rekey 手拼 ':' 与 NUL key 不一致)
+    expect((await b.get('alice@xd.com', 'project', 'p1')).kind).toBe('found')
+    expect((await b.get('alice@xd.com', 'canvas', 'c1')).kind).toBe('found')
+    expect((await b.get('alice@xd.com', 'chat-collection', 'c1')).kind).toBe('found')
+
+    // getProjectOwner/getCanvasOwner 点查可见(globalProject/CanvasOwners value L→U)
+    expect(b.getProjectOwner('p1')?.ownerId).toBe('alice@xd.com')
+    expect(b.getCanvasOwner('c1')?.ownerId).toBe('alice@xd.com')
+
+    // idempotency index rekey:entry 现 under alice(返修前 startsWith('L:') 永不命中 NUL idemKey → 未迁,仍 under fp)
+    const idemMap = (b as unknown as { idempotencyIndex: Map<string, unknown> }).idempotencyIndex
+    expect(idemMap.has(idemIndexKey('alice@xd.com', 'POST', 'project', 'idk1'))).toBe(true)
+    expect(idemMap.has(idemIndexKey(fp, 'POST', 'project', 'idk1'))).toBe(false)
+    // replay 同 idempotencyKey 在 alice 下 → 不重复创建(命中 → existing,非 created)
+    const replay = await b.ensureCreate('alice@xd.com', 'project', 'p1', { name: 'P1' }, { method: 'POST', resourceKind: 'project', idempotencyKey: 'idk1', bodyFingerprint: 'fp1' })
+    expect(replay.kind).not.toBe('created')
+
+    // chatOrderRevision 随迁:alice 下读 c1 = 3(返修前 rekey 漏 chatOrderRevisions → alice 见 0,乐观锁 stale base=0 ABA 风险)
+    expect(await b.getChatOrderRevision('alice@xd.com', 'c1')).toBe(3)
+    expect(await b.getChatOrderRevision(fp, 'c1')).toBe(0) // 旧 fp 下已无
+
+    // 旧 fp 点查全 missing(byOwner 已迁走)
+    expect((await b.get(fp, 'project', 'p1')).kind).toBe('missing')
   })
 })

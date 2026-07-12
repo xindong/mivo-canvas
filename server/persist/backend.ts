@@ -294,7 +294,7 @@ export interface PersistBackend {
    * 两阶段(防 resolver 中途抛错留下半迁移态):
    *  1. 扫 byOwner 外层 key 收集 legacy ownerId + 调 resolver 取 username(resolver 抛 → 未 mutation);
    *  2. 逐 owner rekey(Map ops 同步,不抛):byOwner bucket L→U(recordKey/ownerId 前缀)+ idempotencyIndex
-   *     (idemIndexKey + envelopeKey 前缀)+ globalProjectOwners/globalCanvasOwners(value L→U)。
+   *     (idemIndexKey + envelopeKey 前缀)+ chatOrderRevisions(chatOrderRevKey 前缀,A8②-2 P1 补)+ globalProjectOwners/globalCanvasOwners(value L→U)。
    *
    * - resolver 返 undefined/空 → 该 owner unmapped(留 legacy,strict gate 仍 no-go);返回 username → migrated。
    * - **可选**:InMemoryPersistBackend 实装(可测);PG + permissions + assets 跨 backend 迁移仍是 G2.2 scope,
@@ -326,6 +326,9 @@ export const recordKey = (ownerId: string, type: PersistType, id: string): strin
   `${ownerId}${KEY_SEP}${type}${KEY_SEP}${id}`
 export const idemIndexKey = (ownerId: string, method: string, resourceKind: string, idempotencyKey: string): string =>
   `${ownerId}${KEY_SEP}${method}${KEY_SEP}${resourceKind}${KEY_SEP}${idempotencyKey}`
+// DP-6R P1-2:per-actor×canvas chat order revision cursor key(同用 NUL 分隔,与 recordKey/idemIndexKey 同源;
+// 旧 `::` 双冒号是另一手拼分隔符,A8②-2 统一改 NUL,顺手 grep 清零手拼 ':' 残留)。导出供测试 + rekey 复用。
+export const chatOrderRevKey = (ownerId: string, canvasId: string): string => `${ownerId}${KEY_SEP}${canvasId}`
 
 // G2.1 F1:legacy owner 形态 = mivo-key 指纹(sha256[:16] hex,见 keys.ts `fingerprintOfPlatformKey`)。
 // 内联于此(不 import owner.ts)以保 persist 层 framework-agnostic(不耦合 hono)。owner.ts 同样定义
@@ -362,7 +365,7 @@ export class InMemoryPersistBackend implements PersistBackend {
   private readonly globalCanvasOwners = new Map<string, string>()
   /**
    * DP-6R P1-2:per-actor×canvas chat collection 独立乐观锁 cursor(orderRevision)。
-   * key = `${actor}::${canvasId}`;reorder 同事务 compare+bump;与共享 canvas contentVersion 解耦。
+   * key = chatOrderRevKey(actor, canvasId)(NUL 分隔,A8②-2);reorder 同事务 compare+bump;与共享 canvas contentVersion 解耦。
    * 内存实现易失(与 InMemoryPersistBackend 整体一致);PG 实现持久化(chat_order_revisions 表)。
    */
   private readonly chatOrderRevisions = new Map<string, Revision>()
@@ -436,12 +439,12 @@ export class InMemoryPersistBackend implements PersistBackend {
    * 不复活)。仅 __reset(测试清理)清零。双后端契约测试钉死此行为(见 backend.contract.dual.test.ts)。
    */
   private chatOrderRevision(ownerId: string, canvasId: string): Revision {
-    return this.chatOrderRevisions.get(`${ownerId}::${canvasId}`) ?? 0
+    return this.chatOrderRevisions.get(chatOrderRevKey(ownerId, canvasId)) ?? 0
   }
 
   /** DP-6R P1-2:bump per-actor×canvas chat orderRevision(+1);返新值。reorder 成功后调用。 */
   private bumpChatOrderRevision(ownerId: string, canvasId: string): Revision {
-    const key = `${ownerId}::${canvasId}`
+    const key = chatOrderRevKey(ownerId, canvasId)
     const next = (this.chatOrderRevisions.get(key) ?? 0) + 1
     this.chatOrderRevisions.set(key, next)
     return next
@@ -1415,7 +1418,8 @@ export class InMemoryPersistBackend implements PersistBackend {
   /**
    * G2.1 R3-F1:把 legacy 形态 ownerId(指纹)重键为 SSO username。两阶段(防 resolver 中途抛错留半迁移):
    *  1. 收集 legacy ownerId + 调 resolver 取 username(resolver 抛 → 未 mutation,安全);
-   *  2. 逐 owner rekey(Map ops 同步不抛):byOwner bucket + idempotencyIndex + globalProject/CanvasOwners。
+   *  2. 逐 owner rekey(Map ops 同步不抛):byOwner bucket + idempotencyIndex + chatOrderRevisions + globalProject/CanvasOwners。
+   *     全走 KEY_SEP(NUL)前缀替换 L→U,禁手拼 ':'(A8②-2 P1:旧手拼 ':' 与 NUL key 不一致 → 迁移后点查 missing)。
    * unmapped(resolver 返 undefined/空)→ 留 legacy,strict gate 仍 no-go。返回 {migrated, unmapped}。
    */
   async migrateLegacyOwnersToUsernameForm(
@@ -1444,31 +1448,46 @@ export class InMemoryPersistBackend implements PersistBackend {
         migrated += 1
         continue
       }
-      // byOwner bucket:oldKey=`L:type:id` → newKey=`U:type:id`,record.ownerId → U。
+      // byOwner bucket:oldKey=recordKey(L,type,id) → newKey=recordKey(U,type,id)。统一 KEY_SEP(NUL)前缀替换
+      // L→U,禁手拼 ':'(与 recordKey/idemIndexKey 构造器同源;旧手拼 ':' 与 NUL key 不一致 → 迁移后点查 missing,P1)。
+      // legacyOwnerPrefix = L + KEY_SEP:NUL 紧随 L,保证 startsWith 不误吞更长 owner(L 是另一 owner 前缀时)。
+      const legacyOwnerPrefix = L + KEY_SEP
       const srcBucket = this.byOwner.get(L)
       if (srcBucket) {
         const dstBucket = this.bucket(U)
         for (const [oldKey, rec] of srcBucket) {
-          const suffix = oldKey.slice(L.length + 1) // `type:id`(id 可能含 ':',suffix 取 L: 之后全部)
-          dstBucket.set(`${U}:${suffix}`, { ...rec, ownerId: U })
+          const rest = oldKey.slice(legacyOwnerPrefix.length) // type + KEY_SEP + id(段内 NUL 不存在,slice 安全)
+          dstBucket.set(U + KEY_SEP + rest, { ...rec, ownerId: U })
           srcBucket.delete(oldKey)
         }
         if (srcBucket.size === 0) this.byOwner.delete(L)
       }
-      // idempotencyIndex:idemKey=`L:method:resourceKind:key` → `U:...`;envelopeKey 同步前缀换。
+      // idempotencyIndex:idemKey=idemIndexKey(L,method,resourceKind,key) → U 前缀;envelopeKey=recordKey(L,type,id) 同步。
       const idemKeysToMove: string[] = []
       for (const idemKey of this.idempotencyIndex.keys()) {
-        if (idemKey.startsWith(`${L}:`)) idemKeysToMove.push(idemKey)
+        if (idemKey.startsWith(legacyOwnerPrefix)) idemKeysToMove.push(idemKey)
       }
       for (const idemKey of idemKeysToMove) {
         const entry = this.idempotencyIndex.get(idemKey)!
         this.idempotencyIndex.delete(idemKey)
-        const idemSuffix = idemKey.slice(L.length + 1) // `method:resourceKind:idempotencyKey`
-        const envSuffix = entry.envelopeKey.slice(L.length + 1) // `type:id`
-        this.idempotencyIndex.set(`${U}:${idemSuffix}`, {
-          envelopeKey: `${U}:${envSuffix}`,
+        const idemRest = idemKey.slice(legacyOwnerPrefix.length) // method + KEY_SEP + resourceKind + KEY_SEP + idempotencyKey
+        const envRest = entry.envelopeKey.slice(legacyOwnerPrefix.length) // type + KEY_SEP + id
+        this.idempotencyIndex.set(U + KEY_SEP + idemRest, {
+          envelopeKey: U + KEY_SEP + envRest,
           fingerprint: entry.fingerprint,
         })
+      }
+      // chatOrderRevisions:chatOrderRevKey(L,canvasId) → chatOrderRevKey(U,canvasId)(per-actor×canvas cursor 随 owner 迁移,
+      // 否则 rekey 后 U 的 reorder 见 revision=0 → 乐观锁 stale base=0 ABA 风险)。旧 rekey 漏此步,A8②-2 P1 顺手补。
+      const chatKeysToMove: string[] = []
+      for (const revKey of this.chatOrderRevisions.keys()) {
+        if (revKey.startsWith(legacyOwnerPrefix)) chatKeysToMove.push(revKey)
+      }
+      for (const revKey of chatKeysToMove) {
+        const rev = this.chatOrderRevisions.get(revKey)!
+        this.chatOrderRevisions.delete(revKey)
+        const canvasId = revKey.slice(legacyOwnerPrefix.length)
+        this.chatOrderRevisions.set(chatOrderRevKey(U, canvasId), rev)
       }
       // globalProjectOwners / globalCanvasOwners:value === L → U(派生 owner 指向同步)。
       for (const [pid, owner] of this.globalProjectOwners) {
