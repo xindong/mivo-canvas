@@ -1,18 +1,71 @@
 # N2-0 真相源拍板:Figma 式 vs Yjs(返修重评分 v3,R2 复审返修,decision-complete)
 
-> 状态:**返修重评分 v3(等 lead + sol4 第三轮复审)**。v1(94c7c0c)被 8 条双审 finding 判 REQUIRES_CHANGES(6 P1 + 2 P2);v2 补 5 条 finding 真实探针 + P1-4 文本判决 + P1-6 破坏面 inventory + P2-8 §10 对齐 G1-b R2;**v2 仍被 R2 复审判 REQUIRES_CHANGES(6 P1 + 1 P2,R2-1~R2-7)**——判决措辞过度(称"七 gate 全 GO 的充分判据"),证据与声称不匹配。
-> **v3 返修两头一起动(R2 纲)**:① 证据硬化——PG 同 client(R2-1)/SSE live push+desiredSize backpressure+gateway-secret authz seam(R2-2)/§10 三层信任+clock PG schema+batch 真单事务+immutable/atomic leaf+idempotent replay(R2-3)/数组三类+leaf validator(R2-4)/restore 走 overwrite 管线(R2-5)/逐文件破坏面+cutover 拍死(R2-6)/Gate7 ★ 降级(R2-7);② **声称降级**——Gate3/7 平局、Gate5 条件式、推荐改述"基于现有底座与迁移成本"(非"七 gate 全 GO 的充分判据")。
-> 日期:2026-07-12(v3)。
+> 状态:**v9 决议收口(sol 第八轮返修 3 阻断修复,等 sol 第九轮终审)**。v8 被 sol 第八轮判 FAIL(2/4 已闭环:baseline 分层✅ + 证据计数✅;剩 3 项:bundle 未写进所有 active 入口 / submitFromBundle 增量更新无证据 / legacy active 状态表 + pending>0 假声称)。**v9 病根继承 v7/v8:禁止追加式修复;直接重写 active 段原文;全文扫尾不漏;fail-visible 缺项禁借用(不许假声称已测)**。v9 收口 3 阻断(见 §14.7):① bundle 写进所有 active 入口(inventory :16/§3 loadSnapshot/submitChange/subscribe 全重写 bundle;§11.1/11.5 标 [superseded by v8/v9]);② submitFromBundle 真 adapter 路径(extractWireBase 真传 + accepted/conflict 增量更新非全量重建 + 未命中项值不变;spike S10-12 五路 edit/delete/reorder/create/conflict + 增量铁证);③ legacy active 状态表同步(decision :41/:167 existing+base≠rev→409 / missing+base>0→409 dead-letter / missing+base=0→create)+ C-2 pending>0 真测(v8 :65 假声称补真)。NOTES(§14.7 sol 第八轮 5 条):bundle 增量更新 + fail-visible 缺项禁借用 + pending>0 真测。
+> 日期:2026-07-13(v9 决议收口)。
 > 任务来源:`docs/plan/remaining-tasks-cutover-plan.md` §8 N2-0(7 hard gate,逐字执行)。
 > 前置:`docs/spike/n1-yjs-mapping.md`(N1 结论 + Q1-Q10)、`docs/decisions/record-schema.md`、`src/kernel/{docKernel,records,adapters}.ts`、`docs/decisions/platform-architecture-2026-07-07.md`。
 > 验证产物(全绿):
-> - `src/kernel/__spike__/n20-truth-source.spike.test.ts`(48 tests:15 原 + 18 返修 + 8 补缺 + 3 R2 增:T1-5 restore 全链 / S10-10 immutable/atomic leaf 表 / S10-11 idempotent replay;**R5 F4:C-1~C-4 cutover contract harness:flag on/off decoder / old-queue migration / stale-base 200 / rollback snapshot materialize**)
-> - `server/__tests__/n20-sse-route.spike.test.ts`(9 tests,真实 Hono SSE route 集成 + R2-2 live push 5-7 + desiredSize backpressure + **R3 F3:真实 resolveActor/canAccessCanvas authz seam(替代 fake secret,错 proof → 404 no-leak 非 401)+ 5-8 slow-reader response body 恢复**;**R5 F3:5-9 post-revoke write 拒绝(同 Hono harness 加真实 authz seam PATCH write route,bob 撤权 → SSE revoke/close + write 404 no-leak + owner write 200)**)
-> - `server/__tests__/n20-pg-tx-fault.spike.test.ts`(8 tests,真实 PG transaction fault injection + R2-1 同一 client pool.connect+finally release;PG-T3 改名同库资产元数据;**R3 F2:PG-T5 field_clock 持久 / PG-T7 strict-tx 跨 record**;**R5 F2:PG-T6 真实领域 replay path(单事务原子写 record+seq+event+idem row → destroy pool → 重连 replay 同 key 不二次 bump revision/seq/event)+ PG-T6b 首次事务 fault/rollback(领域写+idem row 同事务原子)**)
+> - `src/kernel/__spike__/n20-truth-source.spike.test.ts`(**54 tests**;v4 +7:3 S10-12/13/14 + CutoverHarness 改真实 WriteOp/NodePayload + 4 X-1~X-4 交叉契约;**v8:S10-12 加 SnapshotCursor=opaque bundle 交叉测试 + C-2 加 delete-race/retirement fake-clock quiet-window,吸收进既有 it() 不增计数**;分项见 §附)
+> - `server/__tests__/n20-sse-route.spike.test.ts`(13 tests,真实 Hono SSE route 集成 + R2-2 live push 5-7 + desiredSize backpressure + R3 F3 authz seam + R5 F3 post-revoke write + **v4:4 网关失败树 5-10~5-13 first-frame/header-strip/short-poll fallback SLO**)
+> - `server/__tests__/n20-pg-tx-fault.spike.test.ts`(8 tests,真实 PG transaction fault injection + R2-1 同一 client + R3/R5 F2 持久/跨 record/真实 replay)
 >
-> **65 pass / 0 skip / 0 fail**(spike 48 + SSE 9 + PG 8;本地 PG port 55443 实跑,PG-T1~T7(含 T6b) 同 client 真 pass;PG-T5/T6/T6b/T7 真 PG 持久/跨 record/真实 replay);`tsc -b` 0 errors;`eslint` 干净;`npm run build` exit 0;`grep -roE 'yjs|lib0|YEvent|applyUpdate|AbstractType|encodeStateAsUpdate' dist/` **零命中**(yjs 不进生产 bundle)。
+> **75 pass / 0 skip / 0 fail**(spike 54 + SSE 13 + PG 8;本地 PG port 55443 实跑,PG-T1~T7(含 T6b) 同 client 真 pass);`tsc -b` 0 errors;`eslint` 干净;`npm run build` exit 0;`grep -roE 'yjs|lib0|YEvent|applyUpdate|AbstractType|encodeStateAsUpdate' dist/` **零命中**(yjs 不进生产 bundle)。
 >
-> **倾向 Figma 式,但措辞降级为"基于现有底座与迁移成本的推荐"(R2 纲)** — 非"七 gate 全 GO 的充分判据";Gate3/7 平局、Gate5 条件式。v1→v3 优势缩窄但不反转。结论见 §0,被推翻/修正表述见 §3。
+> **倾向 Figma 式,但措辞降级为"基于现有底座与迁移成本的推荐"(R2 纲)** — 非"七 gate 全 GO 的充分判据";Gate3/7 平局、Gate5 条件式。结论见 §0,被推翻/修正表述见 §3。**v4 收口 6 阻断见 §14。**
+
+---
+
+## 14. v9 决议收口(sol 第八轮返修 3 阻断逐条修复;§14.1-14.6 v7/v8 保持)
+
+> sol 第六轮终审判 FAIL(三条均部分推进未关死)。**v7 病根:连续三轮栽在"改了点名处、漏了全文扫尾"**。v7 硬禁令:禁止追加式修复;直接重写 active 段原文;全文扫尾不漏。v7 收口 3 阻断 + before→after 对照表(见 send_to_lead)+ grep 自检。
+
+### 14.1 Blocker 1 — BaseCursor field clock 粒度(fieldKeyOf 完整 path;per-field writer map;同-field stale 通知该完整 path 前写者)
+
+- **v6 漏洞**:S10-12 用 `String(op.fieldPath[0])` 当 clock key → transform.x 和 transform.y 被并成一个 field,违背 leaf-level;lastWriter 是 record 级单值 → title 被覆盖会通知到 transform 的 writer。
+- **v7 修**:S10-12 用 **`fieldKeyOf(op.fieldPath)`**(与 S10-4 同一函数同一语义;完整 path key,transform.x≠transform.y);record 状态改 **per-field writer map**(`writers: Record<fieldKey, actor>`);overwritten 发给该**完整 path** 的前写者(非 record 级单值误通知)。
+- **field clock key 规范编码(A2 不许猜粒度)**:clock key = `fieldKeyOf(fieldPath)` = path 段 join('.')(`['transform','x']`→`'transform.x'`);leaf-level 粒度。S10-4 同一 fieldKeyOf;PG field_clock 表 field_key 同此编码。
+- **scope+per-field clock(承接 v6)**:token 绑 canvasId+recordId+revision+per-field clock snapshot;decodeBase 验签+scope;同-field(完整 path)stale 才 overwritten(不同字段 stale 不误报);edit 永不 409(G4-4)。
+- **契约测试佐证**:S10-2(真 codec round-trip + scope mismatch→null)+ **S10-12(fieldKeyOf 完整 path:transform.x≠transform.y stale 互不误报;title→transform→stale title 通知 title 前写者 alice 非 transform writer bob;per-field writer map;delete/reorder fresh→200 stale→409;create dup→409;malformed/scope-mismatch→400)**+ S10-4(删 BaseWithClock 统一 codec)。
+
+### 14.2 Blocker 2 — active 文档一次性清零(逐行修,勿再漏)
+
+- **v7 硬禁令:禁止追加式修复;直接重写 active 段原文;全文扫尾**(v6 仍有点名处漏扫尾)。逐行清零 16 点位(见 send_to_lead before→after 对照表):decision §2 Gate4(:121 #194 表 revision-conflict 409→base-driven)+ §2 Gate5(:294 旧 §-ref→§14.4,v4→v7,short-poll→finite)+ §3 表(:375 by-id→[superseded])+ §4.3 PoC(:447 S10-7→[superseded])+ §10 依据(:476 by-id→deferred)+ §10.1 DomainOp 注释(:481 strict-tx 删)+ §10.4 注释(:502 旧 §-ref→server-named 段)+ §10.8(:584 POST /nodes→:nodeId)+ §10.9(:589 FX-5 旧 schema→legacy 兼容通道)+ §13(:624 by-id→deferred,v5→v7)+ §1.2 状态表(:173 LegacyReplaceRequest 信封 wire/gate/scope/base-conflict/观测/retirement+受控迁移协议例外;:174 响应补 base;:175 同-field stale 才 overwritten)+ 文档头计数(54+13+8=75)。inventory §2/§3 主表 + §11 同步。
+- **S10-7/by-id 标 [superseded, non-normative]**:标题 + §3 表 + §4.3 PoC + 所有引用处;active 仅 whole-lww + primitive。
+- **契约测试佐证**:S10-10(无 atomic-container)+ S10-7(by-id [superseded];active 仅 whole-lww+primitive)+ S10-14(FieldTarget 无 atomic-container)。
+
+### 14.3 Blocker 3 — LegacyReplaceRequest 补全(信封绑 canvasId+nodeId+baseRevision;scope;stale base→409 terminal conflict dead-letter;真实 authz+deny;retirement 双指标)
+
+- **v6 漏洞**:C-2 信封仅 {nodeId,payload,version},无 canvasId/baseRevision;decoder 无 scope 校验(防同 nodeId 跨 canvas 重放);无 stale base 策略(盲 replace 数据破坏);authz void actor;retirement 仅 drainCount 累计(非可达指标)。
+- **v7 修**:
+  - ① **信封绑 canvasId+nodeId+version+payload+原队列 baseRevision**:`{kind:'legacy-replace',canvasId,nodeId,version:1,payload,baseRevision}`;decoder 校验 path canvas/node scope(env.canvasId===path canvasId && env.nodeId===path nodeId,防同 nodeId 跨 canvas 重放)。
+  - ② **【lead 拍板】stale base→409 terminal conflict(v8/v9 active 同步)**:**existing 且 base≠rev→409 terminal conflict**;**missing+base>0→409 dead-letter(防盲 create 复活已删 record)**;**missing+base=0→create fresh**;existing 且 base=rev→200 replace。不落盲 replace(队列残留是离线期改动,覆盖是数据破坏);409 后该 queue 项按 FX-5 dead-letter 语义走(用户可见)。spike CutoverHarness.patch + C-2 ⑥b 实证(missing+base>0→409 不复活 / missing+base=0→create)。
+  - ③ **authz 走真实 canvas-write seam + deny 负例**:members canWrite;无 actor→403(no void actor);非 member→403 deny 负例。
+  - ④ **retirement 双可达指标**:pending legacy queue gauge=0 + 连续观察窗 envelope 增量=0 → canRetire;drainCount 只作累计总量(非 retirement 条件);冻结 gate 配置名 LEGACY_DRAIN/观察窗/关闭后行为(gate 关→envelope 400)。
+  - ⑤ **§1.2 状态表写全**:信封 wire/gate/scope/base-conflict/观测/retirement + "受控迁移协议例外"术语(非双协议窗口:drain-only 临时信封,retirement 后消失,主写唯一 DomainOp)。
+- **仓库事实**:旧 upsert=replace(`backend.ts:1086-1088`);不翻译为 DomainOps;不绕 by-id defer;缺失字段=移除(replace 覆盖)。
+- **契约测试佐证**:C-1(flag decoder)+ **C-2(raw old body→400;信封经 decoder wire→200 replace 非直调;scope env.canvasId≠path→400+env.nodeId≠path→400;stale base→409 terminal conflict 非盲 replace+dead-letter;fresh base→200;authz 无 actor→403+非 member→403 deny;retirement pending=0+窗增量=0→canRetire;gate 关→400;deep-equal+replace 覆盖非 merge;delete→cascade;reorder→DomainOp)**+ C-4(rollback)。
+
+### 14.4 Gate5 finite short-poll 真模式(闭环,保持)
+
+- GET `/api/canvas/:id/events/poll?since=`(冻结 route)→ `{events, nextSince}` JSON,服务端自然结束,非 SSE;fallback=finite short-poll(非 SSE-fallback 循环)。失败树:调 proxy→finite short-poll→N2-2 blocked。5-12 真测。
+
+### 14.5 server-named 诚实化(保持)
+
+- 仅 `node-delete-cascade` 经 PG-T1~T3/T7 实证;`group-reparent`/`result-asset-attach` 类型+注释级 A2 需另测。S10-13 `EMPIRICALLY_PROVEN` 分级。
+
+### 14.6 两文档交叉契约(保持)
+
+- port CanvasChange ↔ N20 CreateBody/DomainOp 无损映射(X-1~X4);inventory §5 item 5 网关条件式 + §11 v7 收口。
+
+### 14.7 NOTES 保持(sol 第八轮版本,原文替换;v9 补 bundle 增量更新 + fail-visible 缺项禁借用 + pending>0 真测)
+
+- edit stale 永不 409,**同 fieldKeyOf-path stale 才 overwritten**(不同字段 stale 不误报;per-field writer map 通知该完整 path 前写者);BaseCursor 绑 scope+field-clock,业务层 opaque,codec 只在 adapter;create 唯一 POST /nodes/:nodeId;leaf-level 无白名单;by-id fail-visible deferred;legacy replace 只走可关闭可观测 drain 通道(stale base→409 terminal conflict dead-letter 非盲 replace;**existing 且 base≠rev→409;missing+base>0→409 dead-letter 非盲 create 复活已删 record;missing+base=0→create fresh;existing 且 base=rev→200 replace**);server-named 仅 cascade 实证;Gate5 失败树固定。
+- **canvas 级 `SnapshotCursor` = opaque bundle**(recordId→`BaseCursor` 映射 + canvas order cursor + event since cursor);多 record hydrate 后单 record 级 token 无法为任意 n1/n2 提供 If-Match → bundle 聚合;submitChange 按 change.recordId/op class 抽对应 wire base(edit/delete→record base;reorder→order base;catch-up→since base);port SnapshotCursor 仍 opaque(branded),adapter 构造/解包,port 不读内部(inventory §1 item2/§2.1/§2.2/§3 active 入口全写 bundle;§11.1/11.5 历史段标 [superseded by v8/v9])。
+- **bundle 增量更新(v9 Blocker)**:accepted/conflict 用 wire response 的 base/seq **增量更新** bundle(仅命中 record/order 项;未命中项值不变;**非整 bundle 全量重建**);submitFromBundle 真 adapter 路径(extractWireBase 结果真实传给 edit/delete/reorder/create,非直传 h.snapshot);spike S10-12 五路全跑(edit/delete/reorder/create/conflict)+ 增量铁证(新 bundle 未命中 record 保留旧 bundle 值非 recs 当前扫描)+ 未命中项值未动(.toStrictEqual)+ conflict 只更新对应 current base。
+- **baseline/target 分层**:§1.1 #194 行现状写回仓库真实(整 record REPLACE `backend.ts:1086-1088` / 裸 `Revision` `parseIfMatch` / stale→409 含 edit / 响应 `{id,revision}` 无 seq/base,`server/routes/canvas.ts:506-545` 实证);A2 目标态(field-level DomainOp + opaque BaseCursor + edit stale→200+overwritten + 响应扩 seq/base)分层到 §1.2 破坏面 + cutover 状态表,**不混写为现状**。
+- **retirement fake-clock quiet-window + fail-visible 缺项禁借用**:冻结配置名 `LEGACY_DRAIN_QUIET_WINDOW_MS` + 绝对时长 + 时间戳/重置语义(窗口内任一 envelope 到达即重新计时);只有完整连续窗口 delta=0(`envelopeIncrementInWindow===0` + `elapsed>=quietWindowMs`)且 pending gauge=0 才 retire;spike C-2 **v9 真测 pending>0 不 retire + drain/dead-letter 归零后仍须重新满完整 quiet-window**(v8 :65 假声称测了实为缺项,v9 补真断言);drainCount 只作累计总量(非 retirement 条件)。**fail-visible 缺项禁借用**:fail-visible 项(by-id deferred / server-named 仅 cascade 实证 / 网关条件式)须实证或显式标 deferred,**不许假声称已测**(v8 :65 教训:声称 "pending>0 不 retire" 测了但实测没有 → v9 补真;lead 独立核证必拆穿假声称)。
+
+---
 
 ---
 
@@ -27,7 +80,7 @@
 2. **Yjs 移植成本 = 拆已建成的写路径 + 双真相源调和**:N1 §3.1 实证 `revision ↔ Yjs` 双真相源背离;本 spike `antiYjs-坑5` 复现背离、`antiYjs-坑7` 复现 clear+rebuild 吞子字段(§9)。
 3. **跨介质/跨 doc 事务:Gate3 平局(R2-1)**:intra-doc/intra-DB 原子两案一致(G3-real-1 真 Yjs doc.transact / PG-T1~T3 同一 client 已验);**跨介质 Figma=saga 补偿非真原子、Yjs=无方案** — 非相对优势(原 v2 "Figma 占优"降为平局)。PG-T3 改名"同库资产元数据"(非跨介质)。
 4. **revoke 简单 + 可预测存储控制(非"存储更小"):Gate7 平局(R2-7)**:G7-hard-4 ★真测 Yjs 有 GC 时 bytes 更小(yjsWithGc=58B < figmaCompressed=8637B);G7-hard-1~3 降 ●/○(自建 server 无 Yjs 对照,原标 ★ 虚标)。Figma 真实优势 = revoke 简单(●/○ 设计推理,非 Yjs 对照实证)+ 可预测控制 — 非相对存储优势。
-5. **Figma 不依赖 WS 网关验证:Gate5 条件式 GO(R2-2)**:REST+SSE 走 plain HTTP(5-1~9 真验 live push+desiredSize backpressure+gateway-secret authz seam+post-revoke write 拒绝);网关 SSE buffering/超时 = ○条件式留 lead 生产实测(§12),非"无需验证";Yjs y-protocol 需双向 WS(网关 WS 放行亦条件式)。不影响 Figma 选型(SSE fallback 兜底)。
+5. **Figma 不依赖 WS 网关验证:Gate5 条件式 GO(R2-2)**:REST+SSE 走 plain HTTP(5-1~9 真验 live push+desiredSize backpressure+gateway-secret authz seam+post-revoke write 拒绝 + **v4 5-10~13 网关失败树**);网关 SSE buffering/超时 = ○条件式留 lead 生产实测(§12 + §14.4),非"无需验证";Yjs y-protocol 需双向 WS(网关 WS 放行亦条件式)。不影响 Figma 选型(**finite short-poll 兜底**,非 SSE-fallback 循环,§14.4)。
 
 | # | hard gate | 判决 | 证据强度 | v1→v3 变化 |
 |---|---|---|---|---|
@@ -60,10 +113,10 @@
 |---|---|---|---|
 | DocKernel | `src/kernel/docKernel.ts` | record 级 upsert + 三 Map + per-record revision | 服务端真相 + per-record revision LWW tie-break |
 | NodeRecord | `src/kernel/records.ts` | 40 canonical 字段 + revision;`text?` 整串叶子 | 字段扁平可映射 Y.Map —— 但映射≠采用 |
-| #194 API 契约 | `server/routes/canvas.ts:450-525` + `server/persist/backend.ts` | `PATCH /api/canvas/:id/nodes/:nodeId` → `upsertChild`;If-Match 严格(400/428/409);payload 对 server 不透明 | 服务端做主 + If-Match 乐观并发 + revision-conflict 409 |
+| #194 API 契约 | `server/routes/canvas.ts:450-525` + `server/persist/backend.ts` | `PATCH /api/canvas/:id/nodes/:nodeId` → `upsertChild`(**整 record REPLACE**,`backend.ts:1086-1088` `payload: clone(payload)` 非 field-level merge);If-Match = **裸 `Revision`(number)**(`parseIfMatch`→`revision:number`,非 opaque BaseCursor;400 malformed/428 missing);stale → **409**(edit stale 也 409,非 A2 的 200+overwritten);响应 `{id,revision}`(**无 seq/base**;`server/routes/canvas.ts:506-545` 实证);payload 对 server 不透明 | 服务端做主 + If-Match(bare revision)+ per-record revision LWW tie-break(**现状**);★ A2 目标态见 §1.2 破坏面 + cutover 状态表(field-level DomainOp + opaque BaseCursor 绑 scope+field-clock + edit stale→200+overwritten + 响应扩 seq/base;canvas 级 SnapshotCursor=opaque bundle) |
 | ServerPersistAdapter | `src/lib/serverPersistAdapter.ts` | upsertNode/reorderChildren/fetchCanvas | **仍未接线生产**(`unwiredServerPersistAdapter` 全 reject) |
 | SSO 身份 | `server/lib/owner.ts` | `x-mivo-auth-user` + `x-mivo-gateway-secret`(fail-closed) | HTTP-header-based 鉴权 |
-| shared 契约 | `shared/persist-contract.ts` | `NodePayload = Omit<NodeRecord,'id'|'revision'>`(payload 不携带 id/revision,envelope 唯一真相) | transport payload 不透明,防双真相 |
+| shared 契约 | `shared/persist-contract.ts` | `NodePayload = Omit<NodeRecord,'id'|'revision'>`(payload 不携带 id/revision,Envelope 列唯一真相) | transport payload 不透明,防双真相 |
 
 ### 1.2 破坏面 inventory(R2-6 逐文件清单 + cutover 拍死,▲lead 核证生产调用)
 
@@ -101,7 +154,7 @@ npm run test:unit -- src/lib/serverPersistAdapter.contract.test.ts server/persis
 **cutover 方案拍死(R2-6:选一个,说理由)**:**原子 cutover**(非 versioned endpoint)。理由:
 1. **无双协议窗口成立**:#194 `unwiredServerPersistAdapter` 前端未接线 → 原地演进,无新旧 endpoint 并存窗口 → 不付双 endpoint 王税。
 2. **单次部署切 schema**:部署带 feature flag(`FIELD_LEVEL_OPS=on`),切 field-level op schema;可切回整 record payload 回滚。
-3. **FX-5 队列一次性迁移**:旧 IDB queued body → 新 op schema 转换(migration on read);stale client(旧 body)打新 endpoint → 400 `payload-rejected` → 明确错误提示 refetch(非 409)。
+3. **FX-5 队列迁移(v5 Blocker 3:走 legacy 全量 record 兼容通道,非域 DomainOps)**:仓库事实——旧 `upsertChild` = 整 record **REPLACE**(`backend.ts:1086-1088` `payload: clone(payload)`,非 merge)。旧 IDB queued `WriteOp`(upsertNode/deleteNode/reorderChildren,writeRetryQueue:73-99)→ migration 走 **legacy 全量 record 兼容通道**(drain-only,whole-record replace 同 backend.ts;**不翻译为 DomainOps**——replace≠field-level,delta-inversion 无算法;**不发明 by-id/whole-lww DomainOp,不绕 by-id defer**);deleteNode→server-named cascade;reorderChildren→DomainOp reorder。payload = `NodePayload`(Omit<NodeRecord,'id'|'revision'>,**id 不在 payload**,id 来自 WriteOp.nodeId);缺失字段=移除(replace 覆盖,非 unset/merge)。stale client(旧 body)打新 endpoint → 400 `payload-rejected` → refetch(非 409)。
 4. **回滚策略**:feature flag 切回 `FIELD_LEVEL_OPS=off` → 整 record payload decoder;rollback 从 authoritative 全 record snapshot materialize 旧 shape body(非 delta 反演;delta-inversion 无算法/不支持,见下注 + spike C-4)。
 5. **不选 versioned endpoint 的理由**:方案 B(新增 `POST /nodes/:nodeId/ops` versioned + #194 冻结)付双 endpoint 税,但 #194 前端未接线 → 方案 B 无"不动 #194"收益,纯增成本。
 
@@ -112,9 +165,9 @@ npm run test:unit -- src/lib/serverPersistAdapter.contract.test.ts server/persis
 | 场景 | flag / 时机 | 客户端发 | 服务端行为 | 状态码 | 客户端动作 |
 |---|---|---|---|---|---|
 | old client(旧 body)→ 新 server | `FIELD_LEVEL_OPS=on`(cutover 后) | 整 record payload(旧 shape) | `validateChildPayload` 拒(非 `DomainOp` shape) | **400 `payload-rejected`** | refetch 全量 → 重发新 op(非 409 重放) |
-| old queue(FX-5 IDB 旧 queued body) | cutover 后 drain 队列 | 旧 queued `NodePayload` | migration-on-read:旧 body → 新 op schema 转换 | 200 ok(转换后) | 客户端无感(队列 drain 时转换) |
-| new server(新 op schema) | `FIELD_LEVEL_OPS=on` | `DomainOp` / `DomainOp[]` | field-level merge + bump revision/seq | 200 `{id,revision,seq}` | 正常 |
-| new op + stale base(并发不同字段) | 运行时 | `DomainOp`(base 落后) | LWW 后写 wins + `overwritten` 推前写者(G4-4 不拒写) | 200 + overwritten(非 409) | 前写者收 overwritten → 可选 `restore` |
+| old queue(FX-5 IDB 旧 queued `WriteOp`:upsertNode/deleteNode/reorderChildren) | cutover 后 drain 队列(LEGACY_DRAIN gate on) | **LegacyReplaceRequest 信封**(`{kind:'legacy-replace',canvasId,nodeId,version,payload,baseRevision}`;绑 canvasId+nodeId+原队列 baseRevision;非 DomainOp 非 raw body) | **decoder wire**:scope 校验(env.canvasId+nodeId 匹配 path,防同 nodeId 跨 canvas 重放)+ 真实 canvas-write authz(非 member→403 deny,无 void actor)+ stale base→409 dead-letter:**existing 且 base≠rev→409 terminal conflict 非盲 replace**(数据破坏防;queue 项 dead-letter 用户可见);**missing+base>0→409 dead-letter(防盲 create 复活已删 record)**;fresh(**existing 且 base=rev** 或 **missing+base=0→create**)→whole-record replace 同 backend.ts:1086-1088 + drainCount 累计 + envelopeIncrementInWindow 窗增量 + pendingLegacyQueue-- | fresh(existing+base=rev / missing+base=0→create)→200 replace;stale(existing+base≠rev / missing+base>0)→409 dead-letter | 客户端无感(fresh drain);stale→dead-letter 用户可见(refetch+resubmit)。**受控迁移协议例外**(非双协议窗口:drain-only 临时信封,retirement 后消失,主写唯一 DomainOp) |
+| new server(新 op schema) | `FIELD_LEVEL_OPS=on` | `DomainOp` / `DomainOp[]` | field-level merge + bump revision/seq + per-field clock(fieldKeyOf 完整 path) | 200 `{id,revision,seq,base}`(签发新 BaseCursor) | 正常 |
+| new op + stale base(并发不同字段) | 运行时 | `DomainOp`(base 落后) | LWW 后写 wins + **同-field(fieldKeyOf 完整 path)stale 才 overwritten**;per-field writer map 通知该完整 path 前写者(不同字段 stale 不误报) | 200 + overwritten(非 409;同-field 才发) | 前写者收 overwritten → 可选 `restore` |
 | rollback(flag off) | `FIELD_LEVEL_OPS=off` | flag off 切回整 record decoder | 从 **authoritative 全 record snapshot materialize 旧 body**(非 delta 反演;见下注) | 200(旧 shape) | snapshot materialize 旧 body → PATCH 200 |
 
 > **R5 F4 rollback 降级**:原表称 "新 op → 旧 body 反向转换,无丢失"。`DomainOp` 是 delta(fragment),无 authoritative snapshot 无法无损反演完整旧 `NodePayload` — 原承诺无证据(无算法/无 probe)。**降级为 snapshot materialize**:rollback 从 authoritative 全 record snapshot 直接 materialize 旧 shape body(源头是全 record 非 delta,可证明无丢失)。delta-inversion(从单个 delta 反演完整旧 body)显式**无算法/不支持**(降级到已测范围)。spike C-4 验:`materializeLegacyBody` 从 authoritative snapshot 直出旧 body,flag-off PATCH 200。
@@ -202,14 +255,14 @@ npm run test:unit -- src/lib/serverPersistAdapter.contract.test.ts server/persis
 | 维度 | 方案 A(受控修订 #194) | 方案 B(严格 endpoint + versioned ops) |
 |---|---|---|
 | wire 演进 | 原地演进 `PATCH /nodes/:nodeId` payload:整 record → field-level ops | 新增 `POST /nodes/:nodeId/ops`(versioned);#194 冻结 |
-| envelope | If-Match 400/428/409 不变(`G4-3` 428) | 双 endpoint 并存 |
+| envelope | **v4 Blocker 1**:If-Match 必填(428)+ 格式校验(400)+ opaque BaseCursor 单一 wire;**409 仅 create/delete/reorder race**(edit stale 永远 200,G4-4);非"409 envelope 不变"歧义 | 双 endpoint 并存 |
 | revision 语义 | per-record,每 accepted op bump,**只供 snapshot/catch-up,不参与 LWW 拒写**(`G4-4`) | 同 |
 | 生产破坏面 | **前端未接线但契约/服务端破坏面非零**(§1.2:≥12 文件 + FX-5 队列迁移 + 118 项回归) | 不动 #194,新 endpoint 独立上线 |
 | 迁移窗口 | 无双协议窗口(原地演进) | 双 endpoint 并存窗口 + 客户端分叉 |
 
 **证据**:`G4-1`(不同字段双留)、`G4-2`(嵌套叶子双留)、`G4-3`(428)、`G4-4`(base 落后不同字段→接受);▲lead 核证 #194 route 注册 + shared contract 冻结 + FX-5 payload(§1.2)。
 
-**成本**:方案 A 改 `validateChildPayload` + `upsertChild`(field-level merge)+ 契约测试 + **FX-5 队列迁移**(旧 body→新 op schema)+ cutover 策略(**原子 cutover**,§1.2 拍死,非 versioned payload)。方案 B 付双 endpoint 税。
+**成本**:方案 A 改 `validateChildPayload` + `upsertChild`(field-level merge)+ 契约测试 + **FX-5 队列迁移**(走 LegacyReplaceRequest 兼容通道,非 DomainOps 翻译)+ cutover 策略(**原子 cutover**,§1.2 拍死,非 versioned payload)。方案 B 付双 endpoint 税。
 
 **go/no-go**:**方案 A GO**。理由:#194 前端主路径未接线(`unwiredServerPersistAdapter`),**无双协议窗口**成立;方案 B 的"不动 #194"优势在 #194 已上线生产时才成立,目前 #194 前端未接线——方案 B 付双 endpoint 税却无收益。但**破坏面非零**,cutover 已拍死**原子**(§1.2,非 versioned payload/无双 decoder 兼容窗)。方案 A 直接产出 N2-1 契约(§10)。
 
@@ -230,17 +283,17 @@ npm run test:unit -- src/lib/serverPersistAdapter.contract.test.ts server/persis
 | 维度 | Figma 式 | Yjs |
 |---|---|---|
 | 主通道 | REST PATCH(#194)+ SSE 广播(真实 5-1~6) | y-protocol 双向 WS |
-| 网关 WS 不放行时 | SSE fallback 仍可用(plain HTTP) | 需 polling fallback,失 CRDT 实时价值 |
+| 网关 WS 不放行时 | SSE 仍可用(plain HTTP);SSE 亦降级时 finite short-poll 兜底(§14.4) | 需 polling fallback,失 CRDT 实时价值 |
 | auth 复用 | 复用 #194 SSO header 链(SSE 同链) | WS handshake 需网关注入(未验证) |
 
-**go/no-go**:**条件式 GO(R2-2)**。Figma 式 REST+SSE:5-1~9 真实验证(**live push 5-7 + desiredSize backpressure 5-6 + R3 F3 真实 resolveActor/canAccessCanvas authz seam 5-5(404 no-leak,替代 fake secret)+ slow-reader response body 恢复 5-8 + R5 F3 post-revoke write 拒绝 5-9(真实 seam PATCH write route:bob 撤权 → 404 no-leak + owner 200)**,复用 owner.ts fail-closed 模式;非 v2 直信 x-mivo-auth-user)。**网关 gate 条件式**:网关对 `text/event-stream` buffering/超时 = ○条件式留 lead 生产实测(非"任何网关必透传"——生产网关可能缓冲);不影响 Figma 选型(SSE fallback 兜底),只影响实时性调优。Yjs 依赖 WS 网关放行(亦条件式未验证)。
+**go/no-go**:**条件式 GO(R2-2)**。Figma 式 REST+SSE:5-1~13 真实验证(**live push 5-7 + desiredSize backpressure 5-6 + R3 F3 真实 resolveActor/canAccessCanvas authz seam 5-5(404 no-leak,替代 fake secret)+ slow-reader response body 恢复 5-8 + R5 F3 post-revoke write 拒绝 5-9(真实 seam PATCH write route:bob 撤权 → 404 no-leak + owner 200)**,复用 owner.ts fail-closed 模式;非 v2 直信 x-mivo-auth-user)。**网关 gate 条件式 + v7 失败树**:网关对 `text/event-stream` buffering/超时 = ○条件式留 lead 生产实测(非"任何网关必透传"——生产网关可能缓冲);**v7 Gate5 失败树(§14.4)**:首帧延迟超 SLO / header strip → 调 proxy buffering/read-timeout/flush 复测 → 仍失败 → **finite short-poll** `GET /events/poll?since=`(SLO 500ms,5-12)或判 N2-2 blocked。**非 "SSE 失败由 SSE fallback" 循环**(fallback = finite short-poll,5-13)。不影响 Figma 选型(finite short-poll 兜底),只影响实时性调优。Yjs 依赖 WS 网关放行(亦条件式未验证)。
 
-**未验证项(○条件式,留 lead 生产实测,§12)**:
-1. 生产 SSO 网关是否代理 WS upgrade + 注入 `x-mivo-auth-user`/`x-mivo-gateway-secret`(条件式:做到→N2-2 上 WS 优化;做不到→SSE 兜底,**Figma 选型不变**)。
-2. SSE 长连接在网关的超时/缓冲策略(5-2 heartbeat 已实现,但生产网关缓冲未测;条件式:必要时加心跳)。
+**未验证项(○条件式,留 lead 生产实测,§12 + §14.4 失败树)**:
+1. 生产 SSO 网关是否代理 WS upgrade + 注入 `x-mivo-auth-user`/`x-mivo-gateway-secret`(条件式:做到→N2-2 上 WS 优化;做不到→SSE/short-poll 兜底,**Figma 选型不变**)。
+2. SSE 长连接在网关的超时/缓冲/首帧延迟/header strip(5-2 heartbeat 已实现;**v6 失败树 §14.4**:首帧超 SLO 200ms / header strip → 调 proxy buffering/read-timeout/flush 复测 → 仍失败 → finite short-poll `GET /events/poll?since=` SLO 500ms 或判 N2-2 blocked)。
 3. 网关对 `text/event-stream` 的 streaming 行为。
 
-→ **这些不标"无需验证",标"条件式":Figma 式有 SSE fallback 兜底不影响选型;只影响 N2-2 是否上 WS 优化。**
+→ **这些不标"无需验证",标"条件式":Figma 式有 finite short-poll 兜底不影响选型(§14.4 失败树);只影响 N2-2 是否上 WS 优化。**
 
 ### Gate 6 · 迁移 / 双协议窗口 — P1-6 诚实化
 
@@ -314,7 +367,7 @@ npm run test:unit -- src/lib/serverPersistAdapter.contract.test.ts server/persis
 | §10 per-field clock 留 N2-1(自相矛盾) | 持久形态定死 PG `field_clock` 表(PG-T5 真测:write→destroy pool→重连读回;S10-4 演示逻辑) | `S10-4`+`PG-T5`(●) |
 | §10 batch 无原子性 | batch 预检 + 全 ok 或全 reject(无 partial);跨 record 单事务 PG-T7 真测 | `S10-5`+`PG-T7`(●) |
 | §10 FieldPath 允许空 / 无防原型污染 | 非空 tuple + 拒 __proto__/prototype/constructor(对齐 G1-b R2-P1-1) | `S10-1/S10-6`(●) |
-| §10 数组无中性 intent | by-stable-id insert/remove/splice(对齐 G1-b R2-P1-1) | `S10-7`(●) |
+| §10 数组无中性 intent | by-id insert/remove/splice **[superseded, non-normative]**(A2 deferred;DomainOp 不含 by-id;见 S10-7/S10-14) | `S10-7`(●,[superseded]) |
 | §10 create→edit 无因果 | 同 record FIFO(pending create ack 前 hold edit,对齐 G1-b R2-P1-2) | `S10-8`(●) |
 | §10 DELETE 无 cursor/404 边界 | accepted 必携 seq;幂等已删返 cursor;404→rejected(对齐 G1-b R2-P1-3) | `S10-9`(●) |
 | v2 Gate3 "Figma 占优(跨介质边界)" | v3 **平局**(R2-1):intra 原子两案一致;跨介质 Figma=saga 非真原子、Yjs=无方案;PG-T3 改名同库资产元数据;PG-T 同一 client(pool.connect+finally release) | `PG-T1~T3`(●同 client)+ `G3-real-1`(★) |
@@ -330,9 +383,9 @@ npm run test:unit -- src/lib/serverPersistAdapter.contract.test.ts server/persis
 
 ---
 
-## 4-9. PoC 清单与实跑结果(65 tests 全绿)
+## 4-9. PoC 清单与实跑结果(75 tests 全绿)
 
-**文件**:`src/kernel/__spike__/n20-truth-source.spike.test.ts`(48)+ `server/__tests__/n20-sse-route.spike.test.ts`(9)+ `server/__tests__/n20-pg-tx-fault.spike.test.ts`(8)。
+**文件**:`src/kernel/__spike__/n20-truth-source.spike.test.ts`(54)+ `server/__tests__/n20-sse-route.spike.test.ts`(13)+ `server/__tests__/n20-pg-tx-fault.spike.test.ts`(8)。
 
 ### 4.1 原 PoC(15 tests,v1 已有)
 
@@ -373,7 +426,7 @@ npm run test:unit -- src/lib/serverPersistAdapter.contract.test.ts server/persis
 | G7-hard-4 bytes 对比(Yjs 有 GC 更小) | P2-7 | 7 | `figmaCompressed<figmaRaw && yjsNoGc>yjsWithGc` | ★ |
 | S10-1 setByPath 拒原型污染 | P1-3 | §10 | `toThrow(/forbidden path segment/)` | ● |
 | S10-2 三层信任边界 trustify | P1-3 | §10 | `actor==='alice' && recordId==='n1' && base===0`(不信 body) | ● |
-| S10-3 typed domain op union | P1-3 | §10 | set/unset/array/reorder/strict-tx 可区分;**create 独立 CreateBody+trustifyCreate(非 DomainOp,R5 F1)** | ● |
+| S10-3 typed domain op union | P1-3 | §10 | set/unset/array/reorder 可区分;**v4:strict-tx 已剔出 DomainOp**(改 server-named ServerInvariantCommand,S10-13);**create 独立 CreateBody+trustifyCreate(client-id,非 server-mint)** | ● |
 | S10-4 per-field clock 持久形态 | P1-3 | §10 | clock 逻辑(内存演示)+ **PG-T5 真持久**(write→destroy pool→重连读回,clock 仍在) | ● |
 | S10-5 batch 原子性 | P1-3 | §10 | batch 逻辑(单 record)+ **PG-T7 跨 record**(BEGIN 两 record+fault+ROLLBACK 两 record 均不变) | ● |
 
@@ -386,11 +439,11 @@ npm run test:unit -- src/lib/serverPersistAdapter.contract.test.ts server/persis
 | T1-3 不同字段并发无 overwritten | P1-4 | 1 | `inbox.length===0` | ● |
 | T1-4 对照 A 方案 409 语义差异(B 与 G4-4 自洽) | P1-4 | 1 | `同字段也 200(不 409)` | ● |
 | S10-6 FieldPath 非空 tuple | P2-8 | §10 | `toThrow(/empty fieldPath/)` | ● |
-| S10-7 数组中性 intent by-stable-id | P2-8 | §10 | `insert/remove/splice 用 id 非 index` | ● |
+| S10-7 数组 intent **[superseded, non-normative]** | P2-8 | §10 | `by-id insert/remove/splice **A2 deferred**(DomainOp 不含 by-id;active 仅 whole-lww/primitive;见 S10-14)` | ●,[superseded] |
 | S10-8 create→edit 因果 FIFO | P2-8 | §10 | `order==['create:init','edit:edited']` | ● |
 | S10-9 DELETE cursor/404 边界 | P2-8 | §10 | `成功+幂等返 seq;从未存在→not-found` | ● |
 
-### 4.4 真实 SSE route 集成(9 tests:5-1~6 R2 + 5-7 R2-2 live push + **5-8 R3 F3 slow-reader 恢复** + **5-9 R5 F3 post-revoke write 拒绝**;5-5 R3 F3 改真实 authz seam)
+### 4.4 真实 SSE route 集成(13 tests:5-1~9 R2/R2-2/R3 F3/R5 F3 live push+desiredSize backpressure+authz seam+slow-reader 恢复+post-revoke write 拒绝 + **v4:5-10~13 网关失败树 first-frame/header-strip/short-poll fallback SLO**;5-5 R3 F3 改真实 authz seam)
 
 见 Gate5 §2(5-1 content-type/framing、5-2 heartbeat、5-3 since 补拉、5-4 revoke 断流、5-5 authz **404 no-leak**(R3 F3 真实 seam,原 403 系 fake secret)、5-6 slow consumer 有界 + response body 实收(R3 F3);5-7 live push、5-8 slow-reader 恢复、5-9 post-revoke write 拒绝见 §4.6)。强度 ●。
 
@@ -403,90 +456,110 @@ npm run test:unit -- src/lib/serverPersistAdapter.contract.test.ts server/persis
 | PoC | finding | gate | 断言 | 强度 |
 |---|---|---|---|---|
 | T1-5 restore 走 overwrite 管线全链(A写→B写→A restore→B收 notice→B后续写→A收 notice) | R2-5 | 1 | `overwrittenTo==='bob' && aliceInbox.length===2 && bobInbox.length===1`(lastWriter 链不断) | ● |
-| S10-10 immutable/atomic leaf 表 | R2-3 | §10 | `immutable 字段 set→throw;atomic-container 整值替换(allowContainerClobber);其余 leaf set ok` | ● |
+| S10-10 immutable/leaf 字段表 | R2-3 | §10 | `immutable 字段 set→throw;container(transform/relations)整对象 set 拒(leaf-level,无 atomic-container 白名单);其余 leaf set ok`(v6 删 atomic-container) | ● |
 | S10-11 idempotent replay | R2-3 | §10 | replay 逻辑(内存 Map)+ **R5 F2:PG-T6 真实领域 replay**(单事务写 record+seq+event+idem row → destroy pool → 重连 replay 同 key 不二次 bump revision/seq/event)+ **PG-T6b fault/rollback**(领域写+idem row 同事务原子) | ● |
 | 5-7 SSE live push(建连后 push→response body 实收) | R2-2 | 5 | `chunks 含 'live-value' && op.value==='live-value'`(非建连前 replay) | ● |
 | 5-8 slow-reader 恢复(R3 F3) | R3 F3 | 5 | `resumedMax-resumedMin+1 > resumed.length`(response body 观察 seq gap)+ `?since=0 补拉 seq 1..51 全 51 无缺口` | ● |
 | 5-9 post-revoke write 拒绝(R5 F3) | R5 F3 | 5 | bob 撤权后 SSE `event: revoke`/close + bob PATCH write 返真实 `404 unknown-canvas` no-leak(非 401/403)+ owner alice write `200`(真实 seam:resolveActor+canAccessCanvas('write')+denyStatus) | ● |
 
-**实跑汇总**:`65 pass / 0 skip / 0 fail`(spike 48 + SSE 9 + PG 8,本地 PG port 55443 实跑 MIVO_PG_TEST=1,PG-T1~T7(含 T6b) 同一 client 真 pass;PG-T5/T6/T6b/T7 真 PG 持久/跨 record/真实 replay;SSE 5-8 slow-reader 恢复 + 5-9 post-revoke write 拒绝)。`tsc -b` 0 errors;`eslint` 干净;`npm run build` exit 0;`grep -roE 'yjs|lib0|YEvent|applyUpdate|AbstractType|encodeStateAsUpdate' dist/` 零命中(yjs 不进生产 bundle)。
+**实跑汇总**:`75 pass / 0 skip / 0 fail`(spike 54 + SSE 13 + PG 8,本地 PG port 55443 实跑 MIVO_PG_TEST=1,PG-T1~T7(含 T6b) 同一 client 真 pass;PG-T5/T6/T6b/T7 真 PG 持久/跨 record/真实 replay;SSE 5-8 slow-reader 恢复 + 5-9 post-revoke write 拒绝)。`tsc -b` 0 errors;`eslint` 干净;`npm run build` exit 0;`grep -roE 'yjs|lib0|YEvent|applyUpdate|AbstractType|encodeStateAsUpdate' dist/` 零命中(yjs 不进生产 bundle)。
 
 ---
 
 ## 10. G1-c / N2-1 唯一契约草案 v2(对齐 G1-b R2)
 
-> 依据:gate 4 方案 A + gate 5 REST+SSE + gate 7 seq/补拉/压缩/revoke + **G1-b R2 三 finding 对齐**(FieldPath 非空 tuple / 数组 by-stable-id / create→edit 因果 / DELETE cursor)。**唯一契约——选 Yjs 则替换为 Y.Doc 通道,但本决策已否决 Yjs。**
+> 依据:gate 4 方案 A + gate 5 REST+SSE + gate 7 seq/补拉/压缩/revoke + **G1-b R4 finding 对齐**(FieldPath 非空 tuple / 数组 by-id **A2 deferred**(DomainOp 不含 by-id) / create→edit 因果 / DELETE cursor / classifier 必填)。**唯一契约——选 Yjs 则替换为 Y.Doc 通道,但本决策已否决 Yjs。**
 
 ### 10.1 op schema(field-level,走 #194 PATCH envelope;v2 对齐 G1-b R2;**R5 F1:create 独立 endpoint,非 PATCH DomainOp**)
 
 ```ts
-// DomainOp = 中性 delta(transport-neutral):set/unset/array/reorder/strict-tx 无 recordId/actor/base/opId
+// DomainOp = 中性 delta(transport-neutral):set/unset/array(whole-lww/primitive)/reorder 无 recordId/actor/base/opId
 //   (recordId ← URL path;actor ← resolveActor;base ← If-Match;opId ← idempotency-key header,全 adapter 注入)。
-//   ★ R5 F1:create 已从 PATCH DomainOp 剔除 — create 走独立 POST endpoint(见 CreateBody),非 PATCH member;
-//     杜绝"同一 PATCH wire 同时有 trusted ctx.recordId(path)与不可信 domain.recordId(body)双 record 权威"。
-type FieldPath = readonly [string | number, ...(string | number)[]]  // 非空 tuple(G1-b R2-P1-1,S10-6 运行时拒空)
+//   ★ v4 Blocker 2:create 已从 PATCH DomainOp 剔除,走独立 POST endpoint(CreateBody);create id = client NodeRecord.id(非 server-mint,废除 R5 F1 server-mint)。
+//   ★ v4 Blocker 3:strict-tx 已剔出 DomainOp(假跨 record tx 无 target)→ 跨 record 改 server-named ServerInvariantCommand(由 path/method 推导目标)。
+type FieldPath = readonly [string | number, ...(string | number)[]]  // 非空 tuple(G1-b R4-P1-1,S10-6 运行时拒空)
 
-type DomainOp =
-  | { kind: 'set'; fieldPath: FieldPath; value: unknown }                                   // 无 recordId(path 注入)
+// ★ v5 Blocker 1:base.clock 单一 wire = opaque BaseCursor string(真 codec + 签名,非 type-cast)。
+//   生命周期:accepted {id,revision,seq,base} 响应签发 + hydrate snapshot 签发;client 回传 If-Match;conflict 返 current base;malformed/unsigned→400。
+type BaseCursor = string & { readonly __brand: 'BaseCursor' }
+const encodeBase = (rev: number, cv?: number): BaseCursor => { /* adapter codec:rev→signed opaque token */ } // 签发 from accepted/snapshot
+const decodeBase = (token: BaseCursor|string|undefined): { rev: number; cv?: number } | null => { /* adapter codec:验签→{rev,cv}|null(malformed/unsigned/tampered→null→400) */ }
+
+type DomainOp =  // ★ v5:仅单 record LWW delta(set/unset/whole-lww/primitive/reorder);无 strict-tx(改 server-named);无 by-id(A2 deferred,fail-visible)
+  | { kind: 'set'; fieldPath: FieldPath; value: unknown }                                   // 无 recordId(path 注入);leaf-level set(container set 拒,白名单取消)
   | { kind: 'unset'; fieldPath: FieldPath }                                                 // 无 recordId
-  | { kind: 'array'; fieldPath: FieldPath; class: 'by-id'; intent: 'insert'; afterId: string|null; value: {id:string} }  // ① by-stable-id(fills/strokes/effects)
-  | { kind: 'array'; fieldPath: FieldPath; class: 'by-id'; intent: 'remove'; removeId: string }
-  | { kind: 'array'; fieldPath: FieldPath; class: 'by-id'; intent: 'splice'; afterId: string; removeCount: number; values: {id:string}[] }
-  | { kind: 'array'; fieldPath: FieldPath; class: 'whole-lww'; intent: 'replace'; value: unknown[] }  // ② 无 stable-id(markupPoints)整值 LWW
-  | { kind: 'array'; fieldPath: FieldPath; class: 'primitive'; intent: 'insert'|'remove'; value: string }  // ③ primitive(resultNodeIds)by value
+  | { kind: 'array'; fieldPath: FieldPath; class: 'whole-lww'; intent: 'replace'; value: unknown[] }  // ② markupPoints(无 stable-id,A2 supported)
+  | { kind: 'array'; fieldPath: FieldPath; class: 'primitive'; intent: 'insert'|'remove'; value: string }  // ③ resultNodeIds(无 stable-id,A2 supported)
   | { kind: 'reorder'; orderedIds: string[] }                                              // parentId 从 path 注入
-  | { kind: 'strict-tx'; ops: DomainOp[] }                                                 // 严格事务路径(跨 record 原子,§10.4);ops 无 create
+  // ★ v5 by-id variant 不在 DomainOp(by-id A2 deferred,fail-visible,禁降级整数组 LWW;fills/strokes/effects/experimentalAnchors migration 走 legacy 兼容通道,见 §10.2/§14.3)
+
+// ★ v5 Blocker 3:server-named invariant command(跨 record 原子,非 PATCH DomainOp;由 path/method 推导目标,per-target 鉴权)
+//   ★ 诚实化(server-named 诚实化段):仅 node-delete-cascade 经 PG-T1~T3/T7 实证;group-reparent/result-asset-attach 类型+注释级 A2 需另测。
+type ServerInvariantCommand =
+  | { kind: 'node-delete-cascade'; canvasId: string; nodeId: string }                      // ★ 实证(PG-T1~T3/T7):node+edges+asset ref 同 tx 原子 + 跨 record 回滚
+  | { kind: 'group-reparent'; canvasId: string; nodeIds: string[]; targetGroupId: string|null }  // 类型+注释级(A2 需另测)
+  | { kind: 'result-asset-attach'; canvasId: string; anchorId: string; assetId: string; resultNodeId: string }  // 类型+注释级(A2 需另测)
 ```
 
-**三层信任边界(R5 F1:对齐 spike S10-2/S10-3 权威类型,PATCH body 任意 variant 含 strict-tx 嵌套零 privileged;create 独立 endpoint)**:
+**三层信任边界(v5:PATCH body 零 privileged;base=opaque BaseCursor string codec;create client-id;by-id deferred;container 白名单取消)**:
 ```ts
-// 客户端 PATCH payload(不可信):零 privileged 载体 — 无 opId/actor/recordId/baseRevision(全 adapter 注入)
+// 客户端 PATCH payload(不可信):零 privileged 载体 — 无 opId/actor/recordId/base(全 adapter 注入)
 type ClientFieldOp = { clientId: string; domain: DomainOp }
-// 服务端 trusted(actor ← resolveActor(authz);recordId ← URL path;base ← If-Match;opId ← idempotency-key header 单一权威载体)
-type TrustedCtx = { opId: string; clientId: string; actor: string; recordId: string; baseRevision: Revision }
+// 服务端 trusted:actor ← resolveActor(authz);recordId ← URL path;opId ← idempotency-key header;
+//   base ← If-Match(opaque BaseCursor string,adapter decodeBase 验签;v5 Blocker 1 单一 wire + 完整生命周期)
+type TrustedCtx = { opId: string; clientId: string; actor: string; recordId: string; base: BaseCursor }
 type WireOp = TrustedCtx & { domain: DomainOp }
-// trustify:ClientFieldOp.domain + TrustedCtx → WireOp(PATCH body 无 privileged 字段可伪造,S10-2 类型级断言全 variant)
 const trustify = (client: ClientFieldOp, ctx: TrustedCtx): WireOp => ({ ...ctx, domain: client.domain })
 
-// ── R5 F1:create 独立契约(POST /api/canvas/:id/nodes,非 PATCH DomainOp)──
-// CreateBody 零 privileged:无 recordId(server 分配/idempotency-key 派生,非 body)/actor/base/opId。
-//   id 唯一来源 = trusted endpoint ctx(server-minted),非 body 可伪造字段 — 杜绝双 record 权威。
-type CreateBody = { clientId: string; type: 'node'|'edge'|'anchor'; payload: unknown }
-type CreateWire = { opId: string; clientId: string; actor: string; recordId: string; type: 'node'|'edge'|'anchor'; payload: unknown }
+// ── v5 Blocker 2:create client-supplied id(废除 server-mint,对齐 G1-b R4 + canvasSyncPort create-node)──
+//   adapter 从 NodeRecord.id 提取 → create URL path(:nodeId);body = CreateBody 零 privileged(payload=NodePayload)。
+//   server 信 path id,做 format/uniqueness/permission 校验;id 唯一来源 = client NodeRecord.id(非 server-mint)。
+//   ★ v5:container 白名单 ['transform','relations'] 取消(lead 裁定 rejected):transform/relations 内部字段有独立并发语义,
+//     整对象 LWW 吞 sibling 更新;A2 维持叶子级 set(整对象 set 拒,须分解 transform.x 叶子 set)。无 'atomic-container'(FieldTarget 清理)。
+type RecordKind = 'node'|'edge'|'anchor'
+type FieldTarget = 'leaf'|'container'|'array-element'  // v5:无 'atomic-container'(白名单取消)
+type RecordKindSchema = { kind: RecordKind; classifyField: (fieldPath: FieldPath) => FieldTarget }  // G1-b R4 必填(安全入口,A2 实装前提)
+type CreateBody = { clientId: string; type: RecordKind; payload: unknown }  // 零 recordId(id 来自 path:client NodeRecord.id)
+type CreateWire = { opId: string; clientId: string; actor: string; recordId: string; type: RecordKind; payload: unknown }
 const trustifyCreate = (client: CreateBody, ctx: TrustedCtx): CreateWire =>
   ({ opId: ctx.opId, clientId: ctx.clientId, actor: ctx.actor, recordId: ctx.recordId, type: client.type, payload: client.payload })
-// S10-2 类型级 gate(tsc -b 强制):DomainOp['kind'] 不含 'create';CreateBody keyof 无 recordId;
-//   全 array variant keyof 无 recordId/actor/base/opId;create 塞回 DomainOp / 嵌套进 strict-tx.ops → @ts-expect-error 失效 → build fail。
+// S10-2 类型级 gate(tsc -b 强制):DomainOp['kind'] 不含 'create'/'strict-tx'/'by-id';CreateBody keyof 无 recordId;base 非 bare number;真 codec round-trip。
+//   base 非 bare number(@ts-expect-error);create/strict-tx 塞回 DomainOp → @ts-expect-error 失效 → build fail。
 ```
 
-### 10.2 wire(#194 envelope 不变,payload 演进;cutover 策略见 §1.2;**R5 F1:create 独立 endpoint**)
+### 10.2 wire(**v5:base.clock opaque BaseCursor string codec + 完整生命周期;create client-id path;base-driven 409 矩阵;FX-5 走 legacy 兼容通道**)
 
-- `PATCH /api/canvas/:id/nodes/:nodeId` — payload = `DomainOp` 或 `DomainOp[]`(batch 同 record,**原子:全 ok 或全 reject**,S10-5)。**R5 F1:DomainOp 不含 create**(create 走独立 POST,见下)→ PATCH body 任意 variant 零 privileged recordId,recordId 仅来自 trusted path ctx(无双 record 权威)。
-- `POST /api/canvas/:id/nodes` — **R5 F1 独立 create endpoint**:body = `CreateBody`(零 recordId;server 分配/idempotency-key 派生 id),经 `trustifyCreate` 注入 server-minted recordId 到 trusted ctx(非 body 可伪造)。不与 PATCH DomainOp 共 wire。
-- If-Match: `baseRevision`(400/428/409 复用 #194 `parseIfMatch`;create endpoint 无 :nodeId path,recordId 由 server 注入,baseRevision 为 create 时的 canvas base)。
-- 响应:`{ id, revision, seq }`(`UpsertResponse` 扩 `seq`;打破 exact type test,契约测试重写)。
-- **cutover**:**原子 cutover**(§1.2 拍死;非 versioned payload,无双 decoder 兼容窗)+ FX-5 队列 migration-on-read + stale client 旧 body → 400 `payload-rejected`(见 §1.2 cutover 状态表)。create endpoint 随 PATCH 一同 cutover(同 feature flag)。
+- `PATCH /api/canvas/:id/nodes/:nodeId` — payload = `DomainOp` 或 `DomainOp[]`(batch 同 record,**原子:全 ok 或全 reject**,S10-5)。**v5:DomainOp 不含 create/strict-tx/by-id**(by-id A2 deferred)→ PATCH body 任意 variant 零 privileged recordId,recordId 仅来自 trusted path ctx。
+- `POST /api/canvas/:id/nodes/:nodeId` — **v5 create endpoint(client-id path)**:`:nodeId` = client `NodeRecord.id`(adapter 提取进 path);body = `CreateBody`(零 recordId;payload = `NodePayload`)。server 信 path id,做 format/uniqueness/permission 校验。**废除 server-mint**。经 `trustifyCreate` 注入 trusted ctx。不与 PATCH DomainOp 共 wire。
+- **If-Match = `base`(opaque BaseCursor string,真 codec+签名)**:**生命周期**:accepted `{id,revision,seq,base}` 响应签发 base + hydrate snapshot 签发;client 回传 If-Match;server `decodeBase` 验签;malformed/unsigned→400;**conflict 响应返 current base 供 re-fetch**。**必填(428 missing)**。**base-driven 409 矩阵(§14.1)**:edit stale→**永远 200+overwritten**(G4-4,非 409);**delete/reorder fresh base→200**,并发 race(stale base / orderedIds≠live)→409;create dup→409;malformed→400;legacy flag-off old body→400 payload-rejected(非 409,C-1)。
+- 响应:`{ id, revision, seq, base }`(`UpsertResponse` 扩 `seq` + `base` BaseCursor;打破 exact type test,契约测试重写)。
+- **cutover**:**原子 cutover**(§1.2 拍死)+ **FX-5 走 legacy 全量 record 兼容通道**(旧 upsert=replace,backend.ts:1086-188;不可翻译为 DomainOps → drain-only whole-record replace 同 backend.ts;不发明 by-id/whole-lww DomainOp,不绕 by-id defer;见 §14.3/C-2)+ stale client 旧 body → 400 `payload-rejected`(见 §1.2 状态表)。create endpoint 随 PATCH 一同 cutover。
 
 ### 10.3 服务端合并(field-level LWW,非整 record 替换)
 
-- `upsertChild` 演进:`validateChildPayload` 改 field-level op schema 校验(逐 fieldPath 白名单,拒 unknown,拒空路径 S10-6,拒原型污染 S10-1);merge = 按 `fieldPath` set 叶子(`setByPath` 硬化),**永不 `clear` 整 record**(N1 坑7)。
-- revision:每 accepted op bump(per-record);**只供 snapshot/catch-up + legacy cache 校验,不参与 LWW 拒写**(G4-4)。
+- `upsertChild` 演进:`validateChildPayload` 改 field-level op schema 校验(逐 fieldPath 白名单 + **RecordKindSchema classifier 必填,G1-b R4**;拒 unknown,拒空路径 S10-6,拒原型污染 S10-1);merge = 按 `fieldPath` set 叶子(`setByPath` 硬化),**永不 `clear` 整 record**(N1 坑7)。
+- revision:每 accepted op bump(per-record);**只供 snapshot/catch-up + legacy cache 校验,不参与 LWW 拒写(G4-4,edit stale 永远 200 非 409,见 §14.1 冻结矩阵)**。
 - 同 `fieldPath` 并发:server seq LWW(后者 wins,整串;gate 1 文本 gate 接受)+ **overwritten 事件推前写者**(B 方案,T1-1)。
-- 全序 `seq`:per-canvas 单调事件序号(gate 7 `?since=seq` 补拉)。
-- per-field clock:**持久形态定死** PG `field_clock` 表(PG-T5 真测:write→destroy pool→重连读回,clock 仍在;S10-4 演示逻辑,不留 N2-1);stale 判定 = base.clock < current.clock → 条件逆运算 skip(M2)。
+- 全序 `seq`:per-canvas 单调事件序号(gate 7 `?since=seq` 补拉 + 网关降级时 finite short-poll,见 §14.4)。
+- per-field clock:**持久形态定死** PG `field_clock` 表(PG-T5 真测:write→destroy pool→重连读回,clock 仍在;S10-4 演示逻辑,不留 N2-1);**base.clock 单一 wire = opaque BaseCursor**(If-Match 携带,client 不读内部;stale 判定 = server 解码 base.clock < current.clock → 条件逆运算 skip M2,不拒写)。
 
-### 10.4 跨 record invariant = 严格事务路径(非 LWW)
+### 10.4 跨 record invariant = server-named invariant command(非 LWW,非 PATCH strict-tx;**v5 Blocker 3 + 诚实化**)
 
-- `deleteNodeCascade(nodeId)` 等 server-side 事务:node 删 + edge 级联 + asset ref 清理,**同一 PG 事务原子**(G3-1 + PG-T1~T3 + **PG-T7 跨 record 单事务**真实验证)。
+- **strict-tx 已剔出 DomainOp**(假跨 record tx 无 target)。跨 record invariant 改 **server-named `ServerInvariantCommand`**(由 path/method 推导目标,非 PATCH DomainOp):
+  - `node-delete-cascade(nodeId)`:DELETE /nodes/:id → node 删 + edge 级联 + asset ref 清理,**同一 PG 事务原子**。★ **仅此 command 经 PG-T1~T3/T7 实证**(node+edges+asset ref 同 tx + 一般跨 record 回滚;S10-13 + X-3)。
+  - `group-reparent(nodeIds, targetGroupId)`:path 推导目标集,per-node 鉴权。★ **类型+注释级,A2 需另测**(非实证)。
+  - `result-asset-attach(anchorId, assetId, resultNodeId)`:result+asset ref 同 tx。★ **类型+注释级,A2 需另测**(非实证)。
 - delete-vs-update:delete wins,update 落 not-found(G3-2,非 409 重试)。
-- group/frame、result node+asset ref 同走事务路径(`strict-tx` op)。
+- **先逐 target authz 再同 PG tx**(NOTES 保持);**二选一写死**:选 server-named(非可鉴权多 target wire);若未来需多 target tx,定义 per-target base/clock wire(非 A2 范围,deferred)。
 
-### 10.5 实时通道(REST + SSE;WS 选作 N2-2 优化)
+### 10.5 实时通道(REST + SSE;WS 选作 N2-2 优化;**v5 Blocker 4 finite short-poll 真模式**)
 
 - 写:`PATCH`(#194,已建)。
-- 广播:SSE(`/api/canvas/:id/events?since=seq`),plain HTTP,网关透传,鉴权走 SSO header 链(真实 5-1~6)。
+- 广播:SSE(`/api/canvas/:id/events?since=seq`),plain HTTP,网关**应**透传(非"必透传";生产可能缓冲/超时 = ○条件式),鉴权走 SSO header 链(真实 5-1~6)。
+- **finite short-poll 真模式(v5 Blocker 4)**:GET `/api/canvas/:id/events/poll?since=` → 响应 `{events, nextSince}` JSON,**服务端自然结束**(非长流);content-type `application/json`(非 SSE);只含 seq>since 条目。**fallback = finite short-poll**(非 "SSE 失败由 SSE fallback" 循环;永不关闭的 SSE 流读两帧 cancel 不算 poll)。
+- **网关失败树(NOTES 保持)**:Gate5 失败只能 ① 调 proxy buffering/read-timeout/flush 复测(首帧 SLO 200ms,5-10)→ ② finite short-poll(500ms SLO,5-12)→ ③ N2-2 blocked(5-13 步骤冻结)。header strip→404 fail-closed(5-11)。
 - **overwritten 事件**(B 方案):同 fieldPath 后写 wins 时,前写者收 `{seq, recordId, fieldPath, historicalValue, byActor, currentRevision}`(T1-1);前写者可 `restore`(发 historicalValue,新 seq,T1-2)。
-- WS:N2-2 选作低延迟优化(非依赖);**网关 WS 放行 = ○条件式留 lead 生产实测**,不放行则 SSE 兜底。
+- WS:N2-2 选作低延迟优化(非依赖);**网关 WS 放行 = ○条件式留 lead 生产实测**,不放行则 SSE/finite short-poll 兜底。
 - presence:WS(若可用)或 SSE 单独 channel。
 
 ### 10.6 权限撤销 / 补拉 / 压缩
@@ -503,12 +576,12 @@ const trustifyCreate = (client: CreateBody, ctx: TrustedCtx): CreateWire =>
 
 - 同 canvas+record submit FIFO:pending create ack 前 hold 后续 edit;ack 后 flush(先 create 后 edit,不 404 丢改动)(S10-8)。
 - 真不存在/已删 record 的 edit 仍 rejected(not-found);pending-local-create 的 edit 不走该终态。
-- **R5 F1**:create 经独立 `POST /api/canvas/:id/nodes`(CreateBody,非 PATCH DomainOp)提交;submit FIFO 仍按 recordId 排队(ack create 前 hold 同 record 的 PATCH edit)。
+- **R5 F1**:create 经独立 `POST /api/canvas/:id/nodes/:nodeId`(CreateBody,client-id path,非 PATCH DomainOp)提交;submit FIFO 仍按 recordId 排队(ack create 前 hold 同 record 的 PATCH edit)。
 
 ### 10.9 迁移 / 双协议窗口 / 破坏面
 
 - **无双协议窗口**(gate 6):#194 前端未接线→原地演进;PG JSONB payload 不透明不动。
-- **破坏面非零**(§1.2):≥12 文件 + FX-5 队列 migration-on-read(旧 queued body→新 op schema 转换)+ stale client 旧 body 打新 endpoint → 400 `payload-rejected`(非 409 refetch)+ 118 项定向回归 + cutover 策略(原子,§1.2)。
+- **破坏面非零**(§1.2):≥12 文件 + FX-5 队列 migration-on-read(走 LegacyReplaceRequest 兼容通道,非 DomainOps 翻译)+ stale client 旧 body 打新 endpoint → 400 `payload-rejected`(非 409 refetch)+ 118 项定向回归 + cutover 策略(原子,§1.2)。
 - stale-client(旧 body 打新 endpoint):**400 `payload-rejected` → refetch**(非 409);409 revision-conflict 是 #194 envelope 复用码(parseIfMatch),新 field-level 协议 G4-4 明确 base 落后不拒写(200),故 stale-client 无 409(见 §1.2 cutover 状态表)。
 
 ---
@@ -531,8 +604,8 @@ const trustifyCreate = (client: CreateBody, ctx: TrustedCtx): CreateWire =>
 
 | 未验证项 | 影响谁 | 处理(条件式) |
 |---|---|---|
-| 生产 SSO 网关 WS upgrade 放行 + header 注入 | N2-2(WS 优化)/ Yjs(致命) | **○条件式留 lead 生产网关实测**;做到→N2-2 上 WS 优化;做不到→SSE 兜底,**Figma 选型不变** |
-| 网关对 `text/event-stream` 缓冲/超时 | N2-2 SSE | ○条件式:lead 实测,必要时加心跳(5-2 heartbeat 已实现,生产网关缓冲未测) |
+| 生产 SSO 网关 WS upgrade 放行 + header 注入 | N2-2(WS 优化)/ Yjs(致命) | **○条件式留 lead 生产网关实测**;做到→N2-2 上 WS 优化;做不到→SSE/short-poll 兜底,**Figma 选型不变** |
+| 网关对 `text/event-stream` 缓冲/超时/首帧延迟/header strip | N2-2 SSE | **v5 Blocker 4 失败树(§14.4)**:① lead 实测首帧/连续帧延迟 + heartbeat(5-2)+ 空闲超时 + header 注入/strip 阈值(5-10/5-11,SSE SLO 200ms);② 失败先调 proxy buffering/read-timeout/flush 复测;③ 仍失败 → **finite short-poll** GET /events/poll?since=(JSON 服务端自然结束,SLO 500ms,5-12)或判 N2-2 blocked。**非 "SSE 失败由 SSE fallback" 循环**(fallback=finite short-poll,5-13;永不关闭 SSE 流读两帧 cancel 不算 poll) |
 | 20k 节点高频 update 渲染性能 | N2-1/N2-2 | 复用 §12 风险4 的 26.7ms p95 基线,N2-2 做 pan bench(对齐 N1 §4 未验证项) |
 | per-field clock 精确 stale 判定 | N2-1 实装 | 持久形态已定死(PG-T5 真测持久;S10-4 演示逻辑);生产加 per-field clock 做精确 stale(契约 §10.3) |
 | canvas 文本同段共编真实需求 | 未来 | 若出现,N2-1 后对 `text` 单字段局部引入 OT/CRDT(不拖全局);v2 文本判决 B 已给 overwritten+restore 兜底 |
@@ -540,23 +613,23 @@ const trustifyCreate = (client: CreateBody, ctx: TrustedCtx): CreateWire =>
 
 ---
 
-## 13. 与计划/上游对齐(含 G1-b R2)
+## 13. 与计划/上游对齐(含 G1-b **R4**;v4 对齐冻结源 R4)
 
-- **计划 §8 N2-0 七项 hard gate**:逐项两案 + 证据 + 成本 + go/no-go(§2);文本 gate 判决(§2 gate 1,P1-4 二选一 B);网关 gate 判决(§2 gate 5,○条件式留 lead);唯一推荐 + G1-c/N2-1 契约 v2(§10);改写 N1 Q1-Q5(§11)。✅ decision-complete v2。
-- **计划 §4 G1-b/G1-c**:G1-b 两案契约 inventory 冻结为 Figma 式唯一(§10);G1-c 落本契约,无 Yjs 死接口。**G1-b R2 三 finding 对齐**(§10):FieldPath 非空 tuple(R2-P1-1,S10-6)/ 数组 by-stable-id(R2-P1-1,S10-7)/ create→edit 因果(R2-P1-2,S10-8)/ DELETE cursor(R2-P1-3,S10-9)。trusted actor/base/idempotency/seq 全留 adapter/transport 层(P2-8)。
-- **计划 §8 N2-1**:op schema/field 边界/seq/revision 用途/事务路径 = §10 契约 v2 直接落地。
+- **计划 §8 N2-0 七项 hard gate**:逐项两案 + 证据 + 成本 + go/no-go(§2);文本 gate 判决(§2 gate 1,P1-4 二选一 B);网关 gate 判决(§2 gate 5,○条件式留 lead + §14.4 失败树);唯一推荐 + G1-c/N2-1 契约 v6(§10);改写 N1 Q1-Q5(§11)。✅ decision-complete v8。
+- **计划 §4 G1-b/G1-c**:G1-b 两案契约 inventory 冻结为 Figma 式唯一(§10);G1-c 落本契约,无 Yjs 死接口。**v7 对齐 G1-b R4(冻结源已到 R4)**:FieldPath 非空 tuple(R4-P1-1,S10-6)/ 数组 by-id **A2 deferred**(R4-P1-1,S10-7 [superseded];DomainOp 不含 by-id)/ create→edit 因果(R4-P1-2,S10-8)/ DELETE cursor(R4-P1-3,S10-9)/ **classifier 必填(R4-P1-1,RecordKindSchema,S10-2/S10-14)**/ **async submitChange caller-owned retry/rebase(R4-P1-2,对齐 canvasSyncPort R4 状态机)**。trusted actor/base/idempotency/seq 全留 adapter/transport 层(P2-8)。**v7:create client-id(非 server-mint)对齐 canvasSyncPort create-node(携 NodeRecord.id)**;**container 白名单取消(lead 裁定 rejected;A2 leaf-level set;FieldTarget 无 'atomic-container',两文档同规则 §10.1 + inventory §11)**。
+- **计划 §8 N2-1**:op schema/field 边界/seq/revision 用途/事务路径 = §10 契约 v4 直接落地。
 - **platform §6 CRDT-ready**:映射可行性保留(N1 证);但**采用 Yjs 否决**——CRDT-ready = 字段扁平可映射,不等于必须采 Yjs。属性级 LWW(field-level PATCH)满足"协作肯定要做"的演进不返工承诺。
 - **platform §13.5 Figma 式**:与本法一致。
 
 ---
 
-## 附:spike 文件结构索引
+## 附:spike 文件结构索引(v4)
 
-- `src/kernel/__spike__/n20-truth-source.spike.test.ts`(48 tests):
+- `src/kernel/__spike__/n20-truth-source.spike.test.ts`(**54 tests**;v4 +7:3 S10-12/13/14 + CutoverHarness 改真实 WriteOp/NodePayload + 4 X-1~X-4 交叉契约;**v8:S10-12 加 SnapshotCursor=opaque bundle 交叉测试 + C-2 加 delete-race/retirement fake-clock quiet-window,吸收进既有 it() 不增计数**):
+  - 模块级 v5 契约权威类型(BaseCursor string codec/DomainOp 无 by-id/ServerInvariantCommand 诚实分级/TrustedCtx.base/CreateBody client-id/RecordKindSchema;无 ATOMIC_CONTAINER_WHITELIST 白名单取消)
   - `makeNode` fixture + `setByPath`/`getByPath`/`fieldKeyOf`(硬化:拒原型污染 S10-1 + 拒空路径 S10-6 + R2-4 leaf validator 拒整对象 clobber S10-6)
-  - `FieldLevelServer`:applyOp/applyOpAuthz(返 forbidden,G7-hard-3)/ deleteNodeCascade / **deleteNodeCascadeWithCursor**(S10-9)/ pullSinceWithGap(logFloor/gap,G7-hard-1)/ compress / snapshot / addMember/removeMember / storageBytes / deletedTombstones / **staging+commitStaged**(R2-3 batch 真单事务 S10-5)
-  - `CommandUndoStack`(原 PoC)+ `ConditionalUndoStack`(返修:条件逆运算 P1-1)+ `TextLwwWithOverwrite`(P1-4 B 方案,**restore 走 overwrite 管线全链 R2-5 T1-5**)
-  - `yjsMatrixSetup`(真 Yjs UndoManager 同矩阵 helper)
-  - G4+G1(5)/ G3(2)+G3-real(3)/ G2(2)+M1-M6(6)/ G7(3)+G7-hard(4)/ G5(1)/ antiYjs(2)/ S10(5)+S10-6~9(4)/ T1(4)+**T1-5(R2-5)**/ **S10-10 immutable/atomic leaf(R2-3)**/ **S10-11 idempotent replay(R2-3)**/ **C-1~C-4 cutover contract harness(R5 F4:flag decoder/migration/stale-base/rollback snapshot materialize)** = **48 tests**
-- `server/__tests__/n20-sse-route.spike.test.ts`(9 tests):真实 Hono SSE route(content-type/heartbeat/since/revoke/authz/slow-consumer + **5-7 live push R2-2** + **5-8 slow-reader 恢复 R3 F3** + **5-9 post-revoke write 拒绝 R5 F3**;5-5 真实 resolveActor/canAccessCanvas authz seam;5-9 同 harness 加真实 seam PATCH write route)
-- `server/__tests__/n20-pg-tx-fault.spike.test.ts`(8 tests):真实 PG transaction fault injection(原子提交/fault ROLLBACK/同库资产元数据(R2-1 改名)/无事务 partial 对照 + PG-T5 field_clock 持久 + **R5 F2:PG-T6 真实领域 replay + PG-T6b fault/rollback** + PG-T7 跨 record;本地 PG 55443 实跑 MIVO_PG_TEST=1;**全部 PG-T 同一 client pool.connect+finally release**)
+  - `FieldLevelServer`:applyOp/applyOpAuthz/deleteNodeCascade/deleteNodeCascadeWithCursor/pullSinceWithGap/compress/snapshot/addMember/removeMember/storageBytes/staging+commitStaged
+  - `CommandUndoStack`+ `ConditionalUndoStack`+ `TextLwwWithOverwrite`
+  - G4+G1(5)/ G3(2)+G3-real(3)/ G2(2)+M1-M6(6)/ G7(3)+G7-hard(4)/ G5(1)/ antiYjs(2)/ S10(5)+S10-6~9(4)/ T1(4)+T1-5/ S10-10/S10-11/ **C-1/C-2/C-4(C-3 new-op+stale-base 200 非 409 由 G4-4/T1-1 覆盖,非独立 it())**/ **S10-12 base.clock 冻结矩阵+v8 bundle 交叉(Blocker 1)**/ **S10-13 server-named invariant(Blocker 3)**/ **S10-14 array defer+白名单(Blocker 2)**/ **X-1~X-4 交叉契约 port CanvasChange↔N20(Blocker 6)** = **54 tests**
+- `server/__tests__/n20-sse-route.spike.test.ts`(**13 tests**;v4 +4:5-10~13 网关失败树):真实 Hono SSE route(content-type/heartbeat/since/revoke/authz/slow-consumer + 5-7 live push + 5-8 slow-reader 恢复 + 5-9 post-revoke write 拒绝;**v4:5-10 首帧延迟 SLO + 5-11 header strip→404 + 5-12 short-poll ?since=seq fallback SLO + 5-13 失败树步骤冻结(Blocker 5,非 SSE-fallback 循环)**)
+- `server/__tests__/n20-pg-tx-fault.spike.test.ts`(8 tests):真实 PG transaction fault injection(原子提交/fault ROLLBACK/同库资产元数据/无事务 partial 对照 + PG-T5 field_clock 持久 + PG-T6 真实领域 replay + PG-T6b fault/rollback + **PG-T7 跨 record(server-named cascade 原子,对齐 Blocker 3)**;本地 PG 55443 实跑 MIVO_PG_TEST=1;全部 PG-T 同一 client pool.connect+finally release)

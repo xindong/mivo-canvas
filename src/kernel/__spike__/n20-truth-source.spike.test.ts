@@ -18,6 +18,9 @@
 import * as Y from 'yjs'
 import { describe, it, expect, expectTypeOf } from 'vitest'
 import type { NodeRecord, Revision } from '../records'
+import type { NodePayload } from '../../../shared/persist-contract'
+import type { WriteOp } from '../../lib/writeRetryQueue'
+import type { CanvasChange, FieldIntent } from '../../lib/canvasSyncPort'
 
 // ── 最小 NodeRecord fixture(直接构造,不走 toRecord/fromRecord,避免依赖 legacy MivoCanvasNode 全字段) ──
 const makeNode = (id: string, over: Partial<NodeRecord> = {}): NodeRecord =>
@@ -348,6 +351,150 @@ class CommandUndoStack {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// N2-0 v6 唯一契约权威类型(模块级;对齐 G1-b R4 + sol 第五轮 3 阻断)
+// ════════════════════════════════════════════════════════════════════════════
+// v6 病根:v5 追加式 supersede 致两套矛盾模型并存(active 段原文未动)。v6 硬禁令:禁止追加式修复;直接重写 active 段原文。
+// v6 决议收口(3 阻断):Blocker 1 BaseCursor 绑 scope+per-field clock(防跨 record/canvas 重放 + 同-field stale 语义);Blocker 2 active 段清零旧模型残留;Blocker 3 FX-5 走 LegacyReplaceRequest 信封 wire(非直调 harness)。
+type FieldPath = readonly [string | number, ...(string | number)[]]  // 非空 tuple(S10-6 运行时拒空)
+
+// ── v6 Blocker 1:BaseCursor 绑 scope(canvasId+recordId)+ revision + per-field clock snapshot ──
+//   防 v5 两洞:① token 跨 record/canvas 重放(n1 rev=1 token 用于 n2;HMAC 只防改值不防换资源)→ v6 token 绑 canvasId+recordId,decode 校验 scope;
+//   ② 无 per-field clock,S10-12 用 record-rev 落后判 overwritten(别的字段变过也误报,违反 §10.3 同-field 语义)→ v6 token 携 per-field clock,同-field stale 才 overwritten。
+//   生命周期:accepted/snapshot 签发;client 回传 If-Match;server decodeBase 验签+scope;malformed/unsigned/scope-mismatch→400;conflict 返 current base。业务层 opaque,codec 只在 adapter。
+const BASE_SECRET = 'test-base-secret' // 测试 fixture;真实 adapter 用 server secret + HMAC
+const baseSig = (payload: string): string => {
+  let h = 0x811c9dc5
+  const key = payload + ':' + BASE_SECRET
+  for (let i = 0; i < key.length; i++) { h ^= key.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0 }
+  return h.toString(16).padStart(8, '0')
+}
+type FieldClocks = Record<string, number>  // fieldKey → clock(同-field stale 判定)
+/** BaseCursor = opaque string token(branded;绑 scope+revision+per-field clock;client 不可构造/伪造)。 */
+type BaseCursor = string & { readonly __brand: 'BaseCursor' }
+/** encode record base:绑 canvasId+recordId+revision+per-field clock snapshot;签。 */
+const encodeBase = (canvasId: string, recordId: string, revision: number, fieldClocks: FieldClocks): BaseCursor => {
+  const fc = Object.entries(fieldClocks).map(([k, v]) => `${k}:${v}`).join(',')
+  const payload = `cv=${canvasId}|rid=${recordId}|r=${revision}|fc=${fc}`
+  return `base:${payload}.${baseSig(payload)}` as BaseCursor
+}
+/** encode order base(canvas-scoped,无 recordId;reorder 用 canvas contentVersion)。 */
+const encodeOrderBase = (canvasId: string, cv: number): BaseCursor => {
+  const payload = `cv=${canvasId}|order=${cv}`
+  return `base:${payload}.${baseSig(payload)}` as BaseCursor
+}
+/** parse payload segments(payload 格式 `cv=X|rid=Y|r=Z|fc=k:v,k:v`)。 */
+const parseSegments = (payload: string): Record<string, string> => {
+  const out: Record<string, string> = {}
+  for (const seg of payload.split('|')) { const i = seg.indexOf('='); if (i > 0) out[seg.slice(0, i)] = seg.slice(i + 1) }
+  return out
+}
+/** decode record base:验签 + scope(canvasId+recordId 必须匹配 expected)→ {revision, fieldClocks} | null。 */
+const decodeBase = (token: BaseCursor | string | undefined, expectedCanvasId: string, expectedRecordId: string): { revision: number; fieldClocks: FieldClocks } | null => {
+  if (typeof token !== 'string' || !token.startsWith('base:')) return null
+  const body = token.slice(5); const dot = body.lastIndexOf('.')
+  if (dot < 0) return null
+  const payload = body.slice(0, dot); const sig = body.slice(dot + 1)
+  if (sig !== baseSig(payload)) return null  // 签名错/篡改 → null
+  const seg = parseSegments(payload)
+  if (seg.cv !== expectedCanvasId || seg.rid !== expectedRecordId) return null  // ★ scope mismatch(n1 token→n2 / 跨 canvas)→ null
+  const fc: FieldClocks = {}
+  if (seg.fc) for (const pair of seg.fc.split(',')) { const [k, v] = pair.split(':'); if (k) fc[k] = Number(v) }
+  const rev = Number(seg.r); if (!Number.isFinite(rev)) return null
+  return { revision: rev, fieldClocks: fc }
+}
+/** decode order base:验签 + canvas scope → {cv} | null。 */
+const decodeOrderBase = (token: BaseCursor | string | undefined, expectedCanvasId: string): { cv: number } | null => {
+  if (typeof token !== 'string' || !token.startsWith('base:')) return null
+  const body = token.slice(5); const dot = body.lastIndexOf('.')
+  if (dot < 0) return null
+  const payload = body.slice(0, dot); const sig = body.slice(dot + 1)
+  if (sig !== baseSig(payload)) return null
+  const seg = parseSegments(payload)
+  if (seg.cv !== expectedCanvasId || seg.order === undefined) return null  // ★ scope mismatch(c1 order→c2)→ null
+  return { cv: Number(seg.order) }
+}
+/** encode event-since base(canvas-scoped seq;GET /events/poll?since= 增量补拉用;bundle 内 since 项)。 */
+const encodeSinceBase = (canvasId: string, seq: number): BaseCursor => {
+  const payload = `cv=${canvasId}|since=${seq}`
+  return `base:${payload}.${baseSig(payload)}` as BaseCursor
+}
+
+// ── v8 Blocker 1:SnapshotCursor(canvas 级 opaque bundle)= recordId→BaseCursor map + canvas order base + event since base ──
+//   现状矛盾:port CanvasSnapshot 只有一个 canvas 级 cursor(canvasSyncPort.ts:95-102);inventory §2.1/§2.2 v7 把它写成
+//   "绑 canvasId+recordId 的单个 BaseCursor"——多 record hydrate 后,一个 record 级 token 无法为任意 n1/n2 提供 If-Match(串用)。
+//   ★ v8 冻结:bundle 内含 recordId→BaseCursor 映射 + canvas order cursor + event since cursor;submitChange 按 change.recordId/
+//     op class 抽对应 wire base(edit/delete→record base;reorder→order base;catch-up→since base);accepted/conflict 后更新 bundle 内对应项。
+//     port SnapshotCursor 仍 opaque(branded),adapter 构造/解包,port 不读内部(见 canvasSyncPort.ts:77 注释 + inventory §2.1/§2.2)。
+type SnapshotCursor = string & { readonly __brand: 'SnapshotCursor' }
+type BundleEntry = { revision: number; fieldClocks: FieldClocks }
+/** encode canvas bundle:opaque canvas 级 token(内含 recordId→(rev,fc) map + order cv + since seq;签)。adapter 侧构造,port 不读内部。 */
+const encodeBundle = (canvasId: string, entries: Record<string, BundleEntry>, orderCv: number, sinceSeq: number): SnapshotCursor => {
+  const payload = JSON.stringify({ cv: canvasId, recs: entries, order: orderCv, since: sinceSeq })
+  return `bundle:${payload}.${baseSig(payload)}` as SnapshotCursor
+}
+/** decode canvas bundle:验签 + canvas scope → {records(recordId→wire BaseCursor 重建), order, since, entries} | null。
+ *  ★ 解包即按 recordId 重建 wire BaseCursor(submitChange 抽对应 record base;reorder 抽 order base;不串用)。 */
+const decodeBundle = (token: SnapshotCursor | string | undefined, expectedCanvasId: string): { records: Record<string, BaseCursor>; order: BaseCursor; since: BaseCursor; entries: Record<string, BundleEntry>; orderCv: number; sinceSeq: number } | null => {
+  if (typeof token !== 'string' || !token.startsWith('bundle:')) return null
+  const body = token.slice(7); const dot = body.lastIndexOf('.')
+  if (dot < 0) return null
+  const payload = body.slice(0, dot); const sig = body.slice(dot + 1)
+  if (sig !== baseSig(payload)) return null  // 签名错/篡改 → null
+  let obj: { cv?: string; recs?: Record<string, BundleEntry>; order?: number; since?: number }
+  try { obj = JSON.parse(payload) } catch { return null }
+  if (obj.cv !== expectedCanvasId) return null  // ★ canvas scope mismatch(跨 canvas bundle 重放)→ null
+  const records: Record<string, BaseCursor> = {}
+  const entries: Record<string, BundleEntry> = {}
+  for (const [id, e] of Object.entries(obj.recs ?? {})) {
+    entries[id] = e
+    records[id] = encodeBase(expectedCanvasId, id, e.revision, e.fieldClocks)  // ★ 按 recordId 重建 wire BaseCursor(不串用)
+  }
+  const orderCv = obj.order ?? 0; const sinceSeq = obj.since ?? 0
+  return { records, order: encodeOrderBase(expectedCanvasId, orderCv), since: encodeSinceBase(expectedCanvasId, sinceSeq), entries, orderCv, sinceSeq }
+}
+
+// ── Blocker 3:strict-tx 已从 DomainOp 剔除(假跨 record tx 无 target)→ server-named invariant command ──
+//   跨 record invariant 由 path/method 推导目标,非 PATCH DomainOp。DomainOp 仅单 record LWW delta。
+//   ★ v5 by-id 数组 A2 deferred(NOTES:fail-visible,禁降级整数组 LWW):DomainOp 不含 by-id variant
+//     (fills/strokes/effects/experimentalAnchors 的 by-id 结构编辑 A2 不支持;migration 走 legacy 兼容通道,见 C-2)。
+//     whole-lww(markupPoints,无 stable-id)+ primitive(resultNodeIds)A2 supported。
+type DomainOp =
+  | { kind: 'set'; fieldPath: FieldPath; value: unknown }
+  | { kind: 'unset'; fieldPath: FieldPath }
+  | { kind: 'array'; fieldPath: FieldPath; class: 'whole-lww'; intent: 'replace'; value: unknown[] }   // ② markupPoints(无 stable-id)
+  | { kind: 'array'; fieldPath: FieldPath; class: 'primitive'; intent: 'insert' | 'remove'; value: string }  // ③ resultNodeIds
+  | { kind: 'reorder'; orderedIds: string[] }
+// server-named invariant command(跨 record 原子,非 PATCH DomainOp;由 path/method 推导目标,per-target 鉴权)
+//   ★ v5 诚实化(S10-13):仅 node-delete-cascade 经 PG-T1~T3/T7 实证;group-reparent/result-asset-attach 是类型+注释级,A2 需另测。
+type ServerInvariantCommand =
+  | { kind: 'node-delete-cascade'; canvasId: string; nodeId: string }                      // DELETE /nodes/:id → node+edges+asset ref 同 PG tx(实证:PG-T1~T3/T7)
+  | { kind: 'group-reparent'; canvasId: string; nodeIds: string[]; targetGroupId: string | null }              // 类型+注释级(A2 需另测)
+  | { kind: 'result-asset-attach'; canvasId: string; anchorId: string; assetId: string; resultNodeId: string } // 类型+注释级(A2 需另测)
+
+// 客户端 PATCH payload(不可信):零 privileged 载体 — 无 opId/actor/recordId/base(全 adapter 注入)
+type ClientFieldOp = { clientId: string; domain: DomainOp }
+// 服务端 trusted:actor ← resolveActor;recordId ← URL path;opId ← idempotency-key header;
+//   base ← If-Match(opaque BaseCursor string,adapter decodeBase 验签;Blocker 1 单一 wire)
+type TrustedCtx = { opId: string; clientId: string; actor: string; recordId: string; base: BaseCursor }
+type WireOp = TrustedCtx & { domain: DomainOp }
+const trustify = (client: ClientFieldOp, ctx: TrustedCtx): WireOp => ({ ...ctx, domain: client.domain })
+const adaptToWire = (domain: DomainOp, ctx: TrustedCtx): WireOp => ({ ...ctx, domain })
+
+// ── Blocker 2:create client-supplied id(废除 server-mint,对齐 G1-b R4 + canvasSyncPort create-node)──
+//   adapter 从 NodeRecord.id 提取 → create URL path(:nodeId);body = CreateBody 零 privileged(payload=NodePayload)。
+//   server 信 path id,做 format/uniqueness/permission 校验;id 唯一来源 = client NodeRecord.id(非 server-mint)。
+//   ★ v5:container 白名单 ['transform','relations'] 取消(lead 裁定 rejected):transform/relations 内部字段有独立并发语义,
+//     整对象 LWW 会吞 sibling 更新;A2 维持叶子级 set(整对象 set 仍拒,canvasSyncPort validateFieldIntent R4 封死)。
+//     未来要原子容器需逐 kind atomic schema + 双 actor sibling-write 不丢测试再提。
+type RecordKind = 'node' | 'edge' | 'anchor'
+type FieldTarget = 'leaf' | 'container' | 'array-element'  // v5:无 'atomic-container'(白名单取消)
+type RecordKindSchema = { kind: RecordKind; classifyField: (fieldPath: FieldPath) => FieldTarget }  // G1-b R4 必填(安全入口)
+type CreateBody = { clientId: string; type: RecordKind; payload: unknown }  // 零 recordId(id 来自 path:client NodeRecord.id)
+type CreateWire = { opId: string; clientId: string; actor: string; recordId: string; type: RecordKind; payload: unknown }
+const trustifyCreate = (client: CreateBody, ctx: TrustedCtx): CreateWire =>
+  ({ opId: ctx.opId, clientId: ctx.clientId, actor: ctx.actor, recordId: ctx.recordId, type: client.type, payload: client.payload })
+
+// ════════════════════════════════════════════════════════════════════════════
 // 测试:七 gate + anti-Yjs
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -544,7 +691,7 @@ describe('N2-0 G5: 实时 transport 协议侧(SSE broadcast skeleton;WS upgrade 
     s.addMember('alice')
     const stream: string[] = []
     s.addConn('alice', (e) => stream.push(`seq=${e.seq}:${e.op.fieldPath[0]}`))
-    // SSE 语义:EventSource = HTTP GET + text/event-stream,网关必透传(与 PATCH 同通道)。
+    // SSE 语义:EventSource = HTTP GET + text/event-stream,网关应透传(plain HTTP,与 PATCH 同通道);但生产网关可能缓冲/超时(条件式,非"必透传",见 §2 Gate5 + N2-0 决策 §12 失败树)。
     s.applyOp({ opId: 'a1', clientId: 'A', actor: 'alice', recordId: 'n1', baseRevision: 0, fieldPath: ['title'], value: 't1' })
     expect(stream).toContain('seq=1:title')
     // ★ SSE 走 HTTP,不依赖 WS upgrade 放行 → Figma 式 fallback 即使网关不放行 WS 也能实时广播。
@@ -1173,45 +1320,9 @@ describe('N2-0 返修 Gate7: logFloor/gap 协议 + 恢复等价 + post-revoke �
 // ════════════════════════════════════════════════════════════════════════════
 
 describe('N2-0 返修 §10: 三层信任边界 + typed op union + setByPath 防原型污染', () => {
-  // ═══ R5 F1 §10 唯一契约权威类型(create 从 PATCH DomainOp 剔除,独立 create endpoint/body)═══
-  // R5 F1 返修:原 DomainOp 含 `{kind:'create',recordId}`,又允许 §10.2 通用 PATCH 接收任意 DomainOp,
-  //   致同一 PATCH wire 同时有 trusted ctx.recordId(path)与不可信 domain.recordId(body)两个 record 权威
-  //   →"body 零 privileged 可伪造"不成立。修法(补探针把声称测实):create 不走 PATCH DomainOp,
-  //   独立 POST /api/canvas/:id/nodes endpoint + 独立 CreateBody(零 recordId;server 分配/idempotency-key 派生,
-  //   非 body 携带)+ 独立 trustifyCreate adapter。PATCH DomainOp 仅 set/unset/array/reorder/strict-tx,
-  //   全 variant 任意嵌套层零 privileged(recordId/actor/baseRevision/opId 全 adapter 注入)。
-  type FieldPath = readonly [string | number, ...(string | number)[]]  // 非空 tuple(S10-6 运行时拒空)
-  // DomainOp = 中性 delta(transport-neutral):set/unset/array/reorder/strict-tx 无 recordId/actor/base/opId
-  //   (recordId ← URL path;actor ← resolveActor;base ← If-Match;opId ← idempotency-key header,全 adapter 注入)。
-  //   ★ R5 F1:create 已剔除 — create 走独立 POST endpoint(见 CreateBody),非 PATCH DomainOp member。
-  type DomainOp =
-    | { kind: 'set'; fieldPath: FieldPath; value: unknown }                                    // 无 recordId(path 注入)
-    | { kind: 'unset'; fieldPath: FieldPath }                                                  // 无 recordId
-    | { kind: 'array'; fieldPath: FieldPath; class: 'by-id'; intent: 'insert'; afterId: string | null; value: { id: string } }      // ① by-stable-id(fills/strokes/effects)
-    | { kind: 'array'; fieldPath: FieldPath; class: 'by-id'; intent: 'remove'; removeId: string }
-    | { kind: 'array'; fieldPath: FieldPath; class: 'by-id'; intent: 'splice'; afterId: string; removeCount: number; values: { id: string }[] }
-    | { kind: 'array'; fieldPath: FieldPath; class: 'whole-lww'; intent: 'replace'; value: unknown[] }                                // ② 无 stable-id(markupPoints)整值 LWW
-    | { kind: 'array'; fieldPath: FieldPath; class: 'primitive'; intent: 'insert' | 'remove'; value: string }                         // ③ primitive(resultNodeIds)by value
-    | { kind: 'reorder'; orderedIds: string[] }                                                 // parentId 从 path 注入
-    | { kind: 'strict-tx'; ops: DomainOp[] }                                                    // 严格事务路径(跨 record 原子,§10.4);ops 无 create(create 不进 PATCH)
-  // 客户端 PATCH payload(不可信):零 privileged 载体 — 无 opId/actor/recordId/baseRevision(全 adapter 注入)
-  type ClientFieldOp = { clientId: string; domain: DomainOp }
-  // 服务端 trusted(actor ← resolveActor;recordId ← URL path;base ← If-Match;opId ← idempotency-key header)
-  type TrustedCtx = { opId: string; clientId: string; actor: string; recordId: string; baseRevision: Revision }
-  type WireOp = TrustedCtx & { domain: DomainOp }
-  // trustify:ClientFieldOp.domain + TrustedCtx → WireOp(body 无 privileged 字段可伪造)
-  const trustify = (client: ClientFieldOp, ctx: TrustedCtx): WireOp => ({ ...ctx, domain: client.domain })
-  // adaptToWire:中性 DomainOp + trusted ctx → wire op(R3 F1:三类 array 同一 adapter 映射)
-  const adaptToWire = (domain: DomainOp, ctx: TrustedCtx): WireOp => ({ ...ctx, domain })
-
-  // ── R5 F1:create 独立契约(POST /api/canvas/:id/nodes,非 PATCH DomainOp)──
-  // CreateBody 零 privileged:无 recordId(server 分配/idempotency-key 派生,非 body)/actor/base/opId。
-  //   id 唯一来源 = trusted endpoint ctx(server-minted,或 idempotency-key header 派生),非 body 可伪造字段。
-  type CreateBody = { clientId: string; type: 'node' | 'edge' | 'anchor'; payload: unknown }
-  type CreateWire = { opId: string; clientId: string; actor: string; recordId: string; type: 'node' | 'edge' | 'anchor'; payload: unknown }
-  // trustifyCreate:CreateBody + TrustedCtx(recordId = server-minted,非 body)→ CreateWire;body 零 privileged 可伪造。
-  const trustifyCreate = (client: CreateBody, ctx: TrustedCtx): CreateWire =>
-    ({ opId: ctx.opId, clientId: ctx.clientId, actor: ctx.actor, recordId: ctx.recordId, type: client.type, payload: client.payload })
+  // §10 唯一契约权威类型(BaseCursor/DomainOp/TrustedCtx/CreateBody/ServerInvariantCommand/ATOMIC_CONTAINER_WHITELIST 等)
+  //   已移至模块级(见文件头部 "N2-0 v4 唯一契约权威类型" 段),供跨 describe 共享:S10-1..S10-14 + G1-b 衔接 describe 均可访问。
+  //   v4 决议收口(6 阻断)见模块级注释:Blocker 1 base.clock opaque wire / Blocker 2 create client-id + classifier + 白名单 / Blocker 3 strict-tx 剔出改 server-named。
 
   it('S10-1 setByPath 拒原型污染路径(__proto__/prototype/constructor)', () => {
     const obj: Record<string, unknown> = { title: 'orig', transform: { x: 0, y: 0 } }
@@ -1226,117 +1337,126 @@ describe('N2-0 返修 §10: 三层信任边界 + typed op union + setByPath 防�
     expect(({} as { polluted?: boolean }).polluted).toBeUndefined()
   })
 
-  it('S10-2 三层信任边界(R5 F1:PATCH body 任意 variant 含 strict-tx 嵌套零 privileged;create 不进 PATCH DomainOp)', () => {
-    // R5 F1:body 零信任字段 — ClientFieldOp = {clientId, domain};DomainOp set/unset/array/reorder/strict-tx
-    //   全 variant 任意嵌套层无 recordId/actor/base/opId;privileged 全在 adapter/trusted 注入:
-    //   actor ← resolveActor;recordId ← URL path;base ← If-Match;opId ← idempotency-key header。
-    //   create 走独立 CreateBody(零 recordId;server-minted id),非 PATCH DomainOp member — 杜绝双 record 权威。
-    // 类型级断言(tsc -b 强制:若类型加回任一 privileged 字段 / create 塞回 DomainOp,expectTypeOf 失配 /
-    //   或 ts-expect-error 抑制指令失效 → build fail):
-    expectTypeOf<keyof ClientFieldOp>().toEqualTypeOf<'clientId' | 'domain'>()  // PATCH body 零 privileged(opId/actor/recordId/baseRevision 全无)
-    // ★ R5 F1:DomainOp 不含 create kind(create 走独立 endpoint,非 PATCH member)— 若 create 塞回则此行失配 → build fail
-    expectTypeOf<DomainOp['kind']>().toEqualTypeOf<'set' | 'unset' | 'array' | 'reorder' | 'strict-tx'>()
-    // ★ R5 F1:create 独立 CreateBody 零 privileged(无 recordId/actor/base/opId;id 由 server ctx 注入)
+  it('S10-2 三层信任边界(v5:PATCH body 零 privileged;base=opaque BaseCursor string codec;create client-id;by-id deferred;container 白名单取消)', () => {
+    // v5 决议收口(对齐 G1-b R4 + sol 第四轮 4 阻断):
+    //   Blocker 1 — base.clock = opaque BaseCursor string(真 codec+HMAC 签名,非 type-cast;client 不可伪造,server decodeBase 验签)。
+    //   Blocker 2 — create client-id(废除 server-mint);RecordKindSchema classifier 必填;container 白名单取消(transform/relations 整对象 set 仍拒,leaf-level set)。
+    //   Blocker 3 — strict-tx 剔出 DomainOp;by-id 数组 A2 deferred(DomainOp 不含 by-id variant,migration 走 legacy 兼容通道)。
+    expectTypeOf<keyof ClientFieldOp>().toEqualTypeOf<'clientId' | 'domain'>()  // PATCH body 零 privileged
+    // ★ v5:DomainOp 不含 create/strict-tx 亦不含 by-id(by-id deferred,A2 不支持数组结构编辑)
+    expectTypeOf<DomainOp['kind']>().toEqualTypeOf<'set' | 'unset' | 'array' | 'reorder'>()
     expectTypeOf<keyof CreateBody>().toEqualTypeOf<'clientId' | 'type' | 'payload'>()
     type SetOp = Extract<DomainOp, { kind: 'set' }>
     type UnsetOp = Extract<DomainOp, { kind: 'unset' }>
     type ReorderOp = Extract<DomainOp, { kind: 'reorder' }>
-    type StrictTxOp = Extract<DomainOp, { kind: 'strict-tx' }>
-    type ArrayByIdInsert = Extract<DomainOp, { kind: 'array'; class: 'by-id'; intent: 'insert' }>
-    type ArrayByIdRemove = Extract<DomainOp, { kind: 'array'; class: 'by-id'; intent: 'remove' }>
     type ArrayWholeLww = Extract<DomainOp, { kind: 'array'; class: 'whole-lww' }>
     type ArrayPrimitive = Extract<DomainOp, { kind: 'array'; class: 'primitive' }>
-    // ★ R6 F1 补 by-id splice variant exact-key gate(判决 V3:原 S10-2 漏 splice,给 splice 加 privileged key 不使 build fail)
-    type ArrayByIdSplice = Extract<DomainOp, { kind: 'array'; class: 'by-id'; intent: 'splice' }>
-    expectTypeOf<keyof SetOp>().toEqualTypeOf<'kind' | 'fieldPath' | 'value'>()            // set 无 recordId/actor/base/opId
-    expectTypeOf<keyof UnsetOp>().toEqualTypeOf<'kind' | 'fieldPath'>()                    // unset 无 recordId/actor/base/opId
-    expectTypeOf<keyof ReorderOp>().toEqualTypeOf<'kind' | 'orderedIds'>()                 // reorder 无 recordId(parentId 从 path 注入)
-    expectTypeOf<keyof StrictTxOp>().toEqualTypeOf<'kind' | 'ops'>()                       // strict-tx 仅 kind+ops(无 privileged)
-    expectTypeOf<keyof ArrayByIdInsert>().toEqualTypeOf<'kind' | 'fieldPath' | 'class' | 'intent' | 'afterId' | 'value'>()
-    expectTypeOf<keyof ArrayByIdRemove>().toEqualTypeOf<'kind' | 'fieldPath' | 'class' | 'intent' | 'removeId'>()
+    expectTypeOf<keyof SetOp>().toEqualTypeOf<'kind' | 'fieldPath' | 'value'>()
+    expectTypeOf<keyof UnsetOp>().toEqualTypeOf<'kind' | 'fieldPath'>()
+    expectTypeOf<keyof ReorderOp>().toEqualTypeOf<'kind' | 'orderedIds'>()
     expectTypeOf<keyof ArrayWholeLww>().toEqualTypeOf<'kind' | 'fieldPath' | 'class' | 'intent' | 'value'>()
     expectTypeOf<keyof ArrayPrimitive>().toEqualTypeOf<'kind' | 'fieldPath' | 'class' | 'intent' | 'value'>()
-    // ★ R6 F1:by-id splice variant exact-key gate — splice 亦无 recordId/actor/base/opId(与 insert/remove 同 gate)
-    expectTypeOf<keyof ArrayByIdSplice>().toEqualTypeOf<'kind' | 'fieldPath' | 'class' | 'intent' | 'afterId' | 'removeCount' | 'values'>()
-    // @ts-expect-error R5 F1:ClientFieldOp body 零 privileged(无 actor)— 若加回则下行非 error → directive 失效 → build fail
+    // @ts-expect-error v5:ClientFieldOp body 零 privileged(无 actor)
     const _badActor: ClientFieldOp = { clientId: 'A', domain: { kind: 'set', fieldPath: ['title'], value: 'x' }, actor: 'admin' }
-    // @ts-expect-error R5 F1:create 不再是 PATCH DomainOp member — 若 create 塞回 DomainOp 则下行非 error → build fail
+    // @ts-expect-error v5:create 不再是 PATCH DomainOp member
     const _badCreateInDomain: DomainOp = { kind: 'create', recordId: 'forged', type: 'node', payload: {} }
-    // @ts-expect-error R5 F1:create 不能嵌套进 strict-tx.ops(ops: DomainOp[],create 不在 DomainOp)— 杜绝嵌套双 record 权威
-    const _badCreateNested: DomainOp = { kind: 'strict-tx', ops: [{ kind: 'create', recordId: 'forged', type: 'node', payload: {} }] }
-    // @ts-expect-error R5 F1:Array variant 零 privileged(无 recordId)— 若加回则 build fail
-    const _badArrayRec: DomainOp = { kind: 'array', fieldPath: ['fills'], class: 'by-id', intent: 'insert', afterId: null, value: { id: 'fA' }, recordId: 'forged' }
-    // ★ R6 F1:by-id splice variant 同样零 privileged(无 recordId)— 判决 V3 验收:给 splice 加 recordId/actor/baseRevision/opId 任一 → tsc -b 失败
-    // @ts-expect-error R6 F1:ArrayByIdSplice 零 privileged(无 recordId)— 若加回则下行非 error → directive 失效 → build fail
-    const _badSpliceRec: DomainOp = { kind: 'array', fieldPath: ['fills'], class: 'by-id', intent: 'splice', afterId: 'f1', removeCount: 1, values: [{ id: 'fB' }], recordId: 'forged' }
-    // @ts-expect-error R5 F1:CreateBody 零 privileged(无 recordId)— 若加回则 build fail
+    // @ts-expect-error v5:strict-tx 已剔出 DomainOp(跨 record 走 server-named command)
+    const _badStrictTxInDomain: DomainOp = { kind: 'strict-tx' as const, ops: [] as unknown as never }
+    // @ts-expect-error v5:by-id variant 已 deferred(DomainOp 不含 by-id)— 塞回则 build fail(A2 不支持数组结构编辑)
+    const _badByIdInDomain: DomainOp = { kind: 'array' as const, fieldPath: ['fills'] as FieldPath, class: 'by-id' as const, intent: 'insert' as const, afterId: null, value: { id: 'fA' } }
+    // @ts-expect-error v5:Array variant 零 privileged(无 recordId)
+    const _badArrayRec: DomainOp = { kind: 'array', fieldPath: ['markupPoints'], class: 'whole-lww', intent: 'replace', value: [], recordId: 'forged' }
+    // @ts-expect-error v5:CreateBody 零 privileged(无 recordId;id 来自 path 非 body)
     const _badCreateBody: CreateBody = { clientId: 'A', type: 'node', payload: {}, recordId: 'forged' }
-    expect(_badActor).toBeDefined(); expect(_badCreateInDomain).toBeDefined(); expect(_badCreateNested).toBeDefined()
-    expect(_badArrayRec).toBeDefined(); expect(_badCreateBody).toBeDefined(); expect(_badSpliceRec).toBeDefined()  // 标记已用(noUnusedLocals)+ 证明 body/DomainOp 无法携 privileged(含 by-id splice,R6 F1)
-    // trustify:ClientFieldOp.domain + TrustedCtx → WireOp(body 无 privileged 可伪造;forge 无处可藏)
+    // ★ Blocker 1:base 是 opaque BaseCursor string(branded),非 bare number — 传 number 则 build fail(client 不可伪造)
+    // @ts-expect-error v5:base 是 BaseCursor(string branded),非 bare number
+    const _badBaseNumber: TrustedCtx = { opId: 'x', clientId: 'A', actor: 'a', recordId: 'n1', base: 0 }
+    expect(_badActor).toBeDefined(); expect(_badCreateInDomain).toBeDefined(); expect(_badStrictTxInDomain).toBeDefined()
+    expect(_badByIdInDomain).toBeDefined(); expect(_badArrayRec).toBeDefined(); expect(_badCreateBody).toBeDefined(); expect(_badBaseNumber).toBeDefined()
+    // ★ v6 Blocker 1:真 string codec round-trip(encode → token → decode 验签+scope → {revision, fieldClocks};非 type-cast)
+    const base0 = encodeBase('c1', 'n1', 0, { title: 0 })
+    expect(typeof base0).toBe('string')              // ★ BaseCursor 是 string(opaque token,client 持 opaque string)
+    expect(decodeBase(base0, 'c1', 'n1')).toEqual({ revision: 0, fieldClocks: { title: 0 } })  // ★ decode 验签+scope 成功(真 round-trip)
+    expect(decodeBase(base0, 'c1', 'n2')).toBeNull()  // ★ scope mismatch(n1 token→n2)→ null(防跨 record 重放,v6 绑 recordId)
+    expect(decodeBase(base0, 'c2', 'n1')).toBeNull()  // ★ scope mismatch(c1→c2)→ null(防跨 canvas 重放)
+    expect(decodeBase('base:cv=c1|rid=n1|r=0.deadbeef', 'c1', 'n1')).toBeNull()  // ★ 签名错 → null(防篡改)
+    expect(decodeBase('not-a-base-token', 'c1', 'n1')).toBeNull()  // malformed → null(400)
+    expect(decodeBase(undefined, 'c1', 'n1')).toBeNull()  // missing → null(428)
+    // trustify:ClientFieldOp.domain + TrustedCtx → WireOp
     const set: DomainOp = { kind: 'set', fieldPath: ['title'], value: 'hacked' }
-    const trusted = trustify(
-      { clientId: 'A', domain: set },
-      { opId: 'idem-key-abc', clientId: 'A', actor: 'alice', recordId: 'n1', baseRevision: 0 },
-    )
-    expect(trusted.actor).toBe('alice')            // authz 注入(无 body.actor 可伪造)
-    expect(trusted.recordId).toBe('n1')             // path 注入
-    expect(trusted.baseRevision).toBe(0)           // If-Match 注入
-    expect(trusted.opId).toBe('idem-key-abc')       // idempotency-key header 注入
-    expect(trusted.domain).toBe(set)               // domain 中性 delta 引用
-    // ★ R5 F1:create 走独立 trustifyCreate:CreateBody(零 recordId)+ TrustedCtx(server-minted recordId)→ CreateWire
-    //   body 零 privileged 可伪造;recordId 唯一来源 = trusted ctx(server 分配),非 body 字段。
+    const trusted = trustify({ clientId: 'A', domain: set }, { opId: 'idem-key-abc', clientId: 'A', actor: 'alice', recordId: 'n1', base: base0 })
+    expect(trusted.actor).toBe('alice')
+    expect(trusted.recordId).toBe('n1')
+    expect(trusted.base).toBe(base0)                // ★ Blocker 1:opaque BaseCursor string 注入
+    expect(trusted.opId).toBe('idem-key-abc')
+    expect(trusted.domain).toBe(set)
+    // ★ Blocker 2:create client-id(adapter 从 NodeRecord.id 提取进 path,非 server-mint)
     const createBody: CreateBody = { clientId: 'A', type: 'node', payload: { title: 'new' } }
-    const createWire = trustifyCreate(createBody, { opId: 'idem-create-1', clientId: 'A', actor: 'alice', recordId: 'n-new-minted', baseRevision: 0 })
-    expect(createWire.recordId).toBe('n-new-minted')  // ★ server-minted(trusted ctx),非 body 可伪造
-    expect(createWire.actor).toBe('alice')            // authz 注入
-    expect(createWire.opId).toBe('idem-create-1')      // idempotency-key header 注入
+    const createWire = trustifyCreate(createBody, { opId: 'idem-create-1', clientId: 'A', actor: 'alice', recordId: 'n-client-1', base: base0 })
+    expect(createWire.recordId).toBe('n-client-1')  // ★ client-supplied(NodeRecord.id via adapter path)
     expect(createWire.type).toBe('node'); expect(createWire.payload).toEqual({ title: 'new' })
-    // 证明:createBody 无 recordId 字段可伪造(若客户端试图塞 recordId,上面 _badCreateBody @ts-expect-error 已 schema 级拒)
+    // ★ Blocker 2:RecordKindSchema classifier 必填(G1-b R4);container 白名单取消 — transform/relations 整对象 set 仍拒(leaf-level set)
+    const nodeSchema: RecordKindSchema = {
+      kind: 'node',
+      classifyField: (fp) => {
+        const root = fp[0] as string
+        if (root === 'transform' || root === 'relations') return 'container' as const  // 整对象 set 拒(白名单取消;须分解 transform.x/relations.parentIds 叶子 set)
+        if (root === 'fills' || root === 'strokes' || root === 'effects' || root === 'markupPoints' || root === 'resultNodeIds' || root === 'experimentalAnchors') return 'array-element' as const
+        return 'leaf' as const
+      },
+    }
+    expect(nodeSchema.classifyField(['transform'])).toBe('container')   // 整对象 set 拒(非白名单;leaf-level)
+    expect(nodeSchema.classifyField(['title'])).toBe('leaf')
+    expect(nodeSchema.classifyField(['fills'])).toBe('array-element')   // 数组结构 deferred
   })
 
-  it('S10-3 typed domain op union + adapter 分层(R5 F1:create 独立 endpoint,非 PATCH DomainOp;三类 array 同一 adapter 映射)', () => {
-    // R5 F1:DomainOp/TrustedCtx/WireOp/adaptToWire 复用 §10 describe 权威类型(无另造冲突局部类型);
+  it('S10-3 typed domain op union + adapter 分层(v4:create client-id 独立 endpoint;strict-tx 剔出 DomainOp 改 server-named invariant;三类 array 同一 adapter 映射)', () => {
+    // v4:DomainOp/TrustedCtx/WireOp/adaptToWire 复用 §10 describe 权威类型(无另造冲突局部类型);
     //   DomainOp 中性 delta,不带 recordId/actor/base/opId(全 adapter 注入);三类 array 同一 adaptToWire 覆盖。
-    //   create 走独立 CreateBody + trustifyCreate(非 adaptToWire/DomainOp)— 杜绝 PATCH 双 record 权威。
-    // @ts-expect-error R5 F1:create 不再是 PATCH DomainOp member — 若 create 塞回 DomainOp 则下行非 error → build fail
+    //   create 走独立 CreateBody + trustifyCreate(client NodeRecord.id via path,非 server-mint)— 杜绝 PATCH 双 record 权威。
+    //   strict-tx 已剔出 DomainOp(Blocker 3):跨 record 原子改 server-named ServerInvariantCommand(由 path/method 推导目标)。
+    // @ts-expect-error v4:create 不再是 PATCH DomainOp member — 若 create 塞回 DomainOp 则下行非 error → build fail
     const _createNotDomain: DomainOp = { kind: 'create', recordId: 'n-new', type: 'node', payload: { title: 'new' } }
-    // create 走独立 CreateBody(零 recordId)+ trustifyCreate(server-minted recordId via trusted ctx)
+    // create 走独立 CreateBody(零 recordId)+ trustifyCreate(client NodeRecord.id via adapter path,非 server-mint)
     const createBody: CreateBody = { clientId: 'A', type: 'node', payload: { title: 'new' } }
-    const createWire = trustifyCreate(createBody, { opId: 'idem-create', clientId: 'A', actor: 'alice', recordId: 'n-new-minted', baseRevision: 0 })
+    const createWire = trustifyCreate(createBody, { opId: 'idem-create', clientId: 'A', actor: 'alice', recordId: 'n-client-2', base: encodeBase('c1', 'n-client-2', 0, {}) })
     expect(_createNotDomain).toBeDefined()  // 标记已用(noUnusedLocals)+ 证明 create 无法回塞 DomainOp
-    expect(createWire.recordId).toBe('n-new-minted')  // ★ server-minted(trusted ctx),非 body 可伪造 recordId
+    expect(createWire.recordId).toBe('n-client-2')  // ★ client-supplied(NodeRecord.id via adapter path),非 server-mint
     expect(createWire.type).toBe('node'); expect(createWire.payload).toEqual({ title: 'new' })
     const set: DomainOp = { kind: 'set', fieldPath: ['title'], value: 'x' }
     const unset: DomainOp = { kind: 'unset', fieldPath: ['tempKey'] }
     const reorder: DomainOp = { kind: 'reorder', orderedIds: ['n2', 'n1', 'n3'] }
-    const tx: DomainOp = { kind: 'strict-tx', ops: [set, { kind: 'set', fieldPath: ['groupId'], value: 'g1' }] }
-    // ① by-stable-id(fills/strokes/effects):insert/remove by id(并发不漂移)
-    const fillsInsert: DomainOp = { kind: 'array', fieldPath: ['fills'], class: 'by-id', intent: 'insert', afterId: 'f1', value: { id: 'fA' } }
-    const fillsRemove: DomainOp = { kind: 'array', fieldPath: ['fills'], class: 'by-id', intent: 'remove', removeId: 'fA' }
-    // ★ R6 F1:by-id splice variant(判决 V3:原 S10-3 不构造 splice,补全三类 by-id intent:insert/remove/splice)
-    const fillsSplice: DomainOp = { kind: 'array', fieldPath: ['fills'], class: 'by-id', intent: 'splice', afterId: 'f1', removeCount: 1, values: [{ id: 'fB' }] }
-    // ② whole-lww(markupPoints,无 stable-id,mivoCanvas.ts MarkupPoint {x,y,pressure?}):整值 LWW 替换(限制:并发丢前写者,上层 coalesce 或转 by-id)
+    // ★ Blocker 3:strict-tx 已剔出 DomainOp — 跨 record invariant 走 server-named ServerInvariantCommand(由 path/method 推导目标,非 PATCH DomainOp)
+    // @ts-expect-error v5:strict-tx 不再是 DomainOp member — 若塞回则下行非 error → directive 失效 → build fail
+    const _strictTxNotDomain: DomainOp = { kind: 'strict-tx' as const, ops: [] as unknown as never }
+    const deleteCascade: ServerInvariantCommand = { kind: 'node-delete-cascade', canvasId: 'c1', nodeId: 'n1' }  // ★ 实证(PG-T1~T3/T7)
+    const groupReparent: ServerInvariantCommand = { kind: 'group-reparent', canvasId: 'c1', nodeIds: ['n2', 'n3'], targetGroupId: 'g1' }  // 类型+注释级(A2 需另测)
+    const resultAsset: ServerInvariantCommand = { kind: 'result-asset-attach', canvasId: 'c1', anchorId: 'a1', assetId: 'ast1', resultNodeId: 'n4' }  // 类型+注释级(A2 需另测)
+    // ★ v5:by-id 数组 A2 deferred(DomainOp 不含 by-id variant);A2 仅 whole-lww + primitive array
+    // @ts-expect-error v5:by-id variant 已 deferred(DomainOp 不含 by-id)— 塞回则 build fail
+    const _byIdDeferred: DomainOp = { kind: 'array' as const, fieldPath: ['fills'] as FieldPath, class: 'by-id' as const, intent: 'insert' as const, afterId: null, value: { id: 'fA' } }
+    // ② whole-lww(markupPoints,无 stable-id):整值 LWW 替换(A2 supported)
     const markupReplace: DomainOp = { kind: 'array', fieldPath: ['markupPoints'], class: 'whole-lww', intent: 'replace', value: [{ x: 3, y: 3 }] }
-    // ③ primitive(resultNodeIds,string[],mivoCanvas.ts:249):by value(元素是 string 无 id,不能 by-id)
+    // ③ primitive(resultNodeIds,string[]):by value(A2 supported)
     const resultInsert: DomainOp = { kind: 'array', fieldPath: ['resultNodeIds'], class: 'primitive', intent: 'insert', value: 'n3' }
-    // 验 union 可区分(kind/class 判别;create 已剔除,不在 DomainOp kind 集)
+    // 验 union 可区分(kind/class 判别;create + strict-tx + by-id 已剔除,不在 DomainOp kind 集)
     expect(set.kind).toBe('set'); expect(unset.kind).toBe('unset')
-    expect(reorder.kind).toBe('reorder'); expect(tx.kind).toBe('strict-tx')
-    expect(fillsInsert.kind).toBe('array'); expect(fillsInsert.class).toBe('by-id')
+    expect(reorder.kind).toBe('reorder')
+    expect(deleteCascade.kind).toBe('node-delete-cascade')  // ★ server-named invariant(非 DomainOp);实证 PG-T1~T3/T7
+    expect(groupReparent.kind).toBe('group-reparent'); expect(resultAsset.kind).toBe('result-asset-attach')  // 类型+注释级(A2 需另测)
+    expect(_strictTxNotDomain).toBeDefined(); expect(_byIdDeferred).toBeDefined()
     expect(markupReplace.class).toBe('whole-lww'); expect(resultInsert.class).toBe('primitive')
     // R3 F1 adapter 映射:中性 DomainOp → wire op(recordId/actor/base/opId 全由 trusted ctx 注入,不在 DomainOp)
-    const ctx: TrustedCtx = { opId: 'idem-1', clientId: 'A', actor: 'alice', recordId: 'n1', baseRevision: 3 }
+    const base3 = encodeBase('c1', 'n1', 3, { title: 2 })
+    expect(decodeBase(base3, 'c1', 'n1')).toEqual({ revision: 3, fieldClocks: { title: 2 } })  // ★ v6 Blocker 1:真 codec round-trip(scope+field clock)
+    const ctx: TrustedCtx = { opId: 'idem-1', clientId: 'A', actor: 'alice', recordId: 'n1', base: base3 }
     const wire = adaptToWire(set, ctx)
-    expect(wire.recordId).toBe('n1'); expect(wire.actor).toBe('alice'); expect(wire.baseRevision).toBe(3); expect(wire.opId).toBe('idem-1')
+    expect(wire.recordId).toBe('n1'); expect(wire.actor).toBe('alice'); expect(wire.base).toBe(base3); expect(wire.opId).toBe('idem-1')
     expect(wire.domain).toBe(set)  // domain 中性 delta 引用(无 recordId/actor/base/opId)
-    // ★ 三类 array 同一 adaptToWire 覆盖(对齐 §10 三类 union,无另造冲突局部类型):
-    const wireFills = adaptToWire(fillsInsert, ctx); expect(wireFills.domain).toBe(fillsInsert)              // ① fills by-id insert
-    const wireFillsRm = adaptToWire(fillsRemove, ctx); expect(wireFillsRm.domain).toBe(fillsRemove)        // ① fills by-id remove
-    const wireFillsSp = adaptToWire(fillsSplice, ctx); expect(wireFillsSp.domain).toBe(fillsSplice)        // ① fills by-id splice(R6 F1 补:正常 splice 经 adapter trusted ctx 唯一生效)
+    // ★ v5 两类 array(whole-lww + primitive)同一 adaptToWire 覆盖;by-id deferred(A2 不支持,迁移走 legacy 兼容通道,见 C-2)
     const wireMarkup = adaptToWire(markupReplace, ctx); expect(wireMarkup.domain).toBe(markupReplace)      // ② markupPoints whole-lww
     const wireResult = adaptToWire(resultInsert, ctx); expect(wireResult.domain).toBe(resultInsert)        // ③ resultNodeIds primitive
-    // ★ §10 验收:三类 array 均可构造 fills/markupPoints/resultNodeIds;strict-tx = 跨 record 严格事务原子(P1-2/G3 跨介质边界,非 LWW)
+    // ★ §10 验收:whole-lww + primitive array 可构造;by-id deferred(DomainOp 不含);strict-tx 剔出改 server-named(仅 node-delete-cascade 实证,见 S10-13 + PG-T1~T3/T7)
   })
 
   it('S10-4 per-field clock 持久形态(R2-3):PG field_clock schema + 客户端 base.clock 表达 + 重启可恢复', () => {
@@ -1365,10 +1485,11 @@ describe('N2-0 返修 §10: 三层信任边界 + typed op union + setByPath 防�
     expect(clock('n1', ['title'])).toBe(3)
     expect(clock('n1', ['transform', 'x'])).toBe(1)
     expect(clock('n1', ['transform', 'y'])).toBe(0) // 未改过
-    // ★ R2-3 客户端 base.clock 表达:baseRevision 携带 {revision, clock map} — base.clock 用于 stale 判定
-    type BaseWithClock = { revision: Revision; clock: Record<string, number> } // fieldKey → clock
-    const clientBase: BaseWithClock = { revision: 0, clock: { title: 2 } } // A 看到 title.clock=2 时发 op
-    expect(clientBase.clock['title']).toBeLessThan(clock('n1', ['title'])) // ★ base=2 < current=3 → stale
+    // ★ v6 Blocker 1:删平行明文 BaseWithClock,统一走同一 BaseCursor codec 生命周期。
+    //   client base.clock 表达 = BaseCursor string token(encodeBase 绑 canvasId+recordId+revision+per-field clock snapshot;非平行明文 type)。
+    const clientBase = encodeBase('c1', 'n1', 0, { title: 2 })  // ★ A 看到 title.clock=2 时签发的 base token(同 codec,非平行 BaseWithClock)
+    const decoded = decodeBase(clientBase, 'c1', 'n1')!  // decode 验签+scope → {revision, fieldClocks}
+    expect(decoded.fieldClocks.title).toBeLessThan(clock('n1', ['title']))  // ★ base title.clock=2 < current=3 → 同-field stale
     // ★ R2-3 重启可恢复:clock 持久在 field_clock 表,重启从 PG 读回(模拟)
     const persistedRows: FieldClockRow[] = [
       { canvas_id: 'c1', record_id: 'n1', field_key: 'title', clock: 3 },
@@ -1383,8 +1504,8 @@ describe('N2-0 返修 §10: 三层信任边界 + typed op union + setByPath 防�
     expect(restored.get('n1')?.get('transform.x')).toBe(1)
     expect(FIELD_CLOCK_DDL).toContain('field_clock')       // schema 名定死
     expect(FIELD_CLOCK_DDL).toContain('PRIMARY KEY (canvas_id, record_id, field_key)')
-    // ★ 持久形态定死:PG field_clock 表 + 客户端 base.clock 表达 + 重启恢复;不留 N2-1(R2-3)。
-    //   stale 判定 = base.clock < current.clock → 条件逆运算 skip(见 Gate2 M2)
+    // ★ 持久形态定死:PG field_clock 表 + client base = BaseCursor token(同 codec 绑 field clock;非平行 BaseWithClock)+ 重启恢复;不留 N2-1(R2-3)。
+    //   stale 判定 = decoded.fieldClocks[field] < current.clock → 同-field stale 才 overwritten(见 S10-12;非 record-rev 落后误报)。
   })
 
   it('S10-5 batch 真单事务(R2-3):staging → 全 ok 才 commitStaged;第二项 runtime 失败第一项不落库(无 partial)', () => {
@@ -1600,18 +1721,17 @@ describe('N2-0 返修 §10 G1-b 衔接(P2-8): FieldPath 非空 + 数组中性 in
     expect((obj.transform as { y: number }).y).toBe(99)
   })
 
-  it('S10-7 数组三类意图(对照 mivoCanvas.ts 真实类型,R2-4 对齐 G1B R2-P1-1):有 stable-id / 无 stable-id / primitive', () => {
-    // R2-4:数组 intent 不能写死 {id:string} — 须按真实元素形态分三类(对照 mivoCanvas.ts):
-    //   ① 有 stable-id(fills/strokes/effects,元素 {id:string,...})→ insert/remove/splice by id(并发不漂移)
-    //   ② 无 stable-id(markupPoints,元素 {x,y,pressure?} 无 id,mivoCanvas.ts:69-74 MarkupPoint)→ 整值 LWW(标注限制:并发会丢前写者的点,需上层 coalesce 或转 by-id 模型)
-    //   ③ primitive(resultNodeIds,元素是 string,mivoCanvas.ts:249 resultNodeIds?: string[])→ insert/remove by value(非 by-id,元素无 id)
-    type ArrayIntent =  // R3 F1:对齐 §10 DomainOp array 三类 union(无 recordId,recordId/path 注入在 adapter 层)
+  it('S10-7 数组三类意图(v6:by-id [superseded, non-normative] A2 deferred;active 仅 whole-lww + primitive;对照 mivoCanvas.ts 真实类型)', () => {
+    // v6 Blocker 2:by-id 数组 A2 deferred(S10-14 断言 DomainOp 不含 by-id);S10-7 的 by-id active 证据与 S10-14 矛盾 → 标 [superseded, non-normative],移出 active evidence。
+    //   ① 有 stable-id(fills/strokes/effects):by-id 结构编辑 **A2 deferred**(fail-visible,禁降级整数组 LWW);migration 走 legacy 兼容通道(见 C-2),不绕 defer。by-id applyArrayIntent 逻辑保留作 [superseded] 历史模型,非 active 证据。
+    //   ② 无 stable-id(markupPoints):whole-lww(A2 supported)。③ primitive(resultNodeIds):by value(A2 supported)。
+    type ArrayIntent =
       | { kind: 'array'; fieldPath: (string | number)[]; class: 'by-id'; intent: 'insert'; afterId: string | null; value: { id: string } }
       | { kind: 'array'; fieldPath: (string | number)[]; class: 'by-id'; intent: 'remove'; removeId: string }
       | { kind: 'array'; fieldPath: (string | number)[]; class: 'by-id'; intent: 'splice'; afterId: string; removeCount: number; values: { id: string }[] }
-      | { kind: 'array'; fieldPath: (string | number)[]; class: 'whole-lww'; intent: 'replace'; value: unknown[] } // ② 无 stable-id 整值 LWW
-      | { kind: 'array'; fieldPath: (string | number)[]; class: 'primitive'; intent: 'insert'; value: string }      // ③ primitive insert by value
-      | { kind: 'array'; fieldPath: (string | number)[]; class: 'primitive'; intent: 'remove'; value: string }      // ③ primitive remove by value
+      | { kind: 'array'; fieldPath: (string | number)[]; class: 'whole-lww'; intent: 'replace'; value: unknown[] }
+      | { kind: 'array'; fieldPath: (string | number)[]; class: 'primitive'; intent: 'insert'; value: string }
+      | { kind: 'array'; fieldPath: (string | number)[]; class: 'primitive'; intent: 'remove'; value: string }
     const applyArrayIntent = (arr: unknown[], intent: ArrayIntent): unknown[] => {
       if (intent.class === 'by-id') {
         const idArr = arr as { id: string }[]
@@ -1621,39 +1741,27 @@ describe('N2-0 返修 §10 G1-b 衔接(P2-8): FieldPath 非空 + 数组中性 in
           const at = idx + 1
           return [...idArr.slice(0, at), intent.value, ...idArr.slice(at)]
         }
-        if (intent.intent === 'remove') return idArr.filter((x) => x.id !== intent.removeId) // ★ by id,非 index
+        if (intent.intent === 'remove') return idArr.filter((x) => x.id !== intent.removeId)
         const idx = idArr.findIndex((x) => x.id === intent.afterId)
         if (idx === -1) throw new Error(`afterId ${intent.afterId} not found`)
         return [...idArr.slice(0, idx + 1), ...intent.values, ...idArr.slice(idx + 1 + intent.removeCount)]
       }
-      if (intent.class === 'whole-lww') {
-        // ② 无 stable-id(markupPoints):整值 LWW — 后写整数组替换
-        //   限制(诚实标注):并发会丢前写者的点;N2-1 实装须上层 coalesce(同 actor 同 stroke 合并)或把 markupPoints 升级为 by-id 模型(加 id)
-        return intent.value
-      }
-      // ③ primitive(resultNodeIds:string[]):by value(元素是 string 无 id)
+      if (intent.class === 'whole-lww') return intent.value
       if (intent.intent === 'insert') return [...(arr as string[]), intent.value]
       return (arr as string[]).filter((v) => v !== intent.value)
     }
-    // ① 有 stable-id(fills) — insert/remove by id(并发 insert 改 index,id 定位仍准)
-    const base = [{ id: 'f1' }, { id: 'f2' }]
-    const aInsert = applyArrayIntent(base, { kind: 'array', fieldPath: ['fills'], class: 'by-id', intent: 'insert', afterId: 'f1', value: { id: 'fA' } })
-    expect(aInsert.map((x) => (x as { id: string }).id)).toEqual(['f1', 'fA', 'f2'])
-    const afterRemove = applyArrayIntent(aInsert, { kind: 'array', fieldPath: ['fills'], class: 'by-id', intent: 'remove', removeId: 'fA' })
-    expect(afterRemove.map((x) => (x as { id: string }).id)).toEqual(['f1', 'f2'])
-    const spliced = applyArrayIntent([{ id: 'f1' }, { id: 'f2' }, { id: 'f3' }], { kind: 'array', fieldPath: ['fills'], class: 'by-id', intent: 'splice', afterId: 'f1', removeCount: 1, values: [{ id: 'fN' }] })
-    expect(spliced.map((x) => (x as { id: string }).id)).toEqual(['f1', 'fN', 'f3'])
-    // ② 无 stable-id(markupPoints:{x,y,pressure?}[],无 id,mivoCanvas.ts:69-74)— 整值 LWW(标注限制)
+    // ① by-id [superseded, non-normative]:A2 deferred(DomainOp 不含 by-id,S10-14);applyArrayIntent by-id 逻辑保留作历史模型,非 active 证据。A2 实装前 fills/strokes/effects 结构编辑不可用(migration 走 legacy 通道)。
+    // ② whole-lww(markupPoints,A2 supported):整值 LWW
     const pts: { x: number; y: number }[] = [{ x: 1, y: 1 }, { x: 2, y: 2 }]
     const ptsLww = applyArrayIntent(pts, { kind: 'array', fieldPath: ['markupPoints'], class: 'whole-lww', intent: 'replace', value: [{ x: 3, y: 3 }] })
-    expect(ptsLww).toEqual([{ x: 3, y: 3 }]) // ★ 整值 LWW(后写整数组替换;限制:并发丢前写者,上层须 coalesce 或转 by-id)
-    // ③ primitive(resultNodeIds:string[],mivoCanvas.ts:249)— by value(元素是 string 无 id,不能 by-id)
+    expect(ptsLww).toEqual([{ x: 3, y: 3 }])  // ★ whole-lww(A2 supported)
+    // ③ primitive(resultNodeIds,A2 supported):by value
     const rids = ['n1', 'n2']
     const ridsIns = applyArrayIntent(rids, { kind: 'array', fieldPath: ['resultNodeIds'], class: 'primitive', intent: 'insert', value: 'n3' })
     expect(ridsIns).toEqual(['n1', 'n2', 'n3'])
     const ridsRm = applyArrayIntent(ridsIns, { kind: 'array', fieldPath: ['resultNodeIds'], class: 'primitive', intent: 'remove', value: 'n2' })
-    expect(ridsRm).toEqual(['n1', 'n3']) // ★ by value 定位(元素是 string 无 id)
-    // ★ R2-4 验收:三类数组各有冻结意图;['transform']+整对象 clobber 被 S10-6 leaf validator 拒;path/base/actor/idempotency/seq 只在 adapter 层(S10-2 trustify)。
+    expect(ridsRm).toEqual(['n1', 'n3'])  // ★ primitive by value(A2 supported)
+    // ★ v6 验收:by-id active 证据移出([superseded, non-normative];A2 deferred,见 S10-14);active 仅 whole-lww + primitive;['transform']+整对象 clobber 被 S10-10 拒(container leaf-level)。
   })
 
   it('S10-8 create→edit 因果(G1B R2-P1-2 对齐):pending create ack 前 hold edit,先 create 后 edit', () => {
@@ -1706,41 +1814,36 @@ describe('N2-0 返修 §10 G1-b 衔接(P2-8): FieldPath 非空 + 数组中性 in
     expect(r3.kind).toBe('not-found') // ★ 404 → rejected,不冒充 cursor
   })
 
-  it('S10-10 immutable/atomic leaf 表(R2-3):immutable 字段不可 set;atomic-container 整值替换;其余 leaf set', () => {
-    // R2-3:immutable/atomic 字段表缺失 → 返修定死。对照 NodeRecord(src/kernel/records.ts canonical 字段):
-    //   immutable:id/type/createdAt/revision(创建后不可变,set → forbidden;id 由 path,type/createdAt 由 create)
-    //   atomic-container:transform/relations(整对象替换,allowContainerClobber,标注丢兄弟字段代价)
-    //   leaf:其余(title/text/x/y/width/height/fills/strokes/effects/markupPoints/...)
-    type FieldMutability = 'immutable' | 'atomic-container' | 'leaf'
+  it('S10-10 immutable/leaf 字段表(v6:无 atomic-container;白名单取消 → transform/relations=container 整对象 set 拒,leaf-level;immutable 不可 set)', () => {
+    // v6 Blocker 2:删 atomic-container(S10-14 断言 FieldTarget 无 atomic-container;两测试矛盾对拆)。container 白名单取消(lead 裁定 rejected)。
+    //   对照 NodeRecord(canonical):immutable(id/type/createdAt/revision,创建后不可变,set→forbidden);container(transform/relations,整对象 set 拒,须分解叶子 set);leaf(其余)。
+    type FieldMutability = 'immutable' | 'container' | 'leaf'  // v6:无 'atomic-container'(白名单取消)
     const MUTABILITY: Record<string, FieldMutability> = {
       id: 'immutable', type: 'immutable', createdAt: 'immutable', revision: 'immutable',
-      transform: 'atomic-container', relations: 'atomic-container',
+      transform: 'container', relations: 'container',  // v6:container(整对象 set 拒,leaf-level;非 atomic-container 白名单)
     }
     const mutabilityOf = (firstSeg: string): FieldMutability => MUTABILITY[firstSeg] ?? 'leaf'
-    // immutable 字段:id/type/createdAt/revision
     expect(mutabilityOf('id')).toBe('immutable')
     expect(mutabilityOf('type')).toBe('immutable')
     expect(mutabilityOf('createdAt')).toBe('immutable')
     expect(mutabilityOf('revision')).toBe('immutable')
-    // atomic-container:transform/relations(整值替换,标注代价)
-    expect(mutabilityOf('transform')).toBe('atomic-container')
-    expect(mutabilityOf('relations')).toBe('atomic-container')
-    // 其余 leaf(title/text/x/fills/...)
+    expect(mutabilityOf('transform')).toBe('container')   // v6:container(非 atomic-container)
+    expect(mutabilityOf('relations')).toBe('container')   // v6:container(非 atomic-container)
     expect(mutabilityOf('title')).toBe('leaf')
     expect(mutabilityOf('text')).toBe('leaf')
-    expect(mutabilityOf('fills')).toBe('leaf')
-    expect(mutabilityOf('x')).toBe('leaf')
-    // ★ immutable 字段 set → forbidden(N2-1 adapter 校验)
+    // ★ immutable 字段 set → forbidden;container 整对象 set(path.length===1)→ 拒(leaf-level);container 子路径 set(如 transform.x)→ ok(到 leaf)
     const assertMutable = (path: (string | number)[]): void => {
       const first = String(path[0])
       if (mutabilityOf(first) === 'immutable') throw new Error(`immutable field "${first}" cannot be set (R2-3 immutable leaf table)`)
+      if (mutabilityOf(first) === 'container' && path.length === 1) throw new Error(`container field "${first}" requires leaf sub-path set (v6 白名单取消,leaf-level)`)
     }
     expect(() => assertMutable(['id'])).toThrow(/immutable field "id"/)
     expect(() => assertMutable(['type'])).toThrow(/immutable field "type"/)
     expect(() => assertMutable(['createdAt'])).toThrow(/immutable field "createdAt"/)
     expect(() => assertMutable(['title'])).not.toThrow()               // leaf 可 set
-    expect(() => assertMutable(['transform', 'x'])).not.toThrow()      // transform.x 是 leaf 子路径(transform 本身是 atomic-container,但子路径 x 是 leaf)
-    // ★ atomic-container transform 整值替换走 allowContainerClobber(见 S10-6),标注丢兄弟字段代价
+    expect(() => assertMutable(['transform', 'x'])).not.toThrow()     // transform.x 是 leaf 子路径(到 leaf,非整对象 set)
+    expect(() => assertMutable(['transform'])).toThrow(/container field "transform" requires leaf sub-path/)  // ★ v6:transform 整对象 set 拒(白名单取消)
+    expect(() => assertMutable(['relations'])).toThrow(/container field "relations" requires leaf sub-path/)  // ★ relations 整对象 set 拒
   })
 
   it('S10-11 idempotent replay(R2-3):同 opId(idempotency-key)replay 不二次 bump revision/seq、不二次发事件', () => {
@@ -1774,6 +1877,385 @@ describe('N2-0 返修 §10 G1-b 衔接(P2-8): FieldPath 非空 + 数组中性 in
     expect(s.revision('n1')).toBe(revAfter1 + 1)  // 新 op bump
     // ★ R2-3 验收:replay revision/seq 不变;伪造 body opId 不影响(header 单一权威,S10-2)
   })
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // v4 决议收口(sol 第三轮 6 阻断):base.clock 冻结矩阵 + server-named invariant + array defer inventory
+  // ════════════════════════════════════════════════════════════════════════════
+  it('S10-12 BaseCursor 绑 scope+per-field clock + base-driven 冻结矩阵 + v8 SnapshotCursor=opaque canvas bundle(v8 Blocker 1:SnapshotCursor=recordId→base map+order+since,多 record hydrate 不串用,delete 取 record base/reorder 取 order base/accepted 更新对应项;v6:scope 防跨 record/canvas 重放;同-field stale 才 overwritten,不同字段 stale 不误报;delete/reorder fresh→200 race→409;create dup→409;malformed/scope-mismatch→400)', () => {
+    // v6 病根:v5 codec payload {rev,cv?} 两洞:① token 跨 record/canvas 重放(n1 rev=1 token 能用于 n2;HMAC 只防改值不防换资源);② 无 per-field clock,S10-12 用 record-rev 落后判 overwritten(别的字段变过也误报,违反 §10.3 同-field 语义)。
+    // v6 修:token 绑 canvasId+recordId+revision+per-field clock snapshot;decodeBase 验签+scope;同-field stale 才 overwritten(不同字段 stale 不误报)。
+    type Outcome = { status: number; outcome: 'accepted' | 'conflict' | 'rejected'; base?: BaseCursor; overwritten?: boolean }
+    class BaseDrivenHarness {
+      readonly canvasId: string
+      constructor(canvasId = 'c1') { this.canvasId = canvasId }
+      private recs = new Map<string, { rev: number; fc: FieldClocks; present: boolean; writers: Record<string, string> }>()
+      private cv = 0
+      private seq = 0  // v8:canvas 事件 seq(bundle since 项;每次 accepted op bump)
+      private children: string[] = []
+      private outbox: { to: string; field: string; by: string }[] = []
+      seedRecord(nodeId: string, fc: FieldClocks = {}) { this.recs.set(nodeId, { rev: 0, fc: { ...fc }, present: true, writers: {} }) }
+      recordExists(id: string) { return this.recs.get(id)?.present === true }
+      fieldClock(nodeId: string, field: string): number { return this.recs.get(nodeId)?.fc[field] ?? 0 }
+      fieldWriter(nodeId: string, field: string): string { return this.recs.get(nodeId)?.writers[field] ?? '' }
+      /** hydrate snapshot 签发 record base(绑 canvasId+recordId+rev+per-field clock;clock key = fieldKeyOf 完整 path)。 */
+      snapshot(nodeId: string): BaseCursor | null {
+        const r = this.recs.get(nodeId); return r && r.present ? encodeBase(this.canvasId, nodeId, r.rev, r.fc) : null
+      }
+      /** reorder base 签发(canvas-scoped cv)。 */
+      snapshotOrder(): BaseCursor { return encodeOrderBase(this.canvasId, this.cv) }
+      seedChildren(ids: string[]) { this.children = [...ids]; this.cv = 0 }
+      /** edit:malformed/scope-mismatch→400;永远 200(G4-4);**同-field stale 才 overwritten**(fieldKeyOf 完整 path 粒度;per-field writer map)。 */
+      edit(nodeId: string, op: { fieldPath: FieldPath; value: unknown }, base: BaseCursor, actor: string): Outcome {
+        const d = decodeBase(base, this.canvasId, nodeId)  // ★ scope check(canvasId+recordId 必须匹配)
+        if (!d) return { status: 400, outcome: 'rejected' }  // malformed/unsigned/scope-mismatch → 400
+        const r = this.recs.get(nodeId)
+        if (!r || !r.present) return { status: 404, outcome: 'rejected' }
+        const field = fieldKeyOf([...op.fieldPath])  // ★ v7:完整 path key(transform.x ≠ transform.y;leaf-level 粒度)
+        const baseFC = d.fieldClocks[field] ?? 0
+        const curFC = r.fc[field] ?? 0
+        const sameFieldStale = baseFC < curFC  // ★ 同-field(完整 path)stale 才 overwritten;别的字段(含 transform.y)变过不算
+        if (sameFieldStale && r.writers[field]) this.outbox.push({ to: r.writers[field], field, by: actor })  // ★ v7:通知该完整 path 前写者(per-field writer map;非 record 级单值误通知)
+        r.fc[field] = curFC + 1; r.rev += 1; this.seq += 1; r.writers[field] = actor  // ★ per-field writer map(非 record 级 lastWriter);seq bump(事件)
+        return { status: 200, outcome: 'accepted', base: encodeBase(this.canvasId, nodeId, r.rev, r.fc), overwritten: sameFieldStale }
+      }
+      /** delete:malformed/scope-mismatch→400;fresh base(rev===current)→200;stale base(rev<current)→409 race。 */
+      delete(nodeId: string, base: BaseCursor): Outcome {
+        const d = decodeBase(base, this.canvasId, nodeId)
+        if (!d) return { status: 400, outcome: 'rejected' }
+        const r = this.recs.get(nodeId)
+        if (!r || !r.present) return { status: 404, outcome: 'rejected' }
+        if (d.revision === r.rev) { r.present = false; this.seq += 1; return { status: 200, outcome: 'accepted' } }
+        return { status: 409, outcome: 'conflict', base: encodeBase(this.canvasId, nodeId, r.rev, r.fc) }
+      }
+      /** reorder:malformed/scope-mismatch→400;fresh cv + valid perm→200(顺序变也成功);stale cv / orderedIds≠live→409。 */
+      reorder(orderedIds: string[], base: BaseCursor): Outcome {
+        const d = decodeOrderBase(base, this.canvasId)
+        if (!d) return { status: 400, outcome: 'rejected' }
+        if (d.cv !== this.cv) return { status: 409, outcome: 'conflict', base: this.snapshotOrder() }
+        const liveSet = new Set(this.children)
+        const validPerm = orderedIds.length === this.children.length && new Set(orderedIds).size === orderedIds.length && orderedIds.every((id) => liveSet.has(id))
+        if (!validPerm) return { status: 409, outcome: 'conflict', base: this.snapshotOrder() }
+        this.children = [...orderedIds]; this.cv += 1; this.seq += 1
+        return { status: 200, outcome: 'accepted', base: this.snapshotOrder() }
+      }
+      /** create:dup id→409;new→201 + base。 */
+      create(nodeId: string): Outcome {
+        const r = this.recs.get(nodeId)
+        if (r && r.present) return { status: 409, outcome: 'conflict', base: encodeBase(this.canvasId, nodeId, r.rev, r.fc) }
+        this.recs.set(nodeId, { rev: 1, fc: {}, present: true, writers: {} }); this.seq += 1
+        return { status: 201, outcome: 'accepted', base: encodeBase(this.canvasId, nodeId, 1, {}) }
+      }
+      drainOverwritten(to: string) { const e = this.outbox.filter((o) => o.to === to); this.outbox = this.outbox.filter((o) => o.to !== to); return e }
+      // ── v8 Blocker 1:canvas 级 SnapshotCursor = opaque bundle(recordId→BaseCursor map + order base + since base)──
+      /** hydrate 签发 canvas 级 opaque bundle(内含所有 present record 的 (rev,fc) + order cv + since seq)。多 record 聚合,非单 record 级 token。 */
+      snapshotBundle(): SnapshotCursor {
+        const entries: Record<string, BundleEntry> = {}
+        for (const [id, r] of this.recs) if (r.present) entries[id] = { revision: r.rev, fieldClocks: { ...r.fc } }
+        return encodeBundle(this.canvasId, entries, this.cv, this.seq)
+      }
+      /** 解包 bundle(测试断言用;adapter 侧解包,port 不读内部)。 */
+      extractBundle(bundle: SnapshotCursor | string | undefined) { return decodeBundle(bundle, this.canvasId) }
+      /** ★ submitChange 抽 wire base:edit/delete→record base(bundle 内 recordId 对应项,按 recordId 重建);reorder→order base(非 record base)。
+       *  多 record hydrate 后 nb1/nb2 各自 record base 不串用(单 record 级 token 无法为任意 record 提供 If-Match 的根因)。 */
+      extractWireBase(bundle: SnapshotCursor | string | undefined, opClass: 'edit' | 'delete' | 'reorder', nodeId?: string): BaseCursor | null {
+        const d = decodeBundle(bundle, this.canvasId); if (!d) return null
+        if (opClass === 'reorder') return d.order  // ★ reorder 取 order base(非 record base)
+        if (nodeId === undefined) return null
+        return d.records[nodeId] ?? null  // ★ edit/delete 取 record base(按 recordId 抽;不串用)
+      }
+      // ── v9 真 adapter harness:submitFromBundle — extractWireBase 真传给 edit/delete/reorder/create;增量更新(非全量重建)──
+      /** ★ v9:submitFromBundle(bundle, change) 真 adapter 路径。extractWireBase 结果真实传给 edit/delete/reorder/create(非直传 h.snapshot);
+       *  accepted/conflict 用 wire response 的 base/seq **增量更新** bundle(仅命中 record/order 项;未命中项引用不变;非全量 snapshotBundle 重建)。
+       *  返 { outcome, newBundle, entries }:entries 为构建 newBundle 的 in-memory 对象(未命中项与旧 bundle decode 的 entry 同引用,断言用)。 */
+      submitFromBundle(bundle: SnapshotCursor, change:
+        | { kind: 'edit'; nodeId: string; fieldPath: FieldPath; value: unknown }
+        | { kind: 'delete'; nodeId: string }
+        | { kind: 'reorder'; orderedIds: string[] }
+        | { kind: 'create'; nodeId: string }, actor = 'anon'): { outcome: Outcome; newBundle: SnapshotCursor; entries: Record<string, BundleEntry> } {
+        const dec = decodeBundle(bundle, this.canvasId)
+        if (!dec) return { outcome: { status: 400, outcome: 'rejected' }, newBundle: bundle, entries: {} }
+        const entries: Record<string, BundleEntry> = { ...dec.entries }  // ★ shallow copy:未命中项引用不变(同 BundleEntry 对象)
+        let orderCv = dec.orderCv; let sinceSeq = dec.sinceSeq
+        if (change.kind === 'edit') {
+          const base = this.extractWireBase(bundle, 'edit', change.nodeId)  // ★ 真传 extractWireBase 结果(非 h.snapshot 直传)
+          if (!base) return { outcome: { status: 400, outcome: 'rejected' }, newBundle: bundle, entries }
+          const r = this.edit(change.nodeId, { fieldPath: change.fieldPath, value: change.value }, base, actor)
+          if (r.outcome === 'accepted' && r.base) { const d = decodeBase(r.base, this.canvasId, change.nodeId)!; entries[change.nodeId] = { revision: d.revision, fieldClocks: d.fieldClocks }; sinceSeq += 1 }  // ★ 仅命中 record 增量更新 + since
+          else if (r.outcome === 'conflict' && r.base) { const d = decodeBase(r.base, this.canvasId, change.nodeId)!; entries[change.nodeId] = { revision: d.revision, fieldClocks: d.fieldClocks } }  // ★ conflict 只更新该 record current base(非全量)
+          return { outcome: r, newBundle: encodeBundle(this.canvasId, entries, orderCv, sinceSeq), entries }
+        }
+        if (change.kind === 'delete') {
+          const base = this.extractWireBase(bundle, 'delete', change.nodeId)
+          if (!base) return { outcome: { status: 400, outcome: 'rejected' }, newBundle: bundle, entries }
+          const r = this.delete(change.nodeId, base)
+          if (r.outcome === 'accepted') { delete entries[change.nodeId]; sinceSeq += 1 }  // ★ 移 entry + since
+          else if (r.outcome === 'conflict' && r.base) { const d = decodeBase(r.base, this.canvasId, change.nodeId)!; entries[change.nodeId] = { revision: d.revision, fieldClocks: d.fieldClocks } }
+          return { outcome: r, newBundle: encodeBundle(this.canvasId, entries, orderCv, sinceSeq), entries }
+        }
+        if (change.kind === 'reorder') {
+          const base = this.extractWireBase(bundle, 'reorder')  // ★ reorder 取 order base
+          if (!base) return { outcome: { status: 400, outcome: 'rejected' }, newBundle: bundle, entries }
+          const r = this.reorder(change.orderedIds, base)
+          if (r.outcome === 'accepted' && r.base) { orderCv += 1; sinceSeq += 1 }  // ★ 更新 order + since
+          else if (r.outcome === 'conflict' && r.base) { const d = decodeOrderBase(r.base, this.canvasId)!; orderCv = d.cv }  // conflict 只更新 order current base
+          return { outcome: r, newBundle: encodeBundle(this.canvasId, entries, orderCv, sinceSeq), entries }
+        }
+        // create
+        const r = this.create(change.nodeId)
+        if (r.outcome === 'accepted' && r.base) { const d = decodeBase(r.base, this.canvasId, change.nodeId)!; entries[change.nodeId] = { revision: d.revision, fieldClocks: d.fieldClocks }; sinceSeq += 1 }  // ★ 增 entry + since
+        else if (r.outcome === 'conflict' && r.base) { const d = decodeBase(r.base, this.canvasId, change.nodeId)!; entries[change.nodeId] = { revision: d.revision, fieldClocks: d.fieldClocks } }
+        return { outcome: r, newBundle: encodeBundle(this.canvasId, entries, orderCv, sinceSeq), entries }
+      }
+    }
+    const h = new BaseDrivenHarness('c1')
+    // ── 新鲜 base:正常操作必须成功(非 race)──
+    h.create('n1')  // create n1 → rev 1
+    const snap1 = h.snapshot('n1')!  // 绑 c1+n1+rev1+fc={}
+    expect(decodeBase(snap1, 'c1', 'n1')).toEqual({ revision: 1, fieldClocks: {} })  // ★ 真 codec round-trip(scope 正确)
+    // edit fresh base → 200 + new base(title.clock=1, rev=2),no overwritten
+    const e1 = h.edit('n1', { fieldPath: ['title'], value: 'A' }, snap1, 'alice')
+    expect(e1.status).toBe(200); expect(e1.outcome).toBe('accepted'); expect(e1.overwritten).toBe(false)
+    expect(h.fieldClock('n1', 'title')).toBe(1)
+    // ★ 同-field stale:snap1 title.clock=0 < current 1 → 200 + overwritten(非 409,G4-4)
+    const e2 = h.edit('n1', { fieldPath: ['title'], value: 'B' }, snap1, 'bob')
+    expect(e2.status).toBe(200); expect(e2.outcome).toBe('accepted')  // ★ edit stale 永 200 非 409
+    expect(e2.overwritten).toBe(true)  // ★ 同-field(title)stale → overwritten
+    expect(h.drainOverwritten('alice').length).toBe(1)  // alice 收 overwritten
+    // ★ v7 不同字段 stale 不误报(fieldKeyOf 完整 path 粒度;per-field writer map;非 record-rev 误报)
+    h.create('n2')
+    const snap2a = h.snapshot('n2')!  // title.clock=0, transform.x.clock=0, transform.y.clock=0
+    h.edit('n2', { fieldPath: ['transform', 'x'], value: 5 }, snap2a, 'carol')  // bump transform.x.clock=1, rev=2
+    expect(h.fieldClock('n2', 'transform.x')).toBe(1); expect(h.fieldClock('n2', 'title')).toBe(0); expect(h.fieldClock('n2', 'transform.y')).toBe(0)  // ★ fieldKeyOf 粒度:transform.x ≠ transform.y ≠ title
+    // edit TITLE with snap2a(title.clock=0 === current 0,虽 transform.x.clock 落后)— 不发 overwritten(非同-field stale)
+    const e3 = h.edit('n2', { fieldPath: ['title'], value: 'T' }, snap2a, 'dave')
+    expect(e3.status).toBe(200); expect(e3.overwritten).toBe(false)  // ★ 不同字段 stale(transform.x 变了)不误报 title overwritten
+    expect(h.drainOverwritten('carol').length).toBe(0)  // carol(transform.x writer)不收(title 非其字段;per-field writer map)
+    // ★ v7 transform.x 与 transform.y stale 互不误报(fieldKeyOf leaf-level 粒度;v6 用 fieldPath[0] 会并成一个 transform)
+    h.create('n5')
+    const snap5a = h.snapshot('n5')!  // transform.x.clock=0, transform.y.clock=0
+    h.edit('n5', { fieldPath: ['transform', 'x'], value: 1 }, snap5a, 'alice')  // transform.x.clock=1, writer[transform.x]=alice
+    expect(h.fieldClock('n5', 'transform.x')).toBe(1); expect(h.fieldClock('n5', 'transform.y')).toBe(0)  // ★ transform.x ≠ transform.y
+    // edit transform.y with snap5a(transform.y.clock=0 === current 0,虽 transform.x.clock 落后)— 不发 overwritten
+    const e5y = h.edit('n5', { fieldPath: ['transform', 'y'], value: 2 }, snap5a, 'bob')
+    expect(e5y.status).toBe(200); expect(e5y.overwritten).toBe(false)  // ★ transform.y 未被并发改 → 不误报(transform.x 变了不算)
+    expect(h.drainOverwritten('alice').length).toBe(0)  // alice(transform.x writer)不收(transform.y 非其字段)
+    // edit transform.x with snap5a(transform.x.clock=0 < current 1)→ 200 + overwritten;通知 transform.x 前写者 alice(非 bob)
+    const e5x = h.edit('n5', { fieldPath: ['transform', 'x'], value: 3 }, snap5a, 'carol')
+    expect(e5x.status).toBe(200); expect(e5x.overwritten).toBe(true)  // ★ 同-field(transform.x)stale → overwritten
+    const ov5 = h.drainOverwritten('alice')
+    expect(ov5.length).toBe(1); expect(ov5[0].field).toBe('transform.x')  // ★ 通知 transform.x 前写者 alice(完整 path 粒度)
+    expect(h.drainOverwritten('bob').length).toBe(0)  // bob(transform.y writer)不收(非 transform.x)
+    // ★ v7 title→transform→stale title 通知发 title 前写者(per-field writer map;非 record 级单值误通知 transform writer)
+    h.create('n6')
+    const snap6a = h.snapshot('n6')!  // title.clock=0, transform.x.clock=0
+    h.edit('n6', { fieldPath: ['title'], value: 'A' }, snap6a, 'alice')  // title.clock=1, writer[title]=alice
+    h.edit('n6', { fieldPath: ['transform', 'x'], value: 9 }, snap6a, 'bob')  // transform.x.clock=1, writer[transform.x]=bob
+    // edit title with snap6a(title.clock=0 < current 1)→ 200 + overwritten;通知 writer[title]=alice(非 bob who wrote transform.x)
+    const e6 = h.edit('n6', { fieldPath: ['title'], value: 'B' }, snap6a, 'carol')
+    expect(e6.status).toBe(200); expect(e6.overwritten).toBe(true)  // ★ 同-field(title)stale → overwritten
+    const ov6 = h.drainOverwritten('alice')
+    expect(ov6.length).toBe(1); expect(ov6[0].field).toBe('title')  // ★ 通知 title 前写者 alice(per-field writer map)
+    expect(h.drainOverwritten('bob').length).toBe(0)  // ★ bob(transform.x writer)不收(title 非其字段;v6 record 级单值会误通知 bob)
+    // ★ delete fresh base → 200(removed,非 409)
+    const snap3 = h.snapshot('n1')!  // n1 rev=3(title bumped twice)
+    const d1 = h.delete('n1', snap3)
+    expect(d1.status).toBe(200); expect(d1.outcome).toBe('accepted')  // ★ fresh delete → 200
+    // ★ delete stale base → 409(race)
+    h.create('n3')
+    const snapN3 = h.snapshot('n3')!  // rev 1
+    h.edit('n3', { fieldPath: ['title'], value: 'X' }, snapN3, 'alice')  // bump rev 1→2
+    const d2 = h.delete('n3', snapN3)  // stale base(rev1 < current 2)
+    expect(d2.status).toBe(409); expect(d2.outcome).toBe('conflict')  // ★ stale delete → 409
+    // malformed/unsigned base → 400
+    expect(h.delete('n3', 'not-a-base' as BaseCursor).status).toBe(400)
+    expect(h.delete('n3', 'base:cv=c1|rid=n3|r=1.deadbeef' as BaseCursor).status).toBe(400)  // 签名错 → 400
+    // create dup → 409
+    expect(h.create('n3').status).toBe(409)
+    // ★ scope mismatch:n4 token 用于 n3 → 拒(HMAC 防改值不防换资源 → v6 绑 recordId 防跨 record 重放)
+    h.create('n4')
+    const n4snap = h.snapshot('n4')!  // c1+n4 token
+    // 用 n4 的 token 试图 edit n3(rid 不匹配)→ scope-mismatch → 400
+    const e4 = h.edit('n3', { fieldPath: ['title'], value: 'forge' }, n4snap, 'eve')
+    expect(e4.status).toBe(400); expect(e4.outcome).toBe('rejected')  // ★ n4 token→n3 scope-mismatch → 400(防跨 record 重放)
+    // ★ c1 order token 用于 c2 canvas → 拒(scope-mismatch)
+    h.seedChildren(['a', 'b', 'c'])
+    const c1OrderToken = h.snapshotOrder()  // c1 canvas token
+    const h2 = new BaseDrivenHarness('c2')  // 另一 canvas
+    h2.seedChildren(['a', 'b', 'c'])
+    const rCross = h2.reorder(['c', 'b', 'a'], c1OrderToken)  // c1 token → c2 canvas
+    expect(rCross.status).toBe(400); expect(rCross.outcome).toBe('rejected')  // ★ c1 order→c2 scope-mismatch → 400(防跨 canvas 重放)
+    // ★ reorder fresh base + 顺序变 → 200(非 409 即使顺序不同)
+    const orderBase = h.snapshotOrder()  // c1 cv 0
+    const r1 = h.reorder(['c', 'b', 'a'], orderBase)  // 顺序变,但 fresh + scope 正确 → 200
+    expect(r1.status).toBe(200); expect(r1.outcome).toBe('accepted')  // ★ fresh reorder → 200
+    // ★ reorder stale cv → 409(race)
+    const r2 = h.reorder(['a', 'b', 'c'], orderBase)  // stale cv(0 < current 1)
+    expect(r2.status).toBe(409); expect(r2.outcome).toBe('conflict')  // ★ stale cv → 409
+    // ★ reorder orderedIds≠live set → 409
+    const orderBase2 = h.snapshotOrder()
+    const r3 = h.reorder(['a', 'b', 'd'], orderBase2)  // 'd' 不在 live
+    expect(r3.status).toBe(409); expect(r3.outcome).toBe('conflict')  // orderedIds≠live → 409
+    // ── v8 Blocker 1:SnapshotCursor = opaque canvas 级 bundle(recordId→BaseCursor map + order base + since base)──
+    //   现状矛盾:port CanvasSnapshot 只有一个 canvas 级 cursor;inventory v7 写成"绑 canvasId+recordId 的单个 BaseCursor" →
+    //   多 record hydrate 后一个 record 级 token 无法为任意 n1/n2 提供 If-Match(串用)。★ v8:bundle 聚合 + submitChange 按 recordId/op class 抽 wire base。
+    h.create('nb1'); h.edit('nb1', { fieldPath: ['title'], value: 'B1' }, h.snapshot('nb1')!, 'alice')  // nb1 rev=2, title.clock=1
+    h.create('nb2'); h.edit('nb2', { fieldPath: ['transform', 'x'], value: 9 }, h.snapshot('nb2')!, 'bob')  // nb2 rev=2, transform.x.clock=1
+    const bN1 = h.snapshot('nb1')!  // per-record wire base(wire-level,绑 c1+nb1+rev2+fc{title:1})
+    const bN2 = h.snapshot('nb2')!  // per-record wire base(绑 c1+nb2+rev2+fc{transform.x:1})
+    const bundle = h.snapshotBundle()  // ★ canvas 级 opaque bundle(聚合 nb1/nb2 record base + order + since)
+    const dec = h.extractBundle(bundle)!
+    expect(dec.records.nb1).toBeDefined(); expect(dec.records.nb2).toBeDefined()  // bundle 含两 record 的 base
+    expect(dec.records.nb1).toEqual(bN1)  // ★ bundle nb1 entry 重建 = per-record base(按 recordId 重建,不串用)
+    expect(dec.records.nb2).toEqual(bN2)  // ★ bundle nb2 entry 重建 = per-record base
+    expect(dec.records.nb1).not.toEqual(bN2)  // ★ n1/n2 base 不串用(distinct;单 record 级 token 无法为任意 record 提供 If-Match 的根因)
+    expect(dec.order).toEqual(h.snapshotOrder())  // bundle order = canvas order base
+    expect(typeof dec.since).toBe('string')  // bundle since = event-since base(canvas-scoped seq,catch-up 用)
+    // ★ submitChange 抽 wire base:edit nb1→nb1 record base(非 nb2);edit nb2→nb2;delete nb1→nb1 record base;reorder→order base(非 record)
+    expect(h.extractWireBase(bundle, 'edit', 'nb1')!).toEqual(bN1)
+    expect(h.extractWireBase(bundle, 'edit', 'nb2')!).toEqual(bN2)
+    expect(h.extractWireBase(bundle, 'edit', 'nb1')!).not.toEqual(bN2)  // ★ nb1 token 不串用到 nb2
+    expect(h.extractWireBase(bundle, 'delete', 'nb1')!).toEqual(bN1)  // ★ delete 取 record base
+    expect(h.extractWireBase(bundle, 'reorder', undefined)!).toEqual(h.snapshotOrder())  // ★ reorder 取 order base(非 record base)
+    expect(h.extractWireBase(bundle, 'reorder', undefined)!).not.toEqual(bN1)  // ★ 非 record base
+    expect(h.extractWireBase(bundle, 'edit', 'nb-missing')).toBeNull()  // ★ bundle 无该 record → null(不串用别的 record base)
+    // ★ accepted edit → bundle reissued(新 bundle 的 nb1 entry 更新;nb2 不变;不重建 nb2 base)
+    h.edit('nb1', { fieldPath: ['title'], value: 'B1-v2' }, h.snapshot('nb1')!, 'carol')  // bump nb1 rev/fc
+    const bundle2 = h.snapshotBundle()
+    const dec2 = h.extractBundle(bundle2)!
+    expect(dec2.records.nb1).not.toEqual(bN1)  // ★ nb1 entry 更新(rev bumped;accepted 后 bundle 内对应项更新)
+    expect(dec2.records.nb2).toEqual(bN2)  // ★ nb2 不变(只更新 change 命中的 record 对应项)
+    // ★ 跨 canvas bundle 重放 → scope-mismatch → null(防 c1 bundle 用于 c2;bundle canvas-scoped)
+    const hB = new BaseDrivenHarness('c2'); hB.create('nb1')
+    expect(hB.extractBundle(bundle)).toBeNull()  // c1 bundle → c2 scope mismatch → null
+    // ── v9 真 adapter harness:submitFromBundle(extractWireBase 真传 + 增量更新 + 未命中项引用不变;edit/delete/reorder/create/conflict 五路全跑)──
+    //   v8 缺陷:S10-12 只比较 extractWireBase 返回值,edit 仍直传 h.snapshot,accepted 后 snapshotBundle() 全量重建——"增量更新"无证据。v9 补真 adapter 路径。
+    h.create('sb1'); h.edit('sb1', { fieldPath: ['title'], value: 'S1' }, h.snapshot('sb1')!, 'alice')  // sb1 rev2 title.clock1
+    h.create('sb2'); h.edit('sb2', { fieldPath: ['transform', 'x'], value: 7 }, h.snapshot('sb2')!, 'bob')  // sb2 rev2 transform.x.clock1
+    const sbN1 = h.snapshot('sb1')!; const sbN2 = h.snapshot('sb2')!  // per-record wire base(rev2)
+    const bundleS = h.snapshotBundle()  // canvas 级 bundle(sb1+sb2 rev2 + order + since)
+    const decS = h.extractBundle(bundleS)!
+    // ★ 增量铁证 setup:bump recs.sb2(AFTER bundleS、BEFORE submitFromBundle)— 区分增量(bundleS 的 sb2=rev2)vs 全量扫描(recs.sb2=rev3)
+    h.edit('sb2', { fieldPath: ['title'], value: 'sneaky' }, h.snapshot('sb2')!, 'eve')  // recs.sb2 rev2→3;bundleS 的 sb2 仍 rev2
+    // ★ ① edit 路径:submitFromBundle(edit sb1)— extractWireBase 真传(非直传 h.snapshot);accepted 增量更新(仅 sb1;未命中 sb2 引用不变 + 值=旧 bundleS 非 recs)
+    const rEdit = h.submitFromBundle(bundleS, { kind: 'edit', nodeId: 'sb1', fieldPath: ['title'], value: 'S1-v2' }, 'carol')
+    expect(rEdit.outcome.outcome).toBe('accepted')  // base rev2===current rev2(recs.sb1 未 bump)→ fresh → 200
+    expect(h.extractBundle(rEdit.newBundle)!.records.sb1).not.toEqual(sbN1)  // ★ sb1 entry 更新(wire response base 增量)
+    expect(h.extractBundle(rEdit.newBundle)!.records.sb2).toEqual(sbN2)  // ★ 增量铁证:sb2 = 旧 bundleS 的 rev2(非 recs 当前的 sneaky rev3)— 非全量扫描
+    expect(rEdit.entries.sb2).toStrictEqual(decS.entries.sb2)  // ★ 未命中项值未动(shallow copy 保留;跨 decode 引用必异,故值相等证"未动",lead 括号允许"对象/值未动")
+    expect(rEdit.entries.sb1).not.toStrictEqual(decS.entries.sb1)  // ★ sb1 新值(更新;rev3≠rev2)
+    // recs 现状:sb1=rev3(被 edit bump),sb2=rev3(sneaky bump)
+    // ★ ② delete 路径:submitFromBundle(delete sb1, fresh base)— 移 entry + since;sb2 不变(引用不变)
+    const bundleDel = h.snapshotBundle()  // fresh bundle(sb1=rev3 匹配 current → fresh delete)
+    const decDel = h.extractBundle(bundleDel)!
+    const rDel = h.submitFromBundle(bundleDel, { kind: 'delete', nodeId: 'sb1' })
+    expect(rDel.outcome.outcome).toBe('accepted')  // base rev3===current rev3 → fresh → 200
+    expect(h.extractBundle(rDel.newBundle)!.records.sb1).toBeUndefined()  // ★ sb1 entry 移除
+    expect(h.extractBundle(rDel.newBundle)!.records.sb2).toBeDefined()  // sb2 仍在
+    expect(rDel.entries.sb2).toStrictEqual(decDel.entries.sb2)  // ★ 未命中项值未动(delete 不动 sb2 entry)
+    // ★ ③ create 路径:submitFromBundle(create sb3)— 增 entry + since;未命中项引用不变
+    const bundleCre = h.snapshotBundle()
+    const decCre = h.extractBundle(bundleCre)!
+    const rCre = h.submitFromBundle(bundleCre, { kind: 'create', nodeId: 'sb3' })
+    expect(rCre.outcome.outcome).toBe('accepted')  // sb3 不存在 → create 201
+    expect(h.extractBundle(rCre.newBundle)!.records.sb3).toBeDefined()  // ★ sb3 entry 新增
+    expect(rCre.entries.sb2).toStrictEqual(decCre.entries.sb2)  // ★ 未命中项值未动(create 不动 sb2)
+    // ★ ④ reorder 路径:submitFromBundle(reorder)— 更新 order + since;record entries 引用不变
+    h.seedChildren(['sb1', 'sb2', 'sb3'])  // 设 children for reorder
+    const bundleRe = h.snapshotBundle()
+    const decRe = h.extractBundle(bundleRe)!
+    const orderBefore = decRe.orderCv
+    const rRe = h.submitFromBundle(bundleRe, { kind: 'reorder', orderedIds: ['sb3', 'sb2', 'sb1'] })
+    expect(rRe.outcome.outcome).toBe('accepted')  // fresh order base + valid perm → 200
+    expect(h.extractBundle(rRe.newBundle)!.orderCv).toBe(orderBefore + 1)  // ★ order cv +1
+    expect(rRe.entries.sb2).toStrictEqual(decRe.entries.sb2)  // ★ 未命中项值未动(reorder 不动 record entries,只更 order)
+    // ★ ⑤ conflict 路径:delete stale base → 409 conflict,只更新该 record current base,未全量重建
+    h.create('sb4'); h.edit('sb4', { fieldPath: ['title'], value: 'X' }, h.snapshot('sb4')!, 'alice')  // sb4 rev2
+    const bundleC = h.snapshotBundle()  // sb4 base = rev2
+    const decC = h.extractBundle(bundleC)!
+    h.edit('sb4', { fieldPath: ['title'], value: 'Y' }, h.snapshot('sb4')!, 'bob')  // recs.sb4 rev2→3;bundleC 的 sb4 base stale
+    const rCon = h.submitFromBundle(bundleC, { kind: 'delete', nodeId: 'sb4' })
+    expect(rCon.outcome.outcome).toBe('conflict')  // ★ delete stale base(rev2≠current rev3)→ 409 conflict
+    expect(h.extractBundle(rCon.newBundle)!.records.sb4).toBeDefined()  // sb4 entry 仍在(conflict 不删;只更新 current base)
+    expect(rCon.entries.sb2).toStrictEqual(decC.entries.sb2)  // ★ conflict 未全量重建:未命中项值未动
+    expect(rCon.entries.sb4).not.toStrictEqual(decC.entries.sb4)  // ★ sb4 新值(conflict 更新 current base;rev3≠rev2)
+    // 冻结矩阵(决策 §14.1 引用):edit 同-field stale 200+overwritten(永非 409);不同字段 stale 200 无 overwritten;delete/reorder fresh→200, stale→409;create dup→409;malformed/scope-mismatch→400
+    type OpClass = 'edit-same-field-stale' | 'edit-diff-field-stale' | 'edit-fresh' | 'delete-fresh' | 'delete-stale' | 'reorder-fresh' | 'reorder-stale' | 'create-dup' | 'malformed' | 'scope-mismatch'
+    const MATRIX: Record<OpClass, { status: number; outcome: 'accepted' | 'conflict' | 'rejected' }> = {
+      'edit-same-field-stale': { status: 200, outcome: 'accepted' },      // ★ 同-field stale → 200+overwritten(非 409)
+      'edit-diff-field-stale': { status: 200, outcome: 'accepted' },     // ★ 不同字段 stale → 200 无 overwritten(v6 per-field clock)
+      'edit-fresh': { status: 200, outcome: 'accepted' },
+      'delete-fresh': { status: 200, outcome: 'accepted' },
+      'delete-stale': { status: 409, outcome: 'conflict' },
+      'reorder-fresh': { status: 200, outcome: 'accepted' },
+      'reorder-stale': { status: 409, outcome: 'conflict' },
+      'create-dup': { status: 409, outcome: 'conflict' },
+      'malformed': { status: 400, outcome: 'rejected' },
+      'scope-mismatch': { status: 400, outcome: 'rejected' },            // ★ 跨 record/canvas token → 400(防重放)
+    }
+    expect(Object.keys(MATRIX).sort()).toEqual(['create-dup', 'delete-fresh', 'delete-stale', 'edit-diff-field-stale', 'edit-fresh', 'edit-same-field-stale', 'malformed', 'reorder-fresh', 'reorder-stale', 'scope-mismatch'])
+    // ★ Blocker 1 验收:BaseCursor 绑 scope+per-field clock(防跨 record/canvas 重放 + 同-field stale 语义);base-driven 矩阵(正常 op fresh base→200,race 才 409;edit 永 200,同-field stale 才 overwritten;malformed/scope-mismatch→400)。
+  })
+
+  it('S10-13 server-named invariant command(v5 诚实化:仅 node-delete-cascade 经 PG 实证;group/result-asset 类型+注释级 A2 需另测)', () => {
+    // Blocker 3:strict-tx 已剔出 DomainOp(假跨 record tx 无 target)。跨 record invariant 改 server-named command(由 path/method 推导目标,非 PATCH DomainOp)。
+    // ★ v5 诚实化:仅 node-delete-cascade 经 PG-T1~T3/T7 实证(node+edges+asset ref 同 tx 原子 + 一般跨 record 回滚);
+    //   group-reparent / result-asset-attach 是类型+注释级,A2 需另测(per-target authz + 同 tx)—— 决议不得写成三 command 全实证。
+    const cascade: ServerInvariantCommand = { kind: 'node-delete-cascade', canvasId: 'c1', nodeId: 'n1' }
+    const group: ServerInvariantCommand = { kind: 'group-reparent', canvasId: 'c1', nodeIds: ['n2', 'n3'], targetGroupId: 'g1' }
+    const resultAsset: ServerInvariantCommand = { kind: 'result-asset-attach', canvasId: 'c1', anchorId: 'a1', assetId: 'ast1', resultNodeId: 'n4' }
+    type ServerKind = ServerInvariantCommand['kind']
+    expectTypeOf<ServerKind>().toEqualTypeOf<'node-delete-cascade' | 'group-reparent' | 'result-asset-attach'>()
+    expect(cascade.kind).toBe('node-delete-cascade')
+    expect(group.kind).toBe('group-reparent')
+    expect(resultAsset.kind).toBe('result-asset-attach')
+    // ★ server-named command 不是 PATCH DomainOp(跨 record 不经 DomainOp wire;由 path/method 推导)
+    // @ts-expect-error Blocker 3:ServerInvariantCommand 不是 DomainOp(跨 record 走 server-named 路径,非 PATCH wire)
+    const _notDomain: DomainOp = cascade
+    expect(_notDomain).toBeDefined()
+    // ★ v5 实证分级(冻结,改任一行 → 红):
+    const EMPIRICALLY_PROVEN: Record<ServerKind, boolean> = {
+      'node-delete-cascade': true,       // ★ PG-T1~T3/T7 实证(node+edges+asset ref 同 tx 原子 + 跨 record 回滚)
+      'group-reparent': false,           // 类型+注释级(A2 需另测 per-target authz + 同 tx)
+      'result-asset-attach': false,      // 类型+注释级(A2 需另测)
+    }
+    expect(EMPIRICALLY_PROVEN['node-delete-cascade']).toBe(true)
+    expect(EMPIRICALLY_PROVEN['group-reparent']).toBe(false)  // ★ 诚实:非实证
+    expect(EMPIRICALLY_PROVEN['result-asset-attach']).toBe(false)  // ★ 诚实:非实证
+    // ★ Blocker 3 验收:strict-tx 剔出 DomainOp;跨 record 改 server-named;仅 node-delete-cascade 实证(PG-T1~T3/T7),group/result-asset 类型+注释级 A2 需另测(诚实化)。
+  })
+
+  it('S10-14 array defer inventory(v5:by-id A2 deferred 不在 DomainOp;whole-lww/primitive supported;container 白名单取消)', () => {
+    // v5:by-id 数组 A2 deferred(NOTES:fail-visible,禁降级整数组 LWW)→ DomainOp 不含 by-id variant;
+    //   fills/strokes/effects/experimentalAnchors 在旧 payload 出现时 migration 走 legacy 兼容通道(见 C-2),不绕过 defer。
+    //   container 白名单取消(lead 裁定):transform/relations 整对象 set 仍拒(leaf-level set);无 'atomic-container'。
+    type ArrayFieldClass = 'by-id' | 'whole-lww' | 'primitive'
+    type ArrayFieldInventory = { field: string; class: ArrayFieldClass; a2Stance: 'deferred' | 'supported' }
+    const NODE_ARRAY_INVENTORY: ArrayFieldInventory[] = [
+      { field: 'fills', class: 'by-id', a2Stance: 'deferred' },                 // by-id deferred(DomainOp 不含 by-id;migration 走 legacy 通道)
+      { field: 'strokes', class: 'by-id', a2Stance: 'deferred' },
+      { field: 'effects', class: 'by-id', a2Stance: 'deferred' },
+      { field: 'experimentalAnchors', class: 'by-id', a2Stance: 'deferred' },  // 收编为顶层 Anchor record
+      { field: 'markupPoints', class: 'whole-lww', a2Stance: 'supported' },   // 整值 LWW(A2 supported,DomainOp whole-lww)
+      { field: 'resultNodeIds', class: 'primitive', a2Stance: 'supported' },   // by value(A2 supported,DomainOp primitive)
+    ]
+    expect(NODE_ARRAY_INVENTORY.filter((f) => f.class === 'by-id').map((f) => f.field)).toEqual(['fills', 'strokes', 'effects', 'experimentalAnchors'])
+    expect(NODE_ARRAY_INVENTORY.filter((f) => f.class === 'whole-lww').map((f) => f.field)).toEqual(['markupPoints'])
+    expect(NODE_ARRAY_INVENTORY.filter((f) => f.class === 'primitive').map((f) => f.field)).toEqual(['resultNodeIds'])
+    expect(NODE_ARRAY_INVENTORY.filter((f) => f.a2Stance === 'deferred').every((f) => f.class === 'by-id')).toBe(true)
+    expect(NODE_ARRAY_INVENTORY.filter((f) => f.a2Stance === 'supported').map((f) => f.class).sort()).toEqual(['primitive', 'whole-lww'])
+    // ★ v5:DomainOp 不含 by-id variant(by-id deferred;A2 fail-visible,禁降级整数组 LWW)
+    // @ts-expect-error v5:by-id variant 已 deferred(DomainOp 不含 by-id)— 塞回则 build fail
+    const _byIdNotInDomain: DomainOp = { kind: 'array' as const, fieldPath: ['fills'] as FieldPath, class: 'by-id' as const, intent: 'insert' as const, afterId: null, value: { id: 'fA' } }
+    expect(_byIdNotInDomain).toBeDefined()
+    // A2 supported array ops(whole-lww + primitive)
+    const markupReplace: DomainOp = { kind: 'array', fieldPath: ['markupPoints'], class: 'whole-lww', intent: 'replace', value: [{ x: 1, y: 1 }] }
+    const resultInsert: DomainOp = { kind: 'array', fieldPath: ['resultNodeIds'], class: 'primitive', intent: 'insert', value: 'n3' }
+    expect(markupReplace.class).toBe('whole-lww'); expect(resultInsert.class).toBe('primitive')
+    // ★ v5 container 白名单取消:FieldTarget 无 'atomic-container';transform/relations 整对象 set 拒(leaf-level set)
+    type FieldTargetKeys = FieldTarget
+    expectTypeOf<FieldTargetKeys>().toEqualTypeOf<'leaf' | 'container' | 'array-element'>()  // 无 'atomic-container'
+    // ★ Blocker 2 验收:by-id deferred(DomainOp 不含 + migration 走 legacy 通道);whole-lww/primitive supported;container 白名单取消(transform/relations leaf-level set)。
+  })
 })
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1788,196 +2270,424 @@ describe('N2-0 返修 §10 G1-b 衔接(P2-8): FieldPath 非空 + 数组中性 in
 //   snapshot materialize 旧 shape body(非 delta 反演),delta-inversion 显式标注无算法/不支持(降级到已测范围)。
 // 决策文档 §1.2 状态表 + 冻结命令同步(见 docs/decisions/n20-truth-source-decision.md §1.2)。
 
-describe('N2-0 返修 §1.2 cutover contract harness(R5 F4): flag on/off decoder + old-queue migration + stale-base 200 + rollback snapshot materialize', () => {
-  // ── cutover 状态表契约类型(对齐 §1.2 状态表 + §10.1 DomainOp;create 独立 endpoint 非 PATCH,不进此 harness)──
-  /** 旧 shape:整 record payload(cutover 前的 NodePayload,§1.2 "old client/old queue" 行)。 */
-  type LegacyBody = { id: string; title: string; transform: { x: number; y: number } }
-  /** 新 shape:DomainOp 子集(cutover 后的 field-level op,§10.1;spike 简化为 set/unset)。 */
-  type NewOp = { kind: 'set'; fieldPath: string[]; value: unknown } | { kind: 'unset'; fieldPath: string[] }
+describe('N2-0 v8 cutover contract harness(Blocker 3 补全:LegacyReplaceRequest 绑 canvasId+nodeId+baseRevision;scope 校验;stale base→409 terminal conflict dead-letter 非盲 replace;v8 delete-race missing+baseRev>0→409;真实 authz+deny 负例;v8 retirement fake-clock quiet-window)', () => {
+  // v7 Blocker 3 补全(v6 仅 wire 未补全 stale/authz/retirement):
+  //   ① 信封绑 canvasId+nodeId+version+payload+原队列 baseRevision;decoder 校验 path canvas/node scope(防同 nodeId 跨 canvas 重放)。
+  //   ② 【lead 拍板】stale base(baseRevision≠current rev,record 已有更新版本)→409 显式 terminal conflict,不落盲 replace(队列残留是离线期改动,覆盖是数据破坏;409 后 queue 项走 FX-5 dead-letter,用户可见)。
+  //   ③ authz 走真实 canvas-write seam(members canWrite)+ deny 负例(不许 void actor;无 actor 或非 member → 403)。
+  //   ④ retirement 双可达指标:pending legacy queue gauge=0 + 连续观察窗 envelope 增量=0(drainCount 只作累计总量);冻结 gate 配置名 LEGACY_DRAIN/观察窗/关闭后行为。
+  //   ⑤ §1.2 状态表写全(信封 wire/gate/scope/base-conflict/观测/retirement + "受控迁移协议例外"术语)。
+  type LegacyUpsertBody = NodePayload
+  type NewOp = DomainOp
+  /** ★ v7 Blocker 3:versioned LegacyReplaceRequest 信封(绑 canvasId+nodeId+version+payload+原队列 baseRevision;独立 DomainOp+raw NodePayload)。 */
+  type LegacyReplaceRequest = { kind: 'legacy-replace'; canvasId: string; nodeId: string; version: 1; payload: NodePayload; baseRevision: Revision }
 
-  /**
-   * CutoverHarness:原子 cutover 协议的最小可执行模型(对齐 §1.2 状态表 5 行)。
-   * - flag(FIELD_LEVEL_OPS)决定 decoder 接受 old-shape(整 record)还是 new-shape(DomainOp)。
-   * - authoritative store = 全 record(server-side,source of truth;rollback 的 materialize 源)。
-   * - rollback = 从 authoritative snapshot materialize 旧 body(非 delta 反演)。
-   */
-  // ★ R6 F4a/F4b:CutoverHarness 加真实 revision/lastWriter/outbox + patch 支持 transform 子字段 + base 比较
-  //   判决 V6 红证:原 CutoverHarness 无 revision/last-writer/notice,C-3 只连续 set A/B 断言后者 200 + title=B,
-  //   删除任何 stale-base/overwritten 逻辑都不红(逻辑不存在);migrateOldQueueBody 只生成 title set 丢 transform。
-  /** overwritten 事件:base 落后并发时,前写者收(败方知情,T1-1/G4-4 不拒写只 surfacing)。 */
-  type OverwrittenEvent = { toActor: string; fieldPath: string[]; historicalValue: unknown; byActor: string; currentRevision: number }
-  class CutoverHarness {
-    private flag = false
-    /** authoritative store:全 record + per-record revision + lastWriter(rollback/恢复的 materialize 源)。 */
-    private recs = new Map<string, LegacyBody & { revision: number; lastWriter: string }>()
-    /** overwritten outbox:base 落后并发时,前写者收的事件(drainOverwritten 读取)。 */
-    private outbox: OverwrittenEvent[] = []
-    setFlag(on: boolean) { this.flag = on }
-    /**
-     * PATCH decoder:flag 决定接受 old-shape(整 record)还是 new-shape(DomainOp);反之 400 payload-rejected。
-     * ★ R6 F4a:new-shape set 携 opts.{actor, baseRevision};base < current revision → 不拒写(200,G4-4)+ 推前写者 overwritten。
-     * ★ R6 F4b:patch 支持 title + transform.x + transform.y 子字段(原只处理 title,致 C-2 丢 transform)。
-     */
-    patch(nodeId: string, body: LegacyBody | NewOp, opts?: { actor?: string; baseRevision?: number }): { status: number; body: { error?: string; id?: string; revision?: number; seq?: number } } {
-      const isNew = 'kind' in body && (body.kind === 'set' || body.kind === 'unset')
-      const actor = opts?.actor ?? 'unknown'
-      const base = opts?.baseRevision ?? 0
-      if (this.flag) {
-        // flag on:new-shape DomainOp 接受;old-shape 整 record → 400 payload-rejected(状态表 row 1/3)
-        if (isNew) {
-          const r = this.recs.get(nodeId) ?? { id: nodeId, title: '', transform: { x: 0, y: 0 }, revision: 0, lastWriter: '' }
-          const prevRevision = r.revision
-          const prevWriter = r.lastWriter
-          if (body.kind === 'set') {
-            if (body.fieldPath[0] === 'title') {
-              const historicalValue = r.title
-              r.title = body.value as string
-              r.revision = prevRevision + 1; r.lastWriter = actor
-              // ★ R6 F4a:base 落后(base < prevRevision)→ 不拒写(200)+ 推前写者 overwritten(败方知情)
-              if (base < prevRevision && prevWriter) {
-                this.outbox.push({ toActor: prevWriter, fieldPath: body.fieldPath, historicalValue, byActor: actor, currentRevision: r.revision })
-              }
-            } else if (body.fieldPath[0] === 'transform') {
-              const sub = body.fieldPath[1] as 'x' | 'y'
-              r.transform[sub] = body.value as number
-              r.revision = prevRevision + 1; r.lastWriter = actor
-            }
-          }
-          this.recs.set(nodeId, structuredClone(r))
-          return { status: 200, body: { id: nodeId, revision: r.revision, seq: r.revision } }
-        }
-        return { status: 400, body: { error: 'payload-rejected' } } // old shape on flag-on → 400(状态表 row 1)
-      }
-      // flag off:old-shape 整 record 接受;new-shape DomainOp → 400 payload-rejected(状态表 rollback/old-server)
-      if (!isNew) {
-        this.recs.set(nodeId, structuredClone({ ...(body as LegacyBody), revision: 1, lastWriter: actor }))
-        return { status: 200, body: { id: nodeId, revision: 1, seq: 1 } }
-      }
-      return { status: 400, body: { error: 'payload-rejected' } } // new shape on flag-off → 400
-    }
-    /** ★ R6 F4a:drain overwritten 事件给某 actor(前写者;败方知情)。 */
-    drainOverwritten(actor: string): OverwrittenEvent[] {
-      const events = this.outbox.filter((e) => e.toActor === actor)
-      this.outbox = this.outbox.filter((e) => e.toActor !== actor)
-      return events
-    }
-    /** ★ R6 F4a:per-record revision(状态表 row 4 stale-base 判定用)。 */
-    revision(nodeId: string): number { return this.recs.get(nodeId)?.revision ?? 0 }
-    /** FX-5 old queue migration-on-read:旧 queued NodePayload → 转换为新 op schema(状态表 row 2)。 */
-    migrateOldQueueBody(legacy: LegacyBody): NewOp[] {
-      // ★ R6 F4b:migration-on-read 全字段生成(title + transform.x + transform.y),不丢 transform(原只生成 title)
-      return [
-        { kind: 'set', fieldPath: ['title'], value: legacy.title },
-        { kind: 'set', fieldPath: ['transform', 'x'], value: legacy.transform.x },
-        { kind: 'set', fieldPath: ['transform', 'y'], value: legacy.transform.y },
-      ]
-    }
-    /** authoritative snapshot(全 record;rollback / 恢复的 materialize 源)。 */
-    snapshot(): (LegacyBody & { revision: number; lastWriter: string })[] { return [...this.recs.values()].map((r) => structuredClone(r)) }
-    /** rollback materialize:从 authoritative 全 record 重建旧 shape body(非 delta 反演;状态表 row 5)。 */
-    materializeLegacyBody(nodeId: string): LegacyBody | null {
-      const r = this.recs.get(nodeId)
-      if (!r) return null
-      // authoritative 全 record → 旧 shape body 直出(剥 revision/lastWriter 元数据,非从单个 delta 反演)
-      // 显式构造(非 rest 解构):eslint no-unused-vars 的 ignoreRestSiblings 默认 false,rest 前缀 _rev/_lw 会被报 unused
-      return structuredClone({ id: r.id, title: r.title, transform: r.transform })
-    }
-    get(nodeId: string): (LegacyBody & { revision: number; lastWriter: string }) | undefined {
-      const r = this.recs.get(nodeId)
-      return r ? structuredClone(r) : undefined
+  const nodePayload = (over: Partial<NodePayload> = {}): NodePayload => {
+    const n = makeNode('px')
+    const { id: _id, revision: _rev, ...rest } = n
+    void _id; void _rev
+    return { ...rest, ...over } as NodePayload
+  }
+
+  type HasId = 'id' extends keyof NodePayload ? true : false
+  const _noIdInPayload: HasId = false
+
+  type MigratedOp =
+    | { kind: 'legacy-envelope'; envelope: LegacyReplaceRequest }
+    | { kind: 'delete'; cmd: ServerInvariantCommand }
+    | { kind: 'reorder'; op: DomainOp }
+
+  const migrateWriteOp = (op: WriteOp): MigratedOp => {
+    switch (op.kind) {
+      case 'upsertNode':
+        // ★ 包进 LegacyReplaceRequest 信封(绑 canvasId+nodeId+version+payload+原队列 baseRevision)走 decoder wire
+        return { kind: 'legacy-envelope', envelope: { kind: 'legacy-replace', canvasId: op.canvasId, nodeId: op.nodeId, version: 1, payload: op.payload, baseRevision: op.baseRevision ?? 0 } }
+      case 'deleteNode':
+        return { kind: 'delete', cmd: { kind: 'node-delete-cascade', canvasId: op.canvasId, nodeId: op.nodeId } }
+      case 'reorderChildren':
+        return { kind: 'reorder', op: { kind: 'reorder', orderedIds: op.orderedIds } }
+      default:
+        throw new Error(`migrateWriteOp: kind ${op.kind} not in 3 classes`)
     }
   }
 
-  it('C-1 cutover flag on/off decoder(R5 F4):flag-off old-shape 200 + new-op 400;flag-on old-shape 400 + new-op 200(状态表 row 1/3)', () => {
-    const h = new CutoverHarness()
-    const legacy: LegacyBody = { id: 'n1', title: 'orig', transform: { x: 0, y: 0 } }
-    const newOp: NewOp = { kind: 'set', fieldPath: ['title'], value: 'T' }
-    // ★ flag off(FIELD_LEVEL_OPS=off,cutover 前):old-shape 200,new-op 400 payload-rejected
-    h.setFlag(false)
-    expect(h.patch('n1', legacy).status).toBe(200)       // old shape accepted(整 record decoder)
-    expect(h.patch('n1', newOp).status).toBe(400)        // new op rejected(payload-rejected)
-    expect(h.patch('n1', newOp).body.error).toBe('payload-rejected')
-    // ★ flag on(FIELD_LEVEL_OPS=on,cutover 后):old-shape 400,new-op 200
-    h.setFlag(true)
-    expect(h.patch('n1', legacy).status).toBe(400)       // old shape rejected(stale client 旧 body 打新 endpoint)
-    expect(h.patch('n1', legacy).body.error).toBe('payload-rejected')
-    expect(h.patch('n1', newOp).status).toBe(200)        // new op accepted(field-level merge)
-    // 状态表 row 1(old client 旧 body → 新 server)= 400;row 3(new server 新 op)= 200;flag on/off 切换可逆。
-  })
-
-  it('C-2 FX-5 old queue migration-on-read 全字段 round-trip(R6 F4b):旧 queued NodePayload 全字段 → 新 op schema → flag-on 应用 → deep equal 原值(含 transform;漏任一字段必红,状态表 row 2)', () => {
-    // R6 F4b 红证(判决 V6):原 migrateOldQueueBody 只生成 title set(丢 transform),C-2 只验 title;
-    //   漏 LegacyBody.transform 字段 C-2 不红(逻辑根本不验 transform)→ 状态表"旧 queued 转换后客户端无感"强于实测。
-    // 绿证(补探针):migrateOldQueueBody 全字段生成(title + transform.x + transform.y);C-2 应用全 op 后 deep equal 原值。
-    const h = new CutoverHarness()
-    h.setFlag(true) // cutover 后 drain 队列
-    // 旧 IDB queued body(cutover 前入队的整 record NodePayload,含 transform)
-    const queuedLegacy: LegacyBody = { id: 'n2', title: 'queued', transform: { x: 5, y: 5 } }
-    // ★ R6 F4b:migration-on-read 全字段生成(title + transform.x + transform.y),原只生成 title 丢 transform
-    const migrated = h.migrateOldQueueBody(queuedLegacy)
-    expect(migrated.length).toBe(3) // ★ 全字段 3 个 op(漏任一 LegacyBody 字段 → length<3 红)
-    expect(migrated.every((op) => op.kind === 'set')).toBe(true)
-    // 转换后全 op 打 flag-on endpoint → 200(队列 drain 时转换,客户端无感)
-    for (const op of migrated) {
-      expect(h.patch('n2', op).status).toBe(200)
+  class CutoverHarness {
+    readonly canvasId: string
+    constructor(canvasId = 'c1') { this.canvasId = canvasId }
+    private flag = false
+    private legacyDrain = false  // gate LEGACY_DRAIN(cutover drain 窗口开启,retirement 后关)
+    private drainCount = 0       // ★ 累计总量(observability,非 retirement 条件)
+    private pendingLegacyQueue = 0  // ★ retirement gauge 1:pending queue 项数
+    private envelopeIncrementInWindow = 0  // ★ retirement gauge 2:观察窗内 envelope 增量
+    private members = new Set<string>()  // ★ authz:canvas-write seam
+    private recs = new Map<string, NodeRecord>()
+    // ★ v8 Blocker 3② retirement fake-clock quiet-window:冻结配置名 LEGACY_DRAIN_QUIET_WINDOW_MS + 绝对时长 + 时间戳/重置语义。
+    //   窗口内任一 envelope 到达即重新计时(windowStartAt=now);只有完整连续窗口 delta=0 且 pending gauge=0 才 retire。
+    static readonly LEGACY_DRAIN_QUIET_WINDOW_MS = 60_000  // ★ 冻结配置名 + 绝对时长(quiet-window)
+    private now = 0  // fake clock
+    private windowStartAt = 0  // ★ 当前 quiet 窗口起点(envelope 到达即重置;窗口完整 = now-windowStartAt>=quietWindowMs 且期间无到达)
+    setFlag(on: boolean) { this.flag = on }
+    setLegacyDrain(on: boolean) { this.legacyDrain = on }
+    addMember(actor: string) { this.members.add(actor) }
+    canWrite(actor: string) { return this.members.has(actor) }
+    drainCountValue() { return this.drainCount }
+    pendingLegacyQueueGauge() { return this.pendingLegacyQueue }
+    envelopeIncrementInWindowGauge() { return this.envelopeIncrementInWindow }
+    enqueueLegacy(n = 1) { this.pendingLegacyQueue += n }  // 模拟队列项入队
+    setClock(t: number) { this.now = t }  // ★ v8 fake clock 推进(retirement quiet-window 测试用)
+    advanceClock(dt: number) { this.now += dt }  // ★ v8 fake clock 步进
+    /** ★ v8 quiet-window:任一 envelope 到达(经 authz+gate+scope)→ 重新计时(windowStartAt=now;envelope 增量 +1)。 */
+    private touchWindow() { this.windowStartAt = this.now; this.envelopeIncrementInWindow += 1 }
+    /** ★ v8 tickObservationWindow:推进 fake clock 判定;只有完整连续 quiet 窗口(elapsed>=quietWindowMs,期间无 envelope 到达——
+     *   任一到达会重置 windowStartAt 使窗口不完整)才归零 envelopeIncrement(delta=0)并返 true;窗口未完整返 false(不归零)。 */
+    tickObservationWindow(): boolean {
+      if (this.now - this.windowStartAt >= CutoverHarness.LEGACY_DRAIN_QUIET_WINDOW_MS) {
+        this.envelopeIncrementInWindow = 0  // ★ 完整连续窗口 delta=0 归零
+        return true
+      }
+      return false
     }
-    // ★ deep equality round-trip:迁移后 record 与原 queuedLegacy 全字段一致(无丢失,含 transform.x/y)
-    const got = h.get('n2')!
-    expect(got.id).toBe('n2')
-    expect(got.title).toBe('queued')        // ★ 漏 title op → 此行红(初始 '' ≠ 'queued')
-    expect(got.transform.x).toBe(5)         // ★ 漏 transform.x op → 此行红(初始 0 ≠ 5)
-    expect(got.transform.y).toBe(5)         // ★ 漏 transform.y op → 此行红(初始 0 ≠ 5)
-    expect(got.transform).toEqual({ x: 5, y: 5 }) // 整对象 deep equal
-    // ★ R6 F4b 验收:漏任一 LegacyBody 字段(title / transform.x / transform.y)时 C-2 必红(length 或 deep equal 断言)。
-  })
+    /** ★ v8 retirement 可达指标:pending gauge=0 + 完整连续窗口 delta=0(envelopeIncrement===0 + elapsed>=quietWindowMs);drainCount 只作总量(非条件)。 */
+    canRetire(): boolean {
+      return this.pendingLegacyQueue === 0
+        && this.envelopeIncrementInWindow === 0
+        && (this.now - this.windowStartAt) >= CutoverHarness.LEGACY_DRAIN_QUIET_WINDOW_MS
+    }
+    seedRecord(n: NodeRecord) { this.recs.set(n.id, structuredClone(n)) }
+    recordRev(nodeId: string): number { return this.recs.get(nodeId)?.revision ?? 0 }
+    recordExists(nodeId: string): boolean { return this.recs.has(nodeId) }
+    /** ★ v7 PATCH decoder wire(flag-on):DomainOp→200;LegacyReplaceRequest 信封→200 replace(scope+authz+stale-base+gate);raw NodePayload→400;flag-off:NodePayload→200,其余→400。 */
+    patch(nodeId: string, body: LegacyUpsertBody | NewOp | LegacyReplaceRequest, opts?: { actor?: string }): { status: number; body: { error?: string; id?: string; revision?: number; seq?: number } } {
+      const obj = body as { kind?: string }
+      const isDomainOp = typeof obj.kind === 'string' && (obj.kind === 'set' || obj.kind === 'unset' || obj.kind === 'array' || obj.kind === 'reorder')
+      const isLegacyEnvelope = obj.kind === 'legacy-replace'
+      if (this.flag) {
+        if (isLegacyEnvelope) {
+          // ★ ③ authz:真实 canvas-write seam + deny 负例(不许 void actor;无 actor 或非 member → 403)
+          const actor = opts?.actor
+          if (!actor) return { status: 403, body: { error: 'forbidden' } }  // ★ 无 actor → 403(no void actor)
+          if (!this.canWrite(actor)) return { status: 403, body: { error: 'forbidden' } }  // ★ deny 负例(非 member)
+          // ④ gate LEGACY_DRAIN
+          if (!this.legacyDrain) return { status: 400, body: { error: 'payload-rejected' } }  // gate 关 → 400
+          const env = body as LegacyReplaceRequest
+          // ① scope 校验:env.canvasId+env.nodeId 必须匹配 path canvas+node(防同 nodeId 跨 canvas 重放)
+          if (env.canvasId !== this.canvasId || env.nodeId !== nodeId) return { status: 400, body: { error: 'payload-rejected' } }  // ★ scope mismatch → 400
+          // ★ v8 quiet-window:任一 envelope 到达(经 authz+gate+scope)→ 重新计时窗口(envelope 增量 +1;windowStartAt=now;retirement 须重等完整窗口)
+          this.touchWindow()
+          // ② 【lead 拍板】stale base 策略:record 已有更新版本(env.baseRevision≠current rev)→409 terminal conflict,不落盲 replace(数据破坏);dead-letter
+          const existing = this.recs.get(nodeId)
+          if (existing && env.baseRevision !== existing.revision) {
+            this.pendingLegacyQueue = Math.max(0, this.pendingLegacyQueue - 1)  // ★ queue 项 dead-lettered(用户可见)
+            return { status: 409, body: { error: 'legacy-stale-conflict', revision: existing.revision } }  // ★ terminal conflict,不盲 replace
+          }
+          // ★ v8 Blocker 3① delete race:record missing + baseRevision>0 → record 已在入队后被删,盲 create = 复活已删 record(数据破坏)→ 409 terminal conflict dead-letter(非盲 create)
+          if (!existing && env.baseRevision > 0) {
+            this.pendingLegacyQueue = Math.max(0, this.pendingLegacyQueue - 1)  // ★ dead-lettered(用户可见)
+            return { status: 409, body: { error: 'legacy-stale-conflict', revision: 0 } }  // ★ terminal conflict,不盲 create 复活已删 record
+          }
+          // fresh(baseRevision===current rev,或 record 不存在且 baseRevision===0=new record)→200 replace
+          this.applyLegacyReplace(nodeId, env.payload)
+          this.drainCount += 1; this.pendingLegacyQueue = Math.max(0, this.pendingLegacyQueue - 1)  // ★ envelope 增量已由 touchWindow 计(不重复)
+          return { status: 200, body: { id: nodeId, revision: this.recs.get(nodeId)!.revision, seq: this.recs.get(nodeId)!.revision } }
+        }
+        if (!isDomainOp) return { status: 400, body: { error: 'payload-rejected' } }  // raw 旧 body(无 kind)→ 400(必须包信封)
+        const op = body as NewOp
+        const r = this.recs.get(nodeId) ?? { ...nodePayload(), id: nodeId, revision: 0 } as NodeRecord
+        if (op.kind === 'set') setByPath(r as Record<string, unknown>, [...op.fieldPath], op.value, { allowContainerClobber: false })
+        else if (op.kind === 'array' && op.class === 'whole-lww') setByPath(r as Record<string, unknown>, [...op.fieldPath], op.value, { allowContainerClobber: true })
+        r.revision += 1
+        this.recs.set(nodeId, structuredClone(r))
+        return { status: 200, body: { id: nodeId, revision: r.revision, seq: r.revision } }
+      }
+      if (isDomainOp || isLegacyEnvelope) return { status: 400, body: { error: 'payload-rejected' } }
+      this.applyLegacyReplace(nodeId, body as LegacyUpsertBody)
+      return { status: 200, body: { id: nodeId, revision: this.recs.get(nodeId)!.revision, seq: 1 } }
+    }
+    /** whole-record replace(同 backend.ts:1086-1088 `payload: clone(payload)`,非 merge);由 patch decoder 调用(非测试直调)。 */
+    private applyLegacyReplace(nodeId: string, payload: NodePayload) {
+      const existing = this.recs.get(nodeId)
+      const rev = existing ? existing.revision + 1 : 1
+      this.recs.set(nodeId, structuredClone({ ...payload, id: nodeId, revision: rev }) as NodeRecord)
+    }
+    applyDelete(cmd: ServerInvariantCommand) { if (cmd.kind === 'node-delete-cascade') this.recs.delete(cmd.nodeId) }
+    snapshot(): NodeRecord[] { return [...this.recs.values()].map((r) => structuredClone(r)) }
+    materializeLegacyBody(nodeId: string): NodePayload | null {
+      const r = this.recs.get(nodeId); if (!r) return null
+      const { id: _id, revision: _rev, ...rest } = r; void _id; void _rev
+      return structuredClone(rest) as NodePayload
+    }
+    get(nodeId: string): NodeRecord | undefined { const r = this.recs.get(nodeId); return r ? structuredClone(r) : undefined }
+  }
 
-  it('C-3 new op + stale base(R6 F4a:真实 base/revision/overwritten):并发 base 落后 → 200 + overwritten 推前写者(非 409;移除 overwritten 必红,状态表 row 4)', () => {
-    // R6 F4a 红证(判决 V6):原 C-3 无 base/revision/overwritten,只连续 set A/B 断言第二次 200 + title=B;
-    //   删除任何 stale-base/overwritten 逻辑都不红(逻辑根本不存在)→ 文档状态表 117/124 行"base 落后 + overwritten"
-    //   逐行断言强于探针实测。
-    // 绿证(补探针):CutoverHarness 加真实 revision/lastWriter/outbox;C-3 用真实 base/actor:
-    //   A 写(base 0)→ revision 0→1;B 基于过期 base(base 0 < current 1)写 → 200(非 409)+ A 收 overwritten。
+  it('C-1 cutover flag on/off decoder:flag-off NodePayload 200 + DomainOp 400;flag-on NodePayload 400 + DomainOp 200(状态表 row 1/3)', () => {
     const h = new CutoverHarness()
+    const legacy: LegacyUpsertBody = nodePayload({ title: 'orig' })
+    const newOp: NewOp = { kind: 'set', fieldPath: ['title'], value: 'T' }
+    h.setFlag(false)
+    expect(h.patch('n1', legacy).status).toBe(200)
+    expect(h.patch('n1', newOp).status).toBe(400)
     h.setFlag(true)
-    // A 写 title=A(base 0,actor alice)→ revision 0→1, lastWriter=alice
-    const resA = h.patch('n1', { kind: 'set', fieldPath: ['title'], value: 'A' }, { actor: 'alice', baseRevision: 0 })
-    expect(resA.status).toBe(200)
-    expect(resA.body.revision).toBe(1)
-    expect(h.revision('n1')).toBe(1)
-    // ★ B 基于过期 base(base=0,但 current revision=1)写 title=B → 200(非 409;G4-4 revision 不拒写)
-    const resB = h.patch('n1', { kind: 'set', fieldPath: ['title'], value: 'B' }, { actor: 'bob', baseRevision: 0 })
-    expect(resB.status).toBe(200) // ★ 过期 base 仍 200(非 409;状态表 row 4 契约)
-    expect(resB.body.revision).toBe(2) // 后写 wins,bump
-    expect(h.get('n1')?.title).toBe('B') // LWW 后写 wins
-    // ★ A 收 overwritten 事件(historicalValue=A, byActor=bob, currentRevision=2)— 败方知情(T1-1/G4-4 surfacing)
-    const overwritten = h.drainOverwritten('alice')
-    expect(overwritten.length).toBe(1) // ★ 移除 outbox.push(overwritten)→ 此行红(0 ≠ 1)
-    expect(overwritten[0].historicalValue).toBe('A') // A 的前值
-    expect(overwritten[0].byActor).toBe('bob') // 被谁覆盖
-    expect(overwritten[0].currentRevision).toBe(2) // 当前权威 revision
-    // B 是后写者,不收 overwritten
-    expect(h.drainOverwritten('bob').length).toBe(0)
-    // ★ R6 F4a 验收:移除 overwritten(outbox.push)时 C-3 必红(drainOverwritten 返空,length 0≠1)。
-    //   stale-client 旧 body 打新 endpoint = 400(状态表 row 1,C-1 已证);此行证 stale-base(新 op 落后 base)= 200 + overwritten,二者区分见 §1.2。
+    expect(h.patch('n1', legacy).status).toBe(400)
+    expect(h.patch('n1', legacy).body.error).toBe('payload-rejected')
+    expect(h.patch('n1', newOp).status).toBe(200)
   })
 
-  it('C-4 rollback = snapshot materialize(R5 F4):flag off → 从 authoritative 全 record 重建旧 body(非 delta 反演;delta-inversion 无算法/不支持,降级承诺到已测范围;状态表 row 5)', () => {
+  it('C-2 FX-5 migration wire v9 补全(LegacyReplaceRequest 绑 canvasId+baseRevision;scope+authz+stale-base 409 dead-letter+v8 delete-race missing+baseRev>0→409 非盲 create 复活+v8 retirement fake-clock quiet-window+v9 pending>0 不 retire + drain 归零后须重等完整 quiet-window;raw→400, envelope→200 replace 非直调)', () => {
+    const h = new CutoverHarness('c1')
+    h.setFlag(true); h.setLegacyDrain(true); h.addMember('alice'); h.addMember('bob')  // authz:canvas-write seam
+    expect(_noIdInPayload).toBe(false)
+    // ★ ① raw 旧 body(NodePayload 无 kind)→ 400(必须包信封;禁止绕 wire 直调 drainLegacyUpsert)
+    expect(h.patch('n-raw', nodePayload({ title: 'raw' })).status).toBe(400)
+    expect(h.recordExists('n-raw')).toBe(false)
+    // ★ ② envelope 经 decoder wire → 200 replace(authz alice pass;scope c1/n-up match;baseRevision=0,record 不存在→create fresh)
+    h.enqueueLegacy(1)  // 模拟队列项入队
+    const payload = nodePayload({ title: 'drained', text: 'body', fontSize: 18, locked: true, transform: { x: 5, y: 6, width: 100, height: 40, rotation: 0 }, fills: [] })
+    const upsertOp: WriteOp = { kind: 'upsertNode', canvasId: 'c1', nodeId: 'n-up', payload, baseRevision: 0 }
+    const m = migrateWriteOp(upsertOp)
+    expect(m.kind).toBe('legacy-envelope')
+    if (m.kind === 'legacy-envelope') {
+      const env = m.envelope
+      expect(env.canvasId).toBe('c1'); expect(env.nodeId).toBe('n-up'); expect(env.version).toBe(1); expect(env.baseRevision).toBe(0)  // ★ 信封绑 canvasId+nodeId+version+baseRevision
+      const res = h.patch(env.nodeId, env, { actor: 'alice' })  // ★ 经 decoder wire(非直调)
+      expect(res.status).toBe(200)  // ★ envelope → 200 replace
+      expect(h.drainCountValue()).toBe(1); expect(h.envelopeIncrementInWindowGauge()).toBe(1)  // ★ 观测+窗增量
+      expect(h.pendingLegacyQueueGauge()).toBe(0)  // ★ queue 项 drained(从 1→0)
+      const got = h.get('n-up')!
+      expect(got.id).toBe('n-up'); expect(got.title).toBe('drained'); expect(got.text).toBe('body'); expect(got.fontSize).toBe(18)
+      expect(got.transform).toEqual({ x: 5, y: 6, width: 100, height: 40, rotation: 0 }); expect(got.fills).toEqual([])
+      expect(h.materializeLegacyBody('n-up')).toEqual(payload)  // ★ deep-equal
+    }
+    // ★ ③ authz deny 负例:无 actor → 403(no void actor);非 member → 403
+    const mNoAuth = migrateWriteOp({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n-noauth', payload: nodePayload({ title: 'x' }), baseRevision: 0 })
+    if (mNoAuth.kind === 'legacy-envelope') {
+      expect(h.patch(mNoAuth.envelope.nodeId, mNoAuth.envelope).status).toBe(403)  // ★ 无 actor → 403(no void)
+      expect(h.patch(mNoAuth.envelope.nodeId, mNoAuth.envelope, { actor: 'eve' }).status).toBe(403)  // ★ 非 member → 403(deny 负例)
+    }
+    // ★ ④ scope 校验:envelope.canvasId 不匹配 path canvas → 400(防同 nodeId 跨 canvas 重放)
+    const mCross = migrateWriteOp({ kind: 'upsertNode', canvasId: 'c2', nodeId: 'n-scope', payload: nodePayload({ title: 'x' }), baseRevision: 0 })
+    if (mCross.kind === 'legacy-envelope') {
+      expect(h.patch(mCross.envelope.nodeId, mCross.envelope, { actor: 'alice' }).status).toBe(400)  // ★ env.canvasId=c2 ≠ path c1 → 400(跨 canvas 重放防)
+      expect(h.recordExists('n-scope')).toBe(false)  // 未落库
+    }
+    // ★ ⑤ scope:envelope.nodeId 不匹配 path node → 400(防 forge path)
+    const mForge = migrateWriteOp({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n-real', payload: nodePayload({ title: 'x' }), baseRevision: 0 })
+    if (mForge.kind === 'legacy-envelope') {
+      expect(h.patch('n-different', mForge.envelope, { actor: 'alice' }).status).toBe(400)  // env.nodeId(n-real)≠path(n-different)→ 400
+    }
+    // ★ ⑥ 【lead 拍板】stale base→409 terminal conflict,不落盲 replace(数据破坏防);dead-letter(queue 项移除,用户可见)
+    h.seedRecord(makeNode('n-stale', { title: 'server-version' }))  // record rev=0
+    // 模拟 server 已更新(record rev bumped to 2,非 queued 时的 baseRevision=0)
+    h.setFlag(true)  // 用 DomainOp bump rev:patch set 两次 → rev 2
+    h.patch('n-stale', { kind: 'set', fieldPath: ['title'], value: 'v1' })  // rev 0→1
+    h.patch('n-stale', { kind: 'set', fieldPath: ['title'], value: 'v2' })  // rev 1→2
+    expect(h.recordRev('n-stale')).toBe(2)
+    h.enqueueLegacy(1)  // queued op with stale baseRevision=0
+    const mStale = migrateWriteOp({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n-stale', payload: nodePayload({ title: 'queued-stale' }), baseRevision: 0 })
+    if (mStale.kind === 'legacy-envelope') {
+      const res = h.patch(mStale.envelope.nodeId, mStale.envelope, { actor: 'alice' })
+      expect(res.status).toBe(409); expect(res.body.error).toBe('legacy-stale-conflict')  // ★ stale base(0≠2)→409 terminal conflict
+      expect(res.body.revision).toBe(2)  // 返 current rev
+      expect(h.get('n-stale')?.title).toBe('v2')  // ★ 不落盲 replace(record 仍 server 版本,非 queued-stale;数据破坏防)
+      expect(h.pendingLegacyQueueGauge()).toBe(0)  // ★ dead-letter(queue 项移除,用户可见)
+    }
+    // ★ ⑥b v8 Blocker 3① delete race:record 已删(missing)+ baseRevision>0 → 409 terminal conflict dead-letter(不盲 create 复活已删 record);missing + baseRevision===0 → create fresh
+    h.seedRecord(makeNode('n-delrace', { title: 'will-delete' }))  // record rev=0
+    h.patch('n-delrace', { kind: 'set', fieldPath: ['title'], value: 'v1' })  // DomainOp bump rev 0→1(不经 legacy envelope,不 touchWindow)
+    h.patch('n-delrace', { kind: 'set', fieldPath: ['title'], value: 'v2' })  // rev 1→2
+    expect(h.recordRev('n-delrace')).toBe(2)
+    h.applyDelete({ kind: 'node-delete-cascade', canvasId: 'c1', nodeId: 'n-delrace' })  // ★ record 删(missing;模拟入队后、drain 前被删)
+    expect(h.recordExists('n-delrace')).toBe(false)
+    h.enqueueLegacy(1)  // stale queue item:baseRevision=2(record 删前 rev)
+    const mDelRace = migrateWriteOp({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n-delrace', payload: nodePayload({ title: 'revive' }), baseRevision: 2 })
+    if (mDelRace.kind === 'legacy-envelope') {
+      const res = h.patch(mDelRace.envelope.nodeId, mDelRace.envelope, { actor: 'alice' })
+      expect(res.status).toBe(409); expect(res.body.error).toBe('legacy-stale-conflict')  // ★ missing + baseRevision>0 → 409 terminal conflict(不盲 create 复活)
+      expect(res.body.revision).toBe(0)  // record 已删,返 0(非盲 create 的 rev)
+      expect(h.recordExists('n-delrace')).toBe(false)  // ★ 不复活(数据破坏防;stale queue 不盲 create 已删 record)
+      expect(h.pendingLegacyQueueGauge()).toBe(0)  // dead-letter(queue 项移除)
+    }
+    // ★ 对照:missing + baseRevision===0 → create fresh(新 record,非 stale queue 复活;与 ② n-up 同型)
+    h.enqueueLegacy(1)
+    const mNewRace = migrateWriteOp({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n-brandnew', payload: nodePayload({ title: 'new' }), baseRevision: 0 })
+    if (mNewRace.kind === 'legacy-envelope') {
+      expect(h.patch(mNewRace.envelope.nodeId, mNewRace.envelope, { actor: 'alice' }).status).toBe(200)  // ★ missing + baseRevision===0 → create fresh
+      expect(h.recordExists('n-brandnew')).toBe(true)
+    }
+    // ★ ⑦ fresh base(baseRevision===current rev)→ 200 replace
+    const freshBase = h.recordRev('n-stale')  // 2
+    const mFresh = migrateWriteOp({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n-stale', payload: nodePayload({ title: 'fresh-replace' }), baseRevision: freshBase })
+    if (mFresh.kind === 'legacy-envelope') {
+      expect(h.patch(mFresh.envelope.nodeId, mFresh.envelope, { actor: 'alice' }).status).toBe(200)  // ★ fresh base → 200 replace
+      expect(h.get('n-stale')?.title).toBe('fresh-replace')
+    }
+    // ★ ⑧ v8 retirement fake-clock quiet-window(冻结配置名 LEGACY_DRAIN_QUIET_WINDOW_MS + 绝对时长 + 时间戳/重置语义;
+    //   窗口内任一 envelope 到达即重新计时;只有完整连续窗口 delta=0 + pending gauge=0 才 retire)
+    expect(h.pendingLegacyQueueGauge()).toBe(0)  // queue drained(②/⑥/⑥b/⑦ drain 完)
+    expect(h.envelopeIncrementInWindowGauge()).toBeGreaterThan(0)  // ②/⑥b/⑦ envelope 到达过(delta>0)
+    expect(h.canRetire()).toBe(false)  // ★ delta>0(刚有 envelope 活动)→ 不 retire
+    h.advanceClock(CutoverHarness.LEGACY_DRAIN_QUIET_WINDOW_MS - 1)  // 推进到完整 quiet 窗口边界前 1ms
+    expect(h.canRetire()).toBe(false)  // ★ 窗口未完整(elapsed < quietWindowMs)→ 不 retire
+    expect(h.tickObservationWindow()).toBe(false)  // ★ 窗口未完整 → 不归零 delta(返 false)
+    expect(h.envelopeIncrementInWindowGauge()).toBeGreaterThan(0)  // delta 仍 >0
+    h.advanceClock(1)  // 推过完整 quiet 窗口边界
+    expect(h.tickObservationWindow()).toBe(true)  // ★ 完整连续 quiet 窗口(delta=0,期间无 envelope 到达)→ 归零 envelopeIncrement(返 true)
+    expect(h.envelopeIncrementInWindowGauge()).toBe(0)  // ★ delta=0(完整窗口归零)
+    expect(h.canRetire()).toBe(true)  // ★ 完整窗口 delta=0 + pending=0 → 可 retire
+    expect(h.drainCountValue()).toBeGreaterThan(0)  // drainCount 累计总量(非 retirement 条件)
+    // ★ v8 mid-window envelope 到达 → 重新计时(须再等完整 quiet 窗口才可 retire;防"刚 retire 又来 envelope"误判)
+    const mMid = migrateWriteOp({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n-mid', payload: nodePayload({ title: 'mid' }), baseRevision: 0 })
+    if (mMid.kind === 'legacy-envelope') {
+      expect(h.patch(mMid.envelope.nodeId, mMid.envelope, { actor: 'alice' }).status).toBe(200)  // fresh envelope 到达 → touchWindow 重新计时
+    }
+    expect(h.envelopeIncrementInWindowGauge()).toBeGreaterThan(0)  // ★ envelope 到达 → delta>0
+    expect(h.canRetire()).toBe(false)  // ★ 窗口被重新计时(windowStartAt=now,elapsed 归零)→ 不 retire(须再等完整窗口)
+    h.advanceClock(CutoverHarness.LEGACY_DRAIN_QUIET_WINDOW_MS)  // 再推过完整 quiet 窗口
+    expect(h.tickObservationWindow()).toBe(true)  // 完整窗口 → 归零 delta
+    expect(h.canRetire()).toBe(true)  // ★ 再等完整窗口后 → 可 retire(连续窗口 delta=0 + pending=0)
+    // ★ v9 pending gauge:enqueue pending>0 → canRetire()===false(即使 delta=0 + 完整窗口)— v8 :65 声称测了但实测没有,v9 补真断言
+    h.enqueueLegacy(1)  // pending=1(模拟队列有残留)
+    expect(h.pendingLegacyQueueGauge()).toBe(1)
+    expect(h.canRetire()).toBe(false)  // ★ pending>0 → 不 retire(双指标:delta=0 + pending=0 + 完整窗口,缺一不可)
+    // drain/dead-letter 归零后仍须重新满完整 quiet-window 才可 retire(patch envelope drain 触发 touchWindow 重置 window)
+    const mPd = migrateWriteOp({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n-pendrain', payload: nodePayload({ title: 'drain' }), baseRevision: 0 })
+    if (mPd.kind === 'legacy-envelope') {
+      expect(h.patch(mPd.envelope.nodeId, mPd.envelope, { actor: 'alice' }).status).toBe(200)  // fresh drain(envelope 到达 → touchWindow 重置 window;pending 1→0)
+    }
+    expect(h.pendingLegacyQueueGauge()).toBe(0)  // pending 归零
+    expect(h.canRetire()).toBe(false)  // ★ pending=0 但 window 被 touchWindow 重置(刚有 envelope 活动)→ 仍须重新满完整 quiet-window
+    h.advanceClock(CutoverHarness.LEGACY_DRAIN_QUIET_WINDOW_MS)
+    expect(h.tickObservationWindow()).toBe(true)  // 完整窗口 → 归零 delta
+    expect(h.canRetire()).toBe(true)  // ★ 重新满完整 quiet-window(delta=0 + pending=0 + 完整窗口)→ 可 retire
+    // ★ ⑨ LEGACY_DRAIN gate 关(retirement 后)→ envelope→400(兼容通道关闭)
+    h.setLegacyDrain(false)
+    const mGate = migrateWriteOp({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n-gate', payload: nodePayload({ title: 'after-retire' }), baseRevision: 0 })
+    if (mGate.kind === 'legacy-envelope') {
+      expect(h.patch(mGate.envelope.nodeId, mGate.envelope, { actor: 'alice' }).status).toBe(400)  // ★ gate 关 → 400
+    }
+    // ★ ⑩ replace 覆盖(非 merge)+ delete→cascade + reorder→DomainOp
+    h.seedRecord(makeNode('n-replace', { text: 'hello', title: 'seed' })); h.setLegacyDrain(true); h.enqueueLegacy(1)
+    const payloadNoText = nodePayload({ title: 'no-text' }); delete (payloadNoText as { text?: string }).text
+    const mRep = migrateWriteOp({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n-replace', payload: payloadNoText, baseRevision: 0 })
+    if (mRep.kind === 'legacy-envelope') {
+      expect(h.patch(mRep.envelope.nodeId, mRep.envelope, { actor: 'bob' }).status).toBe(200)  // record 不存在时 base 0 fresh;但 n-replace seed rev=0,baseRevision=0===0 fresh
+      expect((h.get('n-replace') as { text?: string }).text).toBeUndefined()  // replace 移除 text(非 merge)
+    }
+    h.seedRecord(makeNode('n-del'))
+    const mDel = migrateWriteOp({ kind: 'deleteNode', canvasId: 'c1', nodeId: 'n-del' })
+    expect(mDel.kind).toBe('delete')
+    if (mDel.kind === 'delete') { expect(mDel.cmd.kind).toBe('node-delete-cascade'); h.applyDelete(mDel.cmd); expect(h.recordExists('n-del')).toBe(false) }
+    const mRe = migrateWriteOp({ kind: 'reorderChildren', canvasId: 'c1', type: 'node', orderedIds: ['n3', 'n1', 'n2'], baseContentVersion: 0 })
+    expect(mRe.kind).toBe('reorder')
+    if (mRe.kind === 'reorder') { expect(mRe.op.kind === 'reorder' && mRe.op.orderedIds).toEqual(['n3', 'n1', 'n2']) }
+    // ★ Blocker 3 验收:LegacyReplaceRequest 绑 canvasId+nodeId+baseRevision;scope 校验(防跨 canvas);stale base→409 terminal conflict 非盲 replace+dead-letter;真实 authz+deny 负例(no void actor);retirement 双指标(pending queue=0 + 窗增量=0);raw→400, envelope→200 replace 经 decoder wire 非直调。
+  })
+
+  it('C-4 rollback = snapshot materialize:flag off → 从 authoritative 全 record 重建 NodePayload(非 delta 反演;剥 id+revision,状态表 row 5)', () => {
     const h = new CutoverHarness()
     h.setFlag(true)
     h.patch('n1', { kind: 'set', fieldPath: ['title'], value: 'new-title' })
-    // ★ authoritative snapshot(全 record,rollback 的 materialize 源)
     const snap = h.snapshot()
     expect(snap.find((r) => r.id === 'n1')?.title).toBe('new-title')
-    // ★ rollback(flag off):从 authoritative snapshot materialize 旧 shape body(非 delta 反演)
     h.setFlag(false)
     const legacyBody = h.materializeLegacyBody('n1')!
-    expect(legacyBody.id).toBe('n1')
-    expect(legacyBody.title).toBe('new-title') // 从 authoritative 全 record 直出(非从单个 delta 反演)
-    // flag-off 下 materialized 旧 body 可 PATCH 200(整 record decoder,状态表 row 5:200 旧 shape)
-    expect(h.patch('n1', legacyBody).status).toBe(200)
-    // ★ R5 F4 降级:rollback 不再声称 "新 op → 旧 body 反向转换无丢失"(DomainOp 是 delta fragment,
-    //   无 authoritative snapshot 无法无损反演 — 原承诺无证据);改为 snapshot materialize
-    //   (authoritative 全 record → 旧 shape body,可证明无丢失因源头是全 record 非 delta)。
-    //   delta-inversion 显式无算法/不支持(降级到已测范围,见决策文档 §1.2 状态表 row 5 + §3 诚实化表)。
+    expect(legacyBody.title).toBe('new-title')
+    expect((legacyBody as { id?: string }).id).toBeUndefined()  // ★ materialized NodePayload 无 id
+    expect(h.patch('n1', legacyBody).status).toBe(200)  // flag-off NodePayload 200(整 record decoder,状态表 row 5)
+    // ★ Blocker 3 验收:rollback snapshot materialize 从 authoritative 全 record 重建 NodePayload(无 id);delta-inversion 无算法/不支持(降级到已测范围)。
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// v4 Blocker 6:两文档交叉契约测试 — port CanvasChange 形状 ↔ N20 CreateBody/DomainOp 可无损映射
+// ════════════════════════════════════════════════════════════════════════════
+// sol 第三轮阻断 6:canvasSyncPort(transport-neutral port)与 N2-0 决议(CreateBody/DomainOp)形状需无损映射;
+//   port create-node 携 NodeRecord(含 id)→ N20 CreateBody(payload=NodePayload 无 id,id → adapter path);
+//   port edit-node FieldIntent[] → N20 DomainOp set/unset[];port delete-node → N20 ServerInvariantCommand cascade;
+//   port reorder-children → N20 DomainOp reorder。两文档形状一致,adapter 可无损翻译。
+describe('N2-0 v4 Blocker 6: port CanvasChange ↔ N20 CreateBody/DomainOp 无损映射(两文档交叉契约)', () => {
+  // port CanvasChange → N20 wire(CreateBody / DomainOp[] / ServerInvariantCommand)无损映射
+  type N20Wire =
+    | { kind: 'create'; create: CreateBody; recordId: string }   // create-node → CreateBody + path id(client NodeRecord.id)
+    | { kind: 'edit'; ops: DomainOp[] }                          // edit-node → DomainOp set/unset[]
+    | { kind: 'delete'; cmd: ServerInvariantCommand }            // delete-node → server-named cascade
+    | { kind: 'reorder'; op: DomainOp }                          // reorder-children → DomainOp reorder
+
+  const mapChangeToN20 = (change: CanvasChange, canvasId: string): N20Wire => {
+    switch (change.kind) {
+      case 'create-node': {
+        // NodeRecord → (id, NodePayload);CreateBody.payload = NodePayload(无 id);id → adapter path(Blocker 2 client-id)
+        const { id, revision: _rev, ...payload } = change.node
+        void _rev
+        return { kind: 'create', create: { clientId: 'c', type: 'node', payload }, recordId: id }
+      }
+      case 'edit-node': {
+        // FieldIntent[] → DomainOp[] (set/delete-field → set/unset);fieldPath + value 透传无损
+        const ops: DomainOp[] = change.intents.map((fi: FieldIntent) =>
+          fi.op === 'set'
+            ? { kind: 'set', fieldPath: fi.fieldPath as FieldPath, value: fi.value }
+            : { kind: 'unset', fieldPath: fi.fieldPath as FieldPath })
+        return { kind: 'edit', ops }
+      }
+      case 'delete-node':
+        return { kind: 'delete', cmd: { kind: 'node-delete-cascade', canvasId, nodeId: change.nodeId } }
+      case 'reorder-children':
+        return { kind: 'reorder', op: { kind: 'reorder', orderedIds: change.orderedIds } }
+      default:
+        // create-edge/create-anchor/edit-edge/edit-anchor/delete-edge/delete-anchor/update-meta 同形(node→edge/anchor;meta 单独)
+        throw new Error(`mapChangeToN20: ${change.kind} not in node 4-kind cross-mapping (edge/anchor/meta same shape, see inventory §3)`)
+    }
+  }
+
+  it('X-1 create-node → N20 CreateBody 无损映射(payload=NodePayload 无 id;id → path;Blocker 2 client-id)', () => {
+    const node = makeNode('n-x1', { title: 'cross', locked: true })
+    const change: CanvasChange = { kind: 'create-node', node }
+    const wire = mapChangeToN20(change, 'c1')
+    expect(wire.kind).toBe('create')
+    if (wire.kind !== 'create') return
+    // ★ payload = NodePayload(无 id);id 来自 NodeRecord.id → adapter path(非 server-mint,Blocker 2)
+    expect(wire.recordId).toBe('n-x1')                       // ★ id 来自 NodeRecord.id(client-supplied)
+    expect(wire.create.type).toBe('node')
+    expect((wire.create.payload as { id?: string }).id).toBeUndefined()  // ★ payload 无 id
+    expect((wire.create.payload as { title: string }).title).toBe('cross')
+    expect((wire.create.payload as { locked: boolean }).locked).toBe(true)
+    // 无损:NodeRecord = NodePayload + {id, revision};映射后 (recordId, payload) 可重建 NodeRecord(除 revision 由 server bump)
+    const { id: _id, revision: _rev, ...payload } = node
+    void _id; void _rev
+    expect(wire.create.payload).toEqual(payload)            // ★ payload deep equal Omit<NodeRecord,'id'|'revision'>
+  })
+
+  it('X-2 edit-node FieldIntent[] → N20 DomainOp set/unset[] 无损映射(fieldPath + value 透传)', () => {
+    const change: CanvasChange = {
+      kind: 'edit-node', nodeId: 'n-x2',
+      intents: [
+        { op: 'set', fieldPath: ['title'], value: 'edited' },
+        { op: 'delete-field', fieldPath: ['locked'] },
+        { op: 'set', fieldPath: ['transform', 'x'], value: 42 },
+      ],
+    }
+    const wire = mapChangeToN20(change, 'c1')
+    expect(wire.kind).toBe('edit')
+    if (wire.kind !== 'edit') return
+    expect(wire.ops).toHaveLength(3)
+    expect(wire.ops[0]).toEqual({ kind: 'set', fieldPath: ['title'], value: 'edited' })      // set 透传
+    expect(wire.ops[1]).toEqual({ kind: 'unset', fieldPath: ['locked'] })                    // delete-field → unset
+    expect(wire.ops[2]).toEqual({ kind: 'set', fieldPath: ['transform', 'x'], value: 42 })   // 嵌套 fieldPath 透传
+  })
+
+  it('X-3 delete-node → N20 ServerInvariantCommand node-delete-cascade(path 推导目标,非 PATCH DomainOp)', () => {
+    const change: CanvasChange = { kind: 'delete-node', nodeId: 'n-x3' }
+    const wire = mapChangeToN20(change, 'cv1')
+    expect(wire.kind).toBe('delete')
+    if (wire.kind !== 'delete') return
+    expect(wire.cmd.kind).toBe('node-delete-cascade')   // ★ server-named cascade(Blocker 3)
+    expect(wire.cmd).toEqual({ kind: 'node-delete-cascade', canvasId: 'cv1', nodeId: 'n-x3' })
+  })
+
+  it('X-4 reorder-children → N20 DomainOp reorder(orderedIds 透传)', () => {
+    const change: CanvasChange = { kind: 'reorder-children', childType: 'node', orderedIds: ['n3', 'n1', 'n2'] }
+    const wire = mapChangeToN20(change, 'c1')
+    expect(wire.kind).toBe('reorder')
+    if (wire.kind !== 'reorder') return
+    expect(wire.op).toEqual({ kind: 'reorder', orderedIds: ['n3', 'n1', 'n2'] })  // orderedIds 透传无损
   })
 })

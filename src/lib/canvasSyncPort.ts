@@ -7,7 +7,10 @@
 //   - Yjs 案独占形状:Y.Update(Uint8Array 二进制)/ state-vector(编码态 Uint8Array,解码态 Map<clientID,clock>)/ y-protocol frame。
 // port 只表 record/field 级**域语义**:create(全量新 record)/ edit(字段级意图,fieldPath 域数组)/ delete / reorder / update-meta。
 //   两案 adapter 各自翻译:Figma 案 edit→field-path PATCH body + If-Match;Yjs 案 edit→嵌套 Y.Map.set(永不 clear 整 record)。
-// 中性游标 SnapshotCursor = branded unknown(port 永不读其内部;adapter 解释为 revision bundle 或 state-vector)。
+// 中性游标 SnapshotCursor = branded opaque bundle(port 永不读其内部;adapter 解释为 recordId→BaseCursor 映射 + canvas order cursor + event since cursor)。
+//   v8 冻结(inventory §2.1/§2.2 + spike S10-12 bundle 交叉测试):单 canvas 级 cursor 聚合多 record 的 per-record base + order + since;
+//   submitChange 按 change.recordId/op class 抽对应 wire base(edit/delete→record base;reorder→order base;catch-up→since base);
+//   accepted/conflict 后更新 bundle 内对应项(非整 bundle 重建)。多 record hydrate 后单 record 级 token 无法为任意 n1/n2 提供 If-Match → bundle 聚合。
 //
 // 返修 R1(G1-b 双审 REQUIRES_CHANGES,2026-07-12,3 条 finding 全部 lead 独立核证):
 //   - F1:CanvasChange 由「全量 record upsert」改为「create 全量 + edit 字段级意图」。全量 upsert 在并发下会把
@@ -67,12 +70,15 @@ import type { AnchorRecord, EdgeRecord, NodeRecord } from '../kernel/records'
 
 /**
  * 中性版本游标(port 不解释其内部结构)。
- * - Figma 案 adapter 可填 per-record revision bundle / canvas contentVersion;
- * - Yjs 案 adapter 可填 state-vector(编码态 Uint8Array)/ Y.Clock;
+ * - v8 冻结:canvas 级 SnapshotCursor = opaque **bundle**(内含 recordId→BaseCursor 映射 + canvas order cursor + event since cursor);
+ *   Figma 案 adapter 从 bundle 按 change.recordId/op class 抽对应 wire base(edit/delete→record BaseCursor;reorder→order cursor;catch-up→since cursor);
+ *   Yjs 案 adapter 可填 state-vector(编码态 Uint8Array)/ Y.Clock(CRDT 无 per-record base 概念,但 bundle 形状仍容纳——adapter 自解释);
  * port 只持有与回传,绝不读其字段。branded 防误把裸 number/string/array 当游标透传(见 contract test)。
  *
  * 注:本类型故意**非** `Revision`(number)也**非** `number[]`(更**非** `Uint8Array`)——那三形分别是
  * Figma/Yjs 独占,出现在 port 面即违约。adapter 用 `value as unknown as SnapshotCursor` 构造,port 侧零 inspection。
+ *   ★ v8:单 record 级 BaseCursor 不直接出现在 CanvasSnapshot.cursor(那是 canvas 级 bundle);BaseCursor 是 bundle 内 per-record 项,
+ *   仅 submitChange 的 base? 参数与 accepted/conflict 回传的 cursor 经 adapter 解包(见 inventory §2.1 wire / §2.2 hydrate)。
  */
 export type SnapshotCursor = unknown & { readonly __brand: 'SnapshotCursor' }
 
@@ -91,6 +97,10 @@ export type CanvasMetaSnapshot = {
  * 画布全量快照(loadSnapshot 返回;hydrate 用)。children 用域 record(NodeRecord/EdgeRecord/AnchorRecord,
  * K40 canonical),**不**用 wire payload(NodePayload 那种 Omit id/revision 的 transport 形状属 Figma 案独占,
  * 不出现在 port 面)。cursor 是 hydrate 后做增量补拉/并发判定的中性锚点。
+ *
+ * ★ v8:cursor 是单 canvas 级 opaque **bundle**(内含 recordId→BaseCursor 映射 + canvas order cursor + event since cursor),
+ *   非单 record 级 token——多 record hydrate 后单 record 级 token 无法为任意 n1/n2 提供 If-Match(串用);
+ *   submitChange(canvasId, change, base?) 的 base 即此 bundle,adapter 按 change.recordId/op class 抽对应 wire base(见 §14.7 NOTES + inventory §2.1/§2.2)。
  */
 export type CanvasSnapshot = {
   canvasId: string
@@ -362,6 +372,10 @@ export interface CanvasSyncPort {
   /**
    * 提交一条变更。base 游标可选(供并发判定);返 accepted/conflict/retryable/rejected。
    * 注意:base 是**游标**不是 revision number——revision 是 Figma 案独占,不在 port 面。
+   * ★ v8:base 是 canvas 级 opaque bundle(recordId→BaseCursor 映射 + order cursor + since cursor);adapter 按 change.recordId/
+   *   op class 抽对应 wire base(edit/delete→record BaseCursor;reorder→order cursor;catch-up→since cursor);accepted/conflict
+   *   回传新 bundle(只更新 change 命中的 record 对应项,非整 bundle 重建)。多 record hydrate 后单 record 级 token 无法为任意 n1/n2
+   *   提供 If-Match → bundle 聚合(见 inventory §2.1 wire / §2.2 hydrate + spike S10-12 bundle 交叉测试)。
    * edit-* 的 intents 携带字段级意图(已 diff 好);adapter 翻译为 field-path PATCH(Figma)或嵌套 Y.Map.set(Yjs)——
    * adapter 不再对全量 record 做 shadow diff(F1:diff 已在 producer 侧完成,intents 即 diff 结果)。
    *
