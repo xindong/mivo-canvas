@@ -139,7 +139,7 @@ spike 不接线任何生产 store/渲染/服务端,只在本测试文件内 `imp
 | Q6 | Y.Array 元素 id 稳定性 | 元素增删按 Y.Array position 还是另建 id→position 索引(record-schema 假设元素带稳定 id,但 Y.Array 本身按 position) | fills/strokes/effects 并发增删语义 |
 | Q7 | presence 通道选型 | y-protocols/y-presence vs 自建;走 user 域(§13.1)不进 document CRDT | 他人光标/选区实现 |
 | Q8 | 断线重连 / offline edit | state-vector 比对 + 增量拉取;offline edit 队列(与 FX-5 写失败重试队列关系) | 弱网/离线协作可用性 |
-| Q9 | chat 消息 CRDT 形态 | Y.Array<Y.Map> 与 nodes 同 Y.Doc 还是独立 Y.Doc(per-canvas)(DP-6/D6) | chat 协作粒度 + GC |
+| Q9 | chat 消息 CRDT 形态 | Y.Array<Y.Map> 与 nodes 同 Y.Doc 还是独立 Y.Doc（per-actor×canvas）（~~pre-DP-6R 曾考虑 per-canvas 共享~~；DP-6R 订正：chat per-actor 私有、非 per-canvas 共享；CRDT 形态待 per-actor 重定，DP-6/D6） | chat 协作粒度 + GC |
 | Q10 | Y.Doc 增长控制 / GC | 何时 snapshot + 清 op log;与 server 存储成本的关系 | 长期运维 |
 
 ---

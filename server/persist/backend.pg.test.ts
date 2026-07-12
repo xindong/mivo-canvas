@@ -229,6 +229,9 @@ async function canvasTableIsDeleted(id: string): Promise<boolean | null> {
   it('P1-4 fresh DB 启动:migrate-before-warm(删表后 new instance await ready 自迁移,无 42P01)', async () => {
     // 模拟 fresh DB:删全部表(含 kysely_migration 追踪表)
     await pg.__dropAllTables()
+    // R2-P2-1:断言 __dropAllTables 真 drop 了 chat_order_revisions(migration 004 新表,曾漏入 drop 列表 →
+    // to_regclass 仍在,fresh-DB 实际不 fresh,掩盖 004 CREATE/registry 错误)。修复后应为 false。
+    expect(await pg.__tableExists('chat_order_revisions')).toBe(false)
     // new instance,只 await ready(不显式 migrate)—— ready 内部 migrate-before-warm
     const pgFresh = new PgPersistBackend(pgConn())
     // 旧实现:warm() 先 SELECT projects → 空库 42P01 → ready reject。新实现:ready 先 migrate 再 warm。
