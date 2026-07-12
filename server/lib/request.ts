@@ -182,3 +182,28 @@ export const logTaskTerminal = (info: {
   ].filter(Boolean)
   console.log(parts.join(' '))
 }
+
+// P-6 saga 补偿日志:restore/delete 第二步(unRevoke/revoke 级联)的 attempt 结果。失败必记(状态改变 + 失败操作,
+// 按 docs/development-logging.md);成功也记(可观察:saga 收敛过程可追溯)。nothing-pending 不记(噪声)。
+export const logCompensation = (info: {
+  requestId: string
+  projectId: string
+  op: 'restore' | 'delete'
+  outcome: 'completed' | 'failed'
+  attempts: number
+  count?: number
+  error?: string
+}): void => {
+  const parts = [
+    '[mivo-bff-compensation]',
+    `ts=${new Date().toISOString()}`,
+    `rid=${info.requestId}`,
+    `project=${info.projectId}`,
+    `op=${info.op}`,
+    `outcome=${info.outcome}`,
+    `attempts=${info.attempts}`,
+    info.count !== undefined ? `count=${info.count}` : '',
+    info.error ? `error=${info.error}` : '',
+  ].filter(Boolean)
+  console.log(parts.join(' '))
+}

@@ -36,6 +36,12 @@ export type ShareLink = {
   updatedAt: string
   revokedAt: string | null
   expiresAt: string | null
+  /**
+   * cascadeRevokedAt:P-6 marker——区分"级联 revoke"(project 软删/恢复级联)vs"手工 revoke"(用户主动吊销)。
+   * revokeAllForProject(project 软删级联)置非空;unRevokeAllForProject(restore 级联)仅恢复此标记非空且 30 天窗内的
+   * 链接并清空标记;手工 revokeShareLink 不置此列 → restore 补偿永不动手工吊销(防误恢复)。
+   */
+  cascadeRevokedAt: string | null
 }
 
 /** share token 解析结果(供 route 区分 404 / 410)。 */
@@ -55,8 +61,69 @@ export type UnRevokeResult =
   | { ok: true; link: ShareLink }
   | { ok: false; reason: 'not-found' | 'window-closed' } // window-closed:revoke 超 30 天,不可恢复(FX-7 §5.9)
 
+// ── P-6 saga 补偿(restore/delete 两步写:persist 恢复/软删 + permission unRevoke/revoke)──
+// 问题:第二步失败留永久 revoked(delete 方向是 active)链接;且 POST/DELETE 幂等成功后不再重试第二步。
+// 解:补偿意图落持久层(非内存变量),第二步失败可重试收敛;幂等重入补跑而非跳过。从简:无任务框架/通用队列。
+
+/** 补偿 op:restore → unRevokeAllForProject 级联;delete → revokeAllForProject 级联。 */
+export type CompensationOp = 'restore' | 'delete'
+
+/**
+ * 可观察补偿意图(持久层:跨请求存活;InMemory 重启清空同其它权限数据,PG 跨重启)。
+ * attemptCount / lastError / lastAttemptedAt 是"可观察状态"——saga 不是黑盒,可查可调试。
+ *
+ * 返修 P1-2/P2-1(2026-07-12):
+ *  - generation:project 级单调递增 desired-state 代际;新 transition record 时 bump,旧 pending 对立 op
+ *    被 markSuperseded——sweep/attempt 据最新代际决断(防 restore-fail→delete 后旧 restore 晚到重开链接)。
+ *  - status 'superseded':被对立 op 的新代际取代;保留行做可观察历史,不再被 sweep/attempt 处理。
+ *  - claimedAt/claimedUntil:attempt 租约(P2-1);并发 attempt 原子 claim,loser 返 already-claimed。
+ *
+ * 返修 R3-F2(2026-07-12):
+ *  - status 'failed':sweep 超限放弃的 dead-letter 终态(不再伪装成 done);不占 partial unique 槽
+ *    (WHERE status='pending'),下一生命周期 primary 仍可 record 新 pending → 自动重开路径。可告警的未收敛事实。
+ */
+export type CompensationIntent = {
+  id: string
+  projectId: string
+  op: CompensationOp
+  status: 'pending' | 'done' | 'superseded' | 'failed'
+  generation: number
+  attemptCount: number
+  lastError: string | null
+  lastAttemptedAt: string | null
+  claimedAt: string | null
+  claimedUntil: string | null
+  /** R3-F4: claim fencing token(random UUID,随 claim 写入;done/failed 清空)。lease 过期后另一 worker 可重新
+   * claim,done UPDATE WHERE claim_token=ours → 仅当前 owner 能 mark done,loser 返 stale-claim(attemptCount 不失真)。 */
+  claimToken: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+/** attemptCompensation 的结果（可观察；route 用于日志）。 */
+export type CompensationOutcome =
+  | { kind: 'nothing-pending'; op: CompensationOp }
+  | { kind: 'completed'; op: CompensationOp; count: number; attempts: number; intentId: string }
+  | { kind: 'failed'; op: CompensationOp; error: string; attempts: number; intentId: string }
+  | { kind: 'already-claimed'; op: CompensationOp; intentId: string } // P2-1:并发 attempt 输家(lease 未过期)
+  | { kind: 'superseded'; op: CompensationOp; intentId?: string } // R3-F1:晚到 stale op（被更新代际/is_deleted 否决）→ 不重建、不执行副作用
+  | { kind: 'stale-claim'; op: CompensationOp; intentId: string } // R3-F4:claim 在执行中被新 worker 抢走(lease 过期)→ 不 mark done、不报 completed
+
 /** FX-7 §5.9 un-revoke 30 天保留窗(超期不可恢复,purge 由 FX-7 定时落地)。 */
 export const UNREVOKE_WINDOW_MS = 30 * 24 * 60 * 60 * 1000
+
+/**
+ * 返修 P1-2/P2-1(2026-07-12):attempt 租约时长。并发 attempt 时,赢家 claim 后在此窗内输家返
+ * already-claimed;到期后租约释放,可被 sweep/重试重新 claim(防赢家崩溃留永久 claimed 死锁)。
+ * 取 15s:远大于单次 unRevoke/revoke 级联耗时(单语句,ms 级),又短到赢家崩溃后能快速被回收。
+ */
+export const COMPENSATION_CLAIM_LEASE_MS = 15 * 1000
+
+/**
+ * 返修 P1-2:有界 sweep——每条 pending 意图最多重试此次后放弃(超限 mark done 留 last_error)。
+ * 防"永久 pending 黑洞":故障持续不退时,sweep 不会无限重打;留 last_error 给运维定位。
+ */
+export const COMPENSATION_MAX_SWEEP_ATTEMPTS = 10
 
 /**
  * 权限层后端接口(成员 + 分享链接)。
@@ -103,6 +170,48 @@ export interface PermissionBackend {
   revokeAllForProject(projectId: string): Promise<{ count: number }>
   /** un-revoke 某 project 全部分享链接(FX-7 project 恢复级联用;30 天窗内才恢复)。 */
   unRevokeAllForProject(projectId: string): Promise<{ count: number }>
+
+  // ── P-6 saga 补偿(restore/delete 第二步失败可重试收敛)──
+  /**
+   * 记录一条 pending 补偿意图。幂等:(projectId, op) 已有 pending → 返之(不重复);否则新建。
+   * route 命中"刚发生真实级联"(POST restored / DELETE 软删成功)时调。
+   */
+  recordCompensation(projectId: string, op: CompensationOp): Promise<CompensationIntent>
+  /**
+   * 尝试收敛 (projectId, op) 的 pending 意图:无 pending → nothing-pending;有 pending → 跑 step
+   * (restore=unRevokeAllForProject,delete=revokeAllForProject),成功标记 done,失败 bump 可观察字段保持 pending。
+   * 幂等重入调用它收敛(route 在 restored/existing + DELETE 两路径都调)。
+   */
+  attemptCompensation(projectId: string, op: CompensationOp): Promise<CompensationOutcome>
+  /** 可观察:列 project 全部补偿意图(newest first;调试/检查/验收用)。 */
+  listCompensations(projectId: string): Promise<CompensationIntent[]>
+
+  /**
+   * 返修 P1-2:可观察 pending 信号——列全局(或某 project)未收敛补偿意图(含租约信息)。
+   * 供 /readyz 类指标 / sweep driver 调度用;形态你定(memory: 同步过滤;PG: SELECT status='pending')。
+   */
+  listPendingCompensations(projectId?: string): Promise<CompensationIntent[]>
+
+  /**
+   * 返修 R3-F2:可观察 failed/dead-letter 信号——列全局(或某 project)超限放弃的补偿意图。
+   * 与 listPendingCompensations 分离:pending=在途(将收敛),failed=放弃(可告警的未收敛事实)。
+   * 供运维排查 / /readyz 非绿定因。形态同 listPending(memory: 过滤;PG: SELECT status='failed')。
+   */
+  listFailedCompensations(projectId?: string): Promise<CompensationIntent[]>
+
+  /**
+   * 返修 R3-F2:全局未收敛计数 {pending, failed}。供 /readyz readiness 探针 + POST/DELETE 响应 header
+   * 暴露(failed>0 → /readyz 503 非绿且外部可见;pending 仅 informational)。轻量聚合(不计列详情)。
+   */
+  getCompensationCounts(): Promise<{ pending: number; failed: number }>
+
+  /**
+   * 返修 P1-2:有界后台 sweep driver——启动恢复 + 周期退避重试的收敛入口。遍历 pending 意图(跳过
+   * superseded + 未到期租约),逐条 attemptCompensation 收敛。返处理统计 {processed, converged, failed}。
+   * memory: 同步遍历(无重启语义,主要供测试);PG: 跨重启恢复(pending 跨请求/重启存活)。
+   * 有界:每条意图有最大重试上限(超限 mark done 留 last_error,不再重试)。
+   */
+  sweepCompensations(): Promise<{ processed: number; converged: number; failed: number }>
 
   /** Test-only:清空。memory 同步 void;PG 异步 TRUNCATE(Promise<void>)。返回类型放宽,两类 backend 共用接口。 */
   __reset(): void | Promise<void>
@@ -155,6 +264,28 @@ export class InMemoryPermissionBackend implements PermissionBackend {
   private readonly links = new Map<string, ShareLink>()
   private readonly linksByToken = new Map<string, string>()
   private readonly linksByProject = new Map<string, string[]>()
+  // P-6 saga 补偿意图存储(持久层:跨请求存活;重启清空同其它权限数据)。
+  private readonly compensations = new Map<string, CompensationIntent>()
+  private readonly compensationsByProject = new Map<string, string[]>() // newest first
+  /** Test-only 故障注入:op → 剩余强制失败次数(attemptCompensation 内消费,不污染 unRevoke/revoke 本身)。 */
+  private readonly compensationFault: Partial<Record<CompensationOp, number>> = {}
+  /** Test-only:op → 剩余 recordCompensation 强制失败次数(P1-1 验收:record 崩溃后 attempt 据 marker 收敛)。 */
+  private readonly compensationRecordFault: Partial<Record<CompensationOp, number>> = {}
+  /**
+   * R7 Test-only:注入 getCompensationCounts 强制抛错(对偶 PG 侧 share_link_compensations 表缺失/列不匹配/
+   * 权限错 → Kysely SELECT 抛)。用于 /readyz 负例:getCompensationCounts 抛 + computeReadiness 健康 →
+   * 必 503 degraded + unknown 明示(不许 catch 吞成 {0,0} 假绿)。null=不注入(默认)。
+   */
+  private compensationCountsErrorForTest: Error | null = null
+  /**
+   * R5-F1: project → is_deleted durable desired state(memory 对偶 PG projects.is_deleted)。
+   * memory 不持有 projects 表,但为 TOCTOU 双后端契约对称,经 __setProjectDeletedForTest 注入;
+   * attemptCompensation 的 stale gate 与 claim 后重读均据此(与 PG SELECT...FOR UPDATE critical trx 对偶)。
+   * 未注入(undefined)→ 退化到 hasSuperseded fallback(保留原 R3-F1 行为,不破坏未设 is_deleted 的既有测试)。
+   */
+  private readonly projectDeleted = new Map<string, boolean>()
+  /** R5-F1 Test-only:op → claim 后、side effect 前的 await 暂停点(模拟 primary 在 record 前崩溃的 TOCTOU 窗口)。 */
+  private readonly compensationClaimPauseForTest: Partial<Record<CompensationOp, () => Promise<void>>> = {}
   /** additive(PG 落地后接口新增):内存 backend 立即就绪。 */
   readonly ready: Promise<void> = Promise.resolve()
 
@@ -259,6 +390,7 @@ export class InMemoryPermissionBackend implements PermissionBackend {
       updatedAt: now,
       revokedAt: null,
       expiresAt: null,
+      cascadeRevokedAt: null, // P-6 marker:仅级联 revoke 置非空;新建链接无标记
     }
     this.links.set(link.id, link)
     this.linksByToken.set(link.token, link.id)
@@ -313,7 +445,7 @@ export class InMemoryPermissionBackend implements PermissionBackend {
     if (link.revokedAt && Date.now() - Date.parse(link.revokedAt) > UNREVOKE_WINDOW_MS) {
       return { ok: false, reason: 'window-closed' }
     }
-    const unrevoked: ShareLink = { ...link, revokedAt: null, updatedAt: nowIso() }
+    const unrevoked: ShareLink = { ...link, revokedAt: null, cascadeRevokedAt: null, updatedAt: nowIso() }
     this.links.set(linkId, unrevoked)
     return { ok: true, link: unrevoked }
   }
@@ -325,7 +457,8 @@ export class InMemoryPermissionBackend implements PermissionBackend {
     for (const id of ids) {
       const link = this.links.get(id)
       if (link && !link.revokedAt) {
-        this.links.set(id, { ...link, revokedAt: now, updatedAt: now })
+        // 级联 revoke:置 revoked_at + cascade_revoked_at(marker)。restore 补偿只动此标记非空的链接。
+        this.links.set(id, { ...link, revokedAt: now, cascadeRevokedAt: now, updatedAt: now })
         count++
       }
     }
@@ -338,13 +471,322 @@ export class InMemoryPermissionBackend implements PermissionBackend {
     const now = nowIso()
     for (const id of ids) {
       const link = this.links.get(id)
-      // 仅恢复 30 天窗内的 revoked link(FX-7 §5.9);超期保持 revoked(purge 由 FX-7 定时)
-      if (link && link.revokedAt && Date.now() - Date.parse(link.revokedAt) <= UNREVOKE_WINDOW_MS) {
-        this.links.set(id, { ...link, revokedAt: null, updatedAt: now })
+      // P-6 marker:仅恢复"级联 revoke"标记(cascadeRevokedAt 非空)且 30 天窗内的链接,并清空 marker。
+      // 手工 revoke(cascadeRevokedAt IS NULL)永不被 restore 补偿动 → 防误恢复用户主动吊销的链接。
+      if (link && link.cascadeRevokedAt && Date.now() - Date.parse(link.cascadeRevokedAt) <= UNREVOKE_WINDOW_MS) {
+        this.links.set(id, { ...link, revokedAt: null, cascadeRevokedAt: null, updatedAt: now })
         count++
       }
     }
     return { count }
+  }
+
+  // ── P-6 saga 补偿(实现)──
+  // 返修 P1-1/P1-2/P2-1(2026-07-12 双审):marker-driven + supersede + claim/lease + sweep。
+  //   - marker:cascade_revoked_at(级联 revoke 标记)是 desired-state 的可重建载体,落在 share_links
+  //     (随第一步级联一起提交);record 步骤即使崩溃,marker 已 durable 提交 → 重启/重试据 marker 收敛。
+  //   - supersede:record 新 op 时 bump generation 并把 pending 对立 op markSuperseded —— sweep/attempt
+  //     只认 pending(跳过 superseded),防 restore-fail→delete 后旧 restore 晚到重开链接(P1-2 代际)。
+  //   - claim/lease:attempt 原子 claim(单线程 JS 同步段内 check+set);并发输家返 already-claimed(P2-1)。
+  //   - sweep:有界遍历 pending(跳过未到期租约 + 超限放弃),逐条 attempt 收敛(P1-2 driver)。
+
+  /** 找 (projectId, op) 最近一条 pending 意图(无 → undefined)。 */
+  private findPendingCompensation(projectId: string, op: CompensationOp): CompensationIntent | undefined {
+    const ids = this.compensationsByProject.get(projectId) ?? []
+    for (const id of ids) {
+      const it = this.compensations.get(id)
+      if (it && it.op === op && it.status === 'pending') return it
+    }
+    return undefined
+  }
+
+  /**
+   * R3-F1: (projectId, op) 是否存在被显式 supersede 的意图(对立 op 的新代际曾 record 并 supersede 它)。
+   * 用于晚到 attemptCompensation 的 stale-op 判定:若 op 已被对立 op 取代,晚到重试不得仅凭 marker 重建
+   * 旧 op intent(会把更新代际的 revoked/active 终态翻转回来)。memory 无 projects.is_deleted,以此信号
+   * 替代——它精确区分"被显式 supersede 的 stale 重试(F1)"与"record 崩溃后的 marker 自恢复(P1-1,无 supersede 行)"。
+   */
+  private hasSupersededCompensation(projectId: string, op: CompensationOp): boolean {
+    const ids = this.compensationsByProject.get(projectId) ?? []
+    for (const id of ids) {
+      const it = this.compensations.get(id)
+      if (it && it.op === op && it.status === 'superseded') return true
+    }
+    return false
+  }
+
+  /** project 级下一代际 = 现存全部意图(任意状态)max(generation)+1。单调递增,保证新 transition 代际 > 旧。 */
+  private nextGeneration(projectId: string): number {
+    const ids = this.compensationsByProject.get(projectId) ?? []
+    let max = 0
+    for (const id of ids) {
+      const it = this.compensations.get(id)
+      if (it && it.generation > max) max = it.generation
+    }
+    return max + 1
+  }
+
+  /** 把 (projectId, 对立 op) 的 pending 意图 markSuperseded(保留行做历史;不再被 sweep/attempt 处理)。 */
+  private supersedeOppositePending(projectId: string, op: CompensationOp): void {
+    const opposite: CompensationOp = op === 'restore' ? 'delete' : 'restore'
+    const stale = this.findPendingCompensation(projectId, opposite)
+    if (!stale) return
+    const now = nowIso()
+    this.compensations.set(stale.id, {
+      ...stale,
+      status: 'superseded',
+      lastError: `superseded by ${op} generation`,
+      claimedAt: null,
+      claimedUntil: null,
+      claimToken: null,
+      updatedAt: now,
+    })
+  }
+
+  /**
+   * R5-F2: 把 project 的全部历史 failed dead-letter 标 superseded(recordCompensation 时调用)。
+   * 新 generation(同 op 重试 / 对立 op 翻转)意味 desired state 已翻篇,旧 dead-letter 不再代表当前
+   * 未收敛状态 → 不计 getCompensationCounts.failed(可用性恢复,不再永久 503)。保留行于 listCompensations
+   * 供审计(listFailedCompensations 只列当前 failed=空)。memory 单线程:Map 遍历标 superseded,与 PG UPDATE 对偶。
+   */
+  private supersedeOldFailedForProject(projectId: string): void {
+    const ids = this.compensationsByProject.get(projectId) ?? []
+    const now = nowIso()
+    for (const id of ids) {
+      const it = this.compensations.get(id)
+      if (it && it.status === 'failed') {
+        this.compensations.set(id, { ...it, status: 'superseded', lastError: 'superseded by newer generation (reopen)', updatedAt: now })
+      }
+    }
+  }
+
+  /** 建 pending 意图(内部:不查幂等,调用方负责)。 */
+  private createPendingIntent(projectId: string, op: CompensationOp, generation: number): CompensationIntent {
+    const now = nowIso()
+    const intent: CompensationIntent = {
+      id: randomUUID(),
+      projectId,
+      op,
+      status: 'pending',
+      generation,
+      attemptCount: 0,
+      lastError: null,
+      lastAttemptedAt: null,
+      claimedAt: null,
+      claimedUntil: null,
+      claimToken: null,
+      createdAt: now,
+      updatedAt: now,
+    }
+    this.compensations.set(intent.id, intent)
+    const arr = this.compensationsByProject.get(projectId) ?? []
+    arr.unshift(intent.id) // newest first
+    this.compensationsByProject.set(projectId, arr)
+    return intent
+  }
+
+  /**
+   * marker-driven need:restore → 存在 cascade 标记(cascadeRevokedAt 非空)且 30 天窗内的链接(需 unRevoke);
+   * delete → 存在 active 链接(revokedAt IS NULL,需 revoke;调用方 route/sweep 保证 project 已软删)。
+   * 用于"record 崩溃后重试/重启"场景:无 pending 意图但 marker 表明补偿未完成 → attempt 自建意图收敛。
+   * 普通幂等 POST(existing,从未级联)→ 无 marker → need=false → nothing-pending,不动手工 revoked link。
+   */
+  private compensationNeed(projectId: string, op: CompensationOp): boolean {
+    const ids = this.linksByProject.get(projectId) ?? []
+    for (const id of ids) {
+      const link = this.links.get(id)
+      if (!link) continue
+      if (op === 'restore') {
+        if (link.cascadeRevokedAt && Date.now() - Date.parse(link.cascadeRevokedAt) <= UNREVOKE_WINDOW_MS) return true
+      } else {
+        if (!link.revokedAt) return true
+      }
+    }
+    return false
+  }
+
+  async recordCompensation(projectId: string, op: CompensationOp): Promise<CompensationIntent> {
+    // R6 锁序不变量(与 PG pgPermissionBackend.recordCompensation 对偶):PG 侧先锁 project 行 FOR UPDATE 再
+    //   写/插 compensations,以与 attemptCompensation critical section(project→compensation)统一锁序,消除反向
+    //   锁环(40P01 deadlock)。memory 单线程 JS 无真行锁、无并发 deadlock 风险,故此处不持锁;但语义上仍是
+    //   "先据 durable desired state 判 stale、再 mutate compensations"(stale 判定在 attemptCompensation 内,
+    //   此处 record 仅 supersede 对立 op + 插新代际)。保持注释一致以便双后端 review 时对齐 PG 锁序不变量。
+    // P1-1 Test-only:record 故障注入(模拟"第一步提交后、record 前崩溃")。route 已 try/catch 包裹 →
+    // 不阻断主操作;attempt 据 cascade_revoked_at marker 自收敛(无 pending 意图也能 derive)。
+    const rf = this.compensationRecordFault[op] ?? 0
+    if (rf > 0) {
+      this.compensationRecordFault[op] = rf - 1
+      throw new Error(`[compensation-record-fault] ${op} record forced failure (was ${rf})`)
+    }
+    // 幂等:已有 pending 同 op → 返之(不重复),防重入 POST restored 重复建意图。
+    const pending = this.findPendingCompensation(projectId, op)
+    if (pending) return pending
+    // P1-2 supersede:新 transition 取代旧 pending 对立 op(防旧 restore 晚到重开链接)。
+    this.supersedeOppositePending(projectId, op)
+    // R5-F2:新 generation 让同 project 全部历史 failed dead-letter 不计当前未收敛(counts.failed 归零,可用性恢复)。
+    //   新 generation(同 op 重试 / 对立 op 翻转)意味 desired state 已翻篇,旧 dead-letter 不再代表当前未收敛。
+    this.supersedeOldFailedForProject(projectId)
+    return this.createPendingIntent(projectId, op, this.nextGeneration(projectId))
+  }
+
+  async attemptCompensation(projectId: string, op: CompensationOp): Promise<CompensationOutcome> {
+    const now = nowIso()
+    let intent = this.findPendingCompensation(projectId, op)
+    // R3-F1/R5-F1: stale-op gate。晚到的 attemptCompensation 不得仅凭 compensationNeed 重建旧 op intent——
+    // 那会把更新代际对立 op 的 revoked/active 终态翻转回来(权限边界破坏)。durable desired state 决断:
+    //   memory 经 __setProjectDeletedForTest 注入 is_deleted(对偶 PG projects.is_deleted ground truth);is_deleted
+    //   已知且与 op 矛盾 → stale。is_deleted 未注入(undefined)→ 退化到 hasSuperseded(仅 !intent 时,与 PG 对偶)。
+    //   P1-1 marker 自恢复(无 supersede 行、is_deleted 未注入)不受影响:继续据 marker derive。
+    // stale → 标 superseded 返回,不重建、不执行副作用(含 intent 仍 pending 的 sweep 残留也挡)。
+    const isDeleted = this.projectDeleted.get(projectId)
+    let stale = false
+    let staleReason = ''
+    if (isDeleted !== undefined) {
+      const desiredByState: CompensationOp = isDeleted ? 'delete' : 'restore'
+      if (desiredByState !== op) { stale = true; staleReason = `durable desired state (is_deleted=${isDeleted})` }
+    } else if (!intent && this.hasSupersededCompensation(projectId, op)) {
+      stale = true; staleReason = 'superseded by newer opposing generation'
+    }
+    if (stale) {
+      if (intent) {
+        this.compensations.set(intent.id, { ...intent, status: 'superseded', lastError: `superseded by ${staleReason}`, claimedAt: null, claimedUntil: null, claimToken: null, updatedAt: now })
+      }
+      return { kind: 'superseded', op, intentId: intent?.id }
+    }
+    // P1-1 crash-recovery:record 崩溃未建意图,但 marker 表明补偿未完成 → 自建 pending 收敛。
+    const need = this.compensationNeed(projectId, op)
+    if (!intent && !need) return { kind: 'nothing-pending', op }
+    if (!intent) intent = this.createPendingIntent(projectId, op, this.nextGeneration(projectId))
+    // P2-1 claim/lease:已被未到期租约占用 → 输家返 already-claimed(单线程 JS:check+set 同步段原子)。
+    if (intent.claimedUntil && Date.parse(intent.claimedUntil) > Date.now()) {
+      return { kind: 'already-claimed', op, intentId: intent.id }
+    }
+    // R3-F4: claim fencing token(单线程 JS 无 lease 过期竞态,token 仅类型对称 + done 校验占位;真竞态 fencing 在 PG)。
+    const claimToken = randomUUID()
+    const leaseUntil = new Date(Date.now() + COMPENSATION_CLAIM_LEASE_MS).toISOString()
+    const claimed: CompensationIntent = { ...intent, claimedAt: now, claimedUntil: leaseUntil, claimToken, updatedAt: now }
+    this.compensations.set(intent.id, claimed)
+    const attempts = claimed.attemptCount + 1
+    // R5-F1 Test-only pause:claim 后、side effect 前注入 await(模拟 primary 在 record 前崩溃、durable state
+    //   在 claim 后翻转的真实 TOCTOU 窗口)。与 PG __setClaimPauseForTest 对偶。
+    const pauseFn = this.compensationClaimPauseForTest[op]
+    if (pauseFn) await pauseFn()
+    // R5-F1 FIX:critical section —— claim 后、side effect 前重读 durable desired state(与 PG critical 事务对偶)。
+    //   P-6 两步写固有窗口:primary ensureCreate/softDelete 先于 recordCompensation 提交,claim 后 is_deleted
+    //   可能已被 primary 翻转(record 前崩溃/延迟)。memory 单线程:pause 期间测试经 __setProjectDeletedForTest
+    //   翻转 is_deleted;此处重读捕获之。stale → supersede WHERE token=ours,不执行副作用(不重开已删/吊销已恢复)。
+    const isDeletedAfter = this.projectDeleted.get(projectId)
+    if (isDeletedAfter !== undefined) {
+      const desiredAfter: CompensationOp = isDeletedAfter ? 'delete' : 'restore'
+      if (desiredAfter !== op) {
+        const cur0 = this.compensations.get(intent.id)
+        if (cur0 && cur0.claimToken === claimToken && cur0.status === 'pending') {
+          this.compensations.set(intent.id, { ...cur0, status: 'superseded', lastError: `superseded by durable desired state (is_deleted=${isDeletedAfter}) after claim`, claimedAt: null, claimedUntil: null, claimToken: null, updatedAt: now })
+        }
+        return { kind: 'superseded', op, intentId: intent.id }
+      }
+    }
+    // R3-F4 ownership re-fetch:pause 期间 lease 可能过期被另一 worker 重 claim(token 变)→ stale-claim
+    //   (不执行副作用、不 mark done、不 bump attemptCount)。单线程下仅 Promise.all 交错可达。
+    const cur = this.compensations.get(intent.id)
+    if (!cur || cur.claimToken !== claimToken || cur.status !== 'pending') {
+      return { kind: 'stale-claim', op, intentId: intent.id }
+    }
+    // Test-only 故障注入:在 attempt 内消费,不污染 unRevokeAllForProject / revokeAllForProject 本身。
+    const fault = this.compensationFault[op] ?? 0
+    try {
+      if (fault > 0) {
+        this.compensationFault[op] = fault - 1
+        throw new Error(`[compensation-fault] ${op} step forced failure (was ${fault})`)
+      }
+      const r = op === 'restore'
+        ? await this.unRevokeAllForProject(projectId)
+        : await this.revokeAllForProject(projectId)
+      const done: CompensationIntent = {
+        ...cur, status: 'done', attemptCount: attempts,
+        lastError: null, lastAttemptedAt: now, claimedAt: null, claimedUntil: null, claimToken: null, updatedAt: now,
+      }
+      this.compensations.set(intent.id, done)
+      return { kind: 'completed', op, count: r.count, attempts: done.attemptCount, intentId: intent.id }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      const failed: CompensationIntent = {
+        ...cur, attemptCount: attempts,
+        lastError: msg, lastAttemptedAt: now, claimedAt: null, claimedUntil: null, claimToken: null, updatedAt: now,
+      }
+      this.compensations.set(intent.id, failed)
+      return { kind: 'failed', op, error: msg, attempts: failed.attemptCount, intentId: intent.id }
+    }
+  }
+
+  async listCompensations(projectId: string): Promise<CompensationIntent[]> {
+    const ids = this.compensationsByProject.get(projectId) ?? []
+    return ids.map((id) => this.compensations.get(id)).filter((x): x is CompensationIntent => x !== undefined)
+  }
+
+  async listPendingCompensations(projectId?: string): Promise<CompensationIntent[]> {
+    const out: CompensationIntent[] = []
+    const projects = projectId ? [projectId] : [...this.compensationsByProject.keys()]
+    for (const pid of projects) {
+      const ids = this.compensationsByProject.get(pid) ?? []
+      for (const id of ids) {
+        const it = this.compensations.get(id)
+        if (it && it.status === 'pending') out.push(it)
+      }
+    }
+    return out
+  }
+
+  /** R3-F2:列 failed/dead-letter 意图(超限放弃;可告警的未收敛事实)。 */
+  async listFailedCompensations(projectId?: string): Promise<CompensationIntent[]> {
+    const out: CompensationIntent[] = []
+    const projects = projectId ? [projectId] : [...this.compensationsByProject.keys()]
+    for (const pid of projects) {
+      const ids = this.compensationsByProject.get(pid) ?? []
+      for (const id of ids) {
+        const it = this.compensations.get(id)
+        if (it && it.status === 'failed') out.push(it)
+      }
+    }
+    return out
+  }
+
+  /** R3-F2:全局未收敛计数(供 /readyz + 响应 header)。 */
+  async getCompensationCounts(): Promise<{ pending: number; failed: number }> {
+    // R7 Test-only:注入强制抛错(对偶 PG 表缺失/列不匹配/权限错)。生产 memory 路径不注入 → 不抛。
+    if (this.compensationCountsErrorForTest) throw this.compensationCountsErrorForTest
+    let pending = 0
+    let failed = 0
+    for (const it of this.compensations.values()) {
+      if (it.status === 'pending') pending++
+      else if (it.status === 'failed') failed++
+    }
+    return { pending, failed }
+  }
+
+  async sweepCompensations(): Promise<{ processed: number; converged: number; failed: number }> {
+    let processed = 0
+    let converged = 0
+    let failed = 0
+    // 有界:snapshot pending 列表后逐条 attempt(跳过未到期租约——并发 attempt/sweep 不抢)。
+    const pending = await this.listPendingCompensations()
+    for (const it of pending) {
+      if (it.claimedUntil && Date.parse(it.claimedUntil) > Date.now()) continue // 租约未到期,跳过
+      if (it.attemptCount >= COMPENSATION_MAX_SWEEP_ATTEMPTS) {
+        // R3-F2:超限放弃 → 'failed' dead-letter(不再伪装 done);保留可告警的未收敛事实,运维可定因。
+        //   不占 partial unique 槽(WHERE status='pending'),下一生命周期 primary record 新 pending 自动重开。
+        const now = nowIso()
+        this.compensations.set(it.id, { ...it, status: 'failed', lastError: it.lastError ?? 'sweep max attempts exceeded', lastAttemptedAt: now, updatedAt: now })
+        failed++
+        continue
+      }
+      const r = await this.attemptCompensation(it.projectId, it.op)
+      processed++
+      if (r.kind === 'completed') converged++
+      else if (r.kind === 'failed') failed++
+      // already-claimed / nothing-pending / superseded:不计入 processed 的收敛/失败(sweep 视角非错误)
+    }
+    return { processed, converged, failed }
   }
 
   // G2.1 R2-1:legacy owner 形态 = mivo-key 指纹(sha256[:16] hex;权威 keys.ts
@@ -373,6 +815,18 @@ export class InMemoryPermissionBackend implements PermissionBackend {
     this.links.clear()
     this.linksByToken.clear()
     this.linksByProject.clear()
+    this.compensations.clear()
+    this.compensationsByProject.clear()
+    this.projectDeleted.clear()
+    // 故障注入计数也清(防跨用例泄漏)。
+    delete this.compensationFault.restore
+    delete this.compensationFault.delete
+    delete this.compensationRecordFault.restore
+    delete this.compensationRecordFault.delete
+    delete this.compensationClaimPauseForTest.restore
+    delete this.compensationClaimPauseForTest.delete
+    // R7:counts 抛错注入也清(防跨用例泄漏致后续 readyz 用例假 503)。
+    this.compensationCountsErrorForTest = null
   }
 
   /** Test-only:把某 link 的 revokedAt 设为指定 ISO(测 30 天 un-revoke 窗;FX-7 §5.9)。 */
@@ -381,6 +835,57 @@ export class InMemoryPermissionBackend implements PermissionBackend {
     if (!link) return false
     this.links.set(linkId, { ...link, revokedAt: revokedAtIso })
     return true
+  }
+  /** Test-only:把某 link 的 cascadeRevokedAt(P-6 marker)设为指定 ISO(测 cascade restore 30 天窗)。 */
+  __setLinkCascadeRevokedAtForTest(linkId: string, iso: string): boolean {
+    const link = this.links.get(linkId)
+    if (!link) return false
+    this.links.set(linkId, { ...link, cascadeRevokedAt: iso })
+    return true
+  }
+
+  /**
+   * R5-F1 Test-only:设置 project 的 is_deleted durable desired state(memory 对偶 PG __setProjectDeletedForTest)。
+   * memory 不持有 projects 表,但 R5-F1 TOCTOU 双后端契约要求 memory 与 PG 对称:attemptCompensation 的
+   * stale gate(first + claim 后重读)均据此判 stale。未注入(undefined)→ 退化到 hasSuperseded fallback。
+   * R3-F1 既有 memory 用例调此 helper(is_deleted 与 hasSuperseded 信号一致)→ 行为不变。
+   */
+  __setProjectDeletedForTest(projectId: string, isDeleted: boolean): void {
+    this.projectDeleted.set(projectId, isDeleted)
+  }
+
+  /** R5-F1 Test-only:注入 op 在 claim 后、side effect 前的 await 暂停点(模拟 primary 在 record 前崩溃、
+   * durable state 在 claim 后翻转的真实 TOCTOU 窗口)。与 PG __setClaimPauseForTest 对偶。 */
+  __setClaimPauseForTest(op: CompensationOp, pauseFn: () => Promise<void>): void {
+    this.compensationClaimPauseForTest[op] = pauseFn
+  }
+  /** Test-only:清除 claim 暂停点。 */
+  __clearClaimPauseForTest(op: CompensationOp): void {
+    delete this.compensationClaimPauseForTest[op]
+  }
+
+  /** Test-only:注入 op 补偿步骤强制失败 N 次(消费在 attemptCompensation;不污染 unRevoke/revoke 本身)。 */
+  __setCompensationFaultForTest(op: CompensationOp, throwCount: number): void {
+    this.compensationFault[op] = throwCount
+  }
+  /** Test-only:清除 op 补偿故障注入。 */
+  __clearCompensationFaultForTest(op: CompensationOp): void {
+    delete this.compensationFault[op]
+  }
+  /** Test-only:注入 op recordCompensation 强制失败 N 次(P1-1:第一步提交后 record 崩溃)。 */
+  __setRecordFaultForTest(op: CompensationOp, throwCount: number): void {
+    this.compensationRecordFault[op] = throwCount
+  }
+  /** Test-only:清除 op record 故障注入。 */
+  __clearRecordFaultForTest(op: CompensationOp): void {
+    delete this.compensationRecordFault[op]
+  }
+  /**
+   * R7 Test-only:注入 getCompensationCounts 强制抛错(模拟 PG share_link_compensations 表缺失/列不匹配/权限错)。
+   * 传 null 清除(默认 __reset 也清,防跨用例泄漏)。用于 /readyz 负例验证 catch 不再吞成 {0,0} 假绿。
+   */
+  __setCompensationCountsErrorForTest(err: Error | null): void {
+    this.compensationCountsErrorForTest = err
   }
 }
 

@@ -25,7 +25,7 @@ import { resolveActor } from '../lib/owner'
 import type { AuthzAction } from '../lib/authz'
 import { resolveProjectAccess, denyProjectResponse } from '../lib/projectAuthz'
 import type { PermissionBackend } from '../lib/permissions'
-import { newRequestId, logRequest } from '../lib/request'
+import { newRequestId, logRequest, logCompensation } from '../lib/request'
 import {
   bodyError,
   decodeCreateProject,
@@ -150,9 +150,26 @@ export const createProjectsRoutes = ({ backend, permissions }: { backend: Persis
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'parent-not-live' })
       return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
     }
-    // FX-7 §7:project 软删后重建(restore)→ un-revoke 其 share_links(30 天窗内;链接随 project 恢复而恢复)。
+    // FX-7 §7 + P-6 saga:project 软删后重建(restore)→ un-revoke 其 share_links。restore 是两步写(persist 恢复
+    // + permission unRevoke)的第二步;失败留 pending 意图,幂等重入(existing)时 attemptCompensation 收敛,
+    // 不因幂等直接跳过(旧 bug:POST 幂等成功后不再触发补偿 → 链接永久 revoked)。
+    // P1-1 返修(2026-07-12):record 为可观察+supersede+pending 信号;其失败不阻断主操作(cascade_revoked_at
+    // marker 已 durable,attempt 据 marker 自收敛)。attempt 据 cascade_revoked_at 派生——普通 existing(无 marker)
+    // → nothing-pending,不动手工 revoked link(防误恢复)。
     if (result.kind === 'restored') {
-      await permissions.unRevokeAllForProject(id)
+      try {
+        await permissions.recordCompensation(id, 'restore')
+      } catch (err) {
+        logCompensation({ requestId, projectId: id, op: 'restore', outcome: 'failed', attempts: 0, error: `record: ${err instanceof Error ? err.message : String(err)}` })
+      }
+    }
+    if (result.kind === 'restored' || result.kind === 'existing') {
+      const comp = await permissions.attemptCompensation(id, 'restore')
+      if (comp.kind === 'failed') {
+        logCompensation({ requestId, projectId: id, op: 'restore', outcome: 'failed', error: comp.error, attempts: comp.attempts })
+      } else if (comp.kind === 'completed') {
+        logCompensation({ requestId, projectId: id, op: 'restore', outcome: 'completed', attempts: comp.attempts, count: comp.count })
+      }
     }
     const status = result.kind === 'created' ? 201 : 200
     logRequest({ method: c.req.method, path: c.req.path, requestId, status, latencyMs: Date.now() - t0 })
@@ -280,8 +297,21 @@ export const createProjectsRoutes = ({ backend, permissions }: { backend: Persis
     }
     if (!got.record.isDeleted) {
       await backend.softDeleteProjectTree(authz.ownerId, id)
-      // FX-7 §7:project 软删 → 级联 revoke 其 share_links(project 不可见则分享链接失效)。
-      await permissions.revokeAllForProject(id)
+      // P-6 saga:softDelete 成功后才记 delete 补偿意图(softDelete 抛错则不到此,无需补偿)。
+      // P1-1 返修:record 失败不阻断主操作(cascade marker durable,attempt 据 marker 自收敛)。
+      try {
+        await permissions.recordCompensation(id, 'delete')
+      } catch (err) {
+        logCompensation({ requestId, projectId: id, op: 'delete', outcome: 'failed', attempts: 0, error: `record: ${err instanceof Error ? err.message : String(err)}` })
+      }
+    }
+    // P-6:always attempt delete compensation(fresh:recorded above + attempts;reentry already-deleted:据 marker 收敛)。
+    // 旧代码:revoke 在 if 块内,reentry(已删)跳过 → revoke 失败永不重试(链接永久 active)。现 attemptCompensation 收敛。
+    const delComp = await permissions.attemptCompensation(id, 'delete')
+    if (delComp.kind === 'failed') {
+      logCompensation({ requestId, projectId: id, op: 'delete', outcome: 'failed', error: delComp.error, attempts: delComp.attempts })
+    } else if (delComp.kind === 'completed') {
+      logCompensation({ requestId, projectId: id, op: 'delete', outcome: 'completed', attempts: delComp.attempts, count: delComp.count })
     }
     logRequest({ method: c.req.method, path: c.req.path, requestId, status: 204, latencyMs: Date.now() - t0 })
     return c.body(null, 204)

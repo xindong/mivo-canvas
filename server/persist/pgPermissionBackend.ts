@@ -28,8 +28,15 @@ import type {
   RemoveMemberResult,
   RevokeResult,
   UnRevokeResult,
+  CompensationOp,
+  CompensationIntent,
+  CompensationOutcome,
 } from '../lib/permissions'
-import { UNREVOKE_WINDOW_MS } from '../lib/permissions'
+import {
+  UNREVOKE_WINDOW_MS,
+  COMPENSATION_CLAIM_LEASE_MS,
+  COMPENSATION_MAX_SWEEP_ATTEMPTS,
+} from '../lib/permissions'
 import type { ProjectRole, SharePermission } from '../lib/authz'
 
 // ── Kysely Database 类型(权限两表)──────────────────────────────────────────────────
@@ -51,10 +58,32 @@ interface ShareLinksTable {
   updated_at: Generated<Date>
   revoked_at: Date | null
   expires_at: Date | null
+  // P-6 marker(005 migration ALTER 加列):级联 revoke 标记。区分 project 软删级联 vs 手工吊销。
+  cascade_revoked_at: Date | null
+}
+// P-6 saga 补偿意图表(005 migration 建 + 006 加 'failed' 终态)。无 revision(owner 权威写);attempt_count/last_error/last_attempted_at=可观察。
+// 返修 P1-2/P1-3/P2-1:generation(代际 supersede)+ claimed_at/claimed_until(租约)+ status 'superseded' + partial unique index。
+// 返修 R3-F2:status 'failed'(sweep 超限 dead-letter,不占 partial unique 槽,006 ALTER CHECK 加)。
+interface ShareLinkCompensationsTable {
+  id: string
+  project_id: string
+  op: string // 'restore'|'delete'(DB CHECK 强制;读出后 cast)
+  status: string // 'pending'|'done'|'superseded'|'failed'(DB CHECK 强制;006 加 'failed';读出后 cast)
+  generation: number
+  attempt_count: number
+  last_error: string | null
+  last_attempted_at: Date | null
+  claimed_at: Date | null
+  claimed_until: Date | null
+  // R3-F4: claim fencing token(007 migration 加列)。claim 写入;done/failed/supersede 清空。
+  claim_token: string | null
+  created_at: Generated<Date>
+  updated_at: Generated<Date>
 }
 interface PermissionDatabase {
   project_members: ProjectMembersTable
   share_links: ShareLinksTable
+  share_link_compensations: ShareLinkCompensationsTable
 }
 
 /** 密码学随机 token(256-bit,base64url ≈ 43 chars;不可枚举,§1.2)。与内存实现同算法,route 测试断言一致。 */
@@ -81,6 +110,24 @@ const rowToShareLink = (row: Selectable<ShareLinksTable>): ShareLink => ({
   updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : String(row.updated_at),
   revokedAt: row.revoked_at ? (row.revoked_at instanceof Date ? row.revoked_at.toISOString() : String(row.revoked_at)) : null,
   expiresAt: row.expires_at ? (row.expires_at instanceof Date ? row.expires_at.toISOString() : String(row.expires_at)) : null,
+  cascadeRevokedAt: row.cascade_revoked_at ? (row.cascade_revoked_at instanceof Date ? row.cascade_revoked_at.toISOString() : String(row.cascade_revoked_at)) : null,
+})
+
+/** DB 行 → P-6 CompensationIntent。 */
+const rowToCompensation = (row: Selectable<ShareLinkCompensationsTable>): CompensationIntent => ({
+  id: row.id,
+  projectId: row.project_id,
+  op: row.op as CompensationOp,
+  status: row.status as 'pending' | 'done' | 'superseded' | 'failed',
+  generation: row.generation,
+  attemptCount: row.attempt_count,
+  lastError: row.last_error,
+  lastAttemptedAt: row.last_attempted_at instanceof Date ? row.last_attempted_at.toISOString() : (row.last_attempted_at ? String(row.last_attempted_at) : null),
+  claimedAt: row.claimed_at instanceof Date ? row.claimed_at.toISOString() : (row.claimed_at ? String(row.claimed_at) : null),
+  claimedUntil: row.claimed_until instanceof Date ? row.claimed_until.toISOString() : (row.claimed_until ? String(row.claimed_until) : null),
+  claimToken: row.claim_token ?? null,
+  createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at),
+  updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : String(row.updated_at),
 })
 
 // ── Migration provider(静态列表,免 FileMigrationProvider 路径解析;与 PgPersistBackend 同模式)──────────
@@ -110,6 +157,31 @@ export const runPermissionMigrations = async (db: Kysely<PermissionDatabase>): P
   }
 }
 
+// R8 形状守卫(2026-07-12):005/006/007 是补偿表权威 DDL(server/persist/migrations.ts)。
+// 删 002 死草案后仍可能运维误建残缺表 → 005 CREATE TABLE IF NOT EXISTS 跳过不补列(表已存在),
+// kysely_migration 却标 005 applied → migrateToLatest no-op → 表维持残缺。ready 阶段 information_schema
+// 校验必需列集 + status CHECK 域,任一缺失 fail-closed 拒启动(清单以 migrations.ts 005-007 实际 DDL 逐列核对写死)。
+const COMPENSATIONS_REQUIRED_COLUMNS = [
+  'id',
+  'project_id',
+  'op',
+  'status',
+  'generation', // 005(P1-2 代际 supersede)
+  'attempt_count',
+  'last_error',
+  'last_attempted_at',
+  'claimed_at', // 005(P2-1 attempt 租约起点)
+  'claimed_until', // 005(P2-1 租约到期)
+  'claim_token', // 007(R3-F4 claim fencing token)
+  'created_at',
+  'updated_at',
+] as const
+// 006 ALTER CHECK 加 'superseded'(P1-2)+ 'failed'(R3-F2 sweep 超限 dead-letter)。
+const COMPENSATIONS_REQUIRED_STATUS_VALUES = ['pending', 'done', 'superseded', 'failed'] as const
+
+/**
+ * PgPermissionBackend:PG 权限层后端。drop-in 实现 PermissionBackend;路由零改动。
+
 /**
  * PgPermissionBackend:PG 权限层后端。drop-in 实现 PermissionBackend;路由零改动。
  * 单实例 BFF 假设(无全局缓存;多实例协作留 T1.4+,同 PgPersistBackend)。
@@ -120,6 +192,10 @@ export class PgPermissionBackend implements PermissionBackend {
   private readonly ownsPool: boolean
   /** ready:migrations 完成建表(无 warm cache——权限无同步 seam)。app 启动 await 后再 serve。 */
   readonly ready: Promise<void>
+  /** P-6 Test-only 故障注入:op → 剩余强制失败次数(attemptCompensation 内消费,不污染 unRevoke/revoke 本身)。 */
+  private readonly compensationFault: Partial<Record<CompensationOp, number>> = {}
+  /** R3-F4 Test-only:op → claim 后 side effect 前的 await 暂停点(模拟赢家超过 lease 暂停,供 race 验收)。 */
+  private readonly compensationClaimPauseForTest: Partial<Record<CompensationOp, () => Promise<void>>> = {}
 
   /**
    * F2 返修:支持共享 Pool。`sharedPool` 注入则与 PgPersistBackend 复用同一 Pool(单预算 + 共享
@@ -148,6 +224,7 @@ export class PgPermissionBackend implements PermissionBackend {
   /** migrate-then-ready(可重放;migrator 自带 kysely_migration 追踪表)。 */
   private async init(): Promise<void> {
     await this.migrate()
+    await this.verifyCompensationsShape()
   }
 
   /** 优雅关闭连接池(app shutdown 用)。F2:shared pool 时不销毁(由拥有者释放),own pool 时 db.destroy 连带销毁。 */
@@ -173,6 +250,53 @@ export class PgPermissionBackend implements PermissionBackend {
   /** 对本 backend 的 db 跑 migrateToLatest(可重放)。测试 beforeAll + 生产 runbook 用。 */
   async migrate(): Promise<void> {
     await runPermissionMigrations(this.db)
+  }
+
+  /**
+   * R8 形状守卫:migrate() 成功后,information_schema 校验 share_link_compensations 必需列集
+   * + status CHECK 域。任一缺失抛带列名/值的明确错误(fail-closed,不静默)。
+   *
+   * 防的是:migrateToLatest 会把 005 标记成 applied 即便其 CREATE TABLE IF NOT EXISTS 因表已存在
+   * 而跳过(不补列)——典型成因是运维误建残缺表(如已删的 002 死草案形态,缺 generation/
+   * claimed_at/claimed_until)。终态表残缺却"migrations 全绿",counts 查缺列抛(R7 已摘流量),
+   * 但 recordCompensation 跑缺列更早挂;本守卫在启动 ready 阶段就拒,先于任何业务请求。
+   *
+   * 抛错路径:ready Promise reject → index.ts start() 的 Promise.all([persist.ready,
+   * permission.ready]) reject → start().catch → console.error('[mivo-bff] startup failed:', err)
+   * + process.exit(1)(与 G2.1 strict owner-migration gate 同格局)。memory 后端无此方法(无 PG
+   * schema,no-op 语义由其恒-resolve 的 ready 兜底)。
+   */
+  private async verifyCompensationsShape(): Promise<void> {
+    // 列集校验:information_schema.columns 取现存列,与必需清单(以 migrations.ts 005-007 DDL 为准)求差。
+    const cols = (await sql`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_name='share_link_compensations'
+    `.execute(this.db)).rows as { column_name: string }[]
+    const present = new Set(cols.map((r) => r.column_name))
+    const missing = COMPENSATIONS_REQUIRED_COLUMNS.filter((c) => !present.has(c))
+    if (missing.length > 0) {
+      throw new Error(
+        `[PgPermissionBackend] share_link_compensations shape guard failed: missing columns [${missing.join(', ')}]. ` +
+          `Required (migrations.ts 005/006/007 DDL): [${COMPENSATIONS_REQUIRED_COLUMNS.join(', ')}]. ` +
+          `Likely cause: a stale draft table was applied manually (e.g. the deleted 002_compensations.sql), ` +
+          `then 005 CREATE TABLE IF NOT EXISTS skipped adding the missing columns. ` +
+          `Drop the table and re-run migrateToLatest from a clean state.`,
+      )
+    }
+    // status CHECK 域校验:pg_get_constraintdef 取全部 CHECK 定义,校验含 005+006 终态 4 值。
+    const checks = (await sql`
+      SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint
+      WHERE conrelid='share_link_compensations'::regclass AND contype='c'
+    `.execute(this.db)).rows as { def: string }[]
+    const checkDefs = checks.map((r) => r.def).join(' ')
+    const missingStatus = COMPENSATIONS_REQUIRED_STATUS_VALUES.filter((s) => !checkDefs.includes(s))
+    if (missingStatus.length > 0) {
+      throw new Error(
+        `[PgPermissionBackend] share_link_compensations shape guard failed: status CHECK missing values [${missingStatus.join(', ')}]. ` +
+          `Required: ('pending','done','superseded','failed') (005 + 006 ALTER CHECK). ` +
+          `Likely cause: migration 006 (compensation_failed_status) not applied. Re-run migrateToLatest.`,
+      )
+    }
   }
 
   // ── 成员资格(project_members)──────────────────────────────────────────────────────────
@@ -325,10 +449,10 @@ export class PgPermissionBackend implements PermissionBackend {
       if (row.revoked_at && Date.now() - row.revoked_at.getTime() > UNREVOKE_WINDOW_MS) {
         return { ok: false, reason: 'window-closed' }
       }
-      // revoked(窗内)或 active(幂等)→ SET revoked_at=null(returning;原子)。
+      // revoked(窗内)或 active(幂等)→ SET revoked_at=null(returning;原子)。P-6:同步清 cascade_revoked_at marker。
       const upd = await trx
         .updateTable('share_links')
-        .set({ revoked_at: null, updated_at: new Date() })
+        .set({ revoked_at: null, cascade_revoked_at: null, updated_at: new Date() })
         .where('id', '=', linkId)
         .where('project_id', '=', projectId)
         .returningAll()
@@ -342,10 +466,25 @@ export class PgPermissionBackend implements PermissionBackend {
 
   async revokeAllForProject(projectId: string): Promise<{ count: number }> {
     await this.ready
-    // 单语句原子:UPDATE WHERE project_id+revoked_at IS NULL RETURNING id → count=返行数(只 revoke 活的)。
-    const rows = await this.db
+    return this.revokeAllForProjectInConn(this.db, projectId)
+  }
+
+  async unRevokeAllForProject(projectId: string): Promise<{ count: number }> {
+    await this.ready
+    return this.unRevokeAllForProjectInConn(this.db, projectId)
+  }
+
+  /**
+   * R5-F1: revoke 级联的 connection-aware 实现(conn=this.db 走 autocommit;conn=trx 走 attemptCompensation
+   * 的 critical 事务,与 projects FOR UPDATE + done CAS 同事务原子,消除 TOCTOU)。
+   * 单语句原子:UPDATE WHERE project_id+revoked_at IS NULL RETURNING id → count=返行数(只 revoke 活的)。
+   * P-6 marker:同步置 cascade_revoked_at(级联 revoke 标记,restore 补偿只动此标记非空的链接)。
+   */
+  private async revokeAllForProjectInConn(conn: Kysely<PermissionDatabase>, projectId: string): Promise<{ count: number }> {
+    const now = new Date()
+    const rows = await conn
       .updateTable('share_links')
-      .set({ revoked_at: new Date(), updated_at: new Date() })
+      .set({ revoked_at: now, cascade_revoked_at: now, updated_at: now })
       .where('project_id', '=', projectId)
       .where('revoked_at', 'is', null)
       .returning('id')
@@ -353,30 +492,399 @@ export class PgPermissionBackend implements PermissionBackend {
     return { count: rows.length }
   }
 
-  async unRevokeAllForProject(projectId: string): Promise<{ count: number }> {
-    await this.ready
-    // 单语句原子:WHERE project_id + revoked 非空 + 窗内(revoked_at >= now-30d)→ SET revoked_at=null RETURNING id。
-    // 窗判定用 TS 算的 cutoff 日期(Date.now()-30d,与内存 Date.now 等价),全 typed;无 raw SQL 布尔 where 类型坑。
+  /**
+   * R5-F1: unRevoke 级联的 connection-aware 实现(同上,conn=trx 时与 critical 事务同事务)。
+   * P-6 marker:仅恢复"级联 revoke"标记(cascade_revoked_at 非空)且 30 天窗内的链接,清空 marker + revoked_at。
+   * 手工 revoke(cascade_revoked_at IS NULL)永不被 restore 补偿动 → 防误恢复用户主动吊销的链接。
+   */
+  private async unRevokeAllForProjectInConn(conn: Kysely<PermissionDatabase>, projectId: string): Promise<{ count: number }> {
     const cutoff = new Date(Date.now() - UNREVOKE_WINDOW_MS)
-    const rows = await this.db
+    const rows = await conn
       .updateTable('share_links')
-      .set({ revoked_at: null, updated_at: new Date() })
+      .set({ revoked_at: null, cascade_revoked_at: null, updated_at: new Date() })
       .where('project_id', '=', projectId)
-      .where('revoked_at', 'is not', null)
-      .where('revoked_at', '>=', cutoff)
+      .where('cascade_revoked_at', 'is not', null)
+      .where('cascade_revoked_at', '>=', cutoff)
       .returning('id')
       .execute()
     return { count: rows.length }
   }
 
+  // ── P-6 saga 补偿(返修 P1-1/P1-2/P1-3/P2-1:marker + supersede + claim/lease + sweep)──
+  // 设计:
+  //  - marker:cascade_revoked_at(级联 revoke 标记)随 unRevokeAll/revokeAll 提交 durable;record 崩溃后,
+  //    marker 已 durable → 重启 sweep(据 projects.is_deleted + share_links.cascade_revoked_at derive)或
+  //    重试 attempt(据 compensationNeed)自动收敛。手工 revoke(cascade_revoked_at IS NULL)永不动。
+  //  - record:advisory_xact_lock(projectId,op) 串行化并发首建 + partial unique index 兜底 → 恰一条 pending。
+  //  - attempt:原子 UPDATE...WHERE status='pending' AND lease-free RETURNING claim(P2-1);loser 返 already-claimed。
+  //  - sweep:启动 reconcileFromProjectState(derive pending from projects.is_deleted)+ 周期 attempt pending(有界)。
+
+  /** op → advisory lock key2(restore=1,delete=2)。 */
+  private static opLockKey(op: CompensationOp): number {
+    return op === 'restore' ? 1 : 2
+  }
+
+  /** project 级下一代际 = 现存全部意图 max(generation)+1。 */
+  private async nextGenerationInTrx(trx: Kysely<PermissionDatabase>, projectId: string): Promise<number> {
+    const row = await trx.selectFrom('share_link_compensations')
+      .select((eb) => eb.fn.max('generation').as('g'))
+      .where('project_id', '=', projectId)
+      .executeTakeFirst()
+    const g = (row as { g?: number | string | null } | undefined)?.g
+    return (Number(g ?? 0) || 0) + 1
+  }
+
+  async recordCompensation(projectId: string, op: CompensationOp): Promise<CompensationIntent> {
+    await this.ready
+    return this.db.transaction().execute(async (trx) => {
+      // P1-3:pg_advisory_xact_lock 串行化同 (projectId,op) 的并发 record → 恰一条 pending(FOR UPDATE 对空结果不锁,
+      // 原bug:两首建都 INSERT→多条 pending)。partial unique index UNIQUE(project_id,op) WHERE status='pending' 兜底。
+      await sql`SELECT pg_advisory_xact_lock(hashtext(${projectId}), ${PgPermissionBackend.opLockKey(op)}::integer)`.execute(trx)
+      // R6 锁序统一(R5 verdict Step 4 暴露的 P2 反向锁环):先锁 project 行 FOR UPDATE,再写/插 compensations。
+      //   未修前 record 先 UPDATE supersede 持 compensation 行锁,再 INSERT 新 generation 触发 FK(project_id
+      //   REFERENCES projects(id))对 project 行请求 KEY SHARE;而 attemptCompensation critical section 先持
+      //   project FOR UPDATE 后持 compensation FOR UPDATE——形成 compensation→project 与 project→compensation 的
+      //   反向锁环,真 PG 确定性触发 40P01 deadlock。此处与 attempt critical section(project→compensation)统一同序,
+      //   消除环;INSERT 的 FK KEY SHARE 被已持的 FOR UPDATE(强锁)覆盖,无需额外获取。project 行不存在 → SELECT
+      //   返 0 行(无锁),后续 INSERT 仍按原逻辑抛 FK violation(line 487),行为不变。不得削弱 F1 TOCTOU 语义
+      //   (attempt critical 的 is_deleted 重读仍在自身 project FOR UPDATE 锁内,不受影响)。
+      // [R6-RED-PROOF] 已还原:40P01 在旧代码(摘掉此行)确定性复现,加回后绿(见 R6 barrier 测试)。
+      await sql`SELECT 1 FROM projects WHERE id = ${projectId} FOR UPDATE`.execute(trx)
+      // P1-2 supersede:把 pending 对立 op mark superseded(保留行做历史;不再被 sweep/attempt 处理)。
+      const opposite: CompensationOp = op === 'restore' ? 'delete' : 'restore'
+      await trx.updateTable('share_link_compensations')
+        .set({ status: 'superseded', last_error: `superseded by ${op} generation`, claimed_at: null, claimed_until: null, claim_token: null, updated_at: new Date() })
+        .where('project_id', '=', projectId)
+        .where('op', '=', opposite)
+        .where('status', '=', 'pending')
+        .execute()
+      // 幂等:已有 pending 同 op → 返之(不重复),防重入 POST restored 重复建意图。
+      const existing = await trx.selectFrom('share_link_compensations').selectAll()
+        .where('project_id', '=', projectId)
+        .where('op', '=', op)
+        .where('status', '=', 'pending')
+        .executeTakeFirst()
+      if (existing) return rowToCompensation(existing)
+      // R5-F2:新 generation record 时把同 project 全部历史 failed dead-letter 标 superseded(不计当前未收敛)。
+      //   新 generation(同 op 重试 / 对立 op 翻转)意味 desired state 已翻篇,旧 dead-letter 不再代表当前未收敛
+      //   → counts.failed 归零(/readyz 可用性恢复,不再永久 503)。保留行于 listCompensations 供审计。
+      //   与 memory supersedeOldFailedForProject 对偶;同事务 + advisory lock 保证与并发 record 串行。
+      await trx.updateTable('share_link_compensations')
+        .set({ status: 'superseded', last_error: 'superseded by newer generation (reopen)', claimed_at: null, claimed_until: null, claim_token: null, updated_at: new Date() })
+        .where('project_id', '=', projectId)
+        .where('status', '=', 'failed')
+        .execute()
+      const gen = await this.nextGenerationInTrx(trx, projectId)
+      const row = await trx.insertInto('share_link_compensations')
+        .values({
+          id: randomUUID(),
+          project_id: projectId,
+          op,
+          status: 'pending',
+          generation: gen,
+          attempt_count: 0,
+          last_error: null,
+          last_attempted_at: null,
+          claimed_at: null,
+          claimed_until: null,
+          claim_token: null,
+        })
+        .returningAll()
+        .executeTakeFirst()
+      if (!row) throw new Error('recordCompensation: insert failed (FK violation — project missing?)')
+      return rowToCompensation(row)
+    })
+  }
+
+  /** 找 (projectId, op) 最近一条 pending 意图(无 → undefined;按 generation desc 取最新代际)。 */
+  private async findPendingCompensationPg(projectId: string, op: CompensationOp): Promise<CompensationIntent | undefined> {
+    const row = await this.db.selectFrom('share_link_compensations').selectAll()
+      .where('project_id', '=', projectId)
+      .where('op', '=', op)
+      .where('status', '=', 'pending')
+      .orderBy('generation', 'desc')
+      .executeTakeFirst()
+    return row ? rowToCompensation(row) : undefined
+  }
+
+  /** marker-driven need:restore → 存在 cascade 标记且 30 天窗内的链接;delete → 存在 active 链接。 */
+  private async compensationNeedPg(projectId: string, op: CompensationOp): Promise<boolean> {
+    const cutoff = new Date(Date.now() - UNREVOKE_WINDOW_MS)
+    let q
+    if (op === 'restore') {
+      q = this.db.selectFrom('share_links').select('id')
+        .where('project_id', '=', projectId)
+        .where('cascade_revoked_at', 'is not', null)
+        .where('cascade_revoked_at', '>=', cutoff)
+        .limit(1)
+    } else {
+      q = this.db.selectFrom('share_links').select('id')
+        .where('project_id', '=', projectId)
+        .where('revoked_at', 'is', null)
+        .limit(1)
+    }
+    const row = await q.executeTakeFirst()
+    return !!row
+  }
+
+  /**
+   * R3-F1: 查 project 的 durable desired state(projects.is_deleted)。primary ensureCreate(restore→false)/
+   * softDeleteProjectTree(delete→true)先于 recordCompensation 提交 → is_deleted 即最新 desired state 的 ground truth。
+   * project 行不存在 → undefined(权限层 fallback 到 hasSupersededCompensationPg,与 memory 对偶)。
+   */
+  private async getProjectIsDeleted(projectId: string): Promise<boolean | undefined> {
+    const result = await sql`SELECT is_deleted FROM projects WHERE id = ${projectId}`.execute(this.db)
+    const row = (result.rows as { is_deleted?: boolean }[])[0]
+    return row === undefined ? undefined : !!row.is_deleted
+  }
+
+  /** R3-F1: (projectId, op) 是否存在被显式 supersede 的意图(对立 op 新代际曾 record 并 supersede 它)。 */
+  private async hasSupersededCompensationPg(projectId: string, op: CompensationOp): Promise<boolean> {
+    const row = await this.db.selectFrom('share_link_compensations').select('id')
+      .where('project_id', '=', projectId).where('op', '=', op).where('status', '=', 'superseded')
+      .limit(1).executeTakeFirst()
+    return !!row
+  }
+
+  async attemptCompensation(projectId: string, op: CompensationOp): Promise<CompensationOutcome> {
+    await this.ready
+    // 1. find or create pending intent(P1-1 crash-recovery:record 崩溃后无 pending,marker 表明需补偿 → 自建)。
+    let intent = await this.findPendingCompensationPg(projectId, op)
+    // R3-F1: stale-op gate。晚到的 attemptCompensation 不得仅凭 compensationNeed 重建旧 op intent——
+    // 那会把更新代际对立 op 的 revoked/active 终态翻转回来(权限边界破坏:已删项目重开链接/已恢复项目再吊销)。
+    // durable desired state 决断:PG 的 projects.is_deleted 是 ground truth(primary ensureCreate/softDelete
+    //   先于 recordCompensation 提交,is_deleted 即最新 desired state)。is_deleted 已知且与 op 矛盾 → stale。
+    //   is_deleted 未知(project 行不存在)→ 退化到 hasSuperseded(仅 !intent 时,与 memory 对偶)。
+    // stale → 标 superseded 返回,不重建、不执行副作用(含 intent 仍 pending 的 sweep 残留也挡)。
+    const isDeleted = await this.getProjectIsDeleted(projectId)
+    let stale = false
+    let staleReason = ''
+    if (isDeleted !== undefined) {
+      const desiredByState: CompensationOp = isDeleted ? 'delete' : 'restore'
+      if (desiredByState !== op) { stale = true; staleReason = `durable desired state (is_deleted=${isDeleted})` }
+    } else if (!intent && await this.hasSupersededCompensationPg(projectId, op)) {
+      stale = true; staleReason = 'superseded by newer opposing generation'
+    }
+    if (stale) {
+      if (intent) {
+        await this.db.updateTable('share_link_compensations')
+          .set({ status: 'superseded', last_error: `superseded by ${staleReason}`, claimed_at: null, claimed_until: null, updated_at: new Date() })
+          .where('id', '=', intent.id).where('status', '=', 'pending').execute()
+      }
+      return { kind: 'superseded', op, intentId: intent?.id }
+    }
+    const need = await this.compensationNeedPg(projectId, op)
+    if (!intent && !need) return { kind: 'nothing-pending', op }
+    if (!intent) intent = await this.recordCompensation(projectId, op)
+    // 2. P2-1 atomic claim + R3-F4 fencing token:UPDATE WHERE status='pending' AND lease-free
+    //   SET claim_token=randomUUID(), claimed_until RETURNING;0 行 → already-claimed。
+    //   UPDATE 行锁串行化并发 claim:赢家 set token+lease 返行;输家等锁后重检 WHERE(lease 已占)→ 0 行。
+    //   token 用于 side-effect 前预校验 + done/failed UPDATE 的 ownership 校验:lease 过期被新 worker 抢走后,
+    //   旧 owner 的 pre-check 失败/done UPDATE 0 行 → stale-claim(不执行副作用、不 mark done、不 bump attemptCount)。
+    const claimToken = randomUUID()
+    const leaseUntil = new Date(Date.now() + COMPENSATION_CLAIM_LEASE_MS)
+    const claimed = await this.db.updateTable('share_link_compensations')
+      .set({ claim_token: claimToken, claimed_at: new Date(), claimed_until: leaseUntil, updated_at: new Date() })
+      .where('id', '=', intent.id)
+      .where('status', '=', 'pending')
+      .where((eb) => eb.or([eb('claimed_until', 'is', null), eb('claimed_until', '<', new Date())]))
+      .returningAll()
+      .executeTakeFirst()
+    if (!claimed) return { kind: 'already-claimed', op, intentId: intent.id }
+    const cl = rowToCompensation(claimed)
+    const attempts = cl.attemptCount + 1
+    // Test-only pause(F4 race 验收 + R5-F1 TOCTOU 复现):claim 后、side effect 前注入 await,模拟赢家超过 lease
+    //   暂停(F4)或 primary 在 record 前崩溃、durable state 在 claim 后翻转的 TOCTOU 窗口(R5-F1)。
+    const pauseFn = this.compensationClaimPauseForTest[op]
+    if (pauseFn) await pauseFn()
+    // Test-only 故障注入:decrement 后 throw(语义等价"第二步抛错");不污染 unRevoke/revoke 本身。
+    const fault = this.compensationFault[op] ?? 0
+    // R5-F1 FIX: critical section —— claim 后、side effect 前在同一事务内锁 projects 行 FOR UPDATE 并重读
+    //   is_deleted,与 primary softDelete/ensureCreate 的 projects.is_deleted 写串行化(消除 TOCTOU:primary
+    //   提交后、record 前崩溃时 durable state 已翻,旧 worker 不得执行副作用重开已删/吊销已恢复链接)。
+    //   同时锁 compensations 行 FOR UPDATE 确认 claim ownership(lease 过期被新 worker 抢 → stale-claim,
+    //   不执行副作用、不 mark done、不 bump attemptCount)。stale(is_deleted 翻转)→ supersede 不执行副作用;
+    //   否则 side-effect + done CAS 同事务原子。对齐 pgBackend chat CAS 单语句原子先例(同事务串行化)。
+    try {
+      return await this.db.transaction().execute(async (trx) => {
+        // 1. 锁 projects 行 FOR UPDATE + 重读 is_deleted(与 primary is_deleted 写串行化;持锁期间 primary
+        //   softDelete/ensureCreate 的 UPDATE projects.is_deleted 阻塞至本事务提交 → is_deleted 稳定,无 TOCTOU)。
+        const projRes = await sql`SELECT is_deleted FROM projects WHERE id = ${projectId} FOR UPDATE`.execute(trx)
+        const projRow = (projRes.rows as { is_deleted?: boolean }[])[0]
+        const isDeletedAfter = projRow === undefined ? undefined : !!projRow.is_deleted
+        if (isDeletedAfter !== undefined) {
+          const desiredAfter: CompensationOp = isDeletedAfter ? 'delete' : 'restore'
+          if (desiredAfter !== op) {
+            // stale:durable desired state 在 claim 后翻转 → supersede(WHERE token=ours,不执行副作用)。
+            //   project 锁保证重读稳定;WHERE claim_token=ours 防止 clobber lease 过期后被新 worker 抢的 owner。
+            await trx.updateTable('share_link_compensations')
+              .set({ status: 'superseded', last_error: `superseded by durable desired state (is_deleted=${isDeletedAfter}) after claim`, claimed_at: null, claimed_until: null, claim_token: null, updated_at: new Date() })
+              .where('id', '=', intent.id)
+              .where('claim_token', '=', claimToken)
+              .where('status', '=', 'pending')
+              .execute()
+            return { kind: 'superseded', op, intentId: intent.id }
+          }
+        }
+        // 2. 锁 compensations 行 FOR UPDATE + 确认 ownership(token=ours、status=pending)。
+        //   lease 过期被新 worker 重 claim(token 变/status 变)→ 0 行 → stale-claim(不执行副作用、不 mark done)。
+        const ownerRow = await trx.selectFrom('share_link_compensations').select('id')
+          .where('id', '=', intent.id)
+          .where('claim_token', '=', claimToken)
+          .where('status', '=', 'pending')
+          .forUpdate()
+          .executeTakeFirst()
+        if (!ownerRow) return { kind: 'stale-claim', op, intentId: intent.id }
+        // 故障注入(decrement 后 throw):事务回滚 side effect + done,catch 在事务外 bump 可观察字段。
+        if (fault > 0) {
+          this.compensationFault[op] = fault - 1
+          throw new Error(`[compensation-fault] ${op} step forced failure (was ${fault})`)
+        }
+        // 3. side effect(同事务;revoke/unRevoke 级联,connection-aware InConn 跑在 trx 上)。
+        const r = op === 'restore'
+          ? await this.unRevokeAllForProjectInConn(trx, projectId)
+          : await this.revokeAllForProjectInConn(trx, projectId)
+        // 4. done CAS WHERE claim_token=ours(同事务;持 compensations 行锁保证成功,WHERE 仍兜底防异常)。
+        const doneRow = await trx.updateTable('share_link_compensations')
+          .set({ status: 'done', attempt_count: attempts, last_error: null, last_attempted_at: new Date(), claimed_at: null, claimed_until: null, claim_token: null, updated_at: new Date() })
+          .where('id', '=', intent.id)
+          .where('status', '=', 'pending')
+          .where('claim_token', '=', claimToken)
+          .returning('id')
+          .executeTakeFirst()
+        if (!doneRow) return { kind: 'stale-claim', op, intentId: intent.id }
+        return { kind: 'completed', op, count: r.count, attempts, intentId: intent.id }
+      })
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      // 失败(事务回滚:side effect + done 未提交):保持 pending,bump 可观察字段,清 lease+token。
+      //   WHERE claim_token=ours 防止 clobber 新 owner(若执行中 lease 过期被抢,本 UPDATE 0 行 → 不影响新 owner;
+      //   本 worker 仍报 failed,attemptCount 不 bump)。
+      await this.db.updateTable('share_link_compensations')
+        .set({ attempt_count: attempts, last_error: msg, last_attempted_at: new Date(), claimed_at: null, claimed_until: null, claim_token: null, updated_at: new Date() })
+        .where('id', '=', intent.id)
+        .where('status', '=', 'pending')
+        .where('claim_token', '=', claimToken)
+        .execute()
+      return { kind: 'failed', op, error: msg, attempts, intentId: intent.id }
+    }
+  }
+
+  async listCompensations(projectId: string): Promise<CompensationIntent[]> {
+    await this.ready
+    const rows = await this.db.selectFrom('share_link_compensations').selectAll()
+      .where('project_id', '=', projectId)
+      .orderBy('created_at', 'desc')
+      .execute()
+    return rows.map(rowToCompensation)
+  }
+
+  async listPendingCompensations(projectId?: string): Promise<CompensationIntent[]> {
+    await this.ready
+    let q = this.db.selectFrom('share_link_compensations').selectAll().where('status', '=', 'pending')
+    if (projectId) q = q.where('project_id', '=', projectId)
+    const rows = await q.orderBy('generation', 'desc').execute()
+    return rows.map(rowToCompensation)
+  }
+
+  /** R3-F2:列 failed/dead-letter 意图(超限放弃;可告警的未收敛事实)。 */
+  async listFailedCompensations(projectId?: string): Promise<CompensationIntent[]> {
+    await this.ready
+    let q = this.db.selectFrom('share_link_compensations').selectAll().where('status', '=', 'failed')
+    if (projectId) q = q.where('project_id', '=', projectId)
+    const rows = await q.orderBy('generation', 'desc').execute()
+    return rows.map(rowToCompensation)
+  }
+
+  /** R3-F2:全局未收敛计数(供 /readyz + 响应 header;轻量聚合不计列详情)。 */
+  async getCompensationCounts(): Promise<{ pending: number; failed: number }> {
+    await this.ready
+    const rows = await this.db.selectFrom('share_link_compensations')
+      .select(['status', (eb) => eb.fn.count('id').as('n')])
+      .where('status', 'in', ['pending', 'failed'])
+      .groupBy('status')
+      .execute() as { status: string; n: string | number | bigint }[]
+    let pending = 0
+    let failed = 0
+    for (const r of rows) {
+      const n = Number(r.n)
+      if (r.status === 'pending') pending = n
+      else if (r.status === 'failed') failed = n
+    }
+    return { pending, failed }
+  }
+
+  /**
+   * P1-2 启动恢复 derive:从 projects.is_deleted + share_links.cascade_revoked_at 派生 pending
+   * (record 崩溃未建意图的兜底——marker durable,重启据此补建 pending 供 sweep 收敛)。
+   *  - is_deleted=true 且有 active 链接 → record 'delete'(若已有 pending 同 op 幂等不重复)。
+   *  - is_deleted=false 且有 30 天窗内 cascade 标记链接 → record 'restore'。
+   * 查 projects 表(persist schema,同 DB;permission 层已经 FK 引用 + __seedProjectForTest 触及)。
+   */
+  async reconcileFromProjectState(): Promise<{ deleteRecorded: number; restoreRecorded: number }> {
+    await this.ready
+    const deletedProj = await sql`SELECT DISTINCT p.id AS pid FROM projects p
+      WHERE p.is_deleted = true
+        AND EXISTS (SELECT 1 FROM share_links sl WHERE sl.project_id = p.id AND sl.revoked_at IS NULL)`.execute(this.db)
+    for (const row of deletedProj.rows as { pid: string }[]) {
+      await this.recordCompensation(row.pid, 'delete')
+    }
+    const liveProj = await sql`SELECT DISTINCT p.id AS pid FROM projects p
+      WHERE p.is_deleted = false
+        AND EXISTS (SELECT 1 FROM share_links sl WHERE sl.project_id = p.id
+                    AND sl.cascade_revoked_at IS NOT NULL
+                    AND sl.cascade_revoked_at >= now() - (${UNREVOKE_WINDOW_MS}::bigint || ' milliseconds')::interval)`.execute(this.db)
+    for (const row of liveProj.rows as { pid: string }[]) {
+      await this.recordCompensation(row.pid, 'restore')
+    }
+    return { deleteRecorded: (deletedProj.rows as unknown[]).length, restoreRecorded: (liveProj.rows as unknown[]).length }
+  }
+
+  async sweepCompensations(): Promise<{ processed: number; converged: number; failed: number }> {
+    await this.ready
+    let processed = 0
+    let converged = 0
+    let failed = 0
+    // 有界:snapshot pending(跳过未到期租约 + 超限放弃)后逐条 attempt。
+    const now = new Date()
+    const rows = await this.db.selectFrom('share_link_compensations').selectAll()
+      .where('status', '=', 'pending')
+      .where((eb) => eb.or([eb('claimed_until', 'is', null), eb('claimed_until', '<', now)]))
+      .orderBy('generation', 'desc')
+      .execute()
+    for (const row of rows) {
+      const it = rowToCompensation(row)
+      if (it.attemptCount >= COMPENSATION_MAX_SWEEP_ATTEMPTS) {
+        // R3-F2:超限放弃 → 'failed' dead-letter(不再伪装 done);保留可告警的未收敛事实,运维据 lastError 定因。
+        //   不占 partial unique 槽(WHERE status='pending'),下一生命周期 primary record 新 pending 自动重开。
+        await this.db.updateTable('share_link_compensations')
+          .set({ status: 'failed', last_error: it.lastError ?? 'sweep max attempts exceeded', last_attempted_at: new Date(), updated_at: new Date() })
+          .where('id', '=', it.id).where('status', '=', 'pending').execute()
+        failed++
+        continue
+      }
+      const r = await this.attemptCompensation(it.projectId, it.op)
+      processed++
+      if (r.kind === 'completed') converged++
+      else if (r.kind === 'failed') failed++
+    }
+    return { processed, converged, failed }
+  }
+
   // ── Test-only helpers(与 InMemoryPermissionBackend 对偶;双后端契约测试用)──────────────
 
-  /** Test-only:清空权限两表(projects 表归 persist backend,不动;TRUNCATE 等效 DELETE,异步)。 */
+  /** Test-only:清空权限三表(projects 表归 persist backend,不动;TRUNCATE 等效 DELETE,异步)。 */
   async __reset(): Promise<void> {
     await this.db.transaction().execute(async (trx) => {
+      await trx.deleteFrom('share_link_compensations').execute()
       await trx.deleteFrom('share_links').execute()
       await trx.deleteFrom('project_members').execute()
     })
+    // 故障注入计数也清(防跨用例泄漏)。
+    delete this.compensationFault.restore
+    delete this.compensationFault.delete
+    delete this.compensationClaimPauseForTest.restore
+    delete this.compensationClaimPauseForTest.delete
   }
 
   /** Test-only:把某 link 的 revoked_at 设为指定 ISO(测 30 天 un-revoke 窗;FX-7 §5.9;与内存实现对偶)。 */
@@ -384,12 +892,55 @@ export class PgPermissionBackend implements PermissionBackend {
     const r = await this.db.updateTable('share_links').set({ revoked_at: new Date(revokedAtIso) }).where('id', '=', linkId).returning('id').executeTakeFirst()
     return !!r
   }
+  /** Test-only:把某 link 的 cascade_revoked_at(P-6 marker)设为指定 ISO(测 cascade restore 30 天窗;与内存对偶)。 */
+  async __setLinkCascadeRevokedAtForTest(linkId: string, iso: string): Promise<boolean> {
+    const r = await this.db.updateTable('share_links').set({ cascade_revoked_at: new Date(iso) }).where('id', '=', linkId).returning('id').executeTakeFirst()
+    return !!r
+  }
 
   /**
    * Test-only:seed project 行(projects 表)供 FK 用。PG 契约测试 beforeEach 调之(权限表 project_id FK→projects.id)。
-   * 用 raw SQL(projects 表不属 PermissionDatabase 类型;但同 DB,sql 模板直执行)。ON CONFLICT DO NOTHING 幂等。
+   * 用 raw SQL(projects 表不属 PermissionDatabase 类型;但同 DB,sql 模板直执行)。ON CONFLICT DO UPDATE
+   * 重置 is_deleted=false(R3-F1:测试间隔离——前一用例可能 setProjectDeleted(true),beforeEach 须还原)。
    */
   async __seedProjectForTest(projectId: string, ownerId: string): Promise<void> {
-    await sql`INSERT INTO projects (id, owner_id, is_deleted) VALUES (${projectId}, ${ownerId}, false) ON CONFLICT (id) DO NOTHING`.execute(this.db)
+    await sql`INSERT INTO projects (id, owner_id, is_deleted) VALUES (${projectId}, ${ownerId}, false)
+      ON CONFLICT (id) DO UPDATE SET is_deleted = false, updated_at = now()`.execute(this.db)
+  }
+
+  /**
+   * Test-only:设置 project 的 is_deleted durable desired state(R3-F1 真 PG 双向晚到 retry 验收用)。
+   * 模拟 primary ensureCreate/softDeleteProjectTree 已提交(is_deleted 先于 recordCompensation)。
+   * 与 memory 对偶(memory __setProjectDeletedForTest 为 no-op,memory 走 hasSuperseded)。
+   */
+  async __setProjectDeletedForTest(projectId: string, isDeleted: boolean): Promise<void> {
+    await sql`UPDATE projects SET is_deleted = ${isDeleted}, updated_at = now() WHERE id = ${projectId}`.execute(this.db)
+  }
+
+  /** Test-only:注入 op 补偿步骤强制失败 N 次(消费在 attemptCompensation;不污染 unRevoke/revoke 本身;与内存对偶)。 */
+  __setCompensationFaultForTest(op: CompensationOp, throwCount: number): void {
+    this.compensationFault[op] = throwCount
+  }
+  /** Test-only:清除 op 补偿故障注入。 */
+  __clearCompensationFaultForTest(op: CompensationOp): void {
+    delete this.compensationFault[op]
+  }
+  /**
+   * R3-F4 Test-only:注入 op 在 claim 后、side effect 前的 await 暂停点。模拟赢家超过 lease 暂停(供 race 验收:
+   * A 暂停期间手动过期 A 的 lease,B 重新 claim 并 done;A 恢复后 pre-check/done WHERE token 失败 → stale-claim)。
+   */
+  __setClaimPauseForTest(op: CompensationOp, pauseFn: () => Promise<void>): void {
+    this.compensationClaimPauseForTest[op] = pauseFn
+  }
+  /** Test-only:清除 claim 暂停点。 */
+  __clearClaimPauseForTest(op: CompensationOp): void {
+    delete this.compensationClaimPauseForTest[op]
+  }
+  /** R3-F4 Test-only:手动过期 (projectId,op) pending 意图的 lease(claimed_until 置过去),模拟赢家超过 lease。 */
+  async __expireClaimLeaseForTest(projectId: string, op: CompensationOp): Promise<void> {
+    await this.db.updateTable('share_link_compensations')
+      .set({ claimed_until: new Date(Date.now() - 1000) })
+      .where('project_id', '=', projectId).where('op', '=', op).where('status', '=', 'pending')
+      .execute()
   }
 }

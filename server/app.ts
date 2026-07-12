@@ -95,12 +95,15 @@ app.get('/healthz', (c) =>
   c.json({ status: 'ok', persist: { backend: persistBackendConfig.kind, durable: persistDurable } }),
 )
 
-// P0.3 Readiness probe(区别于 /healthz 的 liveness):/healthz 只表"进程活",
-// /readyz 表"依赖此刻可用"——PG persist + permission 连接(SELECT 1)+ asset dir 可写。任一 fail → 503
-// (部署/网关据此摘流量,不把请求打到半挂的 BFF)。pm2/deploy 可探测;响应体带各 check 诊断 reason。
-// F2 返修:同时探活 permission DB(此前只 ping persist,permission pool 耗尽/DB 挂不被发现)。
-// persist + permission 共享同一 pg Pool(F2);memory 恒 ok。assetDir 仅 asset service 启用时探写(service 关=skipped)。
-// F7 返修:503 响应体只回稳定 reason code(不暴露绝对路径/原始 Error);细节进 pm2 err.log(见 readiness.ts)。
+// /readyz readiness probe — P0.3 依赖探活(base)+ R3-F2 saga 补偿未收敛计数(叠加)。
+// /healthz=liveness(进程活恒 200);/readyz=依赖此刻可用 且 无未收敛补偿 dead-letter。任一 fail → 503(部署/网关摘流量)。
+// P0.3 base:computeReadiness 探 PG persist+permission 连接(SELECT 1,memory 恒 ok)+ asset dir 可写(F1 禁 mkdir);
+//   R3-F2 叠加:sharedPermissionBackend.getCompensationCounts() 暴露 pending/failed 计数——X-Compensation-* header
+//   外部可见;failed>0(dead-letter 未收敛)→ 503 unconverged(运维可告警);pending 仅 informational(在途将收敛)。
+//   PG down 时 computeReadiness.ping 已判 degraded;getCompensationCounts 同 PG 可能抛 → catch 置 countsUnknown
+//   =true(不再吞成 {0,0} 假绿):503 degraded + X-Compensation-Counts:unknown + body.compensations='unknown'
+//   (P0.3 graceful 语义不回退——不打 500;fail-visible——PG 活但补偿表结构性不可用亦摘流量,不误判 200 ok 放行)。
+//   R2-5(对齐 P0.3):503 非绿时不回显 assetDir.dir(防 public 暴露绝对路径)。
 app.get('/readyz', async (c) => {
   const report = await computeReadiness({
     persist: sharedPersistBackend,
@@ -110,7 +113,41 @@ app.get('/readyz', async (c) => {
     assetDir: resolveAssetStoreDir(),
     assetEnabled: featureFlags.assetServiceEnabled,
   })
-  return c.json(report, report.status === 'ok' ? 200 : 503)
+  // R3-F2:补偿 dead-letter(failed>0)独立未收敛信号——依赖全 ok 但补偿未收敛仍摘流量。
+  // R7(P1 合并前返修):counts 读取失败(补偿子系统结构性不可用——PG 活但 share_link_compensations 表
+  //   缺失/列不匹配/权限错 → getCompensationCounts 抛)不得被 catch 吞成 {0,0} 假绿。countsUnknown 时
+  //   ready=false、status='degraded'、HTTP 503(保留 graceful 不打 500);header/body 明示 'unknown',
+  //   不再报 0/0 假数(fail-visible + saga 摘流量承诺:网关/运维据 503 摘流量,不误判 200 ok 放行)。
+  let counts: { pending: number; failed: number } = { pending: 0, failed: 0 }
+  let countsUnknown = false
+  try {
+    counts = await sharedPermissionBackend.getCompensationCounts()
+  } catch (err) {
+    countsUnknown = true
+    console.error(`[readyz] getCompensationCounts failed: ${err instanceof Error ? err.message : String(err)}`)
+  }
+  const unconverged = !countsUnknown && counts.failed > 0
+  const ready = report.status === 'ok' && !unconverged && !countsUnknown
+  if (countsUnknown) {
+    // 明示不可读(独立 header);不再报 X-Compensation-Pending/Failed:0 假数(防消费方误判"0 pending")。
+    c.header('X-Compensation-Counts', 'unknown')
+  } else {
+    c.header('X-Compensation-Pending', String(counts.pending))
+    c.header('X-Compensation-Failed', String(counts.failed))
+  }
+  // R2-5:非绿(503)时不回显 assetDir.dir(防 public 0.0.0.0 暴露绝对路径);ok 时保留(ops localhost 探查用)。
+  const assetDir = ready ? report.assetDir : { status: report.assetDir.status, reason: report.assetDir.reason }
+  return c.json(
+    {
+      status: countsUnknown ? 'degraded' : unconverged ? 'unconverged' : report.status,
+      persist: report.persist,
+      permission: report.permission,
+      assetDir,
+      // R7:counts 不可读时 'unknown'(消费方可区分"0 pending"与"读不出来");可读时 {pending,failed}。
+      compensations: countsUnknown ? 'unknown' : counts,
+    },
+    ready ? 200 : 503,
+  )
 })
 
 // visual-diff token probe (env-gated): only when MIVO_VD_TOKEN is set, return it at

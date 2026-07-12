@@ -118,7 +118,6 @@ const DROP_PERMISSIONS_SCHEMA = sql`
 DROP TABLE IF EXISTS share_links;
 DROP TABLE IF EXISTS project_members;
 `
-
 // DP-6R chat per-user 重拆(2026-07-12):无 schema 变更,无数据搬迁——cutover checkpoint + 文档语义。
 // 现状(重拆前):chat-message.owner_id = canvas owner(共享 collection),成员 GET 读全部 → Gate2 启用即隐私违约。
 // 重拆后:chat-message.owner_id = actor(写入者本人,per-actor 私有),PK=(actor,'chat-message',messageId)。
@@ -161,6 +160,84 @@ const CHAT_ORDER_REVISIONS_SCHEMA_DROP = sql`
 DROP TABLE IF EXISTS chat_order_revisions;
 `
 
+// P-6 saga 补偿意图表(share_link_compensations)。migration key 排在 DP-6R chat 之后(字典序 005):
+// lead 拍板(2026-07-12 更新)——DP-6R 占 003_chat_per_actor + 004_chat_order_revisions,本分支 005(key+registry
+// 同步),避免 Kysely 字典序 "share 先 chat 后"导致 migration 顺序冲突(share-先路径因改名后不存在,无需支持)。
+// FK 同权限两表:project_id → projects(id) ON DELETE CASCADE(project purge → 补偿意图清)。
+// 无 revision(owner 权威写,非 CRDT LWW)。attempt_count/last_error/last_attempted_at 是"可观察状态"(saga 非黑盒)。
+//
+// 返修 P1-1/P1-2/P1-3/P2-1(2026-07-12 双审 REQUIRES_CHANGES):
+//  - generation:project 级单调递增的"desired-state 代际";新 transition record 时 bump,旧 pending 对立 op
+//    被 supersede(sweep/attempt 据最新 generation 决断,防 restore-fail→delete 后旧 restore 晚到重开链接)。
+//  - claimed_at/claimed_until:attempt 租约(P2-1);并发 attempt 原子 claim,loser 返 already-claimed。
+//  - status 新增 'superseded':被对立 op 的新代际取代(保留行做可观察历史,不再被 sweep/attempt 处理)。
+//  - partial unique index UNIQUE(project_id,op) WHERE status='pending'(P1-3):并发首建恰一条 pending +
+//    ON CONFLICT;done/superseded 不占槽,下一生命周期可再建。
+//  - cascade_revoked_at(share_links ALTER):区分"级联 revoke"(project 软删级联)vs"手工 revoke"(用户主动吊销);
+//    restore 补偿只 un-revoke cascade 标记的链接,手工 revoked 链接永不动(防误恢复)。
+const COMPENSATIONS_SCHEMA = sql`
+CREATE TABLE IF NOT EXISTS share_link_compensations (
+  id                TEXT        PRIMARY KEY,                     -- surrogate uuid(应用层生成)
+  project_id        TEXT        NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  op                TEXT        NOT NULL CHECK (op IN ('restore', 'delete')),
+  status            TEXT        NOT NULL CHECK (status IN ('pending', 'done', 'superseded')),
+  generation        INTEGER     NOT NULL DEFAULT 1,             -- project 级 desired-state 代际(单调递增)
+  attempt_count     INTEGER     NOT NULL DEFAULT 0,
+  last_error        TEXT,
+  last_attempted_at TIMESTAMPTZ,
+  claimed_at        TIMESTAMPTZ,                                 -- P2-1 attempt 租约起点(null=未被 claim)
+  claimed_until     TIMESTAMPTZ,                                 -- 租约到期(过期可被重新 claim)
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_compensations_project_op ON share_link_compensations (project_id, op);
+-- P1-3:并发首建恰一条 pending(部分唯一索引;done/superseded 不占槽)。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_compensations_pending_project_op
+  ON share_link_compensations (project_id, op) WHERE status = 'pending';
+
+-- P1-1 marker:级联 revoke 标记。revokeAllForProject(project 软删级联)置非空;unRevokeAllForProject(restore 级联)
+-- 仅恢复此标记非空且 30 天窗内的链接并清空标记;手工 revokeShareLink 不置此列 → restore 补偿永不动手工吊销。
+-- ADD COLUMN IF NOT EXISTS 幂等(002 已 applied 的库 ALTER 加列;fresh 库 002 建表后 005 补列,同效)。
+ALTER TABLE share_links ADD COLUMN IF NOT EXISTS cascade_revoked_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_share_links_cascade_project
+  ON share_links (project_id) WHERE cascade_revoked_at IS NOT NULL;
+`
+const DROP_COMPENSATIONS_SCHEMA = sql`
+DROP INDEX IF EXISTS idx_share_links_cascade_project;
+DROP INDEX IF EXISTS uq_compensations_pending_project_op;
+DROP INDEX IF EXISTS idx_compensations_project_op;
+DROP TABLE IF EXISTS share_link_compensations;
+-- 不 DROP cascade_revoked_at 列:share_links 表归 002 拥有,down 只清本 migration 加的索引/表,列随表 DROP 自然消失。
+`
+
+// R3-F2 migration 006:sweep 超限放弃不再伪装成 done——新增 'failed' 终态(dead-letter,可告警的未收敛事实)。
+// 005 的 CHECK 只允许 pending/done/superseded;006 ALTER CONSTRAINT 加 'failed'(005 字节不变,新加 006)。
+// 'failed' 不占 partial unique index 槽(WHERE status='pending'),下一生命周期 primary 仍可 record 新 pending →
+// 故障解除后存在自动重开路径(新 POST/DELETE → record → sweep done)。
+// 字典序 006 > 005,与 DP-6R 003/004 无冲突(合并后 001<002<003<004<005<006 单调)。
+const COMPENSATIONS_FAILED_STATUS = sql`
+ALTER TABLE share_link_compensations DROP CONSTRAINT IF EXISTS share_link_compensations_status_check;
+ALTER TABLE share_link_compensations ADD CONSTRAINT share_link_compensations_status_check
+  CHECK (status IN ('pending', 'done', 'superseded', 'failed'));
+`
+const DROP_COMPENSATIONS_FAILED_STATUS = sql`
+-- down:回滚 CHECK 到 005 原态(不含 'failed')。前提:无 'failed' 行(否则 ALTER 失败,提示先清理 dead-letter)。
+ALTER TABLE share_link_compensations DROP CONSTRAINT IF EXISTS share_link_compensations_status_check;
+ALTER TABLE share_link_compensations ADD CONSTRAINT share_link_compensations_status_check
+  CHECK (status IN ('pending', 'done', 'superseded'));
+`
+
+// R3-F4 migration 007:claim fencing token。lease 过期后第二 worker 可重新 claim,若 done UPDATE 无 ownership
+// 校验,两者都会 completed + attemptCount 失真。claim_token(random UUID)随 claim 写入;side effect 前预校验
+// 仍为当前 owner;done UPDATE WHERE claim_token=ours → 仅当前 owner 能 mark done,loser 返 stale-claim。
+// 005 字节不变,新加 007;字典序 007 > 006 > 005,与 DP-6R 003/004 无冲突。
+const COMPENSATIONS_CLAIM_TOKEN = sql`
+ALTER TABLE share_link_compensations ADD COLUMN IF NOT EXISTS claim_token TEXT;
+`
+const DROP_COMPENSATIONS_CLAIM_TOKEN = sql`
+ALTER TABLE share_link_compensations DROP COLUMN IF EXISTS claim_token;
+`
+
 /** migrations 以 ISO 日期前缀排序;migrator 按 key 字典序应用。 */
 export const migrations: Record<string, Migration> = {
   '2026_07_11_001_initial_persist_schema': {
@@ -193,6 +270,30 @@ export const migrations: Record<string, Migration> = {
     },
     async down(db): Promise<void> {
       await CHAT_ORDER_REVISIONS_SCHEMA_DROP.execute(db)
+    },
+  },
+  '2026_07_12_005_share_link_compensations': {
+    async up(db): Promise<void> {
+      await COMPENSATIONS_SCHEMA.execute(db)
+    },
+    async down(db): Promise<void> {
+      await DROP_COMPENSATIONS_SCHEMA.execute(db)
+    },
+  },
+  '2026_07_12_006_compensation_failed_status': {
+    async up(db): Promise<void> {
+      await COMPENSATIONS_FAILED_STATUS.execute(db)
+    },
+    async down(db): Promise<void> {
+      await DROP_COMPENSATIONS_FAILED_STATUS.execute(db)
+    },
+  },
+  '2026_07_12_007_compensation_claim_token': {
+    async up(db): Promise<void> {
+      await COMPENSATIONS_CLAIM_TOKEN.execute(db)
+    },
+    async down(db): Promise<void> {
+      await DROP_COMPENSATIONS_CLAIM_TOKEN.execute(db)
     },
   },
 }
