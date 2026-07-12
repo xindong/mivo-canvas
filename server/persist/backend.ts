@@ -226,6 +226,18 @@ export interface PersistBackend {
    */
   getChatOrderRevision(ownerId: string, canvasId: string): Promise<Revision>
 
+  /**
+   * DP-6R P1-2(返修 R2-P1-2):原子读 per-actor×canvas chat collection 的 (messages, orderRevision) **对**。
+   * GET /api/canvas/:id/chat 用——messages 与 orderRevision 同一快照(memory 同步临界区无 await;PG 单事务
+   * REPEATABLE READ 一致 snapshot),消除 listByCanvas + getChatOrderRevision 两 await 间隙的 torn pair
+   * (旧 messages + 新 rev → client 下次 reorder 用新 base 配旧顺序被误接受,绕过乐观锁)。仅 chat-message 用。
+   */
+  listChatWithOrderRevision(
+    ownerId: string,
+    canvasId: string,
+    opts?: { includeDeleted?: boolean },
+  ): Promise<{ records: PersistRecord[]; orderRevision: Revision }>
+
   // ── 列表(返修 #6 ORDER BY orderKey;#8 枚举)──
   listByOwner(ownerId: string, type: PersistType, opts?: { includeDeleted?: boolean }): Promise<ListResult>
   listByCanvas(ownerId: string, canvasId: string, type: PersistType, opts?: { includeDeleted?: boolean }): Promise<ListResult>
@@ -386,6 +398,30 @@ export class InMemoryPersistBackend implements PersistBackend {
   /** DP-6R P1-2:GET /chat 用——读 actor×canvas chat collection orderRevision。 */
   async getChatOrderRevision(ownerId: string, canvasId: string): Promise<Revision> {
     return this.chatOrderRevision(ownerId, canvasId)
+  }
+
+  /**
+   * DP-6R P1-2(返修 R2-P1-2):原子读 (messages, orderRevision) 对。
+   * 同步临界区——collect chat-message records 与读 orderRevision 之间无 await:JS 单线程下 microtask
+   * (并发 reorder)无法在两读之间插入,torn pair(旧 messages + 新 rev)不可能。与 PG 单事务 REPEATABLE READ 等价。
+   */
+  async listChatWithOrderRevision(
+    ownerId: string,
+    canvasId: string,
+    opts: { includeDeleted?: boolean } = {},
+  ): Promise<{ records: PersistRecord[]; orderRevision: Revision }> {
+    const include = opts.includeDeleted ?? false
+    const out: PersistRecord[] = []
+    for (const r of this.bucket(ownerId).values()) {
+      if (r.type !== 'chat-message') continue
+      if (r.canvasId !== canvasId) continue
+      if (!include && r.isDeleted) continue
+      out.push(clone(r))
+    }
+    out.sort((a, b) => a.orderKey - b.orderKey || (a.createdAt < b.createdAt ? -1 : 1))
+    // 同 snapshot:无 await 让出点,rev 与 messages 必自洽。
+    const orderRevision = this.chatOrderRevision(ownerId, canvasId)
+    return { records: out, orderRevision }
   }
 
   async get(ownerId: string, type: PersistType, id: string): Promise<GetResult> {

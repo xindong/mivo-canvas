@@ -314,6 +314,41 @@ export class PgPersistBackend implements PersistBackend {
   }
 
   /**
+   * DP-6R P1-2(返修 R2-P1-2):原子读 (messages, orderRevision) 对——单事务 REPEATABLE READ 一致快照。
+   * READ COMMITTED 两语句间并发 reorder 提交 → torn pair(旧 messages + 新 rev);REPEATABLE READ 冻结 snapshot
+   * 于首条语句,messages 与 orderRevision 必同见 pre-reorder 或 post-reorder,不撕裂。与 memory 同步临界区等价。
+   * route GET /chat 用此(替代 listByCanvas + getChatOrderRevision 两 await),根除 canvas.ts:590-592 的 torn pair。
+   */
+  async listChatWithOrderRevision(
+    ownerId: string,
+    canvasId: string,
+    opts: { includeDeleted?: boolean } = {},
+  ): Promise<{ records: PersistRecord[]; orderRevision: Revision }> {
+    await this.ready
+    const include = opts.includeDeleted ?? false
+    return this.db
+      .transaction()
+      .setIsolationLevel('repeatable read')
+      .execute(async (trx) => {
+        let q = trx
+          .selectFrom('persist_records')
+          .selectAll()
+          .where('owner_id', '=', ownerId)
+          .where('canvas_id', '=', canvasId)
+          .where('type', '=', 'chat-message')
+        if (!include) q = q.where('is_deleted', '=', false)
+        const rows = await q.orderBy('order_key', 'asc').orderBy('created_at', 'asc').execute()
+        const revRow = await trx
+          .selectFrom('chat_order_revisions')
+          .select('revision')
+          .where('actor_id', '=', ownerId)
+          .where('canvas_id', '=', canvasId)
+          .executeTakeFirst()
+        return { records: rows.map(rowToRecord), orderRevision: revRow ? Number(revRow.revision) : 0 }
+      })
+  }
+
+  /**
    * DP-6R P1-2:事务内原子 compare+bump chat orderRevision(单语句条件 INSERT,无 get-then-upsert TOCTOU)。
    *
    * R2-P1-1(返修):原 `INSERT (rev=1) ON CONFLICT DO UPDATE WHERE revision=base` 在缺行时 INSERT 无条件成功

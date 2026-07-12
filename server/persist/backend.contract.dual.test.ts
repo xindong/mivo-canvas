@@ -432,6 +432,33 @@ const runPersistBackendContractSuite = (
       if (rOk.kind === 'ok') expect(rOk.contentVersion).toBe(2)
     })
 
+    it('R2-P1-2:listChatWithOrderRevision 原子:torn pair(旧 messages + 新 rev)不可能(双后端一致)', async () => {
+      await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+      await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm1', { text: '1' }, { method: 'POST', resourceKind: 'chat-message' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm2', { text: '2' }, { method: 'POST', resourceKind: 'chat-message' })
+      // 初始:[m1,m2], rev=0(原子读自洽对)
+      const before = await b.listChatWithOrderRevision('actorA', 'c1')
+      expect(before.orderRevision).toBe(0)
+      expect(before.records.map((r) => r.id)).toEqual(['m1', 'm2'])
+      // reorder → rev=1, [m2,m1]
+      const r1 = await b.reorderChildren('actorA', 'c1', 'chat-message', ['m2', 'm1'], { base: 0 })
+      expect(r1.kind).toBe('ok')
+      // barrier 并发:reorder(base=1, [m1,m2]) 与 listChatWithOrderRevision 同时启动(Promise.all)。
+      // list 必自洽:要么 (rev=1, [m2,m1])(reorder 前) 要么 (rev=2, [m1,m2])(reorder 后)——
+      // 不出现 torn pair (rev=1,[m1,m2]) 或 (rev=2,[m2,m1])(旧 messages 配新 rev 会绕过乐观锁)。
+      // memory 同步临界区无 await 让出点;PG 单事务 REPEATABLE READ 冻结 snapshot,均保证自洽。
+      const [, list] = await Promise.all([
+        b.reorderChildren('actorA', 'c1', 'chat-message', ['m1', 'm2'], { base: 1 }),
+        b.listChatWithOrderRevision('actorA', 'c1'),
+      ])
+      const ids = list.records.map((r) => r.id).join(',')
+      const consistent =
+        (list.orderRevision === 1 && ids === 'm2,m1') ||
+        (list.orderRevision === 2 && ids === 'm1,m2')
+      expect(consistent).toBe(true)
+    })
+
     it('P1-2:node 写 bump 共享 cv 不使 chat reorder 误 409(解耦);chat reorder 不 bump 共享 cv', async () => {
       await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
       await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })

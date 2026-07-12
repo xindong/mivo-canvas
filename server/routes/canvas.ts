@@ -587,9 +587,10 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
     if (!authz.ok) return denyCanvas(c, requestId, t0, authz)
     // DP-6R:chat per-user。匿名 share-link 访客(actor=null)→ 401 require-login;否则只读 actor 自己的 collection。
     if (authz.actor === null) return requireLogin(c, requestId, t0)
-    const { records } = await backend.listByCanvas(authz.actor, canvasId, 'chat-message')
-    // DP-6R P1-2:返 per-actor×canvas chat collection orderRevision(client 作下次 chat reorder 的 If-Match base)。
-    const orderRevision = await backend.getChatOrderRevision(authz.actor, canvasId)
+    // DP-6R P1-2(返修 R2-P1-2):原子读 (messages, orderRevision) 对——同快照,消除 listByCanvas +
+    // getChatOrderRevision 两 await 间隙的 torn pair(旧 messages + 新 rev → client 下次 reorder 用新 base
+    // 配旧顺序被误接受,绕过乐观锁)。memory 同步临界区;PG 单事务 REPEATABLE READ 一致 snapshot。
+    const { records, orderRevision } = await backend.listChatWithOrderRevision(authz.actor, canvasId)
     logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0 })
     return c.json({ messages: records.map(toEntry), orderRevision } satisfies ListChatMessagesResponse, 200)
   })
