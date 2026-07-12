@@ -11,7 +11,7 @@ import { serve } from '@hono/node-server'
 import { app, sharedPersistBackend, sharedPermissionBackend, sharedAssetStore } from './app'
 import { resolveFeatureFlags } from './lib/env'
 import { isDevStubActive } from './lib/auth-stub'
-import { validateSsoConfig, assertStrictOwnerMigrationComplete, legacyOwnerDetector } from './lib/owner'
+import { validateSsoConfig, assertStrictOwnerMigrationComplete, buildStartupDetectors } from './lib/owner'
 
 const PORT = Number(process.env.MIVO_PORT) || 8080
 const PUBLIC_MODE = process.env.MIVO_PUBLIC === '1'
@@ -44,14 +44,16 @@ const start = async (): Promise<void> => {
   // exit 1)。机器判定,非文字约定:ops 翻 strict 前必须先跑 G2.2 迁移(跨三域指纹→username),否则
   // legacy 数据对 SSO 用户不可见。返修前 gate 只收 persist → persist=0 但 permission/asset 全 legacy
   // 时放行(R2-1 漏检洞);现三域同判,任一 detector 缺失(PG G2.2 前未实现)→ fail-closed 拒启动。
-  // 非 strict → no-op(生产零变化)。asset service 未启用 → sharedAssetStore=null → 占位 detector(0 legacy)。
-  await assertStrictOwnerMigrationComplete(process.env, [
-    legacyOwnerDetector('persist', sharedPersistBackend),
-    legacyOwnerDetector('permissions', sharedPermissionBackend),
-    sharedAssetStore
-      ? legacyOwnerDetector('assets', sharedAssetStore)
-      : { domain: 'assets', countLegacyFormOwners: () => Promise.resolve(0) },
-  ])
+  // 非 strict → no-op(生产零变化)。R3-F1:asset domain detector 由 buildStartupDetectors 单点构造
+  // (service off 时仍实扫配置资产根,不伪造 0——见 owner.ts 注释)。
+  await assertStrictOwnerMigrationComplete(
+    process.env,
+    buildStartupDetectors({
+      persist: sharedPersistBackend,
+      permissions: sharedPermissionBackend,
+      assetStore: sharedAssetStore,
+    }),
+  )
   serve({ fetch: app.fetch, hostname: HOSTNAME, port: PORT }, (info) => {
     const bound = `${info.address}:${info.port}`
     const mode = PUBLIC_MODE ? 'public 0.0.0.0 (behind SSO gateway)' : 'local 127.0.0.1'

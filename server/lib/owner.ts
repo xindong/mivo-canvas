@@ -51,6 +51,7 @@ import type { Context, ErrorHandler, MiddlewareHandler } from 'hono'
 import { createHash, timingSafeEqual } from 'node:crypto'
 import { fingerprintOfPlatformKey, resolvePlatformCtx } from './keys'
 import type { PersistBackend } from '../persist/backend'
+import { createAssetStore, createFsAssetBackend, resolveAssetStoreDir, type AssetStore } from './assetStore'
 import type { AppEnv } from './types'
 
 /**
@@ -319,6 +320,40 @@ export const legacyOwnerDetector = (
       ? backend.countLegacyFormOwners.bind(backend)
       : undefined,
 })
+
+/**
+ * G2.1 R3-F1:构建启动期三域 owner-migration gate 的 detector 列表(persist + permissions + assets)。
+ * 抽自 `server/index.ts` 内联构造,供 gate 测试直驱。
+ *
+ * **R3-F1 修复**:asset domain detector **始终按配置资产根**(`resolveAssetStoreDir`)构造只读 fs
+ * detector,与 asset route 是否 mount(`MIVO_ENABLE_ASSET_SERVICE`)解耦。service off(assetStore null)
+ * 时仍实扫磁盘上的 legacy `AssetRecord.ownerFp`/`references[].ownerFp`/`.uploaders`,**不伪造 0**。
+ *
+ * 返修前洞:service off → `sharedAssetStore=null` → 注入 `countLegacyFormOwners:()=>0` 占位;资产目录是
+ * 持久目录(过去启用后再关闭/cutover 关闭/稍后重开都可能仍有 legacy ownerFp),persist=0、permission=0、
+ * 磁盘 asset>0 时 strict 可启动 → 跨域绕过(R2-1 要堵的洞)。
+ *
+ * fail-closed 语义:fs backend `listRecords` 对目录缺失(ENOENT)返 `[]` → count 0(合法空,非伪造);
+ * 其他 fs 错(EACCES 等)→ 抛 → gate `await d.countLegacyFormOwners()` 抛 → strict 启动 fail-closed;
+ * 根上存 legacy → count>0 → 拒启动。assetStore 非空(service on)→ 复用 route 用的同一 store(避免双 store)。
+ */
+export const buildStartupDetectors = ({
+  persist,
+  permissions,
+  assetStore,
+}: {
+  persist: { countLegacyFormOwners?(): Promise<number> }
+  permissions: { countLegacyFormOwners?(): Promise<number> }
+  assetStore: AssetStore | null
+}): LegacyOwnerDetector[] => [
+  legacyOwnerDetector('persist', persist),
+  legacyOwnerDetector('permissions', permissions),
+  legacyOwnerDetector(
+    'assets',
+    // R3-F1:assetStore null(service off)→ 回退构造只读 fs detector off 配置资产根,不伪造 0。
+    assetStore ?? createAssetStore(createFsAssetBackend(resolveAssetStoreDir())),
+  ),
+]
 
 /**
  * G2.1 F1/R2-1 启动 gate:strict 模式下,若三域(persist + permissions + assets)任一仍存在
