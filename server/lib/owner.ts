@@ -391,22 +391,23 @@ export const assertStrictOwnerMigrationComplete = async (
 }
 
 /**
- * G2.2 owner 迁移(STUB / 打桩 seam):把 legacy 指纹 ownerId 重映射为 SSO username 形态。
- * **G2.1 不实装**(G2.2 scope);提供具名 seam 供 gate 测试打桩 + G2.2 固定调用点。真实 G2.2 实现需
- * fingerprint→username 映射(需原 mivo_ key 或预建映射表)+ 跨三 backend(persist/permissions/assets)重键
- * owner。G2.2 落地前调用本函数抛错(startup gate 已在启动期拦截 strict,本 stub 不会被生产路径触达)。
+ * G2.2 owner 迁移(seam):把 legacy 指纹 ownerId 重映射为 SSO username 形态。
+ * **R3-F1**:InMemoryPersistBackend 已实装真实 rekey(供 seed→打桩迁移→strict 可见 / unmapped no-go 测试);
+ * delegate 到 `backend.migrateLegacyOwnersToUsernameForm?`。backend 未实现(PG,G2.2 前未补)→ 显式抛
+ * `not implemented (G2.2)`(fail-closed;与启动 gate 一致——无法机械迁移前 strict 不得翻)。
+ * 真实 G2.2 实现需 fingerprint→username 映射(需原 `mivo_` key 或预建映射表)+ 跨三 backend
+ * (persist/permissions/assets)重键 owner;persist 域已就绪,permissions/assets 域随 G2.2 落地。
  */
 export const migrateLegacyOwnersToUsernameForm = async (
   backend: PersistBackend,
   resolveFingerprintToUsername: (fingerprint: string) => string | undefined,
 ): Promise<{ migrated: number; unmapped: number }> => {
-  // stub seam:params 命名锁定 G2.2 契约(backend + 指纹→username resolver);G2.2 实装前不读取,
-  // 此处 void 标记 used 以过 lint,真实实现时移除。startup gate 已在启动期拦截 strict,本 stub 不被生产路径触达。
-  void backend
-  void resolveFingerprintToUsername
-  throw new Error(
-    'migrateLegacyOwnersToUsernameForm: not implemented (G2.2 scope). The startup gate (assertStrictOwnerMigrationComplete) is real and enforced at startup; the migration itself lands with G2.2.',
-  )
+  if (typeof backend.migrateLegacyOwnersToUsernameForm !== 'function') {
+    throw new Error(
+      'migrateLegacyOwnersToUsernameForm: not implemented for this backend (PG lands with G2.2). InMemoryPersistBackend implements it; PG persist + permissions + assets cross-backend migration is G2.2 scope. The startup gate (assertStrictOwnerMigrationComplete) is real and enforced; strict cannot be flipped until all three domain detectors + migrations land.',
+    )
+  }
+  return backend.migrateLegacyOwnersToUsernameForm(resolveFingerprintToUsername)
 }
 
 /**

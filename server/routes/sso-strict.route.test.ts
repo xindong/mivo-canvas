@@ -30,6 +30,8 @@ import {
   assertStrictOwnerMigrationComplete,
   legacyOwnerDetector,
   buildStartupDetectors,
+  migrateLegacyOwnersToUsernameForm,
+  isLegacyFormOwner,
   type LegacyOwnerDetector,
 } from '../lib/owner'
 import type { PersistBackend } from '../persist/backend'
@@ -676,5 +678,74 @@ describe('G2.1 R3-F1 — service-off + 配置根预置 legacy asset → strict �
     await expect(
       assertStrictOwnerMigrationComplete({ MIVO_SSO_STRICT: '1' }, detectors),
     ).resolves.toBeUndefined()
+  })
+})
+
+// ── G2.1 R3-F1:migrateLegacyOwnersToUsernameForm(persist memory;seed→打桩迁移→strict 可见 + unmapped no-go)──
+// R3-F1 验收点 3:补 R2-1 原验收要求的 seed→打桩迁移→strict 可见与 unmapped no-go。
+// 返修前 migrateLegacyOwnersToUsernameForm 仍只 throw(G2.1 不实装),相关测试不存在。
+// 现 InMemoryPersistBackend 落地真实 rekey(byOwner + idempotencyIndex + globalProject/CanvasOwners);
+// PG 三域跨 backend 迁移仍 G2.2(owner.ts 对无该方法 backend 显式抛 not implemented → fail-closed)。
+describe('G2.1 R3-F1 — migrateLegacyOwnersToUsernameForm(seed→migrate→strict 可见 + unmapped no-go)', () => {
+  it('seed legacy persist → migrate(stub fp→username)→ strict gate 通过 + 数据对 username 可见', async () => {
+    const { backend, permissions } = buildPersistApp()
+    const fp = 'abcd1234ef567890'
+    expect(isLegacyFormOwner(fp)).toBe(true)
+    await backend.ensureCreate(fp, 'project', 'p1', { name: 'P1' }, { method: 'POST', resourceKind: 'project' })
+    expect(await backend.countLegacyFormOwners!()).toBe(1)
+
+    // 打桩迁移:resolver 把该指纹映射到 SSO username
+    const result = await migrateLegacyOwnersToUsernameForm(backend, (f) => (f === fp ? 'alice@xd.com' : undefined))
+    expect(result.migrated).toBe(1)
+    expect(result.unmapped).toBe(0)
+    expect(await backend.countLegacyFormOwners!()).toBe(0) // persist 域迁移完成
+
+    // strict gate 通过(persist 0;permissions/assets memory 干净)
+    const assets = createAssetStore(createMemoryAssetBackend())
+    const detectors = buildStartupDetectors({ persist: backend, permissions, assetStore: assets })
+    await expect(assertStrictOwnerMigrationComplete({ MIVO_SSO_STRICT: '1' }, detectors)).resolves.toBeUndefined()
+
+    // strict 可见:数据现归 username ownerId → listByOwner(username) 返回(原指纹 owner 列表空)
+    const visible = await backend.listByOwner('alice@xd.com', 'project')
+    expect(visible.records).toHaveLength(1)
+    expect(visible.records[0].id).toBe('p1')
+    expect(visible.records[0].ownerId).toBe('alice@xd.com')
+    const stale = await backend.listByOwner(fp, 'project')
+    expect(stale.records).toHaveLength(0) // 旧指纹 owner 已无数据
+  })
+
+  it('unmapped resolver(指纹无 username 映射)→ {migrated:0, unmapped:1} + strict 仍拒启动(no-go)', async () => {
+    const { backend, permissions } = buildPersistApp()
+    const fp = '0123456789abcdef'
+    await backend.ensureCreate(fp, 'project', 'p1', { name: 'P1' }, { method: 'POST', resourceKind: 'project' })
+    expect(await backend.countLegacyFormOwners!()).toBe(1)
+
+    // unmapped:resolver 返 undefined(无映射)→ 该 legacy owner 无法迁移
+    const result = await migrateLegacyOwnersToUsernameForm(backend, () => undefined)
+    expect(result.migrated).toBe(0)
+    expect(result.unmapped).toBe(1)
+    expect(await backend.countLegacyFormOwners!()).toBe(1) // 仍 legacy → strict no-go
+
+    const assets = createAssetStore(createMemoryAssetBackend())
+    const detectors = buildStartupDetectors({ persist: backend, permissions, assetStore: assets })
+    await expect(
+      assertStrictOwnerMigrationComplete({ MIVO_SSO_STRICT: '1' }, detectors),
+    ).rejects.toThrow(/persist.*legacy-form owner record/s)
+  })
+
+  it('PG stub(无 migrateLegacyOwnersToUsernameForm)→ 抛 not implemented G2.2(fail-closed)', async () => {
+    const stubPg = { ready: Promise.resolve() } as unknown as PersistBackend
+    await expect(migrateLegacyOwnersToUsernameForm(stubPg, () => 'alice@xd.com')).rejects.toThrow(/not implemented.*G2\.2/s)
+  })
+
+  it('非 strict + legacy persist → migrate 仍可调用(不依赖 strict 开关;G2.2 ops 预迁移用)', async () => {
+    const { backend } = buildPersistApp()
+    const fp = 'abcd1234ef567890'
+    await backend.ensureCreate(fp, 'project', 'p1', { name: 'P1' }, { method: 'POST', resourceKind: 'project' })
+    const result = await migrateLegacyOwnersToUsernameForm(backend, (f) => (f === fp ? 'bob@xd.com' : undefined))
+    expect(result.migrated).toBe(1)
+    expect(await backend.countLegacyFormOwners!()).toBe(0)
+    const visible = await backend.listByOwner('bob@xd.com', 'project')
+    expect(visible.records).toHaveLength(1)
   })
 })

@@ -259,6 +259,23 @@ export interface PersistBackend {
    * share_links(permissions)+ assets(asset store)的 gate 随 G2.2 补。
    */
   countLegacyFormOwners?(): Promise<number>
+  /**
+   * G2.1 R3-F1:把 legacy 形态 ownerId(指纹,16-hex)重键为 SSO username(`resolveFingerprintToUsername`
+   * 返回值)。**R3-F1 验收点 3**:补 seed→打桩迁移→strict 可见与 unmapped no-go 测试。
+   *
+   * 两阶段(防 resolver 中途抛错留下半迁移态):
+   *  1. 扫 byOwner 外层 key 收集 legacy ownerId + 调 resolver 取 username(resolver 抛 → 未 mutation);
+   *  2. 逐 owner rekey(Map ops 同步,不抛):byOwner bucket L→U(recordKey/ownerId 前缀)+ idempotencyIndex
+   *     (idemIndexKey + envelopeKey 前缀)+ globalProjectOwners/globalCanvasOwners(value L→U)。
+   *
+   * - resolver 返 undefined/空 → 该 owner unmapped(留 legacy,strict gate 仍 no-go);返回 username → migrated。
+   * - **可选**:InMemoryPersistBackend 实装(可测);PG + permissions + assets 跨 backend 迁移仍是 G2.2 scope,
+   *   未实装时 owner.ts `migrateLegacyOwnersToUsernameForm` 对无该方法的 backend 显式抛 not implemented(fail-closed)。
+   *   返回 {migrated, unmapped} 计数;unmapped>0 → strict 仍拒启动(明确 no-go)。
+   */
+  migrateLegacyOwnersToUsernameForm?(
+    resolveFingerprintToUsername: (fingerprint: string) => string | undefined,
+  ): Promise<{ migrated: number; unmapped: number }>
 }
 
 // ─── 内存实现(同 docKernel.ts 单文件 interface+impl 模式)──────────────────────────
@@ -1246,6 +1263,76 @@ export class InMemoryPersistBackend implements PersistBackend {
       if (isLegacyFormOwnerId(ownerId)) count += 1
     }
     return count
+  }
+
+  /**
+   * G2.1 R3-F1:把 legacy 形态 ownerId(指纹)重键为 SSO username。两阶段(防 resolver 中途抛错留半迁移):
+   *  1. 收集 legacy ownerId + 调 resolver 取 username(resolver 抛 → 未 mutation,安全);
+   *  2. 逐 owner rekey(Map ops 同步不抛):byOwner bucket + idempotencyIndex + globalProject/CanvasOwners。
+   * unmapped(resolver 返 undefined/空)→ 留 legacy,strict gate 仍 no-go。返回 {migrated, unmapped}。
+   */
+  async migrateLegacyOwnersToUsernameForm(
+    resolveFingerprintToUsername: (fingerprint: string) => string | undefined,
+  ): Promise<{ migrated: number; unmapped: number }> {
+    // Phase 1: 收集 legacy ownerId + 目标 username(resolver 可能抛 → 此时未 mutation)。
+    const legacyOwners: string[] = []
+    for (const ownerId of this.byOwner.keys()) {
+      if (isLegacyFormOwnerId(ownerId)) legacyOwners.push(ownerId)
+    }
+    const mappings: Array<{ legacy: string; target: string | null }> = legacyOwners.map((L) => {
+      const u = resolveFingerprintToUsername(L)
+      return { legacy: L, target: u && u.length > 0 ? u : null }
+    })
+
+    let migrated = 0
+    let unmapped = 0
+    // Phase 2: rekey(Map ops 同步,无 resolver 调用,不抛)。
+    for (const { legacy: L, target: U } of mappings) {
+      if (U === null) {
+        unmapped += 1
+        continue
+      }
+      if (U === L) {
+        // 防御:L 是 16-hex 指纹,U 不会等于 L;理论上不应发生,幂等跳过。
+        migrated += 1
+        continue
+      }
+      // byOwner bucket:oldKey=`L:type:id` → newKey=`U:type:id`,record.ownerId → U。
+      const srcBucket = this.byOwner.get(L)
+      if (srcBucket) {
+        const dstBucket = this.bucket(U)
+        for (const [oldKey, rec] of srcBucket) {
+          const suffix = oldKey.slice(L.length + 1) // `type:id`(id 可能含 ':',suffix 取 L: 之后全部)
+          dstBucket.set(`${U}:${suffix}`, { ...rec, ownerId: U })
+          srcBucket.delete(oldKey)
+        }
+        if (srcBucket.size === 0) this.byOwner.delete(L)
+      }
+      // idempotencyIndex:idemKey=`L:method:resourceKind:key` → `U:...`;envelopeKey 同步前缀换。
+      const idemKeysToMove: string[] = []
+      for (const idemKey of this.idempotencyIndex.keys()) {
+        if (idemKey.startsWith(`${L}:`)) idemKeysToMove.push(idemKey)
+      }
+      for (const idemKey of idemKeysToMove) {
+        const entry = this.idempotencyIndex.get(idemKey)!
+        this.idempotencyIndex.delete(idemKey)
+        const idemSuffix = idemKey.slice(L.length + 1) // `method:resourceKind:idempotencyKey`
+        const envSuffix = entry.envelopeKey.slice(L.length + 1) // `type:id`
+        this.idempotencyIndex.set(`${U}:${idemSuffix}`, {
+          envelopeKey: `${U}:${envSuffix}`,
+          fingerprint: entry.fingerprint,
+        })
+      }
+      // globalProjectOwners / globalCanvasOwners:value === L → U(派生 owner 指向同步)。
+      for (const [pid, owner] of this.globalProjectOwners) {
+        if (owner === L) this.globalProjectOwners.set(pid, U)
+      }
+      for (const [cid, owner] of this.globalCanvasOwners) {
+        if (owner === L) this.globalCanvasOwners.set(cid, U)
+      }
+      migrated += 1
+    }
+    return { migrated, unmapped }
   }
 }
 
