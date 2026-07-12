@@ -1173,13 +1173,18 @@ describe('N2-0 返修 Gate7: logFloor/gap 协议 + 恢复等价 + post-revoke �
 // ════════════════════════════════════════════════════════════════════════════
 
 describe('N2-0 返修 §10: 三层信任边界 + typed op union + setByPath 防原型污染', () => {
-  // ═══ R3 F1 §10 唯一契约权威类型(对齐 docs/decisions/n20-truth-source-decision.md §10.1)═══
-  // DomainOp = 中性 delta(transport-neutral):set/unset/array/reorder 无 recordId/actor/base/opId
-  //   (recordId ← URL path;actor ← resolveActor;base ← If-Match;opId ← idempotency-key header,全 adapter 注入)。
-  //   create 例外:recordId = client-proposed 新 record id(独立 create body,非 path 注入)。
+  // ═══ R5 F1 §10 唯一契约权威类型(create 从 PATCH DomainOp 剔除,独立 create endpoint/body)═══
+  // R5 F1 返修:原 DomainOp 含 `{kind:'create',recordId}`,又允许 §10.2 通用 PATCH 接收任意 DomainOp,
+  //   致同一 PATCH wire 同时有 trusted ctx.recordId(path)与不可信 domain.recordId(body)两个 record 权威
+  //   →"body 零 privileged 可伪造"不成立。修法(补探针把声称测实):create 不走 PATCH DomainOp,
+  //   独立 POST /api/canvas/:id/nodes endpoint + 独立 CreateBody(零 recordId;server 分配/idempotency-key 派生,
+  //   非 body 携带)+ 独立 trustifyCreate adapter。PATCH DomainOp 仅 set/unset/array/reorder/strict-tx,
+  //   全 variant 任意嵌套层零 privileged(recordId/actor/baseRevision/opId 全 adapter 注入)。
   type FieldPath = readonly [string | number, ...(string | number)[]]  // 非空 tuple(S10-6 运行时拒空)
+  // DomainOp = 中性 delta(transport-neutral):set/unset/array/reorder/strict-tx 无 recordId/actor/base/opId
+  //   (recordId ← URL path;actor ← resolveActor;base ← If-Match;opId ← idempotency-key header,全 adapter 注入)。
+  //   ★ R5 F1:create 已剔除 — create 走独立 POST endpoint(见 CreateBody),非 PATCH DomainOp member。
   type DomainOp =
-    | { kind: 'create'; recordId: string; type: 'node' | 'edge' | 'anchor'; payload: unknown }  // create 例外:新 id(client-proposed,非 path 注入)
     | { kind: 'set'; fieldPath: FieldPath; value: unknown }                                    // 无 recordId(path 注入)
     | { kind: 'unset'; fieldPath: FieldPath }                                                  // 无 recordId
     | { kind: 'array'; fieldPath: FieldPath; class: 'by-id'; intent: 'insert'; afterId: string | null; value: { id: string } }      // ① by-stable-id(fills/strokes/effects)
@@ -1188,8 +1193,8 @@ describe('N2-0 返修 §10: 三层信任边界 + typed op union + setByPath 防�
     | { kind: 'array'; fieldPath: FieldPath; class: 'whole-lww'; intent: 'replace'; value: unknown[] }                                // ② 无 stable-id(markupPoints)整值 LWW
     | { kind: 'array'; fieldPath: FieldPath; class: 'primitive'; intent: 'insert' | 'remove'; value: string }                         // ③ primitive(resultNodeIds)by value
     | { kind: 'reorder'; orderedIds: string[] }                                                 // parentId 从 path 注入
-    | { kind: 'strict-tx'; ops: DomainOp[] }                                                    // 严格事务路径(跨 record 原子,§10.4)
-  // 客户端 payload(不可信):零 privileged 载体 — 无 opId/actor/recordId/baseRevision(全 adapter 注入)
+    | { kind: 'strict-tx'; ops: DomainOp[] }                                                    // 严格事务路径(跨 record 原子,§10.4);ops 无 create(create 不进 PATCH)
+  // 客户端 PATCH payload(不可信):零 privileged 载体 — 无 opId/actor/recordId/baseRevision(全 adapter 注入)
   type ClientFieldOp = { clientId: string; domain: DomainOp }
   // 服务端 trusted(actor ← resolveActor;recordId ← URL path;base ← If-Match;opId ← idempotency-key header)
   type TrustedCtx = { opId: string; clientId: string; actor: string; recordId: string; baseRevision: Revision }
@@ -1198,6 +1203,15 @@ describe('N2-0 返修 §10: 三层信任边界 + typed op union + setByPath 防�
   const trustify = (client: ClientFieldOp, ctx: TrustedCtx): WireOp => ({ ...ctx, domain: client.domain })
   // adaptToWire:中性 DomainOp + trusted ctx → wire op(R3 F1:三类 array 同一 adapter 映射)
   const adaptToWire = (domain: DomainOp, ctx: TrustedCtx): WireOp => ({ ...ctx, domain })
+
+  // ── R5 F1:create 独立契约(POST /api/canvas/:id/nodes,非 PATCH DomainOp)──
+  // CreateBody 零 privileged:无 recordId(server 分配/idempotency-key 派生,非 body)/actor/base/opId。
+  //   id 唯一来源 = trusted endpoint ctx(server-minted,或 idempotency-key header 派生),非 body 可伪造字段。
+  type CreateBody = { clientId: string; type: 'node' | 'edge' | 'anchor'; payload: unknown }
+  type CreateWire = { opId: string; clientId: string; actor: string; recordId: string; type: 'node' | 'edge' | 'anchor'; payload: unknown }
+  // trustifyCreate:CreateBody + TrustedCtx(recordId = server-minted,非 body)→ CreateWire;body 零 privileged 可伪造。
+  const trustifyCreate = (client: CreateBody, ctx: TrustedCtx): CreateWire =>
+    ({ opId: ctx.opId, clientId: ctx.clientId, actor: ctx.actor, recordId: ctx.recordId, type: client.type, payload: client.payload })
 
   it('S10-1 setByPath 拒原型污染路径(__proto__/prototype/constructor)', () => {
     const obj: Record<string, unknown> = { title: 'orig', transform: { x: 0, y: 0 } }
@@ -1212,20 +1226,46 @@ describe('N2-0 返修 §10: 三层信任边界 + typed op union + setByPath 防�
     expect(({} as { polluted?: boolean }).polluted).toBeUndefined()
   })
 
-  it('S10-2 三层信任边界(R3 F1):body 零 privileged 载体 — ClientFieldOp/DomainOp keys 类型级断言不含 actor/recordId/base/opId;trustify 注入 ctx', () => {
-    // R3 F1:body 零信任字段 — ClientFieldOp = {clientId, domain};DomainOp set/unset/array/reorder 无 recordId/actor/base/opId。
-    //   privileged 全在 adapter/trusted 注入:actor ← resolveActor;recordId ← URL path;base ← If-Match;opId ← idempotency-key header。
-    // 类型级断言(tsc -b 强制:若类型加回任一 privileged 字段,expectTypeOf 失配 / @ts-expect-error 失效 → build fail):
-    expectTypeOf<keyof ClientFieldOp>().toEqualTypeOf<'clientId' | 'domain'>()  // body 零 privileged(opId/actor/recordId/baseRevision 全无)
+  it('S10-2 三层信任边界(R5 F1:PATCH body 任意 variant 含 strict-tx 嵌套零 privileged;create 不进 PATCH DomainOp)', () => {
+    // R5 F1:body 零信任字段 — ClientFieldOp = {clientId, domain};DomainOp set/unset/array/reorder/strict-tx
+    //   全 variant 任意嵌套层无 recordId/actor/base/opId;privileged 全在 adapter/trusted 注入:
+    //   actor ← resolveActor;recordId ← URL path;base ← If-Match;opId ← idempotency-key header。
+    //   create 走独立 CreateBody(零 recordId;server-minted id),非 PATCH DomainOp member — 杜绝双 record 权威。
+    // 类型级断言(tsc -b 强制:若类型加回任一 privileged 字段 / create 塞回 DomainOp,expectTypeOf 失配 /
+    //   或 ts-expect-error 抑制指令失效 → build fail):
+    expectTypeOf<keyof ClientFieldOp>().toEqualTypeOf<'clientId' | 'domain'>()  // PATCH body 零 privileged(opId/actor/recordId/baseRevision 全无)
+    // ★ R5 F1:DomainOp 不含 create kind(create 走独立 endpoint,非 PATCH member)— 若 create 塞回则此行失配 → build fail
+    expectTypeOf<DomainOp['kind']>().toEqualTypeOf<'set' | 'unset' | 'array' | 'reorder' | 'strict-tx'>()
+    // ★ R5 F1:create 独立 CreateBody 零 privileged(无 recordId/actor/base/opId;id 由 server ctx 注入)
+    expectTypeOf<keyof CreateBody>().toEqualTypeOf<'clientId' | 'type' | 'payload'>()
     type SetOp = Extract<DomainOp, { kind: 'set' }>
     type UnsetOp = Extract<DomainOp, { kind: 'unset' }>
     type ReorderOp = Extract<DomainOp, { kind: 'reorder' }>
-    expectTypeOf<keyof SetOp>().toEqualTypeOf<'kind' | 'fieldPath' | 'value'>()      // set 无 recordId/actor/base/opId
-    expectTypeOf<keyof UnsetOp>().toEqualTypeOf<'kind' | 'fieldPath'>()              // unset 无 recordId/actor/base/opId
-    expectTypeOf<keyof ReorderOp>().toEqualTypeOf<'kind' | 'orderedIds'>()           // reorder 无 recordId(parentId 从 path 注入)
-    // @ts-expect-error R3 F1:ClientFieldOp body 零 privileged(无 actor)— 若加回则下行非 error → directive 失效 → build fail
+    type StrictTxOp = Extract<DomainOp, { kind: 'strict-tx' }>
+    type ArrayByIdInsert = Extract<DomainOp, { kind: 'array'; class: 'by-id'; intent: 'insert' }>
+    type ArrayByIdRemove = Extract<DomainOp, { kind: 'array'; class: 'by-id'; intent: 'remove' }>
+    type ArrayWholeLww = Extract<DomainOp, { kind: 'array'; class: 'whole-lww' }>
+    type ArrayPrimitive = Extract<DomainOp, { kind: 'array'; class: 'primitive' }>
+    expectTypeOf<keyof SetOp>().toEqualTypeOf<'kind' | 'fieldPath' | 'value'>()            // set 无 recordId/actor/base/opId
+    expectTypeOf<keyof UnsetOp>().toEqualTypeOf<'kind' | 'fieldPath'>()                    // unset 无 recordId/actor/base/opId
+    expectTypeOf<keyof ReorderOp>().toEqualTypeOf<'kind' | 'orderedIds'>()                 // reorder 无 recordId(parentId 从 path 注入)
+    expectTypeOf<keyof StrictTxOp>().toEqualTypeOf<'kind' | 'ops'>()                       // strict-tx 仅 kind+ops(无 privileged)
+    expectTypeOf<keyof ArrayByIdInsert>().toEqualTypeOf<'kind' | 'fieldPath' | 'class' | 'intent' | 'afterId' | 'value'>()
+    expectTypeOf<keyof ArrayByIdRemove>().toEqualTypeOf<'kind' | 'fieldPath' | 'class' | 'intent' | 'removeId'>()
+    expectTypeOf<keyof ArrayWholeLww>().toEqualTypeOf<'kind' | 'fieldPath' | 'class' | 'intent' | 'value'>()
+    expectTypeOf<keyof ArrayPrimitive>().toEqualTypeOf<'kind' | 'fieldPath' | 'class' | 'intent' | 'value'>()
+    // @ts-expect-error R5 F1:ClientFieldOp body 零 privileged(无 actor)— 若加回则下行非 error → directive 失效 → build fail
     const _badActor: ClientFieldOp = { clientId: 'A', domain: { kind: 'set', fieldPath: ['title'], value: 'x' }, actor: 'admin' }
-    expect(_badActor).toBeDefined()  // 标记已用(noUnusedLocals)+ 证明 body 无法携带 actor(schema 级拒)
+    // @ts-expect-error R5 F1:create 不再是 PATCH DomainOp member — 若 create 塞回 DomainOp 则下行非 error → build fail
+    const _badCreateInDomain: DomainOp = { kind: 'create', recordId: 'forged', type: 'node', payload: {} }
+    // @ts-expect-error R5 F1:create 不能嵌套进 strict-tx.ops(ops: DomainOp[],create 不在 DomainOp)— 杜绝嵌套双 record 权威
+    const _badCreateNested: DomainOp = { kind: 'strict-tx', ops: [{ kind: 'create', recordId: 'forged', type: 'node', payload: {} }] }
+    // @ts-expect-error R5 F1:Array variant 零 privileged(无 recordId)— 若加回则 build fail
+    const _badArrayRec: DomainOp = { kind: 'array', fieldPath: ['fills'], class: 'by-id', intent: 'insert', afterId: null, value: { id: 'fA' }, recordId: 'forged' }
+    // @ts-expect-error R5 F1:CreateBody 零 privileged(无 recordId)— 若加回则 build fail
+    const _badCreateBody: CreateBody = { clientId: 'A', type: 'node', payload: {}, recordId: 'forged' }
+    expect(_badActor).toBeDefined(); expect(_badCreateInDomain).toBeDefined(); expect(_badCreateNested).toBeDefined()
+    expect(_badArrayRec).toBeDefined(); expect(_badCreateBody).toBeDefined()  // 标记已用(noUnusedLocals)+ 证明 body/DomainOp 无法携 privileged
     // trustify:ClientFieldOp.domain + TrustedCtx → WireOp(body 无 privileged 可伪造;forge 无处可藏)
     const set: DomainOp = { kind: 'set', fieldPath: ['title'], value: 'hacked' }
     const trusted = trustify(
@@ -1237,12 +1277,29 @@ describe('N2-0 返修 §10: 三层信任边界 + typed op union + setByPath 防�
     expect(trusted.baseRevision).toBe(0)           // If-Match 注入
     expect(trusted.opId).toBe('idem-key-abc')       // idempotency-key header 注入
     expect(trusted.domain).toBe(set)               // domain 中性 delta 引用
+    // ★ R5 F1:create 走独立 trustifyCreate:CreateBody(零 recordId)+ TrustedCtx(server-minted recordId)→ CreateWire
+    //   body 零 privileged 可伪造;recordId 唯一来源 = trusted ctx(server 分配),非 body 字段。
+    const createBody: CreateBody = { clientId: 'A', type: 'node', payload: { title: 'new' } }
+    const createWire = trustifyCreate(createBody, { opId: 'idem-create-1', clientId: 'A', actor: 'alice', recordId: 'n-new-minted', baseRevision: 0 })
+    expect(createWire.recordId).toBe('n-new-minted')  // ★ server-minted(trusted ctx),非 body 可伪造
+    expect(createWire.actor).toBe('alice')            // authz 注入
+    expect(createWire.opId).toBe('idem-create-1')      // idempotency-key header 注入
+    expect(createWire.type).toBe('node'); expect(createWire.payload).toEqual({ title: 'new' })
+    // 证明:createBody 无 recordId 字段可伪造(若客户端试图塞 recordId,上面 _badCreateBody @ts-expect-error 已 schema 级拒)
   })
 
-  it('S10-3 typed domain op union + adapter 分层(R3 F1:对齐 §10 权威类型,无另造局部类型):三类 array 同一 adapter 映射', () => {
-    // R3 F1:DomainOp/TrustedCtx/WireOp/adaptToWire 复用 §10 describe 权威类型(无另造冲突局部类型);
+  it('S10-3 typed domain op union + adapter 分层(R5 F1:create 独立 endpoint,非 PATCH DomainOp;三类 array 同一 adapter 映射)', () => {
+    // R5 F1:DomainOp/TrustedCtx/WireOp/adaptToWire 复用 §10 describe 权威类型(无另造冲突局部类型);
     //   DomainOp 中性 delta,不带 recordId/actor/base/opId(全 adapter 注入);三类 array 同一 adaptToWire 覆盖。
-    const create: DomainOp = { kind: 'create', recordId: 'n-new', type: 'node', payload: { title: 'new' } }
+    //   create 走独立 CreateBody + trustifyCreate(非 adaptToWire/DomainOp)— 杜绝 PATCH 双 record 权威。
+    // @ts-expect-error R5 F1:create 不再是 PATCH DomainOp member — 若 create 塞回 DomainOp 则下行非 error → build fail
+    const _createNotDomain: DomainOp = { kind: 'create', recordId: 'n-new', type: 'node', payload: { title: 'new' } }
+    // create 走独立 CreateBody(零 recordId)+ trustifyCreate(server-minted recordId via trusted ctx)
+    const createBody: CreateBody = { clientId: 'A', type: 'node', payload: { title: 'new' } }
+    const createWire = trustifyCreate(createBody, { opId: 'idem-create', clientId: 'A', actor: 'alice', recordId: 'n-new-minted', baseRevision: 0 })
+    expect(_createNotDomain).toBeDefined()  // 标记已用(noUnusedLocals)+ 证明 create 无法回塞 DomainOp
+    expect(createWire.recordId).toBe('n-new-minted')  // ★ server-minted(trusted ctx),非 body 可伪造 recordId
+    expect(createWire.type).toBe('node'); expect(createWire.payload).toEqual({ title: 'new' })
     const set: DomainOp = { kind: 'set', fieldPath: ['title'], value: 'x' }
     const unset: DomainOp = { kind: 'unset', fieldPath: ['tempKey'] }
     const reorder: DomainOp = { kind: 'reorder', orderedIds: ['n2', 'n1', 'n3'] }
@@ -1254,8 +1311,8 @@ describe('N2-0 返修 §10: 三层信任边界 + typed op union + setByPath 防�
     const markupReplace: DomainOp = { kind: 'array', fieldPath: ['markupPoints'], class: 'whole-lww', intent: 'replace', value: [{ x: 3, y: 3 }] }
     // ③ primitive(resultNodeIds,string[],mivoCanvas.ts:249):by value(元素是 string 无 id,不能 by-id)
     const resultInsert: DomainOp = { kind: 'array', fieldPath: ['resultNodeIds'], class: 'primitive', intent: 'insert', value: 'n3' }
-    // 验 union 可区分(kind/class 判别)
-    expect(create.kind).toBe('create'); expect(set.kind).toBe('set'); expect(unset.kind).toBe('unset')
+    // 验 union 可区分(kind/class 判别;create 已剔除,不在 DomainOp kind 集)
+    expect(set.kind).toBe('set'); expect(unset.kind).toBe('unset')
     expect(reorder.kind).toBe('reorder'); expect(tx.kind).toBe('strict-tx')
     expect(fillsInsert.kind).toBe('array'); expect(fillsInsert.class).toBe('by-id')
     expect(markupReplace.class).toBe('whole-lww'); expect(resultInsert.class).toBe('primitive')

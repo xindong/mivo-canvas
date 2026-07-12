@@ -306,7 +306,7 @@ npm test -- src/lib/serverPersistAdapter.contract.test.ts server/persist/backend
 | Gate7 "Y.Doc 全 op log 重放" | 增量 update 不重放全史(Yjs 有 GC) | `G7-hard-4`(★真 encodeStateAsUpdate) |
 | §10 FieldOp body 携 actor/recordId/baseRevision | 三层信任边界:body 不信,authz/path/If-Match 覆盖 | `S10-2`(●) |
 | §10 opId body+header 双载体 | opId 单一权威载体(idempotency-key header) | `S10-2`(●) |
-| §10 无 create/unset/array/reorder/strict-tx | typed domain op union | `S10-3`(●) |
+| §10 无 create/unset/array/reorder/strict-tx | typed domain op union(**R5 F1:create 独立 endpoint,非 PATCH DomainOp member**) | `S10-3`(●) |
 | §10 per-field clock 留 N2-1(自相矛盾) | 持久形态定死 PG `field_clock` 表(PG-T5 真测:write→destroy pool→重连读回;S10-4 演示逻辑) | `S10-4`+`PG-T5`(●) |
 | §10 batch 无原子性 | batch 预检 + 全 ok 或全 reject(无 partial);跨 record 单事务 PG-T7 真测 | `S10-5`+`PG-T7`(●) |
 | §10 FieldPath 允许空 / 无防原型污染 | 非空 tuple + 拒 __proto__/prototype/constructor(对齐 G1-b R2-P1-1) | `S10-1/S10-6`(●) |
@@ -368,7 +368,7 @@ npm test -- src/lib/serverPersistAdapter.contract.test.ts server/persist/backend
 | G7-hard-4 bytes 对比(Yjs 有 GC 更小) | P2-7 | 7 | `figmaCompressed<figmaRaw && yjsNoGc>yjsWithGc` | ★ |
 | S10-1 setByPath 拒原型污染 | P1-3 | §10 | `toThrow(/forbidden path segment/)` | ● |
 | S10-2 三层信任边界 trustify | P1-3 | §10 | `actor==='alice' && recordId==='n1' && base===0`(不信 body) | ● |
-| S10-3 typed domain op union | P1-3 | §10 | `create/set/unset/array/reorder/strict-tx` 可区分 | ● |
+| S10-3 typed domain op union | P1-3 | §10 | set/unset/array/reorder/strict-tx 可区分;**create 独立 CreateBody+trustifyCreate(非 DomainOp,R5 F1)** | ● |
 | S10-4 per-field clock 持久形态 | P1-3 | §10 | clock 逻辑(内存演示)+ **PG-T5 真持久**(write→destroy pool→重连读回,clock 仍在) | ● |
 | S10-5 batch 原子性 | P1-3 | §10 | batch 逻辑(单 record)+ **PG-T7 跨 record**(BEGIN 两 record+fault+ROLLBACK 两 record 均不变) | ● |
 
@@ -411,16 +411,16 @@ npm test -- src/lib/serverPersistAdapter.contract.test.ts server/persist/backend
 
 > 依据:gate 4 方案 A + gate 5 REST+SSE + gate 7 seq/补拉/压缩/revoke + **G1-b R2 三 finding 对齐**(FieldPath 非空 tuple / 数组 by-stable-id / create→edit 因果 / DELETE cursor)。**唯一契约——选 Yjs 则替换为 Y.Doc 通道,但本决策已否决 Yjs。**
 
-### 10.1 op schema(field-level,走 #194 PATCH envelope;v2 对齐 G1-b R2)
+### 10.1 op schema(field-level,走 #194 PATCH envelope;v2 对齐 G1-b R2;**R5 F1:create 独立 endpoint,非 PATCH DomainOp**)
 
 ```ts
-// DomainOp = 中性 delta(transport-neutral):set/unset/array/reorder 无 recordId/actor/base/opId
+// DomainOp = 中性 delta(transport-neutral):set/unset/array/reorder/strict-tx 无 recordId/actor/base/opId
 //   (recordId ← URL path;actor ← resolveActor;base ← If-Match;opId ← idempotency-key header,全 adapter 注入)。
-//   create 例外:recordId = client-proposed 新 record id(独立 create body,非 path 注入)。
+//   ★ R5 F1:create 已从 PATCH DomainOp 剔除 — create 走独立 POST endpoint(见 CreateBody),非 PATCH member;
+//     杜绝"同一 PATCH wire 同时有 trusted ctx.recordId(path)与不可信 domain.recordId(body)双 record 权威"。
 type FieldPath = readonly [string | number, ...(string | number)[]]  // 非空 tuple(G1-b R2-P1-1,S10-6 运行时拒空)
 
 type DomainOp =
-  | { kind: 'create'; recordId: string; type: 'node'|'edge'|'anchor'; payload: unknown }  // create 例外:新 id(client-proposed,非 path 注入)
   | { kind: 'set'; fieldPath: FieldPath; value: unknown }                                   // 无 recordId(path 注入)
   | { kind: 'unset'; fieldPath: FieldPath }                                                 // 无 recordId
   | { kind: 'array'; fieldPath: FieldPath; class: 'by-id'; intent: 'insert'; afterId: string|null; value: {id:string} }  // ① by-stable-id(fills/strokes/effects)
@@ -429,26 +429,37 @@ type DomainOp =
   | { kind: 'array'; fieldPath: FieldPath; class: 'whole-lww'; intent: 'replace'; value: unknown[] }  // ② 无 stable-id(markupPoints)整值 LWW
   | { kind: 'array'; fieldPath: FieldPath; class: 'primitive'; intent: 'insert'|'remove'; value: string }  // ③ primitive(resultNodeIds)by value
   | { kind: 'reorder'; orderedIds: string[] }                                              // parentId 从 path 注入
-  | { kind: 'strict-tx'; ops: DomainOp[] }                                                 // 严格事务路径(跨 record 原子,§10.4)
+  | { kind: 'strict-tx'; ops: DomainOp[] }                                                 // 严格事务路径(跨 record 原子,§10.4);ops 无 create
 ```
 
-**三层信任边界(R3 F1:对齐 spike S10-2/S10-3 权威类型,body 零 privileged 载体)**:
+**三层信任边界(R5 F1:对齐 spike S10-2/S10-3 权威类型,PATCH body 任意 variant 含 strict-tx 嵌套零 privileged;create 独立 endpoint)**:
 ```ts
-// 客户端 payload(不可信):零 privileged 载体 — 无 opId/actor/recordId/baseRevision(全 adapter 注入)
+// 客户端 PATCH payload(不可信):零 privileged 载体 — 无 opId/actor/recordId/baseRevision(全 adapter 注入)
 type ClientFieldOp = { clientId: string; domain: DomainOp }
 // 服务端 trusted(actor ← resolveActor(authz);recordId ← URL path;base ← If-Match;opId ← idempotency-key header 单一权威载体)
 type TrustedCtx = { opId: string; clientId: string; actor: string; recordId: string; baseRevision: Revision }
 type WireOp = TrustedCtx & { domain: DomainOp }
-// trustify:ClientFieldOp.domain + TrustedCtx → WireOp(body 无 privileged 字段可伪造,S10-2 类型级断言)
+// trustify:ClientFieldOp.domain + TrustedCtx → WireOp(PATCH body 无 privileged 字段可伪造,S10-2 类型级断言全 variant)
 const trustify = (client: ClientFieldOp, ctx: TrustedCtx): WireOp => ({ ...ctx, domain: client.domain })
+
+// ── R5 F1:create 独立契约(POST /api/canvas/:id/nodes,非 PATCH DomainOp)──
+// CreateBody 零 privileged:无 recordId(server 分配/idempotency-key 派生,非 body)/actor/base/opId。
+//   id 唯一来源 = trusted endpoint ctx(server-minted),非 body 可伪造字段 — 杜绝双 record 权威。
+type CreateBody = { clientId: string; type: 'node'|'edge'|'anchor'; payload: unknown }
+type CreateWire = { opId: string; clientId: string; actor: string; recordId: string; type: 'node'|'edge'|'anchor'; payload: unknown }
+const trustifyCreate = (client: CreateBody, ctx: TrustedCtx): CreateWire =>
+  ({ opId: ctx.opId, clientId: ctx.clientId, actor: ctx.actor, recordId: ctx.recordId, type: client.type, payload: client.payload })
+// S10-2 类型级 gate(tsc -b 强制):DomainOp['kind'] 不含 'create';CreateBody keyof 无 recordId;
+//   全 array variant keyof 无 recordId/actor/base/opId;create 塞回 DomainOp / 嵌套进 strict-tx.ops → @ts-expect-error 失效 → build fail。
 ```
 
-### 10.2 wire(#194 envelope 不变,payload 演进;cutover 策略见 §1.2)
+### 10.2 wire(#194 envelope 不变,payload 演进;cutover 策略见 §1.2;**R5 F1:create 独立 endpoint**)
 
-- `PATCH /api/canvas/:id/nodes/:nodeId` — payload = `DomainOp` 或 `DomainOp[]`(batch 同 record,**原子:全 ok 或全 reject**,S10-5)。
-- If-Match: `baseRevision`(400/428/409 复用 #194 `parseIfMatch`)。
+- `PATCH /api/canvas/:id/nodes/:nodeId` — payload = `DomainOp` 或 `DomainOp[]`(batch 同 record,**原子:全 ok 或全 reject**,S10-5)。**R5 F1:DomainOp 不含 create**(create 走独立 POST,见下)→ PATCH body 任意 variant 零 privileged recordId,recordId 仅来自 trusted path ctx(无双 record 权威)。
+- `POST /api/canvas/:id/nodes` — **R5 F1 独立 create endpoint**:body = `CreateBody`(零 recordId;server 分配/idempotency-key 派生 id),经 `trustifyCreate` 注入 server-minted recordId 到 trusted ctx(非 body 可伪造)。不与 PATCH DomainOp 共 wire。
+- If-Match: `baseRevision`(400/428/409 复用 #194 `parseIfMatch`;create endpoint 无 :nodeId path,recordId 由 server 注入,baseRevision 为 create 时的 canvas base)。
 - 响应:`{ id, revision, seq }`(`UpsertResponse` 扩 `seq`;打破 exact type test,契约测试重写)。
-- **cutover**:**原子 cutover**(§1.2 拍死;非 versioned payload,无双 decoder 兼容窗)+ FX-5 队列 migration-on-read + stale client 旧 body → 400 `payload-rejected`(见 §1.2 cutover 状态表)。
+- **cutover**:**原子 cutover**(§1.2 拍死;非 versioned payload,无双 decoder 兼容窗)+ FX-5 队列 migration-on-read + stale client 旧 body → 400 `payload-rejected`(见 §1.2 cutover 状态表)。create endpoint 随 PATCH 一同 cutover(同 feature flag)。
 
 ### 10.3 服务端合并(field-level LWW,非整 record 替换)
 
@@ -482,10 +493,11 @@ const trustify = (client: ClientFieldOp, ctx: TrustedCtx): WireOp => ({ ...ctx, 
 
 - DELETE 成功 → 返 seq(cursor);幂等已删(tombstone 命中)→ 亦返 seq(不 404,accepted 必携 cursor);canvas 不存在/无权/从未存在 → 404 → rejected(not-found,不冒充 cursor)(S10-9)。
 
-### 10.8 create→edit 因果(G1-b R2-P1-2 对齐)
+### 10.8 create→edit 因果(G1-b R2-P1-2 对齐;R5 F1:create 走独立 POST endpoint)
 
 - 同 canvas+record submit FIFO:pending create ack 前 hold 后续 edit;ack 后 flush(先 create 后 edit,不 404 丢改动)(S10-8)。
 - 真不存在/已删 record 的 edit 仍 rejected(not-found);pending-local-create 的 edit 不走该终态。
+- **R5 F1**:create 经独立 `POST /api/canvas/:id/nodes`(CreateBody,非 PATCH DomainOp)提交;submit FIFO 仍按 recordId 排队(ack create 前 hold 同 record 的 PATCH edit)。
 
 ### 10.9 迁移 / 双协议窗口 / 破坏面
 
