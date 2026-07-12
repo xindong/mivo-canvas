@@ -10,6 +10,7 @@ import type { SliceCreator } from './canvasStore'
 import { logCanvas, warnCanvas } from './canvasStore'
 import { DEMO_PROJECTS } from './demoScenes'
 import { enqueuePersistWrite, isPersistWriteActive } from '../lib/persistBoot'
+import { normalizeDocument, documentFor } from './canvasDocumentModel'
 
 // Project ids use a `project-` prefix (distinct from `canvas-` / `group-`) so a
 // projectId is never confused with a canvasId. Mirrors createCanvasId's fallback
@@ -90,11 +91,18 @@ export const createProjectsSlice: SliceCreator = (set, get) => ({
     //   local 模式(queue inert)→ 保留旧 standalone 回落(画板 body 保留,projectId→undefined)。
     //     软删基础设施仅服务端有;local 不具备可恢复软删,"standalone 回落理由消失"以软删落地为前提,
     //     local 无软删 → 保留回落防 IDB 数据丢失(决策 §6 目标针对服务端软删落地后的行为)。
+    // P1-2(sol 返修):server 模式删完须维护 active-document 不变量——active canvas 被删时原子切首个
+    //   存活 canvas 并同步顶层 flattened document(nodes/edges/tasks/selection/tool/history),否则 sceneId
+    //   指向已删 document → 顶层 state 悬空 → 后续 generation/mask 读 canvases[sceneId] 崩。无 survivor
+    //   (删完会零 canvas)→ 按 ≥1 canvas 不变量阻止删除(soft-delete-semantics.md:128 guard;不自动建
+    //   fallback 避免副作用,用户先移画板到其他项目再删)。local 模式无此问题(画板 standalone 回落)。
     // 函数式 set:与 createProject/renameProject 一致,不用外层 snapshot,避免并发 set 间丢更新。
     const serverAligned = isPersistWriteActive()
     let removedCanvasIds: string[] = []
+    let blockedNoSurvivor = false
     set((state) => {
       removedCanvasIds = []
+      blockedNoSurvivor = false
       if (!serverAligned) {
         // local: cascade canvases to standalone (body 保留,projectId→undefined)
         const canvases = Object.fromEntries(
@@ -112,11 +120,44 @@ export const createProjectsSlice: SliceCreator = (set, get) => ({
       removedCanvasIds = Object.entries(state.canvases)
         .filter(([, document]) => document.projectId === projectId)
         .map(([canvasId]) => canvasId)
-      const canvases = Object.fromEntries(
-        Object.entries(state.canvases).filter(([, document]) => document.projectId !== projectId),
+      const survivingEntries = Object.entries(state.canvases).filter(
+        ([, document]) => document.projectId !== projectId,
       )
-      return { projects: state.projects.filter((p) => p.id !== projectId), canvases }
+      // P1-2:无 survivor → 阻止删除(≥1 canvas 不变量;返 {} 不改 state,blockedNoSurvivor 标记外层 warn+return)
+      if (survivingEntries.length === 0) {
+        blockedNoSurvivor = true
+        return {}
+      }
+      const canvases = Object.fromEntries(survivingEntries)
+      // P1-2:active canvas 未被删 → 只移除 project+canvases,sceneId/顶层 state 不动
+      if (!removedCanvasIds.includes(state.sceneId)) {
+        return { projects: state.projects.filter((p) => p.id !== projectId), canvases }
+      }
+      // P1-2:active canvas 被删 → 原子切首个存活 canvas + 同步顶层 flattened document/tool/history
+      const survivorId = survivingEntries[0][0]
+      const survivorDoc = normalizeDocument(documentFor(canvases, survivorId))
+      return {
+        projects: state.projects.filter((p) => p.id !== projectId),
+        canvases,
+        sceneId: survivorId,
+        nodes: survivorDoc.nodes,
+        edges: survivorDoc.edges || [],
+        tasks: survivorDoc.tasks,
+        selectedNodeId: survivorDoc.selectedNodeId,
+        selectedNodeIds: survivorDoc.selectedNodeIds || [],
+        activeTool: 'select',
+        historyPast: [],
+        historyFuture: [],
+      }
     })
+
+    // P1-2:无 survivor 阻止删除——warn + return(不 enqueue,不动 store/server)
+    if (blockedNoSurvivor) {
+      warnCanvas(
+        `Delete project "${project.name}" blocked: would leave zero canvases (≥1 canvas invariant; soft-delete-semantics.md:128). Move canvases to another project before deleting.`,
+      )
+      return
+    }
 
     logCanvas(
       serverAligned

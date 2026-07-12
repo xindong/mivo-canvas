@@ -112,8 +112,19 @@ export const __resetPersistBoot = (): void => {
  * 消息之后(离线 append 的消息 createdAt 最新,时序正确)。drain 把 pending 消息发到 PG 后,
  * 下次 hydrate 该消息已在 server 集 → 取 server canonical(内容一致,opaque payload)。
  *
+ * P2-3(sol 返修):local-only 保留必须有 pending append 证明,否则远端已删消息被永久 union 复活。
+ *   - 证明源 = chatStore.unsyncedChatMsgIds sidecar(enqueueChatAppend 置位,跨 boot 持久)。
+ *   - local-only + 在 sidecar 内 → 保留(pending append,未 drain 到 PG)。
+ *   - local-only + 不在 sidecar 内 → server canonical 删除(远端已删,不复活)。
+ *   - server 集内的 id → synced,清 sidecar 对应位(下次不再当 pending 保留)。
+ *   sidecar 经 chatPersistConfig 持久化,boot 时 IDB rehydrate 先于 hydrateFromServer → hydrate
+ *   时 sidecar 已就绪,不依赖 writeQueue.start() 载入 IDB pending(无 boot-order 竞态,优于查队列)。
+ *
  * orderRevision 落点(DP-6R per-actor×canvas reorder cursor;供 reorder If-Match,非只 log)。
- * 仅处理传入 sceneId;切 scene 的 per-scene re-hydrate 属 G1-c 范畴,本轮只 hydrate active。
+ *   ⚠️ 含 local-only id 时 orderRevision 不得直接用于 reorder——local-only id 不在 server order
+ *   序列,reorder 须先 drain(local-only 落 PG 后 server 给出 order)再取 orderRevision,否则 reorder
+ *   If-Match 对 local-only id 无 base。仅处理传入 sceneId;切 scene 的 per-scene re-hydrate 属 G1-c 范畴,
+ *   本轮只 hydrate active。
  */
 const hydrateChatForScene = async (
   sceneId: string,
@@ -124,20 +135,32 @@ const hydrateChatForScene = async (
   const serverMessages = messages.map((r) => r.payload as ChatMessage)
   // R-7 merge:server canonical for synced(按 id);本地未同步(id 不在 server 集)保留。
   const serverIds = new Set(serverMessages.map((m) => m.id))
+  const prevUnsynced = new Set(useChatStore.getState().unsyncedChatMsgIds[sceneId] ?? [])
   const localMessages = useChatStore.getState().messagesByScene[sceneId] ?? []
-  const localOnly = localMessages.filter((m) => !serverIds.has(m.id))
+  // P2-3:local-only 保留必须由 sidecar pending append 证明;否则按 server canonical 删除(远端已删不复活)。
+  const localOnly = localMessages.filter(
+    (m) => !serverIds.has(m.id) && prevUnsynced.has(m.id),
+  )
+  // P2-3:server 集内 id = synced → 清 sidecar 位(下次不再当 pending);仅留仍 pending 的 id。
+  const stillUnsynced = [...prevUnsynced].filter((id) => !serverIds.has(id))
   const merged = [...serverMessages, ...localOnly]
   useChatStore.setState({
     messagesByScene: {
       ...useChatStore.getState().messagesByScene,
       [sceneId]: merged,
     },
+    unsyncedChatMsgIds: {
+      ...useChatStore.getState().unsyncedChatMsgIds,
+      [sceneId]: stillUnsynced,
+    },
   })
   // R2 F4:orderRevision 落点(DP-6R 契约;供 reorder If-Match,非只 log)。
+  //   ⚠️ P2-3:含 local-only id 时 orderRevision 仅覆盖 server 已知 id 的 order;local-only id 须
+  //   drain 后再取,不可直接用于 reorder(见函数头注释)。
   orderRevisionByCanvas.set(sceneId, orderRevision)
   debugLogger.log(
     SOURCE,
-    `server hydrate: ${serverMessages.length} chat message(s) from BFF + ${localOnly.length} local unsynced retained for canvas ${sceneId} (R-7 merge; orderRevision=${orderRevision})`,
+    `server hydrate: ${serverMessages.length} chat message(s) from BFF + ${localOnly.length} local unsynced retained for canvas ${sceneId} (R-7 merge + P2-3 unsynced proof; ${stillUnsynced.length} still pending; orderRevision=${orderRevision})`,
   )
 }
 

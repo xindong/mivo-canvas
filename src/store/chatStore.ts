@@ -12,7 +12,7 @@ import { buildBusyDropMessages } from './chatBusyDrop'
 import { debugLogger } from './debugLogStore'
 import { generationFacade } from './generationFacade'
 import { clampChatGenerationContext } from './chatStoreMigrate'
-import { isChatBlockedForAnonymous, enqueueChatAppend } from './chatPersistSync'
+import { isChatBlockedForAnonymous, enqueueChatAppend, registerUnsyncedMarker } from './chatPersistSync'
 import { chatPersistOptions } from './chatPersistConfig'
 
 export type ChatMessageStatus = 'enhancing' | 'generating' | 'done' | 'error'
@@ -85,6 +85,12 @@ export type ChatMessage = {
 
 export type ChatState = {
   messagesByScene: Record<string, ChatMessage[]>
+  // P2-3(sol 返修):R-7 local-only 保留证明。enqueueChatAppend 置位 msgId(该消息 pending append、
+  // 未 drain 到 PG);hydrateChatForScene 见该 id 在 server 集则清位(synced)。hydrate 时 local-only
+  // 消息(id 不在 server 集)仅当在此 sidecar 内才保留(= pending append);否则按 server canonical 删除
+  // (远端已删不复活)。持久化经 chatPersistConfig partialize,跨 boot 存活(boot 时 IDB rehydrate 先于
+  // hydrate,sidecar 在 hydrate 前就绪,不依赖 queue.start 载入 IDB pending,无 boot-order 竞态)。
+  unsyncedChatMsgIds: Record<string, string[]>
   selectedModel: string
   paramOverrides: ChatParamOverrides
   isBusy: boolean
@@ -176,6 +182,7 @@ export const useChatStore = create<ChatState>()(
   persist(
     (set, get) => ({
       messagesByScene: {},
+      unsyncedChatMsgIds: {},
       selectedModel: 'gemini-3-pro-image',
       paramOverrides: { imgRatio: 'auto', quality: 'auto' },
       isBusy: false,
@@ -864,3 +871,20 @@ export const useChatStore = create<ChatState>()(
     chatPersistOptions,
   ),
 )
+
+// P2-3(sol 返修):注册 unsynced sidecar 标记回调 → enqueueChatAppend 同步置位 msgId。
+//   注册在模块尾部(useChatStore 已建),打破 chatPersistSync↔chatStore 静态环(chatPersistSync
+//   不静态 import chatStore;本注册经 registerUnsyncedMarker 注入 mutator)。运行时 enqueueChatAppend
+//   调 markUnsynced 同步改 sidecar,hydrate 前已就绪(无 async 竞态)。dedup 防 同 msgId 重复入队。
+registerUnsyncedMarker((canvasId, messageId) => {
+  useChatStore.setState((s) => {
+    const prev = s.unsyncedChatMsgIds[canvasId] ?? []
+    if (prev.includes(messageId)) return {} // 已标记,避免重复 push 触发多余 setItem
+    return {
+      unsyncedChatMsgIds: {
+        ...s.unsyncedChatMsgIds,
+        [canvasId]: [...prev, messageId],
+      },
+    }
+  })
+})

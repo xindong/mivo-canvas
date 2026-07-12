@@ -250,7 +250,8 @@ describe('contract: chat persist v2 shape', () => {
     expect(opts.version).toBe(2)
 
     const partialized = opts.partialize!(useChatStore.getState()) as Record<string, unknown>
-    expect(Object.keys(partialized).sort()).toEqual(['messagesByScene', 'paramOverrides', 'selectedModel'].sort())
+    // P2-3:新增 unsyncedChatMsgIds sidecar(R-7 local-only 保留证明,跨 boot 持久)入 partialize 字段集。
+    expect(Object.keys(partialized).sort()).toEqual(['messagesByScene', 'paramOverrides', 'selectedModel', 'unsyncedChatMsgIds'].sort())
   })
 
   it('partialize excludes isBusy (runtime state)', () => {

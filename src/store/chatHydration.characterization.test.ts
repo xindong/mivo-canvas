@@ -196,10 +196,11 @@ describe('① messagesByScene: sceneId 键读写语义', () => {
 // ② 持久化白名单：isBusy 等瞬态不入 persist ===================================
 
 describe('② 持久化白名单：isBusy 等瞬态不入 persist', () => {
-  it('partialize 产出恰好 {messagesByScene, paramOverrides, selectedModel} 三个字段', () => {
+  it('partialize 产出 {messagesByScene, paramOverrides, selectedModel, unsyncedChatMsgIds} 四个字段(白名单,无瞬态)', () => {
     const opts = useChatStore.persist.getOptions()
     const partialized = opts.partialize!(useChatStore.getState()) as Record<string, unknown>
-    expect(Object.keys(partialized).sort()).toEqual(['messagesByScene', 'paramOverrides', 'selectedModel'])
+    // P2-3:unsyncedChatMsgIds sidecar 入 partialize(R-7 local-only 保留证明,跨 boot 持久);isBusy 仍排除。
+    expect(Object.keys(partialized).sort()).toEqual(['messagesByScene', 'paramOverrides', 'selectedModel', 'unsyncedChatMsgIds'])
   })
 
   it('partialize 排除 isBusy（runtime 状态）', () => {
