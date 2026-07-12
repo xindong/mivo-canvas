@@ -72,7 +72,7 @@ checks.push(async () => {
 })
 
 checks.push(async () => {
-  requireLoggerLevels(await read('src/store/canvasStore.ts'), 'Canvas store')
+  requireLoggerLevels(await read('src/store/canvasStoreLog.ts'), 'Canvas store log utilities')
   requireLoggerLevels(await read('src/app/LibraryWorkspace.tsx'), 'Library workspace')
 })
 
