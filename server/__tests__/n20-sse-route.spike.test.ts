@@ -115,6 +115,24 @@ function createSpikeSseApp() {
     })
     return new Response(stream, { headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', 'connection': 'keep-alive' } })
   })
+  // ★ R5 F3:真实 authz seam WRITE route(PATCH /api/canvas/:id/nodes/:nodeId)— 与 GET events route 同 seam
+  //   (resolveActor + canAccessCanvas('write') + denyStatus)。撤权后 bob write → 404 no-leak(non-member)/403(member 越权);
+  //   owner write → 200。原 SSE harness 只 GET(5-4 断流),无 write route;G7-hard-3 是另一套自建 FieldLevelServer
+  //   不复用真实 owner.ts/authz.ts → post-revoke write 拒绝未由真实 seam 验。本 route 补此缺口(补探针把声称测实)。
+  app.patch('/api/canvas/:id/nodes/:nodeId', async (c) => {
+    const actor = resolveActor(c) // ★ 真实:SSO header(trusted+secret ok)or fallback 指纹(非 401)
+    const memberRole = resolveMemberRole(actor)
+    const info: AuthzInfo = { actor, ownerId: state.canvasOwner, memberRole }
+    if (canAccessCanvas(info, 'write') === 'deny') { // ★ 真实 canAccessCanvas('write')
+      const status = denyStatus(info) // ★ 真实 denyStatus:404(non-member 无泄漏)/403(member 越权)
+      const body = status === 403 ? { error: 'forbidden' } : { error: 'unknown-canvas' }
+      return c.json(body, status as 403 | 404)
+    }
+    const nodeId = c.req.param('nodeId')
+    const body = await c.req.json().catch(() => ({})) as { fieldPath?: string[]; value?: unknown }
+    const evt = pushEvent({ recordId: nodeId, op: { fieldPath: body.fieldPath ?? ['title'], value: body.value ?? 'patched' } })
+    return c.json({ id: nodeId, revision: 1, seq: evt.seq })
+  })
   return { app, state, pushEvent, GATEWAY_SECRET }
 }
 
@@ -306,5 +324,33 @@ describe('N2-0 返修 Gate5(R3 F3): 真实 Hono SSE route + resolveActor/canAcce
     expect(pulledSeqs[0]).toBe(1)
     expect(pulledSeqs[pulledSeqs.length - 1]).toBe(51)
     expect(pulledSeqs.length).toBe(51) // ★ 全 51 个事件补拉无缺口(response body + 补拉得无缺口终态)
+  })
+
+  it('5-9 post-revoke write 拒绝(R5 F3:真实 authz seam write route):bob 建流→撤权→SSE revoke/close + bob write 404 no-leak + owner write 200', async () => {
+    // R5 F3 红证:原 SSE harness 只 GET events(5-4 仅断流),无 write route;G7-hard-3 是另一套自建
+    //   FieldLevelServer.applyOpAuthz,不复用真实 owner.ts/authz.ts seam → post-revoke write 拒绝未由真实 seam 验。
+    // 绿证(补探针把声称测实):同 Hono harness 加 PATCH write route(真实 resolveActor + canAccessCanvas('write')
+    //   + denyStatus);bob 建流→撤权→断言 SSE revoke + bob write 返真实 404 no-leak + owner alice write 200。
+    // bob 建流(editor,200)
+    const bobRes = await harness.app.request('/api/canvas/c1/events', { headers: { 'x-mivo-auth-user': 'bob', 'x-mivo-gateway-secret': harness.GATEWAY_SECRET } })
+    expect(bobRes.status).toBe(200)
+    await new Promise((r) => setTimeout(r, 30)) // 等 stream 建立
+    // bob 撤权前 write 仍 200(editor:roleCan('editor','write')=allow)
+    const bobWriteOk = await harness.app.request('/api/canvas/c1/nodes/n1', { method: 'PATCH', headers: { 'x-mivo-auth-user': 'bob', 'x-mivo-gateway-secret': harness.GATEWAY_SECRET, 'content-type': 'application/json' }, body: JSON.stringify({ fieldPath: ['title'], value: 'bob-write' }) })
+    expect(bobWriteOk.status).toBe(200)
+    // 撤权 bob(members.delete → resolveMemberRole(bob)=undefined → revoke-poll 断流 + write deny)
+    harness.state.members.delete('bob')
+    // ★ SSE revoke + 流关闭(真实 seam:resolveMemberRole(bob)=undefined → revoke-poll 发 event:revoke + close)
+    const chunks = await readUntil(bobRes, (cs) => cs.some((c) => c.includes('event: revoke')), 400)
+    expect(chunks.some((c) => c.includes('event: revoke\n'))).toBe(true)
+    // ★ bob write 撤权后 → 真实 canAccessCanvas(info,'write')=deny(memberRole undefined → decideAccess deny)
+    //   → denyStatus=404(non-member 无泄漏,非 401/403)
+    const bobWriteDeny = await harness.app.request('/api/canvas/c1/nodes/n1', { method: 'PATCH', headers: { 'x-mivo-auth-user': 'bob', 'x-mivo-gateway-secret': harness.GATEWAY_SECRET, 'content-type': 'application/json' }, body: JSON.stringify({ fieldPath: ['title'], value: 'bob-write-2' }) })
+    expect(bobWriteDeny.status).toBe(404) // ★ 真实 no-leak 404(撤权 = 非 member,不泄漏存在)
+    expect((await bobWriteDeny.json() as { error: string }).error).toBe('unknown-canvas')
+    // ★ owner alice write 仍 200(owner 不可撤:actor===ownerId → roleCan('owner','write')=allow)
+    const aliceWrite = await harness.app.request('/api/canvas/c1/nodes/n1', { method: 'PATCH', headers: { 'x-mivo-auth-user': 'alice', 'x-mivo-gateway-secret': harness.GATEWAY_SECRET, 'content-type': 'application/json' }, body: JSON.stringify({ fieldPath: ['title'], value: 'alice-write' }) })
+    expect(aliceWrite.status).toBe(200)
+    bobRes.body?.cancel().catch(() => {})
   })
 })
