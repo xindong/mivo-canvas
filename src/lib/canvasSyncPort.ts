@@ -108,9 +108,17 @@ export type FieldIntent =
 /**
  * FieldIntent 校验违规(域枚举,validator 抛出此类型,供调用方 catch 精确分支)。
  * 返修 R2-P1-1:validator 是 port 冻结的**域级**规则(transport-neutral),非 transport impl——
- * adapter/调用方在 submit edit-* 前须过此校验,防 clobber 表达进 wire。
+ *   adapter/调用方在 submit edit-* 前须过此校验,防 clobber 表达进 wire。
+ * 返修 R3-P1-1:扩 schema-aware leaf/container 分类违规——validator 接受可选 classifier,
+ *   拒容器/数组元素路径上的 leaf op(delete-field 整子树删除、set 原子值覆盖整子树);
+ *   结构性拒数组元素 delete-field(last segment number,无需 schema)。
  */
-export type FieldIntentViolation = 'empty-field-path' | 'non-atomic-parent-set'
+export type FieldIntentViolation =
+  | 'empty-field-path'
+  | 'non-atomic-parent-set'
+  | 'array-element-structure-delete'
+  | 'container-delete-field'
+  | 'atomic-value-to-container-path'
 
 export class FieldIntentError extends Error {
   readonly violation: FieldIntentViolation
@@ -126,16 +134,60 @@ const isAtomicLeaf = (v: unknown): boolean =>
   v === null || typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean'
 
 /**
- * 校验单条 FieldIntent 封死 clobber 规则(返修 R2-P1-1,port 冻结域级 validator):
+ * 路径终点类别(返修 R3-P1-1,schema-aware leaf/container 分类):
+ * - `leaf`:标量叶子(string/number/boolean/null)——set/delete-field 合法。
+ * - `container`:对象容器(Y.Map 子树)——set 原子值/delete-field = 整子树替换/删除 = clobber 重表达,拒。
+ * - `array-element`:数组元素位置(number 下标指向的元素)——结构编辑 deferred to N2-0 §10.1 by-stable-id,拒。
+ *   与 n20 R2-4「数组按 有 stable-id / 无 stable-id / primitive 三类冻结意图」方向对齐
+ *   (G1-b 不扩 op 面,只拒;inventory §2.1 注明对齐点)。
+ */
+export type FieldPathTarget = 'leaf' | 'container' | 'array-element'
+
+/**
+ * Schema 分类器(可选,返修 R3-P1-1):判断 fieldPath 终点是 leaf / container / array-element。
+ * port 对 record schema 不透明(FieldIntent.value:unknown 即此意)——classifier 由调用方 / adapter 提供
+ * (N2-0 决议后由真 schema 驱动;port freeze 阶段测试传固定 classifier 证明契约可行)。
+ * 不传 classifier 时 validator 只做结构性校验(空路径 / 非原子 set / 数组元素 delete-field——
+ * 后者无需 schema:last segment 是 number 即数组元素,by-stable-id 方向结构性拒)。
+ */
+export type FieldSchemaClassifier = (fieldPath: FieldPath) => FieldPathTarget
+
+/**
+ * 校验单条 FieldIntent 封死 clobber 规则(port 冻结域级 validator):
  * - 拒空 fieldPath(编译期 tuple 已拒,运行时兜 `as` cast 旁路)。
  * - `set` 拒非原子 value(对象/数组 = 整子树替换 = clobber,封死);原子叶子 set 放行。
- * - `delete-field` 放行任意非空路径(显式删字段,非静默 clobber)。
+ * - `delete-field` 数组元素(last segment number)→ 拒 `array-element-structure-delete`
+ *   (不稳定 index,by-stable-id deferred to N2-0 §10.1;无需 schema,结构性拒)。
+ * - 有 classifier 时:container / array-element 路径上的 `set`(原子值)→ 拒 `atomic-value-to-container-path`;
+ *   `delete-field` 到 container → 拒 `container-delete-field`(整子树删 = clobber 重表达)。
+ *   这是首审 clobber(spike 坑7:整 transform 重写吞 B 的 transform.y=999)在 delete-field 整子树删 /
+ *   原子值-to-容器路径 两个换名重表达面的封死;合法 optional leaf delete 放行(如 delete ['title'])。
  * 调用方:adapter 在翻译 edit-* intents 前逐条校验;port 占位实现不走此路(N2-0 决议后 G1-c adapter 接入)。
  */
-export const validateFieldIntent = (intent: FieldIntent): void | never => {
+export const validateFieldIntent = (
+  intent: FieldIntent,
+  classify?: FieldSchemaClassifier,
+): void | never => {
   if (intent.fieldPath.length === 0) throw new FieldIntentError('empty-field-path')
   if (intent.op === 'set' && !isAtomicLeaf(intent.value)) {
     throw new FieldIntentError('non-atomic-parent-set')
+  }
+  const last = intent.fieldPath[intent.fieldPath.length - 1]
+  // 数组元素 delete-field(不稳定 index):结构性拒,无需 schema(last segment number 即数组元素)。
+  // 与 N2-0 §10.1 by-stable-id 方向对齐(n20 R2-4:数组结构编辑 deferred,不进 FieldIntent)。
+  if (intent.op === 'delete-field' && typeof last === 'number') {
+    throw new FieldIntentError('array-element-structure-delete')
+  }
+  // schema-aware 分类(可选):有 classifier 时拒 container/array-element 路径上的 leaf op。
+  if (classify) {
+    const target = classify(intent.fieldPath)
+    if (target === 'container' || target === 'array-element') {
+      if (intent.op === 'set') throw new FieldIntentError('atomic-value-to-container-path')
+      // delete-field 到 container(整子树删);array-element 已在上方结构性拦,此处兜 classifier 返回 array-element。
+      throw new FieldIntentError(
+        target === 'container' ? 'container-delete-field' : 'array-element-structure-delete',
+      )
+    }
   }
 }
 
@@ -276,6 +328,12 @@ export interface CanvasSyncPort {
    *   load 返 null(canvas 不存在/无权)→ rejected(forbidden 或 not-found),不误报成功;load 确认 record 已不存在
    *   → accepted(幂等 delete,携真实 cursor)。未来若 G1-c/N2-1 让 DELETE 返回 seq,adapter 可省去此次 load
    *   (优化项,非本 freeze 范围;此处不向 n20-fix worker 的 §10 文档提要求)。
+   *
+   * 返修 R3-P1-3(delete race 全封 + 冲突恢复责任冻结):204/404 + load recordPresent 一律 conflict(旧实现
+   *   只挡 404+present,204+present 落 accepted 假成功);delete race(record 被并发重建)显式 conflict,不假 accepted。
+   *   冲突恢复责任在 **caller**(据 conflict 重删 or load/rebase 后再决策)——adapter **不**自动重删(自动重删
+   *   会与 caller 的 rebase 意图冲突);"重建后重删收敛"路径(delete race conflict → caller 重删 → load 确认
+   *   record 不在 → accepted)由 caller 驱动,见 contract test mapDeleteOutcome + "重建后重删收敛"测试。
    */
   submitChange(canvasId: string, change: CanvasChange, base?: SnapshotCursor): Promise<ChangeOutcome>
   /**

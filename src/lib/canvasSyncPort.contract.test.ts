@@ -27,6 +27,8 @@ import type {
   ChangeOutcome,
   FieldIntent,
   FieldPath,
+  FieldPathTarget,
+  FieldSchemaClassifier,
   RejectionReason,
   SnapshotCursor,
 } from './canvasSyncPort'
@@ -85,9 +87,22 @@ describe('CanvasSyncPort interface surface (G1-b transport-neutral)', () => {
   it('R2-P1-1: validateFieldIntent + FieldIntentError are exported (domain rule frozen at port)', () => {
     expectTypeOf<typeof validateFieldIntent>().toBeFunction()
     expectTypeOf<FieldIntentError>().toHaveProperty('violation')
-    expectTypeOf<FieldIntentError['violation']>().toEqualTypeOf<'empty-field-path' | 'non-atomic-parent-set'>()
+    // 返修 R3-P1-1:violation 枚举从 2 key 扩到 5(加 schema-aware 三类:数组元素结构删 / 容器删 / 原子值写容器)。
+    expectTypeOf<FieldIntentError['violation']>().toEqualTypeOf<
+      | 'empty-field-path'
+      | 'non-atomic-parent-set'
+      | 'array-element-structure-delete'
+      | 'container-delete-field'
+      | 'atomic-value-to-container-path'
+    >()
     // runtime smoke:非原子 set 抛 FieldIntentError(封死 clobber 表达)
     expect(() => validateFieldIntent({ op: 'set', fieldPath: ['transform'], value: { x: 1 } })).toThrow(FieldIntentError)
+  })
+
+  it('R3-P1-1: FieldPathTarget + FieldSchemaClassifier are exported (schema-aware contract surface)', () => {
+    // port 对 schema 不透明(FieldIntent.value:unknown),但 validator 可选接受调用方提供的 classifier。
+    expectTypeOf<FieldPathTarget>().toEqualTypeOf<'leaf' | 'container' | 'array-element'>()
+    expectTypeOf<FieldSchemaClassifier>().toEqualTypeOf<(fieldPath: FieldPath) => FieldPathTarget>()
   })
 })
 
@@ -283,6 +298,85 @@ describe('F1: field-level edit intent is lossless under concurrency', () => {
   })
 })
 
+// ── 返修 R3-P1-1:schema-aware leaf/container 分类(delete-field + 原子值-to-容器 封死)────
+describe('R3-P1-1: schema-aware leaf/container classification (delete-field + atomic-to-container sealed)', () => {
+  // 基于 NodeRecord schema 的测试 classifier(records.ts:64-107):
+  //  container(对象): transform / relations / layout / constraints / asset / generation / aiWorkflow / annotationBounds / imageCrop / assetSourceDimensions
+  //  container(数组): fills / strokes / effects / markupPoints / experimentalAnchors —— 数组字段本身是数组容器;[i] 是 array-element
+  //  leaf(标量): id / type / title / revision / text / fontSize / locked / hidden / favorited / ... (optional 可 delete-field)
+  // 与 n20 R2-4「数组按 有 stable-id / 无 stable-id / primitive 三类冻结意图」方向对齐(G1-b 只拒,不扩 op 面)。
+  const nodeClassifier: FieldSchemaClassifier = (path) => {
+    const seg0 = path[0]
+    if (typeof seg0 === 'number') return 'array-element' // 防御(顶层不应是 number)
+    const containers = ['transform', 'relations', 'layout', 'constraints', 'asset', 'generation', 'aiWorkflow', 'annotationBounds', 'imageCrop', 'assetSourceDimensions']
+    const arrays = ['fills', 'strokes', 'effects', 'markupPoints', 'experimentalAnchors']
+    const leaves = ['id', 'type', 'title', 'revision', 'text', 'fontSize', 'textColor', 'fontWeight', 'textAlign', 'textAutoWidth', 'markupKind', 'markupBrushKind', 'markupStampKind', 'markupCornerRadius', 'sectionTitleVisible', 'sectionLockMode', 'sectionTemplateId', 'markdownDisplayMode', 'imageHasTransparency', 'sourceNodeId', 'groupId', 'locked', 'hidden', 'favorited', 'markupStartArrow', 'markupEndArrow']
+    if (arrays.includes(seg0)) {
+      if (path.length === 1) return 'container' // 数组字段本身是数组容器(delete ['fills'] 拒)
+      if (path.length === 2 && typeof path[1] === 'number') return 'array-element' // ['fills',0]
+      return 'leaf' // ['fills',0,'color']
+    }
+    if (containers.includes(seg0)) {
+      if (path.length === 1) return 'container' // ['transform']
+      return 'leaf' // ['transform','x']
+    }
+    if (leaves.includes(seg0)) return 'leaf'
+    return 'leaf' // 未知字段默认 leaf(port 对 schema 不透明,不拦未知)
+  }
+
+  it('R3-P1-1 NEGATIVE: delete-field on required container (transform) rejected (whole-subtree delete = clobber)', () => {
+    // delete ['transform'] = 删整个 transform Y.Map = 吞并发子字段(transform.y=999),clobber 重表达;封死。
+    expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['transform'] }, nodeClassifier)).toThrow(FieldIntentError)
+    expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['transform'] }, nodeClassifier)).toThrow(/container-delete-field/)
+  })
+
+  it('R3-P1-1 NEGATIVE: delete-field on array root container (fills) rejected', () => {
+    // delete ['fills'] = 删整个 fills Y.Array = 整子树删除 + 数组结构编辑 deferred;封死。
+    expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['fills'] }, nodeClassifier)).toThrow(FieldIntentError)
+    expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['fills'] }, nodeClassifier)).toThrow(/container-delete-field/)
+  })
+
+  it('R3-P1-1 NEGATIVE: delete-field on array element (fills[0]) rejected — unstable index, by-stable-id deferred', () => {
+    // delete ['fills',0] 用不稳定 index 表达声称 deferred 的数组 remove,与 n20 §10.1 by-stable-id 方向岔开;封死。
+    // 结构性拒(last segment number),无需 classifier;带 classifier 也一致拒。
+    expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['fills', 0] })).toThrow(/array-element-structure-delete/)
+    expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['fills', 0] }, nodeClassifier)).toThrow(/array-element-structure-delete/)
+  })
+
+  it('R3-P1-1 NEGATIVE: set atomic value at container path (set [transform]=7) rejected (whole-subtree replace)', () => {
+    // set ['transform']=7 = 原子值覆盖整个 transform 容器 = 整子树替换重表达(坑7 的换名面);封死。
+    // 注:R2 validator 只拦 set 非原子 value,原子值写容器路径(=7)放行 —— R3 finding 的核心洞。
+    expect(() => validateFieldIntent({ op: 'set', fieldPath: ['transform'], value: 7 }, nodeClassifier)).toThrow(FieldIntentError)
+    expect(() => validateFieldIntent({ op: 'set', fieldPath: ['transform'], value: 7 }, nodeClassifier)).toThrow(/atomic-value-to-container-path/)
+  })
+
+  it('R3-P1-1 NEGATIVE: set atomic value at array element (set [fills,0]=7) rejected — whole-element replace', () => {
+    // set ['fills',0]=7 = 原子值覆盖整个元素位置 = 整元素替换重表达(断因果链);封死。
+    expect(() => validateFieldIntent({ op: 'set', fieldPath: ['fills', 0], value: 7 }, nodeClassifier)).toThrow(/atomic-value-to-container-path/)
+  })
+
+  it('R3-P1-1 POSITIVE: delete-field on optional leaf (title/locked) passes with classifier', () => {
+    // 合法 optional leaf delete 放行(title/locked 是 optional 叶子,删叶子不吞兄弟字段)。
+    expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['title'] }, nodeClassifier)).not.toThrow()
+    expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['locked'] }, nodeClassifier)).not.toThrow()
+  })
+
+  it('R3-P1-1 POSITIVE: atomic leaf set at leaf path passes with classifier (transform.x / fills[0].color)', () => {
+    // set ['transform','x']=100 / ['fills',0,'color']='#f00' 终点是 leaf,带 classifier 仍放行。
+    expect(() => validateFieldIntent({ op: 'set', fieldPath: ['transform', 'x'], value: 100 }, nodeClassifier)).not.toThrow()
+    expect(() => validateFieldIntent({ op: 'set', fieldPath: ['fills', 0, 'color'], value: '#f00' }, nodeClassifier)).not.toThrow()
+  })
+
+  it('R3-P1-1: without classifier, structural defense still rejects array-element delete-field + non-atomic set', () => {
+    // 无 classifier(port 对 schema 不透明):只结构性拒——数组元素 delete-field(last number)+ 非原子 set。
+    // container delete / 原子值-to-容器 无 schema 不拒(契约:调用方须传 classifier 才做 schema-aware 拒)。
+    expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['fills', 0] })).toThrow(/array-element-structure-delete/)
+    expect(() => validateFieldIntent({ op: 'set', fieldPath: ['transform'], value: { x: 1 } })).toThrow(/non-atomic-parent-set/)
+    // 无 classifier 时 container delete 不拒(port 不知是 container——契约:调用方传 classifier 才判 leaf/container)
+    expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['transform'] })).not.toThrow()
+  })
+})
+
 // ── 返修 F3:终态拒绝 + 权威 accepted(契约证明)─────────────────────────
 describe('F3: terminal rejections + authoritative accepted (no mis-retry, no false success)', () => {
   // 代表性 HTTP→ChangeOutcome 映射(未来 Figma 案 adapter 须实现)。
@@ -291,11 +385,13 @@ describe('F3: terminal rejections + authoritative accepted (no mis-retry, no fal
   const CURSOR = 'rev-1' as unknown as SnapshotCursor
   const CURRENT = 'rev-2' as unknown as SnapshotCursor
 
-  const mapHttpStatusToOutcome = (status: number, opts: { isDelete?: boolean } = {}): ChangeOutcome => {
+  // 返修 R3-P1-3:删 isDelete+404→accepted(常量 CURSOR) 旧 shortcut(delete 路径走 mapDeleteOutcome,
+  //   authoritative load 取真实 cursor;此 helper 只表非 delete 的 HTTP→outcome 映射,不再有 isDelete 旁路)。
+  const mapHttpStatusToOutcome = (status: number): ChangeOutcome => {
     if (status >= 200 && status < 300) return { kind: 'accepted', cursor: CURSOR }
     if (status === 401) return { kind: 'rejected', reason: 'unauthorized' }
     if (status === 403) return { kind: 'rejected', reason: 'forbidden' }
-    if (status === 404) return opts.isDelete ? { kind: 'accepted', cursor: CURSOR } : { kind: 'rejected', reason: 'not-found' }
+    if (status === 404) return { kind: 'rejected', reason: 'not-found' }
     if (status === 413) return { kind: 'rejected', reason: 'too-large' }
     if (status === 422) return { kind: 'rejected', reason: 'reuse-conflict' }
     if (status === 400) return { kind: 'rejected', reason: 'bad-request' }
@@ -394,6 +490,8 @@ describe('F3: terminal rejections + authoritative accepted (no mis-retry, no fal
   type LoadResult = { cursor: SnapshotCursor; recordPresent: boolean } | null
 
   // delete 流程:delete(status) → 若无 cursor,adapter 须做 loadSnapshot authoritative load → 据 load 结果构造 outcome。
+  // 返修 R3-P1-3:204/404 + recordPresent 一律 conflict(旧实现只挡 404+present,204+present 落 accepted 假成功);
+  //   冻结冲突恢复责任:conflict 时 caller 须重删(adapter 不自动重删)或 load/rebase 后再决策(见下方"重建后重删收敛"测试)。
   const mapDeleteOutcome = (status: number, load: LoadResult): ChangeOutcome => {
     if (load === null) {
       // 无 authoritative cursor:404+null-load = canvas 不存在/无权(authz.denyStatus 404)→ rejected(forbidden);
@@ -401,11 +499,12 @@ describe('F3: terminal rejections + authoritative accepted (no mis-retry, no fal
       if (status === 404) return { kind: 'rejected', reason: 'forbidden' }
       return { kind: 'retryable', reason: 'cursor-pending-authoritative-load' }
     }
-    if (status === 404 && load.recordPresent) {
-      // 404 但 load 见 record 仍在 → race(record 被并发重建);conflict,非 accepted。
+    if (load.recordPresent) {
+      // record 仍在 = 并发重建 race → conflict(无论 204 还是 404);delete 目标态未达成,不 accepted。
+      // R3-P1-3:旧实现只挡 404+present,204+present 落 accepted 假成功——现一律 conflict(防 204 race 假 accepted)。
       return { kind: 'conflict', currentCursor: load.cursor, diverging: [] }
     }
-    // 204(已删)或 404(已删,load 确认 record 不在)→ accepted,携**真实 load 来的 cursor**(非常量冒充)。
+    // record 已不在 = delete 目标态达成 → accepted,携**真实 load 来的 cursor**(非常量冒充)。
     return { kind: 'accepted', cursor: load.cursor }
   }
 
@@ -443,6 +542,26 @@ describe('F3: terminal rejections + authoritative accepted (no mis-retry, no fal
     const del = mapDeleteOutcome(404, { cursor: SERVER_SEQ_42, recordPresent: true })
     expect(del.kind).toBe('conflict')
     if (del.kind === 'conflict') expect(del.currentCursor).toBe(SERVER_SEQ_42)
+  })
+
+  it('R3-P1-3: 204 + load sees record still present → conflict (NOT false accepted — old bug)', () => {
+    // 旧实现只挡 404+present,204+present 落 accepted 假成功(204 后 load 又见 record → 旧走最后 return accepted);
+    // R3:一律 recordPresent→conflict(204 race 同 404 race 处理),防 204 race 假 accepted。
+    const del = mapDeleteOutcome(204, { cursor: SERVER_SEQ_42, recordPresent: true })
+    expect(del.kind).toBe('conflict')
+    if (del.kind === 'conflict') expect(del.currentCursor).toBe(SERVER_SEQ_42)
+    expect(del.kind).not.toBe('accepted') // 不假 accepted(旧 bug:204+present 落 accepted)
+  })
+
+  it('R3-P1-3: 重建后重删收敛 — delete race conflict → re-delete → load confirms gone → accepted (conflict recovery)', () => {
+    // 冻结冲突恢复责任:conflict 时 caller 须重删(adapter 不自动重删)或 load/rebase;重删后 load 确认 record 不在 → accepted 收敛。
+    // 场景:删 n1 → 404 race(record 被并发重建)→ conflict;caller 据 conflict 重删 → 204 + load 确认不在 → accepted(真实 cursor)。
+    const raceConflict = mapDeleteOutcome(404, { cursor: SERVER_SEQ_42, recordPresent: true })
+    expect(raceConflict.kind).toBe('conflict') // 第一轮:race → conflict(非假 accepted)
+    // caller 据 conflict 重删(冲突恢复责任在 caller,非 adapter 自动):
+    const reDelete = mapDeleteOutcome(204, { cursor: SERVER_SEQ_43, recordPresent: false })
+    expect(reDelete.kind).toBe('accepted') // 第二轮:重删后 record 已不在 → accepted 收敛
+    if (reDelete.kind === 'accepted') expect(reDelete.cursor).toBe(SERVER_SEQ_43) // 真实 load cursor,非常量冒充
   })
 })
 
