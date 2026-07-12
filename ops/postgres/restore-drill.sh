@@ -132,6 +132,10 @@ log "ok: dump TOC readable (pg_restore -l exit 0)"
 MANIFEST="${LATEST_DUMP%.dump}.manifest.json"
 MANIFEST_STATUS="$(manifest_parse_status "$MANIFEST")"
 MANIFEST_PRESCHEMA=""
+# P03-R3-1:ERR_MANIFEST init-once(manifest 解析失败标志),仅在下方 case 块置 1(no-jq/malformed)。
+# 不再在恢复后重置(旧 :169 `ERR_MANIFEST=0` 清零了此信号 → 坏 manifest 仍 PASS 的假绿)。
+# 最终判定由 decide_drill_outcome 把 ERR_MANIFEST 并入 ERR(单一真相源,见 asset-verify.sh)。
+ERR_MANIFEST=0
 case "$MANIFEST_STATUS" in
   absent)
     log "WARN: no manifest for $LATEST_DUMP (旧备份无 manifest,F3 行数比对跳过;新 backup.sh 会产 manifest)"
@@ -166,7 +170,9 @@ log "ok: pg_restore → $DRILL_DB"
 
 # ─── 3. F3:三核心表存在性 hard gate + manifest 逐表行数比对 ──────────────────
 ERR=0
-ERR_MANIFEST=0  # R2-2:manifest 解析失败(no-jq/malformed)→ 后续并入 ERR hard fail
+# P03-R3-1:不再在此重置 ERR_MANIFEST(旧 `ERR_MANIFEST=0` 清零了 manifest case 块设置的
+# 解析失败信号 → 坏 manifest/no-jq 仍 PASS)。ERR_MANIFEST 已在 manifest case 前 init-once,
+# 由 decide_drill_outcome 在最终判定时并入 ERR(见下方)。
 CORE_MISSING=0
 # 3a. SELECT 1(证明库可读)
 docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$DRILL_DB" -t -A -c "SELECT 1;" >>"$LOG_FILE" 2>&1 || ERR=1
@@ -212,8 +218,8 @@ case "$CORE_OUTCOME" in
     ERR=1
     ;;
 esac
-# R2-2:manifest 解析失败并入 ERR(no-jq / malformed hard fail)。
-if [ "${ERR_MANIFEST:-0}" = "1" ]; then ERR=1; fi
+# P03-R3-1:manifest 解析失败的 ERR 合并收敛进 decide_drill_outcome(单一真相源),
+# 不再在此手动 `if ERR_MANIFEST=1; then ERR=1`(旧 :169 清零 bug 已修,此处合并是冗余重复)。
 
 # ─── 4. F4:asset snapshot 真解压 + sha256 + metadata + manifest blob 数比对 ──────
 # asset backup 开启(ASSET_BACKUP_DIR 设且存在)→ hard gate;关 → skipped(不阻断)。
@@ -258,14 +264,19 @@ fi
 docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_ADMIN_DB" -c "DROP DATABASE IF EXISTS \"$DRILL_DB\";" >>"$LOG_FILE" 2>&1 || true
 
 # ─── 6. 成功判定(F3/F4 硬闸门)─────────────────────────────────────────────
-# R2-2 矩阵:PASS = ERR=0 AND CORE_OUTCOME ∈ {pass, warn}(全在 / 全缺+preSchema+ALLOW_EMPTY)。
-# asset check + manifest 解析失败 已并入 ERR(开启时 / no-jq / malformed)。
-if [ "$ERR" = "0" ] && { [ "$CORE_OUTCOME" = "pass" ] || [ "$CORE_OUTCOME" = "warn" ]; }; then
-  log "PASS: restore drill ok (core=$CORE_OUTCOME coreMissing=$CORE_MISSING, manifest=$MANIFEST_STATUS, preSchema=$MANIFEST_PRESCHEMA, backup=$LATEST_DUMP, asset=$ASSET_CHECK)"
+# P03-R3-1:最终判定收敛到 decide_drill_outcome(单一真相源,见 asset-verify.sh)。
+#   ERR=累积错(核心表行数 mismatch / asset 失败 / SELECT 失败等);
+#   ERR_MANIFEST=manifest 解析失败(no-jq/malformed)→ 函数内并入 ERR hard fail,**即使核心表全在也 FAIL**
+#     (旧实现 ERR_MANIFEST=1 被 :169 清零 → 坏 manifest/no-jq 仍 PASS 的假绿,已修);
+#   CORE_OUTCOME=decide_core_missing(pass/warn/fail)。
+# PASS = decide_drill_outcome=pass(即 ERR=0 AND CORE_OUTCOME ∈ {pass,warn})。
+DRILL_OUTCOME="$(decide_drill_outcome "$ERR" "$ERR_MANIFEST" "$CORE_OUTCOME")"
+if [ "$DRILL_OUTCOME" = "pass" ]; then
+  log "PASS: restore drill ok (core=$CORE_OUTCOME coreMissing=$CORE_MISSING, manifest=$MANIFEST_STATUS, preSchema=$MANIFEST_PRESCHEMA, errManifest=$ERR_MANIFEST, backup=$LATEST_DUMP, asset=$ASSET_CHECK)"
   log "=== restore drill done: PASS ==="
   exit 0
 else
-  log "FAIL: restore drill (err=$ERR coreOutcome=$CORE_OUTCOME coreMissing=$CORE_MISSING asset=$ASSET_CHECK manifest=$MANIFEST_STATUS preSchema=$MANIFEST_PRESCHEMA)"
+  log "FAIL: restore drill (err=$ERR coreOutcome=$CORE_OUTCOME coreMissing=$CORE_MISSING asset=$ASSET_CHECK manifest=$MANIFEST_STATUS preSchema=$MANIFEST_PRESCHEMA errManifest=$ERR_MANIFEST)"
   log "=== restore drill done: FAIL ==="
   exit 1
 fi

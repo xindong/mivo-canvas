@@ -38,6 +38,28 @@ expect "missing=3 allow=1 preSchema=false → fail(preSchema=false 非真)" "$(d
 expect "missing=1 allow=1 preSchema=true → fail(部分缺,即使声明 pre-schema也不放行)" "$(decide_core_missing 1 1 true)" fail
 expect "missing=2 allow=1 preSchema=true → fail(部分缺)" "$(decide_core_missing 2 1 true)" fail
 
+echo "=== R2-2 decide_drill_outcome(manifest 解析失败 → hard fail,即使核心表全在;P03-R3-1) ==="
+
+# decide_drill_outcome <err> <err_manifest> <core_outcome> → pass/fail
+# R2-2 / P03-R3-1 不变量:manifest 解析失败(err_manifest=1: no-jq/malformed)→ hard fail,
+#   即使三核心表全在(core=pass)——旧实现 ERR_MANIFEST=1 被 :169 清零 → 误判 pass(假绿)。
+# valid manifest + 全表全在 → pass
+expect "valid manifest + 全表全在 → pass" "$(decide_drill_outcome 0 0 pass)" pass
+# valid manifest + 全核心表全缺 + manifest 明示 pre-schema(warn)→ pass
+expect "valid manifest + 全缺+preSchema → pass(warn)" "$(decide_drill_outcome 0 0 warn)" pass
+# R2-2 / P03-R3-1 核心:malformed manifest + 全表全在 → fail(解析失败 hard fail,不假绿)
+expect "malformed manifest + 全表全在 → fail(hard fail,不假绿)" "$(decide_drill_outcome 0 1 pass)" fail
+# no-jq + manifest present + 全表全在 → fail
+expect "no-jq + manifest present + 全表全在 → fail(hard fail)" "$(decide_drill_outcome 0 1 pass)" fail
+# absent manifest + 全表全在 → pass(不与解析失败混淆)
+expect "absent manifest + 全表全在 → pass(不与解析失败混淆)" "$(decide_drill_outcome 0 0 pass)" pass
+# valid manifest + 部分缺 → fail
+expect "valid manifest + 部分缺 → fail" "$(decide_drill_outcome 0 0 fail)" fail
+# asset/其它 err + valid manifest + 全表 → fail
+expect "asset err + valid manifest + 全表 → fail" "$(decide_drill_outcome 1 0 pass)" fail
+# malformed + 部分缺 → fail(双重)
+expect "malformed + 部分缺 → fail(双重)" "$(decide_drill_outcome 0 1 fail)" fail
+
 echo "=== R2-2 manifest_parse_status(absent / present / malformed / no-jq) ==="
 
 # absent:无文件

@@ -104,6 +104,27 @@ decide_core_missing() {
   echo fail
 }
 
+# R2-2 / P03-R3-1:restore-drill 最终判定(纯函数,无 docker/PG 依赖,可单测)。
+# $1=ERR(累积:核心表行数 mismatch / asset 失败 / SELECT 失败 等)
+# $2=ERR_MANIFEST(manifest 解析失败标志:0=正常 absent/present,1=no-jq/malformed)
+# $3=CORE_OUTCOME(decide_core_missing 返回:pass/warn/fail)
+# 不变量(P03-R3-1 修复的假绿):
+#   - manifest 解析失败(ERR_MANIFEST=1)→ hard fail,**即使三核心表全在**(core=pass)。
+#     旧实现 ERR_MANIFEST=1 在 manifest case 块设置后,被 :169 `ERR_MANIFEST=0` 无条件清零,
+#     导致 :216 合并进 ERR 时恒读 0 → 坏 manifest/no-jq 仍可 PASS。本函数把 ERR_MANIFEST
+#     并入 ERR 的逻辑收敛为单一真相源,调用方不再自行合并;wiring 侧只保证 init-once、不重置。
+#   - absent manifest(ERR_MANIFEST=0)→ 不与解析失败混淆,按 core_outcome 正常判。
+#   - PASS = ERR=0 AND CORE_OUTCOME ∈ {pass, warn}。
+decide_drill_outcome() {
+  local err="$1" err_manifest="${2:-0}" core_outcome="${3:-}"
+  [ "$err_manifest" = "1" ] && err=1
+  if [ "$err" = "0" ] && { [ "$core_outcome" = "pass" ] || [ "$core_outcome" = "warn" ]; }; then
+    echo pass
+  else
+    echo fail
+  fi
+}
+
 # R2-2:从 pg_restore --data-only --table 的文本输出(stdin)计 COPY 数据行数(纯函数,portable awk)。
 # 输入形如:行 `COPY public.tbl (cols) FROM stdin;` 之后每行一条数据,直到 `\.`;awk 计两行间数据行。
 # 文本 COPY 格式把数据内换行转义为 `\n` 字面 → 一行一条,行计数可靠(无需 docker/PG,可单测)。
