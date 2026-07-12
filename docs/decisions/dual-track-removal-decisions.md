@@ -126,7 +126,7 @@ gh api repos/xindong/mivo-canvas/branches/main/protection \
 #   lint + tsc + unit + logging / structure guard (anti-regression) / e2e prod subset (mock upstream) /
 #   e2e token gate (authorized) / e2e token gate (unauthorized) / secret scan (gitleaks) /
 #   visual diff (dom vs leafer) / e2e kernel gate (new) / pg suite (PG16)
-jq '.checks|length,.contexts|length' /tmp/d4-required-before.json   # 期望 9 9
+jq '(.checks|length),(.contexts|length)' /tmp/d4-required-before.json   # 期望 9 9（r6 修 D4-R6-1：裸 `jq '.checks|length,.contexts|length'` 逗号/管道优先级错——先算 `.checks|length` 得 9，再用字符串 `"contexts"` 索引该数字数组报 `Cannot index array with string "contexts"` rc=5；加括号强制先各自 length 再逗号输出，实跑 rc=0 输出 9、9）
 ```
 
 **renderer 删轨**：只移 `visual diff (dom vs leafer)`，保留 `e2e kernel gate (new)` 与其余 7 项逐字不变：
