@@ -175,13 +175,13 @@ gh api repos/xindong/mivo-canvas/branches/main/protection \
   --jq '.required_status_checks' > /tmp/d4-required-after.json
 # 1. after.checks == before.checks - 目标（按 context 排序，含 app_id 逐字不变）
 diff <(jq -S --arg t "$TARGET" '.checks | map(select(.context != $t)) | sort_by(.context)' /tmp/d4-required-before.json) \
-     <(jq -S '.checks | sort_by(.context)' /tmp/d4-required-after.json) && echo "1.set-diff-ok" || echo "1.FAIL"
+     <(jq -S '.checks | sort_by(.context)' /tmp/d4-required-after.json) && echo "1.set-diff-ok" || { echo "1.FAIL" >&2; exit 1; }
 # 2. strict 不变
-[ "$(jq -r '.strict' /tmp/d4-required-before.json)" = "$(jq -r '.strict' /tmp/d4-required-after.json)" ]
+[ "$(jq -r '.strict' /tmp/d4-required-before.json)" = "$(jq -r '.strict' /tmp/d4-required-after.json)" ] || { echo "2.strict-FAIL" >&2; exit 1; }
 # 3. 另一 gate 仍在 after
-jq -e --arg g "$OTHER" '.checks | map(select(.context == $g)) | length == 1' /tmp/d4-required-after.json
+jq -e --arg g "$OTHER" '.checks | map(select(.context == $g)) | length == 1' /tmp/d4-required-after.json >/dev/null || { echo "3.other-gate-FAIL" >&2; exit 1; }
 # 4. 无 added checks（after contexts ⊆ before contexts）
-[ -z "$(comm -13 <(jq -r '.checks[].context' /tmp/d4-required-before.json | sort) <(jq -r '.checks[].context' /tmp/d4-required-after.json | sort))" ]
+[ -z "$(comm -13 <(jq -r '.checks[].context' /tmp/d4-required-before.json | sort) <(jq -r '.checks[].context' /tmp/d4-required-after.json | sort))" ] || { echo "4.added-FAIL" >&2; exit 1; }
 ```
 
 ```bash
@@ -190,10 +190,10 @@ TARGET='e2e kernel gate (new)'; OTHER='visual diff (dom vs leafer)'
 gh api repos/xindong/mivo-canvas/branches/main/protection \
   --jq '.required_status_checks' > /tmp/d4-required-after.json
 diff <(jq -S --arg t "$TARGET" '.checks | map(select(.context != $t)) | sort_by(.context)' /tmp/d4-required-before.json) \
-     <(jq -S '.checks | sort_by(.context)' /tmp/d4-required-after.json) && echo "1.set-diff-ok" || echo "1.FAIL"
-[ "$(jq -r '.strict' /tmp/d4-required-before.json)" = "$(jq -r '.strict' /tmp/d4-required-after.json)" ]
-jq -e --arg g "$OTHER" '.checks | map(select(.context == $g)) | length == 1' /tmp/d4-required-after.json
-[ -z "$(comm -13 <(jq -r '.checks[].context' /tmp/d4-required-before.json | sort) <(jq -r '.checks[].context' /tmp/d4-required-after.json | sort))" ]
+     <(jq -S '.checks | sort_by(.context)' /tmp/d4-required-after.json) && echo "1.set-diff-ok" || { echo "1.FAIL" >&2; exit 1; }
+[ "$(jq -r '.strict' /tmp/d4-required-before.json)" = "$(jq -r '.strict' /tmp/d4-required-after.json)" ] || { echo "2.strict-FAIL" >&2; exit 1; }
+jq -e --arg g "$OTHER" '.checks | map(select(.context == $g)) | length == 1' /tmp/d4-required-after.json >/dev/null || { echo "3.other-gate-FAIL" >&2; exit 1; }
+[ -z "$(comm -13 <(jq -r '.checks[].context' /tmp/d4-required-before.json | sort) <(jq -r '.checks[].context' /tmp/d4-required-after.json | sort))" ] || { echo "4.added-FAIL" >&2; exit 1; }
 ```
 
 ```bash
@@ -203,6 +203,8 @@ grep -c '^  e2e-kernel-gate:' .github/workflows/ci.yml    # 期望 0（kernel �
 ```
 
 > r4 dry-run 证据（本地 mock before/after fixture，复核人可重跑）：正例 after 去 `visual diff`、其余 7 项逐字不变（含 app_id）→ 4 条全 OK；负例误删另一 gate → 3 红、改 `strict=true` → 2 红、新增 `BOGUS NEW CONTEXT` → 4 红、改 `app_id=99999` → 1 红（证逐字不变检测含 app_id 绑定，非仅 context 名）。r3 原 4 条快速验收仍可作概览，但**不能替代集合 diff**——目标=0 + 总数=8 不保证"其余 7 项 context 拼写 / app_id 逐字不变"。
+>
+> r5 修 D4-R5-5：r4 末尾 `|| echo "1.FAIL"` 把 diff 失败吞成 rc=0（仅打印 FAIL，整段 rc=0 假绿），且 assertion 2-4 失败不传播（strict 改动会让 assertion 2 `[ ]` rc=1 但被后续 assertion 覆盖成 rc=0）。四条断言均改 `cmd || { echo "N.FAIL" >&2; exit 1; }`（不靠 `set -e`——zsh 下 `set -e` 对 `[ ]`/`jq -e` 不可靠，显式 `|| { exit 1; }` shell-agnostic），任一失败整段 shell rc!=0。dry-run（本地 mock 9-check before fixture + 6 after 变体，zsh 与 bash 均验）：正例 rc=0；改 app_id=99999 / 改 context 拼写 / 误删另一 gate / 新增 BOGUS check / 改 strict=true 各自 rc=1（不再只打印 FAIL）。
 
 **trunk-guard org ruleset（id `18006872`，member 无权改）边界**：该 org 级 ruleset 实测只管
 `deletion` / `non_fast_forward` / `pull_request`（`required_review_thread_resolution=true`）
