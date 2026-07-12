@@ -2,13 +2,12 @@
 // T1.3 前置:PersistBackend 存储接口(DP-5 信封列 + 返修 #1~#7/#10)+ 内存实现。
 // 权威:docs/decisions/api-surface.md §0/§2/§6(返修版)。
 //
-// ┌────────────────────────────────────────────────────────────────────────────┐
-// │ TODO(PG / T1.1 批复后):PgPersistBackend 实现本接口。信封列 + payload jsonb,  │
-// │ 附录 A SQL 草案(api-surface.md)。swap 不改路由/契约:server/app.ts 注入点     │
-// │ 从 InMemoryPersistBackend 换 PgPersistBackend,路由 handler 零改动,契约测试   │
-// │ 从内存换成 PG fixture 重跑(同 S6b persist adapter swap 模式)。PG 实现由 T1.1 │
-// │ PG provisioning + Kysely(D10)落地后的实施 PR 补,本文件只钉接口 + 内存实现。   │
-// └────────────────────────────────────────────────────────────────────────────┘
+// PG 实现:PgPersistBackend(server/persist/pgBackend.ts)drop-in 实现本接口——信封列 + payload
+// jsonb(附录 A SQL 草案见 docs/decisions/api-surface.md,实施定稿见 docs/decisions/pg-backend-schema.md)。
+// swap 不改路由/契约:server/app.ts 注入点从 InMemoryPersistBackend 换 PgPersistBackend
+// (MIVO_PERSIST_BACKEND=pg,动态 import 避免 memory 路径加载 kysely),路由 handler 零改动,
+// 契约测试从内存换成 PG fixture 重跑(同 S6b persist adapter swap 模式)。PG schema 由 Kysely
+// runner apply(server/persist/migrations.ts)。本文件只钉接口 + InMemory 实现。
 //
 // 返修要点(逐条):
 //  - #1 owner/resourceOwner:ownerId 是资源归属;鉴权 seam(actor)在 route 层(lib/authz.ts)。
