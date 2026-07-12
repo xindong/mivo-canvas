@@ -13,6 +13,7 @@ import { buildBusyDropMessages } from './chatBusyDrop'
 import { debugLogger } from './debugLogStore'
 import { generationFacade } from './generationFacade'
 import { clampChatGenerationContext, migrateChatPersistedState, sanitizeEnhanceDegradedReason } from './chatStoreMigrate'
+import { isChatBlockedForAnonymous, enqueueChatAppend } from './chatPersistSync'
 
 export type ChatMessageStatus = 'enhancing' | 'generating' | 'done' | 'error'
 export type ChatMessageOrigin = 'chat' | 'mask-edit'
@@ -178,6 +179,10 @@ export const useChatStore = create<ChatState>()(
       sendMessage: async ({ sceneId, text, selectedNodeId, selectedNodeType, referenceFiles = [] }) => {
         const state = get()
         if (state.isBusy) return
+        if (isChatBlockedForAnonymous()) {
+          debugLogger.warn('Chat Store', `sendMessage blocked: anonymous/unauthed in server mode (sceneId=${sceneId}); require login`)
+          return
+        }
 
         const { selectedModel, paramOverrides } = state
         // S03b: 参考图保存失败不再静默丢消息——catch 内自包含地构造并落 user +
@@ -224,6 +229,9 @@ export const useChatStore = create<ChatState>()(
               ]),
             },
           }))
+          // G1-a chat 接线:failed 消息 committed,enqueue append
+          enqueueChatAppend(sceneId, failedUserMessage)
+          enqueueChatAppend(sceneId, failedAssistantMessage)
           return
         }
         if (get().isBusy) {
@@ -257,6 +265,9 @@ export const useChatStore = create<ChatState>()(
               ]),
             },
           }))
+          // G1-a chat 接线:dropped 已 committed,enqueue append
+          enqueueChatAppend(sceneId, droppedUserMessage)
+          enqueueChatAppend(sceneId, droppedAssistantMessage)
           return
         }
 
@@ -304,6 +315,8 @@ export const useChatStore = create<ChatState>()(
             [sceneId]: trimSceneMessages([...existingMessages, userMessage, assistantMessage]),
           },
         }))
+        // G1-a chat 接线:enqueue 用户消息(committed;placeholder assistant 中间态不 sync,finalization 时入队)
+        enqueueChatAppend(sceneId, userMessage)
 
         try {
           const history = historyForEnhance(existingMessages)
@@ -425,6 +438,9 @@ export const useChatStore = create<ChatState>()(
               ),
             },
           }))
+          // G1-a chat 接线:assistant finalized(done)→ enqueue append(placeholder 未 sync;streaming 中间态不跨设备,honest gap)
+          const doneAssistant = get().messagesByScene[sceneId]?.find((m) => m.id === assistantMessageId)
+          if (doneAssistant) enqueueChatAppend(sceneId, doneAssistant)
         } catch (err) {
           const errorInfo = errorInfoForChat(err, abortController.signal)
           const timeoutRetryCount = isTimeoutErrorKind(errorInfo.kind) ? 1 : undefined
@@ -456,6 +472,9 @@ export const useChatStore = create<ChatState>()(
               ),
             },
           }))
+          // G1-a chat 接线:assistant finalized(error)→ enqueue append
+          const errorAssistant = get().messagesByScene[sceneId]?.find((m) => m.id === assistantMessageId)
+          if (errorAssistant) enqueueChatAppend(sceneId, errorAssistant)
         } finally {
           if (activeChatAbortController === abortController) {
             activeChatAbortController = null
@@ -464,6 +483,10 @@ export const useChatStore = create<ChatState>()(
       },
 
       appendNotice: ({ sceneId, origin, nodeIds, prompt }) => {
+        if (isChatBlockedForAnonymous()) {
+          debugLogger.warn('Chat Store', `appendNotice blocked: anonymous/unauthed in server mode (sceneId=${sceneId}); require login`)
+          return
+        }
         const notice: ChatMessage = {
           id: createMessageId(),
           role: 'assistant',
@@ -481,6 +504,8 @@ export const useChatStore = create<ChatState>()(
             [sceneId]: trimSceneMessages([...(s.messagesByScene[sceneId] || []), notice]),
           },
         }))
+        // G1-a chat 接线:enqueue append(committed;local no-op;helper 见 chatPersistSync)
+        enqueueChatAppend(sceneId, notice)
       },
 
       retryMessage: async ({ sceneId, messageId, qualityOverride }) => {
