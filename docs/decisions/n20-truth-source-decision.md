@@ -1,11 +1,11 @@
 # N2-0 真相源拍板:Figma 式 vs Yjs(返修重评分 v3,R2 复审返修,decision-complete)
 
-> 状态:**v7 决议收口(sol 第六轮终审 3 阻断修复,等 lead + sol7 第七轮终审)**。v6 被 sol 第六轮判 FAIL(三条均部分推进未关死)。**v7 病根:连续三轮栽在"改了点名处、漏了全文扫尾"**。v7 硬禁令:禁止追加式修复;直接重写 active 段原文;全文扫尾不漏。v7 收口 3 阻断(见 §14):① BaseCursor field clock 粒度(fieldKeyOf 完整 path key,transform.x≠transform.y;per-field writer map;同-field stale 才 overwritten 通知该完整 path 前写者);② active 文档一次性清零(逐行修 16 点位,勿再漏;S10-7 by-id 标 [superseded]);③ LegacyReplaceRequest 补全(信封绑 canvasId+nodeId+baseRevision;scope 校验;stale base→409 terminal conflict dead-letter 非盲 replace;真实 authz+deny 负例;retirement 双可达指标 pending queue=0 + 观察窗 envelope 增量=0)。NOTES(§14.7):edit stale 永不 409 同 fieldKeyOf-path stale 才 overwritten;BaseCursor 绑 scope+field-clock 业务层 opaque;create 唯一 POST /nodes/:nodeId;leaf-level 无白名单;by-id fail-visible deferred;legacy replace 只走可关闭可观测 drain 通道;server-named 仅 cascade 实证;Gate5 失败树固定。
-> 日期:2026-07-13(v6 决议收口)。
+> 状态:**v8 决议收口(sol 第七轮最小路径 4 阻断修复,等 sol 第八轮终审)**。v7 被 sol 第七轮判 FAIL(1 field-clock 已闭环,余 3 部分推进未关死:port cursor bundle 串用 / baseline-target 混写 / legacy 删除竞态+retirement 瞬时判定)。**v8 病根继承 v7:禁止追加式修复;直接重写 active 段原文;全文扫尾不漏**。v8 收口 4 阻断(见 §14.7):① port cursor bundle 语义冻结(canvas 级 SnapshotCursor=recordId→BaseCursor map+order+since,多 record 不串用);② baseline/target 分层(§1.1 #194 现状写回真实,A2 目标态分层到 §1.2);③ legacy 删除竞态(missing+baseRevision>0→409 非盲 create 复活)+ retirement fake-clock quiet-window(冻结 LEGACY_DRAIN_QUIET_WINDOW_MS,完整连续窗口 delta=0+pending=0 才 retire);④ 证据索引扫尾(spike/SSE/PG 计数 + decision-complete 版本号全改实跑 54+13+8=75 + v8 状态)。NOTES(§14.7):edit stale 永不 409 同 fieldKeyOf-path stale 才 overwritten;BaseCursor 绑 scope+field-clock 业务层 opaque;**canvas 级 SnapshotCursor=opaque bundle(recordId→base+order+since)**;create 唯一 POST /nodes/:nodeId;leaf-level 无白名单;by-id fail-visible deferred;legacy replace 只走可关闭可观测 drain 通道(missing+baseRev>0→409 非盲 create);retirement fake-clock quiet-window;server-named 仅 cascade 实证;Gate5 失败树固定。
+> 日期:2026-07-13(v8 决议收口)。
 > 任务来源:`docs/plan/remaining-tasks-cutover-plan.md` §8 N2-0(7 hard gate,逐字执行)。
 > 前置:`docs/spike/n1-yjs-mapping.md`(N1 结论 + Q1-Q10)、`docs/decisions/record-schema.md`、`src/kernel/{docKernel,records,adapters}.ts`、`docs/decisions/platform-architecture-2026-07-07.md`。
 > 验证产物(全绿):
-> - `src/kernel/__spike__/n20-truth-source.spike.test.ts`(55 tests:15 原 + 18 返修 + 8 补缺 + 3 R2 增 + **v4:3 S10-12/13/14 冻结矩阵/server-named/array defer + CutoverHarness 改真实 WriteOp+NodePayload 四类 + 4 交叉契约 X-1~X-4**)
+> - `src/kernel/__spike__/n20-truth-source.spike.test.ts`(**54 tests**;v4 +7:3 S10-12/13/14 + CutoverHarness 改真实 WriteOp/NodePayload + 4 X-1~X-4 交叉契约;**v8:S10-12 加 SnapshotCursor=opaque bundle 交叉测试 + C-2 加 delete-race/retirement fake-clock quiet-window,吸收进既有 it() 不增计数**;分项见 §附)
 > - `server/__tests__/n20-sse-route.spike.test.ts`(13 tests,真实 Hono SSE route 集成 + R2-2 live push 5-7 + desiredSize backpressure + R3 F3 authz seam + R5 F3 post-revoke write + **v4:4 网关失败树 5-10~5-13 first-frame/header-strip/short-poll fallback SLO**)
 > - `server/__tests__/n20-pg-tx-fault.spike.test.ts`(8 tests,真实 PG transaction fault injection + R2-1 同一 client + R3/R5 F2 持久/跨 record/真实 replay)
 >
@@ -15,7 +15,7 @@
 
 ---
 
-## 14. v7 决议收口(sol 第六轮终审 3 阻断逐条修复)
+## 14. v8 决议收口(sol 第七轮最小路径 4 阻断逐条修复;§14.1-14.6 v7 保持)
 
 > sol 第六轮终审判 FAIL(三条均部分推进未关死)。**v7 病根:连续三轮栽在"改了点名处、漏了全文扫尾"**。v7 硬禁令:禁止追加式修复;直接重写 active 段原文;全文扫尾不漏。v7 收口 3 阻断 + before→after 对照表(见 send_to_lead)+ grep 自检。
 
@@ -57,9 +57,12 @@
 
 - port CanvasChange ↔ N20 CreateBody/DomainOp 无损映射(X-1~X4);inventory §5 item 5 网关条件式 + §11 v7 收口。
 
-### 14.7 NOTES 保持(sol 第七轮版本,原文替换)
+### 14.7 NOTES 保持(sol 第七轮版本,原文替换;v8 补 cursor bundle + delete-race + retirement + baseline/target 分层)
 
-- edit stale 永不 409,**同 fieldKeyOf-path stale 才 overwritten**(不同字段 stale 不误报;per-field writer map 通知该完整 path 前写者);BaseCursor 绑 scope+field-clock,业务层 opaque,codec 只在 adapter;create 唯一 POST /nodes/:nodeId;leaf-level 无白名单;by-id fail-visible deferred;legacy replace 只走可关闭可观测 drain 通道(stale base→409 terminal conflict dead-letter 非盲 replace);server-named 仅 cascade 实证;Gate5 失败树固定。
+- edit stale 永不 409,**同 fieldKeyOf-path stale 才 overwritten**(不同字段 stale 不误报;per-field writer map 通知该完整 path 前写者);BaseCursor 绑 scope+field-clock,业务层 opaque,codec 只在 adapter;create 唯一 POST /nodes/:nodeId;leaf-level 无白名单;by-id fail-visible deferred;legacy replace 只走可关闭可观测 drain 通道(stale base→409 terminal conflict dead-letter 非盲 replace;**v8:record missing + baseRevision>0 → 409 dead-letter 非盲 create 复活已删 record;missing + baseRevision===0 → create fresh**);server-named 仅 cascade 实证;Gate5 失败树固定。
+- **v8 Blocker 1**:**canvas 级 `SnapshotCursor` = opaque bundle**(recordId→`BaseCursor` 映射 + canvas order cursor + event since cursor);多 record hydrate 后单 record 级 token 无法为任意 n1/n2 提供 If-Match → bundle 聚合(inventory §2.1/§2.2 v7 把 canvas cursor 写成"绑 canvasId+recordId 的单个 BaseCursor"是 v8 修的矛盾);submitChange 按 change.recordId/op class 抽对应 wire base(edit/delete→record base;reorder→order base;catch-up→since base);accepted/conflict 更新 bundle 内对应项(非整 bundle 重建);port SnapshotCursor 仍 opaque(branded),adapter 构造/解包,port 不读内部(spike S10-12 bundle 交叉测试:多 record hydrate→edit n1/n2 不串用、delete 取 record base、reorder 取 order base、accepted 更新对应项、跨 canvas scope-mismatch→null)。
+- **v8 Blocker 2**(baseline/target 分层):§1.1 #194 行现状写回仓库真实(整 record REPLACE `backend.ts:1086-1088` / 裸 `Revision` `parseIfMatch` / stale→409 含 edit / 响应 `{id,revision}` 无 seq/base,`server/routes/canvas.ts:506-545` 实证);A2 目标态(field-level DomainOp + opaque BaseCursor 绑 scope+field-clock + edit stale→200+overwritten + 响应扩 seq/base)分层到 §1.2 破坏面 + cutover 状态表,**不混写为现状**(v7 #194 行把 A2 目标态写成当前事实,与 §0 推荐理由 1 "If-Match 400/428/409" 现状自相矛盾——v8 修;全文扫尾仅 §1.1 #194 一处,§1.2/§2/§10/§14 目标 spec 段合法)。
+- **v8 Blocker 3**(retirement fake-clock quiet-window):冻结配置名 `LEGACY_DRAIN_QUIET_WINDOW_MS` + 绝对时长 + 时间戳/重置语义(窗口内任一 envelope 到达即重新计时 `windowStartAt=now`);只有完整连续窗口 delta=0(`envelopeIncrementInWindow===0` + `elapsed>=quietWindowMs`)且 pending gauge=0 才 retire;drainCount 只作累计总量(非 retirement 条件);v7 `tickObservationWindow()` 手工清零瞬时判定 → v8 fake-clock(spike C-2:窗口未完整不归零、mid-window envelope 到达重新计时须重等完整窗口、pending>0 不 retire)。
 
 ---
 
@@ -109,7 +112,7 @@
 |---|---|---|---|
 | DocKernel | `src/kernel/docKernel.ts` | record 级 upsert + 三 Map + per-record revision | 服务端真相 + per-record revision LWW tie-break |
 | NodeRecord | `src/kernel/records.ts` | 40 canonical 字段 + revision;`text?` 整串叶子 | 字段扁平可映射 Y.Map —— 但映射≠采用 |
-| #194 API 契约 | `server/routes/canvas.ts:450-525` + `server/persist/backend.ts` | `PATCH /api/canvas/:id/nodes/:nodeId` → `upsertChild`;If-Match = opaque BaseCursor(绑 scope+field-clock;400 malformed/428 missing;edit stale→200 非 409);payload 对 server 不透明 | 服务端做主 + If-Match opaque BaseCursor + base-driven 409(仅 delete/reorder stale + create dup) |
+| #194 API 契约 | `server/routes/canvas.ts:450-525` + `server/persist/backend.ts` | `PATCH /api/canvas/:id/nodes/:nodeId` → `upsertChild`(**整 record REPLACE**,`backend.ts:1086-1088` `payload: clone(payload)` 非 field-level merge);If-Match = **裸 `Revision`(number)**(`parseIfMatch`→`revision:number`,非 opaque BaseCursor;400 malformed/428 missing);stale → **409**(edit stale 也 409,非 A2 的 200+overwritten);响应 `{id,revision}`(**无 seq/base**;`server/routes/canvas.ts:506-545` 实证);payload 对 server 不透明 | 服务端做主 + If-Match(bare revision)+ per-record revision LWW tie-break(**现状**);★ A2 目标态见 §1.2 破坏面 + cutover 状态表(field-level DomainOp + opaque BaseCursor 绑 scope+field-clock + edit stale→200+overwritten + 响应扩 seq/base;canvas 级 SnapshotCursor=opaque bundle) |
 | ServerPersistAdapter | `src/lib/serverPersistAdapter.ts` | upsertNode/reorderChildren/fetchCanvas | **仍未接线生产**(`unwiredServerPersistAdapter` 全 reject) |
 | SSO 身份 | `server/lib/owner.ts` | `x-mivo-auth-user` + `x-mivo-gateway-secret`(fail-closed) | HTTP-header-based 鉴权 |
 | shared 契约 | `shared/persist-contract.ts` | `NodePayload = Omit<NodeRecord,'id'|'revision'>`(payload 不携带 id/revision,Envelope 列唯一真相) | transport payload 不透明,防双真相 |
@@ -379,9 +382,9 @@ npm run test:unit -- src/lib/serverPersistAdapter.contract.test.ts server/persis
 
 ---
 
-## 4-9. PoC 清单与实跑结果(65 tests 全绿)
+## 4-9. PoC 清单与实跑结果(75 tests 全绿)
 
-**文件**:`src/kernel/__spike__/n20-truth-source.spike.test.ts`(48)+ `server/__tests__/n20-sse-route.spike.test.ts`(9)+ `server/__tests__/n20-pg-tx-fault.spike.test.ts`(8)。
+**文件**:`src/kernel/__spike__/n20-truth-source.spike.test.ts`(54)+ `server/__tests__/n20-sse-route.spike.test.ts`(13)+ `server/__tests__/n20-pg-tx-fault.spike.test.ts`(8)。
 
 ### 4.1 原 PoC(15 tests,v1 已有)
 
@@ -439,7 +442,7 @@ npm run test:unit -- src/lib/serverPersistAdapter.contract.test.ts server/persis
 | S10-8 create→edit 因果 FIFO | P2-8 | §10 | `order==['create:init','edit:edited']` | ● |
 | S10-9 DELETE cursor/404 边界 | P2-8 | §10 | `成功+幂等返 seq;从未存在→not-found` | ● |
 
-### 4.4 真实 SSE route 集成(9 tests:5-1~6 R2 + 5-7 R2-2 live push + **5-8 R3 F3 slow-reader 恢复** + **5-9 R5 F3 post-revoke write 拒绝**;5-5 R3 F3 改真实 authz seam)
+### 4.4 真实 SSE route 集成(13 tests:5-1~9 R2/R2-2/R3 F3/R5 F3 live push+desiredSize backpressure+authz seam+slow-reader 恢复+post-revoke write 拒绝 + **v4:5-10~13 网关失败树 first-frame/header-strip/short-poll fallback SLO**;5-5 R3 F3 改真实 authz seam)
 
 见 Gate5 §2(5-1 content-type/framing、5-2 heartbeat、5-3 since 补拉、5-4 revoke 断流、5-5 authz **404 no-leak**(R3 F3 真实 seam,原 403 系 fake secret)、5-6 slow consumer 有界 + response body 实收(R3 F3);5-7 live push、5-8 slow-reader 恢复、5-9 post-revoke write 拒绝见 §4.6)。强度 ●。
 
@@ -611,7 +614,7 @@ const trustifyCreate = (client: CreateBody, ctx: TrustedCtx): CreateWire =>
 
 ## 13. 与计划/上游对齐(含 G1-b **R4**;v4 对齐冻结源 R4)
 
-- **计划 §8 N2-0 七项 hard gate**:逐项两案 + 证据 + 成本 + go/no-go(§2);文本 gate 判决(§2 gate 1,P1-4 二选一 B);网关 gate 判决(§2 gate 5,○条件式留 lead + §14.4 失败树);唯一推荐 + G1-c/N2-1 契约 v6(§10);改写 N1 Q1-Q5(§11)。✅ decision-complete v6。
+- **计划 §8 N2-0 七项 hard gate**:逐项两案 + 证据 + 成本 + go/no-go(§2);文本 gate 判决(§2 gate 1,P1-4 二选一 B);网关 gate 判决(§2 gate 5,○条件式留 lead + §14.4 失败树);唯一推荐 + G1-c/N2-1 契约 v6(§10);改写 N1 Q1-Q5(§11)。✅ decision-complete v8。
 - **计划 §4 G1-b/G1-c**:G1-b 两案契约 inventory 冻结为 Figma 式唯一(§10);G1-c 落本契约,无 Yjs 死接口。**v7 对齐 G1-b R4(冻结源已到 R4)**:FieldPath 非空 tuple(R4-P1-1,S10-6)/ 数组 by-id **A2 deferred**(R4-P1-1,S10-7 [superseded];DomainOp 不含 by-id)/ create→edit 因果(R4-P1-2,S10-8)/ DELETE cursor(R4-P1-3,S10-9)/ **classifier 必填(R4-P1-1,RecordKindSchema,S10-2/S10-14)**/ **async submitChange caller-owned retry/rebase(R4-P1-2,对齐 canvasSyncPort R4 状态机)**。trusted actor/base/idempotency/seq 全留 adapter/transport 层(P2-8)。**v7:create client-id(非 server-mint)对齐 canvasSyncPort create-node(携 NodeRecord.id)**;**container 白名单取消(lead 裁定 rejected;A2 leaf-level set;FieldTarget 无 'atomic-container',两文档同规则 §10.1 + inventory §11)**。
 - **计划 §8 N2-1**:op schema/field 边界/seq/revision 用途/事务路径 = §10 契约 v4 直接落地。
 - **platform §6 CRDT-ready**:映射可行性保留(N1 证);但**采用 Yjs 否决**——CRDT-ready = 字段扁平可映射,不等于必须采 Yjs。属性级 LWW(field-level PATCH)满足"协作肯定要做"的演进不返工承诺。
@@ -621,11 +624,11 @@ const trustifyCreate = (client: CreateBody, ctx: TrustedCtx): CreateWire =>
 
 ## 附:spike 文件结构索引(v4)
 
-- `src/kernel/__spike__/n20-truth-source.spike.test.ts`(**55 tests**;v4 +7:3 S10-12/13/14 + CutoverHarness 改真实 WriteOp/NodePayload + 4 X-1~X-4 交叉契约):
+- `src/kernel/__spike__/n20-truth-source.spike.test.ts`(**54 tests**;v4 +7:3 S10-12/13/14 + CutoverHarness 改真实 WriteOp/NodePayload + 4 X-1~X-4 交叉契约;**v8:S10-12 加 SnapshotCursor=opaque bundle 交叉测试 + C-2 加 delete-race/retirement fake-clock quiet-window,吸收进既有 it() 不增计数**):
   - 模块级 v5 契约权威类型(BaseCursor string codec/DomainOp 无 by-id/ServerInvariantCommand 诚实分级/TrustedCtx.base/CreateBody client-id/RecordKindSchema;无 ATOMIC_CONTAINER_WHITELIST 白名单取消)
   - `makeNode` fixture + `setByPath`/`getByPath`/`fieldKeyOf`(硬化:拒原型污染 S10-1 + 拒空路径 S10-6 + R2-4 leaf validator 拒整对象 clobber S10-6)
   - `FieldLevelServer`:applyOp/applyOpAuthz/deleteNodeCascade/deleteNodeCascadeWithCursor/pullSinceWithGap/compress/snapshot/addMember/removeMember/storageBytes/staging+commitStaged
   - `CommandUndoStack`+ `ConditionalUndoStack`+ `TextLwwWithOverwrite`
-  - G4+G1(5)/ G3(2)+G3-real(3)/ G2(2)+M1-M6(6)/ G7(3)+G7-hard(4)/ G5(1)/ antiYjs(2)/ S10(5)+S10-6~9(4)/ T1(4)+T1-5/ S10-10/S10-11/ C-1~C-4(改真实 WriteOp+NodePayload 四类)/ **S10-12 base.clock 冻结矩阵(Blocker 1)**/ **S10-13 server-named invariant(Blocker 3)**/ **S10-14 array defer+白名单(Blocker 2)**/ **X-1~X-4 交叉契约 port CanvasChange↔N20(Blocker 6)** = **55 tests**
+  - G4+G1(5)/ G3(2)+G3-real(3)/ G2(2)+M1-M6(6)/ G7(3)+G7-hard(4)/ G5(1)/ antiYjs(2)/ S10(5)+S10-6~9(4)/ T1(4)+T1-5/ S10-10/S10-11/ **C-1/C-2/C-4(C-3 new-op+stale-base 200 非 409 由 G4-4/T1-1 覆盖,非独立 it())**/ **S10-12 base.clock 冻结矩阵+v8 bundle 交叉(Blocker 1)**/ **S10-13 server-named invariant(Blocker 3)**/ **S10-14 array defer+白名单(Blocker 2)**/ **X-1~X-4 交叉契约 port CanvasChange↔N20(Blocker 6)** = **54 tests**
 - `server/__tests__/n20-sse-route.spike.test.ts`(**13 tests**;v4 +4:5-10~13 网关失败树):真实 Hono SSE route(content-type/heartbeat/since/revoke/authz/slow-consumer + 5-7 live push + 5-8 slow-reader 恢复 + 5-9 post-revoke write 拒绝;**v4:5-10 首帧延迟 SLO + 5-11 header strip→404 + 5-12 short-poll ?since=seq fallback SLO + 5-13 失败树步骤冻结(Blocker 5,非 SSE-fallback 循环)**)
 - `server/__tests__/n20-pg-tx-fault.spike.test.ts`(8 tests):真实 PG transaction fault injection(原子提交/fault ROLLBACK/同库资产元数据/无事务 partial 对照 + PG-T5 field_clock 持久 + PG-T6 真实领域 replay + PG-T6b fault/rollback + **PG-T7 跨 record(server-named cascade 原子,对齐 Blocker 3)**;本地 PG 55443 实跑 MIVO_PG_TEST=1;全部 PG-T 同一 client pool.connect+finally release)

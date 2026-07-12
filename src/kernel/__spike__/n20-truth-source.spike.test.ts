@@ -413,6 +413,45 @@ const decodeOrderBase = (token: BaseCursor | string | undefined, expectedCanvasI
   if (seg.cv !== expectedCanvasId || seg.order === undefined) return null  // ★ scope mismatch(c1 order→c2)→ null
   return { cv: Number(seg.order) }
 }
+/** encode event-since base(canvas-scoped seq;GET /events/poll?since= 增量补拉用;bundle 内 since 项)。 */
+const encodeSinceBase = (canvasId: string, seq: number): BaseCursor => {
+  const payload = `cv=${canvasId}|since=${seq}`
+  return `base:${payload}.${baseSig(payload)}` as BaseCursor
+}
+
+// ── v8 Blocker 1:SnapshotCursor(canvas 级 opaque bundle)= recordId→BaseCursor map + canvas order base + event since base ──
+//   现状矛盾:port CanvasSnapshot 只有一个 canvas 级 cursor(canvasSyncPort.ts:95-102);inventory §2.1/§2.2 v7 把它写成
+//   "绑 canvasId+recordId 的单个 BaseCursor"——多 record hydrate 后,一个 record 级 token 无法为任意 n1/n2 提供 If-Match(串用)。
+//   ★ v8 冻结:bundle 内含 recordId→BaseCursor 映射 + canvas order cursor + event since cursor;submitChange 按 change.recordId/
+//     op class 抽对应 wire base(edit/delete→record base;reorder→order base;catch-up→since base);accepted/conflict 后更新 bundle 内对应项。
+//     port SnapshotCursor 仍 opaque(branded),adapter 构造/解包,port 不读内部(见 canvasSyncPort.ts:77 注释 + inventory §2.1/§2.2)。
+type SnapshotCursor = string & { readonly __brand: 'SnapshotCursor' }
+type BundleEntry = { revision: number; fieldClocks: FieldClocks }
+/** encode canvas bundle:opaque canvas 级 token(内含 recordId→(rev,fc) map + order cv + since seq;签)。adapter 侧构造,port 不读内部。 */
+const encodeBundle = (canvasId: string, entries: Record<string, BundleEntry>, orderCv: number, sinceSeq: number): SnapshotCursor => {
+  const payload = JSON.stringify({ cv: canvasId, recs: entries, order: orderCv, since: sinceSeq })
+  return `bundle:${payload}.${baseSig(payload)}` as SnapshotCursor
+}
+/** decode canvas bundle:验签 + canvas scope → {records(recordId→wire BaseCursor 重建), order, since, entries} | null。
+ *  ★ 解包即按 recordId 重建 wire BaseCursor(submitChange 抽对应 record base;reorder 抽 order base;不串用)。 */
+const decodeBundle = (token: SnapshotCursor | string | undefined, expectedCanvasId: string): { records: Record<string, BaseCursor>; order: BaseCursor; since: BaseCursor; entries: Record<string, BundleEntry>; orderCv: number; sinceSeq: number } | null => {
+  if (typeof token !== 'string' || !token.startsWith('bundle:')) return null
+  const body = token.slice(7); const dot = body.lastIndexOf('.')
+  if (dot < 0) return null
+  const payload = body.slice(0, dot); const sig = body.slice(dot + 1)
+  if (sig !== baseSig(payload)) return null  // 签名错/篡改 → null
+  let obj: { cv?: string; recs?: Record<string, BundleEntry>; order?: number; since?: number }
+  try { obj = JSON.parse(payload) } catch { return null }
+  if (obj.cv !== expectedCanvasId) return null  // ★ canvas scope mismatch(跨 canvas bundle 重放)→ null
+  const records: Record<string, BaseCursor> = {}
+  const entries: Record<string, BundleEntry> = {}
+  for (const [id, e] of Object.entries(obj.recs ?? {})) {
+    entries[id] = e
+    records[id] = encodeBase(expectedCanvasId, id, e.revision, e.fieldClocks)  // ★ 按 recordId 重建 wire BaseCursor(不串用)
+  }
+  const orderCv = obj.order ?? 0; const sinceSeq = obj.since ?? 0
+  return { records, order: encodeOrderBase(expectedCanvasId, orderCv), since: encodeSinceBase(expectedCanvasId, sinceSeq), entries, orderCv, sinceSeq }
+}
 
 // ── Blocker 3:strict-tx 已从 DomainOp 剔除(假跨 record tx 无 target)→ server-named invariant command ──
 //   跨 record invariant 由 path/method 推导目标,非 PATCH DomainOp。DomainOp 仅单 record LWW delta。
@@ -1842,7 +1881,7 @@ describe('N2-0 返修 §10 G1-b 衔接(P2-8): FieldPath 非空 + 数组中性 in
   // ════════════════════════════════════════════════════════════════════════════
   // v4 决议收口(sol 第三轮 6 阻断):base.clock 冻结矩阵 + server-named invariant + array defer inventory
   // ════════════════════════════════════════════════════════════════════════════
-  it('S10-12 BaseCursor 绑 scope+per-field clock + base-driven 冻结矩阵(v6 Blocker 1:scope 防跨 record/canvas 重放;同-field stale 才 overwritten,不同字段 stale 不误报;delete/reorder fresh→200 race→409;create dup→409;malformed/scope-mismatch→400)', () => {
+  it('S10-12 BaseCursor 绑 scope+per-field clock + base-driven 冻结矩阵 + v8 SnapshotCursor=opaque canvas bundle(v8 Blocker 1:SnapshotCursor=recordId→base map+order+since,多 record hydrate 不串用,delete 取 record base/reorder 取 order base/accepted 更新对应项;v6:scope 防跨 record/canvas 重放;同-field stale 才 overwritten,不同字段 stale 不误报;delete/reorder fresh→200 race→409;create dup→409;malformed/scope-mismatch→400)', () => {
     // v6 病根:v5 codec payload {rev,cv?} 两洞:① token 跨 record/canvas 重放(n1 rev=1 token 能用于 n2;HMAC 只防改值不防换资源);② 无 per-field clock,S10-12 用 record-rev 落后判 overwritten(别的字段变过也误报,违反 §10.3 同-field 语义)。
     // v6 修:token 绑 canvasId+recordId+revision+per-field clock snapshot;decodeBase 验签+scope;同-field stale 才 overwritten(不同字段 stale 不误报)。
     type Outcome = { status: number; outcome: 'accepted' | 'conflict' | 'rejected'; base?: BaseCursor; overwritten?: boolean }
@@ -1851,6 +1890,7 @@ describe('N2-0 返修 §10 G1-b 衔接(P2-8): FieldPath 非空 + 数组中性 in
       constructor(canvasId = 'c1') { this.canvasId = canvasId }
       private recs = new Map<string, { rev: number; fc: FieldClocks; present: boolean; writers: Record<string, string> }>()
       private cv = 0
+      private seq = 0  // v8:canvas 事件 seq(bundle since 项;每次 accepted op bump)
       private children: string[] = []
       private outbox: { to: string; field: string; by: string }[] = []
       seedRecord(nodeId: string, fc: FieldClocks = {}) { this.recs.set(nodeId, { rev: 0, fc: { ...fc }, present: true, writers: {} }) }
@@ -1875,7 +1915,7 @@ describe('N2-0 返修 §10 G1-b 衔接(P2-8): FieldPath 非空 + 数组中性 in
         const curFC = r.fc[field] ?? 0
         const sameFieldStale = baseFC < curFC  // ★ 同-field(完整 path)stale 才 overwritten;别的字段(含 transform.y)变过不算
         if (sameFieldStale && r.writers[field]) this.outbox.push({ to: r.writers[field], field, by: actor })  // ★ v7:通知该完整 path 前写者(per-field writer map;非 record 级单值误通知)
-        r.fc[field] = curFC + 1; r.rev += 1; r.writers[field] = actor  // ★ per-field writer map(非 record 级 lastWriter)
+        r.fc[field] = curFC + 1; r.rev += 1; this.seq += 1; r.writers[field] = actor  // ★ per-field writer map(非 record 级 lastWriter);seq bump(事件)
         return { status: 200, outcome: 'accepted', base: encodeBase(this.canvasId, nodeId, r.rev, r.fc), overwritten: sameFieldStale }
       }
       /** delete:malformed/scope-mismatch→400;fresh base(rev===current)→200;stale base(rev<current)→409 race。 */
@@ -1884,7 +1924,7 @@ describe('N2-0 返修 §10 G1-b 衔接(P2-8): FieldPath 非空 + 数组中性 in
         if (!d) return { status: 400, outcome: 'rejected' }
         const r = this.recs.get(nodeId)
         if (!r || !r.present) return { status: 404, outcome: 'rejected' }
-        if (d.revision === r.rev) { r.present = false; return { status: 200, outcome: 'accepted' } }
+        if (d.revision === r.rev) { r.present = false; this.seq += 1; return { status: 200, outcome: 'accepted' } }
         return { status: 409, outcome: 'conflict', base: encodeBase(this.canvasId, nodeId, r.rev, r.fc) }
       }
       /** reorder:malformed/scope-mismatch→400;fresh cv + valid perm→200(顺序变也成功);stale cv / orderedIds≠live→409。 */
@@ -1895,17 +1935,34 @@ describe('N2-0 返修 §10 G1-b 衔接(P2-8): FieldPath 非空 + 数组中性 in
         const liveSet = new Set(this.children)
         const validPerm = orderedIds.length === this.children.length && new Set(orderedIds).size === orderedIds.length && orderedIds.every((id) => liveSet.has(id))
         if (!validPerm) return { status: 409, outcome: 'conflict', base: this.snapshotOrder() }
-        this.children = [...orderedIds]; this.cv += 1
+        this.children = [...orderedIds]; this.cv += 1; this.seq += 1
         return { status: 200, outcome: 'accepted', base: this.snapshotOrder() }
       }
       /** create:dup id→409;new→201 + base。 */
       create(nodeId: string): Outcome {
         const r = this.recs.get(nodeId)
         if (r && r.present) return { status: 409, outcome: 'conflict', base: encodeBase(this.canvasId, nodeId, r.rev, r.fc) }
-        this.recs.set(nodeId, { rev: 1, fc: {}, present: true, writers: {} })
+        this.recs.set(nodeId, { rev: 1, fc: {}, present: true, writers: {} }); this.seq += 1
         return { status: 201, outcome: 'accepted', base: encodeBase(this.canvasId, nodeId, 1, {}) }
       }
       drainOverwritten(to: string) { const e = this.outbox.filter((o) => o.to === to); this.outbox = this.outbox.filter((o) => o.to !== to); return e }
+      // ── v8 Blocker 1:canvas 级 SnapshotCursor = opaque bundle(recordId→BaseCursor map + order base + since base)──
+      /** hydrate 签发 canvas 级 opaque bundle(内含所有 present record 的 (rev,fc) + order cv + since seq)。多 record 聚合,非单 record 级 token。 */
+      snapshotBundle(): SnapshotCursor {
+        const entries: Record<string, BundleEntry> = {}
+        for (const [id, r] of this.recs) if (r.present) entries[id] = { revision: r.rev, fieldClocks: { ...r.fc } }
+        return encodeBundle(this.canvasId, entries, this.cv, this.seq)
+      }
+      /** 解包 bundle(测试断言用;adapter 侧解包,port 不读内部)。 */
+      extractBundle(bundle: SnapshotCursor | string | undefined) { return decodeBundle(bundle, this.canvasId) }
+      /** ★ submitChange 抽 wire base:edit/delete→record base(bundle 内 recordId 对应项,按 recordId 重建);reorder→order base(非 record base)。
+       *  多 record hydrate 后 nb1/nb2 各自 record base 不串用(单 record 级 token 无法为任意 record 提供 If-Match 的根因)。 */
+      extractWireBase(bundle: SnapshotCursor | string | undefined, opClass: 'edit' | 'delete' | 'reorder', nodeId?: string): BaseCursor | null {
+        const d = decodeBundle(bundle, this.canvasId); if (!d) return null
+        if (opClass === 'reorder') return d.order  // ★ reorder 取 order base(非 record base)
+        if (nodeId === undefined) return null
+        return d.records[nodeId] ?? null  // ★ edit/delete 取 record base(按 recordId 抽;不串用)
+      }
     }
     const h = new BaseDrivenHarness('c1')
     // ── 新鲜 base:正常操作必须成功(非 race)──
@@ -1995,6 +2052,38 @@ describe('N2-0 返修 §10 G1-b 衔接(P2-8): FieldPath 非空 + 数组中性 in
     const orderBase2 = h.snapshotOrder()
     const r3 = h.reorder(['a', 'b', 'd'], orderBase2)  // 'd' 不在 live
     expect(r3.status).toBe(409); expect(r3.outcome).toBe('conflict')  // orderedIds≠live → 409
+    // ── v8 Blocker 1:SnapshotCursor = opaque canvas 级 bundle(recordId→BaseCursor map + order base + since base)──
+    //   现状矛盾:port CanvasSnapshot 只有一个 canvas 级 cursor;inventory v7 写成"绑 canvasId+recordId 的单个 BaseCursor" →
+    //   多 record hydrate 后一个 record 级 token 无法为任意 n1/n2 提供 If-Match(串用)。★ v8:bundle 聚合 + submitChange 按 recordId/op class 抽 wire base。
+    h.create('nb1'); h.edit('nb1', { fieldPath: ['title'], value: 'B1' }, h.snapshot('nb1')!, 'alice')  // nb1 rev=2, title.clock=1
+    h.create('nb2'); h.edit('nb2', { fieldPath: ['transform', 'x'], value: 9 }, h.snapshot('nb2')!, 'bob')  // nb2 rev=2, transform.x.clock=1
+    const bN1 = h.snapshot('nb1')!  // per-record wire base(wire-level,绑 c1+nb1+rev2+fc{title:1})
+    const bN2 = h.snapshot('nb2')!  // per-record wire base(绑 c1+nb2+rev2+fc{transform.x:1})
+    const bundle = h.snapshotBundle()  // ★ canvas 级 opaque bundle(聚合 nb1/nb2 record base + order + since)
+    const dec = h.extractBundle(bundle)!
+    expect(dec.records.nb1).toBeDefined(); expect(dec.records.nb2).toBeDefined()  // bundle 含两 record 的 base
+    expect(dec.records.nb1).toEqual(bN1)  // ★ bundle nb1 entry 重建 = per-record base(按 recordId 重建,不串用)
+    expect(dec.records.nb2).toEqual(bN2)  // ★ bundle nb2 entry 重建 = per-record base
+    expect(dec.records.nb1).not.toEqual(bN2)  // ★ n1/n2 base 不串用(distinct;单 record 级 token 无法为任意 record 提供 If-Match 的根因)
+    expect(dec.order).toEqual(h.snapshotOrder())  // bundle order = canvas order base
+    expect(typeof dec.since).toBe('string')  // bundle since = event-since base(canvas-scoped seq,catch-up 用)
+    // ★ submitChange 抽 wire base:edit nb1→nb1 record base(非 nb2);edit nb2→nb2;delete nb1→nb1 record base;reorder→order base(非 record)
+    expect(h.extractWireBase(bundle, 'edit', 'nb1')!).toEqual(bN1)
+    expect(h.extractWireBase(bundle, 'edit', 'nb2')!).toEqual(bN2)
+    expect(h.extractWireBase(bundle, 'edit', 'nb1')!).not.toEqual(bN2)  // ★ nb1 token 不串用到 nb2
+    expect(h.extractWireBase(bundle, 'delete', 'nb1')!).toEqual(bN1)  // ★ delete 取 record base
+    expect(h.extractWireBase(bundle, 'reorder', undefined)!).toEqual(h.snapshotOrder())  // ★ reorder 取 order base(非 record base)
+    expect(h.extractWireBase(bundle, 'reorder', undefined)!).not.toEqual(bN1)  // ★ 非 record base
+    expect(h.extractWireBase(bundle, 'edit', 'nb-missing')).toBeNull()  // ★ bundle 无该 record → null(不串用别的 record base)
+    // ★ accepted edit → bundle reissued(新 bundle 的 nb1 entry 更新;nb2 不变;不重建 nb2 base)
+    h.edit('nb1', { fieldPath: ['title'], value: 'B1-v2' }, h.snapshot('nb1')!, 'carol')  // bump nb1 rev/fc
+    const bundle2 = h.snapshotBundle()
+    const dec2 = h.extractBundle(bundle2)!
+    expect(dec2.records.nb1).not.toEqual(bN1)  // ★ nb1 entry 更新(rev bumped;accepted 后 bundle 内对应项更新)
+    expect(dec2.records.nb2).toEqual(bN2)  // ★ nb2 不变(只更新 change 命中的 record 对应项)
+    // ★ 跨 canvas bundle 重放 → scope-mismatch → null(防 c1 bundle 用于 c2;bundle canvas-scoped)
+    const hB = new BaseDrivenHarness('c2'); hB.create('nb1')
+    expect(hB.extractBundle(bundle)).toBeNull()  // c1 bundle → c2 scope mismatch → null
     // 冻结矩阵(决策 §14.1 引用):edit 同-field stale 200+overwritten(永非 409);不同字段 stale 200 无 overwritten;delete/reorder fresh→200, stale→409;create dup→409;malformed/scope-mismatch→400
     type OpClass = 'edit-same-field-stale' | 'edit-diff-field-stale' | 'edit-fresh' | 'delete-fresh' | 'delete-stale' | 'reorder-fresh' | 'reorder-stale' | 'create-dup' | 'malformed' | 'scope-mismatch'
     const MATRIX: Record<OpClass, { status: number; outcome: 'accepted' | 'conflict' | 'rejected' }> = {
@@ -2087,7 +2176,7 @@ describe('N2-0 返修 §10 G1-b 衔接(P2-8): FieldPath 非空 + 数组中性 in
 //   snapshot materialize 旧 shape body(非 delta 反演),delta-inversion 显式标注无算法/不支持(降级到已测范围)。
 // 决策文档 §1.2 状态表 + 冻结命令同步(见 docs/decisions/n20-truth-source-decision.md §1.2)。
 
-describe('N2-0 v7 cutover contract harness(Blocker 3 补全:LegacyReplaceRequest 绑 canvasId+nodeId+baseRevision;scope 校验;stale base→409 terminal conflict dead-letter 非盲 replace;真实 authz+deny 负例;retirement 双可达指标)', () => {
+describe('N2-0 v8 cutover contract harness(Blocker 3 补全:LegacyReplaceRequest 绑 canvasId+nodeId+baseRevision;scope 校验;stale base→409 terminal conflict dead-letter 非盲 replace;v8 delete-race missing+baseRev>0→409;真实 authz+deny 负例;v8 retirement fake-clock quiet-window)', () => {
   // v7 Blocker 3 补全(v6 仅 wire 未补全 stale/authz/retirement):
   //   ① 信封绑 canvasId+nodeId+version+payload+原队列 baseRevision;decoder 校验 path canvas/node scope(防同 nodeId 跨 canvas 重放)。
   //   ② 【lead 拍板】stale base(baseRevision≠current rev,record 已有更新版本)→409 显式 terminal conflict,不落盲 replace(队列残留是离线期改动,覆盖是数据破坏;409 后 queue 项走 FX-5 dead-letter,用户可见)。
@@ -2138,6 +2227,11 @@ describe('N2-0 v7 cutover contract harness(Blocker 3 补全:LegacyReplaceRequest
     private envelopeIncrementInWindow = 0  // ★ retirement gauge 2:观察窗内 envelope 增量
     private members = new Set<string>()  // ★ authz:canvas-write seam
     private recs = new Map<string, NodeRecord>()
+    // ★ v8 Blocker 3② retirement fake-clock quiet-window:冻结配置名 LEGACY_DRAIN_QUIET_WINDOW_MS + 绝对时长 + 时间戳/重置语义。
+    //   窗口内任一 envelope 到达即重新计时(windowStartAt=now);只有完整连续窗口 delta=0 且 pending gauge=0 才 retire。
+    static readonly LEGACY_DRAIN_QUIET_WINDOW_MS = 60_000  // ★ 冻结配置名 + 绝对时长(quiet-window)
+    private now = 0  // fake clock
+    private windowStartAt = 0  // ★ 当前 quiet 窗口起点(envelope 到达即重置;窗口完整 = now-windowStartAt>=quietWindowMs 且期间无到达)
     setFlag(on: boolean) { this.flag = on }
     setLegacyDrain(on: boolean) { this.legacyDrain = on }
     addMember(actor: string) { this.members.add(actor) }
@@ -2146,9 +2240,25 @@ describe('N2-0 v7 cutover contract harness(Blocker 3 补全:LegacyReplaceRequest
     pendingLegacyQueueGauge() { return this.pendingLegacyQueue }
     envelopeIncrementInWindowGauge() { return this.envelopeIncrementInWindow }
     enqueueLegacy(n = 1) { this.pendingLegacyQueue += n }  // 模拟队列项入队
-    tickObservationWindow() { this.envelopeIncrementInWindow = 0 }  // 观察窗重置
-    /** ★ retirement 可达指标:pending queue=0 + 观察窗 envelope 增量=0(drainCount 只作总量)。 */
-    canRetire() { return this.pendingLegacyQueue === 0 && this.envelopeIncrementInWindow === 0 }
+    setClock(t: number) { this.now = t }  // ★ v8 fake clock 推进(retirement quiet-window 测试用)
+    advanceClock(dt: number) { this.now += dt }  // ★ v8 fake clock 步进
+    /** ★ v8 quiet-window:任一 envelope 到达(经 authz+gate+scope)→ 重新计时(windowStartAt=now;envelope 增量 +1)。 */
+    private touchWindow() { this.windowStartAt = this.now; this.envelopeIncrementInWindow += 1 }
+    /** ★ v8 tickObservationWindow:推进 fake clock 判定;只有完整连续 quiet 窗口(elapsed>=quietWindowMs,期间无 envelope 到达——
+     *   任一到达会重置 windowStartAt 使窗口不完整)才归零 envelopeIncrement(delta=0)并返 true;窗口未完整返 false(不归零)。 */
+    tickObservationWindow(): boolean {
+      if (this.now - this.windowStartAt >= CutoverHarness.LEGACY_DRAIN_QUIET_WINDOW_MS) {
+        this.envelopeIncrementInWindow = 0  // ★ 完整连续窗口 delta=0 归零
+        return true
+      }
+      return false
+    }
+    /** ★ v8 retirement 可达指标:pending gauge=0 + 完整连续窗口 delta=0(envelopeIncrement===0 + elapsed>=quietWindowMs);drainCount 只作总量(非条件)。 */
+    canRetire(): boolean {
+      return this.pendingLegacyQueue === 0
+        && this.envelopeIncrementInWindow === 0
+        && (this.now - this.windowStartAt) >= CutoverHarness.LEGACY_DRAIN_QUIET_WINDOW_MS
+    }
     seedRecord(n: NodeRecord) { this.recs.set(n.id, structuredClone(n)) }
     recordRev(nodeId: string): number { return this.recs.get(nodeId)?.revision ?? 0 }
     recordExists(nodeId: string): boolean { return this.recs.has(nodeId) }
@@ -2168,15 +2278,22 @@ describe('N2-0 v7 cutover contract harness(Blocker 3 补全:LegacyReplaceRequest
           const env = body as LegacyReplaceRequest
           // ① scope 校验:env.canvasId+env.nodeId 必须匹配 path canvas+node(防同 nodeId 跨 canvas 重放)
           if (env.canvasId !== this.canvasId || env.nodeId !== nodeId) return { status: 400, body: { error: 'payload-rejected' } }  // ★ scope mismatch → 400
+          // ★ v8 quiet-window:任一 envelope 到达(经 authz+gate+scope)→ 重新计时窗口(envelope 增量 +1;windowStartAt=now;retirement 须重等完整窗口)
+          this.touchWindow()
           // ② 【lead 拍板】stale base 策略:record 已有更新版本(env.baseRevision≠current rev)→409 terminal conflict,不落盲 replace(数据破坏);dead-letter
           const existing = this.recs.get(nodeId)
           if (existing && env.baseRevision !== existing.revision) {
             this.pendingLegacyQueue = Math.max(0, this.pendingLegacyQueue - 1)  // ★ queue 项 dead-lettered(用户可见)
             return { status: 409, body: { error: 'legacy-stale-conflict', revision: existing.revision } }  // ★ terminal conflict,不盲 replace
           }
-          // fresh(baseRevision===current rev,或 record 不存在=create)→200 replace
+          // ★ v8 Blocker 3① delete race:record missing + baseRevision>0 → record 已在入队后被删,盲 create = 复活已删 record(数据破坏)→ 409 terminal conflict dead-letter(非盲 create)
+          if (!existing && env.baseRevision > 0) {
+            this.pendingLegacyQueue = Math.max(0, this.pendingLegacyQueue - 1)  // ★ dead-lettered(用户可见)
+            return { status: 409, body: { error: 'legacy-stale-conflict', revision: 0 } }  // ★ terminal conflict,不盲 create 复活已删 record
+          }
+          // fresh(baseRevision===current rev,或 record 不存在且 baseRevision===0=new record)→200 replace
           this.applyLegacyReplace(nodeId, env.payload)
-          this.drainCount += 1; this.envelopeIncrementInWindow += 1; this.pendingLegacyQueue = Math.max(0, this.pendingLegacyQueue - 1)
+          this.drainCount += 1; this.pendingLegacyQueue = Math.max(0, this.pendingLegacyQueue - 1)  // ★ envelope 增量已由 touchWindow 计(不重复)
           return { status: 200, body: { id: nodeId, revision: this.recs.get(nodeId)!.revision, seq: this.recs.get(nodeId)!.revision } }
         }
         if (!isDomainOp) return { status: 400, body: { error: 'payload-rejected' } }  // raw 旧 body(无 kind)→ 400(必须包信封)
@@ -2221,7 +2338,7 @@ describe('N2-0 v7 cutover contract harness(Blocker 3 补全:LegacyReplaceRequest
     expect(h.patch('n1', newOp).status).toBe(200)
   })
 
-  it('C-2 FX-5 migration wire v7 补全(LegacyReplaceRequest 绑 canvasId+baseRevision;scope+authz+stale-base 409 dead-letter+retirement 双指标;raw→400, envelope→200 replace 非直调)', () => {
+  it('C-2 FX-5 migration wire v8 补全(LegacyReplaceRequest 绑 canvasId+baseRevision;scope+authz+stale-base 409 dead-letter+v8 delete-race missing+baseRev>0→409 非盲 create 复活+v8 retirement fake-clock quiet-window;raw→400, envelope→200 replace 非直调)', () => {
     const h = new CutoverHarness('c1')
     h.setFlag(true); h.setLegacyDrain(true); h.addMember('alice'); h.addMember('bob')  // authz:canvas-write seam
     expect(_noIdInPayload).toBe(false)
@@ -2279,6 +2396,29 @@ describe('N2-0 v7 cutover contract harness(Blocker 3 补全:LegacyReplaceRequest
       expect(h.get('n-stale')?.title).toBe('v2')  // ★ 不落盲 replace(record 仍 server 版本,非 queued-stale;数据破坏防)
       expect(h.pendingLegacyQueueGauge()).toBe(0)  // ★ dead-letter(queue 项移除,用户可见)
     }
+    // ★ ⑥b v8 Blocker 3① delete race:record 已删(missing)+ baseRevision>0 → 409 terminal conflict dead-letter(不盲 create 复活已删 record);missing + baseRevision===0 → create fresh
+    h.seedRecord(makeNode('n-delrace', { title: 'will-delete' }))  // record rev=0
+    h.patch('n-delrace', { kind: 'set', fieldPath: ['title'], value: 'v1' })  // DomainOp bump rev 0→1(不经 legacy envelope,不 touchWindow)
+    h.patch('n-delrace', { kind: 'set', fieldPath: ['title'], value: 'v2' })  // rev 1→2
+    expect(h.recordRev('n-delrace')).toBe(2)
+    h.applyDelete({ kind: 'node-delete-cascade', canvasId: 'c1', nodeId: 'n-delrace' })  // ★ record 删(missing;模拟入队后、drain 前被删)
+    expect(h.recordExists('n-delrace')).toBe(false)
+    h.enqueueLegacy(1)  // stale queue item:baseRevision=2(record 删前 rev)
+    const mDelRace = migrateWriteOp({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n-delrace', payload: nodePayload({ title: 'revive' }), baseRevision: 2 })
+    if (mDelRace.kind === 'legacy-envelope') {
+      const res = h.patch(mDelRace.envelope.nodeId, mDelRace.envelope, { actor: 'alice' })
+      expect(res.status).toBe(409); expect(res.body.error).toBe('legacy-stale-conflict')  // ★ missing + baseRevision>0 → 409 terminal conflict(不盲 create 复活)
+      expect(res.body.revision).toBe(0)  // record 已删,返 0(非盲 create 的 rev)
+      expect(h.recordExists('n-delrace')).toBe(false)  // ★ 不复活(数据破坏防;stale queue 不盲 create 已删 record)
+      expect(h.pendingLegacyQueueGauge()).toBe(0)  // dead-letter(queue 项移除)
+    }
+    // ★ 对照:missing + baseRevision===0 → create fresh(新 record,非 stale queue 复活;与 ② n-up 同型)
+    h.enqueueLegacy(1)
+    const mNewRace = migrateWriteOp({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n-brandnew', payload: nodePayload({ title: 'new' }), baseRevision: 0 })
+    if (mNewRace.kind === 'legacy-envelope') {
+      expect(h.patch(mNewRace.envelope.nodeId, mNewRace.envelope, { actor: 'alice' }).status).toBe(200)  // ★ missing + baseRevision===0 → create fresh
+      expect(h.recordExists('n-brandnew')).toBe(true)
+    }
     // ★ ⑦ fresh base(baseRevision===current rev)→ 200 replace
     const freshBase = h.recordRev('n-stale')  // 2
     const mFresh = migrateWriteOp({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n-stale', payload: nodePayload({ title: 'fresh-replace' }), baseRevision: freshBase })
@@ -2286,12 +2426,30 @@ describe('N2-0 v7 cutover contract harness(Blocker 3 补全:LegacyReplaceRequest
       expect(h.patch(mFresh.envelope.nodeId, mFresh.envelope, { actor: 'alice' }).status).toBe(200)  // ★ fresh base → 200 replace
       expect(h.get('n-stale')?.title).toBe('fresh-replace')
     }
-    // ★ ⑧ retirement 双可达指标:pending queue=0 + 观察窗 envelope 增量=0 → canRetire;drainCount 只作总量
-    h.tickObservationWindow()  // 观察窗重置(envelope 增量→0)
-    expect(h.pendingLegacyQueueGauge()).toBe(0)
-    expect(h.envelopeIncrementInWindowGauge()).toBe(0)
-    expect(h.canRetire()).toBe(true)  // ★ 双指标归零 → 可 retirement
+    // ★ ⑧ v8 retirement fake-clock quiet-window(冻结配置名 LEGACY_DRAIN_QUIET_WINDOW_MS + 绝对时长 + 时间戳/重置语义;
+    //   窗口内任一 envelope 到达即重新计时;只有完整连续窗口 delta=0 + pending gauge=0 才 retire)
+    expect(h.pendingLegacyQueueGauge()).toBe(0)  // queue drained(②/⑥/⑥b/⑦ drain 完)
+    expect(h.envelopeIncrementInWindowGauge()).toBeGreaterThan(0)  // ②/⑥b/⑦ envelope 到达过(delta>0)
+    expect(h.canRetire()).toBe(false)  // ★ delta>0(刚有 envelope 活动)→ 不 retire
+    h.advanceClock(CutoverHarness.LEGACY_DRAIN_QUIET_WINDOW_MS - 1)  // 推进到完整 quiet 窗口边界前 1ms
+    expect(h.canRetire()).toBe(false)  // ★ 窗口未完整(elapsed < quietWindowMs)→ 不 retire
+    expect(h.tickObservationWindow()).toBe(false)  // ★ 窗口未完整 → 不归零 delta(返 false)
+    expect(h.envelopeIncrementInWindowGauge()).toBeGreaterThan(0)  // delta 仍 >0
+    h.advanceClock(1)  // 推过完整 quiet 窗口边界
+    expect(h.tickObservationWindow()).toBe(true)  // ★ 完整连续 quiet 窗口(delta=0,期间无 envelope 到达)→ 归零 envelopeIncrement(返 true)
+    expect(h.envelopeIncrementInWindowGauge()).toBe(0)  // ★ delta=0(完整窗口归零)
+    expect(h.canRetire()).toBe(true)  // ★ 完整窗口 delta=0 + pending=0 → 可 retire
     expect(h.drainCountValue()).toBeGreaterThan(0)  // drainCount 累计总量(非 retirement 条件)
+    // ★ v8 mid-window envelope 到达 → 重新计时(须再等完整 quiet 窗口才可 retire;防"刚 retire 又来 envelope"误判)
+    const mMid = migrateWriteOp({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n-mid', payload: nodePayload({ title: 'mid' }), baseRevision: 0 })
+    if (mMid.kind === 'legacy-envelope') {
+      expect(h.patch(mMid.envelope.nodeId, mMid.envelope, { actor: 'alice' }).status).toBe(200)  // fresh envelope 到达 → touchWindow 重新计时
+    }
+    expect(h.envelopeIncrementInWindowGauge()).toBeGreaterThan(0)  // ★ envelope 到达 → delta>0
+    expect(h.canRetire()).toBe(false)  // ★ 窗口被重新计时(windowStartAt=now,elapsed 归零)→ 不 retire(须再等完整窗口)
+    h.advanceClock(CutoverHarness.LEGACY_DRAIN_QUIET_WINDOW_MS)  // 再推过完整 quiet 窗口
+    expect(h.tickObservationWindow()).toBe(true)  // 完整窗口 → 归零 delta
+    expect(h.canRetire()).toBe(true)  // ★ 再等完整窗口后 → 可 retire(连续窗口 delta=0 + pending=0)
     // ★ ⑨ LEGACY_DRAIN gate 关(retirement 后)→ envelope→400(兼容通道关闭)
     h.setLegacyDrain(false)
     const mGate = migrateWriteOp({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n-gate', payload: nodePayload({ title: 'after-retire' }), baseRevision: 0 })
