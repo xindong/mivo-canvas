@@ -115,6 +115,22 @@ function createSpikeSseApp() {
     })
     return new Response(stream, { headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', 'connection': 'keep-alive' } })
   })
+  // ★ v5 Blocker 4:finite short-poll mode(GET /api/canvas/:id/events/poll?since=)—— SSE 降级时的真 fallback(非 SSE 流)。
+  //   响应服务端自然结束(非长流);content-type=application/json(非 SSE);只含 seq>since 条目;返 nextSince 供下次 poll。
+  //   永不关闭的 SSE 流读两帧 cancel 不算 poll(本 route 返 finite JSON,客户端读毕自然结束)。
+  app.get('/api/canvas/:id/events/poll', (c) => {
+    const actor = resolveActor(c)
+    const memberRole = resolveMemberRole(actor)
+    const info: AuthzInfo = { actor, ownerId: state.canvasOwner, memberRole }
+    if (canAccessCanvas(info, 'read') === 'deny') {
+      const status = denyStatus(info)
+      const body = status === 403 ? { error: 'forbidden' } : { error: 'unknown-canvas' }
+      return c.json(body, status as 403 | 404)
+    }
+    const since = Number(c.req.query('since') ?? 0)
+    const events = state.events.filter((e) => e.seq > since)
+    return c.json({ events, nextSince: state.seq }, 200, { 'content-type': 'application/json', 'cache-control': 'no-cache' })
+  })
   // ★ R5 F3:真实 authz seam WRITE route(PATCH /api/canvas/:id/nodes/:nodeId)— 与 GET events route 同 seam
   //   (resolveActor + canAccessCanvas('write') + denyStatus)。撤权后 bob write → 404 no-leak(non-member)/403(member 越权);
   //   owner write → 200。原 SSE harness 只 GET(5-4 断流),无 write route;G7-hard-3 是另一套自建 FieldLevelServer
@@ -458,43 +474,25 @@ describe('N2-0 v4 Gate5 网关失败树(Blocker 5:first-frame/continuous latency
     // ★ header 注入/strip 阈值:网关未注入 trusted header → fail-closed(非静默放行);SSE 不建流(deny 在建流前)
   })
 
-  it('5-12 short-poll ?since=seq fallback(SSE 降级时的 fallback;plain HTTP GET 返回当前 backlog,无长流;延迟 SLO)', async () => {
-    // ★ 失败树 fallback = ?since=seq short-poll(非 "SSE fallback" 循环):客户端 GET ?since=seq,
-    //   读当前可用事件(seq>since)后关闭(不持长流),周期性 poll。plain HTTP,无 SSE 长流依赖。
+  it('5-12 finite short-poll fallback(v5 Blocker 4:GET /events/poll?since= 返 JSON,服务端自然结束,非 SSE 流;500ms SLO)', async () => {
+    // ★ v5:finite poll 真模式(非永不关闭的 SSE 流读两帧 cancel)。GET /events/poll?since= → JSON {events,nextSince},
+    //   content-type=application/json(非 SSE),只含 seq>since 条目,服务端自然结束(非长流)。500ms SLO。
     harness.state.members.add('alice')
     harness.pushEvent({ recordId: 'n1', op: { fieldPath: ['title'], value: 'e1' } })
     harness.pushEvent({ recordId: 'n1', op: { fieldPath: ['title'], value: 'e2' } })
     harness.pushEvent({ recordId: 'n1', op: { fieldPath: ['title'], value: 'e3' } })
     const start = Date.now()
-    // short-poll:GET ?since=1 → 读 seq>1 事件(seq 2,3),读毕关闭(非长流订阅)
-    const res = await harness.app.request('/api/canvas/c1/events?since=1', { headers: { 'x-mivo-auth-user': 'alice', 'x-mivo-gateway-secret': harness.GATEWAY_SECRET } })
-    expect(res.status).toBe(200)
-    // 读 2 个 data 帧(seq 2,3)后关闭 — short-poll 语义(读当前 backlog,不持流)
-    const reader = res.body!.getReader()
-    const decoder = new TextDecoder()
-    const seqs: number[] = []
-    let buf = ''
-    const pollStart = Date.now()
-    try {
-      while (Date.now() - pollStart < 600 && seqs.length < 2) {
-        const { value, done } = await reader.read()
-        if (done) break
-        buf += decoder.decode(value, { stream: true })
-        let idx: number
-        while ((idx = buf.indexOf('\n\n')) >= 0) {
-          const frame = buf.slice(0, idx)
-          buf = buf.slice(idx + 2)
-          if (frame.startsWith('data: ')) {
-            const evt = JSON.parse(frame.slice('data: '.length)) as SseEvent
-            seqs.push(evt.seq)
-          }
-        }
-      }
-    } finally { await reader.cancel().catch(() => {}) }
+    // ★ finite poll:GET /events/poll?since=1 → JSON body(seq>1),服务端自然结束(非 SSE 长流 cancel)
+    const res = await harness.app.request('/api/canvas/c1/events/poll?since=1', { headers: { 'x-mivo-auth-user': 'alice', 'x-mivo-gateway-secret': harness.GATEWAY_SECRET } })
     const latencyMs = Date.now() - start
-    expect(seqs).toEqual([2, 3])                                       // ★ short-poll 返回 seq>1 事件
-    expect(latencyMs).toBeLessThan(GATE5_FAILURE_TREE.shortPollSloMs)   // ★ short-poll 延迟 < SLO
-    expect(GATE5_FAILURE_TREE.fallback).toBe('since-seq-short-poll')    // ★ 非 "SSE fallback"(循环);fallback = ?since=seq
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-type')).toContain('application/json')  // ★ 非 SSE(text/event-stream)
+    const body = await res.json() as { events: SseEvent[]; nextSince: number }  // ★ res.json() resolve = finite 响应(永不关闭的 SSE 流不会产出完整 JSON)
+    expect(Array.isArray(body.events)).toBe(true)         // ★ finite JSON(非 SSE 长流);body 完整读毕
+    expect(body.events.map((e) => e.seq)).toEqual([2, 3])  // ★ 只含 seq>1 条目
+    expect(body.nextSince).toBe(3)                          // ★ 返 nextSince 供下次 poll
+    expect(latencyMs).toBeLessThan(GATE5_FAILURE_TREE.shortPollSloMs)  // ★ 500ms SLO
+    // ★ v5 验收:finite poll 真模式(JSON + 服务端自然结束 + 非 SSE);非"永不关闭 SSE 流读两帧 cancel"。
   })
 
   it('5-13 失败树步骤冻结(SSE 降级 → 调 proxy → short-poll fallback OR N2-2 blocked;非 SSE-fallback 循环)', () => {

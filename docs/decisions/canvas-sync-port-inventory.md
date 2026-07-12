@@ -523,34 +523,37 @@ port 的中性设计保证 N2-0 任一决议后,G1-c 只需落一个 adapter,另
 
 ---
 
-## 11. v4 决议收口(对齐 N2-0 §14;sol 第三轮 6 阻断交叉影响)
+## 11. v5 决议收口(对齐 N2-0 §14;sol 第四轮 4 阻断交叉影响)
 
-> N2-0 v4 决议(§14)对 port 契约的交叉影响 + 两文档同规则对齐。
+> N2-0 v5 决议(§14)对 port 契约的交叉影响 + 两文档同规则对齐。v5 教训:测试绿但没证明文字声称的语义 → 每条修复让测试真跑该语义。
 
-### 11.1 Blocker 2 — container 整替换白名单(两文档同规则,提案供再审)
+### 11.1 Blocker 2 — container 白名单取消(lead 裁定 rejected;A2 leaf-level set)
 
-- **统一规则**:container set 一般禁止(G1-b port `validateFieldIntent` 拒 `non-atomic-parent-set`);**显式原子容器白名单 `['transform', 'relations']` 允许整替换**(原子容器 = 整对象作单位,非逐字段 merge)。
-- **N2-0 侧**:DomainOp `set ['transform'] = {x,y}` 允许(白名单);server `validateChildPayload` 用 `RecordKindSchema` classifier 判 container + 查白名单放行。
-- **port 侧(G1-b)**:当前 `validateFieldIntent` 拒所有 container set(R4,无白名单);**v4 提案**:classifier 返回 `'atomic-container'`(白名单 transform/relations)时放行 set 整对象。**这是 A2 实装时的 port validator 演进项,提案供 lead 再审**(本 freeze 不改 validator 行为,保 `@ts-expect-error`=7 + seam reject 现状;spike `ATOMIC_CONTAINER_WHITELIST` + S10-14 已演示提案方向)。
-- **不许两套并存**:N2-0 决议 §10.1 + 本 inventory §1 同规则(transform/relations 白名单),见 `src/kernel/__spike__/n20-truth-source.spike.test.ts` `ATOMIC_CONTAINER_WHITELIST` + S10-14。
+- **【lead 裁定】container 白名单 `['transform','relations']` 取消(rejected)**:A2 维持**叶子级 set**(transform/relations 整对象 set 仍拒,须分解 transform.x/relations.parentIds 叶子 set)。理由:transform/relations 内部字段有独立并发语义,整对象 LWW 会吞 sibling 更新;未来要原子容器需逐 kind atomic schema + 双 actor sibling-write 不丢测试再提。
+- **两文档同规则(无白名单)**:N2-0 §10.1 + 本 inventory §1 一致——container set 一般禁止(port `validateFieldIntent` 拒 `non-atomic-parent-set`,R4);**无 `'atomic-container'`**(FieldTarget = 'leaf'|'container'|'array-element',无 atomic-container)。spike 删 `ATOMIC_CONTAINER_WHITELIST`(S10-2/S10-14/S10-3 已对齐 v5)。
+- **port 侧**:本 freeze 不改 validator 行为(保 `@ts-expect-error`=7 + seam reject 现状);A2 实装时 port validator 维持 leaf-level(container set 拒,不发明白名单)。
 
-### 11.2 Blocker 6 — 两文档交叉契约(port CanvasChange ↔ N20 CreateBody/DomainOp 无损映射)
+### 11.2 Blocker 2 — by-id 数组 A2 deferred(DomainOp 不含 by-id;fail-visible,禁降级整数组 LWW)
 
-- **交叉契约测试**:`src/kernel/__spike__/n20-truth-source.spike.test.ts` X-1~X-4(import port `CanvasChange`/`FieldIntent` ↔ N20 `CreateBody`/`DomainOp`/`ServerInvariantCommand`):
-  - X-1 `create-node`(NodeRecord 含 id)→ N20 `CreateBody`(payload=NodePayload 无 id;id → adapter path;Blocker 2 client-id)
-  - X-2 `edit-node` FieldIntent[] → N20 DomainOp set/unset[](fieldPath + value 透传无损)
-  - X-3 `delete-node` → N20 `ServerInvariantCommand` node-delete-cascade(Blocker 3 server-named)
-  - X-4 `reorder-children` → N20 DomainOp reorder(orderedIds 透传)
-- **两文档形状一致**:port CanvasChange 与 N20 wire 无损可映射,adapter 翻译零丢失。
+- **by-id A2 deferred**:fills/strokes/effects/experimentalAnchors 的 by-id 结构编辑 A2 不支持(DomainOp 不含 by-id variant);**fail-visible**(若提交 by-id → reject);**禁止降级整数组 LWW**(whole-lww 会吞并发 array 元素)。whole-lww(markupPoints)+ primitive(resultNodeIds)A2 supported。
+- **migration 不绕 by-id defer**:旧 payload 的 fills 等 by-id 字段,migration 走 legacy 全量 record 兼容通道(不发明 by-id/whole-lww DomainOp;见 N2-0 §14.3/C-2)。
+- 见 `src/kernel/__spike__/n20-truth-source.spike.test.ts` S10-3/S10-14(DomainOp 无 by-id `@ts-expect-error` + inventory)。
 
-### 11.3 Blocker 6 — 网关条件式对齐(§5 item 5 已纠)
+### 11.3 Blocker 6 — 两文档交叉契约(port CanvasChange ↔ N20 CreateBody/DomainOp 无损映射,保持)
 
-- §5 item 5 "网关必透传" → "网关应透传(条件式,非必透传;生产可能缓冲/超时 → N2-0 §14.5 失败树 + short-poll fallback)"。与 N2-0 §2 Gate5 + §14.5 一致。
+- **交叉契约测试**:X-1~X-4(create-node→CreateBody+path id / edit-node FieldIntent[]→DomainOp set/unset[] / delete-node→ServerInvariantCommand / reorder-children→DomainOp reorder)。两文档形状一致,adapter 翻译零丢失。
 
-### 11.4 Blocker 2 — create client-id 对齐(canvasSyncPort create-node 已携 id)
+### 11.4 Blocker 6 — 网关条件式对齐 + finite short-poll(§5 item 5 已纠 + v5 Blocker 4)
 
-- port `CanvasChange.create-node` 携 `NodeRecord`(含 id);N2-0 v4 `CreateBody` id = client `NodeRecord.id`(废除 server-mint)。两文档一致:create id 来自 client(adapter 提取进 path),非 server-mint。见 X-1 交叉契约。
+- §5 item 5 "网关必透传" → "网关应透传(条件式;生产可能缓冲/超时 → N2-0 §14.4 失败树 + finite short-poll)"。与 N2-0 §2 Gate5 + §14.4 一致。
+- **finite short-poll 真模式(v5 Blocker 4)**:GET /events/poll?since= 返 JSON 服务端自然结束(非 SSE 流);fallback = finite short-poll(非 "SSE fallback" 循环)。见 N2-0 §14.4 + SSE spike 5-12。
 
-### 11.5 Blocker 2 — 对齐 G1-b R4(决议原写 R2 已纠)
+### 11.5 Blocker 2 — create client-id 对齐 + base.cursor opaque(canvasSyncPort SnapshotCursor 同规则)
+
+- port `CanvasChange.create-node` 携 `NodeRecord`(含 id);N2-0 v5 `CreateBody` id = client `NodeRecord.id`(废除 server-mint)。两文档一致:create id 来自 client(adapter 提取进 path)。
+- **base = opaque**:`SnapshotCursor` 对业务层 opaque(branded unknown),codec 只在 adapter;N2-0 `BaseCursor` 同规则(string codec + 签名,业务层 opaque)。见 X-1 + N2-0 §14.1。
+
+### 11.6 Blocker 2 — 对齐 G1-b R4(决议原写 R2 已纠)
 
 - N2-0 §13 改 "G1-b R2" → "G1-b R4"(冻结源已到 R4:classifier 必填 + structural 拆分 + async submitChange caller-owned retry/rebase 状态机)。port 当前态 = R4(§10 已述),两文档对齐 R4。
+
