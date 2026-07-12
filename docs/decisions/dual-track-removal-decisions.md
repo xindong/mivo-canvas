@@ -271,15 +271,16 @@ CREATE INDEX mode_hits_track_mode_ts ON mode_hits (track, mode, ts);
 
 1. **生产 `?renderer=dom` 30 天命中 = 0**
    ```bash
-   psql "$DATABASE_URL" -c "SELECT count(*) FROM mode_hits WHERE track='renderer' AND mode='dom' AND ts > now()-interval '30 days'"
+   psql "$DATABASE_URL" -tA -c "SELECT count(*) FROM mode_hits WHERE track='renderer' AND mode='dom' AND ts > now()-interval '30 days'" | { read -r n; [ "$n" = "0" ]; }
    ```
-   样例（green）：`0`（fixture dry-run PG16：40 天前旧命中被 30 天窗排除，30 天内计数=0）。
+   样例（green）：`0`（rc=0；fixture dry-run PG16：40 天前旧命中被 30 天窗排除，30 天内计数=0）。
+   断言（r7b 改 Greptile F1）：原 `psql -c "SELECT count(*)"` 只打印 count、rc 恒 0——30 天内若有 `?renderer=dom` 命中也过（观测缺失假绿）。改 `-tA` 取净值 + `{ read -r n; [ "$n" = "0" ]; }` 显式断言：count=0 rc=0 绿；count≥1 rc=1 红；psql 连接失败/输出空（n 空）rc=1 红（观测缺失即红）。dry-run 正例 `echo 0 | { read -r n; [ "$n" = "0" ]; }`→rc=0 绿；负例 `echo 3 | { read -r n; [ "$n" = "0" ]; }`→rc=1（有 dom 流量）；负例 `printf '' | { read -r n; [ "$n" = "0" ]; }`→rc=1（psql 失败/观测缺失）；负例 `echo "ERROR: conn refused" | { read -r n; [ "$n" = "0" ]; }`→rc=1（非整数垃圾）。
 
 2. **生产 `?renderer=pixi` 工装外 30 天命中 = 0**（完整命令，非 WHERE 片段）
    ```bash
-   psql "$DATABASE_URL" -c "SELECT count(*) FROM mode_hits WHERE track='renderer' AND mode='pixi' AND ts > now()-interval '30 days'"
+   psql "$DATABASE_URL" -tA -c "SELECT count(*) FROM mode_hits WHERE track='renderer' AND mode='pixi' AND ts > now()-interval '30 days'" | { read -r n; [ "$n" = "0" ]; }
    ```
-   样例（green）：`0`。
+   样例（green）：`0`（rc=0）。断言同指标 1（r7b F1）：`-tA`+`[ "$n" = "0" ]`，count≥1 红、psql 失败/输出空红（观测缺失即红）。
 
 3. **e2e `--renderer=both` 最近 20 merged PR 连续绿**（目标 context 过滤 + 连续性断言，非 `grep -c success` 笼统计）
    ```bash
