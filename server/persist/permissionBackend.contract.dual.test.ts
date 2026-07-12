@@ -24,6 +24,7 @@ const runPermissionBackendContractSuite = (
   resetBackend: (b: PermissionBackend) => void | Promise<void>,
   seedProject: (b: PermissionBackend, projectId: string, ownerId: string) => void | Promise<void>,
   setLinkRevokedAt: (b: PermissionBackend, linkId: string, revokedAtIso: string) => boolean | Promise<boolean>,
+  setLinkCascadeRevokedAt: (b: PermissionBackend, linkId: string, iso: string) => boolean | Promise<boolean>,
   setCompensationFault: (b: PermissionBackend, op: CompensationOp, throwCount: number) => void,
 ): void => {
   describe(`${label} — 成员资格:角色派生 + CRUD + 反查`, () => {
@@ -205,24 +206,34 @@ const runPermissionBackendContractSuite = (
       expect(byId[l3.id]).toBeTruthy()
     })
 
-    it('unRevokeAllForProject:仅恢复 30 天窗内的 revoked;超期保持 revoked', async () => {
+    it('unRevokeAllForProject:仅恢复 30 天窗内 cascade 标记的;超期/手工 revoked 保持 revoked', async () => {
       const l1 = await b.createShareLink('p1', 'view', 'ownerA')
       const l2 = await b.createShareLink('p1', 'edit', 'ownerA')
       const l3 = await b.createShareLink('p1', 'view', 'ownerA')
-      await b.revokeShareLink(l1.id, 'p1') // 窗内(刚 revoke)
-      await b.revokeShareLink(l2.id, 'p1')
-      await b.revokeShareLink(l3.id, 'p1')
-      // l3 超 30 天
+      // 级联 revoke(project 软删级联 → 置 cascade_revoked_at marker;restore 补偿只动此标记非空的链接)
+      const { count: revokedCount } = await b.revokeAllForProject('p1')
+      expect(revokedCount).toBe(3)
+      // l3 的 cascade marker 超 30 天(对偶 helper 直改 marker 时间;窗判定走 cascade_revoked_at)
       const oldIso = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000).toISOString()
-      expect(await setLinkRevokedAt(b, l3.id, oldIso)).toBe(true)
+      expect(await setLinkCascadeRevokedAt(b, l3.id, oldIso)).toBe(true)
       const { count } = await b.unRevokeAllForProject('p1')
-      expect(count).toBe(2) // l1/l2 窗内恢复;l3 超期不恢复
+      expect(count).toBe(2) // l1/l2 窗内恢复;l3 超 30 天不恢复
       // l3 仍 revoked;l1/l2 活
       const links = await b.listShareLinks('p1')
       const byId = Object.fromEntries(links.map((l) => [l.id, l.revokedAt]))
       expect(byId[l1.id]).toBeNull()
       expect(byId[l2.id]).toBeNull()
       expect(byId[l3.id]).toBeTruthy() // 超 30 天,仍 revoked
+    })
+
+    it('unRevokeAllForProject:不动手工 revoke(cascade_revoked_at IS NULL 永不恢复,防误恢复)', async () => {
+      const l1 = await b.createShareLink('p1', 'view', 'ownerA')
+      // 手工 revoke(revokeShareLink):置 revoked_at,cascade_revoked_at 保持 null
+      await b.revokeShareLink(l1.id, 'p1')
+      const { count } = await b.unRevokeAllForProject('p1')
+      expect(count).toBe(0) // 手工 revoke 无 cascade marker → restore 补偿不动
+      const links = await b.listShareLinks('p1')
+      expect(links.find((l) => l.id === l1.id)!.revokedAt).toBeTruthy() // 仍 revoked
     })
   })
 
@@ -253,7 +264,7 @@ const runPermissionBackendContractSuite = (
 
     it('restore:record + attempt → completed(unRevoke 级联跑);意图 done,attemptCount=1,链接恢复 active', async () => {
       const link = await b.createShareLink('p1', 'view', 'ownerA')
-      await b.revokeShareLink(link.id, 'p1') // 模拟 project 曾软删(链接 revoked)
+      await b.revokeAllForProject('p1') // 模拟 project 曾软删(级联 revoke,置 cascade marker)
       expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('revoked')
       await b.recordCompensation('p1', 'restore')
       const r = await b.attemptCompensation('p1', 'restore')
@@ -269,7 +280,7 @@ const runPermissionBackendContractSuite = (
 
     it('restore:故障注入 unRevoke 抛错 → failed(意图 pending,链接仍 revoked);重试 → completed 收敛(无"永久 revoked"终态)', async () => {
       const link = await b.createShareLink('p1', 'view', 'ownerA')
-      await b.revokeShareLink(link.id, 'p1')
+      await b.revokeAllForProject('p1') // 级联 revoke(置 cascade marker)
       await b.recordCompensation('p1', 'restore')
       setCompensationFault(b, 'restore', 1) // 下次 attempt 的 step 强制失败 1 次(自减)
       const r1 = await b.attemptCompensation('p1', 'restore')
@@ -282,7 +293,7 @@ const runPermissionBackendContractSuite = (
       expect(ints[0].attemptCount).toBe(1)
       expect(ints[0].lastError).toBeTruthy()
       expect(ints[0].lastAttemptedAt).toBeTruthy()
-      // 幂等重入 attempt:故障已自减为 0 → step 跑通 → 收敛
+      // 幂等重入 attempt:故障已自减为 0 → step 跑通 → 收敛(据 cascade marker 恢复)
       const r2 = await b.attemptCompensation('p1', 'restore')
       expect(r2.kind).toBe('completed')
       if (r2.kind === 'completed') expect(r2.attempts).toBe(2)
@@ -324,6 +335,54 @@ const runPermissionBackendContractSuite = (
       expect(ints[0].op).toBe('delete') // 后建的 delete 排前(newest first)
       expect(ints[1].op).toBe('restore')
     })
+
+    it('P1-2 supersede:record delete 后,旧 pending restore 被 mark superseded(sweep/attempt 不再处理旧 restore)', async () => {
+      await b.recordCompensation('p1', 'restore') // gen1 pending restore
+      await b.recordCompensation('p1', 'delete') // gen2 pending delete + supersede restore
+      const ints = await b.listCompensations('p1')
+      const restore = ints.find((i) => i.op === 'restore')!
+      const del = ints.find((i) => i.op === 'delete')!
+      expect(restore.status).toBe('superseded')
+      expect(del.status).toBe('pending')
+      expect(del.generation).toBeGreaterThan(restore.generation)
+      // listPending 只返 pending(superseded 不进 pending 信号)
+      const pending = await b.listPendingCompensations('p1')
+      expect(pending).toHaveLength(1)
+      expect(pending[0].op).toBe('delete')
+    })
+
+    it('P2-1 并发 attempt:恰一个 claim,输家返 already-claimed(attemptCount 与真实 claim 一致)', async () => {
+      // 建 pending restore 意图 + cascade marker(让 attempt 有活可干且 await 点让出并发窗口)
+      const link = await b.createShareLink('p1', 'view', 'ownerA')
+      await b.revokeAllForProject('p1')
+      await b.recordCompensation('p1', 'restore')
+      const [a, b2] = await Promise.all([
+        b.attemptCompensation('p1', 'restore'),
+        b.attemptCompensation('p1', 'restore'),
+      ])
+      const outcomes = [a, b2].map((o) => o.kind).sort()
+      // 一个 completed(赢家 claim+跑通),一个 already-claimed(输家)
+      expect(outcomes).toEqual(['already-claimed', 'completed'])
+      const ints = await b.listCompensations('p1')
+      // attemptCount 与真实 claim 一致(输家不 bump)
+      expect(ints[0].attemptCount).toBe(1)
+      expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('active')
+    })
+
+    it('P1-2 sweep:制造 pending 后(零用户 attempt)→ sweepCompensations 自动 done 收敛', async () => {
+      const link = await b.createShareLink('p1', 'view', 'ownerA')
+      await b.revokeAllForProject('p1') // cascade marker
+      await b.recordCompensation('p1', 'restore') // pending,无人 attempt
+      expect((await b.listPendingCompensations('p1'))).toHaveLength(1)
+      const r = await b.sweepCompensations()
+      expect(r.processed).toBe(1)
+      expect(r.converged).toBe(1)
+      expect(r.failed).toBe(0)
+      expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('active')
+      const ints = await b.listCompensations('p1')
+      expect(ints[0].status).toBe('done')
+      expect(await b.listPendingCompensations('p1')).toHaveLength(0)
+    })
   })
 }
 
@@ -335,6 +394,7 @@ runPermissionBackendContractSuite(
   // memory 无 FK → seedProject no-op
   () => {},
   (b, id, iso) => (b as InMemoryPermissionBackend).__setLinkRevokedAtForTest(id, iso),
+  (b, id, iso) => (b as InMemoryPermissionBackend).__setLinkCascadeRevokedAtForTest(id, iso),
   (b, op, n) => (b as InMemoryPermissionBackend).__setCompensationFaultForTest(op, n),
 )
 
@@ -368,6 +428,7 @@ let pgPermBackend: PgPermissionBackend | undefined
     (b) => b.__reset(),
     (b, pid, owner) => (b as PgPermissionBackend).__seedProjectForTest(pid, owner),
     (b, id, iso) => (b as PgPermissionBackend).__setLinkRevokedAtForTest(id, iso),
+    (b, id, iso) => (b as PgPermissionBackend).__setLinkCascadeRevokedAtForTest(id, iso),
     (b, op, n) => (b as PgPermissionBackend).__setCompensationFaultForTest(op, n),
   )
 })

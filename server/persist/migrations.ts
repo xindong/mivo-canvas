@@ -119,26 +119,54 @@ DROP TABLE IF EXISTS share_links;
 DROP TABLE IF EXISTS project_members;
 `
 
-// P-6 saga 补偿意图表(share_link_compensations)。独立第三个 migration:已建库 001/002 已被 kysely_migration
-// 追踪表标记 applied,改既有 migration 不会重跑——必须新 migration 才能在已迁移 DB 建表。FK 同权限两表:
-// project_id → projects(id) ON DELETE CASCADE(project purge → 补偿意图清)。无 revision(owner 权威写,非 CRDT LWW)。
-// attempt_count/last_error/last_attempted_at 是"可观察状态"(saga 非黑盒,可查可调试)。
+// P-6 saga 补偿意图表(share_link_compensations)。migration key 排在 DP-6R chat 之后(字典序 005):
+// lead 拍板(2026-07-12 更新)——DP-6R 占 003_chat_per_user + 004_chat_order_revisions,本分支 005(key+registry
+// 同步),避免 Kysely 字典序 "share 先 chat 后"导致 migration 顺序冲突(share-先路径因改名后不存在,无需支持)。
+// FK 同权限两表:project_id → projects(id) ON DELETE CASCADE(project purge → 补偿意图清)。
+// 无 revision(owner 权威写,非 CRDT LWW)。attempt_count/last_error/last_attempted_at 是"可观察状态"(saga 非黑盒)。
+//
+// 返修 P1-1/P1-2/P1-3/P2-1(2026-07-12 双审 REQUIRES_CHANGES):
+//  - generation:project 级单调递增的"desired-state 代际";新 transition record 时 bump,旧 pending 对立 op
+//    被 supersede(sweep/attempt 据最新 generation 决断,防 restore-fail→delete 后旧 restore 晚到重开链接)。
+//  - claimed_at/claimed_until:attempt 租约(P2-1);并发 attempt 原子 claim,loser 返 already-claimed。
+//  - status 新增 'superseded':被对立 op 的新代际取代(保留行做可观察历史,不再被 sweep/attempt 处理)。
+//  - partial unique index UNIQUE(project_id,op) WHERE status='pending'(P1-3):并发首建恰一条 pending +
+//    ON CONFLICT;done/superseded 不占槽,下一生命周期可再建。
+//  - cascade_revoked_at(share_links ALTER):区分"级联 revoke"(project 软删级联)vs"手工 revoke"(用户主动吊销);
+//    restore 补偿只 un-revoke cascade 标记的链接,手工 revoked 链接永不动(防误恢复)。
 const COMPENSATIONS_SCHEMA = sql`
 CREATE TABLE IF NOT EXISTS share_link_compensations (
   id                TEXT        PRIMARY KEY,                     -- surrogate uuid(应用层生成)
   project_id        TEXT        NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   op                TEXT        NOT NULL CHECK (op IN ('restore', 'delete')),
-  status            TEXT        NOT NULL CHECK (status IN ('pending', 'done')),
+  status            TEXT        NOT NULL CHECK (status IN ('pending', 'done', 'superseded')),
+  generation        INTEGER     NOT NULL DEFAULT 1,             -- project 级 desired-state 代际(单调递增)
   attempt_count     INTEGER     NOT NULL DEFAULT 0,
   last_error        TEXT,
   last_attempted_at TIMESTAMPTZ,
+  claimed_at        TIMESTAMPTZ,                                 -- P2-1 attempt 租约起点(null=未被 claim)
+  claimed_until     TIMESTAMPTZ,                                 -- 租约到期(过期可被重新 claim)
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_compensations_project_op ON share_link_compensations (project_id, op);
+-- P1-3:并发首建恰一条 pending(部分唯一索引;done/superseded 不占槽)。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_compensations_pending_project_op
+  ON share_link_compensations (project_id, op) WHERE status = 'pending';
+
+-- P1-1 marker:级联 revoke 标记。revokeAllForProject(project 软删级联)置非空;unRevokeAllForProject(restore 级联)
+-- 仅恢复此标记非空且 30 天窗内的链接并清空标记;手工 revokeShareLink 不置此列 → restore 补偿永不动手工吊销。
+-- ADD COLUMN IF NOT EXISTS 幂等(002 已 applied 的库 ALTER 加列;fresh 库 002 建表后 005 补列,同效)。
+ALTER TABLE share_links ADD COLUMN IF NOT EXISTS cascade_revoked_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_share_links_cascade_project
+  ON share_links (project_id) WHERE cascade_revoked_at IS NOT NULL;
 `
 const DROP_COMPENSATIONS_SCHEMA = sql`
+DROP INDEX IF EXISTS idx_share_links_cascade_project;
+DROP INDEX IF EXISTS uq_compensations_pending_project_op;
+DROP INDEX IF EXISTS idx_compensations_project_op;
 DROP TABLE IF EXISTS share_link_compensations;
+-- 不 DROP cascade_revoked_at 列:share_links 表归 002 拥有,down 只清本 migration 加的索引/表,列随表 DROP 自然消失。
 `
 
 /** migrations 以 ISO 日期前缀排序;migrator 按 key 字典序应用。 */
@@ -159,7 +187,7 @@ export const migrations: Record<string, Migration> = {
       await DROP_PERMISSIONS_SCHEMA.execute(db)
     },
   },
-  '2026_07_12_003_share_link_compensations': {
+  '2026_07_12_005_share_link_compensations': {
     async up(db): Promise<void> {
       await COMPENSATIONS_SCHEMA.execute(db)
     },

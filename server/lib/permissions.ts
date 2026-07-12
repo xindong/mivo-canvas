@@ -36,6 +36,12 @@ export type ShareLink = {
   updatedAt: string
   revokedAt: string | null
   expiresAt: string | null
+  /**
+   * cascadeRevokedAt:P-6 marker——区分"级联 revoke"(project 软删/恢复级联)vs"手工 revoke"(用户主动吊销)。
+   * revokeAllForProject(project 软删级联)置非空;unRevokeAllForProject(restore 级联)仅恢复此标记非空且 30 天窗内的
+   * 链接并清空标记;手工 revokeShareLink 不置此列 → restore 补偿永不动手工吊销(防误恢复)。
+   */
+  cascadeRevokedAt: string | null
 }
 
 /** share token 解析结果(供 route 区分 404 / 410)。 */
@@ -65,15 +71,24 @@ export type CompensationOp = 'restore' | 'delete'
 /**
  * 可观察补偿意图(持久层:跨请求存活;InMemory 重启清空同其它权限数据,PG 跨重启)。
  * attemptCount / lastError / lastAttemptedAt 是"可观察状态"——saga 不是黑盒,可查可调试。
+ *
+ * 返修 P1-2/P2-1(2026-07-12):
+ *  - generation:project 级单调递增 desired-state 代际;新 transition record 时 bump,旧 pending 对立 op
+ *    被 markSuperseded——sweep/attempt 据最新代际决断(防 restore-fail→delete 后旧 restore 晚到重开链接)。
+ *  - status 'superseded':被对立 op 的新代际取代;保留行做可观察历史,不再被 sweep/attempt 处理。
+ *  - claimedAt/claimedUntil:attempt 租约(P2-1);并发 attempt 原子 claim,loser 返 already-claimed。
  */
 export type CompensationIntent = {
   id: string
   projectId: string
   op: CompensationOp
-  status: 'pending' | 'done'
+  status: 'pending' | 'done' | 'superseded'
+  generation: number
   attemptCount: number
   lastError: string | null
   lastAttemptedAt: string | null
+  claimedAt: string | null
+  claimedUntil: string | null
   createdAt: string
   updatedAt: string
 }
@@ -83,9 +98,23 @@ export type CompensationOutcome =
   | { kind: 'nothing-pending'; op: CompensationOp }
   | { kind: 'completed'; op: CompensationOp; count: number; attempts: number; intentId: string }
   | { kind: 'failed'; op: CompensationOp; error: string; attempts: number; intentId: string }
+  | { kind: 'already-claimed'; op: CompensationOp; intentId: string } // P2-1:并发 attempt 输家
 
 /** FX-7 §5.9 un-revoke 30 天保留窗(超期不可恢复,purge 由 FX-7 定时落地)。 */
 export const UNREVOKE_WINDOW_MS = 30 * 24 * 60 * 60 * 1000
+
+/**
+ * 返修 P1-2/P2-1(2026-07-12):attempt 租约时长。并发 attempt 时,赢家 claim 后在此窗内输家返
+ * already-claimed;到期后租约释放,可被 sweep/重试重新 claim(防赢家崩溃留永久 claimed 死锁)。
+ * 取 15s:远大于单次 unRevoke/revoke 级联耗时(单语句,ms 级),又短到赢家崩溃后能快速被回收。
+ */
+export const COMPENSATION_CLAIM_LEASE_MS = 15 * 1000
+
+/**
+ * 返修 P1-2:有界 sweep——每条 pending 意图最多重试此次后放弃(超限 mark done 留 last_error)。
+ * 防"永久 pending 黑洞":故障持续不退时,sweep 不会无限重打;留 last_error 给运维定位。
+ */
+export const COMPENSATION_MAX_SWEEP_ATTEMPTS = 10
 
 /**
  * 权限层后端接口(成员 + 分享链接)。
@@ -148,6 +177,20 @@ export interface PermissionBackend {
   /** 可观察:列 project 全部补偿意图(newest first;调试/检查/验收用)。 */
   listCompensations(projectId: string): Promise<CompensationIntent[]>
 
+  /**
+   * 返修 P1-2:可观察 pending 信号——列全局(或某 project)未收敛补偿意图(含租约信息)。
+   * 供 /readyz 类指标 / sweep driver 调度用;形态你定(memory: 同步过滤;PG: SELECT status='pending')。
+   */
+  listPendingCompensations(projectId?: string): Promise<CompensationIntent[]>
+
+  /**
+   * 返修 P1-2:有界后台 sweep driver——启动恢复 + 周期退避重试的收敛入口。遍历 pending 意图(跳过
+   * superseded + 未到期租约),逐条 attemptCompensation 收敛。返处理统计 {processed, converged, failed}。
+   * memory: 同步遍历(无重启语义,主要供测试);PG: 跨重启恢复(pending 跨请求/重启存活)。
+   * 有界:每条意图有最大重试上限(超限 mark done 留 last_error,不再重试)。
+   */
+  sweepCompensations(): Promise<{ processed: number; converged: number; failed: number }>
+
   /** Test-only:清空。memory 同步 void;PG 异步 TRUNCATE(Promise<void>)。返回类型放宽,两类 backend 共用接口。 */
   __reset(): void | Promise<void>
 
@@ -187,6 +230,8 @@ export class InMemoryPermissionBackend implements PermissionBackend {
   private readonly compensationsByProject = new Map<string, string[]>() // newest first
   /** Test-only 故障注入:op → 剩余强制失败次数(attemptCompensation 内消费,不污染 unRevoke/revoke 本身)。 */
   private readonly compensationFault: Partial<Record<CompensationOp, number>> = {}
+  /** Test-only:op → 剩余 recordCompensation 强制失败次数(P1-1 验收:record 崩溃后 attempt 据 marker 收敛)。 */
+  private readonly compensationRecordFault: Partial<Record<CompensationOp, number>> = {}
   /** additive(PG 落地后接口新增):内存 backend 立即就绪。 */
   readonly ready: Promise<void> = Promise.resolve()
 
@@ -286,6 +331,7 @@ export class InMemoryPermissionBackend implements PermissionBackend {
       updatedAt: now,
       revokedAt: null,
       expiresAt: null,
+      cascadeRevokedAt: null, // P-6 marker:仅级联 revoke 置非空;新建链接无标记
     }
     this.links.set(link.id, link)
     this.linksByToken.set(link.token, link.id)
@@ -340,7 +386,7 @@ export class InMemoryPermissionBackend implements PermissionBackend {
     if (link.revokedAt && Date.now() - Date.parse(link.revokedAt) > UNREVOKE_WINDOW_MS) {
       return { ok: false, reason: 'window-closed' }
     }
-    const unrevoked: ShareLink = { ...link, revokedAt: null, updatedAt: nowIso() }
+    const unrevoked: ShareLink = { ...link, revokedAt: null, cascadeRevokedAt: null, updatedAt: nowIso() }
     this.links.set(linkId, unrevoked)
     return { ok: true, link: unrevoked }
   }
@@ -352,7 +398,8 @@ export class InMemoryPermissionBackend implements PermissionBackend {
     for (const id of ids) {
       const link = this.links.get(id)
       if (link && !link.revokedAt) {
-        this.links.set(id, { ...link, revokedAt: now, updatedAt: now })
+        // 级联 revoke:置 revoked_at + cascade_revoked_at(marker)。restore 补偿只动此标记非空的链接。
+        this.links.set(id, { ...link, revokedAt: now, cascadeRevokedAt: now, updatedAt: now })
         count++
       }
     }
@@ -365,9 +412,10 @@ export class InMemoryPermissionBackend implements PermissionBackend {
     const now = nowIso()
     for (const id of ids) {
       const link = this.links.get(id)
-      // 仅恢复 30 天窗内的 revoked link(FX-7 §5.9);超期保持 revoked(purge 由 FX-7 定时)
-      if (link && link.revokedAt && Date.now() - Date.parse(link.revokedAt) <= UNREVOKE_WINDOW_MS) {
-        this.links.set(id, { ...link, revokedAt: null, updatedAt: now })
+      // P-6 marker:仅恢复"级联 revoke"标记(cascadeRevokedAt 非空)且 30 天窗内的链接,并清空 marker。
+      // 手工 revoke(cascadeRevokedAt IS NULL)永不被 restore 补偿动 → 防误恢复用户主动吊销的链接。
+      if (link && link.cascadeRevokedAt && Date.now() - Date.parse(link.cascadeRevokedAt) <= UNREVOKE_WINDOW_MS) {
+        this.links.set(id, { ...link, revokedAt: null, cascadeRevokedAt: null, updatedAt: now })
         count++
       }
     }
@@ -375,6 +423,13 @@ export class InMemoryPermissionBackend implements PermissionBackend {
   }
 
   // ── P-6 saga 补偿(实现)──
+  // 返修 P1-1/P1-2/P2-1(2026-07-12 双审):marker-driven + supersede + claim/lease + sweep。
+  //   - marker:cascade_revoked_at(级联 revoke 标记)是 desired-state 的可重建载体,落在 share_links
+  //     (随第一步级联一起提交);record 步骤即使崩溃,marker 已 durable 提交 → 重启/重试据 marker 收敛。
+  //   - supersede:record 新 op 时 bump generation 并把 pending 对立 op markSuperseded —— sweep/attempt
+  //     只认 pending(跳过 superseded),防 restore-fail→delete 后旧 restore 晚到重开链接(P1-2 代际)。
+  //   - claim/lease:attempt 原子 claim(单线程 JS 同步段内 check+set);并发输家返 already-claimed(P2-1)。
+  //   - sweep:有界遍历 pending(跳过未到期租约 + 超限放弃),逐条 attempt 收敛(P1-2 driver)。
 
   /** 找 (projectId, op) 最近一条 pending 意图(无 → undefined)。 */
   private findPendingCompensation(projectId: string, op: CompensationOp): CompensationIntent | undefined {
@@ -386,19 +441,47 @@ export class InMemoryPermissionBackend implements PermissionBackend {
     return undefined
   }
 
-  async recordCompensation(projectId: string, op: CompensationOp): Promise<CompensationIntent> {
-    // 幂等:已有 pending → 返之(不重复),防重入 POST restored 重复建意图。
-    const pending = this.findPendingCompensation(projectId, op)
-    if (pending) return pending
+  /** project 级下一代际 = 现存全部意图(任意状态)max(generation)+1。单调递增,保证新 transition 代际 > 旧。 */
+  private nextGeneration(projectId: string): number {
+    const ids = this.compensationsByProject.get(projectId) ?? []
+    let max = 0
+    for (const id of ids) {
+      const it = this.compensations.get(id)
+      if (it && it.generation > max) max = it.generation
+    }
+    return max + 1
+  }
+
+  /** 把 (projectId, 对立 op) 的 pending 意图 markSuperseded(保留行做历史;不再被 sweep/attempt 处理)。 */
+  private supersedeOppositePending(projectId: string, op: CompensationOp): void {
+    const opposite: CompensationOp = op === 'restore' ? 'delete' : 'restore'
+    const stale = this.findPendingCompensation(projectId, opposite)
+    if (!stale) return
+    const now = nowIso()
+    this.compensations.set(stale.id, {
+      ...stale,
+      status: 'superseded',
+      lastError: `superseded by ${op} generation`,
+      claimedAt: null,
+      claimedUntil: null,
+      updatedAt: now,
+    })
+  }
+
+  /** 建 pending 意图(内部:不查幂等,调用方负责)。 */
+  private createPendingIntent(projectId: string, op: CompensationOp, generation: number): CompensationIntent {
     const now = nowIso()
     const intent: CompensationIntent = {
       id: randomUUID(),
       projectId,
       op,
       status: 'pending',
+      generation,
       attemptCount: 0,
       lastError: null,
       lastAttemptedAt: null,
+      claimedAt: null,
+      claimedUntil: null,
       createdAt: now,
       updatedAt: now,
     }
@@ -409,12 +492,58 @@ export class InMemoryPermissionBackend implements PermissionBackend {
     return intent
   }
 
+  /**
+   * marker-driven need:restore → 存在 cascade 标记(cascadeRevokedAt 非空)且 30 天窗内的链接(需 unRevoke);
+   * delete → 存在 active 链接(revokedAt IS NULL,需 revoke;调用方 route/sweep 保证 project 已软删)。
+   * 用于"record 崩溃后重试/重启"场景:无 pending 意图但 marker 表明补偿未完成 → attempt 自建意图收敛。
+   * 普通幂等 POST(existing,从未级联)→ 无 marker → need=false → nothing-pending,不动手工 revoked link。
+   */
+  private compensationNeed(projectId: string, op: CompensationOp): boolean {
+    const ids = this.linksByProject.get(projectId) ?? []
+    for (const id of ids) {
+      const link = this.links.get(id)
+      if (!link) continue
+      if (op === 'restore') {
+        if (link.cascadeRevokedAt && Date.now() - Date.parse(link.cascadeRevokedAt) <= UNREVOKE_WINDOW_MS) return true
+      } else {
+        if (!link.revokedAt) return true
+      }
+    }
+    return false
+  }
+
+  async recordCompensation(projectId: string, op: CompensationOp): Promise<CompensationIntent> {
+    // P1-1 Test-only:record 故障注入(模拟"第一步提交后、record 前崩溃")。route 已 try/catch 包裹 →
+    // 不阻断主操作;attempt 据 cascade_revoked_at marker 自收敛(无 pending 意图也能 derive)。
+    const rf = this.compensationRecordFault[op] ?? 0
+    if (rf > 0) {
+      this.compensationRecordFault[op] = rf - 1
+      throw new Error(`[compensation-record-fault] ${op} record forced failure (was ${rf})`)
+    }
+    // 幂等:已有 pending 同 op → 返之(不重复),防重入 POST restored 重复建意图。
+    const pending = this.findPendingCompensation(projectId, op)
+    if (pending) return pending
+    // P1-2 supersede:新 transition 取代旧 pending 对立 op(防旧 restore 晚到重开链接)。
+    this.supersedeOppositePending(projectId, op)
+    return this.createPendingIntent(projectId, op, this.nextGeneration(projectId))
+  }
+
   async attemptCompensation(projectId: string, op: CompensationOp): Promise<CompensationOutcome> {
-    const intent = this.findPendingCompensation(projectId, op)
-    if (!intent) return { kind: 'nothing-pending', op }
     const now = nowIso()
+    let intent = this.findPendingCompensation(projectId, op)
+    // P1-1 crash-recovery:record 崩溃未建意图,但 marker 表明补偿未完成 → 自建 pending 收敛。
+    const need = this.compensationNeed(projectId, op)
+    if (!intent && !need) return { kind: 'nothing-pending', op }
+    if (!intent) intent = this.createPendingIntent(projectId, op, this.nextGeneration(projectId))
+    // P2-1 claim/lease:已被未到期租约占用 → 输家返 already-claimed(单线程 JS:check+set 同步段原子)。
+    if (intent.claimedUntil && Date.parse(intent.claimedUntil) > Date.now()) {
+      return { kind: 'already-claimed', op, intentId: intent.id }
+    }
+    const leaseUntil = new Date(Date.now() + COMPENSATION_CLAIM_LEASE_MS).toISOString()
+    const claimed: CompensationIntent = { ...intent, claimedAt: now, claimedUntil: leaseUntil, updatedAt: now }
+    this.compensations.set(intent.id, claimed)
+    const attempts = claimed.attemptCount + 1
     // Test-only 故障注入:在 attempt 内消费,不污染 unRevokeAllForProject / revokeAllForProject 本身。
-    // 语义等价于"第二步抛错":decrement 后 throw,被本方法 catch → 记 failCompensationAttempt 可观察字段。
     const fault = this.compensationFault[op] ?? 0
     try {
       if (fault > 0) {
@@ -425,16 +554,16 @@ export class InMemoryPermissionBackend implements PermissionBackend {
         ? await this.unRevokeAllForProject(projectId)
         : await this.revokeAllForProject(projectId)
       const done: CompensationIntent = {
-        ...intent, status: 'done', attemptCount: intent.attemptCount + 1,
-        lastError: null, lastAttemptedAt: now, updatedAt: now,
+        ...claimed, status: 'done', attemptCount: attempts,
+        lastError: null, lastAttemptedAt: now, claimedAt: null, claimedUntil: null, updatedAt: now,
       }
       this.compensations.set(intent.id, done)
       return { kind: 'completed', op, count: r.count, attempts: done.attemptCount, intentId: intent.id }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       const failed: CompensationIntent = {
-        ...intent, attemptCount: intent.attemptCount + 1,
-        lastError: msg, lastAttemptedAt: now, updatedAt: now,
+        ...claimed, attemptCount: attempts,
+        lastError: msg, lastAttemptedAt: now, claimedAt: null, claimedUntil: null, updatedAt: now,
       }
       this.compensations.set(intent.id, failed)
       return { kind: 'failed', op, error: msg, attempts: failed.attemptCount, intentId: intent.id }
@@ -444,6 +573,43 @@ export class InMemoryPermissionBackend implements PermissionBackend {
   async listCompensations(projectId: string): Promise<CompensationIntent[]> {
     const ids = this.compensationsByProject.get(projectId) ?? []
     return ids.map((id) => this.compensations.get(id)).filter((x): x is CompensationIntent => x !== undefined)
+  }
+
+  async listPendingCompensations(projectId?: string): Promise<CompensationIntent[]> {
+    const out: CompensationIntent[] = []
+    const projects = projectId ? [projectId] : [...this.compensationsByProject.keys()]
+    for (const pid of projects) {
+      const ids = this.compensationsByProject.get(pid) ?? []
+      for (const id of ids) {
+        const it = this.compensations.get(id)
+        if (it && it.status === 'pending') out.push(it)
+      }
+    }
+    return out
+  }
+
+  async sweepCompensations(): Promise<{ processed: number; converged: number; failed: number }> {
+    let processed = 0
+    let converged = 0
+    let failed = 0
+    // 有界:snapshot pending 列表后逐条 attempt(跳过未到期租约——并发 attempt/sweep 不抢)。
+    const pending = await this.listPendingCompensations()
+    for (const it of pending) {
+      if (it.claimedUntil && Date.parse(it.claimedUntil) > Date.now()) continue // 租约未到期,跳过
+      if (it.attemptCount >= COMPENSATION_MAX_SWEEP_ATTEMPTS) {
+        // 超限放弃:mark done 留 last_error(防永久 pending 黑洞;运维据 lastError 定位)。
+        const now = nowIso()
+        this.compensations.set(it.id, { ...it, status: 'done', lastError: it.lastError ?? 'sweep max attempts exceeded', lastAttemptedAt: now, updatedAt: now })
+        failed++
+        continue
+      }
+      const r = await this.attemptCompensation(it.projectId, it.op)
+      processed++
+      if (r.kind === 'completed') converged++
+      else if (r.kind === 'failed') failed++
+      // already-claimed / nothing-pending:不计入 processed 的收敛/失败(sweep 视角非错误)
+    }
+    return { processed, converged, failed }
   }
 
   __reset(): void {
@@ -457,6 +623,8 @@ export class InMemoryPermissionBackend implements PermissionBackend {
     // 故障注入计数也清(防跨用例泄漏)。
     delete this.compensationFault.restore
     delete this.compensationFault.delete
+    delete this.compensationRecordFault.restore
+    delete this.compensationRecordFault.delete
   }
 
   /** Test-only:把某 link 的 revokedAt 设为指定 ISO(测 30 天 un-revoke 窗;FX-7 §5.9)。 */
@@ -464,6 +632,13 @@ export class InMemoryPermissionBackend implements PermissionBackend {
     const link = this.links.get(linkId)
     if (!link) return false
     this.links.set(linkId, { ...link, revokedAt: revokedAtIso })
+    return true
+  }
+  /** Test-only:把某 link 的 cascadeRevokedAt(P-6 marker)设为指定 ISO(测 cascade restore 30 天窗)。 */
+  __setLinkCascadeRevokedAtForTest(linkId: string, iso: string): boolean {
+    const link = this.links.get(linkId)
+    if (!link) return false
+    this.links.set(linkId, { ...link, cascadeRevokedAt: iso })
     return true
   }
 
@@ -474,6 +649,14 @@ export class InMemoryPermissionBackend implements PermissionBackend {
   /** Test-only:清除 op 补偿故障注入。 */
   __clearCompensationFaultForTest(op: CompensationOp): void {
     delete this.compensationFault[op]
+  }
+  /** Test-only:注入 op recordCompensation 强制失败 N 次(P1-1:第一步提交后 record 崩溃)。 */
+  __setRecordFaultForTest(op: CompensationOp, throwCount: number): void {
+    this.compensationRecordFault[op] = throwCount
+  }
+  /** Test-only:清除 op record 故障注入。 */
+  __clearRecordFaultForTest(op: CompensationOp): void {
+    delete this.compensationRecordFault[op]
   }
 }
 

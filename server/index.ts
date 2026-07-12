@@ -37,8 +37,34 @@ for (const w of validateSsoConfig()) {
 
 // T1.3: PG backend 启用时,serve 前预热 persist 全局唯一索引缓存 + 权限层 migrations;
 // memory backend 的 ready 立即 resolve(no-op,生产零变化)。PG 连接失败 → 启动停(fail visibly)。
+// P-6 saga sweep driver(返修 P1-2):仅 PG 后端有 sweepCompensations/reconcileFromProjectState(memory 无跨重启语义);
+// 启动恢复(reconcile 从 projects.is_deleted derive pending)+ 周期有界 sweep(60s,每意图 max attempts 上限)。
+// 预算:单实例 BFF 假设(与 PersistBackend 同);多实例协作留 T1.4+(各实例 sweep 各自 lease claim,loser 返 already-claimed)。
+const startCompensationSweep = async (): Promise<void> => {
+  const pg = sharedPermissionBackend as {
+    sweepCompensations?: () => Promise<{ processed: number; converged: number; failed: number }>
+    reconcileFromProjectState?: () => Promise<unknown>
+  }
+  if (typeof pg.sweepCompensations !== 'function') return // memory:无跨重启语义,不跑 sweep
+  // 启动恢复:从 projects.is_deleted + share_links.cascade_revoked_at derive pending(record 崩溃未建意图的兜底)。
+  try {
+    await pg.reconcileFromProjectState?.()
+    const r = await pg.sweepCompensations!()
+    if (r.processed > 0) console.log(`[mivo-bff] P-6 sweep(startup): processed=${r.processed} converged=${r.converged} failed=${r.failed}`)
+  } catch (err) {
+    console.warn(`[mivo-bff] P-6 sweep(startup) failed: ${err instanceof Error ? err.message : String(err)}`)
+  }
+  // 周期有界 sweep:60s 一次;每条 pending 有 max attempts 上限(超限 mark done 留 last_error,防永久 pending)。
+  setInterval(() => {
+    pg.sweepCompensations!().then((r) => {
+      if (r.processed > 0) console.log(`[mivo-bff] P-6 sweep: processed=${r.processed} converged=${r.converged} failed=${r.failed}`)
+    }).catch((err) => console.warn(`[mivo-bff] P-6 sweep failed: ${err instanceof Error ? err.message : String(err)}`))
+  }, 60_000)
+}
+
 const start = async (): Promise<void> => {
   await Promise.all([sharedPersistBackend.ready, sharedPermissionBackend.ready])
+  void startCompensationSweep()
   serve({ fetch: app.fetch, hostname: HOSTNAME, port: PORT }, (info) => {
     const bound = `${info.address}:${info.port}`
     const mode = PUBLIC_MODE ? 'public 0.0.0.0 (behind SSO gateway)' : 'local 127.0.0.1'
