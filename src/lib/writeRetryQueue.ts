@@ -304,18 +304,37 @@ export const isDeleteKind = (kind: WriteOpKind): boolean =>
  *    本函数只覆盖 G1-a 已接线的非画布域 FK 链(project→canvas→chat),G1-c 扩展时另行升级。
  *
  * 跨毫秒时父资源同步先于子资源入队,timestamp 主键已保证顺序 —— tie-breaker 仅在 same-ms tie 时生效。
+ *
+ * R6-1(条件 rank,非全局 kind 映射):上述 0/1/2 层不再是 op kind 的固定映射,而是"仅当本批 due 内
+ * 真实存在其 FK parent 的 pending create 时才赋予高 rank,否则 rank 0"。批内 parent-id 索引由 drain
+ * 排序前扫一遍 due 建立(O(n),见 drain 内 pendingProjectCreateIds/pendingCanvasCreateIds)。效果:
+ * 真实三链(project→canvas→chat,parent 均在批内)仍按 0/1/2 后置;无 FK 竞争对(chat 依赖的 canvas 已
+ * 在先前 drain 建好 + 一个无关 createProject)两者 rank 均 0 → 保持 IDB 入队原序,不被全局 kind 改序。
  */
-const dependencyRank = (op: WriteOp): number => {
+const dependencyRank = (
+  op: WriteOp,
+  pendingProjectCreateIds: Set<string>,
+  pendingCanvasCreateIds: Set<string>,
+): number => {
+  // R6-1:rank 是条件的,不是全局 kind→层映射。只有当本批 due 内真实存在其 FK parent 的 pending create
+  // 时才赋高 rank 后置;否则 rank 0,与无 FK 记录同层,保持 IDB getAll 入队原序(nextAttemptAt/createdAt
+  // 相同时 stable sort 不改序)。这样同毫秒"无 FK 竞争对"(如 chat 依赖的 canvas 已 preseed + 一个无关
+  // createProject)不再被全局 kind rank 误改序;而真实三链 project→canvas→chat 因 parent 在批内仍按
+  // 0/1/2 传递后置(canvas 依赖批内 createProject → rank 1;chat 依赖批内 createCanvas → rank 2)。
   switch (op.kind) {
     // rank 2:canvas-dependent child —— chat 写依赖 canvas 已建(404 unknown-canvas → terminal 会丢消息)。
+    // 仅当 chat.canvasId 的 createCanvas 也在本批 due 内时才后置;否则 canvas 已在先前 drain 建好
+    // (或与本批无关)→ rank 0 保持原序,不误伤无 FK 竞争的同毫秒 op。
     case 'appendChatMessage':
     case 'updateChatMessage':
     case 'deleteChatMessage':
-      return 2
-    // rank 1:canvas 类 —— 携带 projectId 外键,project 先建(rank 0)。
+      return pendingCanvasCreateIds.has(op.canvasId) ? 2 : 0
+    // rank 1:canvas 类 createCanvas/updateCanvas —— 携带 projectId 外键,project 先建。
+    // 仅当 canvas.projectId 的 createProject 也在本批 due 内时才后置;否则 rank 0。
+    // (deleteCanvas 不带 projectId,落 default rank 0;create+delete 同 id 已被 combineOps 抵消,批内不并存。)
     case 'createCanvas':
     case 'updateCanvas':
-      return 1
+      return pendingProjectCreateIds.has(op.projectId) ? 1 : 0
     // rank 0:project 类 + user-state + asset-attach/detach(无跨资源 FK 在 G1-a 范围内 terminal 404 丢失)。
     default:
       return 0
@@ -768,16 +787,33 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
             (r.status === 'pending' || r.status === 'paused-401') &&
             r.nextAttemptAt <= ts,
         )
-        // 主键 nextAttemptAt(退避到期先发)+ 次键 createdAt(同 nextAttemptAt 时先入队先发)
-        // + tie-breaker dependencyRank:同毫秒时按三层依赖 rank(project 0 → canvas 1 → canvas-dependent
-        // child chat 写 2)排序,防子资源 op 在父资源 create 前 drain → 404 terminal 丢失
-        // (R4 project→canvas / R5-1 canvas→chat;见 dependencyRank 注释)。
-        .sort(
-          (a, b) =>
-            a.nextAttemptAt - b.nextAttemptAt ||
-            a.createdAt - b.createdAt ||
-            dependencyRank(a.op) - dependencyRank(b.op),
-        )
+
+      // R6-1:tie-breaker 改为依赖感知——同毫秒时只对批次内真实存在的 FK 父子边重排,无 FK 关系的记录
+      // 保持 IDB getAll 入队原序。先扫一遍 due 建批内 parent-id 索引(O(n)):哪些 project id / canvas id
+      // 在本批 due 内有 pending create。canvas 写当其 projectId 的 createProject 在批内 → 后置;
+      // chat 写当其 canvasId 的 createCanvas 在批内 → 后置;project→canvas→chat 因 parent 均在批内
+      // 传递成 0/1/2 序。无 parent 在批内 → rank 0,与无关记录同层保持原序(见 dependencyRank 注释)。
+      const pendingProjectCreateIds = new Set<string>()
+      const pendingCanvasCreateIds = new Set<string>()
+      for (const r of due) {
+        if (r.op.kind === 'createProject' && r.op.id !== undefined) {
+          pendingProjectCreateIds.add(r.op.id)
+        } else if (r.op.kind === 'createCanvas') {
+          pendingCanvasCreateIds.add(r.op.canvasId)
+        }
+      }
+
+      // 主键 nextAttemptAt(退避到期先发)+ 次键 createdAt(同 nextAttemptAt 时先入队先发)
+      // + tie-breaker dependencyRank:同毫秒时按依赖感知 rank 排序——仅在批内存在真实 FK parent 时
+      // 才后置子资源 op,防 404 terminal 丢失(R4 project→canvas / R5-1 canvas→chat);无 FK 对保持原序。
+      // (stable sort:rank 相同时保留 due 的 IDB 入队序,不误改无关同毫秒写的顺序。)
+      due.sort(
+        (a, b) =>
+          a.nextAttemptAt - b.nextAttemptAt ||
+          a.createdAt - b.createdAt ||
+          dependencyRank(a.op, pendingProjectCreateIds, pendingCanvasCreateIds) -
+            dependencyRank(b.op, pendingProjectCreateIds, pendingCanvasCreateIds),
+      )
 
       for (const rec of due) {
         if (paused) break // a prior op in this cycle got 401 → stop
