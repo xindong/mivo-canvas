@@ -611,7 +611,7 @@ pg-suite 翻 required（2026-07-12，今天）。cutover 未执行。
 
 | 前置 | 动作 | 验收命令 |
 |---|---|---|
-| 事故登记源（**硬前置**，非"建议补"） | 建 `data-loss` GitHub label + `docs/reports/incident-log.md`（人工登记任何数据丢失事件，记日期/影响/根因/PR）。r2 原文"建议删轨前置补"与"数据丢失=0 硬指标"矛盾，r3 改硬前置 | `gh api repos/xindong/mivo-canvas/labels/data-loss >/dev/null 2>&1` rc=0 + `test -f docs/reports/incident-log.md` |
+| 事故登记源（**硬前置**，非"建议补"） | 建 `data-loss` GitHub label + `docs/reports/incident-log.md`（人工登记任何数据丢失事件，**事故段标题须带日期 `## YYYY-MM-DD <影响简述>` 机器可解析 schema**，正文记影响/根因/PR）。r2 原文"建议删轨前置补"与"数据丢失=0 硬指标"矛盾，r3 改硬前置；r5 补日期 schema 让 §2.3②指标 5 能按窗口过滤（D4-R5-3） | `gh api repos/xindong/mivo-canvas/labels/data-loss >/dev/null 2>&1` rc=0 + `test -f docs/reports/incident-log.md` |
 | pm2 日志保留 ≥30 天 | 配 logrotate（daily + 30 份）或 pm2 `--merge --log-date-format` 落盘带时间戳。r2 原命令 `pm2 logs --lines 1000` 只覆盖近若干小时，证不了 30 天零错误 | `ssh "$MIVO_PROD_HOST" 'find ~/.pm2/logs -name "mivo-canvas-error.log*" -printf "%T@\n" \| sort -n \| awk "NR==1{old=\$1} END{print int((\$1-old)/86400)"'` 期望 ≥30（r4 改 R3-2：取 oldest/newest 实际 mtime 跨度天数；r3 `wc -l` 数文件数不证时间跨度——30 个同日文件也过） |
 | persist_observations 审计时序源（**硬前置**，r4 加 R3-2） | 建 `persist_observations(observed_at timestamptz, backend text, canvas_rows bigint, chat_rows bigint)` 表 + 每 3 天 cron 采样一次（生产 BFF 读 `MIVO_PERSIST_BACKEND` env 后 INSERT 带 backend 值 + `canvas_meta`/`chat_messages` 当前 count）。r3 原指标只 `printenv` 一次（只证当下）+ `created_at` 每日新增（非历史累计），证不了 30 天全 pg 且无重启切回 memory / 累计下降 | `psql "$DATABASE_URL" -c "\d persist_observations"` 期望表存在 + `psql "$DATABASE_URL" -tAc "SELECT count(*) FROM persist_observations"` 期望 ≥1 |
 
@@ -669,10 +669,15 @@ pg-suite 翻 required（2026-07-12，今天）。cutover 未执行。
    OBS_START="<cutover S7 日 YYYY-MM-DD>"   # owner 填观察起点
    DL=$(gh issue list -R xindong/mivo-canvas --state all --label data-loss --search "created:>=$OBS_START" --json number | jq 'length')
    echo "data-loss issues: $DL"
-   [ "$DL" -eq 0 ]   # rc=0 绿，rc=1 红
-   test ! -s docs/reports/incident-log.md || ! grep -q '^## ' docs/reports/incident-log.md   # 人工登记源：无 ## 事故段即绿
+   [ "$DL" -eq 0 ]   # GitHub 半：窗口内 data-loss issue=0 → rc=0 绿，rc=1 红
+   # 人工登记半：incident-log.md 事故段须带日期 `## YYYY-MM-DD <描述>`（机器可解析 schema），只计窗口内事故
+   test ! -s docs/reports/incident-log.md \
+     || awk -v start="$OBS_START" '
+          /^## [0-9]{4}-[0-9]{2}-[0-9]{2}/ { if (substr($0, 4, 10) >= start) found = 1 }
+          END { exit found }
+        ' docs/reports/incident-log.md   # 窗口内任一事故 → rc=1 红；窗口外旧事故不计；空文件（前置已 test -f）rc=0 绿
    ```
-   样例（green）：`data-loss issues: 0`（rc=0）。r3 原命令 `--state all` 已对（已关闭 incident 仍计）但缺 `created` 时间窗（窗口外事故被计数，R3-5）；r4 加 `--search "created:>=$OBS_START"` 限窗口内 + label 前置先验。`data-loss` label 当前不存在，硬前置先建。
+   样例（green）：`data-loss issues: 0`（rc=0）。GitHub 半已按 `created:>=$OBS_START` 过滤窗口（r4）；人工登记半 r5 改 D4-R5-3：原 `! grep -q '^## '` 把窗口外任意二级标题都判红（窗口外旧事故永久阻断删轨，与同一指标 GitHub 半口径冲突），现要求事故段标题带日期 `## YYYY-MM-DD <描述>` schema，`awk` 抽 `substr($0,4,10)` 与 `OBS_START` 字符串比较（ISO 日期字典序即时间序）只计窗口内事故。dry-run：空文件 / 仅窗口外事故 / 仅无日期标题 → GREEN；窗口内任一事故（open 或 closed）→ RED。`data-loss` label 当前不存在，硬前置先建。
 
 6. **`backend.contract.dual` 连续绿（pg-suite required，双后端契约守 memory 兼容直到 D PR 删 memory 半）**
    ```bash
