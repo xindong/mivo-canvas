@@ -1,19 +1,19 @@
 import { create } from 'zustand'
-import { createJSONStorage, persist } from 'zustand/middleware'
+import { persist } from 'zustand/middleware'
 import type { EnhanceDegradedReason, GenerationRatio, MivoImageQuality } from '../types/generation'
 import { readImportedAssetFile, saveImportedAsset } from '../lib/assetStorage'
-import { idbStateStorage } from '../lib/persistIdbStorage'
 import { MivoImageRequestError, enhanceMivoPrompt, type MivoImageRequestErrorKind } from '../lib/mivoImageClient'
 import { getModelCapabilities } from '../lib/modelCapabilities'
 import { settleCanvasGenerationLocally } from './canvasGenerationCancel'
-import { fallbackCancelTarget, settleExpiredChatMessages } from './chatGenerationHydration'
+import { fallbackCancelTarget } from './chatGenerationHydration'
 import { resolveChatEnhance, enhanceForGeneration, historyForEnhance, trimSceneMessages } from './chatEnhanceFlow'
 import { cancelMaskEditMessage } from './chatMaskEditFlow'
 import { buildBusyDropMessages } from './chatBusyDrop'
 import { debugLogger } from './debugLogStore'
 import { generationFacade } from './generationFacade'
-import { clampChatGenerationContext, migrateChatPersistedState, sanitizeEnhanceDegradedReason } from './chatStoreMigrate'
+import { clampChatGenerationContext } from './chatStoreMigrate'
 import { isChatBlockedForAnonymous, enqueueChatAppend } from './chatPersistSync'
+import { chatPersistOptions } from './chatPersistConfig'
 
 export type ChatMessageStatus = 'enhancing' | 'generating' | 'done' | 'error'
 export type ChatMessageOrigin = 'chat' | 'mask-edit'
@@ -83,7 +83,7 @@ export type ChatMessage = {
   retryDisabledReason?: string
 }
 
-type ChatState = {
+export type ChatState = {
   messagesByScene: Record<string, ChatMessage[]>
   selectedModel: string
   paramOverrides: ChatParamOverrides
@@ -168,13 +168,9 @@ const errorTextForChat = (
 // sanitizeMessagesByScene 已抽到 ./chatStoreMigrate.ts（保持本文件在 structure-guard
 // 900 行阈值内，同 #76 把 migratePersistedState 搬到 canvasGenerationHydration.ts 的先例）。
 
-// SC-15 R2: hydrate() writes merge's settled state via the *vanilla* set
-// (middleware.mjs:421), not the wrapped one, and only calls setItem on a version
-// *migrate* (line 422-424). With v2==v2 (no migrate) setItem never fires → settled
-// state lives only in memory while IDB keeps the generating blob. This counter gates
-// ONE controlled writeback in onRehydrateStorage (0 when durable already settled →
-// no rewrite on reload-2+).
-let pendingChatHydrationSettleCount = 0
+// SC-15 R2 的 onRehydrateStorage 门控回写 + pendingChatHydrationSettleCount 计数 +
+// merge/migrate/partialize 配置已抽到 ./chatPersistConfig.ts（对齐 canvasPersistConfig
+// 先例，保持本文件在 structure-guard 900 行阈值内）。
 
 export const useChatStore = create<ChatState>()(
   persist(
@@ -865,55 +861,6 @@ export const useChatStore = create<ChatState>()(
           paramOverrides: { ...s.paramOverrides, [key]: value },
         })),
     }),
-    {
-      name: 'mivo-chat-demo',
-      version: 2,
-      // FU4-2: persist to IndexedDB alongside canvasStore. skipHydration defers to
-      // the App-layer hydration gate (no first-paint flash). migrate/merge unchanged.
-      storage: createJSONStorage(() => idbStateStorage),
-      skipHydration: true,
-      partialize: (state) => ({
-        messagesByScene: state.messagesByScene,
-        selectedModel: state.selectedModel,
-        paramOverrides: state.paramOverrides,
-        // isBusy excluded (runtime state)
-      }),
-      migrate: migrateChatPersistedState,
-      merge: (persistedState, currentState) => {
-        const persisted = (persistedState ?? {}) as Partial<ChatState>
-        const merged = {
-          ...currentState,
-          ...persisted,
-          isBusy: false,
-        }
-        const result = settleExpiredChatMessages(merged.messagesByScene || {})
-        if (result.settledMessages > 0) {
-          debugLogger.warn('Chat Store', `Hydration settled ${result.settledMessages} expired chat generation message(s)`)
-        }
-        // SC-15 R2: record settle count for onRehydrateStorage's gated writeback.
-        pendingChatHydrationSettleCount = result.settledMessages
-        // FIX-A: zustand v5 persisted version == options version (v2==v2) 时 migrate
-        // 不走，只走 merge。86ce7d4 之前写入的脏 degradedReason string 仍会经 merge 进
-        // runtime/UI。在 merge 必经路径对每条 message 跑 sanitizeEnhanceDegradedReason
-        // （与 settle 同一处 map），保证 hydration 后 degradedReason 必为 union 成员或 undefined。
-        const sanitizedMessages: Record<string, ChatMessage[]> = {}
-        for (const [sceneId, messages] of Object.entries(result.messagesByScene)) {
-          sanitizedMessages[sceneId] = messages.map(sanitizeEnhanceDegradedReason)
-        }
-        return {
-          ...merged,
-          messagesByScene: sanitizedMessages,
-        }
-      },
-      // SC-15 R2: gated writeback — see pendingChatHydrationSettleCount above. The
-      // wrapped api.setState (middleware.mjs:366-369) triggers setItem → writes the
-      // settled messagesByScene durably. skipHydration=true → only fires on rehydrate.
-      onRehydrateStorage: () => () => {
-        const settled = pendingChatHydrationSettleCount
-        pendingChatHydrationSettleCount = 0
-        if (settled <= 0) return
-        useChatStore.setState((s) => ({ messagesByScene: { ...s.messagesByScene } }))
-      },
-    },
+    chatPersistOptions,
   ),
 )
