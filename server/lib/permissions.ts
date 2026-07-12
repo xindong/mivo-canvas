@@ -4,12 +4,12 @@
 //
 // 边界(boundary 2/3):
 //  - **不**改 #194 persist-contract.ts / PersistBackend(InMemoryPersistBackend)——权限表不是 envelope record,
-//    独立 PermissionBackend 接口;PG DDL 在 server/persist/migrations/001_permissions.sql(T1.3 worker apply + PG 实现)。
+//    独立 PermissionBackend 接口;PG DDL 由 Kysely runner apply(server/persist/migrations.ts PERMISSIONS_SCHEMA,migration 002),PG 实现在 server/persist/pgPermissionBackend.ts。
 //  - 身份载体 = maker user id(= SSO username,DP-4);actor 由 routes 经 resolveActor 注入(已切 x-mivo-auth-user)。
 //  - 成员资格是 owner 权威写(§13.5"仅 owner 可邀请"),非 CRDT LWW;无 revision。
 //  - share_links 的"软删"= revoke(revoked_at,FX-7 §2);30 天 purge 由 FX-7 落地(P-1),本层不实现定时 purge。
 //
-// 设计同 PersistBackend:接口 + InMemory 实现同文件;PG 实现由 T1.3 worker 补(InMemoryPermissionBackend ↔ PgPermissionBackend 对偶)。
+// 设计同 PersistBackend:接口 + InMemory 实现同文件;PG 实现已落地(PgPermissionBackend,server/persist/pgPermissionBackend.ts,与 PgPersistBackend 同 MIVO_PERSIST_BACKEND=pg 开关动态加载)。
 // 接口方法 async(Promise),保 PG swap 时签名不变(InMemory 返 resolved promise)。
 
 import { randomUUID, randomBytes } from 'node:crypto'

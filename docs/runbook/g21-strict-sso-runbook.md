@@ -1,7 +1,7 @@
 # G2.1 严格 SSO cutover runbook
 
 > 状态:**返修 v2(2026-07-12,双审 REQUIRES_CHANGES 6 finding 修复后)**。
-> 权威源:`server/lib/owner.ts`(开关语义 + gate)、`server/persist/backend.ts`(`countLegacyFormOwners`)、`server/index.ts`(启动 gate wiring)、`server/app.ts`(route 挂载 + onError boundary)、`REVIEW-FINDINGS-G21.md`(双审 finding 全文)。
+> 权威源:`server/lib/owner.ts`(开关语义 + gate)、`server/persist/backend.ts`(`countLegacyFormOwners`)、`server/index.ts`(启动 gate wiring)、`server/app.ts`(route 挂载 + onError boundary)、`docs/reports/REVIEW-FINDINGS-G21.md`(双审 finding 全文)。
 > 关联决策:`docs/decisions/dp4-identity-alignment.md` R-2(owner 键空间跃迁)、`docs/decisions/platform-architecture-2026-07-07.md` §13.5(归属模型)。
 
 ## 0. 开关总览(默认关,生产零变化)

@@ -2,7 +2,7 @@
 
 > 状态:**定稿(T1.4,2026-07-11)**。
 > 权威:platform §13.5(归属模型)、`docs/decisions/dp4-identity-alignment.md`(身份载体)、`docs/decisions/soft-delete-semantics.md`(FX-7 share_link 恢复)、`docs/decisions/record-schema.md`(T1.2a 信封列风格)、`shared/persist-contract.ts`(#194 wire 契约,boundary 3 不改)。
-> DDL:`server/persist/migrations/001_permissions.sql`(独立 migration,T1.3 PG worker apply)。
+> DDL:由 Kysely runner apply(`server/persist/migrations.ts` PERMISSIONS_SCHEMA,migration `2026_07_11_002_permissions_schema`);PG 实现在 `server/persist/pgPermissionBackend.ts`。
 
 ## 0. 边界回顾(来自 lead 任务包)
 
@@ -98,7 +98,7 @@ GET /api/share/:token   (公开入口,无需鉴权)
 | 层 | 本 PR(T1.4) | T1.3 worker(PG 落地) |
 |---|---|---|
 | `InMemoryPermissionBackend` | ✅ `server/lib/permissions.ts` 实现 + 全链路测试 | — |
-| PG DDL | ✅ `server/persist/migrations/001_permissions.sql`(独立,不绑 kysely) | apply DDL + 实现 `PgPermissionBackend`(同 `PersistBackend` PG swap 模式) |
+| PG DDL | ✅ `server/persist/migrations.ts` PERMISSIONS_SCHEMA(Kysely migration,原 `001_permissions.sql` vanilla 草案已删,runner 不加载外部 SQL) | apply DDL + 实现 `PgPermissionBackend`(同 `PersistBackend` PG swap 模式) |
 | `PersistBackend`(#194 envelope) | **不动**(boundary 2) | PG swap `InMemoryPersistBackend` → PG |
 | 路由 | `canAccess*` 扩展 + member/share 路由,接 `PermissionBackend` 接口 | 路由不动,swap 注入的 backend 实现即可 |
 
