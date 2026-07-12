@@ -57,9 +57,18 @@ export type WriteOpKind =
   | 'deleteAnchor'
   | 'reorderChildren'
   | 'appendChatMessage'
+  | 'updateChatMessage'
+  | 'deleteChatMessage'
   | 'putUserState'
   | 'deleteUserState'
   | 'createProject'
+  | 'updateProject'
+  | 'deleteProject'
+  | 'createCanvas'
+  | 'updateCanvas'
+  | 'deleteCanvas'
+  | 'attachAsset'
+  | 'detachAsset'
 
 export type WriteOp =
   | { kind: 'upsertNode'; canvasId: string; nodeId: string; payload: NodePayload; baseRevision?: Revision }
@@ -76,9 +85,66 @@ export type WriteOp =
       baseContentVersion: Revision
     }
   | { kind: 'appendChatMessage'; canvasId: string; message: unknown }
+  | { kind: 'updateChatMessage'; canvasId: string; msgId: string; payload: unknown; baseRevision?: Revision }
+  | { kind: 'deleteChatMessage'; canvasId: string; msgId: string }
   | { kind: 'putUserState'; key: string; value: unknown; baseRevision?: Revision }
   | { kind: 'deleteUserState'; key: string }
   | { kind: 'createProject'; name: string; id?: string }
+  | { kind: 'updateProject'; projectId: string; name: string; baseRevision?: Revision }
+  | { kind: 'deleteProject'; projectId: string }
+  | { kind: 'createCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string }
+  | { kind: 'updateCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string; baseRevision?: Revision }
+  | { kind: 'deleteCanvas'; canvasId: string }
+  | { kind: 'attachAsset'; assetId: string; nodeId: string }
+  | { kind: 'detachAsset'; assetId: string; nodeId: string }
+
+// ── G1-a P1-3:类型拆分——非画布域 op(G1-a executor 只接受这些)──────────────────
+// 画布域写(node/edge/anchor/reorder)不属 G1-a executor 范围(G1-c 挂 N2-0)。chat 已接(DP-6R P1-1 划归
+// G1-a,appendChatMessage/updateChatMessage/deleteChatMessage 归入 wired 集合)。已持久化的未支持 op
+// (canvas 域写)用 deferred 状态保留(不发请求不删除),等 G1-c 升级 executor 后 drain。
+// NonCanvasWriteOp 让 executor switch 穷尽非画布域 kind;canvas 域写经 isNonCanvasWriteOp 守卫返
+// unsupported-retained(drain 不 deleteWrite,标 deferred 留存)。
+/** G1-a 接线 executor 支持的 op 子集(非画布域:project / canvas-meta / user-state / asset / chat)。 */
+export type NonCanvasWriteOp =
+  | { kind: 'putUserState'; key: string; value: unknown; baseRevision?: Revision }
+  | { kind: 'deleteUserState'; key: string }
+  | { kind: 'createProject'; name: string; id?: string }
+  | { kind: 'updateProject'; projectId: string; name: string; baseRevision?: Revision }
+  | { kind: 'deleteProject'; projectId: string }
+  | { kind: 'createCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string }
+  | { kind: 'updateCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string; baseRevision?: Revision }
+  | { kind: 'deleteCanvas'; canvasId: string }
+  | { kind: 'attachAsset'; assetId: string; nodeId: string }
+  | { kind: 'detachAsset'; assetId: string; nodeId: string }
+  | { kind: 'appendChatMessage'; canvasId: string; message: unknown }
+  | { kind: 'updateChatMessage'; canvasId: string; msgId: string; payload: unknown; baseRevision?: Revision }
+  | { kind: 'deleteChatMessage'; canvasId: string; msgId: string }
+
+/** 非画布域 op kind 集合(G1-a executor 支持范围,含 chat)。 */
+const NON_CANVAS_KINDS: ReadonlySet<WriteOpKind> = new Set<WriteOpKind>([
+  'putUserState',
+  'deleteUserState',
+  'createProject',
+  'updateProject',
+  'deleteProject',
+  'createCanvas',
+  'updateCanvas',
+  'deleteCanvas',
+  'attachAsset',
+  'detachAsset',
+  'appendChatMessage',
+  'updateChatMessage',
+  'deleteChatMessage',
+])
+
+/**
+ * G1-a P1-3 type guard:op 是否在 G1-a executor 支持的非画布域范围。
+ * - true → executor 处理(发请求)。
+ * - false → canvas/chat op,executor 返 unsupported-retained(drain 标 deferred 留存,不删)。
+ * 返回 `op is NonCanvasWriteOp` 让 executor 的 switch 在 true 分支穷尽 NonCanvasWriteOp kind。
+ */
+export const isNonCanvasWriteOp = (op: WriteOp): op is NonCanvasWriteOp =>
+  NON_CANVAS_KINDS.has(op.kind)
 
 // ── Persisted record + state machine ──
 
@@ -86,8 +152,10 @@ export type WriteStatus =
   | 'pending' // waiting to drain (nextAttemptAt <= now)
   | 'in-flight' // executor currently running
   | 'paused-401' // got 401; queue paused; kept for re-login replay
+  | 'deferred' // G1-a P1-3:unsupported op(canvas/chat)留存,等 executor 升级(G1-c/DP-6R)再 drain
 // Terminal statuses are deleted immediately after surfacing (not stored long-term):
 // success / conflict / too-large / rejected / reuse-conflict / dead-letter.
+// `deferred` is NOT terminal — the record is retained (not deleted) so G1-c/DP-6R can upgrade + replay.
 
 export type QueuedWrite = {
   id: string
@@ -106,7 +174,7 @@ export type QueuedWrite = {
 // ── Executor seam (T1.3 plugs the real fetch here) + outcome classification ──
 
 export type WriteOutcome =
-  | { status: 'success' }
+  | { status: 'success'; revision?: Revision }
   | { status: 'conflict'; currentRevision: Revision }
   | { status: 'too-large'; limit: number }
   | { status: 'unauthorized' }
@@ -114,6 +182,7 @@ export type WriteOutcome =
   | { status: 'rejected'; body: unknown }
   | { status: 'transient'; message: string }
   | { status: 'terminal'; message: string }
+  | { status: 'unsupported-retained'; message: string }
 
 export type WriteExecutor = (op: WriteOp, idempotencyKey: string) => Promise<WriteOutcome>
 
@@ -174,13 +243,242 @@ const computeResourceKey = (op: WriteOp): string | null => {
       return `userstate:${op.key}`
     case 'createProject':
       return op.id ? `project:${op.id}` : `project:name:${op.name}`
+    case 'updateProject':
+    case 'deleteProject':
+      return `project:${op.projectId}`
+    case 'createCanvas':
+    case 'updateCanvas':
+    case 'deleteCanvas':
+      return `canvas:${op.canvasId}`
+    case 'attachAsset':
+      return `asset-attach:${op.assetId}:${op.nodeId}`
+    case 'detachAsset':
+      return `asset-detach:${op.assetId}:${op.nodeId}`
     case 'appendChatMessage':
+      // 每条 chat 消息独立 op(message payload 内含唯一 id,但 op 层不 narrow),不 coalesce;
+      // 快速连发多条消息各自独立入队(符合 chat 语义——不同消息不该合并)。
       return null
+    case 'updateChatMessage':
+    case 'deleteChatMessage':
+      return `chat-msg:${op.canvasId}:${op.msgId}`
   }
 }
 
 export const isDeleteKind = (kind: WriteOpKind): boolean =>
-  kind === 'deleteNode' || kind === 'deleteEdge' || kind === 'deleteAnchor' || kind === 'deleteUserState'
+  kind === 'deleteNode' ||
+  kind === 'deleteEdge' ||
+  kind === 'deleteAnchor' ||
+  kind === 'deleteUserState' ||
+  kind === 'deleteProject' ||
+  kind === 'deleteCanvas' ||
+  kind === 'detachAsset' || // 404(missing asset/ref)→ 幂等 success(detach intent 已满足);403 owner-mismatch → rejected
+  kind === 'deleteChatMessage' // 404(已删 / 跨 actor)→ 幂等 success
+
+/**
+ * G1-a R7-1:drain 排序的稳定拓扑排序(替换 R6-1 的标量 dependencyRank)。
+ *
+ * 背景:R6-1 的条件 dependencyRank 虽只在批内存在 FK parent 时给 child 升 rank,但仍用单一标量 rank
+ * 对整批分层排序。混合批中一旦 chat 因批内 canvas 升到 rank 2,所有 rank 0 的无关记录(如 unrelated
+ * createProject)都会跨过 chat——即使前两条真实 FK 边已天然有序、第三条与两者无 FK,正确的 surgical
+ * 序应完全不变。返修声明"只重排实际 FK 边"不成立。R7 verdict 用 fresh 真 Hono 反例证:IDB 原序
+ * canvas→chat→unrelated project 被改成 canvas→unrelated project→chat。
+ *
+ * 修法(lead 指定):以原 IDB 序(主键 nextAttemptAt/createdAt + stable sort 保留入队序)为优先级的稳定
+ * 拓扑排序。先按主键稳定排序得"原序",再在原序上建批内真实 FK 边,Kahn 算法就绪集(入度 0)每次取原序
+ * 最靠前者(最小堆按 ordered index 升序)。无边记录入度 0 → 完全保持原序;有边记录只在 parent 必须
+ * 先 drain 时后置。O((n+e) log n),n 为单用户同毫秒 due 批规模(个位到几十),性能无虞。
+ *
+ * 批内真实 FK 边(G1-a 已接线的非画布域 FK 链,project→canvas→chat):
+ *  - createProject(id) → createCanvas/updateCanvas(projectId=id):canvas 写携带 projectId 外键,服务端
+ *    要求 project 先建好(POST /api/canvas 缺 project → 404 unknown-project;见 server/routes/canvas.ts
+ *    + canvas.route.test.ts unknown-project 404)。R4 F2 覆盖 project→canvas 同毫秒 FK 链。
+ *  - createCanvas(id) → appendChatMessage/updateChatMessage/deleteChatMessage(canvasId=id):chat 写依赖
+ *    canvas 已建(POST /api/canvas/:id/chat → authzCanvas → canvas 未建 → 404 unknown-canvas → terminal;
+ *    见 canvas.ts authzCanvas + canvas.route.test.ts POST chat 404)。R5-1:同毫秒 createCanvas +
+ *    appendChatMessage(用户新建画布后立即发消息)若 chat 先 drain → 404 unknown-canvas → terminal
+ *    删 chat record → 消息永久丢失。拓扑边强制 canvas 先 drain。
+ *  传递成链:真实三链 project→canvas→chat(parent 均在批内)因边传递约束 → 拓扑序强制 project→canvas→chat。
+ *
+ * 性质对比(为何拓扑排序 surgical,而标量 rank 不是):
+ *  - 无 FK 竞争对(chat 依赖的 canvas 已 preseed + 无关 createProject):无边 → 入度 0 → 原序保持
+ *    (R6-1 两记录守卫:chat→project 保持原序)。
+ *  - 混合批(canvas→chat 真实边已天然有序 + 无关 project 在后):canvas→chat 边存在但原序已 canvas
+ *    在 chat 前,边不改变其相对位置;无关 project 无边不跨过 chat(R7-1 修:canvas→chat→unrelated project)。
+ *  - backoff 跨桶:若 parent.nextAttemptAt > child.nextAttemptAt(parent 失败 backoff 推迟),拓扑边仍
+ *    强制 parent 先 drain——FK 边优先于时间主键,防 child 先 drain 撞未建 parent 404 terminal。
+ *
+ * 第四层依赖面(future seam,当前不加码,书面确认):
+ *  - updateChatMessage / deleteChatMessage 语义上依赖 appendChatMessage 已先成功(否则 PATCH/DELETE 一个
+ *    未建 msgId → 404 unknown-message;delete 404 幂等 success 无险,update 404 → terminal)。**当前
+ *    chatPersistSync 只导出 enqueueChatAppend,无生产 enqueueChatUpdate/Delete caller**(独立 grep 已核验),
+ *    故 append→update 同毫秒风险是 future seam,G1-a 范围书面确认即可,不另建边。
+ *  - node/edge/anchor/reorder/attachAsset 依赖 canvas 与 node 生命周期,但当前 executor 对 canvas 域写返
+ *    unsupported-retained(deferred 留存,不发请求不删,无 404 terminal 险)。**G1-c 接线升级 executor 时
+ *    必须重审依赖排序/恢复策略**(node→edge/anchor、asset-attach 依赖 live node 等),不要继续靠枚举边;
+ *    本函数只覆盖 G1-a 已接线的非画布域 FK 链(project→canvas→chat),G1-c 扩展时另行升级。
+ *
+ * 跨毫秒时父资源同步先于子资源入队,timestamp 主键已保证顺序 —— 拓扑边仅在 same-ms tie 或 backoff
+ * 跨桶(parent 被 backoff 推迟到 child 之后)时生效;主键不同且无 backoff 跨桶时 stable sort 已分桶,
+ * 拓扑边不跨桶。
+ */
+const stableTopologicalSort = (due: QueuedWrite[]): QueuedWrite[] => {
+  // 原序:主键 nextAttemptAt(退避到期先发)+ 次键 createdAt(同 nextAttemptAt 时先入队先发)。
+  // stable sort 保留 IDB getAll 入队序作隐式第三 tie-break(同主键时不动相对位置)。
+  const ordered = due
+    .slice()
+    .sort((a, b) => a.nextAttemptAt - b.nextAttemptAt || a.createdAt - b.createdAt)
+
+  // 建批内 parent-create 索引:project id / canvas id → 该 create 在 ordered 中的 index(首个)。
+  // 同 id 取首个保证确定性(create+create 同 id 生产流不发生;combineOps 已把 create+update 合并保留
+  // create kind,批内不并存同 id 的 createProject/createCanvas)。
+  const projectCreateIndex = new Map<string, number>()
+  const canvasCreateIndex = new Map<string, number>()
+  for (let i = 0; i < ordered.length; i++) {
+    const op = ordered[i]!.op
+    if (op.kind === 'createProject' && op.id !== undefined) {
+      if (!projectCreateIndex.has(op.id)) projectCreateIndex.set(op.id, i)
+    } else if (op.kind === 'createCanvas') {
+      if (!canvasCreateIndex.has(op.canvasId)) canvasCreateIndex.set(op.canvasId, i)
+    }
+  }
+
+  // 建边(parent create → child op 引用该 parent id 且 parent 在批内)。边方向:parent 先 → child 后。
+  // adj[parentIdx] = [childIdx, ...]; indegree[childIdx]++。
+  const n = ordered.length
+  const adj: number[][] = Array.from({ length: n }, () => [])
+  const indegree = new Array<number>(n).fill(0)
+  for (let i = 0; i < n; i++) {
+    const op = ordered[i]!.op
+    // canvas 写引用 project id(createCanvas/updateCanvas 依赖批内 createProject(id=op.projectId))。
+    // deleteCanvas 不带 projectId(create+delete 同 id 已被 combineOps 抵消,批内不并存)。
+    if (op.kind === 'createCanvas' || op.kind === 'updateCanvas') {
+      const pIdx = projectCreateIndex.get(op.projectId)
+      if (pIdx !== undefined && pIdx !== i) {
+        adj[pIdx]!.push(i)
+        indegree[i]!++
+      }
+    }
+    // chat 写引用 canvas id(append/update/deleteChatMessage 依赖批内 createCanvas(id=op.canvasId))。
+    if (
+      op.kind === 'appendChatMessage' ||
+      op.kind === 'updateChatMessage' ||
+      op.kind === 'deleteChatMessage'
+    ) {
+      const cIdx = canvasCreateIndex.get(op.canvasId)
+      if (cIdx !== undefined && cIdx !== i) {
+        adj[cIdx]!.push(i)
+        indegree[i]!++
+      }
+    }
+  }
+
+  // Kahn 拓扑排序:就绪集(入度 0)用最小堆按原序(ordered index 升序)做 tie-break —— 每次取原序最靠前者。
+  // 无边记录入度 0 一开始就在堆里,按原序逐个弹出 → 完全保持原序;有边记录等 parent 弹出后入度归零才入堆。
+  const heap: number[] = []
+  const heapPush = (idx: number): void => {
+    heap.push(idx)
+    let c = heap.length - 1
+    while (c > 0) {
+      const p = (c - 1) >> 1
+      if (heap[p]! <= heap[c]!) break
+      ;[heap[p]!, heap[c]!] = [heap[c]!, heap[p]!]
+      c = p
+    }
+  }
+  const heapPop = (): number => {
+    const top = heap[0]!
+    const last = heap.pop()!
+    if (heap.length > 0) {
+      heap[0] = last
+      let p = 0
+      const len = heap.length
+      for (;;) {
+        const l = 2 * p + 1
+        const r = l + 1
+        let smallest = p
+        if (l < len && heap[l]! < heap[smallest]!) smallest = l
+        if (r < len && heap[r]! < heap[smallest]!) smallest = r
+        if (smallest === p) break
+        ;[heap[smallest]!, heap[p]!] = [heap[p]!, heap[smallest]!]
+        p = smallest
+      }
+    }
+    return top
+  }
+  for (let i = 0; i < n; i++) if (indegree[i] === 0) heapPush(i)
+
+  const sorted: QueuedWrite[] = []
+  const placed = new Array<boolean>(n).fill(false)
+  while (heap.length > 0) {
+    const idx = heapPop()
+    if (placed[idx]) continue
+    placed[idx] = true
+    sorted.push(ordered[idx]!)
+    for (const childIdx of adj[idx]!) {
+      if (--indegree[childIdx]! === 0) heapPush(childIdx)
+    }
+  }
+  // 环保护:FK 边 create→child 单调,不应成环。若因异常数据成环(理论不应发生),剩余按原序追加,
+  // 防 Kahn 死锁导致记录永不 drain(永驻 IDB)。debugLogger.warn 可见,不静默(fail visibly)。
+  if (sorted.length < n) {
+    debugLogger.warn(
+      SOURCE,
+      `topo sort detected possible cycle (${n - sorted.length} records unplaced); appending remainder in original order`,
+    )
+    for (let i = 0; i < n; i++) {
+      if (!placed[i]) sorted.push(ordered[i]!)
+    }
+  }
+  return sorted
+}
+
+/**
+ * G1-a R2 F1:同资源 op 组合规则(在 drain 前的 enqueue coalesce 用)。返回合并后的 op,
+ * 或 'cancel' 表示净消(删 pending 记录,不发任何请求)。
+ *
+ * 旧实现 `existing.op = op` 无差别替换 kind:pending create 被随后的 update 原地替换成 update,
+ * drain 只发 PATCH/PUT,服务端从未收到 POST(create 丢失)——新建后快速重命名会 404。
+ *
+ * 组合规则:
+ *  - create+update → 合并为 create 的最终 body(保留 create kind;drop baseRevision,create 无 base)。
+ *  - create+delete → 净消(资源从未服务端创建,delete 无意义)。
+ *  - 其余(update+update / update+delete / delete+delete / delete+update)→ last-wins(incoming)。
+ *    create+create 同 id 正常 store 流不会发生(createProject 每次新 mint id);若发生也 last-wins。
+ */
+const combineOps = (existing: WriteOp, incoming: WriteOp): WriteOp | 'cancel' => {
+  const ek = existing.kind
+  const ik = incoming.kind
+  // create+update → 保留 create kind,合并到最终 body(防 create 被 update 替换致服务端从未 POST)
+  if (ek === 'createProject' && ik === 'updateProject') {
+    return { kind: 'createProject', name: incoming.name, id: existing.id ?? incoming.projectId }
+  }
+  if (ek === 'createCanvas' && ik === 'updateCanvas') {
+    // R3 F1:field-wise merge — 保留 create 独有/未改字段( notably sourceTemplateId)。
+    // 生产 rename(只带 title)/move(只带 projectId)的 update 不带 sourceTemplateId,
+    // 旧实现只用 incoming 重建 create 致 sourceTemplateId 被静默丢弃。现按字段级合并:
+    // incoming 显式携带 → 用 incoming(可改);incoming 未带 → 保留 existing(不丢 create 独有字段)。
+    return {
+      kind: 'createCanvas',
+      canvasId: existing.canvasId,
+      projectId: incoming.projectId,
+      ...(incoming.title !== undefined
+        ? { title: incoming.title }
+        : existing.title !== undefined
+          ? { title: existing.title }
+          : {}),
+      ...(incoming.sourceTemplateId !== undefined
+        ? { sourceTemplateId: incoming.sourceTemplateId }
+        : existing.sourceTemplateId !== undefined
+          ? { sourceTemplateId: existing.sourceTemplateId }
+          : {}),
+    }
+  }
+  // create+delete → 净消(资源从未服务端创建,delete 无意义)
+  if (ek === 'createProject' && ik === 'deleteProject') return 'cancel'
+  if (ek === 'createCanvas' && ik === 'deleteCanvas') return 'cancel'
+  // 其余组合:last-wins(update+update / update+delete / delete+delete / delete+update / create+create)
+  return incoming
+}
 
 /** Exponential backoff with jitter: min(base * 2^(attempts-1), max) * (0.5..1.0). */
 const backoffDelay = (attempts: number, base: number, max: number, rand: () => number): number => {
@@ -328,6 +626,15 @@ export type WriteQueueOptions = {
   maxDelayMs?: number
   drainIntervalMs?: number
   onConflict?: (op: WriteOp, currentRevision: Revision) => void
+  /**
+   * G1-a R2 F1:成功写回灌。drain 收到 success outcome 时调用,让调用方把服务端返回的新
+   * revision/metaRevision 写回 store,下一次 strict update(PATCH/PUT 带 If-Match)用 fresh base
+   * 而非陈旧值(否则 create 成功后 rename 仍带旧/缺 base → 428,或第二次 rename → 409)。
+   * outcome.revision 为服务端响应携带的 revision(Project.revision / CanvasMeta.metaRevision);
+   * 无 revision 的 op(delete/user-state/asset/chat envelope)revision 为 undefined,调用方据此跳过。
+   * 返回 Promise 时 drain 会 await(确保回灌在 drain 返回前落地,测试/后续 strict update 可见)。
+   */
+  onSuccess?: (op: WriteOp, outcome: { revision?: Revision }) => void | Promise<void>
   /** Inject for deterministic tests. Default: Date.now. */
   clock?: () => number
   /** Inject for deterministic jitter. Default: Math.random. */
@@ -359,6 +666,7 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
   const maxDelay = opts.maxDelayMs ?? DEFAULT_MAX_DELAY
   const drainInterval = opts.drainIntervalMs ?? DEFAULT_DRAIN_INTERVAL
   const onConflict = opts.onConflict
+  const onSuccess = opts.onSuccess
   const now = opts.clock ?? (() => Date.now())
   const rand = opts.random ?? (() => Math.random())
 
@@ -368,41 +676,15 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
   let onlineHandler: (() => void) | undefined
   let visibilityHandler: (() => void) | undefined
 
-  const enqueue = async (op: WriteOp): Promise<string> => {
-    // DP-7: the two device-local API keys (gateway-key/mivo-key) and secret-like
-    // user-state keys/values must NEVER enter the queue payload. Reject at the gate —
-    // never persist, never send. Reuse ALL three #194 contract scanners (no bespoke
-    // scanner) so the prior isUserStateKeyForbidden-alone gaps are closed:
-    //  - camelCase field names (gatewayKey/mivoKey) as the user-state key or nested in the
-    //    value — isUserStateKeyForbidden only knew hyphenated gateway-key/mivo-key + the
-    //    secret/token/password/apikey substrings, so key='gatewayKey' / value={mivoKey:...}
-    //    both bypassed it (P1-1).
-    //  - credential-value segments inside a colon-separated key (mivo_xxx / sk-xxx),
-    //    including URL-encoded / double-encoded variants — scanUserStateKeyForCredential.
-    //  - any sensitive field path nested arbitrarily deep in the value (camelCase,
-    //    hyphenated, prefixed, encoded) — scanForSensitiveFields, invoked with the key
-    //    wrapped as a synthetic field name so the key itself is matched against
-    //    SENSITIVE_FIELD_PATTERN (catches gatewayKey/mivoKey/secret/...) and op.value is
-    //    recursed in the same pass.
-    if (op.kind === 'putUserState' || op.kind === 'deleteUserState') {
-      const value = op.kind === 'putUserState' ? op.value : undefined
-      const keySegHit = scanUserStateKeyForCredential(op.key)
-      const fieldHit = scanForSensitiveFields({ [op.key]: value })
-      if (isUserStateKeyForbidden(op.key) || keySegHit !== null || fieldHit !== null) {
-        const reason =
-          keySegHit !== null
-            ? `forbidden credential segment in key: ${keySegHit}`
-            : fieldHit !== null
-              ? `forbidden field path: ${fieldHit}`
-              : `forbidden user-state key: ${op.key}`
-        debugLogger.error(SOURCE, `refused to queue ${op.kind} (DP-7): ${reason}`)
-        toastFeedback.error('该设置项含敏感信息,不能同步,已阻止。')
-        throw new Error(`DP-7 forbidden user-state payload: ${reason}`)
-      }
-    }
+  // G1-a R2 F1:per-resourceKey 串行链。back-to-back enqueue 到同 key 必须看到彼此的 putWrite
+  // 才能 coalesce;否则两个同步 fire 的 enqueue 竞态(第一个 IDB put 未落,第二个 getAllWrites
+  // 看不到 → 各建独立记录 → create 被当作独立 PATCH/PUT 发出,create 丢失)。链串行化同 key 入队;
+  // 跨 key 仍并发。slot 用 always-resolved 包装防 rejected 污染链 / unhandled rejection;settled 后
+  // 若无更新 enqueue 接管则 prune(Map 不随 distinct key 无界增长)。
+  const enqueueChain = new Map<string, Promise<unknown>>()
 
+  const doEnqueue = async (op: WriteOp, resourceKey: string | null): Promise<string> => {
     const userId = getPersistUserId()
-    const resourceKey = computeResourceKey(op)
     const ts = now()
     const all = await getAllWrites()
 
@@ -419,7 +701,18 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
           (r.status === 'pending' || r.status === 'paused-401'),
       )
       if (existing) {
-        existing.op = op
+        // G1-a R2 F1:kind-aware 组合(create+update 合并保留 create / create+delete 净消),
+        // 不再无差别 `existing.op = op`(会把 pending create 替换成 update 致服务端从未 POST)。
+        const combined = combineOps(existing.op, op)
+        if (combined === 'cancel') {
+          await deleteWrite(existing.id)
+          debugLogger.log(
+            SOURCE,
+            `coalesced write ${resourceKey} (create+delete net-cancel; removed pending ${existing.id})`,
+          )
+          return existing.id
+        }
+        existing.op = combined
         existing.idempotencyKey = newKey()
         existing.attempts = 0
         existing.nextAttemptAt = ts
@@ -481,6 +774,59 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
     return record.id
   }
 
+  const enqueue = (op: WriteOp): Promise<string> => {
+    // DP-7: the two device-local API keys (gateway-key/mivo-key) and secret-like
+    // user-state keys/values must NEVER enter the queue payload. Reject at the gate —
+    // never persist, never send. Reuse ALL three #194 contract scanners (no bespoke
+    // scanner) so the prior isUserStateKeyForbidden-alone gaps are closed:
+    //  - camelCase field names (gatewayKey/mivoKey) as the user-state key or nested in the
+    //    value — isUserStateKeyForbidden only knew hyphenated gateway-key/mivo-key + the
+    //    secret/token/password/apikey substrings, so key='gatewayKey' / value={mivoKey:...}
+    //    both bypassed it (P1-1).
+    //  - credential-value segments inside a colon-separated key (mivo_xxx / sk-xxx),
+    //    including URL-encoded / double-encoded variants — scanUserStateKeyForCredential.
+    //  - any sensitive field path nested arbitrarily deep in the value (camelCase,
+    //    hyphenated, prefixed, encoded) — scanForSensitiveFields, invoked with the key
+    //    wrapped as a synthetic field name so the key itself is matched against
+    //    SENSITIVE_FIELD_PATTERN (catches gatewayKey/mivoKey/secret/...) and op.value is
+    //    recursed in the same pass.
+    if (op.kind === 'putUserState' || op.kind === 'deleteUserState') {
+      const value = op.kind === 'putUserState' ? op.value : undefined
+      const keySegHit = scanUserStateKeyForCredential(op.key)
+      const fieldHit = scanForSensitiveFields({ [op.key]: value })
+      if (isUserStateKeyForbidden(op.key) || keySegHit !== null || fieldHit !== null) {
+        const reason =
+          keySegHit !== null
+            ? `forbidden credential segment in key: ${keySegHit}`
+            : fieldHit !== null
+              ? `forbidden field path: ${fieldHit}`
+              : `forbidden user-state key: ${op.key}`
+        debugLogger.error(SOURCE, `refused to queue ${op.kind} (DP-7): ${reason}`)
+        toastFeedback.error('该设置项含敏感信息,不能同步,已阻止。')
+        return Promise.reject(new Error(`DP-7 forbidden user-state payload: ${reason}`))
+      }
+    }
+
+    const resourceKey = computeResourceKey(op)
+    const run = (): Promise<string> => doEnqueue(op, resourceKey)
+    // chat messages(resourceKey=null)不串行(每条独立 op,不 coalesce),直接 run。
+    if (resourceKey === null) return run()
+    // G1-a R2 F1:同 key 串行 —— 后一个 enqueue 等前一个 putWrite 完成再 getAllWrites,保证 coalesce。
+    const prev = enqueueChain.get(resourceKey) ?? Promise.resolve()
+    const real = prev.then(run, run)
+    // slot 用 always-resolved 包装:real 若 reject(DP-7 / queue full)不污染后续链、不触发 unhandled rejection。
+    const slot: Promise<unknown> = real.then(
+      () => undefined,
+      () => undefined,
+    )
+    enqueueChain.set(resourceKey, slot)
+    // settled 后若本 slot 仍是最新(无更新 enqueue 接管)则 prune,防 Map 随 distinct key 无界增长。
+    slot.then(() => {
+      if (enqueueChain.get(resourceKey) === slot) enqueueChain.delete(resourceKey)
+    })
+    return real
+  }
+
   const drain = async (): Promise<DrainResult> => {
     if (paused) return { processed: 0, successes: 0, failures: 0, terminals: 0, paused: true }
     if (draining) return { processed: 0, successes: 0, failures: 0, terminals: 0, paused: false }
@@ -532,9 +878,12 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
             (r.status === 'pending' || r.status === 'paused-401') &&
             r.nextAttemptAt <= ts,
         )
-        .sort((a, b) => a.nextAttemptAt - b.nextAttemptAt || a.createdAt - b.createdAt)
 
-      for (const rec of due) {
+      // R7-1:稳定拓扑排序(替换 R6-1 的标量 dependencyRank)。只沿真实 FK 边约束顺序,其余一律保持
+      // 原序——防混合批中无关记录跨过有 FK 边的记录(见 stableTopologicalSort 注释)。
+      const sortedDue = stableTopologicalSort(due)
+
+      for (const rec of sortedDue) {
         if (paused) break // a prior op in this cycle got 401 → stop
         rec.status = 'in-flight'
         rec.lastAttemptAt = ts
@@ -560,6 +909,14 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
               SOURCE,
               `write ${rec.id} (${rec.resourceKey ?? rec.op.kind}) succeeded after ${rec.attempts + 1} attempt(s); removed from queue`,
             )
+            // G1-a R2 F1:把服务端返回的新 revision 回灌调用方(store),下一次 strict update 用 fresh base。
+            if (outcome.revision !== undefined) {
+              try {
+                await onSuccess?.(rec.op, { revision: outcome.revision })
+              } catch (cbErr) {
+                debugLogger.warn(SOURCE, `onSuccess callback threw: ${msg(cbErr)}`)
+              }
+            }
             await deleteWrite(rec.id)
             successes++
             break
@@ -650,6 +1007,20 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
             )
             toastFeedback.info('登录已过期,重新登录后将自动重试未保存的改动。')
             break
+          case 'unsupported-retained': {
+            // G1-a P1-3:canvas/chat op 当前 executor 不支持(G1-c 挂 N2-0 / DP-6R 另一 worker)。
+            // 绝不 deleteWrite(否则 G1-c/DP-6R 上线前遗留的 durable 记录被不可恢复删除);
+            // 标 deferred 留存 —— 不发请求(deferred 不在 due 过滤的 pending|paused-401 内,下次 drain 不再取出),
+            // 等 executor 升级后由 G1-c/DP-6R 显式 flip deferred→pending 再 drain。
+            rec.status = 'deferred'
+            rec.lastError = outcome.message
+            await putWrite(rec)
+            debugLogger.log(
+              SOURCE,
+              `write ${rec.id} (${rec.resourceKey ?? rec.op.kind}) deferred — unsupported op retained for executor upgrade: ${outcome.message}`,
+            )
+            break
+          }
         }
         if (paused) break
       }
@@ -749,6 +1120,17 @@ const clearIdbStore = async (): Promise<void> => {
 }
 
 export const __dumpWritesForTest = getAllWrites
+
+/**
+ * G1-a R4 F2 test-only:直接 putWrite 一批构造好的记录(含受控 id / createdAt / nextAttemptAt),
+ * 让单测能精确复现"同毫秒多资源链 + 逆境 IDB key 顺序"——enqueue 路径用随机 UUID 不便控制 key 序。
+ * 与 __dumpWritesForTest / __resetWriteQueueDb 同为 test-only accessor;生产代码不调用。
+ */
+export const __seedWritesForTest = async (records: QueuedWrite[]): Promise<void> => {
+  for (const record of records) {
+    await putWrite(record)
+  }
+}
 
 export const __resetWriteQueueDb = async (): Promise<void> => {
   memStore.clear()

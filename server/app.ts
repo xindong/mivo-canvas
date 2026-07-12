@@ -87,7 +87,13 @@ export { sharedPermissionBackend }
 export const app = new Hono<AppEnv>()
 
 // Liveness probe.
-app.get('/healthz', (c) => c.json({ status: 'ok' }))
+// G1-a R2 F3:暴露 persist readiness(backend kind + durable 标志)。不泄密(backend kind 非敏感)。
+// 客户端 bootPersistWiring 在 server 模式据此 fail-closed:memory 后端不发业务写、不删 durable 记录
+// (防 pm2 重启后“成功保存”假象);pg ready 才 hydrate + start queue;readiness 失败同样 fail-closed。
+const persistDurable = persistBackendConfig.kind === 'pg'
+app.get('/healthz', (c) =>
+  c.json({ status: 'ok', persist: { backend: persistBackendConfig.kind, durable: persistDurable } }),
+)
 
 // P0.3 Readiness probe(区别于 /healthz 的 liveness):/healthz 只表"进程活",
 // /readyz 表"依赖此刻可用"——PG persist + permission 连接(SELECT 1)+ asset dir 可写。任一 fail → 503

@@ -76,6 +76,12 @@ export const useAuthStore = create<AuthState>()((set, get) => ({
           void migrateUntaggedAssets(newUid)
           set({ user: me.user, status: 'authenticated' })
           debugLogger.log('Auth', `会话已恢复:${me.user.name} (${me.user.id})`)
+          // G1-a R2 F5:转入 authenticated 时恢复可能被 401 暂停的持久队列(dynamic import 防静态环;
+          // 队列未启动时 no-op,真正重放在 bootPersistWiring 已认证分支;此处覆盖未来 mid-session
+          // re-auth / token 刷新免重载场景)。
+          void import('../lib/persistBoot')
+            .then(({ resumePersistQueue }) => resumePersistQueue())
+            .catch((e) => debugLogger.warn('Auth', `resumePersistQueue on auth failed: ${e instanceof Error ? e.message : String(e)}`))
         } else {
           // 网关 401 / dev 桩未开 → 未登录。预期态,打 info 不告警。
           // FX-6: 401 不是 logout —— 不重置缓存命名空间(否则会把内存画布写进共享

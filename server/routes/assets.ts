@@ -281,6 +281,128 @@ export const createAssetRoutes = (options: AssetRouteOptions = {}): App => {
     return c.body(hit.bytes as never)
   })
 
+  // ── G1-a P1-2 seam:asset attach/detach HTTP 入口(节点生命周期调用方属 G1-c,本轮冻结 wire)──
+  // assetStore.attach/detach 已实现(内容寻址 + refcount = references.length + owner-checked),
+  // 但此前无 HTTP 入口 → refcount 恒 0。本路由暴露 attach/detach:ownerFp 服务端从 key 派生
+  // (client 不可指定,防越权 attach 他人 asset);nodeId 在 body。返回 wire AttachAssetResult/DetachAssetResult。
+  // 语义:attach 0→1 幂等(already-attached no-op);detach 1→0 幂等;跨 owner detach → 403(decidable,不静默)。
+  // 节点 mutation 调用方(createImageNode/deleteNode)属 G1-c(N2-0),本轮只冻结 route + 不接调用方。
+  //
+  // ── EXPOSURE TRACE(lead 2026-07-12 批准:owner-gate 延 G2.2,需 documented exposure)──
+  // attach 路由 **不 owner-gate**(assetStore.attach 不 owner-check;AttachResult 无 owner-mismatch kind)。
+  // 含义:任何持有 assetId(sha256 hex64)的请求方可 attach 自己的 ref → ref 即 live reference → 可 GET 该
+  // asset。这是内容寻址 ref 模型的既有 backend 设计(attachRef 一直如此),非 G1-a 新引入。生产暴露面:
+  //   - 知 hash 即可 attach+读(理论上绕过 T1.4 share-grant 的显式授权流)。
+  // 缓解(G1-a 阶段):assetId 仅返给 uploader(POST /api/assets 响应);不列举、不猜测(sha256 不可枚举)。
+  // 节点生命周期 attach 同 owner(用户上传 + attach 自己画布的节点),cross-owner attach 生产不发生。
+  // 待办(G2.2):route 层加 `record.ownerFp === attacher` 检查(service 层暴露 isUploader),或并入 T1.4
+  // share-grant 设计统一授权。在此之前的暴露:attach 不阻止 cross-owner(知 hash 即可),detattach 已 owner-gate。
+  const ATTACH_BODY_MAX = 8192 // nodeId 小体量;8KB 上限防滥用
+
+  app.post('/assets/:id/attach', async (c) => {
+    const requestId = newRequestId()
+    c.header('X-Request-Id', requestId)
+    const t0 = Date.now()
+    const assetId = c.req.param('id')
+    const log = (status: number, note?: string): void => {
+      logRequest({ method: 'POST', path: `/api/assets/${shortHash(assetId)}/attach`, requestId, status, latencyMs: Date.now() - t0, note })
+    }
+    // R3-F2: resolveAssetOwner (strict proof) before ALL validation (bad-key/assetId shape),对齐 POST/GET
+    // proof-gate 语义——strict + 无 proof → 401 在 bad-key/assetId 校验前(无存在性泄漏)。合并时 G1-a attach
+    // 漏同步 G2.1(7743a1d)前置语义,沿用裸 fingerprintOfPlatformKey → strict 下绕过 proof-gate(安全回归);
+    // 改用 resolveAssetOwner 对齐 POST/GET:legacy(non-strict)下 ≡ fingerprintOfPlatformKey(resolvePlatformCtx(c).platformKey),零变化。
+    const ownerFp = resolveAssetOwner(c)
+    const badKey = rejectInvalidMivoApiKey(c)
+    if (badKey) {
+      log(400, 'bad-mivo-key')
+      return badKey
+    }
+    if (!ASSET_ID_RE.test(assetId)) {
+      log(404, 'invalid-id')
+      return plainTextNoContentType(c, 'Asset not found', 404)
+    }
+    let body: { nodeId?: string }
+    try {
+      body = await readJsonBody<{ nodeId?: string }>(c, ATTACH_BODY_MAX)
+    } catch {
+      log(400, 'bad-body')
+      return c.json({ error: 'invalid body; expected { nodeId: string }' }, 400)
+    }
+    const nodeId = body?.nodeId?.trim()
+    if (!nodeId) {
+      log(400, 'missing-node-id')
+      return c.json({ error: 'nodeId is required' }, 400)
+    }
+    // service 层 attach 直接返 AttachResult union(attached/already-attached/missing);ownerFp 服务端派生。
+    const result = await store.attach(assetId, nodeId, ownerFp)
+    switch (result.kind) {
+      case 'attached':
+        log(200, 'attached')
+        return c.json({ kind: 'attached' } as { kind: 'attached' }, 200)
+      case 'already-attached':
+        log(200, 'already-attached')
+        return c.json({ kind: 'already-attached' } as { kind: 'already-attached' }, 200)
+      case 'missing':
+        // 无 record/bytes — attach 拒(decidable,不静默)。404(executor 映射 rejected:不能 attach 到不存在的 asset)。
+        log(404, 'missing')
+        return c.json({ kind: 'missing' } satisfies { kind: 'missing' }, 404)
+    }
+  })
+
+  app.post('/assets/:id/detach', async (c) => {
+    const requestId = newRequestId()
+    c.header('X-Request-Id', requestId)
+    const t0 = Date.now()
+    const assetId = c.req.param('id')
+    const log = (status: number, note?: string): void => {
+      logRequest({ method: 'POST', path: `/api/assets/${shortHash(assetId)}/detach`, requestId, status, latencyMs: Date.now() - t0, note })
+    }
+    // R3-F2: resolveAssetOwner (strict proof) before ALL validation (bad-key/assetId shape),对齐 POST/GET
+    // proof-gate 语义——strict + 无 proof → 401 在 bad-key/assetId 校验前(无存在性泄漏)。合并时 G1-a detach
+    // 漏同步 G2.1(7743a1d)前置语义,沿用裸 fingerprintOfPlatformKey → strict 下绕过 proof-gate(安全回归);
+    // 改用 resolveAssetOwner 对齐 POST/GET:legacy(non-strict)下 ≡ fingerprintOfPlatformKey(resolvePlatformCtx(c).platformKey),零变化。
+    const ownerFp = resolveAssetOwner(c)
+    const badKey = rejectInvalidMivoApiKey(c)
+    if (badKey) {
+      log(400, 'bad-mivo-key')
+      return badKey
+    }
+    if (!ASSET_ID_RE.test(assetId)) {
+      log(404, 'invalid-id')
+      return plainTextNoContentType(c, 'Asset not found', 404)
+    }
+    let body: { nodeId?: string }
+    try {
+      body = await readJsonBody<{ nodeId?: string }>(c, ATTACH_BODY_MAX)
+    } catch {
+      log(400, 'bad-body')
+      return c.json({ error: 'invalid body; expected { nodeId: string }' }, 400)
+    }
+    const nodeId = body?.nodeId?.trim()
+    if (!nodeId) {
+      log(400, 'missing-node-id')
+      return c.json({ error: 'nodeId is required' }, 400)
+    }
+    // service 层 detach 直接返 DetachResult union(detached/already-detached/missing/owner-mismatch)。
+    const result = await store.detach(assetId, nodeId, ownerFp)
+    switch (result.kind) {
+      case 'detached':
+        log(200, 'detached')
+        return c.json({ kind: 'detached' } as { kind: 'detached' }, 200)
+      case 'already-detached':
+        log(200, 'already-detached')
+        return c.json({ kind: 'already-detached' } as { kind: 'already-detached' }, 200)
+      case 'missing':
+        // 无 record → 404(executor 幂等 success:detach intent 已满足,asset/ref 已不在)。
+        log(404, 'missing')
+        return c.json({ kind: 'missing' } satisfies { kind: 'missing' }, 404)
+      case 'owner-mismatch':
+        // 跨 owner 非法 detach → 403(decidable,不静默;executor 映射 rejected:绝不静默成功他人 asset 的 detach)。
+        log(403, 'owner-mismatch')
+        return c.json({ kind: 'owner-mismatch' } satisfies { kind: 'owner-mismatch' }, 403)
+    }
+  })
+
   return app
 }
 
