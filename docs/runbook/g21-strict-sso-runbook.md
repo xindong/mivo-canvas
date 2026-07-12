@@ -118,7 +118,7 @@ strict 模式下每条 stateful route 的鉴权域 + 测试引用:
 | `GET/POST/PATCH/DELETE /api/canvas/:id/...` | owner-scoped(`resolveActor`) | ✅ R2-2 middleware | 同上;canvas getCanvasOwner 跳过 | `canvas.route.test.ts` + `sso-strict.route.test.ts` §R2-2 |
 | `GET/PUT /api/user-state` | owner-scoped(`resolveActor`) | ✅ R2-2 middleware | 同上 | `userState.route.test.ts` |
 | `POST /api/mivo/tasks/:id` / `GET /tasks/:id` | owner-scoped(`resolveTaskOwner`→`resolveActor`) | ✅ R2-2 middleware | 缺 proof → 401 在 multipart/JSON 解析前;各 task POST 一律 401 | `sso-strict.route.test.ts` §tasks + §R2-2(realApp) |
-| `POST /api/assets` / `GET /api/assets/:id` | owner-scoped(`resolveAssetOwner`) | ✅ route 内早于 body(`resolveAssetOwner` 在 decode 前) | strict 走 SSO actor;缺 proof → 401 | `sso-strict.route.test.ts` §assets |
+| `POST /api/assets` / `GET /api/assets/:id` | owner-scoped(`resolveAssetOwner`) | ✅ route 内早于所有 validation(R3-F2:`resolveAssetOwner` 在 bad-key/assetId/body 前;GET invalid/missing/known 无 proof 一律 401,无 assetId 形状泄漏) | strict 走 SSO actor;缺 proof → 401 | `sso-strict.route.test.ts` §assets + §R3-F2 assets |
 | `* /api/projects/:id/members` | owner-scoped(`resolveActor` + authz) | ✅ R2-2 middleware(`/api/projects/*`) | 同 projects;token-scoped 豁免 | `permissions.route.test.ts` |
 | `* /api/projects/:id/share-links` | owner-scoped(`resolveActor` + authz) | ✅ R2-2 middleware(`/api/projects/*`) | 同 projects | `permissions.route.test.ts` |
 | `GET /api/share/:token` | **token-scoped**(无鉴权,token 驱动) | N/A(不挂 middleware) | strict 不影响(revoked→410,unknown→404) | `permissions.route.test.ts` |

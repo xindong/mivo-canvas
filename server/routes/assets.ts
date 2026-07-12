@@ -99,13 +99,17 @@ export const createAssetRoutes = (options: AssetRouteOptions = {}): App => {
       logRequest({ method: 'POST', path: '/api/assets', requestId, status, latencyMs: Date.now() - t0, note })
     }
 
+    // R3-F2: resolveAssetOwner (strict proof) before ALL validation (bad-key/body/decode),
+    // 对齐 proof-gate 语义——strict + 无 proof → 401 在任何 bad-key/body/decode 前(invalid/missing/known
+    // asset 一律 401,无存在性泄漏;返修前 GET bad-key/assetId 校验在 proof 前 → 404 泄漏)。
+    const ownerFp = resolveAssetOwner(c)
+
     // F4: reject malformed X-Mivo-Api-Key at the boundary (no env fallback for bogus headers).
     const badKey = rejectInvalidMivoApiKey(c)
     if (badKey) {
       log(400, 'bad-mivo-key')
       return badKey
     }
-    const ownerFp = resolveAssetOwner(c)
 
     // P1 decode concurrency gate: acquire a global sharp-decode permit BEFORE reading
     // the body. A sharp decode expands a small compressed upload to a huge uncompressed
@@ -247,9 +251,15 @@ export const createAssetRoutes = (options: AssetRouteOptions = {}): App => {
       logRequest({ method: 'GET', path: `/api/assets/${shortHash(assetId)}`, requestId, status, latencyMs: Date.now() - t0, note })
     }
 
+    // R3-F2: resolveAssetOwner (strict proof) before ALL validation (bad-key/assetId shape).
+    // strict + 无 proof → 401 在 bad-key/assetId 校验前(invalid/missing/known asset 一律 401,无存在性
+    // 泄漏)。返修前 GET 把 ASSET_ID_RE/badKey 校验放在 resolveAssetOwner 前 → strict+无 proof 下
+    // not-a-hash=404、合法形状 missing=401(不一致,泄漏 assetId 形状)。
+    const ownerFp = resolveAssetOwner(c)
+
     const badKey = rejectInvalidMivoApiKey(c)
     if (badKey) {
-      log(400, 'bad-mivo-key')
+      log(400, 'bad-mimo-key')
       return badKey
     }
     if (!ASSET_ID_RE.test(assetId)) {
@@ -257,7 +267,6 @@ export const createAssetRoutes = (options: AssetRouteOptions = {}): App => {
       return plainTextNoContentType(c, 'Asset not found', 404)
     }
     // P2.5: owner-scoped read — must be uploader or hold a live reference.
-    const ownerFp = resolveAssetOwner(c)
     const hit = await store.readForOwner(assetId, ownerFp)
     if (!hit) {
       log(404, 'missing-or-forbidden')

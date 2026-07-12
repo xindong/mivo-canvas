@@ -14,7 +14,7 @@ import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { resolveFeatureFlags } from './lib/env'
 import type { AppEnv } from './lib/types'
-import { ssoAuthErrorHandler, ssoStrictProofGate } from './lib/owner'
+import { ssoAuthErrorHandler, createSsoStrictProofGate, hasSubresourceId } from './lib/owner'
 import { generateHandler } from './routes/generate'
 import { editHandler } from './routes/edit'
 import { enhanceHandler } from './routes/enhance'
@@ -107,16 +107,18 @@ app.route('/api/auth', authRoute)
 // - stateless /api 路由(generate/edit/keys)不调 resolveActor → 不抛 → 不受影响。
 app.onError(ssoAuthErrorHandler)
 
-// G2.1 R2-2:strict proof 前置中间件。owner-scoped 路由(projects/canvas/userState/tasks/members/
-// shareLinks 子资源)在 strict + 无 share token 时,于任何 body 解析/DB lookup 前统一验 proof → 401。
-// token-scoped(share token 在)豁免;dev mode 豁免;legacy(non-strict)no-op(生产零变化)。
-// 消除存在性 oracle(known/missing 一律 401)+ 未鉴权不消耗昂贵解析(tasks multipart/projects JSON body)。
-// 不挂:/api/share(token-scoped 公开)+ /api/mivo/debug-logs(system-scoped 遥测)+ stateless 路由;
-// assets 路由已在 route 内 resolveAssetOwner 早于 body(无需本中间件)。详见 owner.ts ssoStrictProofGate。
-app.use('/api/projects/*', ssoStrictProofGate)
-app.use('/api/canvas/*', ssoStrictProofGate)
-app.use('/api/user-state/*', ssoStrictProofGate)
-app.use('/api/mivo/tasks/*', ssoStrictProofGate)
+// G2.1 R2-2/R3-F2:strict proof 前置中间件(工厂)。owner-scoped 路由(projects/canvas/userState/tasks/members/
+// shareLinks 子资源)在 strict + 无有效 share token 时,于任何 body 解析/DB lookup 前统一验 proof → 401。
+// R3-F2:token presence 不再豁免——按 route 能力收窄(shareCapable)+ token 经 resolveShareLinkByToken
+// 全局验有效性(active 才豁免;garbage/revoked/expired 不豁免,存在≠proof)。tasks/user-state 永不豁免;
+// projects root(无 :id)永不豁免(hasSubresourceId=false);projects/canvas :id 子资源 + canvas 全部支持
+// (canvas POST / 的 projectId 在 body,gate 全局验 token,route authz 验 token↔project)。
+// dev mode 豁免;legacy(non-strict)no-op(生产零变化)。assets 路由 R3-F2 在 route 内 resolveAssetOwner
+// 移到所有 validation 前(无需本中间件)。详见 owner.ts createSsoStrictProofGate。
+app.use('/api/projects/*', createSsoStrictProofGate({ permissions: sharedPermissionBackend, shareCapable: hasSubresourceId }))
+app.use('/api/canvas/*', createSsoStrictProofGate({ permissions: sharedPermissionBackend, shareCapable: true }))
+app.use('/api/user-state/*', createSsoStrictProofGate({ permissions: sharedPermissionBackend, shareCapable: false }))
+app.use('/api/mivo/tasks/*', createSsoStrictProofGate({ permissions: sharedPermissionBackend, shareCapable: false }))
 
 // P1-c generate/edit/enhance routes. app.all lets each handler enforce POST-only
 // (non-POST → 405 {error:'Method not allowed'}), matching dev middleware semantics

@@ -51,6 +51,7 @@ import type { Context, ErrorHandler, MiddlewareHandler } from 'hono'
 import { createHash, timingSafeEqual } from 'node:crypto'
 import { fingerprintOfPlatformKey, resolvePlatformCtx } from './keys'
 import type { PersistBackend } from '../persist/backend'
+import type { PermissionBackend } from './permissions'
 import { createAssetStore, createFsAssetBackend, resolveAssetStoreDir, type AssetStore } from './assetStore'
 import type { AppEnv } from './types'
 
@@ -228,31 +229,72 @@ export const resolveAssetOwner = (c: Context): string =>
   isSsoStrict() ? resolveActor(c) : fingerprintOfPlatformKey(resolvePlatformCtx(c).platformKey)
 
 /**
- * G2.1 R2-2:strict 模式 proof 前置中间件。owner-scoped 路由(projects/canvas/userState/tasks/members/
- * shareLinks)在 strict + 无 share token 时,于**任何 body 解析/DB lookup 前**统一验 proof(gateway
- * secret + SSO header),缺/错 → 抛 SsoAuthError(→ ssoAuthErrorHandler 401)。token-scoped(share token
- * 在)显式豁免(route authz 验 token,公开分享访问无需 gateway proof);dev mode 豁免(信任
- * x-mivo-auth-user 无需 proof,route 仍调 resolveActor)。legacy(non-strict)→ no-op(生产零变化)。
+ * G2.1 R3-F2:路径是否有 `:id` 子资源段(区分 collection root 与 sub-resource)。
+ * projects mount(`/api/projects/*`)用:root(`/api/projects`,GET list/POST create)不支持 share token,
+ * `:id` 子资源(`/api/projects/:id/...`)支持。shareCapable=本判定 → root 绝不因 token presence 豁免
+ * (R3-F2 修法点 1),`:id` 子资源 valid token 才豁免。
  *
- * **消除存在性 oracle**(R2-2):返修前 GET /api/projects/:id strict+无 proof 下 已存=401(authz 抛
- * SsoAuthError)、未知=404(getProjectOwner 缺失先返)→ 泄漏存在。前置后 known/missing 一律 401
- * (DB lookup 不被未鉴权请求触达)。**未鉴权不消耗昂贵解析**:tasks multipart/mask + projects JSON body
- * 在 401 前不解析(返修前非法 body POST=400、tasks multipart 先于 401 处理)。
+ * 按 `c.req.path`(不含 query)分段:2 段(`api`/`projects`)= root;>2 段 = 有 `:id`。适用于 2 段深
+ * mount(projects/canvas/user-state);tasks mount(`/api/mivo/tasks`,3 段深)用 `shareCapable:false` 直传,不走本判定。
+ */
+export const hasSubresourceId = (c: Context<AppEnv>): boolean => {
+  const parts = c.req.path.split('?')[0].split('/').filter(Boolean)
+  return parts.length > 2
+}
+
+/**
+ * G2.1 R2-2/R3-F2:strict proof 前置中间件(工厂)。owner-scoped 路由(projects/canvas/userState/tasks/
+ * members/shareLinks)在 strict 模式下,于**任何 body 解析/DB lookup 前**统一验 proof(gateway secret +
+ * SSO header),缺/错 → 抛 SsoAuthError(→ ssoAuthErrorHandler 401)。dev mode 豁免(信任 x-mivo-auth-user
+ * 无需 proof,route 仍调 resolveActor)。legacy(non-strict)→ no-op(生产零变化)。
+ *
+ * **R3-F2 修法(token 有效性校验,存在≠proof)**:返修前 `ssoStrictProofGate` 对任意非空 share header/query
+ * 直接 `next()`(token presence 即豁免)→ tasks/user-state/projects root 等不支持 share 的 owner route
+ * 可用垃圾 token 绕过前置 401,恢复未鉴权 body/multipart 解析(大 body/昂贵 multipart DoS)。
+ * 现工厂收 `permissions`(全局验 token via `resolveShareLinkByToken`)+ `shareCapable`(按 route 能力收窄):
+ *  - **不支持的 route(tasks/user-state/projects root)**:`shareCapable=false` → token presence 绝不豁免,
+ *    落到 proof 校验(无 proof → 401,body 不解析)。projects root 用 `hasSubresourceId`(无 `:id` → false)。
+ *  - **支持的 route(project/canvas 子资源)**:`shareCapable=true` → token 经 `resolveShareLinkByToken` 全局
+ *    验有效性:`kind==='active'` → 豁免(公开分享访问,route authz 再验 token↔project);garbage/revoked/
+ *    expired → 不豁免 → 落 proof(无 proof → 401,parser 不调用)。canvas 全部 shareCapable=true(POST `/`
+ *    的 projectId 在 body,无法在 gate 内验 token↔project,改全局验 token 有效性,route authz 验 token↔project)。
+ *
+ * **消除存在性 oracle**(R2-2):返修前 GET /api/projects/:id strict+无 proof 下 已存=401、未知=404 → 泄漏存在。
+ * 前置后 known/missing 一律 401(DB lookup 不被未鉴权请求触达)。**未鉴权不消耗昂贵解析**:tasks multipart/mask +
+ * projects JSON body 在 401 前不解析(返修前非法 body POST=400、tasks multipart 先于 401 处理)。
  *
  * 挂载点:owner-scoped 路由前(app.ts + persistTestApp)。**不挂**:/api/share(token-scoped 公开)、
  * /api/mivo/debug-logs(system-scoped 遥测,独立防护)、stateless /api/mivo/{generate,edit,enhance,...}。
- * assets 路由已在 route 内 resolveAssetOwner 早于 body 解析(无需本中间件)。
+ * assets 路由 R3-F2 把 `resolveAssetOwner` 移到所有 validation 前(route 内前置,无需本中间件)。
  */
-export const ssoStrictProofGate: MiddlewareHandler<AppEnv> = async (c, next) => {
+export const createSsoStrictProofGate = ({
+  permissions,
+  shareCapable,
+}: {
+  permissions: PermissionBackend
+  /**
+   * 本 mount 是否支持 share-token 访问。false=永不豁免(tasks/user-state/projects-root);
+   * true=全部支持(canvas);函数=按路径判定(projects `:id` via hasSubresourceId)。
+   */
+  shareCapable: boolean | ((c: Context<AppEnv>) => boolean)
+}): MiddlewareHandler<AppEnv> => async (c, next) => {
   if (!isSsoStrict(process.env)) return next() // legacy: no-op,零变化(不读 header 不解析 body)
-  // token-scoped 豁免:share token 在 → route authz 验 token(公开分享访问,无需 gateway proof)
+  if (isDevMode(process.env)) return next() // dev mode:信任 x-mivo-auth-user 无需 proof;route 仍调 resolveActor
+  // R3-F2:share token 须按 route 能力收窄 + 全局验有效性(存在≠proof)。
   const shareToken =
     c.req.header('x-mivo-share-token')?.trim() ||
     c.req.query('share')?.toString() ||
     undefined
-  if (shareToken) return next()
-  // strict + 无 share token:proof 前置(在 body 解析 / DB lookup 前)
-  if (isDevMode(process.env)) return next() // dev mode:信任 x-mivo-auth-user 无需 proof;route 仍调 resolveActor
+  if (shareToken) {
+    const cap = typeof shareCapable === 'function' ? shareCapable(c) : shareCapable
+    if (cap) {
+      // 全局验 token 有效性:active → 豁免(route authz 再验 token↔project);garbage/revoked/expired → 不豁免
+      const share = await permissions.resolveShareLinkByToken(shareToken)
+      if (share && share.kind === 'active') return next()
+    }
+    // non-share-capable route(tasks/user-state/projects-root)OR 无效 token → 不豁免,落 proof 校验(存在≠proof)
+  }
+  // strict + 无 share token / 无效 token:proof 前置(在 body 解析 / DB lookup 前)
   if (!ssoHeaderSecretOk(process.env, c.req.header(GATEWAY_SECRET_HEADER))) {
     throw new SsoAuthError('missing or mismatched gateway secret (x-mivo-gateway-secret)')
   }
