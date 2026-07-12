@@ -7,6 +7,7 @@ import {
   readRemoteDebugDates,
   readRemoteDebugRecords,
   remoteDebugRequestMeta,
+  DebugLogQuotaExceededError,
   type RemoteDebugPayload,
 } from '../lib/debug-records'
 
@@ -35,6 +36,10 @@ const LOCALHOST_ORIGIN = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/
 
 const getViewToken = (): string => process.env.MIVO_DEBUG_VIEW_TOKEN?.trim() ?? ''
 const isPublicMode = (): boolean => process.env.MIVO_PUBLIC === '1'
+// R2-4:生产边界 = MIVO_PUBLIC=1 或 NODE_ENV=production(mirror owner.ts validateSsoConfig)。
+// 生产下 debug-logs POST Origin 硬前置(必须显式配 MIVO_DEBUG_ALLOWED_ORIGINS,无 localhost 兜底)。
+const isProdBoundary = (): boolean =>
+  process.env.MIVO_PUBLIC === '1' || process.env.NODE_ENV === 'production'
 
 const getRateLimitPerMin = (): number => {
   const raw = process.env.MIVO_DEBUG_POST_RATE_LIMIT
@@ -68,9 +73,34 @@ const isOriginAllowed = (
   origin: string | undefined,
   allowed: { explicit: boolean; set: Set<string> },
 ): boolean => {
+  // R2-4:生产硬前置 — 生产边界(MIVO_PUBLIC=1 或 NODE_ENV=production)下必须显式配
+  // MIVO_DEBUG_ALLOWED_ORIGINS;无显式 allowlist → 一律拒(无 localhost 兜底);无 Origin 也拒
+  // (浏览器必带 Origin;非浏览器生产不应打 debug POST)。返修前"无 Origin 无条件放行"+"localhost 兜底"
+  // 让生产未配 allowlist 时任意 Origin/无 Origin 放行。
+  if (isProdBoundary()) {
+    if (!allowed.explicit) return false
+    if (!origin) return false
+    return allowed.set.has(origin)
+  }
+  // 非生产:dev compat(无 Origin 放行 + localhost 兜底,原行为不变)
   if (!origin) return true // non-browser / same-origin request carries no Origin
   if (allowed.explicit) return allowed.set.has(origin)
   return LOCALHOST_ORIGIN.test(origin)
+}
+
+/**
+ * R2-4:rate key 用可信来源(非客户端可控)。返修前取 XFF 首项 → 攻击者轮换 XFF 三连 200(rate=1 时绕过)。
+ * - MIVO_DEBUG_TRUST_XFF=1 opt-in(网关清洗 XFF 后 ops 开 + 写入网关验收清单 §真实网关验收)→ 信任 XFF 首项;
+ * - 默认关 → 用 socket remote addr(@hono/node-server c.env.incoming.remoteAddress,非客户端可控),
+ *   测试无 socket → 'unknown'。直连攻击者无法轮换 remote addr → rate 真实受限(网关后共享网关 IP,可接受)。
+ */
+const getRateKey = (c: { req: { header: (n: string) => string | undefined } }, env: unknown): string => {
+  if (process.env.MIVO_DEBUG_TRUST_XFF === '1') {
+    const xff = c.req.header('x-forwarded-for') ?? 'unknown'
+    return xff.split(',')[0].trim() || 'unknown'
+  }
+  const remote = (env as { incoming?: { remoteAddress?: string } } | null | undefined)?.incoming?.remoteAddress
+  return remote || 'unknown'
 }
 
 const hasViewAccess = (
@@ -90,10 +120,23 @@ const hasViewAccess = (
 
 // In-memory per-IP rate limit (D7). Single-process; resets if the BFF restarts.
 // Acceptable for an internal anti-abuse gate; real rate limiting is P4.
+// R2-4: bucket 淘汰(返修前无淘汰 → 内存无限增长)。size 超 MAX_BUCKETS 时 lazy sweep 窗外 stale 项。
+const getMaxBuckets = (): number => {
+  const raw = process.env.MIVO_DEBUG_RATE_MAX_BUCKETS
+  if (raw === undefined || raw === '') return 4096
+  const n = Number(raw)
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 4096
+}
 const rateBuckets = new Map<string, { count: number; windowStart: number }>()
 const rateLimitExceeded = (ip: string, perMin: number): boolean => {
   if (perMin <= 0) return false
   const now = Date.now()
+  // R2-4: lazy eviction — 超额时扫 stale 窗外 bucket 删除(bounded memory)。
+  if (rateBuckets.size > getMaxBuckets()) {
+    for (const [k, b] of rateBuckets) {
+      if (now - b.windowStart >= RATE_LIMIT_WINDOW_MS) rateBuckets.delete(k)
+    }
+  }
   const bucket = rateBuckets.get(ip)
   if (!bucket || now - bucket.windowStart >= RATE_LIMIT_WINDOW_MS) {
     rateBuckets.set(ip, { count: 1, windowStart: now })
@@ -106,6 +149,12 @@ const rateLimitExceeded = (ip: string, perMin: number): boolean => {
 // Test hook: clear the rate-limit state between tests.
 export const __resetDebugLogsRateLimit = (): void => {
   rateBuckets.clear()
+}
+// R2-4 test hook: bucket 数(测 lazy eviction bounded memory)。
+export const __debugLogsBucketCount = (): number => rateBuckets.size
+// R2-4 test hook: 直接 seed 一个 bucket(测 eviction sweep 前的 stale 状态)。
+export const __seedDebugLogsBucket = (key: string, windowStart: number, count = 1): void => {
+  rateBuckets.set(key, { count, windowStart })
 }
 
 class BodyTooLargeError extends Error {
@@ -149,8 +198,8 @@ debugLogsRoute.post('/debug-logs', async (c) => {
   if (!isOriginAllowed(c.req.header('origin'), getAllowedOrigins())) {
     return c.json({ ok: false, error: 'Origin not allowed' }, 403)
   }
-  // D7: rate limit (per IP from X-Forwarded-For, fallback 'unknown')
-  const ip = (c.req.header('x-forwarded-for') ?? 'unknown').split(',')[0].trim()
+  // D7: rate limit (R2-4: rate key 用可信来源 — 默认 socket remote addr,不取客户端可控 XFF)
+  const ip = getRateKey(c, c.env)
   if (rateLimitExceeded(ip, getRateLimitPerMin())) {
     return c.json({ ok: false, error: 'Too many requests' }, 429)
   }
@@ -164,6 +213,10 @@ debugLogsRoute.post('/debug-logs', async (c) => {
   } catch (error) {
     if (error instanceof BodyTooLargeError) {
       return c.json({ ok: false, error: 'Request body is too large' }, 413)
+    }
+    // R2-4:磁盘 quota 超限 → 413(对齐 body cap 语义;appendRemoteDebugRecords 抛 DebugLogQuotaExceededError)
+    if (error instanceof DebugLogQuotaExceededError) {
+      return c.json({ ok: false, error: 'Debug log disk quota exceeded' }, 413)
     }
     const message = error instanceof Error ? error.message : 'Unable to store debug logs'
     return c.json({ ok: false, error: message }, 400)

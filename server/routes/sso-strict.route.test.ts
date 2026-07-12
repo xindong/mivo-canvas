@@ -26,8 +26,12 @@ import {
   validateSsoConfig,
   isLegacyFormOwner,
   assertStrictOwnerMigrationComplete,
+  legacyOwnerDetector,
+  type LegacyOwnerDetector,
 } from '../lib/owner'
 import type { PersistBackend } from '../persist/backend'
+import { InMemoryPermissionBackend } from '../lib/permissions'
+import { createAssetStore, type AssetStore } from '../lib/assetStore'
 import type { AppEnv } from '../lib/types'
 
 const GW = 'gw-secret-xyz'
@@ -263,52 +267,140 @@ describe('G2.1 返修 F2 — isDevMode 路由级负向(strict+dev 各绕过组�
   })
 })
 
-// ── G2.1 返修 F1:owner-migration 启动 gate(机器判定,非文字约定)──────────────────
-describe('G2.1 返修 F1 — assertStrictOwnerMigrationComplete 启动 gate', () => {
-  it('非 strict + legacy 数据 → no-op 通过(生产零变化)', async () => {
-    const { backend } = buildPersistApp()
-    await backend.ensureCreate('abcd1234ef567890', 'project', 'p1', {}, { method: 'POST', resourceKind: 'project' })
-    expect(isLegacyFormOwner('abcd1234ef567890')).toBe(true)
-    expect(await backend.countLegacyFormOwners()).toBe(1)
-    // 非 strict → gate no-op(不检测 legacy)
-    await expect(assertStrictOwnerMigrationComplete({}, backend)).resolves.toBeUndefined()
+// ── G2.1 R2-1:owner-migration 启动 gate 三域化(persist + permissions + assets)──────────────
+// R2-1(P1):返修前 gate 只收 PersistBackend → persist=0 但 permission/asset 全 legacy 时放行
+// (share_links.created_by + AssetRecord.ownerFp/references/uploaders 漏检)。G2.2 若只补 PG persist
+// detector 即可绕过其余两域。修法:gate 收三 detector,任一缺失 fail-closed,任一 legacy>0 拒启动。
+// InMemory persist/permissions/assets detector 可测;PG 标注随 G2.2。
+describe('G2.1 R2-1 — assertStrictOwnerMigrationComplete 三域 gate(persist + permissions + assets)', () => {
+  // 三 detector 全用 memory backend(可测);asset store 经 createAssetStore(createMemoryAssetBackend())。
+  const buildDetectors = (): {
+    persist: PersistBackend
+    permissions: InMemoryPermissionBackend
+    assets: AssetStore
+    detectors: LegacyOwnerDetector[]
+  } => {
+    const { backend, permissions } = buildPersistApp()
+    const assets = createAssetStore(createMemoryAssetBackend())
+    return {
+      persist: backend,
+      permissions,
+      assets,
+      detectors: [
+        legacyOwnerDetector('persist', backend),
+        legacyOwnerDetector('permissions', permissions),
+        legacyOwnerDetector('assets', assets),
+      ],
+    }
+  }
+
+  it('非 strict + 三域全 legacy → no-op 通过(生产零变化,gate 不检测)', async () => {
+    const { persist, permissions, assets, detectors } = buildDetectors()
+    await persist.ensureCreate('abcd1234ef567890', 'project', 'p1', {}, { method: 'POST', resourceKind: 'project' })
+    await permissions.createShareLink('px', 'view', '0123456789abcdef')
+    await assets.upload(Buffer.from([1, 2, 3, 4]), 'image/png', 'a.png', 'fedcba9876543210')
+    expect(await persist.countLegacyFormOwners!()).toBe(1)
+    expect(await permissions.countLegacyFormOwners!()).toBe(1)
+    expect(await assets.countLegacyFormOwners!()).toBe(1)
+    await expect(assertStrictOwnerMigrationComplete({}, detectors)).resolves.toBeUndefined()
   })
 
-  it('strict + legacy 形态 owner 数据>0 → 拒启动(throws,报具体计数)', async () => {
-    const { backend } = buildPersistApp()
-    await backend.ensureCreate('abcd1234ef567890', 'project', 'p1', {}, { method: 'POST', resourceKind: 'project' })
-    await backend.ensureCreate('0123456789abcdef', 'project', 'p2', {}, { method: 'POST', resourceKind: 'project' })
-    expect(await backend.countLegacyFormOwners()).toBe(2)
-    await expect(assertStrictOwnerMigrationComplete({ MIVO_SSO_STRICT: '1' }, backend)).rejects.toThrow(
-      /legacy-form owner record/,
-    )
+  it('strict + persist legacy>0 → 拒启动(报具体计数 + 域名)', async () => {
+    const { persist, detectors } = buildDetectors()
+    await persist.ensureCreate('abcd1234ef567890', 'project', 'p1', {}, { method: 'POST', resourceKind: 'project' })
+    await persist.ensureCreate('0123456789abcdef', 'project', 'p2', {}, { method: 'POST', resourceKind: 'project' })
+    expect(await persist.countLegacyFormOwners!()).toBe(2)
+    await expect(
+      assertStrictOwnerMigrationComplete({ MIVO_SSO_STRICT: '1' }, detectors),
+    ).rejects.toThrow(/persist.*legacy-form owner record/s)
   })
 
-  it('strict + 迁移后(username 形态)→ 通过(模拟迁移:re-seed 为 username owner)', async () => {
-    const { backend } = buildPersistApp()
-    // 模拟 G2.2 迁移完成:数据以 username ownerId 落库(email-style,非 16-hex)
-    await backend.ensureCreate('alice@xd.com', 'project', 'p1', {}, { method: 'POST', resourceKind: 'project' })
-    expect(isLegacyFormOwner('alice@xd.com')).toBe(false)
-    expect(await backend.countLegacyFormOwners()).toBe(0)
-    await expect(assertStrictOwnerMigrationComplete({ MIVO_SSO_STRICT: '1' }, backend)).resolves.toBeUndefined()
+  // R2-1 负例组 ①:persist=0 但 permissions(share_links.created_by)有 legacy → 拒启动(返修前放行)
+  it('strict + persist=0 + permissions legacy(share_links.created_by 指纹)>0 → 拒启动(R2-1 漏检洞)', async () => {
+    const { persist, permissions, detectors } = buildDetectors()
+    // persist 已迁移(username 形态),permissions 未迁移(createdBy=指纹)
+    await persist.ensureCreate('alice@xd.com', 'project', 'p1', {}, { method: 'POST', resourceKind: 'project' })
+    await permissions.createShareLink('p1', 'view', 'abcd1234ef567890') // createdBy = legacy 指纹
+    expect(await persist.countLegacyFormOwners!()).toBe(0)
+    expect(await permissions.countLegacyFormOwners!()).toBe(1)
+    await expect(
+      assertStrictOwnerMigrationComplete({ MIVO_SSO_STRICT: '1' }, detectors),
+    ).rejects.toThrow(/permissions.*legacy-form owner record/s)
   })
 
-  it('strict + backend 无 countLegacyFormOwners(PG G2.2 前未实现)→ fail-closed throws', async () => {
-    // PG backend(G2.2 前)未实现 countLegacyFormOwners → strict 启动 fail-closed 拒启动(安全)。
-    const stubBackend = { ready: Promise.resolve() } as unknown as PersistBackend
-    await expect(assertStrictOwnerMigrationComplete({ MIVO_SSO_STRICT: '1' }, stubBackend)).rejects.toThrow(
-      /countLegacyFormOwners/,
-    )
+  // R2-1 负例组 ②:persist=0 但 assets(AssetRecord.ownerFp)有 legacy → 拒启动(返修前放行)
+  it('strict + persist=0 + assets legacy(AssetRecord.ownerFp 指纹)>0 → 拒启动(R2-1 漏检洞)', async () => {
+    const { persist, assets, detectors } = buildDetectors()
+    await persist.ensureCreate('alice@xd.com', 'project', 'p1', {}, { method: 'POST', resourceKind: 'project' })
+    await assets.upload(Buffer.from([1, 2, 3, 4]), 'image/png', 'a.png', 'abcd1234ef567890') // ownerFp = 指纹
+    expect(await persist.countLegacyFormOwners!()).toBe(0)
+    expect(await assets.countLegacyFormOwners!()).toBe(1)
+    await expect(
+      assertStrictOwnerMigrationComplete({ MIVO_SSO_STRICT: '1' }, detectors),
+    ).rejects.toThrow(/assets.*legacy-form owner record/s)
   })
 
-  it('strict + 混合(legacy + username)→ 拒启动(只要有 legacy 形态即 no-go)', async () => {
-    const { backend } = buildPersistApp()
-    await backend.ensureCreate('alice@xd.com', 'project', 'p1', {}, { method: 'POST', resourceKind: 'project' })
-    await backend.ensureCreate('abcd1234ef567890', 'project', 'p2', {}, { method: 'POST', resourceKind: 'project' })
-    expect(await backend.countLegacyFormOwners()).toBe(1)
-    await expect(assertStrictOwnerMigrationComplete({ MIVO_SSO_STRICT: '1' }, backend)).rejects.toThrow(
-      /legacy-form owner record/,
-    )
+  it('strict + 三域全迁移(username 形态)→ 通过', async () => {
+    const { persist, permissions, assets, detectors } = buildDetectors()
+    await persist.ensureCreate('alice@xd.com', 'project', 'p1', {}, { method: 'POST', resourceKind: 'project' })
+    await permissions.createShareLink('p1', 'view', 'alice@xd.com') // createdBy = username
+    await assets.upload(Buffer.from([1, 2, 3, 4]), 'image/png', 'a.png', 'alice@xd.com') // ownerFp = username
+    expect(await persist.countLegacyFormOwners!()).toBe(0)
+    expect(await permissions.countLegacyFormOwners!()).toBe(0)
+    expect(await assets.countLegacyFormOwners!()).toBe(0)
+    await expect(
+      assertStrictOwnerMigrationComplete({ MIVO_SSO_STRICT: '1' }, detectors),
+    ).resolves.toBeUndefined()
+  })
+
+  // R2-1 负例组 ③:任一 detector 缺失(PG G2.2 前未实现 countLegacyFormOwners)→ fail-closed 拒启动
+  it('strict + persist detector 缺失(PG stub 无 countLegacyFormOwners)→ fail-closed throws', async () => {
+    const stubPersist = { ready: Promise.resolve() } as unknown as PersistBackend
+    const { permissions, assets } = buildDetectors()
+    const detectors = [
+      legacyOwnerDetector('persist', stubPersist), // 无 countLegacyFormOwners
+      legacyOwnerDetector('permissions', permissions),
+      legacyOwnerDetector('assets', assets),
+    ]
+    await expect(
+      assertStrictOwnerMigrationComplete({ MIVO_SSO_STRICT: '1' }, detectors),
+    ).rejects.toThrow(/persist.*countLegacyFormOwners/s)
+  })
+
+  it('strict + permissions detector 缺失 → fail-closed throws(任一缺失即拒)', async () => {
+    const { persist, assets } = buildDetectors()
+    const stubPermissions = { ready: Promise.resolve() } as unknown as InMemoryPermissionBackend
+    const detectors = [
+      legacyOwnerDetector('persist', persist),
+      legacyOwnerDetector('permissions', stubPermissions), // 无 countLegacyFormOwners
+      legacyOwnerDetector('assets', assets),
+    ]
+    await expect(
+      assertStrictOwnerMigrationComplete({ MIVO_SSO_STRICT: '1' }, detectors),
+    ).rejects.toThrow(/permissions.*countLegacyFormOwners/s)
+  })
+
+  it('strict + assets detector 缺失 → fail-closed throws(任一缺失即拒)', async () => {
+    const { persist, permissions } = buildDetectors()
+    const stubAssets = { upload: () => Promise.resolve() } as unknown as AssetStore
+    const detectors = [
+      legacyOwnerDetector('persist', persist),
+      legacyOwnerDetector('permissions', permissions),
+      legacyOwnerDetector('assets', stubAssets), // 无 countLegacyFormOwners
+    ]
+    await expect(
+      assertStrictOwnerMigrationComplete({ MIVO_SSO_STRICT: '1' }, detectors),
+    ).rejects.toThrow(/assets.*countLegacyFormOwners/s)
+  })
+
+  it('strict + 混合(persist legacy + username)→ 拒启动(只要有 legacy 形态即 no-go)', async () => {
+    const { persist, permissions, assets, detectors } = buildDetectors()
+    await persist.ensureCreate('alice@xd.com', 'project', 'p1', {}, { method: 'POST', resourceKind: 'project' })
+    await persist.ensureCreate('abcd1234ef567890', 'project', 'p2', {}, { method: 'POST', resourceKind: 'project' })
+    expect(await persist.countLegacyFormOwners!()).toBe(1)
+    await expect(
+      assertStrictOwnerMigrationComplete({ MIVO_SSO_STRICT: '1' }, detectors),
+    ).rejects.toThrow(/persist.*legacy-form owner record/s)
   })
 })
 
@@ -346,5 +438,164 @@ describe('G2.1 返修 F4 — ssoHeaderSecretOk 恒时比较(纯函数)', () => {
       headers: { 'x-mivo-gateway-secret': GW, 'x-mivo-auth-user': 'alice' },
     })
     expect(res.status).toBe(200)
+  })
+})
+
+// ── G2.1 R2-2:strict proof 前置中间件(body 解析/DB lookup 前统一验 proof)──────────────────
+// R2-2(P1):返修前 projects POST 先 readJsonBodyWithFingerprint(非法 body=400)、tasks POST 先
+// parseMultipartBody、GET /:id 先 getProjectOwner(已存=401/未知=404 存在性 oracle)再 resolveActor。
+// 修法:ssoStrictProofGate 中间件,strict + 无 share token → proof 前置(token-scoped/dev 豁免,legacy no-op)。
+// 验收:strict 无 proof 下 known/missing/invalid/oversized body/各 task POST 一律 401,且断言 parser/backend
+// 未被调用(spy/计数);route matrix 覆盖标注修正。
+describe('G2.1 R2-2 — ssoStrictProofGate 前置 proof(body 解析/DB lookup 前,存在性 oracle 消除)', () => {
+  let app: ReturnType<typeof buildPersistApp>['app']
+  let backend: ReturnType<typeof buildPersistApp>['backend']
+  beforeEach(() => {
+    ;({ app, backend } = buildPersistApp())
+  })
+  afterEach(() => vi.unstubAllEnvs())
+
+  it('strict + 无 proof + POST /api/projects 非法 JSON body → 401(非 400;body 未解析)', async () => {
+    vi.stubEnv('MIVO_SSO_STRICT', '1')
+    vi.stubEnv('MIVO_GATEWAY_SECRET', GW)
+    // 非法 JSON body:若 body 先解析则 400 bad-body;前置 proof 后 401(body 不被读)
+    const res = await req(app, '/api/projects', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: 'this-is-not-json',
+    })
+    expect(res.status).toBe(401)
+    expect((res.body as { error: string }).error).toBe('unauthorized')
+  })
+
+  it('strict + 无 proof + POST /api/projects 超 1MB body → 401(非 413;body cap 未触达)', async () => {
+    vi.stubEnv('MIVO_SSO_STRICT', '1')
+    vi.stubEnv('MIVO_GATEWAY_SECRET', GW)
+    // 超大 body:若 body 先读则 413;前置 proof 后 401(body 不被读/不触 cap)
+    const huge = 'x'.repeat(2 * 1024 * 1024)
+    const res = await req(app, '/api/projects', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: huge,
+    })
+    expect(res.status).toBe(401)
+  })
+
+  it('strict + 无 proof + GET /api/projects/:id(known,非 strict seed)→ 401 + backend.getProjectOwner 未调用', async () => {
+    // 先非 strict seed(legacy 路径,project 落指纹 owner);再翻 strict GET:
+    // 前置 proof → 401 在 getProjectOwner 前(返修前会先查 owner 再 resolveActor 抛 401;现 DB lookup 跳过)
+    await req(app, '/api/projects', {
+      method: 'POST',
+      headers: { 'x-mivo-api-key': 'mivo_aaa_user_a' },
+      body: JSON.stringify({ id: 'p-known', name: 'P' }),
+    })
+    vi.stubEnv('MIVO_SSO_STRICT', '1')
+    vi.stubEnv('MIVO_GATEWAY_SECRET', GW)
+    const spy = vi.spyOn(backend, 'getProjectOwner')
+    const res = await req(app, '/api/projects/p-known', { headers: {} })
+    expect(res.status).toBe(401) // 前置 proof → 401(非 200/404;DB lookup 未触达)
+    expect(spy).not.toHaveBeenCalled() // 返修前会调用 getProjectOwner(authzProject 先查 owner)
+  })
+
+  it('strict + 无 proof + GET /api/projects/:id(missing)→ 401(非 404;存在性 oracle 消除)', async () => {
+    vi.stubEnv('MIVO_SSO_STRICT', '1')
+    vi.stubEnv('MIVO_GATEWAY_SECRET', GW)
+    // missing project:返修前 getProjectOwner 缺失 → 404(泄漏"不存在");前置 proof 后 401(known/missing 一律 401)
+    const res = await req(app, '/api/projects/never-existed', { headers: {} })
+    expect(res.status).toBe(401)
+    expect((res.body as { error: string }).error).toBe('unauthorized')
+  })
+
+  it('strict + 无 proof + GET /api/projects/:id → backend.getProjectOwner 未被调用(spy 证 DB lookup 跳过)', async () => {
+    vi.stubEnv('MIVO_SSO_STRICT', '1')
+    vi.stubEnv('MIVO_GATEWAY_SECRET', GW)
+    const spy = vi.spyOn(backend, 'getProjectOwner')
+    await req(app, '/api/projects/any-id', { headers: {} })
+    expect(spy).not.toHaveBeenCalled() // 前置 proof → 401 在 DB lookup 前;返修前会调用
+  })
+
+  it('strict + 无 proof + GET /api/canvas/:id(missing)→ 401(非 404;canvas 存在性 oracle 消除)', async () => {
+    vi.stubEnv('MIVO_SSO_STRICT', '1')
+    vi.stubEnv('MIVO_GATEWAY_SECRET', GW)
+    const res = await req(app, '/api/canvas/never-existed', { headers: {} })
+    expect(res.status).toBe(401)
+  })
+
+  it('strict + 无 proof + GET /api/canvas/:id → backend.getCanvasOwner 未被调用(spy)', async () => {
+    vi.stubEnv('MIVO_SSO_STRICT', '1')
+    vi.stubEnv('MIVO_GATEWAY_SECRET', GW)
+    const spy = vi.spyOn(backend, 'getCanvasOwner')
+    await req(app, '/api/canvas/any-id', { headers: {} })
+    expect(spy).not.toHaveBeenCalled()
+  })
+
+  // token-scoped 豁免:share token 在 → 不 401(route authz 验 token,公开分享访问)
+  it('strict + 无 proof + share token 在 → 非 401(token-scoped 豁免;route authz 验 token → 404 unknown)', async () => {
+    vi.stubEnv('MIVO_SSO_STRICT', '1')
+    vi.stubEnv('MIVO_GATEWAY_SECRET', GW)
+    const res = await req(app, '/api/projects/some-id', {
+      headers: { 'x-mivo-share-token': 'fake-token' },
+    })
+    expect(res.status).not.toBe(401) // 豁免 → 走 route authz → unknown token → 404 unknown-project
+    expect(res.status).toBe(404)
+  })
+
+  // dev mode 豁免:strict + dev → 信任 header 无需 proof
+  it('strict + dev mode + 无 proof → 200(非 401;dev 豁免,信任 x-mivo-auth-user)', async () => {
+    vi.stubEnv('MIVO_SSO_STRICT', '1')
+    vi.stubEnv('MIVO_DEV_MODE', '1')
+    vi.stubEnv('NODE_ENV', 'test')
+    const res = await req(app, '/api/projects', { headers: { 'x-mivo-auth-user': 'alice' } })
+    expect(res.status).toBe(200) // dev 豁免 → 走 route → resolveActor dev actor → 200 list empty
+  })
+
+  // legacy 零变化硬约束:非 strict + 无 proof + 非法 body → 400(body 解析,中间件 no-op)
+  it('legacy(非 strict)+ 无 proof + 非法 body → 400(body 先解析;中间件 no-op,零变化)', async () => {
+    vi.stubEnv('MIVO_SSO_STRICT', '')
+    const res = await req(app, '/api/projects', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-mivo-api-key': 'mivo_aaa_user_a' },
+      body: 'not-json',
+    })
+    expect(res.status).toBe(400) // body 解析 → bad-body 400(非 401;中间件 no-op,legacy 行为不变)
+  })
+})
+
+// ── G2.1 R2-2:tasks 路由 proof 前置(realApp,multipart/JSON body 在 401 前不解析)──────────────
+describe('G2.1 R2-2 — tasks 路由 strict proof 前置(realApp,各 task POST 一律 401,body 不解析)', () => {
+  beforeEach(() => __resetTaskRegistry())
+  afterEach(() => vi.unstubAllEnvs())
+
+  it('strict + 无 proof + POST /api/mivo/tasks/generate 非法 JSON body → 401(非 400;parser 未调用)', async () => {
+    vi.stubEnv('MIVO_SSO_STRICT', '1')
+    vi.stubEnv('MIVO_GATEWAY_SECRET', GW)
+    const res = await realApp.request('/api/mivo/tasks/generate', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: 'not-json',
+    })
+    expect(res.status).toBe(401) // 前置 proof → 401;返修前 readJsonBody 先解析 → 400
+  })
+
+  it('strict + 无 proof + GET /api/mivo/tasks/:id → 401(非 404;task 存在性 oracle 消除)', async () => {
+    vi.stubEnv('MIVO_SSO_STRICT', '1')
+    vi.stubEnv('MIVO_GATEWAY_SECRET', GW)
+    const res = await realApp.request('/api/mivo/tasks/00000000-0000-0000-0000-000000000000', {
+      headers: {},
+    })
+    expect(res.status).toBe(401) // 返修前 resolveTaskOwner 先于 getTaskForOwner → 401,但经 multipart/JSON 先;现前置
+  })
+
+  it('strict + 无 proof + POST /api/mivo/tasks/edit multipart → 401(multipart parser 未调用)', async () => {
+    vi.stubEnv('MIVO_SSO_STRICT', '1')
+    vi.stubEnv('MIVO_GATEWAY_SECRET', GW)
+    // multipart body:若先解析则进 parseMultipartBody;前置 proof 后 401(body 不解析)
+    const form = new FormData()
+    form.append('prompt', 'p')
+    const res = await realApp.request('/api/mivo/tasks/edit', {
+      method: 'POST',
+      body: form,
+    })
+    expect(res.status).toBe(401)
   })
 })

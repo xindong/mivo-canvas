@@ -47,8 +47,7 @@
 //   (mode-aware:strict 走 resolveActor,non-strict 保持原 raw-key/指纹 行为零变化)。
 // 401 由 ssoAuthBoundary 中间件捕获 SsoAuthError 统一返回(app.ts + persistTestApp 挂载)。
 
-import type { Context, ErrorHandler } from 'hono'
-import { HTTPException } from 'hono/http-exception'
+import type { Context, ErrorHandler, MiddlewareHandler } from 'hono'
 import { createHash, timingSafeEqual } from 'node:crypto'
 import { fingerprintOfPlatformKey, resolvePlatformCtx } from './keys'
 import type { PersistBackend } from '../persist/backend'
@@ -227,18 +226,60 @@ export const resolveTaskOwner = (c: Context): string =>
 export const resolveAssetOwner = (c: Context): string =>
   isSsoStrict() ? resolveActor(c) : fingerprintOfPlatformKey(resolvePlatformCtx(c).platformKey)
 
-// ── G2.1 F1:owner 键空间跃迁防护(strict 禁先于 G2.2)──────────────────────────────
+/**
+ * G2.1 R2-2:strict 模式 proof 前置中间件。owner-scoped 路由(projects/canvas/userState/tasks/members/
+ * shareLinks)在 strict + 无 share token 时,于**任何 body 解析/DB lookup 前**统一验 proof(gateway
+ * secret + SSO header),缺/错 → 抛 SsoAuthError(→ ssoAuthErrorHandler 401)。token-scoped(share token
+ * 在)显式豁免(route authz 验 token,公开分享访问无需 gateway proof);dev mode 豁免(信任
+ * x-mivo-auth-user 无需 proof,route 仍调 resolveActor)。legacy(non-strict)→ no-op(生产零变化)。
+ *
+ * **消除存在性 oracle**(R2-2):返修前 GET /api/projects/:id strict+无 proof 下 已存=401(authz 抛
+ * SsoAuthError)、未知=404(getProjectOwner 缺失先返)→ 泄漏存在。前置后 known/missing 一律 401
+ * (DB lookup 不被未鉴权请求触达)。**未鉴权不消耗昂贵解析**:tasks multipart/mask + projects JSON body
+ * 在 401 前不解析(返修前非法 body POST=400、tasks multipart 先于 401 处理)。
+ *
+ * 挂载点:owner-scoped 路由前(app.ts + persistTestApp)。**不挂**:/api/share(token-scoped 公开)、
+ * /api/mivo/debug-logs(system-scoped 遥测,独立防护)、stateless /api/mivo/{generate,edit,enhance,...}。
+ * assets 路由已在 route 内 resolveAssetOwner 早于 body 解析(无需本中间件)。
+ */
+export const ssoStrictProofGate: MiddlewareHandler<AppEnv> = async (c, next) => {
+  if (!isSsoStrict(process.env)) return next() // legacy: no-op,零变化(不读 header 不解析 body)
+  // token-scoped 豁免:share token 在 → route authz 验 token(公开分享访问,无需 gateway proof)
+  const shareToken =
+    c.req.header('x-mivo-share-token')?.trim() ||
+    c.req.query('share')?.toString() ||
+    undefined
+  if (shareToken) return next()
+  // strict + 无 share token:proof 前置(在 body 解析 / DB lookup 前)
+  if (isDevMode(process.env)) return next() // dev mode:信任 x-mivo-auth-user 无需 proof;route 仍调 resolveActor
+  if (!ssoHeaderSecretOk(process.env, c.req.header(GATEWAY_SECRET_HEADER))) {
+    throw new SsoAuthError('missing or mismatched gateway secret (x-mivo-gateway-secret)')
+  }
+  const ssoUser = c.req.header(SSO_TRUSTED_USER_HEADER)?.trim()
+  if (!ssoUser) throw new SsoAuthError('missing trusted SSO user header (x-mivo-auth-user)')
+  return next() // proof ok;route 继续(resolveActor 再派生,廉价;双校验不增攻击面)
+}
+
+// ── G2.1 F1/R2-1:owner 键空间跃迁防护(strict 禁先于 G2.2,三域 gate)──────────────────────
 // 痛点(F1 复现):strict 切换让 resolveActor 返回 SSO username(无指纹回退),所有 legacy 形态
 // (ownerId=指纹,sha256[:16] hex)的存量数据对 SSO 用户不可见(alice 列表空)。翻 strict 前必须先跑
 // G2.2 迁移(指纹→username),否则数据"消失"。本 gate 是**机器判定**(非文字约定):启动时检测
 // legacy 形态 owner 数据>0 且 strict=1 → 拒绝启动(exit 1)。G2.2 未实装:迁移函数打桩(throw);
-// gate 机制本身真实(memory backend 实扫,可测)。
+// gate 机制本身真实(三域 memory backend 实扫,可测)。
 //
-// 覆盖面:persist backend(projects/canvas/userState/chat-collection/children + idempotency index,
-// 即受影响键清单中的 persist_records/projects/canvases/idempotency_index 四项)。share_links.created_by
-// (permission backend)+ AssetRecord.ownerFp + references[].ownerFp + .uploaders(asset store)的 gate
-// 随 G2.2 迁移一起补(见 docs/runbook/g21-strict-sso-runbook.md §owner inventory 与 DP-4 R-2)。
-// memory backend 实扫(可测);PG backend 未实现 countLegacyFormOwners → strict fail-closed 拒启动(安全)。
+// R2-1(第二轮返修,P1):返修前 gate 只收 PersistBackend → persist=0 但 permission/asset 全 legacy
+// 时放行(share_links.created_by + AssetRecord.ownerFp/references/uploaders 漏检)。G2.2 若只补 PG persist
+// detector 即可绕过其余两域。修法:gate 收三 detector(persist + permissions + assets),任一 detector
+// 缺失 → fail-closed 拒启动,任一域 legacy>0 → 拒启动。InMemory persist/permissions/assets detector 可测;
+// PG 三域 detector 随 G2.2 落地(未实现 → strict 启动 fail-closed,安全)。
+//
+// 覆盖面(三域,对齐 owner inventory 全清单):
+//  - persist(PersistBackend):persist_records/projects/canvases/idempotency_index 的 ownerId(memory 实扫
+//    byOwner 外层 key;PG detector 随 G2.2);
+//  - permissions(PermissionBackend):share_links.created_by(InMemory 扫 links;PG 随 G2.2);
+//  - assets(AssetStore):AssetRecord.ownerFp + references[].ownerFp + .uploaders(InMemory/fs 扫 listRecords
+//    + listUploaders;PG 随 G2.2)。asset service 未启用(MIVO_ENABLE_ASSET_SERVICE=0)时 index.ts 传
+//    countLegacyFormOwners=()=>0 的占位 detector(service off → BFF 不管理 asset 数据 → 0 legacy)。
 
 /**
  * legacy owner 形态 = mivo-key 指纹(sha256[:16] hex,见 keys.ts `fingerprintOfPlatformKey`)。
@@ -249,34 +290,68 @@ export const LEGACY_FINGERPRINT_REGEX = /^[0-9a-f]{16}$/
 export const isLegacyFormOwner = (ownerId: string): boolean => LEGACY_FINGERPRINT_REGEX.test(ownerId)
 
 /**
- * G2.1 F1 启动 gate:strict 模式下,若 persist backend 仍存在 legacy 形态 owner 数据 → **拒绝启动**
- * (fail fast,exit 1 via index.ts start().catch)。机器判定,非文字约定:ops 翻 MIVO_SSO_STRICT=1 前必须
- * 先跑 G2.2 迁移。
+ * G2.1 R2-1 三域 gate 的 detector seam。每个域(persist/permissions/assets)的 backend 实现可选
+ * `countLegacyFormOwners`(memory 实扫可测;PG 随 G2.2)。gate 收 detector 列表,逐个判定:
+ * 缺失方法 → fail-closed;legacy 行数>0 → 拒启动。`domain` 仅用于报错指明哪个域。
+ */
+export type LegacyOwnerDetector = {
+  /** 域名(persist/permissions/assets),仅报错指明;不参与判定逻辑。 */
+  readonly domain: string
+  /**
+   * 统计本域 ownerId 为 legacy 形态(指纹,16-hex)的 owner 数。**可选**:memory 实现可测;
+   * PG detector 随 G2.2 落地,未实现时 gate fail-closed 拒启动(无法机械判定迁移完成)。
+   */
+  countLegacyFormOwners?(): Promise<number>
+}
+
+/**
+ * 把实现了 `countLegacyFormOwners` 的 backend 包成 `LegacyOwnerDetector`(bind 到实例,
+ * 防方法丢失 `this`)。backend 未实现该方法 → detector.countLegacyFormOwners = undefined
+ * → gate fail-closed(对齐 PG G2.2 前未实现场景)。
+ */
+export const legacyOwnerDetector = (
+  domain: string,
+  backend: { countLegacyFormOwners?(): Promise<number> },
+): LegacyOwnerDetector => ({
+  domain,
+  countLegacyFormOwners:
+    typeof backend.countLegacyFormOwners === 'function'
+      ? backend.countLegacyFormOwners.bind(backend)
+      : undefined,
+})
+
+/**
+ * G2.1 F1/R2-1 启动 gate:strict 模式下,若三域(persist + permissions + assets)任一仍存在
+ * legacy 形态 owner 数据 → **拒绝启动**(fail fast,exit 1 via index.ts start().catch)。
+ * 机器判定,非文字约定:ops 翻 MIVO_SSO_STRICT=1 前必须先跑 G2.2 迁移(跨三域重键 owner)。
  *
  * - 非 strict → no-op(生产零变化;legacy 路径不触发本 gate,现有行为完全不变)。
- * - strict + backend 未实现 `countLegacyFormOwners`(如 PG,G2.2 前未补)→ fail-closed 拒启动
- *   (无法机械判定迁移完成前不得翻 strict;PG detector 随 G2.2 落地)。
- * - strict + backend 实现 + legacy 行数>0 → 拒启动(报具体计数 + 迁移指引)。
- * - strict + backend 实现 + 0 legacy 行 → 通过(迁移完成或无存量)。
+ * - strict + 任一 detector 缺失 `countLegacyFormOwners`(如 PG,G2.2 前未补)→ fail-closed 拒启动
+ *   (无法机械判定迁移完成前不得翻 strict;三域 PG detector 随 G2.2 落地)。
+ * - strict + 全 detector 实现 + 任一域 legacy 行数>0 → 拒启动(报具体域 + 计数 + 迁移指引)。
+ * - strict + 全 detector 实现 + 三域 0 legacy 行 → 通过(迁移完成或无存量)。
  *
- * 挂载点:`server/index.ts` `await sharedPersistBackend.ready` 之后、serve 之前。导出供 gate 测试直驱。
+ * 挂载点:`server/index.ts` `await Promise.all([sharedPersistBackend.ready, ...])` 之后、serve 之前。
+ * 导出供 gate 测试直驱(`sso-strict.route.test.ts` §R2-1)。
  */
 export const assertStrictOwnerMigrationComplete = async (
   env: NodeJS.ProcessEnv = process.env,
-  backend: PersistBackend,
+  detectors: LegacyOwnerDetector[],
 ): Promise<void> => {
   if (!isSsoStrict(env)) return // 非 strict:no-op(生产零变化)
-  if (typeof backend.countLegacyFormOwners !== 'function') {
-    // fail-closed:backend 不支持 legacy 检测 → 无法机械判定迁移完成 → strict 拒启动。
-    throw new Error(
-      '[mivo-bff] MIVO_SSO_STRICT=1 but persist backend does not implement countLegacyFormOwners (PG backend detector lands with G2.2). Cannot machine-verify owner migration complete; refusing to start (fail-closed). Run G2.2 owner migration (fingerprint→username) and land the backend detector before flipping strict.',
-    )
-  }
-  const legacyCount = await backend.countLegacyFormOwners()
-  if (legacyCount > 0) {
-    throw new Error(
-      `[mivo-bff] MIVO_SSO_STRICT=1 but ${legacyCount} legacy-form owner record(s) exist (ownerId=fingerprint, sha256[:16] hex). Strict mode resolves actor=SSO username with NO fingerprint fallback → all legacy owner data becomes invisible. Run G2.2 owner migration (fingerprint→username mapping) before flipping MIVO_SSO_STRICT=1. Refusing to start (fail-closed).`,
-    )
+  for (const d of detectors) {
+    if (typeof d.countLegacyFormOwners !== 'function') {
+      // fail-closed:该域 backend 不支持 legacy 检测 → 无法机械判定迁移完成 → strict 拒启动。
+      throw new Error(
+        `[mivo-bff] MIVO_SSO_STRICT=1 but ${d.domain} backend does not implement countLegacyFormOwners (PG ${d.domain} detector lands with G2.2). Cannot machine-verify ${d.domain} owner migration complete; refusing to start (fail-closed). Run G2.2 owner migration (fingerprint→username) across persist/permissions/assets and land all three backend detectors before flipping strict.`,
+      )
+    }
+    const legacyCount = await d.countLegacyFormOwners()
+    if (legacyCount > 0) {
+      throw new Error(
+        `[mivo-bff] MIVO_SSO_STRICT=1 but ${d.domain} backend has ${legacyCount} legacy-form owner record(s) (ownerId=fingerprint, sha256[:16] hex). Strict mode resolves actor=SSO username with NO fingerprint fallback → all legacy owner data becomes invisible. Run G2.2 owner migration (fingerprint→username mapping) across persist/permissions/assets before flipping MIVO_SSO_STRICT=1. Refusing to start (fail-closed).`,
+      )
+    }
   }
 }
 
@@ -307,21 +382,23 @@ export const migrateLegacyOwnersToUsernameForm = async (
  */
 export const ssoAuthErrorHandler: ErrorHandler<AppEnv> = (err, c) => {
   if (err instanceof SsoAuthError) {
+    // c.json 走 c.newResponse → 保 pre-error c.header()(R2-3 parity)。401 JSON 契约
+    // `{error:'unauthorized', message:reason}` 锁定于 sso-strict.route.test ② + sso-error-parity。
     return c.json({ error: 'unauthorized', message: err.reason }, 401)
   }
-  // F5 返修:精确复刻 Hono 默认 onError 语义。origin/main 无 onError → Hono 默认对非 SsoAuthError:
-  //  ① HTTPException → err.getResponse()(保留自定义 status/body);
-  //  ② 普通 Error → console.error(err)+ 500 'Internal Server Error'。
-  // 原实现(G2.1 首版)非 SsoAuthError 一律 `c.text('Internal Server Error', 500)`,吞掉了 console.error
-  // 与 HTTPException.getResponse → sol 复现 consoleErrors 1→0(普通错误静默)。
-  //
-  // 选 option A(分支精确复刻)而非 option B(SsoAuthError extends HTTPException)的理由:
-  //  - 保 SsoAuthError 现有 401 JSON 契约 `{error:'unauthorized', message:reason}`(已写入 app.ts /
-  //    persistTestApp boundary 注释 + sso-strict.route.test 锁定);extends HTTPException 会让
-  //    getResponse 走 HTTPException 默认 body 形态,需再 override 才能回到 `{error,message}`,徒增契约面;
-  //  - 本实现只加两个防御分支,不改 SsoAuthError 形状;surgical,现有测试零变化。
-  if (err instanceof HTTPException) {
-    return err.getResponse() // 防御:仓内现无 HTTPException 抛出,但未来路由引入时不被本 handler 吞
+  // R2-3(F5 第二轮返修):精确复刻 Hono 默认 onError 语义(Option A 精确复刻,finding 允许)。
+  // origin/main 无 onError → Hono 默认对非 SsoAuthError:
+  //  ① `"getResponse" in err` duck-type → `c.newResponse(err.getResponse().body, res)`(保 pre-error c.header());
+  //  ② 否则 → console.error(err) + 500 'Internal Server Error'。
+  // 返修前现实现(首版)用 `instanceof HTTPException` + 直接 `err.getResponse()`,两洞:
+  //  - instanceof 漏 structural HTTPResponseError(有 getResponse 但非 HTTPException 子类)→ 误入 500 分支;
+  //  - 直接 `err.getResponse()` 不走 c.newResponse → 丢 pre-error c.header() 上下文(R2-3 parity 测试复现)。
+  // 改 duck-type + c.newResponse 后:HTTPException / structural 一律经 c.newResponse 保 pre-error header;
+  // 普通 Error 仍 console.error + 500(不吞,F5 复现的 consoleErrors 1→0 修复保持)。
+  // sso-error-parity.test.ts 锁定:普通 Error / HTTPException / structural × 默认 vs custom 全 parity,Hono 升级漂移报警。
+  if (err != null && typeof (err as { getResponse?: unknown }).getResponse === 'function') {
+    const res = (err as { getResponse: () => Response }).getResponse()
+    return c.newResponse(res.body, res)
   }
   console.error(err) // mirror Hono 默认:普通错误日志(修复 F5 复现的 consoleErrors 1→0)
   return c.text('Internal Server Error', 500) // 同 Hono 默认 500 文本

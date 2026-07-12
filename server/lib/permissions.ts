@@ -108,6 +108,16 @@ export interface PermissionBackend {
   __reset(): void | Promise<void>
 
   /**
+   * G2.1 R2-1 三域 gate 的 permissions 域 detector:统计 share_links.created_by 为 legacy 形态
+   * (mivo-key 指纹,sha256[:16] hex;权威定义见 owner.ts `isLegacyFormOwner`/keys.ts
+   * `fingerprintOfPlatformKey`)的 owner 数。strict 模式启动 gate `assertStrictOwnerMigrationComplete`
+   * 调用:>0 → 拒启动(permissions 域迁移未完成)。**可选**:InMemory 实扫(可测);PG detector 随
+   * G2.2 迁移落地,未实现时 strict 启动 fail-closed(owner.ts gate 显式拒绝)。覆盖 share_links.created_by
+   * (persist 域 gate 覆盖 persist_records/projects/canvases/idempotency_index;asset 域 gate 覆盖 ownerFp)。
+   */
+  countLegacyFormOwners?(): Promise<number>
+
+  /**
    * backend 就绪 promise(memory 立即 resolve;PG 跑 migrations 建表)。app 启动(server/index.ts serve 前)
    * await 之,确保权限表已建。additive 字段——内存实现 Promise.resolve(),PG 落地后新增,路由/契约零改动。
    */
@@ -323,6 +333,26 @@ export class InMemoryPermissionBackend implements PermissionBackend {
       }
     }
     return { count }
+  }
+
+  // G2.1 R2-1:legacy owner 形态 = mivo-key 指纹(sha256[:16] hex;权威 keys.ts
+  // `fingerprintOfPlatformKey` + owner.ts `isLegacyFormOwner`,同一形态定义)。内联于此(不 import
+  // owner.ts)以保权限层 framework-agnostic(不耦合 hono);persist/backend.ts 同样内联此正则。
+  // SSO username 为 email-style(含 @);DEV_ACTOR_ID=`mivo-dev-actor`——均不匹配 16-hex,故可机械区分。
+  private static readonly LEGACY_FINGERPRINT_RE = /^[0-9a-f]{16}$/
+  /**
+   * G2.1 R2-1 三域 gate permissions 域 detector:扫 share_links.created_by 为 legacy 指纹形态的
+   * owner 数(去重;同一 legacy createdBy 多条 link 计 1)。strict 启动 gate 调用:>0 → 拒启动。
+   * InMemory 实扫(可测);PG detector 随 G2.2。导出供 owner.ts `legacyOwnerDetector` 包装。
+   */
+  async countLegacyFormOwners(): Promise<number> {
+    const legacy = new Set<string>()
+    for (const link of this.links.values()) {
+      if (InMemoryPermissionBackend.LEGACY_FINGERPRINT_RE.test(link.createdBy)) {
+        legacy.add(link.createdBy)
+      }
+    }
+    return legacy.size
   }
 
   __reset(): void {

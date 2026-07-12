@@ -1,4 +1,4 @@
-import { mkdir, appendFile, readdir, readFile } from 'node:fs/promises'
+import { mkdir, appendFile, readdir, readFile, stat, unlink } from 'node:fs/promises'
 import { resolve } from 'node:path'
 
 // Debug-log normalize / sanitize / filter / storage helpers.
@@ -186,9 +186,89 @@ export const remoteDebugDate = (date = new Date()) => date.toISOString().slice(0
 export const remoteDebugFilePath = (date = remoteDebugDate()) =>
   resolve(remoteDebugLogDir(), `${date}.jsonl`)
 
+// G2.1 R2-4:磁盘 quota/retention(防 JSONL 无限增长)。返修前 appendRemoteDebugRecords
+// 只 mkdir + append,无淘汰无 quota → 长期运行磁盘耗尽。现:append 前 sweep 过期 .jsonl
+// (MIVO_DEBUG_RETENTION_DAYS,默认 7 天)+ 超 quota(MIVO_DEBUG_DISK_QUOTA_MB,默认 512MB)拒写。
+const getRetentionDays = (): number => {
+  const raw = process.env.MIVO_DEBUG_RETENTION_DAYS
+  if (raw === undefined || raw === '') return 7
+  const n = Number(raw)
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 7
+}
+const getDiskQuotaBytes = (): number => {
+  // 0 = 禁用(无 quota);默认 512MB;>0 = N MB。
+  const raw = process.env.MIVO_DEBUG_DISK_QUOTA_MB
+  if (raw === undefined || raw === '') return 512 * 1024 * 1024
+  const n = Number(raw)
+  if (n === 0) return Number.POSITIVE_INFINITY
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) * 1024 * 1024 : 512 * 1024 * 1024
+}
+
+/** R2-4:append 前 sweep 过期 .jsonl(日期早于 today - retentionDays);返回删除数。惰性 retention。 */
+export const sweepExpiredDebugLogs = async (now: Date = new Date()): Promise<number> => {
+  const retentionDays = getRetentionDays()
+  const cutoffMs = now.getTime() - retentionDays * 24 * 60 * 60 * 1000
+  try {
+    const entries = await readdir(remoteDebugLogDir(), { withFileTypes: true })
+    let deleted = 0
+    for (const e of entries) {
+      if (!e.isFile() || !DATE_FILE_PATTERN.test(e.name)) continue
+      const dateStr = e.name.replace(/[.]jsonl$/, '')
+      const fileMs = Date.parse(`${dateStr}T00:00:00Z`)
+      if (Number.isNaN(fileMs)) continue
+      if (fileMs < cutoffMs) {
+        try {
+          await unlink(resolve(remoteDebugLogDir(), e.name))
+          deleted += 1
+        } catch {
+          // 并发删除/竞争 → 忽略(best-effort sweep)
+        }
+      }
+    }
+    return deleted
+  } catch {
+    return 0 // 目录不存在等 → 不阻断 append(mkdir 后重试)
+  }
+}
+
+/** R2-4:log 目录下所有 .jsonl 总字节数(quota 校验用)。 */
+const debugLogDirSizeBytes = async (): Promise<number> => {
+  try {
+    const entries = await readdir(remoteDebugLogDir(), { withFileTypes: true })
+    let total = 0
+    for (const e of entries) {
+      if (e.isFile() && DATE_FILE_PATTERN.test(e.name)) {
+        try {
+          const st = await stat(resolve(remoteDebugLogDir(), e.name))
+          total += st.size
+        } catch {
+          // 并发删除 → 忽略
+        }
+      }
+    }
+    return total
+  } catch {
+    return 0
+  }
+}
+
+/** R2-4:磁盘 quota 超限(append 前 size >= quota)→ 抛此错;route → 413(对齐 body cap 语义)。 */
+export class DebugLogQuotaExceededError extends Error {
+  constructor() {
+    super('debug log disk quota exceeded')
+    this.name = 'DebugLogQuotaExceededError'
+  }
+}
+
 export const appendRemoteDebugRecords = async (records: RemoteDebugRecord[]) => {
   if (!records.length) return
   await mkdir(remoteDebugLogDir(), { recursive: true })
+  // R2-4:惰性 retention(过期 .jsonl 删除)+ quota(超 disk quota 拒写,防磁盘耗尽)。
+  await sweepExpiredDebugLogs()
+  const usedBytes = await debugLogDirSizeBytes()
+  if (usedBytes >= getDiskQuotaBytes()) {
+    throw new DebugLogQuotaExceededError()
+  }
   await appendFile(remoteDebugFilePath(), `${records.map((record) => JSON.stringify(record)).join('\n')}\n`)
 }
 

@@ -5,7 +5,7 @@
 // T1.4:同时挂 members / share-links / share-access 路由 + fresh 内存 permission backend;返回 permissions 供测试 reset。
 import { Hono } from 'hono'
 import type { AppEnv } from '../lib/types'
-import { ssoAuthErrorHandler } from '../lib/owner'
+import { ssoAuthErrorHandler, ssoStrictProofGate } from '../lib/owner'
 import { createProjectsRoutes } from './projects'
 import { createCanvasRoutes } from './canvas'
 import { createUserStateRoutes } from './userState'
@@ -27,6 +27,11 @@ export const buildPersistApp = (): {
   // G2.1: mirror app.ts — top-level onError catches strict-mode SsoAuthError → 401.
   // Inert in non-strict mode (default; existing route tests unaffected).
   app.onError(ssoAuthErrorHandler)
+  // G2.1 R2-2:mirror app.ts — strict proof 前置中间件(owner-scoped 路由,strict + 无 share token
+  // → 401 在 body 解析/DB lookup 前)。legacy no-op(现有路由测试零影响)。/api/share(token-scoped)不挂。
+  app.use('/api/projects/*', ssoStrictProofGate)
+  app.use('/api/canvas/*', ssoStrictProofGate)
+  app.use('/api/user-state/*', ssoStrictProofGate)
   app.route('/api/projects', createProjectsRoutes({ backend, permissions }))
   app.route('/api/projects', createMembersRoutes({ backend, permissions }))
   app.route('/api/projects', createShareLinksRoutes({ backend, permissions }))

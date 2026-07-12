@@ -14,7 +14,7 @@ import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { resolveFeatureFlags } from './lib/env'
 import type { AppEnv } from './lib/types'
-import { ssoAuthErrorHandler } from './lib/owner'
+import { ssoAuthErrorHandler, ssoStrictProofGate } from './lib/owner'
 import { generateHandler } from './routes/generate'
 import { editHandler } from './routes/edit'
 import { enhanceHandler } from './routes/enhance'
@@ -24,6 +24,7 @@ import { authRoute } from './routes/auth'
 import { debugLogsRoute } from './routes/debug-logs'
 import { createLocalAssetsRoutes } from './routes/local-assets'
 import { createAssetRoutes } from './routes/assets'
+import { createAssetStore, createFsAssetBackend, resolveAssetStoreDir, type AssetStore } from './lib/assetStore'
 import { createEagleRoutes } from './routes/eagle'
 import { createPinterestRoutes } from './routes/pinterest'
 import { createProxyImageRoutes } from './routes/proxy-image'
@@ -106,6 +107,17 @@ app.route('/api/auth', authRoute)
 // - stateless /api 路由(generate/edit/keys)不调 resolveActor → 不抛 → 不受影响。
 app.onError(ssoAuthErrorHandler)
 
+// G2.1 R2-2:strict proof 前置中间件。owner-scoped 路由(projects/canvas/userState/tasks/members/
+// shareLinks 子资源)在 strict + 无 share token 时,于任何 body 解析/DB lookup 前统一验 proof → 401。
+// token-scoped(share token 在)豁免;dev mode 豁免;legacy(non-strict)no-op(生产零变化)。
+// 消除存在性 oracle(known/missing 一律 401)+ 未鉴权不消耗昂贵解析(tasks multipart/projects JSON body)。
+// 不挂:/api/share(token-scoped 公开)+ /api/mivo/debug-logs(system-scoped 遥测)+ stateless 路由;
+// assets 路由已在 route 内 resolveAssetOwner 早于 body(无需本中间件)。详见 owner.ts ssoStrictProofGate。
+app.use('/api/projects/*', ssoStrictProofGate)
+app.use('/api/canvas/*', ssoStrictProofGate)
+app.use('/api/user-state/*', ssoStrictProofGate)
+app.use('/api/mivo/tasks/*', ssoStrictProofGate)
+
 // P1-c generate/edit/enhance routes. app.all lets each handler enforce POST-only
 // (non-POST → 405 {error:'Method not allowed'}), matching dev middleware semantics
 // exactly (dev checks request.method !== 'POST' inside each handler).
@@ -126,14 +138,21 @@ app.route('/api/mivo', createLocalAssetsRoutes({ enabled: featureFlags.localAsse
 // controls usage; this flag controls whether the BFF serves at all. Storage
 // backend is swappable for PG (T1.1); MIME allowlist (P1.3) + per-owner quota
 // (P1.4) + owner-scoped GET (P2.5) live in the route.
+// G2.1 R2-1:sharedAssetStore built once here (when service enabled) so the startup
+// owner-migration gate (index.ts) can scan the assets domain for legacy-form ownerFp
+// (AssetRecord.ownerFp + references[].ownerFp + .uploaders). Service off → null →
+// index.ts passes a no-op detector (0 legacy; BFF manages no asset data).
+let sharedAssetStore: AssetStore | null = null
 if (featureFlags.assetServiceEnabled) {
-  app.route('/api', createAssetRoutes())
+  sharedAssetStore = createAssetStore(createFsAssetBackend(resolveAssetStoreDir()))
+  app.route('/api', createAssetRoutes({ store: sharedAssetStore }))
 } else {
   // Flag off → 404 for the asset endpoints (no SPA index.html for an API path).
   const assetDisabled = (c: Context<AppEnv>) => c.notFound()
   app.all('/api/assets', assetDisabled)
   app.all('/api/assets/*', assetDisabled)
 }
+export { sharedAssetStore }
 app.route('/api/mivo', createEagleRoutes({ enabled: featureFlags.eagleProxyEnabled }))
 app.route('/api/mivo', createPinterestRoutes())
 // W3: CORS proxy for external images (readCanvasImageBlob fallback). SSRF-hardened.
