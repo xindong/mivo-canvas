@@ -64,10 +64,52 @@ async function withClient<T>(fn: (client: PoolClient) => Promise<T>): Promise<T>
   const client = await pool!.connect()
   try { return await fn(client) } finally { client.release() }
 }
-/** R5 F2:在指定 pool(非全局 pool)上借专用 client + finally release(PG-T6 跨 pool 重连 replay 用)。 */
-async function withClientOn<T>(target: Pool, fn: (client: PoolClient) => Promise<T>): Promise<T> {
+/**
+ * R6 F2:真实 apply-with-idempotency path(判决 V4:原 PG-T6 首次手写事务,重连只 SELECT idem 不执行领域写,
+ *   第二次根本未发起 mutation → 状态不变是必然结果,不能证明真实 replay early-return;也不能捕获"命中 idem
+ *   后仍继续领域写"的实现错误)。取代 R5 的 withClientOn(只借 client 不做 hit/miss 分支)。
+ * 同一 path 完成 hit/miss 分支 + 事务:
+ *   - hit(SELECT idem row 命中)→ 返 cached result,不执行 mutation(early return)— 验收:移除此则第二次
+ *     二次 bump revision/seq/event,断言"不变"必红。
+ *   - miss → 单事务原子写领域(mutation)+ idem row;mutation 内 throw(fault seam,T6b 用)→ ROLLBACK,
+ *     领域写 + idem row 都不落地(同事务原子,非另写一段 SQL)。
+ */
+type IdemResult = { resultKind: string; revision: number; seq: number }
+async function applyWithIdempotency(
+  target: Pool,
+  key: string,
+  mutation: (client: PoolClient) => Promise<IdemResult>,
+): Promise<IdemResult & { deduped: boolean }> {
+  // hit path:查 idem row,命中 → 返 cached,不执行 mutation(★ early return — 验收:移除此则测试必红)
+  const cached = await target.query(
+    'SELECT result_kind, revision::text AS revision, seq::text AS seq FROM n20_idempotency WHERE key=$1',
+    [key],
+  )
+  if (cached.rows.length > 0) {
+    return {
+      resultKind: cached.rows[0].result_kind,
+      revision: Number(cached.rows[0].revision),
+      seq: Number(cached.rows[0].seq),
+      deduped: true,
+    }
+  }
+  // miss path:单事务原子写领域(mutation)+ idem result row;mutation 内 throw → ROLLBACK(idem row 不落地)
   const client = await target.connect()
-  try { return await fn(client) } finally { client.release() }
+  try {
+    await client.query('BEGIN')
+    const result = await mutation(client) // 领域写(可能 bump revision/seq/event);throw → 事务 abort
+    await client.query(
+      'INSERT INTO n20_idempotency(key,result_kind,revision,seq) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING',
+      [key, result.resultKind, result.revision, result.seq],
+    )
+    await client.query('COMMIT')
+    return { ...result, deduped: false }
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally {
+    client.release()
+  }
 }
 
 describe.skipIf(!PG_TEST_ENABLED)('N2-0 返修 Gate3 PG 侧(R2-1 同一 client): 真实事务原子提交 + fault injection 回滚 + 同库资产元数据', () => {
@@ -173,64 +215,95 @@ describe.skipIf(!PG_TEST_ENABLED)('N2-0 返修 Gate3 PG 侧(R2-1 同一 client):
     ]) // ★ 重启后 clock 仍在(非内存,PG 持久;S10-4 内存模拟不证此)
   })
 
-  it('PG-T6 idempotent replay 真实领域 path(R5 F2):单事务原子写领域 record+seq+event+idem row → 销毁 pool → 重连 replay 同 key → 不二次 bump revision/seq/event(非只测 ON CONFLICT)', async () => {
-    // R5 F2 红证:原 PG-T6 只向 n20_idempotency 插字面量 (revision=2,seq=5)+ ON CONFLICT DO NOTHING,
-    //   未执行领域写、authoritative revision/seq bump 或 event append;只能证 idem row 持久 + 唯一键冲突,
-    //   不能证"同 key replay 不二次应用领域写 / 不二次 bump revision/seq / 不二次发事件"(文档声称强于实测)。
-    // 绿证(补探针把声称测实):本探针单 PG 事务原子写(领域 record title+revision / canvas seq / event / idem result row),
-    //   销毁 pool 模拟进程重启 → 重连走真实 replay path(SELECT idem → 命中 cached → 不二次 apply)→
-    //   断言 authoritative record revision / canvas seq / event count 与首次结果均不变。
+  it('PG-T6 idempotent replay 同一 apply path(R6 F2):applyWithIdempotency 同 key 两次调用 → 第二次命中 cached 不二次 bump revision/seq/event(非只测 ON CONFLICT;移除 early return 测试必红)', async () => {
+    // R6 F2 红证(判决 V4):原 PG-T6 首次手写事务(189-196),重连(198-203)只 SELECT idem row 后测试代码直接不
+    //   执行任何领域 SQL → 第二次根本未发起 mutation,revision/seq/event 不变是必然结果,不能证明真实 replay
+    //   调用会 early-return,更不能捕获"命中 idem 后仍继续领域写"的实现错误。
+    // 绿证(补探针把声称测实):抽出真实 applyWithIdempotency(target,key,mutation)— 同一 path 完成 hit/miss 分支 +
+    //   事务;首次与重连均调用它;hit → 返 cached 不执行 mutation(early return);miss → 单事务原子写领域 + idem row。
+    //   验收:移除 hit path early return(让 hit 也走 mutation)→ 第二次二次 bump revision/seq/event → 断言"不变"必红。
     await pool!.query('TRUNCATE n20_records, n20_canvas_seq, n20_events, n20_idempotency')
     await pool!.query("INSERT INTO n20_records(id,title,revision) VALUES ('n1','orig',0)")
     await pool!.query("INSERT INTO n20_canvas_seq(canvas_id,seq) VALUES ('c1',0)")
     const cfg = pgConn()
-    // ── 首次事务(poolA):单事务原子写领域 record + bump revision + bump canvas seq + append event + insert idem row ──
+    // mutation:单事务原子写领域 record(bump revision)+ canvas seq(bump)+ event append + 读出 authoritative state
+    const mutation = async (client: PoolClient): Promise<IdemResult> => {
+      await client.query("UPDATE n20_records SET title='T1', revision=revision+1 WHERE id='n1'")
+      await client.query("INSERT INTO n20_canvas_seq(canvas_id,seq) VALUES ('c1',1) ON CONFLICT (canvas_id) DO UPDATE SET seq = n20_canvas_seq.seq + 1")
+      const seqRow = await client.query("SELECT seq::text AS seq FROM n20_canvas_seq WHERE canvas_id='c1'")
+      const seq = Number(seqRow.rows[0].seq)
+      await client.query("INSERT INTO n20_events(seq,record_id,op_id) VALUES ($1,'n1','idem-1')", [seq])
+      const rec = await client.query("SELECT revision::text AS revision FROM n20_records WHERE id='n1'")
+      return { resultKind: 'ok', revision: Number(rec.rows[0].revision), seq }
+    }
+    // ── 首次(poolA):applyWithIdempotency miss path → 单事务原子写领域 + idem row ──
     const poolA = new Pool(cfg)
-    await withClientOn(poolA, async (client) => {
-      await client.query('BEGIN')
-      await client.query("UPDATE n20_records SET title='T1', revision=revision+1 WHERE id='n1'") // 领域写 + revision bump 0→1
-      await client.query("INSERT INTO n20_canvas_seq(canvas_id,seq) VALUES ('c1',1) ON CONFLICT (canvas_id) DO UPDATE SET seq = n20_canvas_seq.seq + 1") // canvas seq 0→1
-      await client.query("INSERT INTO n20_events(seq,record_id,op_id) VALUES (1,'n1','idem-1')") // append event(count=1)
-      await client.query("INSERT INTO n20_idempotency(key,result_kind,revision,seq) VALUES ('idem-1','ok',1,1) ON CONFLICT DO NOTHING") // idem result row
-      await client.query('COMMIT')
-    })
-    await poolA.end() // ★ 销毁 poolA(模拟进程重启;内存 Map 会丢,PG 表保留)
-    // ── 重连(poolB)走真实 replay path:同 key 'idem-1' → SELECT idem → 命中 cached → 不二次 apply ──
+    const first = await applyWithIdempotency(poolA, 'idem-1', mutation)
+    expect(first.deduped).toBe(false)       // ★ 首次 miss(领域写 + idem row 落地)
+    expect(first.resultKind).toBe('ok'); expect(first.revision).toBe(1); expect(first.seq).toBe(1)
+    // 首次后 authoritative state:record revision=1 / canvas seq=1 / event count=1 / idem row=1
+    expect((await poolA.query("SELECT revision::text AS r FROM n20_records WHERE id='n1'")).rows[0].r).toBe('1')
+    expect((await poolA.query("SELECT seq::text AS s FROM n20_canvas_seq WHERE canvas_id='c1'")).rows[0].s).toBe('1')
+    expect((await poolA.query('SELECT count(*)::int AS c FROM n20_events')).rows[0].c).toBe(1)
+    expect((await poolA.query("SELECT count(*)::int AS c FROM n20_idempotency WHERE key='idem-1'")).rows[0].c).toBe(1)
+    await poolA.end() // ★ 销毁 poolA(模拟进程重启;PG 表保留,非内存)
+    // ── 重连(poolB):applyWithIdempotency 同 key 'idem-1' → hit path → 返 cached,不执行 mutation ──
     const poolB = new Pool(cfg)
-    const cached = await poolB.query("SELECT result_kind, revision::text AS revision, seq::text AS seq FROM n20_idempotency WHERE key='idem-1'")
-    expect(cached.rows.length).toBe(1) // ★ 命中缓存(replay 返首次结果,不二次 apply 领域写)
-    expect(cached.rows[0].result_kind).toBe('ok'); expect(cached.rows[0].revision).toBe('1'); expect(cached.rows[0].seq).toBe('1')
-    // ★ replay 不再执行领域写 / bump seq / append event(返 cached result 即止)— 断言权威领域 state 不变:
-    const rec = await poolB.query("SELECT title, revision::text AS revision FROM n20_records WHERE id='n1'")
-    expect(rec.rows[0].title).toBe('T1')     // ★ 领域写值不变(replay 未二次 apply 改写)
-    expect(rec.rows[0].revision).toBe('1')   // ★ authoritative revision 不变(未二次 bump 到 2)
-    const seqRow = await poolB.query("SELECT seq::text AS seq FROM n20_canvas_seq WHERE canvas_id='c1'")
-    expect(seqRow.rows[0].seq).toBe('1')     // ★ canvas seq 不变(未二次 bump 到 2)
-    const evtCount = await poolB.query('SELECT count(*)::int AS c FROM n20_events')
-    expect(evtCount.rows[0].c).toBe(1)       // ★ event count 不变(replay 未二次 append event)
+    const second = await applyWithIdempotency(poolB, 'idem-1', mutation)
+    expect(second.deduped).toBe(true)        // ★ hit(返 cached result,不二次 apply 领域写)
+    expect(second.resultKind).toBe('ok'); expect(second.revision).toBe(1); expect(second.seq).toBe(1) // 与首次同结果
+    // ★ authoritative state 全不变(replay 未二次 bump revision/seq/event,未二次 append event)
+    const rec = await poolB.query("SELECT title, revision::text AS r FROM n20_records WHERE id='n1'")
+    expect(rec.rows[0].title).toBe('T1'); expect(rec.rows[0].r).toBe('1')     // ★ 领域写值不变(replay 未二次 apply)
+    expect((await poolB.query("SELECT seq::text AS s FROM n20_canvas_seq WHERE canvas_id='c1'")).rows[0].s).toBe('1') // ★ canvas seq 不变
+    expect((await poolB.query('SELECT count(*)::int AS c FROM n20_events')).rows[0].c).toBe(1) // ★ event count 不变
     await poolB.end()
-    // ★ R5 F2 验收:replay 前后 authoritative record revision / canvas seq / event count 全不变(真实领域 replay 幂等,非只 ON CONFLICT)。
+    // ★ R6 F2 验收:同 key 两次调用 applyWithIdempotency 返同首次结果;authoritative record revision / canvas seq /
+    //   event count 全不变(真实领域 replay 幂等,非"测试没发起第二次 apply"的假象)。移除 hit path early return → 二次 bump → 断言红。
   })
 
-  it('PG-T6b idempotent 首次事务 fault(R5 F2):领域写 + idem row 同事务 fault → 一起 ROLLBACK(无 partial;idem row 不落地 → 重试可重做)', async () => {
-    // R5 F2:replay 幂等的前提是"首次事务 fault 时领域写与 idem row 一起 rollback";否则 idem row 落了但领域写没成
-    //   → 重试被误判 dedup → 永久丢领域写。本探针证同事务 fault → 两边一起 ROLLBACK(idem row 不落地,重试可重做)。
+  it('PG-T6b idempotent 首次事务 fault(R6 F2):applyWithIdempotency mutation 内 fault → 同事务 ROLLBACK(领域写+idem row 都不落地 → 重试可重做,非误判 dedup)', async () => {
+    // R6 F2 红证(判决 V4):原 T6b 另写一段 SQL(withClient 手写 BEGIN/领域写/idem row/1/0/ROLLBACK),未走同一
+    //   apply path — 判决要求"T6b 应通过同一函数的 fault seam 触发 rollback,而非另写一段 SQL"。
+    // 绿证(补探针):T6b 复用 applyWithIdempotency 同一 path;fault seam = mutation 内 throw(SELECT 1/0)→
+    //   applyWithIdempotency catch → ROLLBACK(领域写 + idem row 同事务原子不落地)→ 重试同 key 仍 miss(可重做)。
     await pool!.query('TRUNCATE n20_records, n20_canvas_seq, n20_events, n20_idempotency')
     await pool!.query("INSERT INTO n20_records(id,title,revision) VALUES ('n1','orig',0)")
     await pool!.query("INSERT INTO n20_canvas_seq(canvas_id,seq) VALUES ('c1',0)")
-    await withClient(async (client) => {
-      await client.query('BEGIN')
-      await client.query("UPDATE n20_records SET title='broken', revision=revision+1 WHERE id='n1'") // 领域写
-      await client.query("INSERT INTO n20_idempotency(key,result_kind,revision,seq) VALUES ('idem-fault','ok',1,1) ON CONFLICT DO NOTHING") // idem row
-      await expect(client.query('SELECT 1/0')).rejects.toThrow() // fault(division_by_zero)→ 事务 abort
-      await client.query('ROLLBACK')
-    })
-    // ★ 领域写回滚(title 仍 orig,revision 仍 0)+ idem row 回滚(未落地 → 重试不被误判 dedup)
-    const rec = await pool!.query("SELECT title, revision::text AS revision FROM n20_records WHERE id='n1'")
-    expect(rec.rows[0].title).toBe('orig')
-    expect(rec.rows[0].revision).toBe('0') // ★ 领域写未落地(rollback)
-    const idem = await pool!.query("SELECT count(*)::int AS c FROM n20_idempotency WHERE key='idem-fault'")
-    expect(idem.rows[0].c).toBe(0) // ★ idem row 未落地 → 重试可重做领域写(非误判 dedup 永久丢)
+    // faultyMutation:写领域 + 注入 1/0 fault → throw → applyWithIdempotency ROLLBACK(同事务,非另写 SQL)
+    const faultyMutation = async (client: PoolClient): Promise<IdemResult> => {
+      await client.query("UPDATE n20_records SET title='broken', revision=revision+1 WHERE id='n1'") // 领域写(将被 rollback)
+      await client.query("INSERT INTO n20_canvas_seq(canvas_id,seq) VALUES ('c1',1) ON CONFLICT (canvas_id) DO UPDATE SET seq = n20_canvas_seq.seq + 1")
+      await client.query("INSERT INTO n20_events(seq,record_id,op_id) VALUES (1,'n1','idem-fault')") // event(将被 rollback)
+      await client.query('SELECT 1/0') // ★ fault seam(division_by_zero)→ throw → 事务 abort → ROLLBACK
+      return { resultKind: 'ok', revision: 0, seq: 0 } // 不可达(上面 throw);TS 需返回路径
+    }
+    // ★ 首次调用 fault → throw → ROLLBACK(领域写 + idem row 都不落地)
+    await expect(applyWithIdempotency(pool!, 'idem-fault', faultyMutation)).rejects.toThrow()
+    // ★ 同事务原子回滚:领域写未落地(title 仍 orig,revision 仍 0)+ canvas seq 仍 0 + event count 0 + idem row 未落地
+    const rec = await pool!.query("SELECT title, revision::text AS r FROM n20_records WHERE id='n1'")
+    expect(rec.rows[0].title).toBe('orig'); expect(rec.rows[0].r).toBe('0') // ★ 领域写未落地(rollback)
+    expect((await pool!.query("SELECT seq::text AS s FROM n20_canvas_seq WHERE canvas_id='c1'")).rows[0].s).toBe('0')
+    expect((await pool!.query('SELECT count(*)::int AS c FROM n20_events')).rows[0].c).toBe(0)
+    expect((await pool!.query("SELECT count(*)::int AS c FROM n20_idempotency WHERE key='idem-fault'")).rows[0].c).toBe(0) // ★ idem row 不落地 → 重试不被误判 dedup
+    // ★ 重试同 key:因 idem row 未落地 → miss path → 可重做领域写(非误判 dedup 永久丢)
+    const goodMutation = async (client: PoolClient): Promise<IdemResult> => {
+      await client.query("UPDATE n20_records SET title='recovered', revision=revision+1 WHERE id='n1'")
+      await client.query("INSERT INTO n20_canvas_seq(canvas_id,seq) VALUES ('c1',1) ON CONFLICT (canvas_id) DO UPDATE SET seq = n20_canvas_seq.seq + 1")
+      const seqRow = await client.query("SELECT seq::text AS seq FROM n20_canvas_seq WHERE canvas_id='c1'")
+      const seq = Number(seqRow.rows[0].seq)
+      await client.query("INSERT INTO n20_events(seq,record_id,op_id) VALUES ($1,'n1','idem-fault')", [seq])
+      const r = await client.query("SELECT revision::text AS revision FROM n20_records WHERE id='n1'")
+      return { resultKind: 'ok', revision: Number(r.rows[0].revision), seq }
+    }
+    const retry = await applyWithIdempotency(pool!, 'idem-fault', goodMutation)
+    expect(retry.deduped).toBe(false)        // ★ 重做成功(idem row 未落地 → 重试 miss → 可重做)
+    expect(retry.revision).toBe(1); expect(retry.seq).toBe(1)
+    // ★ 再次同 key → hit → 返 cached(重做后 idem row 落地,replay 不再二次 apply)
+    const replay = await applyWithIdempotency(pool!, 'idem-fault', goodMutation)
+    expect(replay.deduped).toBe(true)
+    expect((await pool!.query("SELECT revision::text AS r FROM n20_records WHERE id='n1'")).rows[0].r).toBe('1') // ★ 不变
+    // ★ R6 F2 验收:首次事务 fault → 领域写 + idem row 同事务 ROLLBACK(idem row 不落地)→ 重试可重做非误判 dedup。
   })
 
   it('PG-T7 strict-tx 跨 record 单事务(R3 F2):BEGIN 两不同 record + fault + ROLLBACK → 两 record 均不变(非 S10-5 单 record)', async () => {
