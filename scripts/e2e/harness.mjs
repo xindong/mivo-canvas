@@ -82,24 +82,92 @@ export const clearAllStorage = async (page) => {
 // reachable — a fresh page before the app hydrates, or a non-app context — in
 // which case the app's `migrateToNamespaced` claims the legacy raw key on its
 // first authenticated read (the migration scenario's v1-inject path still works).
-const resolvePersistKey = async (page, name) => {
+// resolvePersistKey: resolve the physical IDB key the app uses for a logical persist
+// name. Two paths, both single-sourced through the app's __MIVO_E2E__ bridge so the
+// harness never hardcodes the userId, the kernel flag, or the v11 split-key layout:
+//
+//  - No `domain` (default): chat / settings / legacy canvas single-blob → the FX-6
+//    name:uid namespacing (anonymous → raw name). Unchanged from mainfix R3.
+//  - `domain: 'document' | 'session'`: the canvas persist DOCUMENT/SESSION domains.
+//    Under kernel=new the app (docKernelPersistAdapter) writes canvas state to the
+//    SPLIT keys `name:uid:document` / `name:uid:session`, NOT the legacy single-blob
+//    `name:uid` key. The harness asks the bridge's getCanvasPersistDocumentKey/
+//    SessionKey (which route through the app's OWN namespacedKey + the adapter's
+//    documentKey/sessionKey) for the physical key — so the harness reads the SAME key
+//    the app writes under EITHER kernel. Under kernel=legacy the bridge returns the
+//    single-blob key (canvases always lived there), so domain-aware reads are
+//    kernel-agnostic and legacy has zero behaviour change.
+//
+//    This fixed mask-hydration SC-15, which was stable-red under kernel=new because
+//    the pre-reload canvas assertion read the legacy single-blob key while the app
+//    had durably persisted the generating ai-slot to the :document split key (proven
+//    via a runtime IDB getAll dump: the :document key held the generating slot, the
+//    legacy single-blob key was absent). The chat assertion was unaffected (chat uses
+//    idbStateStorage = single-blob under both kernels, correctly resolved by the
+//    no-domain path).
+//
+//  Failure semantics (SC-15 R2 P2): the NO-domain path keeps the broad-catch legacy
+//  fallback to the raw name (chat/settings/anonymous/pre-hydrate — these callers passed
+//  no domain, so degrading to the raw name IS the documented legacy behaviour, not a
+//  silent split-key mismatch). The DOMAIN path is FAIL-CLOSED: it validates the domain
+//  enum, requires the bridge + matching getter, and propagates any evaluate exception
+//  with cause. A split-key probe must never silently read a stale blob off the wrong
+//  physical key (false green) or mask a product persistence bug as a probe timeout
+//  (misleading red) — the silent-failure family this round eliminates. The app's
+//  migrateToNamespaced still claims the legacy raw key on its first authenticated read
+//  in the no-domain fallback case.
+export const resolvePersistKey = async (page, name, { domain } = {}) => {
+  // No `domain` (default): chat / settings / legacy canvas single-blob. This compat
+  // path is UNCHANGED from mainfix R3 — the broad catch stays here on purpose. These
+  // callers passed no domain, so a resolver failure degrading to the raw name is the
+  // documented legacy semantics (the app's migrateToNamespaced then claims the legacy
+  // raw key on its first authenticated read), NOT a silent split-key mismatch.
+  if (domain === undefined) {
+    try {
+      return await page.evaluate(({ n }) => {
+        const bridge = globalThis.__MIVO_E2E__
+        const uid = bridge && typeof bridge.getPersistUserId === 'function' ? bridge.getPersistUserId() : null
+        return uid && uid !== 'anonymous' ? `${n}:${uid}` : n
+      }, { n: name })
+    } catch {
+      return name
+    }
+  }
+
+  // domain-explicit path — FAIL-CLOSED (SC-15 R2 P2). page.evaluate takes EXACTLY ONE
+  // arg, so name + domain are wrapped in an object; Playwright throws "Too many
+  // arguments" on >1 trailing arg, which the old broad catch would have swallowed into
+  // a raw-name fallback reading the WRONG IDB key. A probe that asked for a canvas split
+  // key must NOT silently degrade to a legacy/raw key when the resolver itself is broken:
+  // that reads a stale blob on the wrong physical key (false green) or masks a product
+  // persistence bug as a probe timeout (misleading red). Validate the domain enum,
+  // require the bridge + the matching getter, and propagate any exception with cause.
+  if (domain !== 'document' && domain !== 'session') {
+    throw new Error(`resolvePersistKey: invalid domain '${String(domain)}' (expected 'document' | 'session')`)
+  }
   try {
-    const uid = await page.evaluate(() => {
+    return await page.evaluate(({ n, d }) => {
       const bridge = globalThis.__MIVO_E2E__
-      if (bridge && typeof bridge.getPersistUserId === 'function') {
-        return bridge.getPersistUserId()
+      if (!bridge) {
+        throw new Error(`resolvePersistKey: __MIVO_E2E__ bridge absent (domain='${d}')`)
       }
-      return null
-    })
-    return uid && uid !== 'anonymous' ? `${name}:${uid}` : name
-  } catch {
-    return name
+      const getter = d === 'document' ? bridge.getCanvasPersistDocumentKey : bridge.getCanvasPersistSessionKey
+      if (typeof getter !== 'function') {
+        const which = d === 'document' ? 'Document' : 'Session'
+        throw new Error(`resolvePersistKey: bridge missing getCanvasPersist${which}Key (domain='${d}')`)
+      }
+      return getter(n)
+    }, { n: name, d: domain })
+  } catch (err) {
+    throw new Error(`resolvePersistKey: domain='${domain}' resolve failed for '${name}'`, { cause: err })
   }
 }
 
-/** Read a persisted KV value (the raw JSON string zustand persist stored). */
-export const readPersistedKv = async (page, key) => {
-  const physical = await resolvePersistKey(page, key)
+/** Read a persisted KV value (the raw JSON string zustand persist stored).
+ *  `opts.domain` ('document' | 'session') routes through the kernel-aware split-key
+ *  resolver for canvas persist; omit for chat/settings/legacy single-blob. */
+export const readPersistedKv = async (page, key, opts = {}) => {
+  const physical = await resolvePersistKey(page, key, opts)
   return page.evaluate(async (k) => {
     return new Promise((resolve) => {
       const req = indexedDB.open('mivo-canvas-persist', 1)
@@ -169,10 +237,10 @@ export const writePersistedKv = async (page, key, value) => {
  *  false-green (a `generating` blob passed an `error`/`failed` predicate check because
  *  callers only did `if (!raw) throw`). Callers must assert predicate semantics, not
  *  just key existence; the honest `null` return forces that. */
-export const waitForPersistedKv = async (page, key, predicate, { timeout = 2000, interval = 50 } = {}) => {
+export const waitForPersistedKv = async (page, key, predicate, { timeout = 2000, interval = 50, ...keyOpts } = {}) => {
   const deadline = Date.now() + timeout
   while (Date.now() < deadline) {
-    const raw = await readPersistedKv(page, key)
+    const raw = await readPersistedKv(page, key, keyOpts)
     if (raw !== null && predicate(raw)) return raw
     await new Promise((r) => setTimeout(r, interval))
   }
