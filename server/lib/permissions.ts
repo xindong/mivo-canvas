@@ -515,6 +515,23 @@ export class InMemoryPermissionBackend implements PermissionBackend {
     })
   }
 
+  /**
+   * R5-F2: 把 project 的全部历史 failed dead-letter 标 superseded(recordCompensation 时调用)。
+   * 新 generation(同 op 重试 / 对立 op 翻转)意味 desired state 已翻篇,旧 dead-letter 不再代表当前
+   * 未收敛状态 → 不计 getCompensationCounts.failed(可用性恢复,不再永久 503)。保留行于 listCompensations
+   * 供审计(listFailedCompensations 只列当前 failed=空)。memory 单线程:Map 遍历标 superseded,与 PG UPDATE 对偶。
+   */
+  private supersedeOldFailedForProject(projectId: string): void {
+    const ids = this.compensationsByProject.get(projectId) ?? []
+    const now = nowIso()
+    for (const id of ids) {
+      const it = this.compensations.get(id)
+      if (it && it.status === 'failed') {
+        this.compensations.set(id, { ...it, status: 'superseded', lastError: 'superseded by newer generation (reopen)', updatedAt: now })
+      }
+    }
+  }
+
   /** 建 pending 意图(内部:不查幂等,调用方负责)。 */
   private createPendingIntent(projectId: string, op: CompensationOp, generation: number): CompensationIntent {
     const now = nowIso()
@@ -573,6 +590,9 @@ export class InMemoryPermissionBackend implements PermissionBackend {
     if (pending) return pending
     // P1-2 supersede:新 transition 取代旧 pending 对立 op(防旧 restore 晚到重开链接)。
     this.supersedeOppositePending(projectId, op)
+    // R5-F2:新 generation 让同 project 全部历史 failed dead-letter 不计当前未收敛(counts.failed 归零,可用性恢复)。
+    //   新 generation(同 op 重试 / 对立 op 翻转)意味 desired state 已翻篇,旧 dead-letter 不再代表当前未收敛。
+    this.supersedeOldFailedForProject(projectId)
     return this.createPendingIntent(projectId, op, this.nextGeneration(projectId))
   }
 

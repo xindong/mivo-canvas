@@ -479,9 +479,101 @@ const runPermissionBackendContractSuite = (
       const r = await b.attemptCompensation('p1', 'restore') // 故障已清 → completed
       expect(r.kind).toBe('completed')
       expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('active') // 收敛
-      // failed 历史行保留(可观察),counts.failed 仍 1(历史),pending 0
+      // R5-F2 闭环:重开并 completed 后,旧 failed 历史行不再计入当前未收敛 → counts.failed=0(可用性恢复)。
+      //   未修复:旧 failed 永久计入 → counts.failed=1(永久 503,即使已由新 generation 收敛)。
       const counts2 = await b.getCompensationCounts()
       expect(counts2.pending).toBe(0)
+      expect(counts2.failed).toBe(0) // FIX:重开收敛后 failed 归零(readiness 恢复)
+    })
+
+    // R5-F2 闭环(R4 verdict Step 8 暴露的 P1 阻断):dead-letter 后即使重开新 generation 并收敛,旧 failed
+    //   历史行仍永久计入 getCompensationCounts → /readyz 永久 503。修复:新 generation record 时把同 project
+    //   较旧 failed 标 superseded(保留历史于 listCompensations,不计当前未收敛)。验收三态:failed→reopen→completed→恢复。
+    it('R5-F2 闭环:failed→reopen gen2→completed→counts.failed=0(可用性恢复,历史仍可审计)', async () => {
+      const link = await b.createShareLink('p1', 'view', 'ownerA')
+      await b.revokeAllForProject('p1') // cascade marker,link revoked
+      await setProjectDeleted(b, 'p1', false) // restore desired
+      await b.recordCompensation('p1', 'restore') // gen1 pending
+      // dead-letter:MAX 次故障 → sweep 超限放弃 → failed
+      setCompensationFault(b, 'restore', COMPENSATION_MAX_SWEEP_ATTEMPTS)
+      for (let i = 0; i < COMPENSATION_MAX_SWEEP_ATTEMPTS; i++) {
+        await b.attemptCompensation('p1', 'restore')
+      }
+      const sw = await b.sweepCompensations()
+      expect(sw.failed).toBe(1)
+      const countsBefore = await b.getCompensationCounts()
+      expect(countsBefore.failed).toBe(1) // dead-letter 未收敛
+      expect(countsBefore.pending).toBe(0)
+      // 故障解除 → 重开 gen2(record 时把旧 failed gen1 标 superseded)→ attempt completed
+      const again = await b.recordCompensation('p1', 'restore')
+      expect(again.generation).toBe(2)
+      const countsMid = await b.getCompensationCounts()
+      expect(countsMid.failed).toBe(0) // 旧 failed 已被新 generation supersede,不计当前
+      expect(countsMid.pending).toBe(1) // gen2 在途
+      const r = await b.attemptCompensation('p1', 'restore')
+      expect(r.kind).toBe('completed')
+      expect((await b.resolveShareLink(link.token, 'p1'))?.kind).toBe('active') // 收敛
+      // 恢复:counts.failed=0(不再 503);历史仍可审计(listCompensations 含 failed→superseded 行)
+      const countsAfter = await b.getCompensationCounts()
+      expect(countsAfter.failed).toBe(0)
+      expect(countsAfter.pending).toBe(0)
+      const ints = await b.listCompensations('p1')
+      const gen1 = ints.find((i) => i.generation === 1)!
+      expect(gen1.status).toBe('superseded') // 历史保留,但不再计为 failed
+      expect(ints.filter((i) => i.status === 'failed')).toHaveLength(0) // 当前无 failed
+    })
+
+    it('R5-F2 重开再失败仍 503:gen2 重开→再 dead-letter → counts.failed=1(仅最新 failed 计数)', async () => {
+      await b.createShareLink('p1', 'view', 'ownerA') // 建 link 供级联 revoke(本测只验 counts,不解析 link)
+      await b.revokeAllForProject('p1')
+      await setProjectDeleted(b, 'p1', false)
+      await b.recordCompensation('p1', 'restore') // gen1
+      setCompensationFault(b, 'restore', COMPENSATION_MAX_SWEEP_ATTEMPTS)
+      for (let i = 0; i < COMPENSATION_MAX_SWEEP_ATTEMPTS; i++) await b.attemptCompensation('p1', 'restore')
+      await b.sweepCompensations() // gen1 failed
+      expect((await b.getCompensationCounts()).failed).toBe(1)
+      // 重开 gen2(record supersede gen1 failed)→ gen2 也失败(故障未解除)
+      setCompensationFault(b, 'restore', COMPENSATION_MAX_SWEEP_ATTEMPTS) // gen2 仍故障
+      await b.recordCompensation('p1', 'restore') // gen2 pending,supersede gen1
+      expect((await b.getCompensationCounts()).failed).toBe(0) // gen1 已 supersede,gen2 在途
+      for (let i = 0; i < COMPENSATION_MAX_SWEEP_ATTEMPTS; i++) await b.attemptCompensation('p1', 'restore')
+      const sw2 = await b.sweepCompensations() // gen2 failed
+      expect(sw2.failed).toBe(1)
+      const counts = await b.getCompensationCounts()
+      expect(counts.failed).toBe(1) // 仅 gen2(最新 failed)计数;gen1 已 superseded 不重复计
+      expect(counts.pending).toBe(0)
+    })
+
+    it('R5-F2 多 project:仅未收敛 project 计 failed;p1 重开收敛后 failed=0,p2 不受影响', async () => {
+      await seedProject(b, 'p2', 'ownerA')
+      // p1 dead-letter
+      const link1 = await b.createShareLink('p1', 'view', 'ownerA')
+      await b.revokeAllForProject('p1')
+      await setProjectDeleted(b, 'p1', false)
+      await b.recordCompensation('p1', 'restore')
+      setCompensationFault(b, 'restore', COMPENSATION_MAX_SWEEP_ATTEMPTS)
+      for (let i = 0; i < COMPENSATION_MAX_SWEEP_ATTEMPTS; i++) await b.attemptCompensation('p1', 'restore')
+      await b.sweepCompensations() // p1 gen1 failed
+      // p2 正常完成(无 dead-letter)
+      const link2 = await b.createShareLink('p2', 'view', 'ownerA')
+      await b.revokeAllForProject('p2')
+      await setProjectDeleted(b, 'p2', false)
+      await b.recordCompensation('p2', 'restore')
+      const r2 = await b.attemptCompensation('p2', 'restore')
+      expect(r2.kind).toBe('completed')
+      expect((await b.resolveShareLink(link2.token, 'p2'))?.kind).toBe('active')
+      let counts = await b.getCompensationCounts()
+      expect(counts.failed).toBe(1) // 仅 p1
+      expect(counts.pending).toBe(0)
+      // p1 重开收敛 → failed 归零(p2 从未 failed)
+      const again = await b.recordCompensation('p1', 'restore')
+      expect(again.generation).toBe(2)
+      const r1 = await b.attemptCompensation('p1', 'restore')
+      expect(r1.kind).toBe('completed')
+      expect((await b.resolveShareLink(link1.token, 'p1'))?.kind).toBe('active')
+      counts = await b.getCompensationCounts()
+      expect(counts.failed).toBe(0) // p1 收敛后全局 failed=0
+      expect(counts.pending).toBe(0)
     })
 
     // R5-F1 TOCTOU(R4 加压暴露的 P1 阻断):durable desired state 在 claim 后、side effect 前翻转

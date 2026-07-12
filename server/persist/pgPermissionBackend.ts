@@ -458,6 +458,15 @@ export class PgPermissionBackend implements PermissionBackend {
         .where('status', '=', 'pending')
         .executeTakeFirst()
       if (existing) return rowToCompensation(existing)
+      // R5-F2:新 generation record 时把同 project 全部历史 failed dead-letter 标 superseded(不计当前未收敛)。
+      //   新 generation(同 op 重试 / 对立 op 翻转)意味 desired state 已翻篇,旧 dead-letter 不再代表当前未收敛
+      //   → counts.failed 归零(/readyz 可用性恢复,不再永久 503)。保留行于 listCompensations 供审计。
+      //   与 memory supersedeOldFailedForProject 对偶;同事务 + advisory lock 保证与并发 record 串行。
+      await trx.updateTable('share_link_compensations')
+        .set({ status: 'superseded', last_error: 'superseded by newer generation (reopen)', claimed_at: null, claimed_until: null, claim_token: null, updated_at: new Date() })
+        .where('project_id', '=', projectId)
+        .where('status', '=', 'failed')
+        .execute()
       const gen = await this.nextGenerationInTrx(trx, projectId)
       const row = await trx.insertInto('share_link_compensations')
         .values({
