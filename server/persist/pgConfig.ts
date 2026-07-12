@@ -2,7 +2,9 @@
 // T1.3 PG backend 连接配置 + backend 选择开关。env 驱动,不写死任何密码(.env 不入 git)。
 //
 // 后端选择(与项目一贯 ?kernel= 旗下切换 风格一致):
-//  - MIVO_PERSIST_BACKEND=pg|memory,默认 **memory**(生产零变化),PG 后端灰度启用。
+//  - MIVO_PERSIST_BACKEND=pg|memory,默认 **memory**(未设置/空=memory,生产零变化),PG 后端灰度启用。
+//    非法值(非 pg/memory,含 typo 如 'PG'/'postgres'/'Pg ')→ 启动即抛错 fail visibly,不静默落 memory
+//    (防生产 env 拼错静默丢持久化;与缺密码抛错同一 fail-visible 策略,见 resolvePersistBackendConfig)。
 //  - PG 启用时,连接参数从 MIVO_PG_* env 读;缺密码 → 构造抛错(fail visibly,不静默降级)。
 //
 // 生产端口 55442(MIVO_PG_HOST_PORT,见 ops/postgres/docker-compose.yml);本地开发/测试用
@@ -70,7 +72,19 @@ const parseIdleTimeout = (value: string | undefined, fallback: number): number =
  * kind=pg 但缺 MIVO_PG_PASSWORD → 抛错(不静默回退 memory;PG 启用即承诺真持久)。
  */
 export const resolvePersistBackendConfig = (env: NodeJS.ProcessEnv = process.env): PersistBackendConfig => {
-  const kind: PersistBackendKind = env.MIVO_PERSIST_BACKEND === 'pg' ? 'pg' : 'memory'
+  // B0 fail-fast:MIVO_PERSIST_BACKEND 白名单 {pg, memory},防 env 拼错静默丢持久化。
+  //  - 未设置 / 空串 / 纯空白 → memory(默认,dev 零变化,与现状完全一致)。
+  //  - 显式 'pg' → pg(走下面的密码校验);显式 'memory' → memory(允许显式声明)。
+  //  - 其余任意值(含 typo 如 'PG'/'postgres'/'Pg ')→ 启动即抛错,不静默落 memory
+  //    (与缺密码抛错同一 fail-visible 策略;否则生产 env 拼错会静默降级丢持久化)。
+  const raw = env.MIVO_PERSIST_BACKEND
+  if (raw === undefined || raw.trim() === '') return { kind: 'memory', pg: null }
+  if (raw !== 'pg' && raw !== 'memory') {
+    throw new Error(
+      `MIVO_PERSIST_BACKEND 非法值 "${raw}":合法值为 "pg" 或 "memory"(未设置/空=memory)。生产 env 拼错会静默丢持久化,故启动即拒(fail visibly,不静默降级)。`,
+    )
+  }
+  const kind: PersistBackendKind = raw === 'pg' ? 'pg' : 'memory'
   if (kind !== 'pg') return { kind, pg: null }
   const password = env.MIVO_PG_PASSWORD
   if (!password) {
