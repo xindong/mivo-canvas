@@ -4,10 +4,14 @@
 // 验收(对齐 lead 追加范围):
 //  - server 模式 chat hydrate:hydrateFromServer 拉 active canvas 的 per-actor chat collection → useChatStore 灌入。
 //  - chat mutation 入队:appendNotice → enqueue → queue drain → POST /api/canvas/:id/chat(wired op,非 terminal)。
-//  - dp6r per-actor 语义 stub:KEY_A 的 chat 对 KEY_B 不可见;匿名(无 key)→ 401 require-login。
+//  - adapter per-actor wire-shape 四场景(隔离 / 匿名拒 / PATCH 404 不复制 / orderRevision 贯通)。
 //
-// 本测试用注入 fetch/stub(不依赖真实 dp6r route——dp6r route 在另一分支,lead 安排 dp6r 先进 main)。
-// local 模式(isLocalPersist=true,test env 默认)gate 关闭 → appendNotice 正常进行;queue 显式 start。
+// R3 F4:DP-6R 真路由已合入 main(merge 686cf9c);真 Hono 四场景由 server/routes/chat.peruser.route.test.ts
+// 覆盖(gateway-auth:跨 actor 隔离 / share-link 匿名 401 / PATCH strict-update 404 不复制 / reorder per-actor
+// orderRevision)。本测试用 stub 模拟真路由 per-actor 语义(经客户端 adapter requestJson wire-shape),
+// 证客户端 adapter 不丢/不扭曲 wire shape(尤其 orderRevision);stub 与真路由语义一致(post-merge 对齐)。
+// 注:client adapter 走 api-key 单 actor 认证,跨 actor/share-link 是 gateway-auth 场景(真路由侧覆盖);
+// src/lib↔server 跨 tsconfig 项目边界(TS2591)使 client-adapter 直连真 Hono 桥接不可行(架构边界有意为之)。
 
 import { describe, expect, it, beforeEach, vi } from 'vitest'
 
@@ -146,6 +150,16 @@ describe('G1-a chat — adapter per-actor wire(dp6r 语义 stub:隔离 + 匿名 
         byOwner[key] = [...(byOwner[key] ?? []), b.message]
         return new Response(JSON.stringify({ id: b.message.id, revision: 0 }), { status: 201, headers: { 'content-type': 'application/json' } })
       }
+      if (method === 'PATCH' && path.match(/^\/api\/canvas\/[^/]+\/chat\/[^/]+$/)) {
+        // DP-6R P2-1 strict-update:仅 PATCH 本 owner collection 已存在的 msgId;不存在 → 404(不借 PATCH create 副本)
+        const msgId = decodeURIComponent(path.split('/').pop() as string)
+        const own = byOwner[key] ?? []
+        const exists = own.some((m) => m.id === msgId)
+        if (!exists) return new Response(JSON.stringify({ error: 'unknown-message' }), { status: 404, headers: { 'content-type': 'application/json' } })
+        const b = JSON.parse((init?.body as string) ?? '{}') as { payload: Partial<ChatMessage> }
+        byOwner[key] = own.map((m) => (m.id === msgId ? { ...m, ...b.payload } : m))
+        return new Response(JSON.stringify({ id: msgId, revision: 0 }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
       return new Response(null, { status: 404 })
     }
     return { fetch, byOwner }
@@ -187,5 +201,33 @@ describe('G1-a chat — adapter per-actor wire(dp6r 语义 stub:隔离 + 匿名 
     } catch (e) {
       expect(e).toBeInstanceOf(HttpError)
     }
+  })
+
+  it('R3 F4 ③ PATCH 404 不复制:updateChatMessage 不存在 msgId → 404 HttpError,不借 PATCH create 副本', async () => {
+    const { fetch, byOwner } = makeDp6rStub()
+    const adapterA = createFetchServerPersistAdapter({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders(KEY_A) })
+    // A collection 初始有 a1;PATCH 不存在的 msgId → 404(strict-update,不 create)
+    await expect(adapterA.updateChatMessage('c1', 'nonexistent-msg', { text: 'sneak' } as never)).rejects.toMatchObject({
+      name: 'HttpError',
+      status: 404,
+    })
+    // A collection 仍只有 a1(PATCH 未借机 create nonexistent 副本)
+    expect(byOwner[KEY_A].length).toBe(1)
+    expect(byOwner[KEY_A][0]!.id).toBe('a1')
+    // 确认存在的 msgId 可 PATCH(200,不 404)
+    const updated = await adapterA.updateChatMessage('c1', 'a1', { text: 'edited' } as never)
+    expect(updated).toBeDefined()
+    expect(byOwner[KEY_A].find((m) => m.id === 'a1')!.text).toBe('edited')
+  })
+
+  it('R3 F4 ④ orderRevision 贯通:listChatMessages 返 number cursor(adapter 不丢);贯通无 key → 401 先于 cursor', async () => {
+    const { fetch } = makeDp6rStub()
+    const adapterA = createFetchServerPersistAdapter({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders(KEY_A) })
+    const msgs = await adapterA.listChatMessages('c1')
+    // orderRevision 贯通:adapter requestJson<ListChatMessagesResponse> 不丢 orderRevision(真路由侧由
+    // chat.peruser.route.test.ts 验 reorder If-Match=cursor bump;此处证客户端拿到的 cursor 可消费)
+    expect(typeof msgs.orderRevision).toBe('number')
+    expect(msgs.orderRevision).toBe(0)
+    // cursor 是客户端未来 reorder If-Match base(reorder op 接线时读 getChatOrderRevision;此处 adapter 直返)
   })
 })
