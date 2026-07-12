@@ -102,7 +102,7 @@ npm run test:unit -- src/lib/serverPersistAdapter.contract.test.ts server/persis
 1. **无双协议窗口成立**:#194 `unwiredServerPersistAdapter` 前端未接线 → 原地演进,无新旧 endpoint 并存窗口 → 不付双 endpoint 王税。
 2. **单次部署切 schema**:部署带 feature flag(`FIELD_LEVEL_OPS=on`),切 field-level op schema;可切回整 record payload 回滚。
 3. **FX-5 队列一次性迁移**:旧 IDB queued body → 新 op schema 转换(migration on read);stale client(旧 body)打新 endpoint → 400 `payload-rejected` → 明确错误提示 refetch(非 409)。
-4. **回滚策略**:feature flag 切回 `FIELD_LEVEL_OPS=off` → 整 record payload decoder;FX-5 队列 migration 可逆(新 op → 旧 body 反向转换)。
+4. **回滚策略**:feature flag 切回 `FIELD_LEVEL_OPS=off` → 整 record payload decoder;rollback 从 authoritative 全 record snapshot materialize 旧 shape body(非 delta 反演;delta-inversion 无算法/不支持,见下注 + spike C-4)。
 5. **不选 versioned endpoint 的理由**:方案 B(新增 `POST /nodes/:nodeId/ops` versioned + #194 冻结)付双 endpoint 税,但 #194 前端未接线 → 方案 B 无"不动 #194"收益,纯增成本。
 
 > 注:**"无双协议窗口"仍成立**(原子 cutover + #194 unwired → 原地演进,无双 endpoint 并存);但"零破坏"不成立(逐文件 12 项 + FX-5 迁移 + 118 项回归)。Gate6 判决据此(§2 Gate6)。

@@ -1801,43 +1801,91 @@ describe('N2-0 返修 §1.2 cutover contract harness(R5 F4): flag on/off decoder
    * - authoritative store = 全 record(server-side,source of truth;rollback 的 materialize 源)。
    * - rollback = 从 authoritative snapshot materialize 旧 body(非 delta 反演)。
    */
+  // ★ R6 F4a/F4b:CutoverHarness 加真实 revision/lastWriter/outbox + patch 支持 transform 子字段 + base 比较
+  //   判决 V6 红证:原 CutoverHarness 无 revision/last-writer/notice,C-3 只连续 set A/B 断言后者 200 + title=B,
+  //   删除任何 stale-base/overwritten 逻辑都不红(逻辑不存在);migrateOldQueueBody 只生成 title set 丢 transform。
+  /** overwritten 事件:base 落后并发时,前写者收(败方知情,T1-1/G4-4 不拒写只 surfacing)。 */
+  type OverwrittenEvent = { toActor: string; fieldPath: string[]; historicalValue: unknown; byActor: string; currentRevision: number }
   class CutoverHarness {
     private flag = false
-    private recs = new Map<string, LegacyBody>()
+    /** authoritative store:全 record + per-record revision + lastWriter(rollback/恢复的 materialize 源)。 */
+    private recs = new Map<string, LegacyBody & { revision: number; lastWriter: string }>()
+    /** overwritten outbox:base 落后并发时,前写者收的事件(drainOverwritten 读取)。 */
+    private outbox: OverwrittenEvent[] = []
     setFlag(on: boolean) { this.flag = on }
-    /** PATCH decoder:flag 决定接受 old-shape(200)还是 new-shape(200);反之 400 payload-rejected。 */
-    patch(nodeId: string, body: LegacyBody | NewOp): { status: number; body: { error?: string; id?: string; revision?: number; seq?: number } } {
+    /**
+     * PATCH decoder:flag 决定接受 old-shape(整 record)还是 new-shape(DomainOp);反之 400 payload-rejected。
+     * ★ R6 F4a:new-shape set 携 opts.{actor, baseRevision};base < current revision → 不拒写(200,G4-4)+ 推前写者 overwritten。
+     * ★ R6 F4b:patch 支持 title + transform.x + transform.y 子字段(原只处理 title,致 C-2 丢 transform)。
+     */
+    patch(nodeId: string, body: LegacyBody | NewOp, opts?: { actor?: string; baseRevision?: number }): { status: number; body: { error?: string; id?: string; revision?: number; seq?: number } } {
       const isNew = 'kind' in body && (body.kind === 'set' || body.kind === 'unset')
+      const actor = opts?.actor ?? 'unknown'
+      const base = opts?.baseRevision ?? 0
       if (this.flag) {
         // flag on:new-shape DomainOp 接受;old-shape 整 record → 400 payload-rejected(状态表 row 1/3)
         if (isNew) {
-          const r = this.recs.get(nodeId) ?? { id: nodeId, title: '', transform: { x: 0, y: 0 } }
-          if (body.kind === 'set' && body.fieldPath[0] === 'title') r.title = body.value as string
+          const r = this.recs.get(nodeId) ?? { id: nodeId, title: '', transform: { x: 0, y: 0 }, revision: 0, lastWriter: '' }
+          const prevRevision = r.revision
+          const prevWriter = r.lastWriter
+          if (body.kind === 'set') {
+            if (body.fieldPath[0] === 'title') {
+              const historicalValue = r.title
+              r.title = body.value as string
+              r.revision = prevRevision + 1; r.lastWriter = actor
+              // ★ R6 F4a:base 落后(base < prevRevision)→ 不拒写(200)+ 推前写者 overwritten(败方知情)
+              if (base < prevRevision && prevWriter) {
+                this.outbox.push({ toActor: prevWriter, fieldPath: body.fieldPath, historicalValue, byActor: actor, currentRevision: r.revision })
+              }
+            } else if (body.fieldPath[0] === 'transform') {
+              const sub = body.fieldPath[1] as 'x' | 'y'
+              r.transform[sub] = body.value as number
+              r.revision = prevRevision + 1; r.lastWriter = actor
+            }
+          }
           this.recs.set(nodeId, structuredClone(r))
-          return { status: 200, body: { id: nodeId, revision: 1, seq: 1 } }
+          return { status: 200, body: { id: nodeId, revision: r.revision, seq: r.revision } }
         }
         return { status: 400, body: { error: 'payload-rejected' } } // old shape on flag-on → 400(状态表 row 1)
       }
       // flag off:old-shape 整 record 接受;new-shape DomainOp → 400 payload-rejected(状态表 rollback/old-server)
       if (!isNew) {
-        this.recs.set(nodeId, structuredClone(body as LegacyBody))
+        this.recs.set(nodeId, structuredClone({ ...(body as LegacyBody), revision: 1, lastWriter: actor }))
         return { status: 200, body: { id: nodeId, revision: 1, seq: 1 } }
       }
       return { status: 400, body: { error: 'payload-rejected' } } // new shape on flag-off → 400
     }
+    /** ★ R6 F4a:drain overwritten 事件给某 actor(前写者;败方知情)。 */
+    drainOverwritten(actor: string): OverwrittenEvent[] {
+      const events = this.outbox.filter((e) => e.toActor === actor)
+      this.outbox = this.outbox.filter((e) => e.toActor !== actor)
+      return events
+    }
+    /** ★ R6 F4a:per-record revision(状态表 row 4 stale-base 判定用)。 */
+    revision(nodeId: string): number { return this.recs.get(nodeId)?.revision ?? 0 }
     /** FX-5 old queue migration-on-read:旧 queued NodePayload → 转换为新 op schema(状态表 row 2)。 */
     migrateOldQueueBody(legacy: LegacyBody): NewOp[] {
-      // migration-on-read:整 record → 一组 set op(field-level);生产 N2-1 实装,spike 演示转换可行
-      return [{ kind: 'set', fieldPath: ['title'], value: legacy.title }]
+      // ★ R6 F4b:migration-on-read 全字段生成(title + transform.x + transform.y),不丢 transform(原只生成 title)
+      return [
+        { kind: 'set', fieldPath: ['title'], value: legacy.title },
+        { kind: 'set', fieldPath: ['transform', 'x'], value: legacy.transform.x },
+        { kind: 'set', fieldPath: ['transform', 'y'], value: legacy.transform.y },
+      ]
     }
     /** authoritative snapshot(全 record;rollback / 恢复的 materialize 源)。 */
-    snapshot(): LegacyBody[] { return [...this.recs.values()].map((r) => structuredClone(r)) }
+    snapshot(): (LegacyBody & { revision: number; lastWriter: string })[] { return [...this.recs.values()].map((r) => structuredClone(r)) }
     /** rollback materialize:从 authoritative 全 record 重建旧 shape body(非 delta 反演;状态表 row 5)。 */
     materializeLegacyBody(nodeId: string): LegacyBody | null {
       const r = this.recs.get(nodeId)
-      return r ? structuredClone(r) : null // authoritative 全 record → 旧 shape body 直出(非从单个 delta 反演)
+      if (!r) return null
+      // authoritative 全 record → 旧 shape body 直出(剥 revision/lastWriter 元数据,非从单个 delta 反演)
+      const { revision: _rev, lastWriter: _lw, ...legacy } = r
+      return structuredClone(legacy)
     }
-    get(nodeId: string): LegacyBody | undefined { return this.recs.get(nodeId) ? structuredClone(this.recs.get(nodeId)!) : undefined }
+    get(nodeId: string): (LegacyBody & { revision: number; lastWriter: string }) | undefined {
+      const r = this.recs.get(nodeId)
+      return r ? structuredClone(r) : undefined
+    }
   }
 
   it('C-1 cutover flag on/off decoder(R5 F4):flag-off old-shape 200 + new-op 400;flag-on old-shape 400 + new-op 200(状态表 row 1/3)', () => {
@@ -1857,32 +1905,60 @@ describe('N2-0 返修 §1.2 cutover contract harness(R5 F4): flag on/off decoder
     // 状态表 row 1(old client 旧 body → 新 server)= 400;row 3(new server 新 op)= 200;flag on/off 切换可逆。
   })
 
-  it('C-2 FX-5 old queue migration-on-read(R5 F4):旧 queued NodePayload → 转换新 op schema → flag-on 200(客户端无感,状态表 row 2)', () => {
+  it('C-2 FX-5 old queue migration-on-read 全字段 round-trip(R6 F4b):旧 queued NodePayload 全字段 → 新 op schema → flag-on 应用 → deep equal 原值(含 transform;漏任一字段必红,状态表 row 2)', () => {
+    // R6 F4b 红证(判决 V6):原 migrateOldQueueBody 只生成 title set(丢 transform),C-2 只验 title;
+    //   漏 LegacyBody.transform 字段 C-2 不红(逻辑根本不验 transform)→ 状态表"旧 queued 转换后客户端无感"强于实测。
+    // 绿证(补探针):migrateOldQueueBody 全字段生成(title + transform.x + transform.y);C-2 应用全 op 后 deep equal 原值。
     const h = new CutoverHarness()
     h.setFlag(true) // cutover 后 drain 队列
-    // 旧 IDB queued body(cutover 前入队的整 record NodePayload)
+    // 旧 IDB queued body(cutover 前入队的整 record NodePayload,含 transform)
     const queuedLegacy: LegacyBody = { id: 'n2', title: 'queued', transform: { x: 5, y: 5 } }
-    // ★ migration-on-read:旧 body → 新 op schema 转换(状态表 row 2:200 ok 转换后,客户端无感)
+    // ★ R6 F4b:migration-on-read 全字段生成(title + transform.x + transform.y),原只生成 title 丢 transform
     const migrated = h.migrateOldQueueBody(queuedLegacy)
-    expect(migrated.length).toBeGreaterThan(0)
-    expect(migrated[0].kind).toBe('set')
-    // 转换后新 op 打 flag-on endpoint → 200(队列 drain 时转换,客户端无感)
-    const res = h.patch('n2', migrated[0])
-    expect(res.status).toBe(200)
-    expect(h.get('n2')?.title).toBe('queued') // ★ 旧 body 的 title 经 migration 落到新 op(无丢失)
+    expect(migrated.length).toBe(3) // ★ 全字段 3 个 op(漏任一 LegacyBody 字段 → length<3 红)
+    expect(migrated.every((op) => op.kind === 'set')).toBe(true)
+    // 转换后全 op 打 flag-on endpoint → 200(队列 drain 时转换,客户端无感)
+    for (const op of migrated) {
+      expect(h.patch('n2', op).status).toBe(200)
+    }
+    // ★ deep equality round-trip:迁移后 record 与原 queuedLegacy 全字段一致(无丢失,含 transform.x/y)
+    const got = h.get('n2')!
+    expect(got.id).toBe('n2')
+    expect(got.title).toBe('queued')        // ★ 漏 title op → 此行红(初始 '' ≠ 'queued')
+    expect(got.transform.x).toBe(5)         // ★ 漏 transform.x op → 此行红(初始 0 ≠ 5)
+    expect(got.transform.y).toBe(5)         // ★ 漏 transform.y op → 此行红(初始 0 ≠ 5)
+    expect(got.transform).toEqual({ x: 5, y: 5 }) // 整对象 deep equal
+    // ★ R6 F4b 验收:漏任一 LegacyBody 字段(title / transform.x / transform.y)时 C-2 必红(length 或 deep equal 断言)。
   })
 
-  it('C-3 new op + stale base(R5 F4):并发 base 落后 → 200 + overwritten(非 409,对齐 G4-4 revision 不拒写 + T1-1 败方知情;状态表 row 4)', () => {
-    // 状态表 row 4:new op + stale base(并发不同字段)→ LWW 后写 wins + overwritten 推前写者(G4-4 不拒写,非 409)
+  it('C-3 new op + stale base(R6 F4a:真实 base/revision/overwritten):并发 base 落后 → 200 + overwritten 推前写者(非 409;移除 overwritten 必红,状态表 row 4)', () => {
+    // R6 F4a 红证(判决 V6):原 C-3 无 base/revision/overwritten,只连续 set A/B 断言第二次 200 + title=B;
+    //   删除任何 stale-base/overwritten 逻辑都不红(逻辑根本不存在)→ 文档状态表 117/124 行"base 落后 + overwritten"
+    //   逐行断言强于探针实测。
+    // 绿证(补探针):CutoverHarness 加真实 revision/lastWriter/outbox;C-3 用真实 base/actor:
+    //   A 写(base 0)→ revision 0→1;B 基于过期 base(base 0 < current 1)写 → 200(非 409)+ A 收 overwritten。
     const h = new CutoverHarness()
     h.setFlag(true)
-    // A 写 title=A(base 0)
-    h.patch('n1', { kind: 'set', fieldPath: ['title'], value: 'A' })
-    // ★ B 基于过期 base 写同字段(base 落后)→ 200(非 409;G4-4 revision 不拒写,T1-1 败方收 overwritten 知情)
-    const res = h.patch('n1', { kind: 'set', fieldPath: ['title'], value: 'B' })
-    expect(res.status).toBe(200) // ★ 200 + overwritten(非 409;状态表 row 4 契约)
-    expect(h.get('n1')?.title).toBe('B') // 后写 wins(LWW)
-    // stale-client 旧 body 打新 endpoint = 400(状态表 row 1,C-1 已证);此行证 stale-base(新 op 落后 base)= 200,二者区分见 §1.2。
+    // A 写 title=A(base 0,actor alice)→ revision 0→1, lastWriter=alice
+    const resA = h.patch('n1', { kind: 'set', fieldPath: ['title'], value: 'A' }, { actor: 'alice', baseRevision: 0 })
+    expect(resA.status).toBe(200)
+    expect(resA.body.revision).toBe(1)
+    expect(h.revision('n1')).toBe(1)
+    // ★ B 基于过期 base(base=0,但 current revision=1)写 title=B → 200(非 409;G4-4 revision 不拒写)
+    const resB = h.patch('n1', { kind: 'set', fieldPath: ['title'], value: 'B' }, { actor: 'bob', baseRevision: 0 })
+    expect(resB.status).toBe(200) // ★ 过期 base 仍 200(非 409;状态表 row 4 契约)
+    expect(resB.body.revision).toBe(2) // 后写 wins,bump
+    expect(h.get('n1')?.title).toBe('B') // LWW 后写 wins
+    // ★ A 收 overwritten 事件(historicalValue=A, byActor=bob, currentRevision=2)— 败方知情(T1-1/G4-4 surfacing)
+    const overwritten = h.drainOverwritten('alice')
+    expect(overwritten.length).toBe(1) // ★ 移除 outbox.push(overwritten)→ 此行红(0 ≠ 1)
+    expect(overwritten[0].historicalValue).toBe('A') // A 的前值
+    expect(overwritten[0].byActor).toBe('bob') // 被谁覆盖
+    expect(overwritten[0].currentRevision).toBe(2) // 当前权威 revision
+    // B 是后写者,不收 overwritten
+    expect(h.drainOverwritten('bob').length).toBe(0)
+    // ★ R6 F4a 验收:移除 overwritten(outbox.push)时 C-3 必红(drainOverwritten 返空,length 0≠1)。
+    //   stale-client 旧 body 打新 endpoint = 400(状态表 row 1,C-1 已证);此行证 stale-base(新 op 落后 base)= 200 + overwritten,二者区分见 §1.2。
   })
 
   it('C-4 rollback = snapshot materialize(R5 F4):flag off → 从 authoritative 全 record 重建旧 body(非 delta 反演;delta-inversion 无算法/不支持,降级承诺到已测范围;状态表 row 5)', () => {
