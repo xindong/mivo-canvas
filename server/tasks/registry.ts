@@ -88,7 +88,10 @@ const idempotencyIndex = new Map<string, string>()
 // Composite idempotency index key: scoped per owner so user B reusing user A's
 // Idempotency-Key does NOT resolve to A's task (cross-user collision → wrong
 // taskId / billing leak). Paired with the sweeper's symmetric drop below.
-const idemIndexKey = (ownerFp: string, idempotencyKey: string): string => `${ownerFp}:${idempotencyKey}`
+// 分隔符用 NUL('\u0000') 而非 ':' —— ownerFp(16hex)虽不含 ':',但 idempotencyKey 为调用方
+// 自由字符串可能含 ':',':' 分隔下会与 ownerFp 段歧义;NUL 保证 split 还原恰好 2 段,无歧义。
+// 安全:InMemory Map key,不落 PG/IDB。导出供测试解耦字面格式(A8②-2)。
+export const idemIndexKey = (ownerFp: string, idempotencyKey: string): string => `${ownerFp}\u0000${idempotencyKey}`
 
 const isTerminal = (s: TaskStatus): boolean => s === 'done' || s === 'partial' || s === 'failed' || s === 'canceled'
 

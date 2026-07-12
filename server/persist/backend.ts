@@ -317,9 +317,15 @@ export interface PersistBackend {
 
 const clone = <T>(value: T): T => structuredClone(value)
 const nowIso = (): string => new Date().toISOString()
-const recordKey = (ownerId: string, type: PersistType, id: string): string => `${ownerId}:${type}:${id}`
-const idemIndexKey = (ownerId: string, method: string, resourceKind: string, idempotencyKey: string): string =>
-  `${ownerId}:${method}:${resourceKind}:${idempotencyKey}`
+// 复合 Map key 用 NUL('\u0000') 分隔,而非 ':'。NUL 不会出现在正常 ownerId/type/id/method/
+// resourceKind/idempotencyKey 段中 → 复合 key 无歧义、碰撞-proof(段内即使含 ':' 也可被 split 还原)。
+// 安全:这是 InMemoryPersistBackend 的进程内 Map key,不落 PG(TEXT 列拒 NUL)/IDB(需迁移);
+// PG 后端用独立列(owner_id/type/id)无分隔符问题。导出供测试解耦字面 key 格式(A8②-2)。
+const KEY_SEP = '\u0000'
+export const recordKey = (ownerId: string, type: PersistType, id: string): string =>
+  `${ownerId}${KEY_SEP}${type}${KEY_SEP}${id}`
+export const idemIndexKey = (ownerId: string, method: string, resourceKind: string, idempotencyKey: string): string =>
+  `${ownerId}${KEY_SEP}${method}${KEY_SEP}${resourceKind}${KEY_SEP}${idempotencyKey}`
 
 // G2.1 F1:legacy owner 形态 = mivo-key 指纹(sha256[:16] hex,见 keys.ts `fingerprintOfPlatformKey`)。
 // 内联于此(不 import owner.ts)以保 persist 层 framework-agnostic(不耦合 hono)。owner.ts 同样定义

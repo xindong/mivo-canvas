@@ -4,7 +4,7 @@
 // 原子 tree 软删回滚(#7)、幂等 fingerprint(#10)。
 
 import { describe, it, expect, beforeEach } from 'vitest'
-import { InMemoryPersistBackend, fingerprintOfBody, type PersistBackend, type PersistType } from './backend'
+import { InMemoryPersistBackend, fingerprintOfBody, idemIndexKey, type PersistBackend, type PersistType } from './backend'
 
 describe('InMemoryPersistBackend — 返修 #1 project 全局唯一', () => {
   let b: PersistBackend
@@ -362,7 +362,7 @@ describe('InMemoryPersistBackend — 返修四 F1 createCanvasWithCollection 原
     const beforeCanvas = await rec('canvas', 'c1')
     const beforeColl = await rec('chat-collection', 'c1')
     const idemIdx = (b as unknown as { idempotencyIndex: Map<string, { envelopeKey: string; fingerprint: string }> }).idempotencyIndex
-    const beforeIdem = idemIdx.get('o:POST:canvas:k1')
+    const beforeIdem = idemIdx.get(idemIndexKey('o', 'POST', 'canvas', 'k1'))
     expect(beforeIdem).toBeDefined()
     expect(b.getCanvasOwner('c1')?.ownerId).toBe('o')
 
@@ -386,7 +386,7 @@ describe('InMemoryPersistBackend — 返修四 F1 createCanvasWithCollection 原
     expect(afterColl.isDeleted).toBe(true)
     expect(afterColl.revision).toBe(beforeColl.revision)
     expect(b.getCanvasOwner('c1')?.ownerId).toBe('o') // globalCanvasOwners 回滚
-    const afterIdem = idemIdx.get('o:POST:canvas:k1')
+    const afterIdem = idemIdx.get(idemIndexKey('o', 'POST', 'canvas', 'k1'))
     expect(afterIdem).toEqual(beforeIdem) // idempotencyIndex 回滚(envelopeKey + fingerprint 不变)
   })
 })
