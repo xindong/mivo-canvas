@@ -37,25 +37,66 @@ const SOURCE = 'Write Retry Queue'
 const DB_NAME = 'mivo-write-queue'
 // DB_VERSION 2 (FX-7 / A6): adds the `terminals` store — a durable ledger of
 // dead-letter / conflict / rejected terminal outcomes (op summary + error code +
-// time) for the A3 persist gray observation window. v1→v2 is additive: an existing
-// v1 DB triggers onupgradeneeded which creates the new store; existing `writes`
-// records are untouched. Retry / backoff / terminal-decision semantics are NOT
-// changed — the ledger is append-only alongside the existing delete-after-surface.
+// time) for the A3 persist gray observation window — AND the `meta` store for the
+// non-retreatable per-status cumulative counters (P1-4). v1→v2 is additive: an
+// existing v1 DB triggers onupgradeneeded which creates both new stores; existing
+// `writes` records are untouched. Retry / backoff / terminal-decision semantics are
+// NOT changed — the ledger + counters are append-only alongside the existing
+// delete-after-surface.
 const DB_VERSION = 2
 const STORE_NAME = 'writes'
 const TERMINALS_STORE = 'terminals'
+// P1-4: `meta` store holds the non-retreatable per-status cumulative terminal
+// counters (key 'terminalCounters') + the A3 baseline snapshot (key
+// 'terminalCountersBaseline'). keyPath `key`.
+const META_STORE = 'meta'
 
 // FX-7 / A6: cap the durable terminal ledger so a misbehaving executor cannot grow
 // IDB unbounded. The ledger is an observation/audit trail (A3 gray window stats);
 // old entries age out by timestamp. Mirrors the "IDB must not grow unbounded" posture
-// documented for the writes store.
+// documented for the writes store. (P1-4: evicting a ledger entry does NOT decrement
+// the cumulative counters — counters are the non-retreatable A3 metric.) Mutable so
+// tests can shrink it without recording >256 outcomes; reset in __resetWriteQueueDb.
 const DEFAULT_MAX_TERMINALS = 256
+let maxTerminals = DEFAULT_MAX_TERMINALS
+
+// P1-3: how long to wait for a blocked v1→v2 upgrade before degrading to the
+// in-memory path. Another tab holding an older-version connection without an
+// onversionchange handler would otherwise block open(v2) forever; this timeout
+// turns that into a reject → warnIdbDegradation → memStore (visible, not hung).
+let idbBlockTimeoutMs = 3000
 
 const DEFAULT_MAX_QUEUE = 256
 const DEFAULT_MAX_ATTEMPTS = 8
 const DEFAULT_BASE_DELAY = 1000
 const DEFAULT_MAX_DELAY = 60_000
 const DEFAULT_DRAIN_INTERVAL = 5000
+
+// P1-4: non-retreatable per-status cumulative terminal counters. Each field is
+// monotonic — incremented in recordTerminal, NEVER decremented (not even when the
+// ledger evicts an entry). A3 observation-window stats use these, NOT the bounded
+// snapshot (getWriteQueueTerminals), because a real dead-letter can be evicted from
+// the 256-entry ledger and a snapshot filter would then falsely read 0 (false-green).
+// `evicted` tracks how many ledger entries aged out (so A3 can reconcile snapshot
+// depth vs. cumulative totals). Keys mirror TerminalLedgerStatus exactly.
+type TerminalCounterShape = {
+  conflict: number
+  'too-large': number
+  'reuse-conflict': number
+  rejected: number
+  terminal: number
+  'dead-letter': number
+  evicted: number
+}
+const ZERO_COUNTERS: TerminalCounterShape = {
+  conflict: 0,
+  'too-large': 0,
+  'reuse-conflict': 0,
+  rejected: 0,
+  terminal: 0,
+  'dead-letter': 0,
+  evicted: 0,
+}
 
 const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e))
 
@@ -520,6 +561,11 @@ const memStore = new Map<string, QueuedWrite>()
 // FX-7 / A6: terminal ledger in-memory fallback (mirrors memStore discipline — used
 // only when IDB is unavailable; survives a pm2-restart window, not a reload).
 const terminalMem = new Map<string, TerminalLedgerEntry>()
+// P1-4: non-retreatable per-status cumulative counters + baseline, in-memory
+// fallback (IDB unavailable). Mirrors the union discipline: readCounters takes
+// max(IDB, mem) per field so a mem-fallback increment is not lost when IDB recovers.
+let terminalCountersMem: TerminalCounterShape = { ...ZERO_COUNTERS }
+let terminalCountersBaselineMem: { counters: TerminalCounterShape; ts: number } | null = null
 
 const isIdbAvailable = (): boolean => typeof indexedDB !== 'undefined' && indexedDB !== null
 
@@ -541,19 +587,50 @@ const openDb = (): Promise<IDBDatabase> => {
   if (dbPromise) return dbPromise
   dbPromise = new Promise<IDBDatabase>((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION)
+    // P1-3: if another tab/connection holds an older version and does not cooperate-
+    // close, the upgrade is blocked. Without an onblocked handler + timeout the open
+    // request stays pending forever → every IDB operation hangs and the degradation
+    // catch never fires. Start a timeout on blocked; if it elapses, reject so the
+    // caller degrades to the in-memory path (warnIdbDegradation) instead of hanging.
+    let blockedTimer: ReturnType<typeof setTimeout> | undefined
+    request.onblocked = () => {
+      if (blockedTimer === undefined) {
+        blockedTimer = setTimeout(() => {
+          reject(new Error('IDB open blocked: another connection holds an older version'))
+        }, idbBlockTimeoutMs)
+      }
+    }
     request.onupgradeneeded = () => {
       const db = request.result
       if (!db.objectStoreNames.contains(STORE_NAME)) {
         db.createObjectStore(STORE_NAME, { keyPath: 'id' })
       }
       // FX-7 / A6 (v2): terminal ledger store. Additive — created on first open of a
-      // pre-v2 DB; a fresh DB creates both stores. keyPath `id` (ledger entry id).
+      // pre-v2 DB; a fresh DB creates all stores. keyPath `id` (ledger entry id).
       if (!db.objectStoreNames.contains(TERMINALS_STORE)) {
         db.createObjectStore(TERMINALS_STORE, { keyPath: 'id' })
       }
+      // P1-4: meta store for the non-retreatable per-status cumulative counters + the
+      // A3 baseline snapshot. keyPath `key`.
+      if (!db.objectStoreNames.contains(META_STORE)) {
+        db.createObjectStore(META_STORE, { keyPath: 'key' })
+      }
     }
-    request.onsuccess = () => resolve(request.result)
-    request.onerror = () => reject(request.error)
+    request.onsuccess = () => {
+      if (blockedTimer !== undefined) clearTimeout(blockedTimer)
+      const db = request.result
+      // P1-3: cooperative close — if another tab tries to upgrade this DB, close our
+      // connection so its onupgradeneeded can fire (otherwise we'd block it and force
+      // the other tab into the blocked-timeout path above).
+      db.onversionchange = () => {
+        db.close()
+      }
+      resolve(db)
+    }
+    request.onerror = () => {
+      if (blockedTimer !== undefined) clearTimeout(blockedTimer)
+      reject(request.error)
+    }
   })
   // A failed open (blocked / version conflict) must not poison subsequent calls —
   // drop the cached promise so the next operation retries from scratch.
@@ -688,17 +765,21 @@ const readAllTerminals = async (): Promise<TerminalLedgerEntry[]> => {
 
 const enforceTerminalCap = async (): Promise<void> => {
   if (!isIdbAvailable()) {
-    while (terminalMem.size > DEFAULT_MAX_TERMINALS) {
+    let evictedMem = 0
+    while (terminalMem.size > maxTerminals) {
       const oldest = Array.from(terminalMem.values()).sort((a, b) => a.timestamp - b.timestamp)[0]
       if (!oldest) break
       terminalMem.delete(oldest.id)
+      evictedMem++
     }
+    // P1-4: evicting a ledger entry bumps the `evicted` counter (monotonic, non-retreatable).
+    if (evictedMem > 0) await incrementEvicted(evictedMem)
     return
   }
   try {
     const all = await readAllTerminals()
-    if (all.length <= DEFAULT_MAX_TERMINALS) return
-    const excess = all.length - DEFAULT_MAX_TERMINALS
+    if (all.length <= maxTerminals) return
+    const excess = all.length - maxTerminals
     const oldest = all
       .slice()
       .sort((a, b) => a.timestamp - b.timestamp || (a.id < b.id ? -1 : 1))
@@ -716,6 +797,9 @@ const enforceTerminalCap = async (): Promise<void> => {
       },
       TERMINALS_STORE,
     )
+    // P1-4: evicting ledger entries bumps the `evicted` counter (monotonic, non-retreatable)
+    // — the per-status cumulative counters are NOT decremented (they are the A3 metric).
+    if (excess > 0) await incrementEvicted(excess)
   } catch (error) {
     debugLogger.warn(SOURCE, `terminal cap enforcement failed: ${msg(error)}`)
   }
@@ -742,17 +826,112 @@ const recordTerminal = async (
   if (!isIdbAvailable()) {
     terminalMem.set(entry.id, entry)
     await enforceTerminalCap()
+    // P1-4: increment the non-retreatable cumulative counter (evict does NOT decrement).
+    await incrementTerminalCounter(status)
     return
   }
   try {
     await runTx<IDBValidKey>('readwrite', (store) => store.put(entry), TERMINALS_STORE)
     terminalMem.delete(entry.id)
     await enforceTerminalCap()
+    // P1-4: increment the non-retreatable cumulative counter (evict does NOT decrement).
+    await incrementTerminalCounter(status)
   } catch (error) {
     // Best-effort audit — never block the terminal outcome. Fall back to mem so the
     // entry stays queryable in-process this session (tests + A3 observation).
     warnIdbDegradation(`terminal put failed for ${rec.id}`, error)
     terminalMem.set(entry.id, entry)
+    // Even on the mem-fallback path, bump the counter (in mem) so the count is right
+    // for this session (readTerminalCounters unions IDB + mem).
+    await incrementTerminalCounter(status)
+  }
+}
+
+// ── P1-4: non-retreatable per-status cumulative counters (IDB meta store) ──
+//
+// A3 observation-window judgment MUST use these counters, NOT the bounded snapshot
+// (getWriteQueueTerminals): the snapshot caps at `maxTerminals` and evicts the oldest
+// by timestamp, so a real dead-letter can age out and a snapshot filter would falsely
+// read 0 (false-green). The counters are monotonic — incremented in recordTerminal,
+// NEVER decremented (eviction bumps `evicted` instead). Local diagnostic base only;
+// the A3 aggregation export (cross-tab/cross-session rollup) is a follow-up.
+
+const TERMINAL_COUNTERS_KEY = 'terminalCounters'
+const TERMINAL_COUNTERS_BASELINE_KEY = 'terminalCountersBaseline'
+
+const mergeCounters = (a: TerminalCounterShape, b: TerminalCounterShape): TerminalCounterShape => ({
+  conflict: Math.max(a.conflict, b.conflict),
+  'too-large': Math.max(a['too-large'], b['too-large']),
+  'reuse-conflict': Math.max(a['reuse-conflict'], b['reuse-conflict']),
+  rejected: Math.max(a.rejected, b.rejected),
+  terminal: Math.max(a.terminal, b.terminal),
+  'dead-letter': Math.max(a['dead-letter'], b['dead-letter']),
+  evicted: Math.max(a.evicted, b.evicted),
+})
+
+const readTerminalCounters = async (): Promise<TerminalCounterShape> => {
+  if (!isIdbAvailable()) return { ...terminalCountersMem }
+  try {
+    const entry = await runTx<{ key: string; value: TerminalCounterShape } | undefined>(
+      'readonly',
+      (store) => store.get(TERMINAL_COUNTERS_KEY) as IDBRequest<{ key: string; value: TerminalCounterShape } | undefined>,
+      META_STORE,
+    )
+    const idbCounters = entry?.value ?? { ...ZERO_COUNTERS }
+    // Union (per-field max) with mem so a mem-fallback increment is not lost when IDB
+    // recovers mid-session (same union discipline as getAllWrites).
+    return mergeCounters(idbCounters, terminalCountersMem)
+  } catch (error) {
+    warnIdbDegradation('terminal counters read failed', error)
+    return { ...terminalCountersMem }
+  }
+}
+
+const writeTerminalCounters = async (next: TerminalCounterShape): Promise<void> => {
+  if (!isIdbAvailable()) {
+    terminalCountersMem = next
+    return
+  }
+  try {
+    await runTx<IDBValidKey>(
+      'readwrite',
+      (store) => store.put({ key: TERMINAL_COUNTERS_KEY, value: next }),
+      META_STORE,
+    )
+    terminalCountersMem = next
+  } catch (error) {
+    warnIdbDegradation('terminal counter write failed', error)
+    terminalCountersMem = next
+  }
+}
+
+const incrementTerminalCounter = async (status: TerminalLedgerStatus, by = 1): Promise<void> => {
+  const current = await readTerminalCounters()
+  const next: TerminalCounterShape = { ...current, [status]: (current[status] ?? 0) + by } as TerminalCounterShape
+  await writeTerminalCounters(next)
+}
+
+const incrementEvicted = async (by: number): Promise<void> => {
+  if (by <= 0) return
+  const current = await readTerminalCounters()
+  await writeTerminalCounters({ ...current, evicted: current.evicted + by })
+}
+
+const readTerminalBaseline = async (): Promise<{ counters: TerminalCounterShape; ts: number } | null> => {
+  if (!isIdbAvailable()) return terminalCountersBaselineMem
+  try {
+    const entry = await runTx<{ key: string; value: { counters: TerminalCounterShape; ts: number } } | undefined>(
+      'readonly',
+      (store) =>
+        store.get(TERMINAL_COUNTERS_BASELINE_KEY) as IDBRequest<
+          { key: string; value: { counters: TerminalCounterShape; ts: number } } | undefined
+        >,
+      META_STORE,
+    )
+    return entry?.value ?? terminalCountersBaselineMem
+  } catch (error) {
+    warnIdbDegradation('terminal baseline read failed', error)
+    return terminalCountersBaselineMem
   }
 }
 
@@ -761,8 +940,66 @@ const recordTerminal = async (
  * outcomes with op summary + error code + time). For the A3 persist gray observation
  * window quantitative stats ("dead-letter=0", "unexplained conflict=0"). Each entry's
  * `status` is the machine-readable error code; `message` carries the detail.
+ *
+ * NOTE: this is a BOUNDED snapshot (caps at `maxTerminals`, oldest evicted by
+ * timestamp). For A3 green/red judgment use getWriteQueueTerminalCounters() instead —
+ * the counters are non-retreatable (evict does not decrement) so a real dead-letter
+ * that aged out of this snapshot cannot cause a false-green.
  */
 export const getWriteQueueTerminals = async (): Promise<TerminalLedgerEntry[]> => readAllTerminals()
+
+export type TerminalCountersResult = {
+  /** Cumulative, non-retreatable per-status counts (evict does NOT decrement these). */
+  counters: TerminalCounterShape
+  /** Snapshot at the last resetTerminalCountersBaseline() call (null until reset). */
+  baseline: TerminalCounterShape | null
+  /** Epoch ms when the baseline was set (null until reset). */
+  baselineTs: number | null
+}
+
+/**
+ * FX-7 / A6 P1-4: query the non-retreatable per-status cumulative terminal counters +
+ * the A3 baseline. A3 observation-window judgment uses the DELTA (counters - baseline)
+ * — e.g. `counters['dead-letter'] - (baseline?.['dead-letter'] ?? 0) === 0` for green —
+ * NOT the bounded snapshot (getWriteQueueTerminals), which can false-green after eviction.
+ *
+ * Local diagnostic base only; the A3 cross-tab/cross-session aggregation export is a
+ * follow-up. The `evicted` field reconciles snapshot depth vs. cumulative totals.
+ */
+export const getWriteQueueTerminalCounters = async (): Promise<TerminalCountersResult> => {
+  const [counters, baseline] = await Promise.all([readTerminalCounters(), readTerminalBaseline()])
+  return {
+    counters,
+    baseline: baseline?.counters ?? null,
+    baselineTs: baseline?.ts ?? null,
+  }
+}
+
+/**
+ * FX-7 / A6 P1-4: snapshot the current cumulative counters as the A3 observation-window
+ * baseline. Subsequent getWriteQueueTerminalCounters() calls return the baseline so A3
+ * logic can compute the delta (new terminals since the window opened). The counters
+ * themselves are NEVER reset/decremented — only the baseline reference moves.
+ */
+export const resetTerminalCountersBaseline = async (): Promise<void> => {
+  const counters = await readTerminalCounters()
+  const baseline = { counters, ts: Date.now() }
+  if (!isIdbAvailable()) {
+    terminalCountersBaselineMem = baseline
+    return
+  }
+  try {
+    await runTx<IDBValidKey>(
+      'readwrite',
+      (store) => store.put({ key: TERMINAL_COUNTERS_BASELINE_KEY, value: baseline }),
+      META_STORE,
+    )
+    terminalCountersBaselineMem = baseline
+  } catch (error) {
+    warnIdbDegradation('terminal baseline write failed', error)
+    terminalCountersBaselineMem = baseline
+  }
+}
 
 // ── Public API ──
 
@@ -1297,6 +1534,20 @@ const clearTerminalsStore = async (): Promise<void> => {
   }
 }
 
+// P1-4: clear the meta store (terminal counters + baseline) between tests.
+const clearMetaStore = async (): Promise<void> => {
+  if (!isIdbAvailable()) return
+  try {
+    await runTx<undefined>(
+      'readwrite',
+      (store) => store.clear() as IDBRequest<undefined>,
+      META_STORE,
+    )
+  } catch (error) {
+    debugLogger.warn(SOURCE, `meta clear failed during reset: ${msg(error)}`)
+  }
+}
+
 export const __dumpWritesForTest = getAllWrites
 
 /**
@@ -1305,6 +1556,37 @@ export const __dumpWritesForTest = getAllWrites
  * ledger store; production code uses getWriteQueueTerminals() (same data, public API).
  */
 export const __dumpTerminalsForTest = readAllTerminals
+
+/** P1-4 test-only: dump the terminal counters (cumulative + baseline). */
+export const __dumpTerminalCountersForTest = getWriteQueueTerminalCounters
+
+/**
+ * P1-3 test-only: shrink the blocked-upgrade timeout so a blocked-open test doesn't
+ * wait the full 3s. Reset to default in __resetWriteQueueDb.
+ */
+export const __setIdbBlockTimeoutForTest = (ms: number): void => {
+  idbBlockTimeoutMs = ms
+}
+
+/**
+ * P1-4 test-only: shrink the terminal ledger cap so the eviction test doesn't have to
+ * record >256 outcomes. Reset to default in __resetWriteQueueDb.
+ */
+export const __setMaxTerminalsForTest = (n: number): void => {
+  maxTerminals = n
+}
+
+/**
+ * P1-3 test-only: drop the cached IDB connection WITHOUT running store-clear ops.
+ * Used by the blocked-upgrade test: a stubbed indexedDB.open that fires onblocked
+ * would make __resetWriteQueueDb's clearXStore calls each wait out the full block
+ * timeout (3× = 9s → test timeout), and __resetWriteQueueDb would also reset
+ * idbBlockTimeoutMs. This hook just clears dbPromise so the next op reopens against
+ * the (stubbed) open — the store-clear is already handled by beforeEach.
+ */
+export const __clearWriteQueueDbConnectionForTest = (): void => {
+  dbPromise = undefined
+}
 
 /**
  * G1-a R4 F2 test-only:直接 putWrite 一批构造好的记录(含受控 id / createdAt / nextAttemptAt),
@@ -1321,10 +1603,16 @@ export const __resetWriteQueueDb = async (): Promise<void> => {
   memStore.clear()
   // FX-7 / A6: clear the terminal ledger + its memStore fallback too.
   terminalMem.clear()
+  // P1-4: clear the counter mem fallbacks + restore defaults.
+  terminalCountersMem = { ...ZERO_COUNTERS }
+  terminalCountersBaselineMem = null
+  maxTerminals = DEFAULT_MAX_TERMINALS
+  idbBlockTimeoutMs = 3000
   // Drop the cached connection so the next op reopens against the (now-cleared) store.
   dbPromise = undefined
   await clearIdbStore()
   await clearTerminalsStore()
+  await clearMetaStore()
   // Reset the IDB-degradation toast debounce so each test starts with a fresh first-failure
   // toast window (P1-2). clearIdbStore is test-internal and uses plain debugLogger.warn (not
   // warnIdbDegradation), so it never sets the flag — a prior test's data-path failure may have.

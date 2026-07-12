@@ -1,12 +1,17 @@
 import 'fake-indexeddb/auto'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  __clearWriteQueueDbConnectionForTest,
   __dumpTerminalsForTest,
   __dumpWritesForTest,
   __resetWriteQueueDb,
   __seedWritesForTest,
+  __setIdbBlockTimeoutForTest,
+  __setMaxTerminalsForTest,
   classifyHttpStatus,
   createWriteQueue,
+  getWriteQueueTerminalCounters,
+  resetTerminalCountersBaseline,
   type QueuedWrite,
   type WriteExecutor,
   type WriteOp,
@@ -1570,5 +1575,180 @@ describe('FX-7 / A6 — durable terminal ledger (append-only; retry semantics un
     expect(calls).toHaveLength(2)
     // No terminal ledger entry — success is not a failure terminal.
     expect((await __dumpTerminalsForTest()).length).toBe(0)
+  })
+})
+
+// ── P1-3: writeRetryQueue openDb upgrade blocking + cooperative close ──
+//
+// 复现 P1-3 阻断项:openDb v1→v2 无 onblocked 处理 + 已开连接无 versionchange 协作关闭。
+// 旧 tab 持 v1 连接(无 onversionchange)时新 tab open(2) 永久 pending,所有 IDB 操作卡死,
+// 且不触发降级 catch → 全部静默挂死。
+//
+// 修(lead 指定):openDb 加 onblocked → 定时超时降级内存 + onsuccess 后 db.onversionchange 主动 close。
+// 测试用 stub 控制 onblocked/versionchange 事件(确定性,避免跨测试 DB 版本号交叉污染)。
+
+describe('FX-7 / A6 P1-3 — openDb upgrade blocking + cooperative close', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    return __resetWriteQueueDb()
+  })
+
+  it('a blocked upgrade (onblocked, never onsuccess) rejects after the timeout → in-memory fallback (no hang)', async () => {
+    // Stub indexedDB.open to return a request that fires onblocked and never resolves —
+    // simulates an old tab holding a v1 connection without an onversionchange handler.
+    const openStub = vi.fn(() => {
+      const req: {
+        onupgradeneeded: ((e: unknown) => void) | null
+        onsuccess: ((e: unknown) => void) | null
+        onerror: ((e: unknown) => void) | null
+        onblocked: ((e: unknown) => void) | null
+        result: unknown
+      } = { onupgradeneeded: null, onsuccess: null, onerror: null, onblocked: null, result: undefined }
+      queueMicrotask(() => req.onblocked?.(undefined))
+      return req
+    })
+    vi.stubGlobal('indexedDB', { open: openStub })
+    // Short block timeout AFTER beforeEach's reset (so the 3s default is overridden).
+    // Then just drop the cached connection — calling __resetWriteQueueDb here would run
+    // clearXStore ops against the stubbed (blocked) open and wait out the full timeout 3×.
+    __setIdbBlockTimeoutForTest(30)
+    __clearWriteQueueDbConnectionForTest()
+
+    const { fn } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    // enqueue → getAllWrites + putWrite → openDb → onblocked → 30ms timeout → reject → memStore.
+    // This MUST resolve (not hang); the record survives in the in-memory fallback.
+    await q.enqueue(minimalNode('c1', 'n1'))
+    expect(await q.pendingCount()).toBe(1) // memStore has the record
+    expect(warnLog).toHaveBeenCalledWith('Write Retry Queue', expect.stringContaining('using in-memory fallback'))
+  })
+
+  it('an open connection closes cooperatively on versionchange (lets another tab upgrade)', async () => {
+    const closeSpy = vi.fn()
+    const fakeDb = {
+      objectStoreNames: { contains: () => true },
+      onversionchange: null as ((e: unknown) => void) | null,
+      close: closeSpy,
+      transaction: () => {
+        throw new Error('no tx in stub')
+      },
+    }
+    const openStub = vi.fn(() => {
+      const req: {
+        onupgradeneeded: ((e: unknown) => void) | null
+        onsuccess: ((e: unknown) => void) | null
+        onerror: ((e: unknown) => void) | null
+        onblocked: ((e: unknown) => void) | null
+        result: unknown
+      } = { onupgradeneeded: null, onsuccess: null, onerror: null, onblocked: null, result: undefined }
+      queueMicrotask(() => {
+        req.result = fakeDb
+        req.onsuccess?.(undefined) // open succeeds → onsuccess sets db.onversionchange
+      })
+      return req
+    })
+    vi.stubGlobal('indexedDB', { open: openStub })
+    await __resetWriteQueueDb()
+
+    const { fn } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    // pendingCount → openDb → onsuccess → db.onversionchange is set (runTx then throws →
+    // getAllWrites degrades to memStore, but the connection is open + listening).
+    await q.pendingCount()
+    // Simulate another tab requesting an upgrade → versionchange fires on our connection.
+    fakeDb.onversionchange?.(undefined)
+    expect(closeSpy).toHaveBeenCalledTimes(1) // cooperatively closed so the other tab can upgrade
+  })
+})
+
+// ── P1-4: non-retreatable per-status cumulative terminal counters (A3 false-green) ──
+//
+// 复现 P1-4 阻断项:getWriteQueueTerminals 只本机 256 条快照,cap 静默 evict 最老 → 真实
+// dead-letter 可被淘汰后 filter 得 0,A3 硬 SC 假绿。
+//
+// 修(lead 指定):持久化不可回退的 per-status 累计计数器(IDB meta,recordTerminal 时递增,
+// evict 不减)+ ledger-eviction 计数;查询面 getWriteQueueTerminalCounters()(含 baseline 语义,
+// resetTerminalCountersBaseline())。A3 判定以 counters(不可回退)为准而非快照 filter。
+
+describe('FX-7 / A6 P1-4 — non-retreatable terminal counters (A3 uses counters, not snapshot)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    clockMs = 1_000
+    setPersistUserId('userA')
+    return __resetWriteQueueDb()
+  })
+  afterEach(async () => {
+    await __resetWriteQueueDb()
+    __resetPersistUserId()
+  })
+
+  it('per-status counters are cumulative + non-retreatable (survive ledger eviction)', async () => {
+    // Shrink the cap so we record 7 dead-letters with 2 evictions (fast, no 256-record run).
+    __setMaxTerminalsForTest(5)
+    const { fn } = seqExecutor([{ status: 'transient', message: 'http_503' }])
+    const q = makeQueue(fn, { maxAttempts: 2, baseDelayMs: 1000, maxDelayMs: 60_000 })
+    for (let i = 0; i < 7; i++) {
+      await q.enqueue(minimalNode('c1', `n${i}`))
+      await q.drain() // attempt 1: transient → backoff
+      tick(10_000) // past backoff
+      await q.drain() // attempt 2: dead-letter
+    }
+
+    // Snapshot is capped (5) — 2 entries were evicted.
+    const ledger = await __dumpTerminalsForTest()
+    expect(ledger.length).toBeLessThanOrEqual(5)
+
+    // The non-retreatable counter reflects ALL 7 dead-letters (evict does NOT decrement).
+    const { counters } = await getWriteQueueTerminalCounters()
+    expect(counters['dead-letter']).toBe(7)
+    expect(counters.evicted).toBeGreaterThanOrEqual(2) // eviction count tracked
+
+    // The snapshot filter would FALSELY read 0 for an evicted dead-letter — counters do not.
+    const ledgerDeadLetters = ledger.filter((e) => e.status === 'dead-letter').length
+    expect(counters['dead-letter']).toBeGreaterThan(ledgerDeadLetters) // counters > snapshot
+  })
+
+  it('baseline semantics: A3 delta = counters - baseline (not snapshot filter)', async () => {
+    __setMaxTerminalsForTest(5)
+    const { fn } = seqExecutor([{ status: 'transient', message: 'http_503' }])
+    const q = makeQueue(fn, { maxAttempts: 2, baseDelayMs: 1000, maxDelayMs: 60_000 })
+    // Pre-baseline: 3 dead-letters.
+    for (let i = 0; i < 3; i++) {
+      await q.enqueue(minimalNode('c1', `n${i}`))
+      await q.drain()
+      tick(10_000)
+      await q.drain()
+    }
+    // A3 observation window opens — snapshot the baseline.
+    await resetTerminalCountersBaseline()
+    const before = await getWriteQueueTerminalCounters()
+    expect(before.baseline).not.toBeNull()
+    expect(before.baseline?.['dead-letter']).toBe(3)
+    expect(before.baselineTs).not.toBeNull()
+
+    // During the window: 1 new dead-letter.
+    await q.enqueue(minimalNode('c1', 'window'))
+    await q.drain()
+    tick(10_000)
+    await q.drain()
+
+    const after = await getWriteQueueTerminalCounters()
+    expect(after.counters['dead-letter']).toBe(4) // cumulative
+    // A3 green/red judgment = delta (counters - baseline), NOT snapshot filter.
+    const deadLetterSince = after.counters['dead-letter'] - (after.baseline?.['dead-letter'] ?? 0)
+    expect(deadLetterSince).toBe(1) // 1 new dead-letter in the window → NOT green (would be 0 for green)
+  })
+
+  it('conflict + rejected outcomes bump their respective counters (per-status, not just dead-letter)', async () => {
+    const cq = makeQueue(seqExecutor([{ status: 'conflict', currentRevision: 9 }]).fn, { onConflict: vi.fn() })
+    await cq.enqueue(minimalNode('c1', 'n1', 5))
+    await cq.drain()
+    const rq = makeQueue(seqExecutor([{ status: 'rejected', body: { error: 'bad' } }]).fn)
+    await rq.enqueue(minimalNode('c2', 'n2'))
+    await rq.drain()
+    const { counters } = await getWriteQueueTerminalCounters()
+    expect(counters.conflict).toBe(1)
+    expect(counters.rejected).toBe(1)
+    expect(counters['dead-letter']).toBe(0)
   })
 })

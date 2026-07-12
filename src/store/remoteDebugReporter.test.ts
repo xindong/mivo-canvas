@@ -2,6 +2,7 @@ import 'fake-indexeddb/auto'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useDebugLogStore } from './debugLogStore'
 import {
+  __createIdForTest,
   __resetRemoteDebugStateForTest,
   __setRemoteDebugTestHooks,
   buildRemoteDebugPayload,
@@ -124,6 +125,7 @@ describe('FX-7 remoteDebugReporter durable outbox + retry + drop count', () => {
     await __resetRemoteDebugStateForTest()
   })
   afterEach(async () => {
+    vi.unstubAllGlobals()
     await __resetRemoteDebugStateForTest()
   })
 
@@ -246,5 +248,112 @@ describe('FX-7 remoteDebugReporter durable outbox + retry + drop count', () => {
         (e) => e.level === 'error' && typeof e.message === 'string' && e.message.includes('dropped after'),
       ),
     ).toBe(true)
+  })
+})
+
+// ── P1-1 / P1-2 (double-review fixes) ──
+
+describe('FX-7 P1-1: createId never uses Math.random (CWE-338)', () => {
+  beforeEach(async () => {
+    vi.clearAllMocks()
+    await __resetRemoteDebugStateForTest()
+  })
+  afterEach(async () => {
+    vi.unstubAllGlobals()
+    await __resetRemoteDebugStateForTest()
+  })
+
+  it('branch 1 — crypto.randomUUID path produces unique ids without Math.random', () => {
+    const randomSpy = vi.spyOn(Math, 'random')
+    const ids = new Set<string>()
+    for (let i = 0; i < 100; i++) ids.add(__createIdForTest())
+    expect(ids.size).toBe(100) // all unique (UUID)
+    expect(randomSpy).not.toHaveBeenCalled()
+  })
+
+  it('branch 2 — crypto.getRandomValues (no randomUUID) path produces unique ids without Math.random', () => {
+    const randomSpy = vi.spyOn(Math, 'random')
+    let callN = 0
+    vi.stubGlobal('crypto', {
+      getRandomValues: (arr: Uint8Array) => {
+        callN += 1
+        for (let i = 0; i < arr.length; i++) arr[i] = (callN + i * 3) & 0xff
+        return arr
+      },
+    })
+    const ids = new Set<string>()
+    for (let i = 0; i < 100; i++) ids.add(__createIdForTest())
+    expect(ids.size).toBe(100) // varying CSPRNG bytes → unique
+    expect(randomSpy).not.toHaveBeenCalled()
+    // CSPRNG-fallback id shape: debug-<8hex>-<4hex>-<4hex>-<16hex>
+    expect([...ids][0]).toMatch(/^debug-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{16}$/)
+  })
+
+  it('branch 3 — no crypto at all → timestamp + counter fallback, no Math.random', () => {
+    const randomSpy = vi.spyOn(Math, 'random')
+    vi.stubGlobal('crypto', undefined)
+    const ids: string[] = []
+    for (let i = 0; i < 100; i++) ids.push(__createIdForTest())
+    expect(new Set(ids).size).toBe(100) // monotonic counter → unique within the same ms
+    expect(randomSpy).not.toHaveBeenCalled()
+    expect(ids[0]).toMatch(/^debug-[0-9a-z]+-[0-9a-z]+$/) // timestamp + counter shape
+  })
+})
+
+describe('FX-7 P1-2: fail-safe client info (no silent batch loss on localStorage failure)', () => {
+  beforeEach(async () => {
+    vi.clearAllMocks()
+    await __resetRemoteDebugStateForTest()
+  })
+  afterEach(async () => {
+    vi.unstubAllGlobals()
+    await __resetRemoteDebugStateForTest()
+  })
+
+  it('createRemoteDebugClientInfo does NOT throw when storage.getItem throws (falls back to a fresh client id)', () => {
+    const throwingStorage = {
+      ...createMemoryStorage(),
+      getItem: () => {
+        throw new Error('localStorage blocked (sandboxed iframe)')
+      },
+      setItem: () => {
+        throw new Error('quota exceeded')
+      },
+    }
+    // Must not throw — the read failure falls back to the injected createClientId.
+    const info = createRemoteDebugClientInfo({
+      storage: throwingStorage,
+      createId: () => 'client-fallback',
+      sessionId: 's1',
+      locationPath: '/x',
+      userAgent: 'ua',
+      language: 'en',
+      timezone: 'UTC',
+      screen: { width: 1, height: 1, pixelRatio: 1 },
+    })
+    expect(info.clientId).toBe('client-fallback') // getItem threw → generated
+    expect(info.sessionId).toBe('s1')
+  })
+
+  it('a failing browser client-info read does not silently lose the batch (emergency fallback → outbox persists)', async () => {
+    // No buildClientInfo injected → createBrowserClientInfo uses readBrowserClientInfo →
+    // window.localStorage throws (node test env has no window) → emergencyClientInfo.
+    // The batch must still land in the durable outbox, NOT be silently dropped.
+    const fetchMock = vi.fn(async () => {
+      throw new Error('network down')
+    })
+    const clock = 1000
+    __setRemoteDebugTestHooks({
+      fetchImpl: fetchMock as unknown as typeof fetch,
+      now: () => clock,
+      random: () => 0.5,
+      enabled: true, // no buildClientInfo → exercises the fail-safe default path
+    })
+
+    reportRemoteDebugEntry({ level: 'error', source: 'S', message: 'm', timestamp: 1000 })
+    await flushRemoteDebugEntries()
+    // Batch persisted to the durable outbox despite the client-info read failing.
+    expect(await getRemoteDebugOutboxCount()).toBe(1)
+    expect(await getRemoteDebugDropCount()).toBe(0)
   })
 })

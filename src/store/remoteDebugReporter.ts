@@ -122,9 +122,28 @@ const resolveFetch = (): typeof fetch => testFetch ?? globalThis.fetch
 const now = (): number => (testNow ?? Date.now)()
 const random = (): number => (testRandom ?? Math.random)()
 
-const createId = () => {
-  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID()
-  return `debug-${now().toString(36)}-${Math.random().toString(36).slice(2)}`
+// P1-1 (CWE-338): persistent ids (clientId / sessionId / outbox id) must NEVER be
+// derived from Math.random — GitHub CodeQL flags that as a weak PRNG. Prefer the
+// platform CSPRNG UUID; fall back to crypto.getRandomValues (CSPRNG); only if no
+// CSPRNG exists at all, use a monotonic timestamp + counter (deterministic,
+// collision-safe within a session — still no Math.random).
+let idCounter = 0
+
+const createId = (): string => {
+  const cryptoObj = globalThis.crypto
+  if (cryptoObj?.randomUUID) return cryptoObj.randomUUID()
+  if (cryptoObj?.getRandomValues) {
+    const bytes = new Uint8Array(16)
+    cryptoObj.getRandomValues(bytes)
+    // RFC 4122 v4 variant + version bits, then format as a UUID-ish hex string.
+    bytes[6] = (bytes[6]! & 0x0f) | 0x40
+    bytes[8] = (bytes[8]! & 0x3f) | 0x80
+    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
+    return `debug-${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16)}`
+  }
+  // No CSPRNG available (very old env) — timestamp + monotonic counter. No Math.random.
+  idCounter += 1
+  return `debug-${now().toString(36)}-${idCounter.toString(36)}`
 }
 
 const readTimezone = () => {
@@ -157,10 +176,26 @@ export const createRemoteDebugClientInfo = ({
   screen,
   appVersion = import.meta.env.VITE_MIVO_VERSION || '0.0.0',
 }: ClientInfoOptions): RemoteDebugClientInfo => {
-  const existingClientId = storage.getItem(clientIdStorageKey)
+  // P1-2: localStorage.getItem can throw (sandboxed iframe, quota-exceeded, security
+  // policy, disabled storage). Never let a storage read failure bubble — if it does,
+  // flushRemoteDebugEntries' catch → persistFailedBatch would call createBrowserClientInfo
+  // again and throw BEFORE any outbox write, silently losing the already-dequeued batch.
+  // Fall back to a fresh in-memory client id instead.
+  let existingClientId: string | null = null
+  try {
+    existingClientId = storage.getItem(clientIdStorageKey)
+  } catch {
+    // leave existingClientId null (the init) — fall back to a generated id below
+  }
   const clientId = existingClientId || createClientId()
 
-  if (!existingClientId) storage.setItem(clientIdStorageKey, clientId)
+  if (!existingClientId) {
+    try {
+      storage.setItem(clientIdStorageKey, clientId)
+    } catch {
+      // storage write failure → keep the client id in-memory only (no throw)
+    }
+  }
 
   return {
     clientId,
@@ -174,24 +209,47 @@ export const createRemoteDebugClientInfo = ({
   }
 }
 
+// P1-2: a minimal client info that needs NO window/storage access — used when the
+// browser-environment read fails entirely so createBrowserClientInfo never throws.
+const emergencyClientInfo = (): RemoteDebugClientInfo => ({
+  clientId: createId(),
+  sessionId: readSessionId(),
+  appVersion: import.meta.env.VITE_MIVO_VERSION || '0.0.0',
+  pagePath: '',
+  userAgent: '',
+  language: 'unknown',
+  timezone: 'unknown',
+  screen: { width: 0, height: 0, pixelRatio: 1 },
+})
+
+const readBrowserClientInfo = (): RemoteDebugClientInfo =>
+  createRemoteDebugClientInfo({
+    storage: window.localStorage,
+    createId,
+    sessionId: readSessionId(),
+    locationPath: `${window.location.pathname}${window.location.search}`,
+    userAgent: navigator.userAgent,
+    language: navigator.language || 'unknown',
+    timezone: readTimezone(),
+    screen: {
+      width: window.screen?.width || window.innerWidth || 0,
+      height: window.screen?.height || window.innerHeight || 0,
+      pixelRatio: window.devicePixelRatio || 1,
+    },
+  })
+
 const createBrowserClientInfo = (): RemoteDebugClientInfo => {
-  const builder = testBuildClientInfo ?? (() =>
-    createRemoteDebugClientInfo({
-      storage: window.localStorage,
-      createId,
-      sessionId: readSessionId(),
-      locationPath: `${window.location.pathname}${window.location.search}`,
-      userAgent: navigator.userAgent,
-      language: navigator.language || 'unknown',
-      timezone: readTimezone(),
-      screen: {
-        width: window.screen?.width || window.innerWidth || 0,
-        height: window.screen?.height || window.innerHeight || 0,
-        pixelRatio: window.devicePixelRatio || 1,
-      },
-    })
-  )
-  return builder()
+  // P1-2: NEVER throw out of client-info construction. Any window/storage access
+  // failure (localStorage blocked, navigator unavailable, etc.) falls back to an
+  // emergency in-memory client info so the caller (flush/persist) can still build a
+  // payload and persist the batch to the durable outbox — instead of silently losing
+  // the already-dequeued batch when the catch path re-invokes this and throws again.
+  const builder = testBuildClientInfo ?? readBrowserClientInfo
+  try {
+    return builder()
+  } catch {
+    return emergencyClientInfo()
+  }
 }
 
 export const buildRemoteDebugPayload = (
@@ -627,6 +685,10 @@ export const __setRemoteDebugTestHooks = (hooks: TestHooks): void => {
   if (hooks.enabled !== undefined) testEnabled = hooks.enabled
 }
 
+// P1-1 test-only: direct access to createId so tests can assert the CSPRNG + counter
+// fallbacks never touch Math.random (CWE-338). Production code calls createId directly.
+export const __createIdForTest = (): string => createId()
+
 const clearOutboxStore = async (): Promise<void> => {
   if (!isIdbAvailable()) return
   try {
@@ -659,6 +721,8 @@ export const __resetRemoteDebugStateForTest = async (): Promise<void> => {
   outboxMem.clear()
   dropCountMem = 0
   idbDegradationWarned = false
+  // P1-1: reset the no-CSPRNG fallback counter so tests get deterministic ids.
+  idCounter = 0
   // Clear test hooks so a prior test's injection (fetch/clock/random/clientInfo/enabled)
   // does not leak into the next test's module-level singleton.
   testFetch = undefined
