@@ -225,4 +225,73 @@ const mChatOrder004 = {
       expect(restore.claimToken).toBeNull() // done 清 token
     })
   })
+
+  // R3-F5 record 崩溃→重启恢复:现有 route 测试在同一 HTTP 请求内 immediate self-heal(route catch record 错后
+  // 立即 attempt),未覆盖"primary persist 提交后、record 前进程退出"的核心窗口。本测真 PG 隔离:
+  //   primary 提交 → 销毁实例(不调 record/attempt)→ 重建 backend → 只跑 reconcile+sweep → 无用户重入也收敛。
+  //   restore/delete 双向;marker(cascade_revoked_at)与 reconcile 派生是收敛保证。
+  describe('R3-F5 record 崩溃→重启恢复(真 PG 双向,无用户重入)', () => {
+    beforeAll(async () => {
+      const admin = makeKysely()
+      await resetSchema(admin)
+      await admin.destroy()
+    })
+
+    it('delete 方向:softDelete(primary)→销毁→重建→reconcile+sweep 收敛(link revoked)', async () => {
+      let backend = new PgPermissionBackend(cfg)
+      await backend.ready
+      await backend.__seedProjectForTest('p-crash-del', 'ownerA')
+      const link = await backend.createShareLink('p-crash-del', 'view', 'ownerA')
+      expect((await backend.resolveShareLink(link.token, 'p-crash-del'))?.kind).toBe('active')
+      // primary softDelete 提交(is_deleted=true)——不调 record/attempt(模拟 record 前进程退出)
+      await backend.__setProjectDeletedForTest('p-crash-del', true)
+      // 销毁实例(进程退出);DB 表 share_link_compensations 为空(record 未跑)
+      await backend.destroy()
+      // 重建 backend(重启)——无任何 intent;只跑 startup reconcile+sweep,无用户重入
+      backend = new PgPermissionBackend(cfg)
+      await backend.ready
+      expect((await backend.listCompensations('p-crash-del'))).toHaveLength(0) // 重启后无 intent
+      // reconcile 据 projects.is_deleted=true + active link 派生 pending delete
+      const rec = await backend.reconcileFromProjectState()
+      expect(rec.deleteRecorded).toBe(1)
+      expect(rec.restoreRecorded).toBe(0)
+      // sweep 收敛:attempt delete → revokeAll → link revoked
+      const sw = await backend.sweepCompensations()
+      expect(sw.converged).toBe(1)
+      expect(sw.failed).toBe(0)
+      expect((await backend.resolveShareLink(link.token, 'p-crash-del'))?.kind).toBe('revoked')
+      const ints = await backend.listCompensations('p-crash-del')
+      expect(ints.find((i) => i.op === 'delete')!.status).toBe('done')
+      await backend.destroy()
+    })
+
+    it('restore 方向:restore(primary)→销毁→重建→reconcile+sweep 收敛(link active,依赖 cascade marker)', async () => {
+      let backend = new PgPermissionBackend(cfg)
+      await backend.ready
+      await backend.__seedProjectForTest('p-crash-res', 'ownerA')
+      const link = await backend.createShareLink('p-crash-res', 'view', 'ownerA')
+      // project 曾软删(级联 revoke,置 cascade marker)+ is_deleted=true
+      await backend.revokeAllForProject('p-crash-res')
+      await backend.__setProjectDeletedForTest('p-crash-res', true)
+      expect((await backend.resolveShareLink(link.token, 'p-crash-res'))?.kind).toBe('revoked')
+      // primary restore 提交(is_deleted=false)——不调 record/attempt(模拟 record 前进程退出)
+      await backend.__setProjectDeletedForTest('p-crash-res', false)
+      await backend.destroy()
+      // 重建 backend(重启)
+      backend = new PgPermissionBackend(cfg)
+      await backend.ready
+      expect((await backend.listCompensations('p-crash-res'))).toHaveLength(0)
+      // reconcile 据 is_deleted=false + cascade_revoked_at marker 派生 pending restore(marker 是收敛关键)
+      const rec = await backend.reconcileFromProjectState()
+      expect(rec.restoreRecorded).toBe(1)
+      expect(rec.deleteRecorded).toBe(0)
+      const sw = await backend.sweepCompensations()
+      expect(sw.converged).toBe(1)
+      expect(sw.failed).toBe(0)
+      expect((await backend.resolveShareLink(link.token, 'p-crash-res'))?.kind).toBe('active') // restore 收敛
+      const ints = await backend.listCompensations('p-crash-res')
+      expect(ints.find((i) => i.op === 'restore')!.status).toBe('done')
+      await backend.destroy()
+    })
+  })
 })
