@@ -1,13 +1,17 @@
 import 'fake-indexeddb/auto'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  __clearWriteQueueDbConnectionForTest,
+  __dumpIdbTerminalsForTest,
   __dumpTerminalsForTest,
   __dumpWritesForTest,
+  __readIdbTerminalCountersForTest,
+  __recordTerminalForTest,
   __resetWriteQueueDb,
   __seedWritesForTest,
   __setIdbBlockTimeoutForTest,
   __setMaxTerminalsForTest,
+  __setTerminalFaultInjectorForTest,
+  __setWriteQueueDbNameForTest,
   classifyHttpStatus,
   createWriteQueue,
   getWriteQueueTerminalCounters,
@@ -61,6 +65,20 @@ const putUserStateOp = (key: string, value: unknown, baseRevision?: Revision): W
 })
 const deleteUserStateOp = (key: string): WriteOp => ({ kind: 'deleteUserState', key })
 const appendChatOp = (canvasId: string, message: unknown): WriteOp => ({ kind: 'appendChatMessage', canvasId, message })
+
+// P1-4 r2: construct a controlled QueuedWrite for __recordTerminalForTest (the enqueue
+// path mints random UUIDs; the concurrency test needs deterministic, distinct records).
+const makeMinimalQueuedWrite = (id: string, nodeId: string): QueuedWrite => ({
+  id,
+  idempotencyKey: `mivo-${id}`,
+  userId: 'userA',
+  op: minimalNode('c1', nodeId),
+  resourceKey: `node:c1:${nodeId}`,
+  createdAt: 1000,
+  attempts: 1,
+  nextAttemptAt: 1000,
+  status: 'pending',
+})
 
 // ---- executor that serves a sequence of outcomes (clamped to last) ----
 const seqExecutor = (outcomes: WriteOutcome[]) => {
@@ -1587,77 +1605,134 @@ describe('FX-7 / A6 — durable terminal ledger (append-only; retry semantics un
 // 修(lead 指定):openDb 加 onblocked → 定时超时降级内存 + onsuccess 后 db.onversionchange 主动 close。
 // 测试用 stub 控制 onblocked/versionchange 事件(确定性,避免跨测试 DB 版本号交叉污染)。
 
-describe('FX-7 / A6 P1-3 — openDb upgrade blocking + cooperative close', () => {
+// ── P1-3 (second-round): openDb upgrade blocking + cooperative close ──
+//
+// sol 实测证伪了第一轮的 stub 测试(只 fire 事件,没建真实 v1 连接 → 假绿):blocked 后
+// 第二个 open 排在第一个 pending upgrade 后面,不收 onblocked、无自己的 timeout → 永久挂。
+// 修:blocked timeout 后进模块级 blocked 状态,后续 openDb 立即 reject→memStore,不再新建 open;
+// 晚到 onsuccess → close+清状态恢复。同一 blocker 下绝不排队第二个 open。
+//
+// 验收测试**必须真实连接,不许事件 stub**(lead 红线):fake-indexeddb 真实建 v1 连接持有。
+
+describe('FX-7 / A6 P1-3 (r2) — real-connection upgrade blocking + cooperative close', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
     return __resetWriteQueueDb()
   })
 
-  it('a blocked upgrade (onblocked, never onsuccess) rejects after the timeout → in-memory fallback (no hang)', async () => {
-    // Stub indexedDB.open to return a request that fires onblocked and never resolves —
-    // simulates an old tab holding a v1 connection without an onversionchange handler.
-    const openStub = vi.fn(() => {
-      const req: {
-        onupgradeneeded: ((e: unknown) => void) | null
-        onsuccess: ((e: unknown) => void) | null
-        onerror: ((e: unknown) => void) | null
-        onblocked: ((e: unknown) => void) | null
-        result: unknown
-      } = { onupgradeneeded: null, onsuccess: null, onerror: null, onblocked: null, result: undefined }
-      queueMicrotask(() => req.onblocked?.(undefined))
-      return req
-    })
-    vi.stubGlobal('indexedDB', { open: openStub })
-    // Short block timeout AFTER beforeEach's reset (so the 3s default is overridden).
-    // Then just drop the cached connection — calling __resetWriteQueueDb here would run
-    // clearXStore ops against the stubbed (blocked) open and wait out the full timeout 3×.
+  it('① a real held v1 connection blocks the v2 upgrade → enqueue/pendingCount degrade to mem WITHOUT hanging (Promise.race 1s)', async () => {
+    const testDb = 'mivo-write-queue-p13-blocked'
+    __setWriteQueueDbNameForTest(testDb)
     __setIdbBlockTimeoutForTest(30)
-    __clearWriteQueueDbConnectionForTest()
+    // Open a real v1 connection and HOLD it (no onversionchange handler → won't cooperate-close).
+    const v1Open = indexedDB.open(testDb, 1)
+    v1Open.onupgradeneeded = () => {
+      const db = v1Open.result
+      if (!db.objectStoreNames.contains('writes')) db.createObjectStore('writes', { keyPath: 'id' })
+    }
+    const v1Db = await new Promise<IDBDatabase>((resolve, reject) => {
+      v1Open.onsuccess = () => resolve(v1Open.result)
+      v1Open.onerror = () => reject(v1Open.error)
+    })
+    // NOTE: no v1Db.onversionchange → this connection won't close → blocks the module's open(v2).
 
     const { fn } = seqExecutor([{ status: 'success' }])
     const q = makeQueue(fn)
-    // enqueue → getAllWrites + putWrite → openDb → onblocked → 30ms timeout → reject → memStore.
-    // This MUST resolve (not hang); the record survives in the in-memory fallback.
-    await q.enqueue(minimalNode('c1', 'n1'))
-    expect(await q.pendingCount()).toBe(1) // memStore has the record
+    // enqueue must NOT hang — it degrades to memStore via the blocked-timeout → blocked-state path.
+    // The second openDb (putWrite) immediately rejects (blockedState='blocked') — no second open queued.
+    const HUNG = Symbol('hung')
+    const outcome = await Promise.race([
+      q.enqueue(minimalNode('c1', 'n1')).then(
+        () => 'ok' as const,
+        () => 'rejected' as const,
+      ),
+      new Promise<typeof HUNG>((r) => setTimeout(() => r(HUNG), 1000)),
+    ])
+    expect(outcome).toBe('ok') // did NOT hang (would be HUNG if the second open queued behind the stuck upgrade)
+    expect(await q.pendingCount()).toBe(1) // memStore has the record (IDB blocked → degraded)
     expect(warnLog).toHaveBeenCalledWith('Write Retry Queue', expect.stringContaining('using in-memory fallback'))
+    v1Db.close() // cleanup: release the blocker so afterEach/afterAll can reopen
   })
 
-  it('an open connection closes cooperatively on versionchange (lets another tab upgrade)', async () => {
-    const closeSpy = vi.fn()
-    const fakeDb = {
-      objectStoreNames: { contains: () => true },
-      onversionchange: null as ((e: unknown) => void) | null,
-      close: closeSpy,
-      transaction: () => {
-        throw new Error('no tx in stub')
-      },
+  it('② after closing the v1 blocker, the late onsuccess does not leak + subsequent ops recover IDB', async () => {
+    const testDb = 'mivo-write-queue-p13-recover'
+    __setWriteQueueDbNameForTest(testDb)
+    __setIdbBlockTimeoutForTest(30)
+    const v1Open = indexedDB.open(testDb, 1)
+    v1Open.onupgradeneeded = () => {
+      const db = v1Open.result
+      if (!db.objectStoreNames.contains('writes')) db.createObjectStore('writes', { keyPath: 'id' })
     }
-    const openStub = vi.fn(() => {
-      const req: {
-        onupgradeneeded: ((e: unknown) => void) | null
-        onsuccess: ((e: unknown) => void) | null
-        onerror: ((e: unknown) => void) | null
-        onblocked: ((e: unknown) => void) | null
-        result: unknown
-      } = { onupgradeneeded: null, onsuccess: null, onerror: null, onblocked: null, result: undefined }
-      queueMicrotask(() => {
-        req.result = fakeDb
-        req.onsuccess?.(undefined) // open succeeds → onsuccess sets db.onversionchange
-      })
-      return req
+    const v1Db = await new Promise<IDBDatabase>((resolve, reject) => {
+      v1Open.onsuccess = () => resolve(v1Open.result)
+      v1Open.onerror = () => reject(v1Open.error)
     })
-    vi.stubGlobal('indexedDB', { open: openStub })
-    await __resetWriteQueueDb()
 
     const { fn } = seqExecutor([{ status: 'success' }])
     const q = makeQueue(fn)
-    // pendingCount → openDb → onsuccess → db.onversionchange is set (runTx then throws →
-    // getAllWrites degrades to memStore, but the connection is open + listening).
+    await q.enqueue(minimalNode('c1', 'n1')) // blocked → memStore (blockedState='blocked')
+    expect(await q.pendingCount()).toBe(1)
+    expect(warnLog).toHaveBeenCalledWith('Write Retry Queue', expect.stringContaining('using in-memory fallback'))
+
+    // Close the blocker → the stuck v2 request resumes → late onsuccess fires → handler
+    // closes the connection + clears blockedState (no leak). Wait for the DB to reach v2.
+    v1Db.close()
+    await vi.waitFor(
+      async () => {
+        // A fresh open(v2) should succeed (not block) once the late onsuccess completed.
+        const probe = indexedDB.open(testDb, 2)
+        await new Promise<void>((resolve, reject) => {
+          probe.onsuccess = () => {
+            probe.result.close()
+            resolve()
+          }
+          probe.onblocked = () => reject(new Error('still blocked — late onsuccess did not fire'))
+          probe.onerror = () => reject(probe.error)
+        })
+      },
+      { timeout: 1000, interval: 10 },
+    )
+
+    // Subsequent module op recovers IDB (fresh open succeeds; no degradation warn).
+    warnLog.mockClear()
+    await q.enqueue(minimalNode('c1', 'n2'))
+    expect(warnLog).not.toHaveBeenCalledWith(
+      'Write Retry Queue',
+      expect.stringContaining('using in-memory fallback'),
+    )
+    expect((await __dumpWritesForTest()).length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('③ a real v2 connection cooperatively closes on a v3 upgrade (onversionchange)', async () => {
+    const testDb = 'mivo-write-queue-p13-coop'
+    __setWriteQueueDbNameForTest(testDb)
+    __setIdbBlockTimeoutForTest(30)
+    const { fn } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    // Module opens v2 (fresh DB → onupgradeneeded creates writes/terminals/meta) + caches the
+    // connection with db.onversionchange → close.
     await q.pendingCount()
-    // Simulate another tab requesting an upgrade → versionchange fires on our connection.
-    fakeDb.onversionchange?.(undefined)
-    expect(closeSpy).toHaveBeenCalledTimes(1) // cooperatively closed so the other tab can upgrade
+
+    // Another "tab" requests a v3 upgrade. The module's v2 connection should get versionchange
+    // → close (cooperative) so the v3 upgrade proceeds (not blocked).
+    const v3Open = indexedDB.open(testDb, 3)
+    let v3Result: 'success' | 'blocked' | null = null
+    await new Promise<void>((resolve) => {
+      v3Open.onsuccess = () => {
+        v3Result = 'success'
+        v3Open.result.close()
+        resolve()
+      }
+      v3Open.onblocked = () => {
+        v3Result = 'blocked' // module's v2 did NOT cooperate-close
+        resolve()
+      }
+      v3Open.onerror = () => {
+        v3Result = 'blocked'
+        resolve()
+      }
+    })
+    expect(v3Result).toBe('success') // cooperative close → v3 succeeded, not blocked
   })
 })
 
@@ -1750,5 +1825,70 @@ describe('FX-7 / A6 P1-4 — non-retreatable terminal counters (A3 uses counters
     expect(counters.conflict).toBe(1)
     expect(counters.rejected).toBe(1)
     expect(counters['dead-letter']).toBe(0)
+  })
+
+  // ── P1-4 (second-round): atomic terminal tx (entry + counter in ONE tx) ──
+  // sol 实测证伪了第一轮(三个独立 tx → 崩溃窗口 + 跨 tab lost update)。
+
+  it('① fault-inject tx abort → NEITHER ledger entry NOR counter lands in IDB (atomic; no partial commit)', async () => {
+    __setMaxTerminalsForTest(256) // no cap eviction — isolate the entry+counter atomicity
+    // Fault-inject: abort the recordTerminal atomic tx so neither the entry put nor the
+    // counter RMW commits (tx rolls back atomically).
+    __setTerminalFaultInjectorForTest((tx) => {
+      tx.abort()
+    })
+
+    const { fn } = seqExecutor([{ status: 'terminal', message: 'http_418' }])
+    const q = makeQueue(fn)
+    await q.enqueue(minimalNode('c1', 'n1'))
+    await q.drain() // terminal outcome → recordTerminal → tx aborts → mem fallback
+
+    // IDB ledger does NOT contain the aborted entry (atomic rollback). The union with mem
+    // would show the mem-fallback entry — so assert on the IDB-only view.
+    const idbLedger = await __dumpIdbTerminalsForTest()
+    expect(idbLedger.find((e) => e.status === 'terminal')).toBeUndefined()
+    // IDB counter is UNCHANGED (no increment — the tx that would bump it aborted).
+    const idbCounters = await __readIdbTerminalCountersForTest()
+    expect(idbCounters.terminal).toBe(0)
+    // No "ledger committed / counter unchanged" partial state can exist (both or neither).
+  })
+
+  it('② two concurrent recordTerminal calls → ledger=2 + counter delta=2 (no cross-tab lost update)', async () => {
+    __setMaxTerminalsForTest(256)
+    const baseCounters = await getWriteQueueTerminalCounters()
+    const baselineDeadLetter = baseCounters.counters['dead-letter']
+
+    // Fire two recordTerminal calls in parallel (simulates cross-tab concurrent terminals).
+    // With atomic txs, IDB serializes the two TERMINALS+META txs → both land + counter=+2
+    // (no RMW lost update; the non-atomic version would read 0/put 1 twice → counter=+1).
+    const rec1 = makeMinimalQueuedWrite('rec1', 'n1')
+    const rec2 = makeMinimalQueuedWrite('rec2', 'n2')
+    await Promise.all([
+      __recordTerminalForTest(rec1, 'dead-letter', 'm1'),
+      __recordTerminalForTest(rec2, 'dead-letter', 'm2'),
+    ])
+
+    const ledger = await __dumpTerminalsForTest()
+    expect(ledger.filter((e) => e.status === 'dead-letter').length).toBe(2)
+    const after = await getWriteQueueTerminalCounters()
+    expect(after.counters['dead-letter'] - baselineDeadLetter).toBe(2)
+  })
+
+  it('③ 7 terminals with cap=5 → ledger caps at 5 (evicted=2) but cumulative counter stays 7 (non-retreatable)', async () => {
+    __setMaxTerminalsForTest(5)
+    const { fn } = seqExecutor([{ status: 'transient', message: 'http_503' }])
+    const q = makeQueue(fn, { maxAttempts: 2, baseDelayMs: 1000, maxDelayMs: 60_000 })
+    for (let i = 0; i < 7; i++) {
+      await q.enqueue(minimalNode('c1', `n${i}`))
+      await q.drain()
+      tick(10_000)
+      await q.drain()
+    }
+    // Atomic cap tx: delete + evicted increment in one tx → evicted=2, no partial state.
+    const { counters } = await getWriteQueueTerminalCounters()
+    expect(counters['dead-letter']).toBe(7) // cumulative, non-retreatable (evict does NOT decrement)
+    expect(counters.evicted).toBe(2)
+    const ledger = await __dumpTerminalsForTest()
+    expect(ledger.length).toBeLessThanOrEqual(5) // snapshot capped
   })
 })

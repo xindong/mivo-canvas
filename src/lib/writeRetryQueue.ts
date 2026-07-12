@@ -66,6 +66,27 @@ let maxTerminals = DEFAULT_MAX_TERMINALS
 // turns that into a reject → warnIdbDegradation → memStore (visible, not hung).
 let idbBlockTimeoutMs = 3000
 
+// P1-3 (second-round): once a blocked open times out, the IDBOpenDBRequest is NOT
+// cancelable — it stays queued in the browser's IDB engine. A SECOND open(v2) called
+// while the first is stuck would queue BEHIND it, never receive onblocked, and have
+// no timeout of its own → permanent hang (sol verified with a real v1 connection).
+// So after a blocked-timeout we enter a module-level blocked state: subsequent
+// openDb calls immediately reject → memStore WITHOUT creating a new open. If the
+// stuck request's onsuccess fires late (the blocker released), we close the
+// connection + clear the blocked state so the NEXT openDb does a fresh, clean open.
+let blockedState: 'open' | 'blocked' = 'open'
+
+// P1-3: the DB name is mutable so the real-connection tests can use an isolated DB
+// (avoiding cross-test version-number pollution on the shared mivo-write-queue DB).
+// Production always uses DB_NAME. Reset in __resetWriteQueueDb.
+let dbName = DB_NAME
+
+// P1-4 (second-round): test-only fault injector for the atomic terminal tx. When set,
+// recordTerminal's run callback invokes it with the tx so a test can call tx.abort()
+// to verify the atomic property (neither ledger entry nor counter lands on abort).
+// Production never sets this. Reset in __resetWriteQueueDb.
+let terminalFaultInjector: ((tx: IDBTransaction) => void) | undefined
+
 const DEFAULT_MAX_QUEUE = 256
 const DEFAULT_MAX_ATTEMPTS = 8
 const DEFAULT_BASE_DELAY = 1000
@@ -585,17 +606,33 @@ const warnIdbDegradation = (context: string, error: unknown): void => {
 
 const openDb = (): Promise<IDBDatabase> => {
   if (dbPromise) return dbPromise
+  // P1-3 (second-round): if a prior open was blocked + timed out, the stuck
+  // IDBOpenDBRequest is still queued in the IDB engine (not cancelable). A new
+  // open(v2) here would queue BEHIND it, never receive onblocked, and have no
+  // timeout → permanent hang (sol verified with a real v1 connection). So while in
+  // the blocked state, immediately reject → caller degrades to memStore. NEVER
+  // queue a second open under the same blocker.
+  if (blockedState === 'blocked') {
+    return Promise.reject(
+      new Error('IDB blocked: a prior upgrade is stuck; using in-memory fallback'),
+    )
+  }
   dbPromise = new Promise<IDBDatabase>((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, DB_VERSION)
+    const request = indexedDB.open(dbName, DB_VERSION)
     // P1-3: if another tab/connection holds an older version and does not cooperate-
     // close, the upgrade is blocked. Without an onblocked handler + timeout the open
     // request stays pending forever → every IDB operation hangs and the degradation
-    // catch never fires. Start a timeout on blocked; if it elapses, reject so the
-    // caller degrades to the in-memory path (warnIdbDegradation) instead of hanging.
+    // catch never fires. Start a timeout on blocked; if it elapses, enter the
+    // module-level blocked state (so subsequent ops reject → memStore without a new
+    // open) and reject so the caller degrades.
     let blockedTimer: ReturnType<typeof setTimeout> | undefined
     request.onblocked = () => {
       if (blockedTimer === undefined) {
         blockedTimer = setTimeout(() => {
+          // Enter blocked state — subsequent openDb calls immediately reject (memStore).
+          // The stuck request stays queued; if its onsuccess fires late (blocker
+          // released) the handler below closes the connection + clears this state.
+          blockedState = 'blocked'
           reject(new Error('IDB open blocked: another connection holds an older version'))
         }, idbBlockTimeoutMs)
       }
@@ -624,6 +661,19 @@ const openDb = (): Promise<IDBDatabase> => {
       // the other tab into the blocked-timeout path above).
       db.onversionchange = () => {
         db.close()
+      }
+      if (blockedState === 'blocked') {
+        // LATE success: the stuck upgrade actually completed (blocker released) AFTER
+        // we already timed out + rejected the original openDb promise + entered the
+        // blocked state. We cannot re-resolve that promise. Close this connection +
+        // clear the blocked state so the NEXT openDb does a fresh, clean open (the
+        // blocker is gone by now). Never adopt a stale connection mid-recovery — a
+        // fresh open is clean and the next caller sees a consistent state.
+        db.close()
+        blockedState = 'open'
+        // dbPromise was cleared by the .catch below; leave it undefined so the next
+        // call reopens. Do NOT resolve `this` promise (already rejected).
+        return
       }
       resolve(db)
     }
@@ -658,6 +708,47 @@ const runTx = <T>(
           result = request.result
         }
         tx.oncomplete = () => resolve(result)
+        tx.onerror = () => reject(tx.error)
+        tx.onabort = () => reject(tx.error ?? new Error('IDB transaction aborted'))
+      }),
+  )
+
+/**
+ * P1-4: multi-store readwrite tx. Used to commit the terminal ledger entry + the
+ * per-status counter RMW (and the cap-delete + evicted-counter RMW) in ONE atomic
+ * transaction spanning TERMINALS_STORE + META_STORE. A crash/abort mid-tx rolls
+ * BOTH back — no "ledger committed / counter unchanged" window that a later cap
+ * eviction could turn into an A3 false-green. IDB tx serialization also solves
+ * cross-tab concurrent RMW lost-update. The run callback may chain requests via
+ * onsuccess (get→put); the tx stays open until the last scheduled request settles,
+ * then tx.oncomplete resolves. The tx is passed to run so tests can fault-inject
+ * tx.abort() (production never aborts).
+ */
+const runMultiStoreTx = (
+  storeNames: string[],
+  mode: IDBTransactionMode,
+  run: (stores: Record<string, IDBObjectStore>, tx: IDBTransaction) => void,
+): Promise<void> =>
+  openDb().then(
+    (db) =>
+      new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(storeNames, mode)
+        const stores: Record<string, IDBObjectStore> = {}
+        for (const name of storeNames) stores[name] = tx.objectStore(name)
+        try {
+          run(stores, tx)
+        } catch (error) {
+          // A synchronous throw in run (e.g. test fault-injector) → abort + reject so
+          // any partially-scheduled requests roll back.
+          try {
+            tx.abort()
+          } catch {
+            /* ignore — already aborting */
+          }
+          reject(error)
+          return
+        }
+        tx.oncomplete = () => resolve()
         tx.onerror = () => reject(tx.error)
         tx.onabort = () => reject(tx.error ?? new Error('IDB transaction aborted'))
       }),
@@ -763,6 +854,28 @@ const readAllTerminals = async (): Promise<TerminalLedgerEntry[]> => {
   }
 }
 
+// P1-4 mem-path counter helpers (IDB unavailable OR atomic-tx-abort fallback). These
+// mutate terminalCountersMem directly; readTerminalCounters unions IDB + mem (per-field
+// max) so a mem-fallback increment is reflected even after IDB recovers.
+const bumpTerminalCounterMem = (status: TerminalLedgerStatus, by = 1): TerminalCounterShape => {
+  const next = {
+    ...terminalCountersMem,
+    [status]: (terminalCountersMem[status] ?? 0) + by,
+  } as TerminalCounterShape
+  terminalCountersMem = next
+  return next
+}
+const bumpEvictedMem = (by: number): TerminalCounterShape => {
+  if (by <= 0) return terminalCountersMem
+  const next = { ...terminalCountersMem, evicted: terminalCountersMem.evicted + by }
+  terminalCountersMem = next
+  return next
+}
+
+// P1-4 (second-round): enforceTerminalCap is now ATOMIC — the cap deletes + the evicted-
+// counter RMW land in ONE tx (TERMINALS + META). Crash/abort mid-tx → neither the
+// deletes nor the evicted increment land (no "evicted ledger / counter unchanged"
+// window). IDB tx serialization solves cross-tab concurrent RMW lost-update.
 const enforceTerminalCap = async (): Promise<void> => {
   if (!isIdbAvailable()) {
     let evictedMem = 0
@@ -773,38 +886,51 @@ const enforceTerminalCap = async (): Promise<void> => {
       evictedMem++
     }
     // P1-4: evicting a ledger entry bumps the `evicted` counter (monotonic, non-retreatable).
-    if (evictedMem > 0) await incrementEvicted(evictedMem)
+    if (evictedMem > 0) bumpEvictedMem(evictedMem)
     return
   }
   try {
-    const all = await readAllTerminals()
-    if (all.length <= maxTerminals) return
-    const excess = all.length - maxTerminals
-    const oldest = all
-      .slice()
-      .sort((a, b) => a.timestamp - b.timestamp || (a.id < b.id ? -1 : 1))
-      .slice(0, excess)
-    await runTx<undefined>(
-      'readwrite',
-      (store) => {
-        let lastReq: IDBRequest<undefined> | undefined
-        for (const entry of oldest) {
-          lastReq = store.delete(entry.id) as IDBRequest<undefined>
+    let nextCounters: TerminalCounterShape | undefined
+    await runMultiStoreTx([TERMINALS_STORE, META_STORE], 'readwrite', (stores) => {
+      const getAllReq = stores[TERMINALS_STORE]!.getAll() as IDBRequest<TerminalLedgerEntry[]>
+      getAllReq.onsuccess = () => {
+        const all = getAllReq.result
+        if (all.length <= maxTerminals) return
+        const excess = all.length - maxTerminals
+        const oldest = all
+          .slice()
+          .sort((a, b) => a.timestamp - b.timestamp || (a.id < b.id ? -1 : 1))
+          .slice(0, excess)
+        for (const entry of oldest) stores[TERMINALS_STORE]!.delete(entry.id)
+        // evicted counter RMW in the SAME tx (reconciled with mem so a prior mem-fallback
+        // increment is not lost when IDB recovers).
+        const counterReq = stores[META_STORE]!.get(TERMINAL_COUNTERS_KEY) as IDBRequest<
+          { key: string; value: TerminalCounterShape } | undefined
+        >
+        counterReq.onsuccess = () => {
+          const idbCurrent = counterReq.result?.value ?? { ...ZERO_COUNTERS }
+          const base = mergeCounters(idbCurrent, terminalCountersMem)
+          nextCounters = { ...base, evicted: base.evicted + excess }
+          stores[META_STORE]!.put({ key: TERMINAL_COUNTERS_KEY, value: nextCounters })
         }
-        // runTx awaits one request; excess >= 1 here so lastReq is defined. The fallback
-        // keeps TS non-null honest in the (impossible) empty-excess case.
-        return lastReq ?? (store.get('__none__') as IDBRequest<undefined>)
-      },
-      TERMINALS_STORE,
-    )
-    // P1-4: evicting ledger entries bumps the `evicted` counter (monotonic, non-retreatable)
-    // — the per-status cumulative counters are NOT decremented (they are the A3 metric).
-    if (excess > 0) await incrementEvicted(excess)
+      }
+    })
+    // Sync mem to the committed value (reconciles any prior mem fallback).
+    if (nextCounters) terminalCountersMem = nextCounters
   } catch (error) {
     debugLogger.warn(SOURCE, `terminal cap enforcement failed: ${msg(error)}`)
+    // Mem fallback: leave the ledger over-cap (best-effort); the next enforceTerminalCap
+    // retries. Do NOT bump evicted here — nothing was durably evicted (tx aborted).
   }
 }
 
+// P1-4 (second-round): recordTerminal is now ATOMIC — the ledger entry put + the
+// per-status counter RMW land in ONE tx (TERMINALS + META). Crash/abort mid-tx →
+// neither lands (no "ledger committed / counter unchanged" window that a later cap
+// eviction could turn into an A3 false-green). IDB tx serialization solves cross-tab
+// concurrent RMW lost-update. deleteWrite (in the drain) runs AFTER this returns, so
+// the write record is removed only once the terminal ledger + counter are durably
+// committed (or explicitly mem-degraded below).
 const recordTerminal = async (
   rec: QueuedWrite,
   status: TerminalLedgerStatus,
@@ -825,25 +951,42 @@ const recordTerminal = async (
   }
   if (!isIdbAvailable()) {
     terminalMem.set(entry.id, entry)
-    await enforceTerminalCap()
-    // P1-4: increment the non-retreatable cumulative counter (evict does NOT decrement).
-    await incrementTerminalCounter(status)
+    bumpTerminalCounterMem(status)
+    await enforceTerminalCap() // mem cap + mem evicted
     return
   }
   try {
-    await runTx<IDBValidKey>('readwrite', (store) => store.put(entry), TERMINALS_STORE)
+    let nextCounters: TerminalCounterShape | undefined
+    await runMultiStoreTx([TERMINALS_STORE, META_STORE], 'readwrite', (stores, tx) => {
+      stores[TERMINALS_STORE]!.put(entry)
+      const counterReq = stores[META_STORE]!.get(TERMINAL_COUNTERS_KEY) as IDBRequest<
+        { key: string; value: TerminalCounterShape } | undefined
+      >
+      counterReq.onsuccess = () => {
+        const idbCurrent = counterReq.result?.value ?? { ...ZERO_COUNTERS }
+        // Reconcile with mem (max) so a prior mem-fallback increment is not overwritten
+        // when IDB recovers (no cross mem/IDB lost-update).
+        const base = mergeCounters(idbCurrent, terminalCountersMem)
+        nextCounters = { ...base, [status]: base[status] + 1 } as TerminalCounterShape
+        stores[META_STORE]!.put({ key: TERMINAL_COUNTERS_KEY, value: nextCounters })
+      }
+      // P1-4 test-only fault injector (production never sets this). Aborts the tx so the
+      // test can assert neither entry nor counter lands (atomic property).
+      terminalFaultInjector?.(tx)
+    })
     terminalMem.delete(entry.id)
+    // Sync mem to the committed value.
+    if (nextCounters) terminalCountersMem = nextCounters
+    // ATOMIC cap (delete excess + evicted increment) after the entry+counter commit.
     await enforceTerminalCap()
-    // P1-4: increment the non-retreatable cumulative counter (evict does NOT decrement).
-    await incrementTerminalCounter(status)
   } catch (error) {
-    // Best-effort audit — never block the terminal outcome. Fall back to mem so the
-    // entry stays queryable in-process this session (tests + A3 observation).
-    warnIdbDegradation(`terminal put failed for ${rec.id}`, error)
+    // Explicit mem degradation (lead P1-4 ③): never block the terminal outcome. The
+    // atomic tx aborted → nothing durable landed; fall back to mem so the entry + counter
+    // stay queryable in-process this session (readTerminalCounters unions IDB + mem).
+    warnIdbDegradation(`terminal atomic put failed for ${rec.id}`, error)
     terminalMem.set(entry.id, entry)
-    // Even on the mem-fallback path, bump the counter (in mem) so the count is right
-    // for this session (readTerminalCounters unions IDB + mem).
-    await incrementTerminalCounter(status)
+    bumpTerminalCounterMem(status)
+    await enforceTerminalCap() // mem cap (best-effort; IDB tx aborted so nothing durable)
   }
 }
 
@@ -885,36 +1028,6 @@ const readTerminalCounters = async (): Promise<TerminalCounterShape> => {
     warnIdbDegradation('terminal counters read failed', error)
     return { ...terminalCountersMem }
   }
-}
-
-const writeTerminalCounters = async (next: TerminalCounterShape): Promise<void> => {
-  if (!isIdbAvailable()) {
-    terminalCountersMem = next
-    return
-  }
-  try {
-    await runTx<IDBValidKey>(
-      'readwrite',
-      (store) => store.put({ key: TERMINAL_COUNTERS_KEY, value: next }),
-      META_STORE,
-    )
-    terminalCountersMem = next
-  } catch (error) {
-    warnIdbDegradation('terminal counter write failed', error)
-    terminalCountersMem = next
-  }
-}
-
-const incrementTerminalCounter = async (status: TerminalLedgerStatus, by = 1): Promise<void> => {
-  const current = await readTerminalCounters()
-  const next: TerminalCounterShape = { ...current, [status]: (current[status] ?? 0) + by } as TerminalCounterShape
-  await writeTerminalCounters(next)
-}
-
-const incrementEvicted = async (by: number): Promise<void> => {
-  if (by <= 0) return
-  const current = await readTerminalCounters()
-  await writeTerminalCounters({ ...current, evicted: current.evicted + by })
 }
 
 const readTerminalBaseline = async (): Promise<{ counters: TerminalCounterShape; ts: number } | null> => {
@@ -1589,6 +1702,78 @@ export const __clearWriteQueueDbConnectionForTest = (): void => {
 }
 
 /**
+ * P1-3 (second-round) test-only: use an isolated DB name for the real-connection
+ * blocked-upgrade tests, so a held v1 connection + module open(v2) doesn't collide
+ * with the shared mivo-write-queue DB's cross-test version state. Resets the cached
+ * connection so the next op reopens against the new name. Reset to DB_NAME in
+ * __resetWriteQueueDb.
+ */
+export const __setWriteQueueDbNameForTest = (name: string): void => {
+  dbName = name
+  dbPromise = undefined
+  blockedState = 'open'
+}
+
+/**
+ * P1-4 (second-round) test-only: fault injector for the atomic terminal tx. The test
+ * passes a callback that calls tx.abort() to verify the atomic property — on abort,
+ * NEITHER the ledger entry NOR the counter lands in IDB (no partial commit). Production
+ * never sets this. Reset to undefined in __resetWriteQueueDb.
+ */
+export const __setTerminalFaultInjectorForTest = (
+  fn: ((tx: IDBTransaction) => void) | undefined,
+): void => {
+  terminalFaultInjector = fn
+}
+
+/**
+ * P1-4 test-only: direct access to recordTerminal for the concurrency test (fire two
+ * recordTerminal calls in parallel and assert the atomic txs serialize → ledger=2 +
+ * counter delta=2, no lost update). Production code calls recordTerminal via the drain.
+ */
+export const __recordTerminalForTest = (
+  rec: QueuedWrite,
+  status: TerminalLedgerStatus,
+  message: string,
+): Promise<void> => recordTerminal(rec, status, message)
+
+/**
+ * P1-4 test-only: dump ONLY the IDB terminal ledger (no mem union). Used by the fault-
+ * inject test to assert that an aborted tx left no entry in IDB (the union with mem
+ * would show the mem-fallback entry, masking the atomic property).
+ */
+export const __dumpIdbTerminalsForTest = async (): Promise<TerminalLedgerEntry[]> => {
+  if (!isIdbAvailable()) return []
+  try {
+    return await runTx<TerminalLedgerEntry[]>(
+      'readonly',
+      (store) => store.getAll() as IDBRequest<TerminalLedgerEntry[]>,
+      TERMINALS_STORE,
+    )
+  } catch {
+    return []
+  }
+}
+
+/**
+ * P1-4 test-only: read ONLY the IDB terminal counters (no mem union). Used by the
+ * fault-inject test to assert the IDB counter is unchanged on an aborted tx.
+ */
+export const __readIdbTerminalCountersForTest = async (): Promise<TerminalCounterShape> => {
+  if (!isIdbAvailable()) return { ...ZERO_COUNTERS }
+  try {
+    const entry = await runTx<{ key: string; value: TerminalCounterShape } | undefined>(
+      'readonly',
+      (store) => store.get(TERMINAL_COUNTERS_KEY) as IDBRequest<{ key: string; value: TerminalCounterShape } | undefined>,
+      META_STORE,
+    )
+    return entry?.value ?? { ...ZERO_COUNTERS }
+  } catch {
+    return { ...ZERO_COUNTERS }
+  }
+}
+
+/**
  * G1-a R4 F2 test-only:直接 putWrite 一批构造好的记录(含受控 id / createdAt / nextAttemptAt),
  * 让单测能精确复现"同毫秒多资源链 + 逆境 IDB key 顺序"——enqueue 路径用随机 UUID 不便控制 key 序。
  * 与 __dumpWritesForTest / __resetWriteQueueDb 同为 test-only accessor;生产代码不调用。
@@ -1608,6 +1793,11 @@ export const __resetWriteQueueDb = async (): Promise<void> => {
   terminalCountersBaselineMem = null
   maxTerminals = DEFAULT_MAX_TERMINALS
   idbBlockTimeoutMs = 3000
+  // P1-3 (second-round): clear the blocked-state + fault injector + DB name so a prior
+  // test's isolated DB / blocked state / fault injection never leaks into the next.
+  blockedState = 'open'
+  dbName = DB_NAME
+  terminalFaultInjector = undefined
   // Drop the cached connection so the next op reopens against the (now-cleared) store.
   dbPromise = undefined
   await clearIdbStore()
