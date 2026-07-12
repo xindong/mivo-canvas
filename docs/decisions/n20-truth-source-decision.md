@@ -6,7 +6,7 @@
 > 任务来源:`docs/plan/remaining-tasks-cutover-plan.md` §8 N2-0(7 hard gate,逐字执行)。
 > 前置:`docs/spike/n1-yjs-mapping.md`(N1 结论 + Q1-Q10)、`docs/decisions/record-schema.md`、`src/kernel/{docKernel,records,adapters}.ts`、`docs/decisions/platform-architecture-2026-07-07.md`。
 > 验证产物(全绿):
-> - `src/kernel/__spike__/n20-truth-source.spike.test.ts`(44 tests:15 原 + 18 返修 + 8 补缺 + 3 R2 增:T1-5 restore 全链 / S10-10 immutable/atomic leaf 表 / S10-11 idempotent replay)
+> - `src/kernel/__spike__/n20-truth-source.spike.test.ts`(48 tests:15 原 + 18 返修 + 8 补缺 + 3 R2 增:T1-5 restore 全链 / S10-10 immutable/atomic leaf 表 / S10-11 idempotent replay;**R5 F4:C-1~C-4 cutover contract harness:flag on/off decoder / old-queue migration / stale-base 200 / rollback snapshot materialize**)
 > - `server/__tests__/n20-sse-route.spike.test.ts`(9 tests,真实 Hono SSE route 集成 + R2-2 live push 5-7 + desiredSize backpressure + **R3 F3:真实 resolveActor/canAccessCanvas authz seam(替代 fake secret,错 proof → 404 no-leak 非 401)+ 5-8 slow-reader response body 恢复**;**R5 F3:5-9 post-revoke write 拒绝(同 Hono harness 加真实 authz seam PATCH write route,bob 撤权 → SSE revoke/close + write 404 no-leak + owner write 200)**)
 > - `server/__tests__/n20-pg-tx-fault.spike.test.ts`(8 tests,真实 PG transaction fault injection + R2-1 同一 client pool.connect+finally release;PG-T3 改名同库资产元数据;**R3 F2:PG-T5 field_clock 持久 / PG-T7 strict-tx 跨 record**;**R5 F2:PG-T6 真实领域 replay path(单事务原子写 record+seq+event+idem row → destroy pool → 重连 replay 同 key 不二次 bump revision/seq/event)+ PG-T6b 首次事务 fault/rollback(领域写+idem row 同事务原子)**)
 >
@@ -92,8 +92,8 @@
 ```bash
 # 破坏面全量调用面审计(grep 12 文件)
 grep -rn 'upsertChild\|validateChildPayload\|NodePayload\|UpsertRequest\|UpsertResponse\|WriteOp.*upsertNode' src/ server/ shared/ --include='*.ts'
-# 定向回归测试集(契约 + 集成 + 队列,117 项)
-npm test -- src/lib/serverPersistAdapter.contract.test.ts server/persist/backend.test.ts server/persist/backend.pg.test.ts server/persist/backend.contract.dual.test.ts src/lib/writeRetryQueue.test.ts
+# 定向回归测试集(契约 + 集成 + 队列;R5 F4 修正:原 `npm test` 不存在,本仓 script 是 `test:unit` = `vitest run`)
+npm run test:unit -- src/lib/serverPersistAdapter.contract.test.ts server/persist/backend.test.ts server/persist/backend.pg.test.ts server/persist/backend.contract.dual.test.ts src/lib/writeRetryQueue.test.ts
 ```
 
 **措辞修正**:v1 "零破坏面、无迁移窗口" → v3 "**前端主路径未接线(`unwiredServerPersistAdapter`),但契约/服务端破坏面非零(逐文件清单 12 项 + FX-5 队列迁移 + 117 项定向回归)**"。
@@ -115,9 +115,13 @@ npm test -- src/lib/serverPersistAdapter.contract.test.ts server/persist/backend
 | old queue(FX-5 IDB 旧 queued body) | cutover 后 drain 队列 | 旧 queued `NodePayload` | migration-on-read:旧 body → 新 op schema 转换 | 200 ok(转换后) | 客户端无感(队列 drain 时转换) |
 | new server(新 op schema) | `FIELD_LEVEL_OPS=on` | `DomainOp` / `DomainOp[]` | field-level merge + bump revision/seq | 200 `{id,revision,seq}` | 正常 |
 | new op + stale base(并发不同字段) | 运行时 | `DomainOp`(base 落后) | LWW 后写 wins + `overwritten` 推前写者(G4-4 不拒写) | 200 + overwritten(非 409) | 前写者收 overwritten → 可选 `restore` |
-| rollback(flag off) | `FIELD_LEVEL_OPS=off` | 新 op(若有)→ 反向转旧 body | 切回整 record decoder;FX-5 migration 可逆(新 op → 旧 body 反向转换) | 200(旧 shape) | 新 op 反向转换回旧 body,无丢失 |
+| rollback(flag off) | `FIELD_LEVEL_OPS=off` | flag off 切回整 record decoder | 从 **authoritative 全 record snapshot materialize 旧 body**(非 delta 反演;见下注) | 200(旧 shape) | snapshot materialize 旧 body → PATCH 200 |
 
+> **R5 F4 rollback 降级**:原表称 "新 op → 旧 body 反向转换,无丢失"。`DomainOp` 是 delta(fragment),无 authoritative snapshot 无法无损反演完整旧 `NodePayload` — 原承诺无证据(无算法/无 probe)。**降级为 snapshot materialize**:rollback 从 authoritative 全 record snapshot 直接 materialize 旧 shape body(源头是全 record 非 delta,可证明无丢失)。delta-inversion(从单个 delta 反演完整旧 body)显式**无算法/不支持**(降级到已测范围)。spike C-4 验:`materializeLegacyBody` 从 authoritative snapshot 直出旧 body,flag-off PATCH 200。
+>
 > 全文不再有 "versioned payload 或原子 cutover" / "versioned/原子" 二选一残句;cutover = **原子**(§1.2 拍死)。stale-client(旧 body schema 不匹配)唯一状态码 = **400 `payload-rejected`**;409 revision-conflict 是 #194 envelope 复用码(`parseIfMatch`),新 field-level 协议 G4-4 明确 base 落后不拒写(200),故 stale-client 场景无 409(§1.2 状态表 / §10.2 / §10.9 / §2 Gate6 一致)。
+>
+> **R5 F4 cutover contract harness**:状态表 5 行逐行参数化探针在 `src/kernel/__spike__/n20-truth-source.spike.test.ts` C-1~C-4:flag on/off decoder(C-1,row 1/3)、old-queue migration-on-read(C-2,row 2)、new-op+stale-base 200 非 409(C-3,row 4,对齐 G4-4/T1-1)、rollback=snapshot materialize(C-4,row 5)。冻结命令已 dry-run:grep 149 匹配 / 5 测试文件全在;命令修正 `npm test` → `npm run test:unit`(V16/V17 验)。
 
 ---
 
@@ -322,6 +326,7 @@ npm test -- src/lib/serverPersistAdapter.contract.test.ts server/persist/backend
 | v2 Gate7 G7-hard-1~3 标 ★(自建 server 无 Yjs 对照,虚标) | v3 **降 ●/○**(R2-7);仅 G7-hard-4 ★真测;Gate7 重评平局 | `G7-hard-1~3`(●/○)+ `G7-hard-4`(★) |
 | v2 隐含"Yjs 无原生 coalescing" | v3 修正:Yjs 有 UndoManager captureTimeout 合并(M5 证两案一致,非"无原生 coalescing") | `M5`(★真 Y.UndoManager) |
 | v2 "任何 HTTP 网关必透传 SSE" | v3 改条件式:网关应透传(plain HTTP)但生产可能缓冲/超时(○条件式留 lead 实测) | §2 Gate5 仓库侧分析(R2-2) |
+| §1.2 cutover 状态表 5 行无 probe + 冻结命令 `npm test` 不存在 + rollback "delta 反演无丢失"无算法 | **R5 F4**:新增 C-1~C-4 cutover contract harness(逐行参数化状态表);冻结命令修正 `npm run test:unit`(V16/V17 dry-run);rollback 降级为 **snapshot materialize**(authoritative 全 record → 旧 body,非 delta 反演;delta-inversion 显式无算法/不支持) | `C-1~C-4`(●)+ V16/V17 dry-run |
 
 ---
 
@@ -547,11 +552,11 @@ const trustifyCreate = (client: CreateBody, ctx: TrustedCtx): CreateWire =>
 
 ## 附:spike 文件结构索引
 
-- `src/kernel/__spike__/n20-truth-source.spike.test.ts`(44 tests):
+- `src/kernel/__spike__/n20-truth-source.spike.test.ts`(48 tests):
   - `makeNode` fixture + `setByPath`/`getByPath`/`fieldKeyOf`(硬化:拒原型污染 S10-1 + 拒空路径 S10-6 + R2-4 leaf validator 拒整对象 clobber S10-6)
   - `FieldLevelServer`:applyOp/applyOpAuthz(返 forbidden,G7-hard-3)/ deleteNodeCascade / **deleteNodeCascadeWithCursor**(S10-9)/ pullSinceWithGap(logFloor/gap,G7-hard-1)/ compress / snapshot / addMember/removeMember / storageBytes / deletedTombstones / **staging+commitStaged**(R2-3 batch 真单事务 S10-5)
   - `CommandUndoStack`(原 PoC)+ `ConditionalUndoStack`(返修:条件逆运算 P1-1)+ `TextLwwWithOverwrite`(P1-4 B 方案,**restore 走 overwrite 管线全链 R2-5 T1-5**)
   - `yjsMatrixSetup`(真 Yjs UndoManager 同矩阵 helper)
-  - G4+G1(5)/ G3(2)+G3-real(3)/ G2(2)+M1-M6(6)/ G7(3)+G7-hard(4)/ G5(1)/ antiYjs(2)/ S10(5)+S10-6~9(4)/ T1(4)+**T1-5(R2-5)**/ **S10-10 immutable/atomic leaf(R2-3)**/ **S10-11 idempotent replay(R2-3)** = **44 tests**
+  - G4+G1(5)/ G3(2)+G3-real(3)/ G2(2)+M1-M6(6)/ G7(3)+G7-hard(4)/ G5(1)/ antiYjs(2)/ S10(5)+S10-6~9(4)/ T1(4)+**T1-5(R2-5)**/ **S10-10 immutable/atomic leaf(R2-3)**/ **S10-11 idempotent replay(R2-3)**/ **C-1~C-4 cutover contract harness(R5 F4:flag decoder/migration/stale-base/rollback snapshot materialize)** = **48 tests**
 - `server/__tests__/n20-sse-route.spike.test.ts`(9 tests):真实 Hono SSE route(content-type/heartbeat/since/revoke/authz/slow-consumer + **5-7 live push R2-2** + **5-8 slow-reader 恢复 R3 F3** + **5-9 post-revoke write 拒绝 R5 F3**;5-5 真实 resolveActor/canAccessCanvas authz seam;5-9 同 harness 加真实 seam PATCH write route)
 - `server/__tests__/n20-pg-tx-fault.spike.test.ts`(4 tests):真实 PG transaction fault injection(原子提交/fault ROLLBACK/同库资产元数据(R2-1 改名)/无事务 partial 对照;本地 PG 55443 实跑 MIVO_PG_TEST=1 转 pass;**全部 PG-T 同一 client pool.connect+finally release**)

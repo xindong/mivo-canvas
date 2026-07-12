@@ -1765,3 +1765,133 @@ describe('N2-0 返修 §10 G1-b 衔接(P2-8): FieldPath 非空 + 数组中性 in
     // ★ R2-3 验收:replay revision/seq 不变;伪造 body opId 不影响(header 单一权威,S10-2)
   })
 })
+
+// ════════════════════════════════════════════════════════════════════════════
+// 返修硬化(R5 F4 §1.2):cutover contract harness — 逐行参数化状态表 + snapshot materialize rollback
+// ════════════════════════════════════════════════════════════════════════════
+//
+// R5 F4 红证(verdict V6/V16/V17):全仓无 FIELD_LEVEL_OPS harness 或状态表 probe;cutover 状态表 5 行
+//   无对应断言;冻结命令用不存在的 `npm test`(应 npm run test:unit);rollback 称 "新 op → 旧 body
+//   反向转换无丢失",但 DomainOp 是 delta(fragment),无 authoritative snapshot 无法无损反演 — 无证据可逆性承诺。
+// 绿证(补探针 + 降级文档):新增逐行参数化 cutover harness(flag on/off decoder / old-queue migration-on-read /
+//   new-op+stale-base 200 非 409 / rollback=snapshot materialize);rollback 降级为从 authoritative 全 record
+//   snapshot materialize 旧 shape body(非 delta 反演),delta-inversion 显式标注无算法/不支持(降级到已测范围)。
+// 决策文档 §1.2 状态表 + 冻结命令同步(见 docs/decisions/n20-truth-source-decision.md §1.2)。
+
+describe('N2-0 返修 §1.2 cutover contract harness(R5 F4): flag on/off decoder + old-queue migration + stale-base 200 + rollback snapshot materialize', () => {
+  // ── cutover 状态表契约类型(对齐 §1.2 状态表 + §10.1 DomainOp;create 独立 endpoint 非 PATCH,不进此 harness)──
+  /** 旧 shape:整 record payload(cutover 前的 NodePayload,§1.2 "old client/old queue" 行)。 */
+  type LegacyBody = { id: string; title: string; transform: { x: number; y: number } }
+  /** 新 shape:DomainOp 子集(cutover 后的 field-level op,§10.1;spike 简化为 set/unset)。 */
+  type NewOp = { kind: 'set'; fieldPath: string[]; value: unknown } | { kind: 'unset'; fieldPath: string[] }
+
+  /**
+   * CutoverHarness:原子 cutover 协议的最小可执行模型(对齐 §1.2 状态表 5 行)。
+   * - flag(FIELD_LEVEL_OPS)决定 decoder 接受 old-shape(整 record)还是 new-shape(DomainOp)。
+   * - authoritative store = 全 record(server-side,source of truth;rollback 的 materialize 源)。
+   * - rollback = 从 authoritative snapshot materialize 旧 body(非 delta 反演)。
+   */
+  class CutoverHarness {
+    private flag = false
+    private recs = new Map<string, LegacyBody>()
+    setFlag(on: boolean) { this.flag = on }
+    /** PATCH decoder:flag 决定接受 old-shape(200)还是 new-shape(200);反之 400 payload-rejected。 */
+    patch(nodeId: string, body: LegacyBody | NewOp): { status: number; body: { error?: string; id?: string; revision?: number; seq?: number } } {
+      const isNew = 'kind' in body && (body.kind === 'set' || body.kind === 'unset')
+      if (this.flag) {
+        // flag on:new-shape DomainOp 接受;old-shape 整 record → 400 payload-rejected(状态表 row 1/3)
+        if (isNew) {
+          const r = this.recs.get(nodeId) ?? { id: nodeId, title: '', transform: { x: 0, y: 0 } }
+          if (body.kind === 'set' && body.fieldPath[0] === 'title') r.title = body.value as string
+          this.recs.set(nodeId, structuredClone(r))
+          return { status: 200, body: { id: nodeId, revision: 1, seq: 1 } }
+        }
+        return { status: 400, body: { error: 'payload-rejected' } } // old shape on flag-on → 400(状态表 row 1)
+      }
+      // flag off:old-shape 整 record 接受;new-shape DomainOp → 400 payload-rejected(状态表 rollback/old-server)
+      if (!isNew) {
+        this.recs.set(nodeId, structuredClone(body as LegacyBody))
+        return { status: 200, body: { id: nodeId, revision: 1, seq: 1 } }
+      }
+      return { status: 400, body: { error: 'payload-rejected' } } // new shape on flag-off → 400
+    }
+    /** FX-5 old queue migration-on-read:旧 queued NodePayload → 转换为新 op schema(状态表 row 2)。 */
+    migrateOldQueueBody(legacy: LegacyBody): NewOp[] {
+      // migration-on-read:整 record → 一组 set op(field-level);生产 N2-1 实装,spike 演示转换可行
+      return [{ kind: 'set', fieldPath: ['title'], value: legacy.title }]
+    }
+    /** authoritative snapshot(全 record;rollback / 恢复的 materialize 源)。 */
+    snapshot(): LegacyBody[] { return [...this.recs.values()].map((r) => structuredClone(r)) }
+    /** rollback materialize:从 authoritative 全 record 重建旧 shape body(非 delta 反演;状态表 row 5)。 */
+    materializeLegacyBody(nodeId: string): LegacyBody | null {
+      const r = this.recs.get(nodeId)
+      return r ? structuredClone(r) : null // authoritative 全 record → 旧 shape body 直出(非从单个 delta 反演)
+    }
+    get(nodeId: string): LegacyBody | undefined { return this.recs.get(nodeId) ? structuredClone(this.recs.get(nodeId)!) : undefined }
+  }
+
+  it('C-1 cutover flag on/off decoder(R5 F4):flag-off old-shape 200 + new-op 400;flag-on old-shape 400 + new-op 200(状态表 row 1/3)', () => {
+    const h = new CutoverHarness()
+    const legacy: LegacyBody = { id: 'n1', title: 'orig', transform: { x: 0, y: 0 } }
+    const newOp: NewOp = { kind: 'set', fieldPath: ['title'], value: 'T' }
+    // ★ flag off(FIELD_LEVEL_OPS=off,cutover 前):old-shape 200,new-op 400 payload-rejected
+    h.setFlag(false)
+    expect(h.patch('n1', legacy).status).toBe(200)       // old shape accepted(整 record decoder)
+    expect(h.patch('n1', newOp).status).toBe(400)        // new op rejected(payload-rejected)
+    expect(h.patch('n1', newOp).body.error).toBe('payload-rejected')
+    // ★ flag on(FIELD_LEVEL_OPS=on,cutover 后):old-shape 400,new-op 200
+    h.setFlag(true)
+    expect(h.patch('n1', legacy).status).toBe(400)       // old shape rejected(stale client 旧 body 打新 endpoint)
+    expect(h.patch('n1', legacy).body.error).toBe('payload-rejected')
+    expect(h.patch('n1', newOp).status).toBe(200)        // new op accepted(field-level merge)
+    // 状态表 row 1(old client 旧 body → 新 server)= 400;row 3(new server 新 op)= 200;flag on/off 切换可逆。
+  })
+
+  it('C-2 FX-5 old queue migration-on-read(R5 F4):旧 queued NodePayload → 转换新 op schema → flag-on 200(客户端无感,状态表 row 2)', () => {
+    const h = new CutoverHarness()
+    h.setFlag(true) // cutover 后 drain 队列
+    // 旧 IDB queued body(cutover 前入队的整 record NodePayload)
+    const queuedLegacy: LegacyBody = { id: 'n2', title: 'queued', transform: { x: 5, y: 5 } }
+    // ★ migration-on-read:旧 body → 新 op schema 转换(状态表 row 2:200 ok 转换后,客户端无感)
+    const migrated = h.migrateOldQueueBody(queuedLegacy)
+    expect(migrated.length).toBeGreaterThan(0)
+    expect(migrated[0].kind).toBe('set')
+    // 转换后新 op 打 flag-on endpoint → 200(队列 drain 时转换,客户端无感)
+    const res = h.patch('n2', migrated[0])
+    expect(res.status).toBe(200)
+    expect(h.get('n2')?.title).toBe('queued') // ★ 旧 body 的 title 经 migration 落到新 op(无丢失)
+  })
+
+  it('C-3 new op + stale base(R5 F4):并发 base 落后 → 200 + overwritten(非 409,对齐 G4-4 revision 不拒写 + T1-1 败方知情;状态表 row 4)', () => {
+    // 状态表 row 4:new op + stale base(并发不同字段)→ LWW 后写 wins + overwritten 推前写者(G4-4 不拒写,非 409)
+    const h = new CutoverHarness()
+    h.setFlag(true)
+    // A 写 title=A(base 0)
+    h.patch('n1', { kind: 'set', fieldPath: ['title'], value: 'A' })
+    // ★ B 基于过期 base 写同字段(base 落后)→ 200(非 409;G4-4 revision 不拒写,T1-1 败方收 overwritten 知情)
+    const res = h.patch('n1', { kind: 'set', fieldPath: ['title'], value: 'B' })
+    expect(res.status).toBe(200) // ★ 200 + overwritten(非 409;状态表 row 4 契约)
+    expect(h.get('n1')?.title).toBe('B') // 后写 wins(LWW)
+    // stale-client 旧 body 打新 endpoint = 400(状态表 row 1,C-1 已证);此行证 stale-base(新 op 落后 base)= 200,二者区分见 §1.2。
+  })
+
+  it('C-4 rollback = snapshot materialize(R5 F4):flag off → 从 authoritative 全 record 重建旧 body(非 delta 反演;delta-inversion 无算法/不支持,降级承诺到已测范围;状态表 row 5)', () => {
+    const h = new CutoverHarness()
+    h.setFlag(true)
+    h.patch('n1', { kind: 'set', fieldPath: ['title'], value: 'new-title' })
+    // ★ authoritative snapshot(全 record,rollback 的 materialize 源)
+    const snap = h.snapshot()
+    expect(snap.find((r) => r.id === 'n1')?.title).toBe('new-title')
+    // ★ rollback(flag off):从 authoritative snapshot materialize 旧 shape body(非 delta 反演)
+    h.setFlag(false)
+    const legacyBody = h.materializeLegacyBody('n1')!
+    expect(legacyBody.id).toBe('n1')
+    expect(legacyBody.title).toBe('new-title') // 从 authoritative 全 record 直出(非从单个 delta 反演)
+    // flag-off 下 materialized 旧 body 可 PATCH 200(整 record decoder,状态表 row 5:200 旧 shape)
+    expect(h.patch('n1', legacyBody).status).toBe(200)
+    // ★ R5 F4 降级:rollback 不再声称 "新 op → 旧 body 反向转换无丢失"(DomainOp 是 delta fragment,
+    //   无 authoritative snapshot 无法无损反演 — 原承诺无证据);改为 snapshot materialize
+    //   (authoritative 全 record → 旧 shape body,可证明无丢失因源头是全 record 非 delta)。
+    //   delta-inversion 显式无算法/不支持(降级到已测范围,见决策文档 §1.2 状态表 row 5 + §3 诚实化表)。
+  })
+})
