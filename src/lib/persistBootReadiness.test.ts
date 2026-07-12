@@ -47,10 +47,16 @@ import {
   bootPersistWiring,
   isPersistWriteActive,
   stopPersistWriteQueue,
+  startPersistWriteQueue,
+  drainPersistQueue,
+  enqueuePersistWrite,
+  resumePersistQueue,
   __resetPersistBoot,
 } from './persistBoot'
-import { __resetWriteQueueDb } from './writeRetryQueue'
+import { __resetWriteQueueDb, __dumpWritesForTest } from './writeRetryQueue'
 import { useCanvasStore } from '../store/canvasStore'
+import { useAuthStore } from '../store/authSlice'
+import { setPersistUserId, __resetPersistUserId, ANONYMOUS_USER_ID } from './persistUserId'
 import type { FetchAdapterOptions } from './serverPersistAdapter'
 
 const KEY_A = 'mivo_aaa_user_a'
@@ -71,7 +77,9 @@ beforeEach(async () => {
   stopPersistWriteQueue()
   __resetPersistBoot()
   await __resetWriteQueueDb()
+  __resetPersistUserId()
   useCanvasStore.setState({ projects: [], canvases: {} })
+  useAuthStore.setState({ user: null, status: 'unknown' })
 })
 
 describe('G1-a R2 F3 — fetchPersistReadiness 三态 + fail-closed', () => {
@@ -163,5 +171,89 @@ describe('G1-a R2 F3 — bootPersistWiring(server)durable 门控', () => {
     await flush()
     expect(calls).toEqual(['/healthz'])
     expect(isPersistWriteActive()).toBe(false)
+  })
+})
+
+// ── G1-a R2 F5:paused-401 resume(已认证 boot 自动重放;leftover 记录不再永久卡死)─────
+// 验收(对齐 finding F5):
+//  - session A 写遇 401 → 队列暂停,记录留存 paused-401(不删)。
+//  - session B 已认证 boot → 队列 start 恢复 paused 拒 drain,boot 在已认证场景 resume → 记录自动重放 + 删除。
+//  - 未认证 boot → 不 resume,记录仍 paused-401 保留(不重放)。
+const userState401 = (): Response =>
+  new Response(JSON.stringify({ error: 'require-login' }), { status: 401, headers: { 'content-type': 'application/json' } })
+const userState200 = (): Response =>
+  new Response(JSON.stringify({ id: 'ui:theme', revision: 0 }), { status: 200, headers: { 'content-type': 'application/json' } })
+
+const sessionFetch = (writeResp: () => Response) => {
+  const calls: string[] = []
+  const fetch = async (input: string, init?: RequestInit): Promise<Response> => {
+    calls.push(new URL(input, 'http://stub').pathname)
+    if (input === '/healthz') return healthz('pg', true)
+    const method = (init?.method ?? 'GET').toUpperCase()
+    if (method === 'PUT' && input.startsWith('/api/user-state/')) return writeResp()
+    return emptyLists()
+  }
+  return { fetch, calls }
+}
+
+describe('G1-a R2 F5 — paused-401 resume(已认证 boot 自动重放)', () => {
+  it('session A 造 paused-401;session B 已认证 boot → 记录自动重放 + 删除', async () => {
+    // session A:putUserState 遇 401 → 队列暂停,记录留存 paused-401。
+    setPersistUserId('user-A')
+    const a = sessionFetch(userState401)
+    startPersistWriteQueue({ fetch: a.fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    useAuthStore.setState({ user: { id: 'user-A', name: 'A', avatar: null }, status: 'authenticated' })
+    const enq = enqueuePersistWrite({ kind: 'putUserState', key: 'ui:theme', value: 'dark' })
+    await enq
+    await flush()
+    await drainPersistQueue()
+    const afterA = await __dumpWritesForTest()
+    expect(afterA.length).toBe(1)
+    expect(afterA[0]!.status).toBe('paused-401')
+    // session A 结束:停队列实例(IDB 保留 paused-401 记录)。
+    stopPersistWriteQueue()
+    __resetPersistBoot()
+
+    // session B:replay 返 200;已认证 boot → start 恢复 paused + resume 重放。
+    setPersistUserId('user-A')
+    const b = sessionFetch(userState200)
+    useAuthStore.setState({ user: { id: 'user-A', name: 'A', avatar: null }, status: 'authenticated' })
+    await bootPersistWiring({ fetch: b.fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    // 重放触达 PUT /api/user-state/ui:theme(key 经 encodeURIComponent → ui%3Atheme)
+    expect(b.calls.some((c) => c.startsWith('/api/user-state/ui'))).toBe(true)
+    // 记录已删除(成功重放后 drain 删)
+    const afterB = await __dumpWritesForTest()
+    expect(afterB.length).toBe(0)
+  })
+
+  it('未认证 boot → 不 resume,记录仍 paused-401 保留', async () => {
+    // seed paused-401 via session A
+    setPersistUserId('user-A')
+    const a = sessionFetch(userState401)
+    startPersistWriteQueue({ fetch: a.fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    useAuthStore.setState({ user: { id: 'user-A', name: 'A', avatar: null }, status: 'authenticated' })
+    await (enqueuePersistWrite({ kind: 'putUserState', key: 'ui:theme', value: 'dark' }) ?? Promise.resolve())
+    await flush()
+    await drainPersistQueue()
+    stopPersistWriteQueue()
+    __resetPersistBoot()
+
+    // session B 未认证:boot durable 但 auth=unauthenticated → 不 resume
+    setPersistUserId(ANONYMOUS_USER_ID) // 未登录 → anonymous 命名空间
+    useAuthStore.setState({ user: null, status: 'unauthenticated' })
+    const b = sessionFetch(userState200)
+    await bootPersistWiring({ fetch: b.fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    // 不重放(未认证,user-A 的 paused-401 不被 anonymous 命名空间触达)
+    expect(b.calls.some((c) => c.startsWith('/api/user-state/ui'))).toBe(false)
+    const after = await __dumpWritesForTest()
+    expect(after.length).toBe(1)
+    expect(after[0]!.status).toBe('paused-401')
+  })
+
+  it('resumePersistQueue 已导出且未启动队列时 no-op(不抛)', async () => {
+    __resetPersistBoot()
+    await expect(resumePersistQueue()).resolves.toBeUndefined()
   })
 })

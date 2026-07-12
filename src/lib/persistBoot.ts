@@ -205,8 +205,8 @@ const applyServerRevision = async (op: WriteOp, outcome: { revision?: Revision }
  * onConflict 回灌:F1 —— create/update 成功后把服务端新 revision 写回 store,防下一次 strict update 陈旧。
  * @param opts 注入 fetch opts(测试用 Hono app.request / fetch 计数 stub);production 默认 getProductionFetchOptions()。
  */
-export const startPersistWriteQueue = (opts: FetchAdapterOptions = getProductionFetchOptions()): void => {
-  if (writeQueue) return
+export const startPersistWriteQueue = (opts: FetchAdapterOptions = getProductionFetchOptions()): Promise<void> => {
+  if (writeQueue) return Promise.resolve()
   const executor = createAdapterWriteExecutor(opts)
   writeQueue = createWriteQueue({
     executor,
@@ -223,10 +223,11 @@ export const startPersistWriteQueue = (opts: FetchAdapterOptions = getProduction
     // R2 F1:成功写回灌 revision/metaRevision,防 strict update 陈旧。
     onSuccess: applyServerRevision,
   })
-  void writeQueue.start().catch((error) => {
+  const startPromise = writeQueue.start().catch((error) => {
     debugLogger.error(SOURCE, `queue start failed: ${msg(error)}`)
   })
   debugLogger.log(SOURCE, `write queue started (mode=${getPersistMode()}; non-canvas domain G1-a wired, canvas/chat deferred)`)
+  return startPromise
 }
 
 /** 停队列(HMR / 测试清理)。生产常驻。 */
@@ -235,6 +236,16 @@ export const stopPersistWriteQueue = (): void => {
   writeQueue.stop()
   writeQueue = undefined
   debugLogger.log(SOURCE, 'write queue stopped')
+}
+
+/**
+ * G1-a R2 F5:恢复被 401 暂停的队列(清 paused + drain 重放 leftover paused-401 记录)。
+ * 队列未启动(local 模式 / boot 前)→ no-op(undefined);未暂停 → no-op(resume 内部守卫)。
+ * 由 bootPersistWiring 在已认证 boot 后调用,并由 authSlice 在 status→authenticated 时调用
+ * (覆盖 SSO re-login 后重载场景 + 未来 mid-session re-auth)。
+ */
+export const resumePersistQueue = async (): Promise<void> => {
+  await writeQueue?.resume()
 }
 
 // ── G1-a R2 F3:persist readiness 门控(fail-closed 防 memory 假持久)──────────────
@@ -288,10 +299,22 @@ export const bootPersistWiring = async (opts: FetchAdapterOptions = getProductio
   }
   if (getPersistMode() === 'server') {
     await hydrateFromServer(undefined, opts)
-    startPersistWriteQueue(opts)
+    await startPersistWriteQueue(opts)
   } else {
     // shadow:IDB 已 rehydrate(读源),此处 compare + 双写队列(mutation enqueue 同时写 BFF)
     await shadowCompareWithServer()
-    startPersistWriteQueue(opts)
+    await startPersistWriteQueue(opts)
+  }
+  // R2 F5:已认证 boot 时 resume 暂停的 401 记录。queue.start() 把 leftover paused-401 从 prior
+  // session 恢复后置 paused=true 拒 drain;此处 auth 已 hydrate,authenticated → resume 清 paused +
+  // drain 重放(记录成功后删);unauthenticated → 不 resume(记录仍 paused-401 保留,不重放)。
+  // dynamic import 防静态环(persistBoot↔authSlice)。
+  try {
+    const { useAuthStore } = await import('../store/authSlice')
+    if (useAuthStore.getState().status === 'authenticated') {
+      await resumePersistQueue()
+    }
+  } catch (error) {
+    debugLogger.warn(SOURCE, `post-start resume check failed: ${msg(error)}`)
   }
 }
