@@ -43,40 +43,104 @@ function serverModuleOf(rel) {
   if (parts.length >= 3 && parts[0] === 'server') return `${parts[0]}/${parts[1]}`
   return parts[0]
 }
-// 极简注释剥离(// 行 + /* */ 块,字符串/模板字面量感知),防注释内 `from '...'` 造成方向规则假阳性。
-function stripSourceComments(s) {
-  let out = '', i = 0, inStr = false, strCh = ''
-  while (i < s.length) {
-    const c = s[i], nx = s[i + 1]
-    if (inStr) {
-      out += c
-      if (c === '\\') { out += nx || ''; i += 2; continue }
-      if (c === strCh) inStr = false
-      i++; continue
-    }
-    if (c === '"' || c === "'" || c === '`') { inStr = true; strCh = c; out += c; i++; continue }
-    if (c === '/' && nx === '/') { while (i < s.length && s[i] !== '\n') i++; continue }
-    if (c === '/' && nx === '*') { i += 2; while (i < s.length && !(s[i] === '*' && s[i + 1] === '/')) i++; i += 2; continue }
-    out += c; i++
-  }
-  return out
-}
-const RE_GUARD_FROM = /\bfrom\s*['"](\.\.?\/[^'"]+)['"]/g
-const RE_GUARD_DYNAMIC = /\bimport\s*\(\s*['"](\.\.?\/[^'"]+)['"]\s*\)/g
-// side-effect 裸 import:`import './x'`(无 from 无 ())。A7a 返修 P2-2:原 FROM/DYNAMIC 两 regex
-// 都不命中此形态 → rule④ 可被 `import '../routes/r'` 绕过。补此 regex 收口。
-const RE_GUARD_SIDE = /\bimport\s+['"](\.\.?\/[^'"]+)['"]/g
-// 提取相对 import specifier(剔注释后)。
+// 轻量 lexer:逐字符扫描,跟踪 ' / " / ` / 注释状态,只在 code 状态识别 import token
+// (from '...' / import('...') / 裸 import '...'),提取相对 specifier。
+// A7a 第二轮返修 P2:原 stripSourceComments+regex 保留字符串内容 → 字符串/模板内的
+// `import '../routes/r'` 被当真实 import 误红守卫(sol 只读探针实证)。lexer 在
+// string/template/comment 状态跳过内容,只从 code 位置提取,根治字符串假阳性。
 function scanRelativeSpecs(content) {
-  const stripped = stripSourceComments(content)
   const specs = new Set()
-  RE_GUARD_FROM.lastIndex = 0
-  RE_GUARD_DYNAMIC.lastIndex = 0
-  RE_GUARD_SIDE.lastIndex = 0
-  let m
-  while ((m = RE_GUARD_FROM.exec(stripped)) !== null) specs.add(m[1])
-  while ((m = RE_GUARD_DYNAMIC.exec(stripped)) !== null) specs.add(m[1])
-  while ((m = RE_GUARD_SIDE.exec(stripped)) !== null) specs.add(m[1])
+  const n = content.length
+  let i = 0
+  // 状态:0=code, 1=lineComment, 2=blockComment, 3=strSingle, 4=strDouble, 5=strTemplate
+  let state = 0
+  const isIdent = (c) => !!c && /[A-Za-z0-9_$]/.test(c)
+  const isRelative = (s) => s.startsWith('./') || s.startsWith('../')
+  const isWs = (c) => c === ' ' || c === '\t' || c === '\n' || c === '\r'
+  // 从当前 i(指向开引号)读引号内 specifier;i 推进到闭合引号后;返回原文(不含引号)。
+  const readQuoted = () => {
+    const q = content[i]
+    i++ // 开引号
+    let s = ''
+    while (i < n) {
+      const c = content[i]
+      if (c === '\\') { s += content[i + 1] || ''; i += 2; continue } // 转义(路径无转义,防误判)
+      if (c === q) { i++; break }
+      s += c
+      i++
+    }
+    return s
+  }
+  // 检测 i 处是否为关键字 kw(左右均非 ident = 词边界)。
+  const atKeyword = (kw) => {
+    if (content[i] !== kw[0] || !content.startsWith(kw, i)) return false
+    if (isIdent(content[i + kw.length])) return false // 右边界(importA / fromB 不算)
+    if (i > 0 && isIdent(content[i - 1])) return false // 左边界(ximport / xfrom 不算)
+    return true
+  }
+  while (i < n) {
+    const c = content[i]
+    const nx = content[i + 1]
+    switch (state) {
+      case 0: // code
+        if (c === '/' && nx === '/') { state = 1; i += 2; continue }
+        if (c === '/' && nx === '*') { state = 2; i += 2; continue }
+        if (c === "'") { state = 3; i++; continue } // 字符串/模板字面量 → 跳过其内容(不入 specs)
+        if (c === '"') { state = 4; i++; continue }
+        if (c === '`') { state = 5; i++; continue }
+        // from <ws> '...' / "..."(static import/export ... from '...')
+        if (atKeyword('from')) {
+          let j = i + 4
+          while (j < n && isWs(content[j])) j++
+          if (content[j] === "'" || content[j] === '"') {
+            i = j
+            const s = readQuoted()
+            if (isRelative(s)) specs.add(s)
+            continue
+          }
+        }
+        // import( '...' (dynamic) / import '...' (bare side-effect)
+        if (atKeyword('import')) {
+          let k = i + 6
+          while (k < n && isWs(content[k])) k++
+          if (content[k] === '(') {
+            // dynamic import('...')
+            k++
+            while (k < n && isWs(content[k])) k++
+            if (content[k] === "'" || content[k] === '"') {
+              i = k
+              const s = readQuoted()
+              if (isRelative(s)) specs.add(s)
+              continue
+            }
+          } else if (content[k] === "'" || content[k] === '"') {
+            // bare side-effect import '...'
+            i = k
+            const s = readQuoted()
+            if (isRelative(s)) specs.add(s)
+            continue
+          }
+          // else: import { ... } / import type / import * — 由后续 from 分支提取,此处只前进
+        }
+        i++
+        continue
+      case 1: // line comment
+        if (c === '\n') state = 0
+        i++; continue
+      case 2: // block comment
+        if (c === '*' && nx === '/') { state = 0; i += 2; continue }
+        i++; continue
+      case 3: // str single
+      case 4: // str double
+        if (c === '\\') { i += 2; continue }
+        if ((state === 3 && c === "'") || (state === 4 && c === '"')) { state = 0; i++; continue }
+        i++; continue
+      case 5: // str template(简化:不递归 ${};模板内的 import 当字符串内容跳过)
+        if (c === '\\') { i += 2; continue }
+        if (c === '`') { state = 0; i++; continue }
+        i++; continue
+    }
+  }
   return [...specs]
 }
 // 把相对 spec 解析为 posix 仓内相对路径(仅路径规范化,不查 FS)。

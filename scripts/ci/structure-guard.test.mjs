@@ -134,6 +134,39 @@ describe('structure-guard rule ④ server 分层方向 (A7a-3)', () => {
     expect(exit).toBe(0)
     expect(out).not.toContain('[FAIL] server 分层方向')
   })
+
+  // A7a 第二轮返修 P2:RE_GUARD_SIDE 字符串假阳性——lexer 只从 code 位置提取,字符串/模板内的
+  // `import '...'` 当字符串内容跳过,不误红。3 CLEAN fixture:
+  it('CLEAN: 普通字符串含 `import "../routes/r"` 文本 → PASS(lexer 跳过字符串内容)', () => {
+    const root = makeFixture([
+      CHATSTORE,
+      { path: 'server/lib/x.ts', content: `const sample = "import '../routes/r'"\n` },
+    ])
+    const { exit, out } = runGuard(root)
+    expect(exit).toBe(0)
+    expect(out).not.toContain('[FAIL] server 分层方向')
+    expect(out).not.toContain('server/lib/x.ts')
+  })
+
+  it('CLEAN: 模板字符串含 `import "../routes/r"` 文本 → PASS(lexer 跳过模板内容)', () => {
+    const root = makeFixture([
+      CHATSTORE,
+      { path: 'server/lib/x.ts', content: "const sample = `import '../routes/r'`\n" },
+    ])
+    const { exit, out } = runGuard(root)
+    expect(exit).toBe(0)
+    expect(out).not.toContain('[FAIL] server 分层方向')
+  })
+
+  it('CLEAN: 裸 import 非 relative(`import "polyfill"`)→ PASS(非 ./ ../,非 routes back-edge)', () => {
+    const root = makeFixture([
+      CHATSTORE,
+      { path: 'server/lib/x.ts', content: "import 'polyfill'\n" },
+    ])
+    const { exit, out } = runGuard(root)
+    expect(exit).toBe(0)
+    expect(out).not.toContain('[FAIL] server 分层方向')
+  })
 })
 
 describe('structure-guard rule ① 扩面:src/app 入扫描 (A7a-3)', () => {
