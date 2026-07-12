@@ -1335,9 +1335,20 @@ export class PgPersistBackend implements PersistBackend {
       await trx.schema.dropTable('canvases').ifExists().execute()
       await trx.schema.dropTable('projects').ifExists().execute()
       await trx.schema.dropTable('persist_records').ifExists().execute()
+      // R2-P2-1:DP-6R P1-2 新表(migration 004)曾漏入 drop → __dropAllTables 实际不 fresh,to_regclass 仍在,
+      // 掩盖 004 CREATE/registry 错误。补入;无 FK(PK actor_id,canvas_id)独立 drop。
+      // **⚠ 未来 005+ 新表同样须加此处,否则 fresh-DB 测试继续掩盖 schema/registry 错误。**
+      await trx.schema.dropTable('chat_order_revisions').ifExists().execute()
       await trx.schema.dropTable('kysely_migration').ifExists().execute()
       await trx.schema.dropTable('kysely_migration_lock').ifExists().execute()
     })
+  }
+
+  /** Test-only:表是否存在(to_regclass IS NOT NULL);__dropAllTables fresh-DB 断言用(R2-P2-1:防新表漏入 drop 掩盖错误)。生产不用。 */
+  async __tableExists(name: string): Promise<boolean> {
+    await this.ready
+    const r = await sql<{ exists: string | null }>`SELECT to_regclass(${name}) AS exists`.execute(this.db)
+    return r.rows[0]?.exists != null
   }
 }
 
