@@ -578,6 +578,11 @@ export class InMemoryPermissionBackend implements PermissionBackend {
   }
 
   async recordCompensation(projectId: string, op: CompensationOp): Promise<CompensationIntent> {
+    // R6 锁序不变量(与 PG pgPermissionBackend.recordCompensation 对偶):PG 侧先锁 project 行 FOR UPDATE 再
+    //   写/插 compensations,以与 attemptCompensation critical section(project→compensation)统一锁序,消除反向
+    //   锁环(40P01 deadlock)。memory 单线程 JS 无真行锁、无并发 deadlock 风险,故此处不持锁;但语义上仍是
+    //   "先据 durable desired state 判 stale、再 mutate compensations"(stale 判定在 attemptCompensation 内,
+    //   此处 record 仅 supersede 对立 op + 插新代际)。保持注释一致以便双后端 review 时对齐 PG 锁序不变量。
     // P1-1 Test-only:record 故障注入(模拟"第一步提交后、record 前崩溃")。route 已 try/catch 包裹 →
     // 不阻断主操作;attempt 据 cascade_revoked_at marker 自收敛(无 pending 意图也能 derive)。
     const rf = this.compensationRecordFault[op] ?? 0

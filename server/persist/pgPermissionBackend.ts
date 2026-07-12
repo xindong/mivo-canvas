@@ -443,6 +443,16 @@ export class PgPermissionBackend implements PermissionBackend {
       // P1-3:pg_advisory_xact_lock 串行化同 (projectId,op) 的并发 record → 恰一条 pending(FOR UPDATE 对空结果不锁,
       // 原bug:两首建都 INSERT→多条 pending)。partial unique index UNIQUE(project_id,op) WHERE status='pending' 兜底。
       await sql`SELECT pg_advisory_xact_lock(hashtext(${projectId}), ${PgPermissionBackend.opLockKey(op)}::integer)`.execute(trx)
+      // R6 锁序统一(R5 verdict Step 4 暴露的 P2 反向锁环):先锁 project 行 FOR UPDATE,再写/插 compensations。
+      //   未修前 record 先 UPDATE supersede 持 compensation 行锁,再 INSERT 新 generation 触发 FK(project_id
+      //   REFERENCES projects(id))对 project 行请求 KEY SHARE;而 attemptCompensation critical section 先持
+      //   project FOR UPDATE 后持 compensation FOR UPDATE——形成 compensation→project 与 project→compensation 的
+      //   反向锁环,真 PG 确定性触发 40P01 deadlock。此处与 attempt critical section(project→compensation)统一同序,
+      //   消除环;INSERT 的 FK KEY SHARE 被已持的 FOR UPDATE(强锁)覆盖,无需额外获取。project 行不存在 → SELECT
+      //   返 0 行(无锁),后续 INSERT 仍按原逻辑抛 FK violation(line 487),行为不变。不得削弱 F1 TOCTOU 语义
+      //   (attempt critical 的 is_deleted 重读仍在自身 project FOR UPDATE 锁内,不受影响)。
+      // [R6-RED-PROOF] 已还原:40P01 在旧代码(摘掉此行)确定性复现,加回后绿(见 R6 barrier 测试)。
+      await sql`SELECT 1 FROM projects WHERE id = ${projectId} FOR UPDATE`.execute(trx)
       // P1-2 supersede:把 pending 对立 op mark superseded(保留行做历史;不再被 sweep/attempt 处理)。
       const opposite: CompensationOp = op === 'restore' ? 'delete' : 'restore'
       await trx.updateTable('share_link_compensations')

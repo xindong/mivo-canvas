@@ -387,4 +387,106 @@ const migrateWith = async (
       }
     })
   })
+
+  // R6 锁序 deadlock barrier(2026-07-12 R5 verdict Step 4 暴露的 P2 阻塞):
+  //   recordCompensation 先 UPDATE supersede 持 compensation 行锁,再 INSERT 新 generation 触发 FK(project_id
+  //   REFERENCES projects(id))对 project 请求 KEY SHARE;attemptCompensation critical section 先持 project
+  //   FOR UPDATE 后持 compensation FOR UPDATE——反向锁环,真 PG 确定性触发 40P01 deadlock。修法:record 开头
+  //   先锁 project FOR UPDATE,统一 project→compensation 锁序,消除环。
+  //   本测双事务 barrier 确定性交错:c1(raw,镜像 attempt critical 的 project→gen1 锁序)持 project FOR UPDATE,
+  //   等 1000ms 让 c2(真 backend.recordCompensation 生产代码)进入"持 gen1 + INSERT 阻塞于 project"稳态;
+  //   c1 再请求 gen1 FOR UPDATE——旧代码成环→40P01(红),修复后 c2 先阻于 project→gen1 无人持→c1 取得+提交→
+  //   c2 随后取得 project→supersede+INSERT,无 deadlock(绿)。c1 设 deadlock_timeout=200ms 加速检测。
+  //   最终收敛(真 backend sweep):primary delete 提交(is_deleted=true)→仅最新 gen2 done、gen1 superseded、
+  //   link 跟随 is_deleted 翻 revoked。memory 单线程无真锁→无 deadlock 风险,本测 PG-only。
+  describe('R6 锁序 deadlock barrier:record ↔ attempt 反向锁环(真 PG 双事务确定性交错)', () => {
+    let backend: PgPermissionBackend
+    let barrierPool: Pool
+    beforeAll(async () => {
+      const admin = makeKysely()
+      await resetSchema(admin)
+      await admin.destroy()
+      backend = new PgPermissionBackend(cfg)
+      await backend.ready
+      barrierPool = new Pool({ ...cfg, max: 2 })
+    })
+    afterAll(async () => {
+      if (backend) await backend.destroy()
+      if (barrierPool) await barrierPool.end()
+    })
+
+    it('record 与 attempt 确定性交错无 40P01;最终仅最新 generation 完成,link 跟随 projects.is_deleted', async () => {
+      const pid = 'p-r6-deadlock'
+      await backend.__reset()
+      await backend.__seedProjectForTest(pid, 'ownerA')
+      await backend.__setProjectDeletedForTest(pid, false) // restore desired(对立 op=delete 才 supersede gen1)
+      const link = await backend.createShareLink(pid, 'view', 'ownerA') // active link(无 cascade marker)
+      expect((await backend.resolveShareLink(link.token, pid))?.kind).toBe('active')
+      await backend.recordCompensation(pid, 'restore') // gen1 pending restore(c2 record delete 的 supersede 目标)
+      const gen1 = (await backend.listCompensations(pid)).find((i) => i.op === 'restore' && i.generation === 1)!
+      expect(gen1.status).toBe('pending')
+
+      // 两条 raw pg 连接:c1 镜像 attempt critical 锁序(持 project→请求 gen1);c2 仅作 projectHeld 信号桥,
+      //   真正的 record 侧由 backend.recordCompensation 生产代码驱动(测真代码,非 raw 重放)。
+      const c1 = await barrierPool.connect()
+      let signalProject!: () => void
+      const projectHeld = new Promise<void>((r) => { signalProject = r })
+
+      // c1 = attempt critical section 锁序镜像:先 SELECT project FOR UPDATE(持 project 行锁),等待 c2(record)
+      //   进入"持 gen1(supersede UPDATE)+ INSERT 阻塞于 project"稳态,再 SELECT gen1 FOR UPDATE 构造反向环。
+      //   修复后 record 先阻于 project(FIX SELECT...FOR UPDATE)→ gen1 无人持 → c1 取得 gen1 + 提交 → 无 deadlock。
+      const c1Promise = (async () => {
+        try {
+          await c1.query("SET deadlock_timeout = '200ms'") // 加速 OLD 代码 deadlock 检测(200ms 触发)
+          await c1.query('BEGIN')
+          await c1.query('SELECT is_deleted FROM projects WHERE id = $1 FOR UPDATE', [pid])
+          signalProject() // project 行锁已持,放行 c2
+          // 等 c2(真 record)进入稳态:旧代码→supersede 持 gen1 + INSERT 阻塞于 c1 的 project;新代码→阻塞于 project。
+          await new Promise((r) => setTimeout(r, 1000))
+          await c1.query('SELECT id FROM share_link_compensations WHERE id = $1 FOR UPDATE', [gen1.id])
+          await c1.query('COMMIT')
+          return { side: 'attempt' as const, ok: true, code: null as string | null }
+        } catch (e: unknown) {
+          await c1.query('ROLLBACK').catch(() => {})
+          const code = (e as { code?: string } | undefined)?.code ?? null
+          return { side: 'attempt' as const, ok: code === null, code }
+        } finally {
+          c1.release()
+        }
+      })()
+
+      // c2 = 真生产代码 backend.recordCompensation(pid, 'delete'):advisory → [FIX: project FOR UPDATE] →
+      //   supersede gen1(持 compensation 行锁)→ INSERT gen2(FK KEY SHARE→project)。测真代码锁序。
+      const c2Promise = (async () => {
+        await projectHeld // 等 c1 先持 project,构造反向环前提
+        try {
+          await backend.recordCompensation(pid, 'delete')
+          return { side: 'record' as const, ok: true, code: null as string | null }
+        } catch (e: unknown) {
+          const code = (e as { code?: string } | undefined)?.code ?? null
+          return { side: 'record' as const, ok: code === null, code }
+        }
+      })()
+
+      const [r1, r2] = await Promise.all([c1Promise, c2Promise])
+      // 核心断言:无 40P01 deadlock(旧代码:一侧 40P01 → 红;修复:两侧均成功 → 绿)
+      const deadlock = r1.code === '40P01' || r2.code === '40P01'
+      expect(deadlock, `r1=${JSON.stringify(r1)} r2=${JSON.stringify(r2)}`).toBe(false)
+      // 两侧不得有非 deadlock 的意外错误
+      const unexpected = [r1, r2].filter((r) => !r.ok && r.code !== '40P01')
+      expect(unexpected, `unexpected=${JSON.stringify(unexpected)}`).toHaveLength(0)
+
+      // 最终收敛(真 backend 驱动):primary delete 已提交 → sweep 收敛 gen2 done、gen1 superseded、link revoked。
+      await backend.__setProjectDeletedForTest(pid, true)
+      const sw = await backend.sweepCompensations()
+      expect(sw.failed).toBe(0)
+      const ints = await backend.listCompensations(pid)
+      const gen2 = ints.find((i) => i.op === 'delete' && i.generation === 2)
+      const gen1Final = ints.find((i) => i.op === 'restore' && i.generation === 1)
+      expect(gen2?.status).toBe('done') // 仅最新 generation 完成
+      expect(gen1Final?.status).toBe('superseded') // 旧代际被取代(非 done)
+      // link 跟随 projects.is_deleted(true → revoked):delete sweep 的 revokeAll 副作用把 active link 翻 revoked
+      expect((await backend.resolveShareLink(link.token, pid))?.kind).toBe('revoked')
+    }, 30000)
+  })
 })
