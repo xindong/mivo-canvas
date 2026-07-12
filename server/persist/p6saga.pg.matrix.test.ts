@@ -489,4 +489,87 @@ const migrateWith = async (
       expect((await backend.resolveShareLink(link.token, pid))?.kind).toBe('revoked')
     }, 30000)
   })
+
+  // R8 形状守卫(PgPermissionBackend.ready migrate 后 information_schema 校验)。
+  // 防:运维误建残缺表(如已删 002 死草案形态)→ 005 CREATE TABLE IF NOT EXISTS 跳过不补列,
+  // kysely_migration 仍标 005 applied → migrateToLatest no-op → 表残缺。ready 阶段 fail-closed 拒启动
+  // (ready reject → index.ts start() 的 Promise.all([persist.ready, permission.ready]) reject →
+  // start().catch → console.error('[mivo-bff] startup failed:', err) + process.exit(1),同 G2.1 startup gate)。
+  describe('R8 形状守卫:残缺表/退化 CHECK → ready 必抛带列名;完整表 → ready 绿', () => {
+    it('RED 列缺失:002 死草案形态 + 完整 migrateToLatest(005 跳过不补列,006/007 跑)→ ready 抛含 generation/claimed_at/claimed_until', async () => {
+      const admin = makeKysely()
+      await resetSchema(admin)
+      // 先建 projects(补偿表 FK 引用;001 CREATE TABLE IF NOT EXISTS 跳过,同形态无冲突)。
+      await sql`CREATE TABLE projects (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, is_deleted BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now())`.execute(admin)
+      // 002 死草案形态(见已删 002_compensations.sql):缺 generation/claimed_at/claimed_until/claim_token,status CHECK 只 pending/done。
+      await sql`
+        CREATE TABLE share_link_compensations (
+          id TEXT PRIMARY KEY,
+          project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          op TEXT NOT NULL CHECK (op IN ('restore','delete')),
+          status TEXT NOT NULL CHECK (status IN ('pending','done')),
+          attempt_count INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          last_attempted_at TIMESTAMPTZ,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+      `.execute(admin)
+      // 完整 migrateToLatest:005 CREATE TABLE IF NOT EXISTS 跳过(表已存在,不补 generation/claimed_at/claimed_until);
+      //   006 ALTER CHECK 加 superseded/failed;007 ADD COLUMN IF NOT EXISTS claim_token(补回 claim_token)。
+      await migrateWith(admin, migrations)
+      await admin.destroy()
+
+      const broken = new PgPermissionBackend(cfg)
+      let thrown: unknown
+      try {
+        await broken.ready
+      } catch (e) {
+        thrown = e
+      }
+      expect(thrown).toBeInstanceOf(Error)
+      const msg = thrown instanceof Error ? thrown.message : String(thrown)
+      expect(msg).toContain('share_link_compensations')
+      expect(msg).toMatch(/missing columns/i)
+      expect(msg).toContain('generation')
+      expect(msg).toContain('claimed_at')
+      expect(msg).toContain('claimed_until')
+      // claim_token 被 007 ADD COLUMN IF NOT EXISTS 补回 → 不在缺失列中(仅 generation/claimed_at/claimed_until 缺)。
+      await broken.destroy()
+    })
+
+    it('RED status CHECK 退化:列齐但 CHECK 只 pending/done → ready 抛含 superseded/failed', async () => {
+      const admin = makeKysely()
+      await resetSchema(admin)
+      await migrateWith(admin, migrations) // 完整 001..007 → 13 列齐 + status CHECK 4 值
+      // 退化 status CHECK:DROP 006 的 4 值约束,重建为只 pending/done(模拟 006 未跑/被回退)。
+      await sql`ALTER TABLE share_link_compensations DROP CONSTRAINT IF EXISTS share_link_compensations_status_check`.execute(admin)
+      await sql`ALTER TABLE share_link_compensations ADD CONSTRAINT share_link_compensations_status_check CHECK (status IN ('pending','done'))`.execute(admin)
+      await admin.destroy()
+
+      const broken = new PgPermissionBackend(cfg)
+      let thrown: unknown
+      try {
+        await broken.ready
+      } catch (e) {
+        thrown = e
+      }
+      expect(thrown).toBeInstanceOf(Error)
+      const msg = thrown instanceof Error ? thrown.message : String(thrown)
+      expect(msg).toContain('status CHECK')
+      expect(msg).toMatch(/missing values/i)
+      expect(msg).toContain('superseded')
+      expect(msg).toContain('failed')
+      await broken.destroy()
+    })
+
+    it('GREEN:reset + 完整 migrate → 13 列齐 + status CHECK 4 值 → ready 绿', async () => {
+      const admin = makeKysely()
+      await resetSchema(admin)
+      await admin.destroy()
+      const full = new PgPermissionBackend(cfg)
+      await expect(full.ready).resolves.toBeUndefined()
+      await full.destroy()
+    })
+  })
 })

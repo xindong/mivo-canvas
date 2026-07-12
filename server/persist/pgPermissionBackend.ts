@@ -157,6 +157,31 @@ export const runPermissionMigrations = async (db: Kysely<PermissionDatabase>): P
   }
 }
 
+// R8 形状守卫(2026-07-12):005/006/007 是补偿表权威 DDL(server/persist/migrations.ts)。
+// 删 002 死草案后仍可能运维误建残缺表 → 005 CREATE TABLE IF NOT EXISTS 跳过不补列(表已存在),
+// kysely_migration 却标 005 applied → migrateToLatest no-op → 表维持残缺。ready 阶段 information_schema
+// 校验必需列集 + status CHECK 域,任一缺失 fail-closed 拒启动(清单以 migrations.ts 005-007 实际 DDL 逐列核对写死)。
+const COMPENSATIONS_REQUIRED_COLUMNS = [
+  'id',
+  'project_id',
+  'op',
+  'status',
+  'generation', // 005(P1-2 代际 supersede)
+  'attempt_count',
+  'last_error',
+  'last_attempted_at',
+  'claimed_at', // 005(P2-1 attempt 租约起点)
+  'claimed_until', // 005(P2-1 租约到期)
+  'claim_token', // 007(R3-F4 claim fencing token)
+  'created_at',
+  'updated_at',
+] as const
+// 006 ALTER CHECK 加 'superseded'(P1-2)+ 'failed'(R3-F2 sweep 超限 dead-letter)。
+const COMPENSATIONS_REQUIRED_STATUS_VALUES = ['pending', 'done', 'superseded', 'failed'] as const
+
+/**
+ * PgPermissionBackend:PG 权限层后端。drop-in 实现 PermissionBackend;路由零改动。
+
 /**
  * PgPermissionBackend:PG 权限层后端。drop-in 实现 PermissionBackend;路由零改动。
  * 单实例 BFF 假设(无全局缓存;多实例协作留 T1.4+,同 PgPersistBackend)。
@@ -199,6 +224,7 @@ export class PgPermissionBackend implements PermissionBackend {
   /** migrate-then-ready(可重放;migrator 自带 kysely_migration 追踪表)。 */
   private async init(): Promise<void> {
     await this.migrate()
+    await this.verifyCompensationsShape()
   }
 
   /** 优雅关闭连接池(app shutdown 用)。F2:shared pool 时不销毁(由拥有者释放),own pool 时 db.destroy 连带销毁。 */
@@ -224,6 +250,53 @@ export class PgPermissionBackend implements PermissionBackend {
   /** 对本 backend 的 db 跑 migrateToLatest(可重放)。测试 beforeAll + 生产 runbook 用。 */
   async migrate(): Promise<void> {
     await runPermissionMigrations(this.db)
+  }
+
+  /**
+   * R8 形状守卫:migrate() 成功后,information_schema 校验 share_link_compensations 必需列集
+   * + status CHECK 域。任一缺失抛带列名/值的明确错误(fail-closed,不静默)。
+   *
+   * 防的是:migrateToLatest 会把 005 标记成 applied 即便其 CREATE TABLE IF NOT EXISTS 因表已存在
+   * 而跳过(不补列)——典型成因是运维误建残缺表(如已删的 002 死草案形态,缺 generation/
+   * claimed_at/claimed_until)。终态表残缺却"migrations 全绿",counts 查缺列抛(R7 已摘流量),
+   * 但 recordCompensation 跑缺列更早挂;本守卫在启动 ready 阶段就拒,先于任何业务请求。
+   *
+   * 抛错路径:ready Promise reject → index.ts start() 的 Promise.all([persist.ready,
+   * permission.ready]) reject → start().catch → console.error('[mivo-bff] startup failed:', err)
+   * + process.exit(1)(与 G2.1 strict owner-migration gate 同格局)。memory 后端无此方法(无 PG
+   * schema,no-op 语义由其恒-resolve 的 ready 兜底)。
+   */
+  private async verifyCompensationsShape(): Promise<void> {
+    // 列集校验:information_schema.columns 取现存列,与必需清单(以 migrations.ts 005-007 DDL 为准)求差。
+    const cols = (await sql`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_name='share_link_compensations'
+    `.execute(this.db)).rows as { column_name: string }[]
+    const present = new Set(cols.map((r) => r.column_name))
+    const missing = COMPENSATIONS_REQUIRED_COLUMNS.filter((c) => !present.has(c))
+    if (missing.length > 0) {
+      throw new Error(
+        `[PgPermissionBackend] share_link_compensations shape guard failed: missing columns [${missing.join(', ')}]. ` +
+          `Required (migrations.ts 005/006/007 DDL): [${COMPENSATIONS_REQUIRED_COLUMNS.join(', ')}]. ` +
+          `Likely cause: a stale draft table was applied manually (e.g. the deleted 002_compensations.sql), ` +
+          `then 005 CREATE TABLE IF NOT EXISTS skipped adding the missing columns. ` +
+          `Drop the table and re-run migrateToLatest from a clean state.`,
+      )
+    }
+    // status CHECK 域校验:pg_get_constraintdef 取全部 CHECK 定义,校验含 005+006 终态 4 值。
+    const checks = (await sql`
+      SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint
+      WHERE conrelid='share_link_compensations'::regclass AND contype='c'
+    `.execute(this.db)).rows as { def: string }[]
+    const checkDefs = checks.map((r) => r.def).join(' ')
+    const missingStatus = COMPENSATIONS_REQUIRED_STATUS_VALUES.filter((s) => !checkDefs.includes(s))
+    if (missingStatus.length > 0) {
+      throw new Error(
+        `[PgPermissionBackend] share_link_compensations shape guard failed: status CHECK missing values [${missingStatus.join(', ')}]. ` +
+          `Required: ('pending','done','superseded','failed') (005 + 006 ALTER CHECK). ` +
+          `Likely cause: migration 006 (compensation_failed_status) not applied. Re-run migrateToLatest.`,
+      )
+    }
   }
 
   // ── 成员资格(project_members)──────────────────────────────────────────────────────────
