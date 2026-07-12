@@ -107,6 +107,18 @@ npm test -- src/lib/serverPersistAdapter.contract.test.ts server/persist/backend
 
 > 注:**"无双协议窗口"仍成立**(原子 cutover + #194 unwired → 原地演进,无双 endpoint 并存);但"零破坏"不成立(逐文件 12 项 + FX-5 迁移 + 117 项回归)。Gate6 判决据此(§2 Gate6)。
 
+**cutover 状态表(R3 唯一可执行协议;契约测试命令 = §1.2 的 117 项回归 + grep 调用面审计,已 dry-run:grep 149 匹配 / 5 测试文件全在)**:
+
+| 场景 | flag / 时机 | 客户端发 | 服务端行为 | 状态码 | 客户端动作 |
+|---|---|---|---|---|---|
+| old client(旧 body)→ 新 server | `FIELD_LEVEL_OPS=on`(cutover 后) | 整 record payload(旧 shape) | `validateChildPayload` 拒(非 `DomainOp` shape) | **400 `payload-rejected`** | refetch 全量 → 重发新 op(非 409 重放) |
+| old queue(FX-5 IDB 旧 queued body) | cutover 后 drain 队列 | 旧 queued `NodePayload` | migration-on-read:旧 body → 新 op schema 转换 | 200 ok(转换后) | 客户端无感(队列 drain 时转换) |
+| new server(新 op schema) | `FIELD_LEVEL_OPS=on` | `DomainOp` / `DomainOp[]` | field-level merge + bump revision/seq | 200 `{id,revision,seq}` | 正常 |
+| new op + stale base(并发不同字段) | 运行时 | `DomainOp`(base 落后) | LWW 后写 wins + `overwritten` 推前写者(G4-4 不拒写) | 200 + overwritten(非 409) | 前写者收 overwritten → 可选 `restore` |
+| rollback(flag off) | `FIELD_LEVEL_OPS=off` | 新 op(若有)→ 反向转旧 body | 切回整 record decoder;FX-5 migration 可逆(新 op → 旧 body 反向转换) | 200(旧 shape) | 新 op 反向转换回旧 body,无丢失 |
+
+> 全文不再有 "versioned payload 或原子 cutover" / "versioned/原子" 二选一残句;cutover = **原子**(§1.2 拍死)。stale-client(旧 body schema 不匹配)唯一状态码 = **400 `payload-rejected`**;409 revision-conflict 是 #194 envelope 复用码(`parseIfMatch`),新 field-level 协议 G4-4 明确 base 落后不拒写(200),故 stale-client 场景无 409(§1.2 状态表 / §10.2 / §10.9 / §2 Gate6 一致)。
+
 ---
 
 ## 2. 七 gate 重评分(每项:证据强度 + v1→v2 修正 + go/no-go)
@@ -193,9 +205,9 @@ npm test -- src/lib/serverPersistAdapter.contract.test.ts server/persist/backend
 
 **证据**:`G4-1`(不同字段双留)、`G4-2`(嵌套叶子双留)、`G4-3`(428)、`G4-4`(base 落后不同字段→接受);▲lead 核证 #194 route 注册 + shared contract 冻结 + FX-5 payload(§1.2)。
 
-**成本**:方案 A 改 `validateChildPayload` + `upsertChild`(field-level merge)+ 契约测试 + **FX-5 队列迁移**(旧 body→新 op schema)+ cutover 策略(versioned payload 或原子 cutover)。方案 B 付双 endpoint 税。
+**成本**:方案 A 改 `validateChildPayload` + `upsertChild`(field-level merge)+ 契约测试 + **FX-5 队列迁移**(旧 body→新 op schema)+ cutover 策略(**原子 cutover**,§1.2 拍死,非 versioned payload)。方案 B 付双 endpoint 税。
 
-**go/no-go**:**方案 A GO**。理由:#194 前端主路径未接线(`unwiredServerPersistAdapter`),**无双协议窗口**成立;方案 B 的"不动 #194"优势在 #194 已上线生产时才成立,目前 #194 前端未接线——方案 B 付双 endpoint 税却无收益。但**破坏面非零**,cutover 须选 versioned payload 或原子 cutover(§1.2)。方案 A 直接产出 N2-1 契约(§10)。
+**go/no-go**:**方案 A GO**。理由:#194 前端主路径未接线(`unwiredServerPersistAdapter`),**无双协议窗口**成立;方案 B 的"不动 #194"优势在 #194 已上线生产时才成立,目前 #194 前端未接线——方案 B 付双 endpoint 税却无收益。但**破坏面非零**,cutover 已拍死**原子**(§1.2,非 versioned payload/无双 decoder 兼容窗)。方案 A 直接产出 N2-1 契约(§10)。
 
 ### Gate 5 · 实时 transport + auth spike(网关 gate)— P1-5 真实 SSE
 
@@ -237,7 +249,7 @@ npm test -- src/lib/serverPersistAdapter.contract.test.ts server/persist/backend
 | #194 wire 迁移 | 未接线→原地演进为 field-level ops,**无双协议窗口**;但**契约/服务端破坏面非零**(§1.2) | legacy PATCH↔Y.Update bridge + per-canvas flag = 真双协议窗口 |
 | PG schema | JSONB payload 不透明(已如此);field-level merge 是 server 逻辑 | Y.Doc state 需新存储形态 |
 | FX-5 | **v1 "FX-5 不动"错**:WriteOp 持全 NodePayload(▲lead 核证),旧 IDB queued body 打新 endpoint = 400 `payload-rejected`;需 FX-5 队列迁移 | offline edit 队列与 FX-5 关系需定 |
-| stale-client | 409 revision-conflict → refetch + 重放 | state-vector 比对 |
+| stale-client | 旧 body→新 endpoint = **400 `payload-rejected`** → refetch(非 409);新 op + stale base(并发)= 200 + `overwritten`(G4-4 不拒写,非 409)— 两场景区分见 §1.2 状态表 | state-vector 比对 |
 
 **证据**:▲lead 核证 #194 route 注册 + shared contract 冻结 + FX-5 payload(§1.2);`G4-3` 428/409 envelope;`G7-1` ?since=seq 补拉。
 
@@ -426,7 +438,7 @@ type TrustedFieldOp = { opId; clientId; actor(trusted); recordId(trusted); baseR
 - `PATCH /api/canvas/:id/nodes/:nodeId` — payload = `DomainOp` 或 `DomainOp[]`(batch 同 record,**原子:全 ok 或全 reject**,S10-5)。
 - If-Match: `baseRevision`(400/428/409 复用 #194 `parseIfMatch`)。
 - 响应:`{ id, revision, seq }`(`UpsertResponse` 扩 `seq`;打破 exact type test,契约测试重写)。
-- **cutover**:versioned payload(新旧 decoder 兼容窗)或原子 cutover + FX-5 队列迁移(§1.2)。
+- **cutover**:**原子 cutover**(§1.2 拍死;非 versioned payload,无双 decoder 兼容窗)+ FX-5 队列 migration-on-read + stale client 旧 body → 400 `payload-rejected`(见 §1.2 cutover 状态表)。
 
 ### 10.3 服务端合并(field-level LWW,非整 record 替换)
 
@@ -468,8 +480,8 @@ type TrustedFieldOp = { opId; clientId; actor(trusted); recordId(trusted); baseR
 ### 10.9 迁移 / 双协议窗口 / 破坏面
 
 - **无双协议窗口**(gate 6):#194 前端未接线→原地演进;PG JSONB payload 不透明不动。
-- **破坏面非零**(§1.2):≥12 文件 + FX-5 队列迁移(旧 body→新 op schema,400 payload-rejected 非 409 refetch)+ 117 项定向回归 + cutover 策略。
-- stale-client:409→refetch + 重放。
+- **破坏面非零**(§1.2):≥12 文件 + FX-5 队列 migration-on-read(旧 queued body→新 op schema 转换)+ stale client 旧 body 打新 endpoint → 400 `payload-rejected`(非 409 refetch)+ 117 项定向回归 + cutover 策略(原子,§1.2)。
+- stale-client(旧 body 打新 endpoint):**400 `payload-rejected` → refetch**(非 409);409 revision-conflict 是 #194 envelope 复用码(parseIfMatch),新 field-level 协议 G4-4 明确 base 落后不拒写(200),故 stale-client 无 409(见 §1.2 cutover 状态表)。
 
 ---
 
@@ -496,7 +508,7 @@ type TrustedFieldOp = { opId; clientId; actor(trusted); recordId(trusted); baseR
 | 20k 节点高频 update 渲染性能 | N2-1/N2-2 | 复用 §12 风险4 的 26.7ms p95 基线,N2-2 做 pan bench(对齐 N1 §4 未验证项) |
 | per-field clock 精确 stale 判定 | N2-1 实装 | 持久形态已定死(S10-4);生产加 per-field clock 做精确 stale(契约 §10.3) |
 | canvas 文本同段共编真实需求 | 未来 | 若出现,N2-1 后对 `text` 单字段局部引入 OT/CRDT(不拖全局);v2 文本判决 B 已给 overwritten+restore 兜底 |
-| #194 cutover 破坏面实际调用面 | gate4/gate6 | ▲lead 已核证 route 注册 + FX-5 payload + shared contract(§1.2);cutover 前补全量调用面审计 + versioned/原子 cutover 策略 |
+| #194 cutover 破坏面实际调用面 | gate4/gate6 | ▲lead 已核证 route 注册 + FX-5 payload + shared contract(§1.2);cutover 前补全量调用面审计 + 原子 cutover 策略(§1.2 拍死,非 versioned) |
 
 ---
 
