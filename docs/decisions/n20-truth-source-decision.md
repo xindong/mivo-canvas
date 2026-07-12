@@ -10,7 +10,7 @@
 > - `server/__tests__/n20-sse-route.spike.test.ts`(9 tests,真实 Hono SSE route 集成 + R2-2 live push 5-7 + desiredSize backpressure + **R3 F3:真实 resolveActor/canAccessCanvas authz seam(替代 fake secret,错 proof → 404 no-leak 非 401)+ 5-8 slow-reader response body 恢复**;**R5 F3:5-9 post-revoke write 拒绝(同 Hono harness 加真实 authz seam PATCH write route,bob 撤权 → SSE revoke/close + write 404 no-leak + owner write 200)**)
 > - `server/__tests__/n20-pg-tx-fault.spike.test.ts`(8 tests,真实 PG transaction fault injection + R2-1 同一 client pool.connect+finally release;PG-T3 改名同库资产元数据;**R3 F2:PG-T5 field_clock 持久 / PG-T7 strict-tx 跨 record**;**R5 F2:PG-T6 真实领域 replay path(单事务原子写 record+seq+event+idem row → destroy pool → 重连 replay 同 key 不二次 bump revision/seq/event)+ PG-T6b 首次事务 fault/rollback(领域写+idem row 同事务原子)**)
 >
-> **58 pass / 0 skip / 0 fail**(本地 PG port 55443 实跑,PG-T1~T7 同 client 真 pass;PG-T5/T6/T7 真 PG 持久/跨 record);`tsc -b` 0 errors;`eslint` 干净;`npm run build` exit 0;`grep -roE 'yjs|lib0|YEvent|applyUpdate|AbstractType|encodeStateAsUpdate' dist/` **零命中**(yjs 不进生产 bundle)。
+> **65 pass / 0 skip / 0 fail**(spike 48 + SSE 9 + PG 8;本地 PG port 55443 实跑,PG-T1~T8 同 client 真 pass;PG-T5/T6/T6b/T7 真 PG 持久/跨 record/真实 replay);`tsc -b` 0 errors;`eslint` 干净;`npm run build` exit 0;`grep -roE 'yjs|lib0|YEvent|applyUpdate|AbstractType|encodeStateAsUpdate' dist/` **零命中**(yjs 不进生产 bundle)。
 >
 > **倾向 Figma 式,但措辞降级为"基于现有底座与迁移成本的推荐"(R2 纲)** — 非"七 gate 全 GO 的充分判据";Gate3/7 平局、Gate5 条件式。v1→v3 优势缩窄但不反转。结论见 §0,被推翻/修正表述见 §3。
 
@@ -27,7 +27,7 @@
 2. **Yjs 移植成本 = 拆已建成的写路径 + 双真相源调和**:N1 §3.1 实证 `revision ↔ Yjs` 双真相源背离;本 spike `antiYjs-坑5` 复现背离、`antiYjs-坑7` 复现 clear+rebuild 吞子字段(§9)。
 3. **跨介质/跨 doc 事务:Gate3 平局(R2-1)**:intra-doc/intra-DB 原子两案一致(G3-real-1 真 Yjs doc.transact / PG-T1~T3 同一 client 已验);**跨介质 Figma=saga 补偿非真原子、Yjs=无方案** — 非相对优势(原 v2 "Figma 占优"降为平局)。PG-T3 改名"同库资产元数据"(非跨介质)。
 4. **revoke 简单 + 可预测存储控制(非"存储更小"):Gate7 平局(R2-7)**:G7-hard-4 ★真测 Yjs 有 GC 时 bytes 更小(yjsWithGc=58B < figmaCompressed=8637B);G7-hard-1~3 降 ●/○(自建 server 无 Yjs 对照,原标 ★ 虚标)。Figma 真实优势 = revoke 简单(●/○ 设计推理,非 Yjs 对照实证)+ 可预测控制 — 非相对存储优势。
-5. **Figma 不依赖 WS 网关验证:Gate5 条件式 GO(R2-2)**:REST+SSE 走 plain HTTP(5-1~7 真验 live push+desiredSize backpressure+gateway-secret authz seam);网关 SSE buffering/超时 = ○条件式留 lead 生产实测(§12),非"无需验证";Yjs y-protocol 需双向 WS(网关 WS 放行亦条件式)。不影响 Figma 选型(SSE fallback 兜底)。
+5. **Figma 不依赖 WS 网关验证:Gate5 条件式 GO(R2-2)**:REST+SSE 走 plain HTTP(5-1~9 真验 live push+desiredSize backpressure+gateway-secret authz seam+post-revoke write 拒绝);网关 SSE buffering/超时 = ○条件式留 lead 生产实测(§12),非"无需验证";Yjs y-protocol 需双向 WS(网关 WS 放行亦条件式)。不影响 Figma 选型(SSE fallback 兜底)。
 
 | # | hard gate | 判决 | 证据强度 | v1→v3 变化 |
 |---|---|---|---|---|
@@ -35,7 +35,7 @@
 | 2 | 多人 undo/redo | **Figma GO** | ★真实库对照(M1-M6 真 Y.UndoManager) | 修正 naive inverse bug;条件逆运算语义对齐真 Yjs |
 | 3 | 跨 record 事务 | **平局**(R2-1) | ★真实库对照(G3-real)+ ●真实 PG(PG-T 同 client) | intra 原子两案一致;跨介质 Figma=saga 非真原子、Yjs=无方案;PG-T3 改名同库资产元数据;**v2 "Figma 占优"→v3 平局**(诚实) |
 | 4 | revision×属性 LWW | **方案 A GO** | ●集成(G4)+ ▲lead 核证 | "零破坏"→"前端未接线但契约/服务端破坏面非零";§1.2 inventory **逐文件 + cutover 拍死**(R2-6) |
-| 5 | 实时 transport+auth | **条件式 GO**(R2-2) | ●真实集成(5-1~8 Hono SSE) | G5-1~8 真实 SSE(**live push 5-7 + desiredSize backpressure 5-6 + R3 F3 真实 resolveActor/canAccessCanvas authz seam 5-5(404 no-leak)+ slow-reader 恢复 5-8**);网关 SSE buffering = ○条件式留 lead(非"无需验证") |
+| 5 | 实时 transport+auth | **条件式 GO**(R2-2) | ●真实集成(5-1~9 Hono SSE) | G5-1~9 真实 SSE(**live push 5-7 + desiredSize backpressure 5-6 + R3 F3 真实 resolveActor/canAccessCanvas authz seam 5-5(404 no-leak)+ slow-reader 恢复 5-8 + R5 F3 post-revoke write 拒绝 5-9**);网关 SSE buffering = ○条件式留 lead(非"无需验证") |
 | 6 | 迁移/双协议窗口 | **Figma GO** | ▲lead 核证 + ○分析 | "无双协议窗口"成立;但"零破坏"推翻 → 破坏面 inventory(§1.2 逐文件)+ cutover 拍死原子方案(R2-6) |
 | 7 | seq/补拉/压缩/revoke/存储 | **平局**(R2-7) | ★真实库对照(G7-hard-4)+ ●/○(G7-hard-1~3 自建 server) | G7-hard-1~3 降 ●/○(自建 server 无 Yjs 对照,原 ★ 虚标);G7-hard-4 ★真测 Yjs 更小;优势改为 revoke 简单(●/○ 非对照)+ 可预测控制 — **v2 "Figma GO"→v3 平局** |
 
@@ -46,7 +46,7 @@
 | 标记 | 含义 | 本决策的此类证据 |
 |---|---|---|
 | ★ | 真实库对照 | 真实 `yjs` / `Y.UndoManager` / `Y.Doc.transact` / `encodeStateAsUpdate` 跑同矩阵(M1-M6 / G3-real / G7-hard-4 / antiYjs) |
-| ● | 集成测试 | 真实 Hono SSE route(5-1~6)/ 真实 PG transaction fault injection(PG-T1~T7)/ FieldLevelServer 集成(G4/G7/S10/T1) |
+| ● | 集成测试 | 真实 Hono SSE route(5-1~9)/ 真实 PG transaction fault injection(PG-T1~T8)/ FieldLevelServer 集成(G4/G7/S10/T1/C-1~C-4) |
 | ▲ | lead 核证生产调用 | lead 已 spot-check 生产代码引用(canvas.ts:450-522 / shared/persist-contract.ts:76 / writeRetryQueue.ts:16-19) |
 | ○ | 仍属分析 | 未跑生产网关 / 未压测 20k 渲染;条件式标注,非"无需验证" |
 
@@ -87,7 +87,7 @@
 | 12 | `server/persist/backend.contract.dual.test.ts` | 双 backend 契约测试同步 | grep | ☑ |
 | (13) | `src/lib/writeRetryQueue.test.ts` | WriteOp 队列测试同步 | grep | ☑ |
 
-**117 项定向回归冻结命令**(R2-6 要求可执行命令集合):
+**定向回归冻结命令**(R2-6 要求可执行命令集合;R5 F4 修正 `npm test`→`npm run test:unit`;项数以 runner 实跑为准,当前 118 pass / 32 skip):
 
 ```bash
 # 破坏面全量调用面审计(grep 12 文件)
@@ -96,7 +96,7 @@ grep -rn 'upsertChild\|validateChildPayload\|NodePayload\|UpsertRequest\|UpsertR
 npm run test:unit -- src/lib/serverPersistAdapter.contract.test.ts server/persist/backend.test.ts server/persist/backend.pg.test.ts server/persist/backend.contract.dual.test.ts src/lib/writeRetryQueue.test.ts
 ```
 
-**措辞修正**:v1 "零破坏面、无迁移窗口" → v3 "**前端主路径未接线(`unwiredServerPersistAdapter`),但契约/服务端破坏面非零(逐文件清单 12 项 + FX-5 队列迁移 + 117 项定向回归)**"。
+**措辞修正**:v1 "零破坏面、无迁移窗口" → v3 "**前端主路径未接线(`unwiredServerPersistAdapter`),但契约/服务端破坏面非零(逐文件清单 12 项 + FX-5 队列迁移 + 118 项定向回归)**"。
 
 **cutover 方案拍死(R2-6:选一个,说理由)**:**原子 cutover**(非 versioned endpoint)。理由:
 1. **无双协议窗口成立**:#194 `unwiredServerPersistAdapter` 前端未接线 → 原地演进,无新旧 endpoint 并存窗口 → 不付双 endpoint 王税。
@@ -105,9 +105,9 @@ npm run test:unit -- src/lib/serverPersistAdapter.contract.test.ts server/persis
 4. **回滚策略**:feature flag 切回 `FIELD_LEVEL_OPS=off` → 整 record payload decoder;FX-5 队列 migration 可逆(新 op → 旧 body 反向转换)。
 5. **不选 versioned endpoint 的理由**:方案 B(新增 `POST /nodes/:nodeId/ops` versioned + #194 冻结)付双 endpoint 税,但 #194 前端未接线 → 方案 B 无"不动 #194"收益,纯增成本。
 
-> 注:**"无双协议窗口"仍成立**(原子 cutover + #194 unwired → 原地演进,无双 endpoint 并存);但"零破坏"不成立(逐文件 12 项 + FX-5 迁移 + 117 项回归)。Gate6 判决据此(§2 Gate6)。
+> 注:**"无双协议窗口"仍成立**(原子 cutover + #194 unwired → 原地演进,无双 endpoint 并存);但"零破坏"不成立(逐文件 12 项 + FX-5 迁移 + 118 项回归)。Gate6 判决据此(§2 Gate6)。
 
-**cutover 状态表(R3 唯一可执行协议;契约测试命令 = §1.2 的 117 项回归 + grep 调用面审计,已 dry-run:grep 149 匹配 / 5 测试文件全在)**:
+**cutover 状态表(R3 唯一可执行协议;契约测试命令 = §1.2 定向回归 + grep 调用面审计,dry-run:grep 149 匹配 / 5 测试文件全在 / `npm run test:unit` 118 pass 32 skip)**:
 
 | 场景 | flag / 时机 | 客户端发 | 服务端行为 | 状态码 | 客户端动作 |
 |---|---|---|---|---|---|
@@ -204,7 +204,7 @@ npm run test:unit -- src/lib/serverPersistAdapter.contract.test.ts server/persis
 | wire 演进 | 原地演进 `PATCH /nodes/:nodeId` payload:整 record → field-level ops | 新增 `POST /nodes/:nodeId/ops`(versioned);#194 冻结 |
 | envelope | If-Match 400/428/409 不变(`G4-3` 428) | 双 endpoint 并存 |
 | revision 语义 | per-record,每 accepted op bump,**只供 snapshot/catch-up,不参与 LWW 拒写**(`G4-4`) | 同 |
-| 生产破坏面 | **前端未接线但契约/服务端破坏面非零**(§1.2:≥12 文件 + FX-5 队列迁移 + 117 项回归) | 不动 #194,新 endpoint 独立上线 |
+| 生产破坏面 | **前端未接线但契约/服务端破坏面非零**(§1.2:≥12 文件 + FX-5 队列迁移 + 118 项回归) | 不动 #194,新 endpoint 独立上线 |
 | 迁移窗口 | 无双协议窗口(原地演进) | 双 endpoint 并存窗口 + 客户端分叉 |
 
 **证据**:`G4-1`(不同字段双留)、`G4-2`(嵌套叶子双留)、`G4-3`(428)、`G4-4`(base 落后不同字段→接受);▲lead 核证 #194 route 注册 + shared contract 冻结 + FX-5 payload(§1.2)。
@@ -257,7 +257,7 @@ npm run test:unit -- src/lib/serverPersistAdapter.contract.test.ts server/persis
 
 **证据**:▲lead 核证 #194 route 注册 + shared contract 冻结 + FX-5 payload(§1.2);`G4-3` 428/409 envelope;`G7-1` ?since=seq 补拉。
 
-**成本**:Figma 式 0 双协议窗口(原地演进);但破坏面 inventory(§1.2:≥12 文件 + FX-5 队列迁移 + 117 项回归 + cutover 策略)。Yjs:legacy↔CRDT bridge 翻译规则 + per-canvas flag + 双协议并存窗口。
+**成本**:Figma 式 0 双协议窗口(原地演进);但破坏面 inventory(§1.2:≥12 文件 + FX-5 队列迁移 + 118 项回归 + cutover 策略)。Yjs:legacy↔CRDT bridge 翻译规则 + per-canvas flag + 双协议并存窗口。
 
 **go/no-go**:**Figma GO**(无双协议窗口成立,迁移面小于 Yjs 的双协议窗口;但破坏面非零,须 cutover 策略)。
 
@@ -318,11 +318,11 @@ npm run test:unit -- src/lib/serverPersistAdapter.contract.test.ts server/persis
 | §10 create→edit 无因果 | 同 record FIFO(pending create ack 前 hold edit,对齐 G1-b R2-P1-2) | `S10-8`(●) |
 | §10 DELETE 无 cursor/404 边界 | accepted 必携 seq;幂等已删返 cursor;404→rejected(对齐 G1-b R2-P1-3) | `S10-9`(●) |
 | v2 Gate3 "Figma 占优(跨介质边界)" | v3 **平局**(R2-1):intra 原子两案一致;跨介质 Figma=saga 非真原子、Yjs=无方案;PG-T3 改名同库资产元数据;PG-T 同一 client(pool.connect+finally release) | `PG-T1~T3`(●同 client)+ `G3-real-1`(★) |
-| v2 Gate5 "SSE skeleton replay + 直信 x-mivo-auth-user + 任何网关必透传" | v3 **条件式 GO**(R2-2):live push 5-7 + desiredSize backpressure 5-6 + gateway-secret authz seam 5-5(复用 owner.ts fail-closed);网关 SSE buffering 改条件式(非"必透传") | `5-1~7`(●真实集成) |
+| v2 Gate5 "SSE skeleton replay + 直信 x-mivo-auth-user + 任何网关必透传" | v3 **条件式 GO**(R2-2):live push 5-7 + desiredSize backpressure 5-6 + gateway-secret authz seam 5-5(复用 owner.ts fail-closed)+ R5 F3 post-revoke write 拒绝 5-9;网关 SSE buffering 改条件式(非"必透传") | `5-1~9`(●真实集成) |
 | v2 §10 trustify 无 header 参数(opId 实取 body)+ DomainOp 带 recordId + clock 内存 Map + batch 逐条 mutate | v3 **真三层**(R2-3):trustify 注入 idempotency-key header(opId 单一权威,弃 body.opId);DomainOp 中性 delta(无 recordId/actor/base/opId,adapter 注入);clock PG field_clock schema + 客户端 base.clock;batch 真单事务(staging+commitStaged,无 partial);immutable/atomic leaf 表 + idempotent replay | `S10-2/3/4/5/10/11`(●) |
 | v2 §10 数组写死 {id:string} + FieldPath 只堵 [] | v3 **三类数组 + leaf validator**(R2-4):by-id(有 stable-id)/whole-lww(无 stable-id markupPoints)/primitive(resultNodeIds string[]);setByPath 拒 ['transform']+整对象 clobber(对照 mivoCanvas.ts:69-74,249) | `S10-6/7`(●) |
 | v2 restore 直调 applyOpAuthz(B 收不到 overwritten,lastWriter 错停) | v3 **restore 走 overwrite 管线**(R2-5):败方(当前 lastWriter)收 overwritten;lastWriter 链持续 | `T1-2/T1-5`(●) |
-| v2 §1.2 "≥12 文件" + 117 项无命令 + cutover 二选一未决却称"无双协议窗口" | v3 **逐文件 12 项清单 + 冻结命令 + cutover 拍死原子**(R2-6):无双协议窗口保留(原子 cutover + #194 unwired) | §1.2 inventory(▲lead 核证) |
+| v2 §1.2 "≥12 文件" + 定向回归无冻结命令 + cutover 二选一未决却称"无双协议窗口" | v3 **逐文件 12 项清单 + 冻结命令(R5 F4 修正 npm run test:unit)+ cutover 拍死原子**(R2-6):无双协议窗口保留(原子 cutover + #194 unwired) | §1.2 inventory(▲lead 核证) |
 | v2 Gate7 G7-hard-1~3 标 ★(自建 server 无 Yjs 对照,虚标) | v3 **降 ●/○**(R2-7);仅 G7-hard-4 ★真测;Gate7 重评平局 | `G7-hard-1~3`(●/○)+ `G7-hard-4`(★) |
 | v2 隐含"Yjs 无原生 coalescing" | v3 修正:Yjs 有 UndoManager captureTimeout 合并(M5 证两案一致,非"无原生 coalescing") | `M5`(★真 Y.UndoManager) |
 | v2 "任何 HTTP 网关必透传 SSE" | v3 改条件式:网关应透传(plain HTTP)但生产可能缓冲/超时(○条件式留 lead 实测) | §2 Gate5 仓库侧分析(R2-2) |
@@ -330,7 +330,7 @@ npm run test:unit -- src/lib/serverPersistAdapter.contract.test.ts server/persis
 
 ---
 
-## 4-9. PoC 清单与实跑结果(55 tests 全绿)
+## 4-9. PoC 清单与实跑结果(65 tests 全绿)
 
 **文件**:`src/kernel/__spike__/n20-truth-source.spike.test.ts`(44)+ `server/__tests__/n20-sse-route.spike.test.ts`(8)+ `server/__tests__/n20-pg-tx-fault.spike.test.ts`(7)。
 
@@ -409,7 +409,7 @@ npm run test:unit -- src/lib/serverPersistAdapter.contract.test.ts server/persis
 | 5-8 slow-reader 恢复(R3 F3) | R3 F3 | 5 | `resumedMax-resumedMin+1 > resumed.length`(response body 观察 seq gap)+ `?since=0 补拉 seq 1..51 全 51 无缺口` | ● |
 | 5-9 post-revoke write 拒绝(R5 F3) | R5 F3 | 5 | bob 撤权后 SSE `event: revoke`/close + bob PATCH write 返真实 `404 unknown-canvas` no-leak(非 401/403)+ owner alice write `200`(真实 seam:resolveActor+canAccessCanvas('write')+denyStatus) | ● |
 
-**实跑汇总**:`59 pass / 0 skip / 0 fail`(spike 44 + SSE 8 + PG 7,本地 PG port 55443 实跑 MIVO_PG_TEST=1,PG-T1~T7 同一 client 真 pass;PG-T5/T6/T7 真 PG 持久/跨 record;SSE 5-8 slow-reader 恢复)。`tsc -b` 0 errors;`eslint` 干净;`npm run build` exit 0(567ms);`grep -roE 'yjs|lib0|YEvent|applyUpdate|AbstractType|encodeStateAsUpdate' dist/` 零命中(yjs 不进生产 bundle)。
+**实跑汇总**:`65 pass / 0 skip / 0 fail`(spike 48 + SSE 9 + PG 8,本地 PG port 55443 实跑 MIVO_PG_TEST=1,PG-T1~T8 同一 client 真 pass;PG-T5/T6/T6b/T7 真 PG 持久/跨 record/真实 replay;SSE 5-8 slow-reader 恢复 + 5-9 post-revoke write 拒绝)。`tsc -b` 0 errors;`eslint` 干净;`npm run build` exit 0;`grep -roE 'yjs|lib0|YEvent|applyUpdate|AbstractType|encodeStateAsUpdate' dist/` 零命中(yjs 不进生产 bundle)。
 
 ---
 
@@ -508,7 +508,7 @@ const trustifyCreate = (client: CreateBody, ctx: TrustedCtx): CreateWire =>
 ### 10.9 迁移 / 双协议窗口 / 破坏面
 
 - **无双协议窗口**(gate 6):#194 前端未接线→原地演进;PG JSONB payload 不透明不动。
-- **破坏面非零**(§1.2):≥12 文件 + FX-5 队列 migration-on-read(旧 queued body→新 op schema 转换)+ stale client 旧 body 打新 endpoint → 400 `payload-rejected`(非 409 refetch)+ 117 项定向回归 + cutover 策略(原子,§1.2)。
+- **破坏面非零**(§1.2):≥12 文件 + FX-5 队列 migration-on-read(旧 queued body→新 op schema 转换)+ stale client 旧 body 打新 endpoint → 400 `payload-rejected`(非 409 refetch)+ 118 项定向回归 + cutover 策略(原子,§1.2)。
 - stale-client(旧 body 打新 endpoint):**400 `payload-rejected` → refetch**(非 409);409 revision-conflict 是 #194 envelope 复用码(parseIfMatch),新 field-level 协议 G4-4 明确 base 落后不拒写(200),故 stale-client 无 409(见 §1.2 cutover 状态表)。
 
 ---
@@ -559,4 +559,4 @@ const trustifyCreate = (client: CreateBody, ctx: TrustedCtx): CreateWire =>
   - `yjsMatrixSetup`(真 Yjs UndoManager 同矩阵 helper)
   - G4+G1(5)/ G3(2)+G3-real(3)/ G2(2)+M1-M6(6)/ G7(3)+G7-hard(4)/ G5(1)/ antiYjs(2)/ S10(5)+S10-6~9(4)/ T1(4)+**T1-5(R2-5)**/ **S10-10 immutable/atomic leaf(R2-3)**/ **S10-11 idempotent replay(R2-3)**/ **C-1~C-4 cutover contract harness(R5 F4:flag decoder/migration/stale-base/rollback snapshot materialize)** = **48 tests**
 - `server/__tests__/n20-sse-route.spike.test.ts`(9 tests):真实 Hono SSE route(content-type/heartbeat/since/revoke/authz/slow-consumer + **5-7 live push R2-2** + **5-8 slow-reader 恢复 R3 F3** + **5-9 post-revoke write 拒绝 R5 F3**;5-5 真实 resolveActor/canAccessCanvas authz seam;5-9 同 harness 加真实 seam PATCH write route)
-- `server/__tests__/n20-pg-tx-fault.spike.test.ts`(4 tests):真实 PG transaction fault injection(原子提交/fault ROLLBACK/同库资产元数据(R2-1 改名)/无事务 partial 对照;本地 PG 55443 实跑 MIVO_PG_TEST=1 转 pass;**全部 PG-T 同一 client pool.connect+finally release**)
+- `server/__tests__/n20-pg-tx-fault.spike.test.ts`(8 tests):真实 PG transaction fault injection(原子提交/fault ROLLBACK/同库资产元数据(R2-1 改名)/无事务 partial 对照 + PG-T5 field_clock 持久 + **R5 F2:PG-T6 真实领域 replay + PG-T6b fault/rollback** + PG-T7 跨 record;本地 PG 55443 实跑 MIVO_PG_TEST=1;**全部 PG-T 同一 client pool.connect+finally release**)
