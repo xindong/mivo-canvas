@@ -161,7 +161,7 @@ DROP TABLE IF EXISTS chat_order_revisions;
 `
 
 // P-6 saga 补偿意图表(share_link_compensations)。migration key 排在 DP-6R chat 之后(字典序 005):
-// lead 拍板(2026-07-12 更新)——DP-6R 占 003_chat_per_user + 004_chat_order_revisions,本分支 005(key+registry
+// lead 拍板(2026-07-12 更新)——DP-6R 占 003_chat_per_actor + 004_chat_order_revisions,本分支 005(key+registry
 // 同步),避免 Kysely 字典序 "share 先 chat 后"导致 migration 顺序冲突(share-先路径因改名后不存在,无需支持)。
 // FK 同权限两表:project_id → projects(id) ON DELETE CASCADE(project purge → 补偿意图清)。
 // 无 revision(owner 权威写,非 CRDT LWW)。attempt_count/last_error/last_attempted_at 是"可观察状态"(saga 非黑盒)。
