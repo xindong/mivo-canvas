@@ -1,9 +1,11 @@
 import 'fake-indexeddb/auto'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  __bumpPendingCountersForTest,
   __dumpIdbTerminalsForTest,
   __dumpTerminalsForTest,
   __dumpWritesForTest,
+  __enforceTerminalCapForTest,
   __isWriteQueueBlockedForTest,
   __onErrorBlockedClearCountForTest,
   __readIdbTerminalCountersForTest,
@@ -12,6 +14,7 @@ import {
   __seedWritesForTest,
   __setIdbBlockTimeoutForTest,
   __setMaxTerminalsForTest,
+  __setClaimBarrierHookForTest,
   __setOpenDbUpgradeAbortHookForTest,
   __setTerminalFaultInjectorForTest,
   __setWriteQueueDbNameForTest,
@@ -19,6 +22,7 @@ import {
   createWriteQueue,
   getWriteQueueTerminalCounters,
   resetTerminalCountersBaseline,
+  type TerminalCounterShape,
   type QueuedWrite,
   type WriteExecutor,
   type WriteOp,
@@ -2098,5 +2102,178 @@ describe('FX-7 / A6 P1-4 — non-retreatable terminal counters (A3 uses counters
     await __recordTerminalForTest(makeMinimalQueuedWrite('ok', 'ok'), 'dead-letter', 'm4')
     expect((await __readIdbTerminalCountersForTest())['dead-letter']).toBe(4) // 3 (refunded pending) + 1
     expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(4)
+  })
+
+  // ── Round-5 (P1-B r4 residual): after-claim / before-tx-complete barrier ──
+  // sol 五审 residual: test ⑧ injects the new pending AFTER releaseClaim already ran, so a
+  // "releaseClaim subtracts captured from pending" regression floors at 0 (pending was 0 by
+  // then) and only the inFlight leak signals it. This group holds the FIRST tx mid-claim
+  // (after claimPendingDelta, before the IDB tx queues) via an injectable barrier promise,
+  // injects a new pending delta WHILE the claim is in flight, then releases the first tx +
+  // starts a second. The second must claim ONLY the new delta (1); a wrong releaseClaim
+  // would subtract the first claim's captured(3) from the live pending(1) → floor to 0 →
+  // the second claims 0 → durable LOSES the injected delta (idb=5 not 6) AND read INFLATES
+  // via the inFlight leak (8 not 6). Both the durable-loss and read-inflation assertions
+  // go red under the wrong model (correctness-gate verified: see send_to_lead report).
+
+  it('⑩ (P1-B r4) mid-flight pending injected after claim / before commit → second tx claims only the new delta (no loss, no dup)', async () => {
+    __setMaxTerminalsForTest(256) // no eviction — isolate the claim-barrier concurrency
+    // Seed pending=3 via 3 fault-aborted recordTerminals (each aborts → refund + bump →
+    // pending grows by 1). Barrier hook is NOT installed yet → seeding claims do not block.
+    __setTerminalFaultInjectorForTest((phase, tx) => {
+      if (phase === 'record') tx.abort()
+    })
+    await __recordTerminalForTest(makeMinimalQueuedWrite('p1', 'p1'), 'dead-letter', 'm1')
+    await __recordTerminalForTest(makeMinimalQueuedWrite('p2', 'p2'), 'dead-letter', 'm2')
+    await __recordTerminalForTest(makeMinimalQueuedWrite('p3', 'p3'), 'dead-letter', 'm3')
+    __setTerminalFaultInjectorForTest(undefined)
+    // 3 aborts → pending delta = 3, IDB durable = 0.
+    expect((await __readIdbTerminalCountersForTest())['dead-letter']).toBe(0)
+    expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(3) // read = idbCurrent(0) + pending(3)
+
+    // Barrier hook: block the FIRST record-phase claim; log every record-phase claim so the
+    // test can assert the two claims are exactly 3 and 1. Cap-phase claims (no eviction under
+    // cap=256) are ignored. The first call awaits an injectable promise; later calls no-op.
+    const recordClaims: TerminalCounterShape[] = []
+    let resolveBarrier!: () => void
+    const barrierPromise = new Promise<void>((resolve) => {
+      resolveBarrier = resolve
+    })
+    let firstRecordClaim = true
+    __setClaimBarrierHookForTest(async (phase, captured) => {
+      if (phase !== 'record') return
+      recordClaims.push({ ...captured })
+      if (firstRecordClaim) {
+        firstRecordClaim = false
+        await barrierPromise // hold the first tx mid-claim (after-claim / before-tx)
+      }
+    })
+
+    // Fire the FIRST successful recordTerminal (do not await). It claims pending=3
+    // synchronously (captured={dl:3} → pending 3→0, inFlight 0→3), then hits the barrier and
+    // parks — the IDB tx is NOT yet queued, the claim is in flight.
+    const firstP = __recordTerminalForTest(
+      makeMinimalQueuedWrite('r1', 'r1'),
+      'dead-letter',
+      'm4',
+    )
+    // The claim is synchronous → recordClaims already holds {dl:3}; read = 0 + 0 + 3 (inFlight).
+    expect(recordClaims).toHaveLength(1)
+    expect(recordClaims[0]?.['dead-letter']).toBe(3)
+    expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(3)
+
+    // INJECT a new pending=1 WHILE the first tx is parked mid-claim (before its tx queues).
+    // Simulates a concurrent tab's mem-fallback increment; does NOT itself fire a claim.
+    __bumpPendingCountersForTest('dead-letter', 1)
+    // read = idbCurrent(0) + pending(1) + inFlight(3) = 4.
+    expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(4)
+
+    // Release the first tx AND start the second. The second claims ONLY the new delta(1) —
+    // the first's claim(3) already moved to inFlight, so pending held only the injected 1.
+    resolveBarrier()
+    const secondP = __recordTerminalForTest(
+      makeMinimalQueuedWrite('r2', 'r2'),
+      'dead-letter',
+      'm5',
+    )
+    await Promise.all([firstP, secondP])
+
+    // Two record-phase claims observed: first=3 (seeded pending), second=1 (injected delta).
+    // A wrong releaseClaim (subtract from pending) would zero the live pending(1) before the
+    // second claim → second claims 0, not 1.
+    expect(recordClaims).toHaveLength(2)
+    expect(recordClaims[0]?.['dead-letter']).toBe(3)
+    expect(recordClaims[1]?.['dead-letter']).toBe(1)
+
+    // Durable = 3 (first claim) + 1 (second claim) + 2 (each record's own increment) = 6.
+    // A wrong releaseClaim → durable=5 (lost the injected delta) AND read=8 (inFlight leak).
+    expect((await __readIdbTerminalCountersForTest())['dead-letter']).toBe(6)
+    expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(6)
+  })
+
+  // ── Round-5 (P1-B r4 residual): cap tx claims a NON-zero pending delta ──
+  // sol 五审 residual: tests ⑤/⑦ only exercise the cap tx when pending=0 (claim=0), so a
+  // cap-commit that leaks the non-zero claim via a wrong releaseClaim, or a cap-abort that
+  // fails to refund the non-zero claim, would not surface. ⑪ seeds a non-zero pending delta
+  // + an over-cap ledger so the cap tx claims the pending delta and lands it in the SAME
+  // atomic tx as the evicted increment (each exactly once); ⑫ aborts that cap tx and asserts
+  // the non-zero claim refunds to pending, then a re-run lands each exactly once (no re-flush,
+  // no loss).
+
+  it('⑪ (P1-B r4) cap tx with non-zero pending → pending delta + evicted land in ONE atomic tx, each exactly once', async () => {
+    __setMaxTerminalsForTest(256) // no eviction while seeding — build the over-cap ledger cleanly
+    // Seed 5 dead-letter terminals → IDB dl=5, evicted=0, ledger=5.
+    for (let i = 1; i <= 5; i++) {
+      await __recordTerminalForTest(makeMinimalQueuedWrite(`k${i}`, `k${i}`), 'dead-letter', `m${i}`)
+    }
+    expect((await __readIdbTerminalCountersForTest())['dead-letter']).toBe(5)
+    expect((await __readIdbTerminalCountersForTest()).evicted).toBe(0)
+    expect((await __dumpIdbTerminalsForTest()).length).toBe(5)
+
+    // Pre-create a non-zero pending delta (2) WITHOUT going through claim/tx (simulates a
+    // concurrent tab's mem-fallback increments not yet claimed into an IDB tx).
+    __bumpPendingCountersForTest('dead-letter', 2)
+    expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(7) // read = idb(5) + pending(2)
+
+    // NOW drop the cap below the ledger size (5 > 3) so enforceTerminalCap evicts.
+    __setMaxTerminalsForTest(3)
+    // Cap tx: claim=2 (pending 2→0, inFlight 0→2); getAll → 5, excess=2, delete 2 oldest;
+    // counter put = idbCurrent(5) + capturedPending(2) + evicted(+2) → dl=7, evicted=2.
+    // Commit → releaseClaim(2): inFlight 2→0. BOTH the pending delta and the evicted
+    // increment land in the SAME atomic tx, each exactly once.
+    await __enforceTerminalCapForTest()
+
+    const idb = await __readIdbTerminalCountersForTest()
+    expect(idb['dead-letter']).toBe(7) // 5 (durable) + 2 (pending delta landed once)
+    expect(idb.evicted).toBe(2) // excess=2, landed once
+    expect((await __dumpIdbTerminalsForTest()).length).toBe(3) // ledger capped at 3
+    expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(7) // read = 7 + 0 + 0
+    expect((await getWriteQueueTerminalCounters()).counters.evicted).toBe(2)
+
+    // Idempotency: a SECOND cap call (no new pending, ledger already at cap) is a no-op —
+    // claim=0, getAll=3 <= 3 → no eviction → flushed=false → refund(0). Nothing re-flushes.
+    await __enforceTerminalCapForTest()
+    const idb2 = await __readIdbTerminalCountersForTest()
+    expect(idb2['dead-letter']).toBe(7) // unchanged — pending delta did NOT land a second time
+    expect(idb2.evicted).toBe(2) // unchanged — evicted did NOT increment a second time
+  })
+
+  it('⑫ (P1-B r4) cap tx abort with non-zero claim → refund to pending; subsequent success lands each exactly once (no loss, no dup)', async () => {
+    __setMaxTerminalsForTest(256) // no eviction while seeding
+    for (let i = 1; i <= 5; i++) {
+      await __recordTerminalForTest(makeMinimalQueuedWrite(`a${i}`, `a${i}`), 'dead-letter', `m${i}`)
+    }
+    expect((await __readIdbTerminalCountersForTest())['dead-letter']).toBe(5)
+    // Pre-create a non-zero pending delta (2) + drop the cap below the ledger (5 > 3).
+    __bumpPendingCountersForTest('dead-letter', 2)
+    __setMaxTerminalsForTest(3)
+
+    // Inject: abort the cap tx (phase 'cap') AFTER deletes + counter put are scheduled. The
+    // cap claim(2) → inFlight; the tx aborts → atomic rollback (neither deletes nor the
+    // counter put land) AND refundClaim(2) restores the pending delta.
+    __setTerminalFaultInjectorForTest((phase, tx) => {
+      if (phase === 'cap') tx.abort()
+    })
+    await __enforceTerminalCapForTest()
+    // Atomic rollback: ledger still 5 (no delete), idb dl still 5 (counter put rolled back),
+    // evicted still 0. BUT the non-zero claim(2) was refunded → pending restored to 2.
+    expect((await __dumpIdbTerminalsForTest()).length).toBe(5) // NOT deleted
+    expect((await __readIdbTerminalCountersForTest())['dead-letter']).toBe(5) // NOT incremented
+    expect((await __readIdbTerminalCountersForTest()).evicted).toBe(0) // NOT incremented
+    expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(7) // read = idb(5) + pending(2) refunded
+    expect((await getWriteQueueTerminalCounters()).counters.evicted).toBe(0) // inFlight=0 (refunded)
+
+    // Clear the fault → re-run cap. The refunded pending(2) is re-claimed and lands ONCE.
+    __setTerminalFaultInjectorForTest(undefined)
+    await __enforceTerminalCapForTest()
+    // excess=2 (5 > 3) → delete 2 oldest + counter put = idbCurrent(5) + capturedPending(2) +
+    // evicted(+2) → dl=7, evicted=2. The pending delta landed exactly once (NOT twice — the
+    // abort rolled back the first attempt; only the success flushed it).
+    const idb = await __readIdbTerminalCountersForTest()
+    expect(idb['dead-letter']).toBe(7) // 5 + 2 (pending landed once, not twice)
+    expect(idb.evicted).toBe(2) // landed once
+    expect((await __dumpIdbTerminalsForTest()).length).toBe(3) // ledger capped at 3
+    expect((await getWriteQueueTerminalCounters()).counters['dead-letter']).toBe(7) // read = 7 + 0 + 0
+    expect((await getWriteQueueTerminalCounters()).counters.evicted).toBe(2)
   })
 })

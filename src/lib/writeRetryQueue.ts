@@ -107,6 +107,22 @@ let dbName = DB_NAME
 // injected too (lead residual: cap tx abort was untested).
 let terminalFaultInjector: ((phase: 'record' | 'cap', tx: IDBTransaction) => void) | undefined
 
+// Round-5 test-only: claim-phase barrier hook. Invoked AFTER claimPendingDelta() and
+// BEFORE the IDB tx queues, with the phase ('record' | 'cap') + the captured snapshot.
+// A test may await an injectable promise here to hold the tx mid-claim (after-claim /
+// before-tx-complete) so it can mutate the pending bucket mid-flight and assert the
+// second tx's claim sees ONLY the new delta — kills the "releaseClaim mis-subtracts
+// from pending" regression that the commit-after-add test ⑧ cannot catch (there the
+// new delta arrives AFTER releaseClaim already ran, so a wrong-from-pending subtract
+// floors at 0 and the inFlight leak is the only signal; here the new delta arrives
+// WHILE the claim is in flight, so a wrong subtract zeroes the live delta before the
+// second tx can claim it → durable loss + read inflation, both assertable). The hook
+// is a pure await point — it does NOT touch pending/inFlight, so claim/release/refund
+// semantics are unchanged (production: undefined → no-op). Reset in __resetWriteQueueDb.
+let claimBarrierHook:
+  | ((phase: 'record' | 'cap', captured: TerminalCounterShape) => Promise<void>)
+  | undefined
+
 const DEFAULT_MAX_QUEUE = 256
 const DEFAULT_MAX_ATTEMPTS = 8
 const DEFAULT_BASE_DELAY = 1000
@@ -120,7 +136,9 @@ const DEFAULT_DRAIN_INTERVAL = 5000
 // the 256-entry ledger and a snapshot filter would then falsely read 0 (false-green).
 // `evicted` tracks how many ledger entries aged out (so A3 can reconcile snapshot
 // depth vs. cumulative totals). Keys mirror TerminalLedgerStatus exactly.
-type TerminalCounterShape = {
+// (Round-5: exported as a type-only surface so the barrier regression test can type the
+// claim-capture log — zero runtime impact, no semantic change.)
+export type TerminalCounterShape = {
   conflict: number
   'too-large': number
   'reuse-conflict': number
@@ -962,6 +980,9 @@ const enforceTerminalCap = async (): Promise<void> => {
   // pending delta. Commit → release the claim; abort/no-eviction → refund it.
   const capturedPending = claimPendingDelta()
   try {
+    // Round-5 test-only: hold the cap tx mid-claim so a test can mutate pending mid-flight
+    // (claim semantics unchanged — pure await point; production no-op when hook unset).
+    if (claimBarrierHook) await claimBarrierHook('cap', capturedPending)
     let nextCounters: TerminalCounterShape | undefined
     let flushed = false
     await runMultiStoreTx([TERMINALS_STORE, META_STORE], 'readwrite', (stores, tx) => {
@@ -1045,6 +1066,9 @@ const recordTerminal = async (
   // (sol: pending=3 + 2 concurrent record → durable=8 with the snapshot model; expected 5).
   const capturedPending = claimPendingDelta()
   try {
+    // Round-5 test-only: hold the record tx mid-claim so a test can mutate pending mid-flight
+    // (claim semantics unchanged — pure await point; production no-op when hook unset).
+    if (claimBarrierHook) await claimBarrierHook('record', capturedPending)
     let flushed = false
     await runMultiStoreTx([TERMINALS_STORE, META_STORE], 'readwrite', (stores, tx) => {
       stores[TERMINALS_STORE]!.put(entry)
@@ -1849,6 +1873,25 @@ export const __setTerminalFaultInjectorForTest = (
 }
 
 /**
+ * Round-5 test-only: claim-phase barrier hook setter. The hook is awaited AFTER
+ * claimPendingDelta() and BEFORE the IDB tx queues (phase 'record' | 'cap' + the
+ * captured snapshot), so a test can hold a tx mid-claim, mutate the pending bucket
+ * mid-flight, and assert a second tx claims ONLY the new delta — kills the
+ * "releaseClaim mis-subtracts from pending" regression (test ⑧ adds the delta AFTER
+ * releaseClaim ran, so a from-pending subtract floors at 0; here the delta arrives
+ * WHILE the claim is in flight, so a wrong subtract zeroes the live delta → durable
+ * loss + read inflation, both assertable). Production never sets this. Reset to
+ * undefined in __resetWriteQueueDb.
+ */
+export const __setClaimBarrierHookForTest = (
+  fn:
+    | ((phase: 'record' | 'cap', captured: TerminalCounterShape) => Promise<void>)
+    | undefined,
+): void => {
+  claimBarrierHook = fn
+}
+
+/**
  * P1-A (third-round) test-only: hook invoked inside onupgradeneeded with the version-
  * change transaction; a test calls tx.abort() to make the upgrade terminate with an
  * error (request.onerror) and verify the blocked state is cleared (next openDb recovers
@@ -1884,6 +1927,29 @@ export const __recordTerminalForTest = (
   status: TerminalLedgerStatus,
   message: string,
 ): Promise<void> => recordTerminal(rec, status, message)
+
+/**
+ * Round-5 test-only: directly bump the PENDING delta bucket (terminalCountersMem)
+ * WITHOUT going through claim/tx/abort. Used by the mid-flight barrier test to inject
+ * a new pending delta while a tx is parked mid-claim (simulating a concurrent tab's
+ * mem-fallback increment) so the injection does not itself fire a claim and pollute the
+ * claim log. Mutates only the pending bucket — claim/release/refund semantics unchanged.
+ * Production never calls this.
+ */
+export const __bumpPendingCountersForTest = (
+  status: TerminalLedgerStatus,
+  by = 1,
+): TerminalCounterShape => bumpTerminalCounterMem(status, by)
+
+/**
+ * Round-5 test-only: direct access to enforceTerminalCap for the cap-non-zero-claim
+ * tests. Isolates the cap claim + cap tx (delete + evicted RMW) from the record tx so
+ * a test can seed a non-zero pending delta + an over-cap ledger, then assert the cap
+ * tx lands BOTH the pending delta and the evicted increment in ONE atomic tx, each
+ * exactly once (and on cap-phase abort the non-zero claim refunds to pending, so a
+ * subsequent success lands each exactly once). Production triggers cap via recordTerminal.
+ */
+export const __enforceTerminalCapForTest = (): Promise<void> => enforceTerminalCap()
 
 /**
  * P1-4 test-only: dump ONLY the IDB terminal ledger (no mem union). Used by the fault-
@@ -1947,6 +2013,9 @@ export const __resetWriteQueueDb = async (): Promise<void> => {
   blockedState = 'open'
   dbName = DB_NAME
   terminalFaultInjector = undefined
+  // Round-5: reset the claim-phase barrier hook so a prior test's mid-flight barrier
+  // never leaks into the next.
+  claimBarrierHook = undefined
   // P1-A (third-round): reset the request token + upgrade-abort hook so a prior test's
   // blocked-owner token / upgrade-abort injection never leaks.
   blockedRequestToken = 0
