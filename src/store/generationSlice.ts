@@ -5,7 +5,7 @@ import type {
   MivoCanvasNode,
   MivoCanvasSnapshot,
 } from '../types/mivoCanvas'
-import type { SliceCreator } from './canvasStore'
+import type { SliceCreator } from './canvasStateTypes'
 import type { VariationParam, NormalizedMaskBounds } from '../types/generation'
 import { MivoImageRequestError, assetBlobForNode } from '../lib/mivoImageClient'
 import {
@@ -19,7 +19,7 @@ import {
   type TaskFailure,
   type TaskResultImage,
 } from '../lib/mivoTaskClient'
-import { errorCanvas, logCanvas, warnCanvas } from './canvasStore'
+import { errorCanvas, logCanvas, warnCanvas } from './canvasStoreLog'
 import { createEdgeId, createNodeId, edgeTypeForOperation } from './nodeFactory'
 import {
   defaultDocument,

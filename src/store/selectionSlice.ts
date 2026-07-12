@@ -1,7 +1,7 @@
-import type { SliceCreator } from './canvasStore'
+import type { SliceCreator } from './canvasStateTypes'
 import { defaultStampKind } from '../canvas/stampDefs'
 import { setNodeTransform } from '../model/documentModelV2'
-import { logCanvas, warnCanvas } from './canvasStore'
+import { logCanvas, warnCanvas } from './canvasStoreLog'
 import { makeNode } from './demoScenes'
 import {
   cloneNode,

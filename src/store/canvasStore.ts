@@ -1,11 +1,7 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import { importedImageDisplaySize } from '../lib/imageSizing'
-import { saveGeneratedAsset } from '../lib/assetStorage'
 import { canvasPersistOptions } from './canvasPersistConfig'
-import { debugLogger } from './debugLogStore'
 import { scenes } from './demoScenes'
-import type { CommittedGenerationImage } from '../types/generation'
 import { createDocumentSlice } from './documentSlice'
 import { createNodeMutationSlice } from './nodeMutationSlice'
 import { createNodeCreationSlice } from './nodeCreationSlice'
@@ -14,8 +10,9 @@ import { createSelectionSlice } from './selectionSlice'
 import { createProjectsSlice } from './projectsSlice'
 import { migratePersistedState } from './canvasGenerationHydration'
 
-// 纯类型声明外提到 canvasStateTypes(结构守卫 facade 零增长)。下游
-// `import type { CanvasState, SliceCreator, ... } from './canvasStore'` 路径零改动。
+// 纯类型声明:类型本体在 canvasStateTypes(结构守卫 facade 零增长)。slice 侧已改
+// `import type { SliceCreator } from './canvasStateTypes'` 直连(切断 slice↔facade 边);
+// facade 仍 re-export 供其它非 slice consumer。
 export type {
   CanvasState,
   SelectionAlignment,
@@ -27,52 +24,25 @@ export type {
 } from './canvasStateTypes'
 import type { CanvasState } from './canvasStateTypes'
 
+// 日志 + 图像资产工具(blob/displaySize/log*)外提到 canvasStoreLog(D-4: 切断
+// slice↔facade value-import 环;slice 改从 canvasStoreLog 直连,facade 仅 re-export
+// 保非 slice consumer 零改动)。零行为变化:实现原样搬迁,见 canvasStoreLog.ts。
+export {
+  blobFromCommittedGenerationImage,
+  displaySizeForGeneratedAsset,
+  type GeneratedAssetRecord,
+  logCanvas,
+  warnCanvas,
+  errorCanvas,
+} from './canvasStoreLog'
+
 export { scenes }
-export const blobFromCommittedGenerationImage = (image: CommittedGenerationImage) => {
-  if (image.blob) return image.blob
-
-  const raw = image.b64?.trim() || ''
-  if (!raw) throw new Error('Image service returned empty image data')
-
-  const dataUrlMatch = raw.match(/^data:([^;]+);base64,(.*)$/)
-  const mimeType = image.mimeType || dataUrlMatch?.[1] || 'image/png'
-  const base64 = (dataUrlMatch?.[2] || raw).trim()
-  if (!base64) throw new Error('Image service returned empty image data')
-
-  let binary: string
-  try {
-    binary = atob(base64)
-  } catch (error) {
-    throw new Error('Image service returned invalid image data', { cause: error })
-  }
-  if (!binary.length) throw new Error('Image service returned empty image data')
-
-  const bytes = new Uint8Array(binary.length)
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index)
-  }
-
-  return new Blob([bytes], { type: mimeType })
-}
-
-export type GeneratedAssetRecord = Awaited<ReturnType<typeof saveGeneratedAsset>>
-
-export const displaySizeForGeneratedAsset = (
-  asset: GeneratedAssetRecord,
-  fallbackSize: { width: number; height: number },
-) => asset.sourceDimensions ? importedImageDisplaySize(asset.sourceDimensions) : fallbackSize
-
-
 
 // migratePersistedState lives in canvasGenerationHydration.ts (co-located with
 // settleExpiredCanvasGenerations / mergeCanvasPersistedState — all version-gated
 // hydration logic). Re-exported here so canvasStoreMigrate.test.ts and the
 // persist `migrate` option can keep importing it from the store facade.
 export { migratePersistedState }
-
-export const logCanvas = (message: string) => debugLogger.log('Canvas Store', message)
-export const warnCanvas = (message: string) => debugLogger.warn('Canvas Store', message)
-export const errorCanvas = (message: string) => debugLogger.error('Canvas Store', message)
 
 export const useCanvasStore = create<CanvasState>()(
   persist(

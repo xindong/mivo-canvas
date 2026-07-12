@@ -78,6 +78,7 @@ vi.mock('./chatMaskEditFlow', () => ({
   runMaskEditChatFlow: vi.fn(async () => {}),
   finishMaskEditMessage: vi.fn(),
   failMaskEditMessage: vi.fn(),
+  setChatStoreAccessor: vi.fn(() => {}),
 }))
 
 import { useChatStore } from './chatStore'

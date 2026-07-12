@@ -1,11 +1,11 @@
-import type { SliceCreator } from './canvasStore'
+import type { SliceCreator } from './canvasStateTypes'
 import { highlighterOpacity } from '../canvas/brushGeometry'
 import { defaultStampKind, stampLabelFor } from '../canvas/stampDefs'
 import { defaultSizeForNodeType } from '../canvas/nodeTypes/canvasNodeRegistry'
 import { defaultTextAlign, defaultTextColor, defaultTextFontSize, defaultTextWeight } from '../canvas/textGeometry'
 import { markdownShouldUsePreviewMode } from '../lib/canvasAssetImport'
 import { normalizeCanvasNodeV2, setNodeTransform } from '../model/documentModelV2'
-import { logCanvas, warnCanvas } from './canvasStore'
+import { logCanvas, warnCanvas } from './canvasStoreLog'
 import { makeNode } from './demoScenes'
 import { createNodeId } from './nodeFactory'
 import {

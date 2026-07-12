@@ -5,12 +5,12 @@
 // 给 chatStore.cancelGeneration 委托。chatStore 只暴露薄 action + cancelGeneration 分发，
 // 主体在此（保持 chatStore.ts <= 833 行红线，参考 chatEnhanceFlow/chatGenerationHydration 先例）。
 //
-// 运行时循环注意：本模块 import useChatStore（runtime），chatStore 反向 import cancelMaskEditMessage
-// （runtime）—— ESM live binding，双方只在函数体内访问对方导出，不在模块加载期访问，无 TDZ。
+// D-4 环拆解:原 本模块 value-import useChatStore,chatStore 反向 value-import cancelMaskEditMessage
+// → runtime ESM 环。改依赖倒置:chatStore 初始化时经 setChatStoreAccessor 注入实例,本模块经
+// chatStore() 延迟取用。仍只在函数体内访问,无 TDZ。类型仍 import type 自 chatStore(定义所在)。
 import type { ChatGenerationContext, ChatMessage, ChatMessageErrorKind } from './chatStore'
 import type { MivoImageQuality, MivoImageRatio } from '../types/generation'
 import type { MivoCanvasNode, MivoCanvasSnapshot } from '../types/mivoCanvas'
-import { useChatStore } from './chatStore'
 import { useCanvasStore } from './canvasStore'
 import { debugLogger } from './debugLogStore'
 import { MivoImageRequestError } from '../lib/mivoImageClient'
@@ -22,6 +22,20 @@ import {
   registerMaskEditTask,
   type ActiveMaskEditTask,
 } from './maskEditTaskRuntime'
+
+// D-4: chatStore 在模块装配时注入 useChatStore 实例,本模块经 chatStore() 延迟取用,
+// 不再 value-import chatStore → 切断 chatStore↔chatMaskEditFlow runtime 环。
+type ChatStoreInstance = typeof import('./chatStore')['useChatStore']
+let chatStoreAccessor: ChatStoreInstance | null = null
+export function setChatStoreAccessor(accessor: ChatStoreInstance): void {
+  chatStoreAccessor = accessor
+}
+function chatStore(): ChatStoreInstance {
+  if (!chatStoreAccessor) {
+    throw new Error('chatStore accessor not initialized — chatStore must call setChatStoreAccessor at init')
+  }
+  return chatStoreAccessor
+}
 
 const canceledGenerationMessage = '已取消生成，可修改提示后重试。'
 const maskEditRetryDisabledReason = '局部重绘任务已结束，请重新选择区域后再试'
@@ -42,7 +56,7 @@ const patchAssistantMessage = (
   messageId: string,
   patch: (message: ChatMessage) => ChatMessage,
 ): void => {
-  useChatStore.setState((s) => {
+  chatStore().setState((s) => {
     const prev = s.messagesByScene[sceneId]
     if (!prev) return {}
     return {
@@ -104,7 +118,7 @@ export const beginMaskEditMessage = (args: {
       maskEdit: { sourceTitle: args.source.title, phase: 'enhancing' },
     } as ChatGenerationContext,
   }
-  useChatStore.setState((s) => {
+  chatStore().setState((s) => {
     const prev = s.messagesByScene[args.sceneId] || []
     return {
       messagesByScene: {
@@ -146,7 +160,7 @@ export const finishMaskEditMessage = (args: {
   const currentSceneId = useCanvasStore.getState().sceneId
   if (currentSceneId !== args.sceneId) {
     const title = useCanvasStore.getState().canvases[args.sceneId]?.title || args.sceneId
-    useChatStore.getState().appendNotice({
+    chatStore().getState().appendNotice({
       sceneId: currentSceneId,
       origin: 'mask-edit',
       prompt: `结果已生成到画布 ${title}`,
@@ -154,7 +168,7 @@ export const finishMaskEditMessage = (args: {
   }
   // chat mode replyText 作为附言 notice（W4 永远先出图语义）。
   if (args.noticeText) {
-    useChatStore.getState().appendNotice({
+    chatStore().getState().appendNotice({
       sceneId: currentSceneId,
       origin: 'mask-edit',
       prompt: args.noticeText,
@@ -215,7 +229,7 @@ export const failMaskEditMessage = (args: {
   }))
   const currentSceneId = useCanvasStore.getState().sceneId
   if (currentSceneId !== args.sceneId) {
-    useChatStore.getState().appendNotice({
+    chatStore().getState().appendNotice({
       sceneId: currentSceneId,
       origin: 'mask-edit',
       prompt: `局部重绘失败：${errorMessage}`,
@@ -306,7 +320,7 @@ export const cancelMaskEditMessage = (sceneId: string, messageId: string): void 
     return
   }
   // runtime 已不在（刷新后 / flow 已结束）—— best-effort 走 message 里留的 serverTaskId/pendingSlotId。
-  const message = (useChatStore.getState().messagesByScene[sceneId] || []).find((m) => m.id === messageId)
+  const message = (chatStore().getState().messagesByScene[sceneId] || []).find((m) => m.id === messageId)
   const serverTaskId = message?.generationContext?.maskEdit?.serverTaskId
   const slotId = message?.generationContext?.pendingSlotId
   if (serverTaskId) {
