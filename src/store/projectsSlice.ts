@@ -9,7 +9,7 @@
 import type { SliceCreator } from './canvasStore'
 import { logCanvas, warnCanvas } from './canvasStore'
 import { DEMO_PROJECTS } from './demoScenes'
-import { enqueuePersistWrite } from '../lib/persistBoot'
+import { enqueuePersistWrite, isPersistWriteActive } from '../lib/persistBoot'
 
 // Project ids use a `project-` prefix (distinct from `canvas-` / `group-`) so a
 // projectId is never confused with a canvasId. Mirrors createCanvasId's fallback
@@ -81,34 +81,78 @@ export const createProjectsSlice: SliceCreator = (set, get) => ({
       return
     }
 
-    // Cascade: canvases whose projectId matches fall back to standalone
-    // (projectId → undefined). The canvas body is NOT deleted and updatedAt is
-    // NOT bumped — 归属回落 is a reclassification, not a content change.
-    // 函数式 set:与 createProject/renameProject 一致,不用外层 snapshot,
-    // 避免并发 set 之间丢更新(Greptile P2)。
-    let returnedToStandalone = 0
+    // A2 前置 b / soft-delete-semantics.md §6:对齐服务端整树软删语义。
+    //   server 模式(queue active,isPersistWriteActive)→ 从本地 store 移除 project + 其下所有 canvas
+    //     (服务端 softDeleteProjectTree 已级联软删 project+canvas+chat-collection+share_links;hydrate
+    //     不再返回它们 → 刷新不复现"迁回 standalone")。restore 经 restoreProject(POST ensureCreate →
+    //     restoreProjectTree 整树复活)。content(nodes/edges)全量 hydrate 属 G1-c/阶段4,本轮删除的画板
+    //     content 随本地 store 移除(阶段4 content 持久化后,restore 整树含 content)——已知 phase-1 gap。
+    //   local 模式(queue inert)→ 保留旧 standalone 回落(画板 body 保留,projectId→undefined)。
+    //     软删基础设施仅服务端有;local 不具备可恢复软删,"standalone 回落理由消失"以软删落地为前提,
+    //     local 无软删 → 保留回落防 IDB 数据丢失(决策 §6 目标针对服务端软删落地后的行为)。
+    // 函数式 set:与 createProject/renameProject 一致,不用外层 snapshot,避免并发 set 间丢更新。
+    const serverAligned = isPersistWriteActive()
+    let removedCanvasIds: string[] = []
     set((state) => {
-      returnedToStandalone = 0
-      const canvases = Object.fromEntries(
-        Object.entries(state.canvases).map(([canvasId, document]) => {
-          if (document.projectId === projectId) {
-            returnedToStandalone += 1
-            return [canvasId, { ...document, projectId: undefined }]
-          }
-          return [canvasId, document]
-        }),
-      )
-
-      return {
-        projects: state.projects.filter((p) => p.id !== projectId),
-        canvases,
+      removedCanvasIds = []
+      if (!serverAligned) {
+        // local: cascade canvases to standalone (body 保留,projectId→undefined)
+        const canvases = Object.fromEntries(
+          Object.entries(state.canvases).map(([canvasId, document]) => {
+            if (document.projectId === projectId) {
+              removedCanvasIds.push(canvasId)
+              return [canvasId, { ...document, projectId: undefined }]
+            }
+            return [canvasId, document]
+          }),
+        )
+        return { projects: state.projects.filter((p) => p.id !== projectId), canvases }
       }
+      // server: collect removed canvas ids + remove from store (soft-deleted server-side; restorable via restoreProject)
+      removedCanvasIds = Object.entries(state.canvases)
+        .filter(([, document]) => document.projectId === projectId)
+        .map(([canvasId]) => canvasId)
+      const canvases = Object.fromEntries(
+        Object.entries(state.canvases).filter(([, document]) => document.projectId !== projectId),
+      )
+      return { projects: state.projects.filter((p) => p.id !== projectId), canvases }
     })
 
     logCanvas(
-      `Deleted project "${project.name}" (${projectId}); ${returnedToStandalone} canvas(es) returned to standalone`,
+      serverAligned
+        ? `Deleted project "${project.name}" (${projectId}); ${removedCanvasIds.length} canvas(es) removed (server whole-tree soft-delete; restorable via restoreProject)`
+        : `Deleted project "${project.name}" (${projectId}); ${removedCanvasIds.length} canvas(es) returned to standalone`,
     )
-    // G1-a P1-1:server/shadow 模式 enqueue deleteProject(DELETE 幂等);local no-op。
+    // G1-a P1-1:server/shadow 模式 enqueue deleteProject(DELETE 幂等;服务端 softDeleteProjectTree 整树级联)。local no-op。
     enqueuePersistWrite({ kind: 'deleteProject', projectId })
+    // A2 前置 b:server 模式为被移除画板 enqueue deleteCanvas ——
+    //   ① 若画板有 pending createCanvas(未 drain),createCanvas+deleteCanvas 经 combineOps 净消,防
+    //      parent 软删后 createCanvas 撞 404 unknown-project terminal(避免 A3 rejected/dead-letter 假阳性);
+    //   ② 若画板已 drain(在 server),DELETE 幂等 204(softDeleteProjectTree 已级联软删,幂等无副作用)。
+    if (serverAligned) {
+      for (const canvasId of removedCanvasIds) {
+        enqueuePersistWrite({ kind: 'deleteCanvas', canvasId })
+      }
+    }
+  },
+  restoreProject: (projectId, name) => {
+    const existing = get().projects.find((p) => p.id === projectId)
+    if (existing) {
+      warnCanvas(`Restore project skipped: already exists ${projectId}`)
+      return
+    }
+
+    // A2 前置 b:restore 整树——本地重加 project(可见),enqueue createProject(POST /api/projects
+    // 带被软删的 id → ensureCreate 命中 deleted → restoreProjectTree 原子恢复 project + 其 canvas meta
+    // + chat-collection + share_links)。drain 后 hydrate 整树回填(画板 meta 回;content 全量 hydrate 属
+    // G1-c/阶段4)。决策 §5.2 restore 原子性由服务端 restoreProjectTree 事务保证;前端只触发 + 回填。
+    const trimmed = name?.trim() || DEFAULT_PROJECT_NAME
+    set((state) => ({
+      projects: [...state.projects, { id: projectId, name: trimmed, createdAt: nowIso() }],
+    }))
+
+    logCanvas(`Restored project "${trimmed}" (${projectId}; server restoreProjectTree via POST ensureCreate)`)
+    // createProject POST 幂等:命中 deleted → restored(整树);命中 live → existing(no-op);missing → created。
+    enqueuePersistWrite({ kind: 'createProject', name: trimmed, id: projectId })
   },
 })

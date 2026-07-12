@@ -43,6 +43,7 @@ vi.mock('../store/remoteDebugReporter', () => ({
 }))
 
 import { useCanvasStore } from '../store/canvasStore'
+import { useChatStore } from '../store/chatStore'
 import {
   drainPersistQueue,
   startPersistWriteQueue,
@@ -51,6 +52,8 @@ import {
   hydrateFromServer,
   shadowCompareWithServer,
   getHydratedUserState,
+  getChatOrderRevision,
+  backfillChatAfterDrain,
 } from './persistBoot'
 import { __resetWriteQueueDb } from './writeRetryQueue'
 import type { ServerPersistAdapter } from './serverPersistAdapter'
@@ -525,5 +528,211 @@ describe('G1-a R3 F2-A — user-state 真实消费方:canvas selection 恢复到
     const fakeOpts = makeOpts({}) // 无 selection 条目
     await hydrateFromServer(fakeAdapter, fakeOpts)
     expect(useCanvasStore.getState().selectedNodeIds).toEqual(['n1']) // 不变
+  })
+})
+
+// ── A2 前置 a / R-7 — chat hydrate merge 语义(保留本地未同步消息)──────────────────────
+// 验收(计划 A2 前置 a / SC a):
+//  - 离线 append chat(本地未同步,不在 server)→ server hydrate 不消失(merge-by-id 保留本地)。
+//  - drain 把 pending 消息发到 PG(PG 侧可查)→ backfillChatAfterDrain 回填 store(server canonical)。
+describe('A2 前置 a / R-7 — chat hydrate merge 语义(保留本地未同步消息)', () => {
+  beforeEach(() => {
+    useChatStore.setState({ messagesByScene: {} })
+  })
+
+  it('离线 append chat → server hydrate 不消失(merge-by-id 保留本地未同步 + orderRevision 落点)', async () => {
+    useCanvasStore.setState({
+      sceneId: 'c1',
+      canvases: { c1: { title: 'c', projectId: 'p1', createdAt: 't', updatedAt: 't', nodes: [], edges: [], tasks: [] } as never },
+    })
+    const localUnsynced = { id: 'msg-local', role: 'user', kind: 'text', text: 'offline append', createdAt: 1, status: 'done' } as never
+    useChatStore.setState({ messagesByScene: { c1: [localUnsynced] } })
+    // server 有另一条已同步消息,不含本地未同步
+    const serverMsg = { id: 'msg-srv', role: 'assistant', kind: 'text', text: 'server', createdAt: 0, status: 'done' } as never
+    const fakeAdapter = {
+      listProjects: async () => ({ projects: [] }),
+      listCanvas: async () => ({ canvases: [] }),
+      listChatMessages: async () => ({ messages: [{ payload: serverMsg }], orderRevision: 5 }),
+    } as unknown as ServerPersistAdapter
+    const fakeOpts = { fetch: async () => new Response('{}', { status: 200 }), baseUrl: '', getAuthHeaders: () => authHeaders() }
+    await hydrateFromServer(fakeAdapter, fakeOpts)
+    const msgs = useChatStore.getState().messagesByScene['c1']!
+    // R-7 merge:server 消息 + 本地未同步都在(wholesale replace 会丢 msg-local)
+    expect(msgs.map((m) => m.id).sort()).toEqual(['msg-local', 'msg-srv'])
+    expect(getChatOrderRevision('c1')).toBe(5) // orderRevision 落点
+  })
+
+  it('drain 后 PG 侧可查 + backfillChatAfterDrain 回填 store(本地未同步已发 PG → server canonical)', async () => {
+    const pgChat: { payload: unknown }[] = []
+    const fetch = async (input: string, init?: RequestInit): Promise<Response> => {
+      const method = (init?.method ?? 'GET').toUpperCase()
+      const path = new URL(input, 'http://stub').pathname
+      if (method === 'POST' && path.includes('/chat')) {
+        const body = init?.body ? JSON.parse(init.body as string) : null
+        pgChat.push({ payload: body?.message })
+        return new Response(null, { status: 201 })
+      }
+      return new Response(null, { status: 204 })
+    }
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    useCanvasStore.setState({
+      sceneId: 'c1',
+      canvases: { c1: { title: 'c', projectId: 'p1', createdAt: 't', updatedAt: 't', metaRevision: 0, nodes: [], edges: [], tasks: [] } as never },
+    })
+    const localMsg = { id: 'msg-offline', role: 'user', kind: 'text', text: 'offline', createdAt: 1, status: 'done' } as never
+    useChatStore.setState({ messagesByScene: { c1: [localMsg] } })
+    const fakeOpts = { fetch, baseUrl: '', getAuthHeaders: () => authHeaders() }
+    // hydrate:server 无该消息 → merge 保留本地未同步(不消失)
+    const adapterBefore = {
+      listProjects: async () => ({ projects: [] }),
+      listCanvas: async () => ({ canvases: [] }),
+      listChatMessages: async () => ({ messages: [], orderRevision: 0 }),
+    } as unknown as ServerPersistAdapter
+    await hydrateFromServer(adapterBefore, fakeOpts)
+    expect(useChatStore.getState().messagesByScene['c1']!.map((m) => m.id)).toEqual(['msg-offline'])
+    // enqueue + drain:pending 消息发到 PG
+    const { enqueueChatAppend } = await import('../store/chatPersistSync')
+    enqueueChatAppend('c1', localMsg)
+    await flush()
+    await drainPersistQueue()
+    expect(pgChat.length).toBe(1) // PG 侧可查
+    // backfill:server 现在有该消息 → merge 取 server canonical(store 回填,内容一致)
+    const adapterAfter = {
+      listProjects: async () => ({ projects: [] }),
+      listCanvas: async () => ({ canvases: [] }),
+      listChatMessages: async () => ({ messages: pgChat, orderRevision: 1 }),
+    } as unknown as ServerPersistAdapter
+    await backfillChatAfterDrain('c1', adapterAfter)
+    expect(useChatStore.getState().messagesByScene['c1']!.map((m) => m.id)).toEqual(['msg-offline']) // store 回填
+  })
+})
+
+// ── A2 前置 b — project delete 整树软删 + restore(server 模式对齐 soft-delete 决议)──────────
+// 验收(计划 A2 前置 b / SC b):
+//  - server 模式 deleteProject 从 store 移除 project + 其画板(不 standalone 回落)+ enqueue deleteProject
+//    + 为被移除画板 enqueue deleteCanvas(cancel pending createCanvas / 幂等已软删)。
+//  - local 模式 deleteProject 保留 standalone 回落(防 IDB 数据丢失,软删基础设施仅服务端有)。
+//  - restoreProject 重加 project + enqueue createProject(POST → server restoreProjectTree 整树恢复)。
+describe('A2 前置 b — project delete 整树软删 + restore', () => {
+  it('server 模式 deleteProject 从 store 移除 project + 其画板(不 standalone)+ enqueue deleteProject/deleteCanvas', async () => {
+    const { fetch, calls } = makeCountingFetch()
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    const pid = useCanvasStore.getState().createProject('P')
+    const cid = useCanvasStore.getState().createCanvas('c', { projectId: pid })
+    await flush()
+    await drainPersistQueue() // create project + canvas on server
+    useCanvasStore.getState().deleteProject(pid)
+    await flush()
+    await drainPersistQueue()
+    // project removed from store
+    expect(useCanvasStore.getState().projects.find((p) => p.id === pid)).toBeUndefined()
+    // canvas removed(NOT standalone — 整条画板从 store 移除,刷新后 hydrate 不再返回 → 不复现"迁回 standalone")
+    expect(useCanvasStore.getState().canvases[cid]).toBeUndefined()
+    // enqueue deleteProject(服务端 softDeleteProjectTree 整树级联)
+    expect(calls.some((c) => c.method === 'DELETE' && c.path === `/api/projects/${encodeURIComponent(pid)}`)).toBe(true)
+    // 为被移除画板 enqueue deleteCanvas(cancel pending createCanvas / 幂等已软删)
+    expect(calls.some((c) => c.method === 'DELETE' && c.path === `/api/canvas/${encodeURIComponent(cid)}`)).toBe(true)
+  })
+
+  it('local 模式 deleteProject 保留 standalone 回落(不丢 IDB 数据,软删基础设施仅服务端有)', async () => {
+    // 不 startPersistWriteQueue → isPersistWriteActive()=false → local standalone 回落
+    const pid = useCanvasStore.getState().createProject('P')
+    const cid = useCanvasStore.getState().createCanvas('c', { projectId: pid })
+    useCanvasStore.getState().deleteProject(pid)
+    expect(useCanvasStore.getState().projects.find((p) => p.id === pid)).toBeUndefined()
+    // canvas body 保留,projectId→undefined(standalone 回落,防数据丢失)
+    expect(useCanvasStore.getState().canvases[cid]).toBeDefined()
+    expect(useCanvasStore.getState().canvases[cid]!.projectId).toBeUndefined()
+  })
+
+  it('restoreProject 重加 project + enqueue createProject(POST /api/projects 带被软删 id → restoreProjectTree)', async () => {
+    const { fetch, calls } = makeCountingFetch()
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    const pid = 'p-soft-deleted'
+    useCanvasStore.getState().restoreProject(pid, 'Restored')
+    await flush()
+    await drainPersistQueue()
+    expect(useCanvasStore.getState().projects.find((p) => p.id === pid)?.name).toBe('Restored')
+    // POST /api/projects with the deleted id → server ensureCreate 命中 deleted → restoreProjectTree 整树恢复
+    const restoreCall = calls.find((c) => c.method === 'POST' && c.path === '/api/projects')
+    expect(restoreCall).toBeDefined()
+    expect(restoreCall!.body).toMatchObject({ id: pid, name: 'Restored' })
+  })
+})
+
+// ── A2 前置 c — duplicateCanvas enqueue + 无 metaRevision 首写 baseline 消 428──────────────
+// 验收(计划 A2 前置 c / SC c):
+//  - duplicateCanvas(server 模式)enqueue createCanvas(POST /api/canvas,带新 id+projectId+title)→ duplicate 后服务端有记录。
+//  - renameCanvas 无 metaRevision(旧 IDB 画板)→ enqueue createCanvas(POST ensureCreate)而非 updateCanvas(PUT)→ 不 428。
+//  - renameCanvas 有 metaRevision → enqueue updateCanvas(PUT,If-Match,不变)。
+describe('A2 前置 c — duplicateCanvas enqueue + 无 metaRevision 首写 baseline 消 428', () => {
+  it('duplicateCanvas(server 模式)enqueue createCanvas(POST /api/canvas,带新 id+projectId+title "... Copy")', async () => {
+    const { fetch, calls } = makeCountingFetch()
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    const pid = useCanvasStore.getState().createProject('P')
+    const sourceId = useCanvasStore.getState().createCanvas('orig', { projectId: pid })
+    await flush()
+    await drainPersistQueue() // create source on server
+    calls.length = 0
+    const newId = useCanvasStore.getState().duplicateCanvas(sourceId)!
+    expect(newId).not.toBe(sourceId)
+    await flush()
+    await drainPersistQueue()
+    // duplicate → POST /api/canvas with new id + projectId + title "... Copy"(服务端有记录)
+    const dupCall = calls.find((c) => c.method === 'POST' && c.path === '/api/canvas')
+    expect(dupCall).toBeDefined()
+    expect(dupCall!.body).toMatchObject({ id: newId, projectId: pid, title: 'orig Copy' })
+  })
+
+  it('renameCanvas 无 metaRevision(旧 IDB 画板)→ enqueue createCanvas 而非 updateCanvas(POST 不 428)', async () => {
+    const { fetch, calls } = makeRevisioningFetch()
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    const pid = useCanvasStore.getState().createProject('P')
+    // 预置旧画板(无 metaRevision,模拟 IDB-only 未 hydrate 到服务端)
+    useCanvasStore.setState({
+      canvases: { 'c-old': { title: 'old', projectId: pid, createdAt: 't', updatedAt: 't', nodes: [], edges: [], tasks: [] } as never },
+    })
+    useCanvasStore.getState().renameCanvas('c-old', 'new-name')
+    await flush()
+    await drainPersistQueue()
+    // 无 metaRevision → enqueue createCanvas(POST ensureCreate 带新 title),不发 updateCanvas(PUT 对 existing 缺 base → 428)
+    const createCall = calls.find((c) => c.method === 'POST' && c.path === '/api/canvas')
+    expect(createCall).toBeDefined()
+    expect(createCall!.body).toMatchObject({ id: 'c-old', title: 'new-name' })
+    expect(calls.some((c) => c.method === 'PUT' && c.path === '/api/canvas/c-old')).toBe(false)
+  })
+
+  it('renameCanvas 有 metaRevision → enqueue updateCanvas(PUT,If-Match,不变,不 428)', async () => {
+    const { fetch, calls } = makeRevisioningFetch()
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    const pid = useCanvasStore.getState().createProject('P')
+    const cid = useCanvasStore.getState().createCanvas('c', { projectId: pid })
+    await flush()
+    await drainPersistQueue() // create → metaRevision=0 回灌
+    calls.length = 0
+    useCanvasStore.getState().renameCanvas(cid, 'c2')
+    await flush()
+    await drainPersistQueue()
+    // 有 metaRevision → PUT with if-match=0(不 428,对齐既有 happy path)
+    expect(calls.some((c) => c.method === 'PUT' && c.path === `/api/canvas/${encodeURIComponent(cid)}` && c.headers['if-match'] === '0')).toBe(true)
+  })
+
+  it('moveCanvasToProject 无 metaRevision → enqueue createCanvas(POST,带 target projectId)', async () => {
+    const { fetch, calls } = makeCountingFetch()
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    const pidA = useCanvasStore.getState().createProject('PA')
+    const pidB = useCanvasStore.getState().createProject('PB')
+    // 旧画板在 pidA,无 metaRevision
+    useCanvasStore.setState({
+      canvases: { 'c-old': { title: 'old', projectId: pidA, createdAt: 't', updatedAt: 't', nodes: [], edges: [], tasks: [] } as never },
+    })
+    useCanvasStore.getState().moveCanvasToProject('c-old', pidB)
+    await flush()
+    await drainPersistQueue()
+    // 无 metaRevision → POST createCanvas with target projectId=pidB(不 428)
+    const moveCreateCall = calls.find((c) => c.method === 'POST' && c.path === '/api/canvas')
+    expect(moveCreateCall).toBeDefined()
+    expect(moveCreateCall!.body).toMatchObject({ id: 'c-old', projectId: pidB })
+    expect(calls.some((c) => c.method === 'PUT' && c.path === '/api/canvas/c-old')).toBe(false)
   })
 })

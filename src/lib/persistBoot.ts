@@ -99,6 +99,71 @@ export const __resetPersistBoot = (): void => {
 }
 
 // ── server 模式 boot:hydrate 非画布域(从 BFF 恢复)──
+
+/**
+ * R-7:hydrate 某 scene 的 chat collection(merge 语义,非 wholesale replace)。
+ *
+ * 痛(计划 A2 前置 a / R-7):离线 append 的 chat 消息本地已 committed + 入 writeRetryQueue
+ * (IDB 持久),但尚未 drain 到 PG。若 hydrate 用服务端返回 wholesale replace
+ * `messagesByScene[sceneId]`,本地未同步消息被覆盖 → "离线 append chat → 上线刷新消失"。
+ *
+ * 解:merge-by-id —— server 消息是已同步消息的 canonical 真值(按 id 覆盖本地);本地消息
+ * 中 id 不在 server 集的(= pending 在队列、未 drain 到 PG)按 union 保留,append 在 server
+ * 消息之后(离线 append 的消息 createdAt 最新,时序正确)。drain 把 pending 消息发到 PG 后,
+ * 下次 hydrate 该消息已在 server 集 → 取 server canonical(内容一致,opaque payload)。
+ *
+ * orderRevision 落点(DP-6R per-actor×canvas reorder cursor;供 reorder If-Match,非只 log)。
+ * 仅处理传入 sceneId;切 scene 的 per-scene re-hydrate 属 G1-c 范畴,本轮只 hydrate active。
+ */
+const hydrateChatForScene = async (
+  sceneId: string,
+  adapter: ReturnType<typeof getServerPersistAdapter>,
+): Promise<void> => {
+  const { useChatStore } = await import('../store/chatStore')
+  const { messages, orderRevision } = await adapter.listChatMessages(sceneId)
+  const serverMessages = messages.map((r) => r.payload as ChatMessage)
+  // R-7 merge:server canonical for synced(按 id);本地未同步(id 不在 server 集)保留。
+  const serverIds = new Set(serverMessages.map((m) => m.id))
+  const localMessages = useChatStore.getState().messagesByScene[sceneId] ?? []
+  const localOnly = localMessages.filter((m) => !serverIds.has(m.id))
+  const merged = [...serverMessages, ...localOnly]
+  useChatStore.setState({
+    messagesByScene: {
+      ...useChatStore.getState().messagesByScene,
+      [sceneId]: merged,
+    },
+  })
+  // R2 F4:orderRevision 落点(DP-6R 契约;供 reorder If-Match,非只 log)。
+  orderRevisionByCanvas.set(sceneId, orderRevision)
+  debugLogger.log(
+    SOURCE,
+    `server hydrate: ${serverMessages.length} chat message(s) from BFF + ${localOnly.length} local unsynced retained for canvas ${sceneId} (R-7 merge; orderRevision=${orderRevision})`,
+  )
+}
+
+/**
+ * R-7:drain 后 store 回填——重拉 active scene(或指定 scene)chat 并 merge,让 store 与 PG
+ * canonical 状态对齐。drain 把 pending 未同步消息发到 PG 后,回填确认 store 反映服务端真值
+ * (merge 语义同 hydrateChatForScene,保留 drain 期间新产生的本地未同步消息)。
+ *
+ * 用途:测试 SC "drain 后 store 回填" 的显式钩子;未来生产可接 post-drain 钩子(当前 fire-and-
+ * forget 调用方控制时机,避免与 queue 内部 timer drain 竞态)。local 模式无 hydrate 概念,调用
+ * 为 no-op(adapter unwired → listChatMessages reject → warn,不阻断)。
+ */
+export const backfillChatAfterDrain = async (
+  sceneId?: string,
+  adapter: ReturnType<typeof getServerPersistAdapter> = getServerPersistAdapter(),
+): Promise<void> => {
+  const { useCanvasStore } = await import('../store/canvasStore')
+  const target = sceneId ?? useCanvasStore.getState().sceneId
+  if (!target) return
+  try {
+    await hydrateChatForScene(target, adapter)
+  } catch (error) {
+    debugLogger.warn(SOURCE, `backfillChatAfterDrain failed for ${target}: ${msg(error)}`)
+  }
+}
+
 /**
  * server 模式冷启动 hydrate:project 全量(替换 store.projects)+ canvas meta 列表(可观测,
  * 全量 content hydrate 属 G1-c 本轮不做)+ user-state map(无 client KV store,application deferred)。
@@ -223,27 +288,13 @@ export const hydrateFromServer = async (
     debugLogger.warn(SOURCE, `hydrateUserStateMap failed: ${msg(error)}`)
   }
 
-  // 4. chat(DP-6R P1-1,per-actor):hydrate active canvas 的 chat collection(当前 actor 自己的)。
-  //    RecordEntry.payload = opaque ChatMessage,窄化灌入 useChatStore.messagesByScene[activeSceneId]。
-  //    仅 active canvas(chat 是 per-canvas 子资源;切 scene 时按需 re-hydrate 属 G1-c 范畴,本轮只 hydrate active)。
+  // 4. chat(DP-6R P1-1,per-actor):hydrate active canvas 的 chat collection(R-7 merge 语义,
+  //    非 wholesale replace——保留本地未同步消息,见 hydrateChatForScene)。仅 active canvas
+  //    (chat 是 per-canvas 子资源;切 scene 时按需 re-hydrate 属 G1-c 范畴,本轮只 hydrate active)。
   try {
-    const { useChatStore } = await import('../store/chatStore')
     const sceneId = useCanvasStore.getState().sceneId
     if (sceneId) {
-      const { messages, orderRevision } = await adapter.listChatMessages(sceneId)
-      const chatMessages = messages.map((r) => r.payload as ChatMessage)
-      useChatStore.setState({
-        messagesByScene: {
-          ...useChatStore.getState().messagesByScene,
-          [sceneId]: chatMessages,
-        },
-      })
-      // R2 F4:orderRevision 落点(DP-6R 契约;供 reorder If-Match,非只 log)。
-      orderRevisionByCanvas.set(sceneId, orderRevision)
-      debugLogger.log(
-        SOURCE,
-        `server hydrate: ${chatMessages.length} chat message(s) for active canvas ${sceneId} from BFF (per-actor DP-6R; orderRevision=${orderRevision})`,
-      )
+      await hydrateChatForScene(sceneId, adapter)
     }
   } catch (error) {
     debugLogger.warn(SOURCE, `listChatMessages hydrate failed: ${msg(error)} (chat stays IDB/local)`)

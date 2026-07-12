@@ -9,6 +9,7 @@ import { useState } from 'react'
 import { ChevronDown, ChevronRight, Folder, FolderOpen, Pencil, Plus, SquarePen, Trash2 } from 'lucide-react'
 import { useCanvasStore } from '../../store/canvasStore'
 import { toastFeedback } from '../../store/toastStore'
+import { isPersistWriteActive } from '../../lib/persistBoot'
 import { ContextMenu, type ContextMenuItem } from './ContextMenu'
 import { ConfirmDialog } from './ConfirmDialog'
 import { EditableName } from './EditableName'
@@ -44,6 +45,10 @@ export function ProjectRow(props: {
   const createCanvas = useCanvasStore((s) => s.createCanvas)
   const loadScene = useCanvasStore((s) => s.loadScene)
 
+  // A2 前置 b:server 模式(queue active)delete 走整树软删(画板一并删除,可恢复);
+  // local 模式保留旧 standalone 回落(画板移回 Canvas,不删)。文案据此对齐,不误称"移回 Canvas"。
+  const serverAligned = isPersistWriteActive()
+
   const [menuPosition, setMenuPosition] = useState<{ x: number; y: number } | null>(null)
   const [confirmOpen, setConfirmOpen] = useState(false)
 
@@ -65,7 +70,11 @@ export function ProjectRow(props: {
   const confirmRemove = () => {
     deleteProject(project.id)
     setConfirmOpen(false)
-    toastFeedback.success(`已删除项目"${project.name}",${canvasCount} 块画板已移回 Canvas`)
+    toastFeedback.success(
+      serverAligned
+        ? `已删除项目"${project.name}",${canvasCount} 块画板已一并软删除(可恢复)`
+        : `已删除项目"${project.name}",${canvasCount} 块画板已移回 Canvas`,
+    )
   }
 
   const menuItems: ContextMenuItem[] = [
@@ -135,7 +144,11 @@ export function ProjectRow(props: {
       <ConfirmDialog
         open={confirmOpen}
         title={`删除项目"${project.name}"?`}
-        description={`项目下 ${canvasCount} 块画板将移回 Canvas,画板不会被删除。`}
+        description={
+          serverAligned
+            ? `项目下 ${canvasCount} 块画板将一并软删除(可在回收站恢复)。`
+            : `项目下 ${canvasCount} 块画板将移回 Canvas,画板不会被删除。`
+        }
         confirmLabel="删除项目"
         danger
         onConfirm={confirmRemove}

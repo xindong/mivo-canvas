@@ -120,11 +120,21 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
     // C8: duplicate does NOT inherit the source's timestamps — the copy is a new
     // entity with fresh createdAt/updatedAt. projectId IS inherited (copy stays
     // in the same project); only the title gets a " Copy" suffix.
+    // A2 前置 c:server 模式 standalone 源(无 projectId)时镜像 createCanvas 的兜底
+    // (firstExisting / 建 Default Project)——否则 enqueue createCanvas 缺 projectId,POST
+    // /api/canvas → 404 unknown-project 终态删记录,"duplicate 后服务端有记录"不成立。
+    let docProjectId = sourceDocument.projectId
+    if (isServerPersist && !docProjectId) {
+      const firstExisting = get().projects[0]?.id
+      docProjectId = firstExisting ?? get().createProject('Default Project')
+    }
+    const opProjectId = docProjectId ?? ''
     const now = new Date().toISOString()
     const duplicatedDocument = {
       ...normalizeDocument({
         ...sourceDocument,
         title: `${sourceDocument.title} Copy`,
+        projectId: docProjectId,
         nodes: cloneNodes(sourceDocument.nodes),
         tasks: cloneTasks(sourceDocument.tasks),
       }),
@@ -149,6 +159,14 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
     }))
 
     logCanvas(`Duplicated canvas "${sourceDocument.title}" to ${id}`)
+    // G1-a P1-2 / A2 前置 c:server/shadow 模式 enqueue createCanvas(POST 幂等,带新 id + projectId + title)。
+    // 服务端建记录 + onSuccess 回灌 metaRevision,后续 rename/move 用 fresh base(不 428)。local no-op。
+    // standalone 源在 local 模式(opProjectId='')不 enqueue——server 画布必须归 project,无 project 不可 persist。
+    if (opProjectId) {
+      enqueuePersistWrite({ kind: 'createCanvas', canvasId: id, projectId: opProjectId, title: duplicatedDocument.title })
+    } else {
+      warnCanvas(`Duplicate canvas ${id} not enqueued: standalone source, no projectId (local mode; not server-persistable)`)
+    }
     return id
   },
   deleteCanvas: (canvasId) =>
@@ -227,9 +245,15 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
       // non-active path returns { canvases } exactly as before.
       return patchCanvasDocument(state, sceneId, { title })
     })
-    // G1-a P1-2:server/shadow 模式 enqueue updateCanvas(PUT,If-Match = metaRevision)。
-    // IDB 画布无 metaRevision → 428 rejected(fail-visible:canvas 全量 hydrate 属 G1-c,未 hydrate 无法同步 rename)。local no-op。
-    if (existing) {
+    if (!existing) return
+    // G1-a P1-2 / A2 前置 c:metaRevision 有值 → enqueue updateCanvas(PUT,If-Match = metaRevision)。
+    //   metaRevision undefined(旧 IDB 画板,未 hydrate 到服务端)→ enqueue createCanvas(POST ensureCreate
+    //   带新 title)而非 updateCanvas(PUT)——PUT 对 existing 缺 If-Match base → 428(返修 #4);POST 三态
+    //   (created/restored/existing)不 428 + onSuccess 回灌 metaRevision,后续 rename 用 fresh base。
+    //   队列 combineOps 把 pending createCanvas + 后续 updateCanvas 合并为单 createCanvas(带最终 title),
+    //   故首写改 create 不会丢 rename。standalone 画板(无 projectId)在 local 不 enqueue(local no-op);
+    //   server 模式 standalone 用 firstExisting 兜底(不建 Default,避免 rename 副作用)。
+    if (metaRevision !== undefined) {
       enqueuePersistWrite({
         kind: 'updateCanvas',
         canvasId: sceneId,
@@ -237,6 +261,13 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
         title,
         baseRevision: metaRevision,
       })
+    } else {
+      const opProjectId = existing.projectId ?? get().projects[0]?.id ?? ''
+      if (opProjectId) {
+        enqueuePersistWrite({ kind: 'createCanvas', canvasId: sceneId, projectId: opProjectId, title })
+      } else {
+        warnCanvas(`renameCanvas ${sceneId} not enqueued: no metaRevision and no projectId (standalone, no project to persist into)`)
+      }
     }
   },
   moveCanvasToProject: (canvasId, projectId) =>
@@ -256,15 +287,23 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
 
       const target = projectId === undefined ? 'Canvas' : projectId
       logCanvas(`Moved canvas "${document.title}" (${canvasId}) → ${target}`)
-      // G1-a P1-2:server/shadow 模式 enqueue updateCanvas(PUT,projectId 改 = move;move 双端 owner-only authz)。
-      // baseRevision = metaRevision(IDB 画布无 → 428;G1-c canvas hydrate 后填充)。fire-and-forget;local no-op。
-      enqueuePersistWrite({
-        kind: 'updateCanvas',
-        canvasId,
-        projectId: projectId ?? '',
-        title: document.title,
-        baseRevision: document.metaRevision,
-      })
+      // G1-a P1-2 / A2 前置 c:metaRevision 有值 → enqueue updateCanvas(PUT,projectId 改 = move;move 双端 owner-only authz)。
+      //   metaRevision undefined(旧 IDB 画板)→ enqueue createCanvas(POST ensureCreate,带 target projectId + title)
+      //   而非 updateCanvas(PUT)——PUT 对 existing 缺 If-Match base → 428(返修 #4);POST 三态不 428 + onSuccess
+      //   回灌 metaRevision。move-to-standalone(projectId undefined)无 target project → 不 enqueue(不可 persist)。
+      if (document.metaRevision !== undefined) {
+        enqueuePersistWrite({
+          kind: 'updateCanvas',
+          canvasId,
+          projectId: projectId ?? '',
+          title: document.title,
+          baseRevision: document.metaRevision,
+        })
+      } else if (projectId !== undefined) {
+        enqueuePersistWrite({ kind: 'createCanvas', canvasId, projectId, title: document.title })
+      } else {
+        warnCanvas(`moveCanvasToProject ${canvasId} not enqueued: no metaRevision and move-to-standalone (no target project to persist into)`)
+      }
       return {
         canvases: {
           ...state.canvases,

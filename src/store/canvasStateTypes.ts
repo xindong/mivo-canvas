@@ -83,6 +83,7 @@ export type CanvasState = {
   createProject: (name?: string) => string
   renameProject: (projectId: string, name: string) => void
   deleteProject: (projectId: string) => void
+  restoreProject: (projectId: string, name?: string) => void
   moveCanvasToProject: (canvasId: CanvasId, projectId?: string) => void
   createCanvas: (title?: string, options?: { projectId?: string; templateId?: DemoSceneId }) => CanvasId
   duplicateCanvas: (canvasId?: CanvasId) => CanvasId | undefined
