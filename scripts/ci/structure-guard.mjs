@@ -31,9 +31,78 @@ import { join, relative, resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-const REPO_ROOT = resolve(__dirname, '..', '..')
+// MIVO_GUARD_ROOT 允许 fixture 测试把扫描根重定向到临时目录(默认 = 仓根)。
+const REPO_ROOT = process.env.MIVO_GUARD_ROOT ? resolve(process.env.MIVO_GUARD_ROOT) : resolve(__dirname, '..', '..')
 const THRESHOLD = 900
 const STATE_CALL_PATTERN = 'useCanvasStore.getState('
+
+// --- server 分层方向规则(rule ④)辅助函数(A7a-3)---
+// server 文件的模块归类:server/lib, server/routes, server/persist, server/platform, server/tasks, server。
+function serverModuleOf(rel) {
+  const parts = rel.split('/')
+  if (parts.length >= 3 && parts[0] === 'server') return `${parts[0]}/${parts[1]}`
+  return parts[0]
+}
+// 极简注释剥离(// 行 + /* */ 块,字符串/模板字面量感知),防注释内 `from '...'` 造成方向规则假阳性。
+function stripSourceComments(s) {
+  let out = '', i = 0, inStr = false, strCh = ''
+  while (i < s.length) {
+    const c = s[i], nx = s[i + 1]
+    if (inStr) {
+      out += c
+      if (c === '\\') { out += nx || ''; i += 2; continue }
+      if (c === strCh) inStr = false
+      i++; continue
+    }
+    if (c === '"' || c === "'" || c === '`') { inStr = true; strCh = c; out += c; i++; continue }
+    if (c === '/' && nx === '/') { while (i < s.length && s[i] !== '\n') i++; continue }
+    if (c === '/' && nx === '*') { i += 2; while (i < s.length && !(s[i] === '*' && s[i + 1] === '/')) i++; i += 2; continue }
+    out += c; i++
+  }
+  return out
+}
+const RE_GUARD_FROM = /\bfrom\s*['"](\.\.?\/[^'"]+)['"]/g
+const RE_GUARD_DYNAMIC = /\bimport\s*\(\s*['"](\.\.?\/[^'"]+)['"]\s*\)/g
+// 提取相对 import specifier(剔注释后)。
+function scanRelativeSpecs(content) {
+  const stripped = stripSourceComments(content)
+  const specs = new Set()
+  RE_GUARD_FROM.lastIndex = 0
+  RE_GUARD_DYNAMIC.lastIndex = 0
+  let m
+  while ((m = RE_GUARD_FROM.exec(stripped)) !== null) specs.add(m[1])
+  while ((m = RE_GUARD_DYNAMIC.exec(stripped)) !== null) specs.add(m[1])
+  return [...specs]
+}
+// 把相对 spec 解析为 posix 仓内相对路径(仅路径规范化,不查 FS)。
+function resolveSpecPath(spec, fromFileRel) {
+  if (!spec.startsWith('.')) return null
+  const slashIdx = fromFileRel.lastIndexOf('/')
+  const segs = slashIdx >= 0 ? fromFileRel.slice(0, slashIdx).split('/') : []
+  for (const part of spec.split('/')) {
+    if (part === '.' || part === '') continue
+    if (part === '..') { segs.pop(); continue }
+    segs.push(part)
+  }
+  return segs.join('/')
+}
+// Rule ④: server 非 routes 层(lib/persist/platform/tasks)禁 import server/routes。
+// routing 是 server 顶层,下层不得反向依赖 routes。纯函数(入参 [{rel, content}]),便于 fixture 红测。
+export function checkServerDirectionRule(files) {
+  const violations = []
+  for (const f of files) {
+    if (!f.rel.startsWith('server/')) continue
+    const mod = serverModuleOf(f.rel)
+    if (mod === 'server/routes' || mod === 'server') continue
+    for (const spec of scanRelativeSpecs(f.content)) {
+      const target = resolveSpecPath(spec, f.rel)
+      if (target && (target === 'server/routes' || target.startsWith('server/routes/'))) {
+        violations.push(`[FAIL] server 分层方向: ${f.rel}(${mod}) import ${spec} → ${target}(server/routes) — 非 routes 层禁依赖 server/routes(routing 是顶层)`)
+      }
+    }
+  }
+  return violations
+}
 
 const baselinePath = join(__dirname, 'structure-guard.baseline.json')
 const baseline = JSON.parse(readFileSync(baselinePath, 'utf8'))
@@ -234,6 +303,20 @@ for (const f of prodBanFiles) {
   }
 }
 console.log(`[OK] mockGeneration/mockGenerationAdapter 生产路径 ban: ${prodBanFiles.length} 个生产文件扫描,${banHits} 命中(基线 0,任何命中即 FAIL)`)
+
+// --- 规则 ④ server 分层方向(非 routes 层禁 import server/routes;A7a-3)---
+// routing 是 server 顶层,lib/persist/platform/tasks 不得反向 import routes。当前基线 0
+// (codemap 模块图:仅 server/routes → 其它,无反向)。绝对 FAIL(同 rule ③,不依赖 base)。
+const serverScanFiles = listTsFiles(join(REPO_ROOT, 'server')).filter(
+  (f) => !/\.(test|spec)\.(ts|tsx)$/.test(f) && !/__tests__/.test(f)
+)
+const serverFileList = serverScanFiles.map((f) => ({
+  rel: relative(REPO_ROOT, f).replace(/\\/g, '/'),
+  content: readFileSync(f, 'utf8'),
+}))
+const dirViolations = checkServerDirectionRule(serverFileList)
+for (const v of dirViolations) failures.push(v)
+console.log(`[OK] server 分层方向: ${serverFileList.length} 个生产 server 文件扫描,${dirViolations.length} 方向违规(基线 0,非 routes→routes 即 FAIL)`)
 
 // --- 汇总 ---
 console.log(`\n结构守卫: ${allFiles.length} 个文件扫描完毕,${failures.length} FAIL,${warnings.length} WARN`)
