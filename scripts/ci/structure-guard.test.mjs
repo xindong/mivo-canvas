@@ -98,6 +98,42 @@ describe('structure-guard rule ④ server 分层方向 (A7a-3)', () => {
     expect(exit).toBe(0)
     expect(out).not.toContain('[FAIL] server 分层方向')
   })
+
+  // A7a 返修 P2-2:side-effect 裸 import `import '../routes/r'`(无 from 无 ())原两 regex 都不命中,
+  // rule④ 可被绕过。补 RE_GUARD_SIDE 收口 + RED fixture。
+  it('RED: side-effect 裸 import `import "../routes/r"`(server/lib)→ FAIL', () => {
+    const root = makeFixture([
+      CHATSTORE,
+      { path: 'server/lib/x.ts', content: "import '../routes/r'\n" },
+      { path: 'server/routes/r.ts', content: 'export const r = 1\n' },
+    ])
+    const { exit, out } = runGuard(root)
+    expect(exit).toBe(1)
+    expect(out).toContain('[FAIL] server 分层方向')
+    expect(out).toContain('server/lib/x.ts')
+  })
+
+  it('CLEAN: side-effect 裸 import 在 server/routes 内(exempt,正向)→ PASS', () => {
+    const root = makeFixture([
+      CHATSTORE,
+      { path: 'server/routes/r.ts', content: "import '../lib/l'\n" },
+      { path: 'server/lib/l.ts', content: 'export const l = 1\n' },
+    ])
+    const { exit, out } = runGuard(root)
+    expect(exit).toBe(0)
+    expect(out).not.toContain('[FAIL] server 分层方向')
+  })
+
+  it('CLEAN: side-effect 裸 import 在注释内 → PASS(剔注释)', () => {
+    const root = makeFixture([
+      CHATSTORE,
+      { path: 'server/lib/x.ts', content: "// import '../routes/r'\nimport { p } from '../persist/p'\n" },
+      { path: 'server/persist/p.ts', content: 'export const p = 1\n' },
+    ])
+    const { exit, out } = runGuard(root)
+    expect(exit).toBe(0)
+    expect(out).not.toContain('[FAIL] server 分层方向')
+  })
 })
 
 describe('structure-guard rule ① 扩面:src/app 入扫描 (A7a-3)', () => {

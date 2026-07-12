@@ -63,15 +63,20 @@ function stripSourceComments(s) {
 }
 const RE_GUARD_FROM = /\bfrom\s*['"](\.\.?\/[^'"]+)['"]/g
 const RE_GUARD_DYNAMIC = /\bimport\s*\(\s*['"](\.\.?\/[^'"]+)['"]\s*\)/g
+// side-effect 裸 import:`import './x'`(无 from 无 ())。A7a 返修 P2-2:原 FROM/DYNAMIC 两 regex
+// 都不命中此形态 → rule④ 可被 `import '../routes/r'` 绕过。补此 regex 收口。
+const RE_GUARD_SIDE = /\bimport\s+['"](\.\.?\/[^'"]+)['"]/g
 // 提取相对 import specifier(剔注释后)。
 function scanRelativeSpecs(content) {
   const stripped = stripSourceComments(content)
   const specs = new Set()
   RE_GUARD_FROM.lastIndex = 0
   RE_GUARD_DYNAMIC.lastIndex = 0
+  RE_GUARD_SIDE.lastIndex = 0
   let m
   while ((m = RE_GUARD_FROM.exec(stripped)) !== null) specs.add(m[1])
   while ((m = RE_GUARD_DYNAMIC.exec(stripped)) !== null) specs.add(m[1])
+  while ((m = RE_GUARD_SIDE.exec(stripped)) !== null) specs.add(m[1])
   return [...specs]
 }
 // 把相对 spec 解析为 posix 仓内相对路径(仅路径规范化,不查 FS)。
