@@ -55,8 +55,43 @@ export const clearAllStorage = async (page) => {
   })
 }
 
+// FX-6 (#183): the app namespaces its IDB persist keys by the current auth
+// userId — anonymous → raw `name`; authenticated → `name:<userId>`. The e2e dev
+// topology turns the auth dev stub ON (harness.startSmokeBffServer sets
+// MIVO_DEV_AUTH_STUB=1, dev stub /api/auth/me returns username `dev@local`),
+// so canvasStore/chatStore persist under `mivo-canvas-demo:dev@local` /
+// `mivo-chat-demo:dev@local`, NOT the raw names the scenarios pass in. Before
+// this fix the harness read the raw key and found nothing (chat-generation,
+// mask-cross-scene, mask-hydration all timed out on persist assertions) even
+// though the app had written the data — under the namespaced key.
+//
+// Resolve the logical name through the app's OWN `namespacedKey` so the harness
+// reads/writes the same physical key the app uses (single source of truth:
+// anonymous → raw, authenticated → namespaced, no hard-coded userId). Falls back
+// to the raw name when the module isn't reachable — a fresh page before the app
+// hydrates, or a non-app context — in which case the app's
+// `migrateToNamespaced` claims the legacy raw key on its first authenticated
+// read (the migration scenario's v1-inject path still works).
+const resolvePersistKey = async (page, name) => {
+  try {
+    return await page.evaluate(async (logical) => {
+      try {
+        const mod = await import('/src/lib/persistUserId.ts')
+        if (mod && typeof mod.namespacedKey === 'function') return mod.namespacedKey(logical)
+      } catch {
+        // module not yet served (pre-hydration) or page is not the app — caller
+        // falls back to the raw name; migrateToNamespaced handles legacy claims.
+      }
+      return logical
+    }, name)
+  } catch {
+    return name
+  }
+}
+
 /** Read a persisted KV value (the raw JSON string zustand persist stored). */
 export const readPersistedKv = async (page, key) => {
+  const physical = await resolvePersistKey(page, key)
   return page.evaluate(async (k) => {
     return new Promise((resolve) => {
       const req = indexedDB.open('mivo-canvas-persist', 1)
@@ -81,11 +116,15 @@ export const readPersistedKv = async (page, key) => {
       }
       req.onerror = () => resolve(null)
     })
-  }, key)
+  }, physical)
 }
 
 /** Write a persisted KV value (put upsert). Used by the migration scenario to inject
- *  legacy v1 state before the app rehydrates from IDB. */
+ *  legacy v1 state before the app rehydrates from IDB. Writes the RAW logical name
+ *  (NOT namespaced) on purpose: legacy injection simulates a pre-FX-6 session whose
+ *  state lived under the un-suffixed key, and the app's `migrateToNamespaced` claims
+ *  it on first authenticated read. Resolving through `namespacedKey` here would race
+ *  with the chat store's own async write to the namespaced key and clobber v1. */
 export const writePersistedKv = async (page, key, value) => {
   await page.evaluate(async ({ k, v }) => {
     return new Promise((resolve) => {
