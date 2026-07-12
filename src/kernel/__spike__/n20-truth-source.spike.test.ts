@@ -1849,59 +1849,60 @@ describe('N2-0 返修 §10 G1-b 衔接(P2-8): FieldPath 非空 + 数组中性 in
     class BaseDrivenHarness {
       readonly canvasId: string
       constructor(canvasId = 'c1') { this.canvasId = canvasId }
-      private recs = new Map<string, { rev: number; fc: FieldClocks; present: boolean; lastWriter: string }>()
+      private recs = new Map<string, { rev: number; fc: FieldClocks; present: boolean; writers: Record<string, string> }>()
       private cv = 0
       private children: string[] = []
       private outbox: { to: string; field: string; by: string }[] = []
-      seedRecord(nodeId: string, fc: FieldClocks = {}) { this.recs.set(nodeId, { rev: 0, fc: { ...fc }, present: true, lastWriter: '' }) }
+      seedRecord(nodeId: string, fc: FieldClocks = {}) { this.recs.set(nodeId, { rev: 0, fc: { ...fc }, present: true, writers: {} }) }
       recordExists(id: string) { return this.recs.get(id)?.present === true }
       fieldClock(nodeId: string, field: string): number { return this.recs.get(nodeId)?.fc[field] ?? 0 }
-      /** hydrate snapshot 签发 record base(绑 canvasId+recordId+rev+per-field clock)。 */
+      fieldWriter(nodeId: string, field: string): string { return this.recs.get(nodeId)?.writers[field] ?? '' }
+      /** hydrate snapshot 签发 record base(绑 canvasId+recordId+rev+per-field clock;clock key = fieldKeyOf 完整 path)。 */
       snapshot(nodeId: string): BaseCursor | null {
         const r = this.recs.get(nodeId); return r && r.present ? encodeBase(this.canvasId, nodeId, r.rev, r.fc) : null
       }
       /** reorder base 签发(canvas-scoped cv)。 */
       snapshotOrder(): BaseCursor { return encodeOrderBase(this.canvasId, this.cv) }
       seedChildren(ids: string[]) { this.children = [...ids]; this.cv = 0 }
-      /** edit:malformed/scope-mismatch→400;永远 200(G4-4);**同-field stale 才 overwritten**(不同字段 stale 不误报)。 */
+      /** edit:malformed/scope-mismatch→400;永远 200(G4-4);**同-field stale 才 overwritten**(fieldKeyOf 完整 path 粒度;per-field writer map)。 */
       edit(nodeId: string, op: { fieldPath: FieldPath; value: unknown }, base: BaseCursor, actor: string): Outcome {
         const d = decodeBase(base, this.canvasId, nodeId)  // ★ scope check(canvasId+recordId 必须匹配)
         if (!d) return { status: 400, outcome: 'rejected' }  // malformed/unsigned/scope-mismatch → 400
         const r = this.recs.get(nodeId)
         if (!r || !r.present) return { status: 404, outcome: 'rejected' }
-        const field = String(op.fieldPath[0])
+        const field = fieldKeyOf([...op.fieldPath])  // ★ v7:完整 path key(transform.x ≠ transform.y;leaf-level 粒度)
         const baseFC = d.fieldClocks[field] ?? 0
         const curFC = r.fc[field] ?? 0
-        const sameFieldStale = baseFC < curFC  // ★ 同-field stale(仅当本 op 目标字段被并发改过);别的字段变过不算
-        if (sameFieldStale && r.lastWriter) this.outbox.push({ to: r.lastWriter, field, by: actor })
-        r.fc[field] = curFC + 1; r.rev += 1; r.lastWriter = actor
-        return { status: 200, outcome: 'accepted', base: encodeBase(this.canvasId, nodeId, r.rev, r.fc), overwritten: sameFieldStale }  // ★ edit 永 200;同-field stale 才 overwritten
+        const sameFieldStale = baseFC < curFC  // ★ 同-field(完整 path)stale 才 overwritten;别的字段(含 transform.y)变过不算
+        if (sameFieldStale && r.writers[field]) this.outbox.push({ to: r.writers[field], field, by: actor })  // ★ v7:通知该完整 path 前写者(per-field writer map;非 record 级单值误通知)
+        r.fc[field] = curFC + 1; r.rev += 1; r.writers[field] = actor  // ★ per-field writer map(非 record 级 lastWriter)
+        return { status: 200, outcome: 'accepted', base: encodeBase(this.canvasId, nodeId, r.rev, r.fc), overwritten: sameFieldStale }
       }
       /** delete:malformed/scope-mismatch→400;fresh base(rev===current)→200;stale base(rev<current)→409 race。 */
       delete(nodeId: string, base: BaseCursor): Outcome {
-        const d = decodeBase(base, this.canvasId, nodeId)  // ★ scope check
+        const d = decodeBase(base, this.canvasId, nodeId)
         if (!d) return { status: 400, outcome: 'rejected' }
         const r = this.recs.get(nodeId)
         if (!r || !r.present) return { status: 404, outcome: 'rejected' }
-        if (d.revision === r.rev) { r.present = false; return { status: 200, outcome: 'accepted' } }  // ★ fresh → 200(removed)
-        return { status: 409, outcome: 'conflict', base: encodeBase(this.canvasId, nodeId, r.rev, r.fc) }  // ★ stale → 409
+        if (d.revision === r.rev) { r.present = false; return { status: 200, outcome: 'accepted' } }
+        return { status: 409, outcome: 'conflict', base: encodeBase(this.canvasId, nodeId, r.rev, r.fc) }
       }
       /** reorder:malformed/scope-mismatch→400;fresh cv + valid perm→200(顺序变也成功);stale cv / orderedIds≠live→409。 */
       reorder(orderedIds: string[], base: BaseCursor): Outcome {
-        const d = decodeOrderBase(base, this.canvasId)  // ★ canvas scope check
+        const d = decodeOrderBase(base, this.canvasId)
         if (!d) return { status: 400, outcome: 'rejected' }
-        if (d.cv !== this.cv) return { status: 409, outcome: 'conflict', base: this.snapshotOrder() }  // ★ stale cv → 409
+        if (d.cv !== this.cv) return { status: 409, outcome: 'conflict', base: this.snapshotOrder() }
         const liveSet = new Set(this.children)
         const validPerm = orderedIds.length === this.children.length && new Set(orderedIds).size === orderedIds.length && orderedIds.every((id) => liveSet.has(id))
-        if (!validPerm) return { status: 409, outcome: 'conflict', base: this.snapshotOrder() }  // orderedIds≠live → 409
+        if (!validPerm) return { status: 409, outcome: 'conflict', base: this.snapshotOrder() }
         this.children = [...orderedIds]; this.cv += 1
-        return { status: 200, outcome: 'accepted', base: this.snapshotOrder() }  // ★ fresh + valid → 200
+        return { status: 200, outcome: 'accepted', base: this.snapshotOrder() }
       }
       /** create:dup id→409;new→201 + base。 */
       create(nodeId: string): Outcome {
         const r = this.recs.get(nodeId)
         if (r && r.present) return { status: 409, outcome: 'conflict', base: encodeBase(this.canvasId, nodeId, r.rev, r.fc) }
-        this.recs.set(nodeId, { rev: 1, fc: {}, present: true, lastWriter: '' })
+        this.recs.set(nodeId, { rev: 1, fc: {}, present: true, writers: {} })
         return { status: 201, outcome: 'accepted', base: encodeBase(this.canvasId, nodeId, 1, {}) }
       }
       drainOverwritten(to: string) { const e = this.outbox.filter((o) => o.to === to); this.outbox = this.outbox.filter((o) => o.to !== to); return e }
@@ -1920,15 +1921,41 @@ describe('N2-0 返修 §10 G1-b 衔接(P2-8): FieldPath 非空 + 数组中性 in
     expect(e2.status).toBe(200); expect(e2.outcome).toBe('accepted')  // ★ edit stale 永 200 非 409
     expect(e2.overwritten).toBe(true)  // ★ 同-field(title)stale → overwritten
     expect(h.drainOverwritten('alice').length).toBe(1)  // alice 收 overwritten
-    // ★ 不同字段 stale 不误报(v5 用 record-rev 会误报;v6 per-field clock 修正)
+    // ★ v7 不同字段 stale 不误报(fieldKeyOf 完整 path 粒度;per-field writer map;非 record-rev 误报)
     h.create('n2')
-    const snap2a = h.snapshot('n2')!  // title.clock=0, transform.clock=0
-    h.edit('n2', { fieldPath: ['transform', 'x'], value: 5 }, snap2a, 'carol')  // bump transform.clock=1, rev=2
-    expect(h.fieldClock('n2', 'transform')).toBe(1); expect(h.fieldClock('n2', 'title')).toBe(0)  // title 未变
-    // edit TITLE with snap2a(title.clock=0 === current 0,虽 transform.clock 落后)— 不发 overwritten(非同-field stale)
+    const snap2a = h.snapshot('n2')!  // title.clock=0, transform.x.clock=0, transform.y.clock=0
+    h.edit('n2', { fieldPath: ['transform', 'x'], value: 5 }, snap2a, 'carol')  // bump transform.x.clock=1, rev=2
+    expect(h.fieldClock('n2', 'transform.x')).toBe(1); expect(h.fieldClock('n2', 'title')).toBe(0); expect(h.fieldClock('n2', 'transform.y')).toBe(0)  // ★ fieldKeyOf 粒度:transform.x ≠ transform.y ≠ title
+    // edit TITLE with snap2a(title.clock=0 === current 0,虽 transform.x.clock 落后)— 不发 overwritten(非同-field stale)
     const e3 = h.edit('n2', { fieldPath: ['title'], value: 'T' }, snap2a, 'dave')
-    expect(e3.status).toBe(200); expect(e3.overwritten).toBe(false)  // ★ 不同字段 stale(transform 变了)不误报 title overwritten(v6 per-field clock)
-    expect(h.drainOverwritten('carol').length).toBe(0)  // carol 不收(title 非其字段)
+    expect(e3.status).toBe(200); expect(e3.overwritten).toBe(false)  // ★ 不同字段 stale(transform.x 变了)不误报 title overwritten
+    expect(h.drainOverwritten('carol').length).toBe(0)  // carol(transform.x writer)不收(title 非其字段;per-field writer map)
+    // ★ v7 transform.x 与 transform.y stale 互不误报(fieldKeyOf leaf-level 粒度;v6 用 fieldPath[0] 会并成一个 transform)
+    h.create('n5')
+    const snap5a = h.snapshot('n5')!  // transform.x.clock=0, transform.y.clock=0
+    h.edit('n5', { fieldPath: ['transform', 'x'], value: 1 }, snap5a, 'alice')  // transform.x.clock=1, writer[transform.x]=alice
+    expect(h.fieldClock('n5', 'transform.x')).toBe(1); expect(h.fieldClock('n5', 'transform.y')).toBe(0)  // ★ transform.x ≠ transform.y
+    // edit transform.y with snap5a(transform.y.clock=0 === current 0,虽 transform.x.clock 落后)— 不发 overwritten
+    const e5y = h.edit('n5', { fieldPath: ['transform', 'y'], value: 2 }, snap5a, 'bob')
+    expect(e5y.status).toBe(200); expect(e5y.overwritten).toBe(false)  // ★ transform.y 未被并发改 → 不误报(transform.x 变了不算)
+    expect(h.drainOverwritten('alice').length).toBe(0)  // alice(transform.x writer)不收(transform.y 非其字段)
+    // edit transform.x with snap5a(transform.x.clock=0 < current 1)→ 200 + overwritten;通知 transform.x 前写者 alice(非 bob)
+    const e5x = h.edit('n5', { fieldPath: ['transform', 'x'], value: 3 }, snap5a, 'carol')
+    expect(e5x.status).toBe(200); expect(e5x.overwritten).toBe(true)  // ★ 同-field(transform.x)stale → overwritten
+    const ov5 = h.drainOverwritten('alice')
+    expect(ov5.length).toBe(1); expect(ov5[0].field).toBe('transform.x')  // ★ 通知 transform.x 前写者 alice(完整 path 粒度)
+    expect(h.drainOverwritten('bob').length).toBe(0)  // bob(transform.y writer)不收(非 transform.x)
+    // ★ v7 title→transform→stale title 通知发 title 前写者(per-field writer map;非 record 级单值误通知 transform writer)
+    h.create('n6')
+    const snap6a = h.snapshot('n6')!  // title.clock=0, transform.x.clock=0
+    h.edit('n6', { fieldPath: ['title'], value: 'A' }, snap6a, 'alice')  // title.clock=1, writer[title]=alice
+    h.edit('n6', { fieldPath: ['transform', 'x'], value: 9 }, snap6a, 'bob')  // transform.x.clock=1, writer[transform.x]=bob
+    // edit title with snap6a(title.clock=0 < current 1)→ 200 + overwritten;通知 writer[title]=alice(非 bob who wrote transform.x)
+    const e6 = h.edit('n6', { fieldPath: ['title'], value: 'B' }, snap6a, 'carol')
+    expect(e6.status).toBe(200); expect(e6.overwritten).toBe(true)  // ★ 同-field(title)stale → overwritten
+    const ov6 = h.drainOverwritten('alice')
+    expect(ov6.length).toBe(1); expect(ov6[0].field).toBe('title')  // ★ 通知 title 前写者 alice(per-field writer map)
+    expect(h.drainOverwritten('bob').length).toBe(0)  // ★ bob(transform.x writer)不收(title 非其字段;v6 record 级单值会误通知 bob)
     // ★ delete fresh base → 200(removed,非 409)
     const snap3 = h.snapshot('n1')!  // n1 rev=3(title bumped twice)
     const d1 = h.delete('n1', snap3)
@@ -2060,16 +2087,17 @@ describe('N2-0 返修 §10 G1-b 衔接(P2-8): FieldPath 非空 + 数组中性 in
 //   snapshot materialize 旧 shape body(非 delta 反演),delta-inversion 显式标注无算法/不支持(降级到已测范围)。
 // 决策文档 §1.2 状态表 + 冻结命令同步(见 docs/decisions/n20-truth-source-decision.md §1.2)。
 
-describe('N2-0 v6 cutover contract harness(Blocker 3:FX-5 走 LegacyReplaceRequest 信封 wire;decoder:raw old body→400, envelope→200 replace;非直调 drainLegacyUpsert)', () => {
-  // v6 病根:v5 C-2 直调 harness 私有 drainLegacyUpsert(无 wire)→ 无法同时满足"旧 queue 可 drain"与"raw 旧 body 400"。
-  //   仓库事实:旧 upsert = 整 record REPLACE(server/persist/backend.ts:1086-1088 `payload: clone(payload)`,非 merge)。
-  //   v6 修:定义 versioned LegacyReplaceRequest 信封(独立于 DomainOp + raw NodePayload);升级客户端把旧 WriteOp 包进它走专用 decoder branch;
-  //     authz(同 canvas write)+ base/conflict 策略 + feature gate(LEGACY_DRAIN)+ 观测计数 + retirement 条件;raw 旧 body 仍 400。
-  //   契约测试经真实 decoder/route:raw old body→400、migrated envelope→200 replace,禁止直调 drainLegacyUpsert 绕 wire。
+describe('N2-0 v7 cutover contract harness(Blocker 3 补全:LegacyReplaceRequest 绑 canvasId+nodeId+baseRevision;scope 校验;stale base→409 terminal conflict dead-letter 非盲 replace;真实 authz+deny 负例;retirement 双可达指标)', () => {
+  // v7 Blocker 3 补全(v6 仅 wire 未补全 stale/authz/retirement):
+  //   ① 信封绑 canvasId+nodeId+version+payload+原队列 baseRevision;decoder 校验 path canvas/node scope(防同 nodeId 跨 canvas 重放)。
+  //   ② 【lead 拍板】stale base(baseRevision≠current rev,record 已有更新版本)→409 显式 terminal conflict,不落盲 replace(队列残留是离线期改动,覆盖是数据破坏;409 后 queue 项走 FX-5 dead-letter,用户可见)。
+  //   ③ authz 走真实 canvas-write seam(members canWrite)+ deny 负例(不许 void actor;无 actor 或非 member → 403)。
+  //   ④ retirement 双可达指标:pending legacy queue gauge=0 + 连续观察窗 envelope 增量=0(drainCount 只作累计总量);冻结 gate 配置名 LEGACY_DRAIN/观察窗/关闭后行为。
+  //   ⑤ §1.2 状态表写全(信封 wire/gate/scope/base-conflict/观测/retirement + "受控迁移协议例外"术语)。
   type LegacyUpsertBody = NodePayload
   type NewOp = DomainOp
-  /** ★ v6 Blocker 3:versioned LegacyReplaceRequest 信封(独立于 DomainOp + raw NodePayload;drain-only 兼容通道 wire)。 */
-  type LegacyReplaceRequest = { kind: 'legacy-replace'; nodeId: string; payload: NodePayload; version: 1 }
+  /** ★ v7 Blocker 3:versioned LegacyReplaceRequest 信封(绑 canvasId+nodeId+version+payload+原队列 baseRevision;独立 DomainOp+raw NodePayload)。 */
+  type LegacyReplaceRequest = { kind: 'legacy-replace'; canvasId: string; nodeId: string; version: 1; payload: NodePayload; baseRevision: Revision }
 
   const nodePayload = (over: Partial<NodePayload> = {}): NodePayload => {
     const n = makeNode('px')
@@ -2081,70 +2109,91 @@ describe('N2-0 v6 cutover contract harness(Blocker 3:FX-5 走 LegacyReplaceReque
   type HasId = 'id' extends keyof NodePayload ? true : false
   const _noIdInPayload: HasId = false
 
-  // migration-on-read:旧 queued WriteOp → 新 wire(LegacyReplaceRequest 信封 / delete / reorder 三类)
   type MigratedOp =
-    | { kind: 'legacy-envelope'; envelope: LegacyReplaceRequest }   // upsertNode → 包进 LegacyReplaceRequest 信封(走 decoder,非直调)
+    | { kind: 'legacy-envelope'; envelope: LegacyReplaceRequest }
     | { kind: 'delete'; cmd: ServerInvariantCommand }
     | { kind: 'reorder'; op: DomainOp }
 
   const migrateWriteOp = (op: WriteOp): MigratedOp => {
     switch (op.kind) {
       case 'upsertNode':
-        // ★ 旧 upsert=replace(backend.ts:1086-1088)→ 不可翻译为 DomainOps;包进 LegacyReplaceRequest 信封走 decoder wire(非直调 drainLegacyUpsert)
-        return { kind: 'legacy-envelope', envelope: { kind: 'legacy-replace', nodeId: op.nodeId, payload: op.payload, version: 1 } }
+        // ★ 包进 LegacyReplaceRequest 信封(绑 canvasId+nodeId+version+payload+原队列 baseRevision)走 decoder wire
+        return { kind: 'legacy-envelope', envelope: { kind: 'legacy-replace', canvasId: op.canvasId, nodeId: op.nodeId, version: 1, payload: op.payload, baseRevision: op.baseRevision ?? 0 } }
       case 'deleteNode':
         return { kind: 'delete', cmd: { kind: 'node-delete-cascade', canvasId: op.canvasId, nodeId: op.nodeId } }
       case 'reorderChildren':
         return { kind: 'reorder', op: { kind: 'reorder', orderedIds: op.orderedIds } }
       default:
-        throw new Error(`migrateWriteOp: kind ${op.kind} not in 3 classes (upsert→legacy-envelope / delete / reorder)`)
+        throw new Error(`migrateWriteOp: kind ${op.kind} not in 3 classes`)
     }
   }
 
   class CutoverHarness {
+    readonly canvasId: string
+    constructor(canvasId = 'c1') { this.canvasId = canvasId }
     private flag = false
-    private legacyDrain = false  // ★ feature gate LEGACY_DRAIN(cutover drain 窗口开启,retirement 后关)
-    private drainCount = 0       // ★ 观测计数(retirement 条件:drainCount 归零后关 LEGACY_DRAIN)
+    private legacyDrain = false  // gate LEGACY_DRAIN(cutover drain 窗口开启,retirement 后关)
+    private drainCount = 0       // ★ 累计总量(observability,非 retirement 条件)
+    private pendingLegacyQueue = 0  // ★ retirement gauge 1:pending queue 项数
+    private envelopeIncrementInWindow = 0  // ★ retirement gauge 2:观察窗内 envelope 增量
+    private members = new Set<string>()  // ★ authz:canvas-write seam
     private recs = new Map<string, NodeRecord>()
     setFlag(on: boolean) { this.flag = on }
     setLegacyDrain(on: boolean) { this.legacyDrain = on }
+    addMember(actor: string) { this.members.add(actor) }
+    canWrite(actor: string) { return this.members.has(actor) }
     drainCountValue() { return this.drainCount }
+    pendingLegacyQueueGauge() { return this.pendingLegacyQueue }
+    envelopeIncrementInWindowGauge() { return this.envelopeIncrementInWindow }
+    enqueueLegacy(n = 1) { this.pendingLegacyQueue += n }  // 模拟队列项入队
+    tickObservationWindow() { this.envelopeIncrementInWindow = 0 }  // 观察窗重置
+    /** ★ retirement 可达指标:pending queue=0 + 观察窗 envelope 增量=0(drainCount 只作总量)。 */
+    canRetire() { return this.pendingLegacyQueue === 0 && this.envelopeIncrementInWindow === 0 }
     seedRecord(n: NodeRecord) { this.recs.set(n.id, structuredClone(n)) }
+    recordRev(nodeId: string): number { return this.recs.get(nodeId)?.revision ?? 0 }
     recordExists(nodeId: string): boolean { return this.recs.has(nodeId) }
-    /** ★ v6 PATCH decoder wire(flag-on):DomainOp→200;LegacyReplaceRequest 信封→200 replace(LEGACY_DRAIN gate);raw NodePayload→400;flag-off:NodePayload→200,其余→400。 */
+    /** ★ v7 PATCH decoder wire(flag-on):DomainOp→200;LegacyReplaceRequest 信封→200 replace(scope+authz+stale-base+gate);raw NodePayload→400;flag-off:NodePayload→200,其余→400。 */
     patch(nodeId: string, body: LegacyUpsertBody | NewOp | LegacyReplaceRequest, opts?: { actor?: string }): { status: number; body: { error?: string; id?: string; revision?: number; seq?: number } } {
-      const actor = opts?.actor ?? 'unknown'
       const obj = body as { kind?: string }
       const isDomainOp = typeof obj.kind === 'string' && (obj.kind === 'set' || obj.kind === 'unset' || obj.kind === 'array' || obj.kind === 'reorder')
       const isLegacyEnvelope = obj.kind === 'legacy-replace'
       if (this.flag) {
-        // flag-on:new wire(DomainOp)or legacy envelope;raw NodePayload(无 kind)→ 400
         if (isLegacyEnvelope) {
-          // ★ legacy 兼容 decoder branch(authz 同 canvas write;LEGACY_DRAIN gate;观测计数)
-          if (!this.legacyDrain) return { status: 400, body: { error: 'payload-rejected' } }  // gate 关 → 400(retirement 后 raw body 也 400)
+          // ★ ③ authz:真实 canvas-write seam + deny 负例(不许 void actor;无 actor 或非 member → 403)
+          const actor = opts?.actor
+          if (!actor) return { status: 403, body: { error: 'forbidden' } }  // ★ 无 actor → 403(no void actor)
+          if (!this.canWrite(actor)) return { status: 403, body: { error: 'forbidden' } }  // ★ deny 负例(非 member)
+          // ④ gate LEGACY_DRAIN
+          if (!this.legacyDrain) return { status: 400, body: { error: 'payload-rejected' } }  // gate 关 → 400
           const env = body as LegacyReplaceRequest
-          if (env.nodeId !== nodeId) return { status: 400, body: { error: 'payload-rejected' } }  // envelope.nodeId 必须匹配 path(防 forge)
-          this.applyLegacyReplace(nodeId, env.payload, actor)  // ★ 经 decoder wire → whole-record replace(非直调 drainLegacyUpsert)
-          this.drainCount += 1  // 观测计数(retirement 条件)
+          // ① scope 校验:env.canvasId+env.nodeId 必须匹配 path canvas+node(防同 nodeId 跨 canvas 重放)
+          if (env.canvasId !== this.canvasId || env.nodeId !== nodeId) return { status: 400, body: { error: 'payload-rejected' } }  // ★ scope mismatch → 400
+          // ② 【lead 拍板】stale base 策略:record 已有更新版本(env.baseRevision≠current rev)→409 terminal conflict,不落盲 replace(数据破坏);dead-letter
+          const existing = this.recs.get(nodeId)
+          if (existing && env.baseRevision !== existing.revision) {
+            this.pendingLegacyQueue = Math.max(0, this.pendingLegacyQueue - 1)  // ★ queue 项 dead-lettered(用户可见)
+            return { status: 409, body: { error: 'legacy-stale-conflict', revision: existing.revision } }  // ★ terminal conflict,不盲 replace
+          }
+          // fresh(baseRevision===current rev,或 record 不存在=create)→200 replace
+          this.applyLegacyReplace(nodeId, env.payload)
+          this.drainCount += 1; this.envelopeIncrementInWindow += 1; this.pendingLegacyQueue = Math.max(0, this.pendingLegacyQueue - 1)
           return { status: 200, body: { id: nodeId, revision: this.recs.get(nodeId)!.revision, seq: this.recs.get(nodeId)!.revision } }
         }
-        if (!isDomainOp) return { status: 400, body: { error: 'payload-rejected' } }  // ★ raw 旧 body(无 kind)→ 400(必须包信封)
+        if (!isDomainOp) return { status: 400, body: { error: 'payload-rejected' } }  // raw 旧 body(无 kind)→ 400(必须包信封)
         const op = body as NewOp
         const r = this.recs.get(nodeId) ?? { ...nodePayload(), id: nodeId, revision: 0 } as NodeRecord
-        if (op.kind === 'set') setByPath(r as Record<string, unknown>, [...op.fieldPath] as (string | number)[], op.value, { allowContainerClobber: false })
-        else if (op.kind === 'array' && op.class === 'whole-lww') setByPath(r as Record<string, unknown>, [...op.fieldPath] as (string | number)[], op.value, { allowContainerClobber: true })
+        if (op.kind === 'set') setByPath(r as Record<string, unknown>, [...op.fieldPath], op.value, { allowContainerClobber: false })
+        else if (op.kind === 'array' && op.class === 'whole-lww') setByPath(r as Record<string, unknown>, [...op.fieldPath], op.value, { allowContainerClobber: true })
         r.revision += 1
         this.recs.set(nodeId, structuredClone(r))
         return { status: 200, body: { id: nodeId, revision: r.revision, seq: r.revision } }
       }
-      // flag off:NodePayload 接受(legacy upsert replace);DomainOp/envelope → 400
       if (isDomainOp || isLegacyEnvelope) return { status: 400, body: { error: 'payload-rejected' } }
-      this.applyLegacyReplace(nodeId, body as LegacyUpsertBody, actor)
+      this.applyLegacyReplace(nodeId, body as LegacyUpsertBody)
       return { status: 200, body: { id: nodeId, revision: this.recs.get(nodeId)!.revision, seq: 1 } }
     }
-    /** whole-record replace(同 backend.ts:1086-1088 `payload: clone(payload)`,非 merge);由 patch decoder 调用(非测试直调)。authz(_actor)同 canvas write,本 spike 不重复 authz seam。 */
-    private applyLegacyReplace(nodeId: string, payload: NodePayload, _actor: string) {
-      void _actor  // authz 同 canvas write(本 spike 复用 seam,不重复);标记已用
+    /** whole-record replace(同 backend.ts:1086-1088 `payload: clone(payload)`,非 merge);由 patch decoder 调用(非测试直调)。 */
+    private applyLegacyReplace(nodeId: string, payload: NodePayload) {
       const existing = this.recs.get(nodeId)
       const rev = existing ? existing.revision + 1 : 1
       this.recs.set(nodeId, structuredClone({ ...payload, id: nodeId, revision: rev }) as NodeRecord)
@@ -2167,66 +2216,96 @@ describe('N2-0 v6 cutover contract harness(Blocker 3:FX-5 走 LegacyReplaceReque
     expect(h.patch('n1', legacy).status).toBe(200)
     expect(h.patch('n1', newOp).status).toBe(400)
     h.setFlag(true)
-    expect(h.patch('n1', legacy).status).toBe(400)  // ★ raw 旧 body(无 kind)→ 400(必须包信封)
+    expect(h.patch('n1', legacy).status).toBe(400)
     expect(h.patch('n1', legacy).body.error).toBe('payload-rejected')
     expect(h.patch('n1', newOp).status).toBe(200)
   })
 
-  it('C-2 FX-5 migration wire(v6:LegacyReplaceRequest 信封经 decoder;raw old body→400, envelope→200 replace;非直调 drainLegacyUpsert;whole-record replace deep-equal;gate+观测+retirement)', () => {
-    const h = new CutoverHarness()
-    h.setFlag(true); h.setLegacyDrain(true)  // cutover drain 窗口:LEGACY_DRAIN gate on
+  it('C-2 FX-5 migration wire v7 补全(LegacyReplaceRequest 绑 canvasId+baseRevision;scope+authz+stale-base 409 dead-letter+retirement 双指标;raw→400, envelope→200 replace 非直调)', () => {
+    const h = new CutoverHarness('c1')
+    h.setFlag(true); h.setLegacyDrain(true); h.addMember('alice'); h.addMember('bob')  // authz:canvas-write seam
     expect(_noIdInPayload).toBe(false)
     // ★ ① raw 旧 body(NodePayload 无 kind)→ 400(必须包信封;禁止绕 wire 直调 drainLegacyUpsert)
-    const rawPayload = nodePayload({ title: 'raw' })
-    expect(h.patch('n-raw', rawPayload).status).toBe(400)  // ★ raw old body → 400
-    expect(h.patch('n-raw', rawPayload).body.error).toBe('payload-rejected')
-    expect(h.recordExists('n-raw')).toBe(false)  // 未落库
-    // ★ ② upsertNode → migrate → LegacyReplaceRequest 信封 → 经 patch decoder wire → 200 replace(非直调 drainLegacyUpsert)
+    expect(h.patch('n-raw', nodePayload({ title: 'raw' })).status).toBe(400)
+    expect(h.recordExists('n-raw')).toBe(false)
+    // ★ ② envelope 经 decoder wire → 200 replace(authz alice pass;scope c1/n-up match;baseRevision=0,record 不存在→create fresh)
+    h.enqueueLegacy(1)  // 模拟队列项入队
     const payload = nodePayload({ title: 'drained', text: 'body', fontSize: 18, locked: true, transform: { x: 5, y: 6, width: 100, height: 40, rotation: 0 }, fills: [] })
     const upsertOp: WriteOp = { kind: 'upsertNode', canvasId: 'c1', nodeId: 'n-up', payload, baseRevision: 0 }
     const m = migrateWriteOp(upsertOp)
-    expect(m.kind).toBe('legacy-envelope')  // ★ migrate 产 envelope(非 DomainOps;非直调)
+    expect(m.kind).toBe('legacy-envelope')
     if (m.kind === 'legacy-envelope') {
       const env = m.envelope
-      expect(env.kind).toBe('legacy-replace'); expect(env.version).toBe(1)  // versioned 信封
-      const res = h.patch(env.nodeId, env, { actor: 'alice' })  // ★ 经 decoder wire(非直调 drainLegacyUpsert)
+      expect(env.canvasId).toBe('c1'); expect(env.nodeId).toBe('n-up'); expect(env.version).toBe(1); expect(env.baseRevision).toBe(0)  // ★ 信封绑 canvasId+nodeId+version+baseRevision
+      const res = h.patch(env.nodeId, env, { actor: 'alice' })  // ★ 经 decoder wire(非直调)
       expect(res.status).toBe(200)  // ★ envelope → 200 replace
-      expect(h.drainCountValue()).toBe(1)  // ★ 观测计数+1(retirement 条件)
+      expect(h.drainCountValue()).toBe(1); expect(h.envelopeIncrementInWindowGauge()).toBe(1)  // ★ 观测+窗增量
+      expect(h.pendingLegacyQueueGauge()).toBe(0)  // ★ queue 项 drained(从 1→0)
       const got = h.get('n-up')!
-      expect(got.id).toBe('n-up')           // ★ id 来自 envelope.nodeId(非 payload)
-      expect(got.title).toBe('drained')     // ★ 漏 title → 红
-      expect(got.text).toBe('body')        // ★ 漏 text → 红
-      expect(got.fontSize).toBe(18)        // ★ 漏 fontSize → 红
-      expect(got.locked).toBe(true)        // ★ 漏 locked → 红
-      expect(got.transform).toEqual({ x: 5, y: 6, width: 100, height: 40, rotation: 0 })  // ★ 漏 transform → 红
-      expect(got.fills).toEqual([])       // ★ 漏 fills → 红
-      expect(h.materializeLegacyBody('n-up')).toEqual(payload)  // ★ whole-record replace deep-equal(无残留)
+      expect(got.id).toBe('n-up'); expect(got.title).toBe('drained'); expect(got.text).toBe('body'); expect(got.fontSize).toBe(18)
+      expect(got.transform).toEqual({ x: 5, y: 6, width: 100, height: 40, rotation: 0 }); expect(got.fills).toEqual([])
+      expect(h.materializeLegacyBody('n-up')).toEqual(payload)  // ★ deep-equal
     }
-    // ★ ③ replace 覆盖(非 merge):seed text='hello';envelope 缺 text → materialized text=undefined(移除,非 merge 保留)
-    h.seedRecord(makeNode('n-replace', { text: 'hello', title: 'seed' }))
-    const payloadNoText = nodePayload({ title: 'no-text' })
-    delete (payloadNoText as { text?: string }).text
-    const m2 = migrateWriteOp({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n-replace', payload: payloadNoText, baseRevision: 0 })
-    expect(m2.kind).toBe('legacy-envelope')
-    if (m2.kind === 'legacy-envelope') {
-      expect(h.patch(m2.envelope.nodeId, m2.envelope, { actor: 'bob' }).status).toBe(200)  // 经 wire
-      const got = h.get('n-replace')!
-      expect(got.title).toBe('no-text')
-      expect((got as { text?: string }).text).toBeUndefined()  // ★ replace 移除 text(非 merge 保留 'hello')
-      expect(h.materializeLegacyBody('n-replace')).toEqual(payloadNoText)
+    // ★ ③ authz deny 负例:无 actor → 403(no void actor);非 member → 403
+    const mNoAuth = migrateWriteOp({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n-noauth', payload: nodePayload({ title: 'x' }), baseRevision: 0 })
+    if (mNoAuth.kind === 'legacy-envelope') {
+      expect(h.patch(mNoAuth.envelope.nodeId, mNoAuth.envelope).status).toBe(403)  // ★ 无 actor → 403(no void)
+      expect(h.patch(mNoAuth.envelope.nodeId, mNoAuth.envelope, { actor: 'eve' }).status).toBe(403)  // ★ 非 member → 403(deny 负例)
     }
-    // ★ ④ envelope.nodeId 不匹配 path → 400(防 forge path)
-    const m3 = migrateWriteOp({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n-real', payload: nodePayload({ title: 'x' }), baseRevision: 0 })
-    if (m3.kind === 'legacy-envelope') {
-      expect(h.patch('n-different', m3.envelope).status).toBe(400)  // envelope.nodeId(n-real)≠path(n-different)→ 400
+    // ★ ④ scope 校验:envelope.canvasId 不匹配 path canvas → 400(防同 nodeId 跨 canvas 重放)
+    const mCross = migrateWriteOp({ kind: 'upsertNode', canvasId: 'c2', nodeId: 'n-scope', payload: nodePayload({ title: 'x' }), baseRevision: 0 })
+    if (mCross.kind === 'legacy-envelope') {
+      expect(h.patch(mCross.envelope.nodeId, mCross.envelope, { actor: 'alice' }).status).toBe(400)  // ★ env.canvasId=c2 ≠ path c1 → 400(跨 canvas 重放防)
+      expect(h.recordExists('n-scope')).toBe(false)  // 未落库
     }
-    // ★ ⑤ LEGACY_DRAIN gate 关(retirement 后)→ envelope→400(等于 raw body 也 400;drain 窗口关闭)
+    // ★ ⑤ scope:envelope.nodeId 不匹配 path node → 400(防 forge path)
+    const mForge = migrateWriteOp({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n-real', payload: nodePayload({ title: 'x' }), baseRevision: 0 })
+    if (mForge.kind === 'legacy-envelope') {
+      expect(h.patch('n-different', mForge.envelope, { actor: 'alice' }).status).toBe(400)  // env.nodeId(n-real)≠path(n-different)→ 400
+    }
+    // ★ ⑥ 【lead 拍板】stale base→409 terminal conflict,不落盲 replace(数据破坏防);dead-letter(queue 项移除,用户可见)
+    h.seedRecord(makeNode('n-stale', { title: 'server-version' }))  // record rev=0
+    // 模拟 server 已更新(record rev bumped to 2,非 queued 时的 baseRevision=0)
+    h.setFlag(true)  // 用 DomainOp bump rev:patch set 两次 → rev 2
+    h.patch('n-stale', { kind: 'set', fieldPath: ['title'], value: 'v1' })  // rev 0→1
+    h.patch('n-stale', { kind: 'set', fieldPath: ['title'], value: 'v2' })  // rev 1→2
+    expect(h.recordRev('n-stale')).toBe(2)
+    h.enqueueLegacy(1)  // queued op with stale baseRevision=0
+    const mStale = migrateWriteOp({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n-stale', payload: nodePayload({ title: 'queued-stale' }), baseRevision: 0 })
+    if (mStale.kind === 'legacy-envelope') {
+      const res = h.patch(mStale.envelope.nodeId, mStale.envelope, { actor: 'alice' })
+      expect(res.status).toBe(409); expect(res.body.error).toBe('legacy-stale-conflict')  // ★ stale base(0≠2)→409 terminal conflict
+      expect(res.body.revision).toBe(2)  // 返 current rev
+      expect(h.get('n-stale')?.title).toBe('v2')  // ★ 不落盲 replace(record 仍 server 版本,非 queued-stale;数据破坏防)
+      expect(h.pendingLegacyQueueGauge()).toBe(0)  // ★ dead-letter(queue 项移除,用户可见)
+    }
+    // ★ ⑦ fresh base(baseRevision===current rev)→ 200 replace
+    const freshBase = h.recordRev('n-stale')  // 2
+    const mFresh = migrateWriteOp({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n-stale', payload: nodePayload({ title: 'fresh-replace' }), baseRevision: freshBase })
+    if (mFresh.kind === 'legacy-envelope') {
+      expect(h.patch(mFresh.envelope.nodeId, mFresh.envelope, { actor: 'alice' }).status).toBe(200)  // ★ fresh base → 200 replace
+      expect(h.get('n-stale')?.title).toBe('fresh-replace')
+    }
+    // ★ ⑧ retirement 双可达指标:pending queue=0 + 观察窗 envelope 增量=0 → canRetire;drainCount 只作总量
+    h.tickObservationWindow()  // 观察窗重置(envelope 增量→0)
+    expect(h.pendingLegacyQueueGauge()).toBe(0)
+    expect(h.envelopeIncrementInWindowGauge()).toBe(0)
+    expect(h.canRetire()).toBe(true)  // ★ 双指标归零 → 可 retirement
+    expect(h.drainCountValue()).toBeGreaterThan(0)  // drainCount 累计总量(非 retirement 条件)
+    // ★ ⑨ LEGACY_DRAIN gate 关(retirement 后)→ envelope→400(兼容通道关闭)
     h.setLegacyDrain(false)
-    const m4 = migrateWriteOp({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n-gate', payload: nodePayload({ title: 'after-retire' }), baseRevision: 0 })
-    if (m4.kind === 'legacy-envelope') {
-      expect(h.patch(m4.envelope.nodeId, m4.envelope).status).toBe(400)  // ★ gate 关 → 400(retirement 后兼容通道关闭)
+    const mGate = migrateWriteOp({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n-gate', payload: nodePayload({ title: 'after-retire' }), baseRevision: 0 })
+    if (mGate.kind === 'legacy-envelope') {
+      expect(h.patch(mGate.envelope.nodeId, mGate.envelope, { actor: 'alice' }).status).toBe(400)  // ★ gate 关 → 400
     }
-    // ★ ⑥ deleteNode → migrate → {kind:'delete',cmd};reorderChildren → {kind:'reorder',op}
+    // ★ ⑩ replace 覆盖(非 merge)+ delete→cascade + reorder→DomainOp
+    h.seedRecord(makeNode('n-replace', { text: 'hello', title: 'seed' })); h.setLegacyDrain(true); h.enqueueLegacy(1)
+    const payloadNoText = nodePayload({ title: 'no-text' }); delete (payloadNoText as { text?: string }).text
+    const mRep = migrateWriteOp({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n-replace', payload: payloadNoText, baseRevision: 0 })
+    if (mRep.kind === 'legacy-envelope') {
+      expect(h.patch(mRep.envelope.nodeId, mRep.envelope, { actor: 'bob' }).status).toBe(200)  // record 不存在时 base 0 fresh;但 n-replace seed rev=0,baseRevision=0===0 fresh
+      expect((h.get('n-replace') as { text?: string }).text).toBeUndefined()  // replace 移除 text(非 merge)
+    }
     h.seedRecord(makeNode('n-del'))
     const mDel = migrateWriteOp({ kind: 'deleteNode', canvasId: 'c1', nodeId: 'n-del' })
     expect(mDel.kind).toBe('delete')
@@ -2234,7 +2313,7 @@ describe('N2-0 v6 cutover contract harness(Blocker 3:FX-5 走 LegacyReplaceReque
     const mRe = migrateWriteOp({ kind: 'reorderChildren', canvasId: 'c1', type: 'node', orderedIds: ['n3', 'n1', 'n2'], baseContentVersion: 0 })
     expect(mRe.kind).toBe('reorder')
     if (mRe.kind === 'reorder') { expect(mRe.op.kind === 'reorder' && mRe.op.orderedIds).toEqual(['n3', 'n1', 'n2']) }
-    // ★ Blocker 3 验收:LegacyReplaceRequest 信封经 decoder wire(raw old body→400, envelope→200 replace, gate/观测/retirement);非直调 drainLegacyUpsert;whole-record replace deep-equal;envelope.nodeId 防 forge;delete→cascade;reorder→DomainOp。
+    // ★ Blocker 3 验收:LegacyReplaceRequest 绑 canvasId+nodeId+baseRevision;scope 校验(防跨 canvas);stale base→409 terminal conflict 非盲 replace+dead-letter;真实 authz+deny 负例(no void actor);retirement 双指标(pending queue=0 + 窗增量=0);raw→400, envelope→200 replace 经 decoder wire 非直调。
   })
 
   it('C-4 rollback = snapshot materialize:flag off → 从 authoritative 全 record 重建 NodePayload(非 delta 反演;剥 id+revision,状态表 row 5)', () => {

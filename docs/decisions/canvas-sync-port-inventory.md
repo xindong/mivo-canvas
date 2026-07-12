@@ -13,7 +13,7 @@
 ## 0. TL;DR
 
 1. **port 是 transport-neutral 抽象**:接口 `loadSnapshot / submitChange / subscribe`,只表 record/field 级**域语义**(`create-*` 全量新 record / `edit-*` 字段级意图 / `delete-*` / `reorder-children` / `update-meta`),**不**出现任一候选独占的 transport DTO。
-2. **中性游标 `SnapshotCursor`**:branded `unknown`。port 永不读其内部;adapter 解释为 Figma 案的 per-record revision bundle / canvas contentVersion,或 Yjs 案的 state-vector(编码态 `Uint8Array`)/ Y.Clock。这是两案 wire 形状根本不同的唯一收敛点。
+2. **中性游标 `SnapshotCursor`**:branded `unknown`。port 永不读其内部;adapter 解释为 Figma 案的 opaque `BaseCursor`(绑 canvasId+recordId+revision+per-field clock;v7),或 Yjs 案的 state-vector(编码态 `Uint8Array`)/ Y.Clock。这是两案 wire 形状根本不同的唯一收敛点。
 3. **红线(N2-0 前硬约束)**:port 不含 field-path PATCH body / If-Match revision header / 409 ConflictBody / metaRevision·contentVersion 分名(Figma 独占);不含 Y.Update(Uint8Array)/ state-vector(Uint8Array 编码 / `Map<clientID,clock>` 解码)/ y-protocol frame(Yjs 独占)。出现任一即违约(计划 §10 风险表)。自证见 §4 + `canvasSyncPort.contract.test.ts` 的 `@ts-expect-error`。
 4. **不实现 transport**:仅冻结接口 + 类型 + 占位 fail-visible impl。N2-0 决议后 G1-c 落地唯一 adapter,另一模型零死接口。
 5. **两案根本差异在 wire/conflict/shadow 三维**(hydrate/retry 可经 adapter 翻译收敛):Figma 案服务端是**权威合并点**(409 冲突 + rebase + 三态 shadow);Yjs 案客户端 Y.Doc 本身即**合并态**(CRDT 自合并 + sv 补拉 + 一态)。N2-0 的 hard gate(文本同编 / undo / 跨 record 事务 / 网关 ws)决定取舍。
@@ -42,7 +42,7 @@ type FieldIntent =
   | { op: 'set'; fieldPath: FieldPath; value: unknown }
   | { op: 'delete-field'; fieldPath: FieldPath }
 // validateFieldIntentStructural(intent):低层结构性 validator(**非安全入口**)——
-//   拒空路径 / 拒非原子 set(整对象·整数组 clobber 封死)/ 拒数组元素 delete-field(last segment number,by-stable-id deferred)。
+//   拒空路径 / 拒非原子 set(整对象·整数组 clobber 封死)/ 拒数组元素 delete-field(last segment number,by-id deferred)。
 //   不依赖 schema,故**不拒** schema-aware clobber(container/array-element 路径上 leaf op)——调用方明示用 structural 即知无 schema 防线。
 // validateFieldIntent(intent, classify: FieldSchemaClassifier):**安全入口**域级 validator(port 冻结,非 transport impl)——
 //   先过 validateFieldIntentStructural,再以**必填** classifier 拒:delete-field 到 container(整子树删)、set 原子值到 container/array-element 路径(整子树替换)。
@@ -101,7 +101,7 @@ type CanvasSyncEvent =
 | | Figma 式(属性 PATCH + 服务端合并) | Yjs 式(Y.Update + y-protocol) |
 |---|---|---|
 | transport | HTTP REST + SSE/WS 广播合并态 | 双向 WS,y-protocol 帧 |
-| 写请求 | `PATCH /api/canvas/:id/nodes/:nodeId`,body = `DomainOp`(field-level;v6 无 by-id/strict-tx),`If-Match: <opaque BaseCursor 绑 scope+field-clock>`(非 envelope revision) | `Y.Update`(**Uint8Array 二进制**,见 `encoding.d.ts:9-10` `applyUpdate(doc, update: Uint8Array)`)经 WS 推送 |
+| 写请求 | `PATCH /api/canvas/:id/nodes/:nodeId`,body = `DomainOp`(field-level;v7 无 by-id/strict-tx),`If-Match: <opaque BaseCursor 绑 scope+field-clock>`(非旧 envelope 模型) | `Y.Update`(**Uint8Array 二进制**,见 `encoding.d.ts:9-10` `applyUpdate(doc, update: Uint8Array)`)经 WS 推送 |
 | 版本号 | opaque `BaseCursor`(绑 canvasId+recordId+revision+per-field clock;业务层 opaque,codec 只在 adapter)+ per-record `Revision`(envelope)+ canvas `contentVersion` | state-vector——**编码态 = `Uint8Array`**(`encoding.d.ts:19` `encodeStateVector(doc): Uint8Array`),**解码态 = `Map<clientID,clock>`**(`encoding.d.ts:14-15`)。**非 `number[]`**。无显式 revision——但 K40 per-record revision 硬约束 + Yjs 因果序 = 双真相源坑(见 §2.4/§2.5) |
 | 响应 | `UpsertResponse { id, revision, seq, base }`(post-bump + 签发新 base;v6)/ `409 ConflictBody` 仅 delete/reorder stale + create dup(edit stale→200+overwritten 非 409) | 无 per-op 响应;合并态经广播 `Y.Update`(Uint8Array)回流 |
 | 广播 | 服务端合并后 push **合并态**(节点级 PATCH 或全量)给订阅者 | peer 间广播 `Y.Update`(Uint8Array),客户端 CRDT 合并 |
@@ -111,20 +111,20 @@ type CanvasSyncEvent =
 
 | | Figma 式 | Yjs 式 |
 |---|---|---|
-| 全量载入 | `GET /api/canvas/:id` → `GetCanvasResponse`(meta + nodes/edges/anchors envelope,每 record 带 id+revision+orderKey)→ `CanvasSnapshot`(域 record)+ cursor=revision bundle | `GET snapshot`(Y.Doc 序列化或重建)→ `CanvasSnapshot` + cursor=state-vector(**Uint8Array**) |
-| 增量补拉 | `GET /api/canvas/:id?since=<contentVersion>` 或节点级 `?changedSince` | sv 协议:client 发 sv1(**Uint8Array**)→ server 回 sv2(**Uint8Array**)+ `Y.Update(since sv1)`(**Uint8Array**);**两端都是字节流,非 `number[]`** |
-| cursor 含义 | per-record revision bundle / canvas contentVersion(单数字) | state-vector——**编码态 Uint8Array / 解码态 `Map<clientID,clock>`**(clientID→clock)。**非 `number[]`,长度 ≠ peer 数**(是编码字节流,长度由 clientID 数 + clock 大小编码决定) |
-| **port 中性容纳** | `loadSnapshot(canvasId, since?)`:`since` 同 brand 透传,adapter 解释为 revision(contentVersion)做增量 GET,或忽略(首拉)。 | `loadSnapshot(canvasId, since?)`:adapter 解释 `since` 为 sv(Uint8Array)走 sv 协议补拉。port 不知 since 是 revision 还是 sv。 |
+| 全量载入 | `GET /api/canvas/:id` → `GetCanvasResponse`(meta + nodes/edges/anchors envelope,每 record 带 id+revision+orderKey)→ `CanvasSnapshot`(域 record)+ cursor=opaque BaseCursor(签发,绑 scope+field-clock) | `GET snapshot`(Y.Doc 序列化或重建)→ `CanvasSnapshot` + cursor=state-vector(**Uint8Array**) |
+| 增量补拉 | `GET /api/canvas/:id/events/poll?since=seq`(finite short-poll)或 SSE `?since=seq`(seq>since) | sv 协议:client 发 sv1(**Uint8Array**)→ server 回 sv2(**Uint8Array**)+ `Y.Update(since sv1)`(**Uint8Array**);**两端都是字节流,非 `number[]`** |
+| cursor 含义 | opaque `BaseCursor`(绑 canvasId+recordId+revision+per-field clock;业务层 opaque,codec 只在 adapter) | state-vector——**编码态 Uint8Array / 解码态 `Map<clientID,clock>`**(clientID→clock)。**非 `number[]`,长度 ≠ peer 数** |
+| **port 中性容纳** | `loadSnapshot(canvasId, since?)`:`since` 同 brand 透传,adapter 解释为 opaque BaseCursor 做增量补拉,或忽略(首拉)。 | `loadSnapshot(canvasId, since?)`:adapter 解释 `since` 为 sv(Uint8Array)走 sv 协议补拉。port 不知 since 是 BaseCursor 还是 sv。 |
 
 ### 2.3 retry(失败/瞬态重试)
 
 | | Figma 式 | Yjs 式 |
 |---|---|---|
 | 瞬态(5xx/网络) | FX-5 IDB write-retry queue(`src/lib/writeRetryQueue.ts`)按 opId 幂等重放 | WS 断线 → Y.Update 本地累积,重连经 sv 协议自动补发(CRDT deterministic merge) |
-| 428 缺 base | 重读当前 revision 再带 If-Match 重交 | 无 428 概念(Yjs 无 If-Match) |
+| 428 缺 base | re-fetch 当前 BaseCursor 再带 If-Match 重交 | 无 428 概念(Yjs 无 If-Match) |
 | 409 冲突 | **edit stale→200+overwritten**(同-field stale 才 overwritten,非 409 非 rebase;G4-4);delete/reorder stale→409(caller re-fetch current base,非 rebase);create dup→409 | 无 409(CRDT 自合并);但**远端已改写**需刷新视图 |
 | 幂等 | `IDEMPOTENCY_KEY_HEADER` + 同 key 同 body 200 既有 / 不同 body 422(`reuse-conflict`) | Y.Update 本身可重复应用(幂等);op 概念在 CRDT 内建(op ID = `(clientID,clock)` 唯一标识) |
-| **port 中性容纳** | `ChangeOutcome.kind = 'retryable'`(瞬态,原样重试)/ `'conflict'`(需 rebase,返 currentCursor + diverging)/ `'rejected'`(终态,如 401/403/413/422payload,见 §1 RejectionReason)。 | `ChangeOutcome.kind = 'accepted'`(CRDT 总接受);adapter 可在远端改写时经 `subscribe` push `change(origin=remote)` 让 client 刷新。瞬态(WS 抖动)走 `retryable`;终态(权限撤销等)走 `rejected`。两案共用 accepted/conflict/retryable/rejected 四态。 |
+| **port 中性容纳** | `ChangeOutcome.kind = 'retryable'`(瞬态,原样重试)/ `'conflict'`(delete/reorder stale base→409,caller re-fetch currentCursor,非字段级 rebase;edit stale→200+overwritten 非 conflict)/ `'rejected'`(终态,如 401/403/413/422payload,见 §1 RejectionReason)。 | `ChangeOutcome.kind = 'accepted'`(CRDT 总接受);adapter 可在远端改写时经 `subscribe` push `change(origin=remote)` 让 client 刷新。瞬态(WS 抖动)走 `retryable`;终态(权限撤销等)走 `rejected`。两案共用 accepted/conflict/retryable/rejected 四态。 |
 
 ### 2.4 conflict(并发冲突检测/解决)
 
@@ -146,7 +146,7 @@ type CanvasSyncEvent =
 | 三态模型 | local(用户输入)/ shadow(最后已知服务端态)/ server(真相源)——计划 §1 v4 client 三态 | Y.Doc 本身即 local+server **合并态**(CRDT);三态塌缩为**一态 + awareness** |
 | shadow compare | diff(local, shadow) → 最小 PATCH;server 接受后 shadow := local | 无 shadow compare(Y.Doc 已合并);只需广播 diff(Y.Update) |
 | 不变量 | shadow ≠ local 时存在未确认变更;shadow 是重连后 rebase 基线 | Y.Doc state 是重连后 sv 补拉的基线;无显式 shadow |
-| revision 派生 | per-record revision 是服务端赋值单调整数(envelope 唯一真相,§13.5) | **待 PoC**(非既定事实):spike `:408-420` 立"revision 应是 Yjs 状态派生值(op 计数 / 内容 hash / sv clock),非独立 LWW 计数器"——派生算法未 PoC,N2-0 §11 Q2 改写为"选 Figma 则 revision = 服务端赋值,不适用 Yjs 派生" |
+| revision 派生 | per-record revision 是服务端赋值单调整数(Envelope 列唯一真相,§13.5) | **待 PoC**(非既定事实):spike `:408-420` 立"revision 应是 Yjs 状态派生值(op 计数 / 内容 hash / sv clock),非独立 LWW 计数器"——派生算法未 PoC,N2-0 §11 Q2 改写为"选 Figma 则 revision = 服务端赋值,不适用 Yjs 派生" |
 | **port 中性容纳** | port 不暴露三态/shadow compare;adapter 内部维护。Figma 案 adapter 持 shadow 做 diff + rebase(F1 后 diff 已在 producer 侧完成,intents 即 diff 结果,adapter 不再 shadow-diff 全量 record);Yjs 案 adapter 持 Y.Doc 做合并。port 只表"提交 change → 拿回 outcome / cursor"。 | 同上。port 不知 adapter 是三态还是一态。 |
 
 ---
@@ -155,8 +155,8 @@ type CanvasSyncEvent =
 
 | port 方法 | Figma 案 adapter(N2-0 选 Figma 时) | Yjs 案 adapter(N2-0 选 Yjs 时) |
 |---|---|---|
-| `loadSnapshot(id, since?)` | `fetchCanvas`(ServerPersistAdapter)+ 可选 `since=contentVersion` 增量;cursor = revision bundle | `GET /snapshot` 拉序列化 Y.Doc + sv 协议补拉;cursor = state-vector(Uint8Array) |
-| `submitChange(change, base?)` | `create-*`→POST 全量;`edit-*` intents→field-path PATCH body(fieldPath 段直接对应)+ `If-Match: base→revision`;409→`conflict` outcome;401/403/413/422/400→`rejected`(域 reason) | `create-*` seeding 全量 Y.Map;`edit-*` intents→按 fieldPath 逐层 Y.Map.set(永不 clear 整子树);总 `accepted` outcome |
+| `loadSnapshot(id, since?)` | `fetchCanvas`(ServerPersistAdapter)+ 可选 `since=seq` 增量补拉;cursor = opaque BaseCursor(绑 scope+field-clock) | `GET /snapshot` 拉序列化 Y.Doc + sv 协议补拉;cursor = state-vector(Uint8Array) |
+| `submitChange(change, base?)` | `create-*`→POST `:id/nodes/:nodeId` 全量(client-id);`edit-*` intents→field-path PATCH body(fieldPath 段直接对应)+ `If-Match: base→opaque BaseCursor`;edit stale→200+overwritten(非 409);delete/reorder stale→`conflict` outcome(409,caller re-fetch);401/403/413/422/400→`rejected`(域 reason) | `create-*` seeding 全量 Y.Map;`edit-*` intents→按 fieldPath 逐层 Y.Map.set(永不 clear 整子树);总 `accepted` outcome |
 | `subscribe(id, onEvent)` | SSE/WS 订阅服务端广播合并态 → `change(origin=remote)` + 新 cursor | WS y-protocol peer 广播 → `change(origin=remote)` + 新 cursor;断线 → `gap` 事件 |
 
 **红线再强调**:两案 adapter 都**不**把各自独占形状(field-path PATCH body / Y.Update binary / revision / state-vector)放进 `canvasSyncPort.ts` 的类型定义;只在自己的 adapter 文件(N2-0 决议后、G1-c 落地)内出现。port 侧 `SnapshotCursor` 是 branded `unknown`,adapter 用 `as unknown as SnapshotCursor` 构造,port 侧零 inspection。`FieldPath` 是域语义数组,**非** wire JSON-Pointer——两案 adapter 都能消费(fieldPath 是域语义不是 wire)。
@@ -203,7 +203,7 @@ grep -cE '^\s*//\s*@ts-expect-error' src/lib/canvasSyncPort.contract.test.ts
 2. **多人 undo/redo**:Figma 本地 undo × 远端交错未定 vs Yjs UndoManager spike 未决。
 3. **跨 record invariant/事务**:Figma 严格事务路径(record-schema / §10.4)vs Yjs 需 wrapper(CRDT 无原子多 record,spike `:408-420` 实证)。
 4. **revision × 属性 LWW 兼容协议**:Figma (A) 改 #194 / (B) versioned ops endpoint;Yjs 不适用(CRDT)。
-5. **实时 transport + auth spike**:真实 SSO 网关下 WS upgrade 是否放行。**Figma 式 REST+SSE 走 plain HTTP,网关应透传(条件式,非"必透传";生产可能缓冲/超时 → v4 N2-0 §14.5 失败树 + short-poll fallback),不需 WS**(§2.1 + N2-0 §2 gate 5 + §14.5);**Yjs 需双向 WS y-protocol**(网关 WS 放行=未验证项,留 lead 生产实测)。~~原句"网关必透传"与 N2-0 Gate5 条件式矛盾,已纠(v4 Blocker 6 对齐)。~~
+5. **实时 transport + auth spike**:真实 SSO 网关下 WS upgrade 是否放行。**Figma 式 REST+SSE 走 plain HTTP,网关应透传(条件式,非"必透传";生产可能缓冲/超时 → v7 N2-0 §14.4 失败树 + finite short-poll),不需 WS**(§2.1 + N2-0 §2 gate 5 + §14.4);**Yjs 需双向 WS y-protocol**(网关 WS 放行=未验证项,留 lead 生产实测)。~~原句"网关必透传"与 N2-0 Gate5 条件式矛盾,已纠。~~
 6. **迁移/双协议窗口**:#194 / PG JSONB / FX-5 / stale-client。
 7. **事件序号/补拉日志/压缩、权限撤销、性能/存储放大**。
 
@@ -314,7 +314,7 @@ port 的中性设计保证 N2-0 任一决议后,G1-c 只需落一个 adapter,另
 **修法选择**:**(a) FieldPath 非空 tuple + (b) `validateFieldIntent` 域级 validator 拒非原子 set** + **(c) 数组结构编辑 deferred to N2-0 §10.1**(非补中性 intent)。理由:
 1. 非空 tuple `readonly [string|number, ...(string|number)[]]` 编译期拒空路径(空 `[]` 无定位叶子 = 整 record clobber 的合法重表达);+1 `@ts-expect-error` 互锁钉死(总数 6→7,红线 6 不变)。
 2. validator 拒 `set` 的非原子 value(对象/数组 = 整子树替换 = 坑7 clobber 的合法重表达)——**封死**;合法编辑须分解为原子叶子 set(`['transform','x']` 非 `['transform']` 整对象)。这是 port 冻结的**域级**规则(transport-neutral),非 transport impl——validator 只检 `typeof value`,无候选独占 DTO,不违红线。
-3. 数组三选(补中性 intent / 明确整值 LWW 限制 / reject):选 **reject 整数组 set(同整对象一并封死)+ 数组结构编辑 deferred**。理由:补 insert/remove/splice-by-stable-id 会扩 FieldIntent op 面(且需处理无 id 数组如 markupPoints/parentIds 的 by-id 难题),bleed into N2-0 §10.1 FieldOp 设计——超出 G1-b "freeze + 不扩 op 面、保 6 互锁" 范围。数组**叶子**编辑(`['fills',0,'color']` 原子 set)仍支持;数组**结构**编辑(增/删元素)留 N2-0 §10.1。`delete-field` 删任意非空路径字段(显式移除,非静默 clobber)放行。
+3. 数组三选(补中性 intent / 明确整值 LWW 限制 / reject):选 **reject 整数组 set(同整对象一并封死)+ 数组结构编辑 deferred**。理由:补 insert/remove/splice-by-id 会扩 FieldIntent op 面(且需处理无 id 数组如 markupPoints/parentIds 的 by-id 难题),bleed into N2-0 §10.1 FieldOp 设计——超出 G1-b "freeze + 不扩 op 面、保 6 互锁" 范围。数组**叶子**编辑(`['fills',0,'color']` 原子 set)仍支持;数组**结构**编辑(增/删元素)留 N2-0 §10.1。`delete-field` 删任意非空路径字段(显式移除,非静默 clobber)放行。
 4. 不违红线:validator 是域级 `typeof` 检查,不含 If-Match/Y.Update 等候选独占形状;grep §4.1-§4.2 非注释行零命中。
 
 **inventory 分开写 Y.Map/Y.Array**(§2.1 port-中性容纳 Yjs 列):Y.Map(对象字段)逐层 `set` 永不 clear 整子树;Y.Array(数组字段)number 段进下标有**索引漂移**,数组叶子走 `arr.get(i).set('color',...)` 定点;`Y.Array.delete(i)` ≠ JS `delete arr[i]`(后者留 sparse hole)——故域语义须由 Yjs adapter 直译,不经 JS helper 自证。
@@ -387,17 +387,17 @@ port 的中性设计保证 N2-0 任一决议后,G1-c 只需落一个 adapter,另
 
 ### 9.1 R3-P1-1 schema-aware 容器/数组元素封死(delete-field + 原子值-to-容器)
 
-**问题核证**:R2 validator 只拦 `set` 非原子 value;delete-field 全放行——`delete ['transform']`(删整个 transform Y.Map = 吞并发 transform.y,clobber 换名重表达)、`delete ['fills']`(删整个 Y.Array)、`delete ['fills',0]`(用不稳定 index 表达声称 deferred 的数组 remove,与 n20 §10.1 by-stable-id 方向岔开)均放行;`set ['transform']=7`(原子值覆盖整个容器路径 = 整子树替换,坑7 的另一换名面)也放行。spike helper 数值末段直 `Y.Array.delete(index)`。
+**问题核证**:R2 validator 只拦 `set` 非原子 value;delete-field 全放行——`delete ['transform']`(删整个 transform Y.Map = 吞并发 transform.y,clobber 换名重表达)、`delete ['fills']`(删整个 Y.Array)、`delete ['fills',0]`(用不稳定 index 表达声称 deferred 的数组 remove,与 n20 §10.1 by-id 方向岔开)均放行;`set ['transform']=7`(原子值覆盖整个容器路径 = 整子树替换,坑7 的另一换名面)也放行。spike helper 数值末段直 `Y.Array.delete(index)`。
 
 > **⚠ 部分已被 R4-P1-1 supersede(2026-07-12,见 §10.1)**:本「修法选择」把 `FieldSchemaClassifier` 设为**可选**("不传时只结构性拒"),导致省略 classifier 时 `delete ['transform']`/`['fills']`/`set ['transform']=7` 等四负例原漏洞原样通过(安全入口静默降级)。R4-P1-1 已把 classifier 改为**必填**(安全入口不可静默降级:省略即 tsc error + 运行时防御兜 as-cast 旁路)+ 结构性校验拆到显式命名的低层 `validateFieldIntentStructural`(非安全入口)。本段保留作 R3-P1-1 历史回报;当前态见 §10.1 + §1 签名。下方理由 1/2 的结构性拒与 schema-aware 拒语义仍有效,仅 classifier 从可选变必填。
 
 **修法选择**(可选 classifier 已被 R4-P1-1 改必填 supersede):**schema-aware leaf/container/array-element 分类**(可选 `FieldSchemaClassifier`,port 对 schema 不透明故 classifier 由调用方/adapter 提供;不传时只结构性拒)。理由:
-1. 结构性拒(无需 schema):数组元素 delete-field(last segment 是 number)→ 拒 `array-element-structure-delete`(by-stable-id deferred to N2-0 §10.1,无需 schema 判)。
+1. 结构性拒(无需 schema):数组元素 delete-field(last segment 是 number)→ 拒 `array-element-structure-delete`(by-id deferred to N2-0 §10.1,无需 schema 判)。
 2. schema-aware 拒(有 classifier):container 路径上的 `delete-field` → 拒 `container-delete-field`(整子树删 = clobber 重表达);container/array-element 路径上的 `set`(原子值)→ 拒 `atomic-value-to-container-path`(整子树替换)。
 3. 合法 optional leaf delete 放行(`delete ['title']`/`['locked']`——删叶子不吞兄弟字段);原子叶子 set 在 leaf 路径放行(`['transform','x']`/`['fills',0,'color']`)。
 4. 不扩 op 面、不违红线:`FieldPathTarget`/`FieldSchemaClassifier` 是域类型(非候选独占 DTO);`FieldIntentViolation` 枚举 2→5 key;`@ts-expect-error`=7 不变。
 
-**与 n20 §10.1 对齐点**(inventory §2.1 已注明 + 本 §9.1 再钉):数组结构编辑(增/删元素)非 FieldIntent 表达,deferred to N2-0 §10.1 by-stable-id(与 n20 R2-4「数组按 有 stable-id / 无 stable-id / primitive 三类冻结意图」方向对齐);G1-b 只拒(封死 clobber 换名面),不扩 op 面,N2-0 决议后由真 schema 驱动 classifier。
+**与 n20 §10.1 对齐点**(inventory §2.1 已注明 + 本 §9.1 再钉):数组结构编辑(增/删元素)非 FieldIntent 表达,deferred to N2-0 §10.1 by-id(与 n20 R2-4「数组按 有 stable-id / 无 stable-id / primitive 三类冻结意图」方向对齐);G1-b 只拒(封死 clobber 换名面),不扩 op 面,N2-0 决议后由真 schema 驱动 classifier。
 
 **落地**(可选 classify 参数已被 R4-P1-1 改必填 + 拆 structural 低层 supersede,见 §10.1):`validateFieldIntent` 加可选 `classify` 参数;新增 `FieldPathTarget`/`FieldSchemaClassifier` 类型;`FieldIntentViolation` 枚举扩 5 key;contract test +7 负例/正例(无 classifier 结构性拒 + 有 classifier schema-aware 拒 + 合法 leaf 放行);spike +3 真 Y.Doc 并发危害证(delete 整 transform 吞 transform.y=999 / delete fills[0] 按 index 删错元素 / validator 拒之有据)。
 
@@ -405,7 +405,7 @@ port 的中性设计保证 N2-0 任一决议后,G1-c 只需落一个 adapter,另
 - NEGATIVE:`delete ['transform']`/`['fills']`(container)被拒 `container-delete-field`;`delete ['fills',0]`(array-element)被拒 `array-element-structure-delete`;`set ['transform']=7`/`['fills',0]=7`(原子值-to-容器)被拒 `atomic-value-to-container-path`。
 - POSITIVE:`delete ['title']`/`['locked']`(optional leaf)放行;`set ['transform','x']`/`['fills',0,'color']`(leaf)放行。
 - 无 classifier:结构性拒数组元素 delete-field + 非原子 set;container delete 不拒(契约:调用方传 classifier 才做 schema-aware 拒)。
-- 真 Y.Doc(spike):delete 整 transform Y.Map 吞并发 transform.y=999(危害证,validator 拒之有据);delete fills[0] 按 index 删在并发 insert 下删错元素(by-index 漂移,by-stable-id deferred 之据)。
+- 真 Y.Doc(spike):delete 整 transform Y.Map 吞并发 transform.y=999(危害证,validator 拒之有据);delete fills[0] 按 index 删在并发 insert 下删错元素(by-index 漂移,by-id deferred 之据)。
 
 ### 9.2 R3-P1-2 retryable/conflict 所有权 + per-key 状态机(FifoRecordPort 参考 impl)
 
@@ -523,9 +523,9 @@ port 的中性设计保证 N2-0 任一决议后,G1-c 只需落一个 adapter,另
 
 ---
 
-## 11. v6 决议收口(对齐 N2-0 §14;sol 第五轮 3 阻断交叉影响)
+## 11. v7 决议收口(对齐 N2-0 §14;sol 第六轮 3 阻断交叉影响)
 
-> N2-0 v6 决议(§14)对 port 契约的交叉影响 + 两文档同规则对齐。v6 病根:v5 追加式 supersede 致两套矛盾模型并存(active 段原文未动)。v6 硬禁令:禁止追加式修复;直接重写 active 段原文(§2/§3 主表已清零 envelope-revision/409 rebase 旧模型 → opaque BaseCursor + base-driven 409)。
+> N2-0 v7 决议(§14)对 port 契约的交叉影响 + 两文档同规则对齐。v7 病根:连续三轮栽在"改了点名处、漏了全文扫尾"。v7 硬禁令:禁止追加式修复;直接重写 active 段原文;全文扫尾不漏(§2/§3 主表已清零 envelope-revision/409 rebase/revision bundle 旧模型 → opaque BaseCursor 绑 scope+field-clock + base-driven 409;§2.2 hydrate cursor=opaque BaseCursor;§2.3 428 re-fetch BaseCursor+conflict 非 rebase;§2.5 shadow cursor=BaseCursor+base→BaseCursor+edit stale 200+overwritten)。
 
 ### 11.1 Blocker 1 — BaseCursor 绑 scope + per-field clock(对齐 port SnapshotCursor opaque)
 
@@ -534,7 +534,7 @@ port 的中性设计保证 N2-0 任一决议后,G1-c 只需落一个 adapter,另
 
 ### 11.2 Blocker 2 — active 段清零(§2/§3 主表已重写)+ by-id deferred + 白名单取消
 
-- §2/§3 主表已直接重写(非追加):`:nid`→`:nodeId`;`If-Match: <envelope revision>`→`<opaque BaseCursor 绑 scope+field-clock>`;`409 ConflictBody { currentRevision }`→edit stale 200+overwritten(非 409 非 rebase),409 仅 delete/reorder stale + create dup;`rebase`→caller re-fetch(非字段级 rebase)。
+- §2/§3 主表已直接重写(非追加):旧 nid path→`:nodeId`;`If-Match: <旧 envelope 模型>`→`<opaque BaseCursor 绑 scope+field-clock>`;`409 ConflictBody { currentRevision }`→edit stale 200+overwritten(非 409 非 rebase),409 仅 delete/reorder stale + create dup;`rebase`→caller re-fetch(非字段级 rebase)。
 - by-id A2 deferred(DomainOp 不含 by-id,fail-visible,禁降级整数组 LWW);whole-lww + primitive supported。S10-7 by-id 标 [superseded, non-normative]。
 - container 白名单取消(lead 裁定 rejected):A2 leaf-level set;FieldTarget 无 'atomic-container';S10-10 删 atomic-container。
 
