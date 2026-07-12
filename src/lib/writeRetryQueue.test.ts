@@ -470,6 +470,84 @@ describe('FX-5 coalescing', () => {
   })
 })
 
+// ── G1-a R3 F1: createCanvas+updateCanvas coalesce must preserve create-only fields ──
+// R3 verdict: combineOps(createCanvas, updateCanvas) rebuilt the create from incoming
+// update fields only, dropping existing.sourceTemplateId when the production rename/move
+// update does not carry it. Production renameCanvas/moveCanvasToProject updates omit
+// sourceTemplateId, so a template-backed create followed by a pre-drain rename lost the
+// template id silently. These tests pin the field-wise merge contract.
+
+describe('G1-a R3 F1: createCanvas+updateCanvas coalesce preserves sourceTemplateId', () => {
+  const createCanvasOp = (canvasId: string, projectId: string, title: string, sourceTemplateId: string): WriteOp => ({
+    kind: 'createCanvas',
+    canvasId,
+    projectId,
+    title,
+    sourceTemplateId,
+  })
+  // Production rename: carries new title + required projectId, omits sourceTemplateId.
+  const renameCanvasOp = (canvasId: string, projectId: string, title: string): WriteOp => ({
+    kind: 'updateCanvas',
+    canvasId,
+    projectId,
+    title,
+  })
+  // Production move: carries new projectId, omits title + sourceTemplateId.
+  const moveCanvasOp = (canvasId: string, projectId: string): WriteOp => ({
+    kind: 'updateCanvas',
+    canvasId,
+    projectId,
+  })
+
+  it('rename before drain preserves existing sourceTemplateId (not dropped by coalesce)', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue(createCanvasOp('c1', 'p1', 'orig', 'template-keep-me'))
+    await q.enqueue(renameCanvasOp('c1', 'p1', 'renamed')) // same canvas → coalesce
+    expect((await __dumpWritesForTest()).length).toBe(1) // coalesced to one record
+    await q.drain()
+    expect(calls).toHaveLength(1)
+    expect(calls[0].op.kind).toBe('createCanvas')
+    // RED assertion: sourceTemplateId must survive the coalesce (current code drops it).
+    expect((calls[0].op as { sourceTemplateId?: string }).sourceTemplateId).toBe('template-keep-me')
+    // the rename took effect on title
+    expect((calls[0].op as { title?: string }).title).toBe('renamed')
+    expect((calls[0].op as { projectId: string }).projectId).toBe('p1')
+  })
+
+  it('move before drain preserves existing sourceTemplateId and title', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue(createCanvasOp('c2', 'p1', 'orig', 'template-keep-me'))
+    await q.enqueue(moveCanvasOp('c2', 'p2')) // move to p2, no title, no sourceTemplateId
+    expect((await __dumpWritesForTest()).length).toBe(1)
+    await q.drain()
+    expect(calls).toHaveLength(1)
+    expect(calls[0].op.kind).toBe('createCanvas')
+    expect((calls[0].op as { sourceTemplateId?: string }).sourceTemplateId).toBe('template-keep-me')
+    expect((calls[0].op as { title?: string }).title).toBe('orig') // preserved (move carried no title)
+    expect((calls[0].op as { projectId: string }).projectId).toBe('p2') // move took effect
+  })
+
+  it('explicit sourceTemplateId in update still overrides existing (not sticky)', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue(createCanvasOp('c3', 'p1', 'orig', 'template-old'))
+    await q.enqueue({
+      kind: 'updateCanvas',
+      canvasId: 'c3',
+      projectId: 'p1',
+      title: 'renamed',
+      sourceTemplateId: 'template-new',
+    })
+    await q.drain()
+    expect(calls).toHaveLength(1)
+    expect(calls[0].op.kind).toBe('createCanvas')
+    // incoming sourceTemplateId wins over existing (field-wise merge, not sticky-keep)
+    expect((calls[0].op as { sourceTemplateId?: string }).sourceTemplateId).toBe('template-new')
+  })
+})
+
 // ── overflow ──
 
 describe('FX-5 overflow', () => {

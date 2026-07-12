@@ -38,6 +38,61 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
     expect(body.sourceTemplateId).toBe('tpl-1')
   })
 
+  it('R3 F1: sourceTemplateId 真路由存活契约 —— rename PUT(不带 sourceTemplateId)后 GET 仍存活', async () => {
+    // 客户端 coalesce(createCanvas+updateCanvas before drain)依赖服务端这条契约:
+    // 生产 rename/move 的 PUT payload 不带 sourceTemplateId,服务端必须按字段级合并保留既有值,
+    // 否则即便客户端 combineOps 修好了、POST 带上 sourceTemplateId,rename 后也会被服务端擦除。
+    await seedProject()
+    const created = await req(app, '/api/canvas', {
+      method: 'POST',
+      headers: { ...hdr(KEY_A), 'content-type': 'application/json' },
+      body: JSON.stringify({ id: 'c1', projectId: 'p1', title: 'orig', sourceTemplateId: 'tpl-keep' }),
+    })
+    expect(created.status).toBe(201)
+    // GET → 服务端已存 sourceTemplateId
+    const get1 = await req(app, '/api/canvas/c1', { method: 'GET', headers: hdr(KEY_A) })
+    expect(get1.status).toBe(200)
+    expect((get1.body as { sourceTemplateId?: string }).sourceTemplateId).toBe('tpl-keep')
+    // 生产 rename:PUT payload 只带新 title,不带 sourceTemplateId
+    const rename = await req(app, '/api/canvas/c1', {
+      method: 'PUT',
+      headers: { ...hdr(KEY_A), 'content-type': 'application/json', 'if-match': '0' },
+      body: JSON.stringify({ payload: { projectId: 'p1', title: 'renamed' } }),
+    })
+    expect(rename.status).toBe(200)
+    // GET → sourceTemplateId 穿过 rename 存活(字段级合并保留了既有值)
+    const get2 = await req(app, '/api/canvas/c1', { method: 'GET', headers: hdr(KEY_A) })
+    expect(get2.status).toBe(200)
+    const body2 = get2.body as { title: string; sourceTemplateId?: string; metaRevision: number }
+    expect(body2.title).toBe('renamed')
+    expect(body2.sourceTemplateId).toBe('tpl-keep')
+    expect(body2.metaRevision).toBe(1)
+  })
+
+  it('R3 F1: sourceTemplateId 真路由存活契约 —— move PUT(换 projectId,不带 sourceTemplateId)后仍存活', async () => {
+    await seedProject('p1')
+    await seedProject('p2')
+    const created = await req(app, '/api/canvas', {
+      method: 'POST',
+      headers: { ...hdr(KEY_A), 'content-type': 'application/json' },
+      body: JSON.stringify({ id: 'c1', projectId: 'p1', title: 'orig', sourceTemplateId: 'tpl-keep' }),
+    })
+    expect(created.status).toBe(201)
+    // 生产 move:PUT payload 换 projectId,不带 title 也不带 sourceTemplateId
+    const move = await req(app, '/api/canvas/c1', {
+      method: 'PUT',
+      headers: { ...hdr(KEY_A), 'content-type': 'application/json', 'if-match': '0' },
+      body: JSON.stringify({ payload: { projectId: 'p2' } }),
+    })
+    expect(move.status).toBe(200)
+    const get = await req(app, '/api/canvas/c1', { method: 'GET', headers: hdr(KEY_A) })
+    expect(get.status).toBe(200)
+    const body = get.body as { title: string; projectId: string; sourceTemplateId?: string }
+    expect(body.projectId).toBe('p2') // move 生效
+    expect(body.title).toBe('orig') // 未带 title → 保留既有
+    expect(body.sourceTemplateId).toBe('tpl-keep') // 未带 → 保留既有(存活)
+  })
+
   it('GET /api/canvas/:id 全量(metaRevision/contentVersion + nodes 带 orderKey #6);子资源 upsert bump contentVersion #5', async () => {
     await seedProject()
     await seedCanvas()

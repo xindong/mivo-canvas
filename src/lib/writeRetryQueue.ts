@@ -295,12 +295,24 @@ const combineOps = (existing: WriteOp, incoming: WriteOp): WriteOp | 'cancel' =>
     return { kind: 'createProject', name: incoming.name, id: existing.id ?? incoming.projectId }
   }
   if (ek === 'createCanvas' && ik === 'updateCanvas') {
+    // R3 F1:field-wise merge — 保留 create 独有/未改字段( notably sourceTemplateId)。
+    // 生产 rename(只带 title)/move(只带 projectId)的 update 不带 sourceTemplateId,
+    // 旧实现只用 incoming 重建 create 致 sourceTemplateId 被静默丢弃。现按字段级合并:
+    // incoming 显式携带 → 用 incoming(可改);incoming 未带 → 保留 existing(不丢 create 独有字段)。
     return {
       kind: 'createCanvas',
       canvasId: existing.canvasId,
       projectId: incoming.projectId,
-      ...(incoming.title !== undefined ? { title: incoming.title } : {}),
-      ...(incoming.sourceTemplateId !== undefined ? { sourceTemplateId: incoming.sourceTemplateId } : {}),
+      ...(incoming.title !== undefined
+        ? { title: incoming.title }
+        : existing.title !== undefined
+          ? { title: existing.title }
+          : {}),
+      ...(incoming.sourceTemplateId !== undefined
+        ? { sourceTemplateId: incoming.sourceTemplateId }
+        : existing.sourceTemplateId !== undefined
+          ? { sourceTemplateId: existing.sourceTemplateId }
+          : {}),
     }
   }
   // create+delete → 净消(资源从未服务端创建,delete 无意义)
