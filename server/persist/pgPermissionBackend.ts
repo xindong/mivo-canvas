@@ -871,6 +871,61 @@ export class PgPermissionBackend implements PermissionBackend {
     return { processed, converged, failed }
   }
 
+  // ── G2.2:permissions 域 owner rekey(fingerprint→SSO username)──────────────────────────────
+  // 覆盖 dp4 owner inventory 的 permissions 域:share_links.created_by(project_members.user_id 不在 rekey
+  // 范围——按 DP-4 是真实 username,非指纹;legacy 无 SSO 时 member 表本就空)。两阶段:① SELECT DISTINCT
+  // legacy created_by + resolve;② 事务内 UPDATE share_links.created_by。幂等:已 username 形态不再匹配 16-hex。
+
+  /**
+   * G2.1 R2-1 三域 gate 的 permissions 域 detector(PG 实扫):统计 share_links.created_by 为 legacy 指纹形态
+   * (16-hex)的 DISTINCT owner 数。strict 启动 gate 调用:>0 → 拒启动(permissions 域迁移未完成)。
+   */
+  async countLegacyFormOwners(): Promise<number> {
+    await this.ready
+    const rows = await this.db.selectFrom('share_links')
+      .select('created_by')
+      .distinct()
+      .where('created_by', '~', '^[0-9a-f]{16}$')
+      .execute()
+    const legacy = new Set<string>()
+    for (const r of rows) legacy.add(r.created_by)
+    return legacy.size
+  }
+
+  /**
+   * G2.2 permissions 域 owner rekey:把 share_links.created_by 从 legacy 指纹重键为 SSO username。
+   * 两阶段:Phase 1 SELECT DISTINCT legacy created_by + resolve(resolver 可能抛 → 未 mutation);Phase 2 事务内
+   * UPDATE share_links.created_by(无 resolver 调用,不抛)。返回 {migrated, unmapped}(owner 维度计数)。
+   */
+  async migrateLegacyOwnersToUsernameForm(
+    resolveFingerprintToUsername: (fingerprint: string) => string | undefined,
+  ): Promise<{ migrated: number; unmapped: number }> {
+    await this.ready
+    // Phase 1:收集 DISTINCT legacy created_by + resolve(resolver 可能抛 → 此时未 mutation)。
+    const rows = await this.db.selectFrom('share_links')
+      .select('created_by')
+      .distinct()
+      .where('created_by', '~', '^[0-9a-f]{16}$')
+      .execute()
+    const legacySet = new Set<string>()
+    for (const r of rows) legacySet.add(r.created_by)
+    const mapping = new Map<string, string>()
+    let unmapped = 0
+    for (const fp of legacySet) {
+      const u = resolveFingerprintToUsername(fp)
+      if (u && u.length > 0) mapping.set(fp, u)
+      else unmapped += 1
+    }
+    if (mapping.size === 0) return { migrated: 0, unmapped }
+    // Phase 2:事务内 UPDATE share_links.created_by(无 resolver 调用,不抛;幂等)。
+    await this.db.transaction().execute(async (trx) => {
+      for (const [fp, u] of mapping) {
+        await trx.updateTable('share_links').set({ created_by: u }).where('created_by', '=', fp).execute()
+      }
+    })
+    return { migrated: mapping.size, unmapped }
+  }
+
   // ── Test-only helpers(与 InMemoryPermissionBackend 对偶;双后端契约测试用)──────────────
 
   /** Test-only:清空权限三表(projects 表归 persist backend,不动;TRUNCATE 等效 DELETE,异步)。 */

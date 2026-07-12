@@ -454,6 +454,77 @@ export const migrateLegacyOwnersToUsernameForm = async (
 }
 
 /**
+ * G2.2 三域 owner rekey 编排(persist + permissions + assets)——把 legacy 指纹 ownerId 跨三 backend
+ * 重键为 SSO username。供 G2.2 runbook / 迁移脚本调用(单 callable,内部按域分发;resolver 是部署
+ * 特定的 fingerprint→username 映射来源,需原 mivo_ key 或预建映射表,见 dp4-identity-alignment.md R-2)。
+ *
+ * 事务边界:每域内两阶段(先收集+resolve,再原地改;防 resolver 中途抛留半迁移态)。三域之间非同一 DB 事务
+ * (跨 backend:persist/permissions 是 PG,assets 是 fs),但每域内原子;失败返 {migrated, unmapped, failed},
+ * failed 域名供 ops 重跑(幂等:已 rekey 的 username 形态不再匹配 legacy 正则,重跑只处理剩余 legacy)。
+ *
+ * - 任一域 backend 未实现 migrate(detector 已实现但 migrate 缺失,如 PG asset backend)→ 该域抛 not implemented
+ *   (fail-closed);orchestrator 捕获并记入 failed,不静默跳过。
+ * - resolver 返 undefined/空 → 该 fingerprint unmapped(留 legacy,strict gate 仍 no-go)。unmapped>0 → strict 不得翻。
+ * - 迁移后调 `assertStrictOwnerMigrationComplete(env, detectors)` 三域同判 legacy=0 → 通过 → 可翻 strict。
+ *
+ * dp4-identity-alignment.md §3.1 覆盖:persist_records.owner_id(含 chat-message)+ chat_order_revisions.actor_id
+ * + idempotency_index.envelope_owner(本编排 persist 域)+ share_links.created_by(permissions 域)
+ * + AssetRecord.ownerFp + references[].ownerFp + .uploaders(assets 域)。
+ */
+export const migrateAllDomainsLegacyOwnersToUsernameForm = async (
+  backends: {
+    persist: PersistBackend
+    permissions: PermissionBackend
+    assetStore: AssetStore | null
+  },
+  resolveFingerprintToUsername: (fingerprint: string) => string | undefined,
+): Promise<{
+  migrated: number
+  unmapped: number
+  failed: Array<{ domain: string; reason: string }>
+}> => {
+  const failed: Array<{ domain: string; reason: string }> = []
+  let migrated = 0
+  let unmapped = 0
+  // persist 域
+  try {
+    if (typeof backends.persist.migrateLegacyOwnersToUsernameForm !== 'function') {
+      throw new Error('persist backend does not implement migrateLegacyOwnersToUsernameForm (PG lands with G2.2)')
+    }
+    const r = await backends.persist.migrateLegacyOwnersToUsernameForm(resolveFingerprintToUsername)
+    migrated += r.migrated
+    unmapped += r.unmapped
+  } catch (err) {
+    failed.push({ domain: 'persist', reason: err instanceof Error ? err.message : String(err) })
+  }
+  // permissions 域
+  try {
+    if (typeof backends.permissions.migrateLegacyOwnersToUsernameForm !== 'function') {
+      throw new Error('permissions backend does not implement migrateLegacyOwnersToUsernameForm (PG lands with G2.2)')
+    }
+    const r = await backends.permissions.migrateLegacyOwnersToUsernameForm(resolveFingerprintToUsername)
+    migrated += r.migrated
+    unmapped += r.unmapped
+  } catch (err) {
+    failed.push({ domain: 'permissions', reason: err instanceof Error ? err.message : String(err) })
+  }
+  // assets 域。P2-5:assetStore null(service off)时按 resolveAssetStoreDir() 构造 FS store 执行迁移
+  //   (对齐 buildStartupDetectors R3-F1:detector 仍实扫磁盘,不伪造 0;迁移同理——磁盘上 legacy assets
+  //   须迁,否则 strict gate 假绿 0 通过)。不静默跳。
+  try {
+    const assetStore = backends.assetStore ?? createAssetStore(createFsAssetBackend(resolveAssetStoreDir()))
+    if (typeof assetStore.migrateLegacyFormOwners === 'function') {
+      const r = await assetStore.migrateLegacyFormOwners(resolveFingerprintToUsername)
+      migrated += r.migrated
+      unmapped += r.unmapped
+    }
+  } catch (err) {
+    failed.push({ domain: 'assets', reason: err instanceof Error ? err.message : String(err) })
+  }
+  return { migrated, unmapped, failed }
+}
+
+/**
  * 顶层 onError 处理器:严格模式下 SsoAuthError(由 sub-app 内 resolveActor 等抛出)→ 401。
  * 这是可靠 catch 点——`app.route(path, subApp)` 下 sub-app handler 抛错由顶层 onError 统一处理
  * (父级 `app.use` 的 try/catch 跨 sub-app 不可靠)。非 SsoAuthError 回退 Hono 默认 500(行为不变)。

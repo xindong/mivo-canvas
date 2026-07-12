@@ -1369,6 +1369,102 @@ export class PgPersistBackend implements PersistBackend {
     return { count: res.count }
   }
 
+  // ── G2.2:persist 域 owner rekey(fingerprint→SSO username)──────────────────────────────────
+  // 覆盖 dp4 owner inventory 的 persist 域:persist_records.owner_id(含 chat-message,§3.1)+ projects/canvases
+  // .owner_id(瘦全局索引表)+ idempotency_index.owner_id + envelope_owner(#10 幂等表)+ chat_order_revisions
+  // .actor_id(DP-6R P1-2)。两阶段(防 resolver 中途抛留半迁移态):① SELECT DISTINCT legacy owner + resolve;
+  // ② 事务内 UPDATE 全表(无 resolver 调用,不抛)+ warm() 刷新内存全局索引缓存。幂等:已 username 形态不再
+  // 匹配 16-hex 正则,重跑只处理剩余 legacy。unmapped>0 → strict gate 仍 no-go(明确拒迁)。
+
+  /**
+   * G2.1 R2-1 三域 gate 的 persist 域 detector(PG 实扫):统计 persist 域三表(persist_records.owner_id +
+   * idempotency_index.owner_id/envelope_owner + chat_order_revisions.actor_id + projects/canvases.owner_id)中为
+   * legacy 指纹形态(16-hex)的 DISTINCT owner 数。strict 启动 gate 调用:>0 → 拒启动(persist 域迁移未完成)。
+   */
+  async countLegacyFormOwners(): Promise<number> {
+    await this.ready
+    // PG 独立表(idempotency/chat_order_revisions/projects/canvases)非内存 byOwner 派生,须显式扫描;
+    // 与 InMemory(byOwner 外层 key = persist_records.owner_id)对齐并扩展覆盖 PG 独立表。
+    const rows = await sql<{ owner: string | null }>`
+    SELECT DISTINCT owner_id AS owner FROM persist_records WHERE owner_id ~ '^[0-9a-f]{16}$'
+    UNION SELECT DISTINCT owner_id AS owner FROM idempotency_index WHERE owner_id ~ '^[0-9a-f]{16}$'
+    UNION SELECT DISTINCT envelope_owner AS owner FROM idempotency_index WHERE envelope_owner ~ '^[0-9a-f]{16}$'
+    UNION SELECT DISTINCT actor_id AS owner FROM chat_order_revisions WHERE actor_id ~ '^[0-9a-f]{16}$'
+    UNION SELECT DISTINCT owner_id AS owner FROM projects WHERE owner_id ~ '^[0-9a-f]{16}$'
+    UNION SELECT DISTINCT owner_id AS owner FROM canvases WHERE owner_id ~ '^[0-9a-f]{16}$'
+  `.execute(this.db)
+    const legacy = new Set<string>()
+    for (const r of rows.rows) if (r.owner) legacy.add(r.owner)
+    return legacy.size
+  }
+
+  /**
+   * G2.2 persist 域 owner rekey:把 legacy 指纹 ownerId 重键为 SSO username(resolver 返回值)。
+   * 两阶段:Phase 1 收集 DISTINCT legacy owner + resolve(resolver 可能抛 → 未 mutation);Phase 2 事务内
+   * UPDATE persist_records + idempotency_index(owner_id + envelope_owner)+ chat_order_revisions.actor_id +
+   * projects + canvases,再 warm() 刷新内存全局索引缓存。返回 {migrated, unmapped}(owner 维度计数)。
+   */
+  async migrateLegacyOwnersToUsernameForm(
+    resolveFingerprintToUsername: (fingerprint: string) => string | undefined,
+  ): Promise<{ migrated: number; unmapped: number }> {
+    await this.ready
+    // P1-2:dp4 §3.1 fail-closed 预审——零 mutation 前断言所有 legacy chat-message.owner_id === canvas owner
+    //   (migration 003 "零搬迁"论证前提)。异常行(owner_id ≠ canvas owner / 孤儿 canvas)→ no-go 抛错,不静默
+    //   carry over(防换键后数据孤儿 + 隐私边界破损)。memory(backend.ts)parity。
+    const auditRows = await sql<{ id: string; ownerId: string; canvasId: string | null; canvasOwner: string | null }>`
+      SELECT cm.id, cm.owner_id AS "ownerId", cm.canvas_id AS "canvasId", c.owner_id AS "canvasOwner"
+      FROM persist_records cm
+      LEFT JOIN canvases c ON c.id = cm.canvas_id
+      WHERE cm.type = 'chat-message' AND cm.owner_id ~ '^[0-9a-f]{16}$'
+    `.execute(this.db)
+    for (const r of auditRows.rows) {
+      if (r.canvasOwner === null) {
+        throw new Error(
+          `G2.2 dp4 §3.1 no-go: legacy chat-message ${r.id} (owner ${r.ownerId}) references canvas ${r.canvasId} which has no global canvas owner (orphan/canvas deleted); refusing to rekey — resolve or quarantine before migration.`,
+        )
+      }
+      if (r.ownerId !== r.canvasOwner) {
+        throw new Error(
+          `G2.2 dp4 §3.1 no-go: legacy chat-message ${r.id} owner_id ${r.ownerId} !== canvas ${r.canvasId} owner ${r.canvasOwner} (member chat under non-canvas-owner fingerprint is anomalous in legacy form); refusing to rekey — migration 003 "no-move" invariant violated.`,
+        )
+      }
+    }
+    // Phase 1:收集 DISTINCT legacy owner(跨 persist 域全表)+ resolve(resolver 可能抛 → 此时未 mutation)。
+    const rows = await sql<{ owner: string | null }>`
+    SELECT DISTINCT owner_id AS owner FROM persist_records WHERE owner_id ~ '^[0-9a-f]{16}$'
+    UNION SELECT DISTINCT owner_id AS owner FROM idempotency_index WHERE owner_id ~ '^[0-9a-f]{16}$'
+    UNION SELECT DISTINCT envelope_owner AS owner FROM idempotency_index WHERE envelope_owner ~ '^[0-9a-f]{16}$'
+    UNION SELECT DISTINCT actor_id AS owner FROM chat_order_revisions WHERE actor_id ~ '^[0-9a-f]{16}$'
+    UNION SELECT DISTINCT owner_id AS owner FROM projects WHERE owner_id ~ '^[0-9a-f]{16}$'
+    UNION SELECT DISTINCT owner_id AS owner FROM canvases WHERE owner_id ~ '^[0-9a-f]{16}$'
+  `.execute(this.db)
+    const legacySet = new Set<string>()
+    for (const r of rows.rows) if (r.owner) legacySet.add(r.owner)
+    const mapping = new Map<string, string>()
+    let unmapped = 0
+    for (const fp of legacySet) {
+      const u = resolveFingerprintToUsername(fp)
+      if (u && u.length > 0) mapping.set(fp, u)
+      else unmapped += 1
+    }
+    if (mapping.size === 0) return { migrated: 0, unmapped }
+    // Phase 2:事务内 UPDATE 全表(无 resolver 调用,不抛;幂等:已 username 形态不再匹配 16-hex)。
+    await this.db.transaction().execute(async (trx) => {
+      for (const [fp, u] of mapping) {
+        await trx.updateTable('persist_records').set({ owner_id: u }).where('owner_id', '=', fp).execute()
+        await trx.updateTable('idempotency_index').set({ owner_id: u }).where('owner_id', '=', fp).execute()
+        await trx.updateTable('idempotency_index').set({ envelope_owner: u }).where('envelope_owner', '=', fp).execute()
+        await trx.updateTable('chat_order_revisions').set({ actor_id: u }).where('actor_id', '=', fp).execute()
+        await trx.updateTable('projects').set({ owner_id: u }).where('owner_id', '=', fp).execute()
+        await trx.updateTable('canvases').set({ owner_id: u }).where('owner_id', '=', fp).execute()
+      }
+    })
+    // post-migrate:rekey 后 projectIndex/canvasIndex 的 owner 指向变了,从 DB 重新 warm(防 getProjectOwner
+    // 返旧指纹 → strict 下访问错 owner)。warm() 全量重建,幂等。
+    await this.warm()
+    return { migrated: mapping.size, unmapped }
+  }
+
   /**
    * R2-P1-2 回归 barrier 的 test-only 旋钮(production 永不设置;实例属性,随实例销毁)。
    * - afterMessages:在 messages SELECT 完成、orderRevision SELECT 开始之间 await——测试在此窗口内提交

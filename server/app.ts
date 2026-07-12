@@ -222,7 +222,7 @@ app.route('/api/mivo', createLocalAssetsRoutes({ enabled: featureFlags.localAsse
 let sharedAssetStore: AssetStore | null = null
 if (featureFlags.assetServiceEnabled) {
   sharedAssetStore = createAssetStore(createFsAssetBackend(resolveAssetStoreDir()))
-  app.route('/api', createAssetRoutes({ store: sharedAssetStore }))
+  app.route('/api', createAssetRoutes({ store: sharedAssetStore, persist: sharedPersistBackend, permissions: sharedPermissionBackend }))
 } else {
   // Flag off → 404 for the asset endpoints (no SPA index.html for an API path).
   const assetDisabled = (c: Context<AppEnv>) => c.notFound()

@@ -225,6 +225,17 @@ export interface PermissionBackend {
    * (persist 域 gate 覆盖 persist_records/projects/canvases/idempotency_index;asset 域 gate 覆盖 ownerFp)。
    */
   countLegacyFormOwners?(): Promise<number>
+  /**
+   * G2.2:permissions 域 owner rekey——把 share_links.created_by 从 legacy 指纹形态(16-hex)重键为
+   * SSO username(`resolver` 返回值)。覆盖 share_links.created_by(dp4 owner inventory 的 permissions 域)。
+   * project_members.user_id 不在 rekey 范围(按 DP-4 是真实 username,非指纹;legacy 无 SSO 时 member
+   * 表本就空)。**可选**:InMemory 实装(可测);PG 随 G2.2 落地,未实现时 owner.ts 三域编排显式抛
+   * not implemented(fail-closed)。resolver 返 undefined/空 → 该 createdBy unmapped(留 legacy,strict gate 仍 no-go)。
+   * 返回 {migrated, unmapped} 计数;事务边界:两阶段(先收集+resolve,再原地改;防 resolver 中途抛留半迁移态)。
+   */
+  migrateLegacyOwnersToUsernameForm?(
+    resolver: (fingerprint: string) => string | undefined,
+  ): Promise<{ migrated: number; unmapped: number }>
 
   /**
    * backend 就绪 promise(memory 立即 resolve;PG 跑 migrations 建表)。app 启动(server/index.ts serve 前)
@@ -807,6 +818,41 @@ export class InMemoryPermissionBackend implements PermissionBackend {
       }
     }
     return legacy.size
+  }
+
+  /**
+   * G2.2:permissions 域 owner rekey。两阶段(防 resolver 中途抛留半迁移态):
+   *  1. 收集 legacy createdBy(link.createdBy 为 16-hex 指纹)+ 调 resolver 取 username(resolver 抛 → 未 mutation);
+   *  2. 逐 link 原地改 createdBy(Map ops 同步不抛)。linksByToken/linksByProject 存 id 不存对象引用,
+   *     故原地改 ShareLink.createdBy 即覆盖全部索引。
+   * unmapped(resolver 返 undefined/空)→ 留 legacy,strict gate 仍 no-go。返回 {migrated, unmapped}。
+   */
+  async migrateLegacyOwnersToUsernameForm(
+    resolver: (fingerprint: string) => string | undefined,
+  ): Promise<{ migrated: number; unmapped: number }> {
+    // Phase 1:收集 legacy createdBy + 目标 username(resolver 可能抛 → 此时未 mutation)。
+    const legacyLinks: Array<{ link: ShareLink; target: string | null }> = []
+    for (const link of this.links.values()) {
+      if (!InMemoryPermissionBackend.LEGACY_FINGERPRINT_RE.test(link.createdBy)) continue
+      const u = resolver(link.createdBy)
+      legacyLinks.push({ link, target: u && u.length > 0 ? u : null })
+    }
+    let migrated = 0
+    let unmapped = 0
+    // Phase 2:原地改 createdBy(Map ops 同步,无 resolver 调用,不抛)。
+    for (const { link, target } of legacyLinks) {
+      if (target === null) {
+        unmapped += 1
+        continue
+      }
+      if (target === link.createdBy) {
+        migrated += 1 // 幂等(理论上 L 是 16-hex,U 不会等于 L)
+        continue
+      }
+      link.createdBy = target
+      migrated += 1
+    }
+    return { migrated, unmapped }
   }
 
   __reset(): void {

@@ -10,12 +10,15 @@ import { createAssetRoutes } from './assets'
 import { fingerprintOfPlatformKey } from '../lib/keys'
 import { createFsAssetBackend, createMemoryAssetBackend, type AssetStoreBackend } from '../lib/assetStore'
 import { resetDecodeGate, decodeGateStats, acquireDecodePermit } from '../lib/decodeGate'
+import { createPersistBackend } from '../persist/backend'
+import { createPermissionBackend } from '../lib/permissions'
 import type { AppEnv } from '../lib/types'
 
 // Mirrors how server/app.ts mounts the sub-app: app.route('/api', createAssetRoutes()).
+// G2.2: attach/detach routes need persist+permissions for canvas-edit authz; POST/GET ignore them.
 const buildApp = (backend: AssetStoreBackend): Hono<AppEnv> => {
   const app = new Hono<AppEnv>()
-  app.route('/api', createAssetRoutes({ backend }))
+  app.route('/api', createAssetRoutes({ backend, persist: createPersistBackend(), permissions: createPermissionBackend() }))
   return app
 }
 

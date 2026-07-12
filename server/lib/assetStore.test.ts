@@ -353,7 +353,7 @@ describe('assetStore — path traversal guard (P2.6)', () => {
         be.ensureRecord({ contentHash: '../etc/passwd', mimeType: 'image/png', sizeBytes: 1, originalName: 'a', ownerFp: OWNER_A, createdAt: 1 }, 1),
       ).rejects.toBeInstanceOf(InvalidAssetIdError)
       await expect(be.attachRef('../etc/passwd', { nodeId: 'n', ownerFp: OWNER_A })).rejects.toBeInstanceOf(InvalidAssetIdError)
-      await expect(be.detachRef('../etc/passwd', 'n', OWNER_A, 1)).rejects.toBeInstanceOf(InvalidAssetIdError)
+      await expect(be.detachRef('../etc/passwd', 'n', undefined, OWNER_A, 1)).rejects.toBeInstanceOf(InvalidAssetIdError)
       await expect(be.deleteIfStillEligible('../etc/passwd', 1)).rejects.toBeInstanceOf(InvalidAssetIdError)
       for (const s of spies) expect(s).not.toHaveBeenCalled()
     } finally {

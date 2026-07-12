@@ -419,9 +419,9 @@ jobs:
   # 保护配置(照 #186→#193 e2e-kernel-gate 先例:分支保护为 PR 外 lead 动作,与 workflow
   # 改动分离)。分支保护加进后,PG 测试失败即阻断 PR 合并。
   #
-  # 时序:#202 已于 2026-07-11 合入 main,本 PR(2026-07-12)接入 p6saga 矩阵,五个 PG-gated 测试文件已在 main:
-  #   backend.contract.dual / backend.pg / permissionBackend.contract.dual / persist.route.dual / p6saga.pg.matrix
-  # 故本 job 在每个 PR 上实跑真 PG 用例(契约 32 场景 + 并发回归),失败即红。
+  # 时序:#202 已于 2026-07-11 合入 main,本 PR(2026-07-12)接入 p6saga 矩阵,G2.2(A1)加 authz matrix,六个 PG-gated 测试文件已在 main:
+  #   backend.contract.dual / backend.pg / permissionBackend.contract.dual / persist.route.dual / p6saga.pg.matrix / assetsAuthzMatrix
+  # 故本 job 在每个 PR 上实跑真 PG 用例(契约 32 场景 + saga 迁移矩阵 + 并发回归 + authz 矩阵),失败即红。
   pg-suite:
     name: pg suite (PG16)
     if: github.event_name == 'pull_request'
@@ -454,9 +454,12 @@ jobs:
       MIVO_PG_PASSWORD: mivo-test-no-password
       MIVO_PG_DB: mivocanvas
       MIVO_PG_UNIT_DB: mivocanvas_unit
-      # p6saga 迁移矩阵 + 并发回归套件隔离库(p6saga.pg.matrix.test.ts 用;与 mivocanvas_unit
-      # 分离,防 DROP SCHEMA 重置污染 backend.pg 套件)。库由下方 psql 步预建。
+      # G2.2(A1 P1-7):p6saga + authz matrix PG 用例的隔离 DB(与 mivocanvas_unit 分离,防 DROP SCHEMA
+      #   重置污染 + 并发 worktree 污染)。p6saga 矩阵 + 并发回归用 mivocanvas_unit_p6saga;authz 矩阵
+      #   (owner/editor/viewer/share × attach/detach/upload)用 mivocanvas_unit_authz。库由下方 psql 步预建。
       MIVO_PG_UNIT_DB_P6SAGA: mivocanvas_unit_p6saga
+      # G2.2(A1 P1-7):authz 矩阵(owner/editor/viewer/share × attach/detach/upload)隔离库。库由下方 psql 步预建。
+      MIVO_PG_UNIT_DB_AUTHZ: mivocanvas_unit_authz
       # A8②-3 permission 套件隔离库(permissionBackend.contract.dual 用;与 backend.pg 的
       # mivocanvas_unit 分离,防 backend.pg __dropAllTables() 核爆 permission 表 + 追踪表)。库由下方 psql 步预建。
       MIVO_PG_UNIT_DB_PERM: mivocanvas_unit_perm
@@ -494,10 +497,14 @@ jobs:
             || PGPASSWORD=mivo-test-no-password psql -h 127.0.0.1 -p 5432 -U mivo -d postgres -c "CREATE DATABASE mivocanvas_unit"
           echo "mivocanvas_unit ready (CREATEDB confirmed)"
           echo "::endgroup::"
-          echo "::group::Ensure mivocanvas_unit_p6saga DB exists (p6saga.pg.matrix.test.ts isolation DB)"
-          PGPASSWORD=mivo-test-no-password psql -h 127.0.0.1 -p 5432 -U mivo -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='mivocanvas_unit_p6saga'" | grep -q 1 \
-            || PGPASSWORD=mivo-test-no-password psql -h 127.0.0.1 -p 5432 -U mivo -d postgres -c "CREATE DATABASE mivocanvas_unit_p6saga"
-          echo "mivocanvas_unit_p6saga ready (p6saga matrix + concurrency isolation DB)"
+          # G2.2(A1 P1-7):p6saga + authz matrix 隔离 DB 预建(ensureAuthzDb/ensureP6sagaDb 自建兜底,
+          #   预建加速 + 验 CREATEDB;两 DB 与 mivocanvas_unit 分离,防 DROP SCHEMA 重置 + 并发 worktree 污染)。
+          echo "::group::Ensure p6saga + authz isolation DBs exist"
+          for db in mivocanvas_unit_p6saga mivocanvas_unit_authz; do
+            PGPASSWORD=mivo-test-no-password psql -h 127.0.0.1 -p 5432 -U mivo -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$db'" | grep -q 1 \
+              || PGPASSWORD=mivo-test-no-password psql -h 127.0.0.1 -p 5432 -U mivo -d postgres -c "CREATE DATABASE \"$db\""
+            echo "$db ready"
+          done
           echo "::endgroup::"
           echo "::group::Ensure mivocanvas_unit_perm DB exists (permissionBackend.contract.dual isolation DB; A8②-3)"
           PGPASSWORD=mivo-test-no-password psql -h 127.0.0.1 -p 5432 -U mivo -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='mivocanvas_unit_perm'" | grep -q 1 \
@@ -507,21 +514,23 @@ jobs:
 
       # 跑 PG-gated 套件。--no-fileParallelism:多 DB 隔离设计下更稳(lead 指定)。
       # 隔离库:mivocanvas(contract.dual/route.dual)+ mivocanvas_unit(backend.pg)
-      #       + mivocanvas_unit_p6saga(p6saga)+ mivocanvas_unit_perm(permissionBackend.contract.dual,A8②-3)。
-      # 机器不变量:五文件必须全部存在,任一缺失(删/改名/typo)在 vitest 之前即红,
-      # 杜绝"--passWithNoTests + 缺文件 → 其余四文件绿"的静默少跑(本 PR 要消灭的病)。
-      # 五文件已全在 main,infra-only/0-file 兼容期已过,不再保留 --passWithNoTests。
+      #       + mivocanvas_unit_p6saga(p6saga)+ mivocanvas_unit_perm(permissionBackend.contract.dual,A8②-3)
+      #       + mivocanvas_unit_authz(assetsAuthzMatrix,G2.2 A1)。
+      # 机器不变量(#229 硬门禁):六文件必须全部存在,任一缺失(删/改名/typo)在 vitest 之前即红,
+      # 杜绝"--passWithNoTests + 缺文件 → 其余文件绿"的静默少跑(#229 要消灭的病)。
+      # 六文件已全在 main(p6saga 自 #229 入;authz matrix 自 G2.2 A1 加入),infra-only/0-file 兼容期已过,不保留 --passWithNoTests。
       - name: Run PG-gated vitest suite
         run: |
           set -o pipefail
           mkdir -p test-artifacts
-          # 唯一数组(五路径字面);与下方 summary 步同源,改一处须同步另一处。
+          # 唯一数组(六路径字面);与下方 summary 步同源,改一处须同步另一处。
           required_files=(
             server/persist/backend.contract.dual.test.ts
             server/persist/backend.pg.test.ts
             server/persist/permissionBackend.contract.dual.test.ts
             server/routes/persist.route.dual.test.ts
             server/persist/p6saga.pg.matrix.test.ts
+            server/routes/assetsAuthzMatrix.test.ts
           )
           expected=${#required_files[@]}
           for f in "${required_files[@]}"; do
@@ -537,13 +546,14 @@ jobs:
       - name: Surface pg-suite result in job summary
         if: always()
         run: |
-          # 与 vitest 步同源五路径(改一处须同步另一处)。
+          # 与 vitest 步同源六路径(改一处须同步另一处)。
           required_files=(
             server/persist/backend.contract.dual.test.ts
             server/persist/backend.pg.test.ts
             server/persist/permissionBackend.contract.dual.test.ts
             server/routes/persist.route.dual.test.ts
             server/persist/p6saga.pg.matrix.test.ts
+            server/routes/assetsAuthzMatrix.test.ts
           )
           expected=${#required_files[@]}
           nFound=0
@@ -554,8 +564,8 @@ jobs:
             echo '观察窗已收口(七 PR 全绿),已注册进 main 分支保护必需 check `CI / pg suite (PG16)`(仿 #186→#193 e2e-kernel-gate 先例)。失败即阻断合并。'
             echo ''
             echo '### 时序'
-            echo '- #202 已于 2026-07-11 合入 main,本 PR 接入 p6saga 矩阵,五个 PG-gated 测试文件已在 main。'
-            echo '- 每 PR 实跑真 PG 用例(双后端契约 32 场景 + saga 迁移矩阵 + 并发回归),见下方 vitest 日志。'
+            echo '- #202 已于 2026-07-11 合入 main(初始四个 PG-gated 文件);#229 接入 p6saga 矩阵(五);G2.2(A1)加 authz matrix,现六个。'
+            echo '- 每 PR 实跑真 PG 用例(双后端契约 32 场景 + saga 迁移矩阵 + 并发回归 + authz 矩阵),见下方 vitest 日志。'
             echo ''
             echo "### 本轮 vitest 匹配文件数(expected=$expected,不许静默:缺一即红)"
             for f in "${required_files[@]}"; do
@@ -563,7 +573,7 @@ jobs:
             done
             echo ''
             if [ "$nFound" -eq "$expected" ]; then
-              echo "> **真 PG 测试模式**:found=$nFound/expected=$expected,五文件全在,vitest 实跑(见下方日志)。"
+              echo "> **真 PG 测试模式**:found=$nFound/expected=$expected,六文件全在,vitest 实跑(见下方日志)。"
             else
               echo "> **❌ 文件缺失**:found=$nFound/expected=$expected,缺 $((expected-nFound)) 个 → vitest 前置步已红,本步兜底 exit 1。"
             fi
