@@ -13,7 +13,7 @@
 ## 0. TL;DR
 
 1. **port 是 transport-neutral 抽象**:接口 `loadSnapshot / submitChange / subscribe`,只表 record/field 级**域语义**(`create-*` 全量新 record / `edit-*` 字段级意图 / `delete-*` / `reorder-children` / `update-meta`),**不**出现任一候选独占的 transport DTO。
-2. **中性游标 `SnapshotCursor`**:branded `unknown`。port 永不读其内部;adapter 解释为 Figma 案的 opaque `BaseCursor`(绑 canvasId+recordId+revision+per-field clock;v7),或 Yjs 案的 state-vector(编码态 `Uint8Array`)/ Y.Clock。这是两案 wire 形状根本不同的唯一收敛点。
+2. **中性游标 `SnapshotCursor`**:branded opaque **bundle**(v8/v9)。port 永不读其内部;adapter 解释为 canvas 级 opaque bundle(recordId→`BaseCursor` 映射 + canvas order cursor + event since cursor);Figma 案 per-record `BaseCursor`(绑 canvasId+recordId+revision+per-field clock)是 bundle 内 item,submitChange 按 change.recordId/op class 抽对应 wire base(edit/delete→record base;reorder→order base;catch-up→since base);Yjs 案 adapter 可填 state-vector(编码态 `Uint8Array`)/ Y.Clock(bundle 形状容纳,adapter 自解释)。这是两案 wire 形状根本不同的唯一收敛点。
 3. **红线(N2-0 前硬约束)**:port 不含 field-path PATCH body / If-Match revision header / 409 ConflictBody / metaRevision·contentVersion 分名(Figma 独占);不含 Y.Update(Uint8Array)/ state-vector(Uint8Array 编码 / `Map<clientID,clock>` 解码)/ y-protocol frame(Yjs 独占)。出现任一即违约(计划 §10 风险表)。自证见 §4 + `canvasSyncPort.contract.test.ts` 的 `@ts-expect-error`。
 4. **不实现 transport**:仅冻结接口 + 类型 + 占位 fail-visible impl。N2-0 决议后 G1-c 落地唯一 adapter,另一模型零死接口。
 5. **两案根本差异在 wire/conflict/shadow 三维**(hydrate/retry 可经 adapter 翻译收敛):Figma 案服务端是**权威合并点**(409 冲突 + rebase + 三态 shadow);Yjs 案客户端 Y.Doc 本身即**合并态**(CRDT 自合并 + sv 补拉 + 一态)。N2-0 的 hard gate(文本同编 / undo / 跨 record 事务 / 网关 ws)决定取舍。
@@ -155,9 +155,9 @@ type CanvasSyncEvent =
 
 | port 方法 | Figma 案 adapter(N2-0 选 Figma 时) | Yjs 案 adapter(N2-0 选 Yjs 时) |
 |---|---|---|
-| `loadSnapshot(id, since?)` | `fetchCanvas`(ServerPersistAdapter)+ 可选 `since=seq` 增量补拉;cursor = opaque BaseCursor(绑 scope+field-clock) | `GET /snapshot` 拉序列化 Y.Doc + sv 协议补拉;cursor = state-vector(Uint8Array) |
-| `submitChange(change, base?)` | `create-*`→POST `:id/nodes/:nodeId` 全量(client-id);`edit-*` intents→field-path PATCH body(fieldPath 段直接对应)+ `If-Match: base→opaque BaseCursor`;edit stale→200+overwritten(非 409);delete/reorder stale→`conflict` outcome(409,caller re-fetch);401/403/413/422/400→`rejected`(域 reason) | `create-*` seeding 全量 Y.Map;`edit-*` intents→按 fieldPath 逐层 Y.Map.set(永不 clear 整子树);总 `accepted` outcome |
-| `subscribe(id, onEvent)` | SSE/WS 订阅服务端广播合并态 → `change(origin=remote)` + 新 cursor | WS y-protocol peer 广播 → `change(origin=remote)` + 新 cursor;断线 → `gap` 事件 |
+| `loadSnapshot(id, since?)` | `fetchCanvas`(ServerPersistAdapter)+ 可选 `since=seq` 增量补拉;**cursor = canvas 级 opaque bundle**(recordId→BaseCursor 映射 + order cursor + since cursor;v8/v9) | `GET /snapshot` 拉序列化 Y.Doc + sv 协议补拉;cursor = state-vector(Uint8Array) |
+| `submitChange(change, base?)` | `create-*`→POST `:id/nodes/:nodeId` 全量(client-id);`edit-*` intents→field-path PATCH body(fieldPath 段直接对应)+ `If-Match`:**从 canvas 级 bundle(base)按 change kind/id 解包 record/order wire base**(edit/delete→record BaseCursor;reorder→order cursor;v8/v9);accepted/conflict 用 wire response 的 base/seq **增量更新** bundle(仅命中项,未命中项引用不变;spike S10-12 submitFromBundle);edit stale→200+overwritten(非 409);delete/reorder stale→`conflict` outcome(409,caller re-fetch);401/403/413/422/400→`rejected`(域 reason) | `create-*` seeding 全量 Y.Map;`edit-*` intents→按 fieldPath 逐层 Y.Map.set(永不 clear 整子树);总 `accepted` outcome |
+| `subscribe(id, onEvent)` | SSE/WS 订阅服务端广播合并态 → `change(origin=remote)` + 新 cursor(canvas 级 bundle,增量更新命中项) | WS y-protocol peer 广播 → `change(origin=remote)` + 新 cursor;断线 → `gap` 事件 |
 
 **红线再强调**:两案 adapter 都**不**把各自独占形状(field-path PATCH body / Y.Update binary / revision / state-vector)放进 `canvasSyncPort.ts` 的类型定义;只在自己的 adapter 文件(N2-0 决议后、G1-c 落地)内出现。port 侧 `SnapshotCursor` 是 branded `unknown`,adapter 用 `as unknown as SnapshotCursor` 构造,port 侧零 inspection。`FieldPath` 是域语义数组,**非** wire JSON-Pointer——两案 adapter 都能消费(fieldPath 是域语义不是 wire)。
 
@@ -525,9 +525,9 @@ port 的中性设计保证 N2-0 任一决议后,G1-c 只需落一个 adapter,另
 
 ## 11. v7 决议收口(对齐 N2-0 §14;sol 第六轮 3 阻断交叉影响)
 
-> N2-0 v7 决议(§14)对 port 契约的交叉影响 + 两文档同规则对齐。v7 病根:连续三轮栽在"改了点名处、漏了全文扫尾"。v7 硬禁令:禁止追加式修复;直接重写 active 段原文;全文扫尾不漏(§2/§3 主表已清零 envelope-revision/409 rebase/revision bundle 旧模型 → opaque BaseCursor 绑 scope+field-clock + base-driven 409;§2.2 hydrate cursor=opaque BaseCursor;§2.3 428 re-fetch BaseCursor+conflict 非 rebase;§2.5 shadow cursor=BaseCursor+base→BaseCursor+edit stale 200+overwritten)。
+> N2-0 v7 决议(§14)对 port 契约的交叉影响 + 两文档同规则对齐。**[superseded by v8/v9:下文 cursor=opaque BaseCursor / hydrate cursor=opaque BaseCursor / shadow cursor=BaseCursor 等 v7 单 record 级 cursor 表述,已由 v8/v9 canvas 级 opaque bundle(recordId→BaseCursor+order+since)取代,见 §1 item 2 + §2.1/§2.2 + §3 + spike S10-12 submitFromBundle;v7 以下历史叙事保留作演进轨迹]**。v7 病根:连续三轮栽在"改了点名处、漏了全文扫尾"。v7 硬禁令:禁止追加式修复;直接重写 active 段原文;全文扫尾不漏(§2/§3 主表已清零 envelope-revision/409 rebase/revision bundle 旧模型 → opaque BaseCursor 绑 scope+field-clock + base-driven 409;§2.2 hydrate cursor=opaque BaseCursor;§2.3 428 re-fetch BaseCursor+conflict 非 rebase;§2.5 shadow cursor=BaseCursor+base→BaseCursor+edit stale 200+overwritten)。
 
-### 11.1 Blocker 1 — BaseCursor 绑 scope + per-field clock(对齐 port SnapshotCursor opaque)
+### 11.1 Blocker 1 — BaseCursor 绑 scope + per-field clock(对齐 port SnapshotCursor opaque)[superseded by v8/v9:port SnapshotCursor 改 canvas 级 opaque bundle,BaseCursor 为 bundle 内 per-record item;submitFromBundle 增量更新]
 
 - N2-0 v6 `BaseCursor` 绑 canvasId+recordId+revision+per-field clock(port `SnapshotCursor` 同规则:业务层 opaque,codec 只在 adapter)。防跨 record/canvas 重放 + 同-field stale 才 overwritten。
 - port 侧:`SnapshotCursor` 已是 branded unknown(业务层 opaque);N2-0 BaseCursor 是其 Figma 案 wire 形态(string codec + 签名 + scope)。见 N2-0 §14.1 + S10-12。
@@ -547,7 +547,7 @@ port 的中性设计保证 N2-0 任一决议后,G1-c 只需落一个 adapter,另
 - §5 item 5 "网关必透传" → "网关应透传(条件式;生产可能缓冲/超时 → N2-0 §14.4 失败树 + finite short-poll)"。与 N2-0 §2 Gate5 + §14.4 一致。
 - **finite short-poll 真模式(v5 Blocker 4)**:GET /events/poll?since= 返 JSON 服务端自然结束(非 SSE 流);fallback = finite short-poll(非 "SSE fallback" 循环)。见 N2-0 §14.4 + SSE spike 5-12。
 
-### 11.5 Blocker 2 — create client-id 对齐 + base.cursor opaque(canvasSyncPort SnapshotCursor 同规则)
+### 11.5 Blocker 2 — create client-id 对齐 + base.cursor opaque(canvasSyncPort SnapshotCursor 同规则)[superseded by v8/v9:SnapshotCursor 改 canvas 级 opaque bundle;create client-id 对齐保持]
 
 - port `CanvasChange.create-node` 携 `NodeRecord`(含 id);N2-0 v5 `CreateBody` id = client `NodeRecord.id`(废除 server-mint)。两文档一致:create id 来自 client(adapter 提取进 path)。
 - **base = opaque**:`SnapshotCursor` 对业务层 opaque(branded unknown),codec 只在 adapter;N2-0 `BaseCursor` 同规则(string codec + 签名,业务层 opaque)。见 X-1 + N2-0 §14.1。

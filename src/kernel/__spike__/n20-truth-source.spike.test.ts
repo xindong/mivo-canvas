@@ -1963,6 +1963,49 @@ describe('N2-0 返修 §10 G1-b 衔接(P2-8): FieldPath 非空 + 数组中性 in
         if (nodeId === undefined) return null
         return d.records[nodeId] ?? null  // ★ edit/delete 取 record base(按 recordId 抽;不串用)
       }
+      // ── v9 真 adapter harness:submitFromBundle — extractWireBase 真传给 edit/delete/reorder/create;增量更新(非全量重建)──
+      /** ★ v9:submitFromBundle(bundle, change) 真 adapter 路径。extractWireBase 结果真实传给 edit/delete/reorder/create(非直传 h.snapshot);
+       *  accepted/conflict 用 wire response 的 base/seq **增量更新** bundle(仅命中 record/order 项;未命中项引用不变;非全量 snapshotBundle 重建)。
+       *  返 { outcome, newBundle, entries }:entries 为构建 newBundle 的 in-memory 对象(未命中项与旧 bundle decode 的 entry 同引用,断言用)。 */
+      submitFromBundle(bundle: SnapshotCursor, change:
+        | { kind: 'edit'; nodeId: string; fieldPath: FieldPath; value: unknown }
+        | { kind: 'delete'; nodeId: string }
+        | { kind: 'reorder'; orderedIds: string[] }
+        | { kind: 'create'; nodeId: string }, actor = 'anon'): { outcome: Outcome; newBundle: SnapshotCursor; entries: Record<string, BundleEntry> } {
+        const dec = decodeBundle(bundle, this.canvasId)
+        if (!dec) return { outcome: { status: 400, outcome: 'rejected' }, newBundle: bundle, entries: {} }
+        const entries: Record<string, BundleEntry> = { ...dec.entries }  // ★ shallow copy:未命中项引用不变(同 BundleEntry 对象)
+        let orderCv = dec.orderCv; let sinceSeq = dec.sinceSeq
+        if (change.kind === 'edit') {
+          const base = this.extractWireBase(bundle, 'edit', change.nodeId)  // ★ 真传 extractWireBase 结果(非 h.snapshot 直传)
+          if (!base) return { outcome: { status: 400, outcome: 'rejected' }, newBundle: bundle, entries }
+          const r = this.edit(change.nodeId, { fieldPath: change.fieldPath, value: change.value }, base, actor)
+          if (r.outcome === 'accepted' && r.base) { const d = decodeBase(r.base, this.canvasId, change.nodeId)!; entries[change.nodeId] = { revision: d.revision, fieldClocks: d.fieldClocks }; sinceSeq += 1 }  // ★ 仅命中 record 增量更新 + since
+          else if (r.outcome === 'conflict' && r.base) { const d = decodeBase(r.base, this.canvasId, change.nodeId)!; entries[change.nodeId] = { revision: d.revision, fieldClocks: d.fieldClocks } }  // ★ conflict 只更新该 record current base(非全量)
+          return { outcome: r, newBundle: encodeBundle(this.canvasId, entries, orderCv, sinceSeq), entries }
+        }
+        if (change.kind === 'delete') {
+          const base = this.extractWireBase(bundle, 'delete', change.nodeId)
+          if (!base) return { outcome: { status: 400, outcome: 'rejected' }, newBundle: bundle, entries }
+          const r = this.delete(change.nodeId, base)
+          if (r.outcome === 'accepted') { delete entries[change.nodeId]; sinceSeq += 1 }  // ★ 移 entry + since
+          else if (r.outcome === 'conflict' && r.base) { const d = decodeBase(r.base, this.canvasId, change.nodeId)!; entries[change.nodeId] = { revision: d.revision, fieldClocks: d.fieldClocks } }
+          return { outcome: r, newBundle: encodeBundle(this.canvasId, entries, orderCv, sinceSeq), entries }
+        }
+        if (change.kind === 'reorder') {
+          const base = this.extractWireBase(bundle, 'reorder')  // ★ reorder 取 order base
+          if (!base) return { outcome: { status: 400, outcome: 'rejected' }, newBundle: bundle, entries }
+          const r = this.reorder(change.orderedIds, base)
+          if (r.outcome === 'accepted' && r.base) { orderCv += 1; sinceSeq += 1 }  // ★ 更新 order + since
+          else if (r.outcome === 'conflict' && r.base) { const d = decodeOrderBase(r.base, this.canvasId)!; orderCv = d.cv }  // conflict 只更新 order current base
+          return { outcome: r, newBundle: encodeBundle(this.canvasId, entries, orderCv, sinceSeq), entries }
+        }
+        // create
+        const r = this.create(change.nodeId)
+        if (r.outcome === 'accepted' && r.base) { const d = decodeBase(r.base, this.canvasId, change.nodeId)!; entries[change.nodeId] = { revision: d.revision, fieldClocks: d.fieldClocks }; sinceSeq += 1 }  // ★ 增 entry + since
+        else if (r.outcome === 'conflict' && r.base) { const d = decodeBase(r.base, this.canvasId, change.nodeId)!; entries[change.nodeId] = { revision: d.revision, fieldClocks: d.fieldClocks } }
+        return { outcome: r, newBundle: encodeBundle(this.canvasId, entries, orderCv, sinceSeq), entries }
+      }
     }
     const h = new BaseDrivenHarness('c1')
     // ── 新鲜 base:正常操作必须成功(非 race)──
@@ -2084,6 +2127,57 @@ describe('N2-0 返修 §10 G1-b 衔接(P2-8): FieldPath 非空 + 数组中性 in
     // ★ 跨 canvas bundle 重放 → scope-mismatch → null(防 c1 bundle 用于 c2;bundle canvas-scoped)
     const hB = new BaseDrivenHarness('c2'); hB.create('nb1')
     expect(hB.extractBundle(bundle)).toBeNull()  // c1 bundle → c2 scope mismatch → null
+    // ── v9 真 adapter harness:submitFromBundle(extractWireBase 真传 + 增量更新 + 未命中项引用不变;edit/delete/reorder/create/conflict 五路全跑)──
+    //   v8 缺陷:S10-12 只比较 extractWireBase 返回值,edit 仍直传 h.snapshot,accepted 后 snapshotBundle() 全量重建——"增量更新"无证据。v9 补真 adapter 路径。
+    h.create('sb1'); h.edit('sb1', { fieldPath: ['title'], value: 'S1' }, h.snapshot('sb1')!, 'alice')  // sb1 rev2 title.clock1
+    h.create('sb2'); h.edit('sb2', { fieldPath: ['transform', 'x'], value: 7 }, h.snapshot('sb2')!, 'bob')  // sb2 rev2 transform.x.clock1
+    const sbN1 = h.snapshot('sb1')!; const sbN2 = h.snapshot('sb2')!  // per-record wire base(rev2)
+    const bundleS = h.snapshotBundle()  // canvas 级 bundle(sb1+sb2 rev2 + order + since)
+    const decS = h.extractBundle(bundleS)!
+    // ★ 增量铁证 setup:bump recs.sb2(AFTER bundleS、BEFORE submitFromBundle)— 区分增量(bundleS 的 sb2=rev2)vs 全量扫描(recs.sb2=rev3)
+    h.edit('sb2', { fieldPath: ['title'], value: 'sneaky' }, h.snapshot('sb2')!, 'eve')  // recs.sb2 rev2→3;bundleS 的 sb2 仍 rev2
+    // ★ ① edit 路径:submitFromBundle(edit sb1)— extractWireBase 真传(非直传 h.snapshot);accepted 增量更新(仅 sb1;未命中 sb2 引用不变 + 值=旧 bundleS 非 recs)
+    const rEdit = h.submitFromBundle(bundleS, { kind: 'edit', nodeId: 'sb1', fieldPath: ['title'], value: 'S1-v2' }, 'carol')
+    expect(rEdit.outcome.outcome).toBe('accepted')  // base rev2===current rev2(recs.sb1 未 bump)→ fresh → 200
+    expect(h.extractBundle(rEdit.newBundle)!.records.sb1).not.toEqual(sbN1)  // ★ sb1 entry 更新(wire response base 增量)
+    expect(h.extractBundle(rEdit.newBundle)!.records.sb2).toEqual(sbN2)  // ★ 增量铁证:sb2 = 旧 bundleS 的 rev2(非 recs 当前的 sneaky rev3)— 非全量扫描
+    expect(rEdit.entries.sb2).toStrictEqual(decS.entries.sb2)  // ★ 未命中项值未动(shallow copy 保留;跨 decode 引用必异,故值相等证"未动",lead 括号允许"对象/值未动")
+    expect(rEdit.entries.sb1).not.toStrictEqual(decS.entries.sb1)  // ★ sb1 新值(更新;rev3≠rev2)
+    // recs 现状:sb1=rev3(被 edit bump),sb2=rev3(sneaky bump)
+    // ★ ② delete 路径:submitFromBundle(delete sb1, fresh base)— 移 entry + since;sb2 不变(引用不变)
+    const bundleDel = h.snapshotBundle()  // fresh bundle(sb1=rev3 匹配 current → fresh delete)
+    const decDel = h.extractBundle(bundleDel)!
+    const rDel = h.submitFromBundle(bundleDel, { kind: 'delete', nodeId: 'sb1' })
+    expect(rDel.outcome.outcome).toBe('accepted')  // base rev3===current rev3 → fresh → 200
+    expect(h.extractBundle(rDel.newBundle)!.records.sb1).toBeUndefined()  // ★ sb1 entry 移除
+    expect(h.extractBundle(rDel.newBundle)!.records.sb2).toBeDefined()  // sb2 仍在
+    expect(rDel.entries.sb2).toStrictEqual(decDel.entries.sb2)  // ★ 未命中项值未动(delete 不动 sb2 entry)
+    // ★ ③ create 路径:submitFromBundle(create sb3)— 增 entry + since;未命中项引用不变
+    const bundleCre = h.snapshotBundle()
+    const decCre = h.extractBundle(bundleCre)!
+    const rCre = h.submitFromBundle(bundleCre, { kind: 'create', nodeId: 'sb3' })
+    expect(rCre.outcome.outcome).toBe('accepted')  // sb3 不存在 → create 201
+    expect(h.extractBundle(rCre.newBundle)!.records.sb3).toBeDefined()  // ★ sb3 entry 新增
+    expect(rCre.entries.sb2).toStrictEqual(decCre.entries.sb2)  // ★ 未命中项值未动(create 不动 sb2)
+    // ★ ④ reorder 路径:submitFromBundle(reorder)— 更新 order + since;record entries 引用不变
+    h.seedChildren(['sb1', 'sb2', 'sb3'])  // 设 children for reorder
+    const bundleRe = h.snapshotBundle()
+    const decRe = h.extractBundle(bundleRe)!
+    const orderBefore = decRe.orderCv
+    const rRe = h.submitFromBundle(bundleRe, { kind: 'reorder', orderedIds: ['sb3', 'sb2', 'sb1'] })
+    expect(rRe.outcome.outcome).toBe('accepted')  // fresh order base + valid perm → 200
+    expect(h.extractBundle(rRe.newBundle)!.orderCv).toBe(orderBefore + 1)  // ★ order cv +1
+    expect(rRe.entries.sb2).toStrictEqual(decRe.entries.sb2)  // ★ 未命中项值未动(reorder 不动 record entries,只更 order)
+    // ★ ⑤ conflict 路径:delete stale base → 409 conflict,只更新该 record current base,未全量重建
+    h.create('sb4'); h.edit('sb4', { fieldPath: ['title'], value: 'X' }, h.snapshot('sb4')!, 'alice')  // sb4 rev2
+    const bundleC = h.snapshotBundle()  // sb4 base = rev2
+    const decC = h.extractBundle(bundleC)!
+    h.edit('sb4', { fieldPath: ['title'], value: 'Y' }, h.snapshot('sb4')!, 'bob')  // recs.sb4 rev2→3;bundleC 的 sb4 base stale
+    const rCon = h.submitFromBundle(bundleC, { kind: 'delete', nodeId: 'sb4' })
+    expect(rCon.outcome.outcome).toBe('conflict')  // ★ delete stale base(rev2≠current rev3)→ 409 conflict
+    expect(h.extractBundle(rCon.newBundle)!.records.sb4).toBeDefined()  // sb4 entry 仍在(conflict 不删;只更新 current base)
+    expect(rCon.entries.sb2).toStrictEqual(decC.entries.sb2)  // ★ conflict 未全量重建:未命中项值未动
+    expect(rCon.entries.sb4).not.toStrictEqual(decC.entries.sb4)  // ★ sb4 新值(conflict 更新 current base;rev3≠rev2)
     // 冻结矩阵(决策 §14.1 引用):edit 同-field stale 200+overwritten(永非 409);不同字段 stale 200 无 overwritten;delete/reorder fresh→200, stale→409;create dup→409;malformed/scope-mismatch→400
     type OpClass = 'edit-same-field-stale' | 'edit-diff-field-stale' | 'edit-fresh' | 'delete-fresh' | 'delete-stale' | 'reorder-fresh' | 'reorder-stale' | 'create-dup' | 'malformed' | 'scope-mismatch'
     const MATRIX: Record<OpClass, { status: number; outcome: 'accepted' | 'conflict' | 'rejected' }> = {
@@ -2338,7 +2432,7 @@ describe('N2-0 v8 cutover contract harness(Blocker 3 补全:LegacyReplaceRequest
     expect(h.patch('n1', newOp).status).toBe(200)
   })
 
-  it('C-2 FX-5 migration wire v8 补全(LegacyReplaceRequest 绑 canvasId+baseRevision;scope+authz+stale-base 409 dead-letter+v8 delete-race missing+baseRev>0→409 非盲 create 复活+v8 retirement fake-clock quiet-window;raw→400, envelope→200 replace 非直调)', () => {
+  it('C-2 FX-5 migration wire v9 补全(LegacyReplaceRequest 绑 canvasId+baseRevision;scope+authz+stale-base 409 dead-letter+v8 delete-race missing+baseRev>0→409 非盲 create 复活+v8 retirement fake-clock quiet-window+v9 pending>0 不 retire + drain 归零后须重等完整 quiet-window;raw→400, envelope→200 replace 非直调)', () => {
     const h = new CutoverHarness('c1')
     h.setFlag(true); h.setLegacyDrain(true); h.addMember('alice'); h.addMember('bob')  // authz:canvas-write seam
     expect(_noIdInPayload).toBe(false)
@@ -2450,6 +2544,20 @@ describe('N2-0 v8 cutover contract harness(Blocker 3 补全:LegacyReplaceRequest
     h.advanceClock(CutoverHarness.LEGACY_DRAIN_QUIET_WINDOW_MS)  // 再推过完整 quiet 窗口
     expect(h.tickObservationWindow()).toBe(true)  // 完整窗口 → 归零 delta
     expect(h.canRetire()).toBe(true)  // ★ 再等完整窗口后 → 可 retire(连续窗口 delta=0 + pending=0)
+    // ★ v9 pending gauge:enqueue pending>0 → canRetire()===false(即使 delta=0 + 完整窗口)— v8 :65 声称测了但实测没有,v9 补真断言
+    h.enqueueLegacy(1)  // pending=1(模拟队列有残留)
+    expect(h.pendingLegacyQueueGauge()).toBe(1)
+    expect(h.canRetire()).toBe(false)  // ★ pending>0 → 不 retire(双指标:delta=0 + pending=0 + 完整窗口,缺一不可)
+    // drain/dead-letter 归零后仍须重新满完整 quiet-window 才可 retire(patch envelope drain 触发 touchWindow 重置 window)
+    const mPd = migrateWriteOp({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n-pendrain', payload: nodePayload({ title: 'drain' }), baseRevision: 0 })
+    if (mPd.kind === 'legacy-envelope') {
+      expect(h.patch(mPd.envelope.nodeId, mPd.envelope, { actor: 'alice' }).status).toBe(200)  // fresh drain(envelope 到达 → touchWindow 重置 window;pending 1→0)
+    }
+    expect(h.pendingLegacyQueueGauge()).toBe(0)  // pending 归零
+    expect(h.canRetire()).toBe(false)  // ★ pending=0 但 window 被 touchWindow 重置(刚有 envelope 活动)→ 仍须重新满完整 quiet-window
+    h.advanceClock(CutoverHarness.LEGACY_DRAIN_QUIET_WINDOW_MS)
+    expect(h.tickObservationWindow()).toBe(true)  // 完整窗口 → 归零 delta
+    expect(h.canRetire()).toBe(true)  // ★ 重新满完整 quiet-window(delta=0 + pending=0 + 完整窗口)→ 可 retire
     // ★ ⑨ LEGACY_DRAIN gate 关(retirement 后)→ envelope→400(兼容通道关闭)
     h.setLegacyDrain(false)
     const mGate = migrateWriteOp({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n-gate', payload: nodePayload({ title: 'after-retire' }), baseRevision: 0 })
