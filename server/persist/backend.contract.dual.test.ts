@@ -9,7 +9,7 @@
 //
 // PG gate:`MIVO_PG_TEST=1`(本地 brew PG,见 docs/decisions/pg-backend-schema.md §7);CI 无 PG → 跳过 PG describe,内存套件仍必跑。
 
-import { describe, it, expect, beforeEach, beforeAll, afterAll } from 'vitest'
+import { describe, it, expect, beforeEach, beforeAll, afterAll, afterEach } from 'vitest'
 import { InMemoryPersistBackend, fingerprintOfBody, type PersistBackend, type PersistType } from './backend'
 import { PgPersistBackend } from './pgBackend'
 
@@ -432,31 +432,24 @@ const runPersistBackendContractSuite = (
       if (rOk.kind === 'ok') expect(rOk.contentVersion).toBe(2)
     })
 
-    it('R2-P1-2:listChatWithOrderRevision 原子:torn pair(旧 messages + 新 rev)不可能(双后端一致)', async () => {
+    it('R2-P1-2:listChatWithOrderRevision 返回自洽 (rev, messages) 对——reorder 前后各自自洽(双后端契约)', async () => {
       await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
       await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
       await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm1', { text: '1' }, { method: 'POST', resourceKind: 'chat-message' })
       await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm2', { text: '2' }, { method: 'POST', resourceKind: 'chat-message' })
-      // 初始:[m1,m2], rev=0(原子读自洽对)
+      // 初始:自洽对 (rev=0, [m1,m2])
       const before = await b.listChatWithOrderRevision('actorA', 'c1')
       expect(before.orderRevision).toBe(0)
       expect(before.records.map((r) => r.id)).toEqual(['m1', 'm2'])
       // reorder → rev=1, [m2,m1]
       const r1 = await b.reorderChildren('actorA', 'c1', 'chat-message', ['m2', 'm1'], { base: 0 })
       expect(r1.kind).toBe('ok')
-      // barrier 并发:reorder(base=1, [m1,m2]) 与 listChatWithOrderRevision 同时启动(Promise.all)。
-      // list 必自洽:要么 (rev=1, [m2,m1])(reorder 前) 要么 (rev=2, [m1,m2])(reorder 后)——
-      // 不出现 torn pair (rev=1,[m1,m2]) 或 (rev=2,[m2,m1])(旧 messages 配新 rev 会绕过乐观锁)。
-      // memory 同步临界区无 await 让出点;PG 单事务 REPEATABLE READ 冻结 snapshot,均保证自洽。
-      const [, list] = await Promise.all([
-        b.reorderChildren('actorA', 'c1', 'chat-message', ['m1', 'm2'], { base: 1 }),
-        b.listChatWithOrderRevision('actorA', 'c1'),
-      ])
-      const ids = list.records.map((r) => r.id).join(',')
-      const consistent =
-        (list.orderRevision === 1 && ids === 'm2,m1') ||
-        (list.orderRevision === 2 && ids === 'm1,m2')
-      expect(consistent).toBe(true)
+      // reorder 后:自洽对 (rev=1, [m2,m1])——不出现 torn(rev 配错序)。
+      // memory 同步临界区(两读间无 await 让出)与 PG 单事务 REPEATABLE READ 快照均保证自洽;
+      // 真并发 barrier(在两读之间确定性暂停并提交 reorder)见 PG 专有套件——不在此用普通 Promise.all 冒充。
+      const after = await b.listChatWithOrderRevision('actorA', 'c1')
+      expect(after.orderRevision).toBe(1)
+      expect(after.records.map((r) => r.id)).toEqual(['m2', 'm1'])
     })
 
     it('P1-2:node 写 bump 共享 cv 不使 chat reorder 误 409(解耦);chat reorder 不 bump 共享 cv', async () => {
@@ -545,4 +538,106 @@ let pgBackend: PgPersistBackend | undefined
     },
     (b) => b.__reset(),
   )
+
+  // R2-P1-2 真并发 barrier:torn pair 回归的确定性证据(PG 专有;memory 同步临界区无 await 让出点,barrier 无意义)。
+  // barrier 在 listChatWithOrderRevision 的 messages SELECT 完成、orderRevision SELECT 开始之间暂停,
+  // 期间提交 reorder,确定性命中 READ COMMITTED 的撕裂窗口;REPEATABLE READ snapshot 自洽不撕裂。
+  describe('R2-P1-2 真并发 barrier(torn pair 回归;PG 专有)', () => {
+    let b: PgPersistBackend
+    beforeEach(async () => {
+      b = pgBackend!
+      await b.__reset()
+      // 清空 barrier 旋钮防同实例其他用例泄漏(共享 pgBackend 单例)。
+      b.__listChatTornPairTestHooks.afterMessages = undefined
+      b.__listChatTornPairTestHooks.isolationLevel = undefined
+    })
+    afterEach(() => {
+      b.__listChatTornPairTestHooks.afterMessages = undefined
+      b.__listChatTornPairTestHooks.isolationLevel = undefined
+    })
+
+    /** 两读之间确定性暂停的 latch:afterMessages 信号 reached 后等 release;test 在窗口内提交 reorder。 */
+    const makeBarrier = () => {
+      let release = () => {}
+      let signalReached = () => {}
+      const reached = new Promise<void>((r) => {
+        signalReached = r
+      })
+      const releaseP = new Promise<void>((r) => {
+        release = r
+      })
+      return {
+        afterMessages: async () => {
+          signalReached() // messages SELECT 已完成,list 在 orderRevision SELECT 前暂停
+          await releaseP // 等 test 在窗口内提交 reorder 后释放
+        },
+        reached,
+        release: () => release(),
+      }
+    }
+
+    /** 公共 setup:[m1,m2] rev=0 → 首次 reorder → rev=1 [m2,m1](barrier 期间将提交第二次 reorder → rev=2, [m1,m2])。 */
+    const setupReordered = async () => {
+      await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+      await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm1', { text: '1' }, { method: 'POST', resourceKind: 'chat-message' })
+      await b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm2', { text: '2' }, { method: 'POST', resourceKind: 'chat-message' })
+      const r1 = await b.reorderChildren('actorA', 'c1', 'chat-message', ['m2', 'm1'], { base: 0 })
+      expect(r1.kind).toBe('ok')
+    }
+
+    it('green:REPEATABLE READ + barrier——list 自洽(snapshot 冻结于 messages SELECT,见 pre-reorder)', async () => {
+      await setupReordered()
+      const barrier = makeBarrier()
+      b.__listChatTornPairTestHooks.afterMessages = barrier.afterMessages
+      // 启动 list:messages SELECT 完成(=[m2,m1],snapshot 冻结)→ barrier 暂停于 orderRevision SELECT 前。
+      const listP = b.listChatWithOrderRevision('actorA', 'c1')
+      await barrier.reached
+      // 窗口内提交第二次 reorder(base=1 → rev=2, [m1,m2])——独立事务,不阻塞 list 的 ACCESS SHARE。
+      const r2 = await b.reorderChildren('actorA', 'c1', 'chat-message', ['m1', 'm2'], { base: 1 })
+      expect(r2.kind).toBe('ok')
+      if (r2.kind === 'ok') expect(r2.contentVersion).toBe(2)
+      // 释放 list → orderRevision SELECT 见 snapshot 冻结值 rev=1(pre-reorder)。
+      barrier.release()
+      const list = await listP
+      // 自洽 pre-state:(rev=1, [m2,m1])。不出现 torn (rev=2, [m2,m1])(旧 messages 配新 rev 会绕过乐观锁)。
+      expect(list.orderRevision).toBe(1)
+      expect(list.records.map((r) => r.id).join(',')).toBe('m2,m1')
+    })
+
+    it('red-detector:READ COMMITTED + barrier——list 出现 torn pair(旧 messages + 新 rev;barrier 非空转)', async () => {
+      await setupReordered()
+      const barrier = makeBarrier()
+      b.__listChatTornPairTestHooks.afterMessages = barrier.afterMessages
+      b.__listChatTornPairTestHooks.isolationLevel = 'read committed' // 强制回归态(production 永不设)
+      const listP = b.listChatWithOrderRevision('actorA', 'c1')
+      await barrier.reached
+      // 窗口内提交第二次 reorder → rev=2, [m1,m2]。
+      const r2 = await b.reorderChildren('actorA', 'c1', 'chat-message', ['m1', 'm2'], { base: 1 })
+      expect(r2.kind).toBe('ok')
+      barrier.release()
+      const list = await listP
+      const ids = list.records.map((r) => r.id).join(',')
+      // READ COMMITTED:messages SELECT 见 pre([m2,m1]),orderRevision SELECT 见 post(rev=2)→ torn pair。
+      // 此断言通过 = barrier 真在两读之间暂停并让 reorder 提交介入;若 barrier 空转则必得 (1,[m2,m1]) 或 (2,[m1,m2])。
+      expect(list.orderRevision).toBe(2)
+      expect(ids).toBe('m2,m1')
+    })
+
+    it('稳定性:REPEATABLE READ + barrier 连续 20 次零波动(自洽 pre-state)', async () => {
+      for (let i = 0; i < 20; i++) {
+        await b.__reset()
+        await setupReordered()
+        const barrier = makeBarrier()
+        b.__listChatTornPairTestHooks.afterMessages = barrier.afterMessages
+        const listP = b.listChatWithOrderRevision('actorA', 'c1')
+        await barrier.reached
+        await b.reorderChildren('actorA', 'c1', 'chat-message', ['m1', 'm2'], { base: 1 })
+        barrier.release()
+        const list = await listP
+        expect(list.orderRevision).toBe(1)
+        expect(list.records.map((r) => r.id).join(',')).toBe('m2,m1')
+      }
+    })
+  })
 })

@@ -326,9 +326,13 @@ export class PgPersistBackend implements PersistBackend {
   ): Promise<{ records: PersistRecord[]; orderRevision: Revision }> {
     await this.ready
     const include = opts.includeDeleted ?? false
+    // R2-P1-2:单事务 REPEATABLE READ 一致快照——production 默认;test 可经 __listChatTornPairTestHooks
+    // 强制 'read committed' 复现 torn pair 回归(barrier 旋钮详见属性注释)。
+    const isolation: 'repeatable read' | 'read committed' =
+      this.__listChatTornPairTestHooks.isolationLevel ?? 'repeatable read'
     return this.db
       .transaction()
-      .setIsolationLevel('repeatable read')
+      .setIsolationLevel(isolation)
       .execute(async (trx) => {
         let q = trx
           .selectFrom('persist_records')
@@ -338,6 +342,12 @@ export class PgPersistBackend implements PersistBackend {
           .where('type', '=', 'chat-message')
         if (!include) q = q.where('is_deleted', '=', false)
         const rows = await q.orderBy('order_key', 'asc').orderBy('created_at', 'asc').execute()
+        // R2-P1-2 barrier:torn pair 危险窗口正在此——messages SELECT 已完成、orderRevision SELECT 未开始。
+        // production 无 hook 直通(单事务 snapshot 自洽);test 注入 latch 在此暂停,期间提交 reorder,
+        // 确定性验证 REPEATABLE READ 自洽 / READ COMMITTED 撕裂。详见 backend.contract.dual.test.ts PG barrier 套件。
+        if (this.__listChatTornPairTestHooks.afterMessages) {
+          await this.__listChatTornPairTestHooks.afterMessages()
+        }
         const revRow = await trx
           .selectFrom('chat_order_revisions')
           .select('revision')
@@ -1333,6 +1343,19 @@ export class PgPersistBackend implements PersistBackend {
     for (const c of res.childIdxOwners) this.setIndexEntry('canvas', c.id, c.ownerId, false)
     return { count: res.count }
   }
+
+  /**
+   * R2-P1-2 回归 barrier 的 test-only 旋钮(production 永不设置;实例属性,随实例销毁)。
+   * - afterMessages:在 messages SELECT 完成、orderRevision SELECT 开始之间 await——测试在此窗口内提交
+   *   reorder,确定性复现 READ COMMITTED 下的 torn pair(旧 messages + 新 rev)。无 hook 时直通(production 自洽)。
+   * - isolationLevel:测试强制隔离级别(undefined → production 默认 'repeatable read')。red-detector 用
+   *   'read committed' 证明 barrier 非空转(READ COMMITTED 下必出 torn pair)。
+   * 测试务必在 afterEach 清空两字段,避免泄漏到同实例其他用例(共享 pgBackend 单例)。
+   */
+  __listChatTornPairTestHooks: {
+    afterMessages?: () => Promise<void>
+    isolationLevel?: 'repeatable read' | 'read committed'
+  } = {}
 
   /** Test-only:清空全部 records + idempotency index + 全局索引缓存。PG:TRUNCATE(异步)。 */
   __reset(): Promise<void> {
