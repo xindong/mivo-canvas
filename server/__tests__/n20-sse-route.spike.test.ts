@@ -326,23 +326,48 @@ describe('N2-0 返修 Gate5(R3 F3): 真实 Hono SSE route + resolveActor/canAcce
     expect(pulledSeqs.length).toBe(51) // ★ 全 51 个事件补拉无缺口(response body + 补拉得无缺口终态)
   })
 
-  it('5-9 post-revoke write 拒绝(R5 F3:真实 authz seam write route):bob 建流→撤权→SSE revoke/close + bob write 404 no-leak + owner write 200', async () => {
-    // R5 F3 红证:原 SSE harness 只 GET events(5-4 仅断流),无 write route;G7-hard-3 是另一套自建
-    //   FieldLevelServer.applyOpAuthz,不复用真实 owner.ts/authz.ts seam → post-revoke write 拒绝未由真实 seam 验。
-    // 绿证(补探针把声称测实):同 Hono harness 加 PATCH write route(真实 resolveActor + canAccessCanvas('write')
-    //   + denyStatus);bob 建流→撤权→断言 SSE revoke + bob write 返真实 404 no-leak + owner alice write 200。
+  it('5-9 post-revoke write 拒绝 + 服务端 stream 关闭(R6 F3:reader done + conn.closed + conns 移除 断言,非只验 revoke 帧):bob 建流→撤权→SSE revoke + reader done + conn closed + conns 移除 + bob write 404 + owner 200', async () => {
+    // R6 F3 红证(判决 V5):原 5-9 只断言收到 event: revoke 帧,之后还由测试主动 bobRes.body?.cancel();
+    //   未断言 reader 得到 done:true / conn.closed / state.conns 已移除。删除 conn.close() 与
+    //   state.conns.delete(conn)、只保留 revoke enqueue,5-9 仍会绿 → "撤权后断流"仍是未锁定声称。
+    // 绿证(补探针把声称测实):撤权后读 reader 到 done:true(服务端 controller.close 驱动,非测试主动 cancel;
+    //   cancel 仅作 800ms timeout 兜底,且 sawDone = !cancelled 区分"服务端 close done"(true)与"cancel done"(false))+
+    //   断言 conn.closed===true + state.conns 已移除 + bob write 404 no-leak + owner 200。取消主动 cancel() 作关闭替代。
     // bob 建流(editor,200)
     const bobRes = await harness.app.request('/api/canvas/c1/events', { headers: { 'x-mivo-auth-user': 'bob', 'x-mivo-gateway-secret': harness.GATEWAY_SECRET } })
     expect(bobRes.status).toBe(200)
-    await new Promise((r) => setTimeout(r, 30)) // 等 stream 建立
+    await new Promise((r) => setTimeout(r, 30)) // 等 conn 注册到 state.conns
+    // ★ 持有 bob 的 conn 引用(撤权前从 state.conns 取)— 用于撤权后断言服务端 close 状态(非测试主动 cancel 代替)
+    const bobConn = [...harness.state.conns].find((c) => c.actor === 'bob')
+    expect(bobConn).toBeDefined()
     // bob 撤权前 write 仍 200(editor:roleCan('editor','write')=allow)
     const bobWriteOk = await harness.app.request('/api/canvas/c1/nodes/n1', { method: 'PATCH', headers: { 'x-mivo-auth-user': 'bob', 'x-mivo-gateway-secret': harness.GATEWAY_SECRET, 'content-type': 'application/json' }, body: JSON.stringify({ fieldPath: ['title'], value: 'bob-write' }) })
     expect(bobWriteOk.status).toBe(200)
-    // 撤权 bob(members.delete → resolveMemberRole(bob)=undefined → revoke-poll 断流 + write deny)
+    // 撤权 bob(members.delete → resolveMemberRole(bob)=undefined → revoke-poll 发 event:revoke + conn.close + state.conns.delete)
     harness.state.members.delete('bob')
-    // ★ SSE revoke + 流关闭(真实 seam:resolveMemberRole(bob)=undefined → revoke-poll 发 event:revoke + close)
-    const chunks = await readUntil(bobRes, (cs) => cs.some((c) => c.includes('event: revoke')), 400)
-    expect(chunks.some((c) => c.includes('event: revoke\n'))).toBe(true)
+    // ★ 读 reader 到 done:true(服务端 controller.close 驱动,非测试主动 cancel)
+    //   cancel 仅作 800ms timeout 兜底;sawDone = !cancelled 区分"服务端 close done"(true)与"cancel timeout done"(false)
+    const reader = bobRes.body!.getReader()
+    const decoder = new TextDecoder()
+    let buf = ''
+    let sawRevoke = false
+    let sawDone = false
+    let cancelled = false
+    const start = Date.now()
+    const timer = setTimeout(() => { cancelled = true; reader.cancel().catch(() => {}) }, 800)
+    try {
+      while (Date.now() - start < 1000 && !sawDone) {
+        const { value, done } = await reader.read()
+        if (done) { sawDone = !cancelled; break }
+        buf += decoder.decode(value, { stream: true })
+        if (buf.includes('event: revoke')) sawRevoke = true
+      }
+    } finally { clearTimeout(timer); reader.cancel().catch(() => {}) }
+    expect(sawRevoke).toBe(true)      // ★ 收到 revoke 帧
+    expect(sawDone).toBe(true)        // ★ reader 得到 done:true(服务端 controller.close 驱动;若删 conn.close 则 sawDone=false → 红)
+    // ★ 服务端 close 的直接状态证据(非测试主动 cancel 代替)
+    expect(bobConn!.closed).toBe(true)                      // ★ conn.close() 设 closed=true
+    expect(harness.state.conns.has(bobConn!)).toBe(false)   // ★ state.conns.delete(conn) 已移除
     // ★ bob write 撤权后 → 真实 canAccessCanvas(info,'write')=deny(memberRole undefined → decideAccess deny)
     //   → denyStatus=404(non-member 无泄漏,非 401/403)
     const bobWriteDeny = await harness.app.request('/api/canvas/c1/nodes/n1', { method: 'PATCH', headers: { 'x-mivo-auth-user': 'bob', 'x-mivo-gateway-secret': harness.GATEWAY_SECRET, 'content-type': 'application/json' }, body: JSON.stringify({ fieldPath: ['title'], value: 'bob-write-2' }) })
@@ -351,6 +376,7 @@ describe('N2-0 返修 Gate5(R3 F3): 真实 Hono SSE route + resolveActor/canAcce
     // ★ owner alice write 仍 200(owner 不可撤:actor===ownerId → roleCan('owner','write')=allow)
     const aliceWrite = await harness.app.request('/api/canvas/c1/nodes/n1', { method: 'PATCH', headers: { 'x-mivo-auth-user': 'alice', 'x-mivo-gateway-secret': harness.GATEWAY_SECRET, 'content-type': 'application/json' }, body: JSON.stringify({ fieldPath: ['title'], value: 'alice-write' }) })
     expect(aliceWrite.status).toBe(200)
-    bobRes.body?.cancel().catch(() => {})
+    // ★ R6 F3:不再用 bobRes.body?.cancel()(原 354 行删)— 关闭由服务端 conn.close() 驱动,reader 已 done,
+    //   证据是 sawDone + bobConn.closed + conns 移除(非测试主动 cancel 代替服务端关闭)。
   })
 })
