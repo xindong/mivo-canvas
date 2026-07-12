@@ -1,7 +1,7 @@
 # 画布 transport-neutral port + 两案契约 inventory(G1-b)
 
 > 状态:**契约冻结 + inventory,不实现 transport**(G1-b,N2-0 决议前)。
-> 日期:2026-07-12(R1 返修:纠 Yjs 五维事实 + F1 字段级意图 + F3 终态拒绝;R2 返修:封死 clobber + create→edit 因果 + 404-delete authoritative-load cursor,见 §8)。
+> 日期:2026-07-12(R1 返修:纠 Yjs 五维事实 + F1 字段级意图 + F3 终态拒绝;R2 返修:封死 clobber + create→edit 因果 + 404-delete authoritative-load cursor,见 §8;R3 返修:schema-aware 容器/数组封死 + retryable/conflict 所有权 + per-key 状态机 + delete race 全封,见 §9)。
 > 范围:计划 `docs/plan/remaining-tasks-cutover-plan.md` §4 Gate1 G1-b + §10 风险表「画布 port 泄漏候选协议细节」。
 > 上游真相源:`docs/plan/remaining-tasks-cutover-plan.md` §4/§8(N2-0 决策龙头)、`docs/decisions/platform-architecture-2026-07-07.md`(§6 CRDT-ready、§13.5 per-record revision)、`docs/decisions/record-schema.md`(K40 canonical)、`shared/persist-contract.ts`(现有 Figma-case wire 契约)、`src/lib/serverPersistAdapter.ts`(现有 Figma-case adapter 占位)、`node_modules/yjs/dist/src/utils/encoding.d.ts`(Yjs state-vector 真实签名)、`src/kernel/__spike__/yjs-mapping.spike.test.ts`(Yjs 映射 spike 实证)、`src/lib/writeRetryQueue.ts`(WriteOutcome 8 态先例)。
 > 源码产物(本批):`src/lib/canvasSyncPort.ts`(port 接口 + 中性游标 + 字段级意图)、`src/lib/canvasSyncPort.contract.test.ts`(红线自证 + F1/F3 契约)。
@@ -33,12 +33,19 @@ type SnapshotCursor = unknown & { readonly __brand: 'SnapshotCursor' } // brande
 
 // 返修 F1:全量 upsert → create(全量)+ edit(字段级意图)
 // 返修 R2-P1-1:FieldPath 改非空 tuple(封死空路径 clobber)+ validateFieldIntent 拒非原子 set(封死整子树 clobber)
+// 返修 R3-P1-1:加 schema-aware 分类(可选 FieldSchemaClassifier),拒 delete-field 到 container / set 原子值到容器路径
 type FieldPath = readonly [string | number, ...(string | number)[]]   // 非空 tuple,域语义路径,非 RFC6902 JSON-Pointer
+type FieldPathTarget = 'leaf' | 'container' | 'array-element'           // R3-P1-1:路径终点类别(标量/对象容器/数组元素)
+type FieldSchemaClassifier = (fieldPath: FieldPath) => FieldPathTarget   // R3-P1-1:可选,调用方/adapter 提供(port 对 schema 不透明)
 type FieldIntent =
   | { op: 'set'; fieldPath: FieldPath; value: unknown }
   | { op: 'delete-field'; fieldPath: FieldPath }
-// validateFieldIntent(intent):域级 validator(port 冻结,非 transport impl)——拒空路径 / 拒非原子 set(整对象·整数组 clobber 封死)。
-//   数组结构编辑(增/删元素)不在 FieldIntent,deferred to N2-0 §10.1;数组叶子编辑(['fills',0,'color'])仍支持。
+// validateFieldIntent(intent, classify?):域级 validator(port 冻结,非 transport impl)——
+//   拒空路径 / 拒非原子 set(整对象·整数组 clobber 封死)/ 拒数组元素 delete-field(last segment number,by-stable-id deferred)。
+//   有 classifier 时再拒:delete-field 到 container(整子树删)、set 原子值到 container/array-element 路径(整子树替换)。
+//   FieldIntentViolation 枚举:empty-field-path / non-atomic-parent-set / array-element-structure-delete /
+//   container-delete-field / atomic-value-to-container-path(R3-P1-1 扩 2→5 key)。
+//   数组结构编辑(增/删元素)不在 FieldIntent,deferred to N2-0 §10.1(与 n20 R2-4 三类数组方向对齐);数组叶子编辑(['fills',0,'color'])仍支持。
 
 type CanvasChange =
   | { kind: 'create-node'; node: NodeRecord }      // 全量新 record(新 record 无并发覆盖隐患)
@@ -365,3 +372,74 @@ port 的中性设计保证 N2-0 任一决议后,G1-c 只需落一个 adapter,另
 - `npx vitest run src/lib/canvasSyncPort.contract.test.ts src/kernel/__spike__/yjs-mapping.spike.test.ts` → PASS (73) FAIL (0)(50 contract + 23 spike,含 R2 新增 5 例真 Y.Doc + 负例/对称/因果/delete-load)。
 - 红线 grep §4.1-§4.4:非注释代码行零命中候选独占 DTO(§4.1/§4.2 全命中均在 `//`/`*` 注释行);`@ts-expect-error` directive 计数 = **7**(6 红线候选独占形状互锁不变 + 1 R2-P1-1 空路径 tuple 互锁)。
 - transport-neutral 自证:port 文件不含 If-Match/ConflictBody/metaRevision/contentVersion/JSON-Patch/Y.Update/Y.Doc/state-vector/Uint8Array 的非注释代码行(全在注释解释红线)。
+
+---
+
+## 9. 第三轮返修回报(G1-b R3 REQUIRES_CHANGES,2026-07-12,见 REVIEW-FINDINGS-G1B-R3.md)
+
+> 三条 P1(lead+sol7 共识)。R1/R2 闭合项不动:FieldPath 非空 tuple / 整对象·整数组 set 负例 / A↔B 真 Y.Doc 收敛 / 红线 0 候选独占 DTO / `@ts-expect-error`=7(6 红线 + 1 R2 空路径 tuple)——一字不回退。
+
+### 9.1 R3-P1-1 schema-aware 容器/数组元素封死(delete-field + 原子值-to-容器)
+
+**问题核证**:R2 validator 只拦 `set` 非原子 value;delete-field 全放行——`delete ['transform']`(删整个 transform Y.Map = 吞并发 transform.y,clobber 换名重表达)、`delete ['fills']`(删整个 Y.Array)、`delete ['fills',0]`(用不稳定 index 表达声称 deferred 的数组 remove,与 n20 §10.1 by-stable-id 方向岔开)均放行;`set ['transform']=7`(原子值覆盖整个容器路径 = 整子树替换,坑7 的另一换名面)也放行。spike helper 数值末段直 `Y.Array.delete(index)`。
+
+**修法选择**:**schema-aware leaf/container/array-element 分类**(可选 `FieldSchemaClassifier`,port 对 schema 不透明故 classifier 由调用方/adapter 提供;不传时只结构性拒)。理由:
+1. 结构性拒(无需 schema):数组元素 delete-field(last segment 是 number)→ 拒 `array-element-structure-delete`(by-stable-id deferred to N2-0 §10.1,无需 schema 判)。
+2. schema-aware 拒(有 classifier):container 路径上的 `delete-field` → 拒 `container-delete-field`(整子树删 = clobber 重表达);container/array-element 路径上的 `set`(原子值)→ 拒 `atomic-value-to-container-path`(整子树替换)。
+3. 合法 optional leaf delete 放行(`delete ['title']`/`['locked']`——删叶子不吞兄弟字段);原子叶子 set 在 leaf 路径放行(`['transform','x']`/`['fills',0,'color']`)。
+4. 不扩 op 面、不违红线:`FieldPathTarget`/`FieldSchemaClassifier` 是域类型(非候选独占 DTO);`FieldIntentViolation` 枚举 2→5 key;`@ts-expect-error`=7 不变。
+
+**与 n20 §10.1 对齐点**(inventory §2.1 已注明 + 本 §9.1 再钉):数组结构编辑(增/删元素)非 FieldIntent 表达,deferred to N2-0 §10.1 by-stable-id(与 n20 R2-4「数组按 有 stable-id / 无 stable-id / primitive 三类冻结意图」方向对齐);G1-b 只拒(封死 clobber 换名面),不扩 op 面,N2-0 决议后由真 schema 驱动 classifier。
+
+**落地**:`validateFieldIntent` 加可选 `classify` 参数;新增 `FieldPathTarget`/`FieldSchemaClassifier` 类型;`FieldIntentViolation` 枚举扩 5 key;contract test +7 负例/正例(无 classifier 结构性拒 + 有 classifier schema-aware 拒 + 合法 leaf 放行);spike +3 真 Y.Doc 并发危害证(delete 整 transform 吞 transform.y=999 / delete fills[0] 按 index 删错元素 / validator 拒之有据)。
+
+**验收**(contract + spike):
+- NEGATIVE:`delete ['transform']`/`['fills']`(container)被拒 `container-delete-field`;`delete ['fills',0]`(array-element)被拒 `array-element-structure-delete`;`set ['transform']=7`/`['fills',0]=7`(原子值-to-容器)被拒 `atomic-value-to-container-path`。
+- POSITIVE:`delete ['title']`/`['locked']`(optional leaf)放行;`set ['transform','x']`/`['fills',0,'color']`(leaf)放行。
+- 无 classifier:结构性拒数组元素 delete-field + 非原子 set;container delete 不拒(契约:调用方传 classifier 才做 schema-aware 拒)。
+- 真 Y.Doc(spike):delete 整 transform Y.Map 吞并发 transform.y=999(危害证,validator 拒之有据);delete fills[0] 按 index 删在并发 insert 下删错元素(by-index 漂移,by-stable-id deferred 之据)。
+
+### 9.2 R3-P1-2 retryable/conflict 所有权 + per-key 状态机(FifoRecordPort 参考 impl)
+
+**问题核证**:doc(canvasSyncPort.ts submitChange doc)说 create conflict/retryable 时 held edits 继续等收敛;参考 impl `FifoRecordPort.ackCreate` 把所有 non-accepted(含 conflict/retryable)统一 dependency-failed + 清队列——与 doc 矛盾(conflict/retryable 时 held 被错误清空,edit 丢)。单槽 `pendingCreate`/`pendingRid`(非 per-(canvasId,recordId) Map),并发第二 create 覆盖第一(第一的 held 丢或被直送 404)。`submit(c)` 无 canvasId,异 canvas 同 recordId 碰撞。缺测试:retryable/conflict、同 ID 双 create、异 canvas 同 recordId、多 pending、最终 record state 断言。
+
+**修法选择**:**per-(canvasId,recordId) Map 状态机 + 仅终态 rejected 才 dependency-failed**(conflict/retryable 非终态 → held 继续等,不清队列)。理由:
+1. 所有权冻结:caller 拿到 create 的 conflict/retryable outcome 后 **owns** retry/rebase——adapter **不**自动重试 create(自动重试会与 caller rebase 意图冲突);held edits 的 outcome 在 create 终态收敛后才 settle(accepted→flush / rejected→dependency-failed)。这是 doc 已有语义("create conflict/retryable 时 held edits 继续等 create 收敛")的 impl 补齐。
+2. per-key Map:`pending = Map<key, {create, held[]}>`,`key = ${canvasId}::${rid}`——并发第二 create(不同 rid)各自 pending 不 clobber;异 canvas 同 recordId 不碰撞。`submit(canvasId, c)`/`ackCreate(canvasId, rid)` 带 canvasId。
+3. 同 (canvas,rid) 待定 create 期间再来 create = create race:port 直送 transport(likely reuse-conflict 422),**不** clobber 第一个 pending 的 held。
+4. 仅终态 rejected → dependency-failed + 清 key(非 not-found);conflict/retryable → `held: []`(尚未 settle),key 保留,caller 可再次 ackCreate(create 经重试终态收敛后 held 才 settle)。
+
+**落地**:`FifoRecordPort` 改 per-key Map;`makeTransport` 加 `createOutcomes` 序列(建模 conflict→accept / retryable→accept 收敛);`submit`/`ackCreate` 带 canvasId;contract test 5 原 R2 测试签名更新 + 8 新矩阵测试。submitChange doc 加 R3-P1-2 所有权冻结段。
+
+**验收**(contract 矩阵):
+- NEGATIVE:create conflict → held **不**清(`held: []`,非 dependency-failed);caller rebase 后再次 ackCreate → accepted → held flush(非丢)。
+- NEGATIVE:create retryable 跨多次重试 held 持续等(不清队列、不 dependency-fail);收敛 accepted 后 held flush;retryable→终态 rejected 时 held 才 dependency-failed(所有权:caller 放弃重试)。
+- NEGATIVE:并发第二 create(不同 rid)不 clobber 第一 pending 的 held(edit-n20 在 n21 create 后仍 held,n20 ack 后 flush accepted)。
+- NEGATIVE:异 canvas 同 recordId 不碰撞(CV/nX 与 CV2/nX 各自 pending,各自 ack 后 edit flush)。
+- POSITIVE:多 pending(不同 rid)独立 FIFO flush;duplicate create(同 key)直送 transport reuse-conflict 不 clobber 第一 pending;终态 record state 断言(create + edit 叠加,非仅 transport log)。
+
+### 9.3 R3-P1-3 delete race 全封 + 旧 shortcut 删除
+
+**问题核证**:R2 `mapDeleteOutcome` 只挡 `404 + recordPresent`→conflict;`204 + recordPresent`(204 后 load 又见 record = 并发重建 race)落最后 `return accepted` → 假成功。旧 `mapHttpStatusToOutcome` 的 `isDelete+404→accepted(常量 CURSOR)` shortcut 分支仍在(与 R2 authoritative-load 方案矛盾)。conflict 的 `diverging:[]` 恢复责任未冻结。
+
+**修法选择**:**204/404 + recordPresent 一律 conflict + 删旧 shortcut + 冲突恢复责任在 caller**。理由:
+1. 一律 `recordPresent→conflict`(无论 204 还是 404):delete 目标态未达成(record 被并发重建)→ conflict,不假 accepted(防 204 race 假成功,与 404 race 同处理)。
+2. 删 `mapHttpStatusToOutcome` 的 `isDelete` 参数 + `isDelete+404→accepted` 分支(delete 路径走 `mapDeleteOutcome`,authoritative load 取真实 cursor;此 helper 只表非 delete 的 HTTP→outcome 映射)。
+3. 冲突恢复责任在 **caller**(据 conflict 重删 or load/rebase 后再决策)——adapter **不**自动重删(自动重删会与 caller rebase 意图冲突);"重建后重删收敛"路径(delete race conflict → caller 重删 → load 确认 record 不在 → accepted)由 caller 驱动。
+
+**落地**:`mapDeleteOutcome` 改 `if (load.recordPresent) → conflict`(不限 404);`mapHttpStatusToOutcome` 删 `isDelete` 参数 + 404→rejected(not-found);contract test +2(204+present→conflict 防旧 bug、重建后重删收敛)。submitChange doc 加 R3-P1-3 段。
+
+**验收**(contract):
+- NEGATIVE:204 + load recordPresent → conflict(非 accepted,防旧 bug:旧 204+present 落 accepted 假成功)。
+- POSITIVE:重建后重删收敛——race conflict → caller 重删 → 204 + load 确认不在 → accepted(真实 load cursor)。
+- 旧 shortcut(`isDelete+404→accepted`)已删(`mapHttpStatusToOutcome` 无 isDelete 参数,404→rejected)。
+
+### 9.4 实跑结果(R3)
+
+(lead 复审可在此 worktree 复跑:`cd _tmp/worktrees/g1b-port && <cmd>`)
+
+- `npx tsc -b` → No errors found(exit 0)。
+- `npx eslint src/lib/canvasSyncPort.ts src/lib/canvasSyncPort.contract.test.ts src/kernel/__spike__/yjs-mapping.spike.test.ts` → No issues found(exit 0)。
+- `npx vitest run src/lib/canvasSyncPort.contract.test.ts src/kernel/__spike__/yjs-mapping.spike.test.ts` → PASS (95) FAIL (0)(含 R3 新增:R3-P1-1 +7 contract + 3 spike / R3-P1-2 +8 矩阵 / R3-P1-3 +2)。
+- 红线 grep §4.1-§4.4:非注释代码行零命中候选独占 DTO;`@ts-expect-error` directive 计数 = **7**(6 红线候选独占形状互锁不变 + 1 R2-P1-1 空路径 tuple 互锁,R3 不新增互锁)。
+- 通过项不回退:FieldPath 非空 tuple / 整对象·整数组 set 负例 / A↔B 真 Y.Doc 收敛 / 红线 0 候选独占 DTO / directive=7——R3 一字未动。

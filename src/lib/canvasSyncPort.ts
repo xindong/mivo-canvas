@@ -29,6 +29,20 @@
 //     deleteChild lead 核证);delete-* accepted 必经 loadSnapshot authoritative load 取真实 cursor,缺 cursor
 //     的 204/404 不构造 accepted(防常量 cursor 冒充权威)。不碰 route/N2-0 §10(n20-fix worker 管)。
 //
+// 返修 R3(G1-b 第三轮 REQUIRES_CHANGES,2026-07-12,3 条 P1 见 REVIEW-FINDINGS-G1B-R3.md,lead+sol7 共识):
+//   - R3-P1-1 schema-aware 容器/数组封死:validateFieldIntent 扩可选 FieldSchemaClassifier,拒 delete-field 到
+//     container(整子树删=clobber 重表达)、set 原子值到 container/array-element 路径(整子树替换);结构性拒
+//     数组元素 delete-field(last segment number,无需 schema,by-stable-id deferred to N2-0 §10.1)。新增
+//     FieldPathTarget/FieldSchemaClassifier 类型;FieldIntentViolation 枚举 2→5 key。与 n20 §10.1 + R2-4
+//     三类数组方向对齐(G1-b 只拒不扩 op 面)。
+//   - R3-P1-2 retryable/conflict 所有权 + per-key 状态机:仅 create 终态 rejected → 依赖 edit/delete
+//     dependency-failed + 清队列;conflict/retryable(非终态)→ held 继续等不清队列(caller owns retry/rebase,
+//     adapter 不自动重试);FifoRecordPort 参考 impl 改 per-(canvasId,recordId) Map(旧单槽并发第二 create 覆盖
+//     第一)+ submit/ackCreate 带 canvasId(异 canvas 同 recordId 不碰撞)。见 contract test 矩阵测试。
+//   - R3-P1-3 delete race 全封 + 旧 shortcut 删除:204/404 + load recordPresent 一律 conflict(旧只挡 404+present,
+//     204+present 落 accepted 假成功);删 mapHttpStatusToOutcome 的 isDelete+404→accepted 旧 shortcut;冻结冲突
+//     恢复责任在 caller(adapter 不自动重删)。
+//
 // 不接线(N2-0 决议前 G1-c 不落地实现):本文件只冻结接口 + 类型 + 域级 validator(非 transport impl),无 runtime transport。
 // unwiredCanvasSyncPort 占位即失败(Karpathy 规则 12:fail visibly, not silently)——防误以为已同步。
 //
@@ -320,6 +334,13 @@ export interface CanvasSyncPort {
    *   选 per-record FIFO hold 而非 batch/dependency-id:前者不扩 API 面(无新参数/无 batch id 暴露给调用方),
    *   匹配"中性"——两案 adapter 都可实现(Figma 案同 record 串行 PATCH + hold;Yjs 案 Y.Doc 本地因果序天然保,
    *   create 的 Y.Map.set 与后续叶子 set 同事务/同因果链,无 404 概念)。此为 port 契约,adapter 须守。
+   *
+   * 返修 R3-P1-2(retryable/conflict 所有权冻结 + per-key 状态机):仅 create **终态** rejected → 依赖 edit/delete
+   *   surface dependency-failed + 清队列;create conflict/retryable(非终态)时 held edits **不清队列**——caller
+   *   拿到 create 的 conflict/retryable outcome 后 owns retry/rebase(create 经重试终态收敛后 held 才 settle:
+   *   accepted→flush / rejected→dependency-failed),adapter **不**自动重试 create(自动重试会与 caller rebase
+   *   意图冲突)。key = per-(canvasId, recordId),异 canvas 同 recordId 不碰撞。见 contract test FifoRecordPort
+   *   per-key 状态机参考 impl(createOutcomes 序列建模 conflict→accept / retryable→accept 收敛)。
    *
    * 返修 R2-P1-3(accepted cursor 不冒充):真实 DELETE 成功 204(null body)/已删 404 均不携带 cursor/seq
    *   (server/routes/canvas.ts deleteChild lead 核证);404 还可能是 canvas 不存在/无权(authz.denyStatus 404

@@ -1,5 +1,5 @@
 // src/lib/canvasSyncPort.contract.test.ts
-// G1-b port 形状编译期 + 运行期约束(transport-neutral 自证 + 返修 F1/F3 契约测试 + R2-P1-1/2/3)。
+// G1-b port 形状编译期 + 运行期约束(transport-neutral 自证 + 返修 F1/F3 契约测试 + R2-P1-1/2/3 + R3-P1-1/2/3)。
 //
 // 自证逻辑(对应计划 §4 G1-b 验收"N2-0 前生产代码无某候选独占的画布 transport DTO"):
 // 用 @ts-expect-error 证明 CanvasChange/FieldIntent/SnapshotCursor/RejectionReason 不收候选独占形状
@@ -19,6 +19,18 @@
 //    edit 不独立 404;create 终态失败→依赖 edit rejected(dependency-failed,非 not-found);真·不存在 record edit→not-found(边界分开)。
 //  - R2-P1-3 404-delete cursor:204/404 缺 cursor 不构造 accepted(防常量冒充);经 loadSnapshot authoritative load 取真实 cursor 后才 accepted;
 //    load 返 null(canvas 不存在/无权)→ rejected(forbidden),不误报成功。
+//
+// 返修 R3(G1-b 第三轮 REQUIRES_CHANGES,2026-07-12,见 REVIEW-FINDINGS-G1B-R3.md,lead+sol7 共识):
+//  - R3-P1-1 schema-aware 容器/数组封死:validateFieldIntent 加可选 FieldSchemaClassifier,拒 delete-field 到
+//    container、set 原子值到 container/array-element 路径;结构性拒数组元素 delete-field(last number,无需 schema)。
+//    新增 FieldPathTarget/FieldSchemaClassifier 类型;FieldIntentViolation 枚举 2→5 key;+7 负例/正例 + spike 真 Y.Doc 并发危害证。
+//  - R3-P1-2 retryable/conflict 所有权 + per-key 状态机:FifoRecordPort 参考 impl 改 per-(canvasId,recordId) Map
+//    (旧单槽并发第二 create 覆盖第一)+ submit/ackCreate 带 canvasId(异 canvas 同 recordId 不碰撞)+ 仅终态 rejected
+//    → dependency-failed 清队列(conflict/retryable 非终态 → held 继续等,caller owns retry/rebase)。+8 矩阵测试
+//    (conflict/retryable 保持、retryable→rejected 放弃、并发第二 create 不 clobber、异 canvas 不碰撞、多 pending、
+//    duplicate create 直送、终态 record state 断言非仅 transport log)。
+//  - R3-P1-3 delete race 全封:mapDeleteOutcome 一律 recordPresent→conflict(旧只挡 404+present,204+present 落 accepted
+//    假成功);删 mapHttpStatusToOutcome 的 isDelete+404→accepted 旧 shortcut;冻结冲突恢复责任在 caller。+2 测试。
 
 import { describe, it, expect, expectTypeOf } from 'vitest'
 import type {
@@ -565,12 +577,21 @@ describe('F3: terminal rejections + authoritative accepted (no mis-retry, no fal
   })
 })
 
-// ── 返修 R2-P1-2:create→edit 同 record 因果(per-record FIFO hold 契约)──────────
-describe('R2-P1-2: per-record FIFO causality (pending create holds same-record edit/delete)', () => {
+// ── 返修 R2-P1-2 / R3-P1-2:create→edit 同 record 因果(per-key FIFO hold + retryable/conflict 所有权)──
+describe('R2-P1-2 / R3-P1-2: per-key FIFO causality (per-(canvasId,recordId) + conflict/retryable ownership)', () => {
   // 参考 impl(port 冻结的因果契约的可实现性证明,同 applyFieldIntents 的参考性质):
-  // submitChange(create-*) pending 期间,同 recordId 的 edit-*/delete-* 被 hold(不独立提交 → 不独立 404)。
-  // create ack 后按序 flush;create 终态失败 → 依赖 edit/delete surface rejected(dependency-failed,非 not-found)。
+  // submitChange(create-*) pending 期间,同 (canvasId,recordId) 的 edit-*/delete-* 被 hold(不独立提交 → 不独立 404)。
+  // create ack 后按序 flush;create 终态 rejected → 依赖 edit/delete surface rejected(dependency-failed,非 not-found)。
   // 真·不存在 record(无 pending create)的 edit → 直接提交 → rejected(not-found)(与 pending-create 边界分开)。
+  //
+  // 返修 R3-P1-2(冻结 retryable/conflict 所有权 + per-key 状态机;3 bug 闭合):
+  //   bug1 旧 ackCreate 把所有 non-accepted(含 conflict/retryable)统一 dependency-failed + 清队列,与 doc 矛盾
+  //       (doc:conflict/retryable 时 held edits 继续等 create 收敛)→ 改:仅终态 rejected → dependency-failed + 清 key;
+  //       conflict/retryable → held 继续等(不清 key,caller 据 create outcome retry/rebase 后再次 ackCreate)。
+  //   bug2 旧单槽 pendingCreate/pendingRid:并发第二 create 覆盖第一(丢 held)→ 改 per-(canvasId,recordId) Map。
+  //   bug3 旧 submit 无 canvasId:异 canvas 同 recordId 碰撞 → 改 submit(canvasId, change)+ ackCreate(canvasId, rid)。
+  //   所有权冻结:caller 拿到 create 的 conflict/retryable outcome 后 owns retry/rebase(caller 决定,非 adapter 自动);
+  //   held edits 的 outcome 在 create 终态收敛后才 settle(accepted→flush / rejected→dependency-failed)。
 
   const recordIdOf = (c: CanvasChange): string | null => {
     if ('nodeId' in c) return c.nodeId
@@ -583,15 +604,25 @@ describe('R2-P1-2: per-record FIFO causality (pending create holds same-record e
   }
   const isCreateKind = (c: CanvasChange): boolean => c.kind.startsWith('create-')
 
-  // transport: 记录提交序;create(默认)把 rid 加入 known 并 accepted;rejectCreates 时 create→rejected(bad-request)且 rid 不入 known;
+  // transport: 记录提交序;create 默认 accepted + rid 入 known;rejectCreates 时 create→rejected(bad-request)且 rid 不入 known;
+  // createOutcomes[rid] = 该 rid 的 create outcome 序列(每次 transport(create for rid) pop 一个)——建模 conflict→accept / retryable→accept 收敛序列。
   // edit/delete 命中 known→accepted,未知→404 not-found。
-  const makeTransport = (opts: { rejectCreates?: boolean } = {}) => {
+  const makeTransport = (opts: { rejectCreates?: boolean; createOutcomes?: Record<string, ChangeOutcome[]> } = {}) => {
     const known = new Set<string>()
     const log: CanvasChange[] = []
+    const queues: Record<string, ChangeOutcome[]> = Object.fromEntries(
+      Object.entries(opts.createOutcomes ?? {}).map(([k, v]) => [k, [...v]]),
+    )
     const transport = (c: CanvasChange): ChangeOutcome => {
       log.push(c)
       const rid = recordIdOf(c)
       if (rid && isCreateKind(c)) {
+        const q = queues[rid]
+        if (q && q.length > 0) {
+          const o = q.shift() as ChangeOutcome
+          if (o.kind === 'accepted') known.add(rid)
+          return o
+        }
         if (opts.rejectCreates) return { kind: 'rejected', reason: 'bad-request' }
         known.add(rid)
         return { kind: 'accepted', cursor: 'create-seq' as unknown as SnapshotCursor }
@@ -602,45 +633,69 @@ describe('R2-P1-2: per-record FIFO causality (pending create holds same-record e
     return { transport, log }
   }
 
-  // port: per-record FIFO hold。create 期间 pendingRid=rid;同 rid 的 edit/delete 入 held(不提交 transport);
-  // ackCreate 由 transport 决定 create outcome,再 flush held(accepted→提交,record 已 known 不 404;rejected→dependency-failed)。
+  // port: per-(canvasId,recordId) FIFO hold。create 期间该 key pending;同 key 的 edit/delete 入 held(不提交 transport);
+  // ackCreate 由 transport 决定 create outcome,再 dispatch held(accepted→flush,rid 已 known 不 404;
+  //   rejected→dependency-failed;conflict/retryable→held 继续等,不清 key,caller 可再次 ackCreate)。
   class FifoRecordPort {
     private readonly transport: (c: CanvasChange) => ChangeOutcome
-    private pendingCreate: CanvasChange | null = null
-    private pendingRid: string | null = null
-    private readonly held: CanvasChange[] = []
+    private readonly pending = new Map<string, { create: CanvasChange; held: CanvasChange[] }>()
     constructor(transport: (c: CanvasChange) => ChangeOutcome) {
       this.transport = transport
     }
-    submit(c: CanvasChange): ChangeOutcome | 'held' {
+
+    private keyOf(canvasId: string, rid: string): string {
+      return `${canvasId}::${rid}`
+    }
+
+    submit(canvasId: string, c: CanvasChange): ChangeOutcome | 'held' {
       const rid = recordIdOf(c)
       if (rid && isCreateKind(c)) {
-        this.pendingCreate = c
-        this.pendingRid = rid
+        const key = this.keyOf(canvasId, rid)
+        if (this.pending.has(key)) {
+          // R3-P1-2:同 (canvas,rid) 待定 create 期间再来 create = create race / reuse;
+          // 不 clobber 第一个 pending 的 held;直送 transport(likely reuse-conflict 422)。
+          return this.transport(c)
+        }
+        this.pending.set(key, { create: c, held: [] })
         return 'held' // create in-flight;outcome at ackCreate(transport 决定)
       }
-      if (rid && this.pendingRid === rid) {
-        this.held.push(c) // held——**不**独立提交 transport(故不独立 404)
-        return 'held'
+      if (rid) {
+        const key = this.keyOf(canvasId, rid)
+        const entry = this.pending.get(key)
+        if (entry) {
+          entry.held.push(c) // held——**不**独立提交 transport(故不独立 404)
+          return 'held'
+        }
       }
-      return this.transport(c) // 无 pending create → 直送(truly-unknown → 404)
+      return this.transport(c) // 无 pending create(或无 rid:reorder/update-meta)→ 直送(truly-unknown → 404)
     }
-    ackCreate(): { create: ChangeOutcome; held: ChangeOutcome[] } {
-      const create = this.pendingCreate!
-      const createOutcome = this.transport(create) // transport 决定 create outcome(accepted→rid known / rejected→rid 未 known)
-      const heldOutcomes = this.held.map((c) =>
-        createOutcome.kind === 'accepted'
-          ? this.transport(c) // create 成功 → rid 已 known → edit accepted(非 404)
-          : ({
-              kind: 'rejected',
-              reason: 'dependency-failed',
-              detail: `create ${createOutcome.kind}`,
-            } as ChangeOutcome),
-      )
-      this.pendingCreate = null
-      this.pendingRid = null
-      this.held.length = 0
-      return { create: createOutcome, held: heldOutcomes }
+
+    // ackCreate:create 的 outcome 到达(transport 决定)。
+    // - accepted → flush held(FIFO 序,rid 已 known 不 404)+ 清 key。
+    // - rejected(终态)→ held surface dependency-failed(非 not-found)+ 清 key。
+    // - conflict/retryable(非终态)→ held **继续等**(不清 key,不 dependency-fail);caller 据 create outcome
+    //   retry/rebase 后再次 ackCreate(create 终态收敛后 held 才 settle)。返回 held:[](尚未 settle)。
+    ackCreate(canvasId: string, rid: string): { create: ChangeOutcome; held: ChangeOutcome[] } {
+      const key = this.keyOf(canvasId, rid)
+      const entry = this.pending.get(key)
+      if (!entry) throw new Error(`ackCreate: no pending create for ${key}`)
+      const createOutcome = this.transport(entry.create)
+      if (createOutcome.kind === 'accepted') {
+        const heldOutcomes = entry.held.map((c) => this.transport(c)) // create 成功 → rid 已 known → edit accepted(非 404)
+        this.pending.delete(key)
+        return { create: createOutcome, held: heldOutcomes }
+      }
+      if (createOutcome.kind === 'rejected') {
+        const heldOutcomes = entry.held.map((): ChangeOutcome => ({
+          kind: 'rejected',
+          reason: 'dependency-failed',
+          detail: 'create rejected',
+        }))
+        this.pending.delete(key)
+        return { create: createOutcome, held: heldOutcomes }
+      }
+      // conflict / retryable(非终态)→ held 继续等收敛;key 保留,caller 可再次 ackCreate
+      return { create: createOutcome, held: [] }
     }
   }
 
@@ -651,20 +706,33 @@ describe('R2-P1-2: per-record FIFO causality (pending create holds same-record e
   }
 
   // 测试 mock changes:node 是部分对象,用 `as unknown as CanvasChange` 旁路 record schema(port 契约测试只验调度,不验 record 字段)。
+  const CV = 'cv1' // 主测试 canvas(异 canvas 测试用 CV2)
   const mockCreate = (rid: string): CanvasChange =>
     ({ kind: 'create-node', node: { id: rid } }) as unknown as CanvasChange
-  const mockEdit = (rid: string): CanvasChange =>
-    ({ kind: 'edit-node', nodeId: rid, intents: [{ op: 'set', fieldPath: ['title'], value: 'edited' }] }) as unknown as CanvasChange
+  const mockEdit = (rid: string, value = 'edited'): CanvasChange =>
+    ({ kind: 'edit-node', nodeId: rid, intents: [{ op: 'set', fieldPath: ['title'], value }] }) as unknown as CanvasChange
+
+  // R3-P1-2 矩阵 outcome 常量(复用;makeTransport 深拷队列,对象本体共享只读不互相影响):
+  const CURSOR_CREATE = 'create-seq' as unknown as SnapshotCursor
+  const conflictOutcome: ChangeOutcome = {
+    kind: 'conflict',
+    currentCursor: 'rev-x' as unknown as SnapshotCursor,
+    diverging: [] as CanvasChange[],
+  }
+  const retryableOutcome: ChangeOutcome = { kind: 'retryable', reason: 'http_503' }
+  const acceptedCreate: ChangeOutcome = { kind: 'accepted', cursor: CURSOR_CREATE }
+  const rejectedBad: ChangeOutcome = { kind: 'rejected', reason: 'bad-request' }
+  const reuseConflict: ChangeOutcome = { kind: 'rejected', reason: 'reuse-conflict' }
 
   it('edit submitted while create pending is HELD; transport sees create FIRST, edit never 404', () => {
     // 验收:mock 让 edit 可"先发"(submit 调用序 edit 在 create 后但 create 未 ack),adapter 仍先 create 后 edit,
     // 最终 record=初值+编辑,edit 不因"record 尚未落库"独立 404。
     const t = makeTransport()
     const port = new FifoRecordPort(t.transport)
-    expect(port.submit(mockCreate('n1'))).toBe('held') // create pending
-    expect(port.submit(mockEdit('n1'))).toBe('held') // edit held——transport 此刻未见 edit
+    expect(port.submit(CV, mockCreate('n1'))).toBe('held') // create pending
+    expect(port.submit(CV, mockEdit('n1'))).toBe('held') // edit held——transport 此刻未见 edit
     expect(t.log).toEqual([]) // transport 未见任何(create 在 ackCreate 才提交)
-    const { create: createOut, held: [editOut] } = port.ackCreate()
+    const { create: createOut, held: [editOut] } = port.ackCreate(CV, 'n1')
     expect(t.log).toEqual([mockCreate('n1'), mockEdit('n1')]) // create 先、edit 后(transport 提交序)
     expect(createOut.kind).toBe('accepted')
     expect(editOut.kind).toBe('accepted') // edit 提交时 rid 已 known → accepted(非 not-found)
@@ -675,9 +743,9 @@ describe('R2-P1-2: per-record FIFO causality (pending create holds same-record e
     // create 失败(如 bad-request)→ 依赖 edit 不能进行;surface 为 dependency-failed(非 not-found)。
     const t = makeTransport({ rejectCreates: true })
     const port = new FifoRecordPort(t.transport)
-    expect(port.submit(mockCreate('n2'))).toBe('held')
-    expect(port.submit(mockEdit('n2'))).toBe('held')
-    const { create: createOut, held: [editOut] } = port.ackCreate()
+    expect(port.submit(CV, mockCreate('n2'))).toBe('held')
+    expect(port.submit(CV, mockEdit('n2'))).toBe('held')
+    const { create: createOut, held: [editOut] } = port.ackCreate(CV, 'n2')
     expect(createOut.kind).toBe('rejected') // create 自身 bad-request
     if (createOut.kind === 'rejected') expect(createOut.reason).toBe('bad-request')
     expect(editOut.kind).toBe('rejected')
@@ -693,7 +761,7 @@ describe('R2-P1-2: per-record FIFO causality (pending create holds same-record e
     // 验收:从未存在 vs pending-create 两种 404 边界分开断言。此为"从未存在"——直接 404 not-found。
     const t = makeTransport()
     const port = new FifoRecordPort(t.transport)
-    const out = unwrap(port.submit(mockEdit('ghost')))
+    const out = unwrap(port.submit(CV, mockEdit('ghost')))
     expect(out.kind).toBe('rejected')
     if (out.kind === 'rejected') expect(out.reason).toBe('not-found')
     expect(t.log).toEqual([mockEdit('ghost')]) // 直送 transport,record 未知 → 404
@@ -705,10 +773,10 @@ describe('R2-P1-2: per-record FIFO causality (pending create holds same-record e
     const port = new FifoRecordPort(t.transport)
     const e1 = mockEdit('n3')
     const edit2 = { kind: 'edit-node', nodeId: 'n3', intents: [{ op: 'set', fieldPath: ['title'], value: '2' }] } as unknown as CanvasChange
-    expect(port.submit(mockCreate('n3'))).toBe('held')
-    expect(port.submit(e1)).toBe('held')
-    expect(port.submit(edit2)).toBe('held')
-    port.ackCreate()
+    expect(port.submit(CV, mockCreate('n3'))).toBe('held')
+    expect(port.submit(CV, e1)).toBe('held')
+    expect(port.submit(CV, edit2)).toBe('held')
+    port.ackCreate(CV, 'n3')
     // transport 提交序:create 先,然后 e1、edit2 按 submit 序(同引用——toBe Object.is 证 FIFO 序保持)
     expect(t.log.map((c) => (c.kind === 'create-node' ? 'create' : 'edit'))).toEqual(['create', 'edit', 'edit'])
     expect(t.log[1]).toBe(e1) // 第一条 flush 的 edit 是先 submit 的(同对象引用)
@@ -719,11 +787,158 @@ describe('R2-P1-2: per-record FIFO causality (pending create holds same-record e
     // pending create for n4 不 hold n5 的 edit(因果是 per-record,非全局阻塞)。
     const t = makeTransport()
     const port = new FifoRecordPort(t.transport)
-    expect(port.submit(mockCreate('n4'))).toBe('held')
-    const other = unwrap(port.submit(mockEdit('n5'))) // 异 record → 直送(但 n5 未知 → 404)
+    expect(port.submit(CV, mockCreate('n4'))).toBe('held')
+    const other = unwrap(port.submit(CV, mockEdit('n5'))) // 异 record → 直送(但 n5 未知 → 404)
     expect(other.kind).toBe('rejected')
     if (other.kind === 'rejected') expect(other.reason).toBe('not-found') // n5 从未存在 → not-found(非 held)
     expect(t.log).toEqual([mockEdit('n5')]) // n5 edit 直送 transport
+  })
+
+  // ── R3-P1-2 新增矩阵:retryable/conflict 所有权 + per-key 状态机 + 终态断言 ──
+
+  it('R3-P1-2 NEGATIVE: create CONFLICT does NOT clear held as dependency-failed (held kept pending, retried after rebase)', () => {
+    // bug1:旧 ackCreate 见 non-accepted(含 conflict)→ dependency-failed + 清队列 → edit 丢;
+    // 新:conflict 非终态 → held 继续等,不清 key;caller 据 conflict rebase 后再次 ackCreate → accepted → edit flush。
+    const t = makeTransport({ createOutcomes: { n10: [conflictOutcome, acceptedCreate] } })
+    const port = new FifoRecordPort(t.transport)
+    expect(port.submit(CV, mockCreate('n10'))).toBe('held')
+    expect(port.submit(CV, mockEdit('n10'))).toBe('held')
+    const first = port.ackCreate(CV, 'n10')
+    expect(first.create.kind).toBe('conflict') // 第一轮:create conflict(非终态)
+    expect(first.held).toEqual([]) // held 未 settle(继续等),**不** dependency-failed
+    const retry = port.ackCreate(CV, 'n10') // caller 据 conflict rebase 后重试(再次 ackCreate)
+    expect(retry.create.kind).toBe('accepted') // 第二轮:create accepted(终态收敛)
+    expect(retry.held).toHaveLength(1)
+    expect(retry.held[0].kind).toBe('accepted') // edit 在 create 收敛后 flush(非丢、非 dependency-failed)
+    expect(retry.held[0].kind).not.toBe('rejected')
+  })
+
+  it('R3-P1-2 NEGATIVE: create RETRYABLE keeps held pending across retries until terminal (NOT cleared as dependency-failed)', () => {
+    // bug1 retryable 变体:旧 impl retryable 也被当 non-accepted → dependency-failed + 清队列;
+    // 新:retryable 非终态 → held 持续等;caller retry 后再次 ackCreate → accepted → edit flush。
+    const t = makeTransport({ createOutcomes: { n11: [retryableOutcome, retryableOutcome, acceptedCreate] } })
+    const port = new FifoRecordPort(t.transport)
+    expect(port.submit(CV, mockCreate('n11'))).toBe('held')
+    expect(port.submit(CV, mockEdit('n11'))).toBe('held')
+    const a1 = port.ackCreate(CV, 'n11')
+    expect(a1.create.kind).toBe('retryable') // 第一次:非终态
+    expect(a1.held).toEqual([]) // held 继续等(不清队列、不 dependency-fail)
+    const a2 = port.ackCreate(CV, 'n11')
+    expect(a2.create.kind).toBe('retryable') // 第二次:仍非终态
+    expect(a2.held).toEqual([])
+    const converged = port.ackCreate(CV, 'n11') // 第三次:create 终态收敛(accepted)
+    expect(converged.create.kind).toBe('accepted')
+    expect(converged.held[0].kind).toBe('accepted') // edit 在收敛后 flush
+  })
+
+  it('R3-P1-2 NEGATIVE: create retryable then TERMINALLY rejected → held dependency-failed (ownership: caller gives up retry)', () => {
+    // 所有权冻结:caller 拿到 retryable 后放弃重试(create 持续返 retryable 后终态转 rejected);
+    // create 终态 rejected → 此时 held 才 dependency-failed + 清 key(之前 retryable 时 held 一直等)。
+    const t = makeTransport({ createOutcomes: { n12: [retryableOutcome, rejectedBad] } })
+    const port = new FifoRecordPort(t.transport)
+    port.submit(CV, mockCreate('n12'))
+    port.submit(CV, mockEdit('n12'))
+    expect(port.ackCreate(CV, 'n12').create.kind).toBe('retryable') // 非终态:held 等待
+    const giveUp = port.ackCreate(CV, 'n12') // 终态:caller 放弃 / create 转 rejected
+    expect(giveUp.create.kind).toBe('rejected')
+    expect(giveUp.held[0].kind).toBe('rejected')
+    if (giveUp.held[0].kind === 'rejected') expect(giveUp.held[0].reason).toBe('dependency-failed') // 此时才 dependency-failed
+  })
+
+  it('R3-P1-2 NEGATIVE: concurrent second create (different rid) does NOT clobber first pending held edits (per-key Map)', () => {
+    // bug2:旧单槽 pendingRid:submit(create-n21) 覆盖 pendingRid=n20→n21;submit(edit-n20) 见 pendingRid≠n20 → 直送 → 404(edit 丢)。
+    // 新 per-key Map:n20、n21 各自 pending;edit-n20 仍 held;n20 ack 后 edit flush accepted(未被 n21 clobber)。
+    const t = makeTransport()
+    const port = new FifoRecordPort(t.transport)
+    expect(port.submit(CV, mockCreate('n20'))).toBe('held')
+    expect(port.submit(CV, mockEdit('n20'))).toBe('held') // n20 的 edit held
+    expect(port.submit(CV, mockCreate('n21'))).toBe('held') // 第二个 create(不同 rid)→ 各自 pending,不 clobber
+    expect(port.submit(CV, mockEdit('n21'))).toBe('held')
+    const r21 = port.ackCreate(CV, 'n21') // 先 ack n21(序无关)
+    expect(r21.create.kind).toBe('accepted')
+    expect(r21.held[0].kind).toBe('accepted')
+    const r20 = port.ackCreate(CV, 'n20') // 再 ack n20:n20 的 edit **仍** held 中(未被 clobber)
+    expect(r20.create.kind).toBe('accepted')
+    expect(r20.held[0].kind).toBe('accepted') // n20 的 edit 没丢
+  })
+
+  it('R3-P1-2 NEGATIVE: same recordId in different canvases do NOT collide (per-(canvasId,recordId) key)', () => {
+    // bug3:旧 submit 无 canvasId,同 rid 不同 canvas 共用单槽 pendingRid → 互相 clobber(create 丢、held 错位)。
+    // 新 key=`${canvasId}::${rid}`:CV/nX 与 CV2/nX 各自 pending,互不影响。
+    const t = makeTransport()
+    const port = new FifoRecordPort(t.transport)
+    const CV2 = 'cv2'
+    expect(port.submit(CV, mockCreate('nX'))).toBe('held') // c1 create nX
+    expect(port.submit(CV, mockEdit('nX'))).toBe('held') // c1 edit nX held
+    expect(port.submit(CV2, mockCreate('nX'))).toBe('held') // c2 create nX(同 rid,异 canvas)→ 各自 pending
+    expect(port.submit(CV2, mockEdit('nX'))).toBe('held') // c2 edit nX held
+    const r1 = port.ackCreate(CV, 'nX') // ack c1/nX → c1 edit flush;c2/nX 仍 pending
+    expect(r1.create.kind).toBe('accepted')
+    expect(r1.held[0].kind).toBe('accepted')
+    const r2 = port.ackCreate(CV2, 'nX') // ack c2/nX → c2 edit flush(独立于 c1)
+    expect(r2.create.kind).toBe('accepted')
+    expect(r2.held[0].kind).toBe('accepted')
+  })
+
+  it('R3-P1-2: multiple pending creates (different rids) flush independently in FIFO order', () => {
+    const t = makeTransport()
+    const port = new FifoRecordPort(t.transport)
+    const e1 = mockEdit('n30')
+    const e2a = mockEdit('n31', 'a')
+    const e2b = mockEdit('n31', 'b')
+    port.submit(CV, mockCreate('n30'))
+    port.submit(CV, e1)
+    port.submit(CV, mockCreate('n31'))
+    port.submit(CV, e2a)
+    port.submit(CV, e2b)
+    const r31 = port.ackCreate(CV, 'n31') // 先 ack n31(两个 held edit FIFO 序)
+    expect(r31.held.map((o) => o.kind)).toEqual(['accepted', 'accepted'])
+    const r30 = port.ackCreate(CV, 'n30') // 再 ack n30
+    expect(r30.held[0].kind).toBe('accepted')
+  })
+
+  it('R3-P1-2: duplicate create same (canvas,rid) while first pending → direct to transport (reuse-conflict), first pending NOT clobbered', () => {
+    // 同 (canvas,rid) 待定 create 期间再来 create = create race;port 直送 transport(likely reuse-conflict 422),
+    // 不 clobber 第一个 pending 的 held;第一个 create ack 后其 held edit 仍 flush accepted。
+    const t = makeTransport({ createOutcomes: { n40: [reuseConflict, acceptedCreate] } })
+    const port = new FifoRecordPort(t.transport)
+    expect(port.submit(CV, mockCreate('n40'))).toBe('held') // 第一个 create pending
+    expect(port.submit(CV, mockEdit('n40'))).toBe('held') // edit held
+    const dup = unwrap(port.submit(CV, mockCreate('n40'))) // 第二个 create(同 key)→ 直送 transport → reuse-conflict
+    expect(dup.kind).toBe('rejected')
+    if (dup.kind === 'rejected') expect(dup.reason).toBe('reuse-conflict')
+    const r = port.ackCreate(CV, 'n40') // 第一个 pending 未被 clobber:ack 后 edit flush accepted
+    expect(r.create.kind).toBe('accepted')
+    expect(r.held[0].kind).toBe('accepted')
+  })
+
+  it('R3-P1-2: final record STATE asserted (create + edit applied), not just transport log', () => {
+    // 终态断言:不仅看 transport.log 序,更断言最终 record 状态 = create 初值 + 编辑叠加。
+    // record-store transport:create 写入 record(含 title),edit 改 title 字段;ack 后断言 store record.title='edited-title'。
+    const store = new Map<string, { title: string }>()
+    const transport = (c: CanvasChange): ChangeOutcome => {
+      const rid = recordIdOf(c)
+      if (rid && isCreateKind(c)) {
+        const node = (c as { node: { id: string; title: string } }).node
+        store.set(rid, { title: node.title })
+        return { kind: 'accepted', cursor: 'create-seq' as unknown as SnapshotCursor }
+      }
+      if (rid && store.has(rid) && c.kind === 'edit-node') {
+        const intent = (c as { intents: { op: 'set'; fieldPath: readonly (string | number)[]; value: string }[] }).intents[0]
+        if (intent.fieldPath[0] === 'title') store.get(rid)!.title = intent.value
+        return { kind: 'accepted', cursor: 'edit-seq' as unknown as SnapshotCursor }
+      }
+      return { kind: 'rejected', reason: 'not-found' }
+    }
+    const port = new FifoRecordPort(transport)
+    const createN50 = { kind: 'create-node', node: { id: 'n50', title: 'init-title' } } as unknown as CanvasChange
+    const editN50 = { kind: 'edit-node', nodeId: 'n50', intents: [{ op: 'set', fieldPath: ['title'], value: 'edited-title' }] } as unknown as CanvasChange
+    port.submit(CV, createN50)
+    port.submit(CV, editN50)
+    const r = port.ackCreate(CV, 'n50')
+    expect(r.create.kind).toBe('accepted')
+    expect(r.held[0].kind).toBe('accepted')
+    expect(store.get('n50')!.title).toBe('edited-title') // 终态:record = 初值 + 编辑(非仅 log 有 edit)
   })
 })
 
