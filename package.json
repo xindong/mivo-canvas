@@ -16,6 +16,7 @@
     "test:unit": "vitest run",
     "test:bench": "vitest run --config vitest.bench.config.ts",
     "verify:logging": "node scripts/verify-debug-logging.mjs",
+    "test:shell": "bash ops/postgres/test-asset-verify.sh && bash ops/postgres/test-restore-drill-matrix.sh",
     "test:e2e": "npm run test:e2e:dev",
     "test:e2e:dev": "node scripts/e2e-runner.mjs --topology=dev",
     "test:e2e:prod:subset": "node scripts/e2e-runner.mjs --topology=prod --scenario=debug,canvas-interactions,chat-generation,mask,mask-reflow,variations-annotation",
@@ -26,7 +27,7 @@
     "start:server": "tsx server/index.ts",
     "contract:diff": "node scripts/contract-diff.mjs",
     "codemap": "node scripts/codemap.mjs",
-    "preflight": "tsc -b && npm run lint && npm run verify:logging && node scripts/ci/structure-guard.mjs && npm run test:unit",
+    "preflight": "tsc -b && npm run lint && npm run verify:logging && node scripts/ci/structure-guard.mjs && npm run test:unit && npm run test:shell",
     "prepare": "git rev-parse --git-dir >/dev/null 2>&1 && git config core.hooksPath .githooks || true"
   },
   "dependencies": {

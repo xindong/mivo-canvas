@@ -122,6 +122,13 @@ export interface PermissionBackend {
    * await 之,确保权限表已建。additive 字段——内存实现 Promise.resolve(),PG 落地后新增,路由/契约零改动。
    */
   readonly ready: Promise<void>
+
+  /**
+   * P0.3 readiness probe(可选,live 健康检查;区别于 ready 的"启动"语义)。/readyz 用:
+   * memory 恒 ok(无外部依赖);PG `SELECT 1` 探活连接池(捕连接耗尽/PG 挂)。返 ok=false 时携带
+   * reason(readyz 层收敛为稳定 code,不回显)。F2 返修:与 PersistBackend.ping 对偶,readyz 同时探活 persist+permission。
+   */
+  ping(): Promise<{ ok: true } | { ok: false; reason: string }>
 }
 
 const nowIso = (): string => new Date().toISOString()
@@ -150,6 +157,11 @@ export class InMemoryPermissionBackend implements PermissionBackend {
   private readonly linksByProject = new Map<string, string[]>()
   /** additive(PG 落地后接口新增):内存 backend 立即就绪。 */
   readonly ready: Promise<void> = Promise.resolve()
+
+  /** P0.3 readiness:内存 backend 无外部依赖,恒 ok(与 PgPermissionBackend.ping 对偶)。 */
+  async ping(): Promise<{ ok: true } | { ok: false; reason: string }> {
+    return { ok: true }
+  }
 
   private memberBucket(projectId: string): Map<string, ProjectMember> {
     let b = this.members.get(projectId)
