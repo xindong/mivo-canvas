@@ -3,8 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   __dumpWritesForTest,
   __resetWriteQueueDb,
+  __seedWritesForTest,
   classifyHttpStatus,
   createWriteQueue,
+  type QueuedWrite,
   type WriteExecutor,
   type WriteOp,
   type WriteOutcome,
@@ -954,5 +956,151 @@ describe('FX-5 IDB-failure degradation (toast + memStore fallback)', () => {
     await q.enqueue(minimalNode('c1', 'n2')) // different resourceKey → not coalesced
     expect(toastWarn).toHaveBeenCalledTimes(1) // second failure did not re-toast
     expect(await q.pendingCount()).toBe(2) // both records retained in memStore
+  })
+})
+
+// ── G1-a R4 F2:零项目 New Canvas 同毫秒 project/canvas FK 排序(drain tie-breaker)──
+//
+// 复现 R4 P1 阻断项:零项目账号 New Canvas 同步路径(createCanvas → createProject → 两次 enqueue
+// 到不同 resource-key 链)把 createProject 与 createCanvas 在**同一毫秒**入队。IDB getAll() 按 key(id)
+// 序返回——非确定,可能 canvas 在前。drain 纯 timestamp 排序对同毫秒返回 0,顺序退化为 IDB key 序;
+// 若 canvas 先 drain,真 Hono POST /api/canvas 缺 parent project → 404 unknown-project(见
+// server/routes/canvas.ts:286-289 + server/routes/canvas.route.test.ts:26-29)→ classifyHttpStatus(404,
+// isDelete=false) → rejected terminal → 记录被删 → 刷新后画布永久丢失。
+//
+// 修:drain 排序补 dependencyRank tie-breaker(同毫秒 project 类 rank0 先于 canvas 类 rank1)。
+// 本测试用 __seedWritesForTest 直接构造受控 id 的记录精确复现"逆境 IDB key 顺序"(canvas id 字典序
+// 在前),用 FK-enforcing mock executor 忠实建模真 Hono 404→rejected-terminal 分类(parent 未建则
+// canvas rejected),断言 drain 重排后 project 先发、双 success、零 terminal。
+//
+// 注:src/lib ↔ server 跨 tsconfig 项目边界(TS2591,有意为之——见 chatWiring.integration.test.ts:13-14),
+// 故 client 侧 drain 排序修复的 committed 红→绿测试在此文件用 FK-mock executor 覆盖;真 Hono 的
+// 404 unknown-project → terminal 行为由 server/routes/canvas.route.test.ts:26-29 独立覆盖,真 Hono
+// project+canvas 成功落库由 persistWiring.integration.test.ts 覆盖——两端合起来证 client 排序 + 真 route
+// FK 行为。
+describe('G1-a R4 F2 — 同毫秒 createProject/createCanvas 的 drain 依赖排序(tie-breaker)', () => {
+  // FK-enforcing mock executor:忠实建模真 Hono(project 未建则 canvas POST → 404 unknown-project →
+  // classifyHttpStatus(404,isDelete=false) → rejected terminal)。createProject 先建 parent → success;
+  // createCanvas 若 parent 已建 → success,否则 → rejected(terminal,记录被删,复现画布丢失)。
+  const fkExecutor = () => {
+    const calls: { op: WriteOp; key: string }[] = []
+    const createdProjects = new Set<string>()
+    const fn = vi.fn(async (op: WriteOp, key: string): Promise<WriteOutcome> => {
+      calls.push({ op, key })
+      if (op.kind === 'createProject') {
+        createdProjects.add(op.id ?? '')
+        return { status: 'success', revision: 0 }
+      }
+      if (op.kind === 'createCanvas') {
+        if (createdProjects.has(op.projectId)) return { status: 'success', revision: 0 }
+        return { status: 'rejected', body: { error: 'unknown-project' } }
+      }
+      return { status: 'success' }
+    })
+    return { fn, calls, createdProjects }
+  }
+
+  // 同毫秒(createdAt=nextAttemptAt=1000,= makeQueue clockMs)的 project/canvas 记录,canvas 归 p1。
+  const makeRecords = (projectRecordId: string, canvasRecordId: string): { project: QueuedWrite; canvas: QueuedWrite } => ({
+    project: {
+      id: projectRecordId,
+      idempotencyKey: 'mivo-proj-test',
+      userId: 'userA',
+      op: { kind: 'createProject', name: 'Default Project', id: 'p1' },
+      resourceKey: 'project:p1',
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    },
+    canvas: {
+      id: canvasRecordId,
+      idempotencyKey: 'mivo-canvas-test',
+      userId: 'userA',
+      op: { kind: 'createCanvas', canvasId: 'c1', projectId: 'p1', title: 'Untitled Canvas' },
+      resourceKey: 'canvas:c1',
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    },
+  })
+
+  it('逆境 IDB key 序(canvas id 字典序在前)+ 同毫秒 → drain 重排 project 先发,双 success 零 terminal', async () => {
+    const { fn, calls, createdProjects } = fkExecutor()
+    const q = makeQueue(fn)
+    const { project, canvas } = makeRecords('zz-project-record', 'aa-canvas-record')
+    await __seedWritesForTest([project, canvas])
+
+    // 确认逆境 setup:IDB getAll 按 key(id)序返回 canvas 在前(字典序 aa < zz)。
+    const dumped = await __dumpWritesForTest()
+    expect(dumped.map((r) => r.id)).toEqual(['aa-canvas-record', 'zz-project-record'])
+
+    const r = await q.drain()
+    // R4 修复断言:project 必须先 drain(tie-breaker 重排),canvas 归属的 p1 已建 → canvas success。
+    expect(calls).toHaveLength(2)
+    expect(calls[0]!.op.kind).toBe('createProject') // 修复前此处为 'createCanvas'(canvas 先发 → 404 terminal)
+    expect(calls[1]!.op.kind).toBe('createCanvas')
+    expect(calls[1]!.op.kind === 'createCanvas' && (calls[1]!.op as { projectId: string }).projectId).toBe('p1')
+    expect(r).toEqual({ processed: 2, successes: 2, failures: 0, terminals: 0, paused: false })
+    expect(createdProjects.has('p1')).toBe(true) // project 真落"库"(mock)
+    expect(await q.pendingCount()).toBe(0) // 双 success 后队列清空
+  })
+
+  it('非逆境 IDB key 序(project id 在前)→ 仍 project 先发、双 success 零 terminal(回归守卫)', async () => {
+    const { fn, calls } = fkExecutor()
+    const q = makeQueue(fn)
+    const { project, canvas } = makeRecords('aa-project-record', 'zz-canvas-record')
+    await __seedWritesForTest([project, canvas])
+
+    // 非逆境:IDB getAll 返回 project 在前(字典序 aa < zz)。此顺序即使无 tie-breaker 也 project 先发,
+    // 修复不应改变它——回归守卫,确保 tie-breaker 只在 tie 时生效、不误伤非逆境路径。
+    const dumped = await __dumpWritesForTest()
+    expect(dumped.map((r) => r.id)).toEqual(['aa-project-record', 'zz-canvas-record'])
+
+    const r = await q.drain()
+    expect(calls).toHaveLength(2)
+    expect(calls[0]!.op.kind).toBe('createProject')
+    expect(calls[1]!.op.kind).toBe('createCanvas')
+    expect(r).toEqual({ processed: 2, successes: 2, failures: 0, terminals: 0, paused: false })
+    expect(await q.pendingCount()).toBe(0)
+  })
+
+  it('updateCanvas(move 到同毫秒新建的 project)也排在该 createProject 之后(rank1 vs rank0)', async () => {
+    // 覆盖"同毫秒多资源链 project→canvas FK"一类的另一形态:updateCanvas(move)改 projectId 指向同批
+    // 新建的 project。move PUT 的 payload.projectId 同样要求 parent project 先建好,否则 404 terminal。
+    // tie-breaker 把 createProject(rank0)排到 updateCanvas(rank1)前。
+    const { fn, calls } = fkExecutor()
+    const q = makeQueue(fn)
+    const project: QueuedWrite = {
+      id: 'zz-move-project',
+      idempotencyKey: 'mivo-proj-move',
+      userId: 'userA',
+      op: { kind: 'createProject', name: 'Target Project', id: 'p-target' },
+      resourceKey: 'project:p-target',
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    }
+    const move: QueuedWrite = {
+      id: 'aa-move-canvas',
+      idempotencyKey: 'mivo-move-test',
+      userId: 'userA',
+      op: { kind: 'updateCanvas', canvasId: 'c-existing', projectId: 'p-target', title: 'Moved' },
+      resourceKey: 'canvas:c-existing',
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+    }
+    await __seedWritesForTest([project, move])
+    const dumped = await __dumpWritesForTest()
+    expect(dumped.map((r) => r.id)).toEqual(['aa-move-canvas', 'zz-move-project']) // 逆境:update 在前
+
+    const r = await q.drain()
+    expect(calls[0]!.op.kind).toBe('createProject') // 修复前:update 先发 → 移到未建 project → 404 terminal
+    expect(calls[1]!.op.kind).toBe('updateCanvas')
+    expect(r).toEqual({ processed: 2, successes: 2, failures: 0, terminals: 0, paused: false })
   })
 })

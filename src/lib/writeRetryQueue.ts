@@ -275,6 +275,31 @@ export const isDeleteKind = (kind: WriteOpKind): boolean =>
   kind === 'deleteChatMessage' // 404(已删 / 跨 actor)→ 幂等 success
 
 /**
+ * G1-a R4 F2 (零项目 New Canvas 修复):drain 排序的依赖感知 tie-breaker。
+ *
+ * canvas 写(createCanvas / updateCanvas)携带 `projectId` 作外键——服务端要求 project 先建好
+ * (POST /api/canvas 缺 project → 404 unknown-project → rejected terminal,见 server/routes/canvas.ts)。
+ * 零项目账号 New Canvas 的同步路径(documentSlice.createCanvas → get().createProject → 两次 enqueue)
+ * 把 createProject 与 createCanvas 在**同一毫秒**入队到不同 resource-key 链:纯 timestamp 排序对二者
+ * 返回 0,顺序退化为 IDB `getAll()` 的 key(id UUID)序——非确定且可能 canvas 在前,drain 先发 canvas
+ * → 404 terminal → 画布记录被删,刷新后永久丢失(R4 复现)。
+ *
+ * tie-breaker:同 nextAttemptAt + 同 createdAt 时,canvas 类写(rank 1)排在 project 类写(rank 0)之后,
+ * 保证 project prerequisite 先 drain。**最小闭环**,不引入通用 DAG / parent-lookup(只覆盖"同毫秒多资源链
+ * project→canvas FK"这一类;跨毫秒时 createProject 同步先于 createCanvas 入队,timestamp 主键已保证顺序)。
+ * 其余 op kind 无 project-FK 依赖 → rank 0(与 createProject 同层,顺序退化为既有稳定排序,零回归)。
+ */
+const dependencyRank = (op: WriteOp): number => {
+  switch (op.kind) {
+    case 'createCanvas':
+    case 'updateCanvas':
+      return 1
+    default:
+      return 0
+  }
+}
+
+/**
  * G1-a R2 F1:同资源 op 组合规则(在 drain 前的 enqueue coalesce 用)。返回合并后的 op,
  * 或 'cancel' 表示净消(删 pending 记录,不发任何请求)。
  *
@@ -720,7 +745,15 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
             (r.status === 'pending' || r.status === 'paused-401') &&
             r.nextAttemptAt <= ts,
         )
-        .sort((a, b) => a.nextAttemptAt - b.nextAttemptAt || a.createdAt - b.createdAt)
+        // 主键 nextAttemptAt(退避到期先发)+ 次键 createdAt(同 nextAttemptAt 时先入队先发)
+        // + tie-breaker dependencyRank:同毫秒时 project 类写先于 canvas 类写(防零项目 New Canvas
+        // 因 IDB key 序非确定致 canvas 先 drain → 404 terminal 丢失;见 dependencyRank 注释)。
+        .sort(
+          (a, b) =>
+            a.nextAttemptAt - b.nextAttemptAt ||
+            a.createdAt - b.createdAt ||
+            dependencyRank(a.op) - dependencyRank(b.op),
+        )
 
       for (const rec of due) {
         if (paused) break // a prior op in this cycle got 401 → stop
@@ -959,6 +992,17 @@ const clearIdbStore = async (): Promise<void> => {
 }
 
 export const __dumpWritesForTest = getAllWrites
+
+/**
+ * G1-a R4 F2 test-only:直接 putWrite 一批构造好的记录(含受控 id / createdAt / nextAttemptAt),
+ * 让单测能精确复现"同毫秒多资源链 + 逆境 IDB key 顺序"——enqueue 路径用随机 UUID 不便控制 key 序。
+ * 与 __dumpWritesForTest / __resetWriteQueueDb 同为 test-only accessor;生产代码不调用。
+ */
+export const __seedWritesForTest = async (records: QueuedWrite[]): Promise<void> => {
+  for (const record of records) {
+    await putWrite(record)
+  }
+}
 
 export const __resetWriteQueueDb = async (): Promise<void> => {
   memStore.clear()
