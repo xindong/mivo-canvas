@@ -80,7 +80,7 @@ DROP TABLE IF EXISTS persist_records;
 `
 
 // T1.4 权限层 schema(project_members + share_links)。独立第二个 migration,排在 initial 之后(字典序 002)。
-// 权威:docs/decisions/permission-schema.md + server/persist/migrations/001_permissions.sql(vanilla DDL 草案)。
+// 权威:docs/decisions/permission-schema.md;DDL 权威为本文件 PERMISSIONS_SCHEMA(Kysely runner apply,原 001_permissions.sql vanilla 草案已删)。
 // 设计:权限表不带 revision(成员资格/分享是 owner 权威写,非 CRDT LWW);share_links 软删用 revoked_at(FX-7)。
 // FK:project_id REFERENCES projects(id) ON DELETE CASCADE(project purge → members/links 清;projects 表由 001 建,
 // 本迁移在 001 之后 apply,FK 目标存在)。IF NOT EXISTS + migrator kysely_migration 追踪表 → 已建库重放安全。
