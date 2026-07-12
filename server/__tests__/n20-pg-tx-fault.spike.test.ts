@@ -39,17 +39,20 @@ beforeAll(async () => {
   if (!PG_TEST_ENABLED) return
   const cfg = pgConn()
   pool = new Pool(cfg)
-  // 建专用临时表(不依赖 mivo schema)
+  // 建专用临时表(不依赖 mivo schema);R3 F2 加 field_clock/idempotency/records(PG-T5/T6/T7)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS n20_nodes (id text PRIMARY KEY, title text, asset_id text);
     CREATE TABLE IF NOT EXISTS n20_edges (id text PRIMARY KEY, from_id text NOT NULL, to_id text NOT NULL);
     CREATE TABLE IF NOT EXISTS n20_assets (id text PRIMARY KEY, refcount integer NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS n20_field_clock (canvas_id text NOT NULL, record_id text NOT NULL, field_key text NOT NULL, clock bigint NOT NULL DEFAULT 0, PRIMARY KEY (canvas_id, record_id, field_key));
+    CREATE TABLE IF NOT EXISTS n20_idempotency (key text PRIMARY KEY, result_kind text NOT NULL, revision bigint NOT NULL, seq bigint NOT NULL);
+    CREATE TABLE IF NOT EXISTS n20_records (id text PRIMARY KEY, title text NOT NULL);
   `)
 })
 
 afterAll(async () => {
   if (!pool) return
-  await pool.query('DROP TABLE IF EXISTS n20_nodes; DROP TABLE IF EXISTS n20_edges; DROP TABLE IF EXISTS n20_assets;')
+  await pool.query('DROP TABLE IF EXISTS n20_nodes; DROP TABLE IF EXISTS n20_edges; DROP TABLE IF EXISTS n20_assets; DROP TABLE IF EXISTS n20_field_clock; DROP TABLE IF EXISTS n20_idempotency; DROP TABLE IF EXISTS n20_records;')
   await pool.end()
 })
 
@@ -143,5 +146,58 @@ describe.skipIf(!PG_TEST_ENABLED)('N2-0 返修 Gate3 PG 侧(R2-1 同一 client):
     expect(c.allEdges).toBe(2) // e2,e3 仍在(e1 已 partial 删)
     expect(c.n1Edges).toBe(1)  // 只剩 e2 引用 n1 → 孤儿 edge 风险(无事务时存在)
     // ★ 证明:无事务时跨 record 操作有 partial 风险;N2-1 deleteNodeCascade 必须用 PG 事务(§10.4 strict-tx)
+  })
+
+  it('PG-T5 field_clock 持久(R3 F2):write clock → 销毁 pool → 重连读回;重启可恢复(非 S10-4 内存 Map 模拟)', async () => {
+    // R3 F2 红证:S10-4 只把 DDL 放字符串 + persistedRows 数组模拟重启(内存,destroy 即丢,不证持久);
+    //   绿证:本探针真 PG — write via poolA → end poolA(模拟进程重启)→ read via fresh poolB → clock 仍在。
+    await pool!.query('TRUNCATE n20_field_clock')
+    const cfg = pgConn()
+    const poolA = new Pool(cfg)
+    await poolA.query("INSERT INTO n20_field_clock(canvas_id,record_id,field_key,clock) VALUES ('c1','n1','title',3),('c1','n1','transform.x',1) ON CONFLICT DO NOTHING")
+    await poolA.end() // ★ 销毁 poolA(模拟进程重启;内存 Map 会丢,PG 表保留)
+    const poolB = new Pool(cfg) // ★ 重连(新 pool,非内存)
+    const res = await poolB.query("SELECT field_key, clock::text AS clock FROM n20_field_clock WHERE record_id='n1' ORDER BY field_key")
+    await poolB.end()
+    expect(res.rows).toEqual([
+      { field_key: 'title', clock: '3' },
+      { field_key: 'transform.x', clock: '1' },
+    ]) // ★ 重启后 clock 仍在(非内存,PG 持久;S10-4 内存模拟不证此)
+  })
+
+  it('PG-T6 idempotency 持久(R3 F2):write idem key+result → 销毁 pool → 重连 replay 同 key → 不二次 bump(非 S10-11 内存 Map)', async () => {
+    // R3 F2 红证:S10-11 idempotencyCache 是进程内 Map,重启后同 key 会二次 bump revision/seq;
+    //   绿证:本探针真 PG — write via poolA → end → replay same key via fresh poolB → ON CONFLICT DO NOTHING + cached,不二次 bump。
+    await pool!.query('TRUNCATE n20_idempotency')
+    const cfg = pgConn()
+    const poolA = new Pool(cfg)
+    await poolA.query("INSERT INTO n20_idempotency(key,result_kind,revision,seq) VALUES ('idem-1','ok',2,5) ON CONFLICT DO NOTHING")
+    await poolA.end() // ★ 销毁 poolA(内存 Map 会丢,PG 表保留)
+    const poolB = new Pool(cfg) // ★ 重连
+    // replay 同 key → ON CONFLICT DO NOTHING(不覆盖,不二次 bump revision/seq)
+    const replay = await poolB.query("INSERT INTO n20_idempotency(key,result_kind,revision,seq) VALUES ('idem-1','ok',3,6) ON CONFLICT DO NOTHING")
+    expect(replay.rowCount).toBe(0) // ★ 已存在,不插入(不二次 bump)
+    const cached = await poolB.query("SELECT revision::text AS revision, seq::text AS seq FROM n20_idempotency WHERE key='idem-1'")
+    await poolB.end()
+    expect(cached.rows[0].revision).toBe('2') // ★ 仍 2(未 bump 到 3)
+    expect(cached.rows[0].seq).toBe('5')      // ★ 仍 5(未 bump 到 6)
+  })
+
+  it('PG-T7 strict-tx 跨 record 单事务(R3 F2):BEGIN 两不同 record + fault + ROLLBACK → 两 record 均不变(非 S10-5 单 record)', async () => {
+    // R3 F2 红证:S10-5 始终 clone/commit ops[0].recordId(单 record),不能证 §10.4 跨 record 单事务原子;
+    //   绿证:本探针两不同 record(nA/nB)同一 client BEGIN + 双 update + fault + ROLLBACK → 两 record 均不变。
+    await pool!.query('TRUNCATE n20_records')
+    await pool!.query("INSERT INTO n20_records(id,title) VALUES ('nA','origA'),('nB','origB')")
+    await withClient(async (client) => {
+      await client.query('BEGIN')
+      await client.query("UPDATE n20_records SET title='newA' WHERE id='nA'") // record A
+      await client.query("UPDATE n20_records SET title='newB' WHERE id='nB'") // record B(不同 record)
+      await expect(client.query('SELECT 1/0')).rejects.toThrow() // fault(division_by_zero)
+      await client.query('ROLLBACK')
+    })
+    const a = await pool!.query("SELECT title FROM n20_records WHERE id='nA'")
+    const b = await pool!.query("SELECT title FROM n20_records WHERE id='nB'")
+    expect(a.rows[0].title).toBe('origA') // ★ A 未改
+    expect(b.rows[0].title).toBe('origB') // ★ B 未改(跨 record 同事务原子回滚,非 partial;S10-5 单 record 不证此)
   })
 })

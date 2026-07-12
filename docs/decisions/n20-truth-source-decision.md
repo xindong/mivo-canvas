@@ -8,9 +8,9 @@
 > 验证产物(全绿):
 > - `src/kernel/__spike__/n20-truth-source.spike.test.ts`(44 tests:15 原 + 18 返修 + 8 补缺 + 3 R2 增:T1-5 restore 全链 / S10-10 immutable/atomic leaf 表 / S10-11 idempotent replay)
 > - `server/__tests__/n20-sse-route.spike.test.ts`(7 tests,真实 Hono SSE route 集成 + R2-2 live push 5-7 + desiredSize backpressure + gateway-secret authz seam)
-> - `server/__tests__/n20-pg-tx-fault.spike.test.ts`(4 tests,真实 PG transaction fault injection + R2-1 同一 client pool.connect+finally release;PG-T3 改名同库资产元数据)
+> - `server/__tests__/n20-pg-tx-fault.spike.test.ts`(7 tests,真实 PG transaction fault injection + R2-1 同一 client pool.connect+finally release;PG-T3 改名同库资产元数据;**R3 F2:PG-T5 field_clock 持久 / PG-T6 idempotency 持久 / PG-T7 strict-tx 跨 record**)
 >
-> **55 pass / 0 skip / 0 fail**(本地 PG port 55443 实跑,PG-T1~T4 同 client 真 pass);`tsc -b` 0 errors;`eslint` 干净;`npm run build` exit 0;`grep -roE 'yjs|lib0|YEvent|applyUpdate|AbstractType|encodeStateAsUpdate' dist/` **零命中**(yjs 不进生产 bundle)。
+> **58 pass / 0 skip / 0 fail**(本地 PG port 55443 实跑,PG-T1~T7 同 client 真 pass;PG-T5/T6/T7 真 PG 持久/跨 record);`tsc -b` 0 errors;`eslint` 干净;`npm run build` exit 0;`grep -roE 'yjs|lib0|YEvent|applyUpdate|AbstractType|encodeStateAsUpdate' dist/` **零命中**(yjs 不进生产 bundle)。
 >
 > **倾向 Figma 式,但措辞降级为"基于现有底座与迁移成本的推荐"(R2 纲)** — 非"七 gate 全 GO 的充分判据";Gate3/7 平局、Gate5 条件式。v1→v3 优势缩窄但不反转。结论见 §0,被推翻/修正表述见 §3。
 
@@ -46,7 +46,7 @@
 | 标记 | 含义 | 本决策的此类证据 |
 |---|---|---|
 | ★ | 真实库对照 | 真实 `yjs` / `Y.UndoManager` / `Y.Doc.transact` / `encodeStateAsUpdate` 跑同矩阵(M1-M6 / G3-real / G7-hard-4 / antiYjs) |
-| ● | 集成测试 | 真实 Hono SSE route(5-1~6)/ 真实 PG transaction fault injection(PG-T1~T4)/ FieldLevelServer 集成(G4/G7/S10/T1) |
+| ● | 集成测试 | 真实 Hono SSE route(5-1~6)/ 真实 PG transaction fault injection(PG-T1~T7)/ FieldLevelServer 集成(G4/G7/S10/T1) |
 | ▲ | lead 核证生产调用 | lead 已 spot-check 生产代码引用(canvas.ts:450-522 / shared/persist-contract.ts:76 / writeRetryQueue.ts:16-19) |
 | ○ | 仍属分析 | 未跑生产网关 / 未压测 20k 渲染;条件式标注,非"无需验证" |
 
@@ -307,8 +307,8 @@ npm test -- src/lib/serverPersistAdapter.contract.test.ts server/persist/backend
 | §10 FieldOp body 携 actor/recordId/baseRevision | 三层信任边界:body 不信,authz/path/If-Match 覆盖 | `S10-2`(●) |
 | §10 opId body+header 双载体 | opId 单一权威载体(idempotency-key header) | `S10-2`(●) |
 | §10 无 create/unset/array/reorder/strict-tx | typed domain op union | `S10-3`(●) |
-| §10 per-field clock 留 N2-1(自相矛盾) | 持久形态定死 Map<recordId,Map<fieldKey,clock>> | `S10-4`(●) |
-| §10 batch 无原子性 | batch 预检 + 全 ok 或全 reject(无 partial) | `S10-5`(●) |
+| §10 per-field clock 留 N2-1(自相矛盾) | 持久形态定死 PG `field_clock` 表(PG-T5 真测:write→destroy pool→重连读回;S10-4 演示逻辑) | `S10-4`+`PG-T5`(●) |
+| §10 batch 无原子性 | batch 预检 + 全 ok 或全 reject(无 partial);跨 record 单事务 PG-T7 真测 | `S10-5`+`PG-T7`(●) |
 | §10 FieldPath 允许空 / 无防原型污染 | 非空 tuple + 拒 __proto__/prototype/constructor(对齐 G1-b R2-P1-1) | `S10-1/S10-6`(●) |
 | §10 数组无中性 intent | by-stable-id insert/remove/splice(对齐 G1-b R2-P1-1) | `S10-7`(●) |
 | §10 create→edit 无因果 | 同 record FIFO(pending create ack 前 hold edit,对齐 G1-b R2-P1-2) | `S10-8`(●) |
@@ -369,8 +369,8 @@ npm test -- src/lib/serverPersistAdapter.contract.test.ts server/persist/backend
 | S10-1 setByPath 拒原型污染 | P1-3 | §10 | `toThrow(/forbidden path segment/)` | ● |
 | S10-2 三层信任边界 trustify | P1-3 | §10 | `actor==='alice' && recordId==='n1' && base===0`(不信 body) | ● |
 | S10-3 typed domain op union | P1-3 | §10 | `create/set/unset/array/reorder/strict-tx` 可区分 | ● |
-| S10-4 per-field clock 持久形态 | P1-3 | §10 | `clock('n1',['title'])===3 && clock(['transform','x'])===1` | ● |
-| S10-5 batch 原子性 | P1-3 | §10 | `batchBad.allOk===false && title 仍 T(无 partial)` | ● |
+| S10-4 per-field clock 持久形态 | P1-3 | §10 | clock 逻辑(内存演示)+ **PG-T5 真持久**(write→destroy pool→重连读回,clock 仍在) | ● |
+| S10-5 batch 原子性 | P1-3 | §10 | batch 逻辑(单 record)+ **PG-T7 跨 record**(BEGIN 两 record+fault+ROLLBACK 两 record 均不变) | ● |
 
 ### 4.3 补缺探针(8 tests,本 worker)
 
@@ -389,7 +389,7 @@ npm test -- src/lib/serverPersistAdapter.contract.test.ts server/persist/backend
 
 见 Gate5 §2(5-1 content-type/framing、5-2 heartbeat、5-3 since 补拉、5-4 revoke 断流、5-5 authz 403、5-6 slow consumer 有界;5-7 live push 见 §4.6 R2 增补)。强度 ●。
 
-### 4.5 真实 PG fault injection(4 tests,前任 worker,本地 PG 55443 实跑)
+### 4.5 真实 PG fault injection(7 tests:PG-T1~T4 R2-1 同 client + **PG-T5/T6/T7 R3 F2 持久/跨 record**,本地 PG 55443 实跑)
 
 见 Gate3 §2(PG-T1 原子提交、PG-T2 fault ROLLBACK、PG-T3 同库资产元数据(R2-1 改名,非跨介质)、PG-T4 无事务 partial 对照)。强度 ●。
 
@@ -399,10 +399,10 @@ npm test -- src/lib/serverPersistAdapter.contract.test.ts server/persist/backend
 |---|---|---|---|---|
 | T1-5 restore 走 overwrite 管线全链(A写→B写→A restore→B收 notice→B后续写→A收 notice) | R2-5 | 1 | `overwrittenTo==='bob' && aliceInbox.length===2 && bobInbox.length===1`(lastWriter 链不断) | ● |
 | S10-10 immutable/atomic leaf 表 | R2-3 | §10 | `immutable 字段 set→throw;atomic-container 整值替换(allowContainerClobber);其余 leaf set ok` | ● |
-| S10-11 idempotent replay | R2-3 | §10 | `同 opId(idempotency-key)replay 不二次 bump revision/seq、不二次发事件` | ● |
+| S10-11 idempotent replay | R2-3 | §10 | replay 逻辑(内存 Map)+ **PG-T6 真持久**(write→destroy→重连 replay 不二次 bump) | ● |
 | 5-7 SSE live push(建连后 push→response body 实收) | R2-2 | 5 | `chunks 含 'live-value' && op.value==='live-value'`(非建连前 replay) | ● |
 
-**实跑汇总**:`55 pass / 0 skip / 0 fail`(spike 44 + SSE 7 + PG 4,本地 PG port 55443 实跑 MIVO_PG_TEST=1,PG-T1~T4 同一 client 真 pass)。`tsc -b` 0 errors;`eslint` 干净;`npm run build` exit 0(567ms);`grep -roE 'yjs|lib0|YEvent|applyUpdate|AbstractType|encodeStateAsUpdate' dist/` 零命中(yjs 不进生产 bundle)。
+**实跑汇总**:`58 pass / 0 skip / 0 fail`(spike 44 + SSE 7 + PG 7,本地 PG port 55443 实跑 MIVO_PG_TEST=1,PG-T1~T7 同一 client 真 pass;PG-T5/T6/T7 真 PG 持久/跨 record)。`tsc -b` 0 errors;`eslint` 干净;`npm run build` exit 0(567ms);`grep -roE 'yjs|lib0|YEvent|applyUpdate|AbstractType|encodeStateAsUpdate' dist/` 零命中(yjs 不进生产 bundle)。
 
 ---
 
@@ -455,11 +455,11 @@ const trustify = (client: ClientFieldOp, ctx: TrustedCtx): WireOp => ({ ...ctx, 
 - revision:每 accepted op bump(per-record);**只供 snapshot/catch-up + legacy cache 校验,不参与 LWW 拒写**(G4-4)。
 - 同 `fieldPath` 并发:server seq LWW(后者 wins,整串;gate 1 文本 gate 接受)+ **overwritten 事件推前写者**(B 方案,T1-1)。
 - 全序 `seq`:per-canvas 单调事件序号(gate 7 `?since=seq` 补拉)。
-- per-field clock:**持久形态定死** `Map<recordId, Map<fieldKey, clock>>`(S10-4,不留 N2-1);stale 判定 = base.clock < current.clock → 条件逆运算 skip(M2)。
+- per-field clock:**持久形态定死** PG `field_clock` 表(PG-T5 真测:write→destroy pool→重连读回,clock 仍在;S10-4 演示逻辑,不留 N2-1);stale 判定 = base.clock < current.clock → 条件逆运算 skip(M2)。
 
 ### 10.4 跨 record invariant = 严格事务路径(非 LWW)
 
-- `deleteNodeCascade(nodeId)` 等 server-side 事务:node 删 + edge 级联 + asset ref 清理,**同一 PG 事务原子**(G3-1 + PG-T1~T3 真实验证)。
+- `deleteNodeCascade(nodeId)` 等 server-side 事务:node 删 + edge 级联 + asset ref 清理,**同一 PG 事务原子**(G3-1 + PG-T1~T3 + **PG-T7 跨 record 单事务**真实验证)。
 - delete-vs-update:delete wins,update 落 not-found(G3-2,非 409 重试)。
 - group/frame、result node+asset ref 同走事务路径(`strict-tx` op)。
 
@@ -515,7 +515,7 @@ const trustify = (client: ClientFieldOp, ctx: TrustedCtx): WireOp => ({ ...ctx, 
 | 生产 SSO 网关 WS upgrade 放行 + header 注入 | N2-2(WS 优化)/ Yjs(致命) | **○条件式留 lead 生产网关实测**;做到→N2-2 上 WS 优化;做不到→SSE 兜底,**Figma 选型不变** |
 | 网关对 `text/event-stream` 缓冲/超时 | N2-2 SSE | ○条件式:lead 实测,必要时加心跳(5-2 heartbeat 已实现,生产网关缓冲未测) |
 | 20k 节点高频 update 渲染性能 | N2-1/N2-2 | 复用 §12 风险4 的 26.7ms p95 基线,N2-2 做 pan bench(对齐 N1 §4 未验证项) |
-| per-field clock 精确 stale 判定 | N2-1 实装 | 持久形态已定死(S10-4);生产加 per-field clock 做精确 stale(契约 §10.3) |
+| per-field clock 精确 stale 判定 | N2-1 实装 | 持久形态已定死(PG-T5 真测持久;S10-4 演示逻辑);生产加 per-field clock 做精确 stale(契约 §10.3) |
 | canvas 文本同段共编真实需求 | 未来 | 若出现,N2-1 后对 `text` 单字段局部引入 OT/CRDT(不拖全局);v2 文本判决 B 已给 overwritten+restore 兜底 |
 | #194 cutover 破坏面实际调用面 | gate4/gate6 | ▲lead 已核证 route 注册 + FX-5 payload + shared contract(§1.2);cutover 前补全量调用面审计 + 原子 cutover 策略(§1.2 拍死,非 versioned) |
 
