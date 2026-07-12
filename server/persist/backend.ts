@@ -276,6 +276,14 @@ export interface PersistBackend {
    * additive 字段——内存实现 Promise.resolve(),PG 落地后新增,路由/契约零改动。
    */
   readonly ready: Promise<void>
+
+  /**
+   * P0.3 readiness probe(可选,live 健康检查;区别于 ready 的"启动预热"语义)。
+   * /readyz 用:/healthz 只探"进程活"(恒 ok),/readyz 探"依赖此刻可用"。
+   * memory:恒 ok(无外部依赖);PG:`SELECT 1` 探活连接池(捕连接耗尽/PG 挂)。
+   * 返 ok=false 时携带 reason 供 /readyz 503 响应体诊断。additive——与 ready/__reset 同模式。
+   */
+  ping(): Promise<{ ok: true } | { ok: false; reason: string }>
 }
 
 // ─── 内存实现(同 docKernel.ts 单文件 interface+impl 模式)──────────────────────────
@@ -321,6 +329,11 @@ export class InMemoryPersistBackend implements PersistBackend {
   private readonly chatOrderRevisions = new Map<string, Revision>()
   /** additive(PG 落地后接口新增):内存 backend 立即就绪。 */
   readonly ready: Promise<void> = Promise.resolve()
+
+  /** P0.3 readiness probe:内存 backend 无外部依赖,恒 ok。 */
+  async ping(): Promise<{ ok: true } | { ok: false; reason: string }> {
+    return { ok: true }
+  }
 
   private bucket(ownerId: string): Map<string, PersistRecord> {
     let b = this.byOwner.get(ownerId)

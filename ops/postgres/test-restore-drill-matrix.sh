@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+# ops/postgres/test-restore-drill-matrix.sh — R2-2 对抗矩阵单测(无 docker/PG)。
+# source asset-verify.sh,测 manifest 解析状态 + ALLOW_EMPTY 矩阵 + dump-consistent 行计数。
+# 覆盖验收矩阵:allow0/allow1 × 全缺/部分缺/全在 × manifest valid/malformed/no-jq + count_copy_rows 纯函数。
+# 成功标准:全 PASS,FAIL=0;该 fail 却 exit 0 / 该 ok 却 exit 1 → 非 0 退出。
+# 跑法:bash ops/postgres/test-restore-drill-matrix.sh
+set -euo pipefail
+dir="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC1091  # 动态路径;已显式 source
+. "$dir/asset-verify.sh"
+
+PASS=0; FAIL=0
+ok() { echo "PASS: $1"; PASS=$((PASS+1)); }
+bad() { echo "FAIL: $1"; FAIL=$((FAIL+1)); }
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+# 断言 helper:实际 == 期望 → ok,否则 bad。
+expect() { local desc="$1" actual="$2" expected="$3"; if [ "$actual" = "$expected" ]; then ok "$desc (=$actual)"; else bad "$desc: 期望=$expected 实际=$actual"; fi; }
+
+echo "=== R2-2 decide_core_missing 矩阵(allow0/1 × missing 0/1/2/3 × preSchema) ==="
+
+# 全在(0 缺失):无论 allow/preSchema → pass
+expect "missing=0 allow=0 → pass" "$(decide_core_missing 0 0 '')" pass
+expect "missing=0 allow=1 preSchema=true → pass" "$(decide_core_missing 0 1 true)" pass
+expect "missing=0 allow=0 preSchema=true → pass" "$(decide_core_missing 0 0 true)" pass
+
+# allow=0(生产禁用 ALLOW_EMPTY):任何缺失 → fail
+expect "missing=1 allow=0 → fail" "$(decide_core_missing 1 0 '')" fail
+expect "missing=2 allow=0 → fail" "$(decide_core_missing 2 0 '')" fail
+expect "missing=3 allow=0 preSchema=true → fail(allow=0 不放行,生产禁用)" "$(decide_core_missing 3 0 true)" fail
+
+# allow=1:只许三核心表全缺(3)+ manifest 明示 pre-schema(true);否则 fail
+expect "missing=3 allow=1 preSchema=true → warn(legit pre-schema)" "$(decide_core_missing 3 1 true)" warn
+expect "missing=3 allow=1 preSchema='' → fail(全缺但未声明 pre-schema)" "$(decide_core_missing 3 1 '')" fail
+expect "missing=3 allow=1 preSchema=false → fail(preSchema=false 非真)" "$(decide_core_missing 3 1 false)" fail
+expect "missing=1 allow=1 preSchema=true → fail(部分缺,即使声明 pre-schema也不放行)" "$(decide_core_missing 1 1 true)" fail
+expect "missing=2 allow=1 preSchema=true → fail(部分缺)" "$(decide_core_missing 2 1 true)" fail
+
+echo "=== R2-2 decide_drill_outcome(manifest 解析失败 → hard fail,即使核心表全在;P03-R3-1) ==="
+
+# decide_drill_outcome <err> <err_manifest> <core_outcome> → pass/fail
+# R2-2 / P03-R3-1 不变量:manifest 解析失败(err_manifest=1: no-jq/malformed)→ hard fail,
+#   即使三核心表全在(core=pass)——旧实现 ERR_MANIFEST=1 被 :169 清零 → 误判 pass(假绿)。
+# valid manifest + 全表全在 → pass
+expect "valid manifest + 全表全在 → pass" "$(decide_drill_outcome 0 0 pass)" pass
+# valid manifest + 全核心表全缺 + manifest 明示 pre-schema(warn)→ pass
+expect "valid manifest + 全缺+preSchema → pass(warn)" "$(decide_drill_outcome 0 0 warn)" pass
+# R2-2 / P03-R3-1 核心:malformed manifest + 全表全在 → fail(解析失败 hard fail,不假绿)
+expect "malformed manifest + 全表全在 → fail(hard fail,不假绿)" "$(decide_drill_outcome 0 1 pass)" fail
+# no-jq + manifest present + 全表全在 → fail
+expect "no-jq + manifest present + 全表全在 → fail(hard fail)" "$(decide_drill_outcome 0 1 pass)" fail
+# absent manifest + 全表全在 → pass(不与解析失败混淆)
+expect "absent manifest + 全表全在 → pass(不与解析失败混淆)" "$(decide_drill_outcome 0 0 pass)" pass
+# valid manifest + 部分缺 → fail
+expect "valid manifest + 部分缺 → fail" "$(decide_drill_outcome 0 0 fail)" fail
+# asset/其它 err + valid manifest + 全表 → fail
+expect "asset err + valid manifest + 全表 → fail" "$(decide_drill_outcome 1 0 pass)" fail
+# malformed + 部分缺 → fail(双重)
+expect "malformed + 部分缺 → fail(双重)" "$(decide_drill_outcome 0 1 fail)" fail
+
+echo "=== R2-2 manifest_parse_status(absent / present / malformed / no-jq) ==="
+
+# absent:无文件
+absent_manifest="$WORK/absent.manifest.json"
+expect "absent manifest → absent" "$(manifest_parse_status "$absent_manifest")" absent
+expect "empty path → absent" "$(manifest_parse_status '')" absent
+
+# present:合法 JSON
+present_manifest="$WORK/present.manifest.json"
+printf '{"preSchema":true,"tables":{"persist_records":5,"projects":1,"canvases":2},"assetBlobCount":3}' > "$present_manifest"
+expect "valid JSON manifest → present" "$(manifest_parse_status "$present_manifest")" present
+
+# malformed:坏 JSON
+malformed_manifest="$WORK/malformed.manifest.json"
+printf '{this is not json,,,missing quotes}' > "$malformed_manifest"
+expect "malformed JSON → malformed(hard fail 信号)" "$(manifest_parse_status "$malformed_manifest")" malformed
+
+# manifest_field 在 present 时返字段值;malformed 时返 -1(跳过——但 restore-drill 已据 malformed hard fail)
+expect "present manifest .preSchema → true" "$(manifest_field "$present_manifest" '.preSchema')" true
+expect "present manifest .tables.persist_records → 5" "$(manifest_field "$present_manifest" '.tables.persist_records')" 5
+expect "present manifest 缺字段 → -1" "$(manifest_field "$present_manifest" '.nonexistent')" -1
+expect "absent manifest field → -1" "$(manifest_field "$absent_manifest" '.preSchema')" -1
+
+# no-jq:PATH 屏蔽 jq → manifest 存在但无法解析 → no-jq(hard fail 信号,不假绿跳过)
+if command -v jq >/dev/null 2>&1; then
+  # 用一个不含 jq 的 PATH 跑 manifest_parse_status,模拟无 jq 环境。
+  no_jq_dir="$(mktemp -d)"
+  expect "no-jq 环境 + present manifest → no-jq(hard fail)" "$(PATH="$no_jq_dir" manifest_parse_status "$present_manifest")" no-jq
+  expect "no-jq 环境 + malformed manifest → no-jq(无法判定,hard fail)" "$(PATH="$no_jq_dir" manifest_parse_status "$malformed_manifest")" no-jq
+  rm -rf "$no_jq_dir"
+else
+  ok "jq 不在本机,manifest_parse_status 无-jq 路径已由 absent/malformed 覆盖(跳过 no-jq 专项)"
+fi
+
+echo "=== R2-2 count_copy_rows(dump-consistent 行计数纯函数) ==="
+
+# 3 行数据 → 3
+block3='COPY public.persist_records (id, owner_id) FROM stdin;
+r1aaa
+r2bbb
+r3ccc
+\.'
+expect "COPY 块 3 行 → 3" "$(printf '%s\n' "$block3" | count_copy_rows)" 3
+
+# 空 COPY(表存在 0 行)→ 0
+block0='COPY public.projects (id) FROM stdin;
+\.'
+expect "COPY 块 0 行 → 0" "$(printf '%s\n' "$block0" | count_copy_rows)" 0
+
+# 无 COPY 块(表在 dump TOC 缺)→ 0
+expect "无 COPY 块 → 0" "$(printf 'no copy block here\njust noise\n' | count_copy_rows)" 0
+
+# 多个 COPY 块(不该发生在 --table 单表提取,但 awk 容错:只计 COPY 与 \. 间)→ 计所有块
+block2x='COPY public.t1 (id) FROM stdin;
+a
+\.
+COPY public.t2 (id) FROM stdin;
+b
+c
+\.'
+expect "两 COPY 块共 3 行 → 3" "$(printf '%s\n' "$block2x" | count_copy_rows)" 3
+
+# 数据行含 `\.` 子串(非结束符,只有单独一行 ^\. 才结束)→ 不误判结束
+block_tricky='COPY public.t (id) FROM stdin;
+has\.dot
+second
+\.'
+expect "数据含\\. 子串不误结束 → 2" "$(printf '%s\n' "$block_tricky" | count_copy_rows)" 2
+
+echo "=== R2-6/F8 latest_dump 无 dump dry-run(fail-visible 回归;P03-R3-3) ==="
+
+# 空临时目录(存在但无 .dump)→ --dry-run 必须 FAIL visibly(rc=1 + 两条诊断)。
+# 旧实现 latest_dump 无 `|| true`:ls 无匹配非零,在 `set -euo pipefail` 下经命令替换
+# 直接杀脚本(:85 abort),:90-93 的 "FAIL: no .dump" 分支永不执行 → rc=1 但缺诊断(静默退,非 fail-visible)。
+# 当前 `|| true` 实现:空结果正常化为空串,走到 :90 显式 FAIL 分支 → rc=1 + 诊断齐全。
+# 本 case 真跑整脚本子进程(无 docker/PG:空 dump 在 :90-93 早退,不触 docker)。
+DRILL_EMPTY="$WORK/drill-empty"; mkdir -p "$DRILL_EMPTY"
+DRILL_LOG="$WORK/restore-drill.log"
+DRY_OUT_FILE="$WORK/dry-out.txt"
+set +e
+PG_BACKUP_DIR="$DRILL_EMPTY" PG_DRILL_LOG="$DRILL_LOG" \
+  bash "$dir/restore-drill.sh" --dry-run >"$DRY_OUT_FILE" 2>&1
+DRY_RC=$?
+set -e
+expect "空 dump dir --dry-run rc=1" "$DRY_RC" 1
+DRY_OUT="$(cat "$DRY_OUT_FILE")"
+# 两条 FAIL 诊断必须出现(fail-visible,非静默退)
+if printf '%s\n' "$DRY_OUT" | grep -q "FAIL: no .dump"; then
+  ok "dry-run 输出含 'FAIL: no .dump'"
+else
+  bad "dry-run 输出缺 'FAIL: no .dump'(实际:$(printf '%s' "$DRY_OUT" | tr '\n' '|'))"
+fi
+if printf '%s\n' "$DRY_OUT" | grep -q "dry-run done: FAIL"; then
+  ok "dry-run 输出含 'dry-run done: FAIL'"
+else
+  bad "dry-run 输出缺 'dry-run done: FAIL'(实际:$(printf '%s' "$DRY_OUT" | tr '\n' '|'))"
+fi
+echo "=== P03-R4-1 manifest wiring 整脚本回归(stub docker/pg_restore → 最终判定;防 ERR_MANIFEST 清零回潮) ==="
+
+# 本段不重测 decide_drill_outcome 纯函数(上方已覆盖),而是真跑整脚本 restore-drill.sh,
+# 覆盖 MANIFEST_STATUS → ERR_MANIFEST → decide_drill_outcome 的状态传播 wiring。
+# stub docker:容器"running" + pg_restore 成功 + psql 返三核心表全在(to_regclass=t)→ ERR=0、CORE=pass;
+# asset 用空 snapshot(无 .bin → verify_asset_snapshot 不调 validate_meta,从而不依赖 jq)→ ASSET_CHECK=ok、ERR=0。
+# malformed / no-jq manifest → ERR_MANIFEST=1 → decide_drill_outcome(0,1,pass)=fail → exit 1 + FAIL 诊断。
+# 关键不变量(本段唯一目的):若在 restore 后回植旧 `ERR_MANIFEST=0` 清零行(P03-R3-1 原假绿 bug),
+#   ERR_MANIFEST 被清零 → decide_drill_outcome(0,0,pass)=pass → exit 0(假绿)→ rc=1 断言失败 → 红测,
+#   阻止同一 P1 fail-open 无声回潮。负例(回植清零行)红测证据见 commit message。
+
+: "${BASH:=bash}"   # 用本机 bash 启动 restore-drill.sh 子进程(注入 PATH 不影响 launcher 查找)
+
+# ── stub bin:docker(响应 inspect / exec 的 psql·pg_restore 子命令;无 docker/PG 依赖走到最终判定)──
+STUB_BIN="$WORK/stub-bin"; mkdir -p "$STUB_BIN"
+cat > "$STUB_BIN/docker" <<'STUB'
+#!/bin/bash
+# docker stub:让 restore-drill.sh 在无 docker/PG 环境走到最终判定(仅 P03-R4-1 wiring 测试用)。
+# - inspect -f '{{.State.Running}}' <c> → "true"(容器存活,grep -q true 通过)
+# - exec [-i] <c> pg_restore ... → exit 0(TOC -l 可读 + --clean restore 成功)
+# - exec [-i] <c> psql -U .. -d .. -t -A -c "SQL" → 按 SQL 返"三核心表全在"固定值(使 ERR=0、CORE=pass)
+if [ "${1:-}" = "inspect" ]; then echo "true"; exit 0; fi
+if [ "${1:-}" = "exec" ]; then
+  shift                          # exec
+  if [ "${1:-}" = "-i" ]; then shift; fi   # 可选 -i(stdin 重定向由内核处理,stub 不必读)
+  shift                          # container
+  case "${1:-}" in
+    pg_restore) exit 0 ;;         # -l(TOC) / --no-owner --clean(restore)均成功
+    psql)
+      shift                       # psql
+      sql=""
+      while [ $# -gt 0 ]; do
+        if [ "$1" = "-c" ]; then sql="$2"; shift 2; else shift; fi
+      done
+      # 按 SQL 内容返固定值,模拟"三核心表全在 + 库可读",使最终判定唯一由 ERR_MANIFEST 决定。
+      case "$sql" in
+        *to_regclass*)           echo "t" ;;   # 表存在(IS NOT NULL → t)
+        *information_schema*)     echo "3" ;;   # public base table 计数
+        *"SELECT 1"*)           echo "1" ;;   # SELECT 1 库可读
+        *"FROM public."*)       echo "5" ;;   # 核心表行数(manifest 非 present,不参与比对)
+        *)                        : ;;          # DROP/CREATE DATABASE / pg_stat_user_tables → 静默 exit 0
+      esac
+      ;;
+  esac
+fi
+exit 0
+STUB
+chmod +x "$STUB_BIN/docker"
+
+# ── 空 asset snapshot(无 .bin → verify_asset_snapshot 不调 validate_meta,不依赖 jq)→ ASSET_CHECK=ok ──
+# 使 malformed/no-jq 两 case 的最终判定唯一由 ERR_MANIFEST 决定(asset 不污染 ERR=0)。
+make_empty_snapshot() {
+  local snap="$1" root; root="$(mktemp -d)"
+  mkdir -p "$root/assets"
+  tar -czf "$snap" -C "$root" assets
+  rm -rf "$root"
+}
+
+DUMP_TS="20260712-050000"
+DUMP_NAME="mivocanvas-$DUMP_TS.dump"
+ASSET_DIR="$WORK/asset-backups"; mkdir -p "$ASSET_DIR"
+make_empty_snapshot "$ASSET_DIR/asset-snap-$DUMP_TS.tar.gz"
+LOG_FILE="$WORK/restore-drill-wiring.log"
+: > "$LOG_FILE"
+
+# ── runner:PATH 注入 stub 跑整脚本,断言 rc=1 + 两条 FAIL 诊断(manifest 解析失败 hard fail 可见)──
+# $1=PATH(注入 stub + 控制 jq 可用性) $2=BACKUP_DIR(含 dump + manifest)
+run_wiring_case() {
+  local wire_path="$1" dump_dir="$2" out_file rc out
+  out_file="$WORK/wiring-out.txt"
+  set +e
+  PATH="$wire_path" PG_BACKUP_DIR="$dump_dir" PG_DRILL_LOG="$LOG_FILE" \
+    ASSET_BACKUP_DIR="$ASSET_DIR" "$BASH" "$dir/restore-drill.sh" >"$out_file" 2>&1
+  rc=$?
+  set -e
+  out="$(cat "$out_file")"
+  expect "wiring rc=1(manifest 解析失败 → hard fail,即使核心表全在)" "$rc" 1
+  if printf '%s\n' "$out" | grep -q "FAIL: manifest"; then
+    ok "wiring 输出含 'FAIL: manifest'(manifest 解析失败诊断)"
+  else
+    bad "wiring 缺 'FAIL: manifest'(实际:$(printf '%s' "$out" | tr '\n' '|'))"
+  fi
+  if printf '%s\n' "$out" | grep -q "restore drill done: FAIL"; then
+    ok "wiring 输出含 'restore drill done: FAIL'(最终判定 fail-visible)"
+  else
+    bad "wiring 缺 'restore drill done: FAIL'(实际:$(printf '%s' "$out" | tr '\n' '|'))"
+  fi
+}
+
+# ── Case A:malformed manifest(jq 在 → manifest_parse_status=malformed → ERR_MANIFEST=1)──
+CASEA_DIR="$WORK/case-malformed"; mkdir -p "$CASEA_DIR"
+: > "$CASEA_DIR/$DUMP_NAME"                                   # dump 内容无关(stub 不读)
+printf '{this is not json,,,missing quotes}' > "$CASEA_DIR/${DUMP_NAME%.dump}.manifest.json"
+run_wiring_case "$STUB_BIN:$PATH" "$CASEA_DIR"
+
+# ── Case B:no-jq manifest(jq 不可用 → manifest_parse_status=no-jq → ERR_MANIFEST=1)──
+# jq 在 /usr/bin;构造"含 essentials 但不含 jq"的 PATH:符号链接 /usr/bin 工具(显式跳过 jq)+ /bin。
+# docker stub shebang 用 #!/bin/bash(绝对路径,免 env 查找 — env 在 /usr/bin 会带 jq)。
+NOJQ_BIN="$WORK/nojq-bin"; mkdir -p "$NOJQ_BIN"
+for c in head tail grep stat tee dirname basename awk mktemp find tar; do
+  src="$(command -v "$c" 2>/dev/null || echo "/usr/bin/$c")"
+  if [ -e "$src" ]; then ln -sf "$src" "$NOJQ_BIN/$c"; fi
+done
+NOJQ_PATH="$STUB_BIN:$NOJQ_BIN:/bin"
+if PATH="$NOJQ_PATH" command -v jq >/dev/null 2>&1; then
+  ok "no-jq: 本机 jq 无法从 PATH 隐藏(可能在 /bin),跳过 no-jq 整脚本用例;wiring 不变量由 Case A(malformed)覆盖"
+else
+  ok "no-jq: 受限 PATH 下 jq 不可用(符合预期)"
+  CASEB_DIR="$WORK/case-nojq"; mkdir -p "$CASEB_DIR"
+  : > "$CASEB_DIR/$DUMP_NAME"
+  printf '{"preSchema":true,"tables":{"persist_records":5},"assetBlobCount":0}' > "$CASEB_DIR/${DUMP_NAME%.dump}.manifest.json"
+  run_wiring_case "$NOJQ_PATH" "$CASEB_DIR"
+fi
+
+echo "----------------"
+echo "PASS=$PASS FAIL=$FAIL"
+[ "$FAIL" -eq 0 ]
