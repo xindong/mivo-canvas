@@ -53,8 +53,10 @@ const orderRevisionByCanvas = new Map<string, Revision>()
 export const getChatOrderRevision = (canvasId: string): Revision | undefined =>
   orderRevisionByCanvas.get(canvasId)
 
-// G1-a R2 F2:user-state hydrate 落点(非只 log)。selection/camera 当前 ephemeral、settings=API keys
+// G1-a R2 F2 / R3 F2-A:user-state hydrate 落点(非只 log)。selection/camera 当前 ephemeral、settings=API keys
 // 受 DP-7 排除——无 client KV store 消费;但 hydrate 把 map 存此,供未来 selection/camera/pref KV 接线消费。
+// R3 F2-A:`canvas:<id>:selection`(DP-1 frozen key)由本模块 hydrateFromServer 真实消费(恢复 active canvas
+// selection 到 store),其余 key 仍存此供未来 pref-KV(G1-c)消费。local 模式永不写入(hydrate 不跑)。
 const userStateMap = new Map<string, UserStateEntry>()
 
 /**
@@ -174,16 +176,48 @@ export const hydrateFromServer = async (
     debugLogger.warn(SOURCE, `listCanvas hydrate failed: ${msg(error)}`)
   }
 
-  // 3. user-state map → 落点(R2 F2:不再 only-log)。selection/camera 当前 ephemeral、settings=API keys
-  //    受 DP-7 排除——无 client KV store 消费;但 hydrate 把 map 存 module 级(getHydratedUserState),
-  //    供未来 selection/camera/pref KV 接线消费(非只 log;消费方属 G1-c/pref-KV defer,此处只存)。
+  // 3. user-state map → 落点 + 真实消费方(R3 F2-A:不再只存 module 级 accessor)。
+  //    selection/camera 当前 ephemeral、settings=API keys 受 DP-7 排除;但 `canvas:<id>:selection`
+  //    是 DP-1 frozen user-state(每画布选中节点 id 列表),hydrate 后真实应用:恢复 active canvas 的
+  //    selection —— 用 selectionFrom 过滤已删/hidden node 防悬空,同时写入 document(切 scene 不丢)+ 顶层
+  //    (active 可见)。这是真实 store 消费方(非只 accessor)。其余 key 仍存 userStateMap 供未来 pref-KV(G1-c)消费。
   try {
     const map = await hydrateUserStateMap(opts)
     userStateMap.clear()
     for (const [k, v] of Object.entries(map)) userStateMap.set(k, v)
+    // R3 F2-A:真实消费方 —— 恢复 active canvas 的 selection(server user-state `canvas:<id>:selection`)。
+    const sceneId = useCanvasStore.getState().sceneId
+    if (sceneId) {
+      const selEntry = userStateMap.get(`canvas:${sceneId}:selection`)
+      if (selEntry && Array.isArray(selEntry.value) && selEntry.value.length > 0) {
+        const doc = useCanvasStore.getState().canvases[sceneId]
+        if (doc && doc.nodes.length > 0) {
+          const { selectionFrom } = await import('../store/canvasDocumentModel')
+          const sel = selectionFrom(selEntry.value as string[], undefined, doc.nodes)
+          if (sel.selectedNodeIds.length > 0) {
+            useCanvasStore.setState((s) => ({
+              selectedNodeId: sel.selectedNodeId,
+              selectedNodeIds: sel.selectedNodeIds,
+              canvases: {
+                ...s.canvases,
+                [sceneId]: {
+                  ...s.canvases[sceneId]!,
+                  selectedNodeId: sel.selectedNodeId,
+                  selectedNodeIds: sel.selectedNodeIds,
+                },
+              },
+            }))
+            debugLogger.log(
+              SOURCE,
+              `server hydrate: restored selection for ${sceneId} from user-state (${sel.selectedNodeIds.length} node(s); real consumer)`,
+            )
+          }
+        }
+      }
+    }
     debugLogger.log(
       SOURCE,
-      `server hydrate: ${userStateMap.size} user-state key(s) from BFF (stored via getHydratedUserState; consumer (selection/camera/pref-KV) deferred)`,
+      `server hydrate: ${userStateMap.size} user-state key(s) from BFF (active-canvas selection applied to store; pref-KV consumer deferred to G1-c)`,
     )
   } catch (error) {
     debugLogger.warn(SOURCE, `hydrateUserStateMap failed: ${msg(error)}`)

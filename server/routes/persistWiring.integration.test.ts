@@ -221,3 +221,47 @@ describe('G1-a P2-1 — user-state If-Match 契约(428/409)真实 route', () => 
     expect(ok.status).toBe(200)
   })
 })
+
+describe('G1-a R3 F2-A — user-state 真实消费方依赖的 server 端 round-trip(canvas:<id>:selection)', () => {
+  // 客户端 hydrateFromServer 现真实消费 `canvas:<id>:selection`(DP-1 frozen key,恢复 active canvas
+  // selection 到 store;R3 F2-A)。本测试刻画服务端 round-trip:PUT string-array value → GET list/单 key
+  // 返该 value(hydrate 读此形状)。证客户端消费方读到的服务端真值,且跨 owner 隔离。
+  it('PUT /api/user-state/canvas:c1:selection {value:string[]} → GET 返该 value(rev 0 create)', async () => {
+    const { app } = buildPersistApp()
+    const put = await req(app, '/api/user-state/canvas:c1:selection', {
+      method: 'PUT',
+      headers: { ...hdr(KEY_A), 'content-type': 'application/json' },
+      body: JSON.stringify({ value: ['n1', 'n2'] }),
+    })
+    expect(put.status).toBe(200)
+    expect((put.body as { revision: number }).revision).toBe(0)
+    // GET list → hydrateUserStateMap 读的同一形状
+    const list = await req(app, '/api/user-state', { method: 'GET', headers: hdr(KEY_A) })
+    expect(list.status).toBe(200)
+    const entries = (list.body as { entries: Record<string, { value: unknown; revision: number }> }).entries
+    expect(entries['canvas:c1:selection']).toBeDefined()
+    expect(entries['canvas:c1:selection'].value).toEqual(['n1', 'n2'])
+    // 单 key GET 亦返
+    const single = await req(app, '/api/user-state/canvas:c1:selection', { method: 'GET', headers: hdr(KEY_A) })
+    expect(single.status).toBe(200)
+    expect((single.body as { value: unknown }).value).toEqual(['n1', 'n2'])
+  })
+
+  it('canvas:<id>:selection 跨 owner 隔离(KEY_A 的 selection 不被 KEY_B 见)', async () => {
+    const { app } = buildPersistApp()
+    await req(app, '/api/user-state/canvas:c1:selection', {
+      method: 'PUT',
+      headers: { ...hdr(KEY_A), 'content-type': 'application/json' },
+      body: JSON.stringify({ value: ['n-a'] }),
+    })
+    await req(app, '/api/user-state/canvas:c1:selection', {
+      method: 'PUT',
+      headers: { ...hdr(KEY_B), 'content-type': 'application/json' },
+      body: JSON.stringify({ value: ['n-b'] }),
+    })
+    const listA = await req(app, '/api/user-state', { method: 'GET', headers: hdr(KEY_A) })
+    expect((listA.body as { entries: Record<string, { value: unknown }> }).entries['canvas:c1:selection'].value).toEqual(['n-a'])
+    const listB = await req(app, '/api/user-state', { method: 'GET', headers: hdr(KEY_B) })
+    expect((listB.body as { entries: Record<string, { value: unknown }> }).entries['canvas:c1:selection'].value).toEqual(['n-b'])
+  })
+})

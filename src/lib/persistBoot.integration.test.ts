@@ -453,3 +453,77 @@ describe('G1-a R2 F2 — user-state hydrate 落点(不 only-log)', () => {
     expect(getHydratedUserState('absent-key')).toBeUndefined()
   })
 })
+
+// ── G1-a R3 F2-A:user-state 真实消费方 ──────────────────────────────────────────
+// R3 verdict:R2 只把 hydrate 存进 module 级 Map + getHydratedUserState accessor,全仓搜索 accessor 仅测试
+// 用;生产 selection/camera/preferences 不读它("only cache")。修:hydrate 后真实应用 `canvas:<id>:selection`
+// (DP-1 frozen user-state,每画布选中节点 id 列表)—— 恢复 active canvas 的 selection 到 store。用
+// selectionFrom 过滤已删/hidden node 防悬空;同时写入 document(切 scene 不丢)。这是真实 store 消费方。
+describe('G1-a R3 F2-A — user-state 真实消费方:canvas selection 恢复到 store', () => {
+  const node = (id: string) => ({ id, type: 'text', title: id, x: 0, y: 0, width: 100, height: 40, text: 'hi' }) as never
+  const docWith = (ids: string[], selIds: string[] = []) =>
+    ({ title: 'c1', projectId: 'p1', createdAt: 't', updatedAt: 't', nodes: ids.map(node), edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: selIds }) as never
+
+  const makeOpts = (entries: Record<string, unknown>): { fetch: typeof fetch; baseUrl: string; getAuthHeaders: () => Record<string, string> } => ({
+    fetch: async () =>
+      new Response(JSON.stringify({ entries }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    baseUrl: '',
+    getAuthHeaders: () => authHeaders(),
+  })
+
+  it('hydrate canvas:<id>:selection → active canvas selection 恢复(节点存在;selectionFrom 过滤)', async () => {
+    useCanvasStore.setState({
+      sceneId: 'c1',
+      canvases: { c1: docWith(['n1', 'n2']) },
+      selectedNodeId: undefined,
+      selectedNodeIds: [],
+    })
+    const fakeAdapter = {
+      listProjects: async () => ({ projects: [] }),
+      listCanvas: async () => ({ canvases: [canvasMeta('c1', 'p1', 'c1', 0)] }),
+      listChatMessages: async () => ({ messages: [], orderRevision: 0 }),
+    } as unknown as ServerPersistAdapter
+    const fakeOpts = makeOpts({ 'canvas:c1:selection': { key: 'canvas:c1:selection', value: ['n1', 'n2'], revision: 1, updatedAt: 't' } })
+    await hydrateFromServer(fakeAdapter, fakeOpts)
+    // R3 F2-A:selection 从服务端 user-state 恢复到 store(真实消费方,非只 accessor)
+    expect(useCanvasStore.getState().selectedNodeIds).toEqual(['n1', 'n2'])
+    expect(useCanvasStore.getState().selectedNodeId).toBe('n1') // primary = first
+    // 写入 document(切 scene 不丢)
+    expect(useCanvasStore.getState().canvases['c1']!.selectedNodeIds).toEqual(['n1', 'n2'])
+  })
+
+  it('selection 含已删 node → 过滤后只保留存在的(防悬空 selection)', async () => {
+    useCanvasStore.setState({
+      sceneId: 'c1',
+      canvases: { c1: docWith(['n1']) }, // 本地只有 n1
+      selectedNodeId: undefined,
+      selectedNodeIds: [],
+    })
+    const fakeAdapter = {
+      listProjects: async () => ({ projects: [] }),
+      listCanvas: async () => ({ canvases: [canvasMeta('c1', 'p1', 'c1', 0)] }),
+      listChatMessages: async () => ({ messages: [], orderRevision: 0 }),
+    } as unknown as ServerPersistAdapter
+    // 服务端 selection 含 n-gone(本地已删)→ selectionFrom 过滤
+    const fakeOpts = makeOpts({ 'canvas:c1:selection': { key: 'canvas:c1:selection', value: ['n1', 'n-gone'], revision: 1, updatedAt: 't' } })
+    await hydrateFromServer(fakeAdapter, fakeOpts)
+    expect(useCanvasStore.getState().selectedNodeIds).toEqual(['n1']) // n-gone 过滤掉
+  })
+
+  it('无 canvas:<id>:selection 条目 → selection 不变(本地读源保留)', async () => {
+    useCanvasStore.setState({
+      sceneId: 'c1',
+      canvases: { c1: docWith(['n1']) },
+      selectedNodeId: 'n1',
+      selectedNodeIds: ['n1'],
+    })
+    const fakeAdapter = {
+      listProjects: async () => ({ projects: [] }),
+      listCanvas: async () => ({ canvases: [canvasMeta('c1', 'p1', 'c1', 0)] }),
+      listChatMessages: async () => ({ messages: [], orderRevision: 0 }),
+    } as unknown as ServerPersistAdapter
+    const fakeOpts = makeOpts({}) // 无 selection 条目
+    await hydrateFromServer(fakeAdapter, fakeOpts)
+    expect(useCanvasStore.getState().selectedNodeIds).toEqual(['n1']) // 不变
+  })
+})
