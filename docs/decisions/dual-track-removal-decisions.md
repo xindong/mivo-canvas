@@ -686,7 +686,7 @@ pg-suite 翻 required（2026-07-12，今天）。cutover 未执行。
    | 字段 | 值 | 核验依据 |
    |---|---|---|
    | `schemaVersion` | event schema 版本（当前 `1`） | guard 按版本校验字段齐全 |
-   | `cutoverPrNumber` | 把 `pgConfig.ts:40` 默认 `memory`→`pg` 的 cutover PR 号（S7 不可逆点 = 该 PR 合并日） | `gh api repos/xindong/mivo-canvas/pulls/<n>` → `.merged==true`（PR 号可人工填但真伪由 API 判；**不命名 `cSwitchPrNumber`——persist 无 C-switch**） |
+   | `cutoverPrNumber` | 把 `pgConfig.ts:40` 默认 `memory`→`pg` 的 cutover PR 号（S7 不可逆点 = 该 PR 合并日） | `gh api repos/xindong/mivo-canvas/pulls/<n>` → `.merged==true` **且** `pulls/<n>/files` 中 `server/persist/pgConfig.ts` 的 patch 方向确为 memory→pg 翻转（r6 修 D4-R6-2：只验 merged 则任意无关 merged PR 可冒充 S7——PR #216 `.merged=true` 但标题是 D3 refactor、`pulls/216/files` 不含 pgConfig.ts；只"文件出现"也不够，须钉住 `=== 'pg' ? 'pg' : 'memory'` → `=== 'memory' ? 'memory' : 'pg'` 的语义翻转，pg→memory 反向 / 只改注释 必红）；PR 号可人工填但 merged + 翻转事实由 API 判，**不命名 `cSwitchPrNumber`——persist 无 C-switch** |
    | `drillReportPath` | backup+restore drill 报告仓库内相对路径（独立 closeout PR 已落 main） | `gh api repos/.../contents/<path>` 存在 + 报告符下 schema |
 
    > **event 不含 `cSwitchHeadSha` / `cSwitchMergedAt` / `cSwitchPrNumber`**：这些是 kernel C-switch 专用字段；persist 的 S7/cutover 身份由 `cutoverPrNumber` 经 GitHub API 派生 `.merged_at`（= S7），merge SHA / 合并时间**全由 guard 经 API 读，不入 event**（同 kernel R3-1 原则，防预填可伪造事实）。
@@ -735,7 +735,7 @@ pg-suite 翻 required（2026-07-12，今天）。cutover 未执行。
 
    D PR 的 `scripts/ci/structure-guard.mjs` 加 persist 段机械检查（每条对应一外部事实，所有 post-merge 事实从 GitHub API 派生，不信 event 内填的 SHA/日期/计数）：
 
-   1. `gh api repos/xindong/mivo-canvas/pulls/<cutoverPrNumber>` → `.merged==true`（**伪造 PR 号 / 未合并必红**）；从同一响应读 `.merged_at` = S7 不可逆点（**不与 event 内字段比对——event 不存日期**）；
+   1. cutover 身份核验（r6 修 D4-R6-2：不只验 merged，否则任意足够老的无关 merged PR 可伪造 S7 起点提前满足 30 天窗口）：`gh api repos/xindong/mivo-canvas/pulls/<cutoverPrNumber>` → `.merged==true`（**伪造 PR 号 404 / 未合并 .merged=false 必红**）；**且**机械核验该 PR 的 patch 对 `server/persist/pgConfig.ts` 的默认翻转——`gh api repos/xindong/mivo-canvas/pulls/<cutoverPrNumber>/files --jq '.[]|select(.filename=="server/persist/pgConfig.ts")|.patch'` 须含 `-` 行 `=== 'pg' ? 'pg' : 'memory'`（旧 memory 默认删）与 `+` 行 `=== 'memory' ? 'memory' : 'pg'`（新 pg 默认加），钉住 `pgConfig.ts:40` 默认确为 memory→pg（**#216 这类无关 merged PR 不含 pgConfig.ts → 空 patch 必红；只改注释 → 无 ternary 匹配必红；pg→memory 反向 → 方向反必红**）；从同一 pulls 响应读 `.merged_at` = S7 不可逆点（**不与 event 内字段比对——event 不存日期**）；
    2. 从上步 `.merged_at` 算距 D PR 开工日 ≥ 30 天（**伪造日期必红——日期来自 API 非人工填**）；
    3. `gh api repos/xindong/mivo-canvas/contents/<drillReportPath>` 存在 + 内容符上 JSON schema（顶层与 `checks` 双 exact-key / `schemaVersion==1` / `roundtripVerdict=="pass"` / `executedAt` 为可解析 RFC3339 / `executor` 字符串 / 四项 `checks` 全 `type=="boolean" and .==true`，r6 修 D4-R6-3 防 truthy 假绿）（**缺报告 / 不符 schema / 类型错 / 额外或缺字段 / 非法时间 必红**）；报告由独立 closeout PR 落 main，D PR 改不动它；
    4. drill `executedAt` ≥ cutover `merged_at` 且 ≤ D PR 开工日（**窗口外 drill 必红——drill 须在 S7 后观察窗内执行**）。
