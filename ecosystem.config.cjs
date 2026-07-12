@@ -11,9 +11,10 @@
 // .cjs 显式 CommonJS,pm2 稳定加载。
 //
 // ⚠️ 密码不入库:MIVO_PG_PASSWORD 不写在此处(本文件入 git)。服务器侧由 deploy.sh
-// 从 ops/postgres/.env 读取后 export 进环境,再 `pm2 start/restart`(deploy.sh 仅在服务器,
-// 不入仓库,见 CLAUDE.md 部署规则)。ecosystem 的 env 块只放非密 env;缺 MIVO_PG_PASSWORD
-// 时 BFF 启动 fail visibly(resolvePersistBackendConfig 抛错,不静默降级 memory)。
+// 从 ops/postgres/.env 读取后 export 进环境,再 `pm2 startOrRestart ecosystem.config.cjs --update-env`
+// (与上方 :4 同一命令;deploy.sh 仅在服务器,不入仓库,见 CLAUDE.md 部署规则)。ecosystem
+// 的 env 块只放非密 env;缺 MIVO_PG_PASSWORD 时 BFF 启动 fail visibly
+// (resolvePersistBackendConfig 抛错,不静默降级 memory)。
 //
 // 关联文档:docs/runbook/p0.3-runtime-hardening.md(pm2 看护 / /readyz / 连接预算 /
 // asset dir 固定 / restore 含 asset)。
@@ -45,7 +46,8 @@ module.exports = {
       // min_uptime:进程起后活不到该时长 → 视为异常退出,计入重启计数。
       min_uptime: '15s',
       // max_restarts:在 `restart_delay × max_restarts` 时间窗内重启超该数 → pm2 停止
-      // 重启(标 errored),避免无限 crash-loop。人工 `pm2 restart` 可解除。
+      // 重启(标 errored),避免无限 crash-loop。人工 `pm2 startOrRestart ecosystem.config.cjs
+      // --update-env` 可解除(同部署命令,重启时一并重载 ecosystem env,禁裸 `pm2 restart`)。
       max_restarts: 10,
       // 两次重启间的固定退避(非 crash-loop 的常规重启用此固定值)。
       restart_delay: 3000,
