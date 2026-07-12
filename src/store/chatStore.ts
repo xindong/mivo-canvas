@@ -168,6 +168,14 @@ const errorTextForChat = (
 // sanitizeMessagesByScene 已抽到 ./chatStoreMigrate.ts（保持本文件在 structure-guard
 // 900 行阈值内，同 #76 把 migratePersistedState 搬到 canvasGenerationHydration.ts 的先例）。
 
+// SC-15 R2: hydrate() writes merge's settled state via the *vanilla* set
+// (middleware.mjs:421), not the wrapped one, and only calls setItem on a version
+// *migrate* (line 422-424). With v2==v2 (no migrate) setItem never fires → settled
+// state lives only in memory while IDB keeps the generating blob. This counter gates
+// ONE controlled writeback in onRehydrateStorage (0 when durable already settled →
+// no rewrite on reload-2+).
+let pendingChatHydrationSettleCount = 0
+
 export const useChatStore = create<ChatState>()(
   persist(
     (set, get) => ({
@@ -882,6 +890,8 @@ export const useChatStore = create<ChatState>()(
         if (result.settledMessages > 0) {
           debugLogger.warn('Chat Store', `Hydration settled ${result.settledMessages} expired chat generation message(s)`)
         }
+        // SC-15 R2: record settle count for onRehydrateStorage's gated writeback.
+        pendingChatHydrationSettleCount = result.settledMessages
         // FIX-A: zustand v5 persisted version == options version (v2==v2) 时 migrate
         // 不走，只走 merge。86ce7d4 之前写入的脏 degradedReason string 仍会经 merge 进
         // runtime/UI。在 merge 必经路径对每条 message 跑 sanitizeEnhanceDegradedReason
@@ -894,6 +904,15 @@ export const useChatStore = create<ChatState>()(
           ...merged,
           messagesByScene: sanitizedMessages,
         }
+      },
+      // SC-15 R2: gated writeback — see pendingChatHydrationSettleCount above. The
+      // wrapped api.setState (middleware.mjs:366-369) triggers setItem → writes the
+      // settled messagesByScene durably. skipHydration=true → only fires on rehydrate.
+      onRehydrateStorage: () => () => {
+        const settled = pendingChatHydrationSettleCount
+        pendingChatHydrationSettleCount = 0
+        if (settled <= 0) return
+        useChatStore.setState((s) => ({ messagesByScene: { ...s.messagesByScene } }))
       },
     },
   ),

@@ -22,9 +22,38 @@
 // DP-7 合规:raw mivo key 永不作为 user-state 数据落库(DP-7);fallback 路径只用其指纹作 owner
 // 分片键(keys.ts 注释明示"per-user partition/routing key,never stored")。T1.4 生产路径 actor=username,
 // 指纹仅 dev/legacy fallback。两把 key 原文仍在前端 strictIdbStateStorage(DP-7 专用语义边界)。
+//
+// ── G2.1 严格 SSO(cutover 计划 §5;2026-07-12)──────────────────────────────────
+// 痛点:legacy resolveActor 在 SSO 信任失败时**静默回退 mivo-key 指纹**——生产仅 warning。
+// 若 MIVO_PLATFORM_KEY 是共享/缺失,多用户解析到同一指纹 → 同一 actor → 跨用户数据互访(共享分片)。
+// 严格模式开关 `MIVO_SSO_STRICT=1`(默认关,生产零变化);切换日翻开。
+//
+// 开关语义:
+// - `MIVO_SSO_STRICT=1`(默认关):严格模式。缺/错 secret·header → **401,不回退指纹**。
+//   SSO header `x-mivo-auth-user` 仅网关注入;client 不得携带——服务端靠网关共享密钥
+//   `x-mivo-gateway-secret` 证明网关注入(无密钥/不匹配 → 401,即"拒绝 client 侧同名 header")。
+//   严格模式下 resolveActor **无任何指纹回退路径**(见下方 strict 分支:仅返回 SSO user / dev actor /
+//   抛 SsoAuthError;fingerprintOfPlatformKey 仅在 legacy 分支出现)。
+// - `MIVO_DEV_MODE=1`(显式 dev mode;**三重保险**:MIVO_DEV_MODE opt-in + MIVO_PUBLIC=1 恒 false
+//   + NODE_ENV 正向枚举仅 development/test 放行,F2 返修):严格模式下的本地开发通道。
+//   信任 `x-mivo-auth-user` 而无需网关密钥(本地无网关);缺失则用稳定 dev actor。**不是靠 fallback**——
+//   是显式 env 开关,生产/public/staging/空 NODE_ENV 下 isDevMode 恒 false(防误开 → 走严格生产路径 → 401,绝不冒充)。
+// - 默认关(MIVO_SSO_STRICT 未设):legacy 行为完全不变(isSsoHeaderTrusted + ssoHeaderSecretOk → SSO user;
+//   否则指纹 fallback)。现有测试零红。
+//
+// 持久化路由(projects/canvas/userState/assets/tasks/members/shareLinks)在严格模式下全部走 SSO actor:
+// - projects/canvas/userState/members/shareLinks 直接调 resolveActor(c) → strict 分支自动生效。
+// - tasks/assets 历史上绕过 resolveActor 直接用指纹;G2.1 改走 resolveTaskOwner/resolveAssetOwner
+//   (mode-aware:strict 走 resolveActor,non-strict 保持原 raw-key/指纹 行为零变化)。
+// 401 由 ssoAuthBoundary 中间件捕获 SsoAuthError 统一返回(app.ts + persistTestApp 挂载)。
 
-import type { Context } from 'hono'
+import type { Context, ErrorHandler, MiddlewareHandler } from 'hono'
+import { createHash, timingSafeEqual } from 'node:crypto'
 import { fingerprintOfPlatformKey, resolvePlatformCtx } from './keys'
+import type { PersistBackend } from '../persist/backend'
+import type { PermissionBackend } from './permissions'
+import { createAssetStore, createFsAssetBackend, resolveAssetStoreDir, type AssetStore } from './assetStore'
+import type { AppEnv } from './types'
 
 /**
  * 网关注入的可信身份 header(DP-4 §4)。值 = SSO `username`(maker user id)。
@@ -43,25 +72,77 @@ import { fingerprintOfPlatformKey, resolvePlatformCtx } from './keys'
 export const SSO_TRUSTED_USER_HEADER = 'x-mivo-auth-user'
 export const GATEWAY_SECRET_HEADER = 'x-mivo-gateway-secret'
 
-/** x-mivo-auth-user 是否可信(opt-in,默认关防伪造)。 */
+/** 严格 SSO 模式开关(cutover §5 G2.1;默认关,生产零变化)。 */
+export const isSsoStrict = (env: NodeJS.ProcessEnv = process.env): boolean =>
+  env.MIVO_SSO_STRICT === '1'
+
+/**
+ * 显式 dev mode(G2.1)。**三重保险**(返修 F2:mirror auth-stub.ts:21-25 + NODE_ENV 正向枚举):
+ *  1. `MIVO_DEV_MODE !== '1'` → false(显式 opt-in,默认关);
+ *  2. `MIVO_PUBLIC === '1'` → false(public/生产部署恒关,身份只由网关提供——堵 F2 复现洞:
+ *     原 `NODE_ENV !== 'production'` 负向判定让 staging/空值+dev+public 绕过,任意 x-mivo-auth-user 冒充);
+ *  3. `NODE_ENV` 正向枚举:**仅** `development` / `test` 放行,staging/production/空值/其他一律 false
+ *     (负向 `!== 'production'` 把 staging 当 dev → 不安全;正向枚举才严)。
+ * 生产下恒 false(防误开 → 严格生产路径 → 401,绝不冒充)。dev mode 是显式 env 开关,不是 fallback。
+ */
+export const isDevMode = (env: NodeJS.ProcessEnv = process.env): boolean => {
+  if (env.MIVO_DEV_MODE !== '1') return false // ① opt-in(默认关)
+  if (env.MIVO_PUBLIC === '1') return false // ② public/生产部署恒关(mirror auth-stub.ts:24)
+  const nodeEnv = env.NODE_ENV
+  if (nodeEnv !== 'development' && nodeEnv !== 'test') return false // ③ 正向枚举(仅 dev/test)
+  return true
+}
+
+/** dev mode 下无 `x-mivo-auth-user` header 时使用的稳定 actor(本地 dev parity)。 */
+export const DEV_ACTOR_ID = 'mivo-dev-actor'
+
+/**
+ * 严格模式下 SSO 鉴权失败(缺/错 secret·header)时抛出;由 ssoAuthBoundary 中间件捕获 → 401。
+ * legacy(non-strict)模式下 resolveActor 永不抛此错(回退指纹)。
+ */
+export class SsoAuthError extends Error {
+  readonly reason: string
+  constructor(reason: string) {
+    super(`SSO auth required: ${reason}`)
+    this.name = 'SsoAuthError'
+    this.reason = reason
+  }
+}
+
+/** x-mivo-auth-user 是否可信(opt-in,默认关防伪造;legacy 路径用)。 */
 export const isSsoHeaderTrusted = (env: NodeJS.ProcessEnv = process.env): boolean =>
   env.MIVO_TRUST_SSO_HEADER === '1'
 
 /**
  * 启动时校验 SSO 身份配置(Greptile security 第二轮 finding 2:防静默回退共享指纹)。
- * 生产(NODE_ENV=production)下:SSO 开但缺网关密钥 → 警告(可伪造);SSO 未开 → 警告
- * (persist 走指纹,若 MIVO_PLATFORM_KEY 共享则多用户同 actor,不安全)。仅警告不硬失败
+ * 生产边界(NODE_ENV=production **或** MIVO_PUBLIC=1,F2 返修:public 即生产边界,不能只看
+ * NODE_ENV——否则 MIVO_PUBLIC=1 + dev flag 的 misconfig 静默)下:SSO 开但缺网关密钥 → 警告(可伪造);
+ * SSO 未开 → 警告(persist 走指纹,若 MIVO_PLATFORM_KEY 共享则多用户同 actor,不安全)。仅警告不硬失败
  * (保单用户/合法指纹模式部署可用);ops 据警告修正。返回告警列表(供 index.ts 启动日志)。
+ *
+ * G2.1:增严格模式告警——生产边界下 MIVO_SSO_STRICT=1 但缺 MIVO_GATEWAY_SECRET → 所有持久化
+ * 请求 401(运行时 fail-closed);MIVO_DEV_MODE=1 在生产边界 → 告警(isDevMode 已恒 false,但仍提示 ops 误配)。
  */
 export const validateSsoConfig = (env: NodeJS.ProcessEnv = process.env): string[] => {
   const warnings: string[] = []
-  if (env.NODE_ENV !== 'production') return warnings
+  // F2 返修:MIVO_PUBLIC=1 同样是生产边界(public 部署身份只由网关提供),不能只凭 NODE_ENV 判定。
+  const isProdBoundary = env.NODE_ENV === 'production' || env.MIVO_PUBLIC === '1'
+  if (!isProdBoundary) return warnings
+  if (env.MIVO_DEV_MODE === '1') {
+    warnings.push('MIVO_DEV_MODE=1 at production boundary (NODE_ENV=production or MIVO_PUBLIC=1): dev mode is force-disabled (isDevMode=false under MIVO_PUBLIC=1 / non-dev-test NODE_ENV); remove this flag to avoid confusion. Strict path will 401 on missing gateway proof.')
+  }
+  if (isSsoStrict(env)) {
+    if (!env.MIVO_GATEWAY_SECRET) {
+      warnings.push('MIVO_SSO_STRICT=1 but MIVO_GATEWAY_SECRET unset: every persistence request will 401 (fail-closed). Set MIVO_GATEWAY_SECRET + have the gateway inject x-mivo-gateway-secret.')
+    }
+    return warnings
+  }
   if (isSsoHeaderTrusted(env)) {
     if (!env.MIVO_GATEWAY_SECRET) {
       warnings.push('MIVO_TRUST_SSO_HEADER=1 but MIVO_GATEWAY_SECRET unset: x-mivo-auth-user is forgeable (no gateway proof). Set MIVO_GATEWAY_SECRET + have the gateway inject x-mivo-gateway-secret.')
     }
   } else {
-    warnings.push('MIVO_TRUST_SSO_HEADER!=1 in production: /api/{projects,canvas,user-state} resolve identity via mivo-key fingerprint; if MIVO_PLATFORM_KEY is shared/absent, all users resolve to the same actor (data cross-access). Enable SSO + MIVO_GATEWAY_SECRET behind the gateway.')
+    warnings.push('MIVO_SSO_STRICT!=1 and MIVO_TRUST_SSO_HEADER!=1 at production boundary: /api/{projects,canvas,user-state} resolve identity via mivo-key fingerprint; if MIVO_PLATFORM_KEY is shared/absent, all users resolve to the same actor (data cross-access). Enable MIVO_SSO_STRICT=1 + MIVO_GATEWAY_SECRET behind the gateway.')
   }
   return warnings
 }
@@ -78,23 +159,49 @@ export const validateSsoConfig = (env: NodeJS.ProcessEnv = process.env): string[
 export const ssoHeaderSecretOk = (env: NodeJS.ProcessEnv, headerSecret: string | undefined): boolean => {
   const gatewaySecret = env.MIVO_GATEWAY_SECRET
   if (!gatewaySecret) return false // fail-closed:无密钥 → 永不信任(防伪造身份头,任何模式)
-  return headerSecret?.trim() === gatewaySecret // 配置:须匹配
+  // F4 返修:恒时比较——两侧先 SHA-256 digest(均固定 32 字节,消除长度泄漏与早返回),
+  // 再 crypto.timingSafeEqual。不再直接 `===`(原 `headerSecret?.trim() === gatewaySecret`
+  // 非恒时:长度不匹配即时返回 + 逐字节短路,泄漏 secret 长度/前缀)。等长 digest → 纯恒时。
+  const gatewayDigest = createHash('sha256').update(gatewaySecret).digest()
+  const headerDigest = createHash('sha256').update(headerSecret?.trim() ?? '').digest()
+  return timingSafeEqual(gatewayDigest, headerDigest)
 }
 
 /**
- * Actor user id for the /api/{canvas,projects,user-state} endpoints (返修 #1 + T1.4 DP-4).
- * T1.4:仅当 `MIVO_TRUST_SSO_HEADER=1`(网关后 opt-in)且网关密钥通过时读 `x-mivo-auth-user`。
- * 生产缺 MIVO_GATEWAY_SECRET → 密钥不通过 → 不信任 SSO header(防伪造,Greptile 第三轮)。
- * 否则(默认关 / dev / legacy / 无网关)→ fallback mivo_ 平台 key 指纹(T1.3 owner===actor 自归属 parity)。
+ * Actor user id for the /api/{canvas,projects,user-state} endpoints (返修 #1 + T1.4 DP-4 + G2.1 严格 SSO)。
+ *
+ * **严格模式(MIVO_SSO_STRICT=1)**:
+ * - dev mode(MIVO_DEV_MODE=1 且非生产):信任 `x-mivo-auth-user`(本地无网关,无需密钥);
+ *   缺失 → DEV_ACTOR_ID 稳定 dev actor。显式 env 开关,非 fallback。
+ * - 生产严格:要求网关密钥通过(ssoHeaderSecretOk)且 `x-mivo-auth-user` 存在;缺/错任一 → 抛 SsoAuthError
+ *   (→ ssoAuthBoundary 401)。**无指纹回退**(strict 分支不调用 fingerprintOfPlatformKey)。
+ *
+ * **legacy(默认关 → 生产零变化)**:仅当 `MIVO_TRUST_SSO_HEADER=1`(网关后 opt-in)且网关密钥通过时
+ * 读 `x-mivo-auth-user`;否则 fallback mivo_ 平台 key 指纹(T1.3 owner===actor 自归属 parity)。
  * 空 key(无 header + 无 env)→ 稳定 fallback 指纹(dev/legacy parity,同 tasks-per-user.test)。
  */
 export const resolveActor = (c: Context): string => {
-  if (isSsoHeaderTrusted() && ssoHeaderSecretOk(process.env, c.req.header(GATEWAY_SECRET_HEADER))) {
+  const env = process.env
+  if (isSsoStrict(env)) {
+    if (isDevMode(env)) {
+      // 显式 dev mode:本地无网关,信任 x-mivo-auth-user(无需密钥);缺失 → 稳定 dev actor
+      return c.req.header(SSO_TRUSTED_USER_HEADER)?.trim() || DEV_ACTOR_ID
+    }
+    // 严格生产:网关密钥必须通过(防 client 伪造 x-mivo-auth-user);不通过 → 401,不回退指纹
+    if (!ssoHeaderSecretOk(env, c.req.header(GATEWAY_SECRET_HEADER))) {
+      throw new SsoAuthError('missing or mismatched gateway secret (x-mivo-gateway-secret)')
+    }
+    const ssoUser = c.req.header(SSO_TRUSTED_USER_HEADER)?.trim()
+    if (!ssoUser) throw new SsoAuthError('missing trusted SSO user header (x-mivo-auth-user)')
+    return ssoUser // 严格模式 carrier = SSO username(maker user id,DP-4 一致)
+  }
+  // legacy(默认关):SSO opt-in + 密钥通过 → SSO user;否则指纹 fallback(零变化)
+  if (isSsoHeaderTrusted(env) && ssoHeaderSecretOk(env, c.req.header(GATEWAY_SECRET_HEADER))) {
     const ssoUser = c.req.header(SSO_TRUSTED_USER_HEADER)?.trim()
     if (ssoUser) return ssoUser // T1.4 carrier = maker user id (username,DP-4 一致)
     // secret 通过但无 SSO header → fallback 指纹(网关未注入身份)
   }
-  return fingerprintOfPlatformKey(resolvePlatformCtx(c).platformKey) // T1.3 fallback
+  return fingerprintOfPlatformKey(resolvePlatformCtx(c).platformKey) // T1.3 fallback(仅 legacy 分支)
 }
 
 /**
@@ -102,3 +209,276 @@ export const resolveActor = (c: Context): string => {
  * T1.4 member/share 落地后,route 改用 resolveActor + authz seam,此别名仅过渡。
  */
 export const resolveOwner = resolveActor
+
+/**
+ * Task registry 的 owner key(FX-2 per-user 隔离;registry 内部 fingerprint 入库)。
+ * - 严格模式:resolveActor(c)——SSO user(缺/错 proof 抛 SsoAuthError → 401);registry 对其再指纹
+ *   得稳定 per-user 分片(非密 actor 被哈希无安全损害)。无 mivo-key 指纹回退 → 无共享分片。
+ * - legacy(默认关):raw mivo 平台 key(registry 指纹 → ownerFp;**当前行为零变化**,tasks 测试全绿)。
+ *   注:runner 的 platformKey(LLM 调用用)仍由 route 直接读 header/route 传入,与此 owner 解耦。
+ */
+export const resolveTaskOwner = (c: Context): string =>
+  isSsoStrict() ? resolveActor(c) : resolvePlatformCtx(c).platformKey
+
+/**
+ * Asset store 的 owner(P2.5 owner-scoped;值直接作 store key,不再二次指纹)。
+ * - 严格模式:resolveActor(c)——SSO user(缺/错 proof 抛 SsoAuthError → 401)。
+ * - legacy(默认关):mivo-key 指纹(**当前行为零变化**)。
+ */
+export const resolveAssetOwner = (c: Context): string =>
+  isSsoStrict() ? resolveActor(c) : fingerprintOfPlatformKey(resolvePlatformCtx(c).platformKey)
+
+/**
+ * G2.1 R3-F2:路径是否有 `:id` 子资源段(区分 collection root 与 sub-resource)。
+ * projects mount(`/api/projects/*`)用:root(`/api/projects`,GET list/POST create)不支持 share token,
+ * `:id` 子资源(`/api/projects/:id/...`)支持。shareCapable=本判定 → root 绝不因 token presence 豁免
+ * (R3-F2 修法点 1),`:id` 子资源 valid token 才豁免。
+ *
+ * 按 `c.req.path`(不含 query)分段:2 段(`api`/`projects`)= root;>2 段 = 有 `:id`。适用于 2 段深
+ * mount(projects/canvas/user-state);tasks mount(`/api/mivo/tasks`,3 段深)用 `shareCapable:false` 直传,不走本判定。
+ */
+export const hasSubresourceId = (c: Context<AppEnv>): boolean => {
+  const parts = c.req.path.split('?')[0].split('/').filter(Boolean)
+  return parts.length > 2
+}
+
+/**
+ * G2.1 R2-2/R3-F2:strict proof 前置中间件(工厂)。owner-scoped 路由(projects/canvas/userState/tasks/
+ * members/shareLinks)在 strict 模式下,于**任何 body 解析/DB lookup 前**统一验 proof(gateway secret +
+ * SSO header),缺/错 → 抛 SsoAuthError(→ ssoAuthErrorHandler 401)。dev mode 豁免(信任 x-mivo-auth-user
+ * 无需 proof,route 仍调 resolveActor)。legacy(non-strict)→ no-op(生产零变化)。
+ *
+ * **R3-F2 修法(token 有效性校验,存在≠proof)**:返修前 `ssoStrictProofGate` 对任意非空 share header/query
+ * 直接 `next()`(token presence 即豁免)→ tasks/user-state/projects root 等不支持 share 的 owner route
+ * 可用垃圾 token 绕过前置 401,恢复未鉴权 body/multipart 解析(大 body/昂贵 multipart DoS)。
+ * 现工厂收 `permissions`(全局验 token via `resolveShareLinkByToken`)+ `shareCapable`(按 route 能力收窄):
+ *  - **不支持的 route(tasks/user-state/projects root)**:`shareCapable=false` → token presence 绝不豁免,
+ *    落到 proof 校验(无 proof → 401,body 不解析)。projects root 用 `hasSubresourceId`(无 `:id` → false)。
+ *  - **支持的 route(project/canvas 子资源)**:`shareCapable=true` → token 经 `resolveShareLinkByToken` 全局
+ *    验有效性:`kind==='active'` → 豁免(公开分享访问,route authz 再验 token↔project);garbage/revoked/
+ *    expired → 不豁免 → 落 proof(无 proof → 401,parser 不调用)。canvas 全部 shareCapable=true(POST `/`
+ *    的 projectId 在 body,无法在 gate 内验 token↔project,改全局验 token 有效性,route authz 验 token↔project)。
+ *
+ * **消除存在性 oracle**(R2-2):返修前 GET /api/projects/:id strict+无 proof 下 已存=401、未知=404 → 泄漏存在。
+ * 前置后 known/missing 一律 401(DB lookup 不被未鉴权请求触达)。**未鉴权不消耗昂贵解析**:tasks multipart/mask +
+ * projects JSON body 在 401 前不解析(返修前非法 body POST=400、tasks multipart 先于 401 处理)。
+ *
+ * 挂载点:owner-scoped 路由前(app.ts + persistTestApp)。**不挂**:/api/share(token-scoped 公开)、
+ * /api/mivo/debug-logs(system-scoped 遥测,独立防护)、stateless /api/mivo/{generate,edit,enhance,...}。
+ * assets 路由 R3-F2 把 `resolveAssetOwner` 移到所有 validation 前(route 内前置,无需本中间件)。
+ */
+export const createSsoStrictProofGate = ({
+  permissions,
+  shareCapable,
+}: {
+  permissions: PermissionBackend
+  /**
+   * 本 mount 是否支持 share-token 访问。false=永不豁免(tasks/user-state/projects-root);
+   * true=全部支持(canvas);函数=按路径判定(projects `:id` via hasSubresourceId)。
+   */
+  shareCapable: boolean | ((c: Context<AppEnv>) => boolean)
+}): MiddlewareHandler<AppEnv> => async (c, next) => {
+  if (!isSsoStrict(process.env)) return next() // legacy: no-op,零变化(不读 header 不解析 body)
+  if (isDevMode(process.env)) return next() // dev mode:信任 x-mivo-auth-user 无需 proof;route 仍调 resolveActor
+  // R3-F2:share token 须按 route 能力收窄 + 全局验有效性(存在≠proof)。
+  const shareToken =
+    c.req.header('x-mivo-share-token')?.trim() ||
+    c.req.query('share')?.toString() ||
+    undefined
+  if (shareToken) {
+    const cap = typeof shareCapable === 'function' ? shareCapable(c) : shareCapable
+    if (cap) {
+      // 全局验 token 有效性:active → 豁免(route authz 再验 token↔project);garbage/revoked/expired → 不豁免
+      const share = await permissions.resolveShareLinkByToken(shareToken)
+      if (share && share.kind === 'active') return next()
+    }
+    // non-share-capable route(tasks/user-state/projects-root)OR 无效 token → 不豁免,落 proof 校验(存在≠proof)
+  }
+  // strict + 无 share token / 无效 token:proof 前置(在 body 解析 / DB lookup 前)
+  if (!ssoHeaderSecretOk(process.env, c.req.header(GATEWAY_SECRET_HEADER))) {
+    throw new SsoAuthError('missing or mismatched gateway secret (x-mivo-gateway-secret)')
+  }
+  const ssoUser = c.req.header(SSO_TRUSTED_USER_HEADER)?.trim()
+  if (!ssoUser) throw new SsoAuthError('missing trusted SSO user header (x-mivo-auth-user)')
+  return next() // proof ok;route 继续(resolveActor 再派生,廉价;双校验不增攻击面)
+}
+
+// ── G2.1 F1/R2-1:owner 键空间跃迁防护(strict 禁先于 G2.2,三域 gate)──────────────────────
+// 痛点(F1 复现):strict 切换让 resolveActor 返回 SSO username(无指纹回退),所有 legacy 形态
+// (ownerId=指纹,sha256[:16] hex)的存量数据对 SSO 用户不可见(alice 列表空)。翻 strict 前必须先跑
+// G2.2 迁移(指纹→username),否则数据"消失"。本 gate 是**机器判定**(非文字约定):启动时检测
+// legacy 形态 owner 数据>0 且 strict=1 → 拒绝启动(exit 1)。迁移函数 memory backend 已实装
+// (09ef7af InMemoryPersistBackend 真实 rekey,可测);PG 三域迁移随 G2.2 落地,未实现时抛
+// `not implemented (G2.2)`(fail-closed,与启动 gate 一致)。gate 机制本身真实(三域 memory backend 实扫,可测)。
+//
+// R2-1(第二轮返修,P1):返修前 gate 只收 PersistBackend → persist=0 但 permission/asset 全 legacy
+// 时放行(share_links.created_by + AssetRecord.ownerFp/references/uploaders 漏检)。G2.2 若只补 PG persist
+// detector 即可绕过其余两域。修法:gate 收三 detector(persist + permissions + assets),任一 detector
+// 缺失 → fail-closed 拒启动,任一域 legacy>0 → 拒启动。InMemory persist/permissions/assets detector 可测;
+// PG 三域 detector 随 G2.2 落地(未实现 → strict 启动 fail-closed,安全)。
+//
+// 覆盖面(三域,对齐 owner inventory 全清单):
+//  - persist(PersistBackend):persist_records/projects/canvases/idempotency_index 的 ownerId(memory 实扫
+//    byOwner 外层 key;PG detector 随 G2.2);
+//  - permissions(PermissionBackend):share_links.created_by(InMemory 扫 links;PG 随 G2.2);
+//  - assets(AssetStore):AssetRecord.ownerFp + references[].ownerFp + .uploaders(InMemory/fs 扫 listRecords
+//    + listUploaders;PG 随 G2.2)。asset service 未启用(MIVO_ENABLE_ASSET_SERVICE=0)时 buildStartupDetectors
+//    回退构造只读 fs detector off 配置资产根(R3-F1),实扫磁盘 legacy,**不伪造 0**(见下方 buildStartupDetectors)。
+
+/**
+ * legacy owner 形态 = mivo-key 指纹(sha256[:16] hex,见 keys.ts `fingerprintOfPlatformKey`)。
+ * SSO username 为 email-style(含 `@`,如 `zhuzan@xd.com`);DEV_ACTOR_ID=`mivo-dev-actor`——均不匹配
+ * 此 16-hex 正则,故可机械区分 legacy 形态与新形态。
+ */
+export const LEGACY_FINGERPRINT_REGEX = /^[0-9a-f]{16}$/
+export const isLegacyFormOwner = (ownerId: string): boolean => LEGACY_FINGERPRINT_REGEX.test(ownerId)
+
+/**
+ * G2.1 R2-1 三域 gate 的 detector seam。每个域(persist/permissions/assets)的 backend 实现可选
+ * `countLegacyFormOwners`(memory 实扫可测;PG 随 G2.2)。gate 收 detector 列表,逐个判定:
+ * 缺失方法 → fail-closed;legacy 行数>0 → 拒启动。`domain` 仅用于报错指明哪个域。
+ */
+export type LegacyOwnerDetector = {
+  /** 域名(persist/permissions/assets),仅报错指明;不参与判定逻辑。 */
+  readonly domain: string
+  /**
+   * 统计本域 ownerId 为 legacy 形态(指纹,16-hex)的 owner 数。**可选**:memory 实现可测;
+   * PG detector 随 G2.2 落地,未实现时 gate fail-closed 拒启动(无法机械判定迁移完成)。
+   */
+  countLegacyFormOwners?(): Promise<number>
+}
+
+/**
+ * 把实现了 `countLegacyFormOwners` 的 backend 包成 `LegacyOwnerDetector`(bind 到实例,
+ * 防方法丢失 `this`)。backend 未实现该方法 → detector.countLegacyFormOwners = undefined
+ * → gate fail-closed(对齐 PG G2.2 前未实现场景)。
+ */
+export const legacyOwnerDetector = (
+  domain: string,
+  backend: { countLegacyFormOwners?(): Promise<number> },
+): LegacyOwnerDetector => ({
+  domain,
+  countLegacyFormOwners:
+    typeof backend.countLegacyFormOwners === 'function'
+      ? backend.countLegacyFormOwners.bind(backend)
+      : undefined,
+})
+
+/**
+ * G2.1 R3-F1:构建启动期三域 owner-migration gate 的 detector 列表(persist + permissions + assets)。
+ * 抽自 `server/index.ts` 内联构造,供 gate 测试直驱。
+ *
+ * **R3-F1 修复**:asset domain detector **始终按配置资产根**(`resolveAssetStoreDir`)构造只读 fs
+ * detector,与 asset route 是否 mount(`MIVO_ENABLE_ASSET_SERVICE`)解耦。service off(assetStore null)
+ * 时仍实扫磁盘上的 legacy `AssetRecord.ownerFp`/`references[].ownerFp`/`.uploaders`,**不伪造 0**。
+ *
+ * 返修前洞:service off → `sharedAssetStore=null` → 注入 `countLegacyFormOwners:()=>0` 占位;资产目录是
+ * 持久目录(过去启用后再关闭/cutover 关闭/稍后重开都可能仍有 legacy ownerFp),persist=0、permission=0、
+ * 磁盘 asset>0 时 strict 可启动 → 跨域绕过(R2-1 要堵的洞)。
+ *
+ * fail-closed 语义:fs backend `listRecords` 对目录缺失(ENOENT)返 `[]` → count 0(合法空,非伪造);
+ * 其他 fs 错(EACCES 等)→ 抛 → gate `await d.countLegacyFormOwners()` 抛 → strict 启动 fail-closed;
+ * 根上存 legacy → count>0 → 拒启动。assetStore 非空(service on)→ 复用 route 用的同一 store(避免双 store)。
+ */
+export const buildStartupDetectors = ({
+  persist,
+  permissions,
+  assetStore,
+}: {
+  persist: { countLegacyFormOwners?(): Promise<number> }
+  permissions: { countLegacyFormOwners?(): Promise<number> }
+  assetStore: AssetStore | null
+}): LegacyOwnerDetector[] => [
+  legacyOwnerDetector('persist', persist),
+  legacyOwnerDetector('permissions', permissions),
+  legacyOwnerDetector(
+    'assets',
+    // R3-F1:assetStore null(service off)→ 回退构造只读 fs detector off 配置资产根,不伪造 0。
+    assetStore ?? createAssetStore(createFsAssetBackend(resolveAssetStoreDir())),
+  ),
+]
+
+/**
+ * G2.1 F1/R2-1 启动 gate:strict 模式下,若三域(persist + permissions + assets)任一仍存在
+ * legacy 形态 owner 数据 → **拒绝启动**(fail fast,exit 1 via index.ts start().catch)。
+ * 机器判定,非文字约定:ops 翻 MIVO_SSO_STRICT=1 前必须先跑 G2.2 迁移(跨三域重键 owner)。
+ *
+ * - 非 strict → no-op(生产零变化;legacy 路径不触发本 gate,现有行为完全不变)。
+ * - strict + 任一 detector 缺失 `countLegacyFormOwners`(如 PG,G2.2 前未补)→ fail-closed 拒启动
+ *   (无法机械判定迁移完成前不得翻 strict;三域 PG detector 随 G2.2 落地)。
+ * - strict + 全 detector 实现 + 任一域 legacy 行数>0 → 拒启动(报具体域 + 计数 + 迁移指引)。
+ * - strict + 全 detector 实现 + 三域 0 legacy 行 → 通过(迁移完成或无存量)。
+ *
+ * 挂载点:`server/index.ts` `await Promise.all([sharedPersistBackend.ready, ...])` 之后、serve 之前。
+ * 导出供 gate 测试直驱(`sso-strict.route.test.ts` §R2-1)。
+ */
+export const assertStrictOwnerMigrationComplete = async (
+  env: NodeJS.ProcessEnv = process.env,
+  detectors: LegacyOwnerDetector[],
+): Promise<void> => {
+  if (!isSsoStrict(env)) return // 非 strict:no-op(生产零变化)
+  for (const d of detectors) {
+    if (typeof d.countLegacyFormOwners !== 'function') {
+      // fail-closed:该域 backend 不支持 legacy 检测 → 无法机械判定迁移完成 → strict 拒启动。
+      throw new Error(
+        `[mivo-bff] MIVO_SSO_STRICT=1 but ${d.domain} backend does not implement countLegacyFormOwners (PG ${d.domain} detector lands with G2.2). Cannot machine-verify ${d.domain} owner migration complete; refusing to start (fail-closed). Run G2.2 owner migration (fingerprint→username) across persist/permissions/assets and land all three backend detectors before flipping strict.`,
+      )
+    }
+    const legacyCount = await d.countLegacyFormOwners()
+    if (legacyCount > 0) {
+      throw new Error(
+        `[mivo-bff] MIVO_SSO_STRICT=1 but ${d.domain} backend has ${legacyCount} legacy-form owner record(s) (ownerId=fingerprint, sha256[:16] hex). Strict mode resolves actor=SSO username with NO fingerprint fallback → all legacy owner data becomes invisible. Run G2.2 owner migration (fingerprint→username mapping) across persist/permissions/assets before flipping MIVO_SSO_STRICT=1. Refusing to start (fail-closed).`,
+      )
+    }
+  }
+}
+
+/**
+ * G2.2 owner 迁移(seam):把 legacy 指纹 ownerId 重映射为 SSO username 形态。
+ * **R3-F1**:InMemoryPersistBackend 已实装真实 rekey(供 seed→打桩迁移→strict 可见 / unmapped no-go 测试);
+ * delegate 到 `backend.migrateLegacyOwnersToUsernameForm?`。backend 未实现(PG,G2.2 前未补)→ 显式抛
+ * `not implemented (G2.2)`(fail-closed;与启动 gate 一致——无法机械迁移前 strict 不得翻)。
+ * 真实 G2.2 实现需 fingerprint→username 映射(需原 `mivo_` key 或预建映射表)+ 跨三 backend
+ * (persist/permissions/assets)重键 owner;persist 域已就绪,permissions/assets 域随 G2.2 落地。
+ */
+export const migrateLegacyOwnersToUsernameForm = async (
+  backend: PersistBackend,
+  resolveFingerprintToUsername: (fingerprint: string) => string | undefined,
+): Promise<{ migrated: number; unmapped: number }> => {
+  if (typeof backend.migrateLegacyOwnersToUsernameForm !== 'function') {
+    throw new Error(
+      'migrateLegacyOwnersToUsernameForm: not implemented for this backend (PG lands with G2.2). InMemoryPersistBackend implements it; PG persist + permissions + assets cross-backend migration is G2.2 scope. The startup gate (assertStrictOwnerMigrationComplete) is real and enforced; strict cannot be flipped until all three domain detectors + migrations land.',
+    )
+  }
+  return backend.migrateLegacyOwnersToUsernameForm(resolveFingerprintToUsername)
+}
+
+/**
+ * 顶层 onError 处理器:严格模式下 SsoAuthError(由 sub-app 内 resolveActor 等抛出)→ 401。
+ * 这是可靠 catch 点——`app.route(path, subApp)` 下 sub-app handler 抛错由顶层 onError 统一处理
+ * (父级 `app.use` 的 try/catch 跨 sub-app 不可靠)。非 SsoAuthError 回退 Hono 默认 500(行为不变)。
+ * 挂载于 `app.onError(ssoAuthErrorHandler)`(app.ts + persistTestApp)。
+ */
+export const ssoAuthErrorHandler: ErrorHandler<AppEnv> = (err, c) => {
+  if (err instanceof SsoAuthError) {
+    // c.json 走 c.newResponse → 保 pre-error c.header()(R2-3 parity)。401 JSON 契约
+    // `{error:'unauthorized', message:reason}` 锁定于 sso-strict.route.test ② + sso-error-parity。
+    return c.json({ error: 'unauthorized', message: err.reason }, 401)
+  }
+  // R2-3(F5 第二轮返修):精确复刻 Hono 默认 onError 语义(Option A 精确复刻,finding 允许)。
+  // origin/main 无 onError → Hono 默认对非 SsoAuthError:
+  //  ① `"getResponse" in err` duck-type → `c.newResponse(err.getResponse().body, res)`(保 pre-error c.header());
+  //  ② 否则 → console.error(err) + 500 'Internal Server Error'。
+  // 返修前现实现(首版)用 `instanceof HTTPException` + 直接 `err.getResponse()`,两洞:
+  //  - instanceof 漏 structural HTTPResponseError(有 getResponse 但非 HTTPException 子类)→ 误入 500 分支;
+  //  - 直接 `err.getResponse()` 不走 c.newResponse → 丢 pre-error c.header() 上下文(R2-3 parity 测试复现)。
+  // 改 duck-type + c.newResponse 后:HTTPException / structural 一律经 c.newResponse 保 pre-error header;
+  // 普通 Error 仍 console.error + 500(不吞,F5 复现的 consoleErrors 1→0 修复保持)。
+  // sso-error-parity.test.ts 锁定:普通 Error / HTTPException / structural × 默认 vs custom 全 parity,Hono 升级漂移报警。
+  if (err != null && typeof (err as { getResponse?: unknown }).getResponse === 'function') {
+    const res = (err as { getResponse: () => Response }).getResponse()
+    return c.newResponse(res.body, res)
+  }
+  console.error(err) // mirror Hono 默认:普通错误日志(修复 F5 复现的 consoleErrors 1→0)
+  return c.text('Internal Server Error', 500) // 同 Hono 默认 500 文本
+}

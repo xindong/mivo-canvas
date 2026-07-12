@@ -15,7 +15,8 @@
 import { Hono } from 'hono'
 import type { HttpBindings } from '@hono/node-server'
 import { defaultMivoImageModel } from '../lib/config'
-import { rejectInvalidMivoApiKey, resolvePlatformCtx } from '../lib/keys'
+import { rejectInvalidMivoApiKey } from '../lib/keys'
+import { resolveTaskOwner } from '../lib/owner'
 import { generateAreaMaskPng, type MaskSize, type NormalizedMaskBounds } from '../lib/maskPng'
 import {
   firstMultipartField,
@@ -64,11 +65,12 @@ tasksRoute.post('/generate', async (c) => {
   const model = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : defaultMivoImageModel
   const idempotencyKey = c.req.header('idempotency-key') || undefined
   const platformKey = c.req.header('x-mivo-api-key')?.trim() || undefined
-  // FX-2: owner fingerprint from the resolved mivo_ key (header || env) — the
-  // task is only visible to later GET/DELETE carrying the same key.
-  // resolvePlatformCtx mirrors the runner's platformCtxFromKey so the create-scope
-  // and read-scope agree on the owner.
-  const ownerKey = resolvePlatformCtx(c).platformKey
+  // FX-2 / G2.1: owner key for the task registry (per-user isolation). resolveTaskOwner
+  // returns the SSO actor in strict mode (MIVO_SSO_STRICT=1; missing/wrong gateway proof
+  // → SsoAuthError → 401 via ssoAuthBoundary, no fingerprint fallback) or the raw mivo
+  // platform key in legacy mode (registry fingerprints → ownerFp; current behavior).
+  // The runner's platformKey (LLM calls) is read separately from the header above.
+  const ownerKey = resolveTaskOwner(c)
   const { record, created } = createTask('generate', model, requestId, ownerKey, idempotencyKey)
   // P1 fix (rev-behavior): only launch the runner on first creation. A repeat
   // submission with the same Idempotency-Key returns the existing task
@@ -163,7 +165,7 @@ tasksRoute.post('/edit', async (c) => {
   }
 
   const platformKey = c.req.header('x-mivo-api-key')?.trim() || undefined
-  const ownerKey = resolvePlatformCtx(c).platformKey
+  const ownerKey = resolveTaskOwner(c)
   const { record, created } = createTask('edit', modelField, requestId, ownerKey, idempotencyKey)
   // P1 fix: only launch the runner on first creation (see /generate).
   if (created) {
@@ -239,7 +241,7 @@ tasksRoute.post('/variations', async (c) => {
   // batchId groups this batch's N edits for client-side display (variant grid).
   // Not the taskId — the taskId is the registry id returned to the client.
   const batchId = `batch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
-  const ownerKey = resolvePlatformCtx(c).platformKey
+  const ownerKey = resolveTaskOwner(c)
   const { record, created } = createTask('variations', modelField, requestId, ownerKey, idempotencyKey, { batchId, count: variations.length })
   // P1 fix: only launch the runner on first creation (see /generate). On a repeat
   // submission the existing batchId/count are returned from the record, so the
@@ -287,7 +289,7 @@ tasksRoute.post('/settle', async (c) => {
     .map((x) => String(x))
     .filter((x) => x.length > 0)
     .slice(0, 64)
-  const ownerKey = resolvePlatformCtx(c).platformKey
+  const ownerKey = resolveTaskOwner(c)
   const results: Record<string, TaskView> = {}
   for (const id of taskIds) {
     const record = getTaskForOwner(id, ownerKey)
@@ -305,7 +307,7 @@ tasksRoute.get('/:id', (c) => {
   const badMivoKey = rejectInvalidMivoApiKey(c)
   if (badMivoKey) return badMivoKey
   const id = c.req.param('id')
-  const ownerKey = resolvePlatformCtx(c).platformKey
+  const ownerKey = resolveTaskOwner(c)
   const record = getTaskForOwner(id, ownerKey)
   if (!record) return c.json({ error: 'unknown-task' }, 404)
   return c.json(toView(record), 200)
@@ -316,7 +318,7 @@ tasksRoute.delete('/:id', (c) => {
   const badMivoKey = rejectInvalidMivoApiKey(c)
   if (badMivoKey) return badMivoKey
   const id = c.req.param('id')
-  const ownerKey = resolvePlatformCtx(c).platformKey
+  const ownerKey = resolveTaskOwner(c)
   const record = getTaskForOwner(id, ownerKey)
   if (!record) return c.json({ error: 'unknown-task' }, 404)
   cancelTask(id)

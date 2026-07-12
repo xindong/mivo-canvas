@@ -6,6 +6,7 @@ import { DebugReportsPage } from './app/DebugReportsPage.tsx'
 import { useCanvasStore } from './store/canvasStore'
 import { useChatStore } from './store/chatStore'
 import { useAuthStore } from './store/authSlice'
+import { getPersistUserId } from './lib/persistUserId'
 import { installRollbackTrigger } from './kernel/rollbackTrigger'
 
 declare global {
@@ -13,6 +14,11 @@ declare global {
     __MIVO_E2E__?: {
       useCanvasStore: typeof useCanvasStore
       useChatStore: typeof useChatStore
+      /** Current cache-namespace user id (FX-6). Exposed so the e2e harness can
+       *  resolve the same namespaced IDB key the app writes WITHOUT a browser-side
+       *  /src/lib/persistUserId.ts import — which 404s under the prod static dist
+       *  server and trips the console-error MIME guard (mainfix R3). */
+      getPersistUserId: typeof getPersistUserId
     }
     __MIVO_E2E_ENABLED__?: boolean
     /** e2e opt-out: set via addInitScript to suppress first-login auto-prompt
@@ -28,7 +34,7 @@ const debugReportsRequested =
 const rootElement = debugReportsRequested ? <DebugReportsPage /> : <App />
 
 if (window.__MIVO_E2E_ENABLED__ === true) {
-  window.__MIVO_E2E__ = { useCanvasStore, useChatStore }
+  window.__MIVO_E2E__ = { useCanvasStore, useChatStore, getPersistUserId }
 }
 
 // T1.2 S6c:rollbackFromV11 诊断口子(仅 DEV——installRollbackTrigger 内 import.meta.env.DEV

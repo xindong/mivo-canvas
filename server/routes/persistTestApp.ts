@@ -5,6 +5,7 @@
 // T1.4:同时挂 members / share-links / share-access 路由 + fresh 内存 permission backend;返回 permissions 供测试 reset。
 import { Hono } from 'hono'
 import type { AppEnv } from '../lib/types'
+import { ssoAuthErrorHandler, createSsoStrictProofGate, hasSubresourceId } from '../lib/owner'
 import { createProjectsRoutes } from './projects'
 import { createCanvasRoutes } from './canvas'
 import { createUserStateRoutes } from './userState'
@@ -23,6 +24,17 @@ export const buildPersistApp = (): {
   const backend = new InMemoryPersistBackend()
   const permissions = new InMemoryPermissionBackend()
   const app = new Hono<AppEnv>()
+  // G2.1: mirror app.ts — top-level onError catches strict-mode SsoAuthError → 401.
+  // Inert in non-strict mode (default; existing route tests unaffected).
+  app.onError(ssoAuthErrorHandler)
+  // G2.1 R2-2/R3-F2:mirror app.ts — strict proof 前置中间件(工厂)。R3-F2:token presence 不再豁免;
+  // 按 route 能力收窄(shareCapable)+ token 经 resolveShareLinkByToken 全局验有效性(active 才豁免,
+  // garbage/revoked/expired 不豁免,存在≠proof)。tasks/user-state 永不豁免;projects root(无 :id)
+  // 永不豁免(hasSubresourceId=false);projects/canvas :id + canvas 全部支持。legacy no-op(现有路由测试零影响)。
+  // /api/share(token-scoped)不挂。tasks 走 realApp(不在此 mount)。
+  app.use('/api/projects/*', createSsoStrictProofGate({ permissions, shareCapable: hasSubresourceId }))
+  app.use('/api/canvas/*', createSsoStrictProofGate({ permissions, shareCapable: true }))
+  app.use('/api/user-state/*', createSsoStrictProofGate({ permissions, shareCapable: false }))
   app.route('/api/projects', createProjectsRoutes({ backend, permissions }))
   app.route('/api/projects', createMembersRoutes({ backend, permissions }))
   app.route('/api/projects', createShareLinksRoutes({ backend, permissions }))
