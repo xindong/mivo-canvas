@@ -35,8 +35,21 @@ import { toastFeedback } from '../store/toastStore'
 const SOURCE = 'Write Retry Queue'
 
 const DB_NAME = 'mivo-write-queue'
-const DB_VERSION = 1
+// DB_VERSION 2 (FX-7 / A6): adds the `terminals` store — a durable ledger of
+// dead-letter / conflict / rejected terminal outcomes (op summary + error code +
+// time) for the A3 persist gray observation window. v1→v2 is additive: an existing
+// v1 DB triggers onupgradeneeded which creates the new store; existing `writes`
+// records are untouched. Retry / backoff / terminal-decision semantics are NOT
+// changed — the ledger is append-only alongside the existing delete-after-surface.
+const DB_VERSION = 2
 const STORE_NAME = 'writes'
+const TERMINALS_STORE = 'terminals'
+
+// FX-7 / A6: cap the durable terminal ledger so a misbehaving executor cannot grow
+// IDB unbounded. The ledger is an observation/audit trail (A3 gray window stats);
+// old entries age out by timestamp. Mirrors the "IDB must not grow unbounded" posture
+// documented for the writes store.
+const DEFAULT_MAX_TERMINALS = 256
 
 const DEFAULT_MAX_QUEUE = 256
 const DEFAULT_MAX_ATTEMPTS = 8
@@ -504,6 +517,9 @@ const newKey = (): string =>
 
 let dbPromise: Promise<IDBDatabase> | undefined
 const memStore = new Map<string, QueuedWrite>()
+// FX-7 / A6: terminal ledger in-memory fallback (mirrors memStore discipline — used
+// only when IDB is unavailable; survives a pm2-restart window, not a reload).
+const terminalMem = new Map<string, TerminalLedgerEntry>()
 
 const isIdbAvailable = (): boolean => typeof indexedDB !== 'undefined' && indexedDB !== null
 
@@ -530,6 +546,11 @@ const openDb = (): Promise<IDBDatabase> => {
       if (!db.objectStoreNames.contains(STORE_NAME)) {
         db.createObjectStore(STORE_NAME, { keyPath: 'id' })
       }
+      // FX-7 / A6 (v2): terminal ledger store. Additive — created on first open of a
+      // pre-v2 DB; a fresh DB creates both stores. keyPath `id` (ledger entry id).
+      if (!db.objectStoreNames.contains(TERMINALS_STORE)) {
+        db.createObjectStore(TERMINALS_STORE, { keyPath: 'id' })
+      }
     }
     request.onsuccess = () => resolve(request.result)
     request.onerror = () => reject(request.error)
@@ -545,12 +566,16 @@ const openDb = (): Promise<IDBDatabase> => {
 const runTx = <T>(
   mode: IDBTransactionMode,
   run: (store: IDBObjectStore) => IDBRequest<T>,
+  // FX-7 / A6: optional store name so the terminal ledger (TERMINALS_STORE) can share
+  // the same transaction helper. Defaults to the writes store — all pre-FX-7 callers
+  // are unchanged (backward-compatible 2-arg calls).
+  storeName: string = STORE_NAME,
 ): Promise<T> =>
   openDb().then(
     (db) =>
       new Promise<T>((resolve, reject) => {
-        const tx = db.transaction(STORE_NAME, mode)
-        const request = run(tx.objectStore(STORE_NAME))
+        const tx = db.transaction(storeName, mode)
+        const request = run(tx.objectStore(storeName))
         let result: T
         request.onsuccess = () => {
           result = request.result
@@ -607,6 +632,137 @@ const deleteWrite = async (id: string): Promise<void> => {
     debugLogger.warn(SOURCE, `delete failed for ${id}: ${msg(error)}`)
   }
 }
+
+// ── FX-7 / A6: durable terminal ledger (dead-letter / conflict / rejected outcomes) ──
+//
+// Boundary (lead A6 task pack, decision 3): "只加账本不改重试语义" — this ledger is
+// append-only alongside the existing delete-after-surface. It does NOT change retry /
+// backoff / terminal-decision logic. Each terminal-failure branch calls recordTerminal
+// BEFORE deleteWrite so the outcome (op summary + error code + time + attempts) is
+// durably auditable for the A3 persist gray observation window ("dead-letter=0" /
+// "unexplained conflict=0" quantitative stats). The ledger is bounded (cap evicts the
+// oldest by timestamp) so IDB does not grow unbounded (same posture as the writes store).
+//
+// Status is the machine-readable error code; success is NOT ledgered (success is not a
+// failure terminal). Ledger writes are best-effort — a ledger put failure must not block
+// the terminal outcome (it still surfaces via debugLogger/toast above).
+
+export type TerminalLedgerStatus =
+  | 'conflict'
+  | 'too-large'
+  | 'reuse-conflict'
+  | 'rejected'
+  | 'terminal'
+  | 'dead-letter'
+
+export type TerminalLedgerEntry = {
+  id: string
+  recordId: string
+  userId: string
+  opKind: WriteOpKind
+  resourceKey: string | null
+  status: TerminalLedgerStatus
+  message: string
+  attempts: number
+  timestamp: number
+}
+
+const readAllTerminals = async (): Promise<TerminalLedgerEntry[]> => {
+  if (!isIdbAvailable()) return Array.from(terminalMem.values())
+  try {
+    const idbRecords = await runTx<TerminalLedgerEntry[]>(
+      'readonly',
+      (store) => store.getAll() as IDBRequest<TerminalLedgerEntry[]>,
+      TERMINALS_STORE,
+    )
+    // Union with terminalMem so a ledger entry that fell back to memStore when an IDB
+    // tx failed is not invisible to a plain IDB read (same union as getAllWrites).
+    const idbIds = new Set(idbRecords.map((r) => r.id))
+    const memOnly = Array.from(terminalMem.values()).filter((r) => !idbIds.has(r.id))
+    return [...idbRecords, ...memOnly]
+  } catch (error) {
+    warnIdbDegradation('terminal getAll failed', error)
+    return Array.from(terminalMem.values())
+  }
+}
+
+const enforceTerminalCap = async (): Promise<void> => {
+  if (!isIdbAvailable()) {
+    while (terminalMem.size > DEFAULT_MAX_TERMINALS) {
+      const oldest = Array.from(terminalMem.values()).sort((a, b) => a.timestamp - b.timestamp)[0]
+      if (!oldest) break
+      terminalMem.delete(oldest.id)
+    }
+    return
+  }
+  try {
+    const all = await readAllTerminals()
+    if (all.length <= DEFAULT_MAX_TERMINALS) return
+    const excess = all.length - DEFAULT_MAX_TERMINALS
+    const oldest = all
+      .slice()
+      .sort((a, b) => a.timestamp - b.timestamp || (a.id < b.id ? -1 : 1))
+      .slice(0, excess)
+    await runTx<undefined>(
+      'readwrite',
+      (store) => {
+        let lastReq: IDBRequest<undefined> | undefined
+        for (const entry of oldest) {
+          lastReq = store.delete(entry.id) as IDBRequest<undefined>
+        }
+        // runTx awaits one request; excess >= 1 here so lastReq is defined. The fallback
+        // keeps TS non-null honest in the (impossible) empty-excess case.
+        return lastReq ?? (store.get('__none__') as IDBRequest<undefined>)
+      },
+      TERMINALS_STORE,
+    )
+  } catch (error) {
+    debugLogger.warn(SOURCE, `terminal cap enforcement failed: ${msg(error)}`)
+  }
+}
+
+const recordTerminal = async (
+  rec: QueuedWrite,
+  status: TerminalLedgerStatus,
+  message: string,
+): Promise<void> => {
+  const entry: TerminalLedgerEntry = {
+    id: newId(),
+    recordId: rec.id,
+    userId: rec.userId,
+    opKind: rec.op.kind,
+    resourceKey: rec.resourceKey,
+    status,
+    message,
+    // attempts counts prior transient failures; +1 = the attempt that terminated
+    // (mirrors the drain's dead-letter log "after N attempts").
+    attempts: rec.attempts + 1,
+    timestamp: Date.now(),
+  }
+  if (!isIdbAvailable()) {
+    terminalMem.set(entry.id, entry)
+    await enforceTerminalCap()
+    return
+  }
+  try {
+    await runTx<IDBValidKey>('readwrite', (store) => store.put(entry), TERMINALS_STORE)
+    terminalMem.delete(entry.id)
+    await enforceTerminalCap()
+  } catch (error) {
+    // Best-effort audit — never block the terminal outcome. Fall back to mem so the
+    // entry stays queryable in-process this session (tests + A3 observation).
+    warnIdbDegradation(`terminal put failed for ${rec.id}`, error)
+    terminalMem.set(entry.id, entry)
+  }
+}
+
+/**
+ * FX-7 / A6: query the durable terminal ledger (dead-letter / conflict / rejected
+ * outcomes with op summary + error code + time). For the A3 persist gray observation
+ * window quantitative stats ("dead-letter=0", "unexplained conflict=0"). Each entry's
+ * `status` is the machine-readable error code; `message` carries the detail.
+ */
+export const getWriteQueueTerminals = async (): Promise<TerminalLedgerEntry[]> => readAllTerminals()
 
 // ── Public API ──
 
@@ -933,6 +1089,9 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
             } catch (cbErr) {
               debugLogger.warn(SOURCE, `onConflict callback threw: ${msg(cbErr)}`)
             }
+            // FX-7 / A6: durable terminal ledger (audit trail for A3 gray window stats).
+            // Must precede deleteWrite so the entry is durable before the record is removed.
+            await recordTerminal(rec, 'conflict', `server revision ${outcome.currentRevision}`)
             await deleteWrite(rec.id)
             terminals++
             break
@@ -942,6 +1101,7 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
               `write ${rec.id} rejected as too large (limit ${outcome.limit}); not retrying same payload`,
             )
             toastFeedback.error('这条改动内容过大,无法保存。')
+            await recordTerminal(rec, 'too-large', `limit ${outcome.limit}`)
             await deleteWrite(rec.id)
             terminals++
             break
@@ -951,6 +1111,7 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
               `write ${rec.id} idempotency-key reuse conflict (key ${outcome.key})`,
             )
             toastFeedback.error('保存失败,请重试该改动。')
+            await recordTerminal(rec, 'reuse-conflict', `key ${outcome.key}`)
             await deleteWrite(rec.id)
             terminals++
             break
@@ -960,12 +1121,14 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
               `write ${rec.id} rejected by server: ${JSON.stringify(outcome.body).slice(0, 200)}`,
             )
             toastFeedback.error('这条改动无法保存,可能内容有误。')
+            await recordTerminal(rec, 'rejected', JSON.stringify(outcome.body).slice(0, 200))
             await deleteWrite(rec.id)
             terminals++
             break
           case 'terminal':
             debugLogger.error(SOURCE, `write ${rec.id} terminal failure: ${outcome.message}`)
             toastFeedback.error('保存失败,请重试。')
+            await recordTerminal(rec, 'terminal', outcome.message)
             await deleteWrite(rec.id)
             terminals++
             break
@@ -977,6 +1140,7 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
                 `write ${rec.id} dead-lettered after ${attempts} attempts: ${outcome.message}`,
               )
               toastFeedback.error('多次重试失败,部分改动未能保存。')
+              await recordTerminal(rec, 'dead-letter', `after ${attempts} attempts: ${outcome.message}`)
               await deleteWrite(rec.id)
               terminals++
             } else {
@@ -1119,7 +1283,28 @@ const clearIdbStore = async (): Promise<void> => {
   }
 }
 
+// FX-7 / A6: clear the terminal ledger store between tests (mirrors clearIdbStore).
+const clearTerminalsStore = async (): Promise<void> => {
+  if (!isIdbAvailable()) return
+  try {
+    await runTx<undefined>(
+      'readwrite',
+      (store) => store.clear() as IDBRequest<undefined>,
+      TERMINALS_STORE,
+    )
+  } catch (error) {
+    debugLogger.warn(SOURCE, `terminal clear failed during reset: ${msg(error)}`)
+  }
+}
+
 export const __dumpWritesForTest = getAllWrites
+
+/**
+ * FX-7 / A6 test-only: dump the terminal ledger (dead-letter / conflict / rejected
+ * entries with op summary + error code + time). Mirrors __dumpWritesForTest for the
+ * ledger store; production code uses getWriteQueueTerminals() (same data, public API).
+ */
+export const __dumpTerminalsForTest = readAllTerminals
 
 /**
  * G1-a R4 F2 test-only:直接 putWrite 一批构造好的记录(含受控 id / createdAt / nextAttemptAt),
@@ -1134,9 +1319,12 @@ export const __seedWritesForTest = async (records: QueuedWrite[]): Promise<void>
 
 export const __resetWriteQueueDb = async (): Promise<void> => {
   memStore.clear()
+  // FX-7 / A6: clear the terminal ledger + its memStore fallback too.
+  terminalMem.clear()
   // Drop the cached connection so the next op reopens against the (now-cleared) store.
   dbPromise = undefined
   await clearIdbStore()
+  await clearTerminalsStore()
   // Reset the IDB-degradation toast debounce so each test starts with a fresh first-failure
   // toast window (P1-2). clearIdbStore is test-internal and uses plain debugLogger.warn (not
   // warnIdbDegradation), so it never sets the flag — a prior test's data-path failure may have.

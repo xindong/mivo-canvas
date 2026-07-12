@@ -18,6 +18,7 @@ import {
 import { useCanvasStore } from '../store/canvasStore'
 import { selectHasUnreadChangelog, useChangelogStore } from '../store/changelogStore'
 import { debugLogger, useDebugLogStore, type DebugLogEntry, type DebugLogLevel } from '../store/debugLogStore'
+import { getRemoteDebugDropCount } from '../store/remoteDebugReporter'
 import { toastFeedback } from '../store/toastStore'
 import type { CanvasId } from '../types/mivoCanvas'
 import { ChangelogPanel } from './ChangelogPanel'
@@ -70,6 +71,10 @@ export function ProjectSidebar({
   const [changelogOpenedAt, setChangelogOpenedAt] = useState<number | null>(null)
   const [debugLogOpen, setDebugLogOpen] = useState(false)
   const [debugLogFilter, setDebugLogFilter] = useState<DebugLogLevel | 'all'>('all')
+  // FX-7 / A6: persisted remote-debug drop count (batches lost after retry exhaustion).
+  // Loaded when the Debug Log panel opens so operators can see unrecoverable diagnostic
+  // losses during the A3 persist gray observation window without scraping server logs.
+  const [remoteDropCount, setRemoteDropCount] = useState<number | null>(null)
   // Track which project is in inline-rename mode. Lifted (not per-ProjectRow) so a
   // freshly-created project can enter rename mode immediately (B7: 段头 + → create
   // → rename).
@@ -81,6 +86,14 @@ export function ProjectSidebar({
   useEffect(() => {
     void loadChangelog()
   }, [loadChangelog])
+
+  // FX-7 / A6: refresh the persisted drop count whenever the Debug Log panel opens so
+  // the operator sees the current value (it survives refresh in IDB; a live bump from a
+  // retry-exhaustion in another code path lands on the next open).
+  useEffect(() => {
+    if (!debugLogOpen) return
+    void getRemoteDebugDropCount().then(setRemoteDropCount)
+  }, [debugLogOpen])
 
   // Derived sidebar model: project groups (sorted by latest activity) + standalone
   // canvas ids. Replaces the hardcoded demo projectGroups/starterCanvasIds.
@@ -340,6 +353,17 @@ export function ProjectSidebar({
                       <div>
                         <strong>Debug Log</strong>
                         <span>Runtime console</span>
+                      </div>
+                      <div className="debug-log-dropcount" title="Remote diagnostic batches dropped after retry exhaustion (FX-7)">
+                        {remoteDropCount === null ? (
+                          <span aria-live="polite">Dropped…</span>
+                        ) : remoteDropCount > 0 ? (
+                          <span className="debug-log-dropcount-warn" aria-live="polite">
+                            Dropped {remoteDropCount}
+                          </span>
+                        ) : (
+                          <span aria-live="polite">Dropped 0</span>
+                        )}
                       </div>
                       <button type="button" aria-label="Close debug log" onClick={() => setDebugLogOpen(false)}>
                         <X size={16} />

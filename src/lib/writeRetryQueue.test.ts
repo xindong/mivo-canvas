@@ -1,6 +1,7 @@
 import 'fake-indexeddb/auto'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  __dumpTerminalsForTest,
   __dumpWritesForTest,
   __resetWriteQueueDb,
   __seedWritesForTest,
@@ -1482,5 +1483,92 @@ describe('G1-a R7-1 — 稳定拓扑排序(Kahn + 原序 tie-break,只沿真实 
     expect((calls[3]!.op as { canvasId: string }).canvasId).toBe('c-b')
     expect(r).toEqual({ processed: 4, successes: 4, failures: 0, terminals: 0, paused: false })
     expect(await q.pendingCount()).toBe(0)
+  })
+})
+
+// ── FX-7 / A6: durable terminal ledger (dead-letter / conflict / rejected outcomes) ──
+//
+// 决策 3(lead A6 task pack):writeRetryQueue 的 dead-letter/conflict 终态处理(现状"记录后立即
+// 删除")增加持久化终态账本(IDB,含 op 摘要/错误码/时间),供 A3 灰度观察窗定量统计
+// "dead-letter=0" / "不可解释 conflict=0"。**只加账本不改重试语义** —— 账本是 append-only,
+// 与现有 delete-after-surface 并行;retry/backoff/terminal-decision 逻辑不动。
+//
+// 账本查询入口(生产/A3 观察):
+//   import { getWriteQueueTerminals } from './writeRetryQueue'
+//   const terminals = await getWriteQueueTerminals()   // [{status, opKind, resourceKey, message, attempts, timestamp, ...}]
+// 测试入口:__dumpTerminalsForTest()(同数据,test-only 镜像)。
+
+describe('FX-7 / A6 — durable terminal ledger (append-only; retry semantics unchanged)', () => {
+  it('SC3: a dead-letter outcome is recorded in the durable ledger with its error code + op summary', async () => {
+    const { fn } = seqExecutor([{ status: 'transient', message: 'http_503' }])
+    const q = makeQueue(fn, { maxAttempts: 2, baseDelayMs: 1000, maxDelayMs: 60_000 })
+    await q.enqueue(minimalNode('c1', 'n1'))
+    // attempt 1: attempts 0→1 (<2) → backoff
+    expect((await q.drain()).failures).toBe(1)
+    tick(800) // past backoff
+    // attempt 2: attempts 1→2 (>=2) → dead-letter (terminal)
+    const r = await q.drain()
+    expect(r.terminals).toBe(1)
+
+    // The durable terminal ledger has the dead-letter entry, queryable with the error code.
+    const ledger = await __dumpTerminalsForTest()
+    expect(ledger).toHaveLength(1)
+    const entry = ledger[0]!
+    expect(entry.status).toBe('dead-letter') // error code
+    expect(entry.opKind).toBe('upsertNode') // op summary
+    expect(entry.message).toContain('http_503') // error detail
+    expect(entry.message).toContain('after 2 attempts')
+    expect(entry.attempts).toBe(2) // attempts at termination
+    expect(entry.resourceKey).toBe('node:c1:n1') // resource summary
+  })
+
+  it('conflict + rejected + terminal outcomes are all ledgered (A3 audit coverage)', async () => {
+    // conflict (409 revision-conflict)
+    const cq = makeQueue(seqExecutor([{ status: 'conflict', currentRevision: 9 }]).fn, { onConflict: vi.fn() })
+    await cq.enqueue(minimalNode('c1', 'n1', 5))
+    await cq.drain()
+    // rejected (4xx)
+    const rq = makeQueue(seqExecutor([{ status: 'rejected', body: { error: 'bad-request' } }]).fn)
+    await rq.enqueue(minimalNode('c2', 'n2'))
+    await rq.drain()
+    // plain terminal (non-classifiable HTTP)
+    const tq = makeQueue(seqExecutor([{ status: 'terminal', message: 'http_418' }]).fn)
+    await tq.enqueue(minimalNode('c3', 'n3'))
+    await tq.drain()
+
+    const ledger = await __dumpTerminalsForTest()
+    const statuses = ledger.map((e) => e.status).sort()
+    expect(statuses).toEqual(['conflict', 'rejected', 'terminal'])
+    // each entry carries its error-code detail in `message`
+    const byStatus = new Map(ledger.map((e) => [e.status, e]))
+    expect(byStatus.get('conflict')!.message).toContain('9')
+    expect(byStatus.get('rejected')!.message).toContain('bad-request')
+    expect(byStatus.get('terminal')!.message).toContain('http_418')
+  })
+
+  it('success outcomes are NOT ledgered (success is not a failure terminal)', async () => {
+    const { fn } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue(minimalNode('c1', 'n1'))
+    await q.drain()
+    expect((await __dumpTerminalsForTest()).length).toBe(0)
+  })
+
+  it('ledger does not change retry semantics: a transient op still retries with backoff then succeeds', async () => {
+    // The ledger is append-only alongside delete-after-surface; it must not alter the
+    // retry/backoff/terminal-decision flow. A transient op retries and succeeds on the
+    // second attempt — the ledger stays empty until a real terminal outcome.
+    const { fn, calls } = seqExecutor([
+      { status: 'transient', message: 'http_503' },
+      { status: 'success' },
+    ])
+    const q = makeQueue(fn, { baseDelayMs: 1000, maxDelayMs: 60_000 })
+    await q.enqueue(minimalNode('c1', 'n1'))
+    expect((await q.drain()).failures).toBe(1)
+    tick(1000) // past backoff
+    expect((await q.drain()).successes).toBe(1)
+    expect(calls).toHaveLength(2)
+    // No terminal ledger entry — success is not a failure terminal.
+    expect((await __dumpTerminalsForTest()).length).toBe(0)
   })
 })
