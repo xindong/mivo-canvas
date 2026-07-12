@@ -50,6 +50,7 @@ import {
   __resetPersistBoot,
   hydrateFromServer,
   shadowCompareWithServer,
+  getHydratedUserState,
 } from './persistBoot'
 import { __resetWriteQueueDb } from './writeRetryQueue'
 import type { ServerPersistAdapter } from './serverPersistAdapter'
@@ -360,5 +361,95 @@ describe('G1-a R2 F1 — canvas create+update coalesce 不丢 create + metaRevis
     expect(calls[0].headers['if-match']).toBe('0')
     expect(useCanvasStore.getState().canvases[id]?.metaRevision).toBe(1)
     expect(useCanvasStore.getState().canvases[id]?.title).toBe('c2')
+  })
+})
+
+// ── G1-a R2 F2:server 冷启动恢复 canvas-meta + user-state(不 only-log)────────────────
+// 验收(对齐 finding F2):
+//  - 空 IDB + BFF 预置 canvas meta → store.canvases 出现 meta-stub(title/projectId/metaRevision 对齐;
+//    content 空,全量 content hydrate 属 G1-c defer)。
+//  - 本地已有 canvas + BFF meta → meta 字段刷新(title/metaRevision),本地 content(nodes)保留。
+//  - user-state map 落点(getHydratedUserState 返值;非只 log)。
+const canvasMeta = (id: string, projectId: string, title: string, metaRevision: number): CanvasMeta => ({
+  id,
+  projectId,
+  title,
+  createdAt: 't',
+  updatedAt: 't',
+  metaRevision,
+  contentVersion: 0,
+})
+
+describe('G1-a R2 F2 — canvas-meta hydrate 合并进 store.canvases(不 only-log)', () => {
+  it('空 IDB + BFF canvas meta → store.canvases 出现 meta-stub(meta 对齐,content 空 G1-c defer)', async () => {
+    useCanvasStore.setState({ canvases: {} })
+    expect(Object.keys(useCanvasStore.getState().canvases)).toHaveLength(0)
+    const fakeAdapter = {
+      listProjects: async () => ({ projects: [] }),
+      listCanvas: async () => ({ canvases: [canvasMeta('c-srv', 'p1', 'server-canvas', 3)] }),
+      listChatMessages: async () => ({ messages: [], orderRevision: 0 }),
+    } as unknown as ServerPersistAdapter
+    const fakeOpts = {
+      fetch: async () => new Response(JSON.stringify({ entries: {} }), { status: 200, headers: { 'content-type': 'application/json' } }),
+      baseUrl: '',
+      getAuthHeaders: () => authHeaders(),
+    }
+    await hydrateFromServer(fakeAdapter, fakeOpts)
+    const c = useCanvasStore.getState().canvases['c-srv']
+    expect(c).toBeDefined()
+    expect(c.title).toBe('server-canvas')
+    expect(c.projectId).toBe('p1')
+    expect(c.metaRevision).toBe(3)
+    // content 空(全量 content hydrate 属 G1-c defer;meta 已恢复,非 only-log)
+    expect(c.nodes).toEqual([])
+  })
+
+  it('本地已有 canvas + BFF meta → meta 刷新(title/metaRevision),本地 content 保留', async () => {
+    const localNode = { id: 'n1', type: 'text', title: 'local', x: 0, y: 0, width: 100, height: 40, text: 'hi' } as never
+    useCanvasStore.setState({
+      canvases: {
+        c1: { title: 'old-title', projectId: 'p1', createdAt: 't', updatedAt: 't', nodes: [localNode], edges: [], tasks: [] } as never,
+      },
+    })
+    const fakeAdapter = {
+      listProjects: async () => ({ projects: [] }),
+      listCanvas: async () => ({ canvases: [canvasMeta('c1', 'p1', 'new-title', 7)] }),
+      listChatMessages: async () => ({ messages: [], orderRevision: 0 }),
+    } as unknown as ServerPersistAdapter
+    const fakeOpts = {
+      fetch: async () => new Response(JSON.stringify({ entries: {} }), { status: 200, headers: { 'content-type': 'application/json' } }),
+      baseUrl: '',
+      getAuthHeaders: () => authHeaders(),
+    }
+    await hydrateFromServer(fakeAdapter, fakeOpts)
+    const c = useCanvasStore.getState().canvases['c1']
+    expect(c.title).toBe('new-title') // 服务端 meta 刷新
+    expect(c.metaRevision).toBe(7)
+    expect(c.nodes).toEqual([localNode]) // 本地 content 保留(G1-c content hydrate 未跑)
+  })
+})
+
+describe('G1-a R2 F2 — user-state hydrate 落点(不 only-log)', () => {
+  it('hydrate user-state map → getHydratedUserState 返值(非只 log)', async () => {
+    const fakeAdapter = {
+      listProjects: async () => ({ projects: [] }),
+      listCanvas: async () => ({ canvases: [] }),
+      listChatMessages: async () => ({ messages: [], orderRevision: 0 }),
+    } as unknown as ServerPersistAdapter
+    const fakeOpts = {
+      fetch: async () =>
+        new Response(
+          JSON.stringify({ entries: { 'pref:theme': { key: 'pref:theme', value: 'dark', revision: 2, updatedAt: 't' } } }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      baseUrl: '',
+      getAuthHeaders: () => authHeaders(),
+    }
+    await hydrateFromServer(fakeAdapter, fakeOpts)
+    const entry = getHydratedUserState('pref:theme')
+    expect(entry).toBeDefined()
+    expect(entry?.value).toBe('dark')
+    expect(entry?.revision).toBe(2)
+    expect(getHydratedUserState('absent-key')).toBeUndefined()
   })
 })

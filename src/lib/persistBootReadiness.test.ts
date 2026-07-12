@@ -257,3 +257,30 @@ describe('G1-a R2 F5 — paused-401 resume(已认证 boot 自动重放)', () => 
     await expect(resumePersistQueue()).resolves.toBeUndefined()
   })
 })
+
+// ── G1-a R2 F2:standalone canvas 在 server 模式强制归 project(不再 projectId='' → 404)─────
+// 验收(对齐 finding F2 子项2):server 模式 createCanvas 无显式 projectId → enqueue 的 createCanvas op
+// 带 projects[0].id(非 ''),防 POST /api/canvas 空 projectId 走 unknown-project 404 被队列当 rejected 删。
+describe('G1-a R2 F2 — server 模式 standalone canvas 强制归 project', () => {
+  it('createCanvas 无 projectId → enqueue op.projectId = projects[0].id(非空)', async () => {
+    useCanvasStore.setState({ projects: [{ id: 'p1', name: 'P1', createdAt: 't' }] as never })
+    // start queue 让 enqueue 落 IDB(便于 dump op);fetch stub 仅 readiness 不触达(createCanvas 入队即停)
+    startPersistWriteQueue({ fetch: async () => healthz('pg', true), baseUrl: '', getAuthHeaders: () => authHeaders() })
+    useCanvasStore.getState().createCanvas('Untitled Canvas')
+    await flush()
+    const recs = await __dumpWritesForTest()
+    const createOp = recs.find((r) => r.op.kind === 'createCanvas')
+    expect(createOp).toBeDefined()
+    expect((createOp!.op as { projectId: string }).projectId).toBe('p1')
+  })
+
+  it('createCanvas 显式 projectId → 用显式值(不强覆盖)', async () => {
+    useCanvasStore.setState({ projects: [{ id: 'p1', name: 'P1', createdAt: 't' }, { id: 'p2', name: 'P2', createdAt: 't' }] as never })
+    startPersistWriteQueue({ fetch: async () => healthz('pg', true), baseUrl: '', getAuthHeaders: () => authHeaders() })
+    useCanvasStore.getState().createCanvas('T', { projectId: 'p2' })
+    await flush()
+    const recs = await __dumpWritesForTest()
+    const createOp = recs.find((r) => r.op.kind === 'createCanvas')
+    expect((createOp!.op as { projectId: string }).projectId).toBe('p2')
+  })
+})

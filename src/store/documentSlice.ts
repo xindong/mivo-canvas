@@ -36,6 +36,7 @@ import {
   snapshotFromState,
 } from './canvasDocumentModel'
 import { enqueuePersistWrite } from '../lib/persistBoot'
+import { isServerPersist } from '../lib/persistMode'
 
 export const createDocumentSlice: SliceCreator = (set, get) => ({
   canvases: defaultCanvases,
@@ -46,15 +47,22 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
   historyFuture: [],
   createCanvas: (title = 'Untitled Canvas', options) => {
     const id = createCanvasId()
+    // R2 F2:server 模式 standalone canvas 强制归 project(防 POST /api/canvas projectId='' → 404 unknown-project
+    // 被队列当 rejected 删)。local 模式保持 options?.projectId(undefined = standalone,零变化)。
+    // docProjectId 用于本地 doc(local standalone=undefined);opProjectId 用于 enqueue op(string 要求,'' 兜底)。
+    const docProjectId = isServerPersist
+      ? (options?.projectId ?? get().projects[0]?.id ?? '')
+      : options?.projectId
+    const opProjectId = docProjectId ?? ''
 
     set((state) => {
       const document = options?.templateId
         ? {
             ...canvasDocumentFromScene(options.templateId),
             title,
-            projectId: options.projectId,
+            projectId: docProjectId,
           }
-        : createBlankDocument(title, options?.projectId)
+        : createBlankDocument(title, docProjectId)
       const normalizedDocument = normalizeDocument(document)
 
       return {
@@ -80,7 +88,7 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
     enqueuePersistWrite({
       kind: 'createCanvas',
       canvasId: id,
-      projectId: options?.projectId ?? '',
+      projectId: opProjectId,
       title,
       ...(options?.templateId ? { sourceTemplateId: options.templateId } : {}),
     })

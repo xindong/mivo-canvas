@@ -25,7 +25,8 @@ import { debugLogger } from '../store/debugLogStore'
 import { toastFeedback } from '../store/toastStore'
 import { defaultFetch, type FetchAdapterOptions, type FetchLike, type GetAuthHeaders } from './serverPersistAdapter'
 import type { ChatMessage } from '../store/chatStore'
-import type { Revision } from '../../shared/persist-contract.ts'
+import type { CanvasDocument } from '../types/mivoCanvas'
+import type { Revision, UserStateEntry } from '../../shared/persist-contract.ts'
 
 const SOURCE = 'Persist Boot'
 
@@ -51,6 +52,16 @@ const orderRevisionByCanvas = new Map<string, Revision>()
  */
 export const getChatOrderRevision = (canvasId: string): Revision | undefined =>
   orderRevisionByCanvas.get(canvasId)
+
+// G1-a R2 F2:user-state hydrate 落点(非只 log)。selection/camera 当前 ephemeral、settings=API keys
+// 受 DP-7 排除——无 client KV store 消费;但 hydrate 把 map 存此,供未来 selection/camera/pref KV 接线消费。
+const userStateMap = new Map<string, UserStateEntry>()
+
+/**
+ * G1-a R2 F2:取 hydrate 的 user-state entry。由 hydrateFromServer 在 server 模式写入;未 hydrate / local →
+ * undefined。消费方(selection/camera/pref-KV)defer 到 G1-c,此处是 server-truth 应用点(非只 log)。
+ */
+export const getHydratedUserState = (key: string): UserStateEntry | undefined => userStateMap.get(key)
 
 /**
  * G1-a P1-1:非画布域 mutation enqueue 出口。store mutation(set 后)调此。
@@ -82,6 +93,7 @@ export const __resetPersistBoot = (): void => {
   writeQueue?.stop()
   writeQueue = undefined
   orderRevisionByCanvas.clear()
+  userStateMap.clear()
 }
 
 // ── server 模式 boot:hydrate 非画布域(从 BFF 恢复)──
@@ -108,25 +120,70 @@ export const hydrateFromServer = async (
     debugLogger.error(SOURCE, `listProjects hydrate failed: ${msg(error)} (degrade to local/demo state)`)
   }
 
-  // 2. canvas meta 列表(可观测差异证据;全量 content hydrate fetchCanvas + RecordEntry→NodeRecord 转换属 G1-c,
-  //    本轮只读 list 作 observability + 为 G1-c 铺底,不替换 store.canvases——否则 content 缺失致画布空)。
+  // 2. canvas meta 列表 → 合并进 store.canvases(R2 F2:不再 only-log)。全量 content hydrate
+  //    (fetchCanvas + RecordEntry→NodeRecord)属 G1-c defer —— 此处只 merge meta(title/projectId/
+  //    metaRevision/contentVersion/updatedAt),本地 content(nodes/edges/tasks)保留;服务端有但本地
+  //    无的 canvas 插入 meta-stub(content 空,G1-c 补 content);本地有但服务端无的保留(pending create /
+  //    demo,G1-c reconcile)。active sceneId 的 meta 刷新但其 flattened nodes/edges 不动(content 不变)。
   try {
     const { canvases } = await adapter.listCanvas()
+    const serverById = new Map(canvases.map((m) => [m.id, m] as const))
+    useCanvasStore.setState((s) => {
+      const local = s.canvases
+      const merged: Record<string, CanvasDocument> = {}
+      for (const meta of canvases) {
+        const existing = local[meta.id]
+        if (existing) {
+          // 刷新 meta 字段,保留本地 content(nodes/edges/tasks/selection)+ sourceTemplateId
+          // (sourceTemplateId 客户端是 DemoSceneId,服务端 string 不覆盖)。
+          merged[meta.id] = {
+            ...existing,
+            title: meta.title,
+            projectId: meta.projectId,
+            metaRevision: meta.metaRevision,
+            contentVersion: meta.contentVersion,
+            updatedAt: meta.updatedAt,
+          }
+        } else {
+          // meta-stub:content 空(G1-c content hydrate defer);meta 已恢复,非 only-log。
+          // sourceTemplateId 不从服务端 string 覆盖(客户端 DemoSceneId 域,留 undefined)。
+          merged[meta.id] = {
+            title: meta.title,
+            projectId: meta.projectId,
+            createdAt: meta.createdAt,
+            updatedAt: meta.updatedAt,
+            metaRevision: meta.metaRevision,
+            contentVersion: meta.contentVersion,
+            nodes: [],
+            edges: [],
+            tasks: [],
+          } as CanvasDocument
+        }
+      }
+      // 本地有但服务端无:保留(pending create / demo;G1-c 全量 reconcile owns drop)
+      for (const [id, doc] of Object.entries(local)) {
+        if (!serverById.has(id)) merged[id] = doc
+      }
+      return { canvases: merged }
+    })
     debugLogger.log(
       SOURCE,
-      `server hydrate: ${canvases.length} canvas meta(s) from BFF (content hydrate deferred to G1-c; store.canvases unchanged)`,
+      `server hydrate: ${canvases.length} canvas meta(s) merged into store.canvases (content hydrate deferred to G1-c; local-only canvases retained)`,
     )
   } catch (error) {
     debugLogger.warn(SOURCE, `listCanvas hydrate failed: ${msg(error)}`)
   }
 
-  // 3. user-state map(可观测;无 client KV store——selection/camera 当前 ephemeral,settings=API keys 受 DP-7 排除;
-  //    application 到 store deferred 到 pref KV 落地,本轮只 log 作 server-truth 证据)。
+  // 3. user-state map → 落点(R2 F2:不再 only-log)。selection/camera 当前 ephemeral、settings=API keys
+  //    受 DP-7 排除——无 client KV store 消费;但 hydrate 把 map 存 module 级(getHydratedUserState),
+  //    供未来 selection/camera/pref KV 接线消费(非只 log;消费方属 G1-c/pref-KV defer,此处只存)。
   try {
     const map = await hydrateUserStateMap(opts)
+    userStateMap.clear()
+    for (const [k, v] of Object.entries(map)) userStateMap.set(k, v)
     debugLogger.log(
       SOURCE,
-      `server hydrate: ${Object.keys(map).length} user-state key(s) from BFF (no client KV store yet; apply deferred)`,
+      `server hydrate: ${userStateMap.size} user-state key(s) from BFF (stored via getHydratedUserState; consumer (selection/camera/pref-KV) deferred)`,
     )
   } catch (error) {
     debugLogger.warn(SOURCE, `hydrateUserStateMap failed: ${msg(error)}`)
