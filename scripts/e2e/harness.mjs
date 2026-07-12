@@ -154,7 +154,13 @@ export const writePersistedKv = async (page, key, value) => {
 
 /** Poll readPersistedKv until predicate(rawString) returns true or timeout. Used for
  *  persist checks where the IDB write is async (zustand persist fire-and-forgets the
- *  setItem promise, so the read might lag the state change). */
+ *  setItem promise, so the read might lag the state change).
+ *
+ *  Returns the raw string once predicate(raw) is true, or `null` on timeout. NEVER
+ *  returns a non-null blob whose content failed the predicate — that was the SC-15
+ *  false-green (a `generating` blob passed an `error`/`failed` predicate check because
+ *  callers only did `if (!raw) throw`). Callers must assert predicate semantics, not
+ *  just key existence; the honest `null` return forces that. */
 export const waitForPersistedKv = async (page, key, predicate, { timeout = 2000, interval = 50 } = {}) => {
   const deadline = Date.now() + timeout
   while (Date.now() < deadline) {
@@ -162,7 +168,14 @@ export const waitForPersistedKv = async (page, key, predicate, { timeout = 2000,
     if (raw !== null && predicate(raw)) return raw
     await new Promise((r) => setTimeout(r, interval))
   }
-  return readPersistedKv(page, key)
+  // SC-15 R2 (probe honesty): predicate never satisfied within timeout → return null.
+  // The previous `return readPersistedKv(page, key)` returned whatever non-null blob
+  // lived under the key even when its content failed the predicate — so callers that
+  // only checked truthiness passed on a non-empty but semantically WRONG blob. That
+  // was exactly the SC-15 false-green that masked the durable-settle bug (a generating
+  // blob passed the error/failed assertion). Returning null forces callers to fail
+  // loudly when the predicate is never met, instead of silently passing.
+  return null
 }
 
 // killStaleDevServer: detect and kill leftover dev/bff servers from a prior failed
