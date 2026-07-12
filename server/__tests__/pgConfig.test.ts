@@ -90,3 +90,64 @@ describe('pgConfig: resolvePersistBackendConfig (F9 idle=0 + defaults)', () => {
     expect(cfg.pg!.port).toBe(55443)
   })
 })
+
+describe('pgConfig: B0 backend 白名单 fail-fast(非法值启动即拒,不静默落 memory)', () => {
+  it('B0: 未设置 MIVO_PERSIST_BACKEND → memory(与现状完全一致)', () => {
+    const cfg = resolvePersistBackendConfig(env({ MIVO_PERSIST_BACKEND: undefined }))
+    expect(cfg.kind).toBe('memory')
+    expect(cfg.pg).toBeNull()
+  })
+
+  it('B0: 空串 → memory(与现状完全一致)', () => {
+    const cfg = resolvePersistBackendConfig(env({ MIVO_PERSIST_BACKEND: '' }))
+    expect(cfg.kind).toBe('memory')
+    expect(cfg.pg).toBeNull()
+  })
+
+  it('B0: 纯空白 → memory(与现状完全一致;trim 视为未设)', () => {
+    const cfg = resolvePersistBackendConfig(env({ MIVO_PERSIST_BACKEND: '   ' }))
+    expect(cfg.kind).toBe('memory')
+    expect(cfg.pg).toBeNull()
+  })
+
+  it('B0: 显式 memory → memory(允许显式声明)', () => {
+    const cfg = resolvePersistBackendConfig(env({ MIVO_PERSIST_BACKEND: 'memory' }))
+    expect(cfg.kind).toBe('memory')
+    expect(cfg.pg).toBeNull()
+  })
+
+  it('B0: 显式 pg(带密码)→ pg', () => {
+    const cfg = resolvePersistBackendConfig(pgEnv())
+    expect(cfg.kind).toBe('pg')
+    expect(cfg.pg).not.toBeNull()
+  })
+
+  it('B0: typo "PG"(大写)→ 抛错,信息回显原值', () => {
+    expect(() => resolvePersistBackendConfig(env({ MIVO_PERSIST_BACKEND: 'PG' }))).toThrow(
+      /MIVO_PERSIST_BACKEND 非法值 "PG"/,
+    )
+  })
+
+  it('B0: typo "postgres" → 抛错', () => {
+    expect(() => resolvePersistBackendConfig(env({ MIVO_PERSIST_BACKEND: 'postgres' }))).toThrow(
+      /MIVO_PERSIST_BACKEND 非法值 "postgres"/,
+    )
+  })
+
+  it('B0: typo "Pg "(大小写+尾空格)→ 抛错,信息回显原值(含尾空格)', () => {
+    expect(() => resolvePersistBackendConfig(env({ MIVO_PERSIST_BACKEND: 'Pg ' }))).toThrow(
+      /MIVO_PERSIST_BACKEND 非法值 "Pg "/,
+    )
+  })
+
+  it('B0: typo 抛错信息说清合法值(含 "pg" 与 "memory",助运维快速自纠)', () => {
+    let msg = ''
+    try {
+      resolvePersistBackendConfig(env({ MIVO_PERSIST_BACKEND: 'PG' }))
+    } catch (e) {
+      msg = (e as Error).message
+    }
+    expect(msg).toMatch(/"pg"/)
+    expect(msg).toMatch(/"memory"/)
+  })
+})
