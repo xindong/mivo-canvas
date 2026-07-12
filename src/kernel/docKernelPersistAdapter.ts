@@ -17,8 +17,10 @@ import { rawIdbStorage } from '../lib/persistIdbStorage'
 import { namespacedKey } from '../lib/persistUserId'
 import { projectToThreeDomain, type PersistedV10Blob } from './persistMigration'
 
-const documentKey = (name: string): string => `${namespacedKey(name)}:document`
-const sessionKey = (name: string): string => `${namespacedKey(name)}:session`
+// documentKey/sessionKey 导出供 __MIVO_E2E__ bridge 复用(e2e harness 解析物理键时走 app
+// 自己的 key 布局,零硬编码;见 main.tsx __MIVO_E2E__ 的 getCanvasPersistDocumentKey)。
+export const documentKey = (name: string): string => `${namespacedKey(name)}:document`
+export const sessionKey = (name: string): string => `${namespacedKey(name)}:session`
 
 const V11 = 11
 
