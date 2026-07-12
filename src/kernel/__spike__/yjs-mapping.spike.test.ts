@@ -24,7 +24,7 @@ import type { MivoCanvasNode } from '../../types/mivoCanvas'
 import { fromRecord } from '../mapping'
 import { MemoryDocKernel } from '../docKernel'
 import type { NodeRecord } from '../records'
-import { validateFieldIntent, type FieldIntent, type FieldSchemaClassifier } from '../../lib/canvasSyncPort'
+import { validateFieldIntent, validateFieldIntentStructural, type FieldIntent, type FieldSchemaClassifier } from '../../lib/canvasSyncPort'
 
 // ─── 通用递归 codec(spike 核心 helper)─────────────────────────────────
 // record-schema §1 映射规则:node=Y.Map;有序集合=Y.Array;标量=叶子;子结构=嵌套 Y.Map。
@@ -608,10 +608,13 @@ describe('N1-D: LeaferJS 渲染面静态分析(Yjs→record→node→renderer �
 // 参考 adapter 语义实现:按 fieldPath 逐层导航 Y.Map/Y.Array,叶子处 set/delete(永不 clear 整子树)。
 describe('R2-P1-1: FieldIntent semantics against real Y.Doc (nested leaf + array, A↔B symmetry)', () => {
   // applyFieldIntentToYjs:把单条 FieldIntent 应用到 record 的 Y.Map 上(域语义参考实现)。
-  // 逐层导航:string→Y.Map.get、number→Y.Array.get;叶子处 set/delete。先过 validateFieldIntent(封死非原子 set)。
+  // 逐层导航:string→Y.Map.get、number→Y.Array.get;叶子处 set/delete。先过 validator(封死非原子 set)。
   // 返修 R3-P1-1:加可选 classify 参数(schema-aware 拒容器/数组元素路径上的 leaf op)。
+  // 返修 R4-P1-1:安全入口 validateFieldIntent 的 classifier 改必填——spike helper 无 classifier 时走低层
+  //   validateFieldIntentStructural(结构性:非原子 set / 空路径 / 数组元素 delete);有 classifier 走安全入口(结构 + schema-aware)。
   const applyFieldIntentToYjs = (ymap: Y.Map<unknown>, intent: FieldIntent, classify?: FieldSchemaClassifier): void => {
-    validateFieldIntent(intent, classify) // 域级 validator 先校验(封死非原子 set + R3 schema-aware 容器/数组元素拒绝)
+    if (classify) validateFieldIntent(intent, classify) // 安全入口(结构 + schema-aware)
+    else validateFieldIntentStructural(intent) // 低层结构校验(无 schema 时仍封死非原子 set / 数组元素 delete)
     const path = [...intent.fieldPath]
     let cur: unknown = ymap
     for (let i = 0; i < path.length - 1; i++) {

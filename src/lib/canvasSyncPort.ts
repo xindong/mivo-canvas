@@ -43,6 +43,20 @@
 //     204+present 落 accepted 假成功);删 mapHttpStatusToOutcome 的 isDelete+404→accepted 旧 shortcut;冻结冲突
 //     恢复责任在 caller(adapter 不自动重删)。
 //
+// 返修 R4(G1-b 第四轮 REQUIRES_CHANGES,2026-07-12,2 条 P1 见 REVIEW-FINDINGS-G1B-R4.md,lead 复审判决):
+//   - R4-P1-1 schema classifier 必填(安全入口不可静默降级):R3 把 classifier 设为可选,导致省略 classifier 时
+//     delete ['transform']/['fills']/set ['transform']=7 原漏洞原样通过(旧测试 line 388 甚至钉死 not.toThrow)。
+//     R4 让 schema 分类成为不可省略的校验前提:validateFieldIntent(intent, classify: FieldSchemaClassifier)classifier
+//     **必填** = 安全入口(编译期省略即 tsc error + 运行时防御兜 as-cast 旁路);结构性校验拆到显式命名的低层
+//     validateFieldIntentStructural(空路径/非原子 set/数组元素 delete——非安全入口,不拒 schema-aware clobber)。
+//     四负例经安全入口(任何合法公开调用 = 带 classifier)必拒;红线 @ts-expect-error 仍恰 7(未增减)。
+//   - R4-P1-2 caller-owned retry/rebase 经公开 submitChange 闭环:R3 的 FifoRecordPort sync submit/ackCreate
+//     重发**旧** entry.create(adapter 自动重试 stale create),无 caller 提交 rebased create/new base 接管 pending
+//     entry 的路径;conflict→accepted 测试靠预编排 outcome 队列假收敛。R4 改 FifoRecordPort 为 async
+//     submitChange(canvasId, change, base?) 同形参考:phase(in-flight vs awaiting-retry)区分 retry(推进 pending
+//     attempt,经公开入口)+ duplicate(in-flight 期间并发,直送 transport);base 透传 transport 区分 old/new base
+//     (旧 base 仍 conflict、新 base 才 accepted);held edit 在 create 终态才 settle。删 ackCreate(不再重发旧 create)。
+//
 // 不接线(N2-0 决议前 G1-c 不落地实现):本文件只冻结接口 + 类型 + 域级 validator(非 transport impl),无 runtime transport。
 // unwiredCanvasSyncPort 占位即失败(Karpathy 规则 12:fail visibly, not silently)——防误以为已同步。
 //
@@ -158,30 +172,30 @@ const isAtomicLeaf = (v: unknown): boolean =>
 export type FieldPathTarget = 'leaf' | 'container' | 'array-element'
 
 /**
- * Schema 分类器(可选,返修 R3-P1-1):判断 fieldPath 终点是 leaf / container / array-element。
+ * Schema 分类器(返修 R3-P1-1 引入;R4-P1-1 改 validateFieldIntent 必填):判断 fieldPath 终点是 leaf / container / array-element。
  * port 对 record schema 不透明(FieldIntent.value:unknown 即此意)——classifier 由调用方 / adapter 提供
  * (N2-0 决议后由真 schema 驱动;port freeze 阶段测试传固定 classifier 证明契约可行)。
- * 不传 classifier 时 validator 只做结构性校验(空路径 / 非原子 set / 数组元素 delete-field——
- * 后者无需 schema:last segment 是 number 即数组元素,by-stable-id 方向结构性拒)。
+ * R4-P1-1:安全入口 validateFieldIntent 的 classifier **必填**(省略 = 编译期 tsc error + 运行时防御兜 as-cast 旁路);
+ *   不传 classifier 的结构性校验走显式命名的低层 validateFieldIntentStructural(空路径 / 非原子 set / 数组元素 delete-field——
+ *   后者无需 schema:last segment 是 number 即数组元素,by-stable-id 方向结构性拒;structural 非安全入口,不拒 schema-aware clobber)。
  */
 export type FieldSchemaClassifier = (fieldPath: FieldPath) => FieldPathTarget
 
 /**
- * 校验单条 FieldIntent 封死 clobber 规则(port 冻结域级 validator):
+ * 校验单条 FieldIntent 的**结构性**规则(低层,非安全入口)。
+ * 只做不依赖 schema 的结构性检查:
  * - 拒空 fieldPath(编译期 tuple 已拒,运行时兜 `as` cast 旁路)。
- * - `set` 拒非原子 value(对象/数组 = 整子树替换 = clobber,封死);原子叶子 set 放行。
+ * - `set` 拒非原子 value(对象/数组 = 整子树替换 = clobber,封死)。
  * - `delete-field` 数组元素(last segment number)→ 拒 `array-element-structure-delete`
  *   (不稳定 index,by-stable-id deferred to N2-0 §10.1;无需 schema,结构性拒)。
- * - 有 classifier 时:container / array-element 路径上的 `set`(原子值)→ 拒 `atomic-value-to-container-path`;
- *   `delete-field` 到 container → 拒 `container-delete-field`(整子树删 = clobber 重表达)。
- *   这是首审 clobber(spike 坑7:整 transform 重写吞 B 的 transform.y=999)在 delete-field 整子树删 /
- *   原子值-to-容器路径 两个换名重表达面的封死;合法 optional leaf delete 放行(如 delete ['title'])。
- * 调用方:adapter 在翻译 edit-* intents 前逐条校验;port 占位实现不走此路(N2-0 决议后 G1-c adapter 接入)。
+ *
+ * 返修 R4-P1-1(安全入口不可静默降级):R3 把 classifier 设为可选,导致省略 classifier 时
+ *   container-delete / 原子值-to-容器 原漏洞原样通过。R4 把 schema 分类提成不可省略的校验前提
+ *   (validateFieldIntent classifier 必填 = 安全入口),结构性校验拆到此**显式命名**的低层函数。
+ *   本函数**非安全入口**:不拒 schema-aware clobber(container/array-element 路径上 leaf op)——
+ *   调用方明示用 structural 即知无 schema 防线;四负例全拒须走 validateFieldIntent(带 classifier)。
  */
-export const validateFieldIntent = (
-  intent: FieldIntent,
-  classify?: FieldSchemaClassifier,
-): void | never => {
+export const validateFieldIntentStructural = (intent: FieldIntent): void | never => {
   if (intent.fieldPath.length === 0) throw new FieldIntentError('empty-field-path')
   if (intent.op === 'set' && !isAtomicLeaf(intent.value)) {
     throw new FieldIntentError('non-atomic-parent-set')
@@ -192,16 +206,42 @@ export const validateFieldIntent = (
   if (intent.op === 'delete-field' && typeof last === 'number') {
     throw new FieldIntentError('array-element-structure-delete')
   }
-  // schema-aware 分类(可选):有 classifier 时拒 container/array-element 路径上的 leaf op。
-  if (classify) {
-    const target = classify(intent.fieldPath)
-    if (target === 'container' || target === 'array-element') {
-      if (intent.op === 'set') throw new FieldIntentError('atomic-value-to-container-path')
-      // delete-field 到 container(整子树删);array-element 已在上方结构性拦,此处兜 classifier 返回 array-element。
-      throw new FieldIntentError(
-        target === 'container' ? 'container-delete-field' : 'array-element-structure-delete',
-      )
-    }
+}
+
+/**
+ * 校验单条 FieldIntent 封死 clobber 规则(**安全入口**,port 冻结域级 validator):
+ * - 先过结构性校验(validateFieldIntentStructural:空路径 / 非原子 set / 数组元素 delete-field)。
+ * - schema-aware 分类(classifier **必填**):container / array-element 路径上的 `set`(原子值)→
+ *   拒 `atomic-value-to-container-path`;`delete-field` 到 container → 拒 `container-delete-field`(整子树删 = clobber 重表达)。
+ *   这是首审 clobber(spike 坑7:整 transform 重写吞 B 的 transform.y=999)在 delete-field 整子树删 /
+ *   原子值-to-容器路径 两个换名重表达面的封死;合法 optional leaf delete 放行(如 delete ['title'])。
+ *
+ * 返修 R4-P1-1:schema 分类成为**不可省略**的校验前提——classifier 从可选改必填(编译期:省略即 tsc error);
+ *   运行时防御兜 `as` cast 旁路(非函数 classifier → 显式抛错,与 empty-field-path 运行时防御同型)。
+ *   安全入口永不静默降级到无 schema 校验(旧可选 classifier 让四负例原漏洞原样通过,是 R4 finding 的核心洞)。
+ * 调用方:adapter 在翻译 edit-* intents 前逐条校验;port 占位实现不走此路(N2-0 决议后 G1-c adapter 接入)。
+ *
+ * @param intent 待校验意图。
+ * @param classify **必填** schema 分类器(按 record kind 提供;port 对 schema 不透明,classifier 由调用方/adapter 提供)。
+ *   省略或传非函数 = 编译期 tsc error + 运行时显式抛错(双重不可绕过)。
+ */
+export const validateFieldIntent = (
+  intent: FieldIntent,
+  classify: FieldSchemaClassifier,
+): void | never => {
+  if (typeof classify !== 'function') {
+    // 运行时防御:兜 `as` cast 旁路(undefined / 非函数 classifier)。安全入口永不静默降级到无 schema 校验。
+    throw new Error('validateFieldIntent: schema classifier is required (safe entry cannot silently degrade)')
+  }
+  validateFieldIntentStructural(intent)
+  // schema-aware 分类:有 classifier 时拒 container/array-element 路径上的 leaf op。
+  const target = classify(intent.fieldPath)
+  if (target === 'container' || target === 'array-element') {
+    if (intent.op === 'set') throw new FieldIntentError('atomic-value-to-container-path')
+    // delete-field 到 container(整子树删);array-element 已在 structural 拦(last number),此处兜 classifier 返回 array-element 的 delete-field。
+    throw new FieldIntentError(
+      target === 'container' ? 'container-delete-field' : 'array-element-structure-delete',
+    )
   }
 }
 

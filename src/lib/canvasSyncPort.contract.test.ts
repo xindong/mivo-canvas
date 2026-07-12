@@ -31,6 +31,15 @@
 //    duplicate create 直送、终态 record state 断言非仅 transport log)。
 //  - R3-P1-3 delete race 全封:mapDeleteOutcome 一律 recordPresent→conflict(旧只挡 404+present,204+present 落 accepted
 //    假成功);删 mapHttpStatusToOutcome 的 isDelete+404→accepted 旧 shortcut;冻结冲突恢复责任在 caller。+2 测试。
+//
+// 返修 R4(G1-b 第四轮 REQUIRES_CHANGES,2026-07-12,2 条 P1 见 REVIEW-FINDINGS-G1B-R4.md,lead 复审判决):
+//  - R4-P1-1 schema classifier 必填(安全入口不可静默降级):R3 可选 classifier 让省略时四负例原漏洞原样通过
+//    (旧 line 388 钉死 not.toThrow)。R4:validateFieldIntent classifier 改必填(编译期 + 运行时双重不可绕过);
+//    结构性校验拆到显式命名的低层 validateFieldIntentStructural(非安全入口,不拒 schema-aware clobber)。
+//    删 line 388 bug 断言;+5 R4 测试(四负例经安全入口必拒 / classifier-bypass 抛错 / structural 低层不拒 clobber / optional leaf + 数组 leaf set 放行)。
+//  - R4-P1-2 caller-owned retry/rebase 经公开 submitChange 闭环:R3 sync submit/ackCreate 重发旧 create(adapter 自动重试 stale);
+//    R4 改 FifoRecordPort async submitChange(canvasId, change, base?) 同形参考:phase 区分 retry(推进 pending)/duplicate(直送);
+//    base 透传 transport 区分 old/new base;held edit 在 create 终态才 settle;删 ackCreate。+矩阵测试改写。
 
 import { describe, it, expect, expectTypeOf } from 'vitest'
 import type {
@@ -48,6 +57,7 @@ import {
   FieldIntentError,
   unwiredCanvasSyncPort,
   validateFieldIntent,
+  validateFieldIntentStructural,
 } from './canvasSyncPort'
 
 // ── 接口面存在且签名稳定(正向编译期断言)──────────────────────────────────
@@ -107,8 +117,9 @@ describe('CanvasSyncPort interface surface (G1-b transport-neutral)', () => {
       | 'container-delete-field'
       | 'atomic-value-to-container-path'
     >()
-    // runtime smoke:非原子 set 抛 FieldIntentError(封死 clobber 表达)
-    expect(() => validateFieldIntent({ op: 'set', fieldPath: ['transform'], value: { x: 1 } })).toThrow(FieldIntentError)
+    // runtime smoke:非原子 set 抛 FieldIntentError(封死 clobber 表达)。
+    // R4:结构性校验走 validateFieldIntentStructural(非原子 set 是结构性规则,无需 schema classifier)。
+    expect(() => validateFieldIntentStructural({ op: 'set', fieldPath: ['transform'], value: { x: 1 } })).toThrow(FieldIntentError)
   })
 
   it('R3-P1-1: FieldPathTarget + FieldSchemaClassifier are exported (schema-aware contract surface)', () => {
@@ -164,8 +175,10 @@ describe('F1: field-level edit intent is lossless under concurrency', () => {
   // 测试内参考 apply:证明 FieldIntent[] 语义在「按 fieldPath 定点 set」下无损。
   // 这是 port 冻结的域语义的参考实现(adapter 各自实现,但语义须与此一致)。
   // 返修 R2-P1-1:apply 前先逐条过 validateFieldIntent(封死 clobber——非原子 set 在此即抛,不进 wire)。
+  // 返修 R4-P1-1:F1 参考 apply 用叶子 op(无 schema-aware clobber 面),走低层 validateFieldIntentStructural
+  //   (结构性:非原子 set / 空路径 / 数组元素 delete 在此即抛);安全入口 validateFieldIntent 需 classifier,见 R4 段。
   const applyFieldIntents = <R extends Record<string, unknown>>(base: R, intents: FieldIntent[]): R => {
-    for (const intent of intents) validateFieldIntent(intent) // 域级 validator 先校验(封死 clobber)
+    for (const intent of intents) validateFieldIntentStructural(intent) // 结构性 validator 先校验(封死 clobber)
     const out: Record<string, unknown> = JSON.parse(JSON.stringify(base))
     for (const intent of intents) {
       const path = [...intent.fieldPath]
@@ -239,11 +252,13 @@ describe('F1: field-level edit intent is lossless under concurrency', () => {
   })
 
   // ── 返修 R2-P1-1:封死 clobber 负例 + A→B/B→A 双向对称 ──────────────────
+  // R4:这些是结构性规则(空路径/非原子 set——不依赖 schema),走低层 validateFieldIntentStructural;
+  //   schema-aware 负例(container-delete/atomic-to-container)见 R3/R4 段(带 nodeClassifier)。
   it('R2-P1-1 NEGATIVE: validator rejects empty fieldPath (runtime defense for as-cast bypass)', () => {
     // tuple 编译期已拒空路径;validator 再兜运行时 as 旁路(防 as unknown as FieldIntent 强构造空路径)。
     const empty = { op: 'set', fieldPath: [] as unknown as FieldPath, value: 1 } as FieldIntent
-    expect(() => validateFieldIntent(empty)).toThrow(FieldIntentError)
-    expect(() => validateFieldIntent(empty)).toThrow(/empty-field-path/)
+    expect(() => validateFieldIntentStructural(empty)).toThrow(FieldIntentError)
+    expect(() => validateFieldIntentStructural(empty)).toThrow(/empty-field-path/)
   })
 
   it('R2-P1-1 NEGATIVE: set whole OBJECT at parent path is rejected (clobber sealed)', () => {
@@ -254,8 +269,8 @@ describe('F1: field-level edit intent is lossless under concurrency', () => {
       fieldPath: ['transform'],
       value: { x: 1, y: 2, width: 3, height: 4, rotation: 0 },
     }
-    expect(() => validateFieldIntent(wholeObject)).toThrow(FieldIntentError)
-    expect(() => validateFieldIntent(wholeObject)).toThrow(/non-atomic-parent-set/)
+    expect(() => validateFieldIntentStructural(wholeObject)).toThrow(FieldIntentError)
+    expect(() => validateFieldIntentStructural(wholeObject)).toThrow(/non-atomic-parent-set/)
   })
 
   it('R2-P1-1 NEGATIVE: set whole ARRAY at parent path is rejected (Y.Array clobber sealed)', () => {
@@ -266,8 +281,8 @@ describe('F1: field-level edit intent is lossless under concurrency', () => {
       fieldPath: ['fills'],
       value: [{ id: 'f1', color: '#000' }],
     }
-    expect(() => validateFieldIntent(wholeArray)).toThrow(FieldIntentError)
-    expect(() => validateFieldIntent(wholeArray)).toThrow(/non-atomic-parent-set/)
+    expect(() => validateFieldIntentStructural(wholeArray)).toThrow(FieldIntentError)
+    expect(() => validateFieldIntentStructural(wholeArray)).toThrow(/non-atomic-parent-set/)
   })
 
   it('R2-P1-1 NEGATIVE: set whole array ELEMENT (object) is rejected — must decompose to leaf sets', () => {
@@ -277,16 +292,16 @@ describe('F1: field-level edit intent is lossless under concurrency', () => {
       fieldPath: ['fills', 0],
       value: { id: 'f1', color: '#f00' },
     }
-    expect(() => validateFieldIntent(wholeElement)).toThrow(/non-atomic-parent-set/)
+    expect(() => validateFieldIntentStructural(wholeElement)).toThrow(/non-atomic-parent-set/)
   })
 
   it('R2-P1-1 POSITIVE: atomic leaf sets + delete-field pass validator', () => {
-    expect(() => validateFieldIntent({ op: 'set', fieldPath: ['transform', 'x'], value: 100 })).not.toThrow()
-    expect(() => validateFieldIntent({ op: 'set', fieldPath: ['title'], value: 'n' })).not.toThrow()
-    expect(() => validateFieldIntent({ op: 'set', fieldPath: ['fills', 0, 'color'], value: '#f00' })).not.toThrow()
-    expect(() => validateFieldIntent({ op: 'set', fieldPath: ['locked'], value: false })).not.toThrow()
-    expect(() => validateFieldIntent({ op: 'set', fieldPath: ['meta', 'x'], value: null })).not.toThrow() // null 是原子叶子
-    expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['title'] })).not.toThrow()
+    expect(() => validateFieldIntentStructural({ op: 'set', fieldPath: ['transform', 'x'], value: 100 })).not.toThrow()
+    expect(() => validateFieldIntentStructural({ op: 'set', fieldPath: ['title'], value: 'n' })).not.toThrow()
+    expect(() => validateFieldIntentStructural({ op: 'set', fieldPath: ['fills', 0, 'color'], value: '#f00' })).not.toThrow()
+    expect(() => validateFieldIntentStructural({ op: 'set', fieldPath: ['locked'], value: false })).not.toThrow()
+    expect(() => validateFieldIntentStructural({ op: 'set', fieldPath: ['meta', 'x'], value: null })).not.toThrow() // null 是原子叶子
+    expect(() => validateFieldIntentStructural({ op: 'delete-field', fieldPath: ['title'] })).not.toThrow()
   })
 
   it('R2-P1-1 SYMMETRY: A→B and B→A converge to same merged state for non-overlapping fields', () => {
@@ -350,8 +365,8 @@ describe('R3-P1-1: schema-aware leaf/container classification (delete-field + at
 
   it('R3-P1-1 NEGATIVE: delete-field on array element (fills[0]) rejected — unstable index, by-stable-id deferred', () => {
     // delete ['fills',0] 用不稳定 index 表达声称 deferred 的数组 remove,与 n20 §10.1 by-stable-id 方向岔开;封死。
-    // 结构性拒(last segment number),无需 classifier;带 classifier 也一致拒。
-    expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['fills', 0] })).toThrow(/array-element-structure-delete/)
+    // 结构性拒(last segment number),无需 classifier;低层 validateFieldIntentStructural 与安全入口 validateFieldIntent(带 classifier)均一致拒。
+    expect(() => validateFieldIntentStructural({ op: 'delete-field', fieldPath: ['fills', 0] })).toThrow(/array-element-structure-delete/)
     expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['fills', 0] }, nodeClassifier)).toThrow(/array-element-structure-delete/)
   })
 
@@ -382,10 +397,78 @@ describe('R3-P1-1: schema-aware leaf/container classification (delete-field + at
   it('R3-P1-1: without classifier, structural defense still rejects array-element delete-field + non-atomic set', () => {
     // 无 classifier(port 对 schema 不透明):只结构性拒——数组元素 delete-field(last number)+ 非原子 set。
     // container delete / 原子值-to-容器 无 schema 不拒(契约:调用方须传 classifier 才做 schema-aware 拒)。
-    expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['fills', 0] })).toThrow(/array-element-structure-delete/)
-    expect(() => validateFieldIntent({ op: 'set', fieldPath: ['transform'], value: { x: 1 } })).toThrow(/non-atomic-parent-set/)
-    // 无 classifier 时 container delete 不拒(port 不知是 container——契约:调用方传 classifier 才判 leaf/container)
-    expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['transform'] })).not.toThrow()
+    expect(() => validateFieldIntentStructural({ op: 'delete-field', fieldPath: ['fills', 0] })).toThrow(/array-element-structure-delete/)
+    expect(() => validateFieldIntentStructural({ op: 'set', fieldPath: ['transform'], value: { x: 1 } })).toThrow(/non-atomic-parent-set/)
+    // structural 低层入口不拒 container delete(需 schema);安全入口 validateFieldIntent 才拒(见 R4)。
+    expect(() => validateFieldIntentStructural({ op: 'delete-field', fieldPath: ['transform'] })).not.toThrow()
+  })
+})
+
+// ── 返修 R4-P1-1:schema classifier 必填(安全入口不可静默降级)+ structural 拆分 ──────────
+// R4 finding:R3 把 classifier 设为可选,导致省略 classifier 时 delete ['transform']/['fills']/set ['transform']=7
+// 原漏洞原样通过(旧测试 line 388 甚至钉死 not.toThrow)。R4 让 schema 分类成为不可省略的校验前提:
+//  - validateFieldIntent(intent, classify: FieldSchemaClassifier)classifier **必填** = 安全入口(结构 + schema-aware)。
+//  - validateFieldIntentStructural(intent) = 低层结构校验(空路径/非原子 set/数组元素 delete);
+//    显式命名 "Structural" 标明它**非安全入口**——不拒 schema-aware clobber(container/array-element 路径上 leaf op)。
+// 验收:1) 四负例经安全入口(任何合法公开调用 = 带 classifier)必拒;2) 省略 classifier 编译期 + 运行时双重显式失败;
+//       3) optional leaf delete + 数组 leaf set 继续放行。
+describe('R4-P1-1: classifier REQUIRED + structural split (safe entry cannot silently degrade)', () => {
+  // 与 R3 同形的 nodeClassifier(基于 NodeRecord schema;transform/fills=container,fills[0]=array-element,title=leaf)。
+  const nodeClassifier: FieldSchemaClassifier = (path) => {
+    const seg0 = path[0]
+    if (typeof seg0 === 'number') return 'array-element' // 防御(顶层不应是 number)
+    const containers = ['transform', 'relations', 'layout', 'constraints', 'asset', 'generation', 'aiWorkflow', 'annotationBounds', 'imageCrop', 'assetSourceDimensions']
+    const arrays = ['fills', 'strokes', 'effects', 'markupPoints', 'experimentalAnchors']
+    if (arrays.includes(seg0)) {
+      if (path.length === 1) return 'container'
+      if (path.length === 2 && typeof path[1] === 'number') return 'array-element'
+      return 'leaf'
+    }
+    if (containers.includes(seg0)) return path.length === 1 ? 'container' : 'leaf'
+    return 'leaf'
+  }
+
+  it('R4-P1-1 RED→GREEN: validateFieldIntentStructural exported (low-level structural, NOT a safe entry)', () => {
+    // 拆分:结构性校验(空路径/非原子 set/数组元素 delete)独立成 validateFieldIntentStructural,单参 intent。
+    // 显式命名 "Structural" 标明它非安全入口——不拒 schema-aware clobber(见下);安全入口 validateFieldIntent 才拒。
+    expectTypeOf<typeof validateFieldIntentStructural>().toBeFunction()
+    // 运行时 smoke:structural 入口存在且可调用(原子叶子 set 放行)。
+    expect(() => validateFieldIntentStructural({ op: 'set', fieldPath: ['transform', 'x'], value: 100 })).not.toThrow()
+  })
+
+  it('R4-P1-1 RED→GREEN: omitting classifier on safe entry FAILS (compile-time required + runtime defense)', () => {
+    // 验收 2:省略 schema 校验显式失败。classifier 是必填参数(编译期:省略即 tsc error);
+    // 运行时防御兜 `as` cast 旁路(undefined / 非函数)→ 显式抛错(安全入口永不静默降级到无 schema 校验)。
+    // 与 empty-field-path 运行时防御(line 185)同型:tuple 类型可 as-cast 旁路,运行时再兜。
+    expect(() =>
+      validateFieldIntent({ op: 'delete-field', fieldPath: ['transform'] }, undefined as unknown as FieldSchemaClassifier),
+    ).toThrow(/classifier/)
+  })
+
+  it('R4-P1-1: four clobber negatives rejected by SAFE ENTRY validateFieldIntent (with classifier)', () => {
+    // 验收 1:四负例(任何合法公开调用 = 经安全入口 validateFieldIntent + classifier)必拒:
+    //  delete ['transform'](container-delete-field)、delete ['fills'](container-delete-field)、
+    //  delete ['fills',0](array-element-structure-delete)、set ['transform']=7(atomic-value-to-container-path)。
+    expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['transform'] }, nodeClassifier)).toThrow(FieldIntentError)
+    expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['fills'] }, nodeClassifier)).toThrow(FieldIntentError)
+    expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['fills', 0] }, nodeClassifier)).toThrow(FieldIntentError)
+    expect(() => validateFieldIntent({ op: 'set', fieldPath: ['transform'], value: 7 }, nodeClassifier)).toThrow(FieldIntentError)
+  })
+
+  it('R4-P1-1: structural-only entry does NOT reject schema-aware clobber (low-level, explicitly not a safe entry)', () => {
+    // validateFieldIntentStructural 只拒结构性(空路径/非原子 set/数组元素 delete);
+    // container-delete / atomic-to-container 需 schema,structural 不拒(故非安全入口——调用方明示用 structural 即知无 schema 防线)。
+    expect(() => validateFieldIntentStructural({ op: 'delete-field', fieldPath: ['transform'] })).not.toThrow()
+    expect(() => validateFieldIntentStructural({ op: 'set', fieldPath: ['transform'], value: 7 })).not.toThrow()
+    // 但结构性三态仍拒(与安全入口一致):
+    expect(() => validateFieldIntentStructural({ op: 'delete-field', fieldPath: ['fills', 0] })).toThrow(/array-element-structure-delete/)
+    expect(() => validateFieldIntentStructural({ op: 'set', fieldPath: ['transform'], value: { x: 1 } })).toThrow(/non-atomic-parent-set/)
+  })
+
+  it('R4-P1-1: optional leaf delete + array leaf set still PASS at safe entry (with classifier)', () => {
+    // 验收 3:合法 optional leaf delete 放行(title 是 optional 叶子);数组 leaf set 放行(['fills',0,'color'] 终点 leaf)。
+    expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['title'] }, nodeClassifier)).not.toThrow()
+    expect(() => validateFieldIntent({ op: 'set', fieldPath: ['fills', 0, 'color'], value: '#f00' }, nodeClassifier)).not.toThrow()
   })
 })
 
