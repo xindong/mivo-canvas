@@ -259,7 +259,7 @@ describe('G1-a canvas-meta hydrate(fetchCanvas / listCanvas 读路径)', () => {
   })
 })
 
-describe('G1-a 画布域写 + chat seam reject(G1-c / DP-6R,不接)', () => {
+describe('G1-a 画布域写 seam reject(G1-c,不接);chat 已 wired(DP-6R P1-1)', () => {
   it('upsertNode/deleteNode/reorderChildren reject(G1-c seam)', async () => {
     const stub = makeStubBff()
     const adapter = makeAdapter(stub)
@@ -272,10 +272,13 @@ describe('G1-a 画布域写 + chat seam reject(G1-c / DP-6R,不接)', () => {
     await expect(adapter.deleteAnchor('c1', 'a1')).rejects.toThrow(/G1-c/)
     await expect(adapter.reorderChildren('c1', 'node', ['n1'], 0)).rejects.toThrow(/G1-c/)
   })
-  it('appendChatMessage reject(DP-6R seam)', async () => {
+  it('appendChatMessage 已 wired(DP-6R P1-1):POST /api/canvas/:id/chat(stub 无 chat route → 404 HttpError,非 DP-6R seam reject)', async () => {
     const stub = makeStubBff()
     const adapter = makeAdapter(stub)
-    await expect(adapter.appendChatMessage('c1', { text: 'hi' })).rejects.toThrow(/DP-6R/)
+    // appendChatMessage 现为 wired op:POST 到 BFF(stub 未挂 chat route → 404)。不再是 notWiredDP6R reject。
+    await expect(adapter.appendChatMessage('c1', { text: 'hi' })).rejects.toMatchObject({
+      name: 'HttpError', status: 404,
+    })
   })
 })
 

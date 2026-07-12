@@ -35,6 +35,7 @@ import {
   sceneIds,
   snapshotFromState,
 } from './canvasDocumentModel'
+import { enqueuePersistWrite } from '../lib/persistBoot'
 
 export const createDocumentSlice: SliceCreator = (set, get) => ({
   canvases: defaultCanvases,
@@ -74,6 +75,15 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
     })
 
     logCanvas(`Created canvas "${title}" (${id})`)
+    // G1-a P1-2:server/shadow 模式 enqueue createCanvas(POST 幂等,带本地 id + projectId + title);
+    // canvas content(nodes/edges)同步属 G1-c(节点 mutation),本轮只 enqueue meta create。local no-op。
+    enqueuePersistWrite({
+      kind: 'createCanvas',
+      canvasId: id,
+      projectId: options?.projectId ?? '',
+      title,
+      ...(options?.templateId ? { sourceTemplateId: options.templateId } : {}),
+    })
     return id
   },
   duplicateCanvas: (canvasId) => {
@@ -139,12 +149,16 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
 
       if (targetId !== state.sceneId) {
         logCanvas(`Deleted inactive canvas "${deletedTitle}"`)
+        // G1-a P1-2:server/shadow 模式 enqueue deleteCanvas(DELETE 幂等)。local no-op。
+        enqueuePersistWrite({ kind: 'deleteCanvas', canvasId: targetId })
         return { canvases: remainingCanvases }
       }
 
       const nextSceneId = canvasIds.find((id) => id !== targetId) || defaultSceneId
       const nextDocument = normalizeDocument(documentFor(remainingCanvases, nextSceneId))
       logCanvas(`Deleted active canvas "${deletedTitle}" and loaded "${nextDocument.title}"`)
+      // G1-a P1-2:server/shadow 模式 enqueue deleteCanvas(DELETE 幂等)。local no-op。
+      enqueuePersistWrite({ kind: 'deleteCanvas', canvasId: targetId })
 
       return {
         canvases: remainingCanvases,
@@ -180,7 +194,9 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
         },
       }
     }),
-  renameCanvas: (sceneId, title) =>
+  renameCanvas: (sceneId, title) => {
+    const existing = get().canvases[sceneId]
+    const metaRevision = existing?.metaRevision
     set((state) => {
       const document = documentFor(state.canvases, sceneId)
       logCanvas(`Renamed canvas "${document.title}" to "${title}"`)
@@ -189,7 +205,19 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
       // also surfaces unchanged nodes/edges/tasks/selection (no-op merge); the
       // non-active path returns { canvases } exactly as before.
       return patchCanvasDocument(state, sceneId, { title })
-    }),
+    })
+    // G1-a P1-2:server/shadow 模式 enqueue updateCanvas(PUT,If-Match = metaRevision)。
+    // IDB 画布无 metaRevision → 428 rejected(fail-visible:canvas 全量 hydrate 属 G1-c,未 hydrate 无法同步 rename)。local no-op。
+    if (existing) {
+      enqueuePersistWrite({
+        kind: 'updateCanvas',
+        canvasId: sceneId,
+        projectId: existing.projectId ?? '',
+        title,
+        baseRevision: metaRevision,
+      })
+    }
+  },
   moveCanvasToProject: (canvasId, projectId) =>
     set((state) => {
       const document = state.canvases[canvasId]
@@ -207,6 +235,15 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
 
       const target = projectId === undefined ? 'Canvas' : projectId
       logCanvas(`Moved canvas "${document.title}" (${canvasId}) → ${target}`)
+      // G1-a P1-2:server/shadow 模式 enqueue updateCanvas(PUT,projectId 改 = move;move 双端 owner-only authz)。
+      // baseRevision = metaRevision(IDB 画布无 → 428;G1-c canvas hydrate 后填充)。fire-and-forget;local no-op。
+      enqueuePersistWrite({
+        kind: 'updateCanvas',
+        canvasId,
+        projectId: projectId ?? '',
+        title: document.title,
+        baseRevision: document.metaRevision,
+      })
       return {
         canvases: {
           ...state.canvases,

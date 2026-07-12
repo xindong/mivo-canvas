@@ -57,9 +57,18 @@ export type WriteOpKind =
   | 'deleteAnchor'
   | 'reorderChildren'
   | 'appendChatMessage'
+  | 'updateChatMessage'
+  | 'deleteChatMessage'
   | 'putUserState'
   | 'deleteUserState'
   | 'createProject'
+  | 'updateProject'
+  | 'deleteProject'
+  | 'createCanvas'
+  | 'updateCanvas'
+  | 'deleteCanvas'
+  | 'attachAsset'
+  | 'detachAsset'
 
 export type WriteOp =
   | { kind: 'upsertNode'; canvasId: string; nodeId: string; payload: NodePayload; baseRevision?: Revision }
@@ -76,9 +85,66 @@ export type WriteOp =
       baseContentVersion: Revision
     }
   | { kind: 'appendChatMessage'; canvasId: string; message: unknown }
+  | { kind: 'updateChatMessage'; canvasId: string; msgId: string; payload: unknown; baseRevision?: Revision }
+  | { kind: 'deleteChatMessage'; canvasId: string; msgId: string }
   | { kind: 'putUserState'; key: string; value: unknown; baseRevision?: Revision }
   | { kind: 'deleteUserState'; key: string }
   | { kind: 'createProject'; name: string; id?: string }
+  | { kind: 'updateProject'; projectId: string; name: string; baseRevision?: Revision }
+  | { kind: 'deleteProject'; projectId: string }
+  | { kind: 'createCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string }
+  | { kind: 'updateCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string; baseRevision?: Revision }
+  | { kind: 'deleteCanvas'; canvasId: string }
+  | { kind: 'attachAsset'; assetId: string; nodeId: string }
+  | { kind: 'detachAsset'; assetId: string; nodeId: string }
+
+// ── G1-a P1-3:类型拆分——非画布域 op(G1-a executor 只接受这些)──────────────────
+// 画布域写(node/edge/anchor/reorder)不属 G1-a executor 范围(G1-c 挂 N2-0)。chat 已接(DP-6R P1-1 划归
+// G1-a,appendChatMessage/updateChatMessage/deleteChatMessage 归入 wired 集合)。已持久化的未支持 op
+// (canvas 域写)用 deferred 状态保留(不发请求不删除),等 G1-c 升级 executor 后 drain。
+// NonCanvasWriteOp 让 executor switch 穷尽非画布域 kind;canvas 域写经 isNonCanvasWriteOp 守卫返
+// unsupported-retained(drain 不 deleteWrite,标 deferred 留存)。
+/** G1-a 接线 executor 支持的 op 子集(非画布域:project / canvas-meta / user-state / asset / chat)。 */
+export type NonCanvasWriteOp =
+  | { kind: 'putUserState'; key: string; value: unknown; baseRevision?: Revision }
+  | { kind: 'deleteUserState'; key: string }
+  | { kind: 'createProject'; name: string; id?: string }
+  | { kind: 'updateProject'; projectId: string; name: string; baseRevision?: Revision }
+  | { kind: 'deleteProject'; projectId: string }
+  | { kind: 'createCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string }
+  | { kind: 'updateCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string; baseRevision?: Revision }
+  | { kind: 'deleteCanvas'; canvasId: string }
+  | { kind: 'attachAsset'; assetId: string; nodeId: string }
+  | { kind: 'detachAsset'; assetId: string; nodeId: string }
+  | { kind: 'appendChatMessage'; canvasId: string; message: unknown }
+  | { kind: 'updateChatMessage'; canvasId: string; msgId: string; payload: unknown; baseRevision?: Revision }
+  | { kind: 'deleteChatMessage'; canvasId: string; msgId: string }
+
+/** 非画布域 op kind 集合(G1-a executor 支持范围,含 chat)。 */
+const NON_CANVAS_KINDS: ReadonlySet<WriteOpKind> = new Set<WriteOpKind>([
+  'putUserState',
+  'deleteUserState',
+  'createProject',
+  'updateProject',
+  'deleteProject',
+  'createCanvas',
+  'updateCanvas',
+  'deleteCanvas',
+  'attachAsset',
+  'detachAsset',
+  'appendChatMessage',
+  'updateChatMessage',
+  'deleteChatMessage',
+])
+
+/**
+ * G1-a P1-3 type guard:op 是否在 G1-a executor 支持的非画布域范围。
+ * - true → executor 处理(发请求)。
+ * - false → canvas/chat op,executor 返 unsupported-retained(drain 标 deferred 留存,不删)。
+ * 返回 `op is NonCanvasWriteOp` 让 executor 的 switch 在 true 分支穷尽 NonCanvasWriteOp kind。
+ */
+export const isNonCanvasWriteOp = (op: WriteOp): op is NonCanvasWriteOp =>
+  NON_CANVAS_KINDS.has(op.kind)
 
 // ── Persisted record + state machine ──
 
@@ -86,8 +152,10 @@ export type WriteStatus =
   | 'pending' // waiting to drain (nextAttemptAt <= now)
   | 'in-flight' // executor currently running
   | 'paused-401' // got 401; queue paused; kept for re-login replay
+  | 'deferred' // G1-a P1-3:unsupported op(canvas/chat)留存,等 executor 升级(G1-c/DP-6R)再 drain
 // Terminal statuses are deleted immediately after surfacing (not stored long-term):
 // success / conflict / too-large / rejected / reuse-conflict / dead-letter.
+// `deferred` is NOT terminal — the record is retained (not deleted) so G1-c/DP-6R can upgrade + replay.
 
 export type QueuedWrite = {
   id: string
@@ -114,6 +182,7 @@ export type WriteOutcome =
   | { status: 'rejected'; body: unknown }
   | { status: 'transient'; message: string }
   | { status: 'terminal'; message: string }
+  | { status: 'unsupported-retained'; message: string }
 
 export type WriteExecutor = (op: WriteOp, idempotencyKey: string) => Promise<WriteOutcome>
 
@@ -174,13 +243,36 @@ const computeResourceKey = (op: WriteOp): string | null => {
       return `userstate:${op.key}`
     case 'createProject':
       return op.id ? `project:${op.id}` : `project:name:${op.name}`
+    case 'updateProject':
+    case 'deleteProject':
+      return `project:${op.projectId}`
+    case 'createCanvas':
+    case 'updateCanvas':
+    case 'deleteCanvas':
+      return `canvas:${op.canvasId}`
+    case 'attachAsset':
+      return `asset-attach:${op.assetId}:${op.nodeId}`
+    case 'detachAsset':
+      return `asset-detach:${op.assetId}:${op.nodeId}`
     case 'appendChatMessage':
+      // 每条 chat 消息独立 op(message payload 内含唯一 id,但 op 层不 narrow),不 coalesce;
+      // 快速连发多条消息各自独立入队(符合 chat 语义——不同消息不该合并)。
       return null
+    case 'updateChatMessage':
+    case 'deleteChatMessage':
+      return `chat-msg:${op.canvasId}:${op.msgId}`
   }
 }
 
 export const isDeleteKind = (kind: WriteOpKind): boolean =>
-  kind === 'deleteNode' || kind === 'deleteEdge' || kind === 'deleteAnchor' || kind === 'deleteUserState'
+  kind === 'deleteNode' ||
+  kind === 'deleteEdge' ||
+  kind === 'deleteAnchor' ||
+  kind === 'deleteUserState' ||
+  kind === 'deleteProject' ||
+  kind === 'deleteCanvas' ||
+  kind === 'detachAsset' || // 404(missing asset/ref)→ 幂等 success(detach intent 已满足);403 owner-mismatch → rejected
+  kind === 'deleteChatMessage' // 404(已删 / 跨 actor)→ 幂等 success
 
 /** Exponential backoff with jitter: min(base * 2^(attempts-1), max) * (0.5..1.0). */
 const backoffDelay = (attempts: number, base: number, max: number, rand: () => number): number => {
@@ -650,6 +742,20 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
             )
             toastFeedback.info('登录已过期,重新登录后将自动重试未保存的改动。')
             break
+          case 'unsupported-retained': {
+            // G1-a P1-3:canvas/chat op 当前 executor 不支持(G1-c 挂 N2-0 / DP-6R 另一 worker)。
+            // 绝不 deleteWrite(否则 G1-c/DP-6R 上线前遗留的 durable 记录被不可恢复删除);
+            // 标 deferred 留存 —— 不发请求(deferred 不在 due 过滤的 pending|paused-401 内,下次 drain 不再取出),
+            // 等 executor 升级后由 G1-c/DP-6R 显式 flip deferred→pending 再 drain。
+            rec.status = 'deferred'
+            rec.lastError = outcome.message
+            await putWrite(rec)
+            debugLogger.log(
+              SOURCE,
+              `write ${rec.id} (${rec.resourceKey ?? rec.op.kind}) deferred — unsupported op retained for executor upgrade: ${outcome.message}`,
+            )
+            break
+          }
         }
         if (paused) break
       }

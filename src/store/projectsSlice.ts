@@ -9,6 +9,7 @@
 import type { SliceCreator } from './canvasStore'
 import { logCanvas, warnCanvas } from './canvasStore'
 import { DEMO_PROJECTS } from './demoScenes'
+import { enqueuePersistWrite } from '../lib/persistBoot'
 
 // Project ids use a `project-` prefix (distinct from `canvas-` / `group-`) so a
 // projectId is never confused with a canvasId. Mirrors createCanvasId's fallback
@@ -40,6 +41,8 @@ export const createProjectsSlice: SliceCreator = (set, get) => ({
     }))
 
     logCanvas(`Created project "${trimmed}" (${id})`)
+    // G1-a P1-1:server/shadow 模式 enqueue createProject(POST 幂等,带本地 id);local no-op。
+    enqueuePersistWrite({ kind: 'createProject', name: trimmed, id })
     return id
   },
   renameProject: (projectId, name) => {
@@ -62,6 +65,14 @@ export const createProjectsSlice: SliceCreator = (set, get) => ({
     }))
 
     logCanvas(`Renamed project "${existing.name}" to "${trimmed}" (${projectId})`)
+    // G1-a P1-1:server/shadow 模式 enqueue updateProject(PATCH,If-Match = server hydrate 带来的 revision);
+    // demo/local 项目 revision 缺省 → 428 rejected(fail-visible:demo 不在 server,需先 create)。
+    enqueuePersistWrite({
+      kind: 'updateProject',
+      projectId,
+      name: trimmed,
+      baseRevision: existing.revision,
+    })
   },
   deleteProject: (projectId) => {
     const project = get().projects.find((p) => p.id === projectId)
@@ -97,5 +108,7 @@ export const createProjectsSlice: SliceCreator = (set, get) => ({
     logCanvas(
       `Deleted project "${project.name}" (${projectId}); ${returnedToStandalone} canvas(es) returned to standalone`,
     )
+    // G1-a P1-1:server/shadow 模式 enqueue deleteProject(DELETE 幂等);local no-op。
+    enqueuePersistWrite({ kind: 'deleteProject', projectId })
   },
 })

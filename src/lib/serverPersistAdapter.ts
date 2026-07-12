@@ -17,13 +17,18 @@
 //  - #8 补 edge/anchor delete + canvas 枚举 + asset seam(引 #195 CreateAssetResponse/AssetRef,不重复实现)。
 
 import type {
+  AttachAssetResult,
   CreateAssetResponse,
+  CreateCanvasResponse,
+  DetachAssetResult,
   GetCanvasResponse,
   ListCanvasResponse,
+  ListChatMessagesResponse,
   ListProjectsResponse,
   Project,
   ResolvedAsset,
   Revision,
+  UpdateCanvasRequest,
   UpsertResponse,
   UserStateEntry,
 } from '../../shared/persist-contract.ts'
@@ -40,12 +45,24 @@ export interface ServerPersistAdapter {
   // ── document scope → /api/projects ──
   listProjects(): Promise<ListProjectsResponse>
   createProject(name: string, id?: string): Promise<Project>
+  /** G1-a P1-2:GET /api/projects/:id → Project;404(unknown/unauthorized)→ null。 */
+  getProject(id: string): Promise<Project | null>
+  /** G1-a P1-2:PATCH /api/projects/:id,body { name },If-Match = revision base;返更新后 Project。 */
+  updateProject(id: string, name: string, baseRevision?: Revision): Promise<Project>
+  /** G1-a P1-2:DELETE /api/projects/:id → 204(幂等);404 → 视为已删(void,幂等)。 */
+  deleteProject(id: string): Promise<void>
 
   // ── document scope → /api/canvas ──
   /** 返修 #5:hydrate GET /api/canvas/:id(全量 meta + nodes/edges/anchors)。返 metaRevision + contentVersion。null=404。 */
   fetchCanvas(canvasId: string): Promise<GetCanvasResponse | null>
   /** 返修 #8:canvas 枚举(按 project/owner)。 */
   listCanvas(projectId?: string): Promise<ListCanvasResponse>
+  /** G1-a P1-2:POST /api/canvas → 201/200 CanvasMeta(createCanvas meta CRUD)。 */
+  createCanvas(input: { projectId: string; id?: string; title?: string; sourceTemplateId?: string }): Promise<CreateCanvasResponse>
+  /** G1-a P1-2:PUT /api/canvas/:id,body { payload: CanvasPayload },If-Match = metaRevision base;返更新后 CanvasMeta。 */
+  updateCanvas(id: string, patch: { projectId: string; title?: string; sourceTemplateId?: string }, baseRevision?: Revision): Promise<CreateCanvasResponse>
+  /** G1-a P1-2:DELETE /api/canvas/:id → 204(幂等);404 → 视为已删(void,幂等)。 */
+  deleteCanvas(id: string): Promise<void>
   /** 节点级 PATCH(FX-4);baseRevision = client 读到的 envelope revision(If-Match,返修 #4)。 */
   upsertNode(canvasId: string, node: NodeRecord, baseRevision?: Revision): Promise<UpsertResponse>
   upsertEdge(canvasId: string, edge: EdgeRecord, baseRevision?: Revision): Promise<UpsertResponse>
@@ -67,8 +84,27 @@ export interface ServerPersistAdapter {
     baseContentVersion: Revision,
   ): Promise<{ reordered: number; contentVersion: Revision }>
 
-  // ── document scope → /api/canvas/:id/chat(DP-6)──
+  // ── document scope → /api/canvas/:id/chat(G1-a chat 接线,DP-6R per-actor)──
+  /**
+   * G1-a chat 接线(DP-6R P1-1):GET /api/canvas/:id/chat → ListChatMessagesResponse(messages=RecordEntry[],
+   * payload=opaque ChatMessage)。per-actor:服务端返当前 actor 的 collection(dp6r;匿名 → 401 require-login)。
+   */
+  listChatMessages(canvasId: string): Promise<ListChatMessagesResponse>
+  /**
+   * G1-a chat 接线(DP-6R P1-1):POST /api/canvas/:id/chat,body { message } → 201/200 UpsertResponse。
+   * 幂等(idempotency-key);per-actor:写入当前 actor 的 collection。
+   */
   appendChatMessage(canvasId: string, message: unknown): Promise<UpsertResponse>
+  /**
+   * G1-a chat 接线(DP-6R P1-1):PATCH /api/canvas/:id/chat/:msgId,body { payload } → 200 UpsertResponse。
+   * If-Match = msg envelope revision(missing → 428 / stale → 409)。per-actor:只能改自己的 collection。
+   */
+  updateChatMessage(canvasId: string, msgId: string, payload: unknown, baseRevision?: Revision): Promise<UpsertResponse>
+  /**
+   * G1-a chat 接线(DP-6R P1-1):DELETE /api/canvas/:id/chat/:msgId → 204(硬删);404 → 视为已删(void,幂等)。
+   * per-actor:只能删自己的 collection(跨 actor → 404 无泄漏)。
+   */
+  deleteChatMessage(canvasId: string, msgId: string): Promise<void>
 
   // ── user scope → /api/user-state(DP-1 selection / DP-7 排除)──
   putUserState(key: string, value: unknown, baseRevision?: Revision): Promise<UpsertResponse>
@@ -87,6 +123,18 @@ export interface ServerPersistAdapter {
    * 无泄漏)、Cache-Control: private、refcount=references.length。null=404(env off / 不存在 / 跨 owner)。
    */
   resolveAsset(assetId: string): Promise<ResolvedAsset | null>
+  /**
+   * G1-a P1-2 seam:POST /api/assets/:assetId/attach,body { nodeId } → AttachAssetResult。ownerFp 服务端派生
+   * (client 不传)。节点生命周期调用方属 G1-c(node mutation),本轮只冻结 wire seam。
+   * 404(missing asset)→ 抛 HttpError(executor 映射 rejected)。
+   */
+  attachAsset(assetId: string, nodeId: string): Promise<AttachAssetResult>
+  /**
+   * G1-a P1-2 seam:POST /api/assets/:assetId/detach,body { nodeId } → DetachAssetResult。ownerFp 服务端派生;
+   * 跨 owner detach → 403(owner-mismatch,decidable,不静默)。节点生命周期调用方属 G1-c,本轮只冻结 wire seam。
+   * 404(missing)→ 抛 HttpError(executor 幂等 success)。
+   */
+  detachAsset(assetId: string, nodeId: string): Promise<DetachAssetResult>
 }
 
 /**
@@ -100,8 +148,14 @@ const notWired = (method: string): Promise<never> =>
 export const unwiredServerPersistAdapter: ServerPersistAdapter = {
   listProjects: () => notWired('listProjects'),
   createProject: () => notWired('createProject'),
+  getProject: () => notWired('getProject'),
+  updateProject: () => notWired('updateProject'),
+  deleteProject: () => notWired('deleteProject'),
   fetchCanvas: () => notWired('fetchCanvas'),
   listCanvas: () => notWired('listCanvas'),
+  createCanvas: () => notWired('createCanvas'),
+  updateCanvas: () => notWired('updateCanvas'),
+  deleteCanvas: () => notWired('deleteCanvas'),
   upsertNode: () => notWired('upsertNode'),
   upsertEdge: () => notWired('upsertEdge'),
   upsertAnchor: () => notWired('upsertAnchor'),
@@ -110,11 +164,16 @@ export const unwiredServerPersistAdapter: ServerPersistAdapter = {
   deleteAnchor: () => notWired('deleteAnchor'),
   reorderChildren: () => notWired('reorderChildren'),
   appendChatMessage: () => notWired('appendChatMessage'),
+  listChatMessages: () => notWired('listChatMessages'),
+  updateChatMessage: () => notWired('updateChatMessage'),
+  deleteChatMessage: () => notWired('deleteChatMessage'),
   putUserState: () => notWired('putUserState'),
   getUserState: () => notWired('getUserState'),
   deleteUserState: () => notWired('deleteUserState'),
   uploadAsset: () => notWired('uploadAsset'),
   resolveAsset: () => notWired('resolveAsset'),
+  attachAsset: () => notWired('attachAsset'),
+  detachAsset: () => notWired('detachAsset'),
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -235,12 +294,6 @@ const notWiredG1c = (method: string): Promise<never> =>
     ),
   )
 
-/** chat seam reject(DP-6R per-user 重拆,另一 worker;不在 G1-a 范围)。 */
-const notWiredDP6R = (method: string): Promise<never> =>
-  Promise.reject(
-    new Error(`ServerPersistAdapter.${method} not wired — chat per-user rearchitecture is DP-6R (another worker); not in G1-a scope`),
-  )
-
 /**
  * 真 fetch ServerPersistAdapter(G1-a 非画布域接线)。工厂式:测试注入 fetch=getAppRequest +
  * getAuthHeaders=()=>({x-mivo-api-key:KEY_A}) 驱动 buildPersistApp 的真实 Hono route;生产由
@@ -274,6 +327,47 @@ export const createFetchServerPersistAdapter = (opts: FetchAdapterOptions): Serv
         path: '/api/projects',
         body: { name, ...(id ? { id } : {}) },
       }),
+    // G1-a P1-2:project CRUD 单 get / rename / delete(对齐 server/routes/projects.ts:163/185/263)
+    getProject: async (id) => {
+      try {
+        return await requestJson<Project>({
+          fetch: doFetch,
+          baseUrl,
+          getAuthHeaders,
+          method: 'GET',
+          path: `/api/projects/${encodeURIComponent(id)}`,
+        })
+      } catch (error) {
+        // 404(unknown / 跨 owner unauthorized 统一 404 无泄漏)→ null;其他 HttpError 原样抛。
+        if (error instanceof HttpError && error.status === 404) return null
+        throw error
+      }
+    },
+    updateProject: (id, name, baseRevision) =>
+      requestJson<Project>({
+        fetch: doFetch,
+        baseUrl,
+        getAuthHeaders,
+        method: 'PATCH',
+        path: `/api/projects/${encodeURIComponent(id)}`,
+        body: { name },
+        ...(baseRevision !== undefined ? { ifMatch: baseRevision } : {}),
+      }),
+    deleteProject: async (id) => {
+      try {
+        await requestJson<void>({
+          fetch: doFetch,
+          baseUrl,
+          getAuthHeaders,
+          method: 'DELETE',
+          path: `/api/projects/${encodeURIComponent(id)}`,
+        })
+      } catch (error) {
+        // 幂等删:404(已删 / 不存在)视为成功 void(对齐 server DELETE 204 幂等 + 404 unknown 统一吃掉)。
+        if (error instanceof HttpError && error.status === 404) return
+        throw error
+      }
+    },
 
     // ── canvas-meta(hydrate 读路径;写路径 node/edge/anchor 走 G1-c seam)──
     fetchCanvas: async (canvasId) => {
@@ -300,6 +394,52 @@ export const createFetchServerPersistAdapter = (opts: FetchAdapterOptions): Serv
         path: `/api/canvas${qs}`,
       })
     },
+    // G1-a P1-2:canvas-meta CRUD(对齐 server/routes/canvas.ts:224/284/380)
+    createCanvas: (input) =>
+      requestJson<CreateCanvasResponse>({
+        fetch: doFetch,
+        baseUrl,
+        getAuthHeaders,
+        method: 'POST',
+        path: '/api/canvas',
+        body: {
+          projectId: input.projectId,
+          ...(input.id ? { id: input.id } : {}),
+          ...(input.title !== undefined ? { title: input.title } : {}),
+          ...(input.sourceTemplateId !== undefined ? { sourceTemplateId: input.sourceTemplateId } : {}),
+        },
+      }),
+    updateCanvas: (id, patch, baseRevision) =>
+      requestJson<CreateCanvasResponse>({
+        fetch: doFetch,
+        baseUrl,
+        getAuthHeaders,
+        method: 'PUT',
+        path: `/api/canvas/${encodeURIComponent(id)}`,
+        body: {
+          payload: {
+            projectId: patch.projectId,
+            ...(patch.title !== undefined ? { title: patch.title } : {}),
+            ...(patch.sourceTemplateId !== undefined ? { sourceTemplateId: patch.sourceTemplateId } : {}),
+          },
+        } satisfies UpdateCanvasRequest,
+        ...(baseRevision !== undefined ? { ifMatch: baseRevision } : {}),
+      }),
+    deleteCanvas: async (id) => {
+      try {
+        await requestJson<void>({
+          fetch: doFetch,
+          baseUrl,
+          getAuthHeaders,
+          method: 'DELETE',
+          path: `/api/canvas/${encodeURIComponent(id)}`,
+        })
+      } catch (error) {
+        // 幂等删:404(已删 / 不存在)视为成功 void。
+        if (error instanceof HttpError && error.status === 404) return
+        throw error
+      }
+    },
 
     // ── canvas-domain 写(G1-c 挂 N2-0;seam reject,不接)──
     upsertNode: () => notWiredG1c('upsertNode'),
@@ -310,8 +450,49 @@ export const createFetchServerPersistAdapter = (opts: FetchAdapterOptions): Serv
     deleteAnchor: () => notWiredG1c('deleteAnchor'),
     reorderChildren: () => notWiredG1c('reorderChildren'),
 
-    // ── chat(DP-6R 另一 worker;seam reject,不接)──
-    appendChatMessage: () => notWiredDP6R('appendChatMessage'),
+    // ── chat(G1-a chat 接线,DP-6R per-actor;wire shape 与旧版/新版 route 一致,owner 语义服务端管)──
+    listChatMessages: (canvasId) =>
+      requestJson<ListChatMessagesResponse>({
+        fetch: doFetch,
+        baseUrl,
+        getAuthHeaders,
+        method: 'GET',
+        path: `/api/canvas/${encodeURIComponent(canvasId)}/chat`,
+      }),
+    appendChatMessage: (canvasId, message) =>
+      requestJson<UpsertResponse>({
+        fetch: doFetch,
+        baseUrl,
+        getAuthHeaders,
+        method: 'POST',
+        path: `/api/canvas/${encodeURIComponent(canvasId)}/chat`,
+        body: { message },
+      }),
+    updateChatMessage: (canvasId, msgId, payload, baseRevision) =>
+      requestJson<UpsertResponse>({
+        fetch: doFetch,
+        baseUrl,
+        getAuthHeaders,
+        method: 'PATCH',
+        path: `/api/canvas/${encodeURIComponent(canvasId)}/chat/${encodeURIComponent(msgId)}`,
+        body: { payload },
+        ...(baseRevision !== undefined ? { ifMatch: baseRevision } : {}),
+      }),
+    deleteChatMessage: async (canvasId, msgId) => {
+      try {
+        await requestJson<void>({
+          fetch: doFetch,
+          baseUrl,
+          getAuthHeaders,
+          method: 'DELETE',
+          path: `/api/canvas/${encodeURIComponent(canvasId)}/chat/${encodeURIComponent(msgId)}`,
+        })
+      } catch (error) {
+        // 幂等删:404(已删 / 不存在 / 跨 actor)视为成功 void。
+        if (error instanceof HttpError && error.status === 404) return
+        throw error
+      }
+    },
 
     // ── user-state(user scope)──
     putUserState: (key, value, baseRevision) =>
@@ -391,5 +572,26 @@ export const createFetchServerPersistAdapter = (opts: FetchAdapterOptions): Serv
         mimeType: res.headers.get('content-type') || 'application/octet-stream',
       }
     },
+    // G1-a P1-2 seam:asset attach/detach wire(节点生命周期调用方属 G1-c,本轮只冻结 wire)。
+    // ownerFp 服务端派生(client 不传);route:200(attached/already-attached)/404(missing)。
+    attachAsset: (assetId, nodeId) =>
+      requestJson<AttachAssetResult>({
+        fetch: doFetch,
+        baseUrl,
+        getAuthHeaders,
+        method: 'POST',
+        path: `/api/assets/${encodeURIComponent(assetId)}/attach`,
+        body: { nodeId },
+      }),
+    // route:200(detached/already-detached)/404(missing)/403(owner-mismatch)。404 由 executor 幂等 success。
+    detachAsset: (assetId, nodeId) =>
+      requestJson<DetachAssetResult>({
+        fetch: doFetch,
+        baseUrl,
+        getAuthHeaders,
+        method: 'POST',
+        path: `/api/assets/${encodeURIComponent(assetId)}/detach`,
+        body: { nodeId },
+      }),
   }
 }

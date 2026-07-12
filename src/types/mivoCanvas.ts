@@ -427,6 +427,18 @@ export type CanvasProject = {
   name: string
   /** ISO timestamp; set once at createProject time. */
   createdAt: string
+  /**
+   * G1-a P1-1 server 接线:从 BFF hydrate 的 server-true 字段(可选,demo/local 项目省略)。
+   * - `revision`:server envelope revision;renameProject(PATCH /api/projects/:id)的 If-Match base。
+   *   demo/local 项目无此字段 → server 模式 rename 时 baseRevision=undefined → 428 rejected(fail-visible:
+   *   demo 项目不存在于 server,无法同步 rename——需先 createProject 落 server 再 rename)。
+   * - `ownerId`/`updatedAt`/`isDeleted`:server 真值镜像,observability + 未来 G1-c 用。
+   * 可选字段保证 local/demo 零变化(表征测试创建 {id,name,createdAt} 仍满足 widened 类型)。
+   */
+  revision?: number
+  ownerId?: string
+  updatedAt?: string
+  isDeleted?: boolean
 }
 
 export type CanvasDocument = {
@@ -442,6 +454,16 @@ export type CanvasDocument = {
   tasks: CanvasTask[]
   selectedNodeId?: string
   selectedNodeIds?: string[]
+  /**
+   * G1-a P1-1/P1-2 server 接线:从 BFF hydrate 的 canvas meta revision(可选,IDB 画布省略)。
+   * - `metaRevision`:PUT /api/canvas/:id(rename/move)的 If-Match base。IDB 画布无此字段 → server 模式
+   *   updateCanvas 时 baseRevision=undefined → 428 rejected(fail-visible:canvas 全量 hydrate 属 G1-c,
+   *   未 hydrate 的 IDB 画布无法同步 rename/move——需 G1-c fetchCanvas 填充 metaRevision)。
+   * - `contentVersion`:子资源版本(observability,G1-c 用)。
+   * 可选字段保证 local/demo 零变化。
+   */
+  metaRevision?: number
+  contentVersion?: number
 }
 
 export type SceneDefinition = {
