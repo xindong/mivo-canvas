@@ -167,6 +167,39 @@ describe('structure-guard rule ④ server 分层方向 (A7a-3)', () => {
     expect(exit).toBe(0)
     expect(out).not.toContain('[FAIL] server 分层方向')
   })
+
+  // A7a 第三轮返修(lead 指定 + sol 探针):改走 TS AST 后,补手写 lexer 漏检/误报的三例边界。
+  it('RED: 模板插值内 dynamic import("../routes/r") → FAIL(AST 递归进 ${} 找到 CallExpression)', () => {
+    const root = makeFixture([
+      CHATSTORE,
+      { path: 'server/lib/x.ts', content: "const url = `${import('../routes/r')}?q=1`\n" },
+    ])
+    const { exit, out } = runGuard(root)
+    expect(exit).toBe(1)
+    expect(out).toContain('[FAIL] server 分层方向')
+    expect(out).toContain('server/lib/x.ts')
+  })
+
+  it('RED: 正则字面量后下一行真实 side-effect import → FAIL(AST 不被正则误切状态吞下行)', () => {
+    const root = makeFixture([
+      CHATSTORE,
+      { path: 'server/lib/x.ts', content: "const re = /['\"]/\nimport '../routes/r'\n" },
+    ])
+    const { exit, out } = runGuard(root)
+    expect(exit).toBe(1)
+    expect(out).toContain('[FAIL] server 分层方向')
+    expect(out).toContain('server/lib/x.ts')
+  })
+
+  it('CLEAN: 正则字面量仅含 import routes 文本 → PASS(AST 当 RegexLiteral,不提取)', () => {
+    const root = makeFixture([
+      CHATSTORE,
+      { path: 'server/lib/x.ts', content: "const re = /import routes r/\n" },
+    ])
+    const { exit, out } = runGuard(root)
+    expect(exit).toBe(0)
+    expect(out).not.toContain('[FAIL] server 分层方向')
+  })
 })
 
 describe('structure-guard rule ① 扩面:src/app 入扫描 (A7a-3)', () => {

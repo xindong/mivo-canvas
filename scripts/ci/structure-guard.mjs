@@ -29,6 +29,7 @@ import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { execSync } from 'node:child_process'
 import { join, relative, resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import ts from 'typescript'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 // MIVO_GUARD_ROOT 允许 fixture 测试把扫描根重定向到临时目录(默认 = 仓根)。
@@ -43,104 +44,31 @@ function serverModuleOf(rel) {
   if (parts.length >= 3 && parts[0] === 'server') return `${parts[0]}/${parts[1]}`
   return parts[0]
 }
-// 轻量 lexer:逐字符扫描,跟踪 ' / " / ` / 注释状态,只在 code 状态识别 import token
-// (from '...' / import('...') / 裸 import '...'),提取相对 specifier。
-// A7a 第二轮返修 P2:原 stripSourceComments+regex 保留字符串内容 → 字符串/模板内的
-// `import '../routes/r'` 被当真实 import 误红守卫(sol 只读探针实证)。lexer 在
-// string/template/comment 状态跳过内容,只从 code 位置提取,根治字符串假阳性。
-function scanRelativeSpecs(content) {
+// TS AST 提取相对 import specifier。A7a 第三轮返修:lead 指定改走 TS compiler API
+// (ts.createSourceFile + 递归遍历),不再手写词法器——手写 lexer 补模板插值栈 + 正则/除法
+// 区分是无底洞(sol 探针实证:模板插值内 import() 漏检、/['"]/ 误切 strSingle 吞下一行真实
+// import、正则字面量内 import 文本误报)。AST 天然免疫字符串/模板/正则/注释全部边界。
+// 只采集三类节点的 string literal specifier:ImportDeclaration.moduleSpecifier /
+// ExportDeclaration.moduleSpecifier / CallExpression(expression.kind===ImportKeyword) 首参。
+function scanRelativeSpecs(rel, content) {
   const specs = new Set()
-  const n = content.length
-  let i = 0
-  // 状态:0=code, 1=lineComment, 2=blockComment, 3=strSingle, 4=strDouble, 5=strTemplate
-  let state = 0
-  const isIdent = (c) => !!c && /[A-Za-z0-9_$]/.test(c)
+  // fileName 传 rel(含 .ts/.tsx 扩展)→ TS 据扩展名推断 ScriptKind(.tsx 走 TSX,JSX 不误判)。
+  const sf = ts.createSourceFile(rel || 'scan.ts', content, ts.ScriptTarget.Latest, true)
   const isRelative = (s) => s.startsWith('./') || s.startsWith('../')
-  const isWs = (c) => c === ' ' || c === '\t' || c === '\n' || c === '\r'
-  // 从当前 i(指向开引号)读引号内 specifier;i 推进到闭合引号后;返回原文(不含引号)。
-  const readQuoted = () => {
-    const q = content[i]
-    i++ // 开引号
-    let s = ''
-    while (i < n) {
-      const c = content[i]
-      if (c === '\\') { s += content[i + 1] || ''; i += 2; continue } // 转义(路径无转义,防误判)
-      if (c === q) { i++; break }
-      s += c
-      i++
+  const addIfRelative = (specNode) => {
+    if (specNode && ts.isStringLiteral(specNode) && isRelative(specNode.text)) specs.add(specNode.text)
+  }
+  function visit(node) {
+    if (ts.isImportDeclaration(node)) {
+      addIfRelative(node.moduleSpecifier)
+    } else if (ts.isExportDeclaration(node)) {
+      addIfRelative(node.moduleSpecifier)
+    } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+      addIfRelative(node.arguments && node.arguments[0])
     }
-    return s
+    ts.forEachChild(node, visit)
   }
-  // 检测 i 处是否为关键字 kw(左右均非 ident = 词边界)。
-  const atKeyword = (kw) => {
-    if (content[i] !== kw[0] || !content.startsWith(kw, i)) return false
-    if (isIdent(content[i + kw.length])) return false // 右边界(importA / fromB 不算)
-    if (i > 0 && isIdent(content[i - 1])) return false // 左边界(ximport / xfrom 不算)
-    return true
-  }
-  while (i < n) {
-    const c = content[i]
-    const nx = content[i + 1]
-    switch (state) {
-      case 0: // code
-        if (c === '/' && nx === '/') { state = 1; i += 2; continue }
-        if (c === '/' && nx === '*') { state = 2; i += 2; continue }
-        if (c === "'") { state = 3; i++; continue } // 字符串/模板字面量 → 跳过其内容(不入 specs)
-        if (c === '"') { state = 4; i++; continue }
-        if (c === '`') { state = 5; i++; continue }
-        // from <ws> '...' / "..."(static import/export ... from '...')
-        if (atKeyword('from')) {
-          let j = i + 4
-          while (j < n && isWs(content[j])) j++
-          if (content[j] === "'" || content[j] === '"') {
-            i = j
-            const s = readQuoted()
-            if (isRelative(s)) specs.add(s)
-            continue
-          }
-        }
-        // import( '...' (dynamic) / import '...' (bare side-effect)
-        if (atKeyword('import')) {
-          let k = i + 6
-          while (k < n && isWs(content[k])) k++
-          if (content[k] === '(') {
-            // dynamic import('...')
-            k++
-            while (k < n && isWs(content[k])) k++
-            if (content[k] === "'" || content[k] === '"') {
-              i = k
-              const s = readQuoted()
-              if (isRelative(s)) specs.add(s)
-              continue
-            }
-          } else if (content[k] === "'" || content[k] === '"') {
-            // bare side-effect import '...'
-            i = k
-            const s = readQuoted()
-            if (isRelative(s)) specs.add(s)
-            continue
-          }
-          // else: import { ... } / import type / import * — 由后续 from 分支提取,此处只前进
-        }
-        i++
-        continue
-      case 1: // line comment
-        if (c === '\n') state = 0
-        i++; continue
-      case 2: // block comment
-        if (c === '*' && nx === '/') { state = 0; i += 2; continue }
-        i++; continue
-      case 3: // str single
-      case 4: // str double
-        if (c === '\\') { i += 2; continue }
-        if ((state === 3 && c === "'") || (state === 4 && c === '"')) { state = 0; i++; continue }
-        i++; continue
-      case 5: // str template(简化:不递归 ${};模板内的 import 当字符串内容跳过)
-        if (c === '\\') { i += 2; continue }
-        if (c === '`') { state = 0; i++; continue }
-        i++; continue
-    }
-  }
+  visit(sf)
   return [...specs]
 }
 // 把相对 spec 解析为 posix 仓内相对路径(仅路径规范化,不查 FS)。
@@ -163,7 +91,7 @@ export function checkServerDirectionRule(files) {
     if (!f.rel.startsWith('server/')) continue
     const mod = serverModuleOf(f.rel)
     if (mod === 'server/routes' || mod === 'server') continue
-    for (const spec of scanRelativeSpecs(f.content)) {
+    for (const spec of scanRelativeSpecs(f.rel, f.content)) {
       const target = resolveSpecPath(spec, f.rel)
       if (target && (target === 'server/routes' || target.startsWith('server/routes/'))) {
         violations.push(`[FAIL] server 分层方向: ${f.rel}(${mod}) import ${spec} → ${target}(server/routes) — 非 routes 层禁依赖 server/routes(routing 是顶层)`)
