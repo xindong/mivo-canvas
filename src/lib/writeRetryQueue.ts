@@ -275,25 +275,48 @@ export const isDeleteKind = (kind: WriteOpKind): boolean =>
   kind === 'deleteChatMessage' // 404(已删 / 跨 actor)→ 幂等 success
 
 /**
- * G1-a R4 F2 (零项目 New Canvas 修复):drain 排序的依赖感知 tie-breaker。
+ * G1-a R5 F1(R4 tie-breaker 三层化):drain 排序的依赖感知 tie-breaker。
  *
- * canvas 写(createCanvas / updateCanvas)携带 `projectId` 作外键——服务端要求 project 先建好
- * (POST /api/canvas 缺 project → 404 unknown-project → rejected terminal,见 server/routes/canvas.ts)。
- * 零项目账号 New Canvas 的同步路径(documentSlice.createCanvas → get().createProject → 两次 enqueue)
- * 把 createProject 与 createCanvas 在**同一毫秒**入队到不同 resource-key 链:纯 timestamp 排序对二者
- * 返回 0,顺序退化为 IDB `getAll()` 的 key(id UUID)序——非确定且可能 canvas 在前,drain 先发 canvas
- * → 404 terminal → 画布记录被删,刷新后永久丢失(R4 复现)。
+ * 跨 resource-key、同毫秒入队的写按"父资源先建"分层,防子资源 op 在父资源 create 前 drain
+ * → 服务端 FK 404 → classifyHttpStatus(404, isDelete=false) → rejected terminal → durable record 被删
+ * → 刷新后永久丢失。三层依赖顺序:
+ *  - rank 0:project 类(createProject/updateProject/deleteProject)+ user-state + asset-attach/detach。
+ *    无跨资源 FK 会在 G1-a executor 范围内因 404 terminal 丢失(attachAsset 依赖 node 生命周期,但当前
+ *    无生产 enqueue caller,见下 G1-c 提醒)。
+ *  - rank 1:canvas 类 createCanvas/updateCanvas —— 携带 projectId 外键,服务端要求 project 先建好
+ *    (POST /api/canvas 缺 project → 404 unknown-project;见 server/routes/canvas.ts + canvas.route.test.ts
+ *    unknown-project 404)。R4 F2 已覆盖 project→canvas 同毫秒 FK 链。
+ *  - rank 2:canvas-dependent child —— appendChatMessage / updateChatMessage / deleteChatMessage。依赖
+ *    canvas 已建(POST /api/canvas/:id/chat → authzCanvas → canvas 未建 → 404 unknown-canvas → terminal;
+ *    见 canvas.ts authzCanvas + canvas.route.test.ts POST chat 404)。R5-1:同毫秒 createCanvas +
+ *    appendChatMessage(用户新建画布后立即发消息,chatStore.sendMessage → enqueueChatAppend)若 chat 先
+ *    drain → 404 unknown-canvas → terminal 删 chat record → 消息永久丢失。rank 2 保证 chat 在 createCanvas
+ *    之后 drain。
  *
- * tie-breaker:同 nextAttemptAt + 同 createdAt 时,canvas 类写(rank 1)排在 project 类写(rank 0)之后,
- * 保证 project prerequisite 先 drain。**最小闭环**,不引入通用 DAG / parent-lookup(只覆盖"同毫秒多资源链
- * project→canvas FK"这一类;跨毫秒时 createProject 同步先于 createCanvas 入队,timestamp 主键已保证顺序)。
- * 其余 op kind 无 project-FK 依赖 → rank 0(与 createProject 同层,顺序退化为既有稳定排序,零回归)。
+ * 第四层依赖面(future seam,当前不加码,书面确认):
+ *  - updateChatMessage / deleteChatMessage 语义上依赖 appendChatMessage 已先成功(否则 PATCH/DELETE 一个
+ *    未建 msgId → 404 unknown-message;delete 404 幂等 success 无险,update 404 → terminal)。**当前
+ *    chatPersistSync 只导出 enqueueChatAppend,无生产 enqueueChatUpdate/Delete caller**(独立 grep 已核验),
+ *    故 append→update 同毫秒风险是 future seam,G1-a 范围书面确认即可,不另立 rank 层。
+ *  - node/edge/anchor/reorder/attachAsset 依赖 canvas 与 node 生命周期,但当前 executor 对 canvas 域写返
+ *    unsupported-retained(deferred 留存,不发请求不删,无 404 terminal 险)。**G1-c 接线升级 executor 时
+ *    必须重审依赖排序/恢复策略**(node→edge/anchor、asset-attach 依赖 live node 等),不要继续靠枚举层;
+ *    本函数只覆盖 G1-a 已接线的非画布域 FK 链(project→canvas→chat),G1-c 扩展时另行升级。
+ *
+ * 跨毫秒时父资源同步先于子资源入队,timestamp 主键已保证顺序 —— tie-breaker 仅在 same-ms tie 时生效。
  */
 const dependencyRank = (op: WriteOp): number => {
   switch (op.kind) {
+    // rank 2:canvas-dependent child —— chat 写依赖 canvas 已建(404 unknown-canvas → terminal 会丢消息)。
+    case 'appendChatMessage':
+    case 'updateChatMessage':
+    case 'deleteChatMessage':
+      return 2
+    // rank 1:canvas 类 —— 携带 projectId 外键,project 先建(rank 0)。
     case 'createCanvas':
     case 'updateCanvas':
       return 1
+    // rank 0:project 类 + user-state + asset-attach/detach(无跨资源 FK 在 G1-a 范围内 terminal 404 丢失)。
     default:
       return 0
   }
@@ -746,8 +769,9 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
             r.nextAttemptAt <= ts,
         )
         // 主键 nextAttemptAt(退避到期先发)+ 次键 createdAt(同 nextAttemptAt 时先入队先发)
-        // + tie-breaker dependencyRank:同毫秒时 project 类写先于 canvas 类写(防零项目 New Canvas
-        // 因 IDB key 序非确定致 canvas 先 drain → 404 terminal 丢失;见 dependencyRank 注释)。
+        // + tie-breaker dependencyRank:同毫秒时按三层依赖 rank(project 0 → canvas 1 → canvas-dependent
+        // child chat 写 2)排序,防子资源 op 在父资源 create 前 drain → 404 terminal 丢失
+        // (R4 project→canvas / R5-1 canvas→chat;见 dependencyRank 注释)。
         .sort(
           (a, b) =>
             a.nextAttemptAt - b.nextAttemptAt ||

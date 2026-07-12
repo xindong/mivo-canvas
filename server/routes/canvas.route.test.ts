@@ -320,6 +320,22 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
     expect((listAfter.body as { messages: unknown[] }).messages).toHaveLength(0)
   })
 
+  it('R5-1: POST chat 到从未创建的 canvas → 404 unknown-canvas(createCanvas 未 drain 前 appendChat 先发 → terminal 丢消息的 FK 源头)', async () => {
+    // 镜像 line 26-29(POST canvas 缺 project → 404 unknown-project)。client writeRetryQueue 三层 rank
+    // (project 0 → canvas 1 → chat 2)就是为防 appendChatMessage 在 createCanvas 前 drain 命中此 404
+    // → classifyHttpStatus(404,isDelete=false) → rejected terminal → durable record 删 → 消息永久丢失。
+    // 本测试锚定服务端 FK 行为(canvas.ts authzCanvas !owner → 404 unknown-canvas),client 排序由
+    // writeRetryQueue.test.ts 'G1-a R5 F1' 用 FK-mock executor 覆盖;两端合证。
+    const noCanvas = await req(app, '/api/canvas/c-never-created/chat', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ message: { id: 'm1', role: 'user', text: 'hi' } }) })
+    expect(noCanvas.status).toBe(404)
+    expect((noCanvas.body as { error: string }).error).toBe('unknown-canvas')
+    // 建好 canvas 后 POST chat → 201(FK 满足)
+    await seedProject()
+    await seedCanvas('c-created', 'p1')
+    const ok = await req(app, '/api/canvas/c-created/chat', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ message: { id: 'm1', role: 'user', text: 'hi' } }) })
+    expect(ok.status).toBe(201)
+  })
+
   it('owner 隔离:B GET A 的 canvas → 404(同 unknown,无泄漏 #1)', async () => {
     await seedProject()
     await seedCanvas()
