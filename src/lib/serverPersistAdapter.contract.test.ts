@@ -10,6 +10,7 @@
 import { describe, expect, it, expectTypeOf } from 'vitest'
 import type {
   CanvasMeta,
+  CanvasChildUpsertResponse,
   ConflictBody,
   CreateAssetResponse,
   GetCanvasResponse,
@@ -43,17 +44,26 @@ import type { NodeRecord } from '../kernel/records'
 
 describe('T1.3 ServerPersistAdapter ↔ server contract 类型共享互锁(返修版二)', () => {
   it('shared wire 类型被 client + server 共同 import(互锁基础)', () => {
-    // A2-S2:UpsertResponse 扩 optional seq/base(§10.2);toEqualTypeOf→toMatchTypeOf 松绑(阶段 3 client 接线时改必填 + 恢复 toEqualTypeOf)。
-    // TODO(A2-S3): strictify seq/base — 改必填 + 恢复 exact type test。
+    // A2-S3(lead ②,Plan C 收尾):strictify 仅 canvas child 域——拆 CanvasChildUpsertResponse(seq+base 必填)
+    //   extends UpsertResponse(optional)。canvas child(PATCH/POST upsertNode/Edge/Anchor)返必填型 → exact type;
+    //   chat(DP-6R per-actor,独立 orderRevision 游标,不进 canvas_seq)/user-state(无序流)仍用 UpsertResponse
+    //   (optional,不填 seq/base——不发明未经终审的语义)。原 TODO(A2-S3) 锚点兑现:恢复 toEqualTypeOf。
+    // UpsertResponse 仍 optional(chat/userState 用):toMatchTypeOf 松绑保留。
     expectTypeOf<UpsertResponse>().toMatchTypeOf<{ id: string; revision: Revision }>()
+    // canvas child 域:seq+base 必填 → exact type test 恢复(lead ②)。CanvasChildUpsertResponse = UpsertResponse &
+    //   {seq:number;base:string}(intersection);exact 断言经 adapter 方法返回类型锚定(下 it:upsertNode/Edge/Anchor
+    //   returns.toEqualTypeOf<Promise<CanvasChildUpsertResponse>>)——standalone expectTypeOf<intersection>() 触发
+    //   vitest 0-arg overload 误选,故不走 standalone 形式;adapter-return 锚定即 exact type 恢复点。
     expectTypeOf<ConflictBody>().toEqualTypeOf<{ error: 'revision-conflict'; id: string; currentRevision: Revision }>()
   })
 
   it('adapter 方法返回类型 = shared wire 响应类型(fetchCanvas/upsert/putUserState + #8/N9 asset seam)', () => {
     expectTypeOf<ServerPersistAdapter['fetchCanvas']>().returns.toMatchTypeOf<Promise<GetCanvasResponse | null>>()
-    expectTypeOf<ServerPersistAdapter['upsertNode']>().returns.toMatchTypeOf<Promise<UpsertResponse>>()
-    expectTypeOf<ServerPersistAdapter['upsertEdge']>().returns.toMatchTypeOf<Promise<UpsertResponse>>()
-    expectTypeOf<ServerPersistAdapter['upsertAnchor']>().returns.toMatchTypeOf<Promise<UpsertResponse>>()
+    // A2-S3:canvas child 域 upsert 返 CanvasChildUpsertResponse(seq+base 必填)→ exact type(lead ②)。
+    expectTypeOf<ServerPersistAdapter['upsertNode']>().returns.toEqualTypeOf<Promise<CanvasChildUpsertResponse>>()
+    expectTypeOf<ServerPersistAdapter['upsertEdge']>().returns.toEqualTypeOf<Promise<CanvasChildUpsertResponse>>()
+    expectTypeOf<ServerPersistAdapter['upsertAnchor']>().returns.toEqualTypeOf<Promise<CanvasChildUpsertResponse>>()
+    // chat/userState 仍 UpsertResponse(optional,不填 seq/base)→ toMatchTypeOf 保留(非 canvas child 域)。
     expectTypeOf<ServerPersistAdapter['appendChatMessage']>().returns.toMatchTypeOf<Promise<UpsertResponse>>()
     expectTypeOf<ServerPersistAdapter['putUserState']>().returns.toMatchTypeOf<Promise<UpsertResponse>>()
     expectTypeOf<ServerPersistAdapter['getUserState']>().returns.toMatchTypeOf<Promise<UserStateEntry | null>>()

@@ -21,12 +21,15 @@ import { getServerPersistAdapter } from './serverPersistAdapterSelector'
 import { createAdapterWriteExecutor } from './persistWriteExecutor'
 import { createWriteQueue, type WriteOp, type WriteQueue } from './writeRetryQueue'
 import { hydrateUserStateMap } from './serverPersistHydrate'
+import { storeCanvasCursor, __resetCanvasCursorStore } from './snapshotCursorStore'
+import { fromRecord, edgeFromRecord } from '../kernel/mapping'
+import type { NodeRecord, EdgeRecord } from '../kernel/records'
 import { debugLogger } from '../store/debugLogStore'
 import { toastFeedback } from '../store/toastStore'
 import { defaultFetch, type FetchAdapterOptions, type FetchLike, type GetAuthHeaders } from './serverPersistAdapter'
 import type { ChatMessage } from '../store/chatStore'
 import type { CanvasDocument } from '../types/mivoCanvas'
-import type { Revision, UserStateEntry } from '../../shared/persist-contract.ts'
+import type { Revision, UserStateEntry, RecordEntry } from '../../shared/persist-contract.ts'
 
 const SOURCE = 'Persist Boot'
 
@@ -44,6 +47,18 @@ let writeQueue: WriteQueue | undefined
 // 供未来 reorder If-Match 用(reorder cursor 真相源;消费方属 DP-6R/G1-c defer 域,此处只存不消费,
 // 非"只 log"——是可观测的应用点 + accessor)。local 模式永不写入(hydrate 不跑)。
 const orderRevisionByCanvas = new Map<string, Revision>()
+
+// A2-S3 block 8:scene 切换 re-hydrate 去重 + in-flight 防并发状态(module 级,同 orderRevisionByCanvas 模式)。
+//   - hydratedSceneIds:本会话已成功 hydrate content 的 sceneId 集合(切走再切回不重复 fetch;lead 要求
+//     "同 scene 会话内去重")。boot step 2.5 对 active scene 调 hydrateCanvasContentIfMissing 时也记入,
+//     故 boot active scene 切走再切回不双拉。
+//   - inFlightSceneIds:正在 fetch 的 sceneId(防同 scene 并发双拉;hydrate 内 R-7 union 已处理重叠,
+//     去重避免浪费网络)。
+//   - sceneHydrationUnsub:scene 切换订阅的 unsubscribe(boot durable 后启动;__resetPersistBoot /
+//     stopSceneHydrationSubscription 停)。local 模式永不写(订阅永不启动,bootPersistWiring 第一行 return)。
+const hydratedSceneIds = new Set<string>()
+const inFlightSceneIds = new Set<string>()
+let sceneHydrationUnsub: (() => void) | undefined
 
 /**
  * G1-a R2 F4:取某 canvas 的 chat orderRevision(DP-6R per-actor×canvas reorder cursor)。
@@ -96,6 +111,11 @@ export const __resetPersistBoot = (): void => {
   writeQueue = undefined
   orderRevisionByCanvas.clear()
   userStateMap.clear()
+  __resetCanvasCursorStore()
+  // A2-S3 block 8:清 scene 切换 re-hydrate 状态(逐 test 隔离;unsub + 清去重/in-flight 集合)。
+  stopSceneHydrationSubscription()
+  hydratedSceneIds.clear()
+  inFlightSceneIds.clear()
 }
 
 // ── server 模式 boot:hydrate 非画布域(从 BFF 恢复)──
@@ -188,6 +208,140 @@ export const backfillChatAfterDrain = async (
 }
 
 /**
+ * A2-S3 item 4:server 模式 hydrate 补画布正文拉取/应用(现在只 merge canvas meta → 补 content)。
+ * 按 G1-b 冻结 hydrate 语义(inventory §2.2:loadSnapshot → CanvasSnapshot + cursor):
+ *  - fetchCanvas(active)→ 构建 canvas 级 bundle cursor(recordId→base + orderCv + sinceSeq;§14.7 hydrate 签发)
+ *    存 snapshotCursorStore(Block 7 edit/delete 从此取 wire base 作 If-Match)。
+ *  - 应用 nodes/edges 到 store.canvases[sceneId]:R-7 union(server canonical by id 覆盖本地;local-only =
+ *    id 不在 server 集 = pending create 未 drain / demo → 保留 union,同 chat R-7)。tasks/selection 不动
+ *    (content hydrate 不碰衍生态)。anchors 的 base 入 bundle(供 Block 7),但 anchors 不在 CanvasDocument
+ *    (存别处),apply 跳过 anchors。
+ *  - kernel=new/legacy 两轨兼容:写 legacy store(canvases[sceneId]);kernel=new 读自己 DocKernel adapter
+ *    (src/kernel/adapters.ts,直读 backend),不经此 store → 默认 legacy 不破(只补 content,不改 meta 语义)。
+ * local 模式无 hydrate 概念,永不调此。失败降级 try/catch + warn(不阻断其余 hydrate)。
+ */
+const hydrateActiveCanvasContent = async (
+  sceneId: string,
+  adapter: ReturnType<typeof getServerPersistAdapter>,
+): Promise<boolean> => {
+  const { useCanvasStore } = await import('../store/canvasStore')
+  let resp
+  try {
+    resp = await adapter.fetchCanvas(sceneId)
+  } catch (error) {
+    debugLogger.warn(SOURCE, `fetchCanvas content hydrate failed for ${sceneId}: ${msg(error)} (content stays local)`)
+    return false
+  }
+  if (!resp) return false // canvas 不存在/无权(null,与 fetchCanvas 一致;不应用 content;不计 hydrated 允许重试)
+  // 构建 bundle cursor(per-record base + orderCv + sinceSeq;§14.7;Block 7 用)。
+  storeCanvasCursor(resp)
+  // 应用 nodes/edges(R-7 union:server canonical by id + 保留 local-only)。
+  const serverNodes = resp.nodes
+    .filter((r): r is RecordEntry & { payload: object } => r.payload != null && typeof r.payload === 'object')
+    .map((r) => fromRecord({ ...r.payload, id: r.id, revision: r.revision } as NodeRecord))
+  const serverEdges = resp.edges
+    .filter((r): r is RecordEntry & { payload: object } => r.payload != null && typeof r.payload === 'object')
+    .map((r) => edgeFromRecord({ ...r.payload, id: r.id, revision: r.revision } as EdgeRecord))
+  const serverNodeIds = new Set(serverNodes.map((n) => n.id))
+  const serverEdgeIds = new Set(serverEdges.map((e) => e.id))
+  let localOnlyNodes = 0
+  let localOnlyEdges = 0
+  useCanvasStore.setState((s) => {
+    const existing = s.canvases[sceneId]
+    if (!existing) return {} // meta-stub 未建(step 2 应已建);若仍无,返空 set 不动
+    const localNodes = existing.nodes.filter((n) => {
+      if (serverNodeIds.has(n.id)) return false
+      localOnlyNodes++
+      return true
+    })
+    const localEdges = existing.edges.filter((e) => {
+      if (serverEdgeIds.has(e.id)) return false
+      localOnlyEdges++
+      return true
+    })
+    return {
+      canvases: {
+        ...s.canvases,
+        [sceneId]: {
+          ...existing,
+          nodes: [...serverNodes, ...localNodes],
+          edges: [...serverEdges, ...localEdges],
+        },
+      },
+    }
+  })
+  // A2-S3 block 8:hydrate 写了 canvases[sceneId].nodes/edges,顶层 state.nodes/edges 须同步
+  // (否则 loadScene 在 fetch 完成前拍的空 document 留顶层,用户看到空画布;docNodesLength>0
+  // 但 topLevelNodesLength=0)。refresh 复用 loadScene 拍平逻辑只刷 nodes/edges(不碰 selection/
+  // history/activeTool/viewport);race(active ≠ sceneId,fetch 完成时已切走)由 refresh 内 gate
+  // 拦(不动顶层,内容留 canvases[sceneId] 切回 loadScene 自然拍平)。
+  useCanvasStore.getState().refreshActiveCanvasContent(sceneId)
+  debugLogger.log(
+    SOURCE,
+    `server hydrate: active canvas ${sceneId} content applied (${serverNodes.length} nodes + ${serverEdges.length} edges from BFF; ${localOnlyNodes} local-only nodes + ${localOnlyEdges} local-only edges retained (R-7 union); bundle cursor built)`,
+  )
+  return true
+}
+
+/**
+ * A2-S3 block 8:去重 + in-flight 防并发的 content hydrate 包装。成功 hydrate 的 sceneId 记入
+ * hydratedSceneIds(切走再切回不重复 fetch);in-flight 标记防同 scene 并发双拉。fetch 失败
+ * (hydrateActiveCanvasContent 内 try/catch warn 降级,不 throw)→ 不记 hydrated,下次切回可重试。
+ * 仅 server/shadow 模式调(local 短路在 bootPersistWiring 第一行,订阅永不启动)。
+ */
+const hydrateCanvasContentIfMissing = async (
+  sceneId: string,
+  adapter: ReturnType<typeof getServerPersistAdapter>,
+): Promise<void> => {
+  if (hydratedSceneIds.has(sceneId)) {
+    debugLogger.log(SOURCE, `scene ${sceneId} content already hydrated this session, skip fetch (dedup)`)
+    return
+  }
+  if (inFlightSceneIds.has(sceneId)) {
+    debugLogger.log(SOURCE, `scene ${sceneId} content hydrate already in-flight, skip concurrent fetch (in-flight guard)`)
+    return
+  }
+  inFlightSceneIds.add(sceneId)
+  try {
+    // hydrateActiveCanvasContent 返 true=成功应用 content(记 hydrated,切回不重复 fetch);
+    // false=fetchCanvas 失败/resp null(不记,下次切回可重试;fail-visible 由其内 warn 留痕)。
+    const applied = await hydrateActiveCanvasContent(sceneId, adapter)
+    if (applied) hydratedSceneIds.add(sceneId)
+  } finally {
+    inFlightSceneIds.delete(sceneId)
+  }
+}
+
+/**
+ * A2-S3 block 8:启动 scene 切换 re-hydrate 订阅。boot readiness durable 后(server/shadow 分支)调此。
+ * 订阅 useCanvasStore.sceneId 变化 → 对新 scene 调 hydrateCanvasContentIfMissing(补 content)。
+ * dynamic import canvasStore 防静态环(persistBoot↔canvasStore 经 projectsSlice)。local 模式永不调
+ * (bootPersistWiring 第一行 return);故订阅内不再检查 isLocalPersist(local 零行为变化由 boot 入口保证)。
+ * 幂等:已启动则直接 return(防重复订阅)。
+ */
+const startSceneHydrationSubscription = async (
+  adapter: ReturnType<typeof getServerPersistAdapter> = getServerPersistAdapter(),
+): Promise<void> => {
+  if (sceneHydrationUnsub) return
+  const { useCanvasStore } = await import('../store/canvasStore')
+  sceneHydrationUnsub = useCanvasStore.subscribe((state, prev) => {
+    if (state.sceneId && state.sceneId !== prev.sceneId) {
+      void hydrateCanvasContentIfMissing(state.sceneId, adapter)
+    }
+  })
+  debugLogger.log(
+    SOURCE,
+    `scene-switch content re-hydrate subscription started (mode=${getPersistMode()}; dedup + in-flight guard active; local never subscribes)`,
+  )
+}
+
+/** A2-S3 block 8:停 scene 切换订阅(测试/HMR 清理)。生产 boot 常驻。 */
+export const stopSceneHydrationSubscription = (): void => {
+  sceneHydrationUnsub?.()
+  sceneHydrationUnsub = undefined
+}
+
+/**
  * server 模式冷启动 hydrate:project 全量(替换 store.projects)+ canvas meta 列表(可观测,
  * 全量 content hydrate 属 G1-c 本轮不做)+ user-state map(无 client KV store,application deferred)。
  * 失败降级:各步独立 try/catch + debugLogger,任一失败不阻断其余(绝不因部分 hydrate 失败挂死 app)。
@@ -262,6 +416,24 @@ export const hydrateFromServer = async (
     )
   } catch (error) {
     debugLogger.warn(SOURCE, `listCanvas hydrate failed: ${msg(error)}`)
+  }
+
+  // 2.5 A2-S3 item 4:active canvas 正文拉取 + bundle cursor 构建(content hydrate;现 meta 已 merge,补 content)。
+  //    fetchCanvas(active)→ 应用 nodes/edges(R-7 union)+ 构建 bundle cursor(Block 7 edit/delete 用)。走
+  //    hydrateCanvasContentIfMissing(去重包装):boot active scene 记入 hydratedSceneIds,切走再切回不双拉。
+  //    切 scene re-hydrate 由 block 8 订阅(startSceneHydrationSubscription)处理,此处只 hydrate boot active。
+  //    mode gate:仅 server 执行。shadow 恒不 populate canvas content(IDB 读源契约:A3 灰度观察窗前提;
+  //    onConflict 路径 writeQueue 在 server/shadow 两分支都调,shadow 下撞 409 经 onConflict →
+  //    hydrateFromServer 到此,无 gate 即 populate canvas content 违反 ff91846 不变量 → 故 shadow 跳过)。
+  //    local 永不调(bootPersistWiring 第一行 return;onConflict 也不触达——local queue 未启动)。
+  //    server onConflict 补 content 保留(权威源正确行为)。失败降级 warn 不阻断。
+  try {
+    const sceneId = useCanvasStore.getState().sceneId
+    if (sceneId && getPersistMode() === 'server') {
+      await hydrateCanvasContentIfMissing(sceneId, adapter)
+    }
+  } catch (error) {
+    debugLogger.warn(SOURCE, `active canvas content hydrate failed: ${msg(error)} (content stays local/meta-only)`)
   }
 
   // 3. user-state map → 落点 + 真实消费方(R3 F2-A:不再只存 module 级 accessor)。
@@ -401,7 +573,7 @@ export const startPersistWriteQueue = (
     onConflict: (op, currentRevision) => {
       debugLogger.warn(
         SOURCE,
-        `conflict on ${op.kind} (server rev ${currentRevision}); re-hydrating non-canvas state for recoverable rebase`,
+        `conflict on ${op.kind} (server rev ${currentRevision}); re-hydrating from server for recoverable rebase (server: full incl canvas content; shadow: non-canvas only, canvas content gated out by step 2.5 mode gate)`,
       )
       void hydrateFromServer().catch((error) => {
         debugLogger.warn(SOURCE, `conflict re-hydrate failed: ${msg(error)}`)
@@ -499,8 +671,14 @@ export const bootPersistWiring = async (opts: FetchAdapterOptions = getProductio
   if (getPersistMode() === 'server') {
     await hydrateFromServer(undefined, opts)
     await startPersistWriteQueue(opts)
+    // A2-S3 block 8:启动 scene 切换 re-hydrate 订阅(切到新 server 画布 → fetchCanvas 补 content;
+    // 去重 + in-flight 防并发)。local 在 bootPersistWiring 第一行 return 短路,永不调此。
+    await startSceneHydrationSubscription()
   } else {
-    // shadow:IDB 已 rehydrate(读源),此处 compare + 双写队列(mutation enqueue 同时写 BFF)
+    // shadow:IDB 已 rehydrate(读源),此处 compare + 双写队列(mutation enqueue 同时写 BFF)。
+    // shadow 恒不 populate canvas content(IDB 读源契约:A3 灰度观察窗 mismatch 归因干净;server 与
+    //   IDB 不一致时 populate 会让用户可见内容漂移,违反 shadow 零变化承诺)。故切 scene re-hydrate
+    //   仅 server 模式(block 8),shadow 不订阅 scene 切换。
     await shadowCompareWithServer()
     await startPersistWriteQueue(opts)
   }

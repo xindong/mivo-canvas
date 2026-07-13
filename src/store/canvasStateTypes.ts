@@ -99,6 +99,7 @@ export type CanvasState = {
   duplicateCanvas: (canvasId?: CanvasId) => CanvasId | undefined
   deleteCanvas: (canvasId?: CanvasId) => void
   loadScene: (sceneId: CanvasId) => void
+  refreshActiveCanvasContent: (sceneId: CanvasId) => void
   renameCanvas: (sceneId: CanvasId, title: string) => void
   selectNode: (nodeId?: string, options?: { additive?: boolean }) => void
   selectNodes: (nodeIds: string[], primaryNodeId?: string) => void

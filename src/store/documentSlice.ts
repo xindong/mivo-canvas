@@ -233,6 +233,24 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
         },
       }
     }),
+  /**
+   * A2-S3 block 8:hydrate 后顶层 content 刷新。hydrateActiveCanvasContent 只写
+   * canvases[sceneId].nodes/edges,顶层 state.nodes/edges 需同步(否则 loadScene 在 fetch
+   * 完成前拍的空 document 留在顶层,用户看到空画布:docNodesLength>0 但 topLevelNodesLength=0)。
+   * 复用 loadScene 拍平逻辑(documentFor + normalizeDocument),但只刷 nodes/edges——不碰
+   * selection/history/activeTool/viewport(用户可感状态;loadScene 重入会重置这些,故抽此共用函数)。
+   * race:fetch 完成时 active ≠ sceneId(用户已切走)→ 返空不动顶层(内容留 canvases[sceneId],
+   * 切回时 loadScene 自然拍平)。
+   */
+  refreshActiveCanvasContent: (sceneId) =>
+    set((state) => {
+      if (state.sceneId !== sceneId) return {} // race:已切走,不动顶层(内容留 canvases[sceneId],切回 loadScene 拍平)
+      const document = normalizeDocument(documentFor(state.canvases, sceneId))
+      return {
+        nodes: document.nodes,
+        edges: document.edges || [],
+      }
+    }),
   renameCanvas: (sceneId, title) => {
     const existing = get().canvases[sceneId]
     const metaRevision = existing?.metaRevision

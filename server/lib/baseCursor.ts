@@ -72,28 +72,27 @@ const verify = (payload: string, expectedSigHex: string): boolean => {
 const PREFIX = 'base:'
 
 // ── record base ──
-/** encode record base:绑 canvasId+recordId+revision+per-field clock snapshot;签。 */
+// ★ A2-S3 item 5 (sol LOW 硬化):payload 改 JSON(与 bundle 同形),消除 `cv=X|rid=Y|r=Z|fc=k:v,k:v`
+//   的 `|`/`:`/`,`/`=` 分隔解析——fieldKey(fieldKeyOf=path.join('.'))若含这些字符,旧 `fc=k:v,k:v`
+//   会误拆(如 fieldKey `a,b` → `a,b:1` 被 `,` 切成 `a` 与 `b:1`)。JSON payload 无分隔符歧义,
+//   fieldKey 任意字符安全。本阶段 base 变 load-bearing(client 真发 If-Match),必须硬化。
+//   内部格式变化(token opaque,无外部消费者;spike 用自己的 codec,route 经 encode/decode 闭环)。
+/** encode record base:绑 canvasId+recordId+revision+per-field clock snapshot;签。payload = JSON(无分隔歧义)。 */
 export const encodeBase = (canvasId: string, recordId: string, revision: number, fieldClocks: FieldClocks): BaseCursor => {
-  const fc = Object.entries(fieldClocks).map(([k, v]) => `${k}:${v}`).join(',')
-  const payload = `cv=${canvasId}|rid=${recordId}|r=${revision}|fc=${fc}`
+  const payload = JSON.stringify({ cv: canvasId, rid: recordId, r: revision, fc: fieldClocks })
   return `${PREFIX}${payload}.${sign(payload)}` as BaseCursor
 }
 
-/** parse payload segments(payload 格式 `cv=X|rid=Y|r=Z|fc=k:v,k:v`)。 */
-const parseSegments = (payload: string): Record<string, string> => {
-  const out: Record<string, string> = {}
-  for (const seg of payload.split('|')) {
-    const i = seg.indexOf('=')
-    if (i > 0) out[seg.slice(0, i)] = seg.slice(i + 1)
-  }
-  return out
+/** parse JSON payload(非分隔符切分;JSON.parse 失败→null,防畸形 token 误信)。 */
+const parseJsonPayload = (payload: string): Record<string, unknown> | null => {
+  try { return JSON.parse(payload) as Record<string, unknown> } catch { return null }
 }
 
 export type DecodedBase = { revision: number; fieldClocks: FieldClocks }
 
 /**
  * decode record base:验签 + scope(canvasId+recordId 必须匹配 expected)→ {revision, fieldClocks} | null。
- * - null 语义:malformed(非 base: 前缀/无 dot)→ 400;unsigned/篡改(验签失败)→ 400;scope mismatch(跨 record/canvas 重放)→ 400。
+ * - null 语义:malformed(非 base: 前缀/无 dot/JSON.parse 失败)→ 400;unsigned/篡改(验签失败)→ 400;scope mismatch(跨 record/canvas 重放)→ 400。
  * - missing(token undefined)在 route 层映射 428(precondition-required);本函数对 undefined 也返 null,route 据 If-Match 缺失区分。
  */
 export const decodeBase = (token: BaseCursor | string | undefined, expectedCanvasId: string, expectedRecordId: string): DecodedBase | null => {
@@ -103,24 +102,25 @@ export const decodeBase = (token: BaseCursor | string | undefined, expectedCanva
   if (dot < 0) return null
   const payload = body.slice(0, dot)
   if (!verify(payload, body.slice(dot + 1))) return null
-  const seg = parseSegments(payload)
-  if (seg.cv !== expectedCanvasId || seg.rid !== expectedRecordId) return null // scope mismatch → null(防跨 record/canvas 重放)
+  const obj = parseJsonPayload(payload)
+  if (!obj) return null
+  if (obj.cv !== expectedCanvasId || obj.rid !== expectedRecordId) return null // scope mismatch → null(防跨 record/canvas 重放)
   const fc: FieldClocks = {}
-  if (seg.fc) {
-    for (const pair of seg.fc.split(',')) {
-      const [k, v] = pair.split(':')
-      if (k) fc[k] = Number(v)
+  if (obj.fc && typeof obj.fc === 'object') {
+    for (const [k, v] of Object.entries(obj.fc as Record<string, unknown>)) {
+      if (typeof v === 'number' && Number.isFinite(v)) fc[k] = v
     }
   }
-  const rev = Number(seg.r)
+  const rev = typeof obj.r === 'number' ? obj.r : Number(obj.r)
   if (!Number.isFinite(rev)) return null
   return { revision: rev, fieldClocks: fc }
 }
 
 // ── order base(canvas-scoped,reorder 用)──
+// A2-S3 item 5:payload 改 JSON(与 record base/bundle 同形,消除 `|` 分隔)。
 /** encode order base(canvas-scoped,无 recordId;reorder 用 canvas contentVersion)。 */
 export const encodeOrderBase = (canvasId: string, cv: number): BaseCursor => {
-  const payload = `cv=${canvasId}|order=${cv}`
+  const payload = JSON.stringify({ cv: canvasId, order: cv })
   return `${PREFIX}${payload}.${sign(payload)}` as BaseCursor
 }
 
@@ -134,15 +134,18 @@ export const decodeOrderBase = (token: BaseCursor | string | undefined, expected
   if (dot < 0) return null
   const payload = body.slice(0, dot)
   if (!verify(payload, body.slice(dot + 1))) return null
-  const seg = parseSegments(payload)
-  if (seg.cv !== expectedCanvasId || seg.order === undefined) return null
-  return { cv: Number(seg.order) }
+  const obj = parseJsonPayload(payload)
+  if (!obj || obj.cv !== expectedCanvasId || obj.order === undefined) return null
+  const cv = typeof obj.order === 'number' ? obj.order : Number(obj.order)
+  if (!Number.isFinite(cv)) return null
+  return { cv }
 }
 
 // ── event-since base(canvas-scoped seq;bundle 内 since 项)──
+// A2-S3 item 5:payload 改 JSON(同 record/order base)。
 /** encode event-since base(canvas-scoped seq;GET /events/poll?since= 增量补拉用;bundle 内 since 项)。 */
 export const encodeSinceBase = (canvasId: string, seq: number): BaseCursor => {
-  const payload = `cv=${canvasId}|since=${seq}`
+  const payload = JSON.stringify({ cv: canvasId, since: seq })
   return `${PREFIX}${payload}.${sign(payload)}` as BaseCursor
 }
 
@@ -156,9 +159,11 @@ export const decodeSinceBase = (token: BaseCursor | string | undefined, expected
   if (dot < 0) return null
   const payload = body.slice(0, dot)
   if (!verify(payload, body.slice(dot + 1))) return null
-  const seg = parseSegments(payload)
-  if (seg.cv !== expectedCanvasId || seg.since === undefined) return null
-  return { seq: Number(seg.since) }
+  const obj = parseJsonPayload(payload)
+  if (!obj || obj.cv !== expectedCanvasId || obj.since === undefined) return null
+  const seq = typeof obj.since === 'number' ? obj.since : Number(obj.since)
+  if (!Number.isFinite(seq)) return null
+  return { seq }
 }
 
 // ── v8 Blocker 1:SnapshotCursor(canvas 级 opaque bundle)= recordId→BaseCursor map + canvas order base + event since base ──

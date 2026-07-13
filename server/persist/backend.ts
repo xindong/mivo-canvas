@@ -361,6 +361,21 @@ export interface PersistBackend {
   getChatOrderRevision(ownerId: string, canvasId: string): Promise<Revision>
 
   /**
+   * A2-S3(§14.7/§10.2「hydrate snapshot 签发 base」):读单 record 的 per-field clock 全快照
+   * (fieldKeyOf 完整 path 粒度;供 route encodeBase 签发该 record 的 BaseCursor)。GET /api/canvas/:id
+   * 的 toEntry 逐 record 调此 → encodeBase(canvasId, recordId, revision, fieldClocks) → RecordEntry.base。
+   * pre-existing record hydrate 即得 base,client 首次 edit/delete 不再缺 If-Match。缺省 {} (create/fresh)。
+   */
+  readRecordFieldClocks(ownerId: string, type: PersistType, recordId: string): Promise<FieldClocks>
+
+  /**
+   * A2-S3:读 canvas 当前事件 seq(per-canvas 单调;供 route encodeSinceBase + encodeBundle 的 since 项 +
+   * CanvasMeta.sinceSeq)。GET /api/canvas/:id 的 toCanvasMeta 调此。缺省 0(canvas 无写操作)。
+   * 非 canvas_seq 语义的 type(chat-message per-actor)不调此。
+   */
+  readCanvasSeq(canvasId: string): Promise<number>
+
+  /**
    * DP-6R P1-2(返修 R2-P1-2):原子读 per-actor×canvas chat collection 的 (messages, orderRevision) **对**。
    * GET /api/canvas/:id/chat 用——messages 与 orderRevision 同一快照(memory 同步临界区无 await;PG 单事务
    * REPEATABLE READ 一致 snapshot),消除 listByCanvas + getChatOrderRevision 两 await 间隙的 torn pair
@@ -634,6 +649,16 @@ export class InMemoryPersistBackend implements PersistBackend {
   /** DP-6R P1-2:GET /chat 用——读 actor×canvas chat collection orderRevision。 */
   async getChatOrderRevision(ownerId: string, canvasId: string): Promise<Revision> {
     return this.chatOrderRevision(ownerId, canvasId)
+  }
+
+  /** A2-S3:读单 record per-field clock 全快照(供 route encodeBase 签发 BaseCursor;hydrate 用)。 */
+  async readRecordFieldClocks(ownerId: string, type: PersistType, recordId: string): Promise<FieldClocks> {
+    return this.snapshotFieldClocks(recordKey(ownerId, type, recordId))
+  }
+
+  /** A2-S3:读 canvas 当前事件 seq(供 route encodeSinceBase/encodeBundle + CanvasMeta.sinceSeq)。 */
+  async readCanvasSeq(canvasId: string): Promise<number> {
+    return this.canvasSeq.get(canvasId) ?? 0
   }
 
   /**

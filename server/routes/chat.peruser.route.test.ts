@@ -12,6 +12,7 @@
 import { describe, it, expect, beforeEach, beforeAll, afterAll } from 'vitest'
 import { buildPersistApp, req } from './persistTestApp'
 import type { InMemoryPersistBackend } from '../persist/backend'
+import { setBaseCursorSecrets } from '../lib/baseCursor'
 
 // T1.4 身份注入需 opt-in flag + 网关密钥(fail-closed)。test 显式设之,复用 permissions.route.test.ts 模式。
 let prevTrustFlag: string | undefined
@@ -21,12 +22,15 @@ beforeAll(() => {
   prevGwSecret = process.env.MIVO_GATEWAY_SECRET
   process.env.MIVO_TRUST_SSO_HEADER = '1'
   process.env.MIVO_GATEWAY_SECRET = 'gw-test-secret'
+  // A2-S3:GET /api/canvas/:id 现 hydrate 签发 per-record base(encodeBase,§14.7);需 secret,否则 fail-closed 500。
+  setBaseCursorSecrets(['chat-peruser-test-secret'])
 })
 afterAll(() => {
   if (prevTrustFlag === undefined) delete process.env.MIVO_TRUST_SSO_HEADER
   else process.env.MIVO_TRUST_SSO_HEADER = prevTrustFlag
   if (prevGwSecret === undefined) delete process.env.MIVO_GATEWAY_SECRET
   else process.env.MIVO_GATEWAY_SECRET = prevGwSecret
+  setBaseCursorSecrets(null)
 })
 
 describe('DP-6R chat per-user — 路由级验收', () => {

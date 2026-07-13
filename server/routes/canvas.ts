@@ -34,11 +34,12 @@ import {
   reuseConflict,
   validateChildPayload,
 } from '../lib/persistHttp'
-import { encodeBase, decodeBase } from '../lib/baseCursor'
+import { encodeBase, decodeBase, encodeBundle, encodeOrderBase, type BundleEntry } from '../lib/baseCursor'
 import { validateDomainOps, validateCreateBody, validateLegacyReplaceRequest, DomainOpError, type DomainOp, type LegacyReplaceRequest } from '../lib/domainOp'
 import { legacyDrainGate } from '../lib/legacyDrainGate'
 import type {
   CanvasMeta,
+  CanvasChildUpsertResponse,
   ConflictBody,
   CreateCanvasRequest,
   GetCanvasResponse,
@@ -227,11 +228,43 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
       backend.listByCanvas(authz.ownerId, id, 'edge'),
       backend.listByCanvas(authz.ownerId, id, 'anchor'),
     ])
+    // A2-S3(§14.7/§10.2「hydrate snapshot 签发 base」):逐 record 签发 BaseCursor(encodeBase,
+    //   绑 canvasId+recordId+revision+per-field clock snapshot)→ RecordEntry.base;client 回传 PATCH/DELETE
+    //   的 If-Match。pre-existing record hydrate 即得 base → 首次 edit/delete 不再缺 If-Match(428)。
+    //   同时收集 bundle entries(recordId→{revision,fieldClocks})+ canvasSeq → 签 canvas 级 bundle + sinceSeq。
+    //   ⚠️ perf:per-record readRecordFieldClocks 对 PG 是 N 次查询;A2-S3 优先正确性,批量查询待优化
+    //   (collab 生产大画布前;in-memory Map 查询 O(1) 无影响)。
+    const signEntries = async (
+      recs: PersistRecord[],
+      type: 'node' | 'edge' | 'anchor',
+    ): Promise<{ entry: RecordEntry; recordId: string; bundleEntry: BundleEntry }[]> =>
+      Promise.all(
+        recs.map(async (r) => {
+          const fieldClocks = await backend.readRecordFieldClocks(authz.ownerId, type, r.id)
+          return {
+            entry: { ...toEntry(r), base: encodeBase(id, r.id, r.revision, fieldClocks) },
+            recordId: r.id,
+            bundleEntry: { revision: r.revision, fieldClocks },
+          }
+        }),
+      )
+    const [nodeEntries, edgeEntries, anchorEntries] = await Promise.all([
+      signEntries(nodes.records, 'node'),
+      signEntries(edges.records, 'edge'),
+      signEntries(anchors.records, 'anchor'),
+    ])
+    const bundleById: Record<string, BundleEntry> = {}
+    for (const x of [...nodeEntries, ...edgeEntries, ...anchorEntries]) bundleById[x.recordId] = x.bundleEntry
+    const canvasSeq = await backend.readCanvasSeq(id)
+    const cp = isCanvasPayload(authz.record.payload) ? authz.record.payload : { projectId: '' }
+    const contentVersion = cp.contentVersion ?? 0
     const body: GetCanvasResponse = {
       ...toCanvasMeta(authz.record),
-      nodes: nodes.records.map(toEntry),
-      edges: edges.records.map(toEntry),
-      anchors: anchors.records.map(toEntry),
+      bundle: encodeBundle(id, bundleById, contentVersion, canvasSeq),
+      sinceSeq: canvasSeq,
+      nodes: nodeEntries.map((x) => x.entry),
+      edges: edgeEntries.map((x) => x.entry),
+      anchors: anchorEntries.map((x) => x.entry),
     }
     logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0 })
     return c.json(body, 200)
@@ -470,7 +503,13 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
       return c.json(preconditionRequired(id), 428)
     }
     logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0 })
-    return c.json({ reordered: result.reordered, contentVersion: result.contentVersion }, 200)
+    // A2-S3(lead ②b):reorder 更新 order 游标(bump contentVersion),响应携新 order base(encodeOrderBase)
+    //   供 client 增量更新 bundle.orderCv;client 下次 reorder 的 If-Match 走 parseIfMatch bare contentVersion
+    //   (order base 是 canvas 级 cursor 的 order 项,与 per-record base 解耦)。
+    return c.json(
+      { reordered: result.reordered, contentVersion: result.contentVersion, base: encodeOrderBase(id, result.contentVersion) },
+      200,
+    )
   })
 
   // ── A2-S2 §14.3:legacy drain envelope(PATCH /:id/nodes/:nodeId 复用 decoder wire;FX-5 队列迁移 drain-only 兼容通道)──
@@ -614,7 +653,7 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: 0, note: `overwritten field=${o.fieldKey} byActor=${o.byActor} historicalValue=${JSON.stringify(o.historicalValue)}` })
     }
     const base = encodeBase(canvasId, childId, result.record.revision, result.fieldClocks)
-    const res: UpsertResponse = { id: result.record.id, revision: result.record.revision, seq: result.seq, base }
+    const res: CanvasChildUpsertResponse = { id: result.record.id, revision: result.record.revision, seq: result.seq, base }
     logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0 })
     return c.json(res, 200)
   }
@@ -680,7 +719,7 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
     }
     // created:create 不伪造 base(§14.1);签发新 base(空 fieldClocks)。
     const base = encodeBase(canvasId, childId, result.record.revision, result.fieldClocks)
-    const res: UpsertResponse = { id: result.record.id, revision: result.record.revision, seq: result.seq, base }
+    const res: CanvasChildUpsertResponse = { id: result.record.id, revision: result.record.revision, seq: result.seq, base }
     logRequest({ method: c.req.method, path: c.req.path, requestId, status: 201, latencyMs: Date.now() - t0 })
     return c.json(res, 201)
   }

@@ -380,6 +380,25 @@ export class PgPersistBackend implements PersistBackend {
   }
 
   /**
+   * A2-S3:读单 record per-field clock 全快照(供 route encodeBase 签发 BaseCursor;hydrate 用)。
+   * 非事务读(已提交状态);复用 snapshotFieldClocksInTrx(this.db, rk)。
+   */
+  async readRecordFieldClocks(ownerId: string, type: PersistType, recordId: string): Promise<FieldClocks> {
+    await this.ready
+    return this.snapshotFieldClocksInTrx(this.db, pgRecordKey(ownerId, type, recordId))
+  }
+
+  /**
+   * A2-S3:读 canvas 当前事件 seq(供 route encodeSinceBase/encodeBundle + CanvasMeta.sinceSeq)。
+   * 非事务读;复用 readCanvasSeqInTrx(this.db, canvasId);行不存在即 0。
+   */
+  async readCanvasSeq(canvasId: string): Promise<number> {
+    await this.ready
+    return this.readCanvasSeqInTrx(this.db, canvasId)
+  }
+
+
+  /**
    * DP-6R P1-2(返修 R2-P1-2):原子读 (messages, orderRevision) 对——单事务 REPEATABLE READ 一致快照。
    * READ COMMITTED 两语句间并发 reorder 提交 → torn pair(旧 messages + 新 rev);REPEATABLE READ 冻结 snapshot
    * 于首条语句,messages 与 orderRevision 必同见 pre-reorder 或 post-reorder,不撕裂。与 memory 同步临界区等价。
