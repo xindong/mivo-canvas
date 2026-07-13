@@ -334,7 +334,8 @@ export const migrations: Record<string, Migration> = {
     },
   },
   // A2-S2(§14.1/§10.5/§10.7):field-level per-field clock + per-canvas 单调 seq + child tombstone。
-  // R8 风格 shape guard:IF NOT EXISTS 可重放 + PRIMARY KEY/UNIQUE 约束;field_clock record_key 同 recordKey() NUL 分隔。
+  // R8 风格 shape guard:IF NOT EXISTS 可重放 + PRIMARY KEY/UNIQUE 约束;field_clock record_key 用 \x1f unit-separator
+  // (逻辑同 InMemory recordKey() 的 (ownerId,type,id) 复合,但 PG TEXT 列拒 0x00 NUL,故 pgBackend 用 \x1f 替代;见 pgBackend.pgRecordKey)。
   '2026_07_13_009_field_clock_canvas_seq_tombstones': {
     async up(db): Promise<void> {
       await sql`

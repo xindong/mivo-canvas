@@ -2,11 +2,11 @@
 // P-6 saga 返修 PG 专属验收(P1-3 并发 + P1-4 迁移矩阵)。gate:MIVO_PG_TEST=1。
 // 隔离库 mivocanvas_unit_p6saga(lead 指定;与 dual contract suite 的 mivocanvas_unit 分离,防并发 worktree 污染)。
 //
-// P1-4 矩阵(合并 origin/main 后 combined registry = 001..008):DP-6R 占 003_chat_per_actor + 004_chat_order_revisions,
+// P1-4 矩阵(合并 origin/main 后 combined registry = 001..009):DP-6R 占 003_chat_per_actor + 004_chat_order_revisions,
 //  saga 占 005_share_link_compensations + 006_compensation_failed_status + 007_compensation_claim_token,
 //  G2.2 占 008_g22_owner_rekey_audit(COMMENT fail-closed 审计标记,本分支 A1 落地)。
-//  - fresh combined:001..008 全量 migrateToLatest 绿,表/列/索引齐,kysely_migration 精确单调(8 行)。
-//  - chat-applied→combined:模拟 001→004 已 tracked,migrateToLatest 追加 005/006/007/008,kysely_migration 精确单调(001<...<008)。
+//  - fresh combined:001..009 全量 migrateToLatest 绿,表/列/索引齐,kysely_migration 精确单调(9 行)。
+//  - chat-applied→combined:模拟 001→004 已 tracked,migrateToLatest 追加 005/006/007/008/009,kysely_migration 精确单调(001<...<009)。
 // P1-3:真 PG Promise.all 并发 record 20 次 → 恰 1 条 pending(partial unique + advisory_xact_lock);done 后可再建。
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
@@ -51,11 +51,11 @@ const migrateWith = async (
 // 2026_07_12_003_chat_per_user(错名),实际 DP-6R 8aa1f2b 的 registry 名是 2026_07_12_003_chat_per_actor;
 // 测试内伪 registry 自洽但未验证实际 combined registry(假阳性)。现改用真实生产 `migrations` registry,
 // 禁测试内占位 migration。
-// 合并 origin/main 后,combined registry 自然含 003/004/005/006/007/008(本分支已与 DP-6R 收敛),
+// 合并 origin/main 后,combined registry 自然含 003/004/005/006/007/008/009(本分支已与 DP-6R 收敛),
 // 故 fresh + combined 两路径均在本测试实跑(下方),不再有 merge-time 缺口。
 
 ;(PG_TEST_ENABLED ? describe : describe.skip)('P-6 saga PG:迁移矩阵(P1-4)+ 并发(P1-3)', () => {
-  it('R3-F3 fresh combined registry:001..008 全量 migrateToLatest 绿,表/列/索引齐,kysely_migration 精确单调', async () => {
+  it('R3-F3 fresh combined registry:001..009 全量 migrateToLatest 绿,表/列/索引齐,kysely_migration 精确单调', async () => {
     const db = makeKysely()
     await resetSchema(db)
     // 真实生产 combined registry(合并 DP-6R + G2.2 后):001+002+003+004+005+006+007+008。禁测试内占位 migration。
@@ -77,7 +77,7 @@ const migrateWith = async (
     // partial unique index
     const idx = (await sql`SELECT indexname FROM pg_indexes WHERE tablename='share_link_compensations'`.execute(db)).rows as { indexname: string }[]
     expect(idx.map((r) => r.indexname)).toContain('uq_compensations_pending_project_op')
-    // kysely_migration 精确单调:combined registry 全 8 行(001<002<003<004<005<006<007<008)
+    // kysely_migration 精确单调:combined registry 全 9 行(001<002<003<004<005<006<007<008<009)
     const applied = (await sql`SELECT name FROM kysely_migration ORDER BY name`.execute(db)).rows as { name: string }[]
     expect(applied.map((r) => r.name)).toEqual([
       '2026_07_11_001_initial_persist_schema',
@@ -88,6 +88,7 @@ const migrateWith = async (
       '2026_07_12_006_compensation_failed_status',
       '2026_07_12_007_compensation_claim_token',
       '2026_07_12_008_g22_owner_rekey_audit',
+      '2026_07_13_009_field_clock_canvas_seq_tombstones',
     ])
     // combined registry 确含 003/004(合并 DP-6R 收敛)
     expect(Object.keys(migrations).sort()).toEqual([
@@ -99,13 +100,14 @@ const migrateWith = async (
       '2026_07_12_006_compensation_failed_status',
       '2026_07_12_007_compensation_claim_token',
       '2026_07_12_008_g22_owner_rekey_audit',
+      '2026_07_13_009_field_clock_canvas_seq_tombstones',
     ])
     await db.destroy()
   })
 
-  // R3-F3 combined DP-6R 路径(真实 001→004 tracked → 追加 005/006/007/008):合并 origin/main 后 combined
+  // R3-F3 combined DP-6R 路径(真实 001→004 tracked → 追加 005/006/007/008/009):合并 origin/main 后 combined
   //   registry 含 003_chat_per_actor + 004_chat_order_revisions,本测实跑真实 combined。
-  it('R3-F3 combined DP-6R 路径:001→004 已 tracked → 追加 005/006/007/008,kysely_migration 精确单调', async () => {
+  it('R3-F3 combined DP-6R 路径:001→004 已 tracked → 追加 005/006/007/008/009,kysely_migration 精确单调', async () => {
     const db = makeKysely()
     await resetSchema(db)
     // 模拟 DP-6R 已应用库:先 migrate 真实 001+002+003+004(DP-6R 003/004)
@@ -123,7 +125,7 @@ const migrateWith = async (
     // 005 表此时不存在(仅 004 applied)
     const before = (await sql`SELECT to_regclass('share_link_compensations') AS r`.execute(db)).rows as { r: string | null }[]
     expect(before[0].r).toBeNull()
-    // migrateToLatest 用完整 combined registry:识别 001→004 已 tracked,追加 005/006/007/008
+    // migrateToLatest 用完整 combined registry:识别 001→004 已 tracked,追加 005/006/007/008/009
     await migrateWith(db, migrations)
     applied = (await sql`SELECT name FROM kysely_migration ORDER BY name`.execute(db)).rows as { name: string }[]
     expect(applied.map((r) => r.name)).toEqual([
@@ -135,6 +137,7 @@ const migrateWith = async (
       '2026_07_12_006_compensation_failed_status',
       '2026_07_12_007_compensation_claim_token',
       '2026_07_12_008_g22_owner_rekey_audit',
+      '2026_07_13_009_field_clock_canvas_seq_tombstones',
     ])
     // 005 表+列齐(share_link_compensations / cascade_revoked_at / claim_token)
     const cols = (await sql`SELECT column_name FROM information_schema.columns WHERE table_name='share_link_compensations' ORDER BY column_name`.execute(db)).rows as { column_name: string }[]
@@ -152,7 +155,7 @@ const migrateWith = async (
     let backend: PgPermissionBackend
     beforeAll(async () => {
       // 隔离:本库可能被上方 fresh/combined 用例留下 tracked 行,先 reset schema 再建 backend。
-      // backend.ready→migrate() 带 combined registry(001..008),clean 库下全量 migrate 无 missing。
+      // backend.ready→migrate() 带 combined registry(001..009),clean 库下全量 migrate 无 missing。
       const admin = makeKysely()
       await resetSchema(admin)
       await admin.destroy()
@@ -545,7 +548,7 @@ const migrateWith = async (
     it('RED status CHECK 退化:列齐但 CHECK 只 pending/done → ready 抛含 superseded/failed', async () => {
       const admin = makeKysely()
       await resetSchema(admin)
-      await migrateWith(admin, migrations) // 完整 001..008 → 13 列齐 + status CHECK 4 值
+      await migrateWith(admin, migrations) // 完整 001..009 → 13 列齐 + status CHECK 4 值
       // 退化 status CHECK:DROP 006 的 4 值约束,重建为只 pending/done(模拟 006 未跑/被回退)。
       await sql`ALTER TABLE share_link_compensations DROP CONSTRAINT IF EXISTS share_link_compensations_status_check`.execute(admin)
       await sql`ALTER TABLE share_link_compensations ADD CONSTRAINT share_link_compensations_status_check CHECK (status IN ('pending','done'))`.execute(admin)
