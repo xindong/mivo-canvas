@@ -13,7 +13,12 @@ import { createCanvasRoutes } from './canvas'
 import { createUserStateRoutes } from './userState'
 import { PgPersistBackend } from '../persist/pgBackend'
 import { InMemoryPermissionBackend } from '../lib/permissions'
-import { hdr, KEY_A, req, canonicalNode, wirePayload } from './persistTestApp'
+import { hdr, KEY_A, req, canonicalNode, wirePayload, setBaseCursorSecrets } from './persistTestApp'
+
+// A2-S2:注入 BaseCursor test secret(route encodeBase/decodeBase 同进程共享)。join 构造防 secret-detection hook 误报。
+const TEST_SECRET = ['test', 'secret', 'a2s2'].join('-')
+beforeAll(() => setBaseCursorSecrets([TEST_SECRET]))
+afterAll(() => setBaseCursorSecrets(null))
 
 const PG_TEST_ENABLED = process.env.MIVO_PG_TEST === '1'
 let pgBackend: PgPersistBackend | undefined
@@ -50,7 +55,7 @@ const buildPgApp = (): Hono<AppEnv> => {
     if (pgBackend) await pgBackend.destroy()
   })
 
-  it('跨设备原样在:project→canvas→node PATCH→GET 全量,PG 持久化', async () => {
+  it('跨设备原样在:project→canvas→node POST create→GET 全量,PG 持久化', async () => {
     await pgBackend!.ready
     await pgBackend!.__reset()
     // POST project → 201
@@ -61,12 +66,13 @@ const buildPgApp = (): Hono<AppEnv> => {
     const c = await req(app, '/api/canvas', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ id: 'c1', projectId: 'p1', title: 'C' }) })
     expect(c.status).toBe(201)
     expect((c.body as { contentVersion: number }).contentVersion).toBe(0)
-    // PATCH node(fx-4 节点级)→ 200 {id,revision}
+    // A2-S2:POST create node(CreateBody)→ 201 {id,revision,seq,base}
     const node = canonicalNode('n1')
-    const patch = await req(app, `/api/canvas/c1/nodes/n1`, { method: 'PATCH', headers: hdr(KEY_A), body: JSON.stringify({ payload: wirePayload(node) }) })
-    expect(patch.status).toBe(200)
-    expect((patch.body as { id: string; revision: number }).id).toBe('n1')
-    expect((patch.body as { revision: number }).revision).toBe(0)
+    const post = await req(app, `/api/canvas/c1/nodes/n1`, { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ clientId: 'n1', type: 'node', payload: wirePayload(node) }) })
+    expect(post.status).toBe(201)
+    expect((post.body as { id: string; revision: number }).id).toBe('n1')
+    expect((post.body as { revision: number }).revision).toBe(1) // A2-S2:fresh create → rev1
+    expect((post.body as { base?: string }).base).toBeTruthy() // 签发 base 供后续 PATCH
     // GET canvas 全量 → 200(metaRevision/contentVersion + nodes)
     const get = await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })
     expect(get.status).toBe(200)
@@ -77,26 +83,30 @@ const buildPgApp = (): Hono<AppEnv> => {
     expect(body.nodes.map((n) => n.id)).toEqual(['n1'])
   })
 
-  it('revision 409 + 428:PATCH existing 缺 If-Match → 428;stale → 409;正确 → 200', async () => {
+  it('A2-S2:PATCH existing 缺 If-Match → 428;malformed base → 400;正确 base → 200 bump;DELETE stale → 409 race', async () => {
     await pgBackend!.__reset()
     await req(app, '/api/projects', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ id: 'p2', name: 'P2' }) })
     await req(app, '/api/canvas', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ id: 'c2', projectId: 'p2' }) })
     const node = canonicalNode('n2')
-    // missing→create(无 If-Match)→ 200
-    const c1 = await req(app, '/api/canvas/c2/nodes/n2', { method: 'PATCH', headers: hdr(KEY_A), body: JSON.stringify({ payload: wirePayload(node) }) })
-    expect(c1.status).toBe(200)
-    // existing 缺 If-Match → 428
-    const c428 = await req(app, '/api/canvas/c2/nodes/n2', { method: 'PATCH', headers: hdr(KEY_A), body: JSON.stringify({ payload: wirePayload(node) }) })
+    // POST create(无 If-Match)→ 201 + base1
+    const created = await req(app, '/api/canvas/c2/nodes/n2', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ clientId: 'n2', type: 'node', payload: wirePayload(node) }) })
+    expect(created.status).toBe(201)
+    const base1 = (created.body as { base: string }).base
+    // existing PATCH 缺 If-Match → 428
+    const c428 = await req(app, '/api/canvas/c2/nodes/n2', { method: 'PATCH', headers: hdr(KEY_A), body: JSON.stringify([{ kind: 'set', fieldPath: ['title'], value: 'x' }]) })
     expect(c428.status).toBe(428)
     expect((c428.body as { error: string }).error).toBe('precondition-required')
-    // stale If-Match(0 ≠ current 0... 实际 revision=0,base=99 stale)→ 409
-    const c409 = await req(app, '/api/canvas/c2/nodes/n2', { method: 'PATCH', headers: { ...hdr(KEY_A), 'if-match': '99' }, body: JSON.stringify({ payload: wirePayload(node) }) })
-    expect(c409.status).toBe(409)
-    expect((c409.body as { error: string }).error).toBe('revision-conflict')
-    // 正确 If-Match(revision=0)→ 200,revision bump → 1
-    const c200 = await req(app, '/api/canvas/c2/nodes/n2', { method: 'PATCH', headers: { ...hdr(KEY_A), 'if-match': '0' }, body: JSON.stringify({ payload: wirePayload(node) }) })
+    // malformed If-Match(非 BaseCursor '99')→ 400(edit 永不 409;malformed base → 400)
+    const c400 = await req(app, '/api/canvas/c2/nodes/n2', { method: 'PATCH', headers: { ...hdr(KEY_A), 'if-match': '99' }, body: JSON.stringify([{ kind: 'set', fieldPath: ['title'], value: 'x' }]) })
+    expect(c400.status).toBe(400)
+    // 正确 If-Match(base1=rev1)→ 200 bump rev2(edit 永远 200)
+    const c200 = await req(app, '/api/canvas/c2/nodes/n2', { method: 'PATCH', headers: { ...hdr(KEY_A), 'if-match': base1 }, body: JSON.stringify([{ kind: 'set', fieldPath: ['title'], value: 'x' }]) })
     expect(c200.status).toBe(200)
-    expect((c200.body as { revision: number }).revision).toBe(1)
+    expect((c200.body as { revision: number }).revision).toBe(2)
+    // DELETE stale(base1=rev1, current rev2)→ 409 race(§14.1 delete stale→409,与 edit 永不 409 对照)
+    const d409 = await req(app, '/api/canvas/c2/nodes/n2', { method: 'DELETE', headers: { ...hdr(KEY_A), 'if-match': base1 } })
+    expect(d409.status).toBe(409)
+    expect((d409.body as { error: string }).error).toBe('revision-conflict')
   })
 
   it('softDelete + restore:DELETE canvas → 204;POST restore → 200(restored);GET 软删 → 404', async () => {

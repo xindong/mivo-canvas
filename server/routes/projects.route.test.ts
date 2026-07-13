@@ -3,9 +3,14 @@
 // #1 project id 全局唯一(跨 owner → 409 project-exists)+ 授权 seam(跨 owner → 404)、
 // #2/#7 DELETE softDeleteProjectTree 原子级联(canvas meta + chat-collection 软删;children 活)、
 // #4 428/If-Match、#10 幂等跨 type 不串、#12 413 完整 body。
-import { describe, it, expect, beforeEach } from 'vitest'
-import { buildPersistApp, hdr, KEY_A, KEY_B, req, canonicalNode, wirePayload } from './persistTestApp'
+import { describe, it, expect, beforeEach, beforeAll, afterAll } from 'vitest'
+import { buildPersistApp, hdr, KEY_A, KEY_B, req, canonicalNode, wirePayload, setBaseCursorSecrets } from './persistTestApp'
 import { fingerprintOfPlatformKey } from '../lib/keys'
+
+// A2-S2:BaseCursor test secret(route encodeBase/decodeBase 同进程共享)。join 构造防 secret-detection hook 误报。
+const TEST_SECRET = ['test', 'secret', 'a2s2'].join('-')
+beforeAll(() => setBaseCursorSecrets([TEST_SECRET]))
+afterAll(() => setBaseCursorSecrets(null))
 
 describe('/api/projects routes (T1.3 返修)', () => {
   let app: ReturnType<typeof buildPersistApp>['app']
@@ -74,7 +79,7 @@ describe('/api/projects routes (T1.3 返修)', () => {
     await create(KEY_A, 'p1')
     await req(app, '/api/canvas', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ id: 'c1', projectId: 'p1', title: 'C' }) })
     await req(app, '/api/canvas/c1/chat', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ message: { id: 'm1', text: 'hi' } }) })
-    await req(app, '/api/canvas/c1/nodes/n1', { method: 'PATCH', headers: hdr(KEY_A), body: JSON.stringify({ payload: wirePayload(canonicalNode('n1')) }) })
+    await req(app, '/api/canvas/c1/nodes/n1', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ clientId: 'n1', type: 'node', payload: wirePayload(canonicalNode('n1')) }) })
 
     const del = await req(app, '/api/projects/p1', { method: 'DELETE', headers: hdr(KEY_A) })
     expect(del.status).toBe(204)

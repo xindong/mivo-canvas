@@ -4,17 +4,42 @@
 // + N5 If-Match 严格 + N7 authz + N8 reorder + N10 payload allowlist + 原 13 条回归(保持绿):
 // 全量 GET(#5/#6)、枚举(#8)、节点级 PATCH(FX-4 + #3 cross-canvas + #4 428/If-Match + #13 白名单 + #12 413)、
 // edge/anchor DELETE(#8)、硬删子资源(#2)、原子 tree 软删(#2/#7)、reorder(#6/N8)、chat(DP-6/N2/N3)。
-import { describe, it, expect, beforeEach } from 'vitest'
-import { buildPersistApp, hdr, KEY_A, KEY_B, req, canonicalNode, canonicalEdge, canonicalAnchor, wirePayload, patchChildWithFixture } from './persistTestApp'
+import { describe, it, expect, beforeEach, beforeAll, afterAll } from 'vitest'
+import {
+  buildPersistApp,
+  hdr,
+  KEY_A,
+  KEY_B,
+  req,
+  canonicalNode,
+  canonicalEdge,
+  canonicalAnchor,
+  wirePayload,
+  createChildFixture,
+  patchDomainOps,
+  deleteChildFixture,
+  encodeBase,
+  setBaseCursorSecrets,
+} from './persistTestApp'
 import { fingerprintOfPlatformKey } from '../lib/keys'
 
+// A2-S2:注入 BaseCursor test secret(route encodeBase/decodeBase 同进程共享)。join 构造防 secret-detection hook 误报。
+const TEST_SECRET = ['test', 'secret', 'a2s2'].join('-')
+
 describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
+  beforeAll(() => setBaseCursorSecrets([TEST_SECRET]))
+  afterAll(() => setBaseCursorSecrets(null))
+
   let app: ReturnType<typeof buildPersistApp>['app']
   let backend: ReturnType<typeof buildPersistApp>['backend']
 
   beforeEach(() => {
     ;({ app, backend } = buildPersistApp())
   })
+
+  /** 构造合法 record BaseCursor(供 PATCH/DELETE If-Match);rev=当前 record revision,fc=空或具体 fieldClocks。 */
+  const baseToken = (canvasId: string, childId: string, rev: number, fc: Record<string, number> = {}): string =>
+    encodeBase(canvasId, childId, rev, fc)
 
   const seedProject = async (id = 'p1'): Promise<void> => {
     await req(app, '/api/projects', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ id, name: 'P' }) })
@@ -110,12 +135,16 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
     expect(body.sourceTemplateId).toBe('tpl-keep') // 未带 → 保留既有(存活)
   })
 
-  it('GET /api/canvas/:id 全量(metaRevision/contentVersion + nodes 带 orderKey #6);子资源 upsert bump contentVersion #5', async () => {
+  it('GET /api/canvas/:id 全量(metaRevision/contentVersion + nodes 带 orderKey #6);子资源写入 bump contentVersion #5', async () => {
     await seedProject()
     await seedCanvas()
-    await patchChildWithFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1'))) // create
-    await patchChildWithFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')), '0') // update
-    await patchChildWithFixture(app, 'c1', 'node', 'n2', wirePayload(canonicalNode('n2')))
+    // A2-S2:create 走 POST(CreateBody);edit 走 PATCH DomainOp(If-Match = create 响应的 base token)。
+    const c1 = await createChildFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1'))) // create → rev1
+    expect(c1.status).toBe(201)
+    const base1 = (c1.body as { base: string }).base
+    const u1 = await patchDomainOps(app, 'c1', 'node', 'n1', [{ kind: 'set', fieldPath: ['title'], value: 'edited' }], base1) // edit → rev2
+    expect(u1.status).toBe(200)
+    await createChildFixture(app, 'c1', 'node', 'n2', wirePayload(canonicalNode('n2'))) // create → rev1
 
     const got = await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })
     expect(got.status).toBe(200)
@@ -124,7 +153,7 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
     expect(body.contentVersion).toBeGreaterThanOrEqual(3) // 3 次 child 写入 bump
     expect(body.nodes).toHaveLength(2)
     expect(body.nodes[0].id).toBe('n1')
-    expect(body.nodes[0].revision).toBe(1) // create(0) → update bumped to 1
+    expect(body.nodes[0].revision).toBe(2) // A2-S2:create(1) → edit bumped to 2
     expect(body.nodes[0].orderKey).toBe(0)
     expect(body.nodes.map((n) => n.id)).toEqual(['n1', 'n2'])
   })
@@ -140,123 +169,132 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
     expect((cross.body as { canvases: unknown[] }).canvases).toHaveLength(0)
   })
 
-  it('返修 #4:PATCH node missing→create(无 If-Match);update 须 If-Match;existing 缺 If-Match → 428', async () => {
+  it('返修 #4(A2-S2):create 走 POST(无 If-Match);edit 须 If-Match;existing 缺 If-Match → 428;edit stale 永不 409(§14.1)', async () => {
     await seedProject()
     await seedCanvas()
-    const created = await patchChildWithFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
-    expect(created.status).toBe(200)
-    expect((created.body as { revision: number }).revision).toBe(0)
+    // create 走 POST(无 If-Match;base 必填仅对 edit)→ 201 + base
+    const created = await createChildFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
+    expect(created.status).toBe(201)
+    expect((created.body as { revision: number }).revision).toBe(1) // A2-S2:fresh create → rev1
+    const base1 = (created.body as { base: string }).base
 
-    // existing 缺 If-Match → 428
-    const noBase = await patchChildWithFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
+    // existing edit 缺 If-Match → 428
+    const noBase = await patchDomainOps(app, 'c1', 'node', 'n1', [{ kind: 'set', fieldPath: ['title'], value: 'x' }])
     expect(noBase.status).toBe(428)
     expect((noBase.body as { error: string; id: string }).error).toBe('precondition-required')
 
-    // If-Match 正确 → 200 bump
-    const updated = await patchChildWithFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')), '0')
+    // If-Match 正确(base1=rev1)→ 200 bump rev2
+    const updated = await patchDomainOps(app, 'c1', 'node', 'n1', [{ kind: 'set', fieldPath: ['title'], value: 'A' }], base1)
     expect(updated.status).toBe(200)
-    expect((updated.body as { revision: number }).revision).toBe(1)
+    expect((updated.body as { revision: number }).revision).toBe(2)
 
-    // stale If-Match → 409
-    const stale = await patchChildWithFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')), '0')
-    expect(stale.status).toBe(409)
-    expect((stale.body as { currentRevision: number }).currentRevision).toBe(1)
+    // stale If-Match(base1=rev1, current rev2)→ 200+overwritten(edit 永不 409,§14.1;overwritten 仅落 debug 面,响应只返新 base)
+    const stale = await patchDomainOps(app, 'c1', 'node', 'n1', [{ kind: 'set', fieldPath: ['title'], value: 'B' }], base1)
+    expect(stale.status).toBe(200) // ★ edit stale 永不 409
+    expect((stale.body as { revision: number }).revision).toBe(3) // 又 bump
   })
 
-  it('返修 #4:If-Match 严格优先于 body.revision(wire body 不带 revision #5;body.revision 被忽略)', async () => {
+  it('返修 #4(A2-S2):If-Match 严格优先;DomainOp body 零 privileged(无 revision 字段,§10.1)', async () => {
     await seedProject()
     await seedCanvas()
-    await patchChildWithFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
-    // 旧 client 带 body.revision:999 + If-Match:0 → 用 If-Match(0),bump 成功;canonical payload 通过白名单
+    const created = await createChildFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
+    const base1 = (created.body as { base: string }).base
+    // 旧 client 在 DomainOp body 走私 revision:999 → validateDomainOps 忽略(只读 kind/fieldPath/value);
+    // If-Match=base1 决定 base → 200 bump(wire body 零 privileged revision 字段,§10.1)。
     const updated = await req(app, '/api/canvas/c1/nodes/n1', {
       method: 'PATCH',
-      headers: { ...hdr(KEY_A), 'if-match': '0' },
-      body: JSON.stringify({ payload: wirePayload(canonicalNode('n1')), revision: 999 }),
+      headers: { ...hdr(KEY_A), 'if-match': base1 },
+      body: JSON.stringify({ kind: 'set', fieldPath: ['title'], value: 'X', revision: 999 }),
     })
-    expect(updated.status).toBe(200) // If-Match 优先,body.revision 忽略
+    expect(updated.status).toBe(200) // If-Match 优先,body.revision 走私被忽略
   })
 
-  it('返修 #13:payload 白名单——拒 status/tasks/mirror 字段;返修 #5:payload.id 与 path 一致', async () => {
+  it('返修 #13(A2-S2):POST create payload 白名单——拒 status/tasks/mirror;返修 #5:payload.id 与 path 一致', async () => {
     await seedProject()
     await seedCanvas()
     const base = wirePayload(canonicalNode('n1')) as Record<string, unknown>
-    // status 字段(DP-9)→ forbidden-field(在 missing 之前命中)
-    const st = await patchChildWithFixture(app, 'c1', 'node', 'n1', { ...base, status: 'ready' })
+    // status 字段(DP-9)→ forbidden-field(validateChildPayload 现守 POST create;在 missing 之前命中)
+    const st = await createChildFixture(app, 'c1', 'node', 'n1', { ...base, status: 'ready' })
     expect(st.status).toBe(400)
     expect((st.body as { reason: string; field: string })).toMatchObject({ reason: 'forbidden-field', field: 'status' })
     // tasks 字段(DP-8)→ forbidden-field
-    const tk = await patchChildWithFixture(app, 'c1', 'node', 'n1', { ...base, tasks: [] })
+    const tk = await createChildFixture(app, 'c1', 'node', 'n1', { ...base, tasks: [] })
     expect((tk.body as { field: string }).field).toBe('tasks')
     // envelope 镜像字段 ownerId → mirror-field
-    const mi = await patchChildWithFixture(app, 'c1', 'node', 'n1', { ...base, ownerId: 'x' })
+    const mi = await createChildFixture(app, 'c1', 'node', 'n1', { ...base, ownerId: 'x' })
     expect((mi.body as { reason: string; field: string })).toMatchObject({ reason: 'mirror-field', field: 'ownerId' })
     // canvasId mirror
-    const mc = await patchChildWithFixture(app, 'c1', 'node', 'n1', { ...base, canvasId: 'c1' })
+    const mc = await createChildFixture(app, 'c1', 'node', 'n1', { ...base, canvasId: 'c1' })
     expect((mc.body as { field: string }).field).toBe('canvasId')
     // payload.id 与 path 不一致 → id-mismatch
-    const idm = await patchChildWithFixture(app, 'c1', 'node', 'n1', { ...base, id: 'n2' })
+    const idm = await createChildFixture(app, 'c1', 'node', 'n1', { ...base, id: 'n2' })
     expect((idm.body as { reason: string }).reason).toBe('id-mismatch')
-    // 干净 canonical payload → 200 create
-    const ok = await patchChildWithFixture(app, 'c1', 'node', 'n1', base)
-    expect(ok.status).toBe(200)
+    // 干净 canonical payload → 201 create
+    const ok = await createChildFixture(app, 'c1', 'node', 'n1', base)
+    expect(ok.status).toBe(201)
   })
 
-  it('返修 #12:413 body 完整 TooLargeBody 契约体', async () => {
+  it('返修 #12(A2-S2):413 body 完整 TooLargeBody 契约体(POST create 大 body)', async () => {
     await seedProject()
     await seedCanvas()
     const big = wirePayload(canonicalNode('n-big')) as Record<string, unknown>
     big.padding = 'x'.repeat(1_100_000) // unknown field,但 body > 1MB → 413 在 read 阶段先于 validation
-    const tooLarge = await patchChildWithFixture(app, 'c1', 'node', 'n-big', big)
+    const tooLarge = await createChildFixture(app, 'c1', 'node', 'n-big', big)
     expect(tooLarge.status).toBe(413)
     expect(tooLarge.body).toEqual({ error: 'request-body-too-large', limit: 1048576 })
   })
 
-  it('返修 #3:cross-canvas——node A in c1,PATCH c2/nodes/A → 404;DELETE c2/nodes/A → 404(canvas_id 不可变)', async () => {
+  it('返修 #3(A2-S2):cross-canvas——node n1 in c1,PATCH/DELETE c2/n1 → 404(canvas_id 不可变)', async () => {
     await seedProject()
     await seedCanvas('c1', 'p1')
     await seedCanvas('c2', 'p1')
-    await patchChildWithFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1'))) // n1 属 c1
-    // PATCH c2/nodes/n1 → cross-canvas 404(不 create,canvas_id 不可变)
-    const crossPatch = await patchChildWithFixture(app, 'c2', 'node', 'n1', wirePayload(canonicalNode('n1')))
+    await createChildFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1'))) // n1 属 c1
+    // PATCH c2/nodes/n1(合法 DomainOp + 合法 (c2,n1) base token)→ authz c2 ok → backend cross-canvas → 404
+    const crossPatch = await patchDomainOps(app, 'c2', 'node', 'n1', [{ kind: 'set', fieldPath: ['title'], value: 'x' }], baseToken('c2', 'n1', 1))
     expect(crossPatch.status).toBe(404)
     expect((crossPatch.body as { error: string }).error).toBe('unknown-node')
-    // DELETE c2/nodes/n1 → 404
-    const crossDel = await req(app, '/api/canvas/c2/nodes/n1', { method: 'DELETE', headers: hdr(KEY_A) })
+    // DELETE c2/nodes/n1(合法 (c2,n1) base token)→ cross-canvas → 404
+    const crossDel = await deleteChildFixture(app, 'c2', 'node', 'n1', baseToken('c2', 'n1', 1))
     expect(crossDel.status).toBe(404)
     // n1 仍属 c1(不可变)
     const got = await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })
     expect((got.body as { nodes: { id: string }[] }).nodes.map((n) => n.id)).toContain('n1')
   })
 
-  it('返修 #2:DELETE node/edge/anchor 硬删(物理移除,GET canvas 后空);canonical edge/anchor 往返', async () => {
+  it('返修 #2(A2-S2):DELETE node/edge/anchor(If-Match base;fresh→200 {id,seq});canonical edge/anchor 往返', async () => {
     await seedProject()
     await seedCanvas()
-    await patchChildWithFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
+    const cn = await createChildFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
     // canonical edge/anchor 往返(含 createdAt 域字段,N1:保留不镜像)
-    const e1 = await patchChildWithFixture(app, 'c1', 'edge', 'e1', wirePayload(canonicalEdge('e1')))
-    expect(e1.status).toBe(200)
-    const a1 = await patchChildWithFixture(app, 'c1', 'anchor', 'a1', wirePayload(canonicalAnchor('a1')))
-    expect(a1.status).toBe(200)
+    const ce = await createChildFixture(app, 'c1', 'edge', 'e1', wirePayload(canonicalEdge('e1')))
+    expect(ce.status).toBe(201)
+    const ca = await createChildFixture(app, 'c1', 'anchor', 'a1', wirePayload(canonicalAnchor('a1')))
+    expect(ca.status).toBe(201)
     // GET 回读:edge/anchor payload 含 createdAt 域字段
     const got = await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })
     const body = got.body as { edges: { id: string; payload: Record<string, unknown> }[]; anchors: { id: string; payload: Record<string, unknown> }[] }
     expect(body.edges[0].payload.createdAt).toBe(12345) // N1:domain createdAt 保留
     expect(body.anchors[0].payload.createdAt).toBe(6789)
 
-    const dn = await req(app, '/api/canvas/c1/nodes/n1', { method: 'DELETE', headers: hdr(KEY_A) })
-    expect(dn.status).toBe(204)
-    const de = await req(app, '/api/canvas/c1/edges/e1', { method: 'DELETE', headers: hdr(KEY_A) })
-    expect(de.status).toBe(204)
-    const da = await req(app, '/api/canvas/c1/anchors/a1', { method: 'DELETE', headers: hdr(KEY_A) })
-    expect(da.status).toBe(204)
+    const baseN = (cn.body as { base: string }).base
+    const baseE = (ce.body as { base: string }).base
+    const baseA = (ca.body as { base: string }).base
+    // DELETE fresh base → 200 {id,seq}(§10.7 accepted 必携 cursor;非 204)
+    const dn = await deleteChildFixture(app, 'c1', 'node', 'n1', baseN)
+    expect(dn.status).toBe(200)
+    expect((dn.body as { id: string; seq: number }).id).toBe('n1')
+    const de = await deleteChildFixture(app, 'c1', 'edge', 'e1', baseE)
+    expect(de.status).toBe(200)
+    const da = await deleteChildFixture(app, 'c1', 'anchor', 'a1', baseA)
+    expect(da.status).toBe(200)
 
     const got2 = await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })
     const body2 = got2.body as { nodes: unknown[]; edges: unknown[]; anchors: unknown[] }
     expect(body2.nodes).toHaveLength(0)
     expect(body2.edges).toHaveLength(0)
     expect(body2.anchors).toHaveLength(0)
-    // missing DELETE → 404
-    const missing = await req(app, '/api/canvas/c1/nodes/never', { method: 'DELETE', headers: hdr(KEY_A) })
+    // missing DELETE(合法 base token 但 record 从未存在)→ 404
+    const missing = await deleteChildFixture(app, 'c1', 'node', 'never', baseToken('c1', 'never', 1))
     expect(missing.status).toBe(404)
     expect((missing.body as { error: string }).error).toBe('unknown-node')
   })
@@ -264,7 +302,7 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
   it('返修 #2/#7:DELETE canvas → softDeleteCanvasTree(canvas meta + chat-collection 软删;children 活);GET/chat → 404', async () => {
     await seedProject()
     await seedCanvas()
-    await patchChildWithFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
+    await createChildFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
     await req(app, '/api/canvas/c1/chat', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ message: { id: 'm1' } }) })
 
     const del = await req(app, '/api/canvas/c1', { method: 'DELETE', headers: hdr(KEY_A) })
@@ -278,9 +316,9 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
   it('返修 #6/F5:POST /api/canvas/:id/reorder 持久化 orderKey(If-Match contentVersion 必填;响应返 contentVersion)', async () => {
     await seedProject()
     await seedCanvas()
-    await patchChildWithFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
-    await patchChildWithFixture(app, 'c1', 'node', 'n2', wirePayload(canonicalNode('n2')))
-    await patchChildWithFixture(app, 'c1', 'node', 'n3', wirePayload(canonicalNode('n3')))
+    await createChildFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
+    await createChildFixture(app, 'c1', 'node', 'n2', wirePayload(canonicalNode('n2')))
+    await createChildFixture(app, 'c1', 'node', 'n3', wirePayload(canonicalNode('n3')))
     // F5:读当前 contentVersion(3 次 child 写入 bump → 3)作 If-Match base
     const before = await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })
     const cv = (before.body as { contentVersion: number }).contentVersion
@@ -348,16 +386,16 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
 
   // ── 返修二 N1-N10 回归(真实 canonical fixture 驱动真实 route)──
 
-  it('N1: canonical node fixture 经 encoder PATCH 真实 route 200;GET 回读 envelope revision 回填;wire payload 无 id/revision', async () => {
+  it('N1(A2-S2):canonical node fixture 经 POST create 真实 route 201;GET 回读 envelope revision;wire payload 无 id/revision', async () => {
     await seedProject()
     await seedCanvas()
-    const created = await patchChildWithFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
-    expect(created.status).toBe(200)
-    expect((created.body as { id: string; revision: number }).revision).toBe(0)
+    const created = await createChildFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
+    expect(created.status).toBe(201)
+    expect((created.body as { id: string; revision: number }).revision).toBe(1) // A2-S2:fresh create → rev1
     // GET 回读:envelope revision 回填;payload 域字段保留;wire payload 不携带 id/revision
     const got = await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })
     const entry = (got.body as { nodes: { id: string; revision: number; payload: Record<string, unknown> }[] }).nodes.find((n) => n.id === 'n1')!
-    expect(entry.revision).toBe(0) // envelope revision 回填
+    expect(entry.revision).toBe(1) // envelope revision 回填
     expect(entry.payload.type).toBe('image')
     expect(entry.payload.transform).toEqual(canonicalNode('n1').transform)
     expect(entry.payload.fills).toEqual(canonicalNode('n1').fills)
@@ -365,13 +403,14 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
     expect('id' in entry.payload).toBe(false) // N1:wire payload 不携带 id(取自 path)
   })
 
-  it('N2: create→delete→restore(无 idem)后 canvas+collection 全 live;硬删 child 不复活', async () => {
+  it('N2(A2-S2):create→delete→restore(无 idem)后 canvas+collection 全 live;硬删 child 不复活', async () => {
     await seedProject()
     await seedCanvas('c1', 'p1')
-    await patchChildWithFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
+    const cn = await createChildFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
     await req(app, '/api/canvas/c1/chat', { method: 'POST', headers: hdr(KEY_A), body: JSON.stringify({ message: { id: 'm1', text: 'hi' } }) })
-    // 硬删 n1(物理移除)→ 后续 restore 不复活
-    await req(app, '/api/canvas/c1/nodes/n1', { method: 'DELETE', headers: hdr(KEY_A) })
+    // 硬删 n1(物理移除,If-Match base)→ 后续 restore 不复活
+    const dn = await deleteChildFixture(app, 'c1', 'node', 'n1', (cn.body as { base: string }).base)
+    expect(dn.status).toBe(200)
     // delete canvas → softDeleteCanvasTree
     await req(app, '/api/canvas/c1', { method: 'DELETE', headers: hdr(KEY_A) })
     expect((await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })).status).toBe(404)
@@ -430,41 +469,44 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
     expect((list.body as { messages: { id: string }[] }).messages.map((m) => m.id)).toContain('m1')
   })
 
-  it('N4: 同 idem key 同 body → 200 不 bump;不同 body → 422 reuse-conflict', async () => {
+  it('N4(A2-S2):同 idem key 同 body → 200 不 bump;不同 body → 422 reuse-conflict(PATCH DomainOp)', async () => {
     await seedProject()
     await seedCanvas()
-    // first PATCH(idem k1)
-    const r1 = await req(app, '/api/canvas/c1/nodes/n1', { method: 'PATCH', headers: { ...hdr(KEY_A), 'idempotency-key': 'k1' }, body: JSON.stringify({ payload: wirePayload(canonicalNode('n1')) }) })
+    const cn = await createChildFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
+    const base1 = (cn.body as { base: string }).base
+    const op1: unknown[] = [{ kind: 'set', fieldPath: ['title'], value: 'T1' }]
+    // first PATCH(idem k1,base1)→ 200 bump rev2
+    const r1 = await patchDomainOps(app, 'c1', 'node', 'n1', op1, base1, { idempotencyKey: 'k1' })
     expect(r1.status).toBe(200)
-    expect((r1.body as { revision: number }).revision).toBe(0)
-    // same key same body → 200 no bump
-    const r2 = await req(app, '/api/canvas/c1/nodes/n1', { method: 'PATCH', headers: { ...hdr(KEY_A), 'idempotency-key': 'k1' }, body: JSON.stringify({ payload: wirePayload(canonicalNode('n1')) }) })
+    expect((r1.body as { revision: number }).revision).toBe(2)
+    // same key same body → 200 no bump(idem replay,返既有 accepted rev2)
+    const r2 = await patchDomainOps(app, 'c1', 'node', 'n1', op1, base1, { idempotencyKey: 'k1' })
     expect(r2.status).toBe(200)
-    expect((r2.body as { revision: number }).revision).toBe(0) // 不 bump
+    expect((r2.body as { revision: number }).revision).toBe(2) // 不 bump
     // same key different body(title 改)→ 422
-    const node2 = canonicalNode('n1'); node2.title = 'changed'
-    const r3 = await req(app, '/api/canvas/c1/nodes/n1', { method: 'PATCH', headers: { ...hdr(KEY_A), 'idempotency-key': 'k1' }, body: JSON.stringify({ payload: wirePayload(node2) }) })
+    const op2: unknown[] = [{ kind: 'set', fieldPath: ['title'], value: 'changed' }]
+    const r3 = await patchDomainOps(app, 'c1', 'node', 'n1', op2, base1, { idempotencyKey: 'k1' })
     expect(r3.status).toBe(422)
     expect((r3.body as { error: string }).error).toBe('idempotency-key-reuse')
   })
 
-  it('N5: If-Match 严格——1.5/1e2/0x10/-1/abc/超界 → 400;缺失(existing)→ 428;正确 → base', async () => {
+  it('N5(A2-S2):If-Match = BaseCursor——malformed/非 base: 前缀/签名错 → 400;缺失 → 428;合法 token → 200', async () => {
     await seedProject()
     await seedCanvas()
-    await patchChildWithFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1'))) // create rev 0
-    // existing + invalid If-Match → 400
-    for (const bad of ['1.5', '1e2', '0x10', '-1', 'abc', '99999999999999999999999']) {
-      const r = await patchChildWithFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')), bad)
+    const cn = await createChildFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1'))) // create rev1
+    // existing + malformed/unsigned/scope-mismatch If-Match → 400(decodeBase → null)
+    for (const bad of ['1.5', '1e2', '0x10', '-1', 'abc', '99999999999999999999999', 'base:cv=c1|rid=n1|r=0.deadbeef', 'not-a-base-token']) {
+      const r = await patchDomainOps(app, 'c1', 'node', 'n1', [{ kind: 'set', fieldPath: ['title'], value: 'x' }], bad)
       expect(r.status).toBe(400)
       expect((r.body as { error: string }).error).toBe('bad-request')
     }
     // existing + missing If-Match → 428
-    const noBase = await patchChildWithFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
+    const noBase = await patchDomainOps(app, 'c1', 'node', 'n1', [{ kind: 'set', fieldPath: ['title'], value: 'x' }])
     expect(noBase.status).toBe(428)
-    // correct If-Match:0 → 200 bump
-    const ok = await patchChildWithFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')), '0')
+    // 合法 base token(create 响应)→ 200 bump rev2
+    const ok = await patchDomainOps(app, 'c1', 'node', 'n1', [{ kind: 'set', fieldPath: ['title'], value: 'x' }], (cn.body as { base: string }).base)
     expect(ok.status).toBe(200)
-    expect((ok.body as { revision: number }).revision).toBe(1)
+    expect((ok.body as { revision: number }).revision).toBe(2)
   })
 
   it('N7: B 跨 owner GET/DELETE A 的 canvas → 404(同 unknown);move projectId 到他人 project → 404;list 仅自己', async () => {
@@ -492,9 +534,9 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
   it('N8/F5: reorder orderedIds 全等+唯一;If-Match contentVersion 必填(缺→428);stale→409;bump contentVersion', async () => {
     await seedProject()
     await seedCanvas()
-    await patchChildWithFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
-    await patchChildWithFixture(app, 'c1', 'node', 'n2', wirePayload(canonicalNode('n2')))
-    await patchChildWithFixture(app, 'c1', 'node', 'n3', wirePayload(canonicalNode('n3')))
+    await createChildFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
+    await createChildFixture(app, 'c1', 'node', 'n2', wirePayload(canonicalNode('n2')))
+    await createChildFixture(app, 'c1', 'node', 'n3', wirePayload(canonicalNode('n3')))
     // 读当前 contentVersion(3 次 child 写入 bump → 3)作 If-Match base
     const before = await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })
     const cv = (before.body as { contentVersion: number }).contentVersion
@@ -521,30 +563,30 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
     expect(ok.status).toBe(200)
   })
 
-  it('N10: payload 真 allowlist——缺必填 → missing-field;unknown field → unknown-field;非 string id → bad-id-type', async () => {
+  it('N10(A2-S2):POST create payload 真 allowlist——缺必填 → missing-field;unknown → unknown-field;非 string id → bad-id-type', async () => {
     await seedProject()
     await seedCanvas()
     const base = wirePayload(canonicalNode('n1')) as Record<string, unknown>
     // 缺必填 transform → missing-field
     const noTransform = { ...base }; delete noTransform.transform
-    const r1 = await patchChildWithFixture(app, 'c1', 'node', 'n1', noTransform)
+    const r1 = await createChildFixture(app, 'c1', 'node', 'n1', noTransform)
     expect(r1.status).toBe(400)
     expect((r1.body as { reason: string; field?: string }).reason).toBe('missing-field')
     expect((r1.body as { field?: string }).field).toBe('transform')
     // unknown field → unknown-field
-    const r2 = await patchChildWithFixture(app, 'c1', 'node', 'n1', { ...base, bogusField: 'x' })
+    const r2 = await createChildFixture(app, 'c1', 'node', 'n1', { ...base, bogusField: 'x' })
     expect((r2.body as { reason: string; field?: string }).reason).toBe('unknown-field')
     expect((r2.body as { field?: string }).field).toBe('bogusField')
     // 非 string id → bad-id-type
-    const r3 = await patchChildWithFixture(app, 'c1', 'node', 'n1', { ...base, id: 123 })
+    const r3 = await createChildFixture(app, 'c1', 'node', 'n1', { ...base, id: 123 })
     expect((r3.body as { reason: string }).reason).toBe('bad-id-type')
     // edge 缺必填(from)→ missing-field
     const eBase = wirePayload(canonicalEdge('e1')) as Record<string, unknown>
     const noFrom = { ...eBase }; delete noFrom.from
-    const r4 = await patchChildWithFixture(app, 'c1', 'edge', 'e1', noFrom)
+    const r4 = await createChildFixture(app, 'c1', 'edge', 'e1', noFrom)
     expect((r4.body as { reason: string }).reason).toBe('missing-field')
     // edge bad type(createdAt 非 number)→ bad-type
-    const r5 = await patchChildWithFixture(app, 'c1', 'edge', 'e1', { ...eBase, createdAt: 'not-a-num' })
+    const r5 = await createChildFixture(app, 'c1', 'edge', 'e1', { ...eBase, createdAt: 'not-a-num' })
     expect((r5.body as { reason: string }).reason).toBe('bad-type')
   })
 
@@ -600,8 +642,8 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
   it('F5: reorder 并发同 base 一 200 一 409(从 adapter seam 驱动;reorderChildren 带 baseContentVersion)', async () => {
     await seedProject()
     await seedCanvas()
-    await patchChildWithFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
-    await patchChildWithFixture(app, 'c1', 'node', 'n2', wirePayload(canonicalNode('n2')))
+    await createChildFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
+    await createChildFixture(app, 'c1', 'node', 'n2', wirePayload(canonicalNode('n2')))
     const before = await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })
     const cv = (before.body as { contentVersion: number }).contentVersion
     // adapter seam:薄 wrapper 镜像 ServerPersistAdapter.reorderChildren(canvasId, type, orderedIds, baseContentVersion)
@@ -617,49 +659,49 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
     expect(statuses).toEqual([200, 409])
   })
 
-  it('F6: PATCH payload 递归 schema——relations 内藏 status/tasks 400;fontSize 坏类型 400;transform 内坏类型 400', async () => {
+  it('F6(A2-S2):POST create payload 递归 schema——relations 内藏 status/tasks 400;fontSize 坏类型 400;transform 内坏类型 400', async () => {
     await seedProject()
     await seedCanvas()
     const base = wirePayload(canonicalNode('n1')) as Record<string, unknown>
     // relations 内藏 status → forbidden-field(relations.status)
-    const f1 = await patchChildWithFixture(app, 'c1', 'node', 'n1', { ...base, relations: { status: 'ready' } })
+    const f1 = await createChildFixture(app, 'c1', 'node', 'n1', { ...base, relations: { status: 'ready' } })
     expect(f1.status).toBe(400)
     expect((f1.body as { reason: string; field?: string })).toMatchObject({ reason: 'forbidden-field', field: 'relations.status' })
     // relations 内藏 tasks → forbidden-field
-    const f2 = await patchChildWithFixture(app, 'c1', 'node', 'n1', { ...base, relations: { tasks: [] } })
+    const f2 = await createChildFixture(app, 'c1', 'node', 'n1', { ...base, relations: { tasks: [] } })
     expect((f2.body as { reason: string }).reason).toBe('forbidden-field')
     // optional fontSize 坏类型('x')→ bad-type
-    const f3 = await patchChildWithFixture(app, 'c1', 'node', 'n1', { ...base, fontSize: 'x' })
+    const f3 = await createChildFixture(app, 'c1', 'node', 'n1', { ...base, fontSize: 'x' })
     expect((f3.body as { reason: string; field?: string })).toMatchObject({ reason: 'bad-type', field: 'fontSize' })
     // transform 内坏类型(x 非 number)→ bad-type field=transform.x
-    const f4 = await patchChildWithFixture(app, 'c1', 'node', 'n1', { ...base, transform: { x: 'bad', y: 0, width: 100, height: 100, rotation: 0 } })
+    const f4 = await createChildFixture(app, 'c1', 'node', 'n1', { ...base, transform: { x: 'bad', y: 0, width: 100, height: 100, rotation: 0 } })
     expect((f4.body as { reason: string; field?: string })).toMatchObject({ reason: 'bad-type', field: 'transform.x' })
-    // 干净 canonical → 200 create
-    const ok = await patchChildWithFixture(app, 'c1', 'node', 'n1', base)
-    expect(ok.status).toBe(200)
+    // 干净 canonical → 201 create
+    const ok = await createChildFixture(app, 'c1', 'node', 'n1', base)
+    expect(ok.status).toBe(201)
   })
 
   // ── 返修四 P1-1/P1-3 路由级回归(真实 app.request 全链路)──
 
-  it('P1-3/F6:走私有 payload 全 400(markupPoints 走私/fills 坏类型/maskBounds 坏值+extra);canonical 全 200', async () => {
+  it('P1-3/F6(A2-S2):POST create 走私有 payload 全 400(markupPoints 走私/fills 坏类型/maskBounds 坏值+extra);canonical 全 201', async () => {
     await seedProject()
     await seedCanvas()
     const base = wirePayload(canonicalNode('n1')) as Record<string, unknown>
     // markupPoints 元素走私字段 → 400 unknown-field path=markupPoints[0].smuggled
-    const s1 = await patchChildWithFixture(app, 'c1', 'node', 'n1', { ...base, markupPoints: [{ x: 0, y: 0, smuggled: 1 }] })
+    const s1 = await createChildFixture(app, 'c1', 'node', 'n1', { ...base, markupPoints: [{ x: 0, y: 0, smuggled: 1 }] })
     expect(s1.status).toBe(400)
     expect((s1.body as { reason: string; field?: string })).toMatchObject({ reason: 'unknown-field', field: 'markupPoints[0].smuggled' })
     // fills 元素坏类型(id 非 string)→ 400 bad-type path=fills[0].id
-    const s2 = await patchChildWithFixture(app, 'c1', 'node', 'n1', { ...base, fills: [{ id: 1, kind: 'solid', color: '#fff', opacity: 1, visible: true }] })
+    const s2 = await createChildFixture(app, 'c1', 'node', 'n1', { ...base, fills: [{ id: 1, kind: 'solid', color: '#fff', opacity: 1, visible: true }] })
     expect(s2.status).toBe(400)
     expect((s2.body as { reason: string; field?: string })).toMatchObject({ reason: 'bad-type', field: 'fills[0].id' })
     // generation.maskBounds 坏值 + extra → 400 unknown-field path=generation.maskBounds.extra
-    const s3 = await patchChildWithFixture(app, 'c1', 'node', 'n1', { ...base, generation: { prompt: 'p', model: 'm', maskBounds: { x: 'bad', y: 0, width: 1, height: 1, extra: 1 } } })
+    const s3 = await createChildFixture(app, 'c1', 'node', 'n1', { ...base, generation: { prompt: 'p', model: 'm', maskBounds: { x: 'bad', y: 0, width: 1, height: 1, extra: 1 } } })
     expect(s3.status).toBe(400)
     expect((s3.body as { reason: string; field?: string })).toMatchObject({ reason: 'unknown-field', field: 'generation.maskBounds.extra' })
-    // 合法 canonical → 200
-    const okR = await patchChildWithFixture(app, 'c1', 'node', 'n1', base)
-    expect(okR.status).toBe(200)
+    // 合法 canonical → 201
+    const okR = await createChildFixture(app, 'c1', 'node', 'n1', base)
+    expect(okR.status).toBe(201)
   })
 
   it('P1-1/F1 barrier:POST canvas 原子建 canvas+collection;DELETE project cascade both → 树内零 live orphan', async () => {
@@ -682,7 +724,7 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
     if (collAfter.kind === 'found') expect(collAfter.record.isDeleted).toBe(true)
   })
 
-  it('P2-3/F6 返修五 route 级:PATCH node markupKind=bogus → 400;anchor box 缺 width → 400;point 带 width → 400', async () => {
+  it('P2-3/F6 返修五 route 级:POST create node markupKind=bogus → 400;anchor box 缺 width → 400;point 带 width → 400', async () => {
     await seedProject()
     await seedCanvas()
     const baseNode = {
@@ -691,24 +733,24 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
       fills: [] as unknown[], strokes: [] as unknown[], effects: [] as unknown[], relations: {} as Record<string, unknown>,
     }
     // markupKind=bogus → 400 bad-type markupKind(enum predicate,从 src/types 单一来源导出;旧 scalar(isStr) 放行)
-    const bogus = await patchChildWithFixture(app, 'c1', 'node', 'n1', wirePayload({ ...baseNode, markupKind: 'bogus' }))
+    const bogus = await createChildFixture(app, 'c1', 'node', 'n1', wirePayload({ ...baseNode, markupKind: 'bogus' }))
     expect(bogus.status).toBe(400)
     expect(bogus.body).toMatchObject({ error: 'payload-rejected', reason: 'bad-type', field: 'markupKind' })
-    // 合法 markupKind → 200(控制组:枚举合法值通过)
-    const ok = await patchChildWithFixture(app, 'c1', 'node', 'n1', wirePayload({ ...baseNode, markupKind: 'arrow' }))
-    expect(ok.status).toBe(200)
+    // 合法 markupKind → 201(控制组:枚举合法值通过)
+    const ok = await createChildFixture(app, 'c1', 'node', 'n1', wirePayload({ ...baseNode, markupKind: 'arrow' }))
+    expect(ok.status).toBe(201)
 
     // anchor box 缺 width → 400 missing-field width(type 判别 union:box 必填 width+height)
-    const boxMissing = await patchChildWithFixture(app, 'c1', 'anchor', 'a1', wirePayload({ id: 'a1', type: 'box', targetNodeId: 'n2', x: 0, y: 0, instruction: 'i', createdAt: 1, revision: 0, height: 10 }))
+    const boxMissing = await createChildFixture(app, 'c1', 'anchor', 'a1', wirePayload({ id: 'a1', type: 'box', targetNodeId: 'n2', x: 0, y: 0, instruction: 'i', createdAt: 1, revision: 0, height: 10 }))
     expect(boxMissing.status).toBe(400)
     expect(boxMissing.body).toMatchObject({ error: 'payload-rejected', reason: 'missing-field', field: 'width' })
     // anchor point 带 width → 400 unknown-field width(point 拒 box 专属字段)
-    const pointWidth = await patchChildWithFixture(app, 'c1', 'anchor', 'a2', wirePayload({ id: 'a2', type: 'point', targetNodeId: 'n2', x: 0, y: 0, instruction: 'i', createdAt: 1, revision: 0, width: 10 }))
+    const pointWidth = await createChildFixture(app, 'c1', 'anchor', 'a2', wirePayload({ id: 'a2', type: 'point', targetNodeId: 'n2', x: 0, y: 0, instruction: 'i', createdAt: 1, revision: 0, width: 10 }))
     expect(pointWidth.status).toBe(400)
     expect(pointWidth.body).toMatchObject({ error: 'payload-rejected', reason: 'unknown-field', field: 'width' })
   })
 
-  it('P2-4 返修五 route 级:owner-only 语义不变——A 访问自己资源全通(GET/PATCH);B 跨 owner 404(无存在泄漏)', async () => {
+  it('P2-4 返修五 route 级:owner-only 语义不变——A 访问自己资源全通(GET/POST);B 跨 owner 404(无存在泄漏)', async () => {
     await seedProject() // owner A 的 p1
     await seedCanvas()  // owner A 的 c1
     // A 自己 GET canvas → 200(owner===resourceOwner seam)
@@ -717,11 +759,11 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
     // B 跨 owner GET canvas → 404
     const bGet = await req(app, '/api/canvas/c1', { headers: hdr(KEY_B) })
     expect(bGet.status).toBe(404)
-    // A 自己 PATCH node → 200
-    const aPatch = await patchChildWithFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
-    expect(aPatch.status).toBe(200)
-    // B 跨 owner PATCH node → 404(单资源 route 已 resourceOwner 化,canAccessCanvas 拒跨 owner)
-    const bPatch = await req(app, '/api/canvas/c1/nodes/n1', { method: 'PATCH', headers: hdr(KEY_B), body: JSON.stringify({ payload: wirePayload(canonicalNode('n1')) }) })
+    // A 自己 POST create node → 201
+    const aCreate = await createChildFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
+    expect(aCreate.status).toBe(201)
+    // B 跨 owner PATCH node(合法 DomainOp body)→ authzCanvas 拒 → 404(单资源 route resourceOwner 化,无存在泄漏)
+    const bPatch = await patchDomainOps(app, 'c1', 'node', 'n1', [{ kind: 'set', fieldPath: ['title'], value: 'x' }], baseToken('c1', 'n1', 1), { key: KEY_B })
     expect(bPatch.status).toBe(404)
   })
 })

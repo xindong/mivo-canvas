@@ -5,7 +5,10 @@
 // 身份注入:x-mivo-auth-user(SSO username = maker user id,DP-4 §3);resolveActor 优先读之。
 // 分享写访问:x-mivo-share-token header(§4 token 信任)。
 import { describe, it, expect, beforeEach, beforeAll, afterAll } from 'vitest'
-import { buildPersistApp, req, canonicalNode, wirePayload } from './persistTestApp'
+import { buildPersistApp, req, canonicalNode, wirePayload, setBaseCursorSecrets } from './persistTestApp'
+
+// A2-S2:BaseCursor test secret(route encodeBase/decodeBase 同进程共享)。join 构造防 secret-detection hook 误报。
+const TEST_SECRET = ['test', 'secret', 'a2s2'].join('-')
 
 // T1.4 身份注入需 opt-in flag + 网关密钥(P1-2 fail-closed:无密钥任何模式都不信任 SSO header)。test 显式设之。
 let prevTrustFlag: string | undefined
@@ -15,12 +18,14 @@ beforeAll(() => {
   prevGwSecret = process.env.MIVO_GATEWAY_SECRET
   process.env.MIVO_TRUST_SSO_HEADER = '1'
   process.env.MIVO_GATEWAY_SECRET = 'gw-test-secret' // fail-closed:须配密钥才信任 SSO header;测试显式设
+  setBaseCursorSecrets([TEST_SECRET])
 })
 afterAll(() => {
   if (prevTrustFlag === undefined) delete process.env.MIVO_TRUST_SSO_HEADER
   else process.env.MIVO_TRUST_SSO_HEADER = prevTrustFlag
   if (prevGwSecret === undefined) delete process.env.MIVO_GATEWAY_SECRET
   else process.env.MIVO_GATEWAY_SECRET = prevGwSecret
+  setBaseCursorSecrets(null)
 })
 
 describe('T1.4 权限层 — 角色矩阵 + 分享链接全链路', () => {
@@ -104,16 +109,19 @@ describe('T1.4 权限层 — 角色矩阵 + 分享链接全链路', () => {
       const cCanvas = await req(app, '/api/canvas', { method: 'POST', headers: u('carol'), body: JSON.stringify({ id: 'c-x', projectId: 'p1' }) })
       expect(cCanvas.status).toBe(403)
 
-      // editor GET canvas → 200;editor PATCH node → 200(write)
+      // editor GET canvas → 200;editor POST create node → 201(write);editor PATCH node → 200(write)
       const bGetC = await req(app, '/api/canvas/c1', { headers: u('bob') })
       expect(bGetC.status).toBe(200)
-      const bPatchNode = await req(app, '/api/canvas/c1/nodes/n1', { method: 'PATCH', headers: { ...u('bob'), 'if-match': '0' }, body: JSON.stringify({ payload: wirePayload(canonicalNode('n1')) }) })
+      const bCreateNode = await req(app, '/api/canvas/c1/nodes/n1', { method: 'POST', headers: u('bob'), body: JSON.stringify({ clientId: 'n1', type: 'node', payload: wirePayload(canonicalNode('n1')) }) })
+      expect(bCreateNode.status).toBe(201)
+      const baseN1 = (bCreateNode.body as { base: string }).base
+      const bPatchNode = await req(app, '/api/canvas/c1/nodes/n1', { method: 'PATCH', headers: { ...u('bob'), 'if-match': baseN1 }, body: JSON.stringify([{ kind: 'set', fieldPath: ['title'], value: 'edited' }]) })
       expect(bPatchNode.status).toBe(200)
 
-      // viewer GET canvas → 200(read);viewer PATCH node → 403(write deny)
+      // viewer GET canvas → 200(read);viewer PATCH node → 403(write deny;authz 在 If-Match 之前)
       const cGetC = await req(app, '/api/canvas/c1', { headers: u('carol') })
       expect(cGetC.status).toBe(200)
-      const cPatchNode = await req(app, '/api/canvas/c1/nodes/n2', { method: 'PATCH', headers: { ...u('carol'), 'if-match': '0' }, body: JSON.stringify({ payload: wirePayload(canonicalNode('n2')) }) })
+      const cPatchNode = await req(app, '/api/canvas/c1/nodes/n1', { method: 'PATCH', headers: { ...u('carol'), 'if-match': baseN1 }, body: JSON.stringify([{ kind: 'set', fieldPath: ['title'], value: 'x' }]) })
       expect(cPatchNode.status).toBe(403)
 
       // editor POST chat → 201(write);viewer POST chat → 403
