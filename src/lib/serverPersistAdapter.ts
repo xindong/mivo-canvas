@@ -76,14 +76,15 @@ export interface ServerPersistAdapter {
    * 返修 #6/F5:重排子资源顺序(持久化 orderKey)。**If-Match(contentVersion base)必填**——
    * baseContentVersion = client 最近读到的 canvas contentVersion(若-Match);并发同 base 一成一 409。
    * F5 seam 必填:不传 baseContentVersion 编译失败(见 contract test @ts-expect-error 互锁)。
-   * 响应返新 contentVersion(client 据此作下次 reorder 的 If-Match base)。
+   * 响应返新 contentVersion + base(client 据此作下次 reorder 的 If-Match base + 增量更新 bundle.orderCv)。
+   * A2-S3(lead ②b):reorder 更新 order 游标,响应携新 order base(encodeOrderBase,server 签发)。
    */
   reorderChildren(
     canvasId: string,
     type: 'node' | 'edge' | 'anchor' | 'chat-message',
     orderedIds: string[],
     baseContentVersion: Revision,
-  ): Promise<{ reordered: number; contentVersion: Revision }>
+  ): Promise<{ reordered: number; contentVersion: Revision; base: string }>
 
   // ── document scope → /api/canvas/:id/chat(G1-a chat 接线,DP-6R per-actor)──
   /**
@@ -297,6 +298,19 @@ const notWiredG1c = (method: string): Promise<never> =>
   )
 
 /**
+ * A2-S3:从 record 剥离 id+revision(transport payload = Omit<Record,'id'|'revision'>;id 来自 path,revision
+ * 来自 envelope/If-Match,shared 契约 wire body 不携带)。create POST 的 CreateBody.payload 用此。
+ */
+const stripIdRev = <T extends { id?: unknown; revision?: unknown }>(r: T): Record<string, unknown> => {
+  const out: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(r)) {
+    if (k === 'id' || k === 'revision') continue
+    out[k] = v
+  }
+  return out
+}
+
+/**
  * 真 fetch ServerPersistAdapter(G1-a 非画布域接线)。工厂式:测试注入 fetch=getAppRequest +
  * getAuthHeaders=()=>({x-mivo-api-key:KEY_A}) 驱动 buildPersistApp 的真实 Hono route;生产由
  * serverPersistAdapterSelector 提供(默认全局 fetch + '' baseUrl + lazy authHeaders)。
@@ -443,14 +457,56 @@ export const createFetchServerPersistAdapter = (opts: FetchAdapterOptions): Serv
       }
     },
 
-    // ── canvas-domain 写(G1-c 挂 N2-0;seam reject,不接)──
-    upsertNode: () => notWiredG1c('upsertNode'),
-    upsertEdge: () => notWiredG1c('upsertEdge'),
-    upsertAnchor: () => notWiredG1c('upsertAnchor'),
-    deleteNode: () => notWiredG1c('deleteNode'),
-    deleteEdge: () => notWiredG1c('deleteEdge'),
-    deleteAnchor: () => notWiredG1c('deleteAnchor'),
-    reorderChildren: () => notWiredG1c('reorderChildren'),
+    // ── canvas-domain 写(G1-c 接线;lead 授权方案 A。A2-S3 create/reorder 先行;edit/delete 待 Block 7)──
+    // create:baseRevision undefined → POST :nodeId/:edgeId/:anchorId,CreateBody{clientId=record.id,type,payload=
+    //   stripIdRev(record)};确定性 idempotencyKey(create-<type>:<canvasId>:<recordId>)防 retry dup→409。
+    //   返 CanvasChildUpsertResponse(seq+base 必填,lead ②)。
+    // edit(baseRevision defined):需 per-record signed BaseCursor(从 bundle holder 抽,Block 7)→ notWiredG1c。
+    // delete:需 signed base + authoritative load(port R2-P1-3,Block 7)→ notWiredG1c。
+    upsertNode: (canvasId, node, baseRevision) => {
+      if (baseRevision !== undefined) return notWiredG1c('upsertNode edit (A2-S3 Block 7 pending: needs signed base from bundle)')
+      return requestJson<CanvasChildUpsertResponse>({
+        fetch: doFetch, baseUrl, getAuthHeaders,
+        method: 'POST',
+        path: `/api/canvas/${encodeURIComponent(canvasId)}/nodes/${encodeURIComponent(node.id)}`,
+        body: { clientId: node.id, type: 'node' as const, payload: stripIdRev(node) },
+        idempotencyKey: `create-node:${canvasId}:${node.id}`,
+      })
+    },
+    upsertEdge: (canvasId, edge, baseRevision) => {
+      if (baseRevision !== undefined) return notWiredG1c('upsertEdge edit (A2-S3 Block 7 pending)')
+      return requestJson<CanvasChildUpsertResponse>({
+        fetch: doFetch, baseUrl, getAuthHeaders,
+        method: 'POST',
+        path: `/api/canvas/${encodeURIComponent(canvasId)}/edges/${encodeURIComponent(edge.id)}`,
+        body: { clientId: edge.id, type: 'edge' as const, payload: stripIdRev(edge) },
+        idempotencyKey: `create-edge:${canvasId}:${edge.id}`,
+      })
+    },
+    upsertAnchor: (canvasId, anchor, baseRevision) => {
+      if (baseRevision !== undefined) return notWiredG1c('upsertAnchor edit (A2-S3 Block 7 pending)')
+      return requestJson<CanvasChildUpsertResponse>({
+        fetch: doFetch, baseUrl, getAuthHeaders,
+        method: 'POST',
+        path: `/api/canvas/${encodeURIComponent(canvasId)}/anchors/${encodeURIComponent(anchor.id)}`,
+        body: { clientId: anchor.id, type: 'anchor' as const, payload: stripIdRev(anchor) },
+        idempotencyKey: `create-anchor:${canvasId}:${anchor.id}`,
+      })
+    },
+    // delete → Block 7(signed base from bundle + authoritative load semantics,port R2-P1-3)
+    deleteNode: () => notWiredG1c('deleteNode (A2-S3 Block 7 pending: signed base + authoritative load)'),
+    deleteEdge: () => notWiredG1c('deleteEdge (A2-S3 Block 7 pending)'),
+    deleteAnchor: () => notWiredG1c('deleteAnchor (A2-S3 Block 7 pending)'),
+    // reorder:POST /:id/reorder,body{type, orderedIds},If-Match = bare contentVersion(parseIfMatch 路径,非签名)。
+    //   响应 {reordered, contentVersion, base}(base=encodeOrderBase,server A2-S3 签发;client 增量更新 bundle.orderCv)。
+    reorderChildren: (canvasId, type, orderedIds, baseContentVersion) =>
+      requestJson<{ reordered: number; contentVersion: Revision; base: string }>({
+        fetch: doFetch, baseUrl, getAuthHeaders,
+        method: 'POST',
+        path: `/api/canvas/${encodeURIComponent(canvasId)}/reorder`,
+        body: { type, orderedIds },
+        ifMatch: baseContentVersion,
+      }),
 
     // ── chat(G1-a chat 接线,DP-6R per-actor;wire shape 与旧版/新版 route 一致,owner 语义服务端管)──
     listChatMessages: (canvasId) =>

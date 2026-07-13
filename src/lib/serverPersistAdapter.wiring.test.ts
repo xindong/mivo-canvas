@@ -112,6 +112,19 @@ const makeStubBff = () => {
       return json({ canvases: list }, 200)
     }
 
+    // POST /api/canvas/:id/nodes|edges|anchors/:childId (create) — A2-S3 wired(lead 授权方案 A;create 先行)
+    if (method === 'POST' && /^\/api\/canvas\/[^/]+\/(nodes|edges|anchors)\/[^/]+$/.test(path)) {
+      const segs = path.split('/')
+      const childId = decodeURIComponent(segs[segs.length - 1] ?? '')
+      // stub:返 CanvasChildUpsertResponse(seq+base 必填,lead ②;wire shape 钉死,非真 backend 语义)
+      return json({ id: childId, revision: 1, seq: 1, base: `stub-base:${childId}` }, 201)
+    }
+    // POST /api/canvas/:id/reorder — A2-S3 wired(reorder If-Match = bare contentVersion)
+    if (method === 'POST' && /^\/api\/canvas\/[^/]+\/reorder$/.test(path)) {
+      const b = JSON.parse((init?.body as string) ?? '{}') as { orderedIds?: string[] }
+      return json({ reordered: b.orderedIds?.length ?? 0, contentVersion: 1, base: 'stub-order-base' }, 200)
+    }
+
     return new Response(null, { status: 404 })
   }
 
@@ -259,19 +272,73 @@ describe('G1-a canvas-meta hydrate(fetchCanvas / listCanvas 读路径)', () => {
   })
 })
 
-describe('G1-a 画布域写 seam reject(G1-c,不接);chat 已 wired(DP-6R P1-1)', () => {
-  it('upsertNode/deleteNode/reorderChildren reject(G1-c seam)', async () => {
+describe('A2-S3 画布域写:create/reorder 已 wired(lead 方案 A);delete 待 Block 7(G1-c seam)', () => {
+  it('upsertNode/Edge/Anchor 无 base → POST create:wired(201 CanvasChildUpsertResponse;wire shape 钉死)', async () => {
+    const stub = makeStubBff()
+    const calls: { path: string; init: RequestInit }[] = []
+    const spyFetch = async (input: string, init?: RequestInit) => {
+      calls.push({ path: input, init: init ?? {} })
+      return stub.fetch(input, init)
+    }
+    const adapter = createFetchServerPersistAdapter({ fetch: spyFetch, baseUrl: '', getAuthHeaders: authHeaders(KEY_A) })
+    const node = { id: 'n1', type: 'image', title: 't', transform: { x: 1 } } as unknown as NodeRecord
+    const res = await adapter.upsertNode('c1', node)
+    // 返 CanvasChildUpsertResponse(seq+base 必填,lead ②)
+    expect(res.id).toBe('n1')
+    expect(res.seq).toBe(1)
+    expect(res.base).toBe('stub-base:n1')
+    // wire shape:POST /api/canvas/c1/nodes/n1,body = CreateBody{clientId, type, payload(无 id/revision)}
+    expect(calls[0].path).toBe('/api/canvas/c1/nodes/n1')
+    expect(calls[0].init.method).toBe('POST')
+    const body = JSON.parse((calls[0].init.body as string) ?? '{}') as { clientId: string; type: string; payload: Record<string, unknown> }
+    expect(body.clientId).toBe('n1')
+    expect(body.type).toBe('node')
+    expect(body.payload).not.toHaveProperty('id')
+    expect(body.payload).not.toHaveProperty('revision')
+    expect(body.payload.title).toBe('t')
+    // 确定性 idempotencyKey(防 retry dup→409)
+    expect(new Headers((calls[0].init.headers as Record<string, string>) ?? {}).get('idempotency-key')).toBe('create-node:c1:n1')
+    // edge/anchor 同型
+    await adapter.upsertEdge('c1', { id: 'e1' } as never)
+    await adapter.upsertAnchor('c1', { id: 'a1' } as never)
+    expect(calls[1].path).toBe('/api/canvas/c1/edges/e1')
+    expect(calls[2].path).toBe('/api/canvas/c1/anchors/a1')
+  })
+
+  it('upsertNode 带 base → edit:仍 notWiredG1c(Block 7 pending:needs signed base from bundle)', async () => {
     const stub = makeStubBff()
     const adapter = makeAdapter(stub)
-    const node = { id: 'n1', type: 'image', title: 't' } as unknown as NodeRecord
-    await expect(adapter.upsertNode('c1', node)).rejects.toThrow(/G1-c/)
-    await expect(adapter.upsertEdge('c1', {} as never)).rejects.toThrow(/G1-c/)
-    await expect(adapter.upsertAnchor('c1', {} as never)).rejects.toThrow(/G1-c/)
+    const node = { id: 'n1', type: 'image' } as unknown as NodeRecord
+    await expect(adapter.upsertNode('c1', node, 5)).rejects.toThrow(/G1-c/)
+    await expect(adapter.upsertEdge('c1', { id: 'e1' } as never, 5)).rejects.toThrow(/G1-c/)
+    await expect(adapter.upsertAnchor('c1', { id: 'a1' } as never, 5)).rejects.toThrow(/G1-c/)
+  })
+
+  it('deleteNode/Edge/Anchor:仍 notWiredG1c(Block 7 pending:signed base + authoritative load)', async () => {
+    const stub = makeStubBff()
+    const adapter = makeAdapter(stub)
     await expect(adapter.deleteNode('c1', 'n1')).rejects.toThrow(/G1-c/)
     await expect(adapter.deleteEdge('c1', 'e1')).rejects.toThrow(/G1-c/)
     await expect(adapter.deleteAnchor('c1', 'a1')).rejects.toThrow(/G1-c/)
-    await expect(adapter.reorderChildren('c1', 'node', ['n1'], 0)).rejects.toThrow(/G1-c/)
   })
+
+  it('reorderChildren:wired(POST /:id/reorder,If-Match=bare contentVersion;响应 {reordered,contentVersion,base})', async () => {
+    const calls: { path: string; init: RequestInit }[] = []
+    const stubFetch = async (input: string, init?: RequestInit) => {
+      calls.push({ path: input, init: init ?? {} })
+      return json({ reordered: 2, contentVersion: 2, base: 'stub-order-base' }, 200)
+    }
+    const adapter = createFetchServerPersistAdapter({ fetch: stubFetch, baseUrl: '', getAuthHeaders: authHeaders(KEY_A) })
+    const res = await adapter.reorderChildren('c1', 'node', ['n1', 'n2'], 1)
+    expect(res).toEqual({ reordered: 2, contentVersion: 2, base: 'stub-order-base' })
+    expect(calls[0].path).toBe('/api/canvas/c1/reorder')
+    expect(calls[0].init.method).toBe('POST')
+    expect(new Headers((calls[0].init.headers as Record<string, string>) ?? {}).get('if-match')).toBe('1') // bare contentVersion
+    const body = JSON.parse((calls[0].init.body as string) ?? '{}') as { type: string; orderedIds: string[] }
+    expect(body.type).toBe('node')
+    expect(body.orderedIds).toEqual(['n1', 'n2'])
+  })
+
   it('appendChatMessage 已 wired(DP-6R P1-1):POST /api/canvas/:id/chat(stub 无 chat route → 404 HttpError,非 DP-6R seam reject)', async () => {
     const stub = makeStubBff()
     const adapter = makeAdapter(stub)
