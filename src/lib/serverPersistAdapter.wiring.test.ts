@@ -12,7 +12,7 @@
 // 默认 mode=local 零变化:本测试只测 wired adapter(显式构造,不依赖 persistMode);unwired 全 reject
 // 由 contract test 钉死(本测试末尾再钉一次回归保护)。
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, afterEach } from 'vitest'
 import {
   isUserStateKeyNamespaceAllowed,
   scanForSensitiveFields,
@@ -20,10 +20,12 @@ import {
   type CanvasMeta,
   type CreateAssetResponse,
   type GetCanvasResponse,
+  type NodePayload,
   type Project,
   type UserStateEntry,
 } from '../../shared/persist-contract.ts'
 import { createFetchServerPersistAdapter, HttpError, unwiredServerPersistAdapter } from './serverPersistAdapter'
+import { storeCanvasCursor, __resetCanvasCursorStore } from './snapshotCursorStore'
 import type { NodeRecord } from '../kernel/records'
 
 const KEY_A = 'mivo_aaa_user_a'
@@ -272,7 +274,20 @@ describe('G1-a canvas-meta hydrate(fetchCanvas / listCanvas 读路径)', () => {
   })
 })
 
-describe('A2-S3 画布域写:create/reorder 已 wired(lead 方案 A);delete 待 Block 7(G1-c seam)', () => {
+describe('A2-S3 画布域写:create/reorder/edit/delete 全 7 写口真发(lead 方案 A)', () => {
+  afterEach(() => __resetCanvasCursorStore())
+
+  /** 预填 bundle holder(模拟 hydrate 已签发 per-record base;edit/delete 从此取 If-Match base)。 */
+  const seedBundle = (canvasId: string, recordId: string, base: string): void => {
+    const resp: GetCanvasResponse = {
+      id: canvasId, projectId: 'p1', title: 'c', createdAt: 't0', updatedAt: 't1',
+      metaRevision: 0, contentVersion: 1, sinceSeq: 5,
+      nodes: [{ id: recordId, revision: 1, orderKey: 0, payload: {} as NodePayload, base }],
+      edges: [], anchors: [],
+    }
+    storeCanvasCursor(resp)
+  }
+
   it('upsertNode/Edge/Anchor 无 base → POST create:wired(201 CanvasChildUpsertResponse;wire shape 钉死)', async () => {
     const stub = makeStubBff()
     const calls: { path: string; init: RequestInit }[] = []
@@ -305,21 +320,66 @@ describe('A2-S3 画布域写:create/reorder 已 wired(lead 方案 A);delete 待 
     expect(calls[2].path).toBe('/api/canvas/c1/anchors/a1')
   })
 
-  it('upsertNode 带 base → edit:仍 notWiredG1c(Block 7 pending:needs signed base from bundle)', async () => {
-    const stub = makeStubBff()
-    const adapter = makeAdapter(stub)
-    const node = { id: 'n1', type: 'image' } as unknown as NodeRecord
-    await expect(adapter.upsertNode('c1', node, 5)).rejects.toThrow(/G1-c/)
-    await expect(adapter.upsertEdge('c1', { id: 'e1' } as never, 5)).rejects.toThrow(/G1-c/)
-    await expect(adapter.upsertAnchor('c1', { id: 'a1' } as never, 5)).rejects.toThrow(/G1-c/)
+  it('upsertNode 带 base → edit:leaf-decompose payload → PATCH DomainOp[] + If-Match=bundle base', async () => {
+    const calls: { path: string; init: RequestInit }[] = []
+    const spyFetch = async (input: string, init?: RequestInit) => {
+      calls.push({ path: input, init: init ?? {} })
+      return json({ id: 'n1', revision: 2, seq: 6, base: 'new-base' }, 200)
+    }
+    const adapter = createFetchServerPersistAdapter({ fetch: spyFetch, baseUrl: '', getAuthHeaders: authHeaders(KEY_A) })
+    seedBundle('c1', 'n1', 'bundle-base-n1') // 预填 bundle(hydrate 签发 base)
+    const node = { id: 'n1', type: 'image', title: 'edited', transform: { x: 2, y: 3 } } as unknown as NodeRecord
+    const res = await adapter.upsertNode('c1', node, 1) // baseRevision defined → edit
+    expect(res.revision).toBe(2)
+    expect(calls[0].path).toBe('/api/canvas/c1/nodes/n1')
+    expect(calls[0].init.method).toBe('PATCH')
+    expect(new Headers((calls[0].init.headers as Record<string, string>) ?? {}).get('if-match')).toBe('bundle-base-n1')
+    // body = DomainOp[](leaf-decompose:set 原子叶子 + array whole-lww replace;无 id/revision;无 unset)
+    const ops = JSON.parse((calls[0].init.body as string) ?? '[]') as Array<{ kind: string; fieldPath: string[]; value?: unknown }>
+    expect(ops.map((o) => o.kind).every((k) => k === 'set' || k === 'array')).toBe(true)
+    const paths = ops.map((o) => o.fieldPath.join('.'))
+    expect(paths).toContain('title')
+    expect(paths).toContain('transform.x')
+    expect(paths).toContain('transform.y') // 嵌套对象递归到叶子
+    expect(paths).not.toContain('id')
+    expect(paths).not.toContain('revision')
   })
 
-  it('deleteNode/Edge/Anchor:仍 notWiredG1c(Block 7 pending:signed base + authoritative load)', async () => {
+  it('edit 无 bundle base → notWiredG1c(fail-visible;hydrate 先填 bundle;禁借用别的 record base 串用)', async () => {
     const stub = makeStubBff()
     const adapter = makeAdapter(stub)
-    await expect(adapter.deleteNode('c1', 'n1')).rejects.toThrow(/G1-c/)
-    await expect(adapter.deleteEdge('c1', 'e1')).rejects.toThrow(/G1-c/)
-    await expect(adapter.deleteAnchor('c1', 'a1')).rejects.toThrow(/G1-c/)
+    await expect(adapter.upsertNode('c1', { id: 'n1', type: 'image' } as unknown as NodeRecord, 1)).rejects.toThrow(/G1-c/)
+  })
+
+  it('deleteNode/Edge/Anchor:DELETE + If-Match=bundle base;404→idempotent void;无 base→notWiredG1c', async () => {
+    const calls: { path: string; init: RequestInit }[] = []
+    const spyFetch = async (input: string, init?: RequestInit) => {
+      calls.push({ path: input, init: init ?? {} })
+      return new Response(null, { status: 204 })
+    }
+    const adapter = createFetchServerPersistAdapter({ fetch: spyFetch, baseUrl: '', getAuthHeaders: authHeaders(KEY_A) })
+    seedBundle('c1', 'n1', 'bundle-base-n1')
+    await adapter.deleteNode('c1', 'n1')
+    expect(calls[0].path).toBe('/api/canvas/c1/nodes/n1')
+    expect(calls[0].init.method).toBe('DELETE')
+    expect(new Headers((calls[0].init.headers as Record<string, string>) ?? {}).get('if-match')).toBe('bundle-base-n1')
+    // 404 → idempotent void(不抛)
+    const spy404 = async () => new Response(null, { status: 404 })
+    const adapter404 = createFetchServerPersistAdapter({ fetch: spy404, baseUrl: '', getAuthHeaders: authHeaders(KEY_A) })
+    seedBundle('c1', 'n1', 'bundle-base-n1')
+    await expect(adapter404.deleteNode('c1', 'n1')).resolves.toBeUndefined()
+    // 无 bundle base → notWiredG1c(须 clean bundle store;先前 seedBundle 残留会致命中 base 走 DELETE)
+    __resetCanvasCursorStore()
+    const stub = makeStubBff()
+    const adapterNoBundle = makeAdapter(stub)
+    await expect(adapterNoBundle.deleteNode('c1', 'n1')).rejects.toThrow(/G1-c/)
+  })
+
+  it('deleteNode 409 → re-raise HttpError(delete race;不静默成功;caller owns conflict recovery)', async () => {
+    const spy409 = async () => json({ error: 'revision-conflict', id: 'n1', currentRevision: 2 }, 409)
+    const adapter = createFetchServerPersistAdapter({ fetch: spy409, baseUrl: '', getAuthHeaders: authHeaders(KEY_A) })
+    seedBundle('c1', 'n1', 'stale-base')
+    await expect(adapter.deleteNode('c1', 'n1')).rejects.toMatchObject({ name: 'HttpError', status: 409 })
   })
 
   it('reorderChildren:wired(POST /:id/reorder,If-Match=bare contentVersion;响应 {reordered,contentVersion,base})', async () => {

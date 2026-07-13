@@ -22,6 +22,8 @@ import type {
   CreateAssetResponse,
   CreateCanvasResponse,
   DetachAssetResult,
+  DomainOp,
+  FieldPath,
   GetCanvasResponse,
   ListCanvasResponse,
   ListChatMessagesResponse,
@@ -34,6 +36,8 @@ import type {
   UserStateEntry,
 } from '../../shared/persist-contract.ts'
 import type { AnchorRecord, EdgeRecord, NodeRecord } from '../kernel/records'
+import { getCanvasCursor } from './snapshotCursorStore'
+import { unwrapBundle } from './snapshotCursorBundle'
 // G1-a:wire 期需要的 runtime 常量(纯数据,无副作用)。IF_MATCH/IDEMPOTENCY_KEY 用于构造请求头;
 // 不改契约语义,只按 shared 既有常量拼 wire shape(防字符串漂移,与 server/lib/persistHttp 同源)。
 import { IF_MATCH_HEADER, IDEMPOTENCY_KEY_HEADER } from '../../shared/persist-contract.ts'
@@ -267,7 +271,8 @@ export const requestJson = async <T>(args: {
   method: string
   path: string
   body?: unknown
-  ifMatch?: Revision
+  /** If-Match header value:bare revision number(parseIfMatch 路径,reorder/PUT)OR opaque signed BaseCursor string(A2-S3 PATCH/DELETE 路径,decodeBase 验签)。 */
+  ifMatch?: number | string
   idempotencyKey?: string
   signal?: AbortSignal
 }): Promise<T> => {
@@ -311,6 +316,33 @@ const stripIdRev = <T extends { id?: unknown; revision?: unknown }>(r: T): Recor
 }
 
 /**
+ * A2-S3 item 2 edit 翻译:全量 payload → DomainOp[](leaf-decompose;§10.1 / task「FieldIntent→set/unset 翻译」)。
+ * - 原子叶子(null/string/number/boolean)→ `set` 叶子 path(validator 接受 atomic value)。
+ * - 数组 → `array whole-lww replace`(markupPoints 类无 stable-id 全量替换;by-id 数组 fills/strokes 的
+ *   per-element 编辑 A2 deferred —— 整数组 LWW replace 在**单用户**下安全(无并发 sibling),collab 下数组
+ *   clobber 属 by-id deferred 已知限制,Phase 4 CanvasSyncPort edit-node 带 FieldIntents 修复)。
+ * - 嵌套对象 → 递归到叶子。
+ * - undefined 字段 → skip(不 set;**不 unset** —— unset 需 shadow diff 知"已移除",无 shadow 则只 set
+ *   现有字段,语义从旧 upsert=replace 变为 patch;A2-S3 接受,Phase 4 field-level 修复)。
+ * 整 record 经此 → field-level DomainOp[] → PATCH(非 legacy drain;走新契约,不经 gated drain 通道)。
+ */
+const payloadToDomainOps = (payload: Record<string, unknown>, prefix: readonly (string | number)[] = []): DomainOp[] => {
+  const ops: DomainOp[] = []
+  for (const [k, v] of Object.entries(payload)) {
+    if (v === undefined) continue
+    const path = [...prefix, k] as unknown as FieldPath
+    if (v === null || typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
+      ops.push({ kind: 'set', fieldPath: path, value: v })
+    } else if (Array.isArray(v)) {
+      ops.push({ kind: 'array', fieldPath: path, class: 'whole-lww', intent: 'replace', value: v as unknown[] })
+    } else if (typeof v === 'object') {
+      ops.push(...payloadToDomainOps(v as Record<string, unknown>, path))
+    }
+  }
+  return ops
+}
+
+/**
  * 真 fetch ServerPersistAdapter(G1-a 非画布域接线)。工厂式:测试注入 fetch=getAppRequest +
  * getAuthHeaders=()=>({x-mivo-api-key:KEY_A}) 驱动 buildPersistApp 的真实 Hono route;生产由
  * serverPersistAdapterSelector 提供(默认全局 fetch + '' baseUrl + lazy authHeaders)。
@@ -323,6 +355,43 @@ export const createFetchServerPersistAdapter = (opts: FetchAdapterOptions): Serv
   const doFetch = opts.fetch ?? defaultFetch
   const baseUrl = opts.baseUrl ?? ''
   const getAuthHeaders = opts.getAuthHeaders
+
+  // A2-S3 Block 7:canvas-domain edit/delete helpers(用 bundle holder 取 signed base 作 If-Match)。
+  // bundle holder 由 hydrate(item 4 fetchCanvas)填充 per-record base;edit/delete 从此抽对应 record 的 base。
+  const childSeg = (type: 'node' | 'edge' | 'anchor'): string => (type === 'node' ? 'nodes' : type === 'edge' ? 'edges' : 'anchors')
+  const childPath = (canvasId: string, type: 'node' | 'edge' | 'anchor', recordId: string): string =>
+    `/api/canvas/${encodeURIComponent(canvasId)}/${childSeg(type)}/${encodeURIComponent(recordId)}`
+  // edit:leaf-decompose payload → DomainOp[] → PATCH + If-Match=bundle base。
+  const editChild = async (
+    canvasId: string,
+    recordId: string,
+    type: 'node' | 'edge' | 'anchor',
+    payload: Record<string, unknown>,
+  ): Promise<CanvasChildUpsertResponse> => {
+    const ops = payloadToDomainOps(payload)
+    if (ops.length === 0) return notWiredG1c(`${type} edit (empty payload after leaf-decompose;nothing to set)`)
+    const base = unwrapBundle(getCanvasCursor(canvasId))?.records[recordId]
+    if (!base) return notWiredG1c(`${type} edit (no signed base in bundle for ${recordId}; hydrate/fetchCanvas first to populate bundle cursor)`)
+    return requestJson<CanvasChildUpsertResponse>({
+      fetch: doFetch, baseUrl, getAuthHeaders,
+      method: 'PATCH',
+      path: childPath(canvasId, type, recordId),
+      body: ops,
+      ifMatch: base,
+    })
+  }
+  // delete:If-Match=bundle base;404→idempotent void;409/428/400→re-raise(port R2-P1-3:authoritative load
+  //   由 caller 先 hydrate 填 bundle;adapter 不自动 fetch 以免与 caller rebase 意图冲突)。
+  const deleteChild = async (canvasId: string, recordId: string, type: 'node' | 'edge' | 'anchor'): Promise<void> => {
+    const base = unwrapBundle(getCanvasCursor(canvasId))?.records[recordId]
+    if (!base) return notWiredG1c(`${type} delete (no signed base in bundle for ${recordId}; hydrate/fetchCanvas first)`)
+    try {
+      await requestJson<void>({ fetch: doFetch, baseUrl, getAuthHeaders, method: 'DELETE', path: childPath(canvasId, type, recordId), ifMatch: base })
+    } catch (error) {
+      if (error instanceof HttpError && error.status === 404) return // 幂等(已删 / 不存在)
+      throw error // 409 delete-race / 428 / 400 → re-raise for caller
+    }
+  }
 
   return {
     // ── project(document scope)──
@@ -457,14 +526,15 @@ export const createFetchServerPersistAdapter = (opts: FetchAdapterOptions): Serv
       }
     },
 
-    // ── canvas-domain 写(G1-c 接线;lead 授权方案 A。A2-S3 create/reorder 先行;edit/delete 待 Block 7)──
+    // ── canvas-domain 写(G1-c 接线;lead 授权方案 A。A2-S3 全 7 写口真发)──
     // create:baseRevision undefined → POST :nodeId/:edgeId/:anchorId,CreateBody{clientId=record.id,type,payload=
     //   stripIdRev(record)};确定性 idempotencyKey(create-<type>:<canvasId>:<recordId>)防 retry dup→409。
     //   返 CanvasChildUpsertResponse(seq+base 必填,lead ②)。
-    // edit(baseRevision defined):需 per-record signed BaseCursor(从 bundle holder 抽,Block 7)→ notWiredG1c。
-    // delete:需 signed base + authoritative load(port R2-P1-3,Block 7)→ notWiredG1c。
+    // edit(baseRevision defined):leaf-decompose payload → DomainOp[] → PATCH + If-Match=bundle base。
+    //   全量 payload 无 field-level diff;leaf-decompose 把整 record 翻成叶子 set + array whole-lww replace
+    //   (单用户安全;collab 数组 clobber 属 by-id deferred;Phase 4 CanvasSyncPort edit-node FieldIntents 修复)。
     upsertNode: (canvasId, node, baseRevision) => {
-      if (baseRevision !== undefined) return notWiredG1c('upsertNode edit (A2-S3 Block 7 pending: needs signed base from bundle)')
+      if (baseRevision !== undefined) return editChild(canvasId, node.id, 'node', stripIdRev(node))
       return requestJson<CanvasChildUpsertResponse>({
         fetch: doFetch, baseUrl, getAuthHeaders,
         method: 'POST',
@@ -474,7 +544,7 @@ export const createFetchServerPersistAdapter = (opts: FetchAdapterOptions): Serv
       })
     },
     upsertEdge: (canvasId, edge, baseRevision) => {
-      if (baseRevision !== undefined) return notWiredG1c('upsertEdge edit (A2-S3 Block 7 pending)')
+      if (baseRevision !== undefined) return editChild(canvasId, edge.id, 'edge', stripIdRev(edge))
       return requestJson<CanvasChildUpsertResponse>({
         fetch: doFetch, baseUrl, getAuthHeaders,
         method: 'POST',
@@ -484,7 +554,7 @@ export const createFetchServerPersistAdapter = (opts: FetchAdapterOptions): Serv
       })
     },
     upsertAnchor: (canvasId, anchor, baseRevision) => {
-      if (baseRevision !== undefined) return notWiredG1c('upsertAnchor edit (A2-S3 Block 7 pending)')
+      if (baseRevision !== undefined) return editChild(canvasId, anchor.id, 'anchor', stripIdRev(anchor))
       return requestJson<CanvasChildUpsertResponse>({
         fetch: doFetch, baseUrl, getAuthHeaders,
         method: 'POST',
@@ -493,10 +563,10 @@ export const createFetchServerPersistAdapter = (opts: FetchAdapterOptions): Serv
         idempotencyKey: `create-anchor:${canvasId}:${anchor.id}`,
       })
     },
-    // delete → Block 7(signed base from bundle + authoritative load semantics,port R2-P1-3)
-    deleteNode: () => notWiredG1c('deleteNode (A2-S3 Block 7 pending: signed base + authoritative load)'),
-    deleteEdge: () => notWiredG1c('deleteEdge (A2-S3 Block 7 pending)'),
-    deleteAnchor: () => notWiredG1c('deleteAnchor (A2-S3 Block 7 pending)'),
+    // delete:If-Match=bundle base;404→idempotent void;409/428/400→re-raise(port R2-P1-3:caller 先 hydrate 填 bundle)。
+    deleteNode: (canvasId, nodeId) => deleteChild(canvasId, nodeId, 'node'),
+    deleteEdge: (canvasId, edgeId) => deleteChild(canvasId, edgeId, 'edge'),
+    deleteAnchor: (canvasId, anchorId) => deleteChild(canvasId, anchorId, 'anchor'),
     // reorder:POST /:id/reorder,body{type, orderedIds},If-Match = bare contentVersion(parseIfMatch 路径,非签名)。
     //   响应 {reordered, contentVersion, base}(base=encodeOrderBase,server A2-S3 签发;client 增量更新 bundle.orderCv)。
     reorderChildren: (canvasId, type, orderedIds, baseContentVersion) =>
