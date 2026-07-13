@@ -81,12 +81,37 @@ interface ChatOrderRevisionsTable {
   revision: Generated<number>
   updated_at: Generated<Date>
 }
+// ── A2-S2(§14.1/§10.5/§10.7;009 migration)──
+/** per-record per-field clock(fieldKeyOf 完整 path 粒度;同-field stale 判定)+ writer(overwritten byActor)。 */
+interface FieldClocksTable {
+  record_key: string
+  field_key: string
+  clock: Generated<number>
+  writer: string | null
+  updated_at: Generated<Date>
+}
+/** per-canvas 单调事件序号 seq(§10.5;?since=seq 补拉)。 */
+interface CanvasSeqTable {
+  canvas_id: string
+  seq: Generated<number>
+  updated_at: Generated<Date>
+}
+/** child tombstone(§10.7 幂等已删返 seq vs 从未存在 404;物理删后留占位)。 */
+interface ChildTombstonesTable {
+  record_key: string
+  canvas_id: string
+  seq_at_delete: number
+  deleted_at: Generated<Date>
+}
 interface Database {
   persist_records: PersistRecordsTable
   projects: GlobalIndexTable
   canvases: GlobalIndexTable
   idempotency_index: IdempotencyTable
   chat_order_revisions: ChatOrderRevisionsTable
+  field_clocks: FieldClocksTable
+  canvas_seq: CanvasSeqTable
+  child_tombstones: ChildTombstonesTable
 }
 
 const clone = <T>(value: T): T => structuredClone(value)
