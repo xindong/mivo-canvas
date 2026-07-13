@@ -195,6 +195,41 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
     expect((stale.body as { revision: number }).revision).toBe(3) // 又 bump
   })
 
+  it('A2-S3 round-trip:GET 签发的 per-record base 可直接用于 PATCH(hydrate 缺口补全铁证;lead 补充要求)', async () => {
+    await seedProject()
+    await seedCanvas()
+    // create n1 → rev1(POST 签发 base1)
+    await createChildFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
+    // GET /api/canvas/c1 → 每 record 带 base + canvas 带 bundle/sinceSeq(§14.7/§10.2「hydrate snapshot 签发 base」)
+    const got = await req(app, '/api/canvas/c1', { method: 'GET', headers: hdr(KEY_A) })
+    expect(got.status).toBe(200)
+    const gb = got.body as {
+      nodes: { id: string; revision: number; base?: string }[]
+      bundle?: string
+      sinceSeq?: number
+      contentVersion: number
+    }
+    const n1 = gb.nodes.find((n) => n.id === 'n1')!
+    expect(n1.base).toBeTruthy() // ★ hydrate 签发了 base(A2-S2 漏实现的缺口已补)
+    expect(gb.bundle).toBeTruthy() // canvas 级 bundle cursor
+    expect(typeof gb.sinceSeq).toBe('number')
+    // ★ round-trip 铁证:GET 签发的 base 直接作 PATCH 的 If-Match → 200(edit 永不 409,§14.1)
+    //   (此前死路:GET 无 base → client 拿不到签名 base → PATCH 必 428/400;现 hydrate 即得 base)
+    const patch = await patchDomainOps(app, 'c1', 'node', 'n1', [{ kind: 'set', fieldPath: ['title'], value: 'from-hydrate-base' }], n1.base!)
+    expect(patch.status).toBe(200)
+    const pb = patch.body as { id: string; revision: number; seq: number; base: string }
+    expect(pb.revision).toBe(2) // bumped rev1 → rev2
+    expect(pb.base).toBeTruthy() // accepted 响应签发新 base(供下次 PATCH)
+    // DELETE round-trip:再 GET 取 fresh base → DELETE If-Match=base → 200/204
+    const got2 = await req(app, '/api/canvas/c1', { method: 'GET', headers: hdr(KEY_A) })
+    const n1b = (got2.body as { nodes: { id: string; base?: string }[] }).nodes.find((n) => n.id === 'n1')!
+    const del = await req(app, '/api/canvas/c1/nodes/n1', {
+      method: 'DELETE',
+      headers: { ...hdr(KEY_A), 'if-match': n1b.base! },
+    })
+    expect([200, 204]).toContain(del.status)
+  })
+
   it('返修 #4(A2-S2):If-Match 严格优先;DomainOp body 零 privileged(无 revision 字段,§10.1)', async () => {
     await seedProject()
     await seedCanvas()

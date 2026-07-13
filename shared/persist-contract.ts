@@ -306,6 +306,13 @@ export type CreateCanvasRequest = {
  *   (chat 非共享画布内容);chat reorder 的乐观锁走独立的 per-actor×canvas `orderRevision`
  *   (见 ListChatMessagesResponse),与共享 contentVersion 解耦——node 写不使 chat reorder 误 409。
  * - `sourceTemplateId`/`createdAt`/`move`(返修 #8 API 面补全,对齐 documentMeta)。
+ *
+ * A2-S3(§14.7/§10.2「hydrate snapshot 签发 base + bundle + since」):
+ * - `bundle`:opaque canvas 级 SnapshotCursor bundle 字符串(server encodeBundle 签发,内含 recordId→
+ *   BaseCursor 映射 + order cursor + since cursor;client 不读内部,作 events/poll catch-up 的 cursor
+ *   透传)。optional(Plan C 渐进)。
+ * - `sinceSeq`:canvas 事件 seq(数字,供 client 构建 bundle 的 since 项 + GET /events/poll?since=<seq>
+ *   增量补拉;非连续,取 server 权威值)。optional(Plan C 渐进)。
  */
 export type CanvasMeta = {
   id: string
@@ -316,6 +323,10 @@ export type CanvasMeta = {
   updatedAt: string
   metaRevision: Revision
   contentVersion: Revision
+  /** A2-S3:opaque canvas 级 bundle cursor(server encodeBundle 签发;client 透传 events/poll)。 */
+  bundle?: string
+  /** A2-S3:canvas 事件 seq(client 构建 since cursor + events/poll?since=<seq> 补拉)。 */
+  sinceSeq?: number
 }
 
 /**
@@ -323,8 +334,13 @@ export type CanvasMeta = {
  * DP-5 + 返修 #6)+ 不透明 payload(NodeRecord/EdgeRecord/AnchorRecord,客户端 narrow)。
  * per-record revision 让客户端下次 PATCH 带正确 If-Match(base = 该 envelope revision)。
  * payload 内 NodeRecord.revision 是客户端镜像,客户端读时 sync = envelope revision,不双写(返修 #5)。
+ *
+ * A2-S3(§14.7/§10.2「hydrate snapshot 签发 base」):每 record 附 `base` = opaque BaseCursor
+ * 字符串(server encodeBase 签发,绑 canvasId+recordId+revision+per-field clock snapshot)。client 不读
+ * 内部,回传 PATCH/DELETE 的 If-Match。pre-existing record hydrate 后即有 base → 首次 edit/delete 不再
+ * 缺 If-Match(428)/不再需 refetch-mint。optional(Plan C 渐进;旧 client 不读此字段不 break)。
  */
-export type RecordEntry = { id: string; revision: Revision; orderKey: number; payload: unknown }
+export type RecordEntry = { id: string; revision: Revision; orderKey: number; payload: unknown; base?: string }
 
 export type GetCanvasResponse = CanvasMeta & {
   nodes: RecordEntry[]
