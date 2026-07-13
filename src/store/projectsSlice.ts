@@ -79,7 +79,7 @@ export const createProjectsSlice: SliceCreator = (set, get) => ({
     const project = get().projects.find((p) => p.id === projectId)
     if (!project) {
       warnCanvas(`Delete project skipped: missing project ${projectId}`)
-      return
+      return { status: 'skipped', reason: 'missing' }
     }
 
     // A2 前置 b / soft-delete-semantics.md §6:对齐服务端整树软删语义。
@@ -156,7 +156,7 @@ export const createProjectsSlice: SliceCreator = (set, get) => ({
       warnCanvas(
         `Delete project "${project.name}" blocked: would leave zero canvases (≥1 canvas invariant; soft-delete-semantics.md:128). Move canvases to another project before deleting.`,
       )
-      return
+      return { status: 'blocked', reason: 'no-survivor' }
     }
 
     logCanvas(
@@ -175,6 +175,7 @@ export const createProjectsSlice: SliceCreator = (set, get) => ({
         enqueuePersistWrite({ kind: 'deleteCanvas', canvasId })
       }
     }
+    return { status: 'deleted' }
   },
   restoreProject: (projectId, name) => {
     const existing = get().projects.find((p) => p.id === projectId)

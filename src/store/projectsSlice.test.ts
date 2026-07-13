@@ -142,8 +142,10 @@ describe('projectsSlice: renameProject', () => {
 describe('projectsSlice: deleteProject', () => {
   it('removes the project entity', () => {
     const id = useCanvasStore.getState().createProject('Gone')
-    useCanvasStore.getState().deleteProject(id)
+    const result = useCanvasStore.getState().deleteProject(id)
     expect(useCanvasStore.getState().projects.find((p) => p.id === id)).toBeUndefined()
+    // e2e FAIL 修复:删除成功返回 status:'deleted'(UI 据此弹 success toast)
+    expect(result.status).toBe('deleted')
   })
 
   it('cascades: canvases whose projectId matches fall back to standalone (projectId undefined)', () => {
@@ -191,8 +193,10 @@ describe('projectsSlice: deleteProject', () => {
 
   it('is a no-op (warn) when the project id does not exist', () => {
     const before = useCanvasStore.getState().projects
-    useCanvasStore.getState().deleteProject('project-does-not-exist')
+    const result = useCanvasStore.getState().deleteProject('project-does-not-exist')
     expect(useCanvasStore.getState().projects).toBe(before)
+    // e2e FAIL 修复:project 不存在返回 status:'skipped'(供 UI 静默处理,不误弹 success toast)
+    expect(result).toEqual({ status: 'skipped', reason: 'missing' })
   })
 })
 

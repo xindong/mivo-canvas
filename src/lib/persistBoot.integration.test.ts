@@ -870,7 +870,7 @@ describe('P1-2 — deleteProject server 分支 active-document 不变量', () =>
         [c2]: { title: 'c2', projectId: pidB, createdAt: 't', updatedAt: 't', nodes: [{ id: 'n2' }] as never, edges: [], tasks: [] } as never,
       } as never,
     })
-    useCanvasStore.getState().deleteProject(pidA)
+    const deleteResult = useCanvasStore.getState().deleteProject(pidA)
     await flush()
     await drainPersistQueue()
     // P1-2:c1(active)被删 → sceneId 切首个存活 c2 + 顶层 nodes 与 c2 一致(不悬空)
@@ -882,6 +882,8 @@ describe('P1-2 — deleteProject server 分支 active-document 不变量', () =>
     expect(useCanvasStore.getState().nodes[0]?.id).toBe('n2')
     expect(useCanvasStore.getState().activeTool).toBe('select')
     expect(useCanvasStore.getState().historyPast).toEqual([])
+    // e2e FAIL 修复:有 survivor 的删除返回 status:'deleted'(UI 据此弹 success toast)
+    expect(deleteResult.status).toBe('deleted')
     // enqueue deleteProject(PA) + deleteCanvas(c1)(c2 属 PB 不被删,无 deleteCanvas c2)
     expect(calls.some((c) => c.method === 'DELETE' && c.path === `/api/projects/${encodeURIComponent(pidA)}`)).toBe(true)
     expect(calls.some((c) => c.method === 'DELETE' && c.path === `/api/canvas/${encodeURIComponent(c1)}`)).toBe(true)
@@ -898,7 +900,7 @@ describe('P1-2 — deleteProject server 分支 active-document 不变量', () =>
       sceneId: c1,
       canvases: { [c1]: { title: 'c1', projectId: pid, createdAt: 't', updatedAt: 't', nodes: [], edges: [], tasks: [] } as never } as never,
     })
-    useCanvasStore.getState().deleteProject(pid)
+    const deleteResult = useCanvasStore.getState().deleteProject(pid)
     await flush()
     await drainPersistQueue()
     // P1-2:无 survivor → 阻止删除(project + canvas 仍在,sceneId 不变,无 DELETE 入队)
@@ -907,6 +909,9 @@ describe('P1-2 — deleteProject server 分支 active-document 不变量', () =>
     expect(useCanvasStore.getState().sceneId).toBe(c1)
     expect(calls.some((c) => c.method === 'DELETE' && c.path === `/api/projects/${encodeURIComponent(pid)}`)).toBe(false)
     expect(calls.some((c) => c.method === 'DELETE' && c.path === `/api/canvas/${encodeURIComponent(c1)}`)).toBe(false)
+    // e2e FAIL 修复:零-survivor 阻止删除须返回 status:'blocked' + reason:'no-survivor'
+    //   (UI 据此弹 warn toast"至少需保留一个画板",不误称"已删除"导致项目还在却显示成功)
+    expect(deleteResult).toEqual({ status: 'blocked', reason: 'no-survivor' })
   })
 
   // sol 非阻断建议(顺手做):project/canvas 双删除次序 404 幂等——deleteProject 软删整树后,后续

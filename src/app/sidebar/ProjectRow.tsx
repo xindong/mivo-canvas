@@ -68,8 +68,20 @@ export function ProjectRow(props: {
   }
 
   const confirmRemove = () => {
-    deleteProject(project.id)
+    const result = deleteProject(project.id)
     setConfirmOpen(false)
+    // blocked:零-survivor 不变量阻止删除(server 模式删完全场零 canvas)——提示用户先移画板,
+    //   不弹成功 toast 误导(否则用户看到"已删除"但项目还在)。
+    if (result.status === 'blocked') {
+      toastFeedback.warn(
+        `无法删除项目"${project.name}":至少需保留一个画板,请先将画板移动到其他项目或删除`,
+      )
+      return
+    }
+    // skipped:project 不存在(UI 不可能触达——row 渲染即存在;debugLog 已 warn),静默不 toast 免噪声。
+    if (result.status === 'skipped') {
+      return
+    }
     toastFeedback.success(
       serverAligned
         ? `已删除项目"${project.name}",${canvasCount} 块画板已一并软删除(可恢复)`
