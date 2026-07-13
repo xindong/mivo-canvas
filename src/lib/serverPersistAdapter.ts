@@ -18,6 +18,7 @@
 
 import type {
   AttachAssetResult,
+  CanvasChildUpsertResponse,
   CreateAssetResponse,
   CreateCanvasResponse,
   DetachAssetResult,
@@ -63,10 +64,10 @@ export interface ServerPersistAdapter {
   updateCanvas(id: string, patch: { projectId: string; title?: string; sourceTemplateId?: string }, baseRevision?: Revision): Promise<CreateCanvasResponse>
   /** G1-a P1-2:DELETE /api/canvas/:id → 204(幂等);404 → 视为已删(void,幂等)。 */
   deleteCanvas(id: string): Promise<void>
-  /** 节点级 PATCH(FX-4);baseRevision = client 读到的 envelope revision(If-Match,返修 #4)。 */
-  upsertNode(canvasId: string, node: NodeRecord, baseRevision?: Revision): Promise<UpsertResponse>
-  upsertEdge(canvasId: string, edge: EdgeRecord, baseRevision?: Revision): Promise<UpsertResponse>
-  upsertAnchor(canvasId: string, anchor: AnchorRecord, baseRevision?: Revision): Promise<UpsertResponse>
+  /** 节点级 PATCH(FX-4);baseRevision = client 读到的 envelope revision(If-Match,返修 #4)。A2-S3:返 CanvasChildUpsertResponse(seq+base 必填,canvas child 域;lead ②)。 */
+  upsertNode(canvasId: string, node: NodeRecord, baseRevision?: Revision): Promise<CanvasChildUpsertResponse>
+  upsertEdge(canvasId: string, edge: EdgeRecord, baseRevision?: Revision): Promise<CanvasChildUpsertResponse>
+  upsertAnchor(canvasId: string, anchor: AnchorRecord, baseRevision?: Revision): Promise<CanvasChildUpsertResponse>
   /** 返修 #8:edge/anchor delete(硬删,对齐 #2)。 */
   deleteNode(canvasId: string, nodeId: string): Promise<void>
   deleteEdge(canvasId: string, edgeId: string): Promise<void>

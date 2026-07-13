@@ -39,6 +39,7 @@ import { validateDomainOps, validateCreateBody, validateLegacyReplaceRequest, Do
 import { legacyDrainGate } from '../lib/legacyDrainGate'
 import type {
   CanvasMeta,
+  CanvasChildUpsertResponse,
   ConflictBody,
   CreateCanvasRequest,
   GetCanvasResponse,
@@ -652,7 +653,7 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: 0, note: `overwritten field=${o.fieldKey} byActor=${o.byActor} historicalValue=${JSON.stringify(o.historicalValue)}` })
     }
     const base = encodeBase(canvasId, childId, result.record.revision, result.fieldClocks)
-    const res: UpsertResponse = { id: result.record.id, revision: result.record.revision, seq: result.seq, base }
+    const res: CanvasChildUpsertResponse = { id: result.record.id, revision: result.record.revision, seq: result.seq, base }
     logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0 })
     return c.json(res, 200)
   }
@@ -718,7 +719,7 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
     }
     // created:create 不伪造 base(§14.1);签发新 base(空 fieldClocks)。
     const base = encodeBase(canvasId, childId, result.record.revision, result.fieldClocks)
-    const res: UpsertResponse = { id: result.record.id, revision: result.record.revision, seq: result.seq, base }
+    const res: CanvasChildUpsertResponse = { id: result.record.id, revision: result.record.revision, seq: result.seq, base }
     logRequest({ method: c.req.method, path: c.req.path, requestId, status: 201, latencyMs: Date.now() - t0 })
     return c.json(res, 201)
   }
