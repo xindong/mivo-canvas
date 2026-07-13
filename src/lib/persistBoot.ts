@@ -21,12 +21,15 @@ import { getServerPersistAdapter } from './serverPersistAdapterSelector'
 import { createAdapterWriteExecutor } from './persistWriteExecutor'
 import { createWriteQueue, type WriteOp, type WriteQueue } from './writeRetryQueue'
 import { hydrateUserStateMap } from './serverPersistHydrate'
+import { storeCanvasCursor, __resetCanvasCursorStore } from './snapshotCursorStore'
+import { fromRecord, edgeFromRecord } from '../kernel/mapping'
+import type { NodeRecord, EdgeRecord } from '../kernel/records'
 import { debugLogger } from '../store/debugLogStore'
 import { toastFeedback } from '../store/toastStore'
 import { defaultFetch, type FetchAdapterOptions, type FetchLike, type GetAuthHeaders } from './serverPersistAdapter'
 import type { ChatMessage } from '../store/chatStore'
 import type { CanvasDocument } from '../types/mivoCanvas'
-import type { Revision, UserStateEntry } from '../../shared/persist-contract.ts'
+import type { Revision, UserStateEntry, RecordEntry } from '../../shared/persist-contract.ts'
 
 const SOURCE = 'Persist Boot'
 
@@ -96,6 +99,7 @@ export const __resetPersistBoot = (): void => {
   writeQueue = undefined
   orderRevisionByCanvas.clear()
   userStateMap.clear()
+  __resetCanvasCursorStore()
 }
 
 // ── server 模式 boot:hydrate 非画布域(从 BFF 恢复)──
@@ -188,6 +192,75 @@ export const backfillChatAfterDrain = async (
 }
 
 /**
+ * A2-S3 item 4:server 模式 hydrate 补画布正文拉取/应用(现在只 merge canvas meta → 补 content)。
+ * 按 G1-b 冻结 hydrate 语义(inventory §2.2:loadSnapshot → CanvasSnapshot + cursor):
+ *  - fetchCanvas(active)→ 构建 canvas 级 bundle cursor(recordId→base + orderCv + sinceSeq;§14.7 hydrate 签发)
+ *    存 snapshotCursorStore(Block 7 edit/delete 从此取 wire base 作 If-Match)。
+ *  - 应用 nodes/edges 到 store.canvases[sceneId]:R-7 union(server canonical by id 覆盖本地;local-only =
+ *    id 不在 server 集 = pending create 未 drain / demo → 保留 union,同 chat R-7)。tasks/selection 不动
+ *    (content hydrate 不碰衍生态)。anchors 的 base 入 bundle(供 Block 7),但 anchors 不在 CanvasDocument
+ *    (存别处),apply 跳过 anchors。
+ *  - kernel=new/legacy 两轨兼容:写 legacy store(canvases[sceneId]);kernel=new 读自己 DocKernel adapter
+ *    (src/kernel/adapters.ts,直读 backend),不经此 store → 默认 legacy 不破(只补 content,不改 meta 语义)。
+ * local 模式无 hydrate 概念,永不调此。失败降级 try/catch + warn(不阻断其余 hydrate)。
+ */
+const hydrateActiveCanvasContent = async (
+  sceneId: string,
+  adapter: ReturnType<typeof getServerPersistAdapter>,
+): Promise<void> => {
+  const { useCanvasStore } = await import('../store/canvasStore')
+  let resp
+  try {
+    resp = await adapter.fetchCanvas(sceneId)
+  } catch (error) {
+    debugLogger.warn(SOURCE, `fetchCanvas content hydrate failed for ${sceneId}: ${msg(error)} (content stays local)`)
+    return
+  }
+  if (!resp) return // canvas 不存在/无权(null,与 fetchCanvas 一致;不应用 content)
+  // 构建 bundle cursor(per-record base + orderCv + sinceSeq;§14.7;Block 7 用)。
+  storeCanvasCursor(resp)
+  // 应用 nodes/edges(R-7 union:server canonical by id + 保留 local-only)。
+  const serverNodes = resp.nodes
+    .filter((r): r is RecordEntry & { payload: object } => r.payload != null && typeof r.payload === 'object')
+    .map((r) => fromRecord({ ...r.payload, id: r.id, revision: r.revision } as NodeRecord))
+  const serverEdges = resp.edges
+    .filter((r): r is RecordEntry & { payload: object } => r.payload != null && typeof r.payload === 'object')
+    .map((r) => edgeFromRecord({ ...r.payload, id: r.id, revision: r.revision } as EdgeRecord))
+  const serverNodeIds = new Set(serverNodes.map((n) => n.id))
+  const serverEdgeIds = new Set(serverEdges.map((e) => e.id))
+  let localOnlyNodes = 0
+  let localOnlyEdges = 0
+  useCanvasStore.setState((s) => {
+    const existing = s.canvases[sceneId]
+    if (!existing) return {} // meta-stub 未建(step 2 应已建);若仍无,返空 set 不动
+    const localNodes = existing.nodes.filter((n) => {
+      if (serverNodeIds.has(n.id)) return false
+      localOnlyNodes++
+      return true
+    })
+    const localEdges = existing.edges.filter((e) => {
+      if (serverEdgeIds.has(e.id)) return false
+      localOnlyEdges++
+      return true
+    })
+    return {
+      canvases: {
+        ...s.canvases,
+        [sceneId]: {
+          ...existing,
+          nodes: [...serverNodes, ...localNodes],
+          edges: [...serverEdges, ...localEdges],
+        },
+      },
+    }
+  })
+  debugLogger.log(
+    SOURCE,
+    `server hydrate: active canvas ${sceneId} content applied (${serverNodes.length} nodes + ${serverEdges.length} edges from BFF; ${localOnlyNodes} local-only nodes + ${localOnlyEdges} local-only edges retained (R-7 union); bundle cursor built)`,
+  )
+}
+
+/**
  * server 模式冷启动 hydrate:project 全量(替换 store.projects)+ canvas meta 列表(可观测,
  * 全量 content hydrate 属 G1-c 本轮不做)+ user-state map(无 client KV store,application deferred)。
  * 失败降级:各步独立 try/catch + debugLogger,任一失败不阻断其余(绝不因部分 hydrate 失败挂死 app)。
@@ -262,6 +335,18 @@ export const hydrateFromServer = async (
     )
   } catch (error) {
     debugLogger.warn(SOURCE, `listCanvas hydrate failed: ${msg(error)}`)
+  }
+
+  // 2.5 A2-S3 item 4:active canvas 正文拉取 + bundle cursor 构建(content hydrate;现 meta 已 merge,补 content)。
+  //    fetchCanvas(active)→ 应用 nodes/edges(R-7 union)+ 构建 bundle cursor(Block 7 edit/delete 用)。仅 active canvas
+  //    (切 scene re-hydrate 属 G1-c 范畴);local 模式永不调。失败降级 warn 不阻断。
+  try {
+    const sceneId = useCanvasStore.getState().sceneId
+    if (sceneId) {
+      await hydrateActiveCanvasContent(sceneId, adapter)
+    }
+  } catch (error) {
+    debugLogger.warn(SOURCE, `active canvas content hydrate failed: ${msg(error)} (content stays local/meta-only)`)
   }
 
   // 3. user-state map → 落点 + 真实消费方(R3 F2-A:不再只存 module 级 accessor)。
