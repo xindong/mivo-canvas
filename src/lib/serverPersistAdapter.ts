@@ -306,7 +306,7 @@ const notWiredG1c = (method: string): Promise<never> =>
  * A2-S3:从 record 剥离 id+revision(transport payload = Omit<Record,'id'|'revision'>;id 来自 path,revision
  * 来自 envelope/If-Match,shared 契约 wire body 不携带)。create POST 的 CreateBody.payload 用此。
  */
-const stripIdRev = <T extends { id?: unknown; revision?: unknown }>(r: T): Record<string, unknown> => {
+export const stripIdRev = <T extends { id?: unknown; revision?: unknown }>(r: T): Record<string, unknown> => {
   const out: Record<string, unknown> = {}
   for (const [k, v] of Object.entries(r)) {
     if (k === 'id' || k === 'revision') continue

@@ -142,16 +142,22 @@ export const applyAccepted = (
   const records = { ...bundle.records }
   switch (change.kind) {
     case 'edit-node':
-    case 'delete-node':
       if (newBase !== undefined) records[change.nodeId] = newBase
       break
+    case 'delete-node':
+      delete records[change.nodeId]
+      break
     case 'edit-edge':
-    case 'delete-edge':
       if (newBase !== undefined) records[change.edgeId] = newBase
       break
+    case 'delete-edge':
+      delete records[change.edgeId]
+      break
     case 'edit-anchor':
-    case 'delete-anchor':
       if (newBase !== undefined) records[change.anchorId] = newBase
+      break
+    case 'delete-anchor':
+      delete records[change.anchorId]
       break
     case 'create-node':
       if (newBase !== undefined) records[change.node.id] = newBase

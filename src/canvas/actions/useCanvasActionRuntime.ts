@@ -3,6 +3,7 @@ import { useCanvasStore } from '../../store/canvasStore'
 import type { MivoCanvasNode } from '../../types/mivoCanvas'
 import type { CanvasActionRuntime } from './canvasActionTypes'
 import { createCanvasSelectionContext } from './canvasSelectionModel'
+import { wrapCanvasActionRuntimeWithSync } from './canvasSyncRuntime'
 
 type UseCanvasActionRuntimeOptions = {
   primaryNode?: MivoCanvasNode
@@ -87,7 +88,7 @@ export const useCanvasActionRuntime = ({
     [contextNodes, primaryNode],
   )
 
-  return {
+  return wrapCanvasActionRuntimeWithSync({
     context,
     clipboardCount: clipboardNodes.length,
     hiddenCount: nodes.filter((node) => node.hidden).length,
@@ -136,5 +137,5 @@ export const useCanvasActionRuntime = ({
     showAllHiddenNodes,
     deleteNode,
     deleteSelectedNodes,
-  }
+  })
 }
