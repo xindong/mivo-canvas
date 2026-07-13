@@ -35,10 +35,10 @@ describe('applyCanvasCommand — node creation dispatch', () => {
     expect(vi.mocked(rt.addTextNode)).toHaveBeenCalledWith({ x: 1, y: 2 }, 'hi')
     expect(id).toBe('text-id')
   })
-  it('add-text-node (no text) → addTextNode(position, undefined)', () => {
+  it('add-text-node (no text) → addTextNode(position)', () => {
     const rt = createMockRuntime()
     applyCanvasCommand({ kind: 'add-text-node', position: { x: 0, y: 0 } }, rt)
-    expect(vi.mocked(rt.addTextNode)).toHaveBeenCalledWith({ x: 0, y: 0 }, undefined)
+    expect(vi.mocked(rt.addTextNode).mock.calls[0]).toEqual([{ x: 0, y: 0 }])
   })
   it('add-frame-node → addFrameNode(position, size, title); returns new id', () => {
     const rt = createMockRuntime()
@@ -75,6 +75,16 @@ describe('applyCanvasCommand — node creation dispatch', () => {
       'cat',
     )
   })
+  it('add-frame-node (position only) → addFrameNode(position)', () => {
+    const rt = createMockRuntime()
+    applyCanvasCommand({ kind: 'add-frame-node', position: { x: 9, y: 9 } }, rt)
+    expect(vi.mocked(rt.addFrameNode).mock.calls[0]).toEqual([{ x: 9, y: 9 }])
+  })
+  it('add-ai-slot-node (position only) → addAiSlotNode(position)', () => {
+    const rt = createMockRuntime()
+    applyCanvasCommand({ kind: 'add-ai-slot-node', position: { x: 3, y: 4 } }, rt)
+    expect(vi.mocked(rt.addAiSlotNode).mock.calls[0]).toEqual([{ x: 3, y: 4 }])
+  })
   it('add-annotation-node → addAnnotationNode(sourceNodeId, position, instruction, options)', () => {
     const rt = createMockRuntime()
     applyCanvasCommand(
@@ -93,6 +103,11 @@ describe('applyCanvasCommand — node creation dispatch', () => {
       'rm bg',
       { operation: 'remove-background', title: 'Edit for image' },
     )
+  })
+  it('add-annotation-node (source only) → addAnnotationNode(sourceNodeId)', () => {
+    const rt = createMockRuntime()
+    applyCanvasCommand({ kind: 'add-annotation-node', sourceNodeId: 'img-1' }, rt)
+    expect(vi.mocked(rt.addAnnotationNode).mock.calls[0]).toEqual(['img-1'])
   })
   it('add-markup-node → addMarkupNode(kind, position, geometry, options)', () => {
     const rt = createMockRuntime()
@@ -163,10 +178,10 @@ describe('applyCanvasCommand — selection / tool dispatch', () => {
     )
     expect(vi.mocked(rt.selectNodes)).toHaveBeenCalledWith(['a', 'b'], 'a')
   })
-  it('select-nodes (no primary) → selectNodes(nodeIds, undefined)', () => {
+  it('select-nodes (no primary) → selectNodes(nodeIds)', () => {
     const rt = createMockRuntime()
     applyCanvasCommand({ kind: 'select-nodes', nodeIds: ['a'] }, rt)
-    expect(vi.mocked(rt.selectNodes)).toHaveBeenCalledWith(['a'], undefined)
+    expect(vi.mocked(rt.selectNodes).mock.calls[0]).toEqual([['a']])
   })
   it('set-active-tool → setActiveTool(toolId)', () => {
     const rt = createMockRuntime()
@@ -284,6 +299,7 @@ describe('applyCanvasCommand — return value contract', () => {
     const rt = createMockRuntime()
     vi.mocked(rt.addAnnotationNode).mockReturnValue(undefined)
     const id = applyCanvasCommand({ kind: 'add-annotation-node' }, rt)
+    expect(vi.mocked(rt.addAnnotationNode).mock.calls[0]).toEqual([])
     expect(id).toBeUndefined()
   })
   it('non-creation commands return undefined', () => {

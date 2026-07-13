@@ -13,24 +13,9 @@
 // generate-* / mask-edit) stay as direct calls (applyCanvasCommand would throw
 // CanvasCommandDeferredError — exec-t23s2 lane handles their two-stage-asset apply).
 //
-// UNSWITCHED EXITS (5 kinds, 5 sites — direct runtime calls retained, per boundary 5
-// "无法等价切 command → 列入未切清单+原因,不许硬切改行为"):
-//   add-text-node / add-frame-node / add-ai-slot-node (createTextAt/Frame/AiSlot
-//   helpers), select-nodes (selectAll), 1-arg add-annotation-node
-//   (addAnnotationForPrimary).
-// ROOT CAUSE: the #205 executor contract (locked by canvasCommandExecutor.test.ts)
-// unpacks EVERY command field as a runtime arg including undefined optionals — so
-// `add-text-node` always calls `runtime.addTextNode(pos, undefined)` (2-arity). The
-// characterization tests (do-not-modify) assert the ORIGINAL omitted-arity call
-// `addTextNode(pos)` (1-arity); vitest toHaveBeenCalledWith rejects the extra
-// undefined arg. Real runtime behavior is identical, but the characterization
-// strict-arity matcher makes the rewiring non-equivalent at the gate. Resolving
-// requires a #205 contract decision (executor conditionally omits undefined
-// optionals + its tests relaxed) — tracked as follow-up after #208 (exec-t23s2
-// deferred-apply) lands; this lane does not touch the executor. The 4-arg
-// add-annotation-node site (beginImageEditPrompt) IS rewired: its original call
-// already passes explicit undefined for position, matching the executor's
-// full-arity unpack, so it is characterization-compatible.
+// Sync applied-kind exits are now fully routed through CanvasCommand (27/27).
+// The remaining deferred kinds (import-asset / generate-* / mask-edit) stay on
+// direct runtime calls until their two-stage asset bridge is wired.
 
 import type { CanvasActionRuntime, LayerMove } from './canvasActionTypes'
 import type { MarkupKind, SectionLockMode, ToolId } from '../../types/mivoCanvas'
@@ -76,8 +61,7 @@ const generateIntoPrimarySlot = (runtime: CanvasActionRuntime) => {
 }
 
 const addAnnotationForPrimary = (runtime: CanvasActionRuntime) => {
-  // T2.2 unswitched: 1-arg call; executor full-arity (4 args w/ undefined) ≠ characterization 1-arity. See top note.
-  runtime.addAnnotationNode(primaryNodeId(runtime))
+  applyCanvasCommand({ kind: 'add-annotation-node', sourceNodeId: primaryNodeId(runtime) }, runtime)
 }
 
 const beginImageEditPrompt = (
@@ -201,8 +185,7 @@ const createTextAtContext = (runtime: CanvasActionRuntime) => {
     return
   }
 
-  // T2.2 unswitched: executor addTextNode(pos, undefined) ≠ characterization addTextNode(pos). See top note.
-  runtime.addTextNode(runtime.canvasPosition)
+  applyCanvasCommand({ kind: 'add-text-node', position: runtime.canvasPosition }, runtime)
 }
 
 const createFrameAtContext = (runtime: CanvasActionRuntime) => {
@@ -216,14 +199,18 @@ const createFrameAtContext = (runtime: CanvasActionRuntime) => {
     return
   }
 
-  // T2.2 unswitched: executor addFrameNode(pos, undefined, undefined) ≠ characterization addFrameNode(pos). See top note.
-  runtime.addFrameNode(runtime.canvasPosition)
+  applyCanvasCommand({ kind: 'add-frame-node', position: runtime.canvasPosition }, runtime)
 }
 
 const createAiSlotAtContext = (runtime: CanvasActionRuntime) => {
   const position = runtime.canvasPosition || { x: 0, y: 0 }
-  // T2.2 unswitched: executor addAiSlotNode(pos, undefined, undefined) ≠ characterization addAiSlotNode(pos). See top note.
-  runtime.addAiSlotNode({ x: position.x - 160, y: position.y - 160 })
+  applyCanvasCommand(
+    {
+      kind: 'add-ai-slot-node',
+      position: { x: position.x - 160, y: position.y - 160 },
+    },
+    runtime,
+  )
 }
 
 const createMarkupAtContext = (runtime: CanvasActionRuntime, kind: MarkupKind) => {
@@ -265,8 +252,7 @@ const importAssetAtContext = (runtime: CanvasActionRuntime) => {
 }
 
 const selectAll = (runtime: CanvasActionRuntime) => {
-  // T2.2 unswitched: executor selectNodes(ids, undefined) ≠ characterization selectNodes(ids). See top note.
-  runtime.selectNodes(runtime.allNodeIds)
+  applyCanvasCommand({ kind: 'select-nodes', nodeIds: runtime.allNodeIds }, runtime)
 }
 
 const align = (runtime: CanvasActionRuntime, alignment: SelectionAlignment) => {
