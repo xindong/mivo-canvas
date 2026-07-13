@@ -16,34 +16,10 @@
 // 边界:类型可被 shared/route/backend 引用;validator 是 runtime 入口(route 把 PATCH body unknown → DomainOp[])。
 // 不 import spike;不碰 client(阶段 3)。
 
-/** FieldPath = 非空 tuple(G1-b R4-P1-1 / S10-6;运行时拒空)。leaf-level 域语义路径,非 RFC6902 JSON-Pointer。 */
-export type FieldPath = readonly [string | number, ...(string | number)[]]
-
-/**
- * DomainOp = 单 record LWW delta(§10.1 v5:仅 set/unset/whole-lww/primitive/reorder)。
- * - recordId ← URL path;actor ← resolveActor;base ← If-Match;opId ← idempotency-key header(全 adapter 注入)。
- * - reorder 的 parentId 从 path/ctx 注入(orderedIds 表移动意图,非 Y.Array delete+insert)。
- */
-export type DomainOp =
-  | { kind: 'set'; fieldPath: FieldPath; value: unknown }                                    // leaf-level set(container 整对象 set 拒)
-  | { kind: 'unset'; fieldPath: FieldPath }                                                   // 删叶子(不删 container 整子树)
-  | { kind: 'array'; fieldPath: FieldPath; class: 'whole-lww'; intent: 'replace'; value: unknown[] }   // ② markupPoints(无 stable-id)
-  | { kind: 'array'; fieldPath: FieldPath; class: 'primitive'; intent: 'insert' | 'remove'; value: string } // ③ resultNodeIds
-  | { kind: 'reorder'; orderedIds: string[] }                                                 // parentId 从 path 注入
-
-/**
- * server-named invariant command(跨 record 原子,非 PATCH DomainOp;由 path/method 推导目标,per-target authz)。
- * ★ 诚实化(§14.5):仅 node-delete-cascade 经 PG-T1~T3/T7 实证;group-reparent/result-asset-attach 类型+注释级,A2 需另测。
- */
-export type ServerInvariantCommand =
-  | { kind: 'node-delete-cascade'; canvasId: string; nodeId: string }                                   // 实证:node+edges+asset ref 同 PG tx
-  | { kind: 'group-reparent'; canvasId: string; nodeIds: string[]; targetGroupId: string | null }       // 类型+注释级(A2 需另测)
-  | { kind: 'result-asset-attach'; canvasId: string; anchorId: string; assetId: string; resultNodeId: string } // 类型+注释级(A2 需另测)
-
-// ── create client-id(§10.1 v5 Blocker 2:废除 server-mint,id 来自 path client NodeRecord.id)──
-export type RecordKind = 'node' | 'edge' | 'anchor'
-/** CreateBody = 零 privileged(id 来自 path;payload = NodePayload,不含 recordId)。 */
-export type CreateBody = { clientId: string; type: RecordKind; payload: unknown }
+// A2-S2 wire 契约类型(FieldPath/DomainOp/ServerInvariantCommand/RecordKind/CreateBody)定义在
+// shared/persist-contract.ts(server/client 共享 seam);本文件 re-export + 提供 runtime validator(fieldKeyOf/setByPath/validateDomainOp)。
+import type { CreateBody, DomainOp, FieldPath, RecordKind, ServerInvariantCommand } from '../../shared/persist-contract.ts'
+export type { CreateBody, DomainOp, FieldPath, RecordKind, ServerInvariantCommand }
 
 // ── fieldKeyOf + setByPath/getByPath(硬化:拒原型污染 + 拒空路径 + 拒容器 clobber)──
 const FORBIDDEN_SEGMENTS = new Set(['__proto__', 'prototype', 'constructor'])
