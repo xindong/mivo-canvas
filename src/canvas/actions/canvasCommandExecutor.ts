@@ -109,6 +109,19 @@ export type CanvasCommandApplyResult = string | string[] | undefined
  */
 export type CanvasCommandApplyReturn = CanvasCommandApplyResult | Promise<CanvasCommandApplyResult>
 
+// Block 2: the remaining sync emitters must preserve the historical runtime arity
+// while still routing through CanvasCommand. Trim only trailing undefineds so
+// `fn(a, undefined)` becomes `fn(a)`, but interior holes like
+// `fn(a, undefined, c)` are preserved.
+const invokeRuntimeWithTrimmedTrailingUndefineds = <TArgs extends unknown[], TReturn>(
+  fn: (...args: TArgs) => TReturn,
+  ...args: TArgs
+): TReturn => {
+  let end = args.length
+  while (end > 0 && args[end - 1] === undefined) end -= 1
+  return fn(...(args.slice(0, end) as unknown as TArgs))
+}
+
 /**
  * Thrown when a two-stage assetId cannot be resolved (404 / network failure /
  * purged asset). Tagged so callers can tell a missing-asset failure apart from
@@ -343,13 +356,24 @@ export const applyCanvasCommand = (
   switch (command.kind) {
     // ── Node creation ───────────────────────────────────────────────────────────
     case 'add-text-node':
-      return runtime.addTextNode(command.position, command.text)
+      return invokeRuntimeWithTrimmedTrailingUndefineds(runtime.addTextNode, command.position, command.text)
     case 'add-frame-node':
-      return runtime.addFrameNode(command.position, command.size, command.title)
+      return invokeRuntimeWithTrimmedTrailingUndefineds(
+        runtime.addFrameNode,
+        command.position,
+        command.size,
+        command.title,
+      )
     case 'add-ai-slot-node':
-      return runtime.addAiSlotNode(command.position, command.size, command.prompt)
+      return invokeRuntimeWithTrimmedTrailingUndefineds(
+        runtime.addAiSlotNode,
+        command.position,
+        command.size,
+        command.prompt,
+      )
     case 'add-annotation-node':
-      return runtime.addAnnotationNode(
+      return invokeRuntimeWithTrimmedTrailingUndefineds(
+        runtime.addAnnotationNode,
         command.sourceNodeId,
         command.position,
         command.instruction,
@@ -379,7 +403,7 @@ export const applyCanvasCommand = (
 
     // ── Selection / tool ────────────────────────────────────────────────────────
     case 'select-nodes':
-      runtime.selectNodes(command.nodeIds, command.primaryNodeId)
+      invokeRuntimeWithTrimmedTrailingUndefineds(runtime.selectNodes, command.nodeIds, command.primaryNodeId)
       return undefined
     case 'set-active-tool':
       runtime.setActiveTool(command.toolId)
