@@ -21,7 +21,7 @@ import { downloadCanvasNodeOriginal } from '../lib/assetDownload'
 import { MarkdownPreview } from '../lib/MarkdownPreview'
 import { useResolvedAssetUrl } from '../lib/useResolvedAssetUrl'
 import { useCanvasStore } from '../store/canvasStore'
-import { renderKindForNode, type CanvasNodeRenderKind } from '../canvas/nodeTypes/canvasNodeRegistry'
+import { renderKindForNode, type CanvasNodeRenderKind } from '../model/canvasNodeRegistry'
 import type { MivoCanvasNode } from '../types/mivoCanvas'
 
 type InspectorPanelProps = {

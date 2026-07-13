@@ -7,7 +7,7 @@ import { getModelCapabilities } from '../lib/modelCapabilities'
 import { settleCanvasGenerationLocally } from './canvasGenerationCancel'
 import { fallbackCancelTarget } from './chatGenerationHydration'
 import { resolveChatEnhance, enhanceForGeneration, historyForEnhance, trimSceneMessages } from './chatEnhanceFlow'
-import { cancelMaskEditMessage } from './chatMaskEditFlow'
+import { cancelMaskEditMessage, setChatStoreAccessor } from './chatMaskEditFlow'
 import { buildBusyDropMessages } from './chatBusyDrop'
 import { debugLogger } from './debugLogStore'
 import { generationFacade } from './generationFacade'
@@ -871,6 +871,10 @@ export const useChatStore = create<ChatState>()(
     chatPersistOptions,
   ),
 )
+
+// D-4: 注入 useChatStore 实例到 chatMaskEditFlow(依赖倒置,切断 chatStore↔chatMaskEditFlow runtime 环)。
+// 在 useChatStore 定义之后调用;chatMaskEditFlow 侧只在函数体内经 chatStore() 取用,无 TDZ。
+setChatStoreAccessor(useChatStore)
 
 // P2-3(sol 返修):注册 unsynced sidecar 标记回调 → enqueueChatAppend 同步置位 msgId。
 //   注册在模块尾部(useChatStore 已建),打破 chatPersistSync↔chatStore 静态环(chatPersistSync

@@ -29,11 +29,77 @@ import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { execSync } from 'node:child_process'
 import { join, relative, resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import ts from 'typescript'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-const REPO_ROOT = resolve(__dirname, '..', '..')
+// MIVO_GUARD_ROOT 允许 fixture 测试把扫描根重定向到临时目录(默认 = 仓根)。
+const REPO_ROOT = process.env.MIVO_GUARD_ROOT ? resolve(process.env.MIVO_GUARD_ROOT) : resolve(__dirname, '..', '..')
 const THRESHOLD = 900
 const STATE_CALL_PATTERN = 'useCanvasStore.getState('
+
+// --- server 分层方向规则(rule ④)辅助函数(A7a-3)---
+// server 文件的模块归类:server/lib, server/routes, server/persist, server/platform, server/tasks, server。
+function serverModuleOf(rel) {
+  const parts = rel.split('/')
+  if (parts.length >= 3 && parts[0] === 'server') return `${parts[0]}/${parts[1]}`
+  return parts[0]
+}
+// TS AST 提取相对 import specifier。A7a 第三轮返修:lead 指定改走 TS compiler API
+// (ts.createSourceFile + 递归遍历),不再手写词法器——手写 lexer 补模板插值栈 + 正则/除法
+// 区分是无底洞(sol 探针实证:模板插值内 import() 漏检、/['"]/ 误切 strSingle 吞下一行真实
+// import、正则字面量内 import 文本误报)。AST 天然免疫字符串/模板/正则/注释全部边界。
+// 只采集三类节点的 string literal specifier:ImportDeclaration.moduleSpecifier /
+// ExportDeclaration.moduleSpecifier / CallExpression(expression.kind===ImportKeyword) 首参。
+function scanRelativeSpecs(rel, content) {
+  const specs = new Set()
+  // fileName 传 rel(含 .ts/.tsx 扩展)→ TS 据扩展名推断 ScriptKind(.tsx 走 TSX,JSX 不误判)。
+  const sf = ts.createSourceFile(rel || 'scan.ts', content, ts.ScriptTarget.Latest, true)
+  const isRelative = (s) => s.startsWith('./') || s.startsWith('../')
+  const addIfRelative = (specNode) => {
+    if (specNode && ts.isStringLiteral(specNode) && isRelative(specNode.text)) specs.add(specNode.text)
+  }
+  function visit(node) {
+    if (ts.isImportDeclaration(node)) {
+      addIfRelative(node.moduleSpecifier)
+    } else if (ts.isExportDeclaration(node)) {
+      addIfRelative(node.moduleSpecifier)
+    } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+      addIfRelative(node.arguments && node.arguments[0])
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(sf)
+  return [...specs]
+}
+// 把相对 spec 解析为 posix 仓内相对路径(仅路径规范化,不查 FS)。
+function resolveSpecPath(spec, fromFileRel) {
+  if (!spec.startsWith('.')) return null
+  const slashIdx = fromFileRel.lastIndexOf('/')
+  const segs = slashIdx >= 0 ? fromFileRel.slice(0, slashIdx).split('/') : []
+  for (const part of spec.split('/')) {
+    if (part === '.' || part === '') continue
+    if (part === '..') { segs.pop(); continue }
+    segs.push(part)
+  }
+  return segs.join('/')
+}
+// Rule ④: server 非 routes 层(lib/persist/platform/tasks)禁 import server/routes。
+// routing 是 server 顶层,下层不得反向依赖 routes。纯函数(入参 [{rel, content}]),便于 fixture 红测。
+export function checkServerDirectionRule(files) {
+  const violations = []
+  for (const f of files) {
+    if (!f.rel.startsWith('server/')) continue
+    const mod = serverModuleOf(f.rel)
+    if (mod === 'server/routes' || mod === 'server') continue
+    for (const spec of scanRelativeSpecs(f.rel, f.content)) {
+      const target = resolveSpecPath(spec, f.rel)
+      if (target && (target === 'server/routes' || target.startsWith('server/routes/'))) {
+        violations.push(`[FAIL] server 分层方向: ${f.rel}(${mod}) import ${spec} → ${target}(server/routes) — 非 routes 层禁依赖 server/routes(routing 是顶层)`)
+      }
+    }
+  }
+  return violations
+}
 
 const baselinePath = join(__dirname, 'structure-guard.baseline.json')
 const baseline = JSON.parse(readFileSync(baselinePath, 'utf8'))
@@ -234,6 +300,20 @@ for (const f of prodBanFiles) {
   }
 }
 console.log(`[OK] mockGeneration/mockGenerationAdapter 生产路径 ban: ${prodBanFiles.length} 个生产文件扫描,${banHits} 命中(基线 0,任何命中即 FAIL)`)
+
+// --- 规则 ④ server 分层方向(非 routes 层禁 import server/routes;A7a-3)---
+// routing 是 server 顶层,lib/persist/platform/tasks 不得反向 import routes。当前基线 0
+// (codemap 模块图:仅 server/routes → 其它,无反向)。绝对 FAIL(同 rule ③,不依赖 base)。
+const serverScanFiles = listTsFiles(join(REPO_ROOT, 'server')).filter(
+  (f) => !/\.(test|spec)\.(ts|tsx)$/.test(f) && !/__tests__/.test(f)
+)
+const serverFileList = serverScanFiles.map((f) => ({
+  rel: relative(REPO_ROOT, f).replace(/\\/g, '/'),
+  content: readFileSync(f, 'utf8'),
+}))
+const dirViolations = checkServerDirectionRule(serverFileList)
+for (const v of dirViolations) failures.push(v)
+console.log(`[OK] server 分层方向: ${serverFileList.length} 个生产 server 文件扫描,${dirViolations.length} 方向违规(基线 0,非 routes→routes 即 FAIL)`)
 
 // --- 汇总 ---
 console.log(`\n结构守卫: ${allFiles.length} 个文件扫描完毕,${failures.length} FAIL,${warnings.length} WARN`)

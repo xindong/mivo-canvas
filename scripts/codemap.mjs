@@ -12,6 +12,7 @@
 
 import { readFileSync, readdirSync, statSync, existsSync } from "node:fs";
 import { join, relative, dirname, resolve, sep, posix, extname } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const COMPACT_CAP_BYTES = 3072; // 3KB 硬上限
 const ROOT = process.cwd();
@@ -147,16 +148,25 @@ function resolveImport(specifier, fromFilePosix) {
   return null;
 }
 
-// 扫描单文件的相对 import，返回 { resolved: string[], unresolved: number }
-function scanFileImports(filePx, content) {
-  const resolved = new Set();
-  let unresolved = 0;
+// 从源码文本提取相对 import specifier(先剔 // 与 /* */ 注释,防 `from '...'` 出现在
+// 注释里被误判为 import edge —— A7a-4 假阳性:canvasStore.ts 自环注释 / canvasStateTypes
+// 注释把 27 报成 29)。纯函数(不碰文件系统),便于 fixture 测试。
+export function extractSpecs(content) {
+  const stripped = stripJsonComments(content);
   const specs = new Set();
   RE_FROM.lastIndex = 0;
   RE_DYNAMIC.lastIndex = 0;
   let m;
-  while ((m = RE_FROM.exec(content)) !== null) specs.add(m[1]);
-  while ((m = RE_DYNAMIC.exec(content)) !== null) specs.add(m[1]);
+  while ((m = RE_FROM.exec(stripped)) !== null) specs.add(m[1]);
+  while ((m = RE_DYNAMIC.exec(stripped)) !== null) specs.add(m[1]);
+  return specs;
+}
+
+// 扫描单文件的相对 import，返回 { resolved: string[], unresolved: number }
+export function scanFileImports(filePx, content) {
+  const specs = extractSpecs(content);
+  const resolved = new Set();
+  let unresolved = 0;
   for (const spec of specs) {
     const target = resolveImport(spec, filePx);
     if (target) resolved.add(target);
@@ -192,7 +202,7 @@ function checkPathAlias() {
   }
 }
 
-function stripJsonComments(s) {
+export function stripJsonComments(s) {
   // 极简：去 // 行注释与 /* */ 块注释（tsconfig 用得到）
   let out = "";
   let i = 0;
@@ -446,8 +456,12 @@ async function main() {
   }
 }
 
-main().catch((e) => {
-  console.error("codemap: 失败 -", e.message);
-  console.error(e.stack);
-  process.exit(1);
-});
+// 仅在直接运行时跑(被 import 做 fixture 测试时不执行,避免污染 stdout / 触发性能门 exit)
+const __isMain = process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
+if (__isMain) {
+  main().catch((e) => {
+    console.error("codemap: 失败 -", e.message);
+    console.error(e.stack);
+    process.exit(1);
+  });
+}

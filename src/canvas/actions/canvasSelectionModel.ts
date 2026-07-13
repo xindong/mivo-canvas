@@ -1,8 +1,8 @@
 import type { MivoCanvasNode } from '../../types/mivoCanvas'
-import { capabilitiesForNode } from '../nodeTypes/canvasNodeRegistry'
-import type { CanvasObjectCapability } from '../nodeTypes/nodeCapabilities'
+import { capabilitiesForNode } from '../../model/canvasNodeRegistry'
+import type { CanvasObjectCapability } from '../../model/nodeCapabilities'
 
-export type { CanvasObjectCapability } from '../nodeTypes/nodeCapabilities'
+export type { CanvasObjectCapability } from '../../model/nodeCapabilities'
 
 export type CanvasSelectionKind = 'blank' | 'single' | 'multi'
 

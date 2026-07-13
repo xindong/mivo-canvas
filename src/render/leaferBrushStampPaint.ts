@@ -61,7 +61,7 @@
 import { Group, Line, Path, Rect } from 'leafer-ui'
 import type { Leafer } from 'leafer-ui'
 import type { MarkupPoint, MivoCanvasNode } from '../types/mivoCanvas'
-import { brushOutlinePathFor } from '../canvas/brushGeometry'
+import { brushOutlinePathFor } from '../model/brushGeometry'
 import { stampSrcFor } from '../canvas/stampDefs'
 import { debugLogger } from '../store/debugLogStore'
 import { isLeaferBrushStampPaintedNode } from './leaferSpikeFilter'

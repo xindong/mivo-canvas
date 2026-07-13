@@ -1,5 +1,5 @@
 import type { MivoCanvasNode } from '../types/mivoCanvas'
-import { isConnectorNode } from './connectorGeometry'
+import { isConnectorNode } from '../model/connectorGeometry'
 
 export type SmartSelectionAxis = 'horizontal' | 'vertical'
 export type SmartSelectionLayoutKind = 'row' | 'column' | 'grid'
