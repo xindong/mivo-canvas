@@ -1177,6 +1177,22 @@ export class PgPersistBackend implements PersistBackend {
     })
   }
 
+  // ── A2-S2 field-level DomainOp 路径(PG 真实装见 Block 4;此处 stub 占位让 interface 类型完整 + typecheck 绿)──
+  // TODO(A2-S2 Block 4):PG 单事务实装 applyDomainOps/createChild/deleteChildCascade + 009 migration field_clock/canvas_seq。
+  //   applyDomainOps:SELECT existing(payload jsonb)→ JS 解析 → 逐 op setByPath(复用 domainOp)→ UPDATE payload/revision
+  //     → UPSERT field_clock(bump)→ UPSERT canvas_seq(bump)→ idem row;同事务原子(PG-T6 风格)。
+  //   createChild:INSERT ON CONFLICT → dup-conflict / created;canvas_seq bump。
+  //   deleteChildCascade:DELETE node + cascade edge(from/to)同事务;canvas_seq bump;tombstone 走 not-found/idempotent。
+  async applyDomainOps(): Promise<never> {
+    throw new Error('PgPersistBackend.applyDomainOps not implemented (A2-S2 Block 4)')
+  }
+  async createChild(): Promise<never> {
+    throw new Error('PgPersistBackend.createChild not implemented (A2-S2 Block 4)')
+  }
+  async deleteChildCascade(): Promise<never> {
+    throw new Error('PgPersistBackend.deleteChildCascade not implemented (A2-S2 Block 4)')
+  }
+
   async reorderChildren(
     ownerId: string,
     canvasId: string,
