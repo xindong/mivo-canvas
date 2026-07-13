@@ -385,12 +385,18 @@ const applyServerRevision = async (op: WriteOp, outcome: { revision?: Revision }
  * 作可恢复处理(P1-3:conflict 不静默删——re-hydrate 让本地从服务端真值刷新,用户可基于新 revision 重放)。
  * onConflict 回灌:F1 —— create/update 成功后把服务端新 revision 写回 store,防下一次 strict update 陈旧。
  * @param opts 注入 fetch opts(测试用 Hono app.request / fetch 计数 stub);production 默认 getProductionFetchOptions()。
+ * @param queueOpts 注入 writeRetryQueue 阈值(测试用 maxQueuePerUser 触发溢出驱逐;production 默认 createWriteQueue 内 DEFAULT_MAX_QUEUE=256)。
  */
-export const startPersistWriteQueue = (opts: FetchAdapterOptions = getProductionFetchOptions()): Promise<void> => {
+export const startPersistWriteQueue = (
+  opts: FetchAdapterOptions = getProductionFetchOptions(),
+  queueOpts?: { maxQueuePerUser?: number; maxAttempts?: number },
+): Promise<void> => {
   if (writeQueue) return Promise.resolve()
   const executor = createAdapterWriteExecutor(opts)
   writeQueue = createWriteQueue({
     executor,
+    ...(queueOpts?.maxQueuePerUser !== undefined ? { maxQueuePerUser: queueOpts.maxQueuePerUser } : {}),
+    ...(queueOpts?.maxAttempts !== undefined ? { maxAttempts: queueOpts.maxAttempts } : {}),
     // P1-3:conflict 强制提供可恢复处理——re-hydrate 刷新本地 revision,用户可重放(非静默删 op)。
     onConflict: (op, currentRevision) => {
       debugLogger.warn(

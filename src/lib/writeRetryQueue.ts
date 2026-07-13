@@ -1400,6 +1400,15 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
       const oldest = pending[0]
       if (oldest) {
         await deleteWrite(oldest.id)
+        // P2-3(sol 第三轮 P1):驱逐的 oldest op 不经 drain switch,须显式 fire onOutcome 清 sidecar
+        //   (若 oldest 是 chat append,marker 否则孤儿 → 该消息 committed 本地+永不发服务端 → hydrate 永久
+        //   union 复活;相对 main wholesale-replace 净回归)。terminal 复用现有契约(onOutcome 消费方按
+        //   op.kind 清 appendChatMessage sidecar,非 chat op no-op)。
+        try {
+          await onOutcome?.(oldest.op, { status: 'terminal', message: 'evicted (queue overflow)' })
+        } catch (cbErr) {
+          debugLogger.warn(SOURCE, `onOutcome(evicted) callback threw: ${msg(cbErr)}`)
+        }
         debugLogger.warn(
           SOURCE,
           `queue overflow (${active.length}/${maxQueue}); evicted oldest pending ${oldest.resourceKey ?? oldest.id}`,
@@ -1411,6 +1420,13 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
           `queue full (${active.length}/${maxQueue}, all in-flight); refused new write`,
         )
         toastFeedback.error('保存队列繁忙,请稍后重试。')
+        // P2-3(sol 第三轮 P1):满拒的 new op 未入队(throw 前未 putWrite),但 enqueueChatAppend 已
+        //   markUnsynced 置位 → marker 孤儿。fire onOutcome(op, terminal) 清之(同上,消费方按 op.kind 清)。
+        try {
+          await onOutcome?.(op, { status: 'terminal', message: 'queue full (refused)' })
+        } catch (cbErr) {
+          debugLogger.warn(SOURCE, `onOutcome(refused) callback threw: ${msg(cbErr)}`)
+        }
         throw new Error('write queue full')
       }
     }

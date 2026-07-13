@@ -1103,4 +1103,35 @@ describe('P2-3 生命周期矩阵 — unsynced sidecar 真实 enqueue→outcome�
     await hydrateFromServer(emptyChatAdapter, { fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
     expect(useChatStore.getState().messagesByScene['c1'] ?? []).toEqual([])
   })
+
+  it('溢出驱逐的 chat append fire onOutcome → marker 清 + hydrate 不复活(消"eviction 孤儿 marker 净回归")', async () => {
+    // P2-3(sol 第三轮 P1):maxQueuePerUser=2 → 第 3 条 enqueue 驱逐最老 pending。stub 返 500(transient)
+    //   → op 留 pending、marker 保留(不被 success 清),隔离驱逐路径的清位。flush 间隔保证 createdAt
+    //   递增 → c1 为最老(被驱逐)。未修前:驱逐 deleteWrite 不经 drain switch → c1 marker 孤儿 → hydrate 永久
+    //   union 复活(相对 main wholesale-replace 净回归)。修后:驱逐 fire onOutcome(terminal)清 c1 marker。
+    const { fetch } = makeChatOutcomeFetch(500)
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() }, { maxQueuePerUser: 2 })
+    useCanvasStore.setState({
+      sceneId: 'c1',
+      canvases: {
+        c1: { title: 'c1', projectId: 'p1', createdAt: 't', updatedAt: 't', nodes: [], edges: [], tasks: [] } as never,
+        c2: { title: 'c2', projectId: 'p1', createdAt: 't', updatedAt: 't', nodes: [], edges: [], tasks: [] } as never,
+        c3: { title: 'c3', projectId: 'p1', createdAt: 't', updatedAt: 't', nodes: [], edges: [], tasks: [] } as never,
+      } as never,
+    })
+    const m1 = msg('m1'), m2 = msg('m2'), m3 = msg('m3')
+    useChatStore.setState({ messagesByScene: { c1: [m1], c2: [m2], c3: [m3] }, unsyncedChatMsgIds: {} })
+    await enqueueChatAppend('c1', m1); await flush()
+    await enqueueChatAppend('c2', m2); await flush()
+    // 前 2 条 marker 置位(queue active)
+    expect(useChatStore.getState().unsyncedChatMsgIds).toEqual({ c1: ['m1'], c2: ['m2'] })
+    // 第 3 条 → active=2>=maxQueue → 驱逐 oldest(c1)→ onOutcome(terminal) 清 c1 marker(不孤儿)
+    await enqueueChatAppend('c3', m3)
+    expect(useChatStore.getState().unsyncedChatMsgIds['c1'] ?? []).toEqual([]) // c1 marker 清(驱逐 fire onOutcome)
+    expect(useChatStore.getState().unsyncedChatMsgIds['c2']).toEqual(['m2']) // c2 留 pending
+    expect(useChatStore.getState().unsyncedChatMsgIds['c3']).toEqual(['m3']) // c3 留 pending
+    // hydrate(active=c1, server 空)→ m1 不在 server 集 + 无 marker → 按 canonical 删除(不复活为孤儿)
+    await hydrateFromServer(emptyChatAdapter, { fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    expect(useChatStore.getState().messagesByScene['c1'] ?? []).toEqual([]) // 不复活
+  })
 })

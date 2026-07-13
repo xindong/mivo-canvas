@@ -61,9 +61,11 @@ export const clearUnsyncedMarker = (canvasId: string, messageId: string): void =
  * P2-3(sol 第二轮返修):marker 仅在 enqueuePersistWrite 返非 undefined(queue active,op 已入队将持久)
  *   时置位——local/无队列(返 undefined)不置(消"local 假 marker → 切 server 被当 pending 永久 union")。
  *   终态(success/terminal)经 writeRetryQueue onOutcome → clearUnsyncedMarker 清位;非终态保留。
+ * 返回 enqueuePromise 供调用方 await 入队顺序(测试驱动溢出驱逐需串行入队);sendMessage 等生产方 fire-and-forget 不 await。
  */
-export const enqueueChatAppend = (canvasId: string, message: ChatMessage): void => {
+export const enqueueChatAppend = (canvasId: string, message: ChatMessage): Promise<void> | undefined => {
   const enqueuePromise = enqueuePersistWrite({ kind: 'appendChatMessage', canvasId, message })
   if (enqueuePromise) markUnsynced(canvasId, message.id) // queue active → real pending append
   // local(返 undefined)→ 不置 marker(hydrate 不当 pending 保留,按 canonical 删除)
+  return enqueuePromise
 }
