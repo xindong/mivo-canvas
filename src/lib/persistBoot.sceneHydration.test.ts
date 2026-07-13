@@ -58,12 +58,14 @@ vi.mock('../store/remoteDebugReporter', () => ({ reportRemoteDebugEntry: () => {
 import {
   bootPersistWiring,
   stopPersistWriteQueue,
+  enqueuePersistWrite,
+  drainPersistQueue,
   __resetPersistBoot,
 } from './persistBoot'
 import { __resetWriteQueueDb } from './writeRetryQueue'
 import { useCanvasStore } from '../store/canvasStore'
 import { useAuthStore } from '../store/authSlice'
-import { __resetPersistUserId } from './persistUserId'
+import { setPersistUserId, __resetPersistUserId } from './persistUserId'
 import type { ServerPersistAdapter } from './serverPersistAdapter'
 import type { CanvasDocument } from '../types/mivoCanvas'
 
@@ -228,5 +230,61 @@ describe('A2-S3 block 8 — server 模式切 scene re-hydrate(对新 scene 调 f
     // shadow 模式零 fetchCanvas 请求(切 scene re-hydrate 仅 server 模式;shadow 不订阅;
     // shadowCompareWithServer 的 listProjects 请求走 adapter 非 fetchCanvas,不算)
     expect(fetchCanvasSpy).not.toHaveBeenCalled()
+  })
+
+  it('⑤ shadow onConflict(mock 409)零 fetchCanvas(mode gate 跳过 step 2.5);server onConflict 仍补 content(gate 不跳过,正例)', async () => {
+    const conflict409 = (): Response =>
+      new Response(JSON.stringify({ error: 'revision-conflict', currentRevision: 0 }), { status: 409, headers: { 'content-type': 'application/json' } })
+    // opts:GET /healthz=pg / GET /api/user-state=空 map / PUT /api/user-state/*=409(撞 conflict → onConflict)
+    const opts409 = () => ({
+      fetch: async (input: string, init?: RequestInit): Promise<Response> => {
+        const method = (init?.method ?? 'GET').toUpperCase()
+        if (input === '/healthz') return healthzPg()
+        if (input.startsWith('/api/user-state')) {
+          if (method === 'GET') return emptyUserState()
+          return conflict409()
+        }
+        return new Response(JSON.stringify({}), { status: 200, headers: { 'content-type': 'application/json' } })
+      },
+      baseUrl: '',
+      getAuthHeaders: () => authHeaders(),
+    })
+
+    // ── shadow:onConflict → step 2.5 mode gate 跳过 → 0 fetchCanvas(不变量:shadow 恒不 populate) ──
+    persistState.mode = 'shadow'
+    useCanvasStore.setState({ sceneId: 'sceneA', canvases: { sceneA: blankCanvas('sceneA') } })
+    setPersistUserId('user-A')
+    await bootPersistWiring(opts409())
+    await flush()
+    fetchCanvasSpy.mockClear()
+    await (enqueuePersistWrite({ kind: 'putUserState', key: 'ui:theme', value: 'dark' }) ?? Promise.resolve())
+    await flush()
+    await drainPersistQueue()
+    await flush(50) // 等 onConflict 的 hydrateFromServer(void fire-and-forget)完成
+    // shadow:canvas content 不 populate(mode gate 跳过 step 2.5)→ 0 fetchCanvas
+    expect(fetchCanvasSpy).not.toHaveBeenCalled()
+
+    // ── server 正例:onConflict → step 2.5 gate 不跳过 → 补 content(权威源正确) ──
+    stopPersistWriteQueue()
+    __resetPersistBoot()
+    await __resetWriteQueueDb()
+    persistState.mode = 'server'
+    // boot fetchCanvas 返 null(canvas 不存在 → applied false → 不记 hydrated);
+    // onConflict 第二次返正常 resp(补 content,证 step 2.5 gate 不跳过 server)
+    fetchCanvasSpy = vi.fn().mockResolvedValueOnce(null).mockResolvedValue(fakeFetchCanvasResp('sceneA'))
+    adapterHolder.adapter = makeFakeAdapter(fetchCanvasSpy)
+    useCanvasStore.setState({ sceneId: 'sceneA', canvases: { sceneA: blankCanvas('sceneA') } })
+    useAuthStore.setState({ user: null, status: 'unknown' })
+    setPersistUserId('user-A')
+    await bootPersistWiring(opts409())
+    await flush()
+    expect(fetchCanvasSpy).toHaveBeenCalledWith('sceneA') // boot step 2.5 fetchCanvas sceneA → null
+    fetchCanvasSpy.mockClear()
+    await (enqueuePersistWrite({ kind: 'putUserState', key: 'ui:theme', value: 'dark' }) ?? Promise.resolve())
+    await flush()
+    await drainPersistQueue()
+    await flush(50)
+    // server:onConflict → step 2.5 gate 不跳过 → sceneA 未 hydrated(boot null)→ fetchCanvas sceneA 补 content
+    expect(fetchCanvasSpy).toHaveBeenCalledWith('sceneA')
   })
 })

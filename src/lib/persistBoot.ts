@@ -415,11 +415,15 @@ export const hydrateFromServer = async (
   // 2.5 A2-S3 item 4:active canvas 正文拉取 + bundle cursor 构建(content hydrate;现 meta 已 merge,补 content)。
   //    fetchCanvas(active)→ 应用 nodes/edges(R-7 union)+ 构建 bundle cursor(Block 7 edit/delete 用)。走
   //    hydrateCanvasContentIfMissing(去重包装):boot active scene 记入 hydratedSceneIds,切走再切回不双拉。
-  //    切 scene re-hydrate 由 block 8 订阅(startSceneHydrationSubscription)处理,此处只 hydrate boot active;
-  //    local 模式永不调(hydrateFromServer 仅 server 分支)。失败降级 warn 不阻断。
+  //    切 scene re-hydrate 由 block 8 订阅(startSceneHydrationSubscription)处理,此处只 hydrate boot active。
+  //    mode gate:仅 server 执行。shadow 恒不 populate canvas content(IDB 读源契约:A3 灰度观察窗前提;
+  //    onConflict 路径 writeQueue 在 server/shadow 两分支都调,shadow 下撞 409 经 onConflict →
+  //    hydrateFromServer 到此,无 gate 即 populate canvas content 违反 ff91846 不变量 → 故 shadow 跳过)。
+  //    local 永不调(bootPersistWiring 第一行 return;onConflict 也不触达——local queue 未启动)。
+  //    server onConflict 补 content 保留(权威源正确行为)。失败降级 warn 不阻断。
   try {
     const sceneId = useCanvasStore.getState().sceneId
-    if (sceneId) {
+    if (sceneId && getPersistMode() === 'server') {
       await hydrateCanvasContentIfMissing(sceneId, adapter)
     }
   } catch (error) {
@@ -563,7 +567,7 @@ export const startPersistWriteQueue = (
     onConflict: (op, currentRevision) => {
       debugLogger.warn(
         SOURCE,
-        `conflict on ${op.kind} (server rev ${currentRevision}); re-hydrating non-canvas state for recoverable rebase`,
+        `conflict on ${op.kind} (server rev ${currentRevision}); re-hydrating from server for recoverable rebase (server: full incl canvas content; shadow: non-canvas only, canvas content gated out by step 2.5 mode gate)`,
       )
       void hydrateFromServer().catch((error) => {
         debugLogger.warn(SOURCE, `conflict re-hydrate failed: ${msg(error)}`)
