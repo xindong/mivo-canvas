@@ -34,6 +34,9 @@ import {
   reuseConflict,
   validateChildPayload,
 } from '../lib/persistHttp'
+import { encodeBase, decodeBase } from '../lib/baseCursor'
+import { validateDomainOps, validateCreateBody, validateLegacyReplaceRequest, DomainOpError, type DomainOp, type LegacyReplaceRequest } from '../lib/domainOp'
+import { legacyDrainGate } from '../lib/legacyDrainGate'
 import type {
   CanvasMeta,
   ConflictBody,
@@ -470,8 +473,74 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
     return c.json({ reordered: result.reordered, contentVersion: result.contentVersion }, 200)
   })
 
-  // ── 节点级 PATCH(FX-4 + 返修 #3/#4/#5/#13 + N1/N5/N7):node/edge/anchor ──
-  const patchChild = async (
+  // ── A2-S2 §14.3:legacy drain envelope(PATCH /:id/nodes/:nodeId 复用 decoder wire;FX-5 队列迁移 drain-only 兼容通道)──
+  // 蓝本:src/kernel/__spike__/n20-truth-source.spike.test.ts CutoverHarness L2273-2403(语义蓝本,生产化到 route)。
+  // 顺序:validate wire(400)→ authzCanvas('write')(403/404)→ null-actor 401(requireLogin,同 child-write 约定)→
+  //   LEGACY_DRAIN gate(关→400)→ scope(env.canvasId/nodeId 匹配 path,防同 nodeId 跨 canvas 重放→400)→
+  //   touchWindow(envelope 到达重计 quiet-window)→ backend.legacyReplaceDrain 四态→ 映射 200/409/404/422。
+  // retirement 是进程内观测(canRetire 的 pendingGauge 由 ops 从队列实况推导;route 只 touchWindow+incrementDrainCount)。
+  const legacyDrainEnvelope = async (
+    c: Context<AppEnv>,
+    childId: string,
+    raw: unknown,
+    fingerprint: string,
+    requestId: string,
+    t0: number,
+  ): Promise<Response> => {
+    let env: LegacyReplaceRequest
+    try {
+      env = validateLegacyReplaceRequest(raw)
+    } catch (e) {
+      const msg = e instanceof DomainOpError ? e.violation : 'invalid legacy envelope'
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'payload-rejected' })
+      return c.json({ error: 'bad-request', message: msg }, 400)
+    }
+    const canvasId = c.req.param('id') ?? ''
+    const authz = await authzCanvas(c, canvasId, 'write')
+    if (!authz.ok) return denyCanvas(c, requestId, t0, authz)
+    if (authz.actor === null) return requireLogin(c, requestId, t0)
+    // ④ LEGACY_DRAIN gate(env 默认关;关 → envelope 400 payload-rejected,§14.3 受控迁移协议例外,非双协议窗口)
+    if (!legacyDrainGate.isOpen()) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'legacy-drain-gate-closed' })
+      return c.json({ error: 'bad-request', message: 'legacy drain gate closed' }, 400)
+    }
+    // ① scope 校验(env.canvasId+env.nodeId 必须匹配 path canvas+node;防同 nodeId 跨 canvas 重放)
+    if (env.canvasId !== canvasId || env.nodeId !== childId) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'legacy-drain-scope-mismatch' })
+      return c.json({ error: 'bad-request', message: 'envelope canvasId/nodeId must match path' }, 400)
+    }
+    // ④ v8 quiet-window:任一 envelope 到达(经 authz+gate+scope)→ 重新计时(envelope 增量 +1;retirement 须重等完整窗口)
+    legacyDrainGate.touchWindow()
+    const result = await backend.legacyReplaceDrain(authz.ownerId, canvasId, 'node', childId, { payload: env.payload, baseRevision: env.baseRevision }, {
+      idempotencyKey: c.req.header('idempotency-key') || undefined,
+      method: 'PATCH',
+      resourceKind: 'node',
+      bodyFingerprint: fingerprint,
+      actor: authz.actor,
+    })
+    if (result.kind === 'replaced') {
+      legacyDrainGate.incrementDrainCount()
+      const res: UpsertResponse = { id: result.record.id, revision: result.record.revision, seq: result.seq }
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0, note: 'legacy-drain-replaced' })
+      return c.json(res, 200)
+    }
+    if (result.kind === 'stale-conflict') {
+      // ② 【lead 拍板】stale base → 409 terminal conflict dead-letter(不盲 replace;队列残留是离线期改动,覆盖是数据破坏)
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 409, latencyMs: Date.now() - t0, note: 'legacy-stale-conflict' })
+      return c.json({ error: 'legacy-stale-conflict', id: childId, currentRevision: result.currentRevision }, 409)
+    }
+    if (result.kind === 'cross-canvas') {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'cross-canvas' })
+      return c.json({ error: 'unknown-node' } satisfies UnknownResourceBody, 404)
+    }
+    // reuse-conflict:同 idem key 不同 fingerprint → 422
+    const err: ReuseConflictBody = reuseConflict(c.req.header('idempotency-key') ?? '')
+    logRequest({ method: c.req.method, path: c.req.path, requestId, status: 422, latencyMs: Date.now() - t0, note: 'reuse-conflict' })
+    return c.json(err, 422)
+  }
+
+  // ── A2-S2 节点级 PATCH DomainOp path(§10.1/§14.1;edit 永不 409,同 fieldKeyOf path stale 才 overwritten)──
+  const patchDomainChild = async (
     c: Context<AppEnv>,
     type: 'node' | 'edge' | 'anchor',
     childId: string,
@@ -481,21 +550,105 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
     const t0 = Date.now()
     const bad = rejectInvalidMivoApiKey(c)
     if (bad) return badMivo(c, requestId, t0)
-    let decoded
+    let raw: unknown, fingerprint: string
     try {
-      const { body: raw, fingerprint } = await readJsonBodyWithFingerprint<unknown>(c)
-      decoded = decodeUpsertRequest(raw, fingerprint)
+      const r = await readJsonBodyWithFingerprint<unknown>(c)
+      raw = r.body; fingerprint = r.fingerprint
     } catch (error) {
       const { status, body } = bodyError(error)
       logRequest({ method: c.req.method, path: c.req.path, requestId, status, latencyMs: Date.now() - t0, note: 'bad-body' })
       return c.json(body, status as 400 | 413)
     }
-    if (!decoded.ok) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: decoded.status, latencyMs: Date.now() - t0, note: 'bad-body' })
-      return c.json(decoded.body, decoded.status as 400 | 413)
+    // A2-S2 §14.3:legacy-replace 信封(nodes only)→ legacy drain 通道;edges/anchors 信封落 validateDomainOps → 400(非 DomainOp)。
+    if (type === 'node' && typeof raw === 'object' && raw !== null && (raw as { kind?: unknown }).kind === 'legacy-replace') {
+      return legacyDrainEnvelope(c, childId, raw, fingerprint, requestId, t0)
     }
-    // 返修 N1/N10:逐 type payload 白名单 runtime 校验(必填/类型/拒 unknown/非 string id/mirror/forbidden)。
-    const check = validateChildPayload(type, decoded.value.payload, childId)
+    // body = DomainOp | DomainOp[](batch 同 record 原子,§10.2);stale-client 旧 body → validateDomainOps throw → 400 payload-rejected(§1.2)。
+    let ops: DomainOp[]
+    try {
+      ops = validateDomainOps(raw)
+    } catch (e) {
+      const msg = e instanceof DomainOpError ? `${e.violation}${e.field ? ` (${e.field})` : ''}` : 'invalid domain op body'
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'payload-rejected' })
+      return c.json({ error: 'bad-request', message: msg }, 400)
+    }
+    const canvasId = c.req.param('id') ?? ''
+    const authz = await authzCanvas(c, canvasId, 'write')
+    if (!authz.ok) return denyCanvas(c, requestId, t0, authz)
+    if (authz.actor === null) return requireLogin(c, requestId, t0)
+    // §14.1:If-Match = opaque BaseCursor(decodeBase 验签+scope;missing → 428;malformed/unsigned/scope-mismatch → 400)。
+    const ifMatch = c.req.header('if-match')
+    if (!ifMatch) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 428, latencyMs: Date.now() - t0, note: 'precondition-required' })
+      return c.json(preconditionRequired(childId), 428)
+    }
+    const decodedBase = decodeBase(ifMatch, canvasId, childId)
+    if (!decodedBase) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'bad-base-cursor' })
+      return c.json({ error: 'bad-request', message: 'If-Match must be a valid signed BaseCursor for this canvas/record' }, 400)
+    }
+    const result = await backend.applyDomainOps(authz.ownerId, canvasId, type, childId, ops, {
+      baseRevision: decodedBase.revision,
+      baseFieldClocks: decodedBase.fieldClocks,
+      idempotencyKey: c.req.header('idempotency-key') || undefined,
+      method: 'PATCH',
+      resourceKind: type,
+      bodyFingerprint: fingerprint,
+      actor: authz.actor,
+    })
+    if (result.kind === 'reuse-conflict') {
+      const err: ReuseConflictBody = reuseConflict(c.req.header('idempotency-key') ?? '')
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 422, latencyMs: Date.now() - t0, note: 'reuse-conflict' })
+      return c.json(err, 422)
+    }
+    if (result.kind === 'cross-canvas' || result.kind === 'not-found') {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: result.kind })
+      return c.json({ error: `unknown-${type}` } satisfies UnknownResourceBody, 404)
+    }
+    if (result.kind === 'precondition-required') {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 428, latencyMs: Date.now() - t0, note: 'precondition-required' })
+      return c.json(preconditionRequired(childId), 428)
+    }
+    // accepted:edit 永不 409(§14.1);overwritten notices 先落 debug 面(§14.1 "通知前写者语义先落 debug 面";SSE 推送后续阶段)。
+    for (const o of result.overwritten) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: 0, note: `overwritten field=${o.fieldKey} byActor=${o.byActor} historicalValue=${JSON.stringify(o.historicalValue)}` })
+    }
+    const base = encodeBase(canvasId, childId, result.record.revision, result.fieldClocks)
+    const res: UpsertResponse = { id: result.record.id, revision: result.record.revision, seq: result.seq, base }
+    logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0 })
+    return c.json(res, 200)
+  }
+
+  // ── A2-S2 POST create client-id path(§10.2;CreateBody 零 privileged,dup → 409)──
+  const createDomainChild = async (
+    c: Context<AppEnv>,
+    type: 'node' | 'edge' | 'anchor',
+    childId: string,
+  ): Promise<Response> => {
+    const requestId = newRequestId()
+    c.header('X-Request-Id', requestId)
+    const t0 = Date.now()
+    const bad = rejectInvalidMivoApiKey(c)
+    if (bad) return badMivo(c, requestId, t0)
+    let raw: unknown, fingerprint: string
+    try {
+      const r = await readJsonBodyWithFingerprint<unknown>(c)
+      raw = r.body; fingerprint = r.fingerprint
+    } catch (error) {
+      const { status, body } = bodyError(error)
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status, latencyMs: Date.now() - t0, note: 'bad-body' })
+      return c.json(body, status as 400 | 413)
+    }
+    let createBody
+    try {
+      createBody = validateCreateBody(raw)
+    } catch (e) {
+      const msg = e instanceof DomainOpError ? `${e.violation}${e.field ? ` (${e.field})` : ''}` : 'invalid create body'
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'payload-rejected' })
+      return c.json({ error: 'bad-request', message: msg }, 400)
+    }
+    // payload 白名单校验(复用 N1/N10 validateChildPayload;id 来自 path,不校验 payload.id)。
+    const check = validateChildPayload(type, createBody.payload, childId)
     if (!check.ok) {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'payload-rejected' })
       return c.json(check.body, 400)
@@ -503,19 +656,13 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
     const canvasId = c.req.param('id') ?? ''
     const authz = await authzCanvas(c, canvasId, 'write')
     if (!authz.ok) return denyCanvas(c, requestId, t0, authz)
-    // N5:If-Match 严格(parseIfMatch;invalid → 400,missing → 428 via backend,value → base)。
-    const parsed = parseIfMatch(c.req.header('if-match'))
-    if (parsed.kind === 'invalid') {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'bad-if-match' })
-      return c.json(badIfMatch(childId), 400)
-    }
-    const base = parsed.kind === 'value' ? parsed.revision : undefined
-    const result = await backend.upsertChild(authz.ownerId, canvasId, type, childId, check.payload, {
-      base,
-      method: 'PATCH',
-      resourceKind: type,
+    if (authz.actor === null) return requireLogin(c, requestId, t0)
+    const result = await backend.createChild(authz.ownerId, canvasId, type, childId, check.payload, {
       idempotencyKey: c.req.header('idempotency-key') || undefined,
-      bodyFingerprint: decoded.fingerprint,
+      method: 'POST',
+      resourceKind: type,
+      bodyFingerprint: fingerprint,
+      actor: authz.actor,
     })
     if (result.kind === 'reuse-conflict') {
       const err: ReuseConflictBody = reuseConflict(c.req.header('idempotency-key') ?? '')
@@ -526,9 +673,54 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'cross-canvas' })
       return c.json({ error: `unknown-${type}` } satisfies UnknownResourceBody, 404)
     }
-    // not-found 仅 chat PATCH(strictUpdate)可触发;node/edge/anchor 非 strict 不走此分支,防御性 404。
-    if (result.kind === 'not-found') {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'unknown' })
+    if (result.kind === 'dup-conflict') {
+      const err: ConflictBody = { error: 'revision-conflict', id: childId, currentRevision: result.existingRevision }
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 409, latencyMs: Date.now() - t0, note: 'create-dup' })
+      return c.json(err, 409)
+    }
+    // created:create 不伪造 base(§14.1);签发新 base(空 fieldClocks)。
+    const base = encodeBase(canvasId, childId, result.record.revision, result.fieldClocks)
+    const res: UpsertResponse = { id: result.record.id, revision: result.record.revision, seq: result.seq, base }
+    logRequest({ method: c.req.method, path: c.req.path, requestId, status: 201, latencyMs: Date.now() - t0 })
+    return c.json(res, 201)
+  }
+
+  // ── A2-S2 DELETE node-delete-cascade(§10.4/§10.7;fresh base → 200, stale → 409 race)──
+  const deleteChildCascadeHandler = async (
+    c: Context<AppEnv>,
+    type: 'node' | 'edge' | 'anchor',
+    childId: string,
+  ): Promise<Response> => {
+    const requestId = newRequestId()
+    c.header('X-Request-Id', requestId)
+    const t0 = Date.now()
+    const bad = rejectInvalidMivoApiKey(c)
+    if (bad) return badMivo(c, requestId, t0)
+    const canvasId = c.req.param('id') ?? ''
+    const authz = await authzCanvas(c, canvasId, 'write')
+    if (!authz.ok) return denyCanvas(c, requestId, t0, authz)
+    if (authz.actor === null) return requireLogin(c, requestId, t0)
+    // §14.1:If-Match = BaseCursor(missing → 428;malformed/scope → 400)。
+    const ifMatch = c.req.header('if-match')
+    if (!ifMatch) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 428, latencyMs: Date.now() - t0, note: 'precondition-required' })
+      return c.json(preconditionRequired(childId), 428)
+    }
+    const decodedBase = decodeBase(ifMatch, canvasId, childId)
+    if (!decodedBase) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'bad-base-cursor' })
+      return c.json({ error: 'bad-request', message: 'If-Match must be a valid signed BaseCursor for this canvas/record' }, 400)
+    }
+    const result = await backend.deleteChildCascade(authz.ownerId, canvasId, type, childId, {
+      baseRevision: decodedBase.revision,
+      idempotencyKey: c.req.header('idempotency-key') || undefined,
+      method: 'DELETE',
+      resourceKind: type,
+      bodyFingerprint: undefined,
+      actor: authz.actor,
+    })
+    if (result.kind === 'cross-canvas') {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'cross-canvas' })
       return c.json({ error: `unknown-${type}` } satisfies UnknownResourceBody, 404)
     }
     if (result.kind === 'precondition-required') {
@@ -537,41 +729,30 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
     }
     if (result.kind === 'conflict') {
       const err: ConflictBody = { error: 'revision-conflict', id: childId, currentRevision: result.currentRevision }
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 409, latencyMs: Date.now() - t0, note: 'rev-conflict' })
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 409, latencyMs: Date.now() - t0, note: 'delete-race' })
       return c.json(err, 409)
     }
-    const res: UpsertResponse = { id: result.record.id, revision: result.record.revision }
-    logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0 })
-    return c.json(res, 200)
-  }
-
-  route.patch('/:id/nodes/:nodeId', (c) => patchChild(c, 'node', c.req.param('nodeId') ?? ''))
-  route.patch('/:id/edges/:edgeId', (c) => patchChild(c, 'edge', c.req.param('edgeId') ?? ''))
-  route.patch('/:id/anchors/:anchorId', (c) => patchChild(c, 'anchor', c.req.param('anchorId') ?? ''))
-
-  // 返修 #2/#8:DELETE child record(node/edge/anchor 真硬删)。canvas 须存在未删 + N7 authz。
-  const deleteChild = async (c: Context<AppEnv>, type: 'node' | 'edge' | 'anchor'): Promise<Response> => {
-    const requestId = newRequestId()
-    c.header('X-Request-Id', requestId)
-    const t0 = Date.now()
-    const bad = rejectInvalidMivoApiKey(c)
-    if (bad) return badMivo(c, requestId, t0)
-    const canvasId = c.req.param('id') ?? ''
-    const childId = c.req.param('nodeId') ?? c.req.param('edgeId') ?? c.req.param('anchorId') ?? ''
-    const authz = await authzCanvas(c, canvasId, 'write')
-    if (!authz.ok) return denyCanvas(c, requestId, t0, authz)
-    const { deleted } = await backend.hardDeleteChild(authz.ownerId, canvasId, type, childId)
-    if (!deleted) {
-      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
+    if (result.kind === 'not-found') {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'unknown' })
       return c.json({ error: `unknown-${type}` } satisfies UnknownResourceBody, 404)
     }
-    logRequest({ method: c.req.method, path: c.req.path, requestId, status: 204, latencyMs: Date.now() - t0 })
-    return c.body(null, 204)
+    // deleted / idempotent:返 seq cursor(§10.7 accepted 必携 cursor;幂等已删不 404)。
+    logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0, note: result.kind })
+    return c.json({ id: childId, seq: result.seq }, 200)
   }
 
-  route.delete('/:id/nodes/:nodeId', (c) => deleteChild(c, 'node'))
-  route.delete('/:id/edges/:edgeId', (c) => deleteChild(c, 'edge'))
-  route.delete('/:id/anchors/:anchorId', (c) => deleteChild(c, 'anchor'))
+  route.patch('/:id/nodes/:nodeId', (c) => patchDomainChild(c, 'node', c.req.param('nodeId') ?? ''))
+  route.patch('/:id/edges/:edgeId', (c) => patchDomainChild(c, 'edge', c.req.param('edgeId') ?? ''))
+  route.patch('/:id/anchors/:anchorId', (c) => patchDomainChild(c, 'anchor', c.req.param('anchorId') ?? ''))
+  // A2-S2(§10.2):POST create client-id path(CreateBody 零 privileged;dup → 409)。
+  route.post('/:id/nodes/:nodeId', (c) => createDomainChild(c, 'node', c.req.param('nodeId') ?? ''))
+  route.post('/:id/edges/:edgeId', (c) => createDomainChild(c, 'edge', c.req.param('edgeId') ?? ''))
+  route.post('/:id/anchors/:anchorId', (c) => createDomainChild(c, 'anchor', c.req.param('anchorId') ?? ''))
+
+  // A2-S2(§10.4/§10.7):DELETE node-delete-cascade(fresh base → 200 + seq cursor;stale → 409 race)。
+  route.delete('/:id/nodes/:nodeId', (c) => deleteChildCascadeHandler(c, 'node', c.req.param('nodeId') ?? ''))
+  route.delete('/:id/edges/:edgeId', (c) => deleteChildCascadeHandler(c, 'edge', c.req.param('edgeId') ?? ''))
+  route.delete('/:id/anchors/:anchorId', (c) => deleteChildCascadeHandler(c, 'anchor', c.req.param('anchorId') ?? ''))
 
   // ── chat 子资源(DP-6 + N2/N3)──
 

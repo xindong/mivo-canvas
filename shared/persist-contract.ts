@@ -104,10 +104,68 @@ export type UpsertRequest<Payload = unknown> = {
   payload: Payload
 }
 
-/** 写成功响应(201/200)。revision = post-bump(调用方免二次读)。 */
+/**
+ * 写成功响应(201/200)。revision = post-bump(调用方免二次读)。
+ *
+ * A2-S2 过渡态(§10.2):扩 seq(per-canvas 单调事件序号)+ base(opaque BaseCursor string,accepted 后签发)。
+ *   - TODO(A2-S3): strictify seq/base — 阶段 3 client adapter 接线时,改必填 + 恢复 client contract test 的 exact type test(toEqualTypeOf)。
+ *   - 当前 optional:旧 client(只读 id/revision)不 break;新 server route(PATCH/POST/DELETE)返全字段。
+ *   - base 是 opaque string(server encodeBase 签发,client 不读内部,回传 If-Match)。
+ */
 export type UpsertResponse = {
   id: string
   revision: Revision
+  /** A2-S2:per-canvas 单调事件序号(§10.5;?since=seq 补拉)。optional 过渡,阶段 3 必填。 */
+  seq?: number
+  /** A2-S2:opaque BaseCursor string(§14.1;accepted 后签发新 base,client 回传 If-Match)。optional 过渡,阶段 3 必填。 */
+  base?: string
+}
+
+// ── A2-S2 field-level DomainOp wire 契约(§10.1;server/client 共享;server/lib/domainOp.ts 提供 validator)──
+// TODO(A2-S3): 阶段 3 client adapter 接线时,DomainOp/CreateBody 投入生产 wire(client 发,server 收)。
+/** FieldPath = 非空 tuple(G1-b R4-P1-1 / S10-6;运行时拒空)。leaf-level 域语义路径,非 RFC6902 JSON-Pointer。 */
+export type FieldPath = readonly [string | number, ...(string | number)[]]
+/**
+ * DomainOp = 单 record LWW delta(§10.1;无 recordId/actor/base/opId,全 adapter/path/header 注入)。
+ * 无 create(走独立 POST)/ 无 strict-tx(改 server-named)/ 无 by-id(A2 deferred,fail-visible)。
+ */
+export type DomainOp =
+  | { kind: 'set'; fieldPath: FieldPath; value: unknown }
+  | { kind: 'unset'; fieldPath: FieldPath }
+  | { kind: 'array'; fieldPath: FieldPath; class: 'whole-lww'; intent: 'replace'; value: unknown[] }
+  | { kind: 'array'; fieldPath: FieldPath; class: 'primitive'; intent: 'insert' | 'remove'; value: string }
+  | { kind: 'reorder'; orderedIds: string[] }
+/** server-named invariant command(跨 record 原子,§10.4;仅 node-delete-cascade 实证;其余类型+注释级)。 */
+export type ServerInvariantCommand =
+  | { kind: 'node-delete-cascade'; canvasId: string; nodeId: string }
+  | { kind: 'group-reparent'; canvasId: string; nodeIds: string[]; targetGroupId: string | null }
+  | { kind: 'result-asset-attach'; canvasId: string; anchorId: string; assetId: string; resultNodeId: string }
+export type RecordKind = 'node' | 'edge' | 'anchor'
+/** CreateBody = POST /:id/nodes/:nodeId body(§10.2;零 privileged,id 来自 path client NodeRecord.id)。 */
+export type CreateBody = { clientId: string; type: RecordKind; payload: unknown }
+/**
+ * LegacyReplaceRequest 信封(§14.3;FX-5 队列迁移 drain-only 兼容通道)。
+ * - 绑 canvasId+nodeId+原队列 baseRevision;scope 校验防同 nodeId 跨 canvas 重放。
+ * - 四态矩阵:existing+base=rev→200 replace / existing+base≠rev→409 / missing+base>0→409 dead-letter / missing+base=0→create。
+ * - LEGACY_DRAIN gate env 默认关;retirement 后消失(主写唯一 DomainOp)。受控迁移协议例外(非双协议窗口)。
+ */
+export type LegacyReplaceRequest = {
+  kind: 'legacy-replace'
+  canvasId: string
+  nodeId: string
+  version: 1
+  payload: unknown
+  baseRevision: Revision
+}
+/** Legacy drain 观测 + retirement 判定接口(§14.3;drainCount 累计 + pending gauge + quiet-window 60_000ms)。 */
+export type LegacyDrainStatus = {
+  drainCount: number
+  pendingGauge: number
+  envelopeIncrementInWindow: number
+  quietWindowMs: number
+  elapsedMs: number
+  /** canRetire:pending=0 + 窗内 envelope 增量=0 + elapsed>=quietWindowMs(连续 quiet-window 内无 envelope 到达)。 */
+  canRetire: boolean
 }
 
 /** 409 revision 冲突体(api-surface §2)。客户端据此 rebase。 */

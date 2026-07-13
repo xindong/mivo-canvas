@@ -43,7 +43,9 @@ import type { NodeRecord } from '../kernel/records'
 
 describe('T1.3 ServerPersistAdapter ↔ server contract 类型共享互锁(返修版二)', () => {
   it('shared wire 类型被 client + server 共同 import(互锁基础)', () => {
-    expectTypeOf<UpsertResponse>().toEqualTypeOf<{ id: string; revision: Revision }>()
+    // A2-S2:UpsertResponse 扩 optional seq/base(§10.2);toEqualTypeOf→toMatchTypeOf 松绑(阶段 3 client 接线时改必填 + 恢复 toEqualTypeOf)。
+    // TODO(A2-S3): strictify seq/base — 改必填 + 恢复 exact type test。
+    expectTypeOf<UpsertResponse>().toMatchTypeOf<{ id: string; revision: Revision }>()
     expectTypeOf<ConflictBody>().toEqualTypeOf<{ error: 'revision-conflict'; id: string; currentRevision: Revision }>()
   })
 

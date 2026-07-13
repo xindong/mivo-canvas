@@ -25,17 +25,24 @@ import { Migrator, type Migration, type MigrationProvider } from 'kysely/migrati
 import { migrations } from './migrations'
 import type { PgConnectionConfig } from './pgConfig'
 import type {
+  ApplyDomainOpsResult,
+  CreateChildResult,
+  DeleteChildResult,
   EnsureChildResult,
   EnsureCreateResult,
   GetChildResult,
   GetResult,
+  LegacyReplaceDrainResult,
   ListResult,
+  OverwrittenNotice,
   PersistBackend,
   PersistRecord,
   ReorderResult,
   UpsertChildResult,
   UpsertResult,
 } from './backend'
+import { fieldKeyOf, setByPath, unsetByPath, getByPath, type DomainOp } from '../lib/domainOp'
+import type { FieldClocks } from '../lib/baseCursor'
 import type { PersistScope, PersistType, Revision } from '../../shared/persist-contract.ts'
 
 // ── Kysely Database 类型(列 SelectType=读类型;Generated=有 DB 默认值可省略插入)──────────
@@ -81,15 +88,49 @@ interface ChatOrderRevisionsTable {
   revision: Generated<number>
   updated_at: Generated<Date>
 }
+// ── A2-S2(§14.1/§10.5/§10.7;009 migration)──
+/** per-record per-field clock(fieldKeyOf 完整 path 粒度;同-field stale 判定)+ writer(overwritten byActor)。 */
+interface FieldClocksTable {
+  record_key: string
+  field_key: string
+  clock: Generated<number>
+  writer: string | null
+  updated_at: Generated<Date>
+}
+/** per-canvas 单调事件序号 seq(§10.5;?since=seq 补拉)。 */
+interface CanvasSeqTable {
+  canvas_id: string
+  seq: Generated<number>
+  updated_at: Generated<Date>
+}
+/** child tombstone(§10.7 幂等已删返 seq vs 从未存在 404;物理删后留占位)。 */
+interface ChildTombstonesTable {
+  record_key: string
+  canvas_id: string
+  seq_at_delete: number
+  deleted_at: Generated<Date>
+}
 interface Database {
   persist_records: PersistRecordsTable
   projects: GlobalIndexTable
   canvases: GlobalIndexTable
   idempotency_index: IdempotencyTable
   chat_order_revisions: ChatOrderRevisionsTable
+  field_clocks: FieldClocksTable
+  canvas_seq: CanvasSeqTable
+  child_tombstones: ChildTombstonesTable
 }
 
 const clone = <T>(value: T): T => structuredClone(value)
+
+/**
+ * PG record_key(009 migration field_clocks/child_tombstones.record_key TEXT 列)。
+ * InMemory recordKey() 用 NUL('\0')分隔(Map key,进程内安全),但 PG TEXT 列拒 0x00 字节。
+ * PG 用 \x1f unit-separator 替代(TEXT 安全:PG TEXT 仅拒 0x00,其余控制字符可存;不出现于 ownerId/type/id)。
+ * 逻辑同 recordKey()(同 (ownerId,type,id) → 同 key),仅分隔符不同(PG/InMemory 独立后端,record_key 不跨用)。
+ */
+const pgRecordKey = (ownerId: string, type: PersistType, id: string): string =>
+  `${ownerId}\x1f${type}\x1f${id}`
 
 /** DB 行 → PersistRecord(.returningAll()/.selectAll() 返 Selectable:revision→number, created_at→Date, payload→object;Date→ISO,jsonb payload→对象)。idempotencyKey/fingerprint 不持久化在 record 行,由写方法从 opts 回填。 */
 const rowToRecord = (row: Selectable<PersistRecordsTable>): PersistRecord => ({
@@ -1164,6 +1205,52 @@ export class PgPersistBackend implements PersistBackend {
     )
   }
 
+  // ── A2-S2 §14.3:legacy drain(PATCH /:id/nodes/:nodeId 复用 decoder wire;FX-5 队列迁移 drain-only 兼容通道)──
+  // 四态矩阵(同 InMemory;fresh 落 upsertChild(base 重验)作 TOCTOU guard;seq 独立 tx bump,observability cursor)。
+  async legacyReplaceDrain(
+    ownerId: string,
+    canvasId: string,
+    type: PersistType,
+    recordId: string,
+    env: { payload: unknown; baseRevision: Revision },
+    opts: { idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string; actor: string },
+  ): Promise<LegacyReplaceDrainResult> {
+    await this.ready
+    // 先 getChild 判 stale(existing+base≠rev / missing+base>0 → 409 dead-letter),fresh 再 upsertChild 原子写。
+    const got = await this.getChild(ownerId, canvasId, type, recordId)
+    if (got.kind === 'cross-canvas') return { kind: 'cross-canvas' }
+    if (got.kind === 'found') {
+      // existing+base≠rev → 409 terminal conflict(不盲 replace;队列残留是离线期改动,覆盖是数据破坏)
+      if (env.baseRevision !== got.record.revision) {
+        return { kind: 'stale-conflict', currentRevision: got.record.revision }
+      }
+      // fresh(existing+base=rev)→ 落 upsertChild(base 重验,TOCTOU guard)
+    } else {
+      // missing+base>0 → 409 dead-letter(防盲 create 复活已删 record);missing+base=0 → create fresh 落 upsertChild
+      if (env.baseRevision > 0) return { kind: 'stale-conflict', currentRevision: 0 }
+    }
+    // whole-record replace(委托 upsertChild;base=env.baseRevision → upsertChild conflict check 充当 TOCTOU guard:
+    //   getChild 与 write 之间并发写 bump revision → upsertChild base≠current → conflict,非盲 replace)。
+    const r = await this.upsertChild(ownerId, canvasId, type, recordId, env.payload, {
+      base: env.baseRevision,
+      idempotencyKey: opts.idempotencyKey,
+      method: opts.method,
+      resourceKind: opts.resourceKind,
+      bodyFingerprint: opts.bodyFingerprint,
+      strictUpdate: false,
+    })
+    if (r.kind === 'created' || r.kind === 'updated') {
+      // seq = per-canvas 单调事件序号(§10.5);独立 tx bump(observability cursor,record 写已由 upsertChild 原子落)。
+      const seq = await this.db.transaction().execute(async (trx) => this.nextCanvasSeqInTrx(trx, canvasId))
+      return { kind: 'replaced', record: r.record, seq }
+    }
+    if (r.kind === 'conflict') return { kind: 'stale-conflict', currentRevision: r.currentRevision }
+    if (r.kind === 'cross-canvas') return { kind: 'cross-canvas' }
+    if (r.kind === 'reuse-conflict') return { kind: 'reuse-conflict' }
+    // precondition-required / not-found —— 不应发生(传了 base + strictUpdate=false);防御返 stale-conflict
+    return { kind: 'stale-conflict', currentRevision: 0 }
+  }
+
   async hardDeleteChild(ownerId: string, canvasId: string, type: PersistType, id: string): Promise<{ deleted: boolean }> {
     await this.ready
     return this.db.transaction().execute(async (trx) => {
@@ -1175,6 +1262,270 @@ export class PgPersistBackend implements PersistBackend {
       if (type !== 'chat-message') await this.bumpCanvasContentVersionInTrx(trx, ownerId, canvasId)
       return { deleted: true }
     })
+  }
+
+  // ── A2-S2 PG helpers(canvas_seq / field_clocks / child_tombstones;009 migration 表;conn=trx 或 this.db 均可)──
+  /** 事务内 bump per-canvas seq(UPSERT;首 INSERT seq=1,conflict seq+1);返新 seq。 */
+  private async nextCanvasSeqInTrx(conn: Kysely<Database>, canvasId: string): Promise<number> {
+    const row = await conn
+      .insertInto('canvas_seq')
+      .values({ canvas_id: canvasId, seq: 1 })
+      .onConflict((oc) => oc.column('canvas_id').doUpdateSet({ seq: sql`canvas_seq.seq + 1`, updated_at: new Date() }))
+      .returning('seq')
+      .executeTakeFirstOrThrow()
+    return Number(row.seq)
+  }
+  /** 事务内读 per-canvas seq(缺省 0)。 */
+  private async readCanvasSeqInTrx(conn: Kysely<Database>, canvasId: string): Promise<number> {
+    const r = await conn.selectFrom('canvas_seq').select('seq').where('canvas_id', '=', canvasId).executeTakeFirst()
+    return r ? Number(r.seq) : 0
+  }
+  /** 事务内读 per-record per-field clock(缺省 0)。 */
+  private async getFieldClockInTrx(conn: Kysely<Database>, rk: string, fieldKey: string): Promise<number> {
+    const r = await conn.selectFrom('field_clocks').select('clock').where('record_key', '=', rk).where('field_key', '=', fieldKey).executeTakeFirst()
+    return r ? Number(r.clock) : 0
+  }
+  /** 事务内 bump per-record per-field clock(UPSERT;首 INSERT clock=1,conflict clock+1)+ writer;返新 clock。 */
+  private async bumpFieldClockInTrx(conn: Kysely<Database>, rk: string, fieldKey: string, writer: string): Promise<number> {
+    const row = await conn
+      .insertInto('field_clocks')
+      .values({ record_key: rk, field_key: fieldKey, clock: 1, writer, updated_at: new Date() })
+      .onConflict((oc) => oc.columns(['record_key', 'field_key']).doUpdateSet({ clock: sql`field_clocks.clock + 1`, writer, updated_at: new Date() }))
+      .returning('clock')
+      .executeTakeFirstOrThrow()
+    return Number(row.clock)
+  }
+  /** 事务内读 per-record 全 fieldClocks 快照(供 route encodeBase)。 */
+  private async snapshotFieldClocksInTrx(conn: Kysely<Database>, rk: string): Promise<FieldClocks> {
+    const rows = await conn.selectFrom('field_clocks').select(['field_key', 'clock']).where('record_key', '=', rk).execute()
+    const out: FieldClocks = {}
+    for (const r of rows) out[r.field_key] = Number(r.clock)
+    return out
+  }
+  /** 事务内读 per-field writer(overwritten notice 的 byActor;缺省 'unknown')。 */
+  private async getFieldWriterInTrx(conn: Kysely<Database>, rk: string, fieldKey: string): Promise<string> {
+    const r = await conn.selectFrom('field_clocks').select('writer').where('record_key', '=', rk).where('field_key', '=', fieldKey).executeTakeFirst()
+    return r?.writer ?? 'unknown'
+  }
+  /** 事务内查 tombstone(§10.7 幂等已删返 seq vs 从未存在 404)。 */
+  private async isTombstonedInTrx(conn: Kysely<Database>, rk: string): Promise<boolean> {
+    const r = await conn.selectFrom('child_tombstones').select('record_key').where('record_key', '=', rk).executeTakeFirst()
+    return !!r
+  }
+  /** 事务内写 tombstone(物理删后留占位;ON CONFLICT DO NOTHING 幂等)。 */
+  private async setTombstoneInTrx(conn: Kysely<Database>, rk: string, canvasId: string, seqAtDelete: number): Promise<void> {
+    await conn
+      .insertInto('child_tombstones')
+      .values({ record_key: rk, canvas_id: canvasId, seq_at_delete: seqAtDelete })
+      .onConflict((oc) => oc.column('record_key').doNothing())
+      .execute()
+  }
+
+  // ── A2-S2 field-level DomainOp 路径(§10.1/§14.1;PG 单事务实装,逻辑同 InMemory,复用 domainOp setByPath)──
+  async applyDomainOps(
+    ownerId: string,
+    canvasId: string,
+    type: PersistType,
+    recordId: string,
+    ops: DomainOp[],
+    opts: {
+      baseRevision?: Revision
+      baseFieldClocks?: FieldClocks
+      idempotencyKey?: string
+      method: string
+      resourceKind: string
+      bodyFingerprint?: string
+      actor: string
+    },
+  ): Promise<ApplyDomainOpsResult> {
+    await this.ready
+    try {
+      return await this.db.transaction().execute(async (trx) => {
+        const rk = pgRecordKey(ownerId,type, recordId)
+        // idem 预检 replay(同 key 已提交 → 返既有 accepted,不二次 bump,§10.3 idempotent replay)
+        if (opts.idempotencyKey) {
+          const entry = await trx.selectFrom('idempotency_index').select(['fingerprint', 'envelope_owner', 'envelope_type', 'envelope_id']).where('owner_id', '=', ownerId).where('method', '=', opts.method).where('resource_kind', '=', opts.resourceKind).where('key', '=', opts.idempotencyKey).executeTakeFirst()
+          if (entry) {
+            const r = await trx.selectFrom('persist_records').selectAll().where('owner_id', '=', entry.envelope_owner).where('type', '=', entry.envelope_type).where('id', '=', entry.envelope_id).executeTakeFirst()
+            if (r) {
+              if (r.canvas_id !== canvasId) return { kind: 'cross-canvas' }
+              if (opts.bodyFingerprint && entry.fingerprint !== opts.bodyFingerprint) return { kind: 'reuse-conflict' }
+              return { kind: 'accepted', record: this.withIdem(rowToRecord(r), opts), seq: await this.readCanvasSeqInTrx(trx, canvasId), fieldClocks: await this.snapshotFieldClocksInTrx(trx, rk), overwritten: [] }
+            }
+            // stale idem entry(record 物理删)→ 清 + 继续写
+            await trx.deleteFrom('idempotency_index').where('owner_id', '=', ownerId).where('method', '=', opts.method).where('resource_kind', '=', opts.resourceKind).where('key', '=', opts.idempotencyKey).execute()
+          }
+        }
+        // SELECT existing FOR UPDATE(锁 record 行,序列化并发 edit;edit 永不 409,base 仅作 overwritten 判定)
+        const existing = await trx.selectFrom('persist_records').selectAll().where('owner_id', '=', ownerId).where('type', '=', type).where('id', '=', recordId).forUpdate().executeTakeFirst()
+        if (existing && existing.canvas_id !== canvasId) return { kind: 'cross-canvas' }
+        if (!existing || existing.is_deleted) return { kind: 'not-found' }
+        if (opts.baseRevision === undefined) return { kind: 'precondition-required' }
+        // ★ batch 同 record 原子:逐 op apply(clone payload)+ 收集 toBump;全 ok 后统一 bump+UPDATE(无 partial)。
+        const updatedPayload = clone(existing.payload) as Record<string, unknown>
+        const overwritten: OverwrittenNotice[] = []
+        const toBump: string[] = []
+        const seenFields = new Set<string>()
+        for (const op of ops) {
+          if (op.kind === 'reorder') throw new Error('reorder op not allowed in applyDomainOps (use reorderChildren)')
+          const fieldPath = [...op.fieldPath] as (string | number)[]
+          const fkey = fieldKeyOf(fieldPath)
+          // §14.1:同 fieldKeyOf path stale(base.clock < current.clock)才 overwritten;不同 field stale 不误报。
+          if (!seenFields.has(fkey)) {
+            seenFields.add(fkey)
+            const currentClock = await this.getFieldClockInTrx(trx, rk, fkey)
+            const baseClock = opts.baseFieldClocks?.[fkey] ?? 0
+            if (baseClock < currentClock) {
+              overwritten.push({ fieldKey: fkey, historicalValue: getByPath(clone(existing.payload) as Record<string, unknown>, fieldPath), byActor: await this.getFieldWriterInTrx(trx, rk, fkey), currentRevision: Number(existing.revision) })
+            }
+          }
+          if (op.kind === 'set') {
+            setByPath(updatedPayload, fieldPath, op.value)
+          } else if (op.kind === 'unset') {
+            unsetByPath(updatedPayload, fieldPath)
+          } else if (op.kind === 'array') {
+            if (op.class === 'whole-lww') {
+              setByPath(updatedPayload, fieldPath, op.value, { allowContainerClobber: true })
+            } else {
+              const arr = getByPath(updatedPayload, fieldPath)
+              const set = Array.isArray(arr) ? arr.filter((x): x is string => typeof x === 'string') : []
+              if (op.intent === 'insert') { if (!set.includes(op.value)) set.push(op.value) }
+              else { const i = set.indexOf(op.value); if (i >= 0) set.splice(i, 1) }
+              setByPath(updatedPayload, fieldPath, set, { allowContainerClobber: true })
+            }
+          }
+          toBump.push(fkey)
+        }
+        // 全 op apply 成功 → UPDATE payload/revision + bump fieldClocks + canvas_seq + contentVersion + idem row(同事务原子)
+        const newRev = Number(existing.revision) + 1
+        const updated = await trx.updateTable('persist_records').set({ payload: JSON.stringify(updatedPayload), revision: newRev, updated_at: new Date() }).where('owner_id', '=', ownerId).where('type', '=', type).where('id', '=', recordId).returningAll().executeTakeFirst()
+        if (!updated) throw new Error('applyDomainOps: update affected 0 rows (record vanished mid-tx;FOR UPDATE should prevent)')
+        for (const fkey of toBump) await this.bumpFieldClockInTrx(trx, rk, fkey, opts.actor)
+        const seq = await this.nextCanvasSeqInTrx(trx, canvasId)
+        if (type !== 'chat-message') await this.bumpCanvasContentVersionInTrx(trx, ownerId, canvasId)
+        await this.setIdempotencyEntryInTrx(trx, ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, opts.bodyFingerprint ?? '', ownerId, type, recordId)
+        return { kind: 'accepted', record: this.withIdem(rowToRecord(updated), opts), seq, fieldClocks: await this.snapshotFieldClocksInTrx(trx, rk), overwritten }
+      })
+    } catch (e) {
+      // IdempotencyRaceLost:并发同 idem key,输家事务回滚 → 重读赢家构造 replay(同 body)/reuse-conflict(不同 body)
+      if (e instanceof IdempotencyRaceLost) {
+        if (e.fingerprintMismatch) return { kind: 'reuse-conflict' }
+        const r = await this.db.selectFrom('persist_records').selectAll().where('owner_id', '=', ownerId).where('type', '=', type).where('id', '=', recordId).executeTakeFirst()
+        if (!r || r.canvas_id !== canvasId) return { kind: 'cross-canvas' }
+        const rk = pgRecordKey(ownerId,type, recordId)
+        return { kind: 'accepted', record: this.withIdem(rowToRecord(r), opts), seq: await this.readCanvasSeqInTrx(this.db, canvasId), fieldClocks: await this.snapshotFieldClocksInTrx(this.db, rk), overwritten: [] }
+      }
+      throw e
+    }
+  }
+
+  async createChild(
+    ownerId: string,
+    canvasId: string,
+    type: PersistType,
+    recordId: string,
+    payload: unknown,
+    opts: { idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string; actor: string },
+  ): Promise<CreateChildResult> {
+    await this.ready
+    try {
+      return await this.db.transaction().execute(async (trx) => {
+        // idem 预检 replay
+        if (opts.idempotencyKey) {
+          const entry = await trx.selectFrom('idempotency_index').select(['fingerprint', 'envelope_owner', 'envelope_type', 'envelope_id']).where('owner_id', '=', ownerId).where('method', '=', opts.method).where('resource_kind', '=', opts.resourceKind).where('key', '=', opts.idempotencyKey).executeTakeFirst()
+          if (entry) {
+            const r = await trx.selectFrom('persist_records').selectAll().where('owner_id', '=', entry.envelope_owner).where('type', '=', entry.envelope_type).where('id', '=', entry.envelope_id).executeTakeFirst()
+            if (r) {
+              if (r.canvas_id !== canvasId) return { kind: 'cross-canvas' }
+              if (opts.bodyFingerprint && entry.fingerprint !== opts.bodyFingerprint) return { kind: 'reuse-conflict' }
+              return { kind: 'created', record: this.withIdem(rowToRecord(r), opts), seq: await this.readCanvasSeqInTrx(trx, canvasId), fieldClocks: {} }
+            }
+            await trx.deleteFrom('idempotency_index').where('owner_id', '=', ownerId).where('method', '=', opts.method).where('resource_kind', '=', opts.resourceKind).where('key', '=', opts.idempotencyKey).execute()
+          }
+        }
+        const rk = pgRecordKey(ownerId,type, recordId)
+        // SELECT existing(create 用 INSERT ON CONFLICT 自身原子;不加 FOR UPDATE)
+        const existing = await trx.selectFrom('persist_records').selectAll().where('owner_id', '=', ownerId).where('type', '=', type).where('id', '=', recordId).executeTakeFirst()
+        if (existing && existing.canvas_id !== canvasId) return { kind: 'cross-canvas' }
+        // existing & !isDeleted → dup-conflict(§10.2 create dup→409;不借 PATCH create)
+        if (existing && !existing.is_deleted) return { kind: 'dup-conflict', existingRevision: Number(existing.revision) }
+        // create(id 来自 path,client-id;返 seq+空 fieldClocks 供 route encodeBase;软删重建走 ON CONFLICT doUpdateSet)
+        const rev = existing ? Number(existing.revision) + 1 : 1
+        const orderKey = existing ? Number(existing.order_key) : await this.nextOrderKeyInTrx(trx, ownerId, canvasId, type)
+        const created = await trx
+          .insertInto('persist_records')
+          .values({ id: recordId, owner_id: ownerId, canvas_id: canvasId, type, scope: 'document', revision: rev, order_key: orderKey, is_deleted: false, payload: JSON.stringify(payload) })
+          .onConflict((oc) => oc.columns(['owner_id', 'type', 'id']).doUpdateSet({ payload: JSON.stringify(payload), is_deleted: false, revision: rev, canvas_id: canvasId, updated_at: new Date() }))
+          .returningAll()
+          .executeTakeFirst()
+        if (!created) throw new Error(`createChild: insert failed for ${type}:${recordId}`)
+        await trx.deleteFrom('child_tombstones').where('record_key', '=', rk).execute() // 重建清 tombstone(§10.7 幂等已删 → 重建后不再 idempotent)
+        const seq = await this.nextCanvasSeqInTrx(trx, canvasId)
+        if (type !== 'chat-message') await this.bumpCanvasContentVersionInTrx(trx, ownerId, canvasId)
+        await this.setIdempotencyEntryInTrx(trx, ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, opts.bodyFingerprint ?? '', ownerId, type, recordId)
+        return { kind: 'created', record: this.withIdem(rowToRecord(created), opts), seq, fieldClocks: {} }
+      })
+    } catch (e) {
+      // IdempotencyRaceLost:并发同 idem key,输家回滚 → 重读赢家构造 created replay / reuse-conflict
+      if (e instanceof IdempotencyRaceLost) {
+        if (e.fingerprintMismatch) return { kind: 'reuse-conflict' }
+        const r = await this.db.selectFrom('persist_records').selectAll().where('owner_id', '=', ownerId).where('type', '=', type).where('id', '=', recordId).executeTakeFirst()
+        if (!r || r.canvas_id !== canvasId) return { kind: 'cross-canvas' }
+        return { kind: 'created', record: this.withIdem(rowToRecord(r), opts), seq: await this.readCanvasSeqInTrx(this.db, canvasId), fieldClocks: {} }
+      }
+      throw e
+    }
+  }
+
+  async deleteChildCascade(
+    ownerId: string,
+    canvasId: string,
+    type: PersistType,
+    recordId: string,
+    opts: { baseRevision?: Revision; idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string; actor: string },
+  ): Promise<DeleteChildResult> {
+    await this.ready
+    try {
+      return await this.db.transaction().execute(async (trx) => {
+        const rk = pgRecordKey(ownerId,type, recordId)
+        // SELECT existing FOR UPDATE(锁,序列化并发 delete;fresh/stale 判定)
+        const existing = await trx.selectFrom('persist_records').selectAll().where('owner_id', '=', ownerId).where('type', '=', type).where('id', '=', recordId).forUpdate().executeTakeFirst()
+        if (existing && existing.canvas_id !== canvasId) return { kind: 'cross-canvas' }
+        if (existing && !existing.is_deleted) {
+          // base 必填(fresh/stale 判定)。
+          if (opts.baseRevision === undefined) return { kind: 'precondition-required' }
+          // ★ §14.1 冻结矩阵:delete fresh base→200,stale base→409 race(base.revision !== current → conflict)。
+          if (opts.baseRevision !== Number(existing.revision)) return { kind: 'conflict', currentRevision: Number(existing.revision) }
+          // fresh base → node-delete-cascade(§10.4:type='node' 删 node + 级联引用 edge;同事务原子)。
+          const cascadedEdgeIds: string[] = []
+          if (type === 'node') {
+            const edges = await trx.selectFrom('persist_records').selectAll().where('owner_id', '=', ownerId).where('type', '=', 'edge').where('canvas_id', '=', canvasId).where('is_deleted', '=', false).execute()
+            for (const e of edges) {
+              const ep = e.payload as Record<string, unknown> | null
+              if (ep && (ep.from === recordId || ep.to === recordId)) cascadedEdgeIds.push(e.id)
+            }
+          }
+          await trx.deleteFrom('persist_records').where('owner_id', '=', ownerId).where('type', '=', type).where('id', '=', recordId).execute()
+          for (const eid of cascadedEdgeIds) {
+            await trx.deleteFrom('persist_records').where('owner_id', '=', ownerId).where('type', '=', 'edge').where('id', '=', eid).execute()
+            await trx.deleteFrom('field_clocks').where('record_key', '=', pgRecordKey(ownerId,'edge', eid)).execute()
+          }
+          await trx.deleteFrom('field_clocks').where('record_key', '=', rk).execute() // 清被删 record 的 field clocks
+          const seq = await this.nextCanvasSeqInTrx(trx, canvasId)
+          await this.setTombstoneInTrx(trx, rk, canvasId, seq)
+          if (type !== 'chat-message') await this.bumpCanvasContentVersionInTrx(trx, ownerId, canvasId)
+          await this.setIdempotencyEntryInTrx(trx, ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, opts.bodyFingerprint ?? '', ownerId, type, recordId)
+          return { kind: 'deleted', seq }
+        }
+        // !existing:幂等已删 vs 从未存在(§10.7)。幂等已删(tombstone 命中)→ 返当前 seq(不 404,accepted 必携 cursor)。
+        if (await this.isTombstonedInTrx(trx, rk)) return { kind: 'idempotent', seq: await this.readCanvasSeqInTrx(trx, canvasId) }
+        return { kind: 'not-found' }
+      })
+    } catch (e) {
+      // IdempotencyRaceLost:并发同 idem key(重复 DELETE)→ 输家回滚;delete 幂等 → idempotent
+      if (e instanceof IdempotencyRaceLost) return { kind: 'idempotent', seq: await this.readCanvasSeqInTrx(this.db, canvasId) }
+      throw e
+    }
   }
 
   async reorderChildren(
@@ -1478,7 +1829,7 @@ export class PgPersistBackend implements PersistBackend {
     isolationLevel?: 'repeatable read' | 'read committed'
   } = {}
 
-  /** Test-only:清空全部 records + idempotency index + 全局索引缓存。PG:TRUNCATE(异步)。 */
+  /** Test-only:清空全部 records + idempotency index + 全局索引缓存 + 009 field_clocks/canvas_seq/child_tombstones。PG:deleteFrom(异步)。 */
   __reset(): Promise<void> {
     this.projectIndex.clear()
     this.canvasIndex.clear()
@@ -1488,6 +1839,11 @@ export class PgPersistBackend implements PersistBackend {
       await trx.deleteFrom('projects').execute()
       await trx.deleteFrom('canvases').execute()
       await trx.deleteFrom('chat_order_revisions').execute()
+      // A2-S2(009 migration):field_clocks/canvas_seq/child_tombstones 须一并清,否则 field_clocks 跨测试累积
+      // → 同 record_key (owner,type,id) 的 title.clock 残留,后续测试 "expected 1 got 2"。三表无 FK,顺序无关。
+      await trx.deleteFrom('field_clocks').execute()
+      await trx.deleteFrom('canvas_seq').execute()
+      await trx.deleteFrom('child_tombstones').execute()
     })
   }
 
@@ -1518,8 +1874,13 @@ export class PgPersistBackend implements PersistBackend {
       await trx.schema.dropTable('persist_records').ifExists().execute()
       // R2-P2-1:DP-6R P1-2 新表(migration 004)曾漏入 drop → __dropAllTables 实际不 fresh,to_regclass 仍在,
       // 掩盖 004 CREATE/registry 错误。补入;无 FK(PK actor_id,canvas_id)独立 drop。
-      // **⚠ 未来 005+ 新表同样须加此处,否则 fresh-DB 测试继续掩盖 schema/registry 错误。**
+      // A2-S2(009 migration):field_clocks/canvas_seq/child_tombstones 同理须补入 drop,否则 __reset 漏三表
+      // + fresh-DB 掩盖 009 schema 错误。三表无 FK(PK record_key/canvas_id),独立 drop 顺序无关。
+      // **⚠ 未来 010+ 新表同样须加此处,否则 fresh-DB 测试继续掩盖 schema/registry 错误。**
       await trx.schema.dropTable('chat_order_revisions').ifExists().execute()
+      await trx.schema.dropTable('field_clocks').ifExists().execute()
+      await trx.schema.dropTable('canvas_seq').ifExists().execute()
+      await trx.schema.dropTable('child_tombstones').ifExists().execute()
       await trx.schema.dropTable('kysely_migration').ifExists().execute()
       await trx.schema.dropTable('kysely_migration_lock').ifExists().execute()
     })

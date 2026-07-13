@@ -14,6 +14,8 @@ import { createShareLinksRoutes, createShareAccessRoutes } from './shareLinks'
 import { InMemoryPersistBackend } from '../persist/backend'
 import { InMemoryPermissionBackend } from '../lib/permissions'
 import { encodeChildPayload } from '../../shared/persist-contract.ts'
+// A2-S2 BaseCursor codec re-export(route encodeBase/decodeBase 同进程共享;test file beforeAll 注入 secret)。
+export { encodeBase, setBaseCursorSecrets } from '../lib/baseCursor'
 import type { AnchorRecord, EdgeRecord, NodeRecord } from '../../src/kernel/records'
 
 export const buildPersistApp = (): {
@@ -128,4 +130,62 @@ export const patchChildWithFixture = async (
     headers: { ...hdr(KEY_A), ...(ifMatch !== undefined ? { 'if-match': ifMatch } : {}) },
     body: JSON.stringify({ payload }),
   })
+}
+
+// ── A2-S2 新契约辅助(§10.2):POST create / PATCH DomainOp / DELETE,均经真实 route 全链路 ──
+// body = CreateBody(POST)/ DomainOp|DomainOp[](PATCH);If-Match = opaque BaseCursor string(encodeBase 签发)。
+// 用法:create→取 response.body.base 作下次 PATCH 的 If-Match;stale base 用 encodeBase 直接构造。
+const childSuffix = (type: 'node' | 'edge' | 'anchor'): string =>
+  type === 'node' ? 'nodes' : type === 'edge' ? 'edges' : 'anchors'
+
+/** A2-S2 POST create child(CreateBody {clientId,type,payload});响应 201 {id,revision,seq,base}(dup→409)。 */
+export const createChildFixture = async (
+  app: Hono<AppEnv>,
+  canvasId: string,
+  type: 'node' | 'edge' | 'anchor',
+  childId: string,
+  payload: unknown,
+  opts: { key?: string; idempotencyKey?: string } = {},
+): Promise<{ status: number; body: unknown }> => {
+  const headers: Record<string, string> = { ...hdr(opts.key ?? KEY_A) }
+  if (opts.idempotencyKey) headers['idempotency-key'] = opts.idempotencyKey
+  return req(app, `/api/canvas/${canvasId}/${childSuffix(type)}/${childId}`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ clientId: childId, type, payload }),
+  })
+}
+
+/** A2-S2 PATCH DomainOp body(单 op 或 batch);If-Match = BaseCursor token;edit 永不 409(stale→200+overwritten)。 */
+export const patchDomainOps = async (
+  app: Hono<AppEnv>,
+  canvasId: string,
+  type: 'node' | 'edge' | 'anchor',
+  childId: string,
+  ops: unknown,
+  ifMatchBase?: string,
+  opts: { key?: string; idempotencyKey?: string } = {},
+): Promise<{ status: number; body: unknown }> => {
+  const headers: Record<string, string> = { ...hdr(opts.key ?? KEY_A) }
+  if (ifMatchBase !== undefined) headers['if-match'] = ifMatchBase
+  if (opts.idempotencyKey) headers['idempotency-key'] = opts.idempotencyKey
+  return req(app, `/api/canvas/${canvasId}/${childSuffix(type)}/${childId}`, {
+    method: 'PATCH',
+    headers,
+    body: JSON.stringify(ops),
+  })
+}
+
+/** A2-S2 DELETE child(node-delete-cascade);If-Match = BaseCursor token;fresh→200 {id,seq},stale→409 race。 */
+export const deleteChildFixture = async (
+  app: Hono<AppEnv>,
+  canvasId: string,
+  type: 'node' | 'edge' | 'anchor',
+  childId: string,
+  ifMatchBase?: string,
+  opts: { key?: string } = {},
+): Promise<{ status: number; body: unknown }> => {
+  const headers: Record<string, string> = { ...hdr(opts.key ?? KEY_A) }
+  if (ifMatchBase !== undefined) headers['if-match'] = ifMatchBase
+  return req(app, `/api/canvas/${canvasId}/${childSuffix(type)}/${childId}`, { method: 'DELETE', headers })
 }

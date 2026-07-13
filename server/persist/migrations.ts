@@ -333,6 +333,44 @@ export const migrations: Record<string, Migration> = {
       await G22_OWNER_REKEY_AUDIT_COMMENT_DROP.execute(db)
     },
   },
+  // A2-S2(§14.1/§10.5/§10.7):field-level per-field clock + per-canvas 单调 seq + child tombstone。
+  // R8 风格 shape guard:IF NOT EXISTS 可重放 + PRIMARY KEY/UNIQUE 约束;field_clock record_key 用 \x1f unit-separator
+  // (逻辑同 InMemory recordKey() 的 (ownerId,type,id) 复合,但 PG TEXT 列拒 0x00 NUL,故 pgBackend 用 \x1f 替代;见 pgBackend.pgRecordKey)。
+  '2026_07_13_009_field_clock_canvas_seq_tombstones': {
+    async up(db): Promise<void> {
+      await sql`
+-- A2-S2 field-level per-field clock(§14.1;fieldKeyOf 完整 path 粒度;同-field stale 判定 + per-field writer)。
+CREATE TABLE IF NOT EXISTS field_clocks (
+  record_key   TEXT     NOT NULL,
+  field_key    TEXT     NOT NULL,
+  clock        INTEGER  NOT NULL DEFAULT 0,
+  writer       TEXT,
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (record_key, field_key)
+);
+CREATE INDEX IF NOT EXISTS idx_field_clocks_record ON field_clocks (record_key);
+
+-- A2-S2 per-canvas 单调事件序号 seq(§10.5;?since=seq 补拉日志)。
+CREATE TABLE IF NOT EXISTS canvas_seq (
+  canvas_id    TEXT     PRIMARY KEY,
+  seq          INTEGER  NOT NULL DEFAULT 0,
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- A2-S2 child tombstone(§10.7 幂等已删返 seq vs 从未存在 404;物理删后留此占位供幂等判定)。
+CREATE TABLE IF NOT EXISTS child_tombstones (
+  record_key    TEXT     PRIMARY KEY,
+  canvas_id     TEXT     NOT NULL,
+  seq_at_delete INTEGER  NOT NULL,
+  deleted_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_child_tombstones_canvas ON child_tombstones (canvas_id);
+`.execute(db)
+    },
+    async down(db): Promise<void> {
+      await sql`DROP TABLE IF EXISTS child_tombstones; DROP TABLE IF EXISTS canvas_seq; DROP TABLE IF EXISTS field_clocks;`.execute(db)
+    },
+  },
 }
 
 export const MIGRATION_NAMES = Object.keys(migrations).sort()

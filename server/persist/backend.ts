@@ -29,6 +29,14 @@ import type {
   PersistType,
   Revision,
 } from '../../shared/persist-contract.ts'
+import {
+  fieldKeyOf,
+  setByPath,
+  unsetByPath,
+  getByPath,
+  type DomainOp,
+} from '../lib/domainOp'
+import type { FieldClocks } from '../lib/baseCursor'
 
 /** 内存/PG 共享的存储 record(信封 + payload;payload 不透明,服务端不解析——除 canvas meta 的 contentVersion 维护)。 */
 export type PersistRecord = Envelope<unknown> & { idempotencyKey?: string; fingerprint?: string }
@@ -82,6 +90,64 @@ export type UpsertChildResult =
   | { kind: 'cross-canvas' } // 返修 #3:同 id 存在但属于另一 canvas → route 404(不 create,canvas_id 不可变)
   | { kind: 'reuse-conflict' } // N4:同 idem key 不同 fingerprint → route 422
   | { kind: 'not-found' } // DP-6R P2-1:strict-update(chat PATCH)——actor bucket 无此 msgId/已删 → route 404 unknown-message(不许借 PATCH create)
+
+// ── A2-S2 field-level DomainOp 路径(§10.1/§14.1;edit 永不 409,同 fieldKeyOf path stale 才 overwritten)──
+/** overwritten 通知(§14.1:同 field stale 时,前写者收 historicalValue+byActor;route 先落 debug 面,SSE 推送后续阶段)。 */
+export type OverwrittenNotice = { fieldKey: string; historicalValue: unknown; byActor: string; currentRevision: Revision }
+/**
+ * applyDomainOps 结果(node/edge/anchor PATCH DomainOp body)。
+ * - accepted:edit 永远 200(§14.1 edit stale 永不 409);accepted 携 seq(per-canvas 单调)+ fieldClocks(供 route encodeBase)+ overwritten notices(同-field stale 才有;不同 field stale 为空数组)。
+ * - precondition-required:missing base(edit 仍 428,base 必填)。
+ * - not-found:record 不存在(edit rejected)。
+ * - cross-canvas:同 id 属另一 canvas。
+ * - reuse-conflict:同 idem key 不同 fingerprint。
+ */
+export type ApplyDomainOpsResult =
+  | { kind: 'accepted'; record: PersistRecord; seq: number; fieldClocks: FieldClocks; overwritten: OverwrittenNotice[] }
+  | { kind: 'precondition-required' }
+  | { kind: 'not-found' }
+  | { kind: 'cross-canvas' }
+  | { kind: 'reuse-conflict' }
+/**
+ * createChild 结果(POST /:id/nodes/:nodeId client-id path,§10.2)。
+ * - created:201/200,返 seq+fieldClocks(空,供 route encodeBase 签发新 base)。
+ * - dup-conflict:existing 同 ownerId+type+id 且 !isDeleted → 409(§10.2 create dup→409)。
+ * - cross-canvas:同 id 属另一 canvas → 404。
+ * - reuse-conflict:同 idem key 不同 fingerprint → 422。
+ */
+export type CreateChildResult =
+  | { kind: 'created'; record: PersistRecord; seq: number; fieldClocks: FieldClocks }
+  | { kind: 'dup-conflict'; existingRevision: Revision }
+  | { kind: 'cross-canvas' }
+  | { kind: 'reuse-conflict' }
+/**
+ * legacyReplaceDrain 结果(PATCH /:id/nodes/:nodeId 复用 decoder wire;§14.3;FX-5 drain-only 兼容通道)。
+ * - replaced:fresh(existing+base=rev,或 missing+base=0→create)→ 200 whole-record replace(同 upsertChild,非 merge)。
+ * - stale-conflict:existing+base≠rev,或 missing+base>0(防盲 create 复活已删 record)→ 409 terminal conflict dead-letter(不盲 replace)。
+ * - cross-canvas:同 id 属另一 canvas → 404。
+ * - reuse-conflict:同 idem key 不同 fingerprint → 422。
+ */
+export type LegacyReplaceDrainResult =
+  | { kind: 'replaced'; record: PersistRecord; seq: number }
+  | { kind: 'stale-conflict'; currentRevision: Revision }
+  | { kind: 'cross-canvas' }
+  | { kind: 'reuse-conflict' }
+/**
+ * deleteChildCascade 结果(ServerInvariantCommand node-delete-cascade,§10.4/§10.7)。
+ * - deleted:fresh base(base.revision===current.revision)→ 删 + 级联 edge;返 seq(cursor)。
+ * - idempotent:幂等已删(tombstone 命中)→ 返当前 seq(不 404,§10.7 accepted 必携 cursor)。
+ * - conflict:stale base(base.revision<current.revision)→ 409 race(返 current 供 re-fetch)。
+ * - precondition-required:missing base。
+ * - not-found:从未存在(canvas 不存在/无权亦此终态)。
+ * - cross-canvas:同 id 属另一 canvas。
+ */
+export type DeleteChildResult =
+  | { kind: 'deleted'; seq: number }
+  | { kind: 'idempotent'; seq: number }
+  | { kind: 'conflict'; currentRevision: Revision }
+  | { kind: 'precondition-required' }
+  | { kind: 'not-found' }
+  | { kind: 'cross-canvas' }
 
 /** 幂等回放结果(返修 #10:fingerprint 校验)。 */
 export type IdempotentReplay =
@@ -202,6 +268,75 @@ export interface PersistBackend {
   ): Promise<UpsertChildResult>
   /** 硬删子资源(物理移除,返修 #2:node/edge/anchor/chat-message 不软删)。canvas_id 校验。 */
   hardDeleteChild(ownerId: string, canvasId: string, type: PersistType, id: string): Promise<{ deleted: boolean }>
+  /**
+   * A2-S2(§10.1/§14.1):node/edge/anchor PATCH field-level DomainOp。
+   * - base:opaque BaseCursor 已由 route decodeBase 验签+scope(传明文 {revision, fieldClocks});missing → route 428,backend 不收 undefined base(edit 路径)。
+   * - edit 永不 409(§14.1):existing record 永远 accepted(bump revision+seq,apply ops);同 fieldKeyOf path stale → overwritten notice(不同 field stale 不误报)。
+   * - batch 同 record 原子:全 ok 或全 reject(无 partial,§10.2/S10-5)。
+   * - 不签发 base(返明文 fieldClocks,route encodeBase);不推送 SSE(overwritten notice 返 route,route 先落 debug 面)。
+   */
+  applyDomainOps(
+    ownerId: string,
+    canvasId: string,
+    type: PersistType,
+    recordId: string,
+    ops: DomainOp[],
+    opts: {
+      baseRevision?: Revision
+      baseFieldClocks?: FieldClocks
+      idempotencyKey?: string
+      method: string
+      resourceKind: string
+      bodyFingerprint?: string
+      actor: string
+    },
+  ): Promise<ApplyDomainOpsResult>
+  /**
+   * A2-S2(§10.2):POST /:id/nodes/:nodeId create client-id path。
+   * - id 来自 path(client NodeRecord.id,非 server-mint);body = CreateBody 零 privileged。
+   * - existing 同 ownerId+type+id 且 !isDeleted → dup-conflict(409);cross-canvas → 404。
+   * - created 返 seq+fieldClocks(空,供 route encodeBase 签发新 base;create 不伪造 base,§14.1)。
+   */
+  createChild(
+    ownerId: string,
+    canvasId: string,
+    type: PersistType,
+    recordId: string,
+    payload: unknown,
+    opts: { idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string; actor: string },
+  ): Promise<CreateChildResult>
+  /**
+   * A2-S2(§14.3):PATCH /:id/nodes/:nodeId 复用 decoder wire 的 legacy drain(FX-5 队列迁移 drain-only 兼容通道)。
+   * - 四态矩阵(§14.3):existing+base=rev → replaced(200 whole-record replace 同 upsertChild,非 merge);
+   *   existing+base≠rev → stale-conflict(409 terminal conflict dead-letter,不盲 replace);
+   *   missing+base>0 → stale-conflict(409 dead-letter,防盲 create 复活已删 record);
+   *   missing+base=0 → replaced(200 create fresh)。
+   * - scope 校验(env.canvasId/nodeId 匹配 path)+ authz + LEGACY_DRAIN gate 在 route 做;backend 只收已过 gate/scope 的明文 {payload,baseRevision}。
+   * - whole-record replace = 旧 upsert 语义(backend.ts upsertChild `payload: clone(payload)`,非 field-level merge;不翻译为 DomainOps)。
+   * - 复用 upsertChild(base=env.baseRevision)做原子写:upsertChild 的 conflict check 充当 TOCTOU guard( getChild stale-check 与 write 之间并发写 → upsertChild 409,非盲 replace)。
+   */
+  legacyReplaceDrain(
+    ownerId: string,
+    canvasId: string,
+    type: PersistType,
+    recordId: string,
+    env: { payload: unknown; baseRevision: Revision },
+    opts: { idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string; actor: string },
+  ): Promise<LegacyReplaceDrainResult>
+  /**
+   * A2-S2(§10.4/§10.7):ServerInvariantCommand node-delete-cascade。
+   * - fresh base(base.revision===current.revision)→ 删 node + 级联 edge(from/to===nodeId)→ deleted(返 seq cursor)。
+   * - stale base(base.revision<current.revision)→ conflict(409 race);missing base → precondition-required。
+   * - 幂等已删(tombstone)→ idempotent(返当前 seq,不 404,§10.7);从未存在 → not-found。
+   * - type='node' 级联 edge;type='edge'/'anchor' 单删(无级联)。asset ref 清理 PG 阶段(G2.2)。
+   */
+  deleteChildCascade(
+    ownerId: string,
+    canvasId: string,
+    type: PersistType,
+    recordId: string,
+    opts: { baseRevision?: Revision; idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string; actor: string },
+  ): Promise<DeleteChildResult>
   /**
    * 返修 N8/F5:重排 canvas 下某 type 子资源顺序。
    * orderedIds 须与 live set 全等且唯一;**If-Match(contentVersion base)必填**(F5 seam 必填——
@@ -368,6 +503,18 @@ export class InMemoryPersistBackend implements PersistBackend {
    * 内存实现易失(与 InMemoryPersistBackend 整体一致);PG 实现持久化(chat_order_revisions 表)。
    */
   private readonly chatOrderRevisions = new Map<string, Revision>()
+  /**
+   * A2-S2(§14.1):per-record per-field clock map(recordKey → fieldKey → clock;fieldKeyOf 完整 path 粒度)。
+   * 同-field stale 判定:base.fieldClocks[fieldKey] < current → 该 field stale → overwritten notice。
+   * 内存易失;PG 持久化走 field_clock 表(009 migration)。
+   */
+  private readonly fieldClocks = new Map<string, Map<string, number>>()
+  /** A2-S2:per-record per-field writer map(recordKey → fieldKey → actor;overwritten notice 的 byActor 来源)。 */
+  private readonly fieldWriters = new Map<string, Map<string, string>>()
+  /** A2-S2(§10.5):per-canvas 单调事件序号 seq(gate 7 补拉日志;?since=seq)。 */
+  private readonly canvasSeq = new Map<string, number>()
+  /** A2-S2(§10.7):已删 record tombstone(区分幂等已删返 seq vs 从未存在 404)。 */
+  private readonly deletedTombstones = new Set<string>()
   /** additive(PG 落地后接口新增):内存 backend 立即就绪。 */
   readonly ready: Promise<void> = Promise.resolve()
 
@@ -447,6 +594,41 @@ export class InMemoryPersistBackend implements PersistBackend {
     const next = (this.chatOrderRevisions.get(key) ?? 0) + 1
     this.chatOrderRevisions.set(key, next)
     return next
+  }
+
+  // ── A2-S2 helper(per-field clock + canvas seq,§14.1/§10.5)──
+  /** bump per-canvas 单调 seq(+1);accepted op / create / delete 调用。返新 seq。 */
+  private nextCanvasSeq(canvasId: string): number {
+    const next = (this.canvasSeq.get(canvasId) ?? 0) + 1
+    this.canvasSeq.set(canvasId, next)
+    return next
+  }
+  /** 读 per-record per-field clock(fieldKeyOf 完整 path 粒度;缺省 0)。 */
+  private getFieldClock(recordKey: string, fieldKey: string): number {
+    return this.fieldClocks.get(recordKey)?.get(fieldKey) ?? 0
+  }
+  /** bump per-record per-field clock(+1)+ 记 writer;返新 clock。 */
+  private bumpFieldClock(recordKey: string, fieldKey: string, actor: string): number {
+    let fc = this.fieldClocks.get(recordKey)
+    if (!fc) { fc = new Map(); this.fieldClocks.set(recordKey, fc) }
+    const next = (fc.get(fieldKey) ?? 0) + 1
+    fc.set(fieldKey, next)
+    let fw = this.fieldWriters.get(recordKey)
+    if (!fw) { fw = new Map(); this.fieldWriters.set(recordKey, fw) }
+    fw.set(fieldKey, actor)
+    return next
+  }
+  /** 读 per-record 全 fieldClocks 快照(供 route encodeBase;返新 Record)。 */
+  private snapshotFieldClocks(recordKey: string): FieldClocks {
+    const fc = this.fieldClocks.get(recordKey)
+    if (!fc) return {}
+    const out: FieldClocks = {}
+    for (const [k, v] of fc) out[k] = v
+    return out
+  }
+  /** 读 per-field writer(overwritten notice 的 byActor;缺省 'unknown')。 */
+  private getFieldWriter(recordKey: string, fieldKey: string): string {
+    return this.fieldWriters.get(recordKey)?.get(fieldKey) ?? 'unknown'
   }
 
   /** DP-6R P1-2:GET /chat 用——读 actor×canvas chat collection orderRevision。 */
@@ -1114,6 +1296,256 @@ export class InMemoryPersistBackend implements PersistBackend {
     // DP-6R:chat-message per-actor 私有,不 bump 共享 canvas contentVersion(node/edge/anchor 硬删仍 bump)。
     if (type !== 'chat-message') this.bumpCanvasContentVersion(ownerId, canvasId)
     return { deleted: true }
+  }
+
+  // ── A2-S2 field-level DomainOp 路径(§10.1/§14.1;edit 永不 409,同 fieldKeyOf path stale 才 overwritten)──
+  async applyDomainOps(
+    ownerId: string,
+    canvasId: string,
+    type: PersistType,
+    recordId: string,
+    ops: DomainOp[],
+    opts: {
+      baseRevision?: Revision
+      baseFieldClocks?: FieldClocks
+      idempotencyKey?: string
+      method: string
+      resourceKind: string
+      bodyFingerprint?: string
+      actor: string
+    },
+  ): Promise<ApplyDomainOpsResult> {
+    // 幂等 replay(同 idem key + fingerprint 匹配 → 返既有 accepted;不二次 bump revision/seq/clock,§10.3 idempotent replay)。
+    if (opts.idempotencyKey) {
+      const entry = this.idempotencyIndex.get(idemIndexKey(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey))
+      if (entry) {
+        const r = this.bucket(ownerId).get(entry.envelopeKey)
+        if (r) {
+          if (r.canvasId !== canvasId) return { kind: 'cross-canvas' }
+          if (opts.bodyFingerprint && entry.fingerprint !== opts.bodyFingerprint) return { kind: 'reuse-conflict' }
+          return { kind: 'accepted', record: clone(r), seq: this.canvasSeq.get(canvasId) ?? 0, fieldClocks: this.snapshotFieldClocks(recordKey(ownerId, type, recordId)), overwritten: [] }
+        }
+        this.idempotencyIndex.delete(idemIndexKey(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey))
+      }
+    }
+    const existing = this.find(ownerId, type, recordId)
+    if (existing && existing.canvasId !== canvasId) return { kind: 'cross-canvas' }
+    // edit 永远 accepted(§14.1 edit stale 永不 409);但 record 须存在且 !isDeleted。
+    if (!existing || existing.isDeleted) return { kind: 'not-found' }
+    // base 必填(edit 路径仍 428;§14.1 base-driven — malformed/scope 由 route decodeBase 拦,backend 只收明文)。
+    if (opts.baseRevision === undefined) return { kind: 'precondition-required' }
+    // ★ batch 同 record 原子:快照回滚 + 逐 op apply;全 ok 或全 reject(无 partial,§10.2/S10-5)。
+    // 原子策略:先逐 op mutate updatedPayload(clone)并收集 toBump;全 op 成功后统一 bump fieldClocks + 写 record;
+    //   throw 时 fieldClocks 未 mutate、record 未 set,回滚 = restore existing snapshot(干净,无半态)。
+    const rk = recordKey(ownerId, type, recordId)
+    const snapshot = clone(existing)
+    const overwritten: OverwrittenNotice[] = []
+    const updatedPayload = clone(existing.payload) as Record<string, unknown>
+    const toBump: string[] = []
+    const seenFields = new Set<string>() // 同 field 多 op 只判一次 overwritten(§14.1 前写者通知不重复)
+    try {
+      for (const op of ops) {
+        if (op.kind === 'reorder') {
+          throw new Error('reorder op not allowed in applyDomainOps (use reorderChildren)')
+        }
+        const fieldPath = [...op.fieldPath] as (string | number)[]
+        const fkey = fieldKeyOf(fieldPath)
+        // ★ §14.1:同 fieldKeyOf path stale(base.clock < current.clock)才 overwritten;不同 field stale 不误报。
+        if (!seenFields.has(fkey)) {
+          seenFields.add(fkey)
+          const currentClock = this.getFieldClock(rk, fkey)
+          const baseClock = opts.baseFieldClocks?.[fkey] ?? 0
+          if (baseClock < currentClock) {
+            overwritten.push({
+              fieldKey: fkey,
+              historicalValue: getByPath(clone(existing.payload) as Record<string, unknown>, fieldPath),
+              byActor: this.getFieldWriter(rk, fkey),
+              currentRevision: existing.revision,
+            })
+          }
+        }
+        // apply op(field-level merge,永不 clear 整 record;§10.3 setByPath 硬化拒容器 clobber)。
+        if (op.kind === 'set') {
+          setByPath(updatedPayload, fieldPath, op.value)
+        } else if (op.kind === 'unset') {
+          unsetByPath(updatedPayload, fieldPath)
+        } else if (op.kind === 'array') {
+          if (op.class === 'whole-lww') {
+            // markupPoints(无 stable-id)整值替换(allowContainerClobber:整数组替换是 intent)。
+            setByPath(updatedPayload, fieldPath, op.value, { allowContainerClobber: true })
+          } else {
+            // primitive:resultNodeIds string[];op.value 是 string;insert/remove 从数组增删该 string。
+            const arr = getByPath(updatedPayload, fieldPath)
+            const set = Array.isArray(arr) ? arr.filter((x): x is string => typeof x === 'string') : []
+            if (op.intent === 'insert') {
+              if (!set.includes(op.value)) set.push(op.value)
+            } else {
+              const i = set.indexOf(op.value)
+              if (i >= 0) set.splice(i, 1)
+            }
+            setByPath(updatedPayload, fieldPath, set, { allowContainerClobber: true })
+          }
+        }
+        toBump.push(fkey)
+      }
+      // 全 op apply 成功 → 统一 bump fieldClocks + 写 record(原子;throw 前未 mutate fieldClocks 内部 Map)。
+      for (const fkey of toBump) this.bumpFieldClock(rk, fkey, opts.actor)
+      const updated: PersistRecord = { ...clone(existing), payload: updatedPayload, revision: existing.revision + 1, updatedAt: nowIso() }
+      this.bucket(ownerId).set(rk, updated)
+      const seq = this.nextCanvasSeq(canvasId)
+      if (type !== 'chat-message') this.bumpCanvasContentVersion(ownerId, canvasId)
+      this.setIdemIndex(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, rk, opts.bodyFingerprint ?? '')
+      return { kind: 'accepted', record: clone(updated), seq, fieldClocks: this.snapshotFieldClocks(rk), overwritten }
+    } catch (err) {
+      // 回滚:updatedPayload 是 clone(throw 不影响 existing);fieldClocks 未 bump;record 未 set(restore snapshot = existing,幂等)。
+      this.bucket(ownerId).set(rk, snapshot)
+      throw err
+    }
+  }
+
+  async createChild(
+    ownerId: string,
+    canvasId: string,
+    type: PersistType,
+    recordId: string,
+    payload: unknown,
+    opts: { idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string; actor: string },
+  ): Promise<CreateChildResult> {
+    // 幂等 replay(同 idem key + fingerprint → 返既有 created)。
+    if (opts.idempotencyKey) {
+      const entry = this.idempotencyIndex.get(idemIndexKey(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey))
+      if (entry) {
+        const r = this.bucket(ownerId).get(entry.envelopeKey)
+        if (r) {
+          if (r.canvasId !== canvasId) return { kind: 'cross-canvas' }
+          if (opts.bodyFingerprint && entry.fingerprint !== opts.bodyFingerprint) return { kind: 'reuse-conflict' }
+          return { kind: 'created', record: clone(r), seq: this.canvasSeq.get(canvasId) ?? 0, fieldClocks: this.snapshotFieldClocks(recordKey(ownerId, type, recordId)) }
+        }
+        this.idempotencyIndex.delete(idemIndexKey(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey))
+      }
+    }
+    const existing = this.find(ownerId, type, recordId)
+    if (existing && existing.canvasId !== canvasId) return { kind: 'cross-canvas' }
+    // existing & !isDeleted → dup-conflict(§10.2 create dup→409;create 不借 PATCH create 己方副本)。
+    if (existing && !existing.isDeleted) return { kind: 'dup-conflict', existingRevision: existing.revision }
+    // create(id 来自 path,client-id;create 不伪造 base,§14.1;返 seq+空 fieldClocks 供 route encodeBase)。
+    const ts = nowIso()
+    const created: PersistRecord = {
+      id: recordId,
+      ownerId,
+      canvasId,
+      type,
+      scope: 'document',
+      revision: existing ? existing.revision + 1 : 1,
+      orderKey: this.nextOrderKey(ownerId, canvasId, type),
+      isDeleted: false,
+      createdAt: existing ? existing.createdAt : ts,
+      updatedAt: ts,
+      payload: clone(payload),
+      idempotencyKey: opts.idempotencyKey,
+      fingerprint: opts.bodyFingerprint,
+    }
+    const rk = recordKey(ownerId, type, recordId)
+    this.bucket(ownerId).set(rk, created)
+    this.deletedTombstones.delete(rk) // 重建清 tombstone(§10.7 幂等已删 → 重建后不再 idempotent)
+    const seq = this.nextCanvasSeq(canvasId)
+    if (type !== 'chat-message') this.bumpCanvasContentVersion(ownerId, canvasId)
+    this.setIdemIndex(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, rk, opts.bodyFingerprint ?? '')
+    return { kind: 'created', record: clone(created), seq, fieldClocks: {} }
+  }
+
+  async legacyReplaceDrain(
+    ownerId: string,
+    canvasId: string,
+    type: PersistType,
+    recordId: string,
+    env: { payload: unknown; baseRevision: Revision },
+    opts: { idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string; actor: string },
+  ): Promise<LegacyReplaceDrainResult> {
+    // §14.3 四态矩阵:先 getChild 判 stale(existing+base≠rev / missing+base>0 → 409 dead-letter),fresh 再 upsertChild 原子写。
+    const got = await this.getChild(ownerId, canvasId, type, recordId)
+    if (got.kind === 'cross-canvas') return { kind: 'cross-canvas' }
+    if (got.kind === 'found') {
+      // existing+base≠rev → 409 terminal conflict(不盲 replace;队列残留是离线期改动,覆盖是数据破坏)
+      if (env.baseRevision !== got.record.revision) {
+        return { kind: 'stale-conflict', currentRevision: got.record.revision }
+      }
+      // fresh(existing+base=rev)→ 落到 upsertChild(base=env.baseRevision 重验,TOCTOU guard)
+    } else {
+      // missing+base>0 → 409 dead-letter(防盲 create 复活已删 record);missing+base=0 → create fresh 落 upsertChild
+      if (env.baseRevision > 0) return { kind: 'stale-conflict', currentRevision: 0 }
+    }
+    // whole-record replace(委托 upsertChild;base=env.baseRevision → upsertChild conflict check 充当 TOCTOU guard:
+    //   getChild 与 write 之间并发写 bump revision → upsertChild base≠current → conflict,非盲 replace)。
+    const r = await this.upsertChild(ownerId, canvasId, type, recordId, env.payload, {
+      base: env.baseRevision,
+      idempotencyKey: opts.idempotencyKey,
+      method: opts.method,
+      resourceKind: opts.resourceKind,
+      bodyFingerprint: opts.bodyFingerprint,
+      strictUpdate: false,
+    })
+    if (r.kind === 'created' || r.kind === 'updated') {
+      const seq = this.nextCanvasSeq(canvasId)
+      return { kind: 'replaced', record: r.record, seq }
+    }
+    if (r.kind === 'conflict') return { kind: 'stale-conflict', currentRevision: r.currentRevision }
+    if (r.kind === 'cross-canvas') return { kind: 'cross-canvas' }
+    if (r.kind === 'reuse-conflict') return { kind: 'reuse-conflict' }
+    // precondition-required / not-found —— 不应发生(传了 base + strictUpdate=false);防御返 stale-conflict
+    return { kind: 'stale-conflict', currentRevision: 0 }
+  }
+
+  async deleteChildCascade(
+    ownerId: string,
+    canvasId: string,
+    type: PersistType,
+    recordId: string,
+    opts: { baseRevision?: Revision; idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string; actor: string },
+  ): Promise<DeleteChildResult> {
+    const existing = this.find(ownerId, type, recordId)
+    const rk = recordKey(ownerId, type, recordId)
+    if (existing && existing.canvasId !== canvasId) return { kind: 'cross-canvas' }
+    if (existing && !existing.isDeleted) {
+      // base 必填(fresh/stale 判定)。
+      if (opts.baseRevision === undefined) return { kind: 'precondition-required' }
+      // ★ §14.1 冻结矩阵:delete fresh base→200,stale base→409 race(base.revision !== current → conflict)。
+      if (opts.baseRevision !== existing.revision) {
+        return { kind: 'conflict', currentRevision: existing.revision }
+      }
+      // fresh base → node-delete-cascade(§10.4:type='node' 删 node + 级联 edge from/to===nodeId;同 PG tx,内存快照回滚)。
+      const snapshot: Array<[string, PersistRecord]> = [[rk, clone(existing)]]
+      const cascadedEdges: Array<[string, PersistRecord]> = []
+      if (type === 'node') {
+        for (const [eid, e] of this.bucket(ownerId)) {
+          const rec = e as PersistRecord
+          if (rec.type === 'edge' && rec.canvasId === canvasId && !rec.isDeleted) {
+            // edge payload 含 from/to(不透明,但 EdgeRecord 约定);级联删引用该 node 的 edge。
+            const ep = rec.payload as Record<string, unknown> | null
+            if (ep && (ep.from === recordId || ep.to === recordId)) {
+              cascadedEdges.push([eid, clone(rec)])
+            }
+          }
+        }
+      }
+      try {
+        this.bucket(ownerId).delete(rk)
+        for (const [eid] of cascadedEdges) this.bucket(ownerId).delete(eid)
+        this.deletedTombstones.add(rk)
+        const seq = this.nextCanvasSeq(canvasId)
+        if (type !== 'chat-message') this.bumpCanvasContentVersion(ownerId, canvasId)
+        this.setIdemIndex(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, rk, opts.bodyFingerprint ?? '')
+        return { kind: 'deleted', seq }
+      } catch (err) {
+        for (const [k, rec] of [...snapshot, ...cascadedEdges]) this.bucket(ownerId).set(k, rec)
+        throw err
+      }
+    }
+    // !existing:幂等已删 vs 从未存在(§10.7)。
+    if (this.deletedTombstones.has(rk)) {
+      return { kind: 'idempotent', seq: this.canvasSeq.get(canvasId) ?? 0 }
+    }
+    return { kind: 'not-found' }
   }
 
   async reorderChildren(
