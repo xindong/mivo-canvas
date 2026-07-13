@@ -12,7 +12,7 @@ import { buildBusyDropMessages } from './chatBusyDrop'
 import { debugLogger } from './debugLogStore'
 import { generationFacade } from './generationFacade'
 import { clampChatGenerationContext } from './chatStoreMigrate'
-import { isChatBlockedForAnonymous, enqueueChatAppend } from './chatPersistSync'
+import { isChatBlockedForAnonymous, enqueueChatAppend, registerChatStoreAccessor } from './chatPersistSync'
 import { chatPersistOptions } from './chatPersistConfig'
 
 export type ChatMessageStatus = 'enhancing' | 'generating' | 'done' | 'error'
@@ -85,6 +85,12 @@ export type ChatMessage = {
 
 export type ChatState = {
   messagesByScene: Record<string, ChatMessage[]>
+  // P2-3(sol 返修):R-7 local-only 保留证明。enqueueChatAppend 置位 msgId(该消息 pending append、
+  // 未 drain 到 PG);hydrateChatForScene 见该 id 在 server 集则清位(synced)。hydrate 时 local-only
+  // 消息(id 不在 server 集)仅当在此 sidecar 内才保留(= pending append);否则按 server canonical 删除
+  // (远端已删不复活)。持久化经 chatPersistConfig partialize,跨 boot 存活(boot 时 IDB rehydrate 先于
+  // hydrate,sidecar 在 hydrate 前就绪,不依赖 queue.start 载入 IDB pending,无 boot-order 竞态)。
+  unsyncedChatMsgIds: Record<string, string[]>
   selectedModel: string
   paramOverrides: ChatParamOverrides
   isBusy: boolean
@@ -176,6 +182,7 @@ export const useChatStore = create<ChatState>()(
   persist(
     (set, get) => ({
       messagesByScene: {},
+      unsyncedChatMsgIds: {},
       selectedModel: 'gemini-3-pro-image',
       paramOverrides: { imgRatio: 'auto', quality: 'auto' },
       isBusy: false,
@@ -868,3 +875,7 @@ export const useChatStore = create<ChatState>()(
 // D-4: 注入 useChatStore 实例到 chatMaskEditFlow(依赖倒置,切断 chatStore↔chatMaskEditFlow runtime 环)。
 // 在 useChatStore 定义之后调用;chatMaskEditFlow 侧只在函数体内经 chatStore() 取用,无 TDZ。
 setChatStoreAccessor(useChatStore)
+
+// P2-3(sol 第二轮返修):注入 useChatStore 实例到 chatPersistSync(同 #236 DI 思路)——sidecar 生命周期
+//   mutator(mark/clear unsyncedChatMsgIds)在 chatPersistSync 内取用,打破静态环,保持 chatStore ≤900 行。
+registerChatStoreAccessor(useChatStore)

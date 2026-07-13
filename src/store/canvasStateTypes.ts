@@ -62,6 +62,16 @@ export type BrushStyle = {
   kind: BrushToolMode
 }
 
+// deleteProject 返回值:让 UI 层按结果分支 toast(避免删除被零-survivor 不变量阻止时仍弹
+// "已删除"成功提示)。blocked 仅在 server 模式零 survivor 时出现(local 模式画板回落
+// standalone,永不阻止);skipped 在 project 不存在时出现(UI 不可能触达,debugLog 已 warn,
+// 静默不 toast 免噪声)。用 `status` 判别键(三态共用),UI 用 `result.status === 'blocked''
+// narrow,避免 boolean 键在联合上无法直接访问的 narrowing 坑。
+export type ProjectDeleteResult =
+  | { status: 'deleted' }
+  | { status: 'blocked'; reason: 'no-survivor' }
+  | { status: 'skipped'; reason: 'missing' }
+
 export type CanvasState = {
   canvases: Record<CanvasId, CanvasDocument>
   projects: CanvasProject[]
@@ -82,7 +92,8 @@ export type CanvasState = {
   historyFuture: MivoCanvasSnapshot[]
   createProject: (name?: string) => string
   renameProject: (projectId: string, name: string) => void
-  deleteProject: (projectId: string) => void
+  deleteProject: (projectId: string) => ProjectDeleteResult
+  restoreProject: (projectId: string, name?: string) => void
   moveCanvasToProject: (canvasId: CanvasId, projectId?: string) => void
   createCanvas: (title?: string, options?: { projectId?: string; templateId?: DemoSceneId }) => CanvasId
   duplicateCanvas: (canvasId?: CanvasId) => CanvasId | undefined

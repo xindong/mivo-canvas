@@ -31,6 +31,8 @@ export const chatPersistOptions = {
   skipHydration: true,
   partialize: (state: ChatState) => ({
     messagesByScene: state.messagesByScene,
+    // P2-3:持久化 unsynced sidecar(跨 boot 存活;boot 时 IDB rehydrate 先于 hydrate,sidecar 就绪)。
+    unsyncedChatMsgIds: state.unsyncedChatMsgIds,
     selectedModel: state.selectedModel,
     paramOverrides: state.paramOverrides,
     // isBusy excluded (runtime state)
@@ -60,6 +62,8 @@ export const chatPersistOptions = {
     return {
       ...merged,
       messagesByScene: sanitizedMessages,
+      // P2-3:旧 persisted 无 unsyncedChatMsgIds → 显式 default {}(防 undefined 漏入 runtime)。
+      unsyncedChatMsgIds: merged.unsyncedChatMsgIds ?? {},
     }
   },
   // SC-15 R2: gated writeback — see pendingChatHydrationSettleCount above. The

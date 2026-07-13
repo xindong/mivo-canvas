@@ -9,6 +9,7 @@ import { useState } from 'react'
 import { ChevronDown, ChevronRight, Folder, FolderOpen, Pencil, Plus, SquarePen, Trash2 } from 'lucide-react'
 import { useCanvasStore } from '../../store/canvasStore'
 import { toastFeedback } from '../../store/toastStore'
+import { isPersistWriteActive } from '../../lib/persistBoot'
 import { ContextMenu, type ContextMenuItem } from './ContextMenu'
 import { ConfirmDialog } from './ConfirmDialog'
 import { EditableName } from './EditableName'
@@ -44,6 +45,10 @@ export function ProjectRow(props: {
   const createCanvas = useCanvasStore((s) => s.createCanvas)
   const loadScene = useCanvasStore((s) => s.loadScene)
 
+  // A2 前置 b:server 模式(queue active)delete 走整树软删(画板一并删除,可恢复);
+  // local 模式保留旧 standalone 回落(画板移回 Canvas,不删)。文案据此对齐,不误称"移回 Canvas"。
+  const serverAligned = isPersistWriteActive()
+
   const [menuPosition, setMenuPosition] = useState<{ x: number; y: number } | null>(null)
   const [confirmOpen, setConfirmOpen] = useState(false)
 
@@ -63,9 +68,25 @@ export function ProjectRow(props: {
   }
 
   const confirmRemove = () => {
-    deleteProject(project.id)
+    const result = deleteProject(project.id)
     setConfirmOpen(false)
-    toastFeedback.success(`已删除项目"${project.name}",${canvasCount} 块画板已移回 Canvas`)
+    // blocked:零-survivor 不变量阻止删除(server 模式删完全场零 canvas)——提示用户先移画板,
+    //   不弹成功 toast 误导(否则用户看到"已删除"但项目还在)。
+    if (result.status === 'blocked') {
+      toastFeedback.warn(
+        `无法删除项目"${project.name}":至少需保留一个画板,请先将画板移动到其他项目或删除`,
+      )
+      return
+    }
+    // skipped:project 不存在(UI 不可能触达——row 渲染即存在;debugLog 已 warn),静默不 toast 免噪声。
+    if (result.status === 'skipped') {
+      return
+    }
+    toastFeedback.success(
+      serverAligned
+        ? `已删除项目"${project.name}",${canvasCount} 块画板已一并软删除(可恢复)`
+        : `已删除项目"${project.name}",${canvasCount} 块画板已移回 Canvas`,
+    )
   }
 
   const menuItems: ContextMenuItem[] = [
@@ -135,7 +156,11 @@ export function ProjectRow(props: {
       <ConfirmDialog
         open={confirmOpen}
         title={`删除项目"${project.name}"?`}
-        description={`项目下 ${canvasCount} 块画板将移回 Canvas,画板不会被删除。`}
+        description={
+          serverAligned
+            ? `项目下 ${canvasCount} 块画板将一并软删除(可在回收站恢复)。`
+            : `项目下 ${canvasCount} 块画板将移回 Canvas,画板不会被删除。`
+        }
         confirmLabel="删除项目"
         danger
         onConfirm={confirmRemove}

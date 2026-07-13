@@ -130,6 +130,14 @@ export const createAdapterWriteExecutor = (opts: FetchAdapterOptions): WriteExec
         case 'createCanvas': {
           // POST /api/canvas,body CreateCanvasRequest → 201/200 CanvasMeta。
           // G1-a R2 F1:回捕 CanvasMeta.metaRevision,drain 经 onSuccess 回灌 store.canvases[id].metaRevision。
+          // P1-1(sol 返修):服务端 createCanvasWithCollection 对同 owner live existing 返原 record 不应用
+          //   incoming title/projectId(backend.ts existing → clone(existing),pgBackend.ts 同)→ POST 200 但
+          //   rename/move 静默回退(刷新后 hydrate 取 server 旧值覆盖本地,applyServerRevision 只回灌
+          //   metaRevision 不比对值)。修:createCanvas op 改 create-or-update——POST 返回 CanvasMeta 后比对
+          //   title/projectId,不等则用返回的 metaRevision 立即 PUT If-Match 写目标值(POST 返 existing 时
+          //   metaRevision 是该 record 当前 base,PUT 用它不 428 missing / 不 409 stale)。真 create/fresh id →
+          //   POST created,title/projectId 一致,无 PUT(零回归)。PUT 在单 op 内 drain,不进 combineOps
+          //   (combineOps 的 create+update 合并 / create+delete 净消针对批内未 drain op,本 PUT 已 drain)。
           const result = await requestJson<CanvasMeta>({
             ...base,
             method: 'POST',
@@ -142,6 +150,27 @@ export const createAdapterWriteExecutor = (opts: FetchAdapterOptions): WriteExec
             },
             idempotencyKey,
           })
+          // P1-1:POST 返 existing(未应用 incoming)→ 比对 title/projectId,不等则 PUT 补写目标值。
+          //   op.title undefined(纯 move 不改名)只比对 projectId;两边一致 → 无 PUT(create 真命中/幂等)。
+          const titleMismatch = op.title !== undefined && result.title !== op.title
+          const projectMismatch = result.projectId !== op.projectId
+          if (titleMismatch || projectMismatch) {
+            const updated = await requestJson<CanvasMeta>({
+              ...base,
+              method: 'PUT',
+              path: `/api/canvas/${encodeURIComponent(op.canvasId)}`,
+              body: {
+                payload: {
+                  projectId: op.projectId,
+                  ...(op.title !== undefined ? { title: op.title } : {}),
+                  ...(op.sourceTemplateId !== undefined ? { sourceTemplateId: op.sourceTemplateId } : {}),
+                },
+              },
+              ifMatch: result.metaRevision,
+              idempotencyKey,
+            })
+            return { status: 'success', revision: updated.metaRevision }
+          }
           return { status: 'success', revision: result.metaRevision }
         }
 
