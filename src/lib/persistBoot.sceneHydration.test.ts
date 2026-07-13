@@ -208,4 +208,25 @@ describe('A2-S3 block 8 — server 模式切 scene re-hydrate(对新 scene 调 f
     // local 模式零行为变化:不发任何 fetchCanvas 请求(订阅未启动)
     expect(fetchCanvasSpy).not.toHaveBeenCalled()
   })
+
+  it('④ shadow 模式:boot 后切 scene 零 fetchCanvas 调用(shadow 恒不 populate,IDB 读源契约;切 scene re-hydrate 仅 server)', async () => {
+    persistState.mode = 'shadow'
+    useCanvasStore.setState({
+      sceneId: 'sceneA',
+      canvases: {
+        sceneA: blankCanvas('sceneA'),
+        sceneB: blankCanvas('sceneB'),
+      },
+    })
+    // shadow 模式 bootPersistWiring:readiness durable → shadowCompareWithServer + startPersistWriteQueue,
+    // 但不启动 scene 切换订阅(shadow 恒不 populate canvas content,IDB 读源契约;A3 灰度观察窗前提)。
+    await bootPersistWiring(bootOpts())
+    await flush()
+    // 切 scene(用户点侧栏)
+    useCanvasStore.getState().loadScene('sceneB')
+    await flush()
+    // shadow 模式零 fetchCanvas 请求(切 scene re-hydrate 仅 server 模式;shadow 不订阅;
+    // shadowCompareWithServer 的 listProjects 请求走 adapter 非 fetchCanvas,不算)
+    expect(fetchCanvasSpy).not.toHaveBeenCalled()
+  })
 })

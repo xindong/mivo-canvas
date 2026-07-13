@@ -665,11 +665,12 @@ export const bootPersistWiring = async (opts: FetchAdapterOptions = getProductio
     // 去重 + in-flight 防并发)。local 在 bootPersistWiring 第一行 return 短路,永不调此。
     await startSceneHydrationSubscription()
   } else {
-    // shadow:IDB 已 rehydrate(读源),此处 compare + 双写队列(mutation enqueue 同时写 BFF)
+    // shadow:IDB 已 rehydrate(读源),此处 compare + 双写队列(mutation enqueue 同时写 BFF)。
+    // shadow 恒不 populate canvas content(IDB 读源契约:A3 灰度观察窗 mismatch 归因干净;server 与
+    //   IDB 不一致时 populate 会让用户可见内容漂移,违反 shadow 零变化承诺)。故切 scene re-hydrate
+    //   仅 server 模式(block 8),shadow 不订阅 scene 切换。
     await shadowCompareWithServer()
     await startPersistWriteQueue(opts)
-    // A2-S3 block 8:shadow 模式同样订阅 scene 切换 re-hydrate(lead 要求 persist=server|shadow 均触发)。
-    await startSceneHydrationSubscription()
   }
   // R2 F5:已认证 boot 时 resume 暂停的 401 记录。queue.start() 把 leftover paused-401 从 prior
   // session 恢复后置 paused=true 拒 drain;此处 auth 已 hydrate,authenticated → resume 清 paused +
