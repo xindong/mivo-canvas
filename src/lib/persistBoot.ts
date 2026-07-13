@@ -270,6 +270,12 @@ const hydrateActiveCanvasContent = async (
       },
     }
   })
+  // A2-S3 block 8:hydrate 写了 canvases[sceneId].nodes/edges,顶层 state.nodes/edges 须同步
+  // (否则 loadScene 在 fetch 完成前拍的空 document 留顶层,用户看到空画布;docNodesLength>0
+  // 但 topLevelNodesLength=0)。refresh 复用 loadScene 拍平逻辑只刷 nodes/edges(不碰 selection/
+  // history/activeTool/viewport);race(active ≠ sceneId,fetch 完成时已切走)由 refresh 内 gate
+  // 拦(不动顶层,内容留 canvases[sceneId] 切回 loadScene 自然拍平)。
+  useCanvasStore.getState().refreshActiveCanvasContent(sceneId)
   debugLogger.log(
     SOURCE,
     `server hydrate: active canvas ${sceneId} content applied (${serverNodes.length} nodes + ${serverEdges.length} edges from BFF; ${localOnlyNodes} local-only nodes + ${localOnlyEdges} local-only edges retained (R-7 union); bundle cursor built)`,

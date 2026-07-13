@@ -144,8 +144,12 @@ beforeEach(async () => {
 })
 
 describe('A2-S3 block 8 — server 模式切 scene re-hydrate(对新 scene 调 fetchCanvas)', () => {
-  it('① boot 后切到另一张 server 画布 → 对新 scene 调 fetchCanvas(补 content)', async () => {
+  it('① boot 后切到另一张 server 画布 → 对新 scene 调 fetchCanvas + 顶层 nodes 同步刷新(active 未变)', async () => {
     persistState.mode = 'server'
+    // fetchCanvas 返有 nodes 的 resp(证 hydrate 后顶层同步;当前 bug:顶层 nodes 空)
+    const nodePayload = { id: 'srv-node-1', type: 'image', title: 'srv', transform: { x: 0, y: 0, width: 100, height: 100, rotation: 0 }, fills: [], strokes: [] }
+    const respWithNodes = (id: string) => ({ ...fakeFetchCanvasResp(id), nodes: [{ id: 'r1', revision: 0, base: 'b1', payload: nodePayload }] })
+    fetchCanvasSpy.mockImplementation(async (id: string) => respWithNodes(id))
     useCanvasStore.setState({
       sceneId: 'sceneA',
       canvases: {
@@ -164,6 +168,13 @@ describe('A2-S3 block 8 — server 模式切 scene re-hydrate(对新 scene 调 f
     await flush()
     // 切 scene 触发对新 sceneB 的 fetchCanvas(block 8 核心行为;修前 0 调用)
     expect(fetchCanvasSpy).toHaveBeenCalledWith('sceneB')
+    // 扩展(A2-S3 顶层刷新):hydrate 写了 canvases[sceneB].nodes,顶层 state.nodes 须同步
+    // (修前 bug:loadScene 在 fetch 完成前拍空 document 到顶层,hydrate 只写 canvases 不刷顶层
+    // → docNodesLength>0 但 topLevelNodesLength=0,用户看到空画布)
+    const docNodes = useCanvasStore.getState().canvases['sceneB']?.nodes ?? []
+    const topLevelNodes = useCanvasStore.getState().nodes
+    expect(docNodes.length).toBeGreaterThan(0) // canvases[sceneB] 有 hydrate 内容
+    expect(topLevelNodes.length).toBe(docNodes.length) // 顶层同步 canvases[sceneB]
   })
 
   it('② 同 scene 会话内去重:切走再切回不重复 fetch(已 hydrate 的 sceneId 不双拉)', async () => {
@@ -286,5 +297,46 @@ describe('A2-S3 block 8 — server 模式切 scene re-hydrate(对新 scene 调 f
     await flush(50)
     // server:onConflict → step 2.5 gate 不跳过 → sceneA 未 hydrated(boot null)→ fetchCanvas sceneA 补 content
     expect(fetchCanvasSpy).toHaveBeenCalledWith('sceneA')
+  })
+
+  it('⑥ fetch 返回前已切走 → 顶层不被污染(race:active ≠ hydrated scene,内容留 canvases[thatScene] 切回拍平)', async () => {
+    persistState.mode = 'server'
+    const nodePayload = { id: 'srv-node-1', type: 'image', title: 'srv', transform: { x: 0, y: 0, width: 100, height: 100, rotation: 0 }, fills: [], strokes: [] }
+    const sceneBResp = () => ({ ...fakeFetchCanvasResp('sceneB'), nodes: [{ id: 'r1', revision: 0, base: 'b1', payload: nodePayload }] })
+    // sceneB fetch 挂起(可控 resolve);其他 scene 立即返
+    let resolveSceneB!: () => void
+    const sceneBPending = () => new Promise<void>((resolve) => { resolveSceneB = resolve })
+    fetchCanvasSpy.mockImplementation(async (id: string) => {
+      if (id === 'sceneB') {
+        await sceneBPending()
+        return sceneBResp()
+      }
+      return fakeFetchCanvasResp(id)
+    })
+    useCanvasStore.setState({
+      sceneId: 'sceneA',
+      canvases: { sceneA: blankCanvas('sceneA'), sceneB: blankCanvas('sceneB'), sceneC: blankCanvas('sceneC') },
+    })
+    await bootPersistWiring(bootOpts())
+    await flush()
+    // 切到 sceneB → 订阅触发 hydrate(fetch 挂起)
+    useCanvasStore.getState().loadScene('sceneB')
+    await flush()
+    // fetch 进行中切到 sceneC(active=sceneC ≠ sceneB)
+    useCanvasStore.getState().loadScene('sceneC')
+    await flush()
+    // resolve sceneB fetch → hydrate 写 canvases[sceneB] + refresh(active=sceneC ≠ sceneB → gate 拦,不动顶层)
+    resolveSceneB()
+    await flush(50) // 等 hydrate 完成
+    // 顶层 nodes 是 sceneC 的(blankCanvas 空),未被 sceneB hydrate 内容污染(race gate)
+    const topLevelNodes = useCanvasStore.getState().nodes
+    expect(topLevelNodes.length).toBe(0)
+    // canvases[sceneB] 有 hydrate 内容(切回 sceneB 时 loadScene 拍平)
+    const sceneBDocNodes = useCanvasStore.getState().canvases['sceneB']?.nodes ?? []
+    expect(sceneBDocNodes.length).toBeGreaterThan(0)
+    // 切回 sceneB → loadScene 拍平 → 顶层同步(sceneB 已 hydrated,订阅 dedup skip,loadScene 自然拍平)
+    useCanvasStore.getState().loadScene('sceneB')
+    await flush()
+    expect(useCanvasStore.getState().nodes.length).toBeGreaterThan(0)
   })
 })
