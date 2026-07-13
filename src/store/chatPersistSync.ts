@@ -7,7 +7,6 @@
 import { isLocalPersist } from '../lib/persistMode'
 import { useAuthStore } from './authSlice'
 import { enqueuePersistWrite } from '../lib/persistBoot'
-import type { WriteOp } from '../lib/writeRetryQueue'
 import type { ChatMessage } from './chatStore'
 
 /**
@@ -19,25 +18,52 @@ export const isChatBlockedForAnonymous = (): boolean => {
   return useAuthStore.getState().status !== 'authenticated'
 }
 
-// P2-3(sol 返修):R-7 local-only 保留证明的 unsynced sidecar 标记回调。
-// chatStore 模块尾部注册(registerUnsyncedMarker)→ enqueueChatAppend 同步调之,避免
-// chatPersistSync↔chatStore 静态环(chatPersistSync 不静态 import chatStore;mutator 经
-// 注册注入,运行时同步执行无 async 竞态)。local 模式 markUnsynced 仍被调但 sidecar 在 hydrate
-// 时不读(local 不跑 hydrateFromServer),无副作用。
-let markUnsynced: (canvasId: string, messageId: string) => void = () => {}
-export const registerUnsyncedMarker = (fn: (canvasId: string, messageId: string) => void): void => {
-  markUnsynced = fn
+// P2-3(sol 第二轮返修):R-7 unsynced sidecar 生命周期。DI 模式(同 #236 chatMaskEditFlow 的
+//   setChatStoreAccessor 思路)——chatStore 尾部注入 useChatStore 实例,本模块经 accessor 取用,
+//   打破 chatPersistSync↔chatStore 静态环(本模块不静态 import chatStore);运行时同步执行无竞态。
+//   markUnsynced:enqueueChatAppend 在 queue active 时置位(local 不置,消"local 假 marker → 切 server 永久 union")。
+//   clearUnsynced:writeRetryQueue onOutcome 在 op 终态(success/terminal)时清位(消"成功不清/terminal 留假 pending");
+//     非终态(transient-retry/401/retained)不清(保持 pending)。
+type ChatStoreInstance = typeof import('./chatStore')['useChatStore']
+let chatStoreAccessor: ChatStoreInstance | null = null
+export const registerChatStoreAccessor = (accessor: ChatStoreInstance): void => {
+  chatStoreAccessor = accessor
+}
+
+/** P2-3:置位 msgId(enqueueChatAppend 在 queue active 时调;local 不调)。dedup 防重复 push。 */
+const markUnsynced = (canvasId: string, messageId: string): void => {
+  if (!chatStoreAccessor) return
+  chatStoreAccessor.setState((s) => {
+    const prev = s.unsyncedChatMsgIds[canvasId] ?? []
+    if (prev.includes(messageId)) return {}
+    return { unsyncedChatMsgIds: { ...s.unsyncedChatMsgIds, [canvasId]: [...prev, messageId] } }
+  })
+}
+
+/** P2-3:清 msgId(writeRetryQueue onOutcome 在 op 终态时调;消"成功不清/terminal 留假 pending")。 */
+const clearUnsynced = (canvasId: string, messageId: string): void => {
+  if (!chatStoreAccessor) return
+  chatStoreAccessor.setState((s) => {
+    const prev = s.unsyncedChatMsgIds[canvasId]
+    if (!prev || !prev.includes(messageId)) return {}
+    return { unsyncedChatMsgIds: { ...s.unsyncedChatMsgIds, [canvasId]: prev.filter((id) => id !== messageId) } }
+  })
+}
+
+/** P2-3:清 sidecar msgId(op 终态时 writeRetryQueue onOutcome 调;dynamic import by persistBoot)。 */
+export const clearUnsyncedMarker = (canvasId: string, messageId: string): void => {
+  clearUnsynced(canvasId, messageId)
 }
 
 /**
  * G1-a chat enqueue 出口:把 appendChatMessage op 入队(server/shadow → BFF;local no-op)。
- * 薄封装减 chatStore 行内冗余;message 是 finalized committed 消息(POST 幂等 per-actor)。
- * P2-3:同步置位 unsynced sidecar(markUnsynced)——该 msgId 标记为 pending append,hydrate
- *   hydrateChatForScene 见其在 server 集才清位;local-only(id 不在 server 集)仅当在此 sidecar
- *   内才保留(= pending append),否则按 server canonical 删除(远端已删不复活)。
+ * message 是 finalized committed 消息(POST 幂等 per-actor)。
+ * P2-3(sol 第二轮返修):marker 仅在 enqueuePersistWrite 返非 undefined(queue active,op 已入队将持久)
+ *   时置位——local/无队列(返 undefined)不置(消"local 假 marker → 切 server 被当 pending 永久 union")。
+ *   终态(success/terminal)经 writeRetryQueue onOutcome → clearUnsyncedMarker 清位;非终态保留。
  */
 export const enqueueChatAppend = (canvasId: string, message: ChatMessage): void => {
-  markUnsynced(canvasId, message.id)
-  const op: WriteOp = { kind: 'appendChatMessage', canvasId, message }
-  enqueuePersistWrite(op)
+  const enqueuePromise = enqueuePersistWrite({ kind: 'appendChatMessage', canvasId, message })
+  if (enqueuePromise) markUnsynced(canvasId, message.id) // queue active → real pending append
+  // local(返 undefined)→ 不置 marker(hydrate 不当 pending 保留,按 canonical 删除)
 }

@@ -1286,6 +1286,16 @@ export type WriteQueueOptions = {
    * 返回 Promise 时 drain 会 await(确保回灌在 drain 返回前落地,测试/后续 strict update 可见)。
    */
   onSuccess?: (op: WriteOp, outcome: { revision?: Revision }) => void | Promise<void>
+  /**
+   * P2-3(sol 第二轮返修):op 终态回调——drain 收到**终态** outcome(success / conflict / too-large /
+   * reuse-conflict / rejected / terminal / dead-letter)时调用,让调用方清 sidecar 等"pending 证明"。
+   * **非终态**(transient-retry / unauthorized(paused-401)/ unsupported-retained(deferred))op 仍留存队列
+   * → 不调 onOutcome(sidecar marker 保持置位,= 仍 pending)。与 onSuccess 正交:onSuccess 只在
+   * success+revision 时回灌 revision(createCanvas 等);onOutcome 对所有终态 fire(含无 revision 的 chat/delete),
+   * 让 chat unsynced sidecar 在 appendChatMessage success/terminal 时清位(消"成功不清/terminal 留假 pending")。
+   * 返回 Promise 时 drain 不 await(fire-and-forget;sidecar 清位是 sync setState,不阻塞 drain 循环)。
+   */
+  onOutcome?: (op: WriteOp, outcome: WriteOutcome) => void | Promise<void>
   /** Inject for deterministic tests. Default: Date.now. */
   clock?: () => number
   /** Inject for deterministic jitter. Default: Math.random. */
@@ -1318,6 +1328,7 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
   const drainInterval = opts.drainIntervalMs ?? DEFAULT_DRAIN_INTERVAL
   const onConflict = opts.onConflict
   const onSuccess = opts.onSuccess
+  const onOutcome = opts.onOutcome
   const now = opts.clock ?? (() => Date.now())
   const rand = opts.random ?? (() => Math.random())
 
@@ -1550,6 +1561,10 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
         }
         processed++
 
+        // P2-3(sol 第二轮返修):finalized 标志——终态(success/conflict/too-large/reuse-conflict/
+        // rejected/terminal/dead-letter)置 true,post-switch 调 onOutcome 清 sidecar 等 pending 证明;
+        // 非终态(transient-retry/unauthorized/unsupported-retained)op 留存队列 → false,不清(sidecar 保持)。
+        let finalized = false
         switch (outcome.status) {
           case 'success':
             // P2-1: success path must surface via debugLogger (development-logging
@@ -1570,6 +1585,7 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
             }
             await deleteWrite(rec.id)
             successes++
+            finalized = true
             break
           case 'conflict':
             // 409 revision conflict — do NOT blindly retry (it would 409 again on the
@@ -1589,6 +1605,7 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
             await recordTerminal(rec, 'conflict', `server revision ${outcome.currentRevision}`)
             await deleteWrite(rec.id)
             terminals++
+            finalized = true
             break
           case 'too-large':
             debugLogger.error(
@@ -1599,6 +1616,7 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
             await recordTerminal(rec, 'too-large', `limit ${outcome.limit}`)
             await deleteWrite(rec.id)
             terminals++
+            finalized = true
             break
           case 'reuse-conflict':
             debugLogger.error(
@@ -1609,6 +1627,7 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
             await recordTerminal(rec, 'reuse-conflict', `key ${outcome.key}`)
             await deleteWrite(rec.id)
             terminals++
+            finalized = true
             break
           case 'rejected':
             debugLogger.error(
@@ -1619,6 +1638,7 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
             await recordTerminal(rec, 'rejected', JSON.stringify(outcome.body).slice(0, 200))
             await deleteWrite(rec.id)
             terminals++
+            finalized = true
             break
           case 'terminal':
             debugLogger.error(SOURCE, `write ${rec.id} terminal failure: ${outcome.message}`)
@@ -1626,6 +1646,7 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
             await recordTerminal(rec, 'terminal', outcome.message)
             await deleteWrite(rec.id)
             terminals++
+            finalized = true
             break
           case 'transient': {
             const attempts = rec.attempts + 1
@@ -1638,6 +1659,7 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
               await recordTerminal(rec, 'dead-letter', `after ${attempts} attempts: ${outcome.message}`)
               await deleteWrite(rec.id)
               terminals++
+              finalized = true // dead-letter = 终态(不再重试)→ onOutcome 清 sidecar
             } else {
               const delay = backoffDelay(attempts, baseDelay, maxDelay, rand)
               rec.attempts = attempts
@@ -1679,6 +1701,16 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
               `write ${rec.id} (${rec.resourceKey ?? rec.op.kind}) deferred — unsupported op retained for executor upgrade: ${outcome.message}`,
             )
             break
+          }
+        }
+        // P2-3(sol 第二轮返修):终态(success/各 terminal/dead-letter)→ 调 onOutcome 让调用方清
+        //   sidecar 等 pending 证明(消"成功不清/terminal 留假 pending → 永久 union");非终态(transient-retry/
+        //   unauthorized/unsupported-retained)finalized=false,不清 sidecar(保持 pending)。
+        if (finalized) {
+          try {
+            await onOutcome?.(rec.op, outcome)
+          } catch (cbErr) {
+            debugLogger.warn(SOURCE, `onOutcome callback threw: ${msg(cbErr)}`)
           }
         }
         if (paused) break

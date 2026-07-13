@@ -12,7 +12,7 @@ import { buildBusyDropMessages } from './chatBusyDrop'
 import { debugLogger } from './debugLogStore'
 import { generationFacade } from './generationFacade'
 import { clampChatGenerationContext } from './chatStoreMigrate'
-import { isChatBlockedForAnonymous, enqueueChatAppend, registerUnsyncedMarker } from './chatPersistSync'
+import { isChatBlockedForAnonymous, enqueueChatAppend, registerChatStoreAccessor } from './chatPersistSync'
 import { chatPersistOptions } from './chatPersistConfig'
 
 export type ChatMessageStatus = 'enhancing' | 'generating' | 'done' | 'error'
@@ -876,19 +876,6 @@ export const useChatStore = create<ChatState>()(
 // 在 useChatStore 定义之后调用;chatMaskEditFlow 侧只在函数体内经 chatStore() 取用,无 TDZ。
 setChatStoreAccessor(useChatStore)
 
-// P2-3(sol 返修):注册 unsynced sidecar 标记回调 → enqueueChatAppend 同步置位 msgId。
-//   注册在模块尾部(useChatStore 已建),打破 chatPersistSync↔chatStore 静态环(chatPersistSync
-//   不静态 import chatStore;本注册经 registerUnsyncedMarker 注入 mutator)。运行时 enqueueChatAppend
-//   调 markUnsynced 同步改 sidecar,hydrate 前已就绪(无 async 竞态)。dedup 防 同 msgId 重复入队。
-registerUnsyncedMarker((canvasId, messageId) => {
-  useChatStore.setState((s) => {
-    const prev = s.unsyncedChatMsgIds[canvasId] ?? []
-    if (prev.includes(messageId)) return {} // 已标记,避免重复 push 触发多余 setItem
-    return {
-      unsyncedChatMsgIds: {
-        ...s.unsyncedChatMsgIds,
-        [canvasId]: [...prev, messageId],
-      },
-    }
-  })
-})
+// P2-3(sol 第二轮返修):注入 useChatStore 实例到 chatPersistSync(同 #236 DI 思路)——sidecar 生命周期
+//   mutator(mark/clear unsyncedChatMsgIds)在 chatPersistSync 内取用,打破静态环,保持 chatStore ≤900 行。
+registerChatStoreAccessor(useChatStore)

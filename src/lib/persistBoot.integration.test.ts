@@ -44,6 +44,7 @@ vi.mock('../store/remoteDebugReporter', () => ({
 
 import { useCanvasStore } from '../store/canvasStore'
 import { useChatStore } from '../store/chatStore'
+import { enqueueChatAppend } from '../store/chatPersistSync'
 import {
   drainPersistQueue,
   startPersistWriteQueue,
@@ -995,5 +996,111 @@ describe('P2-3 — local-only 保留由 unsynced sidecar 证明,远端已删不�
     // P2-3:m-del(远端已删,无 sidecar)→ 丢弃不复活;m-pend(pending,sidecar 证明)→ 保留
     expect(msgs.map((m) => m.id)).toEqual(['m-pend'])
     expect(useChatStore.getState().unsyncedChatMsgIds['c1']).toEqual(['m-pend'])
+  })
+})
+
+// ── P2-3(sol 第二轮返修)— unsynced sidecar 生命周期矩阵(真实 enqueue→outcome→hydrate 链,禁手工 set marker)──
+// 验收(lead 第二轮 P1):marker 生命周期经真实 enqueue/outcome 驱动(非手工 setState),覆盖 6 路径:
+//   local no-op 无 marker / transient 保留 / 401 保留 / success 清 / terminal 不伪装 pending / success 后 remote delete 不复活。
+// 修:sol 最小路径——marker 仅 queue active 时置位;writeRetryQueue onOutcome 终态 fire 清位;非终态保留。
+describe('P2-3 生命周期矩阵 — unsynced sidecar 真实 enqueue→outcome→hydrate(禁手工 set marker)', () => {
+  beforeEach(() => {
+    useChatStore.setState({ messagesByScene: {}, unsyncedChatMsgIds: {} })
+    useCanvasStore.setState({
+      sceneId: 'c1',
+      canvases: { c1: { title: 'c', projectId: 'p1', createdAt: 't', updatedAt: 't', nodes: [], edges: [], tasks: [] } as never },
+    })
+  })
+
+  /** appendChatMessage POST /api/canvas/:id/chat → 受控 status;其余 200/204。 */
+  const makeChatOutcomeFetch = (chatStatus: number) => {
+    const calls: { method: string; path: string }[] = []
+    const fetch = async (input: string, init?: RequestInit): Promise<Response> => {
+      const method = (init?.method ?? 'GET').toUpperCase()
+      const path = new URL(input, 'http://stub').pathname
+      calls.push({ method, path })
+      if (method === 'POST' && path.includes('/chat')) {
+        const body = chatStatus >= 200 && chatStatus < 300 ? '{}' : JSON.stringify({ error: 'stub' })
+        return new Response(body, { status: chatStatus, headers: { 'content-type': 'application/json' } })
+      }
+      if (method === 'DELETE') return new Response(null, { status: 204 })
+      return new Response(JSON.stringify({ id: 'srv', revision: 0 }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    return { fetch, calls }
+  }
+
+  const msg = (id: string): never => ({ id, role: 'user', kind: 'text', text: 'x', createdAt: 1, status: 'done' } as never)
+  const emptyChatAdapter = {
+    listProjects: async () => ({ projects: [] }),
+    listCanvas: async () => ({ canvases: [] }),
+    listChatMessages: async () => ({ messages: [], orderRevision: 0 }),
+  } as unknown as ServerPersistAdapter
+
+  it('local 模式(无 queue)enqueueChatAppend 不置 marker;hydrate 后 local 消息按 canonical 删除(不复活)', async () => {
+    // local:不 startPersistWriteQueue → enqueuePersistWrite 返 undefined → 不置 marker(消"local 假 marker → 切 server 永久 union")
+    useChatStore.setState({ messagesByScene: { c1: [msg('m1')] }, unsyncedChatMsgIds: {} })
+    enqueueChatAppend('c1', msg('m1'))
+    expect(useChatStore.getState().unsyncedChatMsgIds['c1'] ?? []).toEqual([])
+    // hydrate(server 空)→ m1 不在 server 集 + 无 marker → 按 canonical 删除(不复活为假 pending)
+    await hydrateFromServer(emptyChatAdapter, { fetch: async () => new Response('{}', { status: 200 }), baseUrl: '', getAuthHeaders: () => authHeaders() })
+    expect(useChatStore.getState().messagesByScene['c1'] ?? []).toEqual([])
+  })
+
+  it('transient(500 retry)→ marker 保留(非终态 onOutcome 不 fire;op 仍 pending 重试)', async () => {
+    const { fetch } = makeChatOutcomeFetch(500)
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    useChatStore.setState({ messagesByScene: { c1: [msg('m1')] } })
+    enqueueChatAppend('c1', msg('m1'))
+    await flush()
+    expect(useChatStore.getState().unsyncedChatMsgIds['c1']).toEqual(['m1']) // enqueue 置位(queue active)
+    await drainPersistQueue() // POST chat → 500 → transient-retry → 非终态 → onOutcome 不 fire
+    expect(useChatStore.getState().unsyncedChatMsgIds['c1']).toEqual(['m1']) // marker 保留
+  })
+
+  it('401(unauthorized paused)→ marker 保留(op 留存 paused-401 等 re-login replay)', async () => {
+    const { fetch } = makeChatOutcomeFetch(401)
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    useChatStore.setState({ messagesByScene: { c1: [msg('m1')] } })
+    enqueueChatAppend('c1', msg('m1'))
+    await flush()
+    await drainPersistQueue() // POST chat → 401 → unauthorized(paused-401)→ 非终态 → onOutcome 不 fire
+    expect(useChatStore.getState().unsyncedChatMsgIds['c1']).toEqual(['m1']) // marker 保留
+  })
+
+  it('success(201)→ marker 清(无 revision 也清;消"成功不清 outcome.revision!==undefined 才 onSuccess")', async () => {
+    const { fetch } = makeChatOutcomeFetch(201)
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    useChatStore.setState({ messagesByScene: { c1: [msg('m1')] } })
+    enqueueChatAppend('c1', msg('m1'))
+    await flush()
+    expect(useChatStore.getState().unsyncedChatMsgIds['c1']).toEqual(['m1']) // enqueue 置位
+    await drainPersistQueue() // POST chat → 201 success → onOutcome fire → 清位
+    expect(useChatStore.getState().unsyncedChatMsgIds['c1'] ?? []).toEqual([]) // marker 清
+  })
+
+  it('terminal(400 rejected)→ marker 清(不伪装 pending;hydrate 后不复活,消"terminal 留假 pending → 永久 union")', async () => {
+    const { fetch } = makeChatOutcomeFetch(400)
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    useChatStore.setState({ messagesByScene: { c1: [msg('m1')] } })
+    enqueueChatAppend('c1', msg('m1'))
+    await flush()
+    await drainPersistQueue() // POST chat → 400 rejected(terminal)→ onOutcome fire → 清位
+    expect(useChatStore.getState().unsyncedChatMsgIds['c1'] ?? []).toEqual([]) // marker 清(不伪装 pending)
+    // hydrate(server 空)→ m1 不在 server 集 + 无 marker → 按 canonical 删除(不复活为假 pending)
+    await hydrateFromServer(emptyChatAdapter, { fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    expect(useChatStore.getState().messagesByScene['c1'] ?? []).toEqual([])
+  })
+
+  it('success 后 remote delete 不复活(success 清 marker → hydrate 见 server 已删 + 无 marker → 丢弃)', async () => {
+    const { fetch } = makeChatOutcomeFetch(201)
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    useChatStore.setState({ messagesByScene: { c1: [msg('m1')] } })
+    enqueueChatAppend('c1', msg('m1'))
+    await flush()
+    await drainPersistQueue() // success → marker 清(消息已 drain 到 server)
+    expect(useChatStore.getState().unsyncedChatMsgIds['c1'] ?? []).toEqual([])
+    // 远端随后删了 m1 → hydrate server 不返 m1 + marker 已清 → 丢弃(不复活为假 pending)
+    await hydrateFromServer(emptyChatAdapter, { fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    expect(useChatStore.getState().messagesByScene['c1'] ?? []).toEqual([])
   })
 })

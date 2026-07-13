@@ -403,6 +403,18 @@ export const startPersistWriteQueue = (opts: FetchAdapterOptions = getProduction
     },
     // R2 F1:成功写回灌 revision/metaRevision,防 strict update 陈旧。
     onSuccess: applyServerRevision,
+    // P2-3(sol 第二轮返修):op 终态回调 — appendChatMessage success/terminal 时清 unsynced sidecar
+    //   (消"成功不清 outcome.revision!==undefined 才 onSuccess / terminal 留假 pending → 永久 union");
+    //   非终态(transient-retry/401/retained)writeRetryQueue 不 fire onOutcome,sidecar 保持 pending。
+    //   dynamic import 破 persistBoot↔chatPersistSync 静态环(chatPersistSync 静态 import persistBoot);
+    //   drain await 本回调(清位在 drain 返回前落地,测试可 drain 后立即断言 marker,无竞态)。
+    onOutcome: async (op) => {
+      if (op.kind !== 'appendChatMessage') return
+      const msgId = (op.message as { id?: string }).id
+      if (!msgId) return
+      const { clearUnsyncedMarker } = await import('../store/chatPersistSync')
+      clearUnsyncedMarker(op.canvasId, msgId)
+    },
   })
   const startPromise = writeQueue.start().catch((error) => {
     debugLogger.error(SOURCE, `queue start failed: ${msg(error)}`)
