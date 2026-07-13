@@ -18,8 +18,8 @@
 
 // A2-S2 wire 契约类型(FieldPath/DomainOp/ServerInvariantCommand/RecordKind/CreateBody)定义在
 // shared/persist-contract.ts(server/client 共享 seam);本文件 re-export + 提供 runtime validator(fieldKeyOf/setByPath/validateDomainOp)。
-import type { CreateBody, DomainOp, FieldPath, RecordKind, ServerInvariantCommand } from '../../shared/persist-contract.ts'
-export type { CreateBody, DomainOp, FieldPath, RecordKind, ServerInvariantCommand }
+import type { CreateBody, DomainOp, FieldPath, LegacyReplaceRequest, RecordKind, ServerInvariantCommand } from '../../shared/persist-contract.ts'
+export type { CreateBody, DomainOp, FieldPath, LegacyReplaceRequest, RecordKind, ServerInvariantCommand }
 
 // ── fieldKeyOf + setByPath/getByPath(硬化:拒原型污染 + 拒空路径 + 拒容器 clobber)──
 const FORBIDDEN_SEGMENTS = new Set(['__proto__', 'prototype', 'constructor'])
@@ -35,6 +35,7 @@ export type DomainOpViolation =
   | 'unknown-op-shape'
   | 'bad-field-path-segment'
   | 'bad-kind'
+  | 'bad-legacy-envelope'
 
 // erasableSyntaxOnly(tsconfig):禁止 parameter property(public readonly 构造参数),显式赋值。
 export class DomainOpError extends Error {
@@ -178,4 +179,22 @@ export const validateCreateBody = (body: unknown): CreateBody => {
   if (o.type !== 'node' && o.type !== 'edge' && o.type !== 'anchor') throw new DomainOpError('bad-kind', String(o.type))
   if (o.payload == null || typeof o.payload !== 'object' || Array.isArray(o.payload)) throw new DomainOpError('unknown-op-shape', 'create payload required')
   return { clientId: o.clientId, type: o.type, payload: o.payload }
+}
+
+/**
+ * validateLegacyReplaceRequest:PATCH body = LegacyReplaceRequest 信封(§14.3;FX-5 drain-only 兼容通道)。
+ * - kind='legacy-replace' + canvasId+nodeId+version=1+payload(object)+baseRevision(非负整数)。
+ * - route 复用 PATCH decoder wire:body 非信封 → validateDomainOps 走 DomainOp 路径;信封 → 本 validator 走 drain。
+ * - scope 校验(env.canvasId/nodeId 匹配 path)在 route 做(防同 nodeId 跨 canvas 重放);本 validator 只校 wire shape。
+ */
+export const validateLegacyReplaceRequest = (body: unknown): LegacyReplaceRequest => {
+  if (body == null || typeof body !== 'object' || Array.isArray(body)) throw new DomainOpError('bad-legacy-envelope', 'legacy-replace must be object')
+  const o = body as Record<string, unknown>
+  if (o.kind !== 'legacy-replace') throw new DomainOpError('bad-legacy-envelope', 'kind must be legacy-replace')
+  if (typeof o.canvasId !== 'string' || !o.canvasId) throw new DomainOpError('bad-legacy-envelope', 'canvasId required')
+  if (typeof o.nodeId !== 'string' || !o.nodeId) throw new DomainOpError('bad-legacy-envelope', 'nodeId required')
+  if (o.version !== 1) throw new DomainOpError('bad-legacy-envelope', 'version must be 1')
+  if (o.payload == null || typeof o.payload !== 'object' || Array.isArray(o.payload)) throw new DomainOpError('bad-legacy-envelope', 'payload required')
+  if (typeof o.baseRevision !== 'number' || !Number.isInteger(o.baseRevision) || o.baseRevision < 0) throw new DomainOpError('bad-legacy-envelope', 'baseRevision must be non-negative integer')
+  return { kind: 'legacy-replace', canvasId: o.canvasId, nodeId: o.nodeId, version: 1, payload: o.payload, baseRevision: o.baseRevision }
 }

@@ -4,7 +4,7 @@
 // + N5 If-Match 严格 + N7 authz + N8 reorder + N10 payload allowlist + 原 13 条回归(保持绿):
 // 全量 GET(#5/#6)、枚举(#8)、节点级 PATCH(FX-4 + #3 cross-canvas + #4 428/If-Match + #13 白名单 + #12 413)、
 // edge/anchor DELETE(#8)、硬删子资源(#2)、原子 tree 软删(#2/#7)、reorder(#6/N8)、chat(DP-6/N2/N3)。
-import { describe, it, expect, beforeEach, beforeAll, afterAll } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest'
 import {
   buildPersistApp,
   hdr,
@@ -22,6 +22,7 @@ import {
   setBaseCursorSecrets,
 } from './persistTestApp'
 import { fingerprintOfPlatformKey } from '../lib/keys'
+import { legacyDrainGate } from '../lib/legacyDrainGate'
 
 // A2-S2:注入 BaseCursor test secret(route encodeBase/decodeBase 同进程共享)。join 构造防 secret-detection hook 误报。
 const TEST_SECRET = ['test', 'secret', 'a2s2'].join('-')
@@ -765,5 +766,168 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
     // B 跨 owner PATCH node(合法 DomainOp body)→ authzCanvas 拒 → 404(单资源 route resourceOwner 化,无存在泄漏)
     const bPatch = await patchDomainOps(app, 'c1', 'node', 'n1', [{ kind: 'set', fieldPath: ['title'], value: 'x' }], baseToken('c1', 'n1', 1), { key: KEY_B })
     expect(bPatch.status).toBe(404)
+  })
+
+  // ── A2-S2 §14.3 legacy drain envelope(PATCH /:id/nodes/:nodeId 复用 decoder wire;FX-5 队列迁移 drain-only 兼容通道)──
+  // 蓝本:src/kernel/__spike__/n20-truth-source.spike.test.ts CutoverHarness C-2(语义蓝本,生产化到 route)。
+  // 四态 + scope forge + gate 关 + authz deny + 观测(touchWindow/drainCount)。retirement fake-clock 在 legacyDrainGate.test.ts。
+  describe('A2-S2 §14.3 legacy drain envelope(PATCH /:id/nodes/:nodeId;蓝本 spike CutoverHarness C-2)', () => {
+    // gate 进程内单例:每 test __reset + setOpen(true)(drain 测试默认开闸);afterEach 复位防外溢。
+    beforeEach(() => {
+      legacyDrainGate.__reset()
+      legacyDrainGate.setOpen(true)
+    })
+    afterEach(() => {
+      legacyDrainGate.__reset()
+    })
+
+    // LegacyReplaceRequest 信封(§14.3;绑 canvasId+nodeId+version+payload+原队列 baseRevision)。
+    const envelope = (
+      canvasId: string,
+      nodeId: string,
+      payload: unknown,
+      baseRevision: number,
+      over: Record<string, unknown> = {},
+    ): unknown => ({ kind: 'legacy-replace', canvasId, nodeId, version: 1, payload, baseRevision, ...over })
+
+    const drainEnvelope = async (
+      canvasId: string,
+      nodeId: string,
+      body: unknown,
+      opts: { key?: string; idempotencyKey?: string } = {},
+    ): Promise<{ status: number; body: unknown }> => {
+      const headers: Record<string, string> = { ...hdr(opts.key ?? KEY_A) }
+      if (opts.idempotencyKey) headers['idempotency-key'] = opts.idempotencyKey
+      return req(app, `/api/canvas/${canvasId}/nodes/${nodeId}`, { method: 'PATCH', headers, body: JSON.stringify(body) })
+    }
+
+    it('gate 关 → 400 payload-rejected(§14.3 受控迁移协议例外;关 → envelope 400)', async () => {
+      await seedProject()
+      await seedCanvas()
+      legacyDrainGate.setOpen(false)
+      const r = await drainEnvelope('c1', 'n1', envelope('c1', 'n1', wirePayload(canonicalNode('n1')), 0))
+      expect(r.status).toBe(400)
+      expect((r.body as { error: string }).error).toBe('bad-request')
+    })
+
+    it('authz deny:viewer member(可读不可写)→ 403 forbidden(真实 canvas-write seam + deny 负例)', async () => {
+      await seedProject()
+      await seedCanvas()
+      const userB = fingerprintOfPlatformKey(KEY_B)
+      const addViewer = await req(app, '/api/projects/p1/members', {
+        method: 'POST',
+        headers: hdr(KEY_A),
+        body: JSON.stringify({ userId: userB, role: 'viewer' }),
+      })
+      expect(addViewer.status).toBe(201)
+      // viewer drain → authzCanvas('write') deny(memberRole=viewer 知资源存在 → 403;非 member→404 no-leak)
+      const r = await drainEnvelope('c1', 'n1', envelope('c1', 'n1', wirePayload(canonicalNode('n1')), 0), { key: KEY_B })
+      expect(r.status).toBe(403)
+      expect((r.body as { error: string }).error).toBe('forbidden')
+    })
+
+    it('scope canvasId mismatch(env.canvasId≠path canvas)→ 400(防同 nodeId 跨 canvas 重放)', async () => {
+      await seedProject()
+      await seedCanvas()
+      const r = await drainEnvelope('c1', 'n1', envelope('c2', 'n1', wirePayload(canonicalNode('n1')), 0))
+      expect(r.status).toBe(400)
+      expect((r.body as { error: string }).error).toBe('bad-request')
+    })
+
+    it('scope nodeId mismatch(env.nodeId≠path node forge)→ 400(防 forge path)', async () => {
+      await seedProject()
+      await seedCanvas()
+      // env.nodeId='n-real' ≠ path 'n-different' → 400
+      const r = await drainEnvelope('c1', 'n-different', envelope('c1', 'n-real', wirePayload(canonicalNode('n-real')), 0))
+      expect(r.status).toBe(400)
+    })
+
+    it('raw 旧 body(无 kind)on PATCH /nodes/:nodeId → 400 payload-rejected(必须包信封;禁绕 wire 直调)', async () => {
+      await seedProject()
+      await seedCanvas()
+      // raw NodePayload(无 kind)→ 非 legacy envelope → validateDomainOps throw → 400
+      const r = await req(app, '/api/canvas/c1/nodes/n1', {
+        method: 'PATCH',
+        headers: hdr(KEY_A),
+        body: JSON.stringify({ payload: wirePayload(canonicalNode('n1')) }),
+      })
+      expect(r.status).toBe(400)
+    })
+
+    it('envelope + missing + base=0 → 200 replaced(create fresh)+ seq + record 落 payload', async () => {
+      await seedProject()
+      await seedCanvas()
+      const payload = wirePayload(canonicalNode('n1'))
+      const r = await drainEnvelope('c1', 'n1', envelope('c1', 'n1', payload, 0))
+      expect(r.status).toBe(200)
+      const body = r.body as { id: string; revision: number; seq: number }
+      expect(body.id).toBe('n1')
+      expect(body.seq).toBeGreaterThan(0)
+      // GET → node 落 payload
+      const get = await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })
+      const nodes = (get.body as { nodes: Array<{ id: string; payload: unknown }> }).nodes
+      expect(nodes.find((n) => n.id === 'n1')).toBeTruthy()
+    })
+
+    it('envelope + existing + base=rev → 200 replaced(whole-record replace)+ rev bump', async () => {
+      await seedProject()
+      await seedCanvas()
+      const created = await createChildFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
+      expect(created.status).toBe(201)
+      const rev = (created.body as { revision: number }).revision
+      const r = await drainEnvelope('c1', 'n1', envelope('c1', 'n1', wirePayload(canonicalNode('n1')), rev))
+      expect(r.status).toBe(200)
+      expect((r.body as { revision: number }).revision).toBe(rev + 1)
+    })
+
+    it('envelope + existing + base≠rev → 409 legacy-stale-conflict(terminal conflict dead-letter,不盲 replace)', async () => {
+      await seedProject()
+      await seedCanvas()
+      const created = await createChildFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
+      const rev = (created.body as { revision: number }).revision
+      const base = (created.body as { base: string }).base
+      // server bump rev(base≠queued base)
+      const patched = await patchDomainOps(app, 'c1', 'node', 'n1', [{ kind: 'set', fieldPath: ['title'], value: 'server-v2' }], base)
+      expect(patched.status).toBe(200)
+      // queued stale drain base=rev(≠rev+1)→ 409
+      const r = await drainEnvelope('c1', 'n1', envelope('c1', 'n1', wirePayload(canonicalNode('n1')), rev))
+      expect(r.status).toBe(409)
+      expect((r.body as { error: string; currentRevision: number })).toMatchObject({ error: 'legacy-stale-conflict', currentRevision: rev + 1 })
+    })
+
+    it('envelope + missing + base>0 → 409 legacy-stale-conflict dead-letter(不盲 create 复活已删 record)', async () => {
+      await seedProject()
+      await seedCanvas()
+      const created = await createChildFixture(app, 'c1', 'node', 'n1', wirePayload(canonicalNode('n1')))
+      const rev = (created.body as { revision: number }).revision
+      const base = (created.body as { base: string }).base
+      const patched = await patchDomainOps(app, 'c1', 'node', 'n1', [{ kind: 'set', fieldPath: ['title'], value: 'v2' }], base)
+      const newBase = (patched.body as { base: string }).base
+      const deleted = await deleteChildFixture(app, 'c1', 'node', 'n1', newBase)
+      expect(deleted.status).toBe(200)
+      // drain n1 base=rev+1(record 删前 rev,>0)→ missing+base>0 → 409 dead-letter(不盲 create 复活)
+      const r = await drainEnvelope('c1', 'n1', envelope('c1', 'n1', wirePayload(canonicalNode('n1')), rev + 1))
+      expect(r.status).toBe(409)
+      expect((r.body as { error: string; currentRevision: number })).toMatchObject({ error: 'legacy-stale-conflict', currentRevision: 0 })
+    })
+
+    it('drain 观测:touchWindow(每 envelope 经 authz+gate+scope)+ drainCount(仅 replaced)— 真实 seam 全链路', async () => {
+      await seedProject()
+      await seedCanvas()
+      expect(legacyDrainGate.envelopeIncrementInWindowValue()).toBe(0)
+      expect(legacyDrainGate.drainCountValue()).toBe(0)
+      // drain1: missing+base=0 → replaced → touchWindow(incr=1) + incrementDrainCount(drain=1)
+      const r1 = await drainEnvelope('c1', 'n1', envelope('c1', 'n1', wirePayload(canonicalNode('n1')), 0))
+      expect(r1.status).toBe(200)
+      expect(legacyDrainGate.envelopeIncrementInWindowValue()).toBe(1)
+      expect(legacyDrainGate.drainCountValue()).toBe(1)
+      // drain2: existing+base≠rev → stale-conflict → touchWindow(incr=2) + NO incrementDrainCount(drain=1)
+      const created = await createChildFixture(app, 'c1', 'node', 'n2', wirePayload(canonicalNode('n2')))
+      const rev2 = (created.body as { revision: number }).revision
+      const r2 = await drainEnvelope('c1', 'n2', envelope('c1', 'n2', wirePayload(canonicalNode('n2')), rev2 + 99))
+      expect(r2.status).toBe(409)
+      expect(legacyDrainGate.envelopeIncrementInWindowValue()).toBe(2) // touchWindow on every envelope
+      expect(legacyDrainGate.drainCountValue()).toBe(1) // no increment on stale-conflict(dead-letter)
+    })
   })
 })

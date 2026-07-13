@@ -10,7 +10,7 @@
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest'
 import { InMemoryPersistBackend, type PersistBackend } from './backend'
-import type { ApplyDomainOpsResult, CreateChildResult, GetChildResult } from './backend'
+import type { ApplyDomainOpsResult, CreateChildResult, GetChildResult, LegacyReplaceDrainResult } from './backend'
 import { PgPersistBackend } from './pgBackend'
 import { setBaseCursorSecrets, encodeBase, decodeBase, encodeOrderBase, decodeOrderBase } from '../lib/baseCursor'
 import { validateDomainOps, type DomainOp } from '../lib/domainOp'
@@ -32,6 +32,10 @@ const acc = (r: ApplyDomainOpsResult): Extract<ApplyDomainOpsResult, { kind: 'ac
 }
 const cre = (r: CreateChildResult): Extract<CreateChildResult, { kind: 'created' }> => {
   if (r.kind !== 'created') throw new Error(`expected created, got ${r.kind}`)
+  return r
+}
+const dr = (r: LegacyReplaceDrainResult): Extract<LegacyReplaceDrainResult, { kind: 'replaced' }> => {
+  if (r.kind !== 'replaced') throw new Error(`expected replaced, got ${r.kind}`)
   return r
 }
 
@@ -202,6 +206,90 @@ const runA2S2ContractSuite = (
         const ob = encodeOrderBase('c1', 5)
         expect(decodeOrderBase(ob, 'c1')).toEqual({ cv: 5 })
         expect(decodeOrderBase(ob, 'c2')).toBeNull() // 跨 canvas → null
+      })
+    })
+
+    describe('legacyReplaceDrain 四态矩阵(§14.3;FX-5 队列迁移 drain-only 兼容通道;蓝本 spike CutoverHarness C-2)', () => {
+      // 四态:existing+base=rev → replaced(200 whole-record replace 同 upsertChild,非 merge)
+      //       existing+base≠rev → stale-conflict(409 terminal conflict dead-letter,不盲 replace)
+      //       missing+base>0 → stale-conflict(409 dead-letter,防盲 create 复活已删 record)
+      //       missing+base=0 → replaced(200 create fresh)。
+      // 蓝本:src/kernel/__spike__/n20-truth-source.spike.test.ts C-2 ②/⑥/⑥b/⑦(语义蓝本,生产化到 backend)。
+
+      it('missing + base=0 → replaced(create fresh)+ seq>0 + record 落 payload(whole-record)', async () => {
+        await seedCanvas(b)
+        const payload = makeNode('n-new', { title: 'drained' })
+        const r = await b.legacyReplaceDrain('owner', 'c1', 'node', 'n-new', { payload, baseRevision: 0 }, { method: 'PATCH', resourceKind: 'node', actor: 'alice' })
+        expect(r.kind).toBe('replaced')
+        expect(dr(r).seq).toBeGreaterThan(0)
+        const got = await b.getChild('owner', 'c1', 'node', 'n-new')
+        expect(got.kind).toBe('found')
+        expect(found(got).record.payload).toEqual(payload) // whole-record replace(deep-equal)
+      })
+
+      it('existing + base=rev → replaced(whole-record replace,非 merge)+ seq + payload 完全替换', async () => {
+        await seedCanvas(b)
+        const created = await b.createChild('owner', 'c1', 'node', 'n1', makeNode('n1', { title: 'orig' }), { method: 'POST', resourceKind: 'node', actor: 'alice' })
+        const rev1 = cre(created).record.revision
+        const newPayload = makeNode('n1', { title: 'drained' })
+        const r = await b.legacyReplaceDrain('owner', 'c1', 'node', 'n1', { payload: newPayload, baseRevision: rev1 }, { method: 'PATCH', resourceKind: 'node', actor: 'alice' })
+        expect(r.kind).toBe('replaced')
+        expect(dr(r).seq).toBeGreaterThan(0)
+        const got = await b.getChild('owner', 'c1', 'node', 'n1')
+        expect(found(got).record.payload).toEqual(newPayload) // ★ whole-record replace(非 merge:新 payload 完全替换)
+        expect(found(got).record.revision).toBe(rev1 + 1)
+      })
+
+      it('existing + base≠rev → stale-conflict(409 terminal conflict)+ currentRevision + record 不被盲 replace(数据破坏防)', async () => {
+        await seedCanvas(b)
+        const created = await b.createChild('owner', 'c1', 'node', 'n1', makeNode('n1', { title: 'server-version' }), { method: 'POST', resourceKind: 'node', actor: 'alice' })
+        const rev1 = cre(created).record.revision
+        // server bump rev(base≠queued baseRevision=rev1;模拟 queued 时 server 已更新)
+        await b.applyDomainOps('owner', 'c1', 'node', 'n1', op({ kind: 'set', fieldPath: ['title'], value: 'v2' }), { baseRevision: rev1, baseFieldClocks: {}, method: 'PATCH', resourceKind: 'node', actor: 'alice' })
+        expect(found(await b.getChild('owner', 'c1', 'node', 'n1')).record.revision).toBe(rev1 + 1)
+        // queued stale drain base=rev1(≠rev1+1)→ stale-conflict,不盲 replace
+        const r = await b.legacyReplaceDrain('owner', 'c1', 'node', 'n1', { payload: makeNode('n1', { title: 'queued-stale' }), baseRevision: rev1 }, { method: 'PATCH', resourceKind: 'node', actor: 'alice' })
+        expect(r.kind).toBe('stale-conflict')
+        if (r.kind === 'stale-conflict') expect(r.currentRevision).toBe(rev1 + 1)
+        // record 仍 server 版本(不盲 replace)
+        const got = await b.getChild('owner', 'c1', 'node', 'n1')
+        expect((found(got).record.payload as { title: string }).title).toBe('v2')
+      })
+
+      it('missing + base>0 → stale-conflict dead-letter(不盲 create 复活已删 record)+ currentRevision=0 + record 仍 missing', async () => {
+        await seedCanvas(b)
+        const created = await b.createChild('owner', 'c1', 'node', 'n1', makeNode('n1', { title: 'will-delete' }), { method: 'POST', resourceKind: 'node', actor: 'alice' })
+        const rev1 = cre(created).record.revision
+        // bump rev + hard delete(record missing;tombstone)
+        await b.applyDomainOps('owner', 'c1', 'node', 'n1', op({ kind: 'set', fieldPath: ['title'], value: 'v2' }), { baseRevision: rev1, baseFieldClocks: {}, method: 'PATCH', resourceKind: 'node', actor: 'alice' })
+        const rev2 = found(await b.getChild('owner', 'c1', 'node', 'n1')).record.revision
+        const del = await b.deleteChildCascade('owner', 'c1', 'node', 'n1', { baseRevision: rev2, method: 'DELETE', resourceKind: 'node', actor: 'alice' })
+        expect(del.kind).toBe('deleted')
+        expect((await b.getChild('owner', 'c1', 'node', 'n1')).kind).toBe('missing')
+        // stale queue drain base=rev2(record 删前 rev)→ missing+base>0 → stale-conflict dead-letter(不盲 create 复活)
+        const r = await b.legacyReplaceDrain('owner', 'c1', 'node', 'n1', { payload: makeNode('n1', { title: 'revive' }), baseRevision: rev2 }, { method: 'PATCH', resourceKind: 'node', actor: 'alice' })
+        expect(r.kind).toBe('stale-conflict')
+        if (r.kind === 'stale-conflict') expect(r.currentRevision).toBe(0) // record 已删,返 0(非盲 create 的 rev)
+        expect((await b.getChild('owner', 'c1', 'node', 'n1')).kind).toBe('missing') // ★ 不复活(数据破坏防)
+      })
+
+      it('cross-canvas(同 id 属另一 canvas)→ cross-canvas(canvas_id 不可变,不 create)', async () => {
+        await seedCanvas(b, 'owner', 'c1')
+        await seedCanvas(b, 'owner', 'c2')
+        await b.createChild('owner', 'c1', 'node', 'n1', makeNode('n1'), { method: 'POST', resourceKind: 'node', actor: 'alice' })
+        // drain 到 c2(但 n1 属 c1)→ getChild cross-canvas → drain cross-canvas
+        const r = await b.legacyReplaceDrain('owner', 'c2', 'node', 'n1', { payload: makeNode('n1'), baseRevision: 0 }, { method: 'PATCH', resourceKind: 'node', actor: 'alice' })
+        expect(r.kind).toBe('cross-canvas')
+      })
+
+      it('reuse-conflict:同 idem key 不同 fingerprint → reuse-conflict(422)', async () => {
+        await seedCanvas(b)
+        const payloadA = makeNode('n1', { title: 'a' })
+        const r1 = await b.legacyReplaceDrain('owner', 'c1', 'node', 'n1', { payload: payloadA, baseRevision: 0 }, { method: 'PATCH', resourceKind: 'node', idempotencyKey: 'k1', bodyFingerprint: 'fa', actor: 'alice' })
+        expect(r1.kind).toBe('replaced')
+        // 同 idem key 不同 fingerprint(base=0=current rev,fresh 过 stale check;idem guard 拒)→ reuse-conflict
+        const r2 = await b.legacyReplaceDrain('owner', 'c1', 'node', 'n1', { payload: makeNode('n1', { title: 'b' }), baseRevision: 0 }, { method: 'PATCH', resourceKind: 'node', idempotencyKey: 'k1', bodyFingerprint: 'fb', actor: 'alice' })
+        expect(r2.kind).toBe('reuse-conflict')
       })
     })
   })

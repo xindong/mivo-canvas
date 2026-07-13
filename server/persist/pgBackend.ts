@@ -32,6 +32,7 @@ import type {
   EnsureCreateResult,
   GetChildResult,
   GetResult,
+  LegacyReplaceDrainResult,
   ListResult,
   OverwrittenNotice,
   PersistBackend,
@@ -1202,6 +1203,52 @@ export class PgPersistBackend implements PersistBackend {
       (winnerRecord, mismatch) =>
         mismatch ? { kind: 'reuse-conflict' } : { kind: 'updated', record: this.withIdem(winnerRecord, opts) },
     )
+  }
+
+  // ── A2-S2 §14.3:legacy drain(PATCH /:id/nodes/:nodeId 复用 decoder wire;FX-5 队列迁移 drain-only 兼容通道)──
+  // 四态矩阵(同 InMemory;fresh 落 upsertChild(base 重验)作 TOCTOU guard;seq 独立 tx bump,observability cursor)。
+  async legacyReplaceDrain(
+    ownerId: string,
+    canvasId: string,
+    type: PersistType,
+    recordId: string,
+    env: { payload: unknown; baseRevision: Revision },
+    opts: { idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string; actor: string },
+  ): Promise<LegacyReplaceDrainResult> {
+    await this.ready
+    // 先 getChild 判 stale(existing+base≠rev / missing+base>0 → 409 dead-letter),fresh 再 upsertChild 原子写。
+    const got = await this.getChild(ownerId, canvasId, type, recordId)
+    if (got.kind === 'cross-canvas') return { kind: 'cross-canvas' }
+    if (got.kind === 'found') {
+      // existing+base≠rev → 409 terminal conflict(不盲 replace;队列残留是离线期改动,覆盖是数据破坏)
+      if (env.baseRevision !== got.record.revision) {
+        return { kind: 'stale-conflict', currentRevision: got.record.revision }
+      }
+      // fresh(existing+base=rev)→ 落 upsertChild(base 重验,TOCTOU guard)
+    } else {
+      // missing+base>0 → 409 dead-letter(防盲 create 复活已删 record);missing+base=0 → create fresh 落 upsertChild
+      if (env.baseRevision > 0) return { kind: 'stale-conflict', currentRevision: 0 }
+    }
+    // whole-record replace(委托 upsertChild;base=env.baseRevision → upsertChild conflict check 充当 TOCTOU guard:
+    //   getChild 与 write 之间并发写 bump revision → upsertChild base≠current → conflict,非盲 replace)。
+    const r = await this.upsertChild(ownerId, canvasId, type, recordId, env.payload, {
+      base: env.baseRevision,
+      idempotencyKey: opts.idempotencyKey,
+      method: opts.method,
+      resourceKind: opts.resourceKind,
+      bodyFingerprint: opts.bodyFingerprint,
+      strictUpdate: false,
+    })
+    if (r.kind === 'created' || r.kind === 'updated') {
+      // seq = per-canvas 单调事件序号(§10.5);独立 tx bump(observability cursor,record 写已由 upsertChild 原子落)。
+      const seq = await this.db.transaction().execute(async (trx) => this.nextCanvasSeqInTrx(trx, canvasId))
+      return { kind: 'replaced', record: r.record, seq }
+    }
+    if (r.kind === 'conflict') return { kind: 'stale-conflict', currentRevision: r.currentRevision }
+    if (r.kind === 'cross-canvas') return { kind: 'cross-canvas' }
+    if (r.kind === 'reuse-conflict') return { kind: 'reuse-conflict' }
+    // precondition-required / not-found —— 不应发生(传了 base + strictUpdate=false);防御返 stale-conflict
+    return { kind: 'stale-conflict', currentRevision: 0 }
   }
 
   async hardDeleteChild(ownerId: string, canvasId: string, type: PersistType, id: string): Promise<{ deleted: boolean }> {

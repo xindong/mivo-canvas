@@ -35,7 +35,8 @@ import {
   validateChildPayload,
 } from '../lib/persistHttp'
 import { encodeBase, decodeBase } from '../lib/baseCursor'
-import { validateDomainOps, validateCreateBody, DomainOpError, type DomainOp } from '../lib/domainOp'
+import { validateDomainOps, validateCreateBody, validateLegacyReplaceRequest, DomainOpError, type DomainOp, type LegacyReplaceRequest } from '../lib/domainOp'
+import { legacyDrainGate } from '../lib/legacyDrainGate'
 import type {
   CanvasMeta,
   ConflictBody,
@@ -472,6 +473,72 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
     return c.json({ reordered: result.reordered, contentVersion: result.contentVersion }, 200)
   })
 
+  // ── A2-S2 §14.3:legacy drain envelope(PATCH /:id/nodes/:nodeId 复用 decoder wire;FX-5 队列迁移 drain-only 兼容通道)──
+  // 蓝本:src/kernel/__spike__/n20-truth-source.spike.test.ts CutoverHarness L2273-2403(语义蓝本,生产化到 route)。
+  // 顺序:validate wire(400)→ authzCanvas('write')(403/404)→ null-actor 401(requireLogin,同 child-write 约定)→
+  //   LEGACY_DRAIN gate(关→400)→ scope(env.canvasId/nodeId 匹配 path,防同 nodeId 跨 canvas 重放→400)→
+  //   touchWindow(envelope 到达重计 quiet-window)→ backend.legacyReplaceDrain 四态→ 映射 200/409/404/422。
+  // retirement 是进程内观测(canRetire 的 pendingGauge 由 ops 从队列实况推导;route 只 touchWindow+incrementDrainCount)。
+  const legacyDrainEnvelope = async (
+    c: Context<AppEnv>,
+    childId: string,
+    raw: unknown,
+    fingerprint: string,
+    requestId: string,
+    t0: number,
+  ): Promise<Response> => {
+    let env: LegacyReplaceRequest
+    try {
+      env = validateLegacyReplaceRequest(raw)
+    } catch (e) {
+      const msg = e instanceof DomainOpError ? e.violation : 'invalid legacy envelope'
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'payload-rejected' })
+      return c.json({ error: 'bad-request', message: msg }, 400)
+    }
+    const canvasId = c.req.param('id') ?? ''
+    const authz = await authzCanvas(c, canvasId, 'write')
+    if (!authz.ok) return denyCanvas(c, requestId, t0, authz)
+    if (authz.actor === null) return requireLogin(c, requestId, t0)
+    // ④ LEGACY_DRAIN gate(env 默认关;关 → envelope 400 payload-rejected,§14.3 受控迁移协议例外,非双协议窗口)
+    if (!legacyDrainGate.isOpen()) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'legacy-drain-gate-closed' })
+      return c.json({ error: 'bad-request', message: 'legacy drain gate closed' }, 400)
+    }
+    // ① scope 校验(env.canvasId+env.nodeId 必须匹配 path canvas+node;防同 nodeId 跨 canvas 重放)
+    if (env.canvasId !== canvasId || env.nodeId !== childId) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'legacy-drain-scope-mismatch' })
+      return c.json({ error: 'bad-request', message: 'envelope canvasId/nodeId must match path' }, 400)
+    }
+    // ④ v8 quiet-window:任一 envelope 到达(经 authz+gate+scope)→ 重新计时(envelope 增量 +1;retirement 须重等完整窗口)
+    legacyDrainGate.touchWindow()
+    const result = await backend.legacyReplaceDrain(authz.ownerId, canvasId, 'node', childId, { payload: env.payload, baseRevision: env.baseRevision }, {
+      idempotencyKey: c.req.header('idempotency-key') || undefined,
+      method: 'PATCH',
+      resourceKind: 'node',
+      bodyFingerprint: fingerprint,
+      actor: authz.actor,
+    })
+    if (result.kind === 'replaced') {
+      legacyDrainGate.incrementDrainCount()
+      const res: UpsertResponse = { id: result.record.id, revision: result.record.revision, seq: result.seq }
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0, note: 'legacy-drain-replaced' })
+      return c.json(res, 200)
+    }
+    if (result.kind === 'stale-conflict') {
+      // ② 【lead 拍板】stale base → 409 terminal conflict dead-letter(不盲 replace;队列残留是离线期改动,覆盖是数据破坏)
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 409, latencyMs: Date.now() - t0, note: 'legacy-stale-conflict' })
+      return c.json({ error: 'legacy-stale-conflict', id: childId, currentRevision: result.currentRevision }, 409)
+    }
+    if (result.kind === 'cross-canvas') {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'cross-canvas' })
+      return c.json({ error: 'unknown-node' } satisfies UnknownResourceBody, 404)
+    }
+    // reuse-conflict:同 idem key 不同 fingerprint → 422
+    const err: ReuseConflictBody = reuseConflict(c.req.header('idempotency-key') ?? '')
+    logRequest({ method: c.req.method, path: c.req.path, requestId, status: 422, latencyMs: Date.now() - t0, note: 'reuse-conflict' })
+    return c.json(err, 422)
+  }
+
   // ── A2-S2 节点级 PATCH DomainOp path(§10.1/§14.1;edit 永不 409,同 fieldKeyOf path stale 才 overwritten)──
   const patchDomainChild = async (
     c: Context<AppEnv>,
@@ -491,6 +558,10 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
       const { status, body } = bodyError(error)
       logRequest({ method: c.req.method, path: c.req.path, requestId, status, latencyMs: Date.now() - t0, note: 'bad-body' })
       return c.json(body, status as 400 | 413)
+    }
+    // A2-S2 §14.3:legacy-replace 信封(nodes only)→ legacy drain 通道;edges/anchors 信封落 validateDomainOps → 400(非 DomainOp)。
+    if (type === 'node' && typeof raw === 'object' && raw !== null && (raw as { kind?: unknown }).kind === 'legacy-replace') {
+      return legacyDrainEnvelope(c, childId, raw, fingerprint, requestId, t0)
     }
     // body = DomainOp | DomainOp[](batch 同 record 原子,§10.2);stale-client 旧 body → validateDomainOps throw → 400 payload-rejected(§1.2)。
     let ops: DomainOp[]

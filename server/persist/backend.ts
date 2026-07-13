@@ -121,6 +121,18 @@ export type CreateChildResult =
   | { kind: 'cross-canvas' }
   | { kind: 'reuse-conflict' }
 /**
+ * legacyReplaceDrain 结果(PATCH /:id/nodes/:nodeId 复用 decoder wire;§14.3;FX-5 drain-only 兼容通道)。
+ * - replaced:fresh(existing+base=rev,或 missing+base=0→create)→ 200 whole-record replace(同 upsertChild,非 merge)。
+ * - stale-conflict:existing+base≠rev,或 missing+base>0(防盲 create 复活已删 record)→ 409 terminal conflict dead-letter(不盲 replace)。
+ * - cross-canvas:同 id 属另一 canvas → 404。
+ * - reuse-conflict:同 idem key 不同 fingerprint → 422。
+ */
+export type LegacyReplaceDrainResult =
+  | { kind: 'replaced'; record: PersistRecord; seq: number }
+  | { kind: 'stale-conflict'; currentRevision: Revision }
+  | { kind: 'cross-canvas' }
+  | { kind: 'reuse-conflict' }
+/**
  * deleteChildCascade 结果(ServerInvariantCommand node-delete-cascade,§10.4/§10.7)。
  * - deleted:fresh base(base.revision===current.revision)→ 删 + 级联 edge;返 seq(cursor)。
  * - idempotent:幂等已删(tombstone 命中)→ 返当前 seq(不 404,§10.7 accepted 必携 cursor)。
@@ -293,6 +305,24 @@ export interface PersistBackend {
     payload: unknown,
     opts: { idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string; actor: string },
   ): Promise<CreateChildResult>
+  /**
+   * A2-S2(§14.3):PATCH /:id/nodes/:nodeId 复用 decoder wire 的 legacy drain(FX-5 队列迁移 drain-only 兼容通道)。
+   * - 四态矩阵(§14.3):existing+base=rev → replaced(200 whole-record replace 同 upsertChild,非 merge);
+   *   existing+base≠rev → stale-conflict(409 terminal conflict dead-letter,不盲 replace);
+   *   missing+base>0 → stale-conflict(409 dead-letter,防盲 create 复活已删 record);
+   *   missing+base=0 → replaced(200 create fresh)。
+   * - scope 校验(env.canvasId/nodeId 匹配 path)+ authz + LEGACY_DRAIN gate 在 route 做;backend 只收已过 gate/scope 的明文 {payload,baseRevision}。
+   * - whole-record replace = 旧 upsert 语义(backend.ts upsertChild `payload: clone(payload)`,非 field-level merge;不翻译为 DomainOps)。
+   * - 复用 upsertChild(base=env.baseRevision)做原子写:upsertChild 的 conflict check 充当 TOCTOU guard( getChild stale-check 与 write 之间并发写 → upsertChild 409,非盲 replace)。
+   */
+  legacyReplaceDrain(
+    ownerId: string,
+    canvasId: string,
+    type: PersistType,
+    recordId: string,
+    env: { payload: unknown; baseRevision: Revision },
+    opts: { idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string; actor: string },
+  ): Promise<LegacyReplaceDrainResult>
   /**
    * A2-S2(§10.4/§10.7):ServerInvariantCommand node-delete-cascade。
    * - fresh base(base.revision===current.revision)→ 删 node + 级联 edge(from/to===nodeId)→ deleted(返 seq cursor)。
@@ -1422,6 +1452,48 @@ export class InMemoryPersistBackend implements PersistBackend {
     if (type !== 'chat-message') this.bumpCanvasContentVersion(ownerId, canvasId)
     this.setIdemIndex(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, rk, opts.bodyFingerprint ?? '')
     return { kind: 'created', record: clone(created), seq, fieldClocks: {} }
+  }
+
+  async legacyReplaceDrain(
+    ownerId: string,
+    canvasId: string,
+    type: PersistType,
+    recordId: string,
+    env: { payload: unknown; baseRevision: Revision },
+    opts: { idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string; actor: string },
+  ): Promise<LegacyReplaceDrainResult> {
+    // §14.3 四态矩阵:先 getChild 判 stale(existing+base≠rev / missing+base>0 → 409 dead-letter),fresh 再 upsertChild 原子写。
+    const got = await this.getChild(ownerId, canvasId, type, recordId)
+    if (got.kind === 'cross-canvas') return { kind: 'cross-canvas' }
+    if (got.kind === 'found') {
+      // existing+base≠rev → 409 terminal conflict(不盲 replace;队列残留是离线期改动,覆盖是数据破坏)
+      if (env.baseRevision !== got.record.revision) {
+        return { kind: 'stale-conflict', currentRevision: got.record.revision }
+      }
+      // fresh(existing+base=rev)→ 落到 upsertChild(base=env.baseRevision 重验,TOCTOU guard)
+    } else {
+      // missing+base>0 → 409 dead-letter(防盲 create 复活已删 record);missing+base=0 → create fresh 落 upsertChild
+      if (env.baseRevision > 0) return { kind: 'stale-conflict', currentRevision: 0 }
+    }
+    // whole-record replace(委托 upsertChild;base=env.baseRevision → upsertChild conflict check 充当 TOCTOU guard:
+    //   getChild 与 write 之间并发写 bump revision → upsertChild base≠current → conflict,非盲 replace)。
+    const r = await this.upsertChild(ownerId, canvasId, type, recordId, env.payload, {
+      base: env.baseRevision,
+      idempotencyKey: opts.idempotencyKey,
+      method: opts.method,
+      resourceKind: opts.resourceKind,
+      bodyFingerprint: opts.bodyFingerprint,
+      strictUpdate: false,
+    })
+    if (r.kind === 'created' || r.kind === 'updated') {
+      const seq = this.nextCanvasSeq(canvasId)
+      return { kind: 'replaced', record: r.record, seq }
+    }
+    if (r.kind === 'conflict') return { kind: 'stale-conflict', currentRevision: r.currentRevision }
+    if (r.kind === 'cross-canvas') return { kind: 'cross-canvas' }
+    if (r.kind === 'reuse-conflict') return { kind: 'reuse-conflict' }
+    // precondition-required / not-found —— 不应发生(传了 base + strictUpdate=false);防御返 stale-conflict
+    return { kind: 'stale-conflict', currentRevision: 0 }
   }
 
   async deleteChildCascade(
