@@ -19,7 +19,8 @@ let wiredAdapter: ServerPersistAdapter | undefined
  * 生产 adapter 出口:store 初始化 / hydrate / writeRetryQueue executor 单点读取。
  * - local(默认):unwired,所有方法 reject(生产零变化,表征测试不红)。
  * - shadow/server:wired,非画布域(project/canvas-meta/user-state/asset)真 fetch;画布域写
- *   与 chat 仍 reject(G1-c / DP-6R seam)。
+ *   (node/edge/anchor upsert/delete/reorder)与 chat 写(append/patch/delete)经 A2-S3 全 7 写口真发 BFF
+ *   (缺 bundle base 时 fail-visible reject 防陈旧写);submitChange(field-level DomainOp PATCH)待 Phase 4 驱动。
  *
  * authHeaders 走 lazy dynamic import —— 仅在 server/shadow 模式被选中时才拉 settingsSlice,
  * local 模式(生产默认)永不加载 settingsSlice 经此路径。返回单例(wiredAdapter 缓存)。
