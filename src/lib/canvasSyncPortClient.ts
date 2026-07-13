@@ -3,6 +3,7 @@ import type {
   CanvasSnapshot,
   CanvasSyncPort,
   ChangeOutcome,
+  FieldPathTarget,
   SnapshotCursor,
   Unsubscribe,
   FieldIntent,
@@ -35,7 +36,15 @@ import {
 } from './snapshotCursorBundle'
 import { getCanvasCursor, setCanvasCursor, storeCanvasCursor } from './snapshotCursorStore'
 import { isLocalPersist, persistMode } from './persistMode'
-import { unwiredCanvasSyncPort, type RejectionReason } from './canvasSyncPort'
+import {
+  FieldIntentError,
+  unwiredCanvasSyncPort,
+  validateFieldIntent,
+  type RejectionReason,
+} from './canvasSyncPort'
+import { debugLogger } from '../store/debugLogStore'
+
+const SOURCE = 'Canvas Sync Port Client'
 
 const recordIdOf = (change: CanvasChange): string | undefined => {
   switch (change.kind) {
@@ -135,6 +144,34 @@ type PendingCreateEntry = {
   held: Array<{ change: CanvasChange; resolve: (outcome: ChangeOutcome) => void }>
 }
 
+type PendingCreateAwareCanvasSyncPort = CanvasSyncPort & {
+  __abortPendingCreate?: (canvasId: string, change: CanvasChange, detail: string) => boolean
+}
+
+const classifyTransportIntentTarget = (intent: FieldIntent): FieldPathTarget => {
+  const last = intent.fieldPath[intent.fieldPath.length - 1]
+  return typeof last === 'number' ? 'array-element' : 'leaf'
+}
+
+const validateTransportIntent = (intent: FieldIntent): FieldIntentError | null => {
+  try {
+    validateFieldIntent(intent, () => classifyTransportIntentTarget(intent))
+    return null
+  } catch (error) {
+    return error instanceof FieldIntentError ? error : new FieldIntentError('non-atomic-parent-set')
+  }
+}
+
+export const abortPendingCanvasSyncCreate = (
+  port: CanvasSyncPort,
+  canvasId: string,
+  change: CanvasChange,
+  detail: string,
+): boolean => {
+  const aware = port as PendingCreateAwareCanvasSyncPort
+  return aware.__abortPendingCreate?.(canvasId, change, detail) ?? false
+}
+
 export const createFetchCanvasSyncPort = (opts: FetchAdapterOptions): CanvasSyncPort => {
   const doFetch: FetchLike = opts.fetch ?? defaultFetch
   const baseUrl = opts.baseUrl ?? ''
@@ -231,6 +268,14 @@ export const createFetchCanvasSyncPort = (opts: FetchAdapterOptions): CanvasSync
           if (!recordId || !wireBase) {
             return { kind: 'rejected', reason: 'terminal', detail: `${change.kind} missing bundle base` }
           }
+          for (const intent of change.intents) {
+            const violation = validateTransportIntent(intent)
+            if (violation) {
+              const detail = `invalid field intent ${violation.violation} for ${change.kind}:${recordId}`
+              debugLogger.error(SOURCE, detail)
+              return { kind: 'rejected', reason: 'bad-request', detail }
+            }
+          }
           const response = await requestJson<CanvasChildUpsertResponse>({
             fetch: doFetch,
             baseUrl,
@@ -316,6 +361,20 @@ export const createFetchCanvasSyncPort = (opts: FetchAdapterOptions): CanvasSync
     return createOutcome
   }
 
+  const abortPendingCreate = (canvasId: string, change: CanvasChange, detail: string): boolean => {
+    if (!isCreateKind(change)) return false
+    const recordId = recordIdOf(change)
+    if (!recordId) return false
+    const key = keyOf(canvasId, recordId)
+    const entry = pendingCreates.get(key)
+    if (!entry) return false
+    pendingCreates.delete(key)
+    for (const held of entry.held) {
+      held.resolve({ kind: 'rejected', reason: 'dependency-failed', detail })
+    }
+    return true
+  }
+
   return {
     async loadSnapshot(canvasId: string): Promise<CanvasSnapshot | null> {
       const resp = await hydrateAdapter.fetchCanvas(canvasId)
@@ -362,7 +421,8 @@ export const createFetchCanvasSyncPort = (opts: FetchAdapterOptions): CanvasSync
     async subscribe(): Promise<Unsubscribe> {
       throw new Error('CanvasSyncPort.subscribe not wired in Block 1')
     },
-  }
+    __abortPendingCreate: abortPendingCreate,
+  } as PendingCreateAwareCanvasSyncPort
 }
 
 let wiredPort: CanvasSyncPort | undefined

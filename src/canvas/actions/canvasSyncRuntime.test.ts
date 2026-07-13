@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { CanvasActionRuntime } from './canvasActionTypes'
 import type { NodeRecord } from '../../kernel/records'
 import type { MivoCanvasNode } from '../../types/mivoCanvas'
+import type { CanvasChange, ChangeOutcome, CanvasSyncPort } from '../../lib/canvasSyncPort'
 
 vi.hoisted(() => {
   const store = new Map<string, string>()
@@ -58,22 +59,34 @@ const nodeRecord = (overrides: Partial<NodeRecord> = {}): NodeRecord => ({
   ...overrides,
 })
 
-const loadRuntimeModule = async (options: { local?: boolean } = {}) => {
+const loadRuntimeModule = async (
+  options: {
+    local?: boolean
+    submitChangeImpl?: (canvasId: string, change: CanvasChange) => Promise<ChangeOutcome>
+    abortPendingCreateImpl?: (port: CanvasSyncPort, canvasId: string, change: CanvasChange, detail: string) => boolean
+  } = {},
+) => {
   vi.resetModules()
-  const submitChange = vi.fn(async () => ({
-    kind: 'accepted' as const,
-    cursor: 'cursor' as never,
-  }))
+  const submitChange = vi.fn(
+    options.submitChangeImpl ??
+      (async () => ({
+        kind: 'accepted' as const,
+        cursor: 'cursor' as never,
+      })),
+  )
+  const abortPendingCreate = vi.fn(options.abortPendingCreateImpl ?? (() => false))
   vi.doMock('../../lib/persistMode', () => ({
     isLocalPersist: options.local ?? false,
   }))
   vi.doMock('../../lib/canvasSyncPortClient', () => ({
     getCanvasSyncPort: () => ({ submitChange }),
+    abortPendingCanvasSyncCreate: abortPendingCreate,
     persistMode: options.local ? 'local' : 'server',
   }))
   const mod = await import('./canvasSyncRuntime')
   const { useCanvasStore } = await import('../../store/canvasStore')
-  return { ...mod, useCanvasStore, submitChange }
+  const { useDebugLogStore } = await import('../../store/debugLogStore')
+  return { ...mod, useCanvasStore, useDebugLogStore, submitChange, abortPendingCreate }
 }
 
 describe('canvasSyncRuntime(Block 1 runtime driving)', () => {
@@ -112,6 +125,55 @@ describe('canvasSyncRuntime(Block 1 runtime driving)', () => {
         intents: [{ op: 'delete-field', fieldPath: ['sectionLockMode'] }],
       },
     ])
+  })
+
+  it('array length changes are fail-visible dropped and do not block other legal changes in the same batch', async () => {
+    const { buildCanvasSyncChanges, useDebugLogStore } = await loadRuntimeModule()
+    useDebugLogStore.setState({ entries: [] })
+
+    const changes = buildCanvasSyncChanges(
+      {
+        canvasId: 'c1',
+        nodes: new Map([
+          ['n1', nodeRecord({ fills: [{ kind: 'solid', color: '#111111', opacity: 1, visible: true }] as never })],
+          ['n2', nodeRecord({ id: 'n2', title: 'Before' })],
+        ]),
+        edges: new Map(),
+        anchors: new Map(),
+        nodeOrder: ['n1', 'n2'],
+        edgeOrder: [],
+        anchorOrder: [],
+      },
+      {
+        canvasId: 'c1',
+        nodes: new Map([
+          [
+            'n1',
+            nodeRecord({
+              fills: [
+                { kind: 'solid', color: '#111111', opacity: 1, visible: true },
+                { kind: 'solid', color: '#222222', opacity: 1, visible: true },
+              ] as never,
+            }),
+          ],
+          ['n2', nodeRecord({ id: 'n2', title: 'After' })],
+        ]),
+        edges: new Map(),
+        anchors: new Map(),
+        nodeOrder: ['n1', 'n2'],
+        edgeOrder: [],
+        anchorOrder: [],
+      },
+    )
+
+    expect(changes).toEqual([
+      {
+        kind: 'edit-node',
+        nodeId: 'n2',
+        intents: [{ op: 'set', fieldPath: ['title'], value: 'After' }],
+      },
+    ])
+    expect(useDebugLogStore.getState().entries[0]?.message).toContain('drop invalid edit-node intent')
   })
 
   it('wrapCanvasActionRuntimeWithSync drives submitChange from the existing runtime mutation path', async () => {
@@ -160,5 +222,57 @@ describe('canvasSyncRuntime(Block 1 runtime driving)', () => {
     const { wrapCanvasActionRuntimeWithSync } = await loadRuntimeModule({ local: true })
     const runtime = { deleteNode: vi.fn() } as unknown as CanvasActionRuntime
     expect(wrapCanvasActionRuntimeWithSync(runtime)).toBe(runtime)
+  })
+
+  it('create retryable is fail-visible aborted so later same-canvas batches do not deadlock', async () => {
+    let released = false
+    const { abortPendingCreate, enqueueCanvasSyncChanges, submitChange, useDebugLogStore } =
+      await loadRuntimeModule({
+        submitChangeImpl: async (canvasId, change) => {
+          void canvasId
+          if (change.kind === 'create-node') return { kind: 'retryable', reason: 'http_503' }
+          if (change.kind === 'edit-node' && change.nodeId === 'n1') {
+            if (!released) return await new Promise<ChangeOutcome>(() => {})
+            return { kind: 'rejected', reason: 'dependency-failed', detail: 'released by caller' }
+          }
+          return { kind: 'accepted', cursor: 'cursor' as never }
+        },
+        abortPendingCreateImpl: (port, canvasId, change) => {
+          void port
+          void canvasId
+          if (change.kind === 'create-node') {
+            released = true
+            return true
+          }
+          return false
+        },
+      })
+    useDebugLogStore.setState({ entries: [] })
+
+    const fakePort = { submitChange } as unknown as CanvasSyncPort
+    await enqueueCanvasSyncChanges('c1', [{ kind: 'create-node', node: nodeRecord() }], fakePort)
+    await enqueueCanvasSyncChanges(
+      'c1',
+      [{ kind: 'edit-node', nodeId: 'n1', intents: [{ op: 'set', fieldPath: ['title'], value: 'later' }] }],
+      fakePort,
+    )
+    await enqueueCanvasSyncChanges(
+      'c1',
+      [{ kind: 'edit-node', nodeId: 'n2', intents: [{ op: 'set', fieldPath: ['title'], value: 'survives' }] }],
+      fakePort,
+    )
+
+    expect(abortPendingCreate).toHaveBeenCalledTimes(1)
+    expect(
+      submitChange.mock.calls.some(
+        ([canvasId, change]) => {
+          if (canvasId !== 'c1' || change.kind !== 'edit-node') return false
+          return change.nodeId === 'n2'
+        },
+      ),
+    ).toBe(true)
+    expect(
+      useDebugLogStore.getState().entries.some((entry) => entry.message.includes('submitChange retryable')),
+    ).toBe(true)
   })
 })

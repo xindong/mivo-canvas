@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { FetchLike } from './serverPersistAdapter'
 import type { NodeRecord } from '../kernel/records'
-import { createFetchCanvasSyncPort } from './canvasSyncPortClient'
+import { abortPendingCanvasSyncCreate, createFetchCanvasSyncPort } from './canvasSyncPortClient'
 import { buildBundle, unwrapBundle } from './snapshotCursorBundle'
 import { __resetCanvasCursorStore, getCanvasCursor, setCanvasCursor } from './snapshotCursorStore'
 
@@ -104,6 +104,7 @@ describe('createFetchCanvasSyncPort(Block 1 write driving)', () => {
     })
 
     await Promise.resolve()
+    await Promise.resolve()
     expect(calls).toHaveLength(1)
 
     resolveCreate(jsonResponse(200, { id: 'client-n1', revision: 1, seq: 2, base: 'base:client-n1:r1' }))
@@ -150,6 +151,44 @@ describe('createFetchCanvasSyncPort(Block 1 write driving)', () => {
       records: { n1: 'base:n1:r2', n2: 'base:n2:r1' },
       orderCv: 9,
       sinceSeq: 4,
+    })
+  })
+
+  it('retryable create can be explicitly abandoned so held edits resolve instead of hanging forever', async () => {
+    let resolveCreate!: (response: Response) => void
+    const createPending = new Promise<Response>((resolve) => {
+      resolveCreate = resolve
+    })
+    const fetch: FetchLike = vi.fn((input, init) => {
+      void input
+      if (init?.method === 'POST') return createPending
+      return Promise.resolve(jsonResponse(200, { id: 'n1', revision: 2, seq: 3, base: 'base:n1:r2' }))
+    })
+    const port = createFetchCanvasSyncPort({
+      fetch,
+      getAuthHeaders: async () => ({}),
+    })
+
+    const create = { kind: 'create-node', node: imageRecord('n1') } as const
+    const createPromise = port.submitChange('c1', create)
+    const editPromise = port.submitChange('c1', {
+      kind: 'edit-node',
+      nodeId: 'n1',
+      intents: [{ op: 'set', fieldPath: ['title'], value: 'later' }],
+    })
+
+    await Promise.resolve()
+    resolveCreate(jsonResponse(503, { error: 'upstream-busy' }))
+    const createOutcome = await createPromise
+    expect(createOutcome).toEqual({ kind: 'retryable', reason: 'http_503' })
+
+    expect(
+      abortPendingCanvasSyncCreate(port, 'c1', create, 'submitChange retryable for c1:create-node (http_503)'),
+    ).toBe(true)
+    await expect(editPromise).resolves.toEqual({
+      kind: 'rejected',
+      reason: 'dependency-failed',
+      detail: 'submitChange retryable for c1:create-node (http_503)',
     })
   })
 })
