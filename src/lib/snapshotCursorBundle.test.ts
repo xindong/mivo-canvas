@@ -85,6 +85,14 @@ describe('A2-S3 item 1 — SnapshotCursor bundle (SC①)', () => {
     // create→edit 因果:create 后即有 base,后续 edit 不缺命中(§10.8)
   })
 
+  it('applyAccepted delete:移除已删 record 的 base,未命中项保持原值', () => {
+    const cursor = buildBundle('c1', { n1: baseOf('n1', 1), n2: baseOf('n2', 1) }, 5, 0)
+    const deleted = applyAccepted(cursor, { kind: 'delete-node', nodeId: 'n1' }, undefined, 8)
+    expect(extractWireBase(deleted, { kind: 'delete-node', nodeId: 'n1' })).toBeUndefined()
+    expect(extractWireBase(deleted, { kind: 'edit-node', nodeId: 'n2', intents: [] })).toBe(baseOf('n2', 1))
+    expect(getSinceSeq(deleted)).toBe(8)
+  })
+
   it('applyAccepted reorder:orderCv 增量更新(bump 后新 contentVersion);sinceSeq 取响应 seq', () => {
     const cursor = buildBundle('c1', { n1: baseOf('n1', 1) }, 5, 10)
     const reorder: CanvasChange = { kind: 'reorder-children', childType: 'node', orderedIds: ['n1'] }

@@ -37,6 +37,11 @@ export const storeCanvasCursor = (resp: GetCanvasResponse): SnapshotCursor => {
 export const getCanvasCursor = (canvasId: string): SnapshotCursor | undefined =>
   cursorByCanvas.get(canvasId)
 
+/** 真 submitChange 用:以增量/refresh 结果整体替换某 canvas 的 bundle cursor。 */
+export const setCanvasCursor = (canvasId: string, cursor: SnapshotCursor): void => {
+  cursorByCanvas.set(canvasId, cursor)
+}
+
 /** 测试用:定点回填单 record base(authoritative load 后,R2-P1-3)。 */
 export const setCanvasRecordBase = (canvasId: string, recordId: string, base: string | undefined): void => {
   const cur = cursorByCanvas.get(canvasId)

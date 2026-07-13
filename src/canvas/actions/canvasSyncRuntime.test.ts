@@ -1,0 +1,278 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { CanvasActionRuntime } from './canvasActionTypes'
+import type { NodeRecord } from '../../kernel/records'
+import type { MivoCanvasNode } from '../../types/mivoCanvas'
+import type { CanvasChange, ChangeOutcome, CanvasSyncPort } from '../../lib/canvasSyncPort'
+
+vi.hoisted(() => {
+  const store = new Map<string, string>()
+  const localStorage = {
+    get length() {
+      return store.size
+    },
+    clear: () => store.clear(),
+    getItem: (key: string) => store.get(key) ?? null,
+    key: (index: number) => [...store.keys()][index] ?? null,
+    removeItem: (key: string) => {
+      store.delete(key)
+    },
+    setItem: (key: string, value: string) => {
+      store.set(key, String(value))
+    },
+  }
+  const g = globalThis as Record<string, unknown>
+  if (g.window === undefined) g.window = { localStorage }
+  if (g.localStorage === undefined) g.localStorage = localStorage
+})
+
+vi.mock('../../lib/demoImages', () => ({
+  createDemoImage: () => 'data:image/png;base64,mock-demo-image',
+}))
+
+vi.mock('../../store/remoteDebugReporter', () => ({
+  reportRemoteDebugEntry: () => {},
+}))
+
+const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
+  id: 'n1',
+  type: 'image',
+  title: 'Image',
+  x: 10,
+  y: 20,
+  width: 120,
+  height: 80,
+  status: 'ready',
+  assetUrl: '/image.png',
+  ...overrides,
+})
+
+const nodeRecord = (overrides: Partial<NodeRecord> = {}): NodeRecord => ({
+  id: 'n1',
+  type: 'image',
+  title: 'Image',
+  revision: 0,
+  transform: { x: 10, y: 20, width: 120, height: 80, rotation: 0 },
+  fills: [],
+  strokes: [],
+  effects: [],
+  relations: {},
+  ...overrides,
+})
+
+const loadRuntimeModule = async (
+  options: {
+    local?: boolean
+    submitChangeImpl?: (canvasId: string, change: CanvasChange) => Promise<ChangeOutcome>
+    abortPendingCreateImpl?: (port: CanvasSyncPort, canvasId: string, change: CanvasChange, detail: string) => boolean
+  } = {},
+) => {
+  vi.resetModules()
+  const submitChange = vi.fn(
+    options.submitChangeImpl ??
+      (async () => ({
+        kind: 'accepted' as const,
+        cursor: 'cursor' as never,
+      })),
+  )
+  const abortPendingCreate = vi.fn(options.abortPendingCreateImpl ?? (() => false))
+  vi.doMock('../../lib/persistMode', () => ({
+    isLocalPersist: options.local ?? false,
+  }))
+  vi.doMock('../../lib/canvasSyncPortClient', () => ({
+    getCanvasSyncPort: () => ({ submitChange }),
+    abortPendingCanvasSyncCreate: abortPendingCreate,
+    persistMode: options.local ? 'local' : 'server',
+  }))
+  const mod = await import('./canvasSyncRuntime')
+  const { useCanvasStore } = await import('../../store/canvasStore')
+  const { useDebugLogStore } = await import('../../store/debugLogStore')
+  return { ...mod, useCanvasStore, useDebugLogStore, submitChange, abortPendingCreate }
+}
+
+describe('canvasSyncRuntime(Block 1 runtime driving)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('buildCanvasSyncChanges emits delete-field when an optional field is removed', async () => {
+    const { buildCanvasSyncChanges } = await loadRuntimeModule()
+
+    const changes = buildCanvasSyncChanges(
+      {
+        canvasId: 'c1',
+        nodes: new Map([['n1', nodeRecord({ sectionLockMode: 'all' })]]),
+        edges: new Map(),
+        anchors: new Map(),
+        nodeOrder: ['n1'],
+        edgeOrder: [],
+        anchorOrder: [],
+      },
+      {
+        canvasId: 'c1',
+        nodes: new Map([['n1', nodeRecord()]]),
+        edges: new Map(),
+        anchors: new Map(),
+        nodeOrder: ['n1'],
+        edgeOrder: [],
+        anchorOrder: [],
+      },
+    )
+
+    expect(changes).toEqual([
+      {
+        kind: 'edit-node',
+        nodeId: 'n1',
+        intents: [{ op: 'delete-field', fieldPath: ['sectionLockMode'] }],
+      },
+    ])
+  })
+
+  it('array length changes are fail-visible dropped and do not block other legal changes in the same batch', async () => {
+    const { buildCanvasSyncChanges, useDebugLogStore } = await loadRuntimeModule()
+    useDebugLogStore.setState({ entries: [] })
+
+    const changes = buildCanvasSyncChanges(
+      {
+        canvasId: 'c1',
+        nodes: new Map([
+          ['n1', nodeRecord({ fills: [{ kind: 'solid', color: '#111111', opacity: 1, visible: true }] as never })],
+          ['n2', nodeRecord({ id: 'n2', title: 'Before' })],
+        ]),
+        edges: new Map(),
+        anchors: new Map(),
+        nodeOrder: ['n1', 'n2'],
+        edgeOrder: [],
+        anchorOrder: [],
+      },
+      {
+        canvasId: 'c1',
+        nodes: new Map([
+          [
+            'n1',
+            nodeRecord({
+              fills: [
+                { kind: 'solid', color: '#111111', opacity: 1, visible: true },
+                { kind: 'solid', color: '#222222', opacity: 1, visible: true },
+              ] as never,
+            }),
+          ],
+          ['n2', nodeRecord({ id: 'n2', title: 'After' })],
+        ]),
+        edges: new Map(),
+        anchors: new Map(),
+        nodeOrder: ['n1', 'n2'],
+        edgeOrder: [],
+        anchorOrder: [],
+      },
+    )
+
+    expect(changes).toEqual([
+      {
+        kind: 'edit-node',
+        nodeId: 'n2',
+        intents: [{ op: 'set', fieldPath: ['title'], value: 'After' }],
+      },
+    ])
+    expect(useDebugLogStore.getState().entries[0]?.message).toContain('drop invalid edit-node intent')
+  })
+
+  it('wrapCanvasActionRuntimeWithSync drives submitChange from the existing runtime mutation path', async () => {
+    const { __resetCanvasSyncRuntimeQueue, submitChange, useCanvasStore, wrapCanvasActionRuntimeWithSync } =
+      await loadRuntimeModule()
+    const baseState = useCanvasStore.getInitialState()
+    useCanvasStore.setState(
+      {
+        ...baseState,
+        sceneId: 'c1',
+        canvases: {
+          c1: {
+            title: 'Canvas',
+            createdAt: '2026-07-13T00:00:00.000Z',
+            updatedAt: '2026-07-13T00:00:00.000Z',
+            nodes: [imageNode()],
+            edges: [],
+            tasks: [],
+            selectedNodeId: 'n1',
+            selectedNodeIds: ['n1'],
+          },
+        },
+        nodes: [imageNode()],
+        edges: [],
+        tasks: [],
+        selectedNodeId: 'n1',
+        selectedNodeIds: ['n1'],
+      } as never,
+      true,
+    )
+
+    const runtime = wrapCanvasActionRuntimeWithSync({
+      deleteNode: (nodeId: string) => useCanvasStore.getState().deleteNode(nodeId),
+    } as unknown as CanvasActionRuntime)
+
+    runtime.deleteNode('n1')
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(submitChange).toHaveBeenCalledWith('c1', { kind: 'delete-node', nodeId: 'n1' })
+    expect(useCanvasStore.getState().nodes).toHaveLength(0)
+    __resetCanvasSyncRuntimeQueue()
+  })
+
+  it('returns the original runtime unchanged in local mode', async () => {
+    const { wrapCanvasActionRuntimeWithSync } = await loadRuntimeModule({ local: true })
+    const runtime = { deleteNode: vi.fn() } as unknown as CanvasActionRuntime
+    expect(wrapCanvasActionRuntimeWithSync(runtime)).toBe(runtime)
+  })
+
+  it('create retryable is fail-visible aborted so later same-canvas batches do not deadlock', async () => {
+    let released = false
+    const { abortPendingCreate, enqueueCanvasSyncChanges, submitChange, useDebugLogStore } =
+      await loadRuntimeModule({
+        submitChangeImpl: async (canvasId, change) => {
+          void canvasId
+          if (change.kind === 'create-node') return { kind: 'retryable', reason: 'http_503' }
+          if (change.kind === 'edit-node' && change.nodeId === 'n1') {
+            if (!released) return await new Promise<ChangeOutcome>(() => {})
+            return { kind: 'rejected', reason: 'dependency-failed', detail: 'released by caller' }
+          }
+          return { kind: 'accepted', cursor: 'cursor' as never }
+        },
+        abortPendingCreateImpl: (port, canvasId, change) => {
+          void port
+          void canvasId
+          if (change.kind === 'create-node') {
+            released = true
+            return true
+          }
+          return false
+        },
+      })
+    useDebugLogStore.setState({ entries: [] })
+
+    const fakePort = { submitChange } as unknown as CanvasSyncPort
+    await enqueueCanvasSyncChanges('c1', [{ kind: 'create-node', node: nodeRecord() }], fakePort)
+    await enqueueCanvasSyncChanges(
+      'c1',
+      [{ kind: 'edit-node', nodeId: 'n1', intents: [{ op: 'set', fieldPath: ['title'], value: 'later' }] }],
+      fakePort,
+    )
+    await enqueueCanvasSyncChanges(
+      'c1',
+      [{ kind: 'edit-node', nodeId: 'n2', intents: [{ op: 'set', fieldPath: ['title'], value: 'survives' }] }],
+      fakePort,
+    )
+
+    expect(abortPendingCreate).toHaveBeenCalledTimes(1)
+    expect(
+      submitChange.mock.calls.some(
+        ([canvasId, change]) => {
+          if (canvasId !== 'c1' || change.kind !== 'edit-node') return false
+          return change.nodeId === 'n2'
+        },
+      ),
+    ).toBe(true)
+    expect(
+      useDebugLogStore.getState().entries.some((entry) => entry.message.includes('submitChange retryable')),
+    ).toBe(true)
+  })
+})
