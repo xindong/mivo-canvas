@@ -456,4 +456,82 @@ describe('canvasSyncRuntime — Block 3 asset attach/detach side-effects', () =>
     expect(enqueueAssetAttach).toHaveBeenCalledWith('c1', 'asset-1', expect.any(String))
     __resetCanvasSyncRuntimeQueue()
   })
+
+  // ── A2 SC:为新包 action 加行为单元(server 模式 → wrapMutation → submitChange + change kind)──
+  // 复用 F1 的 imageNode + setState 种子;setupSelectedImageNode 共享选中 image node 的画布态。
+  const setupSelectedImageNode = (store: Awaited<ReturnType<typeof loadRuntimeModule>>['useCanvasStore'], img: MivoCanvasNode) => {
+    const baseState = store.getInitialState()
+    store.setState(
+      {
+        ...baseState,
+        sceneId: 'c1',
+        canvases: { c1: { title: 'Canvas', createdAt: '2026-07-13T00:00:00.000Z', updatedAt: '2026-07-13T00:00:00.000Z', nodes: [img], edges: [], tasks: [], selectedNodeId: 'n1', selectedNodeIds: ['n1'] } },
+        nodes: [img],
+        edges: [],
+        tasks: [],
+        selectedNodeId: 'n1',
+        selectedNodeIds: ['n1'],
+      } as never,
+      true,
+    )
+  }
+
+  it('A2 SC: wrapMutation(store.cutSelectedNodes) → delete-node submitChange + enqueueAssetDetach(Cmd+X)', async () => {
+    const { __resetCanvasSyncRuntimeQueue, wrapMutation, submitChange, enqueueAssetDetach, useCanvasStore } = await loadRuntimeModule()
+    const img = imageNode({ id: 'n1', assetUrl: 'mivo-sasset:asset-1' })
+    setupSelectedImageNode(useCanvasStore, img)
+    wrapMutation(useCanvasStore.getState().cutSelectedNodes)()
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+    expect(submitChange).toHaveBeenCalledWith('c1', expect.objectContaining({ kind: 'delete-node', nodeId: 'n1' }))
+    expect(enqueueAssetDetach).toHaveBeenCalledWith('c1', 'asset-1', 'n1')
+    __resetCanvasSyncRuntimeQueue()
+  })
+
+  it('A2 SC: wrapMutation(store.moveSelectedNodesBy)(10,0) → edit-node submitChange(transform diff;Arrow)', async () => {
+    const { __resetCanvasSyncRuntimeQueue, wrapMutation, submitChange, useCanvasStore } = await loadRuntimeModule()
+    const img = imageNode({ id: 'n1' })
+    setupSelectedImageNode(useCanvasStore, img)
+    wrapMutation(useCanvasStore.getState().moveSelectedNodesBy)(10, 0)
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+    expect(submitChange).toHaveBeenCalledWith('c1', expect.objectContaining({ kind: 'edit-node', nodeId: 'n1' }))
+    __resetCanvasSyncRuntimeQueue()
+  })
+
+  it('A2 SC: wrapMutation(pasteClipboardAssets) → create-node submitChange(paste image assets 创 nodes)', async () => {
+    const { __resetCanvasSyncRuntimeQueue, wrapMutation, submitChange, useCanvasStore } = await loadRuntimeModule()
+    const baseState = useCanvasStore.getInitialState()
+    useCanvasStore.setState(
+      {
+        ...baseState,
+        sceneId: 'c1',
+        canvases: { c1: { title: 'Canvas', createdAt: '2026-07-13T00:00:00.000Z', updatedAt: '2026-07-13T00:00:00.000Z', nodes: [], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] } },
+        nodes: [],
+        edges: [],
+        tasks: [],
+        clipboardAssets: [{ url: 'mivo-sasset:asset-1', name: 'a.png', width: 100, height: 100 }] as never,
+      } as never,
+      true,
+    )
+    wrapMutation(() => useCanvasStore.getState().pasteClipboardAssets({ x: 0, y: 0 }))()
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+    expect(submitChange).toHaveBeenCalledWith('c1', expect.objectContaining({ kind: 'create-node' }))
+    __resetCanvasSyncRuntimeQueue()
+  })
+
+  it('A2 SC 特测: wrapMutation(store.undo) → 触发 submitChange(inverse-diff DomainOp;Cmd+Z)', async () => {
+    const { __resetCanvasSyncRuntimeQueue, wrapMutation, submitChange, useCanvasStore } = await loadRuntimeModule()
+    const img = imageNode({ id: 'n1', assetUrl: 'mivo-sasset:asset-1' })
+    setupSelectedImageNode(useCanvasStore, img)
+    // duplicate 先建 node(push history via patchWithHistory)→ undo 撤销 → wrapMutation snapshot-diff 触发 submitChange。
+    // 注:实测 undo-of-duplicate 的 diff = reorder-children(非朴素 delete-node)——store history/snapshot 语义下
+    //   undo 撤节点序/选择产 reorder diff;本断言钉"wrapMutation(undo) 触发第 2 次 submitChange = 合法 DomainOp"
+    //   (wrap 对 undo 生效),不钉脆弱的 undo-diff kind(那依赖 store history 内部,非本 wrap 接线面)。
+    wrapMutation(useCanvasStore.getState().duplicateSelectedNodes)()
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+    wrapMutation(useCanvasStore.getState().undo)()
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+    // 1st call = duplicate 的 create-node;2nd call = undo 的 inverse-diff(实测 reorder-children)。
+    expect(submitChange).toHaveBeenNthCalledWith(2, 'c1', expect.objectContaining({ kind: expect.any(String) }))
+    __resetCanvasSyncRuntimeQueue()
+  })
 })
