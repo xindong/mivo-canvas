@@ -397,4 +397,63 @@ describe('canvasSyncRuntime — Block 3 asset attach/detach side-effects', () =>
     await enqueueCanvasSyncChanges('c1', [{ kind: 'create-node', node }], fakePort, effects)
     expect(enqueueAssetAttach).not.toHaveBeenCalled()
   })
+
+  // F1:快捷键(useGlobalCanvasEvents)直调 wrapMutation(store action)—— 证明快捷键路径经 wrap →
+  // submitChange → enqueue attach/detach(项目无 React render harness,无法 fire 真实 keydown/paste event,
+  // 此处测快捷键调用的 wrapMutation 本身的行为:server 模式 + image node → submitChange accepted → enqueue)。
+  it('F1: wrapMutation 直接包 deleteSelectedNodes(Delete 快捷键)→ delete-node submitChange + enqueueAssetDetach', async () => {
+    const { __resetCanvasSyncRuntimeQueue, wrapMutation, submitChange, enqueueAssetDetach, useCanvasStore } = await loadRuntimeModule()
+    const baseState = useCanvasStore.getInitialState()
+    const img = imageNode({ id: 'n1', assetUrl: 'mivo-sasset:asset-1' })
+    useCanvasStore.setState(
+      {
+        ...baseState,
+        sceneId: 'c1',
+        canvases: {
+          c1: { title: 'Canvas', createdAt: '2026-07-13T00:00:00.000Z', updatedAt: '2026-07-13T00:00:00.000Z', nodes: [img], edges: [], tasks: [], selectedNodeId: 'n1', selectedNodeIds: ['n1'] },
+        },
+        nodes: [img],
+        edges: [],
+        tasks: [],
+        selectedNodeId: 'n1',
+        selectedNodeIds: ['n1'],
+      } as never,
+      true,
+    )
+    wrapMutation(useCanvasStore.getState().deleteSelectedNodes)()
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(submitChange).toHaveBeenCalledWith('c1', expect.objectContaining({ kind: 'delete-node', nodeId: 'n1' }))
+    expect(enqueueAssetDetach).toHaveBeenCalledWith('c1', 'asset-1', 'n1')
+    __resetCanvasSyncRuntimeQueue()
+  })
+
+  it('F1: wrapMutation 直接包 duplicateSelectedNodes(Cmd+D 快捷键)→ create-node submitChange + enqueueAssetAttach', async () => {
+    const { __resetCanvasSyncRuntimeQueue, wrapMutation, submitChange, enqueueAssetAttach, useCanvasStore } = await loadRuntimeModule()
+    const baseState = useCanvasStore.getInitialState()
+    const img = imageNode({ id: 'n1', assetUrl: 'mivo-sasset:asset-1' })
+    useCanvasStore.setState(
+      {
+        ...baseState,
+        sceneId: 'c1',
+        canvases: {
+          c1: { title: 'Canvas', createdAt: '2026-07-13T00:00:00.000Z', updatedAt: '2026-07-13T00:00:00.000Z', nodes: [img], edges: [], tasks: [], selectedNodeId: 'n1', selectedNodeIds: ['n1'] },
+        },
+        nodes: [img],
+        edges: [],
+        tasks: [],
+        selectedNodeId: 'n1',
+        selectedNodeIds: ['n1'],
+      } as never,
+      true,
+    )
+    wrapMutation(useCanvasStore.getState().duplicateSelectedNodes)()
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(submitChange).toHaveBeenCalledWith('c1', expect.objectContaining({ kind: 'create-node' }))
+    expect(enqueueAssetAttach).toHaveBeenCalledWith('c1', 'asset-1', expect.any(String))
+    __resetCanvasSyncRuntimeQueue()
+  })
 })

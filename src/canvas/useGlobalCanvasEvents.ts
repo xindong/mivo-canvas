@@ -5,6 +5,7 @@ import { hasActiveTextSelection, isEditingTarget } from './canvasInteraction'
 import { toolForKeyboardShortcut } from './canvasToolRegistry'
 import { importImageFileToCanvas } from '../lib/canvasAssetImport'
 import { useCanvasStore } from '../store/canvasStore'
+import { wrapMutation } from './actions/canvasSyncRuntime'
 
 export type GlobalEventsApi = {
   maskEditNodeId: string | undefined
@@ -200,13 +201,13 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
 
       if (modifier && key === 'd') {
         event.preventDefault()
-        store.duplicateSelectedNodes()
+        wrapMutation(store.duplicateSelectedNodes)()
         return
       }
 
       if (event.key === 'Backspace' || event.key === 'Delete') {
         event.preventDefault()
-        store.deleteSelectedNodes()
+        wrapMutation(store.deleteSelectedNodes)()
         return
       }
 
@@ -316,7 +317,7 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
 
       if (store.clipboardNodes.length) {
         event.preventDefault()
-        store.pasteClipboardNodes()
+        wrapMutation(() => store.pasteClipboardNodes())()
       }
     }
 

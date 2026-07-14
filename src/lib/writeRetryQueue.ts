@@ -364,9 +364,9 @@ const computeResourceKey = (op: WriteOp): string | null => {
     case 'deleteCanvas':
       return `canvas:${op.canvasId}`
     case 'attachAsset':
-      return `asset-attach:${op.assetId}:${op.nodeId}`
+      return `asset-attach:${op.assetId}:${op.canvasId}:${op.nodeId}`
     case 'detachAsset':
-      return `asset-detach:${op.assetId}:${op.nodeId}`
+      return `asset-detach:${op.assetId}:${op.canvasId}:${op.nodeId}`
     case 'appendChatMessage':
       // 每条 chat 消息独立 op(message payload 内含唯一 id,但 op 层不 narrow),不 coalesce;
       // 快速连发多条消息各自独立入队(符合 chat 语义——不同消息不该合并)。

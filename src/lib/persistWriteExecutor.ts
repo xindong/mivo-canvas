@@ -25,6 +25,7 @@ import {
   type WriteOutcome,
 } from './writeRetryQueue'
 import { HttpError, requestJson, type FetchAdapterOptions, type FetchLike, type GetAuthHeaders } from './serverPersistAdapter'
+import { debugLogger } from '../store/debugLogStore'
 import type {
   AttachAssetResult,
   DetachAssetResult,
@@ -53,6 +54,20 @@ export const createAdapterWriteExecutor = (opts: FetchAdapterOptions): WriteExec
       return {
         status: 'unsupported-retained',
         message: `${op.kind} not wired (canvas domain G1-c/N2-0 or chat DP-6R; another worker); record retained for executor upgrade`,
+      }
+    }
+    // F3:旧 durable 记录(Block 3 seam 加 canvasId 前入队)读出 attach/detach 的 canvasId===undefined →
+    // server attach 路由 required canvasId 会 400 → rejected 删记录 → intent 静默丢。廉价防线:缺 canvasId →
+    // fail-visible retain(unsupported-retained:不发不删,deferred 留存不重发),debugLogger 记失败路径。
+    // 不做 migration 推导(canvasId 推不出,别猜)。
+    if ((op.kind === 'attachAsset' || op.kind === 'detachAsset') && !op.canvasId) {
+      debugLogger.error(
+        'PersistWriteExecutor',
+        `${op.kind} missing canvasId (legacy durable record; canvasId required since Block 3 — retained, not derivable, not sent): assetId=${op.assetId} nodeId=${op.nodeId}`,
+      )
+      return {
+        status: 'unsupported-retained',
+        message: 'missing canvasId (legacy durable record; canvasId required in Block 3 — retained, not derivable)',
       }
     }
 

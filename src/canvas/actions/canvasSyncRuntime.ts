@@ -395,10 +395,13 @@ export const __resetCanvasSyncRuntimeQueue = (): void => {
   queueByCanvas.clear()
 }
 
-const wrapMutation = <TArgs extends unknown[], TResult>(
+export const wrapMutation = <TArgs extends unknown[], TResult>(
   mutate: (...args: TArgs) => TResult,
 ): ((...args: TArgs) => TResult) => {
   return (...args: TArgs): TResult => {
+    // local 模式无 server port,直接 mutate 不 submitChange(与 wrapCanvasActionRuntimeWithSync 的 local
+    // gate 一致;本 gate 给直接调用 wrapMutation 的快捷键路径用,防 local 模式误发 submitChange)。
+    if (isLocalPersist) return mutate(...args)
     const before = snapshotFromState(useCanvasStore.getState())
     const result = mutate(...args)
     const after = snapshotFromState(useCanvasStore.getState())
