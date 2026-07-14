@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState, type PointerEvent as ReactPointerEvent, type RefObject } from 'react'
 import { useCanvasStore } from '../store/canvasStore'
+import { wrapMutation } from './actions/canvasSyncRuntime'
 import type { CanvasId, MivoCanvasNode } from '../types/mivoCanvas'
 import type { ResizeCorner, SnapGuide } from './canvasGeometry'
 import { boundsForNodes, isActiveSelectionRect, previewIdsFromSelectionBox, runtimeToolFor, selectionRectFromBox, type RuntimeCanvasTool } from './canvasInteraction'
@@ -68,7 +69,7 @@ export function useCanvasInteractionController({
   const discardEmptyEditingText = useCallback((nodeId = editingTextNodeId) => {
     if (!nodeId) return
     const node = useCanvasStore.getState().nodes.find((item) => item.id === nodeId)
-    if (isAutoDeletedEmptyTextNode(node) && !node.text?.trim()) deleteNode(nodeId)
+    if (isAutoDeletedEmptyTextNode(node) && !node.text?.trim()) wrapMutation(deleteNode)(nodeId)
     setEditingTextNodeId((current) => (current === nodeId ? undefined : current))
   }, [deleteNode, editingTextNodeId])
 

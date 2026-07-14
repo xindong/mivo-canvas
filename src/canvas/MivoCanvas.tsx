@@ -15,6 +15,7 @@ import { downloadCanvasNodeOriginal } from '../lib/assetDownload'
 import { canReadLocalAssetDrag, parseLocalAssetDragPayload } from '../lib/canvasAssetDrag'
 import { canImportCanvasFile, importFilesToCanvas, importImageUrlToCanvas } from '../lib/canvasAssetImport'
 import { useCanvasStore } from '../store/canvasStore'
+import { wrapMutation } from './actions/canvasSyncRuntime'
 import { handleImportError, useOpenNodeDetails } from './canvasImportHandlers'
 import { brushCursorCssFor } from './brushCursors'
 import { brushOutlinePathFor, highlighterOpacity } from '../model/brushGeometry'
@@ -245,7 +246,7 @@ export function MivoCanvas({
 
   const createTextAt = useCallback(
     (position: { x: number; y: number }) => {
-      const id = addTextNode(position)
+      const id = wrapMutation(addTextNode)(position)
       editTextNode(id)
     },
     [addTextNode, editTextNode],
@@ -253,7 +254,7 @@ export function MivoCanvas({
 
   const createFrameAt = useCallback(
     (position: { x: number; y: number }) => {
-      addFrameNode(
+      wrapMutation(addFrameNode)(
         {
           x: position.x - 280,
           y: position.y - 160,

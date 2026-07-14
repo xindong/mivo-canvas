@@ -579,4 +579,34 @@ describe('canvasSyncRuntime — Block 3 asset attach/detach side-effects', () =>
     expect(placedId).toBe(nodes[0]?.id)
     __resetCanvasSyncRuntimeQueue()
   })
+
+  // ── A2 alias: 别名形态 call site 行为单元(pointer-end 创建→create-node / interaction delete→delete-node)──
+  it('A2 alias: wrapMutation(addTextNode) → server 模式 create-node submitChange', async () => {
+    const { __resetCanvasSyncRuntimeQueue, wrapMutation, submitChange, useCanvasStore } = await loadRuntimeModule()
+    setupEmptyCanvas(useCanvasStore)
+    wrapMutation(useCanvasStore.getState().addTextNode)({ x: 0, y: 0 })
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+    expect(submitChange).toHaveBeenCalledWith('c1', expect.objectContaining({ kind: 'create-node' }))
+    __resetCanvasSyncRuntimeQueue()
+  })
+
+  it('A2 alias: wrapMutation(addFrameNode) → server 模式 create-node submitChange', async () => {
+    const { __resetCanvasSyncRuntimeQueue, wrapMutation, submitChange, useCanvasStore } = await loadRuntimeModule()
+    setupEmptyCanvas(useCanvasStore)
+    wrapMutation(useCanvasStore.getState().addFrameNode)({ x: 0, y: 0 }, { width: 100, height: 100 })
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+    expect(submitChange).toHaveBeenCalledWith('c1', expect.objectContaining({ kind: 'create-node' }))
+    __resetCanvasSyncRuntimeQueue()
+  })
+
+  it('A2 alias: wrapMutation(deleteNode) → server 模式 delete-node submitChange + enqueueAssetDetach(interaction 空文本自动删)', async () => {
+    const { __resetCanvasSyncRuntimeQueue, wrapMutation, submitChange, enqueueAssetDetach, useCanvasStore } = await loadRuntimeModule()
+    const img = imageNode({ id: 'n1', assetUrl: 'mivo-sasset:asset-1' })
+    setupSelectedImageNode(useCanvasStore, img)
+    wrapMutation(useCanvasStore.getState().deleteNode)('n1')
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+    expect(submitChange).toHaveBeenCalledWith('c1', expect.objectContaining({ kind: 'delete-node', nodeId: 'n1' }))
+    expect(enqueueAssetDetach).toHaveBeenCalledWith('c1', 'asset-1', 'n1')
+    __resetCanvasSyncRuntimeQueue()
+  })
 })

@@ -12,9 +12,7 @@
   "_scannedDirs": ["src/store", "src/canvas", "src/app"],
   "fileLines": {
     "src/store/canvasStore.ts": 420,
-    "src/canvas/useCanvasInteractionController.ts": 1775,
     "src/canvas/actions/canvasActionModel.ts": 1320,
-    "src/canvas/MivoCanvas.tsx": 965,
     "src/app/LibraryWorkspace.tsx": 1316
   },
   "chatStoreGetStateCount": 0

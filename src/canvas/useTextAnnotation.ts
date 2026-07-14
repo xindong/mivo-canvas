@@ -1,5 +1,6 @@
 import { useCallback, useRef, useState, type Dispatch, type PointerEvent as ReactPointerEvent, type RefObject, type SetStateAction } from 'react'
 import { useCanvasStore } from '../store/canvasStore'
+import { wrapMutation } from './actions/canvasSyncRuntime'
 import type { MivoCanvasNode, MarkupKind, MarkupPoint, ToolId } from '../types/mivoCanvas'
 import { nearestConnectorBindingForPoint } from '../model/connectorGeometry'
 import { markupKindForTool } from './canvasToolRegistry'
@@ -555,7 +556,7 @@ export function useTextAnnotation({
       const height = dragged ? Math.max(42, rect.height) : 42
       const x = dragged ? rect.x : textCreation.startX
       const y = dragged ? rect.y : textCreation.startY - defaultTextFontSize
-      const id = addTextNode({ x, y })
+      const id = wrapMutation(addTextNode)({ x, y })
 
       if (dragged) {
         resizeTextNode(id, x, width, height)
@@ -581,7 +582,7 @@ export function useTextAnnotation({
       const x = dragged ? rect.x : frameCreation.startX
       const y = dragged ? rect.y : frameCreation.startY
 
-      addFrameNode({ x, y }, { width, height })
+      wrapMutation(addFrameNode)({ x, y }, { width, height })
       frameCreationRef.current = null
       setFrameCreationBox(null)
       setActiveTool('select')
@@ -644,7 +645,7 @@ export function useTextAnnotation({
 
       const isBrush = markupCreation.kind === 'brush'
       const brushStyle = useCanvasStore.getState().brushStyle
-      addMarkupNode(markupCreation.kind, finalPosition, finalSize, {
+      wrapMutation(addMarkupNode)(markupCreation.kind, finalPosition, finalSize, {
         points,
         select: false,
         ...(isBrush
