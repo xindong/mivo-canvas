@@ -75,6 +75,9 @@ const loadRuntimeModule = async (
       })),
   )
   const abortPendingCreate = vi.fn(options.abortPendingCreateImpl ?? (() => false))
+  // Block 3: mock assetAttachWiring —— 透传真 serverAssetIdFromUrl(URL 过滤逻辑走真路径),enqueueAssetAttach/Detach
+  // 为 spy(验 submitChanges accepted 后的 enqueue 行为)。在 doMock persistMode 之后 import 真 assetAttachWiring,
+  // 保证 persistBoot→canvasStore 链拿 mock persistMode。
   vi.doMock('../../lib/persistMode', () => ({
     isLocalPersist: options.local ?? false,
   }))
@@ -83,10 +86,18 @@ const loadRuntimeModule = async (
     abortPendingCanvasSyncCreate: abortPendingCreate,
     persistMode: options.local ? 'local' : 'server',
   }))
+  const realAssetWiring = await import('../../lib/assetAttachWiring')
+  const enqueueAssetAttach = vi.fn()
+  const enqueueAssetDetach = vi.fn()
+  vi.doMock('../../lib/assetAttachWiring', () => ({
+    serverAssetIdFromUrl: realAssetWiring.serverAssetIdFromUrl,
+    enqueueAssetAttach,
+    enqueueAssetDetach,
+  }))
   const mod = await import('./canvasSyncRuntime')
   const { useCanvasStore } = await import('../../store/canvasStore')
   const { useDebugLogStore } = await import('../../store/debugLogStore')
-  return { ...mod, useCanvasStore, useDebugLogStore, submitChange, abortPendingCreate }
+  return { ...mod, useCanvasStore, useDebugLogStore, submitChange, abortPendingCreate, enqueueAssetAttach, enqueueAssetDetach }
 }
 
 describe('canvasSyncRuntime(Block 1 runtime driving)', () => {
@@ -274,5 +285,116 @@ describe('canvasSyncRuntime(Block 1 runtime driving)', () => {
     expect(
       useDebugLogStore.getState().entries.some((entry) => entry.message.includes('submitChange retryable')),
     ).toBe(true)
+  })
+})
+
+describe('canvasSyncRuntime — Block 3 asset attach/detach side-effects', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  describe('computeAssetSideEffects — diff + URL 过滤(§5 #2 #4)', () => {
+    it('新建的 server 资产 node → attach map 记 assetId(剥 mivo-sasset: 前缀)', async () => {
+      const { computeAssetSideEffects } = await loadRuntimeModule()
+      const effects = computeAssetSideEffects(
+        { canvasId: 'c1', nodes: new Map(), edges: new Map(), anchors: new Map(), nodeOrder: [], edgeOrder: [], anchorOrder: [] },
+        {
+          canvasId: 'c1',
+          nodes: new Map([['n1', nodeRecord({ id: 'n1', asset: { url: 'mivo-sasset:asset-1' } })]]),
+          edges: new Map(), anchors: new Map(), nodeOrder: ['n1'], edgeOrder: [], anchorOrder: [],
+        },
+      )
+      expect(effects.attach.get('n1')).toBe('asset-1')
+      expect(effects.detach.size).toBe(0)
+    })
+
+    it('删除的 server 资产 node → detach map 记 assetId', async () => {
+      const { computeAssetSideEffects } = await loadRuntimeModule()
+      const effects = computeAssetSideEffects(
+        {
+          canvasId: 'c1',
+          nodes: new Map([['n1', nodeRecord({ id: 'n1', asset: { url: 'mivo-sasset:asset-1' } })]]),
+          edges: new Map(), anchors: new Map(), nodeOrder: ['n1'], edgeOrder: [], anchorOrder: [],
+        },
+        { canvasId: 'c1', nodes: new Map(), edges: new Map(), anchors: new Map(), nodeOrder: [], edgeOrder: [], anchorOrder: [] },
+      )
+      expect(effects.detach.get('n1')).toBe('asset-1')
+      expect(effects.attach.size).toBe(0)
+    })
+
+    it('非 server 资产(local://、/path.png、无 asset)的增删 node 不产 effect —— 不 enqueue', async () => {
+      const { computeAssetSideEffects } = await loadRuntimeModule()
+      const before = {
+        canvasId: 'c1',
+        nodes: new Map([['gone', nodeRecord({ id: 'gone', asset: { url: 'local://x' } })]]),
+        edges: new Map(), anchors: new Map(), nodeOrder: ['gone'], edgeOrder: [], anchorOrder: [],
+      }
+      const after = {
+        canvasId: 'c1',
+        nodes: new Map([
+          ['new', nodeRecord({ id: 'new', asset: { url: '/image.png' } })],
+          ['bare', nodeRecord({ id: 'bare' })],
+        ]),
+        edges: new Map(), anchors: new Map(), nodeOrder: ['new', 'bare'], edgeOrder: [], anchorOrder: [],
+      }
+      const effects = computeAssetSideEffects(before, after)
+      expect(effects.attach.size).toBe(0) // /image.png 与 bare(无 asset)都不产
+      expect(effects.detach.size).toBe(0) // local:// 不产
+    })
+
+    it('已存在 node(既不新建也不删除)不产 effect(edit-node 不触发 attach/detach)', async () => {
+      const { computeAssetSideEffects } = await loadRuntimeModule()
+      const effects = computeAssetSideEffects(
+        { canvasId: 'c1', nodes: new Map([['n1', nodeRecord({ id: 'n1', asset: { url: 'mivo-sasset:a1' } })]]), edges: new Map(), anchors: new Map(), nodeOrder: ['n1'], edgeOrder: [], anchorOrder: [] },
+        { canvasId: 'c1', nodes: new Map([['n1', nodeRecord({ id: 'n1', asset: { url: 'mivo-sasset:a1' } })]]), edges: new Map(), anchors: new Map(), nodeOrder: ['n1'], edgeOrder: [], anchorOrder: [] },
+      )
+      expect(effects.attach.size).toBe(0)
+      expect(effects.detach.size).toBe(0)
+    })
+  })
+
+  it('create-node accepted → enqueueAssetAttach(canvasId, assetId, nodeId);detach 不发(§5 #2 #3 ordering)', async () => {
+    const { enqueueCanvasSyncChanges, enqueueAssetAttach, enqueueAssetDetach, submitChange } = await loadRuntimeModule()
+    const fakePort = { submitChange } as unknown as CanvasSyncPort
+    const node = nodeRecord({ id: 'n1', asset: { url: 'mivo-sasset:asset-1' } })
+    const effects = { attach: new Map([['n1', 'asset-1']]), detach: new Map() }
+    await enqueueCanvasSyncChanges('c1', [{ kind: 'create-node', node }], fakePort, effects)
+    expect(submitChange).toHaveBeenCalledWith('c1', { kind: 'create-node', node })
+    expect(enqueueAssetAttach).toHaveBeenCalledWith('c1', 'asset-1', 'n1')
+    expect(enqueueAssetDetach).not.toHaveBeenCalled()
+  })
+
+  it('delete-node accepted → enqueueAssetDetach;attach 不发(§5 #2 #3)', async () => {
+    const { enqueueCanvasSyncChanges, enqueueAssetAttach, enqueueAssetDetach, submitChange } = await loadRuntimeModule()
+    const fakePort = { submitChange } as unknown as CanvasSyncPort
+    const effects = { attach: new Map(), detach: new Map([['n1', 'asset-1']]) }
+    await enqueueCanvasSyncChanges('c1', [{ kind: 'delete-node', nodeId: 'n1' }], fakePort, effects)
+    expect(submitChange).toHaveBeenCalledWith('c1', { kind: 'delete-node', nodeId: 'n1' })
+    expect(enqueueAssetDetach).toHaveBeenCalledWith('c1', 'asset-1', 'n1')
+    expect(enqueueAssetAttach).not.toHaveBeenCalled()
+  })
+
+  it('R1: create-node submitChange rejected → 不发 attach(reject 不 enqueue side-effect)', async () => {
+    const { enqueueCanvasSyncChanges, enqueueAssetAttach, enqueueAssetDetach, submitChange } = await loadRuntimeModule({
+      submitChangeImpl: async () => ({ kind: 'rejected', reason: 'forbidden' }),
+    })
+    const fakePort = { submitChange } as unknown as CanvasSyncPort
+    const node = nodeRecord({ id: 'n1', asset: { url: 'mivo-sasset:asset-1' } })
+    const effects = { attach: new Map([['n1', 'asset-1']]), detach: new Map() }
+    await enqueueCanvasSyncChanges('c1', [{ kind: 'create-node', node }], fakePort, effects)
+    expect(submitChange).toHaveBeenCalled()
+    expect(enqueueAssetAttach).not.toHaveBeenCalled()
+    expect(enqueueAssetDetach).not.toHaveBeenCalled()
+  })
+
+  it('无 asset 的 create-node accepted → 不 enqueue attach(text/frame 等非资产 node)', async () => {
+    const { enqueueCanvasSyncChanges, enqueueAssetAttach } = await loadRuntimeModule()
+    const fakePort = {
+      submitChange: vi.fn(async () => ({ kind: 'accepted', cursor: 'c' as never })),
+    } as unknown as CanvasSyncPort
+    const node = nodeRecord({ id: 'n-text', type: 'text' }) // 无 asset
+    const effects = { attach: new Map(), detach: new Map() } // computeAssetSideEffects 对无 asset 返空
+    await enqueueCanvasSyncChanges('c1', [{ kind: 'create-node', node }], fakePort, effects)
+    expect(enqueueAssetAttach).not.toHaveBeenCalled()
   })
 })

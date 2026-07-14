@@ -210,20 +210,20 @@ export const createAdapterWriteExecutor = (opts: FetchAdapterOptions): WriteExec
         }
 
         case 'attachAsset': {
-          // POST /api/assets/:assetId/attach,body { nodeId } → 200 AttachAssetResult。
+          // POST /api/assets/:assetId/attach,body { nodeId, canvasId } → 200 AttachAssetResult。
           // 200 = attached/already-attached → success;404(missing asset)→ isDelete=false → rejected。
           await requestJson<AttachAssetResult>({
             ...base,
             method: 'POST',
             path: `/api/assets/${encodeURIComponent(op.assetId)}/attach`,
-            body: { nodeId: op.nodeId },
+            body: { nodeId: op.nodeId, canvasId: op.canvasId },
             idempotencyKey,
           })
           return { status: 'success' }
         }
 
         case 'detachAsset': {
-          // POST /api/assets/:assetId/detach,body { nodeId } → 200 DetachAssetResult。
+          // POST /api/assets/:assetId/detach,body { nodeId, canvasId } → 200 DetachAssetResult。
           // 200 = detached/already-detached → success;404(missing)→ isDelete=true → success(幂等);
           // 403(owner-mismatch)→ isDelete=true → classifyHttpStatus(403) → rejected(跨 owner 非法,不静默成功)。
           try {
@@ -231,7 +231,7 @@ export const createAdapterWriteExecutor = (opts: FetchAdapterOptions): WriteExec
               ...base,
               method: 'POST',
               path: `/api/assets/${encodeURIComponent(op.assetId)}/detach`,
-              body: { nodeId: op.nodeId },
+              body: { nodeId: op.nodeId, canvasId: op.canvasId },
               idempotencyKey,
             })
           } catch (error) {

@@ -12,6 +12,7 @@ import type {
 import { FieldIntentError, validateFieldIntent } from '../../lib/canvasSyncPort'
 import { abortPendingCanvasSyncCreate, getCanvasSyncPort } from '../../lib/canvasSyncPortClient'
 import { isLocalPersist } from '../../lib/persistMode'
+import { enqueueAssetAttach, enqueueAssetDetach, serverAssetIdFromUrl } from '../../lib/assetAttachWiring'
 import { debugLogger } from '../../store/debugLogStore'
 import { useCanvasStore } from '../../store/canvasStore'
 import { documentFor } from '../../store/canvasDocumentModel'
@@ -299,16 +300,51 @@ export const buildCanvasSyncChanges = (before: SyncSnapshot, after: SyncSnapshot
   return changes
 }
 
+// ── Block 3 (A2-S4): asset attach/detach side-effects ──────────────────────────
+// 从 before/after SyncSnapshot diff 出「新建/删除的带 server 资产的 node」→ attach/detach 候选。
+// submitChanges 在对应 create-node/delete-node accepted 后 enqueue(R1 方案 A:attach 依赖 server 端 node 已落,
+// gate ① persist.getChild 才能找到;detach 在 delete-node accepted 后清残留 ref —— server 不级联清 asset ref)。
+// 只覆盖走 wrapMutation 的 mutation(duplicate/paste/delete);import/generate/mask-edit 走 deferred 路径不经
+// wrapMutation(node 不落 server,attach 无对象,Block 3 裁定 OUT,见 PR 残余风险段)。
+type AssetSideEffects = { attach: Map<string, string>; detach: Map<string, string> }
+
+export const computeAssetSideEffects = (before: SyncSnapshot, after: SyncSnapshot): AssetSideEffects => {
+  const attach = new Map<string, string>()
+  const detach = new Map<string, string>()
+  for (const recordId of after.nodeOrder) {
+    if (before.nodes.has(recordId)) continue
+    const assetId = serverAssetIdFromUrl(after.nodes.get(recordId)?.asset?.url)
+    if (assetId) attach.set(recordId, assetId)
+  }
+  for (const recordId of before.nodeOrder) {
+    if (after.nodes.has(recordId)) continue
+    const assetId = serverAssetIdFromUrl(before.nodes.get(recordId)?.asset?.url)
+    if (assetId) detach.set(recordId, assetId)
+  }
+  return { attach, detach }
+}
+
 const queueByCanvas = new Map<string, Promise<void>>()
 
 const submitChanges = async (
   canvasId: string,
   changes: CanvasChange[],
   port: CanvasSyncPort,
+  assetEffects?: AssetSideEffects,
 ): Promise<void> => {
   for (const change of changes) {
     const outcome = await port.submitChange(canvasId, change)
-    if (outcome.kind === 'accepted') continue
+    if (outcome.kind === 'accepted') {
+      // R1 方案 A(Block 3):node-change submitChange 成功后 enqueue asset side-effect(server 端 node 已落)。
+      // attach 须在 create-node accepted 后(gate ① persist.getChild 能找到 node);detach 在 delete-node
+      // accepted 后清残留 ref。conflict/retryable/rejected → 下方 return,不发后续(R1:reject 不发 attach)。
+      if (change.kind === 'create-node' && assetEffects?.attach.has(change.node.id)) {
+        enqueueAssetAttach(canvasId, assetEffects.attach.get(change.node.id) as string, change.node.id)
+      } else if (change.kind === 'delete-node' && assetEffects?.detach.has(change.nodeId)) {
+        enqueueAssetDetach(canvasId, assetEffects.detach.get(change.nodeId) as string, change.nodeId)
+      }
+      continue
+    }
     if (outcome.kind === 'conflict') {
       const detail = `submitChange conflict for ${canvasId}:${change.kind}; caller rebase not wired in Block 1`
       if (isCreateChange(change)) {
@@ -341,12 +377,13 @@ export const enqueueCanvasSyncChanges = (
   canvasId: string,
   changes: CanvasChange[],
   port: CanvasSyncPort = getCanvasSyncPort(),
+  assetEffects?: AssetSideEffects,
 ): Promise<void> => {
   if (changes.length === 0) return Promise.resolve()
   const previous = queueByCanvas.get(canvasId) ?? Promise.resolve()
   const next = previous
     .catch(() => {})
-    .then(() => submitChanges(canvasId, changes, port))
+    .then(() => submitChanges(canvasId, changes, port, assetEffects))
   queueByCanvas.set(canvasId, next)
   void next.finally(() => {
     if (queueByCanvas.get(canvasId) === next) queueByCanvas.delete(canvasId)
@@ -370,7 +407,8 @@ const wrapMutation = <TArgs extends unknown[], TResult>(
       return result
     }
     const changes = buildCanvasSyncChanges(before, after)
-    if (changes.length > 0) void enqueueCanvasSyncChanges(before.canvasId, changes)
+    const assetEffects = computeAssetSideEffects(before, after)
+    if (changes.length > 0) void enqueueCanvasSyncChanges(before.canvasId, changes, undefined, assetEffects)
     return result
   }
 }
