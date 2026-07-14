@@ -609,4 +609,51 @@ describe('canvasSyncRuntime — Block 3 asset attach/detach side-effects', () =>
     expect(enqueueAssetDetach).toHaveBeenCalledWith('c1', 'asset-1', 'n1')
     __resetCanvasSyncRuntimeQueue()
   })
+
+  // ── A2 alias F1[复审]: 拖拽创建文字复合 mutation(create+条件 resize 同 wrap)→ 单条 create-node 最终几何 ──
+  it('A2 alias F1[复审]: 拖拽创建文字(dragged 非默认几何)→ 单条 create-node 带最终 transform + textAutoWidth=false', async () => {
+    const { __resetCanvasSyncRuntimeQueue, wrapMutation, submitChange, useCanvasStore } = await loadRuntimeModule()
+    setupEmptyCanvas(useCanvasStore)
+    const store = useCanvasStore.getState()
+    const x = 100, y = 200, width = 300, height = 80 // 非默认(dragged)
+    // 复合 lambda:create + resize(同 useTextAnnotation tryEndTextCreation 的 dragged 路径)。
+    const id = wrapMutation(() => {
+      const nodeId = store.addTextNode({ x, y })
+      store.resizeTextNode(nodeId, x, width, height)
+      return nodeId
+    })()
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+    // 唯一 create-node(create+resize 同 wrap 的 after-snapshot 捕获最终几何;另可能含 reorder-children 同 append 模式,不计)。
+    const createCalls = submitChange.mock.calls.filter((c) => (c[1] as { kind?: string }).kind === 'create-node')
+    expect(createCalls).toHaveLength(1)
+    const createCall = createCalls[0]?.[1] as { node?: { transform?: { x: number; y: number; width: number; height: number }; textAutoWidth?: boolean } }
+    expect(createCall.node?.transform).toMatchObject({ x, y, width, height })
+    expect(createCall.node?.textAutoWidth).toBe(false)
+    // 本地节点与 payload 一致 + 返回 id。
+    const localNode = useCanvasStore.getState().nodes.find((n) => n.id === id)
+    expect(localNode).toBeDefined()
+    expect(localNode?.x).toBe(x)
+    expect(localNode?.y).toBe(y)
+    expect(localNode?.width).toBe(width)
+    expect(localNode?.height).toBe(height)
+    expect(localNode?.textAutoWidth).toBe(false)
+    __resetCanvasSyncRuntimeQueue()
+  })
+
+  it('A2 alias F1[复审]: 非拖拽创建文字(默认几何,无 resize)→ 单条 create-node 回归不破', async () => {
+    const { __resetCanvasSyncRuntimeQueue, wrapMutation, submitChange, useCanvasStore } = await loadRuntimeModule()
+    setupEmptyCanvas(useCanvasStore)
+    const store = useCanvasStore.getState()
+    const id = wrapMutation(() => store.addTextNode({ x: 50, y: 60 }))()
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+    // 唯一 create-node(回归:复合 lambda create-only 仍发 create-node;reorder-children 同 append 模式,不计)。
+    const createCalls = submitChange.mock.calls.filter((c) => (c[1] as { kind?: string }).kind === 'create-node')
+    expect(createCalls).toHaveLength(1)
+    expect(submitChange).toHaveBeenCalledWith('c1', expect.objectContaining({ kind: 'create-node' }))
+    const localNode = useCanvasStore.getState().nodes.find((n) => n.id === id)
+    expect(localNode).toBeDefined()
+    expect(localNode?.x).toBe(50)
+    expect(localNode?.y).toBe(60)
+    __resetCanvasSyncRuntimeQueue()
+  })
 })
