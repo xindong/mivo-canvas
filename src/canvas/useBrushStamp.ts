@@ -3,6 +3,7 @@ import { useCanvasStore } from '../store/canvasStore'
 import { eraserHitStrokeIds, eraserScreenRadius } from '../model/brushGeometry'
 import { stampGrowthIntervalMs, stampGrowthSizes } from './stampDefs'
 import { isNodeEffectivelyLocked } from './useNodeTransform'
+import { wrapMutation } from './actions/canvasSyncRuntime'
 import type { SnapGuide } from './canvasGeometry'
 import type { Viewport } from './canvasInteraction'
 
@@ -136,7 +137,7 @@ export function useBrushStamp({
         const point = screenToCanvas(event.clientX, event.clientY)
         const size = stampGrowthSizes[placement.stage]
         const store = useCanvasStore.getState()
-        const placedStampId = store.addMarkupNode(
+        const placedStampId = wrapMutation(store.addMarkupNode)(
           'stamp',
           { x: point.x - size / 2, y: point.y - size / 2 },
           { width: size, height: size },

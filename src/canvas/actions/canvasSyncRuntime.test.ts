@@ -541,4 +541,38 @@ describe('canvasSyncRuntime — Block 3 asset attach/detach side-effects', () =>
     expect(submitChange).toHaveBeenNthCalledWith(2, 'c1', expect.objectContaining({ kind: 'reorder-children' }))
     __resetCanvasSyncRuntimeQueue()
   })
+
+  // ── A2 ptr: pointerup stamp 放置 addMarkupNode 行为单元(server→create-node / local→no submit)──
+  const setupEmptyCanvas = (store: Awaited<ReturnType<typeof loadRuntimeModule>>['useCanvasStore']) => {
+    const baseState = store.getInitialState()
+    store.setState(
+      {
+        ...baseState,
+        sceneId: 'c1',
+        canvases: { c1: { title: 'Canvas', createdAt: '2026-07-15T00:00:00.000Z', updatedAt: '2026-07-15T00:00:00.000Z', nodes: [], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] } },
+        nodes: [],
+        edges: [],
+        tasks: [],
+      } as never,
+      true,
+    )
+  }
+
+  it('A2 ptr: wrapMutation(store.addMarkupNode)(pointerup stamp) → server 模式 create-node submitChange accepted', async () => {
+    const { __resetCanvasSyncRuntimeQueue, wrapMutation, submitChange, useCanvasStore } = await loadRuntimeModule()
+    setupEmptyCanvas(useCanvasStore)
+    wrapMutation(useCanvasStore.getState().addMarkupNode)('stamp', { x: 0, y: 0 }, { width: 10, height: 10 }, { stampKind: 'star', select: false })
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+    expect(submitChange).toHaveBeenCalledWith('c1', expect.objectContaining({ kind: 'create-node' }))
+    __resetCanvasSyncRuntimeQueue()
+  })
+
+  it('A2 ptr: wrapMutation(store.addMarkupNode) → local 模式不 submitChange(local gate,isLocalPersist 直 mutate)', async () => {
+    const { __resetCanvasSyncRuntimeQueue, wrapMutation, submitChange, useCanvasStore } = await loadRuntimeModule({ local: true })
+    setupEmptyCanvas(useCanvasStore)
+    wrapMutation(useCanvasStore.getState().addMarkupNode)('stamp', { x: 0, y: 0 }, { width: 10, height: 10 }, { stampKind: 'star', select: false })
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+    expect(submitChange).not.toHaveBeenCalled()
+    __resetCanvasSyncRuntimeQueue()
+  })
 })
