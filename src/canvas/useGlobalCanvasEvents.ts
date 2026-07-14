@@ -164,8 +164,10 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
 
       if (modifier && key === 'z') {
         event.preventDefault()
-        if (event.shiftKey) store.redo()
-        else store.undo()
+        // A2 SC:undo/redo 是 document mutation(documentSlice),经 wrapMutation 包(snapshot-diff →
+        //   inverse-diff change flow,server 收 inverse DomainOp 对齐;无需特殊 undo command)。
+        if (event.shiftKey) wrapMutation(store.redo)()
+        else wrapMutation(store.undo)()
         return
       }
 
@@ -188,14 +190,16 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
       if (modifier && key === 'x') {
         if (hasActiveTextSelection()) return
         event.preventDefault()
-        store.cutSelectedNodes()
+        // A2 SC:cut = copy + delete(document mutation),经 wrapMutation 包(delete 部分落 submitChange)。
+        wrapMutation(store.cutSelectedNodes)()
         return
       }
 
       if (modifier && key === 'g') {
         event.preventDefault()
-        if (event.shiftKey) store.ungroupSelectedNodes()
-        else store.groupSelectedNodes()
+        // A2 SC:group/ungroup 改 parentIds(document mutation),经 wrapMutation 包。
+        if (event.shiftKey) wrapMutation(store.ungroupSelectedNodes)()
+        else wrapMutation(store.groupSelectedNodes)()
         return
       }
 
@@ -213,13 +217,14 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
 
       if (event.key === '[') {
         event.preventDefault()
-        store.moveSelectedLayer(event.shiftKey ? 'back' : 'backward')
+        // A2 SC:moveSelectedLayer 改 orderKey(document mutation),经 wrapMutation 包(取参包)。
+        wrapMutation(store.moveSelectedLayer)(event.shiftKey ? 'back' : 'backward')
         return
       }
 
       if (event.key === ']') {
         event.preventDefault()
-        store.moveSelectedLayer(event.shiftKey ? 'front' : 'forward')
+        wrapMutation(store.moveSelectedLayer)(event.shiftKey ? 'front' : 'forward')
         return
       }
 
@@ -242,18 +247,19 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
       }
 
       const arrowDelta = event.shiftKey ? 10 : 1
+      // A2 SC:arrow nudge 改 transform(document mutation),经 wrapMutation 包(取参包)。
       if (event.key === 'ArrowLeft') {
         event.preventDefault()
-        store.moveSelectedNodesBy(-arrowDelta, 0)
+        wrapMutation(store.moveSelectedNodesBy)(-arrowDelta, 0)
       } else if (event.key === 'ArrowRight') {
         event.preventDefault()
-        store.moveSelectedNodesBy(arrowDelta, 0)
+        wrapMutation(store.moveSelectedNodesBy)(arrowDelta, 0)
       } else if (event.key === 'ArrowUp') {
         event.preventDefault()
-        store.moveSelectedNodesBy(0, -arrowDelta)
+        wrapMutation(store.moveSelectedNodesBy)(0, -arrowDelta)
       } else if (event.key === 'ArrowDown') {
         event.preventDefault()
-        store.moveSelectedNodesBy(0, arrowDelta)
+        wrapMutation(store.moveSelectedNodesBy)(0, arrowDelta)
       }
     }
 
@@ -291,7 +297,9 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
       const store = useCanvasStore.getState()
       if (store.clipboardAssets.length) {
         event.preventDefault()
-        store.pasteClipboardAssets(viewportCenter())
+        // A2 SC:pasteClipboardAssets 创建 image nodes(document mutation),经 wrapMutation 包
+        //   (lambda 包保 viewportCenter() 落点,同 #244 pasteClipboardNodes 模式)。
+        wrapMutation(() => store.pasteClipboardAssets(viewportCenter()))()
         return
       }
 

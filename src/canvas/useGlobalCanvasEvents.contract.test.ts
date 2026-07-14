@@ -27,10 +27,54 @@ describe('F1: useGlobalCanvasEvents 快捷键路径经 wrapMutation(源码契约
     expect(source).toContain("wrapMutation(() => store.pasteClipboardNodes())()")
   })
 
-  it('undo/cut/group/ungroup/moveLayer 等其余快捷键不在本契约范围(存量缺口,另列任务)', () => {
-    // 边界声明(lead 裁定):本 PR 只改 duplicate/delete/paste 三条 asset 相关路径。
-    // 其余快捷键的同类旁路(store.cutSelectedNodes / groupSelectedNodes / moveSelectedLayer 等)
-    // 是存量缺口,不归本 PR,不在此断言。
+  // ── A2 SC:快捷键/全局事件 mutation 全量接入 wrapMutation(9 位点,lead 批复)──
+  it('Cmd+Z → wrapMutation(store.undo),非裸 store.undo()', () => {
+    expect(source).toContain('wrapMutation(store.undo)()')
+    expect(source).not.toMatch(/store\.undo\(\)/)
+  })
+
+  it('Cmd+Shift+Z → wrapMutation(store.redo),非裸 store.redo()', () => {
+    expect(source).toContain('wrapMutation(store.redo)()')
+    expect(source).not.toMatch(/store\.redo\(\)/)
+  })
+
+  it('Cmd+X → wrapMutation(store.cutSelectedNodes),非裸 store.cutSelectedNodes()', () => {
+    expect(source).toContain('wrapMutation(store.cutSelectedNodes)()')
+    expect(source).not.toMatch(/store\.cutSelectedNodes\(\)/)
+  })
+
+  it('Cmd+G → wrapMutation(store.groupSelectedNodes),非裸 store.groupSelectedNodes()', () => {
+    expect(source).toContain('wrapMutation(store.groupSelectedNodes)()')
+    expect(source).not.toMatch(/store\.groupSelectedNodes\(\)/)
+  })
+
+  it('Cmd+Shift+G → wrapMutation(store.ungroupSelectedNodes),非裸 store.ungroupSelectedNodes()', () => {
+    expect(source).toContain('wrapMutation(store.ungroupSelectedNodes)()')
+    expect(source).not.toMatch(/store\.ungroupSelectedNodes\(\)/)
+  })
+
+  it('[ / ] → wrapMutation(store.moveSelectedLayer)(move),非裸 store.moveSelectedLayer(move)', () => {
+    // 取参包:wrap 版是 store.moveSelectedLayer)(move)(右括号插入);裸版 store.moveSelectedLayer(move)。
+    // regex 匹配裸调(store.X 紧跟左括号);wrap 版 store.X 紧跟右括号,不匹配。
+    expect(source).toContain('wrapMutation(store.moveSelectedLayer)')
+    expect(source).not.toMatch(/store\.moveSelectedLayer\(/)
+  })
+
+  it('Arrow keys → wrapMutation(store.moveSelectedNodesBy)(dx,dy),非裸 store.moveSelectedNodesBy(dx,dy)', () => {
+    expect(source).toContain('wrapMutation(store.moveSelectedNodesBy)')
+    expect(source).not.toMatch(/store\.moveSelectedNodesBy\(/)
+  })
+
+  it('paste(clipboardAssets)→ wrapMutation(() => store.pasteClipboardAssets(viewportCenter()))', () => {
+    // lambda 包装(保 viewportCenter 落点),regex not-to-match 不适用(lambda body 内含 store.X());只 toContain。
+    expect(source).toContain('wrapMutation(() => store.pasteClipboardAssets(viewportCenter()))()')
+  })
+
+  it('非 document mutation 的快捷键不在此契约范围(纯 UI 态;useBrushStamp pointer 旁路单列 sibling)', () => {
+    // 边界声明(A2 SC lead 裁定):selectNodes/selectNode/setActiveTool/setBrushStyle/copySelectedNodes
+    //   (clipboard 只读)/zoomBy/zoomTo/fitAll/fitSelection/reset* 不改 document/nodes/edges,不进
+    //   submitChange 同步域,不需 wrapMutation。useBrushStamp.ts pointerup 的 store.addMarkupNode 旁路
+    //   是 pointer 交互(非键盘/全局事件),单列 sibling 任务,不在本契约范围。
     expect(true).toBe(true)
   })
 })
