@@ -37,6 +37,7 @@ import { createCanvasRoutes } from './routes/canvas'
 import { createUserStateRoutes } from './routes/userState'
 import { createMembersRoutes } from './routes/members'
 import { createShareLinksRoutes, createShareAccessRoutes } from './routes/shareLinks'
+import { createE2eResetRoute } from './routes/e2eReset'
 import { createPersistBackend, type PersistBackend } from './persist/backend'
 import { resolvePersistBackendConfig } from './persist/pgConfig'
 import { createPermissionBackend, type PermissionBackend } from './lib/permissions'
@@ -275,6 +276,14 @@ if (featureFlags.sseProbeEnabled) {
   const sseProbeDisabled = (c: Context<AppEnv>) => c.notFound()
   app.all('/api/diag/sse-probe', sseProbeDisabled)
 }
+
+// A2-S4 Block 5 F1: e2e persist harness reset 端点(test-only,三重保险 fail-closed)。
+// --persist=server 档 e2e 每轮结束清掉测试创建的 project/canvas/asset,不留残留污染下一轮。
+// 挂载条件 mirror auth-stub.ts isDevStubActive 三重保险(createE2eResetRoute 内 isE2eResetEnabled):
+// MIVO_E2E_RESET_TOKEN 设置 + MIVO_E2E_HARNESS==='1' sentinel(harness 显式注入)+ NODE_ENV!=='production'
+// + MIVO_PUBLIC!=='1';任一不满足 → 404 stub(防 SPA fallback)。调 sharedPersistBackend/PermissionBackend
+// __reset() 清 owner-scoped 数据(memory 同步 void;PG TRUNCATE)。test-only,生产绝不挂载。
+app.route('/api/__e2e/reset', createE2eResetRoute({ persist: sharedPersistBackend, permission: sharedPermissionBackend, env: process.env }))
 
 // Same-origin static hosting of dist/ (Vite build output). serveStatic only
 // accepts a root relative to cwd and calls next() on miss, letting the SPA

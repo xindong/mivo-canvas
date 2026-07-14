@@ -57,6 +57,30 @@ const parseKernel = (argv) => {
   return 'legacy'
 }
 
+// A2-S4 Block 5: --persist 维度透传(local|shadow|server,默认 local=零行为变化)。
+// 三态见 src/lib/persistMode.ts:v4 §1。local=IDB-only(生产默认);shadow=IDB+服务端双写;
+// server=服务端权威(hydrate 从 BFF 拉)。runner 路由:
+//  - server 档走专用 e2e-persist-smoke.mjs(纯 HTTP 打 BFF,不打前端/不启 Playwright;
+//    server 档 UI scenario 是后续块,lead §4 不要求 A2 全部七条 SC 用例)。
+//  - local/shadow 档走原 e2e-smoke.mjs scenario 矩阵(透传 --persist 旗标给前端)。
+const parsePersist = (argv) => {
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index]
+    if (arg === '--persist') {
+      const value = argv[index + 1]
+      if (value === 'local' || value === 'shadow' || value === 'server') return value
+      throw new Error('--persist requires local, shadow, or server')
+    }
+    if (arg.startsWith('--persist=')) {
+      const value = arg.slice('--persist='.length)
+      if (value === 'local' || value === 'shadow' || value === 'server') return value
+      throw new Error(`Unknown --persist value: ${value}`)
+    }
+  }
+  return 'local'
+}
+
+
 const parseScenarios = (argv) => {
   const values = []
 
@@ -91,6 +115,7 @@ const topology = parseTopology(argv)
 const portBase = Number(process.env.MIVO_E2E_PORT_BASE ?? (topology === 'prod' ? 6174 : 5174))
 const renderer = parseRenderer(argv)
 const kernel = parseKernel(argv)
+const persist = parsePersist(argv)
 const requestedScenarios = parseScenarios(argv)
 const selectedScenarios = requestedScenarios.length === 0
   ? scenarioOrder
@@ -104,6 +129,40 @@ if (unknownScenarios.length > 0) {
 }
 
 const smokeScript = fileURLToPath(new URL('./e2e-smoke.mjs', import.meta.url))
+// A2-S4 Block 5: server 档专用 HTTP 冒烟脚本(纯 BFF,不打前端/不启 Playwright)。
+const persistSmokeScript = fileURLToPath(new URL('./e2e-persist-smoke.mjs', import.meta.url))
+
+// A2-S4 Block 5: --persist=server 档走专用 HTTP 冒烟(建画布→写入 node→重载 hydrate 校验→reset 清理)。
+// server 档 UI scenario 是后续块(lead §4:本块交付 harness 能力,不要求 A2 全部七条 SC 用例)。
+// local/shadow 档走原 e2e-smoke.mjs scenario 矩阵(下方 renderer×kernel×scenario 笛卡尔积循环)。
+if (persist === 'server') {
+  const scenarioPort = String(portBase)
+  console.log(`[e2e-runner] topology=${topology} persist=server HTTP smoke port=${scenarioPort} base=${portBase}`)
+  const child = spawn(
+    process.execPath,
+    [persistSmokeScript, '--topology', topology],
+    {
+      stdio: 'inherit',
+      env: {
+        ...process.env,
+        MIVO_E2E_PORT: scenarioPort,
+        MIVO_E2E_PORT_BASE: String(portBase),
+      },
+    },
+  )
+  await new Promise((resolve, reject) => {
+    child.on('close', (code) => {
+      if (code === 0) {
+        resolve()
+        return
+      }
+      reject(new Error(`e2e-persist-smoke failed (exit ${code ?? 'unknown'});server 档需本地 PG(docker compose -f ops/postgres/docker-compose.e2e.yml up -d)或 CI service`))
+    })
+  })
+  console.log(`[e2e-runner] topology=${topology} persist=server HTTP smoke passed`)
+} else {
+  // local/shadow 档:走原 scenario 矩阵,透传 --persist 旗标给 e2e-smoke(前端 persistMode.ts 读 URL ?persist=)。
+
 
 const rendererModes = renderer === 'both' ? ['dom', 'leafer'] : [renderer]
 // both → 先 legacy 后 new(contract §7);单值 → [该值]。kernel 维度在最外层串行。
@@ -115,7 +174,7 @@ const runScenarioAttempt = (scenarioName, index, attempt, rendererMode, kernelMo
     console.log(`[e2e-runner] topology=${topology} scenario=${scenarioName} kernel=${kernelMode} renderer=${rendererMode} attempt=${attempt} port=${scenarioPort} base=${portBase}`)
     const child = spawn(
       process.execPath,
-      [smokeScript, '--topology', topology, '--scenario', scenarioName, '--renderer', rendererMode, '--kernel', kernelMode],
+      [smokeScript, '--topology', topology, '--scenario', scenarioName, '--renderer', rendererMode, '--kernel', kernelMode, '--persist', persist],
       {
         stdio: 'inherit',
         env: {
@@ -173,5 +232,6 @@ for (const kernelMode of kernelModes) {
 
 const kernelBreakdown = kernelModes.map((mode) => `kernel=${mode}:${perKernelPassed[mode]}`).join(' ')
 console.log(
-  `[e2e-runner] topology=${topology} kernel=${kernel} renderer=${renderer} passed ${selectedScenarios.length} scenario(s) across ${kernelModes.length} kernel mode(s) x ${rendererModes.length} renderer mode(s) [${kernelBreakdown}]`,
+  `[e2e-runner] topology=${topology} persist=${persist} kernel=${kernel} renderer=${renderer} passed ${selectedScenarios.length} scenario(s) across ${kernelModes.length} kernel mode(s) x ${rendererModes.length} renderer mode(s) [${kernelBreakdown}]`,
 )
+}

@@ -86,13 +86,34 @@ const resolveKernel = (argv) => {
   return 'legacy'
 }
 const kernelMode = resolveKernel(cliArgs)
+// A2-S4 Block 5: --persist 维度透传(local|shadow|server,默认 local=零行为变化)。
+// persistMode.ts 读 ?persist= URL 参数或 VITE_MIVO_PERSIST env;smoke 透传到 URL + BFF/dev env。
+// local=IDB-only(默认);shadow=IDB+服务端双写;server=服务端权威(经 e2e-persist-smoke.mjs 走专用 HTTP
+// 冒烟,不经本 scenario 矩阵——server 档 UI scenario 是后续块,lead §4 不要求 A2 全部七条 SC 用例)。
+const resolvePersist = (argv) => {
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index]
+    if (arg === '--persist') {
+      const value = argv[index + 1]
+      if (value === 'local' || value === 'shadow' || value === 'server') return value
+      throw new Error('--persist requires local, shadow, or server')
+    }
+    if (arg.startsWith('--persist=')) {
+      const value = arg.slice('--persist='.length)
+      if (value === 'local' || value === 'shadow' || value === 'server') return value
+      throw new Error(`Unknown --persist value: ${value}`)
+    }
+  }
+  return 'local'
+}
+const persistMode = resolvePersist(cliArgs)
 const useRealUpstream = process.env.MIVO_E2E_USE_REAL_UPSTREAM === '1'
 const disableApiRouteMocks = process.env.MIVO_E2E_DISABLE_API_ROUTE_MOCKS === '1'
 const securityPort = requestedPort
 const runtimePort = isProdTopology ? requestedPort + 1 : requestedPort
 const securityBaseUrl = createBaseUrl(securityPort)
 const baseUrl = createBaseUrl(runtimePort)
-const canvasUrl = `${baseUrl}?renderer=${rendererMode}&kernel=${kernelMode}`
+const canvasUrl = `${baseUrl}?renderer=${rendererMode}&kernel=${kernelMode}${persistMode !== 'local' ? `&persist=${persistMode}` : ''}`
 const devBffBaseUrl = createBaseUrl(requestedPort + 1)
 const debugViewToken = 'test-token'
 const {
@@ -116,6 +137,7 @@ const startTopologyServer = ({ activePort, debugViewToken: serverDebugViewToken,
         debugViewToken: serverDebugViewToken,
         enableLocalAssets,
         enableEagleProxy,
+        persistMode,
       })
     : (() => {
         const bffPort = activePort + 1
@@ -128,8 +150,9 @@ const startTopologyServer = ({ activePort, debugViewToken: serverDebugViewToken,
           enableLocalAssets,
           enableEagleProxy,
           isPublic: false,
+          persistMode,
         })
-        const dev = startSmokeDevServer({ port: activePort, localAssetFixtureDir, eagleMockPort: eagleMockHandle.port, bffPort })
+        const dev = startSmokeDevServer({ port: activePort, localAssetFixtureDir, eagleMockPort: eagleMockHandle.port, bffPort, persistMode })
         return { bff, dev }
       })()
 
