@@ -42,22 +42,46 @@ const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e))
 const defaultFetch: FetchLike = (input, init) => fetch(input, init)
 
 /**
- * F2:legacy-envelope 发送前本地完整校验(复刻 server validateLegacyReplaceRequest 的 shape 语义,不 import
- *   server;OUT 边界禁动 server/)。本地非法/腐败 → rejected fail-visible(不发送,400 根本轮不到歧义)。
- *   本地合法 + 收到 400 → 只剩 gate 关 / server 漂移 → gate-blocked 数据保全(见 classifyLegacyDrain)。
- * 校验:kind='legacy-replace' + canvasId/nodeId 非空 string + version===1 + payload object(非 null/array)+
- *   baseRevision 非负 safe integer。scope 在 client 侧平凡(path 从 env 自身构造,canvasId/nodeId 必匹配)。
+ * F2/F4:legacy-envelope 发送前本地校验**实际发送的 JSON wire**(与 server validateLegacyReplaceRequest
+ *   (domainOp.ts:190-199)逐字同形,不 import server;OUT 边界禁动 server/)。本地非法/腐败 → rejected
+ *   fail-visible(不发送,400 根本轮不到歧义)。本地合法 + 收到 400 → 只剩 gate 关 / server 漂移 →
+ *   gate-blocked 数据保全(见 classifyLegacyDrain)。
+ *
+ * F4 修(与 server 等价,消两类漂移):
+ *  1. **校验 wire 形态,非原对象**:先 JSON.stringify(env)(触发 toJSON + 检测循环引用/BigInt,失败 →
+ *     rejected)→ JSON.parse 回来,对 **round-tripped 对象**跑校验(即 server 将收到的形态)。防 toJSON 漂移
+ *     (payload=new Date(0) 本地 object 放行 → JSON 化变 string → server 400 → 被 F2 归 gate-blocked 永久重发)。
+ *  2. **整数规则逐字同 server**:Number.isInteger && >= 0(非 isSafeInteger——MAX_SAFE_INTEGER+1 时 server 收、
+ *     client 拒会判定分裂)。
+ *  3. 循环引用/BigInt → stringify 抛 → rejected(0 fetch,不落外层 transient)。
+ * 返回 round-tripped wire 供发送(防对原 env 二次 stringify 致 toJSON 二次漂移)。
+ * scope 在 client 侧平凡(path 从 env.canvasId/nodeId 构造,primitive 无 toJSON,round-trip 不变)。
  */
-const validateLegacyEnvelopeLocal = (env: LegacyReplaceRequest): { ok: true } | { ok: false; reason: string } => {
-  if (env == null || typeof env !== 'object' || Array.isArray(env)) return { ok: false, reason: 'legacy-replace must be object' }
-  const e = env as Record<string, unknown>
+const validateLegacyEnvelopeLocal = (
+  env: LegacyReplaceRequest,
+): { ok: true; wire: Record<string, unknown> } | { ok: false; reason: string } => {
+  let wireStr: string
+  try {
+    wireStr = JSON.stringify(env) // 触发 toJSON(若有)+ 检测循环引用/BigInt(抛 → rejected,非 transient)
+  } catch (e) {
+    return { ok: false, reason: `envelope not serializable (cycle/BigInt?): ${msg(e)}` }
+  }
+  let wire: unknown
+  try {
+    wire = JSON.parse(wireStr) // round-trip:parse 回来的 plain object(无 toJSON),即 server 将收到的形态
+  } catch {
+    return { ok: false, reason: 'envelope wire not parseable' }
+  }
+  if (wire == null || typeof wire !== 'object' || Array.isArray(wire)) return { ok: false, reason: 'legacy-replace must be object' }
+  const e = wire as Record<string, unknown>
   if (e.kind !== 'legacy-replace') return { ok: false, reason: 'kind must be legacy-replace' }
-  if (typeof e.canvasId !== 'string' || e.canvasId.length === 0) return { ok: false, reason: 'canvasId must be non-empty string' }
-  if (typeof e.nodeId !== 'string' || e.nodeId.length === 0) return { ok: false, reason: 'nodeId must be non-empty string' }
+  if (typeof e.canvasId !== 'string' || !e.canvasId) return { ok: false, reason: 'canvasId required' }
+  if (typeof e.nodeId !== 'string' || !e.nodeId) return { ok: false, reason: 'nodeId required' }
   if (e.version !== 1) return { ok: false, reason: 'version must be 1' }
-  if (e.payload == null || typeof e.payload !== 'object' || Array.isArray(e.payload)) return { ok: false, reason: 'payload must be object' }
-  if (typeof e.baseRevision !== 'number' || !Number.isSafeInteger(e.baseRevision) || (e.baseRevision as number) < 0) return { ok: false, reason: 'baseRevision must be non-negative safe integer' }
-  return { ok: true }
+  if (e.payload == null || typeof e.payload !== 'object' || Array.isArray(e.payload)) return { ok: false, reason: 'payload required' }
+  // 整数规则与 server 逐字相同(domainOp.ts:198):Number.isInteger && >= 0(非 isSafeInteger)
+  if (typeof e.baseRevision !== 'number' || !Number.isInteger(e.baseRevision) || (e.baseRevision as number) < 0) return { ok: false, reason: 'baseRevision must be non-negative integer' }
+  return { ok: true, wire: e }
 }
 
 /**
@@ -144,18 +168,19 @@ export const createAdapterWriteExecutor = (opts: FetchAdapterOptions): WriteExec
         case 'legacy-envelope': {
           path = 'envelope'
           const env = migrated.envelope
-          // F2:发送前本地完整校验 envelope shape(本地非法/腐败 → rejected,不发送;400 根本轮不到歧义)。
+          // F2/F4:校验实际发送的 JSON wire(stringify→parse round-trip,server 等价规则 isInteger 非 isSafeInteger)。
+          //   本地非法/腐败(含 toJSON 漂移 / 循环引用 / BigInt / 整数超界)→ rejected fail-visible(0 fetch,400 根本轮不到歧义)。
           //   本地合法 + 收到 400 → gate-blocked(数据保全,见 classifyLegacyDrain envelope-400)。
           const v = validateLegacyEnvelopeLocal(env)
           if (!v.ok) return { status: 'rejected', body: { error: 'bad-request', message: v.reason } }
-          // PATCH /api/canvas/:canvasId/nodes/:nodeId,body = LegacyReplaceRequest 信封(baseRevision
-          //   在信封内,**非 If-Match header**);§14.3 decoder wire:gate 关→400 / scope mismatch→400 /
+          // PATCH /api/canvas/:canvasId/nodes/:nodeId,body = round-tripped wire(v.wire,非原 env——防 toJSON 二次漂移);
+          //   baseRevision 在信封内(**非 If-Match header**);§14.3 decoder wire:gate 关→400 / scope mismatch→400 /
           //   stale base→409 legacy-stale-conflict / fresh(existing+base=rev / missing+base=0→create)→200 replace。
           const result = await requestJson<UpsertResponse>({
             ...base,
             method: 'PATCH',
             path: `/api/canvas/${encodeURIComponent(env.canvasId)}/nodes/${encodeURIComponent(env.nodeId)}`,
-            body: env,
+            body: v.wire,
             idempotencyKey,
           })
           // 回捕 revision(UpsertResponse{id,revision,seq}),drain 经 onSuccess 回灌 store 下一次 strict

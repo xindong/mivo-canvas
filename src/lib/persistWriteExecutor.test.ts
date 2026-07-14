@@ -257,6 +257,60 @@ describe('A2-S4 Block 4:FX-5 队列 migration-on-read(§14.3 legacy drain 兼容
       expect(calls.length).toBe(0) // 本地非法 → validateLegacyEnvelopeLocal 拒,不发请求
     })
 
+    it('F4-① baseRevision=MAX_SAFE_INTEGER+1 → client(isInteger)与 server 同判放行(非 isSafeInteger 拒)→ 发请求 success', async () => {
+      const calls: { method: string }[] = []
+      const fetch = async (_input: string, init?: RequestInit): Promise<Response> => {
+        calls.push({ method: (init?.method ?? 'GET').toUpperCase() })
+        return json({ id: 'n1', revision: 5, seq: 1, base: 'b' }, 200)
+      }
+      const exec = stubExecutor(fetch)
+      // MAX_SAFE_INTEGER+1=2^53:Number.isInteger=true(放行);旧 isSafeInteger=false 会拒(与 server isInteger 分裂)。
+      const r = await exec({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n1', payload: { x: 1 } as never, baseRevision: Number.MAX_SAFE_INTEGER + 1 }, 'f4-1')
+      expect(r.status).toBe('success') // 新代码 isInteger 放行 = server 同判 → 发请求 200
+      expect(calls.length).toBe(1)
+    })
+
+    it('F4-② payload=new Date(0)(toJSON→string)→ wire 形态 payload 非 object → 本地 rejected,0 fetch(不击穿 F2 gate-blocked 永久重发)', async () => {
+      const calls: { method: string }[] = []
+      const fetch = async (_input: string, init?: RequestInit): Promise<Response> => {
+        calls.push({ method: (init?.method ?? 'GET').toUpperCase() })
+        return json({ id: 'n1', revision: 5 }, 200)
+      }
+      const exec = stubExecutor(fetch)
+      // Date(0) 本地 typeof==='object'(旧放行);JSON.stringify 触发 toJSON→'"1970-01-01T00:00:00.000Z"'(string),
+      //   parse 回来 payload=string → 新代码 rejected(0 fetch,不发给 server 致 400→gate-blocked 周期性永久重发)。
+      const r = await exec({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n1', payload: new Date(0) as never, baseRevision: 0 }, 'f4-2')
+      expect(r.status).toBe('rejected')
+      expect(calls.length).toBe(0)
+    })
+
+    it('F4-②b payload 自定义 toJSON 产生非 object(string)→ 本地 rejected,0 fetch', async () => {
+      const calls: { method: string }[] = []
+      const fetch = async (_input: string, init?: RequestInit): Promise<Response> => {
+        calls.push({ method: (init?.method ?? 'GET').toUpperCase() })
+        return json({ id: 'n1', revision: 5 }, 200)
+      }
+      const exec = stubExecutor(fetch)
+      const r = await exec({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n1', payload: { toJSON: () => 'string-result' } as never, baseRevision: 0 }, 'f4-2b')
+      expect(r.status).toBe('rejected')
+      expect(calls.length).toBe(0)
+    })
+
+    it('F4-③ payload 循环引用 → JSON.stringify 抛 → 本地 rejected(非 transient),0 fetch', async () => {
+      const calls: { method: string }[] = []
+      const fetch = async (_input: string, init?: RequestInit): Promise<Response> => {
+        calls.push({ method: (init?.method ?? 'GET').toUpperCase() })
+        return json({ id: 'n1', revision: 5 }, 200)
+      }
+      const exec = stubExecutor(fetch)
+      const cyclic: Record<string, unknown> = { x: 1 }
+      cyclic.self = cyclic // 循环引用 → JSON.stringify 抛
+      const r = await exec({ kind: 'upsertNode', canvasId: 'c1', nodeId: 'n1', payload: cyclic as never, baseRevision: 0 }, 'f4-3')
+      expect(r.status).toBe('rejected') // F4:stringify 抛在 validateLegacyEnvelopeLocal 内 catch → rejected(旧代码落外层 transient)
+      expect(r.status).not.toBe('transient')
+      expect(calls.length).toBe(0)
+    })
+
     it('401 → unauthorized(队列暂停,数据保留)', async () => {
       const exec = cannedExecutor(401, { error: 'require-login' })
       const r = await exec(op(7), 'idem-5')
