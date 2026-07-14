@@ -602,3 +602,88 @@ jobs:
           path: test-artifacts
           if-no-files-found: warn
           retention-days: 14
+
+  # A2-S4 Block 5: e2e persist server 档冒烟 job(--persist=server)。
+  # 证明 persist 维度透传落地:BFF server 档连真 PG → 建画布→写入 node→重载 GET hydrate 校验
+  # → reset 清理无残留(详见 scripts/e2e-persist-smoke.mjs)。与 pg-suite 同款 PG service container
+  # (非生产凭据 mivo/mivo-e2e-test);纯 HTTP 打 BFF(不打前端/不启 Playwright/不需 npm run build)。
+  # 本块交付 harness 能力(lead §4:不要求 A2 全部七条 SC 用例;SC 用例是后续块)。失败即阻断。
+  e2e-persist-server:
+    name: e2e persist server (PG smoke)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    services:
+      postgres:
+        # PG16(与生产/pg-suite 一致)。service container + healthcheck。
+        image: postgres:16
+        env:
+          # e2e 专用 superuser + DB;非生产凭据(与 pg-suite 同模式)。
+          POSTGRES_USER: mivo
+          POSTGRES_PASSWORD: mivo-e2e-test
+          POSTGRES_DB: mivocanvas
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mivo -d mivocanvas"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # server 档 BFF 连真 PG(harness startSmokeBffServer persistMode=server 注入 MIVO_PERSIST_BACKEND=pg + MIVO_PG_*)。
+      # CI service container 监听 5432(本地 docker-compose.e2e.yml 用 55443;CI 用 5432,env 覆盖)。
+      MIVO_PG_HOST: 127.0.0.1
+      MIVO_PG_PORT: '5432'
+      MIVO_PG_USER: mivo
+      MIVO_PG_PASSWORD: mivo-e2e-test
+      MIVO_PG_DB: mivocanvas
+      # legacy 模式 actor = fingerprintOfPlatformKey(MIVO_PLATFORM_KEY);e2e 稳定 owner,自归属过 authz。
+      MIVO_PLATFORM_KEY: mivo_e2e_persist
+      # e2e reset 端点 token(harness 每轮清 PG 残留;与 e2e-persist-smoke.mjs resetToken 同值)。
+      MIVO_E2E_RESET_TOKEN: e2e-reset-token
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node (LTS)
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # server 档纯 HTTP 冒烟:不需 Playwright/不需 npm run build(BFF 用 tsx 直跑 server/index.ts;
+      # /api/* 路由在 serveStatic 之前挂载,冒烟请求命中路由不到 SPA fallback)。
+      - name: Run e2e persist server smoke (--persist=server, PG)
+        run: |
+          set -o pipefail
+          mkdir -p test-artifacts
+          node scripts/e2e-runner.mjs --topology=dev --persist=server 2>&1 | tee test-artifacts/e2e-persist-server.log
+
+      - name: Surface e2e-persist-server result in job summary
+        if: always()
+        run: |
+          {
+            echo '## e2e persist server (--persist=server, PG smoke)'
+            echo ''
+            echo 'A2-S4 Block 5 harness 能力:harness 支持 persist 三模式透传 + server 档 HTTP 冒烟打通(建画布→写入 node→重载 hydrate 校验→reset 清理)。'
+            echo '与 pg-suite 同款 PG service container;纯 HTTP 打 BFF(不打前端/不启 Playwright)。'
+            echo '本块交付 harness 能力,SC 用例是后续块(lead §4)。'
+            echo ''
+            echo '### 冒烟日志(末 30 行)'
+            echo '```'
+            tail -n 30 test-artifacts/e2e-persist-server.log 2>/dev/null || echo '(无日志:可能在 setup 阶段异常,见上方 step 日志)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload failing e2e artifacts
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-persist-server-artifacts
+          path: test-artifacts
+          if-no-files-found: warn
+          retention-days: 14
+

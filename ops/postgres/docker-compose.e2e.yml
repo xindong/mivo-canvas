@@ -1,0 +1,58 @@
+# ops/postgres/docker-compose.e2e.yml
+# A2-S4 Block 5: e2e --persist=server 档本地 PG。
+# 专门用于本地 e2e server 档冒烟(ephemeral,与生产 docker-compose.yml 完全隔离)。
+# 生产 docker-compose.yml 严禁本地 up(见其文件头:bind /AIGC_Group/... + 固定生产网段);
+# 本文件是 e2e 专用,临时起停自由,down -v 即清空。
+#
+# 用法:
+#   docker compose -f ops/postgres/docker-compose.e2e.yml up -d --wait
+#   node scripts/e2e-runner.mjs --topology=dev --persist=server
+#   docker compose -f ops/postgres/docker-compose.e2e.yml down -v
+#
+# 隔离设计(与生产 compose 分离,避免本地 e2e 污染生产数据/网段):
+#  - 端口 55443(避开生产 5432;与 server/persist/pgConfig.ts 注释的本地测试端口 55443 对齐);
+#  - 临时 named volume e2e-pg-data(docker compose down -v 清空,不 bind 生产路径 /AIGC_Group/...);
+#  - container_name mivo-e2e-postgres(不撞生产 mivo-postgres);
+#  - 独立网络 mivo-e2e-pg-net(192.168.229.0/24,与生产 228 段分离);
+#  - 凭据 mivo/mivo-e2e-test(e2e 专用非生产;与 CI pg-suite service container 同模式)。
+# PgPersistBackend 启动自动跑 migrations(ready=migrate-before-warm,见 pgBackend.ts),fresh DB 即用。
+
+services:
+  mivo-e2e-postgres:
+    image: postgres:16-alpine
+    container_name: mivo-e2e-postgres
+    restart: 'no'
+    # 仅绑 127.0.0.1:e2e 本地,不对外。
+    ports:
+      - "127.0.0.1:55443:5432"
+    environment:
+      POSTGRES_USER: mivo
+      POSTGRES_PASSWORD: mivo-e2e-test
+      POSTGRES_DB: mivocanvas
+      TZ: Asia/Shanghai
+    volumes:
+      - e2e-pg-data:/var/lib/postgresql/data
+    shm_size: 64m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mivo -d mivocanvas"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+volumes:
+  e2e-pg-data:
+
+networks:
+  default:
+    name: mivo-e2e-pg-net
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: "192.168.229.0/24"

@@ -12,6 +12,7 @@ import { Hono, type Context } from 'hono'
 import { serveStatic } from '@hono/node-server/serve-static'
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
+import { createHash, timingSafeEqual } from 'node:crypto'
 import { resolveFeatureFlags } from './lib/env'
 import { computeReadiness } from './lib/readiness'
 import type { AppEnv } from './lib/types'
@@ -274,6 +275,34 @@ if (featureFlags.sseProbeEnabled) {
   // Flag off → 404 for the probe path (no SPA index.html for an API path).
   const sseProbeDisabled = (c: Context<AppEnv>) => c.notFound()
   app.all('/api/diag/sse-probe', sseProbeDisabled)
+}
+
+// A2-S4 Block 5: e2e persist harness reset 端点(test-only, fail-closed)。
+// --persist=server 档 e2e 每轮结束清掉测试创建的 project/canvas/asset,不留残留污染下一轮。
+// 仅当 MIVO_E2E_RESET_TOKEN env 设置时挂载(本地 e2e / CI e2e job);生产不设 → 404 stub
+// (防 SPA fallback,同 sse-probe/asset-disabled 模式)。请求须带 x-e2e-reset-token header 匹配
+// (恒时比较防 token 长度泄漏,与 owner.ts ssoHeaderSecretOk 同策略)。调 sharedPersistBackend.__reset()
+// + sharedPermissionBackend.__reset() 清空 owner-scoped 数据(memory 同步 void;PG TRUNCATE persist_records
+// + 权限表)。test-only,绝不入生产 env——生产部署不得设 MIVO_E2E_RESET_TOKEN。
+const e2eResetToken = process.env.MIVO_E2E_RESET_TOKEN
+if (e2eResetToken) {
+  app.post('/api/__e2e/reset', async (c) => {
+    const token = c.req.header('x-e2e-reset-token') ?? ''
+    const expectedDigest = createHash('sha256').update(e2eResetToken).digest()
+    const gotDigest = createHash('sha256').update(token).digest()
+    if (!timingSafeEqual(expectedDigest, gotDigest)) {
+      return c.json({ error: 'forbidden' }, 403)
+    }
+    await Promise.all([
+      sharedPersistBackend.__reset(),
+      sharedPermissionBackend.__reset(),
+    ])
+    return c.json({ ok: true, backend: persistBackendConfig.kind })
+  })
+} else {
+  // Flag off → 404 (no SPA index.html for an API path; mirror asset/sse-probe disabled stubs).
+  const e2eResetDisabled = (c: Context<AppEnv>) => c.notFound()
+  app.all('/api/__e2e/reset', e2eResetDisabled)
 }
 
 // Same-origin static hosting of dist/ (Vite build output). serveStatic only
