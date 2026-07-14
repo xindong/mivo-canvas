@@ -518,20 +518,27 @@ describe('canvasSyncRuntime — Block 3 asset attach/detach side-effects', () =>
     __resetCanvasSyncRuntimeQueue()
   })
 
-  it('A2 SC 特测: wrapMutation(store.undo) → 触发 submitChange(inverse-diff DomainOp;Cmd+Z)', async () => {
+  it('A2 SC 特测(硬化): wrapMutation(store.undo) → undo batch [delete-node(copyId), reorder-children](Cmd+Z)', async () => {
     const { __resetCanvasSyncRuntimeQueue, wrapMutation, submitChange, useCanvasStore } = await loadRuntimeModule()
     const img = imageNode({ id: 'n1', assetUrl: 'mivo-sasset:asset-1' })
     setupSelectedImageNode(useCanvasStore, img)
-    // duplicate 先建 node(push history via patchWithHistory)→ undo 撤销 → wrapMutation snapshot-diff 触发 submitChange。
-    // 注:实测 undo-of-duplicate 的 diff = reorder-children(非朴素 delete-node)——store history/snapshot 语义下
-    //   undo 撤节点序/选择产 reorder diff;本断言钉"wrapMutation(undo) 触发第 2 次 submitChange = 合法 DomainOp"
-    //   (wrap 对 undo 生效),不钉脆弱的 undo-diff kind(那依赖 store history 内部,非本 wrap 接线面)。
+    // 审核官定性:duplicate batch = [create-node(copyId), reorder-children](buildCanvasSyncChanges diff,
+    //   异步串行提交);undo batch = [delete-node(copyId), reorder-children](inverse,副本确删)。
+    //   旧版只等 3 microtask → 断到的"第 2 次 call"实为 duplicate 自己的 reorder(false-positive)。
+    //   硬化:等 duplicate 两条完整提交 → 捕获 copyId → clear mock → wrapped undo → 等 undo batch → 明确断言。
+    const drain = async (): Promise<void> => { for (let i = 0; i < 20; i++) await Promise.resolve() }
     wrapMutation(useCanvasStore.getState().duplicateSelectedNodes)()
-    await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+    await drain() // 等 duplicate batch(create-node + reorder-children)完整提交
+    const createCall = submitChange.mock.calls.find(
+      ([cid, ch]) => cid === 'c1' && (ch as { kind?: string }).kind === 'create-node',
+    )
+    const copyId = (createCall?.[1] as { node?: { id?: string } } | undefined)?.node?.id
+    expect(copyId).toBeTruthy()
+    submitChange.mockClear() // 隔离 duplicate 的 call → 后续全来自 undo batch
     wrapMutation(useCanvasStore.getState().undo)()
-    await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
-    // 1st call = duplicate 的 create-node;2nd call = undo 的 inverse-diff(实测 reorder-children)。
-    expect(submitChange).toHaveBeenNthCalledWith(2, 'c1', expect.objectContaining({ kind: expect.any(String) }))
+    await drain() // 等 undo batch(delete-node + reorder-children)完整提交
+    expect(submitChange).toHaveBeenNthCalledWith(1, 'c1', expect.objectContaining({ kind: 'delete-node', nodeId: copyId }))
+    expect(submitChange).toHaveBeenNthCalledWith(2, 'c1', expect.objectContaining({ kind: 'reorder-children' }))
     __resetCanvasSyncRuntimeQueue()
   })
 })
