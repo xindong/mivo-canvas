@@ -1,5 +1,6 @@
 import { useCallback, useRef, useState, type Dispatch, type PointerEvent as ReactPointerEvent, type RefObject, type SetStateAction } from 'react'
 import { useCanvasStore } from '../store/canvasStore'
+import { wrapMutation } from './actions/canvasSyncRuntime'
 import type { MivoCanvasNode, MarkupKind, MarkupPoint, ToolId } from '../types/mivoCanvas'
 import { nearestConnectorBindingForPoint } from '../model/connectorGeometry'
 import { markupKindForTool } from './canvasToolRegistry'
@@ -555,11 +556,17 @@ export function useTextAnnotation({
       const height = dragged ? Math.max(42, rect.height) : 42
       const x = dragged ? rect.x : textCreation.startX
       const y = dragged ? rect.y : textCreation.startY - defaultTextFontSize
-      const id = addTextNode({ x, y })
-
-      if (dragged) {
-        resizeTextNode(id, x, width, height)
-      }
+      // F1[复审]:create + 条件 resize 包进**同一个** wrapMutation 复合 lambda——after-snapshot 捕获最终几何
+      //   (dragged 时 resize 后的 transform),单条 create-node 带正确尺寸 + textAutoWidth=false。
+      //   旧版(#248)只包 addTextNode,resizeTextNode 在 wrap 边界外裸调 → server 捕获默认几何(96×42+
+      //   textAutoWidth=true),拖拽最终尺寸只留本地 → 刷新/换端 hydrate 几何回退,确定性分叉。
+      const id = wrapMutation(() => {
+        const nodeId = addTextNode({ x, y })
+        if (dragged) {
+          resizeTextNode(nodeId, x, width, height)
+        }
+        return nodeId
+      })()
 
       textCreationRef.current = null
       setTextCreationBox(null)
@@ -581,7 +588,7 @@ export function useTextAnnotation({
       const x = dragged ? rect.x : frameCreation.startX
       const y = dragged ? rect.y : frameCreation.startY
 
-      addFrameNode({ x, y }, { width, height })
+      wrapMutation(addFrameNode)({ x, y }, { width, height })
       frameCreationRef.current = null
       setFrameCreationBox(null)
       setActiveTool('select')
@@ -644,7 +651,7 @@ export function useTextAnnotation({
 
       const isBrush = markupCreation.kind === 'brush'
       const brushStyle = useCanvasStore.getState().brushStyle
-      addMarkupNode(markupCreation.kind, finalPosition, finalSize, {
+      wrapMutation(addMarkupNode)(markupCreation.kind, finalPosition, finalSize, {
         points,
         select: false,
         ...(isBrush
