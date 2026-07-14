@@ -130,17 +130,19 @@ export interface ServerPersistAdapter {
    */
   resolveAsset(assetId: string): Promise<ResolvedAsset | null>
   /**
-   * G1-a P1-2 seam:POST /api/assets/:assetId/attach,body { nodeId } → AttachAssetResult。ownerFp 服务端派生
-   * (client 不传)。节点生命周期调用方属 G1-c(node mutation),本轮只冻结 wire seam。
+   * G1-a P1-2 seam:POST /api/assets/:assetId/attach,body { nodeId, canvasId } → AttachAssetResult。ownerFp 服务端派生
+   * (client 不传)。canvasId required(G2.2/#233 attach 双门 ①:server 验 actor 对 canvas write 权 + node 属该 canvas,
+   * 不信裸 nodeId)。节点生命周期调用方属 G1-c;Block 3 起由 canvasSyncRuntime 在 create-node submitChange 成功后 enqueue。
    * 404(missing asset)→ 抛 HttpError(executor 映射 rejected)。
    */
-  attachAsset(assetId: string, nodeId: string): Promise<AttachAssetResult>
+  attachAsset(assetId: string, nodeId: string, canvasId: string): Promise<AttachAssetResult>
   /**
-   * G1-a P1-2 seam:POST /api/assets/:assetId/detach,body { nodeId } → DetachAssetResult。ownerFp 服务端派生;
-   * 跨 owner detach → 403(owner-mismatch,decidable,不静默)。节点生命周期调用方属 G1-c,本轮只冻结 wire seam。
-   * 404(missing)→ 抛 HttpError(executor 幂等 success)。
+   * G1-a P1-2 seam:POST /api/assets/:assetId/detach,body { nodeId, canvasId } → DetachAssetResult。ownerFp 服务端派生;
+   * 跨 owner detach → 403(owner-mismatch,decidable,不静默)。canvasId for 新 ref composite-key 选择(G2.2/P1-4);
+   * legacy ref(无 canvasId)回退 ownerFp 校验。节点生命周期调用方属 G1-c;Block 3 起由 canvasSyncRuntime 在 delete-node
+   * submitChange 成功后 enqueue。404(missing)→ 抛 HttpError(executor 幂等 success)。
    */
-  detachAsset(assetId: string, nodeId: string): Promise<DetachAssetResult>
+  detachAsset(assetId: string, nodeId: string, canvasId: string): Promise<DetachAssetResult>
 }
 
 /**
@@ -700,26 +702,27 @@ export const createFetchServerPersistAdapter = (opts: FetchAdapterOptions): Serv
         mimeType: res.headers.get('content-type') || 'application/octet-stream',
       }
     },
-    // G1-a P1-2 seam:asset attach/detach wire(节点生命周期调用方属 G1-c,本轮只冻结 wire)。
-    // ownerFp 服务端派生(client 不传);route:200(attached/already-attached)/404(missing)。
-    attachAsset: (assetId, nodeId) =>
+    // G1-a P1-2 seam:asset attach/detach wire。ownerFp 服务端派生(client 不传);
+    // canvasId required(G2.2/#233 attach 双门 ① + detach composite-key 选择);Block 3 起 canvasSyncRuntime enqueue。
+    // route:200(attached/already-attached)/404(missing)。
+    attachAsset: (assetId, nodeId, canvasId) =>
       requestJson<AttachAssetResult>({
         fetch: doFetch,
         baseUrl,
         getAuthHeaders,
         method: 'POST',
         path: `/api/assets/${encodeURIComponent(assetId)}/attach`,
-        body: { nodeId },
+        body: { nodeId, canvasId },
       }),
     // route:200(detached/already-detached)/404(missing)/403(owner-mismatch)。404 由 executor 幂等 success。
-    detachAsset: (assetId, nodeId) =>
+    detachAsset: (assetId, nodeId, canvasId) =>
       requestJson<DetachAssetResult>({
         fetch: doFetch,
         baseUrl,
         getAuthHeaders,
         method: 'POST',
         path: `/api/assets/${encodeURIComponent(assetId)}/detach`,
-        body: { nodeId },
+        body: { nodeId, canvasId },
       }),
   }
 }

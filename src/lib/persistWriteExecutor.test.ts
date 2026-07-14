@@ -6,8 +6,9 @@
 // stub BFF(契约 wire shape)验证成功/冲突/幂等删路径;stub fetch 验证 5xx/401/429/422 + non-HttpError throw。
 // 与 serverPersistAdapter.wiring.test.ts 同款:不 import server 代码(app 项目无 node types;tsc -b 会报 TS2591)。
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { createAdapterWriteExecutor } from './persistWriteExecutor'
+import { debugLogger } from '../store/debugLogStore'
 import type { WriteOp } from './writeRetryQueue'
 
 const KEY_A = 'mivo_aaa_user_a'
@@ -218,22 +219,52 @@ describe('G1-a persistWriteExecutor — 非画布域新 op dispatch(stub BFF)', 
     const exec = createAdapterWriteExecutor({ fetch, baseUrl: '', getAuthHeaders: () => ah() })
     expect(await exec({ kind: 'deleteCanvas', canvasId: 'c-gone' }, 'dc1')).toEqual({ status: 'success' })
   })
-  it('attachAsset → POST /api/assets/:assetId/attach,body {nodeId};404(missing)→ rejected', async () => {
+  it('attachAsset → POST /api/assets/:assetId/attach,body {nodeId,canvasId};404(missing)→ rejected', async () => {
     const { fetch, calls } = captureCalls()
     const exec = createAdapterWriteExecutor({ fetch, baseUrl: '', getAuthHeaders: () => ah() })
-    expect(await exec({ kind: 'attachAsset', assetId: 'a1', nodeId: 'n1' }, 'aa1')).toEqual({ status: 'success' })
-    expect(calls[0]).toMatchObject({ method: 'POST', path: '/api/assets/a1/attach', body: { nodeId: 'n1' } })
+    expect(await exec({ kind: 'attachAsset', canvasId: 'c1', assetId: 'a1', nodeId: 'n1' }, 'aa1')).toEqual({ status: 'success' })
+    expect(calls[0]).toMatchObject({ method: 'POST', path: '/api/assets/a1/attach', body: { nodeId: 'n1', canvasId: 'c1' } })
     // 404 missing asset → rejected(isDelete=false;不能 attach 到不存在的 asset)
     const exec404 = createAdapterWriteExecutor({ fetch: async () => new Response(null, { status: 404 }), baseUrl: '', getAuthHeaders: () => ah() })
-    expect((await exec404({ kind: 'attachAsset', assetId: 'a-missing', nodeId: 'n1' }, 'aa2')).status).toBe('rejected')
+    expect((await exec404({ kind: 'attachAsset', canvasId: 'c1', assetId: 'a-missing', nodeId: 'n1' }, 'aa2')).status).toBe('rejected')
   })
   it('detachAsset → POST /api/assets/:assetId/detach;404 → success(幂等);403 → rejected', async () => {
     const { fetch, calls } = captureCalls(404, null)
     const exec = createAdapterWriteExecutor({ fetch, baseUrl: '', getAuthHeaders: () => ah() })
-    expect(await exec({ kind: 'detachAsset', assetId: 'a1', nodeId: 'n1' }, 'da1')).toEqual({ status: 'success' })
-    expect(calls[0]).toMatchObject({ method: 'POST', path: '/api/assets/a1/detach' })
+    expect(await exec({ kind: 'detachAsset', canvasId: 'c1', assetId: 'a1', nodeId: 'n1' }, 'da1')).toEqual({ status: 'success' })
+    expect(calls[0]).toMatchObject({ method: 'POST', path: '/api/assets/a1/detach', body: { nodeId: 'n1', canvasId: 'c1' } })
     // 403 owner-mismatch → rejected(跨 owner 非法 detach,不静默成功)
     const exec403 = createAdapterWriteExecutor({ fetch: async () => json({ error: 'forbidden' }, 403), baseUrl: '', getAuthHeaders: () => ah() })
-    expect((await exec403({ kind: 'detachAsset', assetId: 'a1', nodeId: 'n1' }, 'da2')).status).toBe('rejected')
+    expect((await exec403({ kind: 'detachAsset', canvasId: 'c1', assetId: 'a1', nodeId: 'n1' }, 'da2')).status).toBe('rejected')
+  })
+
+  // F3: attach/detach 缺 canvasId(旧 durable 记录)→ fail-visible retain。
+  // Block 3 seam 加 required canvasId 前入队的旧 IDB 记录读出 canvasId===undefined;server attach 路由
+  // required canvasId 会 400 → rejected 删记录 → intent 静默丢。廉价防线:executor 拦截 → unsupported-retained
+  // (不发不删,deferred 留存)+ debugLogger.error 记失败路径。不做 migration 推导(canvasId 推不出)。
+  it('F3: attachAsset 缺 canvasId → unsupported-retained,不发请求,debugLogger.error 记失败路径', async () => {
+    const errorSpy = vi.spyOn(debugLogger, 'error').mockImplementation(() => {})
+    const { fetch, calls } = captureCalls()
+    const exec = createAdapterWriteExecutor({ fetch, baseUrl: '', getAuthHeaders: () => ah() })
+    const op = { kind: 'attachAsset', assetId: 'a1', nodeId: 'n1' } as unknown as WriteOp
+    const outcome = await exec(op, 'k-legacy-attach')
+    expect(outcome.status).toBe('unsupported-retained')
+    expect(calls.length).toBe(0)
+    expect(errorSpy).toHaveBeenCalledTimes(1)
+    expect(errorSpy.mock.calls[0][0]).toBe('PersistWriteExecutor')
+    expect(errorSpy.mock.calls[0][1]).toContain('missing canvasId')
+    errorSpy.mockRestore()
+  })
+
+  it('F3: detachAsset 缺 canvasId → unsupported-retained,不发请求', async () => {
+    const errorSpy = vi.spyOn(debugLogger, 'error').mockImplementation(() => {})
+    const { fetch, calls } = captureCalls()
+    const exec = createAdapterWriteExecutor({ fetch, baseUrl: '', getAuthHeaders: () => ah() })
+    const op = { kind: 'detachAsset', assetId: 'a1', nodeId: 'n1' } as unknown as WriteOp
+    const outcome = await exec(op, 'k-legacy-detach')
+    expect(outcome.status).toBe('unsupported-retained')
+    expect(calls.length).toBe(0)
+    expect(errorSpy).toHaveBeenCalled()
+    errorSpy.mockRestore()
   })
 })

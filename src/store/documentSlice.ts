@@ -482,6 +482,10 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
             : replacingSlot || currentSource?.type === 'ai-slot'
               ? 'slot-generation'
               : 'beside-generation'
+        // TODO(T2.2): generate 结果路径不经 wrapMutation,server 模式下 node 不落 server → attach 无对象。
+        // 待 T2.2 deferred-kinds server-wire lane 把 generate node-create 接上 submitChange 后,在 create-node
+        // accepted 后补 enqueueAssetAttach(canvasId, serverAssetIdFromUrl(asset.assetUrl), nodeId)。
+        // Block 3 裁定 OUT,见本 PR 残余风险段。
         const resultNode = createGenerationResultNode({
           id: nodeId,
           title: image.title?.trim() || `Generated image ${index + 1}`,

@@ -208,8 +208,8 @@ export type WriteOp =
   | { kind: 'createCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string }
   | { kind: 'updateCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string; baseRevision?: Revision }
   | { kind: 'deleteCanvas'; canvasId: string }
-  | { kind: 'attachAsset'; assetId: string; nodeId: string }
-  | { kind: 'detachAsset'; assetId: string; nodeId: string }
+  | { kind: 'attachAsset'; canvasId: string; assetId: string; nodeId: string }
+  | { kind: 'detachAsset'; canvasId: string; assetId: string; nodeId: string }
 
 // ── G1-a P1-3:类型拆分——非画布域 op(G1-a executor 只接受这些)──────────────────
 // 画布域写(node/edge/anchor/reorder)不属 G1-a executor 范围(G1-c 挂 N2-0)。chat 已接(DP-6R P1-1 划归
@@ -227,8 +227,8 @@ export type NonCanvasWriteOp =
   | { kind: 'createCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string }
   | { kind: 'updateCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string; baseRevision?: Revision }
   | { kind: 'deleteCanvas'; canvasId: string }
-  | { kind: 'attachAsset'; assetId: string; nodeId: string }
-  | { kind: 'detachAsset'; assetId: string; nodeId: string }
+  | { kind: 'attachAsset'; canvasId: string; assetId: string; nodeId: string }
+  | { kind: 'detachAsset'; canvasId: string; assetId: string; nodeId: string }
   | { kind: 'appendChatMessage'; canvasId: string; message: unknown }
   | { kind: 'updateChatMessage'; canvasId: string; msgId: string; payload: unknown; baseRevision?: Revision }
   | { kind: 'deleteChatMessage'; canvasId: string; msgId: string }
@@ -364,9 +364,9 @@ const computeResourceKey = (op: WriteOp): string | null => {
     case 'deleteCanvas':
       return `canvas:${op.canvasId}`
     case 'attachAsset':
-      return `asset-attach:${op.assetId}:${op.nodeId}`
+      return `asset-attach:${op.assetId}:${op.canvasId}:${op.nodeId}`
     case 'detachAsset':
-      return `asset-detach:${op.assetId}:${op.nodeId}`
+      return `asset-detach:${op.assetId}:${op.canvasId}:${op.nodeId}`
     case 'appendChatMessage':
       // 每条 chat 消息独立 op(message payload 内含唯一 id,但 op 层不 narrow),不 coalesce;
       // 快速连发多条消息各自独立入队(符合 chat 语义——不同消息不该合并)。

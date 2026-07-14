@@ -2277,3 +2277,45 @@ describe('FX-7 / A6 P1-4 — non-retreatable terminal counters (A3 uses counters
     expect((await getWriteQueueTerminalCounters()).counters.evicted).toBe(2)
   })
 })
+
+describe('F2: attach/detach resourceKey 含 canvasId(跨 canvas 不 coalesce)', () => {
+  // Block 3 seam 加 canvasId 后,resourceKey = asset-attach:${assetId}:${canvasId}:${nodeId}。
+  // 跨 canvas 同 asset/node 的两条 op 资源键不同 → 不合并,两条均 pending + drain。
+  // 修前 key 漏 canvasId 会把两条合并成一条,前一条静默丢 → refcount 少 1 → 误 purge。
+  const attachAssetOp = (canvasId: string, assetId: string, nodeId: string): WriteOp => ({ kind: 'attachAsset', canvasId, assetId, nodeId })
+
+  it('跨 canvas 同 asset/node 两条 attachAsset → pendingCount=2,drain 两条均发', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'success' }, { status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue(attachAssetOp('canvas-a', 'asset-1', 'node-1'))
+    await q.enqueue(attachAssetOp('canvas-b', 'asset-1', 'node-1'))
+    expect(await q.pendingCount()).toBe(2)
+    const r = await q.drain()
+    expect(r.processed).toBe(2)
+    expect(r.successes).toBe(2)
+    expect(calls.length).toBe(2)
+    // drain 顺序不保证(nextAttemptAt/createdAt tie 时 stable sort 可能乱),用 canvasId 集合比对。
+    const canvasIds = calls.map((c) => (c.op as { canvasId: string }).canvasId).sort()
+    expect(canvasIds).toEqual(['canvas-a', 'canvas-b'])
+  })
+
+  it('同 canvas 同 asset/node 两条 attachAsset → 资源键相同,coalesce 合并,pendingCount=1,drain 一条', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue(attachAssetOp('canvas-a', 'asset-1', 'node-1'))
+    await q.enqueue(attachAssetOp('canvas-a', 'asset-1', 'node-1'))
+    expect(await q.pendingCount()).toBe(1)
+    await q.drain()
+    expect(calls.length).toBe(1)
+  })
+
+  it('detach 同形:跨 canvas 不合并,两条均 drain', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'success' }, { status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue({ kind: 'detachAsset', canvasId: 'canvas-a', assetId: 'asset-1', nodeId: 'node-1' })
+    await q.enqueue({ kind: 'detachAsset', canvasId: 'canvas-b', assetId: 'asset-1', nodeId: 'node-1' })
+    expect(await q.pendingCount()).toBe(2)
+    await q.drain()
+    expect(calls.length).toBe(2)
+  })
+})
