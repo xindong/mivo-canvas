@@ -606,8 +606,10 @@ jobs:
   # A2-S4 Block 5: e2e persist server 档冒烟 job(--persist=server)。
   # 证明 persist 维度透传落地:BFF server 档连真 PG → 建画布→写入 node→重载 GET hydrate 校验
   # → reset 清理无残留(详见 scripts/e2e-persist-smoke.mjs)。与 pg-suite 同款 PG service container
-  # (非生产凭据 mivo/mivo-e2e-test);纯 HTTP 打 BFF(不打前端/不启 Playwright/不需 npm run build)。
-  # 本块交付 harness 能力(lead §4:不要求 A2 全部七条 SC 用例;SC 用例是后续块)。失败即阻断。
+  # (F2 e2e 专用命名 mivo_e2e/mivocanvas_e2e,与生产硬区隔);纯 HTTP 打 BFF(不打前端/不启 Playwright/不需 npm run build)。
+  # 本块交付 harness 能力(lead §4:不要求 A2 全部七条 SC 用例;SC 用例是后续块)。
+  # F5 注释口径:本 job 当前**非** required check(未注册进 main 分支保护必需 checks);
+  # 失败不自动阻断合并(仅 PR 上可见红)。是否升门为 required 由 lead 另行决策(本 PR 不动分支保护)。
   e2e-persist-server:
     name: e2e persist server (PG smoke)
     if: github.event_name == 'pull_request'
@@ -618,14 +620,14 @@ jobs:
         # PG16(与生产/pg-suite 一致)。service container + healthcheck。
         image: postgres:16
         env:
-          # e2e 专用 superuser + DB;非生产凭据(与 pg-suite 同模式)。
-          POSTGRES_USER: mivo
+          # F2 e2e 专用命名(superuser mivo_e2e + DB mivocanvas_e2e,与生产 mivo/mivocanvas 硬区隔);非生产凭据。
+          POSTGRES_USER: mivo_e2e
           POSTGRES_PASSWORD: mivo-e2e-test
-          POSTGRES_DB: mivocanvas
+          POSTGRES_DB: mivocanvas_e2e
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U mivo -d mivocanvas"
+          --health-cmd "pg_isready -U mivo_e2e -d mivocanvas_e2e"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 10
@@ -634,9 +636,9 @@ jobs:
       # CI service container 监听 5432(本地 docker-compose.e2e.yml 用 55443;CI 用 5432,env 覆盖)。
       MIVO_PG_HOST: 127.0.0.1
       MIVO_PG_PORT: '5432'
-      MIVO_PG_USER: mivo
+      MIVO_PG_USER: mivo_e2e
       MIVO_PG_PASSWORD: mivo-e2e-test
-      MIVO_PG_DB: mivocanvas
+      MIVO_PG_DB: mivocanvas_e2e
       # legacy 模式 actor = fingerprintOfPlatformKey(MIVO_PLATFORM_KEY);e2e 稳定 owner,自归属过 authz。
       MIVO_PLATFORM_KEY: mivo_e2e_persist
       # e2e reset 端点 token(harness 每轮清 PG 残留;与 e2e-persist-smoke.mjs resetToken 同值)。

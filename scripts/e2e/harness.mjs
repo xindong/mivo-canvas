@@ -358,12 +358,58 @@ const spawnBackgroundProcess = (command, args, options) => {
   return child
 }
 
+// A2-S4 Block 5 F2: e2e server 档 PG 专用命名(与生产 mivocanvas/mivo 硬区隔)。
+// harness 默认库名/用户名硬编码 e2e 专用,不接受 process.env 覆盖 DB 名/用户名
+// (MIVO_PG_HOST/PORT/PASSWORD 可覆盖:本地 55443 / CI 5432 / 密码不同;但 DB/USER 硬区隔)。
+const E2E_PG_DB = 'mivocanvas_e2e'
+const E2E_PG_USER = 'mivo_e2e'
+const E2E_PG_PASSWORD_DEFAULT = 'mivo-e2e-test'
+const E2E_BASE_CURSOR_SECRET_DEFAULT = 'e2e-basecursor-secret'
+const E2E_PLATFORM_KEY_DEFAULT = 'mivo_e2e_persist'
+const E2E_RESET_TOKEN_DEFAULT = 'e2e-reset-token'
+
+// F2: server 档 PG fail-fast 白名单校验。harness 启动 BFF 与调 reset 前调用。
+// MIVO_PG_HOST 必须 127.0.0.1/localhost(防连生产远程 PG);MIVO_PG_DB 必须 === mivocanvas_e2e
+// (与生产名 mivocanvas 硬区隔)。不满足 throw(fail-visible,不静默改写/不连生产)。
+// 校验 process.env:若父 shell 设了危险值(如 MIVO_PG_DB=mivocanvas 生产名),直接拒跑。
+export const assertE2ePgWhitelist = () => {
+  const host = process.env.MIVO_PG_HOST ?? '127.0.0.1'
+  const db = process.env.MIVO_PG_DB ?? E2E_PG_DB
+  if (host !== '127.0.0.1' && host !== 'localhost') {
+    throw new Error(
+      `[e2e F2] MIVO_PG_HOST="${host}" 非 127.0.0.1/localhost(fail-visible,防连生产远程 PG)。` +
+      ` server 档只允许本机 PG;用 docker compose -f ops/postgres/docker-compose.e2e.yml 起本地。`,
+    )
+  }
+  if (db !== E2E_PG_DB) {
+    throw new Error(
+      `[e2e F2] MIVO_PG_DB="${db}" 非 "${E2E_PG_DB}"(fail-visible,防连生产同名库 mivocanvas)。` +
+      ` e2e 专用命名与生产硬区隔;本地 PG 库须为 mivocanvas_e2e(重建见 docker-compose.e2e.yml / createdb)。`,
+    )
+  }
+}
+
+// F3: persist/PG/reset 相关 env 键(剥离父 env 串扰)。local/shadow 档 BFF 必须 memory 不连 PG;
+// 父 shell 残留 MIVO_PERSIST_BACKEND=pg / MIVO_PG_* / MIVO_E2E_RESET_TOKEN / MIVO_E2E_HARNESS
+// 会被 ...process.env 带入 → local/shadow 档误连 PG 或挂载 reset 端点。剥离后按 mode 确定性重注。
+const PERSIST_ENV_KEYS = [
+  'VITE_MIVO_PERSIST',
+  'MIVO_PERSIST_BACKEND',
+  'MIVO_PG_HOST', 'MIVO_PG_PORT', 'MIVO_PG_DB', 'MIVO_PG_USER', 'MIVO_PG_PASSWORD',
+  'MIVO_PLATFORM_KEY', 'MIVO_E2E_RESET_TOKEN', 'MIVO_E2E_HARNESS', 'MIVO_BASE_CURSOR_SECRET',
+]
+const stripPersistEnv = (env) => {
+  const out = { ...env }
+  for (const key of PERSIST_ENV_KEYS) delete out[key]
+  return out
+}
+
 export const startSmokeDevServer = ({ port, localAssetFixtureDir, eagleMockPort, bffPort, persistMode = 'local' }) => {
   killStaleDevServer(port)
   return spawnBackgroundProcess(localBin('vite'), ['--host', '127.0.0.1', '--port', String(port), '--strictPort'], {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...stripPersistEnv(process.env),
       MIVO_PORT: String(bffPort),
       MIVO_ASSET_DIR: localAssetFixtureDir,
       MIVO_EAGLE_API_URL: `http://127.0.0.1:${eagleMockPort}`,
@@ -371,10 +417,9 @@ export const startSmokeDevServer = ({ port, localAssetFixtureDir, eagleMockPort,
       // P2-C1b: fast task polling so the progressive /tasks/:id mock (10→30→60→
       // done) completes in ~150ms instead of 3s, keeping chat-generation fast.
       VITE_MIVO_TASK_POLL_INTERVAL_MS: '50',
-      // A2-S4 Block 5: persist 旗标透传给前端(persistMode.ts 读 import.meta.env[VITE_MIVO_PERSIST])。
-      // 仅非 local 注入;local 缺省=默认轨,dev 进程 env 不污染,零行为变化。
-      // shadow=IDB+服务端双写(IDB 仍读源);server=服务端权威(hydrate 从 BFF 拉)。
-      ...(persistMode !== 'local' ? { VITE_MIVO_PERSIST: persistMode } : {}),
+      // F3: 前端 persist 三态永远显式设(含 local;防父 env 残留 VITE_MIVO_PERSIST=server 串扰 local 档)。
+      // persistMode.ts 读 import.meta.env[VITE_MIVO_PERSIST](最高优先级,覆盖 URL ?persist=)。
+      VITE_MIVO_PERSIST: persistMode,
     },
   })
 }
@@ -389,11 +434,13 @@ export const startSmokeBffServer = ({
   enableEagleProxy,
   isPublic = true,
   persistMode = 'local',
-}) =>
-  spawnBackgroundProcess(localBin('tsx'), ['server/index.ts'], {
+}) => {
+  // F2: server 档构造 env 前 fail-fast 白名单校验(防连生产 PG;在 spawn BFF 前)。
+  if (persistMode === 'server') assertE2ePgWhitelist()
+  return spawnBackgroundProcess(localBin('tsx'), ['server/index.ts'], {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...stripPersistEnv(process.env),
       MIVO_PORT: String(port),
       // P1-b: dev stub is now opt-in (MIVO_DEV_AUTH_STUB=1 && non-prod && non-public).
       // e2e local topology (isPublic=false) needs the stub ON so /api/auth/me returns
@@ -415,54 +462,58 @@ export const startSmokeBffServer = ({
       MIVO_LLM_API_KEY: process.env.MIVO_LLM_API_KEY || process.env.MIVO_IMAGE_API_KEY || 'sk_test',
       MIVO_ENABLE_LOCAL_ASSETS: enableLocalAssets ? '1' : '0',
       MIVO_ENABLE_EAGLE_PROXY: enableEagleProxy ? '1' : '0',
-      // A2-S4 Block 5: BaseCursor codec secret(createChild/patchDomainOps 签发 base 用;baseCursor.ts
-      // fail-closed:无 MIVO_BASE_CURSOR_SECRET → encodeBase throw → 500)。e2e BFF 总设(测试 secret);
-      // shadow 档双写 + server 档 HTTP 冒烟均触发 encodeBase,故不条件限 persist 档。生产由 ops 设该 env(部署依赖)。
-      MIVO_BASE_CURSOR_SECRET: process.env.MIVO_BASE_CURSOR_SECRET ?? 'e2e-basecursor-secret',
+      // F3: BaseCursor codec secret(createChild/patchDomainOps 签发 base;baseCursor.ts fail-closed:
+      // 无 secret → encodeBase throw → 500)。shadow 双写 + server HTTP 冒烟均触发 encodeBase,所有档总设。
+      MIVO_BASE_CURSOR_SECRET: process.env.MIVO_BASE_CURSOR_SECRET ?? E2E_BASE_CURSOR_SECRET_DEFAULT,
       ...(upstreamBaseUrl
         ? {
             MIVO_IMAGE_API_BASE: `${upstreamBaseUrl}/v1/images`,
             MIVO_LLM_API_BASE: `${upstreamBaseUrl}/v1`,
           }
         : {}),
-      // A2-S4 Block 5: persist server 档 BFF 连真 PG(本地 docker-compose.e2e.yml / CI service container,
-      // 对齐 pg-suite 做法)。server 档注入:
-      //  - MIVO_PERSIST_BACKEND=pg + MIVO_PG_* → resolvePersistBackendConfig 选 PG backend(server/app.ts
-      //    动态 import PgPersistBackend;缺 MIVO_PG_PASSWORD → 启动即抛 fail visibly,不静默降级 memory)。
-      //  - MIVO_PLATFORM_KEY → legacy 模式 resolveActor = fingerprintOfPlatformKey(key),e2e 稳定 owner,
-      //    自归属过 authz(e2e 不设 MIVO_SSO_STRICT → createSsoStrictProofGate no-op;assertStrictOwnerMigrationComplete
-      //    仅 strict 跑,e2e no-op)。
-      //  - MIVO_E2E_RESET_TOKEN → /api/__e2e/reset 端点挂载,harness 每轮清 PG 残留(防污染下一轮)。
-      // PG 连接参数允许 process.env 覆盖(本地用 55443 避开生产 5432;CI service 用 5432)。
+      // F2/F3: persist env 按 mode 确定性构造(stripPersistEnv 已剥父 env 串扰)。
+      //  - local/shadow: 显式 BFF memory(不注 PG/reset/sentinel → reset 端点三重保险不挂载)。
+      //  - server: 经 F2 白名单 + e2e 专用命名(库/用户硬编码 mivocanvas_e2e/mivo_e2e,与生产硬区隔);
+      //    host/port/password 接受 process.env 覆盖(本地 55443 / CI 5432);MIVO_E2E_HARNESS=1 sentinel
+      //    让 reset 端点三重保险挂载(app.ts isE2eResetEnabled)。MIVO_PLATFORM_KEY → legacy actor 稳定 owner。
       ...(persistMode === 'server'
         ? {
             MIVO_PERSIST_BACKEND: 'pg',
             MIVO_PG_HOST: process.env.MIVO_PG_HOST ?? '127.0.0.1',
             MIVO_PG_PORT: process.env.MIVO_PG_PORT ?? '55443',
-            MIVO_PG_DB: process.env.MIVO_PG_DB ?? 'mivocanvas',
-            MIVO_PG_USER: process.env.MIVO_PG_USER ?? 'mivo',
-            MIVO_PG_PASSWORD: process.env.MIVO_PG_PASSWORD ?? 'mivo-e2e-test',
-            MIVO_PLATFORM_KEY: process.env.MIVO_PLATFORM_KEY ?? 'mivo_e2e_persist',
-            MIVO_E2E_RESET_TOKEN: process.env.MIVO_E2E_RESET_TOKEN ?? 'e2e-reset-token',
+            MIVO_PG_DB: E2E_PG_DB,
+            MIVO_PG_USER: E2E_PG_USER,
+            MIVO_PG_PASSWORD: process.env.MIVO_PG_PASSWORD ?? E2E_PG_PASSWORD_DEFAULT,
+            MIVO_PLATFORM_KEY: process.env.MIVO_PLATFORM_KEY ?? E2E_PLATFORM_KEY_DEFAULT,
+            MIVO_E2E_RESET_TOKEN: process.env.MIVO_E2E_RESET_TOKEN ?? E2E_RESET_TOKEN_DEFAULT,
+            MIVO_E2E_HARNESS: '1',
           }
-        : {}),
+        : {
+            MIVO_PERSIST_BACKEND: 'memory',
+          }),
     },
   })
+}
 
 // A2-S4 Block 5: server 档测试数据清理——每轮结束清掉测试创建的 project/canvas/asset,不留残留污染下一轮。
-// 调 POST /api/__e2e/reset(env-gated,fail-closed;app.ts 仅 MIVO_E2E_RESET_TOKEN 设置时挂载,生产 404 stub)。
+// 调 POST /api/__e2e/reset(app.ts createE2eResetRoute;三重保险挂载:token+sentinel+非生产+非public 任一不满足 → 404)。
 // PG 档 __reset TRUNCATE persist_records + 权限表;memory 档同步清空。local/shadow 档无需 reset(IDB
 // persist 由 clearAllStorage 清浏览器侧;此函数对 404 返 ok=false 不阻断,仅供 server 档 harness 调用)。
+// F2: 调 reset 前再校验白名单(防进程间 env 被改连生产;与启动 BFF 同一校验)。
+// F4: 设计为可重入 + 幂等(reset 端点本身幂等),供 e2e-persist-smoke finally 兜底调用;调用方应 try/catch,
+//   清理失败不吞原始测试错误(见 e2e-persist-smoke.mjs aggregateErrors)。
 //
-// 返回 {ok,backend?}:ok=true 清理成功(backend=memory|pg);ok=false 且 reason 含 'not mounted' = 端点未挂载
-// (local/shadow 档预期);非 404 的失败抛错(fail visibly,不静默吞——server 档 reset 失败须阻断,否则残留污染下一轮)。
+// 返回 {ok,backend?}:ok=true 清理成功;ok=false 且 reason 含 'not mounted' = 端点未挂载(local/shadow 档预期,
+// 三重保险任一不满足);非 404 的失败抛错(fail visibly,不静默吞——server 档 reset 失败须阻断,否则残留污染下一轮)。
 export const resetServerPersist = async (bffBaseUrl, resetToken) => {
+  // F2: 调 reset 前再校验白名单(防进程间 env 被改连生产)。
+  assertE2ePgWhitelist()
   const res = await fetch(`${bffBaseUrl}/api/__e2e/reset`, {
     method: 'POST',
     headers: { 'x-e2e-reset-token': resetToken ?? '' },
   })
   if (res.status === 404) {
-    return { ok: false, reason: 'reset endpoint not mounted (MIVO_E2E_RESET_TOKEN unset; local/shadow 档无需 server reset)' }
+    return { ok: false, reason: 'reset endpoint not mounted (三重保险:token+sentinel+非生产+非public 任一不满足;local/shadow 档无需 server reset)' }
   }
   if (res.status === 403) {
     throw new Error(`resetServerPersist: forbidden (x-e2e-reset-token mismatch; BFF MIVO_E2E_RESET_TOKEN vs harness resetToken)`)

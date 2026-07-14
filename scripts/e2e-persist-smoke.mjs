@@ -10,6 +10,10 @@
 //  2. 写入落 PG + hydrate 从 PG 拉:POST project/canvas/node → GET canvas 重载校验 node 持久;
 //  3. 测试数据清理:reset 清 PG 残留,reset 后 GET canvas → 404(不留残留污染下一轮)。
 //
+// F4: finally 受保护兜底 reset。早期断言失败(如 ④ 建 node 500)会跳过 ⑥ reset → PG 残留污染下一轮;
+//   finally 跟踪 serverReady/cleanupDone,BFF 起成功但 cleanup 没做时兜底 reset。清理失败与原始测试错误
+//   分别保留聚合上报(不互相吞——原始错误在前,清理错误在后,throw 聚合 Error)。
+//
 // 鉴权(legacy 模式,e2e 不设 MIVO_SSO_STRICT → createSsoStrictProofGate no-op;assertStrictOwnerMigrationComplete
 // 仅 strict 跑,e2e no-op):BFF env MIVO_PLATFORM_KEY=mivo_e2e_persist → resolveActor = fingerprintOfPlatformKey(key)
 // 稳定 owner;请求带 X-Mivo-Api-Key: mivo_e2e_persist(合法 mivo_ 前缀,过 rejectInvalidMivoApiKey)→
@@ -50,6 +54,10 @@ const canonicalNodePayload = {
 const { localAssetFixtureDir } = prepareSmokeFixtures()
 
 let server
+// F4: 状态跟踪(serverReady=BFF 起成功可 reset;cleanupDone=reset 已成功)。finally 据此决定是否兜底 reset。
+let serverReady = false
+let cleanupDone = false
+const errors = [] // 聚合错误(原始测试错误在前,清理错误在后;不互相吞)。
 
 try {
   await runCommand('npm', ['run', 'verify:logging'])
@@ -65,10 +73,9 @@ try {
     persistMode: 'server',
   })
   await waitForServer(`${baseUrl}/healthz`)
+  serverReady = true // BFF 起成功 → finally 可兜底 reset
 
   // ── ① persist 维度透传落地校验(fail visibly:server 档必须是 PG durable)──
-  // /healthz 返 {persist:{backend,durable}};server 档 backend=pg durable=true。
-  // 非 pg(memory)说明 MIVO_PERSIST_BACKEND/MIVO_PG_PASSWORD 未注入 → 抛,不静默降级。
   const healthRes = await fetch(`${baseUrl}/healthz`)
   const health = await healthRes.json()
   if (health.persist?.backend !== 'pg' || health.persist?.durable !== true) {
@@ -150,12 +157,13 @@ try {
   console.log(`[e2e-persist-smoke] ⑤ hydrate 校验通过:node ${nodeId} revision=${found.revision} 从 PG 重载`)
 
   // ── ⑥ 测试数据清理:reset 清空 PG(不留残留污染下一轮)──
-  // resetServerPersist 调 POST /api/__e2e/reset;server 档必须 ok=true(端点已挂载)。
+  // resetServerPersist 调 POST /api/__e2e/reset(server 档三重保险已挂载);成功设 cleanupDone=true。
   const resetResult = await resetServerPersist(baseUrl, resetToken)
   if (!resetResult.ok) {
     throw new Error(`server 档 reset 未成功:${resetResult.reason}`)
   }
-  console.log(`[e2e-persist-smoke] ⑥ PG 清理完成 backend=${resetResult.backend}`)
+  cleanupDone = true
+  console.log(`[e2e-persist-smoke] ⑥ PG 清理完成 backend=${resetResult.backend ?? 'pg'}`)
 
   // ── ⑦ reset 无残留校验:GET /api/canvas/:id → 404 unknown-canvas(证明清空,不污染下一轮)──
   const afterResetRes = await fetch(`${baseUrl}/api/canvas/${canvasId}`, { headers: authHeaders })
@@ -167,6 +175,30 @@ try {
   console.log(`[e2e-persist-smoke] ⑦ reset 无残留校验通过:canvas ${canvasId} 已 404`)
 
   console.log('E2E persist server smoke passed')
+} catch (err) {
+  // F4: 原始测试错误在前(不吞);清理错误(若 finally 兜底失败)在后。聚合上报。
+  errors.push(err)
 } finally {
+  // F4: 受保护兜底 reset。BFF 起成功(serverReady)但 cleanup 没做(早期断言失败跳过 ⑥)→ finally 兜底,
+  //   防 PG 残留污染下一轮。清理失败不吞原始错误(分别 push,聚合 throw)。
+  if (serverReady && !cleanupDone) {
+    try {
+      const r = await resetServerPersist(baseUrl, resetToken)
+      if (r.ok) {
+        cleanupDone = true
+        console.log('[e2e-persist-smoke] F4 finally 兜底 reset 成功(早期断言失败后清 PG 残留)')
+      } else {
+        errors.push(new Error(`F4 finally 兜底 reset 未成功:${r.reason}`))
+      }
+    } catch (cleanupErr) {
+      errors.push(new Error(`F4 finally 兜底 reset 失败:${cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)}`))
+    }
+  }
   await stopSmokeDevServer(server)
+}
+
+// F4: 聚合上报。errors 非空 → throw 聚合 Error(原始测试错误 + 清理错误分别保留,不互相吞)。
+if (errors.length > 0) {
+  const messages = errors.map((e, i) => `  [${i + 1}] ${e instanceof Error ? e.message : String(e)}`).join('\n')
+  throw new Error(`e2e-persist-smoke 失败(聚合 ${errors.length} 个错误,原始测试错误在前 + 清理错误在后,不互相吞):\n${messages}`)
 }
