@@ -20,6 +20,8 @@ import {
   classifyHttpStatus,
   isDeleteKind,
   isNonCanvasWriteOp,
+  migrateLegacyOp,
+  type MigratedOp,
   type WriteExecutor,
   type WriteOp,
   type WriteOutcome,
@@ -31,11 +33,117 @@ import type {
   DetachAssetResult,
   Project,
   CanvasMeta,
+  LegacyReplaceRequest,
+  UpsertResponse,
 } from '../../shared/persist-contract.ts'
 
 const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e))
 
 const defaultFetch: FetchLike = (input, init) => fetch(input, init)
+
+/**
+ * F2/F4:legacy-envelope 发送前本地校验**实际发送的 JSON wire**(与 server validateLegacyReplaceRequest
+ *   (domainOp.ts:190-199)逐字同形,不 import server;OUT 边界禁动 server/)。本地非法/腐败 → rejected
+ *   fail-visible(不发送,400 根本轮不到歧义)。本地合法 + 收到 400 → 只剩 gate 关 / server 漂移 →
+ *   gate-blocked 数据保全(见 classifyLegacyDrain)。
+ *
+ * F4 修(与 server 等价,消两类漂移):
+ *  1. **校验 wire 形态,非原对象**:先 JSON.stringify(env)(触发 toJSON + 检测循环引用/BigInt,失败 →
+ *     rejected)→ JSON.parse 回来,对 **round-tripped 对象**跑校验(即 server 将收到的形态)。防 toJSON 漂移
+ *     (payload=new Date(0) 本地 object 放行 → JSON 化变 string → server 400 → 被 F2 归 gate-blocked 永久重发)。
+ *  2. **整数规则逐字同 server**:Number.isInteger && >= 0(非 isSafeInteger——MAX_SAFE_INTEGER+1 时 server 收、
+ *     client 拒会判定分裂)。
+ *  3. 循环引用/BigInt → stringify 抛 → rejected(0 fetch,不落外层 transient)。
+ * 返回 round-tripped wire 供发送(防对原 env 二次 stringify 致 toJSON 二次漂移)。
+ * scope 在 client 侧平凡(path 从 env.canvasId/nodeId 构造,primitive 无 toJSON,round-trip 不变)。
+ */
+const validateLegacyEnvelopeLocal = (
+  env: LegacyReplaceRequest,
+): { ok: true; wire: Record<string, unknown> } | { ok: false; reason: string } => {
+  let wireStr: string
+  try {
+    wireStr = JSON.stringify(env) // 触发 toJSON(若有)+ 检测循环引用/BigInt(抛 → rejected,非 transient)
+  } catch (e) {
+    return { ok: false, reason: `envelope not serializable (cycle/BigInt?): ${msg(e)}` }
+  }
+  let wire: unknown
+  try {
+    wire = JSON.parse(wireStr) // round-trip:parse 回来的 plain object(无 toJSON),即 server 将收到的形态
+  } catch {
+    return { ok: false, reason: 'envelope wire not parseable' }
+  }
+  if (wire == null || typeof wire !== 'object' || Array.isArray(wire)) return { ok: false, reason: 'legacy-replace must be object' }
+  const e = wire as Record<string, unknown>
+  if (e.kind !== 'legacy-replace') return { ok: false, reason: 'kind must be legacy-replace' }
+  if (typeof e.canvasId !== 'string' || !e.canvasId) return { ok: false, reason: 'canvasId required' }
+  if (typeof e.nodeId !== 'string' || !e.nodeId) return { ok: false, reason: 'nodeId required' }
+  if (e.version !== 1) return { ok: false, reason: 'version must be 1' }
+  if (e.payload == null || typeof e.payload !== 'object' || Array.isArray(e.payload)) return { ok: false, reason: 'payload required' }
+  // 整数规则与 server 逐字相同(domainOp.ts:198):Number.isInteger && >= 0(非 isSafeInteger)
+  if (typeof e.baseRevision !== 'number' || !Number.isInteger(e.baseRevision) || (e.baseRevision as number) < 0) return { ok: false, reason: 'baseRevision must be non-negative integer' }
+  return { ok: true, wire: e }
+}
+
+/**
+ * A2-S4 Block 4:§14.3 legacy drain 状态码分类(**不走通用 classifyHttpStatus**)。
+ *
+ * 为何独立分类(而非复用 classifyHttpStatus):
+ *  1. **envelope 400 → gate-blocked(数据保全,非 terminal)**:drainMigrated 发送前 validateLegacyEnvelopeLocal
+ *     已校验 envelope 合法 → 收到 400 不可能是 payload-rejection(那需 envelope 非法,本地已拒不发送)→ 只剩
+ *     gate 关(LEGACY_DRAIN env 默认关,canvas.ts:544)或 server 漂移 → 都不该丢数据 → gate-blocked(drain 标
+ *     gate-blocked + gateAttempts 独立退避,不消耗 maxAttempts、无紧循环;gate 开后重 drain 出队,见
+ *     writeRetryQueue drain gate-blocked case)。全等匹配 `error==='bad-request' && message==='legacy drain gate closed'`
+ *     (非 includes,防相似文本误判)作诊断区分 gate-closed vs server-drift。
+ *  2. **legacy 409 → rejected dead-letter(非 conflict)**:legacy-stale-conflict / reorder-conflict /
+ *     delete-race 的 409 一律 terminal rejected(不触发 onConflict 自动 rebase——legacy 记录的
+ *     refetch+resubmit 是 G1-c 的活,本 block 只 surface dead-letter fail-visible)。
+ *
+ * 权威:server/routes/canvas.ts legacyDrainEnvelope(L521-579,200/409/400-gate/400-scope/403/404/422)+
+ *   deleteChildCascadeHandler(L728-781,200/404/409/428)+ reorder(L447-513,200/400/409/428)。
+ * fail-visible:terminal/rejected 由 drain switch 经 recordTerminal + debugLogger.error + toast 留痕
+ *   (docs/development-logging.md),executor 只返 outcome;gate-blocked 由 drain debugLogger.warn(数据保全)。
+ */
+const classifyLegacyDrain = (
+  status: number,
+  body: unknown,
+  path: 'envelope' | 'delete' | 'reorder',
+): WriteOutcome => {
+  if (status >= 200 && status < 300) return { status: 'success' }
+  if (status === 401) return { status: 'unauthorized' }
+  if (status === 409) {
+    // legacy-stale-conflict(envelope)/ reorder revision-conflict / delete-race → terminal dead-letter(fail-visible)
+    return { status: 'rejected', body }
+  }
+  if (status === 400) {
+    if (path === 'envelope') {
+      // F2:drainMigrated 发送前已 validateLegacyEnvelopeLocal 校验 envelope 合法 → 400 不可能是
+      //   payload-rejection(那需 envelope 非法,本地已拒不发送)→ 只剩 gate 关 / server 漂移 → 数据保全
+      //   gate-blocked(不丢数据)。全等匹配 gate-closed 作诊断区分(非 includes,防相似文本误判)。
+      const b = body as { error?: string; message?: string }
+      const gateClosed = b?.error === 'bad-request' && b?.message === 'legacy drain gate closed'
+      return {
+        status: 'gate-blocked',
+        message: gateClosed
+          ? 'legacy drain gate closed (LEGACY_DRAIN off)'
+          : `legacy-envelope 400 post-local-validate (server drift?): ${JSON.stringify(body).slice(0, 160)}`,
+      }
+    }
+    // delete/reorder 400 = 真实 payload 问题(delete bad base cursor / reorder bad-orderedIds)→ rejected terminal
+    return { status: 'rejected', body }
+  }
+  if (status === 403) return { status: 'rejected', body } // authz deny terminal
+  if (status === 404) {
+    if (path === 'delete') return { status: 'success' } // idempotent(已删 / cross-canvas —— delete 意图已满足)
+    return { status: 'rejected', body } // unknown-node / cross-canvas(envelope/reorder)→ terminal
+  }
+  if (status === 422) {
+    const b = body as { key?: string }
+    return { status: 'reuse-conflict', key: typeof b?.key === 'string' ? b.key : '' }
+  }
+  if (status === 428) return { status: 'rejected', body } // delete 缺 BaseCursor / reorder 缺 base → terminal fail-visible
+  if (status >= 500 || status === 408 || status === 429) return { status: 'transient', message: `http_${status}` }
+  return { status: 'terminal', message: `http_${status}` }
+}
 
 /**
  * 造一个 WriteExecutor(队列 drain 用)。opts 与 createFetchServerPersistAdapter 同源
@@ -47,9 +155,100 @@ export const createAdapterWriteExecutor = (opts: FetchAdapterOptions): WriteExec
   const getAuthHeaders: GetAuthHeaders = opts.getAuthHeaders
   const base = { fetch: doFetch, baseUrl, getAuthHeaders }
 
+  /**
+   * A2-S4 Block 4:drain 迁移产物(三路真发 server,§14.3 drain-only 兼容通道)。
+   * 闭包 `base`(同 createFetchServerPersistAdapter 的 fetch/baseUrl/auth),保证直接写与重试写走同一 BFF。
+   * HttpError → classifyLegacyDrain(gate-off 400 retained / 409 dead-letter / 其余按 path 分类);
+   * 非 HTTP throw → transient(带 backoff 重试,同主 switch 约定)。
+   */
+  const drainMigrated = async (migrated: MigratedOp, idempotencyKey: string): Promise<WriteOutcome> => {
+    let path: 'envelope' | 'delete' | 'reorder' = 'envelope'
+    try {
+      switch (migrated.kind) {
+        case 'legacy-envelope': {
+          path = 'envelope'
+          const env = migrated.envelope
+          // F2/F4:校验实际发送的 JSON wire(stringify→parse round-trip,server 等价规则 isInteger 非 isSafeInteger)。
+          //   本地非法/腐败(含 toJSON 漂移 / 循环引用 / BigInt / 整数超界)→ rejected fail-visible(0 fetch,400 根本轮不到歧义)。
+          //   本地合法 + 收到 400 → gate-blocked(数据保全,见 classifyLegacyDrain envelope-400)。
+          const v = validateLegacyEnvelopeLocal(env)
+          if (!v.ok) return { status: 'rejected', body: { error: 'bad-request', message: v.reason } }
+          // PATCH /api/canvas/:canvasId/nodes/:nodeId,body = round-tripped wire(v.wire,非原 env——防 toJSON 二次漂移);
+          //   baseRevision 在信封内(**非 If-Match header**);§14.3 decoder wire:gate 关→400 / scope mismatch→400 /
+          //   stale base→409 legacy-stale-conflict / fresh(existing+base=rev / missing+base=0→create)→200 replace。
+          const result = await requestJson<UpsertResponse>({
+            ...base,
+            method: 'PATCH',
+            path: `/api/canvas/${encodeURIComponent(env.canvasId)}/nodes/${encodeURIComponent(env.nodeId)}`,
+            body: v.wire,
+            idempotencyKey,
+          })
+          // 回捕 revision(UpsertResponse{id,revision,seq}),drain 经 onSuccess 回灌 store 下一次 strict
+          //   update 用 fresh base(同 createProject/createCanvas 模式;若上层未接 upsertNode onSuccess 则 no-op)。
+          return { status: 'success', revision: result.revision }
+        }
+        case 'delete': {
+          const cmd = migrated.cmd
+          // 仅 node-delete-cascade 经 §10.4 实证(§14.5);group-reparent/result-asset-attach 非本迁移产物,
+          //   防御性返 unsupported-retained(不应发生;migrateLegacyOp 只产 node-delete-cascade)。
+          if (cmd.kind !== 'node-delete-cascade') {
+            return {
+              status: 'unsupported-retained',
+              message: `legacy delete cmd ${cmd.kind} not wired; record retained`,
+            }
+          }
+          path = 'delete'
+          // DELETE /api/canvas/:canvasId/nodes/:nodeId(§10.4 cascade)。**队列 deleteNode op 无 base 字段**,
+          //   server deleteChildCascadeHandler 要求 If-Match=签名 BaseCursor(canvas.ts:748 decodeBase),
+          //   missing→428 / bare→400。legacy delete 无法提供签名 base → server 返 428 → classifyLegacyDrain
+          //   分类 rejected terminal(fail-visible:drain recordTerminal 留痕 + debugLogger.error + toast,
+          //   不静默丢;一发即终态,不重试不 busy-loop)。legacy delete 缺 base 无法安全 drain,需 G1-c base
+          //   获取或新路径重删——本 block 只 surface fail-visible(lead 裁定 1:不做半截/不接受永远 deferred,
+          //   428 terminal 是 definitive fail-visible 非"悬空 deferred")。
+          await requestJson({
+            ...base,
+            method: 'DELETE',
+            path: `/api/canvas/${encodeURIComponent(cmd.canvasId)}/nodes/${encodeURIComponent(cmd.nodeId)}`,
+            idempotencyKey,
+          })
+          return { status: 'success' }
+        }
+        case 'reorder': {
+          path = 'reorder'
+          const r = migrated
+          // POST /api/canvas/:canvasId/reorder,body {type, orderedIds},If-Match = bare contentVersion
+          //   (parseIfMatch 路径,非 decodeBase——reorder 端点收 bare revision)。队列 reorderChildren
+          //   .baseContentVersion 是必填 bare Revision → If-Match 有值,428 不会发生。
+          //   200→success / 400 bad-orderedIds→rejected / 409 revision-conflict→rejected dead-letter。
+          await requestJson({
+            ...base,
+            method: 'POST',
+            path: `/api/canvas/${encodeURIComponent(r.canvasId)}/reorder`,
+            body: { type: r.childType, orderedIds: r.orderedIds },
+            ifMatch: r.baseContentVersion,
+            idempotencyKey,
+          })
+          // reorder 200 响应 {reordered,contentVersion,base}——无 per-record revision,onSuccess 不回灌(跳过)。
+          return { status: 'success' }
+        }
+      }
+    } catch (error) {
+      if (error instanceof HttpError) return classifyLegacyDrain(error.status, error.body, path)
+      return { status: 'transient', message: `executor threw: ${msg(error)}` }
+    }
+  }
+
   const exec: WriteExecutor = async (op, idempotencyKey) => {
+    // A2-S4 Block 4:旧队列画布域写(upsertNode/deleteNode/reorderChildren)→ §14.3 迁移信封,真发 server。
+    //   迁移在 drain 时内存计算(IDB pristine,不写回);非三类 kind 返 null → 落下面 unsupported-retained /
+    //   wired 路径(新格式记录零影响)。migrateLegacyOp 不 throw(生产 null 表 passthrough)。
+    const migrated = migrateLegacyOp(op)
+    if (migrated !== null) return drainMigrated(migrated, idempotencyKey)
+
     // G1-a P1-3:canvas/chat op 不在 G1-a executor 支持范围 → unsupported-retained(留存不删)。
     // 防御性:绝不返 terminal(否则 drain deleteWrite 永久删 G1-c/DP-6R 上线前的遗留 durable 记录)。
+    // 注:三类 legacy 画布域 op(upsertNode/deleteNode/reorderChildren)已被上面 migrateLegacyOp 接走,
+    //   这里只命中非三类画布域 op(upsertEdge/upsertAnchor/deleteEdge/deleteAnchor)→ retained 等 G1-c。
     if (!isNonCanvasWriteOp(op)) {
       return {
         status: 'unsupported-retained',
