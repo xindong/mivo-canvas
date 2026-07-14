@@ -22,7 +22,14 @@
 // error). Never silently drop a write. Terminal records are deleted after surfacing
 // (debugLogStore is the audit trail; IDB must not grow unbounded).
 
-import type { AnchorPayload, EdgePayload, NodePayload, Revision } from '../../shared/persist-contract.ts'
+import type {
+  AnchorPayload,
+  EdgePayload,
+  LegacyReplaceRequest,
+  NodePayload,
+  Revision,
+  ServerInvariantCommand,
+} from '../../shared/persist-contract.ts'
 import {
   isUserStateKeyForbidden,
   scanForSensitiveFields,
@@ -259,6 +266,104 @@ const NON_CANVAS_KINDS: ReadonlySet<WriteOpKind> = new Set<WriteOpKind>([
 export const isNonCanvasWriteOp = (op: WriteOp): op is NonCanvasWriteOp =>
   NON_CANVAS_KINDS.has(op.kind)
 
+// ── A2-S4 Block 4:FX-5 队列 migration-on-read(n20 §14.3 + spike migrateWriteOp)──────────
+// 旧队列残留的画布域写(upsertNode/deleteNode/reorderChildren — 全量 upsert 时代代入队、DomainOp
+// cutover 后尚未 drain)在 executor 侧 drain 时迁移为新契约信封,走 §14.3 drain-only 兼容通道——
+// 保证契约切换后旧队列残留**不会以旧格式重放失败、更不会静默丢弃**(fail-visible 硬要求,
+// docs/development-logging.md)。新格式记录(非画布域 op / DomainOp)零影响:migrateLegacyOp 返
+// null → executor 走原 isNonCanvasWriteOp → unsupported-retained / wired 路径,行为不变。
+//
+// 权威来源:
+//  - docs/decisions/n20-truth-source-decision.md §14.3(行 36-46)+ §1.2 cutover 状态表 row 2(行 168)
+//  - src/kernel/__spike__/n20-truth-source.spike.test.ts migrateWriteOp(L2300-2312,契约蓝本)
+//  - server §14.3 已就位(#239):server/routes/canvas.ts legacyDrainEnvelope(L521-579)+
+//    deleteChildCascadeHandler(L728-781)+ reorder(L447-513)、server/lib/legacyDrainGate.ts(env
+//    LEGACY_DRAIN 默认关)、server/lib/domainOp.ts validateLegacyReplaceRequest。
+//
+// 设计(lead 裁定 2026-07-14):迁移在 executor 侧 drain 时**内存计算**(IDB pristine,不写回,
+// 每次 drain 重算,契合 spike 纯函数);MigratedOp 是 queue→executor 内部 seam 类型,**不进 WriteOp
+// union**,QueuedWrite 不加 version 字段。三路映射照 spike 语义:upsertNode→legacy-envelope /
+// deleteNode→node-delete-cascade / reorderChildren→DomainOp reorder。非三类 kind(upsertEdge/
+// upsertAnchor/deleteEdge/deleteAnchor 等)返 null → executor 走原 unsupported-retained 路径(留存不删,
+// 等 G1-c)——**不 throw 进生产路径**(与 spike 的 `throw 'not in 3 classes'` 不同:生产用 null
+// 表 passthrough,避免异常污染 drain 循环)。
+//
+// 迁移函数本身失败(意外 kind/缺字段)→ fail-visible,不静默跳过:三类 kind 字段皆 TS 必填,
+// 结构性失败不会发生;若 IDB 腐败致字段缺失,server §14.3 decoder 返 400 payload-rejected →
+// executor 分类 rejected terminal(drain recordTerminal 留痕 + debugLogger.error + toast,
+// fail-visible,不静默跳过)。
+
+/**
+ * FX-5 队列迁移产物(queue→executor 内部 seam;**不进 WriteOp union,不持久化**)。镜像 spike
+ * `migrateWriteOp` 三路语义,扩为携带 executor 真发 server 所需字段(spike 的 reorder/delete
+ * 最小形态不含 canvasId/type/base,生产端点需要——lead:具体端点以 server/routes 代码现实为准)。
+ *
+ * - `legacy-envelope`:upsertNode → `{kind:'legacy-replace',canvasId,nodeId,version:1,payload,
+ *   baseRevision ?? 0}`;PATCH /:id/nodes/:nodeId 复用 decoder wire(§14.3 四态:existing+base=rev→200
+ *   replace / existing+base≠rev→409 stale / missing+base>0→409 dead-letter / missing+base=0→create fresh)。
+ * - `delete`:deleteNode → `{kind:'node-delete-cascade',canvasId,nodeId}` ServerInvariantCommand(§10.4)。
+ * - `reorder`:reorderChildren → POST /:id/reorder,body {type,orderedIds},If-Match = bare contentVersion
+ *   (parseIfMatch 路径,非 decodeBase)。
+ */
+export type MigratedOp =
+  | { kind: 'legacy-envelope'; envelope: LegacyReplaceRequest }
+  | { kind: 'delete'; cmd: ServerInvariantCommand }
+  | {
+      kind: 'reorder'
+      canvasId: string
+      childType: 'node' | 'edge' | 'anchor'
+      orderedIds: string[]
+      baseContentVersion: Revision
+    }
+
+/**
+ * 旧队列画布域写 → §14.3 迁移信封(**纯函数,drain 时内存计算**,不持久化、不写回 IDB)。
+ *
+ * - upsertNode → legacy-envelope;baseRevision 缺省(`?? 0`)→ server 走 `missing+base=0→create fresh`
+ *   (§14.3 四态,baseRevision 在信封内非 If-Match header)。
+ * - deleteNode → node-delete-cascade ServerInvariantCommand(§10.4)。
+ * - reorderChildren → reorder MigratedOp(携带 canvasId/childType/orderedIds/baseContentVersion,
+ *   executor 发 POST /:id/reorder 走 DomainOp reorder wire)。
+ * - 其余 kind(含 upsertEdge/upsertAnchor/deleteEdge/deleteAnchor 等非三类画布域 op)→ **null**
+ *   (executor 走原 isNonCanvasWriteOp → unsupported-retained,留存不删,等 G1-c)。
+ *
+ * 不 throw:与 spike 的 `throw 'not in 3 classes'` 不同——生产用 null 表 passthrough,避免异常
+ * 污染 drain 循环(lead 裁定 2:不 throw 进生产路径)。迁移函数结构性失败不会发生(三类 kind 字段
+ * 皆 TS 必填);IDB 腐败致字段缺失时,server §14.3 decoder 400 payload-rejected → rejected
+ * terminal(fail-visible,不静默跳过)。
+ */
+export const migrateLegacyOp = (op: WriteOp): MigratedOp | null => {
+  switch (op.kind) {
+    case 'upsertNode':
+      return {
+        kind: 'legacy-envelope',
+        envelope: {
+          kind: 'legacy-replace',
+          canvasId: op.canvasId,
+          nodeId: op.nodeId,
+          version: 1,
+          payload: op.payload,
+          baseRevision: op.baseRevision ?? 0,
+        },
+      }
+    case 'deleteNode':
+      return { kind: 'delete', cmd: { kind: 'node-delete-cascade', canvasId: op.canvasId, nodeId: op.nodeId } }
+    case 'reorderChildren':
+      // chat-message reorder 是 per-actor(DP-6R:orderRevision base + actor owner,非共享 contentVersion),
+      // 不属 §14.3 legacy 画布域 drain 通道(canvas.ts:601 legacy-replace "nodes only")→ null,留存给 DP-6R。
+      if (op.type === 'chat-message') return null
+      return {
+        kind: 'reorder',
+        canvasId: op.canvasId,
+        childType: op.type,
+        orderedIds: op.orderedIds,
+        baseContentVersion: op.baseContentVersion,
+      }
+    default:
+      return null
+  }
+}
+
 // ── Persisted record + state machine ──
 
 export type WriteStatus =
@@ -266,9 +371,13 @@ export type WriteStatus =
   | 'in-flight' // executor currently running
   | 'paused-401' // got 401; queue paused; kept for re-login replay
   | 'deferred' // G1-a P1-3:unsupported op(canvas/chat)留存,等 executor 升级(G1-c/DP-6R)再 drain
+  | 'gate-blocked' // F1:legacy-envelope drain 撞 gate-off 400(LEGACY_DRAIN 关)→ 可重试保留(gateAttempts 独立退避,不消耗 maxAttempts、无紧循环),gate 开后重 drain 出队
 // Terminal statuses are deleted immediately after surfacing (not stored long-term):
 // success / conflict / too-large / rejected / reuse-conflict / dead-letter.
 // `deferred` is NOT terminal — the record is retained (not deleted) so G1-c/DP-6R can upgrade + replay.
+// `gate-blocked` is NOT terminal — retained + retried with bounded backoff (never dead-letters; gate may
+//   stay off until cutover opens it, then the next backoff-elapsed drain succeeds). F1:三类 legacy deferred
+//   记录由 drain recovery pass 定向 flip 回 pending(见 drain);非三类 deferred 继续 deferred 等 G1-c。
 
 export type QueuedWrite = {
   id: string
@@ -282,6 +391,8 @@ export type QueuedWrite = {
   status: WriteStatus
   lastError?: string
   lastAttemptAt?: number
+  /** F1:gate-blocked 退避计数(独立于 attempts/maxAttempts;旧 IDB 记录无此字段 → undefined → 0)。 */
+  gateAttempts?: number
 }
 
 // ── Executor seam (T1.3 plugs the real fetch here) + outcome classification ──
@@ -296,6 +407,7 @@ export type WriteOutcome =
   | { status: 'transient'; message: string }
   | { status: 'terminal'; message: string }
   | { status: 'unsupported-retained'; message: string }
+  | { status: 'gate-blocked'; message: string }
 
 export type WriteExecutor = (op: WriteOp, idempotencyKey: string) => Promise<WriteOutcome>
 
@@ -1541,6 +1653,18 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
           r.lastError = 'recovered in-flight'
           changed = true
         }
+        // F1:定向再激活——历史 deferred 的三类 legacy op(upsertNode/deleteNode/reorderChildren;G1-a
+        //   时代被 unsupported-retained→deferred)→ 本 Block 4 executor 已升级(migrate+drain §14.3),
+        //   flip 回 pending 可 drain。**禁止 blanket**:非三类 deferred(upsertEdge/attachAsset/
+        //   detachAsset 等,含 #244 缺 canvasId 的 asset op 形态)continue deferred(等各自升级)——
+        //   migrateLegacyOp 对非三类返 null,天然不 flip。
+        if (r.status === 'deferred' && r.userId === userId && migrateLegacyOp(r.op) !== null) {
+          r.status = 'pending'
+          r.nextAttemptAt = ts
+          r.lastError = 'reactivated (Block 4 §14.3 migration-on-read)'
+          r.gateAttempts = 0
+          changed = true
+        }
         if (changed) {
           await putWrite(r)
           recovered++
@@ -1553,7 +1677,7 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
         .filter(
           (r) =>
             r.userId === userId &&
-            (r.status === 'pending' || r.status === 'paused-401') &&
+            (r.status === 'pending' || r.status === 'paused-401' || r.status === 'gate-blocked') &&
             r.nextAttemptAt <= ts,
         )
 
@@ -1705,10 +1829,11 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
             toastFeedback.info('登录已过期,重新登录后将自动重试未保存的改动。')
             break
           case 'unsupported-retained': {
-            // G1-a P1-3:canvas/chat op 当前 executor 不支持(G1-c 挂 N2-0 / DP-6R 另一 worker)。
-            // 绝不 deleteWrite(否则 G1-c/DP-6R 上线前遗留的 durable 记录被不可恢复删除);
-            // 标 deferred 留存 —— 不发请求(deferred 不在 due 过滤的 pending|paused-401 内,下次 drain 不再取出),
-            // 等 executor 升级后由 G1-c/DP-6R 显式 flip deferred→pending 再 drain。
+            // G1-a P1-3:非三类 canvas op(upsertEdge/upsertAnchor/deleteEdge/deleteAnchor 等)+ chat 未支持
+            //   op 当前 executor 不支持(G1-c 挂 N2-0 / DP-6R 另一 worker)。绝不 deleteWrite(否则遗留 durable
+            //   记录被不可恢复删除);标 deferred 留存(deferred 不在 due 过滤内,下次 drain 不再取出)。
+            //   注:三类 legacy op(upsertNode/deleteNode/reorderChildren)已迁 §14.3 不再走此分支——其历史
+            //   deferred 由 drain recovery pass 定向 flip 回 pending(migrateLegacyOp(op)!==null)。
             rec.status = 'deferred'
             rec.lastError = outcome.message
             await putWrite(rec)
@@ -1716,6 +1841,25 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
               SOURCE,
               `write ${rec.id} (${rec.resourceKey ?? rec.op.kind}) deferred — unsupported op retained for executor upgrade: ${outcome.message}`,
             )
+            break
+          }
+          case 'gate-blocked': {
+            // F1:legacy-envelope drain 撞 gate-off 400(LEGACY_DRAIN 关)。可重试保留:gateAttempts 独立退避
+            //   (复用 backoffDelay,60s cap;不消耗 maxAttempts、无紧循环);gate 开后下次退避到期重 drain →
+            //   200 success 出队。永不 dead-letter(gate 可能很久才开 / retirement 后永关;那时 legacy 记录应已
+            //   drain 完)。不 deleteWrite(数据保全)。finalized=false(sidecar 保持置位)。
+            const ga = (rec.gateAttempts ?? 0) + 1
+            const delay = backoffDelay(ga, baseDelay, maxDelay, rand)
+            rec.gateAttempts = ga
+            rec.status = 'gate-blocked'
+            rec.nextAttemptAt = now() + delay
+            rec.lastError = outcome.message
+            await putWrite(rec)
+            debugLogger.warn(
+              SOURCE,
+              `write ${rec.id} (${rec.resourceKey ?? rec.op.kind}) gate-blocked (LEGACY_DRAIN off); retry in ${delay}ms (gate-attempt ${ga}): ${outcome.message}`,
+            )
+            failures++
             break
           }
         }
@@ -1804,7 +1948,8 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
     const all = await getAllWrites()
     return all.filter(
       (r) =>
-        r.userId === userId && (r.status === 'pending' || r.status === 'paused-401' || r.status === 'in-flight'),
+        r.userId === userId &&
+        (r.status === 'pending' || r.status === 'paused-401' || r.status === 'in-flight' || r.status === 'gate-blocked'),
     ).length
   }
 
