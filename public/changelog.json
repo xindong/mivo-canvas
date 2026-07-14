@@ -1,7 +1,78 @@
 {
-  "lastGithash": "bf30d2d7f26cc11be2bcc619c167198c22754cc8",
-  "updatedAt": "2026-07-13T08:49:35+08:00",
+  "lastGithash": "1b2849913d41df43a2740d395d0ee224193d8bdd",
+  "updatedAt": "2026-07-14T19:37:42+08:00",
   "entries": [
+    {
+      "date": "2026-07-14",
+      "prs": [
+        243,
+        244,
+        245,
+        246,
+        247,
+        248
+      ],
+      "features": [
+        {
+          "text": "自动化测试框架扩容支持三模式存储 + 服务端冒烟打通",
+          "by": "PraiseZhu"
+        },
+        {
+          "text": "素材 attach/detach 客户端接线（画布资产引用同步）",
+          "by": "PraiseZhu"
+        },
+        {
+          "text": "写失败重试队列 migration-on-read：旧全量 upsert 残留走 §14.3 兼容通道",
+          "by": "PraiseZhu"
+        },
+        {
+          "text": "快捷键/全局事件 mutation 全量接入 wrapMutation 同步（undo/redo/cut/group/箭头等 9 位点）",
+          "by": "PraiseZhu"
+        },
+        {
+          "text": "指针交互 mutation 接入 wrapMutation 同步（brush stamp 放置）",
+          "by": "PraiseZhu"
+        },
+        {
+          "text": "别名形态 mutation 接入 wrapMutation 同步（取 action 存变量的 6 位点）",
+          "by": "PraiseZhu"
+        }
+      ],
+      "fixes": []
+    },
+    {
+      "date": "2026-07-13",
+      "prs": [
+        237,
+        239,
+        240,
+        241,
+        242
+      ],
+      "features": [
+        {
+          "text": "画布删除/恢复对齐软删语义；离线 chat 消息上线刷新不再消失",
+          "by": "PraiseZhu"
+        },
+        {
+          "text": "服务端新增 DomainOp 字段级写契约 + BaseCursor 游标",
+          "by": "PraiseZhu"
+        },
+        {
+          "text": "画布传输客户端接线：7 个写口真发服务端 + hydrate 签发 base/bundle",
+          "by": "PraiseZhu"
+        },
+        {
+          "text": "画布 submitChange 写路径通电：CanvasCommand 驱动 server persist + fail-visible",
+          "by": "PraiseZhu"
+        },
+        {
+          "text": "剩余 5 个 emitter 迁 CanvasCommand，27/27 画布动作全走命令总线",
+          "by": "PraiseZhu"
+        }
+      ],
+      "fixes": []
+    },
     {
       "date": "2026-07-12",
       "prs": [
