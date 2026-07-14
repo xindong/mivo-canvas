@@ -396,6 +396,10 @@ const PERSIST_ENV_KEYS = [
   'VITE_MIVO_PERSIST',
   'MIVO_PERSIST_BACKEND',
   'MIVO_PG_HOST', 'MIVO_PG_PORT', 'MIVO_PG_DB', 'MIVO_PG_USER', 'MIVO_PG_PASSWORD',
+  // F3-bis:补 pgConfig.ts:99-107 真实读取的 4 键(防父 env 串扰 server 档 PG 连接预算/超时)。
+  // server 档不重注(用 pgConfig 默认:max=10/idle=30000/conn=5000;MIVO_PG_HOST_PORT 是 MIVO_PG_PORT 旧别名,
+  // server 档已注 MIVO_PG_PORT,不需 HOST_PORT)。
+  'MIVO_PG_HOST_PORT', 'MIVO_PG_MAX_CONNECTIONS', 'MIVO_PG_IDLE_TIMEOUT_MS', 'MIVO_PG_CONNECTION_TIMEOUT_MS',
   'MIVO_PLATFORM_KEY', 'MIVO_E2E_RESET_TOKEN', 'MIVO_E2E_HARNESS', 'MIVO_BASE_CURSOR_SECRET',
 ]
 const stripPersistEnv = (env) => {
@@ -478,6 +482,9 @@ export const startSmokeBffServer = ({
       //    让 reset 端点三重保险挂载(app.ts isE2eResetEnabled)。MIVO_PLATFORM_KEY → legacy actor 稳定 owner。
       ...(persistMode === 'server'
         ? {
+            // F1-bis: server 档显式注入 NODE_ENV=test(reset 端点全正向挂载条件第 1 条;
+            //   route isE2eResetEnabled 要求 NODE_ENV==='test',unset/staging/production 一律不挂)。
+            NODE_ENV: 'test',
             MIVO_PERSIST_BACKEND: 'pg',
             MIVO_PG_HOST: process.env.MIVO_PG_HOST ?? '127.0.0.1',
             MIVO_PG_PORT: process.env.MIVO_PG_PORT ?? '55443',

@@ -1,14 +1,20 @@
 // server/routes/e2eReset.ts
-// A2-S4 Block 5 F1: e2e persist harness reset 端点(test-only,三重保险 fail-closed)。
+// A2-S4 Block 5 F1-bis: e2e persist harness reset 端点(test-only,全正向 8 条挂载 + PG 白名单下沉 route)。
 //
-// mirror server/lib/auth-stub.ts:21-25 三重保险模式(isDevStubActive):
-//  1. MIVO_E2E_RESET_TOKEN 设置(非空)——显式 opt-in;
-//  2. MIVO_E2E_HARNESS==='1'——专用 sentinel(harness 显式注入;防生产误设 token 就挂载);
-//  3. NODE_ENV!=='production'——双保险(即便误设 sentinel+token,生产仍硬关);
-//  4. MIVO_PUBLIC!=='1'——public 部署绝不允许 reset(身份只由网关提供,reset 危险)。
-// 任一不满足 → 端点不挂载(404 stub,防 SPA fallback)。
+// F1-bis 收口(上一轮 F1 的 NODE_ENV!=='production' 负向判定 + PG 白名单只在 harness 的绕过路径):
+//  全正向判定(8 条全满足才挂载,任一不满足 → 404 stub),见 isE2eResetEnabled:
+//  1. NODE_ENV === 'test'(正向:只 test 放行;unset/staging/production 一律关)
+//  2. MIVO_PUBLIC !== '1'(public 部署绝不允许)
+//  3. MIVO_E2E_RESET_TOKEN 非空(显式 opt-in)
+//  4. MIVO_E2E_HARNESS === '1'(sentinel,harness 显式注入;非 secret,故需 PG 白名单补)
+//  5. MIVO_PERSIST_BACKEND === 'pg'(memory 档 e2e 不挂 reset——重启即清,不受影响)
+//  6. MIVO_PG_HOST 为 127.0.0.1/localhost(防连生产远程 PG)
+//  7. MIVO_PG_DB === 'mivocanvas_e2e'(与生产名 mivocanvas 硬区隔)
+//  8. MIVO_PG_USER === 'mivo_e2e'(与生产名 mivo 硬区隔)
+// PG 白名单下沉进 route(不只 harness):防 npm run start:server 设 token+sentinel 直跑生产库
+// (生产 MIVO_PG_DB=mivocanvas ≠ mivocanvas_e2e → 校验失败 → 不挂载)。
 //
-// 抽纯函数 isE2eResetEnabled + route builder createE2eResetRoute,供测试 6 路 env 驱动 fresh app
+// 抽纯函数 isE2eResetEnabled + route builder createE2eResetRoute,供测试驱动 fresh app 验 8 路负向 + 正向
 // (主 app.ts 是 module-level singleton,env 在加载时读,无法动态重测;route builder 让测试构造 fresh app)。
 // 调 sharedPersistBackend.__reset() + sharedPermissionBackend.__reset() 清 owner-scoped 数据
 // (memory 同步 void;PG TRUNCATE persist_records + 权限表)。test-only,生产绝不挂载。
@@ -21,15 +27,33 @@ import type { PersistBackend } from '../persist/backend'
 import type { PermissionBackend } from '../lib/permissions'
 
 /**
- * F1 三重保险挂载条件(mirror auth-stub.ts isDevStubActive)。任一不满足 → 不挂载(404 stub)。
- * 抽纯函数:测试可驱动 6 路 env(unset / production / MIVO_PUBLIC=1 / 缺 sentinel / wrong-token / valid-token)
- * 构造 fresh app 验挂载行为,无需重载主 app singleton。
+ * F1-bis 全正向挂载条件(8 条全部满足才挂载,任一不满足 → 404 stub)。
+ * 上一轮 F1 的 NODE_ENV!=='production' 是负向判定(unset/staging 放行)+ PG 白名单只在 harness
+ * (npm run start:server 设 token+sentinel 即可对生产库挂载 reset)——本轮收口:
+ *  1. NODE_ENV === 'test'(正向:只 test 放行;unset/staging/production 一律关,mirror auth-stub 负向漏洞)
+ *  2. MIVO_PUBLIC !== '1'(public 部署绝不允许)
+ *  3. MIVO_E2E_RESET_TOKEN 非空(显式 opt-in)
+ *  4. MIVO_E2E_HARNESS === '1'(sentinel,harness 显式注入;非 secret,故需 PG 白名单补)
+ *  5. MIVO_PERSIST_BACKEND === 'pg'(memory 档 e2e 不挂 reset——重启即清,不受影响)
+ *  6. MIVO_PG_HOST 为 127.0.0.1/localhost(防连生产远程 PG)
+ *  7. MIVO_PG_DB === 'mivocanvas_e2e'(与生产名 mivocanvas 硬区隔)
+ *  8. MIVO_PG_USER === 'mivo_e2e'(与生产名 mivo 硬区隔)
+ * PG 白名单下沉进 route(不只 harness):防 npm run start:server 设 token+sentinel 直跑生产库
+ * (生产 MIVO_PG_DB=mivocanvas ≠ mivocanvas_e2e → 校验失败 → 不挂载)。
+ * 抽纯函数:测试驱动 fresh app 验 8 路负向 + 正向,无需重载主 app singleton。
  */
-export const isE2eResetEnabled = (env: NodeJS.ProcessEnv = process.env): boolean =>
-  Boolean(env.MIVO_E2E_RESET_TOKEN)
-  && env.MIVO_E2E_HARNESS === '1'
-  && env.NODE_ENV !== 'production'
-  && env.MIVO_PUBLIC !== '1'
+export const isE2eResetEnabled = (env: NodeJS.ProcessEnv = process.env): boolean => {
+  if (env.NODE_ENV !== 'test') return false
+  if (env.MIVO_PUBLIC === '1') return false
+  if (!env.MIVO_E2E_RESET_TOKEN) return false
+  if (env.MIVO_E2E_HARNESS !== '1') return false
+  if (env.MIVO_PERSIST_BACKEND !== 'pg') return false
+  const host = env.MIVO_PG_HOST ?? ''
+  if (host !== '127.0.0.1' && host !== 'localhost') return false
+  if (env.MIVO_PG_DB !== 'mivocanvas_e2e') return false
+  if (env.MIVO_PG_USER !== 'mivo_e2e') return false
+  return true
+}
 
 /**
  * F1 构建 e2e reset route(env-gated;不满足挂载条件 → 404 stub sub-app)。
