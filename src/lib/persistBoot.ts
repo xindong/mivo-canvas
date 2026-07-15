@@ -19,7 +19,7 @@
 import { getPersistMode, isLocalPersist } from './persistMode'
 import { getServerPersistAdapter } from './serverPersistAdapterSelector'
 import { createAdapterWriteExecutor } from './persistWriteExecutor'
-import { createWriteQueue, type WriteOp, type WriteQueue } from './writeRetryQueue'
+import { createWriteQueue, getPendingDeleteResourceIds, type WriteOp, type WriteQueue } from './writeRetryQueue'
 import { hydrateUserStateMap } from './serverPersistHydrate'
 import { storeCanvasCursor, __resetCanvasCursorStore } from './snapshotCursorStore'
 import { fromRecord, edgeFromRecord } from '../kernel/mapping'
@@ -356,10 +356,24 @@ export const hydrateFromServer = async (
   const { useCanvasStore } = await import('../store/canvasStore')
 
   // 1. project 全量(非画布域,完全在 G1-a 范围)——替换 store.projects 为服务端真值。
+  //    P1 bug fix(delete-resurrection)C:差集过滤 pending-delete project id —— DELETE 还在
+  //    writeRetryQueue 未 drain 时服务端仍 LIVE,直接 replace 会把已删 project 灌回本地(复活)。
+  //    读 IDB pending deleteProject id 集合(boot hydrate 前 queue 未 start 也可读 IDB 真值;onConflict
+  //    re-hydrate 复用同一过滤),从服务端结果摘除,永不灌回"本地已排队删、尚未 drain"的记录。
   try {
-    const { projects } = await adapter.listProjects()
-    useCanvasStore.setState({ projects })
-    debugLogger.log(SOURCE, `server hydrate: ${projects.length} project(s) from BFF (replaced local)`)
+    const [{ projects }, pendingDeleteProjectIds] = await Promise.all([
+      adapter.listProjects(),
+      getPendingDeleteResourceIds('deleteProject'),
+    ])
+    const filteredProjects = pendingDeleteProjectIds.size === 0
+      ? projects
+      : projects.filter((p) => !pendingDeleteProjectIds.has(p.id))
+    useCanvasStore.setState({ projects: filteredProjects })
+    const droppedProjects = projects.length - filteredProjects.length
+    debugLogger.log(
+      SOURCE,
+      `server hydrate: ${filteredProjects.length} project(s) from BFF (replaced local${droppedProjects > 0 ? `; ${droppedProjects} filtered as pending-delete not-yet-drained (anti-resurrection)` : ''})`,
+    )
   } catch (error) {
     debugLogger.error(SOURCE, `listProjects hydrate failed: ${msg(error)} (degrade to local/demo state)`)
   }
@@ -370,12 +384,20 @@ export const hydrateFromServer = async (
   //    无的 canvas 插入 meta-stub(content 空,G1-c 补 content);本地有但服务端无的保留(pending create /
   //    demo,G1-c reconcile)。active sceneId 的 meta 刷新但其 flattened nodes/edges 不动(content 不变)。
   try {
-    const { canvases } = await adapter.listCanvas()
-    const serverById = new Map(canvases.map((m) => [m.id, m] as const))
+    const [{ canvases }, pendingDeleteCanvasIds] = await Promise.all([
+      adapter.listCanvas(),
+      getPendingDeleteResourceIds('deleteCanvas'),
+    ])
+    // P1 bug fix(delete-resurrection)C:差集过滤 pending-delete canvas id —— DELETE 还在队列未 drain
+    //   时服务端仍 LIVE,union-merge 会把已删 canvas 灌回本地(复活)。摘除后再 merge(同 step1 project)。
+    const serverCanvases = pendingDeleteCanvasIds.size === 0
+      ? canvases
+      : canvases.filter((m) => !pendingDeleteCanvasIds.has(m.id))
+    const serverById = new Map(serverCanvases.map((m) => [m.id, m] as const))
     useCanvasStore.setState((s) => {
       const local = s.canvases
       const merged: Record<string, CanvasDocument> = {}
-      for (const meta of canvases) {
+      for (const meta of serverCanvases) {
         const existing = local[meta.id]
         if (existing) {
           // 刷新 meta 字段,保留本地 content(nodes/edges/tasks/selection)+ sourceTemplateId
@@ -410,9 +432,10 @@ export const hydrateFromServer = async (
       }
       return { canvases: merged }
     })
+    const droppedCanvases = canvases.length - serverCanvases.length
     debugLogger.log(
       SOURCE,
-      `server hydrate: ${canvases.length} canvas meta(s) merged into store.canvases (content hydrate deferred to G1-c; local-only canvases retained)`,
+      `server hydrate: ${serverCanvases.length} canvas meta(s) merged into store.canvases (content hydrate deferred to G1-c; local-only canvases retained${droppedCanvases > 0 ? `; ${droppedCanvases} filtered as pending-delete not-yet-drained (anti-resurrection)` : ''})`,
     )
   } catch (error) {
     debugLogger.warn(SOURCE, `listCanvas hydrate failed: ${msg(error)}`)
@@ -585,8 +608,34 @@ export const startPersistWriteQueue = (
     //   (消"成功不清 outcome.revision!==undefined 才 onSuccess / terminal 留假 pending → 永久 union");
     //   非终态(transient-retry/401/retained)writeRetryQueue 不 fire onOutcome,sidecar 保持 pending。
     //   dynamic import 破 persistBoot↔chatPersistSync 静态环(chatPersistSync 静态 import persistBoot);
-    //   drain await 本回调(清位在 drain 返回前落地,测试可 drain 后立即断言 marker,无竞态)。
-    onOutcome: async (op) => {
+    //   drain await 本回调(writeRetryQueue drain `await onOutcome`)→ 清位/摘除在 drain 返回前落地,
+    //   测试可 drain 后立即断言 marker/store,无竞态(注:WriteQueueOptions docstring "返回 Promise drain
+    //   不 await"系 stale,实际 drain await onOutcome,见 writeRetryQueue drain 实现)。
+    // P1 bug fix(delete-resurrection)B:deleteProject/deleteCanvas 终态 success → 从 store 摘除该 id,
+    //   兜底 hydrate 曾先灌回的情况(C 差集过滤堵 hydrate 窗口;B 堵 drain 后残留——C 未过滤时
+    //   (如 hydrate 先于 putWrite 落地的竞态)灌回的记录由 B 在 drain 成功时摘除)。只在
+    //   outcome.status==='success' 摘除(含 404-idempotent-success):失败 terminal/rejected 不摘
+    //   (server 仍有,下次 hydrate 自然保留;C 差集随记录离队失效,不冲突)。local 模式 onOutcome
+    //   永不调(队列未启动)。applyServerRevision(onSuccess)对 delete 提前 return(revision undefined),
+    //   故 delete 终态只经此 onOutcome 摘除(非 applyServerRevision 死代码分支)。
+    onOutcome: async (op, outcome) => {
+      if (op.kind === 'deleteProject' && outcome.status === 'success') {
+        const { useCanvasStore } = await import('../store/canvasStore')
+        useCanvasStore.setState((s) => ({ projects: s.projects.filter((p) => p.id !== op.projectId) }))
+        debugLogger.log(SOURCE, `deleteProject ${op.projectId} drained success → removed from store (anti-resurrection fallback B)`)
+        return
+      }
+      if (op.kind === 'deleteCanvas' && outcome.status === 'success') {
+        const { useCanvasStore } = await import('../store/canvasStore')
+        useCanvasStore.setState((s) => {
+          if (!s.canvases[op.canvasId]) return {}
+          const next = { ...s.canvases }
+          delete next[op.canvasId]
+          return { canvases: next }
+        })
+        debugLogger.log(SOURCE, `deleteCanvas ${op.canvasId} drained success → removed from store (anti-resurrection fallback B)`)
+        return
+      }
       if (op.kind !== 'appendChatMessage') return
       const msgId = (op.message as { id?: string }).id
       if (!msgId) return

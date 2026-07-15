@@ -940,6 +940,45 @@ const getAllWrites = async (): Promise<QueuedWrite[]> => {
   }
 }
 
+/**
+ * P1 bug fix (delete-resurrection): read the set of resource ids (projectId / canvasId) whose
+ * delete op is still pending in the durable IDB queue (not yet drained to server). Used by
+ * hydrateFromServer to difference-filter server results so a not-yet-drained delete is NOT poured
+ * back into the local store ("resurrection" — see persistBoot.ts hydrate step1/step2).
+ *
+ * Reads IDB directly (durable, survives reload) via getAllWrites — works BEFORE the queue singleton
+ * is started (boot hydrate runs before startPersistWriteQueue, so the singleton is undefined then;
+ * the IDB still holds prior-session pending deletes) AND mid-session (onConflict re-hydrate; queue
+ * already started). getAllWrites returns only non-terminal records (terminal outcomes are
+ * delete-after-surface), so pending / in-flight / paused-401 / gate-blocked all read as
+ * "not yet drained" → filtered. Unions memStore fallback (IDB-unavailable) so the read stays
+ * consistent with the queue's own view.
+ *
+ * local mode: the write-queue IDB/memStore is never populated with project/canvas deletes —
+ * enqueuePersistWrite is a no-op when the queue singleton is undefined (isLocalPersist early
+ * return in persistBoot.bootPersistWiring), and the queue is never started in local mode →
+ * getAllWrites returns [] → empty set, zero impact (and this function is only called from
+ * hydrateFromServer, which local mode never invokes).
+ */
+export const getPendingDeleteResourceIds = async (
+  kind: 'deleteProject' | 'deleteCanvas',
+): Promise<Set<string>> => {
+  const all = await getAllWrites()
+  const ids = new Set<string>()
+  for (const r of all) {
+    const op = r.op
+    // Narrow via kind check so TS narrows op to the deleteProject/deleteCanvas variant
+    // (projectId / canvasId access). Both delete kinds carry no baseRevision → never 409
+    // revision-conflict; only success (incl 404-idempotent) / rejected / terminal outcomes.
+    if (kind === 'deleteProject' && op.kind === 'deleteProject') {
+      ids.add(op.projectId)
+    } else if (kind === 'deleteCanvas' && op.kind === 'deleteCanvas') {
+      ids.add(op.canvasId)
+    }
+  }
+  return ids
+}
+
 const putWrite = async (record: QueuedWrite): Promise<void> => {
   if (!isIdbAvailable()) {
     memStore.set(record.id, record)

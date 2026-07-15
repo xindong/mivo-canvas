@@ -47,6 +47,7 @@ import { useChatStore } from '../store/chatStore'
 import { enqueueChatAppend } from '../store/chatPersistSync'
 import {
   drainPersistQueue,
+  enqueuePersistWrite,
   startPersistWriteQueue,
   stopPersistWriteQueue,
   __resetPersistBoot,
@@ -56,7 +57,8 @@ import {
   getChatOrderRevision,
   backfillChatAfterDrain,
 } from './persistBoot'
-import { __resetWriteQueueDb } from './writeRetryQueue'
+import { __resetWriteQueueDb, __seedWritesForTest } from './writeRetryQueue'
+import { ANONYMOUS_USER_ID } from './persistUserId'
 import type { ServerPersistAdapter } from './serverPersistAdapter'
 import type { Project, CanvasMeta } from '../../shared/persist-contract.ts'
 
@@ -1138,5 +1140,170 @@ describe('P2-3 生命周期矩阵 — unsynced sidecar 真实 enqueue→outcome�
     // hydrate(active=c1, server 空)→ m1 不在 server 集 + 无 marker → 按 canonical 删除(不复活为孤儿)
     await hydrateFromServer(emptyChatAdapter, { fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
     expect(useChatStore.getState().messagesByScene['c1'] ?? []).toEqual([]) // 不复活
+  })
+})
+
+// ── P1 bug fix(delete-resurrection)— hydrate 差集过滤(C)+ onOutcome 摘除(B)──────────────────
+// 验收(lead SC-1~4):
+//  SC-1:server 模式删项目/画布后立即刷新(drain 前)→ 已删项不再出现(hydrate 差集过滤 pending-delete)。
+//  SC-2:删除后其他 op 撞 409 触发 re-hydrate、DELETE 仍 pending → 不复活(onConflict 复用同一差集过滤)。
+//  SC-3:DELETE drain 成功后即使 hydrate 曾先灌回,本地 store 不含该记录(onOutcome success 摘除兜底)。
+//  SC-4:restoreProject 恢复仍正常(不破坏恢复路径;pending delete 经 combineOps morph 成 create → C 不过滤)。
+// 根因:bootPersistWiring 先 hydrateFromServer 后 startPersistWriteQueue;DELETE 还在 IDB 队列未 drain 时
+//   hydrate 读服务端仍 LIVE 记录灌回本地 → 复活留到下次刷新。修 C(hydrateFromServer step1/step2 差集过滤
+//   pending-delete)+ B(onOutcome success 摘除兜底,堵 C 未覆盖的 hydrate-先于-putWrite 竞态)。local 模式
+//   hydrate/onOutcome 永不调(bootPersistWiring 第一行 return;队列未启动)。
+describe('P1 bug fix — delete-resurrection: hydrate 差集过滤(C)+ onOutcome 摘除(B)', () => {
+  const proj = (id: string, name: string): Project => ({
+    id, name, ownerId: KEY_A, createdAt: 't', updatedAt: 't', revision: 0, isDeleted: false,
+  })
+  const cmeta = (id: string, projectId: string, title: string): CanvasMeta => ({
+    id, projectId, title, createdAt: 't', updatedAt: 't', metaRevision: 0, contentVersion: 0,
+  })
+  const doc = (projectId: string, title: string) =>
+    ({ title, projectId, createdAt: 't', updatedAt: 't', nodes: [], edges: [], tasks: [] }) as never
+  const fakeAdapter = (projects: Project[], canvases: CanvasMeta[]): ServerPersistAdapter =>
+    ({
+      listProjects: async () => ({ projects }),
+      listCanvas: async () => ({ canvases }),
+      listChatMessages: async () => ({ messages: [], orderRevision: 0 }),
+    }) as unknown as ServerPersistAdapter
+  // hydrate 的 opts:user-state step3 fetch 返空 entries(同既有 hydrate 测试 fakeOpts 模式),
+  //   与 queue 的 fetch 分离(queue 用注入 fetch 驱动 drain;hydrate 经 fakeAdapter + 此 opts)。
+  const hydrateOpts = {
+    fetch: async () => new Response(JSON.stringify({ entries: {} }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    baseUrl: '',
+    getAuthHeaders: () => authHeaders(),
+  }
+
+  // SC-1: server 模式删项目/画布后立即刷新(drain 前)→ 已删项不再出现(C 差集过滤)。
+  it('SC-1: deleteProject(乐观移除 pX/cX + enqueue delete 未 drain)→ hydrate 不灌回(C 差集过滤)', async () => {
+    const { fetch } = makeCountingFetch() // DELETE 204(不会被调:不手动 drain,5s timer 不及)
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush() // start() immediate drain 在空队列跑完
+    // pX/cX(active)+ pY/cY(survivor);sceneId=cX(被删 → P1-2 切 cY)
+    resetStoreProjects([proj('pX', 'X'), proj('pY', 'Y')])
+    useCanvasStore.setState({
+      sceneId: 'cX',
+      canvases: { cX: doc('pX', 'cX'), cY: doc('pY', 'cY') } as never,
+    })
+    // 真实 store action:乐观移除 pX/cX + sceneId→cY + enqueue deleteProject(pX)+deleteCanvas(cX)(pending 未 drain)
+    useCanvasStore.getState().deleteProject('pX')
+    await flush() // enqueue putWrite 落地(deletes pending,未 drain)
+    // hydrate:服务端仍返 pX/cX LIVE(DELETE 未 drain)→ C 必须差集过滤,不灌回(无 C 则复活)
+    await hydrateFromServer(
+      fakeAdapter([proj('pX', 'X'), proj('pY', 'Y')], [cmeta('cX', 'pX', 'cX'), cmeta('cY', 'pY', 'cY')]),
+      hydrateOpts,
+    )
+    // 已删 pX/cX 不复活(差集过滤);pY/cY 保留;sceneId 停 cY
+    expect(useCanvasStore.getState().projects.map((p) => p.id)).toEqual(['pY'])
+    expect(Object.keys(useCanvasStore.getState().canvases)).toEqual(['cY'])
+    expect(useCanvasStore.getState().sceneId).toBe('cY')
+  })
+
+  // SC-2: 删除后其他 op 撞 409 触发 onConflict re-hydrate,DELETE 仍 pending → 不复活。
+  it('SC-2: 409 触发 onConflict re-hydrate,pending-delete 被差集过滤(不复活)', async () => {
+    // executor 用注入 fetch(wired):PATCH /api/projects/pY → 409 revision-conflict(触发 onConflict);
+    //   DELETE → 204。onConflict 调 hydrateFromServer()(无参 → 默认 adapter,local 测试为 unwired →
+    //   re-hydrate 失败但证 wiring fire);此处手动调 hydrateFromServer(fakeAdapter)模拟 server 模式
+    //   wired adapter 下的 re-hydrate,验 C 差集过滤 pending-delete(production server 模式 onConflict
+    //   的 void hydrateFromServer() 即跑此 C)。
+    const fetch = async (input: string, init?: RequestInit): Promise<Response> => {
+      const method = (init?.method ?? 'GET').toUpperCase()
+      const path = new URL(input, 'http://stub').pathname
+      if (method === 'PATCH' && path.startsWith('/api/projects/')) {
+        return new Response(JSON.stringify({ error: 'revision-conflict', currentRevision: 9 }), { status: 409, headers: { 'content-type': 'application/json' } })
+      }
+      if (method === 'DELETE') return new Response(null, { status: 204 })
+      return new Response(JSON.stringify({ id: 'srv', revision: 0 }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    resetStoreProjects([proj('pX', 'X'), proj('pY', 'Y')])
+    useCanvasStore.setState({ canvases: {} })
+    // pending deleteProject(pX):nextAttemptAt 远未来 → 本次 drain 不取(保持 pending 证 C 过滤)
+    await __seedWritesForTest([{
+      id: 'rec-del-px', idempotencyKey: 'k-del-px', userId: ANONYMOUS_USER_ID,
+      op: { kind: 'deleteProject', projectId: 'pX' }, resourceKey: 'project:pX',
+      createdAt: 0, attempts: 0, nextAttemptAt: Number.MAX_SAFE_INTEGER, status: 'pending',
+    }])
+    // 触发 409:updateProject(pY) 带 stale base → PATCH 409 → onConflict → void hydrateFromServer()
+    await enqueuePersistWrite({ kind: 'updateProject', projectId: 'pY', name: 'new', baseRevision: 0 })
+    await flush()
+    const drainResult = await drainPersistQueue()
+    await flush(20) // onConflict 内 void hydrateFromServer fire-and-forget,等其落地(失败亦落地)
+    // onConflict 的 re-hydrate 默认 unwired adapter(local 测试)失败 → store 未变(pX/pY 仍在)。
+    //   手动调 hydrateFromServer(fakeAdapter)模拟 server 模式 wired re-hydrate → C 差集过滤 pX。
+    await hydrateFromServer(fakeAdapter([proj('pX', 'X'), proj('pY', 'Y')], []), hydrateOpts)
+    // 409 conflict terminal(证 onConflict 路径 fire)+ pX 不复活(pending-delete 被 C 差集过滤)
+    expect(drainResult?.terminals).toBe(1)
+    expect(useCanvasStore.getState().projects.map((p) => p.id)).toEqual(['pY'])
+  })
+
+  // SC-3: hydrate 先灌回 → DELETE drain 成功 → onOutcome success 摘除(B 兜底)。
+  it('SC-3: hydrate 先灌回 pX/cX → drain DELETE 成功 → onOutcome success 摘除(B 兜底)', async () => {
+    const { fetch } = makeCountingFetch() // DELETE 204(success)
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    resetStoreProjects([])
+    useCanvasStore.setState({ canvases: {} })
+    // 第一次 hydrate:无 pending delete → C 不过滤 → pX/cX 灌回(模拟"删前 hydrate 已灌回"状态)
+    await hydrateFromServer(fakeAdapter([proj('pX', 'X')], [cmeta('cX', 'pX', 'cX')]), hydrateOpts)
+    expect(useCanvasStore.getState().projects.map((p) => p.id)).toEqual(['pX']) // 灌回
+    expect(Object.keys(useCanvasStore.getState().canvases)).toEqual(['cX']) // 灌回
+    // 直接 enqueue delete(此时 pX/cX 已在 store,不经 store action 乐观移除)→ drain DELETE 204
+    //   success → onOutcome fire(B 门 outcome.status==='success')→ 从 store 摘除
+    await enqueuePersistWrite({ kind: 'deleteProject', projectId: 'pX' })
+    await enqueuePersistWrite({ kind: 'deleteCanvas', canvasId: 'cX' })
+    await flush()
+    await drainPersistQueue()
+    // B 摘除:即使 hydrate 曾灌回,drain 成功后 store 不含该记录
+    expect(useCanvasStore.getState().projects.map((p) => p.id)).toEqual([])
+    expect(Object.keys(useCanvasStore.getState().canvases)).toEqual([])
+  })
+
+  // SC-3 辅证:deleteProject 失败(rejected 400)→ onOutcome fire 但 B 不摘(outcome.status!==success)。
+  it('SC-3 辅证:deleteProject 撞 400 rejected → onOutcome fire 但 B 不摘(server 仍有,保留一致)', async () => {
+    const fetch = async (_input: string, init?: RequestInit): Promise<Response> => {
+      const method = (init?.method ?? 'GET').toUpperCase()
+      if (method === 'DELETE') return new Response(JSON.stringify({ error: 'forbidden' }), { status: 400, headers: { 'content-type': 'application/json' } })
+      return new Response(JSON.stringify({ id: 'srv', revision: 0 }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    resetStoreProjects([proj('pX', 'X')])
+    useCanvasStore.setState({ canvases: {} })
+    await enqueuePersistWrite({ kind: 'deleteProject', projectId: 'pX' })
+    await flush()
+    const drainResult = await drainPersistQueue()
+    // 400 → rejected terminal → onOutcome fire 但 B 门 outcome.status==='success' 不满足 → 不摘
+    //   (server 仍有 pX,本地保留一致;非"复活"而是"删除失败"——下次 hydrate 自然带回)
+    expect(drainResult?.terminals).toBe(1)
+    expect(useCanvasStore.getState().projects.map((p) => p.id)).toEqual(['pX']) // 仍在(B 未摘)
+  })
+
+  // SC-4: restoreProject 恢复路径不被 C 破坏(pending delete 经 combineOps morph 成 create → C 不再过滤)。
+  it('SC-4: restoreProject 把 pending deleteProject morph 成 createProject → hydrate 不再过滤(恢复不被破坏)', async () => {
+    const { fetch } = makeCountingFetch()
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    resetStoreProjects([])
+    useCanvasStore.setState({ canvases: {} })
+    // 预置 pending deleteProject(pX)(远未来不 drain)
+    await __seedWritesForTest([{
+      id: 'rec-del-px2', idempotencyKey: 'k-del-px2', userId: ANONYMOUS_USER_ID,
+      op: { kind: 'deleteProject', projectId: 'pX' }, resourceKey: 'project:pX',
+      createdAt: 0, attempts: 0, nextAttemptAt: Number.MAX_SAFE_INTEGER, status: 'pending',
+    }])
+    // 第一次 hydrate:pX pending-delete → C 差集过滤 → store 无 pX(确认 C 在工作)
+    await hydrateFromServer(fakeAdapter([proj('pX', 'X')], []), hydrateOpts)
+    expect(useCanvasStore.getState().projects.map((p) => p.id)).toEqual([])
+    // restoreProject(pX):重加 project + enqueue createProject(id=pX) → combineOps 把 pending
+    //   deleteProject morph 成 createProject(同 resourceKey last-wins)→ IDB 记录不再是 delete。
+    useCanvasStore.getState().restoreProject('pX', 'Restored')
+    await flush() // enqueue 的 getAllWrites+combineOps+putWrite 落地
+    // 第二次 hydrate:IDB 记录已 morph 成 createProject → C 读不到 deleteProject → 不过滤 → pX 保留
+    await hydrateFromServer(fakeAdapter([proj('pX', 'X')], []), hydrateOpts)
+    expect(useCanvasStore.getState().projects.map((p) => p.id)).toEqual(['pX']) // 恢复未被 C 破坏
   })
 })
