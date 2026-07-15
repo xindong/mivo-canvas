@@ -4,6 +4,7 @@ import { defaultStampKind, stampLabelFor } from '../canvas/stampDefs'
 import { defaultSizeForNodeType } from '../model/canvasNodeRegistry'
 import { defaultTextAlign, defaultTextColor, defaultTextFontSize, defaultTextWeight } from '../canvas/textGeometry'
 import { markdownShouldUsePreviewMode } from '../lib/canvasAssetImport'
+import { getSceneWrap } from '../lib/sceneWrapRegistry'
 import { normalizeCanvasNodeV2, setNodeTransform } from '../model/documentModelV2'
 import { logCanvas, warnCanvas } from './canvasStoreLog'
 import { makeNode } from './demoScenes'
@@ -37,11 +38,12 @@ export const createNodeCreationSlice: SliceCreator = (set, get) => ({
     logCanvas(`Import image requested: ${title}`)
     get().addImportedFileNode('image', assetUrl, title, size, position, metadata)
   },
-  // TODO(T2.2): import 路径不经 wrapMutation,server 模式下 node 不落 server → attach 无对象(必 404
-  // unknown-node rejected)。待 T2.2 deferred-kinds server-wire lane 把 import node-create 接上 submitChange 后,
-  // 在 create-node accepted 后补 enqueueAssetAttach(canvasId, serverAssetIdFromUrl(assetUrl), id)。
-  // Block 3 裁定 OUT,见本 PR 残余风险段。
+  // T2.2 Block 3 闭环:import node-create 路径现经 getSceneWrap() 包 set 段(见下方 wrap)→
+  //   create-node 经 submitChange 落 server;attach 由 Block 2 computeAssetSideEffects 自动驱动
+  //   (assetUrl 为 server 资产 → server assetId → create-node accepted 后 enqueueAssetAttach;
+  //   非 server url 仅 create-node,无 attach)。local 模式 gate 短路零行为变化。
   addImportedFileNode: (type, assetUrl, title, size = 'source', position, metadata) => {
+    const targetSceneId = get().sceneId
     const id = createNodeId('imported')
     const displaySize = importedAssetDisplaySize(type, metadata)
     const markdownDisplayMode =
@@ -50,7 +52,11 @@ export const createNodeCreationSlice: SliceCreator = (set, get) => ({
       title?.trim() ||
       metadata?.originalName?.replace(/\.[^.]+$/, '') ||
       (type === 'markdown' ? 'Markdown document' : type === 'pdf' ? 'PDF document' : type === 'video' ? 'Video file' : 'Imported Image')
-    set((state) =>
+    // T2.2 Block 3:wrap import node-create 的 set 段经 submitChange 落 server。patchWithHistory →
+    //   patchActiveCanvas 写 canvases[sceneId] → wrap 快照 diff 出 create-node(assetUrl 为 server
+    //   资产时 computeAssetSideEffects 自动 attach)。getSceneWrap() 取 wrapMutationForScene;
+    //   targetSceneId 锚活跃画布(import 无 sceneId 形参,落 active scene)。local gate 短路零变化。
+    getSceneWrap()(targetSceneId, () => set((state) =>
       patchWithHistory(state, {
         selectedNodeId: id,
         selectedNodeIds: [id],
@@ -84,7 +90,7 @@ export const createNodeCreationSlice: SliceCreator = (set, get) => ({
           }),
         ],
       }),
-    )
+    ))
     logCanvas(`Imported ${type} node "${nodeTitle}" from ${metadata?.originalName || assetUrl}`)
   },
   cropImageNode: (nodeId, box) =>

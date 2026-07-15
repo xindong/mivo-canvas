@@ -37,6 +37,7 @@ import {
 } from './canvasDocumentModel'
 import { enqueuePersistWrite } from '../lib/persistBoot'
 import { isServerPersist } from '../lib/persistMode'
+import { getSceneWrap } from '../lib/sceneWrapRegistry'
 
 export const createDocumentSlice: SliceCreator = (set, get) => ({
   canvases: defaultCanvases,
@@ -422,7 +423,17 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
       throw new Error(`AI 生成槽位已删除，生成结果未落画布。已保存资产：${savedNames}`)
     }
 
-    set((state) => {
+    // T2.2 Block 3:wrap the synchronous set 段 with scene-scoped server-wire。set 段是
+    //   await saveGeneratedAsset 之后的同步子片段(commitGenerationResult 虽 async,但 set 本身
+    //   同步);wrap 它即让 generate result 的 node-create / slot-replace edit-node 经
+    //   submitChange 落 server。Block 2 的 computeAssetSideEffects assetUrl-diff 自动驱动 attach
+    //   (result asset.assetUrl → server assetId → create-node/edit-node accepted 后 attach),
+    //   无需手工 enqueueAssetAttach(下方原 TODO 485-488 由本接线闭环)。
+    //   覆盖面:5 个 generate* 变体的 success commit 全经此(无重复包);
+    //   chatTaskReconcile.reconcileExpiredChatTasks 的 commit(sceneId 锚定)亦经此
+    //   → 一处接线覆盖全部 deferred generate-result 路径。local 模式 wrapMutationForScene
+    //   的 isLocalPersist gate 短路,不发 submit,零行为变化。
+    getSceneWrap()(targetSceneId, () => set((state) => {
       const targetDocument = state.canvases[targetSceneId]
       if (!targetDocument) return {}
 
@@ -482,10 +493,10 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
             : replacingSlot || currentSource?.type === 'ai-slot'
               ? 'slot-generation'
               : 'beside-generation'
-        // TODO(T2.2): generate 结果路径不经 wrapMutation,server 模式下 node 不落 server → attach 无对象。
-        // 待 T2.2 deferred-kinds server-wire lane 把 generate node-create 接上 submitChange 后,在 create-node
-        // accepted 后补 enqueueAssetAttach(canvasId, serverAssetIdFromUrl(asset.assetUrl), nodeId)。
-        // Block 3 裁定 OUT,见本 PR 残余风险段。
+        // T2.2 Block 3 闭环:generate 结果路径现已经 getSceneWrap() 包 set 段(见上方 wrap)→
+        //   node-create / slot-replace edit-node 经 submitChange 落 server;attach 由 Block 2 的
+        //   computeAssetSideEffects assetUrl-diff 自动驱动(result asset.assetUrl → server assetId →
+        //   create-node/edit-node accepted 后 enqueueAssetAttach),无需此手工补 enqueueAssetAttach。
         const resultNode = createGenerationResultNode({
           id: nodeId,
           title: image.title?.trim() || `Generated image ${index + 1}`,
@@ -542,7 +553,7 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
         nodes: nextNodes,
         edges: nextEdges,
       }, { history: !replaceSlotId })
-    })
+    }))
 
     // S02: 落地断言——资产已保存但无任何节点落地（set 内同 tick 竞态最后防线触发了
     // 静默 return {}）时显式抛错带资产名，避免假成功。正常流下上提校验已拦住所有

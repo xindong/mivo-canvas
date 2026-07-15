@@ -8,6 +8,7 @@ import type {
 import type { SliceCreator } from './canvasStateTypes'
 import type { VariationParam, NormalizedMaskBounds } from '../types/generation'
 import { MivoImageRequestError, assetBlobForNode } from '../lib/mivoImageClient'
+import { getSceneWrap } from '../lib/sceneWrapRegistry'
 import {
   cancelTask,
   kindForFailedTask,
@@ -300,14 +301,16 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
             createFailedVariationSlot(source, failure, basePrompt, model, taskId),
           )
           if (failedSlots.length > 0) {
-            set((current) => {
+            // T2.2 Block 3:失败槽位 node-create 经 submitChange 落 server(无 assetUrl,仅 create-node,无 attach)。
+            //   success 结果已由上方 commitGenerationResult 的 wrap 落 server。local gate 短路零变化。
+            getSceneWrap()(targetSceneId, () => set((current) => {
               const doc = current.canvases[targetSceneId]
               if (!doc) return {}
               return patchCanvasDocument(current, targetSceneId, {
                 nodes: [...doc.nodes, ...failedSlots.map((s) => s.node)],
                 edges: [...doc.edges, ...failedSlots.map((s) => s.edge)],
               })
-            })
+            }))
           }
           return successIds
         },
@@ -588,7 +591,16 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
       baselineSnapshot = get().historyPast.at(-1)
     }
 
-    set((current) => {
+    // T2.2 Block 3 P1(复审修复):generating 态 mutation 接 scene-scoped server-wire(与 catch 删 slot 同机制)。
+    //   原 594-620 裸 set 只写本地 generating 态(generation.prompt/model/taskId + aiWorkflow.prompt/status),零 submit
+    //   → 成功后 commitGenerationResult 的 wrap 在 commit 当下拍 before 已含上述本地值;结果图沿用相同 model/prompt/taskId
+    //   → diff 判"没变"不发 intents → server 端 generation.model/prompt/taskId、aiWorkflow.prompt 停留旧值,刷新 hydrate
+    //   后结果图 metadata 与本地不一致。把本 set 也经注入的 onSceneMutation(wrapMutationForScene)包裹按序落 server:
+    //   generating edit-node 先发(status/prompt/model/taskId 落 server),commit edit-node 后发(type/asset/status=ready),
+    //   server base 与本地 before 一致。与 Block 1 给 maskEditGeneration 接「slot create+初始 generating status 同包」同构。
+    //   local 模式 wrapMutationForScene 的 isLocalPersist gate 短路,零行为变化。runSceneMutation hoist 到此供 catch 复用。
+    const runSceneMutation = options.onSceneMutation ?? ((_: string, mutate: () => void) => mutate())
+    runSceneMutation(targetSceneId, () => set((current) => {
       const targetDocument = current.canvases[targetSceneId]
       if (!targetDocument) return {}
       const nodes = targetDocument.nodes.map((node) =>
@@ -614,7 +626,7 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
           : node,
       )
       return patchCanvasDocument(current, targetSceneId, { nodes, tasks: upsertTask(targetDocument.tasks, runningTask) })
-    })
+    }))
 
     let serverTaskId: string | undefined
     try {
@@ -716,7 +728,7 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
             tasks: targetDocument.tasks.filter((task) => task.id !== runningTask.id),
           })
         })
-      const runSceneMutation = options.onSceneMutation ?? ((_: string, mutate: () => void) => mutate())
+      // runSceneMutation hoist 在 generating set 前(本函数顶部),catch 复用同一 resolver(Block 1 F1 注入 onSceneMutation)。
       runSceneMutation(targetSceneId, deleteSlot)
       if (canceled) {
         warnCanvas(`生成到槽位已取消，已移除占位符：${slot.title}`)
