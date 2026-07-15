@@ -306,8 +306,10 @@ export const buildCanvasSyncChanges = (before: SyncSnapshot, after: SyncSnapshot
 // 从 before/after SyncSnapshot diff 出「新建/删除的带 server 资产的 node」→ attach/detach 候选。
 // submitChanges 在对应 create-node/delete-node accepted 后 enqueue(R1 方案 A:attach 依赖 server 端 node 已落,
 // gate ① persist.getChild 才能找到;detach 在 delete-node accepted 后清残留 ref —— server 不级联清 asset ref)。
-// 只覆盖走 wrapMutation 的 mutation(duplicate/paste/delete);import/generate/mask-edit 走 deferred 路径不经
-// wrapMutation(node 不落 server,attach 无对象,Block 3 裁定 OUT,见 PR 残余风险段)。
+// Block 2(T2.2):扩 edit-node 的 assetUrl 变更 —— before/after 都存在的 node 做 assetId diff,堵 slot→result
+// 同 id edit-node 场景下结果图资产 refcount=0 → 7 天误删(详见 computeAssetSideEffects edit-node 分支)。
+// 只覆盖走 wrapMutation 的 mutation(duplicate/paste/delete + Block 2 edit-node assetUrl-diff);import/generate/
+// mask-edit 的「产生 assetUrl 变更的调用方」仍走 deferred 路径不经 wrapMutation(diff 机制已就位,接线是 Block 3)。
 type AssetSideEffects = { attach: Map<string, string>; detach: Map<string, string> }
 
 export const computeAssetSideEffects = (before: SyncSnapshot, after: SyncSnapshot): AssetSideEffects => {
@@ -322,6 +324,26 @@ export const computeAssetSideEffects = (before: SyncSnapshot, after: SyncSnapsho
     if (after.nodes.has(recordId)) continue
     const assetId = serverAssetIdFromUrl(before.nodes.get(recordId)?.asset?.url)
     if (assetId) detach.set(recordId, assetId)
+  }
+  // Block 2(T2.2):edit-node(before/after 都存在的 node)的 assetUrl 变更 diff。旧逻辑只认 create/delete,
+  // edit 变 assetUrl 时 attach 永不触发 → slot→result 同 id edit-node 的结果图资产 refcount=0 → 7 天误删。
+  //   旧无→新有:attach 新 | 旧有→新无:detach 旧 | 旧≠新(都 server):detach 旧 + attach 新 | 其余(相同/都非 server)不动。
+  for (const recordId of after.nodeOrder) {
+    if (!before.nodes.has(recordId)) continue // create 由首循环处理
+    const prevAssetId = serverAssetIdFromUrl(before.nodes.get(recordId)?.asset?.url)
+    const nextAssetId = serverAssetIdFromUrl(after.nodes.get(recordId)?.asset?.url)
+    if (prevAssetId === nextAssetId) continue // 相同(含都 undefined / 都非 server url)→ 不动
+    if (prevAssetId) {
+      // 旧有 server 资产:detach 旧(server A→B 与 server→无 都先 detach 旧)
+      detach.set(recordId, prevAssetId)
+      if (nextAssetId) {
+        // 旧≠新(都 server):attach 新
+        attach.set(recordId, nextAssetId)
+      }
+    } else if (nextAssetId) {
+      // 旧无→新有(旧非 server/无 asset → 新 server):attach 新
+      attach.set(recordId, nextAssetId)
+    }
   }
   return { attach, detach }
 }
@@ -344,6 +366,18 @@ const submitChanges = async (
         enqueueAssetAttach(canvasId, assetEffects.attach.get(change.node.id) as string, change.node.id)
       } else if (change.kind === 'delete-node' && assetEffects?.detach.has(change.nodeId)) {
         enqueueAssetDetach(canvasId, assetEffects.detach.get(change.nodeId) as string, change.nodeId)
+      } else if (change.kind === 'edit-node') {
+        // Block 2(T2.2):edit-node accepted 后,按 computeAssetSideEffects 的 assetUrl-diff 结果 enqueue
+        // detach 旧 + attach 新(顺序先 detach 旧再 attach 新,与 computeAssetSideEffects server A→B 分支语义对齐)。
+        // slot→result 同 id edit-node 在此接出 attach —— 堵结果图资产 refcount=0 → 7 天误删。
+        // attach 合法:edit-node accepted 意味 node 仍在 server(非 delete),attach gate ① persist.getChild 能找到。
+        // 两个 if 非 else:A→B 时 detach 与 attach 都要发;assetUrl 不变的 edit 两 map 都无该 nodeId → 都不发。
+        if (assetEffects?.detach.has(change.nodeId)) {
+          enqueueAssetDetach(canvasId, assetEffects.detach.get(change.nodeId) as string, change.nodeId)
+        }
+        if (assetEffects?.attach.has(change.nodeId)) {
+          enqueueAssetAttach(canvasId, assetEffects.attach.get(change.nodeId) as string, change.nodeId)
+        }
       }
       continue
     }

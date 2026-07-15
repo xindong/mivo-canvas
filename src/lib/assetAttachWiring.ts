@@ -18,7 +18,9 @@
 // OUT 边界(本块不接,见 PR 残余风险段):
 // - import/generate 路径的 attach:这些 mutation 不经 wrapMutation,server 模式下 node 不落 server,attach 无对象。
 //   依赖 T2.2 deferred-kinds server-wire lane。
-// - mask-edit 换 asset(edit-node 改 assetUrl):detach 旧 + attach 新 不在本块覆盖(asset-mutating,同 T2.2 lane)。
+// - mask-edit 换 asset(edit-node 改 assetUrl)的 diff 机制由 Block 2(T2.2)覆盖(computeAssetSideEffects assetUrl-diff
+//   + submitChanges edit-node accepted 接线);但产生此类 edit-node 的 mask-edit/generation 调用方仍走 deferred
+//   路径不经 wrapMutation,实际接线是 Block 3。
 
 import { enqueuePersistWrite } from './persistBoot'
 import { isServerAssetUrl, serverAssetId } from './assetServiceMode'
