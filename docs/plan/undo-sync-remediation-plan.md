@@ -93,7 +93,7 @@ a(队列兜底,保留)、b/b'(rejected-forward + reuse-conflict 边缘)、多 ch
 |---|---|---|---|
 | **U0(非 undo 工作,硬前置)** | Block 3 deferred-kinds server-wire lane:import/generate 经 wrapMutation 同步落 server | — | 已在 T2.2 规划,undo 正确性离不开它 |
 | **U1** | submitChanges 多 change 原子性:mid-batch conflict/reject 不再裸 `return`;走 (a) 服务端事务端点(优先)或 (b) 客户端补偿:re-hydrate + re-diff + 重试剩余 | U0 | (a) 2-3 PR;(b) 1-2 PR |
-| **U2** | 跨 scene undo 守卫:`wrapMutation` scene-mismatch 时改 route 到 `after.canvasId`(回滚目标 scene)而非 skip | — | 0.5 PR + 测试 |
+| **U2** | 跨 scene undo 守卫:**不能只改提交路由**——`wrapMutation` 的 before/after 快照必须来自同一目标 scene(scene-mismatch 时以 `after.canvasId` 的 scene 基线重新采集 before,或 undo 入口按 scene 分别取快照后逐 scene diff);若仅把提交 route 到 `after.canvasId`,diff 会把原画布记录当删除、目标画布已有记录当创建,造成重复创建/误删/服务端分叉。现状 skip 保持为安全兜底,直至同 scene 采集方案落地 | — | 1 PR + 测试(含跨 scene 用例) |
 | **U3** | rejected-forward local 乐观态回滚:`submitChange` terminal-reject 时回滚本地乐观改动(或标 stale)——本调查暴露的独立潜在 bug | — | 1 PR |
 | **U4(defer 到 A4b)** | per-user scoped undo / OT — 仅当实时协作落地 | A4b | 大,独立 epic |
 
