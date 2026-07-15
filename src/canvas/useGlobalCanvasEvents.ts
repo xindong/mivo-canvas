@@ -6,6 +6,7 @@ import { toolForKeyboardShortcut } from './canvasToolRegistry'
 import { importImageFileToCanvas } from '../lib/canvasAssetImport'
 import { useCanvasStore } from '../store/canvasStore'
 import { wrapMutation } from './actions/canvasSyncRuntime'
+import { createArrowNudgeThrottle, type ArrowKey } from './arrowNudgeThrottle'
 
 export type GlobalEventsApi = {
   maskEditNodeId: string | undefined
@@ -78,6 +79,22 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
       pressedTemporaryToolsRef.current = []
       setTemporaryTool(undefined)
     }
+
+    // #arrowflood:方向键连按节流。burst 期间裸 move(即时视觉、零 submit),松键/blur/卸载
+    //   settle 一次。settle = reset 回 before-burst + wrapMutation 重放累计 delta → 单次 submitChange
+    //   (server);local 模式 wrapMutation 命中 local gate → 不 submit(零回归)。多键同按:全部释放才结算。
+    const arrowThrottle = createArrowNudgeThrottle({
+      moveBy: (dx, dy) => useCanvasStore.getState().moveSelectedNodesBy(dx, dy),
+      settle: (accDx, accDy) => {
+        if (accDx === 0 && accDy === 0) return
+        const store = useCanvasStore.getState()
+        // reset 回 before-burst(裸 move,不 submit)。moveSelectedNodesBy 是纯位置 delta,对相同选区
+        //   -acc 精确回退(selection 在 burst 内由其保持,故可逆)。
+        store.moveSelectedNodesBy(-accDx, -accDy)
+        // 一次性重放:wrapMutation snapshot(reset 后=before-burst)→ apply +acc → final,单次 submit。
+        wrapMutation(store.moveSelectedNodesBy)(accDx, accDy)
+      },
+    })
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (isEditingTarget(event.target)) return
@@ -246,20 +263,18 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
         return
       }
 
-      const arrowDelta = event.shiftKey ? 10 : 1
-      // A2 SC:arrow nudge 改 transform(document mutation),经 wrapMutation 包(取参包)。
-      if (event.key === 'ArrowLeft') {
+      // 方向键:经 arrowThrottle 节流(#arrowflood)。原逐 keydown wrapMutation 路径已下线 ——
+      //   防按住方向键 OS key-repeat ~30Hz 走 wrapMutation = 全画布 snapshot×2 + diff × repeat +
+      //   ~30Hz submitChange 队列(server 模式 #256 后成现实体验问题)。burst 期间裸 move(即时视觉、
+      //   零 submit),松键/blur/卸载时 throttle 内部 settle 一次(单次 submitChange)。
+      if (
+        event.key === 'ArrowLeft' ||
+        event.key === 'ArrowRight' ||
+        event.key === 'ArrowUp' ||
+        event.key === 'ArrowDown'
+      ) {
         event.preventDefault()
-        wrapMutation(store.moveSelectedNodesBy)(-arrowDelta, 0)
-      } else if (event.key === 'ArrowRight') {
-        event.preventDefault()
-        wrapMutation(store.moveSelectedNodesBy)(arrowDelta, 0)
-      } else if (event.key === 'ArrowUp') {
-        event.preventDefault()
-        wrapMutation(store.moveSelectedNodesBy)(0, -arrowDelta)
-      } else if (event.key === 'ArrowDown') {
-        event.preventDefault()
-        wrapMutation(store.moveSelectedNodesBy)(0, arrowDelta)
+        arrowThrottle.onKeyDown(event.key as ArrowKey, event.shiftKey)
       }
     }
 
@@ -275,9 +290,21 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
         event.preventDefault()
         releaseTemporaryTool('zoom')
       }
+
+      // 方向键 keyup:移出按住集合,全部释放时结算 burst(单次 submitChange;#arrowflood)。
+      if (
+        event.key === 'ArrowLeft' ||
+        event.key === 'ArrowRight' ||
+        event.key === 'ArrowUp' ||
+        event.key === 'ArrowDown'
+      ) {
+        arrowThrottle.onKeyUp(event.key as ArrowKey)
+      }
     }
 
     const handleWindowBlur = () => {
+      // 焦点丢失:结算任何 pending 方向键 burst(防丢最终位置;#arrowflood)。
+      arrowThrottle.onBlur()
       resetTemporaryTools()
       setZoomOutCursor(false)
       resetPan()
@@ -335,6 +362,8 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
     window.addEventListener('paste', handlePaste)
 
     return () => {
+      // 组件卸载 / effect 重跑:结算 pending 方向键 burst,保证不丢最终位置(#arrowflood)。
+      arrowThrottle.flush()
       window.removeEventListener('keydown', handleKeyDown)
       window.removeEventListener('keyup', handleKeyUp)
       window.removeEventListener('blur', handleWindowBlur)

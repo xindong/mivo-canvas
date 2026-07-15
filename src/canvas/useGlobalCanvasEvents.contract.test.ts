@@ -60,9 +60,15 @@ describe('F1: useGlobalCanvasEvents 快捷键路径经 wrapMutation(源码契约
     expect(source).not.toMatch(/store\.moveSelectedLayer\(/)
   })
 
-  it('Arrow keys → wrapMutation(store.moveSelectedNodesBy)(dx,dy),非裸 store.moveSelectedNodesBy(dx,dy)', () => {
+  it('Arrow keys → 经 createArrowNudgeThrottle 节流;松键/blur/卸载 settle 时经 wrapMutation(store.moveSelectedNodesBy) 一次同步', () => {
+    // #arrowflood:原逐 keydown wrapMutation 在 OS key-repeat(~30Hz)下致 server 模式 submitChange 洪峰
+    //   (全画布 snapshot×2 + diff × repeat)。改节流:keydown 进 throttle(burst 裸 move、零 submit),
+    //   松键/blur/flush 时 settle 一次。settle 路径仍经 wrapMutation(store.moveSelectedNodesBy) →
+    //   attach/detach 接线与单次 submitChange 不变(原契约的核心不变量保留)。
+    expect(source).toContain('createArrowNudgeThrottle')
     expect(source).toContain('wrapMutation(store.moveSelectedNodesBy)')
-    expect(source).not.toMatch(/store\.moveSelectedNodesBy\(/)
+    // burst 期间允许裸 store.moveSelectedNodesBy(即时视觉、不 submit) —— 节流设计的有意行为,
+    //   原 not.toMatch(/store\.moveSelectedNodesBy\(/) 的逐 keydown 禁令已下线(行为由 throttle 单测覆盖)。
   })
 
   it('paste(clipboardAssets)→ wrapMutation(() => store.pasteClipboardAssets(viewportCenter()))', () => {
