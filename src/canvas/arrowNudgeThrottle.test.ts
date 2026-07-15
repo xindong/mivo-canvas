@@ -467,4 +467,81 @@ describe('arrowNudgeThrottle 集成(真 store + wrapMutation + mock port)', () =
     expect(useCanvasStore.getState().nodes.find((n) => n.id === 'n3')!.x).toBe(initialC2N3) // c2 节点零影响 ✓
     __resetCanvasSyncRuntimeQueue()
   })
+
+  // ── #arrowflood P1 续修(Greptile:键盘选区切换未结算)──
+  // pointerdown capture flush(上两测)覆盖鼠标路径;本组覆盖键盘路径 —— handleKeyDown 顶部通用前置 flush
+  //   (非方向键/非纯修饰键 → flush)先于 Escape/Cmd+A 分支。语义(若 flush 在选区切换前发生则 A 正确
+  //   提交)与 pointerdown P1 同构,此处钉死 Escape(清选区)/Cmd+A(扩选区)两具体场景 + Shift 不打断。
+  //   接线事实(handleKeyDown 真调 flush 且排除方向键/修饰键)由 useGlobalCanvasEvents.contract.test 钉死。
+  it('P1 Escape:burst 中 keydown(Escape)先 flush → A 累计位移已提交、选区随后被清', async () => {
+    const { wrapMutation, __resetCanvasSyncRuntimeQueue, useCanvasStore, submitChange } = await loadHarness({ local: false })
+    seedStoreWithTwoNodesSelectedA(useCanvasStore)
+    const initialA = useCanvasStore.getState().nodes.find((n) => n.id === 'n1')!.x
+
+    const throttle = wireThrottleToStore(wrapMutation, useCanvasStore)
+    for (let i = 0; i < 5; i += 1) throttle.onKeyDown('ArrowRight', false)
+    // keydown 通用前置 flush(Escape 触发):settle 在选区仍是 A 时 → 提交 A +5
+    throttle.flush()
+    await flushMicrotasks()
+
+    expect(submitChange).toHaveBeenCalledTimes(1)
+    expect(submitChange.mock.calls[0][0]).toBe('c1')
+    expect(submitChange.mock.calls[0][1]).toMatchObject({ kind: 'edit-node', nodeId: 'n1' })
+    expect(useCanvasStore.getState().nodes.find((n) => n.id === 'n1')!.x).toBe(initialA + 5) // A 累计位移已提交 ✓
+
+    // Escape 分支随后清选区(模拟 store.selectNode(undefined)):A 已提交,清选区不再丢 A 位移(fix 前丢)
+    useCanvasStore.getState().selectNode(undefined)
+    expect(useCanvasStore.getState().selectedNodeId).toBeUndefined() // 选区已清 ✓
+    expect(useCanvasStore.getState().selectedNodeIds).toEqual([]) // 选区 ids 已清 ✓
+    expect(useCanvasStore.getState().nodes.find((n) => n.id === 'n1')!.x).toBe(initialA + 5) // A 位移保持 ✓
+    __resetCanvasSyncRuntimeQueue()
+  })
+
+  it('P1 Cmd+A:burst 中 keydown(Cmd+A)先 flush → A 位移已提交、其他节点零净变化', async () => {
+    const { wrapMutation, __resetCanvasSyncRuntimeQueue, useCanvasStore, submitChange } = await loadHarness({ local: false })
+    seedStoreWithTwoNodesSelectedA(useCanvasStore)
+    const initialA = useCanvasStore.getState().nodes.find((n) => n.id === 'n1')!.x
+    const initialB = useCanvasStore.getState().nodes.find((n) => n.id === 'n2')!.x
+
+    const throttle = wireThrottleToStore(wrapMutation, useCanvasStore)
+    for (let i = 0; i < 5; i += 1) throttle.onKeyDown('ArrowRight', false)
+    // keydown 通用前置 flush(Cmd+A 触发):settle 在选区仍是 A 时 → 只提交 A +5(B 未被选,settle 不碰)
+    throttle.flush()
+    await flushMicrotasks()
+
+    expect(submitChange).toHaveBeenCalledTimes(1)
+    expect(submitChange.mock.calls[0][0]).toBe('c1')
+    expect(submitChange.mock.calls[0][1]).toMatchObject({ kind: 'edit-node', nodeId: 'n1' }) // 只 edit A ✓
+    expect(useCanvasStore.getState().nodes.find((n) => n.id === 'n1')!.x).toBe(initialA + 5) // A 位移已提交 ✓
+    expect(useCanvasStore.getState().nodes.find((n) => n.id === 'n2')!.x).toBe(initialB) // 其他节点零净变化 ✓
+
+    // Cmd+A 分支随后扩选区(模拟 store.selectNodes(all)):扩选区是纯 UI 态(documentSlice 之外),不产生 submit
+    const allVisibleIds = useCanvasStore.getState().nodes.filter((n) => !n.hidden).map((n) => n.id)
+    useCanvasStore.getState().selectNodes(allVisibleIds)
+    await flushMicrotasks()
+    expect(submitChange).toHaveBeenCalledTimes(1) // 扩选区无新增提交 ✓(fix 前此点 settle 会作用于全选 → 冗余 diff)
+    expect(useCanvasStore.getState().nodes.find((n) => n.id === 'n2')!.x).toBe(initialB) // n2 仍零净变化 ✓
+    __resetCanvasSyncRuntimeQueue()
+  })
+
+  it('P1 Shift:burst 中按 Shift 不触发 flush(单次 submit 语义保持)', async () => {
+    // fix 的 keydown 通用 guard 排除纯修饰键(Shift/Meta/Control/Alt):shift-arrow(10px 步长)是 burst 内
+    //   合法组合,Shift 按下不应 flush 打断 burst。语义:burst 内 shiftKey 由 false→true 切换,中间不 flush,
+    //   keyup 仍单次结算(单次 submitChange,累计 = 5×1 + 5×10 = 55)。
+    const { wrapMutation, __resetCanvasSyncRuntimeQueue, useCanvasStore, submitChange } = await loadHarness({ local: false })
+    seedStoreWithSelectedNode(useCanvasStore)
+    const initialX = useCanvasStore.getState().nodes.find((n) => n.id === 'n1')!.x
+
+    const throttle = wireThrottleToStore(wrapMutation, useCanvasStore)
+    // 5× 1px + (Shift 按下,guard 排除修饰键 → 不 flush)+ 5× 10px,同一 burst 不打断
+    for (let i = 0; i < 5; i += 1) throttle.onKeyDown('ArrowRight', false)
+    for (let i = 0; i < 5; i += 1) throttle.onKeyDown('ArrowRight', true)
+    throttle.onKeyUp('ArrowRight')
+    await flushMicrotasks()
+
+    expect(submitChange).toHaveBeenCalledTimes(1) // 单次 submit(未被打断成两个 burst)✓
+    expect(submitChange.mock.calls[0][1]).toMatchObject({ kind: 'edit-node', nodeId: 'n1' })
+    expect(useCanvasStore.getState().nodes.find((n) => n.id === 'n1')!.x).toBe(initialX + 55) // 5×1 + 5×10 = 55 ✓
+    __resetCanvasSyncRuntimeQueue()
+  })
 })

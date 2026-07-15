@@ -8,6 +8,12 @@ import { useCanvasStore } from '../store/canvasStore'
 import { wrapMutation } from './actions/canvasSyncRuntime'
 import { createArrowNudgeThrottle, type ArrowKey } from './arrowNudgeThrottle'
 
+// #arrowflood P1(Greptile:键盘选区/画布切换未结算)— handleKeyDown 顶部通用前置 flush 的键集合。
+//   ARROW_KEYS:burst 内合法 keydown(节流自身处理,不应 flush 自打断)。
+//   MODIFIER_KEYS:纯修饰键;shift-arrow(10px 步长)是 burst 内合法组合,Shift 按下不应打断 burst。
+const ARROW_KEYS = new Set(['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'])
+const MODIFIER_KEYS = new Set(['Shift', 'Meta', 'Control', 'Alt'])
+
 export type GlobalEventsApi = {
   maskEditNodeId: string | undefined
   onCancelMaskEdit: (() => void) | undefined
@@ -98,6 +104,18 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (isEditingTarget(event.target)) return
+
+      // #arrowflood P1 续修(Greptile:键盘选区切换未结算):非方向键、非纯修饰键的任意 keydown 先 flush
+      //   pending 方向键 burst。burst 期间对 A 的裸移动零 submit;若用户在 burst 中按 Escape(清选区,见下方
+      //   Escape 分支 selectNode(undefined))或 Cmd+A(扩选区)等改变选区/场景的键,不先 flush 则 settle 会
+      //   作用于实时选区(空 or 扩大)→ A 的累计位移 -acc/+acc 双 no-op 或作用于错误选区,永不提交,刷新后
+      //   A 回退(pointerdown capture flush 已覆盖鼠标路径 #arrowflood P1 首修,本 guard 补键盘路径,不再靠
+      //   逐键枚举跟维护)。排除纯修饰键(Shift/Meta/Control/Alt):shift-arrow(10px 步长)是 burst 内合法
+      //   组合,Shift 按下不应打断 burst。flush 的 acc=0 idempotent guard 保证普通打键零开销。不动
+      //   arrowNudgeThrottle.ts 纯模块(flush 语义已正确)。
+      if (!ARROW_KEYS.has(event.key) && !MODIFIER_KEYS.has(event.key)) {
+        arrowThrottle.flush()
+      }
 
       const store = useCanvasStore.getState()
       const modifier = event.metaKey || event.ctrlKey
@@ -267,12 +285,7 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
       //   防按住方向键 OS key-repeat ~30Hz 走 wrapMutation = 全画布 snapshot×2 + diff × repeat +
       //   ~30Hz submitChange 队列(server 模式 #256 后成现实体验问题)。burst 期间裸 move(即时视觉、
       //   零 submit),松键/blur/卸载时 throttle 内部 settle 一次(单次 submitChange)。
-      if (
-        event.key === 'ArrowLeft' ||
-        event.key === 'ArrowRight' ||
-        event.key === 'ArrowUp' ||
-        event.key === 'ArrowDown'
-      ) {
+      if (ARROW_KEYS.has(event.key)) {
         event.preventDefault()
         arrowThrottle.onKeyDown(event.key as ArrowKey, event.shiftKey)
       }
@@ -292,12 +305,7 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
       }
 
       // 方向键 keyup:移出按住集合,全部释放时结算 burst(单次 submitChange;#arrowflood)。
-      if (
-        event.key === 'ArrowLeft' ||
-        event.key === 'ArrowRight' ||
-        event.key === 'ArrowUp' ||
-        event.key === 'ArrowDown'
-      ) {
+      if (ARROW_KEYS.has(event.key)) {
         arrowThrottle.onKeyUp(event.key as ArrowKey)
       }
     }

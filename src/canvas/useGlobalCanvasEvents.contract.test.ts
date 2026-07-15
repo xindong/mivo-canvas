@@ -83,6 +83,21 @@ describe('F1: useGlobalCanvasEvents 快捷键路径经 wrapMutation(源码契约
     expect(source).toContain('removeEventListener')
   })
 
+  it('#arrowflood P1 续修:handleKeyDown 顶部通用前置 flush(非方向键/非纯修饰键),覆盖 Escape/Cmd+A 等键盘选区切换', () => {
+    // Greptile P1(键盘选区切换未结算):pointerdown capture flush 覆盖鼠标路径,但 burst 中按 Escape(清选区)
+    //   或 Cmd+A(扩选区)走 keydown,不先 flush 则 settle 作用于实时选区(空/扩大)→ A 的 -acc/+acc 双 no-op
+    //   或作用于错误选区,A 永不提交,刷新后 A 回退(节流引入的新回归窗口)。fix:handleKeyDown 顶部
+    //   (isEditingTarget early-return 之后、一切分支之前)加通用前置 flush —— event.key 非四个方向键、且非纯修饰键
+    //   (Shift/Meta/Control/Alt)→ arrowThrottle.flush()。覆盖 Escape/Cmd+A 及未来任何键盘选区/画布路径,不靠
+    //   逐键枚举。排除方向键:burst 自身 keydown 不应 flush 自打断;排除纯修饰键:shift-arrow(10px 步长)
+    //   是 burst 内合法组合,Shift 按下不应打断 burst。flush 的 acc=0 idempotent guard 保证普通打键零开销。
+    // 钉死接线:guard 同时排除 ARROW_KEYS + MODIFIER_KEYS,且 body 调 arrowThrottle.flush()。语义(A 正确
+    //   提交、其他节点零影响、Shift 不打断单次 submit)由 arrowNudgeThrottle.test 的 P1 Escape/Cmd+A/Shift 集成测覆盖。
+    expect(source).toMatch(/if \(!ARROW_KEYS\.has\(event\.key\) && !MODIFIER_KEYS\.has\(event\.key\)\)[\s\S]*?arrowThrottle\.flush\(\)/)
+    expect(source).toContain("new Set(['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'])")
+    expect(source).toContain("new Set(['Shift', 'Meta', 'Control', 'Alt'])")
+  })
+
   it('paste(clipboardAssets)→ wrapMutation(() => store.pasteClipboardAssets(viewportCenter()))', () => {
     // lambda 包装(保 viewportCenter 落点),regex not-to-match 不适用(lambda body 内含 store.X());只 toContain。
     expect(source).toContain('wrapMutation(() => store.pasteClipboardAssets(viewportCenter()))()')
