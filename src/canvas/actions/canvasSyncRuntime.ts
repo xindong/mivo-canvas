@@ -470,5 +470,14 @@ export const wrapCanvasActionRuntimeWithSync = (runtime: CanvasActionRuntime): C
     showAllHiddenNodes: wrapMutation(runtime.showAllHiddenNodes),
     deleteNode: wrapMutation(runtime.deleteNode),
     deleteSelectedNodes: wrapMutation(runtime.deleteSelectedNodes),
+    // F4:runtime 路径(canvasActionModel 菜单 "Generate into slot" + ai-slot view-details)的 generateIntoAiSlot
+    // 注入 onSceneMutation —— catch 删 slot 经回调发 delete-node(与 chat generationFacade 注入对称)。不 wrapMutation
+    // (async 生成不能同步 before/after wrap,那是 Block 3);只注入回调,内部失败删 slot 那一步经 wrapMutationForScene
+    // 发 delete-node。local 分支早 return runtime → raw,catch default passthrough,行为不退。
+    generateIntoAiSlot: (slotId, prompt, options) =>
+      runtime.generateIntoAiSlot(slotId, prompt, {
+        ...options,
+        onSceneMutation: (sceneId: string, mutate: () => void) => wrapMutationForScene(sceneId, mutate)(),
+      }),
   }
 }

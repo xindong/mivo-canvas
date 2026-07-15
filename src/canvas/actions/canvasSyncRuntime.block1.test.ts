@@ -9,6 +9,7 @@
 // retry 在真实失败后(slot 已删)→ 新建 slot(新 id);local 模式 gate 不发。
 
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { CanvasActionRuntime } from './canvasActionTypes'
 import type { MivoCanvasNode } from '../../types/mivoCanvas'
 import type { CanvasChange, ChangeOutcome } from '../../lib/canvasSyncPort'
 
@@ -387,6 +388,43 @@ describe('T2.2 Block 1 — ai-slot 占位落 server + rollback(delete-node)', ()
     await drain()
     expect(prep2.slotId).not.toBe(prep1.slotId) // 新 id(A 已删,不复用)
     expect(submitChange).toHaveBeenCalledWith('c1', expect.objectContaining({ kind: 'create-node' }))
+    __resetCanvasSyncRuntimeQueue()
+  })
+
+  it('F4 server:菜单/runtime 路径 generateIntoAiSlot 失败 → 同 slotId 先 create-node 后 delete-node(覆盖 baselineSnapshot rollback 分支)', async () => {
+    const { __resetCanvasSyncRuntimeQueue, wrapCanvasActionRuntimeWithSync, submitChange, pollTask, useCanvasStore } = await loadRuntimeModule()
+    seedEmptyCanvas(useCanvasStore)
+    const store = useCanvasStore.getState()
+    // 菜单等价:用 wrapCanvasActionRuntimeWithSync 包的 runtime(生产 canvasActionModel 菜单 / ai-slot view-details 经此路径)
+    const runtime = wrapCanvasActionRuntimeWithSync({
+      addAiSlotNode: store.addAiSlotNode,
+      generateIntoAiSlot: store.generateIntoAiSlot,
+    } as unknown as CanvasActionRuntime)
+
+    // 菜单建 slot(经 wrapped addAiSlotNode)→ create-node
+    const slotId = runtime.addAiSlotNode({ x: 0, y: 0 }, { width: 200, height: 200 }, 'cat')
+    await drain()
+    expect(submitChange).toHaveBeenCalledWith('c1', expect.objectContaining({ kind: 'create-node' }))
+
+    pollTask.mockResolvedValueOnce(failedView('boom'))
+    // runtime.generateIntoAiSlot(菜单路径)失败 → F4 注入 onSceneMutation → catch 删 slot 发 delete-node。
+    // 覆盖 baselineSnapshot rollback 分支:菜单不传 skipSlotHistoryBaseline → generateIntoAiSlot:586 捕获 baselineSnapshot
+    // → catch 走 rollbackLatestHistoryBaseline(chat F1 走 skipSlotHistoryBaseline→filter 分支,此例补 rollback 分支)。
+    await expect(runtime.generateIntoAiSlot(slotId, 'cat', { sceneId: 'c1' })).rejects.toThrow(/boom/)
+    await drain()
+
+    expect(submitChange).toHaveBeenCalledWith('c1', expect.objectContaining({ kind: 'delete-node', nodeId: slotId }))
+    // create 在 delete 之前(queueByCanvas 串行:create 终态后 delete 才发)
+    const createCall = submitChange.mock.calls.find(
+      ([cid, ch]) => cid === 'c1' && (ch as { kind?: string; node?: { id?: string } }).kind === 'create-node' && (ch as { node?: { id?: string } }).node?.id === slotId,
+    )
+    const deleteCall = submitChange.mock.calls.find(
+      ([cid, ch]) => cid === 'c1' && (ch as { kind?: string; nodeId?: string }).kind === 'delete-node' && (ch as { nodeId?: string }).nodeId === slotId,
+    )
+    expect(createCall).toBeDefined()
+    expect(deleteCall).toBeDefined()
+    expect(submitChange.mock.calls.indexOf(createCall!)).toBeLessThan(submitChange.mock.calls.indexOf(deleteCall!))
+    expect(useCanvasStore.getState().canvases.c1.nodes.some((n) => n.id === slotId)).toBe(false)
     __resetCanvasSyncRuntimeQueue()
   })
 })

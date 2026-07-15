@@ -657,4 +657,3 @@ describe('canvasSyncRuntime — Block 3 asset attach/detach side-effects', () =>
     __resetCanvasSyncRuntimeQueue()
   })
 })
-
