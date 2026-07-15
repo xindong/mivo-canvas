@@ -60,9 +60,42 @@ describe('F1: useGlobalCanvasEvents 快捷键路径经 wrapMutation(源码契约
     expect(source).not.toMatch(/store\.moveSelectedLayer\(/)
   })
 
-  it('Arrow keys → wrapMutation(store.moveSelectedNodesBy)(dx,dy),非裸 store.moveSelectedNodesBy(dx,dy)', () => {
+  it('Arrow keys → 经 createArrowNudgeThrottle 节流;松键/blur/卸载 settle 时经 wrapMutation(store.moveSelectedNodesBy) 一次同步', () => {
+    // #arrowflood:原逐 keydown wrapMutation 在 OS key-repeat(~30Hz)下致 server 模式 submitChange 洪峰
+    //   (全画布 snapshot×2 + diff × repeat)。改节流:keydown 进 throttle(burst 裸 move、零 submit),
+    //   松键/blur/flush 时 settle 一次。settle 路径仍经 wrapMutation(store.moveSelectedNodesBy) →
+    //   attach/detach 接线与单次 submitChange 不变(原契约的核心不变量保留)。
+    expect(source).toContain('createArrowNudgeThrottle')
     expect(source).toContain('wrapMutation(store.moveSelectedNodesBy)')
-    expect(source).not.toMatch(/store\.moveSelectedNodesBy\(/)
+    // burst 期间允许裸 store.moveSelectedNodesBy(即时视觉、不 submit) —— 节流设计的有意行为,
+    //   原 not.toMatch(/store\.moveSelectedNodesBy\(/) 的逐 keydown 禁令已下线(行为由 throttle 单测覆盖)。
+  })
+
+  it('#arrowflood P1:pointerdown(capture 阶段)先 flush pending burst,防选区/场景切换后 A 累计位移永不提交', () => {
+    // Greptile P1(结算目标随实时选区漂移):burst 期间 A 的裸移动零 submit;若 pointerdown 不先 flush,
+    //   选区/画布切换后 settle 作用于实时选区(B/新画布)→ A 永不提交,刷新后 A 回退。fix:在 window
+    //   pointerdown capture 阶段(先于画布/选区/侧栏 click→selectNode/openCanvas 的 bubble handler)调
+    //   arrowThrottle.flush()。钉死 addEventListener+capture+handler 体含 flush+removeEventListener 四要素,
+    //   防有人删 pointerdown flush 接线(回归 A 回退)。语义(换选区 A 提交 B 零影响)由 arrowNudgeThrottle.test
+    //   的 P1 集成测覆盖,本文件只钉源码接线事实。
+    expect(source).toContain("addEventListener('pointerdown', handlePointerDown, { capture: true })")
+    expect(source).toMatch(/handlePointerDown = \(\) => \{[\s\S]*?arrowThrottle\.flush\(\)/)
+    expect(source).toContain('removeEventListener')
+  })
+
+  it('#arrowflood P1 续修:handleKeyDown 顶部通用前置 flush(非方向键/非纯修饰键),覆盖 Escape/Cmd+A 等键盘选区切换', () => {
+    // Greptile P1(键盘选区切换未结算):pointerdown capture flush 覆盖鼠标路径,但 burst 中按 Escape(清选区)
+    //   或 Cmd+A(扩选区)走 keydown,不先 flush 则 settle 作用于实时选区(空/扩大)→ A 的 -acc/+acc 双 no-op
+    //   或作用于错误选区,A 永不提交,刷新后 A 回退(节流引入的新回归窗口)。fix:handleKeyDown 顶部
+    //   (isEditingTarget early-return 之后、一切分支之前)加通用前置 flush —— event.key 非四个方向键、且非纯修饰键
+    //   (Shift/Meta/Control/Alt)→ arrowThrottle.flush()。覆盖 Escape/Cmd+A 及未来任何键盘选区/画布路径,不靠
+    //   逐键枚举。排除方向键:burst 自身 keydown 不应 flush 自打断;排除纯修饰键:shift-arrow(10px 步长)
+    //   是 burst 内合法组合,Shift 按下不应打断 burst。flush 的 acc=0 idempotent guard 保证普通打键零开销。
+    // 钉死接线:guard 同时排除 ARROW_KEYS + MODIFIER_KEYS,且 body 调 arrowThrottle.flush()。语义(A 正确
+    //   提交、其他节点零影响、Shift 不打断单次 submit)由 arrowNudgeThrottle.test 的 P1 Escape/Cmd+A/Shift 集成测覆盖。
+    expect(source).toMatch(/if \(!ARROW_KEYS\.has\(event\.key\) && !MODIFIER_KEYS\.has\(event\.key\)\)[\s\S]*?arrowThrottle\.flush\(\)/)
+    expect(source).toContain("new Set(['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'])")
+    expect(source).toContain("new Set(['Shift', 'Meta', 'Control', 'Alt'])")
   })
 
   it('paste(clipboardAssets)→ wrapMutation(() => store.pasteClipboardAssets(viewportCenter()))', () => {

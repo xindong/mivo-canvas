@@ -6,6 +6,13 @@ import { toolForKeyboardShortcut } from './canvasToolRegistry'
 import { importImageFileToCanvas } from '../lib/canvasAssetImport'
 import { useCanvasStore } from '../store/canvasStore'
 import { wrapMutation } from './actions/canvasSyncRuntime'
+import { createArrowNudgeThrottle, type ArrowKey } from './arrowNudgeThrottle'
+
+// #arrowflood P1(Greptile:键盘选区/画布切换未结算)— handleKeyDown 顶部通用前置 flush 的键集合。
+//   ARROW_KEYS:burst 内合法 keydown(节流自身处理,不应 flush 自打断)。
+//   MODIFIER_KEYS:纯修饰键;shift-arrow(10px 步长)是 burst 内合法组合,Shift 按下不应打断 burst。
+const ARROW_KEYS = new Set(['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'])
+const MODIFIER_KEYS = new Set(['Shift', 'Meta', 'Control', 'Alt'])
 
 export type GlobalEventsApi = {
   maskEditNodeId: string | undefined
@@ -79,8 +86,36 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
       setTemporaryTool(undefined)
     }
 
+    // #arrowflood:方向键连按节流。burst 期间裸 move(即时视觉、零 submit),松键/blur/卸载
+    //   settle 一次。settle = reset 回 before-burst + wrapMutation 重放累计 delta → 单次 submitChange
+    //   (server);local 模式 wrapMutation 命中 local gate → 不 submit(零回归)。多键同按:全部释放才结算。
+    const arrowThrottle = createArrowNudgeThrottle({
+      moveBy: (dx, dy) => useCanvasStore.getState().moveSelectedNodesBy(dx, dy),
+      settle: (accDx, accDy) => {
+        if (accDx === 0 && accDy === 0) return
+        const store = useCanvasStore.getState()
+        // reset 回 before-burst(裸 move,不 submit)。moveSelectedNodesBy 是纯位置 delta,对相同选区
+        //   -acc 精确回退(selection 在 burst 内由其保持,故可逆)。
+        store.moveSelectedNodesBy(-accDx, -accDy)
+        // 一次性重放:wrapMutation snapshot(reset 后=before-burst)→ apply +acc → final,单次 submit。
+        wrapMutation(store.moveSelectedNodesBy)(accDx, accDy)
+      },
+    })
+
     const handleKeyDown = (event: KeyboardEvent) => {
       if (isEditingTarget(event.target)) return
+
+      // #arrowflood P1 续修(Greptile:键盘选区切换未结算):非方向键、非纯修饰键的任意 keydown 先 flush
+      //   pending 方向键 burst。burst 期间对 A 的裸移动零 submit;若用户在 burst 中按 Escape(清选区,见下方
+      //   Escape 分支 selectNode(undefined))或 Cmd+A(扩选区)等改变选区/场景的键,不先 flush 则 settle 会
+      //   作用于实时选区(空 or 扩大)→ A 的累计位移 -acc/+acc 双 no-op 或作用于错误选区,永不提交,刷新后
+      //   A 回退(pointerdown capture flush 已覆盖鼠标路径 #arrowflood P1 首修,本 guard 补键盘路径,不再靠
+      //   逐键枚举跟维护)。排除纯修饰键(Shift/Meta/Control/Alt):shift-arrow(10px 步长)是 burst 内合法
+      //   组合,Shift 按下不应打断 burst。flush 的 acc=0 idempotent guard 保证普通打键零开销。不动
+      //   arrowNudgeThrottle.ts 纯模块(flush 语义已正确)。
+      if (!ARROW_KEYS.has(event.key) && !MODIFIER_KEYS.has(event.key)) {
+        arrowThrottle.flush()
+      }
 
       const store = useCanvasStore.getState()
       const modifier = event.metaKey || event.ctrlKey
@@ -246,20 +281,13 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
         return
       }
 
-      const arrowDelta = event.shiftKey ? 10 : 1
-      // A2 SC:arrow nudge 改 transform(document mutation),经 wrapMutation 包(取参包)。
-      if (event.key === 'ArrowLeft') {
+      // 方向键:经 arrowThrottle 节流(#arrowflood)。原逐 keydown wrapMutation 路径已下线 ——
+      //   防按住方向键 OS key-repeat ~30Hz 走 wrapMutation = 全画布 snapshot×2 + diff × repeat +
+      //   ~30Hz submitChange 队列(server 模式 #256 后成现实体验问题)。burst 期间裸 move(即时视觉、
+      //   零 submit),松键/blur/卸载时 throttle 内部 settle 一次(单次 submitChange)。
+      if (ARROW_KEYS.has(event.key)) {
         event.preventDefault()
-        wrapMutation(store.moveSelectedNodesBy)(-arrowDelta, 0)
-      } else if (event.key === 'ArrowRight') {
-        event.preventDefault()
-        wrapMutation(store.moveSelectedNodesBy)(arrowDelta, 0)
-      } else if (event.key === 'ArrowUp') {
-        event.preventDefault()
-        wrapMutation(store.moveSelectedNodesBy)(0, -arrowDelta)
-      } else if (event.key === 'ArrowDown') {
-        event.preventDefault()
-        wrapMutation(store.moveSelectedNodesBy)(0, arrowDelta)
+        arrowThrottle.onKeyDown(event.key as ArrowKey, event.shiftKey)
       }
     }
 
@@ -275,9 +303,16 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
         event.preventDefault()
         releaseTemporaryTool('zoom')
       }
+
+      // 方向键 keyup:移出按住集合,全部释放时结算 burst(单次 submitChange;#arrowflood)。
+      if (ARROW_KEYS.has(event.key)) {
+        arrowThrottle.onKeyUp(event.key as ArrowKey)
+      }
     }
 
     const handleWindowBlur = () => {
+      // 焦点丢失:结算任何 pending 方向键 burst(防丢最终位置;#arrowflood)。
+      arrowThrottle.onBlur()
       resetTemporaryTools()
       setZoomOutCursor(false)
       resetPan()
@@ -289,6 +324,17 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
       resetZoomGesture()
       setEditingTextNodeId(undefined)
       setActiveConnectorDropTargetId(undefined)
+    }
+
+    // #arrowflood P1(Greptile:结算目标随实时选区漂移):pointerdown 在 capture 阶段(先于画布/选区/
+    //   侧栏 click→selectNode/openCanvas 的 bubble handler)先 flush pending 方向键 burst。burst 期间对 A
+    //   的裸移动零 submit;若用户在 burst 中点击换选区到 B 或切画布,不先 flush 则 settle 会作用于实时选区
+    //   (已是 B)→ A 的累计位移永不提交,刷新/重连后 A 回退(节流引入的新回归窗口)。pointerdown 先行使
+    //   settle 仍落在 A(选区/场景未变),server 收到 A 的正确位移。flush 内 idempotent guard:无 pending
+    //   burst时 acc=0 no-op,不误伤普通点击。键盘/程序化切选区/画布路径当前不存在(grep 无键盘切画布入口),
+    //   若未来引入需在 store 层补「按 ids move」(超出本 fix boundary)。
+    const handlePointerDown = () => {
+      arrowThrottle.flush()
     }
 
     const handlePaste = async (event: ClipboardEvent) => {
@@ -332,12 +378,18 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
     window.addEventListener('keydown', handleKeyDown)
     window.addEventListener('keyup', handleKeyUp)
     window.addEventListener('blur', handleWindowBlur)
+    // capture:先于 bubble 阶段的 click→selectNode/openCanvas,保证 flush 在选区/场景切换前发生(#arrowflood P1)。
+    window.addEventListener('pointerdown', handlePointerDown, { capture: true })
     window.addEventListener('paste', handlePaste)
 
     return () => {
+      // 组件卸载 / effect 重跑:结算 pending 方向键 burst,保证不丢最终位置(#arrowflood)。
+      arrowThrottle.flush()
       window.removeEventListener('keydown', handleKeyDown)
       window.removeEventListener('keyup', handleKeyUp)
       window.removeEventListener('blur', handleWindowBlur)
+      // capture 标志须与 add 一致,确保能正确移除 listener(#arrowflood P1)。
+      window.removeEventListener('pointerdown', handlePointerDown, { capture: true })
       window.removeEventListener('paste', handlePaste)
     }
   }, [
