@@ -59,9 +59,14 @@ const classifyFieldPathTarget = (
   const last = fieldPath[fieldPath.length - 1]
   if (typeof last === 'number') return 'array-element'
   const nextValue = readValueAtPath(afterRecord, fieldPath)
-  if (Array.isArray(nextValue) || isPlainObject(nextValue)) return 'container'
+  // ③(B′,T2.2 Block 2 review):数组目标单独 'array-field'(与 plainObject 'container' 区分)——delete 合法
+  //   (validateFieldIntent 放行 array-field delete,set 仍拒)。解决 aiWorkflow 含 sourceNodeIds 等数组 child
+  //   无法 leaf-delete(被当 container-delete 拒)的契约缺口。
+  if (Array.isArray(nextValue)) return 'array-field'
+  if (isPlainObject(nextValue)) return 'container'
   const prevValue = readValueAtPath(beforeRecord, fieldPath)
-  if (Array.isArray(prevValue) || isPlainObject(prevValue)) return 'container'
+  if (Array.isArray(prevValue)) return 'array-field' // after 缺失(被删)但 before 是数组 → array-field
+  if (isPlainObject(prevValue)) return 'container'
   return 'leaf'
 }
 

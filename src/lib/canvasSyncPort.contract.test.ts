@@ -124,7 +124,7 @@ describe('CanvasSyncPort interface surface (G1-b transport-neutral)', () => {
 
   it('R3-P1-1: FieldPathTarget + FieldSchemaClassifier are exported (schema-aware contract surface)', () => {
     // port 对 schema 不透明(FieldIntent.value:unknown),但 validator 可选接受调用方提供的 classifier。
-    expectTypeOf<FieldPathTarget>().toEqualTypeOf<'leaf' | 'container' | 'array-element'>()
+    expectTypeOf<FieldPathTarget>().toEqualTypeOf<'leaf' | 'container' | 'array-element' | 'array-field'>()
     expectTypeOf<FieldSchemaClassifier>().toEqualTypeOf<(fieldPath: FieldPath) => FieldPathTarget>()
   })
 })
@@ -338,13 +338,22 @@ describe('R3-P1-1: schema-aware leaf/container classification (delete-field + at
     const containers = ['transform', 'relations', 'layout', 'constraints', 'asset', 'generation', 'aiWorkflow', 'annotationBounds', 'imageCrop', 'assetSourceDimensions']
     const arrays = ['fills', 'strokes', 'effects', 'markupPoints', 'experimentalAnchors']
     const leaves = ['id', 'type', 'title', 'revision', 'text', 'fontSize', 'textColor', 'fontWeight', 'textAlign', 'textAutoWidth', 'markupKind', 'markupBrushKind', 'markupStampKind', 'markupCornerRadius', 'sectionTitleVisible', 'sectionLockMode', 'sectionTemplateId', 'markdownDisplayMode', 'imageHasTransparency', 'sourceNodeId', 'groupId', 'locked', 'hidden', 'favorited', 'markupStartArrow', 'markupEndArrow']
+    // ③(B′,T2.2 Block 2 review):container 的数组 child(parent 是 container,child 字段是数组)→ array-field。
+    //   与生产 classifyFieldPathTarget(Array.isArray value-based)对齐:数组目标 delete 合法、set 仍拒。
+    const arrayChildrenOfContainer: Record<string, string[]> = {
+      aiWorkflow: ['sourceNodeIds'],
+      relations: ['parentIds'],
+    }
     if (arrays.includes(seg0)) {
-      if (path.length === 1) return 'container' // 数组字段本身是数组容器(delete ['fills'] 拒)
+      // ③(B′):数组字段本身 → array-field(delete 合法,set 仍拒;set ['fills']=[whole] 经 structural non-atomic-parent-set 拒)
+      if (path.length === 1) return 'array-field'
       if (path.length === 2 && typeof path[1] === 'number') return 'array-element' // ['fills',0]
       return 'leaf' // ['fills',0,'color']
     }
     if (containers.includes(seg0)) {
       if (path.length === 1) return 'container' // ['transform']
+      // ③(B′):container 的数组 child → array-field(解决 aiWorkflow.sourceNodeIds 等无法整体删的契约缺口)
+      if (path.length === 2 && arrayChildrenOfContainer[seg0]?.includes(path[1] as string)) return 'array-field'
       return 'leaf' // ['transform','x']
     }
     if (leaves.includes(seg0)) return 'leaf'
@@ -357,10 +366,23 @@ describe('R3-P1-1: schema-aware leaf/container classification (delete-field + at
     expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['transform'] }, nodeClassifier)).toThrow(/container-delete-field/)
   })
 
-  it('R3-P1-1 NEGATIVE: delete-field on array root container (fills) rejected', () => {
-    // delete ['fills'] = 删整个 fills Y.Array = 整子树删除 + 数组结构编辑 deferred;封死。
-    expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['fills'] }, nodeClassifier)).toThrow(FieldIntentError)
-    expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['fills'] }, nodeClassifier)).toThrow(/container-delete-field/)
+  it('③(B′) POSITIVE: delete-field on array root (fills) is legal — array-field delete (LWW tombstone, not clobber)', () => {
+    // ③(B′,T2.2 Block 2 review):delete ['fills'] 目标是数组字段 → array-field → delete 合法。删除是低频有意图操作,
+    //   LWW+per-field clock 下产生 tombstone、并发 peer 编辑走 stale 通知,与删整个 plain-object 容器同构。
+    //   set ['fills'] 仍拒(整数组替换 clobber,见下方 ③(B′) NEGATIVE regression)。
+    expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['fills'] }, nodeClassifier)).not.toThrow()
+  })
+
+  it('③(B′) POSITIVE: delete-field on array child of container (aiWorkflow.sourceNodeIds) is legal', () => {
+    // aiWorkflow(容器)含 sourceNodeIds(数组 child)无法整体删的契约缺口修复:数组 child → array-field → delete 合法。
+    expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['aiWorkflow', 'sourceNodeIds'] }, nodeClassifier)).not.toThrow()
+  })
+
+  it('③(B′) NEGATIVE regression: set whole array (fills) still rejected — clobber defense intact (line 277-285)', () => {
+    // set ['fills']=[whole] = 整数组替换 = clobber 吞 peer insert,封死(③(B′) 仅开 delete 方向,set 维持)。
+    // 非原子 value(structural non-atomic-parent-set)+ 原子值到数组路径(atomic-value-to-container-path)均拒。
+    expect(() => validateFieldIntentStructural({ op: 'set', fieldPath: ['fills'], value: [{ id: 'f1' }] })).toThrow(/non-atomic-parent-set/)
+    expect(() => validateFieldIntent({ op: 'set', fieldPath: ['fills'], value: 'not-array' }, nodeClassifier)).toThrow(/atomic-value-to-container-path/)
   })
 
   it('R3-P1-1 NEGATIVE: delete-field on array element (fills[0]) rejected — unstable index, by-stable-id deferred', () => {
