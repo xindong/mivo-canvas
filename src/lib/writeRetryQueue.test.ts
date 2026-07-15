@@ -2503,4 +2503,49 @@ describe('F2 (T2.2 Block 2 review) — seq 防逆序 stale asset ref', () => {
     expect(seqs[1]! > seqs[0]!).toBe(true) // 严格递增
     expect(seqs[2]! > seqs[1]!).toBe(true)
   })
+
+  // F3-ter(T2.2 Block 2 五轮):seq 降级高水位对齐——IDB tx 故障期 fallback seq 仍 > 进程内已分配 durable seq,
+  //   防 fallback 回退到 < durable → 与 durable 撞号/逆序 → [detach,attach] 误排 → B ref 永久残留。
+  //   审官复现:durable seq=1,2(IDB 成功)→ META tx 注错 → 旧 fallback 给 seqMemCounter++=1 < 2(旧 seqMemCounter
+  //   不在 IDB 成功时 bump)→ 与 seq=1 撞号且逆序。F3-ter:seqHighWater 在 IDB 成功时同步 bump(=2),fallback
+  //   取 seqHighWater+1=3 > 2;IDB 恢复后首次成功 reconciliation:max(cur+1, seqHighWater+1) 防 stale cur 撞号。
+  //   stubIdbTxThrows 在 IDB-failure describe 内(本 describe 不可见),故 inline 同形 tx-throwing stub。
+  it('F3-ter durable seq=1,2 → IDB tx 注错 → fallback seq=seqHighWater+1=3(>2 不撞号)→ 恢复 reconciliation seq=4(>3)', async () => {
+    const stubIdbTxThrowsLocal = () => {
+      const fakeDb = {
+        objectStoreNames: { contains: () => true },
+        transaction: () => { throw new Error('idb tx boom') },
+        close: () => {},
+      }
+      vi.stubGlobal('indexedDB', {
+        open: () => {
+          const req: { onupgradeneeded: ((e: { target: unknown }) => void) | null; onsuccess: ((e: { target: unknown }) => void) | null; onerror: ((e: { target: unknown }) => void) | null; result: unknown } = { onupgradeneeded: null, onsuccess: null, onerror: null, result: undefined }
+          queueMicrotask(() => { req.result = fakeDb; req.onsuccess?.({ target: req }) })
+          return req
+        },
+      })
+    }
+    const exec = refTrackingExecutor()
+    const q = makeQueue(exec.fn)
+    // ① 两次 enqueue(IDB 正常)→ durable seq=1,2;seqHighWater 同步 bump 到 2(旧 seqMemCounter 不 bump)
+    await q.enqueue(attachBOp)
+    await q.enqueue(detachBOp)
+    const durable = (await __dumpWritesForTest()).map((r) => r.seq ?? 0).sort((a, b) => a - b)
+    expect(durable).toEqual([1, 2])
+    // ② 注错 IDB tx + drop dbPromise(__setWriteQueueDbNameForTest 只 drop dbPromise,不清 store、不重置 seqHighWater=2)
+    stubIdbTxThrowsLocal()
+    __setWriteQueueDbNameForTest('f3ter-fault')
+    // ③ 新 enqueue → nextSeq IDB tx throws → fallback seq=seqHighWater+1=3(旧代码给 1 < 2,撞号逆序)
+    await q.enqueue(attachBOp)
+    const faultSeqs = (await __dumpWritesForTest()).map((r) => r.seq ?? 0)
+    expect(faultSeqs).toContain(3) // fallback seq=3
+    expect(Math.max(...faultSeqs)).toBe(3) // > durable 2(seqHighWater+1,不撞号逆序)
+    // ④ 恢复:unstub indexedDB + 切新空 DB(cur=0)→ 下次 nextSeq reconciliation:max(cur+1=1, seqHighWater+1=4)=4 > fallback 3
+    vi.unstubAllGlobals()
+    __setWriteQueueDbNameForTest('f3ter-recover')
+    await q.enqueue(detachBOp)
+    const recoverSeqs = (await __dumpWritesForTest()).map((r) => r.seq ?? 0).sort((a, b) => a - b)
+    expect(recoverSeqs).toContain(4) // recovery seq=4(reconciliation 防 stale cur 撞号)
+    expect(Math.max(...recoverSeqs)).toBe(4) // > fallback 3
+  })
 })

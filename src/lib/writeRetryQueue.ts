@@ -1085,11 +1085,19 @@ const deleteWrite = async (id: string): Promise<void> => {
 // IDB 不可用降级 module counter(per-tab,degraded 模式;IDB 不可用时 enqueuePersistWrite 本就 memStore 兜底,
 // 单 tab 内 ++ 仍唯一)。META seqCounter key 由 __resetWriteQueueDb 的 clearIdbStore 清(测试间复位)。
 const SEQ_COUNTER_KEY = 'seqCounter'
-let seqMemCounter = 0
+// F3-ter(T2.2 Block 2 五轮):进程内 seq 高水位——追踪本 process 内(含 IDB 成功 + fallback)分配过的最大 seq。
+//   防 IDB tx 故障降级 memCounter 时回退到 < 已分配的 durable seq(审官复现:durable seq=1,2 → META get 注错 →
+//   旧 fallback 给 seq=1 < 2 → 与已存 seq=1 撞号且逆序 → [detach,attach] 误排 → B ref 永久残留)。
+//   fallback 取 seqHighWater+1(必 > 进程内任何已分配 seq,含 IDB 成功期分配的)。IDB 恢复后首次成功 nextSeq
+//   reconciliation:nextVal=max(cur+1, seqHighWater+1) 并 put——IDB cur 可能 stale(fallback 期未写 IDB),防撞号。
+let seqHighWater = 0
 const nextSeq = async (): Promise<number> => {
   if (!isIdbAvailable()) {
-    seqMemCounter += 1
-    return seqMemCounter
+    // 完全 IDB 不可用:per-tab mem 高水位(跨 tab 非单调,degraded)。
+    //   跨 tab 限制:多 tab 同时 fallback 各自 seqHighWater 不互知 → 跨 tab 可能逆序;IDB 不可用时 enqueuePersistWrite
+    //   本就 memStore 兜底(不持久、刷新即丢),接受此降级(fail-visible:warnIdbDegradation 已在 openDb 阶段告警)。
+    seqHighWater += 1
+    return seqHighWater
   }
   // 原子 RMW:readwrite tx 内 get→+1→put;tx.oncomplete 时 nextVal 已由 onsuccess 置定,跨 key/跨 tab 串行唯一。
   let nextVal = 0
@@ -1099,18 +1107,26 @@ const nextSeq = async (): Promise<number> => {
       const req = store.get(SEQ_COUNTER_KEY)
       req.onsuccess = () => {
         const cur = (req.result as { key: string; value?: number } | undefined)?.value ?? 0
-        nextVal = cur + 1
+        // F3-ter reconciliation:IDB 恢复后 cur 可能 stale(低于 fallback 期分配的 seqHighWater);
+        //   nextVal=max(cur+1, seqHighWater+1) 防 fallback seq 撞号,并 put 推进 IDB counter 到高水位。
+        //   正常运行(无 fallback)cur+1 == seqHighWater+1,max 取 cur+1(等价),无副作用。
+        nextVal = Math.max(cur + 1, seqHighWater + 1)
         store.put({ key: SEQ_COUNTER_KEY, value: nextVal })
       }
     })
-    if (nextVal > 0) return nextVal
+    if (nextVal > 0) {
+      seqHighWater = nextVal // 更新进程高水位(IDB 成功分配)
+      return nextVal
+    }
   } catch (error) {
-    // IDB tx 故障(fault-injected / blocked / degraded):降级 mem counter,不抛 —— 与 getAllWrites/putWrite 的
-    // mem 兜底同模式,enqueue 永不因 seq 分配失败而 throw(per-tab 内 ++ 仍唯一;IDB 恢复后下次 nextSeq 续用持久 counter)。
+    // IDB tx 故障(fault-injected / blocked / degraded):降级进程高水位 fallback,不抛 —— 与 getAllWrites/putWrite 的
+    // mem 兜底同模式,enqueue 永不因 seq 分配失败而 throw(seqHighWater+1 必 > 进程内已分配 seq;IDB 恢复后 reconciliation 续用持久 counter)。
     warnIdbDegradation('seq counter increment failed; using in-memory fallback', error)
   }
-  seqMemCounter += 1
-  return seqMemCounter
+  // fallback:IDB tx 故障(blocked/degraded/injected)→ 取进程高水位 + 1(必 > 进程内任何已分配 seq,
+  //   含 IDB 成功期分配的),更新 seqHighWater。enqueue 永不因 seq 分配失败而 throw。
+  seqHighWater += 1
+  return seqHighWater
 }
 
 // ── FX-7 / A6: durable terminal ledger (dead-letter / conflict / rejected outcomes) ──
@@ -2346,8 +2362,9 @@ export const __resetWriteQueueDb = async (): Promise<void> => {
   terminalCountersMem = { ...ZERO_COUNTERS }
   inFlightCountersMem = { ...ZERO_COUNTERS }
   terminalCountersBaselineMem = null
-  // F2-bis:reset the in-memory seq counter fallback (IDB seqCounter key is cleared by clearIdbStore below).
-  seqMemCounter = 0
+  // F2-bis/F3-ter:reset the in-process seq high-water (IDB seqCounter key is cleared by clearIdbStore below;
+  //   fallback seq 派生自 seqHighWater,测试间复位防跨用例串味)。
+  seqHighWater = 0
   maxTerminals = DEFAULT_MAX_TERMINALS
   idbBlockTimeoutMs = 3000
   // P1-3 (second-round): clear the blocked-state + fault injector + DB name so a prior
