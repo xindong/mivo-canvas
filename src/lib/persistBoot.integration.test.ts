@@ -44,6 +44,7 @@ vi.mock('../store/remoteDebugReporter', () => ({
 
 import { useCanvasStore } from '../store/canvasStore'
 import { useChatStore } from '../store/chatStore'
+import { debugLogger } from '../store/debugLogStore'
 import { enqueueChatAppend } from '../store/chatPersistSync'
 import {
   drainPersistQueue,
@@ -51,6 +52,7 @@ import {
   startPersistWriteQueue,
   stopPersistWriteQueue,
   __resetPersistBoot,
+  __flushServerMigrationForTest,
   hydrateFromServer,
   shadowCompareWithServer,
   getHydratedUserState,
@@ -58,7 +60,7 @@ import {
   backfillChatAfterDrain,
 } from './persistBoot'
 import { __resetWriteQueueDb, __seedWritesForTest } from './writeRetryQueue'
-import { ANONYMOUS_USER_ID } from './persistUserId'
+import { ANONYMOUS_USER_ID, setPersistUserId, __resetPersistUserId } from './persistUserId'
 import type { ServerPersistAdapter } from './serverPersistAdapter'
 import type { Project, CanvasMeta } from '../../shared/persist-contract.ts'
 
@@ -151,8 +153,8 @@ describe('G1-a P1-1 — server 模式 mutation → enqueue → drain → fetch(B
   })
 })
 
-describe('G1-a P1-1 — server 冷启动 hydrate 从 BFF 恢复(hydrateFromServer 替换 store.projects)', () => {
-  it('hydrateFromServer(fakeAdapter) → store.projects 被服务端真值替换 + listCanvas 读取', async () => {
+describe('G1-a P1-1 — server 冷启动 hydrate 从 BFF 恢复(store.projects = server 真值 ∪ local-only)', () => {
+  it('hydrateFromServer(fakeAdapter) → server projects 入 store + local-only 保留 union(无 marker 差集迁移)+ listCanvas 读取', async () => {
     const serverProjects: Project[] = [
       { id: 'srv-1', name: 'Server Project A', ownerId: KEY_A, createdAt: 't1', updatedAt: 't1', revision: 0, isDeleted: false },
       { id: 'srv-2', name: 'Server Project B', ownerId: KEY_A, createdAt: 't2', updatedAt: 't2', revision: 0, isDeleted: false },
@@ -160,7 +162,7 @@ describe('G1-a P1-1 — server 冷启动 hydrate 从 BFF 恢复(hydrateFromServe
     const serverCanvases: CanvasMeta[] = [
       { id: 'c-srv', projectId: 'srv-1', title: 'c', createdAt: 't', updatedAt: 't', metaRevision: 0, contentVersion: 0 },
     ]
-    // local 先有 demo project
+    // local 先有 demo project(server 没有 → local-only)
     resetStoreProjects([{ id: 'demo', name: 'demo', createdAt: 't' } as unknown as Project])
     expect(useCanvasStore.getState().projects.map((p) => p.id)).toContain('demo')
 
@@ -175,10 +177,12 @@ describe('G1-a P1-1 — server 冷启动 hydrate 从 BFF 恢复(hydrateFromServe
     }
     await hydrateFromServer(fakeAdapter, fakeOpts)
 
-    // server 真值替换 local demo
+    // 无 marker:server 真值 ∪ local-only demo(差集迁移——不丢 local-only,SC-G 详测 op 入队)。
+    //   旧版此处整替换丢 demo(线程1 数据丢失 bug);新版 union 保留 demo + 收集 createProject(demo)。
     const projects = useCanvasStore.getState().projects
-    expect(projects.map((p) => p.id)).toEqual(['srv-1', 'srv-2'])
+    expect(projects.map((p) => p.id)).toEqual(['srv-1', 'srv-2', 'demo'])
     expect(projects[0].name).toBe('Server Project A')
+    expect(projects.find((p) => p.id === 'demo')).toBeDefined() // local-only 保留(union)
   })
 })
 
@@ -1305,5 +1309,408 @@ describe('P1 bug fix — delete-resurrection: hydrate 差集过滤(C)+ onOutcome
     // 第二次 hydrate:IDB 记录已 morph 成 createProject → C 读不到 deleteProject → 不过滤 → pX 保留
     await hydrateFromServer(fakeAdapter([proj('pX', 'X')], []), hydrateOpts)
     expect(useCanvasStore.getState().projects.map((p) => p.id)).toEqual(['pX']) // 恢复未被 C 破坏
+  })
+})
+
+// ── D2 migration-on-boot + D3 DELETE in-flight + restoreProject 边缘(lead SC-B/D/E)──────────
+// 验收:
+//  SC-B: server 空 + 本地有存量 → boot 后本地不丢,迁移 create op 全量入队,drain 后服务端拿到全部。
+//  SC-C: server 非空 → 现行为不变(#254 C 过滤用例不回归)— 由上文 SC-1~4 覆盖,此处不重复。
+//  SC-D: 迁移幂等——同 userId 二次 boot 不重复入队(marker);换 userId 各自独立。
+//  SC-E: DELETE in-flight + restoreProject → DELETE success 后 B 跳过摘除(项目仍在);无 restore 不回归。
+describe('D2 migration-on-boot + D3 restore-safe edge (lead SC-B/D/E)', () => {
+  const proj = (id: string, name: string): Project => ({
+    id, name, ownerId: KEY_A, createdAt: 't', updatedAt: 't', revision: 0, isDeleted: false,
+  })
+  const doc = (projectId: string, title: string) =>
+    ({ title, projectId, createdAt: 't', updatedAt: 't', nodes: [], edges: [], tasks: [] }) as never
+  const emptyAdapter = (): ServerPersistAdapter =>
+    ({
+      listProjects: async () => ({ projects: [] }),
+      listCanvas: async () => ({ canvases: [] }),
+      listChatMessages: async () => ({ messages: [], orderRevision: 0 }),
+    }) as unknown as ServerPersistAdapter
+  const hydrateOpts = {
+    fetch: async () => new Response(JSON.stringify({ entries: {} }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    baseUrl: '',
+    getAuthHeaders: () => authHeaders(),
+  }
+  // fakeExecutor fetch:POST /api/projects → 200 {id,name,revision};POST /api/canvas → 200 CanvasMeta(echo,
+  //   无 mismatch → 不触发补 PUT);DELETE → 204。记录 wire shape(body.id)供断言。
+  const makeMigrationFetch = () => {
+    const calls: { method: string; path: string; body: unknown }[] = []
+    const fetch = async (input: string, init?: RequestInit): Promise<Response> => {
+      const method = (init?.method ?? 'GET').toUpperCase()
+      const path = new URL(input, 'http://stub').pathname
+      const body = init?.body ? JSON.parse(init.body as string) : null
+      calls.push({ method, path, body })
+      if (method === 'POST' && path === '/api/projects') {
+        return new Response(JSON.stringify({ id: (body as { id: string }).id, name: (body as { name: string }).name, revision: 1, ownerId: KEY_A, createdAt: 't', updatedAt: 't', isDeleted: false }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (method === 'POST' && path === '/api/canvas') {
+        const b = body as { id: string; projectId: string; title?: string }
+        return new Response(JSON.stringify({ id: b.id, projectId: b.projectId, title: b.title ?? '', metaRevision: 1, contentVersion: 0, createdAt: 't', updatedAt: 't' }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (method === 'DELETE') return new Response(null, { status: 204 })
+      return new Response(JSON.stringify({ id: 'srv', revision: 0 }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    return { fetch, calls }
+  }
+
+  // makeMigrationServer:stateful 迁移服务端 —— adapter(listProjects/listCanvas 读 state)与
+  //   queue fetch(POST/DELETE 写 state)**共享同一 state**。F1 flush 在 drain 后重拉 adapter.listProjects/
+  //   listCanvas 验证可恢复性,故 adapter 必须反映 drain 后服务端真值(POST 成功的 create 已入 state);
+  //   旧 stateless emptyAdapter/nonEmptyAdapter 在全成功路径会让 F1 误判 terminal → 不种 marker(SC-B/D/G 回归)。
+  //   failProjectOnce:某 project id 首次 POST /api/projects 返 400(rejected terminal);后续返 200(SC-J 用)。
+  const makeMigrationServer = (opts: {
+    projects?: Project[]
+    canvases?: CanvasMeta[]
+    failProjectOnce?: string
+  } = {}): {
+    adapter: ServerPersistAdapter
+    fetch: (input: string, init?: RequestInit) => Promise<Response>
+    calls: { method: string; path: string; body: unknown }[]
+    state: { projects: Project[]; canvases: CanvasMeta[] }
+  } => {
+    const state = {
+      projects: [...(opts.projects ?? [])],
+      canvases: [...(opts.canvases ?? [])],
+    }
+    const calls: { method: string; path: string; body: unknown }[] = []
+    const failCount = new Map<string, number>()
+    const adapter: ServerPersistAdapter = {
+      listProjects: async () => ({ projects: state.projects.map((p) => ({ ...p })) }),
+      listCanvas: async () => ({ canvases: state.canvases.map((c) => ({ ...c })) }),
+      listChatMessages: async () => ({ messages: [], orderRevision: 0 }),
+    } as unknown as ServerPersistAdapter
+    const fetch = async (input: string, init?: RequestInit): Promise<Response> => {
+      const method = (init?.method ?? 'GET').toUpperCase()
+      const path = new URL(input, 'http://stub').pathname
+      const body = init?.body ? JSON.parse(init.body as string) : null
+      calls.push({ method, path, body })
+      if (method === 'POST' && path === '/api/projects') {
+        const b = body as { id: string; name: string }
+        if (opts.failProjectOnce && b.id === opts.failProjectOnce && (failCount.get(b.id) ?? 0) < 1) {
+          failCount.set(b.id, (failCount.get(b.id) ?? 0) + 1)
+          return new Response(JSON.stringify({ error: 'rejected-simulated-terminal' }), { status: 400, headers: { 'content-type': 'application/json' } })
+        }
+        if (!state.projects.some((p) => p.id === b.id)) {
+          state.projects.push({ id: b.id, name: b.name, ownerId: KEY_A, createdAt: 't', updatedAt: 't', revision: 1, isDeleted: false })
+        }
+        return new Response(JSON.stringify({ id: b.id, name: b.name, revision: 1, ownerId: KEY_A, createdAt: 't', updatedAt: 't', isDeleted: false }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (method === 'POST' && path === '/api/canvas') {
+        const b = body as { id: string; projectId: string; title?: string }
+        if (!state.canvases.some((c) => c.id === b.id)) {
+          state.canvases.push({ id: b.id, projectId: b.projectId, title: b.title ?? '', createdAt: 't', updatedAt: 't', metaRevision: 1, contentVersion: 0 })
+        }
+        return new Response(JSON.stringify({ id: b.id, projectId: b.projectId, title: b.title ?? '', metaRevision: 1, contentVersion: 0, createdAt: 't', updatedAt: 't' }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (method === 'DELETE') return new Response(null, { status: 204 })
+      return new Response(JSON.stringify({ id: 'srv', revision: 0 }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    return { adapter, fetch, calls, state }
+  }
+
+  // SC-B: server 空 + 本地有 project/canvas → hydrate 保留本地 + flush enqueue + drain 后服务端拿到全部。
+  it('SC-B: server 空 + 本地有 project/canvas → hydrate 保留本地 + flush enqueue + drain 后服务端拿到全部记录', async () => {
+    const server = makeMigrationServer()
+    const calls = server.calls
+    resetStoreProjects([proj('p1', 'Proj1'), proj('p2', 'Proj2')])
+    useCanvasStore.setState({ canvases: { c1: doc('p1', 'C1'), c2: doc('p2', 'C2') } as never })
+    // hydrate:server 空 + 本地有 + 无 marker → 保留本地 + 收集 createProject(p1,p2)+createCanvas(c1,c2)
+    await hydrateFromServer(server.adapter, hydrateOpts)
+    // 本地不丢(迁移分支保留本地,不 replace 为 [])
+    expect(useCanvasStore.getState().projects.map((p) => p.id).sort()).toEqual(['p1', 'p2'])
+    expect(Object.keys(useCanvasStore.getState().canvases).sort()).toEqual(['c1', 'c2'])
+    // start queue + flush(queue 已启动 → 真 enqueue + drain + F1 可恢复性验证 → 全成功 marker 种)
+    startPersistWriteQueue({ fetch: server.fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    await __flushServerMigrationForTest(server.adapter)
+    await flush()
+    // 服务端拿到全部:createProject p1/p2 + createCanvas c1/c2
+    const projectCreates = calls.filter((c) => c.method === 'POST' && c.path === '/api/projects')
+    const canvasCreates = calls.filter((c) => c.method === 'POST' && c.path === '/api/canvas')
+    expect(projectCreates.map((c) => (c.body as { id: string }).id).sort()).toEqual(['p1', 'p2'])
+    expect(canvasCreates.map((c) => (c.body as { id: string }).id).sort()).toEqual(['c1', 'c2'])
+    // marker seeded(F1:全 candidate 可恢复 → 种;SC-D 前置)
+    expect(localStorage.getItem('mivo:server-migration:anonymous')).toBe('done')
+    // F1:stateful server 反映 drain 后真值(p1/p2 已入服务端)
+    expect(server.state.projects.map((p) => p.id).sort()).toEqual(['p1', 'p2'])
+  })
+
+  // SC-D: 同 userId 二次 boot marker 已 set → hydrate 跳迁移收集 + 保留本地 → flush 不重复入队。
+  it('SC-D: 同 userId 二次 boot marker 已 set → 不重复入队(保留本地,marker 防重迁)', async () => {
+    const server = makeMigrationServer()
+    const calls = server.calls
+    // 第一次 boot:server 空 + 本地 p1 → 迁移 + marker(F1:drain 后 p1 在服务端 → 可恢复 → 种 marker)
+    resetStoreProjects([proj('p1', 'P1')])
+    useCanvasStore.setState({ canvases: {} })
+    await hydrateFromServer(server.adapter, hydrateOpts)
+    startPersistWriteQueue({ fetch: server.fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    await __flushServerMigrationForTest(server.adapter)
+    await flush()
+    expect(calls.filter((c) => c.method === 'POST' && c.path === '/api/projects')).toHaveLength(1)
+    expect(localStorage.getItem('mivo:server-migration:anonymous')).toBe('done')
+    // 第二次 boot:仅 stop queue + 清 IDB(保留 marker;不调 __resetPersistBoot 否则清 marker)。
+    //   用 emptyAdapter 模拟"server empty + marker set + 本地有"→ keep-local 分支(独立覆盖;stateful
+    //   server 实际已有 p1,但此处隔离测 keep-local 不 replace 为 [])。flush 无迁移 op → no-op,无 F1 验证。
+    stopPersistWriteQueue()
+    await __resetWriteQueueDb()
+    resetStoreProjects([proj('p1', 'P1')]) // 本地仍有 p1
+    useCanvasStore.setState({ canvases: {} })
+    await hydrateFromServer(emptyAdapter(), hydrateOpts)
+    // marker set → 跳迁移收集;keep-local 解耦 → 本地 p1 不丢(不 replace 为 [])
+    expect(useCanvasStore.getState().projects.map((p) => p.id)).toEqual(['p1'])
+    startPersistWriteQueue({ fetch: server.fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    await __flushServerMigrationForTest() // pendingServerMigrationOps 空(marker 拦截)→ no-op
+    await flush()
+    // 二次 boot 不重复入队:POST /api/projects 计数不增(仍为 1)
+    expect(calls.filter((c) => c.method === 'POST' && c.path === '/api/projects')).toHaveLength(1)
+  })
+
+  // SC-D: 换 userId 各自独立(marker 按 userId 分区;userA 已迁不影响 userB)。
+  it('SC-D: 换 userId 各自独立(marker 按 userId 分区;userA 已迁不影响 userB)', async () => {
+    __resetPersistUserId()
+    setPersistUserId('userA')
+    try {
+      // 各 userId 独立 stateful server(模型 per-user 服务端数据隔离;F1 需 stateful 以种 marker)
+      const serverA = makeMigrationServer()
+      const serverB = makeMigrationServer()
+      // userA boot:server 空 + 本地 pA → 迁移 + marker A
+      resetStoreProjects([proj('pA', 'PA')])
+      useCanvasStore.setState({ canvases: {} })
+      await hydrateFromServer(serverA.adapter, hydrateOpts)
+      startPersistWriteQueue({ fetch: serverA.fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+      await flush()
+      await __flushServerMigrationForTest(serverA.adapter)
+      await flush()
+      expect(localStorage.getItem('mivo:server-migration:userA')).toBe('done')
+      // userB:marker B 未设(独立)
+      expect(localStorage.getItem('mivo:server-migration:userB')).toBeNull()
+      stopPersistWriteQueue()
+      await __resetWriteQueueDb()
+      setPersistUserId('userB')
+      // userB boot:server 空 + 本地 pB → 迁移 + marker B
+      resetStoreProjects([proj('pB', 'PB')])
+      useCanvasStore.setState({ canvases: {} })
+      await hydrateFromServer(serverB.adapter, hydrateOpts)
+      startPersistWriteQueue({ fetch: serverB.fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+      await flush()
+      await __flushServerMigrationForTest(serverB.adapter)
+      await flush()
+      expect(localStorage.getItem('mivo:server-migration:userB')).toBe('done')
+      // 两 userId 各自 marker 独立
+      expect(localStorage.getItem('mivo:server-migration:userA')).toBe('done')
+      // 服务端拿到 userA 的 pA + userB 的 pB(各 server 独立 calls 合并)
+      const ids = [...serverA.calls, ...serverB.calls]
+        .filter((c) => c.method === 'POST' && c.path === '/api/projects')
+        .map((c) => (c.body as { id: string }).id)
+      expect(ids.sort()).toEqual(['pA', 'pB'])
+    } finally {
+      __resetPersistUserId()
+    }
+  })
+
+  // SC-E (D3): deleteProject in-flight + restoreProject → DELETE success → B 跳过摘除,项目仍在。
+  it('SC-E: deleteProject in-flight + restoreProject → DELETE success → B 跳过摘除(项目仍在)', async () => {
+    const fetch = async (input: string, init?: RequestInit): Promise<Response> => {
+      const method = (init?.method ?? 'GET').toUpperCase()
+      const path = new URL(input, 'http://stub').pathname
+      if (method === 'DELETE' && path === '/api/projects/pX') {
+        // DELETE in-flight 窗口:用户立即 restoreProject(pX) → 重加 store + enqueue createProject(pX)
+        //   (deleteProject 此刻 in-flight → combineOps 不合并 → 两记录共存:delete in-flight + create pending)
+        useCanvasStore.getState().restoreProject('pX', 'Restored')
+        await flush() // createProject(pX) enqueue 的 putWrite 落地 IDB
+        return new Response(null, { status: 204 }) // DELETE success
+      }
+      if (method === 'POST' && path === '/api/projects') {
+        return new Response(JSON.stringify({ id: 'pX', name: 'Restored', revision: 5, ownerId: KEY_A, createdAt: 't', updatedAt: 't', isDeleted: false }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ id: 'srv', revision: 0 }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    resetStoreProjects([proj('pX', 'X')])
+    // 用户删 pX(store action:乐观移除 + enqueue deleteProject)
+    useCanvasStore.getState().deleteProject('pX')
+    await flush() // deleteProject(pX) pending
+    // drain:deleteProject in-flight → mid-flight restoreProject → DELETE 204 success → B 查 pending create → 跳过摘除
+    await drainPersistQueue()
+    await flush()
+    // pX 仍在(B 跳过:pending createProject(pX) restore 存在)。无 D3 则 B 会摘除 pX → bug。
+    expect(useCanvasStore.getState().projects.map((p) => p.id)).toContain('pX')
+    // pending createProject(pX) 仍在队列(本轮 sortedDue 快照不含 mid-flight enqueue)→ 再 drain 重建
+    await drainPersistQueue()
+    await flush()
+    // createProject drain success → applyServerRevision 更新 pX(在 store)→ pX 仍在
+    expect(useCanvasStore.getState().projects.map((p) => p.id)).toContain('pX')
+  })
+
+  // SC-E 回归:DELETE success 无 restore → B 照常摘除(D3 不破坏无 restore 路径;#254 SC-3 同款不回归)。
+  it('SC-E 回归: DELETE success 无 restore → B 照常摘除(D3 不破坏无 restore 路径)', async () => {
+    const { fetch } = makeCountingFetch() // DELETE 204 success
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    resetStoreProjects([proj('pX', 'X')])
+    // 直接 enqueue deleteProject(无 restore)→ drain DELETE success → 无 pending create → B 摘除
+    await enqueuePersistWrite({ kind: 'deleteProject', projectId: 'pX' })
+    await flush()
+    await drainPersistQueue()
+    expect(useCanvasStore.getState().projects.map((p) => p.id)).toEqual([])
+  })
+
+  // ── 差集迁移(Greptile 线程1 数据丢失修复;lead SC-G/H)──────────
+  //  SC-G: server 非空 + 本地有 local-only project/canvas + 无 marker → 本地不丢(store 并集)、
+  //        差集 create op 入队、drain 后服务端补齐;已在服务端的 id 不重复入队。
+  //  SC-H: marker 已种 + server 非空 + 本地有 local-only → 纯现行为(replace,不再迁移)——线程1 场景在 marker 后收敛。
+  const cmeta = (id: string, projectId: string, title: string): CanvasMeta => ({
+    id, projectId, title, createdAt: 't', updatedAt: 't', metaRevision: 0, contentVersion: 0,
+  })
+  // server 已有 pSrv/cSrv(模拟"另一台浏览器已上迁,服务端非空");本地有 local-only pLocal/cLocal + 共享 pSrv/cSrv。
+  const nonEmptyAdapter = (projects: Project[], canvases: CanvasMeta[]): ServerPersistAdapter =>
+    ({
+      listProjects: async () => ({ projects }),
+      listCanvas: async () => ({ canvases }),
+      listChatMessages: async () => ({ messages: [], orderRevision: 0 }),
+    }) as unknown as ServerPersistAdapter
+
+  // SC-G(兼 SC-L 全成功回归):server 非空 + 本地 local-only + 无 marker → 本地不丢(union)+ 差集 op 入队
+  //   + drain 补齐 + server id 不重复入队 + F1 全 candidate 可恢复 → marker 种上(行为同 d3b8927)。
+  it('SC-G: server 非空 + 本地 local-only + 无 marker → 本地不丢(union)+ 差集 op 入队 + drain 补齐 + server id 不重复入队', async () => {
+    const serverProj = [proj('pSrv', 'Srv')]
+    const serverCv = [cmeta('cSrv', 'pSrv', 'CSrv')]
+    const server = makeMigrationServer({ projects: serverProj, canvases: serverCv })
+    const calls = server.calls
+    // 本地:pLocal/cLocal(server 没有 → local-only 差集候选)+ pSrv/cSrv(共享,已在服务端)
+    resetStoreProjects([proj('pLocal', 'Local'), proj('pSrv', 'Srv')])
+    useCanvasStore.setState({ canvases: { cLocal: doc('pLocal', 'CLocal'), cSrv: doc('pSrv', 'CSrv') } as never })
+    await hydrateFromServer(server.adapter, hydrateOpts)
+    // 本地不丢(union):pLocal 保留(差集候选,SC-G 核心——旧版此处整替换丢 pLocal = 线程1 bug);
+    //   pSrv 取服务端真值;差集 union 不丢 local-only。
+    expect(useCanvasStore.getState().projects.map((p) => p.id).sort()).toEqual(['pLocal', 'pSrv'])
+    // canvas 同理:union-merge 保留 local-only cLocal(旧版 else 也保留,但漏迁 op;新版补 op)。
+    expect(Object.keys(useCanvasStore.getState().canvases).sort()).toEqual(['cLocal', 'cSrv'])
+    // start queue + flush(queue 已启动 → 真 enqueue + drain + F1 验证)→ 只为 local-only 候选入队(pLocal, cLocal)。
+    startPersistWriteQueue({ fetch: server.fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    await __flushServerMigrationForTest(server.adapter)
+    await flush()
+    const projectCreates = calls.filter((c) => c.method === 'POST' && c.path === '/api/projects').map((c) => (c.body as { id: string }).id)
+    const canvasCreates = calls.filter((c) => c.method === 'POST' && c.path === '/api/canvas').map((c) => (c.body as { id: string }).id)
+    // 已在服务端的 id(pSrv/cSrv)不重复入队;只上迁 local-only(pLocal/cLocal)。
+    expect(projectCreates.sort()).toEqual(['pLocal'])
+    expect(canvasCreates.sort()).toEqual(['cLocal'])
+    // F1(SC-L):全 candidate 可恢复(drain 后 pLocal/cLocal 已在服务端)→ marker 种上(行为同 d3b8927)
+    expect(localStorage.getItem('mivo:server-migration:anonymous')).toBe('done')
+    // F1:stateful server 反映 drain 后真值(pSrv 初始 + pLocal 上迁)
+    expect(server.state.projects.map((p) => p.id).sort()).toEqual(['pLocal', 'pSrv'])
+    expect(server.state.canvases.map((c) => c.id).sort()).toEqual(['cLocal', 'cSrv'])
+  })
+
+  it('SC-H: marker 已种 + server 非空 + 本地 local-only → 纯现行为(replace,不再迁移;线程1 场景 marker 后收敛)', async () => {
+    const { fetch, calls } = makeMigrationFetch()
+    // 预种 marker(模拟"曾迁移过的浏览器二次 boot";beforeEach 已清,此处显式种)。
+    localStorage.setItem('mivo:server-migration:anonymous', 'done')
+    const serverProj = [proj('pSrv', 'Srv')]
+    const serverCv = [cmeta('cSrv', 'pSrv', 'CSrv')]
+    // 同 SC-G 的本地态(pLocal/cLocal local-only + pSrv/cSrv 共享),但 marker 已种。
+    resetStoreProjects([proj('pLocal', 'Local'), proj('pSrv', 'Srv')])
+    useCanvasStore.setState({ canvases: { cLocal: doc('pLocal', 'CLocal'), cSrv: doc('pSrv', 'CSrv') } as never })
+    await hydrateFromServer(nonEmptyAdapter(serverProj, serverCv), hydrateOpts)
+    // marker set → 纯现行为:projects 服务端真值 replace(pLocal 被丢——线程1 场景在 marker 后收敛,
+    //   即 marker 后不再走差集 union;local-only 此处 = 迁移后新建/已在队列,replace 不破)。
+    expect(useCanvasStore.getState().projects.map((p) => p.id)).toEqual(['pSrv'])
+    // canvas:marker set 走 else union-merge(同旧版 else——canvas else 本就 union 保留 local-only,不变)。
+    expect(Object.keys(useCanvasStore.getState().canvases).sort()).toEqual(['cLocal', 'cSrv'])
+    // 不收集迁移 op(marker 拦截两步)→ flush no-op → 无 POST(不再迁移)。
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    await __flushServerMigrationForTest() // pendingServerMigrationOps 空(marker 拦截)→ no-op
+    await flush()
+    expect(calls.filter((c) => c.method === 'POST')).toHaveLength(0)
+  })
+
+  // ── F1+F2 r3 返修(lead SC-J/K;Greptile 线程4 数据丢失残根)──────────
+  //  SC-J: p1 成功 + p2 4xx terminal → flush 后 marker 未种 + error 日志;二次 boot 差集重收集 p2(重试)
+  //        且 p1 不重复入队;p2 二次成功后 marker 种上。
+  //  SC-K: marker 已种 + createProject(p2) 仍 pending 于队列 + 服务端仅 p1 → hydrate replace 分支 setState 含 p2
+  //        (pending-create 并集保护 F2,不丢)。
+  it('SC-J: p1 成功 + p2 4xx terminal → flush 不种 marker + error;二次 boot 差集重收 p2(不重排 p1)+ p2 成功后种 marker', async () => {
+    const server = makeMigrationServer({ failProjectOnce: 'p2' })
+    const calls = server.calls
+    const errorSpy = vi.spyOn(debugLogger, 'error')
+    try {
+      // 第一次 boot:server 空 + 本地 p1/p2 + 无 marker → 差集收集 p1,p2
+      resetStoreProjects([proj('p1', 'P1'), proj('p2', 'P2')])
+      useCanvasStore.setState({ canvases: {} })
+      await hydrateFromServer(server.adapter, hydrateOpts)
+      startPersistWriteQueue({ fetch: server.fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+      await flush()
+      await __flushServerMigrationForTest(server.adapter)
+      await flush()
+      // drain:p1 POST 200(入服务端),p2 POST 400 rejected terminal(不入服务端、recordTerminal 离队)
+      const p1Posts = calls.filter((c) => c.method === 'POST' && c.path === '/api/projects' && (c.body as { id: string }).id === 'p1')
+      const p2Posts = calls.filter((c) => c.method === 'POST' && c.path === '/api/projects' && (c.body as { id: string }).id === 'p2')
+      expect(p1Posts).toHaveLength(1)
+      expect(p2Posts).toHaveLength(1)
+      // F1:p2 terminal(既不在服务端也不在队列)→ marker 未种
+      expect(localStorage.getItem('mivo:server-migration:anonymous')).toBeNull()
+      // F1(D4):debugLogger.error 出声,指名 p2 terminal(精确匹配 F1 verifyMigrationCandidatesRecoverable 的日志)
+      expect(errorSpy).toHaveBeenCalledWith('Persist Boot', expect.stringContaining('createProject p2'))
+      expect(
+        errorSpy.mock.calls.some((m) => {
+          const message = m[1] as string
+          return typeof message === 'string' && message.includes('createProject p2') && message.includes('terminally failed')
+        }),
+      ).toBe(true)
+      // stateful server:p1 入,p2 未入
+      expect(server.state.projects.map((p) => p.id)).toEqual(['p1'])
+    } finally {
+      errorSpy.mockRestore()
+    }
+
+    // 第二次 boot:stop queue + 清 IDB(保留 marker=null;server.state 保留 [p1])
+    stopPersistWriteQueue()
+    await __resetWriteQueueDb()
+    resetStoreProjects([proj('p1', 'P1'), proj('p2', 'P2')]) // 本地仍 p1/p2(IDB persist rehydrate)
+    useCanvasStore.setState({ canvases: {} })
+    // marker 仍未种 → 差集重收集;server 已有 p1 → candidates 仅 p2(p1 不重复入队)
+    await hydrateFromServer(server.adapter, hydrateOpts)
+    expect(useCanvasStore.getState().projects.map((p) => p.id).sort()).toEqual(['p1', 'p2'])
+    startPersistWriteQueue({ fetch: server.fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    await __flushServerMigrationForTest(server.adapter)
+    await flush()
+    // p2 二次 POST 200(failProjectOnce 已用尽);p1 不重复入队(计数不增)
+    const p1PostsTotal = calls.filter((c) => c.method === 'POST' && c.path === '/api/projects' && (c.body as { id: string }).id === 'p1')
+    const p2PostsTotal = calls.filter((c) => c.method === 'POST' && c.path === '/api/projects' && (c.body as { id: string }).id === 'p2')
+    expect(p1PostsTotal).toHaveLength(1) // p1 不重排
+    expect(p2PostsTotal).toHaveLength(2) // p2:首 boot 400 + 二 boot 200
+    // F1:p2 现在服务端 → 全可恢复 → marker 种上
+    expect(localStorage.getItem('mivo:server-migration:anonymous')).toBe('done')
+    expect(server.state.projects.map((p) => p.id).sort()).toEqual(['p1', 'p2'])
+  })
+
+  it('SC-K: marker 已种 + createProject(p2) 仍 pending 于队列 + 服务端仅 p1 → hydrate replace 含 p2(F2 并集保护,不丢)', async () => {
+    // 预种 marker(模拟"曾迁移过的浏览器刷新页面,creates 仍 pending")
+    localStorage.setItem('mivo:server-migration:anonymous', 'done')
+    // 预置 pending createProject(p2)于 IDB(未 drain;nextAttemptAt 远未来不取,保持 pending 证 F2)
+    await __seedWritesForTest([{
+      id: 'rec-create-p2-k', idempotencyKey: 'k-create-p2-k', userId: ANONYMOUS_USER_ID,
+      op: { kind: 'createProject', name: 'P2', id: 'p2' }, resourceKey: 'project:p2',
+      createdAt: 0, attempts: 0, nextAttemptAt: Number.MAX_SAFE_INTEGER, status: 'pending',
+    }])
+    // 服务端仅 p1(p2 仍 pending 在队列,未 drain 到服务端)
+    const server = makeMigrationServer({ projects: [proj('p1', 'P1')] })
+    // 本地 p1 + p2(p2 来自 pending create;IDB persist rehydrate 后本地仍在)
+    resetStoreProjects([proj('p1', 'P1'), proj('p2', 'P2')])
+    useCanvasStore.setState({ canvases: {} })
+    // hydrate:marker set → replace 分支;F2 应并集本地 pending-create(p2)→ 不丢
+    await hydrateFromServer(server.adapter, hydrateOpts)
+    // F2:replace = C 过滤后服务端[p1] ∪ 本地 pending-create[p2] = [p1, p2](无 F2 则丢 p2 = [p1] = 线程4 残根)
+    expect(useCanvasStore.getState().projects.map((p) => p.id).sort()).toEqual(['p1', 'p2'])
   })
 })

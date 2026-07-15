@@ -20,6 +20,8 @@ import {
   __setWriteQueueDbNameForTest,
   classifyHttpStatus,
   createWriteQueue,
+  getPendingCreateResourceIds,
+  getPendingDeleteResourceIds,
   getWriteQueueTerminalCounters,
   resetTerminalCountersBaseline,
   type TerminalCounterShape,
@@ -2317,5 +2319,55 @@ describe('F2: attach/detach resourceKey 含 canvasId(跨 canvas 不 coalesce)', 
     expect(await q.pendingCount()).toBe(2)
     await q.drain()
     expect(calls.length).toBe(2)
+  })
+})
+
+// ── D2/Greptile 线程3:pending-create/delete helper 按 userId 过滤(lead SC-I)──────────
+// 验收:
+//  SC-I: getPendingDeleteResourceIds / getPendingCreateResourceIds 都按 r.userId === getPersistUserId()
+//        过滤 —— userA 的 pending 记录不影响 userB 的差集/摘除判定(共享 IDB store,无串号)。
+describe('D2 helper userId scoping (lead SC-I) — getPending{Create,Delete}ResourceIds', () => {
+  // 两用户各一条 pending-delete + pending-create(restore),共 4 条,共享同一 IDB store。
+  const seedBothUsers = (): Promise<unknown> =>
+    __seedWritesForTest([
+      { id: 'a-del', idempotencyKey: 'k-a-del', userId: 'userA', op: { kind: 'deleteProject', projectId: 'pA' }, resourceKey: 'project:pA', createdAt: 0, attempts: 0, nextAttemptAt: Number.MAX_SAFE_INTEGER, status: 'pending' },
+      { id: 'a-cre', idempotencyKey: 'k-a-cre', userId: 'userA', op: { kind: 'createProject', id: 'cA', name: 'CA' }, resourceKey: 'project:cA', createdAt: 0, attempts: 0, nextAttemptAt: Number.MAX_SAFE_INTEGER, status: 'pending' },
+      { id: 'b-del', idempotencyKey: 'k-b-del', userId: 'userB', op: { kind: 'deleteProject', projectId: 'pB' }, resourceKey: 'project:pB', createdAt: 0, attempts: 0, nextAttemptAt: Number.MAX_SAFE_INTEGER, status: 'pending' },
+      { id: 'b-cre', idempotencyKey: 'k-b-cre', userId: 'userB', op: { kind: 'createProject', id: 'cB', name: 'CB' }, resourceKey: 'project:cB', createdAt: 0, attempts: 0, nextAttemptAt: Number.MAX_SAFE_INTEGER, status: 'pending' },
+    ])
+
+  it('SC-I: userA 视角只读 userA 的 pending-delete/create(userB 记录不串号)', async () => {
+    await seedBothUsers()
+    setPersistUserId('userA')
+    expect([...(await getPendingDeleteResourceIds('deleteProject'))]).toEqual(['pA'])
+    expect([...(await getPendingCreateResourceIds('createProject'))]).toEqual(['cA'])
+    // userB 的 pB/cB 不在 userA 视角(无过滤则会串号:返回 [pA,pB]/[cA,cB])
+    expect([...(await getPendingDeleteResourceIds('deleteProject'))]).not.toContain('pB')
+    expect([...(await getPendingCreateResourceIds('createProject'))]).not.toContain('cB')
+  })
+
+  it('SC-I: 切到 userB 视角只读 userB 的(隔离独立;不互相污染)', async () => {
+    await seedBothUsers()
+    setPersistUserId('userB')
+    expect([...(await getPendingDeleteResourceIds('deleteProject'))]).toEqual(['pB'])
+    expect([...(await getPendingCreateResourceIds('createProject'))]).toEqual(['cB'])
+    // 换 user 后 userA 的记录不再可见
+    expect([...(await getPendingDeleteResourceIds('deleteProject'))]).not.toContain('pA')
+    expect([...(await getPendingCreateResourceIds('createProject'))]).not.toContain('cA')
+  })
+
+  it('SC-I: deleteCanvas/createCanvas 同款 userId 过滤(非 project 变体也隔离)', async () => {
+    await __seedWritesForTest([
+      { id: 'a-cdel', idempotencyKey: 'k-a-cdel', userId: 'userA', op: { kind: 'deleteCanvas', canvasId: 'cvA' }, resourceKey: 'canvas:cvA', createdAt: 0, attempts: 0, nextAttemptAt: Number.MAX_SAFE_INTEGER, status: 'pending' },
+      { id: 'b-ccre', idempotencyKey: 'k-b-ccre', userId: 'userB', op: { kind: 'createCanvas', canvasId: 'cvB', projectId: 'pB', title: 'CVB' }, resourceKey: 'canvas:cvB', createdAt: 0, attempts: 0, nextAttemptAt: Number.MAX_SAFE_INTEGER, status: 'pending' },
+    ])
+    setPersistUserId('userA')
+    expect([...(await getPendingDeleteResourceIds('deleteCanvas'))]).toEqual(['cvA'])
+    // userB 的 createCanvas(cvB) 不在 userA 的 createCanvas 视角
+    expect([...(await getPendingCreateResourceIds('createCanvas'))]).toEqual([])
+    setPersistUserId('userB')
+    expect([...(await getPendingCreateResourceIds('createCanvas'))]).toEqual(['cvB'])
+    // userA 的 deleteCanvas(cvA) 不在 userB 的 deleteCanvas 视角
+    expect([...(await getPendingDeleteResourceIds('deleteCanvas'))]).toEqual([])
   })
 })

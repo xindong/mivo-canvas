@@ -19,9 +19,16 @@
 import { getPersistMode, isLocalPersist } from './persistMode'
 import { getServerPersistAdapter } from './serverPersistAdapterSelector'
 import { createAdapterWriteExecutor } from './persistWriteExecutor'
-import { createWriteQueue, getPendingDeleteResourceIds, type WriteOp, type WriteQueue } from './writeRetryQueue'
+import {
+  createWriteQueue,
+  getPendingCreateResourceIds,
+  getPendingDeleteResourceIds,
+  type WriteOp,
+  type WriteQueue,
+} from './writeRetryQueue'
 import { hydrateUserStateMap } from './serverPersistHydrate'
 import { storeCanvasCursor, __resetCanvasCursorStore } from './snapshotCursorStore'
+import { getPersistUserId } from './persistUserId'
 import { fromRecord, edgeFromRecord } from '../kernel/mapping'
 import type { NodeRecord, EdgeRecord } from '../kernel/records'
 import { debugLogger } from '../store/debugLogStore'
@@ -80,6 +87,217 @@ const userStateMap = new Map<string, UserStateEntry>()
  */
 export const getHydratedUserState = (key: string): UserStateEntry | undefined => userStateMap.get(key)
 
+// ── D2 migration-on-boot(2026-07-15):存量本地(IDB)数据 → server 一次性上迁 ──────────────
+//
+// 真因(lead 已在服务器坐实):生产前端此前跑在 local 持久化模式(persistMode 默认 local,构建时从未
+// 设 VITE_MIVO_PERSIST),后端 PG 空库 0 写入;local 模式删项目时画板按设计回落 standalone,表象即
+// "删除的项目/画布复活"。真解 = 生产构建默认切 server 持久化(D1:.env.production)+ 存量本地数据
+// 一次性上迁(本块)+ 顺手修 #254 遗留的 DELETE in-flight + restoreProject 边缘(D3)。
+//
+// 时序硬约束:bootPersistWiring server 分支是 `hydrateFromServer → startPersistWriteQueue`(hydrate 在
+// 前,队列 singleton 未启动),而 enqueuePersistWrite 首行 `if (!writeQueue) return undefined`(no-op)。
+// 故 hydrate 内**不能**直接 enqueue。解:hydrate 检测迁移条件(**marker 未种** + 本地有 local-only)→
+// 按资源差集(candidates = 本地 id 不在服务端列表)把 createProject/createCanvas op 收集进
+// pendingServerMigrationOps;bootPersistWiring 在 startPersistWriteQueue 之后调 flushServerMigration
+// (此时 queue 已启动 → 真 enqueue,combineOps 去重 + idempotencyKey minting 全生效)→ eager drain →
+// **drain 后逐 candidate 验证可恢复性——全部可恢复才种 marker(F1;详见 flushServerMigration)**。
+//
+// onConflict re-hydrate(mid-session)永不命中迁移分支:409 蕴含 marker 已 set(boot flush 后)→
+// `!marker` false → 走 else(现行为 replace + pending-create 并集 + union-merge + #254 C 过滤)。迁移只在 boot(marker 未种)触发。
+//
+// 幂等:marker(localStorage 按 userId 分区)跨 boot 防重迁;combineOps 同 resourceKey 去重防同 boot 内
+// 重复 enqueue;差集过滤(已在服务端的 id 不入队)。**F1 marker-seed 时机(2026-07-15 r3 返修,Greptile
+// 线程4)**:marker 不在 enqueue 落 IDB 后即种,而在 drain 后验证全部 candidate 可恢复(on server 或 pending
+// in durable queue)才种。terminal 残根(部分 create 4xx rejected)→ 不种 marker,下次 boot 差集重收集 +
+// combineOps 与 IDB 仍 pending 的首次记录去重(无重复 server 写)+ terminal 记录已离队 → 天然重试。即便
+// drain 后、种 marker 前崩 → marker 仍未种 + 本地 union 仍在(不丢),下次 boot 再收集,安全。
+//
+// **差集迁移 vs 旧版「server 空才迁」(Greptile 线程1 数据丢失修复)**:旧版迁移只在 `projects.length===0`
+// 触发,多设备用户第二台浏览器首启时服务端已非空 → else 整替换 store.projects → 本地独有(legacy local 模式)
+// 项目消失 + zustand persist 回写 = 永久丢失。新版迁移开关从「server 空」改为「marker 未种」:`!marker` 时
+// 无论 server 空或非空,setState = C 过滤后服务端列表 ∪ candidates(local-only 保留可见,正在上迁)+ 为
+// candidates 收集 create op。已知有界局限(代码注释 + PR body):某浏览器首启若发生在「用户已在别处删除某项目」
+// 之后,差集迁移会把该项目重新建回(复活)——窗口仅每浏览器首启一次,与「永久丢数据」相比取复活(可再删,可恢复);
+// marker 种下后不再发生。marker set → 现行为(server 真值 replace + C 过滤 + **F2 pending-create 并集保护**;
+// 线程1 场景在 marker 后收敛)。**F2(线程4)**:marker 已种但 creates 仍 pending 于队列时刷新,纯 replace 会丢
+// pending creates + persist 回写永久丢失;修:replace 并集本地 pending-create projects(canvas union-merge 已保留 local-only,不动)。
+const pendingServerMigrationOps: WriteOp[] = []
+
+/** marker 物理 key(按 userId 分区;anonymous namespace 与 authenticated 互不可见,同 persistUserId)。 */
+const migrationMarkerKey = (userId: string): string => `mivo:server-migration:${userId}`
+
+/** 本 userId 是否已种过迁移 marker(跨 boot 防重迁)。localStorage 不可用(SSR/纯 Node)→ false(不迁)。 */
+const isServerMigrationMarkerSet = (): boolean => {
+  try {
+    if (typeof localStorage === 'undefined') return false
+    return localStorage.getItem(migrationMarkerKey(getPersistUserId())) !== null
+  } catch {
+    return false
+  }
+}
+
+/** 种 marker(迁移 op enqueue 落地后调;localStorage 不可用 → warn,不影响 IDB 已落地的 op)。 */
+const seedServerMigrationMarker = (): void => {
+  try {
+    if (typeof localStorage === 'undefined') return
+    localStorage.setItem(migrationMarkerKey(getPersistUserId()), 'done')
+  } catch (error) {
+    debugLogger.warn(SOURCE, `migration marker seed failed (localStorage): ${msg(error)}`)
+  }
+}
+
+/** 测试/HMR 清理:清所有 userId 的迁移 marker(防跨测试泄漏;localStorage 不可用 → no-op)。 */
+const clearAllServerMigrationMarkers = (): void => {
+  try {
+    if (typeof localStorage === 'undefined') return
+    const prefix = 'mivo:server-migration:'
+    const toRemove: string[] = []
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i)
+      if (k && k.startsWith(prefix)) toRemove.push(k)
+    }
+    for (const k of toRemove) localStorage.removeItem(k)
+  } catch {
+    /* ignore — best-effort cleanup */
+  }
+}
+
+/**
+ * D2:flush hydrate 收集的迁移 op(bootPersistWiring 在 startPersistWriteQueue 之后调)。
+ * queue singleton 此时已启动 → enqueuePersistWrite 真 enqueue(combineOps 去重 + overflow +
+ * idempotencyKey 全生效);eager drain 让上迁即时发出(不等 5s timer)。失败 fail-visible:enqueue
+ * 失败经 enqueuePersistWrite 内 debugLogger.error;drain 终态失败(rejected/terminal)经 writeRetryQueue
+ * drain switch debugLogger.error + recordTerminal 留账(docs/development-logging.md,不静默)。
+ * 成功/跳过路径亦打 log(D4)。
+ *
+ * **F1 marker-seed 时机(2026-07-15 r3 返修,Greptile 线程4 数据丢失残根)**:marker 不再在 enqueue
+ * 落 IDB 后即种,而是 **drain 完成后逐 candidate 做可恢复性验证——全部可恢复才种**。否则若部分
+ * create 终态失败(如 p2 4xx rejected,p1 成功),enqueue 后即种 marker → 下次 boot server 非空 +
+ * marker 已种 → 走 replace 分支丢 p2 + zustand persist 回写永久丢失。修:drain 后重新拉取
+ * adapter.listProjects/listCanvas + getPendingCreateResourceIds,对每个 candidate id 判定——
+ * 在服务端(drain 成功)或仍在队列 pending(durable,后续 timer drain)均算"可恢复";既不在服务端
+ * 也不在队列 = 终态失败 → 本轮**不种 marker**(下次 boot 差集重收集,combineOps 与残留记录去重,
+ * 天然重试)+ debugLogger.error 出声(D4)。全部可恢复 → 种 marker。
+ *
+ * 注:即使 drain 后、种 marker 前崩 → marker 仍未种 + 本地 union 仍在(不丢);下次 boot 再收集时
+ * combineOps 与 IDB 仍 pending 的首次记录去重(无重复 server 写);首次记录已 drain 成功 → server 非空
+ * → 下次 boot 不进迁移分支。安全(与旧版 enqueue-后-即种 相同的崩溃安全,但堵住了 terminal 残根)。
+ *
+ * @param adapter 与 hydrate 同源 adapter(bootPersistWiring 传入,不另起获取通道);测试注入 fake。
+ */
+const flushServerMigration = async (
+  adapter: ReturnType<typeof getServerPersistAdapter> = getServerPersistAdapter(),
+): Promise<void> => {
+  const ops = pendingServerMigrationOps.splice(0)
+  if (ops.length === 0) return
+  // F1:capture candidate ids for post-drain recoverability verification(marker-seed 前置数据)。
+  const projectCandidates: string[] = []
+  const canvasCandidates: string[] = []
+  for (const op of ops) {
+    if (op.kind === 'createProject') {
+      const id = (op as { id?: string }).id
+      if (id) projectCandidates.push(id)
+    } else if (op.kind === 'createCanvas') {
+      canvasCandidates.push(op.canvasId)
+    }
+  }
+  let enqueued = 0
+  for (const op of ops) {
+    const p = enqueuePersistWrite(op)
+    if (p === undefined) {
+      // queue 未启动(不应发生 — bootPersistWiring 刚 startPersistWriteQueue)→ fail-visible。
+      debugLogger.error(
+        SOURCE,
+        `migration enqueue no-op (queue undefined) for ${op.kind} ${op.kind === 'createProject' ? (op as { id?: string }).id ?? (op as { name: string }).name : (op as { canvasId: string }).canvasId}; op NOT uploaded`,
+      )
+      continue
+    }
+    try {
+      await p // 等 IDB putWrite 落地(durable)
+      enqueued++
+    } catch {
+      // enqueuePersistWrite 内已 debugLogger.error 吞 + 记;此处不重记(避免双 log)
+    }
+  }
+  debugLogger.log(
+    SOURCE,
+    `server migration-on-boot: ${enqueued}/${ops.length} op(s) enqueued; draining eagerly before marker verification`,
+  )
+  // eager drain:让迁移 op 即时发出(不等 5s timer);drain 终态失败由 drain switch fail-visible。
+  try {
+    await drainPersistQueue()
+  } catch (error) {
+    debugLogger.warn(SOURCE, `migration eager drain failed: ${msg(error)} (ops remain in IDB queue; next timer drain will retry)`)
+  }
+  // F1:post-drain 可恢复性验证——全部 candidate 可恢复(on server 或 pending in durable queue)才种 marker。
+  //   terminal 残根(如 4xx rejected)→ 既不在服务端也不在队列 → 不种 marker + error 出声;下次 boot 差集
+  //   重收集 + combineOps 去重 + terminal 记录已离队 → 天然重试(不重复 server 写)。堵"enqueue 后即种
+  //   marker → 下次 boot replace 丢 terminal-failed local + persist 回写永久丢失"残根。
+  let allRecoverable: boolean
+  try {
+    allRecoverable = await verifyMigrationCandidatesRecoverable(adapter, projectCandidates, canvasCandidates)
+  } catch (error) {
+    // 验证拉取失败(如 adapter 瞬时不可用)→ fail-closed:不种 marker,下次 boot 重验(ops 已 durable 入队,
+    //   不丢;下次 boot 差集重收集时 on-server 的 id 不再候选,无重复 server 写)。
+    debugLogger.warn(SOURCE, `migration recoverability verification failed: ${msg(error)}; marker NOT seeded (fail-closed; next boot re-verifies)`)
+    allRecoverable = false
+  }
+  if (allRecoverable) {
+    seedServerMigrationMarker()
+    debugLogger.log(
+      SOURCE,
+      `server migration-on-boot: all ${projectCandidates.length + canvasCandidates.length} candidate(s) recoverable (on server or pending in durable queue); marker seeded`,
+    )
+  }
+  // allRecoverable===false:marker deliberately NOT seeded this round(verifyMigrationCandidatesRecoverable
+  //   已 per-failure error 留痕;下次 boot 差集重收集 + 天然重试)。
+}
+
+/**
+ * F1:drain 后逐 candidate 验证可恢复性。candidate 可恢复 = 在服务端(drain 成功)或仍在 durable 队列
+ * pending(后续 timer drain 重试)。既不在服务端也不在队列 = 终态失败(rejected/terminal 已 recordTerminal
+ * 离队)。terminal-failed candidate → 返 false + debugLogger.error(D4,不静默)。空 candidate(无迁移 op)
+ * → true(marker 正常种)。
+ */
+const verifyMigrationCandidatesRecoverable = async (
+  adapter: ReturnType<typeof getServerPersistAdapter>,
+  projectCandidates: string[],
+  canvasCandidates: string[],
+): Promise<boolean> => {
+  if (projectCandidates.length === 0 && canvasCandidates.length === 0) return true
+  const [{ projects }, { canvases }, pendingProjectCreates, pendingCanvasCreates] = await Promise.all([
+    adapter.listProjects(),
+    adapter.listCanvas(),
+    getPendingCreateResourceIds('createProject'),
+    getPendingCreateResourceIds('createCanvas'),
+  ])
+  const serverProjectIds = new Set(projects.map((p) => p.id))
+  const serverCanvasIds = new Set(canvases.map((c) => c.id))
+  let failed = 0
+  for (const id of projectCandidates) {
+    if (serverProjectIds.has(id)) continue // drain 成功 → 在服务端
+    if (pendingProjectCreates.has(id)) continue // 仍 pending in durable queue → 后续 timer drain
+    failed++
+    debugLogger.error(
+      SOURCE,
+      `migration candidate createProject ${id} terminally failed (neither on server nor pending in durable queue); marker NOT seeded this boot — next boot will re-collect and retry`,
+    )
+  }
+  for (const id of canvasCandidates) {
+    if (serverCanvasIds.has(id)) continue
+    if (pendingCanvasCreates.has(id)) continue
+    failed++
+    debugLogger.error(
+      SOURCE,
+      `migration candidate createCanvas ${id} terminally failed (neither on server nor pending in durable queue); marker NOT seeded this boot — next boot will re-collect and retry`,
+    )
+  }
+  return failed === 0
+}
+
+/** 测试用:驱动迁移 flush(等价 bootPersistWiring 在 startPersistWriteQueue 后调 flush;adapter 同源注入)。 */
+export const __flushServerMigrationForTest = flushServerMigration
+
 /**
  * G1-a P1-1:非画布域 mutation enqueue 出口。store mutation(set 后)调此。
  * - local(默认):writeQueue undefined → 立即 return(零副作用,表征测试不红)。
@@ -116,6 +334,9 @@ export const __resetPersistBoot = (): void => {
   stopSceneHydrationSubscription()
   hydratedSceneIds.clear()
   inFlightSceneIds.clear()
+  // D2:清迁移收集状态 + 所有 userId marker(逐 test 隔离;防跨 test marker 泄漏致下一 test 误跳迁移)。
+  pendingServerMigrationOps.length = 0
+  clearAllServerMigrationMarkers()
 }
 
 // ── server 模式 boot:hydrate 非画布域(从 BFF 恢复)──
@@ -355,25 +576,79 @@ export const hydrateFromServer = async (
   // dynamic import:防 canvasStore→projectsSlice→persistBoot→canvasStore 静态环。
   const { useCanvasStore } = await import('../store/canvasStore')
 
-  // 1. project 全量(非画布域,完全在 G1-a 范围)——替换 store.projects 为服务端真值。
+  // D2 migration-on-boot:迁移 marker(按 userId 分区;boot 防重迁)。onConflict re-hydrate 时
+  //   marker 已 set(boot flush 后)→ 跳迁移;且 onConflict 蕴含 server 非空 → 迁移分支(server 空)
+  //   本就不命中。一次 hydrate 调用内 step1/step2 共用此快照(不重复读 localStorage)。
+  const migrationMarkerSet = isServerMigrationMarkerSet()
+
+  // 1. project 全量(非画布域,完全在 G1-a 范围)——按 marker 决定 union 差集迁移 or 服务端真值 replace。
   //    P1 bug fix(delete-resurrection)C:差集过滤 pending-delete project id —— DELETE 还在
-  //    writeRetryQueue 未 drain 时服务端仍 LIVE,直接 replace 会把已删 project 灌回本地(复活)。
+  //    writeRetryQueue 未 drain 时服务端仍 LIVE,直接 replace/union 会把已删 project 灌回本地(复活)。
   //    读 IDB pending deleteProject id 集合(boot hydrate 前 queue 未 start 也可读 IDB 真值;onConflict
   //    re-hydrate 复用同一过滤),从服务端结果摘除,永不灌回"本地已排队删、尚未 drain"的记录。
+  //
+  //    D2 差集迁移(Greptile 线程1 数据丢失修复):`!marker` 时 candidates = 本地 id 不在服务端列表(差集;
+  //    服务端空→差集=全量本地,与旧版一致)。setState = C 过滤后服务端列表 ∪ candidates(local-only 保留
+  //    可见,正在上迁——旧版服务端非空时整替换丢 local-only → zustand persist 回写永久丢失,此为该 bug 的修);
+  //    为 candidates 收集 createProject op(已在服务端的 id 不重复入队 SC-G)。**keep-local 与 enqueue 解耦**:
+  //    即便迁移 terminal 失败,本地 union 仍在(不丢);marker flush 后种。不复活:server 模式删项目时 store
+  //    已乐观移除,本地 candidates 均为 live,不经 pending-delete 过滤(同旧版迁移分支)。
+  //    marker set → 现行为(server 真值 replace + C 过滤 + **F2 pending-create 并集保护**;线程1 场景在 marker 后收敛 SC-H)。
+  //    **F2(2026-07-15 r3 返修,Greptile 线程4)**:marker 已种但 creates 仍 pending 于队列时刷新页面,纯 replace
+  //    会丢 local-only pending creates + zustand persist 回写永久丢失。修:replace 时并集本地 pending-create
+  //    projects(对称于 C pending-delete 过滤;canvas 侧 union-merge 本就保留 local-only,无需动)。
+  //    "keep-local 解耦不丢"在 marker-set 分支的适用范围 = 仅 pending-create 集合(!marker 分支 = 全 local-only 差集)。
   try {
-    const [{ projects }, pendingDeleteProjectIds] = await Promise.all([
+    const [{ projects }, pendingDeleteProjectIds, pendingCreateProjectIds] = await Promise.all([
       adapter.listProjects(),
       getPendingDeleteResourceIds('deleteProject'),
+      getPendingCreateResourceIds('createProject'),
     ])
     const filteredProjects = pendingDeleteProjectIds.size === 0
       ? projects
       : projects.filter((p) => !pendingDeleteProjectIds.has(p.id))
-    useCanvasStore.setState({ projects: filteredProjects })
-    const droppedProjects = projects.length - filteredProjects.length
-    debugLogger.log(
-      SOURCE,
-      `server hydrate: ${filteredProjects.length} project(s) from BFF (replaced local${droppedProjects > 0 ? `; ${droppedProjects} filtered as pending-delete not-yet-drained (anti-resurrection)` : ''})`,
-    )
+    const localProjects = useCanvasStore.getState().projects
+    if (!migrationMarkerSet) {
+      // 首启 marker 未种:差集迁移。candidates = 本地 id 不在服务端列表(服务端空→全量本地,与旧版一致)。
+      const serverProjectIds = new Set(projects.map((p) => p.id))
+      const candidates = localProjects.filter((p) => !serverProjectIds.has(p.id))
+      // 服务端非空:setState = C 过滤后服务端列表 ∪ candidates(local-only 保留,正在上迁)。
+      //   服务端空:filteredProjects=[] ∪ candidates(=全量本地)→ 保留本地(与旧版 keep-local 一致),
+      //   跳过 setState 避免无谓 persist 回写(op 已下方收集)。
+      if (projects.length > 0) {
+        useCanvasStore.setState({ projects: [...filteredProjects, ...candidates] })
+      }
+      for (const p of candidates) {
+        pendingServerMigrationOps.push({ kind: 'createProject', name: p.name, id: p.id })
+      }
+      debugLogger.log(
+        SOURCE,
+        `server hydrate: ${filteredProjects.length} server project(s)${candidates.length > 0 ? ` + ${candidates.length} local-only candidate(s) kept (union; createProject ops collected for migration-on-boot)` : ' (replaced local)'}${projects.length === 0 && localProjects.length > 0 ? ' [server empty, local retained]' : ''}`,
+      )
+    } else {
+      // marker 已种 → 现行为(服务端真值 replace + C 过滤)+ F2 pending-create 并集保护。
+      if (projects.length === 0 && localProjects.length > 0) {
+        // server 空 + 本地有(marker set = 曾迁移;creates 在 IDB queue pending 或 terminal 失败)→ 保留本地,
+        //   不 re-enqueue(marker)。pending creates 经 queue timer drain;terminal 失败 fail-visible(D4)。
+        debugLogger.log(
+          SOURCE,
+          `server hydrate: server empty + ${localProjects.length} local project(s) but migration marker set → keep local, skip re-enqueue (prior migration pending/failed; queue drains pending)`,
+        )
+      } else {
+        // F2:replace = C 过滤后服务端列表 ∪ 本地 pending-create projects(防 marker 已种 + creates 仍 pending
+        //   时刷新丢;已在服务端的 id 不重复加,防 double)。
+        const filteredIds = new Set(filteredProjects.map((p) => p.id))
+        const localPendingCreates = pendingCreateProjectIds.size === 0
+          ? []
+          : localProjects.filter((p) => pendingCreateProjectIds.has(p.id) && !filteredIds.has(p.id))
+        useCanvasStore.setState({ projects: [...filteredProjects, ...localPendingCreates] })
+        const droppedProjects = projects.length - filteredProjects.length
+        debugLogger.log(
+          SOURCE,
+          `server hydrate: ${filteredProjects.length} project(s) from BFF (replaced local${droppedProjects > 0 ? `; ${droppedProjects} filtered as pending-delete not-yet-drained (anti-resurrection)` : ''}${localPendingCreates.length > 0 ? `; ${localPendingCreates.length} local pending-create(s) retained (anti-drop F2)` : ''})`,
+        )
+      }
+    }
   } catch (error) {
     debugLogger.error(SOURCE, `listProjects hydrate failed: ${msg(error)} (degrade to local/demo state)`)
   }
@@ -393,50 +668,98 @@ export const hydrateFromServer = async (
     const serverCanvases = pendingDeleteCanvasIds.size === 0
       ? canvases
       : canvases.filter((m) => !pendingDeleteCanvasIds.has(m.id))
-    const serverById = new Map(serverCanvases.map((m) => [m.id, m] as const))
-    useCanvasStore.setState((s) => {
-      const local = s.canvases
-      const merged: Record<string, CanvasDocument> = {}
-      for (const meta of serverCanvases) {
-        const existing = local[meta.id]
-        if (existing) {
-          // 刷新 meta 字段,保留本地 content(nodes/edges/tasks/selection)+ sourceTemplateId
-          // (sourceTemplateId 客户端是 DemoSceneId,服务端 string 不覆盖)。
-          merged[meta.id] = {
-            ...existing,
-            title: meta.title,
-            projectId: meta.projectId,
-            metaRevision: meta.metaRevision,
-            contentVersion: meta.contentVersion,
-            updatedAt: meta.updatedAt,
-          }
-        } else {
-          // meta-stub:content 空(G1-c content hydrate defer);meta 已恢复,非 only-log。
-          // sourceTemplateId 不从服务端 string 覆盖(客户端 DemoSceneId 域,留 undefined)。
-          merged[meta.id] = {
-            title: meta.title,
-            projectId: meta.projectId,
-            createdAt: meta.createdAt,
-            updatedAt: meta.updatedAt,
-            metaRevision: meta.metaRevision,
-            contentVersion: meta.contentVersion,
-            nodes: [],
-            edges: [],
-            tasks: [],
-          } as CanvasDocument
+    const localCanvases = useCanvasStore.getState().canvases
+    const localCanvasEntries = Object.entries(localCanvases)
+    // D2 差集迁移:`!marker` 时为 local-only candidates(本地有 projectId 且 id 不在服务端列表)收集 createCanvas
+    //   meta op。union-merge(下方)本就保留 local-only canvas(content 不丢),store 侧无额外动;此块只补 op 收集。
+    //   **修线程1 canvas 侧:服务端非空 + 无 marker 时旧版只 union-merge 保留 local-only 但漏迁(永不 enqueue 上传)
+    //   → 本修复补差集 op(已在服务端的 id 不重复入队 SC-G)。** 服务端空:差集=全量本地(与旧版一致);
+    //   无 projectId 跳过计数(demo,不可迁,createCanvas op projectId 必填),与旧版一致。
+    //   **content gap(V1)**:createCanvas op 只带 meta(canvasId/projectId/title),不带 nodes/edges。
+    //   画布 content 写走 upsertNode/upsertEdge(画布域),G1-a executor 返 unsupported-retained(deferred
+    //   等 G1-c);migrateLegacyOp 把 upsertNode 映 legacy-envelope 但受 LEGACY_DRAIN gate(默认关)→ gate-blocked
+    //   留存不 drain。故 V1 无现成可 drain 的 content 上迁通道 → content 不迁,保留本地(union-merge 仍保留
+    //   本地 content;不静默丢,在此明示)。G1-c 接线后补 content 上迁。
+    //   sourceTemplateId 是客户端 DemoSceneId 域(hydrate 不从服务端 string 覆盖),迁移 op 不带它(无 loss:
+    //   本地保留,服务端无该字段不影响)。
+    let migrationCanvasCandidates = 0
+    let gapNoProject = 0
+    if (!migrationMarkerSet && localCanvasEntries.length > 0) {
+      const serverCanvasIds = new Set(canvases.map((m) => m.id))
+      for (const [id, doc] of localCanvasEntries) {
+        if (serverCanvasIds.has(id)) continue // 已在服务端,不重复入队(SC-G)
+        if (!doc.projectId) {
+          // demo/无 projectId canvas 无法 createCanvas(op projectId 必填)→ 跳过,fail-visible 计数。
+          gapNoProject++
+          continue
         }
+        pendingServerMigrationOps.push({
+          kind: 'createCanvas',
+          canvasId: id,
+          projectId: doc.projectId,
+          title: doc.title,
+        })
+        migrationCanvasCandidates++
       }
-      // 本地有但服务端无:保留(pending create / demo;G1-c 全量 reconcile owns drop)
-      for (const [id, doc] of Object.entries(local)) {
-        if (!serverById.has(id)) merged[id] = doc
+      if (migrationCanvasCandidates > 0 || gapNoProject > 0) {
+        debugLogger.log(
+          SOURCE,
+          `server hydrate: ${localCanvasEntries.length} local canvas(s) → migration-on-boot (createCanvas meta ops collected for ${migrationCanvasCandidates} local-only candidate(s)${gapNoProject > 0 ? `; ${gapNoProject} skipped (no projectId — demo, not migrable)` : ''}; content(nodes/edges) NOT migrated — V1 meta-only gap, retained local — see report)`,
+        )
       }
-      return { canvases: merged }
-    })
-    const droppedCanvases = canvases.length - serverCanvases.length
-    debugLogger.log(
-      SOURCE,
-      `server hydrate: ${serverCanvases.length} canvas meta(s) merged into store.canvases (content hydrate deferred to G1-c; local-only canvases retained${droppedCanvases > 0 ? `; ${droppedCanvases} filtered as pending-delete not-yet-drained (anti-resurrection)` : ''})`,
-    )
+    }
+    // union-merge:server canonical 刷 meta + 保留 local-only content(R-7 同语义,store 侧本就保留 local-only)。
+    //   服务端空 + 本地有 + `!marker`:merged=本地(无 meta 可刷)→ 跳过 setState(与旧版一致,避免无谓 persist
+    //   回写;迁移 op 已上方收集)。其余(含 marker set、服务端非空、服务端空+本地空):走 union-merge setState。
+    //   marker set 时曾迁移 creates 仍 pending/terminal → 走 union-merge 保留本地(此分支只挡 `!marker` 首启)。
+    if (canvases.length === 0 && localCanvasEntries.length > 0 && !migrationMarkerSet) {
+      // server 空 + 本地有 + 首启:保留本地(union 结果=本地,无 meta 可刷),跳过 setState。op 已上方收集。
+    } else {
+      const serverById = new Map(serverCanvases.map((m) => [m.id, m] as const))
+      useCanvasStore.setState((s) => {
+        const local = s.canvases
+        const merged: Record<string, CanvasDocument> = {}
+        for (const meta of serverCanvases) {
+          const existing = local[meta.id]
+          if (existing) {
+            // 刷新 meta 字段,保留本地 content(nodes/edges/tasks/selection)+ sourceTemplateId
+            // (sourceTemplateId 客户端是 DemoSceneId,服务端 string 不覆盖)。
+            merged[meta.id] = {
+              ...existing,
+              title: meta.title,
+              projectId: meta.projectId,
+              metaRevision: meta.metaRevision,
+              contentVersion: meta.contentVersion,
+              updatedAt: meta.updatedAt,
+            }
+          } else {
+            // meta-stub:content 空(G1-c content hydrate defer);meta 已恢复,非 only-log。
+            // sourceTemplateId 不从服务端 string 覆盖(客户端 DemoSceneId 域,留 undefined)。
+            merged[meta.id] = {
+              title: meta.title,
+              projectId: meta.projectId,
+              createdAt: meta.createdAt,
+              updatedAt: meta.updatedAt,
+              metaRevision: meta.metaRevision,
+              contentVersion: meta.contentVersion,
+              nodes: [],
+              edges: [],
+              tasks: [],
+            } as CanvasDocument
+          }
+        }
+        // 本地有但服务端无:保留(pending create / demo;G1-c 全量 reconcile owns drop)
+        for (const [id, doc] of Object.entries(local)) {
+          if (!serverById.has(id)) merged[id] = doc
+        }
+        return { canvases: merged }
+      })
+      const droppedCanvases = canvases.length - serverCanvases.length
+      debugLogger.log(
+        SOURCE,
+        `server hydrate: ${serverCanvases.length} canvas meta(s) merged into store.canvases (content hydrate deferred to G1-c; local-only canvases retained${droppedCanvases > 0 ? `; ${droppedCanvases} filtered as pending-delete not-yet-drained (anti-resurrection)` : ''})`,
+      )
+    }
   } catch (error) {
     debugLogger.warn(SOURCE, `listCanvas hydrate failed: ${msg(error)}`)
   }
@@ -618,14 +941,37 @@ export const startPersistWriteQueue = (
     //   (server 仍有,下次 hydrate 自然保留;C 差集随记录离队失效,不冲突)。local 模式 onOutcome
     //   永不调(队列未启动)。applyServerRevision(onSuccess)对 delete 提前 return(revision undefined),
     //   故 delete 终态只经此 onOutcome 摘除(非 applyServerRevision 死代码分支)。
+    // D3 edge fix(2026-07-15,#254 backlog):DELETE in-flight 时用户立即 restoreProject → enqueue
+    //   createProject(同 id,在 in-flight delete 不能 combineOps 合并 → 两记录共存)。旧 DELETE drain
+    //   success 后 B 按 id 无条件摘除会误删刚恢复的项目,且 applyServerRevision(createProject)只更新
+    //   existing project → 项目永久消失(直到下次 hydrate)。修:B 摘除前查队列是否有同 id 的 pending
+    //   createProject(restore)/createCanvas,有则跳过摘除(恢复 op 待 drain 重建,store 保留)。getPendingCreateResourceIds
+    //   读 IDB 非终态记录(此时本 delete 记录已 deleteWrite 离队,不在集内 → 不误判)。无 restore 时
+    //   createProject 不在集 → B 照常摘除(#254 SC-3 原行为不回归)。
     onOutcome: async (op, outcome) => {
       if (op.kind === 'deleteProject' && outcome.status === 'success') {
+        const restoreIds = await getPendingCreateResourceIds('createProject')
+        if (restoreIds.has(op.projectId)) {
+          debugLogger.log(
+            SOURCE,
+            `deleteProject ${op.projectId} drained success but a pending createProject(restore) exists → skip store removal (anti-resurrection B D3 restore-safe)`,
+          )
+          return
+        }
         const { useCanvasStore } = await import('../store/canvasStore')
         useCanvasStore.setState((s) => ({ projects: s.projects.filter((p) => p.id !== op.projectId) }))
         debugLogger.log(SOURCE, `deleteProject ${op.projectId} drained success → removed from store (anti-resurrection fallback B)`)
         return
       }
       if (op.kind === 'deleteCanvas' && outcome.status === 'success') {
+        const restoreIds = await getPendingCreateResourceIds('createCanvas')
+        if (restoreIds.has(op.canvasId)) {
+          debugLogger.log(
+            SOURCE,
+            `deleteCanvas ${op.canvasId} drained success but a pending createCanvas(restore) exists → skip store removal (anti-resurrection B D3 restore-safe)`,
+          )
+          return
+        }
         const { useCanvasStore } = await import('../store/canvasStore')
         useCanvasStore.setState((s) => {
           if (!s.canvases[op.canvasId]) return {}
@@ -718,8 +1064,19 @@ export const bootPersistWiring = async (opts: FetchAdapterOptions = getProductio
     return
   }
   if (getPersistMode() === 'server') {
-    await hydrateFromServer(undefined, opts)
+    // F1:与 hydrate 同源 adapter(单获取通道;flush 在 drain 后需重拉 listProjects/listCanvas 做可恢复性
+    //   验证,复用此 adapter,不另起第二条获取通道;getServerPersistAdapter 返单例)。
+    const adapter = getServerPersistAdapter()
+    await hydrateFromServer(adapter, opts)
     await startPersistWriteQueue(opts)
+    // D2:flush hydrate 收集的迁移 op(server 空 + 本地存量 → createProject/createCanvas 上迁)。
+    //   必须在 startPersistWriteQueue 之后(queue singleton 已启动 → enqueuePersistWrite 真 enqueue)。
+    //   无迁移 op 时(pendingServerMigrationOps 空)flush 内 splice 后 length===0 → 直接 return,零开销。
+    //   F1:flush 在 drain 后验证可恢复性——全可恢复才种 marker(堵 terminal 残根;详见 flushServerMigration)。
+    //   local 在 bootPersistWiring 第一行 return 短路,永不达此。
+    if (pendingServerMigrationOps.length > 0) {
+      await flushServerMigration(adapter)
+    }
     // A2-S3 block 8:启动 scene 切换 re-hydrate 订阅(切到新 server 画布 → fetchCanvas 补 content;
     // 去重 + in-flight 防并发)。local 在 bootPersistWiring 第一行 return 短路,永不调此。
     await startSceneHydrationSubscription()
