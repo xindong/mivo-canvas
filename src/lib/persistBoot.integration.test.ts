@@ -152,8 +152,8 @@ describe('G1-a P1-1 — server 模式 mutation → enqueue → drain → fetch(B
   })
 })
 
-describe('G1-a P1-1 — server 冷启动 hydrate 从 BFF 恢复(hydrateFromServer 替换 store.projects)', () => {
-  it('hydrateFromServer(fakeAdapter) → store.projects 被服务端真值替换 + listCanvas 读取', async () => {
+describe('G1-a P1-1 — server 冷启动 hydrate 从 BFF 恢复(store.projects = server 真值 ∪ local-only)', () => {
+  it('hydrateFromServer(fakeAdapter) → server projects 入 store + local-only 保留 union(无 marker 差集迁移)+ listCanvas 读取', async () => {
     const serverProjects: Project[] = [
       { id: 'srv-1', name: 'Server Project A', ownerId: KEY_A, createdAt: 't1', updatedAt: 't1', revision: 0, isDeleted: false },
       { id: 'srv-2', name: 'Server Project B', ownerId: KEY_A, createdAt: 't2', updatedAt: 't2', revision: 0, isDeleted: false },
@@ -161,7 +161,7 @@ describe('G1-a P1-1 — server 冷启动 hydrate 从 BFF 恢复(hydrateFromServe
     const serverCanvases: CanvasMeta[] = [
       { id: 'c-srv', projectId: 'srv-1', title: 'c', createdAt: 't', updatedAt: 't', metaRevision: 0, contentVersion: 0 },
     ]
-    // local 先有 demo project
+    // local 先有 demo project(server 没有 → local-only)
     resetStoreProjects([{ id: 'demo', name: 'demo', createdAt: 't' } as unknown as Project])
     expect(useCanvasStore.getState().projects.map((p) => p.id)).toContain('demo')
 
@@ -176,10 +176,12 @@ describe('G1-a P1-1 — server 冷启动 hydrate 从 BFF 恢复(hydrateFromServe
     }
     await hydrateFromServer(fakeAdapter, fakeOpts)
 
-    // server 真值替换 local demo
+    // 无 marker:server 真值 ∪ local-only demo(差集迁移——不丢 local-only,SC-G 详测 op 入队)。
+    //   旧版此处整替换丢 demo(线程1 数据丢失 bug);新版 union 保留 demo + 收集 createProject(demo)。
     const projects = useCanvasStore.getState().projects
-    expect(projects.map((p) => p.id)).toEqual(['srv-1', 'srv-2'])
+    expect(projects.map((p) => p.id)).toEqual(['srv-1', 'srv-2', 'demo'])
     expect(projects[0].name).toBe('Server Project A')
+    expect(projects.find((p) => p.id === 'demo')).toBeDefined() // local-only 保留(union)
   })
 })
 
@@ -1492,5 +1494,70 @@ describe('D2 migration-on-boot + D3 restore-safe edge (lead SC-B/D/E)', () => {
     await flush()
     await drainPersistQueue()
     expect(useCanvasStore.getState().projects.map((p) => p.id)).toEqual([])
+  })
+
+  // ── 差集迁移(Greptile 线程1 数据丢失修复;lead SC-G/H)──────────
+  //  SC-G: server 非空 + 本地有 local-only project/canvas + 无 marker → 本地不丢(store 并集)、
+  //        差集 create op 入队、drain 后服务端补齐;已在服务端的 id 不重复入队。
+  //  SC-H: marker 已种 + server 非空 + 本地有 local-only → 纯现行为(replace,不再迁移)——线程1 场景在 marker 后收敛。
+  const cmeta = (id: string, projectId: string, title: string): CanvasMeta => ({
+    id, projectId, title, createdAt: 't', updatedAt: 't', metaRevision: 0, contentVersion: 0,
+  })
+  // server 已有 pSrv/cSrv(模拟"另一台浏览器已上迁,服务端非空");本地有 local-only pLocal/cLocal + 共享 pSrv/cSrv。
+  const nonEmptyAdapter = (projects: Project[], canvases: CanvasMeta[]): ServerPersistAdapter =>
+    ({
+      listProjects: async () => ({ projects }),
+      listCanvas: async () => ({ canvases }),
+      listChatMessages: async () => ({ messages: [], orderRevision: 0 }),
+    }) as unknown as ServerPersistAdapter
+
+  it('SC-G: server 非空 + 本地 local-only + 无 marker → 本地不丢(union)+ 差集 op 入队 + drain 补齐 + server id 不重复入队', async () => {
+    const { fetch, calls } = makeMigrationFetch()
+    const serverProj = [proj('pSrv', 'Srv')]
+    const serverCv = [cmeta('cSrv', 'pSrv', 'CSrv')]
+    // 本地:pLocal/cLocal(server 没有 → local-only 差集候选)+ pSrv/cSrv(共享,已在服务端)
+    resetStoreProjects([proj('pLocal', 'Local'), proj('pSrv', 'Srv')])
+    useCanvasStore.setState({ canvases: { cLocal: doc('pLocal', 'CLocal'), cSrv: doc('pSrv', 'CSrv') } as never })
+    await hydrateFromServer(nonEmptyAdapter(serverProj, serverCv), hydrateOpts)
+    // 本地不丢(union):pLocal 保留(差集候选,SC-G 核心——旧版此处整替换丢 pLocal = 线程1 bug);
+    //   pSrv 取服务端真值;差集 union 不丢 local-only。
+    expect(useCanvasStore.getState().projects.map((p) => p.id).sort()).toEqual(['pLocal', 'pSrv'])
+    // canvas 同理:union-merge 保留 local-only cLocal(旧版 else 也保留,但漏迁 op;新版补 op)。
+    expect(Object.keys(useCanvasStore.getState().canvases).sort()).toEqual(['cLocal', 'cSrv'])
+    // start queue + flush(queue 已启动 → 真 enqueue + drain)→ 只为 local-only 候选入队(pLocal, cLocal)。
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    await __flushServerMigrationForTest()
+    await flush()
+    const projectCreates = calls.filter((c) => c.method === 'POST' && c.path === '/api/projects').map((c) => (c.body as { id: string }).id)
+    const canvasCreates = calls.filter((c) => c.method === 'POST' && c.path === '/api/canvas').map((c) => (c.body as { id: string }).id)
+    // 已在服务端的 id(pSrv/cSrv)不重复入队;只上迁 local-only(pLocal/cLocal)。
+    expect(projectCreates.sort()).toEqual(['pLocal'])
+    expect(canvasCreates.sort()).toEqual(['cLocal'])
+    // marker seeded(SC-D 前置:下次 boot 不再迁移)
+    expect(localStorage.getItem('mivo:server-migration:anonymous')).toBe('done')
+  })
+
+  it('SC-H: marker 已种 + server 非空 + 本地 local-only → 纯现行为(replace,不再迁移;线程1 场景 marker 后收敛)', async () => {
+    const { fetch, calls } = makeMigrationFetch()
+    // 预种 marker(模拟"曾迁移过的浏览器二次 boot";beforeEach 已清,此处显式种)。
+    localStorage.setItem('mivo:server-migration:anonymous', 'done')
+    const serverProj = [proj('pSrv', 'Srv')]
+    const serverCv = [cmeta('cSrv', 'pSrv', 'CSrv')]
+    // 同 SC-G 的本地态(pLocal/cLocal local-only + pSrv/cSrv 共享),但 marker 已种。
+    resetStoreProjects([proj('pLocal', 'Local'), proj('pSrv', 'Srv')])
+    useCanvasStore.setState({ canvases: { cLocal: doc('pLocal', 'CLocal'), cSrv: doc('pSrv', 'CSrv') } as never })
+    await hydrateFromServer(nonEmptyAdapter(serverProj, serverCv), hydrateOpts)
+    // marker set → 纯现行为:projects 服务端真值 replace(pLocal 被丢——线程1 场景在 marker 后收敛,
+    //   即 marker 后不再走差集 union;local-only 此处 = 迁移后新建/已在队列,replace 不破)。
+    expect(useCanvasStore.getState().projects.map((p) => p.id)).toEqual(['pSrv'])
+    // canvas:marker set 走 else union-merge(同旧版 else——canvas else 本就 union 保留 local-only,不变)。
+    expect(Object.keys(useCanvasStore.getState().canvases).sort()).toEqual(['cLocal', 'cSrv'])
+    // 不收集迁移 op(marker 拦截两步)→ flush no-op → 无 POST(不再迁移)。
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    await __flushServerMigrationForTest() // pendingServerMigrationOps 空(marker 拦截)→ no-op
+    await flush()
+    expect(calls.filter((c) => c.method === 'POST')).toHaveLength(0)
   })
 })

@@ -954,6 +954,10 @@ const getAllWrites = async (): Promise<QueuedWrite[]> => {
  * "not yet drained" → filtered. Unions memStore fallback (IDB-unavailable) so the read stays
  * consistent with the queue's own view.
  *
+ * Scoped to the current persist user (`r.userId === getPersistUserId()`) — same convention as
+ * pendingCount/start; the IDB store is shared across users, so without this filter one account's
+ * pending delete would pollute another account's hydrate difference-filter (Greptile thread 3).
+ *
  * local mode: the write-queue IDB/memStore is never populated with project/canvas deletes —
  * enqueuePersistWrite is a no-op when the queue singleton is undefined (isLocalPersist early
  * return in persistBoot.bootPersistWiring), and the queue is never started in local mode →
@@ -963,9 +967,13 @@ const getAllWrites = async (): Promise<QueuedWrite[]> => {
 export const getPendingDeleteResourceIds = async (
   kind: 'deleteProject' | 'deleteCanvas',
 ): Promise<Set<string>> => {
+  const userId = getPersistUserId()
   const all = await getAllWrites()
   const ids = new Set<string>()
   for (const r of all) {
+    // 按 userId 过滤(同 pendingCount/start 约定;Greptile 线程3:多用户共享 IDB store,
+    //   不过滤则 userA 的 pending-delete 会污染 userB 的差集判定 → userB hydrate 误摘除)。
+    if (r.userId !== userId) continue
     const op = r.op
     // Narrow via kind check so TS narrows op to the deleteProject/deleteCanvas variant
     // (projectId / canvasId access). Both delete kinds carry no baseRevision → never 409
@@ -1001,13 +1009,22 @@ export const getPendingDeleteResourceIds = async (
  * singleton is started (reads IDB directly via getAllWrites) AND mid-session. Unions
  * memStore fallback. local mode: never populated (queue never started, enqueue no-op) →
  * empty set, zero impact (and onOutcome is never called in local mode anyway).
+ *
+ * Scoped to the current persist user (`r.userId === getPersistUserId()`) — same convention as
+ * getPendingDeleteResourceIds / pendingCount; without this filter one account's pending
+ * create (restore) would make another account's DELETE onOutcome B erroneously skip removal
+ * (Greptile thread 3).
  */
 export const getPendingCreateResourceIds = async (
   kind: 'createProject' | 'createCanvas',
 ): Promise<Set<string>> => {
+  const userId = getPersistUserId()
   const all = await getAllWrites()
   const ids = new Set<string>()
   for (const r of all) {
+    // 按 userId 过滤(同 getPendingDeleteResourceIds / pendingCount 约定;Greptile 线程3:
+    //   不过滤则 userA 的 pending-create(restore)会让 userB 的 DELETE onOutcome B 误跳过摘除)。
+    if (r.userId !== userId) continue
     const op = r.op
     if (kind === 'createProject' && op.kind === 'createProject' && op.id !== undefined) {
       ids.add(op.id)
