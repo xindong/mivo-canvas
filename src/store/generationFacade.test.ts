@@ -145,11 +145,12 @@ describe('generationFacade — delegation + failure rethrow (SC3.1 / A1 quirks)'
     spy.mockRestore()
   })
 
-  it('generateIntoAiSlot delegates to the store action', async () => {
+  it('generateIntoAiSlot delegates to the store action + 注入 onSceneMutation(F1)', async () => {
     const spy = vi.spyOn(useCanvasStore.getState(), 'generateIntoAiSlot').mockResolvedValue(['res-slot'])
     const nodeIds = await generationFacade.generateIntoAiSlot('slot-1', 'p', { sceneId: 'c1' })
     expect(nodeIds).toEqual(['res-slot'])
-    expect(spy).toHaveBeenCalledWith('slot-1', 'p', { sceneId: 'c1' })
+    // F1:facade 注入 scene-scoped sync 回调(catch 删 slot 时发 delete-node);caller 原 options 透传。
+    expect(spy).toHaveBeenCalledWith('slot-1', 'p', expect.objectContaining({ sceneId: 'c1', onSceneMutation: expect.any(Function) }))
     spy.mockRestore()
   })
 

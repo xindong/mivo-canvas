@@ -19,6 +19,7 @@ import type { CanvasId } from '../types/mivoCanvas'
 import { defaultSizeForNodeType } from '../model/canvasNodeRegistry'
 import { AI_SLOT_GAP, chooseAdjacentPlacement } from './aiCanvasWorkflow'
 import { firstAnchorImageFor } from './canvasDocumentModel'
+import { wrapMutationForScene } from '../canvas/actions/canvasSyncRuntime'
 
 type ChatSlotPrep =
   | { mode: 'beside'; slotId: undefined }
@@ -38,7 +39,15 @@ export const generationFacade = {
     options?: Parameters<CanvasState['generateIntoAiSlot']>[2],
   ) => {
     const skipSlotHistoryBaseline = Boolean(slotId && freshlyCreatedChatSlots.delete(slotId))
-    const nextOptions = skipSlotHistoryBaseline ? { ...options, skipSlotHistoryBaseline } : options
+    // T2.2 Block 1 F1:注入 scene-scoped sync → generateIntoAiSlot catch 删 slot 时发 delete-node。
+    // generationFacade 无环(canvasStore 不引 generationFacade),可静态 import wrapMutationForScene;注入
+    // 回调而非让 generationSlice 静态引 canvasSyncRuntime(避 store→canvas→store 环)。local 模式
+    // wrapMutationForScene 的 isLocalPersist gate 短路,不发 submit(行为不退)。
+    const nextOptions = {
+      ...options,
+      ...(skipSlotHistoryBaseline ? { skipSlotHistoryBaseline } : {}),
+      onSceneMutation: (sceneId: string, mutate: () => void) => wrapMutationForScene(sceneId, mutate)(),
+    }
     return useCanvasStore.getState().generateIntoAiSlot(slotId, prompt, nextOptions)
   },
   generateVariations: (...args: Parameters<CanvasState['generateVariations']>) =>
@@ -102,12 +111,12 @@ export const generationFacade = {
             margin: AI_SLOT_GAP,
           })
         })()
-    const slotId = store.addAiSlotNode(
-      slotPosition,
-      slotSize,
-      params.prompt ?? '',
-      { sceneId: params.sceneId },
-    )
+    // T2.2 Block 1:chat slot 经 wrapMutationForScene → server 模式 create-node submitChange
+    // (slot 落 server,为 Block 3 结果原位 edit 铺地基)。local 模式 gate 不发。sceneId 锚定
+    // params.sceneId(可非活跃画布),不用 wrapMutation(锚 state.sceneId 会快照错画布)。
+    const slotId = wrapMutationForScene(params.sceneId, () =>
+      store.addAiSlotNode(slotPosition, slotSize, params.prompt ?? '', { sceneId: params.sceneId }),
+    )()
     freshlyCreatedChatSlots.add(slotId)
     requestSlotFocus(slotId)
     return { mode: 'slot', slotId }

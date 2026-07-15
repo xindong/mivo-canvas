@@ -149,8 +149,10 @@ const recordsFromDocument = (document: CanvasDocument) => {
 const mapById = <T extends { id: string }>(records: T[]): Map<string, T> =>
   new Map(records.map((record) => [record.id, record]))
 
-const snapshotFromState = (state: CanvasState): SyncSnapshot => {
-  const canvasId = state.sceneId
+// sceneId 可选:缺省快照活跃画布(state.sceneId);传入时快照指定画布(供 wrapMutationForScene
+// 给 deferred slot 路径用 —— slot 可建/删于非活跃画布,T2.2 Block 1)。
+const snapshotFromState = (state: CanvasState, sceneId?: string): SyncSnapshot => {
+  const canvasId = sceneId ?? state.sceneId
   const document = documentFor(state.canvases, canvasId)
   const { nodes, edges, anchors } = recordsFromDocument(document)
   return {
@@ -416,6 +418,30 @@ export const wrapMutation = <TArgs extends unknown[], TResult>(
   }
 }
 
+// ── T2.2 Block 1:scene-scoped wrapMutation(deferred slot 路径用) ──────────────────
+// 与 wrapMutation 同型,但快照/diff/submit 锚定 caller 指定的 targetSceneId,而非 state.sceneId。
+// placeholder slot 可建于非活跃画布(prepareChatSlot / prepareMaskEditPlaceholder 的 sceneId 形参);
+// 若用 wrapMutation(锚 state.sceneId)会快照错画布 → diff 空 → slot 不落 server。targetSceneId ===
+// state.sceneId 时行为与 wrapMutation 一致。OUT 边界:只接 slot create + rollback delete;result
+// edit-node(slot→结果原位替换)+ attach 是 Block 2/3(computeAssetSideEffects assetUrl-diff);slot create
+// 的 undo 走既有键盘 undo call-site wrap(#246),不在此。
+export const wrapMutationForScene = <TArgs extends unknown[], TResult>(
+  targetSceneId: string,
+  mutate: (...args: TArgs) => TResult,
+): ((...args: TArgs) => TResult) => {
+  return (...args: TArgs): TResult => {
+    // local 模式无 server port,直接 mutate(与 wrapMutation 的 local gate 一致)。
+    if (isLocalPersist) return mutate(...args)
+    const before = snapshotFromState(useCanvasStore.getState(), targetSceneId)
+    const result = mutate(...args)
+    const after = snapshotFromState(useCanvasStore.getState(), targetSceneId)
+    const changes = buildCanvasSyncChanges(before, after)
+    const assetEffects = computeAssetSideEffects(before, after)
+    if (changes.length > 0) void enqueueCanvasSyncChanges(targetSceneId, changes, undefined, assetEffects)
+    return result
+  }
+}
+
 export const wrapCanvasActionRuntimeWithSync = (runtime: CanvasActionRuntime): CanvasActionRuntime => {
   if (isLocalPersist) return runtime
   return {
@@ -444,5 +470,14 @@ export const wrapCanvasActionRuntimeWithSync = (runtime: CanvasActionRuntime): C
     showAllHiddenNodes: wrapMutation(runtime.showAllHiddenNodes),
     deleteNode: wrapMutation(runtime.deleteNode),
     deleteSelectedNodes: wrapMutation(runtime.deleteSelectedNodes),
+    // F4:runtime 路径(canvasActionModel 菜单 "Generate into slot" + ai-slot view-details)的 generateIntoAiSlot
+    // 注入 onSceneMutation —— catch 删 slot 经回调发 delete-node(与 chat generationFacade 注入对称)。不 wrapMutation
+    // (async 生成不能同步 before/after wrap,那是 Block 3);只注入回调,内部失败删 slot 那一步经 wrapMutationForScene
+    // 发 delete-node。local 分支早 return runtime → raw,catch default passthrough,行为不退。
+    generateIntoAiSlot: (slotId, prompt, options) =>
+      runtime.generateIntoAiSlot(slotId, prompt, {
+        ...options,
+        onSceneMutation: (sceneId: string, mutate: () => void) => wrapMutationForScene(sceneId, mutate)(),
+      }),
   }
 }

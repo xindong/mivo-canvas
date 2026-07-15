@@ -689,27 +689,35 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
         await cancelTask(serverTaskId)
       }
       const message = error instanceof Error ? error.message : 'Generation failed'
-      set((current) => {
-        const targetDocument = current.canvases[targetSceneId]
-        if (!targetDocument) return {}
-        // S01: 仅当栈顶仍是生成开始时捕获的基线引用才回滚；baselineSnapshot 为
-        // undefined（chat 新建槽位 skip 路径）或栈顶已变（用户异步期间编辑过）时
-        // 走 filter-removal —— 删槽位与运行中 task，但 historyPast/historyFuture
-        // 不动，保留用户编辑与 redo 栈。
-        const rollback = baselineSnapshot
-          ? rollbackLatestHistoryBaseline(current, targetSceneId, {
-              removeNodeId: slot.id,
-              expectedBaseline: baselineSnapshot,
-            })
-          : undefined
-        if (rollback) return rollback
+      // T2.2 Block 1 F1:catch 内 slot 删除经注入的 scene-scoped sync → server 模式发 delete-node
+      // (slot.id + edges/tasks);未注入/local → pass-through 仍删(行为不退)。注入点在 generationFacade
+      // (无环层),不静态 import canvasSyncRuntime —— generationSlice 由 canvasStore 组合,静态引会成
+      // store→canvas→store 环(structure-guard + 架构红线)。chat slot 无 reflow(prepareChatSlot 不
+      // reflow),delete diff 不含 position-revert,server base 匹配无错位风险。
+      const deleteSlot = () =>
+        set((current) => {
+          const targetDocument = current.canvases[targetSceneId]
+          if (!targetDocument) return {}
+          // S01: 仅当栈顶仍是生成开始时捕获的基线引用才回滚；baselineSnapshot 为
+          // undefined（chat 新建槽位 skip 路径）或栈顶已变（用户异步期间编辑过）时
+          // 走 filter-removal —— 删槽位与运行中 task，但 historyPast/historyFuture
+          // 不动，保留用户编辑与 redo 栈。
+          const rollback = baselineSnapshot
+            ? rollbackLatestHistoryBaseline(current, targetSceneId, {
+                removeNodeId: slot.id,
+                expectedBaseline: baselineSnapshot,
+              })
+            : undefined
+          if (rollback) return rollback
 
-        return patchCanvasDocument(current, targetSceneId, {
-          nodes: targetDocument.nodes.filter((node) => node.id !== slot.id),
-          edges: (targetDocument.edges || []).filter((edge) => edge.from !== slot.id && edge.to !== slot.id),
-          tasks: targetDocument.tasks.filter((task) => task.id !== runningTask.id),
+          return patchCanvasDocument(current, targetSceneId, {
+            nodes: targetDocument.nodes.filter((node) => node.id !== slot.id),
+            edges: (targetDocument.edges || []).filter((edge) => edge.from !== slot.id && edge.to !== slot.id),
+            tasks: targetDocument.tasks.filter((task) => task.id !== runningTask.id),
+          })
         })
-      })
+      const runSceneMutation = options.onSceneMutation ?? ((_: string, mutate: () => void) => mutate())
+      runSceneMutation(targetSceneId, deleteSlot)
       if (canceled) {
         warnCanvas(`生成到槽位已取消，已移除占位符：${slot.title}`)
       } else {
