@@ -6,10 +6,9 @@ import type {
   CanvasChange,
   CanvasSyncPort,
   FieldIntent,
-  FieldPath,
-  FieldPathTarget,
 } from '../../lib/canvasSyncPort'
 import { FieldIntentError, validateFieldIntent } from '../../lib/canvasSyncPort'
+import { classifyFieldPathBySchema } from '../../../shared/persist-contract.ts'
 import { abortPendingCanvasSyncCreate, getCanvasSyncPort } from '../../lib/canvasSyncPortClient'
 import { isLocalPersist } from '../../lib/persistMode'
 import { enqueueAssetAttach, enqueueAssetDetach, serverAssetIdFromUrl } from '../../lib/assetAttachWiring'
@@ -38,32 +37,12 @@ const cloneValue = <T>(value: T): T => {
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
 
-const readValueAtPath = (record: Record<string, unknown>, fieldPath: FieldPath): unknown => {
-  let current: unknown = record
-  for (const segment of fieldPath) {
-    if (Array.isArray(current) && typeof segment === 'number') {
-      current = current[segment]
-      continue
-    }
-    if (!isPlainObject(current) || typeof segment !== 'string') return undefined
-    current = current[segment]
-  }
-  return current
-}
-
-const classifyFieldPathTarget = (
-  beforeRecord: Record<string, unknown>,
-  afterRecord: Record<string, unknown>,
-  fieldPath: FieldPath,
-): FieldPathTarget => {
-  const last = fieldPath[fieldPath.length - 1]
-  if (typeof last === 'number') return 'array-element'
-  const nextValue = readValueAtPath(afterRecord, fieldPath)
-  if (Array.isArray(nextValue) || isPlainObject(nextValue)) return 'container'
-  const prevValue = readValueAtPath(beforeRecord, fieldPath)
-  if (Array.isArray(prevValue) || isPlainObject(prevValue)) return 'container'
-  return 'leaf'
-}
+// F2-ter(T2.2 Block 2 五轮):生产 classifier 改用 shared classifyFieldPathBySchema(单一真相源,与 transport 同实现)。
+//   旧 value-based classifier(看 before/after 实际值判 array/container)废弃——schema 分类是结构性的,不需运行时值;
+//   唯一行为差异(lead 裁定 P2-2):fills/strokes/effects(required 根数组)从 'array-field'(delete 放行)升 'container'
+//   (delete/set 都拒)——required 根数组不可整体删,validateChildPayload dam 兜底保证 payload 合法。
+const typeOfChangeKind = (changeKind: 'edit-node' | 'edit-edge' | 'edit-anchor'): 'node' | 'edge' | 'anchor' =>
+  changeKind === 'edit-node' ? 'node' : changeKind === 'edit-edge' ? 'edge' : 'anchor'
 
 const valuesEqual = (left: unknown, right: unknown): boolean => {
   if (Object.is(left, right)) return true
@@ -100,6 +79,19 @@ const diffValue = (
 ): void => {
   if (valuesEqual(before, after)) return
   if (after === undefined) {
+    // F1(T2.2 Block 2 review):plainObject container 整体消失时分解为子 key 的 leaf delete,而非 container-level
+    //   delete-field(后者被 validateFieldIntent 拒 'container-delete-field' → 静默丢,server 永不知字段消失 +
+    //   本块 computeAssetSideEffects 的 detach 会与被丢的 change 错位 → 混合批次悬空资产)。leaf delete 合规放行
+    //   (validateFieldIntent 注释:合法 optional leaf delete 放行),是 container 消失在 clobber 契约下的唯一合规
+    //   表达。asset 消失 → delete ['asset','url'] 等,让 edit-node change 真发出 → attach/detach 可对齐真相源
+    //   (见 computeAssetSideEffects 的 changes 过滤)。数组消失不分解(Array 非 plainObject,走下方 delete-field;
+    //   数组元素 delete-field 被 structural 拒 array-element-structure-delete,行为不变)。
+    if (isPlainObject(before)) {
+      for (const key of Object.keys(before)) {
+        diffValue(before[key], undefined, [...fieldPath, key], intents)
+      }
+      return
+    }
     intents.push({ op: 'delete-field', fieldPath })
     return
   }
@@ -182,8 +174,6 @@ const intentsForRecord = (
 const filterValidIntents = (
   changeKind: 'edit-node' | 'edit-edge' | 'edit-anchor',
   recordId: string,
-  beforeRecord: Record<string, unknown>,
-  afterRecord: Record<string, unknown>,
   intents: FieldIntent[],
 ): FieldIntent[] => {
   const valid: FieldIntent[] = []
@@ -191,7 +181,7 @@ const filterValidIntents = (
     try {
       validateFieldIntent(
         intent,
-        (fieldPath) => classifyFieldPathTarget(beforeRecord, afterRecord, fieldPath),
+        (fieldPath) => classifyFieldPathBySchema(typeOfChangeKind(changeKind), fieldPath),
       )
       valid.push(intent)
     } catch (error) {
@@ -243,8 +233,6 @@ export const buildCanvasSyncChanges = (before: SyncSnapshot, after: SyncSnapshot
     const intents = filterValidIntents(
       'edit-node',
       recordId,
-      prev as unknown as Record<string, unknown>,
-      next as unknown as Record<string, unknown>,
       intentsForRecord(prev as unknown as Record<string, unknown>, next as unknown as Record<string, unknown>),
     )
     if (intents.length > 0) changes.push({ kind: 'edit-node', nodeId: recordId, intents })
@@ -264,8 +252,6 @@ export const buildCanvasSyncChanges = (before: SyncSnapshot, after: SyncSnapshot
     const intents = filterValidIntents(
       'edit-edge',
       recordId,
-      prev as unknown as Record<string, unknown>,
-      next as unknown as Record<string, unknown>,
       intentsForRecord(prev as unknown as Record<string, unknown>, next as unknown as Record<string, unknown>),
     )
     if (intents.length > 0) changes.push({ kind: 'edit-edge', edgeId: recordId, intents })
@@ -285,8 +271,6 @@ export const buildCanvasSyncChanges = (before: SyncSnapshot, after: SyncSnapshot
     const intents = filterValidIntents(
       'edit-anchor',
       recordId,
-      prev as unknown as Record<string, unknown>,
-      next as unknown as Record<string, unknown>,
       intentsForRecord(prev as unknown as Record<string, unknown>, next as unknown as Record<string, unknown>),
     )
     if (intents.length > 0) changes.push({ kind: 'edit-anchor', anchorId: recordId, intents })
@@ -306,11 +290,17 @@ export const buildCanvasSyncChanges = (before: SyncSnapshot, after: SyncSnapshot
 // 从 before/after SyncSnapshot diff 出「新建/删除的带 server 资产的 node」→ attach/detach 候选。
 // submitChanges 在对应 create-node/delete-node accepted 后 enqueue(R1 方案 A:attach 依赖 server 端 node 已落,
 // gate ① persist.getChild 才能找到;detach 在 delete-node accepted 后清残留 ref —— server 不级联清 asset ref)。
-// 只覆盖走 wrapMutation 的 mutation(duplicate/paste/delete);import/generate/mask-edit 走 deferred 路径不经
-// wrapMutation(node 不落 server,attach 无对象,Block 3 裁定 OUT,见 PR 残余风险段)。
+// Block 2(T2.2):扩 edit-node 的 assetUrl 变更 —— before/after 都存在的 node 做 assetId diff,堵 slot→result
+// 同 id edit-node 场景下结果图资产 refcount=0 → 7 天误删(详见 computeAssetSideEffects edit-node 分支)。
+// 只覆盖走 wrapMutation 的 mutation(duplicate/paste/delete + Block 2 edit-node assetUrl-diff);import/generate/
+// mask-edit 的「产生 assetUrl 变更的调用方」仍走 deferred 路径不经 wrapMutation(diff 机制已就位,接线是 Block 3)。
 type AssetSideEffects = { attach: Map<string, string>; detach: Map<string, string> }
 
-export const computeAssetSideEffects = (before: SyncSnapshot, after: SyncSnapshot): AssetSideEffects => {
+export const computeAssetSideEffects = (
+  before: SyncSnapshot,
+  after: SyncSnapshot,
+  changes?: readonly CanvasChange[],
+): AssetSideEffects => {
   const attach = new Map<string, string>()
   const detach = new Map<string, string>()
   for (const recordId of after.nodeOrder) {
@@ -322,6 +312,49 @@ export const computeAssetSideEffects = (before: SyncSnapshot, after: SyncSnapsho
     if (after.nodes.has(recordId)) continue
     const assetId = serverAssetIdFromUrl(before.nodes.get(recordId)?.asset?.url)
     if (assetId) detach.set(recordId, assetId)
+  }
+  // Block 2(T2.2):edit-node(before/after 都存在的 node)的 assetUrl 变更 diff。旧逻辑只认 create/delete,
+  // edit 变 assetUrl 时 attach 永不触发 → slot→result 同 id edit-node 的结果图资产 refcount=0 → 7 天误删。
+  //   旧无→新有:attach 新 | 旧有→新无:detach 旧 | 旧≠新(都 server):detach 旧 + attach 新 | 其余(相同/都非 server)不动。
+  for (const recordId of after.nodeOrder) {
+    if (!before.nodes.has(recordId)) continue // create 由首循环处理
+    const prevAssetId = serverAssetIdFromUrl(before.nodes.get(recordId)?.asset?.url)
+    const nextAssetId = serverAssetIdFromUrl(after.nodes.get(recordId)?.asset?.url)
+    if (prevAssetId === nextAssetId) continue // 相同(含都 undefined / 都非 server url)→ 不动
+    if (prevAssetId) {
+      // 旧有 server 资产:detach 旧(server A→B 与 server→无 都先 detach 旧)
+      detach.set(recordId, prevAssetId)
+      if (nextAssetId) {
+        // 旧≠新(都 server):attach 新
+        attach.set(recordId, nextAssetId)
+      }
+    } else if (nextAssetId) {
+      // 旧无→新有(旧非 server/无 asset → 新 server):attach 新
+      attach.set(recordId, nextAssetId)
+    }
+  }
+  // F1(T2.2 Block 2 review):edit-node 的 attach/detach 对齐到 buildCanvasSyncChanges 真实产出的 changes ——
+  //   只有 changes 里有对应 edit-node change 且含 asset 叶子 intent(fieldPath[0]==='asset')的 entry 才保留。
+  //   一个真相源:asset 变更被 validator 丢(container-delete)或未分解 → change 无 asset 叶子 intent →
+  //   side effect 也不发,防"asset 移除被丢但 detach 仍发"的悬空资产。create/delete 的 entry 对应的
+  //   create-node/delete-node change 必在 changes(nodeId 仅在 before 或仅 after),不过滤。
+  if (changes) {
+    const editAssetChanged = new Set<string>()
+    for (const change of changes) {
+      if (change.kind === 'edit-node' && change.intents.some((intent) => intent.fieldPath[0] === 'asset')) {
+        editAssetChanged.add(change.nodeId)
+      }
+    }
+    for (const recordId of attach.keys()) {
+      if (before.nodes.has(recordId) && after.nodes.has(recordId) && !editAssetChanged.has(recordId)) {
+        attach.delete(recordId)
+      }
+    }
+    for (const recordId of detach.keys()) {
+      if (before.nodes.has(recordId) && after.nodes.has(recordId) && !editAssetChanged.has(recordId)) {
+        detach.delete(recordId)
+      }
+    }
   }
   return { attach, detach }
 }
@@ -344,6 +377,18 @@ const submitChanges = async (
         enqueueAssetAttach(canvasId, assetEffects.attach.get(change.node.id) as string, change.node.id)
       } else if (change.kind === 'delete-node' && assetEffects?.detach.has(change.nodeId)) {
         enqueueAssetDetach(canvasId, assetEffects.detach.get(change.nodeId) as string, change.nodeId)
+      } else if (change.kind === 'edit-node') {
+        // Block 2(T2.2):edit-node accepted 后,按 computeAssetSideEffects 的 assetUrl-diff 结果 enqueue
+        // detach 旧 + attach 新(顺序先 detach 旧再 attach 新,与 computeAssetSideEffects server A→B 分支语义对齐)。
+        // slot→result 同 id edit-node 在此接出 attach —— 堵结果图资产 refcount=0 → 7 天误删。
+        // attach 合法:edit-node accepted 意味 node 仍在 server(非 delete),attach gate ① persist.getChild 能找到。
+        // 两个 if 非 else:A→B 时 detach 与 attach 都要发;assetUrl 不变的 edit 两 map 都无该 nodeId → 都不发。
+        if (assetEffects?.detach.has(change.nodeId)) {
+          enqueueAssetDetach(canvasId, assetEffects.detach.get(change.nodeId) as string, change.nodeId)
+        }
+        if (assetEffects?.attach.has(change.nodeId)) {
+          enqueueAssetAttach(canvasId, assetEffects.attach.get(change.nodeId) as string, change.nodeId)
+        }
       }
       continue
     }
@@ -412,7 +457,7 @@ export const wrapMutation = <TArgs extends unknown[], TResult>(
       return result
     }
     const changes = buildCanvasSyncChanges(before, after)
-    const assetEffects = computeAssetSideEffects(before, after)
+    const assetEffects = computeAssetSideEffects(before, after, changes)
     if (changes.length > 0) void enqueueCanvasSyncChanges(before.canvasId, changes, undefined, assetEffects)
     return result
   }
@@ -436,7 +481,7 @@ export const wrapMutationForScene = <TArgs extends unknown[], TResult>(
     const result = mutate(...args)
     const after = snapshotFromState(useCanvasStore.getState(), targetSceneId)
     const changes = buildCanvasSyncChanges(before, after)
-    const assetEffects = computeAssetSideEffects(before, after)
+    const assetEffects = computeAssetSideEffects(before, after, changes)
     if (changes.length > 0) void enqueueCanvasSyncChanges(targetSceneId, changes, undefined, assetEffects)
     return result
   }

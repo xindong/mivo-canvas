@@ -67,6 +67,9 @@
 // N2-0 选 Figma 时由 ServerPersistAdapter(+ SSE/WS 广播)实现,选 Yjs 时由 Y.Doc + y-protocol WS 实现。
 
 import type { AnchorRecord, EdgeRecord, NodeRecord } from '../kernel/records'
+// F2-ter(T2.2 Block 2 五轮):FieldPathTarget 单一定义于 shared(与 FieldPath 同层 neutral type contract);
+//   port re-export,下游(canvasSyncPortClient/canvasSyncRuntime)从本模块导入不变。仅类型,不耦合 schema DSL。
+import type { FieldPathTarget } from '../../shared/persist-contract.ts'
 
 /**
  * 中性版本游标(port 不解释其内部结构)。
@@ -178,8 +181,14 @@ const isAtomicLeaf = (v: unknown): boolean =>
  * - `array-element`:数组元素位置(number 下标指向的元素)——结构编辑 deferred to N2-0 §10.1 by-stable-id,拒。
  *   与 n20 R2-4「数组按 有 stable-id / 无 stable-id / primitive 三类冻结意图」方向对齐
  *   (G1-b 不扩 op 面,只拒;inventory §2.1 注明对齐点)。
+ * - `array-field`:数组字段整体(string 段指向一个数组值)——③(B′,T2.2 Block 2 review):删除方向合法
+ *   (delete-field [parent, arrayChild] 与直接删数组字段,解决 aiWorkflow 含 sourceNodeIds 等数组 child 无法
+ *   整体删的契约缺口);set 方向仍拒(整数组替换 = clobber 吞 peer insert,line 277-285 防线原样保留)。
+ *   语义依据:编辑必须细粒度(单元素 patch 走 ['arr',i,'leaf'] 或 reorder op),删除是低频有意图操作,
+ *   LWW+per-field clock 下产生 tombstone、并发 peer 编辑走 stale 通知,与删整个 plain-object 容器同构。
+ *   判别依据是 op 种类(set vs delete)本身,classifier 不需知"是否来自分解"。
  */
-export type FieldPathTarget = 'leaf' | 'container' | 'array-element'
+export type { FieldPathTarget } // F2-ter: 定义移至 shared/persist-contract.ts(单一真相源),本处 re-export
 
 /**
  * Schema 分类器(返修 R3-P1-1 引入;R4-P1-1 改 validateFieldIntent 必填):判断 fieldPath 终点是 leaf / container / array-element。
@@ -252,6 +261,15 @@ export const validateFieldIntent = (
     throw new FieldIntentError(
       target === 'container' ? 'container-delete-field' : 'array-element-structure-delete',
     )
+  }
+  // ③(B′,T2.2 Block 2 review):数组字段(array-field)——delete-field 合法(删整数组字段,解决 aiWorkflow 含
+  //   sourceNodeIds 等数组 child 无法整体删的契约缺口);set 仍拒(整数组替换 = clobber 吞 peer insert,
+  //   line 277-285 防线原样保留)。set 的非原子 value 已被上方 validateFieldIntentStructural 拒
+  //   (non-atomic-parent-set);此处兜"atomic 值到数组路径"(如 set ['fills']='string' 的类型违例),与 container 同拒。
+  //   判别依据是 op 种类(set vs delete),classifier 不需知"是否来自分解"。
+  if (target === 'array-field') {
+    if (intent.op === 'set') throw new FieldIntentError('atomic-value-to-container-path')
+    // delete-field on array-field → 放行(数组字段整体删,合法)
   }
 }
 

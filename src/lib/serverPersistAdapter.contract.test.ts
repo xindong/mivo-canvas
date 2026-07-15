@@ -263,7 +263,7 @@ describe('T1.3 ServerPersistAdapter ↔ server contract 类型共享互锁(返�
     expect(scanForSensitiveFields({ data: '%6divo_encoded' })).toBe('data') // value 仍走 isCredentialValue
   })
 
-  it('F6:validateChildPayload 递归 schema——status/tasks 任意层拒;optional 类型;transform nested exact key/type', () => {
+  it('F6(schema-aware,lead 裁定 B):status/tasks 仅 schema 未定义处拒;aiWorkflow.status 放行;optional 类型;transform nested', () => {
     const base = {
       type: 'image', title: 't',
       transform: { x: 0, y: 0, width: 100, height: 100, rotation: 0 },
@@ -271,13 +271,21 @@ describe('T1.3 ServerPersistAdapter ↔ server contract 类型共享互锁(返�
     }
     // 干净 canonical → ok
     expect(validateChildPayload('node', { ...base }, 'n1').ok).toBe(true)
-    // status/tasks 任意层递归拒:relations 内藏 status → forbidden-field path=relations.status
+    // F6 schema-aware(lead 裁定 B):aiWorkflow.status 是 AI_WORKFLOW schema 合法字段 → 放行(不 forbidden)。
+    //   生产 bug 回归:#256 server cutover 后 Block 1 ai-slot 占位 create(带 aiWorkflow.status)旧版被 400 拒;schema-aware 后放行。
+    const fAi = validateChildPayload('node', { ...base, aiWorkflow: { kind: 'slot', status: 'empty', sourceNodeIds: ['n2'], prompt: 'p' } }, 'n1')
+    expect(fAi.ok).toBe(true) // ★ aiWorkflow.status 放行(create 路由不再 400)
+    // envelope 防线仍立:relations 内藏 status(schema 未定义)→ forbidden-field path=relations.status
     const f1 = validateChildPayload('node', { ...base, relations: { status: 'ready' } }, 'n1')
     expect(f1.ok).toBe(false)
     if (!f1.ok) expect(f1.body).toMatchObject({ reason: 'forbidden-field', field: 'relations.status' })
-    // tasks 嵌套在 fills item → forbidden-field(fills[0].tasks)
-    const f2 = validateChildPayload('node', { ...base, fills: [{ tasks: [] }] }, 'n1')
-    if (!f2.ok) expect(f2.body.reason).toBe('forbidden-field')
+    // layout 内藏 status(schema 未定义:layout 字段是 mode/direction/gap/padding,无 status)→ forbidden-field(envelope 防线)
+    const fLay = validateChildPayload('node', { ...base, layout: { mode: 'auto', status: 'ready' } }, 'n1')
+    expect(fLay.ok).toBe(false)
+    if (!fLay.ok) expect(fLay.body).toMatchObject({ reason: 'forbidden-field', field: 'layout.status' })
+    // tasks 嵌套在 fills item(schema-aware:fill 元素须带 kind 选 variant,variant solid 的 fields 不含 tasks)→ forbidden-field(fills[0].tasks)
+    const f2 = validateChildPayload('node', { ...base, fills: [{ kind: 'solid', tasks: [] }] }, 'n1')
+    if (!f2.ok) expect(f2.body).toMatchObject({ reason: 'forbidden-field', field: 'fills[0].tasks' })
     // optional 类型校验:fontSize:'x' → bad-type
     const f3 = validateChildPayload('node', { ...base, fontSize: 'x' }, 'n1')
     if (!f3.ok) expect(f3.body).toMatchObject({ reason: 'bad-type', field: 'fontSize' })
@@ -293,6 +301,41 @@ describe('T1.3 ServerPersistAdapter ↔ server contract 类型共享互锁(返�
     // 既有顶层 forbidden 不回归:status 顶层 → forbidden-field field=status
     const f7 = validateChildPayload('node', { ...base, status: 'ready' }, 'n1')
     if (!f7.ok) expect(f7.body).toMatchObject({ reason: 'forbidden-field', field: 'status' })
+  })
+
+  // P2-1(五轮复审):Object.prototype 键绕过 schema-aware forbidden/unknown 扫描。`in`/裸索引走原型链,plain schema
+  //   对象(check.fields/check.variants)继承 Object.prototype,故 `'constructor' in check.fields`=true、
+  //   `check.variants['constructor']`=Object.prototype.constructor(函数,truthy)→ forbidden 扫描误判 schema 已定义
+  //   → 递归函数 default null(绕过);validateCheck union 侧 `check.variants[tag]` 命中函数 → .t=undefined →
+  //   assertNeverCheck throw → 路由 500。修复:Object.hasOwn 只判自有键 → 未知键落 unknown-field(400),union tag
+  //   为 'constructor'/'toString' 稳定 400 不 500。
+  it('P2-1 Object.prototype 键(constructor/toString/hasOwnProperty)顶层 + schema 嵌套容器 → 400 unknown-field;union tag → 400 不 500', () => {
+    const base = {
+      type: 'image', title: 't',
+      transform: { x: 0, y: 0, width: 100, height: 100, rotation: 0 },
+      fills: [] as unknown[], strokes: [] as unknown[], effects: [] as unknown[], relations: {} as Record<string, unknown>,
+    }
+    // 顶层三键:不在 node schema(PAYLOAD_FORBIDDEN_FIELDS 仅 status/tasks,不含原型键)→ unknown-field。
+    for (const protoKey of ['constructor', 'toString', 'hasOwnProperty'] as const) {
+      const r = validateChildPayload('node', { ...base, [protoKey]: { status: 'ready' } }, 'n1')
+      expect(r.ok).toBe(false)
+      if (!r.ok) expect(r.body).toMatchObject({ reason: 'unknown-field', field: protoKey })
+    }
+    // schema 内嵌套容器(relations 是 schema object,无 required):relations.constructor 未知键 → unknown-field
+    const nested = validateChildPayload('node', { ...base, relations: { constructor: { status: 'ready' } } }, 'n1')
+    expect(nested.ok).toBe(false)
+    if (!nested.ok) expect(nested.body).toMatchObject({ reason: 'unknown-field', field: 'relations.constructor' })
+    // 合法 aiWorkflow.status(schema 自有键)仍放行(F6 不回归)
+    const legal = validateChildPayload('node', { ...base, aiWorkflow: { kind: 'slot', status: 'empty', prompt: 'p' } }, 'n1')
+    expect(legal.ok).toBe(true)
+    // union tag 为 Object.prototype 键名 → 稳定 400 unknown-field,不得 500(旧代码命中函数 variant → throw)
+    for (const protoTag of ['constructor', 'toString', 'hasOwnProperty'] as const) {
+      const tagCall = () => validateChildPayload('node', { ...base, fills: [{ kind: protoTag }] }, 'n1')
+      expect(tagCall).not.toThrow() // ★ 旧代码 assertNeverCheck throw → 路由 500;修复后返 400
+      const u = tagCall()
+      expect(u.ok).toBe(false)
+      if (!u.ok) expect(u.body).toMatchObject({ reason: 'unknown-field', field: 'fills[0].kind' })
+    }
   })
 
   it('F7:userStateNamespaceKind selection → string-array(与 SessionStore 对齐)', () => {

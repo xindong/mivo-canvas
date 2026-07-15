@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { CanvasActionRuntime } from './canvasActionTypes'
-import type { NodeRecord } from '../../kernel/records'
 import type { MivoCanvasNode } from '../../types/mivoCanvas'
-import type { CanvasChange, ChangeOutcome, CanvasSyncPort } from '../../lib/canvasSyncPort'
+import type { ChangeOutcome, CanvasSyncPort } from '../../lib/canvasSyncPort'
+import { imageNode, nodeRecord, loadRuntimeModule } from './canvasSyncRuntimeTestFactories'
 
 vi.hoisted(() => {
   const store = new Map<string, string>()
@@ -32,73 +32,6 @@ vi.mock('../../lib/demoImages', () => ({
 vi.mock('../../store/remoteDebugReporter', () => ({
   reportRemoteDebugEntry: () => {},
 }))
-
-const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
-  id: 'n1',
-  type: 'image',
-  title: 'Image',
-  x: 10,
-  y: 20,
-  width: 120,
-  height: 80,
-  status: 'ready',
-  assetUrl: '/image.png',
-  ...overrides,
-})
-
-const nodeRecord = (overrides: Partial<NodeRecord> = {}): NodeRecord => ({
-  id: 'n1',
-  type: 'image',
-  title: 'Image',
-  revision: 0,
-  transform: { x: 10, y: 20, width: 120, height: 80, rotation: 0 },
-  fills: [],
-  strokes: [],
-  effects: [],
-  relations: {},
-  ...overrides,
-})
-
-const loadRuntimeModule = async (
-  options: {
-    local?: boolean
-    submitChangeImpl?: (canvasId: string, change: CanvasChange) => Promise<ChangeOutcome>
-    abortPendingCreateImpl?: (port: CanvasSyncPort, canvasId: string, change: CanvasChange, detail: string) => boolean
-  } = {},
-) => {
-  vi.resetModules()
-  const submitChange = vi.fn(
-    options.submitChangeImpl ??
-      (async () => ({
-        kind: 'accepted' as const,
-        cursor: 'cursor' as never,
-      })),
-  )
-  const abortPendingCreate = vi.fn(options.abortPendingCreateImpl ?? (() => false))
-  // Block 3: mock assetAttachWiring —— 透传真 serverAssetIdFromUrl(URL 过滤逻辑走真路径),enqueueAssetAttach/Detach
-  // 为 spy(验 submitChanges accepted 后的 enqueue 行为)。在 doMock persistMode 之后 import 真 assetAttachWiring,
-  // 保证 persistBoot→canvasStore 链拿 mock persistMode。
-  vi.doMock('../../lib/persistMode', () => ({
-    isLocalPersist: options.local ?? false,
-  }))
-  vi.doMock('../../lib/canvasSyncPortClient', () => ({
-    getCanvasSyncPort: () => ({ submitChange }),
-    abortPendingCanvasSyncCreate: abortPendingCreate,
-    persistMode: options.local ? 'local' : 'server',
-  }))
-  const realAssetWiring = await import('../../lib/assetAttachWiring')
-  const enqueueAssetAttach = vi.fn()
-  const enqueueAssetDetach = vi.fn()
-  vi.doMock('../../lib/assetAttachWiring', () => ({
-    serverAssetIdFromUrl: realAssetWiring.serverAssetIdFromUrl,
-    enqueueAssetAttach,
-    enqueueAssetDetach,
-  }))
-  const mod = await import('./canvasSyncRuntime')
-  const { useCanvasStore } = await import('../../store/canvasStore')
-  const { useDebugLogStore } = await import('../../store/debugLogStore')
-  return { ...mod, useCanvasStore, useDebugLogStore, submitChange, abortPendingCreate, enqueueAssetAttach, enqueueAssetDetach }
-}
 
 describe('canvasSyncRuntime(Block 1 runtime driving)', () => {
   beforeEach(() => {
@@ -342,7 +275,7 @@ describe('canvasSyncRuntime — Block 3 asset attach/detach side-effects', () =>
       expect(effects.detach.size).toBe(0) // local:// 不产
     })
 
-    it('已存在 node(既不新建也不删除)不产 effect(edit-node 不触发 attach/detach)', async () => {
+    it('已存在 node 且 assetUrl 不变 → 不产 effect(assetUrl 不变的 edit-node 不触发 attach/detach)', async () => {
       const { computeAssetSideEffects } = await loadRuntimeModule()
       const effects = computeAssetSideEffects(
         { canvasId: 'c1', nodes: new Map([['n1', nodeRecord({ id: 'n1', asset: { url: 'mivo-sasset:a1' } })]]), edges: new Map(), anchors: new Map(), nodeOrder: ['n1'], edgeOrder: [], anchorOrder: [] },

@@ -84,16 +84,60 @@ export const setByPath = (obj: Record<string, unknown>, path: (string | number)[
   assertSafePath(path)
   if (!opts.allowContainerClobber) assertAtomicLeaf(obj, path, value)
   let cur: Record<string, unknown> = obj
-  for (let i = 0; i < path.length - 1; i++) cur = cur[path[i] as string] as Record<string, unknown>
+  for (let i = 0; i < path.length - 1; i++) {
+    const seg = path[i]
+    // F1-bis ①(T2.2 Block 2 review):缺失的 plain-object 祖先自动物化,使 set ['asset','url'] 在 asset 缺失时
+    //   建 {asset:{url:...}}(ai-slot→image 的 asset 物化;审官真实 backend 往返证原实现直接 TypeError)。
+    //   仅物化 string 段的 plain-object 祖先;数组下标(number 段)缺失不物化(遇数组祖先仍 throw,不静默
+    //   创对象数组,lead 裁定:数组祖先不物化)。null 祖先不物化(导航 null 报错,合理)。
+    if (cur[seg as string] === undefined && typeof seg !== 'number') {
+      cur[seg as string] = {}
+    }
+    cur = cur[seg as string] as Record<string, unknown>
+  }
   cur[path[path.length - 1] as string] = value
 }
 
 /** 嵌套字段 unset(删叶子键,mutates obj)。硬化:同拒原型污染路径;拒删 container 整子树(由 validateDomainOp 在 kind 层拦)。 */
-export const unsetByPath = (obj: Record<string, unknown>, path: (string | number)[]): void => {
+export const unsetByPath = (
+  obj: Record<string, unknown>,
+  path: (string | number)[],
+  opts: { isRequiredTopLevel?: (topLevelKey: string) => boolean } = {},
+): void => {
   assertSafePath(path)
+  // 记录祖先链(parent + key),供删叶子后向上剪枝空 plain-object 祖先。
+  const chain: Array<{ parent: Record<string, unknown>; key: string | number }> = []
   let cur: Record<string, unknown> = obj
-  for (let i = 0; i < path.length - 1; i++) cur = cur[path[i] as string] as Record<string, unknown>
+  for (let i = 0; i < path.length - 1; i++) {
+    chain.push({ parent: cur, key: path[i] })
+    cur = cur[path[i] as string] as Record<string, unknown>
+  }
   delete cur[path[path.length - 1] as string]
+  // F1-bis ②(T2.2 Block 2 review):叶子删后沿路径向上清除变空的 plain-object 祖先(通用空对象剪枝,不依赖
+  //   schema;剪到 record 顶层字段为止——chain[0].parent===obj,顶层空对象字段也剪)。防 asset:{} 空壳残留被
+  //   hydrate 误判 ready。数组祖先不剪(即便空也不删数组容器;但数组字段被删后其 plain-object 父容器变空仍剪,
+  //   见 ③ 裁定)。遇非空/数组祖先即停(上层不会再因子树变空)。
+  // F1-ter(T2.2 Block 2 五轮):顶层 required 字段空壳保留(isRequiredTopLevel 回调)。如 relations 删尽 parentIds
+  //   后变 {} —— relations 是 schema required 顶层,但 RELATIONS 无 required child,空 shell 合法;若照剪则
+  //   payload 缺 required 顶层 → hydrate missing-field。故 i===0(顶层)且 isRequiredTopLevel(key) → break 保留空壳。
+  //   optional 顶层(asset/generation/aiWorkflow…)isRequiredTopLevel 返 false → 照剪(F1-bis ② 行为不变)。
+  for (let i = chain.length - 1; i >= 0; i--) {
+    const { parent, key } = chain[i]!
+    const node = parent[key as string] as unknown
+    if (
+      node !== null &&
+      typeof node === 'object' &&
+      !Array.isArray(node) &&
+      Object.keys(node as Record<string, unknown>).length === 0
+    ) {
+      if (i === 0 && typeof key === 'string' && opts.isRequiredTopLevel?.(key)) {
+        break // 顶层 required 空壳保留(防 prune 掉 required 顶层 → payload 非法)
+      }
+      delete parent[key as string]
+    } else {
+      break
+    }
+  }
 }
 
 /** 嵌套字段 get(读当前服务端值用;条件逆运算 / overwritten historicalValue)。硬化:同拒原型污染路径。 */

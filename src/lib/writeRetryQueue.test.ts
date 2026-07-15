@@ -2371,3 +2371,181 @@ describe('D2 helper userId scoping (lead SC-I) — getPending{Create,Delete}Reso
     expect([...(await getPendingDeleteResourceIds('deleteCanvas'))]).toEqual([])
   })
 })
+
+// ── F2 (T2.2 Block 2 review):持久 seq 作 drain 第三排序键,防 reload 逆序留 stale asset ref ──
+// 审官复现:attach/detach 不同 resourceKey(asset-attach: vs asset-detach:,见 computeResourceKey)→ 跨 key 并发;
+// 同毫秒 drain 排序 createdAt 相同后靠 IDB getAll 隐式序(store keyPath='id'=UUID,reload 后 getAll 按 UUID 主键
+// 随机序)→ "先 attach B 后 detach B" 执行成 [detach,attach] → B ref 永久残留。修法:QueuedWrite.seq 持久单调
+// (入队时 max(已存 seq)+1),drain 排序第三键,替代隐式 getAll 序。旧 record 缺 seq → ?? 0(fail-safe,不 NaN)。
+describe('F2 (T2.2 Block 2 review) — seq 防逆序 stale asset ref', () => {
+  const attachBOp: WriteOp = { kind: 'attachAsset', canvasId: 'c1', assetId: 'B', nodeId: 'n1' }
+  const detachBOp: WriteOp = { kind: 'detachAsset', canvasId: 'c1', assetId: 'B', nodeId: 'n1' }
+  const detachAOp: WriteOp = { kind: 'detachAsset', canvasId: 'c1', assetId: 'A', nodeId: 'n1' }
+
+  // asset resourceKey(与生产 computeResourceKey 对齐,seed 用;sort 不依赖 resourceKey,但保持真实形态)
+  const assetResourceKey = (op: WriteOp): string => {
+    if (op.kind === 'attachAsset') return `asset-attach:${op.assetId}:${op.canvasId}:${op.nodeId}`
+    if (op.kind === 'detachAsset') return `asset-detach:${op.assetId}:${op.canvasId}:${op.nodeId}`
+    return `unknown:${op.kind}`
+  }
+
+  // 受控 seed:id 逆序于 seq(zzz*=seq1 但 id 排后,aaa*=seq2 但 id 排前)→ getAll 按 id 主键返回逆序 enqueue,
+  // 模拟 reload 后 IDB getAll 随机序。无 seq 会稳定排序保留此逆序 → [detach,attach] 留 stale;有 seq 修正。
+  const seedAssetRecord = (id: string, op: WriteOp, seq: number): QueuedWrite => ({
+    id,
+    idempotencyKey: `mivo-${id}`,
+    userId: 'userA',
+    op,
+    resourceKey: assetResourceKey(op),
+    createdAt: 1_000,
+    attempts: 0,
+    nextAttemptAt: 1_000,
+    status: 'pending',
+    seq,
+  })
+
+  // executor:记录调用序 + 维护 assetId refcount(attach +1 / detach -1);attach-then-detach → net 0(无 stale)
+  const refTrackingExecutor = () => {
+    const calls: WriteOp[] = []
+    const refs = new Map<string, number>()
+    const fn = vi.fn(async (op: WriteOp): Promise<WriteOutcome> => {
+      calls.push(op)
+      if (op.kind === 'attachAsset') refs.set(op.assetId, (refs.get(op.assetId) ?? 0) + 1)
+      else if (op.kind === 'detachAsset') refs.set(op.assetId, (refs.get(op.assetId) ?? 0) - 1)
+      return { status: 'success' }
+    })
+    return { fn, calls, refs }
+  }
+
+  // F2-1:attach B→detach B(id 逆序,同毫秒,seq 1/2)→ executor 按 [attach, detach] 序;B refcount=0(无 stale)
+  it('F2-1 attach B→detach B(reverse-id, same-ms):seq 使 executor 按 [attach, detach] 序;B refcount=0(逆序则 =1 stale)', async () => {
+    const exec = refTrackingExecutor()
+    await __seedWritesForTest([
+      seedAssetRecord('zzz-attach', attachBOp, 1), // id 'zzz' 排后,但 seq=1 应先
+      seedAssetRecord('aaa-detach', detachBOp, 2), // id 'aaa' 排前(getAll 先返),但 seq=2 应后
+    ])
+    const q = makeQueue(exec.fn)
+    const r = await q.drain()
+    expect(r.processed).toBe(2)
+    expect(exec.calls.map((o) => o.kind)).toEqual(['attachAsset', 'detachAsset'])
+    expect(exec.refs.get('B') ?? 0).toBe(0) // attach 后 detach → net 0;逆序 [detach,attach] 则 B=1 stale
+  })
+
+  // F2-2:detach A→attach B(id 逆序,同毫秒,seq 1/2)→ executor 按 [detach A, attach B] 序
+  it('F2-2 detach A→attach B(reverse-id, same-ms):seq 使 executor 按 [detach A, attach B] 序', async () => {
+    const exec = refTrackingExecutor()
+    await __seedWritesForTest([
+      seedAssetRecord('zzz-detachA', detachAOp, 1),
+      seedAssetRecord('aaa-attachB', attachBOp, 2),
+    ])
+    const q = makeQueue(exec.fn)
+    await q.drain()
+    expect(exec.calls.map((o) => o.kind)).toEqual(['detachAsset', 'attachAsset'])
+  })
+
+  // F2-3:reload — real enqueue attach B→detach B(同毫秒,doEnqueue 戳 seq 1/2)→ 新 queue 读同 IDB drain 仍 [attach, detach]
+  it('F2-3 reload:real enqueue attach B→detach B(同 ms)→ 新 queue drain 仍 [attach, detach] + B refcount=0', async () => {
+    const exec1 = refTrackingExecutor()
+    const q1 = makeQueue(exec1.fn)
+    await q1.enqueue(attachBOp) // doEnqueue 戳 seq=1(空 IDB → max 0 +1)
+    await q1.enqueue(detachBOp) // doEnqueue 戳 seq=2(getAll 见 attach seq1 → +1);不同 resourceKey 不 coalesce
+    expect(exec1.calls).toHaveLength(0) // q1 inert 未 drain
+    // reload = 新 queue 读同 IDB(q1 未 drain,记录持久化)
+    const exec2 = refTrackingExecutor()
+    const q2 = makeQueue(exec2.fn)
+    const r = await q2.drain()
+    expect(r.processed).toBe(2)
+    expect(exec2.calls.map((o) => o.kind)).toEqual(['attachAsset', 'detachAsset'])
+    expect(exec2.refs.get('B') ?? 0).toBe(0)
+  })
+
+  // F2-4 migration:旧 record 无 seq(undefined)+ 新 seq record,id 逆序,同毫秒 → 旧(??0=0)先于新,不 NaN 排序
+  it('F2-4 migration:旧 record 无 seq + 新 seq record(reverse-id, same-ms)→ ??0 兜底,旧先于新,不 NaN', async () => {
+    const exec = refTrackingExecutor()
+    const legacyRecord: QueuedWrite = {
+      id: 'zzz-legacy', // id 排后,但无 seq(??0=0)应先
+      idempotencyKey: 'mivo-legacy',
+      userId: 'userA',
+      op: attachBOp,
+      resourceKey: assetResourceKey(attachBOp),
+      createdAt: 1_000,
+      attempts: 0,
+      nextAttemptAt: 1_000,
+      status: 'pending',
+      // 故意无 seq 字段(模拟旧 IDB 记录,migration-on-read)
+    }
+    const newRecord = seedAssetRecord('aaa-new', detachBOp, 5) // id 排前(getAll 先返),seq=5 应后
+    await __seedWritesForTest([legacyRecord, newRecord])
+    const q = makeQueue(exec.fn)
+    await q.drain()
+    // 旧(seq ??0=0)先于新(seq=5);attach B 先 detach B 后 → B refcount=0;无 NaN 排序
+    expect(exec.calls.map((o) => o.kind)).toEqual(['attachAsset', 'detachAsset'])
+    expect(exec.refs.get('B') ?? 0).toBe(0)
+  })
+
+  // F2-bis(T2.2 Block 2 三轮复审):seq 全局原子分配(IDB META counter 同事务 increment+put,runMultiStoreTx)。
+  // 审官复现:F2 的 max+1 读非锁定快照,Promise.all 跨 key 并发 enqueue 派生重复 seq(seq=1/1)→ 逆序执行。
+  // nextSeq 的 readwrite tx 序列化(META_STORE)→ 并发 enqueue 得唯一严格递增 seq(per-resourceKey coalesce 不动)。
+  // reload 后按意图序由 F2-3 顺序 enqueue 覆盖;逆序由 F2-1 reverse-id 覆盖;"移除 seq 排序即失败"反证 = F2-1。
+  it('F2-bis Promise.all 跨 key 并发 enqueue(同毫秒)→ seq 全异严格递增(原子 nextSeq,无 max+1 的 1/1 重复)', async () => {
+    const exec = refTrackingExecutor()
+    const q = makeQueue(exec.fn)
+    // 3 跨 key(不同 assetId → asset-attach:A/B/C 不同 resourceKey)同毫秒并发 enqueue
+    await Promise.all([
+      q.enqueue({ kind: 'attachAsset', canvasId: 'c1', assetId: 'A', nodeId: 'n1' }),
+      q.enqueue({ kind: 'attachAsset', canvasId: 'c1', assetId: 'B', nodeId: 'n1' }),
+      q.enqueue({ kind: 'attachAsset', canvasId: 'c1', assetId: 'C', nodeId: 'n1' }),
+    ])
+    const all = await __dumpWritesForTest()
+    const seqs = all.map((r) => r.seq ?? 0).sort((a, b) => a - b)
+    expect(seqs).toHaveLength(3)
+    expect(new Set(seqs).size).toBe(3) // 全异(原子 nextSeq;max+1 会给 1/1/1 重复)
+    expect(seqs[1]! > seqs[0]!).toBe(true) // 严格递增
+    expect(seqs[2]! > seqs[1]!).toBe(true)
+  })
+
+  // F3-ter(T2.2 Block 2 五轮):seq 降级高水位对齐——IDB tx 故障期 fallback seq 仍 > 进程内已分配 durable seq,
+  //   防 fallback 回退到 < durable → 与 durable 撞号/逆序 → [detach,attach] 误排 → B ref 永久残留。
+  //   审官复现:durable seq=1,2(IDB 成功)→ META tx 注错 → 旧 fallback 给 seqMemCounter++=1 < 2(旧 seqMemCounter
+  //   不在 IDB 成功时 bump)→ 与 seq=1 撞号且逆序。F3-ter:seqHighWater 在 IDB 成功时同步 bump(=2),fallback
+  //   取 seqHighWater+1=3 > 2;IDB 恢复后首次成功 reconciliation:max(cur+1, seqHighWater+1) 防 stale cur 撞号。
+  //   stubIdbTxThrows 在 IDB-failure describe 内(本 describe 不可见),故 inline 同形 tx-throwing stub。
+  it('F3-ter durable seq=1,2 → IDB tx 注错 → fallback seq=seqHighWater+1=3(>2 不撞号)→ 恢复 reconciliation seq=4(>3)', async () => {
+    const stubIdbTxThrowsLocal = () => {
+      const fakeDb = {
+        objectStoreNames: { contains: () => true },
+        transaction: () => { throw new Error('idb tx boom') },
+        close: () => {},
+      }
+      vi.stubGlobal('indexedDB', {
+        open: () => {
+          const req: { onupgradeneeded: ((e: { target: unknown }) => void) | null; onsuccess: ((e: { target: unknown }) => void) | null; onerror: ((e: { target: unknown }) => void) | null; result: unknown } = { onupgradeneeded: null, onsuccess: null, onerror: null, result: undefined }
+          queueMicrotask(() => { req.result = fakeDb; req.onsuccess?.({ target: req }) })
+          return req
+        },
+      })
+    }
+    const exec = refTrackingExecutor()
+    const q = makeQueue(exec.fn)
+    // ① 两次 enqueue(IDB 正常)→ durable seq=1,2;seqHighWater 同步 bump 到 2(旧 seqMemCounter 不 bump)
+    await q.enqueue(attachBOp)
+    await q.enqueue(detachBOp)
+    const durable = (await __dumpWritesForTest()).map((r) => r.seq ?? 0).sort((a, b) => a - b)
+    expect(durable).toEqual([1, 2])
+    // ② 注错 IDB tx + drop dbPromise(__setWriteQueueDbNameForTest 只 drop dbPromise,不清 store、不重置 seqHighWater=2)
+    stubIdbTxThrowsLocal()
+    __setWriteQueueDbNameForTest('f3ter-fault')
+    // ③ 新 enqueue → nextSeq IDB tx throws → fallback seq=seqHighWater+1=3(旧代码给 1 < 2,撞号逆序)
+    await q.enqueue(attachBOp)
+    const faultSeqs = (await __dumpWritesForTest()).map((r) => r.seq ?? 0)
+    expect(faultSeqs).toContain(3) // fallback seq=3
+    expect(Math.max(...faultSeqs)).toBe(3) // > durable 2(seqHighWater+1,不撞号逆序)
+    // ④ 恢复:unstub indexedDB + 切新空 DB(cur=0)→ 下次 nextSeq reconciliation:max(cur+1=1, seqHighWater+1=4)=4 > fallback 3
+    vi.unstubAllGlobals()
+    __setWriteQueueDbNameForTest('f3ter-recover')
+    await q.enqueue(detachBOp)
+    const recoverSeqs = (await __dumpWritesForTest()).map((r) => r.seq ?? 0).sort((a, b) => a - b)
+    expect(recoverSeqs).toContain(4) // recovery seq=4(reconciliation 防 stale cur 撞号)
+    expect(Math.max(...recoverSeqs)).toBe(4) // > fallback 3
+  })
+})

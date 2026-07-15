@@ -3,7 +3,6 @@ import type {
   CanvasSnapshot,
   CanvasSyncPort,
   ChangeOutcome,
-  FieldPathTarget,
   SnapshotCursor,
   Unsubscribe,
   FieldIntent,
@@ -16,6 +15,7 @@ import type {
   GetCanvasResponse,
   Revision,
 } from '../../shared/persist-contract.ts'
+import { classifyFieldPathBySchema } from '../../shared/persist-contract.ts'
 import type { AnchorRecord, EdgeRecord, NodeRecord } from '../kernel/records'
 import {
   createFetchServerPersistAdapter,
@@ -148,14 +148,15 @@ type PendingCreateAwareCanvasSyncPort = CanvasSyncPort & {
   __abortPendingCreate?: (canvasId: string, change: CanvasChange, detail: string) => boolean
 }
 
-const classifyTransportIntentTarget = (intent: FieldIntent): FieldPathTarget => {
-  const last = intent.fieldPath[intent.fieldPath.length - 1]
-  return typeof last === 'number' ? 'array-element' : 'leaf'
-}
-
-const validateTransportIntent = (intent: FieldIntent): FieldIntentError | null => {
+// F2-ter(T2.2 Block 2 五轮):transport classifier 改用 shared classifyFieldPathBySchema(与生产同实现,单一真相源)。
+//   旧 permissive classifier(只看末段 number → 否则 leaf)漏洞:set ['fills']='not-array' 直通(末段 string → leaf → 放行);
+//   schema 分类下 ['fills']=required 根数组 → 'container' → set 拒(atomic-value-to-container-path),与生产一致封死。
+const validateTransportIntent = (
+  intent: FieldIntent,
+  recordType: 'node' | 'edge' | 'anchor',
+): FieldIntentError | null => {
   try {
-    validateFieldIntent(intent, () => classifyTransportIntentTarget(intent))
+    validateFieldIntent(intent, (fieldPath) => classifyFieldPathBySchema(recordType, fieldPath))
     return null
   } catch (error) {
     return error instanceof FieldIntentError ? error : new FieldIntentError('non-atomic-parent-set')
@@ -269,7 +270,7 @@ export const createFetchCanvasSyncPort = (opts: FetchAdapterOptions): CanvasSync
             return { kind: 'rejected', reason: 'terminal', detail: `${change.kind} missing bundle base` }
           }
           for (const intent of change.intents) {
-            const violation = validateTransportIntent(intent)
+            const violation = validateTransportIntent(intent, recordType)
             if (violation) {
               const detail = `invalid field intent ${violation.violation} for ${change.kind}:${recordId}`
               debugLogger.error(SOURCE, detail)

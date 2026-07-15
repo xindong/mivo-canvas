@@ -41,6 +41,7 @@ import type {
   UpsertChildResult,
   UpsertResult,
 } from './backend'
+import { requiredTopLevelFields, validateChildPayload } from '../../shared/persist-contract.ts'
 import { fieldKeyOf, setByPath, unsetByPath, getByPath, type DomainOp } from '../lib/domainOp'
 import type { FieldClocks } from '../lib/baseCursor'
 import type { PersistScope, PersistType, Revision } from '../../shared/persist-contract.ts'
@@ -1382,6 +1383,12 @@ export class PgPersistBackend implements PersistBackend {
         if (opts.baseRevision === undefined) return { kind: 'precondition-required' }
         // ★ batch 同 record 原子:逐 op apply(clone payload)+ 收集 toBump;全 ok 后统一 bump+UPDATE(无 partial)。
         const updatedPayload = clone(existing.payload) as Record<string, unknown>
+        // F1-ter:unsetByPath 顶层 required 空壳保留回调(schema 推导);relations:{} 保留,optional 顶层照剪。
+        const childType: 'node' | 'edge' | 'anchor' | undefined =
+          type === 'node' || type === 'edge' || type === 'anchor' ? type : undefined
+        const requiredFields = childType === undefined ? undefined : requiredTopLevelFields(childType)
+        const isRequiredTopLevel: ((key: string) => boolean) | undefined =
+          requiredFields === undefined ? undefined : (key: string): boolean => requiredFields.includes(key)
         const overwritten: OverwrittenNotice[] = []
         const toBump: string[] = []
         const seenFields = new Set<string>()
@@ -1401,7 +1408,7 @@ export class PgPersistBackend implements PersistBackend {
           if (op.kind === 'set') {
             setByPath(updatedPayload, fieldPath, op.value)
           } else if (op.kind === 'unset') {
-            unsetByPath(updatedPayload, fieldPath)
+            unsetByPath(updatedPayload, fieldPath, { isRequiredTopLevel })
           } else if (op.kind === 'array') {
             if (op.class === 'whole-lww') {
               setByPath(updatedPayload, fieldPath, op.value, { allowContainerClobber: true })
@@ -1414,6 +1421,13 @@ export class PgPersistBackend implements PersistBackend {
             }
           }
           toBump.push(fkey)
+        }
+        // F1-ter(T2.2 Block 2 五轮):post-apply schema 校验堤坝 — UPDATE 前 validateChildPayload 对 mutated
+        //   payload 递归白名单;非法(required 顶层被掏空 / set ['type']='bogus' / required child 缺失 / unknown-field)
+        //   → 返 payload-rejected,fail-visible 不 commit(不 UPDATE、不 bump;tx 仅 SELECT,提交无副作用,无 partial)。
+        if (childType !== undefined) {
+          const damCheck = validateChildPayload(childType, updatedPayload, recordId)
+          if (!damCheck.ok) return { kind: 'payload-rejected', body: damCheck.body }
         }
         // 全 op apply 成功 → UPDATE payload/revision + bump fieldClocks + canvas_seq + contentVersion + idem row(同事务原子)
         const newRev = Number(existing.revision) + 1

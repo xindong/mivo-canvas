@@ -648,6 +648,11 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 428, latencyMs: Date.now() - t0, note: 'precondition-required' })
       return c.json(preconditionRequired(childId), 428)
     }
+    // F1-ter:applyDomainOps post-apply dam 拦截的非法 payload → 400 payload-rejected(同 create 路径 validateChildPayload body 形状)。
+    if (result.kind === 'payload-rejected') {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'payload-rejected' })
+      return c.json(result.body, 400)
+    }
     // accepted:edit 永不 409(§14.1);overwritten notices 先落 debug 面(§14.1 "通知前写者语义先落 debug 面";SSE 推送后续阶段)。
     for (const o of result.overwritten) {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: 0, note: `overwritten field=${o.fieldKey} byActor=${o.byActor} historicalValue=${JSON.stringify(o.historicalValue)}` })

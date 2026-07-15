@@ -393,6 +393,15 @@ export type QueuedWrite = {
   lastAttemptAt?: number
   /** F1:gate-blocked 退避计数(独立于 attempts/maxAttempts;旧 IDB 记录无此字段 → undefined → 0)。 */
   gateAttempts?: number
+  /**
+   * F2(T2.2 Block 2 review):持久单调 seq,作 drain 排序的显式第三 tie-break(主键 nextAttemptAt、次键 createdAt
+   * 之后的第三键),替代原"stable sort 保留 IDB getAll 入队序"的隐式 tie-break —— IDB store keyPath='id'(UUID),
+   * reload 后 getAll 按 UUID 主键返回(随机序)→ 同毫秒的 attach B/detach B 可被逆序执行成 [detach,attach] →
+   * B ref 永久残留(stale ref)。seq 入队时从 max(已存 seq)+1 派生(单调,顺序入队保证意图序),持久化于 record,
+   * reload 后仍生效。旧 IDB 记录无此字段 → undefined → 排序时 `?? 0`(fail-safe,与 gateAttempts 同 migration-on-read
+   * 模式,不许 NaN 排序;旧记录 seq=0 先于新记录 seq≥1,保持旧→新序)。
+   */
+  seq?: number
 }
 
 // ── Executor seam (T1.3 plugs the real fetch here) + outcome classification ──
@@ -548,10 +557,13 @@ export const isDeleteKind = (kind: WriteOpKind): boolean =>
  */
 const stableTopologicalSort = (due: QueuedWrite[]): QueuedWrite[] => {
   // 原序:主键 nextAttemptAt(退避到期先发)+ 次键 createdAt(同 nextAttemptAt 时先入队先发)。
-  // stable sort 保留 IDB getAll 入队序作隐式第三 tie-break(同主键时不动相对位置)。
+  // F2(T2.2 Block 2 review):第三键 seq(持久单调,入队时打)替代原"stable sort 保留 IDB getAll 入队序"的
+  //   隐式 tie-break —— IDB store keyPath='id'(UUID),reload 后 getAll 按 UUID 主键返回随机序,同毫秒的
+  //   attach B/detach B 可被逆序执行成 [detach,attach] → B ref 永久残留。seq 使排序按入队意图序确定化。
+  //   旧 IDB 记录缺 seq → ?? 0(fail-safe,不许 NaN;旧记录 seq=0 先于新记录 seq≥1,保持旧→新序)。
   const ordered = due
     .slice()
-    .sort((a, b) => a.nextAttemptAt - b.nextAttemptAt || a.createdAt - b.createdAt)
+    .sort((a, b) => a.nextAttemptAt - b.nextAttemptAt || a.createdAt - b.createdAt || (a.seq ?? 0) - (b.seq ?? 0))
 
   // 建批内 parent-create 索引:project id / canvas id → 该 create 在 ordered 中的 index(首个)。
   // 同 id 取首个保证确定性(create+create 同 id 生产流不发生;combineOps 已把 create+update 合并保留
@@ -1064,6 +1076,79 @@ const deleteWrite = async (id: string): Promise<void> => {
   } catch (error) {
     debugLogger.warn(SOURCE, `delete failed for ${id}: ${msg(error)}`)
   }
+}
+
+// ── F2-bis(T2.2 Block 2 三轮复审):持久单调 seq 的全局原子分配 ──────────────────────────────
+// F2 的 max(all.seq)+1 读非锁定快照,跨 key 并发 enqueue(Promise.all)派生重复 seq(审官复现 seq=1/1 逆序执行)。
+// 改 IDB META_STORE 同事务 increment+put(runMultiStoreTx:get→+1→put 单 readwrite tx,IDB tx 序列化跨 key/跨 tab
+// 唯一严格递增)。per-resourceKey coalesce 语义不动(coalesce 路径不调 nextSeq,保留既有 record 的 seq)。
+// IDB 不可用降级 module counter(per-tab,degraded 模式;IDB 不可用时 enqueuePersistWrite 本就 memStore 兜底,
+// 单 tab 内 ++ 仍唯一)。META seqCounter key 由 __resetWriteQueueDb 的 clearIdbStore 清(测试间复位)。
+const SEQ_COUNTER_KEY = 'seqCounter'
+// F3-ter(T2.2 Block 2 五轮):进程内 seq 高水位——追踪本 process 内(含 IDB 成功 + fallback)分配过的最大 seq。
+//   防 IDB tx 故障降级 memCounter 时回退到 < 已分配的 durable seq(审官复现:durable seq=1,2 → META get 注错 →
+//   旧 fallback 给 seq=1 < 2 → 与已存 seq=1 撞号且逆序 → [detach,attach] 误排 → B ref 永久残留)。
+//   fallback 取 seqHighWater+1(必 > 进程内任何已分配 seq,含 IDB 成功期分配的)。IDB 恢复后首次成功 nextSeq
+//   reconciliation:nextVal=max(cur+1, seqHighWater+1) 并 put——IDB cur 可能 stale(fallback 期未写 IDB),防撞号。
+let seqHighWater = 0
+// F3-ter+ P2-2(五轮复审):旧 nextSeq(META RMW 单独 tx)+ putWrite(writes put 单独 tx)两笔独立事务致 META 失败
+//   但 writes 成功 → record 落 IDB 而 META stale → 跨 tab 撞号逆序。已合并为下方 nextSeqAndPutWrite 单笔原子 tx。
+//   原 nextSeq 函数移除(死代码,noUnusedLocals);reconciliation 语义(max(cur+1, seqHighWater+1))迁入 nextSeqAndPutWrite。
+
+
+/**
+ * F3-ter+ P2-2(T2.2 Block 2 五轮复审):原子「读/增 META seq + put writes record」单笔 readwrite tx。
+ *   根因(复审复现):旧 nextSeq(META RMW)与 putWrite(writes put)是两笔独立事务,seqHighWater 仅进程内——
+ *   tab A META RMW 一次失败但 writes put 成功 → record 以 seq=N 落 IDB 而 META 停在 N-1(stale);tab B(新 realm,
+ *   seqHighWater=0)从 stale META 再发 seq=N → durable 撞号 → [detach,attach] 误排 → B ref 永久残留。
+ *   仅进程内 seqHighWater reconciliation 不足(跨 tab 不互知),不许只打补丁在 seqHighWater 上。
+ *   修法(lead 裁定选项①):非 coalesce 新记录的 META 增量 + writes put 合进同一 [META_STORE, STORE_NAME]
+ *   readwrite tx——META RMW 失败则整 tx 回滚,writes record 不落 IDB(降级 memStore,seq=seqHighWater+1 仅进程内,
+ *   不与 durable 撞号;IDB 恢复后续 enqueue 走 reconciliation max(cur+1, seqHighWater+1) 续用持久 counter)。
+ *   per-resourceKey coalesce 路径不动(保留既有 record 的 seq,走 putWrite)。
+ */
+const nextSeqAndPutWrite = async (record: QueuedWrite): Promise<number> => {
+  if (!isIdbAvailable()) {
+    seqHighWater += 1
+    record.seq = seqHighWater
+    memStore.set(record.id, record)
+    return seqHighWater
+  }
+  let nextVal = 0
+  let committed = false
+  try {
+    await runMultiStoreTx([META_STORE, STORE_NAME], 'readwrite', (stores) => {
+      const meta = stores[META_STORE]!
+      const writes = stores[STORE_NAME]!
+      const req = meta.get(SEQ_COUNTER_KEY)
+      req.onsuccess = () => {
+        const cur = (req.result as { key: string; value?: number } | undefined)?.value ?? 0
+        // F3-ter reconciliation:IDB 恢复后 cur 可能 stale(低于 fallback 期分配的 seqHighWater);
+        //   nextVal=max(cur+1, seqHighWater+1) 防 fallback seq 撞号,并 put 推进 IDB counter 到高水位。
+        //   正常运行(无 fallback)cur+1 == seqHighWater+1,max 取 cur+1(等价),无副作用。
+        nextVal = Math.max(cur + 1, seqHighWater + 1)
+        meta.put({ key: SEQ_COUNTER_KEY, value: nextVal })
+        record.seq = nextVal
+        writes.put(record) // 同 tx:与 META RMW 原子;META 增量失败则整 tx 回滚,record 不落 IDB(防 stale durable)。
+      }
+    })
+    committed = true
+  } catch (error) {
+    // 整 tx 故障(fault-injected / blocked / degraded / abort):META 未增、writes 未落,全回滚。降级进程高水位
+    //   fallback——record 仅入 memStore(seq=seqHighWater+1 不写 IDB;durable counter 成功前绝不落 IDB 防 cross-tab 撞号)。
+    //   与 getAllWrites/putWrite 的 mem 兜底同模式;enqueue 永不因 seq+put 失败而 throw。
+    warnIdbDegradation('seq+put atomic tx failed; using in-memory fallback', error)
+  }
+  if (committed && nextVal > 0) {
+    seqHighWater = nextVal // 更新进程高水位(原子 tx 成功分配 durable seq)
+    memStore.delete(record.id) // record 已 durable,清 stale memStore 兜底(若先前 fallback 留过)
+    return nextVal
+  }
+  // fallback(整 tx 失败 / onsuccess 未触发):record 不入 IDB,仅 memStore;seqHighWater+1 > 进程内任何已分配 seq。
+  seqHighWater += 1
+  record.seq = seqHighWater
+  memStore.set(record.id, record)
+  return seqHighWater
 }
 
 // ── FX-7 / A6: durable terminal ledger (dead-letter / conflict / rejected outcomes) ──
@@ -1603,7 +1688,7 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
     if (active.length >= maxQueue) {
       const pending = active
         .filter((r) => r.status === 'pending')
-        .sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : 1))
+        .sort((a, b) => a.createdAt - b.createdAt || (a.seq ?? 0) - (b.seq ?? 0) || (a.id < b.id ? -1 : 1))
       const oldest = pending[0]
       if (oldest) {
         await deleteWrite(oldest.id)
@@ -1638,6 +1723,11 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
       }
     }
 
+    // F2-bis(T2.2 Block 2 三轮复审):seq 走全局原子 nextSeq(IDB META counter 同事务 increment+put,跨 key/跨 tab
+    //   唯一严格递增),替代 F2 的 max(all.seq)+1(后者跨 key 并发 Promise.all 派生重复 seq,审官复现 seq=1/1)。
+    //   旧 record 缺 seq → 排序 ??0(fail-safe);per-resourceKey coalesce 不动(coalesce 路径不调 nextSeq)。
+    //   F3-ter+ P2-2(五轮):META seq 增量 + writes put 合进同一 [META,STORE_NAME] readwrite tx(nextSeqAndPutWrite),
+    //   防 META RMW 失败但 putWrite 成功 → record 落 IDB 而 META stale → 跨 tab 撞号逆序。
     const record: QueuedWrite = {
       id: newId(),
       idempotencyKey: newKey(),
@@ -1649,7 +1739,7 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
       nextAttemptAt: ts,
       status: 'pending',
     }
-    await putWrite(record)
+    await nextSeqAndPutWrite(record) // seq 由原子 tx 内分配并同 tx put(失败则降级 memStore,不落 IDB)
     debugLogger.log(SOURCE, `queued write ${record.id} (${op.kind}) for user ${userId}`)
     // Drain is NOT auto-triggered here: enqueue is pure persist + return. Drain runs via
     // start()'s timer / online event / explicit queue.drain() call. This keeps enqueue
@@ -2294,6 +2384,9 @@ export const __resetWriteQueueDb = async (): Promise<void> => {
   terminalCountersMem = { ...ZERO_COUNTERS }
   inFlightCountersMem = { ...ZERO_COUNTERS }
   terminalCountersBaselineMem = null
+  // F2-bis/F3-ter:reset the in-process seq high-water (IDB seqCounter key is cleared by clearIdbStore below;
+  //   fallback seq 派生自 seqHighWater,测试间复位防跨用例串味)。
+  seqHighWater = 0
   maxTerminals = DEFAULT_MAX_TERMINALS
   idbBlockTimeoutMs = 3000
   // P1-3 (second-round): clear the blocked-state + fault injector + DB name so a prior
