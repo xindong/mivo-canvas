@@ -1,7 +1,7 @@
 // server/__tests__/owner.test.ts
 // T1.4 owner.ts 纯函数 + 配置校验单测(SSO trust flag + 网关密钥 + 生产告警)。
 import { describe, it, expect } from 'vitest'
-import { isSsoHeaderTrusted, validateSsoConfig, ssoHeaderSecretOk, SSO_TRUSTED_USER_HEADER, GATEWAY_SECRET_HEADER } from '../lib/owner'
+import { isSsoHeaderTrusted, validateSsoConfig, validateDebugLogsOriginConfig, ssoHeaderSecretOk, SSO_TRUSTED_USER_HEADER, GATEWAY_SECRET_HEADER } from '../lib/owner'
 
 describe('T1.4 isSsoHeaderTrusted(opt-in,默认关)', () => {
   it('默认关(未设 flag)', () => {
@@ -31,6 +31,39 @@ describe('T1.4 validateSsoConfig(生产告警,Greptile finding 2 防静默共享
     const w = validateSsoConfig({ NODE_ENV: 'production' })
     expect(w.length).toBe(1)
     expect(w[0]).toContain('fingerprint')
+  })
+})
+
+describe('P2 validateDebugLogsOriginConfig(debug-logs origin 启动期 fail-visible 守卫)', () => {
+  it('非生产 → 无告警(MIVO_PUBLIC 未设 / NODE_ENV 非 production)', () => {
+    expect(validateDebugLogsOriginConfig({})).toEqual([])
+    expect(validateDebugLogsOriginConfig({ NODE_ENV: 'development' })).toEqual([])
+  })
+  it('SC-10 正向:生产 + 三个 origin env 全空 → 告警(指明 403 + MIVO_PUBLIC_ORIGIN)', () => {
+    // MIVO_PUBLIC=1 且不配任何 origin env → 守卫触发
+    const w = validateDebugLogsOriginConfig({ MIVO_PUBLIC: '1' })
+    expect(w.length).toBe(1)
+    expect(w[0]).toContain('403')
+    expect(w[0]).toContain('MIVO_PUBLIC_ORIGIN')
+    // NODE_ENV=production 同样触发(两种生产边界入口)
+    const w2 = validateDebugLogsOriginConfig({ NODE_ENV: 'production' })
+    expect(w2.length).toBe(1)
+    expect(w2[0]).toContain('403')
+  })
+  it('SC-10 反向:生产 + 配了 MIVO_PUBLIC_ORIGIN → 无告警', () => {
+    expect(
+      validateDebugLogsOriginConfig({ MIVO_PUBLIC: '1', MIVO_PUBLIC_ORIGIN: 'https://app.example' }),
+    ).toEqual([])
+  })
+  it('生产 + 配了 MIVO_DEBUG_TRUST_XFF=1 → 无告警(非 "1" 不算配置)', () => {
+    expect(validateDebugLogsOriginConfig({ MIVO_PUBLIC: '1', MIVO_DEBUG_TRUST_XFF: '1' })).toEqual([])
+    // 'true' / '0' 不等于 '1' → 仍告警(与 debug-logs.ts gate 的 ==="1" 判定一致)
+    expect(validateDebugLogsOriginConfig({ MIVO_PUBLIC: '1', MIVO_DEBUG_TRUST_XFF: 'true' }).length).toBe(1)
+  })
+  it('生产 + 配了 MIVO_DEBUG_ALLOWED_ORIGINS → 无告警', () => {
+    expect(
+      validateDebugLogsOriginConfig({ MIVO_PUBLIC: '1', MIVO_DEBUG_ALLOWED_ORIGINS: 'https://app.example' }),
+    ).toEqual([])
   })
 })
 

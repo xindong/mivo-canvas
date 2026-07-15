@@ -11,7 +11,7 @@ import { serve } from '@hono/node-server'
 import { app, sharedPersistBackend, sharedPermissionBackend, sharedAssetStore } from './app'
 import { resolveFeatureFlags } from './lib/env'
 import { isDevStubActive } from './lib/auth-stub'
-import { validateSsoConfig, assertStrictOwnerMigrationComplete, buildStartupDetectors } from './lib/owner'
+import { validateSsoConfig, assertStrictOwnerMigrationComplete, buildStartupDetectors, validateDebugLogsOriginConfig } from './lib/owner'
 
 const PORT = Number(process.env.MIVO_PORT) || 8080
 const PUBLIC_MODE = process.env.MIVO_PUBLIC === '1'
@@ -33,6 +33,13 @@ if (PUBLIC_MODE) {
 // T1.4: SSO 身份配置校验(Greptile security:防静默回退共享指纹 / 可伪造身份头)。仅生产告警。
 for (const w of validateSsoConfig()) {
   console.warn(`[mivo-bff] WARN: ${w}`)
+}
+
+// P2 代码加固:debug-logs origin 启动期 fail-visible 守卫——生产边界 + 三个 origin env 全空 →
+// error 级告警(不阻断 serve,debug-logs 外功能正常),防线上 pm2 env 缺 MIVO_PUBLIC_ORIGIN 时
+// 每个 /api/mivo/debug-logs POST 静默 403。见 owner.ts validateDebugLogsOriginConfig。
+for (const w of validateDebugLogsOriginConfig()) {
+  console.error(`[mivo-bff] ERROR: ${w}`)
 }
 
 // T1.3: PG backend 启用时,serve 前预热 persist 全局唯一索引缓存 + 权限层 migrations;
