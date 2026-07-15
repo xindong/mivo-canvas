@@ -100,6 +100,19 @@ const diffValue = (
 ): void => {
   if (valuesEqual(before, after)) return
   if (after === undefined) {
+    // F1(T2.2 Block 2 review):plainObject container 整体消失时分解为子 key 的 leaf delete,而非 container-level
+    //   delete-field(后者被 validateFieldIntent 拒 'container-delete-field' → 静默丢,server 永不知字段消失 +
+    //   本块 computeAssetSideEffects 的 detach 会与被丢的 change 错位 → 混合批次悬空资产)。leaf delete 合规放行
+    //   (validateFieldIntent 注释:合法 optional leaf delete 放行),是 container 消失在 clobber 契约下的唯一合规
+    //   表达。asset 消失 → delete ['asset','url'] 等,让 edit-node change 真发出 → attach/detach 可对齐真相源
+    //   (见 computeAssetSideEffects 的 changes 过滤)。数组消失不分解(Array 非 plainObject,走下方 delete-field;
+    //   数组元素 delete-field 被 structural 拒 array-element-structure-delete,行为不变)。
+    if (isPlainObject(before)) {
+      for (const key of Object.keys(before)) {
+        diffValue(before[key], undefined, [...fieldPath, key], intents)
+      }
+      return
+    }
     intents.push({ op: 'delete-field', fieldPath })
     return
   }
@@ -312,7 +325,11 @@ export const buildCanvasSyncChanges = (before: SyncSnapshot, after: SyncSnapshot
 // mask-edit 的「产生 assetUrl 变更的调用方」仍走 deferred 路径不经 wrapMutation(diff 机制已就位,接线是 Block 3)。
 type AssetSideEffects = { attach: Map<string, string>; detach: Map<string, string> }
 
-export const computeAssetSideEffects = (before: SyncSnapshot, after: SyncSnapshot): AssetSideEffects => {
+export const computeAssetSideEffects = (
+  before: SyncSnapshot,
+  after: SyncSnapshot,
+  changes?: readonly CanvasChange[],
+): AssetSideEffects => {
   const attach = new Map<string, string>()
   const detach = new Map<string, string>()
   for (const recordId of after.nodeOrder) {
@@ -343,6 +360,29 @@ export const computeAssetSideEffects = (before: SyncSnapshot, after: SyncSnapsho
     } else if (nextAssetId) {
       // 旧无→新有(旧非 server/无 asset → 新 server):attach 新
       attach.set(recordId, nextAssetId)
+    }
+  }
+  // F1(T2.2 Block 2 review):edit-node 的 attach/detach 对齐到 buildCanvasSyncChanges 真实产出的 changes ——
+  //   只有 changes 里有对应 edit-node change 且含 asset 叶子 intent(fieldPath[0]==='asset')的 entry 才保留。
+  //   一个真相源:asset 变更被 validator 丢(container-delete)或未分解 → change 无 asset 叶子 intent →
+  //   side effect 也不发,防"asset 移除被丢但 detach 仍发"的悬空资产。create/delete 的 entry 对应的
+  //   create-node/delete-node change 必在 changes(nodeId 仅在 before 或仅 after),不过滤。
+  if (changes) {
+    const editAssetChanged = new Set<string>()
+    for (const change of changes) {
+      if (change.kind === 'edit-node' && change.intents.some((intent) => intent.fieldPath[0] === 'asset')) {
+        editAssetChanged.add(change.nodeId)
+      }
+    }
+    for (const recordId of attach.keys()) {
+      if (before.nodes.has(recordId) && after.nodes.has(recordId) && !editAssetChanged.has(recordId)) {
+        attach.delete(recordId)
+      }
+    }
+    for (const recordId of detach.keys()) {
+      if (before.nodes.has(recordId) && after.nodes.has(recordId) && !editAssetChanged.has(recordId)) {
+        detach.delete(recordId)
+      }
     }
   }
   return { attach, detach }
@@ -446,7 +486,7 @@ export const wrapMutation = <TArgs extends unknown[], TResult>(
       return result
     }
     const changes = buildCanvasSyncChanges(before, after)
-    const assetEffects = computeAssetSideEffects(before, after)
+    const assetEffects = computeAssetSideEffects(before, after, changes)
     if (changes.length > 0) void enqueueCanvasSyncChanges(before.canvasId, changes, undefined, assetEffects)
     return result
   }
@@ -470,7 +510,7 @@ export const wrapMutationForScene = <TArgs extends unknown[], TResult>(
     const result = mutate(...args)
     const after = snapshotFromState(useCanvasStore.getState(), targetSceneId)
     const changes = buildCanvasSyncChanges(before, after)
-    const assetEffects = computeAssetSideEffects(before, after)
+    const assetEffects = computeAssetSideEffects(before, after, changes)
     if (changes.length > 0) void enqueueCanvasSyncChanges(targetSceneId, changes, undefined, assetEffects)
     return result
   }

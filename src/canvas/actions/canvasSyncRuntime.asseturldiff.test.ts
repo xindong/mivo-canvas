@@ -10,6 +10,7 @@
 
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AnchorRecord, EdgeRecord, NodeRecord } from '../../kernel/records'
+import type { MivoCanvasNode } from '../../types/mivoCanvas'
 import type { CanvasSyncPort } from '../../lib/canvasSyncPort'
 import { imageNode, nodeRecord, loadRuntimeModule } from './canvasSyncRuntimeTestFactories'
 
@@ -152,7 +153,7 @@ describe('canvasSyncRuntime — Block 2 edit-node assetUrl-diff side-effects', (
       const effects = { attach: new Map([['n1', 'asset-1']]), detach: new Map() }
       await enqueueCanvasSyncChanges(
         'c1',
-        [{ kind: 'edit-node', nodeId: 'n1', intents: [{ op: 'set', fieldPath: ['asset'], value: { url: 'mivo-sasset:asset-1' } }] }],
+        [{ kind: 'edit-node', nodeId: 'n1', intents: [{ op: 'set', fieldPath: ['asset', 'url'], value: 'mivo-sasset:asset-1' }] }],
         fakePort,
         effects,
       )
@@ -168,7 +169,7 @@ describe('canvasSyncRuntime — Block 2 edit-node assetUrl-diff side-effects', (
       const effects = { attach: new Map(), detach: new Map([['n1', 'asset-1']]) }
       await enqueueCanvasSyncChanges(
         'c1',
-        [{ kind: 'edit-node', nodeId: 'n1', intents: [{ op: 'delete-field', fieldPath: ['asset'] }] }],
+        [{ kind: 'edit-node', nodeId: 'n1', intents: [{ op: 'delete-field', fieldPath: ['asset', 'url'] }] }],
         fakePort,
         effects,
       )
@@ -183,7 +184,7 @@ describe('canvasSyncRuntime — Block 2 edit-node assetUrl-diff side-effects', (
       const effects = { attach: new Map([['n1', 'asset-B']]), detach: new Map([['n1', 'asset-A']]) }
       await enqueueCanvasSyncChanges(
         'c1',
-        [{ kind: 'edit-node', nodeId: 'n1', intents: [{ op: 'set', fieldPath: ['asset'], value: { url: 'mivo-sasset:asset-B' } }] }],
+        [{ kind: 'edit-node', nodeId: 'n1', intents: [{ op: 'set', fieldPath: ['asset', 'url'], value: 'mivo-sasset:asset-B' }] }],
         fakePort,
         effects,
       )
@@ -219,7 +220,7 @@ describe('canvasSyncRuntime — Block 2 edit-node assetUrl-diff side-effects', (
       const effects = { attach: new Map([['n1', 'asset-1']]), detach: new Map() }
       await enqueueCanvasSyncChanges(
         'c1',
-        [{ kind: 'edit-node', nodeId: 'n1', intents: [{ op: 'set', fieldPath: ['asset'], value: { url: 'mivo-sasset:asset-1' } }] }],
+        [{ kind: 'edit-node', nodeId: 'n1', intents: [{ op: 'set', fieldPath: ['asset', 'url'], value: 'mivo-sasset:asset-1' }] }],
         fakePort,
         effects,
       )
@@ -333,6 +334,122 @@ describe('canvasSyncRuntime — Block 2 edit-node assetUrl-diff side-effects', (
       await Promise.resolve()
       expect(submitChange).toHaveBeenCalledWith('c1', expect.objectContaining({ kind: 'edit-node', nodeId: 'slot1' }))
       expect(enqueueAssetAttach).toHaveBeenCalledWith('c1', 'result-asset', 'slot1')
+      expect(enqueueAssetDetach).not.toHaveBeenCalled()
+      __resetCanvasSyncRuntimeQueue()
+    })
+  })
+
+  // ── F1 验收(lead review):wrapMutationForScene 端到端,走 build/validator → submitChanges,不手工注入 change/effects ──
+  // 验 ① diffValue 分解 asset 消失为 leaf delete + ③ computeAssetSideEffects(changes) 对齐真相源 联合生效:
+  //   server asset→undefined:edit-node 含合法 leaf delete(['asset','url'],validator 放行)→ accepted 后 detach。
+  //   不手工注入 delete-field ['asset'](那会被 validator 丢,不反映真实);全程经 build 产出 + validator。
+  describe('F1 验收 — wrapMutationForScene 端到端 asset 变更(走 build/validator,不手工注入)', () => {
+    const setupCanvasWith = (
+      useCanvasStore: Awaited<ReturnType<typeof loadRuntimeModule>>['useCanvasStore'],
+      img: MivoCanvasNode,
+    ) => {
+      const baseState = useCanvasStore.getInitialState()
+      useCanvasStore.setState(
+        {
+          ...baseState,
+          sceneId: 'c1',
+          canvases: {
+            c1: { title: 'Canvas', createdAt: '2026-07-15T00:00:00.000Z', updatedAt: '2026-07-15T00:00:00.000Z', nodes: [img], edges: [], tasks: [], selectedNodeId: 'n1', selectedNodeIds: ['n1'] },
+          },
+          nodes: [img],
+          edges: [],
+          tasks: [],
+          selectedNodeId: 'n1',
+          selectedNodeIds: ['n1'],
+        } as never,
+        true,
+      )
+    }
+
+    // 取 n1 的 edit-node change 的 intents(从 submitChange mock calls)
+    const editNodeIntentsOf = (
+      submitChange: { mock: { calls: Array<[string, unknown]> } },
+    ): Array<{ op: string; fieldPath: (string | number)[]; value?: unknown }> => {
+      const call = submitChange.mock.calls.find(([cid, ch]) => {
+        const change = ch as { kind?: string; nodeId?: string }
+        return cid === 'c1' && change?.nodeId === 'n1' && change?.kind === 'edit-node'
+      })
+      return ((call?.[1] as { intents?: Array<{ op: string; fieldPath: (string | number)[]; value?: unknown }> })?.intents) ?? []
+    }
+
+    // (a) server asset→undefined:edit 含合法 leaf delete,accepted 后 detach
+    it('(a) server asset→undefined:wrapMutationForScene 产 edit-node 含 delete-field [asset,url] leaf + enqueueAssetDetach', async () => {
+      const { __resetCanvasSyncRuntimeQueue, wrapMutationForScene, submitChange, enqueueAssetAttach, enqueueAssetDetach, useCanvasStore } =
+        await loadRuntimeModule()
+      setupCanvasWith(useCanvasStore, imageNode({ id: 'n1', assetUrl: 'mivo-sasset:asset-A' }))
+      // 移除 asset(assetUrl→undefined)经 wrapMutationForScene → buildCanvasSyncChanges → validator → submitChange
+      wrapMutationForScene('c1', () => {
+        const s = useCanvasStore.getState()
+        useCanvasStore.setState({
+          canvases: {
+            ...s.canvases,
+            c1: { ...s.canvases.c1, nodes: s.canvases.c1.nodes.map((n) => (n.id === 'n1' ? { ...n, assetUrl: undefined } : n)) },
+          },
+        })
+      })()
+      await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+      // 提交的 edit-node 含合法 leaf delete(非手工注入:build 产出 + validator 放行 container-clobber 防线)
+      expect(submitChange).toHaveBeenCalledWith('c1', expect.objectContaining({ kind: 'edit-node', nodeId: 'n1' }))
+      const intents = editNodeIntentsOf(submitChange)
+      expect(intents.some((i) => i.op === 'delete-field' && i.fieldPath[0] === 'asset' && i.fieldPath[1] === 'url')).toBe(true)
+      // accepted 后 detach 旧 A(③ 对齐:change 含 asset 叶子 intent → side effect 发)
+      expect(enqueueAssetDetach).toHaveBeenCalledWith('c1', 'asset-A', 'n1')
+      expect(enqueueAssetAttach).not.toHaveBeenCalled()
+      __resetCanvasSyncRuntimeQueue()
+    })
+
+    // (b) asset 移除 + title 同批:server change(edit-node 含 title set + asset leaf delete)与 detach 对齐
+    it('(b) asset 移除 + title 同批:edit-node 含 [set title, delete-field asset.url] + enqueueAssetDetach 对齐(无悬空)', async () => {
+      const { __resetCanvasSyncRuntimeQueue, wrapMutationForScene, submitChange, enqueueAssetDetach, enqueueAssetAttach, useCanvasStore } =
+        await loadRuntimeModule()
+      setupCanvasWith(useCanvasStore, imageNode({ id: 'n1', title: 'old', assetUrl: 'mivo-sasset:asset-A' }))
+      // 同批:asset 移除 + title 改
+      wrapMutationForScene('c1', () => {
+        const s = useCanvasStore.getState()
+        useCanvasStore.setState({
+          canvases: {
+            ...s.canvases,
+            c1: { ...s.canvases.c1, nodes: s.canvases.c1.nodes.map((n) => (n.id === 'n1' ? { ...n, assetUrl: undefined, title: 'new' } : n)) },
+          },
+        })
+      })()
+      await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+      // 单条 edit-node 含 title set + asset leaf delete(混合批次,asset 不被 validator 丢)
+      expect(submitChange).toHaveBeenCalledWith('c1', expect.objectContaining({ kind: 'edit-node', nodeId: 'n1' }))
+      const intents = editNodeIntentsOf(submitChange)
+      expect(intents.some((i) => i.op === 'set' && i.fieldPath[0] === 'title' && i.value === 'new')).toBe(true)
+      expect(intents.some((i) => i.op === 'delete-field' && i.fieldPath[0] === 'asset' && i.fieldPath[1] === 'url')).toBe(true)
+      // detach 与 server change 对齐(都发:server 经 leaf delete 知 asset 移除 + detach 清 refcount,无悬空)
+      expect(enqueueAssetDetach).toHaveBeenCalledWith('c1', 'asset-A', 'n1')
+      expect(enqueueAssetAttach).not.toHaveBeenCalled()
+      __resetCanvasSyncRuntimeQueue()
+    })
+
+    // (a 反例/防御)③ 真相源:asset 变更被 validator 丢时(模拟:手工塞 container delete-field ['asset'] 进 change)
+    //   → computeAssetSideEffects 应过滤掉 detach。此处用「asset 整体 set(非原子,validator 拒)」绕不开 build,
+    //   改用真实路径:仅改 title(asset 不变)→ computeAssetSideEffects 算出 0 effect(无 asset diff)→ 不发 detach。
+    it('(防御)③ 真相源:仅 title 改(asset 不变)→ edit-node 无 asset 叶子 intent → 不 enqueue attach/detach', async () => {
+      const { __resetCanvasSyncRuntimeQueue, wrapMutationForScene, submitChange, enqueueAssetAttach, enqueueAssetDetach, useCanvasStore } =
+        await loadRuntimeModule()
+      setupCanvasWith(useCanvasStore, imageNode({ id: 'n1', title: 'old', assetUrl: 'mivo-sasset:asset-A' }))
+      wrapMutationForScene('c1', () => {
+        const s = useCanvasStore.getState()
+        useCanvasStore.setState({
+          canvases: {
+            ...s.canvases,
+            c1: { ...s.canvases.c1, nodes: s.canvases.c1.nodes.map((n) => (n.id === 'n1' ? { ...n, title: 'new' } : n)) },
+          },
+        })
+      })()
+      await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+      expect(submitChange).toHaveBeenCalledWith('c1', expect.objectContaining({ kind: 'edit-node', nodeId: 'n1' }))
+      // asset 未变 → 无 asset 叶子 intent → ③ 过滤后 0 effect → 不发 attach/detach(对齐真相源)
+      expect(enqueueAssetAttach).not.toHaveBeenCalled()
       expect(enqueueAssetDetach).not.toHaveBeenCalled()
       __resetCanvasSyncRuntimeQueue()
     })
