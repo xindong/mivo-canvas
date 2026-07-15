@@ -284,4 +284,57 @@ describe('canvasSyncRuntime — Block 2 edit-node assetUrl-diff side-effects', (
       __resetCanvasSyncRuntimeQueue()
     })
   })
+
+  // ── Block 1 × Block 2 语义配合:slot→结果原位替换 edit-node 经 wrapMutationForScene → attach ──
+  // 验 Block 1 的 wrapMutationForScene(内部已调 computeAssetSideEffects + enqueueCanvasSyncChanges(assetEffects))
+  // 与 Block 2 的 edit-node assetUrl-diff + submitChanges edit-node attach 端到端打通。Block 1 注释(line ~459)
+  // 明确「result edit-node(slot→结果替换)+ attach 是 Block 2/3」——此条证该衔接在 wrap 通路真生效:
+  // slot 占位 node(无 server asset)经 wrapMutationForScene 包「换 assetUrl 为 server 结果资产」的 edit →
+  // 应发 edit-node submitChange + enqueueAssetAttach(canvasId, resultAssetId, slotNodeId),不发 detach。
+  // 生产里 assetUrl edit 的调用方(commitGenerationResult/mask-edit)是 Block 3;此处 setState 驱动该 mutation
+  // 以隔离测 wrap→diff→attach 链(addAiSlotNode 等 slot 创建已由 canvasSyncRuntime.block1.test.ts 覆盖)。
+  describe('Block 1 × Block 2 语义配合 — wrapMutationForScene → edit-node assetUrl-diff → attach', () => {
+    it('slot 占位 node 经 wrapMutationForScene edit 换成 server assetUrl → edit-node submitChange + enqueueAssetAttach', async () => {
+      const { __resetCanvasSyncRuntimeQueue, wrapMutationForScene, submitChange, enqueueAssetAttach, enqueueAssetDetach, useCanvasStore } =
+        await loadRuntimeModule()
+      const baseState = useCanvasStore.getInitialState()
+      // slot 占位:image node,assetUrl=undefined(无 server 资产,模拟 Block 1 建的待替换 slot)
+      const slot = imageNode({ id: 'slot1', assetUrl: undefined })
+      useCanvasStore.setState(
+        {
+          ...baseState,
+          sceneId: 'c1',
+          canvases: {
+            c1: { title: 'Canvas', createdAt: '2026-07-15T00:00:00.000Z', updatedAt: '2026-07-15T00:00:00.000Z', nodes: [slot], edges: [], tasks: [], selectedNodeId: 'slot1', selectedNodeIds: ['slot1'] },
+          },
+          nodes: [slot],
+          edges: [],
+          tasks: [],
+          selectedNodeId: 'slot1',
+          selectedNodeIds: ['slot1'],
+        } as never,
+        true,
+      )
+      // edit slot1.assetUrl → server 结果资产(模拟 slot→结果原位替换);wrapMutationForScene 快照 before/after diff
+      wrapMutationForScene('c1', () => {
+        const s = useCanvasStore.getState()
+        useCanvasStore.setState({
+          canvases: {
+            ...s.canvases,
+            c1: {
+              ...s.canvases.c1,
+              nodes: s.canvases.c1.nodes.map((n) => (n.id === 'slot1' ? { ...n, assetUrl: 'mivo-sasset:result-asset' } : n)),
+            },
+          },
+        })
+      })()
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(submitChange).toHaveBeenCalledWith('c1', expect.objectContaining({ kind: 'edit-node', nodeId: 'slot1' }))
+      expect(enqueueAssetAttach).toHaveBeenCalledWith('c1', 'result-asset', 'slot1')
+      expect(enqueueAssetDetach).not.toHaveBeenCalled()
+      __resetCanvasSyncRuntimeQueue()
+    })
+  })
 })
