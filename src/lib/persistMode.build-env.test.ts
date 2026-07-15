@@ -13,7 +13,7 @@
 // 故 development/test 断言 not.toBe('server')(文件不生效);若外部进程 env 恰设了 server,此断言会
 // 误判——但那非本仓库 .env.production 的作用,属环境异常。
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, afterEach } from 'vitest'
 import { loadEnv } from 'vite'
 
 describe('SC-A 构建模式分离 — .env.production 按 mode 加载(lead D1)', () => {
@@ -31,5 +31,28 @@ describe('SC-A 构建模式分离 — .env.production 按 mode 加载(lead D1)',
   it('test mode 不加载 .env.production → 单测环境 local(既有测试全绿的前提)', () => {
     const env = loadEnv('test', process.cwd())
     expect(env.VITE_MIVO_PERSIST).not.toBe('server')
+  })
+})
+
+// Option A(lead 裁决①)依赖:vite loadEnv 下进程 env VITE_MIVO_PERSIST 压过 .env.production 文件值。
+// 用途:`VITE_MIVO_PERSIST=local npm run build` 让 e2e 构 local 模式 dist(匹配 memory BFF 拓扑),
+// 而生产裸 `npm run build`(无进程 env)仍读 .env.production=server。本测试证明 loadEnv 的进程 env 优先级,
+// 从而 e2e 脚本前缀 `VITE_MIVO_PERSIST=local npm run build &&` 能在构建期注入 local(覆盖 .env.production)。
+describe('loadEnv 优先级 — 进程 env 压过 .env.production 文件(Option A 依赖)', () => {
+  afterEach(() => {
+    // 清进程 env,防泄漏影响同文件其他 loadEnv 测试(它们依赖 VITE_MIVO_PERSIST 未设)。
+    delete process.env.VITE_MIVO_PERSIST
+  })
+
+  it('process.env.VITE_MIVO_PERSIST=local 覆盖 .env.production 的 server(production mode)', () => {
+    process.env.VITE_MIVO_PERSIST = 'local'
+    const env = loadEnv('production', process.cwd())
+    expect(env.VITE_MIVO_PERSIST).toBe('local')
+  })
+
+  it('process.env.VITE_MIVO_PERSIST=server 时与 .env.production 一致(仍 server)', () => {
+    process.env.VITE_MIVO_PERSIST = 'server'
+    const env = loadEnv('production', process.cwd())
+    expect(env.VITE_MIVO_PERSIST).toBe('server')
   })
 })
