@@ -2482,4 +2482,25 @@ describe('F2 (T2.2 Block 2 review) — seq 防逆序 stale asset ref', () => {
     expect(exec.calls.map((o) => o.kind)).toEqual(['attachAsset', 'detachAsset'])
     expect(exec.refs.get('B') ?? 0).toBe(0)
   })
+
+  // F2-bis(T2.2 Block 2 三轮复审):seq 全局原子分配(IDB META counter 同事务 increment+put,runMultiStoreTx)。
+  // 审官复现:F2 的 max+1 读非锁定快照,Promise.all 跨 key 并发 enqueue 派生重复 seq(seq=1/1)→ 逆序执行。
+  // nextSeq 的 readwrite tx 序列化(META_STORE)→ 并发 enqueue 得唯一严格递增 seq(per-resourceKey coalesce 不动)。
+  // reload 后按意图序由 F2-3 顺序 enqueue 覆盖;逆序由 F2-1 reverse-id 覆盖;"移除 seq 排序即失败"反证 = F2-1。
+  it('F2-bis Promise.all 跨 key 并发 enqueue(同毫秒)→ seq 全异严格递增(原子 nextSeq,无 max+1 的 1/1 重复)', async () => {
+    const exec = refTrackingExecutor()
+    const q = makeQueue(exec.fn)
+    // 3 跨 key(不同 assetId → asset-attach:A/B/C 不同 resourceKey)同毫秒并发 enqueue
+    await Promise.all([
+      q.enqueue({ kind: 'attachAsset', canvasId: 'c1', assetId: 'A', nodeId: 'n1' }),
+      q.enqueue({ kind: 'attachAsset', canvasId: 'c1', assetId: 'B', nodeId: 'n1' }),
+      q.enqueue({ kind: 'attachAsset', canvasId: 'c1', assetId: 'C', nodeId: 'n1' }),
+    ])
+    const all = await __dumpWritesForTest()
+    const seqs = all.map((r) => r.seq ?? 0).sort((a, b) => a - b)
+    expect(seqs).toHaveLength(3)
+    expect(new Set(seqs).size).toBe(3) // 全异(原子 nextSeq;max+1 会给 1/1/1 重复)
+    expect(seqs[1]! > seqs[0]!).toBe(true) // 严格递增
+    expect(seqs[2]! > seqs[1]!).toBe(true)
+  })
 })

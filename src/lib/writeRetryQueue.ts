@@ -1078,6 +1078,41 @@ const deleteWrite = async (id: string): Promise<void> => {
   }
 }
 
+// ── F2-bis(T2.2 Block 2 三轮复审):持久单调 seq 的全局原子分配 ──────────────────────────────
+// F2 的 max(all.seq)+1 读非锁定快照,跨 key 并发 enqueue(Promise.all)派生重复 seq(审官复现 seq=1/1 逆序执行)。
+// 改 IDB META_STORE 同事务 increment+put(runMultiStoreTx:get→+1→put 单 readwrite tx,IDB tx 序列化跨 key/跨 tab
+// 唯一严格递增)。per-resourceKey coalesce 语义不动(coalesce 路径不调 nextSeq,保留既有 record 的 seq)。
+// IDB 不可用降级 module counter(per-tab,degraded 模式;IDB 不可用时 enqueuePersistWrite 本就 memStore 兜底,
+// 单 tab 内 ++ 仍唯一)。META seqCounter key 由 __resetWriteQueueDb 的 clearIdbStore 清(测试间复位)。
+const SEQ_COUNTER_KEY = 'seqCounter'
+let seqMemCounter = 0
+const nextSeq = async (): Promise<number> => {
+  if (!isIdbAvailable()) {
+    seqMemCounter += 1
+    return seqMemCounter
+  }
+  // 原子 RMW:readwrite tx 内 get→+1→put;tx.oncomplete 时 nextVal 已由 onsuccess 置定,跨 key/跨 tab 串行唯一。
+  let nextVal = 0
+  try {
+    await runMultiStoreTx([META_STORE], 'readwrite', (stores) => {
+      const store = stores[META_STORE]!
+      const req = store.get(SEQ_COUNTER_KEY)
+      req.onsuccess = () => {
+        const cur = (req.result as { key: string; value?: number } | undefined)?.value ?? 0
+        nextVal = cur + 1
+        store.put({ key: SEQ_COUNTER_KEY, value: nextVal })
+      }
+    })
+    if (nextVal > 0) return nextVal
+  } catch (error) {
+    // IDB tx 故障(fault-injected / blocked / degraded):降级 mem counter,不抛 —— 与 getAllWrites/putWrite 的
+    // mem 兜底同模式,enqueue 永不因 seq 分配失败而 throw(per-tab 内 ++ 仍唯一;IDB 恢复后下次 nextSeq 续用持久 counter)。
+    warnIdbDegradation('seq counter increment failed; using in-memory fallback', error)
+  }
+  seqMemCounter += 1
+  return seqMemCounter
+}
+
 // ── FX-7 / A6: durable terminal ledger (dead-letter / conflict / rejected outcomes) ──
 //
 // Boundary (lead A6 task pack, decision 3): "只加账本不改重试语义" — this ledger is
@@ -1650,6 +1685,10 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
       }
     }
 
+    // F2-bis(T2.2 Block 2 三轮复审):seq 走全局原子 nextSeq(IDB META counter 同事务 increment+put,跨 key/跨 tab
+    //   唯一严格递增),替代 F2 的 max(all.seq)+1(后者跨 key 并发 Promise.all 派生重复 seq,审官复现 seq=1/1)。
+    //   旧 record 缺 seq → 排序 ??0(fail-safe);per-resourceKey coalesce 不动(coalesce 路径不调 nextSeq)。
+    const seq = await nextSeq()
     const record: QueuedWrite = {
       id: newId(),
       idempotencyKey: newKey(),
@@ -1659,10 +1698,7 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
       createdAt: ts,
       attempts: 0,
       nextAttemptAt: ts,
-      // F2(T2.2 Block 2 review):持久单调 seq = max(已存 record 的 seq)+1(复用上方 getAllWrites 的 all 快照;
-      // 顺序入队保证意图序;A→B 一 mutation 内 detach A+attach B 跨 key 并发可能同 seq,但 ops 可交换无害)。
-      // drain 排序第三键,防 reload 后 IDB getAll 随机序致 attach B/detach B 逆序留 stale ref。旧 record 缺 seq → ??0。
-      seq: all.reduce((max, r) => Math.max(max, r.seq ?? 0), 0) + 1,
+      seq,
       status: 'pending',
     }
     await putWrite(record)
@@ -2310,6 +2346,8 @@ export const __resetWriteQueueDb = async (): Promise<void> => {
   terminalCountersMem = { ...ZERO_COUNTERS }
   inFlightCountersMem = { ...ZERO_COUNTERS }
   terminalCountersBaselineMem = null
+  // F2-bis:reset the in-memory seq counter fallback (IDB seqCounter key is cleared by clearIdbStore below).
+  seqMemCounter = 0
   maxTerminals = DEFAULT_MAX_TERMINALS
   idbBlockTimeoutMs = 3000
   // P1-3 (second-round): clear the blocked-state + fault injector + DB name so a prior
