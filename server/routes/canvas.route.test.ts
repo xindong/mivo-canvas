@@ -626,6 +626,47 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
     expect((r5.body as { reason: string }).reason).toBe('bad-type')
   })
 
+  // P3(五轮复审):生产形状 route 级回归测。旧 backend.a2s2 helper 固定 type:'text' 且绕过 route(直调 backend),
+  //   测不到真 ai-slot 形状。#256 cutover 后 Block 1 ai-slot 占位 create(带 aiWorkflow.status)旧版被 400 拒
+  //   (live 生产 bug);F6 schema-aware 后放行。本测走真 route 全链路(createDomainChild → validateChildPayload dam
+  //   → backend.createChild),用真实 store 产物形状(type:'ai-slot' + aiWorkflow{kind,status,operation,prompt,
+  //   placement,createdAt} + generation)→ 201 + 回读逐字断言,防 ai-slot create 形状回归。
+  //   注:node 顶层无 status(records.ts:status 不存,派生自 tasks),wire payload 不带顶层 status。
+  it('P3:ai-slot 真实 store 产物形状(type:ai-slot + aiWorkflow + generation)经 create route → 201 + 回读逐字断言', async () => {
+    await seedProject()
+    await seedCanvas()
+    // 真实 store 产物形状(对齐 src/store/nodeCreationSlice.addAiSlotNode:ai-slot 占位 create payload;wire 不带顶层 status)。
+    const aiWorkflow = { kind: 'slot', status: 'empty', operation: 'slot-generation', prompt: '等待 AI 生成', placement: 'slot', createdAt: 1234567 }
+    const generation = { prompt: '等待 AI 生成', model: 'Mivo Mock Image Workflow', size: '256x256', seed: 42 }
+    const payload = {
+      type: 'ai-slot',
+      title: 'AI Slot 1',
+      transform: { x: 10, y: 20, width: 256, height: 256, rotation: 0 },
+      fills: [],
+      strokes: [],
+      effects: [],
+      relations: {},
+      generation,
+      aiWorkflow,
+    }
+    const created = await createChildFixture(app, 'c1', 'node', 'slot-1', payload)
+    expect(created.status).toBe(201) // ★ ai-slot 形状经 validateChildPayload 通过(含 aiWorkflow.status 合法 schema 字段)
+    expect((created.body as { id: string }).id).toBe('slot-1')
+    // 回读逐字断言:落库 payload 与发送形状逐字一致(envelope revision 回填;wire 无 id/revision/顶层 status)。
+    const got = await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })
+    const entry = (got.body as { nodes: { id: string; revision: number; payload: Record<string, unknown> }[] }).nodes.find((n) => n.id === 'slot-1')!
+    expect(entry.revision).toBe(1)
+    expect(entry.payload.type).toBe('ai-slot')
+    expect(entry.payload.aiWorkflow).toEqual(aiWorkflow) // ★ 逐字(含 status:'empty' 合法 schema 字段,不 forbidden)
+    expect(entry.payload.generation).toEqual(generation) // ★ 逐字
+    expect(entry.payload.transform).toEqual(payload.transform)
+    expect(entry.payload.fills).toEqual([])
+    expect(entry.payload.relations).toEqual({})
+    expect('id' in entry.payload).toBe(false) // wire 不带 id(取自 path)
+    expect('revision' in entry.payload).toBe(false) // wire 不带 revision
+    expect('status' in entry.payload).toBe(false) // 顶层无 status(派生自 tasks,不入 record)
+  })
+
   // ── 返修三 F1-F7 路由级回归(逐字复现场景,真实 app.request 全链路)──
 
   it('F1: 软删 project 后 POST 旧 c1/新 c2 → 404;restoreProjectTree 后整树 live(禁独立 child restore)', async () => {

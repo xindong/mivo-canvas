@@ -999,7 +999,11 @@ const findForbiddenDeep = (check: Check, value: unknown, prefix: string): string
       if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
       const obj = value as Record<string, unknown>
       for (const [k, v] of Object.entries(obj)) {
-        if (k in check.fields) {
+        // F3-ter+ P2-1(五轮复审):own-property 判定——`in` 走原型链,Object.prototype 键(constructor/toString/
+        //   hasOwnProperty)会命中 `k in check.fields`(plain object 继承 Object.prototype)→ 误判 schema 已定义 →
+        //   递归 check.fields[k](= Object.prototype.constructor 函数,无 .t)→ default null,forbidden 扫描被绕过。
+        //   Object.hasOwn 只判自有键,constructor 等落 else → unknown-field(PAYLOAD_FORBIDDEN_FIELDS 不含它们)。
+        if (Object.hasOwn(check.fields, k)) {
           // schema 定义该字段:递归下钻(合法字段如 aiWorkflow.status 不拒,交 validateCheck 类型校验)
           const hit = findForbiddenDeep(check.fields[k] as Check, v, prefix ? `${prefix}.${k}` : k)
           if (hit) return hit
@@ -1022,8 +1026,12 @@ const findForbiddenDeep = (check: Check, value: unknown, prefix: string): string
       if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
       const tagVal = (value as Record<string, unknown>)[check.tag]
       if (typeof tagVal !== 'string') return null // tag 缺/非 string 交 validateCheck
-      const variant = check.variants[tagVal]
-      if (!variant) return null // tag 不在 variants 交 validateCheck unknown-field
+      // P2-1:own-property 判 variant——tagVal 为 'constructor'/'toString' 时 `check.variants[tagVal]` 走原型链
+      //   命中 Object.prototype.constructor(函数,truthy)→ 旧 `if (!variant)` 不拒 → 递归函数 default → 不 forbidden;
+      //   validateCheck 侧 `check.variants[tag]` 同样命中 → 函数 .t=undefined → assertNeverCheck throw → 500。
+      //   hasOwn 只判自有 variant,未知 tag 交 validateCheck unknown-field(400,不 500)。
+      if (!Object.hasOwn(check.variants, tagVal)) return null // tag 不在 variants 交 validateCheck unknown-field
+      const variant = check.variants[tagVal] as Check
       return findForbiddenDeep(variant, value, prefix)
     }
     default:
@@ -1046,13 +1054,14 @@ const validateCheck = (check: Check, value: unknown, path: string): FieldError |
       if (!isObj(value)) return { reason: 'bad-type', field: path || '<root>' }
       // unknown nested key → unknown-field(§3 exact;先于 required/type,与 transform.bogus 测试一致)
       for (const k of Object.keys(value)) {
-        if (!(k in check.fields)) return { reason: 'unknown-field', field: path ? `${path}.${k}` : k }
+        // P2-1:own-property 判 schema 字段——防 Object.prototype 键(constructor 等)经 `in` 误命中 schema。
+        if (!Object.hasOwn(check.fields, k)) return { reason: 'unknown-field', field: path ? `${path}.${k}` : k }
       }
       for (const req of check.required ?? []) {
-        if (!(req in value)) return { reason: 'missing-field', field: path ? `${path}.${req}` : req }
+        if (!Object.hasOwn(value, req)) return { reason: 'missing-field', field: path ? `${path}.${req}` : req }
       }
       for (const [k, sub] of Object.entries(check.fields)) {
-        if (k in value) {
+        if (Object.hasOwn(value, k)) {
           const err = validateCheck(sub, value[k], path ? `${path}.${k}` : k)
           if (err) return err
         }
@@ -1069,11 +1078,13 @@ const validateCheck = (check: Check, value: unknown, path: string): FieldError |
     }
     case 'union': {
       if (!isObj(value)) return { reason: 'bad-type', field: path || '<root>' }
-      if (!(check.tag in value)) return { reason: 'missing-field', field: path ? `${path}.${check.tag}` : check.tag }
+      // P2-1:own-property 判别 tag presence(防原型链);variant lookup 同用 hasOwn(防 constructor/toString 命中
+      //   Object.prototype.constructor 函数 → truthy 误判 → 函数 .t=undefined → assertNeverCheck throw 500)。
+      if (!Object.hasOwn(value, check.tag)) return { reason: 'missing-field', field: path ? `${path}.${check.tag}` : check.tag }
       const tag = value[check.tag]
       if (!isStr(tag)) return { reason: 'bad-type', field: path ? `${path}.${check.tag}` : check.tag }
-      const variant = check.variants[tag]
-      if (!variant) return { reason: 'unknown-field', field: path ? `${path}.${check.tag}` : check.tag }
+      if (!Object.hasOwn(check.variants, tag)) return { reason: 'unknown-field', field: path ? `${path}.${check.tag}` : check.tag }
+      const variant = check.variants[tag] as Check
       return validateCheck(variant, value, path)
     }
     default:
@@ -1107,7 +1118,8 @@ export const validateChildPayload = (
   }
   const obj = payload
   // id 特殊(允许但须匹配 path;N10 非 string id → bad-id-type)
-  if ('id' in obj) {
+  // P2-1:own-property 判 id/mirror——防 payload 经原型链误命中(虽 JSON payload 仅自有键,统一 own-property 语义)。
+  if (Object.hasOwn(obj, 'id')) {
     if (!isStr(obj.id)) {
       return { ok: false, body: { error: 'payload-rejected', reason: 'bad-id-type', field: 'id' } }
     }
@@ -1117,7 +1129,7 @@ export const validateChildPayload = (
   }
   // envelope 镜像字段(含 revision)→ mirror-field
   for (const f of PAYLOAD_MIRROR_FIELDS) {
-    if (f in obj) return { ok: false, body: { error: 'payload-rejected', reason: 'mirror-field', field: f } }
+    if (Object.hasOwn(obj, f)) return { ok: false, body: { error: 'payload-rejected', reason: 'mirror-field', field: f } }
   }
   // F6(schema-aware,lead 裁定 B):status/tasks 仅在 schema 未定义处拒;schema 合法字段(aiWorkflow.status)放行。
   //   envelope 防线保留:顶层 status/tasks 照拒、schema 未定义容器内藏(relations.status / fills[0].tasks)照拒。
@@ -1174,7 +1186,7 @@ export const classifyFieldPathBySchema = (
     // string 段:仅 object 变体可 schema 下钻;scalar/array(schema 已耗尽)/union(无 tag 值无法下钻)→ 视 leaf
     //   (port 对 schema 不透明处不拦未知;非法 set 由 structural 入口兜,非法 payload 由 validateChildPayload dam 兜底)。
     if (!check || check.t !== 'object') return 'leaf'
-    if (!(seg in check.fields)) return 'leaf' // 未知字段:port 不拦未知,视 leaf
+    if (!Object.hasOwn(check.fields, seg)) return 'leaf' // 未知字段:port 不拦未知,视 leaf(P2-1 own-property 判定)
     const isRequired = (check.required ?? []).includes(seg)
     const sub: Check = check.fields[seg]
     if (isLast) {
