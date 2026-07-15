@@ -8,6 +8,7 @@ import type {
 import type { SliceCreator } from './canvasStateTypes'
 import type { VariationParam, NormalizedMaskBounds } from '../types/generation'
 import { MivoImageRequestError, assetBlobForNode } from '../lib/mivoImageClient'
+import { getSceneWrap } from '../lib/sceneWrapRegistry'
 import {
   cancelTask,
   kindForFailedTask,
@@ -300,14 +301,16 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
             createFailedVariationSlot(source, failure, basePrompt, model, taskId),
           )
           if (failedSlots.length > 0) {
-            set((current) => {
+            // T2.2 Block 3:失败槽位 node-create 经 submitChange 落 server(无 assetUrl,仅 create-node,无 attach)。
+            //   success 结果已由上方 commitGenerationResult 的 wrap 落 server。local gate 短路零变化。
+            getSceneWrap()(targetSceneId, () => set((current) => {
               const doc = current.canvases[targetSceneId]
               if (!doc) return {}
               return patchCanvasDocument(current, targetSceneId, {
                 nodes: [...doc.nodes, ...failedSlots.map((s) => s.node)],
                 edges: [...doc.edges, ...failedSlots.map((s) => s.edge)],
               })
-            })
+            }))
           }
           return successIds
         },
