@@ -12,6 +12,7 @@ import { classifyFieldPathBySchema } from '../../../shared/persist-contract.ts'
 import { abortPendingCanvasSyncCreate, getCanvasSyncPort } from '../../lib/canvasSyncPortClient'
 import { isLocalPersist } from '../../lib/persistMode'
 import { enqueueAssetAttach, enqueueAssetDetach, serverAssetIdFromUrl } from '../../lib/assetAttachWiring'
+import { registerSceneWrap } from '../../lib/sceneWrapRegistry'
 import { debugLogger } from '../../store/debugLogStore'
 import { useCanvasStore } from '../../store/canvasStore'
 import { documentFor } from '../../store/canvasDocumentModel'
@@ -486,6 +487,20 @@ export const wrapMutationForScene = <TArgs extends unknown[], TResult>(
     return result
   }
 }
+
+// ── T2.2 Block 3 (C 方案):注册 wrapMutationForScene 执行适配到 sceneWrapRegistry ──────────
+// canvasSyncRuntime(canvas 层)模块顶层 side-effect 注册;canvas → lib 方向合法(本模块已引
+// store/debugLogStore 等 leaf,registry 是 lib leaf,无环)。store 层消费点(documentSlice
+// commitGenerationResult set 段 / nodeCreationSlice.addImportedFileNode / generationSlice 失败槽位)
+// 从 getSceneWrap() 取,不经 store→canvas→store 静态环(A 方案判死的原因)。适配把 curried
+// wrapMutationForScene 摊成 onSceneMutation 形 (sceneId, mutate) => void,与 generationFacade
+// 注入 generateIntoAiSlot 的 onSceneMutation 回调同形(canvasSyncRuntime.ts:525)。
+// boot 时序:本模块经 generationFacade(chatStore 静态 import)进 useStoreHydration 求值链,
+// 注册在 reconcileExpiredChatTasks(useEffect 内)之前跑,消费时注册必已就位(详见
+// sceneWrapRegistry.ts 文件头注释)。
+registerSceneWrap((sceneId, mutate) => {
+  wrapMutationForScene(sceneId, mutate)()
+})
 
 export const wrapCanvasActionRuntimeWithSync = (runtime: CanvasActionRuntime): CanvasActionRuntime => {
   if (isLocalPersist) return runtime
