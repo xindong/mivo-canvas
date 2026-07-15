@@ -148,6 +148,39 @@ export const validateSsoConfig = (env: NodeJS.ProcessEnv = process.env): string[
 }
 
 /**
+ * P2 代码加固:debug-logs origin 启动期 fail-visible 守卫。
+ *
+ * 痛点:server/routes/debug-logs.ts 在生产边界(`isProdBoundary` = MIVO_PUBLIC=1 或
+ * NODE_ENV=production,与本文件 validateSsoConfig 同式)下,同源 POST 走 `isSameOrigin` →
+ * `getTrustedExternalOrigin` 需 `MIVO_PUBLIC_ORIGIN` 或 `MIVO_DEBUG_TRUST_XFF=1` 才非空;
+ * 跨域走 `MIVO_DEBUG_ALLOWED_ORIGINS`。三者全空 → 同源 POST fail-closed 403(每个请求静默 403),
+ * 线上 pm2 env 缺这些变量即 debug-logs 全 403 刷屏。
+ *
+ * 守卫(lead Decisions 划定):isProdBoundary 为真 AND 三个 origin env 全空/未设
+ * (MIVO_PUBLIC_ORIGIN trim 后空 + MIVO_DEBUG_TRUST_XFF!=='1' + MIVO_DEBUG_ALLOWED_ORIGINS
+ * trim 后空) → 返回告警串(供 index.ts 启动 console.error)。仅告警不硬失败(warn 语义,继续
+ * serve;debug-logs 之外功能正常);配任一 env → 无告警。
+ *
+ * 边界:只检测"全缺失",不做 origin 语法校验(那需复用 debug-logs.ts 的 parseSerializedOrigin,
+ * 属 gate 逻辑,不在本守卫范围)。仅 MIVO_DEBUG_ALLOWED_ORIGINS 配置(无 trusted origin)不触发——
+ * 该配置只放行跨域 allowlist 命中,同源 POST 仍因 isSameOrigin 无 trusted origin 而 403;此为 lead
+ * 划定的"全缺失"触发边界,部分错配留 ops 据运行期 403 日志另行发现。
+ */
+export const validateDebugLogsOriginConfig = (env: NodeJS.ProcessEnv = process.env): string[] => {
+  const warnings: string[] = []
+  const isProdBoundary = env.NODE_ENV === 'production' || env.MIVO_PUBLIC === '1'
+  if (!isProdBoundary) return warnings
+  const publicOrigin = env.MIVO_PUBLIC_ORIGIN?.trim() ?? ''
+  const trustXff = env.MIVO_DEBUG_TRUST_XFF === '1'
+  const allowedOrigins = env.MIVO_DEBUG_ALLOWED_ORIGINS?.trim() ?? ''
+  if (publicOrigin || trustXff || allowedOrigins) return warnings
+  warnings.push(
+    'debug-logs trusted origin config missing in production boundary (MIVO_PUBLIC=1 or NODE_ENV=production): MIVO_PUBLIC_ORIGIN unset, MIVO_DEBUG_TRUST_XFF!=1, MIVO_DEBUG_ALLOWED_ORIGINS unset. Same-origin browser POST /api/mivo/debug-logs will fail-closed to 403 on every request (isSameOrigin needs a trusted external origin). Set MIVO_PUBLIC_ORIGIN (e.g. https://app.example) to the public origin clients reach, OR set MIVO_DEBUG_TRUST_XFF=1 behind a gateway that scrubs X-Forwarded-Proto, OR set MIVO_DEBUG_ALLOWED_ORIGINS for cross-origin. Without one of these the client debugLogger POSTs are all 403.',
+  )
+  return warnings
+}
+
+/**
  * 网关共享密钥是否通过(T1.4 终审 P1-2 fail-closed:无密钥 → 任何模式都不得信任 SSO header)。
  * - 配置了 MIVO_GATEWAY_SECRET → 要求 x-mivo-gateway-secret 匹配(网关注入,客户端不可构造)。
  * - **未配置密钥 → 一律 false(含 dev/test)**:不靠部署约定堵伪造,服务器侧 fail-closed。
