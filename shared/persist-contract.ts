@@ -144,6 +144,17 @@ export type CanvasChildUpsertResponse = UpsertResponse & {
 // TODO(A2-S3): 阶段 3 client adapter 接线时,DomainOp/CreateBody 投入生产 wire(client 发,server 收)。
 /** FieldPath = 非空 tuple(G1-b R4-P1-1 / S10-6;运行时拒空)。leaf-level 域语义路径,非 RFC6902 JSON-Pointer。 */
 export type FieldPath = readonly [string | number, ...(string | number)[]]
+
+/**
+ * F2-ter(T2.2 Block 2 五轮):fieldPath 终点类别(schema-aware 分类,单一真相源)。
+ * 定义于 shared(与 FieldPath 同层,neutral type contract 层)——生产 classifyFieldPathTarget
+ * 与 transport classifyTransportIntentTarget 两站共用 `classifyFieldPathBySchema` 返此类型,杜绝手写第二份。
+ * - `leaf`:标量叶子(string/number/boolean)——set/delete-field 合法。
+ * - `container`:对象/union 容器,或 required 根数组(fills/strokes/effects)——整子树 set/delete-field = clobber 重表达,拒。
+ * - `array-element`:数组元素位置(末段 number)——by-stable-id deferred,拒 delete-field;整元素 set 拒。
+ * - `array-field`:optional 数组字段(aiWorkflow.sourceNodeIds/relations.parentIds)——delete 放行(整数组删,合法),set 拒(整数组替换 = clobber 吞 peer insert)。
+ */
+export type FieldPathTarget = 'leaf' | 'container' | 'array-element' | 'array-field'
 /**
  * DomainOp = 单 record LWW delta(§10.1;无 recordId/actor/base/opId,全 adapter/path/header 注入)。
  * 无 create(走独立 POST)/ 无 strict-tx(改 server-named)/ 无 by-id(A2 deferred,fail-visible)。
@@ -973,23 +984,51 @@ const PAYLOAD_SPECS: Record<'node' | 'edge' | 'anchor', Check> = {
   anchor: ANCHOR_WIRE_ELEMENT,
 }
 
-/** F6:递归扫 status/tasks(任意层)——返回首个命中 path(无则 null)。top-level 与 nested(relations/fills 内藏)一视同仁。 */
-const findForbiddenDeep = (value: unknown, prefix: string): string | null => {
-  if (Array.isArray(value)) {
-    for (let i = 0; i < value.length; i++) {
-      const hit = findForbiddenDeep(value[i], `${prefix}[${i}]`)
-      if (hit) return hit
+/**
+ * F6(schema-aware,lead 裁定 B):递归扫 status/tasks,但**仅在 schema 未定义该位置时**才拒;schema 合法字段(如
+ * AI_WORKFLOW.status)放行,交 validateCheck 类型校验。envelope 防线语义保留:顶层 status/tasks(node schema 未定义)
+ * 照拒、schema 未定义容器内藏匿 status(relations/layout/fills[0] 等)照拒。
+ * 地面真因:旧版任意层拒 status 把 AI_WORKFLOW.status 这类合法 schema 字段也拒了 → #256 server cutover 后 Block 1
+ *   ai-slot 占位 create(带 aiWorkflow.status)被 400 拒,slot 落库通道断(live 生产 bug)。schema-aware 后放行。
+ */
+const findForbiddenDeep = (check: Check, value: unknown, prefix: string): string | null => {
+  switch (check.t) {
+    case 'scalar':
+      return null // 标量叶,无子字段
+    case 'object': {
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+      const obj = value as Record<string, unknown>
+      for (const [k, v] of Object.entries(obj)) {
+        if (k in check.fields) {
+          // schema 定义该字段:递归下钻(合法字段如 aiWorkflow.status 不拒,交 validateCheck 类型校验)
+          const hit = findForbiddenDeep(check.fields[k] as Check, v, prefix ? `${prefix}.${k}` : k)
+          if (hit) return hit
+        } else {
+          // schema 未定义该 key:status/tasks → forbidden(藏匿 envelope/runaway 字段);其余交 validateCheck unknown-field
+          if (PAYLOAD_FORBIDDEN_FIELDS.has(k)) return prefix ? `${prefix}.${k}` : k
+        }
+      }
+      return null
     }
-    return null
-  }
-  if (value !== null && typeof value === 'object') {
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      if (PAYLOAD_FORBIDDEN_FIELDS.has(k)) return prefix ? `${prefix}.${k}` : k
-      const hit = findForbiddenDeep(v, prefix ? `${prefix}.${k}` : k)
-      if (hit) return hit
+    case 'array': {
+      if (!Array.isArray(value)) return null
+      for (let i = 0; i < value.length; i++) {
+        const hit = findForbiddenDeep(check.element, value[i], `${prefix}[${i}]`)
+        if (hit) return hit
+      }
+      return null
     }
+    case 'union': {
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+      const tagVal = (value as Record<string, unknown>)[check.tag]
+      if (typeof tagVal !== 'string') return null // tag 缺/非 string 交 validateCheck
+      const variant = check.variants[tagVal]
+      if (!variant) return null // tag 不在 variants 交 validateCheck unknown-field
+      return findForbiddenDeep(variant, value, prefix)
+    }
+    default:
+      return null
   }
-  return null
 }
 
 /** F6 递归校验结果(首个错;无则 null)。path 用点号 + 数组下标(如 fills[0].kind / generation.maskBounds.x)。 */
@@ -1080,8 +1119,9 @@ export const validateChildPayload = (
   for (const f of PAYLOAD_MIRROR_FIELDS) {
     if (f in obj) return { ok: false, body: { error: 'payload-rejected', reason: 'mirror-field', field: f } }
   }
-  // F6:status/tasks 任意层递归拒(findForbiddenDeep 在 schema 之前;top-level 与 nested relations/fills 内藏均命中)。
-  const forbiddenPath = findForbiddenDeep(obj, '')
+  // F6(schema-aware,lead 裁定 B):status/tasks 仅在 schema 未定义处拒;schema 合法字段(aiWorkflow.status)放行。
+  //   envelope 防线保留:顶层 status/tasks 照拒、schema 未定义容器内藏(relations.status / fills[0].tasks)照拒。
+  const forbiddenPath = findForbiddenDeep(PAYLOAD_SPECS[type], obj, '')
   if (forbiddenPath) {
     return { ok: false, body: { error: 'payload-rejected', reason: 'forbidden-field', field: forbiddenPath } }
   }
@@ -1091,6 +1131,60 @@ export const validateChildPayload = (
     return { ok: false, body: { error: 'payload-rejected', reason: err.reason, field: err.field } }
   }
   return { ok: true, payload: obj }
+}
+
+/**
+ * F1-ter(T2.2 Block 2 五轮):顶层 required 字段集(从 PAYLOAD_SPECS[type].required 推导,不手写第二份)。
+ * 供 server/lib/domainOp unsetByPath 的 isRequiredTopLevel 回调:删叶子后剪枝到顶层 required 字段时保留空壳
+ * (如 relations:{} —— schema required 但 RELATIONS 无 required child,空 shell 合法;防 prune 掉 required 顶层 →
+ * hydrate missing-field)。optional 顶层(asset/generation/aiWorkflow…)不在其中 → 照剪(F1-bis ② 行为不变)。
+ */
+export const requiredTopLevelFields = (type: 'node' | 'edge' | 'anchor'): readonly string[] => {
+  const spec = PAYLOAD_SPECS[type]
+  return spec.t === 'object' ? (spec.required ?? []) : []
+}
+
+/**
+ * F2-ter(T2.2 Block 2 五轮):schema-aware fieldPath 终点分类(单一真相源,生产 + transport 两站共用)。
+ * 遍历 PAYLOAD_SPECS[type] 的 Check schema 沿 fieldPath 下钻,返 FieldPathTarget:
+ *  - 末段 string 命中 required array(fills/strokes/effects:required 根数组)→ 'container'(delete/set 都拒)
+ *  - 末段 string 命中 optional array(aiWorkflow.sourceNodeIds/relations.parentIds)→ 'array-field'(delete 放行 set 拒)
+ *  - 末段 string 命中 object/union(transform/asset/relations/generation…)→ 'container'(整子树 set/delete = clobber,拒)
+ *  - 末段 string 命中 scalar(title/locked…)→ 'leaf'(set/delete-field 合法)
+ *  - 末段 number → 'array-element'(数组元素位置;delete-field 结构性拒,set 拒——整元素替换)
+ *  - 未知字段 / union 内深层(无 tag 值无法 schema 下钻)→ 'leaf'(port 对 schema 不透明处不拦未知;非法 set 由 structural/dam 兜底)
+ * 与旧手写 classifier 的差异(lead 裁定 P2-2):fills/strokes/effects 从 'array-field'(delete 放行)升 'container'
+ *   (delete/set 都拒)——required 根数组不可整体删;validateChildPayload dam 兜底保证 payload 合法。
+ */
+export const classifyFieldPathBySchema = (
+  type: 'node' | 'edge' | 'anchor',
+  fieldPath: readonly (string | number)[],
+): FieldPathTarget => {
+  let check: Check | undefined = PAYLOAD_SPECS[type]
+  for (let i = 0; i < fieldPath.length; i++) {
+    const seg = fieldPath[i]
+    const isLast = i === fieldPath.length - 1
+    if (typeof seg === 'number') {
+      // 数组元素下标:末段 → 指向元素位置 'array-element';中段 → 下钻到数组 element。
+      if (isLast) return 'array-element'
+      if (!check || check.t !== 'array') return 'leaf' // 非数组上 number 段(防御):视 leaf
+      check = check.element
+      continue
+    }
+    // string 段:仅 object 变体可 schema 下钻;scalar/array(schema 已耗尽)/union(无 tag 值无法下钻)→ 视 leaf
+    //   (port 对 schema 不透明处不拦未知;非法 set 由 structural 入口兜,非法 payload 由 validateChildPayload dam 兜底)。
+    if (!check || check.t !== 'object') return 'leaf'
+    if (!(seg in check.fields)) return 'leaf' // 未知字段:port 不拦未知,视 leaf
+    const isRequired = (check.required ?? []).includes(seg)
+    const sub: Check = check.fields[seg]
+    if (isLast) {
+      if (sub.t === 'array') return isRequired ? 'container' : 'array-field'
+      if (sub.t === 'object' || sub.t === 'union') return 'container'
+      return 'leaf' // scalar
+    }
+    check = sub // 中段:下钻
+  }
+  return 'leaf'
 }
 
 /**

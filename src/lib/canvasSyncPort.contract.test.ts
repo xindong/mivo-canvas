@@ -59,6 +59,8 @@ import {
   validateFieldIntent,
   validateFieldIntentStructural,
 } from './canvasSyncPort'
+// F2-ter(T2.2 Block 2 五轮):消灭手写 nodeClassifier,改用 shared classifyFieldPathBySchema(单一真相源)。
+import { classifyFieldPathBySchema } from '../../shared/persist-contract.ts'
 
 // ── 接口面存在且签名稳定(正向编译期断言)──────────────────────────────────
 describe('CanvasSyncPort interface surface (G1-b transport-neutral)', () => {
@@ -332,33 +334,11 @@ describe('R3-P1-1: schema-aware leaf/container classification (delete-field + at
   //  container(数组): fills / strokes / effects / markupPoints / experimentalAnchors —— 数组字段本身是数组容器;[i] 是 array-element
   //  leaf(标量): id / type / title / revision / text / fontSize / locked / hidden / favorited / ... (optional 可 delete-field)
   // 与 n20 R2-4「数组按 有 stable-id / 无 stable-id / primitive 三类冻结意图」方向对齐(G1-b 只拒,不扩 op 面)。
-  const nodeClassifier: FieldSchemaClassifier = (path) => {
-    const seg0 = path[0]
-    if (typeof seg0 === 'number') return 'array-element' // 防御(顶层不应是 number)
-    const containers = ['transform', 'relations', 'layout', 'constraints', 'asset', 'generation', 'aiWorkflow', 'annotationBounds', 'imageCrop', 'assetSourceDimensions']
-    const arrays = ['fills', 'strokes', 'effects', 'markupPoints', 'experimentalAnchors']
-    const leaves = ['id', 'type', 'title', 'revision', 'text', 'fontSize', 'textColor', 'fontWeight', 'textAlign', 'textAutoWidth', 'markupKind', 'markupBrushKind', 'markupStampKind', 'markupCornerRadius', 'sectionTitleVisible', 'sectionLockMode', 'sectionTemplateId', 'markdownDisplayMode', 'imageHasTransparency', 'sourceNodeId', 'groupId', 'locked', 'hidden', 'favorited', 'markupStartArrow', 'markupEndArrow']
-    // ③(B′,T2.2 Block 2 review):container 的数组 child(parent 是 container,child 字段是数组)→ array-field。
-    //   与生产 classifyFieldPathTarget(Array.isArray value-based)对齐:数组目标 delete 合法、set 仍拒。
-    const arrayChildrenOfContainer: Record<string, string[]> = {
-      aiWorkflow: ['sourceNodeIds'],
-      relations: ['parentIds'],
-    }
-    if (arrays.includes(seg0)) {
-      // ③(B′):数组字段本身 → array-field(delete 合法,set 仍拒;set ['fills']=[whole] 经 structural non-atomic-parent-set 拒)
-      if (path.length === 1) return 'array-field'
-      if (path.length === 2 && typeof path[1] === 'number') return 'array-element' // ['fills',0]
-      return 'leaf' // ['fills',0,'color']
-    }
-    if (containers.includes(seg0)) {
-      if (path.length === 1) return 'container' // ['transform']
-      // ③(B′):container 的数组 child → array-field(解决 aiWorkflow.sourceNodeIds 等无法整体删的契约缺口)
-      if (path.length === 2 && arrayChildrenOfContainer[seg0]?.includes(path[1] as string)) return 'array-field'
-      return 'leaf' // ['transform','x']
-    }
-    if (leaves.includes(seg0)) return 'leaf'
-    return 'leaf' // 未知字段默认 leaf(port 对 schema 不透明,不拦未知)
-  }
+  // F2-ter(T2.2 Block 2 五轮):消灭手写 nodeClassifier,改用 shared classifyFieldPathBySchema(单一真相源,与生产/transport 同实现)。
+  //   行为差异(lead 裁定 P2-2):fills/strokes/effects(required 根数组)从旧 'array-field'(delete 放行)升 'container'
+  //   (delete/set 都拒)——line 369 delete ['fills'] 由 POSITIVE 翻 NEGATIVE(见下)。其余断言(transform container /
+  //   aiWorkflow.sourceNodeIds array-field / fills[0] array-element / optional leaf delete)行为一致。
+  const nodeClassifier: FieldSchemaClassifier = (path) => classifyFieldPathBySchema('node', path)
 
   it('R3-P1-1 NEGATIVE: delete-field on required container (transform) rejected (whole-subtree delete = clobber)', () => {
     // delete ['transform'] = 删整个 transform Y.Map = 吞并发子字段(transform.y=999),clobber 重表达;封死。
@@ -366,11 +346,13 @@ describe('R3-P1-1: schema-aware leaf/container classification (delete-field + at
     expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['transform'] }, nodeClassifier)).toThrow(/container-delete-field/)
   })
 
-  it('③(B′) POSITIVE: delete-field on array root (fills) is legal — array-field delete (LWW tombstone, not clobber)', () => {
-    // ③(B′,T2.2 Block 2 review):delete ['fills'] 目标是数组字段 → array-field → delete 合法。删除是低频有意图操作,
-    //   LWW+per-field clock 下产生 tombstone、并发 peer 编辑走 stale 通知,与删整个 plain-object 容器同构。
-    //   set ['fills'] 仍拒(整数组替换 clobber,见下方 ③(B′) NEGATIVE regression)。
-    expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['fills'] }, nodeClassifier)).not.toThrow()
+  // F2-ter(T2.2 Block 2 五轮):delete ['fills'] 翻 NEGATIVE——fills 是 required 根数组,schema classifier 返 'container'
+  //   (非旧手写 'array-field');required 根数组不可整体删(整子树删 = clobber 重表达,与 transform 同质;server 侧
+  //   validateChildPayload dam 兜底保证 payload 合法)。set ['fills'] 仍拒(下方 ③(B′) NEGATIVE regression);
+  //   optional 数组 child(aiWorkflow.sourceNodeIds)delete 仍合法(下条 POSITIVE 不变)。
+  it('③(B′) NEGATIVE (F2-ter flip): delete-field on required root array (fills) rejected — container-delete-field', () => {
+    expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['fills'] }, nodeClassifier)).toThrow(FieldIntentError)
+    expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['fills'] }, nodeClassifier)).toThrow(/container-delete-field/)
   })
 
   it('③(B′) POSITIVE: delete-field on array child of container (aiWorkflow.sourceNodeIds) is legal', () => {
@@ -435,20 +417,10 @@ describe('R3-P1-1: schema-aware leaf/container classification (delete-field + at
 // 验收:1) 四负例经安全入口(任何合法公开调用 = 带 classifier)必拒;2) 省略 classifier 编译期 + 运行时双重显式失败;
 //       3) optional leaf delete + 数组 leaf set 继续放行。
 describe('R4-P1-1: classifier REQUIRED + structural split (safe entry cannot silently degrade)', () => {
-  // 与 R3 同形的 nodeClassifier(基于 NodeRecord schema;transform/fills=container,fills[0]=array-element,title=leaf)。
-  const nodeClassifier: FieldSchemaClassifier = (path) => {
-    const seg0 = path[0]
-    if (typeof seg0 === 'number') return 'array-element' // 防御(顶层不应是 number)
-    const containers = ['transform', 'relations', 'layout', 'constraints', 'asset', 'generation', 'aiWorkflow', 'annotationBounds', 'imageCrop', 'assetSourceDimensions']
-    const arrays = ['fills', 'strokes', 'effects', 'markupPoints', 'experimentalAnchors']
-    if (arrays.includes(seg0)) {
-      if (path.length === 1) return 'container'
-      if (path.length === 2 && typeof path[1] === 'number') return 'array-element'
-      return 'leaf'
-    }
-    if (containers.includes(seg0)) return path.length === 1 ? 'container' : 'leaf'
-    return 'leaf'
-  }
+  // F2-ter(T2.2 Block 2 五轮):消灭手写 nodeClassifier,改用 shared classifyFieldPathBySchema(单一真相源,与 R3 同实现)。
+  //   本 describe 四负例(delete ['transform']/['fills']/['fills',0]、set ['transform']=7)经 shared classifier 全拒
+  //   (transform/fills=container,fills[0]=array-element);optional leaf delete + 数组 leaf set 放行不变。
+  const nodeClassifier: FieldSchemaClassifier = (path) => classifyFieldPathBySchema('node', path)
 
   it('R4-P1-1 RED→GREEN: validateFieldIntentStructural exported (low-level structural, NOT a safe entry)', () => {
     // 拆分:结构性校验(空路径/非原子 set/数组元素 delete)独立成 validateFieldIntentStructural,单参 intent。

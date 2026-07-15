@@ -263,7 +263,7 @@ describe('T1.3 ServerPersistAdapter ↔ server contract 类型共享互锁(返�
     expect(scanForSensitiveFields({ data: '%6divo_encoded' })).toBe('data') // value 仍走 isCredentialValue
   })
 
-  it('F6:validateChildPayload 递归 schema——status/tasks 任意层拒;optional 类型;transform nested exact key/type', () => {
+  it('F6(schema-aware,lead 裁定 B):status/tasks 仅 schema 未定义处拒;aiWorkflow.status 放行;optional 类型;transform nested', () => {
     const base = {
       type: 'image', title: 't',
       transform: { x: 0, y: 0, width: 100, height: 100, rotation: 0 },
@@ -271,13 +271,21 @@ describe('T1.3 ServerPersistAdapter ↔ server contract 类型共享互锁(返�
     }
     // 干净 canonical → ok
     expect(validateChildPayload('node', { ...base }, 'n1').ok).toBe(true)
-    // status/tasks 任意层递归拒:relations 内藏 status → forbidden-field path=relations.status
+    // F6 schema-aware(lead 裁定 B):aiWorkflow.status 是 AI_WORKFLOW schema 合法字段 → 放行(不 forbidden)。
+    //   生产 bug 回归:#256 server cutover 后 Block 1 ai-slot 占位 create(带 aiWorkflow.status)旧版被 400 拒;schema-aware 后放行。
+    const fAi = validateChildPayload('node', { ...base, aiWorkflow: { kind: 'slot', status: 'empty', sourceNodeIds: ['n2'], prompt: 'p' } }, 'n1')
+    expect(fAi.ok).toBe(true) // ★ aiWorkflow.status 放行(create 路由不再 400)
+    // envelope 防线仍立:relations 内藏 status(schema 未定义)→ forbidden-field path=relations.status
     const f1 = validateChildPayload('node', { ...base, relations: { status: 'ready' } }, 'n1')
     expect(f1.ok).toBe(false)
     if (!f1.ok) expect(f1.body).toMatchObject({ reason: 'forbidden-field', field: 'relations.status' })
-    // tasks 嵌套在 fills item → forbidden-field(fills[0].tasks)
-    const f2 = validateChildPayload('node', { ...base, fills: [{ tasks: [] }] }, 'n1')
-    if (!f2.ok) expect(f2.body.reason).toBe('forbidden-field')
+    // layout 内藏 status(schema 未定义:layout 字段是 mode/direction/gap/padding,无 status)→ forbidden-field(envelope 防线)
+    const fLay = validateChildPayload('node', { ...base, layout: { mode: 'auto', status: 'ready' } }, 'n1')
+    expect(fLay.ok).toBe(false)
+    if (!fLay.ok) expect(fLay.body).toMatchObject({ reason: 'forbidden-field', field: 'layout.status' })
+    // tasks 嵌套在 fills item(schema-aware:fill 元素须带 kind 选 variant,variant solid 的 fields 不含 tasks)→ forbidden-field(fills[0].tasks)
+    const f2 = validateChildPayload('node', { ...base, fills: [{ kind: 'solid', tasks: [] }] }, 'n1')
+    if (!f2.ok) expect(f2.body).toMatchObject({ reason: 'forbidden-field', field: 'fills[0].tasks' })
     // optional 类型校验:fontSize:'x' → bad-type
     const f3 = validateChildPayload('node', { ...base, fontSize: 'x' }, 'n1')
     if (!f3.ok) expect(f3.body).toMatchObject({ reason: 'bad-type', field: 'fontSize' })

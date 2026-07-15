@@ -6,10 +6,9 @@ import type {
   CanvasChange,
   CanvasSyncPort,
   FieldIntent,
-  FieldPath,
-  FieldPathTarget,
 } from '../../lib/canvasSyncPort'
 import { FieldIntentError, validateFieldIntent } from '../../lib/canvasSyncPort'
+import { classifyFieldPathBySchema } from '../../../shared/persist-contract.ts'
 import { abortPendingCanvasSyncCreate, getCanvasSyncPort } from '../../lib/canvasSyncPortClient'
 import { isLocalPersist } from '../../lib/persistMode'
 import { enqueueAssetAttach, enqueueAssetDetach, serverAssetIdFromUrl } from '../../lib/assetAttachWiring'
@@ -38,37 +37,12 @@ const cloneValue = <T>(value: T): T => {
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
 
-const readValueAtPath = (record: Record<string, unknown>, fieldPath: FieldPath): unknown => {
-  let current: unknown = record
-  for (const segment of fieldPath) {
-    if (Array.isArray(current) && typeof segment === 'number') {
-      current = current[segment]
-      continue
-    }
-    if (!isPlainObject(current) || typeof segment !== 'string') return undefined
-    current = current[segment]
-  }
-  return current
-}
-
-const classifyFieldPathTarget = (
-  beforeRecord: Record<string, unknown>,
-  afterRecord: Record<string, unknown>,
-  fieldPath: FieldPath,
-): FieldPathTarget => {
-  const last = fieldPath[fieldPath.length - 1]
-  if (typeof last === 'number') return 'array-element'
-  const nextValue = readValueAtPath(afterRecord, fieldPath)
-  // ③(B′,T2.2 Block 2 review):数组目标单独 'array-field'(与 plainObject 'container' 区分)——delete 合法
-  //   (validateFieldIntent 放行 array-field delete,set 仍拒)。解决 aiWorkflow 含 sourceNodeIds 等数组 child
-  //   无法 leaf-delete(被当 container-delete 拒)的契约缺口。
-  if (Array.isArray(nextValue)) return 'array-field'
-  if (isPlainObject(nextValue)) return 'container'
-  const prevValue = readValueAtPath(beforeRecord, fieldPath)
-  if (Array.isArray(prevValue)) return 'array-field' // after 缺失(被删)但 before 是数组 → array-field
-  if (isPlainObject(prevValue)) return 'container'
-  return 'leaf'
-}
+// F2-ter(T2.2 Block 2 五轮):生产 classifier 改用 shared classifyFieldPathBySchema(单一真相源,与 transport 同实现)。
+//   旧 value-based classifier(看 before/after 实际值判 array/container)废弃——schema 分类是结构性的,不需运行时值;
+//   唯一行为差异(lead 裁定 P2-2):fills/strokes/effects(required 根数组)从 'array-field'(delete 放行)升 'container'
+//   (delete/set 都拒)——required 根数组不可整体删,validateChildPayload dam 兜底保证 payload 合法。
+const typeOfChangeKind = (changeKind: 'edit-node' | 'edit-edge' | 'edit-anchor'): 'node' | 'edge' | 'anchor' =>
+  changeKind === 'edit-node' ? 'node' : changeKind === 'edit-edge' ? 'edge' : 'anchor'
 
 const valuesEqual = (left: unknown, right: unknown): boolean => {
   if (Object.is(left, right)) return true
@@ -200,8 +174,6 @@ const intentsForRecord = (
 const filterValidIntents = (
   changeKind: 'edit-node' | 'edit-edge' | 'edit-anchor',
   recordId: string,
-  beforeRecord: Record<string, unknown>,
-  afterRecord: Record<string, unknown>,
   intents: FieldIntent[],
 ): FieldIntent[] => {
   const valid: FieldIntent[] = []
@@ -209,7 +181,7 @@ const filterValidIntents = (
     try {
       validateFieldIntent(
         intent,
-        (fieldPath) => classifyFieldPathTarget(beforeRecord, afterRecord, fieldPath),
+        (fieldPath) => classifyFieldPathBySchema(typeOfChangeKind(changeKind), fieldPath),
       )
       valid.push(intent)
     } catch (error) {
@@ -261,8 +233,6 @@ export const buildCanvasSyncChanges = (before: SyncSnapshot, after: SyncSnapshot
     const intents = filterValidIntents(
       'edit-node',
       recordId,
-      prev as unknown as Record<string, unknown>,
-      next as unknown as Record<string, unknown>,
       intentsForRecord(prev as unknown as Record<string, unknown>, next as unknown as Record<string, unknown>),
     )
     if (intents.length > 0) changes.push({ kind: 'edit-node', nodeId: recordId, intents })
@@ -282,8 +252,6 @@ export const buildCanvasSyncChanges = (before: SyncSnapshot, after: SyncSnapshot
     const intents = filterValidIntents(
       'edit-edge',
       recordId,
-      prev as unknown as Record<string, unknown>,
-      next as unknown as Record<string, unknown>,
       intentsForRecord(prev as unknown as Record<string, unknown>, next as unknown as Record<string, unknown>),
     )
     if (intents.length > 0) changes.push({ kind: 'edit-edge', edgeId: recordId, intents })
@@ -303,8 +271,6 @@ export const buildCanvasSyncChanges = (before: SyncSnapshot, after: SyncSnapshot
     const intents = filterValidIntents(
       'edit-anchor',
       recordId,
-      prev as unknown as Record<string, unknown>,
-      next as unknown as Record<string, unknown>,
       intentsForRecord(prev as unknown as Record<string, unknown>, next as unknown as Record<string, unknown>),
     )
     if (intents.length > 0) changes.push({ kind: 'edit-anchor', anchorId: recordId, intents })
