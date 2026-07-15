@@ -25,10 +25,12 @@
 import { createHash } from 'node:crypto'
 import type {
   Envelope,
+  PayloadRejectedBody,
   PersistScope,
   PersistType,
   Revision,
 } from '../../shared/persist-contract.ts'
+import { requiredTopLevelFields, validateChildPayload } from '../../shared/persist-contract.ts'
 import {
   fieldKeyOf,
   setByPath,
@@ -108,6 +110,11 @@ export type ApplyDomainOpsResult =
   | { kind: 'not-found' }
   | { kind: 'cross-canvas' }
   | { kind: 'reuse-conflict' }
+  // F1-ter(T2.2 Block 2 五轮):post-apply schema 校验堤坝 — commit 前 validateChildPayload 对 mutated payload
+  //   递归白名单校验;非法(required 顶层被掏空 / set ['type']='bogus' bad-type / required child 缺失 / unknown-field)
+  //   → 返 payload-rejected(fail-visible,不 bump fieldClocks、不 set record,无 partial commit)。
+  //   route patchDomainChild map → 400 payload-rejected(同 create 路径 validateChildPayload 400 body 形状)。
+  | { kind: 'payload-rejected'; body: PayloadRejectedBody }
 /**
  * createChild 结果(POST /:id/nodes/:nodeId client-id path,§10.2)。
  * - created:201/200,返 seq+fieldClocks(空,供 route encodeBase 签发新 base)。
@@ -1366,6 +1373,13 @@ export class InMemoryPersistBackend implements PersistBackend {
     const snapshot = clone(existing)
     const overwritten: OverwrittenNotice[] = []
     const updatedPayload = clone(existing.payload) as Record<string, unknown>
+    // F1-ter:unsetByPath 顶层 required 空壳保留回调(从 schema 推导,不手写第二份)。
+    //   relations 删尽 parentIds → relations:{} 保留(required 顶层,空 shell 合法);optional 顶层照剪。
+    const childType: 'node' | 'edge' | 'anchor' | undefined =
+      type === 'node' || type === 'edge' || type === 'anchor' ? type : undefined
+    const requiredFields = childType === undefined ? undefined : requiredTopLevelFields(childType)
+    const isRequiredTopLevel: ((key: string) => boolean) | undefined =
+      requiredFields === undefined ? undefined : (key: string): boolean => requiredFields.includes(key)
     const toBump: string[] = []
     const seenFields = new Set<string>() // 同 field 多 op 只判一次 overwritten(§14.1 前写者通知不重复)
     try {
@@ -1393,7 +1407,7 @@ export class InMemoryPersistBackend implements PersistBackend {
         if (op.kind === 'set') {
           setByPath(updatedPayload, fieldPath, op.value)
         } else if (op.kind === 'unset') {
-          unsetByPath(updatedPayload, fieldPath)
+          unsetByPath(updatedPayload, fieldPath, { isRequiredTopLevel })
         } else if (op.kind === 'array') {
           if (op.class === 'whole-lww') {
             // markupPoints(无 stable-id)整值替换(allowContainerClobber:整数组替换是 intent)。
@@ -1412,6 +1426,14 @@ export class InMemoryPersistBackend implements PersistBackend {
           }
         }
         toBump.push(fkey)
+      }
+      // F1-ter(T2.2 Block 2 五轮):post-apply schema 校验堤坝 — commit 前对 mutated updatedPayload 跑
+      //   validateChildPayload(逐 type 递归白名单);非法(required 顶层被掏空 / set ['type']='bogus' /
+      //   required child 缺失 / unknown-field / bad-type)→ 返 payload-rejected,fail-visible 不 commit
+      //   (不 bump fieldClocks、不 set record;updatedPayload 是 clone,existing 未触,无 partial)。
+      if (childType !== undefined) {
+        const damCheck = validateChildPayload(childType, updatedPayload, recordId)
+        if (!damCheck.ok) return { kind: 'payload-rejected', body: damCheck.body }
       }
       // 全 op apply 成功 → 统一 bump fieldClocks + 写 record(原子;throw 前未 mutate fieldClocks 内部 Map)。
       for (const fkey of toBump) this.bumpFieldClock(rk, fkey, opts.actor)
