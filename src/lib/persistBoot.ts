@@ -99,16 +99,18 @@ export const getHydratedUserState = (key: string): UserStateEntry | undefined =>
 // 故 hydrate 内**不能**直接 enqueue。解:hydrate 检测迁移条件(**marker 未种** + 本地有 local-only)→
 // 按资源差集(candidates = 本地 id 不在服务端列表)把 createProject/createCanvas op 收集进
 // pendingServerMigrationOps;bootPersistWiring 在 startPersistWriteQueue 之后调 flushServerMigration
-// (此时 queue 已启动 → 真 enqueue,combineOps 去重 + idempotencyKey minting 全生效)→ 种 marker → drain。
+// (此时 queue 已启动 → 真 enqueue,combineOps 去重 + idempotencyKey minting 全生效)→ eager drain →
+// **drain 后逐 candidate 验证可恢复性——全部可恢复才种 marker(F1;详见 flushServerMigration)**。
 //
 // onConflict re-hydrate(mid-session)永不命中迁移分支:409 蕴含 marker 已 set(boot flush 后)→
-// `!marker` false → 走 else(现行为 replace + union-merge + #254 C 过滤)。迁移只在 boot(marker 未种)触发。
+// `!marker` false → 走 else(现行为 replace + pending-create 并集 + union-merge + #254 C 过滤)。迁移只在 boot(marker 未种)触发。
 //
 // 幂等:marker(localStorage 按 userId 分区)跨 boot 防重迁;combineOps 同 resourceKey 去重防同 boot 内
-// 重复 enqueue;差集过滤(已在服务端的 id 不入队)+ marker 双保险:首次迁移 drain 成功后 marker 已种 →
-// 下次 boot `!marker` false → 不再迁移。三重防护使得 marker seed 时机(在 enqueue 后)即使被 boot 崩溃
-// 跳过也安全:下次 boot 若 marker 仍未种 + 本地有 local-only → 再收集,combineOps 与 IDB 仍 pending 的
-// 首次记录去重(无重复 server 写)。
+// 重复 enqueue;差集过滤(已在服务端的 id 不入队)。**F1 marker-seed 时机(2026-07-15 r3 返修,Greptile
+// 线程4)**:marker 不在 enqueue 落 IDB 后即种,而在 drain 后验证全部 candidate 可恢复(on server 或 pending
+// in durable queue)才种。terminal 残根(部分 create 4xx rejected)→ 不种 marker,下次 boot 差集重收集 +
+// combineOps 与 IDB 仍 pending 的首次记录去重(无重复 server 写)+ terminal 记录已离队 → 天然重试。即便
+// drain 后、种 marker 前崩 → marker 仍未种 + 本地 union 仍在(不丢),下次 boot 再收集,安全。
 //
 // **差集迁移 vs 旧版「server 空才迁」(Greptile 线程1 数据丢失修复)**:旧版迁移只在 `projects.length===0`
 // 触发,多设备用户第二台浏览器首启时服务端已非空 → else 整替换 store.projects → 本地独有(legacy local 模式)
@@ -116,7 +118,9 @@ export const getHydratedUserState = (key: string): UserStateEntry | undefined =>
 // 无论 server 空或非空,setState = C 过滤后服务端列表 ∪ candidates(local-only 保留可见,正在上迁)+ 为
 // candidates 收集 create op。已知有界局限(代码注释 + PR body):某浏览器首启若发生在「用户已在别处删除某项目」
 // 之后,差集迁移会把该项目重新建回(复活)——窗口仅每浏览器首启一次,与「永久丢数据」相比取复活(可再删,可恢复);
-// marker 种下后不再发生。marker set → 完全现行为(server 真值 replace + C 过滤;线程1 场景在 marker 后收敛)。
+// marker 种下后不再发生。marker set → 现行为(server 真值 replace + C 过滤 + **F2 pending-create 并集保护**;
+// 线程1 场景在 marker 后收敛)。**F2(线程4)**:marker 已种但 creates 仍 pending 于队列时刷新,纯 replace 会丢
+// pending creates + persist 回写永久丢失;修:replace 并集本地 pending-create projects(canvas union-merge 已保留 local-only,不动)。
 const pendingServerMigrationOps: WriteOp[] = []
 
 /** marker 物理 key(按 userId 分区;anonymous namespace 与 authenticated 互不可见,同 persistUserId)。 */
@@ -161,17 +165,42 @@ const clearAllServerMigrationMarkers = (): void => {
 /**
  * D2:flush hydrate 收集的迁移 op(bootPersistWiring 在 startPersistWriteQueue 之后调)。
  * queue singleton 此时已启动 → enqueuePersistWrite 真 enqueue(combineOps 去重 + overflow +
- * idempotencyKey 全生效);enqueue 落地后种 marker(跨 boot 防重迁);eager drain 让上迁即时发出
- * (不等 5s timer)。失败 fail-visible:enqueue 失败经 enqueuePersistWrite 内 debugLogger.error;
- * drain 终态失败(rejected/terminal)经 writeRetryQueue drain switch debugLogger.error + recordTerminal
- * 留账(docs/development-logging.md,不静默)。成功/跳过路径亦打 log(D4)。
+ * idempotencyKey 全生效);eager drain 让上迁即时发出(不等 5s timer)。失败 fail-visible:enqueue
+ * 失败经 enqueuePersistWrite 内 debugLogger.error;drain 终态失败(rejected/terminal)经 writeRetryQueue
+ * drain switch debugLogger.error + recordTerminal 留账(docs/development-logging.md,不静默)。
+ * 成功/跳过路径亦打 log(D4)。
  *
- * 注:即使 enqueue 后、种 marker 前崩 → 下次 boot 再收集时 combineOps 与 IDB 仍 pending 的首次记录
- * 去重(无重复 server 写);首次记录已 drain 成功 → server 非空 → 下次 boot 不进迁移分支。安全。
+ * **F1 marker-seed 时机(2026-07-15 r3 返修,Greptile 线程4 数据丢失残根)**:marker 不再在 enqueue
+ * 落 IDB 后即种,而是 **drain 完成后逐 candidate 做可恢复性验证——全部可恢复才种**。否则若部分
+ * create 终态失败(如 p2 4xx rejected,p1 成功),enqueue 后即种 marker → 下次 boot server 非空 +
+ * marker 已种 → 走 replace 分支丢 p2 + zustand persist 回写永久丢失。修:drain 后重新拉取
+ * adapter.listProjects/listCanvas + getPendingCreateResourceIds,对每个 candidate id 判定——
+ * 在服务端(drain 成功)或仍在队列 pending(durable,后续 timer drain)均算"可恢复";既不在服务端
+ * 也不在队列 = 终态失败 → 本轮**不种 marker**(下次 boot 差集重收集,combineOps 与残留记录去重,
+ * 天然重试)+ debugLogger.error 出声(D4)。全部可恢复 → 种 marker。
+ *
+ * 注:即使 drain 后、种 marker 前崩 → marker 仍未种 + 本地 union 仍在(不丢);下次 boot 再收集时
+ * combineOps 与 IDB 仍 pending 的首次记录去重(无重复 server 写);首次记录已 drain 成功 → server 非空
+ * → 下次 boot 不进迁移分支。安全(与旧版 enqueue-后-即种 相同的崩溃安全,但堵住了 terminal 残根)。
+ *
+ * @param adapter 与 hydrate 同源 adapter(bootPersistWiring 传入,不另起获取通道);测试注入 fake。
  */
-const flushServerMigration = async (): Promise<void> => {
+const flushServerMigration = async (
+  adapter: ReturnType<typeof getServerPersistAdapter> = getServerPersistAdapter(),
+): Promise<void> => {
   const ops = pendingServerMigrationOps.splice(0)
   if (ops.length === 0) return
+  // F1:capture candidate ids for post-drain recoverability verification(marker-seed 前置数据)。
+  const projectCandidates: string[] = []
+  const canvasCandidates: string[] = []
+  for (const op of ops) {
+    if (op.kind === 'createProject') {
+      const id = (op as { id?: string }).id
+      if (id) projectCandidates.push(id)
+    } else if (op.kind === 'createCanvas') {
+      canvasCandidates.push(op.canvasId)
+    }
+  }
   let enqueued = 0
   for (const op of ops) {
     const p = enqueuePersistWrite(op)
@@ -184,16 +213,15 @@ const flushServerMigration = async (): Promise<void> => {
       continue
     }
     try {
-      await p // 等 IDB putWrite 落地(durable)→ marker 种在 durable 之后,幂等
+      await p // 等 IDB putWrite 落地(durable)
       enqueued++
     } catch {
       // enqueuePersistWrite 内已 debugLogger.error 吞 + 记;此处不重记(避免双 log)
     }
   }
-  seedServerMigrationMarker()
   debugLogger.log(
     SOURCE,
-    `server migration-on-boot: ${enqueued}/${ops.length} op(s) enqueued + marker seeded; draining eagerly`,
+    `server migration-on-boot: ${enqueued}/${ops.length} op(s) enqueued; draining eagerly before marker verification`,
   )
   // eager drain:让迁移 op 即时发出(不等 5s timer);drain 终态失败由 drain switch fail-visible。
   try {
@@ -201,9 +229,73 @@ const flushServerMigration = async (): Promise<void> => {
   } catch (error) {
     debugLogger.warn(SOURCE, `migration eager drain failed: ${msg(error)} (ops remain in IDB queue; next timer drain will retry)`)
   }
+  // F1:post-drain 可恢复性验证——全部 candidate 可恢复(on server 或 pending in durable queue)才种 marker。
+  //   terminal 残根(如 4xx rejected)→ 既不在服务端也不在队列 → 不种 marker + error 出声;下次 boot 差集
+  //   重收集 + combineOps 去重 + terminal 记录已离队 → 天然重试(不重复 server 写)。堵"enqueue 后即种
+  //   marker → 下次 boot replace 丢 terminal-failed local + persist 回写永久丢失"残根。
+  let allRecoverable: boolean
+  try {
+    allRecoverable = await verifyMigrationCandidatesRecoverable(adapter, projectCandidates, canvasCandidates)
+  } catch (error) {
+    // 验证拉取失败(如 adapter 瞬时不可用)→ fail-closed:不种 marker,下次 boot 重验(ops 已 durable 入队,
+    //   不丢;下次 boot 差集重收集时 on-server 的 id 不再候选,无重复 server 写)。
+    debugLogger.warn(SOURCE, `migration recoverability verification failed: ${msg(error)}; marker NOT seeded (fail-closed; next boot re-verifies)`)
+    allRecoverable = false
+  }
+  if (allRecoverable) {
+    seedServerMigrationMarker()
+    debugLogger.log(
+      SOURCE,
+      `server migration-on-boot: all ${projectCandidates.length + canvasCandidates.length} candidate(s) recoverable (on server or pending in durable queue); marker seeded`,
+    )
+  }
+  // allRecoverable===false:marker deliberately NOT seeded this round(verifyMigrationCandidatesRecoverable
+  //   已 per-failure error 留痕;下次 boot 差集重收集 + 天然重试)。
 }
 
-/** 测试用:驱动迁移 flush(等价 bootPersistWiring 在 startPersistWriteQueue 后调 flush)。 */
+/**
+ * F1:drain 后逐 candidate 验证可恢复性。candidate 可恢复 = 在服务端(drain 成功)或仍在 durable 队列
+ * pending(后续 timer drain 重试)。既不在服务端也不在队列 = 终态失败(rejected/terminal 已 recordTerminal
+ * 离队)。terminal-failed candidate → 返 false + debugLogger.error(D4,不静默)。空 candidate(无迁移 op)
+ * → true(marker 正常种)。
+ */
+const verifyMigrationCandidatesRecoverable = async (
+  adapter: ReturnType<typeof getServerPersistAdapter>,
+  projectCandidates: string[],
+  canvasCandidates: string[],
+): Promise<boolean> => {
+  if (projectCandidates.length === 0 && canvasCandidates.length === 0) return true
+  const [{ projects }, { canvases }, pendingProjectCreates, pendingCanvasCreates] = await Promise.all([
+    adapter.listProjects(),
+    adapter.listCanvas(),
+    getPendingCreateResourceIds('createProject'),
+    getPendingCreateResourceIds('createCanvas'),
+  ])
+  const serverProjectIds = new Set(projects.map((p) => p.id))
+  const serverCanvasIds = new Set(canvases.map((c) => c.id))
+  let failed = 0
+  for (const id of projectCandidates) {
+    if (serverProjectIds.has(id)) continue // drain 成功 → 在服务端
+    if (pendingProjectCreates.has(id)) continue // 仍 pending in durable queue → 后续 timer drain
+    failed++
+    debugLogger.error(
+      SOURCE,
+      `migration candidate createProject ${id} terminally failed (neither on server nor pending in durable queue); marker NOT seeded this boot — next boot will re-collect and retry`,
+    )
+  }
+  for (const id of canvasCandidates) {
+    if (serverCanvasIds.has(id)) continue
+    if (pendingCanvasCreates.has(id)) continue
+    failed++
+    debugLogger.error(
+      SOURCE,
+      `migration candidate createCanvas ${id} terminally failed (neither on server nor pending in durable queue); marker NOT seeded this boot — next boot will re-collect and retry`,
+    )
+  }
+  return failed === 0
+}
+
+/** 测试用:驱动迁移 flush(等价 bootPersistWiring 在 startPersistWriteQueue 后调 flush;adapter 同源注入)。 */
 export const __flushServerMigrationForTest = flushServerMigration
 
 /**
@@ -501,11 +593,16 @@ export const hydrateFromServer = async (
   //    为 candidates 收集 createProject op(已在服务端的 id 不重复入队 SC-G)。**keep-local 与 enqueue 解耦**:
   //    即便迁移 terminal 失败,本地 union 仍在(不丢);marker flush 后种。不复活:server 模式删项目时 store
   //    已乐观移除,本地 candidates 均为 live,不经 pending-delete 过滤(同旧版迁移分支)。
-  //    marker set → 完全现行为(server 真值 replace + C 过滤;线程1 场景在 marker 后收敛 SC-H)。
+  //    marker set → 现行为(server 真值 replace + C 过滤 + **F2 pending-create 并集保护**;线程1 场景在 marker 后收敛 SC-H)。
+  //    **F2(2026-07-15 r3 返修,Greptile 线程4)**:marker 已种但 creates 仍 pending 于队列时刷新页面,纯 replace
+  //    会丢 local-only pending creates + zustand persist 回写永久丢失。修:replace 时并集本地 pending-create
+  //    projects(对称于 C pending-delete 过滤;canvas 侧 union-merge 本就保留 local-only,无需动)。
+  //    "keep-local 解耦不丢"在 marker-set 分支的适用范围 = 仅 pending-create 集合(!marker 分支 = 全 local-only 差集)。
   try {
-    const [{ projects }, pendingDeleteProjectIds] = await Promise.all([
+    const [{ projects }, pendingDeleteProjectIds, pendingCreateProjectIds] = await Promise.all([
       adapter.listProjects(),
       getPendingDeleteResourceIds('deleteProject'),
+      getPendingCreateResourceIds('createProject'),
     ])
     const filteredProjects = pendingDeleteProjectIds.size === 0
       ? projects
@@ -529,7 +626,7 @@ export const hydrateFromServer = async (
         `server hydrate: ${filteredProjects.length} server project(s)${candidates.length > 0 ? ` + ${candidates.length} local-only candidate(s) kept (union; createProject ops collected for migration-on-boot)` : ' (replaced local)'}${projects.length === 0 && localProjects.length > 0 ? ' [server empty, local retained]' : ''}`,
       )
     } else {
-      // marker 已种 → 完全现行为(服务端真值 replace + C 过滤)。线程1 场景在 marker 后收敛(SC-H)。
+      // marker 已种 → 现行为(服务端真值 replace + C 过滤)+ F2 pending-create 并集保护。
       if (projects.length === 0 && localProjects.length > 0) {
         // server 空 + 本地有(marker set = 曾迁移;creates 在 IDB queue pending 或 terminal 失败)→ 保留本地,
         //   不 re-enqueue(marker)。pending creates 经 queue timer drain;terminal 失败 fail-visible(D4)。
@@ -538,11 +635,17 @@ export const hydrateFromServer = async (
           `server hydrate: server empty + ${localProjects.length} local project(s) but migration marker set → keep local, skip re-enqueue (prior migration pending/failed; queue drains pending)`,
         )
       } else {
-        useCanvasStore.setState({ projects: filteredProjects })
+        // F2:replace = C 过滤后服务端列表 ∪ 本地 pending-create projects(防 marker 已种 + creates 仍 pending
+        //   时刷新丢;已在服务端的 id 不重复加,防 double)。
+        const filteredIds = new Set(filteredProjects.map((p) => p.id))
+        const localPendingCreates = pendingCreateProjectIds.size === 0
+          ? []
+          : localProjects.filter((p) => pendingCreateProjectIds.has(p.id) && !filteredIds.has(p.id))
+        useCanvasStore.setState({ projects: [...filteredProjects, ...localPendingCreates] })
         const droppedProjects = projects.length - filteredProjects.length
         debugLogger.log(
           SOURCE,
-          `server hydrate: ${filteredProjects.length} project(s) from BFF (replaced local${droppedProjects > 0 ? `; ${droppedProjects} filtered as pending-delete not-yet-drained (anti-resurrection)` : ''})`,
+          `server hydrate: ${filteredProjects.length} project(s) from BFF (replaced local${droppedProjects > 0 ? `; ${droppedProjects} filtered as pending-delete not-yet-drained (anti-resurrection)` : ''}${localPendingCreates.length > 0 ? `; ${localPendingCreates.length} local pending-create(s) retained (anti-drop F2)` : ''})`,
         )
       }
     }
@@ -961,14 +1064,18 @@ export const bootPersistWiring = async (opts: FetchAdapterOptions = getProductio
     return
   }
   if (getPersistMode() === 'server') {
-    await hydrateFromServer(undefined, opts)
+    // F1:与 hydrate 同源 adapter(单获取通道;flush 在 drain 后需重拉 listProjects/listCanvas 做可恢复性
+    //   验证,复用此 adapter,不另起第二条获取通道;getServerPersistAdapter 返单例)。
+    const adapter = getServerPersistAdapter()
+    await hydrateFromServer(adapter, opts)
     await startPersistWriteQueue(opts)
     // D2:flush hydrate 收集的迁移 op(server 空 + 本地存量 → createProject/createCanvas 上迁)。
     //   必须在 startPersistWriteQueue 之后(queue singleton 已启动 → enqueuePersistWrite 真 enqueue)。
     //   无迁移 op 时(pendingServerMigrationOps 空)flush 内 splice 后 length===0 → 直接 return,零开销。
+    //   F1:flush 在 drain 后验证可恢复性——全可恢复才种 marker(堵 terminal 残根;详见 flushServerMigration)。
     //   local 在 bootPersistWiring 第一行 return 短路,永不达此。
     if (pendingServerMigrationOps.length > 0) {
-      await flushServerMigration()
+      await flushServerMigration(adapter)
     }
     // A2-S3 block 8:启动 scene 切换 re-hydrate 订阅(切到新 server 画布 → fetchCanvas 补 content;
     // 去重 + in-flight 防并发)。local 在 bootPersistWiring 第一行 return 短路,永不调此。
