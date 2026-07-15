@@ -393,6 +393,15 @@ export type QueuedWrite = {
   lastAttemptAt?: number
   /** F1:gate-blocked 退避计数(独立于 attempts/maxAttempts;旧 IDB 记录无此字段 → undefined → 0)。 */
   gateAttempts?: number
+  /**
+   * F2(T2.2 Block 2 review):持久单调 seq,作 drain 排序的显式第三 tie-break(主键 nextAttemptAt、次键 createdAt
+   * 之后的第三键),替代原"stable sort 保留 IDB getAll 入队序"的隐式 tie-break —— IDB store keyPath='id'(UUID),
+   * reload 后 getAll 按 UUID 主键返回(随机序)→ 同毫秒的 attach B/detach B 可被逆序执行成 [detach,attach] →
+   * B ref 永久残留(stale ref)。seq 入队时从 max(已存 seq)+1 派生(单调,顺序入队保证意图序),持久化于 record,
+   * reload 后仍生效。旧 IDB 记录无此字段 → undefined → 排序时 `?? 0`(fail-safe,与 gateAttempts 同 migration-on-read
+   * 模式,不许 NaN 排序;旧记录 seq=0 先于新记录 seq≥1,保持旧→新序)。
+   */
+  seq?: number
 }
 
 // ── Executor seam (T1.3 plugs the real fetch here) + outcome classification ──
@@ -548,10 +557,13 @@ export const isDeleteKind = (kind: WriteOpKind): boolean =>
  */
 const stableTopologicalSort = (due: QueuedWrite[]): QueuedWrite[] => {
   // 原序:主键 nextAttemptAt(退避到期先发)+ 次键 createdAt(同 nextAttemptAt 时先入队先发)。
-  // stable sort 保留 IDB getAll 入队序作隐式第三 tie-break(同主键时不动相对位置)。
+  // F2(T2.2 Block 2 review):第三键 seq(持久单调,入队时打)替代原"stable sort 保留 IDB getAll 入队序"的
+  //   隐式 tie-break —— IDB store keyPath='id'(UUID),reload 后 getAll 按 UUID 主键返回随机序,同毫秒的
+  //   attach B/detach B 可被逆序执行成 [detach,attach] → B ref 永久残留。seq 使排序按入队意图序确定化。
+  //   旧 IDB 记录缺 seq → ?? 0(fail-safe,不许 NaN;旧记录 seq=0 先于新记录 seq≥1,保持旧→新序)。
   const ordered = due
     .slice()
-    .sort((a, b) => a.nextAttemptAt - b.nextAttemptAt || a.createdAt - b.createdAt)
+    .sort((a, b) => a.nextAttemptAt - b.nextAttemptAt || a.createdAt - b.createdAt || (a.seq ?? 0) - (b.seq ?? 0))
 
   // 建批内 parent-create 索引:project id / canvas id → 该 create 在 ordered 中的 index(首个)。
   // 同 id 取首个保证确定性(create+create 同 id 生产流不发生;combineOps 已把 create+update 合并保留
@@ -1603,7 +1615,7 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
     if (active.length >= maxQueue) {
       const pending = active
         .filter((r) => r.status === 'pending')
-        .sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : 1))
+        .sort((a, b) => a.createdAt - b.createdAt || (a.seq ?? 0) - (b.seq ?? 0) || (a.id < b.id ? -1 : 1))
       const oldest = pending[0]
       if (oldest) {
         await deleteWrite(oldest.id)
@@ -1647,6 +1659,10 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
       createdAt: ts,
       attempts: 0,
       nextAttemptAt: ts,
+      // F2(T2.2 Block 2 review):持久单调 seq = max(已存 record 的 seq)+1(复用上方 getAllWrites 的 all 快照;
+      // 顺序入队保证意图序;A→B 一 mutation 内 detach A+attach B 跨 key 并发可能同 seq,但 ops 可交换无害)。
+      // drain 排序第三键,防 reload 后 IDB getAll 随机序致 attach B/detach B 逆序留 stale ref。旧 record 缺 seq → ??0。
+      seq: all.reduce((max, r) => Math.max(max, r.seq ?? 0), 0) + 1,
       status: 'pending',
     }
     await putWrite(record)
