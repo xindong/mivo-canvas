@@ -46,6 +46,12 @@ import type {
 type LayerMove = 'forward' | 'backward' | 'front' | 'back'
 export type SelectionAlignment = 'left' | 'center' | 'right' | 'top' | 'middle' | 'bottom'
 export type DistributionAxis = 'horizontal' | 'vertical'
+/**
+ * T2.2 Block 1 F1:scene-scoped sync 回调类型。caller(无环层)注入 wrapMutationForScene 的适配,
+ * generationSlice 调用它把 catch 内 slot 删除包进 before/after diff → server 模式发 delete-node。
+ */
+export type SceneScopedMutate = (targetSceneId: string, mutate: () => void) => void
+
 export type CanvasGenerationOptions = {
   sceneId?: CanvasId
   createDerivationEdge?: boolean
@@ -54,6 +60,14 @@ export type CanvasGenerationOptions = {
   model?: string
   referenceFiles?: File[]
   signal?: AbortSignal
+  /**
+   * T2.2 Block 1 F1:scene-scoped sync 注入点。generateIntoAiSlot catch 删 slot 经此回调 → server 模式
+   * delete-node;未注入/local → pass-through 仍删(行为不退)。为何注入而非静态 import:generationSlice 由
+   * canvasStore 组合,静态 import canvasSyncRuntime(canvas/actions)成 store→canvas→store 环;改由
+   * generationFacade(无环)注入回调,generationSlice 只调回调不引环。运行期 options(同 referenceFiles/signal
+   * 非序列化),不进序列化 command options。
+   */
+  onSceneMutation?: SceneScopedMutate
 }
 export type SelectionArrangeMode = 'row' | 'column' | 'grid' | 'tidy'
 export type BrushStyle = {

@@ -39,7 +39,15 @@ export const generationFacade = {
     options?: Parameters<CanvasState['generateIntoAiSlot']>[2],
   ) => {
     const skipSlotHistoryBaseline = Boolean(slotId && freshlyCreatedChatSlots.delete(slotId))
-    const nextOptions = skipSlotHistoryBaseline ? { ...options, skipSlotHistoryBaseline } : options
+    // T2.2 Block 1 F1:注入 scene-scoped sync → generateIntoAiSlot catch 删 slot 时发 delete-node。
+    // generationFacade 无环(canvasStore 不引 generationFacade),可静态 import wrapMutationForScene;注入
+    // 回调而非让 generationSlice 静态引 canvasSyncRuntime(避 store→canvas→store 环)。local 模式
+    // wrapMutationForScene 的 isLocalPersist gate 短路,不发 submit(行为不退)。
+    const nextOptions = {
+      ...options,
+      ...(skipSlotHistoryBaseline ? { skipSlotHistoryBaseline } : {}),
+      onSceneMutation: (sceneId: string, mutate: () => void) => wrapMutationForScene(sceneId, mutate)(),
+    }
     return useCanvasStore.getState().generateIntoAiSlot(slotId, prompt, nextOptions)
   },
   generateVariations: (...args: Parameters<CanvasState['generateVariations']>) =>
