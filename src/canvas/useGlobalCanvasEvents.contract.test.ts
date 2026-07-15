@@ -71,6 +71,18 @@ describe('F1: useGlobalCanvasEvents 快捷键路径经 wrapMutation(源码契约
     //   原 not.toMatch(/store\.moveSelectedNodesBy\(/) 的逐 keydown 禁令已下线(行为由 throttle 单测覆盖)。
   })
 
+  it('#arrowflood P1:pointerdown(capture 阶段)先 flush pending burst,防选区/场景切换后 A 累计位移永不提交', () => {
+    // Greptile P1(结算目标随实时选区漂移):burst 期间 A 的裸移动零 submit;若 pointerdown 不先 flush,
+    //   选区/画布切换后 settle 作用于实时选区(B/新画布)→ A 永不提交,刷新后 A 回退。fix:在 window
+    //   pointerdown capture 阶段(先于画布/选区/侧栏 click→selectNode/openCanvas 的 bubble handler)调
+    //   arrowThrottle.flush()。钉死 addEventListener+capture+handler 体含 flush+removeEventListener 四要素,
+    //   防有人删 pointerdown flush 接线(回归 A 回退)。语义(换选区 A 提交 B 零影响)由 arrowNudgeThrottle.test
+    //   的 P1 集成测覆盖,本文件只钉源码接线事实。
+    expect(source).toContain("addEventListener('pointerdown', handlePointerDown, { capture: true })")
+    expect(source).toMatch(/handlePointerDown = \(\) => \{[\s\S]*?arrowThrottle\.flush\(\)/)
+    expect(source).toContain('removeEventListener')
+  })
+
   it('paste(clipboardAssets)→ wrapMutation(() => store.pasteClipboardAssets(viewportCenter()))', () => {
     // lambda 包装(保 viewportCenter 落点),regex not-to-match 不适用(lambda body 内含 store.X());只 toContain。
     expect(source).toContain('wrapMutation(() => store.pasteClipboardAssets(viewportCenter()))()')

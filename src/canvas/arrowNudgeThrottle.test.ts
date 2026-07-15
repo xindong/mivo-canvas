@@ -112,6 +112,79 @@ const seedStoreWithSelectedNode = (useCanvasStore: unknown) => {
   )
 }
 
+// #arrowflood P1 测试 seed:画布 c1 含 A(n1,选中)+ B(n2),用于「burst 中换选区」集成测。
+const seedStoreWithTwoNodesSelectedA = (useCanvasStore: unknown) => {
+  const store = useCanvasStore as {
+    getInitialState: () => Record<string, unknown>
+    setState: (state: never, replace?: boolean) => void
+  }
+  const baseState = store.getInitialState()
+  const n1 = imageNode({ id: 'n1', x: 10, y: 20 })
+  const n2 = imageNode({ id: 'n2', x: 100, y: 200 })
+  store.setState(
+    {
+      ...baseState,
+      sceneId: 'c1',
+      canvases: {
+        c1: {
+          title: 'Canvas',
+          createdAt: '2026-07-13T00:00:00.000Z',
+          updatedAt: '2026-07-13T00:00:00.000Z',
+          nodes: [n1, n2],
+          edges: [],
+          tasks: [],
+          selectedNodeId: 'n1',
+          selectedNodeIds: ['n1'],
+        },
+      },
+      nodes: [n1, n2],
+      edges: [],
+      tasks: [],
+      selectedNodeId: 'n1',
+      selectedNodeIds: ['n1'],
+    } as never,
+    true,
+  )
+}
+
+// #arrowflood P1 测试 seed:两画布 c1(n1=A,选中)+ c2(n3),active=c1,用于「burst 中切画布」集成测。
+const seedStoreWithTwoCanvases = (useCanvasStore: unknown) => {
+  const store = useCanvasStore as {
+    getInitialState: () => Record<string, unknown>
+    setState: (state: never, replace?: boolean) => void
+  }
+  const baseState = store.getInitialState()
+  const n1 = imageNode({ id: 'n1', x: 10, y: 20 })
+  const n3 = imageNode({ id: 'n3', x: 500, y: 50 })
+  const doc = (nodes: MivoCanvasNode[], selectedNodeId: string) => ({
+    title: 'Canvas',
+    createdAt: '2026-07-13T00:00:00.000Z',
+    updatedAt: '2026-07-13T00:00:00.000Z',
+    nodes,
+    edges: [],
+    tasks: [],
+    selectedNodeId,
+    selectedNodeIds: [selectedNodeId],
+  })
+  store.setState(
+    {
+      ...baseState,
+      sceneId: 'c1',
+      canvases: { c1: doc([n1], 'n1'), c2: doc([n3], 'n3') },
+      nodes: [n1],
+      edges: [],
+      tasks: [],
+      selectedNodeId: 'n1',
+      selectedNodeIds: ['n1'],
+    } as never,
+    true,
+  )
+}
+
+// 读指定画布的 nodes(cast 绕开 CanvasDocument 类型引用;测试 seed 用字面量 canvas id)。
+const nodesOfCanvas = (state: unknown, canvasId: string): MivoCanvasNode[] =>
+  (state as { canvases: Record<string, { nodes: MivoCanvasNode[] }> }).canvases[canvasId].nodes
+
 // 节流 + 真 store + 真 wrapMutation 的接线(同 useGlobalCanvasEvents.ts 的 settle 实现)。
 const wireThrottleToStore = (
   wrapMutation: <TArgs extends unknown[], TResult>(
@@ -339,6 +412,59 @@ describe('arrowNudgeThrottle 集成(真 store + wrapMutation + mock port)', () =
     await flushMicrotasks()
 
     expect(submitChange).toHaveBeenCalledTimes(2) // 每 burst 1 次 ✓
+    __resetCanvasSyncRuntimeQueue()
+  })
+
+  // ── #arrowflood P1(Greptile:结算目标随实时选区漂移)──
+  // burst 期间对 A 的裸移动零 submit;若选区/画布在 settle 前切换,settle 会作用于实时选区(B/新画布)
+  //   → A 累计位移永不提交,刷新后 A 回退(节流引入的新回归窗口)。fix:pointerdown(capture)先 flush,
+  //   settle 落在 A。下列测验证「flush 在选区/场景切换前调用」时 A 正确提交、B/新画布零影响
+  //   (pointerdown→flush 接线由 useGlobalCanvasEvents.contract.test 钉死)。
+  it('P1 选区漂移:burst 中 pointerdown flush 先结算 A,再换选区到 B → A 累计位移已提交、B 零影响', async () => {
+    const { wrapMutation, __resetCanvasSyncRuntimeQueue, useCanvasStore, submitChange } = await loadHarness({ local: false })
+    seedStoreWithTwoNodesSelectedA(useCanvasStore)
+    const initialA = useCanvasStore.getState().nodes.find((n) => n.id === 'n1')!.x
+    const initialB = useCanvasStore.getState().nodes.find((n) => n.id === 'n2')!.x
+
+    const throttle = wireThrottleToStore(wrapMutation, useCanvasStore)
+    // burst 5× ArrowRight on A(裸 move,A 视觉 +5,零 submit)
+    for (let i = 0; i < 5; i += 1) throttle.onKeyDown('ArrowRight', false)
+    // pointerdown flush:settle 在选区仍是 A 时 → 提交 A +5(B 还未选,settle 不碰 B)
+    throttle.flush()
+    await flushMicrotasks()
+
+    expect(submitChange).toHaveBeenCalledTimes(1)
+    expect(submitChange.mock.calls[0][0]).toBe('c1')
+    expect(submitChange.mock.calls[0][1]).toMatchObject({ kind: 'edit-node', nodeId: 'n1' })
+    expect(useCanvasStore.getState().nodes.find((n) => n.id === 'n1')!.x).toBe(initialA + 5) // A 累计位移已提交 ✓
+
+    // 换选区到 B(模拟 pointerdown 后 click→selectNode('n2'))
+    useCanvasStore.getState().selectNode('n2')
+    // B 零影响:未被 A 的 burst settle 碰到(fix 下 settle 在选区还是 A 时已完成)
+    expect(useCanvasStore.getState().nodes.find((n) => n.id === 'n2')!.x).toBe(initialB) // B 零影响 ✓
+    __resetCanvasSyncRuntimeQueue()
+  })
+
+  it('P1 画布漂移:burst 中 pointerdown flush 先结算 A,再切画布到 c2 → A 累计位移已提交到 c1、c2 零影响', async () => {
+    const { wrapMutation, __resetCanvasSyncRuntimeQueue, useCanvasStore, submitChange } = await loadHarness({ local: false })
+    seedStoreWithTwoCanvases(useCanvasStore)
+    const initialA = useCanvasStore.getState().nodes.find((n) => n.id === 'n1')!.x
+    const initialC2N3 = nodesOfCanvas(useCanvasStore.getState(), 'c2').find((n) => n.id === 'n3')!.x
+
+    const throttle = wireThrottleToStore(wrapMutation, useCanvasStore)
+    for (let i = 0; i < 5; i += 1) throttle.onKeyDown('ArrowRight', false)
+    // pointerdown flush:settle 在画布仍是 c1 时 → 提交 A +5 到 c1(锚 state.sceneId=c1)
+    throttle.flush()
+    await flushMicrotasks()
+
+    expect(submitChange).toHaveBeenCalledTimes(1)
+    expect(submitChange.mock.calls[0][0]).toBe('c1') // 提交到原画布 c1 ✓
+    expect(submitChange.mock.calls[0][1]).toMatchObject({ kind: 'edit-node', nodeId: 'n1' })
+    expect(useCanvasStore.getState().nodes.find((n) => n.id === 'n1')!.x).toBe(initialA + 5) // A 累计位移已提交到 c1 ✓
+
+    // 切画布到 c2(模拟 pointerdown 后 openCanvasById → loadScene('c2'))
+    useCanvasStore.getState().loadScene('c2')
+    expect(useCanvasStore.getState().nodes.find((n) => n.id === 'n3')!.x).toBe(initialC2N3) // c2 节点零影响 ✓
     __resetCanvasSyncRuntimeQueue()
   })
 })

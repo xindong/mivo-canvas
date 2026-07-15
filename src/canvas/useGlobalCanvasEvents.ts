@@ -318,6 +318,17 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
       setActiveConnectorDropTargetId(undefined)
     }
 
+    // #arrowflood P1(Greptile:结算目标随实时选区漂移):pointerdown 在 capture 阶段(先于画布/选区/
+    //   侧栏 click→selectNode/openCanvas 的 bubble handler)先 flush pending 方向键 burst。burst 期间对 A
+    //   的裸移动零 submit;若用户在 burst 中点击换选区到 B 或切画布,不先 flush 则 settle 会作用于实时选区
+    //   (已是 B)→ A 的累计位移永不提交,刷新/重连后 A 回退(节流引入的新回归窗口)。pointerdown 先行使
+    //   settle 仍落在 A(选区/场景未变),server 收到 A 的正确位移。flush 内 idempotent guard:无 pending
+    //   burst时 acc=0 no-op,不误伤普通点击。键盘/程序化切选区/画布路径当前不存在(grep 无键盘切画布入口),
+    //   若未来引入需在 store 层补「按 ids move」(超出本 fix boundary)。
+    const handlePointerDown = () => {
+      arrowThrottle.flush()
+    }
+
     const handlePaste = async (event: ClipboardEvent) => {
       if (isEditingTarget(event.target)) return
 
@@ -359,6 +370,8 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
     window.addEventListener('keydown', handleKeyDown)
     window.addEventListener('keyup', handleKeyUp)
     window.addEventListener('blur', handleWindowBlur)
+    // capture:先于 bubble 阶段的 click→selectNode/openCanvas,保证 flush 在选区/场景切换前发生(#arrowflood P1)。
+    window.addEventListener('pointerdown', handlePointerDown, { capture: true })
     window.addEventListener('paste', handlePaste)
 
     return () => {
@@ -367,6 +380,8 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
       window.removeEventListener('keydown', handleKeyDown)
       window.removeEventListener('keyup', handleKeyUp)
       window.removeEventListener('blur', handleWindowBlur)
+      // capture 标志须与 add 一致,确保能正确移除 listener(#arrowflood P1)。
+      window.removeEventListener('pointerdown', handlePointerDown, { capture: true })
       window.removeEventListener('paste', handlePaste)
     }
   }, [
