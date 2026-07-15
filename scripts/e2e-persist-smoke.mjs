@@ -14,6 +14,10 @@
 //   finally 跟踪 serverReady/cleanupDone,BFF 起成功但 cleanup 没做时兜底 reset。清理失败与原始测试错误
 //   分别保留聚合上报(不互相吞——原始错误在前,清理错误在后,throw 聚合 Error)。
 //
+// F4-signal: SIGINT/SIGTERM/CI cancel 不触发 finally(默认行为直接终止)→ PG 残留。process.on('SIGINT'/
+//   'SIGTERM') handler 跑幂等 performCleanup(与 finally 共享 cleanupPromise,不双跑),完成后以 128+signo
+//   退出(POSIX 约定,CI 红)。signaledExitCode 让正常路径聚合 throw 在 signal 路径降级为同码退出。
+//
 // 鉴权(legacy 模式,e2e 不设 MIVO_SSO_STRICT → createSsoStrictProofGate no-op;assertStrictOwnerMigrationComplete
 // 仅 strict 跑,e2e no-op):BFF env MIVO_PLATFORM_KEY=mivo_e2e_persist → resolveActor = fingerprintOfPlatformKey(key)
 // 稳定 owner;请求带 X-Mivo-Api-Key: mivo_e2e_persist(合法 mivo_ 前缀,过 rejectInvalidMivoApiKey)→
@@ -58,6 +62,53 @@ let server
 let serverReady = false
 let cleanupDone = false
 const errors = [] // 聚合错误(原始测试错误在前,清理错误在后;不互相吞)。
+
+// F4 + signal: 单一幂等清理入口,finally 与 SIGINT/SIGTERM handler 共用。cleanupPromise
+// 既是 guard 又是共享 awaitable——signal 打断 try 时由 handler 起头,signal 落在 finally
+// 中段时 no-op 返回同一 promise(不二次 reset/stop)。受保护 reset 复用 serverReady/
+// cleanupDone:BFF 起成功但 ⑥ 未跑(早期断言失败)→ 兜底 reset 防 PG 残留污染下一轮。
+// 清理失败不吞原始错误(分别 push 进 errors,聚合 throw;signal 路径直接以 128+signo 退出)。
+let cleanupPromise = null
+const performCleanup = (reason) => {
+  if (cleanupPromise) return cleanupPromise
+  cleanupPromise = (async () => {
+    if (serverReady && !cleanupDone) {
+      try {
+        const r = await resetServerPersist(baseUrl, resetToken)
+        if (r.ok) {
+          cleanupDone = true
+          console.log(`[e2e-persist-smoke] ${reason} 兜底 reset 成功(清 PG 残留)`)
+        } else {
+          errors.push(new Error(`${reason} 兜底 reset 未成功:${r.reason}`))
+        }
+      } catch (cleanupErr) {
+        errors.push(new Error(`${reason} 兜底 reset 失败:${cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)}`))
+      }
+    }
+    await stopSmokeDevServer(server)
+  })()
+  return cleanupPromise
+}
+
+// SIGINT/SIGTERM/CI cancel 不触发 finally(默认行为直接终止,跳过 finally → PG 残留)。
+// handler 起幂等 performCleanup(若 finally 已跑则 no-op;若 signal 打断 try 则此处理清 PG),
+// 完成后以 128+signo 退出(POSIX 约定,CI 红)。signaledExitCode 让正常路径的聚合 throw
+// 在 signal 路径降级为同码退出(防 try 块 catch/finally 抢先以 exit 1 收场)。二次信号
+// 直接强制退出(清理卡住时连按 Ctrl-C 自救)。
+let signaledExitCode = null
+let signalCleanupStarted = false
+const handleSignal = (signal) => {
+  const signo = signal === 'SIGINT' ? 2 : signal === 'SIGTERM' ? 15 : 0
+  const exitCode = 128 + signo
+  signaledExitCode = exitCode
+  if (signalCleanupStarted) {
+    process.exit(exitCode)
+  }
+  signalCleanupStarted = true
+  performCleanup(`signal ${signal}`).finally(() => process.exit(exitCode))
+}
+process.on('SIGINT', handleSignal)
+process.on('SIGTERM', handleSignal)
 
 try {
   await runCommand('npm', ['run', 'verify:logging'])
@@ -180,24 +231,18 @@ try {
   errors.push(err)
 } finally {
   // F4: 受保护兜底 reset。BFF 起成功(serverReady)但 cleanup 没做(早期断言失败跳过 ⑥)→ finally 兜底,
-  //   防 PG 残留污染下一轮。清理失败不吞原始错误(分别 push,聚合 throw)。
-  if (serverReady && !cleanupDone) {
-    try {
-      const r = await resetServerPersist(baseUrl, resetToken)
-      if (r.ok) {
-        cleanupDone = true
-        console.log('[e2e-persist-smoke] F4 finally 兜底 reset 成功(早期断言失败后清 PG 残留)')
-      } else {
-        errors.push(new Error(`F4 finally 兜底 reset 未成功:${r.reason}`))
-      }
-    } catch (cleanupErr) {
-      errors.push(new Error(`F4 finally 兜底 reset 失败:${cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)}`))
-    }
-  }
-  await stopSmokeDevServer(server)
+  //   防 PG 残留污染下一轮。清理失败不吞原始错误(分别 push,聚合 throw)。经 performCleanup 共享入口:
+  //   若 signal handler 已起 cleanup 则 no-op 返回同一 promise(不二次 reset/stop),否则此处理清。
+  await performCleanup('F4 finally')
 }
 
 // F4: 聚合上报。errors 非空 → throw 聚合 Error(原始测试错误 + 清理错误分别保留,不互相吞)。
+// signal 路径(signaledExitCode≠null):performCleanup 已在 finally/handler 跑完,以 128+signo 退出,
+//   跳过聚合 throw(防 try 块 catch/finally 抢先以 exit 1 收场,淹没 signal 退出码)。
+if (signaledExitCode !== null) {
+  await cleanupPromise
+  process.exit(signaledExitCode)
+}
 if (errors.length > 0) {
   const messages = errors.map((e, i) => `  [${i + 1}] ${e instanceof Error ? e.message : String(e)}`).join('\n')
   throw new Error(`e2e-persist-smoke 失败(聚合 ${errors.length} 个错误,原始测试错误在前 + 清理错误在后,不互相吞):\n${messages}`)
