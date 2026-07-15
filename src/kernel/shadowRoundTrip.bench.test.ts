@@ -92,8 +92,8 @@ describe('S6d kernel=new shadow round-trip 微基准', () => {
     )
 
     // 写文件供 PR 报告读取(console.log 被 rtk 摘要器剥离)。
-    // tsconfig types 不含 node,vitest runtime 提供 fs,@ts-expect-error 抑制 tsc2591。
-    // @ts-expect-error tsconfig types 仅 vite/client,node:fs/promises 由 vitest runtime 解析
+    // node:fs/promises 由 @types/node 在 tsc build 解析 + vitest runtime 提供(@types/node ^24 后
+    // 可解析,原 @ts-expect-error 已 unused → 移除;修复 build 预存在 TS2578)。
     const fs = await import('node:fs/promises')
     await fs.writeFile(
       '/tmp/s6d-shadow-roundtrip-bench-result.json',

@@ -979,6 +979,45 @@ export const getPendingDeleteResourceIds = async (
   return ids
 }
 
+/**
+ * D3 (delete-resurrection edge fix, 2026-07-15): read the set of resource ids
+ * (projectId / canvasId) whose **create** op is still pending in the durable IDB queue
+ * (not yet drained to server). Used by persistBoot onOutcome B to AVOID removing a
+ * just-restored resource from the store when its (in-flight) DELETE succeeds.
+ *
+ * Race (lead D3 + PR #254 backlog): user deletes project X (DELETE in-flight) then
+ * immediately restoreProject(X) → enqueue createProject(X). The in-flight DELETE cannot
+ * coalesce with the new pending create (combineOps only coalesces pending/paused-401, NOT
+ * in-flight), so both records coexist. When the DELETE drains success, onOutcome B used to
+ * remove X from store unconditionally → the just-restored project vanishes, AND
+ * applyServerRevision(createProject) only updates EXISTING projects → X stays gone until
+ * next hydrate. Fix: B checks this set; if a pending create for the same id exists, skip
+ * removal (the restore will drain + re-create; store keeps X).
+ *
+ * getAllWrites returns only non-terminal records (terminal = delete-after-surface), so a
+ * create that already drained success is gone from IDB → not in the set → B removes
+ * (correct: user deleted after a prior create, net delete). Only a STILL-PENDING create
+ * (the in-flight-DELETE + restore race) is in the set → B skips. Works before the queue
+ * singleton is started (reads IDB directly via getAllWrites) AND mid-session. Unions
+ * memStore fallback. local mode: never populated (queue never started, enqueue no-op) →
+ * empty set, zero impact (and onOutcome is never called in local mode anyway).
+ */
+export const getPendingCreateResourceIds = async (
+  kind: 'createProject' | 'createCanvas',
+): Promise<Set<string>> => {
+  const all = await getAllWrites()
+  const ids = new Set<string>()
+  for (const r of all) {
+    const op = r.op
+    if (kind === 'createProject' && op.kind === 'createProject' && op.id !== undefined) {
+      ids.add(op.id)
+    } else if (kind === 'createCanvas' && op.kind === 'createCanvas') {
+      ids.add(op.canvasId)
+    }
+  }
+  return ids
+}
+
 const putWrite = async (record: QueuedWrite): Promise<void> => {
   if (!isIdbAvailable()) {
     memStore.set(record.id, record)

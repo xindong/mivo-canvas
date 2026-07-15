@@ -83,9 +83,8 @@ describe('PR-R2 §12.1 sync 微基准（1000 节点）', () => {
         `  all-changed (≈R2 before): p50=${percentile(allChangedTimes, 50).toFixed(3)}ms p95=${allP95.toFixed(3)}ms\n` +
         `  ratio (all/drag p95): ${(allP95 / Math.max(dragP95, 0.001)).toFixed(1)}x`,
     )
-    // 写文件供报告读取（console.log 被 rtk 摘要器剥离；tsconfig types 不含 node，
-    // vitest runtime 提供 fs，@ts-expect-error 抑制 tsc2591）
-    // @ts-expect-error tsconfig types 仅 vite/client，node:fs 由 vitest runtime 解析
+    // 写文件供报告读取（console.log 被 rtk 摘要器剥离；node:fs/promises 由 @types/node 在 tsc
+    // build 解析 + vitest runtime 提供，@types/node ^24 后原 @ts-expect-error 已 unused → 移除）。
     const fs = await import('node:fs/promises')
     await fs.writeFile(
       '/tmp/pr-r2-bench-result.json',
