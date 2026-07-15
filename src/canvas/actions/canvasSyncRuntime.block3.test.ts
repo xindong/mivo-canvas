@@ -202,6 +202,21 @@ describe('T2.2 Block 3 — deferred-kinds server-wire 验收矩阵', () => {
   }
   const submitChangeKinds = () => submitChange.mock.calls.map((c) => (c[1] as { kind: string }).kind)
 
+  // P2(复审):逐 call 断言 [SCENE, change](含 canvasId)——所有 server 用例的 submitChange 第一参锚 SCENE。
+  const expectAllCallsAnchorScene = () => {
+    for (const call of submitChange.mock.calls) {
+      expect(call[0]).toBe(SCENE)
+    }
+  }
+  // P2/P1(复审):edit-node intent fieldPath 前缀匹配(如 ['generation','model'] / ['aiWorkflow','status'])。
+  const hasIntent = (
+    intents: Array<{ fieldPath: string[] }>,
+    ...path: string[]
+  ): boolean =>
+    intents.some(
+      (i) => i.fieldPath.length >= path.length && path.every((seg, idx) => i.fieldPath[idx] === seg),
+    )
+
   // ── 注册表 fail-visible + boot 注册(①②③)──────────────────────────────────────
   it('① registry 空 + server 模式 → getSceneWrap passthrough 留 debugLogger.error 痕迹(不静默吞同步)', async () => {
     vi.resetModules()
@@ -255,9 +270,11 @@ describe('T2.2 Block 3 — deferred-kinds server-wire 验收矩阵', () => {
     useCanvasStore.getState().addImportedFileNode('image', SERVER_ASSET_URL, 'Imp', 'source', { x: 0, y: 0 })
     await flushSubmit()
     expect(submitChange).toHaveBeenCalled()
+    expectAllCallsAnchorScene() // P2:逐 call 锚 SCENE(canvasId)
     const change = submitChange.mock.calls[0][1] as { kind: string; node: { id: string; asset?: { url: string } } }
     expect(change.kind).toBe('create-node')
-    expect(change.node.asset?.url).toBe(SERVER_ASSET_URL)
+    expect(change.node.id).toEqual(expect.any(String)) // P2:create-node 校验 node.id
+    expect(change.node.asset?.url).toBe(SERVER_ASSET_URL) // P2:create-node 校验 asset.url
     expect(enqueueAssetAttach).toHaveBeenCalledWith(SCENE, 'asset-gen', change.node.id)
     resetQueue()
   })
@@ -307,18 +324,21 @@ describe('T2.2 Block 3 — deferred-kinds server-wire 验收矩阵', () => {
     })
     await flushSubmit()
     expect(nodeIds.length).toBe(1)
+    expectAllCallsAnchorScene() // P2:逐 call 锚 SCENE(canvasId)
     const kinds = submitChangeKinds()
     expect(kinds).toContain('create-node') // 结果图 node
     expect(kinds).toContain('create-edge') // derivation edge n1 → 结果
     const createCall = submitChange.mock.calls.find(
       (c) => (c[1] as { kind: string }).kind === 'create-node',
     )
-    const createdId = (createCall![1] as { node: { id: string } }).node.id
-    expect(enqueueAssetAttach).toHaveBeenCalledWith(SCENE, 'asset-gen', createdId)
+    const createdNode = (createCall![1] as { node: { id: string; asset?: { url?: string } } }).node
+    expect(createdNode.id).toEqual(expect.any(String)) // P2:create-node 校验 node.id
+    expect(createdNode.asset?.url).toBe(SERVER_ASSET_URL) // P2:create-node 校验 asset.url
+    expect(enqueueAssetAttach).toHaveBeenCalledWith(SCENE, 'asset-gen', createdNode.id)
     resetQueue()
   })
 
-  it('⑨ commitGenerationResult(server)replace-slot 路径 → submitChange edit-node(assetUrl diff)+ enqueueAssetAttach', async () => {
+  it('⑨ commitGenerationResult(server)replace-slot 路径 → submitChange edit-node(nodeId=slot-1 + asset.url + metadata intents)+ enqueueAssetAttach', async () => {
     seed(seedCanvas(SCENE, [aiSlotNode({ id: 'slot-1' })]))
     const nodeIds = await useCanvasStore.getState().commitGenerationResult({
       sceneId: SCENE,
@@ -330,7 +350,19 @@ describe('T2.2 Block 3 — deferred-kinds server-wire 验收矩阵', () => {
     })
     await flushSubmit()
     expect(nodeIds).toEqual(['slot-1']) // slot 原位替换,result id = slot id
-    expect(submitChangeKinds()).toContain('edit-node') // slot ai-slot→image + assetUrl undefined→server
+    expectAllCallsAnchorScene() // P2:逐 call 锚 SCENE(canvasId)
+    const editCall = submitChange.mock.calls.find(
+      (c) =>
+        (c[1] as { kind: string; nodeId?: string }).kind === 'edit-node' &&
+        (c[1] as { nodeId?: string }).nodeId === 'slot-1',
+    )
+    expect(editCall).toBeDefined() // P2:edit-node 校验 nodeId='slot-1'
+    const editIntents = (editCall![1] as unknown as { intents: Array<{ fieldPath: string[] }> }).intents
+    expect(hasIntent(editIntents, 'asset', 'url')).toBe(true) // P2:asset.url intent(assetUrl undefined→server)
+    // P2:metadata intents —— type ai-slot→image、aiWorkflow.status empty→ready、generation.model 旧→新
+    expect(hasIntent(editIntents, 'type')).toBe(true)
+    expect(hasIntent(editIntents, 'aiWorkflow', 'status')).toBe(true)
+    expect(hasIntent(editIntents, 'generation', 'model')).toBe(true)
     expect(enqueueAssetAttach).toHaveBeenCalledWith(SCENE, 'asset-gen', 'slot-1') // 旧无→新有
     resetQueue()
   })
@@ -356,7 +388,7 @@ describe('T2.2 Block 3 — deferred-kinds server-wire 验收矩阵', () => {
   })
 
   // ── generateVariations 失败槽位(⑪,失败路径 node-create)──────────────────────
-  it('⑪ generateVariations partial → failedSlots 经 wrap → submitChange create-node(失败槽位,无 attach)', async () => {
+  it('⑪ generateVariations partial → failedSlots 经 wrap → submitChange create-node(失败槽位 node.type=ai-slot + create-edge + 无 attach)', async () => {
     mocks.pollTask.mockResolvedValue(
       partialView(
         [{ blob: new Blob(['ok'], { type: 'image/png' }), variationIndex: 0 }],
@@ -366,26 +398,91 @@ describe('T2.2 Block 3 — deferred-kinds server-wire 验收矩阵', () => {
     seed(seedCanvas(SCENE, [imageNode({ id: 'n1' })]))
     await useCanvasStore.getState().generateVariations('n1', undefined, {})
     await flushSubmit()
+    expectAllCallsAnchorScene() // P2:逐 call 锚 SCENE(canvasId)
     const createNodeCalls = submitChange.mock.calls.filter(
       (c) => (c[1] as { kind: string }).kind === 'create-node',
     )
-    // success 结果(create-node + 有 server asset)+ 失败槽位(create-node + 无 asset)≥ 2 个 create-node
+    // success 结果(create-node + 有 server asset)+ 失败槽位(create-node ai-slot + 无 asset)≥ 2 个 create-node
     expect(createNodeCalls.length).toBeGreaterThanOrEqual(2)
-    // 失败槽位 = 无 asset.url 的 create-node(createFailedVariationSlot 的 ai-slot 无 asset)
+    // 无 asset.url 的 create-node:失败槽位(ai-slot)+ 派生边可视化 markup 节点(均无 server asset)
     const noAssetCreate = createNodeCalls.filter(
       (c) => !(c[1] as { node: { asset?: { url?: string } } }).node.asset?.url,
     )
     expect(noAssetCreate.length).toBeGreaterThanOrEqual(1)
-    const failedNodeIds = noAssetCreate.map(
-      (c) => (c[1] as { node: { id: string } }).node.id,
+    // P2:失败槽位 = no-asset create-node 中 type='ai-slot' 者(createFailedVariationSlot 建 ai-slot 失败槽位;
+    //   派生边 markup 节点 type='markup',不是失败槽位,排除)
+    const failedSlots = noAssetCreate.filter(
+      (c) => (c[1] as { node: { type: string } }).node.type === 'ai-slot',
     )
+    expect(failedSlots.length).toBeGreaterThanOrEqual(1) // P2:失败槽位 node.type='ai-slot'
+    const failedNodeIds = failedSlots.map((c) => (c[1] as { node: { id: string } }).node.id)
+    // P2:失败槽位有对应 create-edge(source → failed nodeId,type='generate')
+    const createEdgeCalls = submitChange.mock.calls.filter(
+      (c) => (c[1] as { kind: string }).kind === 'create-edge',
+    )
+    for (const failedId of failedNodeIds) {
+      expect(
+        createEdgeCalls.some((c) => (c[1] as { edge: { to: string; type: string } }).edge.to === failedId),
+      ).toBe(true)
+    }
     // success 结果有 server asset → attach 命中(asset-gen)
     expect(enqueueAssetAttach).toHaveBeenCalledWith(SCENE, 'asset-gen', expect.any(String))
-    // 失败槽位无 server asset → 不触发 attach(其 nodeId 不在 attach 调用里)
+    // P2:失败槽位无 server asset → 该 nodeId 不在 attach 调用里
     const attachedIds = new Set(enqueueAssetAttach.mock.calls.map((c) => c[2] as string))
     for (const id of failedNodeIds) {
       expect(attachedIds.has(id)).toBe(false)
     }
+    resetQueue()
+  })
+
+  // ── generateIntoAiSlot success 全链(P1 复审修复:generating 态 mutation 接 server-wire)──────────────
+  //   ⑫ 验 generateIntoAiSlot 成功路径发 2 个 slot-1 edit-node:① generating edit-node(status/prompt/model/
+  //      taskId 先落 server,堵原裸 set 致 commit diff 判"没变"不发 intents、server generation.model/prompt/taskId
+  //      与 aiWorkflow.prompt 停留旧值的基线错配);② commit edit-node(nodeId=slot-1 + type/asset/status=ready)。
+  //      union 覆盖 generation.prompt/model/taskId + aiWorkflow.prompt(server 端 metadata 完整,刷新 hydrate 不漂移)。
+  //      不许绕过前置 generating set —— 必须走 generateIntoAiSlot 全链(非直调 commitGenerationResult)。
+  it('⑫ generateIntoAiSlot(server)success → generating edit-node + commit edit-node 双发,union 覆盖 generation.prompt/model/taskId + aiWorkflow.prompt', async () => {
+    const { generationFacade } = await import('../../store/generationFacade')
+    seed(seedCanvas(SCENE, [aiSlotNode({ id: 'slot-1' })]))
+    // 用与 slot 原始 prompt('a cat')不同的 prompt,使 generation.prompt/aiWorkflow.prompt 在 generating edit-node 里"变"出 intent
+    await generationFacade.generateIntoAiSlot('slot-1', 'a refreshed cat', { sceneId: SCENE })
+    await flushSubmit()
+
+    // 全链 submitChange 均锚 SCENE(canvasId)
+    expectAllCallsAnchorScene()
+
+    // slot-1 的 edit-node 按序:generating(#0)→ commit(#1)
+    const slotEditCalls = submitChange.mock.calls.filter(
+      (c) =>
+        (c[1] as { kind: string; nodeId?: string }).kind === 'edit-node' &&
+        (c[1] as { nodeId?: string }).nodeId === 'slot-1',
+    )
+    expect(slotEditCalls.length).toBe(2)
+    const generatingIntents = (slotEditCalls[0][1] as unknown as { intents: Array<{ fieldPath: string[] }> }).intents
+    const commitIntents = (slotEditCalls[1][1] as unknown as { intents: Array<{ fieldPath: string[] }> }).intents
+
+    // ① generating edit-node:status/prompt/model/taskId 落 server(堵裸 set 基线错配)
+    expect(hasIntent(generatingIntents, 'aiWorkflow', 'status')).toBe(true) // empty→generating
+    expect(hasIntent(generatingIntents, 'generation', 'prompt')).toBe(true) // a cat→a refreshed cat
+    expect(hasIntent(generatingIntents, 'aiWorkflow', 'prompt')).toBe(true) // a cat→a refreshed cat
+    expect(hasIntent(generatingIntents, 'generation', 'model')).toBe(true) // Mivo Mock→gpt-image-2
+    expect(hasIntent(generatingIntents, 'generation', 'taskId')).toBe(true) // undefined→task-slot-generation-…
+
+    // ② commit edit-node:nodeId=slot-1 + type/asset/status=ready
+    expect((slotEditCalls[1][1] as { nodeId: string }).nodeId).toBe('slot-1')
+    expect(hasIntent(commitIntents, 'type')).toBe(true) // ai-slot→image
+    expect(hasIntent(commitIntents, 'asset', 'url')).toBe(true) // undefined→server asset
+    expect(hasIntent(commitIntents, 'aiWorkflow', 'status')).toBe(true) // generating→ready
+
+    // union:generation.prompt/model/taskId + aiWorkflow.prompt 全覆盖(server metadata 完整,不漂移)
+    const allIntents = [...generatingIntents, ...commitIntents]
+    expect(hasIntent(allIntents, 'generation', 'prompt')).toBe(true)
+    expect(hasIntent(allIntents, 'generation', 'model')).toBe(true)
+    expect(hasIntent(allIntents, 'generation', 'taskId')).toBe(true)
+    expect(hasIntent(allIntents, 'aiWorkflow', 'prompt')).toBe(true)
+
+    // 结果资产 attach 到 slot-1(commit edit-node 的 assetUrl diff 驱动)
+    expect(enqueueAssetAttach).toHaveBeenCalledWith(SCENE, 'asset-gen', 'slot-1')
     resetQueue()
   })
 })
