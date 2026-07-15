@@ -293,6 +293,72 @@ const runA2S2ContractSuite = (
       })
     })
   })
+
+  // ── F1-bis(T2.2 Block 2 三轮复审):optional container 生命周期真实 backend 往返(lead 裁定窄幅解禁 ──
+  // server setByPath/unsetByPath)。审官真实 backend 往返证 optional container(asset/generation/aiWorkflow)
+  // 在字段级 op 契约下没有合法端到端生死期。①物化缺祖先 ②空壳剪枝 ③(B′)数组 child delete 合法。
+  // 全部真实 backend applyDomainOps→getChild 往返(memory+PG dual),不许 submit mock。lead ④防 clobber 契约
+  // 回归由本套件 §14.1 冻结矩阵 + canvasSyncPort.contract.test.ts:277-285 覆盖(set [arrayField] 仍拒)。
+  describe(`F1-bis ①②③ optional container 生命周期 — ${label}`, () => {
+    let b: PersistBackend
+    beforeEach(async () => {
+      b = make()
+      await reset(b)
+    })
+
+    // ① set ['asset','url'] on asset-less node → setByPath 物化 asset:{url}(原 TypeError)
+    it('① set [asset,url] on asset-less node → materializes asset:{url},hydrate 得目标 URL', async () => {
+      await seedCanvas(b)
+      const created = await b.createChild('owner', 'c1', 'node', 'n1', makeNode('n1'), { method: 'POST', resourceKind: 'node', actor: 'alice' })
+      const rev1 = cre(created).record.revision
+      const r = await b.applyDomainOps('owner', 'c1', 'node', 'n1', op({ kind: 'set', fieldPath: ['asset', 'url'], value: 'mivo-sasset:result-1' }), { baseRevision: rev1, baseFieldClocks: {}, method: 'PATCH', resourceKind: 'node', actor: 'alice' })
+      expect(acc(r).kind).toBe('accepted')
+      const rec = found(await b.getChild('owner', 'c1', 'node', 'n1')).record
+      expect((rec.payload as { asset?: { url?: string } }).asset?.url).toBe('mivo-sasset:result-1')
+    })
+
+    // ② unset ['asset','url'] → unsetByPath 剪枝空 asset:{}(不留空壳,防 hydrate 误判 ready)
+    it('② unset [asset,url] → prunes empty asset:{}(hydrate 完全无 asset,无空壳)', async () => {
+      await seedCanvas(b)
+      const created = await b.createChild('owner', 'c1', 'node', 'n1', makeNode('n1', { asset: { url: 'mivo-sasset:result-1' } }), { method: 'POST', resourceKind: 'node', actor: 'alice' })
+      const rev1 = cre(created).record.revision
+      const r = await b.applyDomainOps('owner', 'c1', 'node', 'n1', op({ kind: 'unset', fieldPath: ['asset', 'url'] }), { baseRevision: rev1, baseFieldClocks: {}, method: 'PATCH', resourceKind: 'node', actor: 'alice' })
+      expect(acc(r).kind).toBe('accepted')
+      const rec = found(await b.getChild('owner', 'c1', 'node', 'n1')).record
+      expect((rec.payload as { asset?: unknown }).asset).toBeUndefined() // 剪枝,无空 asset:{}
+    })
+
+    // ③ generation 嵌套对象整体删不留空骨架(逐叶子 unset → generation:{} 被剪)
+    it('③ generation 整体删(逐叶子 unset)→ 剪枝空 generation:{}(不留空骨架)', async () => {
+      await seedCanvas(b)
+      const created = await b.createChild('owner', 'c1', 'node', 'n1', makeNode('n1', { generation: { prompt: 'p', model: 'm', size: 's', seed: 1 } }), { method: 'POST', resourceKind: 'node', actor: 'alice' })
+      let rev = cre(created).record.revision
+      for (const leaf of ['prompt', 'model', 'size', 'seed']) {
+        const r = await b.applyDomainOps('owner', 'c1', 'node', 'n1', op({ kind: 'unset', fieldPath: ['generation', leaf] }), { baseRevision: rev, baseFieldClocks: {}, method: 'PATCH', resourceKind: 'node', actor: 'alice' })
+        rev = acc(r).record.revision
+      }
+      const rec = found(await b.getChild('owner', 'c1', 'node', 'n1')).record
+      expect((rec.payload as { generation?: unknown }).generation).toBeUndefined() // 剪枝,无空 generation:{}
+    })
+
+    // ③ aiWorkflow(含数组 sourceNodeIds)整体删:数组 child delete 合法(③B′)+ 剪枝空 aiWorkflow(不留 partial)
+    it('③ aiWorkflow(含数组 sourceNodeIds)整体删 → 数组 child delete 合法(③B′)+ 剪枝空 aiWorkflow:{}', async () => {
+      await seedCanvas(b)
+      const created = await b.createChild('owner', 'c1', 'node', 'n1', makeNode('n1', { aiWorkflow: { kind: 'slot', status: 'empty', sourceNodeIds: ['n2'], prompt: 'p' } }), { method: 'POST', resourceKind: 'node', actor: 'alice' })
+      let rev = cre(created).record.revision
+      // ③(B′):unset ['aiWorkflow','sourceNodeIds'](数组 child)合法 accepted(原被当 container-delete 拒)
+      const rArr = await b.applyDomainOps('owner', 'c1', 'node', 'n1', op({ kind: 'unset', fieldPath: ['aiWorkflow', 'sourceNodeIds'] }), { baseRevision: rev, baseFieldClocks: {}, method: 'PATCH', resourceKind: 'node', actor: 'alice' })
+      expect(acc(rArr).kind).toBe('accepted')
+      rev = acc(rArr).record.revision
+      // 删剩余 aiWorkflow 叶子 → aiWorkflow:{} → 剪枝
+      for (const leaf of ['kind', 'status', 'prompt']) {
+        const r = await b.applyDomainOps('owner', 'c1', 'node', 'n1', op({ kind: 'unset', fieldPath: ['aiWorkflow', leaf] }), { baseRevision: rev, baseFieldClocks: {}, method: 'PATCH', resourceKind: 'node', actor: 'alice' })
+        rev = acc(r).record.revision
+      }
+      const rec = found(await b.getChild('owner', 'c1', 'node', 'n1')).record
+      expect((rec.payload as { aiWorkflow?: unknown }).aiWorkflow).toBeUndefined() // 剪枝,无空 aiWorkflow:{} / 无 partial
+    })
+  })
 }
 
 // ── memory 后端(永远跑)──────────────────────────────────────────────────────────────
