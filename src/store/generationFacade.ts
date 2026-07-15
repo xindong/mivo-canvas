@@ -19,6 +19,7 @@ import type { CanvasId } from '../types/mivoCanvas'
 import { defaultSizeForNodeType } from '../model/canvasNodeRegistry'
 import { AI_SLOT_GAP, chooseAdjacentPlacement } from './aiCanvasWorkflow'
 import { firstAnchorImageFor } from './canvasDocumentModel'
+import { wrapMutationForScene } from '../canvas/actions/canvasSyncRuntime'
 
 type ChatSlotPrep =
   | { mode: 'beside'; slotId: undefined }
@@ -102,12 +103,12 @@ export const generationFacade = {
             margin: AI_SLOT_GAP,
           })
         })()
-    const slotId = store.addAiSlotNode(
-      slotPosition,
-      slotSize,
-      params.prompt ?? '',
-      { sceneId: params.sceneId },
-    )
+    // T2.2 Block 1:chat slot 经 wrapMutationForScene → server 模式 create-node submitChange
+    // (slot 落 server,为 Block 3 结果原位 edit 铺地基)。local 模式 gate 不发。sceneId 锚定
+    // params.sceneId(可非活跃画布),不用 wrapMutation(锚 state.sceneId 会快照错画布)。
+    const slotId = wrapMutationForScene(params.sceneId, () =>
+      store.addAiSlotNode(slotPosition, slotSize, params.prompt ?? '', { sceneId: params.sceneId }),
+    )()
     freshlyCreatedChatSlots.add(slotId)
     requestSlotFocus(slotId)
     return { mode: 'slot', slotId }

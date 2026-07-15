@@ -10,6 +10,7 @@ import { AI_SLOT_GAP, reflowRightObstacles } from '../store/aiCanvasWorkflow'
 import { defaultSizeForNodeType } from '../model/canvasNodeRegistry'
 import { rollbackLatestHistoryBaseline, patchCanvasDocument } from '../store/canvasDocumentModel'
 import { debugLogger } from '../store/debugLogStore'
+import { wrapMutationForScene } from './actions/canvasSyncRuntime'
 import { readCanvasImageBlob } from '../lib/canvasImageSource'
 import { MivoImageRequestError } from '../lib/mivoImageClient'
 import {
@@ -104,14 +105,22 @@ export const prepareMaskEditPlaceholder = (
   // (此前按源图全尺寸建占位 → 用户看到 3:2 大占位符);结果比例由生成本身保证
   // (edit 结果与源图同比例),替换时按结果图自然比例等面积落画布(documentSlice)。
   const slotSize = defaultSizeForNodeType('ai-slot')
-  const slotId = useCanvasStore
-    .getState()
-    .addAiSlotNode(
-      { x: source.x + source.width + AI_SLOT_GAP, y: source.y },
-      slotSize,
-      prompt,
-      { sceneId },
-    )
+  // T2.2 Block 1:slot create + 初始 'generating' status(reflow)同包 wrapMutationForScene →
+  // create-node slot + edit-node reflowed nodes + edit-node slot-status 一次提交,使 server base
+  // 含 reflow(防 removeMaskEditPlaceholder 的 position-revert diff 施于未 reflow 的 server base 致错位)。
+  // local 模式 gate 不发;sceneId 锚定入参(可非活跃画布)。
+  const slotId = wrapMutationForScene(sceneId, () => {
+    const id = useCanvasStore
+      .getState()
+      .addAiSlotNode(
+        { x: source.x + source.width + AI_SLOT_GAP, y: source.y },
+        slotSize,
+        prompt,
+        { sceneId },
+      )
+    patchMaskEditSlotStatus(sceneId, id, 'generating', prompt, model)
+    return id
+  })()
   // S01: addAiSlotNode 内部 { history: true } 仅在 sceneId === state.sceneId 时
   // push 基线。非活跃场景下不 push，栈顶是无关快照 —— 此时 baselineSnapshot 必须
   // 置 undefined，否则 removeMaskEditPlaceholder 的 expectedBaseline 校验会误判。
@@ -119,7 +128,6 @@ export const prepareMaskEditPlaceholder = (
     sceneId === useCanvasStore.getState().sceneId
       ? useCanvasStore.getState().historyPast.at(-1)
       : undefined
-  patchMaskEditSlotStatus(sceneId, slotId, 'generating', prompt, model)
   // 镜头跟随契约:占位建好后请求 auto-focus;跨场景 skip 判定在 cameraFocusStore
   // 内(#95 语义:不切场景、不动镜头)。
   useCameraFocusStore.getState().requestPlaceholderFocus(slotId, {
@@ -145,23 +153,29 @@ export const removeMaskEditPlaceholder = (
     baselineSnapshot?: MivoCanvasSnapshot
   } = {},
 ) => {
-  useCanvasStore.setState((current) => {
-    const rollback = context.baselineSnapshot
-      ? rollbackLatestHistoryBaseline(current, sceneId, {
-          removeNodeId: slotId,
-          expectedBaseline: context.baselineSnapshot,
-        })
-      : undefined
-    if (rollback) return rollback
+  // T2.2 Block 1:rollback 同包 wrapMutationForScene → delete-node slot + edit-node reflowed
+  // nodes position-revert(rollbackLatestHistoryBaseline 还原 reflow)一次提交。server base 已含
+  // prepareMaskEditPlaceholder 的 reflow(create+reflow 同包提交过),故 position-revert diff 施于匹配
+  // base,不错位。local 模式 gate 不发但仍 mutate(rollback 语义不破)。
+  wrapMutationForScene(sceneId, () => {
+    useCanvasStore.setState((current) => {
+      const rollback = context.baselineSnapshot
+        ? rollbackLatestHistoryBaseline(current, sceneId, {
+            removeNodeId: slotId,
+            expectedBaseline: context.baselineSnapshot,
+          })
+        : undefined
+      if (rollback) return rollback
 
-    const document = current.canvases[sceneId]
-    if (!document) return {}
-    const nodes = document.nodes.filter((node) => node.id !== slotId)
-    const edges = (document.edges || []).filter((edge) => edge.from !== slotId && edge.to !== slotId)
-    // Filter-removal fallback (rollback didn't apply): route through
-    // patchCanvasDocument so updatedAt bumps on the node/edge removal.
-    return patchCanvasDocument(current, sceneId, { nodes, edges })
-  })
+      const document = current.canvases[sceneId]
+      if (!document) return {}
+      const nodes = document.nodes.filter((node) => node.id !== slotId)
+      const edges = (document.edges || []).filter((edge) => edge.from !== slotId && edge.to !== slotId)
+      // Filter-removal fallback (rollback didn't apply): route through
+      // patchCanvasDocument so updatedAt bumps on the node/edge removal.
+      return patchCanvasDocument(current, sceneId, { nodes, edges })
+    })
+  })()
 
   const title = context.sourceTitle || slotId
   if (context.canceled) {
