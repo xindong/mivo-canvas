@@ -54,6 +54,7 @@ import type { PersistBackend } from '../persist/backend'
 import type { PermissionBackend } from './permissions'
 import { createAssetStore, createFsAssetBackend, resolveAssetStoreDir, type AssetStore } from './assetStore'
 import type { AppEnv } from './types'
+import { parseSerializedOrigin } from './origin-parse'
 
 /**
  * 网关注入的可信身份 header(DP-4 §4)。值 = SSO `username`(maker user id)。
@@ -148,23 +149,27 @@ export const validateSsoConfig = (env: NodeJS.ProcessEnv = process.env): string[
 }
 
 /**
- * P2 代码加固:debug-logs origin 启动期 fail-visible 守卫。
+ * P2 代码加固:debug-logs origin 启动期 fail-visible 守卫(#253 backlog #253-1/#253-2 修复)。
  *
  * 痛点:server/routes/debug-logs.ts 在生产边界(`isProdBoundary` = MIVO_PUBLIC=1 或
  * NODE_ENV=production,与本文件 validateSsoConfig 同式)下,同源 POST 走 `isSameOrigin` →
  * `getTrustedExternalOrigin` 需 `MIVO_PUBLIC_ORIGIN` 或 `MIVO_DEBUG_TRUST_XFF=1` 才非空;
- * 跨域走 `MIVO_DEBUG_ALLOWED_ORIGINS`。三者全空 → 同源 POST fail-closed 403(每个请求静默 403),
- * 线上 pm2 env 缺这些变量即 debug-logs 全 403 刷屏。
+ * 跨域走 `MIVO_DEBUG_ALLOWED_ORIGINS`。同源 POST 缺 trusted origin → fail-closed 403
+ * (每个请求静默 403),线上 pm2 env 缺这些变量即 debug-logs 全 403 刷屏。
  *
- * 守卫(lead Decisions 划定):isProdBoundary 为真 AND 三个 origin env 全空/未设
- * (MIVO_PUBLIC_ORIGIN trim 后空 + MIVO_DEBUG_TRUST_XFF!=='1' + MIVO_DEBUG_ALLOWED_ORIGINS
- * trim 后空) → 返回告警串(供 index.ts 启动 console.error)。仅告警不硬失败(warn 语义,继续
- * serve;debug-logs 之外功能正常);配任一 env → 无告警。
+ * #253-1 修复(D1,lead Decision):原守卫"三个 origin env 全空才告警"有盲区——仅配
+ * MIVO_DEBUG_ALLOWED_ORIGINS(跨域 allowlist)就压制了告警,但 allowlist 只放行跨域命中,
+ * 同源 POST 仍因 isSameOrigin 无 trusted origin 而 403。改为:isProdBoundary 为真 AND
+ * MIVO_PUBLIC_ORIGIN trim 后空 AND MIVO_DEBUG_TRUST_XFF!=='1' → 告警(allowlist 不再压制)。
+ * 告警文案点明 allowlist 不覆盖同源。既有"仅 allowlist → 无告警"用例已反转(语义变更是本次
+ * 目的,非回归)。
  *
- * 边界:只检测"全缺失",不做 origin 语法校验(那需复用 debug-logs.ts 的 parseSerializedOrigin,
- * 属 gate 逻辑,不在本守卫范围)。仅 MIVO_DEBUG_ALLOWED_ORIGINS 配置(无 trusted origin)不触发——
- * 该配置只放行跨域 allowlist 命中,同源 POST 仍因 isSameOrigin 无 trusted origin 而 403;此为 lead
- * 划定的"全缺失"触发边界,部分错配留 ops 据运行期 403 日志另行发现。
+ * #253-2 修复(D2,lead Decision):MIVO_PUBLIC_ORIGIN 非空时,用与 debug-logs gate **同一个**
+ * parseSerializedOrigin(单一真相源 server/lib/origin-parse.ts,非复制粘贴第二份)校验语法;
+ * 解析失败 → 独立告警(点明"已配置但不可解析,同源判定仍会 fail-closed 403")。D1/D2 互斥
+ * (D1 需 publicOrigin 空、D2 需 publicOrigin 非空),至多触发其一。
+ *
+ * D3:守卫仍为 warn 语义(console.error 发射、不阻断 serve,见 index.ts),与 #253 一致。
  */
 export const validateDebugLogsOriginConfig = (env: NodeJS.ProcessEnv = process.env): string[] => {
   const warnings: string[] = []
@@ -172,11 +177,30 @@ export const validateDebugLogsOriginConfig = (env: NodeJS.ProcessEnv = process.e
   if (!isProdBoundary) return warnings
   const publicOrigin = env.MIVO_PUBLIC_ORIGIN?.trim() ?? ''
   const trustXff = env.MIVO_DEBUG_TRUST_XFF === '1'
-  const allowedOrigins = env.MIVO_DEBUG_ALLOWED_ORIGINS?.trim() ?? ''
-  if (publicOrigin || trustXff || allowedOrigins) return warnings
-  warnings.push(
-    'debug-logs trusted origin config missing in production boundary (MIVO_PUBLIC=1 or NODE_ENV=production): MIVO_PUBLIC_ORIGIN unset, MIVO_DEBUG_TRUST_XFF!=1, MIVO_DEBUG_ALLOWED_ORIGINS unset. Same-origin browser POST /api/mivo/debug-logs will fail-closed to 403 on every request (isSameOrigin needs a trusted external origin). Set MIVO_PUBLIC_ORIGIN (e.g. https://app.example) to the public origin clients reach, OR set MIVO_DEBUG_TRUST_XFF=1 behind a gateway that scrubs X-Forwarded-Proto, OR set MIVO_DEBUG_ALLOWED_ORIGINS for cross-origin. Without one of these the client debugLogger POSTs are all 403.',
-  )
+
+  // D1(#253-1):生产边界 + MIVO_PUBLIC_ORIGIN 空 + MIVO_DEBUG_TRUST_XFF!=1 → 告警。
+  // 仅配 MIVO_DEBUG_ALLOWED_ORIGINS 不再压制告警——allowlist 只放行跨域命中,同源 POST 仍因
+  // isSameOrigin 无 trusted origin 而 fail-closed 403(原盲区)。D1 触发即返回(publicOrigin 空
+  // → D2 不可达,D1/D2 互斥)。
+  if (!publicOrigin && !trustXff) {
+    warnings.push(
+      'debug-logs same-origin trusted-origin config missing in production boundary (MIVO_PUBLIC=1 or NODE_ENV=production): MIVO_PUBLIC_ORIGIN unset and MIVO_DEBUG_TRUST_XFF!=1. Same-origin browser POST /api/mivo/debug-logs will fail-closed to 403 on every request (isSameOrigin needs a trusted external origin). MIVO_DEBUG_ALLOWED_ORIGINS does NOT cover same-origin POSTs — it only allowlists cross-origin hits; isSameOrigin still needs MIVO_PUBLIC_ORIGIN or MIVO_DEBUG_TRUST_XFF=1. Set MIVO_PUBLIC_ORIGIN (e.g. https://app.example) to the public origin clients reach, OR set MIVO_DEBUG_TRUST_XFF=1 behind a gateway that scrubs X-Forwarded-Proto. Without one of these, client debugLogger same-origin POSTs are all 403.',
+    )
+    return warnings
+  }
+
+  // D2(#253-2):MIVO_PUBLIC_ORIGIN 非空 → 用与 debug-logs gate 同一个 parseSerializedOrigin 校验
+  // 语法(单一真相源 server/lib/origin-parse.ts)。解析失败 → 独立告警(已配但不可解析,同源判定
+  // 仍 fail-closed 403)。trustXff 路径不校验语法(XFF 来自网关,运行期 gate 自行解析 Host/Proto)。
+  if (publicOrigin) {
+    const parsed = parseSerializedOrigin(publicOrigin)
+    if (!parsed) {
+      warnings.push(
+        'debug-logs MIVO_PUBLIC_ORIGIN is configured but not a parseable serialized origin (RFC 6454 / WHATWG Origin syntax: must be http(s)://host[:port] with no userinfo/path/query/fragment/null). Same-origin判定 still fail-closed to 403 — isSameOrigin parses MIVO_PUBLIC_ORIGIN via the same parser the debug-logs gate uses (server/lib/origin-parse.ts). Fix the value (e.g. https://app.example) so same-origin browser POST /api/mivo/debug-logs is allowed.',
+      )
+    }
+  }
+
   return warnings
 }
 

@@ -34,13 +34,25 @@ describe('T1.4 validateSsoConfig(生产告警,Greptile finding 2 防静默共享
   })
 })
 
-describe('P2 validateDebugLogsOriginConfig(debug-logs origin 启动期 fail-visible 守卫)', () => {
-  it('非生产 → 无告警(MIVO_PUBLIC 未设 / NODE_ENV 非 production)', () => {
+describe('P2 validateDebugLogsOriginConfig(debug-logs origin 启动期 fail-visible 守卫;#253-1/#253-2 修复)', () => {
+  it('SC-4 非生产 → 一律无告警(MIVO_PUBLIC 未设 / NODE_ENV 非 production)', () => {
     expect(validateDebugLogsOriginConfig({})).toEqual([])
     expect(validateDebugLogsOriginConfig({ NODE_ENV: 'development' })).toEqual([])
+    // 非生产即使乱配 MIVO_PUBLIC_ORIGIN 也不告警(语法校验仅生产边界触发)
+    expect(
+      validateDebugLogsOriginConfig({ NODE_ENV: 'development', MIVO_PUBLIC_ORIGIN: 'garbage' }),
+    ).toEqual([])
   })
-  it('SC-10 正向:生产 + 三个 origin env 全空 → 告警(指明 403 + MIVO_PUBLIC_ORIGIN)', () => {
-    // MIVO_PUBLIC=1 且不配任何 origin env → 守卫触发
+  it('SC-1(D1 反转)生产 + 仅配 MIVO_DEBUG_ALLOWED_ORIGINS → 告警(allowlist 不覆盖同源 POST)', () => {
+    // D1 修复(#253-1):原"仅 allowlist → 无告警"用例反转。allowlist 只放行跨域命中,
+    // 同源 POST 仍因 isSameOrigin 无 trusted origin 而 403 → 守卫须告警。
+    const w = validateDebugLogsOriginConfig({ MIVO_PUBLIC: '1', MIVO_DEBUG_ALLOWED_ORIGINS: 'https://app.example' })
+    expect(w.length).toBe(1)
+    expect(w[0]).toContain('403')
+    expect(w[0]).toContain('does NOT cover same-origin') // 点明 allowlist 不覆盖同源
+    expect(w[0]).toContain('MIVO_PUBLIC_ORIGIN') // 指明解法
+  })
+  it('生产 + 三个 origin env 全空 → 告警(D1 基线;指明 403 + MIVO_PUBLIC_ORIGIN)', () => {
     const w = validateDebugLogsOriginConfig({ MIVO_PUBLIC: '1' })
     expect(w.length).toBe(1)
     expect(w[0]).toContain('403')
@@ -50,20 +62,55 @@ describe('P2 validateDebugLogsOriginConfig(debug-logs origin 启动期 fail-visi
     expect(w2.length).toBe(1)
     expect(w2[0]).toContain('403')
   })
-  it('SC-10 反向:生产 + 配了 MIVO_PUBLIC_ORIGIN → 无告警', () => {
+  it('SC-2 生产 + MIVO_PUBLIC_ORIGIN=合法值 → 无告警;+ MIVO_DEBUG_TRUST_XFF=1 → 无告警', () => {
+    // 合法 origin(可解析)→ 无告警
     expect(
       validateDebugLogsOriginConfig({ MIVO_PUBLIC: '1', MIVO_PUBLIC_ORIGIN: 'https://app.example' }),
     ).toEqual([])
-  })
-  it('生产 + 配了 MIVO_DEBUG_TRUST_XFF=1 → 无告警(非 "1" 不算配置)', () => {
-    expect(validateDebugLogsOriginConfig({ MIVO_PUBLIC: '1', MIVO_DEBUG_TRUST_XFF: '1' })).toEqual([])
-    // 'true' / '0' 不等于 '1' → 仍告警(与 debug-logs.ts gate 的 ==="1" 判定一致)
-    expect(validateDebugLogsOriginConfig({ MIVO_PUBLIC: '1', MIVO_DEBUG_TRUST_XFF: 'true' }).length).toBe(1)
-  })
-  it('生产 + 配了 MIVO_DEBUG_ALLOWED_ORIGINS → 无告警', () => {
+    // 合法 origin + 带端口
     expect(
-      validateDebugLogsOriginConfig({ MIVO_PUBLIC: '1', MIVO_DEBUG_ALLOWED_ORIGINS: 'https://app.example' }),
+      validateDebugLogsOriginConfig({ MIVO_PUBLIC: '1', MIVO_PUBLIC_ORIGIN: 'http://127.0.0.1:6276' }),
     ).toEqual([])
+    // XFF=1 → 无告警
+    expect(validateDebugLogsOriginConfig({ MIVO_PUBLIC: '1', MIVO_DEBUG_TRUST_XFF: '1' })).toEqual([])
+    // 合法 origin + allowlist 同配 → 无告警(两者都不触发)
+    expect(
+      validateDebugLogsOriginConfig({
+        MIVO_PUBLIC: '1',
+        MIVO_PUBLIC_ORIGIN: 'https://app.example',
+        MIVO_DEBUG_ALLOWED_ORIGINS: 'https://other.example',
+      }),
+    ).toEqual([])
+  })
+  it('SC-2 边界:MIVO_DEBUG_TRUST_XFF 非 "1" 仍告警(与 debug-logs gate 的 ==="1" 判定一致)', () => {
+    // 'true' / '0' 不等于 '1' → 仍告警(D1 触发)
+    expect(validateDebugLogsOriginConfig({ MIVO_PUBLIC: '1', MIVO_DEBUG_TRUST_XFF: 'true' }).length).toBe(1)
+    expect(validateDebugLogsOriginConfig({ MIVO_PUBLIC: '1', MIVO_DEBUG_TRUST_XFF: '0' }).length).toBe(1)
+  })
+  it('SC-3(D2)生产 + MIVO_PUBLIC_ORIGIN=garbage(不可解析)→ 独立语法告警', () => {
+    // 无 scheme → new URL 抛 → parseSerializedOrigin 返 null
+    const w = validateDebugLogsOriginConfig({ MIVO_PUBLIC: '1', MIVO_PUBLIC_ORIGIN: 'not-a-valid-origin' })
+    expect(w.length).toBe(1)
+    expect(w[0]).toContain('403')
+    expect(w[0]).toContain('not a parseable serialized origin')
+    // 带 path 的 origin(可被 new URL 解析但 pathname!=='/')→ 仍不可解析
+    const w2 = validateDebugLogsOriginConfig({ MIVO_PUBLIC: '1', MIVO_PUBLIC_ORIGIN: 'https://app.example/path' })
+    expect(w2.length).toBe(1)
+    expect(w2[0]).toContain('not a parseable serialized origin')
+    // 非 http(s) scheme → 不可解析
+    const w3 = validateDebugLogsOriginConfig({ MIVO_PUBLIC: '1', MIVO_PUBLIC_ORIGIN: 'ftp://app.example' })
+    expect(w3.length).toBe(1)
+    expect(w3[0]).toContain('not a parseable serialized origin')
+  })
+  it('SC-3/SC-1 互斥:garbage origin + allowlist → 仅 D2 语法告警(D1 不叠加)', () => {
+    // publicOrigin 非空(垃圾)→ D1 不触发(需 publicOrigin 空),D2 触发;至多一条告警
+    const w = validateDebugLogsOriginConfig({
+      MIVO_PUBLIC: '1',
+      MIVO_PUBLIC_ORIGIN: 'garbage',
+      MIVO_DEBUG_ALLOWED_ORIGINS: 'https://app.example',
+    })
+    expect(w.length).toBe(1)
+    expect(w[0]).toContain('not a parseable serialized origin')
   })
 })
 

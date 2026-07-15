@@ -35,9 +35,11 @@ for (const w of validateSsoConfig()) {
   console.warn(`[mivo-bff] WARN: ${w}`)
 }
 
-// P2 代码加固:debug-logs origin 启动期 fail-visible 守卫——生产边界 + 三个 origin env 全空 →
-// error 级告警(不阻断 serve,debug-logs 外功能正常),防线上 pm2 env 缺 MIVO_PUBLIC_ORIGIN 时
-// 每个 /api/mivo/debug-logs POST 静默 403。见 owner.ts validateDebugLogsOriginConfig。
+// P2 代码加固:debug-logs origin 启动期 fail-visible 守卫——生产边界 + MIVO_PUBLIC_ORIGIN 空 且
+// MIVO_DEBUG_TRUST_XFF!=1 → error 级告警(D1:allowlist 不压制,仅配 MIVO_DEBUG_ALLOWED_ORIGINS 仍告警,
+// 因 allowlist 只放行跨域、同源 POST 仍 403);MIVO_PUBLIC_ORIGIN 配了但不可解析 → 独立语法告警(D2,
+// 与 debug-logs gate 同一 parseSerializedOrigin)。不阻断 serve,debug-logs 外功能正常。见
+// owner.ts validateDebugLogsOriginConfig + server/lib/origin-parse.ts(单一真相源)。
 for (const w of validateDebugLogsOriginConfig()) {
   console.error(`[mivo-bff] ERROR: ${w}`)
 }
