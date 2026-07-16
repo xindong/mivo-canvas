@@ -2608,4 +2608,30 @@ describe('P3 (demo-seed-migration-skip) — migration op terminal 降 WARN + 既
     expect(errorLog).not.toHaveBeenCalledWith('Write Retry Queue', expect.stringContaining('rejected by server'))
     expect(warnLog).toHaveBeenCalledWith('Write Retry Queue', expect.stringContaining('[migration]'))
   })
+
+  // P1-2:coalesce 时 migration 标志按 incoming 收窄——existing.migration && (incoming.migration ?? false)。
+  //   migration record pending 期间用户 rename(updateProject)同资源 → 合并后 migration 收窄为 false
+  //   (用户语义优先)→ drain terminal 走 ERROR + toast,不再降 WARN(否则用户主动操作失败被静默降级)。
+  it('P1-2: migration record pending + 用户 updateProject 同资源 coalesce → migration 收窄 false → terminal ERROR+toast(不降 WARN)', async () => {
+    // executor 返 rejected terminal → 验证 coalesce 后 rec.migration=false 走 error+toast(非 migration warn)
+    const exec = vi.fn(async (): Promise<WriteOutcome> => ({ status: 'rejected', body: { error: 'unknown-project' } }))
+    const q = makeQueue(exec)
+    // 1) migration createProject(p1)入队 → pending record migration=true
+    await q.enqueue({ kind: 'createProject', name: 'P1', id: 'p1' }, { migration: true })
+    expect((await __dumpWritesForTest())).toHaveLength(1)
+    expect((await __dumpWritesForTest())[0]!.migration).toBe(true)
+    // 2) 用户 rename(updateProject p1)同 resourceKey `project:p1` → coalesce(create+update → create 合并,
+    //    非 cancel)→ existing.migration(true) && incoming.migration(未带→false) = false(用户语义优先)
+    await q.enqueue({ kind: 'updateProject', projectId: 'p1', name: 'P1-renamed' })
+    expect((await __dumpWritesForTest())).toHaveLength(1) // coalesced(非新记录)
+    expect((await __dumpWritesForTest())[0]!.migration).toBe(false) // 收窄为 false
+    // 3) drain → terminal reject → rec.migration=false → error + toast(不降 WARN,不带 [migration])
+    const r = await q.drain()
+    expect(r.terminals).toBe(1)
+    expect(errorLog).toHaveBeenCalledWith('Write Retry Queue', expect.stringContaining('rejected by server'))
+    expect(toastError).toHaveBeenCalled()
+    expect(warnLog).not.toHaveBeenCalledWith('Write Retry Queue', expect.stringContaining('[migration]'))
+    // terminal 出队
+    expect((await __dumpWritesForTest())).toHaveLength(0)
+  })
 })

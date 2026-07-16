@@ -1759,4 +1759,84 @@ describe('D2 migration-on-boot + D3 restore-safe edge (lead SC-B/D/E)', () => {
     await backfillChatAfterDrain('real-canvas-uuid', server.adapter)
     expect(listChatSpy).toHaveBeenCalledWith('real-canvas-uuid')
   })
+
+  // P1-1:纯 demo 工作区(候选全被 DEMO_PROJECT_ID_SET 滤除)→ 0 op,但收集成功 → flush 种 marker 收敛
+  //   (否则每 boot 重收集/过滤/log 刷屏:demo marker 每 boot 为 null)。复审复现:conceptBattlepass +
+  //   character-flow only → marker null(修前);修后 marker=done。二次 boot 不再收集(无新 POST)。
+  it('P1-1: 纯 demo(无真实 uuid)server 空 → flush 0-op 种 marker(收集 ok);二次 boot 不再收集', async () => {
+    const server = makeMigrationServer()
+    const calls = server.calls
+    // 纯 demo:demo project + demo scene canvases(character-flow/variants 挂 conceptBattlepass;无真实 uuid)
+    resetStoreProjects([proj(DEMO_PROJECT_IDS.conceptBattlepass, 'Concept Battlepass')])
+    useCanvasStore.setState({
+      sceneId: '' as never,
+      canvases: {
+        'character-flow': doc(DEMO_PROJECT_IDS.conceptBattlepass, 'character-flow'),
+        variants: doc(DEMO_PROJECT_IDS.conceptBattlepass, 'variants'),
+      } as never,
+    })
+    await hydrateFromServer(server.adapter, hydrateOpts)
+    // 收集后 0 op(demo 全被 DEMO_PROJECT_ID_SET 滤除)+ migrationCollectionOk=true(lists 未抛)
+    startPersistWriteQueue({ fetch: server.fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    await __flushServerMigrationForTest(server.adapter)
+    await flush()
+    // demo 不上迁(0 POST);但 marker 必种(0 op + 收集 ok → 收敛;修前此处 null → 每 boot 重收集刷屏)
+    expect(calls.filter((c) => c.method === 'POST')).toHaveLength(0)
+    expect(localStorage.getItem('mivo:server-migration:anonymous')).toBe('done')
+
+    // 二次 boot:stop queue + 清 IDB(保留 marker;不 __resetPersistBoot 否则清 marker)
+    stopPersistWriteQueue()
+    await __resetWriteQueueDb()
+    resetStoreProjects([proj(DEMO_PROJECT_IDS.conceptBattlepass, 'Concept Battlepass')])
+    useCanvasStore.setState({
+      sceneId: '' as never,
+      canvases: { 'character-flow': doc(DEMO_PROJECT_IDS.conceptBattlepass, 'character-flow') } as never,
+    })
+    await hydrateFromServer(server.adapter, hydrateOpts)
+    startPersistWriteQueue({ fetch: server.fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    await __flushServerMigrationForTest(server.adapter) // marker 已种 → 0-op 跳过 seed(幂等,不重收集)
+    await flush()
+    // 二次 boot 不再收集:POST 计数不增(仍 0);marker 仍 done
+    expect(calls.filter((c) => c.method === 'POST')).toHaveLength(0)
+    expect(localStorage.getItem('mivo:server-migration:anonymous')).toBe('done')
+  })
+
+  // P1-1 收集失败路径:hydrate listProjects 抛 → migrationCollectionOk=false → flush 0-op 不盲种 marker
+  //   (失败路径语义不变:不知有无 local-only 候选 → 不种,下次 boot 重试;否则用户数据永久滞留 local)。
+  it('P1-1 收集失败: hydrate listProjects 抛 → flush 0-op 不种 marker(失败路径语义不变,下次 boot 重试)', async () => {
+    const throwAdapter: ServerPersistAdapter = {
+      listProjects: async () => { throw new Error('listProjects boom') },
+      listCanvas: async () => ({ canvases: [] }),
+      listChatMessages: async () => ({ messages: [], orderRevision: 0 }),
+    } as unknown as ServerPersistAdapter
+    const server = makeMigrationServer()
+    // 纯 demo 本地(marker 未种;listProjects 抛 → 收集不健康 → 不盲种)
+    resetStoreProjects([proj(DEMO_PROJECT_IDS.conceptBattlepass, 'Concept BP')])
+    useCanvasStore.setState({ sceneId: '' as never, canvases: {} })
+    await hydrateFromServer(throwAdapter, hydrateOpts) // listProjects 抛 → step1 catch → migrationCollectionOk=false
+    startPersistWriteQueue({ fetch: server.fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    await __flushServerMigrationForTest(server.adapter) // 0 op + flag=false → 不种 marker
+    await flush()
+    // 收集失败 → 不盲种(下次 boot 重试)
+    expect(localStorage.getItem('mivo:server-migration:anonymous')).toBeNull()
+  })
+
+  // P1-3:standalone demo scene(task-states/empty)不在 DEMO_SCENE_PROJECT_MAP(仅 4 grouped),
+  //   用完整 DemoSceneId 集合(DEMO_SCENE_ID_SET)判定后也跳过 server chat hydrate(否则每 boot 打 404)。
+  //   复审复现场景(task-states/empty 每 boot 404)转正式回归。
+  it('P1-3: standalone demo scene(task-states/empty)chat hydrate 也跳过 server(完整 6 scene 覆盖)', async () => {
+    const server = makeMigrationServer()
+    const listChatSpy = vi.spyOn(server.adapter, 'listChatMessages')
+    // task-states/empty:standalone,不在 DEMO_SCENE_PROJECT_MAP(4 grouped)→ 修前漏判 → 调 listChatMessages 404
+    await backfillChatAfterDrain('task-states', server.adapter)
+    expect(listChatSpy).not.toHaveBeenCalled()
+    await backfillChatAfterDrain('empty', server.adapter)
+    expect(listChatSpy).not.toHaveBeenCalled()
+    // 对照:非 demo scene → 正常调 listChatMessages
+    await backfillChatAfterDrain('real-canvas-uuid', server.adapter)
+    expect(listChatSpy).toHaveBeenCalledWith('real-canvas-uuid')
+  })
 })

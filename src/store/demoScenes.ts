@@ -40,6 +40,24 @@ export const DEMO_SCENE_PROJECT_MAP: Partial<Record<DemoSceneId, string>> = {
   'stress-test': DEMO_PROJECT_IDS.productDirection,
 }
 
+// P1-3(2026-07-16 demo-seed-migration-skip):全部 DemoSceneId 的单一真相源。hydrate chat 的 demo 判定
+//   必须覆盖全部 6 个 scene(含 standalone 的 task-states/empty),不能只查 DEMO_SCENE_PROJECT_MAP——
+//   后者仅 4 个挂 demo project 的 grouped scene,task-states/empty 不在其中 → 漏判 → 每 boot 打 server
+//   404。exhaustive check 钉死:给 DemoSceneId 加成员不进此数组 → Exclude 非 never → 编译失败
+//   (镜像 types/mivoCanvas.ts 的 MARKUP_KIND_VALUES 同型 _EXHAUSTIVE 模式)。
+export const DEMO_SCENE_IDS: readonly DemoSceneId[] = [
+  'character-flow',
+  'variants',
+  'task-states',
+  'stress-test',
+  'asset-handoff',
+  'empty',
+]
+export const DEMO_SCENE_ID_SET: ReadonlySet<string> = new Set<string>(DEMO_SCENE_IDS)
+export const DEMO_SCENE_IDS_EXHAUSTIVE: Exclude<DemoSceneId, (typeof DEMO_SCENE_IDS)[number]> extends never
+  ? true
+  : never = true
+
 const image = (
   label: string,
   mood: 'character' | 'environment' | 'variant' | 'asset',

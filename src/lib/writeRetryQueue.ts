@@ -1676,6 +1676,12 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
           return existing.id
         }
         existing.op = combined
+        // P1-2(2026-07-16 demo-seed-migration-skip):coalesce 时 migration 标志按 incoming 收窄——
+        //   existing.migration && (opts?.migration ?? false)。只有双方都是 migration 才保持 true;任一侧是
+        //   用户写(非 migration)即降 false(用户语义优先)——否则 migration record pending 期间用户 rename 同
+        //   资源,合并后仍 migration=true → drain terminal 走 termLog WARN + 不弹 toast(用户主动操作失败被
+        //   静默降级)。降 false 后恢复 ERROR + toast(drain switch 的 termLog/termToast 按 rec.migration 分流)。
+        existing.migration = existing.migration && (opts?.migration ?? false)
         existing.idempotencyKey = newKey()
         existing.attempts = 0
         existing.nextAttemptAt = ts
