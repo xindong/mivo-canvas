@@ -63,6 +63,7 @@ import { __resetWriteQueueDb, __seedWritesForTest } from './writeRetryQueue'
 import { ANONYMOUS_USER_ID, setPersistUserId, __resetPersistUserId } from './persistUserId'
 import type { ServerPersistAdapter } from './serverPersistAdapter'
 import type { Project, CanvasMeta } from '../../shared/persist-contract.ts'
+import { DEMO_PROJECT_IDS } from '../store/demoScenes'
 
 const KEY_A = 'mivo_aaa_user_a'
 const authHeaders = (): Record<string, string> => ({ 'x-mivo-api-key': KEY_A })
@@ -1712,5 +1713,50 @@ describe('D2 migration-on-boot + D3 restore-safe edge (lead SC-B/D/E)', () => {
     await hydrateFromServer(server.adapter, hydrateOpts)
     // F2:replace = C 过滤后服务端[p1] ∪ 本地 pending-create[p2] = [p1, p2](无 F2 则丢 p2 = [p1] = 线程4 残根)
     expect(useCanvasStore.getState().projects.map((p) => p.id).sort()).toEqual(['p1', 'p2'])
+  })
+
+  // ── P1 (2026-07-16 demo-seed-migration-skip):D2 候选跳过 demo seed + demo scene chat 免噪 ──
+  it('P1: local 含 demo project/canvas + 真实 uuid project/canvas,server 空 → 只 enqueue 真实 uuid,demo 跳过(不撞 409/404)', async () => {
+    const server = makeMigrationServer()
+    const calls = server.calls
+    // 本地:demo project(全局稳定 id)+ 真实 uuid project;demo canvas(character-flow)+ 真实 canvas
+    resetStoreProjects([
+      proj(DEMO_PROJECT_IDS.conceptBattlepass, 'Concept Battlepass'),
+      proj('real-proj-1', 'Real Project'),
+    ])
+    useCanvasStore.setState({
+      canvases: {
+        'character-flow': doc(DEMO_PROJECT_IDS.conceptBattlepass, 'character-flow'),
+        'real-canvas-1': doc('real-proj-1', 'Real Canvas'),
+      } as never,
+    })
+    await hydrateFromServer(server.adapter, hydrateOpts)
+    startPersistWriteQueue({ fetch: server.fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    await __flushServerMigrationForTest(server.adapter)
+    await flush()
+    // demo project/canvas 不上迁(不 POST),只 POST 真实 uuid
+    const projectPosts = calls.filter((c) => c.method === 'POST' && c.path === '/api/projects').map((c) => (c.body as { id: string }).id)
+    const canvasPosts = calls.filter((c) => c.method === 'POST' && c.path === '/api/canvas').map((c) => (c.body as { id: string }).id)
+    expect(projectPosts.sort()).toEqual(['real-proj-1'])
+    expect(canvasPosts.sort()).toEqual(['real-canvas-1'])
+    // demo 本地仍可见(union 保留,侧栏种子不丢)
+    expect(useCanvasStore.getState().projects.map((p) => p.id)).toContain(DEMO_PROJECT_IDS.conceptBattlepass)
+    // 真实 uuid 全成功 → marker 种(P1 后 demo 不再阻塞 marker 收敛)
+    expect(localStorage.getItem('mivo:server-migration:anonymous')).toBe('done')
+    // server 只拿到真实 uuid(demo 未上迁)
+    expect(server.state.projects.map((p) => p.id).sort()).toEqual(['real-proj-1'])
+    expect(server.state.canvases.map((c) => c.id).sort()).toEqual(['real-canvas-1'])
+  })
+
+  it('P1 附加: demo scene 的 chat hydrate 跳过 server(demo canvas 不上迁 → 不再每 boot 404 WARN)', async () => {
+    const server = makeMigrationServer()
+    const listChatSpy = vi.spyOn(server.adapter, 'listChatMessages')
+    // demo scene → hydrateChatForScene early-return,不调 listChatMessages,不打 404 WARN
+    await backfillChatAfterDrain('character-flow', server.adapter)
+    expect(listChatSpy).not.toHaveBeenCalled()
+    // 对照:非 demo scene → 正常调 listChatMessages(不跳过)
+    await backfillChatAfterDrain('real-canvas-uuid', server.adapter)
+    expect(listChatSpy).toHaveBeenCalledWith('real-canvas-uuid')
   })
 })

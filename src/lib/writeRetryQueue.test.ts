@@ -2549,3 +2549,63 @@ describe('F2 (T2.2 Block 2 review) — seq 防逆序 stale asset ref', () => {
     expect(Math.max(...recoverSeqs)).toBe(4) // > fallback 3
   })
 })
+
+// ── P3 (2026-07-16 demo-seed-migration-skip):migration-on-boot op terminal 日志降 WARN + 不弹 toast;
+//    真实用户写保持 ERROR 不变;既有 migration record drain terminal 后出队清空(最多再刷一轮) ──
+describe('P3 (demo-seed-migration-skip) — migration op terminal 降 WARN + 既有队列自清', () => {
+  it('migration createProject drain 404 rejected → warn 带 [migration] 标识 + 不弹 toast + terminal 出队;非 migration 同场景 → error + toast(行为不变)', async () => {
+    // migration record(flushServerMigration 经 enqueuePersistWrite(op, {migration:true}) 入队)
+    const execMig = vi.fn(async (): Promise<WriteOutcome> => ({
+      status: 'rejected',
+      body: { error: 'unknown-project' },
+    }))
+    const qMig = makeQueue(execMig)
+    await qMig.enqueue({ kind: 'createProject', name: 'P', id: 'p1' }, { migration: true })
+    expect((await __dumpWritesForTest())).toHaveLength(1)
+    const r = await qMig.drain()
+    expect(r.terminals).toBe(1)
+    // migration → termLog 走 warn([migration] 标识),不 error,不 toast
+    expect(warnLog).toHaveBeenCalledWith('Write Retry Queue', expect.stringContaining('[migration]'))
+    expect(warnLog).toHaveBeenCalledWith('Write Retry Queue', expect.stringContaining('rejected by server'))
+    expect(errorLog).not.toHaveBeenCalledWith('Write Retry Queue', expect.stringContaining('rejected by server'))
+    expect(toastError).not.toHaveBeenCalled()
+    // 出队行为不变:terminal reject → recordTerminal + deleteWrite → 队列空
+    expect((await __dumpWritesForTest())).toHaveLength(0)
+
+    // 对照:非 migration(用户 mutation)同 op 同 404 → error + toast(行为不变)
+    const execUser = vi.fn(async (): Promise<WriteOutcome> => ({ status: 'rejected', body: { error: 'unknown-project' } }))
+    const qUser = makeQueue(execUser)
+    await qUser.enqueue({ kind: 'createProject', name: 'P', id: 'p2' }) // 不带 migration
+    const r2 = await qUser.drain()
+    expect(r2.terminals).toBe(1)
+    expect(errorLog).toHaveBeenCalledWith('Write Retry Queue', expect.stringContaining('rejected by server'))
+    expect(toastError).toHaveBeenCalled()
+  })
+
+  it('既有 migration record drain terminal 后出队清空(P1 停重收集来源后不再新增 → 最多再刷一轮)', async () => {
+    // 模拟上次 boot 排入、尚未 drain 的 migration createProject record(若上次崩在 drain 前)。
+    // P1 后 flushServerMigration 不再 enqueue demo op → 此类存量记录 drain 一次即清,不再新增。
+    const exec = vi.fn(async (): Promise<WriteOutcome> => ({ status: 'rejected', body: { error: 'project-exists' } }))
+    const q = makeQueue(exec)
+    await __seedWritesForTest([{
+      id: 'pending-migration-demo',
+      idempotencyKey: 'k-demo',
+      userId: 'userA',
+      op: { kind: 'createProject', name: 'Concept Battlepass', id: 'project-demo-concept-battlepass' },
+      resourceKey: 'project:project-demo-concept-battlepass',
+      createdAt: 1000,
+      attempts: 0,
+      nextAttemptAt: 1000,
+      status: 'pending',
+      migration: true,
+    }])
+    expect((await __dumpWritesForTest())).toHaveLength(1)
+    const r = await q.drain()
+    expect(r.terminals).toBe(1)
+    // terminal reject → deleteWrite 出队 → 队列清空(下次 boot P1 不再重收集 demo → 不再入队)
+    expect((await __dumpWritesForTest())).toHaveLength(0)
+    // migration → warn 不 error(降噪生效)
+    expect(errorLog).not.toHaveBeenCalledWith('Write Retry Queue', expect.stringContaining('rejected by server'))
+    expect(warnLog).toHaveBeenCalledWith('Write Retry Queue', expect.stringContaining('[migration]'))
+  })
+})

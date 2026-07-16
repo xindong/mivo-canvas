@@ -35,12 +35,21 @@ import { debugLogger } from '../store/debugLogStore'
 import { toastFeedback } from '../store/toastStore'
 import { defaultFetch, type FetchAdapterOptions, type FetchLike, type GetAuthHeaders } from './serverPersistAdapter'
 import type { ChatMessage } from '../store/chatStore'
-import type { CanvasDocument } from '../types/mivoCanvas'
+import type { CanvasDocument, DemoSceneId } from '../types/mivoCanvas'
 import type { Revision, UserStateEntry, RecordEntry } from '../../shared/persist-contract.ts'
+// P1(2026-07-16 demo-seed-migration-skip):demo seed 真相源 —— demoScenes 是纯数据(只 import lib/model/types,
+// 不引 store),静态 import 无环(防环注释只禁 canvasStore)。用于派生 DEMO_PROJECT_ID_SET 跳过 demo 上迁。
+import { DEMO_PROJECT_IDS, DEMO_SCENE_PROJECT_MAP } from '../store/demoScenes'
 
 const SOURCE = 'Persist Boot'
 
 const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e))
+
+// P1(2026-07-16 demo-seed-migration-skip):demo seed 的 project id 集合(从 DEMO_PROJECT_IDS 派生,不手写第二份清单)。
+//   D2 上迁跳过 demo —— demo id 全局稳定(project-demo-concept-battlepass 等),per-user owner 下跨 owner 碰撞
+//   409 project-exists / 404 unknown-project(首建用户独占 demo id,其余用户每次打开刷 ERROR);且 demo 是种子非
+//   用户数据,不该 per-user 上迁。本地 union 仍保留 demo 可见(侧栏种子项目不丢),仅跳过 createProject/createCanvas op 收集。
+const DEMO_PROJECT_ID_SET: ReadonlySet<string> = new Set<string>(Object.values(DEMO_PROJECT_IDS))
 
 // 生产 fetch opts(与 serverPersistAdapterSelector 的 wired adapter 同源:default fetch + '' baseUrl + lazy authHeaders)。
 // executor 与 adapter 必须走同一 BFF + 同一鉴权,防双实现漂移(P1-1 接线硬约束)。
@@ -203,7 +212,7 @@ const flushServerMigration = async (
   }
   let enqueued = 0
   for (const op of ops) {
-    const p = enqueuePersistWrite(op)
+    const p = enqueuePersistWrite(op, { migration: true })
     if (p === undefined) {
       // queue 未启动(不应发生 — bootPersistWiring 刚 startPersistWriteQueue)→ fail-visible。
       debugLogger.error(
@@ -305,12 +314,16 @@ export const __flushServerMigrationForTest = flushServerMigration
  *   网络失败记录留存 + 退避重试;断网恢复后 drain。
  * fire-and-forget(mutations 不 await);返回 promise 供测试 flush/drain;enqueue 失败 debugLogger.error(不静默)。
  */
-export const enqueuePersistWrite = (op: WriteOp): Promise<void> | undefined => {
+export const enqueuePersistWrite = (op: WriteOp, opts?: { migration?: boolean }): Promise<void> | undefined => {
   if (!writeQueue) return undefined // local inert OR queue 未启动
-  const p = writeQueue.enqueue(op).then(
+  const p = writeQueue.enqueue(op, opts).then(
     () => {},
     (error) => {
-      debugLogger.error(SOURCE, `enqueue failed (${op.kind}): ${msg(error)}; local set 已生效,服务端可能滞后(队列恢复后补发)`)
+      // P3:migration enqueue 失败也属后台 seed 迁移噪声,降 WARN;真实用户 mutation enqueue 失败保持 ERROR。
+      const log = opts?.migration
+        ? (m: string) => debugLogger.warn(SOURCE, `[migration] ${m}`)
+        : (m: string) => debugLogger.error(SOURCE, m)
+      log(`enqueue failed (${op.kind}): ${msg(error)}; local set 已生效,服务端可能滞后(队列恢复后补发)`)
     },
   )
   return p
@@ -371,6 +384,13 @@ const hydrateChatForScene = async (
   sceneId: string,
   adapter: ReturnType<typeof getServerPersistAdapter>,
 ): Promise<void> => {
+  // P1 附带降噪:demo scene 的 chat 不走 server hydrate —— demo canvas 不上迁(P1),server 上无该 owner 的
+  //   demo canvas,listChatMessages 必 404 → 每 boot WARN 刷屏。demo chat 是种子(本地 IDB 有),跳过 server
+  //   hydrate 留本地即可(与 local 模式一致,无丢失)。覆盖所有调用点(block 4 active hydrate + backfillChatAfterDrain)。
+  if (DEMO_SCENE_PROJECT_MAP[sceneId as DemoSceneId]) {
+    debugLogger.log(SOURCE, `hydrate chat for scene ${sceneId} skipped (demo scene — not migrated to server, chat stays local seed)`)
+    return
+  }
   const { useChatStore } = await import('../store/chatStore')
   const { messages, orderRevision } = await adapter.listChatMessages(sceneId)
   const serverMessages = messages.map((r) => r.payload as ChatMessage)
@@ -618,12 +638,17 @@ export const hydrateFromServer = async (
       if (projects.length > 0) {
         useCanvasStore.setState({ projects: [...filteredProjects, ...candidates] })
       }
+      // P1:demo seed project 不上迁 —— demo id 全局稳定,跨 owner 碰撞 409 project-exists(首建用户独占),
+      //   且 demo 是种子非用户数据。union 仍保留 demo 本地可见(侧栏种子项目不丢),仅跳过 createProject op 收集。
+      let skippedDemoProjects = 0
       for (const p of candidates) {
+        if (DEMO_PROJECT_ID_SET.has(p.id)) { skippedDemoProjects++; continue }
         pendingServerMigrationOps.push({ kind: 'createProject', name: p.name, id: p.id })
       }
+      const demoProjNote = skippedDemoProjects > 0 ? `; ${skippedDemoProjects} demo seed project(s) skipped (not migrated — global id collides cross-owner 409; kept local)` : ''
       debugLogger.log(
         SOURCE,
-        `server hydrate: ${filteredProjects.length} server project(s)${candidates.length > 0 ? ` + ${candidates.length} local-only candidate(s) kept (union; createProject ops collected for migration-on-boot)` : ' (replaced local)'}${projects.length === 0 && localProjects.length > 0 ? ' [server empty, local retained]' : ''}`,
+        `server hydrate: ${filteredProjects.length} server project(s)${candidates.length > 0 ? ` + ${candidates.length} local-only candidate(s) kept (union; createProject ops collected for migration-on-boot${demoProjNote})` : ' (replaced local)'}${projects.length === 0 && localProjects.length > 0 ? ' [server empty, local retained]' : ''}`,
       )
     } else {
       // marker 已种 → 现行为(服务端真值 replace + C 过滤)+ F2 pending-create 并集保护。
@@ -684,6 +709,7 @@ export const hydrateFromServer = async (
     //   本地保留,服务端无该字段不影响)。
     let migrationCanvasCandidates = 0
     let gapNoProject = 0
+    let skippedDemoCanvases = 0
     if (!migrationMarkerSet && localCanvasEntries.length > 0) {
       const serverCanvasIds = new Set(canvases.map((m) => m.id))
       for (const [id, doc] of localCanvasEntries) {
@@ -693,6 +719,9 @@ export const hydrateFromServer = async (
           gapNoProject++
           continue
         }
+        // P1:demo scene canvas(其 projectId 属 demo project)不上迁 —— server 上无该 owner 的 demo canvas,
+        //   createCanvas 会撞 404 unknown-project(非 member);demo 是种子,本地保留即可。
+        if (DEMO_PROJECT_ID_SET.has(doc.projectId)) { skippedDemoCanvases++; continue }
         pendingServerMigrationOps.push({
           kind: 'createCanvas',
           canvasId: id,
@@ -701,10 +730,10 @@ export const hydrateFromServer = async (
         })
         migrationCanvasCandidates++
       }
-      if (migrationCanvasCandidates > 0 || gapNoProject > 0) {
+      if (migrationCanvasCandidates > 0 || gapNoProject > 0 || skippedDemoCanvases > 0) {
         debugLogger.log(
           SOURCE,
-          `server hydrate: ${localCanvasEntries.length} local canvas(s) → migration-on-boot (createCanvas meta ops collected for ${migrationCanvasCandidates} local-only candidate(s)${gapNoProject > 0 ? `; ${gapNoProject} skipped (no projectId — demo, not migrable)` : ''}; content(nodes/edges) NOT migrated — V1 meta-only gap, retained local — see report)`,
+          `server hydrate: ${localCanvasEntries.length} local canvas(s) → migration-on-boot (createCanvas meta ops collected for ${migrationCanvasCandidates} local-only candidate(s)${gapNoProject > 0 ? `; ${gapNoProject} skipped (no projectId — demo, not migrable)` : ''}${skippedDemoCanvases > 0 ? `; ${skippedDemoCanvases} demo seed canvas(s) skipped (not migrated — would 404 unknown-project cross-owner; kept local)` : ''}; content(nodes/edges) NOT migrated — V1 meta-only gap, retained local — see report)`,
         )
       }
     }
