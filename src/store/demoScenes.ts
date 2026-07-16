@@ -45,14 +45,19 @@ export const DEMO_SCENE_PROJECT_MAP: Partial<Record<DemoSceneId, string>> = {
 //   后者仅 4 个挂 demo project 的 grouped scene,task-states/empty 不在其中 → 漏判 → 每 boot 打 server
 //   404。exhaustive check 钉死:给 DemoSceneId 加成员不进此数组 → Exclude 非 never → 编译失败
 //   (镜像 types/mivoCanvas.ts 的 MARKUP_KIND_VALUES 同型 _EXHAUSTIVE 模式)。
-export const DEMO_SCENE_IDS: readonly DemoSceneId[] = [
+// P2(2026-07-16 二轮终审):用 `as const satisfies readonly DemoSceneId[]` 保留字面量联合。只写
+//   `readonly DemoSceneId[]` 会把元素类型拓宽到整个 DemoSceneId 联合 → `(typeof DEMO_SCENE_IDS)[number]`
+//   恒等 DemoSceneId → 下方 Exclude 恒 never → _EXHAUSTIVE 守卫为空(复审已反证:删 'empty' 后 tsc 照过)。
+//   `as const` 钉死字面量联合后,Exclude 仅在数组覆盖全部 union 成员时为 never;删元素 → 非 never →
+//   `= true` 赋值编译失败,守卫真报错(自证:临时删一个元素跑 tsc 必报错,验完还原)。
+export const DEMO_SCENE_IDS = [
   'character-flow',
   'variants',
   'task-states',
   'stress-test',
   'asset-handoff',
   'empty',
-]
+] as const satisfies readonly DemoSceneId[]
 export const DEMO_SCENE_ID_SET: ReadonlySet<string> = new Set<string>(DEMO_SCENE_IDS)
 export const DEMO_SCENE_IDS_EXHAUSTIVE: Exclude<DemoSceneId, (typeof DEMO_SCENE_IDS)[number]> extends never
   ? true

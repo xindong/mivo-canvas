@@ -201,22 +201,39 @@ const clearAllServerMigrationMarkers = (): void => {
  * → 下次 boot 不进迁移分支。安全(与旧版 enqueue-后-即种 相同的崩溃安全,但堵住了 terminal 残根)。
  *
  * @param adapter 与 hydrate 同源 adapter(bootPersistWiring 传入,不另起获取通道);测试注入 fake。
+ * @param collectionOk 本次 boot 的收集健康结果(bootPersistWiring 显式快照传入;不复读 module-global
+ *   migrationCollectionOk 做判定源——避免 onConflict rehydrate 在 drain 期间覆写本次 boot 结果)。两个 marker
+ *   seed 点(0-op 与 >0-op allRecoverable)统一要求 collectionOk===true 才种(详见函数体 P1 r5 段)。
  */
 const flushServerMigration = async (
   adapter: ReturnType<typeof getServerPersistAdapter> = getServerPersistAdapter(),
+  // P1 r5(2026-07-16 二轮终审 P1):本次 boot 收集健康快照,由 bootPersistWiring 显式传入(不复读 module-global
+  //   migrationCollectionOk 做判定源——避免 onConflict rehydrate 在 drain 期间覆写本次 boot 结果)。两个 marker
+  //   seed 点(0-op 与 >0-op allRecoverable)统一要求 collectionOk===true 才种:收集不健康(step1/step2 任一
+  //   list 抛 → 部分 candidate 未收集)即便已收集的 candidate 全 drain 成功也不种 marker,否则下次 boot marker
+  //   已种跳迁移 → 未收集侧永久滞留 local(真实数据丢失)。已收集的 partial ops 照常 enqueue/drain(数据能上
+  //   多少上多少);marker 不种 → 下次 boot 重收集,combineOps 去重无重复 server 写,补齐漏掉侧 + collectionOk=true
+  //   后才种。测试入口 __flushServerMigrationForTest 不传时默认取当前 global(测试无 onConflict mid-flush 覆写,安全)。
+  collectionOk: boolean = migrationCollectionOk,
 ): Promise<void> => {
   const ops = pendingServerMigrationOps.splice(0)
   if (ops.length === 0) {
     // P1-1(2026-07-16 demo-seed-migration-skip):0 op = pure demo(候选全被 DEMO_PROJECT_ID_SET 滤除)/
-    //   全量已在服务端(差集空)。收集成功(listProjects+listCanvas 未抛,migrationCollectionOk)→ 种 marker 收敛
+    //   全量已在服务端(差集空)。收集成功(listProjects+listCanvas 未抛,collectionOk)→ 种 marker 收敛
     //   ("无需迁移=迁移完成"),否则每 boot 重收集/过滤/log 刷屏(demo marker 每 boot 为 null → 重复收集)。
-    //   收集失败(任一 list 抛,hydrat 退化 local/demo)→ migrationCollectionOk=false → 不种(失败路径语义不变:
+    //   收集失败(任一 list 抛,hydrat 退化 local/demo)→ collectionOk=false → 不种(失败路径语义不变:
     //   不知有无 local-only 候选,不盲种致用户数据永久滞留 local;下次 boot 重试)。marker 已种 → 跳过(幂等)。
-    if (migrationCollectionOk && !isServerMigrationMarkerSet()) {
+    if (collectionOk && !isServerMigrationMarkerSet()) {
       seedServerMigrationMarker()
       debugLogger.log(
         SOURCE,
         `server migration-on-boot: 0 candidate (pure demo or all already on server); marker seeded (collection ok — no re-collect next boot)`,
+      )
+    } else if (!collectionOk) {
+      // P1 r5:0 op 但收集不健康(某 list 抛)→ 不种 marker(下次 boot 重收集;本轮无 partial op 可 drain)。
+      debugLogger.log(
+        SOURCE,
+        `server migration-on-boot: 0 candidate but collection was partial (a hydrate list step threw); marker NOT seeded (next boot re-collects)`,
       )
     }
     return
@@ -273,14 +290,24 @@ const flushServerMigration = async (
     debugLogger.warn(SOURCE, `migration recoverability verification failed: ${msg(error)}; marker NOT seeded (fail-closed; next boot re-verifies)`)
     allRecoverable = false
   }
-  if (allRecoverable) {
+  if (allRecoverable && collectionOk) {
     seedServerMigrationMarker()
     debugLogger.log(
       SOURCE,
-      `server migration-on-boot: all ${projectCandidates.length + canvasCandidates.length} candidate(s) recoverable (on server or pending in durable queue); marker seeded`,
+      `server migration-on-boot: all ${projectCandidates.length + canvasCandidates.length} candidate(s) recoverable (on server or pending in durable queue); collection ok; marker seeded`,
+    )
+  } else if (allRecoverable && !collectionOk) {
+    // P1 r5(2026-07-16 二轮终审 P1):收集不健康(step1/step2 任一 list 抛 → 部分 candidate 未收集)→ 即便
+    //   已收集的 candidate 全 drain 成功(allRecoverable)也不种 marker。修前 >0-op 分支只看 allRecoverable →
+    //   种 marker → 下次 boot marker 已种跳迁移 → 未收集侧(如 step2 抛致 canvas 未收集)永久滞留 local
+    //   (真实数据丢失)。已收集的 partial ops 照常 drain(数据能上多少上多少);marker 不种 → 下次 boot 重收集,
+    //   combineOps 去重无重复 server 写,补齐漏掉侧 + collectionOk=true 后才种。
+    debugLogger.log(
+      SOURCE,
+      `server migration-on-boot: ${projectCandidates.length + canvasCandidates.length} candidate(s) recoverable but collection was partial (a hydrate list step threw — some candidates not collected); marker NOT seeded (next boot re-collects the missing side; partial ops already drained)`,
     )
   }
-  // allRecoverable===false:marker deliberately NOT seeded this round(verifyMigrationCandidatesRecoverable
+  // 其余(allRecoverable===false):marker deliberately NOT seeded this round(verifyMigrationCandidatesRecoverable
   //   已 per-failure error 留痕;下次 boot 差集重收集 + 天然重试)。
 }
 
@@ -1136,8 +1163,11 @@ export const bootPersistWiring = async (opts: FetchAdapterOptions = getProductio
     //   必须在 startPersistWriteQueue 之后(queue singleton 已启动 → enqueuePersistWrite 真 enqueue)。
     //   P1-1:无条件调(不再 pending>0 门)——纯 demo / 全量已在服务端时 0 op,flush 内种 marker 收敛
     //   (否则每 boot 重收集/过滤/log 刷屏;详见 flushServerMigration 0-op 分支)。F1:非空 op flush 在 drain
-    //   后验证可恢复性——全可恢复才种 marker(堵 terminal 残根)。local 在 bootPersistWiring 第一行 return 短路,永不达此。
-    await flushServerMigration(adapter)
+    //   后验证可恢复性——全可恢复 + 收集健康才种 marker(堵 terminal 残根 + P1 r5 partial-collection 误种)。
+    //   P1 r5:显式快照本次 boot 的 migrationCollectionOk 传入 flush —— 不让 flush 复读 module-global(避免
+    //   onConflict rehydrate 在 flush 内 drain 期间 fire hydrateFromServer 覆写本次 boot 收集结果,致 seed 决策
+    //   读到被覆写的 global)。local 在 bootPersistWiring 第一行 return 短路,永不达此。
+    await flushServerMigration(adapter, migrationCollectionOk)
     // A2-S3 block 8:启动 scene 切换 re-hydrate 订阅(切到新 server 画布 → fetchCanvas 补 content;
     // 去重 + in-flight 防并发)。local 在 bootPersistWiring 第一行 return 短路,永不调此。
     await startSceneHydrationSubscription()

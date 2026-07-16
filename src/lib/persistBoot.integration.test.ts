@@ -1367,6 +1367,11 @@ describe('D2 migration-on-boot + D3 restore-safe edge (lead SC-B/D/E)', () => {
     projects?: Project[]
     canvases?: CanvasMeta[]
     failProjectOnce?: string
+    // P1 r5 二轮终审(partial collection):首调抛、后续成功(瞬断),模拟 step1/step2 任一 list 一次性失败。
+    //   adapter 的 listProjects/listCanvas 被 hydrate(step1/step2)+ flush 内 verifyMigrationCandidatesRecoverable
+    //   共用;首调抛置 flag、后续调成功反映 drain 后真值(F1 stateful 不变)。
+    failListProjectsOnce?: boolean
+    failListCanvasOnce?: boolean
   } = {}): {
     adapter: ServerPersistAdapter
     fetch: (input: string, init?: RequestInit) => Promise<Response>
@@ -1379,9 +1384,23 @@ describe('D2 migration-on-boot + D3 restore-safe edge (lead SC-B/D/E)', () => {
     }
     const calls: { method: string; path: string; body: unknown }[] = []
     const failCount = new Map<string, number>()
+    let listProjectsFailed = false
+    let listCanvasFailed = false
     const adapter: ServerPersistAdapter = {
-      listProjects: async () => ({ projects: state.projects.map((p) => ({ ...p })) }),
-      listCanvas: async () => ({ canvases: state.canvases.map((c) => ({ ...c })) }),
+      listProjects: async () => {
+        if (opts.failListProjectsOnce && !listProjectsFailed) {
+          listProjectsFailed = true
+          throw new Error('listProjects transient boom (partial collection)')
+        }
+        return { projects: state.projects.map((p) => ({ ...p })) }
+      },
+      listCanvas: async () => {
+        if (opts.failListCanvasOnce && !listCanvasFailed) {
+          listCanvasFailed = true
+          throw new Error('listCanvas transient boom (partial collection)')
+        }
+        return { canvases: state.canvases.map((c) => ({ ...c })) }
+      },
       listChatMessages: async () => ({ messages: [], orderRevision: 0 }),
     } as unknown as ServerPersistAdapter
     const fetch = async (input: string, init?: RequestInit): Promise<Response> => {
@@ -1713,6 +1732,92 @@ describe('D2 migration-on-boot + D3 restore-safe edge (lead SC-B/D/E)', () => {
     await hydrateFromServer(server.adapter, hydrateOpts)
     // F2:replace = C 过滤后服务端[p1] ∪ 本地 pending-create[p2] = [p1, p2](无 F2 则丢 p2 = [p1] = 线程4 残根)
     expect(useCanvasStore.getState().projects.map((p) => p.id).sort()).toEqual(['p1', 'p2'])
+  })
+
+  // ── P1 r5(2026-07-16 二轮终审 P1):partial collection 误种 marker(真实数据永久漏迁)──
+  //  复现:本地 real-p1(project)+ real-c1(canvas);step1 listProjects 成功收集 project 候选;step2 listCanvas
+  //  瞬断抛(collectionOk=false,c1 未收集);flush >0-op 分支只看 allRecoverable → project drain 成功 → 种 marker
+  //  → 下次 boot marker 已种跳迁移 → 未收集的 canvas 永久滞留 local(数据丢失)。修后:>0-op 也要求
+  //  collectionOk===true 才种;partial ops 照常 drain(数据能上多少上多少);marker 不种 → 二次 boot 重收集补漏。
+  it('P1 r5 ①: step1 ok / step2 listCanvas 一次性抛 → ops 照发但 marker=null;二次 boot 重收集补 canvas 后种', async () => {
+    const server = makeMigrationServer({ failListCanvasOnce: true })
+    const calls = server.calls
+    // 本地:真实 uuid project + canvas(均非 demo → 候选)
+    resetStoreProjects([proj('real-p1', 'RealP1')])
+    useCanvasStore.setState({ sceneId: '' as never, canvases: { 'real-c1': doc('real-p1', 'RealC1') } as never })
+    // boot 1 hydrate:step1 listProjects 成功(收集 real-p1 候选);step2 listCanvas 首调抛 → flag=false,c1 未收集
+    await hydrateFromServer(server.adapter, hydrateOpts)
+    // boot 1 flush:>0 op(createProject real-p1)→ drain 成功 → allRecoverable=true,但 collectionOk=false → 不种 marker
+    startPersistWriteQueue({ fetch: server.fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    await __flushServerMigrationForTest(server.adapter, false) // 显式传 collectionOk=false(镜像 bootPersistWiring 快照)
+    await flush()
+    // ops 照发:real-p1 已 POST 上 server(数据能上多少上多少);canvas 未收集 → 未 POST
+    expect(calls.filter((c) => c.method === 'POST' && c.path === '/api/projects').map((c) => (c.body as { id: string }).id)).toEqual(['real-p1'])
+    expect(calls.filter((c) => c.method === 'POST' && c.path === '/api/canvas')).toHaveLength(0)
+    // 修前此处 marker='done'(bug → 下次 boot 跳迁移,c1 永久滞留 local);修后 marker=null(下次 boot 重收集补 c1)
+    expect(localStorage.getItem('mivo:server-migration:anonymous')).toBeNull()
+    expect(server.state.projects.map((p) => p.id)).toEqual(['real-p1'])
+    expect(server.state.canvases.map((c) => c.id)).toEqual([])
+
+    // boot 2:stop queue + 清 IDB(保留 marker=null;server.state 保留 [real-p1])
+    stopPersistWriteQueue()
+    await __resetWriteQueueDb()
+    resetStoreProjects([proj('real-p1', 'RealP1')])
+    useCanvasStore.setState({ sceneId: '' as never, canvases: { 'real-c1': doc('real-p1', 'RealC1') } as never })
+    // marker 仍未种 → 重收集;listCanvas 二次调成功(failListCanvasOnce 已用尽)→ c1 local-only(server 无)→ 候选;
+    //   real-p1 已在服务端 → 不重复入队
+    await hydrateFromServer(server.adapter, hydrateOpts)
+    startPersistWriteQueue({ fetch: server.fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    await __flushServerMigrationForTest(server.adapter, true) // collectionOk=true(本次 list 全成功)
+    await flush()
+    // c1 补迁上 server;real-p1 不重复入队(计数不增)
+    expect(calls.filter((c) => c.method === 'POST' && c.path === '/api/canvas').map((c) => (c.body as { id: string }).id)).toEqual(['real-c1'])
+    expect(calls.filter((c) => c.method === 'POST' && c.path === '/api/projects').map((c) => (c.body as { id: string }).id)).toEqual(['real-p1'])
+    // 全 candidate 可恢复 + collectionOk=true → marker 种
+    expect(localStorage.getItem('mivo:server-migration:anonymous')).toBe('done')
+    expect(server.state.canvases.map((c) => c.id)).toEqual(['real-c1'])
+  })
+
+  // P1 r5 ②(反向):step1 listProjects 一次性抛 / step2 listCanvas 成功 → project 未收集(collectionOk=false)
+  //   但 canvas 候选已收集。修前 >0-op 分支 canvas drain 成功 → 种 marker → 下次 boot 跳迁移 → project 永久
+  //   滞留 local。修后:不种 marker;canvas 照常 drain;二次 boot 重收集补 project 后种。
+  it('P1 r5 ②: step1 listProjects 一次性抛 / step2 ok → ops 照发但 marker=null;二次 boot 重收集补 project 后种', async () => {
+    const server = makeMigrationServer({ failListProjectsOnce: true })
+    const calls = server.calls
+    resetStoreProjects([proj('real-p1', 'RealP1')])
+    useCanvasStore.setState({ sceneId: '' as never, canvases: { 'real-c1': doc('real-p1', 'RealC1') } as never })
+    // boot 1:step1 listProjects 首调抛 → flag=false,project 候选未收集;step2 listCanvas 成功 → canvas 候选收集
+    await hydrateFromServer(server.adapter, hydrateOpts)
+    startPersistWriteQueue({ fetch: server.fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    await __flushServerMigrationForTest(server.adapter, false) // collectionOk=false(step1 抛)
+    await flush()
+    // canvas 照常 drain 上 server;project 未收集 → 未 POST
+    expect(calls.filter((c) => c.method === 'POST' && c.path === '/api/canvas').map((c) => (c.body as { id: string }).id)).toEqual(['real-c1'])
+    expect(calls.filter((c) => c.method === 'POST' && c.path === '/api/projects')).toHaveLength(0)
+    // 修前 marker='done'(bug → project 永久滞留 local);修后 marker=null
+    expect(localStorage.getItem('mivo:server-migration:anonymous')).toBeNull()
+    expect(server.state.canvases.map((c) => c.id)).toEqual(['real-c1'])
+    expect(server.state.projects.map((p) => p.id)).toEqual([])
+
+    // boot 2:real-p1 本地仍在(IDB persist rehydrate);listProjects 二次成功 → real-p1 local-only(server 无)→ 候选;
+    //   c1 已在服务端 → 不重复入队
+    stopPersistWriteQueue()
+    await __resetWriteQueueDb()
+    resetStoreProjects([proj('real-p1', 'RealP1')])
+    useCanvasStore.setState({ sceneId: '' as never, canvases: { 'real-c1': doc('real-p1', 'RealC1') } as never })
+    await hydrateFromServer(server.adapter, hydrateOpts)
+    startPersistWriteQueue({ fetch: server.fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    await __flushServerMigrationForTest(server.adapter, true) // collectionOk=true
+    await flush()
+    // real-p1 补迁;c1 不重复入队(计数不增)
+    expect(calls.filter((c) => c.method === 'POST' && c.path === '/api/projects').map((c) => (c.body as { id: string }).id)).toEqual(['real-p1'])
+    expect(calls.filter((c) => c.method === 'POST' && c.path === '/api/canvas').map((c) => (c.body as { id: string }).id)).toEqual(['real-c1'])
+    expect(localStorage.getItem('mivo:server-migration:anonymous')).toBe('done')
+    expect(server.state.projects.map((p) => p.id)).toEqual(['real-p1'])
   })
 
   // ── P1 (2026-07-16 demo-seed-migration-skip):D2 候选跳过 demo seed + demo scene chat 免噪 ──
