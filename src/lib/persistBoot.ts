@@ -1158,16 +1158,22 @@ export const bootPersistWiring = async (opts: FetchAdapterOptions = getProductio
     //   验证,复用此 adapter,不另起第二条获取通道;getServerPersistAdapter 返单例)。
     const adapter = getServerPersistAdapter()
     await hydrateFromServer(adapter, opts)
+    // P1 r6(2026-07-16 三轮终审 P1):显式快照本次 boot 的收集结果,**必须在 startPersistWriteQueue 之前**取。
+    //   start() 立即 drain 历史队列,409 onConflict 会 fire `void hydrateFromServer()`(rehydrate)——它在 list 完成
+    //   前**乐观置 migrationCollectionOk=true**(行 661)。若 flush 在 start 之后复读 module-global,会读到被
+    //   rehydrate 覆写的 true → partial-collection 原 boot(step2 listCanvas 抛 → 真值=false)仍误种 marker
+    //   → 下次 boot marker 已种跳迁移 → 未收集侧(canvas)永久滞留 local(真实数据丢失)。故快照取在 start 之前,
+    //   把本次 boot 真值传入 flush,不跨 startPersistWriteQueue 这道 await 读 global(rehydrate 的覆写发生在
+    //   该 await 期间,快照先于覆写,免疫)。local 在 bootPersistWiring 第一行 return 短路,永不达此。
+    const collectionOkSnapshot = migrationCollectionOk
     await startPersistWriteQueue(opts)
     // D2:flush hydrate 收集的迁移 op(server 空 + 本地存量 → createProject/createCanvas 上迁)。
     //   必须在 startPersistWriteQueue 之后(queue singleton 已启动 → enqueuePersistWrite 真 enqueue)。
     //   P1-1:无条件调(不再 pending>0 门)——纯 demo / 全量已在服务端时 0 op,flush 内种 marker 收敛
     //   (否则每 boot 重收集/过滤/log 刷屏;详见 flushServerMigration 0-op 分支)。F1:非空 op flush 在 drain
     //   后验证可恢复性——全可恢复 + 收集健康才种 marker(堵 terminal 残根 + P1 r5 partial-collection 误种)。
-    //   P1 r5:显式快照本次 boot 的 migrationCollectionOk 传入 flush —— 不让 flush 复读 module-global(避免
-    //   onConflict rehydrate 在 flush 内 drain 期间 fire hydrateFromServer 覆写本次 boot 收集结果,致 seed 决策
-    //   读到被覆写的 global)。local 在 bootPersistWiring 第一行 return 短路,永不达此。
-    await flushServerMigration(adapter, migrationCollectionOk)
+    //   collectionOk 用上方快照(本次 boot 真值),不复读 module-global(防 start drain 内 onConflict rehydrate 覆写)。
+    await flushServerMigration(adapter, collectionOkSnapshot)
     // A2-S3 block 8:启动 scene 切换 re-hydrate 订阅(切到新 server 画布 → fetchCanvas 补 content;
     // 去重 + in-flight 防并发)。local 在 bootPersistWiring 第一行 return 短路,永不调此。
     await startSceneHydrationSubscription()
