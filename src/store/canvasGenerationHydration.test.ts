@@ -7,7 +7,9 @@ vi.mock('../lib/demoImages', () => ({
   createDemoImage: () => 'data:image/png;base64,mock-demo-image',
 }))
 
-import { mergeCanvasPersistedState, settleExpiredCanvasGenerations } from './canvasGenerationHydration'
+import { mergeCanvasPersistedState, settleExpiredCanvasGenerations, migratePersistedState } from './canvasGenerationHydration'
+import { debugLogger } from '../store/debugLogStore'
+import { DEMO_PROJECTS } from './demoScenes'
 import type { CanvasState } from './canvasStore'
 import type { CanvasDocument, CanvasId } from '../types/mivoCanvas'
 import type { CanvasTask, MivoCanvasNode } from '../types/mivoCanvas'
@@ -183,5 +185,55 @@ describe('mergeCanvasPersistedState: hydration warning (SC-4 / #60 no regression
 
     expect(warn).not.toHaveBeenCalled()
     expect(merged.canvases['task-states'].tasks[0].status).toBe('running')
+  })
+})
+
+// ── Phase 1 项2(2026-07-16):orphan projectId 不再静默清空(选项 B)──────────────────
+// 验收(计划 Phase 1 项2):水合时凡 projectId 不在 projects 列表的画布,旧版把 projectId **清空** → 画布甩到
+//   "无项目态"(顶层 standalone)= 用户可见的"妹子"丢项目归属。改:保留不清空(项目可能仍在迁移/软删/
+//   服务端侧不可见),仅 warn 计数让可观测。配套项3:停清后 orphan-parent 画布在迁移收集器跳过(防 404 死循环)。
+describe('Phase 1 项2 — orphan projectId 不再静默清空(选项 B;retained, not cleared)', () => {
+  it('projectId 指向不在 projects 列表的项目 → 保留不清空(不再甩到 standalone)+ warn 可观测', () => {
+    const warnSpy = vi.spyOn(debugLogger, 'warn')
+    try {
+      const persisted = {
+        canvases: {
+          'c-mei': document({ projectId: 'p-gone' }),
+        },
+        projects: [] as { id: string; name: string; createdAt: string }[],
+        sceneId: 'c-mei',
+      }
+      const migrated = migratePersistedState(persisted, 11) as unknown as CanvasState
+      // 项2:projectId 保留不清空(项目可能仍在迁移/软删),不再变 undefined 甩到 standalone
+      expect(migrated.canvases['c-mei'].projectId).toBe('p-gone')
+      // warn 可观测(检测到 orphan,保留不清空)
+      expect(
+        warnSpy.mock.calls.some(
+          (c) =>
+            typeof c[1] === 'string' &&
+            c[1].includes('orphan projectId') &&
+            c[1].includes('retained, not cleared'),
+        ),
+      ).toBe(true)
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
+  it('无 orphan(所有 projectId 都在 projects 列表,含 demo project 覆盖 initialCanvases)→ 不 warn,projectId 不变', () => {
+    const warnSpy = vi.spyOn(debugLogger, 'warn')
+    try {
+      const persisted = {
+        canvases: { c1: document({ projectId: 'p1' }) },
+        // projects 须含 DEMO_PROJECTS(initialCanvases 注入的 demo 画布的 projectId 指向它们,否则被误判 orphan)
+        projects: [...DEMO_PROJECTS, { id: 'p1', name: 'P1', createdAt: 't' }] as { id: string; name: string; createdAt: string }[],
+        sceneId: 'c1',
+      }
+      const migrated = migratePersistedState(persisted, 11) as unknown as CanvasState
+      expect(migrated.canvases['c1'].projectId).toBe('p1')
+      expect(warnSpy.mock.calls.some((c) => typeof c[1] === 'string' && c[1].includes('orphan'))).toBe(false)
+    } finally {
+      warnSpy.mockRestore()
+    }
   })
 })

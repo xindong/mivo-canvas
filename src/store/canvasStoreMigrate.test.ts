@@ -486,7 +486,7 @@ describe('v10 migration (persistedVersion < 10): projects + timestamps + orphan 
     }
   })
 
-  it('clears orphan projectIds at v9 (projects is empty → every projectId is an orphan)', () => {
+  it('RETAINS orphan projectIds at v9 (Phase 1 项2: 不再静默清空;projects 空 → 全 orphan,保留不清空)', () => {
     const result = migratePersistedState(
       {
         sceneId: 'c1',
@@ -498,7 +498,8 @@ describe('v10 migration (persistedVersion < 10): projects + timestamps + orphan 
     )
 
     expect(result.projects).toEqual([])
-    expect(result.canvases.c1.projectId).toBeUndefined()
+    // 项2:orphan projectId 保留不清空(项目可能仍在迁移/软删/服务端侧不可见),不再甩到 standalone
+    expect(result.canvases.c1.projectId).toBe('project-ghost')
   })
 
   it('preserves a valid projectId when the project exists in the projects list (v10)', () => {
@@ -517,7 +518,7 @@ describe('v10 migration (persistedVersion < 10): projects + timestamps + orphan 
     expect(result.canvases.c1.projectId).toBe('p1')
   })
 
-  it('clears orphan projectIds at v10 too (后续版本同规则)', () => {
+  it('RETAINS orphan projectIds at v10 too (Phase 1 项2: 后续版本同规则 — 不清空)', () => {
     const result = migratePersistedState(
       {
         sceneId: 'c1',
@@ -531,7 +532,8 @@ describe('v10 migration (persistedVersion < 10): projects + timestamps + orphan 
     )
 
     expect(result.canvases.c1.projectId).toBe('p1') // valid — kept
-    expect(result.canvases.c2.projectId).toBeUndefined() // orphan — cleared
+    // 项2:orphan — 保留不清空(不再甩到 standalone;项目可能仍在迁移/软删)
+    expect(result.canvases.c2.projectId).toBe('project-ghost')
   })
 
   it('preserves existing timestamps at v10 (no re-backfill)', () => {
@@ -606,10 +608,10 @@ describe('v10 demo project relink (guardrail 4a/4b: seed once at v9, never reviv
     expect(result.canvases['stress-test'].projectId).toBeUndefined()
   })
 
-  it('4b (stale projectId): v10 snapshot with orphaned demo projectIds + empty projects → orphan cleanup clears, no revival', () => {
+  it('4b (stale projectId): v10 snapshot with orphaned demo projectIds + empty projects → 项2 保留 projectId(不复活 demo project;不清空 projectId)', () => {
     // Edge case: a v10 snapshot where demo canvases still carry a demo projectId
     // but the projects list is empty (e.g. projects field wiped out-of-band).
-    // Orphan cleanup must clear the projectIds; relink must NOT re-seed at v10.
+    // Phase 1 项2:orphan cleanup 不再清空 projectId(项目可能仍在迁移/软删);relink 不在 v10 re-seed。
     const result = migratePersistedState(
       {
         sceneId: 'character-flow',
@@ -621,8 +623,9 @@ describe('v10 demo project relink (guardrail 4a/4b: seed once at v9, never reviv
       10,
     )
 
-    expect(result.projects).toEqual([]) // no revival
-    expect(result.canvases['character-flow'].projectId).toBeUndefined() // orphan cleared
+    expect(result.projects).toEqual([]) // no revival (relink gated < v10)
+    // 项2:orphan projectId 保留不清空(等项目恢复/迁回;不再甩到 standalone)
+    expect(result.canvases['character-flow'].projectId).toBe(DEMO_PROJECT_IDS.conceptBattlepass)
   })
 
   it('DEMO_SCENE_PROJECT_MAP covers exactly the 4 grouped demo scenes (sanity)', () => {

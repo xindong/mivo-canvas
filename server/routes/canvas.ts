@@ -234,20 +234,38 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
     //   同时收集 bundle entries(recordId→{revision,fieldClocks})+ canvasSeq → 签 canvas 级 bundle + sinceSeq。
     //   ⚠️ perf:per-record readRecordFieldClocks 对 PG 是 N 次查询;A2-S3 优先正确性,批量查询待优化
     //   (collab 生产大画布前;in-memory Map 查询 O(1) 无影响)。
+    // Phase 1 项5(2026-07-16 server 读容错,防 canvas-78c5bed3 类 500):GET /:id 对每个 child record 做
+    //   readRecordFieldClocks(N 次查询)+ payload/base 编码,**单条损坏子记录即可整体 500**(CR-14:须查
+    //   node/edge/anchor 子记录 payload 合法性与 field-clock 行,不只 meta)。改:per-record try/catch 降级 ——
+    //   损坏子记录(payload 缺失/字段异常/field-clock 查询抛错)跳过 + server console.warn 留痕,返回其余可读
+    //   内容(非整体 500)。**只防御性降级,不做任何生产数据修复**(数据修复需 lead 单独授权,不在本范围)。
+    //   跳过的 record 不入 entries/bundle;client hydrate R-7 union 视其为缺失(降级非崩溃);client 后续
+    //   edit/delete 该缺失 base 的 record → 428(降级但非崩溃,优于整画布 500 不可用)。Promise.all 保序,
+    //   filter(null) 剔除损坏项,返回剩余可读 entries。
+    type SignedEntry = { entry: RecordEntry; recordId: string; bundleEntry: BundleEntry }
     const signEntries = async (
       recs: PersistRecord[],
       type: 'node' | 'edge' | 'anchor',
-    ): Promise<{ entry: RecordEntry; recordId: string; bundleEntry: BundleEntry }[]> =>
-      Promise.all(
-        recs.map(async (r) => {
-          const fieldClocks = await backend.readRecordFieldClocks(authz.ownerId, type, r.id)
-          return {
-            entry: { ...toEntry(r), base: encodeBase(id, r.id, r.revision, fieldClocks) },
-            recordId: r.id,
-            bundleEntry: { revision: r.revision, fieldClocks },
+    ): Promise<SignedEntry[]> => {
+      const results = await Promise.all(
+        recs.map(async (r): Promise<SignedEntry | null> => {
+          try {
+            const fieldClocks = await backend.readRecordFieldClocks(authz.ownerId, type, r.id)
+            return {
+              entry: { ...toEntry(r), base: encodeBase(id, r.id, r.revision, fieldClocks) },
+              recordId: r.id,
+              bundleEntry: { revision: r.revision, fieldClocks },
+            }
+          } catch (error) {
+            console.warn(
+              `[canvas GET /:id] skipping corrupted ${type} record ${r.id} (canvas=${id}, owner=${authz.ownerId}, request=${requestId}): ${error instanceof Error ? error.message : String(error)} — returning remaining readable content (degraded, no data repair)`,
+            )
+            return null
           }
         }),
       )
+      return results.filter((x): x is SignedEntry => x !== null)
+    }
     const [nodeEntries, edgeEntries, anchorEntries] = await Promise.all([
       signEntries(nodes.records, 'node'),
       signEntries(edges.records, 'edge'),

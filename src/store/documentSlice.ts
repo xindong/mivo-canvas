@@ -35,9 +35,22 @@ import {
   sceneIds,
   snapshotFromState,
 } from './canvasDocumentModel'
-import { enqueuePersistWrite } from '../lib/persistBoot'
+import { enqueuePersistWrite, isPersistWriteActive } from '../lib/persistBoot'
 import { isServerPersist } from '../lib/persistMode'
 import { getSceneWrap } from '../lib/sceneWrapRegistry'
+// Phase 1 项4(复活加固):store delete action 发起时写持久 tombstone(详见 src/lib/deletionTombstones.ts)。
+import { recordDeletionTombstone } from '../lib/deletionTombstones'
+
+// Phase 1 项4(复活加固):server/shadow 模式删 canvas 时写持久 tombstone(与队列记录生死解耦,覆盖溢出驱逐/
+//   重试耗尽离队后 pending-delete 失效的复活;hydrate step2 并集 tombstone 过滤)。local 模式(queue 未启动)
+//   无 hydrate/无复活,不写(避免 IDB 积累永不清的 tombstone)。fire-and-forget(recordDeletionTombstone 内部
+//   best-effort 永不 throw);clear 时机 = onOutcome DELETE 终态 success(persistBoot)。
+const recordCanvasTombstone = (canvasId: string): void => {
+  if (!isPersistWriteActive()) return
+  void recordDeletionTombstone('canvas', canvasId).catch((e) =>
+    warnCanvas(`tombstone record failed (canvas ${canvasId}): ${e instanceof Error ? e.message : String(e)}`),
+  )
+}
 
 export const createDocumentSlice: SliceCreator = (set, get) => ({
   canvases: defaultCanvases,
@@ -191,6 +204,7 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
         logCanvas(`Deleted inactive canvas "${deletedTitle}"`)
         // G1-a P1-2:server/shadow 模式 enqueue deleteCanvas(DELETE 幂等)。local no-op。
         enqueuePersistWrite({ kind: 'deleteCanvas', canvasId: targetId })
+        recordCanvasTombstone(targetId) // Phase 1 项4:server 模式写 tombstone 挡复活
         return { canvases: remainingCanvases }
       }
 
@@ -199,6 +213,7 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
       logCanvas(`Deleted active canvas "${deletedTitle}" and loaded "${nextDocument.title}"`)
       // G1-a P1-2:server/shadow 模式 enqueue deleteCanvas(DELETE 幂等)。local no-op。
       enqueuePersistWrite({ kind: 'deleteCanvas', canvasId: targetId })
+      recordCanvasTombstone(targetId) // Phase 1 项4:server 模式写 tombstone 挡复活
 
       return {
         canvases: remainingCanvases,

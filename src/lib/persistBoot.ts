@@ -29,6 +29,14 @@ import {
 import { hydrateUserStateMap } from './serverPersistHydrate'
 import { storeCanvasCursor, __resetCanvasCursorStore } from './snapshotCursorStore'
 import { getPersistUserId } from './persistUserId'
+// Phase 1 项4(2026-07-16 复活加固):持久 tombstone 集 —— DELETE 离队(重试耗尽 terminal / 队列溢出驱逐)后
+//   pending-delete 差集过滤失效,tombstone 接力挡复活。写入点在 store delete action(见 projectsSlice/
+//   documentSlice);本模块负责 hydrate 过滤读取 + onOutcome DELETE success 清除 + enqueuePersistWrite create 撤销。
+import {
+  revokeDeletionTombstone,
+  clearDeletionTombstone,
+  getDeletionTombstones,
+} from './deletionTombstones'
 import { fromRecord, edgeFromRecord } from '../kernel/mapping'
 import type { NodeRecord, EdgeRecord } from '../kernel/records'
 import { debugLogger } from '../store/debugLogStore'
@@ -370,6 +378,23 @@ export const __flushServerMigrationForTest = flushServerMigration
  */
 export const enqueuePersistWrite = (op: WriteOp, opts?: { migration?: boolean }): Promise<void> | undefined => {
   if (!writeQueue) return undefined // local inert OR queue 未启动
+  // Phase 1 项4(复活加固):createProject/createCanvas 是 restore 路径(restoreProject / 同 id createCanvas)的
+  //   tombstone 撤销点 —— 删除→立即恢复的资源必须撤销 tombstone,否则恢复的资源被 hydrate 永久隐藏(比复活
+  //   更糟)。revoke 在此单点覆盖所有 create 路径(restoreProject / renameCanvas-no-metaRevision / moveCanvas-no-
+  //   metaRevision / duplicateCanvas);全新 id 无 tombstone → revoke 幂等 no-op silent(不 log,防刷屏)。migration
+  //   op 跳过(D2 上迁候选为 local-only,从未删除,无 tombstone;省 N 次 IDB delete 噪声)。fire-and-forget
+  //   (不 await,不阻断 enqueue);失败 best-effort warn,不阻断业务。local 模式上方 return 已短路,永不达此。
+  if (!opts?.migration) {
+    if (op.kind === 'createProject' && op.id !== undefined) {
+      void revokeDeletionTombstone('project', op.id).catch((e) =>
+        debugLogger.warn(SOURCE, `tombstone revoke failed (createProject ${op.id}): ${msg(e)}`),
+      )
+    } else if (op.kind === 'createCanvas') {
+      void revokeDeletionTombstone('canvas', op.canvasId).catch((e) =>
+        debugLogger.warn(SOURCE, `tombstone revoke failed (createCanvas ${op.canvasId}): ${msg(e)}`),
+      )
+    }
+  }
   const p = writeQueue.enqueue(op, opts).then(
     () => {},
     (error) => {
@@ -678,14 +703,18 @@ export const hydrateFromServer = async (
   //    projects(对称于 C pending-delete 过滤;canvas 侧 union-merge 本就保留 local-only,无需动)。
   //    "keep-local 解耦不丢"在 marker-set 分支的适用范围 = 仅 pending-create 集合(!marker 分支 = 全 local-only 差集)。
   try {
-    const [{ projects }, pendingDeleteProjectIds, pendingCreateProjectIds] = await Promise.all([
+    const [{ projects }, pendingDeleteProjectIds, pendingCreateProjectIds, tombstoneProjectIds] = await Promise.all([
       adapter.listProjects(),
       getPendingDeleteResourceIds('deleteProject'),
       getPendingCreateResourceIds('createProject'),
+      getDeletionTombstones('project'),
     ])
-    const filteredProjects = pendingDeleteProjectIds.size === 0
+    // C 差集过滤 pending-delete(DELETE 未 drain 服务端仍 LIVE,不灌回 = 反复活)+ Phase 1 项4 tombstone 并集过滤
+    //   (DELETE 离队——重试耗尽 terminal / 队列溢出驱逐——后 pending-delete 失效,tombstone 接力挡复活;
+    //   tombstone 写入点在 store delete action,与队列记录生死解耦,覆盖溢出驱逐路径)。两者取并集过滤。
+    const filteredProjects = (pendingDeleteProjectIds.size === 0 && tombstoneProjectIds.size === 0)
       ? projects
-      : projects.filter((p) => !pendingDeleteProjectIds.has(p.id))
+      : projects.filter((p) => !pendingDeleteProjectIds.has(p.id) && !tombstoneProjectIds.has(p.id))
     const localProjects = useCanvasStore.getState().projects
     if (!migrationMarkerSet) {
       // 首启 marker 未种:差集迁移。candidates = 本地 id 不在服务端列表(服务端空→全量本地,与旧版一致)。
@@ -721,15 +750,26 @@ export const hydrateFromServer = async (
       } else {
         // F2:replace = C 过滤后服务端列表 ∪ 本地 pending-create projects(防 marker 已种 + creates 仍 pending
         //   时刷新丢;已在服务端的 id 不重复加,防 double)。
+        // Phase 1 项1(2026-07-16 丢项目制造者修复,CR-1):replace 时额外并集本地仍存在的 DEMO_PROJECT_ID_SET
+        //   项目(对称于 :700-706 !marker 分支的 demo 保护)。根因:demo seed 的 createProject op 在 !marker
+        //   分支 :704 被 skip(不上迁),故 demo 既不在服务端 filteredProjects 也不在 localPendingCreates →
+        //   marker-set replace 把 demo 从 store.projects 丢弃 → zustand persist 回写 → 下次 boot demo 项目消失
+        //   + 其画布成 orphan projectId(项2 已停清,但 demo 项目本身丢了)。并集保留 demo(侧栏种子项目不丢),
+        //   去重(不与 filteredProjects/localPendingCreates 的 id 重复,防 double)。保持 F2 pending-create 并集
+        //   与 C pending-delete 过滤不回退。
         const filteredIds = new Set(filteredProjects.map((p) => p.id))
         const localPendingCreates = pendingCreateProjectIds.size === 0
           ? []
           : localProjects.filter((p) => pendingCreateProjectIds.has(p.id) && !filteredIds.has(p.id))
-        useCanvasStore.setState({ projects: [...filteredProjects, ...localPendingCreates] })
+        const retainedIds = new Set<string>([...filteredIds, ...localPendingCreates.map((p) => p.id)])
+        const retainedDemoProjects = localProjects.filter(
+          (p) => DEMO_PROJECT_ID_SET.has(p.id) && !retainedIds.has(p.id),
+        )
+        useCanvasStore.setState({ projects: [...filteredProjects, ...localPendingCreates, ...retainedDemoProjects] })
         const droppedProjects = projects.length - filteredProjects.length
         debugLogger.log(
           SOURCE,
-          `server hydrate: ${filteredProjects.length} project(s) from BFF (replaced local${droppedProjects > 0 ? `; ${droppedProjects} filtered as pending-delete not-yet-drained (anti-resurrection)` : ''}${localPendingCreates.length > 0 ? `; ${localPendingCreates.length} local pending-create(s) retained (anti-drop F2)` : ''})`,
+          `server hydrate: ${filteredProjects.length} project(s) from BFF (replaced local${droppedProjects > 0 ? `; ${droppedProjects} filtered as pending-delete not-yet-drained (anti-resurrection)` : ''}${localPendingCreates.length > 0 ? `; ${localPendingCreates.length} local pending-create(s) retained (anti-drop F2)` : ''}${retainedDemoProjects.length > 0 ? `; ${retainedDemoProjects.length} demo seed project(s) retained (anti-drop 项1 — not migrated, kept local)` : ''})`,
         )
       }
     }
@@ -744,15 +784,17 @@ export const hydrateFromServer = async (
   //    无的 canvas 插入 meta-stub(content 空,G1-c 补 content);本地有但服务端无的保留(pending create /
   //    demo,G1-c reconcile)。active sceneId 的 meta 刷新但其 flattened nodes/edges 不动(content 不变)。
   try {
-    const [{ canvases }, pendingDeleteCanvasIds] = await Promise.all([
+    const [{ canvases }, pendingDeleteCanvasIds, tombstoneCanvasIds] = await Promise.all([
       adapter.listCanvas(),
       getPendingDeleteResourceIds('deleteCanvas'),
+      getDeletionTombstones('canvas'),
     ])
-    // P1 bug fix(delete-resurrection)C:差集过滤 pending-delete canvas id —— DELETE 还在队列未 drain
-    //   时服务端仍 LIVE,union-merge 会把已删 canvas 灌回本地(复活)。摘除后再 merge(同 step1 project)。
-    const serverCanvases = pendingDeleteCanvasIds.size === 0
+    // P1 bug fix(delete-resurrection)C + Phase 1 项4:差集过滤 pending-delete canvas id(DELETE 未 drain 服务端
+    //   仍 LIVE,union-merge 会灌回 = 复活)+ tombstone 并集过滤(同 step1 project;canvas 侧复活同理,
+    //   tombstone 接力挡离队后的复活)。摘除后再 merge(同 step1 project)。
+    const serverCanvases = (pendingDeleteCanvasIds.size === 0 && tombstoneCanvasIds.size === 0)
       ? canvases
-      : canvases.filter((m) => !pendingDeleteCanvasIds.has(m.id))
+      : canvases.filter((m) => !pendingDeleteCanvasIds.has(m.id) && !tombstoneCanvasIds.has(m.id))
     const localCanvases = useCanvasStore.getState().canvases
     const localCanvasEntries = Object.entries(localCanvases)
     // D2 差集迁移:`!marker` 时为 local-only candidates(本地有 projectId 且 id 不在服务端列表)收集 createCanvas
@@ -770,8 +812,21 @@ export const hydrateFromServer = async (
     let migrationCanvasCandidates = 0
     let gapNoProject = 0
     let skippedDemoCanvases = 0
+    // Phase 1 项3(2026-07-16 orphan-parent 跳收集,CR-2,与项2 停清 projectId 配套):停清后(项2),
+    //   projectId 指向"不在服务端列表且不在本地 candidates 集"项目的画布,会在下方被收集成 createCanvas op
+    //   → 服务端无此 project → 404 unknown-project terminal → F1(:280-311)永不种 marker → 每 boot 重收集 +
+    //   ERROR 死循环。下方在 demo 判断后、push op 前加 parent 可迁性判定,parent 不可迁 → 跳过 + 此计数。
+    let skippedOrphanParent = 0
     if (!migrationMarkerSet && localCanvasEntries.length > 0) {
       const serverCanvasIds = new Set(canvases.map((m) => m.id))
+      // parent 可迁集 = store.projects 的 id(step1 setState 后 = 服务端 live ∼ local candidates,即"迁移后将
+      //   存在于服务端的项目集";服务端 live 已含于 filteredProjects,local candidates 正在上迁)。parent 不在此
+      //   集 = 既不在服务端也不在本地候选 → 不可迁,其画布跳过(不 push 注定 404 的 createCanvas op)。
+      //   注:step1 的 `projects` 来自项目侧 try 块,跨 try 作用域不可直访;此处用 store 真值更稳妥且 step1
+      //   setState 已同步生效(zustand set 同步)。step1 抛(部分收集)→ store.projects=本地全量(降级假设:
+      //   全 local 视作候选),marker 不种(collectionOk=false)→ 下次 boot 重收集,404 风险为既有 partial 边缘,
+      //   非本改引入。
+      const migratableParentIds = new Set(useCanvasStore.getState().projects.map((p) => p.id))
       for (const [id, doc] of localCanvasEntries) {
         if (serverCanvasIds.has(id)) continue // 已在服务端,不重复入队(SC-G)
         if (!doc.projectId) {
@@ -782,6 +837,13 @@ export const hydrateFromServer = async (
         // P1:demo scene canvas(其 projectId 属 demo project)不上迁 —— server 上无该 owner 的 demo canvas,
         //   createCanvas 会撞 404 unknown-project(非 member);demo 是种子,本地保留即可。
         if (DEMO_PROJECT_ID_SET.has(doc.projectId)) { skippedDemoCanvases++; continue }
+        // Phase 1 项3:parent 不可迁(不在服务端列表且不在本地候选集)→ 跳过,fail-visible 计数(同
+        //   gapNoProject/skippedDemoCanvases 模式),不 push 注定 404 unknown-project 的 createCanvas op。
+        //   画布留本地(union-merge :840-843 保留 local-only),marker 不被它拖住(F1 正常种)。
+        if (!migratableParentIds.has(doc.projectId)) {
+          skippedOrphanParent++
+          continue
+        }
         pendingServerMigrationOps.push({
           kind: 'createCanvas',
           canvasId: id,
@@ -790,10 +852,10 @@ export const hydrateFromServer = async (
         })
         migrationCanvasCandidates++
       }
-      if (migrationCanvasCandidates > 0 || gapNoProject > 0 || skippedDemoCanvases > 0) {
+      if (migrationCanvasCandidates > 0 || gapNoProject > 0 || skippedDemoCanvases > 0 || skippedOrphanParent > 0) {
         debugLogger.log(
           SOURCE,
-          `server hydrate: ${localCanvasEntries.length} local canvas(s) → migration-on-boot (createCanvas meta ops collected for ${migrationCanvasCandidates} local-only candidate(s)${gapNoProject > 0 ? `; ${gapNoProject} skipped (no projectId — demo, not migrable)` : ''}${skippedDemoCanvases > 0 ? `; ${skippedDemoCanvases} demo seed canvas(s) skipped (not migrated — would 404 unknown-project cross-owner; kept local)` : ''}; content(nodes/edges) NOT migrated — V1 meta-only gap, retained local — see report)`,
+          `server hydrate: ${localCanvasEntries.length} local canvas(s) → migration-on-boot (createCanvas meta ops collected for ${migrationCanvasCandidates} local-only candidate(s)${gapNoProject > 0 ? `; ${gapNoProject} skipped (no projectId — demo, not migrable)` : ''}${skippedDemoCanvases > 0 ? `; ${skippedDemoCanvases} demo seed canvas(s) skipped (not migrated — would 404 unknown-project cross-owner; kept local)` : ''}${skippedOrphanParent > 0 ? `; ${skippedOrphanParent} orphan-parent canvas(s) skipped (projectId not migratable — not on server nor local candidate; would 404 unknown-project terminal + ERROR loop; kept local)` : ''}; content(nodes/edges) NOT migrated — V1 meta-only gap, retained local — see report)`,
         )
       }
     }
@@ -1040,6 +1102,10 @@ export const startPersistWriteQueue = (
     //   createProject 不在集 → B 照常摘除(#254 SC-3 原行为不回归)。
     onOutcome: async (op, outcome) => {
       if (op.kind === 'deleteProject' && outcome.status === 'success') {
+        // Phase 1 项4:DELETE 终态 success(含 404-idempotent)→ 服务端已软删 → 不再 LIVE → 无复活风险 →
+        //   tombstone 完成使命可清。restore 路径(restoreProject enqueue createProject)已 revoke,此处 clear 幂等
+        //   no-op。terminal 失败(rejected/dead-letter)不走此分支 → tombstone 保留(服务端仍 LIVE,继续挡复活)。
+        await clearDeletionTombstone('project', op.projectId)
         const restoreIds = await getPendingCreateResourceIds('createProject')
         if (restoreIds.has(op.projectId)) {
           debugLogger.log(
@@ -1054,6 +1120,8 @@ export const startPersistWriteQueue = (
         return
       }
       if (op.kind === 'deleteCanvas' && outcome.status === 'success') {
+        // Phase 1 项4:DELETE 终态 success(含 404-idempotent)→ 服务端已软删 → tombstone 可清(同 deleteProject)。
+        await clearDeletionTombstone('canvas', op.canvasId)
         const restoreIds = await getPendingCreateResourceIds('createCanvas')
         if (restoreIds.has(op.canvasId)) {
           debugLogger.log(

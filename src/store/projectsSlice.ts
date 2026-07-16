@@ -11,6 +11,9 @@ import { logCanvas, warnCanvas } from './canvasStoreLog'
 import { DEMO_PROJECTS } from './demoScenes'
 import { enqueuePersistWrite, isPersistWriteActive } from '../lib/persistBoot'
 import { normalizeDocument, documentFor } from './canvasDocumentModel'
+// Phase 1 项4(复活加固):store delete action 发起时写持久 tombstone(与队列记录生死解耦,覆盖溢出驱逐/重试
+//   耗尽离队后 pending-delete 失效的复活)。详见 src/lib/deletionTombstones.ts。
+import { recordDeletionTombstone } from '../lib/deletionTombstones'
 
 // Project ids use a `project-` prefix (distinct from `canvas-` / `group-`) so a
 // projectId is never confused with a canvasId. Mirrors createCanvasId's fallback
@@ -171,8 +174,19 @@ export const createProjectsSlice: SliceCreator = (set, get) => ({
     //      parent 软删后 createCanvas 撞 404 unknown-project terminal(避免 A3 rejected/dead-letter 假阳性);
     //   ② 若画板已 drain(在 server),DELETE 幂等 204(softDeleteProjectTree 已级联软删,幂等无副作用)。
     if (serverAligned) {
+      // Phase 1 项4:server 模式发起删除时写 tombstone(project + 其级联 canvas)。与队列记录生死解耦 ——
+      //   DELETE 离队(重试耗尽 terminal / 队列溢出驱逐)后 pending-delete 差集过滤失效,tombstone 接力挡
+      //   复活(hydrate step1/step2 并集 tombstone 过滤)。local 模式(serverAligned=false)无 hydrate/无复活,
+      //   不写(避免 IDB 积累永不清的 tombstone)。fire-and-forget(recordDeletionTombstone 内部 best-effort,
+      //   永不 throw);catch 兜底防 reject 逸出。clear 时机 = onOutcome DELETE 终态 success(persistBoot)。
+      void recordDeletionTombstone('project', projectId).catch((e) =>
+        warnCanvas(`tombstone record failed (project ${projectId}): ${e instanceof Error ? e.message : String(e)}`),
+      )
       for (const canvasId of removedCanvasIds) {
         enqueuePersistWrite({ kind: 'deleteCanvas', canvasId })
+        void recordDeletionTombstone('canvas', canvasId).catch((e) =>
+          warnCanvas(`tombstone record failed (canvas ${canvasId}): ${e instanceof Error ? e.message : String(e)}`),
+        )
       }
     }
     return { status: 'deleted' }

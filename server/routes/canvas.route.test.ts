@@ -4,7 +4,7 @@
 // + N5 If-Match 严格 + N7 authz + N8 reorder + N10 payload allowlist + 原 13 条回归(保持绿):
 // 全量 GET(#5/#6)、枚举(#8)、节点级 PATCH(FX-4 + #3 cross-canvas + #4 428/If-Match + #13 白名单 + #12 413)、
 // edge/anchor DELETE(#8)、硬删子资源(#2)、原子 tree 软删(#2/#7)、reorder(#6/N8)、chat(DP-6/N2/N3)。
-import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll, vi } from 'vitest'
 import {
   buildPersistApp,
   hdr,
@@ -157,6 +157,39 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
     expect(body.nodes[0].revision).toBe(2) // A2-S2:create(1) → edit bumped to 2
     expect(body.nodes[0].orderKey).toBe(0)
     expect(body.nodes.map((n) => n.id)).toEqual(['n1', 'n2'])
+  })
+
+  // Phase 1 项5(2026-07-16 server 读容错,防 canvas-78c5bed3 类 500):GET /:id 的 signEntries 对每个 child record
+  //   做 readRecordFieldClocks(N 次查询)+ payload/base 编码,单条损坏子记录即可整体 500。改:per-record
+  //   try/catch 降级 —— 损坏 record 跳过 + console.warn,返回其余可读内容(非 500)。只降级不修数据。
+  it('Phase 1 项5: GET /:id 单条损坏子 record(readRecordFieldClocks 抛错)→ 降级 200(非 500),损坏 record 跳过,其余可读', async () => {
+    await seedProject()
+    await seedCanvas()
+    await createChildFixture(app, 'c1', 'node', 'n-ok', wirePayload(canonicalNode('n-ok')))
+    await createChildFixture(app, 'c1', 'node', 'n-bad', wirePayload(canonicalNode('n-bad')))
+    // 模拟 canvas-78c5bed3 类损坏:n-bad 的 field-clock 查询抛错(DB 读失败 / 字段异常)。
+    const original = backend.readRecordFieldClocks.bind(backend)
+    backend.readRecordFieldClocks = async (ownerId: string, type: 'node' | 'edge' | 'anchor', recordId: string) => {
+      if (recordId === 'n-bad') throw new Error('simulated corrupt field-clock row (canvas-78c5bed3 class)')
+      return original(ownerId, type, recordId)
+    }
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const got = await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })
+      // 项5:降级 200(非整体 500);损坏 n-bad 跳过,其余可读(n-ok 返回)
+      expect(got.status).toBe(200)
+      const body = got.body as { nodes: { id: string }[] }
+      expect(body.nodes.map((n) => n.id)).toEqual(['n-ok'])
+      expect(body.nodes.map((n) => n.id)).not.toContain('n-bad')
+      // server console.warn 留痕(损坏 record 可观测,fail-visible)
+      expect(
+        warnSpy.mock.calls.some(
+          (c) => typeof c[0] === 'string' && c[0].includes('skipping corrupted node record n-bad'),
+        ),
+      ).toBe(true)
+    } finally {
+      warnSpy.mockRestore()
+    }
   })
 
   it('返修 #8:GET /api/canvas?projectId= 枚举(跨 owner 不可见)', async () => {

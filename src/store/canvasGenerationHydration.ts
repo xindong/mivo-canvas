@@ -229,16 +229,24 @@ export const migratePersistedState = (persistedState: unknown, persistedVersion 
       )
     }
   }
+  // Phase 1 项2(2026-07-16 复活+丢项目修复,选项 B):不再静默清空 orphan projectId。
+  //   根因(计划 Context):projectId 指向的项目从 projects 列表消失(被删/软删/未迁移)时,清空 projectId
+  //   → 画布甩到"无项目态"(顶层 standalone)= 用户可见的"妹子"丢项目归属。清空是单向不可逆破坏:即便
+  //   项目后续恢复/迁回,projectId 已丢,画布回不到原项目。
+  //   改:保留 projectId 不清空(项目可能仍在迁移/软删/服务端侧不可见),仅 warn 计数让可观测。
+  //   配套项3:停清后,orphan projectId 的画布在 persistBoot 迁移收集器跳过 createCanvas op(防 404
+  //   unknown-project terminal + ERROR 死循环)。deleteProject(projectsSlice.ts:91 local 模式)显式清
+  //   projectId 是 local 模式正确语义(画板 standalone 回落防 IDB 丢),与本改正交,不受影响。
+  //   v10 demo relink(:213-230)在本段之前跑,其幂等性不受影响(它只补种+挂回,不清空)。
   const knownProjectIds = new Set(projects.map((p) => p.id))
   let orphanCount = 0
-  for (const [canvasId, document] of Object.entries(canvases)) {
+  for (const document of Object.values(canvases)) {
     if (document.projectId && !knownProjectIds.has(document.projectId)) {
       orphanCount += 1
-      canvases[canvasId] = { ...document, projectId: undefined }
     }
   }
   if (orphanCount > 0) {
-    warnCanvas(`Hydration cleared ${orphanCount} orphan projectId(s) (not in projects list)`)
+    warnCanvas(`Hydration detected ${orphanCount} orphan projectId(s) (not in projects list) — retained, not cleared (project may be mid-migration / soft-deleted / server-side hidden)`)
   }
 
   return {
