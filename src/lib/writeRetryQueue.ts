@@ -402,6 +402,15 @@ export type QueuedWrite = {
    * 模式,不许 NaN 排序;旧记录 seq=0 先于新记录 seq≥1,保持旧→新序)。
    */
   seq?: number
+  /**
+   * P3(2026-07-16 demo-seed-migration-skip):标记本 record 来自 D2 存量上迁(persistBoot.flushServerMigration
+   * 经 enqueuePersistWrite(op, { migration: true }) 入队),非用户主动 mutation。drain 终态失败(rejected/
+   * terminal/too-large/reuse-conflict/dead-letter)时日志降 WARN + [migration] 标识 + 不弹 toast —— 后台
+   * seed 迁移噪声,非用户操作失败,弹 error toast 是误导。真实用户写(migration undefined/false)保持 ERROR
+   * + toast 不变。出队行为(recordTerminal + deleteWrite)不受此标记影响 —— migration 失败仍 terminal 出队。
+   * 旧 IDB 记录无此字段 → undefined → false(同 seq/gateAttempts migration-on-read 模式)。
+   */
+  migration?: boolean
 }
 
 // ── Executor seam (T1.3 plugs the real fetch here) + outcome classification ──
@@ -1595,7 +1604,7 @@ export type WriteQueueOptions = {
 }
 
 export type WriteQueue = {
-  enqueue: (op: WriteOp) => Promise<string>
+  enqueue: (op: WriteOp, opts?: { migration?: boolean }) => Promise<string>
   drain: () => Promise<DrainResult>
   resume: () => Promise<void>
   pause: () => void
@@ -1637,7 +1646,7 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
   // 若无更新 enqueue 接管则 prune(Map 不随 distinct key 无界增长)。
   const enqueueChain = new Map<string, Promise<unknown>>()
 
-  const doEnqueue = async (op: WriteOp, resourceKey: string | null): Promise<string> => {
+  const doEnqueue = async (op: WriteOp, resourceKey: string | null, opts?: { migration?: boolean }): Promise<string> => {
     const userId = getPersistUserId()
     const ts = now()
     const all = await getAllWrites()
@@ -1667,6 +1676,12 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
           return existing.id
         }
         existing.op = combined
+        // P1-2(2026-07-16 demo-seed-migration-skip):coalesce 时 migration 标志按 incoming 收窄——
+        //   existing.migration && (opts?.migration ?? false)。只有双方都是 migration 才保持 true;任一侧是
+        //   用户写(非 migration)即降 false(用户语义优先)——否则 migration record pending 期间用户 rename 同
+        //   资源,合并后仍 migration=true → drain terminal 走 termLog WARN + 不弹 toast(用户主动操作失败被
+        //   静默降级)。降 false 后恢复 ERROR + toast(drain switch 的 termLog/termToast 按 rec.migration 分流)。
+        existing.migration = existing.migration && (opts?.migration ?? false)
         existing.idempotencyKey = newKey()
         existing.attempts = 0
         existing.nextAttemptAt = ts
@@ -1738,6 +1753,7 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
       attempts: 0,
       nextAttemptAt: ts,
       status: 'pending',
+      migration: opts?.migration,
     }
     await nextSeqAndPutWrite(record) // seq 由原子 tx 内分配并同 tx put(失败则降级 memStore,不落 IDB)
     debugLogger.log(SOURCE, `queued write ${record.id} (${op.kind}) for user ${userId}`)
@@ -1749,7 +1765,7 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
     return record.id
   }
 
-  const enqueue = (op: WriteOp): Promise<string> => {
+  const enqueue = (op: WriteOp, opts?: { migration?: boolean }): Promise<string> => {
     // DP-7: the two device-local API keys (gateway-key/mivo-key) and secret-like
     // user-state keys/values must NEVER enter the queue payload. Reject at the gate —
     // never persist, never send. Reuse ALL three #194 contract scanners (no bespoke
@@ -1783,7 +1799,7 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
     }
 
     const resourceKey = computeResourceKey(op)
-    const run = (): Promise<string> => doEnqueue(op, resourceKey)
+    const run = (): Promise<string> => doEnqueue(op, resourceKey, opts)
     // chat messages(resourceKey=null)不串行(每条独立 op,不 coalesce),直接 run。
     if (resourceKey === null) return run()
     // G1-a R2 F1:同 key 串行 —— 后一个 enqueue 等前一个 putWrite 完成再 getAllWrites,保证 coalesce。
@@ -1890,6 +1906,16 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
         // rejected/terminal/dead-letter)置 true,post-switch 调 onOutcome 清 sidecar 等 pending 证明;
         // 非终态(transient-retry/unauthorized/unsupported-retained)op 留存队列 → false,不清(sidecar 保持)。
         let finalized = false
+        // P3(2026-07-16 demo-seed-migration-skip):migration-on-boot op 的 terminal 失败是后台 seed 迁移噪声
+        //   (非用户主动 mutation)——日志降 WARN + [migration] 标识 + 不弹 toast(用户未触发,弹 error toast 是误导)。
+        //   真实用户写(rec.migration undefined)保持 ERROR + toast 不变。出队(recordTerminal + deleteWrite)不变。
+        const termLog = (m: string): void => {
+          if (rec.migration) debugLogger.warn(SOURCE, `[migration] ${m}`)
+          else debugLogger.error(SOURCE, m)
+        }
+        const termToast = (userMsg: string): void => {
+          if (!rec.migration) toastFeedback.error(userMsg)
+        }
         switch (outcome.status) {
           case 'success':
             // P2-1: success path must surface via debugLogger (development-logging
@@ -1933,41 +1959,32 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
             finalized = true
             break
           case 'too-large':
-            debugLogger.error(
-              SOURCE,
-              `write ${rec.id} rejected as too large (limit ${outcome.limit}); not retrying same payload`,
-            )
-            toastFeedback.error('这条改动内容过大,无法保存。')
+            termLog(`write ${rec.id} rejected as too large (limit ${outcome.limit}); not retrying same payload`)
+            termToast('这条改动内容过大,无法保存。')
             await recordTerminal(rec, 'too-large', `limit ${outcome.limit}`)
             await deleteWrite(rec.id)
             terminals++
             finalized = true
             break
           case 'reuse-conflict':
-            debugLogger.error(
-              SOURCE,
-              `write ${rec.id} idempotency-key reuse conflict (key ${outcome.key})`,
-            )
-            toastFeedback.error('保存失败,请重试该改动。')
+            termLog(`write ${rec.id} idempotency-key reuse conflict (key ${outcome.key})`)
+            termToast('保存失败,请重试该改动。')
             await recordTerminal(rec, 'reuse-conflict', `key ${outcome.key}`)
             await deleteWrite(rec.id)
             terminals++
             finalized = true
             break
           case 'rejected':
-            debugLogger.error(
-              SOURCE,
-              `write ${rec.id} rejected by server: ${JSON.stringify(outcome.body).slice(0, 200)}`,
-            )
-            toastFeedback.error('这条改动无法保存,可能内容有误。')
+            termLog(`write ${rec.id} rejected by server: ${JSON.stringify(outcome.body).slice(0, 200)}`)
+            termToast('这条改动无法保存,可能内容有误。')
             await recordTerminal(rec, 'rejected', JSON.stringify(outcome.body).slice(0, 200))
             await deleteWrite(rec.id)
             terminals++
             finalized = true
             break
           case 'terminal':
-            debugLogger.error(SOURCE, `write ${rec.id} terminal failure: ${outcome.message}`)
-            toastFeedback.error('保存失败,请重试。')
+            termLog(`write ${rec.id} terminal failure: ${outcome.message}`)
+            termToast('保存失败,请重试。')
             await recordTerminal(rec, 'terminal', outcome.message)
             await deleteWrite(rec.id)
             terminals++
@@ -1976,11 +1993,8 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
           case 'transient': {
             const attempts = rec.attempts + 1
             if (attempts >= maxAttempts) {
-              debugLogger.error(
-                SOURCE,
-                `write ${rec.id} dead-lettered after ${attempts} attempts: ${outcome.message}`,
-              )
-              toastFeedback.error('多次重试失败,部分改动未能保存。')
+              termLog(`write ${rec.id} dead-lettered after ${attempts} attempts: ${outcome.message}`)
+              termToast('多次重试失败,部分改动未能保存。')
               await recordTerminal(rec, 'dead-letter', `after ${attempts} attempts: ${outcome.message}`)
               await deleteWrite(rec.id)
               terminals++

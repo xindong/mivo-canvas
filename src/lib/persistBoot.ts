@@ -37,10 +37,19 @@ import { defaultFetch, type FetchAdapterOptions, type FetchLike, type GetAuthHea
 import type { ChatMessage } from '../store/chatStore'
 import type { CanvasDocument } from '../types/mivoCanvas'
 import type { Revision, UserStateEntry, RecordEntry } from '../../shared/persist-contract.ts'
+// P1(2026-07-16 demo-seed-migration-skip):demo seed 真相源 —— demoScenes 是纯数据(只 import lib/model/types,
+// 不引 store),静态 import 无环(防环注释只禁 canvasStore)。用于派生 DEMO_PROJECT_ID_SET 跳过 demo 上迁。
+import { DEMO_PROJECT_IDS, DEMO_SCENE_ID_SET } from '../store/demoScenes'
 
 const SOURCE = 'Persist Boot'
 
 const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e))
+
+// P1(2026-07-16 demo-seed-migration-skip):demo seed 的 project id 集合(从 DEMO_PROJECT_IDS 派生,不手写第二份清单)。
+//   D2 上迁跳过 demo —— demo id 全局稳定(project-demo-concept-battlepass 等),per-user owner 下跨 owner 碰撞
+//   409 project-exists / 404 unknown-project(首建用户独占 demo id,其余用户每次打开刷 ERROR);且 demo 是种子非
+//   用户数据,不该 per-user 上迁。本地 union 仍保留 demo 可见(侧栏种子项目不丢),仅跳过 createProject/createCanvas op 收集。
+const DEMO_PROJECT_ID_SET: ReadonlySet<string> = new Set<string>(Object.values(DEMO_PROJECT_IDS))
 
 // 生产 fetch opts(与 serverPersistAdapterSelector 的 wired adapter 同源:default fetch + '' baseUrl + lazy authHeaders)。
 // executor 与 adapter 必须走同一 BFF + 同一鉴权,防双实现漂移(P1-1 接线硬约束)。
@@ -123,6 +132,14 @@ export const getHydratedUserState = (key: string): UserStateEntry | undefined =>
 // pending creates + persist 回写永久丢失;修:replace 并集本地 pending-create projects(canvas union-merge 已保留 local-only,不动)。
 const pendingServerMigrationOps: WriteOp[] = []
 
+// P1-1(2026-07-16 demo-seed-migration-skip):hydrate 收集健康标志——listProjects+listCanvas 均未抛才 true。
+//   纯 demo 工作区(候选全被 DEMO_PROJECT_ID_SET 滤除)→ 0 op → flush 需种 marker 收敛(否则每 boot 重收集/
+//   过滤/log 刷屏;demo 不上迁但 marker 必种示"迁移完成=无需迁")。但 hydrate 收集失败(list 抛,退化 local/demo)
+//   → 不知有无 local-only 候选 → 不种(失败路径语义不变:下次 boot 重试,不盲种致用户数据永久滞留 local)。
+//   hydrat 内 reset=true,step1/step2 catch 置 false;flush 0-op 分支消费。onConflict re-hydrate 也置位但
+//   boot 已过不消费(boot 单次 await hydrateFromServer 后即读,无并发)。
+let migrationCollectionOk = false
+
 /** marker 物理 key(按 userId 分区;anonymous namespace 与 authenticated 互不可见,同 persistUserId)。 */
 const migrationMarkerKey = (userId: string): string => `mivo:server-migration:${userId}`
 
@@ -184,12 +201,43 @@ const clearAllServerMigrationMarkers = (): void => {
  * → 下次 boot 不进迁移分支。安全(与旧版 enqueue-后-即种 相同的崩溃安全,但堵住了 terminal 残根)。
  *
  * @param adapter 与 hydrate 同源 adapter(bootPersistWiring 传入,不另起获取通道);测试注入 fake。
+ * @param collectionOk 本次 boot 的收集健康结果(bootPersistWiring 显式快照传入;不复读 module-global
+ *   migrationCollectionOk 做判定源——避免 onConflict rehydrate 在 drain 期间覆写本次 boot 结果)。两个 marker
+ *   seed 点(0-op 与 >0-op allRecoverable)统一要求 collectionOk===true 才种(详见函数体 P1 r5 段)。
  */
 const flushServerMigration = async (
   adapter: ReturnType<typeof getServerPersistAdapter> = getServerPersistAdapter(),
+  // P1 r5(2026-07-16 二轮终审 P1):本次 boot 收集健康快照,由 bootPersistWiring 显式传入(不复读 module-global
+  //   migrationCollectionOk 做判定源——避免 onConflict rehydrate 在 drain 期间覆写本次 boot 结果)。两个 marker
+  //   seed 点(0-op 与 >0-op allRecoverable)统一要求 collectionOk===true 才种:收集不健康(step1/step2 任一
+  //   list 抛 → 部分 candidate 未收集)即便已收集的 candidate 全 drain 成功也不种 marker,否则下次 boot marker
+  //   已种跳迁移 → 未收集侧永久滞留 local(真实数据丢失)。已收集的 partial ops 照常 enqueue/drain(数据能上
+  //   多少上多少);marker 不种 → 下次 boot 重收集,combineOps 去重无重复 server 写,补齐漏掉侧 + collectionOk=true
+  //   后才种。测试入口 __flushServerMigrationForTest 不传时默认取当前 global(测试无 onConflict mid-flush 覆写,安全)。
+  collectionOk: boolean = migrationCollectionOk,
 ): Promise<void> => {
   const ops = pendingServerMigrationOps.splice(0)
-  if (ops.length === 0) return
+  if (ops.length === 0) {
+    // P1-1(2026-07-16 demo-seed-migration-skip):0 op = pure demo(候选全被 DEMO_PROJECT_ID_SET 滤除)/
+    //   全量已在服务端(差集空)。收集成功(listProjects+listCanvas 未抛,collectionOk)→ 种 marker 收敛
+    //   ("无需迁移=迁移完成"),否则每 boot 重收集/过滤/log 刷屏(demo marker 每 boot 为 null → 重复收集)。
+    //   收集失败(任一 list 抛,hydrat 退化 local/demo)→ collectionOk=false → 不种(失败路径语义不变:
+    //   不知有无 local-only 候选,不盲种致用户数据永久滞留 local;下次 boot 重试)。marker 已种 → 跳过(幂等)。
+    if (collectionOk && !isServerMigrationMarkerSet()) {
+      seedServerMigrationMarker()
+      debugLogger.log(
+        SOURCE,
+        `server migration-on-boot: 0 candidate (pure demo or all already on server); marker seeded (collection ok — no re-collect next boot)`,
+      )
+    } else if (!collectionOk) {
+      // P1 r5:0 op 但收集不健康(某 list 抛)→ 不种 marker(下次 boot 重收集;本轮无 partial op 可 drain)。
+      debugLogger.log(
+        SOURCE,
+        `server migration-on-boot: 0 candidate but collection was partial (a hydrate list step threw); marker NOT seeded (next boot re-collects)`,
+      )
+    }
+    return
+  }
   // F1:capture candidate ids for post-drain recoverability verification(marker-seed 前置数据)。
   const projectCandidates: string[] = []
   const canvasCandidates: string[] = []
@@ -203,7 +251,7 @@ const flushServerMigration = async (
   }
   let enqueued = 0
   for (const op of ops) {
-    const p = enqueuePersistWrite(op)
+    const p = enqueuePersistWrite(op, { migration: true })
     if (p === undefined) {
       // queue 未启动(不应发生 — bootPersistWiring 刚 startPersistWriteQueue)→ fail-visible。
       debugLogger.error(
@@ -242,14 +290,24 @@ const flushServerMigration = async (
     debugLogger.warn(SOURCE, `migration recoverability verification failed: ${msg(error)}; marker NOT seeded (fail-closed; next boot re-verifies)`)
     allRecoverable = false
   }
-  if (allRecoverable) {
+  if (allRecoverable && collectionOk) {
     seedServerMigrationMarker()
     debugLogger.log(
       SOURCE,
-      `server migration-on-boot: all ${projectCandidates.length + canvasCandidates.length} candidate(s) recoverable (on server or pending in durable queue); marker seeded`,
+      `server migration-on-boot: all ${projectCandidates.length + canvasCandidates.length} candidate(s) recoverable (on server or pending in durable queue); collection ok; marker seeded`,
+    )
+  } else if (allRecoverable && !collectionOk) {
+    // P1 r5(2026-07-16 二轮终审 P1):收集不健康(step1/step2 任一 list 抛 → 部分 candidate 未收集)→ 即便
+    //   已收集的 candidate 全 drain 成功(allRecoverable)也不种 marker。修前 >0-op 分支只看 allRecoverable →
+    //   种 marker → 下次 boot marker 已种跳迁移 → 未收集侧(如 step2 抛致 canvas 未收集)永久滞留 local
+    //   (真实数据丢失)。已收集的 partial ops 照常 drain(数据能上多少上多少);marker 不种 → 下次 boot 重收集,
+    //   combineOps 去重无重复 server 写,补齐漏掉侧 + collectionOk=true 后才种。
+    debugLogger.log(
+      SOURCE,
+      `server migration-on-boot: ${projectCandidates.length + canvasCandidates.length} candidate(s) recoverable but collection was partial (a hydrate list step threw — some candidates not collected); marker NOT seeded (next boot re-collects the missing side; partial ops already drained)`,
     )
   }
-  // allRecoverable===false:marker deliberately NOT seeded this round(verifyMigrationCandidatesRecoverable
+  // 其余(allRecoverable===false):marker deliberately NOT seeded this round(verifyMigrationCandidatesRecoverable
   //   已 per-failure error 留痕;下次 boot 差集重收集 + 天然重试)。
 }
 
@@ -274,6 +332,11 @@ const verifyMigrationCandidatesRecoverable = async (
   const serverProjectIds = new Set(projects.map((p) => p.id))
   const serverCanvasIds = new Set(canvases.map((c) => c.id))
   let failed = 0
+  // P1-4(2026-07-16 demo-seed-migration-skip,lead P3 收窄裁定):此处 ERROR 保留不降级——P3 的 WARN+不
+  //   toast 仅适用于 queue 层([migration] op terminal,writeRetryQueue drain switch 的 termLog);本 verifier
+  //   只会见到真实 uuid 候选的迁移失败(D2 收集层已用 DEMO_PROJECT_ID_SET 滤除 demo seed,纯 demo 不产生
+  //   candidate → 永不进此 verifier)。真实候选 terminal 失败 = "用户数据没上 server"的正当 fail-visible,
+  //   ERROR 出声 + 不种 marker 下次 boot 重试,不降级(否则静默丢用户数据)。既有 SC-J 测试(本路径)保持。
   for (const id of projectCandidates) {
     if (serverProjectIds.has(id)) continue // drain 成功 → 在服务端
     if (pendingProjectCreates.has(id)) continue // 仍 pending in durable queue → 后续 timer drain
@@ -305,12 +368,16 @@ export const __flushServerMigrationForTest = flushServerMigration
  *   网络失败记录留存 + 退避重试;断网恢复后 drain。
  * fire-and-forget(mutations 不 await);返回 promise 供测试 flush/drain;enqueue 失败 debugLogger.error(不静默)。
  */
-export const enqueuePersistWrite = (op: WriteOp): Promise<void> | undefined => {
+export const enqueuePersistWrite = (op: WriteOp, opts?: { migration?: boolean }): Promise<void> | undefined => {
   if (!writeQueue) return undefined // local inert OR queue 未启动
-  const p = writeQueue.enqueue(op).then(
+  const p = writeQueue.enqueue(op, opts).then(
     () => {},
     (error) => {
-      debugLogger.error(SOURCE, `enqueue failed (${op.kind}): ${msg(error)}; local set 已生效,服务端可能滞后(队列恢复后补发)`)
+      // P3:migration enqueue 失败也属后台 seed 迁移噪声,降 WARN;真实用户 mutation enqueue 失败保持 ERROR。
+      const log = opts?.migration
+        ? (m: string) => debugLogger.warn(SOURCE, `[migration] ${m}`)
+        : (m: string) => debugLogger.error(SOURCE, m)
+      log(`enqueue failed (${op.kind}): ${msg(error)}; local set 已生效,服务端可能滞后(队列恢复后补发)`)
     },
   )
   return p
@@ -336,6 +403,7 @@ export const __resetPersistBoot = (): void => {
   inFlightSceneIds.clear()
   // D2:清迁移收集状态 + 所有 userId marker(逐 test 隔离;防跨 test marker 泄漏致下一 test 误跳迁移)。
   pendingServerMigrationOps.length = 0
+  migrationCollectionOk = false
   clearAllServerMigrationMarkers()
 }
 
@@ -371,6 +439,15 @@ const hydrateChatForScene = async (
   sceneId: string,
   adapter: ReturnType<typeof getServerPersistAdapter>,
 ): Promise<void> => {
+  // P1 附带降噪:demo scene 的 chat 不走 server hydrate —— demo canvas 不上迁(P1),server 上无该 owner 的
+  //   demo canvas,listChatMessages 必 404 → 每 boot WARN 刷屏。demo chat 是种子(本地 IDB 有),跳过 server
+  //   hydrate 留本地即可(与 local 模式一致,无丢失)。覆盖所有调用点(block 4 active hydrate + backfillChatAfterDrain)。
+  //   P1-3:用完整 DemoSceneId 集合(DEMO_SCENE_ID_SET,6 个 scene)做真相源,非 DEMO_SCENE_PROJECT_MAP
+  //   (仅 4 个挂项目的 grouped scene)——否则 standalone 的 task-states/empty 漏判 → 每 boot 打 server 404。
+  if (DEMO_SCENE_ID_SET.has(sceneId)) {
+    debugLogger.log(SOURCE, `hydrate chat for scene ${sceneId} skipped (demo scene — not migrated to server, chat stays local seed)`)
+    return
+  }
   const { useChatStore } = await import('../store/chatStore')
   const { messages, orderRevision } = await adapter.listChatMessages(sceneId)
   const serverMessages = messages.map((r) => r.payload as ChatMessage)
@@ -580,6 +657,8 @@ export const hydrateFromServer = async (
   //   marker 已 set(boot flush 后)→ 跳迁移;且 onConflict 蕴含 server 非空 → 迁移分支(server 空)
   //   本就不命中。一次 hydrate 调用内 step1/step2 共用此快照(不重复读 localStorage)。
   const migrationMarkerSet = isServerMigrationMarkerSet()
+  // P1-1:乐观置 true;step1/step2 的 list 调用任一抛 → 对应 catch 置 false(收集不健康 → flush 0-op 不盲种 marker)。
+  migrationCollectionOk = true
 
   // 1. project 全量(非画布域,完全在 G1-a 范围)——按 marker 决定 union 差集迁移 or 服务端真值 replace。
   //    P1 bug fix(delete-resurrection)C:差集过滤 pending-delete project id —— DELETE 还在
@@ -618,12 +697,17 @@ export const hydrateFromServer = async (
       if (projects.length > 0) {
         useCanvasStore.setState({ projects: [...filteredProjects, ...candidates] })
       }
+      // P1:demo seed project 不上迁 —— demo id 全局稳定,跨 owner 碰撞 409 project-exists(首建用户独占),
+      //   且 demo 是种子非用户数据。union 仍保留 demo 本地可见(侧栏种子项目不丢),仅跳过 createProject op 收集。
+      let skippedDemoProjects = 0
       for (const p of candidates) {
+        if (DEMO_PROJECT_ID_SET.has(p.id)) { skippedDemoProjects++; continue }
         pendingServerMigrationOps.push({ kind: 'createProject', name: p.name, id: p.id })
       }
+      const demoProjNote = skippedDemoProjects > 0 ? `; ${skippedDemoProjects} demo seed project(s) skipped (not migrated — global id collides cross-owner 409; kept local)` : ''
       debugLogger.log(
         SOURCE,
-        `server hydrate: ${filteredProjects.length} server project(s)${candidates.length > 0 ? ` + ${candidates.length} local-only candidate(s) kept (union; createProject ops collected for migration-on-boot)` : ' (replaced local)'}${projects.length === 0 && localProjects.length > 0 ? ' [server empty, local retained]' : ''}`,
+        `server hydrate: ${filteredProjects.length} server project(s)${candidates.length > 0 ? ` + ${candidates.length} local-only candidate(s) kept (union; createProject ops collected for migration-on-boot${demoProjNote})` : ' (replaced local)'}${projects.length === 0 && localProjects.length > 0 ? ' [server empty, local retained]' : ''}`,
       )
     } else {
       // marker 已种 → 现行为(服务端真值 replace + C 过滤)+ F2 pending-create 并集保护。
@@ -650,6 +734,7 @@ export const hydrateFromServer = async (
       }
     }
   } catch (error) {
+    migrationCollectionOk = false // P1-1:listProjects 抛 → 收集不健康 → flush 0-op 不盲种 marker(下次 boot 重试)
     debugLogger.error(SOURCE, `listProjects hydrate failed: ${msg(error)} (degrade to local/demo state)`)
   }
 
@@ -684,6 +769,7 @@ export const hydrateFromServer = async (
     //   本地保留,服务端无该字段不影响)。
     let migrationCanvasCandidates = 0
     let gapNoProject = 0
+    let skippedDemoCanvases = 0
     if (!migrationMarkerSet && localCanvasEntries.length > 0) {
       const serverCanvasIds = new Set(canvases.map((m) => m.id))
       for (const [id, doc] of localCanvasEntries) {
@@ -693,6 +779,9 @@ export const hydrateFromServer = async (
           gapNoProject++
           continue
         }
+        // P1:demo scene canvas(其 projectId 属 demo project)不上迁 —— server 上无该 owner 的 demo canvas,
+        //   createCanvas 会撞 404 unknown-project(非 member);demo 是种子,本地保留即可。
+        if (DEMO_PROJECT_ID_SET.has(doc.projectId)) { skippedDemoCanvases++; continue }
         pendingServerMigrationOps.push({
           kind: 'createCanvas',
           canvasId: id,
@@ -701,10 +790,10 @@ export const hydrateFromServer = async (
         })
         migrationCanvasCandidates++
       }
-      if (migrationCanvasCandidates > 0 || gapNoProject > 0) {
+      if (migrationCanvasCandidates > 0 || gapNoProject > 0 || skippedDemoCanvases > 0) {
         debugLogger.log(
           SOURCE,
-          `server hydrate: ${localCanvasEntries.length} local canvas(s) → migration-on-boot (createCanvas meta ops collected for ${migrationCanvasCandidates} local-only candidate(s)${gapNoProject > 0 ? `; ${gapNoProject} skipped (no projectId — demo, not migrable)` : ''}; content(nodes/edges) NOT migrated — V1 meta-only gap, retained local — see report)`,
+          `server hydrate: ${localCanvasEntries.length} local canvas(s) → migration-on-boot (createCanvas meta ops collected for ${migrationCanvasCandidates} local-only candidate(s)${gapNoProject > 0 ? `; ${gapNoProject} skipped (no projectId — demo, not migrable)` : ''}${skippedDemoCanvases > 0 ? `; ${skippedDemoCanvases} demo seed canvas(s) skipped (not migrated — would 404 unknown-project cross-owner; kept local)` : ''}; content(nodes/edges) NOT migrated — V1 meta-only gap, retained local — see report)`,
         )
       }
     }
@@ -761,6 +850,7 @@ export const hydrateFromServer = async (
       )
     }
   } catch (error) {
+    migrationCollectionOk = false // P1-1:listCanvas 抛 → 收集不健康 → flush 0-op 不盲种 marker(下次 boot 重试)
     debugLogger.warn(SOURCE, `listCanvas hydrate failed: ${msg(error)}`)
   }
 
@@ -1068,15 +1158,22 @@ export const bootPersistWiring = async (opts: FetchAdapterOptions = getProductio
     //   验证,复用此 adapter,不另起第二条获取通道;getServerPersistAdapter 返单例)。
     const adapter = getServerPersistAdapter()
     await hydrateFromServer(adapter, opts)
+    // P1 r6(2026-07-16 三轮终审 P1):显式快照本次 boot 的收集结果,**必须在 startPersistWriteQueue 之前**取。
+    //   start() 立即 drain 历史队列,409 onConflict 会 fire `void hydrateFromServer()`(rehydrate)——它在 list 完成
+    //   前**乐观置 migrationCollectionOk=true**(行 661)。若 flush 在 start 之后复读 module-global,会读到被
+    //   rehydrate 覆写的 true → partial-collection 原 boot(step2 listCanvas 抛 → 真值=false)仍误种 marker
+    //   → 下次 boot marker 已种跳迁移 → 未收集侧(canvas)永久滞留 local(真实数据丢失)。故快照取在 start 之前,
+    //   把本次 boot 真值传入 flush,不跨 startPersistWriteQueue 这道 await 读 global(rehydrate 的覆写发生在
+    //   该 await 期间,快照先于覆写,免疫)。local 在 bootPersistWiring 第一行 return 短路,永不达此。
+    const collectionOkSnapshot = migrationCollectionOk
     await startPersistWriteQueue(opts)
     // D2:flush hydrate 收集的迁移 op(server 空 + 本地存量 → createProject/createCanvas 上迁)。
     //   必须在 startPersistWriteQueue 之后(queue singleton 已启动 → enqueuePersistWrite 真 enqueue)。
-    //   无迁移 op 时(pendingServerMigrationOps 空)flush 内 splice 后 length===0 → 直接 return,零开销。
-    //   F1:flush 在 drain 后验证可恢复性——全可恢复才种 marker(堵 terminal 残根;详见 flushServerMigration)。
-    //   local 在 bootPersistWiring 第一行 return 短路,永不达此。
-    if (pendingServerMigrationOps.length > 0) {
-      await flushServerMigration(adapter)
-    }
+    //   P1-1:无条件调(不再 pending>0 门)——纯 demo / 全量已在服务端时 0 op,flush 内种 marker 收敛
+    //   (否则每 boot 重收集/过滤/log 刷屏;详见 flushServerMigration 0-op 分支)。F1:非空 op flush 在 drain
+    //   后验证可恢复性——全可恢复 + 收集健康才种 marker(堵 terminal 残根 + P1 r5 partial-collection 误种)。
+    //   collectionOk 用上方快照(本次 boot 真值),不复读 module-global(防 start drain 内 onConflict rehydrate 覆写)。
+    await flushServerMigration(adapter, collectionOkSnapshot)
     // A2-S3 block 8:启动 scene 切换 re-hydrate 订阅(切到新 server 画布 → fetchCanvas 补 content;
     // 去重 + in-flight 防并发)。local 在 bootPersistWiring 第一行 return 短路,永不调此。
     await startSceneHydrationSubscription()
