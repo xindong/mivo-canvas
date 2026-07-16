@@ -234,14 +234,16 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
     //   同时收集 bundle entries(recordId→{revision,fieldClocks})+ canvasSeq → 签 canvas 级 bundle + sinceSeq。
     //   ⚠️ perf:per-record readRecordFieldClocks 对 PG 是 N 次查询;A2-S3 优先正确性,批量查询待优化
     //   (collab 生产大画布前;in-memory Map 查询 O(1) 无影响)。
-    // Phase 1 项5(2026-07-16 server 读容错,防 canvas-78c5bed3 类 500):GET /:id 对每个 child record 做
-    //   readRecordFieldClocks(N 次查询)+ payload/base 编码,**单条损坏子记录即可整体 500**(CR-14:须查
-    //   node/edge/anchor 子记录 payload 合法性与 field-clock 行,不只 meta)。改:per-record try/catch 降级 ——
-    //   损坏子记录(payload 缺失/字段异常/field-clock 查询抛错)跳过 + server console.warn 留痕,返回其余可读
-    //   内容(非整体 500)。**只防御性降级,不做任何生产数据修复**(数据修复需 lead 单独授权,不在本范围)。
-    //   跳过的 record 不入 entries/bundle;client hydrate R-7 union 视其为缺失(降级非崩溃);client 后续
-    //   edit/delete 该缺失 base 的 record → 428(降级但非崩溃,优于整画布 500 不可用)。Promise.all 保序,
-    //   filter(null) 剔除损坏项,返回剩余可读 entries。
+    // Phase 1 项5(2026-07-16 server 读容错,防 canvas-78c5bed3 类 500 + 双审 F-A 错误分类):
+    //   GET /:id 对每个 child record 做 readRecordFieldClocks(N 次查询)+ payload/base 编码。**错误分类 split**:
+    //   ① readRecordFieldClocks 是 DB 读 —— 抛错一律 rethrow(连接池耗尽 / statement_timeout / 死锁 40P01 /
+    //      序列化 40001 / 连接 08xxx / 未知)。rethrow → 路由外层 500 → client 重试(fail-visible)。**不 swallow**:
+    //      改前(初版)per-record 无差别 catch 把 DB 抖动期瞬时错也当损坏 record 吞 → 200 带洞 = 静默数据缺失
+    //      (无重试信号),Promise.all 并发全失败会一次静默丢一大批 record。F-A 修:DB 读错必 500 让 client 重试。
+    //   ② toEntry/encodeBase 是本 record payload/fieldClocks 结构编码 —— 抛错 = 本条 record 确定性结构损坏
+    //      (如 fieldClocks 含 BigInt/循环引用致 JSON.stringify 失败;重试也复现)→ swallow 跳过 + console.warn,
+    //      返回其余可读(降级 200)。**只 swallow 这一窄类确定性结构损坏**,其余已在 ① rethrow。
+    //   只防御性降级,不修生产数据(canvas-78c5bed3 数据修复需 lead 单独授权)。Promise.all 保序,filter(null) 剔除。
     type SignedEntry = { entry: RecordEntry; recordId: string; bundleEntry: BundleEntry }
     const signEntries = async (
       recs: PersistRecord[],
@@ -249,16 +251,20 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
     ): Promise<SignedEntry[]> => {
       const results = await Promise.all(
         recs.map(async (r): Promise<SignedEntry | null> => {
+          // ① DB 读 —— 任何抛错(瞬时/连接/超时/死锁/未知)rethrow:callback reject → Promise.all reject
+          //   → 路由外层 500 → client 重试(fail-visible,不静默吞)。
+          const fieldClocks = await backend.readRecordFieldClocks(authz.ownerId, type, r.id)
+          // ② 本 record 结构编码 —— 抛错 = 确定性结构损坏(payload/fieldClocks 畸形致 encode/base 失败),
+          //   重试也复现 → swallow 跳过 + console.warn,返回其余可读(降级 200)。
           try {
-            const fieldClocks = await backend.readRecordFieldClocks(authz.ownerId, type, r.id)
             return {
               entry: { ...toEntry(r), base: encodeBase(id, r.id, r.revision, fieldClocks) },
               recordId: r.id,
               bundleEntry: { revision: r.revision, fieldClocks },
             }
-          } catch (error) {
+          } catch (encodeError) {
             console.warn(
-              `[canvas GET /:id] skipping corrupted ${type} record ${r.id} (canvas=${id}, owner=${authz.ownerId}, request=${requestId}): ${error instanceof Error ? error.message : String(error)} — returning remaining readable content (degraded, no data repair)`,
+              `[canvas GET /:id] skipping corrupted ${type} record ${r.id} (canvas=${id}, owner=${authz.ownerId}, request=${requestId}): ${encodeError instanceof Error ? encodeError.message : String(encodeError)} — encode/base structural failure (deterministic); returning remaining readable content (degraded, no data repair)`,
             )
             return null
           }

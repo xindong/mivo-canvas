@@ -762,8 +762,15 @@ export const hydrateFromServer = async (
           ? []
           : localProjects.filter((p) => pendingCreateProjectIds.has(p.id) && !filteredIds.has(p.id))
         const retainedIds = new Set<string>([...filteredIds, ...localPendingCreates.map((p) => p.id)])
+        // Phase 1 Fix 2(双审对称缺口,2026-07-16):retainedDemoProjects 须排除 tombstone/pending-delete(对称于上游
+        //   filteredProjects 排除两者),防极窄边缘(localStorage 丢失重灌 demo seed + IDB tombstone 存活)下
+        //   复活已删 demo 项目。tombstoneProjectIds/pendingDeleteProjectIds 在 step1 作用域内(上方 Promise.all)。
         const retainedDemoProjects = localProjects.filter(
-          (p) => DEMO_PROJECT_ID_SET.has(p.id) && !retainedIds.has(p.id),
+          (p) =>
+            DEMO_PROJECT_ID_SET.has(p.id) &&
+            !retainedIds.has(p.id) &&
+            !tombstoneProjectIds.has(p.id) &&
+            !pendingDeleteProjectIds.has(p.id),
         )
         useCanvasStore.setState({ projects: [...filteredProjects, ...localPendingCreates, ...retainedDemoProjects] })
         const droppedProjects = projects.length - filteredProjects.length
