@@ -77,3 +77,6 @@ bench-results/
 # 0b spike bench baselines (spike 产物,数据见 docs/decisions/leafer-0b-spike-*.md)
 bench/baselines/0b-*.json
 bench/baselines/.0b-*.log
+
+# bug-doctor loop 运行时状态(state/ledger/logs/workpacket/看板,不入 git)
+history/loops/
