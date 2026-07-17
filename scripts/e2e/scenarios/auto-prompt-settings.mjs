@@ -9,7 +9,7 @@
 // to the ACCOUNT section (which shows a 「登录」 button — user clicks it to go to SSO,
 // not auto-redirected). Tests the 用户实测 2026-07-08 unauthenticated branch.
 export const runAutoPromptSettingsScenario = async (context) => {
-  const { baseUrl, page } = context
+  const { baseUrl, page, isProdTopology } = context
 
   // Harness default suppresses AutoPrompt (window.__MIVO_E2E_DISABLE_AUTO_PROMPT__=true).
   // This scenario tests AutoPrompt → opt back in (our addInitScript runs after the
@@ -17,26 +17,36 @@ export const runAutoPromptSettingsScenario = async (context) => {
   await page.addInitScript(() => { window.__MIVO_E2E_DISABLE_AUTO_PROMPT__ = false })
 
   // ── Flow 1: logged-in + no keys → API Keys section ───────────────────────
-  await page.goto(baseUrl, { waitUntil: 'networkidle' })
-  await page.waitForSelector('.project-sidebar')
+  // prod 拓扑 createSmokePage 设 mockAuthMe(e2e-smoke.mjs:291)→ /api/auth/me 返
+  // {authenticated:false};Flow 1 需 dev stub(MIVO_DEV_AUTH_STUB=1)认证态 + 空 keys →
+  // AutoPrompt 开 api-keys 区。prod 下未认证 → AutoPrompt 开 account 区(非 api-keys)
+  // → [data-section="api-keys"]/XD 网关 Key 永不渲染 → 超时(nightly-e2e 全扫红灯)。prod
+  // skip Flow 1(遵 mask-multi-edit:377 既有 dev-only 机制守卫范式 + development-logging
+  // 哲学:不静默跳);Flow 2 未认证 auto-prompt → account/SSO 区(prod-relevant)两拓扑照常跑。
+  if (!isProdTopology) {
+    await page.goto(baseUrl, { waitUntil: 'networkidle' })
+    await page.waitForSelector('.project-sidebar')
 
-  // AutoPrompt fires once auth hydrates (dev stub → authenticated) + settings
-  // hydrate (empty keys) → openSettings('api-keys').
-  await page.waitForSelector('.settings-panel', { state: 'visible' })
-  await page.waitForSelector('[data-section="api-keys"]')
-  await page.getByText('XD 网关 Key', { exact: true }).waitFor()
-  await page.getByText('Mivo Key', { exact: true }).waitFor()
-  if ((await page.getByText('请先登录 SSO 后再配置 API Keys').count()) !== 0) {
-    throw new Error('authenticated API Keys section should render key rows, not the SSO login gate')
-  }
+    // AutoPrompt fires once auth hydrates (dev stub → authenticated) + settings
+    // hydrate (empty keys) → openSettings('api-keys').
+    await page.waitForSelector('.settings-panel', { state: 'visible' })
+    await page.waitForSelector('[data-section="api-keys"]')
+    await page.getByText('XD 网关 Key', { exact: true }).waitFor()
+    await page.getByText('Mivo Key', { exact: true }).waitFor()
+    if ((await page.getByText('请先登录 SSO 后再配置 API Keys').count()) !== 0) {
+      throw new Error('authenticated API Keys section should render key rows, not the SSO login gate')
+    }
 
-  // Close the panel; the session-level autoPrompted flag must suppress re-prompt.
-  await page.getByRole('button', { name: '关闭设置' }).click()
-  await page.waitForSelector('.settings-panel', { state: 'detached' })
-  await new Promise((resolve) => setTimeout(resolve, 300))
-  const reopened = await page.locator('.settings-panel').count()
-  if (reopened) {
-    throw new Error('auto-prompt should NOT re-open after the user closed the panel this session')
+    // Close the panel; the session-level autoPrompted flag must suppress re-prompt.
+    await page.getByRole('button', { name: '关闭设置' }).click()
+    await page.waitForSelector('.settings-panel', { state: 'detached' })
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    const reopened = await page.locator('.settings-panel').count()
+    if (reopened) {
+      throw new Error('auto-prompt should NOT re-open after the user closed the panel this session')
+    }
+  } else {
+    console.log('[auto-prompt-settings] prod: Flow 1 (logged-in → API Keys section) skipped (dev-only MIVO_DEV_AUTH_STUB authenticated stub; prod mocks /me unauthenticated so AutoPrompt opens account, not api-keys); Flow 2 unauthenticated auto-prompt → account/SSO still runs')
   }
 
   // ── Flow 2: unauthenticated → account section (登录 button) ──────────────
