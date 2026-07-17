@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  bug-doctor T5 整点轻巡(契约 docs/loops/bug-doctor.md 触发拓扑第一行):
+  每小时整点跑 patrol.mjs(内部执行 gate - -s0-only,零 LLM);命中新 S0 → 告警;
+  gate 连败 ≥3 → "loop 已失明"自告警。
+
+  安装(本文件为仓内模板,安装副本在 ~/Library/LaunchAgents/):
+    cp scripts/loops/bug-doctor/com.mivo.bug-doctor.patrol.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.mivo.bug-doctor.patrol.plist
+  手动触发一轮:launchctl kickstart gui/$(id -u)/com.mivo.bug-doctor.patrol
+
+  TODO(T8):gate 系列合入 main 后,把下方 ProgramArguments 第二项与 WorkingDirectory
+  从 worktree(.claude/worktrees/bug-doctor-gate)切到主 checkout
+  /Users/praise/AI-Agent/Claude/projects/Project MivoCanvas,然后 bootout + bootstrap 重载。
+  StateDir 已固定指向主 checkout 的 history/loops/bug-doctor,切换时无需迁移台账。
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.mivo.bug-doctor.patrol</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/node</string>
+    <string>/Users/praise/AI-Agent/Claude/projects/Project MivoCanvas/.claude/worktrees/bug-doctor-gate/scripts/loops/bug-doctor/patrol.mjs</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- launchd 默认 PATH 不含 homebrew,gh/ssh 依赖此行 -->
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <!-- 台账固定主 checkout(worktree 只是代码来源,状态单一真相源不随代码路径走) -->
+    <key>MIVO_BUG_DOCTOR_STATE_DIR</key>
+    <string>/Users/praise/AI-Agent/Claude/projects/Project MivoCanvas/history/loops/bug-doctor</string>
+  </dict>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/praise/AI-Agent/Claude/projects/Project MivoCanvas/.claude/worktrees/bug-doctor-gate</string>
+
+  <!-- 每小时整点 -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/praise/AI-Agent/Claude/projects/Project MivoCanvas/history/loops/bug-doctor/patrol.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/praise/AI-Agent/Claude/projects/Project MivoCanvas/history/loops/bug-doctor/patrol.stderr.log</string>
+</dict>
+</plist>
