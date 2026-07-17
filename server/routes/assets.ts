@@ -63,6 +63,7 @@ import { acquireDecodePermit, DecodeBusyError, type DecodePermit } from '../lib/
 import type { PersistBackend } from '../persist/backend'
 import type { PermissionBackend } from '../lib/permissions'
 import type { App, AppEnv } from '../lib/types'
+import type { ArchivedBody } from '../../shared/persist-contract.ts'
 
 // sha256 hex (64). Validated on GET so a non-hash :id never reaches the store /
 // backend (P2.6 — defense in depth: the store re-validates too).
@@ -494,6 +495,23 @@ export const createAssetRoutes = (options: AssetRouteOptions): App => {
         log(access.status, access.status === 403 ? 'forbidden' : access.status === 409 ? 'archived' : 'unknown-canvas')
         return c.json(access.body as Record<string, unknown>, access.status as 400 | 403 | 404 | 409 | 410)
       }
+    } else {
+      // CR-6(Phase 2 归档 write-guard,补 legacy 路径):legacy ref(canvas-less,ref.canvasId undefined)整段
+      //   此前跳过 resolveCanvasAccess → 不触发归档 409(攻击面:pre-G2.2 canvas-less legacy ref 其 node 落已归档
+      //   画布,owner detach → 200 而非 409)。补:用 node→canvas 反查(resolveAssetOwner ownerFp 作 node owner_id
+      //   代理:owner-attached legacy ref ownerFp===canvas owner → persist.get 命中;editor-attached ownerFp≠canvas
+      //   owner → get missing → 解析不到 → 维持现状,行为不变,不误伤)。不能靠 bodyCanvasId(legacy fallback
+      //   故意忽略它,禁回填语义,见下方注释)。
+      const nodeRes = await persist.get(ownerFp, 'node', nodeId)
+      const legacyCanvasId = nodeRes.kind === 'found' ? nodeRes.record.canvasId : null
+      if (legacyCanvasId) {
+        const canvasRes = await persist.get(ownerFp, 'canvas', legacyCanvasId)
+        if (canvasRes.kind === 'found' && canvasRes.record.status === 'archived') {
+          log(409, 'archived')
+          return c.json({ error: 'archived', id: legacyCanvasId } satisfies ArchivedBody, 409)
+        }
+      }
+      // 解析不到(node 孤儿/editor-attached legacy ref)或 canvas active → 维持现状(下方 legacy detach)。
     }
     // authz 过(新 ref canvas-edit / legacy ref 走 service ownerFp)→ detach(P1-4 残留2:传 ref.canvasId
     //   本身;legacy ref → undefined,**禁回填 bodyCanvasId**——否则 backend 按 (bodyCanvasId, nodeId)

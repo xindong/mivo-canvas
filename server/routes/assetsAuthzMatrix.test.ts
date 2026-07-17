@@ -298,6 +298,39 @@ describe('G2.2 P1-4 残留2 — route detach 复合键选择(InMemory route 级)
     expect(await r.json()).toEqual({ kind: 'detached' })
   })
 
+  it('CR-6 legacy 路径:legacy ref(canvas-less)其 node 落在已归档 canvas → detach → 409 {error:"archived"}', async () => {
+    const persist = createPersistBackend()
+    const permissions = new InMemoryPermissionBackend()
+    const assetStore = createAssetStore(createMemoryAssetBackend())
+    const app = buildApp(persist, permissions, assetStore)
+    // seed owner project + canvas + 真实 node(在 canvas 上)。
+    const ids = { project: 'p-arch', canvas: 'c-arch', node: 'n-arch', node2: 'n2-arch' }
+    await persist.ensureCreate(FP_OWNER, 'project', ids.project, { title: 'p' }, { method: 'POST', resourceKind: 'project' })
+    await persist.createCanvasWithCollection(FP_OWNER, ids.canvas, { projectId: ids.project }, { method: 'POST', resourceKind: 'canvas' })
+    await persist.ensureCreateChild(FP_OWNER, ids.canvas, 'node', ids.node, { type: 'image' }, { method: 'POST', resourceKind: 'node' })
+    // upload asset(owner)。
+    const bytes = await realPng()
+    const form = new FormData()
+    form.append('image', new File([bytes], 'a.png', { type: 'image/png' }), 'a.png')
+    const upRes = await app.request('/api/assets', { method: 'POST', headers: hdr(MIVO_KEY_OWNER), body: form })
+    expect(upRes.status).toBe(200)
+    const assetId = ((await upRes.json()) as { assetId: string }).assetId
+    // 创建 legacy ref(canvas-less)指向真实 node(模拟 G2.2 前写入的 ref)。
+    await assetStore.attach(assetId, ids.node, FP_OWNER)
+    // 归档 canvas(其上 node 仍在,canvas meta status→archived)。
+    await persist.archiveCanvasTree(FP_OWNER, ids.canvas)
+    // detach 带 canvasId='c-not-the-legacy-ref' → 精确 (canvasId,node) 不存在 → legacy fallback 命中 (null,node)
+    //   → ref.canvasId undefined → CR-6 legacy 守卫:persist.get(FP_OWNER,'node',node) 命中 → canvasId=c-arch →
+    //   persist.get(FP_OWNER,'canvas',c-arch) status=archived → 409 {error:'archived', id:c-arch}。
+    const r = await app.request(`/api/assets/${assetId}/detach`, {
+      method: 'POST',
+      headers: { ...hdr(MIVO_KEY_OWNER), 'content-type': 'application/json' },
+      body: JSON.stringify({ nodeId: ids.node, canvasId: 'c-not-the-legacy-ref' }),
+    })
+    expect(r.status).toBe(409)
+    expect(await r.json()).toEqual({ error: 'archived', id: ids.canvas })
+  })
+
   it('无 body canvasId + 新 ref(有 canvasId)→ 只匹配 legacy(无)→ already-detached(新 ref 须显式 canvasId)', async () => {
     const persist = createPersistBackend()
     const permissions = new InMemoryPermissionBackend()
