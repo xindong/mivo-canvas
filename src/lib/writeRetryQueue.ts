@@ -760,50 +760,34 @@ const combineOps = (existing: WriteOp, incoming: WriteOp): WriteOp | 'cancel' | 
   // create+delete → 净消(资源从未服务端创建,delete 无意义)
   if (ek === 'createProject' && ik === 'deleteProject') return 'cancel'
   if (ek === 'createCanvas' && ik === 'deleteCanvas') return 'cancel'
-  // D2(Phase 2 归档 combineOps):
-  //  - create+archive → create(status:'archived'):合并后单 create op 带 status,server ensureCreate 应用之,
-  //    归档资源一次落库(防归档意图被随后 create 替换丢失——resourceKey 同,combine 在 create 侧)。
-  //  - create+unarchive → create(status:'active'):撤销先前 create+archive 的 archived(全新 create 无归档态,
-  //    status='active' 幂等;若先前经 create+archive 合并得 archived,此处翻回 active)。
+  // D2(Phase 2 归档 combineOps,P1 三审返修:create+archive/unarchive 不再折成 create(status)):
+  //  - create+archive/unarchive → skip-coalesce(下方 isStateTransition 条件,保留独立 transition record)。
+  //    旧实现折成 create(status:'archived'/'active')把 archiveProject/archiveCanvas op coalesce 删掉 →
+  //    archiveProjectTree 级联永不跑 + lost-response 分叉:server ensureCreate 对 live existing 返原 record 不
+  //    应用 incoming status(backend.ts existing → clone(existing)),executor createProject 直接 success /
+  //    createCanvas 只比 title|projectId 不比 status → create 首次落 active、响应丢失后 archive 入队,coalesced
+  //    retry 报 success 但 server 仍 active,client 乐观全 archived → 永久分叉 + 漏级联子画布(违反 CR-5/D3)。
+  //    且 archive op 在 coalesce 时就被删,archive barrier / 同 resourceKey 前驱屏障都没机会排序(绕过 barrier)。
+  //    skip-coalesce 后保留独立 transition op:同 resourceKey 前驱屏障(createProject↔archiveProject 同 project:p1
+  //    排序)+ archiveProject canvasIds barrier(isArchiveBlockedByEarlierWrite 覆盖 createCanvas:createCanvas ∈
+  //    NON_CANVAS_KINDS → isNonCanvasWriteOp=true → opTargetsCanvasId 命中 c1 → 挡,等 createCanvas drain success
+  //    再放 archiveProject)排序:create 先 drain → server 落 active → archive 后 drain POST /archive → server
+  //    archiveProjectTree 级联归档子画布 → client/server 一致 archived。
   //  - archive+unarchive → 互消(cancel;归档→撤销归档,净态回原状,不发请求;两方向对称)。
   //  - delete+archive/unarchive → delete 赢(return existing):删终态压过归档态;归档一个正被删的资源无意义,
   //    保 delete 不让 archive/unarchive 复活删除意图(last-wins 会返 incoming archive → 删除被替换为归档,bug)。
   //  - archive/unarchive+delete(incoming)= delete 走下方默认 last-wins(incoming delete 胜,无需显式)。
-  if (ek === 'createProject' && ik === 'archiveProject') {
-    return { kind: 'createProject', name: existing.name, id: existing.id ?? incoming.projectId, status: 'archived' }
-  }
-  if (ek === 'createProject' && ik === 'unarchiveProject') {
-    return { kind: 'createProject', name: existing.name, id: existing.id ?? incoming.projectId, status: 'active' }
-  }
-  if (ek === 'createCanvas' && ik === 'archiveCanvas') {
-    // 字段级合并(同 createCanvas+updateCanvas):保留 create 独有字段(sourceTemplateId),status='archived'。
-    return {
-      kind: 'createCanvas',
-      canvasId: existing.canvasId,
-      projectId: existing.projectId,
-      ...(existing.title !== undefined ? { title: existing.title } : {}),
-      ...(existing.sourceTemplateId !== undefined ? { sourceTemplateId: existing.sourceTemplateId } : {}),
-      status: 'archived',
-    }
-  }
-  if (ek === 'createCanvas' && ik === 'unarchiveCanvas') {
-    return {
-      kind: 'createCanvas',
-      canvasId: existing.canvasId,
-      projectId: existing.projectId,
-      ...(existing.title !== undefined ? { title: existing.title } : {}),
-      ...(existing.sourceTemplateId !== undefined ? { sourceTemplateId: existing.sourceTemplateId } : {}),
-      status: 'active',
-    }
-  }
   if (ek === 'archiveProject' && ik === 'unarchiveProject') return 'cancel'
   if (ek === 'unarchiveProject' && ik === 'archiveProject') return 'cancel'
   if (ek === 'archiveCanvas' && ik === 'unarchiveCanvas') return 'cancel'
   if (ek === 'unarchiveCanvas' && ik === 'archiveCanvas') return 'cancel'
   if (ek === 'deleteProject' && (ik === 'archiveProject' || ik === 'unarchiveProject')) return existing
   if (ek === 'deleteCanvas' && (ik === 'archiveCanvas' || ik === 'unarchiveCanvas')) return existing
-  // P1-1(#1/#2 返修):state-transition(archive/unarchive)+ meta update 双向 → skip-coalesce(不合并为单槽,
-  //   保留两条有序 op 按 seq 顺序重放:队列本支持多 op;coalesce 只是优化不是必须)。防 last-wins 静默丢一侧意图:
+  // P1-1(#1/#2 返修)+ P1(三审):一侧 state-transition,另一侧 create 或 meta-update → skip-coalesce(不合并
+  //   为单槽,保留两条有序 op 按 seq 顺序重放:队列本支持多 op;coalesce 只是优化不是必须)。防 last-wins
+  //   静默丢一侧意图:
+  //   - create+transition(三审):见上方 D2 注释——保留独立 transition op 让 archiveProjectTree 级联跑 +
+  //     barrier 排序,修 lost-response 分叉 + 漏级联。
   //   - unarchive+update:last-wins→update 丢 unarchive → 幸存 update 打到仍 archived 服务端 → CR-6 409 →
   //     terminal 删除 → 写永久丢失,client active+新名/server 仍 archived 永久分叉。skip-coalesce→unarchive 先
   //     drain(status→active)→update 后 drain(meta 落 active,不 409)→双意图落地。
@@ -811,13 +795,20 @@ const combineOps = (existing: WriteOp, incoming: WriteOp): WriteOp | 'cancel' | 
   //     archive 先 drain(archived)→update 后 drain(409 stale terminal,P1-2 "archive 之后 stale 写应 409" 正确)。
   //   - update+archive / update+unarchive(反向):skip-coalesce→update 先 drain(meta)→archive/unarchive 后 drain
   //     (status)→双意图落地(顺带修既有 update+archive→archive 胜丢 rename 的取舍:rename 先落,archive 后)。
-  //   注:create+archive 不走此(create 能带 status,create+archive→create(archived) 单 op 双意图,不丢);
+  //   注:create+meta-update(createProject+updateProject / createCanvas+updateCanvas)不走此——上方合并到 create
+  //     body(保留 create kind,防服务端从未 POST);create+transition 才走此 skip(transition 是 status 转移非
+  //     meta 合并,折进 create 会丢 transition op + 绕过 barrier);
   //   archive/unarchive+delete 不走此(delete 终态压过归档,上方 return existing 正确);
   //   archive+unarchive 不走此(互消 cancel,上方);update+update 仍 last-wins(同意图后者胜,不丢意图)。
+  const isCreate = (k: WriteOpKind): boolean => k === 'createProject' || k === 'createCanvas'
   const isStateTransition = (k: WriteOpKind): boolean =>
     k === 'archiveProject' || k === 'unarchiveProject' || k === 'archiveCanvas' || k === 'unarchiveCanvas'
   const isMetaUpdate = (k: WriteOpKind): boolean => k === 'updateProject' || k === 'updateCanvas'
-  if ((isStateTransition(ek) && isMetaUpdate(ik)) || (isMetaUpdate(ek) && isStateTransition(ik))) {
+  // 一侧 state-transition,另一侧 create 或 meta-update(双向)→ skip-coalesce。
+  if (
+    (isStateTransition(ek) && (isCreate(ik) || isMetaUpdate(ik))) ||
+    ((isCreate(ek) || isMetaUpdate(ek)) && isStateTransition(ik))
+  ) {
     return 'skip-coalesce'
   }
   // 其余组合:last-wins(update+update / update+delete / delete+delete / delete+update / create+create /

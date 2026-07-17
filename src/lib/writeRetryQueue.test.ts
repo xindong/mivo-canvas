@@ -2651,29 +2651,40 @@ const updateProjectOp = (projectId: string, name: string): WriteOp => ({ kind: '
 const updateCanvasOp = (canvasId: string, projectId: string, title?: string): WriteOp => ({ kind: 'updateCanvas', canvasId, projectId, ...(title !== undefined ? { title } : {}) })
 
 describe('Phase 2 归档 combineOps (D2) — resourceKey 一致 + 合并规则', () => {
-  it('createProject + archiveProject → 合并为 createProject(status:archived)', async () => {
-    const { fn, calls } = seqExecutor([{ status: 'success' }])
+  it('createProject + archiveProject → skip-coalesce(2 records);drain create 先,archive 后(同 resourceKey 前驱屏障挡 archive;独立 archiveProject op 不被删)', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'success' }, { status: 'success' }])
     const q = makeQueue(fn)
     await q.enqueue(createProjectOp('proj', 'p1'))
-    await q.enqueue(archiveProjectOp('p1')) // 同 resourceKey project:p1 → coalesce
-    expect((await __dumpWritesForTest())).toHaveLength(1)
+    await q.enqueue(archiveProjectOp('p1')) // 同 resourceKey project:p1 → skip-coalesce(P1 三审:不再折成 create(archived))
+    expect((await __dumpWritesForTest())).toHaveLength(2) // skip-coalesce(不合并为 1)
+    // drain1:archiveProject 被同 resourceKey 前驱屏障挡(createProject seq1 active earlier)→ 只 createProject drain
     await q.drain()
     expect(calls).toHaveLength(1)
     expect(calls[0].op.kind).toBe('createProject')
-    expect((calls[0].op as { status?: string }).status).toBe('archived')
+    expect((calls[0].op as { status?: string }).status).toBeUndefined() // create op 不带 status(独立 archive op 才发 archive)
+    // drain2:createProject success 出队 → 屏障解锁 → archiveProject drain success(server POST /archive + cascade)
+    await q.drain()
+    expect(calls).toHaveLength(2)
+    expect(calls[1].op.kind).toBe('archiveProject') // 独立 archive op 存在(未被 coalesce 删)
+    expect((await __dumpWritesForTest())).toHaveLength(0)
   })
 
-  it('createCanvas + archiveCanvas → 合并为 createCanvas(status:archived),保留 sourceTemplateId', async () => {
-    const { fn, calls } = seqExecutor([{ status: 'success' }])
+  it('createCanvas + archiveCanvas → skip-coalesce(2 records);createCanvas 保留 sourceTemplateId,archiveCanvas 独立', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'success' }, { status: 'success' }])
     const q = makeQueue(fn)
     await q.enqueue({ kind: 'createCanvas', canvasId: 'c1', projectId: 'p1', title: 't', sourceTemplateId: 'tmpl' })
-    await q.enqueue(archiveCanvasOp('c1')) // 同 resourceKey canvas:c1 → coalesce
-    expect((await __dumpWritesForTest())).toHaveLength(1)
-    await q.drain()
+    await q.enqueue(archiveCanvasOp('c1')) // 同 resourceKey canvas:c1 → skip-coalesce
+    expect((await __dumpWritesForTest())).toHaveLength(2)
+    await q.drain() // createCanvas 先(无前驱)
+    expect(calls).toHaveLength(1)
     expect(calls[0].op.kind).toBe('createCanvas')
-    const drained = calls[0].op as { status?: string; sourceTemplateId?: string }
-    expect(drained.status).toBe('archived')
-    expect(drained.sourceTemplateId).toBe('tmpl')
+    const created = calls[0].op as { status?: string; sourceTemplateId?: string }
+    expect(created.status).toBeUndefined() // create 不带 status
+    expect(created.sourceTemplateId).toBe('tmpl') // create 独有字段保留
+    await q.drain() // archiveCanvas 后(屏障解锁)
+    expect(calls).toHaveLength(2)
+    expect(calls[1].op.kind).toBe('archiveCanvas') // 独立 archive op
+    expect((await __dumpWritesForTest())).toHaveLength(0)
   })
 
   it('archiveProject + unarchiveProject → 净消 cancel(0 记录,0 请求)', async () => {
@@ -2738,15 +2749,20 @@ describe('Phase 2 归档 combineOps (D2) — resourceKey 一致 + 合并规则',
     expect(calls[0].op.kind).toBe('deleteCanvas')
   })
 
-  it('createProject + unarchiveProject → createProject(status:active)(撤销先前归档)', async () => {
-    const { fn, calls } = seqExecutor([{ status: 'success' }])
+  it('createProject + unarchiveProject → skip-coalesce(2 records);create 先,unarchive 后(独立 transition op)', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'success' }, { status: 'success' }])
     const q = makeQueue(fn)
     await q.enqueue(createProjectOp('proj', 'p1'))
-    await q.enqueue(unarchiveProjectOp('p1')) // create+unarchive → create(active)
-    expect((await __dumpWritesForTest())).toHaveLength(1)
-    await q.drain()
+    await q.enqueue(unarchiveProjectOp('p1')) // 同 resourceKey project:p1 → skip-coalesce(P1 三审)
+    expect((await __dumpWritesForTest())).toHaveLength(2)
+    await q.drain() // createProject 先(屏障挡 unarchive)
+    expect(calls).toHaveLength(1)
     expect(calls[0].op.kind).toBe('createProject')
-    expect((calls[0].op as { status?: string }).status).toBe('active')
+    expect((calls[0].op as { status?: string }).status).toBeUndefined()
+    await q.drain() // unarchiveProject 后(屏障解锁)
+    expect(calls).toHaveLength(2)
+    expect(calls[1].op.kind).toBe('unarchiveProject')
+    expect((await __dumpWritesForTest())).toHaveLength(0)
   })
 })
 
@@ -2788,18 +2804,23 @@ describe('P1-1(返修):state-transition + meta update → skip-coalesce(不静�
     expect((await __dumpWritesForTest())).toHaveLength(0) // archive success 出队 + update terminal 出队 → 空
   })
 
-  it('canvas:createCanvas+archiveCanvas→updateCanvas → create(archived)+meta 单 op,status 不丢(#3)', async () => {
-    const { fn, calls } = seqExecutor([{ status: 'success' }])
+  it('canvas:createCanvas+archiveCanvas→updateCanvas → skip-coalesce 3 records;drain create(→active)→archive(→archived)→update(409 stale terminal);archive op 独立,status 不丢(#3 三审)', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'success' }, { status: 'success' }, { status: 'rejected', body: { error: 'archived' } }])
     const q = makeQueue(fn)
     await q.enqueue({ kind: 'createCanvas', canvasId: 'c1', projectId: 'p1', title: 'orig' })
-    await q.enqueue(archiveCanvasOp('c1')) // create+archive → create(archived) [coalesce]
-    await q.enqueue(updateCanvasOp('c1', 'p1', 'new')) // create(archived)+update → create(archived,new) [#3 status 保留]
-    expect((await __dumpWritesForTest())).toHaveLength(1) // 全 coalesce 为 1 record
-    await q.drain()
+    await q.enqueue(archiveCanvasOp('c1')) // create+archive → skip-coalesce(P1 三审:不再折成 create(archived))
+    await q.enqueue(updateCanvasOp('c1', 'p1', 'new')) // archive+update → skip-coalesce(3 records 全留)
+    expect((await __dumpWritesForTest())).toHaveLength(3) // create + archive + update 全 skip-coalesce
+    await q.drain() // createCanvas 先(无前驱)
     expect(calls).toHaveLength(1)
     expect(calls[0].op.kind).toBe('createCanvas')
-    expect((calls[0].op as { status?: string }).status).toBe('archived') // #3:status 不丢
-    expect((calls[0].op as { title?: string }).title).toBe('new') // update meta 应用
+    await q.drain() // archiveCanvas(屏障解锁)→ success(server archived)
+    expect(calls).toHaveLength(2)
+    expect(calls[1].op.kind).toBe('archiveCanvas') // 独立 archive op 落 archived(status 不丢)
+    await q.drain() // updateCanvas(archive 已 archived)→ 409 stale terminal(P1-2 "archive 后 stale 写应 409")
+    expect(calls).toHaveLength(3)
+    expect(calls[2].op.kind).toBe('updateCanvas')
+    expect((await __dumpWritesForTest())).toHaveLength(0) // create/archive success + update terminal 全出队
   })
 
   it('project:unarchiveProject + updateProject → 前驱屏障:drain1 只 unarchive(update 延后),drain2 update success(不丢 unarchive)', async () => {
@@ -2834,18 +2855,75 @@ describe('P1-1(返修):state-transition + meta update → skip-coalesce(不静�
     expect((await __dumpWritesForTest())).toHaveLength(0)
   })
 
-  it('project:createProject+archiveProject→updateProject → create(archived)+name 单 op,status 不丢(#3)', async () => {
-    const { fn, calls } = seqExecutor([{ status: 'success' }])
+  it('project:createProject+archiveProject→updateProject → skip-coalesce 3 records;drain create→archive→update(success,project PATCH 无 CR-6 409 guard);archive op 独立,status 不丢(#3 三审)', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'success' }, { status: 'success' }, { status: 'success' }])
     const q = makeQueue(fn)
     await q.enqueue(createProjectOp('orig', 'p1'))
-    await q.enqueue(archiveProjectOp('p1')) // create+archive → create(archived)
-    await q.enqueue(updateProjectOp('p1', 'new')) // create(archived)+update → create(archived,new) [#3]
-    expect((await __dumpWritesForTest())).toHaveLength(1)
+    await q.enqueue(archiveProjectOp('p1')) // create+archive → skip-coalesce
+    await q.enqueue(updateProjectOp('p1', 'new')) // archive+update → skip-coalesce(3 records)
+    expect((await __dumpWritesForTest())).toHaveLength(3)
+    await q.drain() // createProject 先
+    expect(calls).toHaveLength(1)
+    expect(calls[0].op.kind).toBe('createProject')
+    await q.drain() // archiveProject(屏障解锁)→ success(server archived)
+    expect(calls).toHaveLength(2)
+    expect(calls[1].op.kind).toBe('archiveProject')
+    await q.drain() // updateProject(archive archived,但 project PATCH /:id 无 CR-6 409 guard → success,归档项目可 rename)
+    expect(calls).toHaveLength(3)
+    expect(calls[2].op.kind).toBe('updateProject')
+    expect((await __dumpWritesForTest())).toHaveLength(0)
+  })
+})
+
+describe('P1(三审)验收锁测:create+archive/unarchive skip-coalesce — 漏级联 + lost-response 分叉根因修复', () => {
+  // 三审根因:旧 combineOps create+archive→create(status:archived) 把 archiveProject/archiveCanvas op coalesce
+  //   删掉 → archiveProjectTree 级联永不跑 + lost-response(server ensureCreate 对 live existing 返原 record 不应用
+  //   status、executor createProject/createCanvas 不比 status)→ server 仍 active、client 乐观 archived 永久分叉。
+  //   修:create+transition → skip-coalesce(保留独立 transition op),让 barrier 排序 + server archive endpoint 级联。
+
+  it('验收1(级联):createProject(p1)→createCanvas(c1,p1)→archiveProject(p1,canvasIds:[c1]) 连续 enqueue,skip-coalesce 保留独立 archiveProject op;循环 drain 后 calls 含 archiveProject(create→createCanvas→archive 顺序),级联不漏 c1', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'success' }, { status: 'success' }, { status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue(createProjectOp('proj', 'p1'))
+    await q.enqueue({ kind: 'createCanvas', canvasId: 'c1', projectId: 'p1' })
+    await q.enqueue({ kind: 'archiveProject', projectId: 'p1', canvasIds: ['c1'] })
+    expect((await __dumpWritesForTest())).toHaveLength(3) // skip-coalesce(独立 archiveProject op 保留,未被折成 create(archived))
+    // 循环 drain 至空:R7-1 拓扑让 createProject 先于 createCanvas(FK 边);两屏障挡 archiveProject 等 create+createCanvas 都 success
+    for (let i = 0; i < 5 && (await __dumpWritesForTest()).length > 0; i++) await q.drain()
+    expect(calls.map((c) => c.op.kind)).toEqual(['createProject', 'createCanvas', 'archiveProject'])
+    expect((await __dumpWritesForTest())).toHaveLength(0) // 全 success 出队
+  })
+
+  it('验收2(lost-response):createProject 已 success(server active existing)后 archiveProject 独立 enqueue → drain archiveProject success(server POST /archive → archived + cascade);不靠 create 折 create(archived)(P1 三审)', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'success' }, { status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue(createProjectOp('proj', 'p1'))
+    await q.drain() // createProject success → server active existing → 出队(模拟首次已落 active,响应到了)
+    expect(calls.map((c) => c.op.kind)).toEqual(['createProject'])
+    // 用户归档(createProject 已不在队列 → archiveProject 独立 op,无 coalesce 伙伴)
+    await q.enqueue(archiveProjectOp('p1'))
+    await q.drain() // archiveProject 独立 drain → server POST /api/projects/p1/archive → archived + archiveProjectTree 级联 c1
+    expect(calls.map((c) => c.op.kind)).toEqual(['createProject', 'archiveProject'])
+    expect((await __dumpWritesForTest())).toHaveLength(0)
+  })
+
+  it('验收3(transient 前驱):createProject transient(backoff pending)期间 archiveProject 不抢跑(同 resourceKey 前驱屏障挡);advance 过 backoff createProject success 后 archiveProject drain success', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'transient', message: 'http_503' }, { status: 'success' }, { status: 'success' }])
+    const q = makeQueue(fn, { baseDelayMs: 1000, maxDelayMs: 60_000 })
+    await q.enqueue(createProjectOp('proj', 'p1'))
+    await q.enqueue(archiveProjectOp('p1')) // 同 resourceKey project:p1 → skip-coalesce(保留独立 archiveProject op)
+    expect((await __dumpWritesForTest())).toHaveLength(2)
+    // drain1:createProject transient(→ backoff nextAttemptAt=1750);archiveProject 被同 resourceKey 前驱屏障挡(createProject pending active)→ 不抢跑
     await q.drain()
     expect(calls).toHaveLength(1)
     expect(calls[0].op.kind).toBe('createProject')
-    expect((calls[0].op as { status?: string }).status).toBe('archived')
-    expect((calls[0].op as { name?: string }).name).toBe('new')
+    // clock 仍 1000 < 1750 → createProject backoff 不 due;archiveProject 仍被屏障挡 → 不 due
+    expect((await q.drain()).processed).toBe(0)
+    // advance 过 backoff → createProject 重试 due → success → 出队 → 屏障解锁 → archiveProject drain
+    tick(800) // 1800 > 1750
+    for (let i = 0; i < 5 && (await __dumpWritesForTest()).length > 0; i++) await q.drain()
+    expect(calls.map((c) => c.op.kind)).toEqual(['createProject', 'createProject', 'archiveProject'])
+    expect((await __dumpWritesForTest())).toHaveLength(0)
   })
 })
 

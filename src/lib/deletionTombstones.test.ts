@@ -4,9 +4,14 @@
 // parentProjectId)→ restoreProject 经 revokeCanvasTombstonesForProject 撤销(镜像级联删);直接 deleteCanvas
 // 的 tombstone(无 parentProjectId)不被项目恢复撤销。
 //
-// node env 无 indexedDB → deletionTombstones 降级 memStore(同 writeRetryQueue;跨 pm2-restart 窗口存活,
-// 不跨 reload)。本测试经 memStore 验证逻辑,无需 fake-indexeddb。
+// P2-2(三审):import 'fake-indexeddb/auto' 让 node env 有 indexedDB → deletionTombstones 走 IDB 分支(非降级
+// memStore)。二审新增的 "IDB stale + mem enriched merge" 测试(deletionTombstones.ts getAllRecords :146-170)
+// 在无 fake-indexeddb 时 getAllRecords 直接返 memStore(:144 isIdbAvailable=false),merge 分支永不执行 → 测试
+// 名义过但没锁行为(未来改坏 merge 不会红)。加 fake-indexeddb 后 merge 分支真跑:旧实现(IDB key 优先 + 过滤
+// 同 key mem)下该测试必红,当前 merge(mem parentProjectId 补进 IDB)下必绿。__resetDeletionTombstonesDb
+// 已 async 清 memStore + IDB store.clear()(runVoidTx await oncomplete),beforeEach/afterEach await 确保逐 test 隔离。
 
+import 'fake-indexeddb/auto'
 import { describe, expect, it, beforeEach, afterEach } from 'vitest'
 import {
   recordDeletionTombstone,
@@ -19,14 +24,14 @@ import {
 } from './deletionTombstones'
 import { setPersistUserId, __resetPersistUserId } from './persistUserId'
 
-beforeEach(() => {
-  __resetDeletionTombstonesDb()
+beforeEach(async () => {
+  await __resetDeletionTombstonesDb()
   __resetPersistUserId()
   setPersistUserId('userA')
 })
 
-afterEach(() => {
-  __resetDeletionTombstonesDb()
+afterEach(async () => {
+  await __resetDeletionTombstonesDb()
   __resetPersistUserId()
 })
 
