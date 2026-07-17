@@ -439,6 +439,18 @@ const SHELL_SIDEBAR_SEED = {
   },
 }
 
+// PR-C2 回收站 seed:标准 seed + 1 个 archived 目标画板(standalone,无 projectId)。
+// active 视图的 5 个画板全部存活为 survivor;archived 画板只在 filterView=archived
+// (回收站视图)下渲染 CanvasRow,是「彻底删除」确认弹窗的唯一入口(active 视图的
+// 直接删除菜单项已在 PR-C2 移除,删除链路收敛为 归档 → 回收站 → 彻底删除)。
+const SHELL_TRASH_SEED = {
+  ...SHELL_SIDEBAR_SEED,
+  canvases: {
+    ...SHELL_SIDEBAR_SEED.canvases,
+    'canvas-trashed-1': { title: '废弃概念稿', status: 'archived', createdAt: '2026-06-20T09:00:00+08:00', updatedAt: '2026-06-26T10:00:00+08:00', nodes: [], edges: [], tasks: [] },
+  },
+}
+
 // Fixed-message chat payload exercising every ChatMessageList card state:
 // user / done+result+enhance / generating(frozen spinner) / error(with medium-retry).
 // createdAt is numeric; the chat UI does not render message timestamps, so the
@@ -534,20 +546,20 @@ const SHELL_CHAT_PAYLOAD = (() => {
   }
 })()
 
-const injectSidebarSeed = (page) =>
-  page.evaluate(async (seed) => {
+const injectSidebarSeed = (page, seed = SHELL_SIDEBAR_SEED) =>
+  page.evaluate(async (seedData) => {
     const { useCanvasStore } = await import('/src/store/canvasStore.ts')
     useCanvasStore.setState({
-      sceneId: seed.sceneId,
-      projects: seed.projects,
-      canvases: seed.canvases,
+      sceneId: seedData.sceneId,
+      projects: seedData.projects,
+      canvases: seedData.canvases,
       nodes: [],
       edges: [],
       tasks: [],
       selectedNodeId: undefined,
       selectedNodeIds: [],
     })
-  }, SHELL_SIDEBAR_SEED)
+  }, seed)
 
 // Self-contained (runs in-page via waitForFunction/evaluate): true when every
 // <img> under `sel` has finished decoding. Used to gate screenshots on async
@@ -587,7 +599,7 @@ const SHELL_FIXTURES = {
   },
   'shell-sidebar-canvas-menu': {
     kind: 'shell',
-    description: '侧栏画板行右键菜单(非画布 NodeActionMenu):重命名 / 移动到项目 ▸ / 复制画板 / ─ / 删除',
+    description: '侧栏画板行右键菜单(非画布 NodeActionMenu,active 视图):重命名 / 移动到项目 ▸ / 复制画板 / ─ / 归档(直接删除入口已收敛到回收站)',
     async setup(page) {
       await injectSidebarSeed(page)
       await page.locator('.canvas-row').first().click({ button: 'right', force: true })
@@ -680,19 +692,31 @@ const SHELL_FIXTURES = {
   },
   'shell-confirm-dialog': {
     kind: 'shell',
-    description: '删除画板确认弹窗:标题 / 描述 / 取消 / 删除(danger)',
+    description: '回收站「彻底删除」确认弹窗:标题 / 不可恢复描述 / 取消 / 彻底删除(danger)。链路:切回收站视图 → archived 画板行右键 → 彻底删除',
     async setup(page) {
-      await injectSidebarSeed(page)
+      await injectSidebarSeed(page, SHELL_TRASH_SEED)
+      // active 视图已无直接删除入口(PR-C2 收敛为 归档 → 回收站 → 彻底删除),
+      // 先切 filterView=archived 让 archived 画板渲染出 CanvasRow。
+      await page.locator('.sidebar-filter-toggle [data-filter-view="archived"]').click()
+      await page.locator('.canvas-row').first().waitFor({ state: 'visible' })
       await page.locator('.canvas-row').first().click({ button: 'right', force: true })
       await page.locator('.sidebar-context-menu').first().waitFor({ state: 'visible' })
       await page
         .locator('.sidebar-context-menu-item')
-        .filter({ hasText: '删除' })
+        .filter({ hasText: '彻底删除' })
         .click({ force: true })
     },
     readySelector: '.sidebar-confirm-dialog',
     screenshotKind: 'viewport',
     screenshotSelector: null,
+    postReady: async (page) => {
+      // Hard guard:证明弹窗是回收站「彻底删除」语义(标题带 彻底删除、描述带 不可恢复),
+      // 不是旧 active 视图的普通删除弹窗。
+      const text = await page.locator('.sidebar-confirm-dialog').innerText()
+      if (!text.includes('彻底删除') || !text.includes('不可恢复')) {
+        throw new Error(`shell-confirm-dialog: expected 彻底删除/不可恢复 copy, got: ${text}`)
+      }
+    },
   },
   'shell-canvas-rename': {
     kind: 'shell',

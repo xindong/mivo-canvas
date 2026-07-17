@@ -143,8 +143,12 @@ describe('PR-C2 P1-1 — archived project 彻底删除的 active-child 闸门(se
     expect(result).toEqual({ status: 'deleted' })
     expect(useCanvasStore.getState().projects.find((p) => p.id === 'p-clean')).toBeUndefined()
     expect(useCanvasStore.getState().canvases.archivedChild).toBeUndefined()
-    const deletes = calls.filter((c) => c.method === 'DELETE').map((c) => c.path)
-    expect(deletes).toContain('/api/projects/p-clean')
-    expect(deletes.some((p) => p.startsWith('/api/canvas/'))).toBe(true)
+    // 精确比较 DELETE 集合(排序后全等):child id 必须是 archivedChild 本体,且不得有
+    // 任何多余 DELETE(防级联误删范围扩大 / survivor 被卷入)。
+    const deletes = calls
+      .filter((c) => c.method === 'DELETE')
+      .map((c) => c.path)
+      .sort()
+    expect(deletes).toEqual(['/api/canvas/archivedChild', '/api/projects/p-clean'])
   })
 })
