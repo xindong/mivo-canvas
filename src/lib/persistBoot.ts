@@ -1080,6 +1080,41 @@ const applyServerRevision = async (op: WriteOp, outcome: { revision?: Revision }
 }
 
 /**
+ * P1-3(返修):unarchiveProject drain success 后,reconcile 子画布 status 用 server 权威(不猜 archivedByCascade)。
+ * 跨设备 hydrate 时 client archivedByCascade=undefined(wire 不回传 provenance)→ 乐观 unarchiveProject 只恢复
+ * archivedByCascade===true 的子画布 → undefined 的全留 archived → client 持久错误态(project active 但
+ * cascade-archived 子画布仍 archived,用户看到空项目)。缺 provenance 不猜 → 拉 includeArchived canvas meta
+ * 用 server status reconcile:server unarchiveProjectTree 已恢复 cascade 子画布(active)、保留 direct(archived)。
+ * best-effort:reconcile 失败不阻断 onOutcome(下轮 hydrate 会再 reconcile)。
+ */
+const reconcileProjectCanvasStatus = async (projectId: string): Promise<void> => {
+  try {
+    const adapter = getServerPersistAdapter()
+    const { canvases } = await adapter.listCanvas(projectId, { includeArchived: true })
+    const { useCanvasStore } = await import('../store/canvasStore')
+    useCanvasStore.setState((s) => {
+      let reconciled = 0
+      const next = { ...s.canvases }
+      for (const meta of canvases) {
+        const existing = next[meta.id]
+        if (!existing) continue // 本地无此 canvas(未 hydrate content)→ 不动(下轮 hydrate 补)
+        // 归一比较(?? 'active')避免 active(explicit)↔ undefined(active) 的无谓 churn;不一致才覆写为 wire 值。
+        if ((existing.status ?? 'active') !== (meta.status ?? 'active')) {
+          next[meta.id] = { ...existing, status: meta.status }
+          reconciled++
+        }
+      }
+      if (reconciled > 0) {
+        debugLogger.log(SOURCE, `unarchiveProject ${projectId} reconcile: ${reconciled} canvas(es) status synced from server (P1-3, don't guess archivedByCascade)`)
+      }
+      return { canvases: next }
+    })
+  } catch (error) {
+    debugLogger.warn(SOURCE, `unarchiveProject ${projectId} reconcile failed (P1-3, best-effort; next hydrate will reconcile): ${msg(error)}`)
+  }
+}
+
+/**
  * G1-a P1-1:启动 writeRetryQueue。server/shadow 在 boot 调此。local 永不调(生产零变化)。
  * executor 复用 createAdapterWriteExecutor(与 adapter 同源 fetch opts);onConflict 触发 re-hydrate
  * 作可恢复处理(P1-3:conflict 不静默删——re-hydrate 让本地从服务端真值刷新,用户可基于新 revision 重放)。
@@ -1168,6 +1203,13 @@ export const startPersistWriteQueue = (
           return { canvases: next }
         })
         debugLogger.log(SOURCE, `deleteCanvas ${op.canvasId} drained success → removed from store (anti-resurrection fallback B)`)
+        return
+      }
+      if (op.kind === 'unarchiveProject' && outcome.status === 'success') {
+        // P1-3(返修):unarchiveProject drain success → reconcile 子画布 status 用 server 权威(不猜 archivedByCascade)。
+        //   跨设备 hydrate archivedByCascade=undefined → 乐观只恢复 ===true → cascade 子画布卡 archived(空项目)。
+        //   server unarchiveProjectTree 已恢复 cascade;拉 includeArchived meta reconcile:cascade→active,direct→archived。
+        await reconcileProjectCanvasStatus(op.projectId)
         return
       }
       if (op.kind !== 'appendChatMessage') return
