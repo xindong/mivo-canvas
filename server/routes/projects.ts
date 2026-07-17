@@ -59,6 +59,8 @@ const toProject = (r: PersistRecord): Project => ({
   updatedAt: r.updatedAt,
   revision: r.revision,
   isDeleted: r.isDeleted,
+  // Phase 2 归档:status 仅在 archived 时显式输出(active 缺省,旧 client 无感;向后兼容)。
+  ...(r.status === 'archived' ? { status: 'archived' as const } : {}),
 })
 
 /** N5:malformed If-Match → 400 bad-request body。 */
@@ -84,7 +86,8 @@ export const createProjectsRoutes = ({ backend, permissions }: { backend: Persis
       return bad
     }
     const actor = resolveActor(c)
-    const owned = await backend.listByOwner(actor, 'project')
+    const includeArchived = c.req.query('includeArchived') === 'true'
+    const owned = await backend.listByOwner(actor, 'project', { includeArchived })
     const projects: Project[] = owned.records.map(toProject)
     // T1.4:合并 shared(editor/viewer 成员资格可见的项目;§13.5)
     const shared = await permissions.listSharedProjects(actor)
@@ -92,7 +95,11 @@ export const createProjectsRoutes = ({ backend, permissions }: { backend: Persis
       const owner = backend.getProjectOwner(projectId)
       if (!owner) continue
       const got = await backend.get(owner.ownerId, 'project', projectId)
-      if (got.kind === 'found' && !got.record.isDeleted) projects.push(toProject(got.record))
+      if (got.kind === 'found' && !got.record.isDeleted) {
+        // Phase 2 归档:默认排除 archived(回收站视图用 includeArchived=true 拉取)
+        if (!includeArchived && got.record.status === 'archived') continue
+        projects.push(toProject(got.record))
+      }
     }
     const body: ListProjectsResponse = { projects }
     logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0 })
@@ -132,6 +139,7 @@ export const createProjectsRoutes = ({ backend, permissions }: { backend: Persis
       resourceKind: 'project',
       idempotencyKey,
       bodyFingerprint: decoded.fingerprint,
+      status: reqBody.status,
     })
     // N4:同 idem key 不同 body → 422 reuse-conflict。
     if (result.kind === 'reuse-conflict') {
@@ -315,6 +323,64 @@ export const createProjectsRoutes = ({ backend, permissions }: { backend: Persis
     }
     logRequest({ method: c.req.method, path: c.req.path, requestId, status: 204, latencyMs: Date.now() - t0 })
     return c.body(null, 204)
+  })
+
+  // POST /api/projects/:id/archive — Phase 2 归档(回收站)。owner-only(manage);级联归档其全部 active 子画布(D3)。
+  // 幂等:已归档→200 no-op。既有 DELETE 保留为"彻底删除"(is_deleted 软删终态)。
+  route.post('/:id/archive', async (c) => {
+    const requestId = newRequestId()
+    c.header('X-Request-Id', requestId)
+    const t0 = Date.now()
+    const bad = rejectInvalidMivoApiKey(c)
+    if (bad) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'bad-mivo-key' })
+      return bad
+    }
+    const id = c.req.param('id')
+    const authz = await authzProject(c, id, 'manage')
+    if (!authz.ok) return denyProject(c, requestId, t0, authz)
+    const got = await backend.get(authz.ownerId, 'project', id)
+    if (got.kind === 'missing' || got.record.isDeleted) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
+      return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
+    }
+    const res = await backend.archiveProjectTree(authz.ownerId, id)
+    const after = await backend.get(authz.ownerId, 'project', id)
+    if (after.kind !== 'found') {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
+      return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
+    }
+    logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0, note: res.count > 0 ? 'archived' : 'already-archived' })
+    return c.json(toProject(after.record), 200)
+  })
+
+  // POST /api/projects/:id/unarchive — 恢复归档项目(级联恢复 archivedByCascade=true 的子画布;单独归档的不动)。
+  // 幂等:已 active→200 no-op。
+  route.post('/:id/unarchive', async (c) => {
+    const requestId = newRequestId()
+    c.header('X-Request-Id', requestId)
+    const t0 = Date.now()
+    const bad = rejectInvalidMivoApiKey(c)
+    if (bad) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'bad-mivo-key' })
+      return bad
+    }
+    const id = c.req.param('id')
+    const authz = await authzProject(c, id, 'manage')
+    if (!authz.ok) return denyProject(c, requestId, t0, authz)
+    const got = await backend.get(authz.ownerId, 'project', id)
+    if (got.kind === 'missing' || got.record.isDeleted) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
+      return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
+    }
+    const res = await backend.unarchiveProjectTree(authz.ownerId, id)
+    const after = await backend.get(authz.ownerId, 'project', id)
+    if (after.kind !== 'found') {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
+      return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
+    }
+    logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0, note: res.count > 0 ? 'unarchived' : 'already-active' })
+    return c.json(toProject(after.record), 200)
   })
 
   return route

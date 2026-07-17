@@ -30,6 +30,15 @@ import {
 /** per-record revision(envelope 唯一真相,节点级合并 LWW tie-break,platform §13.5)。 */
 export type Revision = number
 
+/**
+ * Phase 2 归档(回收站):record 活跃态。live 记录 `status ∈ {active, archived}`(缺省=active,向后兼容)。
+ * - `active`:正常可见可写(默认)。
+ * - `archived`:归档态——可读(回收站预览)、可恢复、子记录写返 409 archived(CR-6,客户端引导先恢复再编辑)。
+ * **彻底删除沿用现有 is_deleted 软删终态,不新增 'deleted' status 值**(避免与 is_deleted 双轨)。
+ * wire optional:旧 client 不读此字段无感;envelope 列(D1,镜像 is_deleted 存储先例)。
+ */
+export type RecordStatus = 'active' | 'archived'
+
 /** scope 分层(platform §13.1)。asset 域见 T1.5,不入本契约。 */
 export type PersistScope = 'document' | 'user'
 
@@ -82,6 +91,8 @@ export type Envelope<Payload = unknown> = {
   revision: Revision
   orderKey: number
   isDeleted: boolean
+  /** D1(Phase 2 归档):status 信封列(镜像 is_deleted 存储先例)。缺省/undefined=active(向后兼容)。 */
+  status?: RecordStatus
   createdAt: string
   updatedAt: string
   payload: Payload
@@ -280,6 +291,15 @@ export type RequireLoginBody = {
   error: 'require-login'
 }
 
+/**
+ * CR-6(Phase 2 归档 write-guard):archived canvas 的子记录写被拒(409)。客户端引导"先恢复再编辑"。
+ * 触发点:authzCanvas 对 archived(action=write|move)返此 body;read/manage 放行(归档可读、可恢复、可彻底删除)。
+ */
+export type ArchivedBody = {
+  error: 'archived'
+  id: string
+}
+
 /** 统一错误体(任一 4xx)。 */
 export type ApiErrorBody =
   | { error: 'bad-request'; message?: string }
@@ -294,6 +314,7 @@ export type ApiErrorBody =
   | PayloadRejectedBody
   | UnknownResourceBody
   | RequireLoginBody
+  | ArchivedBody
   | { error: 'project-exists'; id: string }
   // F4:canvas id 全局唯一(与 project 同模式)——跨 owner 同 canvas id → 409 canvas-exists。
   | { error: 'canvas-exists'; id: string }
@@ -308,10 +329,12 @@ export type Project = {
   updatedAt: string
   revision: Revision
   isDeleted: boolean
+  /** D1(Phase 2 归档):status 列(缺省/undefined=active)。wire optional 向后兼容。 */
+  status?: RecordStatus
 }
 
 export type ListProjectsResponse = { projects: Project[] }
-export type CreateProjectRequest = { id?: string; name: string }
+export type CreateProjectRequest = { id?: string; name: string; status?: RecordStatus }
 /**
  * G1-a P1-2:PATCH /api/projects/:id body(projects.ts:185)。rename 走此;If-Match = Project.revision base
  * (missing → 428 / invalid → 400 / stale → 409 revision-conflict)。wire body 不携带 revision。
@@ -325,6 +348,8 @@ export type CreateCanvasRequest = {
   projectId: string
   title?: string
   sourceTemplateId?: string
+  /** D2(Phase 2 归档):create wire 可选 status(combineOps create+archive→create(status:'archived') 语义)。 */
+  status?: RecordStatus
 }
 
 /**
@@ -357,6 +382,8 @@ export type CanvasMeta = {
   bundle?: string
   /** A2-S3:canvas 事件 seq(client 构建 since cursor + events/poll?since=<seq> 补拉)。 */
   sinceSeq?: number
+  /** D1(Phase 2 归档):status 列(缺省/undefined=active)。wire optional 向后兼容。 */
+  status?: RecordStatus
 }
 
 /**
@@ -398,6 +425,25 @@ export type UpdateCanvasRequest = { payload: CanvasPayload }
 
 /** POST /api/canvas → 201/200 CanvasMeta(createCanvas 返回类型与 listCanvas 元素同 shape)。 */
 export type CreateCanvasResponse = CanvasMeta
+
+// ── Phase 2 归档(回收站):archive/unarchive 端点 wire 契约 ──────────────────────────
+// POST /api/canvas/:id/archive|unarchive  → 200 CanvasMeta(更新后的 canvas meta;archived=可读不可写子记录)
+// POST /api/project/:id/archive|unarchive → 200 Project(级联:archiveProject 归档其全部子画布;
+//   unarchiveProject 仅恢复 archivedByCascade=true 的子画布,用户先前单独归档的不被强制恢复——D3)
+// 既有 DELETE /api/canvas/:id、DELETE /api/project/:id 保留为"彻底删除"(沿用 is_deleted 软删终态)。
+// archive/unarchive 动作语义在 path(空请求体);幂等:重复 archive 已归档 → 200 no-op。
+// 鉴权:action=manage(owner-only,与 DELETE 同矩阵)。
+/** archive/unarchive 请求体(空——动作在 path;镜像 DELETE 无 body 约定)。 */
+export type ArchiveRequest = Record<string, never>
+/** archive/unarchive 响应(单 record meta;canvas→CanvasMeta,project→Project)。 */
+export type ArchiveCanvasResponse = CanvasMeta
+export type ArchiveProjectResponse = Project
+/**
+ * 列表端点 includeArchived 查询参数(GET /api/projects、GET /api/canvas[?projectId=…]):
+ * - 缺省/false:仅返 active(非 archived)+ 非 deleted(默认视图,归档项隐藏)。
+ * - true:返 active + archived(非 deleted);回收站"已归档"视图拉取。deleted 始终排除(除非走 internal includeDeleted)。
+ * wire 是 query string(`?includeArchived=true`),非 body;此处仅冻结语义供 client/server 对齐。
+ */
 
 // ── chat 子资源(DP-6,api-surface §4.2.3)──────────────────────────────────────
 

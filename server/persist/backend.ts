@@ -28,6 +28,7 @@ import type {
   PayloadRejectedBody,
   PersistScope,
   PersistType,
+  RecordStatus,
   Revision,
 } from '../../shared/persist-contract.ts'
 import { requiredTopLevelFields, validateChildPayload } from '../../shared/persist-contract.ts'
@@ -203,6 +204,8 @@ export interface PersistBackend {
       method: string
       resourceKind: string
       bodyFingerprint?: string
+      /** D2(Phase 2 归档):create wire 可选 status;fresh create 落列,restore 路径应用(combineOps create+archive→create(status:'archived'))。 */
+      status?: RecordStatus
     },
   ): Promise<EnsureCreateResult>
   /**
@@ -216,7 +219,7 @@ export interface PersistBackend {
     ownerId: string,
     canvasId: string,
     canvasPayload: unknown,
-    opts: { idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string },
+    opts: { idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string; status?: RecordStatus },
   ): Promise<EnsureCreateResult>
   /**
    * 返修 N3:子资源(chat-message)幂等创建——canvas_id 校验(existing/idem-replay/cross-canvas 全验)。
@@ -395,9 +398,9 @@ export interface PersistBackend {
   ): Promise<{ records: PersistRecord[]; orderRevision: Revision }>
 
   // ── 列表(返修 #6 ORDER BY orderKey;#8 枚举)──
-  listByOwner(ownerId: string, type: PersistType, opts?: { includeDeleted?: boolean }): Promise<ListResult>
-  listByCanvas(ownerId: string, canvasId: string, type: PersistType, opts?: { includeDeleted?: boolean }): Promise<ListResult>
-  listCanvasByProject(ownerId: string, projectId: string, opts?: { includeDeleted?: boolean }): Promise<ListResult>
+  listByOwner(ownerId: string, type: PersistType, opts?: { includeDeleted?: boolean; includeArchived?: boolean }): Promise<ListResult>
+  listByCanvas(ownerId: string, canvasId: string, type: PersistType, opts?: { includeDeleted?: boolean; includeArchived?: boolean }): Promise<ListResult>
+  listCanvasByProject(ownerId: string, projectId: string, opts?: { includeDeleted?: boolean; includeArchived?: boolean }): Promise<ListResult>
 
   // ── 返修 #7/N2:原子 tree 软删/恢复(单函数原子,故障全回滚)──
   /** 软删 canvas 子树:标 canvas meta + chat-collection record(原子;children 保持活记录)。 */
@@ -419,6 +422,18 @@ export interface PersistBackend {
     projectId: string,
     opts?: { payload?: unknown; idempotencyKey?: string; fingerprint?: string },
   ): Promise<{ count: number }>
+
+  // ── Phase 2 归档(回收站):archive/unarchive tree(原子/级联/幂等,镜像 softDelete/restoreTree 模式)──
+  // status 列(D1)作归档标记(非 is_deleted);archivedByCascade(D3)在 canvas meta payload 内布尔区分级联 vs 直接归档。
+  // 彻底删除仍走 softDelete*Tree(is_deleted 终态);archive=软隐藏(可读/可恢复/子记录写返 409 archived,CR-6 write-guard)。
+  /** 归档 canvas(直接):canvas meta status→archived + archivedByCascade→false。幂等(已归档→0 行)。 */
+  archiveCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number }>
+  /** 恢复 canvas(直接):canvas meta status→active + archivedByCascade→false。幂等(已 active→0 行)。 */
+  unarchiveCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number }>
+  /** 归档 project 子树(级联):project meta status→archived + 其全部 active 子画布 status→archived + archivedByCascade→true。幂等。 */
+  archiveProjectTree(ownerId: string, projectId: string): Promise<{ count: number }>
+  /** 恢复 project 子树(级联):project status→active + 仅恢复 archivedByCascade=true 的子画布(D3:单独归档的不被强制恢复)。幂等。 */
+  unarchiveProjectTree(ownerId: string, projectId: string): Promise<{ count: number }>
 
   /**
    * Test-only:清空 owner 全部 records + idempotency index。
@@ -498,8 +513,8 @@ export const fingerprintOfBody = (body: unknown): string => {
   return createHash('sha256').update(json).digest('hex').slice(0, 32)
 }
 
-/** canvas meta payload shape(backend 维护 contentVersion;其余域字段 route 管)。 */
-type CanvasMetaPayload = { projectId?: string; title?: string; sourceTemplateId?: string; contentVersion?: Revision }
+/** canvas meta payload shape(backend 维护 contentVersion;archivedByCascade=D3 级联归档标记;其余域字段 route 管)。 */
+type CanvasMetaPayload = { projectId?: string; title?: string; sourceTemplateId?: string; contentVersion?: Revision; archivedByCascade?: boolean }
 
 const asCanvasMeta = (p: unknown): CanvasMetaPayload | null =>
   typeof p === 'object' && p !== null ? (p as CanvasMetaPayload) : null
@@ -725,6 +740,7 @@ export class InMemoryPersistBackend implements PersistBackend {
       method: string
       resourceKind: string
       bodyFingerprint?: string
+      status?: RecordStatus
     },
   ): Promise<EnsureCreateResult> {
     // F4:canvas id 全局唯一(与 project 同模式)——跨 owner 同 canvas id → exists-other-owner(route → 409 canvas-exists)。
@@ -797,6 +813,7 @@ export class InMemoryPersistBackend implements PersistBackend {
       revision: 0,
       orderKey: 0,
       isDeleted: false,
+      status: opts.status,
       createdAt: ts,
       updatedAt: ts,
       payload: clone(payload),
@@ -844,7 +861,7 @@ export class InMemoryPersistBackend implements PersistBackend {
     ownerId: string,
     canvasId: string,
     canvasPayload: unknown,
-    opts: { idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string },
+    opts: { idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string; status?: RecordStatus },
   ): EnsureCreateResult {
     // 复验 parent live(临界区入口;同步块不可中断,进入即定 live,整块执行不可让渡)。
     const pid = asCanvasMeta(canvasPayload)?.projectId
@@ -865,7 +882,7 @@ export class InMemoryPersistBackend implements PersistBackend {
 
     try {
       // restore canvas meta + chat-collection(同步:undelete+bump+payload merge;内部自快照回滚)。
-      this.restoreCanvasTreeInPlace(ownerId, canvasId, { payload: canvasPayload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint })
+      this.restoreCanvasTreeInPlace(ownerId, canvasId, { payload: canvasPayload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint, status: opts.status })
       // ensureCollectionLive(同步:防旧数据/恢复遗漏产生 orphan)。
       this.ensureCollectionLive(ownerId, canvasId)
       // globalCanvasOwners:canvas 之前已注册;确保指向 ownerId(防 orphan 归属错)。
@@ -901,7 +918,7 @@ export class InMemoryPersistBackend implements PersistBackend {
     ownerId: string,
     canvasId: string,
     canvasPayload: unknown,
-    opts: { idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string },
+    opts: { idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string; status?: RecordStatus },
   ): Promise<EnsureCreateResult> {
     // F4:canvas id 全局唯一(跨 owner 同 id → exists-other-owner;在 idem-replay 之前,不覆盖 globalCanvasOwners)。
     const globalOwner = this.globalCanvasOwners.get(canvasId)
@@ -955,7 +972,7 @@ export class InMemoryPersistBackend implements PersistBackend {
     const ts = nowIso()
     const canvasRec: PersistRecord = {
       id: canvasId, ownerId, canvasId: null, type: 'canvas', scope: 'document', revision: 0, orderKey: 0,
-      isDeleted: false, createdAt: ts, updatedAt: ts, payload: clone(canvasPayload),
+      isDeleted: false, status: opts.status, createdAt: ts, updatedAt: ts, payload: clone(canvasPayload),
       idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint,
     }
     const collRec: PersistRecord = {
@@ -994,14 +1011,14 @@ export class InMemoryPersistBackend implements PersistBackend {
     type: PersistType,
     id: string,
     payload: unknown,
-    opts: { canvasId?: string | null; scope?: PersistScope; idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string },
+    opts: { canvasId?: string | null; scope?: PersistScope; idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string; status?: RecordStatus },
   ): Promise<void> {
     if (type === 'project') {
-      await this.restoreProjectTree(ownerId, id, { payload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint })
+      await this.restoreProjectTree(ownerId, id, { payload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint, status: opts.status })
       return
     }
     if (type === 'canvas') {
-      await this.restoreCanvasTree(ownerId, id, { payload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint })
+      await this.restoreCanvasTree(ownerId, id, { payload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint, status: opts.status })
       return
     }
     // chat-collection(leaf meta):单 record undelete + bump + update payload(无子树)。
@@ -1688,37 +1705,44 @@ export class InMemoryPersistBackend implements PersistBackend {
     }
   }
 
-  async listByOwner(ownerId: string, type: PersistType, opts: { includeDeleted?: boolean } = {}): Promise<ListResult> {
-    const include = opts.includeDeleted ?? false
+  async listByOwner(ownerId: string, type: PersistType, opts: { includeDeleted?: boolean; includeArchived?: boolean } = {}): Promise<ListResult> {
+    const includeDel = opts.includeDeleted ?? false
+    const includeArch = opts.includeArchived ?? false
     const out: PersistRecord[] = []
     for (const r of this.bucket(ownerId).values()) {
       if (r.type !== type) continue
-      if (!include && r.isDeleted) continue
+      if (!includeDel && r.isDeleted) continue
+      // Phase 2 归档:默认排除 archived(回收站视图用 includeArchived=true);includeDel 时返全量。
+      if (!includeDel && !includeArch && r.status === 'archived') continue
       out.push(clone(r))
     }
     out.sort((a, b) => a.orderKey - b.orderKey || (a.createdAt < b.createdAt ? -1 : 1))
     return { records: out }
   }
 
-  async listByCanvas(ownerId: string, canvasId: string, type: PersistType, opts: { includeDeleted?: boolean } = {}): Promise<ListResult> {
-    const include = opts.includeDeleted ?? false
+  async listByCanvas(ownerId: string, canvasId: string, type: PersistType, opts: { includeDeleted?: boolean; includeArchived?: boolean } = {}): Promise<ListResult> {
+    const includeDel = opts.includeDeleted ?? false
+    const includeArch = opts.includeArchived ?? false
     const out: PersistRecord[] = []
     for (const r of this.bucket(ownerId).values()) {
       if (r.type !== type) continue
       if (r.canvasId !== canvasId) continue
-      if (!include && r.isDeleted) continue
+      if (!includeDel && r.isDeleted) continue
+      if (!includeDel && !includeArch && r.status === 'archived') continue
       out.push(clone(r))
     }
     out.sort((a, b) => a.orderKey - b.orderKey || (a.createdAt < b.createdAt ? -1 : 1)) // 返修 #6:ORDER BY orderKey
     return { records: out }
   }
 
-  async listCanvasByProject(ownerId: string, projectId: string, opts: { includeDeleted?: boolean } = {}): Promise<ListResult> {
-    const include = opts.includeDeleted ?? false
+  async listCanvasByProject(ownerId: string, projectId: string, opts: { includeDeleted?: boolean; includeArchived?: boolean } = {}): Promise<ListResult> {
+    const includeDel = opts.includeDeleted ?? false
+    const includeArch = opts.includeArchived ?? false
     const out: PersistRecord[] = []
     for (const r of this.bucket(ownerId).values()) {
       if (r.type !== 'canvas') continue
-      if (!include && r.isDeleted) continue
+      if (!includeDel && r.isDeleted) continue
+      if (!includeDel && !includeArch && r.status === 'archived') continue
       const p = asCanvasMeta(r.payload)
       if (p?.projectId !== projectId) continue
       out.push(clone(r))
@@ -1759,7 +1783,7 @@ export class InMemoryPersistBackend implements PersistBackend {
   private restoreCanvasTreeInPlace(
     ownerId: string,
     canvasId: string,
-    opts: { payload?: unknown; idempotencyKey?: string; fingerprint?: string } = {},
+    opts: { payload?: unknown; idempotencyKey?: string; fingerprint?: string; status?: RecordStatus } = {},
   ): number {
     const b = this.bucket(ownerId)
     const ts = nowIso()
@@ -1780,7 +1804,9 @@ export class InMemoryPersistBackend implements PersistBackend {
           newPayload = { ...(opts.payload as object), contentVersion: oldCv }
         }
         const extra = isMeta ? { idempotencyKey: opts.idempotencyKey, fingerprint: opts.fingerprint } : {}
-        b.set(key, { ...clone(r), payload: newPayload, isDeleted: false, revision: r.revision + 1, updatedAt: ts, ...extra })
+        // D2:opts.status 仅应用到 canvas meta(combineOps create(status:'archived')→restore 带归档);chat-collection 不受影响。
+        const statusOverride = isMeta && opts.status !== undefined ? { status: opts.status } : {}
+        b.set(key, { ...clone(r), payload: newPayload, isDeleted: false, revision: r.revision + 1, updatedAt: ts, ...extra, ...statusOverride })
       }
       return targets.length
     } catch (err) {
@@ -1792,7 +1818,7 @@ export class InMemoryPersistBackend implements PersistBackend {
   async restoreCanvasTree(
     ownerId: string,
     canvasId: string,
-    opts: { payload?: unknown; idempotencyKey?: string; fingerprint?: string } = {},
+    opts: { payload?: unknown; idempotencyKey?: string; fingerprint?: string; status?: RecordStatus } = {},
   ): Promise<{ count: number }> {
     return { count: this.restoreCanvasTreeInPlace(ownerId, canvasId, opts) }
   }
@@ -1834,7 +1860,7 @@ export class InMemoryPersistBackend implements PersistBackend {
   async restoreProjectTree(
     ownerId: string,
     projectId: string,
-    opts: { payload?: unknown; idempotencyKey?: string; fingerprint?: string } = {},
+    opts: { payload?: unknown; idempotencyKey?: string; fingerprint?: string; status?: RecordStatus } = {},
   ): Promise<{ count: number }> {
     const b = this.bucket(ownerId)
     const ts = nowIso()
@@ -1862,7 +1888,118 @@ export class InMemoryPersistBackend implements PersistBackend {
         // N2:project meta payload 更新(若提供);canvas targets 保留 contentVersion(clone r.payload)。
         const newPayload = isProj && opts.payload !== undefined ? clone(opts.payload) : clone(r.payload)
         const extra = isProj ? { idempotencyKey: opts.idempotencyKey, fingerprint: opts.fingerprint } : {}
-        b.set(key, { ...clone(r), payload: newPayload, isDeleted: false, revision: r.revision + 1, updatedAt: ts, ...extra })
+        // D2:opts.status 仅应用到 project meta(combineOps create(status:'archived')→restore 带归档);子画布不受影响。
+        const statusOverride = isProj && opts.status !== undefined ? { status: opts.status } : {}
+        b.set(key, { ...clone(r), payload: newPayload, isDeleted: false, revision: r.revision + 1, updatedAt: ts, ...extra, ...statusOverride })
+      }
+      return { count: targets.length }
+    } catch (err) {
+      for (const [key, rec] of snapshot) b.set(key, rec)
+      throw err
+    }
+  }
+
+  // ── Phase 2 归档(回收站):archive/unarchive tree(镜像 softDelete/restoreTree 原子/级联/幂等)──
+  // status 列(D1)作归档标记(非 is_deleted);archivedByCascade(D3)在 canvas meta payload 内布尔区分级联 vs 直接归档。
+  // 彻底删除仍走 softDelete*Tree(is_deleted 终态);archive=软隐藏(可读/可恢复/子记录写返 409 archived,CR-6 write-guard)。
+
+  /** 归档 canvas(直接):canvas meta status→archived + payload.archivedByCascade→false(直接归档标记,unarchiveProjectTree 不误恢复)。幂等(已归档→0 行)。 */
+  async archiveCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number }> {
+    const b = this.bucket(ownerId)
+    const ts = nowIso()
+    const targets: string[] = []
+    for (const [key, r] of b) {
+      if (r.type === 'canvas' && r.id === canvasId && !r.isDeleted && r.status !== 'archived') targets.push(key)
+    }
+    const snapshot = targets.map((k) => [k, clone(b.get(k)!)] as const)
+    try {
+      for (const key of targets) {
+        const r = b.get(key)!
+        const newPayload = { ...(clone(r.payload) as object), archivedByCascade: false }
+        b.set(key, { ...clone(r), payload: newPayload, status: 'archived', revision: r.revision + 1, updatedAt: ts })
+      }
+      return { count: targets.length }
+    } catch (err) {
+      for (const [key, rec] of snapshot) b.set(key, rec)
+      throw err
+    }
+  }
+
+  /** 恢复 canvas(直接):canvas meta status→active + payload.archivedByCascade→false。幂等(已 active→0 行)。 */
+  async unarchiveCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number }> {
+    const b = this.bucket(ownerId)
+    const ts = nowIso()
+    const targets: string[] = []
+    for (const [key, r] of b) {
+      if (r.type === 'canvas' && r.id === canvasId && !r.isDeleted && r.status === 'archived') targets.push(key)
+    }
+    const snapshot = targets.map((k) => [k, clone(b.get(k)!)] as const)
+    try {
+      for (const key of targets) {
+        const r = b.get(key)!
+        const newPayload = { ...(clone(r.payload) as object), archivedByCascade: false }
+        b.set(key, { ...clone(r), payload: newPayload, status: 'active', revision: r.revision + 1, updatedAt: ts })
+      }
+      return { count: targets.length }
+    } catch (err) {
+      for (const [key, rec] of snapshot) b.set(key, rec)
+      throw err
+    }
+  }
+
+  /** 归档 project 子树(级联):project meta status→archived + 其全部 active 子画布 status→archived + payload.archivedByCascade→true。幂等。 */
+  async archiveProjectTree(ownerId: string, projectId: string): Promise<{ count: number }> {
+    const b = this.bucket(ownerId)
+    const ts = nowIso()
+    const targets: string[] = []
+    const proj = this.find(ownerId, 'project', projectId)
+    if (proj && !proj.isDeleted && proj.status !== 'archived') targets.push(recordKey(ownerId, 'project', projectId))
+    // 其全部 active 子画布(cascade 归档);已归档子画布不动(保留其 archivedByCascade 既有值)
+    for (const [key, r] of b) {
+      if (r.type !== 'canvas' || r.isDeleted) continue
+      if (r.status === 'archived') continue
+      const p = asCanvasMeta(r.payload)
+      if (p?.projectId === projectId) targets.push(key)
+    }
+    const snapshot = targets.map((k) => [k, clone(b.get(k)!)] as const)
+    try {
+      for (const key of targets) {
+        const r = b.get(key)!
+        const isProj = r.type === 'project' && r.id === projectId
+        // 子画布标 archivedByCascade=true(级联归档);project meta payload={name} 不含此字段
+        const newPayload = isProj ? clone(r.payload) : { ...(clone(r.payload) as object), archivedByCascade: true }
+        b.set(key, { ...clone(r), payload: newPayload, status: 'archived', revision: r.revision + 1, updatedAt: ts })
+      }
+      return { count: targets.length }
+    } catch (err) {
+      for (const [key, rec] of snapshot) b.set(key, rec)
+      throw err
+    }
+  }
+
+  /** 恢复 project 子树(级联):project status→active + 仅恢复 archivedByCascade=true 的子画布(D3:单独归档的不被强制恢复);清 archivedByCascade→false。幂等。 */
+  async unarchiveProjectTree(ownerId: string, projectId: string): Promise<{ count: number }> {
+    const b = this.bucket(ownerId)
+    const ts = nowIso()
+    const targets: string[] = []
+    const proj = this.find(ownerId, 'project', projectId)
+    if (proj && !proj.isDeleted && proj.status === 'archived') targets.push(recordKey(ownerId, 'project', projectId))
+    for (const [key, r] of b) {
+      if (r.type !== 'canvas' || r.isDeleted) continue
+      if (r.status !== 'archived') continue
+      const p = asCanvasMeta(r.payload)
+      if (p?.projectId !== projectId) continue
+      // D3:仅恢复 archivedByCascade=true 的子画布(用户先前单独归档的 flag=false 不动)
+      if (p.archivedByCascade !== true) continue
+      targets.push(key)
+    }
+    const snapshot = targets.map((k) => [k, clone(b.get(k)!)] as const)
+    try {
+      for (const key of targets) {
+        const r = b.get(key)!
+        const isProj = r.type === 'project' && r.id === projectId
+        const newPayload = isProj ? clone(r.payload) : { ...(clone(r.payload) as object), archivedByCascade: false }
+        b.set(key, { ...clone(r), payload: newPayload, status: 'active', revision: r.revision + 1, updatedAt: ts })
       }
       return { count: targets.length }
     } catch (err) {
