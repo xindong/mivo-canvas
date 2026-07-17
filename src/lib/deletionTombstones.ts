@@ -335,6 +335,18 @@ export const revokeCanvasTombstonesForProject = async (projectId: string): Promi
 }
 
 /**
+ * active-child 409 恢复辅助:在撤销 cascade tombstone 前取得同一批 child id,供 write queue
+ * 取消 deleteProject 乐观级联产生、但尚未发送的 deleteCanvas。只读、per-user、仅命中带 provenance 的记录。
+ */
+export const getCanvasTombstoneIdsForProject = async (projectId: string): Promise<string[]> => {
+  const ownerId = getPersistUserId()
+  const all = await getAllRecords()
+  return all
+    .filter((r) => r.ownerId === ownerId && r.kind === 'canvas' && r.parentProjectId === projectId)
+    .map((r) => r.resourceId)
+}
+
+/**
  * 清除时机:DELETE 终态 success(含 404-idempotent)时调用(persistBoot onOutcome deleteProject/deleteCanvas
  * success 分支)。服务端已软删 → 不再 LIVE → 无复活风险 → tombstone 完成使命可清。返是否实际清除(命中才 log)。
  * terminal 失败路径不调(服务端仍 LIVE → tombstone 保留继续挡复活)。

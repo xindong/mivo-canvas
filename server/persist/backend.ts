@@ -1847,6 +1847,8 @@ export class InMemoryPersistBackend implements PersistBackend {
     const b = this.bucket(ownerId)
     const ts = nowIso()
     const targets: string[] = []
+    // memory 等效全局锁序:本 async 方法到 return 前无 await,整个同步段是不可让渡临界区；先解析
+    // project,再枚举/判定 live child,最后才 mutation,等价 PG projects→project meta→canvas rows。
     // project meta
     const proj = this.find(ownerId, 'project', projectId)
     // SG-2:archived project 删除门禁——存在 status!=='archived' 的 live 子画布 → blocked,不删任何行
@@ -1937,6 +1939,10 @@ export class InMemoryPersistBackend implements PersistBackend {
     const b = this.bucket(ownerId)
     const ts = nowIso()
     const targets: string[] = []
+    // parent-project-first 的 memory 等效:同步临界区内先解析 parent project,再收集/改 canvas。
+    const canvas = this.find(ownerId, 'canvas', canvasId)
+    const parentProjectId = canvas ? asCanvasMeta(canvas.payload)?.projectId : undefined
+    if (parentProjectId) this.find(ownerId, 'project', parentProjectId)
     for (const [key, r] of b) {
       if (r.type === 'canvas' && r.id === canvasId && !r.isDeleted && r.status !== 'archived') targets.push(key)
     }
@@ -1959,6 +1965,10 @@ export class InMemoryPersistBackend implements PersistBackend {
     const b = this.bucket(ownerId)
     const ts = nowIso()
     const targets: string[] = []
+    // parent-project-first 的 memory 等效(同 archiveCanvasTree):先解析 parent,再改 canvas。
+    const canvas = this.find(ownerId, 'canvas', canvasId)
+    const parentProjectId = canvas ? asCanvasMeta(canvas.payload)?.projectId : undefined
+    if (parentProjectId) this.find(ownerId, 'project', parentProjectId)
     for (const [key, r] of b) {
       if (r.type === 'canvas' && r.id === canvasId && !r.isDeleted && r.status === 'archived') targets.push(key)
     }

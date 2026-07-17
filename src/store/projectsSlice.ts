@@ -212,7 +212,7 @@ export const createProjectsSlice: SliceCreator = (set, get) => ({
         warnCanvas(`tombstone record failed (project ${projectId}): ${e instanceof Error ? e.message : String(e)}`),
       )
       for (const canvasId of removedCanvasIds) {
-        enqueuePersistWrite({ kind: 'deleteCanvas', canvasId })
+        enqueuePersistWrite({ kind: 'deleteCanvas', canvasId, parentProjectId: projectId })
         // F-B(决策7):级联删 canvas tombstone 带 parentProjectId,供 restoreProject 经
         //   revokeCanvasTombstonesForProject(projectId) 撤销(镜像 deleteProject 级联删);直接 deleteCanvas 的
         //   tombstone 无此字段(在 documentSlice.recordCanvasTombstone),revoke-by-project 撞不到,保留挡复活。

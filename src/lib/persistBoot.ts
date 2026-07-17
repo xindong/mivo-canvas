@@ -34,6 +34,8 @@ import { getPersistUserId } from './persistUserId'
 //   documentSlice);本模块负责 hydrate 过滤读取 + onOutcome DELETE success 清除 + enqueuePersistWrite create 撤销。
 import {
   revokeDeletionTombstone,
+  revokeCanvasTombstonesForProject,
+  getCanvasTombstoneIdsForProject,
   clearDeletionTombstone,
   getDeletionTombstones,
 } from './deletionTombstones'
@@ -42,7 +44,7 @@ import type { NodeRecord, EdgeRecord } from '../kernel/records'
 import { debugLogger } from '../store/debugLogStore'
 import { resolveActiveCanvasAfterArchive } from '../store/archiveSurvivor'
 import { toastFeedback } from '../store/toastStore'
-import { defaultFetch, type FetchAdapterOptions, type FetchLike, type GetAuthHeaders } from './serverPersistAdapter'
+import { createFetchServerPersistAdapter, defaultFetch, type FetchAdapterOptions, type FetchLike, type GetAuthHeaders } from './serverPersistAdapter'
 import type { ChatMessage } from '../store/chatStore'
 import type { CanvasDocument } from '../types/mivoCanvas'
 import type { Revision, UserStateEntry, RecordEntry } from '../../shared/persist-contract.ts'
@@ -1212,6 +1214,28 @@ export const startPersistWriteQueue = (
     //   读 IDB 非终态记录(此时本 delete 记录已 deleteWrite 离队,不在集内 → 不误判)。无 restore 时
     //   createProject 不在集 → B 照常摘除(#254 SC-3 原行为不回归)。
     onOutcome: async (op, outcome) => {
+      if (
+        op.kind === 'deleteProject' &&
+        outcome.status === 'rejected' &&
+        typeof outcome.body === 'object' &&
+        outcome.body !== null &&
+        (outcome.body as { error?: unknown }).error === 'active-child'
+      ) {
+        // 跨设备 active-child:本地乐观 delete 已写 project + cascade child tombstone,但 server 409 零写。
+        // 该拒绝不是永久删除意图:先撤销两层 tombstone,再用同一 fetch/鉴权适配器拉权威 project+canvas
+        // 回 store。队列在调用 onOutcome 前已把 delete op 终态出队,hydrate 不会再被 pending-delete 过滤。
+        const cascadeCanvasIds = await getCanvasTombstoneIdsForProject(op.projectId)
+        await writeQueue?.cancelDeleteCanvases(cascadeCanvasIds, op.projectId)
+        await clearDeletionTombstone('project', op.projectId)
+        await revokeCanvasTombstonesForProject(op.projectId)
+        await hydrateFromServer(createFetchServerPersistAdapter(opts), opts)
+        toastFeedback.warn('项目内还有活跃画布(可能来自其他设备),已恢复显示;请先归档或移动再彻底删除。')
+        debugLogger.warn(
+          SOURCE,
+          `deleteProject ${op.projectId} rejected active-child → tombstones revoked and authoritative state re-hydrated`,
+        )
+        return
+      }
       if (op.kind === 'deleteProject' && outcome.status === 'success') {
         // Phase 1 项4:DELETE 终态 success(含 404-idempotent)→ 服务端已软删 → 不再 LIVE → 无复活风险 →
         //   tombstone 完成使命可清。restore 路径(restoreProject enqueue createProject)已 revoke,此处 clear 幂等
