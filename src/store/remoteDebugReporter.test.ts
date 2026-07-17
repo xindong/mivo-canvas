@@ -1,6 +1,6 @@
 import 'fake-indexeddb/auto'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { useDebugLogStore } from './debugLogStore'
+import { debugLogger, useDebugLogStore } from './debugLogStore'
 import {
   __createIdForTest,
   __resetRemoteDebugStateForTest,
@@ -355,5 +355,69 @@ describe('FX-7 P1-2: fail-safe client info (no silent batch loss on localStorage
     // Batch persisted to the durable outbox despite the client-info read failing.
     expect(await getRemoteDebugOutboxCount()).toBe(1)
     expect(await getRemoteDebugDropCount()).toBe(0)
+  })
+})
+
+// ── T2-4: error 级上报附带 stack(≤2KB 截断;warning 级不带,控体积)──
+
+describe('T2-4 stack capture on error-level entries', () => {
+  beforeEach(async () => {
+    vi.clearAllMocks()
+    await __resetRemoteDebugStateForTest()
+  })
+
+  afterEach(async () => {
+    await __resetRemoteDebugStateForTest()
+  })
+
+  it('clamps error-entry stacks to 2KB with a truncation marker', () => {
+    const hugeStack = `Error: huge\n${'    at frame (file.ts:1:1)\n'.repeat(200)}`
+    const payload = buildRemoteDebugPayload(
+      [{ level: 'error', source: 'Canvas', message: 'boom', timestamp: 1, stack: hugeStack }],
+      fixedClientInfo(),
+    )
+
+    expect(payload.entries).toHaveLength(1)
+    const stack = payload.entries[0]!.stack
+    expect(stack).toBeDefined()
+    expect(stack!.length).toBeLessThanOrEqual(2048 + '... [truncated]'.length)
+    expect(stack!.endsWith('... [truncated]')).toBe(true)
+  })
+
+  it('drops stacks from warning-level entries (error-only field)', () => {
+    const payload = buildRemoteDebugPayload(
+      [
+        { level: 'warning', source: 'Settings', message: 'warn', timestamp: 1, stack: 'Error: w\n    at x (a.ts:1:1)' },
+        { level: 'error', source: 'Canvas', message: 'boom', timestamp: 2, stack: 'Error: e\n    at y (b.ts:2:2)' },
+      ],
+      fixedClientInfo(),
+    )
+
+    expect(payload.entries).toHaveLength(2)
+    expect('stack' in payload.entries[0]!).toBe(false)
+    expect(payload.entries[1]!.stack).toContain('b.ts:2:2')
+  })
+
+  it('debugLogger.error(source, message, error) forwards error.stack into the remote payload', async () => {
+    const bodies: string[] = []
+    const fetchMock = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      bodies.push(String(init?.body ?? ''))
+      return { ok: true, status: 200 } as Response
+    })
+    __setRemoteDebugTestHooks({
+      fetchImpl: fetchMock as unknown as typeof fetch,
+      buildClientInfo: fixedClientInfo,
+      enabled: true,
+    })
+
+    debugLogger.error('Canvas Sync', 'sync failed', new Error('sync failed'))
+    await flushRemoteDebugEntries()
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const payload = JSON.parse(bodies[0]!) as { entries: Array<{ level: string; stack?: string }> }
+    expect(payload.entries).toHaveLength(1)
+    expect(payload.entries[0]!.level).toBe('error')
+    expect(payload.entries[0]!.stack).toContain('sync failed')
+    expect(payload.entries[0]!.stack).toMatch(/at /)
   })
 })

@@ -33,6 +33,9 @@ export type RemoteDebugQueuedEntry = {
   source: string
   message: string
   timestamp: number
+  // T2-4:error 级可携带 error.stack(payload 组装时截断 ≤2KB;warning 级被剥除,
+  // 控体积)。服务端 debug-records 落库前再做路径/秘密脱敏。
+  stack?: string
 }
 
 export type RemoteDebugClientInfo = {
@@ -252,14 +255,39 @@ const createBrowserClientInfo = (): RemoteDebugClientInfo => {
   }
 }
 
+// T2-4:stack 客户端体积上限(2KB)。截断在组包时做,保证无论调用方塞多大的
+// error.stack,单条 entry 的 stack 字节数有硬上界(40 条×2KB 远小于服务端 1MB body cap)。
+const maxRemoteDebugStackLength = 2048
+
+const clampRemoteDebugStack = (stack: string | undefined): string | undefined => {
+  if (typeof stack !== 'string') return undefined
+  const trimmed = stack.trim()
+  if (!trimmed) return undefined
+  return trimmed.length > maxRemoteDebugStackLength
+    ? `${trimmed.slice(0, maxRemoteDebugStackLength)}... [truncated]`
+    : trimmed
+}
+
 export const buildRemoteDebugPayload = (
   entries: RemoteDebugQueuedEntry[],
   clientInfo: RemoteDebugClientInfo,
 ): RemoteDebugPayload => ({
   ...clientInfo,
-  entries: entries.filter((entry): entry is RemoteDebugQueuedEntry & { level: ReportableDebugLogLevel } =>
-    shouldReportRemoteDebugLevel(entry.level),
-  ),
+  entries: entries
+    .filter((entry): entry is RemoteDebugQueuedEntry & { level: ReportableDebugLogLevel } =>
+      shouldReportRemoteDebugLevel(entry.level),
+    )
+    .map((entry) => {
+      // T2-4:stack 只随 error 级上报(warning 剥除控体积),且截断 ≤2KB。
+      const stack = entry.level === 'error' ? clampRemoteDebugStack(entry.stack) : undefined
+      const base = {
+        level: entry.level,
+        source: entry.source,
+        message: entry.message,
+        timestamp: entry.timestamp,
+      }
+      return stack === undefined ? base : { ...base, stack }
+    }),
 })
 
 const remoteDebugEnabled = () =>
