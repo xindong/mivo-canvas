@@ -74,7 +74,9 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
       if (options?.projectId) {
         docProjectId = options.projectId
       } else {
-        const firstExisting = get().projects[0]?.id
+        // PR-C1 SC-3:默认父项目取首个 active 项目(非 projects[0])——否则新画布可能静默
+        //   落进 archived 项目(级联归档语义下 archived project 的画布不可见 = 丢画布)。
+        const firstExisting = get().projects.find((p) => p.status !== 'archived')?.id
         docProjectId = firstExisting ?? get().createProject('Default Project')
       }
     } else {
@@ -139,7 +141,8 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
     // /api/canvas → 404 unknown-project 终态删记录,"duplicate 后服务端有记录"不成立。
     let docProjectId = sourceDocument.projectId
     if (isServerPersist && !docProjectId) {
-      const firstExisting = get().projects[0]?.id
+      // PR-C1 SC-3:默认父项目取首个 active 项目(非 projects[0]),防 duplicate 落进 archived 项目。
+      const firstExisting = get().projects.find((p) => p.status !== 'archived')?.id
       docProjectId = firstExisting ?? get().createProject('Default Project')
     }
     const opProjectId = docProjectId ?? ''
@@ -246,11 +249,34 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
       logCanvas(`Archived canvas "${document.title}" (${targetId})`)
       // 直接归档:archivedByCascade=false(unarchiveProject 不恢复此画布;CR-5)。server 幂等:已归档→200 no-op。
       enqueuePersistWrite({ kind: 'archiveCanvas', canvasId: targetId })
+      const nextCanvases = {
+        ...state.canvases,
+        [targetId]: { ...document, status: 'archived' as const, archivedByCascade: false },
+      }
+      // PR-C1 SC-4:归档命中当前打开画布(targetId === sceneId)→ 切到 active survivor(镜像
+      //   deleteCanvas 的 survivor 切换逻辑,但仅认非归档画布);无 active survivor → 安全空态
+      //   (defaultSceneId)。归档非活跃画布无需切 scene。不做只读打开模式(超范围):archived
+      //   canvas 不可留作 sceneId,否则后续编辑撞 CR-6 409 静默丢。
+      if (targetId !== state.sceneId) {
+        return { canvases: nextCanvases }
+      }
+      const survivorId = Object.keys(state.canvases).find(
+        (id) => id !== targetId && state.canvases[id]!.status !== 'archived',
+      )
+      const nextSceneId = survivorId ?? defaultSceneId
+      const nextDocument = normalizeDocument(documentFor(nextCanvases, nextSceneId))
+      logCanvas(`Archived active canvas → switched scene to ${nextSceneId}`)
       return {
-        canvases: {
-          ...state.canvases,
-          [targetId]: { ...document, status: 'archived' as const, archivedByCascade: false },
-        },
+        canvases: nextCanvases,
+        sceneId: nextSceneId,
+        nodes: nextDocument.nodes,
+        edges: nextDocument.edges || [],
+        tasks: nextDocument.tasks,
+        selectedNodeId: nextDocument.selectedNodeId,
+        selectedNodeIds: nextDocument.selectedNodeIds || [],
+        activeTool: 'select',
+        historyPast: [],
+        historyFuture: [],
       }
     }),
   unarchiveCanvas: (canvasId) =>
@@ -371,7 +397,8 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
         baseRevision: metaRevision,
       })
     } else {
-      const opProjectId = existing.projectId ?? get().projects[0]?.id ?? ''
+      // PR-C1 SC-3:默认父项目取首个 active 项目(非 projects[0]),防 rename-standalone 落进 archived 项目。
+      const opProjectId = existing.projectId ?? get().projects.find((p) => p.status !== 'archived')?.id ?? ''
       if (opProjectId) {
         enqueuePersistWrite({ kind: 'createCanvas', canvasId: sceneId, projectId: opProjectId, title })
       } else {

@@ -327,6 +327,14 @@ export const createFetchCanvasSyncPort = (opts: FetchAdapterOptions): CanvasSync
     } catch (error) {
       if (error instanceof HttpError) {
         if (error.status === 409) {
+          // PR-C1 CR-6:archived canvas 写返 409 `{error:'archived'}`(可读不可写)。必须先判此分支——
+          //   若落入下方 conflictCursor 路径,archived canvas 的 refetch 会成功(可读)→ 返 conflict +
+          //   可读 cursor → 调用方以为编辑可 rebase 重发,实际编辑被静默丢(再发仍 409)。独立返
+          //   rejected reason 'archived' 让 canvasSyncRuntime toast "先恢复再编辑",不丢编辑意图。
+          const archivedBody = error.body as { error?: string } | undefined
+          if (archivedBody?.error === 'archived') {
+            return { kind: 'rejected', reason: 'archived', detail: 'canvas archived (CR-6); restore before editing' }
+          }
           const cursor = await conflictCursor(canvasId, change, error.body as ConflictBody | undefined)
           if (cursor) return { kind: 'conflict', currentCursor: cursor, diverging: [] }
           return { kind: 'rejected', reason: 'terminal', detail: 'conflict without refreshable cursor' }

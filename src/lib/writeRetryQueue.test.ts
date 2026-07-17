@@ -338,6 +338,21 @@ describe('FX-5 error branches', () => {
     expect(await q.pendingCount()).toBe(0)
   })
 
+  // PR-C1 CR-6:409 {error:'archived'} 落 rejected(body 保留)→ drain case 'rejected' 判 body.error==='archived'
+  //   → 专用 toast "此画布已归档,请先恢复再编辑。" 替换通用"这条改动无法保存"文案(不静默丢:terminal +
+  //   出队 + 用户感知失败)。单点判定,不新增 WriteOutcome 状态。
+  it('409 {error:archived} rejected → dedicated archived toast (CR-6, not the generic message)', async () => {
+    const { fn } = seqExecutor([{ status: 'rejected', body: { error: 'archived' } }])
+    const q = makeQueue(fn)
+    await q.enqueue(minimalNode('c1', 'n1'))
+    const r = await q.drain()
+    expect(r.terminals).toBe(1)
+    expect(toastError).toHaveBeenCalledTimes(1)
+    expect(toastError).toHaveBeenCalledWith('此画布已归档,请先恢复再编辑。')
+    expect(toastError).not.toHaveBeenCalledWith('这条改动无法保存,可能内容有误。')
+    expect(await q.pendingCount()).toBe(0)
+  })
+
   it('404 on a delete → success (idempotent); on non-delete → rejected', async () => {
     // delete of already-gone resource → executor returns success (classifyHttpStatus
     // maps 404+isDelete to success)

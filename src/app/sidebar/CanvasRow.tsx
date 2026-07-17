@@ -5,7 +5,7 @@
 // relative time label (title = absolute). Self-contained: subscribes to the store
 // for its data + actions, manages its own menu/confirm/rename state.
 import { useState } from 'react'
-import { ChevronRight, Copy, Folder, FolderInput, MonitorUp, Move, Pencil, Trash2 } from 'lucide-react'
+import { Archive, ArchiveRestore, ChevronRight, Copy, Folder, FolderInput, MonitorUp, Move, Pencil, Trash2 } from 'lucide-react'
 import { useCanvasStore } from '../../store/canvasStore'
 import { toastFeedback } from '../../store/toastStore'
 import { formatSidebarTime, formatSidebarTimeTitle } from '../../lib/formatSidebarTime'
@@ -28,6 +28,8 @@ export function CanvasRow(props: {
   const renameCanvas = useCanvasStore((s) => s.renameCanvas)
   const duplicateCanvas = useCanvasStore((s) => s.duplicateCanvas)
   const deleteCanvas = useCanvasStore((s) => s.deleteCanvas)
+  const archiveCanvas = useCanvasStore((s) => s.archiveCanvas)
+  const unarchiveCanvas = useCanvasStore((s) => s.unarchiveCanvas)
   const moveCanvasToProject = useCanvasStore((s) => s.moveCanvasToProject)
 
   const [menuPosition, setMenuPosition] = useState<{ x: number; y: number } | null>(null)
@@ -39,6 +41,10 @@ export function CanvasRow(props: {
   const updatedAt = document.updatedAt
   const active = sceneId === canvasId
   const currentProjectId = document.projectId
+  // PR-C1 SC-1:归档状态驱动菜单项(归档/恢复互斥)+ 行视觉区分。archived 项被 active 视图
+  //   过滤(buildSidebarModel),【恢复】入口在主列表不可达——PR-C2 回收站视图落地其可见性;
+  //   此处接线 action 即满足 C1 任务包(store/e2e 可直触)。
+  const isArchived = document.status === 'archived'
 
   const open = () => {
     loadScene(canvasId)
@@ -85,6 +91,17 @@ export function CanvasRow(props: {
     }
   }
 
+  // PR-C1 SC-1:归档/恢复画布。store action 已含 CR-10(unarchive 自动恢复父项目)+ CR-5;
+  //   归档命中活跃画布时 store 已切 survivor(SC-4),UI 只调用 + 即时反馈。
+  const archive = () => {
+    archiveCanvas(canvasId)
+    toastFeedback.success(`已归档画板"${title}"`)
+  }
+  const restore = () => {
+    unarchiveCanvas(canvasId)
+    toastFeedback.success(`已恢复画板"${title}"`)
+  }
+
   const menuItems: ContextMenuItem[] = [
     { kind: 'item', id: 'rename', label: '重命名', icon: Pencil, onSelect: () => setRenaming(true) },
     {
@@ -125,6 +142,10 @@ export function CanvasRow(props: {
       ],
     },
     { kind: 'item', id: 'duplicate', label: '复制画板', icon: Copy, onSelect: duplicate },
+    { kind: 'separator', id: 'sep-archive' },
+    isArchived
+      ? { kind: 'item', id: 'restore', label: '恢复', icon: ArchiveRestore, onSelect: restore }
+      : { kind: 'item', id: 'archive', label: '归档', icon: Archive, onSelect: archive },
     { kind: 'separator', id: 'sep-delete' },
     { kind: 'item', id: 'delete', label: '删除', icon: Trash2, danger: true, onSelect: () => setConfirmOpen(true) },
   ]
@@ -133,7 +154,7 @@ export function CanvasRow(props: {
     <>
       <button
         type="button"
-        className={active ? 'canvas-row active' : 'canvas-row'}
+        className={`${active ? 'canvas-row active' : 'canvas-row'}${isArchived ? ' is-archived' : ''}`}
         onClick={open}
         onDoubleClick={(event) => {
           event.preventDefault()
@@ -158,6 +179,12 @@ export function CanvasRow(props: {
           <time className="canvas-row-time" dateTime={updatedAt} title={formatSidebarTimeTitle(updatedAt)}>
             {formatSidebarTime(updatedAt)}
           </time>
+        )}
+        {/* PR-C1 SC-1:archived 行视觉标记。archived 项被 active 视图过滤,主列表不可见;
+            此 badge 在 PR-C2 回收站视图落地其可见性。放在 time 之后(children[4]),不顶替
+            row-hover-arrow(children[2])的 DOM 契约。 */}
+        {isArchived && (
+          <span className="canvas-row-archived-badge" aria-hidden="true">已归档</span>
         )}
       </button>
       {menuPosition && (

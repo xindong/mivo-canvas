@@ -2357,14 +2357,21 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
             terminals++
             finalized = true
             break
-          case 'rejected':
+          case 'rejected': {
+            // PR-C1 CR-6:archived canvas 写返 409 `{error:'archived'}`(classifyHttpStatus L486 落
+            //   rejected,body 保留)→ 专用 toast 替换通用"这条改动无法保存"文案,引导先恢复再编辑。
+            //   不静默丢意图:terminal 记录 + 出队,用户感知失败而非以为成功。单点判定,不新增
+            //   WriteOutcome 状态、executor 层不动(canvasSyncPortClient 路径由 SC-5a 处理)。
+            const rejectedBody = outcome.body as { error?: string } | undefined
+            const archived = rejectedBody?.error === 'archived'
             termLog(`write ${rec.id} rejected by server: ${JSON.stringify(outcome.body).slice(0, 200)}`)
-            termToast('这条改动无法保存,可能内容有误。')
+            termToast(archived ? '此画布已归档,请先恢复再编辑。' : '这条改动无法保存,可能内容有误。')
             await recordTerminal(rec, 'rejected', JSON.stringify(outcome.body).slice(0, 200))
             await deleteWrite(rec.id)
             terminals++
             finalized = true
             break
+          }
           case 'terminal':
             termLog(`write ${rec.id} terminal failure: ${outcome.message}`)
             termToast('保存失败,请重试。')

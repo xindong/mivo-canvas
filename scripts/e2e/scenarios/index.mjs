@@ -1,6 +1,9 @@
 import { runAiSlotPlaceholderScenario } from './ai-slot-placeholder.mjs'
 import { runAnchorMvpScenario } from './anchor-mvp.mjs'
 import { runArchiveAssetsScenario } from './archive-assets.mjs'
+import { runArchiveProjectScenario } from './archive-project.mjs'
+import { runArchiveCanvasScenario } from './archive-canvas.mjs'
+import { runArchiveCr6409Scenario } from './archive-cr6-409.mjs'
 import { runMaskReflowScenario } from './mask-reflow.mjs'
 import { runCanvasInteractionsScenario } from './canvas-interactions.mjs'
 import { runChangelogScenario } from './changelog.mjs'
@@ -54,6 +57,9 @@ export const scenarioOrder = [
   'coordinate-probe',
   'stamp-overlap',
   'project-sidebar',
+  'archive-project',
+  'archive-canvas',
+  'archive-cr6-409',
   'userchip',
   'auto-prompt-settings',
 ]
@@ -78,6 +84,9 @@ export const scenarioRunners = {
   'ai-slot-placeholder': runAiSlotPlaceholderScenario,
   'anchor-mvp': runAnchorMvpScenario,
   'archive-assets': runArchiveAssetsScenario,
+  'archive-project': runArchiveProjectScenario,
+  'archive-canvas': runArchiveCanvasScenario,
+  'archive-cr6-409': runArchiveCr6409Scenario,
   'mask-reflow': runMaskReflowScenario,
   'canvas-interactions': runCanvasInteractionsScenario,
   changelog: runChangelogScenario,

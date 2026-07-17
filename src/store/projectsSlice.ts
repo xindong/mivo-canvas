@@ -10,7 +10,7 @@ import type { SliceCreator } from './canvasStateTypes'
 import { logCanvas, warnCanvas } from './canvasStoreLog'
 import { DEMO_PROJECTS } from './demoScenes'
 import { enqueuePersistWrite, isPersistWriteActive } from '../lib/persistBoot'
-import { normalizeDocument, documentFor } from './canvasDocumentModel'
+import { normalizeDocument, documentFor, defaultSceneId } from './canvasDocumentModel'
 // Phase 1 项4(复活加固):store delete action 发起时写持久 tombstone(与队列记录生死解耦,覆盖溢出驱逐/重试
 //   耗尽离队后 pending-delete 失效的复活)。详见 src/lib/deletionTombstones.ts。
 // F-B(决策7,Phase 2 归档):restoreProject 经 revokeCanvasTombstonesForProject 撤销 deleteProject 级联写的子画布
@@ -245,22 +245,58 @@ export const createProjectsSlice: SliceCreator = (set, get) => ({
     const childCanvasIds = Object.entries(get().canvases)
       .filter(([, doc]) => doc.projectId === projectId && doc.status !== 'archived')
       .map(([id]) => id)
-    set((state) => ({
-      projects: state.projects.map((p) => (p.id === projectId ? { ...p, status: 'archived' as const } : p)),
+    // PR-C1 SC-4:捕获归档前 sceneId,供 set 后判定是否命中活跃画布需切 survivor。
+    const prevSceneId = get().sceneId
+    set((state) => {
+      const nextProjects = state.projects.map((p) => (p.id === projectId ? { ...p, status: 'archived' as const } : p))
       // CR-5/D3:级联归档子画布(随项目一起隐藏,不再变孤儿)。active 子画布标 archivedByCascade=true
       //   (unarchiveProject 仅恢复这些);已归档子画布保留其 archivedByCascade 既有值(镜像 server
       //   archiveProjectTree:已归档子画布不动,backend.ts:1957)。
-      canvases: Object.fromEntries(
+      const nextCanvases = Object.fromEntries(
         Object.entries(state.canvases).map(([id, doc]) => {
           if (doc.projectId !== projectId) return [id, doc]
           if (doc.status === 'archived') return [id, doc] // 已归档,保留 archivedByCascade 既有值
           return [id, { ...doc, status: 'archived' as const, archivedByCascade: true }]
         }),
-      ),
-    }))
+      )
+      // SC-4:级联归档若命中当前 sceneId(活跃画布在该项目下)→ 切到 active survivor(镜像
+      //   deleteProject survivor 逻辑)。Survivor = 不属于本项目的 + 非归档画布;无 survivor →
+      //   安全空态(defaultSceneId)。不做只读打开模式:archived canvas 不可留作 sceneId(CR-6 409 静默丢)。
+      const activeScene = state.canvases[state.sceneId]
+      const hitActiveScene =
+        activeScene !== undefined &&
+        activeScene.projectId === projectId &&
+        activeScene.status !== 'archived'
+      if (!hitActiveScene) {
+        return { projects: nextProjects, canvases: nextCanvases }
+      }
+      const survivorId = Object.entries(nextCanvases)
+        .filter(([, d]) => d.projectId !== projectId && d.status !== 'archived')
+        .map(([id]) => id)[0]
+      const nextSceneId = survivorId ?? defaultSceneId
+      const nextDocument = normalizeDocument(documentFor(nextCanvases, nextSceneId))
+      return {
+        projects: nextProjects,
+        canvases: nextCanvases,
+        sceneId: nextSceneId,
+        nodes: nextDocument.nodes,
+        edges: nextDocument.edges || [],
+        tasks: nextDocument.tasks,
+        selectedNodeId: nextDocument.selectedNodeId,
+        selectedNodeIds: nextDocument.selectedNodeIds || [],
+        activeTool: 'select',
+        historyPast: [],
+        historyFuture: [],
+      }
+    })
     logCanvas(
       `Archived project "${project.name}" (${projectId}); active child canvas(es) cascade-archived (archivedByCascade=true)`,
     )
+    // SC-4:若命中活跃画布 → set 后 sceneId 已切;记一条切换日志。
+    const afterSceneId = get().sceneId
+    if (afterSceneId !== prevSceneId) {
+      logCanvas(`Archived project hit active scene → switched scene to ${afterSceneId}`)
+    }
     // server archiveProjectTree 级联归档其全部 active 子画布(D3)。幂等:已归档→200 no-op。local no-op。
     //   P1-2:canvasIds = 上方 childCanvasIds 快照(barrier 用,非 wire 字段;server archiveProjectTree 不读此字段)。
     enqueuePersistWrite({ kind: 'archiveProject', projectId, canvasIds: childCanvasIds })
