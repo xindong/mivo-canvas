@@ -265,6 +265,54 @@ const putRecord = async (record: TombstoneRecord): Promise<'new' | 'enriched' | 
   }
 }
 
+/**
+ * rollbackPending commit token 专用严格写：必须真实提交到 IDB，失败（含 IDB 不可用）直接上抛。
+ * 若此前 best-effort 写曾落入 memStore，则把其中的 enrichment 一并提交；只有 transaction commit
+ * 后才清掉内存 fallback，避免失败时制造“内存看似成功、reload 后 marker 消失”的假 durable 状态。
+ */
+const putRecordStrict = async (record: TombstoneRecord): Promise<'new' | 'enriched' | 'existing'> => {
+  if (!isIdbAvailable()) {
+    throw new Error('IndexedDB unavailable for strict tombstone put')
+  }
+
+  const memoryRecord = memStore.get(record.key)
+  let written = false
+  let enriched = false
+  await runVoidTx('readwrite', (store) => {
+    const getReq = store.get(record.key) as IDBRequest<TombstoneRecord | undefined>
+    getReq.onsuccess = () => {
+      const existing = getReq.result
+      const base = existing ?? memoryRecord ?? record
+      const durableRecord: TombstoneRecord = {
+        ...base,
+        ...(base.parentProjectId === undefined && memoryRecord?.parentProjectId !== undefined
+          ? { parentProjectId: memoryRecord.parentProjectId }
+          : {}),
+        ...(base.parentProjectId === undefined && record.parentProjectId !== undefined
+          ? { parentProjectId: record.parentProjectId }
+          : {}),
+        ...(memoryRecord?.rollbackPending === true || record.rollbackPending === true
+          ? { rollbackPending: true }
+          : {}),
+      }
+      if (existing === undefined) {
+        store.put(durableRecord)
+        written = true
+      } else if (
+        (durableRecord.parentProjectId !== undefined && existing.parentProjectId === undefined) ||
+        (durableRecord.rollbackPending === true && existing.rollbackPending !== true)
+      ) {
+        store.put(durableRecord)
+        enriched = true
+      }
+    }
+  })
+
+  // IDB 已包含 record + mem fallback 的 enrichment；commit 后再清内存镜像。
+  memStore.delete(record.key)
+  return written ? 'new' : enriched ? 'enriched' : 'existing'
+}
+
 const deleteRecord = async (key: string): Promise<boolean> => {
   // 返是否实际删除了一条(供调用方决定是否 log;bare delete 对缺失 key 幂等 no-op)。
   let existed = false
@@ -432,10 +480,10 @@ export const getCanvasTombstoneIdsForProject = async (projectId: string): Promis
     .map((r) => r.resourceId)
 }
 
-/** active-child 权威回灌失败后给 project tombstone 加 durable rollback marker。 */
+/** active-child 权威回灌前给 project tombstone 严格写入 durable rollback marker。 */
 export const markProjectDeletionRollbackPending = async (projectId: string): Promise<void> => {
   const ownerId = getPersistUserId()
-  await putRecord({
+  await putRecordStrict({
     key: tombstoneKey('project', projectId, ownerId),
     ownerId,
     kind: 'project',

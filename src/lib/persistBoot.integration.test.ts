@@ -10,7 +10,7 @@
 // 真实 BFF route 行为(query filter / actor 指纹 / 428/409/422/404 / multipart)由 server/routes 侧
 // 的 persistWiring.integration.test.ts(真实 Hono app.request)覆盖——两端合起来证 client→wire→BFF→backend 全链。
 
-import { describe, expect, it, beforeEach, vi } from 'vitest'
+import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest'
 import { IDBFactory as FakeIDBFactory, IDBObjectStore as FakeIDBObjectStore } from 'fake-indexeddb'
 
 // Hermetic setup(同 chatStore.test.ts):node env 无 DOM/localStorage;canvasStore 经
@@ -2169,6 +2169,18 @@ describe('Phase 1 项3 — orphan-parent 画布跳过收集(防 404 unknown-proj
 })
 
 describe('Phase 1 项4 — 持久 tombstone 全生命周期(DELETE 离队后接力挡复活,CR-3/CR-4)', () => {
+  const previousIndexedDb = globalThis.indexedDB
+  beforeEach(async () => {
+    // rollbackPending 是 reload 后仍须存在的 commit token；本组走真实 fake-IDB durable 分支，
+    // 不再用无 IDB 的 mem fallback 掩盖严格写语义。
+    vi.stubGlobal('indexedDB', new FakeIDBFactory())
+    await __resetWriteQueueDb()
+    await __resetDeletionTombstonesDb()
+  })
+  afterEach(() => {
+    vi.stubGlobal('indexedDB', previousIndexedDb)
+  })
+
   const proj = (id: string, name: string): Project => ({
     id, name, ownerId: KEY_A, createdAt: 't', updatedAt: 't', revision: 0, isDeleted: false,
   })
@@ -2293,6 +2305,99 @@ describe('Phase 1 项4 — 持久 tombstone 全生命周期(DELETE 离队后接�
     expect(await getPendingProjectDeletionRollbackIds()).not.toContain('pX')
     expect(warn).not.toHaveBeenCalledWith('项目内还有活跃画布(可能来自其他设备),已恢复显示;请先归档或移动再彻底删除。')
     warn.mockRestore()
+  })
+
+  it('P2:active-child rollbackPending 严格 put 失败 → 不消费任何 tombstone；解除故障重试后收敛', async () => {
+    localStorage.setItem('mivo:server-migration:anonymous', 'done')
+    const serverProject = proj('pX', 'Server P')
+    let reconcileReads = 0
+    const fetch = async (input: string, init?: RequestInit): Promise<Response> => {
+      const url = new URL(input, 'http://stub')
+      const method = (init?.method ?? 'GET').toUpperCase()
+      const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
+        status, headers: { 'content-type': 'application/json' },
+      })
+      if (method === 'DELETE' && url.pathname === '/api/projects/pX') {
+        return json({ error: 'active-child', id: 'pX' }, 409)
+      }
+      if (method === 'GET' && url.pathname === '/api/projects') {
+        reconcileReads++
+        return json({ projects: [] })
+      }
+      if (method === 'GET' && url.pathname === '/api/canvas') {
+        reconcileReads++
+        return json({ canvases: [] })
+      }
+      return json({})
+    }
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    resetStoreProjects([serverProject])
+    useCanvasStore.setState({
+      canvases: {
+        c1: ({ title: 'one', projectId: 'pX', status: 'active', createdAt: 't', updatedAt: 't', nodes: [], edges: [], tasks: [] }) as never,
+        c2: ({ title: 'two', projectId: 'pX', status: 'active', createdAt: 't', updatedAt: 't', nodes: [], edges: [], tasks: [] }) as never,
+        survivor: ({ title: 'survivor', createdAt: 't', updatedAt: 't', nodes: [], edges: [], tasks: [] }) as never,
+      },
+      sceneId: 'survivor',
+    })
+
+    expect(useCanvasStore.getState().deleteProject('pX')).toEqual({ status: 'deleted' })
+    await flush()
+    expect((await getDeletionTombstones('project')).has('pX')).toBe(true)
+    expect(await getDeletionTombstones('canvas')).toEqual(new Set(['c1', 'c2']))
+
+    const originalPut = FakeIDBObjectStore.prototype.put
+    const originalDelete = FakeIDBObjectStore.prototype.delete
+    let markerPutAttempts = 0
+    const strictChildDeletes: string[] = []
+    const putSpy = vi.spyOn(FakeIDBObjectStore.prototype, 'put').mockImplementation(function (
+      this: InstanceType<typeof FakeIDBObjectStore>,
+      value,
+      key,
+    ) {
+      const tombstone = value as { key?: unknown; rollbackPending?: unknown }
+      if (String(tombstone.key).endsWith(':project:pX') && tombstone.rollbackPending === true) {
+        markerPutAttempts++
+        throw new Error('injected rollbackPending IDB put failure')
+      }
+      return key === undefined ? originalPut.call(this, value) : originalPut.call(this, value, key)
+    })
+    const deleteSpy = vi.spyOn(FakeIDBObjectStore.prototype, 'delete').mockImplementation(function (
+      this: InstanceType<typeof FakeIDBObjectStore>,
+      query,
+    ) {
+      if (String(query).includes(':canvas:')) strictChildDeletes.push(String(query))
+      return originalDelete.call(this, query)
+    })
+
+    try {
+      const failedMarkerDrain = await drainPersistQueue()
+      expect(failedMarkerDrain?.terminals).toBe(1)
+      expect(markerPutAttempts).toBe(1)
+      expect(reconcileReads).toBe(0)
+      expect(strictChildDeletes).toEqual([])
+      expect(await getPendingProjectDeletionRollbackIds()).not.toContain('pX')
+      expect((await getDeletionTombstones('project')).has('pX')).toBe(true)
+      expect(await getDeletionTombstones('canvas')).toEqual(new Set(['c1', 'c2']))
+
+      putSpy.mockRestore()
+      await enqueuePersistWrite({ kind: 'deleteProject', projectId: 'pX' })
+      await flush()
+      const retriedDrain = await drainPersistQueue()
+      expect(retriedDrain?.terminals).toBe(1)
+      expect(reconcileReads).toBe(2)
+      expect(strictChildDeletes.sort()).toEqual([
+        `${ANONYMOUS_USER_ID}:canvas:c1`,
+        `${ANONYMOUS_USER_ID}:canvas:c2`,
+      ])
+      expect(await getPendingProjectDeletionRollbackIds()).not.toContain('pX')
+      expect((await getDeletionTombstones('project')).has('pX')).toBe(false)
+      expect(await getDeletionTombstones('canvas')).toEqual(new Set())
+    } finally {
+      putSpy.mockRestore()
+      deleteSpy.mockRestore()
+    }
   })
 
   it('P2-3:active-child 回灌 GET 全失败 → 不假报恢复、保留 tombstone；后续成功 GET 收敛并清凭据', async () => {

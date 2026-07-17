@@ -1314,8 +1314,18 @@ export const startPersistWriteQueue = (
         // tombstone/报“已恢复”。任一 GET 失败则保留 tombstone 作为 durable retry credential,禁止假成功。
         const cascadeCanvasIds = await getCanvasTombstoneIdsForProject(op.projectId)
         await writeQueue?.cancelDeleteCanvases(cascadeCanvasIds, op.projectId)
-        // 先 durable 落 rollbackPending；即使随后崩溃或 child tombstone 中途清理失败，下轮 hydrate 仍有重试凭据。
-        await markProjectDeletionRollbackPending(op.projectId)
+        // 先严格 durable 落 rollbackPending；marker transaction 失败时禁止进入 reconcile/消费任何
+        // tombstone，避免 mem fallback 假成功后 reload 丢失唯一重试凭据。
+        try {
+          await markProjectDeletionRollbackPending(op.projectId)
+        } catch (error) {
+          toastFeedback.warn('项目删除被阻止,但重试状态保存失败;已保留删除标记,请稍后重试。')
+          debugLogger.warn(
+            SOURCE,
+            `deleteProject ${op.projectId} rejected active-child → rollbackPending durable write failed; tombstones retained without consumption: ${msg(error)}`,
+          )
+          return
+        }
         try {
           const result = await reconcileActiveChildDeleteRejection(op.projectId, createFetchServerPersistAdapter(opts))
           await revokeCanvasTombstonesForProjectStrict(op.projectId)
