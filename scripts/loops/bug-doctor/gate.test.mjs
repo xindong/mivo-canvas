@@ -77,12 +77,11 @@ describe('gate 端到端(fixture 驱动,零网络)', () => {
     const fps = Object.keys(byLevel)
 
     const wrq = fps.find((f) => f.startsWith('Write Retry Queue::'))
-    const persistBoot = fps.find((f) => f.startsWith('Persist Boot::fetchCanvas'))
+    const persistBootFps = fps.filter((f) => f.startsWith('Persist Boot::fetchCanvas'))
     const consoleFp = fps.find((f) => f.startsWith('Console::'))
     const canvasStore = fps.find((f) => f.startsWith('Canvas Store::'))
 
     expect(byLevel[wrq]).toBe('S0')
-    expect(byLevel[persistBoot]).toBe('S1')
     expect(byLevel[consoleFp]).toBe('S2')
     expect(byLevel[canvasStore]).toBe('S3')
 
@@ -90,10 +89,13 @@ describe('gate 端到端(fixture 驱动,零网络)', () => {
     const wrqCluster = wp.clusters.find((c) => c.fp === wrq)
     expect(wrqCluster.count).toBe(3)
     expect(wrqCluster.distinctClients24h).toBe(3)
-    // Persist Boot 两条不同 canvas 变量聚成一簇且带 serverFault 标
-    const pbCluster = wp.clusters.find((c) => c.fp === persistBoot)
-    expect(pbCluster.count).toBe(2)
-    expect(pbCluster.serverFault).toBe(true)
+    // Persist Boot 两条按 canvas slug 分簇(fpv:1 只剥 UUID/hex/数字/引号路径/query,
+    // 裸 slug 与语义词不可通用区分,细化归进化轮),但每簇都命中 serverFault → S1
+    expect(persistBootFps.length).toBe(2)
+    for (const fp of persistBootFps) {
+      expect(byLevel[fp]).toBe('S1')
+      expect(wp.clusters.find((c) => c.fp === fp).serverFault).toBe(true)
+    }
     // 工作包按 score 降序,S0 簇在首位
     expect(wp.clusters[0].fp).toBe(wrq)
     expect(wp.s0Alerts.some((a) => a.fp === wrq)).toBe(true)
