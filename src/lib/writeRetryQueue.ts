@@ -720,18 +720,20 @@ const stableTopologicalSort = (due: QueuedWrite[]): QueuedWrite[] => {
  *  - 其余(update+update / update+delete / delete+delete / delete+update)→ last-wins(incoming)。
  *    create+create 同 id 正常 store 流不会发生(createProject 每次新 mint id);若发生也 last-wins。
  */
-const combineOps = (existing: WriteOp, incoming: WriteOp): WriteOp | 'cancel' => {
+const combineOps = (existing: WriteOp, incoming: WriteOp): WriteOp | 'cancel' | 'skip-coalesce' => {
   const ek = existing.kind
   const ik = incoming.kind
   // create+update → 保留 create kind,合并到最终 body(防 create 被 update 替换致服务端从未 POST)
   if (ek === 'createProject' && ik === 'updateProject') {
-    return { kind: 'createProject', name: incoming.name, id: existing.id ?? incoming.projectId }
+    // P1-1(#3 返修):字段级保留 existing.status(先前 create+archive 合并得的 archived 不被 update 静默丢回 active)。
+    return { kind: 'createProject', name: incoming.name, id: existing.id ?? incoming.projectId, ...(existing.status !== undefined ? { status: existing.status } : {}) }
   }
   if (ek === 'createCanvas' && ik === 'updateCanvas') {
     // R3 F1:field-wise merge — 保留 create 独有/未改字段( notably sourceTemplateId)。
     // 生产 rename(只带 title)/move(只带 projectId)的 update 不带 sourceTemplateId,
     // 旧实现只用 incoming 重建 create 致 sourceTemplateId 被静默丢弃。现按字段级合并:
     // incoming 显式携带 → 用 incoming(可改);incoming 未带 → 保留 existing(不丢 create 独有字段)。
+    // P1-1(#3 返修):同保留 existing.status(防 create+archive→create(archived) 后再 update 把 status 丢回 active)。
     return {
       kind: 'createCanvas',
       canvasId: existing.canvasId,
@@ -746,6 +748,7 @@ const combineOps = (existing: WriteOp, incoming: WriteOp): WriteOp | 'cancel' =>
         : existing.sourceTemplateId !== undefined
           ? { sourceTemplateId: existing.sourceTemplateId }
           : {}),
+      ...(existing.status !== undefined ? { status: existing.status } : {}),
     }
   }
   // create+delete → 净消(资源从未服务端创建,delete 无意义)
@@ -793,9 +796,26 @@ const combineOps = (existing: WriteOp, incoming: WriteOp): WriteOp | 'cancel' =>
   if (ek === 'unarchiveCanvas' && ik === 'archiveCanvas') return 'cancel'
   if (ek === 'deleteProject' && (ik === 'archiveProject' || ik === 'unarchiveProject')) return existing
   if (ek === 'deleteCanvas' && (ik === 'archiveCanvas' || ik === 'unarchiveCanvas')) return existing
+  // P1-1(#1/#2 返修):state-transition(archive/unarchive)+ meta update 双向 → skip-coalesce(不合并为单槽,
+  //   保留两条有序 op 按 seq 顺序重放:队列本支持多 op;coalesce 只是优化不是必须)。防 last-wins 静默丢一侧意图:
+  //   - unarchive+update:last-wins→update 丢 unarchive → 幸存 update 打到仍 archived 服务端 → CR-6 409 →
+  //     terminal 删除 → 写永久丢失,client active+新名/server 仍 archived 永久分叉。skip-coalesce→unarchive 先
+  //     drain(status→active)→update 后 drain(meta 落 active,不 409)→双意图落地。
+  //   - archive+update:last-wins→update 丢 archive → client 乐观 archived/server active+update 分叉。skip-coalesce→
+  //     archive 先 drain(archived)→update 后 drain(409 stale terminal,P1-2 "archive 之后 stale 写应 409" 正确)。
+  //   - update+archive / update+unarchive(反向):skip-coalesce→update 先 drain(meta)→archive/unarchive 后 drain
+  //     (status)→双意图落地(顺带修既有 update+archive→archive 胜丢 rename 的取舍:rename 先落,archive 后)。
+  //   注:create+archive 不走此(create 能带 status,create+archive→create(archived) 单 op 双意图,不丢);
+  //   archive/unarchive+delete 不走此(delete 终态压过归档,上方 return existing 正确);
+  //   archive+unarchive 不走此(互消 cancel,上方);update+update 仍 last-wins(同意图后者胜,不丢意图)。
+  const isStateTransition = (k: WriteOpKind): boolean =>
+    k === 'archiveProject' || k === 'unarchiveProject' || k === 'archiveCanvas' || k === 'unarchiveCanvas'
+  const isMetaUpdate = (k: WriteOpKind): boolean => k === 'updateProject' || k === 'updateCanvas'
+  if ((isStateTransition(ek) && isMetaUpdate(ik)) || (isMetaUpdate(ek) && isStateTransition(ik))) {
+    return 'skip-coalesce'
+  }
   // 其余组合:last-wins(update+update / update+delete / delete+delete / delete+update / create+create /
-  //   update+archive / archive+archive / unarchive+unarchive 等)。注:update+archive→archive 胜(rename 丢失,
-  //   同 update+delete 既有取舍;archive 端点空 body 不带 name,单 op 无法兼 rename+archive,故 archive 胜)。
+  //   archive+archive / unarchive+unarchive 等;state-transition+update 已上方 skip-coalesce 接走)。
   return incoming
 }
 
@@ -1748,21 +1768,31 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
           )
           return existing.id
         }
-        existing.op = combined
-        // P1-2(2026-07-16 demo-seed-migration-skip):coalesce 时 migration 标志按 incoming 收窄——
-        //   existing.migration && (opts?.migration ?? false)。只有双方都是 migration 才保持 true;任一侧是
-        //   用户写(非 migration)即降 false(用户语义优先)——否则 migration record pending 期间用户 rename 同
-        //   资源,合并后仍 migration=true → drain terminal 走 termLog WARN + 不弹 toast(用户主动操作失败被
-        //   静默降级)。降 false 后恢复 ERROR + toast(drain switch 的 termLog/termToast 按 rec.migration 分流)。
-        existing.migration = existing.migration && (opts?.migration ?? false)
-        existing.idempotencyKey = newKey()
-        existing.attempts = 0
-        existing.nextAttemptAt = ts
-        existing.lastError = undefined
-        existing.lastAttemptAt = undefined
-        await putWrite(existing)
-        debugLogger.log(SOURCE, `coalesced write ${resourceKey} (superseded pending ${existing.id})`)
-        return existing.id
+        if (combined === 'skip-coalesce') {
+          // P1-1 返修:state-transition + meta update 不合并,保留两条有序 op(existing 留存 pending,
+          //   incoming 走下方新建 record,按 seq 顺序重放:existing 先 createdAt/seq 先 drain,incoming 后 drain)。
+          //   防 last-wins 静默丢一侧意图(见 combineOps 注释)。fall through 到 overflow 检查 + 新建 record 路径。
+          debugLogger.log(
+            SOURCE,
+            `skip-coalesce ${resourceKey} (state-transition + meta update: keep both as ordered ops; existing ${existing.id} stays, new record for incoming)`,
+          )
+        } else {
+          existing.op = combined
+          // P1-2(2026-07-16 demo-seed-migration-skip):coalesce 时 migration 标志按 incoming 收窄——
+          //   existing.migration && (opts?.migration ?? false)。只有双方都是 migration 才保持 true;任一侧是
+          //   用户写(非 migration)即降 false(用户语义优先)——否则 migration record pending 期间用户 rename 同
+          //   资源,合并后仍 migration=true → drain terminal 走 termLog WARN + 不弹 toast(用户主动操作失败被
+          //   静默降级)。降 false 后恢复 ERROR + toast(drain switch 的 termLog/termToast 按 rec.migration 分流)。
+          existing.migration = existing.migration && (opts?.migration ?? false)
+          existing.idempotencyKey = newKey()
+          existing.attempts = 0
+          existing.nextAttemptAt = ts
+          existing.lastError = undefined
+          existing.lastAttemptAt = undefined
+          await putWrite(existing)
+          debugLogger.log(SOURCE, `coalesced write ${resourceKey} (superseded pending ${existing.id})`)
+          return existing.id
+        }
       }
     }
 
