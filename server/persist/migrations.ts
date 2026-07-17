@@ -238,6 +238,26 @@ const DROP_COMPENSATIONS_CLAIM_TOKEN = sql`
 ALTER TABLE share_link_compensations DROP COLUMN IF EXISTS claim_token;
 `
 
+// Phase 2 归档(PR-A,2026-07-17):status 列镜像 is_deleted 先例(D1)。persist_records(全 record 信封)
+// + projects/canvases 瘦索引表同步加列;存量默认 'active'(live 记录)。'archived' = 归档态——可读/可恢复/
+// 子记录写返 409 archived(CR-6 write-guard 走列判定)。**彻底删除沿用 is_deleted 软删终态,不新增 'deleted'
+// status 值**(避免与 is_deleted 双轨)。wire/列均 optional 语义向后兼容:旧 client 不读此列无感,本 PR 可先合并部署。
+//
+// ADD COLUMN IF NOT EXISTS 幂等:已 applied 的库 ALTER 加列(填默认 'active');fresh 库建表后 010 补列,同效。
+// CHECK (status IN ('active','archived')) 约束合法值域,防脏写。archivedByCascade(D3)是 canvas meta payload 内
+// 布尔(级联归档标记),非独立列——server archiveProjectTree 写 payload.archivedByCascade=true,unarchiveProjectTree
+// 只恢复 payload->>'archivedByCascade'='true' 的子画布(用户先前单独归档的不被强制恢复)。
+const ARCHIVE_STATUS_SCHEMA = sql`
+ALTER TABLE persist_records ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','archived'));
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','archived'));
+ALTER TABLE canvases ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','archived'));
+`
+const DROP_ARCHIVE_STATUS_SCHEMA = sql`
+ALTER TABLE persist_records DROP COLUMN IF EXISTS status;
+ALTER TABLE projects DROP COLUMN IF EXISTS status;
+ALTER TABLE canvases DROP COLUMN IF EXISTS status;
+`
+
 // G2.2 migration 008:三域 owner rekey(fingerprint→SSO username)文档 + fail-closed 审计标记。
 // 决议(lead 定,docs/plan/...A1 D3 节 + docs/decisions/dp4-identity-alignment.md §3.1 + docs/runbook/
 // g21-strict-sso-runbook.md §owner inventory + §owner-migration gate)。受影响持久键(三域全清单):
@@ -331,6 +351,15 @@ export const migrations: Record<string, Migration> = {
     },
     async down(db): Promise<void> {
       await G22_OWNER_REKEY_AUDIT_COMMENT_DROP.execute(db)
+    },
+  },
+  // Phase 2 归档(PR-A):status 列(D1,镜像 is_deleted 先例)。字典序 010 > 009,单调;与既有迁移无冲突。
+  '2026_07_17_010_archive_status_column': {
+    async up(db): Promise<void> {
+      await ARCHIVE_STATUS_SCHEMA.execute(db)
+    },
+    async down(db): Promise<void> {
+      await DROP_ARCHIVE_STATUS_SCHEMA.execute(db)
     },
   },
   // A2-S2(§14.1/§10.5/§10.7):field-level per-field clock + per-canvas 单调 seq + child tombstone。

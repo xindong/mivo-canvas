@@ -44,7 +44,7 @@ import type {
 import { requiredTopLevelFields, validateChildPayload } from '../../shared/persist-contract.ts'
 import { fieldKeyOf, setByPath, unsetByPath, getByPath, type DomainOp } from '../lib/domainOp'
 import type { FieldClocks } from '../lib/baseCursor'
-import type { PersistScope, PersistType, Revision } from '../../shared/persist-contract.ts'
+import type { PersistScope, PersistType, RecordStatus, Revision } from '../../shared/persist-contract.ts'
 
 // ── Kysely Database 类型(列 SelectType=读类型;Generated=有 DB 默认值可省略插入)──────────
 interface PersistRecordsTable {
@@ -56,6 +56,8 @@ interface PersistRecordsTable {
   revision: Generated<number>
   order_key: Generated<number>
   is_deleted: Generated<boolean>
+  /** D1(Phase 2 归档):status 列(镜像 is_deleted;缺省 'active')。 */
+  status: Generated<string>
   created_at: Generated<Date>
   updated_at: Generated<Date>
   // read=object(pg 解析 jsonb 为对象);insert/update=string(JSON.stringify 写入,PG text→jsonb 隐式转换)。JSONColumnType 须 object select,unknown 会破坏 Insertable 提取。
@@ -65,6 +67,8 @@ interface GlobalIndexTable {
   id: string
   owner_id: string
   is_deleted: Generated<boolean>
+  /** D1(Phase 2 归档):status 列(瘦索引表同步;缺省 'active')。 */
+  status: Generated<string>
   created_at: Generated<Date>
   updated_at: Generated<Date>
 }
@@ -143,13 +147,14 @@ const rowToRecord = (row: Selectable<PersistRecordsTable>): PersistRecord => ({
   revision: Number(row.revision),
   orderKey: Number(row.order_key),
   isDeleted: Boolean(row.is_deleted),
+  status: row.status as RecordStatus | undefined,
   createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at),
   updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : String(row.updated_at),
   payload: clone(row.payload),
 })
 
 /** canvas meta payload shape(backend 维护 contentVersion;其余域字段 route 管)。 */
-type CanvasMetaPayload = { projectId?: string; title?: string; sourceTemplateId?: string; contentVersion?: Revision }
+type CanvasMetaPayload = { projectId?: string; title?: string; sourceTemplateId?: string; contentVersion?: Revision; archivedByCascade?: boolean }
 const asCanvasMeta = (p: unknown): CanvasMetaPayload | null =>
   typeof p === 'object' && p !== null ? (p as CanvasMetaPayload) : null
 
@@ -615,6 +620,8 @@ export class PgPersistBackend implements PersistBackend {
       method: string
       resourceKind: string
       bodyFingerprint?: string
+      /** D2(Phase 2 归档):create wire 可选 status;fresh create 落列,restore 路径应用(combineOps create+archive→create(status:'archived'))。 */
+      status?: RecordStatus
     },
   ): Promise<EnsureCreateResult> {
     await this.ready
@@ -681,7 +688,7 @@ export class PgPersistBackend implements PersistBackend {
           // Greptile P1(全局索引竞争):project/canvas 全局唯一索引先建(doNothing+returning);若 returning 空(跨事务
           // race 被吞)→ re-SELECT 归属 → 跨 owner → exists-other-owner(此时 persist_records 尚未插入,trx 提交无 partial)。
           if (type === 'project') {
-            const idx = await trx.insertInto('projects').values({ id, owner_id: ownerId, is_deleted: false }).onConflict((oc) => oc.column('id').doNothing()).returning('id').executeTakeFirst()
+            const idx = await trx.insertInto('projects').values({ id, owner_id: ownerId, is_deleted: false, status: opts.status ?? 'active' }).onConflict((oc) => oc.column('id').doNothing()).returning('id').executeTakeFirst()
             if (!idx) {
               const g = await trx.selectFrom('projects').select('owner_id').where('id', '=', id).executeTakeFirst()
               if (g && g.owner_id !== ownerId) {
@@ -690,7 +697,7 @@ export class PgPersistBackend implements PersistBackend {
               }
             }
           } else if (type === 'canvas') {
-            const idx = await trx.insertInto('canvases').values({ id, owner_id: ownerId, is_deleted: false }).onConflict((oc) => oc.column('id').doNothing()).returning('id').executeTakeFirst()
+            const idx = await trx.insertInto('canvases').values({ id, owner_id: ownerId, is_deleted: false, status: opts.status ?? 'active' }).onConflict((oc) => oc.column('id').doNothing()).returning('id').executeTakeFirst()
             if (!idx) {
               const g = await trx.selectFrom('canvases').select('owner_id').where('id', '=', id).executeTakeFirst()
               if (g && g.owner_id !== ownerId) {
@@ -712,6 +719,7 @@ export class PgPersistBackend implements PersistBackend {
               revision: 0,
               order_key: 0,
               is_deleted: false,
+              status: opts.status ?? 'active',
               payload: JSON.stringify(payload),
             })
             .onConflict((oc) => oc.columns(['owner_id', 'type', 'id']).doNothing())
@@ -761,14 +769,14 @@ export class PgPersistBackend implements PersistBackend {
     type: PersistType,
     id: string,
     payload: unknown,
-    opts: { canvasId?: string | null; scope?: PersistScope; idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string },
+    opts: { canvasId?: string | null; scope?: PersistScope; idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string; status?: RecordStatus },
   ): Promise<{ record: PersistRecord; restored: boolean }> {
     let restored: boolean
     if (type === 'project') {
-      const { metaRestored } = await this.restoreProjectTreeInTrx(trx, ownerId, id, { payload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint })
+      const { metaRestored } = await this.restoreProjectTreeInTrx(trx, ownerId, id, { payload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint, status: opts.status })
       restored = metaRestored
     } else if (type === 'canvas') {
-      const { metaRestored } = await this.restoreCanvasTreeInTrx(trx, ownerId, id, { payload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint })
+      const { metaRestored } = await this.restoreCanvasTreeInTrx(trx, ownerId, id, { payload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint, status: opts.status })
       restored = metaRestored
     } else {
       // chat-collection / leaf meta:单 record undelete + bump + payload。F4:WHERE is_deleted=true + rowCount 定输赢(0 行=并发赢家已恢复)。
@@ -791,7 +799,7 @@ export class PgPersistBackend implements PersistBackend {
     ownerId: string,
     canvasId: string,
     canvasPayload: unknown,
-    opts: { idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string },
+    opts: { idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string; status?: RecordStatus },
   ): Promise<EnsureCreateResult> {
     await this.ready
     return this.withIdempotencyGuard(
@@ -819,7 +827,7 @@ export class PgPersistBackend implements PersistBackend {
                   if (pid2 && !(await this.projectLiveInTrx(trx, ownerId, pid2))) return { kind: 'parent-not-live' }
                   // F1:replay 命中 deleted → 真恢复。idem 条目已存在(:602 读到),不重插(否则误判 race loser→回滚恢复)。
                   // F4:按 restoreCanvasTreeInTrx 的 rowCount 定输赢——0 行(并发赢家已恢复)→ existing。
-                  const { metaRestored } = await this.restoreCanvasTreeInTrx(trx, ownerId, canvasId, { payload: canvasPayload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint })
+                  const { metaRestored } = await this.restoreCanvasTreeInTrx(trx, ownerId, canvasId, { payload: canvasPayload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint, status: opts.status })
                   await this.ensureCollectionLiveInTrx(trx, ownerId, canvasId)
                   const rec = await trx.selectFrom('persist_records').selectAll().where('owner_id', '=', ownerId).where('type', '=', 'canvas').where('id', '=', canvasId).executeTakeFirst()
                   if (!rec) throw new Error('createCanvasWithCollection: post-restore canvas missing')
@@ -840,7 +848,7 @@ export class PgPersistBackend implements PersistBackend {
           }
           if (existing && existing.is_deleted) {
             // N2/F1:parent live(已验 F1)→ restored(事务内 restore + ensureCollectionLive)。F4:rowCount 定输赢(并发赢家已恢复→existing)。
-            const { metaRestored } = await this.restoreCanvasTreeInTrx(trx, ownerId, canvasId, { payload: canvasPayload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint })
+            const { metaRestored } = await this.restoreCanvasTreeInTrx(trx, ownerId, canvasId, { payload: canvasPayload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint, status: opts.status })
             await this.ensureCollectionLiveInTrx(trx, ownerId, canvasId)
             await this.setIdempotencyEntryInTrx(trx, ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, opts.bodyFingerprint ?? '', ownerId, 'canvas', canvasId)
             const rec = await trx.selectFrom('persist_records').selectAll().where('owner_id', '=', ownerId).where('type', '=', 'canvas').where('id', '=', canvasId).executeTakeFirst()
@@ -850,7 +858,7 @@ export class PgPersistBackend implements PersistBackend {
           // 不存在 → 原子 created(canvas meta + chat-collection + canvases 全局索引 同一事务;失败全回滚,无 partial,无 orphan)。
           // Greptile P1(全局索引竞争):canvases 全局索引先建(doNothing+returning);若 returning 空(跨事务 race 被吞)
           // → re-SELECT 归属 → 跨 owner → exists-other-owner(此时 canvas meta/collection 尚未插入,trx 提交无 partial)。
-          const idx = await trx.insertInto('canvases').values({ id: canvasId, owner_id: ownerId, is_deleted: false }).onConflict((oc) => oc.column('id').doNothing()).returning('id').executeTakeFirst()
+          const idx = await trx.insertInto('canvases').values({ id: canvasId, owner_id: ownerId, is_deleted: false, status: opts.status ?? 'active' }).onConflict((oc) => oc.column('id').doNothing()).returning('id').executeTakeFirst()
           if (!idx) {
             const g = await trx.selectFrom('canvases').select('owner_id').where('id', '=', canvasId).executeTakeFirst()
             if (g && g.owner_id !== ownerId) {
@@ -862,7 +870,7 @@ export class PgPersistBackend implements PersistBackend {
           // P1-3:canvas meta INSERT ON CONFLICT DO NOTHING + 重读(同 owner 同 id race:输家重读赢家已提交行 → existing/restored,不再 23505)。
           const canvasInsert = await trx
             .insertInto('persist_records')
-            .values({ id: canvasId, owner_id: ownerId, canvas_id: null, type: 'canvas', scope: 'document', revision: 0, order_key: 0, is_deleted: false, payload: JSON.stringify(canvasPayload) })
+            .values({ id: canvasId, owner_id: ownerId, canvas_id: null, type: 'canvas', scope: 'document', revision: 0, order_key: 0, is_deleted: false, status: opts.status ?? 'active', payload: JSON.stringify(canvasPayload) })
             .onConflict((oc) => oc.columns(['owner_id', 'type', 'id']).doNothing())
             .returningAll()
             .executeTakeFirst()
@@ -872,7 +880,7 @@ export class PgPersistBackend implements PersistBackend {
               await this.ensureCollectionLiveInTrx(trx, ownerId, canvasId)
               if (r.is_deleted) {
                 // F4:rowCount 定输赢(并发赢家已恢复→existing)。
-                const { metaRestored } = await this.restoreCanvasTreeInTrx(trx, ownerId, canvasId, { payload: canvasPayload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint })
+                const { metaRestored } = await this.restoreCanvasTreeInTrx(trx, ownerId, canvasId, { payload: canvasPayload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint, status: opts.status })
                 await this.ensureCollectionLiveInTrx(trx, ownerId, canvasId)
                 await this.setIdempotencyEntryInTrx(trx, ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, opts.bodyFingerprint ?? '', ownerId, 'canvas', canvasId)
                 const rec = await trx.selectFrom('persist_records').selectAll().where('owner_id', '=', ownerId).where('type', '=', 'canvas').where('id', '=', canvasId).executeTakeFirst()
@@ -1625,29 +1633,36 @@ export class PgPersistBackend implements PersistBackend {
 
   // ── 列表(返修 #6 ORDER BY orderKey;#8 枚举)──────────────────────────────────────────
 
-  async listByOwner(ownerId: string, type: PersistType, opts: { includeDeleted?: boolean } = {}): Promise<ListResult> {
+  async listByOwner(ownerId: string, type: PersistType, opts: { includeDeleted?: boolean; includeArchived?: boolean } = {}): Promise<ListResult> {
     await this.ready
-    const include = opts.includeDeleted ?? false
+    const includeDel = opts.includeDeleted ?? false
+    const includeArch = opts.includeArchived ?? false
     let q = this.db.selectFrom('persist_records').selectAll().where('owner_id', '=', ownerId).where('type', '=', type)
-    if (!include) q = q.where('is_deleted', '=', false)
+    if (!includeDel) q = q.where('is_deleted', '=', false)
+    // Phase 2 归档:默认排除 archived(回收站视图用 includeArchived=true 拉取);includeDel 时返全量(含 archived)。
+    if (!includeDel && !includeArch) q = q.where('status', '!=', 'archived')
     const rows = await q.orderBy('order_key', 'asc').orderBy('created_at', 'asc').execute()
     return { records: rows.map(rowToRecord) }
   }
 
-  async listByCanvas(ownerId: string, canvasId: string, type: PersistType, opts: { includeDeleted?: boolean } = {}): Promise<ListResult> {
+  async listByCanvas(ownerId: string, canvasId: string, type: PersistType, opts: { includeDeleted?: boolean; includeArchived?: boolean } = {}): Promise<ListResult> {
     await this.ready
-    const include = opts.includeDeleted ?? false
+    const includeDel = opts.includeDeleted ?? false
+    const includeArch = opts.includeArchived ?? false
     let q = this.db.selectFrom('persist_records').selectAll().where('owner_id', '=', ownerId).where('canvas_id', '=', canvasId).where('type', '=', type)
-    if (!include) q = q.where('is_deleted', '=', false)
+    if (!includeDel) q = q.where('is_deleted', '=', false)
+    if (!includeDel && !includeArch) q = q.where('status', '!=', 'archived')
     const rows = await q.orderBy('order_key', 'asc').orderBy('created_at', 'asc').execute()
     return { records: rows.map(rowToRecord) }
   }
 
-  async listCanvasByProject(ownerId: string, projectId: string, opts: { includeDeleted?: boolean } = {}): Promise<ListResult> {
+  async listCanvasByProject(ownerId: string, projectId: string, opts: { includeDeleted?: boolean; includeArchived?: boolean } = {}): Promise<ListResult> {
     await this.ready
-    const include = opts.includeDeleted ?? false
+    const includeDel = opts.includeDeleted ?? false
+    const includeArch = opts.includeArchived ?? false
     let q = this.db.selectFrom('persist_records').selectAll().where('owner_id', '=', ownerId).where('type', '=', 'canvas').where(sql`payload->>'projectId'`, '=', projectId)
-    if (!include) q = q.where('is_deleted', '=', false)
+    if (!includeDel) q = q.where('is_deleted', '=', false)
+    if (!includeDel && !includeArch) q = q.where('status', '!=', 'archived')
     const rows = await q.orderBy('order_key', 'asc').orderBy('created_at', 'asc').execute()
     return { records: rows.map(rowToRecord) }
   }
@@ -1697,9 +1712,10 @@ export class PgPersistBackend implements PersistBackend {
     return { count: res.count }
   }
 
-  /** 事务内:恢复 canvas 子树(canvas meta + chat-collection;原子,N2)。opts.payload 更新 canvas meta 域字段(保留 contentVersion)。返 { count, metaRestored, canvasIdxOwner }——metaRestored=F4 输赢判定;canvasIdxOwner=F2 post-commit cache 数据源(DB owner_id,未命中→undefined 调用方不碰缓存)。 */
-  private async restoreCanvasTreeInTrx(trx: Kysely<Database>, ownerId: string, canvasId: string, opts: { payload?: unknown; idempotencyKey?: string; fingerprint?: string } = {}): Promise<{ count: number; metaRestored: boolean; canvasIdxOwner?: string }> {
+  /** 事务内:恢复 canvas 子树(canvas meta + chat-collection;原子,N2)。opts.payload 更新 canvas meta 域字段(保留 contentVersion)。opts.status(D2)若提供则覆写 status 列(combineOps create(status:'archived')→restore 带归档),否则保留既有 status。返 { count, metaRestored, canvasIdxOwner }——metaRestored=F4 输赢判定;canvasIdxOwner=F2 post-commit cache 数据源(DB owner_id,未命中→undefined 调用方不碰缓存)。 */
+  private async restoreCanvasTreeInTrx(trx: Kysely<Database>, ownerId: string, canvasId: string, opts: { payload?: unknown; idempotencyKey?: string; fingerprint?: string; status?: RecordStatus } = {}): Promise<{ count: number; metaRestored: boolean; canvasIdxOwner?: string }> {
     const r = await trx.updateTable('persist_records').set({
+      ...(opts.status !== undefined ? { status: opts.status } : {}),
       payload: opts.payload !== undefined ? sql`jsonb_set(${JSON.stringify(opts.payload)}::jsonb, '{contentVersion}', COALESCE(payload->'contentVersion', '0'::jsonb), true)` : sql`payload`,
       is_deleted: false,
       revision: sql`revision + 1`,
@@ -1712,12 +1728,13 @@ export class PgPersistBackend implements PersistBackend {
     return { count, metaRestored: (r?.numUpdatedRows ?? 0n) > 0n, canvasIdxOwner: idx?.owner_id }
   }
 
-  /** 事务内:恢复 project 子树(project + 其 canvas meta + chat-collection;原子,N2)。返 { count, metaRestored, projIdxOwner, childIdxOwners }——F4 输赢 + F2/F5 cache 数据源(全 DB owner_id,未命中不进结果→调用方不碰缓存,无幽灵)。 */
-  private async restoreProjectTreeInTrx(trx: Kysely<Database>, ownerId: string, projectId: string, opts: { payload?: unknown; idempotencyKey?: string; fingerprint?: string } = {}): Promise<{ count: number; metaRestored: boolean; projIdxOwner?: string; childIdxOwners: { id: string; ownerId: string }[] }> {
+  /** 事务内:恢复 project 子树(project + 其 canvas meta + chat-collection;原子,N2)。opts.status(D2)同 restoreCanvasTreeInTrx。返 { count, metaRestored, projIdxOwner, childIdxOwners }——F4 输赢 + F2/F5 cache 数据源(全 DB owner_id,未命中不进结果→调用方不碰缓存,无幽灵)。 */
+  private async restoreProjectTreeInTrx(trx: Kysely<Database>, ownerId: string, projectId: string, opts: { payload?: unknown; idempotencyKey?: string; fingerprint?: string; status?: RecordStatus } = {}): Promise<{ count: number; metaRestored: boolean; projIdxOwner?: string; childIdxOwners: { id: string; ownerId: string }[] }> {
     // F5:先选定本 project 下 soft-deleted child canvas 集合(级联恢复前),供 canvases 瘦索引同步(与 persist_records canvas meta 恢复同集)。
     const childCv = await trx.selectFrom('persist_records').select(['id']).where('owner_id', '=', ownerId).where('type', '=', 'canvas').where(sql`payload->>'projectId'`, '=', projectId).where('is_deleted', '=', true).execute()
     const childIds = childCv.map((r) => r.id)
     const p = await trx.updateTable('persist_records').set({
+      ...(opts.status !== undefined ? { status: opts.status } : {}),
       payload: opts.payload !== undefined ? JSON.stringify(opts.payload) : sql`payload`,
       is_deleted: false,
       revision: sql`revision + 1`,
@@ -1750,6 +1767,84 @@ export class PgPersistBackend implements PersistBackend {
     // F2/F5:post-commit 仅当事务实际命中 durable 行(用 DB owner_id);child canvases 同步(与 persist_records 恢复同集)。0 行 → 不碰缓存(无幽灵)。
     if (res.projIdxOwner !== undefined) this.setIndexEntry('project', projectId, res.projIdxOwner, false)
     for (const c of res.childIdxOwners) this.setIndexEntry('canvas', c.id, c.ownerId, false)
+    return { count: res.count }
+  }
+
+  // ── Phase 2 归档(回收站):archive/unarchive tree 事务 ──────────────────────────────
+  // 镜像 softDelete*Tree / restore*TreeInTrx 的原子/级联/幂等模式,但用 status 列(D1)作归档标记(非 is_deleted)。
+  // archivedByCascade(D3)在 canvas meta payload 内布尔:archiveProjectTree 级联写 true,直接 archiveCanvasTree 写 false;
+  // unarchiveProjectTree 只恢复 archivedByCascade=true 的子画布(用户先前单独归档的不被强制恢复)。
+  // 彻底删除仍走 softDelete*Tree(is_deleted 终态);archive=软隐藏(可读/可恢复/子记录写返 409 archived,CR-6 write-guard)。
+  // 索引缓存(projectIndex/canvasIndex)只存 ownerId+isDeleted,归档不改 isDeleted → 缓存无需 mutation(返 durable owner 仅观测)。
+
+  /** 归档 canvas(直接):canvas meta status→archived + archivedByCascade→false;canvases 索引同步。幂等(已归档→0 行 no-op)。 */
+  async archiveCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number }> {
+    await this.ready
+    const res = await this.db.transaction().execute(async (trx) => {
+      // archivedByCascade→false:直接归档标记为非级联,unarchiveProjectTree 不会误恢复它(D3)。
+      const r = await trx.updateTable('persist_records')
+        .set({ status: 'archived', payload: sql`jsonb_set(payload, '{archivedByCascade}', 'false'::jsonb)`, revision: sql`revision + 1`, updated_at: new Date() })
+        .where('owner_id', '=', ownerId).where('type', '=', 'canvas').where('id', '=', canvasId)
+        .where('is_deleted', '=', false).where('status', '=', 'active').executeTakeFirst()
+      // D1:canvases 瘦索引 status 同步(owner-scoped + status='active' 幂等;未命中不报错)
+      await trx.updateTable('canvases').set({ status: 'archived', updated_at: new Date() })
+        .where('id', '=', canvasId).where('owner_id', '=', ownerId).where('is_deleted', '=', false).where('status', '=', 'active').execute()
+      return { count: Number((r?.numUpdatedRows ?? 0n) > 0n ? 1n : 0n) }
+    })
+    return { count: res.count }
+  }
+
+  /** 恢复 canvas(直接):canvas meta status→active + archivedByCascade→false;canvases 索引同步。幂等(已 active→0 行)。 */
+  async unarchiveCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number }> {
+    await this.ready
+    const res = await this.db.transaction().execute(async (trx) => {
+      const r = await trx.updateTable('persist_records')
+        .set({ status: 'active', payload: sql`jsonb_set(payload, '{archivedByCascade}', 'false'::jsonb)`, revision: sql`revision + 1`, updated_at: new Date() })
+        .where('owner_id', '=', ownerId).where('type', '=', 'canvas').where('id', '=', canvasId)
+        .where('is_deleted', '=', false).where('status', '=', 'archived').executeTakeFirst()
+      await trx.updateTable('canvases').set({ status: 'active', updated_at: new Date() })
+        .where('id', '=', canvasId).where('owner_id', '=', ownerId).where('is_deleted', '=', false).where('status', '=', 'archived').execute()
+      return { count: Number((r?.numUpdatedRows ?? 0n) > 0n ? 1n : 0n) }
+    })
+    return { count: res.count }
+  }
+
+  /** 归档 project 子树(级联):project meta status→archived + 其全部 active 子画布 status→archived + archivedByCascade→true;projects/canvases 索引同步。幂等。 */
+  async archiveProjectTree(ownerId: string, projectId: string): Promise<{ count: number }> {
+    await this.ready
+    const res = await this.db.transaction().execute(async (trx) => {
+      // F5:先选定本 project 下 active child canvas 集合(级联归档前),供 canvases 瘦索引同步(与 canvas meta 归档同集)。
+      const childCv = await trx.selectFrom('persist_records').select(['id']).where('owner_id', '=', ownerId).where('type', '=', 'canvas').where(sql`payload->>'projectId'`, '=', projectId).where('is_deleted', '=', false).where('status', '=', 'active').execute()
+      const childIds = childCv.map((r) => r.id)
+      const p = await trx.updateTable('persist_records').set({ status: 'archived', revision: sql`revision + 1`, updated_at: new Date() }).where('owner_id', '=', ownerId).where('type', '=', 'project').where('id', '=', projectId).where('is_deleted', '=', false).where('status', '=', 'active').executeTakeFirst()
+      // 其全部 active 子画布 → archived + archivedByCascade=true(D3:级联归档标记,unarchiveProjectTree 据此恢复)
+      const cv = childIds.length > 0
+        ? await trx.updateTable('persist_records').set({ status: 'archived', payload: sql`jsonb_set(payload, '{archivedByCascade}', 'true'::jsonb)`, revision: sql`revision + 1`, updated_at: new Date() }).where('owner_id', '=', ownerId).where('type', '=', 'canvas').where('id', 'in', childIds).where('is_deleted', '=', false).where('status', '=', 'active').executeTakeFirst()
+        : undefined
+      await trx.updateTable('projects').set({ status: 'archived', updated_at: new Date() }).where('id', '=', projectId).where('owner_id', '=', ownerId).where('is_deleted', '=', false).where('status', '=', 'active').execute()
+      if (childIds.length > 0) await trx.updateTable('canvases').set({ status: 'archived', updated_at: new Date() }).where('id', 'in', childIds).where('owner_id', '=', ownerId).where('is_deleted', '=', false).where('status', '=', 'active').execute()
+      const count = Number((p?.numUpdatedRows ?? 0n) > 0n ? 1n : 0n) + Number((cv?.numUpdatedRows ?? 0n) > 0n ? 1n : 0n)
+      return { count }
+    })
+    return { count: res.count }
+  }
+
+  /** 恢复 project 子树(级联):project meta status→active + 仅恢复 archivedByCascade=true 的子画布(D3:单独归档的不被强制恢复);清 archivedByCascade→false;索引同步。幂等。 */
+  async unarchiveProjectTree(ownerId: string, projectId: string): Promise<{ count: number }> {
+    await this.ready
+    const res = await this.db.transaction().execute(async (trx) => {
+      // F5:先选定 cascade-archived 子画布(status='archived' AND payload.archivedByCascade=true),供 canvases 索引同步(与恢复同集)。单独归档的(flag≠true)不入集 → 不被恢复。
+      const childCv = await trx.selectFrom('persist_records').select(['id']).where('owner_id', '=', ownerId).where('type', '=', 'canvas').where(sql`payload->>'projectId'`, '=', projectId).where('is_deleted', '=', false).where('status', '=', 'archived').where(sql`payload->>'archivedByCascade'`, '=', 'true').execute()
+      const childIds = childCv.map((r) => r.id)
+      const p = await trx.updateTable('persist_records').set({ status: 'active', revision: sql`revision + 1`, updated_at: new Date() }).where('owner_id', '=', ownerId).where('type', '=', 'project').where('id', '=', projectId).where('is_deleted', '=', false).where('status', '=', 'archived').executeTakeFirst()
+      const cv = childIds.length > 0
+        ? await trx.updateTable('persist_records').set({ status: 'active', payload: sql`jsonb_set(payload, '{archivedByCascade}', 'false'::jsonb)`, revision: sql`revision + 1`, updated_at: new Date() }).where('owner_id', '=', ownerId).where('type', '=', 'canvas').where('id', 'in', childIds).where('is_deleted', '=', false).where('status', '=', 'archived').executeTakeFirst()
+        : undefined
+      await trx.updateTable('projects').set({ status: 'active', updated_at: new Date() }).where('id', '=', projectId).where('owner_id', '=', ownerId).where('is_deleted', '=', false).where('status', '=', 'archived').execute()
+      if (childIds.length > 0) await trx.updateTable('canvases').set({ status: 'active', updated_at: new Date() }).where('id', 'in', childIds).where('owner_id', '=', ownerId).where('is_deleted', '=', false).where('status', '=', 'archived').execute()
+      const count = Number((p?.numUpdatedRows ?? 0n) > 0n ? 1n : 0n) + Number((cv?.numUpdatedRows ?? 0n) > 0n ? 1n : 0n)
+      return { count }
+    })
     return { count: res.count }
   }
 

@@ -38,6 +38,7 @@ import { encodeBase, decodeBase, encodeBundle, encodeOrderBase, type BundleEntry
 import { validateDomainOps, validateCreateBody, validateLegacyReplaceRequest, DomainOpError, type DomainOp, type LegacyReplaceRequest } from '../lib/domainOp'
 import { legacyDrainGate } from '../lib/legacyDrainGate'
 import type {
+  ArchivedBody,
   CanvasMeta,
   CanvasChildUpsertResponse,
   ConflictBody,
@@ -71,6 +72,8 @@ const toCanvasMeta = (r: PersistRecord): CanvasMeta => {
     updatedAt: r.updatedAt,
     metaRevision: r.revision,
     contentVersion: cp.contentVersion ?? 0,
+    // Phase 2 归档:status 仅在 archived 时显式输出(active 缺省,旧 client 无感;向后兼容)。
+    ...(r.status === 'archived' ? { status: 'archived' as const } : {}),
   }
 }
 
@@ -117,6 +120,11 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
     if (got.record.isDeleted && action !== 'manage') {
       return { ok: false, status: 404, body: { error: 'unknown-canvas' } satisfies UnknownResourceBody }
     }
+    // CR-6(Phase 2 归档 write-guard):archived canvas 的子记录写(write/move)→ 409 archived(客户端引导先恢复再编辑)。
+    // read/manage 放行:归档可读(回收站预览)、可恢复(archive/unarchive)、可彻底删除(DELETE manage)。
+    if (!got.record.isDeleted && got.record.status === 'archived' && (action === 'write' || action === 'move')) {
+      return { ok: false, status: 409, body: { error: 'archived', id: canvasId } satisfies ArchivedBody }
+    }
     const projectId = isCanvasPayload(got.record.payload) ? got.record.payload.projectId : ''
     const shareToken = shareTokenOf(c)
     let info: AuthzInfo
@@ -142,8 +150,8 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
 
   /** authzCanvas deny → Response(统一日志)。 */
   const denyCanvas = (c: Context<AppEnv>, requestId: string, t0: number, r: { ok: false; status: number; body: unknown }): Response => {
-    logRequest({ method: c.req.method, path: c.req.path, requestId, status: r.status, latencyMs: Date.now() - t0, note: r.status === 403 ? 'forbidden' : r.status === 410 ? 'gone' : 'unknown-canvas' })
-    return c.json(r.body as Record<string, unknown>, r.status as 400 | 403 | 404 | 410)
+    logRequest({ method: c.req.method, path: c.req.path, requestId, status: r.status, latencyMs: Date.now() - t0, note: r.status === 403 ? 'forbidden' : r.status === 410 ? 'gone' : r.status === 409 ? 'archived' : 'unknown-canvas' })
+    return c.json(r.body as Record<string, unknown>, r.status as 400 | 403 | 404 | 409 | 410)
   }
 
   /**
@@ -171,6 +179,7 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
     const bad = rejectInvalidMivoApiKey(c)
     if (bad) return badMivo(c, requestId, t0)
     const projectId = c.req.query('projectId')?.toString()
+    const includeArchived = c.req.query('includeArchived') === 'true'
     let records: PersistRecord[]
     if (projectId) {
       // T1.4:projectId 给定 → project read-authz(owner/member/share);授权后以 projectOwner 查 canvas。
@@ -192,19 +201,19 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
           info = { actor, ownerId: projectOwner.ownerId, memberRole }
         }
         records = canAccessProject(info, 'read') === 'allow'
-          ? (await backend.listCanvasByProject(projectOwner.ownerId, projectId)).records
+          ? (await backend.listCanvasByProject(projectOwner.ownerId, projectId, { includeArchived })).records
           : []
       }
     } else {
       // T1.4:无 projectId → owned canvases + shared-project canvases(§13.5 被分享后可见)
       const actor = resolveActor(c)
-      const owned = await backend.listByOwner(actor, 'canvas')
+      const owned = await backend.listByOwner(actor, 'canvas', { includeArchived })
       records = owned.records
       const shared = await permissions.listSharedProjects(actor)
       for (const { projectId: pid } of shared) {
         const po = backend.getProjectOwner(pid)
         if (!po) continue
-        const r = await backend.listCanvasByProject(po.ownerId, pid)
+        const r = await backend.listCanvasByProject(po.ownerId, pid, { includeArchived })
         records = records.concat(r.records)
       }
     }
@@ -330,6 +339,7 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
       resourceKind: 'canvas',
       idempotencyKey,
       bodyFingerprint: decoded.fingerprint,
+      status: reqBody.status,
     })
     // N4:同 idem key 不同 body → 422 reuse-conflict。
     if (result.kind === 'reuse-conflict') {
@@ -988,6 +998,55 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
     }
     logRequest({ method: c.req.method, path: c.req.path, requestId, status: 204, latencyMs: Date.now() - t0 })
     return c.body(null, 204)
+  })
+
+  // POST /api/canvas/:id/archive — Phase 2 归档(回收站)。owner-only(manage);archived canvas 子记录写返 409(CR-6)。
+  // 幂等:已归档→200 no-op。既有 DELETE 保留为"彻底删除"(is_deleted 软删终态)。
+  route.post('/:id/archive', async (c) => {
+    const requestId = newRequestId()
+    c.header('X-Request-Id', requestId)
+    const t0 = Date.now()
+    const bad = rejectInvalidMivoApiKey(c)
+    if (bad) return badMivo(c, requestId, t0)
+    const id = c.req.param('id')
+    const authz = await authzCanvas(c, id, 'manage')
+    if (!authz.ok) return denyCanvas(c, requestId, t0, authz)
+    if (authz.record.isDeleted) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
+      return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
+    }
+    const res = await backend.archiveCanvasTree(authz.ownerId, id)
+    const after = await backend.get(authz.ownerId, 'canvas', id)
+    if (after.kind !== 'found' || after.record.isDeleted) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
+      return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
+    }
+    logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0, note: res.count > 0 ? 'archived' : 'already-archived' })
+    return c.json(toCanvasMeta(after.record), 200)
+  })
+
+  // POST /api/canvas/:id/unarchive — 恢复归档画布(直接;status→active)。幂等:已 active→200 no-op。
+  route.post('/:id/unarchive', async (c) => {
+    const requestId = newRequestId()
+    c.header('X-Request-Id', requestId)
+    const t0 = Date.now()
+    const bad = rejectInvalidMivoApiKey(c)
+    if (bad) return badMivo(c, requestId, t0)
+    const id = c.req.param('id')
+    const authz = await authzCanvas(c, id, 'manage')
+    if (!authz.ok) return denyCanvas(c, requestId, t0, authz)
+    if (authz.record.isDeleted) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
+      return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
+    }
+    const res = await backend.unarchiveCanvasTree(authz.ownerId, id)
+    const after = await backend.get(authz.ownerId, 'canvas', id)
+    if (after.kind !== 'found' || after.record.isDeleted) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
+      return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
+    }
+    logRequest({ method: c.req.method, path: c.req.path, requestId, status: 200, latencyMs: Date.now() - t0, note: res.count > 0 ? 'unarchived' : 'already-active' })
+    return c.json(toCanvasMeta(after.record), 200)
   })
 
   return route

@@ -66,7 +66,9 @@ export const decodeCreateProject = (raw: unknown, fingerprint: string): DecodeRe
   const b = raw as Record<string, unknown>
   if (b.id !== undefined && typeof b.id !== 'string') return bad('id must be string')
   if (typeof b.name !== 'string' || b.name.trim() === '') return bad('name is required')
-  return { ok: true, value: { id: typeof b.id === 'string' ? b.id : undefined, name: b.name }, fingerprint }
+  // D2(Phase 2 归档):可选 status(combineOps create+archive→create(status:'archived'));非合法值 → 400。
+  if (b.status !== undefined && b.status !== 'active' && b.status !== 'archived') return bad('status must be active or archived')
+  return { ok: true, value: { id: typeof b.id === 'string' ? b.id : undefined, name: b.name, status: b.status === 'archived' ? 'archived' : undefined }, fingerprint }
 }
 
 /** POST /api/canvas body codec。 */
@@ -74,6 +76,7 @@ export const decodeCreateCanvas = (raw: unknown, fingerprint: string): DecodeRes
   if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return bad('invalid body')
   const b = raw as Record<string, unknown>
   if (typeof b.projectId !== 'string' || b.projectId.trim() === '') return bad('projectId is required')
+  if (b.status !== undefined && b.status !== 'active' && b.status !== 'archived') return bad('status must be active or archived')
   return {
     ok: true,
     value: {
@@ -81,6 +84,7 @@ export const decodeCreateCanvas = (raw: unknown, fingerprint: string): DecodeRes
       id: typeof b.id === 'string' ? b.id : undefined,
       title: typeof b.title === 'string' ? b.title : undefined,
       sourceTemplateId: typeof b.sourceTemplateId === 'string' ? b.sourceTemplateId : undefined,
+      status: b.status === 'archived' ? 'archived' : undefined,
     },
     fingerprint,
   }
