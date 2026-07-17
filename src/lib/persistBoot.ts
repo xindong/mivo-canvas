@@ -34,11 +34,12 @@ import { getPersistUserId } from './persistUserId'
 //   documentSlice);本模块负责 hydrate 过滤读取 + onOutcome DELETE success 清除 + enqueuePersistWrite create 撤销。
 import {
   revokeDeletionTombstone,
-  revokeCanvasTombstonesForProject,
+  revokeCanvasTombstonesForProjectStrict,
   getCanvasTombstoneIdsForProject,
   getPendingProjectDeletionRollbackIds,
   markProjectDeletionRollbackPending,
   clearDeletionTombstone,
+  clearDeletionTombstoneStrict,
   getDeletionTombstones,
 } from './deletionTombstones'
 import { fromRecord, edgeFromRecord } from '../kernel/mapping'
@@ -689,8 +690,9 @@ export const hydrateFromServer = async (
   for (const projectId of rollbackProjectIds) {
     try {
       const result = await reconcileActiveChildDeleteRejection(projectId, adapter)
-      await clearDeletionTombstone('project', projectId)
-      await revokeCanvasTombstonesForProject(projectId)
+      // project tombstone/rollbackPending 是最后的 durable commit token：child 全部严格清理成功后才消费。
+      await revokeCanvasTombstonesForProjectStrict(projectId)
+      await clearDeletionTombstoneStrict('project', projectId)
       debugLogger.warn(
         SOURCE,
         result.kind === 'authoritatively-deleted'
@@ -1200,13 +1202,16 @@ const reconcileActiveChildDeleteRejection = async (
     adapter.listCanvas(projectId, { includeArchived: true }),
   ])
   const project = projects.find((candidate) => candidate.id === projectId)
+  // listCanvas(projectId) 的 wire contract 已 project-scoped；仍在消费端防御过滤，避免畸形 adapter
+  // 把其他项目 child 误算成 pX 的 live child，阻止 authoritatively-deleted 收敛。
+  const projectCanvases = canvases.filter((candidate) => candidate.projectId === projectId)
   if (!project) {
     // 两个权威 GET 均成功且 project/children 同时为空，说明项目已被其他设备合法彻底删除
     // （或当前 actor 已不再可见）。此时本地乐观删除态就是正确终态，调用方可安全消费
     // rollback marker + project/cascade tombstone。project 缺失但仍有 child 则是不一致快照，
     // 必须保留 marker 等下轮重试，不能把潜在 live orphan 当成已删除。
-    if (canvases.length === 0) return { kind: 'authoritatively-deleted' }
-    throw new Error(`active-child reconcile missing project ${projectId} with ${canvases.length} live child canvas(es)`)
+    if (projectCanvases.length === 0) return { kind: 'authoritatively-deleted' }
+    throw new Error(`active-child reconcile missing project ${projectId} with ${projectCanvases.length} live child canvas(es)`)
   }
 
   const { useCanvasStore } = await import('../store/canvasStore')
@@ -1215,7 +1220,7 @@ const reconcileActiveChildDeleteRejection = async (
       ? state.projects.map((candidate) => candidate.id === projectId ? project : candidate)
       : [...state.projects, project]
     const nextCanvases = { ...state.canvases }
-    for (const meta of canvases) {
+    for (const meta of projectCanvases) {
       const existing = nextCanvases[meta.id]
       nextCanvases[meta.id] = existing
         ? {
@@ -1309,10 +1314,12 @@ export const startPersistWriteQueue = (
         // tombstone/报“已恢复”。任一 GET 失败则保留 tombstone 作为 durable retry credential,禁止假成功。
         const cascadeCanvasIds = await getCanvasTombstoneIdsForProject(op.projectId)
         await writeQueue?.cancelDeleteCanvases(cascadeCanvasIds, op.projectId)
+        // 先 durable 落 rollbackPending；即使随后崩溃或 child tombstone 中途清理失败，下轮 hydrate 仍有重试凭据。
+        await markProjectDeletionRollbackPending(op.projectId)
         try {
           const result = await reconcileActiveChildDeleteRejection(op.projectId, createFetchServerPersistAdapter(opts))
-          await clearDeletionTombstone('project', op.projectId)
-          await revokeCanvasTombstonesForProject(op.projectId)
+          await revokeCanvasTombstonesForProjectStrict(op.projectId)
+          await clearDeletionTombstoneStrict('project', op.projectId)
           if (result.kind === 'restored') {
             toastFeedback.warn('项目内还有活跃画布(可能来自其他设备),已恢复显示;请先归档或移动再彻底删除。')
             debugLogger.warn(
@@ -1326,7 +1333,6 @@ export const startPersistWriteQueue = (
             )
           }
         } catch (error) {
-          await markProjectDeletionRollbackPending(op.projectId)
           toastFeedback.warn('项目删除被阻止,但服务器状态恢复失败;已保留重试状态,请稍后重试。')
           debugLogger.warn(
             SOURCE,
