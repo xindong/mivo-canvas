@@ -688,10 +688,15 @@ export const hydrateFromServer = async (
   const rollbackProjectIds = await getPendingProjectDeletionRollbackIds()
   for (const projectId of rollbackProjectIds) {
     try {
-      await reconcileActiveChildDeleteRejection(projectId, adapter)
+      const result = await reconcileActiveChildDeleteRejection(projectId, adapter)
       await clearDeletionTombstone('project', projectId)
       await revokeCanvasTombstonesForProject(projectId)
-      debugLogger.warn(SOURCE, `hydrate retried active-child rollback for ${projectId}: authoritative reconcile succeeded, marker cleared`)
+      debugLogger.warn(
+        SOURCE,
+        result.kind === 'authoritatively-deleted'
+          ? `hydrate retried active-child rollback for ${projectId}: project and children authoritatively absent, marker cleared`
+          : `hydrate retried active-child rollback for ${projectId}: authoritative reconcile restored local state, marker cleared`,
+      )
     } catch (error) {
       debugLogger.warn(SOURCE, `hydrate retried active-child rollback for ${projectId}: still failed, marker retained: ${msg(error)}`)
     }
@@ -1182,16 +1187,27 @@ export const reconcileProjectCanvasStatus = async (
  * active-child 拒绝后的严格权威回灌。project 与该 project 的 canvas GET 必须同时成功才写 store；
  * 与通用 hydrate 不同,本 helper 不吞错,调用方据此决定是否清 tombstone/展示成功文案。
  */
+type ActiveChildDeleteReconcileResult =
+  | { kind: 'restored' }
+  | { kind: 'authoritatively-deleted' }
+
 const reconcileActiveChildDeleteRejection = async (
   projectId: string,
   adapter: ReturnType<typeof getServerPersistAdapter>,
-): Promise<void> => {
+): Promise<ActiveChildDeleteReconcileResult> => {
   const [{ projects }, { canvases }] = await Promise.all([
     adapter.listProjects({ includeArchived: true }),
     adapter.listCanvas(projectId, { includeArchived: true }),
   ])
   const project = projects.find((candidate) => candidate.id === projectId)
-  if (!project) throw new Error(`active-child reconcile missing project ${projectId}`)
+  if (!project) {
+    // 两个权威 GET 均成功且 project/children 同时为空，说明项目已被其他设备合法彻底删除
+    // （或当前 actor 已不再可见）。此时本地乐观删除态就是正确终态，调用方可安全消费
+    // rollback marker + project/cascade tombstone。project 缺失但仍有 child 则是不一致快照，
+    // 必须保留 marker 等下轮重试，不能把潜在 live orphan 当成已删除。
+    if (canvases.length === 0) return { kind: 'authoritatively-deleted' }
+    throw new Error(`active-child reconcile missing project ${projectId} with ${canvases.length} live child canvas(es)`)
+  }
 
   const { useCanvasStore } = await import('../store/canvasStore')
   useCanvasStore.setState((state) => {
@@ -1226,6 +1242,7 @@ const reconcileActiveChildDeleteRejection = async (
     }
     return { projects: nextProjects, canvases: nextCanvases }
   })
+  return { kind: 'restored' }
 }
 
 /**
@@ -1293,14 +1310,21 @@ export const startPersistWriteQueue = (
         const cascadeCanvasIds = await getCanvasTombstoneIdsForProject(op.projectId)
         await writeQueue?.cancelDeleteCanvases(cascadeCanvasIds, op.projectId)
         try {
-          await reconcileActiveChildDeleteRejection(op.projectId, createFetchServerPersistAdapter(opts))
+          const result = await reconcileActiveChildDeleteRejection(op.projectId, createFetchServerPersistAdapter(opts))
           await clearDeletionTombstone('project', op.projectId)
           await revokeCanvasTombstonesForProject(op.projectId)
-          toastFeedback.warn('项目内还有活跃画布(可能来自其他设备),已恢复显示;请先归档或移动再彻底删除。')
-          debugLogger.warn(
-            SOURCE,
-            `deleteProject ${op.projectId} rejected active-child → authoritative project+canvas reconciled, then tombstones revoked`,
-          )
+          if (result.kind === 'restored') {
+            toastFeedback.warn('项目内还有活跃画布(可能来自其他设备),已恢复显示;请先归档或移动再彻底删除。')
+            debugLogger.warn(
+              SOURCE,
+              `deleteProject ${op.projectId} rejected active-child → authoritative project+canvas reconciled, then tombstones revoked`,
+            )
+          } else {
+            debugLogger.warn(
+              SOURCE,
+              `deleteProject ${op.projectId} rejected active-child but subsequent authoritative reads found project+children absent → local deletion retained, tombstones revoked`,
+            )
+          }
         } catch (error) {
           await markProjectDeletionRollbackPending(op.projectId)
           toastFeedback.warn('项目删除被阻止,但服务器状态恢复失败;已保留重试状态,请稍后重试。')

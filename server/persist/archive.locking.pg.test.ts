@@ -1,13 +1,15 @@
 // PR #276 P1 并发锁序 barrier。真 PG 多连接,所有“被阻塞”断言均轮询 pg_stat_activity 的
 // wait_event_type='Lock' rendezvous；禁止用固定 40ms 未 settle 充当并发证据。
 // gate:MIVO_PG_TEST=1；CI pg-suite 白名单必跑,本地默认 55443。
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
+import { randomUUID } from 'node:crypto'
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Pool } from 'pg'
 import { PgPersistBackend } from './pgBackend'
 
 const ENABLED = process.env.MIVO_PG_TEST === '1'
-const BACKEND_APP = 'mivo_archive_locking_backend'
-const BARRIER_APP = 'mivo_archive_locking_barrier'
+const RUN_TOKEN = randomUUID().slice(0, 12)
+const BACKEND_APP = `mivo_archive_backend_${RUN_TOKEN}`
+const BARRIER_APP = `mivo_archive_barrier_${RUN_TOKEN}`
 const cfg = {
   host: process.env.MIVO_PG_HOST || '127.0.0.1',
   port: Number(process.env.MIVO_PG_PORT || 55443),
@@ -17,6 +19,15 @@ const cfg = {
 }
 
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+// rendezvous 最长 12s，文件级 runner timeout 必须覆盖 helper + blocker 释放/后置断言。
+vi.setConfig({ testTimeout: 20_000 })
+
+/** 立即挂 rejection handler 防 rendezvous 轮询期间 backend 提前失败产生 unhandled；原 promise 仍供断言。 */
+const observeBackendPromise = <T>(promise: Promise<T>): Promise<T> => {
+  void promise.catch(() => undefined)
+  return promise
+}
 
 /** 真 rendezvous：只在 backend application_name 的会话进入 PG Lock wait 后才放开 raw 事务。 */
 const waitForBackendLock = async (observer: Pool, label: string, timeoutMs = 12_000): Promise<void> => {
@@ -101,6 +112,7 @@ const projectRow = async (pool: Pool, id: string) => (await pool.query<{
   it('create 持 parent 锁暂停 → archive 等待后读取提交后的 child 集；无死锁且不留 archived-project 下 active child', async () => {
     await setup(backend)
     const writer = await pool.connect()
+    let startedBackendOperation: Promise<unknown> | undefined
     try {
       await writer.query('BEGIN')
       await writer.query("SELECT id FROM projects WHERE id='p1' FOR UPDATE")
@@ -108,13 +120,15 @@ const projectRow = async (pool: Pool, id: string) => (await pool.query<{
       await writer.query(`INSERT INTO persist_records(id,owner_id,canvas_id,type,scope,revision,order_key,is_deleted,status,payload)
         VALUES('c-new','o',NULL,'canvas','document',0,0,false,'active',$1::jsonb)`, [JSON.stringify({ projectId: 'p1', title: 'new' })])
 
-      const archive = backend.archiveProjectTree('o', 'p1')
+      const archive = observeBackendPromise(backend.archiveProjectTree('o', 'p1'))
+      startedBackendOperation = archive
       await waitForBackendLock(pool, 'create → archive')
       await writer.query('COMMIT')
       await expect(within(archive)).resolves.toMatchObject({ count: expect.any(Number) })
       expect(await canvasRow(pool, 'c-new')).toMatchObject({ status: 'archived', is_deleted: false, project_id: 'p1' })
     } finally {
       await writer.query('ROLLBACK').catch(() => undefined)
+      await startedBackendOperation?.catch(() => undefined)
       writer.release()
     }
   })
@@ -123,6 +137,7 @@ const projectRow = async (pool: Pool, id: string) => (await pool.query<{
     await setup(backend, ['p1', 'p2'])
     await addCanvas(backend, 'c-move', 'p2')
     const writer = await pool.connect()
+    let startedBackendOperation: Promise<unknown> | undefined
     try {
       await writer.query('BEGIN')
       await writer.query("SELECT id FROM projects WHERE id='p1' FOR UPDATE")
@@ -130,13 +145,15 @@ const projectRow = async (pool: Pool, id: string) => (await pool.query<{
         SET payload=jsonb_set(payload,'{projectId}',to_jsonb('p1'::text)), revision=revision+1
         WHERE owner_id='o' AND type='canvas' AND id='c-move'`)
 
-      const archive = backend.archiveProjectTree('o', 'p1')
+      const archive = observeBackendPromise(backend.archiveProjectTree('o', 'p1'))
+      startedBackendOperation = archive
       await waitForBackendLock(pool, 'move → archive project')
       await writer.query('COMMIT')
       await within(archive)
       expect(await canvasRow(pool, 'c-move')).toMatchObject({ status: 'archived', is_deleted: false, project_id: 'p1' })
     } finally {
       await writer.query('ROLLBACK').catch(() => undefined)
+      await startedBackendOperation?.catch(() => undefined)
       writer.release()
     }
   })
@@ -146,19 +163,22 @@ const projectRow = async (pool: Pool, id: string) => (await pool.query<{
     await addCanvas(backend, 'c1', 'p1')
     await backend.archiveProjectTree('o', 'p1')
     const unarchiver = await pool.connect()
+    let startedBackendOperation: Promise<unknown> | undefined
     try {
       await unarchiver.query('BEGIN')
       await unarchiver.query("SELECT id FROM projects WHERE id='p1' FOR UPDATE")
       await unarchiver.query("UPDATE persist_records SET status='active', payload=jsonb_set(payload,'{archivedByCascade}','false'::jsonb) WHERE owner_id='o' AND type='canvas' AND id='c1'")
       await unarchiver.query("UPDATE canvases SET status='active' WHERE id='c1' AND owner_id='o'")
 
-      const deleting = backend.softDeleteProjectTree('o', 'p1')
+      const deleting = observeBackendPromise(backend.softDeleteProjectTree('o', 'p1'))
+      startedBackendOperation = deleting
       await waitForBackendLock(pool, 'unarchive → softDelete')
       await unarchiver.query('COMMIT')
       await expect(within(deleting)).resolves.toEqual({ count: 0, blocked: 'active-child' })
       expect(await canvasRow(pool, 'c1')).toMatchObject({ status: 'active', is_deleted: false })
     } finally {
       await unarchiver.query('ROLLBACK').catch(() => undefined)
+      await startedBackendOperation?.catch(() => undefined)
       unarchiver.release()
     }
   })
@@ -168,13 +188,15 @@ const projectRow = async (pool: Pool, id: string) => (await pool.query<{
     await addCanvas(backend, 'c1', 'p1')
     await backend.archiveProjectTree('o', 'p1')
     const deleting = await pool.connect()
+    let startedBackendOperation: Promise<unknown> | undefined
     try {
       await deleting.query('BEGIN')
       await deleting.query("SELECT id FROM projects WHERE id='p1' FOR UPDATE")
       await deleting.query("SELECT id FROM persist_records WHERE owner_id='o' AND type='project' AND id='p1' FOR UPDATE")
       await deleting.query("SELECT id FROM persist_records WHERE owner_id='o' AND type='canvas' AND payload->>'projectId'='p1' AND is_deleted=false ORDER BY id FOR UPDATE")
 
-      const unarchive = backend.unarchiveCanvasTree('o', 'c1')
+      const unarchive = observeBackendPromise(backend.unarchiveCanvasTree('o', 'c1'))
+      startedBackendOperation = unarchive
       await waitForBackendLock(pool, 'softDelete → direct unarchive')
       await deleting.query("UPDATE persist_records SET is_deleted=true WHERE owner_id='o' AND type IN ('project','canvas') AND (id='p1' OR id='c1')")
       await deleting.query("UPDATE projects SET is_deleted=true WHERE id='p1' AND owner_id='o'")
@@ -185,6 +207,7 @@ const projectRow = async (pool: Pool, id: string) => (await pool.query<{
       expect(await canvasRow(pool, 'c1')).toMatchObject({ status: 'archived', is_deleted: true })
     } finally {
       await deleting.query('ROLLBACK').catch(() => undefined)
+      await startedBackendOperation?.catch(() => undefined)
       deleting.release()
     }
   })
@@ -196,10 +219,12 @@ const projectRow = async (pool: Pool, id: string) => (await pool.query<{
     await setup(backend)
     await backend.softDeleteProjectTree('o', 'p1')
     const writer = await pool.connect()
+    let startedBackendOperation: Promise<unknown> | undefined
     try {
       await writer.query('BEGIN')
       await writer.query("SELECT id FROM projects WHERE id='p1' FOR UPDATE")
-      const restoring = startRestore()
+      const restoring = observeBackendPromise(startRestore())
+      startedBackendOperation = restoring
       await waitForBackendLock(pool, label)
       // 镜像 archive/softDelete 的 projects-first 临界区：持 projects 后再写 project meta。
       // 若 restore 仍先持 meta 再等 projects,此 UPDATE 与 restore 构成真 40P01 锁环。
@@ -215,6 +240,7 @@ const projectRow = async (pool: Pool, id: string) => (await pool.query<{
       })
     } finally {
       await writer.query('ROLLBACK').catch(() => undefined)
+      await startedBackendOperation?.catch(() => undefined)
       writer.release()
     }
   }
@@ -245,12 +271,14 @@ const projectRow = async (pool: Pool, id: string) => (await pool.query<{
     await addCanvas(backend, 'c-parent-move', 'parent-a')
     if (target === 'unarchive') await backend.archiveCanvasTree('o', 'c-parent-move')
     const blocker = await pool.connect()
+    let startedBackendOperation: Promise<unknown> | undefined
     try {
       await blocker.query('BEGIN')
       await blocker.query("SELECT id FROM projects WHERE id='parent-a' FOR UPDATE")
-      const mutation = target === 'archive'
+      const mutation = observeBackendPromise(target === 'archive'
         ? backend.archiveCanvasTree('o', 'c-parent-move')
-        : backend.unarchiveCanvasTree('o', 'c-parent-move')
+        : backend.unarchiveCanvasTree('o', 'c-parent-move'))
+      startedBackendOperation = mutation
       await waitForBackendLock(pool, `parent-a→parent-b move × ${target}`)
 
       const current = await backend.get('o', 'canvas', 'c-parent-move')
@@ -276,6 +304,7 @@ const projectRow = async (pool: Pool, id: string) => (await pool.query<{
       })
     } finally {
       await blocker.query('ROLLBACK').catch(() => undefined)
+      await startedBackendOperation?.catch(() => undefined)
       blocker.release()
     }
   }
@@ -292,11 +321,13 @@ const projectRow = async (pool: Pool, id: string) => (await pool.query<{
     await setup(backend, ['parent-b'])
     await backend.ensureCreate('o', 'canvas', 'c-standalone', { title: 'standalone' }, { method: 'POST', resourceKind: 'canvas' })
     const mover = await pool.connect()
+    let startedBackendOperation: Promise<unknown> | undefined
     try {
       await mover.query('BEGIN')
       await mover.query("SELECT id FROM projects WHERE id='parent-b' FOR UPDATE")
       await mover.query("SELECT id FROM persist_records WHERE owner_id='o' AND type='canvas' AND id='c-standalone' FOR UPDATE")
-      const archive = backend.archiveCanvasTree('o', 'c-standalone')
+      const archive = observeBackendPromise(backend.archiveCanvasTree('o', 'c-standalone'))
+      startedBackendOperation = archive
       await waitForBackendLock(pool, 'standalone→parent move × archive')
       await mover.query(`UPDATE persist_records
         SET payload=jsonb_set(payload,'{projectId}',to_jsonb('parent-b'::text)), revision=revision+1
@@ -311,6 +342,7 @@ const projectRow = async (pool: Pool, id: string) => (await pool.query<{
       })
     } finally {
       await mover.query('ROLLBACK').catch(() => undefined)
+      await startedBackendOperation?.catch(() => undefined)
       mover.release()
     }
   })

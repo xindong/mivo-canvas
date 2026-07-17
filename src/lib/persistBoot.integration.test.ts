@@ -68,6 +68,7 @@ import {
   recordDeletionTombstone,
   getDeletionTombstones,
   getPendingProjectDeletionRollbackIds,
+  markProjectDeletionRollbackPending,
 } from './deletionTombstones'
 import type { ServerPersistAdapter } from './serverPersistAdapter'
 import type { Project, CanvasMeta } from '../../shared/persist-contract.ts'
@@ -2337,6 +2338,75 @@ describe('Phase 1 项4 — 持久 tombstone 全生命周期(DELETE 离队后接�
     expect(await getPendingProjectDeletionRollbackIds()).toContain('pX')
     expect(warn).not.toHaveBeenCalledWith('项目内还有活跃画布(可能来自其他设备),已恢复显示;请先归档或移动再彻底删除。')
     warn.mockRestore()
+  })
+
+  const seedRollbackPendingDeletion = async (): Promise<void> => {
+    await recordDeletionTombstone('project', 'pX')
+    await recordDeletionTombstone('canvas', 'cX', { parentProjectId: 'pX' })
+    await markProjectDeletionRollbackPending('pX')
+    resetStoreProjects([])
+    useCanvasStore.setState({ canvases: {}, sceneId: '' as never })
+  }
+
+  it('P2:rollbackPending + project/canvas 权威均空 → 消费 marker 与级联 tombstone；第二次 hydrate 不再专用 reconcile', async () => {
+    localStorage.setItem('mivo:server-migration:anonymous', 'done')
+    await seedRollbackPendingDeletion()
+    let projectReads = 0
+    let canvasReads = 0
+    const emptyAdapter = {
+      listProjects: async () => {
+        projectReads++
+        return { projects: [] }
+      },
+      listCanvas: async () => {
+        canvasReads++
+        return { canvases: [] }
+      },
+      listChatMessages: async () => ({ messages: [], orderRevision: 0 }),
+    } as unknown as ServerPersistAdapter
+
+    await hydrateFromServer(emptyAdapter, hydrateOpts)
+    expect(useCanvasStore.getState().projects.some((p) => p.id === 'pX')).toBe(false)
+    expect(useCanvasStore.getState().canvases.cX).toBeUndefined()
+    expect(await getPendingProjectDeletionRollbackIds()).not.toContain('pX')
+    expect((await getDeletionTombstones('project')).has('pX')).toBe(false)
+    expect((await getDeletionTombstones('canvas')).has('cX')).toBe(false)
+    expect({ projectReads, canvasReads }).toEqual({ projectReads: 2, canvasReads: 2 })
+
+    await hydrateFromServer(emptyAdapter, hydrateOpts)
+    // 第二轮只剩普通 hydrate 的 project/canvas 各一次；若 marker 未消费会各再多一次专用 reconcile。
+    expect({ projectReads, canvasReads }).toEqual({ projectReads: 3, canvasReads: 3 })
+  })
+
+  it('P2:rollbackPending 权威 GET 失败 → marker 与双 tombstone 保留', async () => {
+    localStorage.setItem('mivo:server-migration:anonymous', 'done')
+    await seedRollbackPendingDeletion()
+    const failingAdapter = {
+      listProjects: async () => { throw new Error('projects unavailable') },
+      listCanvas: async () => ({ canvases: [] }),
+      listChatMessages: async () => ({ messages: [], orderRevision: 0 }),
+    } as unknown as ServerPersistAdapter
+
+    await hydrateFromServer(failingAdapter, hydrateOpts)
+    expect(await getPendingProjectDeletionRollbackIds()).toContain('pX')
+    expect((await getDeletionTombstones('project')).has('pX')).toBe(true)
+    expect((await getDeletionTombstones('canvas')).has('cX')).toBe(true)
+  })
+
+  it('P2:rollbackPending project 缺失但权威仍有 child → 不消费 marker/tombstone', async () => {
+    localStorage.setItem('mivo:server-migration:anonymous', 'done')
+    await seedRollbackPendingDeletion()
+    const inconsistentAdapter = adapter([], [{
+      id: 'cX', projectId: 'pX', title: 'still live', createdAt: 't', updatedAt: 't',
+      metaRevision: 1, contentVersion: 0, status: 'active',
+    }])
+
+    await hydrateFromServer(inconsistentAdapter, hydrateOpts)
+    expect(useCanvasStore.getState().projects.some((p) => p.id === 'pX')).toBe(false)
+    expect(useCanvasStore.getState().canvases.cX).toBeUndefined()
+    expect(await getPendingProjectDeletionRollbackIds()).toContain('pX')
+    expect((await getDeletionTombstones('project')).has('pX')).toBe(true)
+    expect((await getDeletionTombstones('canvas')).has('cX')).toBe(true)
   })
 
   // 项4-A: tombstone 单独过滤(无 pending-delete,DELETE 离队后 tombstone 接力挡复活)
