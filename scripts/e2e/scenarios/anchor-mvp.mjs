@@ -31,7 +31,19 @@ const resolveCanvasStoreSpec = async (page) => {
 }
 
 export const runAnchorMvpScenario = async (context) => {
-  const { baseUrl, page, generatedImageB64, rendererMode } = context
+  const { baseUrl, page, generatedImageB64, rendererMode, isProdTopology } = context
+
+  // C12(AnchorOverlay.tsx:143):__setSelectedAnchorId / __anchorGenerate 两个 dev hook 被
+  // `if (!import.meta.env.DEV) return` 门控,prod build 不暴露(设计意图:prod 不得暴露 hook)。
+  // 本场景 ②③④⑤⑥(select/instruction panel/generate/prompt 捕获/snapshot roundtrip)全靠这俩
+  // dev hook 驱动 → prod 下 hook 缺失 → setter/fn 为 undefined → anchor 未选 → instruction panel
+  // 不渲染 → [data-testid="anchor-instruction-input"] 超时(nightly-e2e 全扫红灯,在 migration
+  // 之后故此前未跑达)。prod 显式 skip 全场景(遵 mask-multi-edit:377 既有 dev-only 机制守卫范式
+  // + development-logging 哲学:不静默跳);dev 拓扑全跑六断言不变。
+  if (isProdTopology) {
+    console.log('[anchor-mvp] prod: scenario skipped (dev-only window hooks __setSelectedAnchorId/__anchorGenerate gated by import.meta.env.DEV per C12 — not exposed in prod build); all six assertions run in dev topology')
+    return
+  }
 
   const spec = await resolveCanvasStoreSpec(page)
 

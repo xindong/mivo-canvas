@@ -16,6 +16,15 @@ export const runMigrationScenario = async (context) => {
     if (isProdTopology) {
       await installE2EStoreBridge(migrationContext)
     }
+    // mainfix R3 把 __MIVO_E2E_ENABLED__ flag 从 installE2EStoreBridge 挪到 createSmokePage
+    // (harness.mjs:599-601),让 main.tsx 在两拓扑都填 window.__MIVO_E2E__。本场景用
+    // browser.newContext 自建上下文(line 19 注释:bypasses createSmokePage),flag 漏设 →
+    // main.tsx 不填 bridge global → chatStore bridge module 抛 'Missing E2E store bridge:
+    // useChatStore'(nightly-e2e 红灯 run 29598669120)。此处补 flag,与 createSmokePage 同源;
+    // bridge 路由拦截已在 installE2EStoreBridge 装好,evaluate 动态 import chatStore.ts 在 prod
+    // 走 bridge module(读 globalThis.__MIVO_E2E__.useChatStore)、dev 走 Vite 真模块——两拓扑
+    // 都能验证 v1→v2 迁移(prod-relevant,不可 skip)。
+    await migrationContext.addInitScript(() => { window.__MIVO_E2E_ENABLED__ = true })
     // feat/auth-sso: this custom context bypasses createSmokePage, so the harness's
     // default AutoPrompt suppression doesn't apply. Dev stub → logged-in + no keys →
     // AutoPrompt would auto-open the settings panel + intercept clicks. Suppress here.

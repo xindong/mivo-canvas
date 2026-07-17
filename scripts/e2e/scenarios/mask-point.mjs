@@ -85,7 +85,14 @@ const fillMaskPrompt = async (page, text) => {
 
 // #154 锚点草稿:浮层关闭(X)记住锚点,同图重进恢复 → 多段 region 累积。
 // 受影响段(FIX-3 dblclick 用同 imageId)开浮层前清 draft,使 region=0(钉 #154"不落 point")。
-const clearMaskDraft = async (page, nodeId) => {
+// clearMaskEditDraft 经 /src/canvas/maskEditDraftStore.ts 动态 import,仅 dev 有 Vite /src/,
+// prod 必 404 → TypeError。prod skip(独立 scenario 进程=fresh context;FIX-3 region=0 断言同步
+// skip,见下方 isProdTopology 守卫;armed/disarm 断言两拓扑照常跑)。
+const clearMaskDraft = async (page, nodeId, isProdTopology) => {
+  if (isProdTopology) {
+    console.log('[mask-point] prod: clearMaskDraft skipped (dev-only /src/canvas/maskEditDraftStore.ts import — not in prod bridge)')
+    return
+  }
   await page.evaluate(async (id) => {
     const { clearMaskEditDraft } = await import('/src/canvas/maskEditDraftStore.ts')
     clearMaskEditDraft(id)
@@ -93,20 +100,29 @@ const clearMaskDraft = async (page, nodeId) => {
 }
 
 export const runMaskPointScenario = async (context) => {
-  const { page, canvasStoreSpec, generatedImageB64, rendererMode } = context
+  const { page, canvasStoreSpec, generatedImageB64, rendererMode, isProdTopology } = context
   const leaferMode = rendererMode === 'leafer'
   const spec = await canvasStoreSpec()
 
   const dockMaskButton = page.locator('.canvas-tool-dock').getByRole('button', { name: '局部重绘' })
 
   // P2 — no selected image and no image on canvas: dock entry stays enabled, warns, and does not arm.
+  // createCanvas/selectNode 经 canvasStore bridge(两拓扑都可);clearToasts 走 /src/store/toastStore.ts
+  // 动态 import,仅 dev 有 Vite /src/,prod 必 404 → TypeError(nightly-e2e 红灯)。prod skip
+  // clearToasts(独立 scenario 进程 = fresh context,无 stale toast,P2 DOM warning 断言照常跑)。
   await page.evaluate(async (moduleSpec) => {
     const { useCanvasStore } = await import(moduleSpec)
-    const { useToastStore } = await import('/src/store/toastStore.ts')
     useCanvasStore.getState().createCanvas('E2E Mask Point Empty')
     useCanvasStore.getState().selectNode(undefined)
-    useToastStore.getState().clearToasts()
   }, spec)
+  if (isProdTopology) {
+    console.log('[mask-point] prod: clearToasts skipped (dev-only /src/store/toastStore.ts import — not in prod bridge; fresh context has no stale toasts), P2 DOM warning assertion still runs')
+  } else {
+    await page.evaluate(async () => {
+      const { useToastStore } = await import('/src/store/toastStore.ts')
+      useToastStore.getState().clearToasts()
+    })
+  }
   await dockMaskButton.click()
   await page.waitForFunction(() => {
     const armed = document.querySelector('.canvas-shell')?.classList.contains('mask-armed')
@@ -243,7 +259,7 @@ export const runMaskPointScenario = async (context) => {
   // 落 point)被 #154 移除(commit message「首击不再强制落点选锚点」)。改为钉 #154 后
   // 行为:armed dblclick → 开浮层 + disarm + 选图 + 不落 point(region=0)。
   // #154 锚点草稿同图恢复会累积 region,开浮层前清 imageId draft 使 region=0。
-  await clearMaskDraft(page, imageId)
+  await clearMaskDraft(page, imageId, isProdTopology)
   await dockMaskButton.click()
   await page.waitForFunction(() => document.querySelector('.canvas-shell')?.classList.contains('mask-armed'))
   await page.mouse.dblclick(nodeBox.x + nodeBox.width * 0.5, nodeBox.y + nodeBox.height * 0.5)
@@ -259,7 +275,7 @@ export const runMaskPointScenario = async (context) => {
   if (fastDoubleClickState.armed || fastDoubleClickState.detailsOpen) {
     throw new Error(`FIX-3(#154): armed dblclick 应 disarm + 无 details dialog, got ${JSON.stringify(fastDoubleClickState)}`)
   }
-  if (fastDoubleClickState.region !== 0 || fastDoubleClickState.mask !== 0 || fastDoubleClickState.point !== 0) {
+  if (!isProdTopology && (fastDoubleClickState.region !== 0 || fastDoubleClickState.mask !== 0 || fastDoubleClickState.point !== 0)) {
     throw new Error(`FIX-3(#154): armed dblclick 不应落 point/region(首击只开浮层), got ${JSON.stringify(fastDoubleClickState)}`)
   }
   await cancelMaskEdit(page)
@@ -268,7 +284,7 @@ export const runMaskPointScenario = async (context) => {
   // FIX-3(#154 重写):原"armed slow dblclick 落 1 region + 第二击不重复"前提(armed 首击
   // 落 point)被 #154 移除。改为钉 #154:armed click → 开浮层 + 不落 point(region=0)。
   // 第二击在浮层已开后(armed 已 disarm),不落 armed point。清 draft 使 region=0。
-  await clearMaskDraft(page, imageId)
+  await clearMaskDraft(page, imageId, isProdTopology)
   await dockMaskButton.click()
   await page.waitForFunction(() => document.querySelector('.canvas-shell')?.classList.contains('mask-armed'))
   await page.mouse.click(nodeBox.x + nodeBox.width * 0.5, nodeBox.y + nodeBox.height * 0.5)
@@ -277,7 +293,7 @@ export const runMaskPointScenario = async (context) => {
   await page.mouse.click(nodeBox.x + nodeBox.width * 0.5, nodeBox.y + nodeBox.height * 0.5)
   await page.waitForTimeout(120)
   const slowDoubleClickCounts = await regionCounts(page)
-  if (slowDoubleClickCounts.region !== 0 || slowDoubleClickCounts.mask !== 0 || slowDoubleClickCounts.point !== 0) {
+  if (!isProdTopology && (slowDoubleClickCounts.region !== 0 || slowDoubleClickCounts.mask !== 0 || slowDoubleClickCounts.point !== 0)) {
     throw new Error(`FIX-3(#154): armed slow dblclick 不应落 point/region(首击只开浮层,第二击不重复落), got ${JSON.stringify(slowDoubleClickCounts)}`)
   }
   await cancelMaskEdit(page)
@@ -443,7 +459,9 @@ export const runMaskPointScenario = async (context) => {
   // cleanup(ImageMaskEditOverlay.tsx:548-573)在 !stillExists 时 clearMaskEditDraft;若该
   // 清理路径回归成 saveMaskEditDraft 残留上方构造的 region,本断言会红。手动 poll 等被动
   // effect cleanup(useEffect cleanup 在 DOM detach 后异步执行)跑完,再断言空仓。
-  {
+  if (isProdTopology) {
+    console.log('[mask-point] prod: FIX-2 draft-empty regression assertion skipped (dev-only /src/canvas/maskEditDraftStore.ts import — not in prod bridge); delete-survivor DOM assertions still run')
+  } else {
     const deadline = Date.now() + 2000
     let draft = null
     while (Date.now() < deadline) {

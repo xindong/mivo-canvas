@@ -114,7 +114,7 @@ const countPngAlphaLt255 = (base64) => {
 }
 
 export const runMaskBlackblockScenario = async (context) => {
-  const { page, canvasStoreSpec, chatStoreSpec, rendererMode } = context
+  const { page, canvasStoreSpec, chatStoreSpec, rendererMode, isProdTopology } = context
   const spec = await canvasStoreSpec()
 
   // ── 浏览器侧合成测试图（raw b64，无 data: 前缀 —— 检测器 atob 直接可解） ──
@@ -480,6 +480,16 @@ export const runMaskBlackblockScenario = async (context) => {
       }
       console.log(`[mask-blackblock] BB-3 iteration ${iteration}: submitted image ${alphaStats.width}x${alphaStats.height} alphaLt255=${alphaStats.alphaLt255}`)
 
+      // ②③结果无黑块/落库像素断言依赖浏览器侧动态 import /src/lib/maskResultInspection.ts +
+      // /src/lib/assetStorage.ts(经 assertCommittedResultHasNoBlackComponents),仅 dev 拓扑有
+      // Vite 服务 /src/;prod 拓扑只服务 dist/ build 产物且两模块因无 app 引用被 tree-shake
+      // 出 prod bundle,/src 路径必 404 → 动态 import 抛 TypeError(nightly-e2e 红灯 即此)。
+      // prod 显式 skip ②③像素断言(遵 mask-multi-edit:377 既有 /src-import 守卫范式 +
+      // development-logging 哲学:不静默跳);①源归一断言(countPngAlphaLt255,Node 侧)不减,
+      // BB-3 迭代提交/落库行为仍由 ① + 上游 /tasks/edit 请求校验覆盖。
+      if (isProdTopology) {
+        console.log(`[mask-blackblock] BB-3 iteration ${iteration}: prod skip ②③ pixel inspection (dev-only /src import of maskResultInspection/assetStorage — not in prod bundle); ① source-normalization assertion still passed`)
+      } else {
       // ②结果无黑块断言：返回图全图跑 inspectMaskResultForBlackArtifacts（source=本次提交源图）。
       const inspection = await page.evaluate(async ({ resultB64, sourceBase64, sourceWidth, sourceHeight }) => {
         const { inspectMaskResultForBlackArtifacts } = await import('/src/lib/maskResultInspection.ts')
@@ -498,6 +508,7 @@ export const runMaskBlackblockScenario = async (context) => {
       // ③落库断言：本轮 resultNodeIds[0] 的存储资产无大黑连通域（黑盘不得进画布）。
       const committed = await assertCommittedResultHasNoBlackComponents(lastState.resultNodeIds[0], `BB-3 iteration ${iteration}`)
       console.log(`[mask-blackblock] BB-3 iteration ${iteration}: committed asset ${committed.width}x${committed.height} blackComponents=${committed.components}`)
+      }
     }
   }
 }
