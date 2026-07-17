@@ -1,6 +1,32 @@
 import { defineConfig, loadEnv, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { execFileSync } from 'node:child_process'
+
+// Build-time app version injected as import.meta.env.VITE_MIVO_VERSION
+// (consumed by src/store/remoteDebugReporter.ts for debug-log appVersion).
+// Format: <git short sha>-<yyyymmdd>. Falls back to VITE_MIVO_VERSION from
+// the environment, then 'dev', so builds outside a git checkout still work.
+const resolveAppVersion = (): string => {
+  try {
+    const sha = execFileSync('git', ['rev-parse', '--short', 'HEAD'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim()
+    if (sha) {
+      const now = new Date()
+      const yyyymmdd = [
+        now.getFullYear(),
+        String(now.getMonth() + 1).padStart(2, '0'),
+        String(now.getDate()).padStart(2, '0'),
+      ].join('')
+      return `${sha}-${yyyymmdd}`
+    }
+  } catch {
+    // git unavailable or not a repository — fall through to env/default
+  }
+  return process.env.VITE_MIVO_VERSION || 'dev'
+}
 
 // SC1.3 (P1-d 收尾): the mivo dev middleware is RETIRED. All mivo API traffic
 // is proxied to the standalone BFF (`npm run start:server`, see server/)
@@ -37,6 +63,9 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
   return {
     plugins: [react(), visualDiffProbePlugin],
+    define: {
+      'import.meta.env.VITE_MIVO_VERSION': JSON.stringify(resolveAppVersion()),
+    },
     server: {
       proxy: {
         // ALL /api/* traffic goes to the BFF. Use a single catch-all rather than
