@@ -936,11 +936,14 @@ const isArchiveBlockedByEarlierWrite = (
     if ((r.seq ?? 0) >= archiveSeq) continue
     // 只挡会真正 drain 到 server 的非终态写;deferred(edge/anchor 不发)/ 终态(已出队不在 all)不挡。
     //   in-flight 含入挡集:cross-tab 同 user 的 in-flight(drain recovery pass 未 flip 的边界)→ 等 其 outcome。
+    //   P1-2(二审 gate-blocked 可达性):gate-blocked **不挡**(legacy op 撞 LEGACY_DRAIN 关 400,parked;
+    //     可达性 = pre-G1-a IDB 残留 legacy + LEGACY_DRAIN 默认关;新用户/清 IDB 不可达。若挡 → archive 永久饿死)。
+    //     archive 越过 gate-blocked legacy 时由 drain success 分支的 terminalizeGateBlockedLegacyOnArchivedCanvas
+    //     显式终态化(rejected + fail-visible 日志),防开闸后静默 409 丢(lead 裁定:不留在 park 等开闸 409)。
     const rstatus = r.status
     if (
       rstatus !== 'pending' &&
       rstatus !== 'paused-401' &&
-      rstatus !== 'gate-blocked' &&
       rstatus !== 'in-flight'
     ) continue
     const rop = r.op
@@ -951,6 +954,100 @@ const isArchiveBlockedByEarlierWrite = (
     }
   }
   return false
+}
+
+// ── P1-1(A) 返修(二审根因):同 resourceKey 低 seq 活跃前驱屏障 ──────────────────────────────
+//
+// 根因(二审):P1-1 skip-coalesce 让单 resourceKey 可有多条 pending(archive+update / unarchive+update 等有序
+//   保留)。但 drain 不变式没跟上:若 earlier 写(seq 小)transient backoff 推迟 nextAttemptAt,later 写(seq 大)
+//   nextAttemptAt 先到 → later 抢先 drain → earlier 写后 drain 撞 409 terminal 丢(unarchive transient → update
+//   抢跑撞 archived canvas → 409 丢 update 意图)。本屏障堵此抢跑。
+//
+// 规则:任一 due-eligible record,若存在同 resourceKey + seq 更小 + active(会 drain 的非终态)的前驱 → 本轮
+//   不进 due set(延后),等前驱 success/terminal 出队解锁。最早 seq 无前驱 → 必 drain → 解锁后续 → 无死锁。
+//
+// active 集 = {pending(含 backoff-pending,nextAttemptAt 未来仍 pending),paused-401(会 drain),in-flight(cross-tab
+//   在途,等 outcome)}。**不挡** deferred(edge/anchor executor 不发;且同 resourceKey 的 edge/anchor 经 combineOps
+//   已 coalesce 无多 record → 不存在 deferred 同 resourceKey 前驱 → 不死锁)+ **不挡** gate-blocked(gate-blocked
+//   是 legacy op 走 §14.3,resourceKey 为 node:/reorder: 等,**不与 archive 的 canvas:/project: 同 resourceKey**
+//   → 本屏障天然遇不到 gate-blocked;gate-blocked 跨 resourceKey 影响 archive 由 isArchiveBlockedByEarlierWrite
+//   的 cross-canvas 维度 + P1-2 gate-blocked 修复另处理)+ **不挡** terminal(已出队不在 all)。
+//
+// 与 P1-2 cross-canvas archive barrier(isArchiveBlockedByEarlierWrite)关系:两维度并存(lead 确认)——
+//   本屏障覆盖同 resourceKey(unarchive+update 同 canvas:c1、archive+update 同 canvas:c1 等);
+//   isArchiveBlockedByEarlierWrite 覆盖 archive 跨 resourceKey(archiveCanvas c1 vs upsertNode node:c1:n1 不同
+//   resourceKey 经 canvasId 匹配;archiveProject vs 子画布写)。同 resourceKey 的 archive 场景两屏障都挡(冗余
+//   但无害);cross-resourceKey 仅 archive 屏障挡。
+//
+// 验证不变(lead 要求):archive/transition 之后入队的 stale 写(seq 更大 = later)被 earlier archive(seq 小)
+//   挡 → 等 archive drain → archive success(archived)→ stale 写解锁 → drain → 409 terminal(P1-1 "archive 后
+//   stale 写应 409" 正确,屏障不误挡)。stale 写不被屏障救活——屏障只挡"earlier 前驱未决时 later 抢跑",
+//   earlier archive 已决(archived)后 later 仍 409。
+const isBlockedByEarlierSameResourceWrite = (
+  rec: QueuedWrite,
+  all: QueuedWrite[],
+  userId: string,
+): boolean => {
+  if (rec.resourceKey === null) return false // chat(resourceKey=null)不挡(每条独立 op,无同 resourceKey 前驱)
+  const recSeq = rec.seq ?? 0
+  for (const r of all) {
+    if (r.id === rec.id) continue
+    if (r.userId !== userId) continue
+    if (r.resourceKey !== rec.resourceKey) continue // 同 resourceKey 维度
+    if ((r.seq ?? 0) >= recSeq) continue // 只挡 seq<rec 的 earlier 前驱(rec 是 later)
+    const rstatus = r.status
+    // 只挡 active(会 drain);deferred/gate-blocked/terminal 不挡(见注释:不挡且遇不到)。
+    if (rstatus !== 'pending' && rstatus !== 'paused-401' && rstatus !== 'in-flight') continue
+    return true
+  }
+  return false
+}
+
+/**
+ * P1-2(二审 gate-blocked 修复):archiveCanvas/Project drain success 后,显式终态化该 archived canvas 上的
+ * gate-blocked legacy 写(rejected + fail-visible 日志 + deleteWrite)。防 archive 越过 gate-blocked(已移出阻塞集)
+ * 后,LEGACY_DRAIN 开闸时该 legacy 写 drain 到 archived canvas → 静默 409 terminal 丢(lead:不留 park 等开闸 409)。
+ *
+ * gate-blocked 可达性(lead 问)= pre-G1-a IDB 残留 legacy(upsertNode/deleteNode/reorderChildren)+ LEGACY_DRAIN 默认关;
+ *   观测 12439:无 live legacy enqueuer(当前 build 不 enqueue 画布域 legacy op)→ 新用户/清 IDB 不可达。
+ *   条件可达(老用户残留)→ 走此修复(非 backlog)。
+ *
+ * 范围:gate-blocked + op 为三类 legacy(migrateLegacyOp !== null;wired op 不走 §14.3 gate,不会 gate-blocked)
+ *   + op 指向 archived canvas(archiveCanvas: c1;archiveProject: canvasIds)。post-loop 调用(不在 loop 内,
+ *   防 loop 继续处理已 terminal-ize 的记录致 re-create race)。
+ */
+const terminalizeGateBlockedLegacyOnArchivedCanvas = async (
+  archivedOp: WriteOp,
+  all: QueuedWrite[],
+  userId: string,
+): Promise<number> => {
+  const canvasIds = new Set<string>()
+  if (archivedOp.kind === 'archiveCanvas') {
+    canvasIds.add(archivedOp.canvasId)
+  } else if (archivedOp.kind === 'archiveProject' && archivedOp.canvasIds !== undefined) {
+    for (const cid of archivedOp.canvasIds) canvasIds.add(cid)
+  }
+  if (canvasIds.size === 0) return 0
+  let count = 0
+  for (const r of all) {
+    if (r.userId !== userId) continue
+    if (r.status !== 'gate-blocked') continue
+    const rop = r.op
+    if (migrateLegacyOp(rop) === null) continue // 三类 legacy 才可能是 gate-blocked(wired 不走 §14.3 gate)
+    let hits = false
+    for (const cid of canvasIds) {
+      if (opTargetsCanvasId(rop, cid)) { hits = true; break }
+    }
+    if (!hits) continue
+    debugLogger.warn(
+      SOURCE,
+      `archive pass: terminal-izing gate-blocked legacy ${rop.kind} on archived canvas (P1-2 gate-blocked fix; prevent delayed post-archive 409 loss when LEGACY_DRAIN gate opens): rec=${r.id}`,
+    )
+    await recordTerminal(r, 'rejected', `archived canvas — legacy gate-blocked write terminal-ized at archive pass (canvas archived; LEGACY_DRAIN gate off; prevent delayed 409 loss; P1-2)`)
+    await deleteWrite(r.id)
+    count++
+  }
+  return count
 }
 
 /** Exponential backoff with jitter: min(base * 2^(attempts-1), max) * (0.5..1.0). */
@@ -1884,12 +1981,18 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
     // drains after). A new idempotencyKey is minted because the body changed — reusing
     // the old key with a different body would 422 (idempotency-key-reuse) at the server.
     if (resourceKey !== null) {
-      const existing = all.find(
-        (r) =>
-          r.resourceKey === resourceKey &&
-          r.userId === userId &&
-          (r.status === 'pending' || r.status === 'paused-401'),
-      )
+      // P1-1(B)(二审根因):skip-coalesce 后同 resourceKey 可有多条 pending(archive+update / unarchive+update 等
+      //   有序保留)。配对前驱取同 resourceKey 中 **seq 最大者**(最新意图代表),禁止 all.find 取到更早的错误前驱
+      //   (IDB getAll 按 UUID 主键返回随机序 / reverse UUID 顺序)致误 cancel/误合并跨过中间保留记录。
+      //   例:archive(seq1)+update(seq2)+incoming unarchive(seq3)——max-seq 配 update(seq2)→ skip-coalesce 保留 3 条
+      //   (archive 先 drain archived、update 409 stale、unarchive restore);若误配 archive(seq1)→ archive+unarchive
+      //   误 cancel 跨过 update(seq2)→ update 被错误保留/丢失。max-seq 按 seq 确定,不依赖 IDB 返回序。
+      let existing: QueuedWrite | undefined
+      for (const r of all) {
+        if (r.resourceKey !== resourceKey || r.userId !== userId) continue
+        if (r.status !== 'pending' && r.status !== 'paused-401') continue
+        if (!existing || (r.seq ?? 0) > (existing.seq ?? 0)) existing = r
+      }
       if (existing) {
         // G1-a R2 F1:kind-aware 组合(create+update 合并保留 create / create+delete 净消),
         // 不再无差别 `existing.op = op`(会把 pending create 替换成 update 致服务端从未 POST)。
@@ -2063,6 +2166,9 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
     let successes = 0
     let failures = 0
     let terminals = 0
+    // P1-2(二审 gate-blocked):收集本 drain 成功的 archiveCanvas/archiveProject op,post-loop 终态化其 canvas
+    //   上的 gate-blocked legacy 写(防 archive 越过 gate-blocked 后开闸静默 409 丢)。
+    const archivedThisDrain: WriteOp[] = []
     try {
       const userId = getPersistUserId()
       const ts = now()
@@ -2122,6 +2228,11 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
         //   (不进 due set),防 archive 抢先 drain 成功后 earlier 写吃 CR-6 409 terminal 丢。见 isArchiveBlockedByEarlierWrite。
         //   barrier 只挡会真发 server 的 earlier 写(wired + 三类 legacy);deferred(edge/anchor 不发)不挡(防永久卡死)。
         .filter((r) => !isArchiveBlockedByEarlierWrite(r, all, userId))
+        // P1-1(A)(二审根因):同 resourceKey 低 seq 活跃前驱屏障 — skip-coalesce 后单 resourceKey 可有多条 pending,
+        //   防 later(seq 大)在 earlier(seq 小)transient backoff 推迟 nextAttemptAt 时抢先 drain 撞 409 terminal 丢
+        //   (unarchive transient → update 抢跑撞 archived → 409 丢 update)。earlier 出队(success/terminal)→ later 解锁。
+        //   只挡同 resourceKey + seq<rec + active(pending/paused-401/in-flight);deferred/gate-blocked 不挡(见 helper 注释)。
+        .filter((r) => !isBlockedByEarlierSameResourceWrite(r, all, userId))
 
       // R7-1:稳定拓扑排序(替换 R6-1 的标量 dependencyRank)。只沿真实 FK 边约束顺序,其余一律保持
       // 原序——防混合批中无关记录跨过有 FK 边的记录(见 stableTopologicalSort 注释)。
@@ -2178,6 +2289,10 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
             await deleteWrite(rec.id)
             successes++
             finalized = true
+            // P1-2(二审 gate-blocked):archive 成功 → 收集 op,post-loop 终态化其 canvas 上的 gate-blocked legacy 写。
+            if (rec.op.kind === 'archiveCanvas' || rec.op.kind === 'archiveProject') {
+              archivedThisDrain.push(rec.op)
+            }
             break
           case 'conflict':
             // 409 revision conflict — do NOT blindly retry (it would 409 again on the
@@ -2314,6 +2429,15 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
           }
         }
         if (paused) break
+      }
+      // P1-2(二审 gate-blocked):post-loop 终态化本 drain archive 成功的 canvas 上的 gate-blocked legacy 写
+      //   (loop 内不做:防 loop 继续处理已 terminal-ize 的记录致 re-create race)。freshAll 重取(loop 中
+      //   success/terminal 出队的记录已不在 IDB;gate-blocked 重 drain 后仍 gate-blocked 留存 → 扫描命中)。
+      if (!paused && archivedThisDrain.length > 0) {
+        const freshAll = await getAllWrites()
+        for (const archOp of archivedThisDrain) {
+          terminals += await terminalizeGateBlockedLegacyOnArchivedCanvas(archOp, freshAll, userId)
+        }
       }
     } finally {
       draining = false

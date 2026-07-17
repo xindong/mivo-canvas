@@ -350,4 +350,20 @@ describe('P1-3(返修):reconcileProjectCanvasStatus — fresh-device unarchivePr
     const canvases = useCanvasStore.getState().canvases as Record<string, CanvasLike>
     expect(canvases[cascadeId]?.status).toBe('archived') // 失败 → client 不动(下轮 hydrate 再 reconcile)
   })
+
+  it('P2-1(二审 TOCTOU):reconcile GET 在途时用户再 archiveProject → store project 翻 archived → 守卫跳过(不覆回 active,防撤销新 archive)', async () => {
+    const { cascadeId } = seedTwoArchivedChildren('p1') // fresh-device:cascade 子画布 archived
+    // fake adapter.listCanvas 在返回前模拟用户 archiveProject(乐观 set project archived)→ 触发 TOCTOU
+    const fakeAdapter = {
+      listCanvas: async () => {
+        // GET 在途时用户 archiveProject(setState project archived,模拟 archiveProject action 同步置)
+        useCanvasStore.setState({ projects: [{ id: 'p1', name: 'P1', createdAt: 't', status: 'archived' }] as never })
+        return { canvases: [{ id: cascadeId, status: 'active' }] } // 旧 GET(server unarchiveProjectTree 已恢复 cascade)
+      },
+    } as unknown as AdapterLike
+    await reconcileProjectCanvasStatus('p1', fakeAdapter)
+    // 守卫:project archived(GET 在途时被用户 archive)→ 跳过 reconcile(不用旧 GET 覆回 active,防撤销新 archive)
+    const canvases = useCanvasStore.getState().canvases as Record<string, CanvasLike>
+    expect(canvases[cascadeId]?.status).toBe('archived') // 未被旧 GET 覆回 active(守卫跳过 stale reconcile)
+  })
 })

@@ -15,6 +15,7 @@ import {
   clearDeletionTombstone,
   getDeletionTombstones,
   __resetDeletionTombstonesDb,
+  __seedTombstoneMemForTest,
 } from './deletionTombstones'
 import { setPersistUserId, __resetPersistUserId } from './persistUserId'
 
@@ -138,5 +139,25 @@ describe('Phase 2 F-B(决策7):canvas tombstone parentProjectId + revokeCanvasTo
     // enrich 后,revoke-by-project('p1') 命中(cLegacy 现有 parentProjectId='p1')→ 撤销(restoreProject 可恢复其画布)。
     await revokeCanvasTombstonesForProject('p1')
     expect((await getDeletionTombstones('canvas')).has('cLegacy')).toBe(false)
+  })
+
+  it('P2-2(二审降级 seam):IDB enrich tx 失败回落 memStore(带 parent)→ getAllRecords 同 key merge 把 parent 补进 IDB(enrichment 可见,revoke-by-project 命中)', async () => {
+    // 构造降级态:IDB 存 stale 无 parent 记录(首次删,无 cascade)+ memStore 存 enriched 带 parent 同 key 记录
+    //   (模拟 IDB enrich tx 失败 → catch 回落 memStore)。
+    await recordDeletionTombstone('canvas', 'c1') // 首次删,无 parent → IDB {c1, no parent}(memStore 清)
+    await __seedTombstoneMemForTest('canvas', 'c1', { parentProjectId: 'p1' }) // 模拟 IDB enrich 失败回落 memStore
+    // revokeCanvasTombstonesForProject('p1'):getAllRecords merge → IDB{c1,no parent}+ mem{c1,parent p1} → {c1,parent p1}
+    //   → 命中 c1(parentProjectId='p1')→ 撤销。旧实现(getAllRecords 按 key 优先留 IDB + 过滤同 key mem)→
+    //   返回 IDB{c1,no parent}→ 不命中 → c1 不撤销 → 恢复的画布被永久隐藏(比复活更糟)。
+    await revokeCanvasTombstonesForProject('p1')
+    expect((await getDeletionTombstones('canvas')).has('c1')).toBe(false) // merge 后命中 → 撤销
+  })
+
+  it('P2-2(IDB write abort + read success):IDB 无记录 + memStore 全 mem 记录(key 不在 IDB)→ getAllRecords 追加 mem-only(merge 不漏)', async () => {
+    // 模拟 IDB tx 全失败(新记录回落 memStore,IDB 无此 key)→ getAllRecords 的 mem-only 分支追加(非 merge)。
+    await __seedTombstoneMemForTest('canvas', 'cMemOnly', { parentProjectId: 'p2' })
+    // IDB 无 cMemOnly → mem-only 追加 → revoke-by-project('p2') 命中
+    await revokeCanvasTombstonesForProject('p2')
+    expect((await getDeletionTombstones('canvas')).has('cMemOnly')).toBe(false)
   })
 })

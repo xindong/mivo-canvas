@@ -1099,6 +1099,19 @@ export const reconcileProjectCanvasStatus = async (
     const a = adapter ?? getServerPersistAdapter()
     const { canvases } = await a.listCanvas(projectId, { includeArchived: true })
     const { useCanvasStore } = await import('../store/canvasStore')
+    // P2-1(二审 TOCTOU):reconcile GET 在途时用户再 archiveProject → store project 翻 archived(乐观,archiveProject
+    //   action 同步 set)。若仍应用 reconcile(用旧 GET 把 child 覆回 active)会撤销新 archive 意图。守卫:应用前
+    //   校验 project 仍 active;否则跳过(stale GET 丢弃,下轮 hydrate 用新 server 真值 reconcile)。
+    //   "archive intent" 经 store project.status 捕获(archiveProject action 同步置 archived,无需跨模块 epoch)。
+    const state0 = useCanvasStore.getState()
+    const project0 = state0.projects.find((p) => p.id === projectId)
+    if (project0 && (project0.status ?? 'active') !== 'active') {
+      debugLogger.log(
+        SOURCE,
+        `unarchiveProject ${projectId} reconcile skipped (P2-1 TOCTOU): project status=${project0.status ?? 'active'} (re-archived during GET; stale GET discarded, next hydrate reconciles)`,
+      )
+      return
+    }
     useCanvasStore.setState((s) => {
       let reconciled = 0
       const next = { ...s.canvases }

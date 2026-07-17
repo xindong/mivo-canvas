@@ -146,10 +146,28 @@ const getAllRecords = async (): Promise<TombstoneRecord[]> => {
     const idbRecords = await runTx<TombstoneRecord[]>('readonly', (store) =>
       store.getAll() as IDBRequest<TombstoneRecord[]>,
     )
-    // 并 memStore 兜底记录(同 writeRetryQueue getAllWrites:IDB tx 失败回落 memStore 的记录防丢)。
-    const idbKeys = new Set(idbRecords.map((r) => r.key))
-    const memOnly = Array.from(memStore.values()).filter((r) => !idbKeys.has(r.key))
-    return [...idbRecords, ...memOnly]
+    // P2-2(二审降级 seam):IDB enrich tx 曾失败 → 带 parentProjectId 的记录落 memStore(catch 回落),IDB 仍存
+    //   stale 无 parent 记录(同 key)。旧实现按 key 优先留 IDB + 过滤同 key mem(`!idbKeys.has(r.key)`)→
+    //   enrichment 不可见(parentProjectId 丢 → revokeCanvasTombstonesForProject 撞不到 → 恢复的画布被永久隐藏,
+    //   比复活更糟)。修:同 key merge——mem 的 parentProjectId(enriched)补进 IDB 记录(IDB 缺时);其余字段以
+    //   IDB 为准(durable 权威,createdAt/kind/ownerId/resourceId)。mem-only 记录(key 不在 IDB,如全 mem 兜底)照常追加。
+    //   merge 只在内存(读路径),不写回 IDB(读不改 durable;下次成功 putRecord enrich 自愈 IDB;IDB 持续故障时
+    //   每次 read 重 merge,幂等)。
+    const byKey = new Map<string, TombstoneRecord>()
+    for (const r of idbRecords) byKey.set(r.key, r)
+    for (const r of memStore.values()) {
+      const idb = byKey.get(r.key)
+      if (idb) {
+        // 同 key merge:mem 的 parentProjectId(enriched 投影)补进 IDB 记录(IDB stale 缺时);IDB 已有则不覆盖。
+        if (r.parentProjectId !== undefined && idb.parentProjectId === undefined) {
+          byKey.set(r.key, { ...idb, parentProjectId: r.parentProjectId })
+        }
+      } else {
+        // mem-only(key 不在 IDB)→ 追加(IDB tx 失败回落的全 mem 记录)。
+        byKey.set(r.key, r)
+      }
+    }
+    return Array.from(byKey.values())
   } catch (error) {
     warnIdbDegradation('getAll failed', error)
     return Array.from(memStore.values())
@@ -362,4 +380,26 @@ export const __resetDeletionTombstonesDb = async (): Promise<void> => {
     debugLogger.warn(SOURCE, `clear failed: ${msg(error)}`)
     dbPromise = undefined
   }
+}
+
+/**
+ * P2-2 测试专用:直接置 memStore(模拟 IDB enrich tx 失败 → catch 回落 memStore 的记录),不触 IDB。
+ * 用于构造"IDB 存 stale 无 parent 记录 + memStore 存 enriched 带 parent 同 key 记录"降级态,
+ * 验 getAllRecords 同 key merge 把 mem 的 parentProjectId 补进 IDB(enrichment 可见,防 revokeCanvasTombstonesForProject 撞不到)。
+ */
+export const __seedTombstoneMemForTest = async (
+  kind: TombstoneKind,
+  resourceId: string,
+  opts?: { parentProjectId?: string },
+): Promise<void> => {
+  const ownerId = getPersistUserId()
+  const key = tombstoneKey(kind, resourceId, ownerId)
+  memStore.set(key, {
+    key,
+    ownerId,
+    kind,
+    resourceId,
+    createdAt: Date.now(),
+    ...(opts?.parentProjectId !== undefined ? { parentProjectId: opts.parentProjectId } : {}),
+  })
 }
