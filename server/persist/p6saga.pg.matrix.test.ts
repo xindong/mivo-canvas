@@ -87,7 +87,10 @@ const migrateWith = async (
       const schk = (await sql`SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conrelid=${t}::regclass AND contype='c'`.execute(db)).rows as { def: string }[]
       expect(schk.some((r) => r.def.includes('active') && r.def.includes('archived'))).toBe(true)
     }
-    // kysely_migration 精确单调:combined registry 全 10 行(001<002<003<004<005<006<007<008<009<010)
+    // CR-6 缺口1(011_node_reverse_lookup_index):node 全局反查部分索引存在(findNodeOwners 查询路径)。
+    const nodeIdx = (await sql`SELECT indexname FROM pg_indexes WHERE tablename='persist_records' AND indexname='idx_persist_node_by_id'`.execute(db)).rows as { indexname: string }[]
+    expect(nodeIdx).toHaveLength(1)
+    // kysely_migration 精确单调:combined registry 全 11 行(001<...<010<011)
     const applied = (await sql`SELECT name FROM kysely_migration ORDER BY name`.execute(db)).rows as { name: string }[]
     expect(applied.map((r) => r.name)).toEqual([
       '2026_07_11_001_initial_persist_schema',
@@ -100,6 +103,7 @@ const migrateWith = async (
       '2026_07_12_008_g22_owner_rekey_audit',
       '2026_07_13_009_field_clock_canvas_seq_tombstones',
       '2026_07_17_010_archive_status_column',
+      '2026_07_18_011_node_reverse_lookup_index',
     ])
     // combined registry 确含 003/004(合并 DP-6R 收敛)
     expect(Object.keys(migrations).sort()).toEqual([
@@ -113,6 +117,7 @@ const migrateWith = async (
       '2026_07_12_008_g22_owner_rekey_audit',
       '2026_07_13_009_field_clock_canvas_seq_tombstones',
       '2026_07_17_010_archive_status_column',
+      '2026_07_18_011_node_reverse_lookup_index',
     ])
     await db.destroy()
   })
@@ -137,7 +142,7 @@ const migrateWith = async (
     // 005 表此时不存在(仅 004 applied)
     const before = (await sql`SELECT to_regclass('share_link_compensations') AS r`.execute(db)).rows as { r: string | null }[]
     expect(before[0].r).toBeNull()
-    // migrateToLatest 用完整 combined registry:识别 001→004 已 tracked,追加 005/006/007/008/009/010
+    // migrateToLatest 用完整 combined registry:识别 001→004 已 tracked,追加 005/006/007/008/009/010/011
     await migrateWith(db, migrations)
     applied = (await sql`SELECT name FROM kysely_migration ORDER BY name`.execute(db)).rows as { name: string }[]
     expect(applied.map((r) => r.name)).toEqual([
@@ -151,6 +156,7 @@ const migrateWith = async (
       '2026_07_12_008_g22_owner_rekey_audit',
       '2026_07_13_009_field_clock_canvas_seq_tombstones',
       '2026_07_17_010_archive_status_column',
+      '2026_07_18_011_node_reverse_lookup_index',
     ])
     // 005 表+列齐(share_link_compensations / cascade_revoked_at / claim_token)
     const cols = (await sql`SELECT column_name FROM information_schema.columns WHERE table_name='share_link_compensations' ORDER BY column_name`.execute(db)).rows as { column_name: string }[]

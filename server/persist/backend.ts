@@ -44,6 +44,30 @@ import type { FieldClocks } from '../lib/baseCursor'
 /** 内存/PG 共享的存储 record(信封 + payload;payload 不透明,服务端不解析——除 canvas meta 的 contentVersion 维护)。 */
 export type PersistRecord = Envelope<unknown> & { idempotencyKey?: string; fingerprint?: string }
 
+/**
+ * CR-6 TOCTOU 检查时守卫(Phase 2 归档 backlog 缺口2):route 层 authzCanvas/resolveCanvasAccess 的
+ * archived 检查与 backend 实际写入之间存在 check-time→write-time 窗口(并发 archive 提交后写入仍穿透)。
+ * 本错误由 backend 在**写入同一原子边界内**(PG:同事务 SELECT...FOR UPDATE canvas 行;内存:同步临界区)
+ * 判定 canvas archived-live(!isDeleted && status==='archived')时抛出,per-canvas 粒度,无全局锁。
+ * 携 getResponse():顶层 ssoAuthErrorHandler(owner.ts)的 structural duck-type 分支直接映射为
+ * 409 {error:'archived', id}(与 route 层 CR-6 契约同形,client 无感知差异),无需逐 route try/catch。
+ */
+export class ArchivedCanvasWriteError extends Error {
+  readonly canvasId: string
+  constructor(canvasId: string) {
+    super(`canvas ${canvasId} is archived; child writes rejected (CR-6 write-time guard)`)
+    this.name = 'ArchivedCanvasWriteError'
+    this.canvasId = canvasId
+  }
+  /** Hono onError structural 分支(`"getResponse" in err`)→ 409 archived JSON(保 CR-6 契约体)。 */
+  getResponse(): Response {
+    return new Response(JSON.stringify({ error: 'archived', id: this.canvasId }), {
+      status: 409,
+      headers: { 'content-type': 'application/json' },
+    })
+  }
+}
+
 export type GetResult =
   | { kind: 'found'; record: PersistRecord }
   | { kind: 'missing' }
@@ -189,6 +213,16 @@ export interface PersistBackend {
   getProjectOwner(id: string): { ownerId: string } | undefined
   /** 返修 N7:canvas id 全局归属(授权 seam canAccessCanvas 用;跨 owner → 404)。 */
   getCanvasOwner(id: string): { ownerId: string } | undefined
+  /**
+   * CR-6 缺口1(Phase 2 归档 backlog):node id 全局反查权威归属(nodeId → 所有 owner 的 node record)。
+   * editor-attached legacy asset ref(canvas-less,ref.ownerFp=editor ≠ node 持久化 owner)detach 时,
+   * 请求方-scoped `get(ownerFp,'node',id)` 查不到 node → 归档写保护漏判;本方法按 (type='node', id)
+   * 全局反查,routes/assets.ts legacy detach 用之解析 node 权威 owner→canvas 后执行同一 CR-6 判定。
+   * 返回所有 owner 命中(nodeId 理论上 client 生成全局唯一;跨 owner 撞名时由调用方消歧,防 false-409)。
+   * PG 走 migration 011 部分索引(idx_persist_node_by_id);存量数据无需回填(persist_records 本就权威持有
+   * owner_id/canvas_id 列,缺的只是查询路径)。
+   */
+  findNodeOwners(nodeId: string): Promise<Array<{ ownerId: string; canvasId: string | null; isDeleted: boolean }>>
   /**
    * F1:project 存在且 !isDeleted(live)。canvas POST/PUT(move)前验 parent project live;
    * 软删 parent 下禁独立 child create/restore(只许 POST project 走 restoreProjectTree 整树恢复)。
@@ -728,6 +762,31 @@ export class InMemoryPersistBackend implements PersistBackend {
     return ownerId !== undefined ? { ownerId } : undefined
   }
 
+  /** CR-6 缺口1:node id 全局反查(全 bucket 扫;内存量级小,dev/test 后端可接受;PG 走部分索引)。 */
+  async findNodeOwners(nodeId: string): Promise<Array<{ ownerId: string; canvasId: string | null; isDeleted: boolean }>> {
+    const out: Array<{ ownerId: string; canvasId: string | null; isDeleted: boolean }> = []
+    for (const [ownerId, bucket] of this.byOwner) {
+      const r = bucket.get(recordKey(ownerId, 'node', nodeId))
+      if (r) out.push({ ownerId, canvasId: r.canvasId ?? null, isDeleted: r.isDeleted })
+    }
+    return out
+  }
+
+  /**
+   * CR-6 缺口2(TOCTOU 检查时守卫):写入临界区内重验 canvas archived-live → throw ArchivedCanvasWriteError。
+   * 内存 backend 为 JS 单线程同步临界区——本判定与随后的 Map mutation 之间无 IO await 让出点,并发
+   * archive(microtask)无法插入,check-at-write 天然原子(与 PG 事务内 FOR UPDATE 等效,双后端契约对称)。
+   * canvas missing/isDeleted/active → 放行(missing 由 route authz 兜 404;deleted 对齐 resolveCanvasAccess
+   * isDeleted 先于 archived 的判定顺序,防 false-409 卡死已删画布清理)。
+   * canvas 按 id 全局定位(globalCanvasOwners,F4 canvas id 全局唯一):chat-message 子写的 ownerId=actor
+   * ≠ canvas owner(DP-6R per-actor),按 (ownerId,canvasId) 查会落空漏防;全局索引缺失时回退请求方 bucket。
+   */
+  private assertCanvasWritable(ownerId: string, canvasId: string): void {
+    const canvasOwner = this.globalCanvasOwners.get(canvasId) ?? ownerId
+    const c = this.find(canvasOwner, 'canvas', canvasId)
+    if (c && !c.isDeleted && c.status === 'archived') throw new ArchivedCanvasWriteError(canvasId)
+  }
+
   /** F1:project 存在且 !isDeleted。canvas POST/PUT(move)验 parent live;软删 parent 禁独立 child restore。 */
   projectLive(ownerId: string, projectId: string): boolean {
     const r = this.find(ownerId, 'project', projectId)
@@ -1069,6 +1128,8 @@ export class InMemoryPersistBackend implements PersistBackend {
     payload: unknown,
     opts: { idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string },
   ): Promise<EnsureChildResult> {
+    // CR-6 缺口2:写入临界区内重验 archived(idem replay 之前——route authz 对 replay 同样 409,后端对齐)。
+    this.assertCanvasWritable(ownerId, canvasId)
     if (opts.idempotencyKey) {
       const entry = this.idempotencyIndex.get(idemIndexKey(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey))
       if (entry) {
@@ -1166,6 +1227,9 @@ export class InMemoryPersistBackend implements PersistBackend {
       bodyFingerprint?: string
     },
   ): Promise<UpsertResult> {
+    // CR-6 缺口2:canvas meta PUT/move 同属 route 'write' 禁面(canvas.ts:390 authz)——写入临界区内重验
+    // 自身 archived-live(unarchive/restore 走 tree 方法不经此,不受影响)。
+    if (type === 'canvas') this.assertCanvasWritable(ownerId, id)
     if (opts.idempotencyKey) {
       const entry = this.idempotencyIndex.get(idemIndexKey(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey))
       if (entry) {
@@ -1282,6 +1346,8 @@ export class InMemoryPersistBackend implements PersistBackend {
       strictUpdate?: boolean
     },
   ): Promise<UpsertChildResult> {
+    // CR-6 缺口2:写入临界区内重验 archived(legacyReplaceDrain 委托本方法,守卫一并覆盖)。
+    this.assertCanvasWritable(ownerId, canvasId)
     if (opts.idempotencyKey) {
       const entry = this.idempotencyIndex.get(idemIndexKey(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey))
       if (entry) {
@@ -1359,6 +1425,8 @@ export class InMemoryPersistBackend implements PersistBackend {
   }
 
   async hardDeleteChild(ownerId: string, canvasId: string, type: PersistType, id: string): Promise<{ deleted: boolean }> {
+    // CR-6 缺口2:chat DELETE 路由走 authz 'write'(canvas.ts:991)→ archived 属写禁面;写入临界区内重验。
+    this.assertCanvasWritable(ownerId, canvasId)
     const r = this.find(ownerId, type, id)
     if (!r || r.canvasId !== canvasId) return { deleted: false } // 返修 #3:cross-canvas/missing → 404
     this.bucket(ownerId).delete(recordKey(ownerId, type, id))
@@ -1384,6 +1452,8 @@ export class InMemoryPersistBackend implements PersistBackend {
       actor: string
     },
   ): Promise<ApplyDomainOpsResult> {
+    // CR-6 缺口2:写入临界区内重验 archived。
+    this.assertCanvasWritable(ownerId, canvasId)
     // 幂等 replay(同 idem key + fingerprint 匹配 → 返既有 accepted;不二次 bump revision/seq/clock,§10.3 idempotent replay)。
     if (opts.idempotencyKey) {
       const entry = this.idempotencyIndex.get(idemIndexKey(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey))
@@ -1495,6 +1565,8 @@ export class InMemoryPersistBackend implements PersistBackend {
     payload: unknown,
     opts: { idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string; actor: string },
   ): Promise<CreateChildResult> {
+    // CR-6 缺口2:写入临界区内重验 archived。
+    this.assertCanvasWritable(ownerId, canvasId)
     // 幂等 replay(同 idem key + fingerprint → 返既有 created)。
     if (opts.idempotencyKey) {
       const entry = this.idempotencyIndex.get(idemIndexKey(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey))
@@ -1587,6 +1659,8 @@ export class InMemoryPersistBackend implements PersistBackend {
     recordId: string,
     opts: { baseRevision?: Revision; idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string; actor: string },
   ): Promise<DeleteChildResult> {
+    // CR-6 缺口2:子记录 DELETE 路由走 authz 'write'(canvas.ts:779)→ archived 属写禁面;写入临界区内重验。
+    this.assertCanvasWritable(ownerId, canvasId)
     const existing = this.find(ownerId, type, recordId)
     const rk = recordKey(ownerId, type, recordId)
     if (existing && existing.canvasId !== canvasId) return { kind: 'cross-canvas' }
@@ -1639,6 +1713,8 @@ export class InMemoryPersistBackend implements PersistBackend {
     orderedIds: string[],
     opts: { base: Revision },
   ): Promise<ReorderResult> {
+    // CR-6 缺口2:写入临界区内重验 archived。
+    this.assertCanvasWritable(ownerId, canvasId)
     const b = this.bucket(ownerId)
     // live set(type + canvasId + !deleted)
     const liveIds = new Set<string>()
