@@ -675,7 +675,7 @@ const SHELL_FIXTURES = {
     postReady: async (page) => {
       // Hard guard (F2): prove this is the real canvas NodeActionMenu
       // (contextMenuGroupsFor single image), not the sidebar canvas-row menu
-      // (which is Chinese 重命名/移动到项目/复制画板/删除). Single image →
+      // (which is Chinese 重命名/移动到项目/复制画板/归档). Single image →
       // "View details" + "Duplicate image" items must be present.
       const items = await page.locator('.node-action-item').allTextContents()
       const joined = items.join('|')

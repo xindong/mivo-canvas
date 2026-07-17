@@ -78,7 +78,7 @@ export type BrushStyle = {
 
 // deleteProject 返回值:让 UI 层按结果分支 toast(避免删除被闸门阻止时仍弹"已删除"成功
 // 提示)。blocked 两个分支:
-//   - 'no-survivor':仅 server 模式整树删除、删完会清零 canvas(≥1 canvas 不变量)时出现
+//   - 'no-survivor':server 模式或已归档项目的整树删除、删完会清零 canvas(≥1 canvas 不变量)时出现
 //     (local 模式普通删除画板回落 standalone,不触发);
 //   - 'active-child':archived 项目「彻底删除」前的 fail-closed 闸门,local/server 共用——
 //     项目下仍挂非 archived 子画布(脏数据)即阻止,防止确认弹窗只统计 archived 子而把用户
