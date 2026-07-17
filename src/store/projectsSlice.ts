@@ -107,6 +107,21 @@ export const createProjectsSlice: SliceCreator = (set, get) => ({
     //   fallback 避免副作用,用户先移画板到其他项目再删)。local 模式无此问题(画板 standalone 回落)。
     // 函数式 set:与 createProject/renameProject 一致,不用外层 snapshot,避免并发 set 间丢更新。
     const serverAligned = isPersistWriteActive()
+    // PR-C2 P1:回收站中的 archived project 可能因脏数据仍挂 active child；侧栏会把这种
+    // child 防御性展示为 active standalone。彻底删除前必须 fail-closed，否则确认弹窗只统计
+    // archived child，却会把用户仍可见、可编辑的 active child 一并静默删除。
+    if (project.status === 'archived') {
+      const hasActiveChild = Object.values(get().canvases).some(
+        (document) => document.projectId === projectId && document.status !== 'archived',
+      )
+      if (hasActiveChild) {
+        warnCanvas(
+          `Delete archived project "${project.name}" blocked: project still contains non-archived canvases (${projectId}).`,
+        )
+        toastFeedback.warn('项目内还有未归档的画布，请先归档或移动它们再彻底删除')
+        return { status: 'blocked', reason: 'active-child' }
+      }
+    }
     // PR-C2:archived 项目的“彻底删除”在 local 模式也必须删除整棵本地树；不能沿用普通
     // local deleteProject 的“子画布回落 standalone”语义，否则确认“不可恢复”后子画布仍留回收站。
     const deleteWholeTree = serverAligned || project.status === 'archived'
@@ -169,7 +184,7 @@ export const createProjectsSlice: SliceCreator = (set, get) => ({
         `Delete project "${project.name}" blocked: would leave zero canvases (≥1 canvas invariant; soft-delete-semantics.md:128). Move canvases to another project before deleting.`,
       )
       toastFeedback.warn(
-        `无法删除项目"${project.name}":至少需保留一个画板，请先将画板移动到其他项目`,
+        `无法删除项目"${project.name}":至少需保留一个画板，请先恢复项目，再创建或移动画板`,
       )
       return { status: 'blocked', reason: 'no-survivor' }
     }

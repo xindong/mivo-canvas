@@ -83,7 +83,7 @@ export type BrushStyle = {
 // narrow,避免 boolean 键在联合上无法直接访问的 narrowing 坑。
 export type ProjectDeleteResult =
   | { status: 'deleted' }
-  | { status: 'blocked'; reason: 'no-survivor' }
+  | { status: 'blocked'; reason: 'no-survivor' | 'active-child' }
   | { status: 'skipped'; reason: 'missing' }
 
 export type CanvasState = {

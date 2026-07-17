@@ -1,15 +1,13 @@
 // ProjectRow — a project node + its child canvases (Phase 4 / B4·B6·B7·B8·C10).
 //
 // Click toggles collapse; double-click name starts inline rename; hover shows a
-// `+` (在此项目新建画板); right-click opens 重命名 / 在此项目新建画板 / ─ / 删除项目.
-// Delete confirm copy makes the cascade explicit ("画板将移回 Canvas,不会被删除").
+// `+` (在此项目新建画板); active rows expose archive instead of direct delete.
 // Rename state is LIFTED to ProjectSidebar so a freshly-created project can enter
 // rename mode immediately (B7). When expanded, renders CanvasRow for each child.
 import { useState } from 'react'
 import { Archive, ArchiveRestore, ChevronDown, ChevronRight, Folder, FolderOpen, Pencil, Plus, SquarePen, Trash2 } from 'lucide-react'
 import { useCanvasStore } from '../../store/canvasStore'
 import { toastFeedback } from '../../store/toastStore'
-import { isPersistWriteActive } from '../../lib/persistBoot'
 import { ContextMenu, type ContextMenuItem } from './ContextMenu'
 import { ConfirmDialog } from './ConfirmDialog'
 import { EditableName } from './EditableName'
@@ -50,10 +48,6 @@ export function ProjectRow(props: {
   const createCanvas = useCanvasStore((s) => s.createCanvas)
   const loadScene = useCanvasStore((s) => s.loadScene)
 
-  // A2 前置 b:server 模式(queue active)delete 走整树软删(画板一并删除,可恢复);
-  // local 模式保留旧 standalone 回落(画板移回 Canvas,不删)。文案据此对齐,不误称"移回 Canvas"。
-  const serverAligned = isPersistWriteActive()
-
   // PR-C1 SC-1:归档状态驱动菜单项(归档/恢复互斥)+ 行视觉区分。archived 项被 active 视图
   //   过滤(buildSidebarModel),故【恢复】入口在主列表不可达——PR-C2 回收站视图落地其可见性;
   //   此处接线 action 即满足 C1 任务包(store/e2e 可直触)。
@@ -93,15 +87,7 @@ export function ProjectRow(props: {
     if (result.status === 'skipped') {
       return
     }
-    if (archivedView) {
-      toastFeedback.success(`已彻底删除项目"${project.name}"，不可恢复`)
-    } else {
-      toastFeedback.success(
-        serverAligned
-          ? `已删除项目"${project.name}",${canvasCount} 块画板已一并软删除(可恢复)`
-          : `已删除项目"${project.name}",${canvasCount} 块画板已移回 Canvas`,
-      )
-    }
+    toastFeedback.success(`已彻底删除项目"${project.name}"，不可恢复`)
   }
 
   // PR-C1 SC-1:归档/恢复。store action 已含级联 + CR-5 语义;UI 只调用 + 即时反馈。
@@ -129,8 +115,6 @@ export function ProjectRow(props: {
         { kind: 'item', id: 'new-canvas', label: '在此项目新建画板', icon: SquarePen, onSelect: newCanvasInProject },
         { kind: 'separator', id: 'sep-archive' },
         { kind: 'item', id: 'archive', label: '归档', icon: Archive, onSelect: archive },
-        { kind: 'separator', id: 'sep-delete' },
-        { kind: 'item', id: 'delete', label: '删除项目', icon: Trash2, danger: true, onSelect: () => setConfirmOpen(true) },
       ]
 
   return (
@@ -198,15 +182,9 @@ export function ProjectRow(props: {
       )}
       <ConfirmDialog
         open={confirmOpen}
-        title={archivedView ? `彻底删除项目"${project.name}"?` : `删除项目"${project.name}"?`}
-        description={
-          archivedView
-            ? `项目及其下 ${canvasCount} 块画板将被永久删除，此操作不可恢复。`
-            : serverAligned
-              ? `项目下 ${canvasCount} 块画板将一并软删除(可在回收站恢复)。`
-              : `项目下 ${canvasCount} 块画板将移回 Canvas,画板不会被删除。`
-        }
-        confirmLabel={archivedView ? '彻底删除' : '删除项目'}
+        title={`彻底删除项目"${project.name}"?`}
+        description={`项目及其下 ${canvasCount} 块画板将被永久删除，此操作不可恢复。`}
+        confirmLabel="彻底删除"
         danger
         onConfirm={confirmRemove}
         onCancel={() => setConfirmOpen(false)}

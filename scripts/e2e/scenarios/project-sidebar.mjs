@@ -1,10 +1,12 @@
 // project-sidebar e2e — maker sidebar replication scenarios (Phase 6 / C13).
 //
 // Covers the 6 acceptance flows: project CRUD + inline rename, in-project canvas
-// creation, right-click move (canvas↔project), delete canvas + 「至少保留一块」guard,
-// delete project cascade (with canvas-count copy), collapse persistence + updatedAt
-// ordering. Self-contained: each test resets to a known state via the store, then
-// drives the UI. Must pass on dev/prod × dom/leafer (renderer=both).
+// creation, right-click move (canvas↔project), canvas removal via the archive →
+// trash 彻底删除 paradigm (PR-C2 P1-2: active rows无直接删除入口) + last-active-canvas
+// archive guard, project removal via archive → trash whole-tree 彻底删除 (with
+// canvas-count copy), collapse persistence + updatedAt ordering. Self-contained:
+// each test resets to a known state via the store, then drives the UI. Must pass
+// on dev/prod × dom/leafer (renderer=both).
 import { waitForCanvasReady } from '../renderer-evidence.mjs'
 
 // Wipe canvases/projects to a single blank canvas so each test starts clean
@@ -85,6 +87,16 @@ const moveToProjectViaMenu = async (page, projectName) => {
   await page.locator('.sidebar-context-menu-submenu .sidebar-context-menu-item').filter({ hasText: projectName }).click()
 }
 
+const menuLabels = async (page) => page.locator('.sidebar-context-menu-item').allTextContents()
+
+const switchView = async (page, filterView) => {
+  await page.locator(`[data-filter-view="${filterView}"]`).click()
+  await page.waitForFunction(
+    (view) => document.querySelector(`[data-filter-view="${view}"]`)?.getAttribute('aria-pressed') === 'true',
+    filterView,
+  )
+}
+
 export const runProjectSidebarScenario = async (context) => {
   const { baseUrl, canvasUrl, canvasStoreSpec, page, rendererMode, wait } = context
 
@@ -157,22 +169,44 @@ export const runProjectSidebarScenario = async (context) => {
     }
   }
 
-  // --- 4. Delete canvas + 「至少保留一块」guard ------------------------------
+  // --- 4. 画板删除新范式(PR-C2 P1-2):active 菜单无「删除」;归档 → 回收站彻底删除;
+  //        末块 active 画板归档 guard --------------------------------------------
   {
     await setupState(page, canvasStoreSpec)
     await wait()
+    // active 视图画板菜单不再暴露直接删除入口(删除收敛为 归档 → 回收站「彻底删除」)。
     await openCanvasMenu(page, 'Canvas A')
-    await clickMenuItem(page, '删除')
-    await page.locator('.sidebar-confirm-dialog').waitFor({ state: 'visible' })
-    await page.locator('.sidebar-confirm-confirm').click()
+    let labels = await menuLabels(page)
+    if (labels.includes('删除')) {
+      throw new Error(`active canvas menu must not expose direct delete: ${JSON.stringify(labels)}`)
+    }
+    if (!labels.includes('归档')) {
+      throw new Error(`active canvas menu should expose archive: ${JSON.stringify(labels)}`)
+    }
+    await clickMenuItem(page, '归档')
+    await wait()
+    if ((await canvasRowFor(page, 'Canvas A').count()) !== 0) {
+      throw new Error('archived canvas should leave the active view')
+    }
+    // 回收站彻底删除:确认弹窗明示不可恢复,确认后画板从 store 消失。
+    await switchView(page, 'archived')
+    await openCanvasMenu(page, 'Canvas A')
+    await clickMenuItem(page, '彻底删除')
+    const dialog = page.locator('.sidebar-confirm-dialog')
+    await dialog.waitFor({ state: 'visible' })
+    if (!(await dialog.textContent())?.includes('不可恢复')) {
+      throw new Error('canvas permanent-delete dialog must say 不可恢复')
+    }
+    await dialog.locator('.sidebar-confirm-confirm').click()
     await wait()
     const state = await readState(page, canvasStoreSpec)
     const aId = Object.keys(state.canvasTitles).find((id) => state.canvasTitles[id] === 'Canvas A')
     if (aId) {
-      throw new Error('Delete canvas should remove Canvas A')
+      throw new Error('Permanent delete should remove Canvas A from the store')
     }
+    await switchView(page, 'active')
 
-    // Guard: reduce to a single canvas (the active one), attempt delete → blocked + toast.
+    // Guard(新范式):只剩一块 active 画板时归档被阻止(至少保留一个活跃画布)。
     await page.evaluate(async (spec) => {
       const { useCanvasStore } = await import(spec)
       const s = useCanvasStore.getState()
@@ -185,44 +219,60 @@ export const runProjectSidebarScenario = async (context) => {
     const guardState = await readState(page, canvasStoreSpec)
     const lastTitle = guardState.canvasTitles[guardState.sceneId]
     await openCanvasMenu(page, lastTitle)
-    await clickMenuItem(page, '删除')
-    await page.locator('.sidebar-confirm-confirm').click()
-    const guardToast = page.locator('.toast-item').filter({ hasText: '至少保留一块画板' })
+    await clickMenuItem(page, '归档')
+    const guardToast = page.locator('.toast-item').filter({ hasText: '至少保留一个活跃画布' })
     await guardToast.waitFor({ state: 'visible', timeout: 5000 })
     const after = await readState(page, canvasStoreSpec)
     if (Object.keys(after.canvasTitles).length !== 1) {
-      throw new Error('Guard should have kept the last canvas')
+      throw new Error('Archive guard should have kept the last canvas')
     }
   }
 
-  // --- 5. Delete project → cascade canvases back to standalone ---------------
+  // --- 5. 项目删除新范式(PR-C2 P1-2):active 菜单无「删除项目」;归档 → 回收站
+  //        彻底删除整树(含 canvas-count 文案) -----------------------------------
   {
     await resetState(page, canvasStoreSpec)
     const { projectId } = await setupState(page, canvasStoreSpec)
     await wait()
+    // active 视图项目菜单不再暴露直接删除入口。
     await openProjectMenu(page, 'E2E Project')
-    await clickMenuItem(page, '删除项目')
+    const labels = await menuLabels(page)
+    if (labels.includes('删除项目')) {
+      throw new Error(`active project menu must not expose direct delete: ${JSON.stringify(labels)}`)
+    }
+    if (!labels.includes('归档')) {
+      throw new Error(`active project menu should expose archive: ${JSON.stringify(labels)}`)
+    }
+    await clickMenuItem(page, '归档')
+    await wait()
+    // 归档后:项目(连同级联归档的子画板)离开 active 视图;standalone survivor 仍在。
+    if ((await branchFor(page, 'E2E Project').count()) !== 0) {
+      throw new Error('archived project should leave the active view')
+    }
+    // 回收站彻底删除:确认文案含画板数 + 不可恢复;确认后整树从 store 移除(不回落 standalone)。
+    await switchView(page, 'archived')
+    await openProjectMenu(page, 'E2E Project')
+    await clickMenuItem(page, '彻底删除')
     const dialog = page.locator('.sidebar-confirm-dialog')
     await dialog.waitFor({ state: 'visible' })
     const description = await dialog.locator('.sidebar-confirm-description').textContent()
-    if (!description || !description.includes('2') || !description.includes('画板')) {
-      throw new Error(`Delete-project confirm copy should include canvas count + 画板 note: ${description}`)
+    if (!description || !description.includes('2') || !description.includes('画板') || !description.includes('不可恢复')) {
+      throw new Error(`Permanent-delete confirm copy should include canvas count + 画板 + 不可恢复: ${description}`)
     }
     await dialog.locator('.sidebar-confirm-confirm').click()
     await wait()
     const state = await readState(page, canvasStoreSpec)
     if (state.projects.some((p) => p.id === projectId)) {
-      throw new Error('Delete project should remove the project entity')
-    }
-    // Cascade: its 2 canvases fall back to standalone (projectId undefined), not deleted.
-    const inProject = Object.entries(state.canvasProjects).filter(([, pid]) => pid !== undefined)
-    if (inProject.length !== 0) {
-      throw new Error(`Delete project should clear projectId on its canvases: ${JSON.stringify(inProject)}`)
+      throw new Error('Permanent delete should remove the project entity')
     }
     const remainingTitles = Object.values(state.canvasTitles)
-    if (remainingTitles.filter((t) => t === 'Canvas A' || t === 'Canvas B').length !== 2) {
-      throw new Error('Delete project should NOT delete its canvases (they fall back to standalone)')
+    if (remainingTitles.includes('Canvas A') || remainingTitles.includes('Canvas B')) {
+      throw new Error('Permanent delete should remove the whole tree (no standalone fallback)')
     }
+    if (!remainingTitles.includes('Canvas Standalone')) {
+      throw new Error('Permanent delete must not touch canvases outside the project')
+    }
+    await switchView(page, 'active')
   }
 
   // --- 6. Collapse persistence + updatedAt ordering --------------------------

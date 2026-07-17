@@ -12,6 +12,9 @@ const ids = {
   cascadeArchivedCanvas: 'e2e-cascade-archived-canvas',
   trashProjectCanvas: 'e2e-trash-project-canvas',
   trashCanvas: 'e2e-trash-canvas',
+  dirtyProject: 'e2e-dirty-project',
+  dirtyActiveChild: 'e2e-dirty-active-child',
+  dirtyArchivedChild: 'e2e-dirty-archived-child',
 }
 
 const setupState = async (page, canvasStoreSpec) =>
@@ -196,4 +199,59 @@ export const runArchiveUiTrashScenario = async (context) => {
     throw new Error('permanently deleted canvas must leave the live store')
   }
   await assertGoneFromBothViews(page, () => canvasRow(page, 'Trash Canvas'))
+
+  // P1-1:archived project 仍挂 active 脏子画布(脏数据)→ 彻底删除 fail-closed:
+  //   不删、零状态变更、warn toast 指引先归档/移动。防「确认弹窗只数 archived 子,
+  //   却把用户仍可见可编辑的 active 子一并静默删除」的数据丢失。
+  await page.evaluate(async ({ spec, seedIds }) => {
+    const { useCanvasStore } = await import(spec)
+    const now = '2026-07-18T11:00:00.000Z'
+    const document = (title, status, archivedByCascade) => ({
+      title,
+      projectId: seedIds.dirtyProject,
+      status,
+      archivedByCascade,
+      createdAt: now,
+      updatedAt: now,
+      nodes: [],
+      edges: [],
+      tasks: [],
+      selectedNodeId: undefined,
+      selectedNodeIds: [],
+    })
+    useCanvasStore.setState((state) => ({
+      projects: [
+        ...state.projects,
+        { id: seedIds.dirtyProject, name: 'Dirty Project', createdAt: now, status: 'archived' },
+      ],
+      canvases: {
+        ...state.canvases,
+        [seedIds.dirtyActiveChild]: document('Dirty Active Child', 'active', false),
+        [seedIds.dirtyArchivedChild]: document('Dirty Archived Child', 'archived', true),
+      },
+    }))
+  }, { spec: await canvasStoreSpec(), seedIds: ids })
+  await wait()
+  await switchView(page, 'archived')
+  await openMenu(projectRow(page, 'Dirty Project'))
+  await chooseMenu(page, '彻底删除')
+  const dirtyDialog = page.locator('.sidebar-confirm-dialog')
+  await dirtyDialog.waitFor({ state: 'visible' })
+  await dirtyDialog.locator('.sidebar-confirm-confirm').click()
+  const blockToast = page.locator('.toast-item').filter({ hasText: '项目内还有未归档的画布' })
+  await blockToast.waitFor({ state: 'visible', timeout: 5000 })
+  state = await readState(page, canvasStoreSpec)
+  const dirtyProject = state.projects.find((project) => project.id === ids.dirtyProject)
+  if (dirtyProject?.status !== 'archived') {
+    throw new Error('blocked permanent delete must keep the archived project intact')
+  }
+  if (
+    state.canvases[ids.dirtyActiveChild]?.status !== 'active' ||
+    state.canvases[ids.dirtyArchivedChild]?.status !== 'archived'
+  ) {
+    throw new Error('blocked permanent delete must keep all child canvases untouched')
+  }
+  if ((await projectRow(page, 'Dirty Project').count()) !== 1) {
+    throw new Error('blocked project should stay visible in the archived view')
+  }
 }

@@ -1,7 +1,7 @@
 // CanvasRow — a single canvas row in the sidebar (Phase 4 / B2·B6·B9·C8).
 //
 // Click opens; double-click starts inline rename; right-click opens a context
-// menu (重命名 / 移动到项目 ▸ / 复制画板 / ─ / 删除). The right edge shows a
+// menu (重命名 / 移动到项目 ▸ / 复制画板 / ─ / 归档). The right edge shows a
 // relative time label (title = absolute). Self-contained: subscribes to the store
 // for its data + actions, manages its own menu/confirm/rename state.
 import { useState } from 'react'
@@ -71,14 +71,13 @@ export function CanvasRow(props: {
   const confirmRemove = () => {
     // deleteCanvas guards "at least one canvas remains" (no-ops + errorCanvas).
     // Detect by checking if the canvas still exists after the (synchronous) call.
+    // PR-C2 P1-2:确认弹窗只从回收站菜单可达(active 视图无删除入口),文案固定为彻底删除语义。
     deleteCanvas(canvasId)
     setConfirmOpen(false)
     if (useCanvasStore.getState().canvases[canvasId]) {
       toastFeedback.warn('至少保留一块画板')
-    } else if (archivedView) {
-      toastFeedback.success(`已彻底删除画板"${title}"，不可恢复`)
     } else {
-      toastFeedback.success(`已删除画板"${title}"`)
+      toastFeedback.success(`已彻底删除画板"${title}"，不可恢复`)
     }
   }
 
@@ -161,8 +160,6 @@ export function CanvasRow(props: {
         { kind: 'item', id: 'duplicate', label: '复制画板', icon: Copy, onSelect: duplicate },
         { kind: 'separator', id: 'sep-archive' },
         { kind: 'item', id: 'archive', label: '归档', icon: Archive, onSelect: archive },
-        { kind: 'separator', id: 'sep-delete' },
-        { kind: 'item', id: 'delete', label: '删除', icon: Trash2, danger: true, onSelect: () => setConfirmOpen(true) },
       ]
 
   return (
@@ -207,9 +204,9 @@ export function CanvasRow(props: {
       )}
       <ConfirmDialog
         open={confirmOpen}
-        title={archivedView ? `彻底删除画板"${title}"?` : `删除画板"${title}"?`}
-        description={archivedView ? '画板将被永久删除，此操作不可恢复。' : '此操作不可撤销。'}
-        confirmLabel={archivedView ? '彻底删除' : '删除'}
+        title={`彻底删除画板"${title}"?`}
+        description="画板将被永久删除，此操作不可恢复。"
+        confirmLabel="彻底删除"
         danger
         onConfirm={confirmRemove}
         onCancel={() => setConfirmOpen(false)}
