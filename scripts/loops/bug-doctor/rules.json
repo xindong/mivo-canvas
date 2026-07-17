@@ -1,0 +1,107 @@
+{
+  "$comment": "bug-doctor 机器可读规则单一真相源(契约 docs/loops/bug-doctor.md 与本文件不一致时以本文件为准并回修契约)。gate 打分与主会话分诊共读。",
+  "version": 1,
+  "coreProcesses": [
+    {
+      "id": "canvas",
+      "label": "画布打开/渲染",
+      "sourcePatterns": ["^Canvas(?! Sync)", "^Leafer", "^Renderer", "^Camera", "^Viewport", "^Node Registry"]
+    },
+    {
+      "id": "project-crud",
+      "label": "项目 CRUD",
+      "sourcePatterns": ["^Project", "^Sidebar"]
+    },
+    {
+      "id": "ai-generation",
+      "label": "AI 生成工作流",
+      "sourcePatterns": ["^AI", "^Generation", "^Workflow", "^Task Runner", "^Image", "^Mask Edit"]
+    },
+    {
+      "id": "persistence",
+      "label": "持久化读写",
+      "sourcePatterns": ["^Persist", "^Write Retry Queue", "^Kernel", "^Server Persist", "^Canvas Sync", "^Outbox", "^IDB", "^Migration"]
+    },
+    {
+      "id": "assets",
+      "label": "资产加载",
+      "sourcePatterns": ["^Asset", "^Eagle", "^Local Assets", "^Proxy Image", "^DAM"]
+    },
+    {
+      "id": "chat",
+      "label": "聊天面板",
+      "sourcePatterns": ["^Chat"]
+    }
+  ],
+  "scoring": {
+    "$comment": "score = levelWeight × min(distinctClients, clientCap) × processWeight × freshness × growth(契约公式)",
+    "levelWeights": { "error": 3, "warning": 1 },
+    "clientCap": 10,
+    "coreProcessWeight": 3,
+    "nonCoreProcessWeight": 1,
+    "freshnessMultiplier": 2,
+    "growthMultiplier": 1.5,
+    "growthWindowHours": 24,
+    "ignoredAppVersions": ["unknown", "0.0.0"]
+  },
+  "sLevels": {
+    "$comment": "判定按 S0→S3 顺序短路。s0 阈值窗口=最近 24h(以数据最大 receivedAt 为基准,保证同输入重跑确定性)。",
+    "s0": {
+      "windowHours": 24,
+      "minDistinctClients": 3,
+      "minCount": 5,
+      "silentFailureMessagePatterns": [
+        "retry queue exhausted",
+        "outbox.*(lost|dropped|丢)",
+        "data loss",
+        "quota.*exceeded.*(persist|write)"
+      ]
+    },
+    "s1": {
+      "$comment": "核心流程 error(未达 S0 阈值);或核心流程 warning 命中服务端故障特征(客户端有绕行才降级成 warn,服务端 5xx 本身是 error 级事实,如 Persist Boot fetchCanvas hydrate HTTP 500)。",
+      "coreWarningEscalationPatterns": ["HTTP 5\\d\\d", "http_5\\d\\d"]
+    },
+    "s2": {
+      "$comment": "反复 warn 簇(count≥repeatThreshold)/非核心 error;挂 7 天自动升 S1(分诊层执行)。",
+      "repeatThreshold": 3,
+      "autoEscalateDays": 7
+    }
+  },
+  "t1": {
+    "$comment": "T1 自动合并白名单与禁区。gate 只写 tCap 初值(命中禁区特征封顶 T2),最终 T 级由分诊对照 diff 文件集裁定。",
+    "changeTypeWhitelist": [
+      "hook 依赖数组",
+      "memoization",
+      "死代码/纯清理 effect",
+      "补 debugLogger 调用",
+      "纯文案样式"
+    ],
+    "maxFiles": 2,
+    "maxAutoMergePerDay": 3,
+    "forbiddenPaths": [
+      "src/lib/persist",
+      "src/kernel/",
+      "server/persist/",
+      "shared/persist-contract.ts"
+    ],
+    "forbiddenTopics": [
+      "documentSlice 删除/tombstone 逻辑",
+      "迁移",
+      "鉴权",
+      "计费",
+      "asset DAM",
+      "任何行为/UX 变化"
+    ]
+  },
+  "budget": {
+    "maxParallelFixWorkers": 3,
+    "maxPRsPerDay": 5,
+    "maxAttemptsPerCluster": 2
+  },
+  "loop": {
+    "lockTtlMinutes": 60,
+    "idleHeartbeatHours": 6,
+    "gapCheckHours": 26,
+    "consecutiveFailureAlertThreshold": 3
+  }
+}
