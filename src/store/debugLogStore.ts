@@ -61,10 +61,15 @@ export const debugLogger = {
     useDebugLogStore.getState().addEntry({ level: 'warning', source, message, timestamp })
     reportRemoteDebugEntry({ level: 'warning', source, message, timestamp })
   },
-  error: (source: string, message: string) => {
+  // T2-4:可选第三参传原始 Error(或已有的 stack 字符串),error.stack 随远程上报
+  // 附带(reporter 组包时截断 ≤2KB,服务端落库前脱敏)。本地面板 message 行为不变;
+  // 既有二参调用零改动(可选参,向后兼容)。
+  error: (source: string, message: string, cause?: unknown) => {
     const timestamp = Date.now()
+    const stack =
+      cause instanceof Error ? cause.stack : typeof cause === 'string' ? cause : undefined
     useDebugLogStore.getState().addEntry({ level: 'error', source, message, timestamp })
-    reportRemoteDebugEntry({ level: 'error', source, message, timestamp })
+    reportRemoteDebugEntry({ level: 'error', source, message, timestamp, stack })
   },
 }
 
@@ -86,6 +91,12 @@ export const installConsoleCapture = () => {
   }
   console.error = (...args: unknown[]) => {
     originalError(...args)
-    debugLogger.error('Console', formatConsoleArgs(args))
+    // T2-4:console.error(err) 是生产真实异常的主要入口——把首个 Error 参数透传,
+    // 让远程记录带上结构化 stack(message 内嵌的 stack 文本行为保持不变)。
+    debugLogger.error(
+      'Console',
+      formatConsoleArgs(args),
+      args.find((arg) => arg instanceof Error),
+    )
   }
 }

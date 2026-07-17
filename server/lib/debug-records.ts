@@ -32,6 +32,9 @@ export type RemoteDebugRecord = {
     height: number
     pixelRatio: number
   }
+  // T2-4:error 级记录可携带脱敏后的 stack trace(可选,老客户端无此字段照常入库)。
+  // 指纹/gate 只读 source+message,stack 仅进记录详情供分诊阅读。
+  stack?: string
   ip: string
   referer: string
   receivedAt: string
@@ -80,13 +83,69 @@ const compactRemoteDebugText = (value: unknown, fallback = '') => {
   return value.trim().replace(/\s+/g, ' ')
 }
 
-export const sanitizeRemoteDebugText = (value: unknown, maxLength = maxRemoteDebugTextLength) => {
-  const compact = compactRemoteDebugText(value)
+// 秘密打码(token/key、data URL、长 base64)。message 与 stack 共用同一套模式,
+// 保证两个字段的脱敏语义不漂移。
+const redactRemoteDebugSecrets = (value: string): string =>
+  value
     .replace(/data:[^,\s]+,[^\s]+/gi, 'data:[redacted]')
     .replace(/\b(token|api[_-]?key|authorization|password|secret)=([^\s&]+)/gi, '$1=[redacted]')
     .replace(/\b[A-Za-z0-9+/=_-]{48,}\b/g, '[redacted-base64]')
 
+export const sanitizeRemoteDebugText = (value: unknown, maxLength = maxRemoteDebugTextLength) => {
+  const compact = redactRemoteDebugSecrets(compactRemoteDebugText(value))
+
   return compact.length > maxLength ? `${compact.slice(0, maxLength)}... [truncated]` : compact
+}
+
+// ── T2-4:stack 专用清洗 ─────────────────────────────────────────────────────
+//
+// 与 sanitizeRemoteDebugText 的两点差异:
+//  1. 保留换行(stack 天然多行,压成单行会毁掉可读性);
+//  2. 帧内路径改写:保留「文件名:行号:列号」定位能力,剥掉绝对路径前缀
+//     (用户目录 /Users|/home|/root、构建/部署目录如 /AIGC_Group/...)与
+//     URL 的 origin + query(vite dev 的 ?t=... 时间戳、生产资产域名)。
+// 秘密打码复用 redactRemoteDebugSecrets(与 message 同一套规则)。
+
+const maxRemoteDebugStackLength = 2048
+
+// URL 帧:http(s)://host[:port]/path?query:line:col → path:line:col(去掉前导 /,
+// 变成相对路径形态,避免被下面的绝对路径规则误剥)。
+const STACK_URL_RE = /(?:https?|wss?):\/\/[^\s/)]+\/([^\s)?]*)(?:\?[^\s):]*)?/gi
+// 用户目录前缀(unix /Users|/home|/root + windows 盘符变体):目录段可含空格
+// (如 "Project MivoCanvas"),贪婪吃到最后一个 / 为止,只留文件名。
+const STACK_USER_DIR_RE = /(?:[A-Za-z]:)?[\\/](?:Users|home|root)[\\/][^:)]*[\\/]/g
+// 其余绝对路径(部署/构建根,如 /AIGC_Group/mivo-canvas/dist/...):要求出现在
+// 行首/空白/括号/@ 之后(即帧内路径 token 的起点),不误伤 URL 剥离后留下的
+// 相对路径(src/store/x.ts 无前导 /)。
+const STACK_ABS_PATH_RE = /(?<=^|[\s(@])[\\/](?:[^\s():\\/]+[\\/])+/g
+
+const sanitizeStackLine = (line: string): string =>
+  line
+    .replace(STACK_URL_RE, '$1')
+    .replace(STACK_USER_DIR_RE, '')
+    .replace(STACK_ABS_PATH_RE, '')
+
+/**
+ * T2-4:清洗客户端上报的 stack trace。非字符串/空白 → undefined(可选字段,
+ * 老客户端无 stack 照常入库)。输出保证:无绝对路径前缀、无 URL origin/query、
+ * 无 token/base64 明文,总长 ≤2KB(超长截断加标记)。
+ */
+export const sanitizeRemoteDebugStack = (
+  value: unknown,
+  maxLength = maxRemoteDebugStackLength,
+): string | undefined => {
+  if (typeof value !== 'string' || !value.trim()) return undefined
+
+  const cleaned = redactRemoteDebugSecrets(
+    value
+      .split('\n')
+      .map((line) => sanitizeStackLine(line).replace(/[ \t]{2,}/g, ' ').trimEnd())
+      .join('\n')
+      .trim(),
+  )
+  if (!cleaned) return undefined
+
+  return cleaned.length > maxLength ? `${cleaned.slice(0, maxLength)}... [truncated]` : cleaned
 }
 
 const normalizeRemoteDebugScreen = (screen: unknown): RemoteDebugRecord['screen'] => {
@@ -116,16 +175,26 @@ export const normalizeRemoteDebugPayload = (
 
   return entries.flatMap((entry, index) => {
     if (!entry || typeof entry !== 'object') return []
-    const candidate = entry as { level?: unknown; source?: unknown; message?: unknown; timestamp?: unknown }
+    const candidate = entry as {
+      level?: unknown
+      source?: unknown
+      message?: unknown
+      timestamp?: unknown
+      stack?: unknown
+    }
     if (!isRemoteDebugLevel(candidate.level)) return []
 
     const timestamp = Number(candidate.timestamp)
+    // T2-4:stack 只在 error 级入库(与客户端「warn 不带」约定端到端一致,
+    // 服务端兜底防旧/异常客户端在 warning 上塞 stack);缺省 → 不落 stack 键。
+    const stack = candidate.level === 'error' ? sanitizeRemoteDebugStack(candidate.stack) : undefined
 
     return {
       id: `${serverMeta.receivedAt}-${index}-${Math.random().toString(36).slice(2, 8)}`,
       level: candidate.level,
       source: sanitizeRemoteDebugText(candidate.source || 'Unknown', 160),
       message: sanitizeRemoteDebugText(candidate.message || ''),
+      ...(stack !== undefined ? { stack } : {}),
       timestamp: Number.isFinite(timestamp) ? timestamp : Date.now(),
       clientId,
       sessionId,
