@@ -1310,22 +1310,44 @@ export const startPersistWriteQueue = (
         (outcome.body as { error?: unknown }).error === 'active-child'
       ) {
         // 跨设备 active-child:本地乐观 delete 已写 project + cascade child tombstone,但 server 409 零写。
-        // 先取消尚未执行的级联 canvas DELETE；project+canvas 两个权威 GET 全成功并应用 store 后才清
-        // tombstone/报“已恢复”。任一 GET 失败则保留 tombstone 作为 durable retry credential,禁止假成功。
+        // rollback marker 必须先于取消级联 canvas DELETE 落盘，确保取消队列后仍有 durable retry
+        // credential。无论 marker 是否成功，级联 DELETE 都必须取消：server 已用 active child 拒绝项目
+        // 删除，放行 child DELETE 会反过来销毁保护该项目的数据。
         const cascadeCanvasIds = await getCanvasTombstoneIdsForProject(op.projectId)
-        await writeQueue?.cancelDeleteCanvases(cascadeCanvasIds, op.projectId)
-        // 先严格 durable 落 rollbackPending；marker transaction 失败时禁止进入 reconcile/消费任何
-        // tombstone，避免 mem fallback 假成功后 reload 丢失唯一重试凭据。
         try {
           await markProjectDeletionRollbackPending(op.projectId)
         } catch (error) {
-          toastFeedback.warn('项目删除被阻止,但重试状态保存失败;已保留删除标记,请稍后重试。')
-          debugLogger.warn(
-            SOURCE,
-            `deleteProject ${op.projectId} rejected active-child → rollbackPending durable write failed; tombstones retained without consumption: ${msg(error)}`,
-          )
+          await writeQueue?.cancelDeleteCanvases(cascadeCanvasIds, op.projectId)
+          // 已知降级窗口：marker IDB 写失败后没有 durable retry credential，只能立即做一次严格权威
+          // reconcile。若网络也同时失败，保留 tombstone + ERROR fail-visible；待 IDB 恢复后由后续
+          // 409 或手动刷新收敛，不能假装该双故障窗口已经闭合。
+          try {
+            const result = await reconcileActiveChildDeleteRejection(op.projectId, createFetchServerPersistAdapter(opts))
+            await revokeCanvasTombstonesForProjectStrict(op.projectId)
+            await clearDeletionTombstoneStrict('project', op.projectId)
+            if (result.kind === 'restored') {
+              toastFeedback.warn('项目内还有活跃画布(可能来自其他设备),已恢复显示;请先归档或移动再彻底删除。')
+              debugLogger.warn(
+                SOURCE,
+                `deleteProject ${op.projectId} rejected active-child → rollbackPending durable write failed, but immediate authoritative reconcile restored local state and tombstones were revoked: ${msg(error)}`,
+              )
+            } else {
+              debugLogger.warn(
+                SOURCE,
+                `deleteProject ${op.projectId} rejected active-child → rollbackPending durable write failed, but immediate authoritative reads found project+children absent and tombstones were revoked: ${msg(error)}`,
+              )
+            }
+          } catch (reconcileError) {
+            toastFeedback.warn('项目删除被阻止,但重试状态保存和服务器恢复均失败;已拦截画布删除并保留删除标记,请刷新后重试。')
+            debugLogger.error(
+              SOURCE,
+              `deleteProject ${op.projectId} rejected active-child → degraded dual failure: rollbackPending durable write failed (${msg(error)}), immediate authoritative reconcile or strict tombstone consumption also failed (${msg(reconcileError)}); child DELETEs cancelled and tombstones retained without durable retry marker`,
+              reconcileError,
+            )
+          }
           return
         }
+        await writeQueue?.cancelDeleteCanvases(cascadeCanvasIds, op.projectId)
         try {
           const result = await reconcileActiveChildDeleteRejection(op.projectId, createFetchServerPersistAdapter(opts))
           await revokeCanvasTombstonesForProjectStrict(op.projectId)
