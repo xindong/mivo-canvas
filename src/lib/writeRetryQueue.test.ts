@@ -34,6 +34,7 @@ import type { NodePayload, Revision } from '../../shared/persist-contract.ts'
 import { __resetPersistUserId, setPersistUserId } from './persistUserId'
 import { toastFeedback } from '../store/toastStore'
 import { debugLogger } from '../store/debugLogStore'
+import { __resetArchivedWriteNotice } from './archivedWriteNotice'
 
 // ---- spies (call-through; assert counts only) ----
 const toastWarn = vi.spyOn(toastFeedback, 'warn')
@@ -122,6 +123,7 @@ const makeQueue = (
 
 beforeEach(() => {
   vi.clearAllMocks()
+  __resetArchivedWriteNotice()
   clockMs = 1_000
   setPersistUserId('userA')
   return __resetWriteQueueDb()
@@ -335,6 +337,21 @@ describe('FX-5 error branches', () => {
     const r = await q.drain()
     expect(r.terminals).toBe(1)
     expect(toastError).toHaveBeenCalledTimes(1)
+    expect(await q.pendingCount()).toBe(0)
+  })
+
+  // PR-C1 CR-6:409 {error:'archived'} 落 rejected(body 保留)→ drain case 'rejected' 判 body.error==='archived'
+  //   → 专用 toast "此画布已归档,请先恢复再编辑。" 替换通用"这条改动无法保存"文案(不静默丢:terminal +
+  //   出队 + 用户感知失败)。单点判定,不新增 WriteOutcome 状态。
+  it('409 {error:archived} rejected → dedicated archived toast (CR-6, not the generic message)', async () => {
+    const { fn } = seqExecutor([{ status: 'rejected', body: { error: 'archived' } }])
+    const q = makeQueue(fn)
+    await q.enqueue(minimalNode('c1', 'n1'))
+    const r = await q.drain()
+    expect(r.terminals).toBe(1)
+    expect(toastWarn).toHaveBeenCalledTimes(1)
+    expect(toastWarn).toHaveBeenCalledWith('此画布已归档,请先恢复再编辑。')
+    expect(toastError).not.toHaveBeenCalled()
     expect(await q.pendingCount()).toBe(0)
   })
 

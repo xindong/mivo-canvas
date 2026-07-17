@@ -326,6 +326,11 @@ export type ChangeOrigin = 'self' | 'remote'
  *  - `dependency-failed`:**返修 R2-P1-2**——本 change 依赖的同 record create-* 终态失败(如 create
  *    被拒/超限/坏请求),依赖 edit/delete 因此无法进行。**非 not-found**(record 不是"不存在"而是"创建失败"),
  *    非重试(重试须先修 create;非"record 不在"的瞬态)。
+ *  - `archived`:**PR-C1 CR-6**——目标 canvas 已归档,写被 server CR-6 拒(409 `{error:'archived'}`)。
+ *    archived canvas 可读不可写;adapter 必须把它与 revision-conflict 区分:revision-conflict 走 conflict
+ *    (refetch cursor 成功 → 编辑可 rebase 重发),archived 走 rejected(archived canvas refetch 会成功——
+ *    可读——若当 conflict 处理会 refetch 出可读 cursor 假装编辑可继续,实际编辑静默丢)。调用方据此 toast
+ *    "先恢复再编辑"。非重试(重试同 op 必再 409;须先 unarchive)。
  *  - `terminal`:其他不可重试(catch-all,detail 描述)。
  */
 export type RejectionReason =
@@ -336,6 +341,7 @@ export type RejectionReason =
   | 'reuse-conflict'
   | 'bad-request'
   | 'dependency-failed'
+  | 'archived'
   | 'terminal'
 
 /**

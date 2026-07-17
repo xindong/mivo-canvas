@@ -40,6 +40,8 @@ import { isServerPersist } from '../lib/persistMode'
 import { getSceneWrap } from '../lib/sceneWrapRegistry'
 // Phase 1 项4(复活加固):store delete action 发起时写持久 tombstone(详见 src/lib/deletionTombstones.ts)。
 import { recordDeletionTombstone } from '../lib/deletionTombstones'
+import { toastFeedback } from './toastStore'
+import { resolveActiveCanvasAfterArchive } from './archiveSurvivor'
 
 // Phase 1 项4(复活加固):server/shadow 模式删 canvas 时写持久 tombstone(与队列记录生死解耦,覆盖溢出驱逐/
 //   重试耗尽离队后 pending-delete 失效的复活;hydrate step2 并集 tombstone 过滤)。local 模式(queue 未启动)
@@ -60,6 +62,19 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
   historyPast: [],
   historyFuture: [],
   createCanvas: (title = 'Untitled Canvas', options) => {
+    // PR-C1 二轮 P2(SC-1):显式 archived projectId 阻止。修前:options.projectId 原样通过 →
+    //   server 模式建档+enqueue 落进 archived 父项目(级联归档语义下不可见 = 丢画布);local 模式脏建档。
+    //   与 moveCanvasToProject archived target guard 同语义(只堵 store 层;UI active 视图已过滤 archived
+    //   行,此处防 server/e2e/脏数据直触)。projectId 不在 projects 里的既有容忍行为(unknown project
+    //   原样通过)保持不变——不扩范围(lead 拍板)。
+    if (options?.projectId) {
+      const targetProject = get().projects.find((p) => p.id === options.projectId)
+      if (targetProject && targetProject.status === 'archived') {
+        warnCanvas(`Create canvas blocked: target project ${options.projectId} is archived`)
+        toastFeedback.warn('目标项目已归档,请先恢复项目再新建画板')
+        return undefined
+      }
+    }
     const id = createCanvasId()
     // R2 F2 / R3 F2-B:server 模式 canvas 必须归 project(防 POST /api/canvas projectId='' → 400
     // bad-body / 404 unknown-project 被队列当 rejected terminal 删 → 刷新画布消失)。
@@ -74,7 +89,9 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
       if (options?.projectId) {
         docProjectId = options.projectId
       } else {
-        const firstExisting = get().projects[0]?.id
+        // PR-C1 SC-3:默认父项目取首个 active 项目(非 projects[0])——否则新画布可能静默
+        //   落进 archived 项目(级联归档语义下 archived project 的画布不可见 = 丢画布)。
+        const firstExisting = get().projects.find((p) => p.status !== 'archived')?.id
         docProjectId = firstExisting ?? get().createProject('Default Project')
       }
     } else {
@@ -129,6 +146,24 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
       warnCanvas(`Duplicate canvas skipped: missing source ${sourceId}`)
       return undefined
     }
+    // PR-C1 二轮 P2(SC-2):archived 源 / archived 父项目 阻止。修前:副本经 ...sourceDocument
+    //   展开脏继承 status='archived'(切 sceneId 指向它)+ archived 父 projectId 原样通过 →
+    //   client archived / server active 直接分叉;enqueue 的 create wire 不带 status 致服务端建
+    //   active 记录。与 createCanvas archived 闸门同语义。放行路径副本显式 status='active'、
+    //   archivedByCascade=false(见下方 duplicatedDocument,防脏继承)。
+    if (sourceDocument.status === 'archived') {
+      warnCanvas(`Duplicate canvas blocked: source ${sourceId} is archived`)
+      toastFeedback.warn('画布已归档,请先恢复再复制')
+      return undefined
+    }
+    if (sourceDocument.projectId) {
+      const sourceParent = state.projects.find((p) => p.id === sourceDocument.projectId)
+      if (sourceParent && sourceParent.status === 'archived') {
+        warnCanvas(`Duplicate canvas blocked: source parent project ${sourceDocument.projectId} is archived`)
+        toastFeedback.warn('画布已归档,请先恢复再复制')
+        return undefined
+      }
+    }
 
     const id = createCanvasId()
     // C8: duplicate does NOT inherit the source's timestamps — the copy is a new
@@ -139,16 +174,21 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
     // /api/canvas → 404 unknown-project 终态删记录,"duplicate 后服务端有记录"不成立。
     let docProjectId = sourceDocument.projectId
     if (isServerPersist && !docProjectId) {
-      const firstExisting = get().projects[0]?.id
+      // PR-C1 SC-3:默认父项目取首个 active 项目(非 projects[0]),防 duplicate 落进 archived 项目。
+      const firstExisting = get().projects.find((p) => p.status !== 'archived')?.id
       docProjectId = firstExisting ?? get().createProject('Default Project')
     }
     const opProjectId = docProjectId ?? ''
     const now = new Date().toISOString()
+    const sourceForDuplicate = { ...sourceDocument }
+    delete sourceForDuplicate.archivedByCascade
     const duplicatedDocument = {
       ...normalizeDocument({
-        ...sourceDocument,
+        ...sourceForDuplicate,
         title: `${sourceDocument.title} Copy`,
         projectId: docProjectId,
+        // 副本是独立 active 画布;上方先移除脏 archivedByCascade 标记,避免继承级联归档身份。
+        status: 'active' as const,
         nodes: cloneNodes(sourceDocument.nodes),
         tasks: cloneTasks(sourceDocument.tasks),
       }),
@@ -229,8 +269,7 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
       }
     }),
   // Phase 2 归档(回收站)——CR-10 unarchiveCanvas 自动 unarchive 父项目(编辑先恢复同构)+ CR-11 不入 undo 栈
-  //   (status 变更非画布内容 mutation,historyManager 只管画布内容)。archive 不触发 ≥1 canvas 不变量(画布
-  //   不移除,仅置 status=archived;active scene 若被归档,sceneId 不动——UI 可见性/scene 切换属 PR-C)。
+  //   (status 变更非画布内容 mutation,historyManager 只管画布内容)。归档后必须仍有 ≥1 active canvas。
   archiveCanvas: (canvasId) =>
     set((state) => {
       const targetId = canvasId || state.sceneId
@@ -243,14 +282,37 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
         warnCanvas(`Archive canvas skipped: already archived ${targetId}`)
         return {}
       }
+      const nextCanvases = {
+        ...state.canvases,
+        [targetId]: { ...document, status: 'archived' as const, archivedByCascade: false },
+      }
+      const resolution = resolveActiveCanvasAfterArchive(nextCanvases, state.sceneId)
+      if (resolution.kind === 'blocked') {
+        warnCanvas(`Archive canvas blocked: ${targetId} would leave no active canvas`)
+        toastFeedback.warn('至少保留一个活跃画布,请先创建或恢复其他画布再归档')
+        return {}
+      }
+
       logCanvas(`Archived canvas "${document.title}" (${targetId})`)
       // 直接归档:archivedByCascade=false(unarchiveProject 不恢复此画布;CR-5)。server 幂等:已归档→200 no-op。
       enqueuePersistWrite({ kind: 'archiveCanvas', canvasId: targetId })
+      if (resolution.kind === 'keep') {
+        return { canvases: nextCanvases }
+      }
+      const nextSceneId = resolution.sceneId
+      const nextDocument = normalizeDocument(documentFor(nextCanvases, nextSceneId))
+      logCanvas(`Archived active canvas → switched scene to ${nextSceneId}`)
       return {
-        canvases: {
-          ...state.canvases,
-          [targetId]: { ...document, status: 'archived' as const, archivedByCascade: false },
-        },
+        canvases: nextCanvases,
+        sceneId: nextSceneId,
+        nodes: nextDocument.nodes,
+        edges: nextDocument.edges || [],
+        tasks: nextDocument.tasks,
+        selectedNodeId: nextDocument.selectedNodeId,
+        selectedNodeIds: nextDocument.selectedNodeIds || [],
+        activeTool: 'select',
+        historyPast: [],
+        historyFuture: [],
       }
     }),
   unarchiveCanvas: (canvasId) =>
@@ -371,7 +433,8 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
         baseRevision: metaRevision,
       })
     } else {
-      const opProjectId = existing.projectId ?? get().projects[0]?.id ?? ''
+      // PR-C1 SC-3:默认父项目取首个 active 项目(非 projects[0]),防 rename-standalone 落进 archived 项目。
+      const opProjectId = existing.projectId ?? get().projects.find((p) => p.status !== 'archived')?.id ?? ''
       if (opProjectId) {
         enqueuePersistWrite({ kind: 'createCanvas', canvasId: sceneId, projectId: opProjectId, title })
       } else {
@@ -389,6 +452,11 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
       // projectId === undefined → move back to the Canvas 区 (clear projectId).
       if (projectId !== undefined && !state.projects.some((p) => p.id === projectId)) {
         warnCanvas(`Move canvas skipped: target project ${projectId} does not exist`)
+        return {}
+      }
+      if (projectId !== undefined && state.projects.some((p) => p.id === projectId && p.status === 'archived')) {
+        warnCanvas(`Move canvas blocked: target project ${projectId} is archived`)
+        toastFeedback.warn('目标项目已归档,请先恢复项目再移动')
         return {}
       }
       // Target === current归属 → no-op (no bump, no log).

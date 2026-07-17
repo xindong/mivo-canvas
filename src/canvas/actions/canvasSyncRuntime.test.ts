@@ -3,6 +3,7 @@ import type { CanvasActionRuntime } from './canvasActionTypes'
 import type { MivoCanvasNode } from '../../types/mivoCanvas'
 import type { ChangeOutcome, CanvasSyncPort } from '../../lib/canvasSyncPort'
 import { imageNode, nodeRecord, loadRuntimeModule } from './canvasSyncRuntimeTestFactories'
+import { __resetArchivedWriteNotice } from '../../lib/archivedWriteNotice'
 
 vi.hoisted(() => {
   const store = new Map<string, string>()
@@ -36,6 +37,7 @@ vi.mock('../../store/remoteDebugReporter', () => ({
 describe('canvasSyncRuntime(Block 1 runtime driving)', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    __resetArchivedWriteNotice()
   })
 
   it('buildCanvasSyncChanges emits delete-field when an optional field is removed', async () => {
@@ -166,6 +168,41 @@ describe('canvasSyncRuntime(Block 1 runtime driving)', () => {
     const { wrapCanvasActionRuntimeWithSync } = await loadRuntimeModule({ local: true })
     const runtime = { deleteNode: vi.fn() } as unknown as CanvasActionRuntime
     expect(wrapCanvasActionRuntimeWithSync(runtime)).toBe(runtime)
+  })
+
+  // PR-C1 CR-6:submitChange 返 rejected reason 'archived'(canvasSyncPortClient 把 409 {error:'archived'}
+  //   映射为此)→ canvasSyncRuntime rejected 分支 toastFeedback.warn "先恢复再编辑"(不静默丢编辑)。
+  it('rejected reason archived → toastFeedback warn "先恢复再编辑" (CR-6)', async () => {
+    const { enqueueCanvasSyncChanges, submitChange } = await loadRuntimeModule({
+      submitChangeImpl: async () => ({ kind: 'rejected', reason: 'archived', detail: 'canvas archived (CR-6)' }),
+    })
+    const { toastFeedback } = await import('../../store/toastStore')
+    const warnSpy = vi.spyOn(toastFeedback, 'warn').mockImplementation(() => 'stub')
+    const fakePort = { submitChange } as unknown as CanvasSyncPort
+    await enqueueCanvasSyncChanges(
+      'c1',
+      [{ kind: 'edit-node', nodeId: 'n1', intents: [{ op: 'set', fieldPath: ['title'], value: 'renamed' }] }],
+      fakePort,
+    )
+    expect(warnSpy).toHaveBeenCalledWith('此画布已归档,请先恢复再编辑。')
+    warnSpy.mockRestore()
+  })
+
+  // PR-C1 CR-6:其他 rejected 原因(forbidden 等)只 debugLog,不弹 archived 专用 toast(不误引导)。
+  it('rejected reason != archived does NOT fire the archived toast', async () => {
+    const { enqueueCanvasSyncChanges, submitChange } = await loadRuntimeModule({
+      submitChangeImpl: async () => ({ kind: 'rejected', reason: 'forbidden', detail: 'no access' }),
+    })
+    const { toastFeedback } = await import('../../store/toastStore')
+    const warnSpy = vi.spyOn(toastFeedback, 'warn').mockImplementation(() => 'stub')
+    const fakePort = { submitChange } as unknown as CanvasSyncPort
+    await enqueueCanvasSyncChanges(
+      'c1',
+      [{ kind: 'edit-node', nodeId: 'n1', intents: [{ op: 'set', fieldPath: ['title'], value: 'x' }] }],
+      fakePort,
+    )
+    expect(warnSpy).not.toHaveBeenCalledWith('此画布已归档,请先恢复再编辑。')
+    warnSpy.mockRestore()
   })
 
   it('create retryable is fail-visible aborted so later same-canvas batches do not deadlock', async () => {

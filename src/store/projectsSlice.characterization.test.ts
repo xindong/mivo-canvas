@@ -139,13 +139,13 @@ beforeEach(() => {
 
 describe('characterization: createCanvas — sync id + initial structure', () => {
   it('returns a canvas- prefixed id synchronously (caller can use it immediately)', () => {
-    const id = useCanvasStore.getState().createCanvas('C')
+    const id = useCanvasStore.getState().createCanvas('C')!
     expect(id).toMatch(/^canvas-/)
     expect(useCanvasStore.getState().canvases[id]).toBeDefined()
   })
 
   it('seeds canvases[id] as a blank document: default title, standalone projectId, empty content', () => {
-    const id = useCanvasStore.getState().createCanvas()
+    const id = useCanvasStore.getState().createCanvas()!
     const doc = useCanvasStore.getState().canvases[id]!
     expect(doc.title).toBe('Untitled Canvas')
     expect(doc.projectId).toBeUndefined()
@@ -158,7 +158,7 @@ describe('characterization: createCanvas — sync id + initial structure', () =>
 
   it('seeds canvases[id] with the full field set (createdAt/updatedAt present, no sourceTemplateId for blank)', () => {
     const before = new Date().toISOString()
-    const id = useCanvasStore.getState().createCanvas('C')
+    const id = useCanvasStore.getState().createCanvas('C')!
     const after = new Date().toISOString()
     const doc = useCanvasStore.getState().canvases[id]!
     expect(doc.createdAt >= before).toBe(true)
@@ -187,12 +187,12 @@ describe('characterization: createCanvas — sync id + initial structure', () =>
 
   it('honors options.projectId to attach the new canvas under an existing project', () => {
     const projectId = useCanvasStore.getState().createProject('P')
-    const id = useCanvasStore.getState().createCanvas('C', { projectId })
+    const id = useCanvasStore.getState().createCanvas('C', { projectId })!
     expect(useCanvasStore.getState().canvases[id]!.projectId).toBe(projectId)
   })
 
   it('honors options.templateId to clone a demo scene content, with title + projectId override', () => {
-    const id = useCanvasStore.getState().createCanvas('From Template', { templateId: 'character-flow' })
+    const id = useCanvasStore.getState().createCanvas('From Template', { templateId: 'character-flow' })!
     const doc = useCanvasStore.getState().canvases[id]!
     expect(doc.title).toBe('From Template')
     expect(doc.sourceTemplateId).toBe('character-flow')
@@ -204,8 +204,8 @@ describe('characterization: createCanvas — sync id + initial structure', () =>
   })
 
   it('two sequential createCanvas calls produce distinct ids and both canvases survive', () => {
-    const a = useCanvasStore.getState().createCanvas('A')
-    const b = useCanvasStore.getState().createCanvas('B')
+    const a = useCanvasStore.getState().createCanvas('A')!
+    const b = useCanvasStore.getState().createCanvas('B')!
     expect(a).not.toBe(b)
     expect(useCanvasStore.getState().canvases[a]).toBeDefined()
     expect(useCanvasStore.getState().canvases[b]).toBeDefined()
@@ -589,7 +589,7 @@ describe('characterization: collapse-state decoupling (现状疑点)', () => {
   it('createCanvas does not validate options.projectId against the projects list (orphan accepted) — 现状疑点', () => {
     // 与 moveCanvasToProject（target project 不存在 → reject）不同，createCanvas 无
     // guard，可直接造出指向不存在 project 的画布。钉现状，迁移侧需统一 guard。
-    const id = useCanvasStore.getState().createCanvas('Orphan', { projectId: 'project-nonexistent' })
+    const id = useCanvasStore.getState().createCanvas('Orphan', { projectId: 'project-nonexistent' })!
     expect(useCanvasStore.getState().canvases[id]!.projectId).toBe('project-nonexistent')
     expect(useCanvasStore.getState().projects.some((p) => p.id === 'project-nonexistent')).toBe(false)
   })

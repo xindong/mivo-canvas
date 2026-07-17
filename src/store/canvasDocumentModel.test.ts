@@ -647,7 +647,7 @@ describe('updatedAt bump hub: store actions (createCanvas / duplicateCanvas / re
 
   it('createCanvas sets createdAt = updatedAt = now', () => {
     const before = Date.now()
-    const id = useCanvasStore.getState().createCanvas('Fresh')
+    const id = useCanvasStore.getState().createCanvas('Fresh')!
     const after = Date.now()
     const doc = useCanvasStore.getState().canvases[id]
     expect(doc.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/)
@@ -659,7 +659,7 @@ describe('updatedAt bump hub: store actions (createCanvas / duplicateCanvas / re
 
   it('duplicateCanvas sets fresh createdAt/updatedAt = now (does NOT inherit source timestamps — C8)', () => {
     const sourceTime = '2026-01-01T00:00:00.000Z'
-    const sourceId = useCanvasStore.getState().createCanvas('Original')
+    const sourceId = useCanvasStore.getState().createCanvas('Original')!
     // Pin the source to an old timestamp (merge mode — replace=true would strip
     // the store's action functions, so only the canvases slice is updated here).
     useCanvasStore.setState((s) => ({

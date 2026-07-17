@@ -557,6 +557,7 @@ describe('F3: terminal rejections + authoritative accepted (no mis-retry, no fal
 
   it('RejectionReason is a closed domain enum (no HTTP number / Yjs frame in the port type)', () => {
     // 返修 R2-P1-2:加 'dependency-failed'(create 终态失败时依赖 edit 的 surface,非 not-found)。
+    // PR-C1 CR-6:加 'archived'(archived canvas 写返 409 `{error:'archived'}`,与 revision-conflict 区分)。
     expectTypeOf<RejectionReason>().toEqualTypeOf<
       | 'unauthorized'
       | 'forbidden'
@@ -565,6 +566,7 @@ describe('F3: terminal rejections + authoritative accepted (no mis-retry, no fal
       | 'reuse-conflict'
       | 'bad-request'
       | 'dependency-failed'
+      | 'archived'
       | 'terminal'
     >()
   })

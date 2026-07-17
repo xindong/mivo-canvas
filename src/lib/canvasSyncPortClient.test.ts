@@ -72,6 +72,36 @@ describe('createFetchCanvasSyncPort(Block 1 write driving)', () => {
     ])
   })
 
+  // PR-C1 CR-6:409 `{error:'archived'}` 必须映射为独立 rejected reason 'archived',而非 revision-conflict
+  //   (archived canvas 可读,若当 conflict 处理会 refetch 出可读 cursor 假装编辑可继续 → 编辑静默丢)。
+  it('maps 409 {error:archived} to rejected reason archived (NOT conflict) — edit on archived canvas', async () => {
+    const fetch: FetchLike = vi.fn(async () => jsonResponse(409, { error: 'archived' }))
+    const port = createFetchCanvasSyncPort({ fetch, getAuthHeaders: async () => ({}) })
+    setCanvasCursor('c1', buildBundle('c1', { n1: 'base:n1:r1' }, 7, 1))
+
+    const outcome = await port.submitChange('c1', {
+      kind: 'edit-node',
+      nodeId: 'n1',
+      intents: [{ op: 'set', fieldPath: ['title'], value: 'renamed' }],
+    })
+
+    expect(outcome).toEqual({
+      kind: 'rejected',
+      reason: 'archived',
+      detail: 'canvas archived (CR-6); restore before editing',
+    })
+  })
+
+  it('create-node 409 {error:archived} surfaces rejected archived (held edits resolve dependency-failed)', async () => {
+    const fetch: FetchLike = vi.fn(async () => jsonResponse(409, { error: 'archived' }))
+    const port = createFetchCanvasSyncPort({ fetch, getAuthHeaders: async () => ({}) })
+
+    const outcome = await port.submitChange('c1', { kind: 'create-node', node: imageRecord('n-new') })
+
+    expect(outcome.kind).toBe('rejected')
+    if (outcome.kind === 'rejected') expect(outcome.reason).toBe('archived')
+  })
+
   it('uses the created record id as clientId and holds same-record edits until create ack refreshes base', async () => {
     const calls: Array<{ method: string; path: string; body: unknown; ifMatch?: string }> = []
     let resolveCreate!: (response: Response) => void

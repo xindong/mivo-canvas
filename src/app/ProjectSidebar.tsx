@@ -111,6 +111,8 @@ export function ProjectSidebar({
 
   const createStandaloneCanvas = () => {
     const canvasId = createCanvas('Untitled Canvas')
+    // PR-C1 二轮 P2:createCanvas blocked → 返 undefined。store 层已弹 warn,caller 不重复提示/不打开。
+    if (!canvasId) return
     onOpenCanvas(canvasId)
     toastFeedback.success('已新建画板')
   }

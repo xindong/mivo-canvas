@@ -2,13 +2,14 @@ import { describe, expect, it } from 'vitest'
 import { buildSidebarModel } from './projectSidebarModel'
 import type { CanvasDocument, CanvasProject } from '../../types/mivoCanvas'
 
-const project = (id: string, createdAt = '2026-07-01T00:00:00.000Z'): CanvasProject => ({
+const project = (id: string, createdAt = '2026-07-01T00:00:00.000Z', status: 'active' | 'archived' = 'active'): CanvasProject => ({
   id,
   name: id,
   createdAt,
+  status,
 })
 
-const doc = (updatedAt: string, projectId?: string, title = 'C'): CanvasDocument => ({
+const doc = (updatedAt: string, projectId?: string, title = 'C', status: 'active' | 'archived' = 'active'): CanvasDocument => ({
   title,
   projectId,
   createdAt: '2026-07-01T00:00:00.000Z',
@@ -18,6 +19,7 @@ const doc = (updatedAt: string, projectId?: string, title = 'C'): CanvasDocument
   tasks: [],
   selectedNodeId: undefined,
   selectedNodeIds: [],
+  status,
 })
 
 describe('buildSidebarModel — grouping', () => {
@@ -116,5 +118,51 @@ describe('buildSidebarModel — latestActivityAt', () => {
     }
     const model = buildSidebarModel(projects, canvases)
     expect(model.projectGroups[0].latestActivityAt).toBe('2026-07-09T00:00:00.000Z')
+  })
+})
+
+// PR-C1:active 视图 status 过滤——主列表排除 archived project + archived canvas。
+describe('buildSidebarModel — archived filtering (PR-C1 active view)', () => {
+  it('excludes archived projects from projectGroups', () => {
+    const projects = [project('p-active'), project('p-arch', '2026-07-01T00:00:00.000Z', 'archived')]
+    const canvases = {
+      c1: doc('2026-07-03T00:00:00.000Z', 'p-active'),
+      c2: doc('2026-07-04T00:00:00.000Z', 'p-arch'),
+    }
+    const model = buildSidebarModel(projects, canvases)
+    expect(model.projectGroups.map((g) => g.project.id)).toEqual(['p-active'])
+  })
+
+  it('excludes archived canvases from a project group (active project stays)', () => {
+    const projects = [project('p1')]
+    const canvases = {
+      live: doc('2026-07-03T00:00:00.000Z', 'p1', 'C-live'),
+      gone: doc('2026-07-09T00:00:00.000Z', 'p1', 'C-gone', 'archived'),
+    }
+    const model = buildSidebarModel(projects, canvases)
+    const group = model.projectGroups.find((g) => g.project.id === 'p1')!
+    expect(group.canvasIds).toEqual(['live'])
+  })
+
+  it('excludes archived standalone canvases', () => {
+    const canvases = {
+      s1: doc('2026-07-01T00:00:00.000Z', undefined, 'S1'),
+      s2: doc('2026-07-05T00:00:00.000Z', undefined, 'S2', 'archived'),
+    }
+    const model = buildSidebarModel([], canvases)
+    expect(model.standaloneCanvasIds).toEqual(['s1'])
+  })
+
+  it('treats a canvas whose project is archived as standalone when the canvas itself is active', () => {
+    // Defensive: cascade-archive semantics make an active child of an archived project
+    // impossible, but if data ever lands that way the active canvas must NOT silently
+    // vanish — it surfaces as standalone (so the user can still reach it / move it).
+    const projects = [project('p-arch', '2026-07-01T00:00:00.000Z', 'archived')]
+    const canvases = {
+      orphan: doc('2026-07-04T00:00:00.000Z', 'p-arch'),
+    }
+    const model = buildSidebarModel(projects, canvases)
+    expect(model.projectGroups).toEqual([])
+    expect(model.standaloneCanvasIds).toEqual(['orphan'])
   })
 })
