@@ -60,3 +60,127 @@
 ## Deviations
 
 (执行中偏差记录,当前无)
+
+## 五、二期 T2-1 验证记录(2026-07-18 01:20-02:10 实弹)
+
+> 结论先行:**路由链路未打通,断点=Slack 用户↔设备绑定不被 server 承认;需用户重新绑定(约 1 分钟 UI 操作)后重测。不是架构性不通,不必回落自建监听。**
+
+### 1. 注册机制(SC-①,已摸清且已代办)
+
+- **白名单唯一真相源** = `~/Library/Application Support/xdt-maker/slack-hook.json` 的 `workspaces`(别名→绝对路径)。
+- 三处消费全部**现读磁盘**:①桌面派发校验(ipc.ts getConnection→store.get());②hello 帧(manager.ts:371"每次连接成功都重读配置");③server 实时问答 query.request(queryResponder"敲指令那一刻的最新配置")。
+- 正规注册入口 = maker 桌面端 设置 →「Tina」页 →「Slack 连接」→ 展开「工作目录映射」→ 系统目录选择器添加(变更即保存并在线热推 refreshHello,无需重启)。
+- **本次已由 worker 直接写文件完成注册**:`mivo-canvas → /Users/praise/AI-Agent/Claude/projects/Project MivoCanvas`(备份在 `_tmp/cindy-study/slack-hook.json.bak-*`);01:40:33 app 重启重连,hello 已携带该别名(日志 `handshake complete with xd-slack-hook`)。**用户无需再做注册操作。**
+
+### 2. Slack 通道可用性(SC-②,通过)
+
+- cindy-slack 通道正常收发。自证消息:https://xindong.slack.com/archives/C0BJ2PZA97C/p1784309380632029 (01:29)。
+
+### 3. 实弹路由测试(SC-③,三观察点)
+
+发现频道里存在**两只同名 Cindy 应用**:
+- **U0BF22S17S7**(username=tina,离线圈)——**正确的接单 bot**:对人工路径 @提及 **3-4 秒内 thread 回帖**;其引导文案与当前桌面端 UI(设置→Slack 连接→「连接 Slack」)一字不差,确认属现行 cindy-server。用户 2026-07-17 23:09 拉进频道的就是它,**没拉错**。
+- **U0B4JU6BR52**(绿点在线)——本次为排除假设由 worker `/invite` 进频道;对频道 @提及(API 路径+人工路径)**均零反应**,判定非频道接单 bot(疑似 p2p/DM 形态的 SlackIM 应用)。可 `/remove` 移出或留置无害。
+
+| 观察点 | 结论 | 证据 |
+|---|---|---|
+| ① ack 三态 | 未触达三态——server 在派发前返回**第四种回应:「你还没有绑定 Cindy 设备」引导**(3-4 秒,稳定复现 2 次) | thread 回帖 ts=1784309843.099979(01:37)、ts=1784311254.360149(02:00) |
+| ② 任务落本机 maker 会话 | **否**。桌面侧全天 0 条 task.dispatch 日志;`hook-bindings.json` 未生成;无新 hook 会话 | main-2026-07-18.log 仅 3 行 hook-control(均为 01:40 重连);bindings 文件不存在 |
+| ③ Cindy 回帖落原消息串 | **是**(回帖机制本身工作正常,绑定引导即以 thread reply 落原串) | 同①链接 |
+
+**矛盾点(已定位未解释)**:桌面端日志 01:40:33 收到 `bind.update: confirmed`(设备侧显示已绑定),但 server 对朱赞的 @提及回「未绑定」。推测绑定记录落在其他 Slack 账号/workspace,或品牌统一迁移后 server 侧绑定数据失效(命中二期前置表第 3 行"老授权可能失效"预言)。
+
+**API 路径重要发现**:经 cindy-slack MCP 工具发的 @提及(带"发送工具 @Cindy"署名)**不触发** tina-Cindy 接单(疑似 server 对自家 app 发的消息防回环过滤);**人工在 Slack 客户端手打的提及立即触发**。→ T2-2 起所有实弹测试必须走人工路径(或非 Cindy app 的发送通道)。
+
+### 4. 白名单负测试(SC-④)
+
+**依赖绑定修复,未能实弹**。代码层已核实拒绝路径存在:dispatcher.ts:602(连接校验)、469-474(`unknown_workspace` 拒绝)、白名单每次派发现读文件。待绑定修复后补一条派往未注册目录的实弹。
+
+### 5. 用户待办(约 1 分钟,做完 @lead 重测)
+
+1. maker 桌面端 → 设置 →「Tina」页 →「Slack 连接」:**先关掉开关再打开**(关=解绑,开=自动弹系统浏览器 Sign in with Slack)→ 用 **朱赞@xindong.slack.com** 账号授权。设置页显示「已绑定」即成。
+2. 无需做注册(worker 已代办,见上)。
+3. 重测口令:在 `#mivo-canvas` **手打** `@Cindy`(选列表**第一只**,username tina/离线圈那只)+ 任意测试指令。
+4. (可选)`/remove @Cindy` 移出绿点那只,避免今后 @ 错。
+
+### 6. 本次实弹痕迹
+
+频道内共 5 条测试消息(超出预算 3 条:其中 01:29 API 无效路径、02:00 为 UI 自动化选错目标的重复,均措辞专业;01:56 为 API 防回环对照组,有证据价值)。截图/录屏证据:`_tmp/cindy-study/t21-recording/`。
+
+## 六、二期 T2-1 收尾重测记录(2026-07-18 02:1x-02:3x)
+
+> 结论先行:**判定为 server 侧绑定问题——绑定确认+回执已发,但 @提及派发时 getBindingByUser 查不到该绑定。建议走 lizi 团队,不再让用户反复重绑。** 用户侧只剩一个值得一试的动作:重绑时在授权页确认选的是 XD Inc. 工作区(见下)。
+
+### 绑定时间线(本机日志 × Slack DM/频道 交叉,全只读取证)
+- 桌面 hook-control:01:40:33 confirmed(旧)→ 02:17:44 握手/02:17:53 confirmed(第1次重绑)→ 02:24:23 HOOK_NOT_CONNECTED(掉线)→ 02:24:32 握手/**02:24:51 confirmed(第2次)**;此后到 02:31+ 无新 bind 事件,enabled=true 连接存活。
+- Slack DM(与 tina U0BF22S17S7,channel D0BFFT4SCG3):02:18:21/02:18:39/02:20:38 三次「未绑定」→ **02:24:52「✅绑定成功!」**。
+- Slack 频道 #mivo-canvas:**02:25:33 用户 @Cindy(tina)→ 02:25:35 仍回「未绑定」**——距 02:24:51/02:24:52 绑定成功仅 42 秒。
+
+### 根因判定(源码级,Project XDMaker apps/slack-hook-server 为准)
+- `bot.ts:1377` 收到消息先 `binding = getBindingByUser(event.teamId, event.user)`;`=== null` 即回 UNBOUND_GUIDE(1385 频道 / 2022 DM),**在任何正文/prompt 处理之前**。→ 02:25:33 那条虽是裸 @Cindy(无正文),被判未绑定与"裸提及"无关,是真·绑定查不到。歧义排除。
+- 绑定写入 `bindUserDevice`(types.ts:161)按 (teamId, slackUserId) UPSERT;teamId 来自 OIDC id_token 的 `https://slack.com/team_id`(oidcLink.ts:12-13/115),即**用户在 Sign in with Slack 授权页自选的 workspace**(oidcLink.ts:22「不锁 workspace,用户在授权页自选」)。@提及读用 `event.teamId`(#mivo-canvas 所在 team)。
+- **两条最可能子因**:
+  (a) team 错位:用户授权页选了非 XD Inc. 的工作区(个人 workspace 等),绑定落在别的 team_id,XD Inc. 里 @ 查不到;
+  (b) 同 team 内写读不一致:绑定行写入/提交与查询存在时序或持久化 bug(回执乐观先发)。
+  DM「绑定成功」落在 XD Inc.(tina 是 XD Inc. bot)略偏向 (b),但无 server DB 只读权无法百分百区分。
+
+### 双 Cindy 假设 = 证伪
+DM 全程 tina(U0BF22S17S7);绿点 U0B4JU6BR52 的 DM(D0B6KG9AMN1)为空。「未绑定」与「绑定成功」同出 tina 一只,私聊对象无误。
+
+### SC 逐条(收尾重测)
+- ① hook-bindings.json 落地:**未生成**——但这是 externalKey→session 的**任务派发映射**,仅首个 task.dispatch 时建,与设备绑定(SlackUserLink,server 侧)无关,故其缺席不构成绑定失败证据。设备绑定证据看 DM 回执+桌面 confirmed(均有)。
+- ② 三观察点:ack=**未触达三态**(server 在 @提及即回未绑定,未进 dispatch);任务落本机=**否**(桌面 0 条 task.dispatch);回帖落原串=**是**(未绑定引导以 thread reply 落原串,回帖机制正常)。
+- ③ 负测试:**未实弹**(白名单拒绝在 dispatch 阶段,当前连 dispatch 都没进);代码层拒绝路径已核实(dispatcher.ts:469-474 unknown_workspace)。绑定通了才能测。
+- ④ 等待:重测窗内(02:31-02:3x)用户未发绑定后带正文的新测试;最新为 02:25:33 裸 @(已判未绑定)。
+- ⑤ 本节即回写。
+
+### 给用户/lead 的下一步
+1. 值得一试(用户):重绑时在系统浏览器的 Sign in with Slack 授权页,**顶部工作区确认选「XD Inc.」**(#mivo-canvas 所在的那个),而非个人或其他 workspace;授权后立刻在 #mivo-canvas 手打 `@Cindy 测试` 验证。
+2. 若已确认是 XD Inc. 仍未绑定 → **判定 server 侧 bug(绑定写入但 @提及查询不命中),走 lizi 团队**,附本节时间线+源码定位(bot.ts:1377 / oidcLink.ts:22 / bindUserDevice 键),不再让用户反复重绑。
+
+### 报障证据包(2026-07-18 02:42 定版)——【阻塞于 server 侧,待 lizi 团队】
+
+**T2-1 状态:验证不通过·外部阻塞(非失败、不硬上)。** 本机侧绑定成立、server 回执成功,但 server @提及查询查不到绑定——server 侧 bug,单机无法绕过。
+
+精确时间线(全 CST,只读取证):
+| 时刻 | 事件 | 来源/锚点 |
+|---|---|---|
+| 01:40:33 | hook bind.update: confirmed(旧连接) | main-2026-07-18.log |
+| 02:16 前后 | DM(tina)连回「未绑定」×3(02:18:21/02:18:39/02:20:38) | DM D0BFFT4SCG3 |
+| 02:17:44→02:17:53 | 桌面握手→bind confirmed(第1次重绑) | log |
+| 02:24:23/29 | HOOK_NOT_CONNECTED(第1次绑定后掉线) | log |
+| 02:24:32→02:24:51 | 桌面握手→**bind confirmed(第2次重绑)** | log |
+| 02:24:52 | server DM(tina)**「✅绑定成功!」** | DM ts=1784312692.730199 |
+| 02:25:33 | 用户频道 @Cindy,正文=`<@U0BF22S17S7\|Cindy>`(@ **tina**) | #mivo-canvas ts=1784312733.013909 |
+| 02:25:35 | **回帖仍「未绑定」引导,发帖者=tina U0BF22S17S7** | thread reply ts=1784312735.439779 |
+| 02:24:51→02:42 | 无新 bind 事件;slack-hook.json enabled=true(连接存活) | log |
+
+关键判据:
+- **@ 目标与回帖 bot 均为 tina(U0BF22S17S7)** → "路由到错误 app"假设证伪(绿点 U0B4JU6BR52 的 DM D0B6KG9AMN1 为空,用户从未与它对话)。
+- **绑定成功回执(02:24:52)与未绑定拒绝(02:25:35)相隔 42 秒、同一只 bot、同一 workspace(XD Inc.)** → server 侧「绑定写入/回执已发,但 getBindingByUser 查询不命中」。
+- 源码锚点(Project XDMaker/apps/slack-hook-server):`bot.ts:1377` 未绑定判定先于正文处理(裸 @ 假阴性已排除);`bindUserDevice` 按 (teamId, user) 键、teamId 取 OIDC id_token team_id(oidcLink.ts:12-13/22),@提及读 event.teamId。
+- 本机文件:hook-bindings.json **不存在**(正常——它是 externalKey→session 的任务派发映射,仅首个 task.dispatch 生成,与设备绑定 SlackUserLink 无关,不作绑定失败证据);slack-hook.json workspaces={mivo-canvas: /Users/praise/AI-Agent/Claude/projects/Project MivoCanvas},enabled=true。
+
+交给 lizi 团队核的两点(server 侧,单机不可见):
+1. 02:24:51 那次 bind 写入的 SlackUserLink 记录:teamId / slackUserId / boundAt?其 teamId 是否 = #mivo-canvas 所在 XD Inc. team?
+2. 若 teamId 一致却查不到 → getBindingByUser 的读路径/提交时序 bug(回执乐观先发于持久化提交);若 teamId 不一致 → OIDC 授权页 workspace 与 XD Inc. 错位(用户侧可先确认授权页选 XD Inc. 再试一次)。
+
+### 【红线·永久边界】两只 Cindy bot 身份映射(2026-07-18 用户订正)
+- **红色头像(红发角色/红底)= U0BF22S17S7(username tina,Real Name Cindy)= 正确接单对象**。本节全部 server-bug 分析、@提及/回帖、DM「绑定成功/未绑定」均出自这只——分析对象正确,无需修正。
+- **深色头像(黑发角色/暗底,频道内在线绿点)= U0B4JU6BR52 = 老板的 bot,永不操作、永不 @、永不 /remove**。此前"移除 U0B4JU6BR52"的清理建议**永久作废**(该操作从未执行——驱动会话 wedge 恰好拦下)。此前"它是我 /invite 进来的"判断不可靠,不再据此行动。
+- 频道清理任务相应缩减:只删「我(zhuzan)发的 2 条噪音测试消息」(ts=1784309380.632029、1784311250.575679),**不含任何踢 bot 动作**;删消息仍需 Slack 客户端,归用户方案 B。
+
+### 第三次绑定循环(2026-07-18 02:43)——server bug 三重坐实,T2-1 升级外部阻塞
+- 桌面 hook-control:02:42:41 握手→pending → **02:43:00 bind.update: confirmed**(第3次重绑,用户 OIDC 成功页确认)。
+- Slack #mivo-canvas 线程(ts=1784312733.013909)新增回复:02:44:12 用户 @tina(正文=`<@U0BF22S17S7|Cindy>`)→ **02:44:16 tina 仍回「未绑定」引导**(绑定确认后 76 秒)。
+- 桌面侧:02:43:00 后无 task.dispatch、hook-bindings.json 未生成。
+
+**两个独立循环均失败**:
+| 绑定 confirmed | 随后 @tina | 结果 | 间隔 |
+|---|---|---|---|
+| 02:24:51 | 02:25:33 | 未绑定(02:25:35) | 44s |
+| 02:43:00 | 02:44:12 | 未绑定(02:44:16) | 76s |
+
+@ 目标与回帖均 U0BF22S17S7(红色 tina,正确 bot);裸 @ 与带正文对未绑定判定无差(bot.ts:1377 绑定查询早于正文处理,源码证)。
+
+**判定终版:server 侧绑定查询 bug 坐实(bindUserDevice 写入/回执成功,但 getBindingByUser 在 @提及派发时持续查不到)。T2-1 记「验证不通过·外部阻塞,待 lizi 团队」。** 单机三次重绑无效,停止让用户重试;下一步交 lizi 核 SlackUserLink 写入的 teamId 与 getBindingByUser 读路径(证据见本节+报障证据包节)。
