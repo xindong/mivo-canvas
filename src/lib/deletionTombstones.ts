@@ -156,31 +156,55 @@ const getAllRecords = async (): Promise<TombstoneRecord[]> => {
   }
 }
 
-const putRecord = async (record: TombstoneRecord): Promise<boolean> => {
-  // 已存在则不覆盖 createdAt(保持首次删除时间;重复删同 id 幂等)。先 get 判存,再 put。
+const putRecord = async (record: TombstoneRecord): Promise<'new' | 'enriched' | 'existing'> => {
+  // 已存在则不覆盖 createdAt(保持首次删除时间;重复删同 id 幂等)。
+  // P1-4(forward-compat 返修):同 key 已存在但缺 parentProjectId → 原子 enrich 补 parentProjectId(不整条覆盖,
+  //   保留 existing.createdAt/kind/ownerId/resourceId;#264 旧墓碑补 cascade provenance 供 revokeCanvasTombstonesForProject)。
+  //   仅当新 record 携带 parentProjectId(cascade delete 场景)且 existing 缺它时才 enrich;其余 existing → no-op。
   if (!isIdbAvailable()) {
-    if (memStore.has(record.key)) return false
+    const existing = memStore.get(record.key)
+    if (existing) {
+      if (record.parentProjectId !== undefined && existing.parentProjectId === undefined) {
+        memStore.set(record.key, { ...existing, parentProjectId: record.parentProjectId })
+        return 'enriched'
+      }
+      return 'existing'
+    }
     memStore.set(record.key, record)
-    return true
+    return 'new'
   }
   try {
     let written = false
+    let enriched = false
     await runVoidTx('readwrite', (store) => {
       const getReq = store.get(record.key) as IDBRequest<TombstoneRecord | undefined>
       getReq.onsuccess = () => {
-        if (getReq.result === undefined) {
+        const existing = getReq.result
+        if (existing === undefined) {
           store.put(record)
           written = true
+        } else if (record.parentProjectId !== undefined && existing.parentProjectId === undefined) {
+          // enrich(原子:同 tx 内 get→put;不覆盖 createdAt/kind/ownerId/resourceId,只补 parentProjectId)
+          store.put({ ...existing, parentProjectId: record.parentProjectId })
+          enriched = true
         }
+        // else: existing(已 parentProjectId 或新 record 无 parentProjectId)→ no-op
       }
     })
-    if (written) memStore.delete(record.key)
-    return written
+    if (written) memStore.delete(record.key) // record durable,清 stale memStore 兜底
+    return written ? 'new' : enriched ? 'enriched' : 'existing'
   } catch (error) {
     warnIdbDegradation(`put failed for ${record.key}`, error)
-    if (memStore.has(record.key)) return false
+    const existing = memStore.get(record.key)
+    if (existing) {
+      if (record.parentProjectId !== undefined && existing.parentProjectId === undefined) {
+        memStore.set(record.key, { ...existing, parentProjectId: record.parentProjectId })
+        return 'enriched'
+      }
+      return 'existing'
+    }
     memStore.set(record.key, record)
-    return true
+    return 'new'
   }
 }
 
@@ -234,11 +258,16 @@ export const recordDeletionTombstone = async (
     createdAt: Date.now(),
     ...(opts?.parentProjectId !== undefined ? { parentProjectId: opts.parentProjectId } : {}),
   }
-  const written = await putRecord(record)
-  if (written) {
+  const result = await putRecord(record)
+  if (result === 'new') {
     debugLogger.log(
       SOURCE,
       `tombstone recorded for ${kind} ${resourceId} (owner=${ownerId}; anti-resurrection D${opts?.parentProjectId !== undefined ? `; cascade under project ${opts.parentProjectId}` : ''})`,
+    )
+  } else if (result === 'enriched') {
+    debugLogger.log(
+      SOURCE,
+      `tombstone enriched (parentProjectId=${opts?.parentProjectId} added to legacy record) for ${kind} ${resourceId} (owner=${ownerId}; P1-4 forward-compat)`,
     )
   }
 }

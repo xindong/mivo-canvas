@@ -117,11 +117,26 @@ describe('Phase 2 F-B(决策7):canvas tombstone parentProjectId + revokeCanvasTo
     expect(ids.has('c1')).toBe(true) // userA 的 tombstone 不被 userB 撤销(防跨 owner 误过滤)
   })
 
-  it('旧 tombstone(无 parentProjectId,Phase 1→2 部署窗口期写入)保守不动(缺字段不撤销,依赖回收站兜底)', async () => {
-    // 模拟旧 Phase 1 写入的 canvas tombstone(无 parentProjectId)——revoke-by-project 撞不到
+  it('旧 tombstone(无 parentProjectId,Phase 1→2 部署窗口期写入)未被 cascade 再记录 → 保守不动(缺字段不撤销,依赖回收站兜底)', async () => {
+    // 模拟旧 Phase 1 写入的 canvas tombstone(无 parentProjectId)——revoke-by-project 撞不到。
+    // 注:若后续被 cascade delete 再记录(带 parentProjectId),putRecord 会原子 enrich(见下测);本测覆盖"未被再记录"的旧墓碑。
     await recordDeletionTombstone('canvas', 'cLegacy')
     await revokeCanvasTombstonesForProject('p1') // 旧 tombstone 无 parentProjectId === p1 → 不命中
     const ids = await getDeletionTombstones('canvas')
-    expect(ids.has('cLegacy')).toBe(true) // 保守不动(文档注明的极窄边缘:依赖回收站恢复入口兜底)
+    expect(ids.has('cLegacy')).toBe(true) // 保守不动(未被 cascade 再记录 → 无 enrich → 依赖回收站恢复入口兜底)
+  })
+
+  it('P1-4(forward-compat 返修):旧 tombstone(无 parentProjectId)经 cascade delete 再记录 → 原子 enrich 补 parentProjectId → revoke-by-project 命中', async () => {
+    // Phase 1→2 部署窗口期写入的旧 canvas tombstone(无 parentProjectId)。
+    await recordDeletionTombstone('canvas', 'cLegacy') // 无 parentProjectId → 新 record
+    // 旧 tombstone 此时无 parentProjectId → revoke-by-project 撞不到。
+    await revokeCanvasTombstonesForProject('p1')
+    expect((await getDeletionTombstones('canvas')).has('cLegacy')).toBe(true) // 仍挡复活
+    // 后续 cascade delete 同 canvas(带 parentProjectId)→ putRecord 原子 enrich:existing(无 parent)+ new(parent)
+    // → put({...existing, parentProjectId})(不整条覆盖,保留 createdAt/kind/ownerId/resourceId)。
+    await recordDeletionTombstone('canvas', 'cLegacy', { parentProjectId: 'p1' })
+    // enrich 后,revoke-by-project('p1') 命中(cLegacy 现有 parentProjectId='p1')→ 撤销(restoreProject 可恢复其画布)。
+    await revokeCanvasTombstonesForProject('p1')
+    expect((await getDeletionTombstones('canvas')).has('cLegacy')).toBe(false)
   })
 })
