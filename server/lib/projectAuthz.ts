@@ -14,7 +14,7 @@ import type { PermissionBackend } from './permissions'
 import { canAccessProject, canAccessCanvas, denyStatus, type AuthzAction, type AuthzInfo } from './authz'
 import { resolveActor } from './owner'
 import { logRequest } from './request'
-import type { UnknownResourceBody } from '../../shared/persist-contract.ts'
+import type { ArchivedBody, UnknownResourceBody } from '../../shared/persist-contract.ts'
 
 /** 分享 token header / query(§4 token 信任;routes 共用)。 */
 export const shareTokenOf = (c: Context<AppEnv>): string | undefined =>
@@ -141,6 +141,14 @@ export const resolveCanvasAccess = async (
     const status = denyStatus(info) === 403 ? 403 : 404
     const body = status === 403 ? { error: 'forbidden' } : { error: 'unknown-canvas' } satisfies UnknownResourceBody
     return { ok: false, status, body }
+  }
+  // CR-6(Phase 2 归档 write-guard,与 routes/canvas.ts authzCanvas:145-146 对齐):archived canvas 的
+  //   write/move → 409 archived。资产 attach/detach 经本 helper 授权(assets.ts:380/:492 调 'write'),补齐
+  //   CR-6 在此路径的覆盖(此前仅 authzCanvas 覆盖画布子记录写,资产 attach/detach 走 resolveCanvasAccess 漏)。
+  //   判定在 authz 通过之后 → 非成员先被 canAccessCanvas deny 得 404/403,不泄漏归档存在性(同 authzCanvas
+  //   F-1 修);isDeleted 已在上方 :122-125 短路 404。read/manage 放行(归档可读、可恢复、可彻底删除)。
+  if (got.record.status === 'archived' && (action === 'write' || action === 'move')) {
+    return { ok: false, status: 409, body: { error: 'archived', id: canvasId } satisfies ArchivedBody }
   }
   return { ok: true, ownerId: owner.ownerId, projectId, actor: info.actor }
 }

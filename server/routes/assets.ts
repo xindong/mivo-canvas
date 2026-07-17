@@ -379,8 +379,8 @@ export const createAssetRoutes = (options: AssetRouteOptions): App => {
     // Gate ①:actor 对目标 canvas 有 edit(write)权 + node 属该 canvas(权威反查,不信裸 nodeId)。
     const access = await resolveCanvasAccess(c, persist, permissions, canvasId, 'write')
     if (!access.ok) {
-      log(access.status, access.status === 403 ? 'forbidden' : 'unknown-canvas')
-      return c.json(access.body as Record<string, unknown>, access.status as 400 | 403 | 404 | 410)
+      log(access.status, access.status === 403 ? 'forbidden' : access.status === 409 ? 'archived' : 'unknown-canvas')
+      return c.json(access.body as Record<string, unknown>, access.status as 400 | 403 | 404 | 409 | 410)
     }
     const node = await persist.getChild(access.ownerId, canvasId, 'node', nodeId)
     if (node.kind === 'missing' || node.kind === 'cross-canvas') {
@@ -491,8 +491,8 @@ export const createAssetRoutes = (options: AssetRouteOptions): App => {
       }
       const access = await resolveCanvasAccess(c, persist, permissions, ref.canvasId, 'write')
       if (!access.ok) {
-        log(access.status, access.status === 403 ? 'forbidden' : 'unknown-canvas')
-        return c.json(access.body as Record<string, unknown>, access.status as 400 | 403 | 404 | 410)
+        log(access.status, access.status === 403 ? 'forbidden' : access.status === 409 ? 'archived' : 'unknown-canvas')
+        return c.json(access.body as Record<string, unknown>, access.status as 400 | 403 | 404 | 409 | 410)
       }
     }
     // authz 过(新 ref canvas-edit / legacy ref 走 service ownerFp)→ detach(P1-4 残留2:传 ref.canvasId

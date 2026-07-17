@@ -235,3 +235,42 @@ describe('G2.2 — refcount 经 attach/detach 变化(内容寻址 refcount = ref
     expect(((await r3.json()) as { refcount: number }).refcount).toBe(0)
   })
 })
+
+describe('CR-6(Phase 2 归档 write-guard)— archived canvas attach/detach → 409 {error:"archived"}', () => {
+  // 守卫在 server/lib/projectAuthz.ts resolveCanvasAccess(canAccessCanvas deny 后、return ok 前),对齐
+  // routes/canvas.ts authzCanvas:145-146;补齐资产 attach/detach 路径(走 resolveCanvasAccess 'write')的 CR-6
+  // 覆盖(此前仅 authzCanvas 覆盖画布子记录写,资产 attach/detach 漏)。read/manage 放行(守卫只 write/move):
+  // assets.ts:297 resolveCanvasAccess 'read'(资产可见性)+ attach gate ② actorHasCanvasAccess('read') 均不触发。
+  it('archived canvas attach → 409 {error:"archived", id}(owner write 过 authz,archived write-guard 拒;非 403/404)', async () => {
+    const persist = createPersistBackend()
+    const permissions = new InMemoryPermissionBackend()
+    const app = buildApp(createMemoryAssetBackend(), persist, permissions)
+    const ids = { project: 'p1', canvas: 'c1', node: 'n1' }
+    await seedCanvas(persist, MIVO_KEY_A, ids)
+    const assetId = await uploadAsset(app)
+    // 归档画布(本 app 只挂 asset 路由,无 /:id/archive,直接调 persist.archiveCanvasTree)。
+    const ownerId = fingerprintOfPlatformKey(MIVO_KEY_A)
+    await persist.archiveCanvasTree(ownerId, ids.canvas)
+    const r = await attach(app, assetId, ids.node, ids.canvas)
+    expect(r.status).toBe(409)
+    expect(await r.json()).toEqual({ error: 'archived', id: ids.canvas })
+  })
+
+  it('archived canvas detach → 409 {error:"archived", id}(已有 ref 的 archived 画布 detach 被 write-guard 拒)', async () => {
+    const persist = createPersistBackend()
+    const permissions = new InMemoryPermissionBackend()
+    const app = buildApp(createMemoryAssetBackend(), persist, permissions)
+    const ids = { project: 'p1', canvas: 'c1', node: 'n1' }
+    await seedCanvas(persist, MIVO_KEY_A, ids)
+    const assetId = await uploadAsset(app)
+    // active 态先 attach 一条 ref(供 detach 目标)。
+    const attached = await attach(app, assetId, ids.node, ids.canvas)
+    expect(attached.status).toBe(200)
+    // 归档画布 → detach 走 resolveCanvasAccess(ref.canvasId, 'write') 撞 archived guard → 409。
+    const ownerId = fingerprintOfPlatformKey(MIVO_KEY_A)
+    await persist.archiveCanvasTree(ownerId, ids.canvas)
+    const r = await detach(app, assetId, ids.node, ids.canvas)
+    expect(r.status).toBe(409)
+    expect(await r.json()).toEqual({ error: 'archived', id: ids.canvas })
+  })
+})
