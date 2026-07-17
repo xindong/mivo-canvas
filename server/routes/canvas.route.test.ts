@@ -4,7 +4,7 @@
 // + N5 If-Match 严格 + N7 authz + N8 reorder + N10 payload allowlist + 原 13 条回归(保持绿):
 // 全量 GET(#5/#6)、枚举(#8)、节点级 PATCH(FX-4 + #3 cross-canvas + #4 428/If-Match + #13 白名单 + #12 413)、
 // edge/anchor DELETE(#8)、硬删子资源(#2)、原子 tree 软删(#2/#7)、reorder(#6/N8)、chat(DP-6/N2/N3)。
-import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll, vi } from 'vitest'
 import {
   buildPersistApp,
   hdr,
@@ -157,6 +157,73 @@ describe('/api/canvas routes (T1.3 返修二 N1-N10)', () => {
     expect(body.nodes[0].revision).toBe(2) // A2-S2:create(1) → edit bumped to 2
     expect(body.nodes[0].orderKey).toBe(0)
     expect(body.nodes.map((n) => n.id)).toEqual(['n1', 'n2'])
+  })
+
+  // Phase 1 项5 + 双审 F-A(2026-07-16 server 读容错,防 canvas-78c5bed3 类 500 + 错误分类):
+  //   signEntries split try/catch —— ① readRecordFieldClocks(DB 读)抛错 → rethrow → 500 → client 重试(fail-visible);
+  //   ② toEntry/encodeBase(本 record 结构编码)抛错 → swallow 跳过 → 200 降级(确定性结构损坏,重试也复现)。
+  //   断言绑定真实行为差异:瞬时→500 vs 结构损坏→200-skip(非 shape 断言)。
+  it('Phase 1 项5 结构损坏: GET /:id 单条 record 的 fieldClocks 畸形(BigInt 致 encodeBase JSON.stringify 失败)→ 降级 200(非 500),损坏 record 跳过,其余可读', async () => {
+    await seedProject()
+    await seedCanvas()
+    await createChildFixture(app, 'c1', 'node', 'n-ok', wirePayload(canonicalNode('n-ok')))
+    await createChildFixture(app, 'c1', 'node', 'n-bad', wirePayload(canonicalNode('n-bad')))
+    // 模拟 canvas-78c5bed3 类结构损坏:n-bad 的 fieldClocks 含 BigInt → encodeBase 的 JSON.stringify 抛
+    //   TypeError("Do not know how to serialize a BigInt")= 确定性结构损坏(重试也复现)→ swallow 跳过(② 路径)。
+    const original = backend.readRecordFieldClocks.bind(backend)
+    backend.readRecordFieldClocks = async (ownerId: string, type: 'node' | 'edge' | 'anchor', recordId: string) => {
+      if (recordId === 'n-bad') return { bad: BigInt(1) } as unknown as Record<string, number>
+      return original(ownerId, type, recordId)
+    }
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const got = await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })
+      // 结构损坏:降级 200(非整体 500);n-bad 跳过(encode/base 失败),其余可读(n-ok 返回)
+      expect(got.status).toBe(200)
+      const body = got.body as { nodes: { id: string }[] }
+      expect(body.nodes.map((n) => n.id)).toEqual(['n-ok'])
+      expect(body.nodes.map((n) => n.id)).not.toContain('n-bad')
+      // server console.warn 留痕(结构损坏可观测,含 encode/base structural failure 标识)
+      expect(
+        warnSpy.mock.calls.some(
+          (c) =>
+            typeof c[0] === 'string' &&
+            c[0].includes('skipping corrupted node record n-bad') &&
+            c[0].includes('encode/base structural failure'),
+        ),
+      ).toBe(true)
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
+  it('Phase 1 项5 F-A 瞬时错: GET /:id 的 readRecordFieldClocks 抛连接/超时类瞬时错 → 路由 500(不静默吞 200 带洞;client 重试)', async () => {
+    await seedProject()
+    await seedCanvas()
+    await createChildFixture(app, 'c1', 'node', 'n-ok', wirePayload(canonicalNode('n-ok')))
+    await createChildFixture(app, 'c1', 'node', 'n-bad', wirePayload(canonicalNode('n-bad')))
+    // 模拟 DB 抖动:n-bad 的 field-clock 查询抛连接/超时类瞬时错(PG SQLSTATE 57P01 connection-class,client 可重试)。
+    const original = backend.readRecordFieldClocks.bind(backend)
+    backend.readRecordFieldClocks = async (ownerId: string, type: 'node' | 'edge' | 'anchor', recordId: string) => {
+      if (recordId === 'n-bad') {
+        const e = new Error('connection terminated (connection pool exhausted / statement_timeout)')
+        ;(e as Error & { code: string }).code = '57P01' // PG connection-class SQLSTATE(瞬时,client retry)
+        throw e
+      }
+      return original(ownerId, type, recordId)
+    }
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const got = await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })
+      // F-A:瞬时 DB 错 → rethrow(① 路径)→ 路由外层 500(非 200 带洞;client 重试恢复,fail-visible 不静默吞)
+      expect(got.status).toBe(500)
+      // rethrow 路径不打 warn(swallow 只在②结构损坏时打;瞬时错交外层 500,不静默)
+      expect(
+        warnSpy.mock.calls.some((c) => typeof c[0] === 'string' && c[0].includes('skipping corrupted')),
+      ).toBe(false)
+    } finally {
+      warnSpy.mockRestore()
+    }
   })
 
   it('返修 #8:GET /api/canvas?projectId= 枚举(跨 owner 不可见)', async () => {

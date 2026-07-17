@@ -61,6 +61,12 @@ import {
 } from './persistBoot'
 import { __resetWriteQueueDb, __seedWritesForTest } from './writeRetryQueue'
 import { ANONYMOUS_USER_ID, setPersistUserId, __resetPersistUserId } from './persistUserId'
+// Phase 1 项4:tombstone 生命周期测试辅助(直接写/读 tombstone,隔离 hydrate 过滤/onOutcome 清除/restore 撤销)。
+import {
+  __resetDeletionTombstonesDb,
+  recordDeletionTombstone,
+  getDeletionTombstones,
+} from './deletionTombstones'
 import type { ServerPersistAdapter } from './serverPersistAdapter'
 import type { Project, CanvasMeta } from '../../shared/persist-contract.ts'
 import { DEMO_PROJECT_IDS } from '../store/demoScenes'
@@ -92,6 +98,9 @@ beforeEach(async () => {
   stopPersistWriteQueue()
   __resetPersistBoot()
   await __resetWriteQueueDb()
+  // Phase 1 项4:清 tombstone(逐 test 隔离;防 SC-1 经 deleteProject store action 写的 pX tombstone 泄漏到
+  //   SC-3 → SC-3 第一段 hydrate 误过滤 pX(本该灌回验 B 兜底)→ 假失败。)
+  await __resetDeletionTombstonesDb()
   resetStoreProjects()
 })
 
@@ -1943,5 +1952,256 @@ describe('D2 migration-on-boot + D3 restore-safe edge (lead SC-B/D/E)', () => {
     // 对照:非 demo scene → 正常调 listChatMessages
     await backfillChatAfterDrain('real-canvas-uuid', server.adapter)
     expect(listChatSpy).toHaveBeenCalledWith('real-canvas-uuid')
+  })
+})
+
+// ── Phase 1 项1/项3/项4(2026-07-16 复活 + 丢项目修复,CR-1/CR-2/CR-3·CR-4)──────────────────
+//  项1: marker-set replace 保 demo seed 项目(防种子项目消失 + 其画布成 orphan projectId)
+//  项3: orphan-parent 画布跳过收集(防 404 unknown-project terminal + ERROR 死循环,与项2 停清配套)
+//  项4: 持久 tombstone 全生命周期(DELETE 离队——重试耗尽/溢出驱逐——后 pending-delete 失效,tombstone 接力挡复活)
+
+// stateful 迁移服务端:adapter(listProjects/listCanvas 读 state)+ fetch(POST/DELETE 写 state)共享 state,
+//   F1 flush 重拉 adapter 验可恢复性,故 adapter 反映 drain 后真值(同 makeMigrationServer 但更简,项3 专用)。
+const makeSimpleMigrationServer = () => {
+  const state = { projects: [] as string[], canvases: [] as { id: string; projectId: string }[] }
+  const calls: { method: string; path: string; body: unknown }[] = []
+  const json = (obj: unknown, status: number) =>
+    new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json' } })
+  const fetch = async (input: string, init?: RequestInit): Promise<Response> => {
+    const method = (init?.method ?? 'GET').toUpperCase()
+    const path = new URL(input, 'http://stub').pathname
+    const body = init?.body ? JSON.parse(init.body as string) : null
+    calls.push({ method, path, body })
+    if (method === 'POST' && path === '/api/projects') {
+      state.projects.push((body as { id: string }).id)
+      return json({ id: (body as { id: string }).id, name: (body as { name: string }).name, revision: 1, ownerId: KEY_A, createdAt: 't', updatedAt: 't', isDeleted: false }, 200)
+    }
+    if (method === 'POST' && path === '/api/canvas') {
+      state.canvases.push({ id: (body as { id: string }).id, projectId: (body as { projectId: string }).projectId })
+      return json({ id: (body as { id: string }).id, projectId: (body as { projectId: string }).projectId, title: (body as { title?: string }).title ?? '', metaRevision: 1, contentVersion: 0, createdAt: 't', updatedAt: 't' }, 200)
+    }
+    if (method === 'DELETE') return new Response(null, { status: 204 })
+    return json({ id: 'srv', revision: 0 }, 200)
+  }
+  const adapter: ServerPersistAdapter = {
+    listProjects: async () => ({
+      projects: state.projects.map((id) => ({ id, name: id, ownerId: KEY_A, createdAt: 't', updatedAt: 't', revision: 0, isDeleted: false })),
+    }),
+    listCanvas: async () => ({
+      canvases: state.canvases.map((c) => ({ id: c.id, projectId: c.projectId, title: '', createdAt: 't', updatedAt: 't', metaRevision: 0, contentVersion: 0 })),
+    }),
+    listChatMessages: async () => ({ messages: [], orderRevision: 0 }),
+  } as unknown as ServerPersistAdapter
+  return { adapter, fetch, calls, state }
+}
+
+describe('Phase 1 项1 — marker-set replace 保 demo seed 项目(防种子消失,CR-1)', () => {
+  const proj = (id: string, name: string): Project => ({
+    id, name, ownerId: KEY_A, createdAt: 't', updatedAt: 't', revision: 0, isDeleted: false,
+  })
+  const adapter = (projects: Project[]): ServerPersistAdapter =>
+    ({
+      listProjects: async () => ({ projects }),
+      listCanvas: async () => ({ canvases: [] }),
+      listChatMessages: async () => ({ messages: [], orderRevision: 0 }),
+    }) as unknown as ServerPersistAdapter
+  const hydrateOpts = {
+    fetch: async () => new Response(JSON.stringify({ entries: {} }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    baseUrl: '',
+    getAuthHeaders: () => authHeaders(),
+  }
+
+  it('marker 已种 + 服务端有 real-proj + 本地有 demo + real-proj → replace 保留 demo(对称 !marker demo 保护;修前 demo 被丢)', async () => {
+    localStorage.setItem('mivo:server-migration:anonymous', 'done') // marker set
+    const serverProj = [proj('real-proj-1', 'Real')]
+    resetStoreProjects([proj(DEMO_PROJECT_IDS.conceptBattlepass, 'Concept BP'), proj('real-proj-1', 'Real')])
+    useCanvasStore.setState({ canvases: {} })
+    await hydrateFromServer(adapter(serverProj), hydrateOpts)
+    // 项1:demo 在 marker-set replace 后保留(修前 demo 既不在 filteredProjects 也不在 localPendingCreates → 丢)
+    expect(useCanvasStore.getState().projects.map((p) => p.id).sort()).toEqual(
+      [DEMO_PROJECT_IDS.conceptBattlepass, 'real-proj-1'].sort(),
+    )
+  })
+
+  it('marker 已种 + 服务端无 demo + 本地仅 demo project → 修前 demo 丢 + persist 回写永久消失;修后 retainedDemoProjects 保留', async () => {
+    localStorage.setItem('mivo:server-migration:anonymous', 'done')
+    const serverProj = [proj('real-proj-1', 'Real')]
+    resetStoreProjects([proj(DEMO_PROJECT_IDS.conceptBattlepass, 'Concept BP')])
+    useCanvasStore.setState({ canvases: {} })
+    await hydrateFromServer(adapter(serverProj), hydrateOpts)
+    expect(useCanvasStore.getState().projects.map((p) => p.id)).toContain(DEMO_PROJECT_IDS.conceptBattlepass)
+  })
+
+  // Phase 1 Fix 2(双审对称缺口):retainedDemoProjects 须排除 tombstone/pending-delete(对称于上游 filteredProjects)。
+  //  极窄边缘:localStorage 丢失重灌 demo seed(IDB persist 回到 fresh 种子,demo project 重新在 store)+ IDB tombstone
+  //  存活(demo 曾被删 server 模式)→ 修前 retainedDemoProjects 把已删 demo 加回 = 复活;修后排除 tombstone 不复活。
+  it('Fix 2: 已删 demo(tombstoned)+ marker-set hydrate → 不被 retainedDemoProjects 复活(排除 tombstone,对称 filteredProjects)', async () => {
+    localStorage.setItem('mivo:server-migration:anonymous', 'done')
+    const demoId = DEMO_PROJECT_IDS.conceptBattlepass
+    // 写 tombstone(demo 曾被删 server 模式;IDB tombstone 存活跨 boot)
+    await recordDeletionTombstone('project', demoId)
+    // 模拟"localStorage 丢失重灌 seed":demo project 重新在 store(被 fresh 种入),但 tombstone 存活
+    resetStoreProjects([proj(demoId, 'Concept BP')])
+    useCanvasStore.setState({ canvases: {} })
+    // 服务端无 demo(demo 从不上迁)+ 有 real-proj
+    const serverProj = [proj('real-proj-1', 'Real')]
+    await hydrateFromServer(adapter(serverProj), hydrateOpts)
+    // Fix 2:retainedDemoProjects 排除 tombstoned demo → 不复活已删 demo(修前会 retainedDemoProjects 把它加回)
+    expect(useCanvasStore.getState().projects.map((p) => p.id)).not.toContain(demoId)
+    expect(useCanvasStore.getState().projects.map((p) => p.id)).toContain('real-proj-1')
+  })
+})
+
+describe('Phase 1 项3 — orphan-parent 画布跳过收集(防 404 unknown-project terminal + ERROR 死循环,CR-2)', () => {
+  const proj = (id: string, name: string): Project => ({
+    id, name, ownerId: KEY_A, createdAt: 't', updatedAt: 't', revision: 0, isDeleted: false,
+  })
+  const doc = (projectId: string, title: string) =>
+    ({ title, projectId, createdAt: 't', updatedAt: 't', nodes: [], edges: [], tasks: [] }) as never
+  const hydrateOpts = {
+    fetch: async () => new Response(JSON.stringify({ entries: {} }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    baseUrl: '',
+    getAuthHeaders: () => authHeaders(),
+  }
+
+  it('local canvas 的 projectId 指向不在 store.projects 的项目(orphan parent)→ 不收集 createCanvas op;marker 正常种(无 ERROR 循环)', async () => {
+    const server = makeSimpleMigrationServer()
+    const calls = server.calls
+    // 本地:real-proj(project 在 store)+ c-ok(parent real-proj 可迁)+ c-orphan(parent p-gone 不在 store → orphan)
+    resetStoreProjects([proj('real-proj', 'Real')])
+    useCanvasStore.setState({
+      sceneId: '' as never,
+      canvases: {
+        'c-ok': doc('real-proj', 'OK'),
+        'c-orphan': doc('p-gone', 'Orphan'),
+      } as never,
+    })
+    // hydrate(!marker):step1 收集 createProject(real-proj);step2 收集 createCanvas ——
+    //   c-ok 的 parent real-proj 在 store.projects(step1 setState 后 = filteredProjects ∪ candidates)→ 可迁 → 收集;
+    //   c-orphan 的 parent p-gone 不在 store.projects → 项3 跳过(不 push 注定 404 的 createCanvas op)。
+    await hydrateFromServer(server.adapter, hydrateOpts)
+    startPersistWriteQueue({ fetch: server.fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    await __flushServerMigrationForTest(server.adapter)
+    await flush()
+    // c-ok 上迁(parent 可迁 → POST /api/canvas c-ok);c-orphan 不上迁(parent 不可迁 → 跳过)
+    const canvasPosts = calls.filter((c) => c.method === 'POST' && c.path === '/api/canvas').map((c) => (c.body as { id: string }).id)
+    expect(canvasPosts).toEqual(['c-ok'])
+    expect(canvasPosts).not.toContain('c-orphan')
+    // c-orphan 留本地(union-merge 保留 local-only;不丢,仅不上迁)
+    expect(useCanvasStore.getState().canvases['c-orphan']).toBeDefined()
+    // 项3 验收:c-orphan 不产生 createCanvas op → 无 404 terminal → F1 marker 正常种(不被 orphan 拖住)
+    expect(localStorage.getItem('mivo:server-migration:anonymous')).toBe('done')
+  })
+})
+
+describe('Phase 1 项4 — 持久 tombstone 全生命周期(DELETE 离队后接力挡复活,CR-3/CR-4)', () => {
+  const proj = (id: string, name: string): Project => ({
+    id, name, ownerId: KEY_A, createdAt: 't', updatedAt: 't', revision: 0, isDeleted: false,
+  })
+  const adapter = (projects: Project[], canvases: CanvasMeta[] = []): ServerPersistAdapter =>
+    ({
+      listProjects: async () => ({ projects }),
+      listCanvas: async () => ({ canvases }),
+      listChatMessages: async () => ({ messages: [], orderRevision: 0 }),
+    }) as unknown as ServerPersistAdapter
+  const hydrateOpts = {
+    fetch: async () => new Response(JSON.stringify({ entries: {} }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    baseUrl: '',
+    getAuthHeaders: () => authHeaders(),
+  }
+
+  // 项4-A: tombstone 单独过滤(无 pending-delete,DELETE 离队后 tombstone 接力挡复活)
+  it('项4-A: tombstone 单独过滤(DELETE 离队/未 drain,pending-delete 不在队列,tombstone 接力挡复活)', async () => {
+    localStorage.setItem('mivo:server-migration:anonymous', 'done')
+    // 直接写 tombstone(模拟 store delete action 写入;DELETE 未 drain/已离队 → pending-delete 不在队列)
+    await recordDeletionTombstone('project', 'pX')
+    resetStoreProjects([])
+    useCanvasStore.setState({ canvases: {} })
+    // hydrate:服务端仍返 pX LIVE(DELETE 未到服务端)→ tombstone 必过滤(无 tombstone 则灌回 = 复活)
+    await hydrateFromServer(adapter([proj('pX', 'X')]), hydrateOpts)
+    expect(useCanvasStore.getState().projects.map((p) => p.id)).toEqual([])
+  })
+
+  // 项4-B: delete→立即 restore 撤销 tombstone(恢复不被永久隐藏)
+  it('项4-B: delete→restoreProject 撤销 tombstone → hydrate 不隐藏(restoreProject enqueue createProject 触发 revoke)', async () => {
+    localStorage.setItem('mivo:server-migration:anonymous', 'done')
+    const { fetch } = makeCountingFetch()
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    // 预置 tombstone(pX 曾被删)+ 本地已无 pX
+    await recordDeletionTombstone('project', 'pX')
+    expect((await getDeletionTombstones('project')).has('pX')).toBe(true)
+    // restoreProject(pX):重加 store + enqueue createProject(pX) → enqueuePersistWrite 触发 revoke(项4)
+    useCanvasStore.getState().restoreProject('pX', 'Restored')
+    await flush() // revoke fire-and-forget 落地
+    expect((await getDeletionTombstones('project')).has('pX')).toBe(false) // tombstone 撤销
+    // hydrate:服务端有 pX + tombstone 已撤销 → pX 保留(不被隐藏)
+    await hydrateFromServer(adapter([proj('pX', 'Restored')]), hydrateOpts)
+    expect(useCanvasStore.getState().projects.map((p) => p.id)).toContain('pX')
+  })
+
+  // 项4-C: DELETE 终态失败(rejected 400)→ tombstone 保留(服务端仍 LIVE,继续挡复活)
+  it('项4-C: DELETE 终态失败(rejected 400)→ tombstone 保留(服务端仍 LIVE,继续挡复活)', async () => {
+    localStorage.setItem('mivo:server-migration:anonymous', 'done')
+    const fetch = async (_input: string, init?: RequestInit): Promise<Response> => {
+      if ((init?.method ?? 'GET').toUpperCase() === 'DELETE') return new Response(JSON.stringify({ error: 'forbidden' }), { status: 400, headers: { 'content-type': 'application/json' } })
+      return new Response(JSON.stringify({ id: 'srv', revision: 0 }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    resetStoreProjects([proj('pX', 'X')])
+    useCanvasStore.setState({ canvases: {} })
+    // 模拟 store delete action 写 tombstone + enqueue deleteProject
+    await recordDeletionTombstone('project', 'pX')
+    await enqueuePersistWrite({ kind: 'deleteProject', projectId: 'pX' })
+    await flush()
+    const drainResult = await drainPersistQueue()
+    expect(drainResult?.terminals).toBe(1) // 400 rejected terminal
+    // 项4:terminal 失败(onOutcome 只在 success 清)→ tombstone 保留(服务端仍 LIVE)
+    expect((await getDeletionTombstones('project')).has('pX')).toBe(true)
+    // hydrate:服务端有 pX + tombstone 保留 → 过滤(删除没成功,不复活)
+    await hydrateFromServer(adapter([proj('pX', 'X')]), hydrateOpts)
+    expect(useCanvasStore.getState().projects.map((p) => p.id)).toEqual([])
+  })
+
+  // 项4-D: DELETE 终态 success(204)→ tombstone 清除(服务端已软删,无复活风险)
+  it('项4-D: DELETE 终态 success(204)→ tombstone 清除(服务端已软删,无复活风险)', async () => {
+    localStorage.setItem('mivo:server-migration:anonymous', 'done')
+    const { fetch } = makeCountingFetch() // DELETE 204 success
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    await flush()
+    resetStoreProjects([proj('pX', 'X')])
+    useCanvasStore.setState({ canvases: {} })
+    await recordDeletionTombstone('project', 'pX')
+    await enqueuePersistWrite({ kind: 'deleteProject', projectId: 'pX' })
+    await flush()
+    await drainPersistQueue()
+    // 项4:DELETE success → onOutcome clearDeletionTombstone → tombstone 清除
+    expect((await getDeletionTombstones('project')).has('pX')).toBe(false)
+  })
+
+  // 项4-E: DELETE op 溢出驱逐 → tombstone 保留(与队列生死解耦,接力挡复活)
+  it('项4-E: DELETE op 溢出驱逐(maxQueuePerUser=1)→ tombstone 保留(pX 永不 drain success,服务端仍 LIVE)', async () => {
+    localStorage.setItem('mivo:server-migration:anonymous', 'done')
+    // maxQueuePerUser=1 → 第 2 个 enqueue 驱逐最老 pending。DELETE 返 500(transient → pX 留 pending 重试,不 success 清 tombstone)。
+    const fetch = async (_input: string, init?: RequestInit): Promise<Response> => {
+      if ((init?.method ?? 'GET').toUpperCase() === 'DELETE') return new Response(JSON.stringify({ error: 'transient' }), { status: 500, headers: { 'content-type': 'application/json' } })
+      return new Response(JSON.stringify({ id: 'srv', revision: 0 }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() }, { maxQueuePerUser: 1 })
+    await flush()
+    resetStoreProjects([proj('pX', 'X')])
+    useCanvasStore.setState({ canvases: {} })
+    await recordDeletionTombstone('project', 'pX')
+    await enqueuePersistWrite({ kind: 'deleteProject', projectId: 'pX' })
+    await flush() // pX pending(DELETE 500 transient → 留 pending 重试,未 success)
+    // 第 2 个 delete → active=1>=max → 驱逐最老 pending(pX)→ pX 永不 drain success → tombstone 保留
+    await enqueuePersistWrite({ kind: 'deleteProject', projectId: 'pY' })
+    await flush()
+    expect((await getDeletionTombstones('project')).has('pX')).toBe(true) // 驱逐后 tombstone 仍在(与队列生死解耦)
+    // hydrate:服务端有 pX + tombstone → 过滤(不复活;DELETE 被驱逐从未到服务端,pX 仍 LIVE)
+    await hydrateFromServer(adapter([proj('pX', 'X')]), hydrateOpts)
+    expect(useCanvasStore.getState().projects.map((p) => p.id)).toEqual([])
   })
 })
