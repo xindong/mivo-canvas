@@ -15,6 +15,7 @@ import { ConfirmDialog } from './ConfirmDialog'
 import { EditableName } from './EditableName'
 import { CanvasRow } from './CanvasRow'
 import type { CanvasId, CanvasProject } from '../../types/mivoCanvas'
+import type { SidebarFilterView } from './projectSidebarModel'
 
 export function ProjectRow(props: {
   project: CanvasProject
@@ -27,6 +28,7 @@ export function ProjectRow(props: {
   onRenameStart: () => void
   onRenameSubmit: (name: string) => void
   onRenameCancel: () => void
+  filterView: SidebarFilterView
 }) {
   const {
     project,
@@ -39,6 +41,7 @@ export function ProjectRow(props: {
     onRenameStart,
     onRenameSubmit,
     onRenameCancel,
+    filterView,
   } = props
   const renameProject = useCanvasStore((s) => s.renameProject)
   const deleteProject = useCanvasStore((s) => s.deleteProject)
@@ -55,6 +58,7 @@ export function ProjectRow(props: {
   //   过滤(buildSidebarModel),故【恢复】入口在主列表不可达——PR-C2 回收站视图落地其可见性;
   //   此处接线 action 即满足 C1 任务包(store/e2e 可直触)。
   const isArchived = project.status === 'archived'
+  const archivedView = filterView === 'archived'
 
   const [menuPosition, setMenuPosition] = useState<{ x: number; y: number } | null>(null)
   const [confirmOpen, setConfirmOpen] = useState(false)
@@ -80,23 +84,24 @@ export function ProjectRow(props: {
   const confirmRemove = () => {
     const result = deleteProject(project.id)
     setConfirmOpen(false)
-    // blocked:零-survivor 不变量阻止删除(server 模式删完全场零 canvas)——提示用户先移画板,
-    //   不弹成功 toast 误导(否则用户看到"已删除"但项目还在)。
+    // blocked:零-survivor 不变量阻止删除；projectsSlice 统一发用户可见 toast，
+    //   Row 只负责不再追加成功反馈（避免 store + UI 重复提示）。
     if (result.status === 'blocked') {
-      toastFeedback.warn(
-        `无法删除项目"${project.name}":至少需保留一个画板,请先将画板移动到其他项目或删除`,
-      )
       return
     }
     // skipped:project 不存在(UI 不可能触达——row 渲染即存在;debugLog 已 warn),静默不 toast 免噪声。
     if (result.status === 'skipped') {
       return
     }
-    toastFeedback.success(
-      serverAligned
-        ? `已删除项目"${project.name}",${canvasCount} 块画板已一并软删除(可恢复)`
-        : `已删除项目"${project.name}",${canvasCount} 块画板已移回 Canvas`,
-    )
+    if (archivedView) {
+      toastFeedback.success(`已彻底删除项目"${project.name}"，不可恢复`)
+    } else {
+      toastFeedback.success(
+        serverAligned
+          ? `已删除项目"${project.name}",${canvasCount} 块画板已一并软删除(可恢复)`
+          : `已删除项目"${project.name}",${canvasCount} 块画板已移回 Canvas`,
+      )
+    }
   }
 
   // PR-C1 SC-1:归档/恢复。store action 已含级联 + CR-5 语义;UI 只调用 + 即时反馈。
@@ -112,16 +117,21 @@ export function ProjectRow(props: {
     toastFeedback.success(`已恢复项目"${project.name}"`)
   }
 
-  const menuItems: ContextMenuItem[] = [
-    { kind: 'item', id: 'rename', label: '重命名', icon: Pencil, onSelect: onRenameStart },
-    { kind: 'item', id: 'new-canvas', label: '在此项目新建画板', icon: SquarePen, onSelect: newCanvasInProject },
-    { kind: 'separator', id: 'sep-archive' },
-    isArchived
-      ? { kind: 'item', id: 'restore', label: '恢复', icon: ArchiveRestore, onSelect: restore }
-      : { kind: 'item', id: 'archive', label: '归档', icon: Archive, onSelect: archive },
-    { kind: 'separator', id: 'sep-delete' },
-    { kind: 'item', id: 'delete', label: '删除项目', icon: Trash2, danger: true, onSelect: () => setConfirmOpen(true) },
-  ]
+  // 回收站严格收窄为【恢复 + 彻底删除】；不暴露改名/新建画板等会写 archived 记录的入口。
+  const menuItems: ContextMenuItem[] = archivedView
+    ? [
+        { kind: 'item', id: 'restore', label: '恢复', icon: ArchiveRestore, onSelect: restore },
+        { kind: 'separator', id: 'sep-delete' },
+        { kind: 'item', id: 'delete-permanently', label: '彻底删除', icon: Trash2, danger: true, onSelect: () => setConfirmOpen(true) },
+      ]
+    : [
+        { kind: 'item', id: 'rename', label: '重命名', icon: Pencil, onSelect: onRenameStart },
+        { kind: 'item', id: 'new-canvas', label: '在此项目新建画板', icon: SquarePen, onSelect: newCanvasInProject },
+        { kind: 'separator', id: 'sep-archive' },
+        { kind: 'item', id: 'archive', label: '归档', icon: Archive, onSelect: archive },
+        { kind: 'separator', id: 'sep-delete' },
+        { kind: 'item', id: 'delete', label: '删除项目', icon: Trash2, danger: true, onSelect: () => setConfirmOpen(true) },
+      ]
 
   return (
     <div className="project-branch">
@@ -133,7 +143,7 @@ export function ProjectRow(props: {
           onClick={onToggle}
           onDoubleClick={(event) => {
             event.preventDefault()
-            onRenameStart()
+            if (!archivedView) onRenameStart()
           }}
           onContextMenu={(event) => {
             event.preventDefault()
@@ -168,7 +178,7 @@ export function ProjectRow(props: {
             <span className="project-row-archived-badge" aria-hidden="true">已归档</span>
           )}
         </button>
-        {!renaming && (
+        {!renaming && !archivedView && (
           <button
             type="button"
             className="project-row-create"
@@ -188,13 +198,15 @@ export function ProjectRow(props: {
       )}
       <ConfirmDialog
         open={confirmOpen}
-        title={`删除项目"${project.name}"?`}
+        title={archivedView ? `彻底删除项目"${project.name}"?` : `删除项目"${project.name}"?`}
         description={
-          serverAligned
-            ? `项目下 ${canvasCount} 块画板将一并软删除(可在回收站恢复)。`
-            : `项目下 ${canvasCount} 块画板将移回 Canvas,画板不会被删除。`
+          archivedView
+            ? `项目及其下 ${canvasCount} 块画板将被永久删除，此操作不可恢复。`
+            : serverAligned
+              ? `项目下 ${canvasCount} 块画板将一并软删除(可在回收站恢复)。`
+              : `项目下 ${canvasCount} 块画板将移回 Canvas,画板不会被删除。`
         }
-        confirmLabel="删除项目"
+        confirmLabel={archivedView ? '彻底删除' : '删除项目'}
         danger
         onConfirm={confirmRemove}
         onCancel={() => setConfirmOpen(false)}
@@ -207,6 +219,7 @@ export function ProjectRow(props: {
               canvasId={canvasId}
               onOpenCanvas={onOpenCanvas}
               onExpandProject={onExpandProject}
+              filterView={filterView}
             />
           ))}
         </div>

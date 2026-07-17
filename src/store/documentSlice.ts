@@ -41,7 +41,7 @@ import { getSceneWrap } from '../lib/sceneWrapRegistry'
 // Phase 1 项4(复活加固):store delete action 发起时写持久 tombstone(详见 src/lib/deletionTombstones.ts)。
 import { recordDeletionTombstone } from '../lib/deletionTombstones'
 import { toastFeedback } from './toastStore'
-import { resolveActiveCanvasAfterArchive } from './archiveSurvivor'
+import { findPreferredCanvasSurvivorId, resolveActiveCanvasAfterArchive } from './archiveSurvivor'
 
 // Phase 1 项4(复活加固):server/shadow 模式删 canvas 时写持久 tombstone(与队列记录生死解耦,覆盖溢出驱逐/
 //   重试耗尽离队后 pending-delete 失效的复活;hydrate step2 并集 tombstone 过滤)。local 模式(queue 未启动)
@@ -248,7 +248,8 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
         return { canvases: remainingCanvases }
       }
 
-      const nextSceneId = canvasIds.find((id) => id !== targetId) || defaultSceneId
+      // Q4-5:彻底删除当前画布后优先切 active survivor，避免 status-blind 地打开 archived 记录。
+      const nextSceneId = findPreferredCanvasSurvivorId(remainingCanvases) ?? defaultSceneId
       const nextDocument = normalizeDocument(documentFor(remainingCanvases, nextSceneId))
       logCanvas(`Deleted active canvas "${deletedTitle}" and loaded "${nextDocument.title}"`)
       // G1-a P1-2:server/shadow 模式 enqueue deleteCanvas(DELETE 幂等)。local no-op。

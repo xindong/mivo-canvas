@@ -13,14 +13,16 @@ import { ContextMenu, type ContextMenuItem } from './ContextMenu'
 import { ConfirmDialog } from './ConfirmDialog'
 import { EditableName } from './EditableName'
 import type { CanvasId } from '../../types/mivoCanvas'
+import type { SidebarFilterView } from './projectSidebarModel'
 import { activeMoveTargetProjects } from './moveTargetProjects'
 
 export function CanvasRow(props: {
   canvasId: CanvasId
   onOpenCanvas: (canvasId: CanvasId) => void
   onExpandProject: (projectId: string) => void
+  filterView: SidebarFilterView
 }) {
-  const { canvasId, onOpenCanvas, onExpandProject } = props
+  const { canvasId, onOpenCanvas, onExpandProject, filterView } = props
   // 只订阅本行的 document,避免任一画板变更触发所有行重渲(Greptile P2)。
   const document = useCanvasStore((s) => s.canvases[canvasId])
   const sceneId = useCanvasStore((s) => s.sceneId)
@@ -47,8 +49,11 @@ export function CanvasRow(props: {
   //   此处接线 action 即满足 C1 任务包(store/e2e 可直触)。
   const isArchived = document.status === 'archived'
   const moveTargetProjects = activeMoveTargetProjects(projects)
+  const archivedView = filterView === 'archived'
 
   const open = () => {
+    // 回收站不提供只读打开模式；恢复后回 active 视图再打开，避免 archived scene 编辑撞 CR-6。
+    if (archivedView) return
     loadScene(canvasId)
     onOpenCanvas(canvasId)
   }
@@ -70,6 +75,8 @@ export function CanvasRow(props: {
     setConfirmOpen(false)
     if (useCanvasStore.getState().canvases[canvasId]) {
       toastFeedback.warn('至少保留一块画板')
+    } else if (archivedView) {
+      toastFeedback.success(`已彻底删除画板"${title}"，不可恢复`)
     } else {
       toastFeedback.success(`已删除画板"${title}"`)
     }
@@ -106,53 +113,57 @@ export function CanvasRow(props: {
     toastFeedback.success(`已恢复画板"${title}"`)
   }
 
-  const menuItems: ContextMenuItem[] = [
-    { kind: 'item', id: 'rename', label: '重命名', icon: Pencil, onSelect: () => setRenaming(true) },
-    {
-      kind: 'submenu',
-      id: 'move',
-      label: '移动到项目',
-      icon: Move,
-      items: [
-        // maker parity (SessionProjectMoveSubmenu): project entries carry a Folder
-        // icon; an empty project list shows a disabled "暂无项目" placeholder.
-        ...(moveTargetProjects.length > 0
-          ? moveTargetProjects.map((p) => ({
-              kind: 'item' as const,
-              id: `move-${p.id}`,
-              label: p.name,
-              icon: Folder,
-              disabled: p.id === currentProjectId,
-              onSelect: () => moveTo(p.id),
-            }))
-          : [
-              {
-                kind: 'item' as const,
-                id: 'move-no-projects',
-                label: '暂无项目',
-                disabled: true,
-                onSelect: () => {},
-              },
-            ]),
-        { kind: 'separator' as const, id: 'sep-move-to-canvas' },
+  // 回收站严格收窄为【恢复 + 彻底删除】；不提供改名/移动/复制入口。
+  const menuItems: ContextMenuItem[] = archivedView
+    ? [
+        { kind: 'item', id: 'restore', label: '恢复', icon: ArchiveRestore, onSelect: restore },
+        { kind: 'separator', id: 'sep-delete' },
+        { kind: 'item', id: 'delete-permanently', label: '彻底删除', icon: Trash2, danger: true, onSelect: () => setConfirmOpen(true) },
+      ]
+    : [
+        { kind: 'item', id: 'rename', label: '重命名', icon: Pencil, onSelect: () => setRenaming(true) },
         {
-          kind: 'item' as const,
-          id: 'move-standalone',
-          label: '移到 Canvas',
-          icon: FolderInput,
-          disabled: currentProjectId === undefined,
-          onSelect: () => moveTo(undefined),
+          kind: 'submenu',
+          id: 'move',
+          label: '移动到项目',
+          icon: Move,
+          items: [
+            // 归档项目不作为移动目标；否则 active 画布会静默进入回收站。
+            ...(moveTargetProjects.length > 0
+              ? moveTargetProjects.map((p) => ({
+                  kind: 'item' as const,
+                  id: `move-${p.id}`,
+                  label: p.name,
+                  icon: Folder,
+                  disabled: p.id === currentProjectId,
+                  onSelect: () => moveTo(p.id),
+                }))
+              : [
+                  {
+                    kind: 'item' as const,
+                    id: 'move-no-projects',
+                    label: '暂无项目',
+                    disabled: true,
+                    onSelect: () => {},
+                  },
+                ]),
+            { kind: 'separator' as const, id: 'sep-move-to-canvas' },
+            {
+              kind: 'item' as const,
+              id: 'move-standalone',
+              label: '移到 Canvas',
+              icon: FolderInput,
+              disabled: currentProjectId === undefined,
+              onSelect: () => moveTo(undefined),
+            },
+          ],
         },
-      ],
-    },
-    { kind: 'item', id: 'duplicate', label: '复制画板', icon: Copy, onSelect: duplicate },
-    { kind: 'separator', id: 'sep-archive' },
-    isArchived
-      ? { kind: 'item', id: 'restore', label: '恢复', icon: ArchiveRestore, onSelect: restore }
-      : { kind: 'item', id: 'archive', label: '归档', icon: Archive, onSelect: archive },
-    { kind: 'separator', id: 'sep-delete' },
-    { kind: 'item', id: 'delete', label: '删除', icon: Trash2, danger: true, onSelect: () => setConfirmOpen(true) },
-  ]
+        { kind: 'item', id: 'duplicate', label: '复制画板', icon: Copy, onSelect: duplicate },
+        { kind: 'separator', id: 'sep-archive' },
+        { kind: 'item', id: 'archive', label: '归档', icon: Archive, onSelect: archive },
+        { kind: 'separator', id: 'sep-delete' },
+        { kind: 'item', id: 'delete', label: '删除', icon: Trash2, danger: true, onSelect: () => setConfirmOpen(true) },
+      ]
 
   return (
     <>
@@ -162,7 +173,7 @@ export function CanvasRow(props: {
         onClick={open}
         onDoubleClick={(event) => {
           event.preventDefault()
-          setRenaming(true)
+          if (!archivedView) setRenaming(true)
         }}
         onContextMenu={(event) => {
           event.preventDefault()
@@ -196,9 +207,9 @@ export function CanvasRow(props: {
       )}
       <ConfirmDialog
         open={confirmOpen}
-        title={`删除画板"${title}"?`}
-        description="此操作不可撤销。"
-        confirmLabel="删除"
+        title={archivedView ? `彻底删除画板"${title}"?` : `删除画板"${title}"?`}
+        description={archivedView ? '画板将被永久删除，此操作不可恢复。' : '此操作不可撤销。'}
+        confirmLabel={archivedView ? '彻底删除' : '删除'}
         danger
         onConfirm={confirmRemove}
         onCancel={() => setConfirmOpen(false)}

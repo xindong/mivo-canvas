@@ -13,32 +13,35 @@ export type SidebarProjectGroup = {
   latestActivityAt: string
 }
 
+export type SidebarFilterView = 'active' | 'archived'
+
 type Entry = { id: CanvasId; updatedAt: string }
 
 const sortByUpdatedAtDesc = (a: Entry, b: Entry) =>
   a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0
 
-// PR-C1:active 视图 status 过滤。hydrate 已 includeArchived=true 把归档项拉进 store
-//   (persistBoot CR-8),故不过滤的话归档项会留在主列表“变灰 = 像坏了”。主列表(本函数)
-//   一律排除 archived project + archived canvas;archived 项的展示入口(回收站视图)属 PR-C2,
-//   届时复用此处的 status 感知。archivedByCascade 不影响过滤(级联归档的也是 archived)。
-const isActive = (status: 'active' | 'archived' | undefined): boolean => status !== 'archived'
+// 缺省 status 向后兼容为 active。PR-C2 将 C1 的 active-only 过滤参数化为两态视图；
+// archivedByCascade 不参与筛选（直接归档与级联归档都属于回收站）。
+const matchesView = (
+  status: 'active' | 'archived' | undefined,
+  filterView: SidebarFilterView,
+): boolean => (status === 'archived' ? 'archived' : 'active') === filterView
 
 export const buildSidebarModel = (
   projects: CanvasProject[],
   canvases: Record<CanvasId, CanvasDocument>,
+  filterView: SidebarFilterView = 'active',
 ): { projectGroups: SidebarProjectGroup[]; standaloneCanvasIds: CanvasId[] } => {
-  // Active 视图:只认未归档项目作为分组依据(归档项目不在主列表;其子画布即便 active 也
-  //   不该挂到归档项目组——而级联归档语义下 archived project 的 active 子画布本就不存在)。
-  const activeProjects = projects.filter((p) => isActive(p.status))
-  const knownProjectIds = new Set(activeProjects.map((p) => p.id))
+  // 每个视图只认同态项目作为分组依据。异态父项目下的同态 canvas 防御性落到 standalone，
+  // 避免脏数据让可操作记录静默消失（例如 active canvas 意外挂在 archived project 下）。
+  const visibleProjects = projects.filter((p) => matchesView(p.status, filterView))
+  const knownProjectIds = new Set(visibleProjects.map((p) => p.id))
 
   const standalone: Entry[] = []
   const byProject = new Map<string, Entry[]>()
 
   for (const [id, document] of Object.entries(canvases)) {
-    // 归档画布不进主列表(既不进项目组,也不进 standalone)。
-    if (!isActive(document.status)) continue
+    if (!matchesView(document.status, filterView)) continue
     const projectId = document.projectId
     const updatedAt = document.updatedAt || ''
     // No projectId, or orphan projectId (not in projects list) → standalone.
@@ -51,7 +54,7 @@ export const buildSidebarModel = (
     byProject.set(projectId, group)
   }
 
-  const projectGroups: SidebarProjectGroup[] = activeProjects.map((project) => {
+  const projectGroups: SidebarProjectGroup[] = visibleProjects.map((project) => {
     const entries = (byProject.get(project.id) ?? []).sort(sortByUpdatedAtDesc)
     // entries[0] is the max updatedAt after the desc sort; empty group → project.createdAt.
     const latestActivityAt = entries.length ? entries[0]!.updatedAt : project.createdAt

@@ -43,6 +43,7 @@ vi.mock('../store/remoteDebugReporter', () => ({
 }))
 
 import { useCanvasStore } from '../store/canvasStore'
+import { toastFeedback, useToastStore } from '../store/toastStore'
 import { useChatStore } from '../store/chatStore'
 import { debugLogger } from '../store/debugLogStore'
 import { enqueueChatAppend } from '../store/chatPersistSync'
@@ -942,6 +943,7 @@ describe('P1-2 — deleteProject server 分支 active-document 不变量', () =>
       sceneId: c1,
       canvases: { [c1]: { title: 'c1', projectId: pid, createdAt: 't', updatedAt: 't', nodes: [], edges: [], tasks: [] } as never } as never,
     })
+    toastFeedback.clear()
     const deleteResult = useCanvasStore.getState().deleteProject(pid)
     await flush()
     await drainPersistQueue()
@@ -954,6 +956,48 @@ describe('P1-2 — deleteProject server 分支 active-document 不变量', () =>
     // e2e FAIL 修复:零-survivor 阻止删除须返回 status:'blocked' + reason:'no-survivor'
     //   (UI 据此弹 warn toast"至少需保留一个画板",不误称"已删除"导致项目还在却显示成功)
     expect(deleteResult).toEqual({ status: 'blocked', reason: 'no-survivor' })
+    expect(
+      useToastStore.getState().entries.some((entry) => entry.message.includes('至少需保留一个画板')),
+    ).toBe(true)
+  })
+
+  it('Q4-5:存活列表 archived 在前时仍优先切 active survivor', async () => {
+    const { fetch } = makeCountingFetch()
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    const pidDoomed = useCanvasStore.getState().createProject('Doomed')
+    const pidArchived = useCanvasStore.getState().createProject('Archived')
+    const pidActive = useCanvasStore.getState().createProject('Active')
+    await flush()
+    await drainPersistQueue()
+
+    useCanvasStore.setState({
+      sceneId: 'c-doomed',
+      projects: useCanvasStore.getState().projects.map((project) =>
+        project.id === pidArchived ? { ...project, status: 'archived' as const } : project,
+      ),
+      canvases: {
+        'c-doomed': { title: 'doomed', projectId: pidDoomed, createdAt: 't', updatedAt: 't', nodes: [], edges: [], tasks: [] } as never,
+        'c-archived-first': { title: 'archived', projectId: pidArchived, status: 'archived', createdAt: 't', updatedAt: 't', nodes: [], edges: [], tasks: [] } as never,
+        'c-active-second': { title: 'active', projectId: pidActive, status: 'active', createdAt: 't', updatedAt: 't', nodes: [], edges: [], tasks: [] } as never,
+      } as never,
+    })
+
+    useCanvasStore.getState().deleteProject(pidDoomed)
+    expect(useCanvasStore.getState().sceneId).toBe('c-active-second')
+  })
+
+  it('Q4-5:deleteCanvas 也优先切 active survivor', () => {
+    useCanvasStore.setState({
+      sceneId: 'c-doomed',
+      canvases: {
+        'c-doomed': { title: 'doomed', createdAt: 't', updatedAt: 't', nodes: [], edges: [], tasks: [] } as never,
+        'c-archived-first': { title: 'archived', status: 'archived', createdAt: 't', updatedAt: 't', nodes: [], edges: [], tasks: [] } as never,
+        'c-active-second': { title: 'active', status: 'active', createdAt: 't', updatedAt: 't', nodes: [], edges: [], tasks: [] } as never,
+      } as never,
+    })
+
+    useCanvasStore.getState().deleteCanvas('c-doomed')
+    expect(useCanvasStore.getState().sceneId).toBe('c-active-second')
   })
 
   // sol 非阻断建议(顺手做):project/canvas 双删除次序 404 幂等——deleteProject 软删整树后,后续
