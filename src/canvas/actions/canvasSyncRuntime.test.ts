@@ -3,6 +3,7 @@ import type { CanvasActionRuntime } from './canvasActionTypes'
 import type { MivoCanvasNode } from '../../types/mivoCanvas'
 import type { ChangeOutcome, CanvasSyncPort } from '../../lib/canvasSyncPort'
 import { imageNode, nodeRecord, loadRuntimeModule } from './canvasSyncRuntimeTestFactories'
+import { __resetArchivedWriteNotice } from '../../lib/archivedWriteNotice'
 
 vi.hoisted(() => {
   const store = new Map<string, string>()
@@ -36,6 +37,7 @@ vi.mock('../../store/remoteDebugReporter', () => ({
 describe('canvasSyncRuntime(Block 1 runtime driving)', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    __resetArchivedWriteNotice()
   })
 
   it('buildCanvasSyncChanges emits delete-field when an optional field is removed', async () => {

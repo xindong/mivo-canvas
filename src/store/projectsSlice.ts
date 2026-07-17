@@ -10,7 +10,9 @@ import type { SliceCreator } from './canvasStateTypes'
 import { logCanvas, warnCanvas } from './canvasStoreLog'
 import { DEMO_PROJECTS } from './demoScenes'
 import { enqueuePersistWrite, isPersistWriteActive } from '../lib/persistBoot'
-import { normalizeDocument, documentFor, defaultSceneId } from './canvasDocumentModel'
+import { normalizeDocument, documentFor } from './canvasDocumentModel'
+import { toastFeedback } from './toastStore'
+import { resolveActiveCanvasAfterArchive } from './archiveSurvivor'
 // Phase 1 项4(复活加固):store delete action 发起时写持久 tombstone(与队列记录生死解耦,覆盖溢出驱逐/重试
 //   耗尽离队后 pending-delete 失效的复活)。详见 src/lib/deletionTombstones.ts。
 // F-B(决策7,Phase 2 归档):restoreProject 经 revokeCanvasTombstonesForProject 撤销 deleteProject 级联写的子画布
@@ -247,6 +249,7 @@ export const createProjectsSlice: SliceCreator = (set, get) => ({
       .map(([id]) => id)
     // PR-C1 SC-4:捕获归档前 sceneId,供 set 后判定是否命中活跃画布需切 survivor。
     const prevSceneId = get().sceneId
+    let blockedNoSurvivor = false
     set((state) => {
       const nextProjects = state.projects.map((p) => (p.id === projectId ? { ...p, status: 'archived' as const } : p))
       // CR-5/D3:级联归档子画布(随项目一起隐藏,不再变孤儿)。active 子画布标 archivedByCascade=true
@@ -259,21 +262,17 @@ export const createProjectsSlice: SliceCreator = (set, get) => ({
           return [id, { ...doc, status: 'archived' as const, archivedByCascade: true }]
         }),
       )
-      // SC-4:级联归档若命中当前 sceneId(活跃画布在该项目下)→ 切到 active survivor(镜像
-      //   deleteProject survivor 逻辑)。Survivor = 不属于本项目的 + 非归档画布;无 survivor →
-      //   安全空态(defaultSceneId)。不做只读打开模式:archived canvas 不可留作 sceneId(CR-6 409 静默丢)。
-      const activeScene = state.canvases[state.sceneId]
-      const hitActiveScene =
-        activeScene !== undefined &&
-        activeScene.projectId === projectId &&
-        activeScene.status !== 'archived'
-      if (!hitActiveScene) {
+      const resolution = resolveActiveCanvasAfterArchive(nextCanvases, state.sceneId)
+      if (resolution.kind === 'blocked') {
+        blockedNoSurvivor = true
+        warnCanvas(`Archive project blocked: ${projectId} would leave no active canvas`)
+        toastFeedback.warn('至少保留一个活跃画布,请先创建或恢复其他画布再归档')
+        return {}
+      }
+      if (resolution.kind === 'keep') {
         return { projects: nextProjects, canvases: nextCanvases }
       }
-      const survivorId = Object.entries(nextCanvases)
-        .filter(([, d]) => d.projectId !== projectId && d.status !== 'archived')
-        .map(([id]) => id)[0]
-      const nextSceneId = survivorId ?? defaultSceneId
+      const nextSceneId = resolution.sceneId
       const nextDocument = normalizeDocument(documentFor(nextCanvases, nextSceneId))
       return {
         projects: nextProjects,
@@ -289,6 +288,7 @@ export const createProjectsSlice: SliceCreator = (set, get) => ({
         historyFuture: [],
       }
     })
+    if (blockedNoSurvivor) return
     logCanvas(
       `Archived project "${project.name}" (${projectId}); active child canvas(es) cascade-archived (archivedByCascade=true)`,
     )

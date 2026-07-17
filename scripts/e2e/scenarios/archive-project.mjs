@@ -161,4 +161,26 @@ export const runArchiveProjectScenario = async (context) => {
       throw new Error(`CR-5: cascade-archived B should be restored to active: ${JSON.stringify(bAfter)}`)
     }
   }
+
+  // --- 3. 零 survivor:项目级联会归零 active canvas 时禁止归档 ---
+  {
+    await resetState(page, canvasStoreSpec)
+    const projectId = await page.evaluate(async (spec) => {
+      const { useCanvasStore } = await import(spec)
+      const id = useCanvasStore.getState().createProject('Only Project')
+      useCanvasStore.getState().moveCanvasToProject('e2e-reset', id)
+      return id
+    }, await canvasStoreSpec())
+    await wait()
+    await archiveProjectViaStore(page, canvasStoreSpec, projectId)
+    await wait()
+    const state = await readState(page, canvasStoreSpec)
+    const onlyProject = state.projects.find((item) => item.id === projectId)
+    if (onlyProject?.status === 'archived' || state.canvases['e2e-reset']?.status === 'archived') {
+      throw new Error(`zero-survivor archiveProject must be blocked: ${JSON.stringify(state)}`)
+    }
+    await page.locator('.toast-item.warning')
+      .filter({ hasText: '至少保留一个活跃画布' })
+      .waitFor({ state: 'visible', timeout: 5000 })
+  }
 }

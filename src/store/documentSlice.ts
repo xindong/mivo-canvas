@@ -40,6 +40,8 @@ import { isServerPersist } from '../lib/persistMode'
 import { getSceneWrap } from '../lib/sceneWrapRegistry'
 // Phase 1 项4(复活加固):store delete action 发起时写持久 tombstone(详见 src/lib/deletionTombstones.ts)。
 import { recordDeletionTombstone } from '../lib/deletionTombstones'
+import { toastFeedback } from './toastStore'
+import { resolveActiveCanvasAfterArchive } from './archiveSurvivor'
 
 // Phase 1 项4(复活加固):server/shadow 模式删 canvas 时写持久 tombstone(与队列记录生死解耦,覆盖溢出驱逐/
 //   重试耗尽离队后 pending-delete 失效的复活;hydrate step2 并集 tombstone 过滤)。local 模式(queue 未启动)
@@ -232,8 +234,7 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
       }
     }),
   // Phase 2 归档(回收站)——CR-10 unarchiveCanvas 自动 unarchive 父项目(编辑先恢复同构)+ CR-11 不入 undo 栈
-  //   (status 变更非画布内容 mutation,historyManager 只管画布内容)。archive 不触发 ≥1 canvas 不变量(画布
-  //   不移除,仅置 status=archived;active scene 若被归档,sceneId 不动——UI 可见性/scene 切换属 PR-C)。
+  //   (status 变更非画布内容 mutation,historyManager 只管画布内容)。归档后必须仍有 ≥1 active canvas。
   archiveCanvas: (canvasId) =>
     set((state) => {
       const targetId = canvasId || state.sceneId
@@ -246,24 +247,24 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
         warnCanvas(`Archive canvas skipped: already archived ${targetId}`)
         return {}
       }
-      logCanvas(`Archived canvas "${document.title}" (${targetId})`)
-      // 直接归档:archivedByCascade=false(unarchiveProject 不恢复此画布;CR-5)。server 幂等:已归档→200 no-op。
-      enqueuePersistWrite({ kind: 'archiveCanvas', canvasId: targetId })
       const nextCanvases = {
         ...state.canvases,
         [targetId]: { ...document, status: 'archived' as const, archivedByCascade: false },
       }
-      // PR-C1 SC-4:归档命中当前打开画布(targetId === sceneId)→ 切到 active survivor(镜像
-      //   deleteCanvas 的 survivor 切换逻辑,但仅认非归档画布);无 active survivor → 安全空态
-      //   (defaultSceneId)。归档非活跃画布无需切 scene。不做只读打开模式(超范围):archived
-      //   canvas 不可留作 sceneId,否则后续编辑撞 CR-6 409 静默丢。
-      if (targetId !== state.sceneId) {
+      const resolution = resolveActiveCanvasAfterArchive(nextCanvases, state.sceneId)
+      if (resolution.kind === 'blocked') {
+        warnCanvas(`Archive canvas blocked: ${targetId} would leave no active canvas`)
+        toastFeedback.warn('至少保留一个活跃画布,请先创建或恢复其他画布再归档')
+        return {}
+      }
+
+      logCanvas(`Archived canvas "${document.title}" (${targetId})`)
+      // 直接归档:archivedByCascade=false(unarchiveProject 不恢复此画布;CR-5)。server 幂等:已归档→200 no-op。
+      enqueuePersistWrite({ kind: 'archiveCanvas', canvasId: targetId })
+      if (resolution.kind === 'keep') {
         return { canvases: nextCanvases }
       }
-      const survivorId = Object.keys(state.canvases).find(
-        (id) => id !== targetId && state.canvases[id]!.status !== 'archived',
-      )
-      const nextSceneId = survivorId ?? defaultSceneId
+      const nextSceneId = resolution.sceneId
       const nextDocument = normalizeDocument(documentFor(nextCanvases, nextSceneId))
       logCanvas(`Archived active canvas → switched scene to ${nextSceneId}`)
       return {
@@ -416,6 +417,11 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
       // projectId === undefined → move back to the Canvas 区 (clear projectId).
       if (projectId !== undefined && !state.projects.some((p) => p.id === projectId)) {
         warnCanvas(`Move canvas skipped: target project ${projectId} does not exist`)
+        return {}
+      }
+      if (projectId !== undefined && state.projects.some((p) => p.id === projectId && p.status === 'archived')) {
+        warnCanvas(`Move canvas blocked: target project ${projectId} is archived`)
+        toastFeedback.warn('目标项目已归档,请先恢复项目再移动')
         return {}
       }
       // Target === current归属 → no-op (no bump, no log).

@@ -100,7 +100,9 @@ export function ProjectRow(props: {
   //   归档命中活跃画布时 store 已切 survivor(SC-4),此处不再额外处理。
   const archive = () => {
     archiveProject(project.id)
-    toastFeedback.success(`已归档项目"${project.name}"`)
+    if (useCanvasStore.getState().projects.find((candidate) => candidate.id === project.id)?.status === 'archived') {
+      toastFeedback.success(`已归档项目"${project.name}"`)
+    }
   }
   const restore = () => {
     unarchiveProject(project.id)

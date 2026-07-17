@@ -13,6 +13,7 @@ import { ContextMenu, type ContextMenuItem } from './ContextMenu'
 import { ConfirmDialog } from './ConfirmDialog'
 import { EditableName } from './EditableName'
 import type { CanvasId } from '../../types/mivoCanvas'
+import { activeMoveTargetProjects } from './moveTargetProjects'
 
 export function CanvasRow(props: {
   canvasId: CanvasId
@@ -45,6 +46,7 @@ export function CanvasRow(props: {
   //   过滤(buildSidebarModel),【恢复】入口在主列表不可达——PR-C2 回收站视图落地其可见性;
   //   此处接线 action 即满足 C1 任务包(store/e2e 可直触)。
   const isArchived = document.status === 'archived'
+  const moveTargetProjects = activeMoveTargetProjects(projects)
 
   const open = () => {
     loadScene(canvasId)
@@ -95,7 +97,9 @@ export function CanvasRow(props: {
   //   归档命中活跃画布时 store 已切 survivor(SC-4),UI 只调用 + 即时反馈。
   const archive = () => {
     archiveCanvas(canvasId)
-    toastFeedback.success(`已归档画板"${title}"`)
+    if (useCanvasStore.getState().canvases[canvasId]?.status === 'archived') {
+      toastFeedback.success(`已归档画板"${title}"`)
+    }
   }
   const restore = () => {
     unarchiveCanvas(canvasId)
@@ -112,8 +116,8 @@ export function CanvasRow(props: {
       items: [
         // maker parity (SessionProjectMoveSubmenu): project entries carry a Folder
         // icon; an empty project list shows a disabled "暂无项目" placeholder.
-        ...(projects.length > 0
-          ? projects.map((p) => ({
+        ...(moveTargetProjects.length > 0
+          ? moveTargetProjects.map((p) => ({
               kind: 'item' as const,
               id: `move-${p.id}`,
               label: p.name,

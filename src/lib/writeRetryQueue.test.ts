@@ -34,6 +34,7 @@ import type { NodePayload, Revision } from '../../shared/persist-contract.ts'
 import { __resetPersistUserId, setPersistUserId } from './persistUserId'
 import { toastFeedback } from '../store/toastStore'
 import { debugLogger } from '../store/debugLogStore'
+import { __resetArchivedWriteNotice } from './archivedWriteNotice'
 
 // ---- spies (call-through; assert counts only) ----
 const toastWarn = vi.spyOn(toastFeedback, 'warn')
@@ -122,6 +123,7 @@ const makeQueue = (
 
 beforeEach(() => {
   vi.clearAllMocks()
+  __resetArchivedWriteNotice()
   clockMs = 1_000
   setPersistUserId('userA')
   return __resetWriteQueueDb()
@@ -347,9 +349,9 @@ describe('FX-5 error branches', () => {
     await q.enqueue(minimalNode('c1', 'n1'))
     const r = await q.drain()
     expect(r.terminals).toBe(1)
-    expect(toastError).toHaveBeenCalledTimes(1)
-    expect(toastError).toHaveBeenCalledWith('此画布已归档,请先恢复再编辑。')
-    expect(toastError).not.toHaveBeenCalledWith('这条改动无法保存,可能内容有误。')
+    expect(toastWarn).toHaveBeenCalledTimes(1)
+    expect(toastWarn).toHaveBeenCalledWith('此画布已归档,请先恢复再编辑。')
+    expect(toastError).not.toHaveBeenCalled()
     expect(await q.pendingCount()).toBe(0)
   })
 

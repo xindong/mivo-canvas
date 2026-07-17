@@ -14,7 +14,7 @@ import { isLocalPersist } from '../../lib/persistMode'
 import { enqueueAssetAttach, enqueueAssetDetach, serverAssetIdFromUrl } from '../../lib/assetAttachWiring'
 import { registerSceneWrap } from '../../lib/sceneWrapRegistry'
 import { debugLogger } from '../../store/debugLogStore'
-import { toastFeedback } from '../../store/toastStore'
+import { notifyArchivedWriteBlocked } from '../../lib/archivedWriteNotice'
 import { useCanvasStore } from '../../store/canvasStore'
 import { documentFor } from '../../store/canvasDocumentModel'
 import { anchorsToRecords, edgeToRecord, toRecord } from '../../kernel/mapping'
@@ -418,7 +418,7 @@ const submitChanges = async (
     // PR-C1 CR-6:canvas 已归档(canvasSyncPortClient 把 409 `{error:'archived'}` 映射为 reason
     //   'archived')→ toast 引导"先恢复再编辑",不静默丢编辑。其余 rejected 原因只 debugLog。
     if (outcome.reason === 'archived') {
-      toastFeedback.warn('此画布已归档,请先恢复再编辑。')
+      notifyArchivedWriteBlocked(canvasId)
     }
     debugLogger.warn(
       SOURCE,

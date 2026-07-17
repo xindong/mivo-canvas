@@ -179,4 +179,19 @@ export const runArchiveCanvasScenario = async (context) => {
       throw new Error(`CR-10: cascade-archived sibling B should be restored to active: ${JSON.stringify(bAfter)}`)
     }
   }
+
+  // --- 4. 零 survivor:最后一个 active canvas 禁止归档 ---
+  {
+    await resetState(page, canvasStoreSpec)
+    await wait()
+    await archiveCanvasViaStore(page, canvasStoreSpec, 'e2e-reset')
+    await wait()
+    const state = await readState(page, canvasStoreSpec)
+    if (state.canvases['e2e-reset']?.status === 'archived' || state.sceneId !== 'e2e-reset') {
+      throw new Error(`zero-survivor archiveCanvas must be blocked: ${JSON.stringify(state)}`)
+    }
+    await page.locator('.toast-item.warning')
+      .filter({ hasText: '至少保留一个活跃画布' })
+      .waitFor({ state: 'visible', timeout: 5000 })
+  }
 }

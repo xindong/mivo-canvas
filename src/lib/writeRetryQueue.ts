@@ -39,6 +39,7 @@ import {
 import { ANONYMOUS_USER_ID, getPersistUserId } from './persistUserId'
 import { debugLogger } from '../store/debugLogStore'
 import { toastFeedback } from '../store/toastStore'
+import { notifyArchivedWriteBlocked } from './archivedWriteNotice'
 
 const SOURCE = 'Write Retry Queue'
 
@@ -2365,7 +2366,11 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
             const rejectedBody = outcome.body as { error?: string } | undefined
             const archived = rejectedBody?.error === 'archived'
             termLog(`write ${rec.id} rejected by server: ${JSON.stringify(outcome.body).slice(0, 200)}`)
-            termToast(archived ? '此画布已归档,请先恢复再编辑。' : '这条改动无法保存,可能内容有误。')
+            if (archived && 'canvasId' in rec.op && typeof rec.op.canvasId === 'string') {
+              notifyArchivedWriteBlocked(rec.op.canvasId)
+            } else {
+              termToast('这条改动无法保存,可能内容有误。')
+            }
             await recordTerminal(rec, 'rejected', JSON.stringify(outcome.body).slice(0, 200))
             await deleteWrite(rec.id)
             terminals++

@@ -40,6 +40,7 @@ import {
 import { fromRecord, edgeFromRecord } from '../kernel/mapping'
 import type { NodeRecord, EdgeRecord } from '../kernel/records'
 import { debugLogger } from '../store/debugLogStore'
+import { resolveActiveCanvasAfterArchive } from '../store/archiveSurvivor'
 import { toastFeedback } from '../store/toastStore'
 import { defaultFetch, type FetchAdapterOptions, type FetchLike, type GetAuthHeaders } from './serverPersistAdapter'
 import type { ChatMessage } from '../store/chatStore'
@@ -927,6 +928,31 @@ export const hydrateFromServer = async (
         SOURCE,
         `server hydrate: ${serverCanvases.length} canvas meta(s) merged into store.canvases (content hydrate deferred to G1-c; local-only canvases retained${droppedCanvases > 0 ? `; ${droppedCanvases} filtered as pending-delete not-yet-drained (anti-resurrection)` : ''})`,
       )
+      const hydratedState = useCanvasStore.getState()
+      const resolution = resolveActiveCanvasAfterArchive(hydratedState.canvases, hydratedState.sceneId)
+      if (resolution.kind === 'blocked') {
+        debugLogger.warn(
+          SOURCE,
+          `server hydrate: scene ${hydratedState.sceneId} is missing/archived and no active canvas survivor exists; keeping scene unchanged`,
+        )
+      } else if (resolution.kind === 'switch') {
+        const survivor = hydratedState.canvases[resolution.sceneId]!
+        useCanvasStore.setState({
+          sceneId: resolution.sceneId,
+          nodes: survivor.nodes,
+          edges: survivor.edges || [],
+          tasks: survivor.tasks,
+          selectedNodeId: survivor.selectedNodeId,
+          selectedNodeIds: survivor.selectedNodeIds || [],
+          activeTool: 'select',
+          historyPast: [],
+          historyFuture: [],
+        })
+        debugLogger.log(
+          SOURCE,
+          `server hydrate: reconciled missing/archived scene ${hydratedState.sceneId} → active survivor ${resolution.sceneId}`,
+        )
+      }
     }
   } catch (error) {
     migrationCollectionOk = false // P1-1:listCanvas 抛 → 收集不健康 → flush 0-op 不盲种 marker(下次 boot 重试)

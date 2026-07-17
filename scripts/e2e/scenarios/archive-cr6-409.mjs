@@ -28,13 +28,15 @@ export const runArchiveCr6409Scenario = async (context) => {
   await page.goto(canvasUrl, { waitUntil: 'networkidle' })
   await waitForCanvasReady(page, rendererMode)
 
+  const sharedCanvasId = 'cr6-shared'
+
   // ── 5a:canvasSyncPort 路径(node create 撞 409 archived → warn toast)──────────────
   {
     const runtimeSpec = await moduleSpec(page, '/src/canvas/actions/canvasSyncRuntime.ts')
     const portSpec = await moduleSpec(page, '/src/lib/canvasSyncPortClient.ts')
 
     await page.evaluate(
-      async ({ runtimeSpec, portSpec }) => {
+      async ({ runtimeSpec, portSpec, sharedCanvasId }) => {
         const { enqueueCanvasSyncChanges } = await import(runtimeSpec)
         const { createFetchCanvasSyncPort } = await import(portSpec)
         // mock fetch:直返 409 {error:'archived'}(archived canvas 写被 CR-6 拒)。不走真网络 → 浏览器
@@ -47,25 +49,25 @@ export const runArchiveCr6409Scenario = async (context) => {
           })
         const port = createFetchCanvasSyncPort({ fetch: mockFetch, getAuthHeaders: async () => ({}) })
         await enqueueCanvasSyncChanges(
-          'cr6a',
+          sharedCanvasId,
           [{ kind: 'create-node', node: { id: 'n-cr6a', type: 'text', x: 10, y: 10, width: 96, height: 42, title: 'T', text: '', transform: { x: 10, y: 10, width: 96, height: 42, rotation: 0 }, fills: [], strokes: [], effects: [], relations: {}, hidden: false } }],
           port,
         )
       },
-      { runtimeSpec, portSpec },
+      { runtimeSpec, portSpec, sharedCanvasId },
     )
     await wait()
     // 5a 断言:archived 引导 warn toast 出现(canvasSyncRuntime rejected→toastFeedback.warn;编辑不静默丢)。
     await toastArchived(page, 'warning').waitFor({ state: 'visible', timeout: 5000 })
   }
 
-  // ── 5b:队列路径(meta 写撞 409 archived → 专用 error toast)────────────────────────
+  // ── 5b:同 canvas 的队列路径撞 archived → 3s 窗口内不重复 toast──────────────────
   {
     const queueSpec = await moduleSpec(page, '/src/lib/writeRetryQueue.ts')
     const userIdSpec = await moduleSpec(page, '/src/lib/persistUserId.ts')
 
     await page.evaluate(
-      async ({ queueSpec, userIdSpec }) => {
+      async ({ queueSpec, userIdSpec, sharedCanvasId }) => {
         const { createWriteQueue } = await import(queueSpec)
         const { setPersistUserId } = await import(userIdSpec)
         setPersistUserId('e2e-cr6b')
@@ -74,12 +76,18 @@ export const runArchiveCr6409Scenario = async (context) => {
         //   本 e2e 验真 createWriteQueue drain → case 'rejected' 判 body.error==='archived' → 专用 toast。
         const executor = async () => ({ status: 'rejected', body: { error: 'archived' } })
         const q = createWriteQueue({ executor, clock: () => Date.now(), random: () => 0.5 })
-        await q.enqueue({ kind: 'updateCanvas', canvasId: 'cr6b', projectId: '', title: 'renamed' })
+        await q.enqueue({ kind: 'updateCanvas', canvasId: sharedCanvasId, projectId: '', title: 'renamed' })
         await q.drain()
       },
-      { queueSpec, userIdSpec },
+      { queueSpec, userIdSpec, sharedCanvasId },
     )
     await wait()
-    await toastArchived(page, 'error').waitFor({ state: 'visible', timeout: 5000 })
+    const allArchivedToasts = toastArchived(page)
+    if ((await allArchivedToasts.count()) !== 1) {
+      throw new Error(`same-canvas dual archived rejection should show exactly 1 toast, got ${await allArchivedToasts.count()}`)
+    }
+    if ((await toastArchived(page, 'warning').count()) !== 1 || (await toastArchived(page, 'error').count()) !== 0) {
+      throw new Error('archived write notifier must use one unified warning toast')
+    }
   }
 }
