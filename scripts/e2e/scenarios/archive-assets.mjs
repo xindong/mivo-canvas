@@ -11,7 +11,7 @@ export const runArchiveAssetsScenario = async (context) => {
     readLibrarySurfaceColors,
     wait,
   } = context
-  const { rendererMode } = context
+  const { rendererMode, isProdTopology } = context
   const leaferMode = rendererMode === 'leafer'
 
   // leafer 模式 image 无 DOM:初始节点数/资产来源改读 store(assetUrl 与 <img src> 同源);
@@ -126,54 +126,67 @@ export const runArchiveAssetsScenario = async (context) => {
   }
   // Import JSON 的 UI 入口(标题药丸 "..." 菜单里的 file input)随药丸移除(功能损失已在
   // 交付报告列出)。归档还原逻辑(parseCanvasSnapshot + restoreCanvasImportAssets +
-  // replaceSnapshot)仍在 src/lib，故此处经 store 直接驱动同一管线,保留归档回灌逻辑覆盖。
-  await page.evaluate(
-    async ({ storeSpec, archiveText }) => {
-      const { parseCanvasSnapshot } = await import('/src/lib/snapshotValidation.ts')
-      const { restoreCanvasImportAssets } = await import('/src/lib/canvasArchive.ts')
-      const { useCanvasStore } = await import(storeSpec)
-      const result = parseCanvasSnapshot(archiveText)
-      if (!result.ok) throw new Error(`archive parse failed: ${result.message}`)
-      await restoreCanvasImportAssets(result)
-      useCanvasStore.getState().replaceSnapshot(result.snapshot)
-    },
-    { storeSpec: await canvasStoreSpec(), archiveText: JSON.stringify(archive) },
-  )
-  await page.waitForFunction(
-    async ({ moduleSpec, expectedDomCount }) => {
-      const { useCanvasStore } = await import(moduleSpec)
-      const state = useCanvasStore.getState()
-      return (
-        state.canvases[state.sceneId]?.title === 'canvas-e2e-archive' &&
-        state.nodes.length === 2 &&
-        document.querySelectorAll('.dom-node').length === expectedDomCount &&
-        document.querySelector('.dom-node.text-node .dom-text-node')?.textContent?.includes('Archive text')
-      )
-    },
-    // leafer 模式 image 归 Leafer 真画:DOM 只剩 text 节点(1);dom 模式两个都在(2)。
-    { moduleSpec: await canvasStoreSpec(), expectedDomCount: leaferMode ? 1 : 2 },
-  )
-  if (leaferMode) {
-    const restored = await page.evaluate(async (moduleSpec) => {
-      const { useCanvasStore } = await import(moduleSpec)
-      const node = useCanvasStore.getState().nodes.find((entry) => entry.id === 'archive-image')
-      return node ? { assetUrl: node.assetUrl || '' } : null
-    }, await canvasStoreSpec())
-    if (!restored || !(restored.assetUrl.startsWith('blob:') || restored.assetUrl.startsWith('mivo-asset:'))) {
-      throw new Error(`Importing a Mivo archive should restore embedded local assets (store assetUrl): ${JSON.stringify(restored)}`)
-    }
+  // replaceSnapshot)仍在 src/lib,故此处经 store 直接驱动同一管线,保留归档回灌逻辑覆盖。
+  //
+  // archive-restore 经浏览器侧动态 import /src/lib/snapshotValidation.ts +
+  // /src/lib/canvasArchive.ts 驱动。仅 dev 拓扑有 Vite 服务 /src/;prod 拓扑只服务
+  // dist/ build 产物,且这两个模块因归档 UI 移除已无 app 引用、被 tree-shake 出 prod
+  // bundle(dist/assets/ 无 snapshotValidation/canvasArchive chunk 可证),任何 /src 路径
+  // 在 prod 必 404 → 动态 import 抛 TypeError(nightly-e2e 红灯 run 29529025829/
+  // 29445601589 即此)。prod 显式 skip 归档还原步骤(遵 mask-multi-edit 既有 /src-import
+  // 守卫范式 + development-logging 哲学:不静默跳);前置初始/demo/新建画布断言一条不减,
+  // 后续多格式导入/工作台/侧栏断言照常跑(prod-relevant 覆盖不受影响)。
+  if (isProdTopology) {
+    console.log('[archive-assets] prod: archive-restore step skipped (dev-only /src import of snapshotValidation/canvasArchive — logic not in prod bundle); initial + multi-format + workspace assertions still run')
   } else {
-    const importedArchiveAsset = await page.locator('[data-node-id="archive-image"] .dom-node-media img').evaluate((image) => ({
-      src: image.getAttribute('src') || '',
-      naturalWidth: image instanceof HTMLImageElement ? image.naturalWidth : 0,
-      naturalHeight: image instanceof HTMLImageElement ? image.naturalHeight : 0,
-    }))
-    if (
-      !importedArchiveAsset.src.startsWith('blob:') ||
-      importedArchiveAsset.naturalWidth !== 64 ||
-      importedArchiveAsset.naturalHeight !== 64
-    ) {
-      throw new Error(`Importing a Mivo archive should restore embedded local assets: ${JSON.stringify(importedArchiveAsset)}`)
+    await page.evaluate(
+      async ({ storeSpec, archiveText }) => {
+        const { parseCanvasSnapshot } = await import('/src/lib/snapshotValidation.ts')
+        const { restoreCanvasImportAssets } = await import('/src/lib/canvasArchive.ts')
+        const { useCanvasStore } = await import(storeSpec)
+        const result = parseCanvasSnapshot(archiveText)
+        if (!result.ok) throw new Error(`archive parse failed: ${result.message}`)
+        await restoreCanvasImportAssets(result)
+        useCanvasStore.getState().replaceSnapshot(result.snapshot)
+      },
+      { storeSpec: await canvasStoreSpec(), archiveText: JSON.stringify(archive) },
+    )
+    await page.waitForFunction(
+      async ({ moduleSpec, expectedDomCount }) => {
+        const { useCanvasStore } = await import(moduleSpec)
+        const state = useCanvasStore.getState()
+        return (
+          state.canvases[state.sceneId]?.title === 'canvas-e2e-archive' &&
+          state.nodes.length === 2 &&
+          document.querySelectorAll('.dom-node').length === expectedDomCount &&
+          document.querySelector('.dom-node.text-node .dom-text-node')?.textContent?.includes('Archive text')
+        )
+      },
+      // leafer 模式 image 归 Leafer 真画:DOM 只剩 text 节点(1);dom 模式两个都在(2)。
+      { moduleSpec: await canvasStoreSpec(), expectedDomCount: leaferMode ? 1 : 2 },
+    )
+    if (leaferMode) {
+      const restored = await page.evaluate(async (moduleSpec) => {
+        const { useCanvasStore } = await import(moduleSpec)
+        const node = useCanvasStore.getState().nodes.find((entry) => entry.id === 'archive-image')
+        return node ? { assetUrl: node.assetUrl || '' } : null
+      }, await canvasStoreSpec())
+      if (!restored || !(restored.assetUrl.startsWith('blob:') || restored.assetUrl.startsWith('mivo-asset:'))) {
+        throw new Error(`Importing a Mivo archive should restore embedded local assets (store assetUrl): ${JSON.stringify(restored)}`)
+      }
+    } else {
+      const importedArchiveAsset = await page.locator('[data-node-id="archive-image"] .dom-node-media img').evaluate((image) => ({
+        src: image.getAttribute('src') || '',
+        naturalWidth: image instanceof HTMLImageElement ? image.naturalWidth : 0,
+        naturalHeight: image instanceof HTMLImageElement ? image.naturalHeight : 0,
+      }))
+      if (
+        !importedArchiveAsset.src.startsWith('blob:') ||
+        importedArchiveAsset.naturalWidth !== 64 ||
+        importedArchiveAsset.naturalHeight !== 64
+      ) {
+        throw new Error(`Importing a Mivo archive should restore embedded local assets: ${JSON.stringify(importedArchiveAsset)}`)
+      }
     }
   }
 
