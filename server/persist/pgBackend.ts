@@ -203,6 +203,17 @@ class IdempotencyRaceLost extends Error {
 }
 
 /**
+ * 直接 canvas archive/unarchive 的 parent CAS 失败信号。必须抛出事务边界,让已持有的旧 parent
+ * projects 锁随 rollback 释放；外层随后用新事务重读 parent 并重试,严禁在旧锁事务内追锁新 parent。
+ */
+class CanvasParentChanged extends Error {
+  constructor() {
+    super('CANVAS_PARENT_CHANGED')
+    this.name = 'CanvasParentChanged'
+  }
+}
+
+/**
  * PgPersistBackend:PG 持久化后端。drop-in 实现 PersistBackend;路由零改动。
  * 单实例 BFF 假设(缓存 in-process;多实例协作留 T1.4+,见 pg-backend-schema.md §4)。
  */
@@ -343,9 +354,17 @@ export class PgPersistBackend implements PersistBackend {
   }
 
   /**
+   * Project tree 全局锁序静态清单(projects → project meta → canvas meta → children/index):
+   * 1) softDeleteProjectTree；2) restoreProjectTree；3) ensureCreate(project deleted，经 restore helper)；
+   * 4) upsert(project deleted/fresh，空 projects 行锁为 no-op)；5) archiveProjectTree；6) unarchiveProjectTree；
+   * 7) createCanvasWithCollection(parent)；8) upsert(canvas move target)；9) direct canvas archive/unarchive
+   * (parent CAS miss 必须 rollback 后新事务重读重锁)。所有 project 复活路径在写 project meta 前先锁 projects 行。
+   */
+
+  /**
    * 直接归档/恢复 canvas 的 parent-project-first 锁入口。先无锁读取 parent id,随后锁 projects 行;
-   * 真正 canvas UPDATE 还会以该 parent id 作谓词,因此并发 move 若先赢 canvas 行会令本次 no-op,
-   * 不会在未持有新 parent 锁时修改 canvas。无 parent 的 standalone canvas 无项目行可锁。
+   * 真正 canvas UPDATE 还会以该 parent id 作 CAS 谓词；standalone 用 projectId IS NULL。谓词 miss
+   * 由外层 rollback 整事务并用新事务重读重锁,不会在持有旧 project 锁时追锁新 project。
    */
   private async lockCanvasParentProjectInTrx(trx: Kysely<Database>, ownerId: string, canvasId: string): Promise<string | undefined> {
     const row = await trx
@@ -358,6 +377,55 @@ export class PgPersistBackend implements PersistBackend {
     const projectId = typeof row?.project_id === 'string' && row.project_id.length > 0 ? row.project_id : undefined
     if (projectId) await this.projectStateInTrx(trx, ownerId, projectId)
     return projectId
+  }
+
+  /**
+   * 直接 canvas archive/unarchive：parent-project-first + parent CAS + 有界新事务重试。
+   * CAS miss 且 canvas 仍处于 source status 说明并发 move 赢了；throw 使旧 parent 锁先释放，再重试。
+   * 已到 target status / 已删除 / 不存在是真幂等 no-op。三次 parent churn 后显式返回 retryableConflict。
+   */
+  private async setCanvasArchiveStatusWithParentRetry(
+    ownerId: string,
+    canvasId: string,
+    source: 'active' | 'archived',
+    target: 'active' | 'archived',
+  ): Promise<{ count: number; retryableConflict?: true }> {
+    const maxAttempts = 3
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await this.db.transaction().execute(async (trx) => {
+          const parentProjectId = await this.lockCanvasParentProjectInTrx(trx, ownerId, canvasId)
+          let q = trx.updateTable('persist_records')
+            .set({
+              status: target,
+              payload: sql`jsonb_set(payload, '{archivedByCascade}', 'false'::jsonb)`,
+              revision: sql`revision + 1`,
+              updated_at: new Date(),
+            })
+            .where('owner_id', '=', ownerId).where('type', '=', 'canvas').where('id', '=', canvasId)
+            .where('is_deleted', '=', false).where('status', '=', source)
+          q = parentProjectId
+            ? q.where(sql`payload->>'projectId'`, '=', parentProjectId)
+            : q.where(sql<boolean>`payload->>'projectId' IS NULL`)
+          const r = await q.returning('id').executeTakeFirst()
+          if (!r) {
+            const current = await trx.selectFrom('persist_records')
+              .select(['is_deleted', 'status'])
+              .where('owner_id', '=', ownerId).where('type', '=', 'canvas').where('id', '=', canvasId)
+              .executeTakeFirst()
+            if (current && !current.is_deleted && current.status === source) throw new CanvasParentChanged()
+            return { count: 0 }
+          }
+          await trx.updateTable('canvases').set({ status: target, updated_at: new Date() })
+            .where('id', '=', r.id).where('owner_id', '=', ownerId).where('is_deleted', '=', false).where('status', '=', source).execute()
+          return { count: 1 }
+        })
+      } catch (error) {
+        if (!(error instanceof CanvasParentChanged)) throw error
+        if (attempt === maxAttempts) return { count: 0, retryableConflict: true }
+      }
+    }
+    return { count: 0, retryableConflict: true }
   }
 
   /** 事务内原子 bump canvas meta payload.contentVersion(不动 metaRevision;#5)。返新 contentVersion。 */
@@ -698,6 +766,9 @@ export class PgPersistBackend implements PersistBackend {
               if (r) return { kind: 'exists-other-owner', record: rowToRecord(r) }
             }
           }
+          // Project create/update/restore 统一 projects-first。fresh insert 时 projects 行不存在,FOR UPDATE
+          // 空结果为 no-op,随后 INSERT 逻辑不受影响；deleted project 则在写 meta 前锁住瘦索引行。
+          if (type === 'project') await this.projectStateInTrx(trx, ownerId, id)
           const existing = await trx.selectFrom('persist_records').selectAll().where('owner_id', '=', ownerId).where('type', '=', type).where('id', '=', id).executeTakeFirst()
           const scope: PersistScope = opts.scope ?? 'document'
           const canvasId = opts.canvasId ?? null
@@ -1071,6 +1142,9 @@ export class PgPersistBackend implements PersistBackend {
               if (ps.archived) return { kind: 'parent-archived' }
             }
           }
+          // Project upsert 的 fresh/deleted 两分支都 projects-first。不存在的索引行锁为 no-op；
+          // deleted 分支则确保下面 persist_records ON CONFLICT UPDATE 前已持 projects 行锁。
+          if (type === 'project') await this.projectStateInTrx(trx, ownerId, id)
           const existing = await trx.selectFrom('persist_records').selectAll().where('owner_id', '=', ownerId).where('type', '=', type).where('id', '=', id).executeTakeFirst()
           const scope: PersistScope = opts.scope ?? 'document'
           const canvasId = opts.canvasId ?? null
@@ -1788,6 +1862,9 @@ export class PgPersistBackend implements PersistBackend {
 
   /** 事务内:恢复 project 子树(project + 其 canvas meta + chat-collection;原子,N2)。opts.status(D2)同 restoreCanvasTreeInTrx。返 { count, metaRestored, projIdxOwner, childIdxOwners }——F4 输赢 + F2/F5 cache 数据源(全 DB owner_id,未命中不进结果→调用方不碰缓存,无幽灵)。 */
   private async restoreProjectTreeInTrx(trx: Kysely<Database>, ownerId: string, projectId: string, opts: { payload?: unknown; idempotencyKey?: string; fingerprint?: string; status?: RecordStatus } = {}): Promise<{ count: number; metaRestored: boolean; projIdxOwner?: string; childIdxOwners: { id: string; ownerId: string }[] }> {
+    // 全部 project restore 入口(直接/ensureCreate/restoreMeta)共用此第一步：projects-first。
+    // fresh insert 不走本 helper；即使未来误入,不存在行的 FOR UPDATE 也是安全 no-op。
+    await this.projectStateInTrx(trx, ownerId, projectId)
     // F5:先选定本 project 下 soft-deleted child canvas 集合(级联恢复前),供 canvases 瘦索引同步(与 persist_records canvas meta 恢复同集)。
     const childCv = await trx.selectFrom('persist_records').select(['id']).where('owner_id', '=', ownerId).where('type', '=', 'canvas').where(sql`payload->>'projectId'`, '=', projectId).where('is_deleted', '=', true).execute()
     const childIds = childCv.map((r) => r.id)
@@ -1840,47 +1917,15 @@ export class PgPersistBackend implements PersistBackend {
   // 索引缓存(projectIndex/canvasIndex)只存 ownerId+isDeleted,归档不改 isDeleted → 缓存无需 mutation(返 durable owner 仅观测)。
 
   /** 归档 canvas(直接):canvas meta status→archived + archivedByCascade→false;canvases 索引同步。幂等(已归档→0 行 no-op)。 */
-  async archiveCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number }> {
+  async archiveCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number; retryableConflict?: true }> {
     await this.ready
-    const res = await this.db.transaction().execute(async (trx) => {
-      // parent-project-first:有 parent 时先锁 projects 行,再碰 canvas meta/瘦索引。
-      const parentProjectId = await this.lockCanvasParentProjectInTrx(trx, ownerId, canvasId)
-      // archivedByCascade→false:直接归档标记为非级联,unarchiveProjectTree 不会误恢复它(D3)。
-      let q = trx.updateTable('persist_records')
-        .set({ status: 'archived', payload: sql`jsonb_set(payload, '{archivedByCascade}', 'false'::jsonb)`, revision: sql`revision + 1`, updated_at: new Date() })
-        .where('owner_id', '=', ownerId).where('type', '=', 'canvas').where('id', '=', canvasId)
-        .where('is_deleted', '=', false).where('status', '=', 'active')
-      if (parentProjectId) q = q.where(sql`payload->>'projectId'`, '=', parentProjectId)
-      const r = await q.returning('id').executeTakeFirst()
-      // D1:canvases 瘦索引 status 同步(owner-scoped + status='active' 幂等;未命中不报错)
-      if (r) {
-        await trx.updateTable('canvases').set({ status: 'archived', updated_at: new Date() })
-          .where('id', '=', r.id).where('owner_id', '=', ownerId).where('is_deleted', '=', false).where('status', '=', 'active').execute()
-      }
-      return { count: Number(r !== undefined) }
-    })
-    return { count: res.count }
+    return this.setCanvasArchiveStatusWithParentRetry(ownerId, canvasId, 'active', 'archived')
   }
 
   /** 恢复 canvas(直接):canvas meta status→active + archivedByCascade→false;canvases 索引同步。幂等(已 active→0 行)。 */
-  async unarchiveCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number }> {
+  async unarchiveCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number; retryableConflict?: true }> {
     await this.ready
-    const res = await this.db.transaction().execute(async (trx) => {
-      // parent-project-first:与 softDeleteProjectTree 同锁序,SG-2 检查后不能插入 active child。
-      const parentProjectId = await this.lockCanvasParentProjectInTrx(trx, ownerId, canvasId)
-      let q = trx.updateTable('persist_records')
-        .set({ status: 'active', payload: sql`jsonb_set(payload, '{archivedByCascade}', 'false'::jsonb)`, revision: sql`revision + 1`, updated_at: new Date() })
-        .where('owner_id', '=', ownerId).where('type', '=', 'canvas').where('id', '=', canvasId)
-        .where('is_deleted', '=', false).where('status', '=', 'archived')
-      if (parentProjectId) q = q.where(sql`payload->>'projectId'`, '=', parentProjectId)
-      const r = await q.returning('id').executeTakeFirst()
-      if (r) {
-        await trx.updateTable('canvases').set({ status: 'active', updated_at: new Date() })
-          .where('id', '=', r.id).where('owner_id', '=', ownerId).where('is_deleted', '=', false).where('status', '=', 'archived').execute()
-      }
-      return { count: Number(r !== undefined) }
-    })
-    return { count: res.count }
+    return this.setCanvasArchiveStatusWithParentRetry(ownerId, canvasId, 'archived', 'active')
   }
 
   /** 归档 project 子树(级联):project meta status→archived + 其全部 active 子画布 status→archived + archivedByCascade→true;projects/canvases 索引同步。幂等。 */

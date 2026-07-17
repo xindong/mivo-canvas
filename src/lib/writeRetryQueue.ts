@@ -467,6 +467,7 @@ export type WriteExecutor = (op: WriteOp, idempotencyKey: string) => Promise<Wri
  * Map an HTTP response (status + parsed body) to a WriteOutcome. T1.3's real executor
  * uses this after fetch(); tests bypass it by returning outcomes directly. The
  * `isDelete` flag makes 404 on a delete idempotent-successful (already-gone resource).
+ * 409 concurrent-parent-change+retryable → transient(archive intent 保留原样重试)。
  * 409 revision-conflict → conflict (do NOT blindly retry; surface currentRevision for
  * the app's rebase). 409 project/canvas-exists → rejected terminal (can't confirm it's
  * this session's lost response vs. another tenant's resource; safe terminal, not a
@@ -481,7 +482,9 @@ export const classifyHttpStatus = (
   if (status >= 200 && status < 300) return { status: 'success' }
   if (status === 401) return { status: 'unauthorized' }
   if (status === 409) {
-    const b = body as { error?: string; currentRevision?: Revision }
+    const b = body as { error?: string; currentRevision?: Revision; retryable?: boolean }
+    if (b?.error === 'concurrent-parent-change' && b.retryable === true)
+      return { status: 'transient', message: 'concurrent-parent-change' }
     if (b?.error === 'revision-conflict' && typeof b.currentRevision === 'number')
       return { status: 'conflict', currentRevision: b.currentRevision }
     return { status: 'rejected', body }

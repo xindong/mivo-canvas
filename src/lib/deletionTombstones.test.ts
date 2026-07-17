@@ -19,6 +19,8 @@ import {
   revokeCanvasTombstonesForProject,
   clearDeletionTombstone,
   getDeletionTombstones,
+  markProjectDeletionRollbackPending,
+  getPendingProjectDeletionRollbackIds,
   __resetDeletionTombstonesDb,
   __seedTombstoneMemForTest,
 } from './deletionTombstones'
@@ -106,6 +108,25 @@ describe('Phase 2 F-B(决策7):canvas tombstone parentProjectId + revokeCanvasTo
     await clearDeletionTombstone('canvas', 'c1') // DELETE drain success → 清
     const ids = await getDeletionTombstones('canvas')
     expect(ids.has('c1')).toBe(false)
+  })
+
+  it('P2-3:既有 project tombstone 原子 enrich rollbackPending；clear 后 durable marker 同步消失', async () => {
+    await recordDeletionTombstone('project', 'p1')
+    expect(await getPendingProjectDeletionRollbackIds()).toEqual([])
+    await markProjectDeletionRollbackPending('p1')
+    expect(await getPendingProjectDeletionRollbackIds()).toEqual(['p1'])
+    expect((await getDeletionTombstones('project')).has('p1')).toBe(true)
+    await clearDeletionTombstone('project', 'p1')
+    expect(await getPendingProjectDeletionRollbackIds()).toEqual([])
+  })
+
+  it('P2-3:rollbackPending marker 按 user 分区,不让 userA 的失败回灌污染 userB hydrate', async () => {
+    await recordDeletionTombstone('project', 'p1')
+    await markProjectDeletionRollbackPending('p1')
+    setPersistUserId('userB')
+    expect(await getPendingProjectDeletionRollbackIds()).toEqual([])
+    setPersistUserId('userA')
+    expect(await getPendingProjectDeletionRollbackIds()).toEqual(['p1'])
   })
 
   it('幂等:revokeCanvasTombstonesForProject 无命中 → no-op(不抛)', async () => {

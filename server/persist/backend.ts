@@ -433,9 +433,9 @@ export interface PersistBackend {
   // status 列(D1)作归档标记(非 is_deleted);archivedByCascade(D3)在 canvas meta payload 内布尔区分级联 vs 直接归档。
   // 彻底删除仍走 softDelete*Tree(is_deleted 终态);archive=软隐藏(可读/可恢复/子记录写返 409 archived,CR-6 write-guard)。
   /** 归档 canvas(直接):canvas meta status→archived + archivedByCascade→false。幂等(已归档→0 行)。 */
-  archiveCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number }>
+  archiveCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number; retryableConflict?: true }>
   /** 恢复 canvas(直接):canvas meta status→active + archivedByCascade→false。幂等(已 active→0 行)。 */
-  unarchiveCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number }>
+  unarchiveCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number; retryableConflict?: true }>
   /** 归档 project 子树(级联):project meta status→archived + 其全部 active 子画布 status→archived + archivedByCascade→true。幂等。 */
   archiveProjectTree(ownerId: string, projectId: string): Promise<{ count: number }>
   /** 恢复 project 子树(级联):project status→active + 仅恢复 archivedByCascade=true 的子画布(D3:单独归档的不被强制恢复)。幂等。 */
@@ -1935,7 +1935,7 @@ export class InMemoryPersistBackend implements PersistBackend {
   // 彻底删除仍走 softDelete*Tree(is_deleted 终态);archive=软隐藏(可读/可恢复/子记录写返 409 archived,CR-6 write-guard)。
 
   /** 归档 canvas(直接):canvas meta status→archived + payload.archivedByCascade→false(直接归档标记,unarchiveProjectTree 不误恢复)。幂等(已归档→0 行)。 */
-  async archiveCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number }> {
+  async archiveCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number; retryableConflict?: true }> {
     const b = this.bucket(ownerId)
     const ts = nowIso()
     const targets: string[] = []
@@ -1961,7 +1961,7 @@ export class InMemoryPersistBackend implements PersistBackend {
   }
 
   /** 恢复 canvas(直接):canvas meta status→active + payload.archivedByCascade→false。幂等(已 active→0 行)。 */
-  async unarchiveCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number }> {
+  async unarchiveCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number; retryableConflict?: true }> {
     const b = this.bucket(ownerId)
     const ts = nowIso()
     const targets: string[] = []

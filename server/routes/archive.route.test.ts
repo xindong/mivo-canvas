@@ -2,7 +2,7 @@
 // Phase 2 归档(PR-A):/api/canvas/:id/archive|unarchive + /api/projects/:id/archive|unarchive 路由级契约测试。
 // 覆盖:archive/unarchive 端点(200 + status wire)、CR-6 write-guard(archived canvas 子记录写→409;read/manage 放行)、
 // includeArchived 列表过滤、级联归档/恢复、D2 create(status:) 端到端落库。驱动真实 Hono route(memory backend)。
-import { describe, it, expect, beforeEach, beforeAll, afterAll } from 'vitest'
+import { describe, it, expect, beforeEach, beforeAll, afterAll, vi } from 'vitest'
 import { buildPersistApp, hdr, KEY_A, KEY_B, req, canonicalNode, wirePayload, setBaseCursorSecrets } from './persistTestApp'
 
 const TEST_SECRET = ['test', 'secret', 'a2s2'].join('-')
@@ -11,9 +11,10 @@ afterAll(() => setBaseCursorSecrets(null))
 
 describe('Phase 2 归档 routes (PR-A)', () => {
   let app: ReturnType<typeof buildPersistApp>['app']
+  let backend: ReturnType<typeof buildPersistApp>['backend']
 
   beforeEach(() => {
-    ;({ app } = buildPersistApp())
+    ;({ app, backend } = buildPersistApp())
   })
 
   const createProject = (id: string, name = 'P', status?: 'archived' | 'active') =>
@@ -47,6 +48,21 @@ describe('Phase 2 归档 routes (PR-A)', () => {
     // 幂等
     const u2 = await req(app, '/api/canvas/c1/unarchive', { method: 'POST', headers: hdr(KEY_A) })
     expect(u2.status).toBe(200)
+  })
+
+  it('parent CAS 重试耗尽 → 409 retryable conflict,禁止 200 假幂等', async () => {
+    await setup()
+    vi.spyOn(backend, 'archiveCanvasTree').mockResolvedValueOnce({ count: 0, retryableConflict: true })
+    const a = await req(app, '/api/canvas/c1/archive', { method: 'POST', headers: hdr(KEY_A) })
+    expect(a.status).toBe(409)
+    expect(a.body).toEqual({ error: 'concurrent-parent-change', id: 'c1', retryable: true })
+
+    const archived = await req(app, '/api/canvas/c1/archive', { method: 'POST', headers: hdr(KEY_A) })
+    expect(archived.status).toBe(200)
+    vi.spyOn(backend, 'unarchiveCanvasTree').mockResolvedValueOnce({ count: 0, retryableConflict: true })
+    const u = await req(app, '/api/canvas/c1/unarchive', { method: 'POST', headers: hdr(KEY_A) })
+    expect(u.status).toBe(409)
+    expect(u.body).toEqual({ error: 'concurrent-parent-change', id: 'c1', retryable: true })
   })
 
   it('POST /api/canvas/:id/archive 跨 owner → 404 unknown-canvas(无泄漏)', async () => {

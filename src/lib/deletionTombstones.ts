@@ -47,6 +47,8 @@ type TombstoneRecord = {
    * schemaless value(IDB keyPath='key' 不变),加可选字段不触发 onupgradeneeded(决策7:无 DB_VERSION bump)。
    */
   parentProjectId?: string
+  /** active-child 409 后权威回灌失败：下次 hydrate 必须先重试严格 project+canvas reconcile。 */
+  rollbackPending?: true
 }
 
 const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e))
@@ -159,8 +161,15 @@ const getAllRecords = async (): Promise<TombstoneRecord[]> => {
       const idb = byKey.get(r.key)
       if (idb) {
         // 同 key merge:mem 的 parentProjectId(enriched 投影)补进 IDB 记录(IDB stale 缺时);IDB 已有则不覆盖。
-        if (r.parentProjectId !== undefined && idb.parentProjectId === undefined) {
-          byKey.set(r.key, { ...idb, parentProjectId: r.parentProjectId })
+        if (
+          (r.parentProjectId !== undefined && idb.parentProjectId === undefined) ||
+          (r.rollbackPending === true && idb.rollbackPending !== true)
+        ) {
+          byKey.set(r.key, {
+            ...idb,
+            ...(r.parentProjectId !== undefined && idb.parentProjectId === undefined ? { parentProjectId: r.parentProjectId } : {}),
+            ...(r.rollbackPending === true ? { rollbackPending: true as const } : {}),
+          })
         }
       } else {
         // mem-only(key 不在 IDB)→ 追加(IDB tx 失败回落的全 mem 记录)。
@@ -182,8 +191,15 @@ const putRecord = async (record: TombstoneRecord): Promise<'new' | 'enriched' | 
   if (!isIdbAvailable()) {
     const existing = memStore.get(record.key)
     if (existing) {
-      if (record.parentProjectId !== undefined && existing.parentProjectId === undefined) {
-        memStore.set(record.key, { ...existing, parentProjectId: record.parentProjectId })
+      if (
+        (record.parentProjectId !== undefined && existing.parentProjectId === undefined) ||
+        (record.rollbackPending === true && existing.rollbackPending !== true)
+      ) {
+        memStore.set(record.key, {
+          ...existing,
+          ...(record.parentProjectId !== undefined && existing.parentProjectId === undefined ? { parentProjectId: record.parentProjectId } : {}),
+          ...(record.rollbackPending === true ? { rollbackPending: true as const } : {}),
+        })
         return 'enriched'
       }
       return 'existing'
@@ -201,9 +217,16 @@ const putRecord = async (record: TombstoneRecord): Promise<'new' | 'enriched' | 
         if (existing === undefined) {
           store.put(record)
           written = true
-        } else if (record.parentProjectId !== undefined && existing.parentProjectId === undefined) {
-          // enrich(原子:同 tx 内 get→put;不覆盖 createdAt/kind/ownerId/resourceId,只补 parentProjectId)
-          store.put({ ...existing, parentProjectId: record.parentProjectId })
+        } else if (
+          (record.parentProjectId !== undefined && existing.parentProjectId === undefined) ||
+          (record.rollbackPending === true && existing.rollbackPending !== true)
+        ) {
+          // enrich(原子:同 tx 内 get→put;不覆盖 createdAt/kind/ownerId/resourceId,只补 provenance/rollback marker)
+          store.put({
+            ...existing,
+            ...(record.parentProjectId !== undefined && existing.parentProjectId === undefined ? { parentProjectId: record.parentProjectId } : {}),
+            ...(record.rollbackPending === true ? { rollbackPending: true as const } : {}),
+          })
           enriched = true
         }
         // else: existing(已 parentProjectId 或新 record 无 parentProjectId)→ no-op
@@ -215,8 +238,15 @@ const putRecord = async (record: TombstoneRecord): Promise<'new' | 'enriched' | 
     warnIdbDegradation(`put failed for ${record.key}`, error)
     const existing = memStore.get(record.key)
     if (existing) {
-      if (record.parentProjectId !== undefined && existing.parentProjectId === undefined) {
-        memStore.set(record.key, { ...existing, parentProjectId: record.parentProjectId })
+      if (
+        (record.parentProjectId !== undefined && existing.parentProjectId === undefined) ||
+        (record.rollbackPending === true && existing.rollbackPending !== true)
+      ) {
+        memStore.set(record.key, {
+          ...existing,
+          ...(record.parentProjectId !== undefined && existing.parentProjectId === undefined ? { parentProjectId: record.parentProjectId } : {}),
+          ...(record.rollbackPending === true ? { rollbackPending: true as const } : {}),
+        })
         return 'enriched'
       }
       return 'existing'
@@ -344,6 +374,29 @@ export const getCanvasTombstoneIdsForProject = async (projectId: string): Promis
   return all
     .filter((r) => r.ownerId === ownerId && r.kind === 'canvas' && r.parentProjectId === projectId)
     .map((r) => r.resourceId)
+}
+
+/** active-child 权威回灌失败后给 project tombstone 加 durable rollback marker。 */
+export const markProjectDeletionRollbackPending = async (projectId: string): Promise<void> => {
+  const ownerId = getPersistUserId()
+  await putRecord({
+    key: tombstoneKey('project', projectId, ownerId),
+    ownerId,
+    kind: 'project',
+    resourceId: projectId,
+    createdAt: Date.now(),
+    rollbackPending: true,
+  })
+  debugLogger.warn(SOURCE, `project ${projectId} marked rollbackPending after active-child reconcile failure`)
+}
+
+/** hydrate 启动时读取需要严格重试权威回灌的 project id。 */
+export const getPendingProjectDeletionRollbackIds = async (): Promise<string[]> => {
+  const ownerId = getPersistUserId()
+  const all = await getAllRecords()
+  return all
+    .filter((record) => record.ownerId === ownerId && record.kind === 'project' && record.rollbackPending === true)
+    .map((record) => record.resourceId)
 }
 
 /**

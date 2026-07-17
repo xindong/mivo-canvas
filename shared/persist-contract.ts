@@ -313,6 +313,13 @@ export type ActiveChildBody = {
   id: string
 }
 
+/** 直接归档/恢复与并发 move 的 parent CAS 连续失败；409 但可原样重试,不得按成功出队。 */
+export type ConcurrentParentChangeBody = {
+  error: 'concurrent-parent-change'
+  id: string
+  retryable: true
+}
+
 /** 统一错误体(任一 4xx)。 */
 export type ApiErrorBody =
   | { error: 'bad-request'; message?: string }
@@ -329,6 +336,7 @@ export type ApiErrorBody =
   | RequireLoginBody
   | ArchivedBody
   | ActiveChildBody
+  | ConcurrentParentChangeBody
   | { error: 'project-exists'; id: string }
   // F4:canvas id 全局唯一(与 project 同模式)——跨 owner 同 canvas id → 409 canvas-exists。
   | { error: 'canvas-exists'; id: string }

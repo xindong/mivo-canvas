@@ -573,7 +573,7 @@ jobs:
             echo '观察窗已收口(七 PR 全绿),已注册进 main 分支保护必需 check `CI / pg suite (PG16)`(仿 #186→#193 e2e-kernel-gate 先例)。失败即阻断合并。'
             echo ''
             echo '### 时序'
-            echo '- #202 已于 2026-07-11 合入 main(初始四个 PG-gated 文件);#229 接入 p6saga 矩阵(五);G2.2(A1)加 authz matrix;PR #266 加 archive dual,现七个。'
+            echo '- #202 已于 2026-07-11 合入 main(初始四个 PG-gated 文件);#229 接入 p6saga 矩阵(五);G2.2(A1)加 authz matrix;PR #266 加 archive dual;PR #276 加 archive locking,现八个。'
             echo '- 每 PR 实跑真 PG 用例(双后端契约 32 场景 + saga 迁移矩阵 + 并发回归 + authz 矩阵),见下方 vitest 日志。'
             echo ''
             echo "### 本轮 vitest 匹配文件数(expected=$expected,不许静默:缺一即红)"

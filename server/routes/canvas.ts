@@ -41,6 +41,7 @@ import type {
   ArchivedBody,
   CanvasMeta,
   CanvasChildUpsertResponse,
+  ConcurrentParentChangeBody,
   ConflictBody,
   CreateCanvasRequest,
   GetCanvasResponse,
@@ -1027,6 +1028,10 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
       return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
     }
     const res = await backend.archiveCanvasTree(authz.ownerId, id)
+    if (res.retryableConflict) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 409, latencyMs: Date.now() - t0, note: 'parent-changed-retryable' })
+      return c.json({ error: 'concurrent-parent-change', id, retryable: true } satisfies ConcurrentParentChangeBody, 409)
+    }
     const after = await backend.get(authz.ownerId, 'canvas', id)
     if (after.kind !== 'found' || after.record.isDeleted) {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
@@ -1051,6 +1056,10 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
       return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
     }
     const res = await backend.unarchiveCanvasTree(authz.ownerId, id)
+    if (res.retryableConflict) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 409, latencyMs: Date.now() - t0, note: 'parent-changed-retryable' })
+      return c.json({ error: 'concurrent-parent-change', id, retryable: true } satisfies ConcurrentParentChangeBody, 409)
+    }
     const after = await backend.get(authz.ownerId, 'canvas', id)
     if (after.kind !== 'found' || after.record.isDeleted) {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
