@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- bug-doctor 状态看板常驻静态服务(localhost:8787)。
+     安装:替换 __NODE__ / __SERVE__ / __STATE_DIR__ 为绝对路径后
+     cp 到 ~/Library/LaunchAgents/ 并 launchctl bootstrap gui/$UID <plist>。
+     T8 入库切主 checkout 后,只需把两个路径改指主仓并重新 bootstrap。 -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.mivo.bug-doctor.dashboard</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NODE__</string>
+    <string>__SERVE__</string>
+    <string>--state-dir</string>
+    <string>__STATE_DIR__</string>
+    <string>--port</string>
+    <string>8787</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>__STATE_DIR__/dashboard/serve.log</string>
+  <key>StandardErrorPath</key><string>__STATE_DIR__/dashboard/serve.err.log</string>
+</dict>
+</plist>
