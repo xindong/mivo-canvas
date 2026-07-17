@@ -37,7 +37,9 @@ const server = createServer(async (req, res) => {
     res.writeHead(200, { 'content-type': MIME[extname(file)] || 'application/octet-stream', 'cache-control': 'no-store' });
     res.end(body);
   } catch (e) {
-    res.writeHead(500); res.end(String(e));
+    // CodeQL js/stack-trace-exposure:异常详情只进本地 stderr,响应体不带堆栈内容
+    console.error('[dashboard]', e);
+    res.writeHead(500); res.end('internal error');
   }
 });
 
