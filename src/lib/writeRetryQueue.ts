@@ -221,8 +221,9 @@ export type WriteOp =
   | { kind: 'updateCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string; baseRevision?: Revision }
   | { kind: 'deleteCanvas'; canvasId: string }
   // Phase 2 归档(回收站):archive/unarchive 走写队列(CR-7,断网归档不丢)。resourceKey 与 create/update/delete
-  //   同资源一致 → 同资源归档态写经 combineOps 合并(D2:create+archive→create(archived)/archive+unarchive
-  //   互消/archive+delete→delete last-wins)。幂等:server 对已归档再 archive → 200 no-op。不入 isDeleteKind
+  //   同资源一致 → 同资源归档态写经 combineOps 合并(D2:create+archive/unarchive→skip-coalesce(保留独立 transition
+  //   op,不折进 create(status);P1 三审)/ archive+unarchive 互消(已 attempted 时也 skip-coalesce 防 lost-response
+  //   分叉;P1 四审)/ archive+delete→delete last-wins)。幂等:server 对已归档再 archive → 200 no-op。不入 isDeleteKind
   //   (archive 返 200,非 404-idempotent-success);无 baseRevision(archive 端点空 body,无 If-Match,无 428/409)。
   //   P1-2 barrier:archiveProject 携带 canvasIds?(client-side 快照,非 wire 字段——server 不收;enqueue 时从
   //   store.canvases 收集该 project 的 active 子画布 id)。供 due-filter barrier 判定 earlier 子写是否撞本
@@ -251,8 +252,9 @@ export type NonCanvasWriteOp =
   | { kind: 'updateCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string; baseRevision?: Revision }
   | { kind: 'deleteCanvas'; canvasId: string }
   // Phase 2 归档(回收站):archive/unarchive 走写队列(CR-7,断网归档不丢)。resourceKey 与 create/update/delete
-  //   同资源一致 → 同资源归档态写经 combineOps 合并(D2:create+archive→create(archived)/archive+unarchive
-  //   互消/archive+delete→delete last-wins)。幂等:server 对已归档再 archive → 200 no-op。不入 isDeleteKind
+  //   同资源一致 → 同资源归档态写经 combineOps 合并(D2:create+archive/unarchive→skip-coalesce(保留独立 transition
+  //   op,不折进 create(status);P1 三审)/ archive+unarchive 互消(已 attempted 时也 skip-coalesce 防 lost-response
+  //   分叉;P1 四审)/ archive+delete→delete last-wins)。幂等:server 对已归档再 archive → 200 no-op。不入 isDeleteKind
   //   (archive 返 200,非 404-idempotent-success);无 baseRevision(archive 端点空 body,无 If-Match,无 428/409)。
   //   P1-2 barrier:archiveProject 携带 canvasIds?(client-side 快照,非 wire 字段——server 不收;enqueue 时从
   //   store.canvases 收集该 project 的 active 子画布 id)。供 due-filter barrier 判定 earlier 子写是否撞本
@@ -725,16 +727,35 @@ const stableTopologicalSort = (due: QueuedWrite[]): QueuedWrite[] => {
  *  - create+delete → 净消(资源从未服务端创建,delete 无意义)。
  *  - 其余(update+update / update+delete / delete+delete / delete+update)→ last-wins(incoming)。
  *    create+create 同 id 正常 store 流不会发生(createProject 每次新 mint id);若发生也 last-wins。
+ *
+ * P1(四审 lost-response attempted-gate):destructive coalesce(create+update 字段合并 / create+delete 净消 /
+ *   archive↔unarchive 互消)只有在 existing 记录“从未发送”(existingAttempted=false,lastAttemptAt===undefined)时
+ *   才允许。existing 已尝试过(existingAttempted=true,即已 POST 落 server、仅响应丢失回到 pending)时,destructive
+ *   coalesce 会静默吞真实后继意图(create 已落 server→delete 净消→server 存活他端复活;archive↔unarchive 净消两条
+ *   →server 保持首态 client 保持反向乐观态永久分叉;create+update 折回 create 换新 idempotencyKey→POST 命中 live
+ *   existing,backend 返旧 record 不 rename→rename 静默吞)。已尝试一律 'skip-coalesce':existing 原封不动(原
+ *   idempotencyKey 是 replay 证据,attempts/lastAttemptAt 不重置),incoming 走新建 record,同 resourceKey 前驱屏障
+ *   + 幂等重放按 seq 顺序处理(existing 先 drain 幂等重放,incoming 后 drain 真生效)。last-wins 分支(update+update
+ *   等)不受 gate 影响——incoming(最新意图)语义上覆盖前驱,重放 incoming 即正确。
  */
-const combineOps = (existing: WriteOp, incoming: WriteOp): WriteOp | 'cancel' | 'skip-coalesce' => {
+const combineOps = (
+  existing: WriteOp,
+  incoming: WriteOp,
+  existingAttempted: boolean,
+): WriteOp | 'cancel' | 'skip-coalesce' => {
   const ek = existing.kind
   const ik = incoming.kind
   // create+update → 保留 create kind,合并到最终 body(防 create 被 update 替换致服务端从未 POST)
   if (ek === 'createProject' && ik === 'updateProject') {
+    // P1(四审 lost-response):前驱 create 已 POST 落 server、仅响应丢失 → 不折回 create(换新 idempotencyKey 会
+    //   命中 live existing,backend 返旧 record 不 rename → rename 静默吞)。skip-coalesce 保留 existing 原封不动
+    //   (原 idempotencyKey 作 replay 证据),update 独立 enqueue 后 drain 真 PATCH rename。
+    if (existingAttempted) return 'skip-coalesce'
     // P1-1(#3 返修):字段级保留 existing.status(先前 create+archive 合并得的 archived 不被 update 静默丢回 active)。
     return { kind: 'createProject', name: incoming.name, id: existing.id ?? incoming.projectId, ...(existing.status !== undefined ? { status: existing.status } : {}) }
   }
   if (ek === 'createCanvas' && ik === 'updateCanvas') {
+    if (existingAttempted) return 'skip-coalesce' // 同上(lost-response:不折回 create,保留独立 update 真 PATCH)
     // R3 F1:field-wise merge — 保留 create 独有/未改字段( notably sourceTemplateId)。
     // 生产 rename(只带 title)/move(只带 projectId)的 update 不带 sourceTemplateId,
     // 旧实现只用 incoming 重建 create 致 sourceTemplateId 被静默丢弃。现按字段级合并:
@@ -757,9 +778,11 @@ const combineOps = (existing: WriteOp, incoming: WriteOp): WriteOp | 'cancel' | 
       ...(existing.status !== undefined ? { status: existing.status } : {}),
     }
   }
-  // create+delete → 净消(资源从未服务端创建,delete 无意义)
-  if (ek === 'createProject' && ik === 'deleteProject') return 'cancel'
-  if (ek === 'createCanvas' && ik === 'deleteCanvas') return 'cancel'
+  // create+delete → 净消(资源从未服务端创建,delete 无意义)。P1(四审 lost-response):前驱 create 已 POST 落 server
+  //   (仅响应丢失)时不得 cancel——delete 被净消 → server 存活 → 他端复活;本地 tombstone 只本地遮盖。
+  //   attempted → skip-coalesce:create 先 drain 幂等重放(server 对 live existing 返 existing 不重创),delete 后 drain 真 DELETE。
+  if (ek === 'createProject' && ik === 'deleteProject') return existingAttempted ? 'skip-coalesce' : 'cancel'
+  if (ek === 'createCanvas' && ik === 'deleteCanvas') return existingAttempted ? 'skip-coalesce' : 'cancel'
   // D2(Phase 2 归档 combineOps,P1 三审返修:create+archive/unarchive 不再折成 create(status)):
   //  - create+archive/unarchive → skip-coalesce(下方 isStateTransition 条件,保留独立 transition record)。
   //    旧实现折成 create(status:'archived'/'active')把 archiveProject/archiveCanvas op coalesce 删掉 →
@@ -777,10 +800,14 @@ const combineOps = (existing: WriteOp, incoming: WriteOp): WriteOp | 'cancel' | 
   //  - delete+archive/unarchive → delete 赢(return existing):删终态压过归档态;归档一个正被删的资源无意义,
   //    保 delete 不让 archive/unarchive 复活删除意图(last-wins 会返 incoming archive → 删除被替换为归档,bug)。
   //  - archive/unarchive+delete(incoming)= delete 走下方默认 last-wins(incoming delete 胜,无需显式)。
-  if (ek === 'archiveProject' && ik === 'unarchiveProject') return 'cancel'
-  if (ek === 'unarchiveProject' && ik === 'archiveProject') return 'cancel'
-  if (ek === 'archiveCanvas' && ik === 'unarchiveCanvas') return 'cancel'
-  if (ek === 'unarchiveCanvas' && ik === 'archiveCanvas') return 'cancel'
+  // P1(四审 lost-response):archive↔unarchive 首个 transition 已 POST 落 server(仅响应丢失)时不得 cancel——
+  //   反向操作净消两条 → server 保持首态、client 保持反向乐观态 → 永久分叉。attempted → skip-coalesce:
+  //   前驱 transition 先 drain 幂等重放(server 对已归档/已激活再 archive/unarchive → 200 no-op),
+  //   反向 transition 后 drain 真转 → 终态与 client 乐观一致。
+  if (ek === 'archiveProject' && ik === 'unarchiveProject') return existingAttempted ? 'skip-coalesce' : 'cancel'
+  if (ek === 'unarchiveProject' && ik === 'archiveProject') return existingAttempted ? 'skip-coalesce' : 'cancel'
+  if (ek === 'archiveCanvas' && ik === 'unarchiveCanvas') return existingAttempted ? 'skip-coalesce' : 'cancel'
+  if (ek === 'unarchiveCanvas' && ik === 'archiveCanvas') return existingAttempted ? 'skip-coalesce' : 'cancel'
   if (ek === 'deleteProject' && (ik === 'archiveProject' || ik === 'unarchiveProject')) return existing
   if (ek === 'deleteCanvas' && (ik === 'archiveCanvas' || ik === 'unarchiveCanvas')) return existing
   // P1-1(#1/#2 返修)+ P1(三审):一侧 state-transition,另一侧 create 或 meta-update → skip-coalesce(不合并
@@ -1987,7 +2014,12 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
       if (existing) {
         // G1-a R2 F1:kind-aware 组合(create+update 合并保留 create / create+delete 净消),
         // 不再无差别 `existing.op = op`(会把 pending create 替换成 update 致服务端从未 POST)。
-        const combined = combineOps(existing.op, op)
+        // P1(四审 lost-response):existing 已尝试过(lastAttemptAt !== undefined = 已 POST 落 server、仅响应丢失回到
+        //   pending)时,destructive coalesce(cancel/字段合并)会吞真实后继意图 → combineOps 内 attempted-gate
+        //   返 skip-coalesce,existing 原封不动(原 idempotencyKey 作 replay 证据),incoming 走下方新建 record
+        //   按 seq 顺序重放。未发送(lastAttemptAt === undefined)保持原 destructive 行为。
+        const existingAttempted = existing.lastAttemptAt !== undefined
+        const combined = combineOps(existing.op, op, existingAttempted)
         if (combined === 'cancel') {
           await deleteWrite(existing.id)
           debugLogger.log(
@@ -2000,9 +2032,13 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
           // P1-1 返修:state-transition + meta update 不合并,保留两条有序 op(existing 留存 pending,
           //   incoming 走下方新建 record,按 seq 顺序重放:existing 先 createdAt/seq 先 drain,incoming 后 drain)。
           //   防 last-wins 静默丢一侧意图(见 combineOps 注释)。fall through 到 overflow 检查 + 新建 record 路径。
+          // P1(四审):existing 已 attempted(lastAttemptAt !== undefined,lost-response)也走 skip-coalesce——
+          //   destructive cancel/字段合并会吞真实后继意图,故保留 existing 原封不动(原 idempotencyKey 作 replay 证据)。
           debugLogger.log(
             SOURCE,
-            `skip-coalesce ${resourceKey} (state-transition + meta update: keep both as ordered ops; existing ${existing.id} stays, new record for incoming)`,
+            existingAttempted
+              ? `skip-coalesce ${resourceKey} (attempted predecessor: lastAttemptAt set → lost-response; preserve existing ${existing.id} idempotencyKey/attempts as replay evidence; new record for incoming; drain in seq order)`
+              : `skip-coalesce ${resourceKey} (state-transition + meta update: keep both as ordered ops; existing ${existing.id} stays, new record for incoming)`,
           )
         } else {
           existing.op = combined

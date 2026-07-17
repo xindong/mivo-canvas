@@ -2637,9 +2637,11 @@ describe('P3 (demo-seed-migration-skip) — migration op terminal 降 WARN + 既
 })
 
 // ── Phase 2 归档 combineOps (D2):create+archive / archive+unarchive / delete+archive ──
-// D2 规则:create+archive→create(archived)/ archive+unarchive→cancel(两向对称)/ archive+delete→delete last-wins /
-//   delete+archive→keep delete(防 archive 复活删除意图)。resourceKey 与 create/update/delete 同资源一致
-//   → 同资源归档态写经 coalesce 合并(单 record)。以下经 enqueue 同资源 + drain 验证 combineOps 行为。
+// D2 规则:create+archive/unarchive→skip-coalesce(保留独立 transition op,不折进 create(status);P1 三审)/
+//   archive+unarchive→cancel(两向对称;已 attempted 时 skip-coalesce 防 lost-response 分叉;P1 四审)/
+//   archive+delete→delete last-wins / delete+archive→keep delete(防 archive 复活删除意图)。
+//   resourceKey 与 create/update/delete 同资源一致 → 同资源归档态写经 coalesce 合并(skip-coalesce 时为多 record)。
+//   以下经 enqueue 同资源 + drain 验证 combineOps 行为。
 const createProjectOp = (name: string, id: string): WriteOp => ({ kind: 'createProject', name, id })
 const deleteProjectOp = (projectId: string): WriteOp => ({ kind: 'deleteProject', projectId })
 const archiveProjectOp = (projectId: string): WriteOp => ({ kind: 'archiveProject', projectId })
@@ -3142,5 +3144,228 @@ describe('P1-2(二审 gate-blocked 活性):archive 越过 gate-blocked legacy �
       (c) => typeof c[1] === 'string' && (c[1] as string).includes('archive pass: terminal-izing gate-blocked legacy'),
     )
     expect(terminalizeLog).toBeDefined()
+  })
+})
+
+// ── P1(四审 lost-response):combineOps attempted-gate — 前驱已 POST(响应丢失)时 destructive coalesce 不吞后继意图 ──
+// 四审根因:前驱 op 已 POST 落 server、仅响应丢失(transient backoff 回 pending,lastAttemptAt 已设)时,旧 combineOps
+//   仍按"从未发送"做 destructive 合并 → 静默吞真实后继意图:
+//   1) create+delete→cancel:create 已落 server → delete 净消 → server 存活 → 他端复活(本地 tombstone 只本地遮盖)。
+//   2) archive↔unarchive→cancel:首个 transition 已落 server 响应丢失 → 反向操作净消两条 → server 保持首态、client 保持
+//      反向乐观态 → 永久分叉。
+//   3) create+update→折回 create 换新 idempotencyKey:原 create 已落 server → coalesce 换新 key 后 POST 命中 live
+//      existing,backend 返旧 record(executor 不 rename 补偿)→ success 但 server 仍旧名 → rename 静默吞。
+//   修:destructive coalesce(cancel + create/update 字段合并)只在 existing "从未发送"(lastAttemptAt===undefined)时
+//   允许;已 attempted(lastAttemptAt!==undefined)一律 skip-coalesce,existing 原封不动(原 idempotencyKey 作 replay
+//   证据),incoming 独立 enqueue,同 resourceKey 前驱屏障 + 幂等重放按 seq 顺序处理。
+//
+// 忠实幂等 backend mock:建模真 backend ensureCreate 语义(已存在 id → 返 existing 不应用 incoming,防 create 重放
+//   静默吞 rename → 防 mock 假绿)。seqExecutor 无脑返 success 不区分"create 重放返 existing"vs"update 真 PATCH rename";
+//   本 mock 让 create+update lost-response 在无 fix 时 create 重放返 existing(不 rename)→ 最终 name 不变(红),有 fix 时
+//   update 真 PATCH → name 变(绿)。projects Map 即 server 真源,测试直接断言最终态。
+//   transientOnCalls 指定的 call 索引:server 侧变更已应用(POST 已落)但返 transient(响应丢失)。
+const makeIdempotentBackend = (opts: { transientOnCalls?: number[] } = {}) => {
+  // server 真源:id → {name, status}。测试可 pre-seed 或断言最终态。
+  const projects = new Map<string, { name: string; status: string }>()
+  const calls: { op: WriteOp; key: string }[] = []
+  const transientSet = new Set(opts.transientOnCalls ?? [])
+  const fn = vi.fn(async (op: WriteOp, _key: string): Promise<WriteOutcome> => {
+    const idx = calls.length
+    calls.push({ op, key: _key })
+    const lostResponse = transientSet.has(idx)
+    // 先应用 server 侧变更(POST 已落),再决定响应(lostResponse → transient 响应丢失)
+    switch (op.kind) {
+      case 'createProject': {
+        const id = op.id ?? ''
+        // 幂等 ensureCreate:已存在 id → 不应用 incoming(backend.ts clone(existing));否则新建。
+        if (!projects.has(id)) projects.set(id, { name: op.name, status: op.status ?? 'active' })
+        break
+      }
+      case 'updateProject': {
+        const existing = projects.get(op.projectId)
+        if (!existing) return { status: 'rejected', body: { error: 'unknown-project' } }
+        existing.name = op.name // 真 PATCH rename
+        break
+      }
+      case 'deleteProject':
+        projects.delete(op.projectId) // 真 DELETE(幂等:已删再删 no-op)
+        break
+      case 'archiveProject': {
+        const p = projects.get(op.projectId)
+        if (p) p.status = 'archived'
+        break
+      }
+      case 'unarchiveProject': {
+        const p = projects.get(op.projectId)
+        if (p) p.status = 'active'
+        break
+      }
+      default:
+        break
+    }
+    return lostResponse
+      ? { status: 'transient', message: 'simulated lost response (POST landed, response lost)' }
+      : { status: 'success' }
+  })
+  return { fn, calls, projects }
+}
+
+describe('P1(四审 lost-response):combineOps attempted-gate — 前驱已 POST 响应丢失时 destructive coalesce 不吞意图', () => {
+  it('lost-response(create+delete):createProject 已 POST(响应丢失,lastAttemptAt 已设)后 enqueue deleteProject → skip-coalesce(create 不被净消);create 幂等重放返 existing,delete 独立 drain 真 DELETE → server 资源被删(不存活致他端复活)', async () => {
+    const backend = makeIdempotentBackend({ transientOnCalls: [0] }) // call0 = createProject 首次 drain 丢响应
+    const q = makeQueue(backend.fn, { baseDelayMs: 1000, maxDelayMs: 60_000 })
+    await q.enqueue(createProjectOp('P1', 'p1'))
+    // drain1:createProject POST 落 server(backend 已建 P1),响应丢失 → transient → 回 pending(lastAttemptAt 已设)
+    await q.drain()
+    expect(backend.calls).toHaveLength(1)
+    expect(backend.calls[0]!.op.kind).toBe('createProject')
+    expect(backend.projects.get('p1')!.name).toBe('P1') // server 已建(POST 落了,仅响应丢失)
+    const afterDrain1 = await __dumpWritesForTest()
+    expect(afterDrain1).toHaveLength(1)
+    expect(afterDrain1[0]!.lastAttemptAt).not.toBeUndefined() // ← attempted 标志(lost-response 信号)
+    const createKey = afterDrain1[0]!.idempotencyKey
+    // enqueue deleteProject 同 resourceKey project:p1
+    await q.enqueue(deleteProjectOp('p1'))
+    // 四审 attempted-gate:existing.lastAttemptAt!==undefined → skip-coalesce(不 cancel)。旧实现 create+delete→cancel
+    //   会净消 create → delete 不发 → server 存活 P1 → 他端复活(本地 tombstone 只本地遮盖)。
+    const writes = await __dumpWritesForTest()
+    expect(writes).toHaveLength(2) // create 留存(原封不动)+ delete 新 record
+    const createRec = writes.find((w) => w.op.kind === 'createProject')!
+    const deleteRec = writes.find((w) => w.op.kind === 'deleteProject')!
+    expect(createRec).toBeDefined()
+    expect(deleteRec).toBeDefined()
+    // existing 原封不动:原 idempotencyKey/attempts/lastAttemptAt 不重置(replay 证据保留)
+    expect(createRec.idempotencyKey).toBe(createKey)
+    expect(createRec.lastAttemptAt).not.toBeUndefined()
+    expect(createRec.attempts).toBe(1) // 一次 transient 后 attempts=1,skip-coalesce 不重置
+    // advance 过 backoff(nextAttemptAt=1750)→ createProject 重试 due
+    tick(800) // 1800 > 1750
+    // 循环 drain:create 先 drain(幂等重放,backend 返 existing 'P1' 不重创)→ 出队 → 屏障解锁 → delete drain 真 DELETE
+    for (let i = 0; i < 5 && (await __dumpWritesForTest()).length > 0; i++) await q.drain()
+    expect(backend.calls.map((c) => c.op.kind)).toEqual([
+      'createProject',
+      'createProject',
+      'deleteProject',
+    ])
+    expect(backend.projects.has('p1')).toBe(false) // ← server 真 DELETE(不存活,不致他端复活)
+    expect((await __dumpWritesForTest())).toHaveLength(0)
+  })
+
+  it('lost-response(archive+unarchive 反向 transition):archiveProject 已 POST(server archived,响应丢失)后 enqueue unarchiveProject → skip-coalesce(不互消);archive 幂等重放 no-op,unarchive 独立 drain 真转 active → server/client 终态 active 一致(不永久分叉)', async () => {
+    const backend = makeIdempotentBackend({ transientOnCalls: [0] }) // call0 = archiveProject 首次 drain 丢响应
+    // project 已存在(之前 create 已 drain 落 server;此处 pre-seed 避免引入额外 create 依赖)
+    backend.projects.set('p1', { name: 'P1', status: 'active' })
+    const q = makeQueue(backend.fn, { baseDelayMs: 1000, maxDelayMs: 60_000 })
+    await q.enqueue(archiveProjectOp('p1'))
+    // drain1:archive POST 落 server(status=archived),响应丢失 → transient → pending(lastAttemptAt 已设)
+    await q.drain()
+    expect(backend.calls).toHaveLength(1)
+    expect(backend.calls[0]!.op.kind).toBe('archiveProject')
+    expect(backend.projects.get('p1')!.status).toBe('archived') // server 已归档(POST 落了)
+    const afterDrain1 = await __dumpWritesForTest()
+    expect(afterDrain1[0]!.lastAttemptAt).not.toBeUndefined() // ← attempted
+    const archKey = afterDrain1[0]!.idempotencyKey
+    // enqueue unarchiveProject 同 resourceKey project:p1
+    await q.enqueue(unarchiveProjectOp('p1'))
+    // 四审 attempted-gate:existing attempted → skip-coalesce(不 cancel)。旧实现 archive+unarchive→cancel 互消两条
+    //   → server 保持 archived、client 乐观 active → 永久分叉。
+    const writes = await __dumpWritesForTest()
+    expect(writes).toHaveLength(2) // archive 留存(原封不动)+ unarchive 新 record
+    const archRec = writes.find((w) => w.op.kind === 'archiveProject')!
+    const unarchRec = writes.find((w) => w.op.kind === 'unarchiveProject')!
+    expect(archRec).toBeDefined()
+    expect(unarchRec).toBeDefined()
+    expect(archRec.idempotencyKey).toBe(archKey) // 原封不动(replay 证据)
+    expect(archRec.lastAttemptAt).not.toBeUndefined()
+    expect(archRec.attempts).toBe(1)
+    tick(800) // 过 backoff(1750)
+    for (let i = 0; i < 5 && (await __dumpWritesForTest()).length > 0; i++) await q.drain()
+    expect(backend.calls.map((c) => c.op.kind)).toEqual([
+      'archiveProject',
+      'archiveProject',
+      'unarchiveProject',
+    ])
+    expect(backend.projects.get('p1')!.status).toBe('active') // ← server 真 unarchive(终态 active,不永久分叉 archived)
+    expect((await __dumpWritesForTest())).toHaveLength(0)
+  })
+
+  it('lost-response(create+meta-update):createProject 已 POST(响应丢失)后 enqueue updateProject(rename)→ skip-coalesce(不折回 create);create 幂等重放返 existing 不 rename,update 独立 drain 真 PATCH → server 最终 name = rename(防 create 重放假绿)', async () => {
+    const backend = makeIdempotentBackend({ transientOnCalls: [0] }) // call0 = createProject 首次 drain 丢响应
+    const q = makeQueue(backend.fn, { baseDelayMs: 1000, maxDelayMs: 60_000 })
+    await q.enqueue(createProjectOp('P1', 'p1'))
+    // drain1:createProject POST 落 server(backend 已建 P1),响应丢失 → transient → pending(lastAttemptAt 已设)
+    await q.drain()
+    expect(backend.projects.get('p1')!.name).toBe('P1') // server 已建(POST 落了)
+    const afterDrain1 = await __dumpWritesForTest()
+    expect(afterDrain1[0]!.lastAttemptAt).not.toBeUndefined() // ← attempted
+    const createKey = afterDrain1[0]!.idempotencyKey
+    // enqueue updateProject(rename P1→P1-renamed)同 resourceKey project:p1
+    await q.enqueue(updateProjectOp('p1', 'P1-renamed'))
+    // 四审 attempted-gate:existing.lastAttemptAt!==undefined → skip-coalesce(不折回 create)。旧实现 create+update→
+    //   折回 create 换新 idempotencyKey,POST 命中 live existing,backend 返旧 record 不 rename → success 但 server 仍
+    //   'P1' → rename 静默吞(假绿)。
+    const writes = await __dumpWritesForTest()
+    expect(writes).toHaveLength(2) // create 留存(原封不动)+ update 新 record
+    const createRec = writes.find((w) => w.op.kind === 'createProject')!
+    const updateRec = writes.find((w) => w.op.kind === 'updateProject')!
+    expect(createRec).toBeDefined()
+    expect(updateRec).toBeDefined()
+    expect(createRec.idempotencyKey).toBe(createKey) // 原封不动(replay 证据;不换新 key)
+    expect(createRec.lastAttemptAt).not.toBeUndefined()
+    expect(createRec.attempts).toBe(1)
+    tick(800) // 过 backoff(1750)→ createProject 重试 due
+    // 循环 drain:create 先 drain(幂等重放,backend 返 existing 'P1' 不 rename)→ 出队 → 屏障解锁 → update drain 真 PATCH
+    for (let i = 0; i < 5 && (await __dumpWritesForTest()).length > 0; i++) await q.drain()
+    expect(backend.calls.map((c) => c.op.kind)).toEqual([
+      'createProject',
+      'createProject',
+      'updateProject',
+    ])
+    expect(backend.projects.get('p1')!.name).toBe('P1-renamed') // ← rename 真落 server(非 create 重放假绿)
+    expect((await __dumpWritesForTest())).toHaveLength(0)
+  })
+
+  // ── 未发送对照:lastAttemptAt===undefined 时 destructive 行为保持原样(gate 只在 attempted 时触发)──
+
+  it('未发送对照(create+delete):createProject 未 drain(lastAttemptAt undefined)+enqueue deleteProject → 仍 cancel(0 record,0 请求)', async () => {
+    const backend = makeIdempotentBackend()
+    const q = makeQueue(backend.fn)
+    await q.enqueue(createProjectOp('P1', 'p1'))
+    expect((await __dumpWritesForTest())[0]!.lastAttemptAt).toBeUndefined() // 未发送
+    await q.enqueue(deleteProjectOp('p1')) // 同 resourceKey project:p1
+    expect((await __dumpWritesForTest())).toHaveLength(0) // cancel 净消(原 destructive 行为保留)
+    expect(backend.calls).toHaveLength(0) // 不发任何请求
+    await q.drain()
+    expect(backend.calls).toHaveLength(0) // 仍无请求(队列空)
+  })
+
+  it('未发送对照(archive+unarchive):archiveProject 未 drain(lastAttemptAt undefined)+enqueue unarchiveProject → 仍 cancel(0 record,0 请求)', async () => {
+    const backend = makeIdempotentBackend()
+    const q = makeQueue(backend.fn)
+    await q.enqueue(archiveProjectOp('p1'))
+    expect((await __dumpWritesForTest())[0]!.lastAttemptAt).toBeUndefined()
+    await q.enqueue(unarchiveProjectOp('p1')) // 同 resourceKey project:p1
+    expect((await __dumpWritesForTest())).toHaveLength(0) // cancel 互消(原行为保留)
+    expect(backend.calls).toHaveLength(0)
+  })
+
+  it('未发送对照(create+meta-update):createProject 未 drain(lastAttemptAt undefined)+enqueue updateProject → 仍字段合并为单 create(rename 折进 create body);drain 单 POST 落最终名', async () => {
+    const backend = makeIdempotentBackend()
+    const q = makeQueue(backend.fn)
+    await q.enqueue(createProjectOp('P1', 'p1'))
+    const beforeMerge = await __dumpWritesForTest()
+    const createKey = beforeMerge[0]!.idempotencyKey
+    expect(beforeMerge[0]!.lastAttemptAt).toBeUndefined() // 未发送
+    await q.enqueue(updateProjectOp('p1', 'P1-renamed')) // 同 resourceKey project:p1
+    const writes = await __dumpWritesForTest()
+    expect(writes).toHaveLength(1) // 合并为单 create record(原 destructive 行为保留)
+    expect(writes[0]!.op.kind).toBe('createProject')
+    expect((writes[0]!.op as { name: string }).name).toBe('P1-renamed') // 字段合并到 create body
+    expect(writes[0]!.idempotencyKey).not.toBe(createKey) // 换新 key(body 变了,防 422 reuse)
+    expect(writes[0]!.lastAttemptAt).toBeUndefined() // 仍未发送
+    await q.drain()
+    expect(backend.calls.map((c) => c.op.kind)).toEqual(['createProject']) // 单 POST(create + 合并 rename)
+    expect(backend.projects.get('p1')!.name).toBe('P1-renamed') // server 落最终名(单 op 直接建名)
+    expect((await __dumpWritesForTest())).toHaveLength(0)
   })
 })
