@@ -2635,3 +2635,115 @@ describe('P3 (demo-seed-migration-skip) — migration op terminal 降 WARN + 既
     expect((await __dumpWritesForTest())).toHaveLength(0)
   })
 })
+
+// ── Phase 2 归档 combineOps (D2):create+archive / archive+unarchive / delete+archive ──
+// D2 规则:create+archive→create(archived)/ archive+unarchive→cancel(两向对称)/ archive+delete→delete last-wins /
+//   delete+archive→keep delete(防 archive 复活删除意图)。resourceKey 与 create/update/delete 同资源一致
+//   → 同资源归档态写经 coalesce 合并(单 record)。以下经 enqueue 同资源 + drain 验证 combineOps 行为。
+const createProjectOp = (name: string, id: string): WriteOp => ({ kind: 'createProject', name, id })
+const deleteProjectOp = (projectId: string): WriteOp => ({ kind: 'deleteProject', projectId })
+const archiveProjectOp = (projectId: string): WriteOp => ({ kind: 'archiveProject', projectId })
+const unarchiveProjectOp = (projectId: string): WriteOp => ({ kind: 'unarchiveProject', projectId })
+const deleteCanvasOp = (canvasId: string): WriteOp => ({ kind: 'deleteCanvas', canvasId })
+const archiveCanvasOp = (canvasId: string): WriteOp => ({ kind: 'archiveCanvas', canvasId })
+const unarchiveCanvasOp = (canvasId: string): WriteOp => ({ kind: 'unarchiveCanvas', canvasId })
+
+describe('Phase 2 归档 combineOps (D2) — resourceKey 一致 + 合并规则', () => {
+  it('createProject + archiveProject → 合并为 createProject(status:archived)', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue(createProjectOp('proj', 'p1'))
+    await q.enqueue(archiveProjectOp('p1')) // 同 resourceKey project:p1 → coalesce
+    expect((await __dumpWritesForTest())).toHaveLength(1)
+    await q.drain()
+    expect(calls).toHaveLength(1)
+    expect(calls[0].op.kind).toBe('createProject')
+    expect((calls[0].op as { status?: string }).status).toBe('archived')
+  })
+
+  it('createCanvas + archiveCanvas → 合并为 createCanvas(status:archived),保留 sourceTemplateId', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue({ kind: 'createCanvas', canvasId: 'c1', projectId: 'p1', title: 't', sourceTemplateId: 'tmpl' })
+    await q.enqueue(archiveCanvasOp('c1')) // 同 resourceKey canvas:c1 → coalesce
+    expect((await __dumpWritesForTest())).toHaveLength(1)
+    await q.drain()
+    expect(calls[0].op.kind).toBe('createCanvas')
+    const drained = calls[0].op as { status?: string; sourceTemplateId?: string }
+    expect(drained.status).toBe('archived')
+    expect(drained.sourceTemplateId).toBe('tmpl')
+  })
+
+  it('archiveProject + unarchiveProject → 净消 cancel(0 记录,0 请求)', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue(archiveProjectOp('p1'))
+    await q.enqueue(unarchiveProjectOp('p1')) // 互消
+    expect((await __dumpWritesForTest())).toHaveLength(0)
+    await q.drain()
+    expect(calls).toHaveLength(0)
+  })
+
+  it('unarchiveProject + archiveProject → 净消 cancel(反序对称)', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue(unarchiveProjectOp('p1'))
+    await q.enqueue(archiveProjectOp('p1'))
+    expect((await __dumpWritesForTest())).toHaveLength(0)
+    await q.drain()
+    expect(calls).toHaveLength(0)
+  })
+
+  it('archiveCanvas + unarchiveCanvas → 净消 cancel', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue(archiveCanvasOp('c1'))
+    await q.enqueue(unarchiveCanvasOp('c1'))
+    expect((await __dumpWritesForTest())).toHaveLength(0)
+    await q.drain()
+    expect(calls).toHaveLength(0)
+  })
+
+  it('deleteProject + archiveProject → 保留 delete(archive 不复活删除意图)', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue(deleteProjectOp('p1'))
+    await q.enqueue(archiveProjectOp('p1')) // ek=deleteProject, ik=archiveProject → keep delete
+    expect((await __dumpWritesForTest())).toHaveLength(1)
+    await q.drain()
+    expect(calls).toHaveLength(1)
+    expect(calls[0].op.kind).toBe('deleteProject')
+  })
+
+  it('archiveProject + deleteProject → delete last-wins(incoming delete 胜)', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue(archiveProjectOp('p1'))
+    await q.enqueue(deleteProjectOp('p1')) // ek=archiveProject, ik=deleteProject → default last-wins → delete
+    expect((await __dumpWritesForTest())).toHaveLength(1)
+    await q.drain()
+    expect(calls).toHaveLength(1)
+    expect(calls[0].op.kind).toBe('deleteProject')
+  })
+
+  it('deleteCanvas + archiveCanvas → 保留 deleteCanvas', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue(deleteCanvasOp('c1'))
+    await q.enqueue(archiveCanvasOp('c1'))
+    expect((await __dumpWritesForTest())).toHaveLength(1)
+    await q.drain()
+    expect(calls[0].op.kind).toBe('deleteCanvas')
+  })
+
+  it('createProject + unarchiveProject → createProject(status:active)(撤销先前归档)', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue(createProjectOp('proj', 'p1'))
+    await q.enqueue(unarchiveProjectOp('p1')) // create+unarchive → create(active)
+    expect((await __dumpWritesForTest())).toHaveLength(1)
+    await q.drain()
+    expect(calls[0].op.kind).toBe('createProject')
+    expect((calls[0].op as { status?: string }).status).toBe('active')
+  })
+})

@@ -39,6 +39,14 @@ type TombstoneRecord = {
   kind: TombstoneKind
   resourceId: string
   createdAt: number
+  /**
+   * F-B(决策7,Phase 2 归档):canvas 级联删 tombstone 的父项目标记。deleteProject 级联删其画布时写
+   * parentProjectId=projectId;restoreProject 整树恢复时经 revokeCanvasTombstonesForProject(projectId) 撤销
+   * 这些级联删 canvas tombstone(镜像 deleteProject 级联删)。直接 deleteCanvas 的 tombstone 无此字段 →
+   * revoke-by-project 撞不到(直接删的画布不该被项目恢复重建,保留挡复活)。
+   * schemaless value(IDB keyPath='key' 不变),加可选字段不触发 onupgradeneeded(决策7:无 DB_VERSION bump)。
+   */
+  parentProjectId?: string
 }
 
 const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e))
@@ -207,8 +215,16 @@ const deleteRecord = async (key: string): Promise<boolean> => {
  * 幂等:重复删同 id 不覆盖(保持首次删除时间),返是否新写。失败 best-effort(memStore 兜底),
  * 永不 throw(不阻断 store action)。server 模式才写(local 模式 hydrate 永不跑,写也无意义;
  * 调用方已 gate 在 isPersistWriteActive)。
+ *
+ * F-B(决策7):opts.parentProjectId 标记级联删 canvas tombstone 的父项目。deleteProject 级联删其画布时传
+ * parentProjectId=projectId;restoreProject 经 revokeCanvasTombstonesForProject(projectId) 撤销这些级联 tombstone。
+ * 直接 deleteCanvas 不传(无父项目级联语义)→ revoke-by-project 撞不到,保留挡复活。
  */
-export const recordDeletionTombstone = async (kind: TombstoneKind, resourceId: string): Promise<void> => {
+export const recordDeletionTombstone = async (
+  kind: TombstoneKind,
+  resourceId: string,
+  opts?: { parentProjectId?: string },
+): Promise<void> => {
   const ownerId = getPersistUserId()
   const record: TombstoneRecord = {
     key: tombstoneKey(kind, resourceId, ownerId),
@@ -216,10 +232,14 @@ export const recordDeletionTombstone = async (kind: TombstoneKind, resourceId: s
     kind,
     resourceId,
     createdAt: Date.now(),
+    ...(opts?.parentProjectId !== undefined ? { parentProjectId: opts.parentProjectId } : {}),
   }
   const written = await putRecord(record)
   if (written) {
-    debugLogger.log(SOURCE, `tombstone recorded for ${kind} ${resourceId} (owner=${ownerId}; anti-resurrection D)`)
+    debugLogger.log(
+      SOURCE,
+      `tombstone recorded for ${kind} ${resourceId} (owner=${ownerId}; anti-resurrection D${opts?.parentProjectId !== undefined ? `; cascade under project ${opts.parentProjectId}` : ''})`,
+    )
   }
 }
 
@@ -233,6 +253,37 @@ export const revokeDeletionTombstone = async (kind: TombstoneKind, resourceId: s
   const removed = await deleteRecord(key)
   if (removed) {
     debugLogger.log(SOURCE, `tombstone revoked for ${kind} ${resourceId} (restore / re-create; un-hide D)`)
+  }
+}
+
+/**
+ * F-B(决策7,Phase 2 restoreProject 接线):撤销某 project 下所有级联删 canvas tombstone(按 parentProjectId 过滤)。
+ * 镜像 deleteProject 级联写 canvas tombstone(带 parentProjectId)——restoreProject 整树恢复时,子画布 tombstone
+ * 也须撤销,否则恢复的画布被 hydrate step2 永久隐藏(比复活更糟;子画布 deleteCanvas op 若被溢出驱逐/重试耗尽
+ * 离队,pending-delete 失效,tombstone 接力挡复活 → 永久隐藏恢复的画布)。
+ *
+ * getAllRecords + JS 过滤(低频小集合,决策7:不建 IDB 索引、无 DB_VERSION bump)。ownerId 过滤(同
+ * getDeletionTombstones;IDB 跨账号共享)。**缺 parentProjectId 的旧 tombstone**(Phase 1→2 部署窗口期写入的
+ * 直接删 canvas tombstone,无此字段)保守不动(不撤销 → 仍挡复活 → 依赖 Phase 2 回收站恢复入口兜底;文档注明
+ * 此极窄边缘)。幂等:无命中 → no-op silent(不 log,防刷屏)。返撤销数(命中才 log)。失败 best-effort,永不 throw。
+ */
+export const revokeCanvasTombstonesForProject = async (projectId: string): Promise<void> => {
+  const ownerId = getPersistUserId()
+  const all = await getAllRecords()
+  const targets = all.filter(
+    (r) => r.ownerId === ownerId && r.kind === 'canvas' && r.parentProjectId === projectId,
+  )
+  if (targets.length === 0) return
+  let revoked = 0
+  for (const t of targets) {
+    const removed = await deleteRecord(t.key)
+    if (removed) revoked++
+  }
+  if (revoked > 0) {
+    debugLogger.log(
+      SOURCE,
+      `revoked ${revoked} cascade-deleted canvas tombstone(s) under project ${projectId} (restoreProject tree; owner=${ownerId}; un-hide D)`,
+    )
   }
 }
 

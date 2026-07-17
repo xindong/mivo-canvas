@@ -27,6 +27,7 @@ import type {
   EdgePayload,
   LegacyReplaceRequest,
   NodePayload,
+  RecordStatus,
   Revision,
   ServerInvariantCommand,
 } from '../../shared/persist-contract.ts'
@@ -187,6 +188,10 @@ export type WriteOpKind =
   | 'createCanvas'
   | 'updateCanvas'
   | 'deleteCanvas'
+  | 'archiveCanvas'
+  | 'unarchiveCanvas'
+  | 'archiveProject'
+  | 'unarchiveProject'
   | 'attachAsset'
   | 'detachAsset'
 
@@ -209,12 +214,20 @@ export type WriteOp =
   | { kind: 'deleteChatMessage'; canvasId: string; msgId: string }
   | { kind: 'putUserState'; key: string; value: unknown; baseRevision?: Revision }
   | { kind: 'deleteUserState'; key: string }
-  | { kind: 'createProject'; name: string; id?: string }
+  | { kind: 'createProject'; name: string; id?: string; status?: RecordStatus }
   | { kind: 'updateProject'; projectId: string; name: string; baseRevision?: Revision }
   | { kind: 'deleteProject'; projectId: string }
-  | { kind: 'createCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string }
+  | { kind: 'createCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string; status?: RecordStatus }
   | { kind: 'updateCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string; baseRevision?: Revision }
   | { kind: 'deleteCanvas'; canvasId: string }
+  // Phase 2 归档(回收站):archive/unarchive 走写队列(CR-7,断网归档不丢)。resourceKey 与 create/update/delete
+  //   同资源一致 → 同资源归档态写经 combineOps 合并(D2:create+archive→create(archived)/archive+unarchive
+  //   互消/archive+delete→delete last-wins)。幂等:server 对已归档再 archive → 200 no-op。不入 isDeleteKind
+  //   (archive 返 200,非 404-idempotent-success);无 baseRevision(archive 端点空 body,无 If-Match,无 428/409)。
+  | { kind: 'archiveCanvas'; canvasId: string }
+  | { kind: 'unarchiveCanvas'; canvasId: string }
+  | { kind: 'archiveProject'; projectId: string }
+  | { kind: 'unarchiveProject'; projectId: string }
   | { kind: 'attachAsset'; canvasId: string; assetId: string; nodeId: string }
   | { kind: 'detachAsset'; canvasId: string; assetId: string; nodeId: string }
 
@@ -228,12 +241,20 @@ export type WriteOp =
 export type NonCanvasWriteOp =
   | { kind: 'putUserState'; key: string; value: unknown; baseRevision?: Revision }
   | { kind: 'deleteUserState'; key: string }
-  | { kind: 'createProject'; name: string; id?: string }
+  | { kind: 'createProject'; name: string; id?: string; status?: RecordStatus }
   | { kind: 'updateProject'; projectId: string; name: string; baseRevision?: Revision }
   | { kind: 'deleteProject'; projectId: string }
-  | { kind: 'createCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string }
+  | { kind: 'createCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string; status?: RecordStatus }
   | { kind: 'updateCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string; baseRevision?: Revision }
   | { kind: 'deleteCanvas'; canvasId: string }
+  // Phase 2 归档(回收站):archive/unarchive 走写队列(CR-7,断网归档不丢)。resourceKey 与 create/update/delete
+  //   同资源一致 → 同资源归档态写经 combineOps 合并(D2:create+archive→create(archived)/archive+unarchive
+  //   互消/archive+delete→delete last-wins)。幂等:server 对已归档再 archive → 200 no-op。不入 isDeleteKind
+  //   (archive 返 200,非 404-idempotent-success);无 baseRevision(archive 端点空 body,无 If-Match,无 428/409)。
+  | { kind: 'archiveCanvas'; canvasId: string }
+  | { kind: 'unarchiveCanvas'; canvasId: string }
+  | { kind: 'archiveProject'; projectId: string }
+  | { kind: 'unarchiveProject'; projectId: string }
   | { kind: 'attachAsset'; canvasId: string; assetId: string; nodeId: string }
   | { kind: 'detachAsset'; canvasId: string; assetId: string; nodeId: string }
   | { kind: 'appendChatMessage'; canvasId: string; message: unknown }
@@ -250,6 +271,10 @@ const NON_CANVAS_KINDS: ReadonlySet<WriteOpKind> = new Set<WriteOpKind>([
   'createCanvas',
   'updateCanvas',
   'deleteCanvas',
+  'archiveCanvas',
+  'unarchiveCanvas',
+  'archiveProject',
+  'unarchiveProject',
   'attachAsset',
   'detachAsset',
   'appendChatMessage',
@@ -488,10 +513,14 @@ const computeResourceKey = (op: WriteOp): string | null => {
       return op.id ? `project:${op.id}` : `project:name:${op.name}`
     case 'updateProject':
     case 'deleteProject':
+    case 'archiveProject':
+    case 'unarchiveProject':
       return `project:${op.projectId}`
     case 'createCanvas':
     case 'updateCanvas':
     case 'deleteCanvas':
+    case 'archiveCanvas':
+    case 'unarchiveCanvas':
       return `canvas:${op.canvasId}`
     case 'attachAsset':
       return `asset-attach:${op.assetId}:${op.canvasId}:${op.nodeId}`
@@ -722,7 +751,51 @@ const combineOps = (existing: WriteOp, incoming: WriteOp): WriteOp | 'cancel' =>
   // create+delete → 净消(资源从未服务端创建,delete 无意义)
   if (ek === 'createProject' && ik === 'deleteProject') return 'cancel'
   if (ek === 'createCanvas' && ik === 'deleteCanvas') return 'cancel'
-  // 其余组合:last-wins(update+update / update+delete / delete+delete / delete+update / create+create)
+  // D2(Phase 2 归档 combineOps):
+  //  - create+archive → create(status:'archived'):合并后单 create op 带 status,server ensureCreate 应用之,
+  //    归档资源一次落库(防归档意图被随后 create 替换丢失——resourceKey 同,combine 在 create 侧)。
+  //  - create+unarchive → create(status:'active'):撤销先前 create+archive 的 archived(全新 create 无归档态,
+  //    status='active' 幂等;若先前经 create+archive 合并得 archived,此处翻回 active)。
+  //  - archive+unarchive → 互消(cancel;归档→撤销归档,净态回原状,不发请求;两方向对称)。
+  //  - delete+archive/unarchive → delete 赢(return existing):删终态压过归档态;归档一个正被删的资源无意义,
+  //    保 delete 不让 archive/unarchive 复活删除意图(last-wins 会返 incoming archive → 删除被替换为归档,bug)。
+  //  - archive/unarchive+delete(incoming)= delete 走下方默认 last-wins(incoming delete 胜,无需显式)。
+  if (ek === 'createProject' && ik === 'archiveProject') {
+    return { kind: 'createProject', name: existing.name, id: existing.id ?? incoming.projectId, status: 'archived' }
+  }
+  if (ek === 'createProject' && ik === 'unarchiveProject') {
+    return { kind: 'createProject', name: existing.name, id: existing.id ?? incoming.projectId, status: 'active' }
+  }
+  if (ek === 'createCanvas' && ik === 'archiveCanvas') {
+    // 字段级合并(同 createCanvas+updateCanvas):保留 create 独有字段(sourceTemplateId),status='archived'。
+    return {
+      kind: 'createCanvas',
+      canvasId: existing.canvasId,
+      projectId: existing.projectId,
+      ...(existing.title !== undefined ? { title: existing.title } : {}),
+      ...(existing.sourceTemplateId !== undefined ? { sourceTemplateId: existing.sourceTemplateId } : {}),
+      status: 'archived',
+    }
+  }
+  if (ek === 'createCanvas' && ik === 'unarchiveCanvas') {
+    return {
+      kind: 'createCanvas',
+      canvasId: existing.canvasId,
+      projectId: existing.projectId,
+      ...(existing.title !== undefined ? { title: existing.title } : {}),
+      ...(existing.sourceTemplateId !== undefined ? { sourceTemplateId: existing.sourceTemplateId } : {}),
+      status: 'active',
+    }
+  }
+  if (ek === 'archiveProject' && ik === 'unarchiveProject') return 'cancel'
+  if (ek === 'unarchiveProject' && ik === 'archiveProject') return 'cancel'
+  if (ek === 'archiveCanvas' && ik === 'unarchiveCanvas') return 'cancel'
+  if (ek === 'unarchiveCanvas' && ik === 'archiveCanvas') return 'cancel'
+  if (ek === 'deleteProject' && (ik === 'archiveProject' || ik === 'unarchiveProject')) return existing
+  if (ek === 'deleteCanvas' && (ik === 'archiveCanvas' || ik === 'unarchiveCanvas')) return existing
+  // 其余组合:last-wins(update+update / update+delete / delete+delete / delete+update / create+create /
+  //   update+archive / archive+archive / unarchive+unarchive 等)。注:update+archive→archive 胜(rename 丢失,
+  //   同 update+delete 既有取舍;archive 端点空 body 不带 name,单 op 无法兼 rename+archive,故 archive 胜)。
   return incoming
 }
 

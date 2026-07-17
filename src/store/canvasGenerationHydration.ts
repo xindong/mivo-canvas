@@ -28,7 +28,11 @@ const warnCanvas = (message: string) => debugLogger.warn('Canvas Store', message
 // domain keys via src/kernel/persistMigration.ts migrateV10ToV11 ceremony,照
 // kernel-dualtrack-contract §4.3)。对 zustand migrate 是 no-op shape-wise(v<10
 // 分支不变,v10→v11 单 blob 形状保留);split 仪式由 S5/S6 在 ?kernel=new 下调用。
-export const CANVAS_PERSIST_VERSION = 11
+// v12 (Phase 2 归档/回收站):status 字段引入(Phase 2 归档三态 active|archived;彻底删除仍走 is_deleted 软删
+//   终态,不新增 'deleted' status)。migrate v<12 分支给存量 projects/canvases 的 undefined status 默认 'active'
+//   (live 记录缺省=active,向后兼容;幂等:只填 undefined→'active',不覆盖既有 'archived')。archivedByCascade
+//   是客户端本地字段(hydrate 不经 wire 暴露),migrate 不设(留 undefined=非级联归档)。
+export const CANVAS_PERSIST_VERSION = 12
 
 // Persisted-state shape (subset of CanvasState that survives compactCanvasesForPersist).
 type PersistedCanvasState = Partial<
@@ -247,6 +251,21 @@ export const migratePersistedState = (persistedState: unknown, persistedVersion 
   }
   if (orphanCount > 0) {
     warnCanvas(`Hydration detected ${orphanCount} orphan projectId(s) (not in projects list) — retained, not cleared (project may be mid-migration / soft-deleted / server-side hidden)`)
+  }
+
+  // v12(Phase 2 归档):status 字段引入。存量 projects/canvases 无 status → 默认 'active'(live 记录缺省=active,
+  //   向后兼容;旧 client 不读此字段无感)。**幂等**:只填 undefined→'active',不覆盖既有 'archived'(归档项保留)。
+  //   仅 persistedVersion<12 触发一次(zustand migrate;mergeCanvasPersistedState 重跑 migrate 传 CURRENT=12 →
+  //   persistedVersion<12 false → 不重跑,同 v9/v10 不在每次 hydrate 重跑的约束)。archivedByCascade 是客户端本地
+  //   字段(hydrate 不经 wire 暴露),migrate 不设(留 undefined=非级联归档,unarchiveProject 严格 ===true 不恢复)。
+  if (persistedVersion < 12) {
+    for (const p of projects) {
+      if (p.status === undefined) p.status = 'active'
+    }
+    for (const doc of Object.values(canvases)) {
+      if (doc.status === undefined) doc.status = 'active'
+    }
+    logCanvas(`Hydration defaulted status='active' on legacy projects/canvases (migrated v${persistedVersion} → v12)`)
   }
 
   return {

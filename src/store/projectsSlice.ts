@@ -13,7 +13,9 @@ import { enqueuePersistWrite, isPersistWriteActive } from '../lib/persistBoot'
 import { normalizeDocument, documentFor } from './canvasDocumentModel'
 // Phase 1 项4(复活加固):store delete action 发起时写持久 tombstone(与队列记录生死解耦,覆盖溢出驱逐/重试
 //   耗尽离队后 pending-delete 失效的复活)。详见 src/lib/deletionTombstones.ts。
-import { recordDeletionTombstone } from '../lib/deletionTombstones'
+// F-B(决策7,Phase 2 归档):restoreProject 经 revokeCanvasTombstonesForProject 撤销 deleteProject 级联写的子画布
+//   tombstone(按 parentProjectId 过滤),否则恢复的画布被 hydrate 永久隐藏。
+import { recordDeletionTombstone, revokeCanvasTombstonesForProject } from '../lib/deletionTombstones'
 
 // Project ids use a `project-` prefix (distinct from `canvas-` / `group-`) so a
 // projectId is never confused with a canvasId. Mirrors createCanvasId's fallback
@@ -184,7 +186,10 @@ export const createProjectsSlice: SliceCreator = (set, get) => ({
       )
       for (const canvasId of removedCanvasIds) {
         enqueuePersistWrite({ kind: 'deleteCanvas', canvasId })
-        void recordDeletionTombstone('canvas', canvasId).catch((e) =>
+        // F-B(决策7):级联删 canvas tombstone 带 parentProjectId,供 restoreProject 经
+        //   revokeCanvasTombstonesForProject(projectId) 撤销(镜像 deleteProject 级联删);直接 deleteCanvas 的
+        //   tombstone 无此字段(在 documentSlice.recordCanvasTombstone),revoke-by-project 撞不到,保留挡复活。
+        void recordDeletionTombstone('canvas', canvasId, { parentProjectId: projectId }).catch((e) =>
           warnCanvas(`tombstone record failed (canvas ${canvasId}): ${e instanceof Error ? e.message : String(e)}`),
         )
       }
@@ -208,7 +213,77 @@ export const createProjectsSlice: SliceCreator = (set, get) => ({
     }))
 
     logCanvas(`Restored project "${trimmed}" (${projectId}; server restoreProjectTree via POST ensureCreate)`)
+    // F-B(决策7):restoreProject 整树恢复 → 撤销 deleteProject 级联写的子画布 tombstone(按 parentProjectId 过滤)。
+    //   否则恢复的画布被 hydrate step2 永久隐藏(子画布 deleteCanvas op 若被溢出驱逐/重试耗尽离队,pending-delete
+    //   失效,tombstone 接力挡复活 → 永久隐藏恢复的画布,比复活更糟)。project tombstone 由下方
+    //   enqueuePersistWrite(createProject)经 enqueuePersistWrite 内 revoke 路径撤销;子画布 tombstone 无对应单 op
+    //   撤销路径,故在此显式 revoke-by-project(镜像 deleteProject 级联删)。local 模式无 tombstone,跳过。
+    if (isPersistWriteActive()) {
+      void revokeCanvasTombstonesForProject(projectId).catch((e) =>
+        warnCanvas(`tombstone revoke-by-project failed (project ${projectId}): ${e instanceof Error ? e.message : String(e)}`),
+      )
+    }
     // createProject POST 幂等:命中 deleted → restored(整树);命中 live → existing(no-op);missing → created。
     enqueuePersistWrite({ kind: 'createProject', name: trimmed, id: projectId })
+  },
+  // Phase 2 归档(回收站)——CR-5/D3 级联 + CR-11 不入 undo 栈(status 变更非画布内容 mutation)。
+  archiveProject: (projectId) => {
+    const project = get().projects.find((p) => p.id === projectId)
+    if (!project) {
+      warnCanvas(`Archive project skipped: missing project ${projectId}`)
+      return
+    }
+    if (project.status === 'archived') {
+      warnCanvas(`Archive project skipped: already archived ${projectId}`)
+      return
+    }
+    set((state) => ({
+      projects: state.projects.map((p) => (p.id === projectId ? { ...p, status: 'archived' as const } : p)),
+      // CR-5/D3:级联归档子画布(随项目一起隐藏,不再变孤儿)。active 子画布标 archivedByCascade=true
+      //   (unarchiveProject 仅恢复这些);已归档子画布保留其 archivedByCascade 既有值(镜像 server
+      //   archiveProjectTree:已归档子画布不动,backend.ts:1957)。
+      canvases: Object.fromEntries(
+        Object.entries(state.canvases).map(([id, doc]) => {
+          if (doc.projectId !== projectId) return [id, doc]
+          if (doc.status === 'archived') return [id, doc] // 已归档,保留 archivedByCascade 既有值
+          return [id, { ...doc, status: 'archived' as const, archivedByCascade: true }]
+        }),
+      ),
+    }))
+    logCanvas(
+      `Archived project "${project.name}" (${projectId}); active child canvas(es) cascade-archived (archivedByCascade=true)`,
+    )
+    // server archiveProjectTree 级联归档其全部 active 子画布(D3)。幂等:已归档→200 no-op。local no-op。
+    enqueuePersistWrite({ kind: 'archiveProject', projectId })
+  },
+  unarchiveProject: (projectId) => {
+    const project = get().projects.find((p) => p.id === projectId)
+    if (!project) {
+      warnCanvas(`Unarchive project skipped: missing project ${projectId}`)
+      return
+    }
+    if (project.status !== 'archived') {
+      warnCanvas(`Unarchive project skipped: not archived ${projectId}`)
+      return
+    }
+    set((state) => ({
+      projects: state.projects.map((p) => (p.id === projectId ? { ...p, status: 'active' as const } : p)),
+      // CR-5/D3:仅恢复 archivedByCascade===true 的子画布(被级联归档的);单独归档的(archivedByCascade!==true)
+      //   保留归档态(用户先前单独归档的不被强制恢复)。恢复的清 archivedByCascade=false(级联标记使命完成)。
+      canvases: Object.fromEntries(
+        Object.entries(state.canvases).map(([id, doc]) => {
+          if (doc.projectId !== projectId) return [id, doc]
+          if (doc.archivedByCascade === true) {
+            return [id, { ...doc, status: 'active' as const, archivedByCascade: false }]
+          }
+          return [id, doc]
+        }),
+      ),
+    }))
+    logCanvas(
+      `Unarchived project "${project.name}" (${projectId}); cascade-archived child canvas(es) restored (directly-archived left as-is per D3)`,
+    )
+    // server unarchiveProjectTree 级联恢复 archivedByCascade=true 的子画布(D3)。幂等:已 active→200 no-op。local no-op。
+    enqueuePersistWrite({ kind: 'unarchiveProject', projectId })
   },
 })
