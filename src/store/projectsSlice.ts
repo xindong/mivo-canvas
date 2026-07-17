@@ -237,6 +237,14 @@ export const createProjectsSlice: SliceCreator = (set, get) => ({
       warnCanvas(`Archive project skipped: already archived ${projectId}`)
       return
     }
+    // P1-2 barrier 快照:收集该 project 的 active 子画布 canvasId(client-side,非 wire 字段——server 不收;
+    //   server archiveProjectTree 级联归档 active 子画布,已归档不动)。供 writeRetryQueue due-filter barrier
+    //   判定 earlier 子写(node/chat/asset/updateCanvas)是否撞本 archive 级联归档后的 CR-6 409,挡 archive
+    //   延后让 earlier 写先落库。边缘 case:enqueue 后 drain 前有新 canvas 加入该 project → 快照不含 →
+    //   barrier 不挡 → archive 级联归档新 canvas → 其 earlier 写(若有)409。属异常序(archive 后加 canvas),取舍不挡。
+    const childCanvasIds = Object.entries(get().canvases)
+      .filter(([, doc]) => doc.projectId === projectId && doc.status !== 'archived')
+      .map(([id]) => id)
     set((state) => ({
       projects: state.projects.map((p) => (p.id === projectId ? { ...p, status: 'archived' as const } : p)),
       // CR-5/D3:级联归档子画布(随项目一起隐藏,不再变孤儿)。active 子画布标 archivedByCascade=true
@@ -254,7 +262,8 @@ export const createProjectsSlice: SliceCreator = (set, get) => ({
       `Archived project "${project.name}" (${projectId}); active child canvas(es) cascade-archived (archivedByCascade=true)`,
     )
     // server archiveProjectTree 级联归档其全部 active 子画布(D3)。幂等:已归档→200 no-op。local no-op。
-    enqueuePersistWrite({ kind: 'archiveProject', projectId })
+    //   P1-2:canvasIds = 上方 childCanvasIds 快照(barrier 用,非 wire 字段;server archiveProjectTree 不读此字段)。
+    enqueuePersistWrite({ kind: 'archiveProject', projectId, canvasIds: childCanvasIds })
   },
   unarchiveProject: (projectId) => {
     const project = get().projects.find((p) => p.id === projectId)

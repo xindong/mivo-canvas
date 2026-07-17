@@ -2832,3 +2832,104 @@ describe('P1-1(返修):state-transition + meta update → skip-coalesce(不静�
     expect((calls[0].op as { name?: string }).name).toBe('new')
   })
 })
+
+describe('P1-2(返修):archive barrier — earlier 同资源非终态写延后 archive drain,防 CR-6 409 terminal 丢', () => {
+  // 必答 1 论证:node/reorder/chat/asset/updateCanvas 进 queue 拿 seq、进 due、drain 到 server(三类 legacy
+  //   经 §14.3、wired NonCanvasWriteOp 直发)→ 撞 archived CR-6 409 → terminal 丢。barrier 挡 archive(earlier seq <
+  //   archive.seq 时)延后,earlier 先落库,archive 再 drain。deferred(edge/anchor executor 不发)不挡(防永久卡死)。
+  // 必答 2:barrier 不改 archive status(仍 pending,留在 durable IDB);不 due → 不执行 → attempts 不加 → 不 dead-letter;
+  //   combine 吃由 skip-coalesce/cancel 防;overflow 极端 backstop(注释)。
+
+  it('barrier 挡 archiveCanvas:earlier updateCanvas(seq1) + archiveCanvas(seq2) → 首 drain 只 updateCanvas success(archive 延后留存),次 drain archive success(earlier 出队解锁)', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'success' }, { status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue(updateCanvasOp('c1', 'p1', 'rename')) // seq1 earlier(updateCanvas 指向 c1,wired 发 server)
+    await q.enqueue(archiveCanvasOp('c1')) // seq2 archive — skip-coalesce 保留两 op;barrier 挡(earlier seq1<c2 指向 c1)
+    // 两 record 均 pending due(同 ts)。barrier 排除 archiveCanvas → due set 只 updateCanvas。
+    await q.drain()
+    expect(calls).toHaveLength(1) // 只 updateCanvas drain(archive 被 barrier 延后)
+    expect(calls[0].op.kind).toBe('updateCanvas')
+    const after1 = await __dumpWritesForTest()
+    expect(after1).toHaveLength(1) // archiveCanvas 留存 pending(未被丢、未被 combine 吃)
+    expect(after1[0].op.kind).toBe('archiveCanvas')
+    expect(after1[0].status).toBe('pending')
+    // 次 drain:earlier updateCanvas 已 success 出队(不在 all)→ barrier 不再挡 → archive 进 due → drain success
+    await q.drain()
+    expect(calls).toHaveLength(2)
+    expect(calls[1].op.kind).toBe('archiveCanvas')
+    expect((await __dumpWritesForTest())).toHaveLength(0) // archive success 出队 → 空
+  })
+
+  it('barrier 不挡 archive-seq-更小:archiveCanvas(seq1) + later updateCanvas(seq2) → archive 先 drain success,later 409 terminal(P1-1 预期"archive 后 stale 写应 409",不挡)', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'success' }, { status: 'rejected', body: { error: 'archived' } }])
+    const q = makeQueue(fn)
+    await q.enqueue(archiveCanvasOp('c1')) // seq1 archive(无 earlier seq<1 → barrier 不挡)
+    await q.enqueue(updateCanvasOp('c1', 'p1', 'stale')) // seq2 later(stale post-archive → 409)
+    await q.drain()
+    expect(calls).toHaveLength(2) // 两 op 均 drain(archive 不被挡)
+    expect(calls[0].op.kind).toBe('archiveCanvas') // seq1 先 drain success
+    expect(calls[1].op.kind).toBe('updateCanvas') // seq2 后 drain → 409 rejected terminal
+    expect((await __dumpWritesForTest())).toHaveLength(0) // 两均出队(success + terminal)
+  })
+
+  it('barrier 不挡 deferred:earlier upsertEdge(unsupported-retained→deferred 不发 server)不永久卡 archive;archive 首 drain success,edge 留 deferred', async () => {
+    // 必答 1(b):upsertEdge → migrateLegacyOp null + 非 NonCanvasWriteOp → executor 返 unsupported-retained(deferred 不发)
+    //   → 不撞 server 409 → 不丢。barrier 不挡(若挡 → deferred 永不 success → archive 永久卡死)。
+    const edgeOp = { kind: 'upsertEdge', canvasId: 'c1', edgeId: 'e1', payload: {}, baseRevision: 0 } as unknown as WriteOp
+    const { fn, calls } = seqExecutor([
+      { status: 'unsupported-retained', message: 'upsertEdge not wired (G1-c)' }, // edge seq1 → deferred
+      { status: 'success' }, // archive seq2 → success
+    ])
+    const q = makeQueue(fn)
+    await q.enqueue(edgeOp) // seq1 earlier(deferred op,executor 不发)
+    await q.enqueue(archiveCanvasOp('c1')) // seq2 archive — barrier 不挡(edge deferred 不发)
+    await q.drain()
+    // 排序:edge seq1 先 drain(unsupported-retained→deferred 留存),archive seq2 后 drain(success→出队)
+    expect(calls).toHaveLength(2)
+    expect(calls[0].op.kind).toBe('upsertEdge')
+    expect(calls[1].op.kind).toBe('archiveCanvas')
+    const after = await __dumpWritesForTest()
+    expect(after).toHaveLength(1) // edge 留 deferred,archive success 出队
+    expect(after[0].op.kind).toBe('upsertEdge')
+    expect(after[0].status).toBe('deferred')
+  })
+
+  it('barrier 挡 archiveProject:earlier appendChatMessage(seq1 on c1 ∈ canvasIds) + archiveProject(seq2 canvasIds=[c1]) → barrier 挡,chat 先 success,archive 留;次 drain archive success', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'success' }, { status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue(appendChatOp('c1', { id: 'm1' })) // seq1 earlier(chat 指向 c1,wired 发 server)
+    // canvasIds 快照(经 store enqueue 时收集;本测试不经 store,手填 c1 模拟快照)
+    await q.enqueue({ kind: 'archiveProject', projectId: 'p1', canvasIds: ['c1'] })
+    await q.drain()
+    expect(calls).toHaveLength(1) // 只 chat drain(archiveProject 被 barrier 挡 — earlier chat seq1<c2 指向 c1∈canvasIds)
+    expect(calls[0].op.kind).toBe('appendChatMessage')
+    expect((await __dumpWritesForTest())).toHaveLength(1) // archiveProject 留存
+    await q.drain() // chat 已出队 → barrier 不挡 → archive drain
+    expect(calls).toHaveLength(2)
+    expect(calls[1].op.kind).toBe('archiveProject')
+    expect((await __dumpWritesForTest())).toHaveLength(0)
+  })
+
+  it('barrier archiveProject 无 canvasIds 快照(undefined)→ 退化不挡(旧 record;archive 首 drain,无 earlier 子写可撞)', async () => {
+    // archiveProject canvasIds 缺失(旧 record / 未携带)→ protectedCanvasIds null → barrier no-op。archive 正常 drain。
+    const { fn, calls } = seqExecutor([{ status: 'success' }])
+    const q = makeQueue(fn)
+    await q.enqueue({ kind: 'archiveProject', projectId: 'p1' }) // 无 canvasIds(模拟旧 record)
+    await q.drain()
+    expect(calls).toHaveLength(1)
+    expect(calls[0].op.kind).toBe('archiveProject')
+    expect((await __dumpWritesForTest())).toHaveLength(0)
+  })
+
+  it('CR-6 archived 子写路径:updateCanvas 打到 archived canvas → executor rejected terminal(body archived)→ 1 请求(一发即终态不重试)+ 队列=0(terminal 出队)+ ledger rejected+1', async () => {
+    const { fn, calls } = seqExecutor([{ status: 'rejected', body: { error: 'archived', id: 'c1' } }])
+    const q = makeQueue(fn)
+    await resetTerminalCountersBaseline() // 清 baseline,让 delta 计数干净
+    await q.enqueue(updateCanvasOp('c1', 'p1', 'stale')) // updateCanvas 打 archived → 409 rejected terminal
+    await q.drain()
+    expect(calls).toHaveLength(1) // 一发即 terminal(rejected 不重试,无 backoff)
+    expect((await __dumpWritesForTest())).toHaveLength(0) // terminal 出队
+    const counters = await getWriteQueueTerminalCounters()
+    expect(counters.counters.rejected).toBe(1) // rejected terminal 入 ledger(非 retreatable 计数)
+  })
+})

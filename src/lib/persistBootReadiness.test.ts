@@ -51,6 +51,7 @@ import {
   drainPersistQueue,
   enqueuePersistWrite,
   resumePersistQueue,
+  reconcileProjectCanvasStatus,
   __resetPersistBoot,
 } from './persistBoot'
 import { __resetWriteQueueDb, __dumpWritesForTest } from './writeRetryQueue'
@@ -282,5 +283,71 @@ describe('G1-a R2 F2 — server 模式 standalone canvas 强制归 project', () 
     const recs = await __dumpWritesForTest()
     const createOp = recs.find((r) => r.op.kind === 'createCanvas')
     expect((createOp!.op as { projectId: string }).projectId).toBe('p2')
+  })
+})
+
+describe('P1-3(返修):reconcileProjectCanvasStatus — fresh-device unarchiveProject 后用 server status reconcile 子画布', () => {
+  // 跨设备 hydrate:client archivedByCascade=undefined(wire 不回传 provenance)→ 乐观 unarchiveProject 后
+  //   undefined 的全留 archived(client 持久错误态:project active 但 cascade 子画布仍 archived)。
+  //   reconcile 拉 includeArchived canvas meta 用 server 权威:server unarchiveProjectTree 已恢复 cascade 子画布
+  //   (active)、保留 direct(archived)。不猜 provenance(防 client 误恢复 direct / 误留 cascade)。
+  //   client 态用 createCanvas 建 valid CanvasDocument(免触发 persist middleware 的 compactCanvasesForPersist
+  //   读 undefined.nodes.map 崩),再 setState 标 archived 模拟 fresh-device 错误态。
+  type AdapterLike = NonNullable<Parameters<typeof reconcileProjectCanvasStatus>[1]>
+  type CanvasLike = { status?: string; id?: string }
+
+  /** 建 2 个 valid client canvas(createCanvas 产 valid doc)+ 标双 archived 模拟 fresh-device 错误态。返两 id。 */
+  const seedTwoArchivedChildren = (projectId: string): { cascadeId: string; directId: string } => {
+    useCanvasStore.setState({ projects: [{ id: projectId, name: 'P1', createdAt: 't' }] as never })
+    useCanvasStore.getState().createCanvas('cascade', { projectId })
+    useCanvasStore.getState().createCanvas('direct', { projectId })
+    const state = useCanvasStore.getState()
+    const ids = Object.keys(state.canvases)
+    const cascadeId = ids[0]!
+    const directId = ids[1]!
+    const canvases = state.canvases as Record<string, CanvasLike>
+    useCanvasStore.setState({
+      canvases: {
+        ...state.canvases,
+        [cascadeId]: { ...canvases[cascadeId]!, status: 'archived' },
+        [directId]: { ...canvases[directId]!, status: 'archived' },
+      } as never,
+    })
+    return { cascadeId, directId }
+  }
+
+  it('cascade 子画布(server active)→ client reconcile active;direct 子画布(server archived)→ 保留 archived(不强制恢复)', async () => {
+    const { cascadeId, directId } = seedTwoArchivedChildren('p1')
+    // server 权威:unarchiveProjectTree 恢复 cascade(active),保留 direct(archived)
+    const fakeAdapter = {
+      listCanvas: async () => ({ canvases: [{ id: cascadeId, status: 'active' }, { id: directId, status: 'archived' }] }),
+    } as unknown as AdapterLike
+    await reconcileProjectCanvasStatus('p1', fakeAdapter)
+    const canvases = useCanvasStore.getState().canvases as Record<string, CanvasLike>
+    expect(canvases[cascadeId]?.status).toBe('active') // cascade → reconcile active(server 权威恢复)
+    expect(canvases[directId]?.status).toBe('archived') // direct → 保留 archived(server 仍 archived,不动)
+  })
+
+  it('本地无此 canvas(server 有但 client 未 hydrate content)→ 不动(不创 ghost);下轮 hydrate 补', async () => {
+    useCanvasStore.setState({
+      projects: [{ id: 'p1', name: 'P1', createdAt: 't' }] as never,
+      canvases: {} as never, // 本地无 canvas
+    })
+    const fakeAdapter = {
+      listCanvas: async () => ({ canvases: [{ id: 'cX', status: 'active' }] }),
+    } as unknown as AdapterLike
+    await reconcileProjectCanvasStatus('p1', fakeAdapter)
+    const canvases = useCanvasStore.getState().canvases as Record<string, unknown>
+    expect(Object.keys(canvases)).toHaveLength(0) // 不创 ghost(本地无 → 不动)
+  })
+
+  it('reconcile 失败(adapter throw)→ best-effort 不抛(下轮 hydrate 再 reconcile);client 态不动', async () => {
+    const { cascadeId } = seedTwoArchivedChildren('p1')
+    const fakeAdapter = {
+      listCanvas: async () => { throw new Error('network down') },
+    } as unknown as AdapterLike
+    await expect(reconcileProjectCanvasStatus('p1', fakeAdapter)).resolves.toBeUndefined() // best-effort 不抛
+    const canvases = useCanvasStore.getState().canvases as Record<string, CanvasLike>
+    expect(canvases[cascadeId]?.status).toBe('archived') // 失败 → client 不动(下轮 hydrate 再 reconcile)
   })
 })

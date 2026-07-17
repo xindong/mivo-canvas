@@ -1086,11 +1086,18 @@ const applyServerRevision = async (op: WriteOp, outcome: { revision?: Revision }
  * cascade-archived 子画布仍 archived,用户看到空项目)。缺 provenance 不猜 → 拉 includeArchived canvas meta
  * 用 server status reconcile:server unarchiveProjectTree 已恢复 cascade 子画布(active)、保留 direct(archived)。
  * best-effort:reconcile 失败不阻断 onOutcome(下轮 hydrate 会再 reconcile)。
+ *
+ * P2 锁测(返修):导出 + 接受注入 adapter(默认 getServerPersistAdapter())——对齐全文件其余 hydrate 函数的注入
+ *   模式,使 fresh-device reconcile 可单测(fake adapter.listCanvas 返 cascade→active/direct→archived,断言 reconcile
+ *   后 client status 对齐 server)。生产 onOutcome 调用点(行 1212)不传 adapter → 走默认 singleton,行为不变。
  */
-const reconcileProjectCanvasStatus = async (projectId: string): Promise<void> => {
+export const reconcileProjectCanvasStatus = async (
+  projectId: string,
+  adapter?: ReturnType<typeof getServerPersistAdapter>,
+): Promise<void> => {
   try {
-    const adapter = getServerPersistAdapter()
-    const { canvases } = await adapter.listCanvas(projectId, { includeArchived: true })
+    const a = adapter ?? getServerPersistAdapter()
+    const { canvases } = await a.listCanvas(projectId, { includeArchived: true })
     const { useCanvasStore } = await import('../store/canvasStore')
     useCanvasStore.setState((s) => {
       let reconciled = 0
