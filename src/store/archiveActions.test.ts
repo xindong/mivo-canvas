@@ -21,6 +21,15 @@ vi.mock('../lib/demoImages', () => ({
 
 vi.mock('./remoteDebugReporter', () => ({ reportRemoteDebugEntry: () => {} }))
 
+// PR-C1 二轮 SC-1/SC-2:spy on enqueuePersistWrite to assert blocked path does NOT enqueue.
+//   local 模式下真 enqueuePersistWrite 本就是 no-op(writeQueue 未启动),替换为 vi.fn 仅为可断言,
+//   不改语义。其余导出(含 isPersistWriteActive)保留真实实现。
+const enqueueMock = vi.hoisted(() => vi.fn(() => undefined))
+vi.mock('../lib/persistBoot', async () => {
+  const actual = await vi.importActual<typeof import('../lib/persistBoot')>('../lib/persistBoot')
+  return { ...actual, enqueuePersistWrite: enqueueMock }
+})
+
 import { useCanvasStore } from './canvasStore'
 import { useToastStore } from './toastStore'
 import type { CanvasDocument, CanvasProject } from '../types/mivoCanvas'
@@ -63,6 +72,7 @@ const seed = (canvases: Record<string, CanvasDocument>, projects: CanvasProject[
 beforeEach(() => {
   useCanvasStore.setState({ ...baseState } as never, true)
   useToastStore.getState().clearToasts()
+  enqueueMock.mockClear()
 })
 
 describe('archive next-state active survivor invariant', () => {
@@ -140,5 +150,80 @@ describe('moveCanvasToProject archived target guard', () => {
       level: 'warning',
       message: '目标项目已归档,请先恢复项目再移动',
     })
+  })
+})
+
+// PR-C1 二轮 P2(SC-1 local 模式):createCanvas 显式 archived projectId 阻止。
+//   server 模式同名用例见 documentSlice.persist.test.ts(断言不发 POST /api/canvas)。
+describe('createCanvas archived project guard', () => {
+  it('blocks an explicit archived projectId, leaves state untouched, and warns (local mode)', () => {
+    seed({ c1: canvas('existing') }, [project('p-arch', 'archived')], 'c1')
+    const beforeKeys = Object.keys(useCanvasStore.getState().canvases)
+
+    const result = useCanvasStore.getState().createCanvas('new', { projectId: 'p-arch' })
+
+    expect(result).toBeUndefined()
+    expect(Object.keys(useCanvasStore.getState().canvases)).toEqual(beforeKeys)
+    expect(useCanvasStore.getState().sceneId).toBe('c1')
+    expect(enqueueMock).not.toHaveBeenCalled()
+    expect(useToastStore.getState().entries.at(-1)).toMatchObject({
+      level: 'warning',
+      message: '目标项目已归档,请先恢复项目再新建画板',
+    })
+  })
+
+  it('still tolerates an unknown projectId (no expansion of scope)', () => {
+    seed({ c1: canvas('existing') }, [], 'c1')
+
+    const result = useCanvasStore.getState().createCanvas('new', { projectId: 'p-unknown' })
+
+    expect(result).not.toBeUndefined()
+    expect(Object.keys(useCanvasStore.getState().canvases)).toContain(result)
+  })
+})
+
+// PR-C1 二轮 P2(SC-2):duplicateCanvas archived 源 / archived 父项目 阻止 + 放行路径副本 active。
+describe('duplicateCanvas archived guard', () => {
+  it('blocks an archived source, leaves state untouched, and warns', () => {
+    seed({ c1: canvas('src', undefined, 'archived') }, [], 'c1')
+    const beforeKeys = Object.keys(useCanvasStore.getState().canvases)
+
+    const result = useCanvasStore.getState().duplicateCanvas('c1')
+
+    expect(result).toBeUndefined()
+    expect(Object.keys(useCanvasStore.getState().canvases)).toEqual(beforeKeys)
+    expect(useCanvasStore.getState().sceneId).toBe('c1')
+    expect(enqueueMock).not.toHaveBeenCalled()
+    expect(useToastStore.getState().entries.at(-1)).toMatchObject({
+      level: 'warning',
+      message: '画布已归档,请先恢复再复制',
+    })
+  })
+
+  it('blocks an active source whose parent project is archived (dirty data) and warns', () => {
+    seed({ c1: canvas('src', 'p-arch') }, [project('p-arch', 'archived')], 'c1')
+
+    const result = useCanvasStore.getState().duplicateCanvas('c1')
+
+    expect(result).toBeUndefined()
+    expect(Object.keys(useCanvasStore.getState().canvases)).toEqual(['c1'])
+    expect(useCanvasStore.getState().sceneId).toBe('c1')
+    expect(enqueueMock).not.toHaveBeenCalled()
+    expect(useToastStore.getState().entries.at(-1)).toMatchObject({
+      level: 'warning',
+      message: '画布已归档,请先恢复再复制',
+    })
+  })
+
+  it('on allow path produces an active copy without archivedByCascade', () => {
+    seed({ c1: { ...canvas('src', 'p1'), archivedByCascade: true } }, [project('p1')], 'c1')
+
+    const result = useCanvasStore.getState().duplicateCanvas('c1')
+
+    expect(result).not.toBeUndefined()
+    const copy = useCanvasStore.getState().canvases[result as string]
+    expect(copy.status).toBe('active')
+    expect(copy.archivedByCascade).toBeUndefined()
+    expect(useCanvasStore.getState().sceneId).toBe(result)
   })
 })

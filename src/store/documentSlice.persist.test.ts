@@ -51,6 +51,7 @@ vi.mock('../lib/persistMode', () => ({
 }))
 
 import { useCanvasStore } from './canvasStore'
+import { useToastStore } from './toastStore'
 import { startPersistWriteQueue, stopPersistWriteQueue, __resetPersistBoot } from '../lib/persistBoot'
 import { __resetWriteQueueDb } from '../lib/writeRetryQueue'
 
@@ -80,6 +81,7 @@ beforeEach(async () => {
   __resetPersistBoot()
   await __resetWriteQueueDb()
   useCanvasStore.setState({ projects: [], canvases: {} })
+  useToastStore.getState().clearToasts()
 })
 
 describe('G1-a R3 F2-B — server 模式零项目账号 createCanvas 自动建 project(不再 enqueue 空 projectId)', () => {
@@ -127,5 +129,51 @@ describe('G1-a R3 F2-B — server 模式零项目账号 createCanvas 自动建 p
     const canvasPosts = calls.filter((c) => c.method === 'POST' && c.path === '/api/canvas')
     expect(canvasPosts).toHaveLength(1)
     expect((canvasPosts[0]!.body as { projectId: string }).projectId).toBe('p-existing')
+  })
+})
+
+// PR-C1 二轮 P2(SC-1 server 模式):显式 archived projectId 阻止——不发 POST /api/canvas、不切 scene、warn toast。
+//   与 archiveActions.test.ts 的 local 模式同名用例互补(两端都堵)。
+describe('PR-C1 二轮 P2(SC-1 server) — createCanvas 显式 archived projectId 阻止', () => {
+  it('不发 POST /api/canvas(archived 父项目闸门),不自动建 project,warn toast', async () => {
+    const { fetch, calls } = makeCountingFetch()
+    startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
+    useCanvasStore.setState({
+      projects: [
+        { id: 'p-arch', name: 'Archived', createdAt: 't', status: 'archived' },
+      ] as never,
+      canvases: {
+        existing: {
+          title: 'Existing',
+          createdAt: 't',
+          updatedAt: 't',
+          nodes: [],
+          edges: [],
+          tasks: [],
+          selectedNodeIds: [],
+        },
+      },
+      sceneId: 'existing',
+      nodes: [],
+      edges: [],
+      tasks: [],
+    } as never)
+
+    const result = useCanvasStore.getState().createCanvas('blocked-canvas', { projectId: 'p-arch' })
+    await flush()
+    const { drainPersistQueue } = await import('../lib/persistBoot')
+    await drainPersistQueue()
+
+    expect(result).toBeUndefined()
+    const canvasPosts = calls.filter((c) => c.method === 'POST' && c.path === '/api/canvas')
+    expect(canvasPosts).toHaveLength(0) // 闸门前置短路,不 enqueue
+    const projectPosts = calls.filter((c) => c.method === 'POST' && c.path === '/api/projects')
+    expect(projectPosts).toHaveLength(0) // 不自动建 Default Project(blocked 在建项目分支前)
+    expect(Object.keys(useCanvasStore.getState().canvases)).toEqual(['existing']) // 不建档
+    expect(useCanvasStore.getState().sceneId).toBe('existing') // 不切 scene
+    expect(useToastStore.getState().entries.at(-1)).toMatchObject({
+      level: 'warning',
+      message: '目标项目已归档,请先恢复项目再新建画板',
+    })
   })
 })

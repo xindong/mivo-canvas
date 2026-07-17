@@ -62,6 +62,19 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
   historyPast: [],
   historyFuture: [],
   createCanvas: (title = 'Untitled Canvas', options) => {
+    // PR-C1 二轮 P2(SC-1):显式 archived projectId 阻止。修前:options.projectId 原样通过 →
+    //   server 模式建档+enqueue 落进 archived 父项目(级联归档语义下不可见 = 丢画布);local 模式脏建档。
+    //   与 moveCanvasToProject archived target guard 同语义(只堵 store 层;UI active 视图已过滤 archived
+    //   行,此处防 server/e2e/脏数据直触)。projectId 不在 projects 里的既有容忍行为(unknown project
+    //   原样通过)保持不变——不扩范围(lead 拍板)。
+    if (options?.projectId) {
+      const targetProject = get().projects.find((p) => p.id === options.projectId)
+      if (targetProject && targetProject.status === 'archived') {
+        warnCanvas(`Create canvas blocked: target project ${options.projectId} is archived`)
+        toastFeedback.warn('目标项目已归档,请先恢复项目再新建画板')
+        return undefined
+      }
+    }
     const id = createCanvasId()
     // R2 F2 / R3 F2-B:server 模式 canvas 必须归 project(防 POST /api/canvas projectId='' → 400
     // bad-body / 404 unknown-project 被队列当 rejected terminal 删 → 刷新画布消失)。
@@ -133,6 +146,24 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
       warnCanvas(`Duplicate canvas skipped: missing source ${sourceId}`)
       return undefined
     }
+    // PR-C1 二轮 P2(SC-2):archived 源 / archived 父项目 阻止。修前:副本经 ...sourceDocument
+    //   展开脏继承 status='archived'(切 sceneId 指向它)+ archived 父 projectId 原样通过 →
+    //   client archived / server active 直接分叉;enqueue 的 create wire 不带 status 致服务端建
+    //   active 记录。与 createCanvas archived 闸门同语义。放行路径副本显式 status='active'、
+    //   archivedByCascade=false(见下方 duplicatedDocument,防脏继承)。
+    if (sourceDocument.status === 'archived') {
+      warnCanvas(`Duplicate canvas blocked: source ${sourceId} is archived`)
+      toastFeedback.warn('画布已归档,请先恢复再复制')
+      return undefined
+    }
+    if (sourceDocument.projectId) {
+      const sourceParent = state.projects.find((p) => p.id === sourceDocument.projectId)
+      if (sourceParent && sourceParent.status === 'archived') {
+        warnCanvas(`Duplicate canvas blocked: source parent project ${sourceDocument.projectId} is archived`)
+        toastFeedback.warn('画布已归档,请先恢复再复制')
+        return undefined
+      }
+    }
 
     const id = createCanvasId()
     // C8: duplicate does NOT inherit the source's timestamps — the copy is a new
@@ -149,11 +180,15 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
     }
     const opProjectId = docProjectId ?? ''
     const now = new Date().toISOString()
+    const sourceForDuplicate = { ...sourceDocument }
+    delete sourceForDuplicate.archivedByCascade
     const duplicatedDocument = {
       ...normalizeDocument({
-        ...sourceDocument,
+        ...sourceForDuplicate,
         title: `${sourceDocument.title} Copy`,
         projectId: docProjectId,
+        // 副本是独立 active 画布;上方先移除脏 archivedByCascade 标记,避免继承级联归档身份。
+        status: 'active' as const,
         nodes: cloneNodes(sourceDocument.nodes),
         tasks: cloneTasks(sourceDocument.tasks),
       }),

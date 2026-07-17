@@ -68,6 +68,9 @@ export function ProjectRow(props: {
 
   const newCanvasInProject = () => {
     const newId = createCanvas('Untitled Canvas', { projectId: project.id })
+    // PR-C1 二轮 P2:createCanvas blocked(目标 project 已归档)→ 返 undefined。store 层已弹 warn,
+    //   caller 不重复提示、不 loadScene、不展开(与 duplicateCanvas caller 同构守卫)。
+    if (!newId) return
     loadScene(newId)
     onOpenCanvas(newId)
     onExpandProject(project.id) // ensure the project is expanded so the new canvas is visible

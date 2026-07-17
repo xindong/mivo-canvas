@@ -418,7 +418,7 @@ describe('G1-a R2 F1 — canvas create+update coalesce 不丢 create + metaRevis
   it('create→rename(未 drain)合并为单个 POST,body 为最终 title', async () => {
     const { fetch, calls } = makeRevisioningFetch()
     startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
-    const id = useCanvasStore.getState().createCanvas('orig', { projectId: 'p1' })
+    const id = useCanvasStore.getState().createCanvas('orig', { projectId: 'p1' })!
     useCanvasStore.getState().renameCanvas(id, 'final')
     await flush()
     await drainPersistQueue()
@@ -430,7 +430,7 @@ describe('G1-a R2 F1 — canvas create+update coalesce 不丢 create + metaRevis
   it('create→drain→rename→drain:rename 用回灌的新 metaRevision(不 409)', async () => {
     const { fetch, calls } = makeRevisioningFetch()
     startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
-    const id = useCanvasStore.getState().createCanvas('c', { projectId: 'p1' })
+    const id = useCanvasStore.getState().createCanvas('c', { projectId: 'p1' })!
     await flush()
     await drainPersistQueue()
     expect(useCanvasStore.getState().canvases[id]?.metaRevision).toBe(0)
@@ -726,7 +726,7 @@ describe('A2 前置 b — project delete 整树软删 + restore', () => {
     const { fetch, calls } = makeCountingFetch()
     startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
     const pid = useCanvasStore.getState().createProject('P')
-    const cid = useCanvasStore.getState().createCanvas('c', { projectId: pid })
+    const cid = useCanvasStore.getState().createCanvas('c', { projectId: pid })!
     await flush()
     await drainPersistQueue() // create project + canvas on server
     useCanvasStore.getState().deleteProject(pid)
@@ -745,7 +745,7 @@ describe('A2 前置 b — project delete 整树软删 + restore', () => {
   it('local 模式 deleteProject 保留 standalone 回落(不丢 IDB 数据,软删基础设施仅服务端有)', async () => {
     // 不 startPersistWriteQueue → isPersistWriteActive()=false → local standalone 回落
     const pid = useCanvasStore.getState().createProject('P')
-    const cid = useCanvasStore.getState().createCanvas('c', { projectId: pid })
+    const cid = useCanvasStore.getState().createCanvas('c', { projectId: pid })!
     useCanvasStore.getState().deleteProject(pid)
     expect(useCanvasStore.getState().projects.find((p) => p.id === pid)).toBeUndefined()
     // canvas body 保留,projectId→undefined(standalone 回落,防数据丢失)
@@ -814,7 +814,7 @@ describe('A2 前置 c — duplicateCanvas enqueue + 无 metaRevision 首写 base
     const { fetch, calls } = makeRevisioningFetch()
     startPersistWriteQueue({ fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
     const pid = useCanvasStore.getState().createProject('P')
-    const cid = useCanvasStore.getState().createCanvas('c', { projectId: pid })
+    const cid = useCanvasStore.getState().createCanvas('c', { projectId: pid })!
     await flush()
     await drainPersistQueue() // create → metaRevision=0 回灌
     calls.length = 0

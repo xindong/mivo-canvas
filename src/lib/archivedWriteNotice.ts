@@ -35,6 +35,15 @@ const lastShown = new Map<string, number>()
  */
 export const notifyArchivedWriteBlocked = (canvasId: string): void => {
   const now = Date.now()
+  // PR-C1 二轮 P3:清理过期条目(防长会话单调增长)。notify 是唯一写入点,顺带在此 GC:
+  //   过期 = now - ts >= DEDUP_WINDOW_MS(与下方抑制判断同阈值,过期即该重新可见)。
+  //   单调增长的代价 = O(n) 遍历,但长会话内同一 canvasId 反复命中会原地刷新 ts(不增条目),
+  //   故实际增长来源是不同 canvasId 的遗留;清它们即可。
+  for (const [key, ts] of lastShown) {
+    if (now - ts >= DEDUP_WINDOW_MS) {
+      lastShown.delete(key)
+    }
+  }
   const last = lastShown.get(canvasId)
   if (last !== undefined && now - last < DEDUP_WINDOW_MS) {
     debugLogger.log(
@@ -51,3 +60,6 @@ export const notifyArchivedWriteBlocked = (canvasId: string): void => {
 export const __resetArchivedWriteNotice = (): void => {
   lastShown.clear()
 }
+
+/** 测试专用:读取去重 Map 当前条目数(断言过期清理,防长会话单调增长)。 */
+export const __getArchivedWriteNoticeSize = (): number => lastShown.size
