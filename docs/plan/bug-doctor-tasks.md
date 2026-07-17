@@ -8,7 +8,7 @@
 
 ### T1 · gate 脚本 + 状态骨架(核心发现层)
 **做法**:
-- 新建 `scripts/loops/bug-doctor-gate.mjs`(node,零依赖优先);状态目录 `history/loops/bug-doctor/`(state.json/ledger.csv/logs.md,不入 git)。
+- 新建 `scripts/loops/bug-doctor/gate.mjs`(node,零依赖优先);状态目录 `history/loops/bug-doctor/`(state.json/ledger.csv/logs.md,不入 git)。
 - SSH 只读拉数:`ssh zhuzan@10.102.80.15 'cat /AIGC_Group/mivo-canvas/data/debug-logs/*.jsonl'`(系统 key 已通);按 `receivedAt > cursor` 增量。
 - 指纹规整:message 剥离 UUID/hash/数字/URL 路径变量后取前缀,`fingerprint = source + '::' + 规整前缀`;聚类计数 distinct clientId。
 - 打分公式照契约;台账 diff(已修/issue-filed/known-noise 过滤);`gh run list --workflow=nightly-e2e` 红灯检测;输出工作包 JSON(簇列表+S级+score+样例记录)。
@@ -54,7 +54,7 @@
 ## P2(收尾)
 
 ### T8 · 契约+脚本入库 PR(含 dashboard 渲染器)
-**做法**:`docs/loops/bug-doctor.md` + `scripts/loops/bug-doctor-gate.mjs` + unknowns-map/tasks 计划文档一并走 PR(带 `[bug-doctor]` 说明)。
+**做法**:`docs/loops/bug-doctor.md` + `scripts/loops/bug-doctor/gate.mjs` + unknowns-map/tasks 计划文档一并走 PR(带 `[bug-doctor]` 说明)。
 **SC**:CI 绿、PR 合并 main、Greptile 线程按规矩回复后 resolve。
 
 ### T9 · 进化轮机制

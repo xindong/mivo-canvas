@@ -9,7 +9,7 @@ mivo 生产 debug log(FX-7 加固过的上报链,现有几十条/天真实错误
 - 任务与 SC:`docs/plan/bug-doctor-tasks.md`
 - 预检决策记录(Q1-Q7):`docs/plan/bug-doctor-unknowns-map.md`
 
-关键已锁决策:24h Mac + launchd + maker 定时会话(A 路线)|T1 自动合并第一天开(白名单最严)|issue 直提组织仓 `[bug-doctor]` 前缀|成本不设顶记账两周|S0 六项核心流程(画布/项目/生成/持久化/资产/聊天)|通知全走 MivoCanvas 飞书群。
+关键已锁决策:24h Mac + launchd + maker 定时会话(A 路线)|T1 自动合并第一天开(白名单最严)|issue 直提组织仓 `[bug-doctor]` 前缀|成本不设顶记账两周|S0 六项核心流程(画布/项目/生成/持久化/资产/聊天)|通知全走 Slack `#mivo-canvas`(2026-07-17 晚由飞书群改道,见 Q6)。
 
 ## Review 对齐
 
