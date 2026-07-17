@@ -127,6 +127,36 @@ const makeStubBff = () => {
       return json({ reordered: b.orderedIds?.length ?? 0, contentVersion: 1, base: 'stub-order-base' }, 200)
     }
 
+    // POST /api/canvas/:id/archive|unarchive — Phase 2 归档(空 body ArchiveRequest=Record<string,never>;
+    //   无 If-Match;返更新后 CanvasMeta)。wire:archive → status:'archived';unarchive → status 缺省(active)。
+    if (method === 'POST' && /^\/api\/canvas\/[^/]+\/(archive|unarchive)$/.test(path)) {
+      const segs = path.split('/')
+      const id = decodeURIComponent(segs[3] ?? '')
+      const action = segs[4] ?? ''
+      const c = canvases.get(id)
+      if (!c || c.owner !== owner) return json({ error: 'unknown-canvas' }, 404)
+      const newRev = c.meta.metaRevision + 1
+      const updated: CanvasMeta = action === 'archive'
+        ? { ...c.meta, status: 'archived', metaRevision: newRev }
+        : { ...c.meta, status: undefined, metaRevision: newRev } // unarchive:显式 undefined 覆盖继承的 archived → JSON.stringify 丢弃 → wire 无 status(active)
+      canvases.set(id, { meta: updated, owner })
+      return json(updated, 200)
+    }
+    // POST /api/projects/:id/archive|unarchive — Phase 2 归档(空 body;返更新后 Project;级联由真 server 做,stub 不模拟)
+    if (method === 'POST' && /^\/api\/projects\/[^/]+\/(archive|unarchive)$/.test(path)) {
+      const segs = path.split('/')
+      const id = decodeURIComponent(segs[3] ?? '')
+      const action = segs[4] ?? ''
+      const p = projects.get(id)
+      if (!p || p.owner !== owner) return json({ error: 'unknown-project' }, 404)
+      const newRev = p.project.revision + 1
+      const updated: Project = action === 'archive'
+        ? { ...p.project, status: 'archived', revision: newRev, updatedAt: 't2' }
+        : { ...p.project, status: undefined, revision: newRev, updatedAt: 't2' } // unarchive:status 缺省(active)
+      projects.set(id, { project: updated, owner })
+      return json(updated, 200)
+    }
+
     return new Response(null, { status: 404 })
   }
 
@@ -135,7 +165,11 @@ const makeStubBff = () => {
     const meta: CanvasMeta = { id, projectId, title, createdAt: 't0', updatedAt: 't1', metaRevision: 0, contentVersion: 0 }
     canvases.set(id, { meta, owner })
   }
-  return { fetch, projects, userState, canvases, seedCanvas }
+  const seedProject = (id: string, owner: string, name = 'proj') => {
+    const project: Project = { id, name, ownerId: owner, createdAt: 't0', updatedAt: 't1', revision: 0, isDeleted: false }
+    projects.set(id, { project, owner })
+  }
+  return { fetch, projects, userState, canvases, seedCanvas, seedProject }
 }
 
 const makeAdapter = (stub: ReturnType<typeof makeStubBff>, key = KEY_A) =>
@@ -460,5 +494,82 @@ describe('G1-a 默认 mode=local 零变化证据', () => {
     expect(e).toBeInstanceOf(HttpError)
     expect(e.status).toBe(409)
     expect(e.name).toBe('HttpError')
+  })
+})
+
+describe('Phase 2 归档 archive/unarchive adapter 路径(空 body + revision 回捕 + status wire)', () => {
+  // 锁测 P2:adapter.archiveCanvas/unarchiveCanvas/archiveProject/unarchiveProject 走 POST 空 body
+  //   (ArchiveRequest = Record<string,never>;adapter 不发 body),无 If-Match;返更新后 CanvasMeta/Project
+  //   (status:archived wire / active 缺省)+ revision/metaRevision bump 供 drain onSuccess 回灌。
+  //   空 body 用 fetch spy 断言(init.body === undefined)。
+  const makeAdapterWithSpy = (stub: ReturnType<typeof makeStubBff>, key = KEY_A) => {
+    const calls: { method: string; path: string; body?: string }[] = []
+    const fetch = async (input: string, init?: RequestInit): Promise<Response> => {
+      calls.push({
+        method: (init?.method ?? 'GET').toUpperCase(),
+        path: new URL(input, 'http://stub').pathname,
+        body: init?.body as string | undefined,
+      })
+      return stub.fetch(input, init)
+    }
+    const adapter = createFetchServerPersistAdapter({ fetch, baseUrl: '', getAuthHeaders: authHeaders(key) })
+    return { adapter, calls }
+  }
+
+  it('archiveCanvas → POST /api/canvas/:id/archive 空 body;返 CanvasMeta(status:archived,metaRevision bump)', async () => {
+    const stub = makeStubBff()
+    stub.seedCanvas('c1', KEY_A, 'p1', 'orig')
+    const { adapter, calls } = makeAdapterWithSpy(stub)
+    const got = await adapter.archiveCanvas('c1')
+    expect(got.status).toBe('archived')
+    expect(got.metaRevision).toBe(1) // bump from 0
+    expect(got.id).toBe('c1')
+    // 空 body + POST + 正确 path
+    const arch = calls.find((c) => c.path === '/api/canvas/c1/archive')
+    expect(arch).toBeDefined()
+    expect(arch!.method).toBe('POST')
+    expect(arch!.body).toBeUndefined() // ArchiveRequest = Record<string,never>;adapter 不发 body
+  })
+
+  it('unarchiveCanvas → POST /api/canvas/:id/unarchive 空 body;返 CanvasMeta(status 缺省=active wire)', async () => {
+    const stub = makeStubBff()
+    stub.seedCanvas('c1', KEY_A, 'p1', 'c')
+    const { adapter, calls } = makeAdapterWithSpy(stub)
+    await adapter.archiveCanvas('c1') // 先 archive(0→1)
+    const got = await adapter.unarchiveCanvas('c1') // unarchive(1→2)
+    expect(got.status).toBeUndefined() // active 缺省(wire 不回传 status,向后兼容旧 client)
+    expect(got.metaRevision).toBe(2)
+    const unarch = calls.find((c) => c.path === '/api/canvas/c1/unarchive')
+    expect(unarch).toBeDefined()
+    expect(unarch!.method).toBe('POST')
+    expect(unarch!.body).toBeUndefined() // 空 body
+  })
+
+  it('archiveProject → POST /api/projects/:id/archive 空 body;返 Project(status:archived,revision bump)', async () => {
+    const stub = makeStubBff()
+    stub.seedProject('p1', KEY_A, 'P1')
+    const { adapter, calls } = makeAdapterWithSpy(stub)
+    const got = await adapter.archiveProject('p1')
+    expect(got.status).toBe('archived')
+    expect(got.revision).toBe(1) // bump from 0
+    expect(got.id).toBe('p1')
+    const arch = calls.find((c) => c.path === '/api/projects/p1/archive')
+    expect(arch).toBeDefined()
+    expect(arch!.method).toBe('POST')
+    expect(arch!.body).toBeUndefined() // 空 body
+  })
+
+  it('unarchiveProject → POST /api/projects/:id/unarchive 空 body;返 Project(status 缺省=active)', async () => {
+    const stub = makeStubBff()
+    stub.seedProject('p1', KEY_A, 'P1')
+    const { adapter, calls } = makeAdapterWithSpy(stub)
+    await adapter.archiveProject('p1') // 0→1
+    const got = await adapter.unarchiveProject('p1') // 1→2
+    expect(got.status).toBeUndefined() // active 缺省
+    expect(got.revision).toBe(2)
+    const unarch = calls.find((c) => c.path === '/api/projects/p1/unarchive')
+    expect(unarch).toBeDefined()
+    expect(unarch!.method).toBe('POST')
+    expect(unarch!.body).toBeUndefined() // 空 body
   })
 })

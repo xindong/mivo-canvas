@@ -39,6 +39,14 @@ type TombstoneRecord = {
   kind: TombstoneKind
   resourceId: string
   createdAt: number
+  /**
+   * F-B(决策7,Phase 2 归档):canvas 级联删 tombstone 的父项目标记。deleteProject 级联删其画布时写
+   * parentProjectId=projectId;restoreProject 整树恢复时经 revokeCanvasTombstonesForProject(projectId) 撤销
+   * 这些级联删 canvas tombstone(镜像 deleteProject 级联删)。直接 deleteCanvas 的 tombstone 无此字段 →
+   * revoke-by-project 撞不到(直接删的画布不该被项目恢复重建,保留挡复活)。
+   * schemaless value(IDB keyPath='key' 不变),加可选字段不触发 onupgradeneeded(决策7:无 DB_VERSION bump)。
+   */
+  parentProjectId?: string
 }
 
 const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e))
@@ -138,41 +146,83 @@ const getAllRecords = async (): Promise<TombstoneRecord[]> => {
     const idbRecords = await runTx<TombstoneRecord[]>('readonly', (store) =>
       store.getAll() as IDBRequest<TombstoneRecord[]>,
     )
-    // 并 memStore 兜底记录(同 writeRetryQueue getAllWrites:IDB tx 失败回落 memStore 的记录防丢)。
-    const idbKeys = new Set(idbRecords.map((r) => r.key))
-    const memOnly = Array.from(memStore.values()).filter((r) => !idbKeys.has(r.key))
-    return [...idbRecords, ...memOnly]
+    // P2-2(二审降级 seam):IDB enrich tx 曾失败 → 带 parentProjectId 的记录落 memStore(catch 回落),IDB 仍存
+    //   stale 无 parent 记录(同 key)。旧实现按 key 优先留 IDB + 过滤同 key mem(`!idbKeys.has(r.key)`)→
+    //   enrichment 不可见(parentProjectId 丢 → revokeCanvasTombstonesForProject 撞不到 → 恢复的画布被永久隐藏,
+    //   比复活更糟)。修:同 key merge——mem 的 parentProjectId(enriched)补进 IDB 记录(IDB 缺时);其余字段以
+    //   IDB 为准(durable 权威,createdAt/kind/ownerId/resourceId)。mem-only 记录(key 不在 IDB,如全 mem 兜底)照常追加。
+    //   merge 只在内存(读路径),不写回 IDB(读不改 durable;下次成功 putRecord enrich 自愈 IDB;IDB 持续故障时
+    //   每次 read 重 merge,幂等)。
+    const byKey = new Map<string, TombstoneRecord>()
+    for (const r of idbRecords) byKey.set(r.key, r)
+    for (const r of memStore.values()) {
+      const idb = byKey.get(r.key)
+      if (idb) {
+        // 同 key merge:mem 的 parentProjectId(enriched 投影)补进 IDB 记录(IDB stale 缺时);IDB 已有则不覆盖。
+        if (r.parentProjectId !== undefined && idb.parentProjectId === undefined) {
+          byKey.set(r.key, { ...idb, parentProjectId: r.parentProjectId })
+        }
+      } else {
+        // mem-only(key 不在 IDB)→ 追加(IDB tx 失败回落的全 mem 记录)。
+        byKey.set(r.key, r)
+      }
+    }
+    return Array.from(byKey.values())
   } catch (error) {
     warnIdbDegradation('getAll failed', error)
     return Array.from(memStore.values())
   }
 }
 
-const putRecord = async (record: TombstoneRecord): Promise<boolean> => {
-  // 已存在则不覆盖 createdAt(保持首次删除时间;重复删同 id 幂等)。先 get 判存,再 put。
+const putRecord = async (record: TombstoneRecord): Promise<'new' | 'enriched' | 'existing'> => {
+  // 已存在则不覆盖 createdAt(保持首次删除时间;重复删同 id 幂等)。
+  // P1-4(forward-compat 返修):同 key 已存在但缺 parentProjectId → 原子 enrich 补 parentProjectId(不整条覆盖,
+  //   保留 existing.createdAt/kind/ownerId/resourceId;#264 旧墓碑补 cascade provenance 供 revokeCanvasTombstonesForProject)。
+  //   仅当新 record 携带 parentProjectId(cascade delete 场景)且 existing 缺它时才 enrich;其余 existing → no-op。
   if (!isIdbAvailable()) {
-    if (memStore.has(record.key)) return false
+    const existing = memStore.get(record.key)
+    if (existing) {
+      if (record.parentProjectId !== undefined && existing.parentProjectId === undefined) {
+        memStore.set(record.key, { ...existing, parentProjectId: record.parentProjectId })
+        return 'enriched'
+      }
+      return 'existing'
+    }
     memStore.set(record.key, record)
-    return true
+    return 'new'
   }
   try {
     let written = false
+    let enriched = false
     await runVoidTx('readwrite', (store) => {
       const getReq = store.get(record.key) as IDBRequest<TombstoneRecord | undefined>
       getReq.onsuccess = () => {
-        if (getReq.result === undefined) {
+        const existing = getReq.result
+        if (existing === undefined) {
           store.put(record)
           written = true
+        } else if (record.parentProjectId !== undefined && existing.parentProjectId === undefined) {
+          // enrich(原子:同 tx 内 get→put;不覆盖 createdAt/kind/ownerId/resourceId,只补 parentProjectId)
+          store.put({ ...existing, parentProjectId: record.parentProjectId })
+          enriched = true
         }
+        // else: existing(已 parentProjectId 或新 record 无 parentProjectId)→ no-op
       }
     })
-    if (written) memStore.delete(record.key)
-    return written
+    if (written) memStore.delete(record.key) // record durable,清 stale memStore 兜底
+    return written ? 'new' : enriched ? 'enriched' : 'existing'
   } catch (error) {
     warnIdbDegradation(`put failed for ${record.key}`, error)
-    if (memStore.has(record.key)) return false
+    const existing = memStore.get(record.key)
+    if (existing) {
+      if (record.parentProjectId !== undefined && existing.parentProjectId === undefined) {
+        memStore.set(record.key, { ...existing, parentProjectId: record.parentProjectId })
+        return 'enriched'
+      }
+      return 'existing'
+    }
     memStore.set(record.key, record)
-    return true
+    return 'new'
   }
 }
 
@@ -207,8 +257,16 @@ const deleteRecord = async (key: string): Promise<boolean> => {
  * 幂等:重复删同 id 不覆盖(保持首次删除时间),返是否新写。失败 best-effort(memStore 兜底),
  * 永不 throw(不阻断 store action)。server 模式才写(local 模式 hydrate 永不跑,写也无意义;
  * 调用方已 gate 在 isPersistWriteActive)。
+ *
+ * F-B(决策7):opts.parentProjectId 标记级联删 canvas tombstone 的父项目。deleteProject 级联删其画布时传
+ * parentProjectId=projectId;restoreProject 经 revokeCanvasTombstonesForProject(projectId) 撤销这些级联 tombstone。
+ * 直接 deleteCanvas 不传(无父项目级联语义)→ revoke-by-project 撞不到,保留挡复活。
  */
-export const recordDeletionTombstone = async (kind: TombstoneKind, resourceId: string): Promise<void> => {
+export const recordDeletionTombstone = async (
+  kind: TombstoneKind,
+  resourceId: string,
+  opts?: { parentProjectId?: string },
+): Promise<void> => {
   const ownerId = getPersistUserId()
   const record: TombstoneRecord = {
     key: tombstoneKey(kind, resourceId, ownerId),
@@ -216,10 +274,19 @@ export const recordDeletionTombstone = async (kind: TombstoneKind, resourceId: s
     kind,
     resourceId,
     createdAt: Date.now(),
+    ...(opts?.parentProjectId !== undefined ? { parentProjectId: opts.parentProjectId } : {}),
   }
-  const written = await putRecord(record)
-  if (written) {
-    debugLogger.log(SOURCE, `tombstone recorded for ${kind} ${resourceId} (owner=${ownerId}; anti-resurrection D)`)
+  const result = await putRecord(record)
+  if (result === 'new') {
+    debugLogger.log(
+      SOURCE,
+      `tombstone recorded for ${kind} ${resourceId} (owner=${ownerId}; anti-resurrection D${opts?.parentProjectId !== undefined ? `; cascade under project ${opts.parentProjectId}` : ''})`,
+    )
+  } else if (result === 'enriched') {
+    debugLogger.log(
+      SOURCE,
+      `tombstone enriched (parentProjectId=${opts?.parentProjectId} added to legacy record) for ${kind} ${resourceId} (owner=${ownerId}; P1-4 forward-compat)`,
+    )
   }
 }
 
@@ -233,6 +300,37 @@ export const revokeDeletionTombstone = async (kind: TombstoneKind, resourceId: s
   const removed = await deleteRecord(key)
   if (removed) {
     debugLogger.log(SOURCE, `tombstone revoked for ${kind} ${resourceId} (restore / re-create; un-hide D)`)
+  }
+}
+
+/**
+ * F-B(决策7,Phase 2 restoreProject 接线):撤销某 project 下所有级联删 canvas tombstone(按 parentProjectId 过滤)。
+ * 镜像 deleteProject 级联写 canvas tombstone(带 parentProjectId)——restoreProject 整树恢复时,子画布 tombstone
+ * 也须撤销,否则恢复的画布被 hydrate step2 永久隐藏(比复活更糟;子画布 deleteCanvas op 若被溢出驱逐/重试耗尽
+ * 离队,pending-delete 失效,tombstone 接力挡复活 → 永久隐藏恢复的画布)。
+ *
+ * getAllRecords + JS 过滤(低频小集合,决策7:不建 IDB 索引、无 DB_VERSION bump)。ownerId 过滤(同
+ * getDeletionTombstones;IDB 跨账号共享)。**缺 parentProjectId 的旧 tombstone**(Phase 1→2 部署窗口期写入的
+ * 直接删 canvas tombstone,无此字段)保守不动(不撤销 → 仍挡复活 → 依赖 Phase 2 回收站恢复入口兜底;文档注明
+ * 此极窄边缘)。幂等:无命中 → no-op silent(不 log,防刷屏)。返撤销数(命中才 log)。失败 best-effort,永不 throw。
+ */
+export const revokeCanvasTombstonesForProject = async (projectId: string): Promise<void> => {
+  const ownerId = getPersistUserId()
+  const all = await getAllRecords()
+  const targets = all.filter(
+    (r) => r.ownerId === ownerId && r.kind === 'canvas' && r.parentProjectId === projectId,
+  )
+  if (targets.length === 0) return
+  let revoked = 0
+  for (const t of targets) {
+    const removed = await deleteRecord(t.key)
+    if (removed) revoked++
+  }
+  if (revoked > 0) {
+    debugLogger.log(
+      SOURCE,
+      `revoked ${revoked} cascade-deleted canvas tombstone(s) under project ${projectId} (restoreProject tree; owner=${ownerId}; un-hide D)`,
+    )
   }
 }
 
@@ -282,4 +380,26 @@ export const __resetDeletionTombstonesDb = async (): Promise<void> => {
     debugLogger.warn(SOURCE, `clear failed: ${msg(error)}`)
     dbPromise = undefined
   }
+}
+
+/**
+ * P2-2 测试专用:直接置 memStore(模拟 IDB enrich tx 失败 → catch 回落 memStore 的记录),不触 IDB。
+ * 用于构造"IDB 存 stale 无 parent 记录 + memStore 存 enriched 带 parent 同 key 记录"降级态,
+ * 验 getAllRecords 同 key merge 把 mem 的 parentProjectId 补进 IDB(enrichment 可见,防 revokeCanvasTombstonesForProject 撞不到)。
+ */
+export const __seedTombstoneMemForTest = async (
+  kind: TombstoneKind,
+  resourceId: string,
+  opts?: { parentProjectId?: string },
+): Promise<void> => {
+  const ownerId = getPersistUserId()
+  const key = tombstoneKey(kind, resourceId, ownerId)
+  memStore.set(key, {
+    key,
+    ownerId,
+    kind,
+    resourceId,
+    createdAt: Date.now(),
+    ...(opts?.parentProjectId !== undefined ? { parentProjectId: opts.parentProjectId } : {}),
+  })
 }

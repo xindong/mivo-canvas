@@ -439,6 +439,14 @@ export type CanvasProject = {
   ownerId?: string
   updatedAt?: string
   isDeleted?: boolean
+  /**
+   * Phase 2 归档(回收站):record 活跃态。live 记录 `status ∈ {'active','archived'}`(缺省=active,向后兼容)。
+   * - `active`:正常可见可写(默认)。
+   * - `archived`:归档态——回收站可见、可恢复、可彻底删除;不进默认 PROJECTS 视图。
+   * **彻底删除沿用 is_deleted 软删终态,不新增 'deleted' status 值**(避免与 is_deleted 双轨)。
+   * 客户端本地镜像 server Project.status(hydrate 从 BFF reconcile);可选字段保证 local/demo 零变化。
+   */
+  status?: 'active' | 'archived'
 }
 
 export type CanvasDocument = {
@@ -464,6 +472,25 @@ export type CanvasDocument = {
    */
   metaRevision?: number
   contentVersion?: number
+  /**
+   * Phase 2 归档(回收站):record 活跃态。live 记录 `status ∈ {'active','archived'}`(缺省=active,向后兼容)。
+   * - `active`:正常可见可写(默认)。
+   * - `archived`:归档态——回收站可见、可恢复;CR-6 server 对 archived canvas 子记录写返 409 archived,
+   *   客户端引导"先恢复再编辑"。
+   * **彻底删除沿用 is_deleted 软删终态,不新增 'deleted' status 值**。
+   * 客户端本地镜像 server CanvasMeta.status(hydrate 从 BFF reconcile);可选字段保证 local/demo 零变化。
+   */
+  status?: 'active' | 'archived'
+  /**
+   * D3(Phase 2 归档):级联归档标记(客户端本地字段)。区分"被 archiveProject 级联归档"vs"被 archiveCanvas 直接归档":
+   * - `true`:由 archiveProject 级联归档(随项目一起隐藏)→ unarchiveProject 会一并恢复(CR-5)。
+   * - `false`/`undefined`:由 archiveCanvas 直接归档(或 hydrate 自 server 无此字段)→ unarchiveProject 不强制恢复,
+   *   保留其单独归档态(用户先前单独归档的画布不被恢复打扰)。
+   * **客户端本地字段,不入 wire 契约**(server PR-A 在 canvas meta payload JSONB 内维护同名标记作跨设备
+   * cascade-restore 权威;client 本字段仅驱动本地乐观级联,跨设备以 server unarchiveProjectTree 结果为准)。
+   * hydrate 不推断此字段(server 不经 wire 暴露;推断不安全——见 PR-B 报告"已知非阻断缺口")。
+   */
+  archivedByCascade?: boolean
 }
 
 export type SceneDefinition = {

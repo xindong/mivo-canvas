@@ -17,6 +17,8 @@
 //  - #8 补 edge/anchor delete + canvas 枚举 + asset seam(引 #195 CreateAssetResponse/AssetRef,不重复实现)。
 
 import type {
+  ArchiveCanvasResponse,
+  ArchiveProjectResponse,
   AttachAssetResult,
   CanvasChildUpsertResponse,
   CreateAssetResponse,
@@ -48,7 +50,12 @@ import { IF_MATCH_HEADER, IDEMPOTENCY_KEY_HEADER } from '../../shared/persist-co
  */
 export interface ServerPersistAdapter {
   // ── document scope → /api/projects ──
-  listProjects(): Promise<ListProjectsResponse>
+  /**
+   * CR-8(Phase 2 归档跨设备 hydrate):opts.includeArchived=true 拉含归档项(active + archived,排除 deleted);
+   * 缺省/false 仅 active。boot hydrate 必须 true 拉全量并 reconcile status(否则"另一设备已归档"的 project
+   * 被当 local-only 保留 → 跨设备归档不生效)。回收站"已归档"视图亦用 true。
+   */
+  listProjects(opts?: { includeArchived?: boolean }): Promise<ListProjectsResponse>
   createProject(name: string, id?: string): Promise<Project>
   /** G1-a P1-2:GET /api/projects/:id → Project;404(unknown/unauthorized)→ null。 */
   getProject(id: string): Promise<Project | null>
@@ -56,18 +63,35 @@ export interface ServerPersistAdapter {
   updateProject(id: string, name: string, baseRevision?: Revision): Promise<Project>
   /** G1-a P1-2:DELETE /api/projects/:id → 204(幂等);404 → 视为已删(void,幂等)。 */
   deleteProject(id: string): Promise<void>
+  /**
+   * Phase 2 归档:POST /api/projects/:id/archive → 200 Project(status:archived wire);级联归档其全部 active 子画布
+   *   (server archiveProjectTree,D3)。幂等:已归档→200 no-op。空 body(ArchiveRequest);owner-only(manage)。
+   */
+  archiveProject(id: string): Promise<ArchiveProjectResponse>
+  /**
+   * Phase 2 归档:POST /api/projects/:id/unarchive → 200 Project(status 缺省=active);级联恢复 archivedByCascade=true
+   *   的子画布(单独归档的不动,D3)。幂等:已 active→200 no-op。
+   */
+  unarchiveProject(id: string): Promise<ArchiveProjectResponse>
 
   // ── document scope → /api/canvas ──
   /** 返修 #5:hydrate GET /api/canvas/:id(全量 meta + nodes/edges/anchors)。返 metaRevision + contentVersion。null=404。 */
   fetchCanvas(canvasId: string): Promise<GetCanvasResponse | null>
   /** 返修 #8:canvas 枚举(按 project/owner)。 */
-  listCanvas(projectId?: string): Promise<ListCanvasResponse>
+  listCanvas(projectId?: string, opts?: { includeArchived?: boolean }): Promise<ListCanvasResponse>
   /** G1-a P1-2:POST /api/canvas → 201/200 CanvasMeta(createCanvas meta CRUD)。 */
   createCanvas(input: { projectId: string; id?: string; title?: string; sourceTemplateId?: string }): Promise<CreateCanvasResponse>
   /** G1-a P1-2:PUT /api/canvas/:id,body { payload: CanvasPayload },If-Match = metaRevision base;返更新后 CanvasMeta。 */
   updateCanvas(id: string, patch: { projectId: string; title?: string; sourceTemplateId?: string }, baseRevision?: Revision): Promise<CreateCanvasResponse>
   /** G1-a P1-2:DELETE /api/canvas/:id → 204(幂等);404 → 视为已删(void,幂等)。 */
   deleteCanvas(id: string): Promise<void>
+  /**
+   * Phase 2 归档:POST /api/canvas/:id/archive → 200 CanvasMeta(status:archived wire)。幂等:已归档→200 no-op。
+   * 空 body;owner-only(manage)。archived canvas 子记录写返 409 archived(CR-6,引导先恢复再编辑)。
+   */
+  archiveCanvas(id: string): Promise<ArchiveCanvasResponse>
+  /** Phase 2 归档:POST /api/canvas/:id/unarchive → 200 CanvasMeta(status 缺省=active)。幂等:已 active→200 no-op。 */
+  unarchiveCanvas(id: string): Promise<ArchiveCanvasResponse>
   /** 节点级 PATCH(FX-4);baseRevision = client 读到的 envelope revision(If-Match,返修 #4)。A2-S3:返 CanvasChildUpsertResponse(seq+base 必填,canvas child 域;lead ②)。 */
   upsertNode(canvasId: string, node: NodeRecord, baseRevision?: Revision): Promise<CanvasChildUpsertResponse>
   upsertEdge(canvasId: string, edge: EdgeRecord, baseRevision?: Revision): Promise<CanvasChildUpsertResponse>
@@ -159,11 +183,15 @@ export const unwiredServerPersistAdapter: ServerPersistAdapter = {
   getProject: () => notWired('getProject'),
   updateProject: () => notWired('updateProject'),
   deleteProject: () => notWired('deleteProject'),
+  archiveProject: () => notWired('archiveProject'),
+  unarchiveProject: () => notWired('unarchiveProject'),
   fetchCanvas: () => notWired('fetchCanvas'),
   listCanvas: () => notWired('listCanvas'),
   createCanvas: () => notWired('createCanvas'),
   updateCanvas: () => notWired('updateCanvas'),
   deleteCanvas: () => notWired('deleteCanvas'),
+  archiveCanvas: () => notWired('archiveCanvas'),
+  unarchiveCanvas: () => notWired('unarchiveCanvas'),
   upsertNode: () => notWired('upsertNode'),
   upsertEdge: () => notWired('upsertEdge'),
   upsertAnchor: () => notWired('upsertAnchor'),
@@ -397,14 +425,17 @@ export const createFetchServerPersistAdapter = (opts: FetchAdapterOptions): Serv
 
   return {
     // ── project(document scope)──
-    listProjects: () =>
-      requestJson<ListProjectsResponse>({
+    listProjects: (opts) => {
+      // CR-8:includeArchived=true 拉含归档项(active+archived);缺省仅 active(server projects.ts:99-100 过滤 archived)。
+      const qs = opts?.includeArchived ? '?includeArchived=true' : ''
+      return requestJson<ListProjectsResponse>({
         fetch: doFetch,
         baseUrl,
         getAuthHeaders,
         method: 'GET',
-        path: '/api/projects',
-      }),
+        path: `/api/projects${qs}`,
+      })
+    },
     createProject: (name, id) =>
       requestJson<Project>({
         fetch: doFetch,
@@ -455,6 +486,24 @@ export const createFetchServerPersistAdapter = (opts: FetchAdapterOptions): Serv
         throw error
       }
     },
+    // Phase 2 归档:archive/unarchive 端点空 body,无 If-Match(无 baseRevision);返更新后 Project/CanvasMeta。
+    //   幂等:server 对已归档/已 active → 200 no-op(无需 404 处理,archive 不在不存在资源上幂等)。
+    archiveProject: (id) =>
+      requestJson<ArchiveProjectResponse>({
+        fetch: doFetch,
+        baseUrl,
+        getAuthHeaders,
+        method: 'POST',
+        path: `/api/projects/${encodeURIComponent(id)}/archive`,
+      }),
+    unarchiveProject: (id) =>
+      requestJson<ArchiveProjectResponse>({
+        fetch: doFetch,
+        baseUrl,
+        getAuthHeaders,
+        method: 'POST',
+        path: `/api/projects/${encodeURIComponent(id)}/unarchive`,
+      }),
 
     // ── canvas-meta(hydrate 读路径;写路径 node/edge/anchor 走 G1-c seam)──
     fetchCanvas: async (canvasId) => {
@@ -471,8 +520,12 @@ export const createFetchServerPersistAdapter = (opts: FetchAdapterOptions): Serv
         throw error
       }
     },
-    listCanvas: (projectId) => {
-      const qs = projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''
+    listCanvas: (projectId, opts) => {
+      // CR-8:projectId + includeArchived 组合 query(server canvas 列表同样支持 includeArchived 过滤)。
+      const params: string[] = []
+      if (projectId) params.push(`projectId=${encodeURIComponent(projectId)}`)
+      if (opts?.includeArchived) params.push('includeArchived=true')
+      const qs = params.length > 0 ? `?${params.join('&')}` : ''
       return requestJson<ListCanvasResponse>({
         fetch: doFetch,
         baseUrl,
@@ -527,6 +580,22 @@ export const createFetchServerPersistAdapter = (opts: FetchAdapterOptions): Serv
         throw error
       }
     },
+    archiveCanvas: (id) =>
+      requestJson<ArchiveCanvasResponse>({
+        fetch: doFetch,
+        baseUrl,
+        getAuthHeaders,
+        method: 'POST',
+        path: `/api/canvas/${encodeURIComponent(id)}/archive`,
+      }),
+    unarchiveCanvas: (id) =>
+      requestJson<ArchiveCanvasResponse>({
+        fetch: doFetch,
+        baseUrl,
+        getAuthHeaders,
+        method: 'POST',
+        path: `/api/canvas/${encodeURIComponent(id)}/unarchive`,
+      }),
 
     // ── canvas-domain 写(G1-c 接线;lead 授权方案 A。A2-S3 全 7 写口真发)──
     // create:baseRevision undefined → POST :nodeId/:edgeId/:anchorId,CreateBody{clientId=record.id,type,payload=

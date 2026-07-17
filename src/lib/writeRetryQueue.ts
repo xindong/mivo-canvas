@@ -27,6 +27,7 @@ import type {
   EdgePayload,
   LegacyReplaceRequest,
   NodePayload,
+  RecordStatus,
   Revision,
   ServerInvariantCommand,
 } from '../../shared/persist-contract.ts'
@@ -187,6 +188,10 @@ export type WriteOpKind =
   | 'createCanvas'
   | 'updateCanvas'
   | 'deleteCanvas'
+  | 'archiveCanvas'
+  | 'unarchiveCanvas'
+  | 'archiveProject'
+  | 'unarchiveProject'
   | 'attachAsset'
   | 'detachAsset'
 
@@ -209,12 +214,24 @@ export type WriteOp =
   | { kind: 'deleteChatMessage'; canvasId: string; msgId: string }
   | { kind: 'putUserState'; key: string; value: unknown; baseRevision?: Revision }
   | { kind: 'deleteUserState'; key: string }
-  | { kind: 'createProject'; name: string; id?: string }
+  | { kind: 'createProject'; name: string; id?: string; status?: RecordStatus }
   | { kind: 'updateProject'; projectId: string; name: string; baseRevision?: Revision }
   | { kind: 'deleteProject'; projectId: string }
-  | { kind: 'createCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string }
+  | { kind: 'createCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string; status?: RecordStatus }
   | { kind: 'updateCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string; baseRevision?: Revision }
   | { kind: 'deleteCanvas'; canvasId: string }
+  // Phase 2 归档(回收站):archive/unarchive 走写队列(CR-7,断网归档不丢)。resourceKey 与 create/update/delete
+  //   同资源一致 → 同资源归档态写经 combineOps 合并(D2:create+archive/unarchive→skip-coalesce(保留独立 transition
+  //   op,不折进 create(status);P1 三审)/ archive+unarchive 互消(已 attempted 时也 skip-coalesce 防 lost-response
+  //   分叉;P1 四审)/ archive+delete→delete last-wins)。幂等:server 对已归档再 archive → 200 no-op。不入 isDeleteKind
+  //   (archive 返 200,非 404-idempotent-success);无 baseRevision(archive 端点空 body,无 If-Match,无 428/409)。
+  //   P1-2 barrier:archiveProject 携带 canvasIds?(client-side 快照,非 wire 字段——server 不收;enqueue 时从
+  //   store.canvases 收集该 project 的 active 子画布 id)。供 due-filter barrier 判定 earlier 子写是否撞本
+  //   archive 级联归档后的 CR-6 409。undefined(旧 record/未携带)→ barrier 退化不挡(no-op)。
+  | { kind: 'archiveCanvas'; canvasId: string }
+  | { kind: 'unarchiveCanvas'; canvasId: string }
+  | { kind: 'archiveProject'; projectId: string; canvasIds?: string[] }
+  | { kind: 'unarchiveProject'; projectId: string }
   | { kind: 'attachAsset'; canvasId: string; assetId: string; nodeId: string }
   | { kind: 'detachAsset'; canvasId: string; assetId: string; nodeId: string }
 
@@ -228,12 +245,24 @@ export type WriteOp =
 export type NonCanvasWriteOp =
   | { kind: 'putUserState'; key: string; value: unknown; baseRevision?: Revision }
   | { kind: 'deleteUserState'; key: string }
-  | { kind: 'createProject'; name: string; id?: string }
+  | { kind: 'createProject'; name: string; id?: string; status?: RecordStatus }
   | { kind: 'updateProject'; projectId: string; name: string; baseRevision?: Revision }
   | { kind: 'deleteProject'; projectId: string }
-  | { kind: 'createCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string }
+  | { kind: 'createCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string; status?: RecordStatus }
   | { kind: 'updateCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string; baseRevision?: Revision }
   | { kind: 'deleteCanvas'; canvasId: string }
+  // Phase 2 归档(回收站):archive/unarchive 走写队列(CR-7,断网归档不丢)。resourceKey 与 create/update/delete
+  //   同资源一致 → 同资源归档态写经 combineOps 合并(D2:create+archive/unarchive→skip-coalesce(保留独立 transition
+  //   op,不折进 create(status);P1 三审)/ archive+unarchive 互消(已 attempted 时也 skip-coalesce 防 lost-response
+  //   分叉;P1 四审)/ archive+delete→delete last-wins)。幂等:server 对已归档再 archive → 200 no-op。不入 isDeleteKind
+  //   (archive 返 200,非 404-idempotent-success);无 baseRevision(archive 端点空 body,无 If-Match,无 428/409)。
+  //   P1-2 barrier:archiveProject 携带 canvasIds?(client-side 快照,非 wire 字段——server 不收;enqueue 时从
+  //   store.canvases 收集该 project 的 active 子画布 id)。供 due-filter barrier 判定 earlier 子写是否撞本
+  //   archive 级联归档后的 CR-6 409。undefined(旧 record/未携带)→ barrier 退化不挡(no-op)。
+  | { kind: 'archiveCanvas'; canvasId: string }
+  | { kind: 'unarchiveCanvas'; canvasId: string }
+  | { kind: 'archiveProject'; projectId: string; canvasIds?: string[] }
+  | { kind: 'unarchiveProject'; projectId: string }
   | { kind: 'attachAsset'; canvasId: string; assetId: string; nodeId: string }
   | { kind: 'detachAsset'; canvasId: string; assetId: string; nodeId: string }
   | { kind: 'appendChatMessage'; canvasId: string; message: unknown }
@@ -250,6 +279,10 @@ const NON_CANVAS_KINDS: ReadonlySet<WriteOpKind> = new Set<WriteOpKind>([
   'createCanvas',
   'updateCanvas',
   'deleteCanvas',
+  'archiveCanvas',
+  'unarchiveCanvas',
+  'archiveProject',
+  'unarchiveProject',
   'attachAsset',
   'detachAsset',
   'appendChatMessage',
@@ -488,10 +521,14 @@ const computeResourceKey = (op: WriteOp): string | null => {
       return op.id ? `project:${op.id}` : `project:name:${op.name}`
     case 'updateProject':
     case 'deleteProject':
+    case 'archiveProject':
+    case 'unarchiveProject':
       return `project:${op.projectId}`
     case 'createCanvas':
     case 'updateCanvas':
     case 'deleteCanvas':
+    case 'archiveCanvas':
+    case 'unarchiveCanvas':
       return `canvas:${op.canvasId}`
     case 'attachAsset':
       return `asset-attach:${op.assetId}:${op.canvasId}:${op.nodeId}`
@@ -690,19 +727,40 @@ const stableTopologicalSort = (due: QueuedWrite[]): QueuedWrite[] => {
  *  - create+delete → 净消(资源从未服务端创建,delete 无意义)。
  *  - 其余(update+update / update+delete / delete+delete / delete+update)→ last-wins(incoming)。
  *    create+create 同 id 正常 store 流不会发生(createProject 每次新 mint id);若发生也 last-wins。
+ *
+ * P1(四审 lost-response attempted-gate):destructive coalesce(create+update 字段合并 / create+delete 净消 /
+ *   archive↔unarchive 互消)只有在 existing 记录“从未发送”(existingAttempted=false,lastAttemptAt===undefined)时
+ *   才允许。existing 已尝试过(existingAttempted=true,即已 POST 落 server、仅响应丢失回到 pending)时,destructive
+ *   coalesce 会静默吞真实后继意图(create 已落 server→delete 净消→server 存活他端复活;archive↔unarchive 净消两条
+ *   →server 保持首态 client 保持反向乐观态永久分叉;create+update 折回 create 换新 idempotencyKey→POST 命中 live
+ *   existing,backend 返旧 record 不 rename→rename 静默吞)。已尝试一律 'skip-coalesce':existing 原封不动(原
+ *   idempotencyKey 是 replay 证据,attempts/lastAttemptAt 不重置),incoming 走新建 record,同 resourceKey 前驱屏障
+ *   + 幂等重放按 seq 顺序处理(existing 先 drain 幂等重放,incoming 后 drain 真生效)。last-wins 分支(update+update
+ *   等)不受 gate 影响——incoming(最新意图)语义上覆盖前驱,重放 incoming 即正确。
  */
-const combineOps = (existing: WriteOp, incoming: WriteOp): WriteOp | 'cancel' => {
+const combineOps = (
+  existing: WriteOp,
+  incoming: WriteOp,
+  existingAttempted: boolean,
+): WriteOp | 'cancel' | 'skip-coalesce' => {
   const ek = existing.kind
   const ik = incoming.kind
   // create+update → 保留 create kind,合并到最终 body(防 create 被 update 替换致服务端从未 POST)
   if (ek === 'createProject' && ik === 'updateProject') {
-    return { kind: 'createProject', name: incoming.name, id: existing.id ?? incoming.projectId }
+    // P1(四审 lost-response):前驱 create 已 POST 落 server、仅响应丢失 → 不折回 create(换新 idempotencyKey 会
+    //   命中 live existing,backend 返旧 record 不 rename → rename 静默吞)。skip-coalesce 保留 existing 原封不动
+    //   (原 idempotencyKey 作 replay 证据),update 独立 enqueue 后 drain 真 PATCH rename。
+    if (existingAttempted) return 'skip-coalesce'
+    // P1-1(#3 返修):字段级保留 existing.status(先前 create+archive 合并得的 archived 不被 update 静默丢回 active)。
+    return { kind: 'createProject', name: incoming.name, id: existing.id ?? incoming.projectId, ...(existing.status !== undefined ? { status: existing.status } : {}) }
   }
   if (ek === 'createCanvas' && ik === 'updateCanvas') {
+    if (existingAttempted) return 'skip-coalesce' // 同上(lost-response:不折回 create,保留独立 update 真 PATCH)
     // R3 F1:field-wise merge — 保留 create 独有/未改字段( notably sourceTemplateId)。
     // 生产 rename(只带 title)/move(只带 projectId)的 update 不带 sourceTemplateId,
     // 旧实现只用 incoming 重建 create 致 sourceTemplateId 被静默丢弃。现按字段级合并:
     // incoming 显式携带 → 用 incoming(可改);incoming 未带 → 保留 existing(不丢 create 独有字段)。
+    // P1-1(#3 返修):同保留 existing.status(防 create+archive→create(archived) 后再 update 把 status 丢回 active)。
     return {
       kind: 'createCanvas',
       canvasId: existing.canvasId,
@@ -717,13 +775,297 @@ const combineOps = (existing: WriteOp, incoming: WriteOp): WriteOp | 'cancel' =>
         : existing.sourceTemplateId !== undefined
           ? { sourceTemplateId: existing.sourceTemplateId }
           : {}),
+      ...(existing.status !== undefined ? { status: existing.status } : {}),
     }
   }
-  // create+delete → 净消(资源从未服务端创建,delete 无意义)
-  if (ek === 'createProject' && ik === 'deleteProject') return 'cancel'
-  if (ek === 'createCanvas' && ik === 'deleteCanvas') return 'cancel'
-  // 其余组合:last-wins(update+update / update+delete / delete+delete / delete+update / create+create)
+  // create+delete → 净消(资源从未服务端创建,delete 无意义)。P1(四审 lost-response):前驱 create 已 POST 落 server
+  //   (仅响应丢失)时不得 cancel——delete 被净消 → server 存活 → 他端复活;本地 tombstone 只本地遮盖。
+  //   attempted → skip-coalesce:create 先 drain 幂等重放(server 对 live existing 返 existing 不重创),delete 后 drain 真 DELETE。
+  if (ek === 'createProject' && ik === 'deleteProject') return existingAttempted ? 'skip-coalesce' : 'cancel'
+  if (ek === 'createCanvas' && ik === 'deleteCanvas') return existingAttempted ? 'skip-coalesce' : 'cancel'
+  // D2(Phase 2 归档 combineOps,P1 三审返修:create+archive/unarchive 不再折成 create(status)):
+  //  - create+archive/unarchive → skip-coalesce(下方 isStateTransition 条件,保留独立 transition record)。
+  //    旧实现折成 create(status:'archived'/'active')把 archiveProject/archiveCanvas op coalesce 删掉 →
+  //    archiveProjectTree 级联永不跑 + lost-response 分叉:server ensureCreate 对 live existing 返原 record 不
+  //    应用 incoming status(backend.ts existing → clone(existing)),executor createProject 直接 success /
+  //    createCanvas 只比 title|projectId 不比 status → create 首次落 active、响应丢失后 archive 入队,coalesced
+  //    retry 报 success 但 server 仍 active,client 乐观全 archived → 永久分叉 + 漏级联子画布(违反 CR-5/D3)。
+  //    且 archive op 在 coalesce 时就被删,archive barrier / 同 resourceKey 前驱屏障都没机会排序(绕过 barrier)。
+  //    skip-coalesce 后保留独立 transition op:同 resourceKey 前驱屏障(createProject↔archiveProject 同 project:p1
+  //    排序)+ archiveProject canvasIds barrier(isArchiveBlockedByEarlierWrite 覆盖 createCanvas:createCanvas ∈
+  //    NON_CANVAS_KINDS → isNonCanvasWriteOp=true → opTargetsCanvasId 命中 c1 → 挡,等 createCanvas drain success
+  //    再放 archiveProject)排序:create 先 drain → server 落 active → archive 后 drain POST /archive → server
+  //    archiveProjectTree 级联归档子画布 → client/server 一致 archived。
+  //  - archive+unarchive → 互消(cancel;归档→撤销归档,净态回原状,不发请求;两方向对称)。
+  //  - delete+archive/unarchive → delete 赢(return existing):删终态压过归档态;归档一个正被删的资源无意义,
+  //    保 delete 不让 archive/unarchive 复活删除意图(last-wins 会返 incoming archive → 删除被替换为归档,bug)。
+  //  - archive/unarchive+delete(incoming)= delete 走下方默认 last-wins(incoming delete 胜,无需显式)。
+  // P1(四审 lost-response):archive↔unarchive 首个 transition 已 POST 落 server(仅响应丢失)时不得 cancel——
+  //   反向操作净消两条 → server 保持首态、client 保持反向乐观态 → 永久分叉。attempted → skip-coalesce:
+  //   前驱 transition 先 drain 幂等重放(server 对已归档/已激活再 archive/unarchive → 200 no-op),
+  //   反向 transition 后 drain 真转 → 终态与 client 乐观一致。
+  if (ek === 'archiveProject' && ik === 'unarchiveProject') return existingAttempted ? 'skip-coalesce' : 'cancel'
+  if (ek === 'unarchiveProject' && ik === 'archiveProject') return existingAttempted ? 'skip-coalesce' : 'cancel'
+  if (ek === 'archiveCanvas' && ik === 'unarchiveCanvas') return existingAttempted ? 'skip-coalesce' : 'cancel'
+  if (ek === 'unarchiveCanvas' && ik === 'archiveCanvas') return existingAttempted ? 'skip-coalesce' : 'cancel'
+  if (ek === 'deleteProject' && (ik === 'archiveProject' || ik === 'unarchiveProject')) return existing
+  if (ek === 'deleteCanvas' && (ik === 'archiveCanvas' || ik === 'unarchiveCanvas')) return existing
+  // P1-1(#1/#2 返修)+ P1(三审):一侧 state-transition,另一侧 create 或 meta-update → skip-coalesce(不合并
+  //   为单槽,保留两条有序 op 按 seq 顺序重放:队列本支持多 op;coalesce 只是优化不是必须)。防 last-wins
+  //   静默丢一侧意图:
+  //   - create+transition(三审):见上方 D2 注释——保留独立 transition op 让 archiveProjectTree 级联跑 +
+  //     barrier 排序,修 lost-response 分叉 + 漏级联。
+  //   - unarchive+update:last-wins→update 丢 unarchive → 幸存 update 打到仍 archived 服务端 → CR-6 409 →
+  //     terminal 删除 → 写永久丢失,client active+新名/server 仍 archived 永久分叉。skip-coalesce→unarchive 先
+  //     drain(status→active)→update 后 drain(meta 落 active,不 409)→双意图落地。
+  //   - archive+update:last-wins→update 丢 archive → client 乐观 archived/server active+update 分叉。skip-coalesce→
+  //     archive 先 drain(archived)→update 后 drain(409 stale terminal,P1-2 "archive 之后 stale 写应 409" 正确)。
+  //   - update+archive / update+unarchive(反向):skip-coalesce→update 先 drain(meta)→archive/unarchive 后 drain
+  //     (status)→双意图落地(顺带修既有 update+archive→archive 胜丢 rename 的取舍:rename 先落,archive 后)。
+  //   注:create+meta-update(createProject+updateProject / createCanvas+updateCanvas)不走此——上方合并到 create
+  //     body(保留 create kind,防服务端从未 POST);create+transition 才走此 skip(transition 是 status 转移非
+  //     meta 合并,折进 create 会丢 transition op + 绕过 barrier);
+  //   archive/unarchive+delete 不走此(delete 终态压过归档,上方 return existing 正确);
+  //   archive+unarchive 不走此(互消 cancel,上方);update+update 仍 last-wins(同意图后者胜,不丢意图)。
+  const isCreate = (k: WriteOpKind): boolean => k === 'createProject' || k === 'createCanvas'
+  const isStateTransition = (k: WriteOpKind): boolean =>
+    k === 'archiveProject' || k === 'unarchiveProject' || k === 'archiveCanvas' || k === 'unarchiveCanvas'
+  const isMetaUpdate = (k: WriteOpKind): boolean => k === 'updateProject' || k === 'updateCanvas'
+  // 一侧 state-transition,另一侧 create 或 meta-update(双向)→ skip-coalesce。
+  if (
+    (isStateTransition(ek) && (isCreate(ik) || isMetaUpdate(ik))) ||
+    ((isCreate(ek) || isMetaUpdate(ek)) && isStateTransition(ik))
+  ) {
+    return 'skip-coalesce'
+  }
+  // 其余组合:last-wins(update+update / update+delete / delete+delete / delete+update / create+create /
+  //   archive+archive / unarchive+unarchive 等;state-transition+update 已上方 skip-coalesce 接走)。
   return incoming
+}
+
+// ── P1-2(Phase 2 归档 barrier):archive op 在 due-filter 阶段延后,等 earlier 同资源写先 drain ──────────────
+//
+// 问题(lead P1-2):archive op 与 seq 更小的 earlier 同资源写竞争时,若 earlier 写因 transient backoff 推迟
+//   nextAttemptAt,archive 的 nextAttemptAt 先到 → archive 抢先 drain 成功(archived)→ earlier 写后 drain 到
+//   server 撞 CR-6 409 archived → classifyHttpStatus(409,isDelete=false)→ rejected terminal → deleteWrite
+//   永久丢弃(确定性丢数据)。
+//
+// 修法(due-filter barrier):archive op(archiveCanvas/Project)在进 due set 前检查是否有 seq 更小的 earlier
+//   非终态写指向同资源(archiveCanvas → 同 canvasId;archiveProject → canvasIds 快照中的子画布)。若有,archive
+//   不进 due set(延后 drain),等 earlier 写先 drain 成功落库(active 态),archive 再 drain → earlier 写不会
+//   撞 409。下轮 drain:earlier 写已 success 出队(不在 all)→ barrier 不再挡 → archive 进 due 正常 drain。
+//
+// 精确语义(必答 1/2 论证,供回报):
+// 必答 1 —— barrier scope(node/edge/anchor 是否进 scope):
+//  (a) 进 scope:node/edge/anchor/reorder/chat/attachAsset/detachAsset/updateCanvas **会进 writeRetryQueue 拿 seq**
+//      (enqueuePersistWrite → nextSeqAndPutWrite → 持久 seq),进 due set,drain 时**真发 server**:
+//      - 三类 legacy(upsertNode/deleteNode/reorderChildren[非 chat])→ migrateLegacyOp !== null → drainMigrated
+//        真发 PATCH/DELETE/POST /api/canvas/:canvasId/... → authzCanvas('write')→ CR-6 409 on archived → terminal 丢。
+//      - chat(append/update/delete)+ attachAsset/detachAsset + updateCanvas → isNonCanvasWriteOp(wired)→ 真发
+//        server → authzCanvas('write'/'move')或 resolveCanvasAccess('write')→ CR-6 409 → terminal 丢。
+//      故 barrier **必须**覆盖这些 op(earlier seq < archive.seq 且指向同 canvas 时挡 archive)。
+//  (b) 不进 scope:upsertEdge/upsertAnchor/deleteEdge/deleteAnchor → migrateLegacyOp 返 null + 非 NonCanvasWriteOp
+//      → executor 返 unsupported-retained → drain 标 **deferred 留存不发请求** → 不可能撞 server 409 → 不丢。
+//      barrier **不挡**它们(若挡 → deferred 永不 success → archive 永久卡死)。判定依据:`!isNonCanvasWriteOp(rop)
+//      && migrateLegacyOp(rop) === null` → continue(不挡),精确镜像 executor 的 "会发 vs 不发" 分界。
+//   → 故"不入 due = 天然不挡"对 deferred 的 edge/anchor 成立(它们不发);对 live 的 node/reorder/chat/asset 不成立
+//      (它们发)→ 必须显式纳入 barrier scope。本实现已纳入(isNonCanvasWriteOp || migrateLegacyOp !== null)。
+//   注:project-meta 写(updateProject/deleteProject on archived project)不进 scope——server routes/projects.ts
+//      PATCH /:id 无 CR-6 409 guard(归档项目可 rename,不 409)→ 无丢数据风险 → 不挡(挡了反而无谓延后 archive)。
+//
+// 必答 2(i) —— archive 延后期间留在 durable queue 不被丢/combine 吃:
+//  - barrier **不改 archive status**(仍 pending),仅 due-filter 排除 → archive 仍在 durable IDB pending,getAllWrites
+//    可见,不被丢。代码依据:本函数只返 bool,due-filter 用其排除 record(drain 行 1980 `.filter`),不调 deleteWrite/putWrite。
+//  - combine 吃:同资源后续 enqueue → combineOps:archive+meta-update skip-coalesce(P1-1,不合并)、archive+unarchive
+//    互消 cancel、create+archive→create(archived)、delete+archive→delete last-wins。archive op 不被静默合并吃
+//    (skip-coalesce 保证两 op 保留)。代码依据:combineOps 行 799-816 skip-coalesce + 行 793-798 cancel/existing。
+//  - overflow 驱逐:doEnqueue 行 1806-1842 在 256 满时驱逐 oldest pending(by createdAt/seq)。archive 通常是用户主动
+//    操作(最近 enqueue,createdAt 新)非 oldest;极端 256 满 + archive 恰 oldest 理论可驱逐——overflow 是极端
+//    backstop(256 队列满才触发),非 P1-2 场景,注释说明,不加保护(加保护会复杂化 overflow 的 oldest-evict 语义)。
+//
+// 必答 2(ii) —— archive 不因"久未 due"被 age-out/dead-letter 误清:
+//  - queue **无 age-out 机制**(无按时间清 pending 的逻辑;只有 overflow 驱逐 + maxAttempts dead-letter 两条出队路径)。
+//  - barrier 让 archive 不 due → 不执行 executor → attempts 不加 → 不达 maxAttempts(8)→ 不 dead-letter。
+//    代码依据:dead-letter 在 drain 行 ~maxAttempts 判定(仅 drain 执行的 record 才加 attempts);archive 不进 due
+//    → 不进 drain loop → attempts 恒 0 → 永不 dead-letter。
+//  - archive 留 pending 直到 earlier 写 drain success(出队→解锁)或 terminal(出队→解锁)或 paused-401 re-auth
+//    后 earlier 写 drain → 解锁。永久 paused-401 → archive 永驻 IDB(re-auth 解锁,lead 裁定可接受)。
+//    代码依据:earlier 写 outcome 由 drain switch 处理(success/terminal → deleteWrite 出队 → 不在 all → 下轮 barrier
+//    不挡;transient → backoff pending → 仍挡;paused-401 → 留存挡直到 re-auth)。
+
+/** archive 受保护 canvas 集合(archiveCanvas → {canvasId};archiveProject → canvasIds 快照;否则 null)。 */
+const archiveProtectedCanvasIds = (op: WriteOp): Set<string> | null => {
+  if (op.kind === 'archiveCanvas') return new Set([op.canvasId])
+  if (op.kind === 'archiveProject') return op.canvasIds !== undefined ? new Set(op.canvasIds) : null
+  return null
+}
+
+/** earlier 写 op 是否指向某 canvasId(用于判断 earlier 写是否撞 archive 的受保护 canvas)。 */
+const opTargetsCanvasId = (op: WriteOp, canvasId: string): boolean => {
+  switch (op.kind) {
+    case 'upsertNode':
+    case 'deleteNode':
+    case 'upsertEdge':
+    case 'deleteEdge':
+    case 'upsertAnchor':
+    case 'deleteAnchor':
+    case 'reorderChildren':
+    case 'appendChatMessage':
+    case 'updateChatMessage':
+    case 'deleteChatMessage':
+    case 'createCanvas':
+    case 'updateCanvas':
+    case 'deleteCanvas':
+    case 'archiveCanvas':
+    case 'unarchiveCanvas':
+    case 'attachAsset':
+    case 'detachAsset':
+      return op.canvasId === canvasId
+    default:
+      // project-meta / user-state op 不携带 canvasId → 不指向任一 canvas(不挡,见必答 1 注:project-meta 无 409)。
+      return false
+  }
+}
+
+/**
+ * P1-2 barrier:archive op 是否被 seq 更小的 earlier 非终态写阻塞(延后 archive drain)。
+ * 调用点:drain due-filter。返回 true → archive 不进 due set(延后);false → 正常进 due。
+ * 只挡会真正 drain 到 server 的 earlier 写(isNonCanvasWriteOp wired OR migrateLegacyOp !== null 三类 legacy);
+ * deferred 留存的写(edge/anchor executor 不发)不挡(防永久卡死 archive)。
+ */
+const isArchiveBlockedByEarlierWrite = (
+  archiveRec: QueuedWrite,
+  all: QueuedWrite[],
+  userId: string,
+): boolean => {
+  const op = archiveRec.op
+  if (op.kind !== 'archiveCanvas' && op.kind !== 'archiveProject') return false
+  const protectedCanvasIds = archiveProtectedCanvasIds(op)
+  // archiveProject canvasIds 缺失(旧 record / 未携带)→ 无法判定 → 退化不挡(no-op,注释见类型定义)。
+  // 空集合(project 无 active 子画布)→ 无 earlier 子写可挡 → no-op。
+  if (protectedCanvasIds === null || protectedCanvasIds.size === 0) return false
+
+  const archiveSeq = archiveRec.seq ?? 0
+  for (const r of all) {
+    if (r.id === archiveRec.id) continue
+    if (r.userId !== userId) continue // per-user 隔离(同 pendingCount/getPendingDeleteResourceIds 约定)
+    // 只挡 seq < archive.seq 的 earlier 写(archive 后入队的才延后;archive seq 小 → archive 先 drain 正确,
+    //   其后的 later 写吃 409 terminal 是 P1-1 skip-coalesce 已确认的预期"archive 之后 stale 写应 409")。
+    if ((r.seq ?? 0) >= archiveSeq) continue
+    // 只挡会真正 drain 到 server 的非终态写;deferred(edge/anchor 不发)/ 终态(已出队不在 all)不挡。
+    //   in-flight 含入挡集:cross-tab 同 user 的 in-flight(drain recovery pass 未 flip 的边界)→ 等 其 outcome。
+    //   P1-2(二审 gate-blocked 可达性):gate-blocked **不挡**(legacy op 撞 LEGACY_DRAIN 关 400,parked;
+    //     可达性 = pre-G1-a IDB 残留 legacy + LEGACY_DRAIN 默认关;新用户/清 IDB 不可达。若挡 → archive 永久饿死)。
+    //     archive 越过 gate-blocked legacy 时由 drain success 分支的 terminalizeGateBlockedLegacyOnArchivedCanvas
+    //     显式终态化(rejected + fail-visible 日志),防开闸后静默 409 丢(lead 裁定:不留在 park 等开闸 409)。
+    const rstatus = r.status
+    if (
+      rstatus !== 'pending' &&
+      rstatus !== 'paused-401' &&
+      rstatus !== 'in-flight'
+    ) continue
+    const rop = r.op
+    // 会发 server = wired(NonCanvasWriteOp)OR 三类 legacy(migrateLegacyOp !== null)。其余(deferred)不发 → 不挡。
+    if (!isNonCanvasWriteOp(rop) && migrateLegacyOp(rop) === null) continue
+    for (const cid of protectedCanvasIds) {
+      if (opTargetsCanvasId(rop, cid)) return true
+    }
+  }
+  return false
+}
+
+// ── P1-1(A) 返修(二审根因):同 resourceKey 低 seq 活跃前驱屏障 ──────────────────────────────
+//
+// 根因(二审):P1-1 skip-coalesce 让单 resourceKey 可有多条 pending(archive+update / unarchive+update 等有序
+//   保留)。但 drain 不变式没跟上:若 earlier 写(seq 小)transient backoff 推迟 nextAttemptAt,later 写(seq 大)
+//   nextAttemptAt 先到 → later 抢先 drain → earlier 写后 drain 撞 409 terminal 丢(unarchive transient → update
+//   抢跑撞 archived canvas → 409 丢 update 意图)。本屏障堵此抢跑。
+//
+// 规则:任一 due-eligible record,若存在同 resourceKey + seq 更小 + active(会 drain 的非终态)的前驱 → 本轮
+//   不进 due set(延后),等前驱 success/terminal 出队解锁。最早 seq 无前驱 → 必 drain → 解锁后续 → 无死锁。
+//
+// active 集 = {pending(含 backoff-pending,nextAttemptAt 未来仍 pending),paused-401(会 drain),in-flight(cross-tab
+//   在途,等 outcome)}。**不挡** deferred(edge/anchor executor 不发;且同 resourceKey 的 edge/anchor 经 combineOps
+//   已 coalesce 无多 record → 不存在 deferred 同 resourceKey 前驱 → 不死锁)+ **不挡** gate-blocked(gate-blocked
+//   是 legacy op 走 §14.3,resourceKey 为 node:/reorder: 等,**不与 archive 的 canvas:/project: 同 resourceKey**
+//   → 本屏障天然遇不到 gate-blocked;gate-blocked 跨 resourceKey 影响 archive 由 isArchiveBlockedByEarlierWrite
+//   的 cross-canvas 维度 + P1-2 gate-blocked 修复另处理)+ **不挡** terminal(已出队不在 all)。
+//
+// 与 P1-2 cross-canvas archive barrier(isArchiveBlockedByEarlierWrite)关系:两维度并存(lead 确认)——
+//   本屏障覆盖同 resourceKey(unarchive+update 同 canvas:c1、archive+update 同 canvas:c1 等);
+//   isArchiveBlockedByEarlierWrite 覆盖 archive 跨 resourceKey(archiveCanvas c1 vs upsertNode node:c1:n1 不同
+//   resourceKey 经 canvasId 匹配;archiveProject vs 子画布写)。同 resourceKey 的 archive 场景两屏障都挡(冗余
+//   但无害);cross-resourceKey 仅 archive 屏障挡。
+//
+// 验证不变(lead 要求):archive/transition 之后入队的 stale 写(seq 更大 = later)被 earlier archive(seq 小)
+//   挡 → 等 archive drain → archive success(archived)→ stale 写解锁 → drain → 409 terminal(P1-1 "archive 后
+//   stale 写应 409" 正确,屏障不误挡)。stale 写不被屏障救活——屏障只挡"earlier 前驱未决时 later 抢跑",
+//   earlier archive 已决(archived)后 later 仍 409。
+const isBlockedByEarlierSameResourceWrite = (
+  rec: QueuedWrite,
+  all: QueuedWrite[],
+  userId: string,
+): boolean => {
+  if (rec.resourceKey === null) return false // chat(resourceKey=null)不挡(每条独立 op,无同 resourceKey 前驱)
+  const recSeq = rec.seq ?? 0
+  for (const r of all) {
+    if (r.id === rec.id) continue
+    if (r.userId !== userId) continue
+    if (r.resourceKey !== rec.resourceKey) continue // 同 resourceKey 维度
+    if ((r.seq ?? 0) >= recSeq) continue // 只挡 seq<rec 的 earlier 前驱(rec 是 later)
+    const rstatus = r.status
+    // 只挡 active(会 drain);deferred/gate-blocked/terminal 不挡(见注释:不挡且遇不到)。
+    if (rstatus !== 'pending' && rstatus !== 'paused-401' && rstatus !== 'in-flight') continue
+    return true
+  }
+  return false
+}
+
+/**
+ * P1-2(二审 gate-blocked 修复):archiveCanvas/Project drain success 后,显式终态化该 archived canvas 上的
+ * gate-blocked legacy 写(rejected + fail-visible 日志 + deleteWrite)。防 archive 越过 gate-blocked(已移出阻塞集)
+ * 后,LEGACY_DRAIN 开闸时该 legacy 写 drain 到 archived canvas → 静默 409 terminal 丢(lead:不留 park 等开闸 409)。
+ *
+ * gate-blocked 可达性(lead 问)= pre-G1-a IDB 残留 legacy(upsertNode/deleteNode/reorderChildren)+ LEGACY_DRAIN 默认关;
+ *   观测 12439:无 live legacy enqueuer(当前 build 不 enqueue 画布域 legacy op)→ 新用户/清 IDB 不可达。
+ *   条件可达(老用户残留)→ 走此修复(非 backlog)。
+ *
+ * 范围:gate-blocked + op 为三类 legacy(migrateLegacyOp !== null;wired op 不走 §14.3 gate,不会 gate-blocked)
+ *   + op 指向 archived canvas(archiveCanvas: c1;archiveProject: canvasIds)。post-loop 调用(不在 loop 内,
+ *   防 loop 继续处理已 terminal-ize 的记录致 re-create race)。
+ */
+const terminalizeGateBlockedLegacyOnArchivedCanvas = async (
+  archivedOp: WriteOp,
+  all: QueuedWrite[],
+  userId: string,
+): Promise<number> => {
+  const canvasIds = new Set<string>()
+  if (archivedOp.kind === 'archiveCanvas') {
+    canvasIds.add(archivedOp.canvasId)
+  } else if (archivedOp.kind === 'archiveProject' && archivedOp.canvasIds !== undefined) {
+    for (const cid of archivedOp.canvasIds) canvasIds.add(cid)
+  }
+  if (canvasIds.size === 0) return 0
+  let count = 0
+  for (const r of all) {
+    if (r.userId !== userId) continue
+    if (r.status !== 'gate-blocked') continue
+    const rop = r.op
+    if (migrateLegacyOp(rop) === null) continue // 三类 legacy 才可能是 gate-blocked(wired 不走 §14.3 gate)
+    let hits = false
+    for (const cid of canvasIds) {
+      if (opTargetsCanvasId(rop, cid)) { hits = true; break }
+    }
+    if (!hits) continue
+    debugLogger.warn(
+      SOURCE,
+      `archive pass: terminal-izing gate-blocked legacy ${rop.kind} on archived canvas (P1-2 gate-blocked fix; prevent delayed post-archive 409 loss when LEGACY_DRAIN gate opens): rec=${r.id}`,
+    )
+    await recordTerminal(r, 'rejected', `archived canvas — legacy gate-blocked write terminal-ized at archive pass (canvas archived; LEGACY_DRAIN gate off; prevent delayed 409 loss; P1-2)`)
+    await deleteWrite(r.id)
+    count++
+  }
+  return count
 }
 
 /** Exponential backoff with jitter: min(base * 2^(attempts-1), max) * (0.5..1.0). */
@@ -1657,16 +1999,27 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
     // drains after). A new idempotencyKey is minted because the body changed — reusing
     // the old key with a different body would 422 (idempotency-key-reuse) at the server.
     if (resourceKey !== null) {
-      const existing = all.find(
-        (r) =>
-          r.resourceKey === resourceKey &&
-          r.userId === userId &&
-          (r.status === 'pending' || r.status === 'paused-401'),
-      )
+      // P1-1(B)(二审根因):skip-coalesce 后同 resourceKey 可有多条 pending(archive+update / unarchive+update 等
+      //   有序保留)。配对前驱取同 resourceKey 中 **seq 最大者**(最新意图代表),禁止 all.find 取到更早的错误前驱
+      //   (IDB getAll 按 UUID 主键返回随机序 / reverse UUID 顺序)致误 cancel/误合并跨过中间保留记录。
+      //   例:archive(seq1)+update(seq2)+incoming unarchive(seq3)——max-seq 配 update(seq2)→ skip-coalesce 保留 3 条
+      //   (archive 先 drain archived、update 409 stale、unarchive restore);若误配 archive(seq1)→ archive+unarchive
+      //   误 cancel 跨过 update(seq2)→ update 被错误保留/丢失。max-seq 按 seq 确定,不依赖 IDB 返回序。
+      let existing: QueuedWrite | undefined
+      for (const r of all) {
+        if (r.resourceKey !== resourceKey || r.userId !== userId) continue
+        if (r.status !== 'pending' && r.status !== 'paused-401') continue
+        if (!existing || (r.seq ?? 0) > (existing.seq ?? 0)) existing = r
+      }
       if (existing) {
         // G1-a R2 F1:kind-aware 组合(create+update 合并保留 create / create+delete 净消),
         // 不再无差别 `existing.op = op`(会把 pending create 替换成 update 致服务端从未 POST)。
-        const combined = combineOps(existing.op, op)
+        // P1(四审 lost-response):existing 已尝试过(lastAttemptAt !== undefined = 已 POST 落 server、仅响应丢失回到
+        //   pending)时,destructive coalesce(cancel/字段合并)会吞真实后继意图 → combineOps 内 attempted-gate
+        //   返 skip-coalesce,existing 原封不动(原 idempotencyKey 作 replay 证据),incoming 走下方新建 record
+        //   按 seq 顺序重放。未发送(lastAttemptAt === undefined)保持原 destructive 行为。
+        const existingAttempted = existing.lastAttemptAt !== undefined
+        const combined = combineOps(existing.op, op, existingAttempted)
         if (combined === 'cancel') {
           await deleteWrite(existing.id)
           debugLogger.log(
@@ -1675,21 +2028,35 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
           )
           return existing.id
         }
-        existing.op = combined
-        // P1-2(2026-07-16 demo-seed-migration-skip):coalesce 时 migration 标志按 incoming 收窄——
-        //   existing.migration && (opts?.migration ?? false)。只有双方都是 migration 才保持 true;任一侧是
-        //   用户写(非 migration)即降 false(用户语义优先)——否则 migration record pending 期间用户 rename 同
-        //   资源,合并后仍 migration=true → drain terminal 走 termLog WARN + 不弹 toast(用户主动操作失败被
-        //   静默降级)。降 false 后恢复 ERROR + toast(drain switch 的 termLog/termToast 按 rec.migration 分流)。
-        existing.migration = existing.migration && (opts?.migration ?? false)
-        existing.idempotencyKey = newKey()
-        existing.attempts = 0
-        existing.nextAttemptAt = ts
-        existing.lastError = undefined
-        existing.lastAttemptAt = undefined
-        await putWrite(existing)
-        debugLogger.log(SOURCE, `coalesced write ${resourceKey} (superseded pending ${existing.id})`)
-        return existing.id
+        if (combined === 'skip-coalesce') {
+          // P1-1 返修:state-transition + meta update 不合并,保留两条有序 op(existing 留存 pending,
+          //   incoming 走下方新建 record,按 seq 顺序重放:existing 先 createdAt/seq 先 drain,incoming 后 drain)。
+          //   防 last-wins 静默丢一侧意图(见 combineOps 注释)。fall through 到 overflow 检查 + 新建 record 路径。
+          // P1(四审):existing 已 attempted(lastAttemptAt !== undefined,lost-response)也走 skip-coalesce——
+          //   destructive cancel/字段合并会吞真实后继意图,故保留 existing 原封不动(原 idempotencyKey 作 replay 证据)。
+          debugLogger.log(
+            SOURCE,
+            existingAttempted
+              ? `skip-coalesce ${resourceKey} (attempted predecessor: lastAttemptAt set → lost-response; preserve existing ${existing.id} idempotencyKey/attempts as replay evidence; new record for incoming; drain in seq order)`
+              : `skip-coalesce ${resourceKey} (state-transition + meta update: keep both as ordered ops; existing ${existing.id} stays, new record for incoming)`,
+          )
+        } else {
+          existing.op = combined
+          // P1-2(2026-07-16 demo-seed-migration-skip):coalesce 时 migration 标志按 incoming 收窄——
+          //   existing.migration && (opts?.migration ?? false)。只有双方都是 migration 才保持 true;任一侧是
+          //   用户写(非 migration)即降 false(用户语义优先)——否则 migration record pending 期间用户 rename 同
+          //   资源,合并后仍 migration=true → drain terminal 走 termLog WARN + 不弹 toast(用户主动操作失败被
+          //   静默降级)。降 false 后恢复 ERROR + toast(drain switch 的 termLog/termToast 按 rec.migration 分流)。
+          existing.migration = existing.migration && (opts?.migration ?? false)
+          existing.idempotencyKey = newKey()
+          existing.attempts = 0
+          existing.nextAttemptAt = ts
+          existing.lastError = undefined
+          existing.lastAttemptAt = undefined
+          await putWrite(existing)
+          debugLogger.log(SOURCE, `coalesced write ${resourceKey} (superseded pending ${existing.id})`)
+          return existing.id
+        }
       }
     }
 
@@ -1826,6 +2193,9 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
     let successes = 0
     let failures = 0
     let terminals = 0
+    // P1-2(二审 gate-blocked):收集本 drain 成功的 archiveCanvas/archiveProject op,post-loop 终态化其 canvas
+    //   上的 gate-blocked legacy 写(防 archive 越过 gate-blocked 后开闸静默 409 丢)。
+    const archivedThisDrain: WriteOp[] = []
     try {
       const userId = getPersistUserId()
       const ts = now()
@@ -1881,6 +2251,15 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
             (r.status === 'pending' || r.status === 'paused-401' || r.status === 'gate-blocked') &&
             r.nextAttemptAt <= ts,
         )
+        // P1-2(Phase 2 归档 barrier):archive op 若被 seq 更小的 earlier 同资源非终态写阻塞 → 延后 drain
+        //   (不进 due set),防 archive 抢先 drain 成功后 earlier 写吃 CR-6 409 terminal 丢。见 isArchiveBlockedByEarlierWrite。
+        //   barrier 只挡会真发 server 的 earlier 写(wired + 三类 legacy);deferred(edge/anchor 不发)不挡(防永久卡死)。
+        .filter((r) => !isArchiveBlockedByEarlierWrite(r, all, userId))
+        // P1-1(A)(二审根因):同 resourceKey 低 seq 活跃前驱屏障 — skip-coalesce 后单 resourceKey 可有多条 pending,
+        //   防 later(seq 大)在 earlier(seq 小)transient backoff 推迟 nextAttemptAt 时抢先 drain 撞 409 terminal 丢
+        //   (unarchive transient → update 抢跑撞 archived → 409 丢 update)。earlier 出队(success/terminal)→ later 解锁。
+        //   只挡同 resourceKey + seq<rec + active(pending/paused-401/in-flight);deferred/gate-blocked 不挡(见 helper 注释)。
+        .filter((r) => !isBlockedByEarlierSameResourceWrite(r, all, userId))
 
       // R7-1:稳定拓扑排序(替换 R6-1 的标量 dependencyRank)。只沿真实 FK 边约束顺序,其余一律保持
       // 原序——防混合批中无关记录跨过有 FK 边的记录(见 stableTopologicalSort 注释)。
@@ -1937,6 +2316,10 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
             await deleteWrite(rec.id)
             successes++
             finalized = true
+            // P1-2(二审 gate-blocked):archive 成功 → 收集 op,post-loop 终态化其 canvas 上的 gate-blocked legacy 写。
+            if (rec.op.kind === 'archiveCanvas' || rec.op.kind === 'archiveProject') {
+              archivedThisDrain.push(rec.op)
+            }
             break
           case 'conflict':
             // 409 revision conflict — do NOT blindly retry (it would 409 again on the
@@ -2073,6 +2456,15 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
           }
         }
         if (paused) break
+      }
+      // P1-2(二审 gate-blocked):post-loop 终态化本 drain archive 成功的 canvas 上的 gate-blocked legacy 写
+      //   (loop 内不做:防 loop 继续处理已 terminal-ize 的记录致 re-create race)。freshAll 重取(loop 中
+      //   success/terminal 出队的记录已不在 IDB;gate-blocked 重 drain 后仍 gate-blocked 留存 → 扫描命中)。
+      if (!paused && archivedThisDrain.length > 0) {
+        const freshAll = await getAllWrites()
+        for (const archOp of archivedThisDrain) {
+          terminals += await terminalizeGateBlockedLegacyOnArchivedCanvas(archOp, freshAll, userId)
+        }
       }
     } finally {
       draining = false

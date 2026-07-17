@@ -638,3 +638,52 @@ describe('v10 demo project relink (guardrail 4a/4b: seed once at v9, never reviv
     expect(DEMO_SCENE_PROJECT_MAP['stress-test']).toBe(DEMO_PROJECT_IDS.productDirection)
   })
 })
+
+describe('migratePersistedState (canvas persist v12 — Phase 2 归档 status 默认,CR-9)', () => {
+  it('v<12:存量 projects/canvases 的 undefined status 默认 active(向后兼容)', () => {
+    const result = migratePersistedState(
+      {
+        sceneId: 'character-flow',
+        projects: [{ id: 'p1', name: 'proj', createdAt: 't' }],
+        canvases: {
+          'character-flow': { title: 'c', nodes: [], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] },
+        },
+      },
+      11,
+    )
+    expect(result.projects[0].status).toBe('active')
+    // demo 场景(initialCanvases merge)+ persisted canvas 都得 active(v12 默认 undefined→active)
+    for (const doc of Object.values(result.canvases)) {
+      expect(doc.status).toBe('active')
+    }
+  })
+
+  it('v<12:既有 archived status 不被默认覆盖(保留归档态;幂等只填 undefined)', () => {
+    const result = migratePersistedState(
+      {
+        sceneId: 'character-flow',
+        projects: [{ id: 'p1', name: 'archived-proj', createdAt: 't', status: 'archived' as const }],
+        canvases: {},
+      },
+      11,
+    )
+    expect(result.projects[0].status).toBe('archived')
+  })
+
+  it('v12:不重跑 status 默认(persistedVersion<12 false → archived 保留、undefined 仍 undefined;merge 重跑 migrate 传 CURRENT=12)', () => {
+    // mergeCanvasPersistedState 重跑 migrate(persistedState, CANVAS_PERSIST_VERSION=12)→ v12 分支不跑(idempotent)
+    const result = migratePersistedState(
+      {
+        sceneId: 'character-flow',
+        projects: [
+          { id: 'p1', name: 'archived-proj', createdAt: 't', status: 'archived' as const },
+          { id: 'p2', name: 'no-status', createdAt: 't' }, // undefined,v12 不重跑 → 不默认成 active
+        ],
+        canvases: {},
+      },
+      12,
+    )
+    expect(result.projects[0].status).toBe('archived')
+    expect(result.projects[1].status).toBeUndefined()
+  })
+})

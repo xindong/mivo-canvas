@@ -228,6 +228,81 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
         historyFuture: [],
       }
     }),
+  // Phase 2 归档(回收站)——CR-10 unarchiveCanvas 自动 unarchive 父项目(编辑先恢复同构)+ CR-11 不入 undo 栈
+  //   (status 变更非画布内容 mutation,historyManager 只管画布内容)。archive 不触发 ≥1 canvas 不变量(画布
+  //   不移除,仅置 status=archived;active scene 若被归档,sceneId 不动——UI 可见性/scene 切换属 PR-C)。
+  archiveCanvas: (canvasId) =>
+    set((state) => {
+      const targetId = canvasId || state.sceneId
+      const document = state.canvases[targetId]
+      if (!document) {
+        warnCanvas(`Archive canvas skipped: missing canvas ${targetId}`)
+        return {}
+      }
+      if (document.status === 'archived') {
+        warnCanvas(`Archive canvas skipped: already archived ${targetId}`)
+        return {}
+      }
+      logCanvas(`Archived canvas "${document.title}" (${targetId})`)
+      // 直接归档:archivedByCascade=false(unarchiveProject 不恢复此画布;CR-5)。server 幂等:已归档→200 no-op。
+      enqueuePersistWrite({ kind: 'archiveCanvas', canvasId: targetId })
+      return {
+        canvases: {
+          ...state.canvases,
+          [targetId]: { ...document, status: 'archived' as const, archivedByCascade: false },
+        },
+      }
+    }),
+  unarchiveCanvas: (canvasId) =>
+    set((state) => {
+      const targetId = canvasId || state.sceneId
+      const document = state.canvases[targetId]
+      if (!document) {
+        warnCanvas(`Unarchive canvas skipped: missing canvas ${targetId}`)
+        return {}
+      }
+      if (document.status !== 'archived') {
+        warnCanvas(`Unarchive canvas skipped: not archived ${targetId}`)
+        return {}
+      }
+      // CR-10:unarchive canvas 自动 unarchive 父项目(若父 archived)——archived canvas 挂 archived 项目下,只恢复
+      //   画布不恢复项目则画布仍不可见(active 视图项目组不显示)。**单 set 原子**完成 canvas active + project
+      //   active + 级联恢复 cascade-archived 同辈(archivedByCascade===true→active,同 unarchiveProject 语义),
+      //   防分两 set 的 lost-update(先 set canvas 再调 unarchiveProject 会以后者 stale state 覆盖前者)。
+      //   级联同辈的 server 恢复由 unarchiveProject op 的 unarchiveProjectTree 承担;本直接归档画布经自身
+      //   unarchiveCanvas op 恢复(archivedByCascade=false,server cascade 不重复动它)。无 projectId(standalone)→ 跳过。
+      const parentId = document.projectId
+      const parent = parentId ? state.projects.find((p) => p.id === parentId) : undefined
+      const unarchiveParent = parent !== undefined && parent.status === 'archived'
+      const canvases = Object.fromEntries(
+        Object.entries(state.canvases).map(([id, doc]) => {
+          if (id === targetId) {
+            return [id, { ...doc, status: 'active' as const, archivedByCascade: false }]
+          }
+          // 父项目归档恢复 → 级联恢复 archivedByCascade===true 的同辈(同 unarchiveProject 语义);直接归档同辈不动。
+          if (
+            unarchiveParent &&
+            parentId !== undefined &&
+            doc.projectId === parentId &&
+            doc.archivedByCascade === true
+          ) {
+            return [id, { ...doc, status: 'active' as const, archivedByCascade: false }]
+          }
+          return [id, doc]
+        }),
+      )
+      const projects = unarchiveParent && parentId
+        ? state.projects.map((p) => (p.id === parentId ? { ...p, status: 'active' as const } : p))
+        : state.projects
+      logCanvas(
+        `Unarchived canvas "${document.title}" (${targetId})${unarchiveParent ? `; parent project ${parentId} auto-unarchived + cascade-archived siblings restored (CR-10)` : ''}`,
+      )
+      enqueuePersistWrite({ kind: 'unarchiveCanvas', canvasId: targetId })
+      if (unarchiveParent && parentId) {
+        enqueuePersistWrite({ kind: 'unarchiveProject', projectId: parentId })
+      }
+      return { canvases, projects }
+    }),
   loadScene: (sceneId) =>
     set((state) => {
       const document = normalizeDocument(documentFor(state.canvases, sceneId))

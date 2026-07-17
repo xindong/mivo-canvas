@@ -704,7 +704,10 @@ export const hydrateFromServer = async (
   //    "keep-local 解耦不丢"在 marker-set 分支的适用范围 = 仅 pending-create 集合(!marker 分支 = 全 local-only 差集)。
   try {
     const [{ projects }, pendingDeleteProjectIds, pendingCreateProjectIds, tombstoneProjectIds] = await Promise.all([
-      adapter.listProjects(),
+      // CR-8(Phase 2 归档跨设备 hydrate):includeArchived=true 拉含归档项(active+archived),否则"另一设备已归档"
+      //   的 project 不在 server 列表(默认 active-only 过滤)→ 本地 active 副本经 union 保留 → 跨设备归档不生效。
+      //   拉全量后 filteredProjects(server 真值含 status:archived)经 union 替换本地 → server 归档态覆盖本地 active。
+      adapter.listProjects({ includeArchived: true }),
       getPendingDeleteResourceIds('deleteProject'),
       getPendingCreateResourceIds('createProject'),
       getDeletionTombstones('project'),
@@ -792,7 +795,9 @@ export const hydrateFromServer = async (
   //    demo,G1-c reconcile)。active sceneId 的 meta 刷新但其 flattened nodes/edges 不动(content 不变)。
   try {
     const [{ canvases }, pendingDeleteCanvasIds, tombstoneCanvasIds] = await Promise.all([
-      adapter.listCanvas(),
+      // CR-8:includeArchived=true 拉含归档画布(同 step1 project);下方 union-merge 用 server meta.status
+      //   reconcile 本地 status(server 归档态覆盖本地 active → 跨设备归档生效)。
+      adapter.listCanvas(undefined, { includeArchived: true }),
       getPendingDeleteResourceIds('deleteCanvas'),
       getDeletionTombstones('canvas'),
     ])
@@ -889,6 +894,9 @@ export const hydrateFromServer = async (
               metaRevision: meta.metaRevision,
               contentVersion: meta.contentVersion,
               updatedAt: meta.updatedAt,
+              // CR-8(Phase 2 归档):status 以 server 为准 reconcile(server archived→archived / 缺省→active),
+              //   跨设备归档生效。archivedByCascade 是客户端本地字段(wire 不暴露),保留本地既有值(...existing 带)。
+              status: meta.status,
             }
           } else {
             // meta-stub:content 空(G1-c content hydrate defer);meta 已恢复,非 only-log。
@@ -900,6 +908,8 @@ export const hydrateFromServer = async (
               updatedAt: meta.updatedAt,
               metaRevision: meta.metaRevision,
               contentVersion: meta.contentVersion,
+              // CR-8:status 以 server 为准(meta.status);新建 stub 无 archivedByCascade(缺省 undefined=非级联归档)。
+              status: meta.status,
               nodes: [],
               edges: [],
               tasks: [],
@@ -1041,18 +1051,86 @@ const applyServerRevision = async (op: WriteOp, outcome: { revision?: Revision }
   const rev = outcome.revision
   const { useCanvasStore } = await import('../store/canvasStore')
   const state = useCanvasStore.getState()
-  if (op.kind === 'createProject' || op.kind === 'updateProject') {
+  // Phase 2 归档:archive/unarchive 同样 bump server revision(status 变更 bump revision/metaRevision),
+  //   回灌 fresh base 防下次 strict update(PATCH/PUT rename/move)用陈旧 base → 428/409。status 已由 store action
+  //   乐观更新,此处只 reconcile revision(不重复设 status,server 已权威;hydrate 下次亦 reconcile)。
+  if (
+    op.kind === 'createProject' ||
+    op.kind === 'updateProject' ||
+    op.kind === 'archiveProject' ||
+    op.kind === 'unarchiveProject'
+  ) {
     const id = op.kind === 'createProject' ? (op.id ?? null) : op.projectId
     if (!id) return
     if (!state.projects.some((p) => p.id === id)) return
     useCanvasStore.setState((s) => ({
       projects: s.projects.map((p) => (p.id === id ? { ...p, revision: rev } : p)),
     }))
-  } else if (op.kind === 'createCanvas' || op.kind === 'updateCanvas') {
+  } else if (
+    op.kind === 'createCanvas' ||
+    op.kind === 'updateCanvas' ||
+    op.kind === 'archiveCanvas' ||
+    op.kind === 'unarchiveCanvas'
+  ) {
     if (!state.canvases[op.canvasId]) return
     useCanvasStore.setState((s) => ({
       canvases: { ...s.canvases, [op.canvasId]: { ...s.canvases[op.canvasId]!, metaRevision: rev } },
     }))
+  }
+}
+
+/**
+ * P1-3(返修):unarchiveProject drain success 后,reconcile 子画布 status 用 server 权威(不猜 archivedByCascade)。
+ * 跨设备 hydrate 时 client archivedByCascade=undefined(wire 不回传 provenance)→ 乐观 unarchiveProject 只恢复
+ * archivedByCascade===true 的子画布 → undefined 的全留 archived → client 持久错误态(project active 但
+ * cascade-archived 子画布仍 archived,用户看到空项目)。缺 provenance 不猜 → 拉 includeArchived canvas meta
+ * 用 server status reconcile:server unarchiveProjectTree 已恢复 cascade 子画布(active)、保留 direct(archived)。
+ * best-effort:reconcile 失败不阻断 onOutcome(下轮 hydrate 会再 reconcile)。
+ *
+ * P2 锁测(返修):导出 + 接受注入 adapter(默认 getServerPersistAdapter())——对齐全文件其余 hydrate 函数的注入
+ *   模式,使 fresh-device reconcile 可单测(fake adapter.listCanvas 返 cascade→active/direct→archived,断言 reconcile
+ *   后 client status 对齐 server)。生产 onOutcome 调用点(行 1212)不传 adapter → 走默认 singleton,行为不变。
+ */
+export const reconcileProjectCanvasStatus = async (
+  projectId: string,
+  adapter?: ReturnType<typeof getServerPersistAdapter>,
+): Promise<void> => {
+  try {
+    const a = adapter ?? getServerPersistAdapter()
+    const { canvases } = await a.listCanvas(projectId, { includeArchived: true })
+    const { useCanvasStore } = await import('../store/canvasStore')
+    // P2-1(二审 TOCTOU):reconcile GET 在途时用户再 archiveProject → store project 翻 archived(乐观,archiveProject
+    //   action 同步 set)。若仍应用 reconcile(用旧 GET 把 child 覆回 active)会撤销新 archive 意图。守卫:应用前
+    //   校验 project 仍 active;否则跳过(stale GET 丢弃,下轮 hydrate 用新 server 真值 reconcile)。
+    //   "archive intent" 经 store project.status 捕获(archiveProject action 同步置 archived,无需跨模块 epoch)。
+    const state0 = useCanvasStore.getState()
+    const project0 = state0.projects.find((p) => p.id === projectId)
+    if (project0 && (project0.status ?? 'active') !== 'active') {
+      debugLogger.log(
+        SOURCE,
+        `unarchiveProject ${projectId} reconcile skipped (P2-1 TOCTOU): project status=${project0.status ?? 'active'} (re-archived during GET; stale GET discarded, next hydrate reconciles)`,
+      )
+      return
+    }
+    useCanvasStore.setState((s) => {
+      let reconciled = 0
+      const next = { ...s.canvases }
+      for (const meta of canvases) {
+        const existing = next[meta.id]
+        if (!existing) continue // 本地无此 canvas(未 hydrate content)→ 不动(下轮 hydrate 补)
+        // 归一比较(?? 'active')避免 active(explicit)↔ undefined(active) 的无谓 churn;不一致才覆写为 wire 值。
+        if ((existing.status ?? 'active') !== (meta.status ?? 'active')) {
+          next[meta.id] = { ...existing, status: meta.status }
+          reconciled++
+        }
+      }
+      if (reconciled > 0) {
+        debugLogger.log(SOURCE, `unarchiveProject ${projectId} reconcile: ${reconciled} canvas(es) status synced from server (P1-3, don't guess archivedByCascade)`)
+      }
+      return { canvases: next }
+    })
+  } catch (error) {
+    debugLogger.warn(SOURCE, `unarchiveProject ${projectId} reconcile failed (P1-3, best-effort; next hydrate will reconcile): ${msg(error)}`)
   }
 }
 
@@ -1145,6 +1223,13 @@ export const startPersistWriteQueue = (
           return { canvases: next }
         })
         debugLogger.log(SOURCE, `deleteCanvas ${op.canvasId} drained success → removed from store (anti-resurrection fallback B)`)
+        return
+      }
+      if (op.kind === 'unarchiveProject' && outcome.status === 'success') {
+        // P1-3(返修):unarchiveProject drain success → reconcile 子画布 status 用 server 权威(不猜 archivedByCascade)。
+        //   跨设备 hydrate archivedByCascade=undefined → 乐观只恢复 ===true → cascade 子画布卡 archived(空项目)。
+        //   server unarchiveProjectTree 已恢复 cascade;拉 includeArchived meta reconcile:cascade→active,direct→archived。
+        await reconcileProjectCanvasStatus(op.projectId)
         return
       }
       if (op.kind !== 'appendChatMessage') return

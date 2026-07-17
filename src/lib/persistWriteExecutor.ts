@@ -274,11 +274,13 @@ export const createAdapterWriteExecutor = (opts: FetchAdapterOptions): WriteExec
       switch (op.kind) {
         case 'createProject': {
           // G1-a R2 F1:回捕服务端 Project.revision,drain 经 onSuccess 回灌 store,下一次 rename 用 fresh base。
+          // D2:createProject op 可带 status(combineOps create+archive→create(archived))→ 传入 CreateProjectRequest,
+          //   server ensureCreate 应用之(归档资源一次落库,无需二次 archive 端点)。
           const result = await requestJson<Project>({
             ...base,
             method: 'POST',
             path: '/api/projects',
-            body: { name: op.name, ...(op.id ? { id: op.id } : {}) },
+            body: { name: op.name, ...(op.id ? { id: op.id } : {}), ...(op.status ? { status: op.status } : {}) },
             idempotencyKey,
           })
           return { status: 'success', revision: result.revision }
@@ -361,6 +363,7 @@ export const createAdapterWriteExecutor = (opts: FetchAdapterOptions): WriteExec
               ...(op.canvasId ? { id: op.canvasId } : {}),
               ...(op.title !== undefined ? { title: op.title } : {}),
               ...(op.sourceTemplateId !== undefined ? { sourceTemplateId: op.sourceTemplateId } : {}),
+              ...(op.status ? { status: op.status } : {}),
             },
             idempotencyKey,
           })
@@ -421,6 +424,53 @@ export const createAdapterWriteExecutor = (opts: FetchAdapterOptions): WriteExec
             throw error
           }
           return { status: 'success' }
+        }
+
+        // Phase 2 归档(回收站):archive/unarchive 端点空 body(ArchiveRequest=Record<string,never>),无 If-Match
+        //   (无 baseRevision,无 428/409-revision-conflict);幂等(server 对已归档再 archive→200 no-op)。
+        //   回捕 metaRevision/revision 供 drain onSuccess 回灌 store,下次 strict update(PUT/PATCH)用 fresh base。
+        //   CR-6:archived canvas 子记录写 server 返 409 archived → classifyHttpStatus(409,isDelete=false)→rejected
+        //   terminal(客户端引导先恢复再编辑;archive 本身不被 409 拒,因 archive 是 manage action 非 child write)。
+        //   404(资源不存在/已硬删)→ isDelete=false → rejected terminal(归档不存在资源无意义,fail-visible)。
+        case 'archiveCanvas': {
+          // POST /api/canvas/:id/archive → 200 CanvasMeta(status:archived wire)。
+          const result = await requestJson<CanvasMeta>({
+            ...base,
+            method: 'POST',
+            path: `/api/canvas/${encodeURIComponent(op.canvasId)}/archive`,
+            idempotencyKey,
+          })
+          return { status: 'success', revision: result.metaRevision }
+        }
+        case 'unarchiveCanvas': {
+          // POST /api/canvas/:id/unarchive → 200 CanvasMeta(status 缺省=active wire)。
+          const result = await requestJson<CanvasMeta>({
+            ...base,
+            method: 'POST',
+            path: `/api/canvas/${encodeURIComponent(op.canvasId)}/unarchive`,
+            idempotencyKey,
+          })
+          return { status: 'success', revision: result.metaRevision }
+        }
+        case 'archiveProject': {
+          // POST /api/projects/:id/archive → 200 Project(status:archived wire);server archiveProjectTree 级联归档子画布。
+          const result = await requestJson<Project>({
+            ...base,
+            method: 'POST',
+            path: `/api/projects/${encodeURIComponent(op.projectId)}/archive`,
+            idempotencyKey,
+          })
+          return { status: 'success', revision: result.revision }
+        }
+        case 'unarchiveProject': {
+          // POST /api/projects/:id/unarchive → 200 Project;server unarchiveProjectTree 级联恢复 archivedByCascade=true 子画布(D3)。
+          const result = await requestJson<Project>({
+            ...base,
+            method: 'POST',
+            path: `/api/projects/${encodeURIComponent(op.projectId)}/unarchive`,
+            idempotencyKey,
+          })
+          return { status: 'success', revision: result.revision }
         }
 
         case 'attachAsset': {

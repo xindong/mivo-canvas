@@ -108,10 +108,17 @@ export type CanvasState = {
   renameProject: (projectId: string, name: string) => void
   deleteProject: (projectId: string) => ProjectDeleteResult
   restoreProject: (projectId: string, name?: string) => void
+  // Phase 2 归档(回收站):archive/unarchive project + canvas。CR-5 archiveProject 级联归档子画布,
+  //   unarchiveProject 仅恢复 archivedByCascade===true 的子画布(单独归档的不动);CR-10 unarchiveCanvas
+  //   自动 unarchive 父项目(编辑先恢复同构);CR-11 archive/unarchive 不入 undo 栈(非画布内容 mutation)。
+  archiveProject: (projectId: string) => void
+  unarchiveProject: (projectId: string) => void
   moveCanvasToProject: (canvasId: CanvasId, projectId?: string) => void
   createCanvas: (title?: string, options?: { projectId?: string; templateId?: DemoSceneId }) => CanvasId
   duplicateCanvas: (canvasId?: CanvasId) => CanvasId | undefined
   deleteCanvas: (canvasId?: CanvasId) => void
+  archiveCanvas: (canvasId?: CanvasId) => void
+  unarchiveCanvas: (canvasId?: CanvasId) => void
   loadScene: (sceneId: CanvasId) => void
   refreshActiveCanvasContent: (sceneId: CanvasId) => void
   renameCanvas: (sceneId: CanvasId, title: string) => void
