@@ -498,20 +498,29 @@ export const createAssetRoutes = (options: AssetRouteOptions): App => {
     } else {
       // CR-6(Phase 2 归档 write-guard,补 legacy 路径):legacy ref(canvas-less,ref.canvasId undefined)整段
       //   此前跳过 resolveCanvasAccess → 不触发归档 409(攻击面:pre-G2.2 canvas-less legacy ref 其 node 落已归档
-      //   画布,owner detach → 200 而非 409)。补:用 node→canvas 反查(resolveAssetOwner ownerFp 作 node owner_id
-      //   代理:owner-attached legacy ref ownerFp===canvas owner → persist.get 命中;editor-attached ownerFp≠canvas
-      //   owner → get missing → 解析不到 → 维持现状,行为不变,不误伤)。不能靠 bodyCanvasId(legacy fallback
-      //   故意忽略它,禁回填语义,见下方注释)。
-      const nodeRes = await persist.get(ownerFp, 'node', nodeId)
-      const legacyCanvasId = nodeRes.kind === 'found' ? nodeRes.record.canvasId : null
-      if (legacyCanvasId) {
-        const canvasRes = await persist.get(ownerFp, 'canvas', legacyCanvasId)
-        if (canvasRes.kind === 'found' && canvasRes.record.status === 'archived') {
-          log(409, 'archived')
-          return c.json({ error: 'archived', id: legacyCanvasId } satisfies ArchivedBody, 409)
+      //   画布,owner detach → 200 而非 409)。补:用 node→canvas 反查。ownerFp 作 node owner_id 代理(owner-attached
+      //   legacy ref ownerFp===canvas owner → persist.get 命中;editor-attached → get missing → 维持现状,不误伤)。
+      //   不能靠 bodyCanvasId(legacy fallback 故意忽略它,禁回填语义,见下方注释)。
+      // ed9b641 返修第四步(lead+gpt-5.6-sol 抓到两类 false 409,修小):
+      //   (A) 原只看 status==='archived' 不看 isDeleted → 画布 archive 后再 DELETE(isDeleted=true,status 仍 archived)
+      //       仍误返 409,卡死已删画布的 legacy ref 清理(已删画布无法 unarchive)。修:node+canvas 须 !isDeleted 才作
+      //       CR-6 对象(对齐 resolveCanvasAccess :123-125 isDeleted 先 404 再 archived 的顺序);任一 isDeleted/missing/active
+      //       → 维持现状(下方 legacy detach)。
+      //   (B) ref 选择只按 nodeId,matched legacy ref 可能属别 owner(ref.ownerFp!==请求方 ownerFp)。原探测用请求方
+      //       ownerFp 查 node + 跑在 store.detach owner 校验之前 → 抢先把 owner-mismatch 误判 409。修:只在
+      //       ref.ownerFp===ownerFp 时探测;不等 → 完全跳过,走下方 store.detach 返 owner-mismatch 403(保既有契约)。
+      if (ref.ownerFp === ownerFp) {
+        const nodeRes = await persist.get(ownerFp, 'node', nodeId)
+        const legacyCanvasId = nodeRes.kind === 'found' && !nodeRes.record.isDeleted ? nodeRes.record.canvasId : null
+        if (legacyCanvasId) {
+          const canvasRes = await persist.get(ownerFp, 'canvas', legacyCanvasId)
+          if (canvasRes.kind === 'found' && !canvasRes.record.isDeleted && canvasRes.record.status === 'archived') {
+            log(409, 'archived')
+            return c.json({ error: 'archived', id: legacyCanvasId } satisfies ArchivedBody, 409)
+          }
         }
       }
-      // 解析不到(node 孤儿/editor-attached legacy ref)或 canvas active → 维持现状(下方 legacy detach)。
+      // 解析不到(ref 非己方 owner-mismatch / node 孤儿或已删 / editor-attached)或 canvas active/deleted → 维持现状(下方 legacy detach)。
     }
     // authz 过(新 ref canvas-edit / legacy ref 走 service ownerFp)→ detach(P1-4 残留2:传 ref.canvasId
     //   本身;legacy ref → undefined,**禁回填 bodyCanvasId**——否则 backend 按 (bodyCanvasId, nodeId)

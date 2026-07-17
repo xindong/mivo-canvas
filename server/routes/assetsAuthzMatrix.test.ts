@@ -331,6 +331,69 @@ describe('G2.2 P1-4 残留2 — route detach 复合键选择(InMemory route 级)
     expect(await r.json()).toEqual({ error: 'archived', id: ids.canvas })
   })
 
+  it('CR-6 legacy 锁A:canvas 先 archive 再 softDelete(isDeleted=true,status 仍 archived)→ owner legacy detach 不得 409(应 200 detached)', async () => {
+    const persist = createPersistBackend()
+    const permissions = new InMemoryPermissionBackend()
+    const assetStore = createAssetStore(createMemoryAssetBackend())
+    const app = buildApp(persist, permissions, assetStore)
+    const ids = { project: 'p-lka', canvas: 'c-lka', node: 'n-lka', node2: 'n2-lka' }
+    await persist.ensureCreate(FP_OWNER, 'project', ids.project, { title: 'p' }, { method: 'POST', resourceKind: 'project' })
+    await persist.createCanvasWithCollection(FP_OWNER, ids.canvas, { projectId: ids.project }, { method: 'POST', resourceKind: 'canvas' })
+    await persist.ensureCreateChild(FP_OWNER, ids.canvas, 'node', ids.node, { type: 'image' }, { method: 'POST', resourceKind: 'node' })
+    const bytes = await realPng()
+    const form = new FormData()
+    form.append('image', new File([bytes], 'a.png', { type: 'image/png' }), 'a.png')
+    const upRes = await app.request('/api/assets', { method: 'POST', headers: hdr(MIVO_KEY_OWNER), body: form })
+    expect(upRes.status).toBe(200)
+    const assetId = ((await upRes.json()) as { assetId: string }).assetId
+    await assetStore.attach(assetId, ids.node, FP_OWNER) // legacy ref(owner-attached)
+    await persist.archiveCanvasTree(FP_OWNER, ids.canvas) // canvas meta status→archived
+    await persist.softDeleteCanvasTree(FP_OWNER, ids.canvas) // isDeleted→true(softDelete 不清 status;node 仍 live)
+    // legacy detach:ref.ownerFp===ownerFp ✓ → get(node) found+!isDeleted → canvasId → get(canvas) found+isDeleted=true
+    //   → !isDeleted FALSE → 不 409 → 维持现状 → store.detach → ref 在+owner 匹配 → 200 detached(画布已删非 archived-live)。
+    const r = await app.request(`/api/assets/${assetId}/detach`, {
+      method: 'POST',
+      headers: { ...hdr(MIVO_KEY_OWNER), 'content-type': 'application/json' },
+      body: JSON.stringify({ nodeId: ids.node, canvasId: 'c-not-the-legacy-ref' }),
+    })
+    expect(r.status).toBe(200) // 非 409:画布已 softDelete(isDeleted) 非 archived-live
+    expect(await r.json()).toEqual({ kind: 'detached' }) // ref 仍在 + owner 匹配 → detached
+  })
+
+  it('CR-6 legacy 锁B:asset 的 legacy ref 属 A;B(不同 key)在 B 己 archived canvas 建同名 node → B detach 仍 403 owner-mismatch(不得 409)', async () => {
+    const persist = createPersistBackend()
+    const permissions = new InMemoryPermissionBackend()
+    const assetStore = createAssetStore(createMemoryAssetBackend())
+    const app = buildApp(persist, permissions, assetStore)
+    // A:project+canvas+node 'n-lkb' + 上传 asset(A)+ legacy ref 属 A(ownerFp=FP_OWNER)。
+    const aIds = { project: 'p-lkb-a', canvas: 'c-lkb-a', node: 'n-lkb', node2: 'n2-lkb-a' }
+    await persist.ensureCreate(FP_OWNER, 'project', aIds.project, { title: 'pa' }, { method: 'POST', resourceKind: 'project' })
+    await persist.createCanvasWithCollection(FP_OWNER, aIds.canvas, { projectId: aIds.project }, { method: 'POST', resourceKind: 'canvas' })
+    await persist.ensureCreateChild(FP_OWNER, aIds.canvas, 'node', aIds.node, { type: 'image' }, { method: 'POST', resourceKind: 'node' })
+    const bytes = await realPng()
+    const form = new FormData()
+    form.append('image', new File([bytes], 'a.png', { type: 'image/png' }), 'a.png')
+    const upRes = await app.request('/api/assets', { method: 'POST', headers: hdr(MIVO_KEY_OWNER), body: form })
+    expect(upRes.status).toBe(200)
+    const assetId = ((await upRes.json()) as { assetId: string }).assetId
+    await assetStore.attach(assetId, aIds.node, FP_OWNER) // legacy ref 属 A(nodeId='n-lkb', ownerFp=FP_OWNER)
+    // B(OUTSIDER,不同 owner):己 project+canvas+同名 node 'n-lkb' + 归档 B 的 canvas。
+    const bIds = { project: 'p-lkb-b', canvas: 'c-lkb-b', node: 'n-lkb', node2: 'n2-lkb-b' }
+    await persist.ensureCreate(FP_OUTSIDER, 'project', bIds.project, { title: 'pb' }, { method: 'POST', resourceKind: 'project' })
+    await persist.createCanvasWithCollection(FP_OUTSIDER, bIds.canvas, { projectId: bIds.project }, { method: 'POST', resourceKind: 'canvas' })
+    await persist.ensureCreateChild(FP_OUTSIDER, bIds.canvas, 'node', bIds.node, { type: 'image' }, { method: 'POST', resourceKind: 'node' })
+    await persist.archiveCanvasTree(FP_OUTSIDER, bIds.canvas) // B 的 canvas archived(B 的同名 node 在 archived canvas 上)
+    // B 请求 detach A 的 asset 的 nodeId 'n-lkb':ref 命中 A 的 legacy ref(ownerFp=FP_OWNER≠FP_OUTSIDER)→
+    //   ref.ownerFp!==ownerFp → 完全跳过 archived 探测(旧 buggy 代码会 get(B 的 node)→B 的 archived canvas→409)→
+    //   store.detach owner 校验:ref.ownerFp(FP_OWNER)≠ownerFp(FP_OUTSIDER)→ owner-mismatch 403(非 409)。
+    const r = await app.request(`/api/assets/${assetId}/detach`, {
+      method: 'POST',
+      headers: { ...hdr(MIVO_KEY_OUTSIDER), 'content-type': 'application/json' },
+      body: JSON.stringify({ nodeId: aIds.node, canvasId: 'c-not-the-legacy-ref' }),
+    })
+    expect(r.status).toBe(403) // owner-mismatch,非 409(锁住 false-409 B 修复)
+  })
+
   it('无 body canvasId + 新 ref(有 canvasId)→ 只匹配 legacy(无)→ already-detached(新 ref 须显式 canvasId)', async () => {
     const persist = createPersistBackend()
     const permissions = new InMemoryPermissionBackend()
