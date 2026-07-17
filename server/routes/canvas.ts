@@ -120,11 +120,6 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
     if (got.record.isDeleted && action !== 'manage') {
       return { ok: false, status: 404, body: { error: 'unknown-canvas' } satisfies UnknownResourceBody }
     }
-    // CR-6(Phase 2 归档 write-guard):archived canvas 的子记录写(write/move)→ 409 archived(客户端引导先恢复再编辑)。
-    // read/manage 放行:归档可读(回收站预览)、可恢复(archive/unarchive)、可彻底删除(DELETE manage)。
-    if (!got.record.isDeleted && got.record.status === 'archived' && (action === 'write' || action === 'move')) {
-      return { ok: false, status: 409, body: { error: 'archived', id: canvasId } satisfies ArchivedBody }
-    }
     const projectId = isCanvasPayload(got.record.payload) ? got.record.payload.projectId : ''
     const shareToken = shareTokenOf(c)
     let info: AuthzInfo
@@ -143,6 +138,12 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
       const status = denyStatus(info) === 403 ? 403 : 404
       const body = status === 403 ? { error: 'forbidden' } : { error: 'unknown-canvas' } satisfies UnknownResourceBody
       return { ok: false, status, body }
+    }
+    // CR-6(Phase 2 归档 write-guard):archived canvas 的子记录写(write/move)→ 409 archived(客户端引导先恢复再编辑)。
+    // **F-1**:判定挪到 canAccessCanvas 通过之后——非成员先走 authz deny 得 404(无 archived 存在性泄漏,不变量恢复);
+    //   owner/editor/share-edit 写归档→409(引导先恢复);viewer 写→403(canAccessCanvas 已拒);read/manage 不受影响(判定只管 write|move)。
+    if (!got.record.isDeleted && got.record.status === 'archived' && (action === 'write' || action === 'move')) {
+      return { ok: false, status: 409, body: { error: 'archived', id: canvasId } satisfies ArchivedBody }
     }
     // DP-6R:返 actor(share-token 路径=null / 匿名访客);chat 路由据此判 401 require-login + 用 actor 作 chat-message 存储 owner。
     return { ok: true, ownerId: owner.ownerId, projectId, record: got.record, actor: info.actor }

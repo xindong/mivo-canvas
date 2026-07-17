@@ -1723,7 +1723,8 @@ export class PgPersistBackend implements PersistBackend {
     }).where('owner_id', '=', ownerId).where('type', '=', 'canvas').where('id', '=', canvasId).where('is_deleted', '=', true).executeTakeFirst()
     const c = await trx.updateTable('persist_records').set({ is_deleted: false, revision: sql`revision + 1`, updated_at: new Date() }).where('owner_id', '=', ownerId).where('type', '=', 'chat-collection').where('canvas_id', '=', canvasId).where('is_deleted', '=', true).executeTakeFirst()
     // F2:canvases 瘦索引 owner-scoped + is_deleted=true + returning;0 行(不存在/未删/错 owner)→ undefined(调用方不碰缓存,无幽灵)。
-    const idx = await trx.updateTable('canvases').set({ is_deleted: false, updated_at: new Date() }).where('id', '=', canvasId).where('owner_id', '=', ownerId).where('is_deleted', '=', true).returning('owner_id').executeTakeFirst()
+    // F-idx:status 与 persist_records 侧(:1718)对称——opts.status 若提供则同步覆写索引 status,防 PR-B 回收站 JOIN 瘦索引读陈旧值。
+    const idx = await trx.updateTable('canvases').set({ ...(opts.status !== undefined ? { status: opts.status } : {}), is_deleted: false, updated_at: new Date() }).where('id', '=', canvasId).where('owner_id', '=', ownerId).where('is_deleted', '=', true).returning('owner_id').executeTakeFirst()
     const count = Number((r?.numUpdatedRows ?? 0n) > 0n ? 1n : 0n) + Number((c?.numUpdatedRows ?? 0n) > 0n ? 1n : 0n)
     return { count, metaRestored: (r?.numUpdatedRows ?? 0n) > 0n, canvasIdxOwner: idx?.owner_id }
   }
@@ -1743,8 +1744,12 @@ export class PgPersistBackend implements PersistBackend {
     const cv = await trx.updateTable('persist_records').set({ is_deleted: false, revision: sql`revision + 1`, updated_at: new Date() }).where('owner_id', '=', ownerId).where('type', '=', 'canvas').where(sql`payload->>'projectId'`, '=', projectId).where('is_deleted', '=', true).executeTakeFirst()
     const cc = await trx.updateTable('persist_records').set({ is_deleted: false, revision: sql`revision + 1`, updated_at: new Date() }).where('owner_id', '=', ownerId).where('type', '=', 'chat-collection').where('canvas_id', 'in', (qb) => qb.selectFrom('persist_records').select('id').where('owner_id', '=', ownerId).where('type', '=', 'canvas').where(sql`payload->>'projectId'`, '=', projectId)).where('is_deleted', '=', true).executeTakeFirst()
     // F2:projects 瘦索引 owner-scoped + is_deleted=true + returning;0 行 → undefined(调用方不碰缓存)。
-    const projIdx = await trx.updateTable('projects').set({ is_deleted: false, updated_at: new Date() }).where('id', '=', projectId).where('owner_id', '=', ownerId).where('is_deleted', '=', true).returning('owner_id').executeTakeFirst()
+    // F-idx:status 与 persist_records 侧(:1737 project meta)对称——opts.status 若提供则同步覆写索引 status。
+    const projIdx = await trx.updateTable('projects').set({ ...(opts.status !== undefined ? { status: opts.status } : {}), is_deleted: false, updated_at: new Date() }).where('id', '=', projectId).where('owner_id', '=', ownerId).where('is_deleted', '=', true).returning('owner_id').executeTakeFirst()
     // F5:child canvases 瘦索引同步(实际受影响集 owner-scoped + is_deleted=true + returning;未命中不进结果)。
+    // F-idx:此处**不**加 opts.status——上面 persist_records 子画布 `cv`(:1743)本身不设 status(子画布恢复时保留
+    //   既有 status,非 project-meta 的 opts.status);索引若单方面写 opts.status 会与 persist_records 不一致(恰是 F-idx
+    //   要消灭的陈旧值)。故子画布索引亦保留既有 status,与 `cv` 对称。
     const childIdx = childIds.length > 0
       ? await trx.updateTable('canvases').set({ is_deleted: false, updated_at: new Date() }).where('id', 'in', childIds).where('owner_id', '=', ownerId).where('is_deleted', '=', true).returning(['id', 'owner_id']).execute()
       : []
@@ -1823,6 +1828,7 @@ export class PgPersistBackend implements PersistBackend {
         : undefined
       await trx.updateTable('projects').set({ status: 'archived', updated_at: new Date() }).where('id', '=', projectId).where('owner_id', '=', ownerId).where('is_deleted', '=', false).where('status', '=', 'active').execute()
       if (childIds.length > 0) await trx.updateTable('canvases').set({ status: 'archived', updated_at: new Date() }).where('id', 'in', childIds).where('owner_id', '=', ownerId).where('is_deleted', '=', false).where('status', '=', 'active').execute()
+      // F-count:count 为布尔型语义——>0=有变更,非精确变更行数(PG 侧=(proj?1:0)+(anyCanvas?1:0)≤2;mem 侧=targets.length;双后端定义不同,勿按精确值做算术)。唯一消费者 route 日志 note(count>0 一致)。
       const count = Number((p?.numUpdatedRows ?? 0n) > 0n ? 1n : 0n) + Number((cv?.numUpdatedRows ?? 0n) > 0n ? 1n : 0n)
       return { count }
     })
@@ -1842,6 +1848,7 @@ export class PgPersistBackend implements PersistBackend {
         : undefined
       await trx.updateTable('projects').set({ status: 'active', updated_at: new Date() }).where('id', '=', projectId).where('owner_id', '=', ownerId).where('is_deleted', '=', false).where('status', '=', 'archived').execute()
       if (childIds.length > 0) await trx.updateTable('canvases').set({ status: 'active', updated_at: new Date() }).where('id', 'in', childIds).where('owner_id', '=', ownerId).where('is_deleted', '=', false).where('status', '=', 'archived').execute()
+      // F-count:count 为布尔型语义——>0=有变更,非精确变更行数(PG 侧=(proj?1:0)+(anyCanvas?1:0)≤2;mem 侧=targets.length;双后端定义不同,勿按精确值做算术)。唯一消费者 route 日志 note(count>0 一致)。
       const count = Number((p?.numUpdatedRows ?? 0n) > 0n ? 1n : 0n) + Number((cv?.numUpdatedRows ?? 0n) > 0n ? 1n : 0n)
       return { count }
     })

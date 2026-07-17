@@ -109,6 +109,21 @@ describe('Phase 2 归档 routes (PR-A)', () => {
     expect((await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })).status).toBe(404)
   })
 
+  // ── F-1 锁:非成员对 archived canvas 写→404(非 409,无存在性泄漏)──
+  // 防回归:若 CR-6 409 判定被挪回 authz 之前(原 F-1 bug 态),KEY_B 会得 409 archived(泄漏存在性),本用例红;修后得 404(走 authz deny)。
+  it('F-1 锁:KEY_B(非成员/无 share)对 KEY_A 的 archived canvas 发写(PUT / node POST)→ 404 unknown-canvas(非 409 archived,无泄漏)', async () => {
+    await setup()
+    await req(app, '/api/canvas/c1/archive', { method: 'POST', headers: hdr(KEY_A) })
+    // 非成员 PUT(写)→ 404(走 authz deny,不返 409 泄漏 archived 存在性)
+    const put = await req(app, '/api/canvas/c1', { method: 'PUT', headers: hdr(KEY_B), body: JSON.stringify({ payload: { projectId: 'p1', title: 'x' } }) })
+    expect(put.status).toBe(404)
+    expect((put.body as { error: string }).error).toBe('unknown-canvas')
+    // 非成员 POST node(子记录写)→ 同样 404(非 409;body 经 validateCreateBody/validateChildPayload 后到 authz)
+    const nodeCreate = await req(app, '/api/canvas/c1/nodes/n1', { method: 'POST', headers: hdr(KEY_B), body: JSON.stringify({ clientId: 'n1', type: 'node', payload: wirePayload(canonicalNode('n1')) }) })
+    expect(nodeCreate.status).toBe(404)
+    expect((nodeCreate.body as { error: string }).error).toBe('unknown-canvas')
+  })
+
   // ── includeArchived 列表过滤 ──
   it('GET /api/canvas 默认排除 archived;?includeArchived=true 含 archived', async () => {
     await setup()

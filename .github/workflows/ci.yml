@@ -424,7 +424,7 @@ jobs:
   # 保护配置(照 #186→#193 e2e-kernel-gate 先例:分支保护为 PR 外 lead 动作,与 workflow
   # 改动分离)。分支保护加进后,PG 测试失败即阻断 PR 合并。
   #
-  # 时序:#202 已于 2026-07-11 合入 main,本 PR(2026-07-12)接入 p6saga 矩阵,G2.2(A1)加 authz matrix,六个 PG-gated 测试文件已在 main:
+  # 时序:#202 已于 2026-07-11 合入 main,本 PR(2026-07-12)接入 p6saga 矩阵,G2.2(A1)加 authz matrix,PR #266 加 archive dual,现七个 PG-gated 测试文件已在 main:
   #   backend.contract.dual / backend.pg / permissionBackend.contract.dual / persist.route.dual / p6saga.pg.matrix / assetsAuthzMatrix
   # 故本 job 在每个 PR 上实跑真 PG 用例(契约 32 场景 + saga 迁移矩阵 + 并发回归 + authz 矩阵),失败即红。
   pg-suite:
@@ -521,16 +521,17 @@ jobs:
       # 隔离库:mivocanvas(contract.dual/route.dual)+ mivocanvas_unit(backend.pg)
       #       + mivocanvas_unit_p6saga(p6saga)+ mivocanvas_unit_perm(permissionBackend.contract.dual,A8②-3)
       #       + mivocanvas_unit_authz(assetsAuthzMatrix,G2.2 A1)。
-      # 机器不变量(#229 硬门禁):六文件必须全部存在,任一缺失(删/改名/typo)在 vitest 之前即红,
+      # 机器不变量(#229 硬门禁):七文件必须全部存在,任一缺失(删/改名/typo)在 vitest 之前即红,
       # 杜绝"--passWithNoTests + 缺文件 → 其余文件绿"的静默少跑(#229 要消灭的病)。
-      # 六文件已全在 main(p6saga 自 #229 入;authz matrix 自 G2.2 A1 加入),infra-only/0-file 兼容期已过,不保留 --passWithNoTests。
+      # 七文件已全在 main(p6saga 自 #229 入;authz matrix 自 G2.2 A1 加入;archive dual 自 PR #266 加入),infra-only/0-file 兼容期已过,不保留 --passWithNoTests。
       - name: Run PG-gated vitest suite
         run: |
           set -o pipefail
           mkdir -p test-artifacts
-          # 唯一数组(六路径字面);与下方 summary 步同源,改一处须同步另一处。
+          # 唯一数组(七路径字面);与下方 summary 步同源,改一处须同步另一处。
           required_files=(
             server/persist/backend.contract.dual.test.ts
+            server/persist/archive.contract.dual.test.ts
             server/persist/backend.pg.test.ts
             server/persist/permissionBackend.contract.dual.test.ts
             server/routes/persist.route.dual.test.ts
@@ -551,9 +552,10 @@ jobs:
       - name: Surface pg-suite result in job summary
         if: always()
         run: |
-          # 与 vitest 步同源六路径(改一处须同步另一处)。
+          # 与 vitest 步同源七路径(改一处须同步另一处)。
           required_files=(
             server/persist/backend.contract.dual.test.ts
+            server/persist/archive.contract.dual.test.ts
             server/persist/backend.pg.test.ts
             server/persist/permissionBackend.contract.dual.test.ts
             server/routes/persist.route.dual.test.ts
@@ -569,7 +571,7 @@ jobs:
             echo '观察窗已收口(七 PR 全绿),已注册进 main 分支保护必需 check `CI / pg suite (PG16)`(仿 #186→#193 e2e-kernel-gate 先例)。失败即阻断合并。'
             echo ''
             echo '### 时序'
-            echo '- #202 已于 2026-07-11 合入 main(初始四个 PG-gated 文件);#229 接入 p6saga 矩阵(五);G2.2(A1)加 authz matrix,现六个。'
+            echo '- #202 已于 2026-07-11 合入 main(初始四个 PG-gated 文件);#229 接入 p6saga 矩阵(五);G2.2(A1)加 authz matrix;PR #266 加 archive dual,现七个。'
             echo '- 每 PR 实跑真 PG 用例(双后端契约 32 场景 + saga 迁移矩阵 + 并发回归 + authz 矩阵),见下方 vitest 日志。'
             echo ''
             echo "### 本轮 vitest 匹配文件数(expected=$expected,不许静默:缺一即红)"
@@ -578,7 +580,7 @@ jobs:
             done
             echo ''
             if [ "$nFound" -eq "$expected" ]; then
-              echo "> **真 PG 测试模式**:found=$nFound/expected=$expected,六文件全在,vitest 实跑(见下方日志)。"
+              echo "> **真 PG 测试模式**:found=$nFound/expected=$expected,七文件全在,vitest 实跑(见下方日志)。"
             else
               echo "> **❌ 文件缺失**:found=$nFound/expected=$expected,缺 $((expected-nFound)) 个 → vitest 前置步已红,本步兜底 exit 1。"
             fi

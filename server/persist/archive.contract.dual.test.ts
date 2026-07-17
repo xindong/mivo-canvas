@@ -2,7 +2,8 @@
 // Phase 2 归档(PR-A):archive/unarchive tree 双后端契约套件(memory + PG)。
 // 覆盖:archive/unarchive 原子+幂等、级联归档(archivedByCascade=true)、D3 级联恢复只恢复 cascade 子画布
 // (单独归档的不被强制恢复)、includeArchived 列表过滤、D2 create(status:) 落库。
-// memory 永远跑;PG gate `MIVO_PG_TEST=1`(本地 brew PG port 55443),CI 无 PG → 跳过 PG,内存套件仍必跑。
+// memory 永远跑;PG gate `MIVO_PG_TEST=1`——CI pg-suite job 已接 PG16 service container 跑 PG 分支
+// (见 .github/workflows/ci.yml pg suite required_files,本文件已入白名单);本地无 brew PG(port 55443)时 skip PG describe,内存套件仍必跑。
 // 镜像 backend.contract.dual.test.ts 的 makeBackend/resetBackend + PG setup 模式。
 import { describe, it, expect, beforeEach, beforeAll, afterAll } from 'vitest'
 import { InMemoryPersistBackend, type PersistBackend } from './backend'
