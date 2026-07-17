@@ -1,7 +1,20 @@
 {
-  "lastGithash": "f317dbb0f1b52e5a7ed78209b8b2303298fbf7ec",
-  "updatedAt": "2026-07-16T08:44:07+08:00",
+  "lastGithash": "63c2dbf203141424dc4bd1362b3e04ef35d2892e",
+  "updatedAt": "2026-07-17T08:46:29+08:00",
   "entries": [
+    {
+      "date": "2026-07-16",
+      "prs": [
+        263
+      ],
+      "features": [],
+      "fixes": [
+        {
+          "text": "修复了迁移数据时演示项目重复收集导致的错误日志刷屏问题，并降低了后台迁移操作的日志噪声",
+          "by": "PraiseZhu"
+        }
+      ]
+    },
     {
       "date": "2026-07-15",
       "prs": [
