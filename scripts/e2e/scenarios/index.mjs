@@ -4,6 +4,7 @@ import { runArchiveAssetsScenario } from './archive-assets.mjs'
 import { runArchiveProjectScenario } from './archive-project.mjs'
 import { runArchiveCanvasScenario } from './archive-canvas.mjs'
 import { runArchiveCr6409Scenario } from './archive-cr6-409.mjs'
+import { runArchiveUiTrashScenario } from './archive-ui-trash.mjs'
 import { runMaskReflowScenario } from './mask-reflow.mjs'
 import { runCanvasInteractionsScenario } from './canvas-interactions.mjs'
 import { runChangelogScenario } from './changelog.mjs'
@@ -60,6 +61,7 @@ export const scenarioOrder = [
   'archive-project',
   'archive-canvas',
   'archive-cr6-409',
+  'archive-ui-trash',
   'userchip',
   'auto-prompt-settings',
 ]
@@ -87,6 +89,7 @@ export const scenarioRunners = {
   'archive-project': runArchiveProjectScenario,
   'archive-canvas': runArchiveCanvasScenario,
   'archive-cr6-409': runArchiveCr6409Scenario,
+  'archive-ui-trash': runArchiveUiTrashScenario,
   'mask-reflow': runMaskReflowScenario,
   'canvas-interactions': runCanvasInteractionsScenario,
   changelog: runChangelogScenario,

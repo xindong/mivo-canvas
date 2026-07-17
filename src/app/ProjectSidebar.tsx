@@ -23,7 +23,7 @@ import { toastFeedback } from '../store/toastStore'
 import type { CanvasId } from '../types/mivoCanvas'
 import { ChangelogPanel } from './ChangelogPanel'
 import { UserChip } from './settings/UserChip'
-import { buildSidebarModel } from './sidebar/projectSidebarModel'
+import { buildSidebarModel, type SidebarFilterView } from './sidebar/projectSidebarModel'
 import { useCollapsedProjects } from './sidebar/useCollapsedProjects'
 import { ProjectRow } from './sidebar/ProjectRow'
 import { CanvasRow } from './sidebar/CanvasRow'
@@ -68,6 +68,7 @@ export function ProjectSidebar({
   const debugEntries = useDebugLogStore((state) => state.entries)
   const clearDebugLog = useDebugLogStore((state) => state.clear)
   const [projectsOpen, setProjectsOpen] = useState(true)
+  const [filterView, setFilterView] = useState<SidebarFilterView>('active')
   const [changelogOpenedAt, setChangelogOpenedAt] = useState<number | null>(null)
   const [debugLogOpen, setDebugLogOpen] = useState(false)
   const [debugLogFilter, setDebugLogFilter] = useState<DebugLogLevel | 'all'>('all')
@@ -97,7 +98,10 @@ export function ProjectSidebar({
 
   // Derived sidebar model: project groups (sorted by latest activity) + standalone
   // canvas ids. Replaces the hardcoded demo projectGroups/starterCanvasIds.
-  const sidebarModel = useMemo(() => buildSidebarModel(projects, canvases), [projects, canvases])
+  const sidebarModel = useMemo(
+    () => buildSidebarModel(projects, canvases, filterView),
+    [projects, canvases, filterView],
+  )
 
   const openChangelog = () => {
     setChangelogOpenedAt(Date.now())
@@ -267,14 +271,40 @@ export function ProjectSidebar({
                 <ChevronRight className="row-hover-arrow" size={15} />
               )}
             </button>
-            <button
-              type="button"
-              aria-label="New project"
-              title="New project"
-              onClick={newProject}
-            >
-              <Plus size={15} />
-            </button>
+            <div className="sidebar-project-heading-actions">
+              <div className="sidebar-filter-toggle" role="group" aria-label="项目列表视图">
+                <button
+                  type="button"
+                  className={filterView === 'active' ? 'is-active' : ''}
+                  aria-label="显示进行中项目"
+                  aria-pressed={filterView === 'active'}
+                  data-filter-view="active"
+                  onClick={() => setFilterView('active')}
+                >
+                  进行中
+                </button>
+                <button
+                  type="button"
+                  className={filterView === 'archived' ? 'is-active' : ''}
+                  aria-label="显示回收站"
+                  aria-pressed={filterView === 'archived'}
+                  data-filter-view="archived"
+                  onClick={() => setFilterView('archived')}
+                >
+                  回收站
+                </button>
+              </div>
+              {filterView === 'active' ? (
+                <button
+                  type="button"
+                  aria-label="New project"
+                  title="New project"
+                  onClick={newProject}
+                >
+                  <Plus size={15} />
+                </button>
+              ) : null}
+            </div>
           </div>
           {projectsOpen ? (
             <div className="project-tree" aria-label="Project canvas tree">
@@ -291,6 +321,7 @@ export function ProjectSidebar({
                   onRenameStart={() => setRenamingProjectId(group.project.id)}
                   onRenameSubmit={() => setRenamingProjectId(null)}
                   onRenameCancel={() => setRenamingProjectId(null)}
+                  filterView={filterView}
                 />
               ))}
             </div>
@@ -300,14 +331,16 @@ export function ProjectSidebar({
         <section className="sidebar-section project-tree-section">
           <div className="section-heading">
             <span>Canvases</span>
-            <button
-              type="button"
-              aria-label="New standalone canvas"
-              title="New standalone canvas"
-              onClick={createStandaloneCanvas}
-            >
-              <Plus size={15} />
-            </button>
+            {filterView === 'active' ? (
+              <button
+                type="button"
+                aria-label="New standalone canvas"
+                title="New standalone canvas"
+                onClick={createStandaloneCanvas}
+              >
+                <Plus size={15} />
+              </button>
+            ) : null}
           </div>
           <div className="canvas-tree standalone-tree" aria-label="Standalone canvases">
             {sidebarModel.standaloneCanvasIds.map((canvasId) => (
@@ -316,6 +349,7 @@ export function ProjectSidebar({
                 canvasId={canvasId}
                 onOpenCanvas={openCanvasById}
                 onExpandProject={(projectId) => setProjectCollapsed(projectId, false)}
+                filterView={filterView}
               />
             ))}
           </div>

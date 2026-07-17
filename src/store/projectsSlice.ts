@@ -12,7 +12,7 @@ import { DEMO_PROJECTS } from './demoScenes'
 import { enqueuePersistWrite, isPersistWriteActive } from '../lib/persistBoot'
 import { normalizeDocument, documentFor } from './canvasDocumentModel'
 import { toastFeedback } from './toastStore'
-import { resolveActiveCanvasAfterArchive } from './archiveSurvivor'
+import { findPreferredCanvasSurvivorId, resolveActiveCanvasAfterArchive } from './archiveSurvivor'
 // Phase 1 项4(复活加固):store delete action 发起时写持久 tombstone(与队列记录生死解耦,覆盖溢出驱逐/重试
 //   耗尽离队后 pending-delete 失效的复活)。详见 src/lib/deletionTombstones.ts。
 // F-B(决策7,Phase 2 归档):restoreProject 经 revokeCanvasTombstonesForProject 撤销 deleteProject 级联写的子画布
@@ -95,9 +95,11 @@ export const createProjectsSlice: SliceCreator = (set, get) => ({
     //     不再返回它们 → 刷新不复现"迁回 standalone")。restore 经 restoreProject(POST ensureCreate →
     //     restoreProjectTree 整树复活)。content(nodes/edges)全量 hydrate 属 G1-c/阶段4,本轮删除的画板
     //     content 随本地 store 移除(阶段4 content 持久化后,restore 整树含 content)——已知 phase-1 gap。
-    //   local 模式(queue inert)→ 保留旧 standalone 回落(画板 body 保留,projectId→undefined)。
+    //   local 模式(queue inert)→ 普通 active 项目保留旧 standalone 回落(画板 body 保留,
+    //     projectId→undefined)；PR-C2 archived 项目“彻底删除”例外为整树移除。
     //     软删基础设施仅服务端有;local 不具备可恢复软删,"standalone 回落理由消失"以软删落地为前提,
-    //     local 无软删 → 保留回落防 IDB 数据丢失(决策 §6 目标针对服务端软删落地后的行为)。
+    //     local 无软删 → 普通删除保留回落防 IDB 数据丢失；只有用户在回收站二次确认“不可恢复”
+    //     时才整树移除。
     // P1-2(sol 返修):server 模式删完须维护 active-document 不变量——active canvas 被删时原子切首个
     //   存活 canvas 并同步顶层 flattened document(nodes/edges/tasks/selection/tool/history),否则 sceneId
     //   指向已删 document → 顶层 state 悬空 → 后续 generation/mask 读 canvases[sceneId] 崩。无 survivor
@@ -105,12 +107,30 @@ export const createProjectsSlice: SliceCreator = (set, get) => ({
     //   fallback 避免副作用,用户先移画板到其他项目再删)。local 模式无此问题(画板 standalone 回落)。
     // 函数式 set:与 createProject/renameProject 一致,不用外层 snapshot,避免并发 set 间丢更新。
     const serverAligned = isPersistWriteActive()
+    // PR-C2 P1:回收站中的 archived project 可能因脏数据仍挂 active child；侧栏会把这种
+    // child 防御性展示为 active standalone。彻底删除前必须 fail-closed，否则确认弹窗只统计
+    // archived child，却会把用户仍可见、可编辑的 active child 一并静默删除。
+    if (project.status === 'archived') {
+      const hasActiveChild = Object.values(get().canvases).some(
+        (document) => document.projectId === projectId && document.status !== 'archived',
+      )
+      if (hasActiveChild) {
+        warnCanvas(
+          `Delete archived project "${project.name}" blocked: project still contains non-archived canvases (${projectId}).`,
+        )
+        toastFeedback.warn('项目内还有未归档的画布，请先归档或移动它们再彻底删除')
+        return { status: 'blocked', reason: 'active-child' }
+      }
+    }
+    // PR-C2:archived 项目的“彻底删除”在 local 模式也必须删除整棵本地树；不能沿用普通
+    // local deleteProject 的“子画布回落 standalone”语义，否则确认“不可恢复”后子画布仍留回收站。
+    const deleteWholeTree = serverAligned || project.status === 'archived'
     let removedCanvasIds: string[] = []
     let blockedNoSurvivor = false
     set((state) => {
       removedCanvasIds = []
       blockedNoSurvivor = false
-      if (!serverAligned) {
+      if (!deleteWholeTree) {
         // local: cascade canvases to standalone (body 保留,projectId→undefined)
         const canvases = Object.fromEntries(
           Object.entries(state.canvases).map(([canvasId, document]) => {
@@ -140,8 +160,8 @@ export const createProjectsSlice: SliceCreator = (set, get) => ({
       if (!removedCanvasIds.includes(state.sceneId)) {
         return { projects: state.projects.filter((p) => p.id !== projectId), canvases }
       }
-      // P1-2:active canvas 被删 → 原子切首个存活 canvas + 同步顶层 flattened document/tool/history
-      const survivorId = survivingEntries[0][0]
+      // Q4-5:active canvas 被删 → 优先切 active survivor；没有 active 时才按既有插入序回落。
+      const survivorId = findPreferredCanvasSurvivorId(canvases)!
       const survivorDoc = normalizeDocument(documentFor(canvases, survivorId))
       return {
         projects: state.projects.filter((p) => p.id !== projectId),
@@ -163,13 +183,18 @@ export const createProjectsSlice: SliceCreator = (set, get) => ({
       warnCanvas(
         `Delete project "${project.name}" blocked: would leave zero canvases (≥1 canvas invariant; soft-delete-semantics.md:128). Move canvases to another project before deleting.`,
       )
+      toastFeedback.warn(
+        `无法删除项目"${project.name}":至少需保留一个画板，请先恢复项目，再创建或移动画板`,
+      )
       return { status: 'blocked', reason: 'no-survivor' }
     }
 
     logCanvas(
       serverAligned
         ? `Deleted project "${project.name}" (${projectId}); ${removedCanvasIds.length} canvas(es) removed (server whole-tree soft-delete; restorable via restoreProject)`
-        : `Deleted project "${project.name}" (${projectId}); ${removedCanvasIds.length} canvas(es) returned to standalone`,
+        : deleteWholeTree
+          ? `Deleted archived project "${project.name}" (${projectId}); ${removedCanvasIds.length} canvas(es) permanently removed from local store`
+          : `Deleted project "${project.name}" (${projectId}); ${removedCanvasIds.length} canvas(es) returned to standalone`,
     )
     // G1-a P1-1:server/shadow 模式 enqueue deleteProject(DELETE 幂等;服务端 softDeleteProjectTree 整树级联)。local no-op。
     enqueuePersistWrite({ kind: 'deleteProject', projectId })

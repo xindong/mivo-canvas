@@ -166,3 +166,39 @@ describe('buildSidebarModel — archived filtering (PR-C1 active view)', () => {
     expect(model.standaloneCanvasIds).toEqual(['orphan'])
   })
 })
+
+describe('buildSidebarModel — two-state filterView (PR-C2)', () => {
+  it('active view contains no archived items and archived view contains only archived items', () => {
+    const projects = [
+      project('p-active'),
+      project('p-archived', '2026-07-02T00:00:00.000Z', 'archived'),
+    ]
+    const canvases = {
+      activeChild: doc('2026-07-03T00:00:00.000Z', 'p-active', 'active child'),
+      archivedChild: doc('2026-07-04T00:00:00.000Z', 'p-archived', 'archived child', 'archived'),
+      activeStandalone: doc('2026-07-05T00:00:00.000Z', undefined, 'active standalone'),
+      archivedStandalone: doc('2026-07-06T00:00:00.000Z', undefined, 'archived standalone', 'archived'),
+    }
+
+    const active = buildSidebarModel(projects, canvases, 'active')
+    expect(active.projectGroups.map((group) => group.project.id)).toEqual(['p-active'])
+    expect(active.projectGroups[0]!.canvasIds).toEqual(['activeChild'])
+    expect(active.standaloneCanvasIds).toEqual(['activeStandalone'])
+
+    const archived = buildSidebarModel(projects, canvases, 'archived')
+    expect(archived.projectGroups.map((group) => group.project.id)).toEqual(['p-archived'])
+    expect(archived.projectGroups[0]!.canvasIds).toEqual(['archivedChild'])
+    expect(archived.standaloneCanvasIds).toEqual(['archivedStandalone'])
+  })
+
+  it('surfaces a directly archived canvas under an active project as archived standalone', () => {
+    const projects = [project('p-active')]
+    const canvases = {
+      archived: doc('2026-07-04T00:00:00.000Z', 'p-active', 'archived', 'archived'),
+    }
+
+    const archived = buildSidebarModel(projects, canvases, 'archived')
+    expect(archived.projectGroups).toEqual([])
+    expect(archived.standaloneCanvasIds).toEqual(['archived'])
+  })
+})

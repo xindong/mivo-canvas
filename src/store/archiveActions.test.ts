@@ -139,6 +139,50 @@ describe('archive next-state active survivor invariant', () => {
   })
 })
 
+describe('deleteProject archived whole-tree active-child gate (PR-C2 P1-1)', () => {
+  it('blocks permanent delete when the archived project still holds a non-archived child', () => {
+    seed(
+      {
+        dirtyChild: canvas('dirty active child', 'p1', 'active'),
+        archivedChild: canvas('archived child', 'p1', 'archived'),
+        survivor: canvas('outside survivor'),
+      },
+      [project('p1', 'archived')],
+      'survivor',
+    )
+
+    const result = useCanvasStore.getState().deleteProject('p1')
+
+    expect(result).toEqual({ status: 'blocked', reason: 'active-child' })
+    // 全部仍在:project + 两个子画布原样保留,零状态变更。
+    expect(useCanvasStore.getState().projects.find((item) => item.id === 'p1')?.status).toBe('archived')
+    expect(useCanvasStore.getState().canvases.dirtyChild?.status).toBe('active')
+    expect(useCanvasStore.getState().canvases.archivedChild?.status).toBe('archived')
+    expect(useToastStore.getState().entries.at(-1)).toMatchObject({
+      level: 'warning',
+      message: '项目内还有未归档的画布，请先归档或移动它们再彻底删除',
+    })
+  })
+
+  it('still permanently deletes the whole tree when every child is archived (regression)', () => {
+    seed(
+      {
+        archivedChild: canvas('archived child', 'p1', 'archived'),
+        survivor: canvas('outside survivor'),
+      },
+      [project('p1', 'archived')],
+      'survivor',
+    )
+
+    const result = useCanvasStore.getState().deleteProject('p1')
+
+    expect(result).toEqual({ status: 'deleted' })
+    expect(useCanvasStore.getState().projects.find((item) => item.id === 'p1')).toBeUndefined()
+    expect(useCanvasStore.getState().canvases.archivedChild).toBeUndefined()
+    expect(useCanvasStore.getState().canvases.survivor).toBeDefined()
+  })
+})
+
 describe('moveCanvasToProject archived target guard', () => {
   it('rejects an archived target project and warns', () => {
     seed({ c1: canvas('canvas') }, [project('p-archived', 'archived')], 'c1')

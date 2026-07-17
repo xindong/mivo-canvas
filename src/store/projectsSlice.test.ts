@@ -198,6 +198,25 @@ describe('projectsSlice: deleteProject', () => {
     // e2e FAIL 修复:project 不存在返回 status:'skipped'(供 UI 静默处理,不误弹 success toast)
     expect(result).toEqual({ status: 'skipped', reason: 'missing' })
   })
+
+  it('PR-C2:local 模式彻底删除 archived project 时整树移除，不把子画布回落到回收站 standalone', () => {
+    const projectId = 'project-archived'
+    seed({
+      projects: [{ id: projectId, name: 'Archived', createdAt: '2026-07-01T00:00:00.000Z', status: 'archived' }],
+      canvases: {
+        archivedChild: blankDocument({ title: 'archived child', projectId, status: 'archived' }),
+        activeSurvivor: blankDocument({ title: 'active survivor', status: 'active' }),
+      },
+      sceneId: 'activeSurvivor',
+    })
+
+    const result = useCanvasStore.getState().deleteProject(projectId)
+
+    expect(result).toEqual({ status: 'deleted' })
+    expect(useCanvasStore.getState().projects).toEqual([])
+    expect(useCanvasStore.getState().canvases.archivedChild).toBeUndefined()
+    expect(useCanvasStore.getState().canvases.activeSurvivor).toBeDefined()
+  })
 })
 
 describe('documentSlice: moveCanvasToProject', () => {
