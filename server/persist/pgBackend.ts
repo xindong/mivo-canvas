@@ -292,7 +292,7 @@ export class PgPersistBackend implements PersistBackend {
     const e = this.canvasIndex.get(id)
     return e ? { ownerId: e.ownerId } : undefined
   }
-  /** F1:project 存在且 !isDeleted(缓存读,反映已提交状态;事务内 F1 检查用 projectLiveInTrx 防 TOCTOU)。 */
+  /** F1:project 存在且 !isDeleted(缓存读,反映已提交状态;事务内 F1/SG-1 检查用 projectStateInTrx 防 TOCTOU)。 */
   projectLive(ownerId: string, projectId: string): boolean {
     const e = this.projectIndex.get(projectId)
     return !!e && e.ownerId === ownerId && !e.isDeleted
@@ -327,15 +327,19 @@ export class PgPersistBackend implements PersistBackend {
     }
   }
 
-  /** 事务内 F1:SELECT...FOR UPDATE project 行(防跨事务 TOCTOU;返 live 状态)。 */
-  private async projectLiveInTrx(trx: Kysely<Database>, ownerId: string, projectId: string): Promise<boolean> {
+  /**
+   * 事务内 F1+SG-1:SELECT...FOR UPDATE project 行,同时返 live 与 archived 状态(单查询,防跨事务 TOCTOU)。
+   * archived 判据取 projects 瘦索引 status 列(archive/unarchive tree 与 persist_records 同事务同步,F-idx)。
+   */
+  private async projectStateInTrx(trx: Kysely<Database>, ownerId: string, projectId: string): Promise<{ live: boolean; archived: boolean }> {
     const r = await trx
       .selectFrom('projects')
-      .select(['owner_id', 'is_deleted'])
+      .select(['owner_id', 'is_deleted', 'status'])
       .where('id', '=', projectId)
       .forUpdate()
       .executeTakeFirst()
-    return !!r && r.owner_id === ownerId && !r.is_deleted
+    const live = !!r && r.owner_id === ownerId && !r.is_deleted
+    return { live, archived: live && r!.status === 'archived' }
   }
 
   /** 事务内原子 bump canvas meta payload.contentVersion(不动 metaRevision;#5)。返新 contentVersion。 */
@@ -637,9 +641,14 @@ export class PgPersistBackend implements PersistBackend {
             }
           }
           // F1:canvas 父 project 须 live(软删 parent 下禁独立 child create/restore;在 idem-replay 之前)。
+          // SG-1:archived 目标 project 拒子记录 create/restore(route → 409 archived;defense-in-depth)。
           if (type === 'canvas') {
             const pid = asCanvasMeta(payload)?.projectId
-            if (pid && !(await this.projectLiveInTrx(trx, ownerId, pid))) return { kind: 'parent-not-live' }
+            if (pid) {
+              const ps = await this.projectStateInTrx(trx, ownerId, pid)
+              if (!ps.live) return { kind: 'parent-not-live' }
+              if (ps.archived) return { kind: 'parent-archived' }
+            }
           }
           // 返修 #10/N4:幂等 header 复用(owner+method+resourceKind+key + fingerprint)。
           if (opts.idempotencyKey) {
@@ -812,8 +821,13 @@ export class PgPersistBackend implements PersistBackend {
             if (r) return { kind: 'exists-other-owner', record: rowToRecord(r) }
           }
           // F1:父 project 须 live(软删 parent 下禁独立 child create/restore;防 orphan)。
+          // SG-1:archived 目标 project 拒子画布 create(route → 409 archived;defense-in-depth)。
           const pid = asCanvasMeta(canvasPayload)?.projectId
-          if (pid && !(await this.projectLiveInTrx(trx, ownerId, pid))) return { kind: 'parent-not-live' }
+          if (pid) {
+            const ps = await this.projectStateInTrx(trx, ownerId, pid)
+            if (!ps.live) return { kind: 'parent-not-live' }
+            if (ps.archived) return { kind: 'parent-archived' }
+          }
           // 幂等 replay(owner+method+resourceKind+key + fingerprint)。
           if (opts.idempotencyKey) {
             const entry = await this.idempotencyEntryInTrx(trx, ownerId, opts.method, opts.resourceKind, opts.idempotencyKey)
@@ -823,8 +837,13 @@ export class PgPersistBackend implements PersistBackend {
                 if (opts.bodyFingerprint && entry.fingerprint !== opts.bodyFingerprint) return { kind: 'reuse-conflict' }
                 // N2/F1:幂等命中 deleted → 真恢复(事务内:复验 parent live + restore canvas+collection + ensureCollectionLive)。
                 if (r.is_deleted) {
+                  // SG-1:restore 路径同门禁(archived 目标 project 拒恢复)。
                   const pid2 = asCanvasMeta(canvasPayload)?.projectId
-                  if (pid2 && !(await this.projectLiveInTrx(trx, ownerId, pid2))) return { kind: 'parent-not-live' }
+                  if (pid2) {
+                    const ps2 = await this.projectStateInTrx(trx, ownerId, pid2)
+                    if (!ps2.live) return { kind: 'parent-not-live' }
+                    if (ps2.archived) return { kind: 'parent-archived' }
+                  }
                   // F1:replay 命中 deleted → 真恢复。idem 条目已存在(:602 读到),不重插(否则误判 race loser→回滚恢复)。
                   // F4:按 restoreCanvasTreeInTrx 的 rowCount 定输赢——0 行(并发赢家已恢复)→ existing。
                   const { metaRestored } = await this.restoreCanvasTreeInTrx(trx, ownerId, canvasId, { payload: canvasPayload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint, status: opts.status })
@@ -1025,9 +1044,14 @@ export class PgPersistBackend implements PersistBackend {
             }
           }
           // F1:canvas PUT move 目标 project 须 live(防 move 到软删 project)。idem-replay 之后、existing 之前。
+          // SG-1:archived 目标 project 拒 PUT move/meta 写(route → 409 archived;与 CR-6 canvas 级闸门同语义)。
           if (type === 'canvas') {
             const pid = asCanvasMeta(payload)?.projectId
-            if (pid && !(await this.projectLiveInTrx(trx, ownerId, pid))) return { kind: 'parent-not-live' }
+            if (pid) {
+              const ps = await this.projectStateInTrx(trx, ownerId, pid)
+              if (!ps.live) return { kind: 'parent-not-live' }
+              if (ps.archived) return { kind: 'parent-archived' }
+            }
           }
           const existing = await trx.selectFrom('persist_records').selectAll().where('owner_id', '=', ownerId).where('type', '=', type).where('id', '=', id).executeTakeFirst()
           const scope: PersistScope = opts.scope ?? 'document'
@@ -1684,9 +1708,16 @@ export class PgPersistBackend implements PersistBackend {
     return { count: res.count }
   }
 
-  async softDeleteProjectTree(ownerId: string, projectId: string): Promise<{ count: number }> {
+  async softDeleteProjectTree(ownerId: string, projectId: string): Promise<{ count: number; blocked?: 'active-child' }> {
     await this.ready
     const res = await this.db.transaction().execute(async (trx) => {
+      // SG-2:archived project 删除门禁——存在 status!=='archived' 的 live 子画布 → blocked,整事务零写
+      // (与 client 'active-child' blocked reason 同语义;FOR UPDATE 锁 project 行防与 archive/unarchive 并发 TOCTOU)。
+      const ps = await this.projectStateInTrx(trx, ownerId, projectId)
+      if (ps.archived) {
+        const activeChild = await trx.selectFrom('persist_records').select('id').where('owner_id', '=', ownerId).where('type', '=', 'canvas').where(sql`payload->>'projectId'`, '=', projectId).where('is_deleted', '=', false).where('status', '!=', 'archived').limit(1).executeTakeFirst()
+        if (activeChild) return { count: 0, blocked: 'active-child' as const, projIdxOwner: undefined, childIdxOwners: [] }
+      }
       // F5:先选定本 project 下 live child canvas 集合(级联软删前),供 canvases 瘦索引同步(与 persist_records canvas meta 软删同集)。
       const childCv = await trx.selectFrom('persist_records').select(['id']).where('owner_id', '=', ownerId).where('type', '=', 'canvas').where(sql`payload->>'projectId'`, '=', projectId).where('is_deleted', '=', false).execute()
       const childIds = childCv.map((r) => r.id)
@@ -1704,8 +1735,10 @@ export class PgPersistBackend implements PersistBackend {
         : []
       // 注:project tree cascade 软删只标 project + 其 canvas meta + chat-collection;children 保持活记录(#2)。
       const count = Number((p?.numUpdatedRows ?? 0n) > 0n ? 1n : 0n) + Number((cv?.numUpdatedRows ?? 0n) > 0n ? 1n : 0n) + Number((cc?.numUpdatedRows ?? 0n) > 0n ? 1n : 0n)
-      return { count, projIdxOwner: projIdx?.owner_id, childIdxOwners: childIdx.map((x) => ({ id: x.id, ownerId: x.owner_id })) }
+      return { count, blocked: undefined as 'active-child' | undefined, projIdxOwner: projIdx?.owner_id, childIdxOwners: childIdx.map((x) => ({ id: x.id, ownerId: x.owner_id })) }
     })
+    // SG-2:blocked → 零写零缓存变更,直接透传。
+    if (res.blocked) return { count: 0, blocked: res.blocked }
     // F2/F5:post-commit 仅当事务实际命中 durable 行(用 DB owner_id);child canvases 同步。0 行 → 不碰缓存(无幽灵)。
     if (res.projIdxOwner !== undefined) this.setIndexEntry('project', projectId, res.projIdxOwner, true)
     for (const c of res.childIdxOwners) this.setIndexEntry('canvas', c.id, c.ownerId, true)

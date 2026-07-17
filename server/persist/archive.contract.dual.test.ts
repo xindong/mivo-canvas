@@ -152,6 +152,87 @@ const runArchiveSuite = (
       const def = await b.listByOwner('o', 'canvas')
       expect(def.records.map((r) => r.id)).toContain('c1')
     })
+
+    // ── SG-1:archived-parent 写入闸门(server 端 defense-in-depth,route → 409 archived)──
+    it('SG-1:createCanvasWithCollection → archived 目标 project → parent-archived(不落任何行)', async () => {
+      await setup(b, 'o', 'p1', ['c1'])
+      await b.archiveProjectTree('o', 'p1')
+      const r = await b.createCanvasWithCollection('o', 'c9', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      expect(r.kind).toBe('parent-archived')
+      expect((await b.get('o', 'canvas', 'c9')).kind).toBe('missing')
+    })
+
+    it('SG-1:ensureCreate(canvas) → archived 目标 project → parent-archived', async () => {
+      await setup(b, 'o', 'p1', ['c1'])
+      await b.archiveProjectTree('o', 'p1')
+      const r = await b.ensureCreate('o', 'canvas', 'c9', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      expect(r.kind).toBe('parent-archived')
+    })
+
+    it('SG-1:upsert(canvas) move → archived 目标 project → parent-archived(canvas 留在原 project)', async () => {
+      await setup(b, 'o', 'p1', ['c1'])
+      await b.ensureCreate('o', 'project', 'p2', { name: 'P2' }, { method: 'POST', resourceKind: 'project' })
+      await b.archiveProjectTree('o', 'p2')
+      const c1 = await rec(b, 'o', 'canvas', 'c1')
+      const r = await b.upsert('o', 'canvas', 'c1', { projectId: 'p2' }, { base: c1.revision, scope: 'document', method: 'PUT', resourceKind: 'canvas' })
+      expect(r.kind).toBe('parent-archived')
+      const after = await rec(b, 'o', 'canvas', 'c1')
+      expect((after.payload as { projectId?: string }).projectId).toBe('p1')
+    })
+
+    it('SG-1:软删 canvas 后 archive project → 重 POST(restore 路径)→ parent-archived(禁向 archived project 复活子画布)', async () => {
+      await setup(b, 'o', 'p1', ['c1'])
+      await b.softDeleteCanvasTree('o', 'c1')
+      await b.archiveProjectTree('o', 'p1')
+      const r = await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      expect(r.kind).toBe('parent-archived')
+      const got = await b.get('o', 'canvas', 'c1')
+      expect(got.kind === 'found' && got.record.isDeleted).toBe(true) // 未被复活
+    })
+
+    it('SG-1:active 目标 project create/move 不受影响(回归)', async () => {
+      await setup(b, 'o', 'p1', ['c1'])
+      await b.ensureCreate('o', 'project', 'p2', { name: 'P2' }, { method: 'POST', resourceKind: 'project' })
+      const r1 = await b.createCanvasWithCollection('o', 'c9', { projectId: 'p2' }, { method: 'POST', resourceKind: 'canvas' })
+      expect(r1.kind).toBe('created')
+      const c1 = await rec(b, 'o', 'canvas', 'c1')
+      const r2 = await b.upsert('o', 'canvas', 'c1', { projectId: 'p2' }, { base: c1.revision, scope: 'document', method: 'PUT', resourceKind: 'canvas' })
+      expect(r2.kind).toBe('updated')
+    })
+
+    // ── SG-2:archived project 删除 active-child 门禁(route → 409 active-child)──
+    it('SG-2:archived project + active 子画布 → softDeleteProjectTree blocked(零写)', async () => {
+      await setup(b, 'o', 'p1', ['c1', 'c2'])
+      await b.archiveProjectTree('o', 'p1')
+      await b.unarchiveCanvasTree('o', 'c1') // 制造 archived project 下的 active child
+      const r = await b.softDeleteProjectTree('o', 'p1')
+      expect(r).toEqual({ count: 0, blocked: 'active-child' })
+      // 零写:project 与子画布均未被软删
+      expect((await rec(b, 'o', 'project', 'p1')).isDeleted).toBe(false)
+      expect((await rec(b, 'o', 'canvas', 'c1')).isDeleted).toBe(false)
+      expect((await rec(b, 'o', 'canvas', 'c2')).isDeleted).toBe(false)
+    })
+
+    it('SG-2:archived project + 纯 archived 子画布 → 整树软删成功', async () => {
+      await setup(b, 'o', 'p1', ['c1', 'c2'])
+      await b.archiveProjectTree('o', 'p1')
+      const r = await b.softDeleteProjectTree('o', 'p1')
+      expect(r.blocked).toBeUndefined()
+      expect(r.count).toBeGreaterThan(0)
+      expect((await rec(b, 'o', 'project', 'p1')).isDeleted).toBe(true)
+      expect((await rec(b, 'o', 'canvas', 'c1')).isDeleted).toBe(true)
+      expect((await rec(b, 'o', 'canvas', 'c2')).isDeleted).toBe(true)
+    })
+
+    it('SG-2:active project 正常删除(整树软删)语义不变(回归,门禁只针对 archived project)', async () => {
+      await setup(b, 'o', 'p1', ['c1', 'c2'])
+      const r = await b.softDeleteProjectTree('o', 'p1')
+      expect(r.blocked).toBeUndefined()
+      expect(r.count).toBeGreaterThan(0)
+      expect((await rec(b, 'o', 'project', 'p1')).isDeleted).toBe(true)
+      expect((await rec(b, 'o', 'canvas', 'c1')).isDeleted).toBe(true)
+      expect((await rec(b, 'o', 'canvas', 'c2')).isDeleted).toBe(true)
+    })
   })
 }
 

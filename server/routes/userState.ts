@@ -211,8 +211,8 @@ export const createUserStateRoutes = ({ backend }: { backend: PersistBackend }):
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 409, latencyMs: Date.now() - t0, note: 'rev-conflict' })
       return c.json(err, 409)
     }
-    // F1 防御:user-state 无父 project,parent-not-live 不可达;类型收窄。
-    if (result.kind === 'parent-not-live') {
+    // F1/SG-1 防御:user-state 无父 project,parent-not-live/parent-archived 不可达;类型收窄。
+    if (result.kind === 'parent-not-live' || result.kind === 'parent-archived') {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'parent-not-live' })
       return c.json({ error: 'unknown-key' } satisfies UnknownResourceBody, 404)
     }

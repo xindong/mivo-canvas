@@ -227,4 +227,82 @@ describe('Phase 2 归档 routes (PR-A)', () => {
     const all = await req(app, '/api/canvas?includeArchived=true', { headers: hdr(KEY_A) })
     expect((all.body as { canvases: { id: string }[] }).canvases.map((c) => c.id)).not.toContain('c1')
   })
+
+  // ── SG-1:server 端 archived-parent 写入闸门(canvas POST create / PUT move → 409 archived)──
+  it('SG-1:POST /api/canvas → archived 目标 project → 409 {error:archived,id:projectId};canvas 未落库', async () => {
+    await createProject('p1')
+    await req(app, '/api/projects/p1/archive', { method: 'POST', headers: hdr(KEY_A) })
+    const c = await createCanvas('c9', 'p1')
+    expect(c.status).toBe(409)
+    expect(c.body).toEqual({ error: 'archived', id: 'p1' })
+    expect((await req(app, '/api/canvas/c9', { headers: hdr(KEY_A) })).status).toBe(404)
+  })
+
+  it('SG-1:POST /api/canvas {status:archived} → archived 目标 project 同样 409(闸门不因 incoming status 放行)', async () => {
+    await createProject('p1')
+    await req(app, '/api/projects/p1/archive', { method: 'POST', headers: hdr(KEY_A) })
+    const c = await createCanvas('c9', 'p1', 'archived')
+    expect(c.status).toBe(409)
+    expect(c.body).toEqual({ error: 'archived', id: 'p1' })
+  })
+
+  it('SG-1:PUT /api/canvas/:id move → archived 目标 project → 409 {error:archived,id:目标 projectId};canvas 留在原 project', async () => {
+    await setup() // p1 + c1/c2(active)
+    await createProject('p2')
+    await req(app, '/api/projects/p2/archive', { method: 'POST', headers: hdr(KEY_A) })
+    const put = await req(app, '/api/canvas/c1', {
+      method: 'PUT',
+      headers: { ...hdr(KEY_A), 'if-match': '0' },
+      body: JSON.stringify({ payload: { projectId: 'p2', title: 'c1' } }),
+    })
+    expect(put.status).toBe(409)
+    expect(put.body).toEqual({ error: 'archived', id: 'p2' })
+    const g = await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })
+    expect((g.body as { projectId?: string }).projectId).toBe('p1')
+  })
+
+  it('SG-1:move 到 active 目标 project 不受影响(回归)', async () => {
+    await setup()
+    await createProject('p2')
+    const put = await req(app, '/api/canvas/c1', {
+      method: 'PUT',
+      headers: { ...hdr(KEY_A), 'if-match': '0' },
+      body: JSON.stringify({ payload: { projectId: 'p2', title: 'c1' } }),
+    })
+    expect(put.status).toBe(200)
+    expect((put.body as { projectId?: string }).projectId).toBe('p2')
+  })
+
+  // ── SG-2:archived project 删除 active-child 门禁(DELETE /api/projects/:id → 409 active-child)──
+  it('SG-2:DELETE archived project(下有 active 子画布)→ 409 {error:active-child,id};零删除', async () => {
+    await setup()
+    await req(app, '/api/projects/p1/archive', { method: 'POST', headers: hdr(KEY_A) })
+    // 制造 archived project 下的 active child:单独恢复 c1
+    await req(app, '/api/canvas/c1/unarchive', { method: 'POST', headers: hdr(KEY_A) })
+    const del = await req(app, '/api/projects/p1', { method: 'DELETE', headers: hdr(KEY_A) })
+    expect(del.status).toBe(409)
+    expect(del.body).toEqual({ error: 'active-child', id: 'p1' })
+    // 零删除:project 与子画布仍可读
+    expect((await req(app, '/api/projects/p1', { headers: hdr(KEY_A) })).status).toBe(200)
+    expect((await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })).status).toBe(200)
+    expect((await req(app, '/api/canvas/c2', { headers: hdr(KEY_A) })).status).toBe(200)
+  })
+
+  it('SG-2:DELETE archived project(纯 archived 子画布)→ 204 整树软删成功', async () => {
+    await setup()
+    await req(app, '/api/projects/p1/archive', { method: 'POST', headers: hdr(KEY_A) })
+    const del = await req(app, '/api/projects/p1', { method: 'DELETE', headers: hdr(KEY_A) })
+    expect(del.status).toBe(204)
+    expect((await req(app, '/api/projects/p1', { headers: hdr(KEY_A) })).status).toBe(404)
+    expect((await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })).status).toBe(404)
+  })
+
+  it('SG-2:DELETE active project(整树软删)语义不变(回归,门禁只针对 archived project)', async () => {
+    await setup()
+    const del = await req(app, '/api/projects/p1', { method: 'DELETE', headers: hdr(KEY_A) })
+    expect(del.status).toBe(204)
+    expect((await req(app, '/api/projects/p1', { headers: hdr(KEY_A) })).status).toBe(404)
+    expect((await req(app, '/api/canvas/c1', { headers: hdr(KEY_A) })).status).toBe(404)
+    expect((await req(app, '/api/canvas/c2', { headers: hdr(KEY_A) })).status).toBe(404)
+  })
 })
