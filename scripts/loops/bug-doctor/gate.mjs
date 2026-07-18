@@ -279,6 +279,14 @@ const scoreClusters = (state, rules, refNowMs) => {
     const growth = prev24h > 0 && count24h >= prev24h * 2 ? scoring.growthMultiplier : 1
     const score = levelWeight * impact * processWeight * freshness * growth
 
+    // 人工报告簇(intake.mjs 写入,origin=human-report):S 级由 intake 默认
+    // (S1 候诊)与分诊会话裁定,gate 不按日志判据重算覆盖(source=HumanReport
+    // 不命中核心流程 pattern,重算会把候诊 S1 错降成 S2/S3)。score 仍正常算。
+    if (cluster.origin === 'human-report') {
+      scored[fp] = { score, count24h, prev24h, distinctClients24h, process: proc ? proc.id : null }
+      continue
+    }
+
     // S 级判定(S0→S3 顺序短路;判据全部来自 rules.json)
     let sLevel = 'S3'
     if (isError && cluster.silentFailure) {
