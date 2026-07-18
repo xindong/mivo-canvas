@@ -100,3 +100,4 @@ node scripts/loops/bug-doctor/intake.mjs status
 - gate 重打分**不覆盖**人工簇 S 级(gate.mjs 按 `origin` 判断);升降级由分诊会话直接改台账字段。**例外**:生产日志记录并入同指纹人工簇时,gate 会解除 `origin` 标记,让真实日志判据接管 S 级(silentFailure/S0 不被候诊 S1 压住)——人工报告不自动高于日志信号,反之亦然。
 - 报单人白名单:`history/loops/bug-doctor/notify.env` 的 `INTAKE_ALLOWLIST`(逗号分隔 Slack user id,不入 git);扩权(T2-7)只改这一处。
 - 台账位置:接单会话跑在 `.xdt-worktrees/` 隔离工作树,但 intake.mjs 默认按 git common dir 穿透到**主 checkout** 的 `history/loops/bug-doctor/` 读写——全仓只有一份台账,勿传 `--state-dir` 覆盖。
+- 台账锁:report 与 gate/班车共用一把互斥锁;锁接管协议存在三方连环微秒级窗口,极端交错下单轮写入可能被覆盖丢失(人工报单无自动重放,丢单需报单人重发)——条件与后果详见 `docs/loops/bug-doctor.md`「已知局限」末条。
