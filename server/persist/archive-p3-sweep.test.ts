@@ -32,16 +32,34 @@ describe('P3 sweep — item 1: restoreCanvasTree parent-archived 守卫(memory)'
     expect(await res.json()).toEqual({ error: 'archived', id: 'p1' })
   })
 
-  it('无 payload / payload 无 projectId → 不触发守卫(同 create 路径 if(pid) 语义,no-op 不误判)', async () => {
+  it('空 opts + parent archived → throw ArchivedParentWriteError(默认调用形态现也判;零写,canvas/chat-collection 仍 deleted)', async () => {
     await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
     await b.ensureCreate('o', 'canvas', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
     await b.ensureCreate('o', 'chat-collection', 'c1', {}, { canvasId: 'c1', method: 'POST', resourceKind: 'chat-collection' })
     await b.softDeleteCanvasTree('o', 'c1')
-    // 空 opts(既有调用面 / 测试传法)→ 不判,正常恢复(行为不变,回归不破)
+    await b.archiveProjectTree('o', 'p1')
+    // 审查方隔离复现序列:softDelete c1 → archive p1 → restore c1(空 opts,最常见调用形态)。
+    // 修复前:守卫只读 opts.payload?.projectId,空 opts 不判 → 成功恢复进 archived project(漏洞)。
+    // 修复后:effectiveProjectId fallback 读 c1 现存 payload.projectId=p1,p1 archived → fail-fast(零写)。
+    const probe = b.restoreCanvasTree('o', 'c1')
+    await expect(probe).rejects.toBeInstanceOf(ArchivedParentWriteError)
+    // 零写:失败 probe 未触达 restoreCanvasTreeInPlace → c1 canvas meta + chat-collection 仍 soft-deleted
+    const cv = await b.get('o', 'canvas', 'c1')
+    expect(cv.kind).toBe('found')
+    if (cv.kind === 'found') expect(cv.record.isDeleted).toBe(true)
+    const cc = await b.get('o', 'chat-collection', 'c1')
+    expect(cc.kind).toBe('found')
+    if (cc.kind === 'found') expect(cc.record.isDeleted).toBe(true)
+  })
+
+  it('空 opts + parent active → 正常恢复(回归,默认调用形态在 active parent 下行为不变)', async () => {
+    await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+    await b.ensureCreate('o', 'canvas', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+    await b.ensureCreate('o', 'chat-collection', 'c1', {}, { canvasId: 'c1', method: 'POST', resourceKind: 'chat-collection' })
+    await b.softDeleteCanvasTree('o', 'c1')
+    // 空 opts + parent active → 读 c1 现存 payload.projectId=p1,p1 active → 放行,正常恢复(原行为回归不破)
     const { count } = await b.restoreCanvasTree('o', 'c1')
     expect(count).toBe(2)
-    // payload 无 projectId → 不触发守卫(c1 已恢复 live,restore 返 0 不 bump,不 throw)
-    await expect(b.restoreCanvasTree('o', 'c1', { payload: { title: 't' } })).resolves.toBeDefined()
   })
 
   it('payload.projectId 指向 active project → 不触发守卫(正常恢复,不误判)', async () => {

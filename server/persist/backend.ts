@@ -2071,13 +2071,20 @@ export class InMemoryPersistBackend implements PersistBackend {
     canvasId: string,
     opts: { payload?: unknown; idempotencyKey?: string; fingerprint?: string; status?: RecordStatus } = {},
   ): Promise<{ count: number }> {
-    // P3 item 1 SG-1 守卫:opts.payload.projectId 指向 archived project → throw ArchivedParentWriteError,
-    // 与 createCanvasWithCollection / restoreCanvasWithCollectionCritical 同语义。该 primitive 当前无生产
-    // 调用方(internal restoreMeta 路径已在上游 ensureCreate 的 SG-1 守卫覆盖),守卫防未来误用——直接调
-    // public restoreCanvasTree 把 canvas 恢复进 archived project 的违规路径在此 fail-fast。无 payload 或
-    // payload 无 projectId → no-op(不判,同 create 路径 `if (pid && ...)` 语义)。
-    const pid = asCanvasMeta(opts.payload)?.projectId
-    if (pid && this.projectArchived(ownerId, pid)) throw new ArchivedParentWriteError(pid)
+    // P3 item 1 SG-1 守卫:恢复进 archived project → throw ArchivedParentWriteError(零写),与
+    // createCanvasWithCollection / restoreCanvasWithCollectionCritical 同语义。effectiveProjectId =
+    // opts.payload.projectId(若提供,restore-via-POST 带 new payload 场景)否则读取待恢复 canvas 现存
+    // payload.projectId——这样 restoreCanvasTree(owner,id) 默认调用形态(无 opts,最常见)也判,堵审查方
+    // 隔离复现 softDelete c1→archive p1→restore c1 原绕过守卫把 canvas 恢复进 archived project 的违规路径。
+    // 该 primitive 当前无生产调用方(internal restoreMeta 路径已在上游 ensureCreate 的 SG-1 守卫覆盖),守卫
+    // 防未来误用。memory 侧在恢复前判(restoreCanvasTreeInPlace 同步临界区无 await 让出点,无 TOCTOU 窗口)。
+    // canvas 不存在 / 无 projectId → no-op(同 create 路径 `if (pid)` 语义,不误判)。
+    const pidFromOpts = asCanvasMeta(opts.payload)?.projectId
+    const existing = this.find(ownerId, 'canvas', canvasId)
+    const effectiveProjectId = pidFromOpts ?? asCanvasMeta(existing?.payload)?.projectId
+    if (effectiveProjectId && this.projectArchived(ownerId, effectiveProjectId)) {
+      throw new ArchivedParentWriteError(effectiveProjectId)
+    }
     return { count: this.restoreCanvasTreeInPlace(ownerId, canvasId, opts) }
   }
 

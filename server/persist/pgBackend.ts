@@ -485,6 +485,25 @@ export class PgPersistBackend implements PersistBackend {
   }
 
   /**
+   * 事务内无锁读 canvas 现存 payload->>'projectId'(P3 item 1 restoreCanvasTree SG-1 守卫 fallback:
+   * 无 opts.payload 时读待恢复 canvas 的 parent project id)。与 lockCanvasParentProjectInTrx 读段同形,
+   * 但不锁 projects 行——锁由调用方 projectStateInTrx 显式取,保持 projects-first 锁序(projects 行 →
+   * persist_records canvas meta;restoreCanvasTreeInTrx 只动 persist_records/canvases 索引,不碰 projects
+   * 表,无锁序冲突)。canvas 不存在 / payload 无 projectId → undefined(守卫 no-op,同 create `if(pid)` 语义)。
+   */
+  private async canvasProjectIdInTrx(trx: Kysely<Database>, ownerId: string, canvasId: string): Promise<string | undefined> {
+    const row = await trx
+      .selectFrom('persist_records')
+      .select(sql`payload->>'projectId'`.as('project_id'))
+      .where('owner_id', '=', ownerId)
+      .where('type', '=', 'canvas')
+      .where('id', '=', canvasId)
+      .executeTakeFirst()
+    const projectId = typeof row?.project_id === 'string' && row.project_id.length > 0 ? row.project_id : undefined
+    return projectId
+  }
+
+  /**
    * 直接 canvas archive/unarchive：parent-project-first + parent CAS + 有界新事务重试。
    * CAS miss 且 canvas 仍处于 source status 说明并发 move 赢了；throw 使旧 parent 锁先释放，再重试。
    * 已到 target status / 已删除 / 不存在是真幂等 no-op。三次 parent churn 后显式返回 retryableConflict。
@@ -2033,15 +2052,21 @@ export class PgPersistBackend implements PersistBackend {
   async restoreCanvasTree(ownerId: string, canvasId: string, opts: { payload?: unknown; idempotencyKey?: string; fingerprint?: string } = {}): Promise<{ count: number }> {
     await this.ready
     const res = await this.db.transaction().execute(async (trx) => {
-      // P3 item 1 SG-1 守卫:opts.payload.projectId 指向 archived project → throw ArchivedParentWriteError,
-      // 与 createCanvasWithCollection / ensureCreate 同语义(事务内 projectStateInTrx 锁 projects 行 + 读
-      // status,防 TOCTOU)。该 primitive 当前无生产调用方(internal restoreMetaInTrx 已在上游
-      // ensureCreate 的 SG-1 守卫覆盖),守卫防未来误用。无 payload / payload 无 projectId → no-op(同 create
-      // 路径 `if (pid)` 语义;既有 direct 调用面 tests 传空 opts,不受影响)。
-      const pid = asCanvasMeta(opts.payload)?.projectId
-      if (pid) {
-        const ps = await this.projectStateInTrx(trx, ownerId, pid)
-        if (ps.archived) throw new ArchivedParentWriteError(pid)
+      // P3 item 1 SG-1 守卫:恢复进 archived project → throw ArchivedParentWriteError(零写),与
+      // createCanvasWithCollection / ensureCreate 同语义(事务内 projectStateInTrx 锁 projects 行 + 读
+      // status,防 TOCTOU)。effectiveProjectId = opts.payload.projectId(若提供,restore-via-POST 带 new
+      // payload 场景)否则读取待恢复 canvas 现存 payload.projectId——这样 restoreCanvasTree(owner,id) 默认
+      // 调用形态(无 opts,最常见)也判,堵审查方隔离复现 softDelete c1→archive p1→restore c1 原绕过守卫
+      // 把 canvas 恢复进 archived project 的违规路径。无锁读 canvas 行(canvasProjectIdInTrx)随后
+      // projectStateInTrx 锁 projects 行,与 lockCanvasParentProjectInTrx 同 projects-first 锁序;
+      // restoreCanvasTreeInTrx 只动 persist_records/canvases 索引,不碰 projects 表,无锁序冲突。
+      // canvas 不存在 / 无 projectId → no-op(同 create 路径 `if (pid)` 语义)。该 primitive 当前无生产
+      // 调用方(internal restoreMetaInTrx 已在上游 ensureCreate 的 SG-1 守卫覆盖),守卫防未来误用。
+      const pidFromOpts = asCanvasMeta(opts.payload)?.projectId
+      const effectiveProjectId = pidFromOpts ?? await this.canvasProjectIdInTrx(trx, ownerId, canvasId)
+      if (effectiveProjectId) {
+        const ps = await this.projectStateInTrx(trx, ownerId, effectiveProjectId)
+        if (ps.archived) throw new ArchivedParentWriteError(effectiveProjectId)
       }
       return this.restoreCanvasTreeInTrx(trx, ownerId, canvasId, opts)
     })
