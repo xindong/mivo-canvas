@@ -6,7 +6,7 @@
 // 在其上追加实现所需字段(lock 文件独立、processedIds、hourly、digest),
 // 均为增量字段,不改动既定字段语义。
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync, appendFileSync, unlinkSync, renameSync, statSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, existsSync, appendFileSync, unlinkSync, renameSync, statSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 
 export const STATE_SCHEMA_VERSION = 1
@@ -108,22 +108,110 @@ export const appendLog = (stateDir, line) => {
 
 // ---- 互斥锁(gate/主轮/补轮共用;文件级 O_EXCL 原子创建 + TTL 自愈) ----
 
-// recovery guard 自身的失效窗:接管流程本身是毫秒级,guard 存活超过 60s
-// 说明上一个接管者也崩了,允许清掉 guard(下一次调用重新竞争)
-const RECOVERY_GUARD_TTL_MS = 60_000
+// 孤儿 .reap 残骸清扫阈:收尸流程本身是毫秒级,.reap 文件存活超过 60s 说明
+// 收尸者在 rename 与清理之间崩了——该文件只是死尸副本(不是锁),按龄清除
+const REAP_ORPHAN_TTL_MS = 60_000
+
+// 文本是否为"新鲜活锁"payload(可解析且 acquiredAt 在 TTL 内)
+const isFreshLockPayload = (text, ttlMs) => {
+  try {
+    const t = Date.parse(JSON.parse(text)?.acquiredAt)
+    return Number.isFinite(t) && Date.now() - t <= ttlMs
+  } catch {
+    return false
+  }
+}
+
+// 清扫超龄孤儿 .reap 残骸(只在走到陈锁路径时调用,常规路径零开销)
+const sweepOrphanReaps = (stateDir) => {
+  let names = []
+  try {
+    names = readdirSync(stateDir)
+  } catch {
+    return
+  }
+  for (const name of names) {
+    if (!name.startsWith(`${LOCK_FILE}.reap.`)) continue
+    const p = join(stateDir, name)
+    try {
+      if (Date.now() - statSync(p).mtimeMs > REAP_ORPHAN_TTL_MS) unlinkSync(p)
+    } catch {
+      /* 已消失/读不到即跳过 */
+    }
+  }
+}
+
+/**
+ * 陈锁收尸(原子 rename 协议;导出仅供回归测试注入交错时序):
+ * rename(lock → lock.reap.<自己的token>) 同一源路径只有一个赢家——输家 ENOENT
+ * 让位,天然杜绝双接管;.reap 目标名含自己的 token,是私有文件,后续 unlink
+ * 无 TOCTOU。锁与 .reap 同目录(同一文件系统),rename 不跨 fs 不退化。
+ *
+ * 验尸比对:陈旧判定与 rename 之间存在微窗——尸体可能已被别的收尸者收走并
+ * 换上新锁,此时 rename 收到的是别人的活锁。用判定时刻的字节快照比对收到的
+ * 文件:不符 = 错收活锁 → 原位放回(空窗内无人建新锁时)并让位;若放回瞬间
+ * 已有新持有者建锁,则不覆盖对方,错收文件降级为孤儿副本删除。
+ * (残余窗口如实声明:三方在微秒级窗口内连环交错时,被错收又无法放回的
+ * 原持有者会丢锁——概率量级远低于被替换的 guard 方案 60s 窗,且 state 写入
+ * 已是原子 rename,最坏后果是单轮更新丢失,不会损坏台账结构。)
+ *
+ * snapshotRaw = 判定时读到的原始字节(半写/损坏锁给 null,此时以"收到的
+ * 文件不是新鲜活锁"为验尸判据)。
+ */
+export const reapStaleLock = (stateDir, { snapshotRaw, ttlMs, token }) => {
+  const path = join(stateDir, LOCK_FILE)
+  const reap = `${path}.reap.${token}`
+  try {
+    renameSync(path, reap)
+  } catch (err) {
+    if (err.code === 'ENOENT') return { reaped: false, reason: 'lost-race' }
+    throw err
+  }
+  let corpse = null
+  try {
+    corpse = readFileSync(reap, 'utf8')
+  } catch {
+    corpse = null
+  }
+  const isJudgedCorpse = snapshotRaw !== null ? corpse === snapshotRaw : !isFreshLockPayload(corpse, ttlMs)
+  if (!isJudgedCorpse) {
+    // 错收了别人的活锁:优先原位放回;放回目标已被新持有者占用则不覆盖,
+    // 错收文件只是副本,删除即可(真相在 path 上的新锁)
+    try {
+      if (!existsSync(path)) {
+        renameSync(reap, path)
+        return { reaped: false, reason: 'misreap-restored' }
+      }
+    } catch {
+      /* 放回失败走删除分支 */
+    }
+    try {
+      unlinkSync(reap)
+    } catch {
+      /* 留作孤儿由 sweepOrphanReaps 清 */
+    }
+    return { reaped: false, reason: 'misreap' }
+  }
+  try {
+    unlinkSync(reap)
+  } catch {
+    /* 私有残骸,超龄清扫兜底 */
+  }
+  return { reaped: true }
+}
 
 /**
  * 尝试取锁。成功 → { acquired: true, token };
  * 已被持有且未过期 → { acquired: false, holder };
- * 过期(> ttlMinutes)→ 经 recovery guard(第二把 O_EXCL)仲裁接管,
- * 恰一方成功:{ acquired: true, stale: true, token },其余 { acquired: false }。
+ * 过期(> ttlMinutes)→ 经原子 rename 收尸接管,恰一方成功:
+ * { acquired: true, stale: true, token },其余 { acquired: false }。
  * token 是本次持有凭证,释放时传回 releaseLock 做归属校验(只删自己的锁)。
  *
  * 原子性要点(审查 P1-NEW):O_EXCL 只保证目录项原子,payload 落盘前文件已
  * 可见——所以 EEXIST 后锁文件"不可解析/缺 acquiredAt"不能当陈锁(很可能是
  * 对方刚创建还没写完),此时按文件 mtime 保守判:TTL 内一律视为有人持有。
- * 陈锁接管的 判定→替换 不再是裸 read-modify-write,而是先 O_EXCL 拿 guard,
- * guard 内 re-read 确认仍陈旧后 unlink + O_EXCL 重建,双竞争者只有一方赢。
+ * 陈锁接管协议见 reapStaleLock(三轮审查后由 recovery guard 换为原子 rename,
+ * 消除 guard 清理的 TOCTOU)。
  */
 export const acquireLock = (stateDir, { ttlMinutes, owner }) => {
   ensureStateDir(stateDir)
@@ -141,73 +229,45 @@ export const acquireLock = (stateDir, { ttlMinutes, owner }) => {
 
   // 锁文件年龄:能解析用 acquiredAt;不可解析/缺字段(半写/损坏)退到 mtime。
   // 两者都拿不到(文件在读取瞬间消失 = 对方刚释放)→ 保守按"有人持有"返回,
-  // 下一次调用自然重试首路径。
-  const lockAgeMs = () => {
-    let holder = null
-    try {
-      holder = JSON.parse(readFileSync(path, 'utf8'))
-    } catch {
-      holder = null
-    }
-    if (holder?.acquiredAt) {
-      const parsed = Date.parse(holder.acquiredAt)
-      if (Number.isFinite(parsed)) return { holder, ageMs: Date.now() - parsed }
-    }
-    try {
-      return { holder, ageMs: Date.now() - statSync(path).mtimeMs }
-    } catch {
-      return { holder, ageMs: null }
-    }
-  }
-
-  const first = lockAgeMs()
-  if (first.ageMs === null || first.ageMs <= ttlMs) {
-    return { acquired: false, holder: first.holder }
-  }
-
-  // ---- 陈锁接管仲裁(第二把 O_EXCL)----
-  const guard = `${path}.recovery`
+  // 下一次调用自然重试首路径。raw 为判定时刻的字节快照,供收尸验尸比对。
+  let holder = null
+  let raw = null
   try {
-    writeFileSync(guard, payload, { flag: 'wx' })
+    raw = readFileSync(path, 'utf8')
+    holder = JSON.parse(raw)
+  } catch {
+    holder = null
+  }
+  let ageMs = null
+  if (holder?.acquiredAt && Number.isFinite(Date.parse(holder.acquiredAt))) {
+    ageMs = Date.now() - Date.parse(holder.acquiredAt)
+  } else {
+    try {
+      ageMs = Date.now() - statSync(path).mtimeMs
+    } catch {
+      ageMs = null
+    }
+  }
+  if (ageMs === null || ageMs <= ttlMs) {
+    return { acquired: false, holder }
+  }
+
+  // ---- 陈锁接管(原子 rename 收尸,恰一赢家)----
+  sweepOrphanReaps(stateDir)
+  const reapResult = reapStaleLock(stateDir, { snapshotRaw: raw, ttlMs, token })
+  if (!reapResult.reaped) {
+    return { acquired: false, holder, recovery: reapResult.reason }
+  }
+  try {
+    writeFileSync(path, payload, { flag: 'wx' })
   } catch (err) {
-    if (err.code !== 'EEXIST') throw err
-    // guard 被别的接管者持有:若 guard 自身也陈旧(接管者崩了)清掉自愈,
-    // 本轮仍返回未取到(下一次调用重新竞争),绝不双接管
-    try {
-      if (Date.now() - statSync(guard).mtimeMs > RECOVERY_GUARD_TTL_MS) unlinkSync(guard)
-    } catch {
-      /* guard 已消失即无需清理 */
+    if (err.code === 'EEXIST') {
+      // 收尸后、建锁前的空窗被首路径新来者抢先:对方是合法新持有者,让位
+      return { acquired: false, holder: null, recovery: 'lost-race' }
     }
-    return { acquired: false, holder: first.holder, recovery: 'in-progress' }
+    throw err
   }
-  try {
-    // guard 内 re-read:确认仍陈旧(期间可能已被正常释放、或他人释放后重取)
-    const again = lockAgeMs()
-    if (again.ageMs !== null && again.ageMs <= ttlMs) {
-      return { acquired: false, holder: again.holder }
-    }
-    try {
-      unlinkSync(path)
-    } catch {
-      /* 已消失即目的达成 */
-    }
-    try {
-      writeFileSync(path, payload, { flag: 'wx' })
-    } catch (err) {
-      if (err.code === 'EEXIST') {
-        // unlink→create 空窗被首路径新来者抢先:对方是合法新持有者,让位
-        return { acquired: false, holder: null, recovery: 'lost-race' }
-      }
-      throw err
-    }
-    return { acquired: true, stale: true, previousHolder: first.holder, token }
-  } finally {
-    try {
-      unlinkSync(guard)
-    } catch {
-      /* guard 已消失即目的达成 */
-    }
-  }
+  return { acquired: true, stale: true, previousHolder: holder, token }
 }
 
 /**

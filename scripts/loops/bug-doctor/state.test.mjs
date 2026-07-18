@@ -12,6 +12,7 @@ import {
   appendLog,
   defaultState,
   loadState,
+  reapStaleLock,
   releaseLock,
   saveState,
 } from './state.mjs'
@@ -128,24 +129,50 @@ describe('互斥锁(TTL 60min)', () => {
     expect(took.stale).toBe(true)
   })
 
-  it('P1-NEW 回归②:接管仲裁 guard 被他人持有 → 本轮必不接管;guard 自身陈旧则清理自愈', () => {
+  it('P1-NEW 回归②a:陈锁收尸赢家路径——acquired stale、无 .reap 残骸、新锁归自己;锁与 .reap 同目录', () => {
     const path = join(dir, LOCK_FILE)
-    const guard = `${path}.recovery`
     writeFileSync(path, JSON.stringify({ pid: 1, owner: 'dead', token: 'd', acquiredAt: '2020-01-01T00:00:00.000Z' }))
-    // guard 新鲜(另一接管者正在流程中)→ 让位
-    writeFileSync(guard, 'other-recoverer')
-    const r1 = acquireLock(dir, { ttlMinutes: 60, owner: 'racer' })
-    expect(r1.acquired).toBe(false)
-    expect(r1.recovery).toBe('in-progress')
-    // guard 陈旧(上一接管者也崩了)→ 本轮仍让位但清掉 guard,下一轮可接管
+    const took = acquireLock(dir, { ttlMinutes: 60, owner: 'gate:full' })
+    expect(took.acquired).toBe(true)
+    expect(took.stale).toBe(true)
+    expect(readdirSync(dir).filter((f) => f.includes('.reap.'))).toEqual([])
+    expect(JSON.parse(readFileSync(path, 'utf8')).token).toBe(took.token)
+    // rename 不跨文件系统:.reap 目标与锁文件构造上同目录
+    expect(dirname(`${path}.reap.${took.token}`)).toBe(dirname(path))
+  })
+
+  it('P1-NEW 回归②b:验尸比对拦下错收——fresh 新锁永不被旧观察者删除,原位放回后旧观察者只能 locked', () => {
+    const path = join(dir, LOCK_FILE)
+    const staleRaw = `${JSON.stringify({ pid: 1, owner: 'dead', token: 'd', acquiredAt: '2020-01-01T00:00:00.000Z' })}\n`
+    // 旧观察者 B 依据 staleRaw 判定陈旧后陷入停顿;停顿期间锁已被 A 收尸并换上新锁
+    const freshRaw = `${JSON.stringify({ pid: 2, owner: 'gate:full', token: 'A-token', acquiredAt: new Date().toISOString() })}\n`
+    writeFileSync(path, freshRaw)
+    const r = reapStaleLock(dir, { snapshotRaw: staleRaw, ttlMs: 3_600_000, token: 'B-token' })
+    expect(r.reaped).toBe(false)
+    expect(r.reason).toBe('misreap-restored')
+    expect(readFileSync(path, 'utf8')).toBe(freshRaw) // A 的新锁字节原样
+    expect(readdirSync(dir).filter((f) => f.includes('.reap.'))).toEqual([]) // 无残骸
+    expect(acquireLock(dir, { ttlMinutes: 60, owner: 'B' }).acquired).toBe(false) // B 随后只能让位
+  })
+
+  it('P1-NEW 回归②c:同一尸体的第二收尸者 rename ENOENT 让位(任意时刻至多一个 recoverer 成功)', () => {
+    // 尸体已被第一收尸者收走 → 路径为空
+    const r = reapStaleLock(dir, { snapshotRaw: 'whatever', ttlMs: 60_000, token: 't2' })
+    expect(r).toEqual({ reaped: false, reason: 'lost-race' })
+  })
+
+  it('P1-NEW 回归②d:超龄孤儿 .reap 残骸在陈锁路径被清扫,新鲜的(活跃收尸中)保留', () => {
+    const path = join(dir, LOCK_FILE)
+    const oldReap = join(dir, `${LOCK_FILE}.reap.orphan-old`)
+    const newReap = join(dir, `${LOCK_FILE}.reap.orphan-new`)
+    writeFileSync(oldReap, 'x')
     const old = new Date(Date.now() - 5 * 60_000)
-    utimesSync(guard, old, old)
-    const r2 = acquireLock(dir, { ttlMinutes: 60, owner: 'racer' })
-    expect(r2.acquired).toBe(false)
-    expect(existsSync(guard)).toBe(false)
-    const r3 = acquireLock(dir, { ttlMinutes: 60, owner: 'racer' })
-    expect(r3.acquired).toBe(true)
-    expect(r3.stale).toBe(true)
+    utimesSync(oldReap, old, old)
+    writeFileSync(newReap, 'x')
+    writeFileSync(path, JSON.stringify({ pid: 1, owner: 'dead', token: 'd', acquiredAt: '2020-01-01T00:00:00.000Z' }))
+    const took = acquireLock(dir, { ttlMinutes: 60, owner: 'gate:full' })
+    expect(took.acquired).toBe(true)
+    expect(readdirSync(dir).filter((f) => f.includes('.reap.'))).toEqual([`${LOCK_FILE}.reap.orphan-new`])
   })
 
   it('P1-NEW 回归③:双竞争者并发接管同一陈锁,恰一方 acquired(子进程实测)', async () => {
