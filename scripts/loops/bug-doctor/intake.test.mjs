@@ -150,6 +150,38 @@ describe('report(CLI 端到端,--state-dir 隔离)', () => {
     expect(out.status).toBe('locked')
     expect(existsSync(join(dir, 'state.json'))).toBe(false)
   })
+
+  it('P1-1 回归:gate 长跑锁(10min,< TTL 60min)在场 → intake 必须让位,不夺锁不删锁', () => {
+    writeAllowlist()
+    const lockPayload = `${JSON.stringify({
+      pid: 99999,
+      owner: 'gate:full',
+      token: 'gate-own-token',
+      acquiredAt: new Date(Date.now() - 10 * 60_000).toISOString(),
+    })}\n`
+    writeFileSync(join(dir, 'gate.lock'), lockPayload)
+    const out = runIntake(['report', ...reportArgs()])
+    expect(out.status).toBe('locked')
+    expect(out.holder.owner).toBe('gate:full')
+    // 锁文件原样保留(未被夺取、未被 finally 误删)
+    expect(readFileSync(join(dir, 'gate.lock'), 'utf8')).toBe(lockPayload)
+    expect(existsSync(join(dir, 'state.json'))).toBe(false)
+  })
+
+  it('P2-2 回归:同串超过 samples 容量(3)后,重放最早一条完全相同输入仍判 duplicate 零写入', () => {
+    writeAllowlist()
+    const msgs = ['bug 原始描述 A', '补充 B', '补充 C', '补充 D'] // 4 条,samples 只留最后 3 条
+    msgs.forEach((m, i) =>
+      runIntake(['report', ...reportArgs({ description: m, now: `2026-07-18T12:0${i}:00.000Z` })]),
+    )
+    const before = readFileSync(join(dir, 'state.json'), 'utf8')
+    const replay = runIntake(['report', ...reportArgs({ description: msgs[0], now: '2026-07-18T12:09:00.000Z' })])
+    expect(replay.kind).toBe('duplicate')
+    expect(readFileSync(join(dir, 'state.json'), 'utf8')).toBe(before)
+    const state = loadState(dir, FINGERPRINT_VERSION)
+    const fp = state.intake.threads[KEY_A].fp
+    expect(state.clusters[fp].count).toBe(4) // 重放没有 +1
+  })
 })
 
 describe('queuePositionOf(与看板同源 activeClusters 口径)', () => {
@@ -222,6 +254,69 @@ describe('gate 兼容性(人工簇进流水线且不破坏幂等)', () => {
     gateRun(fixture)
     expect(clustersOf()).toBe(afterFirst)
     expect(readFileSync(join(dir, 'workpacket.json'), 'utf8')).toBe(wpAfterFirst)
+  })
+})
+
+describe('P2-1 回归:同指纹生产 S0 信号不被人工 origin 保护遮蔽(两个顺序)', () => {
+  const S0_MSG = 'write retry queue exhausted after 5 attempts'
+  const gateRun = (input) =>
+    execFileSync('node', [GATE, '--input', input, '--no-gh', '--state-dir', dir], { encoding: 'utf8' })
+  const s0Fixture = () => {
+    const fixture = join(dir, 'fx-s0.jsonl')
+    writeFileSync(
+      fixture,
+      `${JSON.stringify({
+        id: 'rec-s0',
+        level: 'error',
+        source: 'HumanReport', // 生产 source 恰与人工簇同名 → 同指纹碰撞场景
+        message: S0_MSG,
+        clientId: 'client-prod',
+        appVersion: '0.0.0',
+        receivedAt: '2026-07-18T12:30:00.000Z',
+      })}\n`,
+    )
+    return fixture
+  }
+
+  it('顺序 A:人工先报 → 同指纹 silentFailure error 日志进来 → S0(origin 保护解除)', () => {
+    writeAllowlist()
+    const reported = runIntake(['report', ...reportArgs({ description: S0_MSG })])
+    expect(reported.sLevel).toBe('S1')
+    gateRun(s0Fixture())
+    const state = loadState(dir, FINGERPRINT_VERSION)
+    expect(Object.keys(state.clusters)).toHaveLength(1) // 同指纹并簇,没有分裂
+    const cluster = state.clusters[reported.fp]
+    expect(cluster.origin).toBeUndefined() // 保护已解除
+    expect(cluster.sLevel).toBe('S0') // 真实日志判据接管
+    expect(cluster.reporters).toEqual([REPORTER]) // 报单人关联保留
+  })
+
+  it('顺序 B:日志先 S0 → 人工再报同指纹 → merged 且 S0 保持', () => {
+    writeAllowlist()
+    gateRun(s0Fixture())
+    const reported = runIntake(['report', ...reportArgs({ description: S0_MSG })])
+    expect(reported.kind).toBe('merged')
+    expect(reported.sLevel).toBe('S0') // 并入日志簇,不降级
+    gateRun(s0Fixture()) // 再跑一轮 gate,确认人工样本不把 S0 拉回 S1
+    const state = loadState(dir, FINGERPRINT_VERSION)
+    expect(Object.keys(state.clusters)).toHaveLength(1)
+    expect(state.clusters[reported.fp].sLevel).toBe('S0')
+    expect(state.clusters[reported.fp].origin).toBeUndefined()
+  })
+})
+
+describe('P2-3 回归:status 对半写/损坏 state.json 的容错', () => {
+  it('损坏 JSON → 降级空态出卡(exit 0,degraded 标记),不崩', () => {
+    writeFileSync(join(dir, 'state.json'), '{"schemaVersion":1,"fingerprintVersion":1,"clusters":{"a')
+    const out = runIntake(['status', '--now', NOW])
+    expect(out.degraded).toBe(true)
+    expect(out.stateError).toBeTruthy()
+    expect(out.queue).toMatchObject({ P0: 0, P1: 0, P2: 0, P3: 0 })
+  })
+
+  it('schema/fingerprint 版本不符是完整性错误,不降级照旧失败', () => {
+    writeFileSync(join(dir, 'state.json'), JSON.stringify({ schemaVersion: 99 }))
+    expect(() => runIntake(['status', '--now', NOW])).toThrow()
   })
 })
 

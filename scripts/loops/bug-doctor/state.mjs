@@ -6,7 +6,7 @@
 // 在其上追加实现所需字段(lock 文件独立、processedIds、hourly、digest),
 // 均为增量字段,不改动既定字段语义。
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync, appendFileSync, unlinkSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, existsSync, appendFileSync, unlinkSync, renameSync } from 'node:fs'
 import { join } from 'node:path'
 
 export const STATE_SCHEMA_VERSION = 1
@@ -81,7 +81,12 @@ const stableState = (state) => {
 
 export const saveState = (stateDir, state) => {
   ensureStateDir(stateDir)
-  writeFileSync(join(stateDir, STATE_FILE), `${JSON.stringify(stableState(state), null, 2)}\n`)
+  // 原子替换:先写 tmp 再 rename(同目录同文件系统),并发读方(status/看板)
+  // 永远只会看到完整的旧版或完整的新版,不会读到半写 JSON
+  const path = join(stateDir, STATE_FILE)
+  const tmp = `${path}.tmp-${process.pid}`
+  writeFileSync(tmp, `${JSON.stringify(stableState(state), null, 2)}\n`)
+  renameSync(tmp, path)
 }
 
 export const appendLedger = (stateDir, row) => {
@@ -104,17 +109,19 @@ export const appendLog = (stateDir, line) => {
 // ---- 互斥锁(gate/主轮/补轮共用;文件级 O_EXCL 原子创建 + TTL 自愈) ----
 
 /**
- * 尝试取锁。成功 → { acquired: true };
+ * 尝试取锁。成功 → { acquired: true, token };
  * 已被持有且未过期 → { acquired: false, holder };
- * 过期(> ttlMinutes)→ 视为陈锁,接管并返回 { acquired: true, stale: true }。
+ * 过期(> ttlMinutes)→ 视为陈锁,接管并返回 { acquired: true, stale: true, token }。
+ * token 是本次持有凭证,释放时传回 releaseLock 做归属校验(只删自己的锁)。
  */
 export const acquireLock = (stateDir, { ttlMinutes, owner }) => {
   ensureStateDir(stateDir)
   const path = join(stateDir, LOCK_FILE)
-  const payload = `${JSON.stringify({ pid: process.pid, owner, acquiredAt: new Date().toISOString() })}\n`
+  const token = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+  const payload = `${JSON.stringify({ pid: process.pid, owner, token, acquiredAt: new Date().toISOString() })}\n`
   try {
     writeFileSync(path, payload, { flag: 'wx' })
-    return { acquired: true }
+    return { acquired: true, token }
   } catch (err) {
     if (err.code !== 'EEXIST') throw err
   }
@@ -128,15 +135,30 @@ export const acquireLock = (stateDir, { ttlMinutes, owner }) => {
   if (age > ttlMinutes * 60_000) {
     // 陈锁(上一实例崩溃未清):接管。方向性:宁可接管跑一轮,不永久自锁。
     writeFileSync(path, payload)
-    return { acquired: true, stale: true, previousHolder: holder }
+    return { acquired: true, stale: true, previousHolder: holder, token }
   }
   return { acquired: false, holder }
 }
 
-export const releaseLock = (stateDir) => {
+/**
+ * 释放锁。传 token 时做归属校验:锁文件不是本 token 持有(已被 TTL 接管/他人重取)
+ * → 不删他人的锁,返回 false。不传 token 保持旧语义(无条件删,gate 崩溃恢复用)。
+ */
+export const releaseLock = (stateDir, { token } = {}) => {
+  const path = join(stateDir, LOCK_FILE)
+  if (token) {
+    let holder = null
+    try {
+      holder = JSON.parse(readFileSync(path, 'utf8'))
+    } catch {
+      return false // 文件不存在/不可读:无从确认归属,保守不动(陈锁由 TTL 自愈)
+    }
+    if (holder?.token !== token) return false
+  }
   try {
-    unlinkSync(join(stateDir, LOCK_FILE))
+    unlinkSync(path)
+    return true
   } catch {
-    /* 已不存在即目的达成 */
+    return true /* 已不存在即目的达成 */
   }
 }

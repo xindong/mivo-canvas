@@ -190,6 +190,10 @@ const upsertRecord = (state, rec, flags) => {
     }
     state.clusters[fp] = cluster
   }
+  // 生产日志记录并入人工报告簇(同指纹碰撞,如 source 恰为 HumanReport):
+  // 解除 origin 保护,让真实日志判据接管 S 级(否则 silentFailure/S0 会被
+  // 人工候诊 S1 压住)。人工报告不自动高于日志信号,反之亦然。
+  if (!isNew && cluster.origin === 'human-report') delete cluster.origin
   cluster.count += 1
   if (rec.receivedAt < cluster.firstSeen) cluster.firstSeen = rec.receivedAt
   if (rec.receivedAt > cluster.lastSeen) cluster.lastSeen = rec.receivedAt
@@ -493,10 +497,10 @@ const main = () => {
     } catch (persistErr) {
       log(`失败状态落盘也失败: ${persistErr.message}`)
     }
-    releaseLock(stateDir)
+    releaseLock(stateDir, { token: lock.token })
     process.exit(1)
   }
-  releaseLock(stateDir)
+  releaseLock(stateDir, { token: lock.token })
 }
 
 main()

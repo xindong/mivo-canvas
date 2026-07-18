@@ -70,6 +70,26 @@ export const resolveDefaultStateDir = () => {
 const stateDirFrom = (args) =>
   resolve(args['state-dir'] || process.env.MIVO_BUG_DOCTOR_STATE_DIR || resolveDefaultStateDir())
 
+// 锁 TTL 权威值 = rules.json loop.lockTtlMinutes(与 gate/主轮同一把锁必须同一口径,
+// 否则短 TTL 方会把长任务的活锁误判为陈锁夺走);读不到时回落契约值 60
+export const lockTtlMinutes = () => {
+  try {
+    const rules = JSON.parse(readFileSync(join(__dirname, 'rules.json'), 'utf8'))
+    const ttl = rules?.loop?.lockTtlMinutes
+    return Number.isFinite(ttl) && ttl > 0 ? ttl : 60
+  } catch {
+    return 60
+  }
+}
+
+// 同步短退避(status 安全读重试用;无定时器依赖,worker 线程语义安全)
+const sleepMs = (ms) => {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
+// 报单文本幂等摘要:与 samples 容量上限无关的"该消息串已登记过哪些输入"持久键
+const messageDigest = (text) => createHash('sha256').update(String(text)).digest('hex').slice(0, 16)
+
 export const shortId = (fp) => createHash('sha256').update(fp).digest('hex').slice(0, 8)
 
 const parseArgs = (argv) => {
@@ -134,6 +154,7 @@ export const queuePositionOf = (state, fp) => {
  * 幂等规则:
  *   1) 同 externalKey 已绑簇 → followup(计数+样本,不建新簇,不重复绑定);
  *      同 externalKey + 同 description 重跑 → duplicate(台账零变化,防会话重试双写)。
+ *      判重键 = threads[key].seen 的消息摘要列表(持久,不受 samples 容量上限影响)。
  *   2) 不同 externalKey 但指纹相同 → merged(并入既有簇,新串绑同簇)。
  *   3) 全新 → created(S1 候诊,origin=human-report)。
  */
@@ -155,12 +176,14 @@ export const applyReport = (state, { externalKey, reporter, description, level, 
     externalKey,
     ...(screenshot ? { screenshot } : {}),
   }
+  const digest = messageDigest(sample.message)
 
   if (cluster) {
-    // 防重:同串同文案重复提交(会话重试/用户重发)→ 台账零变化
-    const dup = (cluster.samples || []).some(
-      (s) => s.externalKey === externalKey && s.message === sample.message,
-    )
+    // 防重:同串同文案重复提交(会话重试/用户重发)→ 台账零变化。
+    // 主判据 seen 摘要(持久);samples 兜底兼容 seen 字段之前的旧绑定。
+    const dup =
+      (threads[externalKey]?.seen || []).includes(digest) ||
+      (cluster.samples || []).some((s) => s.externalKey === externalKey && s.message === sample.message)
     if (dup) {
       kind = 'duplicate'
     } else {
@@ -205,7 +228,11 @@ export const applyReport = (state, { externalKey, reporter, description, level, 
     state.clusters[fp] = cluster
   }
 
-  if (!threads[externalKey]) threads[externalKey] = { fp, boundAt: now }
+  if (!threads[externalKey]) threads[externalKey] = { fp, boundAt: now, seen: [] }
+  if (kind !== 'duplicate') {
+    const seen = (threads[externalKey].seen ||= [])
+    if (!seen.includes(digest)) seen.push(digest)
+  }
 
   return { kind, fp, cluster }
 }
@@ -230,8 +257,9 @@ const runReport = (args) => {
     return
   }
 
-  // 与 gate/主轮共用一把锁,防并发写台账;被占 → 交给会话稍后重试(不排队)
-  const lock = acquireLock(stateDir, { ttlMinutes: 5, owner: 'intake:report' })
+  // 与 gate/主轮共用一把锁,防并发写台账;被占 → 交给会话稍后重试(不排队)。
+  // TTL 必须与 gate 同权威值(rules.json):短 TTL 会把长跑中的 gate 活锁误判陈锁夺走
+  const lock = acquireLock(stateDir, { ttlMinutes: lockTtlMinutes(), owner: 'intake:report' })
   if (!lock.acquired) {
     process.stdout.write(`${JSON.stringify({ status: 'locked', holder: lock.holder })}\n`)
     return
@@ -260,7 +288,7 @@ const runReport = (args) => {
       })}\n`,
     )
   } finally {
-    releaseLock(stateDir)
+    releaseLock(stateDir, { token: lock.token }) // 只删自己持有的锁,不误删接管者的
   }
 }
 
@@ -294,9 +322,26 @@ export const buildStatus = ({ state, baseline, logsMd, now }) => {
 const runStatus = (args) => {
   const stateDir = stateDirFrom(args)
   const now = typeof args.now === 'string' ? args.now : new Date().toISOString()
-  const state = existsSync(join(stateDir, 'state.json'))
-    ? loadState(stateDir, FINGERPRINT_VERSION)
-    : null
+  // 安全读:写方已是原子 rename,这里再加短退避重试兜底(如 NFS/异常残留);
+  // 解析持续失败 → 降级空态出卡(fail-open,与看板 readJsonSafe 同方向),
+  // 但 schema/fingerprint 版本不符是真实完整性错误,照旧抛出(exit 1)。
+  let state = null
+  let stateDegraded = false
+  let stateError = null
+  if (existsSync(join(stateDir, 'state.json'))) {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        state = loadState(stateDir, FINGERPRINT_VERSION)
+        stateError = null
+        break
+      } catch (err) {
+        if (/schemaVersion|fingerprintVersion/.test(err.message)) throw err
+        stateError = err.message
+        sleepMs(100)
+      }
+    }
+    if (!state && stateError) stateDegraded = true
+  }
   let baseline = null
   try {
     baseline = JSON.parse(readFileSync(join(stateDir, 'react-baseline.json'), 'utf8'))
@@ -309,7 +354,12 @@ const runStatus = (args) => {
   } catch {
     logsMd = ''
   }
-  process.stdout.write(`${JSON.stringify(buildStatus({ state: state || { clusters: {}, openPRs: [] }, baseline, logsMd, now }))}\n`)
+  const card = buildStatus({ state: state || { clusters: {}, openPRs: [] }, baseline, logsMd, now })
+  if (stateDegraded) {
+    card.degraded = true
+    card.stateError = stateError
+  }
+  process.stdout.write(`${JSON.stringify(card)}\n`)
 }
 
 // ---- CLI ----

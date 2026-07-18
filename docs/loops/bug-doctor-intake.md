@@ -90,7 +90,7 @@ node scripts/loops/bug-doctor/intake.mjs status
 
 ## 3. 台账语义备忘(给分诊/进化轮,不是给接单会话的动作)
 
-- 人工簇特征:`source=HumanReport`、`origin=human-report`、`clients=human:<uid>`、`reporters[]`、`samples[].externalKey`;`state.intake.threads` 存 消息串→簇 绑定。
-- gate 重打分**不覆盖**人工簇 S 级(gate.mjs 内 origin 判断);升降级由分诊会话直接改台账字段。
+- 人工簇双字段(**casing 是契约,勿混写**):`source` 固定 `HumanReport`(大驼峰,参与指纹与展示);`origin` 固定 `human-report`(小写连字符,人工来源标记,gate 据此判定)。计划文里的简写"source=human-report"对应的是这里的 `origin` 字段。其余特征:`clients=human:<uid>`、`reporters[]`、`samples[].externalKey`;`state.intake.threads` 存 消息串→簇 绑定 + `seen[]` 输入摘要(幂等键)。
+- gate 重打分**不覆盖**人工簇 S 级(gate.mjs 按 `origin` 判断);升降级由分诊会话直接改台账字段。**例外**:生产日志记录并入同指纹人工簇时,gate 会解除 `origin` 标记,让真实日志判据接管 S 级(silentFailure/S0 不被候诊 S1 压住)——人工报告不自动高于日志信号,反之亦然。
 - 报单人白名单:`history/loops/bug-doctor/notify.env` 的 `INTAKE_ALLOWLIST`(逗号分隔 Slack user id,不入 git);扩权(T2-7)只改这一处。
 - 台账位置:接单会话跑在 `.xdt-worktrees/` 隔离工作树,但 intake.mjs 默认按 git common dir 穿透到**主 checkout** 的 `history/loops/bug-doctor/` 读写——全仓只有一份台账,勿传 `--state-dir` 覆盖。
