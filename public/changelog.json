@@ -1,7 +1,20 @@
 {
-  "lastGithash": "e7ffa11c11a29802f2b624e65ef1c0bf7aae699f",
-  "updatedAt": "2026-07-18T04:52:06+08:00",
+  "lastGithash": "5fa39a6bbfd86105e8722d622b1f1170484d6528",
+  "updatedAt": "2026-07-18T08:42:37+08:00",
   "entries": [
+    {
+      "date": "2026-07-18",
+      "prs": [
+        276
+      ],
+      "features": [
+        {
+          "text": "服务端新增归档项目的双重保护:禁止在已归档项目中创建或移动画板,禁止删除包含活跃子画板的已归档项目",
+          "by": "PraiseZhu"
+        }
+      ],
+      "fixes": []
+    },
     {
       "date": "2026-07-17",
       "prs": [
