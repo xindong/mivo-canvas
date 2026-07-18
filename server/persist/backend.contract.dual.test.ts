@@ -10,7 +10,7 @@
 // PG gate:`MIVO_PG_TEST=1`(本地 brew PG,见 docs/decisions/pg-backend-schema.md §7);CI 无 PG → 跳过 PG describe,内存套件仍必跑。
 
 import { describe, it, expect, beforeEach, beforeAll, afterAll, afterEach } from 'vitest'
-import { InMemoryPersistBackend, fingerprintOfBody, type PersistBackend, type PersistType } from './backend'
+import { ArchivedCanvasWriteError, InMemoryPersistBackend, fingerprintOfBody, type PersistBackend, type PersistType } from './backend'
 import { PgPersistBackend } from './pgBackend'
 
 // ── 共享纯契约套件(makeBackend 返 fresh/singleton;resetBackend 清状态)────────────────────
@@ -504,10 +504,149 @@ const runPersistBackendContractSuite = (
       expect((await b.listByCanvas('actorB', 'c1', 'chat-message')).records.map((r) => r.id)).toEqual(['mB'])
     })
   })
+
+  // ── CR-6 缺口1(PR-A #266 backlog):findNodeOwners 全局反查(assets legacy detach 的权威归属来源)──
+  describe(`${label} — CR-6 缺口1:findNodeOwners node 全局反查`, () => {
+    let b: PersistBackend
+    beforeEach(async () => {
+      b = makeBackend()
+      await resetBackend(b)
+    })
+
+    it('返回 node 权威归属(ownerId/canvasId/isDeleted);未知 id → [];跨 owner 撞名 → 各返一条', async () => {
+      await b.ensureCreate('ownerA', 'project', 'pA', { name: 'PA' }, { method: 'POST', resourceKind: 'project' })
+      await b.createCanvasWithCollection('ownerA', 'cA', { projectId: 'pA' }, { method: 'POST', resourceKind: 'canvas' })
+      await b.ensureCreateChild('ownerA', 'cA', 'node', 'n-shared', { type: 'image' }, { method: 'POST', resourceKind: 'node' })
+      await b.ensureCreate('ownerB', 'project', 'pB', { name: 'PB' }, { method: 'POST', resourceKind: 'project' })
+      await b.createCanvasWithCollection('ownerB', 'cB', { projectId: 'pB' }, { method: 'POST', resourceKind: 'canvas' })
+      await b.ensureCreateChild('ownerB', 'cB', 'node', 'n-shared', { type: 'image' }, { method: 'POST', resourceKind: 'node' })
+      const rs = await b.findNodeOwners('n-shared')
+      expect(rs).toHaveLength(2)
+      expect(rs).toContainEqual({ ownerId: 'ownerA', canvasId: 'cA', isDeleted: false })
+      expect(rs).toContainEqual({ ownerId: 'ownerB', canvasId: 'cB', isDeleted: false })
+      expect(await b.findNodeOwners('n-nonexistent')).toEqual([])
+      // 物理删(deleteChildCascade)后不再命中(node/edge/anchor 硬删,无软删残留)。
+      await b.deleteChildCascade('ownerA', 'cA', 'node', 'n-shared', { baseRevision: 0, method: 'DELETE', resourceKind: 'node', actor: 'ownerA' })
+      const after = await b.findNodeOwners('n-shared')
+      expect(after).toEqual([{ ownerId: 'ownerB', canvasId: 'cB', isDeleted: false }])
+    })
+  })
+
+  // ── CR-6 缺口2(PR-A #266 backlog):TOCTOU 检查时守卫——archived 判定收进写入原子边界──
+  // route authz(check-time)与 backend 写入(write-time)之间的窗口由本守卫封死:写入时刻 canvas 已
+  // archived-live → throw ArchivedCanvasWriteError(顶层 onError → 409 archived)。PG 事务内 FOR UPDATE
+  // canvas 行与 archive tree 的 UPDATE 串行化;memory 同步临界区判定与 mutation 间无 await 让出点,等效。
+  describe(`${label} — CR-6 缺口2:TOCTOU 写入时守卫(archived → throw;per-canvas 粒度)`, () => {
+    let b: PersistBackend
+    beforeEach(async () => {
+      b = makeBackend()
+      await resetBackend(b)
+    })
+    const seed = async (): Promise<void> => {
+      await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+      await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      await b.ensureCreateChild('o', 'c1', 'node', 'n1', { type: 'image' }, { method: 'POST', resourceKind: 'node' })
+    }
+
+    it('archived canvas:全部子写方法 + canvas meta upsert 均 throw;unarchive 后恢复可写', async () => {
+      await seed()
+      await b.archiveCanvasTree('o', 'c1')
+      await expect(b.upsertChild('o', 'c1', 'node', 'n1', { type: 'image' }, { method: 'PATCH', resourceKind: 'node', base: 0 })).rejects.toBeInstanceOf(ArchivedCanvasWriteError)
+      await expect(b.ensureCreateChild('o', 'c1', 'node', 'n2', { type: 'image' }, { method: 'POST', resourceKind: 'node' })).rejects.toBeInstanceOf(ArchivedCanvasWriteError)
+      await expect(b.createChild('o', 'c1', 'node', 'n3', { type: 'image' }, { method: 'POST', resourceKind: 'node', actor: 'o' })).rejects.toBeInstanceOf(ArchivedCanvasWriteError)
+      await expect(b.applyDomainOps('o', 'c1', 'node', 'n1', [{ kind: 'set', fieldPath: ['title'], value: 't' }], { baseRevision: 0, method: 'PATCH', resourceKind: 'node', actor: 'o' })).rejects.toBeInstanceOf(ArchivedCanvasWriteError)
+      await expect(b.deleteChildCascade('o', 'c1', 'node', 'n1', { baseRevision: 0, method: 'DELETE', resourceKind: 'node', actor: 'o' })).rejects.toBeInstanceOf(ArchivedCanvasWriteError)
+      await expect(b.reorderChildren('o', 'c1', 'node', ['n1'], { base: 0 })).rejects.toBeInstanceOf(ArchivedCanvasWriteError)
+      await expect(b.hardDeleteChild('o', 'c1', 'node', 'n1')).rejects.toBeInstanceOf(ArchivedCanvasWriteError)
+      await expect(b.legacyReplaceDrain('o', 'c1', 'node', 'n1', { payload: { type: 'image' }, baseRevision: 0 }, { method: 'PATCH', resourceKind: 'node', actor: 'o' })).rejects.toBeInstanceOf(ArchivedCanvasWriteError)
+      await expect(b.upsert('o', 'canvas', 'c1', { projectId: 'p1', title: 'x' }, { base: 0, canvasId: null, method: 'PUT', resourceKind: 'canvas' })).rejects.toBeInstanceOf(ArchivedCanvasWriteError)
+      // chat-message(per-actor 私有)同样封死(chat POST/PATCH/DELETE 路由均 authz 'write')。
+      await expect(b.ensureCreateChild('actorA', 'c1', 'chat-message', 'm1', { text: 'x' }, { method: 'POST', resourceKind: 'chat-message' })).rejects.toBeInstanceOf(ArchivedCanvasWriteError)
+      // 守卫抛出前零副作用:n1 未被改动(revision 仍 0),n2/n3 未创建。
+      const n1 = await b.getChild('o', 'c1', 'node', 'n1')
+      expect(n1.kind).toBe('found')
+      if (n1.kind === 'found') expect(n1.record.revision).toBe(0)
+      expect(await b.findNodeOwners('n2')).toEqual([])
+      // unarchive → 写恢复(守卫只锁 archived-live 态)。
+      await b.unarchiveCanvasTree('o', 'c1')
+      const w = await b.upsertChild('o', 'c1', 'node', 'n1', { type: 'image' }, { method: 'PATCH', resourceKind: 'node', base: 0 })
+      expect(w.kind).toBe('updated')
+    })
+
+    it('守卫错误自带 409 archived JSON 映射(getResponse 契约,顶层 ssoAuthErrorHandler structural 分支直接消费)', async () => {
+      await seed()
+      await b.archiveCanvasTree('o', 'c1')
+      const err = await b
+        .upsertChild('o', 'c1', 'node', 'n1', { type: 'image' }, { method: 'PATCH', resourceKind: 'node', base: 0 })
+        .then(() => undefined)
+        .catch((e: unknown) => e)
+      expect(err).toBeInstanceOf(ArchivedCanvasWriteError)
+      const res = (err as ArchivedCanvasWriteError).getResponse()
+      expect(res.status).toBe(409)
+      expect(await res.json()).toEqual({ error: 'archived', id: 'c1' })
+    })
+
+    it('manage/tree 路径不受守卫影响:archived canvas 可 softDelete(彻底删除);deleted(status 仍 archived)后子写放行(isDeleted 优先,不 false-409)', async () => {
+      await seed()
+      await b.archiveCanvasTree('o', 'c1')
+      // DELETE(manage,彻底删除)是 CR-6 放行面——守卫不得拦 tree 方法。
+      const del = await b.softDeleteCanvasTree('o', 'c1')
+      expect(del.count).toBeGreaterThan(0)
+      // canvas isDeleted=true(status 仍 'archived')→ 守卫放行(对齐 resolveCanvasAccess isDeleted 先于 archived
+      // 的判定顺序;deleted canvas 的子写可达性由 route authz 兜 404,backend 不越位 409)。
+      const r = await b.upsertChild('o', 'c1', 'node', 'n1', { type: 'image' }, { method: 'PATCH', resourceKind: 'node', base: 0 })
+      expect(r.kind).toBe('updated')
+    })
+
+    it('per-canvas 粒度:c1 archived 不影响同 owner c2 子写', async () => {
+      await seed()
+      await b.createCanvasWithCollection('o', 'c2', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      await b.archiveCanvasTree('o', 'c1')
+      const r = await b.ensureCreateChild('o', 'c2', 'node', 'n-c2', { type: 'image' }, { method: 'POST', resourceKind: 'node' })
+      expect(r.kind).toBe('created')
+    })
+  })
 }
 
 // ── memory 后端(永远跑)──────────────────────────────────────────────────────────────
 runPersistBackendContractSuite('memory PersistBackend', () => new InMemoryPersistBackend(), (b) => b.__reset())
+
+describe('memory PersistBackend — P2-1 external mutation canvas critical section', () => {
+  const callbackFirst = async (archive: (b: InMemoryPersistBackend) => Promise<unknown>): Promise<void> => {
+    const b = new InMemoryPersistBackend()
+    await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+    await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+    let entered!: () => void
+    let release!: () => void
+    const atMutation = new Promise<void>((resolve) => { entered = resolve })
+    const held = new Promise<void>((resolve) => { release = resolve })
+    let mutations = 0
+    const guarded = b.withCanvasWriteGuard('o', 'c1', async () => {
+      entered()
+      await held
+      mutations += 1
+    })
+    await atMutation
+    let archiveSettled = false
+    const archiving = archive(b).finally(() => { archiveSettled = true })
+    await Promise.resolve()
+    expect(archiveSettled).toBe(false)
+    release()
+    await Promise.all([guarded, archiving])
+    expect(mutations).toBe(1)
+    const canvas = await b.get('o', 'canvas', 'c1')
+    expect(canvas.kind).toBe('found')
+    if (canvas.kind === 'found') expect(canvas.record.status).toBe('archived')
+  }
+
+  it('guard callback first → archiveCanvasTree waits, terminal order mutation→archived', async () => {
+    await callbackFirst((b) => b.archiveCanvasTree('o', 'c1'))
+  })
+
+  it('guard callback first → archiveProjectTree waits on child canvas, terminal order mutation→archived', async () => {
+    await callbackFirst((b) => b.archiveProjectTree('o', 'p1'))
+  })
+})
 
 // ── PG 后端(gate:MIVO_PG_TEST=1;本地 brew PG port 55443)─────────────────────────────────
 const PG_TEST_ENABLED = process.env.MIVO_PG_TEST === '1'

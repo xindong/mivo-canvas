@@ -287,6 +287,35 @@ const G22_OWNER_REKEY_AUDIT_COMMENT_DROP = sql`
 COMMENT ON TABLE persist_records IS 'DP-5 信封列 + payload jsonb. DP-6R(2026-07-12): chat-message.owner_id = actor(per-actor 私有).';
 `
 
+// CR-6 缺口1(Phase 2 归档 backlog,2026-07-18):node id 全局反查部分索引。editor-attached legacy asset ref
+// (canvas-less,ref.ownerFp=editor ≠ node 持久化 owner)detach 时需按 (type='node', id) 反查 node 权威归属
+// (findNodeOwners),persist_records PK=(owner_id,type,id) 前缀不含裸 id → 无索引则全表扫。部分索引只覆盖
+// type='node' 行,写放大最小。
+//
+// **存量数据无需迁移/回填**(fail-visible 说明):PR-A 记账时预估「nodeId→owner 索引 + 存量数据迁移/回填」,
+// 侦察确认 persist_records 本就权威持有每个 node 的 owner_id/canvas_id 列(单一真相源,DP-5),缺的只是查询
+// 路径——本 migration 纯 DDL 建索引,零数据搬迁、零记录跳过(无 per-record 迁移循环,无统计项)。
+// CREATE INDEX IF NOT EXISTS 幂等可重放(migrator kysely_migration 追踪表 + IF NOT EXISTS 双保险)。
+const NODE_REVERSE_LOOKUP_INDEX = sql`
+CREATE INDEX IF NOT EXISTS idx_persist_node_by_id ON persist_records (id) WHERE type = 'node';
+`
+const DROP_NODE_REVERSE_LOOKUP_INDEX = sql`
+DROP INDEX IF EXISTS idx_persist_node_by_id;
+`
+
+// CR-6 缺口2(P2-2,2026-07-18):canvas id 定点访问部分索引。pgBackend.assertCanvasWritableInTrx 事务内
+// `SELECT ... FROM persist_records WHERE type='canvas' AND id=$canvasId FOR UPDATE`——PK=(owner_id,type,id)
+// 前缀不含裸 id,chat per-actor 子写 ownerId=actor ≠ canvas owner(DP-6R),不带 owner_id 过滤(F4 canvas id
+// 全局唯一)→ 无索引则全索引扫。部分索引只覆盖 type='canvas' 行(写放大最小,与 011 node 反查同构),
+// 令 (type='canvas', id) 定点访问。EXPLAIN (COSTS OFF) 证据见 p6saga.pg.matrix.test.ts CR-6 P2-2 用例。
+// 纯 DDL,零回填(存量 canvas 行本就在 persist_records,缺的只是查询路径)。
+const CANVAS_REVERSE_LOOKUP_INDEX = sql`
+CREATE INDEX IF NOT EXISTS idx_persist_canvas_by_id ON persist_records (id) WHERE type = 'canvas';
+`
+const DROP_CANVAS_REVERSE_LOOKUP_INDEX = sql`
+DROP INDEX IF EXISTS idx_persist_canvas_by_id;
+`
+
 /** migrations 以 ISO 日期前缀排序;migrator 按 key 字典序应用。 */
 export const migrations: Record<string, Migration> = {
   '2026_07_11_001_initial_persist_schema': {
@@ -360,6 +389,25 @@ export const migrations: Record<string, Migration> = {
     },
     async down(db): Promise<void> {
       await DROP_ARCHIVE_STATUS_SCHEMA.execute(db)
+    },
+  },
+  // CR-6 缺口1(Phase 2 归档 backlog):node 全局反查部分索引(纯 DDL,零回填;详见 NODE_REVERSE_LOOKUP_INDEX 注释)。
+  '2026_07_18_011_node_reverse_lookup_index': {
+    async up(db): Promise<void> {
+      await NODE_REVERSE_LOOKUP_INDEX.execute(db)
+    },
+    async down(db): Promise<void> {
+      await DROP_NODE_REVERSE_LOOKUP_INDEX.execute(db)
+    },
+  },
+  // CR-6 缺口2(P2-2,2026-07-18):canvas id 定点访问部分索引(assertCanvasWritableInTrx 事务内
+  // type='canvas' AND id 裸查询;详见 CANVAS_REVERSE_LOOKUP_INDEX 注释)。
+  '2026_07_18_012_canvas_reverse_lookup_index': {
+    async up(db): Promise<void> {
+      await CANVAS_REVERSE_LOOKUP_INDEX.execute(db)
+    },
+    async down(db): Promise<void> {
+      await DROP_CANVAS_REVERSE_LOOKUP_INDEX.execute(db)
     },
   },
   // A2-S2(§14.1/§10.5/§10.7):field-level per-field clock + per-canvas 单调 seq + child tombstone。

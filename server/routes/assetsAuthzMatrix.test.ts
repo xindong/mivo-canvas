@@ -26,7 +26,7 @@ import { createAssetRoutes } from './assets'
 import { createAssetStore, createMemoryAssetBackend, createFsAssetBackend, type AssetStore } from '../lib/assetStore'
 import { resetDecodeGate } from '../lib/decodeGate'
 import { fingerprintOfPlatformKey } from '../lib/keys'
-import { createPersistBackend, type PersistBackend } from '../persist/backend'
+import { ConcurrentParentChangeError, createPersistBackend, type PersistBackend } from '../persist/backend'
 import { InMemoryPermissionBackend, type PermissionBackend } from '../lib/permissions'
 import { PgPersistBackend } from '../persist/pgBackend'
 import { PgPermissionBackend } from '../persist/pgPermissionBackend'
@@ -34,6 +34,7 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AppEnv } from '../lib/types'
+import { ssoAuthErrorHandler } from '../lib/owner'
 
 const PG_TEST_ENABLED = process.env.MIVO_PG_TEST === '1'
 
@@ -394,6 +395,88 @@ describe('G2.2 P1-4 残留2 — route detach 复合键选择(InMemory route 级)
     expect(r.status).toBe(403) // owner-mismatch,非 409(锁住 false-409 B 修复)
   })
 
+  // ── CR-6 缺口1(PR-A #266 backlog):editor-attached legacy ref 的归档覆盖(findNodeOwners 全局反查)──
+  // 形态:pre-G2.2 canvas-less legacy ref 由项目 editor 创建(ref.ownerFp=editor),node/canvas 按项目
+  // owner 的 ownerId 持久化 → 旧探测 persist.get(editorFp,'node',...) 必 missing → 归档判定被跳过,
+  // editor 仍可从已归档画布解除关联(200 而非 409)。findNodeOwners 反查权威归属后闭合。
+  const seedEditorAttachedLegacy = async (suffix: string, opts: { archive: boolean; softDelete?: boolean }) => {
+    const persist = createPersistBackend()
+    const permissions = new InMemoryPermissionBackend()
+    const assetStore = createAssetStore(createMemoryAssetBackend())
+    const app = buildApp(persist, permissions, assetStore)
+    const ids = { project: `p-ea-${suffix}`, canvas: `c-ea-${suffix}`, node: `n-ea-${suffix}` }
+    // owner 的 project + canvas + node(node 持久化在 FP_OWNER 名下)。
+    await persist.ensureCreate(FP_OWNER, 'project', ids.project, { title: 'p' }, { method: 'POST', resourceKind: 'project' })
+    await persist.createCanvasWithCollection(FP_OWNER, ids.canvas, { projectId: ids.project }, { method: 'POST', resourceKind: 'canvas' })
+    await persist.ensureCreateChild(FP_OWNER, ids.canvas, 'node', ids.node, { type: 'image' }, { method: 'POST', resourceKind: 'node' })
+    // editor 是项目成员(editor-attached 成立的本质:当时有权在 owner 画布上 attach)。
+    await permissions.upsertMember(ids.project, FP_EDITOR, 'editor')
+    // editor 上传自己的 asset + service 级 legacy ref(canvas-less,ref.ownerFp=FP_EDITOR ≠ node 持久化 owner)。
+    const upRes = await uploadReq(app, MIVO_KEY_EDITOR)
+    expect(upRes.status).toBe(200)
+    const assetId = ((await upRes.json()) as { assetId: string }).assetId
+    await assetStore.attach(assetId, ids.node, FP_EDITOR)
+    if (opts.archive) await persist.archiveCanvasTree(FP_OWNER, ids.canvas)
+    if (opts.softDelete) await persist.softDeleteCanvasTree(FP_OWNER, ids.canvas)
+    const detach = () =>
+      app.request(`/api/assets/${assetId}/detach`, {
+        method: 'POST',
+        headers: { ...hdr(MIVO_KEY_EDITOR), 'content-type': 'application/json' },
+        body: JSON.stringify({ nodeId: ids.node, canvasId: 'c-not-the-legacy-ref' }),
+      })
+    return { ids, detach }
+  }
+
+  it('CR-6 缺口1:editor-attached legacy ref,node 落 owner 的已归档 canvas → editor detach → 409 {error:"archived"}', async () => {
+    const { ids, detach } = await seedEditorAttachedLegacy('arch', { archive: true })
+    // 旧实现:persist.get(FP_EDITOR,'node',...) missing → 跳过判定 → 200 detached(穿透)。
+    // 新实现:findNodeOwners 反查 → 唯一 live 候选 (FP_OWNER, c-ea-arch) + editor 有 read(成员)→ archived → 409。
+    const r = await detach()
+    expect(r.status).toBe(409)
+    expect(await r.json()).toEqual({ error: 'archived', id: ids.canvas })
+  })
+
+  it('CR-6 缺口1 反面:editor-attached legacy ref,canvas active → editor detach → 200 detached(不误伤)', async () => {
+    const { detach } = await seedEditorAttachedLegacy('act', { archive: false })
+    const r = await detach()
+    expect(r.status).toBe(200)
+    expect(await r.json()).toEqual({ kind: 'detached' })
+  })
+
+  it('CR-6 缺口1 锁A延伸:editor-attached + canvas archive 后 softDelete(isDeleted 优先)→ 200 detached(不 false-409)', async () => {
+    const { detach } = await seedEditorAttachedLegacy('del', { archive: true, softDelete: true })
+    const r = await detach()
+    expect(r.status).toBe(200)
+    expect(await r.json()).toEqual({ kind: 'detached' })
+  })
+
+  it('CR-6 缺口1 锁C:请求方孤儿 legacy ref + 无关 owner 同名 node 落其 archived canvas → 200 detached(访问门拒无关候选,防 false-409)', async () => {
+    const persist = createPersistBackend()
+    const permissions = new InMemoryPermissionBackend()
+    const assetStore = createAssetStore(createMemoryAssetBackend())
+    const app = buildApp(persist, permissions, assetStore)
+    // OUTSIDER:己 project+canvas+node 'n-lkc'(archived)。请求方 OWNER 与其毫无关系(非成员)。
+    const bIds = { project: 'p-lkc-b', canvas: 'c-lkc-b', node: 'n-lkc' }
+    await persist.ensureCreate(FP_OUTSIDER, 'project', bIds.project, { title: 'pb' }, { method: 'POST', resourceKind: 'project' })
+    await persist.createCanvasWithCollection(FP_OUTSIDER, bIds.canvas, { projectId: bIds.project }, { method: 'POST', resourceKind: 'canvas' })
+    await persist.ensureCreateChild(FP_OUTSIDER, bIds.canvas, 'node', bIds.node, { type: 'image' }, { method: 'POST', resourceKind: 'node' })
+    await persist.archiveCanvasTree(FP_OUTSIDER, bIds.canvas)
+    // OWNER:上传 asset + 孤儿 legacy ref(nodeId 与 OUTSIDER 的 node 撞名;OWNER 名下无此 node record)。
+    const upRes = await uploadReq(app, MIVO_KEY_OWNER)
+    expect(upRes.status).toBe(200)
+    const assetId = ((await upRes.json()) as { assetId: string }).assetId
+    await assetStore.attach(assetId, bIds.node, FP_OWNER)
+    // detach:findNodeOwners → 唯一 live 候选属 OUTSIDER,但 OWNER 对其 canvas 无 read(非成员)→
+    // 访问门拒候选 → 维持现状 → store.detach 200(孤儿 ref 清理不被无关 owner 的归档画布卡死)。
+    const r = await app.request(`/api/assets/${assetId}/detach`, {
+      method: 'POST',
+      headers: { ...hdr(MIVO_KEY_OWNER), 'content-type': 'application/json' },
+      body: JSON.stringify({ nodeId: bIds.node, canvasId: 'c-not-the-legacy-ref' }),
+    })
+    expect(r.status).toBe(200)
+    expect(await r.json()).toEqual({ kind: 'detached' })
+  })
+
   it('无 body canvasId + 新 ref(有 canvasId)→ 只匹配 legacy(无)→ already-detached(新 ref 须显式 canvasId)', async () => {
     const persist = createPersistBackend()
     const permissions = new InMemoryPermissionBackend()
@@ -462,6 +545,89 @@ describe('G2.2 P1-4 残留2 — route detach 复合键选择(InMemory route 级)
     })
     expect(detB.status).toBe(200)
     expect(await detB.json()).toEqual({ kind: 'detached' })
+  })
+})
+
+describe('CR-6 P2-1 — asset 三条 mutation 路径的 check→write 竞态注入(InMemory)', () => {
+  const seedRace = async (suffix: string) => {
+    const persist = createPersistBackend()
+    const permissions = new InMemoryPermissionBackend()
+    const assetStore = createAssetStore(createMemoryAssetBackend())
+    const app = buildApp(persist, permissions, assetStore)
+    const ids = { project: `p-race-${suffix}`, canvas: `c-race-${suffix}`, node: `n-race-${suffix}`, node2: `n2-race-${suffix}` }
+    await persist.ensureCreate(FP_OWNER, 'project', ids.project, { title: 'p' }, { method: 'POST', resourceKind: 'project' })
+    await persist.createCanvasWithCollection(FP_OWNER, ids.canvas, { projectId: ids.project }, { method: 'POST', resourceKind: 'canvas' })
+    await persist.ensureCreateChild(FP_OWNER, ids.canvas, 'node', ids.node, { type: 'image' }, { method: 'POST', resourceKind: 'node' })
+    await persist.ensureCreateChild(FP_OWNER, ids.canvas, 'node', ids.node2, { type: 'image' }, { method: 'POST', resourceKind: 'node' })
+    const upRes = await uploadReq(app, MIVO_KEY_OWNER)
+    expect(upRes.status).toBe(200)
+    const assetId = ((await upRes.json()) as { assetId: string }).assetId
+    return { persist, assetStore, app, ids, assetId }
+  }
+
+  const injectArchiveAtGuard = (persist: PersistBackend): void => {
+    const guarded = persist.withCanvasWriteGuard.bind(persist)
+    let injected = false
+    persist.withCanvasWriteGuard = async (ownerId, canvasId, mutation) => {
+      if (!injected) {
+        injected = true
+        await persist.archiveCanvasTree(ownerId, canvasId)
+      }
+      return guarded(ownerId, canvasId, mutation)
+    }
+  }
+
+  it('guard parent CAS 三次重试耗尽的 typed error 经顶层 onError → 409 retryable wire，ref 不新增', async () => {
+    const { persist, assetStore, app, ids, assetId } = await seedRace('parent-retry-exhausted')
+    app.onError(ssoAuthErrorHandler)
+    persist.withCanvasWriteGuard = async () => {
+      throw new ConcurrentParentChangeError(ids.canvas)
+    }
+    const r = await app.request(`/api/assets/${assetId}/attach`, {
+      method: 'POST', headers: { ...hdr(MIVO_KEY_OWNER), 'content-type': 'application/json' },
+      body: JSON.stringify({ nodeId: ids.node, canvasId: ids.canvas }),
+    })
+    expect(r.status).toBe(409)
+    expect(await r.json()).toEqual({ error: 'concurrent-parent-change', id: ids.canvas, retryable: true })
+    expect((await assetStore.getRecord(assetId))?.references).toEqual([])
+  })
+
+  it('attach:authz 已过后 archive 插入，guard 返 409 且 ref 不新增', async () => {
+    const { persist, assetStore, app, ids, assetId } = await seedRace('attach')
+    injectArchiveAtGuard(persist)
+    const r = await app.request(`/api/assets/${assetId}/attach`, {
+      method: 'POST', headers: { ...hdr(MIVO_KEY_OWNER), 'content-type': 'application/json' },
+      body: JSON.stringify({ nodeId: ids.node, canvasId: ids.canvas }),
+    })
+    expect(r.status).toBe(409)
+    expect(await r.json()).toEqual({ error: 'archived', id: ids.canvas })
+    expect((await assetStore.getRecord(assetId))?.references).toEqual([])
+  })
+
+  it('new-ref detach:canvas write authz 已过后 archive 插入，guard 返 409 且 ref 保留', async () => {
+    const { persist, assetStore, app, ids, assetId } = await seedRace('new-detach')
+    await assetStore.attach(assetId, ids.node, FP_OWNER, undefined, ids.canvas)
+    injectArchiveAtGuard(persist)
+    const r = await app.request(`/api/assets/${assetId}/detach`, {
+      method: 'POST', headers: { ...hdr(MIVO_KEY_OWNER), 'content-type': 'application/json' },
+      body: JSON.stringify({ nodeId: ids.node, canvasId: ids.canvas }),
+    })
+    expect(r.status).toBe(409)
+    expect(await r.json()).toEqual({ error: 'archived', id: ids.canvas })
+    expect((await assetStore.getRecord(assetId))?.references).toContainEqual({ nodeId: ids.node, ownerFp: FP_OWNER, canvasId: ids.canvas })
+  })
+
+  it('legacy detach:权威 node→canvas 解析后 archive 插入，guard 返 409 且 canvas-less ref 保留', async () => {
+    const { persist, assetStore, app, ids, assetId } = await seedRace('legacy-detach')
+    await assetStore.attach(assetId, ids.node, FP_OWNER)
+    injectArchiveAtGuard(persist)
+    const r = await app.request(`/api/assets/${assetId}/detach`, {
+      method: 'POST', headers: { ...hdr(MIVO_KEY_OWNER), 'content-type': 'application/json' },
+      body: JSON.stringify({ nodeId: ids.node, canvasId: 'legacy-body-is-not-authority' }),
+    })
+    expect(r.status).toBe(409)
+    expect(await r.json()).toEqual({ error: 'archived', id: ids.canvas })
+    expect((await assetStore.getRecord(assetId))?.references).toContainEqual({ nodeId: ids.node, ownerFp: FP_OWNER, canvasId: undefined })
   })
 })
 
