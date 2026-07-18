@@ -16,6 +16,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { Hono } from 'hono'
 import { HTTPException } from 'hono/http-exception'
 import { ssoAuthErrorHandler, SsoAuthError } from '../lib/owner'
+import { ArchivedCanvasWriteError, ArchivedParentWriteError, ConcurrentParentChangeError } from '../persist/backend'
 import type { AppEnv } from '../lib/types'
 
 /** structural HTTPResponseError:有 getResponse 但非 HTTPException 子类(测 duck-type 兜底)。 */
@@ -46,6 +47,10 @@ const buildApp = (useCustom: boolean): Hono<AppEnv> => {
         new Response('blocked-body', { status: 418, headers: { 'x-structural': 'yes' } }),
       )
     }
+    // P3 item 7:typed 409(CR-6 archived / SG-1 parent-archived / CAS concurrent-parent-change)走 structural 分支
+    if (kind === 'archived-canvas') throw new ArchivedCanvasWriteError('c1')
+    if (kind === 'archived-parent') throw new ArchivedParentWriteError('p1')
+    if (kind === 'concurrent-parent') throw new ConcurrentParentChangeError('c1')
     throw new Error('boom')
   })
   return app
@@ -112,5 +117,29 @@ describe('G2.1 R2-3 — ssoAuthErrorHandler parity(普通 Error / HTTPException 
     expect(body).toEqual({ error: 'unauthorized', message: 'test-reason' })
     // c.json 走 c.newResponse → pre-error header 保留
     expect(r.headers.get(PRE_HEADER.name.toLowerCase())).toBe(PRE_HEADER.value)
+  })
+
+  // P3 item 7:typed 409(CR-6 archived / SG-1 parent-archived / CAS concurrent-parent-change)走顶层 onError
+  //   structural 分支 → 补一条结构化 telemetry(console.warn JSON: event/error/id/path),不改错误语义(409 响应仍走 getResponse)。
+  it.each([
+    { kind: 'archived-canvas', wantStatus: 409, wantId: 'c1', wantName: 'ArchivedCanvasWriteError' },
+    { kind: 'archived-parent', wantStatus: 409, wantId: 'p1', wantName: 'ArchivedParentWriteError' },
+    { kind: 'concurrent-parent', wantStatus: 409, wantId: 'c1', wantName: 'ConcurrentParentChangeError' },
+  ])('typed-409 ($kind) → 409 响应不变 + console.warn telemetry(item 7,不改语义)', async ({ kind, wantStatus, wantId, wantName }) => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const cust = buildApp(true)
+    const r = await cust.request(`/throw/${kind}`)
+    // 语义不变:409 + getResponse body
+    expect(r.status).toBe(wantStatus)
+    const body = (await r.json()) as { error?: string; id?: string }
+    expect(body.id).toBe(wantId)
+    // telemetry:一条结构化 JSON,含 event/error/id/path(不改错误语义,仅观测)
+    expect(warnSpy).toHaveBeenCalledTimes(1)
+    const payload = JSON.parse(warnSpy.mock.calls[0]![0] as string)
+    expect(payload.event).toBe('typed-409')
+    expect(payload.error).toBe(wantName)
+    expect(payload.id).toBe(wantId)
+    expect(payload.path).toBe('/throw/' + kind)
   })
 })

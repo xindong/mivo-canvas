@@ -88,12 +88,20 @@ const migrateWith = async (
       expect(schk.some((r) => r.def.includes('active') && r.def.includes('archived'))).toBe(true)
     }
     // CR-6 缺口1(011_node_reverse_lookup_index):node 全局反查部分索引存在(findNodeOwners 查询路径)。
-    const nodeIdx = (await sql`SELECT indexname FROM pg_indexes WHERE tablename='persist_records' AND indexname='idx_persist_node_by_id'`.execute(db)).rows as { indexname: string }[]
+    // P3 item 8:除名字外断言 indexdef 含索引列与 WHERE 谓词(防误改为非部分索引 / 改列 / 改谓词)。
+    const nodeIdx = (await sql`SELECT indexdef FROM pg_indexes WHERE tablename='persist_records' AND indexname='idx_persist_node_by_id'`.execute(db)).rows as { indexdef: string }[]
     expect(nodeIdx).toHaveLength(1)
+    const nodeIdxDef = nodeIdx[0]!.indexdef
+    expect(nodeIdxDef).toContain('(id)') // 索引列(migration 011:`ON persist_records (id)`)
+    expect(nodeIdxDef).toMatch(/WHERE.*type.*'node'/is) // 部分索引谓词 `WHERE type = 'node'`(PG 规范化含 cast,故用宽松匹配)
     // CR-6 P2-2(012_canvas_reverse_lookup_index):chat actor≠canvas owner 时守卫只能按
     // (type='canvas',id) 全局定位；部分索引令裸 id 查询定点，避免 persist_records 全扫。
-    const canvasIdx = (await sql`SELECT indexname FROM pg_indexes WHERE tablename='persist_records' AND indexname='idx_persist_canvas_by_id'`.execute(db)).rows as { indexname: string }[]
+    // P3 item 8:同上,indexdef 含列与 WHERE 谓词。
+    const canvasIdx = (await sql`SELECT indexdef FROM pg_indexes WHERE tablename='persist_records' AND indexname='idx_persist_canvas_by_id'`.execute(db)).rows as { indexdef: string }[]
     expect(canvasIdx).toHaveLength(1)
+    const canvasIdxDef = canvasIdx[0]!.indexdef
+    expect(canvasIdxDef).toContain('(id)') // 索引列(migration 012:`ON persist_records (id)`)
+    expect(canvasIdxDef).toMatch(/WHERE.*type.*'canvas'/is) // 部分索引谓词 `WHERE type = 'canvas'`
     await sql`
       INSERT INTO persist_records(id,owner_id,canvas_id,type,scope,revision,order_key,is_deleted,status,payload)
       SELECT 'n-plan-' || g::text, 'plan-owner', 'c-plan', 'node', 'document', 0, g, false, 'active', '{}'::jsonb

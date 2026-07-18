@@ -13,12 +13,12 @@
 //
 // 完整 owner/editor/viewer/匿名share × attach/detach/upload 矩阵见 assetsAuthzMatrix.test.ts(D4)。
 
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { createHash } from 'node:crypto'
 import { Hono } from 'hono'
 import sharp from 'sharp'
 import { createAssetRoutes } from './assets'
-import { createMemoryAssetBackend, type AssetStoreBackend } from '../lib/assetStore'
+import { createAssetStore, createMemoryAssetBackend, type AssetStoreBackend, type AssetStore } from '../lib/assetStore'
 import { resetDecodeGate } from '../lib/decodeGate'
 import { fingerprintOfPlatformKey } from '../lib/keys'
 import { createPersistBackend, type PersistBackend } from '../persist/backend'
@@ -272,5 +272,71 @@ describe('CR-6(Phase 2 归档 write-guard)— archived canvas attach/detach → 
     const r = await detach(app, assetId, ids.node, ids.canvas)
     expect(r.status).toBe(409)
     expect(await r.json()).toEqual({ error: 'archived', id: ids.canvas })
+  })
+})
+
+// P3 item 6:legacy detach 多 owner 歧义维持现状分支 → console.warn 计数留痕(行为不变,仍走 legacy detach)。
+describe('P3 item 6 — legacy detach 多 owner 歧义计数日志', () => {
+  const buildAppWithStore = (backend: AssetStoreBackend, persist: PersistBackend, permissions: PermissionBackend): { app: Hono<AppEnv>; store: AssetStore } => {
+    const store = createAssetStore(backend)
+    const app = new Hono<AppEnv>()
+    app.route('/api', createAssetRoutes({ store, persist, permissions }))
+    return { app, store }
+  }
+
+  it('多 owner 撞名且无己方命中 → 歧义维持现状(legacy detach) + console.warn 留痕', async () => {
+    const persist = createPersistBackend()
+    const permissions = new InMemoryPermissionBackend()
+    const { app, store } = buildAppWithStore(createMemoryAssetBackend(), persist, permissions)
+    // 两个不同 owner 各自建同名 node 'n1'(live,挂各自 canvas)→ findNodeOwners('n1') 返 2 候选,无 ownerA 命中
+    await seedCanvas(persist, MIVO_KEY_B, { project: 'pB', canvas: 'cB', node: 'n1' })
+    await seedCanvas(persist, 'mivo_ccc_user_c', { project: 'pC', canvas: 'cC', node: 'n1' })
+    // ownerA 上传 asset(无 n1 node)+ 直接 store.attach 建 legacy ref(canvasId=undefined,ownerFp=ownerA)
+    const assetId = await uploadAsset(app)
+    const ownerA = fingerprintOfPlatformKey(MIVO_KEY_A)
+    await store.attach(assetId, 'n1', ownerA) // legacy ref(无 canvasId)
+    // ownerA detach(无 bodyCanvasId → legacy ref 命中,ref.ownerFp===ownerFp)→ 歧义分支 → console.warn + legacy detach 200
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const res = await app.request(`/api/assets/${assetId}/detach`, {
+      method: 'POST',
+      headers: { ...hdr(MIVO_KEY_A), 'content-type': 'application/json' },
+      body: JSON.stringify({ nodeId: 'n1' }),
+    })
+    const warnCalls = warnSpy.mock.calls // P3:mockRestore 会清 mock.calls,先捕获
+    warnSpy.mockRestore()
+    // 行为不变:legacy detach 走 store.detach(owner 匹配)→ 200 detached
+    expect(res.status).toBe(200)
+    // 留痕:一条结构化 JSON(event/candidateCount/nodeId)
+    const ambiguityCalls = warnCalls.filter((c) => {
+      try { return JSON.parse(c[0] as string).event === 'detach-multi-owner-ambiguity' } catch { return false }
+    })
+    expect(ambiguityCalls).toHaveLength(1)
+    const payload = JSON.parse(ambiguityCalls[0]![0] as string)
+    expect(payload.candidateCount).toBe(2)
+    expect(payload.nodeId).toEqual(expect.any(String)) // shortHash(nodeId),非裸 nodeId
+  })
+
+  it('仅 1 候选或己方命中 → 不触发歧义日志(不误记)', async () => {
+    const persist = createPersistBackend()
+    const permissions = new InMemoryPermissionBackend()
+    const { app, store } = buildAppWithStore(createMemoryAssetBackend(), persist, permissions)
+    // 仅 ownerB 建 n1(liveCandidates=1)→ 不歧义(走 authoritative 单候选判定或 legacy detach,无歧义日志)
+    await seedCanvas(persist, MIVO_KEY_B, { project: 'pB', canvas: 'cB', node: 'n1' })
+    const assetId = await uploadAsset(app)
+    const ownerA = fingerprintOfPlatformKey(MIVO_KEY_A)
+    await store.attach(assetId, 'n1', ownerA)
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const res = await app.request(`/api/assets/${assetId}/detach`, {
+      method: 'POST',
+      headers: { ...hdr(MIVO_KEY_A), 'content-type': 'application/json' },
+      body: JSON.stringify({ nodeId: 'n1' }),
+    })
+    const warnCalls = warnSpy.mock.calls
+    warnSpy.mockRestore()
+    expect(res.status).toBe(200)
+    const ambiguityCalls = warnCalls.filter((c) => {
+      try { return JSON.parse(c[0] as string).event === 'detach-multi-owner-ambiguity' } catch { return false }
+    })
+    expect(ambiguityCalls).toHaveLength(0) // 单候选不歧义,不记
   })
 })

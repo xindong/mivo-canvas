@@ -526,6 +526,14 @@ export const createAssetRoutes = (options: AssetRouteOptions): App => {
         const all = await persist.findNodeOwners(nodeId)
         const own = all.find((n) => n.ownerId === ownerFp)
         const liveCandidates = all.filter((n) => !n.isDeleted && n.canvasId)
+        // P3 item 6:三级消歧的歧义分支(③ 多 owner 撞名且无己方命中)维持现状不判(放行下方 legacy detach,
+        //   锁B 型跨 owner 同名 node 构造不得劫持判定)→ 补一条结构化计数留痕,便于观测该分支命中频次。
+        //   行为不变(不设 writeGuard,继续走 legacy detach);仅 console.warn 留痕。
+        if (!own && liveCandidates.length > 1) {
+          console.warn(
+            JSON.stringify({ event: 'detach-multi-owner-ambiguity', nodeId: shortHash(nodeId), candidateCount: liveCandidates.length }),
+          )
+        }
         let authoritative = own
         if (!authoritative && liveCandidates.length === 1) {
           const sole = liveCandidates[0]

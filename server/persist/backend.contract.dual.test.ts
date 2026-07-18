@@ -10,7 +10,7 @@
 // PG gate:`MIVO_PG_TEST=1`(本地 brew PG,见 docs/decisions/pg-backend-schema.md §7);CI 无 PG → 跳过 PG describe,内存套件仍必跑。
 
 import { describe, it, expect, beforeEach, beforeAll, afterAll, afterEach } from 'vitest'
-import { ArchivedCanvasWriteError, InMemoryPersistBackend, fingerprintOfBody, type PersistBackend, type PersistType } from './backend'
+import { ArchivedCanvasWriteError, ArchivedParentWriteError, InMemoryPersistBackend, fingerprintOfBody, type PersistBackend, type PersistType } from './backend'
 import { PgPersistBackend } from './pgBackend'
 
 // ── 共享纯契约套件(makeBackend 返 fresh/singleton;resetBackend 清状态)────────────────────
@@ -173,6 +173,63 @@ const runPersistBackendContractSuite = (
       expect((await rec('chat-collection', 'c1')).isDeleted).toBe(true)
       const node = await b.getChild('o', 'c1', 'node', 'n1')
       if (node.kind === 'found') expect(node.record.isDeleted).toBe(false)
+    })
+
+    // P3 item 5:ensureCreate(project deleted) 走 restore helper(projectStateInTrx 锁 + restoreProjectTreeInTrx)。
+    //   非语义优化(同事务内复用上游已取的 projectState,不再重复 projectStateInTrx)→ 功能非回归:deleted project
+    //   ensureCreate 仍返 restored + project/子 canvas/chat-collection 全部 live。memory/PG 双后端对称(PG 侧走
+    //   新 preProjectState 复用路径,memory 侧无 projectStateInTrx,逻辑等价)。
+    it('P3 item 5: ensureCreate(deleted project) → restored(非语义优化非回归,both backends)', async () => {
+      await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+      await b.ensureCreate('o', 'canvas', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      await b.ensureCreate('o', 'chat-collection', 'c1', {}, { canvasId: 'c1', method: 'POST', resourceKind: 'chat-collection' })
+      await b.softDeleteProjectTree('o', 'p1')
+      // deleted project ensureCreate → restore helper 跑通(返 restored,非 existing/created)
+      const r = await b.ensureCreate('o', 'project', 'p1', { name: 'P2' }, { method: 'POST', resourceKind: 'project' })
+      expect(r.kind).toBe('restored')
+      expect((await rec('project', 'p1')).isDeleted).toBe(false)
+      expect((await rec('canvas', 'c1')).isDeleted).toBe(false)
+      expect((await rec('chat-collection', 'c1')).isDeleted).toBe(false)
+    })
+  })
+
+  describe(`${label} — P3 item 1 restoreCanvasTree parent-archived 守卫(默认调用形态)`, () => {
+    let b: PersistBackend
+    const rec = async (type: PersistType, id: string) => {
+      const r = await b.get('o', type, id)
+      if (r.kind !== 'found') throw new Error(`${type}:${id} not found`)
+      return r.record
+    }
+    beforeEach(async () => {
+      b = makeBackend()
+      await resetBackend(b)
+    })
+
+    it('空 opts + parent archived → throw ArchivedParentWriteError + 零写(canvas/chat-collection 仍 deleted)', async () => {
+      await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+      await b.ensureCreate('o', 'canvas', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      await b.ensureCreate('o', 'chat-collection', 'c1', {}, { canvasId: 'c1', method: 'POST', resourceKind: 'chat-collection' })
+      await b.softDeleteCanvasTree('o', 'c1')
+      await b.archiveProjectTree('o', 'p1')
+      // 审查方隔离复现序列:softDelete c1 → archive p1 → restore c1(空 opts,最常见调用形态)。
+      // 修复前:守卫只读 opts.payload?.projectId,空 opts 不判 → 成功恢复进 archived project(漏洞)。
+      // 修复后:effectiveProjectId fallback 读 c1 现存 payload.projectId=p1,p1 archived → fail-fast(零写)。
+      const probe = b.restoreCanvasTree('o', 'c1')
+      await expect(probe).rejects.toBeInstanceOf(ArchivedParentWriteError)
+      // 零写:失败 probe 未触达 restoreCanvasTreeInPlace/InTrx → c1 canvas meta + chat-collection 仍 soft-deleted
+      expect((await rec('canvas', 'c1')).isDeleted).toBe(true)
+      expect((await rec('chat-collection', 'c1')).isDeleted).toBe(true)
+    })
+
+    it('显式 payload.projectId 指向 archived project → 同拒(restore-via-POST 带 new payload 场景)', async () => {
+      await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+      await b.ensureCreate('o', 'canvas', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      await b.softDeleteCanvasTree('o', 'c1')
+      await b.archiveProjectTree('o', 'p1')
+      // 显式 payload.projectId=p1 → 守卫以 opts 优先,判 p1 archived → 拒(零写)
+      const probe = b.restoreCanvasTree('o', 'c1', { payload: { projectId: 'p1' } })
+      await expect(probe).rejects.toBeInstanceOf(ArchivedParentWriteError)
+      expect((await rec('canvas', 'c1')).isDeleted).toBe(true)
     })
   })
 
