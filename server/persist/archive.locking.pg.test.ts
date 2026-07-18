@@ -4,7 +4,7 @@
 import { randomUUID } from 'node:crypto'
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Pool } from 'pg'
-import { ArchivedCanvasWriteError } from './backend'
+import { ArchivedCanvasWriteError, ConcurrentParentChangeError } from './backend'
 import { PgPersistBackend } from './pgBackend'
 
 const ENABLED = process.env.MIVO_PG_TEST === '1'
@@ -41,6 +41,25 @@ const waitForBackendLock = async (observer: Pool, label: string, timeoutMs = 12_
           AND application_name = $1
           AND wait_event_type = 'Lock'`,
       [BACKEND_APP],
+    )
+    if (waiting.rowCount && waiting.rowCount > 0) return
+    await delay(20)
+  }
+  throw new Error(`PG lock rendezvous timed out after ${timeoutMs}ms: ${label}`)
+}
+
+/** 等待 backend 会话被指定 blocker PID 阻塞，区分连续重试的每一轮 lock wait。 */
+const waitForBackendBlockedBy = async (observer: Pool, blockerPid: number, label: string, timeoutMs = 12_000): Promise<void> => {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const waiting = await observer.query<{ pid: number }>(
+      `SELECT pid
+         FROM pg_stat_activity
+        WHERE datname = current_database()
+          AND application_name = $1
+          AND wait_event_type = 'Lock'
+          AND $2 = ANY(pg_blocking_pids(pid))`,
+      [BACKEND_APP, blockerPid],
     )
     if (waiting.rowCount && waiting.rowCount > 0) return
     await delay(20)
@@ -489,6 +508,58 @@ const nodeRow = async (pool: Pool, id: string) => (await pool.query<{
       await blocker.query('ROLLBACK').catch(() => undefined)
       await guarded?.catch(() => undefined)
       blocker.release()
+    }
+  })
+
+  it('P2-1 PG guard:parent CAS 连续三次 miss → typed retryable 409，callback 零执行', async () => {
+    await setup(backend, ['parent-0', 'parent-1', 'parent-2', 'parent-3'])
+    await addCanvas(backend, 'c-guard-retry-exhausted', 'parent-0')
+    const blockers = await Promise.all([pool.connect(), pool.connect(), pool.connect()])
+    const blockerPids = await Promise.all(blockers.map(async (blocker) =>
+      Number((await blocker.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0].pid)))
+    let guarded: Promise<unknown> | undefined
+    let mutations = 0
+    try {
+      for (let i = 0; i < blockers.length; i++) {
+        await blockers[i].query('BEGIN')
+        await blockers[i].query('SELECT id FROM projects WHERE id=$1 FOR UPDATE', [`parent-${i}`])
+      }
+      guarded = observeBackendPromise(backend.withCanvasWriteGuard('o', 'c-guard-retry-exhausted', async () => {
+        mutations += 1
+        return 'must-not-run'
+      }))
+
+      for (let attempt = 0; attempt < blockers.length; attempt++) {
+        await waitForBackendBlockedBy(pool, blockerPids[attempt], `guard retry ${attempt + 1}/3`)
+        await pool.query(
+          `UPDATE persist_records
+              SET payload=jsonb_set(payload,'{projectId}',to_jsonb($1::text)), revision=revision+1
+            WHERE owner_id='o' AND type='canvas' AND id='c-guard-retry-exhausted'`,
+          [`parent-${attempt + 1}`],
+        )
+        await blockers[attempt].query('COMMIT')
+      }
+
+      const error = await within(guarded).then(
+        () => undefined,
+        (caught: unknown) => caught,
+      )
+      expect(error).toBeInstanceOf(ConcurrentParentChangeError)
+      const response = (error as ConcurrentParentChangeError).getResponse()
+      expect(response.status).toBe(409)
+      expect(await response.json()).toEqual({
+        error: 'concurrent-parent-change',
+        id: 'c-guard-retry-exhausted',
+        retryable: true,
+      })
+      expect(mutations).toBe(0)
+      expect(await canvasRow(pool, 'c-guard-retry-exhausted')).toMatchObject({ project_id: 'parent-3' })
+    } finally {
+      for (const blocker of blockers) {
+        await blocker.query('ROLLBACK').catch(() => undefined)
+        blocker.release()
+      }
+      await guarded?.catch(() => undefined)
     }
   })
 })

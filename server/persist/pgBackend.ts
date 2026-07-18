@@ -41,7 +41,7 @@ import type {
   UpsertChildResult,
   UpsertResult,
 } from './backend'
-import { ArchivedCanvasWriteError } from './backend'
+import { ArchivedCanvasWriteError, ConcurrentParentChangeError } from './backend'
 import { requiredTopLevelFields, validateChildPayload } from '../../shared/persist-contract.ts'
 import { fieldKeyOf, setByPath, unsetByPath, getByPath, type DomainOp } from '../lib/domainOp'
 import type { FieldClocks } from '../lib/baseCursor'
@@ -413,10 +413,10 @@ export class PgPersistBackend implements PersistBackend {
         })
       } catch (error) {
         if (!(error instanceof CanvasParentChanged)) throw error
-        if (attempt === maxAttempts) throw new Error(`canvas ${canvasId} parent changed during guarded write`, { cause: error })
+        if (attempt === maxAttempts) throw new ConcurrentParentChangeError(canvasId, { cause: error })
       }
     }
-    throw new Error(`canvas ${canvasId} guarded write retry exhausted`)
+    throw new ConcurrentParentChangeError(canvasId)
   }
 
   /**

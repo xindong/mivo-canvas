@@ -24,6 +24,7 @@
 
 import { createHash } from 'node:crypto'
 import type {
+  ConcurrentParentChangeBody,
   Envelope,
   PayloadRejectedBody,
   PersistScope,
@@ -62,6 +63,24 @@ export class ArchivedCanvasWriteError extends Error {
   /** Hono onError structural 分支(`"getResponse" in err`)→ 409 archived JSON(保 CR-6 契约体)。 */
   getResponse(): Response {
     return new Response(JSON.stringify({ error: 'archived', id: this.canvasId }), {
+      status: 409,
+      headers: { 'content-type': 'application/json' },
+    })
+  }
+}
+
+/** PG guarded write 的 canvas parent CAS 连续失败；客户端可安全原样重试。 */
+export class ConcurrentParentChangeError extends Error {
+  readonly canvasId: string
+  constructor(canvasId: string, options?: ErrorOptions) {
+    super(`canvas ${canvasId} parent changed during guarded write`, options)
+    this.name = 'ConcurrentParentChangeError'
+    this.canvasId = canvasId
+  }
+  /** Hono onError structural 分支映射为 retryable 409，避免并发 move 被降级为 500。 */
+  getResponse(): Response {
+    const body: ConcurrentParentChangeBody = { error: 'concurrent-parent-change', id: this.canvasId, retryable: true }
+    return new Response(JSON.stringify(body), {
       status: 409,
       headers: { 'content-type': 'application/json' },
     })

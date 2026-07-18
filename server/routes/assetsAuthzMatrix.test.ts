@@ -26,7 +26,7 @@ import { createAssetRoutes } from './assets'
 import { createAssetStore, createMemoryAssetBackend, createFsAssetBackend, type AssetStore } from '../lib/assetStore'
 import { resetDecodeGate } from '../lib/decodeGate'
 import { fingerprintOfPlatformKey } from '../lib/keys'
-import { createPersistBackend, type PersistBackend } from '../persist/backend'
+import { ConcurrentParentChangeError, createPersistBackend, type PersistBackend } from '../persist/backend'
 import { InMemoryPermissionBackend, type PermissionBackend } from '../lib/permissions'
 import { PgPersistBackend } from '../persist/pgBackend'
 import { PgPermissionBackend } from '../persist/pgPermissionBackend'
@@ -34,6 +34,7 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AppEnv } from '../lib/types'
+import { ssoAuthErrorHandler } from '../lib/owner'
 
 const PG_TEST_ENABLED = process.env.MIVO_PG_TEST === '1'
 
@@ -575,6 +576,21 @@ describe('CR-6 P2-1 — asset 三条 mutation 路径的 check→write 竞态注�
       return guarded(ownerId, canvasId, mutation)
     }
   }
+
+  it('guard parent CAS 三次重试耗尽的 typed error 经顶层 onError → 409 retryable wire，ref 不新增', async () => {
+    const { persist, assetStore, app, ids, assetId } = await seedRace('parent-retry-exhausted')
+    app.onError(ssoAuthErrorHandler)
+    persist.withCanvasWriteGuard = async () => {
+      throw new ConcurrentParentChangeError(ids.canvas)
+    }
+    const r = await app.request(`/api/assets/${assetId}/attach`, {
+      method: 'POST', headers: { ...hdr(MIVO_KEY_OWNER), 'content-type': 'application/json' },
+      body: JSON.stringify({ nodeId: ids.node, canvasId: ids.canvas }),
+    })
+    expect(r.status).toBe(409)
+    expect(await r.json()).toEqual({ error: 'concurrent-parent-change', id: ids.canvas, retryable: true })
+    expect((await assetStore.getRecord(assetId))?.references).toEqual([])
+  })
 
   it('attach:authz 已过后 archive 插入，guard 返 409 且 ref 不新增', async () => {
     const { persist, assetStore, app, ids, assetId } = await seedRace('attach')
