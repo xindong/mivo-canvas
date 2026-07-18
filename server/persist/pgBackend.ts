@@ -374,6 +374,52 @@ export class PgPersistBackend implements PersistBackend {
   }
 
   /**
+   * P2-1:asset ref 等 persist 外部 mutation 的 write-time guard。无锁读 parent 仅用于决定第一把锁；
+   * 随后 projects → canvas FOR UPDATE，并以 payload.projectId 作 CAS。parent 并发 move 时整事务释放旧锁后
+   * 重试，绝不持 canvas 反追新 project。callback 只在 parent 稳定且 canvas 非 archived-live 后执行一次。
+   */
+  async withCanvasWriteGuard<T>(ownerId: string, canvasId: string, mutation: () => Promise<T>): Promise<T> {
+    await this.ready
+    const maxAttempts = 3
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await this.db.transaction().execute(async (trx) => {
+          const before = await trx
+            .selectFrom('persist_records')
+            .select(sql`payload->>'projectId'`.as('project_id'))
+            .where('owner_id', '=', ownerId)
+            .where('type', '=', 'canvas')
+            .where('id', '=', canvasId)
+            .executeTakeFirst()
+          const parentProjectId = typeof before?.project_id === 'string' && before.project_id.length > 0
+            ? before.project_id
+            : undefined
+          if (parentProjectId) await this.projectStateInTrx(trx, ownerId, parentProjectId)
+
+          const canvas = await trx
+            .selectFrom('persist_records')
+            .select(['is_deleted', 'status', sql`payload->>'projectId'`.as('project_id')])
+            .where('owner_id', '=', ownerId)
+            .where('type', '=', 'canvas')
+            .where('id', '=', canvasId)
+            .forUpdate()
+            .executeTakeFirst()
+          const lockedParentId = typeof canvas?.project_id === 'string' && canvas.project_id.length > 0
+            ? canvas.project_id
+            : undefined
+          if (lockedParentId !== parentProjectId) throw new CanvasParentChanged()
+          if (canvas && !canvas.is_deleted && canvas.status === 'archived') throw new ArchivedCanvasWriteError(canvasId)
+          return mutation()
+        })
+      } catch (error) {
+        if (!(error instanceof CanvasParentChanged)) throw error
+        if (attempt === maxAttempts) throw new Error(`canvas ${canvasId} parent changed during guarded write`, { cause: error })
+      }
+    }
+    throw new Error(`canvas ${canvasId} guarded write retry exhausted`)
+  }
+
+  /**
    * 事务内 F1+SG-1:SELECT...FOR UPDATE project 行,同时返 live 与 archived 状态(单查询,防跨事务 TOCTOU)。
    * archived 判据取 projects 瘦索引 status 列(archive/unarchive tree 与 persist_records 同事务同步,F-idx)。
    */
@@ -1158,8 +1204,21 @@ export class PgPersistBackend implements PersistBackend {
     return this.withIdempotencyGuard(
       async () => {
         const result: UpsertResult = await this.db.transaction().execute(async (trx) => {
-          // CR-6 缺口2:canvas meta PUT/move 同属 route 'write' 禁面——事务起点重验自身 archived-live
-          // (fresh create/restore-tree 路径不受影响:missing 行放行,unarchive 走 tree 方法不经此)。
+          // CR-6 缺口2 + P2-4(全局锁序协议,lead 拍板两 backlog PR 统一:
+          // projects 行 → persist_records project 行 → persist_records canvas 行 → children/幂等判定):
+          // canvas meta PUT/move 先取 parent project 行(projectStateInTrx 锁 projects 表行,防 move 到软删/归档 project),
+          // 再锁 persist_records canvas 行(assertCanvasWritableInTrx FOR UPDATE 重验 archived-live)。
+          // fresh create/restore-tree 路径不受影响:missing 行放行,unarchive 走 tree 方法不经此。
+          // 原序(canvas 先锁再取 project)与 softDeleteProjectTree/archiveProjectTree(projects→canvas)构成
+          // 反向闭环 → 死锁;此序对齐协议,消除 canvas PUT 反向锁序死锁(#276 合并后 rebase 不复活 projectLiveInTrx)。
+          if (type === 'canvas') {
+            const pid = asCanvasMeta(payload)?.projectId
+            if (pid) {
+              const ps = await this.projectStateInTrx(trx, ownerId, pid)
+              if (!ps.live) return { kind: 'parent-not-live' }
+              if (ps.archived) return { kind: 'parent-archived' }
+            }
+          }
           if (type === 'canvas') await this.assertCanvasWritableInTrx(trx, ownerId, id)
           if (opts.idempotencyKey) {
             const entry = await this.idempotencyEntryInTrx(trx, ownerId, opts.method, opts.resourceKind, opts.idempotencyKey)
@@ -1170,16 +1229,6 @@ export class PgPersistBackend implements PersistBackend {
                 return { kind: r.is_deleted ? 'created' : 'updated', record: this.withIdem(rowToRecord(r), opts) }
               }
               await trx.deleteFrom('idempotency_index').where('owner_id', '=', ownerId).where('method', '=', opts.method).where('resource_kind', '=', opts.resourceKind).where('key', '=', opts.idempotencyKey).execute()
-            }
-          }
-          // F1:canvas PUT move 目标 project 须 live(防 move 到软删 project)。idem-replay 之后、existing 之前。
-          // SG-1:archived 目标 project 拒 PUT move/meta 写(route → 409 archived;与 CR-6 canvas 级闸门同语义)。
-          if (type === 'canvas') {
-            const pid = asCanvasMeta(payload)?.projectId
-            if (pid) {
-              const ps = await this.projectStateInTrx(trx, ownerId, pid)
-              if (!ps.live) return { kind: 'parent-not-live' }
-              if (ps.archived) return { kind: 'parent-archived' }
             }
           }
           // Project upsert 的 fresh/deleted 两分支都 projects-first。不存在的索引行锁为 no-op；

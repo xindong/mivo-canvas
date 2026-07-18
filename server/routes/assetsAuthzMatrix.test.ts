@@ -547,6 +547,74 @@ describe('G2.2 P1-4 残留2 — route detach 复合键选择(InMemory route 级)
   })
 })
 
+describe('CR-6 P2-1 — asset 三条 mutation 路径的 check→write 竞态注入(InMemory)', () => {
+  const seedRace = async (suffix: string) => {
+    const persist = createPersistBackend()
+    const permissions = new InMemoryPermissionBackend()
+    const assetStore = createAssetStore(createMemoryAssetBackend())
+    const app = buildApp(persist, permissions, assetStore)
+    const ids = { project: `p-race-${suffix}`, canvas: `c-race-${suffix}`, node: `n-race-${suffix}`, node2: `n2-race-${suffix}` }
+    await persist.ensureCreate(FP_OWNER, 'project', ids.project, { title: 'p' }, { method: 'POST', resourceKind: 'project' })
+    await persist.createCanvasWithCollection(FP_OWNER, ids.canvas, { projectId: ids.project }, { method: 'POST', resourceKind: 'canvas' })
+    await persist.ensureCreateChild(FP_OWNER, ids.canvas, 'node', ids.node, { type: 'image' }, { method: 'POST', resourceKind: 'node' })
+    await persist.ensureCreateChild(FP_OWNER, ids.canvas, 'node', ids.node2, { type: 'image' }, { method: 'POST', resourceKind: 'node' })
+    const upRes = await uploadReq(app, MIVO_KEY_OWNER)
+    expect(upRes.status).toBe(200)
+    const assetId = ((await upRes.json()) as { assetId: string }).assetId
+    return { persist, assetStore, app, ids, assetId }
+  }
+
+  const injectArchiveAtGuard = (persist: PersistBackend): void => {
+    const guarded = persist.withCanvasWriteGuard.bind(persist)
+    let injected = false
+    persist.withCanvasWriteGuard = async (ownerId, canvasId, mutation) => {
+      if (!injected) {
+        injected = true
+        await persist.archiveCanvasTree(ownerId, canvasId)
+      }
+      return guarded(ownerId, canvasId, mutation)
+    }
+  }
+
+  it('attach:authz 已过后 archive 插入，guard 返 409 且 ref 不新增', async () => {
+    const { persist, assetStore, app, ids, assetId } = await seedRace('attach')
+    injectArchiveAtGuard(persist)
+    const r = await app.request(`/api/assets/${assetId}/attach`, {
+      method: 'POST', headers: { ...hdr(MIVO_KEY_OWNER), 'content-type': 'application/json' },
+      body: JSON.stringify({ nodeId: ids.node, canvasId: ids.canvas }),
+    })
+    expect(r.status).toBe(409)
+    expect(await r.json()).toEqual({ error: 'archived', id: ids.canvas })
+    expect((await assetStore.getRecord(assetId))?.references).toEqual([])
+  })
+
+  it('new-ref detach:canvas write authz 已过后 archive 插入，guard 返 409 且 ref 保留', async () => {
+    const { persist, assetStore, app, ids, assetId } = await seedRace('new-detach')
+    await assetStore.attach(assetId, ids.node, FP_OWNER, undefined, ids.canvas)
+    injectArchiveAtGuard(persist)
+    const r = await app.request(`/api/assets/${assetId}/detach`, {
+      method: 'POST', headers: { ...hdr(MIVO_KEY_OWNER), 'content-type': 'application/json' },
+      body: JSON.stringify({ nodeId: ids.node, canvasId: ids.canvas }),
+    })
+    expect(r.status).toBe(409)
+    expect(await r.json()).toEqual({ error: 'archived', id: ids.canvas })
+    expect((await assetStore.getRecord(assetId))?.references).toContainEqual({ nodeId: ids.node, ownerFp: FP_OWNER, canvasId: ids.canvas })
+  })
+
+  it('legacy detach:权威 node→canvas 解析后 archive 插入，guard 返 409 且 canvas-less ref 保留', async () => {
+    const { persist, assetStore, app, ids, assetId } = await seedRace('legacy-detach')
+    await assetStore.attach(assetId, ids.node, FP_OWNER)
+    injectArchiveAtGuard(persist)
+    const r = await app.request(`/api/assets/${assetId}/detach`, {
+      method: 'POST', headers: { ...hdr(MIVO_KEY_OWNER), 'content-type': 'application/json' },
+      body: JSON.stringify({ nodeId: ids.node, canvasId: 'legacy-body-is-not-authority' }),
+    })
+    expect(r.status).toBe(409)
+    expect(await r.json()).toEqual({ error: 'archived', id: ids.canvas })
+    expect((await assetStore.getRecord(assetId))?.references).toContainEqual({ nodeId: ids.node, ownerFp: FP_OWNER, canvasId: undefined })
+  })
+})
+
 // ── PG 矩阵(MIVO_PG_TEST=1 时跑;镜像同矩阵,SC2 PG 组合双绿)──
 const pgConn = () => ({
   host: process.env.MIVO_PG_HOST || '127.0.0.1',

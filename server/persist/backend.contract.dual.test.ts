@@ -611,6 +611,43 @@ const runPersistBackendContractSuite = (
 // ── memory 后端(永远跑)──────────────────────────────────────────────────────────────
 runPersistBackendContractSuite('memory PersistBackend', () => new InMemoryPersistBackend(), (b) => b.__reset())
 
+describe('memory PersistBackend — P2-1 external mutation canvas critical section', () => {
+  const callbackFirst = async (archive: (b: InMemoryPersistBackend) => Promise<unknown>): Promise<void> => {
+    const b = new InMemoryPersistBackend()
+    await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+    await b.createCanvasWithCollection('o', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+    let entered!: () => void
+    let release!: () => void
+    const atMutation = new Promise<void>((resolve) => { entered = resolve })
+    const held = new Promise<void>((resolve) => { release = resolve })
+    let mutations = 0
+    const guarded = b.withCanvasWriteGuard('o', 'c1', async () => {
+      entered()
+      await held
+      mutations += 1
+    })
+    await atMutation
+    let archiveSettled = false
+    const archiving = archive(b).finally(() => { archiveSettled = true })
+    await Promise.resolve()
+    expect(archiveSettled).toBe(false)
+    release()
+    await Promise.all([guarded, archiving])
+    expect(mutations).toBe(1)
+    const canvas = await b.get('o', 'canvas', 'c1')
+    expect(canvas.kind).toBe('found')
+    if (canvas.kind === 'found') expect(canvas.record.status).toBe('archived')
+  }
+
+  it('guard callback first → archiveCanvasTree waits, terminal order mutation→archived', async () => {
+    await callbackFirst((b) => b.archiveCanvasTree('o', 'c1'))
+  })
+
+  it('guard callback first → archiveProjectTree waits on child canvas, terminal order mutation→archived', async () => {
+    await callbackFirst((b) => b.archiveProjectTree('o', 'p1'))
+  })
+})
+
 // ── PG 后端(gate:MIVO_PG_TEST=1;本地 brew PG port 55443)─────────────────────────────────
 const PG_TEST_ENABLED = process.env.MIVO_PG_TEST === '1'
 let pgBackend: PgPersistBackend | undefined

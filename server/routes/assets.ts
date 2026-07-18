@@ -413,8 +413,11 @@ export const createAssetRoutes = (options: AssetRouteOptions): App => {
       return c.json({ error: 'forbidden' }, 403)
     }
 
-    // 双门过 → attach(record ref canvasId 供后续 detach canvas-edit authz + gate ② 传递性 view)。
-    const result = await store.attach(assetId, nodeId, ownerFp, undefined, canvasId)
+    // 双门过 → attach。P2-1:route authz 与 asset mutation 间仍可能并发 archive；把真实 mutation
+    // 放进 backend per-canvas guard，PG 持 project→canvas 行锁到 attach 完成，memory 共用 canvas 临界区。
+    const result = await persist.withCanvasWriteGuard(access.ownerId, canvasId, () =>
+      store.attach(assetId, nodeId, ownerFp, undefined, canvasId),
+    )
     switch (result.kind) {
       case 'attached':
         log(200, 'attached')
@@ -482,6 +485,7 @@ export const createAssetRoutes = (options: AssetRouteOptions): App => {
       log(200, 'already-detached')
       return c.json({ kind: 'already-detached' } as { kind: 'already-detached' }, 200)
     }
+    let writeGuard: { ownerId: string; canvasId: string } | undefined
     // decision 2:验目标引用所在 canvas 的 edit 权。新 ref(ref.canvasId)走 canvas-edit authz;
     // legacy ref(无 canvasId)回退 ownerFp 校验(service 层 owner-mismatch,保既有契约)。
     if (ref.canvasId) {
@@ -495,6 +499,7 @@ export const createAssetRoutes = (options: AssetRouteOptions): App => {
         log(access.status, access.status === 403 ? 'forbidden' : access.status === 409 ? 'archived' : 'unknown-canvas')
         return c.json(access.body as Record<string, unknown>, access.status as 400 | 403 | 404 | 409 | 410)
       }
+      writeGuard = { ownerId: access.ownerId, canvasId: ref.canvasId }
     } else {
       // CR-6(Phase 2 归档 write-guard,补 legacy 路径):legacy ref(canvas-less,ref.canvasId undefined)整段
       //   此前跳过 resolveCanvasAccess → 不触发归档 409(攻击面:pre-G2.2 canvas-less legacy ref 其 node 落已归档
@@ -529,6 +534,7 @@ export const createAssetRoutes = (options: AssetRouteOptions): App => {
           }
         }
         if (authoritative && !authoritative.isDeleted && authoritative.canvasId) {
+          writeGuard = { ownerId: authoritative.ownerId, canvasId: authoritative.canvasId }
           const canvasRes = await persist.get(authoritative.ownerId, 'canvas', authoritative.canvasId)
           if (canvasRes.kind === 'found' && !canvasRes.record.isDeleted && canvasRes.record.status === 'archived') {
             log(409, 'archived')
@@ -541,7 +547,10 @@ export const createAssetRoutes = (options: AssetRouteOptions): App => {
     // authz 过(新 ref canvas-edit / legacy ref 走 service ownerFp)→ detach(P1-4 残留2:传 ref.canvasId
     //   本身;legacy ref → undefined,**禁回填 bodyCanvasId**——否则 backend 按 (bodyCanvasId, nodeId)
     //   复合键查 legacy ref (null, nodeId) → 匹配不到 → 假 already-detached)。
-    const result = await store.detach(assetId, nodeId, ownerFp, undefined, ref.canvasId)
+    const detachMutation = () => store.detach(assetId, nodeId, ownerFp, undefined, ref.canvasId)
+    const result = writeGuard
+      ? await persist.withCanvasWriteGuard(writeGuard.ownerId, writeGuard.canvasId, detachMutation)
+      : await detachMutation()
     switch (result.kind) {
       case 'detached':
         log(200, 'detached')

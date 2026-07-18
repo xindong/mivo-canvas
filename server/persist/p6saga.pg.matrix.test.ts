@@ -90,7 +90,28 @@ const migrateWith = async (
     // CR-6 缺口1(011_node_reverse_lookup_index):node 全局反查部分索引存在(findNodeOwners 查询路径)。
     const nodeIdx = (await sql`SELECT indexname FROM pg_indexes WHERE tablename='persist_records' AND indexname='idx_persist_node_by_id'`.execute(db)).rows as { indexname: string }[]
     expect(nodeIdx).toHaveLength(1)
-    // kysely_migration 精确单调:combined registry 全 11 行(001<...<010<011)
+    // CR-6 P2-2(012_canvas_reverse_lookup_index):chat actor≠canvas owner 时守卫只能按
+    // (type='canvas',id) 全局定位；部分索引令裸 id 查询定点，避免 persist_records 全扫。
+    const canvasIdx = (await sql`SELECT indexname FROM pg_indexes WHERE tablename='persist_records' AND indexname='idx_persist_canvas_by_id'`.execute(db)).rows as { indexname: string }[]
+    expect(canvasIdx).toHaveLength(1)
+    await sql`
+      INSERT INTO persist_records(id,owner_id,canvas_id,type,scope,revision,order_key,is_deleted,status,payload)
+      SELECT 'n-plan-' || g::text, 'plan-owner', 'c-plan', 'node', 'document', 0, g, false, 'active', '{}'::jsonb
+      FROM generate_series(1, 2000) AS g
+    `.execute(db)
+    await sql`
+      INSERT INTO persist_records(id,owner_id,canvas_id,type,scope,revision,order_key,is_deleted,status,payload)
+      VALUES('c-plan','canvas-owner',NULL,'canvas','document',0,0,false,'active','{}'::jsonb)
+    `.execute(db)
+    await sql`ANALYZE persist_records`.execute(db)
+    const explain = (await sql<{ 'QUERY PLAN': string }>`
+      EXPLAIN (COSTS OFF)
+      SELECT is_deleted, status FROM persist_records
+      WHERE type='canvas' AND id='c-plan' FOR UPDATE
+    `.execute(db)).rows.map((r) => r['QUERY PLAN']).join('\n')
+    expect(explain).toContain('Index Scan using idx_persist_canvas_by_id')
+    expect(explain).toContain("Index Cond: (id = 'c-plan'::text)")
+    // kysely_migration 精确单调:combined registry 全 12 行(001<...<010<011<012)
     const applied = (await sql`SELECT name FROM kysely_migration ORDER BY name`.execute(db)).rows as { name: string }[]
     expect(applied.map((r) => r.name)).toEqual([
       '2026_07_11_001_initial_persist_schema',
@@ -104,6 +125,7 @@ const migrateWith = async (
       '2026_07_13_009_field_clock_canvas_seq_tombstones',
       '2026_07_17_010_archive_status_column',
       '2026_07_18_011_node_reverse_lookup_index',
+      '2026_07_18_012_canvas_reverse_lookup_index',
     ])
     // combined registry 确含 003/004(合并 DP-6R 收敛)
     expect(Object.keys(migrations).sort()).toEqual([
@@ -118,6 +140,7 @@ const migrateWith = async (
       '2026_07_13_009_field_clock_canvas_seq_tombstones',
       '2026_07_17_010_archive_status_column',
       '2026_07_18_011_node_reverse_lookup_index',
+      '2026_07_18_012_canvas_reverse_lookup_index',
     ])
     await db.destroy()
   })
@@ -157,6 +180,7 @@ const migrateWith = async (
       '2026_07_13_009_field_clock_canvas_seq_tombstones',
       '2026_07_17_010_archive_status_column',
       '2026_07_18_011_node_reverse_lookup_index',
+      '2026_07_18_012_canvas_reverse_lookup_index',
     ])
     // 005 表+列齐(share_link_compensations / cascade_revoked_at / claim_token)
     const cols = (await sql`SELECT column_name FROM information_schema.columns WHERE table_name='share_link_compensations' ORDER BY column_name`.execute(db)).rows as { column_name: string }[]

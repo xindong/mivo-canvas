@@ -4,6 +4,7 @@
 import { randomUUID } from 'node:crypto'
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Pool } from 'pg'
+import { ArchivedCanvasWriteError } from './backend'
 import { PgPersistBackend } from './pgBackend'
 
 const ENABLED = process.env.MIVO_PG_TEST === '1'
@@ -88,6 +89,14 @@ const projectRow = async (pool: Pool, id: string) => (await pool.query<{
           pr.status AS meta_status, p.status AS index_status
      FROM persist_records pr JOIN projects p ON p.id=pr.id
     WHERE pr.owner_id='o' AND pr.type='project' AND pr.id=$1`,
+  [id],
+)).rows[0]
+const nodeRow = async (pool: Pool, id: string) => (await pool.query<{
+  revision: number
+  title: string | null
+}>(
+  `SELECT revision, payload->>'title' AS title
+     FROM persist_records WHERE owner_id='o' AND type='node' AND id=$1`,
   [id],
 )).rows[0]
 
@@ -281,17 +290,27 @@ const projectRow = async (pool: Pool, id: string) => (await pool.query<{
       startedBackendOperation = mutation
       await waitForBackendLock(pool, `parent-a→parent-b move × ${target}`)
 
-      const current = await backend.get('o', 'canvas', 'c-parent-move')
-      expect(current.kind).toBe('found')
-      if (current.kind !== 'found') throw new Error('missing canvas before move')
-      const moved = await backend.upsert(
-        'o',
-        'canvas',
-        'c-parent-move',
-        { ...(current.record.payload as object), projectId: 'parent-b' },
-        { method: 'PUT', resourceKind: 'canvas', base: current.record.revision },
-      )
-      expect(moved.kind).toBe('updated')
+      if (target === 'archive') {
+        const current = await backend.get('o', 'canvas', 'c-parent-move')
+        expect(current.kind).toBe('found')
+        if (current.kind !== 'found') throw new Error('missing canvas before move')
+        const moved = await backend.upsert(
+          'o',
+          'canvas',
+          'c-parent-move',
+          { ...(current.record.payload as object), projectId: 'parent-b' },
+          { method: 'PUT', resourceKind: 'canvas', base: current.record.revision },
+        )
+        expect(moved.kind).toBe('updated')
+      } else {
+        // archived canvas 的公开 PUT 按 SG-1/CR-6 正确拒绝；此处为制造 parent CAS miss，
+        // 用同一 blocker 精确模拟已获管理锁的内部 move 相位，不绕 route 语义。
+        await blocker.query("SELECT id FROM projects WHERE id='parent-b' FOR UPDATE")
+        await blocker.query("SELECT id FROM persist_records WHERE owner_id='o' AND type='canvas' AND id='c-parent-move' FOR UPDATE")
+        await blocker.query(`UPDATE persist_records
+          SET payload=jsonb_set(payload,'{projectId}',to_jsonb('parent-b'::text)), revision=revision+1
+          WHERE owner_id='o' AND type='canvas' AND id='c-parent-move'`)
+      }
       await blocker.query('COMMIT')
 
       const result = await within(mutation)
@@ -344,6 +363,132 @@ const projectRow = async (pool: Pool, id: string) => (await pool.query<{
       await mover.query('ROLLBACK').catch(() => undefined)
       await startedBackendOperation?.catch(() => undefined)
       mover.release()
+    }
+  })
+
+  const childVsArchive = async (kind: 'canvas' | 'project', winner: 'child' | 'archive'): Promise<void> => {
+    await setup(backend)
+    await addCanvas(backend, 'c-child-race', 'p1')
+    await backend.ensureCreateChild('o', 'c-child-race', 'node', 'n-child-race', { type: 'image', title: 'before' }, { method: 'POST', resourceKind: 'node' })
+    const blocker = await pool.connect()
+    let startedBackendOperation: Promise<unknown> | undefined
+    try {
+      await blocker.query('BEGIN')
+      if (winner === 'child') {
+        // 精确暂停在 child write 已持 canvas 行锁、尚未提交的相位；archive 必须在 PG Lock wait rendezvous。
+        await blocker.query("SELECT id FROM persist_records WHERE owner_id='o' AND type='canvas' AND id='c-child-race' FOR UPDATE")
+        await blocker.query("UPDATE persist_records SET payload=jsonb_set(payload,'{title}',to_jsonb('child-won'::text)), revision=revision+1 WHERE owner_id='o' AND type='node' AND id='n-child-race'")
+        const archive = observeBackendPromise(kind === 'canvas'
+          ? backend.archiveCanvasTree('o', 'c-child-race')
+          : backend.archiveProjectTree('o', 'p1'))
+        startedBackendOperation = archive
+        await waitForBackendLock(pool, `child first → archive ${kind}`)
+        await blocker.query('COMMIT')
+        await expect(within(archive)).resolves.toMatchObject({ count: expect.any(Number) })
+        expect(await nodeRow(pool, 'n-child-race')).toMatchObject({ revision: 1, title: 'child-won' })
+        expect(await canvasRow(pool, 'c-child-race')).toMatchObject({ status: 'archived', is_deleted: false })
+      } else {
+        // archive 的协议相位:projects → project meta(仅 project tree) → canvas；child backend 在 canvas 锁等待。
+        await blocker.query("SELECT id FROM projects WHERE id='p1' FOR UPDATE")
+        if (kind === 'project') {
+          await blocker.query("SELECT id FROM persist_records WHERE owner_id='o' AND type='project' AND id='p1' FOR UPDATE")
+          await blocker.query("UPDATE persist_records SET status='archived', revision=revision+1 WHERE owner_id='o' AND type='project' AND id='p1'")
+          await blocker.query("UPDATE projects SET status='archived' WHERE id='p1' AND owner_id='o'")
+        }
+        await blocker.query("SELECT id FROM persist_records WHERE owner_id='o' AND type='canvas' AND id='c-child-race' FOR UPDATE")
+        await blocker.query("UPDATE persist_records SET status='archived', revision=revision+1 WHERE owner_id='o' AND type='canvas' AND id='c-child-race'")
+        await blocker.query("UPDATE canvases SET status='archived' WHERE id='c-child-race' AND owner_id='o'")
+        const child = observeBackendPromise(backend.upsertChild(
+          'o', 'c-child-race', 'node', 'n-child-race', { type: 'image', title: 'must-not-land' },
+          { method: 'PATCH', resourceKind: 'node', base: 0 },
+        ))
+        startedBackendOperation = child
+        await waitForBackendLock(pool, `archive ${kind} first → child`)
+        await blocker.query('COMMIT')
+        await expect(within(child)).rejects.toBeInstanceOf(ArchivedCanvasWriteError)
+        // loser 是 typed archived guard（route 映射 409），不是 40P01/500；mutation 零落盘。
+        expect(await nodeRow(pool, 'n-child-race')).toMatchObject({ revision: 0, title: 'before' })
+        expect(await canvasRow(pool, 'c-child-race')).toMatchObject({ status: 'archived', is_deleted: false })
+      }
+    } finally {
+      // 先释放 blocker，再收 started promise，避免失败路径把连接/锁留给后续用例。
+      await blocker.query('ROLLBACK').catch(() => undefined)
+      await startedBackendOperation?.catch(() => undefined)
+      blocker.release()
+    }
+  }
+
+  it('child first ↔ archiveCanvasTree：archive 真等待，提交序终态 child→archived', async () => {
+    await childVsArchive('canvas', 'child')
+  })
+
+  it('archiveCanvasTree first ↔ child：child 真等待后 typed 409，零 500/零写穿透', async () => {
+    await childVsArchive('canvas', 'archive')
+  })
+
+  it('child first ↔ archiveProjectTree：project tree 真等待，提交序终态 child→archived', async () => {
+    await childVsArchive('project', 'child')
+  })
+
+  it('archiveProjectTree first ↔ child：child 真等待后 typed 409，零 500/零写穿透', async () => {
+    await childVsArchive('project', 'archive')
+  })
+
+  it('P2-1 PG barrier:guard callback 先持 project→canvas 锁，direct archive 等待；终态 mutation→archived', async () => {
+    await setup(backend)
+    await addCanvas(backend, 'c-asset-guard', 'p1')
+    let enter!: () => void
+    let release!: () => void
+    const entered = new Promise<void>((resolve) => { enter = resolve })
+    const held = new Promise<void>((resolve) => { release = resolve })
+    let mutations = 0
+    const guarded = observeBackendPromise(backend.withCanvasWriteGuard('o', 'c-asset-guard', async () => {
+      enter()
+      await held
+      mutations += 1
+      return 'mutated'
+    }))
+    await entered
+    const archive = observeBackendPromise(backend.archiveCanvasTree('o', 'c-asset-guard'))
+    try {
+      await waitForBackendLock(pool, 'asset guard first → direct archive')
+      release()
+      await expect(within(guarded)).resolves.toBe('mutated')
+      await expect(within(archive)).resolves.toMatchObject({ count: 1 })
+      expect(mutations).toBe(1)
+      expect(await canvasRow(pool, 'c-asset-guard')).toMatchObject({ status: 'archived', is_deleted: false })
+    } finally {
+      release()
+      await guarded.catch(() => undefined)
+      await archive.catch(() => undefined)
+    }
+  })
+
+  it('P2-1 PG barrier:direct archive 先持锁，guard 真等待后拒 callback；typed 409/零 mutation', async () => {
+    await setup(backend)
+    await addCanvas(backend, 'c-asset-guard', 'p1')
+    const blocker = await pool.connect()
+    let guarded: Promise<unknown> | undefined
+    let mutations = 0
+    try {
+      await blocker.query('BEGIN')
+      await blocker.query("SELECT id FROM projects WHERE id='p1' FOR UPDATE")
+      await blocker.query("SELECT id FROM persist_records WHERE owner_id='o' AND type='canvas' AND id='c-asset-guard' FOR UPDATE")
+      await blocker.query("UPDATE persist_records SET status='archived' WHERE owner_id='o' AND type='canvas' AND id='c-asset-guard'")
+      await blocker.query("UPDATE canvases SET status='archived' WHERE id='c-asset-guard' AND owner_id='o'")
+      guarded = observeBackendPromise(backend.withCanvasWriteGuard('o', 'c-asset-guard', async () => {
+        mutations += 1
+        return 'must-not-run'
+      }))
+      await waitForBackendLock(pool, 'direct archive first → asset guard')
+      await blocker.query('COMMIT')
+      await expect(within(guarded)).rejects.toBeInstanceOf(ArchivedCanvasWriteError)
+      expect(mutations).toBe(0)
+      expect(await canvasRow(pool, 'c-asset-guard')).toMatchObject({ status: 'archived', is_deleted: false })
+    } finally {
+      await blocker.query('ROLLBACK').catch(() => undefined)
+      await guarded?.catch(() => undefined)
+      blocker.release()
     }
   })
 })

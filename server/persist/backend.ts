@@ -224,6 +224,12 @@ export interface PersistBackend {
    */
   findNodeOwners(nodeId: string): Promise<Array<{ ownerId: string; canvasId: string | null; isDeleted: boolean }>>
   /**
+   * P2-1:把 persist 之外的 per-canvas mutation 纳入 write-time archived guard。
+   * PG 在同一事务内按 project → canvas 锁序持锁到 callback 完成；memory 用 per-canvas 临界区串行
+   * callback 与 archiveCanvasTree/archiveProjectTree。callback 抛错时原样传播，PG 事务回滚/解锁。
+   */
+  withCanvasWriteGuard<T>(ownerId: string, canvasId: string, mutation: () => Promise<T>): Promise<T>
+  /**
    * F1:project 存在且 !isDeleted(live)。canvas POST/PUT(move)前验 parent project live;
    * 软删 parent 下禁独立 child create/restore(只许 POST project 走 restoreProjectTree 整树恢复)。
    */
@@ -592,6 +598,8 @@ export class InMemoryPersistBackend implements PersistBackend {
   private readonly canvasSeq = new Map<string, number>()
   /** A2-S2(§10.7):已删 record tombstone(区分幂等已删返 seq vs 从未存在 404)。 */
   private readonly deletedTombstones = new Set<string>()
+  /** P2-1:asset 等外部 mutation 与 archive tree 共用的 per-canvas promise mutex。 */
+  private readonly canvasWriteLocks = new Map<string, Promise<void>>()
   /** additive(PG 落地后接口新增):内存 backend 立即就绪。 */
   readonly ready: Promise<void> = Promise.resolve()
 
@@ -785,6 +793,54 @@ export class InMemoryPersistBackend implements PersistBackend {
     const canvasOwner = this.globalCanvasOwners.get(canvasId) ?? ownerId
     const c = this.find(canvasOwner, 'canvas', canvasId)
     if (c && !c.isDeleted && c.status === 'archived') throw new ArchivedCanvasWriteError(canvasId)
+  }
+
+  /** 单 canvas FIFO 临界区；tail 吞错只用于维持队列，调用方仍收到原始结果/异常。 */
+  private withCanvasCritical<T>(canvasId: string, mutation: () => Promise<T>): Promise<T> {
+    const previous = this.canvasWriteLocks.get(canvasId) ?? Promise.resolve()
+    const result = previous.then(mutation, mutation)
+    const tail = result.then(() => undefined, () => undefined)
+    this.canvasWriteLocks.set(canvasId, tail)
+    void tail.finally(() => {
+      if (this.canvasWriteLocks.get(canvasId) === tail) this.canvasWriteLocks.delete(canvasId)
+    })
+    return result
+  }
+
+  /** 多 canvas 按 id 排序取锁，供 project tree 避免不同调用者锁序相反。 */
+  private withCanvasCriticalMany<T>(canvasIds: string[], mutation: () => Promise<T>): Promise<T> {
+    const ids = [...new Set(canvasIds)].sort()
+    const acquire = (index: number): Promise<T> =>
+      index === ids.length ? mutation() : this.withCanvasCritical(ids[index], () => acquire(index + 1))
+    return acquire(0)
+  }
+
+  /**
+   * project tree 等待既有 canvas 锁期间，canvas 可能同步 move/create 进该 project。取锁后重算集合；
+   * 若出现未持锁的新成员，先释放旧集合再按新排序集合重试，禁止未持其 mutex 就级联归档。
+   */
+  private async withProjectCanvasCritical<T>(ownerId: string, projectId: string, mutation: () => Promise<T>): Promise<T> {
+    for (;;) {
+      const ids = [...this.bucket(ownerId).values()]
+        .filter((r) => r.type === 'canvas' && asCanvasMeta(r.payload)?.projectId === projectId)
+        .map((r) => r.id)
+      const held = new Set(ids)
+      const result = await this.withCanvasCriticalMany(ids, async () => {
+        const current = [...this.bucket(ownerId).values()]
+          .filter((r) => r.type === 'canvas' && asCanvasMeta(r.payload)?.projectId === projectId)
+          .map((r) => r.id)
+        if (current.some((id) => !held.has(id))) return { retry: true as const }
+        return { retry: false as const, value: await mutation() }
+      })
+      if (!result.retry) return result.value
+    }
+  }
+
+  async withCanvasWriteGuard<T>(ownerId: string, canvasId: string, mutation: () => Promise<T>): Promise<T> {
+    return this.withCanvasCritical(canvasId, async () => {
+      this.assertCanvasWritable(ownerId, canvasId)
+      return mutation()
+    })
   }
 
   /** F1:project 存在且 !isDeleted。canvas POST/PUT(move)验 parent live;软删 parent 禁独立 child restore。 */
@@ -1227,9 +1283,15 @@ export class InMemoryPersistBackend implements PersistBackend {
       bodyFingerprint?: string
     },
   ): Promise<UpsertResult> {
-    // CR-6 缺口2:canvas meta PUT/move 同属 route 'write' 禁面(canvas.ts:390 authz)——写入临界区内重验
-    // 自身 archived-live(unarchive/restore 走 tree 方法不经此,不受影响)。
-    if (type === 'canvas') this.assertCanvasWritable(ownerId, id)
+    // P2-4 与 PG 全局序一致:先解析/检查目标 parent project，再进 canvas write guard。
+    // memory 无 DB 行锁，但保持同一可观察判定次序，防双后端 idempotency/archived 语义漂移。
+    if (type === 'canvas') {
+      const pid = asCanvasMeta(payload)?.projectId
+      if (pid && !this.projectLive(ownerId, pid)) return { kind: 'parent-not-live' }
+      if (pid && this.projectArchived(ownerId, pid)) return { kind: 'parent-archived' }
+      // CR-6:canvas meta PUT/move 同属 route 'write' 禁面；写入临界区内重验自身 archived-live。
+      this.assertCanvasWritable(ownerId, id)
+    }
     if (opts.idempotencyKey) {
       const entry = this.idempotencyIndex.get(idemIndexKey(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey))
       if (entry) {
@@ -1241,13 +1303,6 @@ export class InMemoryPersistBackend implements PersistBackend {
         }
         this.idempotencyIndex.delete(idemIndexKey(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey))
       }
-    }
-    // F1:canvas PUT move 目标 project 须 live(防 move 到软删 project)。idem-replay 之后、existing 之前。
-    if (type === 'canvas') {
-      const pid = asCanvasMeta(payload)?.projectId
-      if (pid && !this.projectLive(ownerId, pid)) return { kind: 'parent-not-live' }
-      // SG-1:archived 目标 project 拒 PUT move/meta 写(route → 409 archived;与 CR-6 canvas 级闸门同语义)。
-      if (pid && this.projectArchived(ownerId, pid)) return { kind: 'parent-archived' }
     }
     const existing = this.find(ownerId, type, id)
     const scope: PersistScope = opts.scope ?? 'document'
@@ -2012,28 +2067,30 @@ export class InMemoryPersistBackend implements PersistBackend {
 
   /** 归档 canvas(直接):canvas meta status→archived + payload.archivedByCascade→false(直接归档标记,unarchiveProjectTree 不误恢复)。幂等(已归档→0 行)。 */
   async archiveCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number; retryableConflict?: true }> {
-    const b = this.bucket(ownerId)
-    const ts = nowIso()
-    const targets: string[] = []
-    // parent-project-first 的 memory 等效:同步临界区内先解析 parent project,再收集/改 canvas。
-    const canvas = this.find(ownerId, 'canvas', canvasId)
-    const parentProjectId = canvas ? asCanvasMeta(canvas.payload)?.projectId : undefined
-    if (parentProjectId) this.find(ownerId, 'project', parentProjectId)
-    for (const [key, r] of b) {
-      if (r.type === 'canvas' && r.id === canvasId && !r.isDeleted && r.status !== 'archived') targets.push(key)
-    }
-    const snapshot = targets.map((k) => [k, clone(b.get(k)!)] as const)
-    try {
-      for (const key of targets) {
-        const r = b.get(key)!
-        const newPayload = { ...(clone(r.payload) as object), archivedByCascade: false }
-        b.set(key, { ...clone(r), payload: newPayload, status: 'archived', revision: r.revision + 1, updatedAt: ts })
+    return this.withCanvasCritical(canvasId, async () => {
+      const b = this.bucket(ownerId)
+      const ts = nowIso()
+      const targets: string[] = []
+      // parent-project-first 的 memory 等效:临界区内先解析 parent project,再收集/改 canvas。
+      const canvas = this.find(ownerId, 'canvas', canvasId)
+      const parentProjectId = canvas ? asCanvasMeta(canvas.payload)?.projectId : undefined
+      if (parentProjectId) this.find(ownerId, 'project', parentProjectId)
+      for (const [key, r] of b) {
+        if (r.type === 'canvas' && r.id === canvasId && !r.isDeleted && r.status !== 'archived') targets.push(key)
       }
-      return { count: targets.length }
-    } catch (err) {
-      for (const [key, rec] of snapshot) b.set(key, rec)
-      throw err
-    }
+      const snapshot = targets.map((k) => [k, clone(b.get(k)!)] as const)
+      try {
+        for (const key of targets) {
+          const r = b.get(key)!
+          const newPayload = { ...(clone(r.payload) as object), archivedByCascade: false }
+          b.set(key, { ...clone(r), payload: newPayload, status: 'archived', revision: r.revision + 1, updatedAt: ts })
+        }
+        return { count: targets.length }
+      } catch (err) {
+        for (const [key, rec] of snapshot) b.set(key, rec)
+        throw err
+      }
+    })
   }
 
   /** 恢复 canvas(直接):canvas meta status→active + payload.archivedByCascade→false。幂等(已 active→0 行)。 */
@@ -2064,32 +2121,34 @@ export class InMemoryPersistBackend implements PersistBackend {
 
   /** 归档 project 子树(级联):project meta status→archived + 其全部 active 子画布 status→archived + payload.archivedByCascade→true。幂等。 */
   async archiveProjectTree(ownerId: string, projectId: string): Promise<{ count: number }> {
-    const b = this.bucket(ownerId)
-    const ts = nowIso()
-    const targets: string[] = []
-    const proj = this.find(ownerId, 'project', projectId)
-    if (proj && !proj.isDeleted && proj.status !== 'archived') targets.push(recordKey(ownerId, 'project', projectId))
-    // 其全部 active 子画布(cascade 归档);已归档子画布不动(保留其 archivedByCascade 既有值)
-    for (const [key, r] of b) {
-      if (r.type !== 'canvas' || r.isDeleted) continue
-      if (r.status === 'archived') continue
-      const p = asCanvasMeta(r.payload)
-      if (p?.projectId === projectId) targets.push(key)
-    }
-    const snapshot = targets.map((k) => [k, clone(b.get(k)!)] as const)
-    try {
-      for (const key of targets) {
-        const r = b.get(key)!
-        const isProj = r.type === 'project' && r.id === projectId
-        // 子画布标 archivedByCascade=true(级联归档);project meta payload={name} 不含此字段
-        const newPayload = isProj ? clone(r.payload) : { ...(clone(r.payload) as object), archivedByCascade: true }
-        b.set(key, { ...clone(r), payload: newPayload, status: 'archived', revision: r.revision + 1, updatedAt: ts })
+    return this.withProjectCanvasCritical(ownerId, projectId, async () => {
+      const b = this.bucket(ownerId)
+      const ts = nowIso()
+      const targets: string[] = []
+      const proj = this.find(ownerId, 'project', projectId)
+      if (proj && !proj.isDeleted && proj.status !== 'archived') targets.push(recordKey(ownerId, 'project', projectId))
+      // 其全部 active 子画布(cascade 归档);已归档子画布不动(保留其 archivedByCascade 既有值)
+      for (const [key, r] of b) {
+        if (r.type !== 'canvas' || r.isDeleted) continue
+        if (r.status === 'archived') continue
+        const p = asCanvasMeta(r.payload)
+        if (p?.projectId === projectId) targets.push(key)
       }
-      return { count: targets.length }
-    } catch (err) {
-      for (const [key, rec] of snapshot) b.set(key, rec)
-      throw err
-    }
+      const snapshot = targets.map((k) => [k, clone(b.get(k)!)] as const)
+      try {
+        for (const key of targets) {
+          const r = b.get(key)!
+          const isProj = r.type === 'project' && r.id === projectId
+          // 子画布标 archivedByCascade=true(级联归档);project meta payload={name} 不含此字段
+          const newPayload = isProj ? clone(r.payload) : { ...(clone(r.payload) as object), archivedByCascade: true }
+          b.set(key, { ...clone(r), payload: newPayload, status: 'archived', revision: r.revision + 1, updatedAt: ts })
+        }
+        return { count: targets.length }
+      } catch (err) {
+        for (const [key, rec] of snapshot) b.set(key, rec)
+        throw err
+      }
+    })
   }
 
   /** 恢复 project 子树(级联):project status→active + 仅恢复 archivedByCascade=true 的子画布(D3:单独归档的不被强制恢复);清 archivedByCascade→false。幂等。 */

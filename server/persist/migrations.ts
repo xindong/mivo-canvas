@@ -303,6 +303,19 @@ const DROP_NODE_REVERSE_LOOKUP_INDEX = sql`
 DROP INDEX IF EXISTS idx_persist_node_by_id;
 `
 
+// CR-6 缺口2(P2-2,2026-07-18):canvas id 定点访问部分索引。pgBackend.assertCanvasWritableInTrx 事务内
+// `SELECT ... FROM persist_records WHERE type='canvas' AND id=$canvasId FOR UPDATE`——PK=(owner_id,type,id)
+// 前缀不含裸 id,chat per-actor 子写 ownerId=actor ≠ canvas owner(DP-6R),不带 owner_id 过滤(F4 canvas id
+// 全局唯一)→ 无索引则全索引扫。部分索引只覆盖 type='canvas' 行(写放大最小,与 011 node 反查同构),
+// 令 (type='canvas', id) 定点访问。EXPLAIN (COSTS OFF) 证据见 p6saga.pg.matrix.test.ts CR-6 P2-2 用例。
+// 纯 DDL,零回填(存量 canvas 行本就在 persist_records,缺的只是查询路径)。
+const CANVAS_REVERSE_LOOKUP_INDEX = sql`
+CREATE INDEX IF NOT EXISTS idx_persist_canvas_by_id ON persist_records (id) WHERE type = 'canvas';
+`
+const DROP_CANVAS_REVERSE_LOOKUP_INDEX = sql`
+DROP INDEX IF EXISTS idx_persist_canvas_by_id;
+`
+
 /** migrations 以 ISO 日期前缀排序;migrator 按 key 字典序应用。 */
 export const migrations: Record<string, Migration> = {
   '2026_07_11_001_initial_persist_schema': {
@@ -385,6 +398,16 @@ export const migrations: Record<string, Migration> = {
     },
     async down(db): Promise<void> {
       await DROP_NODE_REVERSE_LOOKUP_INDEX.execute(db)
+    },
+  },
+  // CR-6 缺口2(P2-2,2026-07-18):canvas id 定点访问部分索引(assertCanvasWritableInTrx 事务内
+  // type='canvas' AND id 裸查询;详见 CANVAS_REVERSE_LOOKUP_INDEX 注释)。
+  '2026_07_18_012_canvas_reverse_lookup_index': {
+    async up(db): Promise<void> {
+      await CANVAS_REVERSE_LOOKUP_INDEX.execute(db)
+    },
+    async down(db): Promise<void> {
+      await DROP_CANVAS_REVERSE_LOOKUP_INDEX.execute(db)
     },
   },
   // A2-S2(§14.1/§10.5/§10.7):field-level per-field clock + per-canvas 单调 seq + child tombstone。
