@@ -23,7 +23,17 @@ const moduleSpec = async (page, needle) =>
   }, needle)
 
 export const runArchiveCr6409Scenario = async (context) => {
-  const { canvasUrl, page, rendererMode, wait } = context
+  const { canvasUrl, page, rendererMode, wait, isProdTopology } = context
+
+  // prod topology skip:本场景依赖 Vite dev server 的 TS module HMR——moduleSpec 通过
+  // performance resource entries 找带 ?v= 查询的 .ts 模块路径,再 dynamic import 注入 mock。
+  // prod 拓扑 BFF 只 serve dist/ 静态产物,不存在 .ts 资源 → moduleSpec 回退原始 .ts 路径 →
+  // 浏览器向 BFF 端口 import 该路径失败(Failed to fetch dynamically imported module)。
+  // 409 逻辑已由 writeRetryQueue.test.ts 单测覆盖,prod e2e 跳过不降低覆盖。dev 拓扑照常执行。
+  if (isProdTopology) {
+    console.log('[e2e-smoke] SKIP scenario=archive-cr6-409 topology=prod reason=依赖 Vite dev server TS module HMR (moduleSpec + dynamic import mock),prod 拓扑 BFF 无 .ts 资源;409 逻辑由 writeRetryQueue.test.ts 单测覆盖')
+    return
+  }
 
   await page.goto(canvasUrl, { waitUntil: 'networkidle' })
   await waitForCanvasReady(page, rendererMode)
