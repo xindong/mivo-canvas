@@ -92,7 +92,7 @@ Project MivoCanvas/
 
 - **默认渲染器**:2026-07-06 起默认 `leafer`(Leafer 正式化最终验收通过后切换);`?renderer=dom` 为应急回退通道,DomRenderer 与双轨代码保留,观察窗后另行决策。
 
-- **Slack 接单会话(@Cindy 报bug/状态)**:行为契约必读 `docs/loops/bug-doctor-intake.md`。
+- **Mivo Slack 接单会话(@Cindy 报bug/状态)**:行为契约必读 `docs/loops/bug-doctor-intake.md`。
 
 （在此追加项目的具体决策、踩坑、TODO）
 

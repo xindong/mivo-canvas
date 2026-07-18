@@ -1,5 +1,5 @@
 {
-  "$comment": "bug-doctor 机器可读规则单一真相源(契约 docs/loops/bug-doctor.md 与本文件不一致时以本文件为准并回修契约)。gate 打分与主会话分诊共读。",
+  "$comment": "Mivo(原 bug-doctor)机器可读规则单一真相源(契约 docs/loops/bug-doctor.md 与本文件不一致时以本文件为准并回修契约)。gate 打分与主会话分诊共读。",
   "version": 1,
   "coreProcesses": [
     {

@@ -78,5 +78,5 @@ bench-results/
 bench/baselines/0b-*.json
 bench/baselines/.0b-*.log
 
-# bug-doctor loop 运行时状态(state/ledger/logs/workpacket/看板,不入 git)
+# Mivo(原 bug-doctor)loop 运行时状态(state/ledger/logs/workpacket/看板,不入 git)
 history/loops/

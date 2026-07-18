@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// patrol.mjs — T5 整点轻巡 wrapper(launchd 每小时调用,零 LLM;不改 gate 已验收逻辑,只消费其输出)
+// patrol.mjs — Mivo(原 bug-doctor)T5 整点轻巡 wrapper(launchd 每小时调用,零 LLM;不改 gate 已验收逻辑,只消费其输出)
 //
 // 职责:
 //   1. 跑 gate --s0-only(互斥锁/游标/台账/logs 全部由 gate 自理);
@@ -31,7 +31,25 @@ const RULES_PATH = join(__dirname, 'rules.json')
 export const PATROL_STATE_FILE = 'patrol-state.json'
 const BLINDNESS_DEDUP_MS = 6 * 3_600_000
 
-const log = (msg) => process.stderr.write(`[bug-doctor:patrol] ${msg}\n`)
+const log = (msg) => process.stderr.write(`[mivo:patrol] ${msg}\n`)
+
+// 展示层 P 编号 = 内部 S 级一一映射(P3-9;台账/工作包内部字段不动)
+const P_LABEL = { S0: 'P0', S1: 'P1', S2: 'P2', S3: 'P3' }
+const pLabel = (s) => P_LABEL[s] || String(s ?? '')
+
+// ---- 告警消息模板(Mivo 署名 + P 编号;导出供模板回归测试)----
+
+export const buildBlindnessAlert = ({ failures, threshold, stateDir }) => ({
+  title: '🛑 [mivo] Mivo 已失明',
+  text:
+    `gate --s0-only 连续失败 ${failures} 次(阈值 ${threshold}),P0 检测已停摆。\n` +
+    `请人工检查:SSH 拉数 / gh / 台账目录 ${stateDir}(详见 logs.md 失败行)。`,
+})
+
+export const buildS0Alert = ({ newAlerts, clustersByFp, stateDir }) => ({
+  title: `🚨 [mivo] P0 告警 · ${newAlerts.length} 项(整点轻巡)`,
+  text: `${newAlerts.map((a) => describeAlert(a, clustersByFp)).join('\n')}\n台账:${stateDir}`,
+})
 
 const parseArgs = (argv) => {
   const out = {}
@@ -88,7 +106,7 @@ const describeAlert = (alert, clustersByFp) => {
   }
   const c = clustersByFp[alert.fp]
   const stats = c
-    ? ` — ${c.sLevel} · 24h ${c.count24h} 次 / ${c.distinctClients24h} 客户端 · 累计 ${c.count}`
+    ? ` — ${pLabel(c.sLevel)} · 24h ${c.count24h} 次 / ${c.distinctClients24h} 客户端 · 累计 ${c.count}`
     : ''
   return `• 簇 [${alert.source}] ${alert.pattern}${stats}\n  fp:${alert.fp}`
 }
@@ -123,10 +141,7 @@ const main = async () => {
     if (failures >= threshold) {
       const last = patrolState.lastBlindnessAlertAt ? Date.parse(patrolState.lastBlindnessAlertAt) : 0
       if (Date.now() - last > BLINDNESS_DEDUP_MS) {
-        const title = '🛑 [bug-doctor] loop 已失明'
-        const text =
-          `gate --s0-only 连续失败 ${failures} 次(阈值 ${threshold}),S0 检测已停摆。\n` +
-          `请人工检查:SSH 拉数 / gh / 台账目录 ${stateDir}(详见 logs.md 失败行)。`
+        const { title, text } = buildBlindnessAlert({ failures, threshold, stateDir })
         const res = await sendAlert({ stateDir, config, title, text })
         patrolState.lastBlindnessAlertAt = new Date().toISOString()
         savePatrolState(stateDir, patrolState)
@@ -168,13 +183,12 @@ const main = async () => {
   const newAlerts = currentAlerts.filter((a) => !patrolState.alertedS0[alertKeyOf(a)])
 
   if (newAlerts.length > 0) {
-    const title = `🚨 [bug-doctor] S0 告警 · ${newAlerts.length} 项(整点轻巡)`
-    const text = `${newAlerts.map((a) => describeAlert(a, clustersByFp)).join('\n')}\n台账:${stateDir}`
+    const { title, text } = buildS0Alert({ newAlerts, clustersByFp, stateDir })
     const res = await sendAlert({ stateDir, config, title, text })
-    appendLog(stateDir, `${new Date().toISOString()} · patrol · S0 告警已发(channel=${res.channel},新 ${newAlerts.length} 项/在场 ${currentKeys.size} 项)`)
-    log(`S0 告警已发(channel=${res.channel},新 ${newAlerts.length} 项)`)
+    appendLog(stateDir, `${new Date().toISOString()} · patrol · P0 告警已发(channel=${res.channel},新 ${newAlerts.length} 项/在场 ${currentKeys.size} 项)`)
+    log(`P0 告警已发(channel=${res.channel},新 ${newAlerts.length} 项)`)
   } else {
-    log(`无新 S0(在场 ${currentKeys.size} 项均已告警或为零),零消息`)
+    log(`无新 P0(在场 ${currentKeys.size} 项均已告警或为零),零消息`)
   }
 
   // 幂等标记维护:在场项记时间戳;已消失项清除(复发再告警)
@@ -189,7 +203,9 @@ const main = async () => {
   }
 }
 
-main().catch((err) => {
-  log(`patrol 自身失败: ${err.message}`)
-  process.exit(1)
-})
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  main().catch((err) => {
+    log(`patrol 自身失败: ${err.message}`)
+    process.exit(1)
+  })
+}

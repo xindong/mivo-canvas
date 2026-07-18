@@ -1,4 +1,4 @@
-// notify.mjs — bug-doctor 告警投递小模块(T5)
+// notify.mjs — Mivo(原 bug-doctor)告警投递小模块(T5)
 //
 // 通道优先级:Slack incoming webhook(SLACK_WEBHOOK_URL,来源:环境变量 > <stateDir>/notify.env)。
 // 未配置或投递失败 → 降级双通道:追加 <stateDir>/pending-alerts.md(必落) + macOS 桌面通知(尽力)。
@@ -47,12 +47,12 @@ const postWebhook = async (url, text) => {
   }
 }
 
-const appendPendingAlert = (stateDir, title, text) => {
+export const appendPendingAlert = (stateDir, title, text) => {
   mkdirSync(stateDir, { recursive: true })
   const path = join(stateDir, PENDING_ALERTS_FILE)
   const header = existsSync(path)
     ? ''
-    : '# bug-doctor pending alerts(webhook 未配置/投递失败时落地;配置后由每日战报补报,不静默丢)\n\n'
+    : '# Mivo pending alerts(webhook 未配置/投递失败时落地;配置后由每日战报补报,不静默丢)\n\n'
   appendFileSync(path, `${header}## ${new Date().toISOString()} · ${title}\n\n${text}\n\n`)
 }
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// intake.mjs — bug-doctor 人工报单/状态查询 helper(T2-2/T2-3,确定性脚本,零 LLM)
+// intake.mjs — Mivo(原 bug-doctor)人工报单/状态查询 helper(T2-2/T2-3,确定性脚本,零 LLM)
 //
 // 供 Slack 接单会话(@Cindy)调用,契约见 docs/loops/bug-doctor-intake.md:
 //   report — 「报bug」动词:白名单校验 → 写台账人工报告簇(source=HumanReport,
@@ -45,7 +45,7 @@ export const S_TO_P = { S0: 'P0', S1: 'P1', S2: 'P2', S3: 'P3' }
 
 // ---- 通用 ----
 
-const log = (msg) => process.stderr.write(`[bug-doctor:intake] ${msg}\n`)
+const log = (msg) => process.stderr.write(`[mivo:intake] ${msg}\n`)
 
 /**
  * 默认状态目录穿透到主 checkout:接单会话跑在 .xdt-worktrees/ 隔离工作树里,
