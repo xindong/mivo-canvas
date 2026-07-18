@@ -220,7 +220,7 @@ export type WriteOp =
   | { kind: 'deleteProject'; projectId: string }
   | { kind: 'createCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string; status?: RecordStatus }
   | { kind: 'updateCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string; baseRevision?: Revision }
-  | { kind: 'deleteCanvas'; canvasId: string }
+  | { kind: 'deleteCanvas'; canvasId: string; parentProjectId?: string }
   // Phase 2 归档(回收站):archive/unarchive 走写队列(CR-7,断网归档不丢)。resourceKey 与 create/update/delete
   //   同资源一致 → 同资源归档态写经 combineOps 合并(D2:create+archive/unarchive→skip-coalesce(保留独立 transition
   //   op,不折进 create(status);P1 三审)/ archive+unarchive 互消(已 attempted 时也 skip-coalesce 防 lost-response
@@ -251,7 +251,7 @@ export type NonCanvasWriteOp =
   | { kind: 'deleteProject'; projectId: string }
   | { kind: 'createCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string; status?: RecordStatus }
   | { kind: 'updateCanvas'; canvasId: string; projectId: string; title?: string; sourceTemplateId?: string; baseRevision?: Revision }
-  | { kind: 'deleteCanvas'; canvasId: string }
+  | { kind: 'deleteCanvas'; canvasId: string; parentProjectId?: string }
   // Phase 2 归档(回收站):archive/unarchive 走写队列(CR-7,断网归档不丢)。resourceKey 与 create/update/delete
   //   同资源一致 → 同资源归档态写经 combineOps 合并(D2:create+archive/unarchive→skip-coalesce(保留独立 transition
   //   op,不折进 create(status);P1 三审)/ archive+unarchive 互消(已 attempted 时也 skip-coalesce 防 lost-response
@@ -467,6 +467,7 @@ export type WriteExecutor = (op: WriteOp, idempotencyKey: string) => Promise<Wri
  * Map an HTTP response (status + parsed body) to a WriteOutcome. T1.3's real executor
  * uses this after fetch(); tests bypass it by returning outcomes directly. The
  * `isDelete` flag makes 404 on a delete idempotent-successful (already-gone resource).
+ * 409 concurrent-parent-change+retryable → transient(archive intent 保留原样重试)。
  * 409 revision-conflict → conflict (do NOT blindly retry; surface currentRevision for
  * the app's rebase). 409 project/canvas-exists → rejected terminal (can't confirm it's
  * this session's lost response vs. another tenant's resource; safe terminal, not a
@@ -481,7 +482,9 @@ export const classifyHttpStatus = (
   if (status >= 200 && status < 300) return { status: 'success' }
   if (status === 401) return { status: 'unauthorized' }
   if (status === 409) {
-    const b = body as { error?: string; currentRevision?: Revision }
+    const b = body as { error?: string; currentRevision?: Revision; retryable?: boolean }
+    if (b?.error === 'concurrent-parent-change' && b.retryable === true)
+      return { status: 'transient', message: 'concurrent-parent-change' }
     if (b?.error === 'revision-conflict' && typeof b.currentRevision === 'number')
       return { status: 'conflict', currentRevision: b.currentRevision }
     return { status: 'rejected', body }
@@ -1955,6 +1958,8 @@ export type WriteQueue = {
   stop: () => void
   isPaused: () => boolean
   pendingCount: () => Promise<number>
+  /** active-child 409:取消同一乐观 project cascade 尚未发送的 child DELETE。 */
+  cancelDeleteCanvases: (canvasIds: readonly string[], parentProjectId?: string) => Promise<void>
 }
 
 /**
@@ -1981,6 +1986,9 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
   let timer: ReturnType<typeof setInterval> | undefined
   let onlineHandler: (() => void) | undefined
   let visibilityHandler: (() => void) | undefined
+  // active-child 409 恢复窗:deleteProject 在同一 drain 中先于其 cascade deleteCanvas。
+  // callback 删除 durable child op 后,本 Set 让已拍入 sortedDue 的内存快照也跳过 executor。
+  const cancelledDeleteCanvasIds = new Set<string>()
 
   // G1-a R2 F1:per-resourceKey 串行链。back-to-back enqueue 到同 key 必须看到彼此的 putWrite
   // 才能 coalesce;否则两个同步 fire 的 enqueue 竞态(第一个 IDB put 未落,第二个 getAllWrites
@@ -2268,6 +2276,14 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
 
       for (const rec of sortedDue) {
         if (paused) break // a prior op in this cycle got 401 → stop
+        if (rec.op.kind === 'deleteCanvas' && cancelledDeleteCanvasIds.has(rec.op.canvasId)) {
+          await deleteWrite(rec.id)
+          debugLogger.log(
+            SOURCE,
+            `deleteCanvas ${rec.op.canvasId} cancelled before send (parent deleteProject rejected active-child; optimistic cascade rolled back)`,
+          )
+          continue
+        }
         rec.status = 'in-flight'
         rec.lastAttemptAt = ts
         await putWrite(rec)
@@ -2365,10 +2381,11 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
             //   WriteOutcome 状态、executor 层不动(canvasSyncPortClient 路径由 SC-5a 处理)。
             const rejectedBody = outcome.body as { error?: string } | undefined
             const archived = rejectedBody?.error === 'archived'
+            const activeChildDelete = rec.op.kind === 'deleteProject' && rejectedBody?.error === 'active-child'
             termLog(`write ${rec.id} rejected by server: ${JSON.stringify(outcome.body).slice(0, 200)}`)
             if (archived && 'canvasId' in rec.op && typeof rec.op.canvasId === 'string') {
               notifyArchivedWriteBlocked(rec.op.canvasId)
-            } else {
+            } else if (!activeChildDelete) {
               termToast('这条改动无法保存,可能内容有误。')
             }
             await recordTerminal(rec, 'rejected', JSON.stringify(outcome.body).slice(0, 200))
@@ -2479,6 +2496,7 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
         }
       }
     } finally {
+      cancelledDeleteCanvasIds.clear()
       draining = false
     }
     return { processed, successes, failures, terminals, paused }
@@ -2489,6 +2507,24 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
     paused = false
     debugLogger.log(SOURCE, 'queue resumed (auth restored); draining pending writes')
     await drain()
+  }
+
+  const cancelDeleteCanvases = async (canvasIds: readonly string[], parentProjectId?: string): Promise<void> => {
+    if (canvasIds.length === 0 && !parentProjectId) return
+    const ids = new Set(canvasIds)
+    for (const id of ids) cancelledDeleteCanvasIds.add(id)
+    const userId = getPersistUserId()
+    const all = await getAllWrites()
+    for (const rec of all) {
+      if (
+        rec.userId === userId &&
+        rec.op.kind === 'deleteCanvas' &&
+        (ids.has(rec.op.canvasId) || (parentProjectId !== undefined && rec.op.parentProjectId === parentProjectId))
+      ) {
+        cancelledDeleteCanvasIds.add(rec.op.canvasId)
+        await deleteWrite(rec.id)
+      }
+    }
   }
 
   const pause = (): void => {
@@ -2556,7 +2592,7 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
     ).length
   }
 
-  return { enqueue, drain, resume, pause, start, stop, isPaused, pendingCount }
+  return { enqueue, drain, resume, pause, start, stop, isPaused, pendingCount, cancelDeleteCanvases }
 }
 
 // ── Test-only: dump all records via the module's own IDB layer + reset between tests ──

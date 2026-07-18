@@ -47,6 +47,8 @@ type TombstoneRecord = {
    * schemaless value(IDB keyPath='key' 不变),加可选字段不触发 onupgradeneeded(决策7:无 DB_VERSION bump)。
    */
   parentProjectId?: string
+  /** active-child 409 后权威回灌失败：下次 hydrate 必须先重试严格 project+canvas reconcile。 */
+  rollbackPending?: true
 }
 
 const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e))
@@ -140,34 +142,50 @@ const runVoidTx = (
       }),
   )
 
-const getAllRecords = async (): Promise<TombstoneRecord[]> => {
-  if (!isIdbAvailable()) return Array.from(memStore.values())
-  try {
-    const idbRecords = await runTx<TombstoneRecord[]>('readonly', (store) =>
-      store.getAll() as IDBRequest<TombstoneRecord[]>,
-    )
-    // P2-2(二审降级 seam):IDB enrich tx 曾失败 → 带 parentProjectId 的记录落 memStore(catch 回落),IDB 仍存
-    //   stale 无 parent 记录(同 key)。旧实现按 key 优先留 IDB + 过滤同 key mem(`!idbKeys.has(r.key)`)→
-    //   enrichment 不可见(parentProjectId 丢 → revokeCanvasTombstonesForProject 撞不到 → 恢复的画布被永久隐藏,
-    //   比复活更糟)。修:同 key merge——mem 的 parentProjectId(enriched)补进 IDB 记录(IDB 缺时);其余字段以
-    //   IDB 为准(durable 权威,createdAt/kind/ownerId/resourceId)。mem-only 记录(key 不在 IDB,如全 mem 兜底)照常追加。
-    //   merge 只在内存(读路径),不写回 IDB(读不改 durable;下次成功 putRecord enrich 自愈 IDB;IDB 持续故障时
-    //   每次 read 重 merge,幂等)。
-    const byKey = new Map<string, TombstoneRecord>()
-    for (const r of idbRecords) byKey.set(r.key, r)
-    for (const r of memStore.values()) {
-      const idb = byKey.get(r.key)
-      if (idb) {
-        // 同 key merge:mem 的 parentProjectId(enriched 投影)补进 IDB 记录(IDB stale 缺时);IDB 已有则不覆盖。
-        if (r.parentProjectId !== undefined && idb.parentProjectId === undefined) {
-          byKey.set(r.key, { ...idb, parentProjectId: r.parentProjectId })
-        }
-      } else {
-        // mem-only(key 不在 IDB)→ 追加(IDB tx 失败回落的全 mem 记录)。
-        byKey.set(r.key, r)
+const mergeIdbAndMemoryRecords = (idbRecords: TombstoneRecord[]): TombstoneRecord[] => {
+  // P2-2(二审降级 seam):IDB enrich tx 曾失败 → 带 parentProjectId 的记录落 memStore(catch 回落),IDB 仍存
+  //   stale 无 parent 记录(同 key)。旧实现按 key 优先留 IDB + 过滤同 key mem(`!idbKeys.has(r.key)`)→
+  //   enrichment 不可见(parentProjectId 丢 → revokeCanvasTombstonesForProject 撞不到 → 恢复的画布被永久隐藏,
+  //   比复活更糟)。修:同 key merge——mem 的 parentProjectId(enriched)补进 IDB 记录(IDB 缺时);其余字段以
+  //   IDB 为准(durable 权威,createdAt/kind/ownerId/resourceId)。mem-only 记录(key 不在 IDB,如全 mem 兜底)照常追加。
+  //   merge 只在内存(读路径),不写回 IDB(读不改 durable;下次成功 putRecord enrich 自愈 IDB;IDB 持续故障时
+  //   每次 read 重 merge,幂等)。
+  const byKey = new Map<string, TombstoneRecord>()
+  for (const r of idbRecords) byKey.set(r.key, r)
+  for (const r of memStore.values()) {
+    const idb = byKey.get(r.key)
+    if (idb) {
+      // 同 key merge:mem 的 parentProjectId(enriched 投影)补进 IDB 记录(IDB stale 缺时);IDB 已有则不覆盖。
+      if (
+        (r.parentProjectId !== undefined && idb.parentProjectId === undefined) ||
+        (r.rollbackPending === true && idb.rollbackPending !== true)
+      ) {
+        byKey.set(r.key, {
+          ...idb,
+          ...(r.parentProjectId !== undefined && idb.parentProjectId === undefined ? { parentProjectId: r.parentProjectId } : {}),
+          ...(r.rollbackPending === true ? { rollbackPending: true as const } : {}),
+        })
       }
+    } else {
+      // mem-only(key 不在 IDB)→ 追加(IDB tx 失败回落的全 mem 记录)。
+      byKey.set(r.key, r)
     }
-    return Array.from(byKey.values())
+  }
+  return Array.from(byKey.values())
+}
+
+/** commit-token 消费路径用：IDB 读取失败必须上抛，不能把空 memStore 误判为“无 child tombstone”。 */
+const getAllRecordsStrict = async (): Promise<TombstoneRecord[]> => {
+  if (!isIdbAvailable()) return Array.from(memStore.values())
+  const idbRecords = await runTx<TombstoneRecord[]>('readonly', (store) =>
+    store.getAll() as IDBRequest<TombstoneRecord[]>,
+  )
+  return mergeIdbAndMemoryRecords(idbRecords)
+}
+
+const getAllRecords = async (): Promise<TombstoneRecord[]> => {
+  try {
+    return await getAllRecordsStrict()
   } catch (error) {
     warnIdbDegradation('getAll failed', error)
     return Array.from(memStore.values())
@@ -182,8 +200,15 @@ const putRecord = async (record: TombstoneRecord): Promise<'new' | 'enriched' | 
   if (!isIdbAvailable()) {
     const existing = memStore.get(record.key)
     if (existing) {
-      if (record.parentProjectId !== undefined && existing.parentProjectId === undefined) {
-        memStore.set(record.key, { ...existing, parentProjectId: record.parentProjectId })
+      if (
+        (record.parentProjectId !== undefined && existing.parentProjectId === undefined) ||
+        (record.rollbackPending === true && existing.rollbackPending !== true)
+      ) {
+        memStore.set(record.key, {
+          ...existing,
+          ...(record.parentProjectId !== undefined && existing.parentProjectId === undefined ? { parentProjectId: record.parentProjectId } : {}),
+          ...(record.rollbackPending === true ? { rollbackPending: true as const } : {}),
+        })
         return 'enriched'
       }
       return 'existing'
@@ -201,9 +226,16 @@ const putRecord = async (record: TombstoneRecord): Promise<'new' | 'enriched' | 
         if (existing === undefined) {
           store.put(record)
           written = true
-        } else if (record.parentProjectId !== undefined && existing.parentProjectId === undefined) {
-          // enrich(原子:同 tx 内 get→put;不覆盖 createdAt/kind/ownerId/resourceId,只补 parentProjectId)
-          store.put({ ...existing, parentProjectId: record.parentProjectId })
+        } else if (
+          (record.parentProjectId !== undefined && existing.parentProjectId === undefined) ||
+          (record.rollbackPending === true && existing.rollbackPending !== true)
+        ) {
+          // enrich(原子:同 tx 内 get→put;不覆盖 createdAt/kind/ownerId/resourceId,只补 provenance/rollback marker)
+          store.put({
+            ...existing,
+            ...(record.parentProjectId !== undefined && existing.parentProjectId === undefined ? { parentProjectId: record.parentProjectId } : {}),
+            ...(record.rollbackPending === true ? { rollbackPending: true as const } : {}),
+          })
           enriched = true
         }
         // else: existing(已 parentProjectId 或新 record 无 parentProjectId)→ no-op
@@ -215,8 +247,15 @@ const putRecord = async (record: TombstoneRecord): Promise<'new' | 'enriched' | 
     warnIdbDegradation(`put failed for ${record.key}`, error)
     const existing = memStore.get(record.key)
     if (existing) {
-      if (record.parentProjectId !== undefined && existing.parentProjectId === undefined) {
-        memStore.set(record.key, { ...existing, parentProjectId: record.parentProjectId })
+      if (
+        (record.parentProjectId !== undefined && existing.parentProjectId === undefined) ||
+        (record.rollbackPending === true && existing.rollbackPending !== true)
+      ) {
+        memStore.set(record.key, {
+          ...existing,
+          ...(record.parentProjectId !== undefined && existing.parentProjectId === undefined ? { parentProjectId: record.parentProjectId } : {}),
+          ...(record.rollbackPending === true ? { rollbackPending: true as const } : {}),
+        })
         return 'enriched'
       }
       return 'existing'
@@ -224,6 +263,54 @@ const putRecord = async (record: TombstoneRecord): Promise<'new' | 'enriched' | 
     memStore.set(record.key, record)
     return 'new'
   }
+}
+
+/**
+ * rollbackPending commit token 专用严格写：必须真实提交到 IDB，失败（含 IDB 不可用）直接上抛。
+ * 若此前 best-effort 写曾落入 memStore，则把其中的 enrichment 一并提交；只有 transaction commit
+ * 后才清掉内存 fallback，避免失败时制造“内存看似成功、reload 后 marker 消失”的假 durable 状态。
+ */
+const putRecordStrict = async (record: TombstoneRecord): Promise<'new' | 'enriched' | 'existing'> => {
+  if (!isIdbAvailable()) {
+    throw new Error('IndexedDB unavailable for strict tombstone put')
+  }
+
+  const memoryRecord = memStore.get(record.key)
+  let written = false
+  let enriched = false
+  await runVoidTx('readwrite', (store) => {
+    const getReq = store.get(record.key) as IDBRequest<TombstoneRecord | undefined>
+    getReq.onsuccess = () => {
+      const existing = getReq.result
+      const base = existing ?? memoryRecord ?? record
+      const durableRecord: TombstoneRecord = {
+        ...base,
+        ...(base.parentProjectId === undefined && memoryRecord?.parentProjectId !== undefined
+          ? { parentProjectId: memoryRecord.parentProjectId }
+          : {}),
+        ...(base.parentProjectId === undefined && record.parentProjectId !== undefined
+          ? { parentProjectId: record.parentProjectId }
+          : {}),
+        ...(memoryRecord?.rollbackPending === true || record.rollbackPending === true
+          ? { rollbackPending: true }
+          : {}),
+      }
+      if (existing === undefined) {
+        store.put(durableRecord)
+        written = true
+      } else if (
+        (durableRecord.parentProjectId !== undefined && existing.parentProjectId === undefined) ||
+        (durableRecord.rollbackPending === true && existing.rollbackPending !== true)
+      ) {
+        store.put(durableRecord)
+        enriched = true
+      }
+    }
+  })
+
+  // IDB 已包含 record + mem fallback 的 enrichment；commit 后再清内存镜像。
+  memStore.delete(record.key)
+  return written ? 'new' : enriched ? 'enriched' : 'existing'
 }
 
 const deleteRecord = async (key: string): Promise<boolean> => {
@@ -248,6 +335,29 @@ const deleteRecord = async (key: string): Promise<boolean> => {
     // delete 失败不阻断(memStore 已清),warn 留痕。
     debugLogger.warn(SOURCE, `delete failed for ${key}: ${msg(error)}`)
   }
+  return existed
+}
+
+/**
+ * durable commit-token 消费路径用的严格删除：IDB transaction 失败必须传播给调用方，且只有
+ * transaction commit 后才清 mem fallback。普通 restore/DELETE-success 仍使用上面的 best-effort API。
+ */
+const deleteRecordStrict = async (key: string): Promise<boolean> => {
+  let existed = memStore.has(key)
+  if (!isIdbAvailable()) {
+    memStore.delete(key)
+    return existed
+  }
+  await runVoidTx('readwrite', (store) => {
+    const getReq = store.get(key) as IDBRequest<TombstoneRecord | undefined>
+    getReq.onsuccess = () => {
+      if (getReq.result !== undefined) {
+        store.delete(key)
+        existed = true
+      }
+    }
+  })
+  memStore.delete(key)
   return existed
 }
 
@@ -335,6 +445,65 @@ export const revokeCanvasTombstonesForProject = async (projectId: string): Promi
 }
 
 /**
+ * active-child rollback commit 专用严格版：读取或任一 child 删除失败即 reject。调用方必须先调本函数，
+ * 全部成功后才清 project rollback marker（project tombstone 是最后的 durable commit token）。
+ */
+export const revokeCanvasTombstonesForProjectStrict = async (projectId: string): Promise<void> => {
+  const ownerId = getPersistUserId()
+  const all = await getAllRecordsStrict()
+  const targets = all.filter(
+    (r) => r.ownerId === ownerId && r.kind === 'canvas' && r.parentProjectId === projectId,
+  )
+  if (targets.length === 0) return
+  let revoked = 0
+  for (const target of targets) {
+    const removed = await deleteRecordStrict(target.key)
+    if (removed) revoked++
+  }
+  if (revoked > 0) {
+    debugLogger.log(
+      SOURCE,
+      `strictly revoked ${revoked} cascade-deleted canvas tombstone(s) under project ${projectId} before project commit token`,
+    )
+  }
+}
+
+/**
+ * active-child 409 恢复辅助:在撤销 cascade tombstone 前取得同一批 child id,供 write queue
+ * 取消 deleteProject 乐观级联产生、但尚未发送的 deleteCanvas。只读、per-user、仅命中带 provenance 的记录。
+ */
+export const getCanvasTombstoneIdsForProject = async (projectId: string): Promise<string[]> => {
+  const ownerId = getPersistUserId()
+  const all = await getAllRecords()
+  return all
+    .filter((r) => r.ownerId === ownerId && r.kind === 'canvas' && r.parentProjectId === projectId)
+    .map((r) => r.resourceId)
+}
+
+/** active-child 权威回灌前给 project tombstone 严格写入 durable rollback marker。 */
+export const markProjectDeletionRollbackPending = async (projectId: string): Promise<void> => {
+  const ownerId = getPersistUserId()
+  await putRecordStrict({
+    key: tombstoneKey('project', projectId, ownerId),
+    ownerId,
+    kind: 'project',
+    resourceId: projectId,
+    createdAt: Date.now(),
+    rollbackPending: true,
+  })
+  debugLogger.warn(SOURCE, `project ${projectId} marked rollbackPending after active-child reconcile failure`)
+}
+
+/** hydrate 启动时读取需要严格重试权威回灌的 project id。 */
+export const getPendingProjectDeletionRollbackIds = async (): Promise<string[]> => {
+  const ownerId = getPersistUserId()
+  const all = await getAllRecords()
+  return all
+    .filter((record) => record.ownerId === ownerId && record.kind === 'project' && record.rollbackPending === true)
+    .map((record) => record.resourceId)
+}
+
+/**
  * 清除时机:DELETE 终态 success(含 404-idempotent)时调用(persistBoot onOutcome deleteProject/deleteCanvas
  * success 分支)。服务端已软删 → 不再 LIVE → 无复活风险 → tombstone 完成使命可清。返是否实际清除(命中才 log)。
  * terminal 失败路径不调(服务端仍 LIVE → tombstone 保留继续挡复活)。
@@ -344,6 +513,15 @@ export const clearDeletionTombstone = async (kind: TombstoneKind, resourceId: st
   const removed = await deleteRecord(key)
   if (removed) {
     debugLogger.log(SOURCE, `tombstone cleared for ${kind} ${resourceId} (DELETE terminal success; server soft-deleted → no resurrection risk)`)
+  }
+}
+
+/** active-child rollback commit 专用严格清除：project marker 删除失败必须传播，留待下轮重试。 */
+export const clearDeletionTombstoneStrict = async (kind: TombstoneKind, resourceId: string): Promise<void> => {
+  const key = tombstoneKey(kind, resourceId)
+  const removed = await deleteRecordStrict(key)
+  if (removed) {
+    debugLogger.log(SOURCE, `tombstone cleared for ${kind} ${resourceId} (strict durable commit token consumed)`)
   }
 }
 

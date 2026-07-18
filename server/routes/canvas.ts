@@ -41,6 +41,7 @@ import type {
   ArchivedBody,
   CanvasMeta,
   CanvasChildUpsertResponse,
+  ConcurrentParentChangeBody,
   ConflictBody,
   CreateCanvasRequest,
   GetCanvasResponse,
@@ -359,6 +360,11 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'parent-not-live' })
       return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
     }
+    // SG-1:目标 project archived → 409 archived(id=projectId;server 端 archived-parent 写入闸门,与 CR-6 同 error 语义)。
+    if (result.kind === 'parent-archived') {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 409, latencyMs: Date.now() - t0, note: 'parent-archived' })
+      return c.json({ error: 'archived', id: reqBody.projectId } satisfies ArchivedBody, 409)
+    }
     // created(canvas+collection 原子建)/restored(restoreCanvasTree 原子恢复 collection)/existing —— collection 全 live。
     const status = result.kind === 'created' ? 201 : 200
     logRequest({ method: c.req.method, path: c.req.path, requestId, status, latencyMs: Date.now() - t0 })
@@ -441,6 +447,11 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
     if (result.kind === 'parent-not-live') {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'parent-not-live' })
       return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
+    }
+    // SG-1:move/meta 写目标 project archived → 409 archived(id=目标 projectId;server 端 archived-parent 写入闸门)。
+    if (result.kind === 'parent-archived') {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 409, latencyMs: Date.now() - t0, note: 'parent-archived' })
+      return c.json({ error: 'archived', id: projectId } satisfies ArchivedBody, 409)
     }
     // F3 防御:upsert missing 跨 owner 同 id → 409 canvas-exists(route 层 authz+预检已阻,backend 防御性)。
     if (result.kind === 'exists-other-owner') {
@@ -1017,6 +1028,10 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
       return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
     }
     const res = await backend.archiveCanvasTree(authz.ownerId, id)
+    if (res.retryableConflict) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 409, latencyMs: Date.now() - t0, note: 'parent-changed-retryable' })
+      return c.json({ error: 'concurrent-parent-change', id, retryable: true } satisfies ConcurrentParentChangeBody, 409)
+    }
     const after = await backend.get(authz.ownerId, 'canvas', id)
     if (after.kind !== 'found' || after.record.isDeleted) {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })
@@ -1041,6 +1056,10 @@ export const createCanvasRoutes = ({ backend, permissions }: { backend: PersistB
       return c.json({ error: 'unknown-canvas' } satisfies UnknownResourceBody, 404)
     }
     const res = await backend.unarchiveCanvasTree(authz.ownerId, id)
+    if (res.retryableConflict) {
+      logRequest({ method: c.req.method, path: c.req.path, requestId, status: 409, latencyMs: Date.now() - t0, note: 'parent-changed-retryable' })
+      return c.json({ error: 'concurrent-parent-change', id, retryable: true } satisfies ConcurrentParentChangeBody, 409)
+    }
     const after = await backend.get(authz.ownerId, 'canvas', id)
     if (after.kind !== 'found' || after.record.isDeleted) {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0 })

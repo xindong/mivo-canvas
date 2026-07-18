@@ -294,10 +294,30 @@ export type RequireLoginBody = {
 /**
  * CR-6(Phase 2 归档 write-guard):archived canvas 的子记录写被拒(409)。客户端引导"先恢复再编辑"。
  * 触发点:authzCanvas 对 archived(action=write|move)返此 body;read/manage 放行(归档可读、可恢复、可彻底删除)。
+ * SG-1(server 端 archived-parent 写入闸门,defense-in-depth):canvas POST create / PUT move 命中 archived
+ * 目标 project 也返此 body(id=目标 projectId;与 CR-6 同 error 语义,客户端既有 409 archived 分支直接覆盖)。
  */
 export type ArchivedBody = {
   error: 'archived'
   id: string
+}
+
+/**
+ * SG-2(server 端 archived project 删除门禁,defense-in-depth):DELETE /api/projects/:id 命中
+ * 「status='archived' 的项目 + 其下存在 status!=='archived' 的 live 子画布」→ 409 返此 body
+ * (与 client deleteProject blocked reason 'active-child' 同语义:先恢复/归档所有活跃子画布再彻底删除)。
+ * active project 的正常删除(整树软删)语义不变,不触发此门禁。
+ */
+export type ActiveChildBody = {
+  error: 'active-child'
+  id: string
+}
+
+/** 直接归档/恢复与并发 move 的 parent CAS 连续失败；409 但可原样重试,不得按成功出队。 */
+export type ConcurrentParentChangeBody = {
+  error: 'concurrent-parent-change'
+  id: string
+  retryable: true
 }
 
 /** 统一错误体(任一 4xx)。 */
@@ -315,6 +335,8 @@ export type ApiErrorBody =
   | UnknownResourceBody
   | RequireLoginBody
   | ArchivedBody
+  | ActiveChildBody
+  | ConcurrentParentChangeBody
   | { error: 'project-exists'; id: string }
   // F4:canvas id 全局唯一(与 project 同模式)——跨 owner 同 canvas id → 409 canvas-exists。
   | { error: 'canvas-exists'; id: string }

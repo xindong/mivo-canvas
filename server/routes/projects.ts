@@ -35,6 +35,7 @@ import {
   reuseConflict,
 } from '../lib/persistHttp'
 import type {
+  ActiveChildBody,
   ConflictBody,
   CreateProjectRequest,
   ListProjectsResponse,
@@ -153,8 +154,8 @@ export const createProjectsRoutes = ({ backend, permissions }: { backend: Persis
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 409, latencyMs: Date.now() - t0, note: 'project-exists' })
       return c.json(err, 409)
     }
-    // F1 防御:project 无父 project,parent-not-live 不可达;类型收窄(不返 200 假成功)。
-    if (result.kind === 'parent-not-live') {
+    // F1/SG-1 防御:project 无父 project,parent-not-live/parent-archived 不可达;类型收窄(不返 200 假成功)。
+    if (result.kind === 'parent-not-live' || result.kind === 'parent-archived') {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'parent-not-live' })
       return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
     }
@@ -274,8 +275,8 @@ export const createProjectsRoutes = ({ backend, permissions }: { backend: Persis
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 409, latencyMs: Date.now() - t0, note: 'project-exists' })
       return c.json(err, 409)
     }
-    // F1 防御:project PATCH 无父 project,parent-not-live 不可达;类型收窄。
-    if (result.kind === 'parent-not-live') {
+    // F1/SG-1 防御:project PATCH 无父 project,parent-not-live/parent-archived 不可达;类型收窄。
+    if (result.kind === 'parent-not-live' || result.kind === 'parent-archived') {
       logRequest({ method: c.req.method, path: c.req.path, requestId, status: 404, latencyMs: Date.now() - t0, note: 'parent-not-live' })
       return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
     }
@@ -304,7 +305,13 @@ export const createProjectsRoutes = ({ backend, permissions }: { backend: Persis
       return c.json({ error: 'unknown-project' } satisfies UnknownResourceBody, 404)
     }
     if (!got.record.isDeleted) {
-      await backend.softDeleteProjectTree(authz.ownerId, id)
+      const del = await backend.softDeleteProjectTree(authz.ownerId, id)
+      // SG-2:archived project + 存在非 archived live 子画布 → 409 active-child(先恢复/归档所有活跃子画布再彻底删除;
+      // 与 client deleteProject blocked reason 对齐;零写,不记补偿)。
+      if (del.blocked === 'active-child') {
+        logRequest({ method: c.req.method, path: c.req.path, requestId, status: 409, latencyMs: Date.now() - t0, note: 'active-child' })
+        return c.json({ error: 'active-child', id } satisfies ActiveChildBody, 409)
+      }
       // P-6 saga:softDelete 成功后才记 delete 补偿意图(softDelete 抛错则不到此,无需补偿)。
       // P1-1 返修:record 失败不阻断主操作(cascade marker durable,attempt 据 marker 自收敛)。
       try {

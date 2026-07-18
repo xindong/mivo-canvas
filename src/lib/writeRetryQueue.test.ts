@@ -152,6 +152,12 @@ describe('classifyHttpStatus', () => {
       currentRevision: 7,
     })
   })
+  it('409 concurrent-parent-change + retryable → transient (archive intent stays queued)', () => {
+    expect(c(409, { error: 'concurrent-parent-change', id: 'c1', retryable: true }, false)).toEqual({
+      status: 'transient',
+      message: 'concurrent-parent-change',
+    })
+  })
   it('409 project-exists / canvas-exists → rejected terminal (no silent success)', () => {
     expect(c(409, { error: 'project-exists', id: 'p1' }, false).status).toBe('rejected')
     expect(c(409, { error: 'canvas-exists', id: 'c1' }, false).status).toBe('rejected')

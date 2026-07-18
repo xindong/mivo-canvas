@@ -62,6 +62,7 @@ export type EnsureCreateResult =
   | { kind: 'exists-other-owner'; record: PersistRecord } // 全局唯一 id 撞(跨 owner),route → 409 project-exists/canvas-exists
   | { kind: 'reuse-conflict' } // N4:同 idem key 不同 fingerprint(不同 body)→ route 422
   | { kind: 'parent-not-live' } // F1:canvas 父 project 软删/不存在 → route 404 unknown-project(禁独立 child restore)
+  | { kind: 'parent-archived' } // SG-1:canvas 目标 project archived → route 409 {error:'archived',id:projectId}(server 端 archived-parent 写入闸门)
 
 /**
  * 子资源 ensureCreate 结果(chat-message POST)。N3:canvas_id 校验(cross-canvas);
@@ -82,6 +83,7 @@ export type UpsertResult =
   | { kind: 'precondition-required'; record: PersistRecord } // 返修 #4:existing 缺 base → 428
   | { kind: 'reuse-conflict' } // N4:同 idem key 不同 fingerprint → route 422
   | { kind: 'parent-not-live' } // F1:canvas PUT move 目标 project 软删/不存在 → route 404 unknown-project
+  | { kind: 'parent-archived' } // SG-1:canvas PUT move 目标 project archived → route 409 {error:'archived',id:projectId}
   | { kind: 'exists-other-owner'; record: PersistRecord } // F3:upsert missing 跨 owner 同 id(全局唯一),route → 409 project-exists/canvas-exists(与 ensureCreate 同语义)
 
 /** 子资源 upsert 结果(PATCH node/edge/anchor/chat-message:返修 #3 cross-canvas + #4 428 + #5 max(0,base)+N4 reuse-conflict)。 */
@@ -405,8 +407,12 @@ export interface PersistBackend {
   // ── 返修 #7/N2:原子 tree 软删/恢复(单函数原子,故障全回滚)──
   /** 软删 canvas 子树:标 canvas meta + chat-collection record(原子;children 保持活记录)。 */
   softDeleteCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number }>
-  /** 软删 project 子树:标 project + 其所有 canvas meta + 所有 chat-collection(原子)。 */
-  softDeleteProjectTree(ownerId: string, projectId: string): Promise<{ count: number }>
+  /**
+   * 软删 project 子树:标 project + 其所有 canvas meta + 所有 chat-collection(原子)。
+   * SG-2:project status='archived' 且其下存在 status!=='archived' 的 live 子画布 → 返 blocked:'active-child'
+   * (不删任何行;route → 409 {error:'active-child'})。active project 整树软删语义不变。
+   */
+  softDeleteProjectTree(ownerId: string, projectId: string): Promise<{ count: number; blocked?: 'active-child' }>
   /**
    * 恢复 canvas 子树:canvas meta + chat-collection(原子,N2)。
    * opts.payload(若有)更新 canvas meta 域字段(restore-via-POST 带 new payload);opts.idempotencyKey/fingerprint 落 meta record。
@@ -427,9 +433,9 @@ export interface PersistBackend {
   // status 列(D1)作归档标记(非 is_deleted);archivedByCascade(D3)在 canvas meta payload 内布尔区分级联 vs 直接归档。
   // 彻底删除仍走 softDelete*Tree(is_deleted 终态);archive=软隐藏(可读/可恢复/子记录写返 409 archived,CR-6 write-guard)。
   /** 归档 canvas(直接):canvas meta status→archived + archivedByCascade→false。幂等(已归档→0 行)。 */
-  archiveCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number }>
+  archiveCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number; retryableConflict?: true }>
   /** 恢复 canvas(直接):canvas meta status→active + archivedByCascade→false。幂等(已 active→0 行)。 */
-  unarchiveCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number }>
+  unarchiveCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number; retryableConflict?: true }>
   /** 归档 project 子树(级联):project meta status→archived + 其全部 active 子画布 status→archived + archivedByCascade→true。幂等。 */
   archiveProjectTree(ownerId: string, projectId: string): Promise<{ count: number }>
   /** 恢复 project 子树(级联):project status→active + 仅恢复 archivedByCascade=true 的子画布(D3:单独归档的不被强制恢复)。幂等。 */
@@ -728,6 +734,12 @@ export class InMemoryPersistBackend implements PersistBackend {
     return !!r && !r.isDeleted
   }
 
+  /** SG-1:project live 且 status='archived'(archived-parent 写入闸门判据;status 缺省=active 不命中)。 */
+  private projectArchived(ownerId: string, projectId: string): boolean {
+    const r = this.find(ownerId, 'project', projectId)
+    return !!r && !r.isDeleted && r.status === 'archived'
+  }
+
   async ensureCreate(
     ownerId: string,
     type: PersistType,
@@ -757,6 +769,8 @@ export class InMemoryPersistBackend implements PersistBackend {
     if (type === 'canvas') {
       const pid = asCanvasMeta(payload)?.projectId
       if (pid && !this.projectLive(ownerId, pid)) return { kind: 'parent-not-live' }
+      // SG-1:archived 目标 project 拒子记录 create/restore(route → 409 archived;defense-in-depth,client 闸门已先拦)。
+      if (pid && this.projectArchived(ownerId, pid)) return { kind: 'parent-archived' }
     }
     // 返修 #10/N4:幂等 header 复用(owner+method+resourceKind+key 复合 + fingerprint)。
     if (opts.idempotencyKey) {
@@ -866,6 +880,8 @@ export class InMemoryPersistBackend implements PersistBackend {
     // 复验 parent live(临界区入口;同步块不可中断,进入即定 live,整块执行不可让渡)。
     const pid = asCanvasMeta(canvasPayload)?.projectId
     if (pid && !this.projectLive(ownerId, pid)) return { kind: 'parent-not-live' }
+    // SG-1:archived 目标 project 拒 restore(与 create 同门禁,route → 409 archived)。
+    if (pid && this.projectArchived(ownerId, pid)) return { kind: 'parent-archived' }
 
     const b = this.bucket(ownerId)
     const canvasKey = recordKey(ownerId, 'canvas', canvasId)
@@ -929,6 +945,8 @@ export class InMemoryPersistBackend implements PersistBackend {
     // F1:父 project 须 live(软删 parent 下禁独立 child create/restore;阻断 orphan)。
     const pid = asCanvasMeta(canvasPayload)?.projectId
     if (pid && !this.projectLive(ownerId, pid)) return { kind: 'parent-not-live' }
+    // SG-1:archived 目标 project 拒子画布 create(route → 409 archived;defense-in-depth,client 闸门已先拦)。
+    if (pid && this.projectArchived(ownerId, pid)) return { kind: 'parent-archived' }
     // 幂等 replay(owner+method+resourceKind+key + fingerprint)。
     if (opts.idempotencyKey) {
       const entry = this.idempotencyIndex.get(idemIndexKey(ownerId, opts.method, opts.resourceKind, opts.idempotencyKey))
@@ -1164,6 +1182,8 @@ export class InMemoryPersistBackend implements PersistBackend {
     if (type === 'canvas') {
       const pid = asCanvasMeta(payload)?.projectId
       if (pid && !this.projectLive(ownerId, pid)) return { kind: 'parent-not-live' }
+      // SG-1:archived 目标 project 拒 PUT move/meta 写(route → 409 archived;与 CR-6 canvas 级闸门同语义)。
+      if (pid && this.projectArchived(ownerId, pid)) return { kind: 'parent-archived' }
     }
     const existing = this.find(ownerId, type, id)
     const scope: PersistScope = opts.scope ?? 'document'
@@ -1823,12 +1843,23 @@ export class InMemoryPersistBackend implements PersistBackend {
     return { count: this.restoreCanvasTreeInPlace(ownerId, canvasId, opts) }
   }
 
-  async softDeleteProjectTree(ownerId: string, projectId: string): Promise<{ count: number }> {
+  async softDeleteProjectTree(ownerId: string, projectId: string): Promise<{ count: number; blocked?: 'active-child' }> {
     const b = this.bucket(ownerId)
     const ts = nowIso()
     const targets: string[] = []
+    // memory 等效全局锁序:本 async 方法到 return 前无 await,整个同步段是不可让渡临界区；先解析
+    // project,再枚举/判定 live child,最后才 mutation,等价 PG projects→project meta→canvas rows。
     // project meta
     const proj = this.find(ownerId, 'project', projectId)
+    // SG-2:archived project 删除门禁——存在 status!=='archived' 的 live 子画布 → blocked,不删任何行
+    // (与 client deleteProject 'active-child' blocked reason 同语义;active project 整树软删不走此分支)。
+    if (proj && !proj.isDeleted && proj.status === 'archived') {
+      for (const [, r] of b) {
+        if (r.type !== 'canvas' || r.isDeleted) continue
+        if (asCanvasMeta(r.payload)?.projectId !== projectId) continue
+        if (r.status !== 'archived') return { count: 0, blocked: 'active-child' }
+      }
+    }
     if (proj && !proj.isDeleted) targets.push(recordKey(ownerId, 'project', projectId))
     // 其所有 canvas meta + chat-collection
     for (const [key, r] of b) {
@@ -1904,10 +1935,14 @@ export class InMemoryPersistBackend implements PersistBackend {
   // 彻底删除仍走 softDelete*Tree(is_deleted 终态);archive=软隐藏(可读/可恢复/子记录写返 409 archived,CR-6 write-guard)。
 
   /** 归档 canvas(直接):canvas meta status→archived + payload.archivedByCascade→false(直接归档标记,unarchiveProjectTree 不误恢复)。幂等(已归档→0 行)。 */
-  async archiveCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number }> {
+  async archiveCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number; retryableConflict?: true }> {
     const b = this.bucket(ownerId)
     const ts = nowIso()
     const targets: string[] = []
+    // parent-project-first 的 memory 等效:同步临界区内先解析 parent project,再收集/改 canvas。
+    const canvas = this.find(ownerId, 'canvas', canvasId)
+    const parentProjectId = canvas ? asCanvasMeta(canvas.payload)?.projectId : undefined
+    if (parentProjectId) this.find(ownerId, 'project', parentProjectId)
     for (const [key, r] of b) {
       if (r.type === 'canvas' && r.id === canvasId && !r.isDeleted && r.status !== 'archived') targets.push(key)
     }
@@ -1926,10 +1961,14 @@ export class InMemoryPersistBackend implements PersistBackend {
   }
 
   /** 恢复 canvas(直接):canvas meta status→active + payload.archivedByCascade→false。幂等(已 active→0 行)。 */
-  async unarchiveCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number }> {
+  async unarchiveCanvasTree(ownerId: string, canvasId: string): Promise<{ count: number; retryableConflict?: true }> {
     const b = this.bucket(ownerId)
     const ts = nowIso()
     const targets: string[] = []
+    // parent-project-first 的 memory 等效(同 archiveCanvasTree):先解析 parent,再改 canvas。
+    const canvas = this.find(ownerId, 'canvas', canvasId)
+    const parentProjectId = canvas ? asCanvasMeta(canvas.payload)?.projectId : undefined
+    if (parentProjectId) this.find(ownerId, 'project', parentProjectId)
     for (const [key, r] of b) {
       if (r.type === 'canvas' && r.id === canvasId && !r.isDeleted && r.status === 'archived') targets.push(key)
     }

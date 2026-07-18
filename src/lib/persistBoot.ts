@@ -34,7 +34,12 @@ import { getPersistUserId } from './persistUserId'
 //   documentSlice);本模块负责 hydrate 过滤读取 + onOutcome DELETE success 清除 + enqueuePersistWrite create 撤销。
 import {
   revokeDeletionTombstone,
+  revokeCanvasTombstonesForProjectStrict,
+  getCanvasTombstoneIdsForProject,
+  getPendingProjectDeletionRollbackIds,
+  markProjectDeletionRollbackPending,
   clearDeletionTombstone,
+  clearDeletionTombstoneStrict,
   getDeletionTombstones,
 } from './deletionTombstones'
 import { fromRecord, edgeFromRecord } from '../kernel/mapping'
@@ -42,7 +47,7 @@ import type { NodeRecord, EdgeRecord } from '../kernel/records'
 import { debugLogger } from '../store/debugLogStore'
 import { resolveActiveCanvasAfterArchive } from '../store/archiveSurvivor'
 import { toastFeedback } from '../store/toastStore'
-import { defaultFetch, type FetchAdapterOptions, type FetchLike, type GetAuthHeaders } from './serverPersistAdapter'
+import { createFetchServerPersistAdapter, defaultFetch, type FetchAdapterOptions, type FetchLike, type GetAuthHeaders } from './serverPersistAdapter'
 import type { ChatMessage } from '../store/chatStore'
 import type { CanvasDocument } from '../types/mivoCanvas'
 import type { Revision, UserStateEntry, RecordEntry } from '../../shared/persist-contract.ts'
@@ -679,6 +684,26 @@ export const hydrateFromServer = async (
   // dynamic import:防 canvasStore→projectsSlice→persistBoot→canvasStore 静态环。
   const { useCanvasStore } = await import('../store/canvasStore')
 
+  // active-child rollback 的 durable retry marker 必须先于普通 tombstone 过滤处理。成功后清 project/
+  // cascade canvas tombstone,让本轮常规 hydrate 继续以 server 真值收敛；失败保留 marker,下次 hydrate 再试。
+  const rollbackProjectIds = await getPendingProjectDeletionRollbackIds()
+  for (const projectId of rollbackProjectIds) {
+    try {
+      const result = await reconcileActiveChildDeleteRejection(projectId, adapter)
+      // project tombstone/rollbackPending 是最后的 durable commit token：child 全部严格清理成功后才消费。
+      await revokeCanvasTombstonesForProjectStrict(projectId)
+      await clearDeletionTombstoneStrict('project', projectId)
+      debugLogger.warn(
+        SOURCE,
+        result.kind === 'authoritatively-deleted'
+          ? `hydrate retried active-child rollback for ${projectId}: project and children authoritatively absent, marker cleared`
+          : `hydrate retried active-child rollback for ${projectId}: authoritative reconcile restored local state, marker cleared`,
+      )
+    } catch (error) {
+      debugLogger.warn(SOURCE, `hydrate retried active-child rollback for ${projectId}: still failed, marker retained: ${msg(error)}`)
+    }
+  }
+
   // D2 migration-on-boot:迁移 marker(按 userId 分区;boot 防重迁)。onConflict re-hydrate 时
   //   marker 已 set(boot flush 后)→ 跳迁移;且 onConflict 蕴含 server 非空 → 迁移分支(server 空)
   //   本就不命中。一次 hydrate 调用内 step1/step2 共用此快照(不重复读 localStorage)。
@@ -1161,6 +1186,71 @@ export const reconcileProjectCanvasStatus = async (
 }
 
 /**
+ * active-child 拒绝后的严格权威回灌。project 与该 project 的 canvas GET 必须同时成功才写 store；
+ * 与通用 hydrate 不同,本 helper 不吞错,调用方据此决定是否清 tombstone/展示成功文案。
+ */
+type ActiveChildDeleteReconcileResult =
+  | { kind: 'restored' }
+  | { kind: 'authoritatively-deleted' }
+
+const reconcileActiveChildDeleteRejection = async (
+  projectId: string,
+  adapter: ReturnType<typeof getServerPersistAdapter>,
+): Promise<ActiveChildDeleteReconcileResult> => {
+  const [{ projects }, { canvases }] = await Promise.all([
+    adapter.listProjects({ includeArchived: true }),
+    adapter.listCanvas(projectId, { includeArchived: true }),
+  ])
+  const project = projects.find((candidate) => candidate.id === projectId)
+  // listCanvas(projectId) 的 wire contract 已 project-scoped；仍在消费端防御过滤，避免畸形 adapter
+  // 把其他项目 child 误算成 pX 的 live child，阻止 authoritatively-deleted 收敛。
+  const projectCanvases = canvases.filter((candidate) => candidate.projectId === projectId)
+  if (!project) {
+    // 两个权威 GET 均成功且 project/children 同时为空，说明项目已被其他设备合法彻底删除
+    // （或当前 actor 已不再可见）。此时本地乐观删除态就是正确终态，调用方可安全消费
+    // rollback marker + project/cascade tombstone。project 缺失但仍有 child 则是不一致快照，
+    // 必须保留 marker 等下轮重试，不能把潜在 live orphan 当成已删除。
+    if (projectCanvases.length === 0) return { kind: 'authoritatively-deleted' }
+    throw new Error(`active-child reconcile missing project ${projectId} with ${projectCanvases.length} live child canvas(es)`)
+  }
+
+  const { useCanvasStore } = await import('../store/canvasStore')
+  useCanvasStore.setState((state) => {
+    const nextProjects = state.projects.some((candidate) => candidate.id === projectId)
+      ? state.projects.map((candidate) => candidate.id === projectId ? project : candidate)
+      : [...state.projects, project]
+    const nextCanvases = { ...state.canvases }
+    for (const meta of projectCanvases) {
+      const existing = nextCanvases[meta.id]
+      nextCanvases[meta.id] = existing
+        ? {
+            ...existing,
+            title: meta.title,
+            projectId: meta.projectId,
+            metaRevision: meta.metaRevision,
+            contentVersion: meta.contentVersion,
+            updatedAt: meta.updatedAt,
+            status: meta.status,
+          }
+        : {
+            title: meta.title,
+            projectId: meta.projectId,
+            createdAt: meta.createdAt,
+            updatedAt: meta.updatedAt,
+            metaRevision: meta.metaRevision,
+            contentVersion: meta.contentVersion,
+            status: meta.status,
+            nodes: [],
+            edges: [],
+            tasks: [],
+          }
+    }
+    return { projects: nextProjects, canvases: nextCanvases }
+  })
+  return { kind: 'restored' }
+}
+
+/**
  * G1-a P1-1:启动 writeRetryQueue。server/shadow 在 boot 调此。local 永不调(生产零变化)。
  * executor 复用 createAdapterWriteExecutor(与 adapter 同源 fetch opts);onConflict 触发 re-hydrate
  * 作可恢复处理(P1-3:conflict 不静默删——re-hydrate 让本地从服务端真值刷新,用户可基于新 revision 重放)。
@@ -1212,6 +1302,77 @@ export const startPersistWriteQueue = (
     //   读 IDB 非终态记录(此时本 delete 记录已 deleteWrite 离队,不在集内 → 不误判)。无 restore 时
     //   createProject 不在集 → B 照常摘除(#254 SC-3 原行为不回归)。
     onOutcome: async (op, outcome) => {
+      if (
+        op.kind === 'deleteProject' &&
+        outcome.status === 'rejected' &&
+        typeof outcome.body === 'object' &&
+        outcome.body !== null &&
+        (outcome.body as { error?: unknown }).error === 'active-child'
+      ) {
+        // 跨设备 active-child:本地乐观 delete 已写 project + cascade child tombstone,但 server 409 零写。
+        // rollback marker 必须先于取消级联 canvas DELETE 落盘，确保取消队列后仍有 durable retry
+        // credential。无论 marker 是否成功，级联 DELETE 都必须取消：server 已用 active child 拒绝项目
+        // 删除，放行 child DELETE 会反过来销毁保护该项目的数据。
+        const cascadeCanvasIds = await getCanvasTombstoneIdsForProject(op.projectId)
+        try {
+          await markProjectDeletionRollbackPending(op.projectId)
+        } catch (error) {
+          await writeQueue?.cancelDeleteCanvases(cascadeCanvasIds, op.projectId)
+          // 已知降级窗口：marker IDB 写失败后没有 durable retry credential，只能立即做一次严格权威
+          // reconcile。若网络也同时失败，保留 tombstone + ERROR fail-visible；待 IDB 恢复后由后续
+          // 409 或手动刷新收敛，不能假装该双故障窗口已经闭合。
+          try {
+            const result = await reconcileActiveChildDeleteRejection(op.projectId, createFetchServerPersistAdapter(opts))
+            await revokeCanvasTombstonesForProjectStrict(op.projectId)
+            await clearDeletionTombstoneStrict('project', op.projectId)
+            if (result.kind === 'restored') {
+              toastFeedback.warn('项目内还有活跃画布(可能来自其他设备),已恢复显示;请先归档或移动再彻底删除。')
+              debugLogger.warn(
+                SOURCE,
+                `deleteProject ${op.projectId} rejected active-child → rollbackPending durable write failed, but immediate authoritative reconcile restored local state and tombstones were revoked: ${msg(error)}`,
+              )
+            } else {
+              debugLogger.warn(
+                SOURCE,
+                `deleteProject ${op.projectId} rejected active-child → rollbackPending durable write failed, but immediate authoritative reads found project+children absent and tombstones were revoked: ${msg(error)}`,
+              )
+            }
+          } catch (reconcileError) {
+            toastFeedback.warn('项目删除被阻止,但重试状态保存和服务器恢复均失败;已拦截画布删除并保留删除标记,请刷新后重试。')
+            debugLogger.error(
+              SOURCE,
+              `deleteProject ${op.projectId} rejected active-child → degraded dual failure: rollbackPending durable write failed (${msg(error)}), immediate authoritative reconcile or strict tombstone consumption also failed (${msg(reconcileError)}); child DELETEs cancelled and tombstones retained without durable retry marker`,
+              reconcileError,
+            )
+          }
+          return
+        }
+        await writeQueue?.cancelDeleteCanvases(cascadeCanvasIds, op.projectId)
+        try {
+          const result = await reconcileActiveChildDeleteRejection(op.projectId, createFetchServerPersistAdapter(opts))
+          await revokeCanvasTombstonesForProjectStrict(op.projectId)
+          await clearDeletionTombstoneStrict('project', op.projectId)
+          if (result.kind === 'restored') {
+            toastFeedback.warn('项目内还有活跃画布(可能来自其他设备),已恢复显示;请先归档或移动再彻底删除。')
+            debugLogger.warn(
+              SOURCE,
+              `deleteProject ${op.projectId} rejected active-child → authoritative project+canvas reconciled, then tombstones revoked`,
+            )
+          } else {
+            debugLogger.warn(
+              SOURCE,
+              `deleteProject ${op.projectId} rejected active-child but subsequent authoritative reads found project+children absent → local deletion retained, tombstones revoked`,
+            )
+          }
+        } catch (error) {
+          toastFeedback.warn('项目删除被阻止,但服务器状态恢复失败;已保留重试状态,请稍后重试。')
+          debugLogger.warn(
+            SOURCE,
+            `deleteProject ${op.projectId} rejected active-child → authoritative reconcile failed; tombstones retained for retry: ${msg(error)}`,
+          )
+        }
+        return
+      }
       if (op.kind === 'deleteProject' && outcome.status === 'success') {
         // Phase 1 项4:DELETE 终态 success(含 404-idempotent)→ 服务端已软删 → 不再 LIVE → 无复活风险 →
         //   tombstone 完成使命可清。restore 路径(restoreProject enqueue createProject)已 revoke,此处 clear 幂等
