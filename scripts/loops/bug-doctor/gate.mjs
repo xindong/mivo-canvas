@@ -190,6 +190,10 @@ const upsertRecord = (state, rec, flags) => {
     }
     state.clusters[fp] = cluster
   }
+  // 生产日志记录并入人工报告簇(同指纹碰撞,如 source 恰为 HumanReport):
+  // 解除 origin 保护,让真实日志判据接管 S 级(否则 silentFailure/S0 会被
+  // 人工候诊 S1 压住)。人工报告不自动高于日志信号,反之亦然。
+  if (!isNew && cluster.origin === 'human-report') delete cluster.origin
   cluster.count += 1
   if (rec.receivedAt < cluster.firstSeen) cluster.firstSeen = rec.receivedAt
   if (rec.receivedAt > cluster.lastSeen) cluster.lastSeen = rec.receivedAt
@@ -278,6 +282,14 @@ const scoreClusters = (state, rules, refNowMs) => {
     const freshness = fresh ? scoring.freshnessMultiplier : 1
     const growth = prev24h > 0 && count24h >= prev24h * 2 ? scoring.growthMultiplier : 1
     const score = levelWeight * impact * processWeight * freshness * growth
+
+    // 人工报告簇(intake.mjs 写入,origin=human-report):S 级由 intake 默认
+    // (S1 候诊)与分诊会话裁定,gate 不按日志判据重算覆盖(source=HumanReport
+    // 不命中核心流程 pattern,重算会把候诊 S1 错降成 S2/S3)。score 仍正常算。
+    if (cluster.origin === 'human-report') {
+      scored[fp] = { score, count24h, prev24h, distinctClients24h, process: proc ? proc.id : null }
+      continue
+    }
 
     // S 级判定(S0→S3 顺序短路;判据全部来自 rules.json)
     let sLevel = 'S3'
@@ -485,10 +497,10 @@ const main = () => {
     } catch (persistErr) {
       log(`失败状态落盘也失败: ${persistErr.message}`)
     }
-    releaseLock(stateDir)
+    releaseLock(stateDir, { token: lock.token })
     process.exit(1)
   }
-  releaseLock(stateDir)
+  releaseLock(stateDir, { token: lock.token })
 }
 
 main()
