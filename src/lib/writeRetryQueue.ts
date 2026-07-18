@@ -39,7 +39,7 @@ import {
 import { ANONYMOUS_USER_ID, getPersistUserId } from './persistUserId'
 import { debugLogger } from '../store/debugLogStore'
 import { toastFeedback } from '../store/toastStore'
-import { notifyArchivedWriteBlocked } from './archivedWriteNotice'
+import { notifyArchivedWriteBlocked, notifyParentArchivedWriteBlocked } from './archivedWriteNotice'
 
 const SOURCE = 'Write Retry Queue'
 
@@ -2379,12 +2379,21 @@ export const createWriteQueue = (opts: WriteQueueOptions): WriteQueue => {
             //   rejected,body 保留)→ 专用 toast 替换通用"这条改动无法保存"文案,引导先恢复再编辑。
             //   不静默丢意图:terminal 记录 + 出队,用户感知失败而非以为成功。单点判定,不新增
             //   WriteOutcome 状态、executor 层不动(canvasSyncPortClient 路径由 SC-5a 处理)。
-            const rejectedBody = outcome.body as { error?: string } | undefined
+            //   P3 item 2:body.error==='archived' 且 body.id≠op.canvasId → 409 id 是父 projectId(父项目归档,
+            //   非画布自身归档)→ 用「目标项目已归档」文案(notifyParentArchivedWriteBlocked,共享 notifier 去重)。
+            //   body.id===op.canvasId 或无 body.id → 画布自身归档,原 notifyArchivedWriteBlocked(canvasId)。
+            const rejectedBody = outcome.body as { error?: string; id?: string } | undefined
             const archived = rejectedBody?.error === 'archived'
             const activeChildDelete = rec.op.kind === 'deleteProject' && rejectedBody?.error === 'active-child'
             termLog(`write ${rec.id} rejected by server: ${JSON.stringify(outcome.body).slice(0, 200)}`)
             if (archived && 'canvasId' in rec.op && typeof rec.op.canvasId === 'string') {
-              notifyArchivedWriteBlocked(rec.op.canvasId)
+              const bodyId = typeof rejectedBody?.id === 'string' ? rejectedBody.id : undefined
+              if (bodyId !== undefined && bodyId !== rec.op.canvasId) {
+                // 父项目归档(body.id = projectId)→ 区分文案,共享 notifier 去重(item 2)
+                notifyParentArchivedWriteBlocked(bodyId)
+              } else {
+                notifyArchivedWriteBlocked(rec.op.canvasId)
+              }
             } else if (!activeChildDelete) {
               termToast('这条改动无法保存,可能内容有误。')
             }

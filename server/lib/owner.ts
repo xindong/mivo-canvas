@@ -51,6 +51,7 @@ import type { Context, ErrorHandler, MiddlewareHandler } from 'hono'
 import { createHash, timingSafeEqual } from 'node:crypto'
 import { fingerprintOfPlatformKey, resolvePlatformCtx } from './keys'
 import type { PersistBackend } from '../persist/backend'
+import { ArchivedCanvasWriteError, ArchivedParentWriteError, ConcurrentParentChangeError } from '../persist/backend'
 import type { PermissionBackend } from './permissions'
 import { createAssetStore, createFsAssetBackend, resolveAssetStoreDir, type AssetStore } from './assetStore'
 import type { AppEnv } from './types'
@@ -604,6 +605,19 @@ export const ssoAuthErrorHandler: ErrorHandler<AppEnv> = (err, c) => {
   // 普通 Error 仍 console.error + 500(不吞,F5 复现的 consoleErrors 1→0 修复保持)。
   // sso-error-parity.test.ts 锁定:普通 Error / HTTPException / structural × 默认 vs custom 全 parity,Hono 升级漂移报警。
   if (err != null && typeof (err as { getResponse?: unknown }).getResponse === 'function') {
+    // P3 item 7:typed 409(CR-6 canvas archived / SG-1 parent-archived / CAS concurrent-parent-change)走顶层
+    //   onError 的 structural 分支 → 补一条结构化 telemetry(不改错误语义,响应仍走 err.getResponse())。
+    //   单点观测 TOCTOU/typed 409 命中(供 A3 灰窗观测/对账);非这些类型(普通 HTTPException 等)不记,避免污染。
+    if (
+      err instanceof ArchivedCanvasWriteError ||
+      err instanceof ArchivedParentWriteError ||
+      err instanceof ConcurrentParentChangeError
+    ) {
+      const typedId = err instanceof ArchivedParentWriteError ? err.projectId : err.canvasId
+      console.warn(
+        JSON.stringify({ event: 'typed-409', error: err.name, id: typedId, path: c.req.path }),
+      )
+    }
     const res = (err as { getResponse: () => Response }).getResponse()
     return c.newResponse(res.body, res)
   }

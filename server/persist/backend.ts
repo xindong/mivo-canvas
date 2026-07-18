@@ -87,6 +87,48 @@ export class ConcurrentParentChangeError extends Error {
   }
 }
 
+/**
+ * SG-1 restoreCanvasTree 守卫(P3 item 1):public restoreCanvasTree 的 opts.payload.projectId
+ * 指向 archived project 时抛出(与 createCanvasWithCollection / restoreCanvasWithCollectionCritical
+ * 同语义的 parent-archived 门禁)。该 primitive 当前无生产调用方(internal restoreMeta 路径已在上游
+ * ensureCreate 的 SG-1 守卫覆盖),守卫防未来误用——直接调 public restoreCanvasTree 把 canvas 恢复
+ * 进 archived project 的违规路径在此 fail-fast。
+ * 携 getResponse()→ 409 {error:'archived', id:projectId}(与 route 层 parent-archived 同形;client
+ * writeRetryQueue 经 body.id≠op.canvasId 区分父项目归档文案,P3 item 2)。structural duck-type 走顶层
+ * onError(owner.ts ssoAuthErrorHandler);telemetry 见 item 7。
+ */
+export class ArchivedParentWriteError extends Error {
+  readonly projectId: string
+  constructor(projectId: string) {
+    super(`project ${projectId} is archived; canvas restore rejected (SG-1 restoreCanvasTree guard)`)
+    this.name = 'ArchivedParentWriteError'
+    this.projectId = projectId
+  }
+  /** Hono onError structural 分支(`"getResponse" in err`)→ 409 archived JSON(id=projectId,保 SG-1 契约体)。 */
+  getResponse(): Response {
+    return new Response(JSON.stringify({ error: 'archived', id: this.projectId }), {
+      status: 409,
+      headers: { 'content-type': 'application/json' },
+    })
+  }
+}
+
+/**
+ * withCanvasWriteGuard non-reentrant 契约(P3 item 3):同 canvas 嵌套调用(在持锁 mutation 的同步段内
+ * 再次进入 withCanvasWriteGuard/withCanvasCritical)→ 同步 throw fail-fast,防 memory FIFO promise-chain
+ * 互等死锁(outer 等待 inner 返回,inner 排在 outer tail 之后永不开跑)。仅覆盖同步段重入(首个 await
+ * 之前的嵌套调用);跨 await 重入是 P3 已知限制——契约由 JSDoc 声明禁止,调用方不得同 canvas 嵌套。
+ * 非 getResponse 错误(程序员契约违反,非可重试业务态)→ 顶层 onError 走 500 分支,显式可见。
+ */
+export class CanvasWriteReentrancyError extends Error {
+  readonly canvasId: string
+  constructor(canvasId: string) {
+    super(`withCanvasWriteGuard non-reentrant contract violated: canvas ${canvasId} re-entered synchronously (deadlock prevented, fail-fast)`)
+    this.name = 'CanvasWriteReentrancyError'
+    this.canvasId = canvasId
+  }
+}
+
 export type GetResult =
   | { kind: 'found'; record: PersistRecord }
   | { kind: 'missing' }
@@ -619,6 +661,13 @@ export class InMemoryPersistBackend implements PersistBackend {
   private readonly deletedTombstones = new Set<string>()
   /** P2-1:asset 等外部 mutation 与 archive tree 共用的 per-canvas promise mutex。 */
   private readonly canvasWriteLocks = new Map<string, Promise<void>>()
+  /**
+   * P3 item 3 non-reentrant 守卫:per-canvas 同步执行中的 mutation 集合。withCanvasCritical 进入时若
+   * canvasId 已在集中 → 同步重入(outer mutation 同步段内再次同 canvas 取锁)→ throw fail-fast,防 FIFO
+   * promise-chain 互等死锁。仅在 mutation 同步段(首 await 前)set,同步段结束即 delete → 合法并发
+   * (不同调用方经 previous tail 串行化,flag 已清)不误判。跨 await 重入为 P3 已知限制,契约由 JSDoc 禁止。
+   */
+  private readonly mutatingSyncCanvasIds = new Set<string>()
   /** additive(PG 落地后接口新增):内存 backend 立即就绪。 */
   readonly ready: Promise<void> = Promise.resolve()
 
@@ -814,10 +863,32 @@ export class InMemoryPersistBackend implements PersistBackend {
     if (c && !c.isDeleted && c.status === 'archived') throw new ArchivedCanvasWriteError(canvasId)
   }
 
-  /** 单 canvas FIFO 临界区；tail 吞错只用于维持队列，调用方仍收到原始结果/异常。 */
+  /**
+   * 单 canvas FIFO 临界区；tail 吞错只用于维持队列，调用方仍收到原始结果/异常。
+   *
+   * P3 item 3 non-reentrant 契约:禁止同 canvas 嵌套调用(在持锁 mutation 内再次进入本方法取同一
+   * canvasId 的锁)。同步段(首 await 之前)的重入经 mutatingSyncCanvasIds 检测 → throw
+   * CanvasWriteReentrancyError fail-fast,防 FIFO promise-chain 互等死锁(outer 等 inner 返回,inner
+   * 排在 outer tail 之后永不开跑)。合法并发(不同调用方)经 previous tail 串行化,不被误判(flag
+   * 仅在 mutation 同步段置位,同步段结束即清)。跨 await 重入不在同步检测范围——契约由调用方遵守,
+   * 不得在 mutation 的 await 之后再次同 canvas 取锁。
+   */
   private withCanvasCritical<T>(canvasId: string, mutation: () => Promise<T>): Promise<T> {
+    if (this.mutatingSyncCanvasIds.has(canvasId)) throw new CanvasWriteReentrancyError(canvasId)
     const previous = this.canvasWriteLocks.get(canvasId) ?? Promise.resolve()
-    const result = previous.then(mutation, mutation)
+    // 包裹 mutation:进入同步段前置 flag(供嵌套同 canvas 重入检测),同步段结束(首 await 后 mutation()
+    // 返回 pending promise)即清——合法并发不被误判。flag 覆盖同步段;mutation 的异步段不持 flag。
+    const run = (): Promise<T> => {
+      this.mutatingSyncCanvasIds.add(canvasId)
+      let p: Promise<T>
+      try {
+        p = mutation()
+      } finally {
+        this.mutatingSyncCanvasIds.delete(canvasId)
+      }
+      return p
+    }
+    const result = previous.then(run, run)
     const tail = result.then(() => undefined, () => undefined)
     this.canvasWriteLocks.set(canvasId, tail)
     void tail.finally(() => {
@@ -855,6 +926,16 @@ export class InMemoryPersistBackend implements PersistBackend {
     }
   }
 
+  /**
+   * P2-1:asset 等 persist 外部 mutation 的 write-time archived guard。
+   *
+   * P3 item 3 non-reentrant 契约:本方法(及其底层 withCanvasCritical)禁止同 canvas 嵌套调用——
+   * 即在 mutation 回调内部再次以同一 canvasId 调用本方法。memory FIFO mutex 侧对同步段重入
+   * (首个 await 之前的嵌套调用)经 mutatingSyncCanvasIds 检测 → throw CanvasWriteReentrancyError
+   * fail-fast,防 promise-chain 互等死锁。跨 await 重入为 P3 已知限制,调用方必须遵守契约:不得
+   * 在 mutation 的任何 await 之后再以同 canvasId 重入。合法并发(不同调用方/不同请求)经 previous
+   * tail 串行化,不受影响。
+   */
   async withCanvasWriteGuard<T>(ownerId: string, canvasId: string, mutation: () => Promise<T>): Promise<T> {
     return this.withCanvasCritical(canvasId, async () => {
       this.assertCanvasWritable(ownerId, canvasId)
@@ -1990,6 +2071,13 @@ export class InMemoryPersistBackend implements PersistBackend {
     canvasId: string,
     opts: { payload?: unknown; idempotencyKey?: string; fingerprint?: string; status?: RecordStatus } = {},
   ): Promise<{ count: number }> {
+    // P3 item 1 SG-1 守卫:opts.payload.projectId 指向 archived project → throw ArchivedParentWriteError,
+    // 与 createCanvasWithCollection / restoreCanvasWithCollectionCritical 同语义。该 primitive 当前无生产
+    // 调用方(internal restoreMeta 路径已在上游 ensureCreate 的 SG-1 守卫覆盖),守卫防未来误用——直接调
+    // public restoreCanvasTree 把 canvas 恢复进 archived project 的违规路径在此 fail-fast。无 payload 或
+    // payload 无 projectId → no-op(不判,同 create 路径 `if (pid && ...)` 语义)。
+    const pid = asCanvasMeta(opts.payload)?.projectId
+    if (pid && this.projectArchived(ownerId, pid)) throw new ArchivedParentWriteError(pid)
     return { count: this.restoreCanvasTreeInPlace(ownerId, canvasId, opts) }
   }
 

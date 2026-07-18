@@ -174,6 +174,23 @@ const runPersistBackendContractSuite = (
       const node = await b.getChild('o', 'c1', 'node', 'n1')
       if (node.kind === 'found') expect(node.record.isDeleted).toBe(false)
     })
+
+    // P3 item 5:ensureCreate(project deleted) 走 restore helper(projectStateInTrx 锁 + restoreProjectTreeInTrx)。
+    //   非语义优化(同事务内复用上游已取的 projectState,不再重复 projectStateInTrx)→ 功能非回归:deleted project
+    //   ensureCreate 仍返 restored + project/子 canvas/chat-collection 全部 live。memory/PG 双后端对称(PG 侧走
+    //   新 preProjectState 复用路径,memory 侧无 projectStateInTrx,逻辑等价)。
+    it('P3 item 5: ensureCreate(deleted project) → restored(非语义优化非回归,both backends)', async () => {
+      await b.ensureCreate('o', 'project', 'p1', { name: 'P' }, { method: 'POST', resourceKind: 'project' })
+      await b.ensureCreate('o', 'canvas', 'c1', { projectId: 'p1' }, { method: 'POST', resourceKind: 'canvas' })
+      await b.ensureCreate('o', 'chat-collection', 'c1', {}, { canvasId: 'c1', method: 'POST', resourceKind: 'chat-collection' })
+      await b.softDeleteProjectTree('o', 'p1')
+      // deleted project ensureCreate → restore helper 跑通(返 restored,非 existing/created)
+      const r = await b.ensureCreate('o', 'project', 'p1', { name: 'P2' }, { method: 'POST', resourceKind: 'project' })
+      expect(r.kind).toBe('restored')
+      expect((await rec('project', 'p1')).isDeleted).toBe(false)
+      expect((await rec('canvas', 'c1')).isDeleted).toBe(false)
+      expect((await rec('chat-collection', 'c1')).isDeleted).toBe(false)
+    })
   })
 
   describe(`${label} — 返修 #10 幂等复合 key + fingerprint`, () => {

@@ -34,7 +34,7 @@ import type { NodePayload, Revision } from '../../shared/persist-contract.ts'
 import { __resetPersistUserId, setPersistUserId } from './persistUserId'
 import { toastFeedback } from '../store/toastStore'
 import { debugLogger } from '../store/debugLogStore'
-import { __resetArchivedWriteNotice } from './archivedWriteNotice'
+import { __resetArchivedWriteNotice, PARENT_ARCHIVED_WRITE_MESSAGE, ARCHIVED_WRITE_MESSAGE } from './archivedWriteNotice'
 
 // ---- spies (call-through; assert counts only) ----
 const toastWarn = vi.spyOn(toastFeedback, 'warn')
@@ -358,6 +358,31 @@ describe('FX-5 error branches', () => {
     expect(toastWarn).toHaveBeenCalledTimes(1)
     expect(toastWarn).toHaveBeenCalledWith('此画布已归档,请先恢复再编辑。')
     expect(toastError).not.toHaveBeenCalled()
+    expect(await q.pendingCount()).toBe(0)
+  })
+
+  // P3 item 2:409 {error:'archived', id≠op.canvasId} → 父项目归档(非画布自身归档)→ 区分文案「目标项目已归档…」,
+  //   共享 notifier 去重(按 project:<id> key,不与画布归档 toast 互相抑制)。body.id===op.canvasId 或无 id → 画布归档(原行为)。
+  it('409 {error:archived, id=projectId≠canvasId} rejected → parent-archived 文案 (P3 item 2)', async () => {
+    const { fn } = seqExecutor([{ status: 'rejected', body: { error: 'archived', id: 'p1' } }])
+    const q = makeQueue(fn)
+    await q.enqueue(minimalNode('c1', 'n1')) // op.canvasId='c1',body.id='p1' → 父项目归档
+    const r = await q.drain()
+    expect(r.terminals).toBe(1)
+    expect(toastWarn).toHaveBeenCalledTimes(1)
+    expect(toastWarn).toHaveBeenCalledWith(PARENT_ARCHIVED_WRITE_MESSAGE)
+    expect(toastWarn).not.toHaveBeenCalledWith(ARCHIVED_WRITE_MESSAGE)
+    expect(await q.pendingCount()).toBe(0)
+  })
+
+  it('409 {error:archived, id=canvasId} rejected → 画布归档文案(非父项目归档,P3 item 2 不回归)', async () => {
+    const { fn } = seqExecutor([{ status: 'rejected', body: { error: 'archived', id: 'c1' } }])
+    const q = makeQueue(fn)
+    await q.enqueue(minimalNode('c1', 'n1')) // op.canvasId='c1',body.id='c1' → 画布自身归档
+    const r = await q.drain()
+    expect(r.terminals).toBe(1)
+    expect(toastWarn).toHaveBeenCalledTimes(1)
+    expect(toastWarn).toHaveBeenCalledWith(ARCHIVED_WRITE_MESSAGE)
     expect(await q.pendingCount()).toBe(0)
   })
 

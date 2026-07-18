@@ -41,7 +41,7 @@ import type {
   UpsertChildResult,
   UpsertResult,
 } from './backend'
-import { ArchivedCanvasWriteError, ConcurrentParentChangeError } from './backend'
+import { ArchivedCanvasWriteError, ArchivedParentWriteError, ConcurrentParentChangeError } from './backend'
 import { requiredTopLevelFields, validateChildPayload } from '../../shared/persist-contract.ts'
 import { fieldKeyOf, setByPath, unsetByPath, getByPath, type DomainOp } from '../lib/domainOp'
 import type { FieldClocks } from '../lib/baseCursor'
@@ -215,6 +215,22 @@ class CanvasParentChanged extends Error {
 }
 
 /**
+ * P3 item 4:CAS miss 重试前的短 jitter 退避(10-50ms)。并发 move 下多个 CAS 失败者若同步雷同重试,
+ * 会再次在同一瞬间撞 parent churn 形成重试雷同群;jitter 把重试时间错开。纯函数(rand 注入,默认
+ * Math.random),单测断言返回值 ∈ [10,50)。生产路径在两个 CAS 重试循环(withCanvasWriteGuard /
+ * setCanvasArchiveStatusWithParentRetry)的 CanvasParentChanged 分支调用。
+ */
+export const casRetryJitterMs = (rand: () => number = Math.random): number =>
+  10 + Math.floor(rand() * 41) // 10..50 inclusive of 10, exclusive of 51 → [10,50]
+
+/** P3 item 4:在 CAS 重试前 await 短 jitter。封装便于测试/观测(可被 spy/替换)。 */
+const waitCasRetryJitter = async (rand: () => number = Math.random): Promise<number> => {
+  const delay = casRetryJitterMs(rand)
+  await new Promise<void>((resolve) => setTimeout(resolve, delay))
+  return delay
+}
+
+/**
  * PgPersistBackend:PG 持久化后端。drop-in 实现 PersistBackend;路由零改动。
  * 单实例 BFF 假设(缓存 in-process;多实例协作留 T1.4+,见 pg-backend-schema.md §4)。
  */
@@ -377,6 +393,12 @@ export class PgPersistBackend implements PersistBackend {
    * P2-1:asset ref 等 persist 外部 mutation 的 write-time guard。无锁读 parent 仅用于决定第一把锁；
    * 随后 projects → canvas FOR UPDATE，并以 payload.projectId 作 CAS。parent 并发 move 时整事务释放旧锁后
    * 重试，绝不持 canvas 反追新 project。callback 只在 parent 稳定且 canvas 非 archived-live 后执行一次。
+   *
+   * P3 item 3 non-reentrant 契约(文档):禁止同 canvas 嵌套调用——在 mutation 内再次以同一 canvasId 调用
+   * 本方法会形成跨事务 self-等待(PG 事务在 mutation 内未提交,嵌套取锁会撞自身未提交行锁 / 串行等待)。
+   * memory 侧 withCanvasCritical 对同步段重入 throw fail-fast;PG 侧无进程内 mutex(以 DB 行锁串行),
+   * 嵌套调用会表现为事务内锁竞争/死锁,故契约由 JSDoc 声明禁止,调用方不得在 mutation 内同 canvas 重入。
+   * P3 item 4:CAS miss(CanvasParentChanged)重试前加 10-50ms 短 jitter,防并发 CAS 失败者同步雷同重试群。
    */
   async withCanvasWriteGuard<T>(ownerId: string, canvasId: string, mutation: () => Promise<T>): Promise<T> {
     await this.ready
@@ -414,6 +436,8 @@ export class PgPersistBackend implements PersistBackend {
       } catch (error) {
         if (!(error instanceof CanvasParentChanged)) throw error
         if (attempt === maxAttempts) throw new ConcurrentParentChangeError(canvasId, { cause: error })
+        // P3 item 4:CAS miss 重试前短 jitter(10-50ms),防并发 CAS 失败者同步雷同重试群。
+        await waitCasRetryJitter()
       }
     }
     throw new ConcurrentParentChangeError(canvasId)
@@ -504,6 +528,8 @@ export class PgPersistBackend implements PersistBackend {
       } catch (error) {
         if (!(error instanceof CanvasParentChanged)) throw error
         if (attempt === maxAttempts) return { count: 0, retryableConflict: true }
+        // P3 item 4:CAS miss 重试前短 jitter(10-50ms),防并发 archive CAS 失败者同步雷同重试群。
+        await waitCasRetryJitter()
       }
     }
     return { count: 0, retryableConflict: true }
@@ -849,7 +875,10 @@ export class PgPersistBackend implements PersistBackend {
           }
           // Project create/update/restore 统一 projects-first。fresh insert 时 projects 行不存在,FOR UPDATE
           // 空结果为 no-op,随后 INSERT 逻辑不受影响；deleted project 则在写 meta 前锁住瘦索引行。
-          if (type === 'project') await this.projectStateInTrx(trx, ownerId, id)
+          // P3 item 5:捕获 projectState 供下方 deleted-restore 路径复用(同事务内避免 restoreProjectTreeInTrx
+          //   再次 projectStateInTrx 重复锁查询;非语义优化,FOR UPDATE 同行已锁,仅省一次往返)。非 project 类型
+          //   或 fresh/existing-live 路径不进 restore,preState 留 undefined(restoreProjectTreeInTrx 自行锁)。
+          const projectPreState = type === 'project' ? await this.projectStateInTrx(trx, ownerId, id) : undefined
           const existing = await trx.selectFrom('persist_records').selectAll().where('owner_id', '=', ownerId).where('type', '=', type).where('id', '=', id).executeTakeFirst()
           const scope: PersistScope = opts.scope ?? 'document'
           const canvasId = opts.canvasId ?? null
@@ -859,7 +888,9 @@ export class PgPersistBackend implements PersistBackend {
           }
           if (existing && existing.is_deleted) {
             // N2:backend 原子 create-or-restore-tree。F4:rowCount 定输赢(并发赢家已恢复→existing)。
-            const { record: restoredRec, restored } = await this.restoreMetaInTrx(trx, ownerId, type, id, payload, opts)
+            // P3 item 5:传 projectPreState(project 路径,L878 已锁并取 state)→ restoreProjectTreeInTrx 复用,
+            //   不再重复 projectStateInTrx(canvas 路径 preState=undefined,restoreCanvasTreeInTrx 本就不锁 project)。
+            const { record: restoredRec, restored } = await this.restoreMetaInTrx(trx, ownerId, type, id, payload, opts, projectPreState)
             await this.setIdempotencyEntryInTrx(trx, ownerId, opts.method, opts.resourceKind, opts.idempotencyKey, opts.bodyFingerprint ?? '', ownerId, type, id)
             return { kind: restored ? 'restored' : 'existing', record: this.withIdem(restoredRec, opts) }
           }
@@ -949,10 +980,13 @@ export class PgPersistBackend implements PersistBackend {
     id: string,
     payload: unknown,
     opts: { canvasId?: string | null; scope?: PersistScope; idempotencyKey?: string; method: string; resourceKind: string; bodyFingerprint?: string; status?: RecordStatus },
+    // P3 item 5:ensureCreate(project deleted) 路径传入上游已取的 projectState,避免 restoreProjectTreeInTrx
+    //   重复 projectStateInTrx(同事务同行已锁,仅省一次往返;非语义优化)。undefined(其他调用方)→ 自行锁。
+    preProjectState?: { live: boolean; archived: boolean },
   ): Promise<{ record: PersistRecord; restored: boolean }> {
     let restored: boolean
     if (type === 'project') {
-      const { metaRestored } = await this.restoreProjectTreeInTrx(trx, ownerId, id, { payload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint, status: opts.status })
+      const { metaRestored } = await this.restoreProjectTreeInTrx(trx, ownerId, id, { payload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint, status: opts.status }, preProjectState)
       restored = metaRestored
     } else if (type === 'canvas') {
       const { metaRestored } = await this.restoreCanvasTreeInTrx(trx, ownerId, id, { payload, idempotencyKey: opts.idempotencyKey, fingerprint: opts.bodyFingerprint, status: opts.status })
@@ -1962,10 +1996,13 @@ export class PgPersistBackend implements PersistBackend {
   }
 
   /** 事务内:恢复 project 子树(project + 其 canvas meta + chat-collection;原子,N2)。opts.status(D2)同 restoreCanvasTreeInTrx。返 { count, metaRestored, projIdxOwner, childIdxOwners }——F4 输赢 + F2/F5 cache 数据源(全 DB owner_id,未命中不进结果→调用方不碰缓存,无幽灵)。 */
-  private async restoreProjectTreeInTrx(trx: Kysely<Database>, ownerId: string, projectId: string, opts: { payload?: unknown; idempotencyKey?: string; fingerprint?: string; status?: RecordStatus } = {}): Promise<{ count: number; metaRestored: boolean; projIdxOwner?: string; childIdxOwners: { id: string; ownerId: string }[] }> {
+  private async restoreProjectTreeInTrx(trx: Kysely<Database>, ownerId: string, projectId: string, opts: { payload?: unknown; idempotencyKey?: string; fingerprint?: string; status?: RecordStatus } = {}, preProjectState?: { live: boolean; archived: boolean }): Promise<{ count: number; metaRestored: boolean; projIdxOwner?: string; childIdxOwners: { id: string; ownerId: string }[] }> {
     // 全部 project restore 入口(直接/ensureCreate/restoreMeta)共用此第一步：projects-first。
     // fresh insert 不走本 helper；即使未来误入,不存在行的 FOR UPDATE 也是安全 no-op。
-    await this.projectStateInTrx(trx, ownerId, projectId)
+    // P3 item 5:ensureCreate(project deleted) 路径已在上游(L878)取并锁 projectState,经 restoreMetaInTrx
+    //   传入 preProjectState → 复用,不再重复 projectStateInTrx(同事务同行 FOR UPDATE 已锁,仅省一次往返,
+    //   非语义优化)。undefined(直接 restoreProjectTree / restoreMeta 非删除路径)→ 自行锁,保持原契约。
+    if (!preProjectState) await this.projectStateInTrx(trx, ownerId, projectId)
     // F5:先选定本 project 下 soft-deleted child canvas 集合(级联恢复前),供 canvases 瘦索引同步(与 persist_records canvas meta 恢复同集)。
     const childCv = await trx.selectFrom('persist_records').select(['id']).where('owner_id', '=', ownerId).where('type', '=', 'canvas').where(sql`payload->>'projectId'`, '=', projectId).where('is_deleted', '=', true).execute()
     const childIds = childCv.map((r) => r.id)
@@ -1995,7 +2032,19 @@ export class PgPersistBackend implements PersistBackend {
 
   async restoreCanvasTree(ownerId: string, canvasId: string, opts: { payload?: unknown; idempotencyKey?: string; fingerprint?: string } = {}): Promise<{ count: number }> {
     await this.ready
-    const res = await this.db.transaction().execute(async (trx) => this.restoreCanvasTreeInTrx(trx, ownerId, canvasId, opts))
+    const res = await this.db.transaction().execute(async (trx) => {
+      // P3 item 1 SG-1 守卫:opts.payload.projectId 指向 archived project → throw ArchivedParentWriteError,
+      // 与 createCanvasWithCollection / ensureCreate 同语义(事务内 projectStateInTrx 锁 projects 行 + 读
+      // status,防 TOCTOU)。该 primitive 当前无生产调用方(internal restoreMetaInTrx 已在上游
+      // ensureCreate 的 SG-1 守卫覆盖),守卫防未来误用。无 payload / payload 无 projectId → no-op(同 create
+      // 路径 `if (pid)` 语义;既有 direct 调用面 tests 传空 opts,不受影响)。
+      const pid = asCanvasMeta(opts.payload)?.projectId
+      if (pid) {
+        const ps = await this.projectStateInTrx(trx, ownerId, pid)
+        if (ps.archived) throw new ArchivedParentWriteError(pid)
+      }
+      return this.restoreCanvasTreeInTrx(trx, ownerId, canvasId, opts)
+    })
     // F2/P1-5:post-commit 定点 cache mutation 仅当事务实际命中 durable 行(用 DB owner_id,不信用入参);0 行(no-op/错 owner/不存在)→ 不碰缓存(无幽灵)。
     if (res.canvasIdxOwner !== undefined) this.setIndexEntry('canvas', canvasId, res.canvasIdxOwner, false)
     return { count: res.count }

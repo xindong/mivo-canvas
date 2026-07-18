@@ -4,6 +4,8 @@ import {
   __getArchivedWriteNoticeSize,
   __resetArchivedWriteNotice,
   notifyArchivedWriteBlocked,
+  notifyParentArchivedWriteBlocked,
+  PARENT_ARCHIVED_WRITE_MESSAGE,
 } from './archivedWriteNotice'
 
 describe('archived write shared notifier', () => {
@@ -56,5 +58,28 @@ describe('archived write shared notifier', () => {
     notifyArchivedWriteBlocked('c2') // cleanup removes c1, adds c2
 
     expect(__getArchivedWriteNoticeSize()).toBe(1) // c1 purged, only c2 remains
+  })
+
+  // P3 item 2:父项目归档专用文案 + 共享 dedup(按 project:<id> key,不与画布归档互相抑制)。
+  it('notifyParentArchivedWriteBlocked 用父项目归档文案 + 按 projectId 去重', () => {
+    vi.spyOn(Date, 'now').mockReturnValueOnce(1_000).mockReturnValueOnce(3_999)
+    const warn = vi.spyOn(toastFeedback, 'warn').mockImplementation(() => 'toast')
+
+    notifyParentArchivedWriteBlocked('p1')
+    notifyParentArchivedWriteBlocked('p1') // 同 projectId 窗口内 → 抑制
+
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(warn).toHaveBeenCalledWith(PARENT_ARCHIVED_WRITE_MESSAGE)
+  })
+
+  it('父项目归档 与 画布归档 互不抑制(不同 key 前缀,各自可见)', () => {
+    // 极端假设:projectId 与 canvasId 同字符串 'x'(理论上 key 前缀仍区分 project:x vs canvas:x)
+    vi.spyOn(Date, 'now').mockReturnValue(1_000)
+    const warn = vi.spyOn(toastFeedback, 'warn').mockImplementation(() => 'toast')
+
+    notifyArchivedWriteBlocked('x') // canvas:x
+    notifyParentArchivedWriteBlocked('x') // project:x → 不同 key,不抑制
+
+    expect(warn).toHaveBeenCalledTimes(2)
   })
 })
