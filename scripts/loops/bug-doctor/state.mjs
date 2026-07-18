@@ -6,7 +6,7 @@
 // 在其上追加实现所需字段(lock 文件独立、processedIds、hourly、digest),
 // 均为增量字段,不改动既定字段语义。
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync, appendFileSync, unlinkSync, renameSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, existsSync, appendFileSync, unlinkSync, renameSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 
 export const STATE_SCHEMA_VERSION = 1
@@ -108,36 +108,106 @@ export const appendLog = (stateDir, line) => {
 
 // ---- 互斥锁(gate/主轮/补轮共用;文件级 O_EXCL 原子创建 + TTL 自愈) ----
 
+// recovery guard 自身的失效窗:接管流程本身是毫秒级,guard 存活超过 60s
+// 说明上一个接管者也崩了,允许清掉 guard(下一次调用重新竞争)
+const RECOVERY_GUARD_TTL_MS = 60_000
+
 /**
  * 尝试取锁。成功 → { acquired: true, token };
  * 已被持有且未过期 → { acquired: false, holder };
- * 过期(> ttlMinutes)→ 视为陈锁,接管并返回 { acquired: true, stale: true, token }。
+ * 过期(> ttlMinutes)→ 经 recovery guard(第二把 O_EXCL)仲裁接管,
+ * 恰一方成功:{ acquired: true, stale: true, token },其余 { acquired: false }。
  * token 是本次持有凭证,释放时传回 releaseLock 做归属校验(只删自己的锁)。
+ *
+ * 原子性要点(审查 P1-NEW):O_EXCL 只保证目录项原子,payload 落盘前文件已
+ * 可见——所以 EEXIST 后锁文件"不可解析/缺 acquiredAt"不能当陈锁(很可能是
+ * 对方刚创建还没写完),此时按文件 mtime 保守判:TTL 内一律视为有人持有。
+ * 陈锁接管的 判定→替换 不再是裸 read-modify-write,而是先 O_EXCL 拿 guard,
+ * guard 内 re-read 确认仍陈旧后 unlink + O_EXCL 重建,双竞争者只有一方赢。
  */
 export const acquireLock = (stateDir, { ttlMinutes, owner }) => {
   ensureStateDir(stateDir)
   const path = join(stateDir, LOCK_FILE)
+  const ttlMs = ttlMinutes * 60_000
   const token = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
   const payload = `${JSON.stringify({ pid: process.pid, owner, token, acquiredAt: new Date().toISOString() })}\n`
+
   try {
     writeFileSync(path, payload, { flag: 'wx' })
     return { acquired: true, token }
   } catch (err) {
     if (err.code !== 'EEXIST') throw err
   }
-  let holder = null
+
+  // 锁文件年龄:能解析用 acquiredAt;不可解析/缺字段(半写/损坏)退到 mtime。
+  // 两者都拿不到(文件在读取瞬间消失 = 对方刚释放)→ 保守按"有人持有"返回,
+  // 下一次调用自然重试首路径。
+  const lockAgeMs = () => {
+    let holder = null
+    try {
+      holder = JSON.parse(readFileSync(path, 'utf8'))
+    } catch {
+      holder = null
+    }
+    if (holder?.acquiredAt) {
+      const parsed = Date.parse(holder.acquiredAt)
+      if (Number.isFinite(parsed)) return { holder, ageMs: Date.now() - parsed }
+    }
+    try {
+      return { holder, ageMs: Date.now() - statSync(path).mtimeMs }
+    } catch {
+      return { holder, ageMs: null }
+    }
+  }
+
+  const first = lockAgeMs()
+  if (first.ageMs === null || first.ageMs <= ttlMs) {
+    return { acquired: false, holder: first.holder }
+  }
+
+  // ---- 陈锁接管仲裁(第二把 O_EXCL)----
+  const guard = `${path}.recovery`
   try {
-    holder = JSON.parse(readFileSync(path, 'utf8'))
-  } catch {
-    holder = null
+    writeFileSync(guard, payload, { flag: 'wx' })
+  } catch (err) {
+    if (err.code !== 'EEXIST') throw err
+    // guard 被别的接管者持有:若 guard 自身也陈旧(接管者崩了)清掉自愈,
+    // 本轮仍返回未取到(下一次调用重新竞争),绝不双接管
+    try {
+      if (Date.now() - statSync(guard).mtimeMs > RECOVERY_GUARD_TTL_MS) unlinkSync(guard)
+    } catch {
+      /* guard 已消失即无需清理 */
+    }
+    return { acquired: false, holder: first.holder, recovery: 'in-progress' }
   }
-  const age = holder?.acquiredAt ? Date.now() - Date.parse(holder.acquiredAt) : Number.POSITIVE_INFINITY
-  if (age > ttlMinutes * 60_000) {
-    // 陈锁(上一实例崩溃未清):接管。方向性:宁可接管跑一轮,不永久自锁。
-    writeFileSync(path, payload)
-    return { acquired: true, stale: true, previousHolder: holder, token }
+  try {
+    // guard 内 re-read:确认仍陈旧(期间可能已被正常释放、或他人释放后重取)
+    const again = lockAgeMs()
+    if (again.ageMs !== null && again.ageMs <= ttlMs) {
+      return { acquired: false, holder: again.holder }
+    }
+    try {
+      unlinkSync(path)
+    } catch {
+      /* 已消失即目的达成 */
+    }
+    try {
+      writeFileSync(path, payload, { flag: 'wx' })
+    } catch (err) {
+      if (err.code === 'EEXIST') {
+        // unlink→create 空窗被首路径新来者抢先:对方是合法新持有者,让位
+        return { acquired: false, holder: null, recovery: 'lost-race' }
+      }
+      throw err
+    }
+    return { acquired: true, stale: true, previousHolder: first.holder, token }
+  } finally {
+    try {
+      unlinkSync(guard)
+    } catch {
+      /* guard 已消失即目的达成 */
+    }
   }
-  return { acquired: false, holder }
 }
 
 /**

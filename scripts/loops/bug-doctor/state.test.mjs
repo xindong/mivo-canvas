@@ -1,6 +1,8 @@
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync, utimesSync } from 'node:fs'
+import { execFile } from 'node:child_process'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   LOCK_FILE,
@@ -105,6 +107,63 @@ describe('互斥锁(TTL 60min)', () => {
     expect(releaseLock(dir, { token: 'dead-token' })).toBe(false) // 旧 token 删不动
     expect(existsSync(join(dir, LOCK_FILE))).toBe(true)
     expect(releaseLock(dir, { token: took.token })).toBe(true) // 接管者自己的 token 可删
+  })
+
+  it('P1-NEW 回归①:锁文件半写(不可解析,mtime 新鲜)→ 视为有人持有,不夺锁', () => {
+    // 模拟首进程 O_EXCL 建档后 payload 尚未写完的窗口:目录项在、内容是半截 JSON
+    writeFileSync(join(dir, LOCK_FILE), '{"pid":123,"owner":"gate:full","acqu')
+    const second = acquireLock(dir, { ttlMinutes: 60, owner: 'intake:report' })
+    expect(second.acquired).toBe(false)
+    // 锁文件未被覆盖(半写内容原样,等首进程写完或 TTL 自愈)
+    expect(readFileSync(join(dir, LOCK_FILE), 'utf8')).toBe('{"pid":123,"owner":"gate:full","acqu')
+  })
+
+  it('P1-NEW 回归①b:不可解析但 mtime 已超 TTL(真死锁残骸)→ 仍可经 guard 接管', () => {
+    const path = join(dir, LOCK_FILE)
+    writeFileSync(path, '{"corrupted')
+    const old = new Date(Date.now() - 2 * 3600 * 1000)
+    utimesSync(path, old, old)
+    const took = acquireLock(dir, { ttlMinutes: 60, owner: 'gate:full' })
+    expect(took.acquired).toBe(true)
+    expect(took.stale).toBe(true)
+  })
+
+  it('P1-NEW 回归②:接管仲裁 guard 被他人持有 → 本轮必不接管;guard 自身陈旧则清理自愈', () => {
+    const path = join(dir, LOCK_FILE)
+    const guard = `${path}.recovery`
+    writeFileSync(path, JSON.stringify({ pid: 1, owner: 'dead', token: 'd', acquiredAt: '2020-01-01T00:00:00.000Z' }))
+    // guard 新鲜(另一接管者正在流程中)→ 让位
+    writeFileSync(guard, 'other-recoverer')
+    const r1 = acquireLock(dir, { ttlMinutes: 60, owner: 'racer' })
+    expect(r1.acquired).toBe(false)
+    expect(r1.recovery).toBe('in-progress')
+    // guard 陈旧(上一接管者也崩了)→ 本轮仍让位但清掉 guard,下一轮可接管
+    const old = new Date(Date.now() - 5 * 60_000)
+    utimesSync(guard, old, old)
+    const r2 = acquireLock(dir, { ttlMinutes: 60, owner: 'racer' })
+    expect(r2.acquired).toBe(false)
+    expect(existsSync(guard)).toBe(false)
+    const r3 = acquireLock(dir, { ttlMinutes: 60, owner: 'racer' })
+    expect(r3.acquired).toBe(true)
+    expect(r3.stale).toBe(true)
+  })
+
+  it('P1-NEW 回归③:双竞争者并发接管同一陈锁,恰一方 acquired(子进程实测)', async () => {
+    writeFileSync(join(dir, LOCK_FILE), JSON.stringify({ pid: 1, owner: 'dead', token: 'd', acquiredAt: '2020-01-01T00:00:00.000Z' }))
+    const stateUrl = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), 'state.mjs')).href
+    const script = [
+      `import { acquireLock } from ${JSON.stringify(stateUrl)}`,
+      `const r = acquireLock(${JSON.stringify(dir)}, { ttlMinutes: 60, owner: 'racer-' + process.pid })`,
+      'console.log(JSON.stringify({ acquired: r.acquired === true }))',
+    ].join('\n')
+    const run = () =>
+      new Promise((res, rej) =>
+        execFile('node', ['--input-type=module', '-e', script], { encoding: 'utf8' }, (e, so) =>
+          e ? rej(e) : res(JSON.parse(so.trim())),
+        ),
+      )
+    const results = await Promise.all([run(), run()])
+    expect(results.filter((r) => r.acquired)).toHaveLength(1)
   })
 })
 

@@ -354,12 +354,19 @@ const runStatus = (args) => {
   } catch {
     logsMd = ''
   }
-  const card = buildStatus({ state: state || { clusters: {}, openPRs: [] }, baseline, logsMd, now })
   if (stateDegraded) {
-    card.degraded = true
-    card.stateError = stateError
+    // 台账读不出 → 不输出任何队列/PR/健康分字段(空态数字会被误当"一切正常"),
+    // 只给显式降级信号;顺手记 logs.md 一行(指引降级文案里的"已记录"由此兑现)
+    try {
+      appendLog(stateDir, `${now} · intake-status · degraded: ${String(stateError).split('\n')[0]}`)
+    } catch {
+      /* 记录失败不影响降级应答 */
+    }
+    process.stdout.write(`${JSON.stringify({ status: 'degraded', generatedAt: now, stateError })}\n`)
+    return
   }
-  process.stdout.write(`${JSON.stringify(card)}\n`)
+  const card = buildStatus({ state: state || { clusters: {}, openPRs: [] }, baseline, logsMd, now })
+  process.stdout.write(`${JSON.stringify({ status: 'ok', ...card })}\n`)
 }
 
 // ---- CLI ----

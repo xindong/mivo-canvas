@@ -305,13 +305,19 @@ describe('P2-1 回归:同指纹生产 S0 信号不被人工 origin 保护遮蔽(
   })
 })
 
-describe('P2-3 回归:status 对半写/损坏 state.json 的容错', () => {
-  it('损坏 JSON → 降级空态出卡(exit 0,degraded 标记),不崩', () => {
+describe('P2-3/P2-NEW 回归:status 降级契约(不伪装正常卡)', () => {
+  it('损坏 JSON → status:"degraded",exit 0;输出不含任何队列/PR/健康分字段,并记入 logs.md', () => {
     writeFileSync(join(dir, 'state.json'), '{"schemaVersion":1,"fingerprintVersion":1,"clusters":{"a')
     const out = runIntake(['status', '--now', NOW])
-    expect(out.degraded).toBe(true)
+    expect(out.status).toBe('degraded')
     expect(out.stateError).toBeTruthy()
-    expect(out.queue).toMatchObject({ P0: 0, P1: 0, P2: 0, P3: 0 })
+    // 正常卡置信语义必须缺席:接单会话拿不到可套正常模板的数字
+    expect(out.queue).toBeUndefined()
+    expect(out.openPRCount).toBeUndefined()
+    expect(out.healthScore).toBeUndefined()
+    expect(out.lastRun).toBeUndefined()
+    // "已记录"文案的兑现:降级事件落 logs.md
+    expect(readFileSync(join(dir, 'logs.md'), 'utf8')).toContain('intake-status · degraded')
   })
 
   it('schema/fingerprint 版本不符是完整性错误,不降级照旧失败', () => {
@@ -339,8 +345,9 @@ describe('status(T2-3,与看板同源)', () => {
     expect(card.lastRun).toMatchObject({ at: '2026-07-18T02:30:00+08:00', mode: 'full', workpacketClusters: 2 })
   })
 
-  it('CLI:空状态目录也能出卡(容错空态)', () => {
+  it('CLI:空状态目录也能出卡(容错空态,status:"ok" —— 台账为空≠台账不可读)', () => {
     const out = runIntake(['status', '--now', NOW])
+    expect(out.status).toBe('ok')
     expect(out.queue).toMatchObject({ P0: 0, P1: 0, P2: 0, P3: 0 })
     expect(out.healthScore).toBeNull()
     expect(out.lastRun).toBeNull()

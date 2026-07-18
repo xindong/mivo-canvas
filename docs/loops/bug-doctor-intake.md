@@ -76,13 +76,19 @@ node scripts/loops/bug-doctor/intake.mjs report \
 node scripts/loops/bug-doctor/intake.mjs status
 ```
 
-### 2.2 应答模板(数据全部来自命令输出,不要另查别处)
+### 2.2 应答模板(数据全部来自命令输出,不要另查别处;**先看顶层 `status` 字段分支**)
+
+`status="ok"` → 正常卡:
 
 > **bug-doctor 状态** _(<generatedAt> 快照)_
 > 队列:P0 <P0> · P1 <P1> · P2 <P2> · P3 <P3>(活跃工单 <activeTotal>)
 > 进行中 loop PR:<openPRCount> 个
 > React 健康分:<healthScore>(基线口径)
 > 上轮班车:<lastRun.at>(<lastRun.mode>,<空转/工作包 N 簇>)
+
+`status="degraded"` → **禁止套正常卡**(此时输出里没有队列字段,任何数字都是编造),回帖固定文案:
+
+> 状态台账暂不可读,请稍后重试(已记录)。
 
 - 白名单成员均可查(状态查询不设更细权限;`report` 的白名单不约束 `status`)。
 - **响应要快**:收到「状态」后直接跑命令出卡,不做任何额外调查/浏览;卡片外不附加分析。速度尽力而为,不向用户承诺具体秒数。
