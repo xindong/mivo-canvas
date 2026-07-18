@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// gate.mjs — bug-doctor 发现层入口(确定性脚本,零 LLM)
+// gate.mjs — Mivo(原 bug-doctor)发现层入口(确定性脚本,零 LLM)
 //
 // 每个工作轮第一步:拉四路信号 → 指纹聚类 → 打分定 S 级 → 对照台账过滤 →
 // 产出 workpacket.json;空 → 记日志秒退(exit 0)。契约见 docs/loops/bug-doctor.md,
@@ -81,7 +81,7 @@ const parseArgs = (argv) => {
   return out
 }
 
-const log = (msg) => process.stderr.write(`[bug-doctor:gate] ${msg}\n`)
+const log = (msg) => process.stderr.write(`[mivo:gate] ${msg}\n`)
 
 const localNowIso = () => {
   const now = new Date()

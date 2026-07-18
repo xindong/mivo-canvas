@@ -1,6 +1,6 @@
-# bug-doctor — loop 契约
+# Mivo(原 bug-doctor)— loop 契约
 
-> 每日自动消化生产 debug log + React 健康扫描,修 bug、提 PR、白名单内自动合并。
+> **Mivo**(原名 bug-doctor,2026-07-19 展示层更名;文件路径/launchd 标签/状态目录/台账内部字段沿用原名,机器判据不动)。每日自动消化生产 debug log + React 健康扫描,修 bug、提 PR、白名单内自动合并。
 > 设计来源:2026-07-17 预检定稿(决策记录见 `docs/plan/bug-doctor-unknowns-map.md`)。
 > 本文件是契约(稳定,改动走 PR);运行时状态与日志在 `history/loops/bug-doctor/`(不入 git,loop 每轮自更新)。
 
@@ -67,7 +67,7 @@ error 突增(单小时 >50)/ persist·迁移类数据完整性信号 / 鉴权异
 行为级修复/禁区内修复/拿不准的一律 T2。agent 干完全部活(复现+修复+证据+PR),Slack 通知,**不按合并键**。
 
 ### T3 · 不修,自动提 GitHub issue(Q2 定稿)
-复现失败 / 根因跨模块 / 意图不明反复 warn / 修 2 次失败 / T0 跟踪票。组织仓 issue,标题 `[bug-doctor]` 前缀 + `bug-doctor` label,按指纹去重(同簇一张票,复发追加评论)。
+复现失败 / 根因跨模块 / 意图不明反复 warn / 修 2 次失败 / T0 跟踪票。组织仓 issue,标题 `[mivo]` 前缀 + `bug-doctor` label(label 沿用原名保历史连续;看板检索对 `[mivo]`/`[bug-doctor]` 双前缀兼容,旧票不失联),按指纹去重(同簇一张票,复发追加评论)。
 
 ## SOP(每个工作轮)
 
@@ -126,9 +126,9 @@ history/loops/bug-doctor/
 └── dashboard/        # 状态看板(每轮重渲染的自包含 HTML,launchd 静态服务 localhost:8787)
 ```
 
-## 状态看板
+## 状态看板(Mivo 看板)
 
-每个工作轮末尾重渲染 `dashboard/index.html`(渲染器在仓库 `scripts/loops/dashboard/`),三区:①agent 工作状态(当前/下一班车/队列/成本 + 运行方块行,蓝点=进化轮)②交付状态(PR 自动合/人审分栏、issue、top 簇台账)③工作仓健康(六项核心流程红黄绿状态灯、React 健康分曲线、错误簇趋势、代码卫生指标)。看板只投影 State/Logs/gh 已有数据,不是第二真相源。
+每个工作轮末尾重渲染 `dashboard/index.html`(渲染器在仓库 `scripts/loops/dashboard/`),三区:①agent 工作状态(当前/下一班车/队列/成本 + 运行方块行,蓝点=进化轮;队列展示层用 P0-P3 编号,内部字段仍为 S 级)②交付状态(PR 自动合/人审分栏、issue、top 簇台账)③工作仓健康(六项核心流程红黄绿状态灯、React 健康分曲线、错误簇趋势、代码卫生指标)。看板只投影 State/Logs/gh 已有数据,不是第二真相源。
 
 ## 已知局限(如实)
 

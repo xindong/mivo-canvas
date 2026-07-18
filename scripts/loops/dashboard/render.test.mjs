@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { activeClusters, computeLights, dataAnchor, esc, parseLedger, parseLogs, queueCounts } from './render.mjs'
+import { activeClusters, buildHtml, computeLights, dataAnchor, esc, mergeGhItems, pLabel, parseLedger, parseLogs, queueCounts } from './render.mjs'
 
 const RULES = {
   coreProcesses: [
@@ -79,5 +79,61 @@ describe('parseLogs / parseLedger', () => {
 describe('esc', () => {
   it('转义 HTML 特殊字符(pattern 里有 JSON 引号)', () => {
     expect(esc('{"error":"<x>&\'y\'"}')).toBe('{&quot;error&quot;:&quot;&lt;x&gt;&amp;&#39;y&#39;&quot;}')
+  })
+})
+
+describe('Mivo 更名 + P3-9 展示层映射', () => {
+  it('pLabel:S→P 一一映射,未知值原样兜底', () => {
+    expect(['S0', 'S1', 'S2', 'S3'].map(pLabel)).toEqual(['P0', 'P1', 'P2', 'P3'])
+    expect(pLabel('S9')).toBe('S9')
+  })
+
+  it('mergeGhItems:新旧标题前缀([mivo]/[bug-doctor])检索结果合并,按 number 去重排序——旧档不失联', () => {
+    const newList = [
+      { number: 300, title: '[mivo] fix: xxx' },
+      { number: 281, title: 'feat(t2-intake): ...' },
+    ]
+    const oldList = [
+      { number: 279, title: '[bug-doctor] fix(e2e): archive-cr6-409 prod 拓扑跳过' },
+      { number: 281, title: 'feat(t2-intake): ...' }, // 两边都命中 → 去重
+    ]
+    const merged = mergeGhItems([newList, oldList])
+    expect(merged.map((i) => i.number)).toEqual([300, 281, 279])
+    expect(merged.some((i) => i.title.includes('[bug-doctor]'))).toBe(true) // 旧前缀样例仍被收录
+    expect(merged.some((i) => i.title.includes('[mivo]'))).toBe(true)
+  })
+
+  it('buildHtml:标题 Mivo 看板、队列徽章 P0-P3、Top 簇 P 级列(内部字段仍 S 级传入)', () => {
+    const runs = parseLogs('- 2026-07-18T02:30:00+08:00 · mode=full · 新记录 1 · 新簇 1 · 活跃簇 2 · S0 1 · 工作包 2 簇\n')
+    const state = { clusters: {}, openPRs: [] }
+    const act = [
+      cluster({ fp: 'a', sLevel: 'S0', levels: ['error'], status: 'new' }),
+      cluster({ fp: 'b', sLevel: 'S1', status: 'new' }),
+    ]
+    const ctx = {
+      now: NOW,
+      state,
+      wp: { clusters: [{ fp: 'a', sLevel: 'S0', score: 9, source: 'Persist Boot', pattern: 'boom' }] },
+      baseline: null,
+      runs,
+      ledger: parseLedger(''),
+      gh: { prs: [], issues: [], stale: true, error: 'off', fetchedAt: null },
+      stateDirLabel: '/tmp/x',
+      q: queueCounts(act),
+      costTotal: 0,
+      lights: computeLights(act, RULES, NOW),
+      anchor: NOW,
+    }
+    const html = buildHtml(ctx)
+    expect(html).toContain('<title>Mivo 看板</title>')
+    expect(html).toContain('<h1>Mivo 看板</h1>')
+    expect(html).toContain('P0 1')
+    expect(html).toContain('P1 1')
+    expect(html).toContain('P2 0')
+    expect(html).toContain('P3 0')
+    expect(html).toContain('<th>P级</th>')
+    expect(html).toContain('>P0</span>') // Top 簇徽章 S0 → P0 展示
+    expect(html).not.toContain('badge s0">S0') // 队列徽章不再出 S 编号(logs 原文 tooltip 不在此列)
+    expect(html).not.toContain('bug-doctor 状态看板')
   })
 })

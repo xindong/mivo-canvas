@@ -1,4 +1,4 @@
-// state.mjs — bug-doctor 运行时状态(state.json / ledger.csv / logs.md / 互斥锁)
+// state.mjs — Mivo(原 bug-doctor)运行时状态(state.json / ledger.csv / logs.md / 互斥锁)
 //
 // 状态目录默认 <repoRoot>/history/loops/bug-doctor/(不入 git),可用
 // MIVO_BUG_DOCTOR_STATE_DIR 或 --state-dir 覆盖(测试与多 checkout 场景)。
@@ -101,7 +101,7 @@ export const appendLog = (stateDir, line) => {
   ensureStateDir(stateDir)
   const path = join(stateDir, LOGS_FILE)
   if (!existsSync(path)) {
-    writeFileSync(path, '# bug-doctor logs(只增,每轮一行;零也记)\n\n')
+    writeFileSync(path, '# Mivo logs(只增,每轮一行;零也记)\n\n')
   }
   appendFileSync(path, `- ${line}\n`)
 }

@@ -1,4 +1,4 @@
-// fingerprint.mjs — bug-doctor 错误指纹规整(纯函数,零依赖,零 IO)
+// fingerprint.mjs — Mivo(原 bug-doctor)错误指纹规整(纯函数,零依赖,零 IO)
 //
 // 指纹 = source + '::' + normalize(message)。normalize 剥离记录级变量
 // (UUID / 长 hex / 数字串 / 引号路径 / URL query),保留错误语义词,使同根因

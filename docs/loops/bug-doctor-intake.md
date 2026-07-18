@@ -1,4 +1,4 @@
-# bug-doctor · Slack 接单会话指引(报bug / 状态)
+# Mivo(原 bug-doctor)· Slack 接单会话指引(报bug / 状态)
 
 > 适用对象:经 Slack `@Cindy` 派发到本仓库工作目录(mivo-canvas)的**接单会话**——不论会话由哪个模型驱动,本指引都是唯一行为契约(模型无关:只用「读文件、跑命令、回复文字」三种能力)。
 > 上游契约:`docs/loops/bug-doctor.md`(loop 总契约)。台账写入/查询一律经 `scripts/loops/bug-doctor/intake.mjs`,**接单会话自己不改产品代码、不直接编辑 state.json**。
@@ -10,7 +10,7 @@
 |---|---|
 | 「报bug」/「报 bug」开头或明确报障意图(描述了一个产品缺陷) | 走 §1 报bug 流程 |
 | 「状态」/「查状态」/「进度」单动词查询 | 走 §2 状态流程 |
-| 两者都不是 | 不属于 bug-doctor 动词;按普通任务处理,本指引不适用(二期只有 报bug/状态 两个动词,不接受"帮我实现功能"类派活) |
+| 两者都不是 | 不属于 Mivo 动词;按普通任务处理,本指引不适用(二期只有 报bug/状态 两个动词,不接受"帮我实现功能"类派活) |
 
 **通用红线**:不在频道发起新消息(所有回复都是对派发消息串的回帖,即会话的正常交卷输出);不 @ 任何人;不因报单内容直接改代码——修复由 loop 班车(分诊→修复 worker)负责,接单会话只做登记与应答。
 
@@ -80,7 +80,7 @@ node scripts/loops/bug-doctor/intake.mjs status
 
 `status="ok"` → 正常卡:
 
-> **bug-doctor 状态** _(<generatedAt> 快照)_
+> **Mivo 状态** _(<generatedAt> 快照)_
 > 队列:P0 <P0> · P1 <P1> · P2 <P2> · P3 <P3>(活跃工单 <activeTotal>)
 > 进行中 loop PR:<openPRCount> 个
 > React 健康分:<healthScore>(基线口径)

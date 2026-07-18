@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// bug-doctor 状态看板渲染器(T-Dash)。
+// Mivo(原 bug-doctor)状态看板渲染器(T-Dash)。
+// 展示层用 P0-P3 编号;内部字段(state.json 的 sLevel/S*)与 CSS class 不动,仅渲染映射。
 // 零依赖:读 state.json / workpacket.json / ledger.csv / logs.md / react-baseline.json
 // + `gh` 查 PR/issue(失败降级为本地缓存并标注"数据过期"),输出自包含 HTML(内联 SVG)
 // 到 <stateDir>/dashboard/index.html。看板只投影已有状态,不是第二真相源。
@@ -25,6 +26,11 @@ const REPO_ROOT = resolve(__dirname, '../../..');
 const REPO_SLUG = 'xindong/mivo-canvas';
 const WINDOW_HOURS = 24;
 const ACTIVE_STATUSES = new Set(['new', 'triaged', 'in-progress', 'fix-attempted']);
+// 展示层 P 编号 = 内部 S 级一一映射(P3-9;内部字段不动)
+const P_LABEL = { S0: 'P0', S1: 'P1', S2: 'P2', S3: 'P3' };
+export const pLabel = (s) => P_LABEL[s] || String(s ?? '—');
+// issue/PR 标题检索前缀:更名 Mivo 后新档走 [mivo],旧档 [bug-doctor] 仍需认(防失联)
+const GH_TITLE_PREFIXES = ['[mivo]', '[bug-doctor]'];
 
 // ---------- CLI ----------
 export function parseArgs(argv) {
@@ -87,15 +93,32 @@ function runGh(args) {
   return JSON.parse(r.stdout || '[]');
 }
 
+// 多前缀检索结果合并去重(按 number,新旧前缀都认;导出供回归测试)
+export function mergeGhItems(lists) {
+  const seen = new Set();
+  const out = [];
+  for (const list of lists) {
+    for (const item of list || []) {
+      if (!item || item.number == null || seen.has(item.number)) continue;
+      seen.add(item.number);
+      out.push(item);
+    }
+  }
+  out.sort((a, b) => b.number - a.number);
+  return out;
+}
+
 export function fetchGithub({ enabled, cachePath, now }) {
   if (enabled) {
     try {
-      const prs = runGh(['pr', 'list', '--repo', REPO_SLUG, '--state', 'all', '--limit', '50',
-        '--search', '[bug-doctor] in:title',
-        '--json', 'number,title,state,isDraft,mergedAt,url,createdAt,labels']);
-      const issues = runGh(['issue', 'list', '--repo', REPO_SLUG, '--state', 'all', '--limit', '50',
-        '--search', '[bug-doctor] in:title',
-        '--json', 'number,title,state,url,createdAt,labels']);
+      const prs = mergeGhItems(GH_TITLE_PREFIXES.map((prefix) =>
+        runGh(['pr', 'list', '--repo', REPO_SLUG, '--state', 'all', '--limit', '50',
+          '--search', `${prefix} in:title`,
+          '--json', 'number,title,state,isDraft,mergedAt,url,createdAt,labels'])));
+      const issues = mergeGhItems(GH_TITLE_PREFIXES.map((prefix) =>
+        runGh(['issue', 'list', '--repo', REPO_SLUG, '--state', 'all', '--limit', '50',
+          '--search', `${prefix} in:title`,
+          '--json', 'number,title,state,url,createdAt,labels'])));
       const data = { fetchedAt: now.toISOString(), prs, issues };
       mkdirSync(dirname(cachePath), { recursive: true });
       writeFileSync(cachePath, JSON.stringify(data, null, 2));
@@ -199,8 +222,8 @@ function sectionAgent({ runs, q, costTotal, state, gh }) {
       <div class="sub">${last ? esc(last.idle ? '空转/静默' : `工作包 ${last.workpacket} 簇`) : '尚未运行'}</div></div>
     <div class="stat"><div class="k">下一班车</div><div class="v" id="next-train">—</div><div class="sub" id="countdown">主轮 02:30 · 补轮 13:00</div></div>
     <div class="stat"><div class="k">队列(活跃簇)</div><div class="v queue">
-      <span class="badge s0">S0 ${q.S0}</span><span class="badge s1">S1 ${q.S1}</span>
-      <span class="badge s2">S2 ${q.S2}</span><span class="badge s3">S3 ${q.S3}</span></div>
+      <span class="badge s0">P0 ${q.S0}</span><span class="badge s1">P1 ${q.S1}</span>
+      <span class="badge s2">P2 ${q.S2}</span><span class="badge s3">P3 ${q.S3}</span></div>
       <div class="sub">open loop PR:${openPRs}</div></div>
     <div class="stat"><div class="k">成本合计</div><div class="v">${costTotal}</div><div class="sub">ledger.csv 累计(${esc(String(runs.length))} 轮)</div></div>
   </div>
@@ -224,7 +247,7 @@ function sectionDelivery({ gh, wp, state }) {
   const top = [...(wp?.clusters || [])].sort((a, b) => (b.score || 0) - (a.score || 0)).slice(0, 8)
     .map((c) => {
       const lc = state?.clusters?.[c.fp || `${c.source}::${c.pattern}`] || {};
-      return `<tr><td><span class="badge ${String(c.sLevel).toLowerCase()}">${esc(c.sLevel)}</span></td>
+      return `<tr><td><span class="badge ${String(c.sLevel).toLowerCase()}">${esc(pLabel(c.sLevel))}</span></td>
       <td class="num">${c.score ?? '—'}</td><td>${esc(c.source)}</td>
       <td class="pattern">${esc((c.pattern || '').slice(0, 90))}</td>
       <td class="num">${lc.count ?? '—'}</td><td class="small">${esc(lc.status || '—')}</td></tr>`;
@@ -244,16 +267,16 @@ function sectionDelivery({ gh, wp, state }) {
     `<tr><td><a href="${esc(i.url)}">#${i.number}</a></td><td>${esc(i.title)}</td><td><span class="pill ${esc(i.state?.toLowerCase())}">${esc(i.state)}</span></td><td class="small">${esc(fmtTs(i.createdAt))}</td></tr>`).join('')}</tbody></table>`
     : '<div class="empty">暂无 issue</div>'}
   <h3>Top 簇台账(按 score)</h3>
-  <table><thead><tr><th>S级</th><th>score</th><th>source</th><th>pattern</th><th>次数</th><th>状态</th></tr></thead>
+  <table><thead><tr><th>P级</th><th>score</th><th>source</th><th>pattern</th><th>次数</th><th>状态</th></tr></thead>
   <tbody>${top || '<tr><td colspan="6" class="empty">工作包为空</td></tr>'}</tbody></table>
 </section>`;
 }
 
 function sectionHealth({ lights, baseline, ledger, anchor }) {
   const lightsHtml = lights.map((l) => `
-    <div class="light ${l.color}" title="S0:${l.s0} error:${l.err} warn:${l.warn}">
+    <div class="light ${l.color}" title="P0:${l.s0} error:${l.err} warn:${l.warn}">
       <span class="lamp"></span><div class="pname">${esc(l.label)}</div>
-      <div class="sub">${l.s0 ? `S0×${l.s0} ` : ''}${l.err ? `err×${l.err} ` : ''}${l.warn ? `warn×${l.warn}` : l.s0 || l.err ? '' : '正常'}</div>
+      <div class="sub">${l.s0 ? `P0×${l.s0} ` : ''}${l.err ? `err×${l.err} ` : ''}${l.warn ? `warn×${l.warn}` : l.s0 || l.err ? '' : '正常'}</div>
     </div>`).join('');
   const healthSeries = baseline?.healthScore?.value != null
     ? [[{ y: baseline.healthScore.value, t: baseline.generatedAt }]] : [[]];
@@ -265,14 +288,14 @@ function sectionHealth({ lights, baseline, ledger, anchor }) {
   return `
 <section class="card" id="health">
   <h2>③ 工作仓健康</h2>
-  <div class="k">六项核心流程状态灯(24h 窗口,锚定台账最新记录 ${esc(fmtTs(anchor.toISOString()))};红=活跃 S0/静默失败,黄=error 级,绿=无 error——warning 为已降级路径)</div>
+  <div class="k">六项核心流程状态灯(24h 窗口,锚定台账最新记录 ${esc(fmtTs(anchor.toISOString()))};红=活跃 P0/静默失败,黄=error 级,绿=无 error——warning 为已降级路径)</div>
   <div class="lights">${lightsHtml}</div>
   <div class="cols2">
     <div><h3>React 健康分${baseline ? ` · 当前 ${baseline.healthScore?.value}` : ''}</h3>
       ${svgLine(healthSeries, { colors: ['#4cc38a'], labels: ['healthScore'] })}
       <div class="sub">${baseline ? `react-doctor ${esc(baseline.toolVersion || '')} · ${esc(fmtTs(baseline.generatedAt))} · ${esc(baseline.gitRef?.sha?.slice(0, 7) || '')}` : '缺 react-baseline.json'}</div></div>
     <div><h3>错误簇趋势(每轮)</h3>
-      ${svgLine([trend, trendS0], { labels: ['活跃簇', 'S0'] })}</div>
+      ${svgLine([trend, trendS0], { labels: ['活跃簇', 'P0'] })}</div>
   </div>
   <h3>代码卫生指标(react-doctor 分类)</h3>
   <div>${hygiene}</div>
@@ -285,7 +308,7 @@ export function buildHtml(ctx) {
   return `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta http-equiv="refresh" content="300">
-<title>bug-doctor 状态看板</title>
+<title>Mivo 看板</title>
 <style>
 :root{color-scheme:dark}
 body{background:#101216;color:#d7dae0;font:14px/1.5 -apple-system,"PingFang SC",sans-serif;margin:0;padding:20px}
@@ -329,7 +352,7 @@ td.pattern{font-family:ui-monospace,monospace;font-size:12px;color:#aab0bc}
 .chart{width:100%;max-width:560px}
 .chart .axis{stroke:#333a45}.chart .tick{fill:#7d8590;font-size:10px}.chart .legend{font-size:11px}
 </style></head><body>
-<h1>bug-doctor 状态看板</h1>
+<h1>Mivo 看板</h1>
 <div class="meta">渲染于 ${esc(fmtTs(now.toISOString()))} · 状态目录 ${esc(ctx.stateDirLabel)} · runCount ${esc(String(ctx.state?.runCount ?? 0))} · fp v${esc(String(ctx.state?.fingerprintVersion ?? '—'))}${ctx.gh.stale ? ' · <b style="color:#ffd479">GH 数据过期</b>' : ' · GH 实时'}</div>
 ${sectionAgent(ctx)}
 ${sectionDelivery(ctx)}
@@ -386,5 +409,5 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const { outFile, ctx } = render(args);
   const lights = ctx.lights.map((l) => `${l.label}=${l.color}`).join(' ');
   console.log(`[dashboard] rendered ${outFile}`);
-  console.log(`[dashboard] queue S0=${ctx.q.S0} S1=${ctx.q.S1} S2=${ctx.q.S2} S3=${ctx.q.S3} · gh=${ctx.gh.stale ? 'stale' : 'fresh'} · lights: ${lights}`);
+  console.log(`[dashboard] queue P0=${ctx.q.S0} P1=${ctx.q.S1} P2=${ctx.q.S2} P3=${ctx.q.S3} · gh=${ctx.gh.stale ? 'stale' : 'fresh'} · lights: ${lights}`);
 }
